@@ -1032,8 +1032,21 @@ void i_ImmSetCompositionWindow(X86 *c) {
 }
 
 // -------------------------------------------------------------------------
-// WSOCK32: enough for startup probing; real networking is a later task.
+// WSOCK32: name resolution against the host. Real networking (sockets) is a
+// later task; host-name lookup is what games probe at startup to discover the
+// local machine's own address.
 // -------------------------------------------------------------------------
+static int g_wsa_last_error = 0;
+static constexpr int WSAEFAULT_ = 10014;
+static constexpr int WSAHOST_NOT_FOUND_ = 11001;
+
+void w_WSAGetLastError(X86 *c) {
+    set_eax(c, (uint32_t)g_wsa_last_error);
+}
+void w_WSASetLastError(X86 *c) {
+    g_wsa_last_error = (int)arg(c, 0);
+}
+
 void w_WSAStartup(X86 *c) {
     uint32_t version = arg(c, 0), pdata = arg(c, 1);
     if (pdata) {
@@ -1052,13 +1065,74 @@ void w_WSACleanup(X86 *c) {
 }
 void w_gethostname(X86 *c) {
     uint32_t buf = arg(c, 0), len = arg(c, 1);
-    if (buf && len)
-        gm_put_str(buf, RECOMP_GAME_ID, len);
+    if (!buf || !len || !gm_valid(buf, len)) {
+        g_wsa_last_error = WSAEFAULT_;
+        set_eax(c, (uint32_t)-1); // SOCKET_ERROR
+        return;
+    }
+    // Fidelity: the real Winsock returns the machine's own name, which a game
+    // then resolves with gethostbyname. The earlier stub returned
+    // RECOMP_GAME_ID, a name no resolver can answer, so that chain always
+    // failed; the host's name is what the original would have returned.
+    if (os_hostname((char *)gm_ptr(buf), len) != 0) {
+        g_wsa_last_error = WSAHOST_NOT_FOUND_;
+        set_eax(c, (uint32_t)-1); // SOCKET_ERROR
+        return;
+    }
     set_eax(c, 0);
 }
+
+// gethostbyname hands back a per-thread block that the next call on the same
+// thread overwrites, exactly like Winsock's thread-local result. It lives in
+// the guest arena so the pointers are guest-addressable; the blocks are reused
+// so a caller that keeps the pointer until its next lookup sees a stable
+// address.
+struct GethostCache {
+    uint32_t hostent = 0;
+    uint32_t name = 0;
+    uint32_t addrs = 0;
+    uint32_t in_addr = 0;
+};
+static thread_local GethostCache g_gethost;
+
+static bool gethost_cache_live() {
+    return g_gethost.hostent && heap_owns(g_gethost.hostent) && heap_owns(g_gethost.name) &&
+           heap_owns(g_gethost.addrs) && heap_owns(g_gethost.in_addr);
+}
+
 void w_gethostbyname(X86 *c) {
-    log_once("gethostbyname", "gethostbyname(\"%s\"): name resolution is not implemented",
-             gm_str(arg(c, 0), 256).c_str());
+    uint32_t namep = arg(c, 0);
+    std::string name = namep ? gm_str(namep, 256) : std::string();
+    unsigned char addr[4];
+    if (!name.empty() && os_resolve_ipv4(name.c_str(), addr) == 0) {
+        if (!gethost_cache_live()) {
+            GethostCache fresh;
+            fresh.hostent = heap_alloc(16, true);
+            fresh.name = heap_alloc(256, true);
+            fresh.addrs = heap_alloc(8, true);
+            fresh.in_addr = heap_alloc(4, true);
+            if (fresh.hostent && fresh.name && fresh.addrs && fresh.in_addr) {
+                // struct hostent: h_name, h_aliases, h_addrtype (AF_INET),
+                // h_length (4), h_addr_list (NULL-terminated array).
+                wr32(fresh.hostent + 0, fresh.name);
+                wr32(fresh.hostent + 4, 0);
+                wr16(fresh.hostent + 8, 2);
+                wr16(fresh.hostent + 10, 4);
+                wr32(fresh.hostent + 12, fresh.addrs);
+                wr32(fresh.addrs + 0, fresh.in_addr);
+                wr32(fresh.addrs + 4, 0);
+                g_gethost = fresh;
+            }
+        }
+        if (gethost_cache_live()) {
+            gm_put_str(g_gethost.name, name.c_str(), 256);
+            memcpy(gm_ptr(g_gethost.in_addr), addr, 4);
+            set_eax(c, g_gethost.hostent);
+            return;
+        }
+    }
+    g_wsa_last_error = WSAHOST_NOT_FOUND_;
+    LOGV("gethostbyname(\"%s\"): no IPv4 address", name.c_str());
     set_eax(c, 0);
 }
 void w_inet_ntoa(X86 *c) {
@@ -2063,6 +2137,10 @@ const ImportShim g_misc_shims[] = {
     {"WSOCK32.dll", "ord52", 1, w_gethostbyname},
     {"WSOCK32.dll", "inet_ntoa", 1, w_inet_ntoa},
     {"WSOCK32.dll", "ord11", 1, w_inet_ntoa},
+    {"WSOCK32.dll", "WSAGetLastError", 0, w_WSAGetLastError},
+    {"WSOCK32.dll", "ord111", 0, w_WSAGetLastError},
+    {"WSOCK32.dll", "WSASetLastError", 1, w_WSASetLastError},
+    {"WSOCK32.dll", "ord112", 1, w_WSASetLastError},
     // WINMM: implemented
     {"WINMM.dll", "timeGetTime", 0, m_timeGetTime},
     {"WINMM.dll", "timeGetDevCaps", 2, m_timeGetDevCaps},

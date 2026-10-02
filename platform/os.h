@@ -150,6 +150,17 @@ void os_sleep_us(uint64_t us);
 int os_strcasecmp(const char *a, const char *b);
 
 // ---------------------------------------------------------------------------
+// Network identity. Used by the winsock name-resolution shims; the commands
+// above never need a DNS resolver, so these are the only socket calls here.
+// ---------------------------------------------------------------------------
+// The machine's own host name, NUL-terminated and truncated to `cap`; 0 or -1.
+int os_hostname(char *buf, size_t cap);
+// Resolve `name` to one IPv4 address in network order (as struct in_addr
+// stores it). IPv4 only: the guest's gethostbyname result describes AF_INET.
+// 0 when it resolved, -1 when it did not.
+int os_resolve_ipv4(const char *name, unsigned char addr[4]);
+
+// ---------------------------------------------------------------------------
 // Environment. Values are copied; 0 or -1.
 // ---------------------------------------------------------------------------
 int os_setenv(const char *name, const char *value);

@@ -1872,6 +1872,39 @@ static void test_misc_shims(X86 *c) {
           "GetSystemDirectoryA reports the size needed when the buffer is short");
 }
 
+// The guest's local-IP probe is gethostname -> gethostbyname -> inet_ntoa. It
+// needs a guest-addressable struct hostent whose h_addr_list leads to a 4-byte
+// AF_INET address, and a Winsock error it can read back after a failure. This
+// checks both, plus the thread-local stability Winsock promises.
+static void test_winsock_resolver(X86 *c) {
+    section("Winsock name resolution");
+    uint32_t namebuf = scratch_block(256);
+    check(call_import(c, "WSOCK32.dll", "gethostname", {namebuf, 256}) == 0 &&
+              gm_str(namebuf).size() > 0,
+          "gethostname -> \"%s\"", gm_str(namebuf).c_str());
+
+    uint32_t local = put_str("localhost");
+    uint32_t he = call_import(c, "WSOCK32.dll", "gethostbyname", {local});
+    if (check(he != 0, "gethostbyname(\"localhost\") returns a hostent")) {
+        uint32_t list = rd32(he + 0xc);
+        uint32_t addr = list ? rd32(list) : 0;
+        uint32_t ip = addr ? rd32(addr) : 0;
+        check(rd16(he + 8) == 2 && rd16(he + 10) == 4, "hostent is AF_INET with 4-byte addresses");
+        check(ip == 0x0100007f, "localhost resolves to 127.0.0.1 (got %02x.%02x.%02x.%02x)",
+              ip & 0xff, (ip >> 8) & 0xff, (ip >> 16) & 0xff, (ip >> 24) & 0xff);
+        uint32_t str = call_import(c, "WSOCK32.dll", "inet_ntoa", {ip});
+        check(gm_str(str) == "127.0.0.1", "inet_ntoa -> %s", gm_str(str).c_str());
+        uint32_t he2 = call_import(c, "WSOCK32.dll", "gethostbyname", {put_str("localhost")});
+        check(he2 == he, "repeated lookups reuse one thread-local hostent");
+    }
+
+    uint32_t bad = put_str("recomp-gethostbyname-test.invalid");
+    check(call_import(c, "WSOCK32.dll", "gethostbyname", {bad}) == 0,
+          "an unresolvable name returns NULL");
+    check(call_import(c, "WSOCK32.dll", "WSAGetLastError", {}) == 11001,
+          "WSAGetLastError reports WSAHOST_NOT_FOUND");
+}
+
 // What a C++ throw looks like from the runtime: the MSVC exception record
 // names the type through its throw info, the object usually carries a
 // message, and the EBP chain names where it came from. This is what the
@@ -6933,6 +6966,7 @@ int main(int argc, char **argv) {
     test_pinned_clock(c);
     test_cadence_trace(c);
     test_misc_shims(c);
+    test_winsock_resolver(c);
     test_windows_version(c);
     test_boot_shims(c);
     test_gdi_and_com(c);

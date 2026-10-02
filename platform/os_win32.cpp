@@ -6,6 +6,8 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <fcntl.h>
 #include <io.h>
 #include <process.h>
@@ -568,6 +570,38 @@ void os_sleep_us(uint64_t us) {
 
 int os_strcasecmp(const char *a, const char *b) {
     return _stricmp(a, b);
+}
+
+int os_hostname(char *buf, size_t cap) {
+    if (!buf || cap == 0)
+        return -1;
+    DWORD n = (DWORD)cap;
+    if (!GetComputerNameA(buf, &n))
+        return -1;
+    return 0;
+}
+
+int os_resolve_ipv4(const char *name, unsigned char addr[4]) {
+    if (!name || !*name)
+        return -1;
+    // getaddrinfo needs Winsock; the process has no other user of it yet, so
+    // the platform initializes it once. 2.2 is what the guest asks for too.
+    static bool started = false;
+    if (!started) {
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+            return -1;
+        started = true;
+    }
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET; // IPv4 only: the guest's hostent is AF_INET
+    struct addrinfo *res = nullptr;
+    if (getaddrinfo(name, nullptr, &hints, &res) != 0 || !res)
+        return -1;
+    memcpy(addr, &((struct sockaddr_in *)res->ai_addr)->sin_addr, 4);
+    freeaddrinfo(res);
+    return 0;
 }
 
 int os_setenv(const char *name, const char *value) {

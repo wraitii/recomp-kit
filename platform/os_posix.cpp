@@ -16,6 +16,9 @@
 #include <strings.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/statvfs.h>
 #include <sys/time.h>
 #include <time.h>
@@ -375,6 +378,27 @@ void os_sleep_us(uint64_t us) {
 
 int os_strcasecmp(const char *a, const char *b) {
     return strcasecmp(a, b);
+}
+
+int os_hostname(char *buf, size_t cap) {
+    if (!buf || cap == 0 || gethostname(buf, cap) != 0)
+        return -1;
+    buf[cap - 1] = '\0';
+    return 0;
+}
+
+int os_resolve_ipv4(const char *name, unsigned char addr[4]) {
+    if (!name || !*name)
+        return -1;
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET; // IPv4 only: the guest's hostent is AF_INET
+    struct addrinfo *res = nullptr;
+    if (getaddrinfo(name, nullptr, &hints, &res) != 0 || !res)
+        return -1;
+    memcpy(addr, &((struct sockaddr_in *)res->ai_addr)->sin_addr, 4);
+    freeaddrinfo(res);
+    return 0;
 }
 
 int os_setenv(const char *name, const char *value) {
