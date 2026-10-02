@@ -3,6 +3,7 @@
 // dispatcher. Descriptors and COM lifetime are tested separately from GPU work.
 #include "com.h"
 #include "dx.h"
+#include "d3d8_fpu.h"
 #include "frame_dump.h"
 #include "../runtime/guest.h"
 #include "../runtime/memory.h"
@@ -525,6 +526,11 @@ void D8_CreateDevice(X86 *c) {
         com_ret(c, D8_ERR_NOTAVAILABLE);
         return;
     }
+    uint16_t previous_cw = c->fpu_cw;
+    uint32_t behavior_flags = arg(c, 4);
+    d3d8_setup_guest_fpu(c, behavior_flags);
+    LOGW("d3d8: CreateDevice behavior=0x%x guest FPU CW %04x -> %04x", behavior_flags, previous_cw,
+         c->fpu_cw);
 #ifdef RECOMP_D3D8_WGPU
     ComObj *factory = d8_this(c);
     ComObj *dev = com_new(K_D3D8DEVICE);

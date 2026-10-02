@@ -1,6 +1,7 @@
 // Guest ABI contract for the implicit D3D8 backbuffer. Devices here are
 // constructed state fixtures, not host renderer creation or execution evidence.
 #include "../dx.h"
+#include "../d3d8_fpu.h"
 #include "../../runtime/memory.h"
 #include "guest_abi.h"
 
@@ -9,6 +10,56 @@ static void check(bool value, const char *message) {
     if (!value) {
         ++g_failures;
         fprintf(stderr, "FAIL: %s\n", message);
+    }
+}
+
+// Exercise the arithmetic behind a log/exponent-based dimension check using
+// the same helpers as generated FLDLN2/FYL2X/FMUL and truncating FISTP. This
+// tests a branch-sensitive result, not approximate agreement of FP values.
+static int dimension_exponent(uint32_t size) {
+    fpush(&g_cpu, 0.69314718055994530942);
+    fpush(&g_cpu, (double)size);
+    fset(&g_cpu, 1, fx87_exact(&g_cpu, ST(&g_cpu, 1) * log2(ST(&g_cpu, 0))));
+    fdrop(&g_cpu);
+    fset(&g_cpu, 0, fx87(&g_cpu, ST(&g_cpu, 0) * 1.4426950408889634));
+    uint16_t cw = g_cpu.fpu_cw;
+    x87_set_cw(&g_cpu, (uint16_t)(cw | 0x0c00u));
+    int result = (int)fround_cw(&g_cpu, fpop(&g_cpu));
+    x87_set_cw(&g_cpu, cw);
+    return result;
+}
+
+static void test_device_fpu() {
+    cpu_reset();
+    x87_set_cw(&g_cpu, 0x027f);
+    check(dimension_exponent(128) == 6, "binary64 intermediate reproduces below-integer exponent");
+    for (uint32_t flags : {0x20u, 0x40u, 0x24u, 0x44u}) {
+        cpu_reset();
+        x87_set_cw(&g_cpu, 0x1f40);
+        g_cpu.fpu_sw = 0x4120;
+        fpush(&g_cpu, 1.25);
+        uint16_t tag = g_cpu.fpu_tag;
+        uint32_t top = g_cpu.fpu_top;
+        d3d8_setup_guest_fpu(&g_cpu, flags);
+        check(g_cpu.fpu_cw == 0x107f,
+              "default device FPU masks exceptions, sets PC24/nearest and preserves other bits");
+        check(g_cpu.fpu_sw == 0x4120 && g_cpu.fpu_tag == tag && g_cpu.fpu_top == top &&
+                  ST(&g_cpu, 0) == 1.25,
+              "device FPU setup preserves status and stack");
+        fdrop(&g_cpu);
+        for (int exponent = 0; exponent <= 13; ++exponent)
+            check(dimension_exponent(1u << exponent) == exponent,
+                  "power-of-two exponent survives default device precision and truncation");
+        for (uint32_t size : {127u, 129u, 255u, 257u})
+            check(ldexp(1.0, dimension_exponent(size)) != (double)size,
+                  "nearby non-power dimension remains rejected");
+        check(g_cpu.fpu_cw == 0x107f && g_cpu.fpu_top == 0,
+              "dimension check restores CW and balances x87 stack");
+    }
+    for (uint16_t cw : {0x037f, 0x027f, 0x1c60}) {
+        x87_set_cw(&g_cpu, cw);
+        d3d8_setup_guest_fpu(&g_cpu, 0x26);
+        check(g_cpu.fpu_cw == cw, "FPU_PRESERVE leaves guest CW unchanged");
     }
 }
 
@@ -539,8 +590,8 @@ static void test_caps() {
     check(rd32(caps + 0x5c) == 2048, "MaxTextureHeight is advertised");
     // Guest 0x007c2160 sizes its texture stage setup from these; zero means
     // the game never binds a texture.
-    check(rd32(caps + 0x94) == 1, "MaxTextureBlendStages matches the stage-0 renderer");
-    check(rd32(caps + 0x98) == 1, "MaxSimultaneousTextures matches the stage-0 renderer");
+    check(rd32(caps + 0x94) == 2, "MaxTextureBlendStages matches the two-stage renderer");
+    check(rd32(caps + 0x98) == 2, "MaxSimultaneousTextures matches the two-stage renderer");
     check(call_method(device, 7, {0}) == 0x8876086c, "null caps output is rejected");
     call_method(device, 2);
 }
@@ -605,6 +656,7 @@ int main(int argc, char **argv) {
     check(call_method(factory, 15, {0, 1, 0, 0x20, pp, sc(0)}) == 0x8876086a && rd32(sc(0)) == 0,
           "no-Rust CreateDevice fails with cleared output and correct stack cleanup");
     call_method(factory, 2);
+    test_device_fpu();
     test_backbuffer(21); // A8R8G8B8
     test_backbuffer(22); // X8R8G8B8
     test_texture();

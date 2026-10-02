@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Honor D3D8 CreateDevice's default guest x87 precision, rounding and exception
+  masks, while respecting FPU_PRESERVE. This prevents binary64 intermediate
+  rounding from rejecting power-of-two dimensions in CPU mip generation.
+
 - Enable mouse capture for acquired DirectInput mice in D3D windows. Games
   without a cursor-feedback hook use relative device motion while captured,
   hiding the OS cursor and retaining movement beyond cursor edges. Release
