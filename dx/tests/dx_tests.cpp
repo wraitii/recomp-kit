@@ -6339,6 +6339,54 @@ static void test_dsound() {
 
 // DirectInput: the keyboard reports the host's key state, and the mouse
 // delivers buffered events built by diffing successive host states.
+// IDirectSound8 keeps the IDirectSound device and adds VerifyCertification;
+// DirectSoundEnumerateA reports the one primary device.
+static uint32_t g_ds8_enum_calls;
+
+static void ds8_enum_callback(X86 *c) {
+    ++g_ds8_enum_calls;
+    CHECK_EQ(arg(c, 0), 0u); // the primary device has no GUID
+    const char *expected[] = {"Primary Sound Driver", "dsound.dll"};
+    for (unsigned n = 0; n < 2; ++n) {
+        uint32_t str = arg(c, n + 1);
+        for (unsigned j = 0; j <= strlen(expected[n]); ++j)
+            CHECK_EQ(rd8(str + j), (uint8_t)expected[n][j]);
+    }
+    CHECK_EQ(arg(c, 3), 0x12345678u);
+    set_eax(c, 1); // continue
+}
+
+static void test_dsound8() {
+    cpu_reset();
+    uint32_t create8 = tramp("DSOUND.dll", "ord11");
+    CHECK(create8 != 0);
+    uint32_t hr = call_shim(create8, {0, sc(0), 0});
+    CHECK_EQ(hr, DS_OK);
+    uint32_t ds8 = rd32(sc(0));
+    CHECK(ds8 != 0);
+    const uint8_t arities[] = {3, 1, 1, 4, 2, 3, 3, 1, 2, 2, 2, 2};
+    for (uint32_t slot = 0; slot < sizeof(arities); ++slot)
+        CHECK_EQ(imports_argc(rd32(rd32(ds8) + 4 * slot)), arities[slot]);
+    CHECK_EQ(call_method(ds8, DS_SetCooperativeLevel, {0x20004, 3}), DS_OK);
+    uint32_t caps = sc(0x300);
+    wr32(caps, DSCAPS_SIZE);
+    CHECK_EQ(call_method(ds8, 4, {caps}), DS_OK);
+    // VerifyCertification is the one IDirectSound8-only slot.
+    CHECK_EQ(call_method(ds8, 11, {sc(0x200)}), DS_OK);
+    CHECK_EQ(rd32(sc(0x200)), 0u); // DS_CERTIFIED
+    CHECK_EQ(call_method(ds8, 11, {0}), DSERR_INVALIDPARAM);
+    // A non-null GUID names a device that was never enumerated.
+    CHECK_EQ(call_shim(create8, {sc(0x300), sc(0), 0}), DSERR_NODRIVER);
+    CHECK_EQ(rd32(sc(0)), 0u);
+    call_method(ds8, 2);
+
+    uint32_t cb = imports_alloc_trampoline("TEST", "DSEnum", ds8_enum_callback, 4);
+    g_ds8_enum_calls = 0;
+    CHECK_EQ(call_shim(tramp("DSOUND.dll", "ord2"), {cb, 0x12345678u}), DS_OK);
+    CHECK_EQ(g_ds8_enum_calls, 1u);
+    CHECK_EQ(call_shim(tramp("DSOUND.dll", "ord2"), {0, 0}), DSERR_INVALIDPARAM);
+}
+
 static void test_dinput() {
     cpu_reset();
     memset(&g_input, 0, sizeof g_input);
@@ -12733,6 +12781,7 @@ int main() {
         {"Direct3D pipeline", test_d3d_pipeline},
         {"Direct3D3 pipeline", test_d3d3_pipeline},
         {"DirectSound", test_dsound},
+        {"DirectSound8", test_dsound8},
         {"DirectInput", test_dinput},
         {"QMixer", test_qmixer},
         {"FMOD samples", test_fmod},

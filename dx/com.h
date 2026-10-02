@@ -66,6 +66,7 @@ enum ComIface : uint16_t {
     IF_D3DLIGHT,
     IF_D3DTEXTURE2,
     IF_DSOUND,
+    IF_DSOUND8,
     IF_DSBUFFER,
     IF_DS3DBUFFER,
     IF_DS3DLISTENER,
