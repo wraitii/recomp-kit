@@ -307,3 +307,69 @@ MOD_TEST_SUITE(overlay_root_and_failure_paths) {
     mods_overlay_remove_all(8);
     MOD_CHECK_EQ(mods_overlay_layer_count(), 2u);
 }
+
+// The per-directory name index is invisible except for its cost, so its
+// counters are the seam: a warmed index must answer repeated lookups without
+// rebuilding, and every mutation - guest or external - must make it see truth.
+MOD_TEST_SUITE(overlay_name_index_cache) {
+    layers();
+    X86 *c = loader_context();
+    loader_init_context(c);
+    std::string data = std::string(ROOT) + "/profile/data";
+
+    // One read warms the index; a differently-cased repeat is served from it.
+    MOD_CHECK(read_file(win32_host_path_op("data\\shared.txt", WIN32_FILE_READ)) == "profile");
+    uint64_t built = mods_cpp_overlay_dir_index_builds();
+    MOD_CHECK(built >= 1);
+    MOD_CHECK(read_file(win32_host_path_op("DATA\\SHARED.TXT", WIN32_FILE_READ)) == "profile");
+    MOD_CHECK_EQ(mods_cpp_overlay_dir_index_builds(), built);
+    // The host path keeps the directory's spelling, not the guest's.
+    std::string upper_host = win32_host_path_op("DATA\\SHARED.TXT", WIN32_FILE_READ);
+    std::string canonical_host = win32_host_path_op("data\\shared.txt", WIN32_FILE_READ);
+    MOD_CHECK_STR(upper_host.c_str(), canonical_host.c_str());
+
+    // A file appearing behind the cache's back bumps the directory mtime, and
+    // the next lookup notices without an explicit invalidation.
+    OsStat st{};
+    MOD_CHECK_EQ(os_stat(data.c_str(), &st), 0);
+    write_file(data + "/behind.txt", "external");
+    MOD_CHECK_EQ(os_set_mtime(data.c_str(), st.mtime + 5), 0);
+    MOD_CHECK(read_file(win32_host_path_op("data\\behind.txt", WIN32_FILE_READ)) == "external");
+
+    // A guest create invalidates explicitly: the shim makes the file and the
+    // resolver must see it even when the mtime stays in the same second.
+    uint32_t name = mod_test_put_str("data\\guest-new.txt");
+    uint32_t h =
+        mod_test_call_import(c, "KERNEL32.dll", "CreateFileA", {name, 0x40000000u, 0, 0, 2, 0, 0});
+    MOD_CHECK(h != 0xffffffffu);
+    mod_test_call_import(c, "KERNEL32.dll", "CloseHandle", {h});
+    MOD_CHECK(win32_host_path_op("data\\guest-new.txt", WIN32_FILE_READ)
+                  .find(mods_overlay_profile_dir()) == 0);
+
+    // The same when a write has to create an intermediate directory: the
+    // parent's index is dropped before the leaf is resolved.
+    uint32_t deep = mod_test_put_str("data\\newdir\\file.txt");
+    uint32_t dh =
+        mod_test_call_import(c, "KERNEL32.dll", "CreateFileA", {deep, 0x40000000u, 0, 0, 2, 0, 0});
+    MOD_CHECK(dh != 0xffffffffu);
+    mod_test_call_import(c, "KERNEL32.dll", "CloseHandle", {dh});
+    MOD_CHECK(win32_host_path_op("data\\newdir\\file.txt", WIN32_FILE_READ)
+                  .find(mods_overlay_profile_dir()) == 0);
+
+    // A guest delete reaches the profile, and what the index held for the
+    // deleted name must not keep answering.
+    os_unlink((data + "/shared.txt").c_str());
+    MOD_CHECK_EQ(os_set_mtime(data.c_str(), st.mtime + 10), 0);
+    MOD_CHECK(read_file(win32_host_path_op("data\\shared.txt", WIN32_FILE_READ)) == "mod-b");
+
+    // The merged listing uses the same index and sees the new file once.
+    std::vector<std::pair<std::string, std::string>> entries;
+    mods_cpp_overlay_list("data", &entries);
+    int guest_new = 0;
+    for (auto &kv : entries)
+        if (kv.first == "guest-new.txt") {
+            ++guest_new;
+            MOD_CHECK(read_file(kv.second).empty());
+        }
+    MOD_CHECK_EQ(guest_new, 1);
+}

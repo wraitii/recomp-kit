@@ -301,6 +301,66 @@ def test_computed_returns_use_sorted_call_continuations(tmp_path, monkeypatch, r
     assert "if (recomp_run_thunk(c, target)) return;" in unknown
 
 
+def test_call_return_bitset_matches_the_sorted_array(tmp_path, monkeypatch):
+    """The O(1) bitset and the sorted array answer identically everywhere.
+
+    The runtime now reads one bit instead of binary-searching on every RET, so
+    the emitted bitset has to agree with the emitted array for every address,
+    in range, at the ends, and outside.
+    """
+    import re
+    import struct
+    entry, callee = 0x00601000, 0x00601080
+    code = (b"\xe8" + struct.pack("<i", callee - entry - 5) + b"\x90"
+            + b"\xe8" + struct.pack("<i", callee - entry - 11) + b"\x90\xc3")
+    img = synthetic_image({entry: code, callee: b"\xc3"}, base=0x00600000)
+    img.code_pointers = lambda *args, **kwargs: (set(), set())
+    listings = tmp_path / "functions"
+    listings.mkdir()
+    (listings / ("%08x.asm" % entry)).write_text(
+        "00601000  CALL 0x601080\n00601005  NOP\n00601006  CALL 0x601080\n"
+        "0060100b  NOP\n0060100c  RET\n")
+    (listings / ("%08x.asm" % callee)).write_text("00601080  RET\n")
+    table = tmp_path / "functions.tsv"
+    table.write_text("address\tname\tsize\n00601000\tcaller\t13\n00601080\tcallee\t1\n")
+    binary, curated = tmp_path / "image", tmp_path / "globals.toml"
+    binary.write_bytes(img.data)
+    curated.write_text("")
+    out = tmp_path / "gen"
+    monkeypatch.setattr(T, "configure", lambda cfg: None)
+    monkeypatch.setattr(T.game_config, "load", lambda path: {})
+    for name, value in (("LISTINGS", listings), ("FUNCS_TSV", table),
+                        ("BINARY", binary), ("CURATED", curated)):
+        monkeypatch.setattr(T, name, str(value))
+    monkeypatch.setattr(T, "EXTRA_ENTRY_POINTS", frozenset())
+    monkeypatch.setattr(T, "Image", lambda path: img)
+    monkeypatch.setattr(sys, "argv", ["translate.py", "--game", str(tmp_path),
+                                     "--out", str(out), "--quiet"])
+    assert T.main() == 0
+    text = (out / "table.c").read_text()
+    returns = text.split("recomp_call_returns[] = {", 1)[1].split("};", 1)[0]
+    addrs = {int(a, 16) for a in re.findall(r"0x([0-9a-f]+)u", returns)}
+    assert addrs  # the fixture must produce CALL continuations
+    cmin = int(re.search(r"recomp_call_return_min = 0x([0-9a-f]+)u", text).group(1), 16)
+    bits = text.split("recomp_call_return_bits[] = {", 1)[1].split("};", 1)[0]
+    words = [int(w, 16) for w in re.findall(r"0x([0-9a-f]+)u", bits)]
+    assert words
+
+    def lookup(target):
+        if target < cmin:
+            return False
+        off = target - cmin
+        if off >= len(words) * 32:
+            return False
+        return bool((words[off >> 5] >> (off & 31)) & 1)
+
+    for a in range(min(addrs) - 1, max(addrs) + 2):
+        assert lookup(a) == (a in addrs), hex(a)
+    # Also outside the span, where the binary search returned 0.
+    for a in (0, cmin - 1, max(addrs) + 32, 0xffffffff):
+        assert lookup(a) == (a in addrs), hex(a)
+
+
 @pytest.mark.parametrize("target,dispatch", [(0x0060100b, True),
                                            (0x00601002, False),
                                            (0x00601100, False)])

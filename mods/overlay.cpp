@@ -11,10 +11,12 @@
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <stdio.h>
 #include <string.h>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace {
@@ -76,20 +78,96 @@ bool mkdirs(const std::string &path) {
     return !ec && fs::is_directory(path, ec) && !ec;
 }
 
-// One directory entry compared case-insensitively against a wanted name.
-struct NameMatch {
-    std::string wanted_lower;
-    std::string found;
-    bool hit;
+// Per-directory case index: the directory's own spellings, built from one
+// os_listdir and kept until the directory's (mtime, inode) changes or something
+// mutates the tree. Resolving a deep asset otherwise listed every directory on
+// every component of every overlay root on every file open, which cost O(entries)
+// per open on the menu/loading path. The inode catches a directory replaced in
+// the same second; explicit invalidation catches a create that leaves the mtime
+// at the same second, which is why every shim mutation clears this too.
+struct DirIndex {
+    int64_t mtime = 0;
+    uint64_t ino = 0;
+    std::vector<std::pair<std::string, std::string>> entries; // (lower, real), directory order
+    std::unordered_map<std::string, std::string> by_lower;    // first spelling wins
 };
-int match_name(const char *name, void *user) {
-    NameMatch *m = (NameMatch *)user;
-    if (lower(name) == m->wanted_lower) {
-        m->found = name;
-        m->hit = true;
-        return 1;
-    }
+std::mutex &dir_index_mutex() {
+    static std::mutex m;
+    return m;
+}
+std::unordered_map<std::string, DirIndex> &dir_index() {
+    static std::unordered_map<std::string, DirIndex> m;
+    return m;
+}
+#ifdef POPM_TESTING
+uint64_t g_dir_index_builds = 0;
+#endif
+
+int collect_index(const char *name, void *user) {
+    DirIndex *d = (DirIndex *)user;
+    std::string l = lower(name);
+    d->by_lower.emplace(l, name); // first spelling wins
+    d->entries.push_back({std::move(l), name});
     return 0;
+}
+// Rebuilds *it (which may be end()) when the directory stat moved, under the
+// caller's lock. Returns false when the directory cannot be listed.
+bool dir_refresh(const std::string &dir, const OsStat &st,
+                 std::unordered_map<std::string, DirIndex>::iterator *it) {
+    auto cur = dir_index().find(dir);
+    if (cur != dir_index().end() && cur->second.mtime == st.mtime && cur->second.ino == st.ino) {
+        *it = cur;
+        return true;
+    }
+    DirIndex fresh;
+    fresh.mtime = st.mtime;
+    fresh.ino = st.ino;
+#ifdef POPM_TESTING
+    ++g_dir_index_builds;
+#endif
+    if (os_listdir(dir.c_str(), collect_index, &fresh) != 0)
+        return false;
+    *it = dir_index().insert_or_assign(dir, std::move(fresh)).first;
+    return true;
+}
+// 1 = listed and the wanted name is present (*real is the directory spelling),
+// 0 = listed but absent, -1 = the directory could not be stat'd or listed.
+int lookup_name(const std::string &dir, const std::string &wanted_lower, std::string *real) {
+    std::lock_guard<std::mutex> lock(dir_index_mutex());
+    OsStat st;
+    if (os_stat(dir.c_str(), &st) != 0 || !st.is_dir)
+        return -1;
+    std::unordered_map<std::string, DirIndex>::iterator it;
+    if (!dir_refresh(dir, st, &it))
+        return -1;
+    auto hit = it->second.by_lower.find(wanted_lower);
+    if (hit == it->second.by_lower.end())
+        return 0;
+    *real = hit->second;
+    return 1;
+}
+// The cached entries of one directory, for a merged overlay listing. False when
+// the directory cannot be stat'd or listed.
+bool list_name_index(const std::string &dir,
+                     std::vector<std::pair<std::string, std::string>> *out) {
+    out->clear();
+    std::lock_guard<std::mutex> lock(dir_index_mutex());
+    OsStat st;
+    if (os_stat(dir.c_str(), &st) != 0 || !st.is_dir)
+        return false;
+    std::unordered_map<std::string, DirIndex>::iterator it;
+    if (!dir_refresh(dir, st, &it))
+        return false;
+    out->assign(it->second.entries.begin(), it->second.entries.end());
+    return true;
+}
+// Drops every index. Called from its own creates and mkdirs, from copy_up's
+// rename, and from win32_invalidate_dir_cache via the registered hook, which is
+// where the kit's file shims already invalidate after create/rename/delete/
+// mkdir/copy.
+void invalidate_name_index() {
+    std::lock_guard<std::mutex> lock(dir_index_mutex());
+    dir_index().clear();
 }
 
 // Mutating walks reject symlinks beneath the configured root: a profile link
@@ -108,12 +186,13 @@ bool resolve_in(const std::string &root, const std::string &rel, bool create, bo
     for (size_t i = 0; i < comps.size(); ++i) {
         std::string name = comps[i];
         // Always use the directory's spelling, even on case-insensitive hosts.
-        NameMatch match{lower(name), std::string(), false};
-        if (os_listdir(host.c_str(), match_name, &match) != 0)
+        std::string found_name;
+        int lk = lookup_name(host, lower(name), &found_name);
+        if (lk < 0)
             return false;
-        if (match.hit)
-            name = match.found;
-        bool found = match.hit;
+        bool found = lk == 1;
+        if (found)
+            name = found_name;
         host += "/" + name;
         if (!found) {
             if (!create)
@@ -124,6 +203,8 @@ bool resolve_in(const std::string &root, const std::string &rel, bool create, bo
             }
             if (os_mkdir(host.c_str()) != 0)
                 return false;
+            // The parent gained an entry; a same-second mtime would hide it.
+            invalidate_name_index();
         }
         if (os_lstat(host.c_str(), &st) != 0)
             return false;
@@ -185,6 +266,9 @@ bool copy_up(const std::string &from, const std::string &to) {
         ok = os_rename(temp.c_str(), to.c_str()) == 0;
     if (!ok)
         os_unlink(temp.c_str());
+    // The destination directory's spelling list changed; the temp create and
+    // rename happen below the thread that may hold an index for it.
+    invalidate_name_index();
     return ok;
 }
 int resolver(const char *relative, int op, char *out, size_t len) {
@@ -204,6 +288,12 @@ void lister(const char *dir, void (*emit)(void *, const char *, const char *), v
 }
 } // namespace
 
+#ifdef POPM_TESTING
+uint64_t mods_cpp_overlay_dir_index_builds() {
+    return g_dir_index_builds;
+}
+#endif
+
 void mods_overlay_reset() {
     std::string dir;
     {
@@ -220,6 +310,7 @@ void mods_overlay_reset() {
     }
     mkdirs(dir);
     win32_set_file_ops(resolver, lister);
+    win32_set_dir_cache_hook(invalidate_name_index);
     win32_invalidate_dir_cache();
 }
 void mods_overlay_set_profile_dir(const char *dir) {
@@ -340,32 +431,22 @@ bool mods_cpp_overlay_resolve(const std::string &rel, int op, std::string *out) 
     *out = target;
     return true;
 }
-namespace {
-// Adds each entry of one root to the merged listing, first spelling wins.
-struct ListCollector {
-    std::unordered_set<std::string> *seen;
-    std::vector<std::pair<std::string, std::string>> *out;
-    std::string host;
-};
-int collect_listing(const char *name, void *user) {
-    ListCollector *c = (ListCollector *)user;
-    if (c->seen->insert(lower(name)).second)
-        c->out->push_back({name, c->host + "/" + name});
-    return 0;
-}
-} // namespace
-
 void mods_cpp_overlay_list(const std::string &rel,
                            std::vector<std::pair<std::string, std::string>> *out) {
     if (!out)
         return;
     std::unordered_set<std::string> seen;
+    std::vector<std::pair<std::string, std::string>> entries;
     for (const auto &root : roots_snapshot()) {
         std::string host;
         if (!resolve_in(root, rel, false, false, &host))
             continue;
-        ListCollector collect{&seen, out, host};
-        os_listdir(host.c_str(), collect_listing, &collect);
+        if (!list_name_index(host, &entries))
+            continue;
+        for (const auto &entry : entries) {
+            if (seen.insert(entry.first).second) // first spelling wins
+                out->push_back({entry.second, host + "/" + entry.second});
+        }
     }
 }
 void mods_fill_overlay_api(PopModApi *api) {

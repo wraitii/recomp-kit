@@ -5891,14 +5891,31 @@ def main():
             fh.write("__attribute__((constructor)) static void %sregister(void)\n"
                      "{\n    recomp_module_register(&%smodule);\n}\n" % (P, P))
         else:
+            # O(1) call-return lookup: a bitset over the addresses' span, built
+            # once at translation time. The binary search this replaces ran on
+            # every guest RET (7.4% self in a windowed profile); the bitset is
+            # one array read. recomp_call_returns stays emitted as the source of
+            # truth the translator's differential test compares the bitset to.
+            if call_returns:
+                cr_min = call_returns[0]
+                cr_words = [0] * (((call_returns[-1] - cr_min) >> 5) + 1)
+                for a in call_returns:
+                    off = a - cr_min
+                    cr_words[off >> 5] |= 1 << (off & 31)
+            else:
+                cr_min, cr_words = 0, [0]
+            fh.write("static const uint32_t recomp_call_return_min = 0x%08xu;\n" % cr_min)
+            fh.write("static const uint32_t recomp_call_return_bits[] = {\n")
+            for w in cr_words:
+                fh.write("    0x%08xu,\n" % w)
+            fh.write("};\n")
             fh.write("""int recomp_is_call_return(uint32_t target)
 {
-    uint32_t lo = 0, hi = recomp_call_return_count;
-    while (lo < hi) {
-        uint32_t mid = lo + (hi - lo) / 2;
-        if (recomp_call_returns[mid] < target) lo = mid + 1; else hi = mid;
-    }
-    return lo < recomp_call_return_count && recomp_call_returns[lo] == target;
+    uint32_t off = target - recomp_call_return_min;
+    if (target < recomp_call_return_min ||
+        off >= (uint32_t)(sizeof recomp_call_return_bits / sizeof recomp_call_return_bits[0]) * 32u)
+        return 0;
+    return (recomp_call_return_bits[off >> 5] >> (off & 31)) & 1u;
 }
 
 const char *recomp_profile_name(uint32_t i) { return i < recomp_func_count ? profile_names[i] : 0; }

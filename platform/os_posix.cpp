@@ -112,6 +112,7 @@ static void fill_stat(const struct stat &st, OsStat *out) {
     out->atime = (int64_t)st.st_atime;
     out->mtime = (int64_t)st.st_mtime;
     out->ctime = (int64_t)st.st_ctime;
+    out->ino = (uint64_t)st.st_ino;
     out->is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
     out->is_regular = S_ISREG(st.st_mode) ? 1 : 0;
     out->is_symlink = S_ISLNK(st.st_mode) ? 1 : 0;

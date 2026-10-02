@@ -121,8 +121,19 @@ int stat_attributes(const wchar_t *path, OsStat *out, bool follow) {
         d.ftLastWriteTime = info.ftLastWriteTime;
         d.nFileSizeHigh = info.nFileSizeHigh;
         d.nFileSizeLow = info.nFileSizeLow;
+        out->ino = ((uint64_t)info.nFileIndexHigh << 32) | info.nFileIndexLow;
         reparse = false;
+        out->size = ((uint64_t)d.nFileSizeHigh << 32) | d.nFileSizeLow;
+        out->atime = filetime_seconds(d.ftLastAccessTime);
+        out->mtime = filetime_seconds(d.ftLastWriteTime);
+        out->ctime = filetime_seconds(d.ftCreationTime);
+        out->is_dir = (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+        out->is_symlink = reparse ? 1 : 0;
+        out->is_regular = (!out->is_dir && !reparse) ? 1 : 0;
+        out->is_readonly = (d.dwFileAttributes & FILE_ATTRIBUTE_READONLY) ? 1 : 0;
+        return 0;
     }
+    out->ino = 0;
     out->size = ((uint64_t)d.nFileSizeHigh << 32) | d.nFileSizeLow;
     out->atime = filetime_seconds(d.ftLastAccessTime);
     out->mtime = filetime_seconds(d.ftLastWriteTime);

@@ -55,6 +55,7 @@ const char *os_plugin_extension(void); // ".dylib", ".so" or ".dll"
 typedef struct OsStat {
     uint64_t size;
     int64_t atime, mtime, ctime; // seconds since the epoch
+    uint64_t ino;                // file/directory identity on this volume; 0 when unavailable
     int is_dir, is_regular, is_symlink, is_readonly;
 } OsStat;
 int os_stat(const char *path, OsStat *out);      // follows symlinks; 0 or -1

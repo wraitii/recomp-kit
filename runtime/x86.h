@@ -162,10 +162,18 @@ static inline void recomp_dirty(uint32_t a, uint32_t n) {
 }
 
 static inline void recomp_watch(uint32_t a, uint32_t n, uint64_t v) {
-    if (g_watch_len != 0 && a < g_watch_base + g_watch_len && g_watch_base < a + n)
-        recomp_watch_hit(a, n, v);
-    if (g_dirty_count != 0)
-        recomp_dirty(a, n);
+    // Both features are disarmed on the ordinary write (the watchpoint is a
+    // diagnostic and a locked DirectDraw surface is rare), so read both once
+    // and test them as one value: one predictable branch instead of two. Arm
+    // and dirty state are set on this same guest thread, so the values read
+    // here are the ones the original two checks would have seen.
+    uint32_t watch = g_watch_len, dirty = g_dirty_count;
+    if ((watch | dirty) != 0) {
+        if (watch != 0 && a < g_watch_base + watch && g_watch_base < a + n)
+            recomp_watch_hit(a, n, v);
+        if (dirty != 0)
+            recomp_dirty(a, n);
+    }
 }
 
 RECOMP_HOT_INLINE void wr8(uint32_t a, uint8_t v) {

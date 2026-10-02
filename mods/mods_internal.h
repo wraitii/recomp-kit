@@ -330,4 +330,9 @@ void mods_run_record_capture_payload(const char *dir);
 bool mods_cpp_overlay_resolve(const std::string &relative, int op, std::string *out_host);
 void mods_cpp_overlay_list(const std::string &relative_dir,
                            std::vector<std::pair<std::string, std::string>> *out);
+#ifdef POPM_TESTING
+// Test seam: how many times the per-directory name index has been rebuilt.
+// A warmed index makes repeated resolutions add nothing.
+uint64_t mods_cpp_overlay_dir_index_builds();
+#endif
 #endif

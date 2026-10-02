@@ -274,8 +274,16 @@ std::vector<std::string> split_path(const std::string &p) {
 
 } // namespace
 
+static void (*g_dir_cache_hook)() = nullptr;
+
+void win32_set_dir_cache_hook(void (*hook)()) {
+    g_dir_cache_hook = hook;
+}
+
 void win32_invalidate_dir_cache() {
     dir_cache().clear();
+    if (g_dir_cache_hook)
+        g_dir_cache_hook();
 }
 
 const std::string &win32_game_dir() {

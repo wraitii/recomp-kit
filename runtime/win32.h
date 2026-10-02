@@ -132,6 +132,12 @@ std::string win32_guest_path(const std::string &host_path);
 // or closed handles and failed position queries; outputs are then unchanged.
 bool win32_file_handle_position(uint32_t handle, std::string *host_path, int64_t *offset);
 void win32_invalidate_dir_cache();
+// An extra invalidation run whenever the directory cache is dropped: the
+// overlay keeps its own per-directory name index and every file shim that
+// mutates the tree (create/rename/delete/mkdir/copy) calls
+// win32_invalidate_dir_cache, so one hook clears both. Set once by
+// mods_overlay_reset; null in an unmodded build.
+void win32_set_dir_cache_hook(void (*hook)());
 
 // The lister reports one (name, host_path) pair per file, already merged and
 // de-duplicated across tiers, so FindFirstFileA can fill metadata from the
