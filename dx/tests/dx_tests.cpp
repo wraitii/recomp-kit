@@ -689,6 +689,7 @@ enum {
     DI_CreateDevice = 3,
     DID_SetProperty = 6,
     DID_Acquire = 7,
+    DID_Unacquire = 8,
     DID_GetDeviceState = 9,
     DID_GetDeviceData = 10,
     DID_SetDataFormat = 11,
@@ -6398,6 +6399,8 @@ static void test_dinput() {
     uint32_t di = rd32(sc(0));
     CHECK(di != 0);
 
+    CHECK(!dinput_host_mouse_acquired());
+
     // The keyboard.
     uint32_t guid = sc(0x40);
     uint8_t kbd[16] = {0x61, 0x2B, 0x1D, 0x6F, 0xA0, 0xD5, 0xCF, 0x11,
@@ -6422,6 +6425,8 @@ static void test_dinput() {
     CHECK_EQ(hr, DI_OK);
     hr = call_method(kb, DID_Acquire, {});
     CHECK_EQ(hr, DI_OK);
+
+    CHECK(!dinput_host_mouse_acquired());
 
     // Two keys down at the host.
     g_input.keys[0x1e] = 0x80; // DIK_A
@@ -6456,6 +6461,8 @@ static void test_dinput() {
     CHECK_EQ(hr, DI_OK);
     hr = call_method(ms, DID_Acquire, {});
     CHECK_EQ(hr, DI_OK);
+
+    CHECK(dinput_host_mouse_acquired());
 
     g_input.mouse_dx = 7;
     g_input.mouse_dy = -3;
@@ -6533,6 +6540,14 @@ static void test_dinput() {
     g_input.mouse_dx = 9;
     call_method(ms, DID_GetDeviceState, {DIMOUSESTATE_SIZE, mstate});
     CHECK_EQ(rd32(mstate + DIMS_OFF_lX), 9); // Later physical motion survives.
+
+    // Eligibility follows acquisition, final release and arena resets.
+    CHECK_EQ(call_method(ms, DID_Unacquire, {}), DI_OK);
+    CHECK(!dinput_host_mouse_acquired());
+    CHECK_EQ(call_method(ms, DID_Acquire, {}), DI_OK);
+    CHECK(dinput_host_mouse_acquired());
+    CHECK_EQ(call_method(ms, 2 /* Release */, {}), 0);
+    CHECK(!dinput_host_mouse_acquired());
 
     // A joystick GUID is refused rather than half-supported.
     for (int i = 0; i < 16; ++i)

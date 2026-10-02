@@ -11,6 +11,8 @@
 #include "dx.h"
 
 #include <mutex>
+#include <atomic>
+#include <set>
 #include "host_api.h"
 #include "../runtime/memory.h"
 #include "../runtime/win32.h"
@@ -66,6 +68,24 @@ const uint32_t DIMOFS_X = 0;
 const uint32_t DIMOFS_Y = 4;
 const uint32_t DIMOFS_Z = 8;
 const uint32_t DIMOFS_BUTTON0 = 12;
+
+// Only the baton holder edits device ownership. The SDL idle pump reads the
+// published count without touching guest memory or the COM registry.
+std::set<uint32_t> g_acquired_mice;
+std::atomic<uint32_t> g_acquired_mouse_count{0};
+void publish_mouse_acquisition(ComObj *d) {
+    if (d->dev_type != DIDEVTYPE_MOUSE)
+        return;
+    if (d->acquired)
+        g_acquired_mice.insert(d->id);
+    else
+        g_acquired_mice.erase(d->id);
+    g_acquired_mouse_count.store(uint32_t(g_acquired_mice.size()));
+}
+void device_destroy(ComObj *d) {
+    d->acquired = false;
+    publish_mouse_acquisition(d);
+}
 
 uint32_t g_scratch = 0, g_scratch_size = 0;
 uint32_t scratch(uint32_t n) {
@@ -371,6 +391,7 @@ void Device_Acquire(X86 *c) {
         return;
     }
     d->acquired = true;
+    publish_mouse_acquisition(d);
     // Acquiring resets the event stream, so the first read after acquisition
     // reports the state now rather than a backlog from before.
     d->events.clear();
@@ -392,6 +413,7 @@ void Device_Unacquire(X86 *c) {
         return;
     }
     d->acquired = false;
+    publish_mouse_acquisition(d);
     d->events.clear();
     com_ret(c, DI_OK);
 }
@@ -1058,6 +1080,10 @@ const ImportShim g_dinput_exports[] = {
 
 } // namespace
 
+extern "C" int dinput_host_mouse_acquired() {
+    return g_acquired_mouse_count.load() != 0;
+}
+
 extern "C" void dinput_discard_mouse_motion(uint32_t device) {
     ComObj *mouse = device ? com_this(device) : nullptr;
     if (!mouse || mouse->kind != K_DIDEVICE || mouse->dev_type != DIDEVTYPE_MOUSE)
@@ -1103,6 +1129,8 @@ void dinput_reset() {
     // handles themselves name kernel objects that no longer exist. Signalling
     // one after a reset would be signalling whatever now has that number.
     g_host_in = HostInput();
+    g_acquired_mice.clear();
+    g_acquired_mouse_count = 0;
     std::lock_guard<std::mutex> lock(g_notify_m);
     g_notify.clear();
 }
@@ -1112,6 +1140,7 @@ void dinput_register() {
     if (done)
         return;
     done = true;
+    com_set_destructor(K_DIDEVICE, device_destroy);
 
     com_define(IF_DINPUT, "DINPUT.dll", "IDirectInputA", g_dinput, std::size(g_dinput));
     com_define(IF_DINPUTDEVICE, "DINPUT.dll", "IDirectInputDeviceA", g_didevice,

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Enable mouse capture for acquired DirectInput mice in D3D windows. Games
+  without a cursor-feedback hook use relative device motion while captured,
+  hiding the OS cursor and retaining movement beyond cursor edges. Release
+  with Ctrl+Alt+M or switch apps; Escape remains available to the game.
+
 - Support opaque Rust CPU storage and mip layouts for the optional D3D8 bridge,
   preserving guest staging and COM identity. Move indexed-draw preparation into
   the renderer with checked arithmetic and correct base-relative index bounds.

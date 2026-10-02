@@ -934,6 +934,37 @@ HitResult host_gate_window_pointer(int32_t x, int32_t y, int32_t *dx, int32_t *d
     return hit;
 }
 
+// Relative devices own their cursor integration and sensitivity. Preserve counts
+// even beyond the cosmetic Win32 cursor's edges; never correct toward the OS.
+bool host_gate_relative_motion(double dx, double dy) {
+    if (!g_captured)
+        return false;
+    auto counts = [](double value, double &remainder) {
+        if (!std::isfinite(value))
+            return int32_t(0);
+        value += remainder;
+        const double nearest = std::round(value);
+        if (std::abs(value - nearest) < 1e-9)
+            value = nearest;
+        const double whole = std::trunc(value);
+        remainder = value - whole;
+        return pixel(whole);
+    };
+    const int32_t mx = counts(dx, g_motion_remainder_x);
+    const int32_t my = counts(dy, g_motion_remainder_y);
+    g_pointer_target_valid = false;
+    const int32_t x =
+        int32_t(std::clamp(int64_t(g_cursor_x) + mx, int64_t(0), int64_t(g_mode_w - 1)));
+    const int32_t y =
+        int32_t(std::clamp(int64_t(g_cursor_y) + my, int64_t(0), int64_t(g_mode_h - 1)));
+    if (host_gate_motion(x, y, mx, my))
+        return false;
+    g_cursor_x = x;
+    g_cursor_y = y;
+    host_input_motion(x, y, mx, my);
+    return true;
+}
+
 bool host_gate_window_motion(int32_t x, int32_t y, double dx, double dy, HitResult *hit) {
     int32_t gx, gy;
     *hit = host_gate_window_pointer(x, y, &gx, &gy);

@@ -121,12 +121,22 @@ responsive if the worker runs longer. Sleeping inside SDL for these short
 handoffs used to add a full slice for every input worker wakeup, causing large
 frame spikes during ordinary pointer movement.
 
-Captured input in fullscreen and borderless uses SDL's window-local mouse
+Games without a configured guest cursor-feedback hook use SDL relative mouse
+mode while captured. Click inside to capture and hide the OS cursor; Ctrl+Alt+M
+(Ctrl+Option+M on macOS) or switching apps releases it. Escape reaches the game.
+Acquiring a DirectInput mouse enables capture for D3D windows as well as
+DirectDraw surfaces. Captured motion preserves device counts and fractional
+remainders without drawable scaling or OS-position feedback, including at the
+edges of the guest cursor. Buttons and wheel use the virtual message cursor
+without injecting extra movement. Live host capture still needs a manual check.
+
+For games with a configured cursor-feedback hook, captured input in fullscreen
+and borderless uses SDL's window-local mouse
 confinement, keeping the accelerated OS cursor four points inside the safe
 content bounds. This avoids desktop hot edges without decoupling the cursor
 or repeatedly warping it. The inset travel range maps onto the whole drawable,
 including its outermost pixels, so camera edge scrolling remains reachable.
-Holding Escape, opening settings or switching apps releases confinement; a
+Ctrl+Alt+M (Ctrl+Option+M on macOS), opening settings or switching apps releases confinement; a
 click in the game captures again. Command-Tab and Command-Q remain available.
 Normal windows retain their resize-edge release gesture. Native cursor and
 window changes run only on the main thread, including worker-queued releases.

@@ -7898,6 +7898,42 @@ static void test_fullscreen_edge_presentation() {
     CHECK_EQ(host_confined_pointer_pixel(5, 0, 0, 0), 0);
 }
 
+// Captured counts must keep flowing at a cosmetic cursor edge, preserve
+// sub-count motion, and ignore OS coordinates/scaling entirely.
+static void test_relative_mouse_counts() {
+    host_gate_reset();
+    host_input_reset();
+    host_pointer_set_mode(640, 480);
+    host_pointer_center();
+    CHECK(!host_gate_relative_motion(10, 20));
+    host_pointer_capture(true);
+    CHECK(host_gate_relative_motion(1000, -1000));
+    HostInputState state;
+    host_input_state(&state);
+    CHECK_EQ(state.mouse_dx, 1000);
+    CHECK_EQ(state.mouse_dy, -1000);
+    CHECK(host_gate_relative_motion(17, -23));
+    host_input_state(&state);
+    CHECK_EQ(state.mouse_dx, 17);
+    CHECK_EQ(state.mouse_dy, -23);
+    int32_t x, y;
+    host_pointer_cursor(&x, &y);
+    CHECK_EQ(x, 639);
+    CHECK_EQ(y, 0);
+    for (int i = 0; i < 10; ++i)
+        CHECK(host_gate_relative_motion(-0.1, 0.1));
+    host_input_state(&state);
+    CHECK_EQ(state.mouse_dx, -1);
+    CHECK_EQ(state.mouse_dy, 1);
+    host_pointer_capture(false);
+    CHECK(!host_gate_relative_motion(30, 40));
+    host_input_state(&state);
+    CHECK_EQ(state.mouse_dx, 0);
+    CHECK_EQ(state.mouse_dy, 0);
+    host_gate_reset();
+    host_input_reset();
+}
+
 static void test_pointer_capture() {
     host_gate_reset();
     host_pointer_set_mode(640, 480);
@@ -9885,6 +9921,7 @@ int main(int argc, char **argv) {
         {"run unfinished", test_run_unfinished},
         {"page draws on a copy", test_page_draws_on_a_copy},
         {"pointer capture", test_pointer_capture},
+        {"relative mouse counts", test_relative_mouse_counts},
         {"T9 hits and drag", test_t9_hits_and_drag},
         {"T9 capture edges cursor", test_t9_snapshot_capture_edges_cursor},
         {"T9 relative and mailbox", test_t9_relative_crossing_and_layout_mailbox},

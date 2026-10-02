@@ -30,6 +30,7 @@
 #include "../launcher/launcher_sdl.h"
 #include "../gpu/gpu_factory.h"
 #include "../input.h"
+#include "../../dx/host_api.h"
 #include "../input_gate.h"
 #include "../input_touch.h"
 #include "../controls/controls_host.h"
@@ -270,7 +271,17 @@ PointRect game_rect_points() {
 // below and applied from pump(), which runs on a thread that holds the baton.
 // ---------------------------------------------------------------------------
 struct PendingInput {
-    enum Kind { MOTION, BUTTON, WHEEL, KEY, MODIFIERS, FOCUS, RELEASE_CAPTURE, PLACE } kind;
+    enum Kind {
+        MOTION,
+        RELATIVE_MOTION,
+        BUTTON,
+        WHEEL,
+        KEY,
+        MODIFIERS,
+        FOCUS,
+        RELEASE_CAPTURE,
+        PLACE
+    } kind;
     int32_t x = 0, y = 0, dz = 0;
     double dx = 0, dy = 0; // Drawable deltas preserve subpixel motion in the queue.
     int drawable_w = 0, drawable_h = 0;
@@ -358,10 +369,15 @@ void deliver_pending_input() {
 // The platform half of pointer capture. The policy and the arithmetic are in
 // input_gate.cpp, where they can be tested without a window; what is left here
 // is what only a window can do: hide and confine the associated system cursor.
-// Window positions remain the motion source in both capture states.
+// Games with an explicit cursor-feedback hook retain window mapping. Other
+// DirectInput games use relative device motion while captured.
 // ---------------------------------------------------------------------------
 bool g_pointer_hidden = false;
-std::atomic<bool> g_escape_held{false};
+bool g_relative_mouse = false;
+// Cursor feedback is explicitly opted in by the game profile. Without it the
+// guest owns its integration and sensitivity; OS positions cannot replace counts.
+constexpr bool kRelativeMouseCapture = RECOMP_HOOK_MOUSE_DEVICE_PTR == 0;
+std::atomic<bool> g_capture_release_held{false};
 std::atomic<bool> g_platform_capture_requested{false};
 void update_platform_pointer_capture();
 
@@ -400,13 +416,11 @@ bool window_fullscreen() {
 bool pointer_capture_wanted() {
     if (!platform_ui_pointer_capture_supported())
         return false;
-    // Nothing to stand in for the system pointer until the guest has a display
-    // surface of its own: while it is still showing plain windows - a launcher,
-    // a settings form - it draws no cursor, so hiding the host one would leave
-    // the player with nothing to aim.
-    if (!ddraw_gdi_primary_active())
+    // DirectDraw owns a game display; other renderers can instead acquire a
+    // DirectInput mouse. Ordinary launcher/settings windows keep the OS cursor.
+    if (!ddraw_gdi_primary_active() && !dinput_host_mouse_acquired())
         return false;
-    if (!g_focused || !g_window || !window_focused() || g_escape_held)
+    if (!g_focused || !g_window || !window_focused() || g_capture_release_held)
         return false;
     if (window_minimized_or_hidden())
         return false;
@@ -418,6 +432,16 @@ bool pointer_capture_wanted() {
 void update_platform_pointer_capture() {
     const bool want = g_platform_capture_requested && pointer_capture_wanted() &&
                       !g_close_requested && !g_fullscreen_transition;
+    const bool relative = want && kRelativeMouseCapture;
+    if (g_window && relative != g_relative_mouse) {
+        if (!SDL_SetWindowRelativeMouseMode(g_window, relative)) {
+            fprintf(stderr, "[host] relative mouse capture failed: %s\n", SDL_GetError());
+            abort();
+        }
+        g_relative_mouse = relative;
+        g_pointer_sample_valid = false;
+        fprintf(stderr, "[host] relative mouse capture: %s\n", relative ? "ON" : "OFF");
+    }
     if (want && !g_pointer_hidden) {
         trace_state("capture ON: hiding the OS cursor");
         SDL_HideCursor();
@@ -434,7 +458,7 @@ void update_platform_pointer_capture() {
     // window's resize edges remain reachable.
     int bw, bh, dw, dh;
     window_sizes(&bw, &bh, &dw, &dh);
-    HostRect rect = host_pointer_confinement_wanted(want, g_window_mode) && g_window
+    HostRect rect = host_pointer_confinement_wanted(want, g_window_mode) && !relative && g_window
                         ? host_pointer_confinement_rect({0, 0, double(bw), double(bh)})
                         : HostRect{};
     if (g_window && (rect.x != g_pointer_confinement.x || rect.y != g_pointer_confinement.y ||
@@ -525,7 +549,7 @@ bool pointer_in_window_points(double *px, double *py) {
 }
 
 void sample_captured_pointer() {
-    if (g_pointer_confinement.empty())
+    if (g_relative_mouse || g_pointer_confinement.empty())
         return;
     double px, py;
     if (!pointer_in_window_points(&px, &py))
@@ -566,6 +590,13 @@ void handle_mouse_move(const SDL_MouseMotionEvent &motion) {
     if (motion.which != SDL_TOUCH_MOUSEID)
         controls::host_pointer_moved(motion.x, motion.y);
     PendingInput e;
+    if (g_relative_mouse) {
+        e.kind = PendingInput::RELATIVE_MOTION;
+        e.dx = motion.xrel;
+        e.dy = motion.yrel;
+        queue_or_apply(e);
+        return;
+    }
     e.kind = PendingInput::MOTION;
     // A pointer resting against a system strip means the edge behind it.
     double strip_top = 0, strip_bottom = 0;
@@ -602,7 +633,14 @@ void apply_button(int button, bool down, int32_t x, int32_t y, bool inside, bool
     // A click inside the window is how the pointer is taken back after it was
     // released - by focus loss, or by the settings page closing.
     int32_t dx, dy;
-    auto hit = host_gate_window_pointer(x, y, &dx, &dy);
+    HitResult hit;
+    if (kRelativeMouseCapture && host_pointer_captured()) {
+        host_pointer_cursor(&hit.gx, &hit.gy);
+        hit.kind = HitResult::HIT_SCENE;
+        dx = dy = 0;
+    } else {
+        hit = host_gate_window_pointer(x, y, &dx, &dy);
+    }
     if (hit.kind == HitResult::HIT_NONE) {
         if (down)
             return;
@@ -612,9 +650,13 @@ void apply_button(int button, bool down, int32_t x, int32_t y, bool inside, bool
         hit.gy = g_cursor_y;
     }
     if (!host_pointer_captured() &&
-        host_pointer_can_capture(pointer_capture_wanted(), inside, down, g_escape_held,
+        host_pointer_can_capture(pointer_capture_wanted(), inside, down, g_capture_release_held,
                                  mods_page_visible() || mods_controls_editing()))
         apply_pointer_capture(true);
+    if (kRelativeMouseCapture && host_pointer_captured()) {
+        host_pointer_cursor(&hit.gx, &hit.gy);
+        dx = dy = 0;
+    }
     x = hit.gx;
     y = hit.gy;
     if (!down && !(g_buttons & ~(1u << button)))
@@ -626,7 +668,7 @@ void apply_button(int button, bool down, int32_t x, int32_t y, bool inside, bool
                 down ? "down" : "up", x, y, int(consumed), int(host_pointer_captured()));
     if (consumed)
         return;
-    if (down)
+    if (down && !kRelativeMouseCapture)
         host_gate_begin_drag(&hit);
     g_cursor_x = x;
     g_cursor_y = y;
@@ -655,8 +697,11 @@ void handle_button(const SDL_MouseButtonEvent &event, int button, bool down) {
     int bw, bh, dw, dh;
     window_sizes(&bw, &bh, &dw, &dh);
     e.inside = event.x >= 0 && event.y >= 0 && event.x < bw && event.y < bh;
-    e.edge = window_has_resize_edges() && host_pointer_at_resize_edge(event.x, event.y, bw, bh, 8);
+    e.edge = !g_relative_mouse && window_has_resize_edges() &&
+             host_pointer_at_resize_edge(event.x, event.y, bw, bh, 8);
     view_point_to_drawable(event.x, event.y, &e.x, &e.y, &e.drawable_w, &e.drawable_h);
+    if (g_relative_mouse)
+        e.inside = true;
     queue_or_apply(e);
 }
 
@@ -667,7 +712,14 @@ void apply_wheel(int32_t dz, int32_t x, int32_t y) {
     if (host_gate_wheel(dz))
         return;
     int32_t dx, dy;
-    auto hit = host_gate_window_pointer(x, y, &dx, &dy);
+    HitResult hit;
+    if (kRelativeMouseCapture && host_pointer_captured()) {
+        host_pointer_cursor(&hit.gx, &hit.gy);
+        hit.kind = HitResult::HIT_SCENE;
+        dx = dy = 0;
+    } else {
+        hit = host_gate_window_pointer(x, y, &dx, &dy);
+    }
     if (hit.kind == HitResult::HIT_NONE)
         return;
     x = hit.gx;
@@ -701,8 +753,10 @@ void handle_key(const SDL_KeyboardEvent &event, bool down) {
         queue_or_apply(e);
         return;
     }
-    if (event.scancode == SDL_SCANCODE_ESCAPE) {
-        g_escape_held = down;
+    const bool release_chord = event.scancode == SDL_SCANCODE_M && (event.mod & SDL_KMOD_CTRL) &&
+                               (event.mod & SDL_KMOD_ALT);
+    if (event.scancode == SDL_SCANCODE_M && ((down && release_chord) || g_capture_release_held)) {
+        g_capture_release_held = down;
         if (down) {
             // Release before queuing guest input: it must work even while the
             // scheduler cannot grant the guest baton.
@@ -712,6 +766,7 @@ void handle_key(const SDL_KeyboardEvent &event, bool down) {
             release.kind = PendingInput::RELEASE_CAPTURE;
             queue_or_apply(release);
         }
+        return; // Reserve both edges of the host release chord, never Escape.
     }
     const uint16_t key = host_keycode_from_scancode(event.scancode);
     if (key == 0xffff)
@@ -752,6 +807,12 @@ void apply_input(const PendingInput &e) {
     switch (e.kind) {
     case PendingInput::MOTION:
         apply_motion(e.x, e.y, e.dx, e.dy);
+        break;
+    case PendingInput::RELATIVE_MOTION:
+        if (host_gate_relative_motion(e.dx, e.dy)) {
+            host_pointer_cursor(&g_cursor_x, &g_cursor_y);
+            post(WM_MOUSEMOVE_, mouse_wparam(), make_lparam(g_cursor_x, g_cursor_y));
+        }
         break;
     case PendingInput::BUTTON:
         apply_button(e.button, e.down, e.x, e.y, e.inside, e.edge);
@@ -996,12 +1057,8 @@ bool handle_editor_event(const SDL_Event &event) {
         controls::host_editor_text(event.text.text);
         return true;
     case SDL_EVENT_KEY_UP:
-        // No key-up is ever swallowed, Escape's included: a key the player was
-        // holding when the editor opened has to be released to the game, and
-        // Escape also has host state behind it (g_escape_held, the pointer
-        // capture) that only its key-up clears. The editor takes key presses
-        // alone, so an Escape release with no press it knows about is the one
-        // the game and the host both still need.
+        // A key held when the editor opened must still release to the game.
+        // The host capture-release chord also needs its key-up below.
         return false;
     case SDL_EVENT_KEY_DOWN:
         if (event.key.scancode == SDL_SCANCODE_ESCAPE)
@@ -1103,7 +1160,7 @@ void handle_event(const SDL_Event &event) {
         trace_state("focus LOST");
         g_platform_capture_requested = false;
         update_platform_pointer_capture();
-        g_escape_held = false;
+        g_capture_release_held = false;
         touch_release_all();
         note_focus(false);
         break;
@@ -1884,8 +1941,8 @@ int main(int argc, char **argv) {
     D3DRenderer::setShared(renderer);
     host_present_set_device(g_gpu.get());
 
-    fprintf(stderr, "Mouse capture: click inside to capture; hold Escape to release; drag to "
-                    "the window edge to resize.\n");
+    fprintf(stderr,
+            "Mouse capture: click inside to capture; Ctrl+Alt+M or switch apps to release.\n");
     mods_display_live_defaults();
     mods_display_default_overlay(platform_ui_default_overlay());
     mods_display_load_modes(classic_modes_path().c_str());

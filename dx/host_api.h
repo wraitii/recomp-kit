@@ -557,6 +557,9 @@ typedef struct
 uint32_t host_frame_draw_count(HostFrameHandle f);
 const HostD3DDrawSnapshot *host_frame_draw(HostFrameHandle f, uint32_t i);
 
+// Thread-safe host capture eligibility; no guest/COM access in the idle pump.
+int dinput_host_mouse_acquired(void);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
