@@ -143,6 +143,7 @@ enum ComIface : uint16_t {
     IF_D3D8,
     IF_D3D8DEVICE,
     IF_D3D8SURFACE8,
+    IF_D3D8TEXTURE8,
     IF_COUNT
 };
 
@@ -212,7 +213,8 @@ enum ComKind : uint16_t {
     K_D3D9QUERY,      // an occlusion or event query
     K_D3D8,           // the IDirect3D8 factory object
     K_D3D8DEVICE,     // one host wgpu device
-    K_D3D8SURFACE,    // a render target / back buffer view
+    K_D3D8SURFACE,    // a render target / back buffer view, or one texture level
+    K_D3D8TEXTURE,    // a 2D texture and its mip levels
 };
 
 // A DirectInput joystick axis's DIPROP_RANGE, DIPROP_DEADZONE and
@@ -383,10 +385,20 @@ struct ComObj {
     void *d3d8_device = nullptr; // D3d8Device* from the Rust ABI
     uint32_t d3d8_width = 0, d3d8_height = 0, d3d8_format = 0;
     uint32_t d3d8_factory = 0; // K_D3D8DEVICE: its IDirect3D8 object id
-    uint32_t d3d8_owner = 0;   // K_D3D8SURFACE: the retained device object id
+    uint32_t d3d8_owner = 0;   // K_D3D8SURFACE/K_D3D8TEXTURE: retained device object id
     // Weak cache of the externally held implicit backbuffer surface. The
     // surface holds its device alive; the device must not retain it in return.
     uint32_t d3d8_backbuffer = 0;
+    // --- K_D3D8TEXTURE
+    uint32_t d3d8_level_count = 0;
+    uint32_t d3d8_usage = 0;           // D3DUSAGE the texture was created with
+    uint32_t d3d8_pool = 0;            // D3DPOOL the texture was created with
+    uint32_t d3d8_lod = 0;             // most detailed mip the texture may use
+    uint32_t d3d8_priority = 0;        // eviction priority; no eviction happens here
+    std::vector<uint32_t> d3d8_levels; // K_D3D8SURFACE id per mip level
+    // --- K_D3D8SURFACE texture levels (the implicit backbuffer leaves these 0)
+    uint32_t d3d8_texture = 0; // owning K_D3D8TEXTURE id
+    uint32_t d3d8_level = 0;   // which mip level of that texture
 };
 
 // One vtable slot.

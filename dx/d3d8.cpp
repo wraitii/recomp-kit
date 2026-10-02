@@ -37,6 +37,16 @@ constexpr uint32_t D8FMT_D24S8 = 75;
 constexpr uint32_t D8FMT_D24X8 = 77;
 constexpr uint32_t D8FMT_D32 = 71;
 
+// D3DUSAGE / D3DRESOURCETYPE / D3DPOOL bits the texture path reasons about.
+constexpr uint32_t D8USAGE_RENDERTARGET = 0x1;
+constexpr uint32_t D8USAGE_DEPTHSTENCIL = 0x2;
+constexpr uint32_t D8_RTYPE_SURFACE = 1;
+constexpr uint32_t D8_RTYPE_VOLUMETEXTURE = 2;
+constexpr uint32_t D8_RTYPE_TEXTURE = 3;
+constexpr uint32_t D8_RTYPE_CUBETEXTURE = 4;
+constexpr uint32_t D8_TYPE_SURFACE = 1;
+constexpr uint32_t D8_TYPE_TEXTURE = 3;
+
 constexpr uint32_t D8_CLEAR_ZBUFFER = 0x2;
 constexpr uint32_t D8_CLEAR_STENCIL = 0x4;
 constexpr uint32_t D8_RS_ZENABLE = 7;
@@ -49,7 +59,53 @@ constexpr uint32_t D8_RS_ZWRITEENABLE = 14;
 // wgpu query.
 constexpr uint32_t D8_AVAILABLE_TEXTURE_MEM = 384u * 1024u * 1024u;
 
+constexpr uint32_t D8FMT_A8R8G8B8 = 21;
+constexpr uint32_t D8FMT_R5G6B5 = 23;
 constexpr uint32_t D8FMT_X8R8G8B8 = 0x16;
+
+// Bytes per pixel for the uncompressed D3D8 formats the bridge can hold in
+// system memory. 0 marks a format the shim does not represent (compressed DXT
+// blocks, depth, mixed signed formats and the like). The value is the true
+// D3D8 texel pitch unit: a R5G6B5 level of width w has pitch 2*w, and the
+// bytes the guest reads and writes through LockRect are in that native
+// layout. The host renderer only samples the 32-bit ARGB formats; a level in
+// any other format is still an honest CPU texture and is refused by name when
+// something tries to give it to the device (SetTexture is unsupported).
+//
+// Format numbers follow the pinned Wine D3D8 headers
+// (graphics/d3d8-wgpu/reference/wine/d3d8types.h).
+uint32_t d8_format_bytes(uint32_t fmt) {
+    switch (fmt) {
+    case D8FMT_A8R8G8B8:
+    case D8FMT_X8R8G8B8:
+        return 4;
+    case D8FMT_R5G6B5:
+    case 24: // X1R5G5B5
+    case 25: // A1R5G5B5
+    case 26: // A4R4G4B4
+    case 29: // A8R3G3B2
+    case 30: // X4R4G4B4
+    case 40: // A8P8
+    case 51: // A8L8
+        return 2;
+    case 27: // R3G3B2
+    case 28: // A8
+    case 41: // P8
+    case 50: // L8
+    case 52: // A4L4
+        return 1;
+    case 31: // A2B10G10R10
+    case 32: // A8B8G8R8
+    case 33: // X8B8G8R8
+    case 34: // G16R16
+    case 35: // A2R10G10B10
+        return 4;
+    case 36: // A16B16G16R16
+        return 8;
+    default:
+        return 0;
+    }
+}
 
 #define D8_IID(a, b, c, d0, d1, d2, d3, d4, d5, d6, d7)                                            \
     {(uint8_t)((a) & 0xff),                                                                        \
@@ -75,6 +131,8 @@ static const uint8_t IID_IDirect3DDevice8_[16] =
     D8_IID(0x7385e5df, 0x8fe8, 0x41d5, 0x86, 0xb6, 0xd7, 0xb4, 0x85, 0x47, 0xb6, 0xcf);
 static const uint8_t IID_IDirect3DSurface8_[16] =
     D8_IID(0xb96eebca, 0xb326, 0x4ea5, 0x88, 0x2f, 0x2f, 0xf5, 0xba, 0xe0, 0x21, 0xdd);
+static const uint8_t IID_IDirect3DTexture8_[16] =
+    D8_IID(0xe4cdd575, 0x2866, 0x4f01, 0xb1, 0x2e, 0x7e, 0xec, 0xe1, 0xec, 0x93, 0x58);
 
 // ---------------------------------------------------------------------------
 // Adapter facts. d3d8_adapter_info builds a wgpu context, so query it once.
@@ -121,6 +179,9 @@ ComObj *d8_this(X86 *c) {
 }
 ComObj *d8_dev(X86 *c) {
     return com_this_arg(c, IF_D3D8DEVICE);
+}
+ComObj *d8_tex(X86 *c) {
+    return com_this_arg(c, IF_D3D8TEXTURE8);
 }
 
 #ifdef RECOMP_D3D8_WGPU
@@ -187,7 +248,21 @@ bool adapter_type(X86 *c) {
     return arg(c, 1) == 0 && arg(c, 2) == D8_DEVTYPE_HAL && ensure_adapter();
 }
 bool color_format(uint32_t format) {
-    return format == 21 || format == 22;
+    return format == D8FMT_A8R8G8B8 || format == D8FMT_X8R8G8B8;
+}
+
+// True when CheckDeviceFormat should answer D3D_OK for a usage/rtype/format
+// triple. Kept separate so the texture tests can exercise the policy without
+// a device. Depth-stencil is not implemented, and the host renderer only
+// samples 32-bit ARGB.
+bool check_device_format_ok(uint32_t usage, uint32_t rtype, uint32_t fmt) {
+    if (usage & D8USAGE_DEPTHSTENCIL)
+        return false;
+    if (usage & D8USAGE_RENDERTARGET)
+        return (rtype == D8_RTYPE_TEXTURE || rtype == D8_RTYPE_SURFACE) && color_format(fmt);
+    if (rtype == D8_RTYPE_TEXTURE)
+        return d8_format_bytes(fmt) != 0;
+    return false;
 }
 
 void write_display_mode(uint32_t addr, const DisplayMode &m) {
@@ -289,10 +364,23 @@ void D8_CheckDeviceType(X86 *c) {
     com_ret(c, ok);
 }
 void D8_CheckDeviceFormat(X86 *c) {
-    com_ret(c, adapter_type(c) && arg(c, 3) == 22 && arg(c, 4) == 1 && arg(c, 5) == 1 &&
-                       color_format(arg(c, 6))
-                   ? D8_OK
-                   : D8_ERR_NOTAVAILABLE);
+    // (Adapter, DeviceType, AdapterFormat, Usage, RType, CheckFormat). The
+    // adapter format is the host's presentation format, so only X8R8G8B8 is
+    // backed. A render-target or depth-stencil use needs host storage: only
+    // the 32-bit ARGB color formats can be a render target, and depth is not
+    // implemented. A plain texture use is answerable for any format the shim
+    // can hold in system memory (a SYSTEMMEM texture is CPU bytes); the host
+    // refuses to sample a non-ARGB format by name if one is ever bound.
+    uint32_t usage = arg(c, 4), rtype = arg(c, 5), fmt = arg(c, 6);
+    bool ok = false;
+    if (adapter_type(c) && arg(c, 3) == D8FMT_X8R8G8B8) {
+        if (check_device_format_ok(usage, rtype, fmt))
+            ok = true;
+    }
+    LOGV("d3d8: CheckDeviceFormat(adapter %u, type %u, adapterfmt 0x%x, usage 0x%x, rtype %u, "
+         "fmt 0x%x) -> %s",
+         arg(c, 1), arg(c, 2), arg(c, 3), usage, rtype, fmt, ok ? "OK" : "NOTAVAILABLE");
+    com_ret(c, ok ? D8_OK : D8_ERR_NOTAVAILABLE);
 }
 void D8_CheckDeviceMultiSampleType(X86 *c) {
     com_ret(c, adapter_type(c) && color_format(arg(c, 3)) && arg(c, 4) && !arg(c, 5)
@@ -627,26 +715,192 @@ void Dev_GetBackBuffer(X86 *c) {
     com_ret(c, D8_OK);
 }
 
-// IDirect3DSurface8 derives directly from IUnknown, not IDirect3DResource8.
-// Its descriptor is eight guest DWORDs; in particular Size precedes the
-// multisample field (unlike D3D9). This view owns no pixel allocation: its
-// storage remains the device's real host backbuffer.
-void Surface_GetDesc(X86 *c) {
-    ComObj *surface = com_this_arg(c, IF_D3D8SURFACE8);
-    ComObj *dev = surface ? com_get(surface->d3d8_owner) : nullptr;
-    uint32_t out = arg(c, 1);
-    if (!dev || !out || !gm_valid(out, 32)) {
+// (this, Width, Height, Levels, Usage, Format, Pool, ppTexture). Every level
+// is a real, separately sized CPU surface; usage that needs the device
+// (render target or depth stencil) is not implemented and stops by name.
+void Dev_CreateTexture(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t w = arg(c, 1), h = arg(c, 2), levels = arg(c, 3);
+    uint32_t usage = arg(c, 4), format = arg(c, 5), pool = arg(c, 6), out = arg(c, 7);
+    if (!out || !gm_valid(out, 4)) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    wr32(out + 0, dev->d3d8_format);
-    wr32(out + 4, 1);  // D3DRTYPE_SURFACE
-    wr32(out + 8, 1);  // D3DUSAGE_RENDERTARGET
-    wr32(out + 12, 0); // D3DPOOL_DEFAULT
-    wr32(out + 16, dev->d3d8_width * dev->d3d8_height * 4);
+    wr32(out, 0);
+    uint32_t bpp = d8_format_bytes(format);
+    if (!dev || !w || !h || w > 16384 || h > 16384) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    if (!bpp) {
+        LOGW("d3d8: CreateTexture format 0x%x is not representable", format);
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    if (usage & (D8USAGE_RENDERTARGET | D8USAGE_DEPTHSTENCIL)) {
+        LOGW("d3d8: CreateTexture usage 0x%x needs device storage, which is not implemented",
+             usage);
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    if (!levels) {
+        levels = 1;
+        for (uint32_t d = (w > h ? w : h); d > 1; d >>= 1)
+            ++levels;
+    }
+    if (levels > 16)
+        levels = 16;
+    ComObj *tex = com_new(K_D3D8TEXTURE);
+    if (!tex) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    tex->d3d8_owner = dev->id;
+    com_addref(dev);
+    tex->rmask = format;
+    tex->d3d8_usage = usage;
+    tex->d3d8_pool = pool;
+    tex->d3d8_level_count = levels;
+    tex->d3d8_lod = 0;
+    for (uint32_t l = 0; l < levels; ++l) {
+        uint32_t lw = w >> l, lh = h >> l;
+        if (!lw)
+            lw = 1;
+        if (!lh)
+            lh = 1;
+        uint64_t bytes = uint64_t(lw) * bpp * lh;
+        ComObj *level = com_new(K_D3D8SURFACE);
+        if (!level || bytes > GUEST_SIZE) {
+            if (level)
+                com_release(level);
+            com_release(tex);
+            com_ret(c, E_OUTOFMEMORY);
+            return;
+        }
+        level->d3d8_owner = dev->id;
+        com_addref(dev);
+        level->d3d8_texture = tex->id;
+        level->d3d8_level = l;
+        level->rmask = format;
+        level->d3d8_usage = usage;
+        level->d3d8_pool = pool;
+        level->width = lw;
+        level->height = lh;
+        level->bpp = bpp * 8;
+        level->pitch = lw * bpp;
+        level->blob.assign((size_t)bytes, 0);
+        level->pixels_bytes = (uint32_t)bytes;
+        // The initial reference is the texture's ownership of the level.
+        tex->d3d8_levels.push_back(level->id);
+    }
+    uint32_t view = com_view(tex, IF_D3D8TEXTURE8);
+    if (!view) {
+        com_release(tex);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    LOGV("d3d8: CreateTexture %ux%u levels=%u fmt=0x%x pool=%u -> %08x into %08x", w, h, levels,
+         format, pool, view, out);
+    wr32(out, view);
+    com_ret(c, D8_OK);
+}
+
+// (this, pSourceTexture, pDestinationTexture). D3D8 requires the source and
+// destination formats to match (the runtime rejects a mismatch with
+// D3DERR_INVALIDCALL). Both textures here are CPU-backed, so an update is a
+// per-level copy; it is the system-memory texture content the guest will
+// later lock or hand to the device.
+void Dev_UpdateTexture(X86 *c) {
+    ComObj *src = com_this(arg(c, 1), IF_D3D8TEXTURE8);
+    ComObj *dst = com_this(arg(c, 2), IF_D3D8TEXTURE8);
+    if (!src || !dst || src->kind != K_D3D8TEXTURE || dst->kind != K_D3D8TEXTURE || src == dst) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    if (src->rmask != dst->rmask) {
+        LOGW("d3d8: UpdateTexture format mismatch 0x%x -> 0x%x", src->rmask, dst->rmask);
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    size_t levels = std::min(src->d3d8_levels.size(), dst->d3d8_levels.size());
+    for (size_t l = 0; l < levels; ++l) {
+        ComObj *s = com_get(src->d3d8_levels[l]);
+        ComObj *d = com_get(dst->d3d8_levels[l]);
+        if (!s || !d) {
+            com_ret(c, D8_ERR_INVALIDCALL);
+            return;
+        }
+        uint32_t rows = std::min(s->height, d->height);
+        uint32_t bytes = std::min(s->pitch, d->pitch);
+        for (uint32_t y = 0; y < rows; ++y)
+            memcpy(d->blob.data() + size_t(y) * d->pitch, s->blob.data() + size_t(y) * s->pitch,
+                   bytes);
+    }
+    com_ret(c, D8_OK);
+}
+// LockRect hands the guest a heap copy; UnlockRect copies it back and frees
+// it. The guest pointer is never stored in a host field beyond the lock.
+static uint32_t d8_stage_lock(ComObj *o) {
+    if (!o || o->blob.empty())
+        return 0;
+    if (o->lock_count++ == 0) {
+        o->pixels = heap_alloc((uint32_t)o->blob.size(), false, 16);
+        if (!o->pixels) {
+            o->lock_count = 0;
+            return 0;
+        }
+        memcpy(gm_ptr(o->pixels), o->blob.data(), o->blob.size());
+    }
+    return o->pixels;
+}
+static void d8_stage_unlock(ComObj *o) {
+    if (!o || o->lock_count <= 0)
+        return;
+    if (--o->lock_count == 0 && o->pixels) {
+        memcpy(o->blob.data(), gm_ptr(o->pixels), o->blob.size());
+        heap_free(o->pixels);
+        o->pixels = 0;
+    }
+}
+
+// A texture level is one K_D3D8SURFACE; the implicit backbuffer has no blob
+// and leaves d3d8_texture zero. The level's own bytes back its lock.
+void Surface_GetDesc(X86 *c) {
+    ComObj *surface = com_this_arg(c, IF_D3D8SURFACE8);
+    uint32_t out = arg(c, 1);
+    if (!surface || !out || !gm_valid(out, 32)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    uint32_t format, usage, pool, size, width, height;
+    if (surface->d3d8_texture) {
+        format = surface->rmask;
+        usage = surface->d3d8_usage;
+        pool = surface->d3d8_pool;
+        width = surface->width;
+        height = surface->height;
+        size = surface->pitch * surface->height;
+    } else {
+        ComObj *dev = com_get(surface->d3d8_owner);
+        if (!dev) {
+            com_ret(c, D8_ERR_INVALIDCALL);
+            return;
+        }
+        format = dev->d3d8_format;
+        usage = D8USAGE_RENDERTARGET;
+        pool = 0; // D3DPOOL_DEFAULT
+        width = dev->d3d8_width;
+        height = dev->d3d8_height;
+        size = width * height * 4;
+    }
+    wr32(out + 0, format);
+    wr32(out + 4, D8_TYPE_SURFACE);
+    wr32(out + 8, usage);
+    wr32(out + 12, pool);
+    wr32(out + 16, size);
     wr32(out + 20, 0); // D3DMULTISAMPLE_NONE
-    wr32(out + 24, dev->d3d8_width);
-    wr32(out + 28, dev->d3d8_height);
+    wr32(out + 24, width);
+    wr32(out + 28, height);
     com_ret(c, D8_OK);
 }
 
@@ -673,7 +927,177 @@ void Surface_GetDevice(X86 *c) {
     com_ret(c, D8_OK);
 }
 
+// A texture level can be locked through its surface view; the implicit
+// backbuffer cannot (its bytes belong to the host render target, not the
+// shim), so that stops by name rather than returning a pointer into host
+// memory.
+void Surface_LockRect(X86 *c) {
+    ComObj *surface = com_this_arg(c, IF_D3D8SURFACE8);
+    uint32_t out = arg(c, 1);
+    if (!surface || !out || !gm_valid(out, 8)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    if (!surface->d3d8_texture) {
+        fprintf(stderr, "d3d8: IDirect3DSurface8::LockRect on a host render target is not "
+                        "implemented\n");
+        fflush(stderr);
+        imports_unsupported(c);
+    }
+    uint32_t staged = d8_stage_lock(surface);
+    wr32(out, surface->pitch);
+    wr32(out + 4, staged);
+    com_ret(c, staged ? D8_OK : E_OUTOFMEMORY);
+}
+void Surface_UnlockRect(X86 *c) {
+    d8_stage_unlock(com_this_arg(c, IF_D3D8SURFACE8));
+    com_ret(c, D8_OK);
+}
+
+// ---------------------------------------------------------------------------
+// IDirect3DTexture8: a 2D texture and its mip levels. The levels are real,
+// separately sized CPU surfaces; LockRect stages through the guest heap. No
+// host texture is created here, so a SYSTEMMEM (or any pool) texture is
+// backed by the bytes the guest writes, not by a hidden GPU copy.
+// ---------------------------------------------------------------------------
+static ComObj *texture_level(ComObj *tex, uint32_t level) {
+    if (!tex || tex->kind != K_D3D8TEXTURE || level >= tex->d3d8_levels.size())
+        return nullptr;
+    return com_get(tex->d3d8_levels[level]);
+}
+
+void Tex_GetDevice(X86 *c) {
+    ComObj *tex = d8_tex(c);
+    ComObj *dev = tex ? com_get(tex->d3d8_owner) : nullptr;
+    uint32_t out = arg(c, 1);
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, 0);
+    if (!dev) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    uint32_t view = com_view(dev, IF_D3D8DEVICE);
+    if (!view) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    com_addref(dev);
+    wr32(out, view);
+    com_ret(c, D8_OK);
+}
+void Tex_SetPriority(X86 *c) {
+    ComObj *tex = d8_tex(c);
+    uint32_t old = tex ? tex->d3d8_priority : 0;
+    if (tex)
+        tex->d3d8_priority = arg(c, 1);
+    com_ret(c, old);
+}
+void Tex_GetPriority(X86 *c) {
+    ComObj *tex = d8_tex(c);
+    com_ret(c, tex ? tex->d3d8_priority : 0);
+}
+void Tex_PreLoad(X86 *c) {
+    // No host copy exists until a draw binds the texture, so there is nothing
+    // to preload. The call is harmless and returns success as the real API.
+    com_ret(c, D8_OK);
+}
+void Tex_GetType(X86 *c) {
+    com_ret(c, D8_TYPE_TEXTURE);
+}
+void Tex_SetLOD(X86 *c) {
+    ComObj *tex = d8_tex(c);
+    uint32_t old = tex ? tex->d3d8_lod : 0;
+    if (tex)
+        tex->d3d8_lod = arg(c, 1);
+    com_ret(c, old);
+}
+void Tex_GetLOD(X86 *c) {
+    ComObj *tex = d8_tex(c);
+    com_ret(c, tex ? tex->d3d8_lod : 0);
+}
+void Tex_GetLevelCount(X86 *c) {
+    ComObj *tex = d8_tex(c);
+    com_ret(c, tex ? tex->d3d8_level_count : 0);
+}
+void Tex_GetLevelDesc(X86 *c) {
+    ComObj *tex = d8_tex(c);
+    ComObj *level = texture_level(tex, arg(c, 1));
+    uint32_t out = arg(c, 2);
+    if (!level || !out || !gm_valid(out, 32)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    wr32(out + 0, level->rmask);
+    wr32(out + 4, D8_TYPE_SURFACE);
+    wr32(out + 8, level->d3d8_usage);
+    wr32(out + 12, level->d3d8_pool);
+    wr32(out + 16, level->pitch * level->height);
+    wr32(out + 20, 0); // D3DMULTISAMPLE_NONE
+    wr32(out + 24, level->width);
+    wr32(out + 28, level->height);
+    com_ret(c, D8_OK);
+}
+void Tex_GetSurfaceLevel(X86 *c) {
+    ComObj *tex = d8_tex(c);
+    ComObj *level = texture_level(tex, arg(c, 1));
+    uint32_t out = arg(c, 2);
+    if (!level || !out || !gm_valid(out, 4)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    com_addref(level);
+    uint32_t view = com_view(level, IF_D3D8SURFACE8);
+    if (!view) {
+        com_release(level);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    wr32(out, view);
+    com_ret(c, D8_OK);
+}
+void Tex_LockRect(X86 *c) {
+    ComObj *level = texture_level(d8_tex(c), arg(c, 1));
+    uint32_t out = arg(c, 2);
+    if (!level || !out || !gm_valid(out, 8)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    uint32_t staged = d8_stage_lock(level);
+    wr32(out, level->pitch);
+    wr32(out + 4, staged);
+    com_ret(c, staged ? D8_OK : E_OUTOFMEMORY);
+}
+void Tex_UnlockRect(X86 *c) {
+    d8_stage_unlock(texture_level(d8_tex(c), arg(c, 1)));
+    com_ret(c, D8_OK);
+}
+void Tex_AddDirtyRect(X86 *c) {
+    // A hint that a rectangle changed. Nothing is uploaded yet, so there is
+    // no GPU copy to mark; the level bytes are already the current contents.
+    (void)c;
+    com_ret(c, D8_OK);
+}
+
+void texture_destroy(ComObj *tex) {
+    for (uint32_t sid : tex->d3d8_levels) {
+        ComObj *level = com_get(sid);
+        if (level)
+            com_release(level); // the texture's own level reference
+    }
+    tex->d3d8_levels.clear();
+    if (ComObj *dev = com_get(tex->d3d8_owner))
+        com_release(dev);
+    tex->d3d8_owner = 0;
+}
+
 void surface_destroy(ComObj *surface) {
+    if (surface->pixels)
+        heap_free(surface->pixels);
+    surface->pixels = 0;
+    surface->blob.clear();
     ComObj *dev = com_get(surface->d3d8_owner);
     if (dev) {
         if (dev->d3d8_backbuffer == surface->id)
@@ -681,6 +1105,7 @@ void surface_destroy(ComObj *surface) {
         com_release(dev);
     }
     surface->d3d8_owner = 0;
+    surface->d3d8_texture = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -698,8 +1123,33 @@ static const ComMethod g_surface8[] = {
     {"FreePrivateData", 2, imports_unsupported},
     {"GetContainer", 3, imports_unsupported},
     {"GetDesc", 2, Surface_GetDesc},
-    {"LockRect", 4, imports_unsupported},
-    {"UnlockRect", 1, imports_unsupported},
+    {"LockRect", 4, Surface_LockRect},
+    {"UnlockRect", 1, Surface_UnlockRect},
+};
+
+// --- IDirect3DTexture8 table. The order is the D3D8 ABI: IUnknown, then
+// IDirect3DResource8 (GetDevice..GetType), IDirect3DBaseTexture8
+// (SetLOD..GetLevelCount), then the texture methods. ---
+static const ComMethod g_texture8[] = {
+    {"QueryInterface", 3, com_QueryInterface},
+    {"AddRef", 1, com_AddRef},
+    {"Release", 1, com_Release},
+    {"GetDevice", 2, Tex_GetDevice},
+    {"SetPrivateData", 5, imports_unsupported},
+    {"GetPrivateData", 4, imports_unsupported},
+    {"FreePrivateData", 2, imports_unsupported},
+    {"SetPriority", 2, Tex_SetPriority},
+    {"GetPriority", 1, Tex_GetPriority},
+    {"PreLoad", 1, Tex_PreLoad},
+    {"GetType", 1, Tex_GetType},
+    {"SetLOD", 2, Tex_SetLOD},
+    {"GetLOD", 1, Tex_GetLOD},
+    {"GetLevelCount", 1, Tex_GetLevelCount},
+    {"GetLevelDesc", 3, Tex_GetLevelDesc},
+    {"GetSurfaceLevel", 3, Tex_GetSurfaceLevel},
+    {"LockRect", 5, Tex_LockRect},
+    {"UnlockRect", 2, Tex_UnlockRect},
+    {"AddDirtyRect", 2, Tex_AddDirtyRect},
 };
 
 // --- IDirect3D8 table ---
@@ -744,7 +1194,7 @@ static const ComMethod g_device8[] = {
     {"GetRasterStatus", 2, imports_unsupported},
     {"SetGammaRamp", 3, imports_unsupported},
     {"GetGammaRamp", 2, imports_unsupported},
-    {"CreateTexture", 8, imports_unsupported},
+    {"CreateTexture", 8, Dev_CreateTexture},
     {"CreateVolumeTexture", 9, imports_unsupported},
     {"CreateCubeTexture", 7, imports_unsupported},
     {"CreateVertexBuffer", 6, imports_unsupported},
@@ -753,7 +1203,7 @@ static const ComMethod g_device8[] = {
     {"CreateDepthStencilSurface", 6, imports_unsupported},
     {"CreateImageSurface", 5, imports_unsupported},
     {"CopyRects", 6, imports_unsupported},
-    {"UpdateTexture", 3, imports_unsupported},
+    {"UpdateTexture", 3, Dev_UpdateTexture},
     {"GetFrontBuffer", 2, imports_unsupported},
     {"SetRenderTarget", 3, imports_unsupported},
     {"GetRenderTarget", 2, imports_unsupported},
@@ -868,13 +1318,17 @@ void d3d8_register() {
     com_define(IF_D3D8, "d3d8.dll", "IDirect3D8", g_d3d8, std::size(g_d3d8));
     com_define(IF_D3D8DEVICE, "d3d8.dll", "IDirect3DDevice8", g_device8, std::size(g_device8));
     com_define(IF_D3D8SURFACE8, "d3d8.dll", "IDirect3DSurface8", g_surface8, std::size(g_surface8));
+    com_define(IF_D3D8TEXTURE8, "d3d8.dll", "IDirect3DTexture8", g_texture8, std::size(g_texture8));
     com_bind(IF_D3D8, K_D3D8);
     com_bind(IF_D3D8DEVICE, K_D3D8DEVICE);
     com_bind(IF_D3D8SURFACE8, K_D3D8SURFACE);
+    com_bind(IF_D3D8TEXTURE8, K_D3D8TEXTURE);
     com_register_iid(IF_D3D8, IID_IDirect3D8_);
     com_register_iid(IF_D3D8DEVICE, IID_IDirect3DDevice8_);
     com_register_iid(IF_D3D8SURFACE8, IID_IDirect3DSurface8_);
+    com_register_iid(IF_D3D8TEXTURE8, IID_IDirect3DTexture8_);
     com_set_destructor(K_D3D8SURFACE, surface_destroy);
+    com_set_destructor(K_D3D8TEXTURE, texture_destroy);
     com_set_destructor(K_D3D8DEVICE, device_destroy);
     imports_register(g_d3d8_exports, std::size(g_d3d8_exports));
 }

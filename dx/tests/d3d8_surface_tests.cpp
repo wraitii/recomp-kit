@@ -97,6 +97,120 @@ static void test_backbuffer(uint32_t format) {
     check(!com_get(factory_id), "device destruction releases factory");
 }
 
+// Creates a device object with the fields CreateTexture reads. No renderer is
+// involved: a system-memory texture is CPU bytes.
+static ComObj *make_test_device(uint32_t w, uint32_t h, uint32_t format) {
+    ComObj *dev = com_new(K_D3D8DEVICE);
+    dev->d3d8_width = w;
+    dev->d3d8_height = h;
+    dev->d3d8_format = format;
+    return dev;
+}
+
+static void test_texture() {
+    cpu_reset();
+    ComObj *dev = make_test_device(8, 4, 22);
+    uint32_t device = com_view(dev, IF_D3D8DEVICE);
+
+    // The startup call: 1x1, 1 level, R5G6B5, SYSTEMMEM.
+    wr32(sc(0), 0xfeedface);
+    check(call_method(device, 20, {1, 1, 1, 0, 23, 2, sc(0)}) == 0, "CreateTexture succeeds");
+    uint32_t tex = rd32(sc(0));
+    check(tex != 0, "CreateTexture writes a real interface");
+    ComObj *t = com_this(tex, IF_D3D8TEXTURE8);
+    check(t && t->kind == K_D3D8TEXTURE, "texture view has its own COM identity");
+    if (!t)
+        return;
+    check(t->d3d8_level_count == 1, "one level requested is one level created");
+
+    // Every slot carries the real D3D8 arity, including unsupported methods.
+    const uint8_t arities[] = {3, 1, 1, 2, 5, 4, 2, 2, 1, 1, 1, 2, 1, 1, 3, 3, 5, 2, 2};
+    for (uint32_t slot = 0; slot < sizeof(arities); ++slot)
+        check(imports_argc(rd32(rd32(tex) + 4 * slot)) == arities[slot],
+              "texture vtable slot arity");
+
+    check(call_method(tex, 10, {}) == 3, "GetType reports D3DRTYPE_TEXTURE");
+    check(call_method(tex, 13, {}) == 1, "GetLevelCount is one");
+    check(call_method(tex, 11, {4}) == 0 && call_method(tex, 12, {}) == 4,
+          "SetLOD returns the old LOD and GetLOD reads the new one");
+
+    check(call_method(tex, 14, {0, sc(32)}) == 0, "GetLevelDesc succeeds");
+    check(rd32(sc(32)) == 23 && rd32(sc(36)) == 1 && rd32(sc(44)) == 2 && rd32(sc(56)) == 1 &&
+              rd32(sc(60)) == 1,
+          "level 0 descriptor is 1x1 R5G6B5 with pitch 2");
+    check(call_method(tex, 14, {1, sc(32)}) == 0x8876086c, "out-of-range level is rejected");
+    check(call_method(tex, 14, {0, 0}) == 0x8876086c, "null level descriptor is rejected");
+
+    // LockRect returns a guest heap pointer in the format's own layout.
+    check(call_method(tex, 16, {0, sc(8), 0, 0}) == 0, "LockRect succeeds");
+    uint32_t pitch = rd32(sc(8)), ptr = rd32(sc(12));
+    check(pitch == 2 && ptr != 0, "LockRect returns pitch 2 and a guest pointer");
+    wr16(ptr, 0xf81f);
+    check(call_method(tex, 17, {0}) == 0, "UnlockRect succeeds");
+    check(call_method(tex, 16, {0, sc(8), 0, 0}) == 0 && rd16(rd32(sc(12))) == 0xf81f,
+          "unlocked texel bytes survive to the next lock");
+    call_method(tex, 17, {0});
+
+    // A level surface shares the texture's staging.
+    check(call_method(tex, 15, {0, sc(16)}) == 0 && rd32(sc(16)) != 0,
+          "GetSurfaceLevel returns a surface view");
+    uint32_t surf = rd32(sc(16));
+    check(call_method(surf, 8, {sc(64)}) == 0 && rd32(sc(64)) == 23 && rd32(sc(88)) == 1 &&
+              rd32(sc(92)) == 1,
+          "level surface descriptor matches the level");
+    check(call_method(surf, 9, {sc(8), 0, 0}) == 0 && rd32(sc(8)) == 2 &&
+              rd16(rd32(sc(12))) == 0xf81f,
+          "surface LockRect shares the level bytes");
+    call_method(surf, 10);
+    call_method(surf, 2);
+    check(call_method(tex, 3, {sc(20)}) == 0 && rd32(sc(20)) == device,
+          "texture GetDevice returns the owning device");
+    call_method(device, 2); // release the GetDevice reference
+    check(call_method(tex, 2) == 0, "last texture reference destroys it");
+    check(!t->alive, "texture object is gone");
+
+    // Levels = 0 asks for the full chain, halving each side to 1x1.
+    cpu_reset();
+    ComObj *dev2 = make_test_device(8, 4, 22);
+    uint32_t device2 = com_view(dev2, IF_D3D8DEVICE);
+    check(call_method(device2, 20, {8, 4, 0, 0, 21, 2, sc(0)}) == 0,
+          "CreateTexture with levels=0 succeeds");
+    uint32_t tex2 = rd32(sc(0));
+    ComObj *t2 = com_this(tex2, IF_D3D8TEXTURE8);
+    check(t2 && t2->d3d8_level_count == 4, "8x4 generates four levels");
+    check(call_method(tex2, 14, {1, sc(32)}) == 0 && rd32(sc(56)) == 4 && rd32(sc(60)) == 2,
+          "level 1 is 4x2");
+    check(call_method(tex2, 14, {3, sc(32)}) == 0 && rd32(sc(56)) == 1 && rd32(sc(60)) == 1,
+          "level 3 is 1x1");
+    call_method(tex2, 2);
+
+    // UpdateTexture copies every level between two CPU-backed textures of the
+    // same format, and rejects a format mismatch as D3D8 does.
+    check(call_method(device2, 20, {1, 1, 1, 0, 23, 2, sc(0)}) == 0, "CreateTexture source");
+    uint32_t src_tex = rd32(sc(0));
+    check(call_method(device2, 20, {1, 1, 1, 0, 23, 0, sc(0)}) == 0, "CreateTexture destination");
+    uint32_t dst_tex = rd32(sc(0));
+    check(call_method(src_tex, 16, {0, sc(8), 0, 0}) == 0, "lock source");
+    wr16(rd32(sc(12)), 0x07e0);
+    call_method(src_tex, 17, {0});
+    check(call_method(device2, 29, {src_tex, dst_tex}) == 0, "UpdateTexture succeeds");
+    check(call_method(dst_tex, 16, {0, sc(8), 0, 0}) == 0 && rd16(rd32(sc(12))) == 0x07e0,
+          "UpdateTexture copied the level bytes");
+    call_method(dst_tex, 17, {0});
+    check(call_method(device2, 29, {src_tex, src_tex}) == 0x8876086c,
+          "UpdateTexture rejects source == destination");
+    call_method(src_tex, 2);
+    call_method(dst_tex, 2);
+
+    // An unrepresentable format fails without fabricating a texture.
+    wr32(sc(0), 0xfeedface);
+    check(call_method(device2, 20, {4, 4, 1, 0, 0x31545844, 2, sc(0)}) == 0x8876086c,
+          "an unrepresentable texture format is rejected");
+    check(rd32(sc(0)) == 0, "failed CreateTexture clears the output pointer");
+    call_method(device2, 2);
+    check(dev2->refs == 0, "all texture references release the device");
+}
+
 int main(int argc, char **argv) {
     mem_init();
     imports_init();
@@ -114,7 +228,8 @@ int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--unsupported-texture") == 0) {
         cpu_reset();
         ComObj *dev = com_new(K_D3D8DEVICE);
-        call_method(com_view(dev, IF_D3D8DEVICE), 20, {16, 16, 1, 0, 21, 0, sc(0)});
+        // CreateVolumeTexture is still unsupported; the probe must abort by name.
+        call_method(com_view(dev, IF_D3D8DEVICE), 21, {4, 4, 4, 1, 0, 21, 2, sc(0)});
         return 1;
     }
     cpu_reset();
@@ -133,6 +248,7 @@ int main(int argc, char **argv) {
     call_method(factory, 2);
     test_backbuffer(21); // A8R8G8B8
     test_backbuffer(22); // X8R8G8B8
+    test_texture();
     // Reset follows the runtime's generation order: old guest heap first,
     // then module state and COM vtables. No stale weak cache may survive.
     mem_init();
