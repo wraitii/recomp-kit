@@ -293,6 +293,58 @@ static void test_texture() {
     check(dev2->refs == 0, "all texture references release the device");
 }
 
+// D3DUSAGE_RENDERTARGET textures are CPU-backed: create, lock/update and
+// sample exactly like a normal texture. They are not bindable by
+// SetRenderTarget, which must abort by name rather than keep the backbuffer
+// bound while returning OK (see --unsupported-rendertarget-texture).
+static void test_render_target_texture() {
+    cpu_reset();
+    ComObj *dev = make_test_device(256, 256, 22);
+    uint32_t device = com_view(dev, IF_D3D8DEVICE);
+
+    check(call_method(device, 20, {256, 256, 1, 1, 22, 0, sc(0)}) == 0,
+          "CreateTexture with D3DUSAGE_RENDERTARGET succeeds");
+    uint32_t tex = rd32(sc(0));
+    ComObj *t = tex ? com_this(tex, IF_D3D8TEXTURE8) : nullptr;
+    check(t && t->d3d8_usage == 1 && t->d3d8_pool == 0,
+          "render-target texture records usage and DEFAULT pool");
+    if (!t)
+        return;
+    check(t->d3d8_level_count == 1, "render-target texture has one level");
+    ComObj *level = com_get(t->d3d8_levels[0]);
+    check(level && level->d3d8_usage == 1 && level->d3d8_texture == t->id,
+          "level keeps the render-target usage and texture owner");
+    check(call_method(tex, 14, {0, sc(32)}) == 0 && rd32(sc(32)) == 22 && rd32(sc(40)) == 1 &&
+              rd32(sc(56)) == 256 && rd32(sc(60)) == 256,
+          "level descriptor reports the render-target usage and size");
+
+    // CPU storage and the normal staged lock path still work.
+    check(call_method(tex, 16, {0, sc(8), 0, 0}) == 0, "render-target level LockRect succeeds");
+    uint32_t pitch = rd32(sc(8)), ptr = rd32(sc(12));
+    check(pitch == 256 * 4 && ptr != 0, "render-target level lock returns its pitch and bytes");
+    wr32(ptr, 0x80112233);
+    check(call_method(tex, 17, {0}) == 0, "render-target UnlockRect succeeds");
+    check(call_method(tex, 16, {0, sc(8), 0, 0}) == 0 && rd32(rd32(sc(12))) == 0x80112233,
+          "unlocked render-target bytes survive to the next lock");
+    call_method(tex, 17, {0});
+
+    // Sampling stays on the same bind path as a normal texture.
+    check(call_method(device, 61, {0, tex}) == 0, "SetTexture accepts a render-target texture");
+    check(dev->d3d8_bound_texture[0] == t->id, "render-target texture is bound on the device");
+    check(call_method(tex, 15, {0, sc(16)}) == 0 && rd32(sc(16)) != 0,
+          "GetSurfaceLevel returns the render-target level surface");
+    call_method(rd32(sc(16)), 2);
+    call_method(device, 61, {0, 0});
+
+    // DEPTHSTENCIL is still refused without fabricating a texture.
+    wr32(sc(0), 0xfeedface);
+    check(call_method(device, 20, {256, 256, 1, 2, 22, 0, sc(0)}) == 0x8876086c,
+          "CreateTexture D3DUSAGE_DEPTHSTENCIL is rejected");
+    check(rd32(sc(0)) == 0, "failed depth-stencil CreateTexture clears the output");
+    check(call_method(tex, 2) == 0, "release the render-target texture");
+    call_method(device, 2);
+}
+
 // The autodepth handle path. Fixtures carry the depth fields CreateDevice
 // would set; the actual depth bytes live in the Rust target and are exercised
 // by the headless replay, not here.
@@ -518,6 +570,20 @@ int main(int argc, char **argv) {
         call_method(com_view(dev, IF_D3D8DEVICE), 31, {com_view(depth, IF_D3D8SURFACE8), 0});
         return 1;
     }
+    if (argc == 2 && strcmp(argv[1], "--unsupported-rendertarget-texture") == 0) {
+        cpu_reset();
+        ComObj *dev = make_test_device(256, 256, 22);
+        uint32_t device = com_view(dev, IF_D3D8DEVICE);
+        // A CPU-backed D3DUSAGE_RENDERTARGET texture level has a matching owner
+        // and is not a depth surface, so the identity check must reject it by
+        // name rather than return OK with the backbuffer still bound.
+        check(call_method(device, 20, {256, 256, 1, 1, 22, 0, sc(0)}) == 0,
+              "probe: create render-target texture");
+        uint32_t tex = rd32(sc(0));
+        check(call_method(tex, 15, {0, sc(4)}) == 0, "probe: GetSurfaceLevel");
+        call_method(device, 31, {rd32(sc(4)), 0});
+        return 1;
+    }
     if (argc == 2 && strcmp(argv[1], "--unsupported-texture") == 0) {
         cpu_reset();
         ComObj *dev = com_new(K_D3D8DEVICE);
@@ -542,6 +608,7 @@ int main(int argc, char **argv) {
     test_backbuffer(21); // A8R8G8B8
     test_backbuffer(22); // X8R8G8B8
     test_texture();
+    test_render_target_texture();
     test_bind_texture();
     test_caps();
     test_depth();

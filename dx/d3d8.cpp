@@ -1019,13 +1019,18 @@ void Dev_GetDepthStencilSurface(X86 *c) {
 // (this, pRenderTarget, pDepthStencilSurface). The backend owns exactly one
 // render target, the implicit backbuffer, with its autodepth attachment. A
 // request for any other target is unimplemented and stops by name rather than
-// silently drawing to the wrong surface.
+// silently drawing to the wrong surface. The identity check explicitly compares
+// against the backbuffer id: a texture level surface (including a
+// D3DUSAGE_RENDERTARGET texture, which is CPU-backed here) has a matching owner
+// and is not a depth surface, so without the id check it would previously fall
+// through and return D8_OK while the renderer kept drawing to the backbuffer.
 void Dev_SetRenderTarget(X86 *c) {
     ComObj *dev = d8_dev(c);
     uint32_t rt_arg = arg(c, 1), ds_arg = arg(c, 2);
     ComObj *rt = rt_arg ? com_this(rt_arg, IF_D3D8SURFACE8) : nullptr;
     ComObj *ds = ds_arg ? com_this(ds_arg, IF_D3D8SURFACE8) : nullptr;
-    if (!dev || !rt_arg || !rt || rt->d3d8_depth || rt->d3d8_owner != dev->id) {
+    if (!dev || !rt_arg || !rt || rt->d3d8_depth || rt->d3d8_owner != dev->id ||
+        rt->id != dev->d3d8_backbuffer) {
         fprintf(stderr, "d3d8: SetRenderTarget only supports this device's implicit backbuffer\n");
         fflush(stderr);
         imports_unsupported(c);
@@ -1046,8 +1051,9 @@ void Dev_SetRenderTarget(X86 *c) {
 }
 
 // (this, Width, Height, Levels, Usage, Format, Pool, ppTexture). Every level
-// is a real, separately sized CPU surface; usage that needs the device
-// (render target or depth stencil) is not implemented and stops by name.
+// is a real, separately sized CPU surface. D3DUSAGE_RENDERTARGET is accepted and
+// kept CPU-backed (see the DIVERGENCE below); D3DUSAGE_DEPTHSTENCIL still stops
+// by name because no depth texture path exists.
 void Dev_CreateTexture(X86 *c) {
     ComObj *dev = d8_dev(c);
     uint32_t w = arg(c, 1), h = arg(c, 2), levels = arg(c, 3);
@@ -1067,8 +1073,9 @@ void Dev_CreateTexture(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if (usage & (D8USAGE_RENDERTARGET | D8USAGE_DEPTHSTENCIL)) {
-        LOGW("d3d8: CreateTexture usage 0x%x needs device storage, which is not implemented",
+    if (usage & D8USAGE_DEPTHSTENCIL) {
+        LOGW("d3d8: CreateTexture usage 0x%x needs device depth-stencil storage, which is not "
+             "implemented",
              usage);
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
@@ -1090,6 +1097,18 @@ void Dev_CreateTexture(X86 *c) {
     if (levels > 16)
         levels = 16;
 #endif
+    // DIVERGENCE(original): D3DUSAGE_RENDERTARGET normally asks for device
+    // storage that SetRenderTarget can bind. No reachable guest path in this
+    // binary SetRenderTargets onto one of these textures (the effect textures
+    // are only created, LockRect'd, UpdateTexture'd and sampled), so they stay
+    // in the same guest-addressable CPU storage as a normal texture and use the
+    // normal upload-on-bind path. If a guest SetRenderTarget onto an RT texture
+    // is evidenced later, replace this with real device storage rather than
+    // widening the divergence.
+    if (usage & D8USAGE_RENDERTARGET) {
+        LOGW("d3d8: CreateTexture RT %ux%u levels=%u fmt=0x%x pool=%u usage=0x%x is CPU-backed", w,
+             h, levels, format, pool, usage);
+    }
     ComObj *tex = com_new(K_D3D8TEXTURE);
     if (!tex) {
         com_ret(c, E_OUTOFMEMORY);
