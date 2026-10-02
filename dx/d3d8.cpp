@@ -1220,6 +1220,8 @@ void Dev_UpdateTexture(X86 *c) {
 #else
         memcpy(storage_data(d), storage_data(s), s->pixels_bytes);
 #endif
+        // The destination texture's sampled content changed.
+        ++d->d3d8_content_generation;
     }
     com_ret(c, D8_OK);
 }
@@ -1245,6 +1247,10 @@ static void d8_stage_unlock(ComObj *o) {
         memcpy(storage_data(o), gm_ptr(o->pixels), o->pixels_bytes);
         heap_free(o->pixels);
         o->pixels = 0;
+        // The level's bytes now differ from any resident GPU copy. A nested
+        // lock (count > 1) writes through the same staged block and is still
+        // open, so the draw path is told `dirty` instead of trusting this.
+        ++o->d3d8_content_generation;
     }
 }
 
@@ -1509,6 +1515,14 @@ void Tex_AddDirtyRect(X86 *c) {
 }
 
 void texture_destroy(ComObj *tex) {
+#ifdef RECOMP_D3D8_WGPU
+    // Drop the resident GPU upload(s) with the guest object; the identity is
+    // never reused, so this cannot stale a later texture.
+    if (ComObj *dev = com_get(tex->d3d8_owner)) {
+        if (dev->d3d8_device)
+            d3d8_device_release_texture(host_device(dev), tex->id);
+    }
+#endif
     for (uint32_t sid : tex->d3d8_levels) {
         ComObj *level = com_get(sid);
         if (level)
@@ -1866,10 +1880,16 @@ bool d8_sync_texture(X86 *c, ComObj *dev, uint32_t stage) {
     int32_t status;
     if (tex && level) {
         const uint8_t *data = d8_buffer_bytes(level);
-        status = d3d8_device_set_texture(host_device(dev), stage, tex->rmask, level->width,
-                                         level->height, data, data ? level->pixels_bytes : 0, &err);
+        // A lock still open at draw time means the guest may be writing the
+        // staged bytes; force an upload instead of trusting the generation.
+        uint32_t dirty = level->lock_count > 0 ? 1u : 0u;
+        status =
+            d3d8_device_set_texture(host_device(dev), stage, tex->id, level->d3d8_level,
+                                    level->d3d8_content_generation, dirty, tex->rmask, level->width,
+                                    level->height, data, data ? level->pixels_bytes : 0, &err);
     } else {
-        status = d3d8_device_set_texture(host_device(dev), stage, 0, 0, 0, nullptr, 0, &err);
+        status =
+            d3d8_device_set_texture(host_device(dev), stage, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, &err);
     }
     if (status != D3D8_STATUS_OK) {
         com_ret(c, host_result(c, status, err));

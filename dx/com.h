@@ -410,7 +410,13 @@ struct ComObj {
     // --- K_D3D8SURFACE texture levels (the implicit backbuffer leaves these 0)
     uint32_t d3d8_texture = 0; // owning K_D3D8TEXTURE id
     uint32_t d3d8_level = 0;   // which mip level of that texture
-    bool d3d8_depth = false;   // this surface is the implicit depth/stencil buffer
+    // Bumped on every write path that changes the bytes a draw would sample
+    // (UnlockRect write-back, UpdateTexture into this level). The Rust upload
+    // cache uses it to skip converting/uploading unchanged content. A lock
+    // still open at draw time is passed to the device as `dirty` instead, so
+    // bytes written through the staged pointer are never assumed unchanged.
+    uint64_t d3d8_content_generation = 0;
+    bool d3d8_depth = false; // this surface is the implicit depth/stencil buffer
     // --- K_D3D8VERTEXBUFFER/K_D3D8INDEXBUFFER
     // Contents live in `blob` (host memory); a Lock stages them into guest heap
     // through `pixels`/`pixels_bytes`/`lock_count`, exactly as the D3D9 path
