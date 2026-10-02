@@ -19,6 +19,26 @@ STRINGS = (("id", "RECOMP_GAME_ID"), ("name", "RECOMP_GAME_NAME"), ("app_name", 
 ADDRESSES = (("image_base", "RECOMP_IMAGE_BASE"), ("entry_point", "RECOMP_ENTRY_POINT"),
              ("heap_base", "RECOMP_HEAP_BASE"))
 
+# Optional [hooks] the runtime, dx and hosts reference unconditionally. A game
+# that does not hook one still has to compile, so absence renders a value that
+# disables the feature rather than leaving the macro undefined. Zero names no
+# real guest address and a one-entry cursor list pointing at address zero has
+# no live surface to find, so both are safely inert. Hooks a game deliberately
+# leaves out for compile-time guards (sprites) are not here: those stay
+# undefined so `#ifdef RECOMP_HOOK_SPRITES_COUNT` keeps working.
+HOOK_DEFAULTS = {
+    "frame_clock_begin": 0,
+    "frame_clock_wait": 0,
+    "frame_clock_wait_clamp": 0,
+    "frame_clock_clamp_deadline": 0,
+    "frame_clock_wait_deadline": 0,
+    "cursor_surface_ptrs": [0],
+    "mouse_vtable": 0,
+    "mouse_device_ptr": 0,
+    "mouse_device_right": 0,
+    "camera": 0,
+}
+
 
 def c_string(value):
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -92,7 +112,9 @@ def render_header(cfg):
     lines.append("#define RECOMP_LAUNCHER_MIN_FREE_MB %du" % launcher["min_free_mb"])
     lines.append("#define RECOMP_REQUIRED_DIRS %s" % c_string_list(cfg["setup"]["required_dirs"]))
     lines.append("#define RECOMP_BUNDLE_EXCLUDE %s" % c_string_list(cfg["bundle"]["exclude"]))
-    for key, value in sorted(cfg.get("hooks", {}).items()):
+    hooks = dict(HOOK_DEFAULTS)
+    hooks.update(cfg.get("hooks", {}))
+    for key, value in sorted(hooks.items()):
         macro = "RECOMP_HOOK_" + key.upper()
         if isinstance(value, list):
             lines.append("#define %s_COUNT %d" % (macro, len(value)))

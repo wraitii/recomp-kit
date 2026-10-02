@@ -25,6 +25,10 @@ struct ImportShim {
     void (*fn)(X86 *); // nullptr => logging-only stub returning EAX = 0
 };
 
+// Explicit unsupported handler: dispatch logs the import name and aborts.
+// Use it when only the ABI is known; no guest result is fabricated.
+void imports_unsupported(X86 *c);
+
 // Registers a shim table. Later registrations override earlier ones for the
 // same (dll, name); a null fn never overrides a non-null one.
 void imports_register(const ImportShim *shims, size_t count);

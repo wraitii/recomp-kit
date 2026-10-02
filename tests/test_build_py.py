@@ -115,6 +115,81 @@ class BuildPyTests(unittest.TestCase):
             self.assertTrue((Path(tmp) / "aux-dfx").is_dir())
             self.assertIn("translate-dfx-report.json", aux_cmd[aux_cmd.index("--report") + 1])
 
+    def test_sync_tree_rewrites_only_changed_files(self):
+        import tempfile
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = Path(tmp) / "src", Path(tmp) / "dst"
+            (src / "sub").mkdir(parents=True)
+            (dst / "sub").mkdir(parents=True)
+            (src / "keep.c").write_text("same")
+            (src / "sub/change.c").write_text("new")
+            (dst / "keep.c").write_text("same")
+            (dst / "sub/change.c").write_text("old")
+            (dst / "stale.c").write_text("gone")
+            time.sleep(0.01)
+            before = (dst / "keep.c").stat().st_mtime_ns
+            build_py.sync_tree(src, dst)
+            self.assertEqual((dst / "keep.c").stat().st_mtime_ns, before,
+                             "an identical file keeps its mtime so ninja skips it")
+            self.assertEqual((dst / "sub/change.c").read_text(), "new")
+            self.assertFalse((dst / "stale.c").exists(), "a dropped file is removed")
+
+    def test_translation_fingerprint_tracks_listings_and_args(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            listings = game / "listings"
+            (listings / "functions").mkdir(parents=True)
+            (game / "globals.toml").write_text("")
+            (listings / "functions.tsv").write_text("address\tname\tbytes\n00401000\tF\t1\n")
+            (listings / "functions" / "00401000.asm").write_text("00401000  RET\n")
+            cfg = {"game": {"sha256": "abc"}, "translate": {}, "listings_path": listings,
+                   "aux_modules": []}
+            base = build_py.translation_fingerprint(game, cfg, {})
+            self.assertEqual(base, build_py.translation_fingerprint(game, cfg, {}))
+            self.assertNotEqual(base, build_py.translation_fingerprint(game, cfg, {"forget": "00401000"}))
+            os.utime(listings / "functions" / "00401000.asm", (1, 1))
+            self.assertNotEqual(base, build_py.translation_fingerprint(game, cfg, {}),
+                                "a changed listing invalidates the stamp")
+
+    def test_fingerprint_tracks_discovered_file_contents(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            discovered = game / "discovered.txt"
+            discovered.write_text("00401000\n")
+            cfg = {"game": {"sha256": "abc"}, "translate": {},
+                   "listings_path": game, "aux_modules": []}
+            args = {"discovered": discovered}
+            before = build_py.translation_fingerprint(game, cfg, args)
+            discovered.write_text("00401000\n00402000\n")
+            self.assertNotEqual(before, build_py.translation_fingerprint(game, cfg, args))
+            discovered.unlink()
+            with self.assertRaises(FileNotFoundError):
+                build_py.translation_fingerprint(game, cfg, args)
+
+    def test_fingerprint_tracks_auxiliary_listings(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            aux = game / "aux"
+            (aux / "functions").mkdir(parents=True)
+            cfg = {"game": {"sha256": "abc"}, "translate": {}, "listings_path": game,
+                   "aux_modules": [{"key": "dll", "listings_path": aux}]}
+            before = build_py.translation_fingerprint(game, cfg, {})
+            listing = aux / "functions/00401000.asm"
+            listing.write_text("RET\n")
+            added = build_py.translation_fingerprint(game, cfg, {})
+            self.assertNotEqual(before, added)
+            listing.write_text("NOP\nRET\n")
+            edited = build_py.translation_fingerprint(game, cfg, {})
+            self.assertNotEqual(added, edited)
+            (aux / "functions.tsv").write_text("00401000\tEntry\n")
+            self.assertNotEqual(edited, build_py.translation_fingerprint(game, cfg, {}))
+            listing.unlink()
+            self.assertNotEqual(edited, build_py.translation_fingerprint(game, cfg, {}))
+
     def test_pick_device_prefers_the_single_paired_ipad(self):
         devices = [
             {"identifier": "A", "hardwareProperties": {"productType": "iPhone16,1"},

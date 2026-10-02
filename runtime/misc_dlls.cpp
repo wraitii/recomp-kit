@@ -285,6 +285,11 @@ const ImportShim shims[] = {
     {"SHELL32.dll", "SHAppBarMessage", 2, zero},
     {"SHELL32.dll", "ShellExecuteW", 6, zero},
     {"URLMON.dll", "URLDownloadToFileW", 5, nullptr},
+    // Symbol APIs have known ABIs but remain unsupported.
+    {"DBGHELP.dll", "SymGetOptions", 0, imports_unsupported},
+    {"DBGHELP.dll", "SymSetOptions", 1, imports_unsupported},
+    {"DBGHELP.dll", "SymInitialize", 3, imports_unsupported},
+    {"DBGHELP.dll", "SymCleanup", 1, imports_unsupported},
 };
 } // namespace
 void misc_dlls_register() {

@@ -17,6 +17,12 @@ void sched_checkpoint();
 #include <string>
 #include <algorithm>
 
+// Registered unsupported APIs retain their arity for observers and diagnostics,
+// but execution must stop until a real implementation is available.
+void imports_unsupported(X86 *) {
+    abort();
+}
+
 namespace {
 
 struct Tramp {
@@ -461,6 +467,8 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     if (skip) {
         // The observer refused the call and has set the result itself.
     } else if (fn) {
+        if (fn == imports_unsupported)
+            fprintf(stderr, "unsupported import %s\n", desc);
         fn(c);
     } else {
         log_once(desc, "unimplemented import %s: returning 0", desc);

@@ -1413,12 +1413,9 @@ void u_MessageBoxW(X86 *c) {
     set_eax(c, answer);
 }
 
-// wvsprintfA: the Win32 subset (%s %c %d %i %u %x %X %% with width/precision
-// and the l/h size prefixes). `va` points at the guest argument array.
-void u_wvsprintfA(X86 *c) {
-    uint32_t out = arg(c, 0);
-    std::string fmt = gm_str(arg(c, 1), 4096);
-    uint32_t va = arg(c, 2);
+// The Win32 format subset (%s %c %d %i %u %x %X %% with width/precision and
+// the l/h size prefixes). `va` points at the guest argument array.
+static void format_into(X86 *c, uint32_t out, const std::string &fmt, uint32_t va) {
     std::string res;
     size_t i = 0;
     while (i < fmt.size()) {
@@ -1488,6 +1485,16 @@ void u_wvsprintfA(X86 *c) {
     if (out)
         memcpy(g_mem + out, res.c_str(), res.size() + 1);
     set_eax(c, (uint32_t)res.size());
+}
+
+void u_wvsprintfA(X86 *c) {
+    format_into(c, arg(c, 0), gm_str(arg(c, 1), 4096), arg(c, 2));
+}
+
+// wsprintfA is the cdecl varargs twin: after its two fixed arguments the
+// values themselves begin at ESP+12, not a va_list pointer.
+void u_wsprintfA(X86 *c) {
+    format_into(c, arg(c, 0), gm_str(arg(c, 1), 4096), c->r[R_ESP] + 12);
 }
 
 } // namespace user32
@@ -1723,6 +1730,8 @@ const ImportShim g_user32_shims[] = {
     {"USER32.dll", "EndPaint", 2, u_EndPaint},
     {"USER32.dll", "LoadIconA", 2, u_LoadIconA},
     {"USER32.dll", "LoadCursorA", 2, u_LoadCursorA},
+    // ABI known; image loading remains unsupported.
+    {"USER32.dll", "LoadImageA", 6, imports_unsupported},
     {"USER32.dll", "ValidateRect", 2, u_ValidateRect},
     {"USER32.dll", "GetUpdateRect", 3, u_GetUpdateRect},
     {"USER32.dll", "GetScrollBarInfo", 3, nullptr},
@@ -1743,6 +1752,8 @@ const ImportShim g_user32_shims[] = {
     {"USER32.dll", "MessageBoxA", 4, u_MessageBoxA},
     {"USER32.dll", "MessageBoxW", 4, u_MessageBoxW},
     {"USER32.dll", "wvsprintfA", 3, u_wvsprintfA},
+    // Variadic and therefore cdecl: the caller cleans the stack.
+    {"USER32.dll", "wsprintfA", ARGC_CDECL, u_wsprintfA},
     // Not imported by D3DPopTB.exe, but registered so GetProcAddress and the
     // host layer can reach them.
     {"USER32.dll", "SendMessageA", 4, u_SendMessageA},

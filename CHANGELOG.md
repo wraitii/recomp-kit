@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Preserve unchanged generated source timestamps and skip translation only when
+  its inputs are unchanged, including discovery file contents and auxiliary listings.
+- Supply disabled defaults for optional runtime hooks and implement `wsprintfA`.
+  Correct undersized current-directory probes and extension-less wildcard matches.
+- Register known arities for unsupported file-time, message, processor-feature,
+  image-loading and symbol APIs; stop with a named diagnostic when reached.
+
 - Make `setjmp`/`longjmp` translation substitutions opt-in through
   `[translate.intrinsics]`; existing games that relied on the previous
   implicit addresses must now declare them in `game.toml`.

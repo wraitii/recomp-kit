@@ -13,6 +13,7 @@ from pathlib import Path
 import platform
 import shutil
 import subprocess
+import hashlib
 import sys
 import tempfile
 from xml.sax.saxutils import escape
@@ -304,15 +305,83 @@ def android_install_and_launch(apk, bundle_id, device=None, console=False, *, ga
         subprocess.run(command + ["logcat"], check=True)
 
 
+def sync_tree(src, dst):
+    """Make `dst` match `src`, rewriting only files whose bytes changed.
+
+    Publishing a fresh tree by rename gives every generated source a new
+    mtime, so ninja rebuilds every chunk even when the translation is byte
+    for byte identical. Copying per file and leaving unchanged files alone
+    keeps their mtimes, so a regeneration that touched one function only
+    recompiles the chunks that function reached. Files `src` no longer
+    carries are removed so a dropped chunk does not linger."""
+    src_files = {p.relative_to(src): p for p in src.rglob("*") if p.is_file()}
+    dst_files = {p.relative_to(dst): p for p in dst.rglob("*") if p.is_file()} if dst.is_dir() else {}
+    for rel in sorted(set(dst_files) - set(src_files), reverse=True):
+        dst_files[rel].unlink()
+    for rel, sp in src_files.items():
+        dp = dst / rel
+        if dp.is_file() and dp.read_bytes() == sp.read_bytes():
+            continue
+        dp.parent.mkdir(parents=True, exist_ok=True)
+        temporary = dp.with_name(dp.name + ".new")
+        shutil.copy2(sp, temporary)
+        temporary.replace(dp)
+
+
+def translation_fingerprint(game_dir, cfg, translate_args):
+    """A hash of everything that can change the translated sources.
+
+    The 39k-function pass takes well over a minute, so a repeated
+    `--regenerate` with the same inputs should not run it again. The hash
+    covers the translator and game configuration, the executable identity,
+    and the listing set; the listings are fingerprinted by name/size/mtime
+    rather than content because re-exporting rewrites mtimes and hashing
+    every listing would cost more than it saves."""
+    h = hashlib.sha256()
+    h.update(b"recomp-translate-v2\n")
+    sources = sorted((ROOT / "tools/recomp").glob("*.py"))
+    sources += [ROOT / "tools/game_config.py", ROOT / "tools/gen_game_config.py"]
+    for path in sources:
+        h.update(path.name.encode() + b"\0" + path.read_bytes())
+    for name in ("game.toml", cfg["translate"].get("globals", "globals.toml")):
+        path = game_dir / name
+        if path.is_file():
+            h.update(name.encode() + b"\0" + path.read_bytes())
+    h.update(b"exe\0" + cfg["game"]["sha256"].encode())
+    def hash_listings(listings):
+        h.update(str(listings.resolve()).encode() + b"\0")
+        functions_tsv = listings / "functions.tsv"
+        if functions_tsv.is_file():
+            h.update(b"tsv\0" + functions_tsv.read_bytes())
+        for path in sorted((listings / "functions").glob("*.asm")):
+            st = path.stat()
+            h.update(("%s:%d:%d\n" % (path.name, st.st_size, st.st_mtime_ns)).encode())
+
+    hash_listings(cfg["listings_path"])
+    for module in cfg["aux_modules"]:
+        h.update(b"aux\0" + module["key"].encode())
+        hash_listings(module["listings_path"])
+    discovered = translate_args.get("discovered")
+    if discovered:
+        # Runs append new entries to the same discovery file. Its path alone
+        # cannot distinguish translations before and after that execution.
+        h.update(b"discovered\0" + Path(discovered).read_bytes())
+    for key in sorted(translate_args):
+        value = translate_args[key]
+        h.update(("arg:%s=%s\n" % (key, value if value is not None else "")).encode())
+    return h.hexdigest()
+
+
 def publish_generated(build_root, translate):
-    """Stage a translation, then publish gen/ and symbols.json by rename.
+    """Stage a translation, then publish it without disturbing unchanged files.
 
     `translate(stage_dir)` writes the sources and raises on failure; the
-    published tree is untouched in that case. Publishing is renames only, so
-    a reader under the same lock never sees half a generation."""
+    published tree is untouched in that case. On success the stage is synced
+    into gen/ file by file, under the build lock, so a reader never sees half
+    a generation and ninja only rebuilds what actually changed."""
     recomp = Path(build_root) / "recomp"
     recomp.mkdir(parents=True, exist_ok=True)
-    gen, old = recomp / "gen", recomp / "gen.old"
+    gen = recomp / "gen"
     stage = recomp / ("gen.new.%d" % os.getpid())
     shutil.rmtree(stage, ignore_errors=True)
     stage.mkdir()
@@ -320,19 +389,14 @@ def publish_generated(build_root, translate):
         translate(stage)
         # x86.h sits beside the generated sources so #include "x86.h" resolves.
         shutil.copy(ROOT / "runtime/x86.h", stage / "x86.h")
-    except BaseException:
+        sync_tree(stage, gen)
+    finally:
         shutil.rmtree(stage, ignore_errors=True)
-        raise
-    shutil.rmtree(old, ignore_errors=True)
-    if gen.exists():
-        gen.rename(old)
-    stage.rename(gen)
     symbols = gen / "symbols.json"
     if symbols.is_file():
         temporary = recomp / ("symbols.json.new.%d" % os.getpid())
         shutil.copy(symbols, temporary)
         temporary.replace(recomp / "symbols.json")
-    shutil.rmtree(old, ignore_errors=True)
 
 
 def run_translator(stage, game_dir, build_root, allow_table_gaps=None, aux_modules=(),
@@ -458,12 +522,28 @@ def main():
             if args.target in NEEDS_GEN and args.regenerate:
                 if not (cfg["listings_path"] / "functions.tsv").is_file():
                     parser.error("Translation listings are missing; run tools/setup.py without --link-only")
-                publish_generated(args.build_root,
-                                  lambda stage: run_translator(stage, args.game_dir, args.build_root,
-                                                               args.allow_table_gaps,
-                                                               [m["key"] for m in cfg["aux_modules"]],
-                                                               args.allow_unmodelled,
-                                                               args.discovered, args.forget))
+                translate_args = {
+                    "allow_table_gaps": args.allow_table_gaps,
+                    "allow_unmodelled": args.allow_unmodelled,
+                    "discovered": args.discovered,
+                    "forget": args.forget,
+                }
+                fingerprint = translation_fingerprint(args.game_dir, cfg, translate_args)
+                stamp = args.build_root / "recomp/translate.stamp"
+                translated = (args.build_root / "recomp/gen/table.c").is_file()
+                if translated and stamp.is_file() and stamp.read_text().strip() == fingerprint:
+                    print("translation inputs unchanged; keeping %s/recomp/gen" % args.build_root)
+                else:
+                    publish_generated(args.build_root,
+                                      lambda stage: run_translator(stage, args.game_dir, args.build_root,
+                                                                   args.allow_table_gaps,
+                                                                   [m["key"] for m in cfg["aux_modules"]],
+                                                                   args.allow_unmodelled,
+                                                                   args.discovered, args.forget))
+                    stamp.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = stamp.with_name("translate.stamp.new")
+                    temporary.write_text(fingerprint + "\n")
+                    temporary.replace(stamp)
             # Generated sources include the adjacent runtime header. Refresh
             # it under the same lock even when their translation is unchanged.
             header = args.build_root / "recomp/gen/x86.h"

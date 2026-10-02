@@ -49,6 +49,7 @@ enum {
     ERROR_HANDLE_EOF_ = 38,
     ERROR_ALREADY_EXISTS_ = 183,
     ERROR_CALL_NOT_IMPLEMENTED_ = 120,
+    ERROR_INSUFFICIENT_BUFFER_ = 122,
 };
 static const uint32_t INVALID_HANDLE_VALUE_ = 0xffffffffu;
 static const uint32_t FILE_ATTRIBUTE_READONLY_ = 0x001;
@@ -581,6 +582,13 @@ uint32_t attrs_for(const OsStat &st) {
 bool wildcard_match(const char *pat, const char *str) {
     if (*pat == '\0')
         return *str == '\0';
+    // Windows' DOS wildcard rules: an extension pattern of exactly "*" is
+    // optional, so "*.*" and "mods\*.*" match names without a dot like
+    // "Origmiss". A real extension ("*.txt") still requires the dot. Ghost
+    // Recon scans Mods\*.* to build its mod list, so requiring the dot made
+    // every mod invisible and left the file search path empty.
+    if (pat[0] == '.' && pat[1] == '*' && pat[2] == '\0' && *str == '\0')
+        return true;
     if (*pat == '*') {
         for (const char *s = str;; ++s) {
             if (wildcard_match(pat + 1, s))
@@ -1031,8 +1039,19 @@ void k_GetFullPathNameA(X86 *c) {
 
 void k_GetCurrentDirectoryA(X86 *c) {
     uint32_t len = arg(c, 0), buf = arg(c, 1);
+    // Windows returns the required size, including the null, when the caller's
+    // buffer is too small (and sets ERROR_INSUFFICIENT_BUFFER). Games probe
+    // with a one-byte buffer and read that size; returning the 0 that
+    // gm_put_str gives for an undersized write made GetCurrentDirectory look
+    // like a hard failure instead of a request to retry.
+    uint32_t need = (uint32_t)g_cur_dir.size() + 1;
     if (!buf || len == 0) {
-        set_eax(c, (uint32_t)g_cur_dir.size() + 1);
+        set_eax(c, need);
+        return;
+    }
+    if (len < need) {
+        set_last_error(ERROR_INSUFFICIENT_BUFFER_);
+        set_eax(c, need);
         return;
     }
     set_eax(c, gm_put_str(buf, g_cur_dir.c_str(), len));
@@ -4761,6 +4780,8 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "FlushFileBuffers", 1, k_FlushFileBuffers},
     {"KERNEL32.dll", "SetEndOfFile", 1, k_SetEndOfFile},
     {"KERNEL32.dll", "GetFileType", 1, k_GetFileType},
+    // ABI known; file timestamps are not implemented. Stop rather than fabricate a result.
+    {"KERNEL32.dll", "GetFileTime", 4, imports_unsupported},
     {"KERNEL32.dll", "GetFileAttributesA", 1, k_GetFileAttributesA},
     {"KERNEL32.dll", "SetFileAttributesA", 2, k_SetFileAttributesA},
     {"KERNEL32.dll", "CreateDirectoryA", 2, k_CreateDirectoryA},
@@ -4815,6 +4836,9 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "IsBadReadPtr", 2, k_IsBadReadPtr},
     {"KERNEL32.dll", "IsBadWritePtr", 2, k_IsBadWritePtr},
     {"KERNEL32.dll", "IsBadCodePtr", 1, k_IsBadCodePtr},
+    // ABI known; these APIs remain unsupported and stop with a named diagnostic.
+    {"KERNEL32.dll", "FormatMessageA", 7, imports_unsupported},
+    {"KERNEL32.dll", "IsProcessorFeaturePresent", 1, imports_unsupported},
     // time
     {"KERNEL32.dll", "GetTickCount", 0, k_GetTickCount},
     {"KERNEL32.dll", "QueryPerformanceCounter", 1, k_QueryPerformanceCounter},

@@ -1378,6 +1378,25 @@ static void test_files(X86 *c) {
         check(call_import(c, "KERNEL32.dll", "FindClose", {fh}) == 1, "FindClose succeeds");
     }
 
+    // Windows' "*.*" matches extension-less names too - the engine scans
+    // Mods\*.* to find its mods, and requiring the dot hid them all. The game
+    // directory holds at least one directory, so a dotless match must appear.
+    {
+        uint32_t allpat = put_str("*.*");
+        uint32_t ah = call_import(c, "KERNEL32.dll", "FindFirstFileA", {allpat, fd});
+        check(ah != 0xffffffffu, "FindFirstFileA(\"*.*\") finds matches");
+        bool dotless = false;
+        if (ah != 0xffffffffu) {
+            do {
+                std::string name = gm_str(fd + 44);
+                if (name != "." && name != ".." && name.find('.') == std::string::npos)
+                    dotless = true;
+            } while (call_import(c, "KERNEL32.dll", "FindNextFileA", {ah, fd}) == 1);
+            call_import(c, "KERNEL32.dll", "FindClose", {ah});
+        }
+        check(dotless, "FindFirstFileA(\"*.*\") returns extension-less names");
+    }
+
     // Guest-visible paths.
     uint32_t pathbuf = scratch_block(300);
     uint32_t n = call_import(c, "KERNEL32.dll", "GetModuleFileNameA", {0, pathbuf, 260});
@@ -1386,6 +1405,12 @@ static void test_files(X86 *c) {
     call_import(c, "KERNEL32.dll", "GetCurrentDirectoryA", {260, pathbuf});
     check(gm_str(pathbuf) == RECOMP_GUEST_ROOT, "GetCurrentDirectoryA -> \"%s\"",
           gm_str(pathbuf).c_str());
+    // The one-byte-buffer size probe: Windows reports the required length,
+    // including the null, instead of failing. Games read that length and
+    // retry; a 0 here is read as a hard failure.
+    uint32_t cwd_probe = call_import(c, "KERNEL32.dll", "GetCurrentDirectoryA", {1, pathbuf});
+    check(cwd_probe == (uint32_t)strlen(RECOMP_GUEST_ROOT) + 1,
+          "GetCurrentDirectoryA(1, buf) reports the required size (%u)", cwd_probe);
 
     // The path GetModuleFileNameA hands out must open, whatever the guest
     // root's shape: a game installed under C:\GOG Games\<name> spells its
@@ -6624,6 +6649,7 @@ static void test_import_return_trace() {
 }
 
 int main(int argc, char **argv) {
+    const bool unsupported_child = argc > 3 && strcmp(argv[1], "--child-unsupported") == 0;
     const bool child = argc > 1 && strcmp(argv[1], "--child-setjmp-abort") == 0;
     if (child) {
         freopen(os_null_device(), "w", stdout);
@@ -6642,6 +6668,15 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (unsupported_child) {
+        mem_init();
+        imports_init();
+        X86 c;
+        loader_init_context(&c);
+        scratch = 0x0ee00000;
+        call_import(&c, argv[2], argv[3], {0, 0, 0, 0, 0, 0, 0});
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--child-exit-stops-workers") == 0)
         return child_exit_stops_workers();
     if (argc == 3 && strcmp(argv[1], "--child-import-trace") == 0) {
@@ -6715,6 +6750,25 @@ int main(int argc, char **argv) {
     X86 *c = loader_context();
     if (child)
         child_setjmp_abort(c);
+    // Unsupported APIs must stop execution, rather than report fabricated
+    // Windows results. Exercise the dispatcher in children that may abort.
+    const char *unsupported[][2] = {{"KERNEL32.dll", "GetFileTime"},
+                                    {"KERNEL32.dll", "FormatMessageA"},
+                                    {"KERNEL32.dll", "IsProcessorFeaturePresent"},
+                                    {"USER32.dll", "LoadImageA"},
+                                    {"DBGHELP.dll", "SymGetOptions"},
+                                    {"DBGHELP.dll", "SymSetOptions"},
+                                    {"DBGHELP.dll", "SymInitialize"},
+                                    {"DBGHELP.dll", "SymCleanup"}};
+    for (const auto &api : unsupported) {
+        char exe[4096];
+        check(os_exe_path(exe, sizeof exe) == 0, "unsupported test knows its executable");
+        const char *child_argv[] = {exe, "--child-unsupported", api[0], api[1], nullptr};
+        int64_t pid = 0;
+        int code = -1;
+        check(os_spawn(child_argv, &pid) == 0 && os_wait(pid, &code) == 0 && code == 134,
+              "%s stops unsupported execution (exit %d)", api[1], code);
+    }
     scratch = 0x0ee00000; // scratch area below the stack, inside the arena
 
     test_allocator();

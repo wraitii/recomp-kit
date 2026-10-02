@@ -393,6 +393,18 @@ class RenderTests(unittest.TestCase):
         self.assertIn("#define RECOMP_HOOK_CURSOR_SURFACE_PTRS {0x00600100u, 0x00600104u}", self.header)
         self.assertIn("#define RECOMP_HOOK_MOUSE_VTABLE 0x00600200u", self.header)
 
+    def test_absent_optional_hooks_render_as_disabled(self):
+        """A game that hooks none of the always-referenced optional hooks still
+        compiles, with each feature inert; guarded hooks such as sprites stay
+        undefined so their #ifdef stays false."""
+        header = gen_game_config.render_header(dict(self.cfg, hooks={}))
+        self.assertIn("#define RECOMP_HOOK_FRAME_CLOCK_BEGIN 0x00000000u", header)
+        self.assertIn("#define RECOMP_HOOK_FRAME_CLOCK_WAIT_DEADLINE 0x00000000u", header)
+        self.assertIn("#define RECOMP_HOOK_MOUSE_DEVICE_PTR 0x00000000u", header)
+        self.assertIn("#define RECOMP_HOOK_CURSOR_SURFACE_PTRS_COUNT 1", header)
+        self.assertIn("#define RECOMP_HOOK_CURSOR_SURFACE_PTRS {0x00000000u}", header)
+        self.assertNotIn("RECOMP_HOOK_SPRITES", header)
+
     def test_cmake_fragment(self):
         self.assertIn('set(RECOMP_APP_NAME "StubRecomp")', self.cmake)
         self.assertIn('set(RECOMP_GAME_NAME "Stub Game")', self.cmake)
