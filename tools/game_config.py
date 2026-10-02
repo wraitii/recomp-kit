@@ -78,6 +78,27 @@ def validate_heap_base(value):
     return value
 
 
+def load_translate_intrinsics(translate, source):
+    """Validate optional guest addresses whose translated bodies use runtime intrinsics."""
+    raw = translate.get("intrinsics", {})
+    if not isinstance(raw, dict):
+        raise ValueError("%s: [translate.intrinsics] must be a table" % source)
+    intrinsics = dict(raw)
+    unknown = sorted(set(intrinsics) - {"setjmp", "longjmp"})
+    if unknown:
+        raise ValueError("%s: [translate.intrinsics] may name only setjmp, longjmp, not %s"
+                         % (source, ", ".join(unknown)))
+    for name, address in intrinsics.items():
+        if type(address) is not int or not (1 <= address <= 0xFFFFFFFF):
+            raise ValueError("%s: [translate.intrinsics] %s must be a guest address from 1 through 0xffffffff, not %r"
+                             % (source, name, address))
+    if len(set(intrinsics.values())) != len(intrinsics):
+        raise ValueError("%s: [translate.intrinsics] setjmp and longjmp addresses must be distinct"
+                         % source)
+    translate["intrinsics"] = intrinsics
+    return intrinsics
+
+
 def load_controls(controls, touch, source):
     """Validate [controls], merging [controls.mapped]/[controls.native] over their
     defaults. `touch` is the already-defaulted [touch] table: its `keypad` knob
@@ -153,6 +174,7 @@ def load(game_dir):
     game["heap_base"] = validate_heap_base(int(game.get("heap_base", HEAP_BASE_DEFAULT)))
     windows_version(game.setdefault("windows_version", "4.10"))
     translate = cfg.setdefault("translate", {})
+    load_translate_intrinsics(translate, source)
     resumable = translate.setdefault("resumable_stacks", False)
     if not isinstance(resumable, bool):
         raise ValueError("%s: [translate] resumable_stacks must be a boolean" % source)

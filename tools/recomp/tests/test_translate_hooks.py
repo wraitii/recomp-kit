@@ -78,6 +78,7 @@ def test_symbols_json_pins_the_exe_and_indexes_the_tables():
 
 
 def test_hook_eligibility_is_narrower_than_dispatch():
+    _configure_fixture_intrinsics()
     doc = json.load(open(SYMBOLS))
     fns = doc["functions"]
     hookable = [f for f in fns if f["hookable"]]
@@ -126,6 +127,15 @@ def _symbols():
     return doc, {f["addr"]: f for f in doc["functions"]}
 
 
+def _configure_fixture_intrinsics():
+    """The Populous hook fixtures were generated with these verified CRT entries."""
+    sys.path.insert(0, os.path.join(ROOT, "tools/recomp"))
+    import translate as T
+    T.configure_intrinsics({"translate": {"intrinsics": {
+        "setjmp": 0x0055DAFC, "longjmp": 0x0055DB78}}})
+    return T
+
+
 def _hookable_addrs(doc):
     """What a host has to resolve a hook against. An address outside this set
     cannot be hooked: the API has nothing to return but POP_E_NOSYMBOL."""
@@ -164,8 +174,7 @@ def _listing_branch_targets():
 
 
 def test_intrinsic_substitutions_are_rejected():
-    sys.path.insert(0, os.path.join(ROOT, "tools/recomp"))
-    import translate as T          # the substitution map, not the artifact
+    T = _configure_fixture_intrinsics()  # the substitution map, not the artifact
 
     doc, by_addr = _symbols()
     hookable = _hookable_addrs(doc)
@@ -198,8 +207,7 @@ def test_internal_blocks_are_rejected_even_when_a_pointer_names_them():
 
 
 def test_listing_gap_continuations_are_rejected():
-    sys.path.insert(0, os.path.join(ROOT, "tools/recomp"))
-    import translate as T
+    T = _configure_fixture_intrinsics()
 
     doc, by_addr = _symbols()
     hookable = _hookable_addrs(doc)

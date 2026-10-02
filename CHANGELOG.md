@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Make `setjmp`/`longjmp` translation substitutions opt-in through
+  `[translate.intrinsics]`; existing games that relied on the previous
+  implicit addresses must now declare them in `game.toml`.
+
 - Allow native game adapters to place their own cursors at absolute touch
   positions in logical game pixels. Placement can discard pending DirectInput
   X/Y movement without losing button, wheel or keyboard input.

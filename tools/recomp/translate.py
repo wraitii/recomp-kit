@@ -82,6 +82,7 @@ def configure_module(cfg, key):
     global LISTINGS, FUNCS_TSV, BINARY, CURATED, ANIMATION_COUNTER, VISUAL_ANIMATION_READS
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT, SYMBOL_PREFIX, AUX_MODULE
     global RESUMABLE_STACKS
+    configure_intrinsics({"translate": {"intrinsics": {}}})
     RESUMABLE_STACKS = cfg["translate"].get("resumable_stacks", False)
     mods = {m["key"]: m for m in cfg.get("aux_modules", [])}
     if key not in mods:
@@ -120,6 +121,7 @@ def read_discovered(path):
 def configure(cfg):
     """Point the translator at one game's listings, binary and audited reads."""
     global LISTINGS, FUNCS_TSV, BINARY, CURATED, ANIMATION_COUNTER, VISUAL_ANIMATION_READS
+    configure_intrinsics(cfg)
     listings = str(cfg["listings_path"])
     LISTINGS = os.path.join(listings, "functions")
     FUNCS_TSV = os.path.join(listings, "functions.tsv")
@@ -293,14 +295,36 @@ def prunable_blocks(recovered_addrs, provenance):
 GUEST_SHIM_BASE = 0x0FF00000
 GUEST_SHIM_END = 0x10000000
 
-# Runtime intrinsics: guest addresses whose translated body is replaced by a
-# call into runtime/intrinsics.h.
-INTRINSIC_LONGJMP = 0x0055DB78          # _longjmp
-INTRINSIC_SETJMP  = 0x0055DAFC          # __setjmp3, buffer at ESP+4
-INTRINSIC_BODY = {
-    INTRINSIC_LONGJMP: "recomp_longjmp(c);",
-    INTRINSIC_SETJMP:  "recomp_setjmp(c);",   # single-call fallback, indirect only
-}
+# Runtime intrinsics: addresses explicitly assigned by a game's
+# game.toml [translate.intrinsics]. None are assumed for an arbitrary image.
+INTRINSIC_LONGJMP = None
+INTRINSIC_SETJMP = None
+INTRINSIC_BODY = {}
+
+
+def configure_intrinsics(cfg):
+    """Install only the runtime intrinsic addresses declared for this image."""
+    global INTRINSIC_SETJMP, INTRINSIC_LONGJMP, INTRINSIC_BODY
+    configured = cfg["translate"].get("intrinsics", {})
+    if not isinstance(configured, dict):
+        raise TranslateError("[translate.intrinsics] must be a table")
+    unknown = set(configured) - {"setjmp", "longjmp"}
+    if unknown:
+        raise TranslateError("[translate.intrinsics] has unknown keys: %s"
+                             % ", ".join(sorted(unknown)))
+    for name, address in configured.items():
+        if type(address) is not int or not (1 <= address <= 0xFFFFFFFF):
+            raise TranslateError("[translate.intrinsics] %s must be a guest address from 1 through 0xffffffff"
+                                 % name)
+    if len(set(configured.values())) != len(configured):
+        raise TranslateError("[translate.intrinsics] setjmp and longjmp addresses must be distinct")
+    INTRINSIC_SETJMP = configured.get("setjmp")
+    INTRINSIC_LONGJMP = configured.get("longjmp")
+    INTRINSIC_BODY = {}
+    if INTRINSIC_SETJMP is not None:
+        INTRINSIC_BODY[INTRINSIC_SETJMP] = "recomp_setjmp(c);"
+    if INTRINSIC_LONGJMP is not None:
+        INTRINSIC_BODY[INTRINSIC_LONGJMP] = "recomp_longjmp(c);"
 
 # --------------------------------------------------------------- registers --
 
@@ -3178,7 +3202,7 @@ class Translator(object):
             if ins.ops and ins.ops[0].startswith("0x"):
                 t = int(ins.ops[0], 16)
                 L.append("c->r[4] -= 4; wr32(c->r[4], %s);" % hexlit(nxt))
-                if t == INTRINSIC_SETJMP:
+                if INTRINSIC_SETJMP is not None and t == INTRINSIC_SETJMP:
                     # The host jmp_buf has to belong to a frame that is still
                     # live when _longjmp fires, so setjmp is taken here rather
                     # than inside the runtime (runtime/intrinsics.h).
@@ -3497,7 +3521,7 @@ class Translator(object):
             return  # a translator built without bytes, as the unit tests are
         if self.image.base <= t < self.image.end:
             return
-        if GUEST_SHIM_BASE <= t < GUEST_SHIM_END or t == INTRINSIC_SETJMP:
+        if GUEST_SHIM_BASE <= t < GUEST_SHIM_END or t in INTRINSIC_BODY:
             return
         raise TranslateError("call to %08x, which is outside the image" % t)
 

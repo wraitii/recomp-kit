@@ -45,6 +45,21 @@ Every kit tool takes `--game-dir <absolute path>`; the game repository's own
 directory. Outputs go under `<game>/build` when the game lives outside the
 kit, else under the kit's `build/`.
 
+Translator runtime substitutions are opt-in per image. If a game's CRT
+`setjmp` or `longjmp` entry points are verified to match the runtime ABI, list
+their guest addresses in `game.toml`:
+
+```toml
+[translate.intrinsics]
+setjmp = 0x00401234
+longjmp = 0x00405678
+```
+
+Omit this table when the image has no verified entry points. Earlier
+translations implicitly treated `0x0055dafc` and `0x0055db78` as these routines;
+games that relied on those substitutions must now declare the addresses
+explicitly. Addresses must be distinct 32-bit guest addresses.
+
 ## Build a game on desktop
 
 `tools/build.py --target app` selects the `macos`, `linux` or `windows`

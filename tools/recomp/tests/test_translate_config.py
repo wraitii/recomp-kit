@@ -73,6 +73,34 @@ class ConfigureTests(unittest.TestCase):
         self.assertEqual(translate.ANIMATION_COUNTER, 0x500000)
         self.assertEqual(len(translate.VISUAL_ANIMATION_READS), 0)
 
+    def test_intrinsics_are_opt_in_and_explicitly_substitute_bodies(self):
+        cfg = game_config.load(ROOT / "games/stub")
+        self.assertEqual(cfg["translate"]["intrinsics"], {})
+        translate.configure(cfg)
+        self.assertEqual(translate.INTRINSIC_BODY, {})
+
+        cfg["translate"]["intrinsics"] = {"setjmp": 0x0055DAFC,
+                                          "longjmp": 0x0055DB78}
+        translate.configure(cfg)
+        self.assertEqual(translate.INTRINSIC_BODY, {
+            0x0055DAFC: "recomp_setjmp(c);",
+            0x0055DB78: "recomp_longjmp(c);",
+        })
+        translate.configure(game_config.load(ROOT / "games/stub"))
+        self.assertEqual(translate.INTRINSIC_BODY, {})
+
+    def test_auxiliary_module_clears_main_image_intrinsics(self):
+        cfg = game_config.load(ROOT / "games/stub")
+        cfg["translate"]["intrinsics"] = {"setjmp": 0x0055DAFC}
+        cfg["aux_modules"] = [{"key": "aux", "listings_path": Path("analysis/aux"),
+                               "path": Path("original/aux.dll"), "function_alignment": 16,
+                               "entry_points": []}]
+        translate.configure(cfg)
+        self.assertTrue(translate.INTRINSIC_BODY)
+        translate.configure_module(cfg, "aux")
+        self.assertEqual(translate.INTRINSIC_BODY, {})
+        translate.configure(game_config.load(ROOT / "games/stub"))
+
     def test_visual_animation_read_rewrites_the_configured_counter(self):
         cfg = game_config.load(ROOT / "games/stub")
         cfg["translate"]["animation_counter"] = 0x1234

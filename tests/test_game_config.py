@@ -92,6 +92,36 @@ class LoadTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "function_alignment"):
                     game_config.load(game)
 
+    def test_translate_intrinsics_default_to_empty_and_accept_guest_addresses(self):
+        cfg = game_config.load(ROOT / "games/stub")
+        self.assertEqual(cfg["translate"]["intrinsics"], {})
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            stub = (ROOT / "games/stub/game.toml").read_text()
+            (game / "globals.toml").write_text("")
+            for name, addr in (("setjmp", "0x0055DAFC"), ("longjmp", "0x0055DB78")):
+                (game / "game.toml").write_text(
+                    stub + "\n[translate.intrinsics]\n%s = %s\n" % (name, addr))
+                self.assertEqual(game_config.load(game)["translate"]["intrinsics"],
+                                 {name: int(addr, 16)})
+
+    def test_translate_intrinsics_reject_unknown_invalid_and_duplicate_addresses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            stub = (ROOT / "games/stub/game.toml").read_text()
+            (game / "globals.toml").write_text("")
+            for table, message in (
+                ("mystery = 0x1234\n", "may name only"),
+                ("setjmp = 0\n", "guest address"),
+                ("setjmp = -1\n", "guest address"),
+                ("setjmp = 0x100000000\n", "guest address"),
+                ("setjmp = true\n", "guest address"),
+                ("setjmp = 0x1234\nlongjmp = 0x1234\n", "distinct"),
+            ):
+                (game / "game.toml").write_text(stub + "\n[translate.intrinsics]\n" + table)
+                with self.assertRaisesRegex(ValueError, message):
+                    game_config.load(game)
+
     def test_heap_base_defaults_to_the_kit_layout(self):
         cfg = game_config.load(ROOT / "games/stub")
         self.assertEqual(cfg["game"]["heap_base"], 0x01000000)

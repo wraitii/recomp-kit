@@ -1517,7 +1517,74 @@ def test_a_call_inside_the_image_or_to_a_shim_is_allowed():
     tr.reject_offimage_call(0x00400000)
     tr.reject_offimage_call(0x00400fff)
     tr.reject_offimage_call(T.GUEST_SHIM_BASE)
+    T.configure_intrinsics({"translate": {"intrinsics": {"setjmp": 0x0055DAFC}}})
     tr.reject_offimage_call(T.INTRINSIC_SETJMP)
+    T.configure_intrinsics({"translate": {"intrinsics": {}}})
+
+
+def test_former_hardcoded_intrinsic_addresses_are_ordinary_calls_by_default():
+    T.configure_intrinsics({"translate": {"intrinsics": {}}})
+    tr = _translator()
+    tr.func_addrs.update((0x0055DAFC, 0x0055DB78))
+    fn = T.Function(0x00401000, "caller", 5,
+                    T.parse_listing_text("00401000  CALL 0x0055dafc\n"))
+    fn.index = {fn.addr: 0}
+    fn.fallthrough = [0x00401005]
+    body = tr.emit(fn, 0, set())
+    assert "CALL_FN(0055dafc);" in " ".join(body)
+    assert "recomp_setjmp" not in " ".join(body)
+    assert "setjmp(" not in " ".join(body)
+
+    fn = T.Function(0x00401000, "caller", 5,
+                    T.parse_listing_text("00401000  CALL 0x0055db78\n"))
+    fn.index = {fn.addr: 0}
+    fn.fallthrough = [0x00401005]
+    body = tr.emit(fn, 0, set())
+    assert "CALL_FN(0055db78);" in " ".join(body)
+    assert "recomp_longjmp" not in " ".join(body)
+
+    for addr in (0x0055DAFC, 0x0055DB78):
+        img = synthetic_image({addr: b"\xc3"}, base=addr, size=0x1000)
+        ordinary = T.Function(addr, "ordinary", 1, img.recover(addr, set()))
+        ordinary.measure(img)
+        ordinary.seh_sites = set()
+        ordinary.seh_restores = set()
+        emitted = T.Translator(img, {addr}, _Opts()).translate(ordinary)
+        text = " ".join(emitted)
+        assert "/* runtime intrinsic */" not in text
+        assert "recomp_setjmp(c)" not in text and "recomp_longjmp(c)" not in text
+        assert "recomp_return(c)" in text
+
+
+def test_explicit_intrinsic_addresses_emit_runtime_substitutions():
+    setjmp, longjmp = 0x0055DAFC, 0x0055DB78
+    T.configure_intrinsics({"translate": {"intrinsics": {
+        "setjmp": setjmp, "longjmp": longjmp}}})
+    for addr, expected in ((setjmp, "recomp_setjmp(c);"),
+                           (longjmp, "recomp_longjmp(c);")):
+        img = synthetic_image({addr: b"\xc3"}, base=addr, size=0x1000)
+        fn = T.Function(addr, "intrinsic", 1, img.recover(addr, set()))
+        fn.measure(img)
+        fn.seh_sites = set()
+        fn.seh_restores = set()
+        tr = T.Translator(img, {addr}, _Opts())
+        assert tr.translate(fn) == ["/* runtime intrinsic */",
+                                    "void fn_%08x(X86 *c) { %s }" % (addr, expected)]
+
+    # The setjmp call-site form owns the host jmp_buf in the caller's live
+    # frame, and invokes setjmp in the C11-permitted controlling expression.
+    caller_addr = 0x00401000
+    caller = T.Function(caller_addr, "calls_setjmp", 5,
+                        T.parse_listing_text("00401000  CALL 0x0055dafc\n"))
+    caller.index = {caller_addr: 0}
+    caller.fallthrough = [caller_addr + 5]
+    body = T.Translator(_Bytes(), set(), _Opts()).emit(caller, 0, set())
+    text = " ".join(body)
+    assert "recomp_setjmp_prepare(c)" in text
+    assert "if (setjmp(*b_) == 0)" in text
+    assert "recomp_setjmp_return(c, 0)" in text
+    assert "recomp_setjmp(c)" not in text
+    T.configure_intrinsics({"translate": {"intrinsics": {}}})
 
 
 def test_without_the_switch_the_dangling_check_keeps_it():
