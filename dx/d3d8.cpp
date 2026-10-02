@@ -80,9 +80,10 @@ constexpr uint32_t D8FMT_X8R8G8B8 = 0x16;
 // whose SetPaletteEntries then fails). The value is the true
 // D3D8 texel pitch unit: a R5G6B5 level of width w has pitch 2*w, and the
 // bytes the guest reads and writes through LockRect are in that native
-// layout. The host renderer only samples the 32-bit ARGB formats; a level in
-// any other format is still an honest CPU texture and is refused by name when
-// something tries to give it to the device (SetTexture is unsupported).
+// layout. The host renderer samples the 32-bit ARGB formats and the packed
+// 16-bit R5G6B5/A1R5G5B5/A4R4G4B4 formats; a level in any other format is
+// still an honest CPU texture and is refused by name when something tries to
+// give it to the device.
 //
 // Format numbers follow the pinned Wine D3D8 headers
 // (graphics/d3d8-wgpu/reference/wine/d3d8types.h).
@@ -1824,19 +1825,30 @@ const uint8_t *d8_buffer_bytes(ComObj *o) {
 // immediately before each draw so a level locked after SetTexture samples its
 // newest content. A null binding sends an empty block, which selects the
 // renderer's default white texture, matching D3D8's unbound-stage default.
-void d8_sync_texture(ComObj *dev, uint32_t stage) {
+//
+// Returns false when the renderer rejected the bind; the diagnostic has already
+// been reported through host_result() and the caller must not draw. This
+// prevents a rejected bind from silently falling back to the white texture.
+bool d8_sync_texture(X86 *c, ComObj *dev, uint32_t stage) {
     if (!dev || !dev->d3d8_device || stage >= 8)
-        return;
+        return true;
     ComObj *tex = com_get(dev->d3d8_bound_texture[stage]);
     ComObj *level = tex && !tex->d3d8_levels.empty() ? com_get(tex->d3d8_levels[0]) : nullptr;
     D3d8Error err{};
+    int32_t status;
     if (tex && level) {
         const uint8_t *data = d8_buffer_bytes(level);
-        d3d8_device_set_texture(host_device(dev), stage, tex->rmask, level->width, level->height,
-                                data, data ? level->pixels_bytes : 0, &err);
+        status = d3d8_device_set_texture(host_device(dev), stage, tex->rmask, level->width,
+                                         level->height, data, data ? level->pixels_bytes : 0,
+                                         &err);
     } else {
-        d3d8_device_set_texture(host_device(dev), stage, 0, 0, 0, nullptr, 0, &err);
+        status = d3d8_device_set_texture(host_device(dev), stage, 0, 0, 0, nullptr, 0, &err);
     }
+    if (status != D3D8_STATUS_OK) {
+        com_ret(c, host_result(c, status, err));
+        return false;
+    }
+    return true;
 }
 #endif
 
@@ -1854,8 +1866,9 @@ void Dev_DrawPrimitive(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
+    if (!d8_sync_texture(c, dev, 0))
+        return;
     D3d8Error err{};
-    d8_sync_texture(dev, 0);
     int32_t status = d3d8_device_draw_primitive(host_device(dev), arg(c, 1), dev->d3d8_fvf, bytes,
                                                 (uint32_t)vb->pixels_bytes, dev->d3d8_stream_stride,
                                                 arg(c, 2), arg(c, 3), &err);
@@ -1886,8 +1899,9 @@ void Dev_DrawIndexedPrimitive(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
+    if (!d8_sync_texture(c, dev, 0))
+        return;
     D3d8Error err{};
-    d8_sync_texture(dev, 0);
     int32_t status = d3d8_device_draw_indexed_primitive(
         host_device(dev), topology, dev->d3d8_fvf, vbytes, vb->pixels_bytes, stride, ibytes,
         ib->pixels_bytes, ib->d3d8_buffer_format, dev->d3d8_base_vertex, min_index, num_vertices,
