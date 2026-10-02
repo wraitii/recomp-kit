@@ -252,12 +252,13 @@ void write_caps(uint32_t addr) {
     wr32(addr + 0x5c, 2048);
     // MaxTextureBlendStages/MaxSimultaneousTextures (+0x94/+0x98). Guest
     // 0x007c2160 clamps both to 2 and only sets up (and later binds) that many
-    // texture stages; at 0 the game renders everything untextured. The bridge
-    // samples stage 0 only, so that is what it advertises.
+    // texture stages; at 0 the game renders everything untextured, and at 1 it
+    // takes its single-stage path and never binds the base texture the world
+    // draws keep in stage 1 (0x007c2c70). The bridge composites two stages.
     //
     // DIVERGENCE(original): the reference adapter reported its hardware's count.
-    wr32(addr + 0x94, 1);
-    wr32(addr + 0x98, 1);
+    wr32(addr + 0x94, 2);
+    wr32(addr + 0x98, 2);
 }
 
 // The DirectDraw table holds the front end's 8/16-bit modes, so filtering it
@@ -1892,8 +1893,10 @@ void Dev_DrawPrimitive(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if (!d8_sync_texture(c, dev, 0))
-        return;
+    // The bridge composites two stages, so both bindings must be current.
+    for (uint32_t stage = 0; stage < 2; ++stage)
+        if (!d8_sync_texture(c, dev, stage))
+            return;
     D3d8Error err{};
     int32_t status = d3d8_device_draw_primitive(host_device(dev), arg(c, 1), dev->d3d8_fvf, bytes,
                                                 (uint32_t)vb->pixels_bytes, dev->d3d8_stream_stride,
@@ -1925,8 +1928,10 @@ void Dev_DrawIndexedPrimitive(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if (!d8_sync_texture(c, dev, 0))
-        return;
+    // The bridge composites two stages, so both bindings must be current.
+    for (uint32_t stage = 0; stage < 2; ++stage)
+        if (!d8_sync_texture(c, dev, stage))
+            return;
     D3d8Error err{};
     int32_t status = d3d8_device_draw_indexed_primitive(
         host_device(dev), topology, dev->d3d8_fvf, vbytes, vb->pixels_bytes, stride, ibytes,

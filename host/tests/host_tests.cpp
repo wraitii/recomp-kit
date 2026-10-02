@@ -219,14 +219,25 @@ static void test_rgb565_expansion() {
 }
 
 static void test_window_size() {
-    // A mode that fits keeps the whole multiple of points it always had.
-    HostWindowSize s = host_window_size_for(800, 600, 1512, 945, 2.0);
-    CHECK_EQ(s.w, 800);
-    CHECK_EQ(s.h, 600);
-    CHECK_EQ(s.min_w, 800);
-    s = host_window_size_for(640, 480, 2560, 1415, 1.0);
+    // A mode whose whole multiple fills at least 85% of the room keeps it.
+    HostWindowSize s = host_window_size_for(640, 480, 1400, 1100, 2.0);
     CHECK_EQ(s.w, 1280);
     CHECK_EQ(s.h, 960);
+    // 640x480 on a 1512x945-point screen fits 1x only (2x needs 960 points of
+    // height): 1x is 53% of the room, so it fills fractionally too.
+    s = host_window_size_for(640, 480, 1512, 945, 2.0);
+    CHECK_EQ(s.w, 1197);
+    CHECK_EQ(s.h, 897);
+    // 800x600 only fits 1x (67% of the room), so it fills 95% of the screen
+    // fractionally (1.496x) instead of staying a small window.
+    s = host_window_size_for(800, 600, 1512, 945, 2.0);
+    CHECK_EQ(s.w, 1197);
+    CHECK_EQ(s.h, 897);
+    CHECK_EQ(s.min_w, 800);
+    CHECK_EQ(s.min_h, 600);
+    s = host_window_size_for(640, 480, 2560, 1415, 1.0);
+    CHECK_EQ(s.w, 1792);
+    CHECK_EQ(s.h, 1344);
     CHECK_EQ(s.min_w, 640);
     CHECK_EQ(s.min_h, 480);
     // 1920x1080 on a 1512x945-point Retina screen: one drawable pixel per guest
@@ -256,7 +267,8 @@ static void test_letterbox() {
     CHECK_NEAR(fit.w, 1280, 1e-9);
     CHECK_NEAR(fit.x, 0, 1e-9);
 
-    // A 1400x1000 drawable still takes 2, not 2.1875: whole pixels only.
+    // A 1400x1000 drawable still takes 2, not 2.1875: the whole multiple fills
+    // 91% of the fractional fit, so pixels stay uniform.
     fit = host_present_fit(1400, 1000, 640, 480);
     CHECK_NEAR(fit.scale, 2.0, 1e-9);
     CHECK_NEAR(fit.w, 1280, 1e-9);
@@ -264,6 +276,11 @@ static void test_letterbox() {
     CHECK_NEAR(fit.x, 60, 1e-9); // centred
     CHECK_NEAR(fit.y, 20, 1e-9);
 
+    // A 1600x1200 drawable has room for 2.5x; 2x would fill only 80% of it, so
+    // the fractional scale is taken.
+    fit = host_present_fit(1600, 1200, 640, 480);
+    CHECK_NEAR(fit.scale, 2.5, 1e-9);
+    CHECK_NEAR(fit.w, 1600, 1e-9);
     // Wider than tall: the aspect ratio decides, and the frame is pillarboxed.
     fit = host_present_fit(2000, 480, 640, 480);
     CHECK_NEAR(fit.scale, 1.0, 1e-9);

@@ -141,6 +141,10 @@ extern "C" void host_present_expand_xrgb8888(const uint8_t *src, int w, int h, i
     }
 }
 
+// Share of the available room a whole-multiple scale must fill to be kept over
+// a fractional one (window sizing and presenter fit use the same rule).
+static constexpr double kWholeFillMin = 0.85;
+
 extern "C" struct HostFit host_present_fit(double dw, double dh, int gw, int gh) {
     HostFit fit = {0, 0, dw, dh, 1.0};
     if (gw <= 0 || gh <= 0 || dw <= 0 || dh <= 0)
@@ -152,7 +156,14 @@ extern "C" struct HostFit host_present_fit(double dw, double dh, int gw, int gh)
     // mode so that cannot happen, and this fractional fall-back exists only so
     // that a drawable that is somehow smaller still shows the whole frame
     // instead of cropping it.
-    double scale = fractional >= 1.0 ? std::floor(fractional) : fractional;
+    //
+    // A whole multiple that leaves a large part of the drawable unused (below
+    // kWholeFillMin of what a fractional fit would take) gives way to the
+    // fractional scale instead: a 1024x768 frame on a screen with room for
+    // 2.3x would otherwise sit at 2x with wide borders.
+    double scale = fractional;
+    if (fractional >= 1.0 && std::floor(fractional) >= kWholeFillMin * fractional)
+        scale = std::floor(fractional);
     fit.scale = scale;
     fit.w = std::floor(gw * scale);
     fit.h = std::floor(gh * scale);
@@ -201,8 +212,16 @@ extern "C" struct HostWindowSize host_window_size_for(int gw, int gh, int uw, in
         int scale = 1;
         while (scale < 4 && (scale + 1) * gw <= room_w && (scale + 1) * gh <= room_h)
             ++scale;
-        s.w = gw * scale;
-        s.h = gh * scale;
+        // Fractional fill when the whole multiple leaves the window small; the
+        // presenter then scales the frame by the same fractional factor.
+        const double f = std::min(room_w / gw, room_h / gh);
+        if (scale >= kWholeFillMin * f) {
+            s.w = gw * scale;
+            s.h = gh * scale;
+        } else {
+            s.w = int(std::floor(gw * f + 1e-6));
+            s.h = int(std::floor(gh * f + 1e-6));
+        }
         return s;
     }
     // Larger than the screen at a point a pixel: count in drawable pixels.
