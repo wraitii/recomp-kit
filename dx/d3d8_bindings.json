@@ -1,0 +1,139 @@
+[
+  {
+    "interface": "IDirect3D8",
+    "table": "g_d3d8",
+    "iid": "IID_IDirect3D8_",
+    "handlers": {
+      "QueryInterface": "com_QueryInterface",
+      "AddRef": "com_AddRef",
+      "Release": "com_Release",
+      "RegisterSoftwareDevice": "D8_RegisterSoftwareDevice",
+      "GetAdapterCount": "D8_GetAdapterCount",
+      "GetAdapterIdentifier": "D8_GetAdapterIdentifier",
+      "GetAdapterModeCount": "D8_GetAdapterModeCount",
+      "EnumAdapterModes": "D8_EnumAdapterModes",
+      "GetAdapterDisplayMode": "D8_GetAdapterDisplayMode",
+      "CheckDeviceType": "D8_CheckDeviceType",
+      "CheckDeviceFormat": "D8_CheckDeviceFormat",
+      "CheckDeviceMultiSampleType": "D8_CheckDeviceMultiSampleType",
+      "CheckDepthStencilMatch": "D8_CheckDepthStencilMatch",
+      "GetDeviceCaps": "D8_GetDeviceCaps",
+      "GetAdapterMonitor": "D8_GetAdapterMonitor",
+      "CreateDevice": "D8_CreateDevice"
+    }
+  },
+  {
+    "interface": "IDirect3DDevice8",
+    "table": "g_device8",
+    "iid": "IID_IDirect3DDevice8_",
+    "handlers": {
+      "QueryInterface": "com_QueryInterface",
+      "AddRef": "com_AddRef",
+      "Release": "com_Release",
+      "TestCooperativeLevel": "Dev_TestCooperativeLevel",
+      "GetAvailableTextureMem": "Dev_GetAvailableTextureMem",
+      "GetDirect3D": "Dev_GetDirect3D",
+      "GetDeviceCaps": "Dev_GetDeviceCaps",
+      "Present": "Dev_Present",
+      "GetBackBuffer": "Dev_GetBackBuffer",
+      "CreateTexture": "Dev_CreateTexture",
+      "CreateVertexBuffer": "Dev_CreateVertexBuffer",
+      "CreateIndexBuffer": "Dev_CreateIndexBuffer",
+      "UpdateTexture": "Dev_UpdateTexture",
+      "SetRenderTarget": "Dev_SetRenderTarget",
+      "GetDepthStencilSurface": "Dev_GetDepthStencilSurface",
+      "BeginScene": "Dev_BeginScene",
+      "EndScene": "Dev_EndScene",
+      "Clear": "Dev_Clear",
+      "SetTransform": "Dev_SetTransform",
+      "SetViewport": "Dev_SetViewport",
+      "SetMaterial": "Dev_SetMaterial",
+      "GetMaterial": "Dev_GetMaterial",
+      "SetLight": "Dev_SetLight",
+      "GetLight": "Dev_GetLight",
+      "LightEnable": "Dev_LightEnable",
+      "GetLightEnable": "Dev_GetLightEnable",
+      "SetRenderState": "Dev_SetRenderState",
+      "SetTextureStageState": "Dev_SetTextureStageState",
+      "DrawPrimitive": "Dev_DrawPrimitive",
+      "DrawIndexedPrimitive": "Dev_DrawIndexedPrimitive",
+      "SetVertexShader": "Dev_SetVertexShader",
+      "GetVertexShader": "Dev_GetVertexShader",
+      "SetStreamSource": "Dev_SetStreamSource",
+      "SetIndices": "Dev_SetIndices"
+    }
+  },
+  {
+    "interface": "IDirect3DSurface8",
+    "table": "g_surface8",
+    "iid": "IID_IDirect3DSurface8_",
+    "handlers": {
+      "QueryInterface": "com_QueryInterface",
+      "AddRef": "com_AddRef",
+      "Release": "com_Release",
+      "GetDevice": "Surface_GetDevice",
+      "GetDesc": "Surface_GetDesc",
+      "LockRect": "Surface_LockRect",
+      "UnlockRect": "Surface_UnlockRect"
+    }
+  },
+  {
+    "interface": "IDirect3DTexture8",
+    "table": "g_texture8",
+    "iid": "IID_IDirect3DTexture8_",
+    "handlers": {
+      "QueryInterface": "com_QueryInterface",
+      "AddRef": "com_AddRef",
+      "Release": "com_Release",
+      "GetDevice": "Tex_GetDevice",
+      "SetPriority": "Tex_SetPriority",
+      "GetPriority": "Tex_GetPriority",
+      "PreLoad": "Tex_PreLoad",
+      "GetType": "Tex_GetType",
+      "SetLOD": "Tex_SetLOD",
+      "GetLOD": "Tex_GetLOD",
+      "GetLevelCount": "Tex_GetLevelCount",
+      "GetLevelDesc": "Tex_GetLevelDesc",
+      "GetSurfaceLevel": "Tex_GetSurfaceLevel",
+      "LockRect": "Tex_LockRect",
+      "UnlockRect": "Tex_UnlockRect",
+      "AddDirtyRect": "Tex_AddDirtyRect"
+    }
+  },
+  {
+    "interface": "IDirect3DVertexBuffer8",
+    "table": "g_vertexbuffer8",
+    "iid": "IID_IDirect3DVertexBuffer8_",
+    "handlers": {
+      "QueryInterface": "com_QueryInterface",
+      "AddRef": "com_AddRef",
+      "Release": "com_Release",
+      "GetDevice": "Buffer_GetDevice",
+      "SetPriority": "Buffer_SetPriority",
+      "GetPriority": "Buffer_GetPriority",
+      "PreLoad": "Buffer_PreLoad",
+      "GetType": "Buffer_GetType",
+      "Lock": "Buffer_Lock",
+      "Unlock": "Buffer_Unlock",
+      "GetDesc": "Buffer_GetDesc"
+    }
+  },
+  {
+    "interface": "IDirect3DIndexBuffer8",
+    "table": "g_indexbuffer8",
+    "iid": "IID_IDirect3DIndexBuffer8_",
+    "handlers": {
+      "QueryInterface": "com_QueryInterface",
+      "AddRef": "com_AddRef",
+      "Release": "com_Release",
+      "GetDevice": "Buffer_GetDevice",
+      "SetPriority": "Buffer_SetPriority",
+      "GetPriority": "Buffer_GetPriority",
+      "PreLoad": "Buffer_PreLoad",
+      "GetType": "Buffer_GetType",
+      "Lock": "Buffer_Lock",
+      "Unlock": "Buffer_Unlock",
+      "GetDesc": "Buffer_GetDesc"
+    }
+  }
+]

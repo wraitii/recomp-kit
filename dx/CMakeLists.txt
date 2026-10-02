@@ -5,8 +5,32 @@ set(POP_DX_SOURCES
   mf.cpp weanetr.cpp d3d9.cpp d3d9_raster.cpp d3d9_shader.cpp d3d9_shadergen.cpp host_d9_default.cpp
   d3dx9.cpp d3d8.cpp)
 
+# A static archive lets ordinary hosts share miniz with the launcher without
+# duplicating its object, and includes it for hosts that have no launcher.
+add_library(recomp_frame_dump STATIC frame_dump.cpp $<TARGET_OBJECTS:recomp_miniz>)
+target_link_libraries(recomp_frame_dump PUBLIC recomp_platform)
+target_compile_options(recomp_frame_dump PRIVATE ${POP_WARN_HOST})
+pop_optimize(recomp_frame_dump 1)
+
+# Interface code is disposable build output; the pinned API header and handler
+# choices are source inputs. Both renderer and null-host objects consume it.
+set(RECOMP_D3D8_GENERATED_DIR "${POP_BUILD_ROOT}/d3d8-generated")
+set(RECOMP_D3D8_COM_TABLES "${RECOMP_D3D8_GENERATED_DIR}/d3d8_interfaces.inc")
+add_custom_command(OUTPUT "${RECOMP_D3D8_COM_TABLES}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${RECOMP_D3D8_GENERATED_DIR}"
+  COMMAND ${Python3_EXECUTABLE} "${POP_ROOT}/tools/gen_com_interfaces.py"
+          --reference "${POP_ROOT}/third_party/wine-d3d8/d3d8.h"
+          --bindings "${CMAKE_CURRENT_SOURCE_DIR}/d3d8_bindings.json"
+          --output "${RECOMP_D3D8_COM_TABLES}"
+  DEPENDS "${POP_ROOT}/tools/gen_com_interfaces.py"
+          "${POP_ROOT}/third_party/wine-d3d8/d3d8.h" "${CMAKE_CURRENT_SOURCE_DIR}/d3d8_bindings.json"
+  VERBATIM)
+add_custom_target(d3d8_com_tables DEPENDS "${RECOMP_D3D8_COM_TABLES}")
+
 add_library(recomp_dx OBJECT ${POP_DX_SOURCES})
-target_link_libraries(recomp_dx PUBLIC recomp_runtime)
+add_dependencies(recomp_dx d3d8_com_tables)
+target_include_directories(recomp_dx PRIVATE "${RECOMP_D3D8_GENERATED_DIR}")
+target_link_libraries(recomp_dx PUBLIC recomp_runtime recomp_frame_dump)
 pop_link_video(recomp_dx)
 target_compile_options(recomp_dx PRIVATE ${POP_WARN_HOST})
 pop_optimize(recomp_dx 2)
@@ -27,6 +51,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND EXISTS "${RECOMP_D3D8_WGPU_DIR}/Cargo
       NOT CMAKE_OSX_ARCHITECTURES STREQUAL CMAKE_HOST_SYSTEM_PROCESSOR))
     message(FATAL_ERROR "D3D8/wgpu integration currently requires a native single-architecture macOS build")
   endif()
+  find_program(CBINDGEN_EXECUTABLE cbindgen HINTS "${RECOMP_GAME_DIR}/build/tools/bin")
+  if(NOT CBINDGEN_EXECUTABLE)
+    message(FATAL_ERROR "D3D8 ABI generation requires cbindgen 0.29.4")
+  endif()
+  execute_process(COMMAND "${CBINDGEN_EXECUTABLE}" --version OUTPUT_VARIABLE RECOMP_CBINDGEN_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(NOT RECOMP_CBINDGEN_VERSION STREQUAL "cbindgen 0.29.4")
+    message(FATAL_ERROR "D3D8 ABI generation requires cbindgen 0.29.4; found ${RECOMP_CBINDGEN_VERSION}")
+  endif()
   file(GLOB_RECURSE RECOMP_D3D8_WGPU_SOURCES CONFIGURE_DEPENDS
     "${RECOMP_D3D8_WGPU_DIR}/src/*.rs")
   set(RECOMP_D3D8_WGPU_TARGET_DIR "${POP_BUILD_ROOT}/d3d8-wgpu/rust")
@@ -40,12 +72,22 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND EXISTS "${RECOMP_D3D8_WGPU_DIR}/Cargo
             ${RECOMP_D3D8_WGPU_SOURCES}
     COMMENT "Building d3d8-wgpu Rust static library"
     VERBATIM)
+  set(RECOMP_D3D8_ABI_HEADER "${RECOMP_D3D8_GENERATED_DIR}/d3d8_abi.h")
+  add_custom_command(OUTPUT "${RECOMP_D3D8_ABI_HEADER}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${RECOMP_D3D8_GENERATED_DIR}"
+    COMMAND "${CBINDGEN_EXECUTABLE}" --quiet --config "${RECOMP_D3D8_WGPU_DIR}/cbindgen.toml"
+            --output "${RECOMP_D3D8_ABI_HEADER}" "${RECOMP_D3D8_WGPU_DIR}"
+    DEPENDS "${RECOMP_D3D8_WGPU_DIR}/cbindgen.toml" "${RECOMP_D3D8_WGPU_DIR}/Cargo.toml"
+            "${RECOMP_D3D8_WGPU_DIR}/Cargo.lock" ${RECOMP_D3D8_WGPU_SOURCES}
+    VERBATIM)
+  add_custom_target(d3d8_abi_header DEPENDS "${RECOMP_D3D8_ABI_HEADER}")
+  add_dependencies(recomp_dx d3d8_abi_header)
   add_custom_target(d3d8_wgpu_rust DEPENDS "${RECOMP_D3D8_WGPU_LIB}")
   add_library(d3d8_wgpu STATIC IMPORTED GLOBAL)
   set_target_properties(d3d8_wgpu PROPERTIES IMPORTED_LOCATION "${RECOMP_D3D8_WGPU_LIB}")
   add_dependencies(d3d8_wgpu d3d8_wgpu_rust)
-  target_include_directories(recomp_dx PRIVATE "${RECOMP_D3D8_WGPU_DIR}/include")
-  target_compile_definitions(recomp_dx PRIVATE RECOMP_D3D8_WGPU=1)
+  target_include_directories(recomp_dx PRIVATE "${RECOMP_D3D8_GENERATED_DIR}")
+  target_compile_definitions(recomp_dx PRIVATE RECOMP_D3D8_WGPU=1 RECOMP_D3D8_RESOURCES=1)
   target_link_libraries(recomp_dx PUBLIC d3d8_wgpu)
   foreach(fw ApplicationServices CoreGraphics CoreVideo Carbon AppKit Foundation QuartzCore Metal CoreFoundation ColorSync CoreServices IOKit)
     find_library(RECOMP_FW_${fw} ${fw})
@@ -59,11 +101,26 @@ endif()
 # these can neither draw nor play sound. The parity fixture and the profile
 # tests use it.
 add_library(recomp_dx_null OBJECT ${POP_DX_SOURCES})
-target_link_libraries(recomp_dx_null PUBLIC recomp_runtime)
+add_dependencies(recomp_dx_null d3d8_com_tables)
+target_include_directories(recomp_dx_null PRIVATE "${RECOMP_D3D8_GENERATED_DIR}")
+target_link_libraries(recomp_dx_null PUBLIC recomp_runtime recomp_frame_dump)
 pop_link_video(recomp_dx_null)
 target_compile_definitions(recomp_dx_null PUBLIC RECOMP_NULL_HOST)
 target_compile_options(recomp_dx_null PRIVATE ${POP_WARN_HOST})
 pop_optimize(recomp_dx_null 1)
+# Exercise the same Rust CPU storage through guest COM without creating a GPU.
+if(TARGET d3d8_wgpu)
+  add_dependencies(recomp_dx_null d3d8_abi_header)
+  target_include_directories(recomp_dx_null PRIVATE "${RECOMP_D3D8_GENERATED_DIR}")
+  target_compile_definitions(recomp_dx_null PUBLIC RECOMP_D3D8_RESOURCES=1)
+  target_link_libraries(recomp_dx_null PUBLIC d3d8_wgpu)
+  foreach(fw ApplicationServices CoreGraphics CoreVideo Carbon AppKit Foundation QuartzCore Metal CoreFoundation ColorSync CoreServices IOKit)
+    if(RECOMP_FW_${fw})
+      target_link_libraries(recomp_dx_null PUBLIC ${RECOMP_FW_${fw}})
+    endif()
+  endforeach()
+endif()
+
 
 if(NOT IOS AND NOT ANDROID)
 # Descriptor/lifetime tests construct guest device state explicitly; no Rust
@@ -76,6 +133,18 @@ pop_optimize(d3d8_surface_tests 1)
 pop_test_binary(d3d8_surface_tests)
 add_test(NAME d3d8_surface_tests COMMAND d3d8_surface_tests)
 set_tests_properties(d3d8_surface_tests PROPERTIES LABELS nogame)
+if(TARGET d3d8_wgpu)
+  add_library(d3d8_abi_layout_test OBJECT tests/d3d8_abi_layout_test.c)
+  add_dependencies(d3d8_abi_layout_test d3d8_abi_header)
+  target_include_directories(d3d8_abi_layout_test PRIVATE "${RECOMP_D3D8_GENERATED_DIR}")
+  target_sources(d3d8_surface_tests PRIVATE $<TARGET_OBJECTS:d3d8_abi_layout_test>)
+  add_test(NAME d3d8_abi_cpp_check
+    COMMAND ${CMAKE_CXX_COMPILER} -std=c++17 -Wall -Wextra -Werror
+            -I${RECOMP_D3D8_GENERATED_DIR} -fsyntax-only -x c++
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d8_abi_layout_test.c)
+  set_tests_properties(d3d8_abi_cpp_check PROPERTIES LABELS nogame)
+endif()
+
 
 # host_api.h is a C header too. The C11 consumer is an object the DX tests
 # link; the header is also parsed as C++17 on its own.

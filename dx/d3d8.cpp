@@ -3,19 +3,23 @@
 // dispatcher. Descriptors and COM lifetime are tested separately from GPU work.
 #include "com.h"
 #include "dx.h"
+#include "frame_dump.h"
 #include "../runtime/guest.h"
 #include "../runtime/memory.h"
 #include "../runtime/display_seam.h"
 #include "../runtime/win32.h"
+#include "../platform/os.h"
 #include <unordered_set>
 #include <cstdio>
 #include <cstdlib>
 
 #include <string.h>
+#include <algorithm>
 #include <vector>
 #include <string>
+#include <new>
 
-#ifdef RECOMP_D3D8_WGPU
+#ifdef RECOMP_D3D8_RESOURCES
 #include "d3d8_abi.h"
 #endif
 
@@ -29,9 +33,7 @@ constexpr uint32_t D8_ERR_INVALIDCALL = 0x8876086Cu;
 constexpr uint32_t D8_ERR_NOTAVAILABLE = 0x8876086Au;
 constexpr uint32_t D8_DEVTYPE_HAL = 1;
 
-// Depth formats the bridge accepts at create time even though it has no depth
-// storage yet, so the guest's D3DPRESENT_PARAMETERS is not rejected outright.
-// Using one (ZENABLE/ZWRITEENABLE on, or a deep Clear) fails by name below.
+// Depth formats supported by the Rust offscreen attachment.
 constexpr uint32_t D8FMT_D16 = 80;
 constexpr uint32_t D8FMT_D24S8 = 75;
 constexpr uint32_t D8FMT_D24X8 = 77;
@@ -85,6 +87,9 @@ constexpr uint32_t D8FMT_X8R8G8B8 = 0x16;
 // Format numbers follow the pinned Wine D3D8 headers
 // (graphics/d3d8-wgpu/reference/wine/d3d8types.h).
 uint32_t d8_format_bytes(uint32_t fmt) {
+#ifdef RECOMP_D3D8_RESOURCES
+    return d3d8_format_bytes(fmt);
+#else
     switch (fmt) {
     case D8FMT_A8R8G8B8:
     case D8FMT_X8R8G8B8:
@@ -113,40 +118,9 @@ uint32_t d8_format_bytes(uint32_t fmt) {
     default:
         return 0;
     }
+#endif
 }
 
-#define D8_IID(a, b, c, d0, d1, d2, d3, d4, d5, d6, d7)                                            \
-    {(uint8_t)((a) & 0xff),                                                                        \
-     (uint8_t)(((a) >> 8) & 0xff),                                                                 \
-     (uint8_t)(((a) >> 16) & 0xff),                                                                \
-     (uint8_t)(((a) >> 24) & 0xff),                                                                \
-     (uint8_t)((b) & 0xff),                                                                        \
-     (uint8_t)(((b) >> 8) & 0xff),                                                                 \
-     (uint8_t)((c) & 0xff),                                                                        \
-     (uint8_t)(((c) >> 8) & 0xff),                                                                 \
-     d0,                                                                                           \
-     d1,                                                                                           \
-     d2,                                                                                           \
-     d3,                                                                                           \
-     d4,                                                                                           \
-     d5,                                                                                           \
-     d6,                                                                                           \
-     d7}
-
-static const uint8_t IID_IDirect3D8_[16] =
-    D8_IID(0x1dd9e8da, 0x1c77, 0x4d40, 0xb0, 0xcf, 0x98, 0xfe, 0xfd, 0xff, 0x95, 0x12);
-static const uint8_t IID_IDirect3DDevice8_[16] =
-    D8_IID(0x7385e5df, 0x8fe8, 0x41d5, 0x86, 0xb6, 0xd7, 0xb4, 0x85, 0x47, 0xb6, 0xcf);
-static const uint8_t IID_IDirect3DSurface8_[16] =
-    D8_IID(0xb96eebca, 0xb326, 0x4ea5, 0x88, 0x2f, 0x2f, 0xf5, 0xba, 0xe0, 0x21, 0xdd);
-static const uint8_t IID_IDirect3DTexture8_[16] =
-    D8_IID(0xe4cdd575, 0x2866, 0x4f01, 0xb1, 0x2e, 0x7e, 0xec, 0xe1, 0xec, 0x93, 0x58);
-static const uint8_t IID_IDirect3DVertexBuffer8_[16] =
-    D8_IID(0x8aeeeac7, 0x05f9, 0x44d4, 0xb5, 0x91, 0x00, 0x0b, 0x0d, 0xf1, 0xcb, 0x95);
-static const uint8_t IID_IDirect3DIndexBuffer8_[16] =
-    D8_IID(0x0e689c9a, 0x053d, 0x44a0, 0x9d, 0x92, 0xdb, 0x0e, 0x3d, 0x75, 0x0f, 0x86);
-
-// ---------------------------------------------------------------------------
 // Adapter facts. d3d8_adapter_info builds a wgpu context, so query it once.
 // ---------------------------------------------------------------------------
 struct AdapterCache {
@@ -175,10 +149,11 @@ bool ensure_adapter() {
     }
     if (d3d8_adapter_info(&c.info, &err) == 0) {
         c.valid = true;
-        LOGW("d3d8: adapter %s vendor=0x%04x device=0x%04x max_texture=%u", c.info.name,
-             c.info.vendor_id, c.info.device_id, c.info.max_texture_dimension_2d);
+        LOGW("d3d8: adapter %s vendor=0x%04x device=0x%04x max_texture=%u",
+             reinterpret_cast<const char *>(c.info.name), c.info.vendor_id, c.info.device_id,
+             c.info.max_texture_dimension_2d);
     } else {
-        LOGW("d3d8: adapter query failed: %s", err.message);
+        LOGW("d3d8: adapter query failed: %s", reinterpret_cast<const char *>(err.message));
     }
 #else
     LOGW("d3d8: built without the Rust wgpu renderer (RECOMP_D3D8_WGPU)");
@@ -206,21 +181,61 @@ static D3d8Device *host_device(ComObj *o) {
 // handles itself: com_reset discards objects without running their destructors.
 std::unordered_set<ComObj *> live_devices;
 
+std::unordered_set<ComObj *> live_resources;
+
+uint8_t *storage_data(ComObj *o) {
+#ifdef RECOMP_D3D8_RESOURCES
+    return d3d8_storage_data(static_cast<D3d8Storage *>(o->d3d8_storage));
+#else
+    return o->blob.empty() ? nullptr : o->blob.data();
+#endif
+}
+bool storage_alloc(ComObj *o, uint32_t bytes) {
+    if (!bytes)
+        return false;
+#ifdef RECOMP_D3D8_RESOURCES
+    D3d8Error err{};
+    o->d3d8_storage = d3d8_storage_create(bytes, &err);
+    if (!o->d3d8_storage)
+        return false;
+#else
+    try {
+        o->blob.assign(bytes, 0);
+    } catch (const std::bad_alloc &) {
+        return false;
+    }
+#endif
+    o->pixels_bytes = bytes;
+    live_resources.insert(o);
+    return true;
+}
+void storage_destroy(ComObj *o) {
+#ifdef RECOMP_D3D8_RESOURCES
+    d3d8_storage_destroy(static_cast<D3d8Storage *>(o->d3d8_storage));
+    o->d3d8_storage = nullptr;
+#else
+    o->blob.clear();
+#endif
+    o->pixels_bytes = 0;
+    live_resources.erase(o);
+}
+
 #ifdef RECOMP_D3D8_WGPU
 uint32_t host_result(X86 *c, int32_t status, const D3d8Error &err) {
-    if (status == D3D8_OK)
+    if (status == D3D8_STATUS_OK)
         return D8_OK;
-    fprintf(stderr, "d3d8: %s\n", err.message);
+    fprintf(stderr, "d3d8: %s\n", reinterpret_cast<const char *>(err.message));
     fflush(stderr);
-    if (status == D3D8_UNSUPPORTED || status == D3D8_NOT_IMPLEMENTED)
+    if (status == D3D8_STATUS_UNSUPPORTED || status == D3D8_STATUS_NOT_IMPLEMENTED)
         imports_unsupported(c);
-    return status == D3D8_INVALID_ARGUMENT ? D8_ERR_INVALIDCALL : D8_ERR_NOTAVAILABLE;
+    return status == D3D8_STATUS_INVALID_ARGUMENT ? D8_ERR_INVALIDCALL
+           : status == D3D8_STATUS_OUT_OF_MEMORY  ? E_OUTOFMEMORY
+                                                  : D8_ERR_NOTAVAILABLE;
 }
 #endif
 
 // ---------------------------------------------------------------------------
-// D3DCAPS8 describes the bridge, not wgpu's potential capabilities. Textures,
-// lighting, vertex buffers and draws remain unsupported in this integration.
+// D3DCAPS8 describes this bounded renderer, not wgpu's potential capabilities.
 // ---------------------------------------------------------------------------
 void write_caps(uint32_t addr) {
     memset(gm_ptr(addr), 0, 212);
@@ -272,12 +287,12 @@ bool d8_depth_format(uint32_t fmt) {
 // True when CheckDeviceFormat should answer D3D_OK for a usage/rtype/format
 // triple. Kept separate so the texture tests can exercise the policy without
 // a device. Depth-stencil use is backed for the four mapped depth formats; the
-// host renderer only samples 32-bit ARGB.
+// CPU formats and GPU sampling support are separate capabilities.
 bool check_device_format_ok(uint32_t usage, uint32_t rtype, uint32_t fmt) {
     if (usage & D8USAGE_DEPTHSTENCIL)
         return rtype == D8_RTYPE_SURFACE && d8_depth_format(fmt);
     if (usage & D8USAGE_RENDERTARGET)
-        return (rtype == D8_RTYPE_TEXTURE || rtype == D8_RTYPE_SURFACE) && color_format(fmt);
+        return rtype == D8_RTYPE_SURFACE && color_format(fmt);
     if (rtype == D8_RTYPE_TEXTURE)
         return d8_format_bytes(fmt) != 0;
     return false;
@@ -316,7 +331,8 @@ void D8_GetAdapterIdentifier(X86 *c) {
     memset(gm_ptr(out), 0, 1068);
 #ifdef RECOMP_D3D8_WGPU
     strncpy((char *)gm_ptr(out), "wgpu", 511);
-    strncpy((char *)gm_ptr(out + 512), adapter_cache().info.name, 511);
+    strncpy((char *)gm_ptr(out + 512), reinterpret_cast<const char *>(adapter_cache().info.name),
+            511);
     wr32(out + 1032, adapter_cache().info.vendor_id);
     wr32(out + 1036, adapter_cache().info.device_id);
 #endif
@@ -400,7 +416,8 @@ void D8_CheckDeviceMultiSampleType(X86 *c) {
 // Every depth format the backend maps is compatible with the 32-bit ARGB
 // render targets this bridge advertises; anything else is NOTAVAILABLE.
 void D8_CheckDepthStencilMatch(X86 *c) {
-    bool ok = adapter_type(c) && color_format(arg(c, 3)) && d8_depth_format(arg(c, 4));
+    bool ok = adapter_type(c) && color_format(arg(c, 3)) && color_format(arg(c, 4)) &&
+              d8_depth_format(arg(c, 5));
     com_ret(c, ok ? D8_OK : D8_ERR_NOTAVAILABLE);
 }
 void D8_GetDeviceCaps(X86 *c) {
@@ -504,7 +521,7 @@ void D8_CreateDevice(X86 *c) {
     dev->d3d8_device = d3d8_device_create(w, h, format, depth ? depth_format : 0, &err);
     if (!dev->d3d8_device) {
         com_release(dev);
-        com_ret(c, host_result(c, err.status ? err.status : D3D8_BACKEND, err));
+        com_ret(c, host_result(c, err.status ? err.status : D3D8_STATUS_BACKEND, err));
         return;
     }
     if (depth)
@@ -600,6 +617,8 @@ void Dev_Clear(X86 *c) {
         float z;
         uint32_t zbits = arg(c, 5);
         memcpy(&z, &zbits, 4);
+        LOGV("d3d8: Clear rects=%u flags=0x%x color=0x%08x z=%g stencil=%u", arg(c, 1), arg(c, 3),
+             arg(c, 4), z, arg(c, 6));
         D3d8Error err{};
         int32_t status = d3d8_device_clear(host_device(dev), arg(c, 1), arg(c, 3), arg(c, 4), z,
                                            arg(c, 6), &err);
@@ -664,7 +683,7 @@ void Dev_GetMaterial(X86 *c) {
         D3d8Material material{};
         D3d8Error err{};
         int32_t status = d3d8_device_get_material(host_device(dev), &material, &err);
-        if (status == D3D8_OK)
+        if (status == D3D8_STATUS_OK)
             memcpy(gm_ptr(p), &material, sizeof material);
         com_ret(c, host_result(c, status, err));
         return;
@@ -697,7 +716,7 @@ void Dev_GetLight(X86 *c) {
         D3d8Light light{};
         D3d8Error err{};
         int32_t status = d3d8_device_get_light(host_device(dev), arg(c, 1), &light, &err);
-        if (status == D3D8_OK)
+        if (status == D3D8_STATUS_OK)
             memcpy(gm_ptr(p), &light, sizeof light);
         com_ret(c, host_result(c, status, err));
         return;
@@ -725,7 +744,7 @@ void Dev_GetLightEnable(X86 *c) {
         uint32_t enabled = 0;
         D3d8Error err{};
         int32_t status = d3d8_device_get_light_enable(host_device(dev), arg(c, 1), &enabled, &err);
-        if (status == D3D8_OK)
+        if (status == D3D8_STATUS_OK)
             wr32(out, enabled);
         com_ret(c, host_result(c, status, err));
         return;
@@ -790,6 +809,7 @@ void Dev_Present(X86 *c) {
             com_ret(c, D8_ERR_NOTAVAILABLE);
             return;
         }
+        dx_dump_frame_rgba(rgba.data(), dev->d3d8_width, dev->d3d8_height);
         std::vector<uint32_t> argb(size_t(bytes / 4));
         for (size_t i = 0; i < argb.size(); ++i) {
             const uint8_t *p = rgba.data() + i * 4;
@@ -926,6 +946,15 @@ void Dev_CreateTexture(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
+#ifdef RECOMP_D3D8_RESOURCES
+    D3d8LevelLayout first{};
+    D3d8Error layout_err{};
+    if (d3d8_texture_level_layout(w, h, levels, 0, format, &first, &layout_err) != D3D8_STATUS_OK) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    levels = first.levels;
+#else
     if (!levels) {
         levels = 1;
         for (uint32_t d = (w > h ? w : h); d > 1; d >>= 1)
@@ -933,6 +962,7 @@ void Dev_CreateTexture(X86 *c) {
     }
     if (levels > 16)
         levels = 16;
+#endif
     ComObj *tex = com_new(K_D3D8TEXTURE);
     if (!tex) {
         com_ret(c, E_OUTOFMEMORY);
@@ -952,8 +982,20 @@ void Dev_CreateTexture(X86 *c) {
         if (!lh)
             lh = 1;
         uint64_t bytes = uint64_t(lw) * bpp * lh;
+#ifdef RECOMP_D3D8_RESOURCES
+        D3d8LevelLayout layout{};
+        if (d3d8_texture_level_layout(w, h, levels, l, format, &layout, &layout_err) !=
+            D3D8_STATUS_OK) {
+            com_release(tex);
+            com_ret(c, D8_ERR_INVALIDCALL);
+            return;
+        }
+        lw = layout.width;
+        lh = layout.height;
+        bytes = layout.size;
+#endif
         ComObj *level = com_new(K_D3D8SURFACE);
-        if (!level || bytes > GUEST_SIZE) {
+        if (!level || bytes > GUEST_SIZE || !storage_alloc(level, (uint32_t)bytes)) {
             if (level)
                 com_release(level);
             com_release(tex);
@@ -971,8 +1013,6 @@ void Dev_CreateTexture(X86 *c) {
         level->height = lh;
         level->bpp = bpp * 8;
         level->pitch = lw * bpp;
-        level->blob.assign((size_t)bytes, 0);
-        level->pixels_bytes = (uint32_t)bytes;
         // The initial reference is the texture's ownership of the level.
         tex->d3d8_levels.push_back(level->id);
     }
@@ -1012,7 +1052,8 @@ void Dev_UpdateTexture(X86 *c) {
     for (size_t l = 0; l < src->d3d8_levels.size(); ++l) {
         ComObj *s = com_get(src->d3d8_levels[l]);
         ComObj *d = com_get(dst->d3d8_levels[l]);
-        if (!s || !d || s->width != d->width || s->height != d->height) {
+        if (!s || !d || s->width != d->width || s->height != d->height ||
+            s->pixels_bytes != d->pixels_bytes || !storage_data(s) || !storage_data(d)) {
             LOGW("d3d8: UpdateTexture level %zu dimensions differ", l);
             com_ret(c, D8_ERR_INVALIDCALL);
             return;
@@ -1021,22 +1062,32 @@ void Dev_UpdateTexture(X86 *c) {
     for (size_t l = 0; l < src->d3d8_levels.size(); ++l) {
         ComObj *s = com_get(src->d3d8_levels[l]);
         ComObj *d = com_get(dst->d3d8_levels[l]);
-        memcpy(d->blob.data(), s->blob.data(), s->blob.size());
+#ifdef RECOMP_D3D8_RESOURCES
+        D3d8Error err{};
+        if (d3d8_storage_copy(static_cast<D3d8Storage *>(d->d3d8_storage),
+                              static_cast<D3d8Storage *>(s->d3d8_storage),
+                              &err) != D3D8_STATUS_OK) {
+            com_ret(c, D8_ERR_INVALIDCALL);
+            return;
+        }
+#else
+        memcpy(storage_data(d), storage_data(s), s->pixels_bytes);
+#endif
     }
     com_ret(c, D8_OK);
 }
 // LockRect hands the guest a heap copy; UnlockRect copies it back and frees
 // it. The guest pointer is never stored in a host field beyond the lock.
 static uint32_t d8_stage_lock(ComObj *o) {
-    if (!o || o->blob.empty())
+    if (!o || !o->pixels_bytes)
         return 0;
     if (o->lock_count++ == 0) {
-        o->pixels = heap_alloc((uint32_t)o->blob.size(), false, 16);
+        o->pixels = heap_alloc(o->pixels_bytes, false, 16);
         if (!o->pixels) {
             o->lock_count = 0;
             return 0;
         }
-        memcpy(gm_ptr(o->pixels), o->blob.data(), o->blob.size());
+        memcpy(gm_ptr(o->pixels), storage_data(o), o->pixels_bytes);
     }
     return o->pixels;
 }
@@ -1044,7 +1095,7 @@ static void d8_stage_unlock(ComObj *o) {
     if (!o || o->lock_count <= 0)
         return;
     if (--o->lock_count == 0 && o->pixels) {
-        memcpy(o->blob.data(), gm_ptr(o->pixels), o->blob.size());
+        memcpy(storage_data(o), gm_ptr(o->pixels), o->pixels_bytes);
         heap_free(o->pixels);
         o->pixels = 0;
     }
@@ -1326,7 +1377,7 @@ void surface_destroy(ComObj *surface) {
     if (surface->pixels)
         heap_free(surface->pixels);
     surface->pixels = 0;
-    surface->blob.clear();
+    storage_destroy(surface);
     ComObj *dev = com_get(surface->d3d8_owner);
     if (dev) {
         if (dev->d3d8_backbuffer == surface->id)
@@ -1341,16 +1392,17 @@ void surface_destroy(ComObj *surface) {
 
 // ---------------------------------------------------------------------------
 // IDirect3DVertexBuffer8 / IDirect3DIndexBuffer8. Storage is real host memory
-// (`blob`); Lock stages it into the guest heap and Unlock copies it back, so the
+// (Rust storage when configured); Lock stages it into the guest heap and
+// Unlock copies it back, so the
 // bytes the guest writes survive for the draw path to consume. A buffer is
 // bound weakly by the device; the guest's reference is the only owner.
 // ---------------------------------------------------------------------------
 bool d8_buffer_alloc(ComObj *o, uint32_t bytes) {
     if (!bytes)
         return false;
-    o->blob.assign(bytes, 0);
+    if (!storage_alloc(o, bytes))
+        return false;
     o->pixels = 0;
-    o->pixels_bytes = bytes;
     return true;
 }
 
@@ -1390,11 +1442,11 @@ void Buffer_GetDevice(X86 *c) {
 void Buffer_Lock(X86 *c) {
     ComObj *o = d8_buffer(c);
     uint32_t offset = arg(c, 1), size = arg(c, 2), out = arg(c, 3);
-    if (!o || o->blob.empty() || !out || !gm_valid(out, 4)) {
+    if (!o || !o->pixels_bytes || !out || !gm_valid(out, 4)) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    uint32_t total = (uint32_t)o->blob.size();
+    uint32_t total = o->pixels_bytes;
     if (!size)
         size = total - offset;
     if (offset > total || size > total - offset) {
@@ -1441,7 +1493,7 @@ void Buffer_GetDesc(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    uint32_t size = (uint32_t)o->blob.size();
+    uint32_t size = o->pixels_bytes;
     if (o->kind == K_D3D8VERTEXBUFFER) {
         if (!gm_valid(out, 24)) {
             com_ret(c, D8_ERR_INVALIDCALL);
@@ -1471,14 +1523,12 @@ void buffer_destroy(ComObj *o) {
     if (o->pixels)
         heap_free(o->pixels);
     o->pixels = 0;
-    o->blob.clear();
-    o->pixels_bytes = 0;
+    storage_destroy(o);
     // The owning device binds buffers weakly; drop any binding that points here
     // so a later draw does not resolve a dead object id.
     if (ComObj *dev = com_get(o->d3d8_owner)) {
         if (dev->d3d8_stream_vb == o->id) {
             dev->d3d8_stream_vb = 0;
-            dev->d3d8_stream_offset = 0;
             dev->d3d8_stream_stride = 0;
         }
         if (dev->d3d8_indices == o->id)
@@ -1488,7 +1538,7 @@ void buffer_destroy(ComObj *o) {
     o->d3d8_owner = 0;
 }
 
-// (this, Length, Usage, FVF, Pool, ppVertexBuffer, pSharedHandle)
+// (this, Length, Usage, FVF, Pool, ppVertexBuffer)
 void Dev_CreateVertexBuffer(X86 *c) {
     ComObj *dev = d8_dev(c);
     uint32_t bytes = arg(c, 1), out = arg(c, 5);
@@ -1522,7 +1572,7 @@ void Dev_CreateVertexBuffer(X86 *c) {
     com_ret(c, D8_OK);
 }
 
-// (this, Length, Usage, Format, Pool, ppIndexBuffer, pSharedHandle)
+// (this, Length, Usage, Format, Pool, ppIndexBuffer)
 void Dev_CreateIndexBuffer(X86 *c) {
     ComObj *dev = d8_dev(c);
     uint32_t bytes = arg(c, 1), out = arg(c, 5), format = arg(c, 3);
@@ -1555,7 +1605,7 @@ void Dev_CreateIndexBuffer(X86 *c) {
     com_ret(c, D8_OK);
 }
 
-// (this, StreamNumber, pStreamData, Stride). D3D8 exposes one vertex stream and
+// (this, StreamNumber, pStreamData, Stride). This renderer currently supports one vertex stream and
 // has no per-stream offset (that arrived in D3D9); any other stream is
 // INVALIDCALL rather than a silent drop.
 void Dev_SetStreamSource(X86 *c) {
@@ -1567,17 +1617,17 @@ void Dev_SetStreamSource(X86 *c) {
         return;
     }
     if (stream != 0) {
-        LOGW("d3d8: SetStreamSource stream %u is not implemented (D3D8 has one stream)", stream);
+        LOGW("d3d8: SetStreamSource stream %u is not implemented (this renderer supports one "
+             "stream)",
+             stream);
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
     if (!vb) {
         dev->d3d8_stream_vb = 0;
-        dev->d3d8_stream_offset = 0;
         dev->d3d8_stream_stride = 0;
     } else if (vb->kind == K_D3D8VERTEXBUFFER) {
         dev->d3d8_stream_vb = vb->id;
-        dev->d3d8_stream_offset = 0;
         dev->d3d8_stream_stride = arg(c, 3);
     } else {
         com_ret(c, D8_ERR_INVALIDCALL);
@@ -1644,11 +1694,11 @@ void Dev_GetVertexShader(X86 *c) {
 // The bytes to draw from right now: the guest heap while the buffer is locked,
 // otherwise the host copy the last Unlock wrote back.
 const uint8_t *d8_buffer_bytes(ComObj *o) {
-    if (!o || o->blob.empty())
+    if (!o || !o->pixels_bytes)
         return nullptr;
     if (o->pixels)
         return gm_ptr(o->pixels);
-    return o->blob.data();
+    return storage_data(o);
 }
 
 // (this, PrimitiveType, StartVertex, PrimitiveCount)
@@ -1661,13 +1711,13 @@ void Dev_DrawPrimitive(X86 *c) {
     }
     ComObj *vb = com_get(dev->d3d8_stream_vb);
     const uint8_t *bytes = d8_buffer_bytes(vb);
-    if (!bytes || !vb->blob.size() || !dev->d3d8_stream_stride) {
+    if (!bytes || !vb->pixels_bytes || !dev->d3d8_stream_stride) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
     D3d8Error err{};
     int32_t status = d3d8_device_draw_primitive(host_device(dev), arg(c, 1), dev->d3d8_fvf, bytes,
-                                                (uint32_t)vb->blob.size(), dev->d3d8_stream_stride,
+                                                (uint32_t)vb->pixels_bytes, dev->d3d8_stream_stride,
                                                 arg(c, 2), arg(c, 3), &err);
     com_ret(c, host_result(c, status, err));
 #else
@@ -1676,9 +1726,8 @@ void Dev_DrawPrimitive(X86 *c) {
 }
 
 // (this, PrimitiveType, MinIndex, NumVertices, StartIndex, PrimitiveCount). The
-// host ABI consumes a linear triangle list, so an indexed triangle list is
-// expanded into one. Every other topology is refused by name: the renderer has
-// no indexed path and expanding a strip/fan would change the primitive order.
+// Rust owns indexed range validation and triangle-list expansion. Guest COM
+// identities and memory staging remain here.
 void Dev_DrawIndexedPrimitive(X86 *c) {
 #ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
@@ -1697,43 +1746,11 @@ void Dev_DrawIndexedPrimitive(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if (topology != 4) {
-        fprintf(stderr,
-                "d3d8: DrawIndexedPrimitive topology %u is not implemented; only "
-                "triangle lists are expanded\n",
-                topology);
-        fflush(stderr);
-        imports_unsupported(c);
-        return;
-    }
-    uint32_t index_size = ib->d3d8_buffer_format == D8FMT_INDEX32 ? 4 : 2;
-    uint32_t index_count = prim_count * 3;
-    if (uint64_t(start_index + index_count) * index_size > ib->blob.size() ||
-        uint64_t(min_index + num_vertices) * stride > vb->blob.size()) {
-        com_ret(c, D8_ERR_INVALIDCALL);
-        return;
-    }
-    std::vector<uint8_t> expanded(size_t(index_count) * stride);
-    for (uint32_t i = 0; i < index_count; ++i) {
-        uint32_t raw;
-        if (index_size == 4) {
-            memcpy(&raw, ibytes + size_t(start_index + i) * 4, 4);
-        } else {
-            uint16_t v;
-            memcpy(&v, ibytes + size_t(start_index + i) * 2, 2);
-            raw = v;
-        }
-        uint32_t actual = raw + dev->d3d8_base_vertex;
-        if (actual < min_index || actual - min_index >= num_vertices) {
-            com_ret(c, D8_ERR_INVALIDCALL);
-            return;
-        }
-        memcpy(expanded.data() + size_t(i) * stride, vbytes + size_t(actual) * stride, stride);
-    }
     D3d8Error err{};
-    int32_t status =
-        d3d8_device_draw_primitive(host_device(dev), topology, dev->d3d8_fvf, expanded.data(),
-                                   (uint32_t)expanded.size(), stride, 0, prim_count, &err);
+    int32_t status = d3d8_device_draw_indexed_primitive(
+        host_device(dev), topology, dev->d3d8_fvf, vbytes, vb->pixels_bytes, stride, ibytes,
+        ib->pixels_bytes, ib->d3d8_buffer_format, dev->d3d8_base_vertex, min_index, num_vertices,
+        start_index, prim_count, &err);
     com_ret(c, host_result(c, status, err));
 #else
     com_ret(c, D8_ERR_INVALIDCALL);
@@ -1744,204 +1761,7 @@ void Dev_DrawIndexedPrimitive(X86 *c) {
 // Vtables, in interface order. A guest dispatches by slot index, so the order
 // is the ABI and may not be rearranged.
 // ---------------------------------------------------------------------------
-// --- IDirect3DSurface8 table ---
-static const ComMethod g_surface8[] = {
-    {"QueryInterface", 3, com_QueryInterface},
-    {"AddRef", 1, com_AddRef},
-    {"Release", 1, com_Release},
-    {"GetDevice", 2, Surface_GetDevice},
-    {"SetPrivateData", 5, imports_unsupported},
-    {"GetPrivateData", 4, imports_unsupported},
-    {"FreePrivateData", 2, imports_unsupported},
-    {"GetContainer", 3, imports_unsupported},
-    {"GetDesc", 2, Surface_GetDesc},
-    {"LockRect", 4, Surface_LockRect},
-    {"UnlockRect", 1, Surface_UnlockRect},
-};
-
-// --- IDirect3DTexture8 table. The order is the D3D8 ABI: IUnknown, then
-// IDirect3DResource8 (GetDevice..GetType), IDirect3DBaseTexture8
-// (SetLOD..GetLevelCount), then the texture methods. ---
-static const ComMethod g_texture8[] = {
-    {"QueryInterface", 3, com_QueryInterface},
-    {"AddRef", 1, com_AddRef},
-    {"Release", 1, com_Release},
-    {"GetDevice", 2, Tex_GetDevice},
-    {"SetPrivateData", 5, imports_unsupported},
-    {"GetPrivateData", 4, imports_unsupported},
-    {"FreePrivateData", 2, imports_unsupported},
-    {"SetPriority", 2, Tex_SetPriority},
-    {"GetPriority", 1, Tex_GetPriority},
-    {"PreLoad", 1, Tex_PreLoad},
-    {"GetType", 1, Tex_GetType},
-    {"SetLOD", 2, Tex_SetLOD},
-    {"GetLOD", 1, Tex_GetLOD},
-    {"GetLevelCount", 1, Tex_GetLevelCount},
-    {"GetLevelDesc", 3, Tex_GetLevelDesc},
-    {"GetSurfaceLevel", 3, Tex_GetSurfaceLevel},
-    {"LockRect", 5, Tex_LockRect},
-    {"UnlockRect", 2, Tex_UnlockRect},
-    {"AddDirtyRect", 2, Tex_AddDirtyRect},
-};
-
-// --- IDirect3DVertexBuffer8 / IDirect3DIndexBuffer8 tables. Both have the
-// IDirect3DResource8 header (GetDevice..GetType) then Lock/Unlock/GetDesc. ---
-static const ComMethod g_vertexbuffer8[] = {
-    {"QueryInterface", 3, com_QueryInterface},
-    {"AddRef", 1, com_AddRef},
-    {"Release", 1, com_Release},
-    {"GetDevice", 2, Buffer_GetDevice},
-    {"SetPrivateData", 5, imports_unsupported},
-    {"GetPrivateData", 4, imports_unsupported},
-    {"FreePrivateData", 2, imports_unsupported},
-    {"SetPriority", 2, Buffer_SetPriority},
-    {"GetPriority", 1, Buffer_GetPriority},
-    {"PreLoad", 1, Buffer_PreLoad},
-    {"GetType", 1, Buffer_GetType},
-    {"Lock", 5, Buffer_Lock},
-    {"Unlock", 1, Buffer_Unlock},
-    {"GetDesc", 2, Buffer_GetDesc},
-};
-static const ComMethod g_indexbuffer8[] = {
-    {"QueryInterface", 3, com_QueryInterface},
-    {"AddRef", 1, com_AddRef},
-    {"Release", 1, com_Release},
-    {"GetDevice", 2, Buffer_GetDevice},
-    {"SetPrivateData", 5, imports_unsupported},
-    {"GetPrivateData", 4, imports_unsupported},
-    {"FreePrivateData", 2, imports_unsupported},
-    {"SetPriority", 2, Buffer_SetPriority},
-    {"GetPriority", 1, Buffer_GetPriority},
-    {"PreLoad", 1, Buffer_PreLoad},
-    {"GetType", 1, Buffer_GetType},
-    {"Lock", 5, Buffer_Lock},
-    {"Unlock", 1, Buffer_Unlock},
-    {"GetDesc", 2, Buffer_GetDesc},
-};
-
-// --- IDirect3D8 table ---
-static const ComMethod g_d3d8[] = {
-    {"QueryInterface", 3, com_QueryInterface},
-    {"AddRef", 1, com_AddRef},
-    {"Release", 1, com_Release},
-    {"RegisterSoftwareDevice", 2, D8_RegisterSoftwareDevice},
-    {"GetAdapterCount", 1, D8_GetAdapterCount},
-    {"GetAdapterIdentifier", 4, D8_GetAdapterIdentifier},
-    {"GetAdapterModeCount", 2, D8_GetAdapterModeCount},
-    {"EnumAdapterModes", 4, D8_EnumAdapterModes},
-    {"GetAdapterDisplayMode", 3, D8_GetAdapterDisplayMode},
-    {"CheckDeviceType", 6, D8_CheckDeviceType},
-    {"CheckDeviceFormat", 7, D8_CheckDeviceFormat},
-    {"CheckDeviceMultiSampleType", 6, D8_CheckDeviceMultiSampleType},
-    {"CheckDepthStencilMatch", 6, D8_CheckDepthStencilMatch},
-    {"GetDeviceCaps", 4, D8_GetDeviceCaps},
-    {"GetAdapterMonitor", 2, D8_GetAdapterMonitor},
-    {"CreateDevice", 7, D8_CreateDevice},
-};
-
-// --- IDirect3DDevice8 table ---
-static const ComMethod g_device8[] = {
-    {"QueryInterface", 3, com_QueryInterface},
-    {"AddRef", 1, com_AddRef},
-    {"Release", 1, com_Release},
-    {"TestCooperativeLevel", 1, Dev_TestCooperativeLevel},
-    {"GetAvailableTextureMem", 1, Dev_GetAvailableTextureMem},
-    {"ResourceManagerDiscardBytes", 2, imports_unsupported},
-    {"GetDirect3D", 2, Dev_GetDirect3D},
-    {"GetDeviceCaps", 2, Dev_GetDeviceCaps},
-    {"GetDisplayMode", 2, imports_unsupported},
-    {"GetCreationParameters", 2, imports_unsupported},
-    {"SetCursorProperties", 4, imports_unsupported},
-    {"SetCursorPosition", 4, imports_unsupported},
-    {"ShowCursor", 2, imports_unsupported},
-    {"CreateAdditionalSwapChain", 3, imports_unsupported},
-    {"Reset", 2, imports_unsupported},
-    {"Present", 5, Dev_Present},
-    {"GetBackBuffer", 4, Dev_GetBackBuffer},
-    {"GetRasterStatus", 2, imports_unsupported},
-    {"SetGammaRamp", 3, imports_unsupported},
-    {"GetGammaRamp", 2, imports_unsupported},
-    {"CreateTexture", 8, Dev_CreateTexture},
-    {"CreateVolumeTexture", 9, imports_unsupported},
-    {"CreateCubeTexture", 7, imports_unsupported},
-    {"CreateVertexBuffer", 6, Dev_CreateVertexBuffer},
-    {"CreateIndexBuffer", 6, Dev_CreateIndexBuffer},
-    {"CreateRenderTarget", 7, imports_unsupported},
-    {"CreateDepthStencilSurface", 6, imports_unsupported},
-    {"CreateImageSurface", 5, imports_unsupported},
-    {"CopyRects", 6, imports_unsupported},
-    {"UpdateTexture", 3, Dev_UpdateTexture},
-    {"GetFrontBuffer", 2, imports_unsupported},
-    {"SetRenderTarget", 3, Dev_SetRenderTarget},
-    {"GetRenderTarget", 2, imports_unsupported},
-    {"GetDepthStencilSurface", 2, Dev_GetDepthStencilSurface},
-    {"BeginScene", 1, Dev_BeginScene},
-    {"EndScene", 1, Dev_EndScene},
-    {"Clear", 7, Dev_Clear},
-    {"SetTransform", 3, Dev_SetTransform},
-    {"GetTransform", 3, imports_unsupported},
-    {"MultiplyTransform", 3, imports_unsupported},
-    {"SetViewport", 2, Dev_SetViewport},
-    {"GetViewport", 2, imports_unsupported},
-    {"SetMaterial", 2, Dev_SetMaterial},
-    {"GetMaterial", 2, Dev_GetMaterial},
-    {"SetLight", 3, Dev_SetLight},
-    {"GetLight", 3, Dev_GetLight},
-    {"LightEnable", 3, Dev_LightEnable},
-    {"GetLightEnable", 3, Dev_GetLightEnable},
-    {"SetClipPlane", 3, imports_unsupported},
-    {"GetClipPlane", 3, imports_unsupported},
-    {"SetRenderState", 3, Dev_SetRenderState},
-    {"GetRenderState", 3, imports_unsupported},
-    {"BeginStateBlock", 1, imports_unsupported},
-    {"EndStateBlock", 2, imports_unsupported},
-    {"ApplyStateBlock", 2, imports_unsupported},
-    {"CaptureStateBlock", 2, imports_unsupported},
-    {"DeleteStateBlock", 2, imports_unsupported},
-    {"CreateStateBlock", 3, imports_unsupported},
-    {"SetClipStatus", 2, imports_unsupported},
-    {"GetClipStatus", 2, imports_unsupported},
-    {"GetTexture", 3, imports_unsupported},
-    {"SetTexture", 3, imports_unsupported},
-    {"GetTextureStageState", 4, imports_unsupported},
-    {"SetTextureStageState", 4, Dev_SetTextureStageState},
-    {"ValidateDevice", 2, imports_unsupported},
-    {"GetInfo", 4, imports_unsupported},
-    {"SetPaletteEntries", 3, imports_unsupported},
-    {"GetPaletteEntries", 3, imports_unsupported},
-    {"SetCurrentTexturePalette", 2, imports_unsupported},
-    {"GetCurrentTexturePalette", 2, imports_unsupported},
-    // TODO(draw): when a draw path is implemented it must call the backend's
-    // state check and fail loudly on any render/texture-stage state the
-    // renderer does not honour, rather than drawing with it dropped.
-    {"DrawPrimitive", 4, Dev_DrawPrimitive},
-    {"DrawIndexedPrimitive", 6, Dev_DrawIndexedPrimitive},
-    {"DrawPrimitiveUP", 5, imports_unsupported},
-    {"DrawIndexedPrimitiveUP", 9, imports_unsupported},
-    {"ProcessVertices", 6, imports_unsupported},
-    {"CreateVertexShader", 5, imports_unsupported},
-    {"SetVertexShader", 2, Dev_SetVertexShader},
-    {"GetVertexShader", 2, Dev_GetVertexShader},
-    {"DeleteVertexShader", 2, imports_unsupported},
-    {"SetVertexShaderConstant", 4, imports_unsupported},
-    {"GetVertexShaderConstant", 4, imports_unsupported},
-    {"GetVertexShaderDeclaration", 4, imports_unsupported},
-    {"GetVertexShaderFunction", 4, imports_unsupported},
-    {"SetStreamSource", 4, Dev_SetStreamSource},
-    {"GetStreamSource", 4, imports_unsupported},
-    {"SetIndices", 3, Dev_SetIndices},
-    {"GetIndices", 3, imports_unsupported},
-    {"CreatePixelShader", 3, imports_unsupported},
-    {"SetPixelShader", 2, imports_unsupported},
-    {"GetPixelShader", 2, imports_unsupported},
-    {"DeletePixelShader", 2, imports_unsupported},
-    {"SetPixelShaderConstant", 4, imports_unsupported},
-    {"GetPixelShaderConstant", 4, imports_unsupported},
-    {"GetPixelShaderFunction", 4, imports_unsupported},
-    {"DrawRectPatch", 4, imports_unsupported},
-    {"DrawTriPatch", 4, imports_unsupported},
-    {"DeletePatch", 2, imports_unsupported},
-};
+#include "d3d8_interfaces.inc"
 
 // The DLL's one export. Not a COM method: the guest calls it directly.
 void d3d8_Direct3DCreate8(X86 *c) {
@@ -2019,5 +1839,8 @@ void d3d8_reset() {
     }
 #endif
     live_devices.clear();
+    // Guest allocations were discarded by mem_init; release only host storage.
+    while (!live_resources.empty())
+        storage_destroy(*live_resources.begin());
     adapter_cache() = {};
 }

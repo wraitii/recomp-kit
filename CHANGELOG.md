@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Support opaque Rust CPU storage and mip layouts for the optional D3D8 bridge,
+  preserving guest staging and COM identity. Move indexed-draw preparation into
+  the renderer with checked arithmetic and correct base-relative index bounds.
+  Generate COM tables from pinned header declarations and retain named failures.
+  Validate the host ABI from both C and C++. Reuse miniz for optional PNG frame
+  dumps instead of maintaining a custom PNG/deflate encoder in the COM bridge.
+
 - Add the D3D8 implicit backbuffer surface interface with a 32-byte guest
   descriptor, stable identity while referenced, and device lifetime retention.
   Unsupported surface methods stop with named argument diagnostics. Locking

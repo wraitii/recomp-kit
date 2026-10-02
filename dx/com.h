@@ -387,7 +387,8 @@ struct ComObj {
 
     // --- D3D8/wgpu. The Rust host device is a
     // host-side pointer kept here, never in a guest field.
-    void *d3d8_device = nullptr; // D3d8Device* from the Rust ABI
+    void *d3d8_storage = nullptr; // opaque Rust CPU storage; never a guest address
+    void *d3d8_device = nullptr;  // D3d8Device* from the Rust ABI
     uint32_t d3d8_width = 0, d3d8_height = 0, d3d8_format = 0;
     uint32_t d3d8_factory = 0; // K_D3D8DEVICE: its IDirect3D8 object id
     uint32_t d3d8_owner = 0;   // K_D3D8SURFACE/K_D3D8TEXTURE: retained device object id
@@ -419,8 +420,7 @@ struct ComObj {
     uint32_t d3d8_buffer_usage = 0;
     uint32_t d3d8_buffer_pool = 0;
     // --- stream/indices state on K_D3D8DEVICE
-    uint32_t d3d8_stream_vb = 0;     // bound K_D3D8VERTEXBUFFER object id
-    uint32_t d3d8_stream_offset = 0; // D3D8 allows one offset per stream source
+    uint32_t d3d8_stream_vb = 0; // bound K_D3D8VERTEXBUFFER object id
     uint32_t d3d8_stream_stride = 0;
     uint32_t d3d8_indices = 0;            // bound K_D3D8INDEXBUFFER object id
     uint32_t d3d8_base_vertex = 0;        // SetIndices base vertex index

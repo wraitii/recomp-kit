@@ -356,7 +356,7 @@ static void test_buffers() {
     check(v && v->kind == K_D3D8VERTEXBUFFER, "vertex buffer view has its own COM identity");
     if (!v)
         return;
-    check(v->blob.size() == 96, "vertex buffer storage is the requested length");
+    check(v->pixels_bytes == 96, "vertex buffer storage is the requested length");
 
     const uint8_t vb_arities[] = {3, 1, 1, 2, 5, 4, 2, 2, 1, 1, 1, 5, 1, 2};
     for (uint32_t slot = 0; slot < sizeof(vb_arities); ++slot)
@@ -476,6 +476,16 @@ int main(int argc, char **argv) {
     test_texture();
     test_depth();
     test_buffers();
+    // Live locked CPU resources must be retired when mem_init discards guest
+    // allocations. Releasing old guest staging during reset would be invalid.
+    ComObj *reset_device = make_test_device(4, 4, 22);
+    uint32_t reset_view = com_view(reset_device, IF_D3D8DEVICE);
+    check(call_method(reset_view, 23, {32, 0, 0x42, 0, sc(0)}) == 0,
+          "create live Rust-backed buffer for generation reset");
+    check(call_method(rd32(sc(0)), 11, {0, 0, sc(8), 0}) == 0,
+          "lock live buffer before generation reset");
+    check(call_method(reset_view, 20, {4, 4, 0, 0, 21, 2, sc(16)}) == 0,
+          "create live mip storage for generation reset");
     // Reset follows the runtime's generation order: old guest heap first,
     // then module state and COM vtables. No stale weak cache may survive.
     mem_init();
@@ -483,6 +493,7 @@ int main(int argc, char **argv) {
     dx_reset();
     g_scratch = heap_alloc(0x400, true, 16);
     test_backbuffer(22);
+    test_buffers();
     printf("d3d8 surface: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

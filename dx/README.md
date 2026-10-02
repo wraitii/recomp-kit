@@ -22,11 +22,14 @@ a guest from selecting this adapter; capability bits must not be inflated to
 bypass selection.
 
 Native macOS builds optionally link a game-provided `graphics/d3d8-wgpu` crate
-exporting `include/d3d8_abi.h`. CMake builds its locked static library, tracks all
+exporting the D3D8 C ABI (generated into the build tree with cbindgen 0.29.4). CMake builds its locked static library, tracks all
 Rust modules and checks the ABI version before use. Other platforms and games
 without that crate build the no-renderer path, which advertises no adapter.
-The null-host target always excludes Rust. The reusable renderer itself has not
-yet been incorporated into the kit; this is a bounded integration boundary.
+The null-host target excludes GPU execution, but links Rust CPU storage when
+the optional crate is present so its guest COM tests exercise the real resource
+ABI. Standalone kit profiles retain C++ CPU storage. The reusable renderer itself remains supplied by the game repository; this is
+a bounded integration boundary. COM IIDs and tables are generated from a pinned
+Wine header plus `d3d8_bindings.json`; see [Testing](../docs/testing.md).
 
 ## Files
 

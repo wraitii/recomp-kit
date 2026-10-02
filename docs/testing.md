@@ -29,7 +29,11 @@ the kit's stub game is used and the `game`-labelled suites report a skip.
 levels and staging, vtable calling convention, identity, bounds and
 device/factory ownership through guest COM dispatch. Its devices are
 constructed state fixtures; it does not create a GPU or demonstrate game
-rendering. `--unsupported-lock` (a lock on the host render target) and
+rendering. When a game provides the optional D3D8 Rust crate, this same suite
+uses its real CPU storage and mip-layout ABI; standalone kit profiles exercise
+the C++ fallback. Live locked resources are also exercised across generation
+reset. `d3d8_abi_cpp_check` and a C compilation fixture check the generated
+header's sizes and offsets when the Rust crate is present. `--unsupported-lock` (a lock on the host render target) and
 `--unsupported-texture` (CreateVolumeTexture) are child probes expected to
 abort with named diagnostics, including with `RECOMP_LOG=0`. When running
 `runtime_tests --startup-contracts`
@@ -94,3 +98,14 @@ The initial publication additionally runs the source-only CI checks and local
 native suites built through CMake from the standalone checkout, and the Linux and
 Windows portable-layer suites in CI. Long campaign completion, multiplayer
 and sustained 4K120 remain unverified; publish measurements with their conditions.
+
+### D3D8 interface generation
+
+`tools/gen_com_interfaces.py` emits IID bytes and full vtables from a pinned Wine
+D3D8 header plus `dx/d3d8_bindings.json`, whose only API choices are handlers.
+Unmapped methods become named unsupported calls. Use `--reference third_party/wine-d3d8/d3d8.h
+--bindings dx/d3d8_bindings.json --output build/d3d8-generated/d3d8_interfaces.inc`; `--check`
+verifies drift without writing. CMake generates the include into the build
+tree automatically; it records the source hash. No generated code is tracked.
+Ghost Recon's parent `tools/d3d8_codegen.py` checks both this boundary and its
+cbindgen-generated host ABI. Generator regressions run in the portable suite.
