@@ -241,6 +241,14 @@ void write_caps(uint32_t addr) {
     memset(gm_ptr(addr), 0, 212);
     wr32(addr, D8_DEVTYPE_HAL);
     wr32(addr + 12, 0x00080000u); // D3DCAPS2_CANRENDERWINDOWED
+    // MaxTextureWidth/MaxTextureHeight (D3DCAPS8 +0x58/+0x5c). A game that
+    // sizes textures against these (Ghost Recon's 0x004eac20 halves an image
+    // until it fits) collapses every texture to 1x1 when they read 0. 2048 is
+    // inside wgpu's default max_texture_dimension_2d (8192) on every backend.
+    //
+    // DIVERGENCE(original): the reference adapter reported its hardware's limit.
+    wr32(addr + 0x58, 2048);
+    wr32(addr + 0x5c, 2048);
 }
 
 // The DirectDraw table holds the front end's 8/16-bit modes, so filtering it
