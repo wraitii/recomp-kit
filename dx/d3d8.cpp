@@ -52,6 +52,12 @@ constexpr uint32_t D8_CLEAR_STENCIL = 0x4;
 constexpr uint32_t D8_RS_ZENABLE = 7;
 constexpr uint32_t D8_RS_ZWRITEENABLE = 14;
 
+// D3DPOOL. UpdateTexture's contract distinguishes the two pools it names.
+constexpr uint32_t D8POOL_DEFAULT = 0;
+constexpr uint32_t D8POOL_MANAGED = 1;
+constexpr uint32_t D8POOL_SYSTEMMEM = 2;
+constexpr uint32_t D8POOL_SCRATCH = 3;
+
 // D3D8's GetAvailableTextureMem reports free texture memory, which on the
 // modeled unified-memory machine is the runtime's deterministic available
 // physical memory (KERNEL32!GlobalMemoryStatus dwAvailPhys, 384 MB). The
@@ -65,7 +71,9 @@ constexpr uint32_t D8FMT_X8R8G8B8 = 0x16;
 
 // Bytes per pixel for the uncompressed D3D8 formats the bridge can hold in
 // system memory. 0 marks a format the shim does not represent (compressed DXT
-// blocks, depth, mixed signed formats and the like). The value is the true
+// blocks, depth, mixed signed formats, and the palettised P8/A8P8 formats: no
+// texture palette path exists, so advertising them would let a create succeed
+// whose SetPaletteEntries then fails). The value is the true
 // D3D8 texel pitch unit: a R5G6B5 level of width w has pitch 2*w, and the
 // bytes the guest reads and writes through LockRect are in that native
 // layout. The host renderer only samples the 32-bit ARGB formats; a level in
@@ -85,12 +93,10 @@ uint32_t d8_format_bytes(uint32_t fmt) {
     case 26: // A4R4G4B4
     case 29: // A8R3G3B2
     case 30: // X4R4G4B4
-    case 40: // A8P8
     case 51: // A8L8
         return 2;
     case 27: // R3G3B2
     case 28: // A8
-    case 41: // P8
     case 50: // L8
     case 52: // A4L4
         return 1;
@@ -805,11 +811,12 @@ void Dev_CreateTexture(X86 *c) {
     com_ret(c, D8_OK);
 }
 
-// (this, pSourceTexture, pDestinationTexture). D3D8 requires the source and
-// destination formats to match (the runtime rejects a mismatch with
-// D3DERR_INVALIDCALL). Both textures here are CPU-backed, so an update is a
-// per-level copy; it is the system-memory texture content the guest will
-// later lock or hand to the device.
+// (this, pSourceTexture, pDestinationTexture). D3D8 requires equal formats and
+// equal level counts and dimensions, with the source in D3DPOOL_SYSTEMMEM and
+// the destination in D3DPOOL_DEFAULT. Any mismatch is a caller error and must
+// not leave a partial update, so every level is checked before anything is
+// copied. Both textures here are CPU-backed; the copy is the system-memory
+// texture content the guest will later lock or hand to the device.
 void Dev_UpdateTexture(X86 *c) {
     ComObj *src = com_this(arg(c, 1), IF_D3D8TEXTURE8);
     ComObj *dst = com_this(arg(c, 2), IF_D3D8TEXTURE8);
@@ -817,24 +824,27 @@ void Dev_UpdateTexture(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if (src->rmask != dst->rmask) {
-        LOGW("d3d8: UpdateTexture format mismatch 0x%x -> 0x%x", src->rmask, dst->rmask);
+    if (src->rmask != dst->rmask || src->d3d8_levels.size() != dst->d3d8_levels.size() ||
+        src->d3d8_pool != D8POOL_SYSTEMMEM || dst->d3d8_pool != D8POOL_DEFAULT) {
+        LOGW("d3d8: UpdateTexture needs equal formats and level counts, SYSTEMMEM source and "
+             "DEFAULT destination (fmt 0x%x/0x%x, pools %u/%u)",
+             src->rmask, dst->rmask, src->d3d8_pool, dst->d3d8_pool);
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    size_t levels = std::min(src->d3d8_levels.size(), dst->d3d8_levels.size());
-    for (size_t l = 0; l < levels; ++l) {
+    for (size_t l = 0; l < src->d3d8_levels.size(); ++l) {
         ComObj *s = com_get(src->d3d8_levels[l]);
         ComObj *d = com_get(dst->d3d8_levels[l]);
-        if (!s || !d) {
+        if (!s || !d || s->width != d->width || s->height != d->height) {
+            LOGW("d3d8: UpdateTexture level %zu dimensions differ", l);
             com_ret(c, D8_ERR_INVALIDCALL);
             return;
         }
-        uint32_t rows = std::min(s->height, d->height);
-        uint32_t bytes = std::min(s->pitch, d->pitch);
-        for (uint32_t y = 0; y < rows; ++y)
-            memcpy(d->blob.data() + size_t(y) * d->pitch, s->blob.data() + size_t(y) * s->pitch,
-                   bytes);
+    }
+    for (size_t l = 0; l < src->d3d8_levels.size(); ++l) {
+        ComObj *s = com_get(src->d3d8_levels[l]);
+        ComObj *d = com_get(dst->d3d8_levels[l]);
+        memcpy(d->blob.data(), s->blob.data(), s->blob.size());
     }
     com_ret(c, D8_OK);
 }
@@ -861,6 +871,27 @@ static void d8_stage_unlock(ComObj *o) {
         heap_free(o->pixels);
         o->pixels = 0;
     }
+}
+
+// Validate a D3D8 lock rectangle against a level and return the byte offset of
+// its top-left corner. A null rect locks the whole level. An empty or
+// out-of-bounds rect is invalid; LockRect reports that as INVALIDCALL rather
+// than handing out a pointer past the allocation.
+bool d8_lock_offset(const ComObj *level, uint32_t rect, uint32_t *offset) {
+    *offset = 0;
+    if (!rect)
+        return true;
+    if (!gm_valid(rect, 16))
+        return false;
+    int32_t left = (int32_t)rd32(rect);
+    int32_t top = (int32_t)rd32(rect + 4);
+    int32_t right = (int32_t)rd32(rect + 8);
+    int32_t bottom = (int32_t)rd32(rect + 12);
+    if (left < 0 || top < 0 || right > (int32_t)level->width || bottom > (int32_t)level->height ||
+        right <= left || bottom <= top)
+        return false;
+    *offset = (uint32_t)top * level->pitch + (uint32_t)left * (level->bpp / 8);
+    return true;
 }
 
 // A texture level is one K_D3D8SURFACE; the implicit backbuffer has no blob
@@ -944,10 +975,16 @@ void Surface_LockRect(X86 *c) {
         fflush(stderr);
         imports_unsupported(c);
     }
-    uint32_t staged = d8_stage_lock(surface);
+    // (this, pLockedRect, pRect, Flags).
+    uint32_t offset;
+    if (!d8_lock_offset(surface, arg(c, 2), &offset)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    uint32_t base = d8_stage_lock(surface);
     wr32(out, surface->pitch);
-    wr32(out + 4, staged);
-    com_ret(c, staged ? D8_OK : E_OUTOFMEMORY);
+    wr32(out + 4, base ? base + offset : 0);
+    com_ret(c, base ? D8_OK : E_OUTOFMEMORY);
 }
 void Surface_UnlockRect(X86 *c) {
     d8_stage_unlock(com_this_arg(c, IF_D3D8SURFACE8));
@@ -1065,10 +1102,16 @@ void Tex_LockRect(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    uint32_t staged = d8_stage_lock(level);
+    // (this, Level, pLockedRect, pRect, Flags).
+    uint32_t offset;
+    if (!d8_lock_offset(level, arg(c, 3), &offset)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    uint32_t base = d8_stage_lock(level);
     wr32(out, level->pitch);
-    wr32(out + 4, staged);
-    com_ret(c, staged ? D8_OK : E_OUTOFMEMORY);
+    wr32(out + 4, base ? base + offset : 0);
+    com_ret(c, base ? D8_OK : E_OUTOFMEMORY);
 }
 void Tex_UnlockRect(X86 *c) {
     d8_stage_unlock(texture_level(d8_tex(c), arg(c, 1)));

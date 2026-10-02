@@ -182,10 +182,52 @@ static void test_texture() {
           "level 1 is 4x2");
     check(call_method(tex2, 14, {3, sc(32)}) == 0 && rd32(sc(56)) == 1 && rd32(sc(60)) == 1,
           "level 3 is 1x1");
+
+    // A sub-rect lock points at the rect's top-left within the level's own
+    // pitch; an empty or out-of-bounds rect is refused.
+    uint32_t rect = sc(96);
+    wr32(rect, 1);
+    wr32(rect + 4, 1);
+    wr32(rect + 8, 2);
+    wr32(rect + 12, 2);
+    check(call_method(tex2, 16, {1, sc(8), rect, 0}) == 0, "sub-rect lock succeeds");
+    uint32_t sub_ptr = rd32(sc(12));
+    check(rd32(sc(8)) == 16, "level 1 pitch is 16");
+    check(call_method(tex2, 16, {1, sc(8), 0, 0}) == 0, "full lock for the base pointer");
+    check(rd32(sc(12)) == sub_ptr - (16 + 4), "sub-rect pointer is base + top*pitch + left*bpp");
+    call_method(tex2, 17, {1});
+    call_method(tex2, 17, {1});
+    wr32(rect, 0);
+    wr32(rect + 4, 0);
+    wr32(rect + 8, 5);
+    wr32(rect + 12, 2);
+    check(call_method(tex2, 16, {1, sc(8), rect, 0}) == 0x8876086c,
+          "a rect past the level's right edge is rejected");
+    wr32(rect + 8, 4);
+    check(call_method(tex2, 16, {1, sc(8), rect, 0}) == 0, "the exact-bound rect is accepted");
+    call_method(tex2, 17, {1});
+    wr32(rect + 8, 0);
+    check(call_method(tex2, 16, {1, sc(8), rect, 0}) == 0x8876086c, "an empty rect is rejected");
+
+    // The level surface uses the same staging block and offset.
+    check(call_method(tex2, 15, {1, sc(16)}) == 0, "GetSurfaceLevel on level 1");
+    uint32_t surf2 = rd32(sc(16));
+    check(call_method(surf2, 9, {sc(8), 0, 0}) == 0, "surface full lock");
+    uint32_t surf_base = rd32(sc(12));
+    call_method(surf2, 10);
+    wr32(rect, 1);
+    wr32(rect + 4, 1);
+    wr32(rect + 8, 2);
+    wr32(rect + 12, 2);
+    check(call_method(tex2, 16, {1, sc(8), rect, 0}) == 0, "texture sub-rect lock");
+    check(rd32(sc(12)) == surf_base + 16 + 4, "surface and texture share level staging");
+    call_method(tex2, 17, {1});
+    call_method(surf2, 2);
     call_method(tex2, 2);
 
-    // UpdateTexture copies every level between two CPU-backed textures of the
-    // same format, and rejects a format mismatch as D3D8 does.
+    // UpdateTexture copies every level between a SYSTEMMEM source and a
+    // DEFAULT destination of the same format and dimensions; every contract
+    // violation is rejected without a partial copy.
     check(call_method(device2, 20, {1, 1, 1, 0, 23, 2, sc(0)}) == 0, "CreateTexture source");
     uint32_t src_tex = rd32(sc(0));
     check(call_method(device2, 20, {1, 1, 1, 0, 23, 0, sc(0)}) == 0, "CreateTexture destination");
@@ -199,8 +241,48 @@ static void test_texture() {
     call_method(dst_tex, 17, {0});
     check(call_method(device2, 29, {src_tex, src_tex}) == 0x8876086c,
           "UpdateTexture rejects source == destination");
+
+    // A format mismatch is refused.
+    check(call_method(device2, 20, {1, 1, 1, 0, 21, 0, sc(0)}) == 0,
+          "CreateTexture wrong-format destination");
+    uint32_t fmt_dst = rd32(sc(0));
+    check(call_method(device2, 29, {src_tex, fmt_dst}) == 0x8876086c,
+          "UpdateTexture rejects a format mismatch");
+    call_method(fmt_dst, 2);
+    // A DEFAULT-pool source is refused.
+    check(call_method(device2, 20, {1, 1, 1, 0, 23, 0, sc(0)}) == 0,
+          "CreateTexture DEFAULT source");
+    uint32_t def_src = rd32(sc(0));
+    check(call_method(device2, 29, {def_src, dst_tex}) == 0x8876086c,
+          "UpdateTexture rejects a DEFAULT source");
+    call_method(def_src, 2);
+    // Mismatched dimensions are refused before anything is copied.
+    check(call_method(device2, 20, {2, 1, 1, 0, 23, 2, sc(0)}) == 0, "CreateTexture wide source");
+    uint32_t wide_src = rd32(sc(0));
+    check(call_method(device2, 29, {wide_src, dst_tex}) == 0x8876086c,
+          "UpdateTexture rejects mismatched dimensions");
+    check(call_method(dst_tex, 16, {0, sc(8), 0, 0}) == 0 && rd16(rd32(sc(12))) == 0x07e0,
+          "a rejected UpdateTexture leaves the destination unchanged");
+    call_method(dst_tex, 17, {0});
+    // Mismatched level counts are refused.
+    check(call_method(device2, 20, {2, 1, 0, 0, 23, 2, sc(0)}) == 0,
+          "CreateTexture two-level source");
+    uint32_t two_src = rd32(sc(0));
+    check(call_method(device2, 29, {two_src, dst_tex}) == 0x8876086c,
+          "UpdateTexture rejects mismatched level counts");
+    call_method(two_src, 2);
+    call_method(wide_src, 2);
     call_method(src_tex, 2);
     call_method(dst_tex, 2);
+
+    // Releasing a texture whose level is still locked must free the staging.
+    check(call_method(device2, 20, {2, 2, 1, 0, 23, 2, sc(0)}) == 0, "CreateTexture lock-destroy");
+    uint32_t locked_tex = rd32(sc(0));
+    check(call_method(locked_tex, 16, {0, sc(8), 0, 0}) == 0, "lock the level");
+    uint32_t staged = rd32(sc(12));
+    check(heap_size(staged) != 0xffffffff, "staging block is live while locked");
+    check(call_method(locked_tex, 2) == 0, "release the locked texture");
+    check(heap_size(staged) == 0xffffffff, "destroying a locked level frees its staging block");
 
     // An unrepresentable format fails without fabricating a texture.
     wr32(sc(0), 0xfeedface);
