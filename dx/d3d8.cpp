@@ -46,6 +46,13 @@ constexpr uint32_t D8_RTYPE_TEXTURE = 3;
 constexpr uint32_t D8_RTYPE_CUBETEXTURE = 4;
 constexpr uint32_t D8_TYPE_SURFACE = 1;
 constexpr uint32_t D8_TYPE_TEXTURE = 3;
+constexpr uint32_t D8_TYPE_VERTEXBUFFER = 6;
+constexpr uint32_t D8_TYPE_INDEXBUFFER = 7;
+
+// D3DFORMAT values a vertex/index buffer descriptor reports.
+constexpr uint32_t D8FMT_VERTEXDATA = 100;
+constexpr uint32_t D8FMT_INDEX16 = 101;
+constexpr uint32_t D8FMT_INDEX32 = 102;
 
 // D3DPOOL. UpdateTexture's contract distinguishes the two pools it names.
 constexpr uint32_t D8POOL_DEFAULT = 0;
@@ -134,6 +141,10 @@ static const uint8_t IID_IDirect3DSurface8_[16] =
     D8_IID(0xb96eebca, 0xb326, 0x4ea5, 0x88, 0x2f, 0x2f, 0xf5, 0xba, 0xe0, 0x21, 0xdd);
 static const uint8_t IID_IDirect3DTexture8_[16] =
     D8_IID(0xe4cdd575, 0x2866, 0x4f01, 0xb1, 0x2e, 0x7e, 0xec, 0xe1, 0xec, 0x93, 0x58);
+static const uint8_t IID_IDirect3DVertexBuffer8_[16] =
+    D8_IID(0x8aeeeac7, 0x05f9, 0x44d4, 0xb5, 0x91, 0x00, 0x0b, 0x0d, 0xf1, 0xcb, 0x95);
+static const uint8_t IID_IDirect3DIndexBuffer8_[16] =
+    D8_IID(0x0e689c9a, 0x053d, 0x44a0, 0x9d, 0x92, 0xdb, 0x0e, 0x3d, 0x75, 0x0f, 0x86);
 
 // ---------------------------------------------------------------------------
 // Adapter facts. d3d8_adapter_info builds a wgpu context, so query it once.
@@ -624,6 +635,98 @@ void Dev_SetViewport(X86 *c) {
         D3d8Error err{};
         int32_t status = d3d8_device_set_viewport(host_device(dev), rd32(vp), rd32(vp + 4),
                                                   rd32(vp + 8), rd32(vp + 12), min_z, max_z, &err);
+        com_ret(c, host_result(c, status, err));
+        return;
+    }
+#endif
+    com_ret(c, D8_ERR_INVALIDCALL);
+}
+void Dev_SetMaterial(X86 *c) {
+#ifdef RECOMP_D3D8_WGPU
+    ComObj *dev = d8_dev(c);
+    uint32_t p = arg(c, 1);
+    if (dev && dev->d3d8_device && p && gm_valid(p, sizeof(D3d8Material))) {
+        D3d8Material material;
+        memcpy(&material, gm_ptr(p), sizeof material);
+        D3d8Error err{};
+        int32_t status = d3d8_device_set_material(host_device(dev), &material, &err);
+        com_ret(c, host_result(c, status, err));
+        return;
+    }
+#endif
+    com_ret(c, D8_ERR_INVALIDCALL);
+}
+void Dev_GetMaterial(X86 *c) {
+#ifdef RECOMP_D3D8_WGPU
+    ComObj *dev = d8_dev(c);
+    uint32_t p = arg(c, 1);
+    if (dev && dev->d3d8_device && p && gm_valid(p, sizeof(D3d8Material))) {
+        D3d8Material material{};
+        D3d8Error err{};
+        int32_t status = d3d8_device_get_material(host_device(dev), &material, &err);
+        if (status == D3D8_OK)
+            memcpy(gm_ptr(p), &material, sizeof material);
+        com_ret(c, host_result(c, status, err));
+        return;
+    }
+#endif
+    com_ret(c, D8_ERR_INVALIDCALL);
+}
+// (this, Index, pLight). D3D8 accepts eight active lights; an out-of-range
+// index is INVALIDCALL from the backend, not a fail-loud unsupported call.
+void Dev_SetLight(X86 *c) {
+#ifdef RECOMP_D3D8_WGPU
+    ComObj *dev = d8_dev(c);
+    uint32_t p = arg(c, 2);
+    if (dev && dev->d3d8_device && p && gm_valid(p, sizeof(D3d8Light))) {
+        D3d8Light light;
+        memcpy(&light, gm_ptr(p), sizeof light);
+        D3d8Error err{};
+        int32_t status = d3d8_device_set_light(host_device(dev), arg(c, 1), &light, &err);
+        com_ret(c, host_result(c, status, err));
+        return;
+    }
+#endif
+    com_ret(c, D8_ERR_INVALIDCALL);
+}
+void Dev_GetLight(X86 *c) {
+#ifdef RECOMP_D3D8_WGPU
+    ComObj *dev = d8_dev(c);
+    uint32_t p = arg(c, 2);
+    if (dev && dev->d3d8_device && p && gm_valid(p, sizeof(D3d8Light))) {
+        D3d8Light light{};
+        D3d8Error err{};
+        int32_t status = d3d8_device_get_light(host_device(dev), arg(c, 1), &light, &err);
+        if (status == D3D8_OK)
+            memcpy(gm_ptr(p), &light, sizeof light);
+        com_ret(c, host_result(c, status, err));
+        return;
+    }
+#endif
+    com_ret(c, D8_ERR_INVALIDCALL);
+}
+void Dev_LightEnable(X86 *c) {
+#ifdef RECOMP_D3D8_WGPU
+    ComObj *dev = d8_dev(c);
+    if (dev && dev->d3d8_device) {
+        D3d8Error err{};
+        int32_t status = d3d8_device_light_enable(host_device(dev), arg(c, 1), arg(c, 2), &err);
+        com_ret(c, host_result(c, status, err));
+        return;
+    }
+#endif
+    com_ret(c, D8_ERR_INVALIDCALL);
+}
+void Dev_GetLightEnable(X86 *c) {
+#ifdef RECOMP_D3D8_WGPU
+    ComObj *dev = d8_dev(c);
+    uint32_t out = arg(c, 2);
+    if (dev && dev->d3d8_device && out && gm_valid(out, 4)) {
+        uint32_t enabled = 0;
+        D3d8Error err{};
+        int32_t status = d3d8_device_get_light_enable(host_device(dev), arg(c, 1), &enabled, &err);
+        if (status == D3D8_OK)
+            wr32(out, enabled);
         com_ret(c, host_result(c, status, err));
         return;
     }
@@ -1237,6 +1340,407 @@ void surface_destroy(ComObj *surface) {
 }
 
 // ---------------------------------------------------------------------------
+// IDirect3DVertexBuffer8 / IDirect3DIndexBuffer8. Storage is real host memory
+// (`blob`); Lock stages it into the guest heap and Unlock copies it back, so the
+// bytes the guest writes survive for the draw path to consume. A buffer is
+// bound weakly by the device; the guest's reference is the only owner.
+// ---------------------------------------------------------------------------
+bool d8_buffer_alloc(ComObj *o, uint32_t bytes) {
+    if (!bytes)
+        return false;
+    o->blob.assign(bytes, 0);
+    o->pixels = 0;
+    o->pixels_bytes = bytes;
+    return true;
+}
+
+ComObj *d8_buffer(X86 *c) {
+    ComObj *o = com_this(arg(c, 0));
+    if (!o || (o->kind != K_D3D8VERTEXBUFFER && o->kind != K_D3D8INDEXBUFFER))
+        return nullptr;
+    return o;
+}
+
+void Buffer_GetDevice(X86 *c) {
+    ComObj *o = d8_buffer(c);
+    ComObj *dev = o ? com_get(o->d3d8_owner) : nullptr;
+    uint32_t out = arg(c, 1);
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, 0);
+    if (!dev) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    uint32_t view = com_view(dev, IF_D3D8DEVICE);
+    if (!view) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    com_addref(dev);
+    wr32(out, view);
+    com_ret(c, D8_OK);
+}
+
+// (this, OffsetToLock, SizeToLock, ppbData, Flags). A zero SizeToLock means
+// "to the end of the buffer", as in D3D8. The whole blob is staged around the
+// lock, so the pointer the guest receives is the staged block plus the offset.
+void Buffer_Lock(X86 *c) {
+    ComObj *o = d8_buffer(c);
+    uint32_t offset = arg(c, 1), size = arg(c, 2), out = arg(c, 3);
+    if (!o || o->blob.empty() || !out || !gm_valid(out, 4)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    uint32_t total = (uint32_t)o->blob.size();
+    if (!size)
+        size = total - offset;
+    if (offset > total || size > total - offset) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    uint32_t base = d8_stage_lock(o);
+    wr32(out, base ? base + offset : 0);
+    com_ret(c, base ? D8_OK : E_OUTOFMEMORY);
+}
+
+void Buffer_Unlock(X86 *c) {
+    d8_stage_unlock(d8_buffer(c));
+    com_ret(c, D8_OK);
+}
+void Buffer_SetPriority(X86 *c) {
+    ComObj *o = d8_buffer(c);
+    if (o)
+        o->d3d8_priority = arg(c, 1);
+    com_ret(c, o ? o->d3d8_priority : 0);
+}
+void Buffer_GetPriority(X86 *c) {
+    ComObj *o = d8_buffer(c);
+    com_ret(c, o ? o->d3d8_priority : 0);
+}
+void Buffer_PreLoad(X86 *c) {
+    (void)c;
+    com_ret(c, D8_OK);
+}
+void Buffer_GetType(X86 *c) {
+    ComObj *o = d8_buffer(c);
+    uint32_t type = 0;
+    if (o)
+        type = o->kind == K_D3D8VERTEXBUFFER ? D8_TYPE_VERTEXBUFFER : D8_TYPE_INDEXBUFFER;
+    com_ret(c, type);
+}
+// D3DVERTEXBUFFER_DESC is 24 bytes, D3DINDEXBUFFER_DESC is 20. A vertex
+// buffer's Format is always D3DFMT_VERTEXDATA; an index buffer reports the
+// format it was created with.
+void Buffer_GetDesc(X86 *c) {
+    ComObj *o = d8_buffer(c);
+    uint32_t out = arg(c, 1);
+    if (!o || !out) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    uint32_t size = (uint32_t)o->blob.size();
+    if (o->kind == K_D3D8VERTEXBUFFER) {
+        if (!gm_valid(out, 24)) {
+            com_ret(c, D8_ERR_INVALIDCALL);
+            return;
+        }
+        wr32(out + 0, D8FMT_VERTEXDATA);
+        wr32(out + 4, D8_TYPE_VERTEXBUFFER);
+        wr32(out + 8, o->d3d8_buffer_usage);
+        wr32(out + 12, o->d3d8_buffer_pool);
+        wr32(out + 16, size);
+        wr32(out + 20, o->d3d8_buffer_fvf);
+    } else {
+        if (!gm_valid(out, 20)) {
+            com_ret(c, D8_ERR_INVALIDCALL);
+            return;
+        }
+        wr32(out + 0, o->d3d8_buffer_format);
+        wr32(out + 4, D8_TYPE_INDEXBUFFER);
+        wr32(out + 8, o->d3d8_buffer_usage);
+        wr32(out + 12, o->d3d8_buffer_pool);
+        wr32(out + 16, size);
+    }
+    com_ret(c, D8_OK);
+}
+
+void buffer_destroy(ComObj *o) {
+    if (o->pixels)
+        heap_free(o->pixels);
+    o->pixels = 0;
+    o->blob.clear();
+    o->pixels_bytes = 0;
+    // The owning device binds buffers weakly; drop any binding that points here
+    // so a later draw does not resolve a dead object id.
+    if (ComObj *dev = com_get(o->d3d8_owner)) {
+        if (dev->d3d8_stream_vb == o->id) {
+            dev->d3d8_stream_vb = 0;
+            dev->d3d8_stream_offset = 0;
+            dev->d3d8_stream_stride = 0;
+        }
+        if (dev->d3d8_indices == o->id)
+            dev->d3d8_indices = 0;
+        com_release(dev);
+    }
+    o->d3d8_owner = 0;
+}
+
+// (this, Length, Usage, FVF, Pool, ppVertexBuffer, pSharedHandle)
+void Dev_CreateVertexBuffer(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t bytes = arg(c, 1), out = arg(c, 5);
+    if (out && gm_valid(out, 4))
+        wr32(out, 0);
+    if (!dev || !out || !gm_valid(out, 4) || !bytes) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    ComObj *vb = com_new(K_D3D8VERTEXBUFFER);
+    if (!vb || !d8_buffer_alloc(vb, bytes)) {
+        if (vb)
+            com_release(vb);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    vb->d3d8_owner = dev->id;
+    com_addref(dev);
+    vb->d3d8_buffer_usage = arg(c, 2);
+    vb->d3d8_buffer_fvf = arg(c, 3);
+    vb->d3d8_buffer_pool = arg(c, 4);
+    uint32_t view = com_view(vb, IF_D3D8VERTEXBUFFER8);
+    if (!view) {
+        com_release(vb);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    LOGV("d3d8: CreateVertexBuffer %u bytes usage=0x%x fvf=0x%x pool=%u -> %08x", bytes, arg(c, 2),
+         arg(c, 3), arg(c, 4), view);
+    wr32(out, view);
+    com_ret(c, D8_OK);
+}
+
+// (this, Length, Usage, Format, Pool, ppIndexBuffer, pSharedHandle)
+void Dev_CreateIndexBuffer(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t bytes = arg(c, 1), out = arg(c, 5), format = arg(c, 3);
+    if (out && gm_valid(out, 4))
+        wr32(out, 0);
+    if (!dev || !out || !gm_valid(out, 4) || !bytes ||
+        (format != D8FMT_INDEX16 && format != D8FMT_INDEX32)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    ComObj *ib = com_new(K_D3D8INDEXBUFFER);
+    if (!ib || !d8_buffer_alloc(ib, bytes)) {
+        if (ib)
+            com_release(ib);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    ib->d3d8_owner = dev->id;
+    com_addref(dev);
+    ib->d3d8_buffer_usage = arg(c, 2);
+    ib->d3d8_buffer_format = format;
+    ib->d3d8_buffer_pool = arg(c, 4);
+    uint32_t view = com_view(ib, IF_D3D8INDEXBUFFER8);
+    if (!view) {
+        com_release(ib);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    wr32(out, view);
+    com_ret(c, D8_OK);
+}
+
+// (this, StreamNumber, pStreamData, Stride). D3D8 exposes one vertex stream and
+// has no per-stream offset (that arrived in D3D9); any other stream is
+// INVALIDCALL rather than a silent drop.
+void Dev_SetStreamSource(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t stream = arg(c, 1);
+    ComObj *vb = com_this(arg(c, 2));
+    if (!dev) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    if (stream != 0) {
+        LOGW("d3d8: SetStreamSource stream %u is not implemented (D3D8 has one stream)", stream);
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    if (!vb) {
+        dev->d3d8_stream_vb = 0;
+        dev->d3d8_stream_offset = 0;
+        dev->d3d8_stream_stride = 0;
+    } else if (vb->kind == K_D3D8VERTEXBUFFER) {
+        dev->d3d8_stream_vb = vb->id;
+        dev->d3d8_stream_offset = 0;
+        dev->d3d8_stream_stride = arg(c, 3);
+    } else {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    com_ret(c, D8_OK);
+}
+
+// (this, pIndexData, BaseVertexIndex)
+void Dev_SetIndices(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    ComObj *ib = com_this(arg(c, 1));
+    if (!dev) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    if (!ib) {
+        dev->d3d8_indices = 0;
+        dev->d3d8_base_vertex = 0;
+    } else if (ib->kind == K_D3D8INDEXBUFFER) {
+        dev->d3d8_indices = ib->id;
+        dev->d3d8_base_vertex = arg(c, 2);
+    } else {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    com_ret(c, D8_OK);
+}
+
+// (this, Handle). For fixed-function rendering the handle is the FVF code.
+// D3D8 programable vertex shader handles have the top 16 bits set (0xFFFE);
+// none can exist because CreateVertexShader is not implemented, so such a
+// handle is a named failure rather than a silent store.
+void Dev_SetVertexShader(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t handle = arg(c, 1);
+    if (!dev) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    if ((handle & 0xFFFE0000u) == 0xFFFE0000u) {
+        fprintf(stderr,
+                "d3d8: SetVertexShader handle 0x%08x is a programable shader, which is "
+                "not implemented\n",
+                handle);
+        fflush(stderr);
+        imports_unsupported(c);
+        return;
+    }
+    dev->d3d8_fvf = handle;
+    com_ret(c, D8_OK);
+}
+void Dev_GetVertexShader(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t out = arg(c, 1);
+    if (!dev || !out || !gm_valid(out, 4)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, dev->d3d8_fvf);
+    com_ret(c, D8_OK);
+}
+
+// The bytes to draw from right now: the guest heap while the buffer is locked,
+// otherwise the host copy the last Unlock wrote back.
+const uint8_t *d8_buffer_bytes(ComObj *o) {
+    if (!o || o->blob.empty())
+        return nullptr;
+    if (o->pixels)
+        return gm_ptr(o->pixels);
+    return o->blob.data();
+}
+
+// (this, PrimitiveType, StartVertex, PrimitiveCount)
+void Dev_DrawPrimitive(X86 *c) {
+#ifdef RECOMP_D3D8_WGPU
+    ComObj *dev = d8_dev(c);
+    if (!dev || !dev->d3d8_device) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    ComObj *vb = com_get(dev->d3d8_stream_vb);
+    const uint8_t *bytes = d8_buffer_bytes(vb);
+    if (!bytes || !vb->blob.size() || !dev->d3d8_stream_stride) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    D3d8Error err{};
+    int32_t status = d3d8_device_draw_primitive(host_device(dev), arg(c, 1), dev->d3d8_fvf, bytes,
+                                                (uint32_t)vb->blob.size(), dev->d3d8_stream_stride,
+                                                arg(c, 2), arg(c, 3), &err);
+    com_ret(c, host_result(c, status, err));
+#else
+    com_ret(c, D8_ERR_INVALIDCALL);
+#endif
+}
+
+// (this, PrimitiveType, MinIndex, NumVertices, StartIndex, PrimitiveCount). The
+// host ABI consumes a linear triangle list, so an indexed triangle list is
+// expanded into one. Every other topology is refused by name: the renderer has
+// no indexed path and expanding a strip/fan would change the primitive order.
+void Dev_DrawIndexedPrimitive(X86 *c) {
+#ifdef RECOMP_D3D8_WGPU
+    ComObj *dev = d8_dev(c);
+    if (!dev || !dev->d3d8_device) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    ComObj *vb = com_get(dev->d3d8_stream_vb);
+    ComObj *ib = com_get(dev->d3d8_indices);
+    uint32_t topology = arg(c, 1), min_index = arg(c, 2), num_vertices = arg(c, 3);
+    uint32_t start_index = arg(c, 4), prim_count = arg(c, 5);
+    const uint8_t *vbytes = d8_buffer_bytes(vb);
+    const uint8_t *ibytes = d8_buffer_bytes(ib);
+    uint32_t stride = dev->d3d8_stream_stride;
+    if (!vbytes || !ibytes || !stride || !num_vertices || !prim_count) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    if (topology != 4) {
+        fprintf(stderr,
+                "d3d8: DrawIndexedPrimitive topology %u is not implemented; only "
+                "triangle lists are expanded\n",
+                topology);
+        fflush(stderr);
+        imports_unsupported(c);
+        return;
+    }
+    uint32_t index_size = ib->d3d8_buffer_format == D8FMT_INDEX32 ? 4 : 2;
+    uint32_t index_count = prim_count * 3;
+    if (uint64_t(start_index + index_count) * index_size > ib->blob.size() ||
+        uint64_t(min_index + num_vertices) * stride > vb->blob.size()) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    std::vector<uint8_t> expanded(size_t(index_count) * stride);
+    for (uint32_t i = 0; i < index_count; ++i) {
+        uint32_t raw;
+        if (index_size == 4) {
+            memcpy(&raw, ibytes + size_t(start_index + i) * 4, 4);
+        } else {
+            uint16_t v;
+            memcpy(&v, ibytes + size_t(start_index + i) * 2, 2);
+            raw = v;
+        }
+        uint32_t actual = raw + dev->d3d8_base_vertex;
+        if (actual < min_index || actual - min_index >= num_vertices) {
+            com_ret(c, D8_ERR_INVALIDCALL);
+            return;
+        }
+        memcpy(expanded.data() + size_t(i) * stride, vbytes + size_t(actual) * stride, stride);
+    }
+    D3d8Error err{};
+    int32_t status =
+        d3d8_device_draw_primitive(host_device(dev), topology, dev->d3d8_fvf, expanded.data(),
+                                   (uint32_t)expanded.size(), stride, 0, prim_count, &err);
+    com_ret(c, host_result(c, status, err));
+#else
+    com_ret(c, D8_ERR_INVALIDCALL);
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // Vtables, in interface order. A guest dispatches by slot index, so the order
 // is the ABI and may not be rearranged.
 // ---------------------------------------------------------------------------
@@ -1278,6 +1782,41 @@ static const ComMethod g_texture8[] = {
     {"LockRect", 5, Tex_LockRect},
     {"UnlockRect", 2, Tex_UnlockRect},
     {"AddDirtyRect", 2, Tex_AddDirtyRect},
+};
+
+// --- IDirect3DVertexBuffer8 / IDirect3DIndexBuffer8 tables. Both have the
+// IDirect3DResource8 header (GetDevice..GetType) then Lock/Unlock/GetDesc. ---
+static const ComMethod g_vertexbuffer8[] = {
+    {"QueryInterface", 3, com_QueryInterface},
+    {"AddRef", 1, com_AddRef},
+    {"Release", 1, com_Release},
+    {"GetDevice", 2, Buffer_GetDevice},
+    {"SetPrivateData", 5, imports_unsupported},
+    {"GetPrivateData", 4, imports_unsupported},
+    {"FreePrivateData", 2, imports_unsupported},
+    {"SetPriority", 2, Buffer_SetPriority},
+    {"GetPriority", 1, Buffer_GetPriority},
+    {"PreLoad", 1, Buffer_PreLoad},
+    {"GetType", 1, Buffer_GetType},
+    {"Lock", 5, Buffer_Lock},
+    {"Unlock", 1, Buffer_Unlock},
+    {"GetDesc", 2, Buffer_GetDesc},
+};
+static const ComMethod g_indexbuffer8[] = {
+    {"QueryInterface", 3, com_QueryInterface},
+    {"AddRef", 1, com_AddRef},
+    {"Release", 1, com_Release},
+    {"GetDevice", 2, Buffer_GetDevice},
+    {"SetPrivateData", 5, imports_unsupported},
+    {"GetPrivateData", 4, imports_unsupported},
+    {"FreePrivateData", 2, imports_unsupported},
+    {"SetPriority", 2, Buffer_SetPriority},
+    {"GetPriority", 1, Buffer_GetPriority},
+    {"PreLoad", 1, Buffer_PreLoad},
+    {"GetType", 1, Buffer_GetType},
+    {"Lock", 5, Buffer_Lock},
+    {"Unlock", 1, Buffer_Unlock},
+    {"GetDesc", 2, Buffer_GetDesc},
 };
 
 // --- IDirect3D8 table ---
@@ -1325,8 +1864,8 @@ static const ComMethod g_device8[] = {
     {"CreateTexture", 8, Dev_CreateTexture},
     {"CreateVolumeTexture", 9, imports_unsupported},
     {"CreateCubeTexture", 7, imports_unsupported},
-    {"CreateVertexBuffer", 6, imports_unsupported},
-    {"CreateIndexBuffer", 6, imports_unsupported},
+    {"CreateVertexBuffer", 6, Dev_CreateVertexBuffer},
+    {"CreateIndexBuffer", 6, Dev_CreateIndexBuffer},
     {"CreateRenderTarget", 7, imports_unsupported},
     {"CreateDepthStencilSurface", 6, imports_unsupported},
     {"CreateImageSurface", 5, imports_unsupported},
@@ -1344,12 +1883,12 @@ static const ComMethod g_device8[] = {
     {"MultiplyTransform", 3, imports_unsupported},
     {"SetViewport", 2, Dev_SetViewport},
     {"GetViewport", 2, imports_unsupported},
-    {"SetMaterial", 2, imports_unsupported},
-    {"GetMaterial", 2, imports_unsupported},
-    {"SetLight", 3, imports_unsupported},
-    {"GetLight", 3, imports_unsupported},
-    {"LightEnable", 3, imports_unsupported},
-    {"GetLightEnable", 3, imports_unsupported},
+    {"SetMaterial", 2, Dev_SetMaterial},
+    {"GetMaterial", 2, Dev_GetMaterial},
+    {"SetLight", 3, Dev_SetLight},
+    {"GetLight", 3, Dev_GetLight},
+    {"LightEnable", 3, Dev_LightEnable},
+    {"GetLightEnable", 3, Dev_GetLightEnable},
     {"SetClipPlane", 3, imports_unsupported},
     {"GetClipPlane", 3, imports_unsupported},
     {"SetRenderState", 3, Dev_SetRenderState},
@@ -1375,22 +1914,22 @@ static const ComMethod g_device8[] = {
     // TODO(draw): when a draw path is implemented it must call the backend's
     // state check and fail loudly on any render/texture-stage state the
     // renderer does not honour, rather than drawing with it dropped.
-    {"DrawPrimitive", 4, imports_unsupported},
-    {"DrawIndexedPrimitive", 6, imports_unsupported},
+    {"DrawPrimitive", 4, Dev_DrawPrimitive},
+    {"DrawIndexedPrimitive", 6, Dev_DrawIndexedPrimitive},
     {"DrawPrimitiveUP", 5, imports_unsupported},
     {"DrawIndexedPrimitiveUP", 9, imports_unsupported},
     {"ProcessVertices", 6, imports_unsupported},
     {"CreateVertexShader", 5, imports_unsupported},
-    {"SetVertexShader", 2, imports_unsupported},
-    {"GetVertexShader", 2, imports_unsupported},
+    {"SetVertexShader", 2, Dev_SetVertexShader},
+    {"GetVertexShader", 2, Dev_GetVertexShader},
     {"DeleteVertexShader", 2, imports_unsupported},
     {"SetVertexShaderConstant", 4, imports_unsupported},
     {"GetVertexShaderConstant", 4, imports_unsupported},
     {"GetVertexShaderDeclaration", 4, imports_unsupported},
     {"GetVertexShaderFunction", 4, imports_unsupported},
-    {"SetStreamSource", 4, imports_unsupported},
+    {"SetStreamSource", 4, Dev_SetStreamSource},
     {"GetStreamSource", 4, imports_unsupported},
-    {"SetIndices", 3, imports_unsupported},
+    {"SetIndices", 3, Dev_SetIndices},
     {"GetIndices", 3, imports_unsupported},
     {"CreatePixelShader", 3, imports_unsupported},
     {"SetPixelShader", 2, imports_unsupported},
@@ -1447,16 +1986,26 @@ void d3d8_register() {
     com_define(IF_D3D8DEVICE, "d3d8.dll", "IDirect3DDevice8", g_device8, std::size(g_device8));
     com_define(IF_D3D8SURFACE8, "d3d8.dll", "IDirect3DSurface8", g_surface8, std::size(g_surface8));
     com_define(IF_D3D8TEXTURE8, "d3d8.dll", "IDirect3DTexture8", g_texture8, std::size(g_texture8));
+    com_define(IF_D3D8VERTEXBUFFER8, "d3d8.dll", "IDirect3DVertexBuffer8", g_vertexbuffer8,
+               std::size(g_vertexbuffer8));
+    com_define(IF_D3D8INDEXBUFFER8, "d3d8.dll", "IDirect3DIndexBuffer8", g_indexbuffer8,
+               std::size(g_indexbuffer8));
     com_bind(IF_D3D8, K_D3D8);
     com_bind(IF_D3D8DEVICE, K_D3D8DEVICE);
     com_bind(IF_D3D8SURFACE8, K_D3D8SURFACE);
     com_bind(IF_D3D8TEXTURE8, K_D3D8TEXTURE);
+    com_bind(IF_D3D8VERTEXBUFFER8, K_D3D8VERTEXBUFFER);
+    com_bind(IF_D3D8INDEXBUFFER8, K_D3D8INDEXBUFFER);
     com_register_iid(IF_D3D8, IID_IDirect3D8_);
     com_register_iid(IF_D3D8DEVICE, IID_IDirect3DDevice8_);
     com_register_iid(IF_D3D8SURFACE8, IID_IDirect3DSurface8_);
     com_register_iid(IF_D3D8TEXTURE8, IID_IDirect3DTexture8_);
+    com_register_iid(IF_D3D8VERTEXBUFFER8, IID_IDirect3DVertexBuffer8_);
+    com_register_iid(IF_D3D8INDEXBUFFER8, IID_IDirect3DIndexBuffer8_);
     com_set_destructor(K_D3D8SURFACE, surface_destroy);
     com_set_destructor(K_D3D8TEXTURE, texture_destroy);
+    com_set_destructor(K_D3D8VERTEXBUFFER, buffer_destroy);
+    com_set_destructor(K_D3D8INDEXBUFFER, buffer_destroy);
     com_set_destructor(K_D3D8DEVICE, device_destroy);
     imports_register(g_d3d8_exports, std::size(g_d3d8_exports));
 }

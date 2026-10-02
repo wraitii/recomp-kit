@@ -145,6 +145,8 @@ enum ComIface : uint16_t {
     IF_D3D8DEVICE,
     IF_D3D8SURFACE8,
     IF_D3D8TEXTURE8,
+    IF_D3D8VERTEXBUFFER8,
+    IF_D3D8INDEXBUFFER8,
     IF_COUNT
 };
 
@@ -202,20 +204,22 @@ enum ComKind : uint16_t {
     K_MF_CLOCK,
     K_MF_VIDEO_DISPLAY, // IMFVideoDisplayControl on the session's renderer
     K_MF_AUDIO_VOLUME,
-    K_D3D9,           // the IDirect3D9 factory object
-    K_D3D9DEVICE,     // one device created from it
-    K_D3DXEFFECTPOOL, // the D3DX effect pool a game shares between effects
-    K_D3DXEFFECT,     // one effect loaded from the executable's resources
-    K_D3D9TEXTURE,    // a 2D or cube texture and its levels
-    K_D3D9SURFACE,    // one surface: a texture level, a back buffer, a depth buffer
-    K_D3D9VB,         // a vertex buffer
-    K_D3D9IB,         // an index buffer
-    K_D3D9DECL,       // a vertex declaration
-    K_D3D9QUERY,      // an occlusion or event query
-    K_D3D8,           // the IDirect3D8 factory object
-    K_D3D8DEVICE,     // one host wgpu device
-    K_D3D8SURFACE,    // a render target / back buffer view, or one texture level
-    K_D3D8TEXTURE,    // a 2D texture and its mip levels
+    K_D3D9,             // the IDirect3D9 factory object
+    K_D3D9DEVICE,       // one device created from it
+    K_D3DXEFFECTPOOL,   // the D3DX effect pool a game shares between effects
+    K_D3DXEFFECT,       // one effect loaded from the executable's resources
+    K_D3D9TEXTURE,      // a 2D or cube texture and its levels
+    K_D3D9SURFACE,      // one surface: a texture level, a back buffer, a depth buffer
+    K_D3D9VB,           // a vertex buffer
+    K_D3D9IB,           // an index buffer
+    K_D3D9DECL,         // a vertex declaration
+    K_D3D9QUERY,        // an occlusion or event query
+    K_D3D8,             // the IDirect3D8 factory object
+    K_D3D8DEVICE,       // one host wgpu device
+    K_D3D8SURFACE,      // a render target / back buffer view, or one texture level
+    K_D3D8TEXTURE,      // a 2D texture and its mip levels
+    K_D3D8VERTEXBUFFER, // a vertex buffer's host storage
+    K_D3D8INDEXBUFFER,  // an index buffer's host storage
 };
 
 // A DirectInput joystick axis's DIPROP_RANGE, DIPROP_DEADZONE and
@@ -406,6 +410,22 @@ struct ComObj {
     uint32_t d3d8_texture = 0; // owning K_D3D8TEXTURE id
     uint32_t d3d8_level = 0;   // which mip level of that texture
     bool d3d8_depth = false;   // this surface is the implicit depth/stencil buffer
+    // --- K_D3D8VERTEXBUFFER/K_D3D8INDEXBUFFER
+    // Contents live in `blob` (host memory); a Lock stages them into guest heap
+    // through `pixels`/`pixels_bytes`/`lock_count`, exactly as the D3D9 path
+    // does. `d3d8_buffer_fvf` is only meaningful for a vertex buffer.
+    uint32_t d3d8_buffer_fvf = 0;
+    uint32_t d3d8_buffer_format = 0; // index format; 0 for a vertex buffer
+    uint32_t d3d8_buffer_usage = 0;
+    uint32_t d3d8_buffer_pool = 0;
+    // --- stream/indices state on K_D3D8DEVICE
+    uint32_t d3d8_stream_vb = 0;     // bound K_D3D8VERTEXBUFFER object id
+    uint32_t d3d8_stream_offset = 0; // D3D8 allows one offset per stream source
+    uint32_t d3d8_stream_stride = 0;
+    uint32_t d3d8_indices = 0;            // bound K_D3D8INDEXBUFFER object id
+    uint32_t d3d8_base_vertex = 0;        // SetIndices base vertex index
+    uint32_t d3d8_fvf = 0;                // fixed-function FVF from SetVertexShader
+    uint32_t d3d8_bound_texture[8] = {0}; // bound K_D3D8TEXTURE id per texture stage
 };
 
 // One vtable slot.

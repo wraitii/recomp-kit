@@ -340,6 +340,91 @@ static void test_depth() {
     check(dev->refs == 0, "device is released after the depth handle");
 }
 
+// Vertex and index buffers: CPU-backed storage with a staged guest lock. No
+// renderer is involved; the draw path that consumes the bytes is exercised by
+// the headless replay.
+static void test_buffers() {
+    cpu_reset();
+    ComObj *dev = make_test_device(64, 48, 22);
+    uint32_t device = com_view(dev, IF_D3D8DEVICE);
+
+    // CreateVertexBuffer: Length, Usage, FVF, Pool, ppVertexBuffer.
+    check(call_method(device, 23, {96, 0x208, 0x142, 0, sc(0)}) == 0,
+          "CreateVertexBuffer succeeds");
+    uint32_t vb = rd32(sc(0));
+    ComObj *v = vb ? com_this(vb, IF_D3D8VERTEXBUFFER8) : nullptr;
+    check(v && v->kind == K_D3D8VERTEXBUFFER, "vertex buffer view has its own COM identity");
+    if (!v)
+        return;
+    check(v->blob.size() == 96, "vertex buffer storage is the requested length");
+
+    const uint8_t vb_arities[] = {3, 1, 1, 2, 5, 4, 2, 2, 1, 1, 1, 5, 1, 2};
+    for (uint32_t slot = 0; slot < sizeof(vb_arities); ++slot)
+        check(imports_argc(rd32(rd32(vb) + 4 * slot)) == vb_arities[slot],
+              "vertex buffer vtable slot arity");
+
+    check(call_method(vb, 10, {}) == 6, "vertex buffer GetType is D3DRTYPE_VERTEXBUFFER");
+    check(call_method(vb, 13, {sc(32)}) == 0, "vertex buffer GetDesc succeeds");
+    check(rd32(sc(32)) == 100 && rd32(sc(36)) == 6 && rd32(sc(40)) == 0x208 && rd32(sc(44)) == 0 &&
+              rd32(sc(48)) == 96 && rd32(sc(52)) == 0x142,
+          "D3DVERTEXBUFFER_DESC fields");
+
+    // Lock writes into guest heap; Unlock copies back. Locking to the end with
+    // size 0 and a sub-range both return the staged block plus the offset.
+    check(call_method(vb, 11, {0, 0, sc(8), 0}) == 0, "vertex buffer Lock succeeds");
+    uint32_t base = rd32(sc(8));
+    check(base != 0 && heap_size(base) != 0xffffffff, "Lock returns live guest storage");
+    wr32(base, 0x11223344);
+    check(call_method(vb, 12, {}) == 0, "vertex buffer Unlock succeeds");
+    check(call_method(vb, 11, {0, 0, sc(8), 0}) == 0 && rd32(rd32(sc(8))) == 0x11223344,
+          "unlocked vertex bytes survive to the next lock");
+    call_method(vb, 12, {});
+    check(call_method(vb, 11, {12, 4, sc(8), 0}) == 0 && rd32(sc(8)) == base + 12,
+          "a sub-range lock returns base + offset");
+    call_method(vb, 12, {});
+    check(call_method(vb, 11, {92, 8, sc(8), 0}) == 0x8876086c,
+          "a lock past the buffer end is rejected");
+    check(call_method(vb, 11, {0, 0, 0, 0}) == 0x8876086c, "null Lock output is rejected");
+
+    // Destroying a still-locked buffer must free its staging block.
+    check(call_method(device, 23, {16, 8, 0x142, 0, sc(24)}) == 0,
+          "CreateVertexBuffer for lock-destroy");
+    uint32_t locked_vb = rd32(sc(24));
+    check(call_method(locked_vb, 11, {0, 0, sc(8), 0}) == 0, "lock the buffer");
+    uint32_t staged = rd32(sc(8));
+    check(heap_size(staged) != 0xffffffff, "staging is live while locked");
+    check(call_method(locked_vb, 2) == 0, "release the locked buffer");
+    check(heap_size(staged) == 0xffffffff, "destroying a locked buffer frees its staging block");
+
+    // CreateIndexBuffer: Length, Usage, Format, Pool, ppIndexBuffer.
+    check(call_method(device, 24, {48, 8, 102, 0, sc(16)}) == 0, "CreateIndexBuffer succeeds");
+    uint32_t ib = rd32(sc(16));
+    ComObj *i = ib ? com_this(ib, IF_D3D8INDEXBUFFER8) : nullptr;
+    check(i && i->kind == K_D3D8INDEXBUFFER, "index buffer view has its own COM identity");
+    if (!i)
+        return;
+    check(call_method(ib, 10, {}) == 7, "index buffer GetType is D3DRTYPE_INDEXBUFFER");
+    check(call_method(ib, 13, {sc(64)}) == 0 && rd32(sc(64)) == 102 && rd32(sc(68)) == 7 &&
+              rd32(sc(72)) == 8 && rd32(sc(80)) == 48,
+          "D3DINDEXBUFFER_DESC reports the index format and size");
+    check(call_method(device, 24, {48, 0, 99, 0, sc(16)}) == 0x8876086c,
+          "an unknown index format is rejected");
+
+    // SetStreamSource/SetIndices bind weakly; releasing the buffer clears the
+    // device binding so a later draw cannot resolve a dead id.
+    check(call_method(device, 83, {0, vb, 24}) == 0, "SetStreamSource accepts stream 0");
+    check(dev->d3d8_stream_vb == v->id && dev->d3d8_stream_stride == 24,
+          "stream source is stored on the device");
+    check(call_method(device, 83, {1, vb, 24}) == 0x8876086c, "a second stream is rejected");
+    check(call_method(device, 85, {ib, 3}) == 0, "SetIndices stores the index buffer");
+    check(dev->d3d8_indices == i->id && dev->d3d8_base_vertex == 3, "base vertex is stored");
+    check(call_method(vb, 2) == 0, "release the vertex buffer destroys it");
+    check(dev->d3d8_stream_vb == 0, "destroying the vertex buffer clears the stream binding");
+    check(call_method(ib, 2) == 0, "release the index buffer destroys it");
+    check(dev->d3d8_indices == 0, "destroying the index buffer clears the indices binding");
+    check(call_method(device, 2) == 0, "device released after the buffers");
+}
+
 int main(int argc, char **argv) {
     mem_init();
     imports_init();
@@ -390,6 +475,7 @@ int main(int argc, char **argv) {
     test_backbuffer(22); // X8R8G8B8
     test_texture();
     test_depth();
+    test_buffers();
     // Reset follows the runtime's generation order: old guest heap first,
     // then module state and COM vtables. No stale weak cache may survive.
     mem_init();
