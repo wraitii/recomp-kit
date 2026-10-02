@@ -30,6 +30,7 @@
       "QueryInterface": "com_QueryInterface",
       "AddRef": "com_AddRef",
       "Release": "com_Release",
+      "Reset": "Dev_Reset",
       "TestCooperativeLevel": "Dev_TestCooperativeLevel",
       "GetAvailableTextureMem": "Dev_GetAvailableTextureMem",
       "GetDirect3D": "Dev_GetDirect3D",

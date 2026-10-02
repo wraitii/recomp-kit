@@ -103,6 +103,11 @@ int g_mode_w = 640, g_mode_h = 480;
 bool g_mode_dirty = false;
 int g_window_mode = 0, g_wanted_window_mode = 0;
 bool g_fullscreen_transition = false;
+// Optional automated run bounds, matching the headless host's MAX_FRAMES and
+// MAX_SECONDS. Zero means the user's window is the only thing that ends the
+// run. A bounded run posts the same WM_CLOSE the frame cap posts headless.
+uint32_t g_run_max_frames = 0;
+double g_run_max_seconds = 0.0;
 HostRect g_pointer_confinement; // window points; main thread only
 bool g_pointer_sample_valid = false;
 int32_t g_pointer_sample_x = 0, g_pointer_sample_y = 0;
@@ -1448,6 +1453,16 @@ void pump() {
     service(0.0);
     after_events();
     host_gate_pointer_tick();
+
+    // A bounded run for automated verification: the same MAX_FRAMES /
+    // MAX_SECONDS the headless host honours. Unset, this is two comparisons
+    // and the window is the only way to end the run.
+    if ((g_run_max_frames || g_run_max_seconds > 0.0) && !boot_close_requested()) {
+        const bool over_frames = g_run_max_frames && host_present_count() >= g_run_max_frames;
+        const bool over_time = g_run_max_seconds > 0.0 && boot_elapsed() >= g_run_max_seconds;
+        if (over_frames || over_time)
+            boot_request_close(over_frames ? "frame cap reached" : "wall-clock cap reached");
+    }
 }
 
 // The runtime's idle wait, called on the run thread when the guest is about to
@@ -1695,6 +1710,10 @@ int main(int argc, char **argv) {
     // packaged build can be checked on a machine with neither a display nor
     // the game.
     const char *exe_flag = nullptr;
+    if (const char *v = recomp_env("MAX_FRAMES"))
+        g_run_max_frames = (uint32_t)strtoul(v, nullptr, 0);
+    if (const char *v = recomp_env("MAX_SECONDS"))
+        g_run_max_seconds = strtod(v, nullptr);
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--version") == 0) {
             printf(RECOMP_APP_NAME " %s (%s)\n", POP_RECOMP_VERSION, gpu::default_backend_name());

@@ -543,6 +543,70 @@ void D8_CreateDevice(X86 *c) {
 // IDirect3DDevice8
 // ---------------------------------------------------------------------------
 
+// Drop the device's weak references to the implicit backbuffer and autodepth
+// surfaces so Reset can lazily build replacements. Any guest reference keeps
+// the old object alive; com_release only destroys it when that was the last.
+void device_discard_implicit_surfaces(ComObj *dev) {
+    if (ComObj *s = com_get(dev->d3d8_backbuffer))
+        com_release(s);
+    if (ComObj *s = com_get(dev->d3d8_depthbuffer))
+        com_release(s);
+    dev->d3d8_backbuffer = 0;
+    dev->d3d8_depthbuffer = 0;
+}
+
+// (this, pPresentationParameters). D3D8 Reset recreates the implicit swap
+// chain and resets device state. The guest 52-byte D3DPRESENT_PARAMETERS is
+// copied into the plain ABI struct; validation and the target/state rebuild
+// live in Rust. Here we only retire the two guest implicit-surface handles so
+// they are lazily recreated against the new target.
+void Dev_Reset(X86 *c) {
+#ifdef RECOMP_D3D8_WGPU
+    ComObj *dev = d8_dev(c);
+    uint32_t pp = arg(c, 1);
+    if (!dev || !dev->d3d8_device || !pp || !gm_valid(pp, 52)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    D3d8PresentParams params{};
+    params.back_buffer_width = rd32(pp);
+    params.back_buffer_height = rd32(pp + 4);
+    params.back_buffer_format = rd32(pp + 8);
+    params.back_buffer_count = rd32(pp + 12);
+    params.multisample_type = rd32(pp + 16);
+    params.swap_effect = rd32(pp + 20);
+    params.device_window = rd32(pp + 24);
+    params.windowed = rd32(pp + 28);
+    params.enable_auto_depth_stencil = rd32(pp + 32);
+    params.auto_depth_stencil_format = rd32(pp + 36);
+    params.flags = rd32(pp + 40);
+    params.fullscreen_refresh_rate = rd32(pp + 44);
+    params.fullscreen_presentation_interval = rd32(pp + 48);
+    LOGV("d3d8: Reset params %ux%u fmt=0x%x count=%u ms=%u swap=%u hwnd=0x%x windowed=%u "
+         "autodepth=%u autofmt=0x%x flags=0x%x refresh=%u interval=%u",
+         params.back_buffer_width, params.back_buffer_height, params.back_buffer_format,
+         params.back_buffer_count, params.multisample_type, params.swap_effect,
+         params.device_window, params.windowed, params.enable_auto_depth_stencil,
+         params.auto_depth_stencil_format, params.flags, params.fullscreen_refresh_rate,
+         params.fullscreen_presentation_interval);
+    D3d8Error err{};
+    int32_t status = d3d8_device_reset(host_device(dev), &params, &err);
+    if (status) {
+        com_ret(c, host_result(c, status, err));
+        return;
+    }
+    dev->d3d8_width = params.back_buffer_width;
+    dev->d3d8_height = params.back_buffer_height;
+    dev->d3d8_format = params.back_buffer_format;
+    dev->d3d8_depth_format =
+        params.enable_auto_depth_stencil ? params.auto_depth_stencil_format : 0;
+    device_discard_implicit_surfaces(dev);
+    com_ret(c, D8_OK);
+#else
+    com_ret(c, D8_ERR_NOTAVAILABLE);
+#endif
+}
+
 void Dev_TestCooperativeLevel(X86 *c) {
     com_ret(c, D8_OK);
 }
