@@ -1470,6 +1470,37 @@ void k_SetLastError(X86 *c) {
     set_eax(c, 0);
 }
 
+// The guest CPU is fixed by recomp_cpuid(): GenuineIntel family 6, model 3
+// (Pentium II), with FPU, TSC and CMOV and no MMX. Answer from that same model
+// so CPUID and this API can never disagree. Feature codes follow winnt.h; an
+// unknown code is FALSE, as on Windows.
+void k_IsProcessorFeaturePresent(X86 *c) {
+    enum {
+        PF_FLOATING_POINT_PRECISION_ERRATA = 0,
+        PF_FLOATING_POINT_EMULATED = 1,
+        PF_COMPARE_EXCHANGE_DOUBLE = 2,
+        PF_MMX_INSTRUCTIONS_AVAILABLE = 3,
+        PF_PPC_MOVEMEM_64BIT_OK = 4,
+        PF_ALPHA_BYTE_INSTRUCTIONS = 5,
+        PF_XMMI_INSTRUCTIONS_AVAILABLE = 6,
+        PF_3DNOW_INSTRUCTIONS_AVAILABLE = 7,
+        PF_RDTSC_INSTRUCTION_AVAILABLE = 8,
+        PF_PAE_ENABLED = 9,
+        PF_XMMI64_INSTRUCTIONS_AVAILABLE = 10,
+    };
+    bool present = false;
+    switch ((uint32_t)arg(c, 0)) {
+    case PF_COMPARE_EXCHANGE_DOUBLE:     // CMPXCHG8B, present since Pentium
+    case PF_RDTSC_INSTRUCTION_AVAILABLE: // CPUID EDX bit 4 is advertised
+        present = true;
+        break;
+    default: // the FDIV erratum, FPU emulation, MMX/SSE/3DNow and the rest
+        present = false;
+        break;
+    }
+    set_eax(c, present ? 1 : 0);
+}
+
 void k_IsBadReadPtr(X86 *c) {
     uint32_t p = arg(c, 0), n = arg(c, 1);
     set_eax(c, (p && gm_valid(p, n ? n : 1)) ? 0 : 1);
@@ -4838,7 +4869,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "IsBadCodePtr", 1, k_IsBadCodePtr},
     // ABI known; these APIs remain unsupported and stop with a named diagnostic.
     {"KERNEL32.dll", "FormatMessageA", 7, imports_unsupported},
-    {"KERNEL32.dll", "IsProcessorFeaturePresent", 1, imports_unsupported},
+    {"KERNEL32.dll", "IsProcessorFeaturePresent", 1, k_IsProcessorFeaturePresent},
     // time
     {"KERNEL32.dll", "GetTickCount", 0, k_GetTickCount},
     {"KERNEL32.dll", "QueryPerformanceCounter", 1, k_QueryPerformanceCounter},

@@ -6,7 +6,9 @@
 #include "gdi_image.h"
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace user32 {
 uint32_t wide_units(const std::string &s) {
@@ -299,6 +301,78 @@ void load_icon(X86 *c) {
     heap_free(copy);
     set_eax(c, ok ? gdi_create_icon(image) : 0);
 }
+// LoadImageA loads an icon, cursor or bitmap from the module's PE resources, or
+// (LR_LOADFROMFILE) from the guest file system. The host paints its own cursor
+// and no window icon, so the icon and cursor forms only need the same distinct
+// non-zero handles LoadIconA/LoadCursorA return; a bitmap is decoded into a
+// real GDI image. The two resource forms reuse the loaders above so the icon
+// group/cursor handling cannot drift between LoadIcon and LoadImage.
+void load_image_a(X86 *c) {
+    enum {
+        IMAGE_BITMAP = 0,
+        IMAGE_ICON = 1,
+        IMAGE_CURSOR = 2,
+        LR_LOADFROMFILE = 0x10,
+    };
+    uint32_t type = arg(c, 2);
+    if (!(arg(c, 5) & LR_LOADFROMFILE)) {
+        if (type == IMAGE_ICON)
+            load_icon(c);
+        else if (type == IMAGE_CURSOR)
+            alias_ansi(c, "LoadCursorA");
+        else if (type == IMAGE_BITMAP)
+            load_bitmap(c);
+        else
+            set_eax(c, 0);
+        return;
+    }
+    std::string name = arg(c, 1) ? gm_str(arg(c, 1)) : std::string();
+    if (name.empty()) {
+        set_eax(c, 0);
+        return;
+    }
+    if (type == IMAGE_ICON) {
+        alias_ansi(c, "LoadIconA");
+        return;
+    }
+    if (type == IMAGE_CURSOR) {
+        // Not decoded, exactly as LoadCursorFromFile: the host paints its own
+        // pointer, so a readable path only needs a distinct handle.
+        alias_ansi(c, "LoadCursorA");
+        return;
+    }
+    if (type != IMAGE_BITMAP) {
+        set_eax(c, 0);
+        return;
+    }
+    // An uncompressed BMP file: the same DIB decoder the PE bitmap resources
+    // use. The 14-byte BITMAPFILEHEADER is not part of the DIB, so skip it;
+    // bfOffBits is relative to the DIB after that skip.
+    std::string path = win32_host_path(name);
+    FILE *f = path.empty() ? nullptr : fopen(path.c_str(), "rb");
+    if (!f) {
+        set_eax(c, 0);
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    rewind(f);
+    uint32_t temp = 0;
+    if (n >= 54 && uint64_t(n) < 0x10000000u) {
+        temp = heap_alloc(uint32_t(n), true);
+        if (!temp || fread(g_mem + temp, 1, size_t(n), f) != size_t(n) || rd16(temp) != 0x4d42 ||
+            rd32(temp + 10) < 54 || rd32(temp + 10) > uint32_t(n)) {
+            heap_free(temp);
+            temp = 0;
+        }
+    }
+    fclose(f);
+    GdiImage image;
+    bool ok = temp && gdi_decode_image(temp + 14, uint32_t(n) - 14, &image, rd32(temp + 10) - 14);
+    if (temp)
+        heap_free(temp);
+    set_eax(c, ok ? gdi_image_bitmap(image) : 0);
+}
 void draw_text(X86 *c) {
     set_eax(c, gdi::draw_text(arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4)));
 }
@@ -524,6 +598,7 @@ const ImportShim shims[] = {
     W("FindWindowExW", 4, find_ex_w),
     W("LoadBitmapW", 2, load_bitmap),
     W("LoadIconW", 2, load_icon),
+    W("LoadImageA", 6, load_image_a),
     W("LoadStringW", 4, load_string),
     W("DrawTextW", 5, draw_text),
     W("DrawTextExW", 6, draw_text_ex),

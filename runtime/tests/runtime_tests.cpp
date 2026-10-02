@@ -3769,6 +3769,24 @@ static void test_startup_apis(X86 *c) {
         uint32_t tramp = imports_alloc_trampoline("abi-test.dll", name, nullptr, ARGC_UNKNOWN);
         check(imports_argc(tramp) == ARGC_UNKNOWN, "reject ambiguous decoration: %s", name);
     }
+    check(call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {0}) == 0,
+          "FDIV precision errata is absent on the emulated Pentium II");
+    check(call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {2}) == 1 &&
+              call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {8}) == 1,
+          "CMPXCHG8B and RDTSC are present, matching CPUID");
+    check(call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {3}) == 0 &&
+              call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {6}) == 0 &&
+              call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {0x7fffffff}) == 0,
+          "MMX, SSE and unknown feature codes are absent");
+    check(call_import(c, "USER32.dll", "LoadImageA", {0, 0, 1, 16, 16, 0}) == 0x00029001,
+          "LoadImageA(IMAGE_ICON) without an instance gives the shared icon handle");
+    check(call_import(c, "USER32.dll", "LoadImageA", {0, 0, 2, 0, 0, 0}) == 0x0002a000,
+          "LoadImageA(IMAGE_CURSOR) gives the shared cursor handle");
+    check(call_import(c, "USER32.dll", "LoadImageA", {0, 0, 7, 0, 0, 0}) == 0,
+          "LoadImageA rejects an unknown image type");
+    check(call_import(c, "USER32.dll", "LoadImageA",
+                      {0, put_str("no-such-image.bmp"), 0, 0, 0, 0x10}) == 0,
+          "LoadImageA(LR_LOADFROMFILE) fails for a missing bitmap");
     uint32_t cdecl = imports_alloc_trampoline("abi-test.dll", "_explicit@8", nullptr, ARGC_CDECL);
     check(imports_argc(cdecl) == ARGC_CDECL, "explicit signature overrides decorated spelling");
 }
@@ -6752,14 +6770,10 @@ int main(int argc, char **argv) {
         child_setjmp_abort(c);
     // Unsupported APIs must stop execution, rather than report fabricated
     // Windows results. Exercise the dispatcher in children that may abort.
-    const char *unsupported[][2] = {{"KERNEL32.dll", "GetFileTime"},
-                                    {"KERNEL32.dll", "FormatMessageA"},
-                                    {"KERNEL32.dll", "IsProcessorFeaturePresent"},
-                                    {"USER32.dll", "LoadImageA"},
-                                    {"DBGHELP.dll", "SymGetOptions"},
-                                    {"DBGHELP.dll", "SymSetOptions"},
-                                    {"DBGHELP.dll", "SymInitialize"},
-                                    {"DBGHELP.dll", "SymCleanup"}};
+    const char *unsupported[][2] = {
+        {"KERNEL32.dll", "GetFileTime"},  {"KERNEL32.dll", "FormatMessageA"},
+        {"DBGHELP.dll", "SymGetOptions"}, {"DBGHELP.dll", "SymSetOptions"},
+        {"DBGHELP.dll", "SymInitialize"}, {"DBGHELP.dll", "SymCleanup"}};
     for (const auto &api : unsupported) {
         char exe[4096];
         check(os_exe_path(exe, sizeof exe) == 0, "unsupported test knows its executable");

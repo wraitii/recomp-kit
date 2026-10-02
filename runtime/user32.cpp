@@ -1730,8 +1730,6 @@ const ImportShim g_user32_shims[] = {
     {"USER32.dll", "EndPaint", 2, u_EndPaint},
     {"USER32.dll", "LoadIconA", 2, u_LoadIconA},
     {"USER32.dll", "LoadCursorA", 2, u_LoadCursorA},
-    // ABI known; image loading remains unsupported.
-    {"USER32.dll", "LoadImageA", 6, imports_unsupported},
     {"USER32.dll", "ValidateRect", 2, u_ValidateRect},
     {"USER32.dll", "GetUpdateRect", 3, u_GetUpdateRect},
     {"USER32.dll", "GetScrollBarInfo", 3, nullptr},
