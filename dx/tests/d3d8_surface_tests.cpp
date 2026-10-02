@@ -425,6 +425,51 @@ static void test_buffers() {
     check(call_method(device, 2) == 0, "device released after the buffers");
 }
 
+// Texture binding and reference lifetime. The renderer's sampling is exercised
+// by the headless replay; this is the guest COM identity/lifetime contract.
+static void test_bind_texture() {
+    cpu_reset();
+    ComObj *dev = make_test_device(8, 4, 22);
+    uint32_t device = com_view(dev, IF_D3D8DEVICE);
+    check(call_method(device, 20, {8, 4, 1, 0, 22, 2, sc(0)}) == 0, "texture A created");
+    uint32_t a = rd32(sc(0));
+    check(call_method(device, 20, {8, 4, 1, 0, 22, 2, sc(4)}) == 0, "texture B created");
+    uint32_t b = rd32(sc(4));
+    ComObj *ta = com_this(a, IF_D3D8TEXTURE8);
+    ComObj *tb = com_this(b, IF_D3D8TEXTURE8);
+    if (!ta || !tb)
+        return;
+
+    // SetTexture binds stage 0; GetTexture returns the same view with a new ref.
+    check(call_method(device, 61, {0, a}) == 0, "SetTexture binds stage 0");
+    check(dev->d3d8_bound_texture[0] == ta->id, "device stores the bound texture");
+    check(call_method(device, 60, {0, sc(8)}) == 0 && rd32(sc(8)) == a,
+          "GetTexture returns the bound view");
+    call_method(rd32(sc(8)), 2);
+
+    // Replacing the binding drops the device's reference to A. With the
+    // caller's reference released below, A is destroyed.
+    check(call_method(device, 61, {0, b}) == 0, "SetTexture replaces the binding");
+    check(dev->d3d8_bound_texture[0] == tb->id, "device stores the replacement");
+    check(call_method(a, 2) == 0, "replaced texture is released by the device");
+    check(!com_get(ta->id), "replaced texture is destroyed");
+
+    // A null binding releases and clears the slot, and GetTexture reports null.
+    wr32(sc(8), 0xfeedface);
+    check(call_method(device, 61, {0, 0}) == 0, "SetTexture(NULL) unbinds");
+    check(dev->d3d8_bound_texture[0] == 0 && call_method(device, 60, {0, sc(8)}) == 0 &&
+              rd32(sc(8)) == 0,
+          "unbound stage is cleared and GetTexture returns null");
+    check(call_method(b, 2) == 0, "unbound texture is released by the device");
+    check(!com_get(tb->id), "unbound texture is destroyed");
+
+    // Stage 8 is outside D3D8's eight stages; a non-texture view is invalid.
+    check(call_method(device, 61, {8, 0}) == 0x8876086c, "stage 8 is rejected");
+    check(call_method(device, 61, {0, a}) == 0x8876086c, "a dead texture view is rejected");
+    call_method(device, 2);
+    check(dev->refs == 0, "device released after the binding test");
+}
+
 int main(int argc, char **argv) {
     mem_init();
     imports_init();
@@ -474,6 +519,7 @@ int main(int argc, char **argv) {
     test_backbuffer(21); // A8R8G8B8
     test_backbuffer(22); // X8R8G8B8
     test_texture();
+    test_bind_texture();
     test_depth();
     test_buffers();
     // Live locked CPU resources must be retired when mem_init discards guest

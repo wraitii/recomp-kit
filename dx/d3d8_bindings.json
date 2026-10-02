@@ -56,6 +56,8 @@
       "GetLightEnable": "Dev_GetLightEnable",
       "SetRenderState": "Dev_SetRenderState",
       "SetTextureStageState": "Dev_SetTextureStageState",
+      "GetTexture": "Dev_GetTexture",
+      "SetTexture": "Dev_SetTexture",
       "DrawPrimitive": "Dev_DrawPrimitive",
       "DrawIndexedPrimitive": "Dev_DrawIndexedPrimitive",
       "SetVertexShader": "Dev_SetVertexShader",

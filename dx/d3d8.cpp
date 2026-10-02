@@ -841,6 +841,52 @@ void Dev_SetTextureStageState(X86 *c) {
 #endif
     com_ret(c, D8_ERR_INVALIDCALL);
 }
+// (this, Stage, pTexture). The device holds a reference to the bound texture
+// and drops the replaced one; the rendered sampling happens at draw time via
+// d8_sync_texture, so a LockRect after SetTexture is observed.
+void Dev_SetTexture(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t stage = arg(c, 1), view = arg(c, 2);
+    if (!dev || stage >= 8) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    ComObj *tex = view ? com_this(view, IF_D3D8TEXTURE8) : nullptr;
+    if (view && (!tex || tex->kind != K_D3D8TEXTURE)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    ComObj *old = com_get(dev->d3d8_bound_texture[stage]);
+    if (tex)
+        com_addref(tex);
+    dev->d3d8_bound_texture[stage] = tex ? tex->id : 0;
+    if (old && old != tex)
+        com_release(old);
+    com_ret(c, D8_OK);
+}
+// (this, Stage, ppTexture). D3D8 returns the bound texture with a new
+// reference; a NULL binding writes NULL and reports D3D_OK.
+void Dev_GetTexture(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t stage = arg(c, 1), out = arg(c, 2);
+    if (!dev || stage >= 8 || !out || !gm_valid(out, 4)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, 0);
+    ComObj *tex = com_get(dev->d3d8_bound_texture[stage]);
+    if (tex) {
+        com_addref(tex);
+        uint32_t tex_view = com_view(tex, IF_D3D8TEXTURE8);
+        if (!tex_view) {
+            com_release(tex);
+            com_ret(c, D8_ERR_INVALIDCALL);
+            return;
+        }
+        wr32(out, tex_view);
+    }
+    com_ret(c, D8_OK);
+}
 void Dev_Present(X86 *c) {
 #ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
@@ -1765,6 +1811,27 @@ const uint8_t *d8_buffer_bytes(ComObj *o) {
     return storage_data(o);
 }
 
+#ifdef RECOMP_D3D8_WGPU
+// Hand the bound stage-0 texture's level-0 CPU bytes to the renderer. Called
+// immediately before each draw so a level locked after SetTexture samples its
+// newest content. A null binding sends an empty block, which selects the
+// renderer's default white texture, matching D3D8's unbound-stage default.
+void d8_sync_texture(ComObj *dev, uint32_t stage) {
+    if (!dev || !dev->d3d8_device || stage >= 8)
+        return;
+    ComObj *tex = com_get(dev->d3d8_bound_texture[stage]);
+    ComObj *level = tex && !tex->d3d8_levels.empty() ? com_get(tex->d3d8_levels[0]) : nullptr;
+    D3d8Error err{};
+    if (tex && level) {
+        const uint8_t *data = d8_buffer_bytes(level);
+        d3d8_device_set_texture(host_device(dev), stage, tex->rmask, level->width, level->height,
+                                data, data ? level->pixels_bytes : 0, &err);
+    } else {
+        d3d8_device_set_texture(host_device(dev), stage, 0, 0, 0, nullptr, 0, &err);
+    }
+}
+#endif
+
 // (this, PrimitiveType, StartVertex, PrimitiveCount)
 void Dev_DrawPrimitive(X86 *c) {
 #ifdef RECOMP_D3D8_WGPU
@@ -1780,6 +1847,7 @@ void Dev_DrawPrimitive(X86 *c) {
         return;
     }
     D3d8Error err{};
+    d8_sync_texture(dev, 0);
     int32_t status = d3d8_device_draw_primitive(host_device(dev), arg(c, 1), dev->d3d8_fvf, bytes,
                                                 (uint32_t)vb->pixels_bytes, dev->d3d8_stream_stride,
                                                 arg(c, 2), arg(c, 3), &err);
@@ -1811,6 +1879,7 @@ void Dev_DrawIndexedPrimitive(X86 *c) {
         return;
     }
     D3d8Error err{};
+    d8_sync_texture(dev, 0);
     int32_t status = d3d8_device_draw_indexed_primitive(
         host_device(dev), topology, dev->d3d8_fvf, vbytes, vb->pixels_bytes, stride, ibytes,
         ib->pixels_bytes, ib->d3d8_buffer_format, dev->d3d8_base_vertex, min_index, num_vertices,
