@@ -390,6 +390,11 @@ struct ComObj {
     // Weak cache of the externally held implicit backbuffer surface. The
     // surface holds its device alive; the device must not retain it in return.
     uint32_t d3d8_backbuffer = 0;
+    // Weak cache of the implicit autodepth surface, created at device creation
+    // when D3DPRESENT_PARAMETERS asked for one. Same ownership rule as the
+    // backbuffer: the surface retains the device, not the reverse.
+    uint32_t d3d8_depthbuffer = 0;
+    uint32_t d3d8_depth_format = 0; // raw D3DFORMAT requested at create; 0 = none
     // --- K_D3D8TEXTURE
     uint32_t d3d8_level_count = 0;
     uint32_t d3d8_usage = 0;           // D3DUSAGE the texture was created with
@@ -400,6 +405,7 @@ struct ComObj {
     // --- K_D3D8SURFACE texture levels (the implicit backbuffer leaves these 0)
     uint32_t d3d8_texture = 0; // owning K_D3D8TEXTURE id
     uint32_t d3d8_level = 0;   // which mip level of that texture
+    bool d3d8_depth = false;   // this surface is the implicit depth/stencil buffer
 };
 
 // One vtable slot.

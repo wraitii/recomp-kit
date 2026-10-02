@@ -293,6 +293,53 @@ static void test_texture() {
     check(dev2->refs == 0, "all texture references release the device");
 }
 
+// The autodepth handle path. Fixtures carry the depth fields CreateDevice
+// would set; the actual depth bytes live in the Rust target and are exercised
+// by the headless replay, not here.
+static void test_depth() {
+    cpu_reset();
+    ComObj *dev = make_test_device(64, 48, 22);
+    uint32_t device = com_view(dev, IF_D3D8DEVICE);
+
+    // No autodepth: the request is refused and clears the output.
+    wr32(sc(0), 0xfeedface);
+    check(call_method(device, 33, {sc(0)}) == 0x8876086c && rd32(sc(0)) == 0,
+          "GetDepthStencilSurface without autodepth is INVALIDCALL");
+
+    dev->d3d8_depth_format = 80; // D3DFMT_D16
+    wr32(sc(0), 0xfeedface);
+    check(call_method(device, 33, {sc(0)}) == 0, "GetDepthStencilSurface returns the depth handle");
+    uint32_t depth = rd32(sc(0));
+    check(depth != 0, "GetDepthStencilSurface writes a real interface");
+    ComObj *d = depth ? com_this(depth, IF_D3D8SURFACE8) : nullptr;
+    check(d && d->d3d8_depth, "depth surface is marked as depth");
+    check(call_method(device, 33, {sc(4)}) == 0 && rd32(sc(4)) == depth,
+          "repeated GetDepthStencilSurface preserves identity");
+    check(d && d->refs == 2, "two GetDepthStencilSurface calls hold two references");
+    call_method(depth, 2);
+
+    // Descriptor: depth usage, D16 format, 2 bytes per texel.
+    check(call_method(depth, 8, {sc(64)}) == 0, "depth GetDesc succeeds");
+    check(rd32(sc(64)) == 80 && rd32(sc(72)) == 2 && rd32(sc(80)) == 64 * 48 * 2 &&
+              rd32(sc(88)) == 64 && rd32(sc(92)) == 48,
+          "depth descriptor format/usage/size/width/height");
+
+    // SetRenderTarget accepts the implicit backbuffer and the depth handle.
+    check(call_method(device, 16, {0, 0, sc(8)}) == 0, "GetBackBuffer for SetRenderTarget");
+    uint32_t backbuffer = rd32(sc(8));
+    check(call_method(device, 31, {backbuffer, depth}) == 0,
+          "SetRenderTarget accepts backbuffer + depth");
+    check(call_method(device, 31, {backbuffer, 0}) == 0,
+          "SetRenderTarget accepts a NULL depth argument");
+    check(call_method(device, 33, {sc(12)}) == 0, "GetDepthStencilSurface after SetRenderTarget");
+    call_method(rd32(sc(12)), 2);
+    call_method(backbuffer, 2);
+    check(call_method(depth, 2) == 0, "last depth reference releases the depth surface");
+    check(!dev->d3d8_depthbuffer, "depth surface destruction clears the weak cache");
+    call_method(device, 2);
+    check(dev->refs == 0, "device is released after the depth handle");
+}
+
 int main(int argc, char **argv) {
     mem_init();
     imports_init();
@@ -306,6 +353,17 @@ int main(int argc, char **argv) {
         ComObj *surface = com_new(K_D3D8SURFACE);
         call_method(com_view(surface, IF_D3D8SURFACE8), 9, {sc(0), 0, 0});
         return 1; // The unsupported call must abort, even with RECOMP_LOG=0.
+    }
+    if (argc == 2 && strcmp(argv[1], "--unsupported-rendertarget") == 0) {
+        cpu_reset();
+        ComObj *dev = make_test_device(4, 4, 22);
+        // A depth surface is not a valid render target; the probe must abort
+        // by name rather than silently redirecting the implicit target.
+        ComObj *depth = com_new(K_D3D8SURFACE);
+        depth->d3d8_owner = dev->id;
+        depth->d3d8_depth = true;
+        call_method(com_view(dev, IF_D3D8DEVICE), 31, {com_view(depth, IF_D3D8SURFACE8), 0});
+        return 1;
     }
     if (argc == 2 && strcmp(argv[1], "--unsupported-texture") == 0) {
         cpu_reset();
@@ -331,6 +389,7 @@ int main(int argc, char **argv) {
     test_backbuffer(21); // A8R8G8B8
     test_backbuffer(22); // X8R8G8B8
     test_texture();
+    test_depth();
     // Reset follows the runtime's generation order: old guest heap first,
     // then module state and COM vtables. No stale weak cache may survive.
     mem_init();

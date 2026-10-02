@@ -47,11 +47,6 @@ constexpr uint32_t D8_RTYPE_CUBETEXTURE = 4;
 constexpr uint32_t D8_TYPE_SURFACE = 1;
 constexpr uint32_t D8_TYPE_TEXTURE = 3;
 
-constexpr uint32_t D8_CLEAR_ZBUFFER = 0x2;
-constexpr uint32_t D8_CLEAR_STENCIL = 0x4;
-constexpr uint32_t D8_RS_ZENABLE = 7;
-constexpr uint32_t D8_RS_ZWRITEENABLE = 14;
-
 // D3DPOOL. UpdateTexture's contract distinguishes the two pools it names.
 constexpr uint32_t D8POOL_DEFAULT = 0;
 constexpr uint32_t D8POOL_MANAGED = 1;
@@ -257,13 +252,19 @@ bool color_format(uint32_t format) {
     return format == D8FMT_A8R8G8B8 || format == D8FMT_X8R8G8B8;
 }
 
+// True when a raw D3DFORMAT is one of the four depth/stencil formats the
+// wgpu backend maps to an honest format (see graphics/d3d8-wgpu format.rs).
+bool d8_depth_format(uint32_t fmt) {
+    return fmt == D8FMT_D16 || fmt == D8FMT_D24S8 || fmt == D8FMT_D24X8 || fmt == D8FMT_D32;
+}
+
 // True when CheckDeviceFormat should answer D3D_OK for a usage/rtype/format
 // triple. Kept separate so the texture tests can exercise the policy without
-// a device. Depth-stencil is not implemented, and the host renderer only
-// samples 32-bit ARGB.
+// a device. Depth-stencil use is backed for the four mapped depth formats; the
+// host renderer only samples 32-bit ARGB.
 bool check_device_format_ok(uint32_t usage, uint32_t rtype, uint32_t fmt) {
     if (usage & D8USAGE_DEPTHSTENCIL)
-        return false;
+        return rtype == D8_RTYPE_SURFACE && d8_depth_format(fmt);
     if (usage & D8USAGE_RENDERTARGET)
         return (rtype == D8_RTYPE_TEXTURE || rtype == D8_RTYPE_SURFACE) && color_format(fmt);
     if (rtype == D8_RTYPE_TEXTURE)
@@ -278,15 +279,6 @@ void write_display_mode(uint32_t addr, const DisplayMode &m) {
     wr32(addr + 4, m.h);
     wr32(addr + 8, m.refresh);
     wr32(addr + 12, m.format);
-}
-
-// Depth storage is not implemented. An operation that would need it must stop
-// with a named diagnostic rather than pretend depth testing/writing happened.
-[[noreturn]] void depth_unsupported(X86 *c, const char *what) {
-    fprintf(stderr, "d3d8: %s needs depth storage, which is not implemented\n", what);
-    fflush(stderr);
-    imports_unsupported(c);
-    abort();
 }
 
 // ---------------------------------------------------------------------------
@@ -393,8 +385,12 @@ void D8_CheckDeviceMultiSampleType(X86 *c) {
                    ? D8_OK
                    : D8_ERR_NOTAVAILABLE);
 }
+// (Adapter, DeviceType, AdapterFormat, RenderTargetFormat, DepthStencilFormat).
+// Every depth format the backend maps is compatible with the 32-bit ARGB
+// render targets this bridge advertises; anything else is NOTAVAILABLE.
 void D8_CheckDepthStencilMatch(X86 *c) {
-    com_ret(c, D8_ERR_NOTAVAILABLE);
+    bool ok = adapter_type(c) && color_format(arg(c, 3)) && d8_depth_format(arg(c, 4));
+    com_ret(c, ok ? D8_OK : D8_ERR_NOTAVAILABLE);
 }
 void D8_GetDeviceCaps(X86 *c) {
     uint32_t out = arg(c, 3);
@@ -414,6 +410,30 @@ void D8_GetDeviceCaps(X86 *c) {
 void D8_GetAdapterMonitor(X86 *c) {
     // USER32's virtual desktop exposes one monitor, with guest handle 1.
     com_ret(c, arg(c, 1) == 0 && ensure_adapter() ? 1 : 0);
+}
+
+// The device's implicit autodepth surface, made on demand and kept via the
+// device's weak cache. The actual depth bytes live in the Rust target; this
+// guest object is the handle GetDepthStencilSurface returns and SetRenderTarget
+// accepts. The surface retains the device, not the reverse.
+ComObj *device_depthbuffer(ComObj *dev) {
+    ComObj *surface = com_get(dev->d3d8_depthbuffer);
+    if (surface) {
+        com_addref(surface);
+        return surface;
+    }
+    surface = com_new(K_D3D8SURFACE);
+    if (!surface)
+        return nullptr;
+    surface->d3d8_owner = dev->id;
+    com_addref(dev);
+    surface->d3d8_depth = true;
+    surface->d3d8_usage = D8USAGE_DEPTHSTENCIL;
+    surface->rmask = dev->d3d8_depth_format;
+    surface->width = dev->d3d8_width;
+    surface->height = dev->d3d8_height;
+    dev->d3d8_depthbuffer = surface->id;
+    return surface;
 }
 
 // The initial bridge supports a single explicit-size windowed color target.
@@ -443,25 +463,18 @@ void D8_CreateDevice(X86 *c) {
     // by presenting a completed frame; reject any other semantics instead of
     // silently dropping them. Windowed (0) and fullscreen (1) present through
     // the same host target, so the flag is not a constraint. An autodepth
-    // request is accepted only for a depth format the bridge can describe;
-    // the host backend does not yet own a depth buffer, so its surface calls
-    // still fail by name rather than returning a fabricated handle.
+    // request is accepted only for a depth format the backend maps; the depth
+    // attachment is owned by the Rust target and the guest surface is its
+    // handle.
     uint32_t depth = rd32(pp + 32), depth_format = rd32(pp + 36);
     if (rd32(pp + 12) > 1 || rd32(pp + 16) || (swap != 1 && swap != 4) ||
-        (depth && depth_format != D8FMT_D32 && depth_format != D8FMT_D24S8 &&
-         depth_format != D8FMT_D24X8 && depth_format != D8FMT_D16) ||
-        rd32(pp + 40) || rd32(pp + 44) || rd32(pp + 48)) {
+        (depth && !d8_depth_format(depth_format)) || rd32(pp + 40) || rd32(pp + 44) ||
+        rd32(pp + 48)) {
         com_ret(c, D8_ERR_NOTAVAILABLE);
         return;
     }
-    // TODO(depth): depth storage is not implemented. The create call is not
-    // refused because the guest asks for it unconditionally, but any state or
-    // clear that would need it fails by name in Dev_SetRenderState/Dev_Clear.
-    if (depth)
-        LOGW("d3d8: autodepth requested (fmt 0x%x); depth storage is not implemented yet",
-             depth_format);
-    LOGV("d3d8: CreateDevice %ux%u fmt=0x%x swap=%u windowed=%u accepted", w, h, format, swap,
-         windowed);
+    LOGV("d3d8: CreateDevice %ux%u fmt=0x%x swap=%u windowed=%u autodepth=%u autofmt=0x%x", w, h,
+         format, swap, windowed, depth, depth_format);
     if (!adapter_type(c)) {
         com_ret(c, D8_ERR_NOTAVAILABLE);
         return;
@@ -475,13 +488,16 @@ void D8_CreateDevice(X86 *c) {
     dev->d3d8_width = w;
     dev->d3d8_height = h;
     dev->d3d8_format = format;
+    dev->d3d8_depth_format = depth ? depth_format : 0;
     D3d8Error err{};
-    dev->d3d8_device = d3d8_device_create(w, h, format, &err);
+    dev->d3d8_device = d3d8_device_create(w, h, format, depth ? depth_format : 0, &err);
     if (!dev->d3d8_device) {
         com_release(dev);
         com_ret(c, host_result(c, err.status ? err.status : D3D8_BACKEND, err));
         return;
     }
+    if (depth)
+        device_depthbuffer(dev); // establish the guest handle for GetDepthStencilSurface
     uint32_t view = com_view(dev, IF_D3D8DEVICE);
     if (!view) {
         com_release(dev);
@@ -567,10 +583,15 @@ void Dev_Clear(X86 *c) {
 #ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     if (dev && dev->d3d8_device) {
-        if (arg(c, 3) & (D8_CLEAR_ZBUFFER | D8_CLEAR_STENCIL))
-            depth_unsupported(c, "IDirect3DDevice8::Clear with ZBUFFER/STENCIL");
+        // (this, Count, pRects, Flags, Color, Z, Stencil). The Rust backend
+        // applies exactly the color/depth/stencil bits Flags asks for; a
+        // request the target cannot satisfy is a named backend error.
+        float z;
+        uint32_t zbits = arg(c, 5);
+        memcpy(&z, &zbits, 4);
         D3d8Error err{};
-        int32_t status = d3d8_device_clear(host_device(dev), arg(c, 1), arg(c, 3), arg(c, 4), &err);
+        int32_t status = d3d8_device_clear(host_device(dev), arg(c, 1), arg(c, 3), arg(c, 4), z,
+                                           arg(c, 6), &err);
         com_ret(c, host_result(c, status, err));
         return;
     }
@@ -613,12 +634,6 @@ void Dev_SetRenderState(X86 *c) {
 #ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     if (dev && dev->d3d8_device) {
-        // Depth-dependent states cannot be honoured without depth storage.
-        // Any nonzero ZENABLE/ZWRITEENABLE would silently mis-render, so it
-        // stops by name here. (The D3D8 default is ZENABLE=TRUE; a game that
-        // relies on depth must wait for the depth implementation.)
-        if ((arg(c, 1) == D8_RS_ZENABLE || arg(c, 1) == D8_RS_ZWRITEENABLE) && arg(c, 2))
-            depth_unsupported(c, "IDirect3DDevice8::SetRenderState(ZENABLE/ZWRITEENABLE on)");
         D3d8Error err{};
         int32_t status = d3d8_device_set_render_state(host_device(dev), arg(c, 1), arg(c, 2), &err);
         com_ret(c, host_result(c, status, err));
@@ -718,6 +733,65 @@ void Dev_GetBackBuffer(X86 *c) {
         return;
     }
     wr32(out, view);
+    com_ret(c, D8_OK);
+}
+
+// (this, ppDepthStencilSurface). Returns the implicit autodepth surface when
+// the device was created with EnableAutoDepthStencil; without one this is the
+// same INVALIDCALL real D3D8 returns.
+void Dev_GetDepthStencilSurface(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t out = arg(c, 1);
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, 0);
+    if (!dev || !dev->d3d8_depth_format) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    ComObj *surface = device_depthbuffer(dev);
+    if (!surface) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    uint32_t view = com_view(surface, IF_D3D8SURFACE8);
+    if (!view) {
+        com_release(surface);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    wr32(out, view);
+    com_ret(c, D8_OK);
+}
+
+// (this, pRenderTarget, pDepthStencilSurface). The backend owns exactly one
+// render target, the implicit backbuffer, with its autodepth attachment. A
+// request for any other target is unimplemented and stops by name rather than
+// silently drawing to the wrong surface.
+void Dev_SetRenderTarget(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t rt_arg = arg(c, 1), ds_arg = arg(c, 2);
+    ComObj *rt = rt_arg ? com_this(rt_arg, IF_D3D8SURFACE8) : nullptr;
+    ComObj *ds = ds_arg ? com_this(ds_arg, IF_D3D8SURFACE8) : nullptr;
+    if (!dev || !rt_arg || !rt || rt->d3d8_depth || rt->d3d8_owner != dev->id) {
+        fprintf(stderr, "d3d8: SetRenderTarget only supports this device's implicit backbuffer\n");
+        fflush(stderr);
+        imports_unsupported(c);
+    }
+    if (ds_arg && (!ds || !ds->d3d8_depth || ds->d3d8_owner != dev->id)) {
+        fprintf(stderr, "d3d8: SetRenderTarget depth surface is not this device's implicit "
+                        "depth buffer\n");
+        fflush(stderr);
+        imports_unsupported(c);
+    }
+    // A NULL depth argument would detach the buffer in D3D8. The Rust target
+    // always owns an autodepth attachment once created, so detaching is not
+    // representable; keep it bound and say so rather than silently dropping
+    // the request.
+    if (!ds_arg && dev && dev->d3d8_depth_format)
+        LOGW("d3d8: SetRenderTarget(NULL depth) is not modelled; the autodepth buffer stays bound");
     com_ret(c, D8_OK);
 }
 
@@ -911,6 +985,15 @@ void Surface_GetDesc(X86 *c) {
         width = surface->width;
         height = surface->height;
         size = surface->pitch * surface->height;
+    } else if (surface->d3d8_depth) {
+        // Autodepth handle. Its bytes live in the Rust target; the descriptor
+        // reports the D3D8 depth size (D16 is 2 bytes/texel, the rest 4).
+        format = surface->rmask;
+        usage = D8USAGE_DEPTHSTENCIL;
+        pool = 0; // D3DPOOL_DEFAULT
+        width = surface->width;
+        height = surface->height;
+        size = width * height * (surface->rmask == D8FMT_D16 ? 2u : 4u);
     } else {
         ComObj *dev = com_get(surface->d3d8_owner);
         if (!dev) {
@@ -1145,6 +1228,8 @@ void surface_destroy(ComObj *surface) {
     if (dev) {
         if (dev->d3d8_backbuffer == surface->id)
             dev->d3d8_backbuffer = 0;
+        if (dev->d3d8_depthbuffer == surface->id)
+            dev->d3d8_depthbuffer = 0;
         com_release(dev);
     }
     surface->d3d8_owner = 0;
@@ -1248,9 +1333,9 @@ static const ComMethod g_device8[] = {
     {"CopyRects", 6, imports_unsupported},
     {"UpdateTexture", 3, Dev_UpdateTexture},
     {"GetFrontBuffer", 2, imports_unsupported},
-    {"SetRenderTarget", 3, imports_unsupported},
+    {"SetRenderTarget", 3, Dev_SetRenderTarget},
     {"GetRenderTarget", 2, imports_unsupported},
-    {"GetDepthStencilSurface", 2, imports_unsupported},
+    {"GetDepthStencilSurface", 2, Dev_GetDepthStencilSurface},
     {"BeginScene", 1, Dev_BeginScene},
     {"EndScene", 1, Dev_EndScene},
     {"Clear", 7, Dev_Clear},
