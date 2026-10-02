@@ -5,9 +5,28 @@ here implements a published API contract and nothing about the game: a shim
 answers the way the real DLL would, and where it cannot, it says so once in
 the log rather than inventing an answer.
 
-Nothing in this directory draws, plays or opens anything. Rendering and audio
-leave through the callbacks in `host_api.h`, which the native host implements with
-Metal and AVAudioEngine. That keeps every test here headless.
+Most rendering and audio leave through callbacks in `host_api.h`. The optional
+D3D8 bridge additionally owns an offscreen Rust/wgpu device; its CPU-only
+descriptor tests compile with that backend disabled.
+
+## Bounded D3D8 bridge
+
+`d3d8.cpp` registers complete factory, device and surface vtables. Implemented
+operations cover adapter facts, conservative capabilities, a single explicit-size
+windowed color target, backbuffer descriptors/lifetime, and the host ABI's scene,
+clear, transform, viewport, render-state and owned-pixel presentation operations.
+Unsupported methods stop with their names; backend failures never become success.
+Vertex-buffer creation/draw, textures, depth/stencil, surface locks, device reset,
+fullscreen and additional swapchains are not implemented. These limits can prevent
+a guest from selecting this adapter; capability bits must not be inflated to
+bypass selection.
+
+Native macOS builds optionally link a game-provided `graphics/d3d8-wgpu` crate
+exporting `include/d3d8_abi.h`. CMake builds its locked static library, tracks all
+Rust modules and checks the ABI version before use. Other platforms and games
+without that crate build the no-renderer path, which advertises no adapter.
+The null-host target always excludes Rust. The reusable renderer itself has not
+yet been incorporated into the kit; this is a bounded integration boundary.
 
 ## Files
 

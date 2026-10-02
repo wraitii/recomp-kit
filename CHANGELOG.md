@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add the D3D8 implicit backbuffer surface interface with a 32-byte guest
+  descriptor, stable identity while referenced, and device lifetime retention.
+  Unsupported surface methods stop with named argument diagnostics. Locking
+  and further device/resource operations remain outside this slice.
+- Correct ANSI resource-name conversion in `LoadImageA`, reject unsupported
+  file icon/cursor loads, and keep processor-feature queries consistent with
+  the runtime's actual CPUID feature bits.
+
 - Dump raw stack argument values, ABI metadata, registers and guest return address
   for unsupported imports. Unknown arities show a labelled eight-word stack preview;
   out-of-arena words are marked unreadable. Fatal diagnostics flush to stderr.

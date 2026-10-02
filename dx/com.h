@@ -139,6 +139,10 @@ enum ComIface : uint16_t {
     // version 8 vtables.
     IF_DINPUT8,
     IF_DINPUTDEVICE8,
+    // Direct3D 8 (d3d8.cpp): independent factory, device and implicit surface.
+    IF_D3D8,
+    IF_D3D8DEVICE,
+    IF_D3D8SURFACE8,
     IF_COUNT
 };
 
@@ -206,6 +210,9 @@ enum ComKind : uint16_t {
     K_D3D9IB,         // an index buffer
     K_D3D9DECL,       // a vertex declaration
     K_D3D9QUERY,      // an occlusion or event query
+    K_D3D8,           // the IDirect3D8 factory object
+    K_D3D8DEVICE,     // one host wgpu device
+    K_D3D8SURFACE,    // a render target / back buffer view
 };
 
 // A DirectInput joystick axis's DIPROP_RANGE, DIPROP_DEADZONE and
@@ -370,6 +377,16 @@ struct ComObj {
     int32_t cc_sharpness = 5;
     int32_t cc_gamma = 1;
     int32_t cc_colorenable = 1;
+
+    // --- D3D8/wgpu. The Rust host device is a
+    // host-side pointer kept here, never in a guest field.
+    void *d3d8_device = nullptr; // D3d8Device* from the Rust ABI
+    uint32_t d3d8_width = 0, d3d8_height = 0, d3d8_format = 0;
+    uint32_t d3d8_factory = 0; // K_D3D8DEVICE: its IDirect3D8 object id
+    uint32_t d3d8_owner = 0;   // K_D3D8SURFACE: the retained device object id
+    // Weak cache of the externally held implicit backbuffer surface. The
+    // surface holds its device alive; the device must not retain it in return.
+    uint32_t d3d8_backbuffer = 0;
 };
 
 // One vtable slot.

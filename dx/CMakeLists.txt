@@ -3,13 +3,57 @@ set(POP_DX_SOURCES
   d3dx10.cpp dsound.cpp dshow.cpp mp3_source.cpp dinput.cpp dinput_joystick.cpp xinput.cpp qmixer.cpp
   mss32.cpp redbook.cpp avi.cpp waveout.cpp fmod.cpp soundlib.cpp galaxy_stub.cpp riff.cpp bink.cpp video_frame.cpp mf_media.cpp
   mf.cpp weanetr.cpp d3d9.cpp d3d9_raster.cpp d3d9_shader.cpp d3d9_shadergen.cpp host_d9_default.cpp
-  d3dx9.cpp)
+  d3dx9.cpp d3d8.cpp)
 
 add_library(recomp_dx OBJECT ${POP_DX_SOURCES})
 target_link_libraries(recomp_dx PUBLIC recomp_runtime)
 pop_link_video(recomp_dx)
 target_compile_options(recomp_dx PRIVATE ${POP_WARN_HOST})
 pop_optimize(recomp_dx 2)
+
+# Optional Rust D3D8/wgpu host renderer. A game that ships
+# graphics/d3d8-wgpu gets the static library and RECOMP_D3D8_WGPU; every other
+# game builds no Rust and compiles d3d8.cpp's no-renderer path only. The
+# frameworks are what the probe binaries link through cargo's build scripts.
+set(RECOMP_D3D8_WGPU_DIR "${RECOMP_GAME_DIR}/graphics/d3d8-wgpu")
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND EXISTS "${RECOMP_D3D8_WGPU_DIR}/Cargo.toml")
+  find_program(CARGO_EXECUTABLE cargo)
+  if(NOT CARGO_EXECUTABLE)
+    message(FATAL_ERROR "graphics/d3d8-wgpu is present but cargo was not found")
+  endif()
+  # This host bridge has only been wired for native macOS builds. Cargo's
+  # default target must not silently supply a host archive to a cross build.
+  if(CMAKE_CROSSCOMPILING OR (CMAKE_OSX_ARCHITECTURES AND
+      NOT CMAKE_OSX_ARCHITECTURES STREQUAL CMAKE_HOST_SYSTEM_PROCESSOR))
+    message(FATAL_ERROR "D3D8/wgpu integration currently requires a native single-architecture macOS build")
+  endif()
+  file(GLOB_RECURSE RECOMP_D3D8_WGPU_SOURCES CONFIGURE_DEPENDS
+    "${RECOMP_D3D8_WGPU_DIR}/src/*.rs")
+  set(RECOMP_D3D8_WGPU_TARGET_DIR "${POP_BUILD_ROOT}/d3d8-wgpu/rust")
+  set(RECOMP_D3D8_WGPU_LIB "${RECOMP_D3D8_WGPU_TARGET_DIR}/release/libd3d8_wgpu.a")
+  add_custom_command(
+    OUTPUT "${RECOMP_D3D8_WGPU_LIB}"
+    COMMAND ${CMAKE_COMMAND} -E env "CARGO_TARGET_DIR=${RECOMP_D3D8_WGPU_TARGET_DIR}"
+            "${CARGO_EXECUTABLE}" build --release --lib --locked --manifest-path "${RECOMP_D3D8_WGPU_DIR}/Cargo.toml"
+    DEPENDS "${RECOMP_D3D8_WGPU_DIR}/Cargo.toml"
+            "${RECOMP_D3D8_WGPU_DIR}/Cargo.lock"
+            ${RECOMP_D3D8_WGPU_SOURCES}
+    COMMENT "Building d3d8-wgpu Rust static library"
+    VERBATIM)
+  add_custom_target(d3d8_wgpu_rust DEPENDS "${RECOMP_D3D8_WGPU_LIB}")
+  add_library(d3d8_wgpu STATIC IMPORTED GLOBAL)
+  set_target_properties(d3d8_wgpu PROPERTIES IMPORTED_LOCATION "${RECOMP_D3D8_WGPU_LIB}")
+  add_dependencies(d3d8_wgpu d3d8_wgpu_rust)
+  target_include_directories(recomp_dx PRIVATE "${RECOMP_D3D8_WGPU_DIR}/include")
+  target_compile_definitions(recomp_dx PRIVATE RECOMP_D3D8_WGPU=1)
+  target_link_libraries(recomp_dx PUBLIC d3d8_wgpu)
+  foreach(fw ApplicationServices CoreGraphics CoreVideo Carbon AppKit Foundation QuartzCore Metal CoreFoundation ColorSync CoreServices IOKit)
+    find_library(RECOMP_FW_${fw} ${fw})
+    if(RECOMP_FW_${fw})
+      target_link_libraries(recomp_dx PUBLIC ${RECOMP_FW_${fw}})
+    endif()
+  endforeach()
+endif()
 
 # The same shims with every host callback a strong no-op: a binary linking
 # these can neither draw nor play sound. The parity fixture and the profile
@@ -22,6 +66,17 @@ target_compile_options(recomp_dx_null PRIVATE ${POP_WARN_HOST})
 pop_optimize(recomp_dx_null 1)
 
 if(NOT IOS AND NOT ANDROID)
+# Descriptor/lifetime tests construct guest device state explicitly; no Rust
+# adapter or GPU is used. This also builds the optional renderer's off path.
+add_executable(d3d8_surface_tests tests/d3d8_surface_tests.cpp
+  ${POP_ROOT}/runtime/tests/stub_recomp_call.cpp)
+target_link_libraries(d3d8_surface_tests PRIVATE recomp_platform recomp_dx_null recomp_runtime)
+target_compile_options(d3d8_surface_tests PRIVATE ${POP_WARN_HOST})
+pop_optimize(d3d8_surface_tests 1)
+pop_test_binary(d3d8_surface_tests)
+add_test(NAME d3d8_surface_tests COMMAND d3d8_surface_tests)
+set_tests_properties(d3d8_surface_tests PROPERTIES LABELS nogame)
+
 # host_api.h is a C header too. The C11 consumer is an object the DX tests
 # link; the header is also parsed as C++17 on its own.
 add_library(host_api_header_test OBJECT tests/host_api_header_test.c)

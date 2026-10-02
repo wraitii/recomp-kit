@@ -29,6 +29,9 @@ void ddraw_register();
 void d3d_register();
 void d3d9_register();
 void d3dx9_register();
+// Direct3D 8: the factory/device/resource bridge onto the Rust wgpu renderer.
+void d3d8_register();
+void d3d8_reset();
 void dsound_register();
 void dshow_register();
 void dinput_register();

@@ -1490,7 +1490,8 @@ void k_IsProcessorFeaturePresent(X86 *c) {
     };
     bool present = false;
     switch ((uint32_t)arg(c, 0)) {
-    case PF_COMPARE_EXCHANGE_DOUBLE:     // CMPXCHG8B, present since Pentium
+    // CMPXCHG8B is deliberately absent from this runtime's CPUID EDX mask.
+    // Do not infer it from the nominal CPU family/model.
     case PF_RDTSC_INSTRUCTION_AVAILABLE: // CPUID EDX bit 4 is advertised
         present = true;
         break;

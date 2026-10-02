@@ -316,6 +316,20 @@ void load_image_a(X86 *c) {
     };
     uint32_t type = arg(c, 2);
     if (!(arg(c, 5) & LR_LOADFROMFILE)) {
+        // resource_find consumes UTF-16 names. Preserve MAKEINTRESOURCE values,
+        // but convert ANSI names before using the shared wide resource loaders.
+        uint32_t name = arg(c, 1), wide = 0;
+        if ((type == IMAGE_ICON || type == IMAGE_BITMAP) && name > 0xffff) {
+            std::string text = gm_str(name);
+            uint32_t cap = wide_units(text) + 1;
+            wide = heap_alloc(cap * 2, true);
+            if (!wide) {
+                set_eax(c, 0);
+                return;
+            }
+            gm_put_wstr(wide, text, cap);
+            wr32(c->r[R_ESP] + 8, wide);
+        }
         if (type == IMAGE_ICON)
             load_icon(c);
         else if (type == IMAGE_CURSOR)
@@ -324,6 +338,10 @@ void load_image_a(X86 *c) {
             load_bitmap(c);
         else
             set_eax(c, 0);
+        if (wide) {
+            wr32(c->r[R_ESP] + 8, name);
+            heap_free(wide);
+        }
         return;
     }
     std::string name = arg(c, 1) ? gm_str(arg(c, 1)) : std::string();
@@ -332,13 +350,13 @@ void load_image_a(X86 *c) {
         return;
     }
     if (type == IMAGE_ICON) {
-        alias_ansi(c, "LoadIconA");
+        set_last_error(120); // File icon decoding is not implemented.
+        set_eax(c, 0);
         return;
     }
     if (type == IMAGE_CURSOR) {
-        // Not decoded, exactly as LoadCursorFromFile: the host paints its own
-        // pointer, so a readable path only needs a distinct handle.
-        alias_ansi(c, "LoadCursorA");
+        set_last_error(120); // File cursor decoding is not implemented.
+        set_eax(c, 0);
         return;
     }
     if (type != IMAGE_BITMAP) {

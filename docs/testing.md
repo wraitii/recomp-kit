@@ -25,6 +25,15 @@ beside `dx_tests` because it defines the `host_pad_*` callbacks strongly.
 Every `tools/test.py` mode takes `--game-dir /abs/path/to/<game>`; without it
 the kit's stub game is used and the `game`-labelled suites report a skip.
 
+`d3d8_surface_tests` (`nogame`) exercises the backbuffer descriptor, vtable
+calling convention, identity, bounds and device/factory ownership through guest
+COM dispatch. Its devices are constructed state fixtures; it does not create a
+GPU or demonstrate game rendering. `--unsupported-lock` and
+`--unsupported-texture` are child probes expected to abort with named diagnostics,
+including with `RECOMP_LOG=0`. When running `runtime_tests --startup-contracts`
+directly, set `RECOMP_PYTHON` to the absolute Python interpreter containing
+`pefile`; CTest normally supplies that setting.
+
 Invoke these with `.venv/bin/python`. The native tests need a macOS Metal device;
 CI compiles them but does not claim GPU or original-game execution. The mod suite
 first builds and runs a deterministic 32-frame entity capture from your own game

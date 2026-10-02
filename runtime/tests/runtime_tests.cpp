@@ -182,7 +182,9 @@ static bool pefile_sections(ExpectedImage &out, std::string &err) {
         "s.Misc_VirtualSize, s.SizeOfRawData, s.PointerToRawData, s.Characteristics)) for s in "
         "pe.sections];"
         "[print('IMPORT %x %s %s' % (i.address, d.dll.decode(), "
-        "i.name.decode() if i.name else 'ord%d' % i.ordinal)) "
+        // pefile annotates some ordinal imports with known names. The PE and
+        // loader still use their ordinal identity, not that optional annotation.
+        "'ord%d' % i.ordinal if i.import_by_ordinal else i.name.decode())) "
         "for d in getattr(pe, 'DIRECTORY_ENTRY_IMPORT', []) for i in d.imports]"
         "\" 2>/dev/null";
     const char *cmd = cmd_s.c_str();
@@ -3733,7 +3735,57 @@ static void test_undeliverable_calls(X86 *c) {
     c->r[R_ESP] = esp0;
 }
 
+// Synthetic named bitmap in the loaded PE's resource arena. Restore every
+// changed byte so subsequent tests still observe the original image.
+static void test_load_image_ansi(X86 *c) {
+    section("LoadImageA named resource encoding");
+    uint32_t image = loader_image_base(), opt = image + rd32(image + 0x3c) + 24;
+    uint32_t root = image + rd32(opt + 112), bytes = rd32(opt + 116);
+    if (!check(bytes >= 0x300 && gm_valid(root, bytes), "resource fixture fits image"))
+        return;
+    std::vector<uint8_t> saved(g_mem + root, g_mem + root + 0x300);
+    memset(g_mem + root, 0, 0x300);
+    wr16(root + 14, 1);
+    wr32(root + 16, 2); // RT_BITMAP
+    wr32(root + 20, 0x80000040);
+    wr16(root + 0x4c, 1);
+    wr16(root + 0x4e, 1);
+    wr32(root + 0x50, 0x80000100);
+    wr32(root + 0x54, 0x80000080);
+    wr32(root + 0x58, 7);
+    wr32(root + 0x5c, 0x80000080);
+    wr16(root + 0x8e, 1);
+    wr32(root + 0x90, 0x409);
+    wr32(root + 0x94, 0xc0);
+    wr32(root + 0xc0, root + 0x200 - image);
+    wr32(root + 0xc4, 44);
+    wr16(root + 0x100, 6);
+    gm_put_wstr(root + 0x102, "Review", 7);
+    wr32(root + 0x200, 40);
+    wr32(root + 0x204, 1);
+    wr32(root + 0x208, 1);
+    wr16(root + 0x20c, 1);
+    wr16(root + 0x20e, 32);
+    wr32(root + 0x228, 0xff123456);
+    for (uint32_t name : {put_str("Review"), 7u}) {
+        uint32_t bitmap = call_import(c, "USER32.dll", "LoadImageA", {image, name, 0, 0, 0, 0});
+        uint32_t out = scratch_block(24);
+        check(bitmap && call_import(c, "GDI32.dll", "GetObjectA", {bitmap, 24, out}) == 24 &&
+                  rd32(out + 4) == 1 && rd32(out + 8) == 1,
+              "LoadImageA resolves ANSI names and integer resource IDs");
+        if (bitmap)
+            call_import(c, "GDI32.dll", "DeleteObject", {bitmap});
+    }
+    memcpy(g_mem + root, saved.data(), saved.size());
+    for (uint32_t type : {1u, 2u})
+        check(call_import(c, "USER32.dll", "LoadImageA",
+                          {0, put_str("missing-image.ico"), type, 0, 0, 0x10}) == 0 &&
+                  get_last_error() == 120,
+              "unsupported file icon/cursor never returns a fabricated handle");
+}
+
 static void test_startup_apis(X86 *c) {
+    test_load_image_ansi(c);
     section("startup API calling conventions and failures");
     check(call_import(c, "KERNEL32.dll", "GetSystemDefaultLCID", {}) == 0x409,
           "system locale matches the virtual Windows locale");
@@ -3771,9 +3823,17 @@ static void test_startup_apis(X86 *c) {
     }
     check(call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {0}) == 0,
           "FDIV precision errata is absent on the emulated Pentium II");
-    check(call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {2}) == 1 &&
+    check(call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {2}) == 0 &&
               call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {8}) == 1,
-          "CMPXCHG8B and RDTSC are present, matching CPUID");
+          "CMPXCHG8B is absent and RDTSC is present, matching CPUID");
+    X86 cpuid{};
+    cpuid.r[R_EAX] = 1;
+    recomp_cpuid(&cpuid);
+    check(call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {2}) ==
+                  ((cpuid.r[R_EDX] >> 8) & 1) &&
+              call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {8}) ==
+                  ((cpuid.r[R_EDX] >> 4) & 1),
+          "feature API agrees with actual CPUID bits");
     check(call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {3}) == 0 &&
               call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {6}) == 0 &&
               call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {0x7fffffff}) == 0,
