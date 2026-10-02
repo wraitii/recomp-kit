@@ -29,6 +29,26 @@ constexpr uint32_t D8_ERR_INVALIDCALL = 0x8876086Cu;
 constexpr uint32_t D8_ERR_NOTAVAILABLE = 0x8876086Au;
 constexpr uint32_t D8_DEVTYPE_HAL = 1;
 
+// Depth formats the bridge accepts at create time even though it has no depth
+// storage yet, so the guest's D3DPRESENT_PARAMETERS is not rejected outright.
+// Using one (ZENABLE/ZWRITEENABLE on, or a deep Clear) fails by name below.
+constexpr uint32_t D8FMT_D16 = 80;
+constexpr uint32_t D8FMT_D24S8 = 75;
+constexpr uint32_t D8FMT_D24X8 = 77;
+constexpr uint32_t D8FMT_D32 = 71;
+
+constexpr uint32_t D8_CLEAR_ZBUFFER = 0x2;
+constexpr uint32_t D8_CLEAR_STENCIL = 0x4;
+constexpr uint32_t D8_RS_ZENABLE = 7;
+constexpr uint32_t D8_RS_ZWRITEENABLE = 14;
+
+// D3D8's GetAvailableTextureMem reports free texture memory, which on the
+// modeled unified-memory machine is the runtime's deterministic available
+// physical memory (KERNEL32!GlobalMemoryStatus dwAvailPhys, 384 MB). The
+// backend exposes no VRAM budget, so this is the modeled figure, not a live
+// wgpu query.
+constexpr uint32_t D8_AVAILABLE_TEXTURE_MEM = 384u * 1024u * 1024u;
+
 constexpr uint32_t D8FMT_X8R8G8B8 = 0x16;
 
 #define D8_IID(a, b, c, d0, d1, d2, d3, d4, d5, d6, d7)                                            \
@@ -135,17 +155,31 @@ void write_caps(uint32_t addr) {
     wr32(addr + 12, 0x00080000u); // D3DCAPS2_CANRENDERWINDOWED
 }
 
-// The same virtual display modes used by the Win32/DirectDraw boundary. Only
-// the 32-bit format supported by this backend is exposed; 0 is default refresh.
+// The DirectDraw table holds the front end's 8/16-bit modes, so filtering it
+// for 32 bits yields nothing. The D3D8 backend can create and present any
+// 32-bit target, so advertise the virtual desktop plus the standard 4:3 steps;
+// 0 is the default refresh. The game picks its own fullscreen size and only
+// needs a non-empty mode list to consider the adapter compatible.
+//
+// DIVERGENCE(original): the reference adapter enumerated the real hardware's
+// modes. These host-presentable sizes are synthesized; the host seam does not
+// enumerate D3D8 display modes, and the desktop entry comes from the virtual
+// display mode rather than an adapter query.
 struct DisplayMode {
     uint32_t w, h, refresh, format;
 };
 std::vector<DisplayMode> display_modes() {
     std::vector<DisplayMode> result;
-    uint32_t w, h, bpp;
-    for (uint32_t i = 0; ddraw_enum_display_mode(i, &w, &h, &bpp); ++i)
-        if (bpp == 32)
-            result.push_back({w, h, 0, D8FMT_X8R8G8B8});
+    uint32_t dw = 0, dh = 0, dbpp = 0;
+    win32_display_mode(&dw, &dh, &dbpp);
+    if (dw && dh)
+        result.push_back({dw, dh, 0, D8FMT_X8R8G8B8});
+    static const uint32_t kStandard[][2] = {
+        {640, 480}, {800, 600}, {1024, 768}, {1280, 1024}, {1600, 1200},
+    };
+    for (const auto &m : kStandard)
+        if (m[0] != dw || m[1] != dh)
+            result.push_back({m[0], m[1], 0, D8FMT_X8R8G8B8});
     return result;
 }
 
@@ -163,6 +197,15 @@ void write_display_mode(uint32_t addr, const DisplayMode &m) {
     wr32(addr + 4, m.h);
     wr32(addr + 8, m.refresh);
     wr32(addr + 12, m.format);
+}
+
+// Depth storage is not implemented. An operation that would need it must stop
+// with a named diagnostic rather than pretend depth testing/writing happened.
+[[noreturn]] void depth_unsupported(X86 *c, const char *what) {
+    fprintf(stderr, "d3d8: %s needs depth storage, which is not implemented\n", what);
+    fflush(stderr);
+    imports_unsupported(c);
+    abort();
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +239,9 @@ void D8_GetAdapterIdentifier(X86 *c) {
     com_ret(c, D8_OK);
 }
 void D8_GetAdapterModeCount(X86 *c) {
-    com_ret(c, arg(c, 1) == 0 && ensure_adapter() ? uint32_t(display_modes().size()) : 0);
+    uint32_t count = arg(c, 1) == 0 && ensure_adapter() ? uint32_t(display_modes().size()) : 0;
+    LOGV("d3d8: GetAdapterModeCount(adapter %u) -> %u", arg(c, 1), count);
+    com_ret(c, count);
 }
 void D8_EnumAdapterModes(X86 *c) {
     auto modes = display_modes();
@@ -210,6 +255,8 @@ void D8_EnumAdapterModes(X86 *c) {
         return;
     }
     write_display_mode(out, modes[mode]);
+    LOGV("d3d8: EnumAdapterModes(adapter %u, mode %u) -> %ux%u fmt=0x%x", arg(c, 1), mode,
+         modes[mode].w, modes[mode].h, modes[mode].format);
     com_ret(c, D8_OK);
 }
 void D8_GetAdapterDisplayMode(X86 *c) {
@@ -231,9 +278,15 @@ void D8_GetAdapterDisplayMode(X86 *c) {
     com_ret(c, D8_OK);
 }
 void D8_CheckDeviceType(X86 *c) {
-    com_ret(c, adapter_type(c) && arg(c, 3) == 22 && color_format(arg(c, 4)) && arg(c, 5)
-                   ? D8_OK
-                   : D8_ERR_NOTAVAILABLE);
+    // The game probes the fullscreen form (Windowed == 0) of its default
+    // mode. The host backend renders the requested backbuffer and blits the
+    // completed frame to the window, so windowed and fullscreen requests are
+    // equally serviceable; only format compatibility is a real constraint.
+    uint32_t ok =
+        adapter_type(c) && arg(c, 3) == 22 && color_format(arg(c, 4)) ? D8_OK : D8_ERR_NOTAVAILABLE;
+    LOGV("d3d8: CheckDeviceType(adapter %u, type %u, display 0x%x, back 0x%x, windowed %u) -> 0x%x",
+         arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5), ok);
+    com_ret(c, ok);
 }
 void D8_CheckDeviceFormat(X86 *c) {
     com_ret(c, adapter_type(c) && arg(c, 3) == 22 && arg(c, 4) == 1 && arg(c, 5) == 1 &&
@@ -260,6 +313,8 @@ void D8_GetDeviceCaps(X86 *c) {
         return;
     }
     write_caps(out);
+    LOGV("d3d8: GetDeviceCaps(adapter %u, type %u) devcaps=0x%x caps2=0x%x", arg(c, 1), arg(c, 2),
+         rd32(out + 28), rd32(out + 12));
     com_ret(c, D8_OK);
 }
 void D8_GetAdapterMonitor(X86 *c) {
@@ -281,15 +336,38 @@ void D8_CreateDevice(X86 *c) {
         return;
     }
     uint32_t w = rd32(pp), h = rd32(pp + 4), format = rd32(pp + 8);
+    uint32_t swap = rd32(pp + 20), windowed = rd32(pp + 28);
+    LOGV("d3d8: CreateDevice params %ux%u fmt=0x%x count=%u ms=%u swap=%u hwnd=0x%x windowed=%u "
+         "autodepth=%u autofmt=0x%x flags=0x%x refresh=%u interval=%u",
+         w, h, format, rd32(pp + 12), rd32(pp + 16), swap, rd32(pp + 24), windowed, rd32(pp + 32),
+         rd32(pp + 36), rd32(pp + 40), rd32(pp + 44), rd32(pp + 48));
     if (!w || !h || uint64_t(w) * h * 4 > UINT32_MAX || !color_format(format)) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if (rd32(pp + 12) > 1 || rd32(pp + 16) || !rd32(pp + 28) || rd32(pp + 32) || rd32(pp + 40) ||
-        rd32(pp + 44) || rd32(pp + 48) || rd32(pp + 20) != 1) {
+    // DISCARD (1) and COPY_VSYNC (4) are the swap effects the host can honour
+    // by presenting a completed frame; reject any other semantics instead of
+    // silently dropping them. Windowed (0) and fullscreen (1) present through
+    // the same host target, so the flag is not a constraint. An autodepth
+    // request is accepted only for a depth format the bridge can describe;
+    // the host backend does not yet own a depth buffer, so its surface calls
+    // still fail by name rather than returning a fabricated handle.
+    uint32_t depth = rd32(pp + 32), depth_format = rd32(pp + 36);
+    if (rd32(pp + 12) > 1 || rd32(pp + 16) || (swap != 1 && swap != 4) ||
+        (depth && depth_format != D8FMT_D32 && depth_format != D8FMT_D24S8 &&
+         depth_format != D8FMT_D24X8 && depth_format != D8FMT_D16) ||
+        rd32(pp + 40) || rd32(pp + 44) || rd32(pp + 48)) {
         com_ret(c, D8_ERR_NOTAVAILABLE);
         return;
     }
+    // TODO(depth): depth storage is not implemented. The create call is not
+    // refused because the guest asks for it unconditionally, but any state or
+    // clear that would need it fails by name in Dev_SetRenderState/Dev_Clear.
+    if (depth)
+        LOGW("d3d8: autodepth requested (fmt 0x%x); depth storage is not implemented yet",
+             depth_format);
+    LOGV("d3d8: CreateDevice %ux%u fmt=0x%x swap=%u windowed=%u accepted", w, h, format, swap,
+         windowed);
     if (!adapter_type(c)) {
         com_ret(c, D8_ERR_NOTAVAILABLE);
         return;
@@ -329,6 +407,12 @@ void D8_CreateDevice(X86 *c) {
 
 void Dev_TestCooperativeLevel(X86 *c) {
     com_ret(c, D8_OK);
+}
+// The renderer stores this as its texture-memory budget (Ghidra 0x007c70b0
+// reads IDirect3DDevice8 slot 4 into renderer +4/+8). Return the modeled
+// available texture memory rather than a fabricated GPU size.
+void Dev_GetAvailableTextureMem(X86 *c) {
+    com_ret(c, D8_AVAILABLE_TEXTURE_MEM);
 }
 void Dev_GetDirect3D(X86 *c) {
     ComObj *dev = d8_dev(c);
@@ -389,6 +473,8 @@ void Dev_Clear(X86 *c) {
 #ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     if (dev && dev->d3d8_device) {
+        if (arg(c, 3) & (D8_CLEAR_ZBUFFER | D8_CLEAR_STENCIL))
+            depth_unsupported(c, "IDirect3DDevice8::Clear with ZBUFFER/STENCIL");
         D3d8Error err{};
         int32_t status = d3d8_device_clear(host_device(dev), arg(c, 1), arg(c, 3), arg(c, 4), &err);
         com_ret(c, host_result(c, status, err));
@@ -433,8 +519,27 @@ void Dev_SetRenderState(X86 *c) {
 #ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     if (dev && dev->d3d8_device) {
+        // Depth-dependent states cannot be honoured without depth storage.
+        // Any nonzero ZENABLE/ZWRITEENABLE would silently mis-render, so it
+        // stops by name here. (The D3D8 default is ZENABLE=TRUE; a game that
+        // relies on depth must wait for the depth implementation.)
+        if ((arg(c, 1) == D8_RS_ZENABLE || arg(c, 1) == D8_RS_ZWRITEENABLE) && arg(c, 2))
+            depth_unsupported(c, "IDirect3DDevice8::SetRenderState(ZENABLE/ZWRITEENABLE on)");
         D3d8Error err{};
         int32_t status = d3d8_device_set_render_state(host_device(dev), arg(c, 1), arg(c, 2), &err);
+        com_ret(c, host_result(c, status, err));
+        return;
+    }
+#endif
+    com_ret(c, D8_ERR_INVALIDCALL);
+}
+void Dev_SetTextureStageState(X86 *c) {
+#ifdef RECOMP_D3D8_WGPU
+    ComObj *dev = d8_dev(c);
+    if (dev && dev->d3d8_device) {
+        D3d8Error err{};
+        int32_t status = d3d8_device_set_texture_stage_state(host_device(dev), arg(c, 1), arg(c, 2),
+                                                             arg(c, 3), &err);
         com_ret(c, host_result(c, status, err));
         return;
     }
@@ -623,7 +728,7 @@ static const ComMethod g_device8[] = {
     {"AddRef", 1, com_AddRef},
     {"Release", 1, com_Release},
     {"TestCooperativeLevel", 1, Dev_TestCooperativeLevel},
-    {"GetAvailableTextureMem", 1, imports_unsupported},
+    {"GetAvailableTextureMem", 1, Dev_GetAvailableTextureMem},
     {"ResourceManagerDiscardBytes", 2, imports_unsupported},
     {"GetDirect3D", 2, Dev_GetDirect3D},
     {"GetDeviceCaps", 2, Dev_GetDeviceCaps},
@@ -682,13 +787,16 @@ static const ComMethod g_device8[] = {
     {"GetTexture", 3, imports_unsupported},
     {"SetTexture", 3, imports_unsupported},
     {"GetTextureStageState", 4, imports_unsupported},
-    {"SetTextureStageState", 4, imports_unsupported},
+    {"SetTextureStageState", 4, Dev_SetTextureStageState},
     {"ValidateDevice", 2, imports_unsupported},
     {"GetInfo", 4, imports_unsupported},
     {"SetPaletteEntries", 3, imports_unsupported},
     {"GetPaletteEntries", 3, imports_unsupported},
     {"SetCurrentTexturePalette", 2, imports_unsupported},
     {"GetCurrentTexturePalette", 2, imports_unsupported},
+    // TODO(draw): when a draw path is implemented it must call the backend's
+    // state check and fail loudly on any render/texture-stage state the
+    // renderer does not honour, rather than drawing with it dropped.
     {"DrawPrimitive", 4, imports_unsupported},
     {"DrawIndexedPrimitive", 6, imports_unsupported},
     {"DrawPrimitiveUP", 5, imports_unsupported},
