@@ -470,6 +470,25 @@ static void test_bind_texture() {
     check(dev->refs == 0, "device released after the binding test");
 }
 
+// D3DCAPS8 texture limits. Ghost Recon's 0x004eac20 halves every texture
+// until it fits MaxTextureWidth/MaxTextureHeight, so a zero here silently
+// collapses all sampled textures to 1x1. The renderer's declared limits must
+// stay non-zero and non-trivial.
+static void test_caps() {
+    cpu_reset();
+    ComObj *dev = make_test_device(4, 4, 22);
+    uint32_t device = com_view(dev, IF_D3D8DEVICE);
+    uint32_t caps = sc(0x100);
+    for (uint32_t i = 0; i < 212; i += 4)
+        wr32(caps + i, 0xcdcdcdcd);
+    check(call_method(device, 7, {caps}) == 0, "GetDeviceCaps succeeds");
+    check(rd32(caps) == 1, "device type is D3DDEVTYPE_HAL");
+    check(rd32(caps + 0x58) == 2048, "MaxTextureWidth is advertised");
+    check(rd32(caps + 0x5c) == 2048, "MaxTextureHeight is advertised");
+    check(call_method(device, 7, {0}) == 0x8876086c, "null caps output is rejected");
+    call_method(device, 2);
+}
+
 int main(int argc, char **argv) {
     mem_init();
     imports_init();
@@ -520,6 +539,7 @@ int main(int argc, char **argv) {
     test_backbuffer(22); // X8R8G8B8
     test_texture();
     test_bind_texture();
+    test_caps();
     test_depth();
     test_buffers();
     // Live locked CPU resources must be retired when mem_init discards guest
