@@ -6666,7 +6666,86 @@ static void test_import_return_trace() {
     remove_tree(dir);
 }
 
+// Exercise actual aborting dispatch, including arities beyond the observer's
+// eight-word limit and a preview that reaches the end of the guest arena.
+static void test_unsupported_diagnostics() {
+    section("unsupported import argument diagnostics");
+    char dir[] = "build/recomp/import-diagnostic-XXXXXX", exe[4096];
+    if (!check(os_mkdtemp(dir) == 0, "created diagnostic directory"))
+        return;
+    if (!check(os_exe_path(exe, sizeof exe) == 0, "found diagnostic executable"))
+        return;
+    for (const char *mode : {"known", "zero", "cdecl", "unknown", "edge", "legacy"}) {
+        std::string path = std::string(dir) + "/" + mode + ".log";
+        const char *args[] = {exe, "--child-import-diagnostic", mode, path.c_str(), nullptr};
+        int64_t pid = 0;
+        int code = -1;
+        check(os_spawn(args, &pid) == 0 && os_wait(pid, &code) == 0 &&
+                  code == (!strcmp(mode, "legacy") ? 0 : 134),
+              "%s diagnostic preserves dispatch outcome (exit %d)", mode, code);
+        std::string text;
+        if (FILE *log = fopen(path.c_str(), "r")) {
+            char line[1024];
+            while (fgets(line, sizeof line, log))
+                text += line;
+            fclose(log);
+        }
+        auto has = [&](const char *part) { return text.find(part) != std::string::npos; };
+        check(has("unsupported import DIAGNOSTIC.dll!Probe") && has("return_address[0]") &&
+                  has("0x12345678") && has("ECX=0xabcdef01"),
+              "%s identifies import, caller and registers", mode);
+        if (!strcmp(mode, "known") || !strcmp(mode, "legacy"))
+            check(has("stdcall, 10 stack argument words") && has("arg[9]") && has("0xa0000009") &&
+                      !has("arg[10]"),
+                  "all ten argument words dumped");
+        else if (!strcmp(mode, "zero"))
+            check(has("stdcall, 0 stack argument words") && !has("arg[0]"),
+                  "zero-argument call does not invent arguments");
+        else {
+            check(has("not identified arguments") && has("stack[7]") && !has("arg[0]"),
+                  "%s labels bounded raw stack preview", mode);
+            if (!strcmp(mode, "cdecl"))
+                check(has("ABI: cdecl"), "cdecl convention retained");
+            if (!strcmp(mode, "edge"))
+                check(has("<unreadable>"), "out-of-arena arguments do not fault diagnostics");
+        }
+    }
+    remove_tree(dir);
+}
+
 int main(int argc, char **argv) {
+    if (argc == 4 && !strcmp(argv[1], "--child-import-diagnostic")) {
+        if (!freopen(argv[3], "w", stderr))
+            return 2;
+        os_setenv("RECOMP_LOG", !strcmp(argv[2], "legacy") ? "1" : "0");
+        mem_init();
+        X86 c = {};
+        c.r[R_ESP] = !strcmp(argv[2], "edge") ? GUEST_SIZE - 4 : STACK_TOP - 64;
+        c.r[R_ECX] = 0xabcdef01;
+        wr32(c.r[R_ESP], 0x12345678);
+        if (strcmp(argv[2], "edge"))
+            for (unsigned i = 0; i < 10; ++i)
+                wr32(c.r[R_ESP] + 4 + 4 * i, 0xa0000000 + i);
+        uint8_t count = (!strcmp(argv[2], "known") || !strcmp(argv[2], "legacy")) ? 10
+                        : !strcmp(argv[2], "zero")                                ? 0
+                        : !strcmp(argv[2], "cdecl")                               ? ARGC_CDECL
+                                                                                  : ARGC_UNKNOWN;
+        uint32_t target = imports_alloc_trampoline(
+            "DIAGNOSTIC.dll", "Probe", !strcmp(argv[2], "legacy") ? nullptr : imports_unsupported,
+            count);
+        const uint32_t entry_sp = c.r[R_ESP];
+        imports_dispatch(&c, target);
+        if (!strcmp(argv[2], "legacy"))
+            return c.r[R_ESP] == entry_sp + 44 && c.eip == 0x12345678 && c.r[R_EAX] == 0 &&
+                           c.r[R_ECX] == 0xabcdef01
+                       ? 0
+                       : 4;
+        return 3;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--import-diagnostics")) {
+        test_unsupported_diagnostics();
+        return g_failures ? 1 : 0;
+    }
     const bool unsupported_child = argc > 3 && strcmp(argv[1], "--child-unsupported") == 0;
     const bool child = argc > 1 && strcmp(argv[1], "--child-setjmp-abort") == 0;
     if (child) {
@@ -6729,6 +6808,7 @@ int main(int argc, char **argv) {
         return heap_alloc(0xffffffffu) == 0 ? 0 : 4;
     }
 
+    test_unsupported_diagnostics();
     test_loader();
     test_discovery_recorder();
     test_pe_exports();

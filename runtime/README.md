@@ -280,3 +280,15 @@ host thread would have surrendered it - no note can arrive in the middle of an
 open that builds nothing, whereas one certainly could arrive in the middle of
 an open waiting on another thread. And nothing waits while holding the baton,
 because nothing waits at all.
+
+### Unsupported import diagnostics
+
+Explicit unsupported handlers print the import name, guest registers, return
+address, and every declared stdcall stack argument word before aborting, even
+with `RECOMP_LOG=0`. Values are raw hexadecimal words, not inferred parameter
+types; COM stack counts include `this`. Cdecl and unknown signatures have no
+known argument count, so they show a labelled eight-word raw stack preview.
+Out-of-arena words are marked unreadable; pointer arguments are not dereferenced.
+The diagnostic is flushed to stderr and can be saved with `2>imports.log`.
+Legacy null handlers also dump this information with their first enabled warning;
+their existing zero-return behavior is unchanged.

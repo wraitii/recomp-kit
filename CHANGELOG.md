@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Dump raw stack argument values, ABI metadata, registers and guest return address
+  for unsupported imports. Unknown arities show a labelled eight-word stack preview;
+  out-of-arena words are marked unreadable. Fatal diagnostics flush to stderr.
+
 - Preserve unchanged generated source timestamps and skip translation only when
   its inputs are unchanged, including discovery file contents and auxiliary listings.
 - Supply disabled defaults for optional runtime hooks and implement `wsprintfA`.

@@ -394,6 +394,43 @@ ImportCallObserver imports_set_call_observer_get(void) {
     return g_call_observer;
 }
 
+// Dump raw ABI words without dereferencing pointer-valued arguments. Use wide
+// address arithmetic so a corrupt stack cannot wrap the preview into low memory.
+// The arena is mapped except for its null guard; bypass faulting guest accessors
+// so diagnostics neither raise guest exceptions nor mutate guest state.
+static void diagnostic_word(const X86 *c, uint32_t offset, const char *label, unsigned index) {
+    const uint64_t at = uint64_t(c->r[R_ESP]) + offset;
+    fprintf(stderr, "  %s[%u] @0x%08llx = ", label, index, (unsigned long long)at);
+    if (!g_mem || at < GUEST_NULL_LIMIT || at + 4 > GUEST_SIZE) {
+        fprintf(stderr, "<unreadable>\n");
+        return;
+    }
+    uint32_t value;
+    memcpy(&value, g_mem + at, sizeof value);
+    fprintf(stderr, "0x%08x\n", value);
+}
+
+static void diagnose_unsupported_import(const X86 *c, const char *desc, uint8_t argc) {
+    fprintf(stderr, "unsupported import %s\n", desc);
+    fprintf(stderr,
+            "  ESP=0x%08x EAX=0x%08x EBX=0x%08x ECX=0x%08x EDX=0x%08x\n"
+            "  ESI=0x%08x EDI=0x%08x EBP=0x%08x EIP=0x%08x\n",
+            c->r[R_ESP], c->r[R_EAX], c->r[R_EBX], c->r[R_ECX], c->r[R_EDX], c->r[R_ESI],
+            c->r[R_EDI], c->r[R_EBP], c->eip);
+    diagnostic_word(c, 0, "return_address", 0);
+    const bool known = argc != ARGC_UNKNOWN && argc != ARGC_CDECL;
+    if (known)
+        fprintf(stderr, "  ABI: stdcall, %u stack argument words (raw 32-bit values)\n",
+                unsigned(argc));
+    else
+        fprintf(stderr,
+                "  ABI: %s; argument count unknown; raw stack preview (not identified arguments)\n",
+                argc == ARGC_CDECL ? "cdecl" : "unknown");
+    for (unsigned i = 0; i < (known ? unsigned(argc) : 8u); ++i)
+        diagnostic_word(c, 4 + i * 4, known ? "arg" : "stack", i);
+    fflush(stderr);
+}
+
 // Dispatch a guest import trampoline at a scheduler checkpoint.
 // Copy dispatch metadata before calling a shim, then restore EIP/ESP according to its calling convention.
 namespace {
@@ -468,10 +505,11 @@ bool imports_dispatch(X86 *c, uint32_t target) {
         // The observer refused the call and has set the result itself.
     } else if (fn) {
         if (fn == imports_unsupported)
-            fprintf(stderr, "unsupported import %s\n", desc);
+            diagnose_unsupported_import(c, desc, argc);
         fn(c);
     } else {
-        log_once(desc, "unimplemented import %s: returning 0", desc);
+        if (log_once(desc, "unimplemented import %s: returning 0", desc))
+            diagnose_unsupported_import(c, desc, argc);
         set_eax(c, 0);
     }
     // Read after the shim ran, so the pointer is into the table as it is now.
