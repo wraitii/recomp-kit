@@ -250,6 +250,14 @@ void write_caps(uint32_t addr) {
     // DIVERGENCE(original): the reference adapter reported its hardware's limit.
     wr32(addr + 0x58, 2048);
     wr32(addr + 0x5c, 2048);
+    // MaxTextureBlendStages/MaxSimultaneousTextures (+0x94/+0x98). Guest
+    // 0x007c2160 clamps both to 2 and only sets up (and later binds) that many
+    // texture stages; at 0 the game renders everything untextured. The bridge
+    // samples stage 0 only, so that is what it advertises.
+    //
+    // DIVERGENCE(original): the reference adapter reported its hardware's count.
+    wr32(addr + 0x94, 1);
+    wr32(addr + 0x98, 1);
 }
 
 // The DirectDraw table holds the front end's 8/16-bit modes, so filtering it
@@ -1839,8 +1847,7 @@ bool d8_sync_texture(X86 *c, ComObj *dev, uint32_t stage) {
     if (tex && level) {
         const uint8_t *data = d8_buffer_bytes(level);
         status = d3d8_device_set_texture(host_device(dev), stage, tex->rmask, level->width,
-                                         level->height, data, data ? level->pixels_bytes : 0,
-                                         &err);
+                                         level->height, data, data ? level->pixels_bytes : 0, &err);
     } else {
         status = d3d8_device_set_texture(host_device(dev), stage, 0, 0, 0, nullptr, 0, &err);
     }

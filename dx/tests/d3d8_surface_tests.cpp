@@ -485,6 +485,10 @@ static void test_caps() {
     check(rd32(caps) == 1, "device type is D3DDEVTYPE_HAL");
     check(rd32(caps + 0x58) == 2048, "MaxTextureWidth is advertised");
     check(rd32(caps + 0x5c) == 2048, "MaxTextureHeight is advertised");
+    // Guest 0x007c2160 sizes its texture stage setup from these; zero means
+    // the game never binds a texture.
+    check(rd32(caps + 0x94) == 1, "MaxTextureBlendStages matches the stage-0 renderer");
+    check(rd32(caps + 0x98) == 1, "MaxSimultaneousTextures matches the stage-0 renderer");
     check(call_method(device, 7, {0}) == 0x8876086c, "null caps output is rejected");
     call_method(device, 2);
 }
