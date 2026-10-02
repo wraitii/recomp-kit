@@ -1691,7 +1691,9 @@ def noreturn_callees_from(parsed, iat_names, image=None):
     that evidence, unless it hands control to an import that does not come
     back (`_CxxThrowException` raises through RaiseException and has a RET
     after it that never runs).  Padding (INT3) right after the call is
-    evidence of its own: the compiler put nothing there to return to."""
+    evidence of its own: the compiler put nothing there to return to.  A
+    callee that is a tail-jump forwarder returns when its target does; its
+    own listing has no RET, so the jump is followed before it is judged."""
     def ends_process(fn):
         for i in fn.insns:
             if i.mnem != "CALL" or not i.ops:
@@ -1703,6 +1705,22 @@ def noreturn_callees_from(parsed, iat_names, image=None):
 
     returns = {fn.addr for fn in parsed
                if any(i.mnem == "RET" for i in fn.insns) and not ends_process(fn)}
+    # A tail jump to a function that returns also returns. Ghidra lists many
+    # forwarders as a short body ending in `JMP real_fn`, with the RET living
+    # only at the target; without following that jump a listing cut at
+    # `CALL thunk` would mark the thunk as never returning and then prune live
+    # code in every caller (Ghost Recon's `RSString` destructor thunk does
+    # exactly this). Follow chains to a fixed point.
+    changed = True
+    while changed:
+        changed = False
+        for fn in parsed:
+            if fn.addr in returns or not fn.insns:
+                continue
+            last = fn.insns[-1]
+            if last.mnem == "JMP" and Translator.branch_target(last) in returns:
+                returns.add(fn.addr)
+                changed = True
     out = set()
     for fn in parsed:
         # A loop that cannot fall out of itself never returns either.

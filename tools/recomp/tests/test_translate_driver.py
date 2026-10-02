@@ -1658,6 +1658,21 @@ def test_a_callee_that_returns_is_not_taken_as_never_returning():
     assert found == {throw}
 
 
+def test_a_tail_jump_forwarder_returns_with_its_target():
+    """A thunk ending in `JMP real_fn` has no RET of its own.  A caller whose
+    listing Ghidra cut at `CALL thunk` must not turn that thunk, and through
+    it live code in every caller, into a call that never returns."""
+    real, thunk, caller = 0x00401000, 0x00401100, 0x00401200
+    listings = {
+        real: "00401000  RET\n",
+        thunk: "00401100  MOV ECX,dword ptr [ESP + 0x4]\n00401104  JMP 0x00401000\n",
+        caller: "00401200  CALL 0x00401100\n",
+    }
+    parsed = [T.Function(a, "f%x" % a, 8, T.parse_listing_text(text))
+              for a, text in listings.items()]
+    assert T.noreturn_callees_from(parsed, {}) == set()
+
+
 def test_padding_after_a_cut_call_keeps_the_callee_never_returning():
     """`longjmp` has a RET on a path the call never takes; the INT3 padding
     after the call says the compiler expected nothing to come back."""
