@@ -467,7 +467,7 @@ void announce_once(const ComObj *b, uint32_t from) {
         if (id == b->id)
             return;
     announced().push_back(b->id);
-    LOGW("dsound: buffer %u first play on channel %d: %u Hz, %u ch, %u bit, "
+    LOGV("dsound: buffer %u first play on channel %d: %u Hz, %u ch, %u bit, "
          "%u bytes from %u, %s, peak %.3f",
          b->id, b->channel, b->frequency ? b->frequency : b->rate, b->nchannels, b->bits,
          b->buf_bytes, from, b->looping ? "looping" : "one-shot",
