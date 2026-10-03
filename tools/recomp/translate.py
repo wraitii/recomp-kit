@@ -906,8 +906,11 @@ FLAG_EFFECT = {
     "RCR": (frozenset(("cf", "of")), frozenset(("cf",))),
     "MUL": (ALL_FLAGS, NO_FLAGS),
     "IMUL": (ALL_FLAGS, NO_FLAGS),
-    "DIV": (ALL_FLAGS, NO_FLAGS),
-    "IDIV": (ALL_FLAGS, NO_FLAGS),
+    # A zero divisor or an out-of-range quotient is a #DE: the fault handler
+    # may inspect any flag, so this reads all of them before it either writes
+    # the (undefined) post-divide flags or faults.
+    "DIV": (ALL_FLAGS, ALL_FLAGS),
+    "IDIV": (ALL_FLAGS, ALL_FLAGS),
     "BT": (frozenset(("cf",)), NO_FLAGS),
     "BTS": (frozenset(("cf",)), NO_FLAGS),
     "BSR": (frozenset(("zf",)), NO_FLAGS),
@@ -925,12 +928,76 @@ FLAG_EFFECT = {
     "CMPSD": (ARITH_ALL, NO_FLAGS),
     "CLC": (frozenset(("cf",)), NO_FLAGS),
     "STC": (frozenset(("cf",)), NO_FLAGS),
+    "CMC": (frozenset(("cf",)), frozenset(("cf",))),
     "NOT": (NO_FLAGS, NO_FLAGS),
+    "CMPXCHG": (ARITH_ALL, NO_FLAGS),
+    "XADD": (ARITH_ALL, NO_FLAGS),
+    # LAHF copies SF:ZF:0:AF:0:PF:1:CF into AH, so it reads five flags.
+    "LAHF": (NO_FLAGS, frozenset(("cf", "pf", "af", "zf", "sf"))),
+    # SSE compare: ZF, PF and CF defined, the arithmetic flags cleared.
+    "COMISD": (ALL_FLAGS, NO_FLAGS), "UCOMISD": (ALL_FLAGS, NO_FLAGS),
+    "COMISS": (ALL_FLAGS, NO_FLAGS), "UCOMISS": (ALL_FLAGS, NO_FLAGS),
 }
+
+#: Helper-backed or trapping instructions whose runtime may inspect the
+#: whole guest context (a fault, an FPU exception, a host callback, a switch
+#: to another translation).  These materialize every flag before they run
+#: even though integer flags are not part of their own semantics, and are
+#: checked before FLAG_NEUTRAL so a form that is flag-neutral by itself
+#: cannot hide a live flag across a helper call.  x87 is matched by prefix.
+FLAG_OBSERVER = frozenset((
+    "CLI", "STI", "HLT", "INT", "INT3", "IN", "OUT", "CPUID", "RDTSC",
+    "PUSHAD", "POPAD", "PUSHA", "POPA", "XLAT",
+    "MOVSB", "MOVSW", "MOVSD", "STOSB", "STOSW", "STOSD",
+    "LODSB", "LODSW", "LODSD", "INSB", "INSW", "INSD",
+    "OUTSB", "OUTSW", "OUTSD",
+    "SCASB", "SCASW", "SCASD", "CMPSB", "CMPSW", "CMPSD",
+))
+
+
+#: Instructions whose arithmetic-flag effect is exactly "none" and that are
+#: not helper-backed or trapping: the whitelist is deliberately shallow,
+#: because a missing entry only costs extra flag stores while a wrong one
+#: would lose a value.  Anything outside FLAG_EFFECT, FLAG_OBSERVER and this
+#: set is treated as a reader of every flag.  Loads and stores are not
+#: observers: rd*/wr* are inline and cannot read flags, their null guard is a
+#: compile-time-disabled diagnostic, and recomp_watch_hit/recomp_dirty carry
+#: no X86 state.
+FLAG_NEUTRAL = frozenset((
+    # Moves, addressing and register-width changes.
+    "MOV", "MOVZX", "MOVSX", "LEA", "NOP", "WAIT", "PAUSE",
+    "CBW", "CWDE", "CDQ", "CWD", "XCHG", "BSWAP", "LEAVE",
+    # Register pushes and pops, which are inline reads and writes.
+    "PUSH", "POP",
+    # Direction-flag setters.
+    "CLD", "STD",
+    # SSE/MMX data movement, arithmetic, lane masks and conversions.  These
+    # lower to inline reads and writes (or recomp_sse_sqrt, which takes no
+    # X86 state); COMIS*/UCOMIS* are in FLAG_EFFECT because they write ZF,
+    # PF and CF.  MOVSD is also an SSE scalar move.
+    "MOVSS", "MOVSD", "MOVAPS", "MOVUPS", "MOVAPD", "MOVUPD", "MOVD", "MOVQ",
+    "MOVDQA", "MOVDQU", "MOVDDUP", "MOVLPD", "MOVLPS", "MOVHPD", "MOVHPS",
+    "PUNPCKLDQ", "PUNPCKHDQ", "PUNPCKLQDQ", "UNPCKLPD", "UNPCKHPD",
+    "PSHUFD", "SHUFPS", "SHUFPD", "ANDNPD", "ANDNPS", "PANDN", "PCMPEQD",
+    "PXOR", "ADDSD", "SUBSD", "MULSD", "DIVSD", "ADDSS", "SUBSS", "MULSS",
+    "DIVSS", "SQRTSD", "SQRTSS", "MINSD", "MAXSD", "MINSS", "MAXSS",
+    "CVTSI2SD", "CVTSI2SS", "CVTTSD2SI", "CVTTSS2SI", "CVTSD2SS", "CVTSS2SD",
+    # Non-arithmetic status and cache instructions that lower inline.
+    "EMMS", "LDMXCSR", "STMXCSR",
+    "PREFETCHNTA", "PREFETCHT0", "PREFETCHT1", "PREFETCHT2",
+    "LFENCE", "MFENCE", "SFENCE", "VZEROALL", "VZEROUPPER",
+))
+
+
+def is_flag_observer(insn):
+    """Whether the instruction reaches a helper or trap that may inspect the
+    full guest context, so every arithmetic flag must be live before it."""
+    return insn.mnem in FLAG_OBSERVER or insn.mnem.startswith("F")
 
 
 def shift_count_const(insn):
-    """The shift count if it is a constant, else None (a CL count is unknown)."""
+    """The masked shift count if it is a constant, else None (a CL count is
+    unknown).  x86 masks every shift and rotate count to five bits."""
     idx = SHIFT_COUNT_INDEX[insn.mnem]
     if len(insn.ops) <= idx:
         return 1                      # the shift-by-one encoding
@@ -941,13 +1008,42 @@ def shift_count_const(insn):
     return (o.imm & 31) if o.kind == "imm" else None
 
 
+def shift_effective_count(insn):
+    """The count that decides whether a shift or rotate changes flags.
+
+    The count is masked to five bits first.  RCL/RCR additionally take it
+    modulo the operand width plus one (Intel SDM), so a constant like
+    RCL AL,9 has an effective count of zero and leaves CF and OF untouched
+    even though count & 31 is non-zero.  ROL/ROR have no such reduction: a
+    count that is a multiple of the width still defines CF, so only a masked
+    count of zero preserves the flags there.  None means the count comes
+    from CL and is not known."""
+    cnt = shift_count_const(insn)
+    if cnt is None:
+        return None
+    if insn.mnem not in ("RCL", "RCR"):
+        return cnt
+    try:
+        op = parse_operand(insn.ops[0])
+        size = operand_size([op], hint=32)
+    except (TranslateError, IndexError):
+        size = 32
+    return cnt % (size + 1)
+
+
 def flag_effect(insn):
     """(defs, uses) of x86 arithmetic flags, ignoring DF which is tracked apart.
 
     `defs` is the kill set for liveness, so it only lists flags the
-    instruction writes on every path.  A shift or rotate whose count might be
-    zero, and a REP-prefixed compare whose count might be zero, write nothing
-    and must therefore not kill the incoming flags."""
+    instruction writes on every path.  A shift or rotate whose effective count
+    might be zero, and a REP-prefixed compare whose count might be zero, write
+    nothing and must therefore not kill the incoming flags.
+
+    The effect table is a whitelist: an instruction that is not a helper or
+    trap observer, is not named in FLAG_EFFECT and is not in FLAG_NEUTRAL is
+    treated as a reader of every flag.  That keeps an unaudited helper, an
+    unmodelled opcode or a faulting instruction from letting a live flag go
+    stale, at the cost of some extra flag stores."""
     m = insn.mnem
     if m in JCC:
         return (NO_FLAGS, frozenset(JCC[m][1]))
@@ -955,15 +1051,27 @@ def flag_effect(insn):
         return (NO_FLAGS, frozenset(SETCC[m][1]))
     if m in CMOVCC:
         return (NO_FLAGS, frozenset(CMOVCC[m][1]))
+    if is_flag_observer(insn):
+        return (NO_FLAGS, ALL_FLAGS)
     if insn.rep and m in ("SCASB", "SCASW", "SCASD", "CMPSB", "CMPSW", "CMPSD"):
-        return (NO_FLAGS, NO_FLAGS)
+        # REPE/REPNE consult ZF between iterations, and a zero counter runs
+        # no iteration, so nothing is defined and nothing may be killed.
+        return (NO_FLAGS, frozenset(("zf",)))
     if m in SHIFT_MAYDEF:
         uses = frozenset(("cf",)) if m in ("RCL", "RCR") else NO_FLAGS
-        cnt = shift_count_const(insn)
-        if cnt is None or cnt == 0:
+        cnt = shift_effective_count(insn)
+        if cnt is None:
             return (NO_FLAGS, uses)
+        if cnt == 0:
+            return (NO_FLAGS, NO_FLAGS)
         return (SHIFT_MAYDEF[m], uses)
-    return FLAG_EFFECT.get(m, (NO_FLAGS, NO_FLAGS))
+    effect = FLAG_EFFECT.get(m)
+    if effect is not None:
+        return effect
+    if m in FLAG_NEUTRAL:
+        return (NO_FLAGS, NO_FLAGS)
+    # Unknown, helper-backed or faulting: assume it can read every flag.
+    return (NO_FLAGS, ALL_FLAGS)
 
 
 # ------------------------------------------------------------------- image --
@@ -2272,31 +2380,136 @@ class Translator(object):
             return int(ins.ops[0], 16)
         return None
 
-    #: instructions that end a basic block; flags are live across all of them
-    BOUNDARY = frozenset(("CALL", "RET", "JMP"))
+    def liveness_stays_inside(self, fn, ins):
+        """A direct JMP with a literal target in this body neither leaves the
+        function nor reads an arithmetic flag.  An indirect JMP always keeps a
+        runtime-dispatch default arm, so it is treated as outward."""
+        if ins.ops and ins.ops[0].startswith("0x"):
+            return int(ins.ops[0], 16) in fn.index
+        return False
+
+    def flag_transfer(self, fn, ins):
+        """(defs, uses) of the arithmetic flags for one instruction.
+
+        `flag_effect` supplies the audited effect.  A transfer to a callee,
+        caller, exception handler or unknown target additionally reads every
+        flag, because the destination is translated separately and may
+        inspect any of them; the caller's state has to be materialized first.
+        """
+        d, u = flag_effect(ins)
+        if ins.mnem == "JMP" and self.liveness_stays_inside(fn, ins):
+            return (d, NO_FLAGS)
+        return (d, u)
+
+    def liveness_exit(self, fn, i, ins):
+        """Whether control can leave this body after `ins` executes.
+
+        A fall-through past the last listed instruction, a listing gap whose
+        destination is outside the body, or a conditional jump with an edge
+        that leaves it all hand the flags to code this function does not
+        contain.  The instruction's writes are then live out in full and must
+        be materialized before the transfer.
+        """
+        if ins.mnem in TERMINATORS or self.never_returns(ins) or ins.mnem == "INT3":
+            return False
+        if ins.mnem in JCC:
+            target = self.branch_target(ins)
+            if target is not None and target not in fn.index:
+                return True
+            if i + 1 < len(fn.insns) and fn.contiguous[i]:
+                return False
+            return fn.fallthrough[i] not in fn.index
+        if i + 1 < len(fn.insns) and fn.contiguous[i]:
+            return False
+        return fn.fallthrough[i] not in fn.index
+
+    def liveness_successors(self, fn, i):
+        """Instruction indices flag liveness can flow into from i.
+
+        Edges that leave the function are not represented; the transferring
+        instruction's all-flags use in `flag_transfer` covers them.  A
+        table-less indirect JMP may enter any instruction, but its use of
+        every flag makes enumerating those edges unnecessary.
+        """
+        ins = fn.insns[i]
+        m = ins.mnem
+        t = self.push_ret_target(fn, i)
+        if t is not None and t not in fn.pushed_continuations:
+            return [fn.index[t]] if t in fn.index else []
+        if m == "INT3" or self.never_returns(ins):
+            return []
+        if m == "RET":
+            return [fn.index[c] for c in sorted(fn.pushed_continuations)
+                    if c in fn.index]
+        nxt = i + 1 if (i + 1 < len(fn.insns) and fn.contiguous[i]) else None
+        fall = None
+        if nxt is None and m not in TERMINATORS:
+            target = fn.fallthrough[i]
+            if target is not None and target in fn.index:
+                fall = fn.index[target]
+        if m in JCC:
+            out = [nxt] if nxt is not None else ([fall] if fall is not None else [])
+            target = self.branch_target(ins)
+            if target is not None and target in fn.index:
+                out.append(fn.index[target])
+            return out
+        if m == "JMP":
+            if self.popped_jump(fn, i) or i in getattr(fn, "return_jumps", ()):
+                return [fn.index[c] for c in sorted(fn.pushed_continuations)
+                        if c in fn.index]
+            if ins.ops and ins.ops[0].startswith("0x"):
+                target = int(ins.ops[0], 16)
+                return [fn.index[target]] if target in fn.index else []
+            targets = self.jumptables.get((fn.addr, ins.addr))
+            if targets:
+                return [fn.index[t] for t in targets if t in fn.index]
+            return []
+        if nxt is not None:
+            return [nxt]
+        return [fall] if fall is not None else []
 
     def liveness(self, fn):
-        """Flag liveness within straight-line code only.
+        """CFG-wide arithmetic-flag liveness.
 
-        Plan correction 6: flags are live at every control-flow boundary, so a
-        CALL, RET, JMP or conditional jump has all six live on the way out and
-        elimination only happens between them.  What this still removes is a
-        flag write that a later instruction in the same run overwrites before
-        anything reads it, which is most of them.
+        Emission uses this to decide which flag stores to keep.  A flag that
+        is overwritten before any read on every path is dead and left in
+        whatever slot it already had; a flag read on any path stays live back
+        to its definition.  Control transfers that a callee, caller, an
+        exception handler or an unknown target can observe keep all six flags
+        live, so the conservative boundary the old straight-line pass drew at
+        every Jcc is now drawn only where the destination is not in this
+        body.  A diagnostic variant that assumes calls are transparent lives
+        in `liveness_cfg` and is not used for emission.
         """
         n = len(fn.insns)
-        live_out = [ALL_FLAGS] * n
-        for i in range(n - 2, -1, -1):
+        if n == 0:
+            return []
+        succ = [self.liveness_successors(fn, i) for i in range(n)]
+        preds = [[] for _ in range(n)]
+        for i, ss in enumerate(succ):
+            for s in ss:
+                preds[s].append(i)
+        live_in = [NO_FLAGS] * n
+        live_out = [NO_FLAGS] * n
+        work = list(range(n))
+        queued = [True] * n
+        while work:
+            i = work.pop()
+            queued[i] = False
             ins = fn.insns[i]
-            # A listing gap is a control-flow boundary too: emission inserts a
-            # goto or a tail call there, so the next listed instruction is not
-            # the fall-through successor.
-            if (ins.mnem in self.BOUNDARY or ins.mnem in JCC
-                    or not fn.contiguous[i]):
-                live_out[i] = ALL_FLAGS
-                continue
-            d, u = flag_effect(fn.insns[i + 1])
-            live_out[i] = (live_out[i + 1] - d) | u
+            lo = NO_FLAGS
+            for s in succ[i]:
+                lo = lo | live_in[s]
+            if self.liveness_exit(fn, i, ins):
+                lo = ALL_FLAGS
+            d, u = self.flag_transfer(fn, ins)
+            li = (lo - d) | u
+            if li != live_in[i] or lo != live_out[i]:
+                live_in[i], live_out[i] = li, lo
+                for p in preds[i]:
+                    if not queued[p]:
+                        queued[p] = True
+                        work.append(p)
         return live_out
 
     def liveness_cfg(self, fn, call_transparent=False):

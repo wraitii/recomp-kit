@@ -2735,6 +2735,13 @@ static void test_v4_unlock_takes_a_rect() {
 static void test_cursor_surface_learned() {
     rec_reset();
     const uint32_t ptrs[] = RECOMP_HOOK_CURSOR_SURFACE_PTRS; // the game's cursor globals
+    // A game profile that configures no cursor globals generates a single
+    // zero entry; there is nothing to learn from and address 0 is not guest
+    // memory, so the test has no subject for that game.
+    if (RECOMP_HOOK_CURSOR_SURFACE_PTRS_COUNT < 2 || !ptrs[0] || !ptrs[1]) {
+        printf("(no cursor globals configured; skipped) ");
+        return;
+    }
     const uint32_t kPtrA = ptrs[0], kPtrB = ptrs[1];
     wr32(kPtrA, 0);
     wr32(kPtrB, 0);
