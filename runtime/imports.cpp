@@ -1,4 +1,5 @@
 #include "imports.h"
+#include "game_config.h"
 #include "../platform/os.h"
 #include "gdi32_internal.h"
 #include "user32_internal.h"
@@ -543,6 +544,12 @@ bool imports_dispatch(X86 *c, uint32_t target) {
         if (fn == imports_unsupported)
             diagnose_unsupported_import(c, desc, argc);
         fn(c);
+    } else if (RECOMP_STRICT_IMPORTS && argc == ARGC_UNKNOWN) {
+        // A game profile can require that an import with no known stdcall
+        // arity stop the run instead of returning 0 with its arguments left
+        // on the stack. Both the diagnostic and the abort name dll!function.
+        diagnose_unsupported_import(c, desc, argc);
+        imports_unsupported(c);
     } else {
         if (log_once(desc, "unimplemented import %s: returning 0", desc))
             diagnose_unsupported_import(c, desc, argc);

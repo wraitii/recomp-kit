@@ -3,6 +3,7 @@
 #include "user32_internal.h"
 #include "memory.h"
 #include "win32.h"
+#include "resources.h"
 #include "gdi_image.h"
 #include <algorithm>
 #include <set>
@@ -1039,8 +1040,11 @@ void insert_menu(X86 *c) {
 bool clipboard_open = false;
 std::map<uint32_t, uint32_t> clipboard;
 std::map<std::string, uint32_t> clipboard_formats, window_messages;
-uint32_t register_name(std::map<std::string, uint32_t> &names, uint32_t p) {
-    std::string name = gm_wstr(p);
+// RegisterClass/RegisterWindowMessage/RegisterClipboardFormat share one
+// case-insensitive name table whose atoms run from 0xC000 upward (the
+// documented system range). The A and W entries take their name encoding from
+// the caller, but the atom for the same spelling is shared.
+uint32_t register_named(std::map<std::string, uint32_t> &names, std::string name) {
     if (name.empty())
         return 0;
     for (char &ch : name)
@@ -1055,10 +1059,13 @@ uint32_t register_name(std::map<std::string, uint32_t> &names, uint32_t p) {
     return id;
 }
 void register_clipboard(X86 *c) {
-    set_eax(c, register_name(clipboard_formats, arg(c, 0)));
+    set_eax(c, register_named(clipboard_formats, gm_wstr(arg(c, 0))));
 }
 void register_message(X86 *c) {
-    set_eax(c, register_name(window_messages, arg(c, 0)));
+    set_eax(c, register_named(window_messages, gm_wstr(arg(c, 0))));
+}
+void register_message_a(X86 *c) {
+    set_eax(c, register_named(window_messages, gm_str(arg(c, 0))));
 }
 void open_clipboard(X86 *c) {
     bool ok = !clipboard_open;
@@ -1116,7 +1123,15 @@ void set_hook(X86 *c) {
 void unhook(X86 *c) {
     set_eax(c, hooks.erase(arg(c, 0)) != 0);
 }
-std::map<uint32_t, std::vector<uint8_t>> accelerators;
+// An accelerator table is raw ACCEL entries. CreateAcceleratorTable takes the
+// 6-byte in-memory layout; LoadAccelerators reads the resource compiler's
+// 8-byte aligned entries. The stride is kept per handle so TranslateAccelerator
+// walks whichever kind it was given.
+struct AcceleratorTable {
+    std::vector<uint8_t> entries;
+    uint32_t stride = 6;
+};
+std::map<uint32_t, AcceleratorTable> accelerators;
 uint32_t next_accelerator = 0x00073000;
 void create_accelerator(X86 *c) {
     uint32_t p = arg(c, 0), n = arg(c, 1);
@@ -1125,11 +1140,83 @@ void create_accelerator(X86 *c) {
         return;
     }
     uint32_t h = next_accelerator++;
-    accelerators[h] = std::vector<uint8_t>(g_mem + p, g_mem + p + n * 6);
+    AcceleratorTable &t = accelerators[h];
+    t.stride = 6;
+    t.entries.assign(g_mem + p, g_mem + p + n * 6);
+    set_eax(c, h);
+}
+// LoadAcceleratorsA(hInstance, lpTableName): the table is RT_ACCELERATOR (9)
+// in the instance's PE resources. An ANSI name is converted before the shared
+// resource reader, which consumes UTF-16; MAKEINTRESOURCE ids pass through.
+void load_accelerators(X86 *c) {
+    uint32_t name = arg(c, 1), wide = 0;
+    if (name > 0xffff) {
+        std::string text = gm_str(name);
+        if (text.empty()) {
+            set_eax(c, 0);
+            return;
+        }
+        uint32_t units = uint32_t(text.size()) + 1;
+        wide = heap_alloc(units * 2, true);
+        if (!wide) {
+            set_eax(c, 0);
+            return;
+        }
+        gm_put_wstr(wide, text, units);
+        name = wide;
+    }
+    uint32_t bytes = 0;
+    uint32_t data = resource_data(resource_find(9, name), &bytes);
+    if (wide)
+        heap_free(wide);
+    if (!data || !bytes || !gm_valid(data, bytes)) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t h = next_accelerator++;
+    AcceleratorTable &t = accelerators[h];
+    t.stride = 8;
+    t.entries.assign(g_mem + data, g_mem + data + bytes);
     set_eax(c, h);
 }
 void destroy_accelerator(X86 *c) {
     set_eax(c, accelerators.erase(arg(c, 0)) != 0);
+}
+// TranslateAcceleratorA(hwnd, hAccel, lpMsg): match a key message against the
+// table and post the command. Unmatched messages return 0 so the caller runs
+// TranslateMessage/DispatchMessage as usual.
+void translate_accelerator(X86 *c) {
+    uint32_t hwnd = arg(c, 0), haccel = arg(c, 1), msg = arg(c, 2);
+    auto ti = accelerators.find(haccel);
+    if (ti == accelerators.end() || !msg || !gm_valid(msg, 28)) {
+        set_eax(c, 0);
+        return;
+    }
+    const uint32_t message = rd32(msg + 4), wparam = rd32(msg + 8);
+    const uint32_t WM_SYSCHAR = 0x106, WM_SYSCOMMAND = 0x112, WM_COMMAND = 0x111;
+    auto down = [](uint32_t vk) { return (g_key_state[vk & 0xff] & 0x80) != 0; };
+    for (size_t i = 0; i + 6 <= ti->second.entries.size(); i += ti->second.stride) {
+        const uint8_t *e = ti->second.entries.data() + i;
+        uint32_t fVirt = e[0], key = uint32_t(e[2]) | (uint32_t(e[3]) << 8),
+                 cmd = uint32_t(e[4]) | (uint32_t(e[5]) << 8);
+        bool hits = false;
+        if (fVirt & 1 /* FVIRTKEY */) {
+            bool keydown = message == 0x100 || message == 0x104;
+            hits = keydown && (wparam & 0xffff) == key && !(fVirt & 4) == !down(0x10) &&
+                   !(fVirt & 8) == !down(0x11) && !(fVirt & 16) == !down(0x12);
+        } else {
+            hits = (message == 0x102 || message == WM_SYSCHAR) && (wparam & 0xffff) == key;
+        }
+        if (!hits)
+            continue;
+        if (fVirt & 16) // FALT: an accelerator command, not a menu accelerator
+            host_post_message(hwnd, WM_SYSCOMMAND, cmd & 0xffff, 0);
+        else
+            host_post_message(hwnd, WM_COMMAND, cmd & 0xffff, 1);
+        set_eax(c, 1);
+        return;
+    }
+    set_eax(c, 0);
 }
 // System brushes are stable cached handles, also accepting COLOR_* + 1 as
 // FillRect does. Window DC presentation remains with the GDI surface layer.
@@ -1458,7 +1545,11 @@ const ImportShim shims[] = {
     U("EmptyClipboard", 0, empty_clipboard),
     U("SetClipboardData", 2, set_clipboard),
     U("RegisterClipboardFormatW", 1, register_clipboard),
+    U("RegisterWindowMessageA", 1, register_message_a),
     U("RegisterWindowMessageW", 1, register_message),
+    U("LoadAcceleratorsA", 2, load_accelerators),
+    U("TranslateAcceleratorA", 3, translate_accelerator),
+    U("TranslateAcceleratorW", 3, translate_accelerator),
     U("SetWindowsHookExW", 4, set_hook),
     U("UnhookWindowsHookEx", 1, unhook),
     U("CallNextHookEx", 4, zero),

@@ -18,6 +18,17 @@ void yes(X86 *c) {
 void zero(X86 *c) {
     set_eax(c, 0);
 }
+// DSETUP.dll is the shipped DirectSetup shim; runblack.exe imports only
+// DirectXSetupGetVersion by ordinal and refuses to start below 0x00040007
+// ("You need DirectX 7 or greater"). The DLL's own file version is 4.0.7.700,
+// so that is what its fallback path reports when the registry has no value.
+void directx_setup_get_version(X86 *c) {
+    if (uint32_t p = arg(c, 0); p && gm_valid(p, 4))
+        wr32(p, 0x00040007);
+    if (uint32_t p = arg(c, 1); p && gm_valid(p, 4))
+        wr32(p, 700);
+    set_eax(c, 1); // S_OK, as the shipped DirectSetup returns
+}
 void session_service_unavailable(X86 *c) {
     // No Remote Desktop Services endpoint is running in the guest runtime.
     // Expose the exports so callers receive the service error as a BOOL result.
@@ -209,6 +220,10 @@ void folder_path(X86 *c) {
     set_eax(c, 0);
 }
 const ImportShim shims[] = {
+    // Ordinal 11 is DirectXSetupGetVersion; the name is registered too so a
+    // GetProcAddress by name answers.
+    {"DSETUP.dll", "ord11", 2, directx_setup_get_version},
+    {"DSETUP.dll", "DirectXSetupGetVersion", 2, directx_setup_get_version},
     {"DWMAPI.dll", "DwmIsCompositionEnabled", 1, composition_enabled},
     {"DWMAPI.dll", "DwmExtendFrameIntoClientArea", 2, buffered_paint_unavailable},
     {"UXTHEME.dll", "IsThemeActive", 0, yes},

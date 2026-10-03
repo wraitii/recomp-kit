@@ -757,18 +757,27 @@ static void test_loader() {
             uint32_t data = imports_data_address(import.dll.c_str(), import.name.c_str());
             uint32_t trampoline = imports_trampoline_for(import.dll.c_str(), import.name.c_str());
             uint32_t value = rd32(import.slot);
+            // A Lionhead import resolves to the address of a translated export
+            // inside an auxiliary module, not to a trampoline. Accept either.
+            const LoaderModule *module = loader_module_containing(value);
+            bool aux_export = module && module->base != loader_image_base();
+            bool ok;
             if (data) {
                 ++data_slots;
-                iat_ok &= value == data && !imports_is_trampoline(value);
+                ok = value == data && !imports_is_trampoline(value);
+            } else if (aux_export) {
+                ok = value != 0;
             } else {
-                iat_ok &= value == trampoline && imports_is_trampoline(value) &&
-                          imports_describe(value) != nullptr;
+                ok = value == trampoline && imports_is_trampoline(value) &&
+                     imports_describe(value) != nullptr;
             }
-            if (value != (data ? data : trampoline))
+            iat_ok &= ok;
+            if (!ok)
                 printf("  IAT mismatch at %08x for %s!%s\n", import.slot, import.dll.c_str(),
                        import.name.c_str());
         }
-        check(iat_ok, "every PE import slot holds its symbol's trampoline or data storage");
+        check(iat_ok,
+              "every PE import slot holds its symbol's trampoline, data storage or aux export");
         check(loader_iat_data_imports() == data_slots,
               "%u IAT slots hold data symbols (expected %u)", loader_iat_data_imports(),
               data_slots);
@@ -1936,8 +1945,7 @@ static void test_winsock_resolver(X86 *c) {
           "an unresolvable name returns NULL");
     check(call_import(c, "WSOCK32.dll", "WSAGetLastError", {}) == 11001,
           "WSAGetLastError reports WSAHOST_NOT_FOUND");
-    check(call_import(c, "WS2_32.dll", "ord116", {}) == 0,
-          "WSACleanup by ordinal succeeds");
+    check(call_import(c, "WS2_32.dll", "ord116", {}) == 0, "WSACleanup by ordinal succeeds");
     // Offline socket calls fail the way the real stack does with no adapter:
     // SOCKET_ERROR/INVALID_SOCKET plus a WSAGetLastError a caller can act on.
     check(call_import(c, "WS2_32.dll", "ord23", {2, 2, 0}) == 0xffffffffu &&
@@ -4051,6 +4059,9 @@ static void test_import_coverage(X86 *c) {
             uint32_t value = rd32(import.slot);
             if (imports_is_trampoline(value))
                 trampolines.insert(value);
+            else if (const LoaderModule *m = loader_module_containing(value);
+                     m && m->base != loader_image_base())
+                continue; // a translated auxiliary-module export, not data storage
             else
                 data.insert(value);
         }
@@ -6431,6 +6442,10 @@ static void test_user32_services() {
     check(message >= 0xc000 &&
               call_import(&c, "USER32.dll", "RegisterWindowMessageW", {s}) == message,
           "registered window message is stable");
+    // The A and W spellings share one global atom for the same name.
+    check(call_import(&c, "USER32.dll", "RegisterWindowMessageA", {put_str("Runtime.Format")}) ==
+              message,
+          "RegisterWindowMessageA shares the W atom");
     call_import(&c, "USER32.dll", "OpenClipboard", {0});
     call_import(&c, "USER32.dll", "EmptyClipboard", {});
     uint32_t data = heap_alloc(16, true);
@@ -6452,6 +6467,22 @@ static void test_user32_services() {
     uint32_t accel = call_import(&c, "USER32.dll", "CreateAcceleratorTableW", {s, 1});
     check(accel && call_import(&c, "USER32.dll", "DestroyAcceleratorTable", {accel}) == 1,
           "accelerator table copies six-byte guest entries");
+    // LoadAcceleratorsA reads the module's RT_ACCELERATOR resource. Games
+    // without one are skipped rather than failed.
+    std::vector<ResourceName> accelerators;
+    if (resource_names(9, &accelerators) && !accelerators.empty()) {
+        uint32_t resource = accelerators.front().id ? accelerators.front().id
+                                                    : put_str(accelerators.front().name.c_str());
+        uint32_t loaded =
+            call_import(&c, "USER32.dll", "LoadAcceleratorsA", {IMAGE_BASE, resource});
+        check(loaded != 0, "LoadAcceleratorsA loads an RT_ACCELERATOR resource");
+        if (loaded)
+            check(call_import(&c, "USER32.dll", "DestroyAcceleratorTable", {loaded}) == 1,
+                  "a loaded accelerator table is destroyable");
+    } else {
+        printf("  [SKIP] the image has no RT_ACCELERATOR resource\n");
+        ++g_skips;
+    }
     // Resource string lookup must keep the length prefix out of the text.
     std::vector<ResourceName> names;
     bool checked = false;
@@ -6850,6 +6881,40 @@ static void test_import_return_trace() {
     remove_tree(dir);
 }
 
+// With [game] strict_imports, an import whose stdcall arity is unknown must
+// stop by name instead of returning 0 with its arguments left on the stack.
+// Without it the legacy return-0 behaviour is preserved.
+static void test_strict_import_abort() {
+    section("strict unknown-arity imports");
+    char dir[] = "build/recomp/strict-import-XXXXXX";
+    if (!check(os_mkdtemp(dir) == 0, "created strict-import directory"))
+        return;
+    std::string path = std::string(dir) + "/strict.log";
+    char exe[4096];
+    if (!check(os_exe_path(exe, sizeof exe) == 0, "found strict-import executable"))
+        return;
+    const char *args[] = {exe, "--child-strict-import", path.c_str(), nullptr};
+    int64_t pid = 0;
+    int code = -1;
+    check(os_spawn(args, &pid) == 0 && os_wait(pid, &code) == 0, "ran the strict-import child");
+#if RECOMP_STRICT_IMPORTS
+    check(code == 134, "an unknown-arity import aborts (exit %d)", code);
+    std::string text;
+    if (FILE *log = fopen(path.c_str(), "r")) {
+        char line[512];
+        while (fgets(line, sizeof line, log))
+            text += line;
+        fclose(log);
+    }
+    check(text.find("unsupported import STRICT.dll!Probe") != std::string::npos,
+          "the abort names the import");
+#else
+    check(code == 0, "an unknown-arity import returns 0 when the profile is not strict (exit %d)",
+          code);
+#endif
+    remove_tree(dir);
+}
+
 // Exercise actual aborting dispatch, including arities beyond the observer's
 // eight-word limit and a preview that reaches the end of the guest arena.
 static void test_unsupported_diagnostics() {
@@ -6930,6 +6995,17 @@ int main(int argc, char **argv) {
         test_unsupported_diagnostics();
         return g_failures ? 1 : 0;
     }
+    if (argc == 3 && strcmp(argv[1], "--child-strict-import") == 0) {
+        if (!freopen(argv[2], "w", stderr))
+            return 2;
+        mem_init();
+        X86 c = {};
+        c.r[R_ESP] = STACK_TOP - 64;
+        wr32(c.r[R_ESP], 0x12345678);
+        uint32_t target = imports_alloc_trampoline("STRICT.dll", "Probe", nullptr, ARGC_UNKNOWN);
+        imports_dispatch(&c, target);
+        return 0;
+    }
     const bool unsupported_child = argc > 3 && strcmp(argv[1], "--child-unsupported") == 0;
     const bool child = argc > 1 && strcmp(argv[1], "--child-setjmp-abort") == 0;
     if (child) {
@@ -6992,6 +7068,7 @@ int main(int argc, char **argv) {
         return heap_alloc(0xffffffffu) == 0 ? 0 : 4;
     }
 
+    test_strict_import_abort();
     test_unsupported_diagnostics();
     test_loader();
     test_discovery_recorder();
