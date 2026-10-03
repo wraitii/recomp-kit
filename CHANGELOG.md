@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Ship the Rust D3D8/wgpu renderer as `graphics/d3d8-wgpu`. Native macOS builds
+  it when `RECOMP_D3D8_WGPU=1` is set for `tools/build.py` (passed to CMake as
+  `RECOMP_D3D8_WGPU`); a game's own `graphics/d3d8-wgpu` still takes precedence,
+  and builds without either compile no Rust.
+
+- DirectSound3D: 3D buffers are attenuated and panned from listener and buffer
+  state following Wine's `DSOUND_Calc3DBuffer`; min/max distance, mode and cone
+  state are stored, and cones, velocity/Doppler and other modes log once and are
+  not applied. `RECOMP_AUDIO_DUMP_BUFFERS`, `RECOMP_TRACE_IMPORTS` and
+  `RECOMP_TRACE_FILES` (now including `mmioOpenA`) are opt-in diagnostics.
+
 - Present optional D3D8 bridge frames through a direct RGBA host seam, avoiding
   the ARGB round trip while preserving opaque window composition and raw dumps.
   The renderer can read mapped rows into caller storage and reuse GPU staging.
