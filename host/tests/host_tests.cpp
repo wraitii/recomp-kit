@@ -885,6 +885,7 @@ static void test_script_parsing() {
     CHECK(strcmp(steps[11].text, "ref_c840") == 0);
     CHECK_EQ(steps[11].threshold, 840.0);
     CHECK(steps[11].at_least);
+#if defined(RECOMP_GLOBAL_SIMULATION_TURN_ADDR) && defined(RECOMP_GLOBAL_COMMAND_FRAME_ADDR)
     // This host test binary has no mod runtime/game view linked or loaded.
     const uint32_t saved_turn = rd32(RECOMP_GLOBAL_SIMULATION_TURN_ADDR);
     const uint32_t saved_command = rd32(RECOMP_GLOBAL_COMMAND_FRAME_ADDR);
@@ -905,6 +906,11 @@ static void test_script_parsing() {
     CHECK_EQ(host_script_counter_metric("turn", rd32), 860.0);
     wr32(RECOMP_GLOBAL_SIMULATION_TURN_ADDR, saved_turn);
     wr32(RECOMP_GLOBAL_COMMAND_FRAME_ADDR, saved_command);
+#else
+    // No counter globals are configured: the metric does not exist.
+    CHECK_EQ(host_script_counter_metric("turn", rd32), -1.0);
+    CHECK_EQ(host_script_counter_metric("command_frame", rd32), -1.0);
+#endif
 
     // Five malformed forms for each of the five verbs. The categories the
     // brief names are missing operand, non-integer, unknown enum, extra token
@@ -8293,6 +8299,11 @@ static void test_t9_relative_crossing_and_layout_mailbox() {
 }
 
 static void test_t9_guest_pointer_resolution() {
+    // A game with no legacy mouse-device hook configures it as 0.
+    if (RECOMP_HOOK_MOUSE_DEVICE_PTR == 0) {
+        printf("%s: skipped, no mouse device configured\n", __func__);
+        return;
+    }
     // A separate arena proves resolution does not accidentally read g_mem or
     // a cached absolute coordinate address. object models ECX at 0052d430.
     std::vector<uint8_t> arena(4096);
@@ -8549,6 +8560,11 @@ static bool near(uint32_t got, uint32_t want) {
 }
 
 static void test_t9_pointer_closed_loop() {
+    // A game with no legacy mouse-device hook configures it as 0.
+    if (RECOMP_HOOK_MOUSE_DEVICE_PTR == 0) {
+        printf("%s: skipped, no mouse device configured\n", __func__);
+        return;
+    }
     constexpr uint32_t base = RECOMP_HOOK_MOUSE_DEVICE_PTR;
     uint8_t saved[0x48];
     memcpy(saved, gm_ptr(base), sizeof saved);
@@ -9371,6 +9387,11 @@ static void test_native_frame_metrics() {
     CHECK(p.snapshot(2.5, 3).intervals_ms.back() > 299);
 }
 static void test_wide_cursor_bound() {
+    // A game with no legacy mouse-device hook configures it as 0.
+    if (RECOMP_HOOK_MOUSE_DEVICE_PTR == 0) {
+        printf("%s: skipped, no mouse device configured\n", __func__);
+        return;
+    }
     constexpr uint32_t base = RECOMP_HOOK_MOUSE_DEVICE_PTR;
     constexpr uint32_t right = RECOMP_HOOK_MOUSE_DEVICE_RIGHT;
     uint32_t saved_right = rd32(right);
@@ -9442,6 +9463,11 @@ static void test_wide_cursor_bound() {
     wr32(right, saved_right);
 }
 static void test_pointer_reaches_scrolling_edges() {
+    // A game with no legacy mouse-device hook configures it as 0.
+    if (RECOMP_HOOK_MOUSE_DEVICE_PTR == 0) {
+        printf("%s: skipped, no mouse device configured\n", __func__);
+        return;
+    }
     constexpr uint32_t base = RECOMP_HOOK_MOUSE_DEVICE_PTR;
     uint8_t saved[0x48];
     memcpy(saved, gm_ptr(base), sizeof saved);

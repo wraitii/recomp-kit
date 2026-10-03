@@ -2138,7 +2138,10 @@ static void test_native_draw_waits(X86 *c) {
     section("native cap replaces both original draw waits without changing simulation time");
     // These are synthetic shim calls, so even unused configured sites can
     // exercise the clock hook without executing the image's draw loop.
-    if (!gm_valid(RECOMP_HOOK_FRAME_CLOCK_WAIT_DEADLINE, 4) ||
+    // A game that has no frame clock configures every site as 0.
+    if (RECOMP_HOOK_FRAME_CLOCK_BEGIN == 0 || RECOMP_HOOK_FRAME_CLOCK_WAIT == 0 ||
+        RECOMP_HOOK_FRAME_CLOCK_WAIT_CLAMP == 0 ||
+        !gm_valid(RECOMP_HOOK_FRAME_CLOCK_WAIT_DEADLINE, 4) ||
         !gm_valid(RECOMP_HOOK_FRAME_CLOCK_CLAMP_DEADLINE, 4)) {
         printf("  [SKIP] frame clock hooks are sentinels for this game\n");
         ++g_skips;
@@ -5240,11 +5243,15 @@ static void test_kernel32_wide() {
     call_import(&c, "KERNEL32.dll", "CloseHandle", {event});
     section("kernel32 wide resources");
     uint32_t r = call_import(&c, "KERNEL32.dll", "FindResourceW", {0, 1, 16});
-    check(r != 0, "FindResourceW(VS_VERSION_INFO)");
+    // The version-resource checks need an image that has one.
+    const bool has_version = image_has_version_resource();
+    check((r != 0) == has_version, "FindResourceW(VS_VERSION_INFO) matches the image (%s)",
+          has_version ? "present" : "absent");
     uint32_t size = call_import(&c, "KERNEL32.dll", "SizeofResource", {0, r});
     uint32_t data = call_import(&c, "KERNEL32.dll", "LoadResource", {0, r});
-    check(size > 0x34 && data != 0 && gm_valid(data, size) && rd32(data + 40) == 0xfeef04bdu,
-          "the loaded resource is a VS_VERSIONINFO (size %u)", size);
+    if (has_version)
+        check(size > 0x34 && data != 0 && gm_valid(data, size) && rd32(data + 40) == 0xfeef04bdu,
+              "the loaded resource is a VS_VERSIONINFO (size %u)", size);
 
     check(call_import(&c, "KERNEL32.dll", "LockResource", {data}) == data,
           "LockResource preserves the guest address");
@@ -5252,20 +5259,22 @@ static void test_kernel32_wide() {
           "FreeResource leaves image-backed resources loaded");
     gm_put_wstr(s, "#16", 64);
     gm_put_wstr(s + 128, "#1", 64);
-    check(r && call_import(&c, "KERNEL32.dll", "FindResourceW",
-                           {loader_image_base(), s + 128, s}) == r,
-          "resource integer strings resolve like IDs");
+    if (has_version)
+        check(r && call_import(&c, "KERNEL32.dll", "FindResourceW",
+                               {loader_image_base(), s + 128, s}) == r,
+              "resource integer strings resolve like IDs");
     check(call_import(&c, "KERNEL32.dll", "FindResourceW", {0, 0xffff, 16}) == 0,
           "missing resource returns zero");
     uint32_t resource_cb =
         imports_alloc_trampoline("test", "resource_enum", resource_enum_callback, 4);
     g_resource_names.clear();
-    check(call_import(&c, "KERNEL32.dll", "EnumResourceNamesW", {0, 16, resource_cb, 0x1234}) ==
-                  1 &&
-              std::find(g_resource_names.begin(), g_resource_names.end(), "#1") !=
-                  g_resource_names.end() &&
-              g_resource_type == 16 && g_resource_param == 0x1234,
-          "EnumResourceNamesW passes names, type and caller data to the guest");
+    if (has_version)
+        check(call_import(&c, "KERNEL32.dll", "EnumResourceNamesW", {0, 16, resource_cb, 0x1234}) ==
+                      1 &&
+                  std::find(g_resource_names.begin(), g_resource_names.end(), "#1") !=
+                      g_resource_names.end() &&
+                  g_resource_type == 16 && g_resource_param == 0x1234,
+              "EnumResourceNamesW passes names, type and caller data to the guest");
     // Replace only guest-memory directory bytes temporarily, then restore them.
     // The real image stays pinned on disk; this fixture exercises names and
     // corrupt offsets that need not occur in a particular game's resources.
@@ -6729,14 +6738,18 @@ static void test_delphi_dlls() {
     // version.dll W over the image's own resource.
     gm_put_wstr(s, RECOMP_EXECUTABLE, 128);
     uint32_t size = call_import(&c, "VERSION.dll", "GetFileVersionInfoSizeW", {s, 0});
-    check(size > 0, "GetFileVersionInfoSizeW = %u", size);
-    check(call_import(&c, "VERSION.dll", "GetFileVersionInfoW", {s, 0, size, s + 0x1000}) == 1,
-          "GetFileVersionInfoW");
-    gm_put_wstr(s + 0x800, "\\", 8);
-    check(call_import(&c, "VERSION.dll", "VerQueryValueW",
-                      {s + 0x1000, s + 0x800, s + 0x900, s + 0x904}) == 1 &&
-              rd32(rd32(s + 0x900)) == 0xfeef04bdu,
-          "VerQueryValueW(\\) finds VS_FIXEDFILEINFO");
+    if (image_has_version_resource()) {
+        check(size > 0, "GetFileVersionInfoSizeW = %u", size);
+        check(call_import(&c, "VERSION.dll", "GetFileVersionInfoW", {s, 0, size, s + 0x1000}) == 1,
+              "GetFileVersionInfoW");
+        gm_put_wstr(s + 0x800, "\\", 8);
+        check(call_import(&c, "VERSION.dll", "VerQueryValueW",
+                          {s + 0x1000, s + 0x800, s + 0x900, s + 0x904}) == 1 &&
+                  rd32(rd32(s + 0x900)) == 0xfeef04bdu,
+              "VerQueryValueW(\\) finds VS_FIXEDFILEINFO");
+    } else {
+        check(size == 0, "an image without a version resource: GetFileVersionInfoSizeW = 0");
+    }
     // The rest answer as documented for a machine with nothing attached.
     wr32(s + 0xa00, 0);
     check(call_import(&c, "WINSPOOL.DRV", "EnumPrintersW", {2, 0, 2, 0, 0, s + 0xa04, s + 0xa00}) ==

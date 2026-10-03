@@ -11,6 +11,7 @@ double host_script_counter_metric(const char *name, uint32_t (*guest_u32)(uint32
     const bool is_turn = !strcmp(name, "turn");
     if (!is_turn && strcmp(name, "command_frame"))
         return -1.0;
+#if defined(RECOMP_GLOBAL_SIMULATION_TURN_ADDR) && defined(RECOMP_GLOBAL_COMMAND_FRAME_ADDR)
     const uint32_t value =
         guest_u32(is_turn ? RECOMP_GLOBAL_SIMULATION_TURN_ADDR : RECOMP_GLOBAL_COMMAND_FRAME_ADDR);
     auto view = is_turn ? view_turn : view_command_frame;
@@ -25,6 +26,13 @@ double host_script_counter_metric(const char *name, uint32_t (*guest_u32)(uint32
         }
     }
     return value;
+#else
+    // A game that configures no counter globals has no such metric.
+    (void)guest_u32;
+    (void)view_turn;
+    (void)view_command_frame;
+    return -1.0;
+#endif
 }
 
 namespace {
