@@ -47,6 +47,8 @@ static const uint8_t IID_IDirectSound8_[16] =
     IID_BYTES(0xC50A7E93, 0xF395, 0x4834, 0x9E, 0xF6, 0x7F, 0xA9, 0x9D, 0xE5, 0x09, 0xE6);
 static const uint8_t IID_IDirectSoundBuffer_[16] =
     IID_BYTES(0x279AFA85, 0x4981, 0x11CE, 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60);
+static const uint8_t IID_IDirectSoundBuffer8_[16] =
+    IID_BYTES(0x6825A449, 0x7524, 0x4D82, 0x92, 0x0F, 0x50, 0xE3, 0x6A, 0xB3, 0xAB, 0x1E);
 static const uint8_t IID_IDirectSound3DListener_[16] =
     IID_BYTES(0x279AFA84, 0x4981, 0x11CE, 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60);
 static const uint8_t IID_IDirectSound3DBuffer_[16] =
@@ -1110,6 +1112,54 @@ const ComMethod g_dsbuffer[] = {
 };
 
 // ===========================================================================
+// IDirectSoundBuffer8.
+//
+// IDirectSoundBuffer8 is IDirectSoundBuffer plus SetFX, AcquireResources and
+// GetObjectInPath. The game asks for it in its streamed-voice path
+// (Ghidra 0x005684e2: CreateSoundBuffer then QueryInterface(IID_IDirectSoundBuffer8));
+// a refusal there is the E_NOINTERFACE the RSMusic path logs as
+// "RSMusic: Error downloading effect", and it stops the music buffer from ever
+// being played. All three added methods are unused by the reference: the only
+// indirect calls at buffer vtable offsets 0x54/0x58/0x5c in the image are on
+// unrelated objects (0x0045cdd0, 0x00467410, 0x004e65b0). They are declared
+// here so the interface exists and fail by name if that ever changes.
+//
+// The three slots must return a real failure rather than a plausible success,
+// because silently accepting SetFX would claim an effect that was never
+// applied.
+// ===========================================================================
+DX_STUB(Buffer8_SetFX, E_NOTIMPL)
+DX_STUB(Buffer8_AcquireResources, E_NOTIMPL)
+DX_STUB(Buffer8_GetObjectInPath, E_NOTIMPL)
+
+const ComMethod g_dsbuffer8[] = {
+    {"QueryInterface", 3, com_QueryInterface},
+    {"AddRef", 1, com_AddRef},
+    {"Release", 1, com_Release},
+    {"GetCaps", 2, Buffer_GetCaps},
+    {"GetCurrentPosition", 3, Buffer_GetCurrentPosition},
+    {"GetFormat", 4, Buffer_GetFormat},
+    {"GetVolume", 2, Buffer_GetVolume},
+    {"GetPan", 2, Buffer_GetPan},
+    {"GetFrequency", 2, Buffer_GetFrequency},
+    {"GetStatus", 2, Buffer_GetStatus},
+    {"Initialize", 3, Buffer_Initialize},
+    {"Lock", 8, Buffer_Lock},
+    {"Play", 4, Buffer_Play},
+    {"SetCurrentPosition", 2, Buffer_SetCurrentPosition},
+    {"SetFormat", 2, Buffer_SetFormat},
+    {"SetVolume", 2, Buffer_SetVolume},
+    {"SetPan", 2, Buffer_SetPan},
+    {"SetFrequency", 2, Buffer_SetFrequency},
+    {"Stop", 1, Buffer_Stop},
+    {"Unlock", 5, Buffer_Unlock},
+    {"Restore", 1, Buffer_Restore},
+    {"SetFX", 3, Buffer8_SetFX},
+    {"AcquireResources", 4, Buffer8_AcquireResources},
+    {"GetObjectInPath", 7, Buffer8_GetObjectInPath},
+};
+
+// ===========================================================================
 // IDirectSound3DBuffer - a view on the same buffer object.
 // ===========================================================================
 // DS3DBUFFER is 76 bytes: dwSize, vPosition, vVelocity, dwInsideConeAngle,
@@ -1767,7 +1817,8 @@ ComObj *dsbuffer_qi(ComObj *self, ComIface want) {
     // The primary buffer also exposes the 3D listener, as real DirectSound does.
     // The listener view is global bookkeeping (position/orientation/factors);
     // it produces no host sound, which is the documented audio gap.
-    if (want == IF_DS3DBUFFER || want == IF_DSNOTIFY || want == IF_DS3DLISTENER)
+    if (want == IF_DS3DBUFFER || want == IF_DSNOTIFY || want == IF_DS3DLISTENER ||
+        want == IF_DSBUFFER8)
         return self;
     return nullptr;
 }
@@ -1832,6 +1883,8 @@ void dsound_register() {
     com_define(IF_DSOUND, "DSOUND.dll", "IDirectSound", g_dsound, std::size(g_dsound));
     com_define(IF_DSOUND8, "DSOUND.dll", "IDirectSound8", g_dsound8, std::size(g_dsound8));
     com_define(IF_DSBUFFER, "DSOUND.dll", "IDirectSoundBuffer", g_dsbuffer, std::size(g_dsbuffer));
+    com_define(IF_DSBUFFER8, "DSOUND.dll", "IDirectSoundBuffer8", g_dsbuffer8,
+               std::size(g_dsbuffer8));
     com_define(IF_DS3DBUFFER, "DSOUND.dll", "IDirectSound3DBuffer", g_ds3dbuffer,
                std::size(g_ds3dbuffer));
     com_define(IF_DS3DLISTENER, "DSOUND.dll", "IDirectSound3DListener", g_ds3dlistener,
@@ -1842,6 +1895,7 @@ void dsound_register() {
     com_bind(IF_DSOUND8, K_DSOUND);
     com_bind(IF_DS3DLISTENER, K_DSOUND);
     com_bind(IF_DSBUFFER, K_DSBUFFER);
+    com_bind(IF_DSBUFFER8, K_DSBUFFER);
     com_bind(IF_DS3DBUFFER, K_DSBUFFER);
     com_bind(IF_DS3DLISTENER, K_DSBUFFER); // the primary buffer exposes the listener
     com_bind(IF_DSNOTIFY, K_DSBUFFER);
@@ -1849,6 +1903,7 @@ void dsound_register() {
     com_register_iid(IF_DSOUND, IID_IDirectSound_);
     com_register_iid(IF_DSOUND8, IID_IDirectSound8_);
     com_register_iid(IF_DSBUFFER, IID_IDirectSoundBuffer_);
+    com_register_iid(IF_DSBUFFER8, IID_IDirectSoundBuffer8_);
     com_register_iid(IF_DS3DBUFFER, IID_IDirectSound3DBuffer_);
     com_register_iid(IF_DS3DLISTENER, IID_IDirectSound3DListener_);
     com_register_iid(IF_DSNOTIFY, IID_IDirectSoundNotify_);

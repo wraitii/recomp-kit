@@ -6336,6 +6336,30 @@ static void test_dsound() {
     CHECK(rdf32(sc(0x500)) == 1.5f);
     CHECK(rdf32(sc(0x504)) == -2.5f);
     CHECK(rdf32(sc(0x508)) == 3.25f);
+
+    // IDirectSoundBuffer8 is IDirectSoundBuffer plus SetFX, AcquireResources
+    // and GetObjectInPath. The game's streamed-voice path asks for it
+    // (Ghidra 0x005684e2) and treats E_NOINTERFACE as a fatal buffer-creation
+    // failure, which is the "RSMusic: Error downloading effect" log; refusing
+    // it is what stops the music. It must answer, and it must be the same
+    // buffer object through another view.
+    uint8_t b8[16] = {0x49, 0xA4, 0x25, 0x68, 0x24, 0x75, 0x82, 0x4D,
+                      0x92, 0x0F, 0x50, 0xE3, 0x6A, 0xB3, 0xAB, 0x1E};
+    for (int i = 0; i < 16; ++i)
+        wr8(iid + (uint32_t)i, b8[i]);
+    hr = call_method(buf, 0 /* QueryInterface */, {iid, sc(0x60)});
+    CHECK_EQ(hr, S_OK);
+    uint32_t buf8 = rd32(sc(0x60));
+    CHECK(buf8 != 0);
+    CHECK(buf8 != buf);
+    CHECK(rd32(buf8 + COM_OFF_vtbl) != rd32(buf + COM_OFF_vtbl));
+    // An inherited method reaches the same buffer state.
+    uint32_t st8 = sc(0x400);
+    CHECK_EQ(call_method(buf8, B_GetStatus, {st8}), DS_OK);
+    CHECK((rd32(st8) & DSBSTATUS_PLAYING) == 0); // stopped at this point
+    // SetFX is the first buffer8-only slot; the reference never calls it, so
+    // it must fail rather than claim an effect that was not applied.
+    CHECK_EQ(call_method(buf8, 21 /* SetFX */, {0, 0}), E_NOTIMPL);
 }
 
 // DirectInput: the keyboard reports the host's key state, and the mouse
@@ -7797,6 +7821,7 @@ static void test_vtable_integrity() {
         {IF_D3DTEXTURE2, 6, "IDirect3DTexture2"},
         {IF_DSOUND, 11, "IDirectSound"},
         {IF_DSBUFFER, 21, "IDirectSoundBuffer"},
+        {IF_DSBUFFER8, 24, "IDirectSoundBuffer8"},
         {IF_DS3DBUFFER, 21, "IDirectSound3DBuffer"},
         {IF_DS3DLISTENER, 18, "IDirectSound3DListener"},
         {IF_DSNOTIFY, 4, "IDirectSoundNotify"},
