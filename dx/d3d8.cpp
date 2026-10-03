@@ -956,7 +956,17 @@ void Dev_Present(X86 *c) {
             com_ret(c, D8_ERR_INVALIDCALL);
             return;
         }
-        std::vector<uint8_t> rgba(size_t(bytes), 0);
+        // Reuse the full-frame readback and swizzle buffers across presents.
+        // The readback overwrites every byte, so the resize only zero-fills on
+        // the first frame or a resolution change, not once per frame. The
+        // ARGB intermediary is kept because `host_display_present_window` takes
+        // ARGB and also forces opaque alpha for the presenter; removing the
+        // round trip would need a new host entry point and a matching alpha
+        // rule to stay byte-identical.
+        static std::vector<uint8_t> rgba;
+        static std::vector<uint32_t> argb;
+        if (rgba.size() != size_t(bytes))
+            rgba.resize(size_t(bytes), 0);
         uint32_t got = 0;
         status =
             d3d8_device_read_pixels(host_device(dev), rgba.data(), uint32_t(bytes), &got, &err);
@@ -969,7 +979,8 @@ void Dev_Present(X86 *c) {
             return;
         }
         dx_dump_frame_rgba(rgba.data(), dev->d3d8_width, dev->d3d8_height);
-        std::vector<uint32_t> argb(size_t(bytes / 4));
+        if (argb.size() != size_t(bytes / 4))
+            argb.resize(size_t(bytes / 4));
         for (size_t i = 0; i < argb.size(); ++i) {
             const uint8_t *p = rgba.data() + i * 4;
             argb[i] =
@@ -1143,7 +1154,6 @@ void Dev_SetRenderTarget(X86 *c) {
     uint32_t rt_arg = arg(c, 1), ds_arg = arg(c, 2);
     ComObj *rt = rt_arg ? com_this(rt_arg, IF_D3D8SURFACE8) : nullptr;
     ComObj *ds = ds_arg ? com_this(ds_arg, IF_D3D8SURFACE8) : nullptr;
-    static unsigned diagnostic_calls = 0;
     bool rejected = !dev || (rt_arg && (!rt || rt->d3d8_depth || rt->d3d8_owner != dev->id)) ||
                     (ds_arg && (!ds || !ds->d3d8_depth || ds->d3d8_owner != dev->id ||
                                 ds->id != dev->d3d8_depthbuffer));
@@ -1151,12 +1161,8 @@ void Dev_SetRenderTarget(X86 *c) {
         (!(rt->d3d8_usage & D8USAGE_RENDERTARGET) || rt->d3d8_pool != D8POOL_DEFAULT ||
          rt->d3d8_level != 0 || !rt->pixels_bytes || rt->lock_count))
         rejected = true;
-    if (diagnostic_calls < 8 || rejected) {
-        diagnose_render_target(c, dev, rt_arg, rt, ds_arg, ds);
-        if (diagnostic_calls < 8)
-            ++diagnostic_calls;
-    }
     if (rejected) {
+        diagnose_render_target(c, dev, rt_arg, rt, ds_arg, ds);
         fprintf(stderr,
                 "d3d8: SetRenderTarget unsupported surface identity/owner/usage/level/lock\n");
         fflush(stderr);
