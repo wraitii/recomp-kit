@@ -35,15 +35,24 @@ pop_link_video(recomp_dx)
 target_compile_options(recomp_dx PRIVATE ${POP_WARN_HOST})
 pop_optimize(recomp_dx 2)
 
-# Optional Rust D3D8/wgpu host renderer. A game that ships
-# graphics/d3d8-wgpu gets the static library and RECOMP_D3D8_WGPU; every other
-# game builds no Rust and compiles d3d8.cpp's no-renderer path only. The
-# frameworks are what the probe binaries link through cargo's build scripts.
-set(RECOMP_D3D8_WGPU_DIR "${RECOMP_GAME_DIR}/graphics/d3d8-wgpu")
-if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND EXISTS "${RECOMP_D3D8_WGPU_DIR}/Cargo.toml")
+# Optional Rust D3D8/wgpu host renderer, shipped in the kit as
+# graphics/d3d8-wgpu. It is built on native macOS when RECOMP_D3D8_WGPU is ON
+# (tools/build.py passes it from the environment) or when a game ships its own
+# graphics/d3d8-wgpu, which then takes precedence. Every other build compiles
+# no Rust and uses d3d8.cpp's no-renderer path only. The frameworks are what the
+# probe binaries link through cargo's build scripts.
+option(RECOMP_D3D8_WGPU "Build the kit's Rust D3D8/wgpu renderer" OFF)
+set(RECOMP_D3D8_WGPU_DIR "")
+if(EXISTS "${RECOMP_GAME_DIR}/graphics/d3d8-wgpu/Cargo.toml")
+  set(RECOMP_D3D8_WGPU_DIR "${RECOMP_GAME_DIR}/graphics/d3d8-wgpu")
+elseif(RECOMP_D3D8_WGPU)
+  set(RECOMP_D3D8_WGPU_DIR "${CMAKE_CURRENT_LIST_DIR}/../graphics/d3d8-wgpu")
+  get_filename_component(RECOMP_D3D8_WGPU_DIR "${RECOMP_D3D8_WGPU_DIR}" ABSOLUTE)
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND RECOMP_D3D8_WGPU_DIR AND EXISTS "${RECOMP_D3D8_WGPU_DIR}/Cargo.toml")
   find_program(CARGO_EXECUTABLE cargo)
   if(NOT CARGO_EXECUTABLE)
-    message(FATAL_ERROR "graphics/d3d8-wgpu is present but cargo was not found")
+    message(FATAL_ERROR "the D3D8/wgpu renderer is enabled but cargo was not found")
   endif()
   # This host bridge has only been wired for native macOS builds. Cargo's
   # default target must not silently supply a host archive to a cross build.

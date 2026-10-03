@@ -1,0 +1,18 @@
+language = "C"
+cpp_compat = true
+include_guard = "D3D8_WGPU_ABI_H"
+autogen_warning = "/* Generated from src/abi.rs by cbindgen. Do not edit. */"
+header = "/* Host-only ABI: opaque handles and plain data; no guest addresses. */"
+usize_is_size_t = true
+style = "type"
+[export]
+include = ["D3d8LevelLayout"]
+exclude = ["RenderError", "RenderErrorKind", "Mat4", "TransformUniform", "D3DFVF_XYZ", "D3DFVF_XYZRHW", "D3DFVF_NORMAL", "D3DFVF_DIFFUSE", "D3DFVF_SPECULAR", "D3DFVF_TEXCOUNT_MASK", "D3DFVF_TEXCOUNT_SHIFT", "D3DFVF_TEX1", "FVF_XYZ_DIFFUSE", "FVF_XYZ_DIFFUSE_TEX1", "D3DFMT_A8R8G8B8", "D3DFMT_X8R8G8B8", "D3DFMT_D16", "D3DFMT_D24S8", "D3DFMT_D24X8", "D3DFMT_D32", "MAX_TEXTURE_STAGES", "MAX_LIGHTS", "UNLIT_WGSL", "READBACK_ORDER"]
+[export.rename]
+"ABI_VERSION" = "D3D8_ABI_VERSION"
+"DIAGNOSTIC_CAPACITY" = "D3D8_DIAGNOSTIC_CAPACITY"
+[enum]
+rename_variants = "ScreamingSnakeCase"
+prefix_with_name = true
+[parse]
+parse_deps = false

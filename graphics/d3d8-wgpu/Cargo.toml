@@ -1,0 +1,28 @@
+[package]
+name = "d3d8-wgpu"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Isolated D3D8-semantics renderer prototype on wgpu (not a game integration)"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "d3d8_wgpu"
+path = "src/lib.rs"
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "probe-headless"
+path = "src/bin/probe_headless.rs"
+
+[[bin]]
+name = "probe-windowed"
+path = "src/bin/probe_windowed.rs"
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+pollster = "0.4"
+wgpu = "27"
+winit = "0.30"

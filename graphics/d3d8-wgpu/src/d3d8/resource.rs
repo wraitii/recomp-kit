@@ -1,0 +1,374 @@
+//! CPU resource storage and draw preparation, independent of adapters and GPUs.
+//! The bridge owns guest staging; these bytes retain their native D3D layout.
+use crate::RenderError;
+use std::borrow::Cow;
+
+/// Stable storage. Allocation is fallible; its address never changes before drop.
+pub struct CpuStorage {
+    pub bytes: Vec<u8>,
+}
+
+impl CpuStorage {
+    pub fn new(size: u32) -> Result<Self, RenderError> {
+        if size == 0 {
+            return Err(RenderError::invalid("CreateResource", "zero size"));
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(size as usize).map_err(|_| {
+            RenderError::out_of_memory("CreateResource", "CPU storage allocation failed")
+        })?;
+        bytes.resize(size as usize, 0);
+        Ok(Self { bytes })
+    }
+}
+
+/// Supported CPU texel layouts, separate from GPU sampling support.
+/// Palette and compressed formats remain unsupported by this storage path.
+pub fn format_bytes(format: u32) -> u32 {
+    match format {
+        21 | 22 | 31..=35 => 4,
+        23..=26 | 29 | 30 | 51 => 2,
+        27 | 28 | 50 | 52 => 1,
+        36 => 8,
+        _ => 0,
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct D3d8LevelLayout {
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub size: u32,
+    pub levels: u32,
+}
+
+/// Preserve the bridge's bounded mip policy while centralizing checked sizes.
+pub fn level_layout(
+    width: u32,
+    height: u32,
+    levels: u32,
+    level: u32,
+    format: u32,
+) -> Result<D3d8LevelLayout, RenderError> {
+    let bpp = format_bytes(format);
+    if width == 0 || height == 0 || width > 16384 || height > 16384 || bpp == 0 {
+        return Err(RenderError::invalid(
+            "CreateTexture",
+            "invalid dimensions or CPU format",
+        ));
+    }
+    let levels = if levels == 0 {
+        u32::BITS - width.max(height).leading_zeros()
+    } else {
+        levels.min(16)
+    };
+    if level >= levels {
+        return Err(RenderError::invalid(
+            "GetLevelDesc",
+            "mip level out of range",
+        ));
+    }
+    let width = (width >> level).max(1);
+    let height = (height >> level).max(1);
+    let pitch = width
+        .checked_mul(bpp)
+        .ok_or_else(|| RenderError::invalid("CreateTexture", "pitch overflow"))?;
+    let size = pitch
+        .checked_mul(height)
+        .ok_or_else(|| RenderError::invalid("CreateTexture", "size overflow"))?;
+    Ok(D3d8LevelLayout {
+        width,
+        height,
+        pitch,
+        size,
+        levels,
+    })
+}
+
+/// Owned probe vertices or a borrowed ABI upload. No extra copy for guest draws.
+pub struct VertexBuffer<'a> {
+    bytes: Cow<'a, [u8]>,
+    pub stride: u32,
+}
+
+impl VertexBuffer<'static> {
+    pub fn new(bytes: &[u8], stride: u32) -> Result<Self, RenderError> {
+        VertexBuffer::borrowed(bytes, stride)?;
+        let mut storage = CpuStorage::new(u32::try_from(bytes.len()).map_err(|_| {
+            RenderError::invalid("CreateVertexBuffer", "size exceeds 32-bit resource limit")
+        })?)?;
+        storage.bytes.copy_from_slice(bytes);
+        Ok(Self {
+            bytes: Cow::Owned(storage.bytes),
+            stride,
+        })
+    }
+}
+
+impl<'a> VertexBuffer<'a> {
+    pub fn borrowed(bytes: &'a [u8], stride: u32) -> Result<Self, RenderError> {
+        if stride == 0 || bytes.is_empty() {
+            return Err(RenderError::invalid(
+                "DrawPrimitive",
+                "nonempty vertices and nonzero stride required",
+            ));
+        }
+        // D3D buffers may have trailing bytes that aren't part of a vertex.
+        Ok(Self {
+            bytes: Cow::Borrowed(bytes),
+            stride,
+        })
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Arguments retain D3D8's distinction between the raw index interval and the
+/// base vertex applied when accessing the stream. Expansion preserves ordering.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexedDraw {
+    pub topology: u32,
+    pub index_format: u32,
+    pub stride: u32,
+    pub base_vertex: u32,
+    pub min_index: u32,
+    pub num_vertices: u32,
+    pub start_index: u32,
+    pub primitive_count: u32,
+}
+
+pub fn expand_indexed(
+    vertices: &[u8],
+    indices: &[u8],
+    draw: IndexedDraw,
+) -> Result<Vec<u8>, RenderError> {
+    let mut output = Vec::new();
+    expand_indexed_into(&mut output, vertices, indices, draw)?;
+    Ok(output)
+}
+
+/// [`expand_indexed`] writing into a caller-owned buffer so a draw loop can
+/// reuse one allocation. Validation happens before `output` is touched, and
+/// `output` is left exactly `count * stride` bytes with every byte written.
+/// `resize` only zero-fills the first time a larger draw grows it; in steady
+/// state the length already matches and nothing is initialised.
+pub fn expand_indexed_into(
+    output: &mut Vec<u8>,
+    vertices: &[u8],
+    indices: &[u8],
+    draw: IndexedDraw,
+) -> Result<(), RenderError> {
+    let invalid = |cause| RenderError::invalid("DrawIndexedPrimitive", cause);
+    if draw.topology != 4 {
+        return Err(RenderError::new(
+            "DrawIndexedPrimitive",
+            "only triangle lists are implemented",
+        ));
+    }
+    let index_size = match draw.index_format {
+        101 => 2usize,
+        102 => 4,
+        _ => return Err(invalid("invalid index format")),
+    };
+    if draw.stride == 0 || draw.num_vertices == 0 || draw.primitive_count == 0 {
+        return Err(invalid("empty draw or zero stride"));
+    }
+    let count = draw
+        .primitive_count
+        .checked_mul(3)
+        .ok_or_else(|| invalid("index count overflow"))?;
+    let end = draw
+        .start_index
+        .checked_add(count)
+        .ok_or_else(|| invalid("index range overflow"))?;
+    if u64::from(end) * index_size as u64 > indices.len() as u64 {
+        return Err(invalid("index range exceeds buffer"));
+    }
+    let raw_end = draw
+        .min_index
+        .checked_add(draw.num_vertices)
+        .ok_or_else(|| invalid("vertex interval overflow"))?;
+    let actual_end = draw
+        .base_vertex
+        .checked_add(raw_end)
+        .ok_or_else(|| invalid("base vertex overflow"))?;
+    if u64::from(actual_end) * u64::from(draw.stride) > vertices.len() as u64 {
+        return Err(invalid("vertex range exceeds buffer"));
+    }
+    // Validate all indices before allocating or reading a vertex.
+    let selected = &indices[draw.start_index as usize * index_size..end as usize * index_size];
+    let read = |bytes: &[u8]| {
+        if index_size == 2 {
+            u32::from(u16::from_le_bytes(bytes.try_into().unwrap()))
+        } else {
+            u32::from_le_bytes(bytes.try_into().unwrap())
+        }
+    };
+    for bytes in selected.chunks_exact(index_size) {
+        let raw = read(bytes);
+        if raw < draw.min_index || raw >= raw_end {
+            return Err(invalid("index outside declared interval"));
+        }
+    }
+    let size = count
+        .checked_mul(draw.stride)
+        .ok_or_else(|| invalid("expanded size overflow"))?;
+    output.resize(size as usize, 0);
+    for (dst, bytes) in output
+        .chunks_exact_mut(draw.stride as usize)
+        .zip(selected.chunks_exact(index_size))
+    {
+        let offset =
+            (u64::from(read(bytes)) + u64::from(draw.base_vertex)) * u64::from(draw.stride);
+        dst.copy_from_slice(&vertices[offset as usize..offset as usize + draw.stride as usize]);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn draw() -> IndexedDraw {
+        IndexedDraw {
+            topology: 4,
+            index_format: 101,
+            stride: 1,
+            base_vertex: 2,
+            min_index: 1,
+            num_vertices: 3,
+            start_index: 1,
+            primitive_count: 1,
+        }
+    }
+    #[test]
+    fn indexed_interval_is_relative_before_base_vertex() {
+        let indices = [99u16, 3, 1, 2]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expand_indexed(&[10, 11, 12, 13, 14, 15], &indices, draw()).unwrap(),
+            [15, 13, 14]
+        );
+        let indices = [99u32, 3, 1, 2]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expand_indexed(
+                &[10, 11, 12, 13, 14, 15],
+                &indices,
+                IndexedDraw {
+                    index_format: 102,
+                    ..draw()
+                }
+            )
+            .unwrap(),
+            [15, 13, 14]
+        );
+    }
+    #[test]
+    fn indexed_overflow_and_bounds_fail_before_allocation() {
+        let indices = [1u16, 2, 3]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        for d in [
+            IndexedDraw {
+                primitive_count: u32::MAX,
+                ..draw()
+            },
+            IndexedDraw {
+                start_index: u32::MAX,
+                ..draw()
+            },
+            IndexedDraw {
+                min_index: u32::MAX,
+                ..draw()
+            },
+            IndexedDraw {
+                base_vertex: u32::MAX,
+                ..draw()
+            },
+            IndexedDraw {
+                num_vertices: 9,
+                ..draw()
+            },
+            IndexedDraw {
+                stride: 0,
+                ..draw()
+            },
+        ] {
+            assert!(expand_indexed(&[0; 6], &indices, d).is_err());
+        }
+        assert!(expand_indexed(&[0; 6], &[0, 0, 0, 0, 0, 0, 0, 0], draw()).is_err());
+    }
+    #[test]
+    fn mip_layout_and_cpu_formats() {
+        assert_eq!(
+            level_layout(8, 4, 0, 3, 23).unwrap(),
+            D3d8LevelLayout {
+                width: 1,
+                height: 1,
+                pitch: 2,
+                size: 2,
+                levels: 4
+            }
+        );
+        assert!(level_layout(8, 4, 0, 4, 23).is_err());
+        assert_eq!(level_layout(1, 1, 99, 15, 21).unwrap().levels, 16);
+        assert!(level_layout(u32::MAX, 1, 1, 0, 21).is_err());
+        assert_eq!(format_bytes(41), 0); // P8 requires palette support.
+        assert_eq!(format_bytes(36), 8);
+    }
+    #[test]
+    fn borrowed_vertices_keep_original_storage_and_trailing_bytes() {
+        let bytes = [0; 17];
+        let view = VertexBuffer::borrowed(&bytes, 16).unwrap();
+        assert_eq!(view.bytes().as_ptr(), bytes.as_ptr());
+        assert_eq!(view.bytes().len(), 17);
+    }
+    #[test]
+    fn reused_expansion_truncates_and_overwrites_every_byte() {
+        // One wide draw fills the scratch, then a narrow one reuses it. The
+        // result must be exactly the narrow expansion: a shorter draw must not
+        // expose bytes the wide draw left behind.
+        let vertices = [10u8, 11, 12, 13, 14, 15, 16];
+        let wide_indices = [0u16, 1, 2, 3, 4, 5]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let narrow_indices = [2u16, 0, 1]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let wide = IndexedDraw {
+            topology: 4,
+            index_format: 101,
+            stride: 1,
+            base_vertex: 0,
+            min_index: 0,
+            num_vertices: 6,
+            start_index: 0,
+            primitive_count: 2,
+        };
+        let narrow = IndexedDraw {
+            primitive_count: 1,
+            num_vertices: 3,
+            ..wide
+        };
+        let mut scratch = Vec::new();
+        expand_indexed_into(&mut scratch, &vertices, &wide_indices, wide).unwrap();
+        assert_eq!(scratch, [10, 11, 12, 13, 14, 15]);
+        expand_indexed_into(&mut scratch, &vertices, &narrow_indices, narrow).unwrap();
+        assert_eq!(scratch, [12, 10, 11]);
+        // And the reverse order: the narrow draw first must not shrink the
+        // reused buffer's capacity so the wide draw still comes out complete.
+        expand_indexed_into(&mut scratch, &vertices, &narrow_indices, narrow).unwrap();
+        expand_indexed_into(&mut scratch, &vertices, &wide_indices, wide).unwrap();
+        assert_eq!(scratch, [10, 11, 12, 13, 14, 15]);
+    }
+}

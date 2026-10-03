@@ -21,13 +21,14 @@ fullscreen and additional swapchains are not implemented. These limits can preve
 a guest from selecting this adapter; capability bits must not be inflated to
 bypass selection.
 
-Native macOS builds optionally link a game-provided `graphics/d3d8-wgpu` crate
-exporting the D3D8 C ABI (generated into the build tree with cbindgen 0.29.4). CMake builds its locked static library, tracks all
-Rust modules and checks the ABI version before use. Other platforms and games
-without that crate build the no-renderer path, which advertises no adapter.
+Native macOS builds optionally link the kit's `graphics/d3d8-wgpu` crate (enable it
+with `RECOMP_D3D8_WGPU=1` in the environment of `tools/build.py`, or a game may ship
+its own `graphics/d3d8-wgpu`, which takes precedence), exporting the D3D8 C ABI (generated into the build tree with cbindgen 0.29.4). CMake builds its locked static library, tracks all
+Rust modules and checks the ABI version before use. Other platforms and builds
+without it build the no-renderer path, which advertises no adapter.
 The null-host target excludes GPU execution, but links Rust CPU storage when
-the optional crate is present so its guest COM tests exercise the real resource
-ABI. Standalone kit profiles retain C++ CPU storage. The reusable renderer itself remains supplied by the game repository; this is
+the crate is enabled so its guest COM tests exercise the real resource
+ABI. Standalone kit profiles retain C++ CPU storage. The renderer's D3D8 coverage is what the games it has run needed so far; this is
 a bounded integration boundary. COM IIDs and tables are generated from a pinned
 Wine header plus `d3d8_bindings.json`; see [Testing](../docs/testing.md).
 

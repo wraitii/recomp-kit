@@ -91,8 +91,14 @@ def cmake_tool(name):
 
 
 def game_defines(game_dir, build_root):
-    """The two cache paths every configure needs."""
-    return ["-DRECOMP_GAME_DIR=%s" % Path(game_dir).as_posix(), "-DPOP_BUILD_ROOT=%s" % Path(build_root).as_posix()]
+    """The cache paths and renderer switch every configure needs.
+
+    RECOMP_D3D8_WGPU=1 in the environment builds the kit's Rust D3D8/wgpu
+    renderer (native macOS only); it is passed explicitly each time so a stale
+    cache cannot keep it on."""
+    wgpu = "ON" if os.environ.get("RECOMP_D3D8_WGPU") == "1" else "OFF"
+    return ["-DRECOMP_GAME_DIR=%s" % Path(game_dir).as_posix(), "-DPOP_BUILD_ROOT=%s" % Path(build_root).as_posix(),
+            "-DRECOMP_D3D8_WGPU=" + wgpu]
 
 
 def configure(preset, extra=(), build_dir=None):
