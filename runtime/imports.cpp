@@ -473,8 +473,17 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     uint8_t argc = tramps()[idx].argc;
     // A guest exception can longjmp across fn(c). Keep no C++ owner live
     // across that call, and do not retain a pointer into the movable vector.
-    char desc[512];
-    snprintf(desc, sizeof desc, "%s", tramps()[idx].desc.c_str());
+    // The copy exists because the shim can reallocate `tramps()`; only take it
+    // when a consumer is actually active, since the snprintf runs on every
+    // import call. `argc == ARGC_UNKNOWN` needs the description for the
+    // once-only key below, and the null/unsupported shims name the import in
+    // their diagnostic.
+    const bool need_desc = log_level() >= 2 || g_call_observer != nullptr ||
+                           g_return_observer != nullptr || fn == nullptr ||
+                           fn == imports_unsupported || argc == ARGC_UNKNOWN;
+    char desc[512] = {};
+    if (need_desc)
+        snprintf(desc, sizeof desc, "%s", tramps()[idx].desc.c_str());
     ++tramps()[idx].calls;
     ++g_import_calls;
 
