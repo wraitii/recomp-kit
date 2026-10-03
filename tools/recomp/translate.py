@@ -939,49 +939,48 @@ FLAG_EFFECT = {
     "COMISS": (ALL_FLAGS, NO_FLAGS), "UCOMISS": (ALL_FLAGS, NO_FLAGS),
 }
 
-#: Helper-backed or trapping instructions whose runtime may inspect the
-#: whole guest context (a fault, an FPU exception, a host callback, a switch
-#: to another translation).  These materialize every flag before they run
-#: even though integer flags are not part of their own semantics, and are
-#: checked before FLAG_NEUTRAL so a form that is flag-neutral by itself
-#: cannot hide a live flag across a helper call.  x87 is matched by prefix.
+#: Instructions whose runtime may inspect the whole guest context (a fault,
+#: an FPU exception, a host callback, a switch to another translation) even
+#: though the integer flags are not part of their own semantics.  These
+#: materialize every flag before they run.  x87 is matched by prefix, string
+#: forms and memory operands in is_flag_observer below.
 FLAG_OBSERVER = frozenset((
     "CLI", "STI", "HLT", "INT", "INT3", "IN", "OUT", "CPUID", "RDTSC",
-    "PUSHAD", "POPAD", "PUSHA", "POPA", "XLAT",
-    "MOVSB", "MOVSW", "MOVSD", "STOSB", "STOSW", "STOSD",
-    "LODSB", "LODSW", "LODSD", "INSB", "INSW", "INSD",
-    "OUTSB", "OUTSW", "OUTSD",
-    "SCASB", "SCASW", "SCASD", "CMPSB", "CMPSW", "CMPSD",
+    "XLAT", "WAIT",
+    # Implicit stack accesses: the return address or saved register block is
+    # in guest memory even though the listing names a register or nothing.
+    "PUSH", "POP", "PUSHA", "POPA", "PUSHAD", "POPAD", "LEAVE",
+    "CALL", "RET", "IRET",
+    # SSE arithmetic, compare and conversion can raise an FP exception the kit
+    # does not yet model, so they are observed rather than assumed safe.
+    "ADDSD", "SUBSD", "MULSD", "DIVSD", "ADDSS", "SUBSS", "MULSS", "DIVSS",
+    "SQRTSD", "SQRTSS", "MINSD", "MAXSD", "MINSS", "MAXSS",
+    "CVTSI2SD", "CVTSI2SS", "CVTTSD2SI", "CVTTSS2SI", "CVTSD2SS", "CVTSS2SD",
+    "COMISD", "UCOMISD", "COMISS", "UCOMISS",
 ))
 
 
 #: Instructions whose arithmetic-flag effect is exactly "none" and that are
-#: not helper-backed or trapping: the whitelist is deliberately shallow,
-#: because a missing entry only costs extra flag stores while a wrong one
-#: would lose a value.  Anything outside FLAG_EFFECT, FLAG_OBSERVER and this
-#: set is treated as a reader of every flag.  Loads and stores are not
-#: observers: rd*/wr* are inline and cannot read flags, their null guard is a
-#: compile-time-disabled diagnostic, and recomp_watch_hit/recomp_dirty carry
-#: no X86 state.
+#: not helper-backed, trapping or memory-touching: the whitelist is
+#: deliberately shallow, because a missing entry only costs extra flag stores
+#: while a wrong one would lose a value.  Anything outside FLAG_EFFECT,
+#: FLAG_OBSERVER and this set is treated as a reader of every flag.
 FLAG_NEUTRAL = frozenset((
-    # Moves, addressing and register-width changes.
-    "MOV", "MOVZX", "MOVSX", "LEA", "NOP", "WAIT", "PAUSE",
-    "CBW", "CWDE", "CDQ", "CWD", "XCHG", "BSWAP", "LEAVE",
-    # Register pushes and pops, which are inline reads and writes.
-    "PUSH", "POP",
+    # Register-only moves, addressing and width changes.  A memory form of any
+    # of these is caught by is_flag_observer's operand scan.
+    "MOV", "MOVZX", "MOVSX", "LEA", "NOP", "PAUSE",
+    "CBW", "CWDE", "CDQ", "CWD", "XCHG", "BSWAP",
     # Direction-flag setters.
     "CLD", "STD",
-    # SSE/MMX data movement, arithmetic, lane masks and conversions.  These
-    # lower to inline reads and writes (or recomp_sse_sqrt, which takes no
-    # X86 state); COMIS*/UCOMIS* are in FLAG_EFFECT because they write ZF,
-    # PF and CF.  MOVSD is also an SSE scalar move.
+    # SSE/MMX data movement, lane masks and integer SIMD (or a memory
+    # operand, caught by the scan).  Arithmetic, compare and conversion forms
+    # are observers above.  MOVSD is also an SSE scalar move and is separated
+    # from its string form by operand shape.
     "MOVSS", "MOVSD", "MOVAPS", "MOVUPS", "MOVAPD", "MOVUPD", "MOVD", "MOVQ",
     "MOVDQA", "MOVDQU", "MOVDDUP", "MOVLPD", "MOVLPS", "MOVHPD", "MOVHPS",
     "PUNPCKLDQ", "PUNPCKHDQ", "PUNPCKLQDQ", "UNPCKLPD", "UNPCKHPD",
     "PSHUFD", "SHUFPS", "SHUFPD", "ANDNPD", "ANDNPS", "PANDN", "PCMPEQD",
-    "PXOR", "ADDSD", "SUBSD", "MULSD", "DIVSD", "ADDSS", "SUBSS", "MULSS",
-    "DIVSS", "SQRTSD", "SQRTSS", "MINSD", "MAXSD", "MINSS", "MAXSS",
-    "CVTSI2SD", "CVTSI2SS", "CVTTSD2SI", "CVTTSS2SI", "CVTSD2SS", "CVTSS2SD",
+    "PXOR",
     # Non-arithmetic status and cache instructions that lower inline.
     "EMMS", "LDMXCSR", "STMXCSR",
     "PREFETCHNTA", "PREFETCHT0", "PREFETCHT1", "PREFETCHT2",
@@ -990,9 +989,37 @@ FLAG_NEUTRAL = frozenset((
 
 
 def is_flag_observer(insn):
-    """Whether the instruction reaches a helper or trap that may inspect the
-    full guest context, so every arithmetic flag must be live before it."""
-    return insn.mnem in FLAG_OBSERVER or insn.mnem.startswith("F")
+    """Whether running this instruction may expose the arithmetic flags to
+    something other than the translated code that follows it.
+
+    That is a helper or a trap (which can read the current CPU from TLS, not
+    only through the X86 argument), an x87 form, or any instruction that may
+    touch guest memory.  A fault or a diagnostic must find the flags the
+    original left there, so the memory access is materialized in front of it
+    even when the access itself defines flags; implicit stack, string, port
+    and table accesses count too, so the operands are scanned rather than
+    trusted to name the access.  An operand the parser does not understand is
+    treated as a possible access."""
+    m = insn.mnem
+    if m in FLAG_OBSERVER or m.startswith("F"):
+        return True
+    # The memory string forms share their mnemonics with SSE moves; only the
+    # non-XMM spelling (STOS, MOVS, LODS, SCAS, CMPS, INS, OUTS) is one.
+    if m in Translator.STRING_MNEM and not names_an_xmm(insn):
+        return True
+    # LEA's operand is memory-shaped but is never dereferenced.
+    if m == "LEA":
+        return False
+    for text in insn.ops:
+        try:
+            op = parse_operand(text)
+        except TranslateError:
+            return True
+        # A segment-register form is lowered through the runtime's segment
+        # handling (and a write to CS traps), so it is observed too.
+        if op.kind == "mem" or op.kind == "sreg":
+            return True
+    return False
 
 
 def shift_count_const(insn):
@@ -1036,27 +1063,29 @@ def flag_effect(insn):
 
     `defs` is the kill set for liveness, so it only lists flags the
     instruction writes on every path.  A shift or rotate whose effective count
-    might be zero, and a REP-prefixed compare whose count might be zero, write
-    nothing and must therefore not kill the incoming flags.
+    might be zero writes nothing and must therefore not kill the incoming
+    flags.  A memory access, helper or trap is an observer instead: it uses
+    every flag and kills none, so a value a fault or handler may read stays
+    live back to its definition.
 
     The effect table is a whitelist: an instruction that is not a helper or
     trap observer, is not named in FLAG_EFFECT and is not in FLAG_NEUTRAL is
     treated as a reader of every flag.  That keeps an unaudited helper, an
     unmodelled opcode or a faulting instruction from letting a live flag go
-    stale, at the cost of some extra flag stores."""
+    stale, at the cost of some extra flag stores.  Observation is checked
+    first so a conditional or set form with a memory operand cannot hide the
+    access behind its condition's flag use."""
     m = insn.mnem
+    if is_flag_observer(insn):
+        # A helper, trap or memory access must find the flags the original
+        # left there, even if the instruction goes on to define some itself.
+        return (NO_FLAGS, ALL_FLAGS)
     if m in JCC:
         return (NO_FLAGS, frozenset(JCC[m][1]))
     if m in SETCC:
         return (NO_FLAGS, frozenset(SETCC[m][1]))
     if m in CMOVCC:
         return (NO_FLAGS, frozenset(CMOVCC[m][1]))
-    if is_flag_observer(insn):
-        return (NO_FLAGS, ALL_FLAGS)
-    if insn.rep and m in ("SCASB", "SCASW", "SCASD", "CMPSB", "CMPSW", "CMPSD"):
-        # REPE/REPNE consult ZF between iterations, and a zero counter runs
-        # no iteration, so nothing is defined and nothing may be killed.
-        return (NO_FLAGS, frozenset(("zf",)))
     if m in SHIFT_MAYDEF:
         uses = frozenset(("cf",)) if m in ("RCL", "RCR") else NO_FLAGS
         cnt = shift_effective_count(insn)

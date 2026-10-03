@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Translate arithmetic flags with intraprocedural CFG liveness instead of
+  marking all six live at every branch. A flag store is kept only where a read
+  or an observer keeps it live: calls, returns, external or unknown transfers,
+  traps, x87 and SSE arithmetic/compare/conversion, segment forms, and any
+  possible guest memory access. LAHF, CMC, CMPXCHG, XADD, the REP compare
+  forms and RCL/RCR's effective zero count are audited, and the eager-flags
+  baseline is unchanged. Generated output is not tracked. The RCL/RCR flag
+  helper no longer sets OF when the effective rotate count is zero, matching
+  the SDM's zero-bit rotate rule (a bounded fix for the exposed case only).
+
 - Compile translated call instrumentation once behind stable entry symbols.
   Native override headers affect the dispatch table, not translated callers.
   Regeneration uses stable address buckets with a 512 KiB body budget and

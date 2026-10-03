@@ -687,13 +687,13 @@ static inline void x86_sahf(X86 *c) {
             v = (UT)((v << 1) | c->eflags_cf);                                                     \
             c->eflags_cf = hi;                                                                     \
         }                                                                                          \
-        if (n & 31u)                                                                               \
+        if (cnt)                                                                                   \
             c->eflags_of = ((uint32_t)(v >> (BITS - 1)) & 1u) ^ c->eflags_cf;                      \
         return v;                                                                                  \
     }                                                                                              \
     static inline UT rcr##BITS##_f(X86 *c, UT v, uint32_t n) {                                     \
         uint32_t cnt = (n & 31u) % (BITS + 1), i;                                                  \
-        if (n & 31u)                                                                               \
+        if (cnt)                                                                                   \
             c->eflags_of = ((uint32_t)(v >> (BITS - 1)) & 1u) ^ c->eflags_cf;                      \
         for (i = 0; i < cnt; i++) {                                                                \
             uint32_t lo = (uint32_t)v & 1u;                                                        \

@@ -541,6 +541,89 @@ CASES = [
          "39 EE  0F 77  C3", lambda rng: {"regs": rand_regs(rng)}),
 ]
 
+# CFG arithmetic-flag liveness: flags must cross a two-way join, survive a
+# loop back-edge, come through INC/DEC with CF intact, and come through a
+# shift whose count is zero (and an RCL whose effective count is zero) still
+# set.  Every one of these is compared against Unicorn's own flags.
+
+def cmp_branch_setup(rng):
+    """Cover both sides of a CMP-driven branch: random operands make equality
+    a 2^-32 event, so half the runs force EAX == EBX and half differ."""
+    eax = rng.getrandbits(32)
+    ebx = eax if rng.random() < 0.5 else eax ^ (1 << rng.randrange(32))
+    return {"regs": rand_regs(rng, EAX=eax, EBX=ebx)}
+
+
+CASES += [
+    Case("A comparison's flags cross a two-way join to SETZ", 0x0D028100,
+         [(0x0, "CMP EAX,EBX"), (0x2, "JNE 0x0d028109"),
+          (0x4, "MOV ECX,0x1"), (0x9, "SETZ CL"), (0xc, "RET")],
+         "39 D8 75 05 B9 01 00 00 00 0F 94 C1 C3", cmp_branch_setup),
+    # Both arms join at a register XOR that redefines every flag before RET,
+    # so only the ZF the branch reads is live at the CMP.  This is the shape
+    # the CFG pass improves on: the old straight-line pass kept all six live
+    # at the branch.  The differential run only proves correctness; the
+    # liveness assertion below proves the elimination.
+    Case("Both arms of a JZ overwrite the flags before RET", 0x0D028200,
+         [(0x0, "CMP EAX,EBX"), (0x2, "JZ 0x0d02820a"),
+          (0x4, "MOV EDX,0x1"), (0x9, "NOP"), (0xa, "XOR ECX,ECX"),
+          (0xc, "RET")],
+         "39 D8 74 06 BA 01 00 00 00 90 31 C9 C3", cmp_branch_setup),
+    Case("CF stays set through an INC/DEC loop and is read after it", 0x0D028300,
+         [(0x0, "XOR EAX,EAX"), (0x2, "SUB EAX,0x1"), (0x5, "MOV ECX,0x3"),
+          (0xa, "INC EAX"), (0xb, "DEC ECX"), (0xc, "JNZ 0x0d02830a"),
+          (0xe, "SETC BL"), (0x11, "RET")],
+         "31 C0 83 E8 01 B9 03 00 00 00 40 49 75 FC 0F 92 C3 C3",
+         lambda rng: {"regs": rand_regs(rng)}),
+    Case("A zero-count shift leaves the carry alone", 0x0D028400,
+         [(0x0, "MOV EAX,0xffffffff"), (0x5, "ADD EAX,0x1"),
+          (0x8, "MOV CL,0x0"), (0xa, "SHL EAX,CL"),
+          (0xc, "SETC BL"), (0xf, "RET")],
+         "B8 FF FF FF FF 83 C0 01 B1 00 D3 E0 0F 92 C3 C3",
+         lambda rng: {"regs": rand_regs(rng)}),
+    # AH and BL retain the consumed flags after XOR kills the flag fields.
+    # LAHF also checks AF through AH, which the generic final flag mask omits.
+    Case("LAHF consumes arithmetic flags before a later overwrite", 0x0D028500,
+         [(0x0, "MOV AL,0xf"), (0x2, "ADD AL,0x1"), (0x4, "LAHF"),
+          (0x5, "XOR ECX,ECX"), (0x7, "RET")],
+         "B0 0F 04 01 9F 31 C9 C3"),
+    Case("CMC consumes carry produced by arithmetic", 0x0D028600,
+         [(0x0, "MOV EAX,0xffffffff"), (0x5, "ADD EAX,0x1"), (0x8, "CMC"),
+          (0x9, "SETC BL"), (0xc, "XOR EDX,EDX"), (0xe, "RET")],
+         "B8 FF FF FF FF 83 C0 01 F5 0F 92 C3 31 D2 C3"),
+    Case("A zero-count REP compare preserves incoming flags", 0x0D028700,
+         [(0x0, "ADD EAX,EBX"), (0x2, "MOV ECX,0x0"),
+          (0x7, "CMPSB.REPE ES:EDI,ESI"), (0x9, "LAHF"),
+          (0xa, "XOR EDX,EDX"), (0xc, "RET")],
+         "01 D8 B9 00 00 00 00 F3 A6 9F 31 D2 C3",
+         lambda rng: {"regs": rand_regs(rng, ESI=SCRATCH, EDI=SCRATCH + 16)}),
+    # RCL/RCR take the count modulo width + 1, so a masked count of 9 on an
+    # 8-bit operand (or 17 on a 16-bit one) is a zero-bit rotate that leaves
+    # every flag alone.  SET OF with a signed overflow, set CF, rotate, then
+    # RET: both flags must come back unchanged.  The runtime helper used to
+    # set OF from `n & 31`, which this catches.
+    Case("RCL AL,9 is a zero-bit rotate that preserves CF and OF", 0x0D028800,
+         [(0x0, "MOV AL,0x7f"), (0x2, "ADD AL,0x1"), (0x4, "STC"),
+          (0x5, "RCL AL,0x9"), (0x8, "RET")],
+         "B0 7F 04 01 F9 C0 D0 09 C3",
+         lambda rng: {"regs": rand_regs(rng)}),
+    Case("RCR AL,9 is a zero-bit rotate that preserves CF and OF", 0x0D028900,
+         [(0x0, "MOV AL,0x7f"), (0x2, "ADD AL,0x1"), (0x4, "STC"),
+          (0x5, "RCR AL,0x9"), (0x8, "RET")],
+         "B0 7F 04 01 F9 C0 D8 09 C3",
+         lambda rng: {"regs": rand_regs(rng)}),
+    Case("RCL AX,17 is a zero-bit rotate that preserves CF and OF", 0x0D028A00,
+         [(0x0, "MOV AX,0x7fff"), (0x4, "INC AX"), (0x6, "STC"),
+          (0x7, "RCL AX,0x11"), (0xb, "RET")],
+         "66 B8 FF 7F 66 40 F9 66 C1 D0 11 C3",
+         lambda rng: {"regs": rand_regs(rng)}),
+    Case("RCR AX,17 is a zero-bit rotate that preserves CF and OF", 0x0D028B00,
+         [(0x0, "MOV AX,0x7fff"), (0x4, "INC AX"), (0x6, "STC"),
+          (0x7, "RCR AX,0x11"), (0xb, "RET")],
+         "66 B8 FF 7F 66 40 F9 66 C1 D8 11 C3",
+         lambda rng: {"regs": rand_regs(rng)}),
+]
+
 
 def integer_copy_setup(rng, value=None):
     return {"regs": rand_regs(rng, EAX=SCRATCH, EDX=SCRATCH + 64),
@@ -909,3 +992,238 @@ def test_segment_register_loads_do_not_reach_the_flat_model():
     text = "\n".join(tr.translate(fn))
     assert "recomp_int(c, 6u);" in text
     assert "0x23u" not in text and "wr" not in text.split("MOV DS,AX")[1].split("\n")[0]
+
+
+# ----------------------------------------------- flag liveness unit tests --
+#
+# These inspect the liveness pass itself rather than executing it.  The
+# differential cases above run the emitted stores, but a boundary's
+# conservatism (a call reads every flag) and a dead write (an overwrite before
+# any read) have no register-visible signature unless the gap is exercised,
+# so they are asserted directly here.
+
+def _liveness(text, base=0x0D040000, mutate=None):
+    tr = T.Translator(NoImage(), set(), Opts())
+    insns = T.parse_listing_text(text)
+    fn = T.Function(base, "liveness", 0x100, insns)
+    fn.measure(NoImage())
+    tr.prepare(fn)
+    if mutate is not None:
+        mutate(fn)
+    return fn, tr.liveness(fn)
+
+
+def _effect(text):
+    return T.flag_effect(T.parse_listing_text(text)[0])
+
+
+def test_flag_effect_audits_flag_consumers():
+    """The consumers the old table missed: LAHF and CMC read flags, DIV can
+    fault into a handler that reads them, and helper-backed, trapping and x87
+    forms are observers rather than silently neutral."""
+    assert _effect("0d040000  LAHF") == (T.NO_FLAGS, frozenset(("cf", "pf", "af", "zf", "sf")))
+    assert _effect("0d040000  CMC") == (frozenset(("cf",)), frozenset(("cf",)))
+    assert _effect("0d040000  DIV ECX")[1] == T.ALL_FLAGS
+    assert _effect("0d040000  CLI")[1] == T.ALL_FLAGS
+    assert _effect("0d040000  FADD ST0,ST1")[1] == T.ALL_FLAGS
+    assert _effect("0d040000  CMPSD.REPE ES:EDI,ESI")[1] == T.ALL_FLAGS
+    assert _effect("0d040000  JZ 0x0d040010")[1] == frozenset(("zf",))
+    assert _effect("0d040000  MOV EAX,EBX") == (T.NO_FLAGS, T.NO_FLAGS)
+
+
+def test_shift_effective_count_leaves_rcl_and_rol_distinct():
+    """RCL's count is modulo width + 1, so RCL AL,9 changes neither operand
+    nor flags.  ROL's count is not, so ROL AL,8 still defines CF."""
+    assert _effect("0d040000  RCL AL,0x9") == (T.NO_FLAGS, T.NO_FLAGS)
+    assert _effect("0d040000  RCL AL,0x1") == (frozenset(("cf", "of")), frozenset(("cf",)))
+    assert _effect("0d040000  ROL AL,0x8") == (frozenset(("cf", "of")), T.NO_FLAGS)
+
+
+def test_liveness_materializes_flags_at_external_boundaries():
+    """A call and a return observe every flag, and a fall-through exit hands
+    them to the next function, so the instruction before each must be given a
+    live-out of all six."""
+    _fn, live = _liveness(
+        "0d040000  TEST EAX,EAX\n"
+        "0d040002  CALL 0x0d040100\n"
+        "0d040007  XOR EDX,EDX\n"
+        "0d040009  RET\n")
+    assert live[0] == T.ALL_FLAGS
+    assert live[1] == T.NO_FLAGS
+    assert live[2] == T.ALL_FLAGS
+    _fn, live = _liveness(
+        "0d040000  ADD EAX,EBX\n"
+        "0d040002  MOV ECX,EDX\n")
+    assert live[0] == T.ALL_FLAGS
+    assert live[1] == T.ALL_FLAGS
+
+
+def test_liveness_kills_a_flag_overwritten_before_any_read():
+    """The first CMP's flags are dead: XOR redefines all of them and the RET
+    reads the XOR result, not the comparison."""
+    _fn, live = _liveness(
+        "0d040000  CMP EAX,EBX\n"
+        "0d040002  XOR EAX,EAX\n"
+        "0d040004  RET\n")
+    assert live[0] == T.NO_FLAGS
+    assert live[1] == T.ALL_FLAGS
+
+
+def test_liveness_keeps_cf_live_through_an_inc_dec_loop():
+    """INC and DEC leave CF alone, so a carry set before the loop is still the
+    one SETC reads after it, across the back edge."""
+    _fn, live = _liveness(
+        "0d040000  STC\n"
+        "0d040001  MOV ECX,0x3\n"
+        "0d040006  INC EAX\n"
+        "0d040007  DEC ECX\n"
+        "0d040008  JNZ 0x0d040006\n"
+        "0d04000a  SETC BL\n"
+        "0d04000d  RET\n")
+    assert "cf" in live[0]
+    assert "cf" in live[2] and "cf" in live[3]
+
+
+def test_liveness_treats_unknown_jumps_and_traps_as_observers():
+    _fn, live = _liveness(
+        "0d040000  TEST EAX,EAX\n"
+        "0d040002  JMP EAX\n")
+    assert live[0] == T.ALL_FLAGS
+    _fn, live = _liveness(
+        "0d040000  TEST EAX,EAX\n"
+        "0d040002  INT3\n")
+    assert live[0] == T.ALL_FLAGS
+
+
+def test_liveness_drops_flags_both_arms_overwrite_before_ret():
+    """Both arms of the JZ run through XOR ECX,ECX, which redefines every
+    flag before RET, so only the ZF the branch itself reads is live at the
+    CMP.  The old straight-line pass kept all six live at the JZ."""
+    _fn, live = _liveness(
+        "0d040000  CMP EAX,EBX\n"
+        "0d040002  JZ 0x0d04000a\n"
+        "0d040004  MOV EDX,0x1\n"
+        "0d040009  NOP\n"
+        "0d04000a  XOR ECX,ECX\n"
+        "0d04000c  RET\n")
+    assert live[0] == frozenset(("zf",))
+    assert live[1] == T.NO_FLAGS
+
+
+def test_liveness_external_conditional_target_is_an_observer():
+    """An edge that leaves the body hands every flag to code this function
+    does not contain, so all six must be live before the branch."""
+    _fn, live = _liveness(
+        "0d040000  TEST EAX,EAX\n"
+        "0d040002  JZ 0x0d050000\n"
+        "0d040008  XOR EDX,EDX\n"
+        "0d04000a  RET\n")
+    assert live[0] == T.ALL_FLAGS
+    assert live[1] == T.ALL_FLAGS
+
+
+def test_liveness_listing_gap_that_leaves_the_body_is_an_observer():
+    """A listing gap whose destination the body does not carry is a tail
+    transfer, so the instruction before it is live out in full."""
+    def make_gap(fn):
+        fn.contiguous[1] = False
+        fn.fallthrough[1] = 0x0D060000
+
+    _fn, live = _liveness(
+        "0d040000  ADD EAX,EBX\n"
+        "0d040002  MOV ECX,EDX\n"
+        "0d040004  RET\n", mutate=make_gap)
+    assert live[0] == T.ALL_FLAGS
+    assert live[1] == T.ALL_FLAGS
+
+
+def test_memory_and_stack_accesses_are_flag_observers():
+    """Any possible guest memory access keeps the prior flags live: an
+    explicit operand, the implicit stack of PUSH/LEAVE, a table JMP, and a
+    conditional move with a memory source."""
+    for body in (
+        "0d040000  ADD EAX,EBX\n"
+        "0d040002  MOV EDX,dword ptr [ECX]\n"
+        "0d040004  XOR EDX,EDX\n"
+        "0d040006  RET\n",
+        "0d040000  ADD EAX,EBX\n"
+        "0d040002  CMP EDX,dword ptr [ECX]\n"
+        "0d040004  XOR EDX,EDX\n"
+        "0d040006  RET\n",
+        "0d040000  ADD EAX,EBX\n"
+        "0d040002  PUSH EDX\n"
+        "0d040003  XOR EDX,EDX\n"
+        "0d040005  RET\n",
+        "0d040000  ADD EAX,EBX\n"
+        "0d040002  LEAVE\n"
+        "0d040003  XOR EDX,EDX\n"
+        "0d040005  RET\n",
+        "0d040000  ADD EAX,EBX\n"
+        "0d040002  JMP dword ptr [EAX*0x4 + 0x00500000]\n",
+        "0d040000  CMP EDX,EDX\n"
+        "0d040002  CMOVZ EAX,dword ptr [ECX]\n"
+        "0d040006  XOR EDX,EDX\n"
+        "0d040008  RET\n",
+    ):
+        _fn, live = _liveness(body)
+        assert live[0] == T.ALL_FLAGS, body
+
+
+def test_liveness_follows_internal_listing_gap_instead_of_next_line():
+    """An alternate entry overlaps ADD's immediate: 05 00 31 c0 90 encodes
+    ADD EAX,0x90c03100, while bytes +2..+3 encode XOR EAX,EAX.  The main
+    entry falls through to +5, where SETC reads carry.  Following the next
+    listed instruction (+2) would wrongly discard the ADD's flags."""
+    def make_gap(fn):
+        fn.contiguous[0] = False
+        fn.fallthrough[0] = 0x0D040005
+
+    _fn, live = _liveness(
+        "0d040000  ADD EAX,0x90c03100\n"
+        "0d040002  XOR EAX,EAX\n"
+        "0d040004  NOP\n"
+        "0d040005  SETC CL\n"
+        "0d040008  XOR EDX,EDX\n"
+        "0d04000a  RET\n", mutate=make_gap)
+    assert live[0] == frozenset(("cf",))
+
+
+def test_segment_forms_are_flag_observers():
+    """MOV to a segment register is lowered through the runtime's segment
+    handling (a write to CS traps), even when both operands are registers, so
+    it observes the flags like any other boundary."""
+    _fn, live = _liveness(
+        "0d040000  CMP EAX,EBX\n"
+        "0d040002  MOV CS,AX\n"
+        "0d040004  XOR EAX,EAX\n"
+        "0d040006  RET\n")
+    assert live[0] == T.ALL_FLAGS
+
+
+def test_sse_arithmetic_and_wait_are_flag_observers():
+    """SSE arithmetic, compare and conversion can raise an FP exception the
+    kit does not model, and WAIT/FWAIT waits on one, so all of them keep the
+    prior flags live instead of assuming the missing support makes them safe.
+    A register XOR after the observer kills the flags before RET; only the
+    observer drives CF (which nothing reads) live back to the ADD."""
+    for after, size in (("ADDSD XMM0,XMM1", 4), ("SQRTSD XMM0,XMM1", 4),
+                        ("COMISD XMM0,XMM1", 4), ("WAIT", 1), ("FWAIT", 1)):
+        kill = 2 + size
+        ret = kill + 2
+        body = ("0d040000  ADD EAX,EBX\n"
+                "0d040002  %s\n"
+                "0d04000%x  XOR EDX,EDX\n"
+                "0d04000%x  RET\n" % (after, kill, ret))
+        _fn, live = _liveness(body)
+        assert "cf" in live[0], after
+
+
+def test_lea_is_transparent_despite_a_memory_shaped_operand():
+    """LEA names an address but never dereferences it, so it stays neutral and
+    a later XOR can still kill the flags before RET."""
+    _fn, live = _liveness(
+        "0d040000  ADD EAX,EBX\n"
+        "0d040002  LEA ECX,[EDX + ESI*0x4]\n"
+        "0d040006  XOR EDX,EDX\n"
+        "0d040008  RET\n")
+    assert live[0] == T.NO_FLAGS
