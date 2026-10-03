@@ -58,6 +58,14 @@ never uploaded. These headless probes do not open an audio device or game window
 
 For instruction-translation changes, use the original differential harness:
 
+`tools/build.py --game-dir <game> --target dispatch-tests` builds the synthetic
+entry-boundary suites (with and without hooks) and the real generated-table
+profiling suite. Run them with `ctest --test-dir <build dir> -R
+'entry_dispatch|profile_tests'`. The synthetic suite checks native selection,
+raw-original access, nested/tail calls, hook delegation/removal and frame
+diagnostics. It needs no original game behaviour; the profile suite needs a
+generated image and exercises real direct/indirect dispatch and unwind cleanup.
+
 ```sh
 .venv/bin/python tools/recomp/tests/test_translate.py --help
 .venv/bin/python tools/recomp/tests/test_translate.py

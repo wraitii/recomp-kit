@@ -35,13 +35,14 @@ TARGETS = {
     "headless": ["pop_headless"],
     "fixture": ["pop_fixture"],
     "gen": ["recomp_gen"],
+    "dispatch-tests": ["dispatch_tests"],
     "plugins": ["plugins"],
     "ios": ["recomp_app"],
     "android": ["recomp_app"],
     "web": ["recomp_app"],
 }
 MACOS_ONLY = {"ios"}
-NEEDS_GEN = {"app", "smoke", "headless", "fixture", "gen", "ios", "android", "web"}
+NEEDS_GEN = {"app", "smoke", "headless", "fixture", "gen", "dispatch-tests", "ios", "android", "web"}
 # Targets with presets of their own, whatever the host system.
 OWN_PRESET = {"ios", "android", "web"}
 

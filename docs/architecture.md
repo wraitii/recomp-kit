@@ -29,6 +29,23 @@ instruction helpers used by generated functions. Functions retain stable guest
 addresses for dispatch, hooks and diagnostics. Those addresses are identifiers,
 not host pointers and not evidence of human-recovered intent.
 
+Generated callers use `entry_ADDR` thunks. Those small, separately compiled
+thunks supply the current dense table index to one per-image dispatch function;
+hook checks, profiling and frame diagnostics no longer expand at every call.
+The base-pointer table selects native replacements, while the raw-pointer table
+retains translated originals. Direct, tail and computed transfers preserve their
+guest stack operations. Replacement headers are compilation dependencies of
+`table.c` only, in addition to native sources that explicitly include them.
+
+Body chunks contain only local callee declarations, with no global function
+census or hook indices. They start in fixed 16 KiB guest-address buckets and
+split by address until their emitted bodies fit a 512 KiB source budget.
+Oversized functions, including their alternate entries, stay intact in separate
+files scheduled first by the build. A change can repack its own bucket, but
+cannot move functions across the rest of the image. Dense-index changes can
+still rebuild lightweight entry shards and the table. Shared inline semantics
+in `x86.h` still require recompiling every body that includes that header.
+
 A game that ships part of its code as a DLL can name it in game.toml as an
 auxiliary module (`[modules.aux.<key>]`). The loader maps it beside the image
 at its preferred base, above the shim trampolines, so `[game] guest_size`

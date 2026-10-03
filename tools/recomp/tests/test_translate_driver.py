@@ -1522,7 +1522,8 @@ def test_auxiliary_module_emits_prefixed_tables_that_self_register(tmp_path, mon
     for main_only in ("void recomp_call(", "void recomp_jump(", "int recomp_is_call_return(",
                       "int recomp_thunk_target_kind(", "recomp_override_hash", "const char *recomp_profile_name("):
         assert main_only not in text
-    assert "recomp_blit_func_addrs[i_]" in header and "recomp_blit_hooked[i_]" in header
+    assert "recomp_blit_func_addrs[i]" in text and "recomp_blit_hooked[i]" in text
+    assert "recomp_blit_enter(c," in "".join(p.read_text() for p in out.glob("chunk_entries_*.c"))
     assert re.search(r"recomp_func_addrs\b", header) is None
 
 

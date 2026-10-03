@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Compile translated call instrumentation once behind stable entry symbols.
+  Native override headers affect the dispatch table, not translated callers.
+  Regeneration uses stable address buckets with a 512 KiB body budget and
+  isolates oversized functions; the build submits those large units first.
+  Existing generated trees retain their legacy build behaviour until regenerated.
+
 - Support D3D8 level-0 DEFAULT-pool A8R8G8B8/X8R8G8B8 render-target textures
   in the optional host bridge, with current-target queries, depth detach/restore,
   viewport reset, retained bound surfaces and GPU-authoritative sampling. Shared

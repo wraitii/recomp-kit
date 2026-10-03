@@ -42,6 +42,29 @@ endif()
 # The interpreter for heap code, on its own: it needs guest memory and
 # recomp_call, which the test provides.
 if(NOT IOS AND NOT ANDROID)
+set(ENTRY_FIXTURE_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/entry-fixture)
+set(ENTRY_FIXTURE_SOURCES
+  ${ENTRY_FIXTURE_DIR}/chunk_0d000000_14.c
+  ${ENTRY_FIXTURE_DIR}/chunk_entries_0d000000.c
+  ${ENTRY_FIXTURE_DIR}/fixture_table.c)
+add_custom_command(
+  OUTPUT ${ENTRY_FIXTURE_SOURCES} ${ENTRY_FIXTURE_DIR}/body.h
+  COMMAND ${Python3_EXECUTABLE} ${POP_ROOT}/tools/recomp/tests/gen_entry_fixture.py ${ENTRY_FIXTURE_DIR}
+  DEPENDS ${POP_ROOT}/tools/recomp/tests/gen_entry_fixture.py ${POP_ROOT}/tools/recomp/translate.py
+  COMMENT "Generating stable-entry dispatch fixture"
+  VERBATIM)
+foreach(entry_test entry_dispatch_tests entry_dispatch_nohooks_tests)
+  add_executable(${entry_test} tests/entry_dispatch_tests.c ${ENTRY_FIXTURE_SOURCES})
+  target_include_directories(${entry_test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${ENTRY_FIXTURE_DIR})
+  target_compile_options(${entry_test} PRIVATE ${POP_WARN_HOST})
+  pop_optimize(${entry_test} 2)
+  pop_test_binary(${entry_test})
+  add_test(NAME ${entry_test} COMMAND ${entry_test})
+  set_tests_properties(${entry_test} PROPERTIES LABELS nogame)
+endforeach()
+target_compile_definitions(entry_dispatch_nohooks_tests PRIVATE RECOMP_NO_HOOKS=1)
+add_custom_target(dispatch_tests DEPENDS entry_dispatch_tests entry_dispatch_nohooks_tests)
+
 add_executable(interp_tests tests/interp_tests.cpp interp.cpp)
 target_include_directories(interp_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(interp_tests PRIVATE ${POP_WARN_HOST})
@@ -111,6 +134,7 @@ if(POP_REAL_GEN AND NOT IOS AND NOT ANDROID)
     REGEX "^#define FIDX_[0-9a-f]+ 0u$" LIMIT_COUNT 1)
   if(PROFILE_FIRST_INDEX)
     add_executable(profile_tests tests/profile_tests.cpp)
+    add_dependencies(dispatch_tests profile_tests)
     string(REGEX REPLACE "^#define FIDX_([0-9a-f]+) 0u$" "\\1"
       PROFILE_TARGET_TOKEN "${PROFILE_FIRST_INDEX}")
     target_compile_definitions(profile_tests PRIVATE RECOMP_PROFILE_TARGET=${PROFILE_TARGET_TOKEN})

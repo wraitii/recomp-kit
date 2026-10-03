@@ -1303,7 +1303,7 @@ def run_synthetic(emu, native, seed, iterations, verbose):
 # The dispatcher test above compares unicorn's landing address against the
 # `case` labels in the generated source, which does not run the generated
 # switch.  This does: the chunk holding fn_0043e8e0 is rebuilt on its own with
-# every FN(ADDR) redirected to a probe that records the address and longjmps
+# every outgoing entry symbol supplied by a probe that records the address and longjmps
 # out, so calling fn_0043e8e0 executes the real prologue and the real switch
 # and stops at the first transfer out of the function.  unicorn is run over the
 # same selector and stopped at its own first transfer out; the two addresses
@@ -1327,6 +1327,7 @@ def build_dispatch_probe(verbose=True):
         return None
     text = open(chunk).read()
     referenced = sorted(set(re.findall(r"FN\(([0-9a-f]{8})\)", text)))
+    stable_entries = os.path.isfile(os.path.join(GEN, "body.h"))
 
     src = os.path.join(ROOT, "build/recomp/dispatch_probe.c")
     hdr = os.path.join(ROOT, "build/recomp/dispatch_probe.h")
@@ -1341,12 +1342,13 @@ def build_dispatch_probe(verbose=True):
         fh.write("static void probe(uint32_t a) { probe_target = a; "
                  "longjmp(probe_out, 1); }\n")
         for a in referenced:
-            fh.write("void probe_%s(X86 *c) { (void)c; probe(0x%su); }\n" % (a, a))
+            symbol = "entry" if stable_entries else "probe"
+            fh.write("void %s_%s(X86 *c) { (void)c; probe(0x%su); }\n" % (symbol, a, a))
         # The chunk is compiled on its own, without table.c, so the hook
         # tables every call site now reads have to come from somewhere.  The
-        # size is taken from the generated table rather than guessed, and the
-        # probe keeps the shipping call path - acquire load and all - rather
-        # than compiling the check out.
+        # size is taken from the generated table rather than guessed. Legacy
+        # translations read these tables inline; stable-entry translations
+        # stop at the entry seam. Dispatch policy itself has native tests.
         nfn = int(re.search(r"^uint8_t recomp_hooked\[(\d+)\];",
                             open(os.path.join(GEN, "table.c")).read(),
                             re.M).group(1))

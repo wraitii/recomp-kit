@@ -30,8 +30,44 @@ else()
   message(STATUS "No translation found: hosts and game-backed tests are not defined")
 endif()
 
+# New translations isolate overrides in table.c. Keep old generated trees usable
+# until their next regeneration; those still need the legacy target-wide define.
+function(pop_translation_overrides target dir header)
+  if(NOT header)
+    return()
+  endif()
+  if(NOT EXISTS "${header}")
+    message(FATAL_ERROR "RECOMP_OVERRIDE_HEADER does not exist: ${header}")
+  endif()
+  get_filename_component(override_dir "${header}" DIRECTORY)
+  if(EXISTS "${dir}/body.h")
+    set_property(SOURCE "${dir}/table.c" APPEND PROPERTY
+      COMPILE_DEFINITIONS RECOMP_OVERRIDE_HEADER="${header}")
+    set_property(SOURCE "${dir}/table.c" APPEND PROPERTY INCLUDE_DIRECTORIES "${override_dir}")
+  else()
+    target_compile_definitions(${target} PRIVATE RECOMP_OVERRIDE_HEADER="${header}")
+    target_include_directories(${target} PRIVATE "${override_dir}")
+  endif()
+endfunction()
+
+# Submit isolated giants first so their compile can overlap the small chunks.
+function(pop_translation_sources result dir)
+  file(GLOB sources CONFIGURE_DEPENDS ${dir}/chunk_*.c ${dir}/table.c)
+  set(giants ${sources})
+  list(FILTER giants INCLUDE REGEX "/chunk_fn_[0-9a-f]+\\.c$")
+  if(giants)
+    list(REMOVE_ITEM sources ${giants})
+  endif()
+  set(${result} ${giants} ${sources} PARENT_SCOPE)
+endfunction()
+
+set(POP_EFFECTIVE_OVERRIDE "${RECOMP_OVERRIDE_HEADER}")
+if(RECOMP_NATIVE_HEADER AND NOT POP_TRANSLATE STREQUAL "STUB")
+  set(POP_EFFECTIVE_OVERRIDE "${RECOMP_NATIVE_HEADER}")
+endif()
+
 if(POP_HAVE_GEN)
-  file(GLOB POP_GEN_SOURCES CONFIGURE_DEPENDS ${POP_GEN_DIR}/chunk_*.c ${POP_GEN_DIR}/table.c)
+  pop_translation_sources(POP_GEN_SOURCES "${POP_GEN_DIR}")
   add_library(recomp_gen STATIC ${POP_GEN_SOURCES})
   set_target_properties(recomp_gen PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY ${POP_ARCHIVE_DIR} OUTPUT_NAME recomp_gen)
@@ -40,19 +76,7 @@ if(POP_HAVE_GEN)
   target_include_directories(recomp_gen PRIVATE ${POP_GEN_DIR} ${POP_ROOT} ${POP_ROOT}/runtime)
   target_include_directories(recomp_gen INTERFACE ${POP_GEN_DIR})
   target_compile_options(recomp_gen PRIVATE ${POP_WARN_GEN})
-  # A game's native replacements. funcs.h includes this header before it
-  # defines FN_<addr>, so every call site, tail call and jump-table case for a
-  # replaced address goes to the native function instead.
-  if(RECOMP_OVERRIDE_HEADER)
-    if(NOT EXISTS ${RECOMP_OVERRIDE_HEADER})
-      message(FATAL_ERROR "RECOMP_OVERRIDE_HEADER does not exist: ${RECOMP_OVERRIDE_HEADER}")
-    endif()
-    target_compile_definitions(recomp_gen PRIVATE
-      RECOMP_OVERRIDE_HEADER="${RECOMP_OVERRIDE_HEADER}")
-    get_filename_component(_override_dir ${RECOMP_OVERRIDE_HEADER} DIRECTORY)
-    target_include_directories(recomp_gen PRIVATE ${_override_dir})
-    message(STATUS "Native overrides: ${RECOMP_OVERRIDE_HEADER}")
-  endif()
+  pop_translation_overrides(recomp_gen "${POP_GEN_DIR}" "${POP_EFFECTIVE_OVERRIDE}")
   pop_optimize(recomp_gen 2)
   # Auxiliary modules (game.toml [modules.aux.<key>]) are translated into
   # gen/aux-<key>/ with their own funcs.h and prefixed tables, so each is its
@@ -65,18 +89,12 @@ if(POP_HAVE_GEN)
     endif()
     get_filename_component(key ${dir} NAME)
     string(REPLACE "aux-" "recomp_gen_" aux_target ${key})
-    file(GLOB aux_sources CONFIGURE_DEPENDS ${dir}/chunk_*.c ${dir}/table.c)
+    pop_translation_sources(aux_sources "${dir}")
     add_library(${aux_target} STATIC ${aux_sources})
     set_target_properties(${aux_target} PROPERTIES
       ARCHIVE_OUTPUT_DIRECTORY ${POP_ARCHIVE_DIR} OUTPUT_NAME ${aux_target})
     target_include_directories(${aux_target} PRIVATE ${dir} ${POP_GEN_DIR} ${POP_ROOT} ${POP_ROOT}/runtime)
-    # A module's own funcs.h reads the same overrides header, so a native
-    # replacement can stand in for one of its functions as for the image's.
-    if(RECOMP_OVERRIDE_HEADER)
-      target_compile_definitions(${aux_target} PRIVATE
-        RECOMP_OVERRIDE_HEADER="${RECOMP_OVERRIDE_HEADER}")
-      target_include_directories(${aux_target} PRIVATE ${_override_dir})
-    endif()
+    pop_translation_overrides(${aux_target} "${dir}" "${POP_EFFECTIVE_OVERRIDE}")
     target_compile_options(${aux_target} PRIVATE ${POP_WARN_GEN})
     pop_optimize(${aux_target} 2)
     list(APPEND POP_GEN_AUX_TARGETS ${aux_target})
@@ -85,7 +103,6 @@ if(POP_HAVE_GEN)
   # The game's native replacements (game.toml [translate] native).
   if(RECOMP_NATIVE_HEADER AND NOT POP_TRANSLATE STREQUAL "STUB")
     target_sources(recomp_gen PRIVATE ${RECOMP_NATIVE_SOURCES})
-    target_compile_definitions(recomp_gen PRIVATE RECOMP_OVERRIDE_HEADER="${RECOMP_NATIVE_HEADER}")
   endif()
 endif()
 

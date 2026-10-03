@@ -44,12 +44,15 @@ def test_the_build_can_state_its_own_override_set():
     assert table.count("    fn_") == table.count("    FN(")
 
 
-def test_call_sites_use_an_acquire_load():
-    funcs = read(os.path.join(GEN, "funcs.h"))
-    assert "__atomic_load_n(&recomp_hooked[i_], __ATOMIC_ACQUIRE)" in funcs
-    assert "#define CALL_FN(a)" in funcs
-    body = read(os.path.join(GEN, "chunk_000.c"))
+def test_call_sites_use_stable_entries_with_an_acquire_load_in_dispatch():
+    header = read(os.path.join(GEN, "body.h"))
+    table = read(os.path.join(GEN, "table.c"))
+    assert "__atomic_load_n(&recomp_hooked[i], __ATOMIC_ACQUIRE)" in table
+    assert "#define CALL_FN(a) RECOMP_ENTRY_CAT(entry_, a)(c)" in header
+    body = "\n".join(read(p) for p in glob.glob(os.path.join(GEN, "chunk_*.c")))
     assert re.search(r"CALL_FN\(00[0-9a-f]{6}\);", body)
+    assert "recomp_hooked" not in body
+    assert '#include "funcs.h"' not in body
     # No direct call bypasses the flag.
     assert not re.search(r"(?<!#define )\bFN\(00[0-9a-f]{6}\)\(c\);", body)
 
