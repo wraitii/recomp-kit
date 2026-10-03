@@ -1505,6 +1505,8 @@ extern "C" void host_audio_set_volume(int32_t id, int32_t volume) {
 // live change re-schedules the rest of the sound from where it had reached.
 // The sound does not restart. The player time is read, and the new
 // scheduling is performed, with the lock released.
+// `apply` returns whether the change needs the rest of the sound re-planned; a
+// no-op change (the same pan or rate again) leaves the channel untouched.
 template <class Apply> static void reschedule_from_current(int32_t id, Apply apply) {
     bool playing = false;
     {
@@ -1512,9 +1514,9 @@ template <class Apply> static void reschedule_from_current(int32_t id, Apply app
         Channel *channel = channel_for(id, true);
         if (!channel)
             return;
-        apply(*channel);
+        const bool redo = apply(*channel);
         reconcile_locked(id, *channel);
-        playing = channel->playing && !channel->pcm.empty();
+        playing = redo && channel->playing && !channel->pcm.empty();
     }
     if (!playing)
         return;
@@ -1541,8 +1543,7 @@ extern "C" void host_audio_set_pan(int32_t id, int32_t pan) {
     reschedule_from_current(id, [pan](Channel &ch) {
         const bool changed = ch.pan_mb != pan;
         ch.pan_mb = pan;
-        if (!changed)
-            ch.playing = false; // nothing to redo
+        return changed;
     });
 }
 
@@ -1553,9 +1554,9 @@ extern "C" void host_audio_set_frequency(int32_t id, uint32_t hz) {
         // with, and stop overriding it.
         ch.rate_overridden = hz != 0;
         uint32_t rate = hz ? hz : ch.base_rate;
-        if (rate == ch.rate)
-            ch.playing = false; // nothing to redo
+        const bool changed = rate != ch.rate;
         ch.rate = rate;
+        return changed;
     });
 }
 

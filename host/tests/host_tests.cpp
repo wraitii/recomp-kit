@@ -1500,6 +1500,16 @@ static void test_audio_completion_during_stop() {
     play.loop = 1;
     host_audio_play(&play);
     CHECK_EQ(host_audio_is_playing(3), 1);
+    // Setting the pan or the rate it already has changes nothing: the channel
+    // must still be playing, and no new sound is scheduled for it.
+    {
+        const int schedules = g_fake_schedules;
+        host_audio_set_pan(3, 0);
+        host_audio_set_pan(3, 0);
+        host_audio_set_frequency(3, play.sample_rate);
+        CHECK_EQ(host_audio_is_playing(3), 1);
+        CHECK_EQ(g_fake_schedules, schedules);
+    }
     host_audio_completed(3, g_fake_last_generation);
     CHECK_EQ(host_audio_is_playing(3), 1);
     host_audio_stop(3);
