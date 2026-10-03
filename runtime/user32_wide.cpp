@@ -590,6 +590,36 @@ void monitor_info(X86 *c) {
         gm_put_wstr(p + 40, "\\\\.\\DISPLAY1", 32);
     set_eax(c, 1);
 }
+// ANSI forms. The game binds GetMonitorInfoA and EnumDisplayDevicesA through
+// GetProcAddress (the multimon.h stub at 0x00514d10), and one missing name
+// makes it drop every multi-monitor entry point and take its Win95 fallback.
+// MONITORINFOEXA is 72 bytes (szDevice is CHAR[32]); DISPLAY_DEVICEA is 424
+// (DeviceName[32], DeviceString[128], StateFlags, DeviceID[128], DeviceKey[128]).
+void monitor_info_a(X86 *c) {
+    uint32_t p = arg(c, 1);
+    if (arg(c, 0) != 1 || !p || !gm_valid(p, 40) || rd32(p) < 40) {
+        set_eax(c, 0);
+        return;
+    }
+    display_rect(p + 4);
+    display_rect(p + 20);
+    wr32(p + 36, 1); // MONITORINFOF_PRIMARY
+    if (rd32(p) >= 72 && gm_valid(p, 72))
+        gm_put_str(p + 40, "\\\\.\\DISPLAY1", 32);
+    set_eax(c, 1);
+}
+void enum_devices_a(X86 *c) {
+    uint32_t p = arg(c, 2);
+    if (arg(c, 1) || !p || !gm_valid(p, 424) || rd32(p) < 424) {
+        set_eax(c, 0);
+        return;
+    }
+    memset(g_mem + p + 4, 0, 420);
+    gm_put_str(p + 4, "\\\\.\\DISPLAY1", 32);
+    gm_put_str(p + 36, "Runtime display", 128);
+    wr32(p + 164, 5); // ATTACHED_TO_DESKTOP | PRIMARY_DEVICE, as the W form reports
+    set_eax(c, 1);
+}
 void dialog_message(X86 *c) {
     set_eax(c, 0);
 }
@@ -636,6 +666,8 @@ const ImportShim shims[] = {
     W("EnumDisplaySettingsA", 3, enum_settings_a),
     W("EnumDisplayDevicesW", 4, enum_devices),
     W("GetMonitorInfoW", 2, monitor_info),
+    W("GetMonitorInfoA", 2, monitor_info_a),
+    W("EnumDisplayDevicesA", 4, enum_devices_a),
     W("IsDialogMessageW", 2, dialog_message),
     W("IsDialogMessageA", 2, dialog_message),
 #undef W

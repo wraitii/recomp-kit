@@ -6053,6 +6053,17 @@ static void test_user32_window_model() {
     check(call_import(&c, "USER32.dll", "GetMonitorInfoW", {1, s + 0x400}) == 1 &&
               rd32(s + 0x40c) == rd32(s + 0x308),
           "monitor geometry");
+    wr32(s + 0x500, 72); // MONITORINFOEXA
+    check(call_import(&c, "USER32.dll", "GetMonitorInfoA", {1, s + 0x500}) == 1 &&
+              rd32(s + 0x50c) == rd32(s + 0x308) && rd32(s + 0x524) == 1 &&
+              !strcmp((const char *)(g_mem + s + 0x528), "\\\\.\\DISPLAY1"),
+          "GetMonitorInfoA geometry, primary flag and device name");
+    wr32(s + 0x600, 424); // DISPLAY_DEVICEA
+    check(call_import(&c, "USER32.dll", "EnumDisplayDevicesA", {0, 0, s + 0x600, 0}) == 1 &&
+              !strcmp((const char *)(g_mem + s + 0x604), "\\\\.\\DISPLAY1") &&
+              rd32(s + 0x6a4) == 5 &&
+              call_import(&c, "USER32.dll", "EnumDisplayDevicesA", {0, 1, s + 0x600, 0}) == 0,
+          "EnumDisplayDevicesA reports one primary display");
     while (call_import(&c, "USER32.dll", "PeekMessageW", {msg, 0, 0, 0, 1})) {
         call_import(&c, "USER32.dll", "DispatchMessageW", {msg});
     }
