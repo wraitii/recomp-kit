@@ -933,6 +933,42 @@ void k_GetFileSize(X86 *c) {
     set_eax(c, (uint32_t)st.size);
 }
 
+void k_GetFileInformationByHandle(X86 *c) {
+    // BY_HANDLE_FILE_INFORMATION (52 bytes). The original uses this to size a
+    // log file and read its timestamps; the host stat is the same evidence.
+    // Volume serial and link count have no host analogue and are reported as
+    // zero and one, which is what a file on a normal volume reads as.
+    HObj *o = handle_get(arg(c, 0), H_FILE);
+    uint32_t out = arg(c, 1);
+    if (!o) {
+        set_last_error(ERROR_INVALID_HANDLE_);
+        set_eax(c, 0);
+        return;
+    }
+    if (!out || !gm_valid(out, 52)) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    OsStat st{};
+    if (os_fd_stat(o->fd, &st) != 0) {
+        set_last_error(ERROR_INVALID_HANDLE_);
+        set_eax(c, 0);
+        return;
+    }
+    wr32(out, attrs_for(st));
+    put_filetime(out + 4, st.ctime);
+    put_filetime(out + 12, st.atime);
+    put_filetime(out + 20, st.mtime);
+    wr32(out + 28, 0); // dwVolumeSerialNumber: no host volume identity
+    wr32(out + 32, (uint32_t)(st.size >> 32));
+    wr32(out + 36, (uint32_t)st.size);
+    wr32(out + 40, 1); // nNumberOfLinks
+    wr32(out + 44, (uint32_t)(st.ino >> 32));
+    wr32(out + 48, (uint32_t)st.ino);
+    set_eax(c, 1);
+}
+
 void k_CloseHandle(X86 *c) {
     uint32_t h = arg(c, 0);
     HObj *o = handle_any(h);
@@ -4815,6 +4851,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "ReadFile", 5, k_ReadFile},
     {"KERNEL32.dll", "WriteFile", 5, k_WriteFile},
     {"KERNEL32.dll", "SetFilePointer", 4, k_SetFilePointer},
+    {"KERNEL32.dll", "GetFileInformationByHandle", 2, k_GetFileInformationByHandle},
     {"KERNEL32.dll", "GetFileSize", 2, k_GetFileSize},
     {"KERNEL32.dll", "CloseHandle", 1, k_CloseHandle},
     {"KERNEL32.dll", "FlushFileBuffers", 1, k_FlushFileBuffers},

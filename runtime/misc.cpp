@@ -829,6 +829,40 @@ void a_RegEnumValueW(X86 *c) {
         hr = reg_read_value(value->second, true, arg(c, 5), arg(c, 6), arg(c, 7));
     set_eax(c, hr);
 }
+// The ANSI spelling of the same enumeration: value names are the UTF-8 the
+// store keeps, written byte-wide, and the string data is read back byte-wide.
+// LHLogR enumerates its registry values in ANSI; leaving this unregistered
+// aborted the DLL's logging init with an unknown stdcall arity.
+uint32_t reg_write_name_a(const std::string &name, uint32_t out, uint32_t len) {
+    if (!len || !gm_valid(len, 4))
+        return 87;
+    uint32_t have = rd32(len), need = uint32_t(name.size());
+    wr32(len, need);
+    if (!out || have <= need)
+        return 234;
+    if (!gm_valid(out, need + 1))
+        return 87;
+    gm_put_str(out, name.c_str(), have);
+    return 0;
+}
+void a_RegEnumValueA(X86 *c) {
+    std::string path = key_path(arg(c, 0), "");
+    if (path.empty()) {
+        set_eax(c, 6);
+        return;
+    }
+    auto it = regstore().find(path);
+    if (it == regstore().end() || arg(c, 1) >= it->second.size()) {
+        set_eax(c, 259);
+        return;
+    }
+    auto value = it->second.begin();
+    std::advance(value, arg(c, 1));
+    uint32_t hr = reg_write_name_a(value->first, arg(c, 2), arg(c, 3));
+    if (!hr)
+        hr = reg_read_value(value->second, false, arg(c, 5), arg(c, 6), arg(c, 7));
+    set_eax(c, hr);
+}
 void a_RegQueryInfoKeyW(X86 *c) {
     std::string path = key_path(arg(c, 0), "");
     if (path.empty()) {
@@ -2089,6 +2123,7 @@ const ImportShim g_misc_shims[] = {
     {"ADVAPI32.dll", "RegQueryValueExW", 6, a_RegQueryValueExW},
     {"ADVAPI32.dll", "RegSetValueExW", 6, a_RegSetValueExW},
     {"ADVAPI32.dll", "RegEnumKeyExW", 8, a_RegEnumKeyExW},
+    {"ADVAPI32.dll", "RegEnumValueA", 8, a_RegEnumValueA},
     {"ADVAPI32.dll", "RegEnumValueW", 8, a_RegEnumValueW},
     {"ADVAPI32.dll", "RegQueryInfoKeyW", 12, a_RegQueryInfoKeyW},
     {"ADVAPI32.dll", "RegDeleteKeyW", 2, a_RegDeleteKeyW},

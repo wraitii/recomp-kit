@@ -820,6 +820,27 @@ static void test_loader() {
         remove_tree(bad_dir);
     }
     check(loader_load(nullptr), "reloaded the correct image");
+
+    // A module given a base different from its PE preferred base is rebased by
+    // the loader the same way the translator's Image rebases the listing. The
+    // scratch region is the gap between the image and the heap, zero-filled by
+    // mem_init and not owned by the allocator.
+    section("auxiliary module base relocation");
+    const uint32_t scratch = 0x00fe0000u, scratch_size = 0x2000u;
+    memset(g_mem + scratch, 0, scratch_size);
+    wr32(scratch + 0x1000, 0x1800); // relocation page RVA
+    wr32(scratch + 0x1004, 10);     // block header plus one entry
+    uint16_t entry = 0x3010;        // IMAGE_REL_BASED_HIGHLOW at page + 0x10
+    memcpy(g_mem + scratch + 0x1008, &entry, sizeof entry);
+    wr32(scratch + 0x1810, 0x00400000); // an absolute dword to move
+    check(loader_test_relocate(scratch, 0x00400000, scratch_size, 0x1000, 10),
+          "rebase a HIGHLOW site from the image's preferred base: %s", loader_error());
+    check(rd32(scratch + 0x1810) == 0x00400000 + (scratch - 0x00400000),
+          "the relocation moved the dword by base - preferred");
+    check(!loader_test_relocate(scratch, 0x00400000, scratch_size, 0, 0),
+          "a rebase with no relocation table is refused: %s", loader_error());
+    check(loader_test_relocate(scratch, 0x00400000, scratch_size, 0x1000, 10),
+          "the refused probe did not disturb the table");
 }
 
 // The recorded lines of a discovery file, without its comment header.

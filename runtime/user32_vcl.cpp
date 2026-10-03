@@ -1477,6 +1477,17 @@ const ImportShim shims[] = {
     U("CreateIcon", 7, create_icon),
     U("DestroyCursor", 1, destroy_cursor),
     U("GetIconInfo", 2, icon_info),
+    // LHLogR imports the classic dialog API. The runtime has no modal dialog
+    // implementation, so these stop by name with their known stdcall arity
+    // rather than drifting the guest stack through an unknown-count stub.
+    U("DialogBoxParamA", 5, imports_unsupported),
+    U("EndDialog", 2, imports_unsupported),
+    U("IsDlgButtonChecked", 2, imports_unsupported),
+    U("CheckDlgButton", 3, imports_unsupported),
+    U("GetDlgItem", 2, imports_unsupported),
+    U("GetDlgItemTextA", 4, imports_unsupported),
+    U("LoadBitmapA", 2, imports_unsupported),
+    U("SendDlgItemMessageA", 5, imports_unsupported),
 #undef U
 };
 } // namespace

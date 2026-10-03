@@ -1815,3 +1815,59 @@ def test_a_wide_literal_behind_a_halt_is_not_code(tmp_path, monkeypatch):
     import re
     placed = set(re.findall(r"^(L_[0-9a-f]{8}): ;", text, re.M))
     assert set(re.findall(r"goto (L_[0-9a-f]{8});", text)) <= placed
+
+
+def _rebase_image(base=0x00100000, size=0x3000, delta=0x100000):
+    """A minimal Image with one HIGHLOW site at base+0x2004 and a .reloc dir."""
+    import struct
+    img = T.Image.__new__(T.Image)
+    img.base = base
+    img.size = size
+    img.end = base + size
+    img.delta = delta
+    img.reloc_dir = (0x1000, 10)
+    img.iat_names = {0x00001234: "SymInitialize"}
+    data = bytearray(size)
+    data[0x1000:0x1004] = struct.pack("<I", 0x2000)   # page RVA
+    data[0x1004:0x1008] = struct.pack("<I", 10)       # block size: header + one entry
+    data[0x1008:0x100A] = struct.pack("<H", 0x3004)   # HIGHLOW at page + 4
+    data[0x2004:0x2008] = struct.pack("<I", 0x00001234)
+    img.data = data
+    return img
+
+
+def test_apply_relocations_shifts_highlow_sites_and_import_slots():
+    """A configured base different from the PE base must move every absolute
+    dword the linker marked, and pefile's import-slot addresses with it."""
+    import struct
+    img = _rebase_image()
+    img.apply_relocations()
+    assert struct.unpack("<I", img.data[0x2004:0x2008])[0] == 0x00101234
+    assert img.iat_names == {0x00101234: "SymInitialize"}
+
+
+def test_apply_relocations_is_a_no_op_at_the_preferred_base():
+    import struct
+    img = _rebase_image(delta=0)
+    before = bytes(img.data)
+    img.apply_relocations()
+    assert bytes(img.data) == before
+
+
+def test_a_rebased_image_without_a_relocation_table_is_an_error():
+    img = _rebase_image()
+    img.reloc_dir = (0, 0)
+    with pytest.raises(T.TranslateError):
+        img.apply_relocations()
+
+
+def test_relocated_pointers_names_configured_base_targets():
+    """Once the data is shifted, the pointer evidence the driver uses for
+    discovery names configured-base addresses, not preferred-base ones."""
+    img = _rebase_image()
+    img.exec_ranges = []
+    img.data_ranges = []
+    img.apply_relocations()
+    # The site's dword is the iat_names value; relocated_pointers reads the
+    # dword at the site and reports (target -> site) in configured space.
+    assert img.relocated_pointers() == {0x00101234: img.base + 0x2004}

@@ -670,4 +670,6 @@ void imports_init() {
     gdi::register_text();
     extern void msimg32_register();
     msimg32_register();
+    extern void imagehlp_register();
+    imagehlp_register();
 }
