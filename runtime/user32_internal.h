@@ -62,6 +62,7 @@ struct Msg {
 std::map<std::string, WndClass> &classes();
 std::map<uint32_t, Window> &windows();
 std::deque<Msg> &queue();
+std::map<uint32_t, std::deque<Msg>> &thread_queues();
 Window *find_window(uint32_t hwnd);
 std::string class_key(uint32_t p, bool wide = false);
 uint32_t wide_units(const std::string &text);

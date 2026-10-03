@@ -3838,6 +3838,12 @@ static std::vector<uint8_t> g_fake_frame_last_row; // first byte of each frame's
 static std::vector<uint32_t> g_fake_frame_sizes;
 static std::vector<uint64_t> g_fake_frame_starts;
 static uint32_t g_fake_run_calls, g_fake_pause_calls, g_fake_stop_calls;
+// The IMediaSample2 probe and the GetMediaType answer, as the real renderer's
+// sample-prep helper (FUN_00717f10) reads them.
+static uint32_t g_fake_sample_qi2_hr = 0xffffffffu;
+static uint32_t g_fake_sample_qi2_ptr = 0xffffffffu;
+static uint32_t g_fake_sample_mt_hr = 0xffffffffu;
+static uint32_t g_fake_sample_mt_ptr = 0xffffffffu;
 
 static void fake_pin_qi(X86 *c) {
     wr32(arg(c, 2), g_fake_imem);
@@ -3868,6 +3874,22 @@ static uint64_t fake_sample_start(uint32_t sample) {
 static void fake_imem_receive(X86 *c) {
     uint32_t sample = arg(c, 1);
     ++g_fake_receive_calls;
+    {
+        // Probe IMediaSample2 exactly as FUN_00717f10 does, then read the
+        // media type the way its fallback does. The shim must refuse the probe
+        // with a nulled out pointer and answer GetMediaType S_FALSE with NULL.
+        static const uint8_t iid_mediasample2[16] = {0x84, 0x38, 0xb7, 0x36, 0xc8, 0xc2,
+                                                     0xcf, 0x11, 0x8b, 0x46, 0x00, 0x80,
+                                                     0x5f, 0x6c, 0xef, 0x60};
+        uint32_t riid = sc(0x3f40), ppv = sc(0x3f50), mt = sc(0x3f54);
+        memcpy(g_mem + riid, iid_mediasample2, 16);
+        wr32(ppv, 0xdeadbeef);
+        g_fake_sample_qi2_hr = call_method(sample, 0, {riid, ppv});
+        g_fake_sample_qi2_ptr = rd32(ppv);
+        wr32(mt, 0xdeadbeef);
+        g_fake_sample_mt_hr = call_method(sample, 13, {mt}); // IMediaSample::GetMediaType
+        g_fake_sample_mt_ptr = rd32(mt);
+    }
     uint32_t out = sc(0x3f00);
     wr32(out, 0);
     call_method(sample, 3, {out}); // IMediaSample::GetPointer
@@ -4114,6 +4136,8 @@ static void test_dshow_movie_run() {
     g_fake_frame_sizes.clear();
     g_fake_frame_starts.clear();
     g_fake_run_calls = g_fake_pause_calls = g_fake_stop_calls = 0;
+    g_fake_sample_qi2_hr = g_fake_sample_qi2_ptr = 0xffffffffu;
+    g_fake_sample_mt_hr = g_fake_sample_mt_ptr = 0xffffffffu;
 
     uint32_t qi = imports_alloc_trampoline("TEST", "FakePinQIRun", fake_pin_qi, 3);
     uint32_t qa =
@@ -4293,6 +4317,12 @@ static void test_dshow_movie_run() {
     }
     for (uint32_t sz : g_fake_frame_sizes)
         CHECK_EQ(sz, 48u); // 4x4 BGR24
+    // IMediaSample2 is deliberately refused and the guest must see the
+    // fallback, and GetMediaType reports "no change" with no allocation.
+    CHECK_EQ(g_fake_sample_qi2_hr, 0x80004002u); // E_NOINTERFACE
+    CHECK_EQ(g_fake_sample_qi2_ptr, 0u);
+    CHECK_EQ(g_fake_sample_mt_hr, 1u); // S_FALSE
+    CHECK_EQ(g_fake_sample_mt_ptr, 0u);
     if (me)
         CHECK_EQ(call_method(me, 12, {0, 0, 0}), S_OK_); // FreeEventParams
     if (mc) {

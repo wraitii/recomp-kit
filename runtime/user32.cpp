@@ -35,6 +35,13 @@ std::deque<Msg> &queue() {
     static std::deque<Msg> q;
     return q;
 }
+// PostThreadMessage queues, one per guest thread id. A thread message has no
+// window, so it must not land in the window queue (where any thread's
+// PeekMessage would take it): only its target thread retrieves it.
+std::map<uint32_t, std::deque<Msg>> &thread_queues() {
+    static std::map<uint32_t, std::deque<Msg>> m;
+    return m;
+}
 
 uint32_t g_next_hwnd = 0x00020004;
 uint32_t g_next_gdi = 0x00028004;
@@ -826,6 +833,19 @@ void peek_message(X86 *c) {
     gdi_present_windows();
     uint32_t p = arg(c, 0), filter_hwnd = arg(c, 1);
     uint32_t min_msg = arg(c, 2), max_msg = arg(c, 3), flags = arg(c, 4);
+    {
+        auto &tq = thread_queues()[guest_current_thread_id()];
+        for (auto it = tq.begin(); it != tq.end(); ++it) {
+            if (!msg_matches(*it, filter_hwnd, min_msg, max_msg))
+                continue;
+            last_message = *it;
+            store_msg(p, *it);
+            if (flags & 1)
+                tq.erase(it); // PM_REMOVE
+            set_eax(c, 1);
+            return;
+        }
+    }
     for (auto it = queue().begin(); it != queue().end(); ++it) {
         if (!msg_matches(*it, filter_hwnd, min_msg, max_msg))
             continue;
@@ -863,6 +883,17 @@ void u_GetMessageA(X86 *c) {
         pump_window_timers();
         pump_mouse_input(c);
         gdi_present_windows();
+        auto &tq = thread_queues()[guest_current_thread_id()];
+        for (auto it = tq.begin(); it != tq.end(); ++it) {
+            if (!msg_matches(*it, filter_hwnd, min_msg, max_msg))
+                continue;
+            Msg m = *it;
+            tq.erase(it);
+            last_message = m;
+            store_msg(p, m);
+            set_eax(c, m.message == 0x0012 ? 0 : 1);
+            return;
+        }
         for (auto it = queue().begin(); it != queue().end(); ++it) {
             if (!msg_matches(*it, filter_hwnd, min_msg, max_msg))
                 continue;
@@ -964,6 +995,65 @@ void u_PostMessageA(X86 *c) {
     }
     host_post_message(arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3));
     set_eax(c, 1);
+}
+
+// PostThreadMessage: the message goes to the target thread's own queue with no
+// window. Win32 fails (ERROR_INVALID_THREAD_ID, 1444) for a thread that does not
+// exist; the runtime's guest thread table is not reachable from here, so any id
+// is accepted and a message to a thread that never retrieves it simply stays
+// queued, as it would for a live thread without a message loop.
+void u_PostThreadMessageA(X86 *c) {
+    uint32_t tid = arg(c, 0);
+    if (arg(c, 1) == 0x000c || arg(c, 1) == 0x000d) {
+        set_last_error(1159); // ERROR_MESSAGE_SYNC_ONLY
+        set_eax(c, 0);
+        return;
+    }
+    if (!tid) {
+        set_last_error(1444); // ERROR_INVALID_THREAD_ID
+        set_eax(c, 0);
+        return;
+    }
+    thread_queues()[tid].push_back(Msg{0, arg(c, 1), arg(c, 2), arg(c, 3), host_millis(),
+                                       uint32_t(g_cursor_x), uint32_t(g_cursor_y)});
+    set_eax(c, 1);
+}
+
+// GetQueueStatus: HIWORD = QS_ bits for message kinds in the calling thread's
+// queue, masked by the flags. Win32's HIWORD is "arrived since the last
+// GetQueueStatus/GetMessage/PeekMessage call" and LOWORD "still in the queue";
+// this reports queue contents in both, which differs only for a message that
+// was already seen but not removed (PM_NOREMOVE).
+static uint32_t queue_status_bits(const Msg &m) {
+    if (m.message >= 0x0100 && m.message <= 0x0109)
+        return 0x0001; // QS_KEY
+    if (m.message == 0x0200)
+        return 0x0002; // QS_MOUSEMOVE
+    if (m.message >= 0x0201 && m.message <= 0x0209)
+        return 0x0004; // QS_MOUSEBUTTON
+    if (m.message == 0x0113)
+        return 0x0010; // QS_TIMER
+    return 0x0008;     // QS_POSTMESSAGE
+}
+
+void u_GetQueueStatus(X86 *c) {
+    uint32_t bits = 0;
+    for (const Msg &m : thread_queues()[guest_current_thread_id()])
+        bits |= queue_status_bits(m);
+    // The window queue belongs to the thread that owns the window; a message
+    // with no window (PostQuitMessage) belongs to the main window's thread.
+    for (const Msg &m : queue()) {
+        const Window *w = find_window(m.hwnd ? m.hwnd : g_main_hwnd);
+        if (!w || w->thread == guest_current_thread_id())
+            bits |= queue_status_bits(m);
+    }
+    if (paint_pending()) {
+        const Window *w = find_window(g_main_hwnd);
+        if (!w || w->thread == guest_current_thread_id())
+            bits |= 0x0020; // QS_PAINT
+    }
+    bits &= arg(c, 0);
+    set_eax(c, (bits << 16) | bits);
 }
 
 void u_PeekMessageA(X86 *c) {
@@ -1771,7 +1861,8 @@ const ImportShim g_user32_shims[] = {
     {"USER32.dll", "MapVirtualKeyExA", 3, u_MapVirtualKeyA},
     {"USER32.dll", "ToUnicode", 6, nullptr},
     {"USER32.dll", "SendInput", 3, nullptr},
-    {"USER32.dll", "PostThreadMessageA", 4, nullptr},
+    {"USER32.dll", "PostThreadMessageA", 4, u_PostThreadMessageA},
+    {"USER32.dll", "GetQueueStatus", 1, u_GetQueueStatus},
     {"USER32.dll", "GetForegroundWindow", 0, u_GetForegroundWindow},
     {"USER32.dll", "WaitMessage", 0, u_WaitMessage},
     {"USER32.dll", "GetActiveWindow", 0, u_GetActiveWindow},

@@ -171,6 +171,11 @@ const uint8_t IID_IEnumMediaTypes_[16] =
 // vtable 0x0086b458 slot 6 (+0x18) is Receive.
 const uint8_t IID_IMediaSample_[16] =
     IID_BYTES(0x56a8689a, 0x0ad4, 0x11ce, 0xb0, 0x3a, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70);
+// IMediaSample2 (amvideo.h). The guest renderer probes this on every sample
+// it receives and falls back to the IMediaSample vtable when it is refused, so
+// it is deliberately not served; see SM_QueryInterface.
+const uint8_t IID_IMediaSample2_[16] =
+    IID_BYTES(0x36b73884, 0xc2c8, 0x11cf, 0x8b, 0x46, 0x00, 0x80, 0x5f, 0x6c, 0xef, 0x60);
 const uint8_t IID_IMemInputPin_[16] =
     IID_BYTES(0x56a8689d, 0x0ad4, 0x11ce, 0xb0, 0x3a, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70);
 // The media types FUN_0049da20 selects pins by, and the format blocks a
@@ -1253,12 +1258,41 @@ void SM_SetActualDataLength(X86 *c) {
     s->actual = len;
     com_ret(c, S_OK);
 }
+// QueryInterface on a sample: the guest renderer (FUN_00717f10, called from
+// its Receive at FUN_00714700) asks for IMediaSample2 first, then reads the
+// sample's properties through the IMediaSample methods below when the probe is
+// refused. That is the standard DirectShow fallback, so the refusal is correct
+// behavior rather than a missing implementation; serve everything else as
+// usual.
+void SM_QueryInterface(X86 *c) {
+    uint32_t riid = arg(c, 1);
+    if (riid && gm_valid(riid, 16) && memcmp(gm_ptr(riid), IID_IMediaSample2_, 16) == 0) {
+        uint32_t out = arg(c, 2);
+        if (out && gm_valid(out, 4))
+            wr32(out, 0);
+        log_once("dshow.sample.qi2",
+                 "dshow: IMediaSample does not serve IMediaSample2 "
+                 "{36B73884-C2C8-11CF-8B46-00805F6CEF60}; the guest renderer probes it and "
+                 "reads the sample through the IMediaSample methods instead, so E_NOINTERFACE "
+                 "is the expected refusal");
+        com_ret(c, E_NOINTERFACE);
+        return;
+    }
+    com_QueryInterface(c);
+}
 void SM_GetMediaType(X86 *c) {
-    // A renderer that could change format mid-stream would ask; this one
-    // negotiates once through QueryAccept, so there is nothing to hand back.
-    log_once("dshow.sample.getmediatype",
-             "dshow: IMediaSample::GetMediaType is not served; the negotiated pin type is fixed");
-    com_ret(c, E_NOTIMPL);
+    // IMediaSample::GetMediaType reports a format change since the previous
+    // sample. The graph negotiates one pin type through QueryAccept and the
+    // shim never calls SetMediaType on a delivered sample, so no sample ever
+    // carries a new type: the faithful answer is S_FALSE with *ppMediaType
+    // NULL, exactly as CMediaSample returns while its media type is unset.
+    uint32_t out = arg(c, 1);
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, E_POINTER);
+        return;
+    }
+    wr32(out, 0);
+    com_ret(c, S_FALSE);
 }
 DX_STUB(SM_SetMediaType, S_OK)
 void SM_IsDiscontinuity(X86 *c) {
@@ -1279,7 +1313,7 @@ void SM_GetMediaTime(X86 *c) {
 }
 DX_STUB(SM_SetMediaTime, S_OK)
 const ComMethod g_mediasample[] = {
-    {"QueryInterface", 3, com_QueryInterface},
+    {"QueryInterface", 3, SM_QueryInterface},
     {"AddRef", 1, com_AddRef},
     {"Release", 1, com_Release},
     {"GetPointer", 2, SM_GetPointer},
