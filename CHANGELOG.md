@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add an optional scene post-process to the D3D8/wgpu renderer. A game's native
+  override calls `d3d8_scene_boundary(c, mode)` (`runtime/native_seam.h`) at the
+  point where its 3D scene is finished and its overlay not yet drawn; mode 1
+  runs an edge-thresholded FXAA over the backbuffer in place, only while the
+  viewport covers it. Mode 0 only marks the boundary in a
+  `RECOMP_D3D8_TRACE_DRAWS` trace. `RECOMP_D3D8_DUMP_SCENE=N` with
+  `RECOMP_DUMP_FRAME_DIR` saves before/after/difference PNGs.
+
 - Ship the Rust D3D8/wgpu renderer as `graphics/d3d8-wgpu`. Native macOS builds
   it when `RECOMP_D3D8_WGPU=1` is set for `tools/build.py` (passed to CMake as
   `RECOMP_D3D8_WGPU`); a game's own `graphics/d3d8-wgpu` still takes precedence,

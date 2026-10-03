@@ -6,6 +6,8 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+/* Same typedef as x86.h; repeating it is valid in C11 and C++. */
+typedef struct X86 X86;
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -26,6 +28,14 @@ int recomp_readable_path(const char *guest_path, char *out, size_t out_len);
 
 /* Offer a DirectDraw display mode, as the host does for its own modes. */
 int ddraw_add_mode(int w, int h, int bpp);
+
+/* The guest has finished drawing its 3D scene and is about to draw its overlay.
+ * Mode 0 only marks the boundary (a draw trace prints it); mode 1 filters the
+ * scene with FXAA first, on the host, so overlay draws stay unfiltered. Needs
+ * the wgpu renderer: any non-zero mode without it, or with an unusable device
+ * state, stops with a diagnostic. Returns zero on success. Requires the guest
+ * scheduler baton. */
+int d3d8_scene_boundary(X86 *c, uint32_t mode);
 
 /* Optional game adapter for absolute touch placement. Coordinates and canvas
  * size are logical game pixels after the compositor's mapping. Called only

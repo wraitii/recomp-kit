@@ -30,6 +30,8 @@
 
 use std::sync::Arc;
 
+mod postprocess;
+
 use crate::RenderError;
 use crate::d3d8::format;
 
@@ -135,6 +137,8 @@ pub struct GpuContext {
     viewport_clear: std::sync::Mutex<ViewportClearCache>,
     // Serializes mapping and reuses staging storage across backbuffer/texture reads.
     readback: std::sync::Mutex<Option<wgpu::Buffer>>,
+    /// Optional FXAA pipeline and scratch target; see `postprocess`.
+    fxaa: std::sync::Mutex<Option<postprocess::FxaaState>>,
 }
 
 #[derive(Default)]
@@ -274,6 +278,7 @@ impl GpuContext {
             window,
             surface_config: None,
             viewport_clear: Default::default(),
+            fxaa: Default::default(),
             readback: Default::default(),
             blit: None,
         })

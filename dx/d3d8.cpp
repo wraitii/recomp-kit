@@ -7,6 +7,7 @@
 #include "frame_dump.h"
 #include "../runtime/guest.h"
 #include "../runtime/memory.h"
+#include "../runtime/native_seam.h"
 #include "../runtime/display_seam.h"
 #include "../runtime/win32.h"
 #include "../platform/os.h"
@@ -282,10 +283,16 @@ std::vector<DisplayMode> display_modes() {
     if (dw && dh)
         result.push_back({dw, dh, 0, D8FMT_X8R8G8B8});
     static const uint32_t kStandard[][2] = {
-        {640, 480}, {800, 600}, {1024, 768}, {1280, 1024}, {1600, 1200},
+        {640, 480},
+        {800, 600},
+        {1024, 768},
+        {1280, 1024},
+        {1600, 1200},
         // Experimental extras: 4:3 above 1600x1200, and 1512x982 (this
         // MacBook's 3024x1964 panel at 1x points, ~1.54:1).
-        {1440, 1080}, {1920, 1440}, {1512, 982},
+        {1440, 1080},
+        {1920, 1440},
+        {1512, 982},
     };
     for (const auto &m : kStandard)
         if (m[0] != dw || m[1] != dh)
@@ -2197,6 +2204,78 @@ void d3d8_register() {
     com_set_destructor(K_D3D8INDEXBUFFER, buffer_destroy);
     com_set_destructor(K_D3D8DEVICE, device_destroy);
     imports_register(g_d3d8_exports, std::size(g_d3d8_exports));
+}
+
+// Native-override seam (runtime/native_seam.h): the guest reached the point
+// between its 3D scene and its overlay. Applies the optional scene
+// post-process to the live device; without the wgpu renderer there is nothing
+// to apply and a request for one fails by name.
+extern "C" int d3d8_scene_boundary(X86 *c, uint32_t mode) {
+#ifdef RECOMP_D3D8_WGPU
+    ComObj *dev = live_devices.empty() ? nullptr : *live_devices.begin();
+    if (dev && dev->d3d8_device) {
+        D3d8Error err{};
+        // RECOMP_D3D8_DUMP_SCENE=N saves the backbuffer before and after every
+        // Nth boundary that runs a post-process, plus an amplified difference
+        // image, into RECOMP_DUMP_FRAME_DIR. Diagnostic only.
+        static const uint32_t dump_every = [] {
+            const char *v = getenv("RECOMP_D3D8_DUMP_SCENE");
+            return v ? uint32_t(strtoul(v, nullptr, 10)) : 0u;
+        }();
+        static uint32_t boundary_serial = 0;
+        const bool dump =
+            mode && dump_every && dx_dump_enabled() && (boundary_serial++ % dump_every) == 0;
+        const size_t pixels = size_t(dev->d3d8_width) * dev->d3d8_height;
+        std::vector<uint8_t> before;
+        if (dump) {
+            before.resize(pixels * 4);
+            uint32_t got = 0;
+            if (d3d8_device_read_pixels(host_device(dev), before.data(), uint32_t(before.size()),
+                                        &got, &err) ||
+                got != before.size())
+                before.clear();
+        }
+        int32_t status = d3d8_device_scene_boundary(host_device(dev), mode, &err);
+        if (status == D3D8_STATUS_OK && !before.empty()) {
+            std::vector<uint8_t> after(pixels * 4), diff(pixels * 4, 255);
+            uint32_t got = 0;
+            if (!d3d8_device_read_pixels(host_device(dev), after.data(), uint32_t(after.size()),
+                                         &got, &err) &&
+                got == after.size()) {
+                size_t changed = 0;
+                for (size_t i = 0; i < pixels; ++i) {
+                    int d = 0;
+                    for (int k = 0; k < 3; ++k)
+                        d = std::max(d, std::abs(int(before[i * 4 + k]) - int(after[i * 4 + k])));
+                    changed += d != 0;
+                    uint8_t v = uint8_t(std::min(255, d * 8));
+                    diff[i * 4] = diff[i * 4 + 1] = diff[i * 4 + 2] = v;
+                }
+                char name[48];
+                static uint32_t dumped = 0;
+                snprintf(name, sizeof name, "scene_%04u_before", dumped);
+                dx_dump_named_rgba(name, before.data(), dev->d3d8_width, dev->d3d8_height);
+                snprintf(name, sizeof name, "scene_%04u_after", dumped);
+                dx_dump_named_rgba(name, after.data(), dev->d3d8_width, dev->d3d8_height);
+                snprintf(name, sizeof name, "scene_%04u_diff", dumped);
+                dx_dump_named_rgba(name, diff.data(), dev->d3d8_width, dev->d3d8_height);
+                fprintf(stderr, "d3d8: scene dump %u: %zu of %zu pixels changed\n", dumped++,
+                        changed, pixels);
+            }
+        }
+        return host_result(c, status, err) == D8_OK ? 0 : -1;
+    }
+    if (mode == 0)
+        return 0;
+    fprintf(stderr, "d3d8: scene post-process %u requested with no live device\n", mode);
+#else
+    if (mode == 0)
+        return 0;
+    fprintf(stderr, "d3d8: scene post-process %u requires the wgpu renderer\n", mode);
+#endif
+    fflush(stderr);
+    imports_unsupported(c);
+    return -1;
 }
 
 void d3d8_reset() {

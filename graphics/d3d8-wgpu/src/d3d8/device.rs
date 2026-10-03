@@ -19,6 +19,10 @@ use crate::{
 mod render_targets;
 use render_targets::Targets;
 
+/// `Device::scene_boundary` modes.
+pub const SCENE_POST_NONE: u32 = 0;
+pub const SCENE_POST_FXAA: u32 = 1;
+
 const CLEAR_TARGET: u32 = 0x1;
 const CLEAR_ZBUFFER: u32 = 0x2;
 const CLEAR_STENCIL: u32 = 0x4;
@@ -1716,6 +1720,57 @@ impl Device {
     ) -> bool {
         self.draw_index += 1;
         self.note_draw_rejection(error, topology, fvf, stride)
+    }
+
+    /// The guest's world/UI boundary: everything drawn so far is the 3D scene,
+    /// everything drawn next is overlay. `mode` selects an optional host
+    /// post-process of the scene ([`SCENE_POST_NONE`] does nothing). Draws are
+    /// flushed first, so the filter sees exactly the scene. Only the implicit
+    /// backbuffer is filtered; an unknown mode, or a render-target texture
+    /// bound at the boundary, is a named error rather than a silent skip.
+    ///
+    /// `RECOMP_D3D8_TRACE_DRAWS` prints a marker with the running draw count so
+    /// a trace shows which draws precede the boundary.
+    pub fn scene_boundary(&mut self, mode: u32) -> Result<(), RenderError> {
+        if std::env::var_os("RECOMP_D3D8_TRACE_DRAWS").is_some() {
+            eprintln!(
+                "[d3d8-trace] scene-boundary frame={} draws={} mode={mode}",
+                self.frame_index, self.draw_index
+            );
+        }
+        match mode {
+            SCENE_POST_NONE => Ok(()),
+            SCENE_POST_FXAA => {
+                if self.targets.current.is_some() {
+                    return Err(RenderError::new(
+                        "SceneBoundary",
+                        "FXAA requested while a render-target texture is bound",
+                    ));
+                }
+                // A partial viewport at the boundary is a sub-view (for
+                // example a preview) drawn over an overlay that already
+                // exists, so filtering the whole target would hit the overlay.
+                let v = &self.state.viewport;
+                let b = &self.targets.backbuffer;
+                if (v.x, v.y, v.width, v.height) != (0, 0, b.width, b.height) {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static WARNED: AtomicBool = AtomicBool::new(false);
+                    if !WARNED.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "[d3d8] scene boundary: FXAA skipped for partial viewport {}x{}+{}+{}",
+                            v.width, v.height, v.x, v.y
+                        );
+                    }
+                    return Ok(());
+                }
+                self.flush_draws();
+                self.gpu.fxaa_in_place(&self.targets.backbuffer)
+            }
+            other => Err(RenderError::new(
+                "SceneBoundary",
+                format!("unknown scene post-process mode {other}"),
+            )),
+        }
     }
 
     pub fn present(&mut self) -> Result<(), RenderError> {

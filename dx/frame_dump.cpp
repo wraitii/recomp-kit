@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-void dx_dump_frame_rgba(const uint8_t *rgba, uint32_t width, uint32_t height) {
+static const std::string &dump_directory() {
     static const std::string directory = [] {
         const char *value = getenv("RECOMP_DUMP_FRAME_DIR");
         std::string dir = value ? value : "";
@@ -24,6 +24,12 @@ void dx_dump_frame_rgba(const uint8_t *rgba, uint32_t width, uint32_t height) {
         }
         return dir;
     }();
+    return directory;
+}
+
+static void dump_png(const std::string &name, const uint8_t *rgba, uint32_t width,
+                     uint32_t height) {
+    const std::string &directory = dump_directory();
     if (directory.empty())
         return;
     if (!rgba || !width || !height || width > INT32_MAX || height > INT32_MAX ||
@@ -39,12 +45,7 @@ void dx_dump_frame_rgba(const uint8_t *rgba, uint32_t width, uint32_t height) {
     size_t size = 0;
     void *png =
         tdefl_write_image_to_png_file_in_memory(rgb.data(), int(width), int(height), 3, &size);
-    static uint32_t serial = 0; // Called on the guest scheduler baton.
-    const std::string path = directory + "/frame_" + [&] {
-        char number[32];
-        snprintf(number, sizeof number, "%05u", serial++);
-        return std::string(number);
-    }() + ".png";
+    const std::string path = directory + "/" + name + ".png";
     FILE *file = png ? fopen(path.c_str(), "wb") : nullptr;
     bool ok = file && fwrite(png, 1, size, file) == size;
     if (file && fclose(file) != 0)
@@ -52,4 +53,21 @@ void dx_dump_frame_rgba(const uint8_t *rgba, uint32_t width, uint32_t height) {
     mz_free(png);
     if (!ok)
         fprintf(stderr, "[frame-dump] cannot write %s\n", path.c_str());
+}
+
+void dx_dump_frame_rgba(const uint8_t *rgba, uint32_t width, uint32_t height) {
+    if (dump_directory().empty())
+        return;
+    static uint32_t serial = 0; // Called on the guest scheduler baton.
+    char number[32];
+    snprintf(number, sizeof number, "frame_%05u", serial++);
+    dump_png(number, rgba, width, height);
+}
+
+bool dx_dump_enabled() {
+    return !dump_directory().empty();
+}
+
+void dx_dump_named_rgba(const char *name, const uint8_t *rgba, uint32_t width, uint32_t height) {
+    dump_png(name, rgba, width, height);
 }

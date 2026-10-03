@@ -1074,6 +1074,25 @@ pub extern "C" fn d3d8_device_present(dev: *mut D3d8Device, err: *mut D3d8Error)
     report(err, device.present())
 }
 
+/// World/UI boundary notification with an optional scene post-process
+/// (`SCENE_POST_*`: 0 none, 1 FXAA). See `Device::scene_boundary`.
+#[unsafe(no_mangle)]
+pub extern "C" fn d3d8_device_scene_boundary(
+    dev: *mut D3d8Device,
+    mode: u32,
+    err: *mut D3d8Error,
+) -> i32 {
+    let Some(device) = device_ref(dev) else {
+        write_error(
+            err,
+            D3d8Status::InvalidArgument,
+            "scene_boundary: null device",
+        );
+        return D3d8Status::InvalidArgument as i32;
+    };
+    report(err, device.scene_boundary(mode))
+}
+
 /// Opaque CPU allocation, usable without an adapter or GPU. Calls on a resource
 /// are serialized by the bridge; borrowed data pointers expire at destruction.
 pub struct D3d8Storage {
