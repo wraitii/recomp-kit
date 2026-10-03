@@ -504,6 +504,12 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     ++g_import_calls;
 
     uint32_t ret_addr = rd32(c->r[R_ESP]);
+    // The guest EIP is only advanced at call boundaries, so without this a
+    // shim that stops (an abort) reports the PREVIOUS import's return address.
+    // Nothing reads EIP across a running shim except diagnostics and SEH, and
+    // the generated code restores it from the stack on RET, so publishing the
+    // current call's return address here is the honest value.
+    c->eip = ret_addr;
     LOGV("-> %s (esp=%08x ret=%08x)", desc, c->r[R_ESP], ret_addr);
     if (trace_filter && strstr(desc, trace_filter)) {
         char line[512];

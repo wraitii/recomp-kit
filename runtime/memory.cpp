@@ -433,6 +433,15 @@ uint32_t heap_alloc(uint32_t size, bool zero, uint32_t align) {
         return user;
     }
     LOGW("heap_alloc: out of guest heap (%u bytes requested)", size);
+    {
+        HeapStats hs = heap_stats();
+        LOGW("heap: %llu used (%llu requested) in %llu blocks, %llu free in %llu blocks, "
+             "largest free %llu; %llu allocs, %llu frees",
+             (unsigned long long)hs.used_bytes, (unsigned long long)hs.req_bytes,
+             (unsigned long long)hs.used_blocks, (unsigned long long)hs.free_bytes,
+             (unsigned long long)hs.free_blocks, (unsigned long long)hs.largest_free,
+             (unsigned long long)hs.total_allocs, (unsigned long long)hs.total_frees);
+    }
     return 0;
 }
 

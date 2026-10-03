@@ -874,6 +874,7 @@ void ddraw_present(ComObj *s) {
     // Whatever the Direct3D device drew belongs in these pixels before they
     // are read: on real hardware the rasterizer wrote here.
     d3d_flush_surface(s, "present");
+    d3d7_flush_surface(s);
     const ComObj *pal = s->bpp <= 8 ? effective_palette(s) : nullptr;
     if (s->bpp <= 8 && !pal) {
         log_once("ddraw.nopal", "ddraw: presenting an 8-bit primary with no palette attached; "
@@ -2795,6 +2796,8 @@ void Surface_Blt(X86 *c) {
     // about to be read or written with the CPU.
     d3d_flush_surface(dst, "Blt dst");
     d3d_flush_surface(src, "Blt src");
+    d3d7_flush_surface(dst);
+    d3d7_flush_surface(src);
 
     // The destination may hang off the surface; Blt clips rather than
     // refusing, and the clip happens below once the source is known so a
@@ -2914,6 +2917,8 @@ void Surface_BltFast(X86 *c) {
     }
     d3d_flush_surface(dst, "BltFast dst");
     d3d_flush_surface(src, "BltFast src");
+    d3d7_flush_surface(dst);
+    d3d7_flush_surface(src);
 
     int32_t sr[4];
     if (!read_rect(src_rect, src, sr)) {
@@ -3065,6 +3070,8 @@ void Surface_Flip(X86 *c) {
     // anything the device drew has to be in it first.
     d3d_flush_surface(s, "Flip front");
     d3d_flush_surface(back, "Flip back");
+    d3d7_flush_surface(s);
+    d3d7_flush_surface(back);
     // And anything a frame still holds has to be copied out of it, because
     // after the swap each surface's revision would name the other's bytes.
     ddraw_preserve_before_storage_change(s);
@@ -3222,6 +3229,7 @@ void Surface_GetDC(X86 *c) {
         return;
     }
     d3d_read_surface(s, nullptr, HOST_READ_GETDC);
+    d3d7_flush_surface(s);
     int32_t r[4] = {0, 0, (int32_t)s->width, (int32_t)s->height};
     ddraw_before_write(s);
     if (!s->dc_handle) {
@@ -3342,6 +3350,7 @@ void Surface_Lock(X86 *c) {
     // The guest is about to hold a pointer into these pixels, so the device's
     // rendering has to be in them before it does.
     d3d_flush_surface(s, "Lock");
+    d3d7_flush_surface(s);
 
     // read_rect already clamped the rectangle to the surface, so this offset
     // is inside the allocation; the span is re-checked anyway because the

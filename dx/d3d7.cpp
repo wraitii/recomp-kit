@@ -21,9 +21,14 @@
 // Clear stay aborted until the renderer and the 16bpp present boundary exist.
 #include "com.h"
 #include "ddraw.h"
+#include "dx.h"
 #include "dxtypes.h"
 #include "../runtime/guest.h"
 #include "../runtime/memory.h"
+
+#ifdef RECOMP_D3D8_WGPU
+#include "d3d8_abi.h"
+#endif
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -278,11 +283,15 @@ uint32_t tss_default(uint32_t stage, uint32_t type) {
 }
 
 void init_device_state(D3d7DeviceState &s) {
-    for (uint32_t i = 0; i < 256; ++i)
+    for (uint32_t i = 0; i < 256; ++i) {
         s.render_state[i] = render_state_default(i);
+        s.render_state_set[i] = false;
+    }
     for (uint32_t stage = 0; stage < 8; ++stage)
-        for (uint32_t type = 0; type < 256; ++type)
+        for (uint32_t type = 0; type < 256; ++type) {
             s.tss[stage][type] = tss_default(stage, type);
+            s.tss_set[stage][type] = false;
+        }
     for (uint32_t t = 0; t < 256; ++t) {
         memset(s.transform[t], 0, sizeof s.transform[t]);
         s.transform[t][0] = s.transform[t][5] = s.transform[t][10] = s.transform[t][15] = 1.0f;
@@ -290,9 +299,11 @@ void init_device_state(D3d7DeviceState &s) {
     }
     memset(s.viewport, 0, sizeof s.viewport);
     s.viewport[5] = 1.0f; // dvMaxZ
+    s.viewport_set = false;
     // Default material: opaque white diffuse, no ambient/specular/emissive.
     memset(s.material, 0, sizeof s.material);
     s.material[0] = s.material[1] = s.material[2] = s.material[3] = 1.0f;
+    s.material_set = false;
     memset(s.light, 0, sizeof s.light);
     memset(s.light_enable, 0, sizeof s.light_enable);
     memset(s.texture, 0, sizeof s.texture);
@@ -301,6 +312,263 @@ void init_device_state(D3d7DeviceState &s) {
     s.render_target = 0;
     memset(s.device_guid, 0, sizeof s.device_guid);
     s.tnl = false;
+}
+
+// ---------------------------------------------------------------- host renderer
+// The Rust d3d8-wgpu device owns a 32-bit internal render target; the guest's
+// 16bpp DirectDraw back buffer stays the truth of what the guest sees. The two
+// are reconciled by d3d7_writeback, which ddraw.cpp calls at every point it is
+// about to read or present those bytes. DIVERGENCE(original): the original
+// rendered directly into the 16bpp target, so its clear color and every pixel
+// landed in R5G6B5; here the target is A8R8G8B8 and the 32->16 copy truncates
+// the low bits (d3d7_rgb888_to_rgb565).
+constexpr uint32_t D3DCLEAR_STENCIL_ = 0x00000004u;
+constexpr uint32_t D3D8FMT_A8R8G8B8 = 21;
+constexpr uint32_t D3D8FMT_D16 = 80;
+constexpr uint32_t D3D8_ERR_INVALIDCALL = 0x8876086Cu;
+
+#ifdef RECOMP_D3D8_WGPU
+bool host_ok(int32_t status, const D3d8Error &err, const char *what) {
+    if (status == 0)
+        return true;
+    LOGW("d3d7: host renderer %s failed: %s", what, (const char *)err.message);
+    return false;
+}
+#endif
+
+// Forward one recorded render state to the host. The state is already in the
+// store; this is the seam, and every render-state forward goes through it so
+// the D3D7->D3D8 table exists once.
+void forward_render_state(ComObj *dev, uint32_t state, uint32_t value) {
+#ifdef RECOMP_D3D8_WGPU
+    if (!dev->d3d7_host)
+        return;
+    uint32_t ds = state;
+    D3d7StateMap m = d3d7_translate_render_state(state, value, &ds);
+    if (m == D3D7_STATE_INVALID) {
+        LOGW("d3d7: render state %u (value %u) has no D3D8 equivalent; stopping", state, value);
+        fflush(stderr);
+        abort();
+    }
+    if (m == D3D7_STATE_IGNORE)
+        return;
+    D3d8Error err{};
+    host_ok(d3d8_device_set_render_state((D3d8Device *)dev->d3d7_host, ds, value, &err), err,
+            "SetRenderState");
+#else
+    (void)dev;
+    (void)state;
+    (void)value;
+#endif
+}
+
+void forward_texture_stage_state(ComObj *dev, uint32_t stage, uint32_t type, uint32_t value) {
+#ifdef RECOMP_D3D8_WGPU
+    if (!dev->d3d7_host)
+        return;
+    uint32_t out[2] = {0, 0};
+    int n = d3d7_translate_texture_stage_state(type, out);
+    if (n < 0) {
+        LOGW("d3d7: texture-stage state %u has no D3D8 equivalent; stopping", type);
+        fflush(stderr);
+        abort();
+    }
+    for (int i = 0; i < n; ++i) {
+        D3d8Error err{};
+        host_ok(d3d8_device_set_texture_stage_state((D3d8Device *)dev->d3d7_host, stage, out[i],
+                                                    value, &err),
+                err, "SetTextureStageState");
+    }
+#else
+    (void)dev;
+    (void)stage;
+    (void)type;
+    (void)value;
+#endif
+}
+
+void forward_transform(ComObj *dev, uint32_t state) {
+#ifdef RECOMP_D3D8_WGPU
+    if (!dev->d3d7_host)
+        return;
+    uint32_t ds = state;
+    if (!d3d7_translate_transform(state, &ds))
+        return; // Get/SetTransform keeps states the D3D8 table has no slot for.
+    D3d8Matrix m;
+    memcpy(m.rows, dev->d3d7->transform[state], sizeof m.rows);
+    D3d8Error err{};
+    host_ok(d3d8_device_set_transform((D3d8Device *)dev->d3d7_host, ds, &m, &err), err,
+            "SetTransform");
+#else
+    (void)dev;
+    (void)state;
+#endif
+}
+
+void forward_viewport(ComObj *dev) {
+#ifdef RECOMP_D3D8_WGPU
+    if (!dev->d3d7_host)
+        return;
+    // D3DVIEWPORT7 stores dwX/dwY/dwWidth/dwHeight as dwords and dvMinZ/dvMaxZ
+    // as floats. The store is a raw byte copy, so reinterpret the dwords.
+    uint32_t x, y, w, h;
+    float minz, maxz;
+    memcpy(&x, dev->d3d7->viewport + 0, 4);
+    memcpy(&y, dev->d3d7->viewport + 1, 4);
+    memcpy(&w, dev->d3d7->viewport + 2, 4);
+    memcpy(&h, dev->d3d7->viewport + 3, 4);
+    memcpy(&minz, dev->d3d7->viewport + 4, 4);
+    memcpy(&maxz, dev->d3d7->viewport + 5, 4);
+    D3d8Error err{};
+    host_ok(d3d8_device_set_viewport((D3d8Device *)dev->d3d7_host, x, y, w, h, minz, maxz, &err),
+            err, "SetViewport");
+#else
+    (void)dev;
+#endif
+}
+
+void forward_material(ComObj *dev) {
+#ifdef RECOMP_D3D8_WGPU
+    if (!dev->d3d7_host)
+        return;
+    D3d8Material m;
+    static_assert(sizeof m == sizeof dev->d3d7->material, "D3DMATERIAL7/8 layout");
+    memcpy(&m, dev->d3d7->material, sizeof m);
+    D3d8Error err{};
+    host_ok(d3d8_device_set_material((D3d8Device *)dev->d3d7_host, &m, &err), err, "SetMaterial");
+#else
+    (void)dev;
+#endif
+}
+
+void forward_light(ComObj *dev, uint32_t index) {
+#ifdef RECOMP_D3D8_WGPU
+    if (!dev->d3d7_host)
+        return;
+    D3d8Light l;
+    static_assert(sizeof l == sizeof dev->d3d7->light, "D3DLIGHT7/8 layout");
+    memcpy(&l, dev->d3d7->light, sizeof l);
+    D3d8Error err{};
+    host_ok(d3d8_device_set_light((D3d8Device *)dev->d3d7_host, index, &l, &err), err, "SetLight");
+#else
+    (void)dev;
+    (void)index;
+#endif
+}
+
+// Replays every state the engine set before the host device existed. The
+// device is created on the first Clear, but the engine sets transforms,
+// material, lights, viewport and render states before that.
+void replay_state(ComObj *dev) {
+    for (uint32_t i = 0; i < 256; ++i)
+        if (dev->d3d7->render_state_set[i])
+            forward_render_state(dev, i, dev->d3d7->render_state[i]);
+    for (uint32_t stage = 0; stage < 8; ++stage)
+        for (uint32_t type = 0; type < 256; ++type)
+            if (dev->d3d7->tss_set[stage][type])
+                forward_texture_stage_state(dev, stage, type, dev->d3d7->tss[stage][type]);
+    for (uint32_t t = 0; t < 256; ++t)
+        if (dev->d3d7->transform_set[t])
+            forward_transform(dev, t);
+    if (dev->d3d7->viewport_set)
+        forward_viewport(dev);
+    if (dev->d3d7->material_set)
+        forward_material(dev);
+    for (uint32_t i = 0; i < 8; ++i)
+        if (dev->d3d7->light_enable[i])
+            forward_light(dev, i);
+}
+
+// Creates the Rust device for a D3D7 device's DirectDraw back buffer. Host
+// truth: the internal target is A8R8G8B8 because that is what the wgpu
+// path can read back as tightly packed RGBA8; the depth attachment is D16
+// because the z-buffer the engine enumerated and attached is 16-bit.
+bool ensure_host(ComObj *dev) {
+#ifdef RECOMP_D3D8_WGPU
+    if (dev->d3d7_host)
+        return true;
+    ComObj *target = com_get(dev->d3d7->render_target);
+    if (!target || target->kind != K_SURFACE || !target->width || !target->height) {
+        LOGW("d3d7: cannot create the host renderer without a render target surface");
+        return false;
+    }
+    uint32_t depth = target->zbuffer_obj ? D3D8FMT_D16 : 0;
+    D3d8Error err{};
+    void *host = d3d8_device_create(target->width, target->height, D3D8FMT_A8R8G8B8, depth, &err);
+    if (!host) {
+        LOGW("d3d7: host renderer device creation failed: %s", (const char *)err.message);
+        return false;
+    }
+    dev->d3d7_host = host;
+    dev->d3d7_width = target->width;
+    dev->d3d7_height = target->height;
+    replay_state(dev);
+    return true;
+#else
+    (void)dev;
+    return false;
+#endif
+}
+
+// Copies the Rust 32-bit target into the guest surface. The writeback is a
+// full replacement: the RenderTarget for this device is authoritative for the
+// 3D content of that surface. DIVERGENCE(original): 2D the guest drew into the
+// surface through GDI or a Lock is not uploaded back into the 32-bit target,
+// so a surface that mixed 2D and 3D loses the 2D at the reconcile point (see
+// docs/d3d7-inventory.md open questions).
+void d3d7_writeback(ComObj *dev) {
+#ifdef RECOMP_D3D8_WGPU
+    if (!dev || !dev->d3d7_host)
+        return;
+    ComObj *s = com_get(dev->d3d7->render_target);
+    if (!s || s->kind != K_SURFACE || !s->pixels)
+        return;
+    const uint32_t w = dev->d3d7_width, h = dev->d3d7_height;
+    if (!w || !h)
+        return;
+    const uint64_t bytes = (uint64_t)w * h * 4;
+    static std::vector<uint8_t> rgba;
+    if (rgba.size() != (size_t)bytes)
+        rgba.resize((size_t)bytes);
+    uint32_t got = 0;
+    D3d8Error err{};
+    if (!host_ok(d3d8_device_read_pixels((D3d8Device *)dev->d3d7_host, rgba.data(), (uint32_t)bytes,
+                                         &got, &err),
+                 err, "ReadPixels"))
+        return;
+    if (got != bytes) {
+        log_once("d3d7.writeback.size", "d3d7: readback returned %u bytes, expected %llu", got,
+                 (unsigned long long)bytes);
+        return;
+    }
+    if (s->bpp == 16) {
+        for (uint32_t y = 0; y < h; ++y) {
+            const uint8_t *src = rgba.data() + (size_t)y * w * 4;
+            uint32_t row = s->pixels + (uint32_t)((size_t)y * s->pitch);
+            for (uint32_t x = 0; x < w; ++x) {
+                uint32_t argb = ((uint32_t)src[x * 4 + 3] << 24) | ((uint32_t)src[x * 4] << 16) |
+                                ((uint32_t)src[x * 4 + 1] << 8) | (uint32_t)src[x * 4 + 2];
+                wr16(row + x * 2, d3d7_rgb888_to_rgb565(argb));
+            }
+        }
+    } else if (s->bpp == 32) {
+        for (uint32_t y = 0; y < h; ++y) {
+            const uint8_t *src = rgba.data() + (size_t)y * w * 4;
+            uint8_t *dst = gm_ptr(s->pixels) + (size_t)y * s->pitch;
+            for (uint32_t x = 0; x < w; ++x) {
+                dst[x * 4 + 0] = src[x * 4 + 2]; // B
+                dst[x * 4 + 1] = src[x * 4 + 1]; // G
+                dst[x * 4 + 2] = src[x * 4 + 0]; // R
+                dst[x * 4 + 3] = 0;
+            }
+        }
+    } else {
+        log_once("d3d7.writeback.bpp", "d3d7: writeback to a %u-bpp surface is not implemented",
+                 s->bpp);
+    }
+#else
+    (void)dev;
+#endif
 }
 
 // ---------------------------------------------------------------- device caps
@@ -473,6 +741,9 @@ void D3D7_CreateDevice(X86 *c) {
     init_device_state(*dev->d3d7);
     dev->d3d7->d3d_obj = d3d->id;
     dev->d3d7->render_target = target->id;
+    // ddraw.cpp finds the Rust target through the surface: the guest bytes are
+    // authoritative, and this is how a Flip/Lock/Blt knows to reconcile first.
+    target->d3d7_target_device = dev->id;
     memcpy(dev->d3d7->device_guid, tnl ? IID_IDirect3DTnLHalDevice_ : IID_IDirect3DHALDevice_, 16);
     dev->d3d7->tnl = tnl;
     com_addref(target);
@@ -592,6 +863,7 @@ void Device7_SetTransform(X86 *c) {
     }
     memcpy(dev->d3d7->transform[state], gm_ptr(matrix), 64);
     dev->d3d7->transform_set[state] = true;
+    forward_transform(dev, state);
     com_ret(c, D3D_OK_);
 }
 
@@ -614,6 +886,8 @@ void Device7_SetViewport(X86 *c) {
         return;
     }
     memcpy(dev->d3d7->viewport, gm_ptr(vp), sizeof dev->d3d7->viewport);
+    dev->d3d7->viewport_set = true;
+    forward_viewport(dev);
     com_ret(c, D3D_OK_);
 }
 
@@ -636,6 +910,8 @@ void Device7_SetMaterial(X86 *c) {
         return;
     }
     memcpy(dev->d3d7->material, gm_ptr(m), sizeof dev->d3d7->material);
+    dev->d3d7->material_set = true;
+    forward_material(dev);
     com_ret(c, D3D_OK_);
 }
 
@@ -658,6 +934,7 @@ void Device7_SetLight(X86 *c) {
         return;
     }
     memcpy(dev->d3d7->light, gm_ptr(data), sizeof dev->d3d7->light);
+    forward_light(dev, idx);
     com_ret(c, D3D_OK_);
 }
 
@@ -680,6 +957,8 @@ void Device7_SetRenderState(X86 *c) {
         return;
     }
     dev->d3d7->render_state[state] = value;
+    dev->d3d7->render_state_set[state] = true;
+    forward_render_state(dev, state, value);
     com_ret(c, D3D_OK_);
 }
 
@@ -716,6 +995,8 @@ void Device7_SetTextureStageState(X86 *c) {
         return;
     }
     dev->d3d7->tss[stage][type] = value;
+    dev->d3d7->tss_set[stage][type] = true;
+    forward_texture_stage_state(dev, stage, type, value);
     com_ret(c, D3D_OK_);
 }
 
@@ -775,6 +1056,13 @@ void Device7_LightEnable(X86 *c) {
         return;
     }
     dev->d3d7->light_enable[idx] = enable ? 1 : 0;
+#ifdef RECOMP_D3D8_WGPU
+    if (dev->d3d7_host) {
+        D3d8Error err{};
+        host_ok(d3d8_device_light_enable((D3d8Device *)dev->d3d7_host, idx, enable ? 1u : 0u, &err),
+                err, "LightEnable");
+    }
+#endif
     com_ret(c, D3D_OK_);
 }
 
@@ -803,6 +1091,154 @@ void Device7_GetRenderTarget(X86 *c) {
     com_ret(c, D3D_OK_);
 }
 
+// Clears the guest surface directly. Used when the Rust renderer is absent or
+// could not start; the guest bytes are the authoritative target, so the color
+// clear is exact and the depth/stencil clear is best-effort (16-bit z only).
+void clear_guest_target(ComObj *dev, uint32_t flags, uint32_t color, float z, uint32_t stencil) {
+    ComObj *s = com_get(dev->d3d7->render_target);
+    if ((flags & D3DCLEAR_TARGET) && s && s->pixels) {
+        const uint16_t c16 = d3d7_rgb888_to_rgb565(color);
+        const uint32_t c32 = 0xff000000u | (color & 0x00ffffffu);
+        for (uint32_t y = 0; y < s->height; ++y) {
+            uint32_t row = s->pixels + (uint32_t)((size_t)y * s->pitch);
+            for (uint32_t x = 0; x < s->width; ++x) {
+                if (s->bpp == 16)
+                    wr16(row + x * 2, c16);
+                else if (s->bpp == 32)
+                    wr32(row + x * 4, c32);
+            }
+        }
+    }
+    if (flags & D3DCLEAR_ZBUFFER) {
+        ComObj *zz = (s && s->zbuffer_obj) ? com_get(s->zbuffer_obj) : nullptr;
+        if (zz && zz->pixels && zz->bpp == 16) {
+            uint16_t zv =
+                (uint16_t)(z <= 0.0f ? 0 : (z >= 1.0f ? 0xffff : (uint32_t)(z * 65535.0f)));
+            for (uint32_t y = 0; y < zz->height; ++y) {
+                uint32_t row = zz->pixels + (uint32_t)((size_t)y * zz->pitch);
+                for (uint32_t x = 0; x < zz->width; ++x)
+                    wr16(row + x * 2, zv);
+            }
+        } else {
+            log_once(
+                "d3d7.clear.z",
+                "d3d7: Clear(ZBUFFER) with no attached 16-bit z-buffer surface; depth not cleared");
+        }
+    }
+    if (flags & D3DCLEAR_STENCIL_) {
+        (void)stencil;
+        log_once("d3d7.clear.stencil", "d3d7: Clear(STENCIL) is not modelled on the guest bytes");
+    }
+}
+
+// `IDirect3DDevice7::Clear` for the full-target clear the engine uses. Flags,
+// color, z and stencil are passed to the Rust device unchanged; a rectangle
+// clear or a flag outside D3DCLEAR_TARGET|ZBUFFER|STENCIL stops loudly rather
+// than clearing something the guest did not ask for.
+void Device7_Clear(X86 *c) {
+    ComObj *dev = this_device7(c);
+    if (!dev) {
+        com_ret(c, DDERR_INVALIDOBJECT);
+        return;
+    }
+    uint32_t count = arg(c, 1), rects = arg(c, 2), flags = arg(c, 3), color = arg(c, 4);
+    uint32_t zb = arg(c, 5);
+    float z;
+    memcpy(&z, &zb, 4);
+    uint32_t stencil = arg(c, 6);
+    if (count || rects) {
+        LOGW("d3d7: IDirect3DDevice7::Clear with %u rectangle(s) is not implemented; stopping",
+             count);
+        fflush(stderr);
+        abort();
+    }
+    if (flags & ~(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL_)) {
+        LOGW("d3d7: IDirect3DDevice7::Clear with flags 0x%x is not implemented; stopping", flags);
+        fflush(stderr);
+        abort();
+    }
+#ifdef RECOMP_D3D8_WGPU
+    if (ensure_host(dev)) {
+        D3d8Error err{};
+        int32_t status =
+            d3d8_device_clear((D3d8Device *)dev->d3d7_host, 0, flags, color, z, stencil, &err);
+        if (host_ok(status, err, "Clear"))
+            com_ret(c, D3D_OK_);
+        else
+            com_ret(c, D3D8_ERR_INVALIDCALL);
+        return;
+    }
+#endif
+    clear_guest_target(dev, flags, color, z, stencil);
+    com_ret(c, D3D_OK_);
+}
+
+// State blocks: the engine's blend-mode probe (fn_0082bf10) records states with
+// Begin/End, applies them and validates. This is a faithful front-end snapshot
+// (a copy of D3d7DeviceState). The Rust host already holds every state because
+// the recorded Set* calls forwarded live; Apply restores the front end only.
+void Device7_BeginStateBlock(X86 *c) {
+    ComObj *dev = this_device7(c);
+    if (!dev) {
+        com_ret(c, DDERR_INVALIDOBJECT);
+        return;
+    }
+    if (dev->d3d7_recording) {
+        com_ret(c, D3DERR_INVALID_DEVICE);
+        return;
+    }
+    dev->d3d7_recording = true;
+    com_ret(c, D3D_OK_);
+}
+
+void Device7_EndStateBlock(X86 *c) {
+    ComObj *dev = this_device7(c);
+    uint32_t out = arg(c, 1);
+    if (!dev || !out || !gm_valid(out, 4)) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    if (!dev->d3d7_recording) {
+        com_ret(c, D3DERR_INVALID_DEVICE);
+        return;
+    }
+    uint32_t handle = dev->d3d7_next_stateblock++;
+    dev->d3d7_stateblocks[handle] = std::make_shared<D3d7DeviceState>(*dev->d3d7);
+    dev->d3d7_recording = false;
+    wr32(out, handle);
+    com_ret(c, D3D_OK_);
+}
+
+void Device7_ApplyStateBlock(X86 *c) {
+    ComObj *dev = this_device7(c);
+    uint32_t handle = arg(c, 1);
+    if (!dev) {
+        com_ret(c, DDERR_INVALIDOBJECT);
+        return;
+    }
+    auto it = dev->d3d7_stateblocks.find(handle);
+    if (it == dev->d3d7_stateblocks.end()) {
+        com_ret(c, D3DERR_INVALID_DEVICE);
+        return;
+    }
+    *dev->d3d7 = *it->second;
+    com_ret(c, D3D_OK_);
+}
+
+void Device7_DeleteStateBlock(X86 *c) {
+    ComObj *dev = this_device7(c);
+    uint32_t handle = arg(c, 1);
+    if (!dev) {
+        com_ret(c, DDERR_INVALIDOBJECT);
+        return;
+    }
+    if (!dev->d3d7_stateblocks.erase(handle)) {
+        com_ret(c, D3DERR_INVALID_DEVICE);
+        return;
+    }
+    com_ret(c, D3D_OK_);
+}
+
 // --- Loudly unimplemented device slots. Naming each one is the whole point:
 // the abort's message is the diagnosis. ---
 #define D3D7_ABORT(fn, method)                                                                     \
@@ -811,10 +1247,7 @@ void Device7_GetRenderTarget(X86 *c) {
     }
 
 D3D7_ABORT(Device7_SetRenderTarget, "SetRenderTarget")
-D3D7_ABORT(Device7_Clear, "Clear")
 D3D7_ABORT(Device7_MultiplyTransform, "MultiplyTransform")
-D3D7_ABORT(Device7_BeginStateBlock, "BeginStateBlock")
-D3D7_ABORT(Device7_EndStateBlock, "EndStateBlock")
 D3D7_ABORT(Device7_PreLoad, "PreLoad")
 D3D7_ABORT(Device7_DrawPrimitive, "DrawPrimitive")
 D3D7_ABORT(Device7_DrawIndexedPrimitive, "DrawIndexedPrimitive")
@@ -825,9 +1258,7 @@ D3D7_ABORT(Device7_DrawIndexedPrimitiveStrided, "DrawIndexedPrimitiveStrided")
 D3D7_ABORT(Device7_DrawPrimitiveVB, "DrawPrimitiveVB")
 D3D7_ABORT(Device7_DrawIndexedPrimitiveVB, "DrawIndexedPrimitiveVB")
 D3D7_ABORT(Device7_ComputeSphereVisibility, "ComputeSphereVisibility")
-D3D7_ABORT(Device7_ApplyStateBlock, "ApplyStateBlock")
 D3D7_ABORT(Device7_CaptureStateBlock, "CaptureStateBlock")
-D3D7_ABORT(Device7_DeleteStateBlock, "DeleteStateBlock")
 D3D7_ABORT(Device7_CreateStateBlock, "CreateStateBlock")
 D3D7_ABORT(Device7_Load, "Load")
 D3D7_ABORT(Device7_SetClipPlane, "SetClipPlane")
@@ -973,11 +1404,189 @@ const ComMethod g_vb7[] = {
 
 } // namespace
 
+// Called by ddraw.cpp before it reads or presents a surface the D3D7 device
+// renders into. A no-op unless the surface has a live D3D7 target.
+void d3d7_flush_surface(ComObj *s) {
+    if (!s || s->kind != K_SURFACE || !s->d3d7_target_device)
+        return;
+    ComObj *dev = com_get(s->d3d7_target_device);
+    if (dev && dev->kind == K_D3D7DEVICE)
+        d3d7_writeback(dev);
+}
+
+// ---------------------------------------------------------------- translation
+// Pure D3D7 -> D3D8 tables. Declared in dx.h so dx_tests can check them
+// without a GPU; the forwarding code above calls them too.
+
+static bool is_d3d8_render_state(uint32_t s) {
+    switch (s) {
+    case 7:
+    case 8:
+    case 9:
+    case 10:
+    case 14:
+    case 15:
+    case 16:
+    case 19:
+    case 20:
+    case 22:
+    case 23:
+    case 24:
+    case 25:
+    case 26:
+    case 27:
+    case 28:
+    case 29:
+    case 30:
+    case 34:
+    case 35:
+    case 36:
+    case 37:
+    case 38:
+    case 40:
+    case 47:
+    case 48:
+    case 52:
+    case 53:
+    case 54:
+    case 55:
+    case 56:
+    case 57:
+    case 58:
+    case 59:
+    case 60:
+    case 128:
+    case 129:
+    case 130:
+    case 131:
+    case 132:
+    case 133:
+    case 134:
+    case 135:
+    case 136:
+    case 137:
+    case 139:
+    case 140:
+    case 141:
+    case 142:
+    case 143:
+    case 145:
+    case 146:
+    case 147:
+    case 148:
+    case 151:
+    case 152:
+    case 153:
+    case 154:
+    case 155:
+    case 156:
+    case 157:
+    case 158:
+    case 159:
+    case 160:
+    case 161:
+    case 162:
+    case 163:
+    case 164:
+    case 165:
+    case 166:
+    case 167:
+    case 168:
+    case 170:
+    case 171:
+    case 172:
+    case 173:
+        return true;
+    default:
+        return false;
+    }
+}
+
+D3d7StateMap d3d7_translate_render_state(uint32_t d3d7_state, uint32_t value,
+                                         uint32_t *d3d8_state) {
+    if (d3d8_state)
+        *d3d8_state = d3d7_state;
+    // D3DRS_TEXTUREPERSPECTIVE (4) is a D3D7-only state. The d3d8-wgpu
+    // fixed-function path perspective-corrects unconditionally, so no value
+    // it takes here can be honoured; ignoring it is a documented divergence
+    // (the game sets 0 = affine).
+    if (d3d7_state == 4)
+        return D3D7_STATE_IGNORE;
+    // D3DRS_COLORKEYENABLE (41) is also D3D7-only. D3D8 keying is per-texture
+    // alpha; value 0 (disabled, the D3D8 default) is exact to ignore, any
+    // other value would silently lose transparency and must stop loudly.
+    if (d3d7_state == 41)
+        return value == 0 ? D3D7_STATE_IGNORE : D3D7_STATE_INVALID;
+    if (is_d3d8_render_state(d3d7_state))
+        return D3D7_STATE_FORWARD;
+    return D3D7_STATE_INVALID;
+}
+
+bool d3d7_translate_transform(uint32_t d3d7_state, uint32_t *d3d8_state) {
+    // D3D7 D3DTS_WORLD is 1, D3D8 D3DTS_WORLD is 256. VIEW (2), PROJECTION (3)
+    // and the texture matrices (16..23) share their values in both enums.
+    uint32_t out;
+    if (d3d7_state == 1 || d3d7_state == 256)
+        out = 256;
+    else if (d3d7_state == 2 || d3d7_state == 3)
+        out = d3d7_state;
+    else if (d3d7_state >= 16 && d3d7_state <= 23)
+        out = d3d7_state;
+    else
+        return false;
+    if (d3d8_state)
+        *d3d8_state = out;
+    return true;
+}
+
+int d3d7_translate_texture_stage_state(uint32_t d3d7_type, uint32_t out[2]) {
+    // D3DTSS_TEXCOORDINDEX is 11 in both. D3D7's D3DTSS_ADDRESS (12) was split
+    // in D3D8 into ADDRESSU (13) and ADDRESSV (14); forwarding it to both is
+    // the exact equivalent for the engine, which sets only the pair.
+    if (d3d7_type == 12) {
+        out[0] = 13;
+        out[1] = 14;
+        return 2;
+    }
+    // Every other D3D8 stage state has the same number in D3D7 (1..11,
+    // 13..28). D3D8 has no 12.
+    if ((d3d7_type >= 1 && d3d7_type <= 11) || (d3d7_type >= 13 && d3d7_type <= 28)) {
+        out[0] = d3d7_type;
+        return 1;
+    }
+    return -1;
+}
+
+uint16_t d3d7_rgb888_to_rgb565(uint32_t argb) {
+    const uint32_t r = (argb >> 16) & 0xff, g = (argb >> 8) & 0xff, b = argb & 0xff;
+    // Truncating shift, not bit replication or rounding: this is the copy from
+    // the 32-bit internal target to the 16bpp guest back buffer, and a real
+    // 16bpp target would have truncated the same low bits when it stored the
+    // clear color or rasterized a pixel.
+    return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+}
+
+uint32_t d3d7_rgb565_to_rgb888(uint16_t rgb565) {
+    const uint32_t r = (rgb565 >> 11) & 0x1f, g = (rgb565 >> 5) & 0x3f, b = rgb565 & 0x1f;
+    // The same `*255/max` expansion the headless presenter uses for a 16bpp
+    // frame, so a written-back pixel round-trips to the color the PNG shows.
+    // Bit replication ((r<<3)|(r>>2)) agrees only at the endpoints; documented
+    // in docs/d3d7-inventory.md.
+    const uint32_t R = (r * 255) / 31, G = (g * 255) / 63, B = (b * 255) / 31;
+    return 0xff000000u | (R << 16) | (G << 8) | B;
+}
+
 // Releasing a device also releases the render target and every bound texture
 // it retained. Registered with com_set_destructor so com_destroy runs it.
 void d3d7_device_destroy(ComObj *dev) {
     if (!dev->d3d7)
         return;
+#ifdef RECOMP_D3D8_WGPU
+    if (dev->d3d7_host) {
+        d3d8_device_destroy((D3d8Device *)dev->d3d7_host);
+        dev->d3d7_host = nullptr;
+    }
+#endif
     for (uint32_t &id : dev->d3d7->texture) {
         if (id) {
             if (ComObj *t = com_get(id))
@@ -986,8 +1595,11 @@ void d3d7_device_destroy(ComObj *dev) {
         }
     }
     if (dev->d3d7->render_target) {
-        if (ComObj *s = com_get(dev->d3d7->render_target))
+        if (ComObj *s = com_get(dev->d3d7->render_target)) {
+            if (s->d3d7_target_device == dev->id)
+                s->d3d7_target_device = 0;
             com_release(s);
+        }
         dev->d3d7->render_target = 0;
     }
 }

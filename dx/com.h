@@ -281,9 +281,16 @@ struct D3d7DeviceState {
     // every state so GetTransform is a faithful read, not a fixed three.
     float transform[256][16];
     bool transform_set[256];
+    // `*_set` records whether the guest ever set the state, so the Rust host
+    // device can be created lazily (the first Clear) and still receive every
+    // state the engine set before it. Defaults are preloaded into the arrays.
+    bool render_state_set[256];
+    bool tss_set[8][256];
     float viewport[6];
+    bool viewport_set;
     float material[68 / 4]; // D3DMATERIAL7, 17 dwords
-    float light[104 / 4];   // D3DLIGHT7, 26 dwords
+    bool material_set;
+    float light[104 / 4]; // D3DLIGHT7, 26 dwords
     uint32_t light_enable[8];
     // Bound stage textures, as K_SURFACE object ids (0 = none, D3D7 slot 0).
     uint32_t texture[8];
@@ -467,6 +474,18 @@ struct ComObj {
     // pointer so the big render-state arrays are not paid for by every COM
     // object; a vertex buffer's storage is the guest `pixels` block.
     std::shared_ptr<D3d7DeviceState> d3d7;
+    // --- K_D3D7DEVICE: the Rust d3d8-wgpu host device that owns the 32-bit
+    // internal render target, and the state-block snapshots the engine's
+    // blend-mode probe records. `d3d7_host` is null without the renderer.
+    void *d3d7_host = nullptr; // D3d8Device*; never a guest address
+    uint32_t d3d7_width = 0, d3d7_height = 0;
+    bool d3d7_recording = false;
+    uint32_t d3d7_next_stateblock = 1;
+    std::map<uint32_t, std::shared_ptr<D3d7DeviceState>> d3d7_stateblocks;
+    // --- K_SURFACE: the D3D7 device that renders into this surface, if any.
+    // The guest bytes stay authoritative; this is only how ddraw.cpp finds the
+    // Rust target to reconcile before it reads or presents those bytes.
+    uint32_t d3d7_target_device = 0;
     uint32_t vb_fvf = 0;
     uint32_t vb_num_vertices = 0;
     uint32_t vb_caps = 0;

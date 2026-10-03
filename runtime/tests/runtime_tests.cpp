@@ -6881,6 +6881,28 @@ static void test_import_return_trace() {
     remove_tree(dir);
 }
 
+static uint32_t g_probe_eip = 0;
+static void eip_probe_shim(X86 *c) {
+    g_probe_eip = c->eip;
+}
+
+// The guest EIP is only advanced at call boundaries. A shim must see the
+// CURRENT call's return address, not the previous import's, or an abort inside
+// the shim blames the wrong call site.
+static void test_import_eip_publishes_return() {
+    section("import dispatch publishes the current return address");
+    X86 c;
+    loader_init_context(&c);
+    g_probe_eip = 0;
+    uint32_t tramp = imports_alloc_trampoline("TEST", "EipProbe", eip_probe_shim, 0);
+    uint32_t ret = 0x00401234;
+    c.r[R_ESP] -= 4;
+    wr32(c.r[R_ESP], ret);
+    imports_dispatch(&c, tramp);
+    check(g_probe_eip == ret, "EIP during the shim is the current return address %08x (got %08x)",
+          ret, g_probe_eip);
+}
+
 // With [game] strict_imports, an import whose stdcall arity is unknown must
 // stop by name instead of returning 0 with its arguments left on the stack.
 // Without it the legacy return-0 behaviour is preserved.
@@ -7088,6 +7110,7 @@ int main(int argc, char **argv) {
     scratch = 0x0ee00000;
     test_startup_apis(loader_context());
     test_import_return_trace();
+    test_import_eip_publishes_return();
     test_modules_and_wide();
     test_preferred_ui_languages();
     test_session_notification_service_unavailable();

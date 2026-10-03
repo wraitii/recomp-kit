@@ -6613,6 +6613,70 @@ static void test_d3d7_pipeline() {
     CHECK_EQ(call_method(d3d, 2, {}), 0);
 }
 
+// The D3D7 -> D3D8 seam tables and the 8:8:8/5:6:5 boundary. These are pure
+// functions, so the table is checked without the renderer or a GPU.
+static void test_d3d7_translation() {
+    cpu_reset();
+
+    // ---- render states: D3D8-shared ids forward unchanged.
+    uint32_t ds = 0;
+    CHECK_EQ((int)d3d7_translate_render_state(7, 1, &ds), (int)D3D7_STATE_FORWARD);
+    CHECK_EQ(ds, 7u); // ZENABLE
+    CHECK_EQ((int)d3d7_translate_render_state(137, 1, &ds), (int)D3D7_STATE_FORWARD);
+    CHECK_EQ(ds, 137u); // LIGHTING
+    CHECK_EQ((int)d3d7_translate_render_state(47, 0, &ds), (int)D3D7_STATE_FORWARD);
+    CHECK_EQ(ds, 47u); // ZBIAS
+    CHECK_EQ((int)d3d7_translate_render_state(136, 1, &ds), (int)D3D7_STATE_FORWARD);
+    CHECK_EQ(ds, 136u); // CLIPPING
+    // D3D7-only states the game uses with a value ignoring is exact for.
+    CHECK_EQ((int)d3d7_translate_render_state(4, 0, &ds), (int)D3D7_STATE_IGNORE);
+    CHECK_EQ((int)d3d7_translate_render_state(41, 0, &ds), (int)D3D7_STATE_IGNORE);
+    // ... a value that would change behavior stops loudly.
+    CHECK_EQ((int)d3d7_translate_render_state(41, 1, &ds), (int)D3D7_STATE_INVALID);
+    CHECK_EQ((int)d3d7_translate_render_state(42, 0, &ds), (int)D3D7_STATE_INVALID);
+
+    // ---- transforms: D3D7 WORLD 1 -> D3D8 256, VIEW/PROJECTION unchanged.
+    CHECK(d3d7_translate_transform(1, &ds) && ds == 256u);
+    CHECK(d3d7_translate_transform(2, &ds) && ds == 2u);
+    CHECK(d3d7_translate_transform(3, &ds) && ds == 3u);
+    CHECK(d3d7_translate_transform(16, &ds) && ds == 16u);
+    CHECK(d3d7_translate_transform(23, &ds) && ds == 23u);
+    CHECK(!d3d7_translate_transform(24, &ds));
+    CHECK(!d3d7_translate_transform(255, &ds));
+
+    // ---- texture-stage states: ADDRESS (12) splits into U (13) and V (14).
+    uint32_t t[2] = {0, 0};
+    CHECK_EQ(d3d7_translate_texture_stage_state(12, t), 2);
+    CHECK_EQ(t[0], 13u);
+    CHECK_EQ(t[1], 14u);
+    CHECK_EQ(d3d7_translate_texture_stage_state(1, t), 1);
+    CHECK_EQ(t[0], 1u);
+    CHECK_EQ(d3d7_translate_texture_stage_state(16, t), 1);
+    CHECK_EQ(t[0], 16u);
+    CHECK_EQ(d3d7_translate_texture_stage_state(28, t), 1);
+    CHECK_EQ(t[0], 28u);
+    CHECK_EQ(d3d7_translate_texture_stage_state(29, t), -1);
+    CHECK_EQ(d3d7_translate_texture_stage_state(0, t), -1);
+
+    // ---- 8:8:8 -> 5:6:5 truncates the low bits (the boundary copy).
+    CHECK_EQ(d3d7_rgb888_to_rgb565(0x00000000u), 0x0000u);
+    CHECK_EQ(d3d7_rgb888_to_rgb565(0x00ffffffu), 0xffffu);
+    CHECK_EQ(d3d7_rgb888_to_rgb565(0x00ff0000u), 0xf800u);
+    CHECK_EQ(d3d7_rgb888_to_rgb565(0x0000ff00u), 0x07e0u);
+    CHECK_EQ(d3d7_rgb888_to_rgb565(0x000000ffu), 0x001fu);
+    CHECK_EQ(d3d7_rgb888_to_rgb565(0x00000007u), 0x0000u); // low bits dropped
+    CHECK_EQ(d3d7_rgb888_to_rgb565(0x00080000u), 0x0800u); // r=8 -> r5=1
+    // ---- 5:6:5 -> 8:8:8 uses the presenter's *255/max scale, so the
+    // endpoints round-trip exactly and the middle values are the PNG's.
+    CHECK_EQ(d3d7_rgb565_to_rgb888(0x0000u), 0xff000000u);
+    CHECK_EQ(d3d7_rgb565_to_rgb888(0xffffu), 0xffffffffu);
+    CHECK_EQ(d3d7_rgb565_to_rgb888(0xf800u), 0xffff0000u);
+    CHECK_EQ(d3d7_rgb565_to_rgb888(0x07e0u), 0xff00ff00u);
+    CHECK_EQ(d3d7_rgb565_to_rgb888(0x001fu), 0xff0000ffu);
+    // Bit replication would give 0xff210000 for 0x2000; the scale gives 0x20.
+    CHECK_EQ(d3d7_rgb565_to_rgb888(0x2000u), 0xff200000u);
+}
+
 // QueryInterface: the DirectDraw object hands out IDirectDraw2 and 4, refuses
 // an interface it does not implement, and reaches Direct3D2.
 static void test_query_interface() {
@@ -14387,6 +14451,7 @@ int main() {
         {"DirectDrawCreateEx fallback", test_directdraw_create_ex_fallback},
         {"IDirectDraw7 object model", test_ddraw7_object_model},
         {"Direct3D7 stage 2a", test_d3d7_pipeline},
+        {"Direct3D7 stage 2b translation", test_d3d7_translation},
         {"QueryInterface", test_query_interface},
         {"display modes", test_enum_display_modes},
         {"DirectDraw enumeration", test_directdraw_enumeration},
