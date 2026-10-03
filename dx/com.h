@@ -328,12 +328,19 @@ struct ComObj {
     uint32_t mode_w = 0, mode_h = 0, mode_bpp = 0;
     bool mode_set = false;
     std::vector<uint32_t> surfaces; // ids, for RestoreAllSurfaces
+    // Video-memory accounting. The engine prefills a texture-surface pool until
+    // CreateSurface fails, so surface pixels must be bounded by the reported
+    // VRAM or the pool drains the guest heap. vram_total == 0 means unbounded
+    // (tests and RECOMP_DDRAW_VRAM_MB=0).
+    uint64_t vram_used = 0;
+    uint32_t vram_total = 0;
 
     // --- K_SURFACE
     uint32_t caps = 0;
     uint32_t width = 0, height = 0, bpp = 0, pitch = 0;
     uint32_t pixels = 0; // guest address of the pixel memory
     uint32_t pixels_bytes = 0;
+    bool counts_vram = false; // owner_dd's vram_used includes this surface
     uint32_t rmask = 0, gmask = 0, bmask = 0, amask = 0;
     uint32_t palette_obj = 0;
     uint32_t clipper_obj = 0;

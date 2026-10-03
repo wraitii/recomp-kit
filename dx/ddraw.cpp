@@ -345,6 +345,72 @@ uint32_t pitch_for(uint32_t width, uint32_t bpp) {
 }
 
 // ---------------------------------------------------------------------------
+// Video-memory budget
+// ---------------------------------------------------------------------------
+// The engine's LH3DVRAM prefills a pool of texture surfaces until CreateSurface
+// fails, then uses the pool as its texture cache. A driver reports
+// DDERR_OUTOFVIDEOMEMORY once VRAM is full and the pool stops; this shim's
+// surface pixels live in the guest heap, so without a cap the pool drains it
+// (~200 MB at the 256 MB MaxVRAM default) and the engine faults when a later
+// allocation cannot be made. The cap is the reported VRAM total; it is a
+// period-card 32 MB by default and can be overridden with
+// RECOMP_DDRAW_VRAM_MB (0 restores unbounded), or with ddraw_set_vram_total
+// from a test. Only explicit video-memory surfaces are charged.
+static constexpr uint32_t VRAM_UNSET = 0xffffffffu;
+uint32_t g_vram_total_override = VRAM_UNSET;
+
+uint32_t ddraw_default_vram_total() {
+    if (g_vram_total_override != VRAM_UNSET)
+        return g_vram_total_override;
+    if (const char *s = recomp_env("DDRAW_VRAM_MB")) {
+        unsigned long mb = strtoul(s, nullptr, 0);
+        return mb ? (uint32_t)mb * 1024u * 1024u : 0u;
+    }
+    return 32u * 1024u * 1024u;
+}
+
+extern "C" void ddraw_set_vram_total(uint32_t bytes) {
+    g_vram_total_override = bytes;
+}
+
+bool surface_uses_vram(const ComObj *s) {
+    return (s->caps & (DDSCAPS_VIDEOMEMORY | DDSCAPS_LOCALVIDMEM | DDSCAPS_NONLOCALVIDMEM)) != 0;
+}
+
+// The effective capacity, so a test override applies to an object created
+// before the test ran.
+uint32_t ddraw_vram_capacity(ComObj *dd) {
+    if (g_vram_total_override != VRAM_UNSET)
+        return g_vram_total_override;
+    return dd ? dd->vram_total : 0;
+}
+
+// Charge a new surface against its DirectDraw object. False means it does not
+// fit; the caller fails the create with DDERR_OUTOFVIDEOMEMORY.
+bool surface_charge_vram(ComObj *dd, ComObj *s) {
+    uint32_t capacity = ddraw_vram_capacity(dd);
+    if (!dd || !capacity || !surface_uses_vram(s))
+        return true;
+    uint64_t bytes = (uint64_t)pitch_for(s->width, s->bpp) * s->height;
+    if (dd->vram_used + bytes > capacity)
+        return false;
+    dd->vram_used += bytes;
+    s->counts_vram = true;
+    return true;
+}
+
+void surface_refund_vram(ComObj *s) {
+    if (!s->counts_vram)
+        return;
+    s->counts_vram = false;
+    ComObj *dd = s->owner_dd ? com_get(s->owner_dd) : nullptr;
+    if (!dd)
+        return;
+    uint64_t bytes = (uint64_t)pitch_for(s->width, s->bpp) * s->height;
+    dd->vram_used = dd->vram_used >= bytes ? dd->vram_used - bytes : 0;
+}
+
+// ---------------------------------------------------------------------------
 // DDSURFACEDESC / DDSURFACEDESC2
 // ---------------------------------------------------------------------------
 // Which record a caller passed. dwSize decides, exactly as DirectDraw does,
@@ -418,6 +484,7 @@ void fill_desc(uint32_t addr, const ComObj *s, bool v2, uint32_t lpsurface) {
 // Surfaces
 // ---------------------------------------------------------------------------
 void surface_destroy(ComObj *s) {
+    surface_refund_vram(s);
     if (s->dc_handle)
         gdi_unbind_surface_dc(s->dc_handle);
     // A surface that is going away takes its pixels with it, and the host may
@@ -4382,7 +4449,13 @@ void create_surface(X86 *c, ComIface surface_iface) {
         s->has_ckey_dst = true;
     }
 
+    if (!surface_charge_vram(dd, s)) {
+        com_release(s);
+        com_ret(c, DDERR_OUTOFVIDEOMEMORY);
+        return;
+    }
     if (!surface_alloc_pixels(s)) {
+        surface_refund_vram(s);
         com_release(s);
         com_ret(c, DDERR_OUTOFMEMORY);
         return;
@@ -4409,10 +4482,11 @@ void create_surface(X86 *c, ComIface surface_iface) {
         b->amask = s->amask;
         b->caps = (caps & ~(DDSCAPS_PRIMARYSURFACE | DDSCAPS_VISIBLE | DDSCAPS_FRONTBUFFER)) |
                   DDSCAPS_BACKBUFFER | DDSCAPS_FLIP;
-        if (!surface_alloc_pixels(b)) {
+        if (!surface_charge_vram(dd, b) || !surface_alloc_pixels(b)) {
+            surface_refund_vram(b);
             com_release(b);
             com_release(s);
-            com_ret(c, DDERR_OUTOFMEMORY);
+            com_ret(c, DDERR_OUTOFVIDEOMEMORY);
             return;
         }
         tail->back_obj = b->id;
@@ -4504,9 +4578,10 @@ void DD_DuplicateSurface(X86 *c) {
     s->gmask = src->gmask;
     s->bmask = src->bmask;
     s->amask = src->amask;
-    if (!surface_alloc_pixels(s)) {
+    if (!surface_charge_vram(dd, s) || !surface_alloc_pixels(s)) {
+        surface_refund_vram(s);
         com_release(s);
-        com_ret(c, DDERR_OUTOFMEMORY);
+        com_ret(c, DDERR_OUTOFVIDEOMEMORY);
         return;
     }
     // The copy reads the source with the CPU, so anything the device drew into
@@ -4830,11 +4905,17 @@ void DD_WaitForVerticalBlank(X86 *c) {
 
 // --- IDirectDraw2 addition
 void DD_GetAvailableVidMem(X86 *c) {
+    ComObj *dd = this_ddraw(c);
     uint32_t total = arg(c, 2), free_ = arg(c, 3);
+    uint32_t capacity = ddraw_vram_capacity(dd);
+    if (!capacity)
+        capacity = 32u * 1024 * 1024; // unbounded shim still reports a card
+    uint64_t used = dd ? dd->vram_used : 0;
+    uint32_t available = used >= capacity ? 0u : capacity - (uint32_t)used;
     if (total && gm_valid(total, 4))
-        wr32(total, 32u * 1024 * 1024);
+        wr32(total, capacity);
     if (free_ && gm_valid(free_, 4))
-        wr32(free_, 24u * 1024 * 1024);
+        wr32(free_, available);
     com_ret(c, DD_OK);
 }
 
@@ -4966,6 +5047,7 @@ void DirectDrawCreate(X86 *c) {
     dd->mode_w = 640;
     dd->mode_h = 480;
     dd->mode_bpp = 8;
+    dd->vram_total = ddraw_default_vram_total();
     uint32_t view = com_view(dd, IF_DIRECTDRAW);
     if (!view) {
         com_release(dd);
@@ -5001,6 +5083,7 @@ void DirectDrawCreateEx(X86 *c) {
     dd->mode_w = 640;
     dd->mode_h = 480;
     dd->mode_bpp = 8;
+    dd->vram_total = ddraw_default_vram_total();
     uint32_t view = com_view(dd, IF_DIRECTDRAW7);
     if (!view) {
         com_release(dd);

@@ -15,6 +15,7 @@
 #include <stdarg.h>
 #include <set>
 #include <string>
+#include <vector>
 
 uint8_t *g_mem = nullptr;
 
@@ -303,6 +304,89 @@ std::map<uint32_t, Blk> *g_blocks = nullptr;
 std::set<uint32_t> *g_free = nullptr;
 uint64_t g_total_allocs = 0, g_total_frees = 0;
 
+// Optional per-allocation tracing (RECOMP_HEAP_TRACE=1): remembers the guest
+// site and requested size of every live block so the out-of-memory dump can
+// say who is holding the heap. Off by default; the map is untouched then.
+struct LiveAlloc {
+    uint32_t site;
+    uint32_t size;
+};
+std::map<uint32_t, LiveAlloc> *g_live = nullptr;
+bool g_heap_trace = false;
+uint32_t heap_site() {
+    if (!g_heap_trace)
+        return 0;
+    const X86 *c = guest_current_context();
+    return c ? c->eip : 0;
+}
+void live_set(uint32_t addr, uint32_t site, uint32_t size) {
+    if (g_heap_trace)
+        (*g_live)[addr] = LiveAlloc{site, size};
+}
+void live_erase(uint32_t addr) {
+    if (g_heap_trace)
+        g_live->erase(addr);
+}
+
+// On out-of-memory, print who is holding the heap: totals per guest call site,
+// the largest non-surface allocations, and a size histogram. Without it the
+// only fact is that the arena is full, not which subsystem filled it.
+void heap_trace_report() {
+    std::map<uint32_t, std::pair<uint32_t, uint64_t>> by_site; // site -> (count, bytes)
+    uint64_t buckets[5] = {0, 0, 0, 0, 0};                     // <1K, <16K, <64K, <256K, >=256K
+    for (auto &kv : *g_live) {
+        auto &e = by_site[kv.second.site];
+        ++e.first;
+        e.second += kv.second.size;
+        uint32_t s = kv.second.size;
+        int b = s < 1024 ? 0 : s < 16384 ? 1 : s < 65536 ? 2 : s < 262144 ? 3 : 4;
+        buckets[b] += s;
+    }
+    std::vector<std::pair<uint32_t, std::pair<uint32_t, uint64_t>>> sorted(by_site.begin(),
+                                                                           by_site.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto &a, const auto &b) { return a.second.second > b.second.second; });
+    std::map<std::pair<uint32_t, uint32_t>, std::pair<uint32_t, uint64_t>> by_size;
+    for (auto &kv : *g_live) {
+        auto &e = by_size[{kv.second.site, kv.second.size}];
+        ++e.first;
+        e.second += kv.second.size;
+    }
+    std::vector<std::pair<std::pair<uint32_t, uint32_t>, std::pair<uint32_t, uint64_t>>> sizes(
+        by_size.begin(), by_size.end());
+    std::sort(sizes.begin(), sizes.end(),
+              [](const auto &a, const auto &b) { return a.second.second > b.second.second; });
+    for (size_t i = 0; i < sizes.size() && i < 8; ++i)
+        LOGW("heap live size: site %08x size %u: %u blocks, %llu bytes", sizes[i].first.first,
+             sizes[i].first.second, sizes[i].second.first,
+             (unsigned long long)sizes[i].second.second);
+    for (size_t i = 0; i < sorted.size() && i < 16; ++i)
+        LOGW("heap live: site %08x: %u blocks, %llu bytes", sorted[i].first, sorted[i].second.first,
+             (unsigned long long)sorted[i].second.second);
+    LOGW("heap live buckets: <1K=%llu <16K=%llu <64K=%llu <256K=%llu >=256K=%llu",
+         (unsigned long long)buckets[0], (unsigned long long)buckets[1],
+         (unsigned long long)buckets[2], (unsigned long long)buckets[3],
+         (unsigned long long)buckets[4]);
+    // RECOMP_HEAP_PEEK=0xADDR,0xADDR lets a run print guest globals that
+    // explain a budget without the runtime naming game addresses.
+    if (const char *peek = recomp_env("HEAP_PEEK")) {
+        const char *p = peek;
+        while (*p) {
+            char *end = nullptr;
+            unsigned long a = strtoul(p, &end, 0);
+            if (end == p)
+                break;
+            if (a < GUEST_SIZE - 4) {
+                const uint8_t *m = g_mem + a;
+                uint32_t v = (uint32_t)m[0] | ((uint32_t)m[1] << 8) | ((uint32_t)m[2] << 16) |
+                             ((uint32_t)m[3] << 24);
+                LOGW("heap peek: [%08lx] = %08x", a, (unsigned)v);
+            }
+            p = (*end == ',') ? end + 1 : end;
+        }
+    }
+}
+
 inline uint32_t align_up(uint32_t v, uint32_t a) {
     return (v + a - 1) & ~(a - 1);
 }
@@ -334,8 +418,12 @@ void heap_reset() {
         g_blocks = new std::map<uint32_t, Blk>();
     if (!g_free)
         g_free = new std::set<uint32_t>();
+    if (!g_live)
+        g_live = new std::map<uint32_t, LiveAlloc>();
+    g_heap_trace = recomp_env("HEAP_TRACE") != nullptr;
     g_blocks->clear();
     g_free->clear();
+    g_live->clear();
     put_block(HEAP_BASE, HEAP_LIMIT - HEAP_BASE, 0, false);
     g_total_allocs = g_total_frees = 0;
 }
@@ -370,6 +458,10 @@ void mem_shutdown() {
     if (g_free) {
         delete g_free;
         g_free = nullptr;
+    }
+    if (g_live) {
+        delete g_live;
+        g_live = nullptr;
     }
 }
 
@@ -430,6 +522,7 @@ uint32_t heap_alloc(uint32_t size, bool zero, uint32_t align) {
         if (zero)
             memset(g_mem + user, 0, need);
         ++g_total_allocs;
+        live_set(user, heap_site(), size);
         return user;
     }
     LOGW("heap_alloc: out of guest heap (%u bytes requested)", size);
@@ -441,6 +534,8 @@ uint32_t heap_alloc(uint32_t size, bool zero, uint32_t align) {
              (unsigned long long)hs.used_blocks, (unsigned long long)hs.free_bytes,
              (unsigned long long)hs.free_blocks, (unsigned long long)hs.largest_free,
              (unsigned long long)hs.total_allocs, (unsigned long long)hs.total_frees);
+        if (g_heap_trace)
+            heap_trace_report();
     }
     return 0;
 }
@@ -472,6 +567,7 @@ bool heap_free(uint32_t addr) {
     it->second.used = false;
     it->second.req = 0;
     ++g_total_frees;
+    live_erase(addr);
 
     // RECOMP_HEAP_QUARANTINE=1 retires a block instead of returning it: the
     // address is never handed out again, and no neighbour absorbs it either.
@@ -538,6 +634,7 @@ uint32_t heap_realloc(uint32_t addr, uint32_t new_size, bool zero) {
             }
         }
         it->second.req = new_size;
+        live_set(addr, heap_site(), new_size);
         if (zero && new_size > old_req)
             memset(g_mem + addr + old_req, 0, new_size - old_req);
         return addr;
@@ -552,6 +649,7 @@ uint32_t heap_realloc(uint32_t addr, uint32_t new_size, bool zero) {
         uint32_t tail = total - need;
         it->second.size = need;
         it->second.req = new_size;
+        live_set(addr, heap_site(), new_size);
         if (tail)
             put_block(addr + need, tail, 0, false);
         if (zero)

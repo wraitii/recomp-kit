@@ -29,6 +29,9 @@ static const uint32_t DDERR_GENERIC = E_FAIL;
 static const uint32_t DDERR_INVALIDPARAMS = E_INVALIDARG;
 static const uint32_t DDERR_INVALIDOBJECT = MAKE_DDHRESULT(130);
 static const uint32_t DDERR_OUTOFMEMORY = E_OUTOFMEMORY;
+// A video-memory surface could not be allocated. A real driver returns this
+// when VRAM is full, and the engine's texture-pool loop stops on it.
+static const uint32_t DDERR_OUTOFVIDEOMEMORY = 0x8876017Cu;
 static const uint32_t DDERR_UNSUPPORTED = E_NOTIMPL;
 // DDERR_INVALIDPIXELFORMAT is 0x88760000 + 145. A caller that asked for a
 // pixel format the driver does not have recognises this and picks another;

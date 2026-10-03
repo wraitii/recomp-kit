@@ -9803,6 +9803,73 @@ static void test_overflow_rejection() {
     CHECK_EQ(rd32(sc(4)), 0);
 }
 
+// A video-memory surface must fail with DDERR_OUTOFVIDEOMEMORY once the
+// reported VRAM is full, and GetAvailableVidMem must report the same capacity
+// and fall as surfaces are charged. This is the signal the engine's LH3DVRAM
+// pool loop (0x85dd60) uses; an unbounded shim lets the pool consume the
+// 208 MB guest heap and the engine faults on a later allocation.
+static void test_vram_budget() {
+    ddraw_set_vram_total(256u * 1024u); // room for 8 x 128x128x16 surfaces
+    cpu_reset();
+    const uint8_t dd7[16] = {0xC0, 0x5E, 0xE6, 0x15, 0x9C, 0x3B, 0xD2, 0x11,
+                             0xB9, 0x2F, 0x00, 0x60, 0x97, 0x97, 0xEA, 0x5B};
+    uint32_t iid = sc(0x40), out = sc(0x60);
+    memcpy(gm_ptr(iid), dd7, sizeof(dd7));
+    CHECK_EQ(call_shim(tramp("DDRAW.dll", "DirectDrawCreateEx"), {0, out, iid, 0}), DD_OK);
+    uint32_t dd = rd32(out);
+    CHECK(dd != 0);
+    CHECK(ddraw_set_modes("320x240x16"));
+    CHECK_EQ(call_method(dd, DD_SetDisplayMode, {320, 240, 16, 0, 0}), DD_OK);
+
+    auto make = [&]() {
+        uint32_t desc = sc(0x900);
+        gm_zero(desc, DDSD2_SIZE);
+        wr32(desc + DDSD_OFF_dwSize, DDSD2_SIZE);
+        wr32(desc + DDSD_OFF_dwFlags, DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT);
+        wr32(desc + DDSD_OFF_dwWidth, 128);
+        wr32(desc + DDSD_OFF_dwHeight, 128);
+        wr32(desc + DDSD_OFF_ddsCaps, DDSCAPS_VIDEOMEMORY | DDSCAPS_LOCALVIDMEM | DDSCAPS_TEXTURE);
+        uint32_t pf = desc + DDSD_OFF_ddpfPixelFormat;
+        wr32(pf + DDPF_OFF_dwSize, DDPF_SIZE);
+        wr32(pf + DDPF_OFF_dwFlags, DDPF_RGB);
+        wr32(pf + DDPF_OFF_dwRGBBitCount, 16);
+        wr32(pf + DDPF_OFF_dwRBitMask, 0xf800);
+        wr32(pf + DDPF_OFF_dwGBitMask, 0x07e0);
+        wr32(pf + DDPF_OFF_dwBBitMask, 0x001f);
+        return call_method(dd, DD_CreateSurface, {desc, sc(0x10), 0});
+    };
+
+    uint32_t surf[8] = {0};
+    for (int i = 0; i < 8; ++i) {
+        CHECK_EQ(make(), DD_OK);
+        surf[i] = rd32(sc(0x10));
+        CHECK(surf[i] != 0);
+    }
+    CHECK_EQ(make(), DDERR_OUTOFVIDEOMEMORY);
+    CHECK_EQ(rd32(sc(0x10)), 0u);
+
+    uint32_t total = sc(0x200), free_ = sc(0x204);
+    wr32(total, 0xdeadbeefu);
+    wr32(free_, 0xdeadbeefu);
+    CHECK_EQ(call_method(dd, DD_GetAvailableVidMem, {0, total, free_}), DD_OK);
+    CHECK_EQ(rd32(total), 256u * 1024u);
+    CHECK_EQ(rd32(free_), 0u);
+
+    // Releasing one refunds its bytes, and a new surface fits again.
+    CHECK_EQ(call_method(surf[0], S_Release, {}), 0u);
+    CHECK_EQ(call_method(dd, DD_GetAvailableVidMem, {0, total, free_}), DD_OK);
+    CHECK_EQ(rd32(free_), 128u * 256u);
+    CHECK_EQ(make(), DD_OK);
+    CHECK(rd32(sc(0x10)) != 0);
+    CHECK_EQ(call_method(rd32(sc(0x10)), S_Release, {}), 0u);
+
+    for (int i = 1; i < 8; ++i)
+        call_method(surf[i], S_Release, {});
+    CHECK_EQ(call_method(dd, DD_Release, {}), 0u);
+    ddraw_reset_modes();
+    ddraw_set_vram_total(DDRAW_VRAM_UNSET);
+}
+
 // IUnknown identity is stable, DirectDraw and Direct3D query each other, and a
 // released parent stays alive while a dependent interface is held.
 static void test_identity_and_parent() {
@@ -14493,6 +14560,7 @@ int main() {
         {"GetDeviceData stride", test_device_data_stride16},
         {"GetClipStatus canary", test_clipstatus_canary},
         {"overflow rejection", test_overflow_rejection},
+        {"VRAM budget", test_vram_budget},
         {"identity and parent", test_identity_and_parent},
         {"duplicate PCM lifetime", test_dsound_duplicate_lifetime},
         {"SetSurfaceDesc owner", test_setsurfacedesc_ownership},
