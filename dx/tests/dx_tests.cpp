@@ -3708,10 +3708,11 @@ static void test_dshow_movie_graph() {
     os_rmdir(dir);
 }
 
-// A minimal uncompressed BGR24 AVI: one 4x4 frame in an idx1-indexed movi.
-// FFmpeg's rawvideo decoder reads it, so MG_Connect's frame-size probe has a
-// real file to open instead of a private asset.
-static bool write_min_raw_avi(const std::string &path, int w, int h) {
+// A minimal uncompressed BGR24 AVI: `frames` 4x4 frames in an idx1-indexed
+// movi, each filled with its own value so a renderer can tell them apart by
+// their first byte. FFmpeg's rawvideo decoder reads it, so both MG_Connect's
+// frame-size probe and the movie pump have a real file to decode.
+static bool write_min_raw_avi(const std::string &path, int w, int h, int frames = 1) {
     auto dw = [](std::vector<uint8_t> &v, uint32_t n) {
         for (int i = 0; i < 4; ++i)
             v.push_back(uint8_t(n >> (i * 8)));
@@ -3736,10 +3737,10 @@ static bool write_min_raw_avi(const std::string &path, int w, int h) {
     strh.push_back(0);
     strh.push_back(0); // wPriority/wLanguage
     dw(strh, 0);
-    dw(strh, 1);  // dwScale
-    dw(strh, 30); // dwRate
-    dw(strh, 0);  // dwStart
-    dw(strh, 1);  // dwLength
+    dw(strh, 1);                // dwScale
+    dw(strh, 30);               // dwRate
+    dw(strh, 0);                // dwStart
+    dw(strh, (uint32_t)frames); // dwLength
     dw(strh, (uint32_t)(w * h * 3));
     dw(strh, 0xffffffffu);
     dw(strh, 0);
@@ -3769,9 +3770,9 @@ static bool write_min_raw_avi(const std::string &path, int w, int h) {
     dw(avih, (uint32_t)(w * h * 3));
     dw(avih, 0);
     dw(avih, 0x10); // AVIF_HASINDEX
-    dw(avih, 1);
+    dw(avih, (uint32_t)frames);
     dw(avih, 0);
-    dw(avih, 1);
+    dw(avih, 1); // dwStreams: one video stream
     dw(avih, (uint32_t)(w * h * 3));
     dw(avih, (uint32_t)w);
     dw(avih, (uint32_t)h);
@@ -3782,16 +3783,28 @@ static bool write_min_raw_avi(const std::string &path, int w, int h) {
         hdrl.push_back(b);
     for (uint8_t b : list("strl", strl))
         hdrl.push_back(b);
-    std::vector<uint8_t> frame;
-    for (int i = 0; i < w * h * 3; ++i)
-        frame.push_back((uint8_t)((i * 7) & 0xff));
+    const uint32_t frame_bytes = (uint32_t)(w * h * 3);
     std::vector<uint8_t> movi;
-    for (uint8_t b : chunk("00db", frame))
-        movi.push_back(b);
-    std::vector<uint8_t> idx = {'0', '0', 'd', 'b'};
-    dw(idx, 0x10);
-    dw(idx, 4);
-    dw(idx, (uint32_t)frame.size());
+    std::vector<uint8_t> idx;
+    uint32_t offset = 4; // first chunk begins just past the 'movi' FOURCC
+    for (int n = 0; n < frames; ++n) {
+        // Every byte of a frame carries the frame's number, so the first
+        // pixel read back identifies the frame regardless of row order.
+        std::vector<uint8_t> frame;
+        for (uint32_t i = 0; i < frame_bytes; ++i)
+            frame.push_back((uint8_t)((n * 64) & 0xff));
+        // A raw AVI stores the bottom picture row first, so its last
+        // scanline is the top of the picture; mark it to check row order.
+        for (uint32_t i = frame_bytes - (uint32_t)(w * 3); i < frame_bytes; ++i)
+            frame[i] = 0xAA;
+        for (uint8_t b : chunk("00db", frame))
+            movi.push_back(b);
+        idx.insert(idx.end(), {'0', '0', 'd', 'b'});
+        dw(idx, 0x10); // AVIIF_KEYFRAME
+        dw(idx, offset);
+        dw(idx, frame_bytes);
+        offset += 8 + frame_bytes + (frame_bytes & 1);
+    }
     std::vector<uint8_t> body = {'A', 'V', 'I', ' '};
     for (uint8_t b : list("hdrl", hdrl))
         body.push_back(b);
@@ -3819,9 +3832,12 @@ static uint16_t g_fake_accept_bits;
 static uint32_t g_fake_accept_w, g_fake_accept_h;
 static bool g_fake_receive_connection;
 static uint32_t g_fake_imem;
-static bool g_fake_received;
-static uint32_t g_fake_received_ptr, g_fake_received_size, g_fake_received_actual;
-static uint8_t g_fake_first_pixel;
+static uint32_t g_fake_receive_calls;
+static std::vector<uint8_t> g_fake_frame_pixels;   // first byte of each received frame
+static std::vector<uint8_t> g_fake_frame_last_row; // first byte of each frame's last row
+static std::vector<uint32_t> g_fake_frame_sizes;
+static std::vector<uint64_t> g_fake_frame_starts;
+static uint32_t g_fake_run_calls, g_fake_pause_calls, g_fake_stop_calls;
 
 static void fake_pin_qi(X86 *c) {
     wr32(arg(c, 2), g_fake_imem);
@@ -3840,17 +3856,42 @@ static void fake_pin_receive_connection(X86 *c) {
     g_fake_receive_connection = true;
     set_eax(c, 0);
 }
+// IMediaSample::GetTime writes a 64-bit REFERENCE_TIME. Read it back through
+// the two out-params the real renderer would pass.
+static uint64_t fake_sample_start(uint32_t sample) {
+    uint32_t lo = sc(0x3f10), hi = sc(0x3f14);
+    wr32(lo, 0);
+    wr32(hi, 0);
+    call_method(sample, 5, {lo, hi}); // GetTime
+    return (uint64_t)rd32(lo) | ((uint64_t)rd32(hi) << 32);
+}
 static void fake_imem_receive(X86 *c) {
     uint32_t sample = arg(c, 1);
-    g_fake_received = true;
+    ++g_fake_receive_calls;
     uint32_t out = sc(0x3f00);
     wr32(out, 0);
     call_method(sample, 3, {out}); // IMediaSample::GetPointer
-    g_fake_received_ptr = rd32(out);
-    g_fake_received_size = call_method(sample, 4);
-    g_fake_received_actual = call_method(sample, 11);
-    if (g_fake_received_ptr)
-        g_fake_first_pixel = rd8(g_fake_received_ptr);
+    uint32_t ptr = rd32(out);
+    g_fake_frame_sizes.push_back(call_method(sample, 11)); // GetActualDataLength
+    g_fake_frame_starts.push_back(fake_sample_start(sample));
+    g_fake_frame_pixels.push_back(ptr ? rd8(ptr) : 0);
+    {
+        const uint32_t size = call_method(sample, 11);
+        g_fake_frame_last_row.push_back(ptr && size >= 12 ? rd8(ptr + size - 12)
+                                                          : 0); // 4x4 BGR24: last row at size-12
+    }
+    set_eax(c, 0);
+}
+static void fake_filter_run(X86 *c) {
+    ++g_fake_run_calls;
+    set_eax(c, 0);
+}
+static void fake_filter_pause(X86 *c) {
+    ++g_fake_pause_calls;
+    set_eax(c, 0);
+}
+static void fake_filter_stop(X86 *c) {
+    ++g_fake_stop_calls;
     set_eax(c, 0);
 }
 
@@ -3878,16 +3919,19 @@ static void test_dshow_movie_connect() {
     g_fake_accept_bits = 0;
     g_fake_accept_w = g_fake_accept_h = 0;
     g_fake_receive_connection = false;
-    g_fake_received = false;
-    g_fake_received_ptr = g_fake_received_size = g_fake_received_actual = 0;
-    g_fake_first_pixel = 0;
+    g_fake_receive_calls = 0;
+    g_fake_frame_pixels.clear();
+    g_fake_frame_last_row.clear();
+    g_fake_frame_sizes.clear();
+    g_fake_frame_starts.clear();
+    g_fake_run_calls = g_fake_pause_calls = g_fake_stop_calls = 0;
 
     // The fake renderer. Slots: QI=0, ReceiveConnection=4, QueryAccept=11 on
     // the IPin vtable; Receive=6 on the IMemInputPin vtable.
     uint32_t qi = imports_alloc_trampoline("TEST", "FakePinQI", fake_pin_qi, 3);
     uint32_t qa = imports_alloc_trampoline("TEST", "FakePinQueryAccept", fake_pin_query_accept, 2);
-    uint32_t rc =
-        imports_alloc_trampoline("TEST", "FakePinReceiveConnection", fake_pin_receive_connection, 3);
+    uint32_t rc = imports_alloc_trampoline("TEST", "FakePinReceiveConnection",
+                                           fake_pin_receive_connection, 3);
     uint32_t receive = imports_alloc_trampoline("TEST", "FakeImemReceive", fake_imem_receive, 2);
     uint32_t ipin_vt = sc(0x2800), ipin = sc(0x2900);
     uint32_t imem_vt = sc(0x2a00);
@@ -4006,19 +4050,255 @@ static void test_dshow_movie_connect() {
     uint32_t vids = find_media_pin(splitter, mediatype_video);
     CHECK(vids != 0);
 
-    // The graph's IGraphBuilder::Connect reaches the guest pin's QueryAccept,
-    // ReceiveConnection and IMemInputPin::Receive.
+    // The graph's IGraphBuilder::Connect reaches the guest pin's QueryAccept
+    // and ReceiveConnection, then holds the IMemInputPin for the pump. No
+    // sample is delivered before Run: the renderer's state check refuses one.
     CHECK_EQ(call_method(graph, 11, {vids, ipin}), S_OK_);
     CHECK_EQ(g_fake_accept_calls, 1u);
     CHECK_EQ(g_fake_accept_bits, 24u);
     CHECK_EQ(g_fake_accept_w, 4u);
     CHECK_EQ(g_fake_accept_h, 4u);
     CHECK(g_fake_receive_connection);
-    CHECK(g_fake_received);
-    CHECK_EQ(g_fake_received_size, 48u);
-    CHECK_EQ(g_fake_received_actual, 48u);
-    CHECK(g_fake_received_ptr != 0);
-    CHECK_EQ(g_fake_first_pixel, 0u); // (x+y)=0 at the first bottom-up pixel
+    CHECK_EQ(g_fake_receive_calls, 0u);
+
+    if (vids)
+        call_method(vids, 2);
+    if (split_in)
+        call_method(split_in, 2);
+    if (src_out)
+        call_method(src_out, 2);
+    call_method(splitter, 2);
+    call_method(source, 2);
+    call_method(graph, 2);
+    os_unlink(file.c_str());
+    os_rmdir(dir);
+}
+
+// The whole movie path end to end: a fake guest renderer whose IBaseFilter
+// Run/Pause/Stop and whose IMemInputPin Receive are import trampolines, a
+// three-frame raw AVI, and the graph's own IMediaControl::Run and
+// IMediaEvent::GetEvent. The frames must arrive in order and the last event
+// must be EC_COMPLETE.
+static void test_dshow_movie_run() {
+    static const uint8_t clsid_filtergraph[16] = {0xb3, 0xeb, 0x36, 0xe4, 0x4f, 0x52, 0xce, 0x11,
+                                                  0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70};
+    static const uint8_t iid_igraphbuilder[16] = {0xa9, 0x68, 0xa8, 0x56, 0xd4, 0x0a, 0xce, 0x11,
+                                                  0xb0, 0x3a, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70};
+    static const uint8_t iid_ibasefilter[16] = {0x95, 0x68, 0xa8, 0x56, 0xd4, 0x0a, 0xce, 0x11,
+                                                0xb0, 0x3a, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70};
+    static const uint8_t iid_imediacon[16] = {0xb1, 0x68, 0xa8, 0x56, 0xd4, 0x0a, 0xce, 0x11,
+                                              0xb0, 0x3a, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70};
+    static const uint8_t iid_imediaevent[16] = {0xb6, 0x68, 0xa8, 0x56, 0xd4, 0x0a, 0xce, 0x11,
+                                                0xb0, 0x3a, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70};
+    static const uint8_t clsid_avi[16] = {0x20, 0x4c, 0x54, 0x1b, 0x0b, 0xfd, 0xce, 0x11,
+                                          0x8c, 0x63, 0x00, 0xaa, 0x00, 0x44, 0xb5, 0x1e};
+    static const uint8_t mediatype_video[16] = {0x76, 0x69, 0x64, 0x73, 0x00, 0x00, 0x10, 0x00,
+                                                0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71};
+    const uint32_t S_OK_ = 0;
+    const int kFrames = 3;
+
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/recomp-dshow-mr-XXXXXX", os_temp_dir());
+    CHECK(os_mkdtemp(dir) == 0);
+    std::string file = std::string(dir) + "/raw.avi";
+    CHECK(write_min_raw_avi(file, 4, 4, kFrames));
+    win32_init(dir);
+
+    g_fake_accept_calls = 0;
+    g_fake_accept_bits = 0;
+    g_fake_accept_w = g_fake_accept_h = 0;
+    g_fake_receive_connection = false;
+    g_fake_receive_calls = 0;
+    g_fake_frame_pixels.clear();
+    g_fake_frame_last_row.clear();
+    g_fake_frame_sizes.clear();
+    g_fake_frame_starts.clear();
+    g_fake_run_calls = g_fake_pause_calls = g_fake_stop_calls = 0;
+
+    uint32_t qi = imports_alloc_trampoline("TEST", "FakePinQIRun", fake_pin_qi, 3);
+    uint32_t qa =
+        imports_alloc_trampoline("TEST", "FakePinQueryAcceptRun", fake_pin_query_accept, 2);
+    uint32_t rc = imports_alloc_trampoline("TEST", "FakePinReceiveConnectionRun",
+                                           fake_pin_receive_connection, 3);
+    uint32_t receive = imports_alloc_trampoline("TEST", "FakeImemReceiveRun", fake_imem_receive, 2);
+    uint32_t run = imports_alloc_trampoline("TEST", "FakeFilterRun", fake_filter_run, 3);
+    uint32_t pause = imports_alloc_trampoline("TEST", "FakeFilterPause", fake_filter_pause, 1);
+    uint32_t stop = imports_alloc_trampoline("TEST", "FakeFilterStop", fake_filter_stop, 1);
+    uint32_t ipin_vt = sc(0x2800), ipin = sc(0x2900), imem_vt = sc(0x2a00), filter_vt = sc(0x2c00),
+             filter = sc(0x2d00);
+    g_fake_imem = sc(0x2b00);
+    wr32(ipin_vt + 0, qi);
+    wr32(ipin_vt + 4 * 4, rc);
+    wr32(ipin_vt + 11 * 4, qa);
+    wr32(imem_vt + 6 * 4, receive);
+    wr32(ipin, ipin_vt);
+    wr32(g_fake_imem, imem_vt);
+    wr32(filter_vt + 4 * 4, stop);
+    wr32(filter_vt + 5 * 4, pause);
+    wr32(filter_vt + 6 * 4, run);
+    wr32(filter, filter_vt);
+
+    uint32_t clsid = sc(0x1e00), iid = sc(0x1e10), ppv = sc(0x1e20), wpath = sc(0x1f00);
+    const char *name = "raw.avi";
+    for (size_t i = 0; i <= strlen(name); ++i)
+        wr16(wpath + 2 * (uint32_t)i, (uint16_t)name[i]);
+    uint32_t cocreate = tramp("ole32.dll", "CoCreateInstance");
+    memcpy(g_mem + clsid, clsid_filtergraph, 16);
+    memcpy(g_mem + iid, iid_igraphbuilder, 16);
+    CHECK_EQ(call_shim(cocreate, {clsid, 0, 1, iid, ppv}), S_OK_);
+    uint32_t graph = rd32(ppv);
+    CHECK(graph != 0);
+    if (!graph)
+        return;
+    uint32_t psource = sc(0x1e30);
+    CHECK_EQ(call_method(graph, 14, {wpath, 0, psource}), S_OK_); // AddSourceFilter
+    uint32_t source = rd32(psource);
+    CHECK(source != 0);
+    memcpy(g_mem + clsid, clsid_avi, 16);
+    memcpy(g_mem + iid, iid_ibasefilter, 16);
+    CHECK_EQ(call_shim(cocreate, {clsid, 0, 1, iid, ppv}), S_OK_);
+    uint32_t splitter = rd32(ppv);
+    CHECK(splitter != 0);
+    if (!splitter)
+        return;
+    CHECK_EQ(call_method(graph, 3, {splitter, 0}), S_OK_); // AddFilter(splitter)
+    CHECK_EQ(call_method(graph, 3, {filter, 0}), S_OK_);   // AddFilter(renderer)
+
+    auto find_pin = [&](uint32_t f, uint32_t dir) -> uint32_t {
+        uint32_t penum = sc(0x2200), ppin = sc(0x2204), pdir = sc(0x2208);
+        wr32(penum, 0);
+        if (call_method(f, 10, {penum}) != S_OK_)
+            return 0;
+        uint32_t en = rd32(penum);
+        if (!en)
+            return 0;
+        uint32_t found = 0;
+        for (;;) {
+            wr32(ppin, 0);
+            if (call_method(en, 3, {1, ppin, 0}) != S_OK_)
+                break;
+            uint32_t pin = rd32(ppin);
+            if (!pin)
+                break;
+            if (call_method(pin, 9, {pdir}) != S_OK_) {
+                call_method(pin, 2);
+                break;
+            }
+            if (rd32(pdir) == dir) {
+                found = pin;
+                break;
+            }
+            call_method(pin, 2);
+        }
+        call_method(en, 2);
+        return found;
+    };
+    uint32_t src_out = find_pin(source, 1);
+    uint32_t split_in = find_pin(splitter, 0);
+    CHECK(src_out != 0);
+    CHECK(split_in != 0);
+    CHECK_EQ(call_method(graph, 11, {src_out, split_in}), S_OK_); // Connect
+
+    auto find_media_pin = [&](uint32_t f, const uint8_t major[16]) -> uint32_t {
+        uint32_t penum = sc(0x2210), ppin = sc(0x2214), pdir = sc(0x2218), ptypes = sc(0x221c),
+                 pmt = sc(0x2220);
+        if (call_method(f, 10, {penum}) != S_OK_)
+            return 0;
+        uint32_t en = rd32(penum);
+        if (!en)
+            return 0;
+        uint32_t found = 0;
+        for (;;) {
+            wr32(ppin, 0);
+            if (call_method(en, 3, {1, ppin, 0}) != S_OK_)
+                break;
+            uint32_t pin = rd32(ppin);
+            if (!pin)
+                break;
+            bool match = false;
+            wr32(ptypes, 0);
+            if (call_method(pin, 9, {pdir}) == S_OK_ && rd32(pdir) == 1 &&
+                call_method(pin, 12, {ptypes}) == S_OK_) {
+                uint32_t ten = rd32(ptypes);
+                for (;;) {
+                    wr32(pmt, 0);
+                    if (!ten || call_method(ten, 3, {1, pmt, 0}) != S_OK_)
+                        break;
+                    uint32_t mt = rd32(pmt);
+                    if (mt && memcmp(g_mem + mt, major, 16) == 0) {
+                        match = true;
+                        break;
+                    }
+                }
+                if (ten)
+                    call_method(ten, 2);
+            }
+            if (match) {
+                found = pin;
+                break;
+            }
+            call_method(pin, 2);
+        }
+        call_method(en, 2);
+        return found;
+    };
+    uint32_t vids = find_media_pin(splitter, mediatype_video);
+    CHECK(vids != 0);
+    CHECK_EQ(call_method(graph, 11, {vids, ipin}), S_OK_); // Connect video
+    CHECK(g_fake_receive_connection);
+    CHECK_EQ(g_fake_receive_calls, 0u);
+
+    // IMediaControl::Run runs the guest renderer first, then starts the pump.
+    uint32_t mc_iid = sc(0x2e10), mc_out = sc(0x2e40);
+    memcpy(g_mem + mc_iid, iid_imediacon, 16);
+    CHECK_EQ(call_method(graph, 0, {mc_iid, mc_out}), S_OK_);
+    uint32_t mc = rd32(mc_out);
+    CHECK(mc != 0);
+    if (mc) {
+        CHECK_EQ(call_method(mc, 7), S_OK_); // Run
+        CHECK_EQ(g_fake_run_calls, 1u);
+    }
+
+    // The video is paced by the host clock, so the frames arrive over the
+    // next ~70 ms; pump and poll rather than spin.
+    uint32_t me_iid = sc(0x2e50), me_out = sc(0x2e60), evcode = sc(0x2e70);
+    memcpy(g_mem + me_iid, iid_imediaevent, 16);
+    CHECK_EQ(call_method(graph, 0, {me_iid, me_out}), S_OK_);
+    uint32_t me = rd32(me_out);
+    CHECK(me != 0);
+    bool complete = false;
+    for (int i = 0; i < 400 && !complete; ++i) {
+        host_pump_timers(&g_cpu);
+        wr32(evcode, 0);
+        if (me && call_method(me, 8, {evcode, 0, 0, 0}) == S_OK_ && rd32(evcode) == 1)
+            complete = true;
+        os_sleep_us(5 * 1000);
+    }
+    CHECK(complete);
+    CHECK_EQ(g_fake_receive_calls, (uint32_t)kFrames);
+    CHECK_EQ(g_fake_frame_pixels.size(), (size_t)kFrames);
+    if (g_fake_frame_pixels.size() == (size_t)kFrames) {
+        CHECK_EQ(g_fake_frame_pixels[0], 0u); // frame 0 fills with n*64
+        CHECK_EQ(g_fake_frame_pixels[1], 64u);
+        CHECK_EQ(g_fake_frame_pixels[2], 128u);
+        // Bottom-up delivery: the buffer's last row is the picture's top row,
+        // which the fixture stores as the file's last scanline (0xAA).
+        CHECK_EQ(g_fake_frame_last_row.size(), (size_t)kFrames);
+        for (uint8_t v : g_fake_frame_last_row)
+            CHECK_EQ(v, 0xAAu);
+    }
+    if (g_fake_frame_starts.size() == (size_t)kFrames) {
+        CHECK(g_fake_frame_starts[0] < g_fake_frame_starts[1]);
+        CHECK(g_fake_frame_starts[1] < g_fake_frame_starts[2]);
+    }
+    for (uint32_t sz : g_fake_frame_sizes)
+        CHECK_EQ(sz, 48u); // 4x4 BGR24
+    if (me)
+        CHECK_EQ(call_method(me, 12, {0, 0, 0}), S_OK_); // FreeEventParams
+    if (mc) {
+        CHECK_EQ(call_method(mc, 9), S_OK_); // Stop
+        CHECK_EQ(g_fake_stop_calls, 1u);
+    }
 
     if (vids)
         call_method(vids, 2);
@@ -13354,6 +13634,7 @@ int main() {
         {"DirectShow graph playback", test_dshow_graph_playback},
         {"DirectShow movie graph", test_dshow_movie_graph},
         {"DirectShow movie connect", test_dshow_movie_connect},
+        {"DirectShow movie run", test_dshow_movie_run},
         {"palette versions", test_palette_versions},
         {"storage generations", test_storage_generations},
         {"draw snapshot is deep", test_draw_snapshot_is_deep},

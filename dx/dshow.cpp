@@ -45,6 +45,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <chrono>
 #include <deque>
 #include <iterator>
 #include <map>
@@ -668,7 +669,59 @@ struct MovieGraph {
     std::vector<uint32_t> filters;       // our filter ids this graph owns
     std::vector<uint32_t> guest_filters; // guest IBaseFilter pointers (the renderer)
     std::string path;
+    // The video connection negotiated in MG_Connect: the guest bank's
+    // IMemInputPin view, the frame size the renderer's VIDEOINFOHEADER must
+    // carry and the subtype bits chosen through QueryAccept. `renderer_imem`
+    // is zero until a guest renderer pin has been connected.
+    uint32_t renderer_pin = 0;  // guest IPin the connection landed on
+    uint32_t renderer_imem = 0; // guest IMemInputPin view of that pin
+    uint32_t video_w = 0, video_h = 0;
+    uint16_t video_bits = 0;
 };
+
+// Everything one movie graph needs to play after IMediaControl::Run. The
+// video is decoded with mf::Media and pushed through the guest renderer's
+// IMemInputPin::Receive; the audio, when the DSound renderer was connected,
+// plays on a host channel. The clock is the host steady_clock, read through
+// now_seconds(); a frame is due once its PTS is at or before
+// `position + (now - clock0)`.
+struct MoviePlay {
+    bool opened = false;
+    mf::Media media;
+    int state = State_Stopped; // State_Stopped/Paused/Running
+    double clock0 = 0;         // now_seconds() when the current run began
+    double position = 0;       // media seconds played before the current run
+    mf::VideoFrame next;
+    bool have_next = false, media_done = false, ended_posted = false;
+    int32_t channel = -1;
+    bool audio_connected = false, audio_started = false, audio_unavailable = false;
+    std::vector<int16_t> pcm;
+    size_t pcm_pos = 0;
+    int32_t volume = 0, balance = 0;
+    uint32_t event = 0; // the completion event handle, once asked for
+    std::deque<uint32_t> events;
+    uint64_t video_frames = 0;
+};
+
+std::map<uint32_t, MoviePlay> &movie_plays() {
+    static auto *m = new std::map<uint32_t, MoviePlay>();
+    return *m;
+}
+
+MoviePlay *movie_play_of(ComObj *g) {
+    if (!g)
+        return nullptr;
+    auto it = movie_plays().find(g->id);
+    return it == movie_plays().end() ? nullptr : &it->second;
+}
+
+// The host clock the movie pump paces against, in seconds. Deliberately the
+// same steady clock mf.cpp uses: monotonic, unaffected by the wall calendar.
+double now_seconds() {
+    using clock = std::chrono::steady_clock;
+    static const clock::time_point t0 = clock::now();
+    return std::chrono::duration<double>(clock::now() - t0).count();
+}
 
 std::map<uint32_t, MoviePin> &movie_pins() {
     static auto *m = new std::map<uint32_t, MoviePin>();
@@ -698,8 +751,11 @@ std::map<uint32_t, MovieSample> &movie_samples() {
     return *m;
 }
 
+// The K_FILTERGRAPH behind `this`, whatever graph view the call arrived
+// through. Asking com_this for IF_GRAPH by name would fail for the transport
+// interfaces (IMediaControl and friends), whose views carry their own iface.
 ComObj *movie_graph_this(X86 *c) {
-    ComObj *g = com_this_arg(c, IF_GRAPH);
+    ComObj *g = com_this_arg(c);
     return g && g->kind == K_FILTERGRAPH ? g : nullptr;
 }
 
@@ -1290,6 +1346,7 @@ ComObj *movie_graph_create() {
     if (!g)
         return nullptr;
     movie_graphs()[g->id] = MovieGraph{};
+    (void)movie_plays()[g->id]; // default-construct the playback state in place
     return g;
 }
 
@@ -1369,8 +1426,7 @@ void MG_EnumFilters(X86 *c) {
 
 // Calls a guest COM vtable method: fn = [*this_addr + slot*4], with the
 // interface pointer as the first stack argument. Returns EAX.
-uint32_t guest_com_method(X86 *c, uint32_t this_addr, int slot, const uint32_t *args,
-                          int nargs) {
+uint32_t guest_com_method(X86 *c, uint32_t this_addr, int slot, const uint32_t *args, int nargs) {
     if (!this_addr || !gm_valid(this_addr, 4))
         return E_FAIL;
     uint32_t vt = rd32(this_addr);
@@ -1512,81 +1568,18 @@ bool movie_connect_guest(X86 *c, ComObj *g, ComObj *host_pin, uint32_t guest_pin
         LOGW("dshow: guest renderer has no IMemInputPin: %08x", hr);
         return false;
     }
-    // One synthetic frame, bottom-up with positive biHeight: the renderer
-    // copies biHeight rows from GetPointer into its locked texture.
-    uint32_t bytes = width * height * ((chosen->bits + 7) / 8);
-    uint32_t data = heap_alloc(bytes, false, 8);
-    if (!data) {
-        heap_free(mt);
-        LOGW("dshow: no guest memory for the synthetic frame");
-        return false;
-    }
-    for (uint32_t y = 0; y < height; ++y)
-        for (uint32_t x = 0; x < width; ++x) {
-            uint8_t *p = gm_ptr(data + (y * width + x) * ((chosen->bits + 7) / 8));
-            uint8_t luma = (uint8_t)(x + y);
-            if (chosen->bits == 32) {
-                p[0] = luma;
-                p[1] = luma;
-                p[2] = luma;
-                p[3] = 0;
-            } else if (chosen->bits == 24) {
-                p[0] = luma;
-                p[1] = luma;
-                p[2] = luma;
-            } else {
-                uint16_t v = (uint16_t)((luma >> 3) << 11 | (luma >> 2) << 5 | (luma >> 3));
-                p[0] = (uint8_t)v;
-                p[1] = (uint8_t)(v >> 8);
-            }
-        }
-    ComObj *sample = com_new(K_MEDIASAMPLE);
-    if (!sample) {
-        heap_free(data);
-        heap_free(mt);
-        return false;
-    }
-    MovieSample &ms = movie_samples()[sample->id];
-    ms.data = data;
-    ms.size = bytes;
-    ms.actual = bytes;
-    ms.sync = true;
-    uint32_t sample_view = com_view(sample, IF_MEDIASAMPLE);
-    if (imem && sample_view) {
-        uint32_t rargs[1] = {sample_view};
-        hr = guest_com_method(c, imem, 6, rargs, 1); // IMemInputPin::Receive
-        LOGV("dshow: IMemInputPin::Receive -> %08x", hr);
-    }
-    if (hr != S_OK) {
-        // DirectShow's protocol: the output pin asks the input pin for its
-        // allocator and tells it which allocator the connection will use.
-        // The renderer's Receive (0x00715030) checks CBaseInputPin state, so
-        // mirror the call before retrying rather than inventing an allocator.
-        uint32_t alloc_out = heap_alloc(4, true, 4);
-        if (alloc_out) {
-            uint32_t aargs[1] = {alloc_out};
-            uint32_t ghr = guest_com_method(c, imem, 3, aargs, 1); // GetAllocator
-            uint32_t allocator = ghr == S_OK ? rd32(alloc_out) : 0;
-            heap_free(alloc_out);
-            LOGV("dshow: IMemInputPin::GetAllocator -> %08x allocator %08x", ghr, allocator);
-            if (allocator) {
-                uint32_t nargs[2] = {allocator, 1};
-                guest_com_method(c, imem, 4, nargs, 2); // NotifyAllocator(alloc, TRUE)
-                uint32_t rargs2[1] = {sample_view};
-                hr = guest_com_method(c, imem, 6, rargs2, 1);
-                LOGV("dshow: IMemInputPin::Receive after NotifyAllocator -> %08x", hr);
-            }
-        }
-    }
-    com_release(sample);
+    // The connection is what this does; frames arrive after
+    // IMediaControl::Run. One sample before Run is refused by the renderer's
+    // state check (its Run sets state 2, its Receive wants that), so there is
+    // nothing useful to hand it here. Keep the negotiated pin and format for
+    // the pump.
+    MovieGraph &info = movie_graphs()[g->id];
+    info.renderer_pin = guest_pin;
+    info.renderer_imem = imem;
+    info.video_w = width;
+    info.video_h = height;
+    info.video_bits = chosen->bits;
     heap_free(mt);
-    if (hr != S_OK) {
-        // The connection itself succeeded; the renderer refuses a sample until
-        // IMediaControl::Run, which the graph has not been driven through yet.
-        // Real frames are the frame pump's job, so this is diagnostic, not a
-        // refusal of the connection.
-        LOGW("dshow: guest renderer did not take the synthetic frame: %08x", hr);
-    }
     movie_pins()[host_pin->id].connected = (uint32_t)-1;
     return true;
 }
@@ -1661,6 +1654,306 @@ void MG_AddSourceFilter(X86 *c) {
     movie_graph_attach(g, f);
     LOGV("dshow: AddSourceFilter(%s) -> filter %u", guest.c_str(), f->id);
     give_view(c, out, f, IF_BASEFILTER);
+}
+
+// ===========================================================================
+// The movie graph's playback. The decoder is mf::Media, the sink is the
+// guest renderer's IMemInputPin; the pump below runs on the guest frame
+// boundary under the scheduler baton, like every other file player here.
+// ===========================================================================
+std::string movie_source_host(ComObj *g) {
+    MovieGraph &info = movie_graphs()[g->id];
+    for (uint32_t id : info.filters) {
+        auto fit = movie_filters().find(id);
+        if (fit == movie_filters().end() || fit->second.role != MR_SOURCE)
+            continue;
+        std::string host = win32_host_path(fit->second.path, false);
+        if (!host.empty())
+            return host;
+    }
+    return std::string();
+}
+
+// True when our DSound renderer has an input pin connected to the splitter's
+// audio output. Without it the movie plays silently, which is what a graph
+// that never connected the renderer does.
+bool movie_audio_connected(ComObj *g) {
+    MovieGraph &info = movie_graphs()[g->id];
+    for (uint32_t id : info.filters) {
+        auto fit = movie_filters().find(id);
+        if (fit == movie_filters().end() || fit->second.role != MR_DSOUND)
+            continue;
+        for (uint32_t pid : fit->second.pins)
+            if (movie_pins()[pid].connected)
+                return true;
+    }
+    return false;
+}
+
+void movie_post(MoviePlay &p, uint32_t code) {
+    p.events.push_back(code);
+    if (p.event)
+        win32_signal_event(p.event, false);
+}
+
+// Drives every guest filter through an IBaseFilter slot: 6 Run (with a
+// REFERENCE_TIME), 5 Pause, 4 Stop. A real filter graph does this on every
+// transition; it is what puts the renderer's input pin into the state its
+// Receive requires. Ours are no-ops at the COM layer, so only the guest
+// renderer is reached.
+void movie_filters_state(X86 *c, ComObj *g, int slot) {
+    MovieGraph &info = movie_graphs()[g->id];
+    for (uint32_t pf : info.guest_filters) {
+        uint32_t args[2] = {0, 0}; // REFERENCE_TIME 0; ignored by Pause/Stop
+        uint32_t hr = guest_com_method(c, pf, slot, args, slot == 6 ? 3 : 1);
+        LOGV("dshow: guest filter %08x IBaseFilter slot %d -> %08x", pf, slot, hr);
+    }
+}
+
+// Stops the host channel. `release` also hands the channel back, which Stop
+// and Reset do; Pause keeps it so a later Run can append into the same voice.
+void movie_stop_audio(MoviePlay &p, bool release) {
+    if (p.channel >= 0) {
+        host_audio_stop(p.channel);
+        if (release) {
+            dx_free_audio_channel(p.channel);
+            p.channel = -1;
+        }
+    }
+    p.audio_started = false;
+}
+
+void movie_close_media(MoviePlay &p) {
+    p.media.close();
+    p.opened = false;
+    p.have_next = false;
+    p.media_done = false;
+    p.ended_posted = false;
+    p.pcm.clear();
+    p.pcm_pos = 0;
+    p.video_frames = 0;
+}
+
+void movie_release_playback(MoviePlay &p) {
+    movie_stop_audio(p, true);
+    movie_close_media(p);
+}
+
+bool movie_start_playback(ComObj *g, MoviePlay &p) {
+    std::string host = movie_source_host(g);
+    if (host.empty()) {
+        LOGW("dshow: movie graph has no source filter");
+        return false;
+    }
+    movie_close_media(p);
+    std::string why;
+    if (!p.media.open(host, &why)) {
+        LOGW("dshow: cannot open %s: %s", host.c_str(), why.c_str());
+        return false;
+    }
+    p.opened = true;
+    p.audio_connected = movie_audio_connected(g);
+    LOGV("dshow: movie opens %s (%dx%d %u-bit, audio %s)", host.c_str(), (int)p.media.width(),
+         (int)p.media.height(), (unsigned)movie_graphs()[g->id].video_bits,
+         p.audio_connected ? "connected" : "absent");
+    return true;
+}
+
+// Drops frames and audio decoded before `target`; used by a non-zero seek,
+// which cannot seek the container (mf::Media has no av_seek_frame).
+void movie_skip_to(MoviePlay &p, double target) {
+    while (p.media.has_video()) {
+        mf::VideoFrame f;
+        if (!p.media.next_video(&f))
+            break;
+        p.media.take_audio(); // audio before the target is not replayed
+        if (f.pts >= target) {
+            p.next = std::move(f);
+            p.have_next = true;
+            break;
+        }
+    }
+}
+
+// Converts one decoded frame to the negotiated subtype and hands it to the
+// renderer as a host IMediaSample. The renderer's DoRenderSample (0x0049d700)
+// copies width * (bits/8) bytes per row straight out of GetPointer, so the
+// bytes are the texture's own layout: RGB24 is B,G,R; RGB32 is B,G,R,X;
+// RGB565 is little-endian r5g6b5.
+void movie_deliver_frame(X86 *c, ComObj *g, MoviePlay &p, const mf::VideoFrame &f) {
+    MovieGraph &info = movie_graphs()[g->id];
+    if (!info.renderer_imem || !info.video_w || !info.video_h)
+        return;
+    if ((uint32_t)f.width != info.video_w || (uint32_t)f.height != info.video_h) {
+        log_once("dshow.movie.size", "dshow: decoded frame is %dx%d, not the negotiated %ux%u",
+                 (int)f.width, (int)f.height, info.video_w, info.video_h);
+        return;
+    }
+    const uint32_t bpp = (info.video_bits + 7) / 8;
+    const uint32_t bytes = info.video_w * info.video_h * bpp;
+    uint32_t data = heap_alloc(bytes, false, 8);
+    if (!data) {
+        log_once("dshow.movie.frame_mem", "dshow: no guest memory for a movie frame");
+        return;
+    }
+    // The negotiated VIDEOINFOHEADER has a positive biHeight, which is a
+    // bottom-up DIB: the first row in the buffer is the bottom row of the
+    // picture, and the guest renderer's copy (FUN_0049d700) relies on that.
+    // The decoder hands out the top row first, so write the rows reversed.
+    for (uint32_t y = 0; y < info.video_h; ++y) {
+        const uint32_t *src = f.argb.data() + (size_t)(info.video_h - 1 - y) * (size_t)f.width;
+        uint8_t *dst = gm_ptr(data + (size_t)y * (size_t)info.video_w * bpp);
+        for (uint32_t x = 0; x < info.video_w; ++x) {
+            const uint32_t px = src[x];
+            const uint8_t r = (uint8_t)(px >> 16), gg = (uint8_t)(px >> 8), b = (uint8_t)px;
+            if (info.video_bits == 32) {
+                dst[x * 4 + 0] = b;
+                dst[x * 4 + 1] = gg;
+                dst[x * 4 + 2] = r;
+                dst[x * 4 + 3] = 0;
+            } else if (info.video_bits == 24) {
+                dst[x * 3 + 0] = b;
+                dst[x * 3 + 1] = gg;
+                dst[x * 3 + 2] = r;
+            } else {
+                const uint16_t v = (uint16_t)(((r >> 3) << 11) | ((gg >> 2) << 5) | (b >> 3));
+                dst[x * 2 + 0] = (uint8_t)v;
+                dst[x * 2 + 1] = (uint8_t)(v >> 8);
+            }
+        }
+    }
+    ComObj *sample = com_new(K_MEDIASAMPLE);
+    if (!sample) {
+        heap_free(data);
+        return;
+    }
+    MovieSample &ms = movie_samples()[sample->id];
+    ms.data = data;
+    ms.size = bytes;
+    ms.actual = bytes;
+    ms.sync = true;
+    ms.start = (uint64_t)(f.pts * 10000000.0 + 0.5);
+    ms.end = ms.start + 333333u; // 30 fps; the renderer paints the texture, not the stamp
+    uint32_t view = com_view(sample, IF_MEDIASAMPLE);
+    if (view) {
+        uint32_t rargs[1] = {view};
+        uint32_t hr = guest_com_method(c, info.renderer_imem, 6, rargs, 1);
+        if (hr != S_OK)
+            LOGW("dshow: IMemInputPin::Receive -> %08x", hr);
+    }
+    // The renderer copied synchronously or AddRef'd the sample for its
+    // streaming thread; either way this reference goes and the data lives
+    // until the renderer's last Release.
+    com_release(sample);
+}
+
+// Queues decoded PCM on the host channel, exactly as the other file players
+// do: one host_audio_play, one conversion to a stream, then host_audio_queue.
+// This is the whole sync story for audio - it is queued one second ahead and
+// left to the OS clock; the video is paced by the same host steady_clock, and
+// there is no sample-accurate A/V lock.
+void movie_feed_audio(MoviePlay &p) {
+    if (p.audio_unavailable || !p.audio_connected || !p.media.has_audio())
+        return;
+    const int channels = p.media.audio_channels();
+    const int rate = p.media.audio_rate();
+    if (channels <= 0 || rate <= 0)
+        return;
+    const uint32_t block = (uint32_t)channels * 2;
+    const uint32_t ahead = (uint32_t)rate * block; // one second
+    while (p.audio_started ? host_audio_queued_bytes(p.channel) < ahead : true) {
+        if (p.pcm_pos == p.pcm.size()) {
+            std::vector<int16_t> more = p.media.take_audio();
+            if (more.empty())
+                return; // nothing decoded yet; a later tick brings more
+            p.pcm = std::move(more);
+            p.pcm_pos = 0;
+        }
+        uint32_t bytes = (uint32_t)((p.pcm.size() - p.pcm_pos) * 2);
+        if (!p.audio_started) {
+            p.channel = dx_alloc_audio_channel();
+            if (p.channel >= 0) {
+                HostAudioPlay play{};
+                play.channel = p.channel;
+                play.pcm = p.pcm.data() + p.pcm_pos;
+                play.bytes = bytes;
+                play.sample_rate = rate;
+                play.channels = channels;
+                play.bits = 16;
+                play.volume = p.volume;
+                play.pan = p.balance;
+                host_audio_play(&play);
+                p.audio_started = host_audio_stream(p.channel) >= 0;
+            }
+            if (!p.audio_started) {
+                LOGW("dshow: host audio streaming unavailable; playing the movie silently");
+                p.audio_unavailable = true;
+                movie_stop_audio(p, true);
+                return;
+            }
+            p.pcm_pos += bytes / 2;
+        } else {
+            const uint32_t queued = host_audio_queued_bytes(p.channel);
+            bytes = bytes < ahead - queued ? bytes : ahead - queued;
+            bytes -= bytes % block;
+            if (!bytes)
+                return;
+            int32_t taken = host_audio_queue(p.channel, p.pcm.data() + p.pcm_pos, bytes);
+            if (taken <= 0)
+                return;
+            p.pcm_pos += (size_t)taken / 2;
+        }
+    }
+}
+
+// One tick: deliver every frame whose PTS is due, keep the channel fed, and
+// post EC_COMPLETE once the file and its audio have run out.
+void movie_advance(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    if (!pp)
+        return;
+    MoviePlay &p = *pp;
+    if (p.state != State_Running || !p.opened)
+        return;
+    const double t = p.position + (now_seconds() - p.clock0);
+    if (!p.have_next && !p.media_done) {
+        if (p.media.next_video(&p.next))
+            p.have_next = true;
+        else
+            p.media_done = true;
+    }
+    while (p.have_next && p.next.pts <= t) {
+        movie_deliver_frame(c, g, p, p.next);
+        ++p.video_frames;
+        p.have_next = false;
+        if (p.media.next_video(&p.next))
+            p.have_next = true;
+        else
+            p.media_done = true;
+    }
+    if (!p.media.has_video()) {
+        p.media.fill_audio((size_t)p.media.audio_rate());
+        if (p.media.finished())
+            p.media_done = true;
+    }
+    movie_feed_audio(p);
+    if (p.media_done && !p.ended_posted && !p.have_next) {
+        const bool draining = p.audio_started && host_audio_queued_bytes(p.channel) > 0;
+        if (!draining) {
+            p.ended_posted = true;
+            LOGV("dshow: movie %08x completed after %llu frames", g->id,
+                 (unsigned long long)p.video_frames);
+            movie_post(p, EC_COMPLETE);
+        }
+    }
+}
+
+void movie_pump(X86 *c) {
+    for (auto &kv : movie_plays()) {
+        ComObj *g = com_get(kv.first);
+        if (g && g->alive)
+            movie_advance(c, g);
+    }
 }
 
 // ===========================================================================
@@ -2478,8 +2771,423 @@ const ComMethod g_graph[] = {
     {"ShouldOperationContinue", 1, GB_ShouldOperationContinue},
 };
 
+// ===========================================================================
+// The movie graph's transport interfaces. They are bound to K_FILTERGRAPH and
+// reach these bodies through the branches at the top of the shared entries
+// below; a K_GRAPH (the multimedia stream) never sees them.
+// ===========================================================================
+double movie_current_seconds(MoviePlay &p) {
+    if (!p.opened)
+        return 0;
+    if (p.state == State_Running)
+        return p.position + (now_seconds() - p.clock0);
+    return p.position;
+}
+
+void movie_seek(X86 *c, ComObj *g, double target) {
+    MoviePlay *pp = movie_play_of(g);
+    if (!pp)
+        return;
+    MoviePlay &p = *pp;
+    if (target < 0)
+        target = 0;
+    const bool was_running = p.state == State_Running;
+    movie_release_playback(p);
+    p.position = target;
+    p.state = State_Stopped;
+    if (!movie_start_playback(g, p))
+        return;
+    if (target > 0)
+        movie_skip_to(p, target);
+    if (was_running) {
+        p.clock0 = now_seconds();
+        p.state = State_Running;
+    }
+}
+
+// --- IMediaControl
+void MGC_Run(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    if (!pp) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    MoviePlay &p = *pp;
+    if (p.state == State_Running) {
+        com_ret(c, S_OK);
+        return;
+    }
+    if (p.state == State_Stopped) {
+        movie_release_playback(p);
+        if (!movie_start_playback(g, p)) {
+            com_ret(c, E_FAIL);
+            return;
+        }
+        p.position = 0;
+    }
+    movie_filters_state(c, g, 6); // IBaseFilter::Run
+    p.clock0 = now_seconds();
+    p.state = State_Running;
+    com_ret(c, S_OK);
+}
+
+void MGC_Pause(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    if (!pp) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    MoviePlay &p = *pp;
+    if (p.state != State_Running) {
+        com_ret(c, S_OK);
+        return;
+    }
+    movie_filters_state(c, g, 5); // IBaseFilter::Pause
+    p.position += now_seconds() - p.clock0;
+    p.state = State_Paused;
+    movie_stop_audio(p, false);
+    com_ret(c, S_OK);
+}
+
+void MGC_Stop(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    if (!pp) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    MoviePlay &p = *pp;
+    movie_filters_state(c, g, 4); // IBaseFilter::Stop
+    movie_release_playback(p);
+    p.state = State_Stopped;
+    p.position = 0;
+    com_ret(c, S_OK);
+}
+
+void MGC_GetState(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    uint32_t out = arg(c, 2);
+    if (!pp || !out || !gm_valid(out, 4)) {
+        com_ret(c, pp ? E_POINTER : E_FAIL);
+        return;
+    }
+    wr32(out, (uint32_t)pp->state);
+    com_ret(c, S_OK);
+}
+
+// --- IMediaEventEx
+void MGE_GetEventHandle(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    uint32_t out = arg(c, 1);
+    if (!pp || !out || !gm_valid(out, 4)) {
+        com_ret(c, pp ? E_POINTER : E_FAIL);
+        return;
+    }
+    if (!pp->event)
+        pp->event = win32_create_event(true, !pp->events.empty());
+    wr32(out, pp->event);
+    com_ret(c, S_OK);
+}
+
+void MGE_GetEvent(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    uint32_t code = arg(c, 1), p1 = arg(c, 2), p2 = arg(c, 3);
+    if (!pp) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    if (pp->events.empty()) {
+        com_ret(c, E_ABORT);
+        return;
+    }
+    uint32_t ev = pp->events.front();
+    pp->events.pop_front();
+    if (code && gm_valid(code, 4))
+        wr32(code, ev);
+    if (p1 && gm_valid(p1, 4))
+        wr32(p1, 0);
+    if (p2 && gm_valid(p2, 4))
+        wr32(p2, 0);
+    if (pp->events.empty() && pp->event)
+        win32_reset_event(pp->event);
+    com_ret(c, S_OK);
+}
+
+void MGE_WaitForCompletion(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    uint32_t out = arg(c, 2);
+    if (!pp) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    const bool done = pp->ended_posted;
+    if (out && gm_valid(out, 4))
+        wr32(out, done ? EC_COMPLETE : 0);
+    com_ret(c, done ? S_OK : E_ABORT);
+}
+
+void MGE_FreeEventParams(X86 *c, ComObj *) {
+    com_ret(c, S_OK);
+}
+
+// --- IMediaSeeking. Media time (100 ns) is the only format, as on the
+// multimedia-stream graph, so the checks mirror it.
+bool movie_is_media_time(uint32_t guid) {
+    return guid && gm_valid(guid, 16) && memcmp(gm_ptr(guid), TIME_FORMAT_MEDIA_TIME_, 16) == 0;
+}
+void MGS_GetCapabilities(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    uint32_t out = arg(c, 1);
+    if (!pp || !out || !gm_valid(out, 4)) {
+        com_ret(c, pp ? E_POINTER : E_FAIL);
+        return;
+    }
+    wr32(out, kSeekingCaps);
+    com_ret(c, S_OK);
+}
+void MGS_CheckCapabilities(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    uint32_t inout = arg(c, 1);
+    if (!pp || !inout || !gm_valid(inout, 4)) {
+        com_ret(c, pp ? E_POINTER : E_FAIL);
+        return;
+    }
+    uint32_t asked = rd32(inout);
+    wr32(inout, asked & kSeekingCaps);
+    com_ret(c, (asked & kSeekingCaps) == asked ? S_OK : S_FALSE);
+}
+void MGS_IsFormatSupported(X86 *c, ComObj *) {
+    com_ret(c, movie_is_media_time(arg(c, 1)) ? S_OK : S_FALSE);
+}
+void MGS_QueryPreferredFormat(X86 *c, ComObj *) {
+    uint32_t out = arg(c, 1);
+    if (!out || !gm_valid(out, 16)) {
+        com_ret(c, E_POINTER);
+        return;
+    }
+    memcpy(gm_ptr(out), TIME_FORMAT_MEDIA_TIME_, 16);
+    com_ret(c, S_OK);
+}
+void MGS_IsUsingTimeFormat(X86 *c, ComObj *) {
+    com_ret(c, movie_is_media_time(arg(c, 1)) ? S_OK : S_FALSE);
+}
+void MGS_SetTimeFormat(X86 *c, ComObj *) {
+    com_ret(c, movie_is_media_time(arg(c, 1)) ? S_OK : E_INVALIDARG);
+}
+void MGS_GetDuration(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    uint32_t out = arg(c, 1);
+    if (!pp || !out || !gm_valid(out, 8)) {
+        com_ret(c, pp ? E_POINTER : E_FAIL);
+        return;
+    }
+    write_u64(out, (uint64_t)(pp->media.duration() * 10000000.0));
+    com_ret(c, S_OK);
+}
+void MGS_GetCurrentPosition(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    uint32_t out = arg(c, 1);
+    if (!pp || !out || !gm_valid(out, 8)) {
+        com_ret(c, pp ? E_POINTER : E_FAIL);
+        return;
+    }
+    write_u64(out, (uint64_t)(movie_current_seconds(*pp) * 10000000.0));
+    com_ret(c, S_OK);
+}
+void MGS_ConvertTimeFormat(X86 *c, ComObj *) {
+    uint32_t out = arg(c, 1);
+    uint64_t src = (uint64_t)arg(c, 3) | ((uint64_t)arg(c, 4) << 32);
+    if (!out || !gm_valid(out, 8)) {
+        com_ret(c, E_POINTER);
+        return;
+    }
+    write_u64(out, src);
+    com_ret(c, S_OK);
+}
+void MGS_SetPositions(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    uint32_t cur = arg(c, 1), cur_flags = arg(c, 2);
+    if (!pp) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    uint32_t how = cur_flags & AM_SEEKING_PositioningBitsMask;
+    if (how == AM_SEEKING_AbsolutePositioning || how == AM_SEEKING_RelativePositioning) {
+        if (!cur || !gm_valid(cur, 8)) {
+            com_ret(c, E_POINTER);
+            return;
+        }
+        double target = (double)read_u64(cur) / 10000000.0;
+        if (how == AM_SEEKING_RelativePositioning)
+            target += movie_current_seconds(*pp);
+        movie_seek(c, g, target);
+        write_u64(cur, (uint64_t)(movie_current_seconds(*pp) * 10000000.0));
+    }
+    com_ret(c, S_OK);
+}
+void MGS_GetPositions(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    if (!pp) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    write_u64(arg(c, 1), (uint64_t)(movie_current_seconds(*pp) * 10000000.0));
+    write_u64(arg(c, 2), (uint64_t)(pp->media.duration() * 10000000.0));
+    com_ret(c, S_OK);
+}
+void MGS_GetAvailable(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    if (!pp) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    write_u64(arg(c, 1), 0);
+    write_u64(arg(c, 2), (uint64_t)(pp->media.duration() * 10000000.0));
+    com_ret(c, S_OK);
+}
+void MGS_SetRate(X86 *c, ComObj *) {
+    com_ret(c, arg_double(c, 1) == 1.0 ? S_OK : E_INVALIDARG);
+}
+void MGS_GetRate(X86 *c, ComObj *) {
+    uint32_t out = arg(c, 1);
+    if (!out || !gm_valid(out, 8)) {
+        com_ret(c, E_POINTER);
+        return;
+    }
+    write_double(out, 1.0);
+    com_ret(c, S_OK);
+}
+void MGS_GetPreroll(X86 *c, ComObj *) {
+    uint32_t out = arg(c, 1);
+    if (!out || !gm_valid(out, 8)) {
+        com_ret(c, E_POINTER);
+        return;
+    }
+    write_u64(out, 0);
+    com_ret(c, S_OK);
+}
+
+// --- IBasicAudio
+void MGA_put_Volume(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    int32_t v = (int32_t)arg(c, 1);
+    if (!pp) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    if (v > 0 || v < (int32_t)kVolumeMin) {
+        com_ret(c, E_INVALIDARG);
+        return;
+    }
+    pp->volume = v;
+    if (pp->audio_started && pp->channel >= 0)
+        host_audio_set_volume(pp->channel, v);
+    com_ret(c, S_OK);
+}
+void MGA_get_Volume(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    uint32_t out = arg(c, 1);
+    if (!pp || !out || !gm_valid(out, 4)) {
+        com_ret(c, pp ? E_POINTER : E_FAIL);
+        return;
+    }
+    wr32(out, (uint32_t)pp->volume);
+    com_ret(c, S_OK);
+}
+void MGA_put_Balance(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    int32_t v = (int32_t)arg(c, 1);
+    if (!pp) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    if (v < -10000 || v > 10000) {
+        com_ret(c, E_INVALIDARG);
+        return;
+    }
+    pp->balance = v;
+    if (pp->audio_started && pp->channel >= 0)
+        host_audio_set_pan(pp->channel, v);
+    com_ret(c, S_OK);
+}
+void MGA_get_Balance(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    uint32_t out = arg(c, 1);
+    if (!pp || !out || !gm_valid(out, 4)) {
+        com_ret(c, pp ? E_POINTER : E_FAIL);
+        return;
+    }
+    wr32(out, (uint32_t)pp->balance);
+    com_ret(c, S_OK);
+}
+
+// --- IMediaPosition
+void MGP_get_Duration(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    uint32_t out = arg(c, 1);
+    if (!pp || !out || !gm_valid(out, 8)) {
+        com_ret(c, pp ? E_POINTER : E_FAIL);
+        return;
+    }
+    write_double(out, pp->media.duration());
+    com_ret(c, S_OK);
+}
+void MGP_put_CurrentPosition(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    double secs = arg_double(c, 1);
+    if (!pp) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    movie_seek(c, g, secs);
+    com_ret(c, S_OK);
+}
+void MGP_get_CurrentPosition(X86 *c, ComObj *g) {
+    MoviePlay *pp = movie_play_of(g);
+    uint32_t out = arg(c, 1);
+    if (!pp || !out || !gm_valid(out, 8)) {
+        com_ret(c, pp ? E_POINTER : E_FAIL);
+        return;
+    }
+    write_double(out, movie_current_seconds(*pp));
+    com_ret(c, S_OK);
+}
+void MGP_put_Rate(X86 *c, ComObj *) {
+    com_ret(c, arg_double(c, 1) == 1.0 ? S_OK : E_INVALIDARG);
+}
+void MGP_get_Rate(X86 *c, ComObj *) {
+    uint32_t out = arg(c, 1);
+    if (!out || !gm_valid(out, 8)) {
+        com_ret(c, E_POINTER);
+        return;
+    }
+    write_double(out, 1.0);
+    com_ret(c, S_OK);
+}
+void MGP_CanSeek(X86 *c, ComObj *) {
+    uint32_t out = arg(c, 1);
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, E_POINTER);
+        return;
+    }
+    wr32(out, (uint32_t)OATRUE);
+    com_ret(c, S_OK);
+}
+void MGP_get_PrefetchTime(X86 *c, ComObj *) {
+    uint32_t out = arg(c, 1);
+    if (!out || !gm_valid(out, 8)) {
+        com_ret(c, E_POINTER);
+        return;
+    }
+    write_double(out, 0.0);
+    com_ret(c, S_OK);
+}
+
 // --- IMediaControl
 void MC_Run(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGC_Run(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     if (!t.s) {
         com_ret(c, E_FAIL);
@@ -2499,6 +3207,10 @@ void MC_Run(X86 *c) {
 // Pause and Stop both silence the channel and keep the position, which is
 // what a later Run continues from; DirectShow's Stop keeps it too.
 void MC_Pause(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGC_Pause(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     if (!t.s) {
         com_ret(c, E_FAIL);
@@ -2510,6 +3222,10 @@ void MC_Pause(X86 *c) {
 }
 
 void MC_Stop(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGC_Stop(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     if (!t.s) {
         com_ret(c, E_FAIL);
@@ -2522,6 +3238,10 @@ void MC_Stop(X86 *c) {
 
 // GetState(msTimeout, pfs)
 void MC_GetState(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGC_GetState(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     uint32_t out = arg(c, 2);
     if (!t.s) {
@@ -2563,6 +3283,10 @@ const ComMethod g_mediacontrol[] = {
 // --- IMediaEventEx. The completion event is a manual-reset event that stays
 // set while the queue holds anything, as the real graph's does.
 void ME_GetEventHandle(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGE_GetEventHandle(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     uint32_t out = arg(c, 1);
     if (!t.s) {
@@ -2583,6 +3307,10 @@ void ME_GetEventHandle(X86 *c) {
 // E_ABORT when there is none. The timeout is not waited: the pump that would
 // produce an event runs on the frame, not here.
 void ME_GetEvent(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGE_GetEvent(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     uint32_t code = arg(c, 1), p1 = arg(c, 2), p2 = arg(c, 3);
     if (!t.s) {
@@ -2609,6 +3337,10 @@ void ME_GetEvent(X86 *c) {
 // WaitForCompletion(msTimeout, pEvCode): answers from what has happened;
 // nothing blocks here.
 void ME_WaitForCompletion(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGE_WaitForCompletion(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     uint32_t out = arg(c, 2);
     if (!t.s) {
@@ -2623,10 +3355,21 @@ void ME_WaitForCompletion(X86 *c) {
 
 DX_STUB(ME_CancelDefaultHandling, S_OK)
 DX_STUB(ME_RestoreDefaultHandling, S_OK)
-DX_STUB(ME_FreeEventParams, S_OK)
+void ME_FreeEventParams(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGE_FreeEventParams(c, mg);
+        return;
+    }
+    com_ret(c, S_OK);
+}
 DX_STUB(ME_SetNotifyWindow, S_OK)
 
 void ME_SetNotifyFlags(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        mg->dsh_notify_flags = arg(c, 1);
+        com_ret(c, S_OK);
+        return;
+    }
     GraphThis t = graph_this(c);
     if (!t.g) {
         com_ret(c, E_FAIL);
@@ -2637,6 +3380,16 @@ void ME_SetNotifyFlags(X86 *c) {
 }
 
 void ME_GetNotifyFlags(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        uint32_t out = arg(c, 1);
+        if (!out || !gm_valid(out, 4)) {
+            com_ret(c, E_POINTER);
+            return;
+        }
+        wr32(out, mg->dsh_notify_flags);
+        com_ret(c, S_OK);
+        return;
+    }
     GraphThis t = graph_this(c);
     uint32_t out = arg(c, 1);
     if (!t.g) {
@@ -2676,6 +3429,10 @@ bool is_media_time(uint32_t guid) {
 }
 
 void SK_GetCapabilities(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGS_GetCapabilities(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     uint32_t out = arg(c, 1);
     if (!t.s || !out || !gm_valid(out, 4)) {
@@ -2687,6 +3444,10 @@ void SK_GetCapabilities(X86 *c) {
 }
 
 void SK_CheckCapabilities(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGS_CheckCapabilities(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     uint32_t inout = arg(c, 1);
     if (!t.s || !inout || !gm_valid(inout, 4)) {
@@ -2699,10 +3460,18 @@ void SK_CheckCapabilities(X86 *c) {
 }
 
 void SK_IsFormatSupported(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGS_IsFormatSupported(c, mg);
+        return;
+    }
     com_ret(c, is_media_time(arg(c, 1)) ? S_OK : S_FALSE);
 }
 
 void SK_QueryPreferredFormat(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGS_QueryPreferredFormat(c, mg);
+        return;
+    }
     uint32_t out = arg(c, 1);
     if (!out || !gm_valid(out, 16)) {
         com_ret(c, E_POINTER);
@@ -2713,14 +3482,26 @@ void SK_QueryPreferredFormat(X86 *c) {
 }
 
 void SK_IsUsingTimeFormat(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGS_IsUsingTimeFormat(c, mg);
+        return;
+    }
     com_ret(c, is_media_time(arg(c, 1)) ? S_OK : S_FALSE);
 }
 
 void SK_SetTimeFormat(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGS_SetTimeFormat(c, mg);
+        return;
+    }
     com_ret(c, is_media_time(arg(c, 1)) ? S_OK : E_INVALIDARG);
 }
 
 void SK_GetDuration(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGS_GetDuration(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     uint32_t out = arg(c, 1);
     if (!t.s || !out || !gm_valid(out, 8)) {
@@ -2736,6 +3517,10 @@ void SK_GetDuration(X86 *c) {
 }
 
 void SK_GetCurrentPosition(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGS_GetCurrentPosition(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     uint32_t out = arg(c, 1);
     if (!t.s || !out || !gm_valid(out, 8)) {
@@ -2749,6 +3534,10 @@ void SK_GetCurrentPosition(X86 *c) {
 // ConvertTimeFormat(pTarget, pTargetFormat, Source, pSourceFormat): one
 // format, so the value passes through.
 void SK_ConvertTimeFormat(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGS_ConvertTimeFormat(c, mg);
+        return;
+    }
     uint32_t out = arg(c, 1);
     uint64_t src = (uint64_t)arg(c, 3) | ((uint64_t)arg(c, 4) << 32);
     if (!out || !gm_valid(out, 8)) {
@@ -2763,6 +3552,10 @@ void SK_ConvertTimeFormat(X86 *c) {
 // position moves the decoder and a running channel with it; the stop
 // position is always the end of the file.
 void SK_SetPositions(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGS_SetPositions(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     uint32_t cur = arg(c, 1), cur_flags = arg(c, 2);
     if (!t.s) {
@@ -2793,6 +3586,10 @@ void SK_SetPositions(X86 *c) {
 }
 
 void SK_GetPositions(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGS_GetPositions(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     if (!t.s) {
         com_ret(c, E_FAIL);
@@ -2805,6 +3602,10 @@ void SK_GetPositions(X86 *c) {
 }
 
 void SK_GetAvailable(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGS_GetAvailable(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     if (!t.s) {
         com_ret(c, E_FAIL);
@@ -2817,6 +3618,10 @@ void SK_GetAvailable(X86 *c) {
 }
 
 void SK_SetRate(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGS_SetRate(c, mg);
+        return;
+    }
     double rate = arg_double(c, 1);
     if (rate != 1.0)
         log_once("dshow.rate", "dshow: a playback rate of %g is not served; the stream plays at 1",
@@ -2825,6 +3630,10 @@ void SK_SetRate(X86 *c) {
 }
 
 void SK_GetRate(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGS_GetRate(c, mg);
+        return;
+    }
     uint32_t out = arg(c, 1);
     if (!out || !gm_valid(out, 8)) {
         com_ret(c, E_POINTER);
@@ -2835,6 +3644,10 @@ void SK_GetRate(X86 *c) {
 }
 
 void SK_GetPreroll(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGS_GetPreroll(c, mg);
+        return;
+    }
     uint32_t out = arg(c, 1);
     if (!out || !gm_valid(out, 8)) {
         com_ret(c, E_POINTER);
@@ -2870,6 +3683,10 @@ const ComMethod g_mediaseeking[] = {
 // --- IBasicAudio: the level and balance, in hundredths of a decibel, the
 // same units the host channel takes.
 void BA_put_Volume(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGA_put_Volume(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     int32_t v = (int32_t)arg(c, 1);
     if (!t.s) {
@@ -2887,6 +3704,10 @@ void BA_put_Volume(X86 *c) {
 }
 
 void BA_get_Volume(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGA_get_Volume(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     uint32_t out = arg(c, 1);
     if (!t.s || !out || !gm_valid(out, 4)) {
@@ -2898,6 +3719,10 @@ void BA_get_Volume(X86 *c) {
 }
 
 void BA_put_Balance(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGA_put_Balance(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     int32_t v = (int32_t)arg(c, 1);
     if (!t.s) {
@@ -2915,6 +3740,10 @@ void BA_put_Balance(X86 *c) {
 }
 
 void BA_get_Balance(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGA_get_Balance(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     uint32_t out = arg(c, 1);
     if (!t.s || !out || !gm_valid(out, 4)) {
@@ -2945,6 +3774,10 @@ double seconds_of(Source &s, uint64_t frames) {
 }
 
 void MP_get_Duration(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGP_get_Duration(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     uint32_t out = arg(c, 1);
     if (!t.s || !out || !gm_valid(out, 8)) {
@@ -2960,6 +3793,10 @@ void MP_get_Duration(X86 *c) {
 }
 
 void MP_put_CurrentPosition(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGP_put_CurrentPosition(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     double secs = arg_double(c, 1);
     if (!t.s) {
@@ -2979,6 +3816,10 @@ void MP_put_CurrentPosition(X86 *c) {
 }
 
 void MP_get_CurrentPosition(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGP_get_CurrentPosition(c, mg);
+        return;
+    }
     GraphThis t = graph_this(c);
     uint32_t out = arg(c, 1);
     if (!t.s || !out || !gm_valid(out, 8)) {
@@ -2993,6 +3834,10 @@ DX_STUB(MP_put_StopTime, S_OK)
 DX_STUB(MP_put_PrefetchTime, S_OK)
 
 void MP_get_PrefetchTime(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGP_get_PrefetchTime(c, mg);
+        return;
+    }
     uint32_t out = arg(c, 1);
     if (!out || !gm_valid(out, 8)) {
         com_ret(c, E_POINTER);
@@ -3003,10 +3848,18 @@ void MP_get_PrefetchTime(X86 *c) {
 }
 
 void MP_put_Rate(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGP_put_Rate(c, mg);
+        return;
+    }
     com_ret(c, arg_double(c, 1) == 1.0 ? S_OK : E_INVALIDARG);
 }
 
 void MP_get_Rate(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGP_get_Rate(c, mg);
+        return;
+    }
     uint32_t out = arg(c, 1);
     if (!out || !gm_valid(out, 8)) {
         com_ret(c, E_POINTER);
@@ -3017,6 +3870,10 @@ void MP_get_Rate(X86 *c) {
 }
 
 void MP_CanSeek(X86 *c) {
+    if (ComObj *mg = movie_graph_this(c)) {
+        MGP_CanSeek(c, mg);
+        return;
+    }
     uint32_t out = arg(c, 1);
     if (!out || !gm_valid(out, 4)) {
         com_ret(c, E_POINTER);
@@ -3103,6 +3960,11 @@ void movie_filter_destroy(ComObj *f) {
 }
 
 void movie_graph_destroy(ComObj *g) {
+    auto pit = movie_plays().find(g->id);
+    if (pit != movie_plays().end()) {
+        movie_release_playback(pit->second);
+        movie_plays().erase(pit);
+    }
     auto it = movie_graphs().find(g->id);
     if (it == movie_graphs().end())
         return;
@@ -3120,9 +3982,12 @@ void movie_graph_destroy(ComObj *g) {
 
 } // namespace
 
-void dshow_frame_pump(X86 *) {
+void dshow_frame_pump(X86 *c) {
     for (auto &entry : sources())
         pump(entry.second);
+    // The movie graph's frames go to the guest renderer, not the host audio
+    // channel, so they are a separate pass under the same pump.
+    movie_pump(c);
 }
 
 void dshow_register() {
@@ -3174,6 +4039,13 @@ void dshow_register() {
     // The movie graph shares IGraphBuilder with the multimedia stream, and
     // adds the filter graph's own interfaces.
     com_bind(IF_GRAPH, K_FILTERGRAPH);
+    // The player asks the filter graph for these five; the shared vtable
+    // entries branch to the movie bodies when `this` is a K_FILTERGRAPH.
+    com_bind(IF_MEDIACONTROL, K_FILTERGRAPH);
+    com_bind(IF_MEDIAEVENT, K_FILTERGRAPH);
+    com_bind(IF_MEDIASEEKING, K_FILTERGRAPH);
+    com_bind(IF_BASICAUDIO, K_FILTERGRAPH);
+    com_bind(IF_MEDIAPOSITION, K_FILTERGRAPH);
     com_bind(IF_BASEFILTER, K_BASEFILTER);
     com_bind(IF_PIN, K_PIN);
     com_bind(IF_ENUMPINS, K_ENUMPINS);
@@ -3224,6 +4096,9 @@ void dshow_reset() {
     // The guest heap the rings and events lived in is gone with mem_init;
     // the host channels are released by the audio reset.
     sources().clear();
+    for (auto &entry : movie_plays())
+        movie_release_playback(entry.second);
+    movie_plays().clear();
     movie_pins().clear();
     movie_filters().clear();
     movie_graphs().clear();

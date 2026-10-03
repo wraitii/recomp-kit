@@ -194,18 +194,6 @@ bool Media::next_video(VideoFrame *out) {
     for (;;) {
         if (avcodec_receive_frame(s_->video, s_->frame) >= 0) {
             const AVFrame &f = *s_->frame;
-            // MS-MPEG-4 decodes to 4:2:0; Indeo 3 (logoubi, outro) decodes to
-            // 4:1:0, where both chroma planes are half the vertical and
-            // horizontal resolution, so the shift is 2 rather than 1.
-            unsigned chroma_shift;
-            if (f.format == AV_PIX_FMT_YUV420P)
-                chroma_shift = 1;
-            else if (f.format == AV_PIX_FMT_YUV410P)
-                chroma_shift = 2;
-            else {
-                av_frame_unref(s_->frame);
-                continue; // an unexpected layout is skipped, not drawn wrong
-            }
             if (f.width <= 0 || f.height <= 0) {
                 av_frame_unref(s_->frame);
                 continue;
@@ -213,13 +201,43 @@ bool Media::next_video(VideoFrame *out) {
             out->width = f.width;
             out->height = f.height;
             out->argb.assign(size_t(f.width) * size_t(f.height), 0);
-            for (int y = 0; y < f.height; ++y)
-                video_frame_convert_row(
-                    reinterpret_cast<uint8_t *>(out->argb.data() + size_t(y) * size_t(f.width)),
-                    f.data[0] + size_t(y) * f.linesize[0],
-                    f.data[1] + size_t(y >> chroma_shift) * f.linesize[1],
-                    f.data[2] + size_t(y >> chroma_shift) * f.linesize[2], uint32_t(f.width),
-                    VIDEO_XRGB8888, chroma_shift);
+            if (f.format == AV_PIX_FMT_BGR24 || f.format == AV_PIX_FMT_RGB24) {
+                // Uncompressed AVI (the test fixture) hands back the packed
+                // bytes the renderer will be given; store them as XRGB8888 so
+                // every path consumes one pixel layout.
+                const bool bgr = f.format == AV_PIX_FMT_BGR24;
+                for (int y = 0; y < f.height; ++y) {
+                    const uint8_t *src = f.data[0] + size_t(y) * f.linesize[0];
+                    uint32_t *dst = out->argb.data() + size_t(y) * size_t(f.width);
+                    for (int x = 0; x < f.width; ++x) {
+                        const uint8_t *p = src + x * 3;
+                        const uint8_t r = bgr ? p[2] : p[0];
+                        const uint8_t g = p[1];
+                        const uint8_t b = bgr ? p[0] : p[2];
+                        dst[x] = (uint32_t(r) << 16) | (uint32_t(g) << 8) | b;
+                    }
+                }
+            } else {
+                // MS-MPEG-4 decodes to 4:2:0; Indeo 3 (logoubi, outro) decodes
+                // to 4:1:0, where both chroma planes are half the vertical and
+                // horizontal resolution, so the shift is 2 rather than 1.
+                unsigned chroma_shift;
+                if (f.format == AV_PIX_FMT_YUV420P)
+                    chroma_shift = 1;
+                else if (f.format == AV_PIX_FMT_YUV410P)
+                    chroma_shift = 2;
+                else {
+                    av_frame_unref(s_->frame);
+                    continue; // an unexpected layout is skipped, not drawn wrong
+                }
+                for (int y = 0; y < f.height; ++y)
+                    video_frame_convert_row(
+                        reinterpret_cast<uint8_t *>(out->argb.data() + size_t(y) * size_t(f.width)),
+                        f.data[0] + size_t(y) * f.linesize[0],
+                        f.data[1] + size_t(y >> chroma_shift) * f.linesize[1],
+                        f.data[2] + size_t(y >> chroma_shift) * f.linesize[2], uint32_t(f.width),
+                        VIDEO_XRGB8888, chroma_shift);
+            }
             const AVRational tb = s_->input->streams[s_->video_index]->time_base;
             const int64_t pts =
                 f.best_effort_timestamp != AV_NOPTS_VALUE ? f.best_effort_timestamp : f.pts;
