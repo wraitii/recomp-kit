@@ -1899,6 +1899,18 @@ static void test_misc_shims(X86 *c) {
 // checks both, plus the thread-local stability Winsock promises.
 static void test_winsock_resolver(X86 *c) {
     section("Winsock name resolution");
+    // ws2_32 ordinal 115 is WSAStartup. A game may LoadLibrary("ws2_32.dll")
+    // and resolve it by ordinal, so the ordinal spelling must reach the same
+    // trampoline as the name, and the WSADATA must be filled.
+    uint32_t wsa_name = put_str("ws2_32.dll");
+    uint32_t wsa = call_import(c, "KERNEL32.dll", "LoadLibraryA", {wsa_name});
+    check(wsa != 0 && call_import(c, "KERNEL32.dll", "GetProcAddress", {wsa, 115}) != 0,
+          "GetProcAddress(ws2_32, ordinal 115) resolves WSAStartup");
+    uint32_t wsa_data = scratch_block(400);
+    memset(g_mem + wsa_data, 0xaa, 400);
+    check(call_import(c, "WS2_32.dll", "ord115", {0x0202, wsa_data}) == 0 &&
+              rd16(wsa_data) == 0x0202 && rd16(wsa_data + 2) == 0x0202,
+          "WSAStartup by ordinal fills WSADATA and succeeds");
     uint32_t namebuf = scratch_block(256);
     check(call_import(c, "WSOCK32.dll", "gethostname", {namebuf, 256}) == 0 &&
               gm_str(namebuf).size() > 0,
@@ -1924,6 +1936,31 @@ static void test_winsock_resolver(X86 *c) {
           "an unresolvable name returns NULL");
     check(call_import(c, "WSOCK32.dll", "WSAGetLastError", {}) == 11001,
           "WSAGetLastError reports WSAHOST_NOT_FOUND");
+    check(call_import(c, "WS2_32.dll", "ord116", {}) == 0,
+          "WSACleanup by ordinal succeeds");
+    // Offline socket calls fail the way the real stack does with no adapter:
+    // SOCKET_ERROR/INVALID_SOCKET plus a WSAGetLastError a caller can act on.
+    check(call_import(c, "WS2_32.dll", "ord23", {2, 2, 0}) == 0xffffffffu &&
+              call_import(c, "WS2_32.dll", "WSAGetLastError", {}) == 10050,
+          "socket() fails offline with INVALID_SOCKET and WSAENETDOWN");
+    check(call_import(c, "WSOCK32.dll", "connect", {0xffffffffu, 0, 16}) == 0xffffffffu &&
+              call_import(c, "WSOCK32.dll", "WSAGetLastError", {}) == 10051,
+          "connect() fails offline with SOCKET_ERROR and WSAENETUNREACH");
+    check(call_import(c, "WS2_32.dll", "gethostbyaddr", {0, 0, 0}) == 0,
+          "gethostbyaddr returns NULL offline");
+    check(call_import(c, "WSOCK32.dll", "htonl", {0x01020304u}) == 0x04030201u &&
+              call_import(c, "WSOCK32.dll", "ntohl", {0x01020304u}) == 0x04030201u &&
+              call_import(c, "WSOCK32.dll", "htons", {0x0102u}) == 0x0201u,
+          "byte-order helpers are exact");
+    check(call_import(c, "WSOCK32.dll", "inet_addr", {put_str("127.0.0.1")}) == 0x0100007fu &&
+              call_import(c, "WSOCK32.dll", "inet_addr", {put_str("not.an.ip")}) == 0xffffffffu,
+          "inet_addr parses a dotted quad and rejects anything else");
+    uint32_t fdset = scratch_block(8);
+    wr32(fdset, 1);
+    wr32(fdset + 4, 0x1234);
+    check(call_import(c, "WS2_32.dll", "__WSAFDIsSet", {0x1234, fdset}) == 1 &&
+              call_import(c, "WS2_32.dll", "__WSAFDIsSet", {0x9999, fdset}) == 0,
+          "__WSAFDIsSet reports membership");
 }
 
 // What a C++ throw looks like from the runtime: the MSVC exception record

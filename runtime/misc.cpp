@@ -1185,6 +1185,130 @@ void w_inet_ntoa(X86 *c) {
 }
 
 // -------------------------------------------------------------------------
+// Winsock with no host network. Black & White does not need the internet, so
+// every call that would open or use a socket fails the way the real stack
+// fails with no network adapter, and name lookups behave as an offline
+// machine: gethostname reports the local name, localhost resolves, every other
+// name is WSAHOST_NOT_FOUND. The byte-order and address-parsing calls need no
+// network and are the real thing. This layer is a deferred fidelity gap for
+// the networking task, not a silent stub; each distinct failing call is logged
+// once. A call whose offline behavior cannot be justified stays a loud abort
+// (see the WSA* event/overlapped entries that map to imports_unsupported).
+// -------------------------------------------------------------------------
+static constexpr int WSAENETDOWN_ = 10050;
+static constexpr int WSAENETUNREACH_ = 10051;
+static constexpr int WSAENOTSOCK_ = 10038;
+
+// SOCKET_ERROR and INVALID_SOCKET are both all-ones, and the byte-count and
+// WSAOVERLAPPED* out-parameters are left untouched: a failing call has no
+// result to report.
+static void wsa_call_failed(X86 *c, const char *fn, int error) {
+    log_once(fn, "WS2_32/WSOCK32!%s: no network host; SOCKET_ERROR, WSAGetLastError=%d", fn,
+             error);
+    g_wsa_last_error = error;
+    set_eax(c, (uint32_t)-1);
+}
+void w_socket(X86 *c) { wsa_call_failed(c, "socket", WSAENETDOWN_); }
+void w_bind(X86 *c) { wsa_call_failed(c, "bind", WSAENETDOWN_); }
+void w_connect(X86 *c) { wsa_call_failed(c, "connect", WSAENETUNREACH_); }
+void w_listen(X86 *c) { wsa_call_failed(c, "listen", WSAENETDOWN_); }
+void w_accept(X86 *c) { wsa_call_failed(c, "accept", WSAENETDOWN_); }
+void w_send(X86 *c) { wsa_call_failed(c, "send", WSAENETDOWN_); }
+void w_recv(X86 *c) { wsa_call_failed(c, "recv", WSAENETDOWN_); }
+void w_sendto(X86 *c) { wsa_call_failed(c, "sendto", WSAENETDOWN_); }
+void w_recvfrom(X86 *c) { wsa_call_failed(c, "recvfrom", WSAENETDOWN_); }
+void w_select(X86 *c) { wsa_call_failed(c, "select", WSAENETDOWN_); }
+void w_shutdown(X86 *c) { wsa_call_failed(c, "shutdown", WSAENETDOWN_); }
+void w_closesocket(X86 *c) { wsa_call_failed(c, "closesocket", WSAENOTSOCK_); }
+void w_ioctlsocket(X86 *c) { wsa_call_failed(c, "ioctlsocket", WSAENOTSOCK_); }
+void w_getsockopt(X86 *c) { wsa_call_failed(c, "getsockopt", WSAENOTSOCK_); }
+void w_setsockopt(X86 *c) { wsa_call_failed(c, "setsockopt", WSAENOTSOCK_); }
+void w_getpeername(X86 *c) { wsa_call_failed(c, "getpeername", WSAENOTSOCK_); }
+void w_getsockname(X86 *c) { wsa_call_failed(c, "getsockname", WSAENOTSOCK_); }
+void w_WSAIoctl(X86 *c) { wsa_call_failed(c, "WSAIoctl", WSAENETDOWN_); }
+void w_WSARecv(X86 *c) { wsa_call_failed(c, "WSARecv", WSAENETDOWN_); }
+void w_WSARecvFrom(X86 *c) { wsa_call_failed(c, "WSARecvFrom", WSAENETDOWN_); }
+
+// Event and overlapped results are not sockets: WSACreateEvent returns
+// WSA_INVALID_EVENT and the rest report FALSE or WSA_WAIT_FAILED.
+void w_WSACreateEvent(X86 *c) {
+    log_once("WSACreateEvent",
+             "WS2_32!WSACreateEvent: no network host; WSA_INVALID_EVENT, WSAGetLastError=%d",
+             WSAENETDOWN_);
+    g_wsa_last_error = WSAENETDOWN_;
+    set_eax(c, 0);
+}
+void w_WSACloseEvent(X86 *c) {
+    log_once("WSACloseEvent", "WS2_32!WSACloseEvent: no network host; FALSE");
+    g_wsa_last_error = WSAENETDOWN_;
+    set_eax(c, 0);
+}
+void w_WSASetEvent(X86 *c) {
+    g_wsa_last_error = WSAENETDOWN_;
+    set_eax(c, 0);
+}
+void w_WSAResetEvent(X86 *c) {
+    g_wsa_last_error = WSAENETDOWN_;
+    set_eax(c, 0);
+}
+void w_WSAWaitForMultipleEvents(X86 *c) {
+    log_once("WSAWaitForMultipleEvents",
+             "WS2_32!WSAWaitForMultipleEvents: no network host; WSA_WAIT_FAILED");
+    g_wsa_last_error = WSAENETDOWN_;
+    set_eax(c, 0xffffffffu); // WSA_WAIT_FAILED
+}
+void w_WSAGetOverlappedResult(X86 *c) {
+    g_wsa_last_error = WSAENETDOWN_;
+    set_eax(c, 0);
+}
+
+void w_gethostbyaddr(X86 *c) {
+    log_once("WS2_32!gethostbyaddr",
+             "WS2_32!gethostbyaddr: no network host; NULL, WSAGetLastError=%d",
+             WSAHOST_NOT_FOUND_);
+    g_wsa_last_error = WSAHOST_NOT_FOUND_;
+    set_eax(c, 0);
+}
+
+// Pure byte-order and address utilities: no network is involved.
+void w_htonl(X86 *c) { set_eax(c, __builtin_bswap32(arg(c, 0))); }
+void w_ntohl(X86 *c) { set_eax(c, __builtin_bswap32(arg(c, 0))); }
+void w_htons(X86 *c) { set_eax(c, (uint32_t)(uint16_t)__builtin_bswap16((uint16_t)arg(c, 0))); }
+void w_ntohs(X86 *c) { set_eax(c, (uint32_t)(uint16_t)__builtin_bswap16((uint16_t)arg(c, 0))); }
+void w_inet_addr(X86 *c) {
+    std::string text = gm_str(arg(c, 0), 64);
+    unsigned a = 0, b = 0, cc = 0, d = 0;
+    char extra = 0;
+    if (sscanf(text.c_str(), "%u.%u.%u.%u%c", &a, &b, &cc, &d, &extra) == 4 && a < 256 &&
+        b < 256 && cc < 256 && d < 256) {
+        set_eax(c, a | (b << 8) | (cc << 16) | (d << 24));
+    } else {
+        set_eax(c, 0xffffffffu); // INADDR_NONE
+    }
+}
+// __WSAFDIsSet(s, fd_set*): nonzero when s is in the set. fd_set is a count
+// followed by that many SOCKETs; FD_SETSIZE is 64.
+void w_wsa_fd_is_set(X86 *c) {
+    uint32_t s = arg(c, 0), set = arg(c, 1);
+    if (!set || !gm_valid(set, 4)) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t count = rd32(set);
+    if (count > 64)
+        count = 64;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!gm_valid(set + 4 + i * 4, 4))
+            break;
+        if (rd32(set + 4 + i * 4) == s) {
+            set_eax(c, 1);
+            return;
+        }
+    }
+    set_eax(c, 0);
+}
+
+// -------------------------------------------------------------------------
 // WINMM: clock, multimedia timers and mmio.
 // -------------------------------------------------------------------------
 struct MmTimer {
@@ -2178,6 +2302,56 @@ const ImportShim g_misc_shims[] = {
     {"WSOCK32.dll", "ord111", 0, w_WSAGetLastError},
     {"WSOCK32.dll", "WSASetLastError", 1, w_WSASetLastError},
     {"WSOCK32.dll", "ord112", 1, w_WSASetLastError},
+    // The rest of the Winsock 1.1 surface follows the same offline rules as
+    // WS2_32 above (same ordinals, same handlers).
+    {"WSOCK32.dll", "gethostbyaddr", 3, w_gethostbyaddr},
+    {"WSOCK32.dll", "ord51", 3, w_gethostbyaddr},
+    {"WSOCK32.dll", "htonl", 1, w_htonl},
+    {"WSOCK32.dll", "ord8", 1, w_htonl},
+    {"WSOCK32.dll", "htons", 1, w_htons},
+    {"WSOCK32.dll", "ord9", 1, w_htons},
+    {"WSOCK32.dll", "inet_addr", 1, w_inet_addr},
+    {"WSOCK32.dll", "ord10", 1, w_inet_addr},
+    {"WSOCK32.dll", "ntohl", 1, w_ntohl},
+    {"WSOCK32.dll", "ord14", 1, w_ntohl},
+    {"WSOCK32.dll", "ntohs", 1, w_ntohs},
+    {"WSOCK32.dll", "ord15", 1, w_ntohs},
+    {"WSOCK32.dll", "socket", 3, w_socket},
+    {"WSOCK32.dll", "ord23", 3, w_socket},
+    {"WSOCK32.dll", "bind", 3, w_bind},
+    {"WSOCK32.dll", "ord2", 3, w_bind},
+    {"WSOCK32.dll", "connect", 3, w_connect},
+    {"WSOCK32.dll", "ord4", 3, w_connect},
+    {"WSOCK32.dll", "listen", 2, w_listen},
+    {"WSOCK32.dll", "ord13", 2, w_listen},
+    {"WSOCK32.dll", "accept", 3, w_accept},
+    {"WSOCK32.dll", "ord1", 3, w_accept},
+    {"WSOCK32.dll", "send", 4, w_send},
+    {"WSOCK32.dll", "ord19", 4, w_send},
+    {"WSOCK32.dll", "recv", 4, w_recv},
+    {"WSOCK32.dll", "ord16", 4, w_recv},
+    {"WSOCK32.dll", "sendto", 6, w_sendto},
+    {"WSOCK32.dll", "ord20", 6, w_sendto},
+    {"WSOCK32.dll", "recvfrom", 6, w_recvfrom},
+    {"WSOCK32.dll", "ord17", 6, w_recvfrom},
+    {"WSOCK32.dll", "select", 5, w_select},
+    {"WSOCK32.dll", "ord18", 5, w_select},
+    {"WSOCK32.dll", "shutdown", 2, w_shutdown},
+    {"WSOCK32.dll", "ord22", 2, w_shutdown},
+    {"WSOCK32.dll", "closesocket", 1, w_closesocket},
+    {"WSOCK32.dll", "ord3", 1, w_closesocket},
+    {"WSOCK32.dll", "ioctlsocket", 3, w_ioctlsocket},
+    {"WSOCK32.dll", "ord12", 3, w_ioctlsocket},
+    {"WSOCK32.dll", "getsockopt", 5, w_getsockopt},
+    {"WSOCK32.dll", "ord7", 5, w_getsockopt},
+    {"WSOCK32.dll", "setsockopt", 5, w_setsockopt},
+    {"WSOCK32.dll", "ord21", 5, w_setsockopt},
+    {"WSOCK32.dll", "getpeername", 3, w_getpeername},
+    {"WSOCK32.dll", "ord5", 3, w_getpeername},
+    {"WSOCK32.dll", "getsockname", 3, w_getsockname},
+    {"WSOCK32.dll", "ord6", 3, w_getsockname},
+    {"WSOCK32.dll", "__WSAFDIsSet", 2, w_wsa_fd_is_set},
+    {"WSOCK32.dll", "ord151", 2, w_wsa_fd_is_set},
     // WINMM: implemented
     {"WINMM.dll", "timeGetTime", 0, m_timeGetTime},
     {"WINMM.dll", "timeGetDevCaps", 2, m_timeGetDevCaps},
@@ -2278,38 +2452,84 @@ const ImportShim g_misc_shims[] = {
     {"WINMM.dll", "waveInStop", 1, nullptr},
     {"WINMM.dll", "waveInReset", 1, nullptr},
     {"WINMM.dll", "waveInGetPosition", 3, nullptr},
-    // Winsock 2: networking is out of scope, but the pop counts are not.
-    {"WS2_32.dll", "WSAStartup", 2, nullptr},
-    {"WS2_32.dll", "WSACleanup", 0, nullptr},
-    {"WS2_32.dll", "WSAGetLastError", 0, nullptr},
-    {"WS2_32.dll", "WSAIoctl", 9, nullptr},
-    {"WS2_32.dll", "WSACreateEvent", 0, nullptr},
-    {"WS2_32.dll", "WSACloseEvent", 1, nullptr},
-    {"WS2_32.dll", "WSASetEvent", 1, nullptr},
-    {"WS2_32.dll", "WSAResetEvent", 1, nullptr},
-    {"WS2_32.dll", "WSAWaitForMultipleEvents", 5, nullptr},
-    {"WS2_32.dll", "WSARecv", 7, nullptr},
-    {"WS2_32.dll", "WSARecvFrom", 9, nullptr},
-    {"WS2_32.dll", "WSAGetOverlappedResult", 5, nullptr},
-    {"WS2_32.dll", "socket", 3, nullptr},
-    {"WS2_32.dll", "bind", 3, nullptr},
-    {"WS2_32.dll", "connect", 3, nullptr},
-    {"WS2_32.dll", "listen", 2, nullptr},
-    {"WS2_32.dll", "accept", 3, nullptr},
-    {"WS2_32.dll", "send", 4, nullptr},
-    {"WS2_32.dll", "recv", 4, nullptr},
-    {"WS2_32.dll", "sendto", 6, nullptr},
-    {"WS2_32.dll", "recvfrom", 6, nullptr},
-    {"WS2_32.dll", "select", 5, nullptr},
-    {"WS2_32.dll", "shutdown", 2, nullptr},
-    {"WS2_32.dll", "closesocket", 1, nullptr},
-    {"WS2_32.dll", "ioctlsocket", 3, nullptr},
-    {"WS2_32.dll", "getsockopt", 5, nullptr},
-    {"WS2_32.dll", "setsockopt", 5, nullptr},
-    {"WS2_32.dll", "getpeername", 3, nullptr},
-    {"WS2_32.dll", "getsockname", 3, nullptr},
-    {"WS2_32.dll", "gethostbyname", 1, nullptr},
-    {"WS2_32.dll", "gethostname", 2, nullptr},
+    // Winsock 2, offline. LHMultiplayerR delay-loads this DLL by ordinal, so
+    // its ImgDelayDescr names ordinals rather than names; the table below
+    // covers exactly that ordinal set (plus the byte-order twins). WSAStartup
+    // and WSACleanup share the WSOCK32 implementation. Every call that would
+    // open or use a socket returns the real offline failure; name lookups
+    // resolve localhost only; the byte-order and address utilities are exact.
+    // See the offline-Winsock block above; networking is a deferred gap.
+    {"WS2_32.dll", "WSAStartup", 2, w_WSAStartup},
+    {"WS2_32.dll", "ord115", 2, w_WSAStartup},
+    {"WS2_32.dll", "WSACleanup", 0, w_WSACleanup},
+    {"WS2_32.dll", "ord116", 0, w_WSACleanup},
+    {"WS2_32.dll", "WSAGetLastError", 0, w_WSAGetLastError},
+    {"WS2_32.dll", "ord111", 0, w_WSAGetLastError},
+    {"WS2_32.dll", "WSASetLastError", 1, w_WSASetLastError},
+    {"WS2_32.dll", "ord112", 1, w_WSASetLastError},
+    {"WS2_32.dll", "accept", 3, w_accept},
+    {"WS2_32.dll", "ord1", 3, w_accept},
+    {"WS2_32.dll", "bind", 3, w_bind},
+    {"WS2_32.dll", "ord2", 3, w_bind},
+    {"WS2_32.dll", "closesocket", 1, w_closesocket},
+    {"WS2_32.dll", "ord3", 1, w_closesocket},
+    {"WS2_32.dll", "connect", 3, w_connect},
+    {"WS2_32.dll", "ord4", 3, w_connect},
+    {"WS2_32.dll", "getpeername", 3, w_getpeername},
+    {"WS2_32.dll", "ord5", 3, w_getpeername},
+    {"WS2_32.dll", "getsockname", 3, w_getsockname},
+    {"WS2_32.dll", "ord6", 3, w_getsockname},
+    {"WS2_32.dll", "getsockopt", 5, w_getsockopt},
+    {"WS2_32.dll", "ord7", 5, w_getsockopt},
+    {"WS2_32.dll", "htonl", 1, w_htonl},
+    {"WS2_32.dll", "ord8", 1, w_htonl},
+    {"WS2_32.dll", "htons", 1, w_htons},
+    {"WS2_32.dll", "ord9", 1, w_htons},
+    {"WS2_32.dll", "inet_addr", 1, w_inet_addr},
+    {"WS2_32.dll", "ord10", 1, w_inet_addr},
+    {"WS2_32.dll", "inet_ntoa", 1, w_inet_ntoa},
+    {"WS2_32.dll", "ord11", 1, w_inet_ntoa},
+    {"WS2_32.dll", "ioctlsocket", 3, w_ioctlsocket},
+    {"WS2_32.dll", "ord12", 3, w_ioctlsocket},
+    {"WS2_32.dll", "listen", 2, w_listen},
+    {"WS2_32.dll", "ord13", 2, w_listen},
+    {"WS2_32.dll", "ntohl", 1, w_ntohl},
+    {"WS2_32.dll", "ord14", 1, w_ntohl},
+    {"WS2_32.dll", "ntohs", 1, w_ntohs},
+    {"WS2_32.dll", "ord15", 1, w_ntohs},
+    {"WS2_32.dll", "recv", 4, w_recv},
+    {"WS2_32.dll", "ord16", 4, w_recv},
+    {"WS2_32.dll", "recvfrom", 6, w_recvfrom},
+    {"WS2_32.dll", "ord17", 6, w_recvfrom},
+    {"WS2_32.dll", "select", 5, w_select},
+    {"WS2_32.dll", "ord18", 5, w_select},
+    {"WS2_32.dll", "send", 4, w_send},
+    {"WS2_32.dll", "ord19", 4, w_send},
+    {"WS2_32.dll", "sendto", 6, w_sendto},
+    {"WS2_32.dll", "ord20", 6, w_sendto},
+    {"WS2_32.dll", "setsockopt", 5, w_setsockopt},
+    {"WS2_32.dll", "ord21", 5, w_setsockopt},
+    {"WS2_32.dll", "shutdown", 2, w_shutdown},
+    {"WS2_32.dll", "ord22", 2, w_shutdown},
+    {"WS2_32.dll", "socket", 3, w_socket},
+    {"WS2_32.dll", "ord23", 3, w_socket},
+    {"WS2_32.dll", "gethostbyaddr", 3, w_gethostbyaddr},
+    {"WS2_32.dll", "ord51", 3, w_gethostbyaddr},
+    {"WS2_32.dll", "gethostbyname", 1, w_gethostbyname},
+    {"WS2_32.dll", "ord52", 1, w_gethostbyname},
+    {"WS2_32.dll", "gethostname", 2, w_gethostname},
+    {"WS2_32.dll", "ord57", 2, w_gethostname},
+    {"WS2_32.dll", "__WSAFDIsSet", 2, w_wsa_fd_is_set},
+    {"WS2_32.dll", "ord151", 2, w_wsa_fd_is_set},
+    {"WS2_32.dll", "WSAIoctl", 9, w_WSAIoctl},
+    {"WS2_32.dll", "WSACreateEvent", 0, w_WSACreateEvent},
+    {"WS2_32.dll", "WSACloseEvent", 1, w_WSACloseEvent},
+    {"WS2_32.dll", "WSASetEvent", 1, w_WSASetEvent},
+    {"WS2_32.dll", "WSAResetEvent", 1, w_WSAResetEvent},
+    {"WS2_32.dll", "WSAWaitForMultipleEvents", 5, w_WSAWaitForMultipleEvents},
+    {"WS2_32.dll", "WSARecv", 7, w_WSARecv},
+    {"WS2_32.dll", "WSARecvFrom", 9, w_WSARecvFrom},
+    {"WS2_32.dll", "WSAGetOverlappedResult", 5, w_WSAGetOverlappedResult},
     {"NETAPI32.dll", "Netbios", 1, nullptr},
     {"DDRAW.dll", "DirectDrawCreate", 3, nullptr},
     {"DDRAW.dll", "DirectDrawEnumerateA", 2, nullptr},

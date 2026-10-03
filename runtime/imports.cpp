@@ -238,6 +238,16 @@ uint32_t imports_resolve(const char *dll, const char *name) {
     if (a)
         return a;
     auto ri = registry().find(key_of(dll, name));
+    // GetProcAddress spells an ordinal "#N" while IAT imports and the shim
+    // tables register it as "ordN". They name the same export, so resolve both
+    // spellings to the one registration; otherwise a game that resolves an
+    // ordinal at run time (LHMultiplayerR asks ws2_32 for #115) misses a shim
+    // its IAT import would have found.
+    std::string ordinal;
+    if (ri == registry().end() && name && name[0] == '#') {
+        ordinal = "ord" + std::string(name + 1);
+        ri = registry().find(key_of(dll, ordinal.c_str()));
+    }
     if (ri == registry().end())
         return 0;
     return imports_alloc_trampoline(ri->second.dll, ri->second.name, ri->second.fn,
