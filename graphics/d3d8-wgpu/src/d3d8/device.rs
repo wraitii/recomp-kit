@@ -987,13 +987,25 @@ impl Device {
         if enable && self.state.alpha_blend_enable() && self.state.dest_blend() == D3DBLEND::One {
             color = [0.0, 0.0, 0.0, 1.0];
         }
+        // D3D8: a non-NONE FOGTABLEMODE selects per-pixel table fog; otherwise
+        // FOGVERTEXMODE selects per-vertex fog, the only kind range-based
+        // distance applies to (`validate_*` refuses range with table fog).
+        let table = self.state.fog_table_mode();
+        let vertex_fog = table == 0;
         FogUniform::new(
             enable,
-            self.state.fog_table_mode(),
+            if vertex_fog {
+                self.state.fog_vertex_mode()
+            } else {
+                table
+            },
+            vertex_fog,
+            vertex_fog && self.state.range_fog_enable(),
             self.state.fog_start(),
             self.state.fog_end(),
             self.state.fog_density(),
             color,
+            self.state.world.mul(self.state.view),
         )
     }
 

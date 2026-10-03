@@ -862,14 +862,12 @@ impl DeviceState {
             return Err(unsupported("D3DRS_ZENABLE must not be D3DZB_USEW"));
         }
         if s.fog_enable {
-            if s.range_fog_enable {
+            // Range-based distance applies to vertex fog. With table fog
+            // active (FOGTABLEMODE != NONE) it is hardware-dependent, so
+            // keep that combination a named failure.
+            if s.range_fog_enable && s.fog_table_mode != 0 {
                 return Err(unsupported(
-                    "D3DRS_RANGEFOGENABLE must be FALSE (range-based fog distance is not implemented)",
-                ));
-            }
-            if D3DFOGMODE::from_raw(s.fog_vertex_mode)? != D3DFOGMODE::None {
-                return Err(unsupported(
-                    "D3DRS_FOGVERTEXMODE must be D3DFOG_NONE (vertex fog is not implemented)",
+                    "D3DRS_RANGEFOGENABLE must be FALSE with table fog (range-based table fog is not implemented)",
                 ));
             }
             // Pixel/table fog is applied by the shader. D3D8 adjusts the fog
@@ -1087,18 +1085,12 @@ mod tests {
 
         assert!(cause_after(|s| s.set_render_state(137, 1).unwrap()).contains("LIGHTING"));
         // CULLMODE and ALPHABLENDENABLE are honoured by the draw pipeline.
-        // Table fog is honoured too; vertex fog and range fog stay named
-        // failures.
+        // Table and vertex fog are honoured; range fog is honoured for vertex
+        // fog only and stays a named failure with table fog.
         assert!(
             cause_after(|s| {
                 s.set_render_state(28, 1).unwrap(); // FOGENABLE
-                s.set_render_state(140, D3DFOGMODE::Exp.raw()).unwrap(); // FOGVERTEXMODE
-            })
-            .contains("FOGVERTEXMODE")
-        );
-        assert!(
-            cause_after(|s| {
-                s.set_render_state(28, 1).unwrap(); // FOGENABLE
+                s.set_render_state(35, D3DFOGMODE::Exp.raw()).unwrap(); // FOGTABLEMODE
                 s.set_render_state(48, 1).unwrap(); // RANGEFOGENABLE
             })
             .contains("RANGEFOGENABLE")

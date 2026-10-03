@@ -224,8 +224,8 @@ struct TransformUniform {
 struct FogUniform {
     enabled: u32,
     mode: u32,
-    pad0: u32,
-    pad1: u32,
+    vertex_fog: u32,
+    range_fog: u32,
     start: f32,
     end: f32,
     density: f32,
@@ -234,6 +234,7 @@ struct FogUniform {
     color_b: f32,
     color_a: f32,
     pad2: f32,
+    world_view: mat4x4<f32>,
 };
 
 struct AlphaTestUniform {
@@ -259,6 +260,7 @@ struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) fogdist: f32,
+    @location(2) fogfactor: f32,
 };
 
 // D3D8 table/pixel fog uses the eye-space depth. A standard D3D perspective
@@ -270,7 +272,15 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     // Column vector * transposed CPU matrix equals the row-vector CPU product.
     out.position = transform.matrix * vec4<f32>(in.position, 1.0);
-    out.fogdist = abs(out.position.w);
+    // Eye distance: the view-space z (clip w), or with D3DRS_RANGEFOGENABLE the
+    // true Euclidean distance to the eye. Vertex fog evaluates the factor here
+    // and the rasterizer interpolates it; table fog evaluates per pixel.
+    var fog_d = abs(out.position.w);
+    if (fog.range_fog != 0u) {
+        fog_d = length((fog.world_view * vec4<f32>(in.position, 1.0)).xyz);
+    }
+    out.fogdist = fog_d;
+    out.fogfactor = select(1.0, fog_factor(fog_d), fog.vertex_fog != 0u);
 
     // D3DCOLOR is ARGB; decode to normalized RGBA.
     let a = f32((in.color >> 24u) & 0xffu) / 255.0;
@@ -294,11 +304,15 @@ fn fog_factor(d: f32) -> f32 {
     return clamp(f, 0.0, 1.0);
 }
 
-fn apply_fog(rgb: vec3<f32>, d: f32) -> vec3<f32> {
+fn apply_fog(rgb: vec3<f32>, d: f32, vertex_factor: f32) -> vec3<f32> {
     if (fog.enabled == 0u) {
         return rgb;
     }
-    return mix(vec3<f32>(fog.color_r, fog.color_g, fog.color_b), rgb, fog_factor(d));
+    var f = vertex_factor;
+    if (fog.vertex_fog == 0u) {
+        f = fog_factor(d);
+    }
+    return mix(vec3<f32>(fog.color_r, fog.color_g, fog.color_b), rgb, f);
 }
 
 // D3D8 alpha test after stage blending and before fog/alpha blend. Returns
@@ -326,7 +340,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (!alpha_test_pass(in.color.a)) {
         discard;
     }
-    return vec4<f32>(apply_fog(in.color.rgb, in.fogdist), in.color.a);
+    return vec4<f32>(apply_fog(in.color.rgb, in.fogdist, in.fogfactor), in.color.a);
 }
 "#;
 
@@ -458,8 +472,13 @@ pub struct FogUniform {
     pub enable: u32,
     /// Raw `D3DFOGMODE`: 0 NONE, 1 EXP, 2 EXP2, 3 LINEAR.
     pub mode: u32,
-    pub pad0: u32,
-    pub pad1: u32,
+    /// Nonzero for per-vertex fog (`D3DRS_FOGVERTEXMODE`, used when
+    /// `D3DRS_FOGTABLEMODE` is NONE): the factor is computed per vertex and
+    /// interpolated. Zero is per-pixel table fog.
+    pub vertex_fog: u32,
+    /// Nonzero for `D3DRS_RANGEFOGENABLE`: fog distance is the Euclidean eye
+    /// distance instead of the view-space depth.
+    pub range_fog: u32,
     pub start: f32,
     pub end: f32,
     pub density: f32,
@@ -468,6 +487,8 @@ pub struct FogUniform {
     pub color_b: f32,
     pub color_a: f32,
     pub pad2: f32,
+    /// `world * view` with CPU rows stored as WGSL columns, for range fog.
+    pub world_view: [[f32; 4]; 4],
 }
 
 impl FogUniform {
@@ -477,16 +498,19 @@ impl FogUniform {
     pub fn new(
         enable: bool,
         mode: u32,
+        vertex_fog: bool,
+        range_fog: bool,
         start: u32,
         end: u32,
         density: u32,
         color: [f32; 4],
+        world_view: Mat4,
     ) -> Self {
         Self {
             enable: u32::from(enable),
             mode,
-            pad0: 0,
-            pad1: 0,
+            vertex_fog: u32::from(vertex_fog),
+            range_fog: u32::from(range_fog),
             start: f32::from_bits(start),
             end: f32::from_bits(end),
             density: f32::from_bits(density),
@@ -495,6 +519,7 @@ impl FogUniform {
             color_b: color[2],
             color_a: color[3],
             pad2: 0.0,
+            world_view: world_view.rows,
         }
     }
 }
@@ -585,8 +610,8 @@ struct StagesUniform {
 struct FogUniform {
     enabled: u32,
     mode: u32,
-    pad0: u32,
-    pad1: u32,
+    vertex_fog: u32,
+    range_fog: u32,
     start: f32,
     end: f32,
     density: f32,
@@ -595,6 +620,7 @@ struct FogUniform {
     color_b: f32,
     color_a: f32,
     pad2: f32,
+    world_view: mat4x4<f32>,
 };
 
 struct AlphaTestUniform {
@@ -634,13 +660,22 @@ struct VertexOutput {
     @location(1) uv0: vec2<f32>,
     @location(2) uv1: vec2<f32>,
     @location(3) fogdist: f32,
+    @location(4) fogfactor: f32,
 };
 
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     out.position = transform.matrix * vec4<f32>(in.position, 1.0);
-    out.fogdist = abs(out.position.w);
+    // Eye distance: the view-space z (clip w), or with D3DRS_RANGEFOGENABLE the
+    // true Euclidean distance to the eye. Vertex fog evaluates the factor here
+    // and the rasterizer interpolates it; table fog evaluates per pixel.
+    var fog_d = abs(out.position.w);
+    if (fog.range_fog != 0u) {
+        fog_d = length((fog.world_view * vec4<f32>(in.position, 1.0)).xyz);
+    }
+    out.fogdist = fog_d;
+    out.fogfactor = select(1.0, fog_factor(fog_d), fog.vertex_fog != 0u);
     let a = f32((in.color >> 24u) & 0xffu) / 255.0;
     let r = f32((in.color >> 16u) & 0xffu) / 255.0;
     let g = f32((in.color >> 8u) & 0xffu) / 255.0;
@@ -803,11 +838,15 @@ fn fog_factor(d: f32) -> f32 {
     return clamp(f, 0.0, 1.0);
 }
 
-fn apply_fog(rgb: vec3<f32>, d: f32) -> vec3<f32> {
+fn apply_fog(rgb: vec3<f32>, d: f32, vertex_factor: f32) -> vec3<f32> {
     if (fog.enabled == 0u) {
         return rgb;
     }
-    return mix(vec3<f32>(fog.color_r, fog.color_g, fog.color_b), rgb, fog_factor(d));
+    var f = vertex_factor;
+    if (fog.vertex_fog == 0u) {
+        f = fog_factor(d);
+    }
+    return mix(vec3<f32>(fog.color_r, fog.color_g, fog.color_b), rgb, f);
 }
 
 // D3D8 alpha test after stage blending and before fog/alpha blend. Returns
@@ -838,7 +877,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (!alpha_test_pass(r1.a)) {
         discard;
     }
-    return vec4<f32>(apply_fog(r1.rgb, in.fogdist), r1.a);
+    return vec4<f32>(apply_fog(r1.rgb, in.fogdist, in.fogfactor), r1.a);
 }
 "#;
 
@@ -1111,18 +1150,22 @@ mod tests {
         let u = FogUniform::new(
             true,
             3,
+            true,
+            true,
             190.0f32.to_bits(),
             240.0f32.to_bits(),
             1.0f32.to_bits(),
             [0.7, 0.7, 0.7, 1.0],
+            Mat4::IDENTITY,
         );
         assert_eq!(u.enable, 1);
+        assert_eq!((u.vertex_fog, u.range_fog), (1, 1));
         assert_eq!(u.mode, 3);
         assert_eq!(u.start, 190.0);
         assert_eq!(u.end, 240.0);
         assert_eq!(u.density, 1.0);
         assert_eq!(u.color_r, 0.7);
-        assert_eq!(bytemuck::bytes_of(&u).len(), 48);
+        assert_eq!(bytemuck::bytes_of(&u).len(), 112);
     }
 
     #[test]
