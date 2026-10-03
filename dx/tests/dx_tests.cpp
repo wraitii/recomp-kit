@@ -5961,6 +5961,21 @@ static void test_unchanged_state_produces_no_buffered_event() {
     wr32(prop + 12, 0);
     wr32(prop + 16, 32);
     CHECK_EQ(call_method(kb, DID_SetProperty, {1 /* DIPROP_BUFFERSIZE */, prop}), DI_OK);
+    {
+        // DIPROP_KEYNAME (20), as the game's key-table loop at 0x0052d87b asks:
+        // a DIPROPSTRING (0x218 bytes) addressed by offset (DIPH_BYOFFSET).
+        uint32_t ks = sc(0x2000);
+        gm_zero(ks, 0x220);
+        wr32(ks + 0, 0x218);
+        wr32(ks + 4, 16);
+        wr32(ks + 8, 0x1d); // DIK_LCONTROL
+        wr32(ks + 12, 1);
+        CHECK_EQ(call_method(kb, 5 /* GetProperty */, {20, ks}), DI_OK);
+        CHECK_EQ(rd16(ks + 16), uint32_t('C'));
+        CHECK_EQ(rd16(ks + 18), uint32_t('t'));
+        wr32(ks + 8, 0x56); // not a key the table names
+        CHECK_EQ(call_method(kb, 5, {20, ks}), 0x80070490u);
+    }
     CHECK_EQ(call_method(kb, DID_Acquire, {}), DI_OK);
 
     const uint32_t kDikF10 = 0x44;
