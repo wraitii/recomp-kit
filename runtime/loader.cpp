@@ -326,7 +326,11 @@ struct AuxPending {
     uint32_t index; // position in g_aux, which is this vector's position
 };
 std::vector<AuxPending> g_aux_pending;
-std::vector<uint32_t> g_aux_order; // g_aux indices in DllMain dependency order
+std::vector<uint32_t> g_aux_order;        // g_aux indices in DllMain dependency order
+std::vector<std::vector<int>> g_aux_deps; // g_aux[i]'s auxiliary-module dependencies
+// g_aux[i] is attached before the exe entry (it is in the executable's static
+// import closure). Runtime-only modules stay false and attach at LoadLibrary.
+std::vector<bool> g_aux_startup;
 
 // The basename, lowercased, with a .dll suffix when it has no extension. Two
 // spellings of the same import module compare equal through this.
@@ -574,6 +578,7 @@ bool bind_aux_imports() {
         g_aux[i].initial_image.assign(g_mem + g_aux[i].base, g_mem + g_aux[i].base + g_aux[i].size);
     }
     g_aux_order = order;
+    g_aux_deps = deps;
     return true;
 }
 
@@ -724,6 +729,8 @@ bool loader_load(const char *exe_path) {
     g_aux.clear();
     g_aux_pending.clear();
     g_aux_order.clear();
+    g_aux_deps.clear();
+    g_aux_startup.clear();
     g_main = LoaderModule{};
     g_iat_patched = 0;
     g_iat_data = 0;
@@ -931,6 +938,47 @@ bool loader_load(const char *exe_path) {
             return false;
     if (!bind_aux_imports())
         return false;
+
+    // Windows attaches a statically imported DLL's DllMain before the exe
+    // entry, and resolves the transitive closure of those imports. A module
+    // the executable does not statically import is mapped here but attached
+    // only when the guest calls LoadLibrary. Mark the startup set so
+    // loader_attach_modules runs exactly those and load_library_named owns
+    // the rest.
+    g_aux_startup.assign(g_aux.size(), false);
+    {
+        size_t dd = opt_off + 96;
+        uint32_t imp_rva = rd<uint32_t>(file, dd + 8);
+        uint32_t imp_size = rd<uint32_t>(file, dd + 12);
+        if (imp_rva && imp_size && rva_ok(imp_rva, imp_size)) {
+            for (uint32_t d = 0; d < imp_size / 20 + 1; ++d) {
+                uint32_t desc = imp_rva + d * 20;
+                if (!rva_ok(desc, 20))
+                    break;
+                uint32_t name_rva = rd32(g_base + desc + 12);
+                uint32_t first = rd32(g_base + desc + 16);
+                uint32_t orig = rd32(g_base + desc);
+                if (!name_rva && !first && !orig)
+                    break;
+                if (!rva_ok(name_rva, 1))
+                    break;
+                std::string dll = normalize_module_name(gm_str(g_base + name_rva, 260).c_str());
+                for (size_t i = 0; i < g_aux.size(); ++i)
+                    if (normalize_module_name(g_aux[i].name.c_str()) == dll)
+                        g_aux_startup[i] = true;
+            }
+        }
+    }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (size_t i = 0; i < g_aux.size(); ++i)
+            if (g_aux_startup[i])
+                for (int j : g_aux_deps[i])
+                    if (!g_aux_startup[(size_t)j]) {
+                        g_aux_startup[(size_t)j] = true;
+                        changed = true;
+                    }
+    }
     if (!patch_iat(file, opt_off, opt_magic, g_base, g_size))
         return false;
 
@@ -1002,7 +1050,7 @@ std::string loader_hash_file(const char *path) {
 void loader_attach_modules(X86 *c) {
     for (uint32_t index : g_aux_order) {
         LoaderModule &m = g_aux[index];
-        if (m.attached)
+        if (!g_aux_startup[index] || m.attached)
             continue;
         if (!m.entry || recomp_module_lookup(m.entry) < 0) {
             fprintf(stderr,

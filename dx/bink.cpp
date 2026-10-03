@@ -30,6 +30,7 @@ extern "C" {
 namespace {
 
 constexpr uint32_t BINK_RECORD_BYTES = 0x100;
+constexpr uint32_t BINK_SUMMARY_BYTES = 0x7c;
 constexpr uint32_t BINK_FILE_HANDLE = 0x00800000;
 constexpr uint32_t BINK_FROM_MEMORY = 0x04000000;
 uint32_t g_error_string = 0;
@@ -533,6 +534,68 @@ void BinkGetRects(X86 *c) {
     set_eax(c, count);
 }
 
+// BinkGetSummary fills the SDK's BINKSUMMARY. The real binkw32.dll's
+// _BinkGetSummary@8 writes Width at +0, Height at +4, FrameRate at +0xc,
+// FrameRateDiv at +0x10 and an HBINK+8 field at +0x20; runblack.exe's video
+// player reads exactly those. Width/height/frame-rate/count come from the
+// host decoder. The real call zeroes 0x7c bytes before filling them.
+void BinkGetSummary(X86 *c) {
+    set_eax(c, 0);
+    uint32_t rec = arg(c, 0), summary = arg(c, 1);
+    BinkPlayer *p = player_for(rec);
+    if (!p || !summary || !gm_valid(summary, BINK_SUMMARY_BYTES))
+        return;
+    memset(g_mem + summary, 0, BINK_SUMMARY_BYTES);
+    wr32(summary + 0x00, (uint32_t)p->video->width);
+    wr32(summary + 0x04, (uint32_t)p->video->height);
+    wr32(summary + 0x0c, (uint32_t)p->fps.num);
+    wr32(summary + 0x10, (uint32_t)p->fps.den);
+    wr32(summary + 0x20, p->count);
+}
+
+// BinkGoto seeks to a frame (flags 0) so a guest can show one logo frame and
+// then another from the same file. The custom I/O seek callback carries the
+// host-file window; the decoder and queued packets are flushed first.
+void BinkGoto(X86 *c) {
+    set_eax(c, 0);
+    uint32_t rec = arg(c, 0);
+    uint32_t frame = arg(c, 1);
+    uint32_t flags = arg(c, 2);
+    BinkPlayer *p = player_for(rec);
+    if (!p)
+        return;
+    if (flags != 0) {
+        p->failed = !video_error("BinkGoto time-based seek is not implemented");
+        return;
+    }
+    if (frame < 1)
+        frame = 1;
+    if (frame > p->count)
+        frame = p->count;
+    for (AVPacket *packet : p->video_packets)
+        av_packet_free(&packet);
+    p->video_packets.clear();
+    p->pending.clear();
+    p->pending_pos = 0;
+    p->eof = false;
+    p->flushed = false;
+    p->failed = false;
+    p->have_frame = false;
+    avcodec_flush_buffers(p->video);
+    if (p->audio)
+        avcodec_flush_buffers(p->audio);
+    AVStream *stream = p->input->streams[p->video_index];
+    int64_t ts = av_rescale_q((int64_t)(frame - 1), av_inv_q(p->fps), stream->time_base);
+    int rc = av_seek_frame(p->input, p->video_index, ts, AVSEEK_FLAG_BACKWARD);
+    if (rc < 0) {
+        p->failed = !decoder_error("seek video frame", rc);
+        p->current = p->count;
+    } else {
+        p->current = frame;
+    }
+    write_frame_count(rec, *p);
+}
+
 // Shift the playback origin by the time spent paused, preserving the time
 // remaining until the next frame. Repeated pause/resume calls are harmless;
 // unsigned subtraction also handles the host's millisecond counter wrapping.
@@ -655,6 +718,21 @@ void BinkNextFrame(X86 *c) {
 void BinkGetRects(X86 *c) {
     ret0(c);
 }
+void BinkGetSummary(X86 *c) {
+    set_eax(c, 0);
+    uint32_t rec = arg(c, 0), summary = arg(c, 1);
+    if (!rec || !summary || !gm_valid(summary, BINK_SUMMARY_BYTES))
+        return;
+    memset(g_mem + summary, 0, BINK_SUMMARY_BYTES);
+    wr32(summary + 0x00, rd32(rec));
+    wr32(summary + 0x04, rd32(rec + 4));
+    wr32(summary + 0x0c, 1);
+    wr32(summary + 0x10, 1);
+}
+void BinkGoto(X86 *c) {
+    // The no-decoder record is already finished; a seek is a no-op.
+    ret0(c);
+}
 void BinkPause(X86 *c) {
     ret0(c);
 }
@@ -697,6 +775,8 @@ void BinkGetError(X86 *c) {
 const ImportShim g_video_shims[] = {
     BINK(OpenDirectSound, 4, ret1),
     BINK(GetRects, 8, BinkGetRects),
+    BINK(GetSummary, 8, BinkGetSummary),
+    BINK(Goto, 12, BinkGoto),
     BINK(Pause, 8, BinkPause),
     BINK(Open, 8, BinkOpen),
     BINK(OpenMiles, 4, ret0),

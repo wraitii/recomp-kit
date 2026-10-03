@@ -1064,6 +1064,26 @@ void i_ImmGetCandidateListA(X86 *c) {
 void i_ImmSetCompositionWindow(X86 *c) {
     set_eax(c, 1);
 }
+// runblack.exe imports these five and the four above; the host has no input
+// method, so there is no context to return or destroy. fn_007F4300 (called by
+// pc_main) is `ImmAssociateContext(hwnd, NULL)` with the result discarded.
+void i_ImmAssociateContext(X86 *c) {
+    // (HWND, HIMC) -> the previous HIMC; there was none, and the caller in
+    // fn_007F4300 discards it.
+    set_eax(c, 0);
+}
+void i_ImmCreateContext(X86 *c) {
+    set_eax(c, 0);
+}
+void i_ImmDestroyContext(X86 *c) {
+    set_eax(c, 1);
+}
+void i_ImmGetProperty(X86 *c) {
+    set_eax(c, 0);
+}
+void i_ImmGetDescriptionA(X86 *c) {
+    set_eax(c, 0);
+}
 
 // -------------------------------------------------------------------------
 // WSOCK32: name resolution against the host. Real networking (sockets) is a
@@ -2285,6 +2305,11 @@ const ImportShim g_misc_shims[] = {
     {"IMM32.dll", "ImmGetCompositionStringA", 4, i_ImmGetCompositionStringA},
     {"IMM32.dll", "ImmGetCandidateListA", 4, i_ImmGetCandidateListA},
     {"IMM32.dll", "ImmSetCompositionWindow", 2, i_ImmSetCompositionWindow},
+    {"IMM32.dll", "ImmAssociateContext", 2, i_ImmAssociateContext},
+    {"IMM32.dll", "ImmCreateContext", 0, i_ImmCreateContext},
+    {"IMM32.dll", "ImmDestroyContext", 1, i_ImmDestroyContext},
+    {"IMM32.dll", "ImmGetProperty", 2, i_ImmGetProperty},
+    {"IMM32.dll", "ImmGetDescriptionA", 3, i_ImmGetDescriptionA},
     // WSOCK32. D3DPopTB.exe imports these five by ordinal, so each shim is
     // registered under both the ordinal the IAT uses and the documented name
     // (which is what GetProcAddress would ask for).
