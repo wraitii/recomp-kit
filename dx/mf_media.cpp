@@ -194,9 +194,21 @@ bool Media::next_video(VideoFrame *out) {
     for (;;) {
         if (avcodec_receive_frame(s_->video, s_->frame) >= 0) {
             const AVFrame &f = *s_->frame;
-            if (f.format != AV_PIX_FMT_YUV420P || f.width <= 0 || f.height <= 0) {
+            // MS-MPEG-4 decodes to 4:2:0; Indeo 3 (logoubi, outro) decodes to
+            // 4:1:0, where both chroma planes are half the vertical and
+            // horizontal resolution, so the shift is 2 rather than 1.
+            unsigned chroma_shift;
+            if (f.format == AV_PIX_FMT_YUV420P)
+                chroma_shift = 1;
+            else if (f.format == AV_PIX_FMT_YUV410P)
+                chroma_shift = 2;
+            else {
                 av_frame_unref(s_->frame);
                 continue; // an unexpected layout is skipped, not drawn wrong
+            }
+            if (f.width <= 0 || f.height <= 0) {
+                av_frame_unref(s_->frame);
+                continue;
             }
             out->width = f.width;
             out->height = f.height;
@@ -205,8 +217,9 @@ bool Media::next_video(VideoFrame *out) {
                 video_frame_convert_row(
                     reinterpret_cast<uint8_t *>(out->argb.data() + size_t(y) * size_t(f.width)),
                     f.data[0] + size_t(y) * f.linesize[0],
-                    f.data[1] + size_t(y / 2) * f.linesize[1],
-                    f.data[2] + size_t(y / 2) * f.linesize[2], uint32_t(f.width), VIDEO_XRGB8888);
+                    f.data[1] + size_t(y >> chroma_shift) * f.linesize[1],
+                    f.data[2] + size_t(y >> chroma_shift) * f.linesize[2], uint32_t(f.width),
+                    VIDEO_XRGB8888, chroma_shift);
             const AVRational tb = s_->input->streams[s_->video_index]->time_base;
             const int64_t pts =
                 f.best_effort_timestamp != AV_NOPTS_VALUE ? f.best_effort_timestamp : f.pts;

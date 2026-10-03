@@ -94,6 +94,7 @@ enum ComIface : uint16_t {
     IF_PIN,              // IPin
     IF_ENUMPINS,         // IEnumPins
     IF_ENUMMEDIATETYPES, // IEnumMediaTypes
+    IF_MEDIASAMPLE,      // IMediaSample handed to the guest renderer
     IF_D3D11_DEVICE,
     IF_D3D11_CONTEXT,
     IF_D3D11_TEXTURE,
@@ -187,6 +188,7 @@ enum ComKind : uint16_t {
     K_PIN,              // one pin on one of those filters
     K_ENUMPINS,         // IEnumPins over a filter's pins
     K_ENUMMEDIATETYPES, // IEnumMediaTypes over a pin's media types
+    K_MEDIASAMPLE,      // one frame delivered to the guest renderer
     K_D3D11_DEVICE,
     K_D3D11_CONTEXT,
     K_D3D11_TEXTURE,

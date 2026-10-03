@@ -37,6 +37,7 @@
 // amstream.h, austream.h, strmif.h and control.h.
 #include "com.h"
 #include "dx.h"
+#include "mf_media.h"
 #include "host_api.h"
 #include "mp3_source.h"
 #include "../runtime/memory.h"
@@ -164,6 +165,13 @@ const uint8_t IID_IEnumPins_[16] =
     IID_BYTES(0x56a86892, 0x0ad4, 0x11ce, 0xb0, 0x3a, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70);
 const uint8_t IID_IEnumMediaTypes_[16] =
     IID_BYTES(0x89c31040, 0x846b, 0x11ce, 0x97, 0xd3, 0x00, 0xaa, 0x00, 0x55, 0x59, 0x5a);
+// IMediaSample and IMemInputPin. The renderer's root QueryInterface handler
+// FUN_00717d70 answers IID_IMemInputPin (0x00866c8c) with renderer+0x98; its
+// vtable 0x0086b458 slot 6 (+0x18) is Receive.
+const uint8_t IID_IMediaSample_[16] =
+    IID_BYTES(0x56a8689a, 0x0ad4, 0x11ce, 0xb0, 0x3a, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70);
+const uint8_t IID_IMemInputPin_[16] =
+    IID_BYTES(0x56a8689d, 0x0ad4, 0x11ce, 0xb0, 0x3a, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70);
 // The media types FUN_0049da20 selects pins by, and the format blocks a
 // VIDEOINFOHEADER carries.
 const uint8_t MEDIATYPE_Video_[16] =
@@ -172,6 +180,10 @@ const uint8_t MEDIATYPE_Audio_[16] =
     IID_BYTES(0x73647561, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
 const uint8_t MEDIASUBTYPE_RGB24_[16] =
     IID_BYTES(0xe436eb7d, 0x524f, 0x11ce, 0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70);
+const uint8_t MEDIASUBTYPE_RGB32_[16] =
+    IID_BYTES(0xe436eb7e, 0x524f, 0x11ce, 0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70);
+const uint8_t MEDIASUBTYPE_RGB565_[16] =
+    IID_BYTES(0xe436eb7b, 0x524f, 0x11ce, 0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70);
 const uint8_t MEDIASUBTYPE_PCM_[16] =
     IID_BYTES(0x00000001, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
 const uint8_t FORMAT_VideoInfo_[16] =
@@ -671,6 +683,21 @@ std::map<uint32_t, MovieGraph> &movie_graphs() {
     return *m;
 }
 
+// The bytes one IMediaSample we handed the guest renderer points at. The
+// renderer's DoRenderSample (FUN_0049d700) reads GetPointer (sample vtable
+// slot 3) and copies biHeight rows, so the buffer is our guest heap.
+struct MovieSample {
+    uint32_t data = 0;
+    uint32_t size = 0;
+    uint32_t actual = 0;
+    uint64_t start = 0, end = 0;
+    bool sync = true;
+};
+std::map<uint32_t, MovieSample> &movie_samples() {
+    static auto *m = new std::map<uint32_t, MovieSample>();
+    return *m;
+}
+
 ComObj *movie_graph_this(X86 *c) {
     ComObj *g = com_this_arg(c, IF_GRAPH);
     return g && g->kind == K_FILTERGRAPH ? g : nullptr;
@@ -713,8 +740,9 @@ void write_media_type(uint32_t mt, const MovieType &t) {
     wr32(mt + 0x20, 1); // bFixedSizeSamples
     wr32(mt + 0x24, 0); // bTemporalCompression
     if (t.is_video) {
+        uint32_t image = t.width * t.height * ((t.bits + 7) / 8);
         memcpy(gm_ptr(mt + 0x2c), FORMAT_VideoInfo_, 16);
-        wr32(mt + 0x28, t.width * t.height * 3);
+        wr32(mt + 0x28, image);
         wr32(mt + 0x40, kVideoInfoHeaderSize);
         wr32(mt + 0x44, mt + kAMMediaTypeSize);
         uint32_t vi = mt + kAMMediaTypeSize;
@@ -726,10 +754,10 @@ void write_media_type(uint32_t mt, const MovieType &t) {
         wr32(vi + 0x30, 40);       // bmiHeader.biSize
         wr32(vi + 0x34, t.width);
         wr32(vi + 0x38, t.height);
-        wr16(vi + 0x3c, 1);  // biPlanes
-        wr16(vi + 0x3e, 24); // biBitCount
-        wr32(vi + 0x40, 0);  // BI_RGB
-        wr32(vi + 0x44, t.width * t.height * 3);
+        wr16(vi + 0x3c, 1);      // biPlanes
+        wr16(vi + 0x3e, t.bits); // biBitCount
+        wr32(vi + 0x40, 0);      // BI_RGB
+        wr32(vi + 0x44, image);
     } else if (t.is_audio) {
         memcpy(gm_ptr(mt + 0x2c), FORMAT_WaveFormatEx_, 16);
         wr32(mt + 0x40, 18); // sizeof(WAVEFORMATEX)
@@ -1093,6 +1121,139 @@ const ComMethod g_enummediatypes[] = {
     {"Clone", 2, EM_Clone},
 };
 
+// --- IMediaSample ---
+// The renderer reads a delivered frame through GetPointer (vtable slot 3);
+// the other slots mirror what a renderer asks of a sample. Every slot is
+// registered, so an unexpected call still reaches a named shim rather than a
+// null vtable entry.
+MovieSample *movie_sample_arg(X86 *c) {
+    ComObj *s = com_this_arg(c, IF_MEDIASAMPLE);
+    if (!s)
+        return nullptr;
+    auto it = movie_samples().find(s->id);
+    return it == movie_samples().end() ? nullptr : &it->second;
+}
+void SM_GetPointer(X86 *c) {
+    MovieSample *s = movie_sample_arg(c);
+    uint32_t out = arg(c, 1);
+    if (!s || !out || !gm_valid(out, 4)) {
+        com_ret(c, E_POINTER);
+        return;
+    }
+    wr32(out, s->data);
+    com_ret(c, S_OK);
+}
+void SM_GetSize(X86 *c) {
+    MovieSample *s = movie_sample_arg(c);
+    com_ret(c, s ? s->size : 0);
+}
+void SM_GetTime(X86 *c) {
+    MovieSample *s = movie_sample_arg(c);
+    uint32_t a = arg(c, 1), b = arg(c, 2);
+    if (!s || !gm_valid(a, 8) || !gm_valid(b, 8)) {
+        com_ret(c, E_POINTER);
+        return;
+    }
+    write_u64(a, s->start);
+    write_u64(b, s->end);
+    com_ret(c, S_OK);
+}
+void SM_SetTime(X86 *c) {
+    MovieSample *s = movie_sample_arg(c);
+    if (!s) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    s->start = read_u64(arg(c, 1));
+    s->end = read_u64(arg(c, 2));
+    com_ret(c, S_OK);
+}
+void SM_IsSyncPoint(X86 *c) {
+    MovieSample *s = movie_sample_arg(c);
+    com_ret(c, s && s->sync ? S_OK : S_FALSE);
+}
+void SM_SetSyncPoint(X86 *c) {
+    MovieSample *s = movie_sample_arg(c);
+    if (s)
+        s->sync = arg(c, 1) != 0;
+    com_ret(c, S_OK);
+}
+void SM_IsPreroll(X86 *c) {
+    movie_sample_arg(c);
+    com_ret(c, S_FALSE);
+}
+DX_STUB(SM_SetPreroll, S_OK)
+void SM_GetActualDataLength(X86 *c) {
+    MovieSample *s = movie_sample_arg(c);
+    com_ret(c, s ? s->actual : 0);
+}
+void SM_SetActualDataLength(X86 *c) {
+    MovieSample *s = movie_sample_arg(c);
+    uint32_t len = arg(c, 1);
+    if (!s || len > s->size) {
+        com_ret(c, E_INVALIDARG);
+        return;
+    }
+    s->actual = len;
+    com_ret(c, S_OK);
+}
+void SM_GetMediaType(X86 *c) {
+    // A renderer that could change format mid-stream would ask; this one
+    // negotiates once through QueryAccept, so there is nothing to hand back.
+    log_once("dshow.sample.getmediatype",
+             "dshow: IMediaSample::GetMediaType is not served; the negotiated pin type is fixed");
+    com_ret(c, E_NOTIMPL);
+}
+DX_STUB(SM_SetMediaType, S_OK)
+void SM_IsDiscontinuity(X86 *c) {
+    movie_sample_arg(c);
+    com_ret(c, S_FALSE);
+}
+DX_STUB(SM_SetDiscontinuity, S_OK)
+void SM_GetMediaTime(X86 *c) {
+    MovieSample *s = movie_sample_arg(c);
+    uint32_t a = arg(c, 1), b = arg(c, 2);
+    if (!s || !gm_valid(a, 8) || !gm_valid(b, 8)) {
+        com_ret(c, E_POINTER);
+        return;
+    }
+    write_u64(a, 0);
+    write_u64(b, 0);
+    com_ret(c, S_OK);
+}
+DX_STUB(SM_SetMediaTime, S_OK)
+const ComMethod g_mediasample[] = {
+    {"QueryInterface", 3, com_QueryInterface},
+    {"AddRef", 1, com_AddRef},
+    {"Release", 1, com_Release},
+    {"GetPointer", 2, SM_GetPointer},
+    {"GetSize", 1, SM_GetSize},
+    {"GetTime", 3, SM_GetTime},
+    {"SetTime", 3, SM_SetTime},
+    {"IsSyncPoint", 1, SM_IsSyncPoint},
+    {"SetSyncPoint", 2, SM_SetSyncPoint},
+    {"IsPreroll", 1, SM_IsPreroll},
+    {"SetPreroll", 2, SM_SetPreroll},
+    {"GetActualDataLength", 1, SM_GetActualDataLength},
+    {"SetActualDataLength", 2, SM_SetActualDataLength},
+    {"GetMediaType", 2, SM_GetMediaType},
+    {"SetMediaType", 2, SM_SetMediaType},
+    {"IsDiscontinuity", 1, SM_IsDiscontinuity},
+    {"SetDiscontinuity", 2, SM_SetDiscontinuity},
+    {"GetMediaTime", 3, SM_GetMediaTime},
+    {"SetMediaTime", 3, SM_SetMediaTime},
+};
+
+void movie_sample_destroy(ComObj *s) {
+    auto it = movie_samples().find(s->id);
+    if (it == movie_samples().end())
+        return;
+    uint32_t data = it->second.data;
+    movie_samples().erase(it);
+    if (data)
+        heap_free(data);
+}
+
 // --- The splitter and the two renderers ---
 ComObj *movie_splitter_create() {
     ComObj *f = movie_new_filter(MR_SPLITTER);
@@ -1206,6 +1367,230 @@ void MG_EnumFilters(X86 *c) {
     give_view(c, out, e, IF_ENUMFILTERS);
 }
 
+// Calls a guest COM vtable method: fn = [*this_addr + slot*4], with the
+// interface pointer as the first stack argument. Returns EAX.
+uint32_t guest_com_method(X86 *c, uint32_t this_addr, int slot, const uint32_t *args,
+                          int nargs) {
+    if (!this_addr || !gm_valid(this_addr, 4))
+        return E_FAIL;
+    uint32_t vt = rd32(this_addr);
+    if (!vt || !gm_valid(vt + (uint32_t)slot * 4, 4))
+        return E_FAIL;
+    uint32_t fn = rd32(vt + (uint32_t)slot * 4);
+    if (!fn)
+        return E_FAIL;
+    uint32_t buf[8] = {0};
+    buf[0] = this_addr;
+    for (int i = 0; i < nargs && i < 7; ++i)
+        buf[i + 1] = args[i];
+    return guest_call(c, fn, buf, nargs + 1);
+}
+
+// The source filter's file, opened just far enough to learn the frame size
+// the renderer's VIDEOINFOHEADER must carry. The bytes come from FFmpeg, not
+// from a guess: the renderer's SetMediaType derives its stride and row count
+// from this format.
+bool movie_source_dims(ComObj *g, uint32_t *width, uint32_t *height) {
+    MovieGraph &info = movie_graphs()[g->id];
+    for (uint32_t id : info.filters) {
+        ComObj *f = com_get(id);
+        if (!f)
+            continue;
+        auto fit = movie_filters().find(id);
+        if (fit == movie_filters().end() || fit->second.role != MR_SOURCE)
+            continue;
+        std::string host = win32_host_path(fit->second.path, false);
+        if (host.empty()) {
+            LOGW("dshow: source %s has no host path to probe", fit->second.path.c_str());
+            return false;
+        }
+        mf::Media media;
+        std::string why;
+        if (!media.open(host, &why) || !media.has_video()) {
+            LOGW("dshow: cannot probe %s: %s", host.c_str(), why.c_str());
+            return false;
+        }
+        *width = (uint32_t)media.width();
+        *height = (uint32_t)media.height();
+        LOGV("dshow: source %s is %ux%u", host.c_str(), *width, *height);
+        return *width && *height;
+    }
+    LOGW("dshow: Connect has no source filter to take a frame size from");
+    return false;
+}
+
+// The renderer's subtype was chosen at construction by FUN_004eaa90; probing
+// its QueryAccept is the evidence, not a host-side assumption. RGB24 is
+// tried first because the constructor's zero case selects it.
+struct ProbeSubtype {
+    const uint8_t *guid;
+    uint16_t bits;
+};
+const ProbeSubtype kProbeSubtypes[] = {
+    {MEDIASUBTYPE_RGB24_, 24},
+    {MEDIASUBTYPE_RGB32_, 32},
+    {MEDIASUBTYPE_RGB565_, 16},
+};
+
+// The output pin is ours; returns its IPin view.
+uint32_t movie_pin_view(ComObj *p) {
+    return com_view(p, IF_PIN);
+}
+
+// Connect(video output -> guest renderer input): negotiate the format, hand
+// the guest pin the connection, obtain IMemInputPin and deliver one frame.
+// The renderer's OLE QueryInterface answers IID_IMemInputPin by returning
+// renderer+0x98 (FUN_00717d70), and IMemInputPin::Receive is slot 6.
+bool movie_connect_guest(X86 *c, ComObj *g, ComObj *host_pin, uint32_t guest_pin) {
+    uint32_t width = 0, height = 0;
+    if (!movie_source_dims(g, &width, &height))
+        return false;
+    if (!guest_pin || !gm_valid(guest_pin, 4))
+        return false;
+    uint32_t host_view = movie_pin_view(host_pin);
+    if (!host_view)
+        return false;
+
+    uint32_t mt = heap_alloc(kAMMediaTypeSize + kVideoInfoHeaderSize, true, 8);
+    if (!mt) {
+        LOGW("dshow: no guest memory for the connection's AM_MEDIA_TYPE");
+        return false;
+    }
+    const ProbeSubtype *chosen = nullptr;
+    for (const ProbeSubtype &probe : kProbeSubtypes) {
+        MovieType t;
+        memcpy(t.major, MEDIATYPE_Video_, 16);
+        memcpy(t.subtype, probe.guid, 16);
+        t.has_major = t.is_video = true;
+        t.width = width;
+        t.height = height;
+        t.bits = probe.bits;
+        write_media_type(mt, t);
+        uint32_t hr = guest_com_method(c, guest_pin, 11, &mt, 1); // IPin::QueryAccept
+        LOGV("dshow: QueryAccept %u-bit video -> %08x", (unsigned)probe.bits, hr);
+        if (hr == S_OK) {
+            chosen = &probe;
+            break;
+        }
+    }
+    if (!chosen) {
+        heap_free(mt);
+        LOGW("dshow: the guest renderer accepted none of RGB24/RGB32/RGB565 "
+             "at %ux%u",
+             width, height);
+        return false;
+    }
+    uint32_t args[2] = {host_view, mt};
+    uint32_t hr = guest_com_method(c, guest_pin, 4, args, 2); // IPin::ReceiveConnection
+    if (hr != S_OK) {
+        heap_free(mt);
+        LOGW("dshow: guest renderer refused ReceiveConnection: %08x", hr);
+        return false;
+    }
+    // Resolve the allocator question from the guest: the renderer's own
+    // IMemInputPin Receive path (FUN_00715110 -> filter+0x78) does not read
+    // m_pAllocator, so Get/NotifyAllocator are only mirroring if it refuses.
+    uint32_t imem = 0;
+    uint32_t iid = heap_alloc(16, true, 4);
+    uint32_t out = heap_alloc(4, true, 4);
+    if (!iid || !out) {
+        if (iid)
+            heap_free(iid);
+        if (out)
+            heap_free(out);
+        heap_free(mt);
+        return false;
+    }
+    memcpy(gm_ptr(iid), IID_IMemInputPin_, 16);
+    uint32_t qargs[2] = {iid, out};
+    hr = guest_com_method(c, guest_pin, 0, qargs, 2); // IUnknown::QueryInterface
+    imem = rd32(out);
+    heap_free(out);
+    heap_free(iid);
+    if (hr != S_OK || !imem) {
+        heap_free(mt);
+        LOGW("dshow: guest renderer has no IMemInputPin: %08x", hr);
+        return false;
+    }
+    // One synthetic frame, bottom-up with positive biHeight: the renderer
+    // copies biHeight rows from GetPointer into its locked texture.
+    uint32_t bytes = width * height * ((chosen->bits + 7) / 8);
+    uint32_t data = heap_alloc(bytes, false, 8);
+    if (!data) {
+        heap_free(mt);
+        LOGW("dshow: no guest memory for the synthetic frame");
+        return false;
+    }
+    for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t x = 0; x < width; ++x) {
+            uint8_t *p = gm_ptr(data + (y * width + x) * ((chosen->bits + 7) / 8));
+            uint8_t luma = (uint8_t)(x + y);
+            if (chosen->bits == 32) {
+                p[0] = luma;
+                p[1] = luma;
+                p[2] = luma;
+                p[3] = 0;
+            } else if (chosen->bits == 24) {
+                p[0] = luma;
+                p[1] = luma;
+                p[2] = luma;
+            } else {
+                uint16_t v = (uint16_t)((luma >> 3) << 11 | (luma >> 2) << 5 | (luma >> 3));
+                p[0] = (uint8_t)v;
+                p[1] = (uint8_t)(v >> 8);
+            }
+        }
+    ComObj *sample = com_new(K_MEDIASAMPLE);
+    if (!sample) {
+        heap_free(data);
+        heap_free(mt);
+        return false;
+    }
+    MovieSample &ms = movie_samples()[sample->id];
+    ms.data = data;
+    ms.size = bytes;
+    ms.actual = bytes;
+    ms.sync = true;
+    uint32_t sample_view = com_view(sample, IF_MEDIASAMPLE);
+    if (imem && sample_view) {
+        uint32_t rargs[1] = {sample_view};
+        hr = guest_com_method(c, imem, 6, rargs, 1); // IMemInputPin::Receive
+        LOGV("dshow: IMemInputPin::Receive -> %08x", hr);
+    }
+    if (hr != S_OK) {
+        // DirectShow's protocol: the output pin asks the input pin for its
+        // allocator and tells it which allocator the connection will use.
+        // The renderer's Receive (0x00715030) checks CBaseInputPin state, so
+        // mirror the call before retrying rather than inventing an allocator.
+        uint32_t alloc_out = heap_alloc(4, true, 4);
+        if (alloc_out) {
+            uint32_t aargs[1] = {alloc_out};
+            uint32_t ghr = guest_com_method(c, imem, 3, aargs, 1); // GetAllocator
+            uint32_t allocator = ghr == S_OK ? rd32(alloc_out) : 0;
+            heap_free(alloc_out);
+            LOGV("dshow: IMemInputPin::GetAllocator -> %08x allocator %08x", ghr, allocator);
+            if (allocator) {
+                uint32_t nargs[2] = {allocator, 1};
+                guest_com_method(c, imem, 4, nargs, 2); // NotifyAllocator(alloc, TRUE)
+                uint32_t rargs2[1] = {sample_view};
+                hr = guest_com_method(c, imem, 6, rargs2, 1);
+                LOGV("dshow: IMemInputPin::Receive after NotifyAllocator -> %08x", hr);
+            }
+        }
+    }
+    com_release(sample);
+    heap_free(mt);
+    if (hr != S_OK) {
+        // The connection itself succeeded; the renderer refuses a sample until
+        // IMediaControl::Run, which the graph has not been driven through yet.
+        // Real frames are the frame pump's job, so this is diagnostic, not a
+        // refusal of the connection.
+        LOGW("dshow: guest renderer did not take the synthetic frame: %08x", hr);
+    }
+    movie_pins()[host_pin->id].connected = (uint32_t)-1;
+    return true;
+}
+
 void MG_Connect(X86 *c) {
     ComObj *g = movie_graph_this(c);
     uint32_t a = arg(c, 1), b = arg(c, 2);
@@ -1228,14 +1613,23 @@ void MG_Connect(X86 *c) {
         com_ret(c, S_OK);
         return;
     }
-    // One side is the guest renderer's pin. Negotiating it and pushing frames
-    // is the next step; failing here is honest, not a half-connected graph.
-    // Evidence for that step: the renderer's IMemInputPin is at
-    // renderer+0x98, its vtable is 0x0086b458, and IMemInputPin::Receive is
-    // slot 6 (+0x18), not slot 3. QueryAccept is IPin slot 11 (+0x2c) and
-    // ReceiveConnection is IPin slot 4 (+0x10).
-    log_once("dshow.movie.guestpin", "dshow: Connect to a guest pin is not implemented yet");
-    com_ret(c, VFW_E_CANNOT_CONNECT);
+    ComObj *host_pin = pa ? pa : pb;
+    uint32_t guest_pin = pa ? b : a;
+    if (!host_pin) {
+        LOGW("dshow: Connect has a guest pin on both sides; the renderer must be one side");
+        com_ret(c, VFW_E_CANNOT_CONNECT);
+        return;
+    }
+    if (host_pin->kind == K_PIN && movie_pins()[host_pin->id].dir != 1) {
+        LOGW("dshow: Connect to a guest pin needs our output pin");
+        com_ret(c, VFW_E_CANNOT_CONNECT);
+        return;
+    }
+    if (!movie_connect_guest(c, g, host_pin, guest_pin)) {
+        com_ret(c, VFW_E_CANNOT_CONNECT);
+        return;
+    }
+    com_ret(c, S_OK);
 }
 
 void MG_AddSourceFilter(X86 *c) {
@@ -2762,6 +3156,8 @@ void dshow_register() {
     com_define(IF_ENUMPINS, "QUARTZ.dll", "IEnumPins", g_enumpins, std::size(g_enumpins));
     com_define(IF_ENUMMEDIATETYPES, "QUARTZ.dll", "IEnumMediaTypes", g_enummediatypes,
                std::size(g_enummediatypes));
+    com_define(IF_MEDIASAMPLE, "QUARTZ.dll", "IMediaSample", g_mediasample,
+               std::size(g_mediasample));
 
     com_bind(IF_MMSTREAM, K_MMSTREAM);
     com_bind(IF_MEDIASTREAM, K_MEDIASTREAM);
@@ -2782,6 +3178,7 @@ void dshow_register() {
     com_bind(IF_PIN, K_PIN);
     com_bind(IF_ENUMPINS, K_ENUMPINS);
     com_bind(IF_ENUMMEDIATETYPES, K_ENUMMEDIATETYPES);
+    com_bind(IF_MEDIASAMPLE, K_MEDIASAMPLE);
 
     com_register_iid(IF_MMSTREAM, IID_IAMMultiMediaStream_);
     com_register_iid(IF_MMSTREAM, IID_IMultiMediaStream_);
@@ -2804,12 +3201,14 @@ void dshow_register() {
     com_register_iid(IF_PIN, IID_IPin_);
     com_register_iid(IF_ENUMPINS, IID_IEnumPins_);
     com_register_iid(IF_ENUMMEDIATETYPES, IID_IEnumMediaTypes_);
+    com_register_iid(IF_MEDIASAMPLE, IID_IMediaSample_);
 
     com_set_destructor(K_MMSTREAM, mmstream_destroy);
     com_set_destructor(K_STREAMSAMPLE, sample_destroy);
     com_set_destructor(K_FILTERGRAPH, movie_graph_destroy);
     com_set_destructor(K_BASEFILTER, movie_filter_destroy);
     com_set_destructor(K_PIN, movie_pin_destroy);
+    com_set_destructor(K_MEDIASAMPLE, movie_sample_destroy);
 
     com_register_class(CLSID_AMMultiMediaStream_, "AMMultiMediaStream", IF_MMSTREAM,
                        mmstream_create);
@@ -2828,4 +3227,5 @@ void dshow_reset() {
     movie_pins().clear();
     movie_filters().clear();
     movie_graphs().clear();
+    movie_samples().clear();
 }

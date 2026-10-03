@@ -17,6 +17,10 @@ void video_frame_convert_row(uint8_t *dest, const uint8_t *y, const uint8_t *u, 
             *dest++ = (uint8_t)g;
             *dest++ = (uint8_t)r;
             *dest++ = 0;
+        } else if (type == VIDEO_BGR24) {
+            *dest++ = (uint8_t)b;
+            *dest++ = (uint8_t)g;
+            *dest++ = (uint8_t)r;
         } else {
             uint32_t pixel = type == VIDEO_RGB565 ? ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
                                                   : ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
