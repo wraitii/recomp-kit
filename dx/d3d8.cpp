@@ -283,6 +283,9 @@ std::vector<DisplayMode> display_modes() {
         result.push_back({dw, dh, 0, D8FMT_X8R8G8B8});
     static const uint32_t kStandard[][2] = {
         {640, 480}, {800, 600}, {1024, 768}, {1280, 1024}, {1600, 1200},
+        // Experimental extras: 4:3 above 1600x1200, and 1512x982 (this
+        // MacBook's 3024x1964 panel at 1x points, ~1.54:1).
+        {1440, 1080}, {1920, 1440}, {1512, 982},
     };
     for (const auto &m : kStandard)
         if (m[0] != dw || m[1] != dh)
