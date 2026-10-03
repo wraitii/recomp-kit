@@ -4179,6 +4179,58 @@ static void test_lister(const char *dir, void (*emit)(void *, const char *, cons
     emit(ctx, "two.txt", (host + "/two.txt").c_str());
 }
 
+// LoadImageA(LR_LOADFROMFILE|LR_CREATEDIBSECTION) must expose the file's own
+// bit depth and row order, as Windows does. A 24-bpp BMP has to stay 24-bpp:
+// the font loader walks the bits as packed 3-byte pixels, and a 32-bpp DIB made
+// it count a glyph per misread row and spin forever.
+static void test_load_image_file_dib(X86 *c) {
+    section("LoadImageA file bitmap keeps the source DIB format");
+    std::string saved_root = g_seam_root;
+    g_seam_root = "build/recomp/load-image-file-test";
+    remove_tree(g_seam_root);
+    mkdir_p(g_seam_root + "/read");
+    // 14-byte BITMAPFILEHEADER + 40-byte BITMAPINFOHEADER + one 8-byte row:
+    // two 24-bpp pixels (BGR) plus row padding.
+    const uint32_t size = 62;
+    uint32_t bmp = scratch_block(size);
+    memset(g_mem + bmp, 0, size);
+    wr16(bmp + 0, 0x4d42);
+    wr32(bmp + 2, size);
+    wr32(bmp + 10, 54);
+    wr32(bmp + 14, 40);
+    wr32(bmp + 18, 2);
+    wr32(bmp + 22, 1);
+    wr16(bmp + 26, 1);
+    wr16(bmp + 28, 24);
+    wr8(bmp + 54, 0x11);
+    wr8(bmp + 55, 0x22);
+    wr8(bmp + 56, 0x33);
+    wr8(bmp + 57, 0x44);
+    wr8(bmp + 58, 0x55);
+    wr8(bmp + 59, 0x66);
+    FILE *f = fopen((g_seam_root + "/read/font24.bmp").c_str(), "wb");
+    check(f && fwrite(g_mem + bmp, 1, size, f) == size, "write 24-bpp BMP fixture");
+    if (f)
+        fclose(f);
+    win32_set_file_ops(test_resolver, nullptr);
+    uint32_t bitmap =
+        call_import(c, "USER32.dll", "LoadImageA", {0, put_str("font24.bmp"), 0, 0, 0, 0x2010});
+    uint32_t out = scratch_block(24);
+    check(bitmap && call_import(c, "GDI32.dll", "GetObjectA", {bitmap, 24, out}) == 24 &&
+              rd32(out + 4) == 2 && rd32(out + 8) == 1 && rd16(out + 18) == 24,
+          "LoadImageA returns a 24-bpp DIB section, not a 32-bpp one");
+    if (bitmap) {
+        uint32_t bits = rd32(out + 20);
+        check(rd8(bits) == 0x11 && rd8(bits + 1) == 0x22 && rd8(bits + 2) == 0x33 &&
+                  rd8(bits + 3) == 0x44 && rd8(bits + 4) == 0x55 && rd8(bits + 5) == 0x66,
+              "and its pixels are the file's packed BGR bytes, bottom-up");
+        call_import(c, "GDI32.dll", "DeleteObject", {bitmap});
+    }
+    win32_set_file_ops(nullptr, nullptr);
+    remove_tree(g_seam_root);
+    g_seam_root = saved_root;
+}
+
 // Runs `fn` on a real guest thread and waits for it to end. The scheduler only
 // lets a guest thread run while this one is at a yield point, so polling
 // GetExitCodeThread is both the wait and the thing that lets it run.
@@ -7109,6 +7161,7 @@ int main(int argc, char **argv) {
     }
     scratch = 0x0ee00000;
     test_startup_apis(loader_context());
+    test_load_image_file_dib(loader_context());
     test_import_return_trace();
     test_import_eip_publishes_return();
     test_modules_and_wide();
