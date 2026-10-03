@@ -464,6 +464,8 @@ def web_site(game_dir, build_root, preset, cfg):
 def parse_args(argv, system=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--regenerate", action="store_true", help="Regenerate and compile translated C")
+    parser.add_argument("--x87-locals-experiment", action="store_true",
+                        help="Build and run the isolated x87 local-value experiment")
     parser.add_argument("--allow-table-gaps", metavar="REASON", default=None,
                         help="Accept jump-table sites the translator cannot decode (passed to translate.py)")
     parser.add_argument("--forget", metavar="ADDR[,ADDR...]", default=None,
@@ -516,6 +518,10 @@ def parse_args(argv, system=None):
 def main():
     """Check inputs, translate under the build lock when needed, then configure and build."""
     args, parser = parse_args(sys.argv[1:])
+    if args.x87_locals_experiment:
+        from experiments.x87_locals.run import run_experiment
+        run_experiment(args.build_root / "x87-locals-experiment", cmake_tool("cmake"), args.jobs)
+        return
     cfg = game_config.load(args.game_dir)
     # Regenerating needs the game and its listings.
     if args.regenerate and not cfg["developer_exe_path"].is_file():

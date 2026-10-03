@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add `tools/build.py --x87-locals-experiment`, an isolated local-value lifting
+  probe comparing generated x87 fragments with the existing emitter. It records
+  final-state comparisons, timings and optimized assembly without changing game
+  translation. See `tools/recomp/experiments/x87_locals/README.md` for its limits.
+
 - Add an optional scene post-process to the D3D8/wgpu renderer. A game's native
   override calls `d3d8_scene_boundary(c, mode)` (`runtime/native_seam.h`) at the
   point where its 3D scene is finished and its overlay not yet drawn; mode 1
