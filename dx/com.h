@@ -47,16 +47,19 @@ enum ComIface : uint16_t {
     IF_DIRECTDRAW,
     IF_DIRECTDRAW2,
     IF_DIRECTDRAW4,
+    IF_DIRECTDRAW7,
     IF_DDSURFACE,
     IF_DDSURFACE2,
     IF_DDSURFACE3,
     IF_DDSURFACE4,
+    IF_DDSURFACE7,
     IF_DDPALETTE,
     IF_DDCLIPPER,
     IF_DDCOLORCONTROL,
     IF_D3D,
     IF_D3D2,
     IF_D3D3,
+    IF_D3D7,
     IF_D3DDEVICE3,
     IF_D3DVIEWPORT3,
     IF_D3DMATERIAL3,
@@ -251,6 +254,13 @@ struct JoyFormatSlot {
     uint32_t object = 0;
 };
 
+// One IDirectDrawSurface4/7 private-data record, keyed by the caller's GUID.
+// The bytes are a host-side copy of guest memory, like a texture's upload.
+struct SurfacePrivateData {
+    uint8_t guid[16] = {0};
+    std::vector<uint8_t> bytes;
+};
+
 // ---------------------------------------------------------------------------
 // The host-side object. One fat struct rather than a class hierarchy: these
 // are shims, the field set is small and fixed, and a flat record keeps every
@@ -307,6 +317,10 @@ struct ComObj {
     bool owns_pixels = false;
     uint32_t texture_handle = 0; // non-zero once GetHandle was called
     uint32_t dc_handle = 0;      // pseudo HDC handed out by GetDC
+    // IDirectDrawSurface4/7 private data, and the v7 priority/LOD hints.
+    std::vector<SurfacePrivateData> priv_data;
+    uint32_t surface_priority = 0;
+    uint32_t surface_lod = 0;
 
     // --- K_PALETTE
     uint32_t pal_flags = 0;
@@ -540,6 +554,15 @@ ComIface com_iface_for_iid(uint32_t guest_guid_addr);
 // false is the normal case.
 typedef ComObj *(*ComQiHook)(ComObj *self, ComIface want);
 void com_set_qi_hook(ComKind kind, ComQiHook hook);
+
+// A kind may name interfaces that must stop the run when queried, instead of
+// returning E_NOINTERFACE. This exists for an interface the original reaches
+// for and dereferences without checking the result: a returned error would
+// become a null dereference in the guest, which is a worse diagnostic than an
+// abort that names the interface it could not get. Returning true means the
+// hook handled (in practice, aborted) the query.
+typedef bool (*ComQiUnsupportedHook)(ComObj *self, ComIface want);
+void com_set_qi_unsupported(ComKind kind, ComQiUnsupportedHook hook);
 
 // ---------------------------------------------------------------------------
 // COM classes: what ole32's CoCreateInstance can make. A module registers the

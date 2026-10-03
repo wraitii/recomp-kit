@@ -25,6 +25,7 @@ KindMask g_kind_mask[IF_COUNT]; // bit per ComKind
 void (*g_dtor[COM_KIND_LIMIT])(ComObj *) = {nullptr};
 void (*g_ref_hook[COM_KIND_LIMIT])(ComObj *) = {nullptr};
 ComQiHook g_qi_hook[COM_KIND_LIMIT] = {nullptr};
+ComQiUnsupportedHook g_qi_unsupported[COM_KIND_LIMIT] = {nullptr};
 const char *g_iface_name[IF_COUNT] = {nullptr};
 
 struct IidEntry {
@@ -696,6 +697,11 @@ void com_set_qi_hook(ComKind kind, ComQiHook hook) {
         g_qi_hook[kind] = hook;
 }
 
+void com_set_qi_unsupported(ComKind kind, ComQiUnsupportedHook hook) {
+    if ((size_t)kind < COM_KIND_LIMIT)
+        g_qi_unsupported[kind] = hook;
+}
+
 // ---------------------------------------------------------------------------
 // IUnknown
 // ---------------------------------------------------------------------------
@@ -757,6 +763,12 @@ void com_QueryInterface(X86 *c) {
     }
 
     ComObj *target = o;
+    // A kind may declare an interface the original cannot survive losing. That
+    // hook runs before the kind check so it also names an interface the object
+    // was never bound to (IDirect3D7 on the DirectDraw object).
+    if ((size_t)o->kind < COM_KIND_LIMIT && g_qi_unsupported[o->kind] &&
+        g_qi_unsupported[o->kind](o, want))
+        return;
     if ((size_t)o->kind < COM_KIND_LIMIT && g_qi_hook[o->kind]) {
         ComObj *alt = g_qi_hook[o->kind](o, want);
         if (alt)

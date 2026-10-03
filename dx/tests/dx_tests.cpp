@@ -617,6 +617,7 @@ enum {
     DD_CreatePalette = 5,
     DD_CreateSurface = 6,
     DD_EnumDisplayModes = 8,
+    DD_GetCaps = 11,
     DD_GetDisplayMode = 12,
     DD_GetFourCCCodes = 13,
     DD_RestoreDisplayMode = 19,
@@ -624,6 +625,8 @@ enum {
     DD_SetDisplayMode = 21,
     DD_GetAvailableVidMem = 23,
     DD_GetDeviceIdentifier = 27,
+    DD_StartModeTest = 28,
+    DD_EvaluateMode = 29,
 };
 enum {
     S_QueryInterface = 0,
@@ -641,6 +644,15 @@ enum {
     S_Lock = 25,
     S_SetPalette = 31,
     S_Unlock = 32,
+    S_SetPrivateData = 40,
+    S_GetPrivateData = 41,
+    S_FreePrivateData = 42,
+    S_GetUniquenessValue = 43,
+    S_ChangeUniquenessValue = 44,
+    S_SetPriority = 45,
+    S_GetPriority = 46,
+    S_SetLOD = 47,
+    S_GetLOD = 48,
 };
 enum { P_SetEntries = 6 };
 enum {
@@ -6144,9 +6156,25 @@ static void test_directdraw_create_ex_fallback() {
     wr32(out, 0xdeadbeef);
     wr32(out + 4, 0xcafebabe);
     const uint32_t live = com_live_count();
-    CHECK_EQ(call_shim(create_ex, {0, out, iid, 0}), DDERR_UNSUPPORTED);
-    CHECK_EQ(rd32(out), 0);
+    // The version 7 factory returns a real IDirectDraw7 view.
+    CHECK_EQ(call_shim(create_ex, {0, out, iid, 0}), DD_OK);
+    const uint32_t dd7obj = rd32(out);
+    CHECK(dd7obj != 0);
+    // Only the first dword of the out pointer is written.
     CHECK_EQ(rd32(out + 4), 0xcafebabe);
+    CHECK_EQ(com_live_count(), live + 1);
+    // QueryInterface for the same interface returns the same pointer, and the
+    // object is one refcount shared across its views.
+    CHECK_EQ(call_method(dd7obj, DD_QueryInterface, {iid, sc(0x64)}), S_OK);
+    CHECK_EQ(rd32(sc(0x64)), dd7obj);
+    CHECK_EQ(call_method(rd32(sc(0x64)), DD_Release, {}), 1);
+    // The v7 vtable has StartModeTest/EvaluateMode in its two trailing slots.
+    const uint32_t vt7 = rd32(dd7obj + COM_OFF_vtbl);
+    const char *tail70 = imports_describe(rd32(vt7 + 0x70));
+    const char *tail74 = imports_describe(rd32(vt7 + 0x74));
+    CHECK(tail70 && strstr(tail70, "StartModeTest") != nullptr);
+    CHECK(tail74 && strstr(tail74, "EvaluateMode") != nullptr);
+    CHECK_EQ(call_method(dd7obj, DD_Release, {}), 0);
     CHECK_EQ(com_live_count(), live);
     CHECK_EQ(call_shim(create_ex, {0, 0, iid, 0}), DDERR_INVALIDPARAMS);
     CHECK_EQ(call_shim(create_ex, {0, out, 0, 0}), DDERR_INVALIDPARAMS);
@@ -6165,6 +6193,157 @@ static void test_directdraw_create_ex_fallback() {
     CHECK_EQ(call_method(view4, DD_Release, {}), 1);
     CHECK_EQ(call_method(dd, DD_Release, {}), 0);
     CHECK_EQ(com_live_count(), live);
+}
+
+// The IDirectDraw7 / IDirectDrawSurface7 object model: one object reachable
+// through several version views sharing a refcount, the DDSURFACEDESC2 /
+// DDSCAPS2 guest widths, and a 16bpp surface whose Lock pointer is the guest's
+// own R5G6B5 bytes.
+static void test_ddraw7_object_model() {
+    cpu_reset();
+    const uint32_t create_ex = tramp("DDRAW.dll", "DirectDrawCreateEx");
+    CHECK(create_ex != 0);
+    if (!create_ex)
+        return;
+    const uint8_t dd7[16] = {0xC0, 0x5E, 0xE6, 0x15, 0x9C, 0x3B, 0xD2, 0x11,
+                             0xB9, 0x2F, 0x00, 0x60, 0x97, 0x97, 0xEA, 0x5B};
+    const uint8_t dd4[16] = {0x9A, 0x50, 0x59, 0x9C, 0xBD, 0x39, 0xD1, 0x11,
+                             0x8C, 0x4A, 0x00, 0xC0, 0x4F, 0xD9, 0x30, 0xC5};
+    uint32_t iid = sc(0x40), out = sc(0x60);
+    memcpy(gm_ptr(iid), dd7, sizeof(dd7));
+    CHECK_EQ(call_shim(create_ex, {0, out, iid, 0}), DD_OK);
+    uint32_t dd = rd32(out);
+    CHECK(dd != 0);
+    if (!dd)
+        return;
+
+    // Guest structure widths and offsets this interface is checked against.
+    CHECK_EQ((uint32_t)DDSD_SIZE, 108u);
+    CHECK_EQ((uint32_t)DDSD2_SIZE, 124u);
+    CHECK_EQ((uint32_t)DDSD_OFF_ddsCaps, 0x68u);
+    CHECK_EQ((uint32_t)DDPF_SIZE, 32u);
+
+    // One object, several views: the DD4 view is a distinct pointer whose
+    // vtable differs, and releasing it leaves the DD7 object alive.
+    memcpy(gm_ptr(iid), dd4, sizeof(dd4));
+    CHECK_EQ(call_method(dd, DD_QueryInterface, {iid, sc(0x64)}), S_OK);
+    const uint32_t dd4view = rd32(sc(0x64));
+    CHECK(dd4view != 0 && dd4view != dd);
+    CHECK(rd32(dd4view + COM_OFF_vtbl) != rd32(dd + COM_OFF_vtbl));
+    CHECK_EQ(call_method(dd4view, DD_Release, {}), 1);
+
+    // SetDisplayMode (0x54) with the five-argument form, then GetDisplayMode
+    // (0x30) must return a DDSURFACEDESC2 with the mode just set.
+    CHECK(ddraw_set_modes("320x240x16"));
+    CHECK_EQ(call_method(dd, DD_SetDisplayMode, {320, 240, 16, 0, 0}), DD_OK);
+    uint32_t mode = sc(0x80);
+    gm_zero(mode, DDSD2_SIZE);
+    wr32(mode + DDSD_OFF_dwSize, DDSD2_SIZE);
+    CHECK_EQ(call_method(dd, DD_GetDisplayMode, {mode}), DD_OK);
+    CHECK_EQ(rd32(mode + DDSD_OFF_dwSize), (uint32_t)DDSD2_SIZE);
+    CHECK_EQ(rd32(mode + DDSD_OFF_dwWidth), 320u);
+    CHECK_EQ(rd32(mode + DDSD_OFF_dwHeight), 240u);
+
+    // GetDeviceIdentifier (0x6c) and GetCaps (0x2c) answer on the DD7 table.
+    uint32_t dev = sc(0x180);
+    CHECK_EQ(call_method(dd, DD_GetDeviceIdentifier, {dev, 0}), DD_OK);
+    CHECK(!gm_str(dev + DDDEVID_OFF_szDriver).empty());
+    uint32_t caps = sc(0x600);
+    gm_zero(caps, DDCAPS_SIZE);
+    wr32(caps, DDCAPS_SIZE);
+    CHECK_EQ(call_method(dd, DD_GetCaps, {caps, 0}), DD_OK);
+    CHECK(rd32(caps + DDCAPS_OFF_dwCaps) != 0);
+
+    // A 16bpp offscreen surface, created through the v7 CreateSurface. Its
+    // out pointer must be an IDirectDrawSurface7 view and its Lock pointer
+    // must be the guest-owned R5G6B5 bytes.
+    uint32_t desc = sc(0x900);
+    gm_zero(desc, DDSD2_SIZE);
+    wr32(desc + DDSD_OFF_dwSize, DDSD2_SIZE);
+    wr32(desc + DDSD_OFF_dwFlags, DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT);
+    wr32(desc + DDSD_OFF_dwWidth, 16);
+    wr32(desc + DDSD_OFF_dwHeight, 16);
+    wr32(desc + DDSD_OFF_ddsCaps, DDSCAPS_OFFSCREENPLAIN);
+    uint32_t pf = desc + DDSD_OFF_ddpfPixelFormat;
+    wr32(pf + DDPF_OFF_dwSize, DDPF_SIZE);
+    wr32(pf + DDPF_OFF_dwFlags, DDPF_RGB);
+    wr32(pf + DDPF_OFF_dwRGBBitCount, 16);
+    wr32(pf + DDPF_OFF_dwRBitMask, 0xf800);
+    wr32(pf + DDPF_OFF_dwGBitMask, 0x07e0);
+    wr32(pf + DDPF_OFF_dwBBitMask, 0x001f);
+    CHECK_EQ(call_method(dd, DD_CreateSurface, {desc, sc(0xa00), 0}), DD_OK);
+    uint32_t surf = rd32(sc(0xa00));
+    CHECK(surf != 0);
+    CHECK_EQ((uint32_t)com_iface_of(surf), (uint32_t)IF_DDSURFACE7);
+    // The v7 extras occupy slots 45..48: SetPriority/GetPriority/SetLOD/GetLOD.
+    const uint32_t svt = rd32(surf + COM_OFF_vtbl);
+    const char *sp = imports_describe(rd32(svt + 0xb4));
+    const char *sl = imports_describe(rd32(svt + 0xc0));
+    CHECK(sp && strstr(sp, "SetPriority") != nullptr);
+    CHECK(sl && strstr(sl, "GetLOD") != nullptr);
+
+    // Lock, write one pure-red R5G6B5 texel, Unlock, read it back.
+    uint32_t ldesc = sc(0xb00);
+    gm_zero(ldesc, DDSD2_SIZE);
+    wr32(ldesc + DDSD_OFF_dwSize, DDSD2_SIZE);
+    CHECK_EQ(call_method(surf, S_Lock, {0, ldesc, DDLOCK_WAIT, 0}), DD_OK);
+    CHECK_EQ(rd32(ldesc + DDSD_OFF_dwSize), (uint32_t)DDSD2_SIZE);
+    const uint32_t pitch = rd32(ldesc + DDSD_OFF_lPitch);
+    const uint32_t ptr = rd32(ldesc + DDSD_OFF_lpSurface);
+    CHECK(pitch >= 32u);
+    CHECK(ptr != 0);
+    wr16(ptr, 0xf800);
+    CHECK_EQ(call_method(surf, S_Unlock, {0}), DD_OK);
+    uint32_t ldesc2 = sc(0xb80);
+    gm_zero(ldesc2, DDSD2_SIZE);
+    wr32(ldesc2 + DDSD_OFF_dwSize, DDSD2_SIZE);
+    CHECK_EQ(call_method(surf, S_Lock, {0, ldesc2, DDLOCK_READONLY, 0}), DD_OK);
+    CHECK_EQ(rd16(rd32(ldesc2 + DDSD_OFF_lpSurface)), 0xf800);
+    CHECK_EQ(rd32(ldesc2 + DDSD_OFF_dwWidth), 16u);
+    CHECK_EQ(rd32(ldesc2 + DDSD_OFF_dwHeight), 16u);
+    CHECK_EQ(call_method(surf, S_Unlock, {0}), DD_OK);
+    uint32_t gpf = sc(0xc00);
+    CHECK_EQ(call_method(surf, S_GetPixelFormat, {gpf}), DD_OK);
+    CHECK_EQ(rd32(gpf + DDPF_OFF_dwRGBBitCount), 16u);
+    CHECK_EQ(rd32(gpf + DDPF_OFF_dwRBitMask), 0xf800u);
+
+    // Surface7 private data, priority and LOD are per-object state.
+    uint8_t tag[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    uint32_t tagp = sc(0xd00);
+    memcpy(gm_ptr(tagp), tag, 16);
+    uint32_t data = sc(0xd40);
+    wr32(data, 0x12345678u);
+    wr32(data + 4, 0x9abcdef0u);
+    CHECK_EQ(call_method(surf, S_SetPrivateData, {tagp, data, 8, 0}), DD_OK);
+    uint32_t got = sc(0xd80), gotlen = sc(0xdc0);
+    wr32(gotlen, 8);
+    CHECK_EQ(call_method(surf, S_GetPrivateData, {tagp, got, gotlen}), DD_OK);
+    CHECK_EQ(rd32(gotlen), 8u);
+    CHECK_EQ(rd32(got), 0x12345678u);
+    CHECK_EQ(rd32(got + 4), 0x9abcdef0u);
+    // A query-only call reports the size, then a short buffer reports MOREDATA.
+    wr32(gotlen, 0);
+    CHECK_EQ(call_method(surf, S_GetPrivateData, {tagp, 0, gotlen}), DD_OK);
+    CHECK_EQ(rd32(gotlen), 8u);
+    uint32_t shortlen = sc(0xdc4);
+    wr32(shortlen, 4);
+    CHECK_EQ(call_method(surf, S_GetPrivateData, {tagp, got, shortlen}), DDERR_MOREDATA);
+    CHECK_EQ(rd32(shortlen), 8u);
+    CHECK_EQ(call_method(surf, S_FreePrivateData, {tagp}), DD_OK);
+    CHECK_EQ(call_method(surf, S_FreePrivateData, {tagp}), DDERR_NOTFOUND);
+
+    CHECK_EQ(call_method(surf, S_SetPriority, {3}), DD_OK);
+    uint32_t prio = sc(0xe00);
+    CHECK_EQ(call_method(surf, S_GetPriority, {prio}), DD_OK);
+    CHECK_EQ(rd32(prio), 3u);
+    CHECK_EQ(call_method(surf, S_SetLOD, {2}), DD_OK);
+    uint32_t lod = sc(0xe40);
+    CHECK_EQ(call_method(surf, S_GetLOD, {lod}), DD_OK);
+    CHECK_EQ(rd32(lod), 2u);
+
+    CHECK_EQ(call_method(surf, S_Release, {}), 0);
+    CHECK_EQ(call_method(dd, DD_Release, {}), 0);
+    ddraw_reset_modes();
 }
 
 // QueryInterface: the DirectDraw object hands out IDirectDraw2 and 4, refuses
@@ -13939,6 +14118,7 @@ int main() {
         {"re-attach a palette", test_setpalette_self},
         {"colour key at 16 bpp", test_colorkey_16bpp},
         {"DirectDrawCreateEx fallback", test_directdraw_create_ex_fallback},
+        {"IDirectDraw7 object model", test_ddraw7_object_model},
         {"QueryInterface", test_query_interface},
         {"display modes", test_enum_display_modes},
         {"DirectDraw enumeration", test_directdraw_enumeration},

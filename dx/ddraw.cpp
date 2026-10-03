@@ -75,6 +75,13 @@ static const uint8_t IID_IDirectDrawClipper_[16] =
     IID_BYTES(0x6C14DB85, 0xA733, 0x11CE, 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60);
 static const uint8_t IID_IDirectDrawColorControl_[16] =
     IID_BYTES(0x4B9F0EE0, 0x0D7E, 0x11D0, 0x9B, 0x06, 0x00, 0xA0, 0xC9, 0x03, 0xA3, 0xB8);
+static const uint8_t IID_IDirectDrawSurface7_[16] =
+    IID_BYTES(0x06675A80, 0x3B9B, 0x11D2, 0xB9, 0x2F, 0x00, 0x60, 0x97, 0x97, 0xEA, 0x5B);
+// The Direct3D 7 object is not implemented yet, but its IID is registered so
+// QueryInterface can name it and stop rather than return an error the caller
+// will not check (see ddraw_qi_unsupported).
+static const uint8_t IID_IDirect3D7_[16] =
+    IID_BYTES(0xF5049E77, 0x4861, 0x11D2, 0xA4, 0x07, 0x00, 0xA0, 0xC9, 0x06, 0x29, 0xA8);
 
 namespace {
 void (*present_first_write)() = nullptr;
@@ -785,10 +792,24 @@ ComObj *surface_arg(X86 *c, int i) {
     return (s && s->kind == K_SURFACE) ? s : nullptr;
 }
 
-// Whether `this` is one of the DDSURFACEDESC2-era interfaces.
+// Whether an interface is one of the DDSURFACEDESC2-era interfaces.
+bool dd_is_v2_iface(ComIface f) {
+    return f == IF_DIRECTDRAW4 || f == IF_DIRECTDRAW7;
+}
+
+// Which surface interface matches a DirectDraw or surface interface, as the
+// real runtime does: version for version.
+ComIface surface_iface_of(ComIface f) {
+    if (f == IF_DIRECTDRAW7 || f == IF_DDSURFACE7)
+        return IF_DDSURFACE7;
+    if (f == IF_DIRECTDRAW4 || f == IF_DDSURFACE4)
+        return IF_DDSURFACE4;
+    return IF_DDSURFACE;
+}
+
 bool this_is_v2_iface(X86 *c) {
     ComIface f = com_iface_of(arg(c, 0));
-    return f == IF_DDSURFACE4 || f == IF_DIRECTDRAW4;
+    return f == IF_DDSURFACE4 || f == IF_DDSURFACE7 || dd_is_v2_iface(f);
 }
 
 } // namespace
@@ -2997,7 +3018,7 @@ void Surface_EnumAttachedSurfaces(X86 *c) {
         return;
     }
     bool v2 = this_is_v2_iface(c);
-    ComIface want = v2 ? IF_DDSURFACE4 : IF_DDSURFACE;
+    ComIface want = surface_iface_of(com_iface_of(arg(c, 0)));
     for (uint32_t id = s->back_obj; id;) {
         ComObj *b = com_get(id);
         if (!b)
@@ -3552,7 +3573,7 @@ void Surface_Unlock(X86 *c) {
     const int32_t *unlock_rect = nullptr;
     uint32_t unlock_ptr = 0;
     uint32_t a1 = arg(c, 1);
-    if (com_iface_of(arg(c, 0)) == IF_DDSURFACE4) {
+    if (com_iface_of(arg(c, 0)) == IF_DDSURFACE4 || com_iface_of(arg(c, 0)) == IF_DDSURFACE7) {
         if (a1 && gm_valid(a1, 16)) {
             for (int i = 0; i < 4; ++i)
                 ur[i] = (int32_t)rd32(a1 + (uint32_t)i * 4);
@@ -3670,9 +3691,127 @@ void Surface_SetSurfaceDesc(X86 *c) {
 }
 
 // --- IDirectDrawSurface4 additions
-DX_STUB(Surface_SetPrivateData, DDERR_UNSUPPORTED)
-DX_STUB(Surface_GetPrivateData, DDERR_NOTFOUND)
-DX_STUB(Surface_FreePrivateData, DDERR_NOTFOUND)
+// Private data is a host-side copy of the guest's bytes, keyed by the caller's
+// GUID. It is per surface and lives exactly as long as the surface object does.
+int surface_priv_index(ComObj *s, const uint8_t *guid) {
+    for (size_t i = 0; i < s->priv_data.size(); ++i)
+        if (memcmp(s->priv_data[i].guid, guid, 16) == 0)
+            return (int)i;
+    return -1;
+}
+
+void Surface_SetPrivateData(X86 *c) {
+    ComObj *s = this_surface(c);
+    uint32_t tag = arg(c, 1), data = arg(c, 2), size = arg(c, 3);
+    if (!s || !tag || !gm_valid(tag, 16)) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    if (size && (!data || !gm_valid(data, size))) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    const uint8_t *guid = gm_ptr(tag);
+    int idx = surface_priv_index(s, guid);
+    if (idx < 0) {
+        s->priv_data.push_back(SurfacePrivateData{});
+        memcpy(s->priv_data.back().guid, guid, 16);
+        idx = (int)s->priv_data.size() - 1;
+    }
+    if (size)
+        s->priv_data[idx].bytes.assign(gm_ptr(data), gm_ptr(data) + size);
+    else
+        s->priv_data[idx].bytes.clear();
+    com_ret(c, DD_OK);
+}
+
+void Surface_GetPrivateData(X86 *c) {
+    ComObj *s = this_surface(c);
+    uint32_t tag = arg(c, 1), buf = arg(c, 2), pcb = arg(c, 3);
+    if (!s || !tag || !gm_valid(tag, 16) || !pcb || !gm_valid(pcb, 4)) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    int idx = surface_priv_index(s, gm_ptr(tag));
+    if (idx < 0) {
+        com_ret(c, DDERR_NOTFOUND);
+        return;
+    }
+    uint32_t size = (uint32_t)s->priv_data[idx].bytes.size();
+    uint32_t have = rd32(pcb);
+    wr32(pcb, size);
+    if (!buf) {
+        com_ret(c, DD_OK);
+        return;
+    }
+    if (have < size) {
+        com_ret(c, DDERR_MOREDATA);
+        return;
+    }
+    if (size && !gm_valid(buf, size)) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    if (size)
+        memcpy(gm_ptr(buf), s->priv_data[idx].bytes.data(), size);
+    com_ret(c, DD_OK);
+}
+
+void Surface_FreePrivateData(X86 *c) {
+    ComObj *s = this_surface(c);
+    uint32_t tag = arg(c, 1);
+    if (!s || !tag || !gm_valid(tag, 16)) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    int idx = surface_priv_index(s, gm_ptr(tag));
+    if (idx < 0) {
+        com_ret(c, DDERR_NOTFOUND);
+        return;
+    }
+    s->priv_data.erase(s->priv_data.begin() + idx);
+    com_ret(c, DD_OK);
+}
+
+// --- IDirectDrawSurface7 additions
+void Surface_SetPriority(X86 *c) {
+    ComObj *s = this_surface(c);
+    if (!s) {
+        com_ret(c, DDERR_INVALIDOBJECT);
+        return;
+    }
+    s->surface_priority = arg(c, 1);
+    com_ret(c, DD_OK);
+}
+void Surface_GetPriority(X86 *c) {
+    ComObj *s = this_surface(c);
+    uint32_t out = arg(c, 1);
+    if (!s || !out || !gm_valid(out, 4)) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    wr32(out, s->surface_priority);
+    com_ret(c, DD_OK);
+}
+void Surface_SetLOD(X86 *c) {
+    ComObj *s = this_surface(c);
+    if (!s) {
+        com_ret(c, DDERR_INVALIDOBJECT);
+        return;
+    }
+    s->surface_lod = arg(c, 1);
+    com_ret(c, DD_OK);
+}
+void Surface_GetLOD(X86 *c) {
+    ComObj *s = this_surface(c);
+    uint32_t out = arg(c, 1);
+    if (!s || !out || !gm_valid(out, 4)) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    wr32(out, s->surface_lod);
+    com_ret(c, DD_OK);
+}
 
 void Surface_GetUniquenessValue(X86 *c) {
     ComObj *s = this_surface(c);
@@ -3745,6 +3884,24 @@ const ComMethod g_surface4[] = {
     {"FreePrivateData", 2, Surface_FreePrivateData},
     {"GetUniquenessValue", 2, Surface_GetUniquenessValue},
     {"ChangeUniquenessValue", 1, Surface_ChangeUniquenessValue},
+};
+
+// IDirectDrawSurface7 is the surface4 table plus its four v7 slots.
+const ComMethod g_surface7[] = {
+    SURFACE_COMMON_SLOTS,
+    {"GetDDInterface", 2, Surface_GetDDInterface},
+    {"PageLock", 2, Surface_PageLock},
+    {"PageUnlock", 2, Surface_PageUnlock},
+    {"SetSurfaceDesc", 3, Surface_SetSurfaceDesc},
+    {"SetPrivateData", 5, Surface_SetPrivateData},
+    {"GetPrivateData", 4, Surface_GetPrivateData},
+    {"FreePrivateData", 2, Surface_FreePrivateData},
+    {"GetUniquenessValue", 2, Surface_GetUniquenessValue},
+    {"ChangeUniquenessValue", 1, Surface_ChangeUniquenessValue},
+    {"SetPriority", 2, Surface_SetPriority},
+    {"GetPriority", 2, Surface_GetPriority},
+    {"SetLOD", 2, Surface_SetLOD},
+    {"GetLOD", 2, Surface_GetLOD},
 };
 
 // ===========================================================================
@@ -4098,7 +4255,7 @@ void DD_CreatePalette(X86 *c) {
 }
 
 // The shared body of IDirectDraw::CreateSurface and IDirectDraw4's.
-void create_surface(X86 *c, bool v2_iface) {
+void create_surface(X86 *c, ComIface surface_iface) {
     ComObj *dd = this_ddraw(c);
     uint32_t desc = arg(c, 1);
     uint32_t out = arg(c, 2);
@@ -4107,7 +4264,7 @@ void create_surface(X86 *c, bool v2_iface) {
         return;
     }
     com_out_ptr(out, 0);
-    bool v2 = desc_is_v2(desc, v2_iface);
+    bool v2 = desc_is_v2(desc, surface_iface == IF_DDSURFACE4 || surface_iface == IF_DDSURFACE7);
     if (!gm_valid(desc, v2 ? DDSD2_SIZE : DDSD_SIZE)) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
@@ -4255,7 +4412,7 @@ void create_surface(X86 *c, bool v2_iface) {
         dd->surfaces.push_back(b->id);
     }
     dd->surfaces.push_back(s->id);
-    ComIface want = v2_iface ? IF_DDSURFACE4 : IF_DDSURFACE;
+    ComIface want = surface_iface;
     uint32_t view = com_view(s, want);
     if (!view) {
         com_release(s);
@@ -4273,8 +4430,8 @@ void create_surface(X86 *c, bool v2_iface) {
 
 // Keep every refusal, including repeated capability probes. The general COM
 // error logger deduplicates by HRESULT and cannot identify the requested surface.
-void create_surface_with_diagnostic(X86 *c, bool v2_iface) {
-    create_surface(c, v2_iface);
+void create_surface_with_diagnostic(X86 *c, ComIface surface_iface) {
+    create_surface(c, surface_iface);
     const uint32_t hr = c->r[R_EAX];
     if (!(hr & 0x80000000u))
         return;
@@ -4297,7 +4454,10 @@ void create_surface_with_diagnostic(X86 *c, bool v2_iface) {
          "\"surface\":\"%s\",\"descriptor_readable\":%s,\"descriptor_flags\":%u,"
          "\"caps\":%u,\"requested_width\":%u,\"requested_height\":%u,"
          "\"requested_format\":%s,\"display_mode\":[%u,%u,%u]}",
-         v2_iface ? "IDirectDraw4" : "IDirectDraw", hr,
+         surface_iface == IF_DDSURFACE7   ? "IDirectDraw7"
+         : surface_iface == IF_DDSURFACE4 ? "IDirectDraw4"
+                                          : "IDirectDraw",
+         hr,
          !readable || !(flags & DDSD_CAPS)
              ? "unknown"
              : ((caps & DDSCAPS_PRIMARYSURFACE) ? "primary" : "offscreen"),
@@ -4308,10 +4468,13 @@ void create_surface_with_diagnostic(X86 *c, bool v2_iface) {
 }
 
 void DD_CreateSurface(X86 *c) {
-    create_surface_with_diagnostic(c, false);
+    create_surface_with_diagnostic(c, IF_DDSURFACE);
 }
 void DD_CreateSurface4(X86 *c) {
-    create_surface_with_diagnostic(c, true);
+    create_surface_with_diagnostic(c, IF_DDSURFACE4);
+}
+void DD_CreateSurface7(X86 *c) {
+    create_surface_with_diagnostic(c, IF_DDSURFACE7);
 }
 
 void DD_DuplicateSurface(X86 *c) {
@@ -4344,7 +4507,7 @@ void DD_DuplicateSurface(X86 *c) {
         memcpy(gm_ptr(s->pixels), gm_ptr(src->pixels),
                std::min(s->pixels_bytes, src->pixels_bytes));
     ComIface f = com_iface_of(arg(c, 0));
-    uint32_t view = com_view(s, f == IF_DIRECTDRAW4 ? IF_DDSURFACE4 : IF_DDSURFACE);
+    uint32_t view = com_view(s, surface_iface_of(f));
     if (!view) {
         com_release(s);
         com_ret(c, E_OUTOFMEMORY);
@@ -4365,7 +4528,7 @@ void DD_EnumDisplayModes(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    bool v2 = com_iface_of(arg(c, 0)) == IF_DIRECTDRAW4;
+    bool v2 = dd_is_v2_iface(com_iface_of(arg(c, 0)));
 
     // A caller may restrict the enumeration by width, height or bit depth.
     uint32_t want_flags = 0, want_w = 0, want_h = 0, want_bpp = 0;
@@ -4426,8 +4589,8 @@ void DD_EnumSurfaces(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    bool v2 = com_iface_of(arg(c, 0)) == IF_DIRECTDRAW4;
-    ComIface want = v2 ? IF_DDSURFACE4 : IF_DDSURFACE;
+    bool v2 = dd_is_v2_iface(com_iface_of(arg(c, 0)));
+    ComIface want = surface_iface_of(com_iface_of(arg(c, 0)));
     // DDENUMSURFACES_DOESEXIST (2) over the surfaces this device made is the
     // only mode with a defined answer here.
     for (uint32_t id : dd->surfaces) {
@@ -4476,7 +4639,7 @@ void DD_GetDisplayMode(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    bool v2 = desc_is_v2(out, com_iface_of(arg(c, 0)) == IF_DIRECTDRAW4);
+    bool v2 = desc_is_v2(out, dd_is_v2_iface(com_iface_of(arg(c, 0))));
     uint32_t size = v2 ? DDSD2_SIZE : DDSD_SIZE;
     if (!gm_valid(out, size)) {
         com_ret(c, DDERR_INVALIDPARAMS);
@@ -4753,6 +4916,23 @@ const ComMethod g_ddraw4[] = {
     {"GetDeviceIdentifier", 3, DD_GetDeviceIdentifier},
 };
 
+// IDirectDraw7 is the v4 table plus its two v7 slots. Neither mode-test method
+// is called by the game, so both stop by name rather than invent a result.
+const ComMethod g_ddraw7[] = {
+    DD_COMMON_SLOTS_HEAD,
+    {"CreateSurface", 4, DD_CreateSurface7}, // DDSURFACEDESC2, IDirectDrawSurface7 out
+    DD_COMMON_SLOTS_TAIL,
+    {"SetDisplayMode", 6, DD_SetDisplayMode2},
+    {"WaitForVerticalBlank", 3, DD_WaitForVerticalBlank},
+    {"GetAvailableVidMem", 4, DD_GetAvailableVidMem},
+    {"GetSurfaceFromDC", 3, DD_GetSurfaceFromDC},
+    {"RestoreAllSurfaces", 1, DD_RestoreAllSurfaces},
+    {"TestCooperativeLevel", 1, DD_TestCooperativeLevel},
+    {"GetDeviceIdentifier", 3, DD_GetDeviceIdentifier},
+    {"StartModeTest", 4, imports_unsupported},
+    {"EvaluateMode", 3, imports_unsupported},
+};
+
 // ===========================================================================
 // DDRAW.dll exports
 // ===========================================================================
@@ -4808,7 +4988,34 @@ void DirectDrawCreateEx(X86 *c) {
         com_ret(c, CLASS_E_NOAGGREGATION);
         return;
     }
-    com_ret(c, DDERR_UNSUPPORTED);
+    ComObj *dd = com_new(K_DDRAW);
+    dd->mode_w = 640;
+    dd->mode_h = 480;
+    dd->mode_bpp = 8;
+    uint32_t view = com_view(dd, IF_DIRECTDRAW7);
+    if (!view) {
+        com_release(dd);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    if (!g_primary_dd)
+        g_primary_dd = dd->id;
+    wr32(out, view);
+    LOGV("ddraw: DirectDrawCreateEx(IID_IDirectDraw7) -> %08x", view);
+    com_ret(c, DD_OK);
+}
+
+// IDirect3D7 is not implemented yet. Its QueryInterface must stop rather than
+// return E_NOINTERFACE: OpenD3D (0x82cd80) does not check the HRESULT and then
+// dereferences the null g_pDirect3D7, so an error here becomes an anonymous
+// null dereference instead of a named missing interface.
+bool ddraw_qi_unsupported(ComObj *, ComIface want) {
+    if (want == IF_D3D7) {
+        LOGW("ddraw: IDirectDraw7::QueryInterface(IID_IDirect3D7) is not implemented;"
+             " there is no Direct3D 7 host yet");
+        abort();
+    }
+    return false;
 }
 
 void enumerate_devices(X86 *c, bool wide, bool extended) {
@@ -4913,6 +5120,7 @@ void ddraw_register() {
     com_define(IF_DIRECTDRAW, "DDRAW.dll", "IDirectDraw", g_ddraw1, std::size(g_ddraw1));
     com_define(IF_DIRECTDRAW2, "DDRAW.dll", "IDirectDraw2", g_ddraw2, std::size(g_ddraw2));
     com_define(IF_DIRECTDRAW4, "DDRAW.dll", "IDirectDraw4", g_ddraw4, std::size(g_ddraw4));
+    com_define(IF_DIRECTDRAW7, "DDRAW.dll", "IDirectDraw7", g_ddraw7, std::size(g_ddraw7));
     com_define(IF_DDSURFACE, "DDRAW.dll", "IDirectDrawSurface", g_surface1, std::size(g_surface1));
     com_define(IF_DDSURFACE2, "DDRAW.dll", "IDirectDrawSurface2", g_surface2,
                std::size(g_surface2));
@@ -4920,6 +5128,8 @@ void ddraw_register() {
                std::size(g_surface3));
     com_define(IF_DDSURFACE4, "DDRAW.dll", "IDirectDrawSurface4", g_surface4,
                std::size(g_surface4));
+    com_define(IF_DDSURFACE7, "DDRAW.dll", "IDirectDrawSurface7", g_surface7,
+               std::size(g_surface7));
     com_define(IF_DDPALETTE, "DDRAW.dll", "IDirectDrawPalette", g_palette, std::size(g_palette));
     com_define(IF_DDCLIPPER, "DDRAW.dll", "IDirectDrawClipper", g_clipper, std::size(g_clipper));
     com_define(IF_DDCOLORCONTROL, "DDRAW.dll", "IDirectDrawColorControl", g_colorcontrol,
@@ -4928,10 +5138,12 @@ void ddraw_register() {
     com_bind(IF_DIRECTDRAW, K_DDRAW);
     com_bind(IF_DIRECTDRAW2, K_DDRAW);
     com_bind(IF_DIRECTDRAW4, K_DDRAW);
+    com_bind(IF_DIRECTDRAW7, K_DDRAW);
     com_bind(IF_DDSURFACE, K_SURFACE);
     com_bind(IF_DDSURFACE2, K_SURFACE);
     com_bind(IF_DDSURFACE3, K_SURFACE);
     com_bind(IF_DDSURFACE4, K_SURFACE);
+    com_bind(IF_DDSURFACE7, K_SURFACE);
     com_bind(IF_DDPALETTE, K_PALETTE);
     com_bind(IF_DDCLIPPER, K_CLIPPER);
     com_bind(IF_DDCOLORCONTROL, K_SURFACE);
@@ -4939,16 +5151,22 @@ void ddraw_register() {
     com_register_iid(IF_DIRECTDRAW, IID_IDirectDraw_);
     com_register_iid(IF_DIRECTDRAW2, IID_IDirectDraw2_);
     com_register_iid(IF_DIRECTDRAW4, IID_IDirectDraw4_);
+    com_register_iid(IF_DIRECTDRAW7, IID_IDirectDraw7_);
     com_register_iid(IF_DDSURFACE, IID_IDirectDrawSurface_);
     com_register_iid(IF_DDSURFACE2, IID_IDirectDrawSurface2_);
     com_register_iid(IF_DDSURFACE3, IID_IDirectDrawSurface3_);
     com_register_iid(IF_DDSURFACE4, IID_IDirectDrawSurface4_);
+    com_register_iid(IF_DDSURFACE7, IID_IDirectDrawSurface7_);
+    // Registered so the QI hook below can name it when it stops the run. It
+    // is not bound to a kind and has no vtable: it is deliberately absent.
+    com_register_iid(IF_D3D7, IID_IDirect3D7_);
     com_register_iid(IF_DDPALETTE, IID_IDirectDrawPalette_);
     com_register_iid(IF_DDCLIPPER, IID_IDirectDrawClipper_);
     com_register_iid(IF_DDCOLORCONTROL, IID_IDirectDrawColorControl_);
 
     com_set_destructor(K_SURFACE, surface_destroy);
     com_set_destructor(K_DDRAW, ddraw_destroy);
+    com_set_qi_unsupported(K_DDRAW, ddraw_qi_unsupported);
 
     imports_register(g_ddraw_exports, std::size(g_ddraw_exports));
 }
