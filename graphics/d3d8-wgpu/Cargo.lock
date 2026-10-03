@@ -409,6 +409,7 @@ dependencies = [
  "bytemuck",
  "env_logger",
  "log",
+ "metal",
  "pollster",
  "wgpu",
  "winit",

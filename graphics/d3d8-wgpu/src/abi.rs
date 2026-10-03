@@ -1074,6 +1074,52 @@ pub extern "C" fn d3d8_device_present(dev: *mut D3d8Device, err: *mut D3d8Error)
     report(err, device.present())
 }
 
+/// Hand the presented frame to a host that shares the Metal device, without a
+/// CPU readback. Copies the backbuffer into a ring slot on the GPU, waits for
+/// it, and returns the slot's `MTLTexture*` (borrowed) with a busy flag the
+/// host must set to 0 once it no longer reads the texture. Any failure leaves
+/// the device usable; the caller falls back to `d3d8_device_read_pixels`.
+#[unsafe(no_mangle)]
+pub extern "C" fn d3d8_device_present_handoff(
+    dev: *mut D3d8Device,
+    out_texture: *mut *mut core::ffi::c_void,
+    out_busy: *mut *mut u32,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    err: *mut D3d8Error,
+) -> i32 {
+    let Some(device) = device_ref(dev) else {
+        write_error(
+            err,
+            D3d8Status::InvalidArgument,
+            "present_handoff: null device",
+        );
+        return D3d8Status::InvalidArgument as i32;
+    };
+    if out_texture.is_null() || out_busy.is_null() || out_width.is_null() || out_height.is_null() {
+        write_error(
+            err,
+            D3d8Status::InvalidArgument,
+            "present_handoff: null out",
+        );
+        return D3d8Status::InvalidArgument as i32;
+    }
+    match device.present_handoff() {
+        Ok(frame) => {
+            // SAFETY: caller-provided out-parameters, checked non-null above.
+            unsafe {
+                *out_texture = frame.texture.cast_mut();
+                *out_busy = frame.busy.as_ptr();
+                *out_width = frame.width;
+                *out_height = frame.height;
+            }
+            write_error(err, D3d8Status::Ok, "");
+            D3d8Status::Ok as i32
+        }
+        Err(failure) => report(err, Err(failure)),
+    }
+}
+
 /// World/UI boundary notification with an optional scene post-process
 /// (`SCENE_POST_*`: 0 none, 1 FXAA). See `Device::scene_boundary`.
 #[unsafe(no_mangle)]

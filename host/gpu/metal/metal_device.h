@@ -85,6 +85,7 @@ class MetalDevice final : public Device {
         return queue_;
     }
     Texture import_texture(id<MTLTexture> t);
+    Texture import_native_texture(void *native) override;
     id<MTLTexture> native_texture(Texture t);
 
   private:

@@ -206,6 +206,15 @@ class Device {
                                         Buffer dst, uint64_t offset, int pitch) = 0;
     virtual void generate_mipmaps(CommandBuffer cb, Texture t) = 0;
 
+    // Wrap a texture another API created on this same GPU device (Metal: an
+    // `id<MTLTexture>` passed as `void *`, not retained by the caller after the
+    // wrapped handle is dropped). Empty when the backend cannot share it, in
+    // which case the caller copies through the CPU instead.
+    virtual Texture import_native_texture(void *native) {
+        (void)native;
+        return {};
+    }
+
     // Runs on a backend thread after the buffer finishes; `status` says how.
     virtual void on_complete(CommandBuffer cb,
                              std::function<void(CommandStatus, double gpu_ms)> fn) = 0;

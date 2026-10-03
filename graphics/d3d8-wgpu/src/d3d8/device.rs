@@ -399,6 +399,55 @@ const _: () = {
     assert!(std::mem::size_of::<StagesUniform>() <= 256);
 };
 
+/// The raw `MTLTexture*` behind a wgpu texture. Only the Metal backend has one.
+#[cfg(target_os = "macos")]
+fn native_texture_ptr(texture: &wgpu::Texture) -> Result<*const core::ffi::c_void, RenderError> {
+    // SAFETY: the pointer is only borrowed, never released or retained here;
+    // the texture outlives every use because the ring owns it.
+    unsafe {
+        let hal = texture
+            .as_hal::<wgpu::hal::api::Metal>()
+            .ok_or_else(|| RenderError::new("present_handoff", "texture is not a Metal texture"))?;
+        let raw: &metal::TextureRef = hal.raw_handle();
+        Ok(raw as *const metal::TextureRef as *const core::ffi::c_void)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_texture_ptr(_: &wgpu::Texture) -> Result<*const core::ffi::c_void, RenderError> {
+    Err(RenderError::new(
+        "present_handoff",
+        "native texture handoff is macOS-only",
+    ))
+}
+
+/// Slots in the present handoff ring. The host's staging blit of a slot runs
+/// asynchronously on its own queue; a slot is reused only after the host
+/// clears its busy flag, so the next frame never overwrites pixels in flight.
+const FRAME_RING_SLOTS: usize = 3;
+
+/// GPU copies of the backbuffer handed to the host presenter as raw native
+/// textures, so a present moves no pixels through the CPU.
+struct FrameRing {
+    width: u32,
+    height: u32,
+    textures: Vec<wgpu::Texture>,
+    /// 1 while the host still reads the slot. Leaked: the host clears it from a
+    /// GPU completion callback that may outlive the device.
+    busy: Vec<&'static std::sync::atomic::AtomicU32>,
+    next: usize,
+}
+
+/// One frame handed to the host. `texture` is a borrowed native texture
+/// (`MTLTexture*`), valid while the device lives; the host sets `*busy` to 0
+/// when it no longer reads it.
+pub struct FrameHandoff {
+    pub texture: *const core::ffi::c_void,
+    pub busy: &'static std::sync::atomic::AtomicU32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Flush a recorded batch once its CPU-side block data reaches this size.
 const BATCH_FLUSH_BYTES: usize = 8 << 20;
 
@@ -410,11 +459,13 @@ struct StageBindings {
     sampler1: wgpu::Sampler,
 }
 
-/// One recorded draw. Its uniforms and vertices live in `DrawBatch::data` at
-/// `base` (uniforms at the `DRAW_UB_*` offsets, vertices at `DRAW_VERTEX_OFFSET`).
+/// One recorded draw. Its uniforms live in `DrawBatch::data` at `ub_base`
+/// (at the `DRAW_UB_*` offsets; consecutive draws with identical uniforms share
+/// one block) and its vertices at `vertex_base`.
 struct PendingDraw {
     pipeline: wgpu::RenderPipeline,
-    base: u64,
+    ub_base: u64,
+    vertex_base: u64,
     vertex_len: u64,
     stages: bool,
     textures: Option<StageBindings>,
@@ -432,6 +483,8 @@ struct PendingDraw {
 struct DrawBatch {
     draws: Vec<PendingDraw>,
     data: Vec<u8>,
+    /// Offset of the most recent uniform block in `data`, for sharing.
+    last_ub: Option<usize>,
     color_view: Option<wgpu::TextureView>,
     depth: Option<(wgpu::TextureView, bool)>,
 }
@@ -507,6 +560,8 @@ pub struct Device {
     /// would require a per-draw ring.
     draw_buffer: std::cell::RefCell<Option<wgpu::Buffer>>,
     batch: std::cell::RefCell<DrawBatch>,
+    /// Present handoff ring (see [`FrameRing`]); created on first use.
+    frame_ring: std::cell::RefCell<Option<FrameRing>>,
     /// The batch's target needs `publish_target` after it is flushed.
     publish_pending: std::cell::Cell<bool>,
     submits: std::cell::Cell<u64>,
@@ -559,6 +614,7 @@ impl Device {
             lit_scratch: Vec::new(),
             draw_buffer: Default::default(),
             batch: Default::default(),
+            frame_ring: Default::default(),
             publish_pending: Default::default(),
             submits: Default::default(),
             buffers_created_at_flush: Default::default(),
@@ -1286,8 +1342,7 @@ impl Device {
             let used = count as usize * vertices.stride as usize;
             (&vertices.bytes()[..used], used)
         };
-        let block = (DRAW_VERTEX_OFFSET + vertex_len as u64).next_multiple_of(256);
-        let base = {
+        let (ub_base, vertex_base) = {
             let mut batch = self.batch.borrow_mut();
             if batch.draws.is_empty() {
                 batch.color_view = Some(self.target.view.clone());
@@ -1297,24 +1352,46 @@ impl Device {
                     .as_ref()
                     .map(|d| (d.view.clone(), d.has_stencil));
             }
-            let base = batch.data.len();
-            batch.data.resize(base + block as usize, 0);
-            let region = &mut batch.data[base..];
+            // Uniform blocks are rebuilt on the stack and shared with the
+            // previous draw when byte-identical: state rarely changes between
+            // consecutive draws, and the block is 1 KB against a few hundred
+            // bytes of vertices.
+            let mut ub = [0u8; DRAW_VERTEX_OFFSET as usize];
             let put = |region: &mut [u8], offset: u64, bytes: &[u8]| {
                 region[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
             };
-            put(region, DRAW_UB_TRANSFORM, bytemuck::bytes_of(&uniform));
-            put(region, DRAW_UB_FOG, bytemuck::bytes_of(&fog_uniform));
+            put(&mut ub, DRAW_UB_TRANSFORM, bytemuck::bytes_of(&uniform));
+            put(&mut ub, DRAW_UB_FOG, bytemuck::bytes_of(&fog_uniform));
             put(
-                region,
+                &mut ub,
                 DRAW_UB_ALPHA_TEST,
                 bytemuck::bytes_of(&alpha_test_uniform),
             );
             if let Some(stages) = &stages_uniform {
-                put(region, DRAW_UB_STAGES, bytemuck::bytes_of(stages));
+                put(&mut ub, DRAW_UB_STAGES, bytemuck::bytes_of(stages));
             }
-            put(region, DRAW_VERTEX_OFFSET, vertex_source);
-            base as u64
+            let shared = batch
+                .last_ub
+                .filter(|&at| batch.data[at..at + ub.len()] == ub);
+            let ub_base = match shared {
+                Some(at) => at,
+                None => {
+                    // Uniform binding offsets need 256-byte alignment.
+                    let at = batch.data.len().next_multiple_of(256);
+                    batch.data.resize(at, 0);
+                    batch.data.extend_from_slice(&ub);
+                    batch.last_ub = Some(at);
+                    at
+                }
+            };
+            // Vertex buffer offsets need 4-byte alignment only.
+            let vertex_base = batch.data.len().next_multiple_of(4);
+            batch.data.resize(vertex_base, 0);
+            batch.data.extend_from_slice(vertex_source);
+            // `write_buffer` needs a multiple of COPY_BUFFER_ALIGNMENT.
+            let padded = batch.data.len().next_multiple_of(4);
+            batch.data.resize(padded, 0);
+            (ub_base as u64, vertex_base as u64)
         };
         self.frame_stats.uniform_writes += 1;
         if let Some(scratch) = lit_scratch.take() {
@@ -1387,7 +1464,8 @@ impl Device {
         };
         self.batch.borrow_mut().draws.push(PendingDraw {
             pipeline,
-            base,
+            ub_base,
+            vertex_base,
             vertex_len: vertex_len as u64,
             stages: stages_uniform.is_some(),
             textures,
@@ -1471,7 +1549,7 @@ impl Device {
             for d in &batch.draws {
                 // A bind group built from an automatic pipeline layout is
                 // exclusive to that pipeline, so groups are built per draw.
-                let t = d.base + DRAW_UB_TRANSFORM;
+                let t = d.ub_base + DRAW_UB_TRANSFORM;
                 let group = if d.stages {
                     gpu.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("D3D8 transform+stage binding"),
@@ -1485,18 +1563,21 @@ impl Device {
                                 binding: 1,
                                 resource: uniform_binding::<StagesUniform>(
                                     db,
-                                    d.base + DRAW_UB_STAGES,
+                                    d.ub_base + DRAW_UB_STAGES,
                                 ),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 2,
-                                resource: uniform_binding::<FogUniform>(db, d.base + DRAW_UB_FOG),
+                                resource: uniform_binding::<FogUniform>(
+                                    db,
+                                    d.ub_base + DRAW_UB_FOG,
+                                ),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 3,
                                 resource: uniform_binding::<AlphaTestUniform>(
                                     db,
-                                    d.base + DRAW_UB_ALPHA_TEST,
+                                    d.ub_base + DRAW_UB_ALPHA_TEST,
                                 ),
                             },
                         ],
@@ -1512,13 +1593,16 @@ impl Device {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 2,
-                                resource: uniform_binding::<FogUniform>(db, d.base + DRAW_UB_FOG),
+                                resource: uniform_binding::<FogUniform>(
+                                    db,
+                                    d.ub_base + DRAW_UB_FOG,
+                                ),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 3,
                                 resource: uniform_binding::<AlphaTestUniform>(
                                     db,
-                                    d.base + DRAW_UB_ALPHA_TEST,
+                                    d.ub_base + DRAW_UB_ALPHA_TEST,
                                 ),
                             },
                         ],
@@ -1551,7 +1635,7 @@ impl Device {
                     });
                     pass.set_bind_group(1, &texture_group, &[]);
                 }
-                let vstart = d.base + DRAW_VERTEX_OFFSET;
+                let vstart = d.vertex_base;
                 pass.set_vertex_buffer(0, db.slice(vstart..vstart + d.vertex_len));
                 let v = &d.viewport;
                 pass.set_scissor_rect(v.x, v.y, v.width, v.height);
@@ -1570,6 +1654,7 @@ impl Device {
         self.submits.set(self.submits.get() + 1);
         batch.draws.clear();
         batch.data.clear();
+        batch.last_ub = None;
         drop(batch);
         drop(slot);
         if self.publish_pending.replace(false) {
@@ -1676,6 +1761,111 @@ impl Device {
     pub fn read_pixels(&self) -> Result<Vec<u8>, RenderError> {
         self.flush_draws();
         self.gpu.read_pixels(&self.targets.backbuffer)
+    }
+
+    /// Copy the backbuffer into the next ring slot on the GPU, wait for the
+    /// work to finish, and return the slot's native texture. This replaces
+    /// `read_pixels_into` for hosts that share the Metal device; the wait for
+    /// the render to finish is the same one the readback made. Fails (so the
+    /// caller falls back to readback) when no native handle is available.
+    pub fn present_handoff(&self) -> Result<FrameHandoff, RenderError> {
+        use std::sync::atomic::Ordering;
+        self.flush_draws();
+        let b = &self.targets.backbuffer;
+        let mut ring = self.frame_ring.borrow_mut();
+        if ring
+            .as_ref()
+            .is_some_and(|r| r.width != b.width || r.height != b.height)
+        {
+            // Resized: the old slots may still be read by the host.
+            let old = ring.take().unwrap();
+            for busy in &old.busy {
+                self.wait_slot(busy)?;
+            }
+        }
+        let ring = ring.get_or_insert_with(|| FrameRing {
+            width: b.width,
+            height: b.height,
+            textures: (0..FRAME_RING_SLOTS)
+                .map(|_| {
+                    self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("d3d8-present-ring"),
+                        size: wgpu::Extent3d {
+                            width: b.width,
+                            height: b.height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: b.format,
+                        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    })
+                })
+                .collect(),
+            busy: (0..FRAME_RING_SLOTS)
+                .map(|_| &*Box::leak(Box::new(std::sync::atomic::AtomicU32::new(0))))
+                .collect(),
+            next: 0,
+        });
+        let slot = ring.next;
+        let native = native_texture_ptr(&ring.textures[slot])?;
+        self.wait_slot(ring.busy[slot])?;
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("d3d8-present-copy"),
+            });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &b.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &ring.textures[slot],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: b.width,
+                height: b.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.gpu.queue.submit([encoder.finish()]);
+        // The host's queue has no ordering against ours: the render and copy
+        // must have finished before it reads the slot.
+        self.gpu
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| RenderError::new("present_handoff::poll", e.to_string()))?;
+        ring.busy[slot].store(1, Ordering::Release);
+        ring.next = (slot + 1) % FRAME_RING_SLOTS;
+        Ok(FrameHandoff {
+            texture: native,
+            busy: ring.busy[slot],
+            width: b.width,
+            height: b.height,
+        })
+    }
+
+    fn wait_slot(&self, busy: &std::sync::atomic::AtomicU32) -> Result<(), RenderError> {
+        let start = std::time::Instant::now();
+        while busy.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            if start.elapsed() > std::time::Duration::from_secs(2) {
+                return Err(RenderError::new(
+                    "present_handoff",
+                    "host never released a presented frame slot",
+                ));
+            }
+            std::thread::yield_now();
+        }
+        Ok(())
     }
 
     /// Required tightly packed backbuffer readback size, independent of viewport.

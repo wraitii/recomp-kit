@@ -245,6 +245,13 @@ Texture MetalDevice::import_texture(id<MTLTexture> t) {
     textures_[id] = Tex{t, desc, true};
     return {id};
 }
+Texture MetalDevice::import_native_texture(void *native) {
+    id<MTLTexture> t = (__bridge id<MTLTexture>)native;
+    // A texture from another MTLDevice cannot be sampled or blitted here.
+    if (!t || t.device != device_)
+        return {};
+    return import_texture(t);
+}
 id<MTLTexture> MetalDevice::native_texture(Texture t) {
     std::lock_guard lock(mutex_);
     auto it = textures_.find(t.id);

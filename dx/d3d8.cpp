@@ -946,6 +946,9 @@ void Dev_GetTexture(X86 *c) {
     }
     com_ret(c, D8_OK);
 }
+// Set once the native-texture handoff is unavailable, so a host that cannot take it
+// does not pay a GPU copy and wait on every frame before falling back.
+static bool g_native_handoff_failed = false;
 void Dev_Present(X86 *c) {
 #ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
@@ -965,6 +968,26 @@ void Dev_Present(X86 *c) {
         if (!bytes || bytes > UINT32_MAX) {
             com_ret(c, D8_ERR_INVALIDCALL);
             return;
+        }
+        // Preferred: hand the backbuffer to the presenter as a GPU texture, with
+        // no CPU pixels. Frame dumps need the pixels, and a host without a shared
+        // Metal device declines, so both take the readback below.
+        if (!dx_dump_enabled() && !g_native_handoff_failed) {
+            void *native = nullptr;
+            uint32_t *busy = nullptr;
+            uint32_t w = 0, h = 0;
+            if (d3d8_device_present_handoff(host_device(dev), &native, &busy, &w, &h, &err) == 0) {
+                if (host_display_present_native_texture(native, int(w), int(h), busy)) {
+                    com_ret(c, D8_OK);
+                    return;
+                }
+                // Declined (different device or no GPU presenter): not retried.
+                __atomic_store_n(busy, 0u, __ATOMIC_RELEASE);
+            }
+            g_native_handoff_failed = true;
+            fprintf(stderr, "d3d8: native present handoff unavailable (%s); using CPU readback\n",
+                    err.message);
+            fflush(stderr);
         }
         // Rust copies mapped rows straight into reused caller storage. Dump raw
         // readback before the host's presentation-only opaque-alpha adjustment.
