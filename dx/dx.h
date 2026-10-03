@@ -27,6 +27,11 @@ void dx_reset();
 // of these; each is idempotent.
 void ddraw_register();
 void d3d_register();
+// Direct3D 7: the IDirect3D7 factory, IDirect3DDevice7 state store and
+// IDirect3DVertexBuffer7. Separate from d3d.cpp because the D3D7 tables have a
+// different slot order from Direct3D 3.
+void d3d7_register();
+void d3d7_reset();
 void d3d9_register();
 void d3dx9_register();
 // Direct3D 8: the factory/device/resource bridge onto the Rust wgpu renderer.

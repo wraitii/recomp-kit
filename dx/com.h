@@ -27,6 +27,7 @@
 #include "dxtypes.h"
 
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -60,6 +61,8 @@ enum ComIface : uint16_t {
     IF_D3D2,
     IF_D3D3,
     IF_D3D7,
+    IF_D3DDEVICE7,
+    IF_D3DVERTEXBUFFER7,
     IF_D3DDEVICE3,
     IF_D3DVIEWPORT3,
     IF_D3DMATERIAL3,
@@ -173,6 +176,8 @@ enum ComKind : uint16_t {
     K_PALETTE,
     K_CLIPPER,
     K_D3DDEVICE,
+    K_D3D7DEVICE,
+    K_D3D7VB,
     K_VIEWPORT,
     K_MATERIAL,
     K_LIGHT,
@@ -259,6 +264,35 @@ struct JoyFormatSlot {
 struct SurfacePrivateData {
     uint8_t guid[16] = {0};
     std::vector<uint8_t> bytes;
+};
+
+// Per-device state for an IDirect3DDevice7 (K_D3D7DEVICE). The engine caches
+// every render/texture-stage state itself and reads it back through Get*, so
+// the front end keeps a faithful store: GetRenderState/GetTextureStageState
+// return exactly what Set* last recorded, and the documented D3D7 defaults
+// for the states never set. Held behind a shared_ptr so ComObj stays copyable
+// and so the arrays cost nothing on the thousands of surface/texture objects.
+struct D3d7DeviceState {
+    // Bounds the type loop the engine walks at 0x82c8f0: render states
+    // 0..255, texture stages 0..7 with types 0..255.
+    uint32_t render_state[256];
+    uint32_t tss[8][256];
+    // Transform states the engine uses: WORLD/VIEW/PROJECTION. Stored for
+    // every state so GetTransform is a faithful read, not a fixed three.
+    float transform[256][16];
+    bool transform_set[256];
+    float viewport[6];
+    float material[68 / 4]; // D3DMATERIAL7, 17 dwords
+    float light[104 / 4];   // D3DLIGHT7, 26 dwords
+    uint32_t light_enable[8];
+    // Bound stage textures, as K_SURFACE object ids (0 = none, D3D7 slot 0).
+    uint32_t texture[8];
+    bool in_scene;
+    uint32_t d3d_obj;       // owning K_DDRAW (IDirect3D7) object id
+    uint32_t render_target; // surface id, or 0
+    // The device class that was requested: one of the two device GUIDs.
+    uint8_t device_guid[16];
+    bool tnl; // device_guid names IID_IDirect3DTnLHalDevice
 };
 
 // ---------------------------------------------------------------------------
@@ -429,7 +463,15 @@ struct ComObj {
     int32_t cc_gamma = 1;
     int32_t cc_colorenable = 1;
 
-    // --- D3D8/wgpu. The Rust host device is a
+    // --- K_D3D7DEVICE / K_D3D7VB. The D3D7 device's state is behind a
+    // pointer so the big render-state arrays are not paid for by every COM
+    // object; a vertex buffer's storage is the guest `pixels` block.
+    std::shared_ptr<D3d7DeviceState> d3d7;
+    uint32_t vb_fvf = 0;
+    uint32_t vb_num_vertices = 0;
+    uint32_t vb_caps = 0;
+
+    // --- K_D3D8/wgpu. The Rust host device is a
     // host-side pointer kept here, never in a guest field.
     void *d3d8_storage = nullptr; // opaque Rust CPU storage; never a guest address
     void *d3d8_device = nullptr;  // D3d8Device* from the Rust ABI

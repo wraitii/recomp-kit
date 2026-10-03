@@ -585,6 +585,7 @@ void dx_register_shims() {
     com_register_ole32();
     ddraw_register();
     d3d_register();
+    d3d7_register();
     d3d11_register();
     dxgi_register();
     d3dcompiler_register();
@@ -629,6 +630,7 @@ void dx_reset() {
     soundlib_reset();
     ddraw_reset();
     d3d_reset();
+    d3d7_reset();
     d3d11_reset();
     d3d9_reset();
     d3d8_reset();

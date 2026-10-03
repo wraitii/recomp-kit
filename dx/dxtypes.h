@@ -383,6 +383,98 @@ enum {
     D3DDD_OFF_wMaxSimultaneousTextures = 0xfa,
 };
 
+// D3DDEVICEDESC7 (Direct3D 7), 236 bytes on x86 (the trailing GUID is 4-byte
+// aligned, so words pack without extra padding). Offsets verified against the
+// mingw-w64 d3d.h layout with _Static_assert. The DX6 D3DDEVICEDESC above is a
+// different record: this one has no dwSize/dwFlags and starts with dwDevCaps.
+enum {
+    D3DDEVICEDESC7_SIZE = 236,
+    D3DDD7_OFF_dwDevCaps = 0x00,
+    D3DDD7_OFF_dpcLineCaps = 0x04,
+    D3DDD7_OFF_dpcTriCaps = 0x3c,
+    D3DDD7_OFF_dwDeviceRenderBitDepth = 0x74,
+    D3DDD7_OFF_dwDeviceZBufferBitDepth = 0x78,
+    D3DDD7_OFF_dwMinTextureWidth = 0x7c,
+    D3DDD7_OFF_dwMinTextureHeight = 0x80,
+    D3DDD7_OFF_dwMaxTextureWidth = 0x84,
+    D3DDD7_OFF_dwMaxTextureHeight = 0x88,
+    D3DDD7_OFF_dwMaxTextureRepeat = 0x8c,
+    D3DDD7_OFF_dwMaxTextureAspectRatio = 0x90,
+    D3DDD7_OFF_dwMaxAnisotropy = 0x94,
+    D3DDD7_OFF_dwStencilCaps = 0xac,
+    D3DDD7_OFF_dwFVFCaps = 0xb0,
+    D3DDD7_OFF_dwTextureOpCaps = 0xb4,
+    D3DDD7_OFF_wMaxTextureBlendStages = 0xb8,
+    D3DDD7_OFF_wMaxSimultaneousTextures = 0xba,
+    D3DDD7_OFF_dwMaxActiveLights = 0xbc,
+    D3DDD7_OFF_dvMaxVertexW = 0xc0,
+    D3DDD7_OFF_deviceGUID = 0xc4,
+    D3DDD7_OFF_wMaxUserClipPlanes = 0xd4,
+    D3DDD7_OFF_wMaxVertexBlendMatrices = 0xd6,
+    D3DDD7_OFF_dwVertexProcessingCaps = 0xd8,
+};
+// D3DDEVCAPS bits the engine tests (0x82cd80).
+static const uint32_t D3DDEVCAPS_TEXTURENONLOCALVIDMEM = 0x00001000u;
+static const uint32_t D3DDEVCAPS_HWTRANSFORMANDLIGHT = 0x00010000u;
+static const uint32_t D3DDEVCAPS_HWRASTERIZATION = 0x00080000u;
+static const uint32_t D3DDEVCAPS_DRAWPRIMITIVES2 = 0x00002000u;
+static const uint32_t D3DDEVCAPS_DRAWPRIMTLVERTEX = 0x00000400u;
+static const uint32_t D3DDEVCAPS_TEXTUREVIDEOMEMORY = 0x00000200u;
+static const uint32_t D3DDEVCAPS_TLVERTEXSYSTEMMEMORY = 0x00000040u;
+// DDBD_ render-bit-depth bits, from ddraw.h.
+static const uint32_t DDBD_16 = 0x00000400u;
+static const uint32_t DDBD_32 = 0x00000100u;
+
+// D3DVIEWPORT7, 24 bytes: no dwSize, unlike D3DVIEWPORT2.
+enum {
+    D3DVIEWPORT7_SIZE = 24,
+    D3DVIEWPORT7_OFF_dwX = 0x00,
+    D3DVIEWPORT7_OFF_dwY = 0x04,
+    D3DVIEWPORT7_OFF_dwWidth = 0x08,
+    D3DVIEWPORT7_OFF_dwHeight = 0x0c,
+    D3DVIEWPORT7_OFF_dvMinZ = 0x10,
+    D3DVIEWPORT7_OFF_dvMaxZ = 0x14,
+};
+
+// D3DMATERIAL7, 68 bytes: five D3DCOLORVALUEs and a power.
+enum {
+    D3DMATERIAL7_SIZE = 68,
+    D3DMATERIAL7_OFF_diffuse = 0x00,
+    D3DMATERIAL7_OFF_ambient = 0x10,
+    D3DMATERIAL7_OFF_specular = 0x20,
+    D3DMATERIAL7_OFF_emissive = 0x30,
+    D3DMATERIAL7_OFF_power = 0x40,
+};
+
+// D3DLIGHT7, 104 bytes: no dwSize (the DX6 D3DLIGHT has one).
+enum {
+    D3DLIGHT7_SIZE = 104,
+    D3DLIGHT7_OFF_dltType = 0x00,
+    D3DLIGHT7_OFF_dcvDiffuse = 0x04,
+    D3DLIGHT7_OFF_dcvSpecular = 0x14,
+    D3DLIGHT7_OFF_dcvAmbient = 0x24,
+    D3DLIGHT7_OFF_dvPosition = 0x34,
+    D3DLIGHT7_OFF_dvDirection = 0x40,
+    D3DLIGHT7_OFF_dvRange = 0x4c,
+    D3DLIGHT7_OFF_dvFalloff = 0x50,
+    D3DLIGHT7_OFF_dvAttenuation0 = 0x54,
+    D3DLIGHT7_OFF_dvAttenuation1 = 0x58,
+    D3DLIGHT7_OFF_dvAttenuation2 = 0x5c,
+    D3DLIGHT7_OFF_dvTheta = 0x60,
+    D3DLIGHT7_OFF_dvPhi = 0x64,
+};
+
+// D3DVERTEXBUFFERDESC, 16 bytes.
+enum {
+    D3DVERTEXBUFFERDESC_SIZE = 16,
+    D3DVBD_OFF_dwSize = 0x00,
+    D3DVBD_OFF_dwCaps = 0x04,
+    D3DVBD_OFF_dwFVF = 0x08,
+    D3DVBD_OFF_dwNumVertices = 0x0c,
+};
+static const uint32_t D3DVBCAPS_WRITEONLY = 0x00010000u;
+static const uint32_t D3DVBCAPS_OPTIMIZED = 0x80000000u;
+
 // D3DFINDDEVICESEARCH (92) and D3DFINDDEVICERESULT (524).
 enum {
     D3DFDS_SIZE = 92,

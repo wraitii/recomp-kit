@@ -677,6 +677,45 @@ enum {
     DEV_SetRenderTarget = 15,
     DEV_GetClipStatus = 32,
 };
+// IDirect3D7, IDirect3DDevice7 and IDirect3DVertexBuffer7 slot numbers, from
+// their D3D7 vtable order (d3d.h), spelled out for the same reason.
+enum {
+    D3D7_EnumDevices = 3,
+    D3D7_CreateDevice = 4,
+    D3D7_CreateVertexBuffer = 5,
+    D3D7_EnumZBufferFormats = 6,
+    D3D7_EvictManagedTextures = 7,
+};
+enum {
+    DEV7_GetCaps = 3,
+    DEV7_EnumTextureFormats = 4,
+    DEV7_BeginScene = 5,
+    DEV7_EndScene = 6,
+    DEV7_GetDirect3D = 7,
+    DEV7_SetRenderTarget = 8,
+    DEV7_Clear = 10,
+    DEV7_SetTransform = 11,
+    DEV7_GetTransform = 12,
+    DEV7_SetViewport = 13,
+    DEV7_GetViewport = 15,
+    DEV7_SetMaterial = 16,
+    DEV7_SetLight = 18,
+    DEV7_SetRenderState = 20,
+    DEV7_GetRenderState = 21,
+    DEV7_GetTexture = 34,
+    DEV7_SetTexture = 35,
+    DEV7_GetTextureStageState = 36,
+    DEV7_SetTextureStageState = 37,
+    DEV7_ValidateDevice = 38,
+    DEV7_LightEnable = 44,
+};
+enum {
+    VB7_Lock = 3,
+    VB7_Unlock = 4,
+    VB7_ProcessVertices = 5,
+    VB7_GetVertexBufferDesc = 6,
+    VB7_Optimize = 7,
+};
 enum { VP_SetViewport2 = 17, VP_Clear = 12, VP_SetBackground = 8 };
 enum { MAT_GetHandle = 5 };
 enum { TEX_GetHandle = 3, TEX_PaletteChanged = 4, TEX_Load = 5 };
@@ -6344,6 +6383,234 @@ static void test_ddraw7_object_model() {
     CHECK_EQ(call_method(surf, S_Release, {}), 0);
     CHECK_EQ(call_method(dd, DD_Release, {}), 0);
     ddraw_reset_modes();
+}
+
+// Direct3D 7 stage 2a: QueryInterface(IID_IDirect3D7) on the DirectDraw object,
+// the enumeration callbacks, device creation and caps, the render-state store
+// and IDirect3DVertexBuffer7's guest-addressable storage.
+static void test_d3d7_pipeline() {
+    cpu_reset();
+    const uint8_t dd7[16] = {0xC0, 0x5E, 0xE6, 0x15, 0x9C, 0x3B, 0xD2, 0x11,
+                             0xB9, 0x2F, 0x00, 0x60, 0x97, 0x97, 0xEA, 0x5B};
+    const uint8_t d3d7[16] = {0x77, 0x9E, 0x04, 0xF5, 0x61, 0x48, 0xD2, 0x11,
+                              0xA4, 0x07, 0x00, 0xA0, 0xC9, 0x06, 0x29, 0xA8};
+    const uint8_t hal[16] = {0xE0, 0x3D, 0xE6, 0x84, 0xAA, 0x46, 0xCF, 0x11,
+                             0x81, 0x6F, 0x00, 0x00, 0xC0, 0x20, 0x15, 0x6E};
+    const uint8_t tnl[16] = {0x78, 0x9E, 0x04, 0xF5, 0x61, 0x48, 0xD2, 0x11,
+                             0xA4, 0x07, 0x00, 0xA0, 0xC9, 0x06, 0x29, 0xA8};
+
+    // ---- struct layouts the shim and tests agree on.
+    CHECK_EQ((uint32_t)D3DDEVICEDESC7_SIZE, 236u);
+    CHECK_EQ((uint32_t)D3DDD7_OFF_dwDevCaps, 0x00u);
+    CHECK_EQ((uint32_t)D3DDD7_OFF_dpcTriCaps, 0x3cu);
+    CHECK_EQ((uint32_t)D3DDD7_OFF_dwDeviceRenderBitDepth, 0x74u);
+    CHECK_EQ((uint32_t)D3DDD7_OFF_deviceGUID, 0xc4u);
+    CHECK_EQ((uint32_t)D3DVIEWPORT7_SIZE, 24u);
+    CHECK_EQ((uint32_t)D3DVIEWPORT7_OFF_dvMaxZ, 0x14u);
+    CHECK_EQ((uint32_t)D3DMATERIAL7_SIZE, 68u);
+    CHECK_EQ((uint32_t)D3DMATERIAL7_OFF_power, 0x40u);
+    CHECK_EQ((uint32_t)D3DLIGHT7_SIZE, 104u);
+    CHECK_EQ((uint32_t)D3DLIGHT7_OFF_dvPhi, 0x64u);
+    CHECK_EQ((uint32_t)D3DVERTEXBUFFERDESC_SIZE, 16u);
+    CHECK_EQ((uint32_t)DDPF_SIZE, 32u);
+
+    // ---- a real IDirectDraw7, then QI(IID_IDirect3D7).
+    uint32_t create_ex = tramp("DDRAW.dll", "DirectDrawCreateEx");
+    uint32_t iid = sc(0x1040), out = sc(0x1080);
+    memcpy(gm_ptr(iid), dd7, 16);
+    CHECK_EQ(call_shim(create_ex, {0, out, iid, 0}), DD_OK);
+    uint32_t dd = rd32(out);
+    CHECK(dd != 0);
+    if (!dd)
+        return;
+    memcpy(gm_ptr(iid), d3d7, 16);
+    CHECK_EQ(call_method(dd, 0, {iid, sc(0x10c0)}), S_OK);
+    uint32_t d3d = rd32(sc(0x10c0));
+    CHECK_EQ(com_iface_of(d3d), IF_D3D7);
+    // The D3D7 object shares the DirectDraw refcount: QI added one, so the
+    // object survives releasing the D3D7 view.
+    CHECK_EQ(call_method(d3d, 2, {}), 1);
+    CHECK(com_this(dd) != nullptr);
+
+    // ---- vtable order: the D3D7 slots differ from the D3D3 ones.
+    uint32_t vt = rd32(d3d + COM_OFF_vtbl);
+    CHECK(strstr(imports_describe(rd32(vt + 0x0c)), "EnumDevices"));
+    CHECK(strstr(imports_describe(rd32(vt + 0x10)), "CreateDevice"));
+    CHECK(strstr(imports_describe(rd32(vt + 0x14)), "CreateVertexBuffer"));
+    CHECK(strstr(imports_describe(rd32(vt + 0x18)), "EnumZBufferFormats"));
+    CHECK(strstr(imports_describe(rd32(vt + 0x1c)), "EvictManagedTextures"));
+
+    // ---- EnumZBufferFormats: one 16-bit DDPF_ZBUFFER entry, callback order.
+    static std::vector<uint32_t> zbuf_flags, zbuf_bits;
+    zbuf_flags.clear();
+    zbuf_bits.clear();
+    uint32_t zcb = imports_alloc_trampoline(
+        "TEST", "D3D7ZBufferFormat",
+        [](X86 *c) {
+            uint32_t pf = arg(c, 0), ctx = arg(c, 1);
+            CHECK_EQ(rd32(pf + DDPF_OFF_dwSize), (uint32_t)DDPF_SIZE);
+            CHECK_EQ(rd32(pf + DDPF_OFF_dwFlags), (uint32_t)DDPF_ZBUFFER);
+            wr32(ctx, rd32(ctx) + 1);
+            zbuf_flags.push_back(rd32(pf + DDPF_OFF_dwFlags));
+            zbuf_bits.push_back(rd32(pf + DDPF_OFF_dwRGBBitCount));
+            set_eax(c, DDENUMRET_OK);
+        },
+        2);
+    wr32(out, 0);
+    memcpy(gm_ptr(iid), hal, 16);
+    CHECK_EQ(call_method(d3d, D3D7_EnumZBufferFormats, {iid, zcb, out}), D3D_OK_);
+    CHECK_EQ(rd32(out), 1u);
+    CHECK_EQ(zbuf_flags.size(), 1u);
+    if (!zbuf_flags.empty()) {
+        CHECK_EQ(zbuf_flags[0], (uint32_t)DDPF_ZBUFFER);
+        CHECK_EQ(zbuf_bits[0], 16u);
+    }
+    // An unrecognised device class is refused, not silently accepted.
+    memcpy(gm_ptr(iid), dd7, 16);
+    CHECK_EQ(call_method(d3d, D3D7_EnumZBufferFormats, {iid, zcb, out}), DDERR_NOTFOUND);
+
+    // ---- create a device on a 3D surface and check caps.
+    uint32_t target = make_render_target_for_test(64, 64, 16);
+    CHECK(target != 0);
+    memcpy(gm_ptr(iid), hal, 16);
+    CHECK_EQ(call_method(d3d, D3D7_CreateDevice, {iid, target, out}), D3D_OK_);
+    uint32_t dev = rd32(out);
+    CHECK_EQ(com_iface_of(dev), IF_D3DDEVICE7);
+    uint32_t caps = sc(0x1400);
+    CHECK_EQ(call_method(dev, DEV7_GetCaps, {caps}), D3D_OK_);
+    CHECK_EQ(rd32(caps + D3DDD7_OFF_dwDevCaps) & D3DDEVCAPS_HWTRANSFORMANDLIGHT, 0u);
+    CHECK((rd32(caps + D3DDD7_OFF_dwDevCaps) & D3DDEVCAPS_TEXTURENONLOCALVIDMEM) != 0u);
+    CHECK_EQ(memcmp(gm_ptr(caps + D3DDD7_OFF_deviceGUID), hal, 16), 0);
+    CHECK_EQ(rd32(caps + D3DDD7_OFF_dwDeviceRenderBitDepth), (uint32_t)DDBD_16);
+    // The HAL device is not TnL; the TnL class reports the TnL cap.
+    memcpy(gm_ptr(iid), tnl, 16);
+    CHECK_EQ(call_method(d3d, D3D7_CreateDevice, {iid, target, sc(0x1480)}), D3D_OK_);
+    uint32_t tdev = rd32(sc(0x1480));
+    CHECK_EQ(call_method(tdev, DEV7_GetCaps, {caps}), D3D_OK_);
+    CHECK((rd32(caps + D3DDD7_OFF_dwDevCaps) & D3DDEVCAPS_HWTRANSFORMANDLIGHT) != 0u);
+    CHECK_EQ(memcmp(gm_ptr(caps + D3DDD7_OFF_deviceGUID), tnl, 16), 0);
+
+    // GetDirect3D round-trips to the same D3D7 view of the DirectDraw object.
+    CHECK_EQ(call_method(dev, DEV7_GetDirect3D, {out}), D3D_OK_);
+    CHECK_EQ(rd32(out), d3d);
+    call_method(rd32(out), 2, {});
+    CHECK_EQ(call_method(tdev, 2, {}), 0);
+
+    // ---- the render-state store: documented defaults, then set/get.
+    uint32_t v = sc(0x1500);
+    CHECK_EQ(call_method(dev, DEV7_GetRenderState, {8, v}), D3D_OK_); // FILLMODE
+    CHECK_EQ(rd32(v), 3u);
+    CHECK_EQ(call_method(dev, DEV7_GetRenderState, {137, v}), D3D_OK_); // LIGHTING
+    CHECK_EQ(rd32(v), 1u);
+    CHECK_EQ(call_method(dev, DEV7_GetRenderState, {143, v}), D3D_OK_); // NORMALIZENORMALS
+    CHECK_EQ(rd32(v), 0u);
+    CHECK_EQ(call_method(dev, DEV7_GetRenderState, {7, v}), D3D_OK_); // ZENABLE
+    CHECK_EQ(rd32(v), 0u);
+    CHECK_EQ(call_method(dev, DEV7_SetRenderState, {137, 0}), D3D_OK_);
+    CHECK_EQ(call_method(dev, DEV7_GetRenderState, {137, v}), D3D_OK_);
+    CHECK_EQ(rd32(v), 0u);
+    // A texture-stage default and a round trip on stage 1.
+    CHECK_EQ(call_method(dev, DEV7_GetTextureStageState, {0, 1, v}), D3D_OK_); // COLOROP
+    CHECK_EQ(rd32(v), 4u);
+    CHECK_EQ(call_method(dev, DEV7_GetTextureStageState, {1, 1, v}), D3D_OK_);
+    CHECK_EQ(rd32(v), 1u); // later stages disabled by default
+    CHECK_EQ(call_method(dev, DEV7_SetTextureStageState, {1, 1, 4}), D3D_OK_);
+    CHECK_EQ(call_method(dev, DEV7_GetTextureStageState, {1, 1, v}), D3D_OK_);
+    CHECK_EQ(rd32(v), 4u);
+    // ValidateDevice reports a usable pass count.
+    CHECK_EQ(call_method(dev, DEV7_ValidateDevice, {v}), D3D_OK_);
+    CHECK_EQ(rd32(v), 1u);
+
+    // ---- transform, viewport, material, light are recorded.
+    uint32_t mtx = sc(0x1600);
+    for (int i = 0; i < 16; ++i)
+        wrf32(mtx + (uint32_t)i * 4, float(i + 1));
+    CHECK_EQ(call_method(dev, DEV7_SetTransform, {1, mtx}), D3D_OK_);
+    uint32_t back = sc(0x1680);
+    CHECK_EQ(call_method(dev, DEV7_GetTransform, {1, back}), D3D_OK_);
+    CHECK_EQ(rd32(back), 0x3f800000u);
+    CHECK_EQ(rd32(back + 60), 0x41800000u); // 16.0f
+    uint32_t vp = sc(0x1700);
+    wr32(vp + D3DVIEWPORT7_OFF_dwWidth, 64);
+    wr32(vp + D3DVIEWPORT7_OFF_dwHeight, 48);
+    wrf32(vp + D3DVIEWPORT7_OFF_dvMaxZ, 1.0f);
+    CHECK_EQ(call_method(dev, DEV7_SetViewport, {vp}), D3D_OK_);
+    gm_zero(back, 24);
+    CHECK_EQ(call_method(dev, DEV7_GetViewport, {back}), D3D_OK_);
+    CHECK_EQ(rd32(back + D3DVIEWPORT7_OFF_dwWidth), 64u);
+    CHECK_EQ(rd32(back + D3DVIEWPORT7_OFF_dwHeight), 48u);
+
+    // ---- EnumTextureFormats: R5G6B5, A4R4G4B4, A8R8G8B8, in that order,
+    // and no DXT/FourCC entry.
+    static std::vector<uint32_t> fmt_bits, fmt_flags, fmt_fourcc;
+    fmt_bits.clear();
+    fmt_flags.clear();
+    fmt_fourcc.clear();
+    uint32_t tcb = imports_alloc_trampoline(
+        "TEST", "D3D7TextureFormat",
+        [](X86 *c) {
+            uint32_t pf = arg(c, 0);
+            CHECK_EQ(rd32(pf + DDPF_OFF_dwSize), (uint32_t)DDPF_SIZE);
+            fmt_bits.push_back(rd32(pf + DDPF_OFF_dwRGBBitCount));
+            fmt_flags.push_back(rd32(pf + DDPF_OFF_dwFlags));
+            fmt_fourcc.push_back(rd32(pf + DDPF_OFF_dwFourCC));
+            set_eax(c, DDENUMRET_OK);
+        },
+        2);
+    CHECK_EQ(call_method(dev, DEV7_EnumTextureFormats, {tcb, 0}), D3D_OK_);
+    CHECK_EQ(fmt_bits.size(), 3u);
+    if (fmt_bits.size() == 3) {
+        CHECK_EQ(fmt_bits[0], 16u);
+        CHECK_EQ(fmt_flags[0], (uint32_t)DDPF_RGB);
+        CHECK_EQ(fmt_bits[1], 16u);
+        CHECK_EQ(fmt_flags[1], (uint32_t)(DDPF_RGB | DDPF_ALPHAPIXELS));
+        CHECK_EQ(fmt_bits[2], 32u);
+        for (uint32_t f : fmt_fourcc)
+            CHECK_EQ(f, 0u);
+    }
+
+    // ---- IDirect3DVertexBuffer7: vtable order and a guest lock round trip.
+    uint32_t desc = sc(0x1800);
+    wr32(desc + D3DVBD_OFF_dwSize, D3DVERTEXBUFFERDESC_SIZE);
+    wr32(desc + D3DVBD_OFF_dwCaps, D3DVBCAPS_WRITEONLY);
+    wr32(desc + D3DVBD_OFF_dwFVF, 0x112); // XYZ | NORMAL | TEX1 = 32 bytes
+    wr32(desc + D3DVBD_OFF_dwNumVertices, 16);
+    CHECK_EQ(call_method(d3d, D3D7_CreateVertexBuffer, {desc, out, 0}), D3D_OK_);
+    uint32_t vb = rd32(out);
+    CHECK_EQ(com_iface_of(vb), IF_D3DVERTEXBUFFER7);
+    uint32_t vvt = rd32(vb + COM_OFF_vtbl);
+    CHECK(strstr(imports_describe(rd32(vvt + 0x0c)), "Lock"));
+    CHECK(strstr(imports_describe(rd32(vvt + 0x18)), "GetVertexBufferDesc"));
+    CHECK(strstr(imports_describe(rd32(vvt + 0x20)), "ProcessVerticesStrided"));
+    uint32_t data = sc(0x1900), size = sc(0x1940);
+    CHECK_EQ(call_method(vb, VB7_Lock, {0, data, size}), D3D_OK_);
+    uint32_t ptr = rd32(data), bytes = rd32(size);
+    CHECK_EQ(bytes, 16u * 32u);
+    CHECK(ptr != 0);
+    wr32(ptr, 0xdeadbeefu);
+    CHECK_EQ(call_method(vb, VB7_Unlock, {}), D3D_OK_);
+    CHECK_EQ(call_method(vb, VB7_Lock, {0, data, size}), D3D_OK_);
+    CHECK_EQ(rd32(rd32(data)), 0xdeadbeefu);
+    CHECK_EQ(call_method(vb, VB7_Unlock, {}), D3D_OK_);
+    gm_zero(desc, 16);
+    CHECK_EQ(call_method(vb, VB7_GetVertexBufferDesc, {desc}), D3D_OK_);
+    CHECK_EQ(rd32(desc + D3DVBD_OFF_dwSize), (uint32_t)D3DVERTEXBUFFERDESC_SIZE);
+    CHECK_EQ(rd32(desc + D3DVBD_OFF_dwFVF), 0x112u);
+    CHECK_EQ(rd32(desc + D3DVBD_OFF_dwNumVertices), 16u);
+    CHECK_EQ(call_method(vb, VB7_Optimize, {0, 0}), D3D_OK_);
+    call_method(vb, 2, {});
+
+    // ---- Unimplemented device slots abort by name; a draw is not silently a
+    // no-op. The abort cannot be observed from the test process, so the only
+    // thing tested here is that the slot is not shared with a state method.
+    uint32_t dvt = rd32(dev + COM_OFF_vtbl);
+    const char *draw = imports_describe(rd32(dvt + 0x68)); // DrawIndexedPrimitive
+    CHECK(draw && strstr(draw, "IDirect3DDevice7::DrawIndexedPrimitive") != nullptr);
+    const char *clear = imports_describe(rd32(dvt + 0x28)); // Clear
+    CHECK(clear && strstr(clear, "IDirect3DDevice7::Clear") != nullptr);
+
+    call_method(dev, 2, {});
+    CHECK_EQ(call_method(d3d, 2, {}), 0);
 }
 
 // QueryInterface: the DirectDraw object hands out IDirectDraw2 and 4, refuses
@@ -14119,6 +14386,7 @@ int main() {
         {"colour key at 16 bpp", test_colorkey_16bpp},
         {"DirectDrawCreateEx fallback", test_directdraw_create_ex_fallback},
         {"IDirectDraw7 object model", test_ddraw7_object_model},
+        {"Direct3D7 stage 2a", test_d3d7_pipeline},
         {"QueryInterface", test_query_interface},
         {"display modes", test_enum_display_modes},
         {"DirectDraw enumeration", test_directdraw_enumeration},

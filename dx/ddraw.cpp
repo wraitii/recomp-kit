@@ -5005,16 +5005,11 @@ void DirectDrawCreateEx(X86 *c) {
     com_ret(c, DD_OK);
 }
 
-// IDirect3D7 is not implemented yet. Its QueryInterface must stop rather than
-// return E_NOINTERFACE: OpenD3D (0x82cd80) does not check the HRESULT and then
-// dereferences the null g_pDirect3D7, so an error here becomes an anonymous
-// null dereference instead of a named missing interface.
-bool ddraw_qi_unsupported(ComObj *, ComIface want) {
-    if (want == IF_D3D7) {
-        LOGW("ddraw: IDirectDraw7::QueryInterface(IID_IDirect3D7) is not implemented;"
-             " there is no Direct3D 7 host yet");
-        abort();
-    }
+// IDirect3D7 is now implemented (dx/d3d7.cpp) and bound to K_DDRAW, so the
+// query is answered by the normal kind check. The hook stays registered as the
+// place a future unimplemented interface the guest dereferences without
+// checking its HRESULT would abort by name; today it handles none.
+bool ddraw_qi_unsupported(ComObj *, ComIface) {
     return false;
 }
 
