@@ -93,6 +93,10 @@ const uint32_t AM_SEEKING_RelativePositioning = 0x2;
 const uint32_t kSeekingCaps = 0x3f;
 const int32_t OATRUE = -1;
 const uint32_t kVolumeMin = (uint32_t)-10000;
+// vfw.h error codes the graph reports when a connection cannot be made.
+const uint32_t VFW_E_NOT_CONNECTED = 0x80040209u;
+const uint32_t VFW_E_NOT_FOUND = 0x80040216u;
+const uint32_t VFW_E_CANNOT_CONNECT = 0x80040217u;
 
 const uint8_t CLSID_AMMultiMediaStream_[16] =
     IID_BYTES(0x49c47ce5, 0x9ba4, 0x11d0, 0x82, 0x12, 0x00, 0xc0, 0x4f, 0xc3, 0x2c, 0x45);
@@ -137,6 +141,46 @@ const uint8_t IID_IEnumFilters_[16] =
     IID_BYTES(0x56a86893, 0x0ad4, 0x11ce, 0xb0, 0x3a, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70);
 const uint8_t TIME_FORMAT_MEDIA_TIME_[16] =
     IID_BYTES(0x7b785574, 0x8c82, 0x11cf, 0xbc, 0x0c, 0x00, 0xaa, 0x00, 0xac, 0x74, 0xf6);
+
+// The movie player's own graph. The guest builds it with CoCreateInstance
+// rather than opening an AMMultiMediaStream, so its filters and pins are a
+// separate object model from the K_GRAPH above. The four CLSIDs are the ones
+// FUN_0049db30 asks for; the interfaces are the ones FUN_0049d990 and
+// FUN_0049da20 walk.
+const uint8_t CLSID_FilterGraph_[16] =
+    IID_BYTES(0xe436ebb3, 0x524f, 0x11ce, 0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70);
+const uint8_t CLSID_AviSplitter_[16] =
+    IID_BYTES(0x1b544c20, 0xfd0b, 0x11ce, 0x8c, 0x63, 0x00, 0xaa, 0x00, 0x44, 0xb5, 0x1e);
+const uint8_t CLSID_MPEG1Splitter_[16] =
+    IID_BYTES(0x336475d0, 0x942a, 0x11ce, 0xa8, 0x70, 0x00, 0xaa, 0x00, 0x2f, 0xea, 0xb5);
+const uint8_t CLSID_DSoundRender_[16] =
+    IID_BYTES(0x79376820, 0x07d0, 0x11cf, 0xa2, 0x4d, 0x00, 0x20, 0xaf, 0xd7, 0x97, 0x67);
+// {56a868xx-0ad4-11ce-b03a-0020af0ba770}
+const uint8_t IID_IBaseFilter_[16] =
+    IID_BYTES(0x56a86895, 0x0ad4, 0x11ce, 0xb0, 0x3a, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70);
+const uint8_t IID_IPin_[16] =
+    IID_BYTES(0x56a86891, 0x0ad4, 0x11ce, 0xb0, 0x3a, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70);
+const uint8_t IID_IEnumPins_[16] =
+    IID_BYTES(0x56a86892, 0x0ad4, 0x11ce, 0xb0, 0x3a, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70);
+const uint8_t IID_IEnumMediaTypes_[16] =
+    IID_BYTES(0x89c31040, 0x846b, 0x11ce, 0x97, 0xd3, 0x00, 0xaa, 0x00, 0x55, 0x59, 0x5a);
+// The media types FUN_0049da20 selects pins by, and the format blocks a
+// VIDEOINFOHEADER carries.
+const uint8_t MEDIATYPE_Video_[16] =
+    IID_BYTES(0x73646976, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
+const uint8_t MEDIATYPE_Audio_[16] =
+    IID_BYTES(0x73647561, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
+const uint8_t MEDIASUBTYPE_RGB24_[16] =
+    IID_BYTES(0xe436eb7d, 0x524f, 0x11ce, 0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70);
+const uint8_t MEDIASUBTYPE_PCM_[16] =
+    IID_BYTES(0x00000001, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
+const uint8_t FORMAT_VideoInfo_[16] =
+    IID_BYTES(0x05589f80, 0xc356, 0x11ce, 0xbf, 0x01, 0x00, 0xaa, 0x00, 0x55, 0x59, 0x5a);
+const uint8_t FORMAT_WaveFormatEx_[16] =
+    IID_BYTES(0x05589f81, 0xc356, 0x11ce, 0xbf, 0x01, 0x00, 0xaa, 0x00, 0x55, 0x59, 0x5a);
+// AM_MEDIA_TYPE + the largest format block (a VIDEOINFOHEADER).
+const uint32_t kAMMediaTypeSize = 0x48;
+const uint32_t kVideoInfoHeaderSize = 0x58;
 
 // Playback through the host: chunks of decoded PCM the host reads from guest
 // heap memory, a ring of them so a chunk is never rewritten before it has
@@ -565,6 +609,664 @@ void release_playback(Source &s) {
         heap_free(s.ring);
         s.ring = 0;
     }
+}
+
+// ===========================================================================
+// The movie player's own filter graph. FUN_0049db30 asks ole32 for
+// CLSID_FilterGraph and drives IGraphBuilder directly, so these filters are a
+// different object model from the K_GRAPH above. Each filter, pin and
+// enumerator is a ComObj whose data lives in the maps below, keyed by id, the
+// way Source is.
+// ===========================================================================
+enum MovieRole {
+    MR_SOURCE = 1,
+    MR_SPLITTER,
+    MR_DSOUND,
+};
+
+// One media type a pin offers. The format block is built on demand; only the
+// major type is needed to select a pin, but a video type carries its
+// VIDEOINFOHEADER so the renderer can be negotiated against it.
+struct MovieType {
+    uint8_t major[16] = {0};
+    uint8_t subtype[16] = {0};
+    bool has_major = false;
+    bool is_video = false;
+    bool is_audio = false;
+    uint32_t width = 0, height = 0;
+    uint32_t rate = 0;
+    uint16_t channels = 0, bits = 16;
+};
+
+struct MoviePin {
+    uint32_t filter = 0;
+    uint32_t dir = 0; // PIN_INPUT 0, PIN_OUTPUT 1
+    uint32_t connected = 0;
+    std::vector<MovieType> types;
+};
+
+struct MovieFilter {
+    uint32_t graph = 0;
+    MovieRole role = MR_SOURCE;
+    std::string path;
+    std::vector<uint32_t> pins;
+};
+
+struct MovieGraph {
+    std::vector<uint32_t> filters;       // our filter ids this graph owns
+    std::vector<uint32_t> guest_filters; // guest IBaseFilter pointers (the renderer)
+    std::string path;
+};
+
+std::map<uint32_t, MoviePin> &movie_pins() {
+    static auto *m = new std::map<uint32_t, MoviePin>();
+    return *m;
+}
+std::map<uint32_t, MovieFilter> &movie_filters() {
+    static auto *m = new std::map<uint32_t, MovieFilter>();
+    return *m;
+}
+std::map<uint32_t, MovieGraph> &movie_graphs() {
+    static auto *m = new std::map<uint32_t, MovieGraph>();
+    return *m;
+}
+
+ComObj *movie_graph_this(X86 *c) {
+    ComObj *g = com_this_arg(c, IF_GRAPH);
+    return g && g->kind == K_FILTERGRAPH ? g : nullptr;
+}
+
+ComObj *movie_new_filter(MovieRole role) {
+    ComObj *f = com_new(K_BASEFILTER);
+    if (!f)
+        return nullptr;
+    MovieFilter info;
+    info.role = role;
+    movie_filters()[f->id] = info;
+    return f;
+}
+
+uint32_t movie_new_pin(ComObj *filter, uint32_t dir, std::vector<MovieType> types) {
+    ComObj *p = com_new(K_PIN);
+    if (!p)
+        return 0;
+    MoviePin pin;
+    pin.filter = filter->id;
+    pin.dir = dir;
+    pin.types = std::move(types);
+    movie_pins()[p->id] = pin;
+    movie_filters()[filter->id].pins.push_back(p->id);
+    return p->id;
+}
+
+void movie_graph_attach(ComObj *graph, ComObj *filter) {
+    movie_filters()[filter->id].graph = graph->id;
+    movie_graphs()[graph->id].filters.push_back(filter->id);
+}
+
+// Writes an AM_MEDIA_TYPE (and, for video/audio, its format block) starting
+// at `mt`, which must hold kAMMediaTypeSize + kVideoInfoHeaderSize bytes.
+void write_media_type(uint32_t mt, const MovieType &t) {
+    gm_zero(mt, kAMMediaTypeSize + kVideoInfoHeaderSize);
+    memcpy(gm_ptr(mt), t.major, 16);
+    memcpy(gm_ptr(mt + 0x10), t.subtype, 16);
+    wr32(mt + 0x20, 1); // bFixedSizeSamples
+    wr32(mt + 0x24, 0); // bTemporalCompression
+    if (t.is_video) {
+        memcpy(gm_ptr(mt + 0x2c), FORMAT_VideoInfo_, 16);
+        wr32(mt + 0x28, t.width * t.height * 3);
+        wr32(mt + 0x40, kVideoInfoHeaderSize);
+        wr32(mt + 0x44, mt + kAMMediaTypeSize);
+        uint32_t vi = mt + kAMMediaTypeSize;
+        wr32(vi + 0x00, t.width);  // rcSource.right
+        wr32(vi + 0x04, t.height); // rcSource.bottom
+        wr32(vi + 0x10, t.width);  // rcTarget.right
+        wr32(vi + 0x14, t.height); // rcTarget.bottom
+        wr32(vi + 0x28, 333333);   // AvgTimePerFrame: 30 fps at 100 ns
+        wr32(vi + 0x30, 40);       // bmiHeader.biSize
+        wr32(vi + 0x34, t.width);
+        wr32(vi + 0x38, t.height);
+        wr16(vi + 0x3c, 1);  // biPlanes
+        wr16(vi + 0x3e, 24); // biBitCount
+        wr32(vi + 0x40, 0);  // BI_RGB
+        wr32(vi + 0x44, t.width * t.height * 3);
+    } else if (t.is_audio) {
+        memcpy(gm_ptr(mt + 0x2c), FORMAT_WaveFormatEx_, 16);
+        wr32(mt + 0x40, 18); // sizeof(WAVEFORMATEX)
+        wr32(mt + 0x44, mt + kAMMediaTypeSize);
+        uint32_t wf = mt + kAMMediaTypeSize;
+        uint16_t align = (uint16_t)(t.channels * (t.bits / 8));
+        wr16(wf + WFX_OFF_wFormatTag, WAVE_FORMAT_PCM);
+        wr16(wf + WFX_OFF_nChannels, t.channels);
+        wr32(wf + WFX_OFF_nSamplesPerSec, t.rate);
+        wr16(wf + WFX_OFF_nBlockAlign, align);
+        wr32(wf + WFX_OFF_nAvgBytesPerSec, t.rate * align);
+        wr16(wf + WFX_OFF_wBitsPerSample, t.bits);
+    }
+}
+
+// Hands a freshly-created object's one reference to the caller through an
+// out-param. Unlike out_view this does not AddRef: the object was made for
+// this answer, so the guest's Release is the one that destroys it.
+void give_view(X86 *c, uint32_t out, ComObj *o, ComIface iface) {
+    if (!out || !gm_valid(out, 4)) {
+        com_release(o);
+        com_ret(c, E_POINTER);
+        return;
+    }
+    uint32_t v = com_view(o, iface);
+    if (!v) {
+        com_release(o);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    wr32(out, v);
+    com_ret(c, S_OK);
+}
+
+// --- IBaseFilter ---
+void MF_GetClassID(X86 *c) {
+    com_ret(c, E_NOTIMPL);
+}
+DX_STUB(MF_Stop, S_OK)
+DX_STUB(MF_Pause, S_OK)
+DX_STUB(MF_Run, S_OK)
+DX_STUB(MF_GetState, S_OK)
+DX_STUB(MF_SetSyncSource, S_OK)
+DX_STUB(MF_GetSyncSource, S_OK)
+
+void MF_EnumPins(X86 *c) {
+    ComObj *f = com_this_arg(c, IF_BASEFILTER);
+    uint32_t out = arg(c, 1);
+    if (!f) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    ComObj *e = com_new(K_ENUMPINS);
+    if (!e) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    e->dsh_filter = f->id;
+    give_view(c, out, e, IF_ENUMPINS);
+}
+
+void MF_FindPin(X86 *c) {
+    // FindPin(Id, ppPin): the graph looks pins up by enumeration, so this is
+    // not reached. Refuse loudly rather than hand back nothing.
+    uint32_t out = arg(c, 2);
+    if (out && gm_valid(out, 4))
+        wr32(out, 0);
+    log_once("dshow.mf_findpin", "dshow: IBaseFilter::FindPin by name is not implemented");
+    com_ret(c, E_NOTIMPL);
+}
+
+void MF_QueryFilterInfo(X86 *c) {
+    uint32_t out = arg(c, 1);
+    if (out && gm_valid(out, 260))
+        gm_zero(out, 260);
+    com_ret(c, S_OK);
+}
+
+void MF_JoinFilterGraph(X86 *c) {
+    com_ret(c, S_OK);
+}
+DX_STUB(MF_QueryVendorInfo, E_NOTIMPL)
+
+const ComMethod g_basefilter[] = {
+    {"QueryInterface", 3, com_QueryInterface},
+    {"AddRef", 1, com_AddRef},
+    {"Release", 1, com_Release},
+    {"GetClassID", 2, MF_GetClassID},
+    {"Stop", 1, MF_Stop},
+    {"Pause", 1, MF_Pause},
+    {"Run", 2, MF_Run},
+    {"GetState", 3, MF_GetState},
+    {"SetSyncSource", 2, MF_SetSyncSource},
+    {"GetSyncSource", 2, MF_GetSyncSource},
+    {"EnumPins", 2, MF_EnumPins},
+    {"FindPin", 3, MF_FindPin},
+    {"QueryFilterInfo", 2, MF_QueryFilterInfo},
+    {"JoinFilterGraph", 3, MF_JoinFilterGraph},
+    {"QueryVendorInfo", 2, MF_QueryVendorInfo},
+};
+
+// --- IPin ---
+void MP_Connect(X86 *c) {
+    log_once("dshow.mp_connect", "dshow: IPin::Connect is not implemented");
+    com_ret(c, E_NOTIMPL);
+}
+void MP_ReceiveConnection(X86 *c) {
+    log_once("dshow.mp_receiveconnection", "dshow: IPin::ReceiveConnection is not implemented");
+    com_ret(c, E_NOTIMPL);
+}
+
+void MP_Disconnect(X86 *c) {
+    ComObj *p = com_this_arg(c, IF_PIN);
+    if (!p) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    movie_pins()[p->id].connected = 0;
+    com_ret(c, S_OK);
+}
+
+void MP_ConnectedTo(X86 *c) {
+    ComObj *p = com_this_arg(c, IF_PIN);
+    uint32_t out = arg(c, 1);
+    if (!p || !out || !gm_valid(out, 4)) {
+        com_ret(c, p ? E_POINTER : E_FAIL);
+        return;
+    }
+    uint32_t other = movie_pins()[p->id].connected;
+    ComObj *o = other ? com_get(other) : nullptr;
+    if (!o) {
+        wr32(out, 0);
+        com_ret(c, VFW_E_NOT_CONNECTED);
+        return;
+    }
+    wr32(out, com_view(o, IF_PIN));
+    com_addref(o);
+    com_ret(c, S_OK);
+}
+
+void MP_ConnectionMediaType(X86 *c) {
+    com_ret(c, VFW_E_NOT_CONNECTED);
+}
+
+void MP_QueryPinInfo(X86 *c) {
+    ComObj *p = com_this_arg(c, IF_PIN);
+    uint32_t out = arg(c, 1);
+    if (!p || !out || !gm_valid(out, 260)) {
+        com_ret(c, p ? E_POINTER : E_FAIL);
+        return;
+    }
+    gm_zero(out, 260);
+    auto it = movie_pins().find(p->id);
+    if (it != movie_pins().end()) {
+        ComObj *f = com_get(it->second.filter);
+        wr32(out, f ? com_view(f, IF_BASEFILTER) : 0);
+        wr32(out + 4, it->second.dir);
+    }
+    com_ret(c, S_OK);
+}
+
+void MP_QueryDirection(X86 *c) {
+    ComObj *p = com_this_arg(c, IF_PIN);
+    uint32_t out = arg(c, 1);
+    if (!p || !out || !gm_valid(out, 4)) {
+        com_ret(c, p ? E_POINTER : E_FAIL);
+        return;
+    }
+    auto it = movie_pins().find(p->id);
+    wr32(out, it == movie_pins().end() ? 0 : it->second.dir);
+    com_ret(c, S_OK);
+}
+
+void MP_QueryId(X86 *c) {
+    com_ret(c, E_NOTIMPL);
+}
+void MP_QueryAccept(X86 *c) {
+    // Our own pins accept any type; the renderer's QueryAccept is the one
+    // Connect probes, and that pin is the guest's, reached through guest_call.
+    com_ret(c, S_OK);
+}
+
+void MP_EnumMediaTypes(X86 *c) {
+    ComObj *p = com_this_arg(c, IF_PIN);
+    uint32_t out = arg(c, 1);
+    if (!p) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    ComObj *e = com_new(K_ENUMMEDIATETYPES);
+    if (!e) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    e->dsh_filter = p->id; // the owning pin
+    give_view(c, out, e, IF_ENUMMEDIATETYPES);
+}
+
+DX_STUB(MP_QueryInternalConnections, E_NOTIMPL)
+DX_STUB(MP_EndOfStream, S_OK)
+DX_STUB(MP_BeginFlush, S_OK)
+DX_STUB(MP_EndFlush, S_OK)
+DX_STUB(MP_NewSegment, S_OK)
+
+const ComMethod g_pin[] = {
+    {"QueryInterface", 3, com_QueryInterface},
+    {"AddRef", 1, com_AddRef},
+    {"Release", 1, com_Release},
+    {"Connect", 3, MP_Connect},
+    {"ReceiveConnection", 3, MP_ReceiveConnection},
+    {"Disconnect", 1, MP_Disconnect},
+    {"ConnectedTo", 2, MP_ConnectedTo},
+    {"ConnectionMediaType", 2, MP_ConnectionMediaType},
+    {"QueryPinInfo", 2, MP_QueryPinInfo},
+    {"QueryDirection", 2, MP_QueryDirection},
+    {"QueryId", 2, MP_QueryId},
+    {"QueryAccept", 2, MP_QueryAccept},
+    {"EnumMediaTypes", 2, MP_EnumMediaTypes},
+    {"QueryInternalConnections", 3, MP_QueryInternalConnections},
+    {"EndOfStream", 1, MP_EndOfStream},
+    {"BeginFlush", 1, MP_BeginFlush},
+    {"EndFlush", 1, MP_EndFlush},
+    {"NewSegment", 4, MP_NewSegment},
+};
+
+// --- IEnumPins ---
+void EP_Next(X86 *c) {
+    ComObj *e = com_this_arg(c, IF_ENUMPINS);
+    uint32_t count = arg(c, 1), out = arg(c, 2), fetched = arg(c, 3);
+    if (!e) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    if (out && gm_valid(out, 4))
+        for (uint32_t i = 0; i < count; ++i)
+            wr32(out + i * 4, 0);
+    uint32_t n = 0;
+    auto it = movie_filters().find(e->dsh_filter);
+    if (it != movie_filters().end() && out && gm_valid(out, count * 4)) {
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t idx = e->dsh_pos + i;
+            if (idx >= it->second.pins.size())
+                break;
+            ComObj *p = com_get(it->second.pins[idx]);
+            if (!p)
+                continue;
+            wr32(out + i * 4, com_view(p, IF_PIN));
+            com_addref(p);
+            ++n;
+        }
+        e->dsh_pos += n;
+    }
+    if (fetched && gm_valid(fetched, 4))
+        wr32(fetched, n);
+    com_ret(c, n == count ? S_OK : S_FALSE);
+}
+void EP_Skip(X86 *c) {
+    ComObj *e = com_this_arg(c, IF_ENUMPINS);
+    if (e)
+        e->dsh_pos += arg(c, 1);
+    com_ret(c, S_OK);
+}
+void EP_Reset(X86 *c) {
+    ComObj *e = com_this_arg(c, IF_ENUMPINS);
+    if (e)
+        e->dsh_pos = 0;
+    com_ret(c, S_OK);
+}
+void EP_Clone(X86 *c) {
+    ComObj *e = com_this_arg(c, IF_ENUMPINS);
+    uint32_t out = arg(c, 1);
+    if (!e) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    ComObj *t = com_new(K_ENUMPINS);
+    if (!t) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    t->dsh_filter = e->dsh_filter;
+    t->dsh_pos = e->dsh_pos;
+    give_view(c, out, t, IF_ENUMPINS);
+}
+const ComMethod g_enumpins[] = {
+    {"QueryInterface", 3, com_QueryInterface},
+    {"AddRef", 1, com_AddRef},
+    {"Release", 1, com_Release},
+    {"Next", 4, EP_Next},
+    {"Skip", 2, EP_Skip},
+    {"Reset", 1, EP_Reset},
+    {"Clone", 2, EP_Clone},
+};
+
+// --- IEnumMediaTypes ---
+void EM_Next(X86 *c) {
+    ComObj *e = com_this_arg(c, IF_ENUMMEDIATETYPES);
+    uint32_t count = arg(c, 1), out = arg(c, 2), fetched = arg(c, 3);
+    if (!e) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    if (out && gm_valid(out, 4))
+        for (uint32_t i = 0; i < count; ++i)
+            wr32(out + i * 4, 0);
+    uint32_t n = 0;
+    auto it = movie_pins().find(e->dsh_filter);
+    if (it != movie_pins().end() && out && gm_valid(out, count * 4)) {
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t idx = e->dsh_pos + i;
+            if (idx >= it->second.types.size())
+                break;
+            uint32_t mt = heap_alloc(kAMMediaTypeSize + kVideoInfoHeaderSize, true, 8);
+            if (!mt)
+                break;
+            write_media_type(mt, it->second.types[idx]);
+            wr32(out + i * 4, mt);
+            ++n;
+        }
+        e->dsh_pos += n;
+    }
+    if (fetched && gm_valid(fetched, 4))
+        wr32(fetched, n);
+    com_ret(c, n == count ? S_OK : S_FALSE);
+}
+void EM_Skip(X86 *c) {
+    ComObj *e = com_this_arg(c, IF_ENUMMEDIATETYPES);
+    if (e)
+        e->dsh_pos += arg(c, 1);
+    com_ret(c, S_OK);
+}
+void EM_Reset(X86 *c) {
+    ComObj *e = com_this_arg(c, IF_ENUMMEDIATETYPES);
+    if (e)
+        e->dsh_pos = 0;
+    com_ret(c, S_OK);
+}
+void EM_Clone(X86 *c) {
+    ComObj *e = com_this_arg(c, IF_ENUMMEDIATETYPES);
+    uint32_t out = arg(c, 1);
+    if (!e) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    ComObj *t = com_new(K_ENUMMEDIATETYPES);
+    if (!t) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    t->dsh_filter = e->dsh_filter;
+    t->dsh_pos = e->dsh_pos;
+    give_view(c, out, t, IF_ENUMMEDIATETYPES);
+}
+const ComMethod g_enummediatypes[] = {
+    {"QueryInterface", 3, com_QueryInterface},
+    {"AddRef", 1, com_AddRef},
+    {"Release", 1, com_Release},
+    {"Next", 4, EM_Next},
+    {"Skip", 2, EM_Skip},
+    {"Reset", 1, EM_Reset},
+    {"Clone", 2, EM_Clone},
+};
+
+// --- The splitter and the two renderers ---
+ComObj *movie_splitter_create() {
+    ComObj *f = movie_new_filter(MR_SPLITTER);
+    if (!f)
+        return nullptr;
+    movie_new_pin(f, 0, {}); // input
+    MovieType vids;
+    memcpy(vids.major, MEDIATYPE_Video_, 16);
+    memcpy(vids.subtype, MEDIASUBTYPE_RGB24_, 16);
+    vids.has_major = vids.is_video = true;
+    movie_new_pin(f, 1, {vids});
+    MovieType auds;
+    memcpy(auds.major, MEDIATYPE_Audio_, 16);
+    memcpy(auds.subtype, MEDIASUBTYPE_PCM_, 16);
+    auds.has_major = auds.is_audio = true;
+    movie_new_pin(f, 1, {auds});
+    return f;
+}
+
+ComObj *movie_dsound_create() {
+    ComObj *f = movie_new_filter(MR_DSOUND);
+    if (!f)
+        return nullptr;
+    MovieType auds;
+    memcpy(auds.major, MEDIATYPE_Audio_, 16);
+    memcpy(auds.subtype, MEDIASUBTYPE_PCM_, 16);
+    auds.has_major = auds.is_audio = true;
+    movie_new_pin(f, 0, {auds});
+    return f;
+}
+
+ComObj *movie_graph_create() {
+    ComObj *g = com_new(K_FILTERGRAPH);
+    if (!g)
+        return nullptr;
+    movie_graphs()[g->id] = MovieGraph{};
+    return g;
+}
+
+// ===========================================================================
+// IGraphBuilder over the movie graph.
+// ===========================================================================
+void MG_AddFilter(X86 *c) {
+    ComObj *g = movie_graph_this(c);
+    uint32_t pf = arg(c, 1);
+    if (!g) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    if (!pf || !gm_valid(pf, 4)) {
+        com_ret(c, E_POINTER);
+        return;
+    }
+    ComObj *f = com_iface_of(pf) != IF_NONE ? com_this(pf, IF_BASEFILTER) : nullptr;
+    if (f) {
+        if (movie_filters()[f->id].graph != g->id) {
+            com_addref(f);
+            movie_graph_attach(g, f);
+        }
+        com_ret(c, S_OK);
+        return;
+    }
+    // The guest's texture renderer is a real filter we do not own; keep its
+    // interface pointer so Connect can reach its pins through guest_call.
+    movie_graphs()[g->id].guest_filters.push_back(pf);
+    LOGV("dshow: graph adds guest filter %08x", pf);
+    com_ret(c, S_OK);
+}
+
+void MG_RemoveFilter(X86 *c) {
+    ComObj *g = movie_graph_this(c);
+    uint32_t pf = arg(c, 1);
+    if (!g) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    MovieGraph &info = movie_graphs()[g->id];
+    for (size_t i = 0; i < info.filters.size(); ++i) {
+        ComObj *f = com_get(info.filters[i]);
+        if (f && com_view(f, IF_BASEFILTER) == pf) {
+            info.filters.erase(info.filters.begin() + i);
+            movie_filters()[f->id].graph = 0;
+            com_release(f);
+            com_ret(c, S_OK);
+            return;
+        }
+    }
+    for (size_t i = 0; i < info.guest_filters.size(); ++i) {
+        if (info.guest_filters[i] == pf) {
+            info.guest_filters.erase(info.guest_filters.begin() + i);
+            com_ret(c, S_OK);
+            return;
+        }
+    }
+    com_ret(c, VFW_E_NOT_FOUND);
+}
+
+void MG_EnumFilters(X86 *c) {
+    ComObj *g = movie_graph_this(c);
+    uint32_t out = arg(c, 1);
+    if (!g) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    ComObj *e = com_new(K_ENUMFILTERS);
+    if (!e) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    e->dsh_owner = g->id;
+    give_view(c, out, e, IF_ENUMFILTERS);
+}
+
+void MG_Connect(X86 *c) {
+    ComObj *g = movie_graph_this(c);
+    uint32_t a = arg(c, 1), b = arg(c, 2);
+    if (!g) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    ComObj *pa = com_iface_of(a) != IF_NONE ? com_this(a, IF_PIN) : nullptr;
+    ComObj *pb = com_iface_of(b) != IF_NONE ? com_this(b, IF_PIN) : nullptr;
+    if (pa && pb) {
+        MoviePin &x = movie_pins()[pa->id];
+        MoviePin &y = movie_pins()[pb->id];
+        if (x.dir != 1 || y.dir != 0) {
+            LOGW("dshow: Connect between two of our pins has the wrong directions");
+            com_ret(c, VFW_E_CANNOT_CONNECT);
+            return;
+        }
+        x.connected = pb->id;
+        y.connected = pa->id;
+        com_ret(c, S_OK);
+        return;
+    }
+    // One side is the guest renderer's pin. Negotiating it and pushing frames
+    // is the next step; failing here is honest, not a half-connected graph.
+    // Evidence for that step: the renderer's IMemInputPin is at
+    // renderer+0x98, its vtable is 0x0086b458, and IMemInputPin::Receive is
+    // slot 6 (+0x18), not slot 3. QueryAccept is IPin slot 11 (+0x2c) and
+    // ReceiveConnection is IPin slot 4 (+0x10).
+    log_once("dshow.movie.guestpin", "dshow: Connect to a guest pin is not implemented yet");
+    com_ret(c, VFW_E_CANNOT_CONNECT);
+}
+
+void MG_AddSourceFilter(X86 *c) {
+    ComObj *g = movie_graph_this(c);
+    uint32_t path = arg(c, 1), out = arg(c, 3);
+    if (!g) {
+        com_ret(c, E_FAIL);
+        return;
+    }
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, E_POINTER);
+        return;
+    }
+    wr32(out, 0);
+    std::string guest = read_wide(path);
+    std::string host = win32_host_path(guest, false);
+    if (host.empty()) {
+        LOGW("dshow: AddSourceFilter(%s): no host path", guest.c_str());
+        com_ret(c, HRESULT_FILE_NOT_FOUND);
+        return;
+    }
+    ComObj *f = movie_new_filter(MR_SOURCE);
+    if (!f) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    movie_filters()[f->id].path = guest;
+    movie_new_pin(f, 1, {}); // one output pin; the splitter consumes it
+    movie_graph_attach(g, f);
+    LOGV("dshow: AddSourceFilter(%s) -> filter %u", guest.c_str(), f->id);
+    give_view(c, out, f, IF_BASEFILTER);
 }
 
 // ===========================================================================
@@ -1206,26 +1908,50 @@ DX_STUB(DISP_GetTypeInfo, E_NOTIMPL)
 DX_STUB(DISP_GetIDsOfNames, E_NOTIMPL)
 DX_STUB(DISP_Invoke, E_NOTIMPL)
 
-// --- IEnumFilters: the graph has no filters, and an enumerator that fetches
-// nothing is how a graph says so. A game that lists the filters for its log
-// walks an empty list rather than reporting a failed enumeration.
+// --- IEnumFilters: over a K_GRAPH it is empty, and an enumerator that
+// fetches nothing is how that graph says so. A movie graph's filters are
+// real, so Next walks them.
 void EF_Next(X86 *c) {
     ComObj *e = com_this_arg(c, IF_ENUMFILTERS);
-    uint32_t out = arg(c, 2), fetched = arg(c, 3);
+    uint32_t count = arg(c, 1), out = arg(c, 2), fetched = arg(c, 3);
     if (!e) {
         com_ret(c, E_FAIL);
         return;
     }
     if (out && gm_valid(out, 4))
-        wr32(out, 0);
+        for (uint32_t i = 0; i < count; ++i)
+            wr32(out + i * 4, 0);
+    uint32_t n = 0;
+    ComObj *owner = com_get(e->dsh_owner);
+    if (owner && owner->kind == K_FILTERGRAPH && out && gm_valid(out, count * 4)) {
+        MovieGraph &g = movie_graphs()[owner->id];
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t idx = e->dsh_pos + i;
+            if (idx >= g.filters.size())
+                break;
+            ComObj *f = com_get(g.filters[idx]);
+            if (!f)
+                continue;
+            wr32(out + i * 4, com_view(f, IF_BASEFILTER));
+            com_addref(f);
+            ++n;
+        }
+        e->dsh_pos += n;
+    }
     if (fetched && gm_valid(fetched, 4))
-        wr32(fetched, 0);
-    com_ret(c, S_FALSE);
+        wr32(fetched, n);
+    com_ret(c, n == count ? S_OK : S_FALSE);
 }
 void EF_Skip(X86 *c) {
+    ComObj *e = com_this_arg(c, IF_ENUMFILTERS);
+    if (e)
+        e->dsh_pos += arg(c, 1);
     com_ret(c, S_FALSE);
 }
 void EF_Reset(X86 *c) {
+    ComObj *e = com_this_arg(c, IF_ENUMFILTERS);
+    if (e)
+        e->dsh_pos = 0;
     com_ret(c, S_OK);
 }
 void EF_Clone(X86 *c) {
@@ -1241,6 +1967,7 @@ void EF_Clone(X86 *c) {
         return;
     }
     twin->dsh_owner = e->dsh_owner;
+    twin->dsh_pos = e->dsh_pos;
     uint32_t v = com_view(twin, IF_ENUMFILTERS);
     if (!v || !out || !gm_valid(out, 4)) {
         com_release(twin);
@@ -1261,11 +1988,30 @@ const ComMethod g_enumfilters[] = {
     {"Clone", 2, EF_Clone},
 };
 
-// --- IGraphBuilder: there are no filters to build with.
-DX_STUB(GB_AddFilter, E_NOTIMPL)
-DX_STUB(GB_RemoveFilter, E_NOTIMPL)
+// --- IGraphBuilder: the K_GRAPH has no filters to build with, so its
+// mutators are inert. The movie graph's are real and dispatch to MG_*.
+void GB_AddFilter(X86 *c) {
+    if (movie_graph_this(c)) {
+        MG_AddFilter(c);
+        return;
+    }
+    log_once("dx.GB_AddFilter", "dx: AddFilter on a multimedia-stream graph does nothing");
+    com_ret(c, E_NOTIMPL);
+}
+void GB_RemoveFilter(X86 *c) {
+    if (movie_graph_this(c)) {
+        MG_RemoveFilter(c);
+        return;
+    }
+    log_once("dx.GB_RemoveFilter", "dx: RemoveFilter on a multimedia-stream graph does nothing");
+    com_ret(c, E_NOTIMPL);
+}
 
 void GB_EnumFilters(X86 *c) {
+    if (movie_graph_this(c)) {
+        MG_EnumFilters(c);
+        return;
+    }
     GraphThis t = graph_this(c);
     uint32_t out = arg(c, 1);
     if (!t.g) {
@@ -1294,10 +2040,25 @@ DX_STUB(GB_ConnectDirect, E_NOTIMPL)
 DX_STUB(GB_Reconnect, E_NOTIMPL)
 DX_STUB(GB_Disconnect, E_NOTIMPL)
 DX_STUB(GB_SetDefaultSyncSource, S_OK)
-DX_STUB(GB_Connect, E_NOTIMPL)
+void GB_Connect(X86 *c) {
+    if (movie_graph_this(c)) {
+        MG_Connect(c);
+        return;
+    }
+    log_once("dx.GB_Connect", "dx: Connect on a multimedia-stream graph does nothing");
+    com_ret(c, E_NOTIMPL);
+}
 DX_STUB(GB_Render, E_NOTIMPL)
 DX_STUB(GB_RenderFile, E_NOTIMPL)
-DX_STUB(GB_AddSourceFilter, E_NOTIMPL)
+void GB_AddSourceFilter(X86 *c) {
+    if (movie_graph_this(c)) {
+        MG_AddSourceFilter(c);
+        return;
+    }
+    log_once("dx.GB_AddSourceFilter",
+             "dx: AddSourceFilter on a multimedia-stream graph does nothing");
+    com_ret(c, E_NOTIMPL);
+}
 DX_STUB(GB_SetLogFile, S_OK)
 DX_STUB(GB_Abort, S_OK)
 DX_STUB(GB_ShouldOperationContinue, S_OK)
@@ -1929,6 +2690,40 @@ ComObj *audiodata_create() {
     return com_new(K_AUDIODATA);
 }
 
+void movie_pin_destroy(ComObj *p) {
+    movie_pins().erase(p->id);
+}
+
+void movie_filter_destroy(ComObj *f) {
+    auto it = movie_filters().find(f->id);
+    if (it != movie_filters().end()) {
+        std::vector<uint32_t> pins = it->second.pins;
+        it->second.pins.clear();
+        movie_filters().erase(it);
+        for (uint32_t id : pins) {
+            ComObj *p = com_get(id);
+            if (p && p->alive)
+                com_release(p);
+        }
+    }
+}
+
+void movie_graph_destroy(ComObj *g) {
+    auto it = movie_graphs().find(g->id);
+    if (it == movie_graphs().end())
+        return;
+    std::vector<uint32_t> ours = it->second.filters;
+    it->second.filters.clear();
+    movie_graphs().erase(it);
+    for (uint32_t id : ours) {
+        ComObj *f = com_get(id);
+        if (!f || !f->alive)
+            continue;
+        movie_filters()[id].graph = 0;
+        com_release(f);
+    }
+}
+
 } // namespace
 
 void dshow_frame_pump(X86 *) {
@@ -1962,6 +2757,11 @@ void dshow_register() {
                std::size(g_mediaposition));
     com_define(IF_ENUMFILTERS, "QUARTZ.dll", "IEnumFilters", g_enumfilters,
                std::size(g_enumfilters));
+    com_define(IF_BASEFILTER, "QUARTZ.dll", "IBaseFilter", g_basefilter, std::size(g_basefilter));
+    com_define(IF_PIN, "QUARTZ.dll", "IPin", g_pin, std::size(g_pin));
+    com_define(IF_ENUMPINS, "QUARTZ.dll", "IEnumPins", g_enumpins, std::size(g_enumpins));
+    com_define(IF_ENUMMEDIATETYPES, "QUARTZ.dll", "IEnumMediaTypes", g_enummediatypes,
+               std::size(g_enummediatypes));
 
     com_bind(IF_MMSTREAM, K_MMSTREAM);
     com_bind(IF_MEDIASTREAM, K_MEDIASTREAM);
@@ -1975,6 +2775,13 @@ void dshow_register() {
     com_bind(IF_BASICAUDIO, K_GRAPH);
     com_bind(IF_MEDIAPOSITION, K_GRAPH);
     com_bind(IF_ENUMFILTERS, K_ENUMFILTERS);
+    // The movie graph shares IGraphBuilder with the multimedia stream, and
+    // adds the filter graph's own interfaces.
+    com_bind(IF_GRAPH, K_FILTERGRAPH);
+    com_bind(IF_BASEFILTER, K_BASEFILTER);
+    com_bind(IF_PIN, K_PIN);
+    com_bind(IF_ENUMPINS, K_ENUMPINS);
+    com_bind(IF_ENUMMEDIATETYPES, K_ENUMMEDIATETYPES);
 
     com_register_iid(IF_MMSTREAM, IID_IAMMultiMediaStream_);
     com_register_iid(IF_MMSTREAM, IID_IMultiMediaStream_);
@@ -1993,17 +2800,32 @@ void dshow_register() {
     com_register_iid(IF_BASICAUDIO, IID_IBasicAudio_);
     com_register_iid(IF_MEDIAPOSITION, IID_IMediaPosition_);
     com_register_iid(IF_ENUMFILTERS, IID_IEnumFilters_);
+    com_register_iid(IF_BASEFILTER, IID_IBaseFilter_);
+    com_register_iid(IF_PIN, IID_IPin_);
+    com_register_iid(IF_ENUMPINS, IID_IEnumPins_);
+    com_register_iid(IF_ENUMMEDIATETYPES, IID_IEnumMediaTypes_);
 
     com_set_destructor(K_MMSTREAM, mmstream_destroy);
     com_set_destructor(K_STREAMSAMPLE, sample_destroy);
+    com_set_destructor(K_FILTERGRAPH, movie_graph_destroy);
+    com_set_destructor(K_BASEFILTER, movie_filter_destroy);
+    com_set_destructor(K_PIN, movie_pin_destroy);
 
     com_register_class(CLSID_AMMultiMediaStream_, "AMMultiMediaStream", IF_MMSTREAM,
                        mmstream_create);
     com_register_class(CLSID_AMAudioData_, "AMAudioData", IF_AUDIODATA, audiodata_create);
+    com_register_class(CLSID_FilterGraph_, "FilterGraph", IF_GRAPH, movie_graph_create);
+    com_register_class(CLSID_AviSplitter_, "AVI Splitter", IF_BASEFILTER, movie_splitter_create);
+    com_register_class(CLSID_MPEG1Splitter_, "MPEG-1 Splitter", IF_BASEFILTER,
+                       movie_splitter_create);
+    com_register_class(CLSID_DSoundRender_, "DSound Renderer", IF_BASEFILTER, movie_dsound_create);
 }
 
 void dshow_reset() {
     // The guest heap the rings and events lived in is gone with mem_init;
     // the host channels are released by the audio reset.
     sources().clear();
+    movie_pins().clear();
+    movie_filters().clear();
+    movie_graphs().clear();
 }

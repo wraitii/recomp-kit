@@ -87,6 +87,13 @@ enum ComIface : uint16_t {
     IF_BASICAUDIO,       // IBasicAudio
     IF_MEDIAPOSITION,    // IMediaPosition
     IF_ENUMFILTERS,      // IEnumFilters over the graph's (empty) filter list
+    // The movie player's own filter graph (dshow.cpp): CoCreateInstance
+    // (CLSID_FilterGraph) builds a real graph whose source, splitter and
+    // DSound renderer are shims and whose texture renderer is the guest's.
+    IF_BASEFILTER,       // IBaseFilter
+    IF_PIN,              // IPin
+    IF_ENUMPINS,         // IEnumPins
+    IF_ENUMMEDIATETYPES, // IEnumMediaTypes
     IF_D3D11_DEVICE,
     IF_D3D11_CONTEXT,
     IF_D3D11_TEXTURE,
@@ -169,12 +176,17 @@ enum ComKind : uint16_t {
     K_DSBUFFER,
     K_DINPUT,
     K_DIDEVICE,
-    K_MMSTREAM,     // a multimedia stream over one audio file
-    K_MEDIASTREAM,  // its audio media stream
-    K_AUDIODATA,    // a guest buffer wrapped for sampling
-    K_STREAMSAMPLE, // one sample: fills an audio data object from a stream
-    K_GRAPH,        // the filter graph a multimedia stream plays through
-    K_ENUMFILTERS,  // an enumerator over that graph's filters
+    K_MMSTREAM,         // a multimedia stream over one audio file
+    K_MEDIASTREAM,      // its audio media stream
+    K_AUDIODATA,        // a guest buffer wrapped for sampling
+    K_STREAMSAMPLE,     // one sample: fills an audio data object from a stream
+    K_GRAPH,            // the filter graph a multimedia stream plays through
+    K_ENUMFILTERS,      // an enumerator over that graph's filters
+    K_FILTERGRAPH,      // CLSID_FilterGraph: the movie player's graph
+    K_BASEFILTER,       // one filter in it: source, splitter or DSound renderer
+    K_PIN,              // one pin on one of those filters
+    K_ENUMPINS,         // IEnumPins over a filter's pins
+    K_ENUMMEDIATETYPES, // IEnumMediaTypes over a pin's media types
     K_D3D11_DEVICE,
     K_D3D11_CONTEXT,
     K_D3D11_TEXTURE,
@@ -373,7 +385,9 @@ struct ComObj {
     uint32_t dsh_notify_flags = 0; // graph: IMediaEventEx::SetNotifyFlags
     uint32_t dsh_data = 0;         // sample: the audio data object it fills
     bool dsh_initialised = false;
-    uint32_t dsh_state = 0;                               // STREAMSTATE_STOP 0 / STREAMSTATE_RUN 1
+    uint32_t dsh_state = 0;  // STREAMSTATE_STOP 0 / STREAMSTATE_RUN 1
+    uint32_t dsh_pos = 0;    // an enumerator's cursor
+    uint32_t dsh_filter = 0; // a pin's owning filter, or an enumerator's owning object
     uint32_t md_buffer = 0, md_length = 0, md_actual = 0; // audio data: the guest buffer
     bool md_has_format = false;
     uint32_t md_rate = 0;
