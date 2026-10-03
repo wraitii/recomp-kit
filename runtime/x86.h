@@ -161,17 +161,23 @@ static inline void recomp_dirty(uint32_t a, uint32_t n) {
     }
 }
 
+/* g_store_hook is g_watch_len | g_dirty_count, kept by whoever changes either
+ * (recomp_store_hook_update). Every guest store tests it, and a store through
+ * g_mem may alias anything, so the compiler reloads each global it reads after
+ * every store: one word is one load where the two counters were two. */
+extern uint32_t g_store_hook;
+static inline void recomp_store_hook_update(void) {
+    g_store_hook = g_watch_len | g_dirty_count;
+}
 static inline void recomp_watch(uint32_t a, uint32_t n, uint64_t v) {
     // Both features are disarmed on the ordinary write (the watchpoint is a
-    // diagnostic and a locked DirectDraw surface is rare), so read both once
-    // and test them as one value: one predictable branch instead of two. Arm
-    // and dirty state are set on this same guest thread, so the values read
-    // here are the ones the original two checks would have seen.
-    uint32_t watch = g_watch_len, dirty = g_dirty_count;
-    if ((watch | dirty) != 0) {
-        if (watch != 0 && a < g_watch_base + watch && g_watch_base < a + n)
+    // diagnostic and a locked DirectDraw surface is rare), so one predictable
+    // branch covers both. Arm and dirty state are set on this same guest
+    // thread, so the value read here is the one the original two checks saw.
+    if (RECOMP_UNLIKELY(g_store_hook != 0)) {
+        if (g_watch_len != 0 && a < g_watch_base + g_watch_len && g_watch_base < a + n)
             recomp_watch_hit(a, n, v);
-        if (dirty != 0)
+        if (g_dirty_count != 0)
             recomp_dirty(a, n);
     }
 }

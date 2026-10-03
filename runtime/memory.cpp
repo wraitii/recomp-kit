@@ -31,6 +31,7 @@ uint32_t g_watch_base = 0;
 uint32_t g_watch_len = 0;
 RecompDirty g_dirty[RECOMP_DIRTY_SLOTS];
 uint32_t g_dirty_count = 0;
+uint32_t g_store_hook = 0;
 
 namespace {
 struct WatchArm {
@@ -53,6 +54,7 @@ struct WatchArm {
             len = GUEST_SIZE - base;
         g_watch_base = (uint32_t)base;
         g_watch_len = (uint32_t)len;
+        recomp_store_hook_update();
     }
 };
 WatchArm g_watch_arm;

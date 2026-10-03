@@ -23,7 +23,7 @@ void recomp_watch_hit(uint32_t addr, uint32_t n, uint64_t value) {
     (void)value;
 }
 RecompDirty g_dirty[RECOMP_DIRTY_SLOTS];
-uint32_t g_dirty_count;
+uint32_t g_dirty_count, g_store_hook;
 
 static uint32_t last_shim, last_unknown, last_div_error;
 static unsigned harness_checks_run;

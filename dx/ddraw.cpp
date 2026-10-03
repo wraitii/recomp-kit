@@ -1895,6 +1895,7 @@ void reset_ddraw_for_test(void) {
     palettes().clear();
     lock_shadows().clear();
     g_dirty_count = 0; // their locks went with them
+    recomp_store_hook_update();
     // Not the baselines: like the retained-pointer flag they sit beside, they
     // belong to the surfaces, which outlive a recorder reset.
     g_frame_id = 1;
@@ -2305,6 +2306,7 @@ bool dirty_open(const ComObj *s) {
     if (g_dirty_count >= RECOMP_DIRTY_SLOTS)
         return false;
     RecompDirty &d = g_dirty[g_dirty_count++];
+    recomp_store_hook_update();
     d.base = s->pixels;
     d.len = s->pixels_bytes;
     d.lo = 0xffffffffu;
@@ -2319,6 +2321,7 @@ bool dirty_close(uint32_t base, uint32_t len, uint32_t *lo, uint32_t *hi) {
             *lo = g_dirty[i].lo;
             *hi = g_dirty[i].hi;
             g_dirty[i] = g_dirty[--g_dirty_count];
+            recomp_store_hook_update();
             return true;
         }
     return false;
@@ -4890,6 +4893,7 @@ void ddraw_reset() {
     // Every surface went with the arena, and their ids start over.
     baselines().clear();
     g_dirty_count = 0;
+    recomp_store_hook_update();
     // The scratch block and every surface lived in the arena mem_init just
     // discarded, so the cached addresses must not be reused.
     g_scratch = 0;

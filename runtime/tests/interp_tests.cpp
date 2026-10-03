@@ -22,7 +22,7 @@ uint8_t *g_mem;
 // runtime would otherwise supply: guest memory, and the dirty-region list
 // x86.h's stores record.
 RecompDirty g_dirty[RECOMP_DIRTY_SLOTS];
-uint32_t g_dirty_count;
+uint32_t g_dirty_count, g_store_hook;
 uint32_t g_watch_base, g_watch_len; // the memory watch, never armed here
 extern "C" void recomp_watch_hit(uint32_t, uint32_t, uint64_t) {}
 
