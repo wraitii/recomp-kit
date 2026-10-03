@@ -359,6 +359,18 @@ extern "C" void host_present(const void *pixels, int w, int h, int bpp, const ui
 extern "C" void host_display_present_window(const uint32_t *argb, int w, int h) {
     host_present(argb, w, h, 32, nullptr, w * 4);
 }
+// File/smoke sinks consume ARGB; retain their original raw-alpha behavior.
+extern "C" void host_display_present_window_rgba(uint8_t *rgba, int w, int h) {
+    if (!rgba || w <= 0 || h <= 0)
+        return;
+    static std::vector<uint32_t> argb;
+    argb.resize(size_t(w) * h);
+    for (size_t i = 0; i < argb.size(); ++i) {
+        const uint8_t *p = rgba + i * 4;
+        argb[i] = (uint32_t(p[3]) << 24) | (uint32_t(p[0]) << 16) | (uint32_t(p[1]) << 8) | p[2];
+    }
+    host_display_present_window(argb.data(), w, h);
+}
 
 extern "C" void host_d3d_begin_scene() {
     ReportLock held;

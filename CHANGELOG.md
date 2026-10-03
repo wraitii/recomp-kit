@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Present optional D3D8 bridge frames through a direct RGBA host seam, avoiding
+  the ARGB round trip while preserving opaque window composition and raw dumps.
+  The renderer can read mapped rows into caller storage and reuse GPU staging.
+
 - Translate arithmetic flags with intraprocedural CFG liveness instead of
   marking all six live at every branch. A flag store is kept only where a read
   or an observer keeps it live: calls, returns, external or unknown transfers,

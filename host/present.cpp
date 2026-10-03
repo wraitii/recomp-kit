@@ -284,3 +284,22 @@ extern "C" void host_display_present_window(const uint32_t *argb, int w, int h) 
     host_present_stage_rgba(rgba.data(), w, h);
     host_present_seal_window();
 }
+
+// Same bookkeeping and owned snapshot as the ARGB seam, without channel
+// conversions or temporary frame allocation. Runs under the guest baton.
+extern "C" void host_display_present_window_rgba(uint8_t *rgba, int w, int h) {
+    if (!rgba || w <= 0 || h <= 0)
+        return;
+    if (g_mode_w != w || g_mode_h != h || g_mode_bpp != 32)
+        host_set_display_mode(w, h, 32);
+    host_present_first_write();
+    for (size_t i = 0, n = size_t(w) * h; i < n; ++i)
+        rgba[i * 4 + 3] = 255;
+    {
+        ReportLock held;
+        ++g_present_count;
+    }
+    host_page_overlay(nullptr, w, h, 32, w * 4, nullptr);
+    host_present_stage_rgba(rgba, w, h);
+    host_present_seal_window();
+}

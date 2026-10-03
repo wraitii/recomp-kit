@@ -956,15 +956,9 @@ void Dev_Present(X86 *c) {
             com_ret(c, D8_ERR_INVALIDCALL);
             return;
         }
-        // Reuse the full-frame readback and swizzle buffers across presents.
-        // The readback overwrites every byte, so the resize only zero-fills on
-        // the first frame or a resolution change, not once per frame. The
-        // ARGB intermediary is kept because `host_display_present_window` takes
-        // ARGB and also forces opaque alpha for the presenter; removing the
-        // round trip would need a new host entry point and a matching alpha
-        // rule to stay byte-identical.
+        // Rust copies mapped rows straight into reused caller storage. Dump raw
+        // readback before the host's presentation-only opaque-alpha adjustment.
         static std::vector<uint8_t> rgba;
-        static std::vector<uint32_t> argb;
         if (rgba.size() != size_t(bytes))
             rgba.resize(size_t(bytes), 0);
         uint32_t got = 0;
@@ -979,14 +973,7 @@ void Dev_Present(X86 *c) {
             return;
         }
         dx_dump_frame_rgba(rgba.data(), dev->d3d8_width, dev->d3d8_height);
-        if (argb.size() != size_t(bytes / 4))
-            argb.resize(size_t(bytes / 4));
-        for (size_t i = 0; i < argb.size(); ++i) {
-            const uint8_t *p = rgba.data() + i * 4;
-            argb[i] =
-                (uint32_t(p[3]) << 24) | (uint32_t(p[0]) << 16) | (uint32_t(p[1]) << 8) | p[2];
-        }
-        host_display_present_window(argb.data(), int(dev->d3d8_width), int(dev->d3d8_height));
+        host_display_present_window_rgba(rgba.data(), int(dev->d3d8_width), int(dev->d3d8_height));
         com_ret(c, D8_OK);
         return;
     }

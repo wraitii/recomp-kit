@@ -5773,6 +5773,20 @@ static void test_presenter_real_offscreen(D3DRenderer *renderer) {
     CHECK_EQ(gdi_rgba[5], 255u);
     CHECK_EQ(gdi_rgba[10], 255u);
     host_present_stop();
+    // Direct RGBA matches the old ARGB seam's channel order and opaque alpha,
+    // including A8 input. The asynchronous presenter must own the whole frame.
+    host_present_start_offscreen(2, 2);
+    uint8_t direct_rgba[16] = {255, 0, 0, 0, 0, 255, 0, 17, 0, 0, 255, 128, 255, 255, 255, 255};
+    host_display_present_window_rgba(direct_rgba, 2, 2);
+    memset(direct_rgba, 0, sizeof direct_rgba);
+    gdi_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (host_present_unique_completed() == 0 && std::chrono::steady_clock::now() < gdi_deadline)
+        std::this_thread::yield();
+    CHECK_EQ(host_present_unique_completed(), 1u);
+    uint8_t direct_result[16] = {};
+    CHECK(host_present_test_read_rgba(direct_result, sizeof direct_result));
+    CHECK(memcmp(direct_result, gdi_rgba, sizeof direct_result) == 0);
+    host_present_stop();
     host_present_start_offscreen(4, 4);
     uint8_t rgba[64];
     for (int i = 0; i < 16; ++i) {
@@ -6505,6 +6519,20 @@ static void test_gdi_window_presentation() {
 
 static void test_d3d11_sealed_presentation();
 static void test_presentation_service() {
+    // RGBA must preserve RGB, force alpha even on A8 input, and own its snapshot.
+    host_present_test_begin();
+    uint8_t rgba[8] = {23, 45, 67, 0, 89, 101, 123, 17};
+    host_display_present_window_rgba(rgba, 2, 1);
+    CHECK_EQ(rgba[0], 23u);
+    CHECK_EQ(rgba[1], 45u);
+    CHECK_EQ(rgba[2], 67u);
+    CHECK_EQ(rgba[3], 255u);
+    CHECK_EQ(rgba[7], 255u);
+    rgba[0] = 0;
+    host_present_tick_for_test(0);
+    CHECK_EQ(host_present_unique_completed(), 1u);
+    CHECK_EQ(host_present_test_last_pixel(), 23u);
+    host_present_stop();
     test_gdi_window_presentation();
     test_d3d11_sealed_presentation();
     test_windowed_first_blit_presents_without_prior_completion();

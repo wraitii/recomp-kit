@@ -39,6 +39,9 @@ extern "C" {
 #endif
 // Synchronous owned-pixel snapshot: the host copies ARGB before returning.
 void host_display_present_window(const uint32_t *argb, int w, int h);
+// Synchronous RGBA snapshot. Windowed hosts force alpha opaque in caller-owned
+// scratch storage before copying it; callers must dump raw pixels beforehand.
+void host_display_present_window_rgba(uint8_t *rgba, int w, int h);
 // Seconds to the presenter's next refresh boundary, `intervals` refreshes
 // on - when a Present with a sync interval returns. Zero on a headless
 // presenter. The caller waits in the scheduler, never in the host.
