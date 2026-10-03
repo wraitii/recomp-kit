@@ -357,6 +357,15 @@ struct ComObj {
     uint32_t lock_off = 0, lock_len = 0;
     float pos3d[3] = {0, 0, 0}, vel3d[3] = {0, 0, 0};
     uint32_t notify_count = 0;
+    // IDirectSound3DBuffer state. `is_3d` is set when the buffer is created
+    // with DSBCAPS_CTRL3D or first exposes the 3D interface. Distances are in
+    // the guest's world units; the defaults are the DS3D ones (1.0 and 1e9).
+    bool is_3d = false;
+    float min3d = 1.0f, max3d = 1000000000.0f;
+    uint32_t mode3d = 0; // DS3DMODE_NORMAL
+    uint32_t cone_inside = 360, cone_outside = 360;
+    float cone_orient[3] = {0, 0, 0};
+    int32_t cone_outside_volume = 0; // DSBVOLUME_MAX
 
     // --- K_DINPUT / K_DIDEVICE
     uint32_t di_version = 0;

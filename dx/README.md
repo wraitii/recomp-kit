@@ -316,6 +316,27 @@ all of this can be read off a headless run:
 RECOMP_AUDIO_TRACE=200 RECOMP_MAX_SECONDS=25 build/recomp/pop_headless
 ```
 
+Other audio diagnostics, all off by default:
+
+- `RECOMP_AUDIO_DUMP_BUFFERS=<dir>` writes the PCM of each distinct sound the
+  guest plays as `buf<id>_<hash>.wav`, in the buffer's own format. It shows
+  what the guest decoded, which tells a bad decode from a bad schedule.
+- `RECOMP_TRACE_IMPORTS=<substring>` logs every import whose `dll!name`
+  contains the substring, with its stdcall arguments (hex and as float) and the
+  guest return address, for example `IDirectSound3D`.
+- `RECOMP_TRACE_FILES=1` logs file opens and reads, including `mmioOpenA`.
+
+## DirectSound3D
+
+3D buffers (`DSBCAPS_CTRL3D`, or a buffer asked for `IDirectSound3DBuffer`) are
+attenuated and panned from the listener and buffer positions, min/max distance
+and rolloff, following Wine's `DSOUND_Calc3DBuffer` (see the comment above
+`calc_3d` in `dsound.cpp` for the formulas and what is from a reference versus
+memory). Cones, velocity/Doppler and modes other than normal are logged once
+and not applied. Ghost Recon uses only position, min/max distance, volume and
+the listener position and orientation; the Windows result for the same inputs
+has not been compared.
+
 ## Tests
 
 ```

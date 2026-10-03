@@ -1239,6 +1239,8 @@ void m_mmioOpenA(X86 *c) {
     bool create = (flags & 0x00001000) != 0;    // MMIO_CREATE
 
     std::string host = win32_host_path(name, write || readwrite || create);
+    if (recomp_env("TRACE_FILES"))
+        LOGW("file: mmioOpen \"%s\" -> \"%s\"", name.c_str(), host.c_str());
     if (host.empty()) {
         LOGV("mmioOpenA(%s): not found", name.c_str());
         if (pinfo)

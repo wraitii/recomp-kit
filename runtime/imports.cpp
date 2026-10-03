@@ -1,4 +1,5 @@
 #include "imports.h"
+#include "../platform/os.h"
 #include "gdi32_internal.h"
 #include "user32_internal.h"
 #include "kernel32_internal.h"
@@ -478,9 +479,13 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     // import call. `argc == ARGC_UNKNOWN` needs the description for the
     // once-only key below, and the null/unsupported shims name the import in
     // their diagnostic.
-    const bool need_desc = log_level() >= 2 || g_call_observer != nullptr ||
-                           g_return_observer != nullptr || fn == nullptr ||
-                           fn == imports_unsupported || argc == ARGC_UNKNOWN;
+    // RECOMP_TRACE_IMPORTS=<substring> logs every import whose "dll!name"
+    // contains the substring, with its stdcall arguments (hex and as float)
+    // and the guest return address.
+    static const char *trace_filter = recomp_env("TRACE_IMPORTS");
+    const bool need_desc = trace_filter != nullptr || log_level() >= 2 ||
+                           g_call_observer != nullptr || g_return_observer != nullptr ||
+                           fn == nullptr || fn == imports_unsupported || argc == ARGC_UNKNOWN;
     char desc[512] = {};
     if (need_desc)
         snprintf(desc, sizeof desc, "%s", tramps()[idx].desc.c_str());
@@ -489,6 +494,18 @@ bool imports_dispatch(X86 *c, uint32_t target) {
 
     uint32_t ret_addr = rd32(c->r[R_ESP]);
     LOGV("-> %s (esp=%08x ret=%08x)", desc, c->r[R_ESP], ret_addr);
+    if (trace_filter && strstr(desc, trace_filter)) {
+        char line[512];
+        int n = snprintf(line, sizeof line, "import: %s ret=%08x", desc, ret_addr);
+        uint32_t na = (argc == ARGC_CDECL || argc == ARGC_UNKNOWN) ? 0u : (uint32_t)argc;
+        for (uint32_t i = 1; i < na && i < 8 && n > 0 && n < (int)sizeof line - 40; ++i) {
+            uint32_t v = rd32(c->r[R_ESP] + 4 + 4 * i);
+            float f;
+            memcpy(&f, &v, 4);
+            n += snprintf(line + n, sizeof line - (size_t)n, " %08x(%g)", v, (double)f);
+        }
+        LOGW("%s", line);
+    }
     recomp_seh_validate_chain(c, "import enter", desc);
 
     // The arguments as they are NOW, before the shim runs: a stdcall shim pops

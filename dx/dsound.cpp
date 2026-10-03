@@ -3,9 +3,11 @@
 //
 // A secondary buffer owns guest memory the game locks and fills with PCM. Play
 // forwards that memory, the format and the current volume and pan to
-// host_audio_play; Task 7 mixes it. Positional parameters are stored and
-// reported back faithfully but are not applied to the sample here, which is
-// what the brief specifies for this task.
+// host_audio_play; Task 7 mixes it. A buffer created with DSBCAPS_CTRL3D also
+// runs the 3D distance attenuation and stereo panning from Wine's software
+// DSOUND_Calc3DBuffer, recomputed at Play and whenever a position, listener or
+// other 3D parameter changes; the formula and the reference are documented
+// above calc_3d.
 //
 // Static cross-referencing of the EXE shows IID_IDirectSound3DBuffer,
 // IID_IDirectSound3DListener and IID_IDirectSoundNotify are all referenced
@@ -19,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 #include <iterator>
 #include "../platform/os.h"
@@ -334,6 +337,232 @@ void service_notifications() {
 float g_listener[12] = {0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0};
 float g_distance_factor = 1.0f, g_doppler_factor = 1.0f, g_rolloff_factor = 1.0f;
 
+// ---------------------------------------------------------------------------
+// 3D positional audio: distance attenuation and stereo panning.
+//
+// Reference. The algorithm below is Wine's software DirectSound 3D path,
+// dlls/dsound/sound3d.c `DSOUND_Calc3DBuffer` (wine-mirror/wine, master),
+// cross-checked against Microsoft's documented 3D attenuation formula and the
+// DS3DBUFFER/DS3DLISTENER defaults in include/dsound.h. It is Win32 x86, runs
+// in software with DS3DMODE_NORMAL and no HRTF, which is exactly the case the
+// game uses. This is a formula and constant reference, not copied code: the
+// shape (clamp, rolloff, inverse distance) and the pan/cone/Doppler layout are
+// Wine's, the arithmetic here is written for this shim.
+//
+// Distance attenuation (Wine sound3d.c 216-237). Microsoft's DirectX reference
+// states the same min/max semantics - no gain increase inside MinDistance, and
+// no further attenuation past MaxDistance - but the exact closed form below is
+// Wine's implementation; the MSDN formula page itself was not reachable to
+// quote directly.
+//
+//   d = |buffer - listener|                         (DS3DMODE_NORMAL)
+//   d = |buffer|                                    (DS3DMODE_HEADRELATIVE)
+//   if (d > max)  d = max                           (unless the buffer was
+//                                                    created with the
+//                                                    MUTE3DATMAXDISTANCE
+//                                                    flag, which silences it)
+//   if (d < min)  d = min
+//   adjusted = min + (d - min) * rolloffFactor
+//   gain = min / adjusted
+//
+// i.e. inverse-distance 1/d beyond MinDistance, MinDistance inside it, and
+// constant (not silent) beyond MaxDistance unless the mute flag is set. Note
+// that RolloffFactor scales the distance *before* the 1/d, so it is not the
+// exponent; the guest leaves it at the 1.0 default. Wine ignores the listener's
+// flDistanceFactor for attenuation entirely - it only appears in its Doppler
+// term - so neither do we.
+//
+// Panning (Wine sound3d.c 286-307, 344-361; stereo speaker table in dsound.c
+// 1067-1074: speaker_angles = {-pi/2, +pi/2}, speaker_num = {left, right}):
+//
+//   left = orientFront x orientTop            (DirectX's left-handed x
+//                                              already makes this point left)
+//   angle = angleBetween(left, dir)
+//   if angleBetween(front, dir) > pi/2: angle = -angle   (source is behind)
+//   angle -= pi/2
+//   if angle < -pi: angle += 2*pi
+//
+// then an equal-power crossfade over the two speakers, sqrt(1-a) and sqrt(a),
+// where a ramps from 0 at the left speaker to 1 at the right. A source dead
+// ahead is therefore sqrt(0.5) in each channel, not unity. Position and
+// listener are left-handed world coordinates and the cross product is taken
+// in that convention, so no axis flip is applied.
+//
+// The host mixer's pan is a one-sided attenuation, not a position, so the two
+// speaker gains are folded into a host volume plus a host pan. The louder
+// speaker becomes the channel volume and the quieter one the pan ratio; the
+// host then reproduces both gains exactly. See host/audio.h.
+//
+// DIVERGENCE(original): Wine converts its millibel volume with
+// pow(2, lVolume/600) while the host mixer uses 10^(mb/2000). The two agree to
+// about 0.3% and the second is the exact decibel definition, so the host form
+// is kept. Also not reproduced: the cone fields, Doppler/velocity, and the
+// flDistanceFactor influence on velocity. The guest never uses them; each logs
+// once when it is set (see B3D_SetCone*/B3D_SetVelocity/SetDopplerFactor) so a
+// future title cannot silently lose them.
+// ---------------------------------------------------------------------------
+enum { DS3DMODE_NORMAL = 0, DS3DMODE_HEADRELATIVE = 1, DS3DMODE_DISABLE = 2 };
+enum { DS3D_IMMEDIATE = 0, DS3D_DEFERRED = 1 };
+static const uint32_t DSBCAPS_MUTE3DATMAXDISTANCE_ = 0x00020000u;
+static const float PI_F_ = 3.14159265358979323846f;
+
+struct V3 {
+    float x, y, z;
+};
+static inline float v3_dot(const V3 &a, const V3 &b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+static inline V3 v3_cross(const V3 &a, const V3 &b) {
+    V3 c;
+    c.x = a.y * b.z - a.z * b.y;
+    c.y = a.z * b.x - a.x * b.z;
+    c.z = a.x * b.y - a.y * b.x;
+    return c;
+}
+static inline float v3_len(const V3 &a) {
+    return sqrtf(v3_dot(a, a));
+}
+static float v3_angle(const V3 &a, const V3 &b) {
+    float la = v3_len(a), lb = v3_len(b);
+    if (!la || !lb)
+        return 0.0f;
+    float c = v3_dot(a, b) / (la * lb);
+    if (c > 1.0f)
+        c = 1.0f;
+    if (c < -1.0f)
+        c = -1.0f;
+    // Wine's AngleBetweenVectorsRad computes the cosine in float and calls the
+    // double acos(), rounding once on return. acosf(-1.0f) on macOS is one ulp
+    // short of pi, which moves an exactly-sideways source a hair off the
+    // speaker axis; the double call rounds to the nearest float and keeps the
+    // reference's hard-side pan.
+    return (float)acos((double)c);
+}
+
+// Wine's stereo speaker mix for a pan angle in radians, and the two gains
+// before the buffer/distance volume is folded in.
+static void stereo_gains(float angle, float *left, float *right) {
+    const float half_pi = PI_F_ / 2.0f;
+    float a;
+    if (angle >= -half_pi && angle < half_pi) {
+        a = (angle + half_pi) / PI_F_;
+        *left = sqrtf(1.0f - a);
+        *right = sqrtf(a);
+        return;
+    }
+    if (angle < -half_pi)
+        angle += 2.0f * PI_F_;
+    a = (angle - half_pi) / PI_F_;
+    if (a < 0.0f)
+        a = 0.0f;
+    if (a > 1.0f)
+        a = 1.0f;
+    *right = sqrtf(1.0f - a);
+    *left = sqrtf(a);
+}
+
+// The host volume and pan for one buffer right now. For a non-3D buffer, or a
+// 3D buffer whose mode is DS3DMODE_DISABLE, that is simply its own SetVolume
+// and SetPan values, which is what DirectSound does.
+void calc_3d(const ComObj *b, int32_t *volume_mb, int32_t *pan_mb) {
+    *volume_mb = b->volume;
+    *pan_mb = b->pan;
+    if (!b->is_3d || b->mode3d == DS3DMODE_DISABLE)
+        return;
+
+    const V3 buf = {b->pos3d[0], b->pos3d[1], b->pos3d[2]};
+    const V3 front = {g_listener[3], g_listener[4], g_listener[5]};
+    const V3 top = {g_listener[6], g_listener[7], g_listener[8]};
+    V3 dir;
+    if (b->mode3d == DS3DMODE_HEADRELATIVE)
+        dir = buf; // already relative to the listener
+    else
+        dir = {buf.x - g_listener[0], buf.y - g_listener[1], buf.z - g_listener[2]};
+    float dist = v3_len(dir);
+
+    if (dist > b->max3d) {
+        if (b->buf_flags & DSBCAPS_MUTE3DATMAXDISTANCE_) {
+            *volume_mb = DSBVOLUME_MIN;
+            *pan_mb = 0;
+            return;
+        }
+        dist = b->max3d;
+    }
+    if (dist < b->min3d)
+        dist = b->min3d;
+
+    const float adjusted = b->min3d + (dist - b->min3d) * g_rolloff_factor;
+    // A zero or negative MinDistance would divide by zero. DirectSound requires
+    // it to be positive; keep full volume rather than propagate a NaN.
+    const float dist_gain = (b->min3d > 0.0f && adjusted > 0.0f) ? b->min3d / adjusted : 1.0f;
+    const float ingain = powf(10.0f, (float)b->volume / 2000.0f) * dist_gain;
+
+    float angle = 0.0f;
+    if (dist != 0.0f) {
+        const V3 left = v3_cross(front, top);
+        angle = v3_angle(left, dir);
+        if (v3_angle(front, dir) > PI_F_ / 2.0f)
+            angle = -angle;
+        angle -= PI_F_ / 2.0f;
+        if (angle < -PI_F_)
+            angle += 2.0f * PI_F_;
+    }
+    float lg = 1.0f, rg = 1.0f;
+    stereo_gains(angle, &lg, &rg);
+    const float l = ingain * lg, r = ingain * rg;
+    const float loud = l > r ? l : r;
+    if (loud <= 0.0f) {
+        *volume_mb = DSBVOLUME_MIN;
+        *pan_mb = 0;
+        return;
+    }
+
+    int32_t vm = (int32_t)lroundf(2000.0f * log10f(loud));
+    if (vm > DSBVOLUME_MAX)
+        vm = DSBVOLUME_MAX;
+    if (vm < DSBVOLUME_MIN)
+        vm = DSBVOLUME_MIN;
+    *volume_mb = vm;
+
+    float pan;
+    if (l > 0.0f && r > 0.0f)
+        pan = 2000.0f * log10f(r / l);
+    else if (r > l)
+        pan = (float)DSBPAN_RIGHT;
+    else
+        pan = (float)DSBPAN_LEFT;
+    int32_t pm = (int32_t)lroundf(pan);
+    if (pm > DSBPAN_RIGHT)
+        pm = DSBPAN_RIGHT;
+    if (pm < DSBPAN_LEFT)
+        pm = DSBPAN_LEFT;
+    *pan_mb = pm;
+}
+
+// Push a buffer's current 3D mix to its host channel. Non-3D and disabled
+// buffers fall through to their own volume and pan.
+void update_channel_mix(ComObj *b) {
+    if (!b || b->channel < 0)
+        return;
+    int32_t volume_mb = b->volume, pan_mb = b->pan;
+    calc_3d(b, &volume_mb, &pan_mb);
+    host_audio_set_volume(b->channel, volume_mb);
+    host_audio_set_pan(b->channel, pan_mb);
+}
+
+// The listener is shared by every 3D buffer, so a listener change with
+// DS3D_IMMEDIATE - or a CommitDeferredSettings - recalcs all of them, exactly
+// as Wine's DSOUND_ChangeListener walks the device buffer list. Stopped
+// buffers need nothing: Play computes from the stored state.
+void update_all_3d() {
+    const uint32_t n = com_object_count();
+    for (uint32_t id = 1; id <= n; ++id) {
+        ComObj *o = com_get(id);
+        if (o && o->alive && o->kind == K_DSBUFFER && o->is_3d)
+            update_channel_mix(o);
+    }
+}
+
 void read_wave_format(ComObj *b, uint32_t wfx) {
     if (!wfx || !gm_valid(wfx, 16))
         return;
@@ -474,6 +703,52 @@ void announce_once(const ComObj *b, uint32_t from) {
          (double)pcm_peak(b->buf_pixels, b->buf_bytes, b->bits));
 }
 
+// RECOMP_AUDIO_DUMP_BUFFERS=<dir> writes the PCM of every distinct sound the
+// guest plays as <dir>/buf<id>_<hash>.wav, once per distinct content, at the
+// moment of Play. It is the way to listen to what the guest decoded, to tell a
+// mis-decoded sample from a mis-scheduled one.
+void dump_buffer_wav(const ComObj *b) {
+    static const char *dir = recomp_env("AUDIO_DUMP_BUFFERS");
+    if (!dir || !*dir || !b->buf_bytes || !gm_fits(b->buf_pixels, (uint64_t)b->buf_bytes))
+        return;
+    static std::vector<uint64_t> seen;
+    const uint8_t *p = (const uint8_t *)gm_ptr(b->buf_pixels);
+    uint64_t h = 1469598103934665603ull; // FNV-1a over the data and the format
+    for (uint32_t i = 0; i < b->buf_bytes; ++i)
+        h = (h ^ p[i]) * 1099511628211ull;
+    uint32_t rate = b->frequency ? b->frequency : b->rate;
+    h = (h ^ rate) * 1099511628211ull;
+    for (uint64_t v : seen)
+        if (v == h)
+            return;
+    seen.push_back(h);
+    char path[1024];
+    snprintf(path, sizeof path, "%s/buf%u_%016llx.wav", dir, b->id, (unsigned long long)h);
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        LOGW("dsound: cannot write %s", path);
+        return;
+    }
+    auto w32 = [&](uint32_t v) { fwrite(&v, 4, 1, f); };
+    auto w16 = [&](uint16_t v) { fwrite(&v, 2, 1, f); };
+    uint32_t ba = b->nchannels * b->bits / 8;
+    fwrite("RIFF", 1, 4, f);
+    w32(36 + b->buf_bytes);
+    fwrite("WAVEfmt ", 1, 8, f);
+    w32(16);
+    w16(1);
+    w16((uint16_t)b->nchannels);
+    w32(rate);
+    w32(rate * ba);
+    w16((uint16_t)ba);
+    w16((uint16_t)b->bits);
+    fwrite("data", 1, 4, f);
+    w32(b->buf_bytes);
+    fwrite(p, 1, b->buf_bytes, f);
+    fclose(f);
+    LOGW("dsound: wrote %s", path);
+}
+
 void start_playback_loop(ComObj *b, uint32_t from, bool loop) {
     if (b->is_primary_buffer || b->channel < 0 || !b->buf_pixels)
         return;
@@ -486,10 +761,10 @@ void start_playback_loop(ComObj *b, uint32_t from, bool loop) {
     p.channels = (int32_t)b->nchannels;
     p.bits = (int32_t)b->bits;
     p.loop = loop ? 1 : 0;
-    p.volume = b->volume;
-    p.pan = b->pan;
+    calc_3d(b, &p.volume, &p.pan);
     p.start_offset = from;
     announce_once(b, from);
+    dump_buffer_wav(b);
     ATRACE("dsound: play buffer %u channel %d from %u, %u bytes, loop %d, peak %.3f", b->id,
            b->channel, from, b->buf_bytes, p.loop,
            (double)pcm_peak(b->buf_pixels, b->buf_bytes, b->bits));
@@ -854,8 +1129,9 @@ void Buffer_SetVolume(X86 *c) {
         return;
     }
     b->volume = v;
-    if (b->channel >= 0)
-        host_audio_set_volume(b->channel, v);
+    // A 3D buffer folds its own volume into the distance calculation; a plain
+    // one applies it directly. update_channel_mix does whichever applies.
+    update_channel_mix(b);
     com_ret(c, DS_OK);
 }
 
@@ -871,8 +1147,11 @@ void Buffer_SetPan(X86 *c) {
         return;
     }
     b->pan = v;
-    if (b->channel >= 0)
-        host_audio_set_pan(b->channel, v);
+    // For a 3D buffer in NORMAL/HEADRELATIVE mode the pan comes from the 3D
+    // position and this is stored but does not reach the mix, which matches
+    // DirectSound's documented "SetPan has no effect on a 3D buffer". In
+    // DS3DMODE_DISABLE it does apply, as Wine's disabled path does.
+    update_channel_mix(b);
     com_ret(c, DS_OK);
 }
 
@@ -1186,9 +1465,11 @@ const ComMethod g_dsbuffer8[] = {
 // ===========================================================================
 // IDirectSound3DBuffer - a view on the same buffer object.
 // ===========================================================================
-// DS3DBUFFER is 76 bytes: dwSize, vPosition, vVelocity, dwInsideConeAngle,
-// dwOutsideConeAngle, vConeOrientation, lConeOutsideVolume, flMinDistance,
-// flMaxDistance, dwMode.
+// DS3DBUFFER is 64 bytes (Wine include/dsound.h): dwSize, vPosition,
+// vVelocity, dwInsideConeAngle, dwOutsideConeAngle, vConeOrientation,
+// lConeOutsideVolume, flMinDistance, flMaxDistance, dwMode. The previous code
+// treated it as 76 bytes and wrote MinDistance into the cone-outside-volume
+// slot; that is corrected here.
 void B3D_GetAllParameters(X86 *c) {
     ComObj *b = this_buffer(c);
     uint32_t out = arg(c, 1);
@@ -1197,7 +1478,7 @@ void B3D_GetAllParameters(X86 *c) {
         return;
     }
     uint32_t size = rd32(out);
-    if (size < 76 || !gm_valid(out, size)) {
+    if (size < 64 || !gm_valid(out, size)) {
         com_ret(c, DSERR_INVALIDPARAM);
         return;
     }
@@ -1206,10 +1487,14 @@ void B3D_GetAllParameters(X86 *c) {
         wrf32(out + 4 + 4u * (uint32_t)i, b->pos3d[i]);
     for (int i = 0; i < 3; ++i)
         wrf32(out + 16 + 4u * (uint32_t)i, b->vel3d[i]);
-    wr32(out + 28, 360);   // dwInsideConeAngle
-    wr32(out + 32, 360);   // dwOutsideConeAngle
-    wrf32(out + 48, 1.0f); // flMinDistance
-    wrf32(out + 52, 1000000000.0f);
+    wr32(out + 28, b->cone_inside);
+    wr32(out + 32, b->cone_outside);
+    for (int i = 0; i < 3; ++i)
+        wrf32(out + 36 + 4u * (uint32_t)i, b->cone_orient[i]);
+    wr32(out + 48, (uint32_t)b->cone_outside_volume);
+    wrf32(out + 52, b->min3d);
+    wrf32(out + 56, b->max3d);
+    wr32(out + 60, b->mode3d);
     com_ret(c, DS_OK);
 }
 
@@ -1237,6 +1522,76 @@ void B3D_GetVelocity(X86 *c) {
     com_ret(c, DS_OK);
 }
 
+void B3D_GetConeAngles(X86 *c) {
+    ComObj *b = this_buffer(c);
+    uint32_t inside = arg(c, 1), outside = arg(c, 2);
+    if (!b) {
+        com_ret(c, DSERR_INVALIDPARAM);
+        return;
+    }
+    if (inside && gm_valid(inside, 4))
+        wr32(inside, b->cone_inside);
+    if (outside && gm_valid(outside, 4))
+        wr32(outside, b->cone_outside);
+    com_ret(c, DS_OK);
+}
+
+void B3D_GetConeOrientation(X86 *c) {
+    ComObj *b = this_buffer(c);
+    uint32_t out = arg(c, 1);
+    if (!b || !out || !gm_valid(out, 12)) {
+        com_ret(c, DSERR_INVALIDPARAM);
+        return;
+    }
+    for (int i = 0; i < 3; ++i)
+        wrf32(out + 4u * (uint32_t)i, b->cone_orient[i]);
+    com_ret(c, DS_OK);
+}
+
+void B3D_GetConeOutsideVolume(X86 *c) {
+    ComObj *b = this_buffer(c);
+    uint32_t out = arg(c, 1);
+    if (!b || !out || !gm_valid(out, 4)) {
+        com_ret(c, DSERR_INVALIDPARAM);
+        return;
+    }
+    wr32(out, (uint32_t)b->cone_outside_volume);
+    com_ret(c, DS_OK);
+}
+
+void B3D_GetMaxDistance(X86 *c) {
+    ComObj *b = this_buffer(c);
+    uint32_t out = arg(c, 1);
+    if (!b || !out || !gm_valid(out, 4)) {
+        com_ret(c, DSERR_INVALIDPARAM);
+        return;
+    }
+    wrf32(out, b->max3d);
+    com_ret(c, DS_OK);
+}
+
+void B3D_GetMinDistance(X86 *c) {
+    ComObj *b = this_buffer(c);
+    uint32_t out = arg(c, 1);
+    if (!b || !out || !gm_valid(out, 4)) {
+        com_ret(c, DSERR_INVALIDPARAM);
+        return;
+    }
+    wrf32(out, b->min3d);
+    com_ret(c, DS_OK);
+}
+
+void B3D_GetMode(X86 *c) {
+    ComObj *b = this_buffer(c);
+    uint32_t out = arg(c, 1);
+    if (!b || !out || !gm_valid(out, 4)) {
+        com_ret(c, DSERR_INVALIDPARAM);
+        return;
+    }
+    wr32(out, b->mode3d);
+    com_ret(c, DS_OK);
+}
+
 void B3D_SetPosition(X86 *c) {
     ComObj *b = this_buffer(c);
     if (!b) {
@@ -1248,6 +1603,8 @@ void B3D_SetPosition(X86 *c) {
     memcpy(&b->pos3d[0], &x, 4);
     memcpy(&b->pos3d[1], &y, 4);
     memcpy(&b->pos3d[2], &z, 4);
+    if (arg(c, 4) == DS3D_IMMEDIATE)
+        update_channel_mix(b);
     com_ret(c, DS_OK);
 }
 
@@ -1261,13 +1618,106 @@ void B3D_SetVelocity(X86 *c) {
     memcpy(&b->vel3d[0], &x, 4);
     memcpy(&b->vel3d[1], &y, 4);
     memcpy(&b->vel3d[2], &z, 4);
+    if (b->vel3d[0] != 0.0f || b->vel3d[1] != 0.0f || b->vel3d[2] != 0.0f)
+        log_once("dsound.3ddoppler",
+                 "dsound: 3D velocity is set but Doppler is not applied to the mix");
+    if (arg(c, 4) == DS3D_IMMEDIATE)
+        update_channel_mix(b);
+    com_ret(c, DS_OK);
+}
+
+void B3D_SetConeAngles(X86 *c) {
+    ComObj *b = this_buffer(c);
+    if (!b) {
+        com_ret(c, DSERR_INVALIDPARAM);
+        return;
+    }
+    b->cone_inside = arg(c, 1);
+    b->cone_outside = arg(c, 2);
+    log_once("dsound.3dcone",
+             "dsound: 3D cone angles (%u/%u) are stored but not applied to the mix", b->cone_inside,
+             b->cone_outside);
+    if (arg(c, 3) == DS3D_IMMEDIATE)
+        update_channel_mix(b);
+    com_ret(c, DS_OK);
+}
+
+void B3D_SetConeOrientation(X86 *c) {
+    ComObj *b = this_buffer(c);
+    if (!b) {
+        com_ret(c, DSERR_INVALIDPARAM);
+        return;
+    }
+    uint32_t x = arg(c, 1), y = arg(c, 2), z = arg(c, 3);
+    memcpy(&b->cone_orient[0], &x, 4);
+    memcpy(&b->cone_orient[1], &y, 4);
+    memcpy(&b->cone_orient[2], &z, 4);
+    log_once("dsound.3dcone",
+             "dsound: a 3D cone orientation is set but cones are not applied to the mix");
+    if (arg(c, 4) == DS3D_IMMEDIATE)
+        update_channel_mix(b);
+    com_ret(c, DS_OK);
+}
+
+void B3D_SetConeOutsideVolume(X86 *c) {
+    ComObj *b = this_buffer(c);
+    if (!b) {
+        com_ret(c, DSERR_INVALIDPARAM);
+        return;
+    }
+    b->cone_outside_volume = (int32_t)arg(c, 1);
+    log_once("dsound.3dcone",
+             "dsound: a 3D cone outside volume is set but cones are not applied to the mix");
+    if (arg(c, 2) == DS3D_IMMEDIATE)
+        update_channel_mix(b);
+    com_ret(c, DS_OK);
+}
+
+void B3D_SetMaxDistance(X86 *c) {
+    ComObj *b = this_buffer(c);
+    if (!b) {
+        com_ret(c, DSERR_INVALIDPARAM);
+        return;
+    }
+    uint32_t v = arg(c, 1);
+    memcpy(&b->max3d, &v, 4);
+    if (arg(c, 2) == DS3D_IMMEDIATE)
+        update_channel_mix(b);
+    com_ret(c, DS_OK);
+}
+
+void B3D_SetMinDistance(X86 *c) {
+    ComObj *b = this_buffer(c);
+    if (!b) {
+        com_ret(c, DSERR_INVALIDPARAM);
+        return;
+    }
+    uint32_t v = arg(c, 1);
+    memcpy(&b->min3d, &v, 4);
+    if (arg(c, 2) == DS3D_IMMEDIATE)
+        update_channel_mix(b);
+    com_ret(c, DS_OK);
+}
+
+void B3D_SetMode(X86 *c) {
+    ComObj *b = this_buffer(c);
+    if (!b) {
+        com_ret(c, DSERR_INVALIDPARAM);
+        return;
+    }
+    b->mode3d = arg(c, 1);
+    if (b->mode3d != DS3DMODE_NORMAL && b->mode3d != DS3DMODE_HEADRELATIVE &&
+        b->mode3d != DS3DMODE_DISABLE)
+        log_once("dsound.3dmode", "dsound: unknown 3D mode %u; treating it as normal", b->mode3d);
+    if (arg(c, 2) == DS3D_IMMEDIATE)
+        update_channel_mix(b);
     com_ret(c, DS_OK);
 }
 
 void B3D_SetAllParameters(X86 *c) {
     ComObj *b = this_buffer(c);
     uint32_t in = arg(c, 1);
-    if (!b || !in || !gm_valid(in, 76)) {
+    if (!b || !in || !gm_valid(in, 64)) {
         com_ret(c, DSERR_INVALIDPARAM);
         return;
     }
@@ -1275,23 +1725,21 @@ void B3D_SetAllParameters(X86 *c) {
         b->pos3d[i] = rdf32(in + 4 + 4u * (uint32_t)i);
     for (int i = 0; i < 3; ++i)
         b->vel3d[i] = rdf32(in + 16 + 4u * (uint32_t)i);
+    b->cone_inside = rd32(in + 28);
+    b->cone_outside = rd32(in + 32);
+    for (int i = 0; i < 3; ++i)
+        b->cone_orient[i] = rdf32(in + 36 + 4u * (uint32_t)i);
+    b->cone_outside_volume = (int32_t)rd32(in + 48);
+    b->min3d = rdf32(in + 52);
+    b->max3d = rdf32(in + 56);
+    b->mode3d = rd32(in + 60);
+    if (b->vel3d[0] != 0.0f || b->vel3d[1] != 0.0f || b->vel3d[2] != 0.0f)
+        log_once("dsound.3ddoppler",
+                 "dsound: 3D velocity is set but Doppler is not applied to the mix");
+    if (arg(c, 2) == DS3D_IMMEDIATE)
+        update_channel_mix(b);
     com_ret(c, DS_OK);
 }
-
-// The remaining 3D parameters are accepted and reported as their defaults.
-// Positional audio is stored, not applied, in this task.
-DX_STUB(B3D_GetConeAngles, DS_OK)
-DX_STUB(B3D_GetConeOrientation, DS_OK)
-DX_STUB(B3D_GetConeOutsideVolume, DS_OK)
-DX_STUB(B3D_GetMaxDistance, DS_OK)
-DX_STUB(B3D_GetMinDistance, DS_OK)
-DX_STUB(B3D_GetMode, DS_OK)
-DX_STUB(B3D_SetConeAngles, DS_OK)
-DX_STUB(B3D_SetConeOrientation, DS_OK)
-DX_STUB(B3D_SetConeOutsideVolume, DS_OK)
-DX_STUB(B3D_SetMaxDistance, DS_OK)
-DX_STUB(B3D_SetMinDistance, DS_OK)
-DX_STUB(B3D_SetMode, DS_OK)
 
 const ComMethod g_ds3dbuffer[] = {
     {"QueryInterface", 3, com_QueryInterface},
@@ -1336,6 +1784,8 @@ void L3D_SetPosition(X86 *c) {
     memcpy(&g_listener[0], &x, 4);
     memcpy(&g_listener[1], &y, 4);
     memcpy(&g_listener[2], &z, 4);
+    if (arg(c, 4) == DS3D_IMMEDIATE)
+        update_all_3d();
     com_ret(c, DS_OK);
 }
 
@@ -1351,10 +1801,25 @@ void L3D_GetOrientation(X86 *c) {
 }
 
 void L3D_SetOrientation(X86 *c) {
+    // Read the six floats before touching the stored listener, because Wine
+    // refuses an orientation whose front and top are parallel and such a call
+    // must leave the previous pair in place.
+    V3 front, top;
+    float v[6];
     for (int i = 0; i < 6; ++i) {
-        uint32_t v = arg(c, 1 + i);
-        memcpy(&g_listener[3 + i], &v, 4);
+        uint32_t raw = arg(c, 1 + i);
+        memcpy(&v[i], &raw, 4);
     }
+    front = {v[0], v[1], v[2]};
+    top = {v[3], v[4], v[5]};
+    if (v3_angle(front, top) == 0.0f) {
+        com_ret(c, DSERR_INVALIDPARAM);
+        return;
+    }
+    for (int i = 0; i < 6; ++i)
+        g_listener[3 + i] = v[i];
+    if (arg(c, 7) == DS3D_IMMEDIATE)
+        update_all_3d();
     com_ret(c, DS_OK);
 }
 
@@ -1374,19 +1839,25 @@ void L3D_SetVelocity(X86 *c) {
     memcpy(&g_listener[9], &x, 4);
     memcpy(&g_listener[10], &y, 4);
     memcpy(&g_listener[11], &z, 4);
+    if (g_listener[9] != 0.0f || g_listener[10] != 0.0f || g_listener[11] != 0.0f)
+        log_once("dsound.3ddoppler",
+                 "dsound: listener velocity is set but Doppler is not applied to the mix");
+    if (arg(c, 4) == DS3D_IMMEDIATE)
+        update_all_3d();
     com_ret(c, DS_OK);
 }
 
 void L3D_GetAllParameters(X86 *c) {
     uint32_t out = arg(c, 1);
     // DS3DLISTENER: dwSize, vPosition, vVelocity, vOrientFront, vOrientTop,
-    // flDistanceFactor, flRolloffFactor, flDopplerFactor = 68 bytes.
+    // flDistanceFactor, flRolloffFactor, flDopplerFactor = 64 bytes (4 + four
+    // 12-byte vectors + three floats). Wine checks the same sizeof().
     if (!out || !gm_valid(out, 4)) {
         com_ret(c, DSERR_INVALIDPARAM);
         return;
     }
     uint32_t size = rd32(out);
-    if (size < 68 || !gm_valid(out, size)) {
+    if (size < 64 || !gm_valid(out, size)) {
         com_ret(c, DSERR_INVALIDPARAM);
         return;
     }
@@ -1407,7 +1878,7 @@ void L3D_GetAllParameters(X86 *c) {
 
 void L3D_SetAllParameters(X86 *c) {
     uint32_t in = arg(c, 1);
-    if (!in || !gm_valid(in, 68)) {
+    if (!in || !gm_valid(in, 64)) {
         com_ret(c, DSERR_INVALIDPARAM);
         return;
     }
@@ -1422,6 +1893,13 @@ void L3D_SetAllParameters(X86 *c) {
     g_distance_factor = rdf32(in + 52);
     g_rolloff_factor = rdf32(in + 56);
     g_doppler_factor = rdf32(in + 60);
+    if (g_listener[9] != 0.0f || g_listener[10] != 0.0f || g_listener[11] != 0.0f ||
+        g_doppler_factor != 1.0f)
+        log_once(
+            "dsound.3ddoppler",
+            "dsound: a listener Doppler parameter is set but Doppler is not applied to the mix");
+    if (arg(c, 2) == DS3D_IMMEDIATE)
+        update_all_3d();
     com_ret(c, DS_OK);
 }
 
@@ -1446,19 +1924,29 @@ void L3D_GetRolloffFactor(X86 *c) {
 void L3D_SetDistanceFactor(X86 *c) {
     uint32_t v = arg(c, 1);
     memcpy(&g_distance_factor, &v, 4);
+    if (arg(c, 2) == DS3D_IMMEDIATE)
+        update_all_3d();
     com_ret(c, DS_OK);
 }
 void L3D_SetDopplerFactor(X86 *c) {
     uint32_t v = arg(c, 1);
     memcpy(&g_doppler_factor, &v, 4);
+    if (g_doppler_factor != 1.0f)
+        log_once("dsound.3ddoppler",
+                 "dsound: the Doppler factor is changed but Doppler is not applied to the mix");
+    if (arg(c, 2) == DS3D_IMMEDIATE)
+        update_all_3d();
     com_ret(c, DS_OK);
 }
 void L3D_SetRolloffFactor(X86 *c) {
     uint32_t v = arg(c, 1);
     memcpy(&g_rolloff_factor, &v, 4);
+    if (arg(c, 2) == DS3D_IMMEDIATE)
+        update_all_3d();
     com_ret(c, DS_OK);
 }
 void L3D_CommitDeferredSettings(X86 *c) {
+    update_all_3d();
     com_ret(c, DS_OK);
 }
 
@@ -1577,6 +2065,7 @@ void DS_CreateSoundBuffer(X86 *c) {
 
     ComObj *b = com_new(K_DSBUFFER);
     b->buf_flags = flags;
+    b->is_3d = (flags & DSBCAPS_CTRL3D) != 0;
     b->is_primary_buffer = primary;
     if (primary) {
         b->rate = 22050;
@@ -1839,10 +2328,13 @@ ComObj *dsound_qi(ComObj *self, ComIface want) {
 }
 ComObj *dsbuffer_qi(ComObj *self, ComIface want) {
     // The primary buffer also exposes the 3D listener, as real DirectSound does.
-    // The listener view is global bookkeeping (position/orientation/factors);
-    // it produces no host sound, which is the documented audio gap.
-    if (want == IF_DS3DBUFFER || want == IF_DSNOTIFY || want == IF_DS3DLISTENER ||
-        want == IF_DSBUFFER8)
+    // The listener view is global bookkeeping (position/orientation/factors),
+    // and its position/orientation now drive the mix for the 3D buffers.
+    if (want == IF_DS3DBUFFER) {
+        self->is_3d = true; // a buffer that has a 3D interface is a 3D buffer
+        return self;
+    }
+    if (want == IF_DSNOTIFY || want == IF_DS3DLISTENER || want == IF_DSBUFFER8)
         return self;
     return nullptr;
 }

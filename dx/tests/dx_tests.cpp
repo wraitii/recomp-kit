@@ -685,6 +685,37 @@ enum {
     DS_DuplicateSoundBuffer = 5,
     N_SetNotificationPositions = 3,
 };
+// IDirectSound3DBuffer and IDirectSound3DListener slot numbers, from their
+// vtable order in include/dsound.h.
+enum {
+    B3D_GetAllParameters = 3,
+    B3D_GetConeAngles = 4,
+    B3D_GetConeOrientation = 5,
+    B3D_GetConeOutsideVolume = 6,
+    B3D_GetMaxDistance = 7,
+    B3D_GetMinDistance = 8,
+    B3D_GetMode = 9,
+    B3D_GetPosition = 10,
+    B3D_SetAllParameters = 12,
+    B3D_SetConeAngles = 13,
+    B3D_SetConeOrientation = 14,
+    B3D_SetConeOutsideVolume = 15,
+    B3D_SetMaxDistance = 16,
+    B3D_SetMinDistance = 17,
+    B3D_SetMode = 18,
+    B3D_SetPosition = 19,
+};
+enum {
+    L3D_GetAllParameters = 3,
+    L3D_GetPosition = 7,
+    L3D_SetAllParameters = 10,
+    L3D_SetDistanceFactor = 11,
+    L3D_SetDopplerFactor = 12,
+    L3D_SetOrientation = 13,
+    L3D_SetPosition = 14,
+    L3D_SetRolloffFactor = 15,
+    L3D_CommitDeferredSettings = 17,
+};
 enum {
     DI_CreateDevice = 3,
     DID_SetProperty = 6,
@@ -7209,6 +7240,197 @@ static void test_dsound() {
     CHECK_EQ(call_method(buf8, 21 /* SetFX */, {0, 0}), E_NOTIMPL);
 }
 
+static uint32_t fbits(float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    return u;
+}
+
+// DirectSound 3D positional audio: the distance attenuation and the stereo
+// panning of Wine's DSOUND_Calc3DBuffer, checked through the guest COM path.
+// The expected millibel values come from the reference formula, not from the
+// shim: distance gain = MinDistance / (MinDistance + rolloff * (d -
+// MinDistance)), and the stereo equal-power pan puts sqrt(0.5) in each channel
+// dead ahead. The host volume is the louder speaker and the host pan is their
+// ratio, so a centred source at twice MinDistance is -903 mB (0.5 * 0.707).
+static void test_dsound_3d_positional() {
+    cpu_reset();
+    g_plays.clear();
+    g_stops.clear();
+    g_audio_volumes.clear();
+    g_audio_pans.clear();
+
+    uint32_t create = tramp("DSOUND.dll", "ord1");
+    CHECK(create != 0);
+    CHECK_EQ(call_shim(create, {0, sc(0), 0}), DS_OK);
+    uint32_t ds = rd32(sc(0));
+    CHECK(ds != 0);
+    CHECK_EQ(call_method(ds, DS_SetCooperativeLevel, {0x20004, 3}), DS_OK);
+
+    // The listener is exposed by the primary buffer, as real DirectSound does.
+    uint32_t pbd = sc(0x200);
+    gm_zero(pbd, DSBUFFERDESC_SIZE);
+    wr32(pbd + DSBD_OFF_dwSize, DSBUFFERDESC_SIZE);
+    wr32(pbd + DSBD_OFF_dwFlags, DSBCAPS_PRIMARYBUFFER);
+    CHECK_EQ(call_method(ds, DS_CreateSoundBuffer, {pbd, sc(4), 0}), DS_OK);
+    uint32_t primary = rd32(sc(4));
+    CHECK(primary != 0);
+    uint32_t iid = sc(0x40);
+    const uint8_t liid[16] = {0x84, 0xFA, 0x9A, 0x27, 0x81, 0x49, 0xCE, 0x11,
+                              0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60};
+    for (int i = 0; i < 16; ++i)
+        wr8(iid + (uint32_t)i, liid[i]);
+    CHECK_EQ(call_method(primary, B_QueryInterface, {iid, sc(0x60)}), S_OK);
+    uint32_t listener = rd32(sc(0x60));
+    CHECK(listener != 0);
+
+    // Origin, facing +z, up +y: DirectX's left-handed convention.
+    CHECK_EQ(call_method(listener, L3D_SetPosition, {0, 0, 0, 0}), DS_OK);
+    CHECK_EQ(call_method(listener, L3D_SetOrientation, {0, 0, fbits(1.0f), 0, fbits(1.0f), 0, 0}),
+             DS_OK);
+
+    // DS3DLISTENER is 64 bytes: the old code required 68 and would have
+    // refused a correctly sized record. Position is at 4, front at 28, top at
+    // 40 and the three factors at 52/56/60.
+    uint32_t lp = sc(0x700);
+    gm_zero(lp, 64);
+    wr32(lp, 64);
+    CHECK_EQ(call_method(listener, L3D_GetAllParameters, {lp}), DS_OK);
+    CHECK(rdf32(lp + 4) == 0.0f);
+    CHECK(rdf32(lp + 28) == 0.0f);
+    CHECK(rdf32(lp + 32) == 0.0f);
+    CHECK(rdf32(lp + 36) == 1.0f);
+    CHECK(rdf32(lp + 44) == 1.0f);
+    CHECK(rdf32(lp + 52) == 1.0f);
+    CHECK(rdf32(lp + 56) == 1.0f);
+    CHECK(rdf32(lp + 60) == 1.0f);
+
+    // A mono 22050 Hz secondary buffer with the 3D control flag.
+    uint32_t wfx = sc(0x100);
+    wr16(wfx + WFX_OFF_wFormatTag, WAVE_FORMAT_PCM);
+    wr16(wfx + WFX_OFF_nChannels, 1);
+    wr32(wfx + WFX_OFF_nSamplesPerSec, 22050);
+    wr32(wfx + WFX_OFF_nAvgBytesPerSec, 44100);
+    wr16(wfx + WFX_OFF_nBlockAlign, 2);
+    wr16(wfx + WFX_OFF_wBitsPerSample, 16);
+    wr16(wfx + WFX_OFF_cbSize, 0);
+
+    uint32_t bd = sc(0x200);
+    gm_zero(bd, DSBUFFERDESC_SIZE);
+    wr32(bd + DSBD_OFF_dwSize, DSBUFFERDESC_SIZE);
+    wr32(bd + DSBD_OFF_dwFlags, DSBCAPS_CTRL3D | DSBCAPS_CTRLVOLUME);
+    wr32(bd + DSBD_OFF_dwBufferBytes, 1024);
+    wr32(bd + DSBD_OFF_lpwfxFormat, wfx);
+    CHECK_EQ(call_method(ds, DS_CreateSoundBuffer, {bd, sc(4), 0}), DS_OK);
+    uint32_t buf = rd32(sc(4));
+    CHECK(buf != 0);
+    CHECK_EQ(call_method(buf, B_Lock, {0, 1024, sc(0x300), sc(0x304), sc(0x308), sc(0x30c), 0}),
+             DS_OK);
+    uint32_t p1 = rd32(sc(0x300));
+    for (uint32_t i = 0; i < 1024; ++i)
+        wr8(p1 + i, (uint8_t)(i & 0xff));
+    call_method(buf, B_Unlock, {p1, 1024, 0, 0});
+
+    const uint8_t b3iid[16] = {0x86, 0xFA, 0x9A, 0x27, 0x81, 0x49, 0xCE, 0x11,
+                               0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60};
+    for (int i = 0; i < 16; ++i)
+        wr8(iid + (uint32_t)i, b3iid[i]);
+    CHECK_EQ(call_method(buf, B_QueryInterface, {iid, sc(0x60)}), S_OK);
+    uint32_t b3 = rd32(sc(0x60));
+    CHECK(b3 != 0);
+
+    // Defaults, then the min/max/mode round trip.
+    CHECK_EQ(call_method(b3, B3D_GetMinDistance, {sc(0x500)}), DS_OK);
+    CHECK(rdf32(sc(0x500)) == 1.0f);
+    CHECK_EQ(call_method(b3, B3D_GetMaxDistance, {sc(0x504)}), DS_OK);
+    CHECK(rdf32(sc(0x504)) == 1000000000.0f);
+    CHECK_EQ(call_method(b3, B3D_SetMinDistance, {fbits(1.0f), 0}), DS_OK);
+    CHECK_EQ(call_method(b3, B3D_SetMaxDistance, {fbits(1000.0f), 0}), DS_OK);
+    CHECK_EQ(call_method(b3, B3D_GetMinDistance, {sc(0x500)}), DS_OK);
+    CHECK(rdf32(sc(0x500)) == 1.0f);
+    CHECK_EQ(call_method(b3, B3D_GetMaxDistance, {sc(0x504)}), DS_OK);
+    CHECK(rdf32(sc(0x504)) == 1000.0f);
+    CHECK_EQ(call_method(b3, B3D_GetMode, {sc(0x508)}), DS_OK);
+    CHECK_EQ(rd32(sc(0x508)), 0u); // DS3DMODE_NORMAL
+
+    // Twice MinDistance dead ahead: 0.5 distance gain, centred equal-power
+    // pan (sqrt(0.5) a side), so 20*log10(0.3536) mB.
+    CHECK_EQ(call_method(b3, B3D_SetPosition, {0, 0, fbits(2.0f), 0}), DS_OK);
+    CHECK_EQ(call_method(buf, B_Play, {0, 0, 0}), DS_OK);
+    CHECK_EQ(g_plays.size(), 1u);
+    int32_t ch = g_plays.empty() ? -1 : g_plays.back().channel;
+    CHECK_EQ(g_plays.back().volume, -903);
+    CHECK_EQ(g_plays.back().pan, 0);
+
+    // Moving a playing source updates it with DS3D_IMMEDIATE: hard right and
+    // hard left. The host pan is positive for right (it attenuates the left).
+    CHECK_EQ(call_method(b3, B3D_SetPosition, {fbits(2.0f), 0, 0, 0}), DS_OK);
+    CHECK_EQ(g_audio_volumes[ch], -602);
+    CHECK_EQ(g_audio_pans[ch], 10000);
+    CHECK_EQ(call_method(b3, B3D_SetPosition, {fbits(-2.0f), 0, 0, 0}), DS_OK);
+    CHECK_EQ(g_audio_volumes[ch], -602);
+    CHECK_EQ(g_audio_pans[ch], -10000);
+
+    // At MinDistance the distance gain is 1, so the only attenuation is the
+    // equal-power centre: -301 mB.
+    CHECK_EQ(call_method(b3, B3D_SetPosition, {0, 0, fbits(1.0f), 0}), DS_OK);
+    CHECK_EQ(g_audio_volumes[ch], -301);
+    CHECK_EQ(g_audio_pans[ch], 0);
+
+    // Beyond MaxDistance the distance is clamped, not zeroed.
+    CHECK_EQ(call_method(b3, B3D_SetMaxDistance, {fbits(2.0f), 0}), DS_OK);
+    CHECK_EQ(call_method(b3, B3D_SetPosition, {0, 0, fbits(4.0f), 0}), DS_OK);
+    CHECK_EQ(g_audio_volumes[ch], -903);
+    CHECK_EQ(g_audio_pans[ch], 0);
+
+    // Deferred listener changes do nothing until CommitDeferredSettings.
+    CHECK_EQ(call_method(b3, B3D_SetMaxDistance, {fbits(1000.0f), 0}), DS_OK);
+    CHECK_EQ(call_method(b3, B3D_SetPosition, {0, 0, fbits(2.0f), 0}), DS_OK);
+    CHECK_EQ(g_audio_volumes[ch], -903);
+    CHECK_EQ(call_method(listener, L3D_SetPosition, {0, 0, fbits(1.0f), 1}), DS_OK);
+    CHECK_EQ(g_audio_volumes[ch], -903); // still the old listener
+    CHECK_EQ(call_method(listener, L3D_CommitDeferredSettings, {}), DS_OK);
+    CHECK_EQ(g_audio_volumes[ch], -301); // now one unit away
+
+    // GetAllParameters reports the full 64-byte DS3DBUFFER, with MinDistance
+    // at 52, MaxDistance at 56 and dwMode at 60.
+    CHECK_EQ(call_method(b3, B3D_SetMinDistance, {fbits(2.5f), 0}), DS_OK);
+    CHECK_EQ(call_method(b3, B3D_SetMaxDistance, {fbits(2000.0f), 0}), DS_OK);
+    uint32_t all = sc(0x600);
+    gm_zero(all, 64);
+    wr32(all, 64);
+    CHECK_EQ(call_method(b3, B3D_GetAllParameters, {all}), DS_OK);
+    CHECK(rdf32(all + 52) == 2.5f);
+    CHECK(rdf32(all + 56) == 2000.0f);
+    CHECK_EQ(rd32(all + 60), 0u);
+    CHECK_EQ(rd32(all + 28), 360u);
+    CHECK_EQ(rd32(all + 32), 360u);
+
+    // DSBCAPS_MUTE3DATMAXDISTANCE silences a source beyond MaxDistance.
+    bd = sc(0x200);
+    gm_zero(bd, DSBUFFERDESC_SIZE);
+    wr32(bd + DSBD_OFF_dwSize, DSBUFFERDESC_SIZE);
+    wr32(bd + DSBD_OFF_dwFlags, DSBCAPS_CTRL3D | DSBCAPS_CTRLVOLUME | 0x00020000u);
+    wr32(bd + DSBD_OFF_dwBufferBytes, 1024);
+    wr32(bd + DSBD_OFF_lpwfxFormat, wfx);
+    CHECK_EQ(call_method(ds, DS_CreateSoundBuffer, {bd, sc(4), 0}), DS_OK);
+    uint32_t mute = rd32(sc(4));
+    CHECK(mute != 0);
+    for (int i = 0; i < 16; ++i)
+        wr8(iid + (uint32_t)i, b3iid[i]);
+    CHECK_EQ(call_method(mute, B_QueryInterface, {iid, sc(0x60)}), S_OK);
+    uint32_t mb3 = rd32(sc(0x60));
+    CHECK(mb3 != 0);
+    CHECK_EQ(call_method(mb3, B3D_SetMinDistance, {fbits(1.0f), 0}), DS_OK);
+    CHECK_EQ(call_method(mb3, B3D_SetMaxDistance, {fbits(2.0f), 0}), DS_OK);
+    CHECK_EQ(call_method(mb3, B3D_SetPosition, {0, 0, fbits(4.0f), 0}), DS_OK);
+    size_t plays = g_plays.size();
+    CHECK_EQ(call_method(mute, B_Play, {0, 0, 0}), DS_OK);
+    CHECK_EQ(g_plays.size(), plays + 1);
+    CHECK_EQ(g_plays.back().volume, -10000);
+    CHECK_EQ(g_plays.back().pan, 0);
+}
+
 // DirectInput: the keyboard reports the host's key state, and the mouse
 // delivers buffered events built by diffing successive host states.
 // IDirectSound8 keeps the IDirectSound device and adds VerifyCertification;
@@ -13727,6 +13949,7 @@ int main() {
         {"Direct3D pipeline", test_d3d_pipeline},
         {"Direct3D3 pipeline", test_d3d3_pipeline},
         {"DirectSound", test_dsound},
+        {"DirectSound 3D", test_dsound_3d_positional},
         {"DirectSound8", test_dsound8},
         {"DirectInput", test_dinput},
         {"QMixer", test_qmixer},
