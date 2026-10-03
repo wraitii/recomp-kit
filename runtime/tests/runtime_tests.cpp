@@ -6064,6 +6064,15 @@ static void test_user32_window_model() {
               rd32(s + 0x6a4) == 5 &&
               call_import(&c, "USER32.dll", "EnumDisplayDevicesA", {0, 1, s + 0x600, 0}) == 0,
           "EnumDisplayDevicesA reports one primary display");
+    // The game's own caller (RSDisplayMgr, 0x00515750) declares the VC6-era
+    // prefix, cb = 0xa8, and must get a device and no write past that size.
+    memset(g_mem + s + 0x600, 0, 0x100);
+    wr32(s + 0x600, 0xa8);
+    wr32(s + 0x6a8, 0xfeedf00d);
+    check(call_import(&c, "USER32.dll", "EnumDisplayDevicesA", {0, 0, s + 0x600, 0}) == 1 &&
+              !strcmp((const char *)(g_mem + s + 0x604), "\\\\.\\DISPLAY1") &&
+              rd32(s + 0x6a4) == 5 && rd32(s + 0x6a8) == 0xfeedf00d,
+          "EnumDisplayDevicesA accepts cb = 0xa8 and stays inside it");
     while (call_import(&c, "USER32.dll", "PeekMessageW", {msg, 0, 0, 0, 1})) {
         call_import(&c, "USER32.dll", "DispatchMessageW", {msg});
     }

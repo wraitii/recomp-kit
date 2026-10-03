@@ -595,6 +595,12 @@ void monitor_info(X86 *c) {
 // makes it drop every multi-monitor entry point and take its Win95 fallback.
 // MONITORINFOEXA is 72 bytes (szDevice is CHAR[32]); DISPLAY_DEVICEA is 424
 // (DeviceName[32], DeviceString[128], StateFlags, DeviceID[128], DeviceKey[128]).
+//
+// The VC6-era DISPLAY_DEVICEA predates DeviceID/DeviceKey: RSDisplayMgr's
+// multimon.h path at 0x00515750 passes cb = 0xa8 (168 = through StateFlags) and
+// only reads DeviceName/StateFlags. Windows accepts that prefix size; requiring
+// the 424-byte modern struct made EnumDisplayDevicesA fail for iDevNum 0, so the
+// display loop never created a window and RSDisplayMgr::Initialize() failed.
 void monitor_info_a(X86 *c) {
     uint32_t p = arg(c, 1);
     if (arg(c, 0) != 1 || !p || !gm_valid(p, 40) || rd32(p) < 40) {
@@ -610,11 +616,19 @@ void monitor_info_a(X86 *c) {
 }
 void enum_devices_a(X86 *c) {
     uint32_t p = arg(c, 2);
-    if (arg(c, 1) || !p || !gm_valid(p, 424) || rd32(p) < 424) {
+    // Accept the VC6 DISPLAY_DEVICEA prefix: the multimon.h caller declares
+    // cb = 0xa8. Fill only the caller's declared size, never past it.
+    if (arg(c, 1) || !p || !gm_valid(p, 4) || rd32(p) < 0xa8) {
         set_eax(c, 0);
         return;
     }
-    memset(g_mem + p + 4, 0, 420);
+    uint32_t cb = rd32(p);
+    uint32_t n = cb < 424 ? cb : 424;
+    if (!gm_valid(p, n)) {
+        set_eax(c, 0);
+        return;
+    }
+    memset(g_mem + p + 4, 0, n - 4);
     gm_put_str(p + 4, "\\\\.\\DISPLAY1", 32);
     gm_put_str(p + 36, "Runtime display", 128);
     wr32(p + 164, 5); // ATTACHED_TO_DESKTOP | PRIMARY_DEVICE, as the W form reports
