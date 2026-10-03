@@ -184,6 +184,7 @@ struct StreamRecord {
     uint32_t obj_id = 0;
     bool active = false;   // converted, and being fed by Unlock
     bool refused = false;  // this host cannot stream; stay on re-submission
+    bool fed_once = false; // ring_end names a real feed, not the seed
     uint32_t ring_end = 0; // ring offset just past the last byte fed
 };
 
@@ -217,6 +218,7 @@ void stream_drop(uint32_t id) {
 void stream_reset(uint32_t id) {
     if (StreamRecord *r = stream_for(id)) {
         r->active = false;
+        r->fed_once = false;
         r->ring_end = 0;
     }
 }
@@ -257,16 +259,22 @@ uint32_t live_position(const ComObj *b) {
 }
 
 // Did the cursor pass `o` on its way from `last` to `pos`? The interval is
-// half-open at the near end and closed at the far end, because DirectSound
-// signals when the cursor *reaches* an offset. A looping buffer wraps, and
-// offset 0 is reached only by wrapping, which is why the wrapped case is
-// written out rather than folded into the other.
+// half-open the way DirectSound's own notification check is: closed at the
+// near end and open at the far end, matching Wine's DSOUND_CheckEvent, which
+// signals every offset in [old, new) as the buffer is mixed. That near-end
+// inclusion is what makes the notification at the start offset fire on the
+// first move off it, which is the event the game's streaming worker waits for
+// before refilling the quarter ahead of the cursor. With the interval open at
+// the near end instead, offset 0 is only ever reached by wrapping, and every
+// refill is then due at the very instant its audio is played.
+// A looping buffer wraps, and offset 0 is reached on the way past, which is
+// why the wrapped case is written out rather than folded into the other.
 bool cursor_crossed(uint32_t last, uint32_t pos, uint32_t o) {
     if (pos == last)
         return false;
     if (pos > last)
-        return o > last && o <= pos;
-    return o > last || o <= pos;
+        return o >= last && o < pos;
+    return o >= last || o < pos;
 }
 
 void signal_stop_positions(const ComObj *b) {
@@ -510,8 +518,19 @@ bool stream_queue_run(ComObj *b, uint32_t off, uint32_t len) {
     // instead, which is what this did before and still works.
     if (taken <= 0)
         taken = host_audio_queue(b->channel, gm_ptr(b->buf_pixels + off), len);
-    ATRACE("dsound: queue buffer %u channel %d off %u len %u -> %d, peak %.3f", b->id, b->channel,
-           off, len, taken, (double)pcm_peak(b->buf_pixels + off, len, b->bits));
+    // `lead` is how far ahead of the play cursor this run was written. A
+    // streamed ring must keep at least a good fraction of a refill ahead, or a
+    // frame's stall lets the cursor overtake unplayed bytes and the boundary is
+    // a click. `play` and `off` are both ring offsets, so lead is modulo the
+    // ring. Gated by RECOMP_AUDIO_TRACE like everything here.
+    if (audio_trace_budget()) {
+        uint32_t play = live_position(b);
+        uint32_t lead = b->buf_bytes ? (off + b->buf_bytes - play) % b->buf_bytes : 0;
+        ATRACE("dsound: queue buffer %u channel %d off %u len %u -> %d, play %u, "
+               "lead %u, peak %.3f",
+               b->id, b->channel, off, len, taken, play, lead,
+               (double)pcm_peak(b->buf_pixels + off, len, b->bits));
+    }
     return taken > 0;
 }
 
@@ -521,7 +540,11 @@ bool stream_queue_run(ComObj *b, uint32_t off, uint32_t len) {
 bool stream_feed(ComObj *b, StreamRecord *r, uint32_t off, uint32_t len) {
     if (!b->buf_bytes || !len)
         return true;
-    if (off != r->ring_end) {
+    // The first feed after a conversion is seeded with the play position, not
+    // with the guest's write cursor, so it is not a jump whatever offset it is
+    // at. Ring order is checked from the second feed on; the guest's cursor
+    // legitimately leads the play cursor by a refill.
+    if (r->fed_once && off != r->ring_end) {
         // The traced game writes strictly in ring order. Anything else is a
         // guest doing something this model does not describe, so say so once
         // and follow it rather than silently playing the wrong bytes.
@@ -530,6 +553,7 @@ bool stream_feed(ComObj *b, StreamRecord *r, uint32_t off, uint32_t len) {
                  "following the guest rather than the ring",
                  off, r->ring_end);
     }
+    r->fed_once = true;
     uint32_t first = len;
     uint32_t second = 0;
     if (off + len > b->buf_bytes) {

@@ -2160,6 +2160,72 @@ static void test_audio_ring_and_clock() {
     CHECK_EQ(host_audio_lock_violations(), 0u);
 }
 
+// A ring converted part-way into its first lap. The rest of that lap must
+// still hear the guest's later writes. A snapshot of the lap taken at
+// conversion plays stale samples for the whole first lap, which is one
+// dropout per streamed track; the guest writes ahead of the cursor, so only
+// samples read from the live ring are right.
+static void test_audio_ring_convert_midlap() {
+    const double rate = 48000.0;
+    if (!host_audio_offline_begin(rate, 4096)) {
+        printf("  (this machine has no audio engine, so the ring is not tested)\n");
+        return;
+    }
+    const uint32_t hz = 22050;
+    const uint32_t ring_bytes = hz * 4; // 1.0 s, stereo 16-bit
+    std::vector<uint8_t> ring(ring_bytes, 0);
+    auto put = [&](uint32_t off, uint32_t bytes, int16_t value) {
+        for (uint32_t i = 0; i < bytes; i += 2) {
+            ring[off + i] = (uint8_t)(value & 0xff);
+            ring[off + i + 1] = (uint8_t)((value >> 8) & 0xff);
+        }
+    };
+
+    HostAudioPlay play;
+    memset(&play, 0, sizeof play);
+    play.channel = 23;
+    play.pcm = ring.data();
+    play.bytes = ring_bytes;
+    play.sample_rate = (int32_t)hz;
+    play.channels = 2;
+    play.bits = 16;
+    play.loop = 1;
+    host_audio_play(&play);
+    CHECK_EQ(host_audio_is_playing(23), 1);
+
+    // Play into the first lap, then convert so the ring starts from where the
+    // sound has already reached.
+    float peak = 0.0f;
+    host_audio_offline_render(960, &peak); // 20 ms
+    CHECK(host_audio_stream(23) >= 0);
+
+    // The first write after conversion is what creates the ring. It carries a
+    // marker at 0.20 s that none of the measured window covers.
+    const uint32_t off_a = (uint32_t)(0.20 * hz) * 4;
+    const uint32_t len = (uint32_t)(0.05 * hz) * 4;
+    put(off_a, len, 20000);
+    CHECK_EQ(host_audio_write(23, ring.data() + off_a, off_a, len), (int32_t)len);
+
+    // A later write lands further into the same lap. It only reaches the live
+    // ring, so a snapshot of the lap taken at conversion would not play it and
+    // the window below would be silent.
+    const uint32_t off_b = (uint32_t)(0.40 * hz) * 4;
+    put(off_b, len, 12000);
+    CHECK_EQ(host_audio_write(23, ring.data() + off_b, off_b, len), (int32_t)len);
+
+    // Render up to just before the later write, then across it. 0.37 s of
+    // source audio has gone by at the start of the window, past the 0.25 s
+    // marker, so only the 0.40 s write can supply the peak.
+    host_audio_offline_render((uint32_t)(0.37 * rate) - 960, &peak);
+    peak = 0.0f;
+    host_audio_offline_render((uint32_t)(0.05 * rate), &peak);
+    CHECK(peak > 0.2f);
+
+    host_audio_stop(23);
+    host_audio_offline_end();
+    CHECK_EQ(host_audio_lock_violations(), 0u);
+}
+
 // One channel, two sounds, the way QMixer replaces: play, convert to a stream,
 // and 50 ms later do it again with a different sound on the same channel.
 //
@@ -9967,6 +10033,7 @@ int main(int argc, char **argv) {
         {"format change", test_audio_format_change},
         {"clipper", test_audio_clipper_takes_only_the_overshoot},
         {"ring and clock", test_audio_ring_and_clock},
+        {"ring convert mid-lap", test_audio_ring_convert_midlap},
         {"replace on a channel", test_audio_replace_on_one_channel},
         {"every sound heard", test_audio_every_sound_started_is_heard},
         {"voice vs queued", test_audio_voice_remaining_versus_queued},

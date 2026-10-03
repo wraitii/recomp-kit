@@ -10781,21 +10781,29 @@ static void test_dsound_notify() {
     CHECK_EQ(call_shim(wait, {ev0, 0}), 0x102u);
     CHECK_EQ(call_shim(wait, {ev1, 0}), 0x102u);
 
-    // Part way into the first half: still nothing.
+    // The first move off the start offset reaches it, because the range is
+    // [old, new). This is the event the game's worker waits for to refill the
+    // half ahead of the cursor, and without it every refill is due at the
+    // instant its audio is played. Nothing has reached the half-way point.
     g_test_audio_pos = kHalf - 4;
     CHECK_EQ(call_shim(pump, {}), 0u);
-    CHECK_EQ(call_shim(wait, {ev0, 0}), 0x102u);
+    CHECK_EQ(call_shim(wait, {ev0, 0}), 0u);
     CHECK_EQ(call_shim(wait, {ev1, 0}), 0x102u);
+    call_shim(reset, {ev0});
 
-    // Reaching the half-way point signals that position and only that one.
+    // Reaching the half-way point signals it on the next move, and only it:
+    // the range is open at the far end, matching Wine's check.
     g_test_audio_pos = kHalf;
+    CHECK_EQ(call_shim(pump, {}), 0u);
+    CHECK_EQ(call_shim(wait, {ev1, 0}), 0x102u);
+    g_test_audio_pos = kHalf + 16;
     CHECK_EQ(call_shim(pump, {}), 0u);
     CHECK_EQ(call_shim(wait, {ev1, 0}), 0u);
     CHECK_EQ(call_shim(wait, {ev0, 0}), 0x102u);
     call_shim(reset, {ev1});
 
-    // The cursor wraps. Offset 0 is reached only by wrapping, and that is
-    // exactly when the game refills the second half.
+    // The cursor wraps. Offset 0 is reached on the way past, and fires again;
+    // that is where the game refills the first half for the next lap.
     g_test_audio_pos = 8;
     CHECK_EQ(call_shim(pump, {}), 0u);
     CHECK_EQ(call_shim(wait, {ev0, 0}), 0u);

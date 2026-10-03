@@ -278,8 +278,7 @@ struct Channel {
     // whose samples the guest's writes overwrite where they lie.
     std::shared_ptr<Segment> ring;
     bool ring_mode = false;
-    uint32_t ring_head_frames = 0; // the one-shot played before the loop
-    uint32_t ring_from_frame = 0;  // where in the ring that one-shot started
+    uint32_t ring_from_frame = 0; // where in the ring playback started
     float ring_tail_l = 0.0f, ring_tail_r = 0.0f;
     uint32_t ring_tail_at = 0xffffffffu;
     uint32_t ring_writes = 0, ring_breaks = 0;
@@ -804,27 +803,14 @@ extern "C" int32_t host_audio_write(int32_t id, const void *pcm, uint32_t offset
         return 0;
     std::lock_guard<std::mutex> api(g_api_mutex);
 
-    // Where the player has actually reached, read before the data lock is
-    // taken because no player call may be made under it.
-    bool ring_playing = false;
-    uint32_t head_len = 0, head_from = 0, ring_frames = 0;
-    {
-        DataLock held;
-        Channel *c0 = channel_for(id, false);
-        if (c0 && c0->ring_mode && c0->ring) {
-            ring_playing = true;
-            head_len = c0->ring_head_frames;
-            head_from = c0->ring_from_frame;
-            ring_frames = c0->ring->frames();
-        }
-    }
-    uint64_t node_frames = 0;
-    bool have_head = ring_playing && ring_frames && node_sample_time(id, &node_frames);
-
     bool schedule_ring = false;
-    std::shared_ptr<Segment> ring, head;
+    std::shared_ptr<Segment> ring;
     uint32_t accepted = 0;
     float volume = 1.0f;
+    // Where the ring segment is told to start, in its own frames. The ring is
+    // a loop read where it lies, so the player can begin part-way into it and
+    // wrap; there is no reason to take a copy of the rest of the lap first.
+    uint32_t ring_start_frame = 0;
     {
         DataLock held;
         Channel *channel = channel_for(id, false);
@@ -863,11 +849,12 @@ extern "C" int32_t host_audio_write(int32_t id, const void *pcm, uint32_t offset
                 return 0;
             channel->ring->loop = true;
             channel->ring_from_frame = from / frame;
-            channel->ring_head_frames = from ? (total - from) / frame : 0;
-            // The rest of the current lap, played once before the loop takes
-            // over at the top.
-            if (from)
-                head = make_segment(*channel, from, total);
+            // The ring is played in place and starts where the sound has
+            // already reached, so later writes to the rest of the current lap
+            // are heard. A head copy of the lap would freeze those samples and
+            // play a stale lap once per stream: the guest writes ahead of the
+            // cursor, so only samples read from the live ring are right.
+            ring_start_frame = channel->ring_from_frame;
 
             ++channel->generation;
             channel->ring_mode = true;
@@ -912,14 +899,9 @@ extern "C" int32_t host_audio_write(int32_t id, const void *pcm, uint32_t offset
             uint32_t fade = rate / 500; // 2 ms
             if (fade > frames)
                 fade = frames;
-            uint32_t head_at;
-            if (have_head) {
-                head_at = node_frames < head_len
-                              ? (uint32_t)((head_from + node_frames) % ring_frames)
-                              : (uint32_t)((node_frames - head_len) % ring_frames);
-            } else {
-                head_at = stream_cursor_locked(*channel) % total / frame;
-            }
+            // The play position within the live ring, which is the clock the
+            // guest's own cursor is measured against.
+            uint32_t head_at = stream_cursor_locked(*channel) % total / frame;
             bool on_the_head = head_at >= at && head_at < at + frames;
             uint32_t from_frame = on_the_head ? head_at - at : 0;
             if (!on_the_head)
@@ -1002,14 +984,12 @@ extern "C" int32_t host_audio_write(int32_t id, const void *pcm, uint32_t offset
             std::lock_guard<std::mutex> render(g_render_mutex);
             Player &p = g_players[id];
             p.segments.clear();
-            p.pos = 0;
+            // Start reading where the sound had reached. A looping segment
+            // wraps at its own end, so the current lap is played out and the
+            // next begins at the top with no copy in between.
+            p.pos = (double)ring_start_frame;
             p.played = 0;
             p.volume = volume;
-            if (head) {
-                head->loop = false;
-                head->completion = 0;
-                p.segments.push_back(head);
-            }
             p.segments.push_back(ring);
             p.playing = true;
         }
