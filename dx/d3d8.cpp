@@ -459,6 +459,32 @@ void D8_GetAdapterMonitor(X86 *c) {
     com_ret(c, arg(c, 1) == 0 && ensure_adapter() ? 1 : 0);
 }
 
+// Internal surface references preserve storage/identity without retaining the
+// device in return. An external AddRef (including GetRenderTarget) restores
+// device ownership; its final Release drops it, avoiding a binding cycle.
+void surface_refs_changed(ComObj *surface) {
+    const bool external = surface->refs > surface->internal_refs;
+    ComObj *dev = com_get(surface->d3d8_owner);
+    if (!dev || external == surface->d3d8_owner_retained)
+        return;
+    surface->d3d8_owner_retained = external;
+    if (external)
+        com_addref(dev);
+    else
+        com_release(dev);
+}
+
+// Drop binding refs after clearing ids: release may recursively destroy a
+// resource or its device. Caller keeps the device alive across normal switches.
+void device_unbind_targets(ComObj *dev) {
+    const uint32_t color = dev->d3d8_target, depth = dev->d3d8_target_depth;
+    dev->d3d8_target = dev->d3d8_target_depth = 0;
+    if (ComObj *o = com_get(color))
+        com_release_internal(o);
+    if (ComObj *o = com_get(depth))
+        com_release_internal(o);
+}
+
 // The device's implicit autodepth surface, made on demand and kept via the
 // device's weak cache. The actual depth bytes live in the Rust target; this
 // guest object is the handle GetDepthStencilSurface returns and SetRenderTarget
@@ -473,6 +499,7 @@ ComObj *device_depthbuffer(ComObj *dev) {
     if (!surface)
         return nullptr;
     surface->d3d8_owner = dev->id;
+    surface->d3d8_owner_retained = true;
     com_addref(dev);
     surface->d3d8_depth = true;
     surface->d3d8_usage = D8USAGE_DEPTHSTENCIL;
@@ -548,8 +575,8 @@ void D8_CreateDevice(X86 *c) {
         com_ret(c, host_result(c, err.status ? err.status : D3D8_STATUS_BACKEND, err));
         return;
     }
-    if (depth)
-        device_depthbuffer(dev); // establish the guest handle for GetDepthStencilSurface
+    // The default depth binding is logical until a guest asks for a handle.
+    // Creating an externally counted handle here would retain the device forever.
     uint32_t view = com_view(dev, IF_D3D8DEVICE);
     if (!view) {
         com_release(dev);
@@ -571,12 +598,10 @@ void D8_CreateDevice(X86 *c) {
 // surfaces so Reset can lazily build replacements. Any guest reference keeps
 // the old object alive; com_release only destroys it when that was the last.
 void device_discard_implicit_surfaces(ComObj *dev) {
-    if (ComObj *s = com_get(dev->d3d8_backbuffer))
-        com_release(s);
-    if (ComObj *s = com_get(dev->d3d8_depthbuffer))
-        com_release(s);
+    device_unbind_targets(dev);
     dev->d3d8_backbuffer = 0;
     dev->d3d8_depthbuffer = 0;
+    dev->d3d8_depth_detached = false;
 }
 
 // (this, pPresentationParameters). D3D8 Reset recreates the implicit swap
@@ -978,6 +1003,7 @@ void Dev_GetBackBuffer(X86 *c) {
     } else {
         surface = com_new(K_D3D8SURFACE);
         surface->d3d8_owner = dev->id;
+        surface->d3d8_owner_retained = true;
         // Only external surface references retain the device. A weak cache
         // avoids a device <-> implicit surface reference cycle.
         com_addref(dev);
@@ -993,6 +1019,42 @@ void Dev_GetBackBuffer(X86 *c) {
     com_ret(c, D8_OK);
 }
 
+// Returns the currently bound color identity, with a real external reference.
+void Dev_GetRenderTarget(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t out = arg(c, 1);
+    if (!dev || !out || !gm_valid(out, 4)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, 0);
+    ComObj *surface = com_get(dev->d3d8_target ? dev->d3d8_target : dev->d3d8_backbuffer);
+    bool fresh = false;
+    if (!surface && !dev->d3d8_target) {
+        surface = com_new(K_D3D8SURFACE);
+        surface->d3d8_owner = dev->id;
+        surface->d3d8_owner_retained = true;
+        com_addref(dev);
+        dev->d3d8_backbuffer = surface->id;
+        fresh = true;
+    }
+    if (!surface || !out || !gm_valid(out, 4)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    uint32_t view = com_view(surface, IF_D3D8SURFACE8);
+    if (!view) {
+        if (fresh)
+            com_release(surface);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    if (!fresh)
+        com_addref(surface);
+    wr32(out, view);
+    com_ret(c, D8_OK);
+}
+
 // (this, ppDepthStencilSurface). Returns the implicit autodepth surface when
 // the device was created with EnableAutoDepthStencil; without one this is the
 // same INVALIDCALL real D3D8 returns.
@@ -1004,11 +1066,18 @@ void Dev_GetDepthStencilSurface(X86 *c) {
         return;
     }
     wr32(out, 0);
-    if (!dev || !dev->d3d8_depth_format) {
+    if (!dev) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    ComObj *surface = device_depthbuffer(dev);
+    if (!dev->d3d8_depth_format || dev->d3d8_depth_detached) {
+        com_ret(c, 0x88760866u);
+        return;
+    }
+    ComObj *surface =
+        dev->d3d8_target_depth ? com_get(dev->d3d8_target_depth) : device_depthbuffer(dev);
+    if (dev->d3d8_target_depth && surface)
+        com_addref(surface);
     if (!surface) {
         com_ret(c, E_OUTOFMEMORY);
         return;
@@ -1023,37 +1092,110 @@ void Dev_GetDepthStencilSurface(X86 *c) {
     com_ret(c, D8_OK);
 }
 
-// (this, pRenderTarget, pDepthStencilSurface). The backend owns exactly one
-// render target, the implicit backbuffer, with its autodepth attachment. A
-// request for any other target is unimplemented and stops by name rather than
-// silently drawing to the wrong surface. The identity check explicitly compares
-// against the backbuffer id: a texture level surface (including a
-// D3DUSAGE_RENDERTARGET texture, which is CPU-backed here) has a matching owner
-// and is not a depth surface, so without the id check it would previously fall
-// through and return D8_OK while the renderer kept drawing to the backbuffer.
+// Bounded boundary evidence. Read raw stack bytes without guest accessors so
+// a corrupt stack cannot fault during diagnostics. Optimized x86 uses EBP as
+// a general register: these words are candidates, never a claimed call chain.
+void diagnose_render_target(X86 *c, ComObj *dev, uint32_t rt_arg, ComObj *rt, uint32_t ds_arg,
+                            ComObj *ds) {
+    fprintf(stderr,
+            "d3d8: SetRenderTarget device=%u backbuffer=%u depthbuffer=%u "
+            "EIP=%08x ESP=%08x EBP=%08x\n",
+            dev ? dev->id : 0, dev ? dev->d3d8_backbuffer : 0, dev ? dev->d3d8_depthbuffer : 0,
+            c->eip, c->r[R_ESP], c->r[R_EBP]);
+    auto surface = [](const char *label, uint32_t pointer, ComObj *o) {
+        if (!o) {
+            fprintf(stderr, "  %s ptr=%08x %s\n", label, pointer, pointer ? "unresolved" : "null");
+            return;
+        }
+        ComObj *owner = com_get(o->d3d8_owner);
+        const bool implicit = owner && owner->d3d8_backbuffer == o->id;
+        fprintf(stderr,
+                "  %s ptr=%08x id=%u owner=%u texture=%u level=%u "
+                "size=%ux%u format=0x%x usage=0x%x pool=%u depth=%u implicit=%u\n",
+                label, pointer, o->id, o->d3d8_owner, o->d3d8_texture, o->d3d8_level,
+                implicit ? owner->d3d8_width : o->width, implicit ? owner->d3d8_height : o->height,
+                implicit ? owner->d3d8_format : o->rmask,
+                implicit ? D8USAGE_RENDERTARGET : o->d3d8_usage, o->d3d8_pool,
+                unsigned(o->d3d8_depth), unsigned(implicit));
+    };
+    surface("backbuffer", 0, dev ? com_get(dev->d3d8_backbuffer) : nullptr);
+    surface("target", rt_arg, rt);
+    surface("depth", ds_arg, ds);
+    fprintf(stderr, "  raw stack (word 0 is COM return address; not an unwound call chain):\n");
+    for (unsigned i = 0; i < 48; ++i) {
+        const uint64_t at = uint64_t(c->r[R_ESP]) + i * 4;
+        if (!g_mem || at < GUEST_NULL_LIMIT || at + 4 > GUEST_SIZE) {
+            fprintf(stderr, "    +%03x <unreadable>\n", i * 4);
+            break;
+        }
+        uint32_t word;
+        memcpy(&word, g_mem + at, sizeof word);
+        fprintf(stderr, "    +%03x %08x\n", i * 4, word);
+    }
+    fflush(stderr);
+}
+
+// D3D8: NULL color keeps current color; NULL depth detaches it. Binding
+// nonnull color resets the viewport. Only this device's implicit surfaces and
+// level-0 DEFAULT-pool RT textures are represented; other cases stop by name.
 void Dev_SetRenderTarget(X86 *c) {
     ComObj *dev = d8_dev(c);
     uint32_t rt_arg = arg(c, 1), ds_arg = arg(c, 2);
     ComObj *rt = rt_arg ? com_this(rt_arg, IF_D3D8SURFACE8) : nullptr;
     ComObj *ds = ds_arg ? com_this(ds_arg, IF_D3D8SURFACE8) : nullptr;
-    if (!dev || !rt_arg || !rt || rt->d3d8_depth || rt->d3d8_owner != dev->id ||
-        rt->id != dev->d3d8_backbuffer) {
-        fprintf(stderr, "d3d8: SetRenderTarget only supports this device's implicit backbuffer\n");
+    static unsigned diagnostic_calls = 0;
+    bool rejected = !dev || (rt_arg && (!rt || rt->d3d8_depth || rt->d3d8_owner != dev->id)) ||
+                    (ds_arg && (!ds || !ds->d3d8_depth || ds->d3d8_owner != dev->id ||
+                                ds->id != dev->d3d8_depthbuffer));
+    if (dev && rt && rt->id != dev->d3d8_backbuffer &&
+        (!(rt->d3d8_usage & D8USAGE_RENDERTARGET) || rt->d3d8_pool != D8POOL_DEFAULT ||
+         rt->d3d8_level != 0 || !rt->pixels_bytes || rt->lock_count))
+        rejected = true;
+    if (diagnostic_calls < 8 || rejected) {
+        diagnose_render_target(c, dev, rt_arg, rt, ds_arg, ds);
+        if (diagnostic_calls < 8)
+            ++diagnostic_calls;
+    }
+    if (rejected) {
+        fprintf(stderr,
+                "d3d8: SetRenderTarget unsupported surface identity/owner/usage/level/lock\n");
         fflush(stderr);
         imports_unsupported(c);
     }
-    if (ds_arg && (!ds || !ds->d3d8_depth || ds->d3d8_owner != dev->id)) {
-        fprintf(stderr, "d3d8: SetRenderTarget depth surface is not this device's implicit "
-                        "depth buffer\n");
-        fflush(stderr);
-        imports_unsupported(c);
+    if (!rt_arg)
+        rt = com_get(dev->d3d8_target ? dev->d3d8_target : dev->d3d8_backbuffer);
+    const bool texture = rt && rt->id != dev->d3d8_backbuffer;
+    const uint32_t width = texture ? rt->width : dev->d3d8_width;
+    const uint32_t height = texture ? rt->height : dev->d3d8_height;
+    if (ds && (ds->width < width || ds->height < height)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
     }
-    // A NULL depth argument would detach the buffer in D3D8. The Rust target
-    // always owns an autodepth attachment once created, so detaching is not
-    // representable; keep it bound and say so rather than silently dropping
-    // the request.
-    if (!ds_arg && dev && dev->d3d8_depth_format)
-        LOGW("d3d8: SetRenderTarget(NULL depth) is not modelled; the autodepth buffer stays bound");
+#ifdef RECOMP_D3D8_WGPU
+    D3d8Error err{};
+    int32_t status = d3d8_device_set_render_target(
+        host_device(dev), texture ? rt->id : 0, texture ? rt->d3d8_level : 0,
+        texture ? rt->d3d8_content_generation : 0, texture ? rt->rmask : dev->d3d8_format, width,
+        height, texture ? storage_data(rt) : nullptr, texture ? rt->pixels_bytes : 0, ds != nullptr,
+        rt_arg != 0, &err);
+    if (status) {
+        com_ret(c, host_result(c, status, err));
+        return;
+    }
+#else
+    // State-only fixtures exercise identity and ownership without claiming GPU execution.
+#endif
+    // Retain new bindings before releasing old ones, including rebinding self.
+    if (rt)
+        com_retain_internal(rt);
+    if (ds)
+        com_retain_internal(ds);
+    device_unbind_targets(dev);
+    dev->d3d8_target = rt ? rt->id : 0;
+    dev->d3d8_target_depth = ds ? ds->id : 0;
+    dev->d3d8_depth_detached = !ds;
+    if (texture)
+        rt->d3d8_gpu_target = true;
     com_ret(c, D8_OK);
 }
 
@@ -1104,18 +1246,8 @@ void Dev_CreateTexture(X86 *c) {
     if (levels > 16)
         levels = 16;
 #endif
-    // DIVERGENCE(original): D3DUSAGE_RENDERTARGET normally asks for device
-    // storage that SetRenderTarget can bind. No reachable guest path in this
-    // binary SetRenderTargets onto one of these textures (the effect textures
-    // are only created, LockRect'd, UpdateTexture'd and sampled), so they stay
-    // in the same guest-addressable CPU storage as a normal texture and use the
-    // normal upload-on-bind path. If a guest SetRenderTarget onto an RT texture
-    // is evidenced later, replace this with real device storage rather than
-    // widening the divergence.
-    if (usage & D8USAGE_RENDERTARGET) {
-        LOGW("d3d8: CreateTexture RT %ux%u levels=%u fmt=0x%x pool=%u usage=0x%x is CPU-backed", w,
-             h, levels, format, pool, usage);
-    }
+    // CPU storage stages guest locks/uploads; SetRenderTarget promotes a
+    // supported level to lifetime-owned GPU storage on first binding.
     ComObj *tex = com_new(K_D3D8TEXTURE);
     if (!tex) {
         com_ret(c, E_OUTOFMEMORY);
@@ -1156,6 +1288,7 @@ void Dev_CreateTexture(X86 *c) {
             return;
         }
         level->d3d8_owner = dev->id;
+        level->d3d8_owner_retained = true;
         com_addref(dev);
         level->d3d8_texture = tex->id;
         level->d3d8_level = l;
@@ -1168,6 +1301,7 @@ void Dev_CreateTexture(X86 *c) {
         level->pitch = lw * bpp;
         // The initial reference is the texture's ownership of the level.
         tex->d3d8_levels.push_back(level->id);
+        com_internalize(level);
     }
     uint32_t view = com_view(tex, IF_D3D8TEXTURE8);
     if (!view) {
@@ -1179,6 +1313,29 @@ void Dev_CreateTexture(X86 *c) {
          format, pool, view, out);
     wr32(out, view);
     com_ret(c, D8_OK);
+}
+
+// Once a level has been GPU-rendered, its CPU blob is a staging copy only.
+// Synchronize before any CPU read (locks or UpdateTexture source), preserving
+// guest byte order through the ABI. Generation stays unchanged on readback.
+void sync_rendered_level(ComObj *level) {
+#ifdef RECOMP_D3D8_WGPU
+    if (!level || !level->d3d8_gpu_target || level->lock_count)
+        return;
+    ComObj *dev = com_get(level->d3d8_owner);
+    if (!dev || !dev->d3d8_device)
+        return;
+    D3d8Error err{};
+    int32_t status = d3d8_device_read_texture(host_device(dev), level->id, level->d3d8_level,
+                                              level->d3d8_content_generation, storage_data(level),
+                                              level->pixels_bytes, &err);
+    if (status) {
+        fprintf(stderr, "d3d8: render-target CPU readback failed: %s\n",
+                reinterpret_cast<const char *>(err.message));
+        fflush(stderr);
+        imports_unsupported(nullptr);
+    }
+#endif
 }
 
 // (this, pSourceTexture, pDestinationTexture). D3D8 requires equal formats and
@@ -1224,6 +1381,7 @@ void Dev_UpdateTexture(X86 *c) {
             return;
         }
 #else
+        sync_rendered_level(s);
         memcpy(storage_data(d), storage_data(s), s->pixels_bytes);
 #endif
         // The destination texture's sampled content changed.
@@ -1236,6 +1394,8 @@ void Dev_UpdateTexture(X86 *c) {
 static uint32_t d8_stage_lock(ComObj *o) {
     if (!o || !o->pixels_bytes)
         return 0;
+    if (o->lock_count == 0)
+        sync_rendered_level(o);
     if (o->lock_count++ == 0) {
         o->pixels = heap_alloc(o->pixels_bytes, false, 16);
         if (!o->pixels) {
@@ -1521,18 +1681,10 @@ void Tex_AddDirtyRect(X86 *c) {
 }
 
 void texture_destroy(ComObj *tex) {
-#ifdef RECOMP_D3D8_WGPU
-    // Drop the resident GPU upload(s) with the guest object; the identity is
-    // never reused, so this cannot stale a later texture.
-    if (ComObj *dev = com_get(tex->d3d8_owner)) {
-        if (dev->d3d8_device)
-            d3d8_device_release_texture(host_device(dev), tex->id);
-    }
-#endif
     for (uint32_t sid : tex->d3d8_levels) {
         ComObj *level = com_get(sid);
         if (level)
-            com_release(level); // the texture's own level reference
+            com_release_internal(level); // the texture's own level reference
     }
     tex->d3d8_levels.clear();
     if (ComObj *dev = com_get(tex->d3d8_owner))
@@ -1541,6 +1693,11 @@ void texture_destroy(ComObj *tex) {
 }
 
 void surface_destroy(ComObj *surface) {
+#ifdef RECOMP_D3D8_WGPU
+    if (ComObj *owner = com_get(surface->d3d8_owner))
+        if (owner->d3d8_device && surface->pixels_bytes)
+            d3d8_device_release_texture(host_device(owner), surface->id);
+#endif
     if (surface->pixels)
         heap_free(surface->pixels);
     surface->pixels = 0;
@@ -1551,8 +1708,10 @@ void surface_destroy(ComObj *surface) {
             dev->d3d8_backbuffer = 0;
         if (dev->d3d8_depthbuffer == surface->id)
             dev->d3d8_depthbuffer = 0;
-        com_release(dev);
+        if (surface->d3d8_owner_retained)
+            com_release(dev);
     }
+    surface->d3d8_owner_retained = false;
     surface->d3d8_owner = 0;
     surface->d3d8_texture = 0;
 }
@@ -1890,7 +2049,7 @@ bool d8_sync_texture(X86 *c, ComObj *dev, uint32_t stage) {
         // staged bytes; force an upload instead of trusting the generation.
         uint32_t dirty = level->lock_count > 0 ? 1u : 0u;
         status =
-            d3d8_device_set_texture(host_device(dev), stage, tex->id, level->d3d8_level,
+            d3d8_device_set_texture(host_device(dev), stage, level->id, level->d3d8_level,
                                     level->d3d8_content_generation, dirty, tex->rmask, level->width,
                                     level->height, data, data ? level->pixels_bytes : 0, &err);
     } else {
@@ -1994,6 +2153,7 @@ static const ImportShim g_d3d8_exports[] = {
 };
 
 void device_destroy(ComObj *o) {
+    device_unbind_targets(o);
 #ifdef RECOMP_D3D8_WGPU
     if (o->d3d8_device) {
         d3d8_device_destroy(static_cast<D3d8Device *>(o->d3d8_device));
@@ -2035,6 +2195,7 @@ void d3d8_register() {
     com_register_iid(IF_D3D8VERTEXBUFFER8, IID_IDirect3DVertexBuffer8_);
     com_register_iid(IF_D3D8INDEXBUFFER8, IID_IDirect3DIndexBuffer8_);
     com_set_destructor(K_D3D8SURFACE, surface_destroy);
+    com_set_ref_hook(K_D3D8SURFACE, surface_refs_changed);
     com_set_destructor(K_D3D8TEXTURE, texture_destroy);
     com_set_destructor(K_D3D8VERTEXBUFFER, buffer_destroy);
     com_set_destructor(K_D3D8INDEXBUFFER, buffer_destroy);

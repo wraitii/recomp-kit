@@ -245,6 +245,10 @@ struct ComObj {
     uint32_t id = 0;
     ComKind kind = K_NONE;
     int32_t refs = 0;
+    // Parent/binding references keep storage alive without being guest-facing.
+    // A ref hook can release an owner's lifetime reference when only internal
+    // references remain, avoiding device -> bound resource -> device cycles.
+    int32_t internal_refs = 0;
     bool alive = false;
     uint32_t views[IF_COUNT] = {0}; // guest address of each interface view
     // The first view ever handed out. COM requires QueryInterface(IID_IUnknown)
@@ -395,11 +399,16 @@ struct ComObj {
     // Weak cache of the externally held implicit backbuffer surface. The
     // surface holds its device alive; the device must not retain it in return.
     uint32_t d3d8_backbuffer = 0;
-    // Weak cache of the implicit autodepth surface, created at device creation
+    // Weak cache of the implicit autodepth surface, materialized on demand
     // when D3DPRESENT_PARAMETERS asked for one. Same ownership rule as the
     // backbuffer: the surface retains the device, not the reverse.
     uint32_t d3d8_depthbuffer = 0;
-    uint32_t d3d8_depth_format = 0; // raw D3DFORMAT requested at create; 0 = none
+    uint32_t d3d8_target = 0;       // internal binding reference; 0 = implicit color
+    uint32_t d3d8_target_depth = 0; // internal binding reference
+    bool d3d8_depth_detached = false;
+    bool d3d8_owner_retained = false; // surface's external refs retain device
+    bool d3d8_gpu_target = false;     // CPU bytes require GPU readback before read
+    uint32_t d3d8_depth_format = 0;   // raw D3DFORMAT requested at create; 0 = none
     // --- K_D3D8TEXTURE
     uint32_t d3d8_level_count = 0;
     uint32_t d3d8_usage = 0;           // D3DUSAGE the texture was created with
@@ -460,6 +469,10 @@ ComIface com_iface_of(uint32_t addr);
 // Guest address of `o` seen through `iface`, allocating the view on first use.
 uint32_t com_view(ComObj *o, ComIface iface);
 void com_addref(ComObj *o);
+void com_set_ref_hook(ComKind kind, void (*fn)(ComObj *));
+void com_internalize(ComObj *o); // convert one existing reference to internal
+void com_retain_internal(ComObj *o);
+void com_release_internal(ComObj *o);
 // Drops one reference and destroys at zero. Returns the new count.
 int32_t com_release(ComObj *o);
 // Final teardown regardless of references, for an implicitly owned object

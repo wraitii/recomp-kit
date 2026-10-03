@@ -344,10 +344,7 @@ static void test_texture() {
     check(dev2->refs == 0, "all texture references release the device");
 }
 
-// D3DUSAGE_RENDERTARGET textures are CPU-backed: create, lock/update and
-// sample exactly like a normal texture. They are not bindable by
-// SetRenderTarget, which must abort by name rather than keep the backbuffer
-// bound while returning OK (see --unsupported-rendertarget-texture).
+// RT texture CPU staging and descriptor contract; switching/lifetime is below.
 static void test_render_target_texture() {
     cpu_reset();
     ComObj *dev = make_test_device(256, 256, 22);
@@ -406,8 +403,8 @@ static void test_depth() {
 
     // No autodepth: the request is refused and clears the output.
     wr32(sc(0), 0xfeedface);
-    check(call_method(device, 33, {sc(0)}) == 0x8876086c && rd32(sc(0)) == 0,
-          "GetDepthStencilSurface without autodepth is INVALIDCALL");
+    check(call_method(device, 33, {sc(0)}) == 0x88760866 && rd32(sc(0)) == 0,
+          "GetDepthStencilSurface without autodepth is NOTFOUND");
 
     dev->d3d8_depth_format = 80; // D3DFMT_D16
     wr32(sc(0), 0xfeedface);
@@ -434,13 +431,58 @@ static void test_depth() {
           "SetRenderTarget accepts backbuffer + depth");
     check(call_method(device, 31, {backbuffer, 0}) == 0,
           "SetRenderTarget accepts a NULL depth argument");
-    check(call_method(device, 33, {sc(12)}) == 0, "GetDepthStencilSurface after SetRenderTarget");
-    call_method(rd32(sc(12)), 2);
+    check(call_method(device, 33, {sc(12)}) == 0x88760866 && rd32(sc(12)) == 0,
+          "NULL depth detaches; GetDepthStencilSurface returns NOTFOUND");
     call_method(backbuffer, 2);
     check(call_method(depth, 2) == 0, "last depth reference releases the depth surface");
     check(!dev->d3d8_depthbuffer, "depth surface destruction clears the weak cache");
     call_method(device, 2);
     check(dev->refs == 0, "device is released after the depth handle");
+}
+
+// Bound surface storage survives releasing the texture and temporary surface
+// handle. Internal binding/parent refs must not keep the device alive in a cycle.
+static void test_render_target_switching() {
+    cpu_reset();
+    ComObj *dev = make_test_device(64, 48, 22);
+    dev->d3d8_depth_format = 71;
+    uint32_t device = com_view(dev, IF_D3D8DEVICE);
+    check(call_method(device, 32, {sc(0)}) == 0, "GetRenderTarget returns implicit color");
+    uint32_t backbuffer = rd32(sc(0));
+    check(call_method(device, 33, {sc(4)}) == 0, "GetDepthStencilSurface before texture pass");
+    uint32_t depth = rd32(sc(4));
+    check(call_method(device, 20, {16, 8, 1, 1, 21, 0, sc(8)}) == 0, "create small RT texture");
+    uint32_t texture = rd32(sc(8));
+    check(call_method(texture, 15, {0, sc(12)}) == 0, "get small RT surface");
+    uint32_t surface = rd32(sc(12));
+    ComObj *level = com_this(surface, IF_D3D8SURFACE8);
+    const uint32_t level_id = level->id;
+    check(call_method(device, 31, {surface, depth}) == 0, "bind texture with larger shared depth");
+    check(dev->d3d8_target == level_id && dev->d3d8_target_depth == com_this(depth)->id,
+          "binding records exact color/depth identities");
+    call_method(surface, 2);
+    call_method(texture, 2);
+    check(com_get(level_id) && level->refs == 1 && level->internal_refs == 1,
+          "binding keeps level alive after parent and external surface release");
+    check(!level->d3d8_owner_retained, "internal-only level does not retain device in return");
+    check(call_method(device, 32, {sc(16)}) == 0 && rd32(sc(16)) == surface,
+          "GetRenderTarget retains the bound surface identity");
+    check(level->d3d8_owner_retained, "external GetRenderTarget reference retains device");
+    call_method(rd32(sc(16)), 2);
+    check(call_method(device, 31, {0, 0}) == 0 && dev->d3d8_target == level_id,
+          "NULL color retains the target; NULL depth detaches");
+    check(call_method(device, 33, {sc(20)}) == 0x88760866 && !rd32(sc(20)),
+          "detached depth is reported as NOTFOUND");
+    check(call_method(device, 31, {backbuffer, depth}) == 0, "restore saved color/depth");
+    check(!com_get(level_id), "restoring releases the last internal level reference");
+    check(call_method(device, 32, {sc(24)}) == 0 && rd32(sc(24)) == backbuffer,
+          "GetRenderTarget returns restored backbuffer");
+    call_method(rd32(sc(24)), 2);
+    call_method(backbuffer, 2);
+    call_method(depth, 2);
+    const uint32_t id = dev->id;
+    call_method(device, 2);
+    check(!com_get(id), "final device Release tears down internal bindings without a cycle");
 }
 
 // Vertex and index buffers: CPU-backed storage with a staged guest lock. No
@@ -625,11 +667,9 @@ int main(int argc, char **argv) {
         cpu_reset();
         ComObj *dev = make_test_device(256, 256, 22);
         uint32_t device = com_view(dev, IF_D3D8DEVICE);
-        // A CPU-backed D3DUSAGE_RENDERTARGET texture level has a matching owner
-        // and is not a depth surface, so the identity check must reject it by
-        // name rather than return OK with the backbuffer still bound.
-        check(call_method(device, 20, {256, 256, 1, 1, 22, 0, sc(0)}) == 0,
-              "probe: create render-target texture");
+        // Matching owner does not make a non-RT texture bindable.
+        check(call_method(device, 20, {256, 256, 1, 0, 22, 0, sc(0)}) == 0,
+              "probe: create texture without RT usage");
         uint32_t tex = rd32(sc(0));
         check(call_method(tex, 15, {0, sc(4)}) == 0, "probe: GetSurfaceLevel");
         call_method(device, 31, {rd32(sc(4)), 0});
@@ -664,6 +704,7 @@ int main(int argc, char **argv) {
     test_bind_texture();
     test_caps();
     test_depth();
+    test_render_target_switching();
     test_buffers();
     // Live locked CPU resources must be retired when mem_init discards guest
     // allocations. Releasing old guest staging during reset would be invalid.

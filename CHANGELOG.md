@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Support D3D8 level-0 DEFAULT-pool A8R8G8B8/X8R8G8B8 render-target textures
+  in the optional host bridge, with current-target queries, depth detach/restore,
+  viewport reset, retained bound surfaces and GPU-authoritative sampling. Shared
+  larger implicit depth buffers keep their identity and contents. Unsupported
+  surface cases retain bounded guest-boundary diagnostics and named failures.
+
 - Honor D3D8 CreateDevice's default guest x87 precision, rounding and exception
   masks, while respecting FPU_PRESERVE. This prevents binary64 intermediate
   rounding from rejecting power-of-two dimensions in CPU mip generation.

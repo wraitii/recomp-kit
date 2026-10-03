@@ -23,6 +23,7 @@ constexpr size_t COM_KIND_LIMIT = 128;
 using KindMask = std::bitset<COM_KIND_LIMIT>;
 KindMask g_kind_mask[IF_COUNT]; // bit per ComKind
 void (*g_dtor[COM_KIND_LIMIT])(ComObj *) = {nullptr};
+void (*g_ref_hook[COM_KIND_LIMIT])(ComObj *) = {nullptr};
 ComQiHook g_qi_hook[COM_KIND_LIMIT] = {nullptr};
 const char *g_iface_name[IF_COUNT] = {nullptr};
 
@@ -251,16 +252,49 @@ void com_set_destructor(ComKind kind, void (*fn)(ComObj *)) {
         g_dtor[kind] = fn;
 }
 
+void com_set_ref_hook(ComKind kind, void (*fn)(ComObj *)) {
+    if ((size_t)kind < COM_KIND_LIMIT)
+        g_ref_hook[kind] = fn;
+}
+static void notify_refs(ComObj *o) {
+    if (o && o->alive && (size_t)o->kind < COM_KIND_LIMIT && g_ref_hook[o->kind])
+        g_ref_hook[o->kind](o);
+}
 void com_addref(ComObj *o) {
-    if (o)
+    if (o) {
         ++o->refs;
+        notify_refs(o);
+    }
+}
+void com_internalize(ComObj *o) {
+    if (o) {
+        ++o->internal_refs;
+        notify_refs(o);
+    }
+}
+void com_retain_internal(ComObj *o) {
+    if (o) {
+        ++o->refs;
+        ++o->internal_refs;
+        notify_refs(o);
+    }
+}
+void com_release_internal(ComObj *o) {
+    if (o) {
+        --o->internal_refs;
+        com_release(o);
+    }
 }
 
 int32_t com_release(ComObj *o) {
     if (!o || !o->alive)
         return 0;
-    if (--o->refs > 0)
-        return o->refs;
+    if (--o->refs > 0) {
+        // A hook may release an owner and recursively destroy this pinned
+        // resource. Do not run a second destruction after notifying it.
+        notify_refs(o);
+        return o->alive ? o->refs : 0;
+    }
     if (o->refs < 0) {
         LOGW("dx: over-release of object %u (kind %u)", o->id, (unsigned)o->kind);
         o->refs = 0;

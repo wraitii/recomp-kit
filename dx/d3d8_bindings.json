@@ -37,6 +37,7 @@
       "GetDeviceCaps": "Dev_GetDeviceCaps",
       "Present": "Dev_Present",
       "GetBackBuffer": "Dev_GetBackBuffer",
+      "GetRenderTarget": "Dev_GetRenderTarget",
       "CreateTexture": "Dev_CreateTexture",
       "CreateVertexBuffer": "Dev_CreateVertexBuffer",
       "CreateIndexBuffer": "Dev_CreateIndexBuffer",
