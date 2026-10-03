@@ -682,6 +682,24 @@ CASES += [
           (4, "FLD1"), (6, "FISTP qword ptr [EDX + 0x8]"), (9, "RET")],
          "df28 df3a d9e8 df7a08 c3", integer_copy_setup),
 ]
+def fcmov_setup(rng):
+    """Random operands for CMP, equal a third of the time so ZF is exercised."""
+    eax = rng.getrandbits(32)
+    ebx = eax if rng.random() < 0.34 else rng.getrandbits(32)
+    return {"regs": rand_regs(rng, EAX=eax, EBX=ebx, EDX=SCRATCH)}
+
+
+# FCMOVcc reads EFLAGS and copies STi to ST0: ST1 = 1.0 and ST0 = 0.0 before it,
+# so the stored pair shows whether the move happened.
+CASES += [
+    Case("%s ST0,ST1 follows EFLAGS from CMP" % mnemonic, 0x0D02E800 + i * 0x100,
+         [(0, "CMP EAX,EBX"), (2, "FLD1"), (4, "FLDZ"), (6, "%s ST0,ST1" % mnemonic),
+          (8, "FISTP dword ptr [EDX]"), (10, "FISTP dword ptr [EDX + 0x4]"), (13, "RET")],
+         "39d8 d9e8 d9ee %s db1a db5a04 c3" % opcode, fcmov_setup)
+    for i, (mnemonic, opcode) in enumerate([
+        ("FCMOVB", "dac1"), ("FCMOVE", "dac9"), ("FCMOVBE", "dad1"), ("FCMOVU", "dad9"),
+        ("FCMOVNB", "dbc1"), ("FCMOVNE", "dbc9"), ("FCMOVNBE", "dbd1"), ("FCMOVNU", "dbd9")])
+]
 CASES += [
     Case("FILD %s sign extends into qword" % size, 0x0D02C000 + i * 0x100,
          [(0, "FILD %s ptr [EAX]" % size), (2, "FISTP qword ptr [EDX]"), (4, "RET")],

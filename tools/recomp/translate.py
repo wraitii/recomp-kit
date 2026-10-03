@@ -863,6 +863,10 @@ JCC["JECXZ"] = ("c->r[1] == 0", ())
 JCC["LOOP"] = ("(c->r[1] = c->r[1] - 1u) != 0u", ())
 SETCC = {"SET" + k: v for k, v in COND.items()}
 CMOVCC = {"CMOV" + k: v for k, v in COND.items()}
+# FCMOVcc tests the same EFLAGS bits as the integer forms but names parity U/NU.
+FCMOVCC = {"FCMOV" + k: COND[v] for k, v in (
+    ("B", "B"), ("E", "E"), ("BE", "BE"), ("U", "P"),
+    ("NB", "NB"), ("NE", "NE"), ("NBE", "NBE"), ("NU", "NP"))}
 
 ARITH_ALL = ALL_FLAGS
 LOGIC_DEF = ALL_FLAGS           # AF is architecturally undefined; treat as killed
@@ -1086,6 +1090,8 @@ def flag_effect(insn):
         return (NO_FLAGS, frozenset(SETCC[m][1]))
     if m in CMOVCC:
         return (NO_FLAGS, frozenset(CMOVCC[m][1]))
+    if m in FCMOVCC:
+        return (NO_FLAGS, frozenset(FCMOVCC[m][1]))
     if m in SHIFT_MAYDEF:
         uses = frozenset(("cf",)) if m in ("RCL", "RCR") else NO_FLAGS
         cnt = shift_effective_count(insn)
@@ -4223,6 +4229,10 @@ class Translator(object):
             L.append("fcom(c, %s, %s);" % (st(0), self.x87_int_value(ops[0])))
             if m == "FICOMP":
                 L.append("fdrop(c);")
+            return L
+        if m in FCMOVCC:
+            # FCMOVcc ST0,STi: copy STi into ST0 when the EFLAGS condition holds.
+            L.append("if (%s) { %s }" % (FCMOVCC[m][0], setst(0, st(ops[-1].sti))))
             return L
         if m in ("FCOMI", "FCOMIP", "FUCOMI", "FUCOMIP"):
             other = st(ops[-1].sti) if ops else st(1)
