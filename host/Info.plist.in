@@ -5,7 +5,7 @@
     <key>CFBundleName</key>
     <string>@RECOMP_APP_NAME@</string>
     <key>CFBundleDisplayName</key>
-    <string>@RECOMP_GAME_NAME@</string>
+    <string>@RECOMP_GAME_NAME_XML@</string>
     <key>CFBundleIdentifier</key>
     <string>@RECOMP_BUNDLE_ID@</string>
     <key>CFBundleExecutable</key>

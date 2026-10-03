@@ -10,6 +10,11 @@ function(pop_mac_bundle target)
   if(core_inputs)
     set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS ${core_inputs})
   endif()
+  # Info.plist is XML: a name such as "Black & White" must be escaped.
+  set(RECOMP_GAME_NAME_XML "${RECOMP_GAME_NAME}")
+  string(REPLACE "&" "&amp;" RECOMP_GAME_NAME_XML "${RECOMP_GAME_NAME_XML}")
+  string(REPLACE "<" "&lt;" RECOMP_GAME_NAME_XML "${RECOMP_GAME_NAME_XML}")
+  string(REPLACE ">" "&gt;" RECOMP_GAME_NAME_XML "${RECOMP_GAME_NAME_XML}")
   configure_file(${POP_ROOT}/host/Info.plist.in ${CMAKE_BINARY_DIR}/generated/Info.plist @ONLY)
   set_target_properties(${target} PROPERTIES
     MACOSX_BUNDLE ON
