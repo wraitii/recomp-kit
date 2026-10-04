@@ -58,13 +58,18 @@ bool d3d7_store_rgba_surface(uint8_t *dst, uint32_t pitch, uint32_t bpp, uint32_
     if (!dst || !rgba || !w || !h)
         return false;
     if (bpp == 16) {
+        // Same truncating conversion as d3d7_rgb888_to_rgb565, written over
+        // whole 32-bit pixels so the compiler vectorizes it (this runs for
+        // every presented frame).
         for (uint32_t y = 0; y < h; ++y) {
-            const uint8_t *src = rgba + (size_t)y * w * 4;
-            uint8_t *row = dst + (size_t)y * pitch;
+            const uint8_t *__restrict src = rgba + (size_t)y * w * 4;
+            uint8_t *__restrict row = dst + (size_t)y * pitch;
             for (uint32_t x = 0; x < w; ++x) {
-                uint32_t argb = ((uint32_t)src[x * 4 + 3] << 24) | ((uint32_t)src[x * 4] << 16) |
-                                ((uint32_t)src[x * 4 + 1] << 8) | (uint32_t)src[x * 4 + 2];
-                uint16_t v = d3d7_rgb888_to_rgb565(argb);
+                uint32_t px;
+                memcpy(&px, src + x * 4, 4); // R, G, B, A in memory order
+                uint16_t v =
+                    (uint16_t)((((px & 0xff) >> 3) << 11) | ((((px >> 8) & 0xff) >> 2) << 5) |
+                               (((px >> 16) & 0xff) >> 3));
                 memcpy(row + x * 2, &v, 2);
             }
         }
