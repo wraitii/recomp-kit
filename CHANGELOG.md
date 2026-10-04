@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add opt-in `[translate] x87_locals = true` C lowering. Supported straight-line
+  regions keep x87 values in scalar locals and defer physical stack/tag/metadata
+  writes until an observation boundary, preserving popped contents and the
+  existing arithmetic/status helpers. Integer memory accesses, calls, branches,
+  alternate entries and unsupported operations retain full eager boundary state.
+  Requires the kit's inline float-access and fatal host-diagnostic policy;
+  arbitrary asynchronous x87 observers are unsupported. The fragment probe now
+  tests the production pass, including comparison/status and integer boundaries.
+
 - Withdraw the experimental `--llvm-runtime` activation and
   `--llvm-compare-boundaries` option. Restore ordinary C/native host dispatch;
   retain the byte-verified codegen comparison, corpus sweep and isolated

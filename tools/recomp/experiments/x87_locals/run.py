@@ -29,6 +29,26 @@ CASES = {
                      "FSTP float ptr [EBX]", "FLD float ptr [ESI]",
                      "FMUL float ptr [EDI + 0x4]", "FSTP float ptr [EBX + 0x4]"],
 }
+PRODUCTION_CASES = {
+    "compare_status": ["FLD float ptr [ESI]", "FMUL float ptr [EDI]", "FADD float ptr [EDI + 4]",
+                       "FNSTSW AX", "FCOMP float ptr [EDI]"],
+    "integer_boundary": ["FLD float ptr [ESI]", "FMUL float ptr [EDI]", "FADD float ptr [EDI + 4]",
+                         "FILD qword ptr [ESI]", "FSTP float ptr [EBX]", "FSTP float ptr [EBX + 4]"],
+    "register_direction": ["FLD float ptr [ESI]", "FLD float ptr [EDI]", "FMUL ST1,ST0",
+                           "FSUBR ST0,ST1", "FSUBP ST1,ST0", "FSTP float ptr [EBX]"],
+}
+
+
+def emit_production(lines, enabled):
+    """Use the C driver's instruction output and its actual region lowering."""
+    from x87_locals import lower_regions
+    insns = T.parse_listing_text("\n".join(f"{0x100000 + i:08x}  {s}" for i, s in enumerate(lines)))
+    tr = T.Translator(None, set(), SimpleNamespace(eager_flags=True))
+    fn = T.Function(0x100000, "fragment", len(insns), insns)
+    bodies = {i: tr.emit(fn, i, T.ALL_FLAGS) for i in range(len(insns))}
+    if enabled:
+        bodies, _, _ = lower_regions(fn, bodies, set(), set(), T.parse_operand)
+    return "\n".join(line for i in range(len(insns)) for line in bodies[i])
 
 
 def emit(lines, mode):
@@ -37,6 +57,11 @@ def emit(lines, mode):
         raise ValueError(mode)
     insns = T.parse_listing_text("\n".join(f"{0x100000 + i:08x}  {s}" for i, s in enumerate(lines)))
     tr = T.Translator(None, set(), SimpleNamespace(eager_flags=False))
+    if mode == "full":
+        # Exercise the reusable production C pass, retaining the eager emitter
+        # as this experiment's baseline. Scope checks remain shared below.
+        emit(lines, "baseline")
+        return emit_production(lines, True)
     out = ["const unsigned top = c->fpu_top;"] if mode != "baseline" else []
     stack, last, serial = [], {}, 0
 
@@ -105,15 +130,21 @@ def run_experiment(out, cmake, jobs):
     for name, lines in CASES.items():
         for mode in MODES:
             code.append(f"void {name}_{mode}(X86 *c) {{\n{emit(lines, mode)}\n}}")
+    for name, lines in PRODUCTION_CASES.items():
+        for mode in MODES:
+            # The live/relaxed columns are eager controls for these additional
+            # production-pass regressions, not relaxed-contract experiments.
+            code.append(f"void {name}_{mode}(X86 *c) {{\n{emit_production(lines, mode == 'full')}\n}}")
     (out / "generated.c").write_text("\n".join(code) + "\n")
     declarations = ['static const char *mode_names[] = {"baseline", "full", "live", "relaxed"};',
                     "static const unsigned normalize_empty_mask = 12, required_match_mask = 6;"]
-    for name in CASES:
+    for name in {**CASES, **PRODUCTION_CASES}:
         for mode in MODES:
             declarations.append(f"void {name}_{mode}(X86 *);")
-    declarations += ["static const char *case_names[] = {" + ','.join(f'"{n}"' for n in CASES) + "};",
+    cases = {**CASES, **PRODUCTION_CASES}
+    declarations += ["static const char *case_names[] = {" + ','.join(f'"{n}"' for n in cases) + "};",
                      "static void (*functions[][4])(X86 *) = {" +
-                     ','.join('{' + ','.join(f"{n}_{m}" for m in MODES) + '}' for n in CASES) + "};"]
+                     ','.join('{' + ','.join(f"{n}_{m}" for m in MODES) + '}' for n in cases) + "};"]
     (out / "fixtures.h").write_text("\n".join(declarations))
     subprocess.run([cmake, "-S", str(HERE), "-B", str(out),
                     f"-DKIT_RUNTIME={KIT / 'runtime'}"], check=True)

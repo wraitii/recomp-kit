@@ -170,6 +170,7 @@ ANIMATION_COUNTER = 0
 VISUAL_ANIMATION_READS = frozenset()
 EXTRA_ENTRY_POINTS = frozenset()
 RESUMABLE_STACKS = False
+X87_LOCALS = False
 FUNCTION_ALIGNMENT = 16
 
 #: game.toml [translate] rewrites: an instruction's memory operand moved to a
@@ -207,9 +208,10 @@ def configure_module(cfg, key):
     reads, no curated symbols (those describe the executable)."""
     global LISTINGS, FUNCS_TSV, BINARY, CURATED, ANIMATION_COUNTER, VISUAL_ANIMATION_READS
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT, SYMBOL_PREFIX, AUX_MODULE
-    global RESUMABLE_STACKS
+    global RESUMABLE_STACKS, X87_LOCALS
     configure_intrinsics({"translate": {"intrinsics": {}}})
     RESUMABLE_STACKS = cfg["translate"].get("resumable_stacks", False)
+    X87_LOCALS = cfg["translate"].get("x87_locals", False)
     mods = {m["key"]: m for m in cfg.get("aux_modules", [])}
     if key not in mods:
         raise SystemExit("game.toml has no [modules.aux.%s]" % key)
@@ -256,8 +258,9 @@ def configure(cfg):
     ANIMATION_COUNTER = cfg["translate"]["animation_counter"]
     VISUAL_ANIMATION_READS = frozenset(cfg["translate"].get("volatile_reads", ()))
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT
-    global RESUMABLE_STACKS
+    global RESUMABLE_STACKS, X87_LOCALS
     RESUMABLE_STACKS = cfg["translate"].get("resumable_stacks", False)
+    X87_LOCALS = cfg["translate"].get("x87_locals", False)
     EXTRA_ENTRY_POINTS = frozenset(int(a) for a in cfg["translate"].get("entry_points", ()))
     FUNCTION_ALIGNMENT = cfg["translate"].get("function_alignment", 16)
     global OPERAND_REDIRECTS, INSTRUCTION_PATCHES, DATA_SEEDS
@@ -3097,12 +3100,21 @@ class Translator(object):
             if head:
                 out.append("    goto L_%08x;" % fn.addr)
         prologue = len(out)          # everything emitted so far is dispatch
+        bodies = {i: self.emit(fn, i, live_out[i]) for i in range(len(fn.insns)) if i not in dead}
+        if getattr(self.opts, "x87_locals", X87_LOCALS):
+            from x87_locals import lower_regions
+            bodies, regions, lifted = lower_regions(
+                fn, bodies, labels, dead, parse_operand,
+                VISUAL_ANIMATION_READS | frozenset(INSTRUCTION_PATCHES))
+            self.stats["_x87_local_regions"] += regions
+            self.stats["_x87_local_instructions"] += lifted
+            self.stats["_x87_local_functions"] += bool(regions)
         for i, ins in enumerate(fn.insns):
             if i in dead:
                 continue
             if ins.addr in labels:
                 out.append("L_%08x: ;" % ins.addr)
-            body = self.emit(fn, i, live_out[i])
+            body = bodies[i]
             for line in body:
                 out.append("    " + line)
             # An INT3 the listing ran into is MSVC's padding between

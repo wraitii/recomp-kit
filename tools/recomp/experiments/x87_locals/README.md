@@ -13,8 +13,9 @@ This is an opt-in research tool; the production translator does not import it.
 The experiment is currently intended for Clang/GCC host builds, not cross builds.
 
 `run.py` parses synthetic instruction listings through the production parser.
-The baseline directly calls `Translator.emit_x87`. Three other emitters track
-stack slots using C temporaries and defer final stack/tag materialization:
+The baseline directly calls `Translator.emit_x87`. The full-state variant uses
+the production C region pass (`tools/recomp/x87_locals.py`); the live/relaxed
+variants remain separate weaker-contract experiments:
 
 - **full:** retains every arithmetic `fx87` call, store conversion and final
   state field, including values and integer metadata in popped slots.
@@ -30,6 +31,11 @@ aliasing reloads. Only self-contained straight-line FLD, FMUL, FADD, FSUB,
 implicit FADDP and FSTP with ordinary binary32 memory operands are supported.
 Other instructions, incoming-stack dependencies and local stack overflow fail.
 No register arguments, types, function boundaries or control flow are inferred.
+Three additional production-pass fixtures cover virtual TOP in FNSTSW followed
+by FCOMP, materialization before FILD with exact-integer metadata, and explicit
+register arithmetic direction/reverse subtraction. Their live/relaxed columns
+are eager controls, not weaker-contract variants. All six fixtures compare full
+state for the production pass (147,456 inputs in total).
 
 The C harness tests 24,576 inputs per fixture, with all eight entry TOPs and
 all sixteen PC/RC bit combinations (including reserved PC=01, for runtime
