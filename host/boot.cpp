@@ -409,6 +409,33 @@ void fault_handler(const char *name) {
     sig_write(" EBP=");
     sig_write_hex8(c->r[R_EBP]);
     sig_write("\n");
+    // The EIP above is the last one the translated code stored, usually a call
+    // return address, not where the fault happened. The registers and the
+    // faulting address are what localise a bad pointer.
+    static const char *const names[8] = {"EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI"};
+    sig_write("[host]");
+    for (int i = 0; i < 8; ++i) {
+        sig_write(" ");
+        sig_write(names[i]);
+        sig_write("=");
+        sig_write_hex8(c->r[i]);
+    }
+    sig_write("\n");
+    const uint64_t fault = os_fault_address();
+    if (fault) {
+        const uint64_t base = (uint64_t)(uintptr_t)g_mem;
+        sig_write("[host] fault address ");
+        sig_write_hex8((uint32_t)(fault >> 32));
+        sig_write_hex8((uint32_t)fault);
+        if (fault >= base && fault < base + (1ull << 32)) {
+            sig_write(" = guest address ");
+            sig_write_hex8((uint32_t)(fault - base));
+            sig_write(fault - base >= (256u << 20) ? " (beyond the 256 MB arena)" : "");
+        } else {
+            sig_write(" (outside the guest arena)");
+        }
+        sig_write("\n");
+    }
     if (c->r[R_ESP] < STACK_LIMIT || c->r[R_ESP] >= STACK_TOP)
         sig_write("[host] the guest stack pointer is outside the main stack: it "
                   "overflowed, lost it, or this is a worker on its own stack\n");
