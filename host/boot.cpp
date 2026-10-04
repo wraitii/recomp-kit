@@ -11,6 +11,7 @@
 #include "../runtime/imports.h"
 #include "../runtime/win32.h"
 #include "../runtime/mods_seam.h"
+#include "../runtime/call_trace.h"
 #include "../runtime/gdi32_internal.h"
 #include "../runtime/display_seam.h"
 #include "../dx/dx.h"
@@ -408,6 +409,33 @@ void fault_handler(const char *name) {
     sig_write(" EBP=");
     sig_write_hex8(c->r[R_EBP]);
     sig_write("\n");
+    // The EIP above is the last one the translated code stored, usually a call
+    // return address, not where the fault happened. The registers and the
+    // faulting address are what localise a bad pointer.
+    static const char *const names[8] = {"EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI"};
+    sig_write("[host]");
+    for (int i = 0; i < 8; ++i) {
+        sig_write(" ");
+        sig_write(names[i]);
+        sig_write("=");
+        sig_write_hex8(c->r[i]);
+    }
+    sig_write("\n");
+    const uint64_t fault = os_fault_address();
+    if (fault) {
+        const uint64_t base = (uint64_t)(uintptr_t)g_mem;
+        sig_write("[host] fault address ");
+        sig_write_hex8((uint32_t)(fault >> 32));
+        sig_write_hex8((uint32_t)fault);
+        if (fault >= base && fault < base + (1ull << 32)) {
+            sig_write(" = guest address ");
+            sig_write_hex8((uint32_t)(fault - base));
+            sig_write(fault - base >= (256u << 20) ? " (beyond the 256 MB arena)" : "");
+        } else {
+            sig_write(" (outside the guest arena)");
+        }
+        sig_write("\n");
+    }
     if (c->r[R_ESP] < STACK_LIMIT || c->r[R_ESP] >= STACK_TOP)
         sig_write("[host] the guest stack pointer is outside the main stack: it "
                   "overflowed, lost it, or this is a worker on its own stack\n");
@@ -522,6 +550,11 @@ bool boot_load(const BootOptions &opts) {
     }
     // The presenters ask this before they touch the page.
     host_page_set_enabled(page_enabled);
+
+    // Arm the guest call tracer (RECOMP_TRACE_CALLS) after the mods are in
+    // place, so its hook chains to any mod hook on the same address rather
+    // than being overwritten by it. A no-op without the variable.
+    recomp_trace_calls_init();
 
     g_loaded = true;
     return true;
@@ -697,8 +730,13 @@ void boot_request_close(const char *reason) {
     // The caller says why in its own words; boot only delivers the message,
     // which is the one thing closing a real window does.
     uint32_t hwnd = host_main_window();
+    // What closing a real window delivers is WM_SYSCOMMAND/SC_CLOSE, which
+    // DefWindowProc turns into WM_CLOSE: a guest may intercept the first, and
+    // Black & White does (its window procedure runs LHSystem::SetTerminate on
+    // SC_CLOSE and never reaches DefWindowProc, so a bare WM_CLOSE only
+    // destroyed the window and left the game running).
     if (hwnd)
-        host_post_message(hwnd, 0x0010 /* WM_CLOSE */, 0, 0);
+        host_post_message(hwnd, 0x0112 /* WM_SYSCOMMAND */, 0xf060 /* SC_CLOSE */, 0);
 }
 
 void boot_print_exit_code(FILE *out) {

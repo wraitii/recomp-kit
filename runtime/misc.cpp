@@ -351,7 +351,13 @@ struct RegValue {
     std::string str;          // REG_SZ / REG_EXPAND_SZ
     uint32_t dword = 0;       // REG_DWORD
     std::vector<uint8_t> bin; // REG_BINARY and everything else
+    // Creation order within its key. Windows enumerates a key's values in the
+    // order they were created, and guests depend on it (Black & White's
+    // settings reader gives up on the first value that does not fit its 4-byte
+    // buffer, so the DWORD settings have to be enumerated before any string).
+    uint64_t seq = 0;
 };
+uint64_t g_reg_seq = 0;
 
 // Registry key paths and value names are case-insensitive on Windows.
 struct CiLess {
@@ -360,6 +366,16 @@ struct CiLess {
     }
 };
 typedef std::map<std::string, RegValue, CiLess> RegValues;
+
+// A key's values in creation order, as RegEnumValue reports them.
+std::vector<const std::pair<const std::string, RegValue> *> reg_in_order(const RegValues &v) {
+    std::vector<const std::pair<const std::string, RegValue> *> out;
+    for (const auto &kv : v)
+        out.push_back(&kv);
+    std::stable_sort(out.begin(), out.end(),
+                     [](const auto *a, const auto *b) { return a->second.seq < b->second.seq; });
+    return out;
+}
 
 std::map<std::string, RegValues, CiLess> &regstore() {
     static std::map<std::string, RegValues, CiLess> m;
@@ -479,8 +495,32 @@ void registry_load() {
                     rv.bin = hex_to_bytes(d->second.str);
                 }
             }
+            auto q = val.second.obj.find("seq");
+            if (q != val.second.obj.end() && q->second.kind == JValue::NUM) {
+                rv.seq = (uint64_t)q->second.num;
+                if (rv.seq > g_reg_seq)
+                    g_reg_seq = rv.seq;
+            }
             values[val.first] = rv;
         }
+    }
+    // A file written before values carried a sequence has lost its creation
+    // order. Give those values one now: DWORDs first, then the rest by name,
+    // after everything that has a real sequence. A heuristic for old files only;
+    // every value written from now on records its true position.
+    for (auto &key : regstore()) {
+        std::vector<RegValues::iterator> legacy;
+        for (auto it = key.second.begin(); it != key.second.end(); ++it)
+            if (!it->second.seq)
+                legacy.push_back(it);
+        std::stable_sort(legacy.begin(), legacy.end(),
+                         [](const RegValues::iterator &a, const RegValues::iterator &b) {
+                             const bool ad = a->second.type == 4 || a->second.type == 5;
+                             const bool bd = b->second.type == 4 || b->second.type == 5;
+                             return ad != bd ? ad : false;
+                         });
+        for (auto &it : legacy)
+            it->second.seq = ++g_reg_seq;
     }
     LOGV("registry: loaded %zu keys from %s", regstore().size(), path.c_str());
 }
@@ -508,20 +548,24 @@ void registry_flush() {
         first_key = false;
         fprintf(f, "  \"%s\": {\n", json_escape(key.first).c_str());
         bool first_val = true;
-        for (const auto &val : key.second) {
+        for (const auto *vp : reg_in_order(key.second)) {
+            const auto &val = *vp;
             if (!first_val)
                 fprintf(f, ",\n");
             first_val = false;
             const RegValue &rv = val.second;
             if (rv.type == 4 || rv.type == 5)
-                fprintf(f, "    \"%s\": {\"type\": %u, \"data\": %u}",
-                        json_escape(val.first).c_str(), rv.type, rv.dword);
+                fprintf(f, "    \"%s\": {\"type\": %u, \"data\": %u, \"seq\": %llu}",
+                        json_escape(val.first).c_str(), rv.type, rv.dword,
+                        (unsigned long long)rv.seq);
             else if (rv.type == 1 || rv.type == 2)
-                fprintf(f, "    \"%s\": {\"type\": %u, \"data\": \"%s\"}",
-                        json_escape(val.first).c_str(), rv.type, json_escape(rv.str).c_str());
+                fprintf(f, "    \"%s\": {\"type\": %u, \"data\": \"%s\", \"seq\": %llu}",
+                        json_escape(val.first).c_str(), rv.type, json_escape(rv.str).c_str(),
+                        (unsigned long long)rv.seq);
             else
-                fprintf(f, "    \"%s\": {\"type\": %u, \"data\": \"%s\"}",
-                        json_escape(val.first).c_str(), rv.type, bytes_to_hex(rv.bin).c_str());
+                fprintf(f, "    \"%s\": {\"type\": %u, \"data\": \"%s\", \"seq\": %llu}",
+                        json_escape(val.first).c_str(), rv.type, bytes_to_hex(rv.bin).c_str(),
+                        (unsigned long long)rv.seq);
         }
         fprintf(f, "\n  }");
     }
@@ -564,6 +608,29 @@ namespace {
 // -------------------------------------------------------------------------
 // ADVAPI32
 // -------------------------------------------------------------------------
+// Defined below the open/create entry points; forward-declared so an open can
+// see whether a key exists only as an ancestor of stored descendants.
+std::vector<std::string> reg_children(const std::string &path);
+
+// Windows creates every missing ancestor when a key is created. The store
+// otherwise only holds the exact key paths that were written, so opening the
+// parent of a stored subkey - which RegOpenKeyA/LHNetGetProfileList does -
+// would fail. Create the ancestors so the tree shape matches the original's.
+bool reg_ensure_ancestors(const std::string &path) {
+    if (path.empty())
+        return false;
+    size_t first = path.find('\\');
+    if (first == std::string::npos)
+        return false; // a predefined hive root is implicit, never stored
+    bool added = false;
+    for (size_t i = path.find('\\', first + 1); i != std::string::npos;
+         i = path.find('\\', i + 1)) {
+        if (regstore().emplace(path.substr(0, i), RegValues{}).second)
+            added = true;
+    }
+    return added;
+}
+
 void a_RegOpenKeyEx(X86 *c, uint32_t hkey, const std::string &sub, uint32_t presult) {
     std::string path = key_path(hkey, sub);
     if (path.empty()) {
@@ -578,7 +645,9 @@ void a_RegOpenKeyEx(X86 *c, uint32_t hkey, const std::string &sub, uint32_t pres
         set_eax(c, 0);
         return;
     }
-    if (regstore().find(path) == regstore().end()) {
+    // A key with descendants exists even when no value was ever written at it
+    // and it was never the target of a create call.
+    if (regstore().find(path) == regstore().end() && reg_children(path).empty()) {
         LOGV("RegOpenKeyExA(%s): not found", path.c_str());
         set_eax(c, 2); // ERROR_FILE_NOT_FOUND
         return;
@@ -606,7 +675,7 @@ void reg_create(X86 *c, const std::string &sub) {
         return;
     }
     bool existed = regstore().find(path) != regstore().end();
-    if (!existed) {
+    if (reg_ensure_ancestors(path) || !existed) {
         regstore()[path];
         g_registry_dirty = true;
     }
@@ -630,7 +699,7 @@ void a_RegCreateKeyA(X86 *c) {
         set_eax(c, 6);
         return;
     }
-    if (regstore().find(path) == regstore().end()) {
+    if (reg_ensure_ancestors(path) || regstore().find(path) == regstore().end()) {
         regstore()[path];
         g_registry_dirty = true;
     }
@@ -697,19 +766,23 @@ void reg_query(X86 *c, const std::string &name, bool wide) {
     std::string path =
         ki != regkeys().end() ? ki->second : std::string(hive_name(hkey) ? hive_name(hkey) : "");
     if (path.empty()) {
+        LOGV("registry: query 0x%08x \"%s\": no such key handle", hkey, name.c_str());
         set_eax(c, 6);
         return;
     }
     auto si = regstore().find(path);
     if (si == regstore().end()) {
+        LOGV("registry: query %s \"%s\": key absent", path.c_str(), name.c_str());
         set_eax(c, 2);
         return;
     }
     auto vi = si->second.find(name);
     if (vi == si->second.end()) {
+        LOGV("registry: query %s \"%s\": value absent", path.c_str(), name.c_str());
         set_eax(c, 2);
         return;
     }
+    LOGV("registry: query %s \"%s\": found", path.c_str(), name.c_str());
 
     set_eax(c, reg_read_value(vi->second, wide, ptype, pdata, pcb));
 }
@@ -739,7 +812,14 @@ void reg_set(X86 *c, const std::string &name, bool wide) {
     } else if (pdata) {
         rv.bin.assign(g_mem + pdata, g_mem + pdata + cb);
     }
-    regstore()[path][name] = rv;
+    if (reg_ensure_ancestors(path))
+        g_registry_dirty = true;
+    {
+        auto &vals = regstore()[path];
+        auto old = vals.find(name);
+        rv.seq = old != vals.end() ? old->second.seq : ++g_reg_seq; // overwriting keeps its place
+        vals[name] = rv;
+    }
     g_registry_dirty = true;
     registry_flush();
     set_eax(c, 0);
@@ -822,14 +902,77 @@ void a_RegEnumValueW(X86 *c) {
         set_eax(c, 259);
         return;
     }
-    auto value = it->second.begin();
-    std::advance(value, arg(c, 1));
+    const auto ordered = reg_in_order(it->second);
+    const auto *value = ordered[arg(c, 1)];
     uint32_t hr = reg_write_name(value->first, arg(c, 2), arg(c, 3));
     if (!hr)
         hr = reg_read_value(value->second, true, arg(c, 5), arg(c, 6), arg(c, 7));
     set_eax(c, hr);
 }
-void a_RegQueryInfoKeyW(X86 *c) {
+// The ANSI spelling of the same enumeration: value names are the UTF-8 the
+// store keeps, written byte-wide, and the string data is read back byte-wide.
+// LHLogR enumerates its registry values in ANSI; leaving this unregistered
+// aborted the DLL's logging init with an unknown stdcall arity.
+uint32_t reg_write_name_a(const std::string &name, uint32_t out, uint32_t len) {
+    if (!len || !gm_valid(len, 4))
+        return 87;
+    uint32_t have = rd32(len), need = uint32_t(name.size());
+    wr32(len, need);
+    if (!out || have <= need)
+        return 234;
+    if (!gm_valid(out, need + 1))
+        return 87;
+    gm_put_str(out, name.c_str(), have);
+    return 0;
+}
+// RegEnumKeyA is the 4-argument ANSI enumerator LHMultiplayerR's profile list
+// uses: child names are the UTF-8 the store keeps, written byte-wide.
+void a_RegEnumKeyA(X86 *c) {
+    std::string path = key_path(arg(c, 0), "");
+    if (path.empty()) {
+        set_eax(c, 6);
+        return;
+    }
+    auto names = reg_children(path);
+    if (arg(c, 1) >= names.size()) {
+        set_eax(c, 259);
+        return;
+    }
+    // Unlike RegEnumValue, RegEnumKey's last argument is the buffer size in
+    // bytes by value (including the NUL), not a pointer to it.
+    const std::string &name = names[arg(c, 1)];
+    uint32_t out = arg(c, 2), cch = arg(c, 3);
+    if (!out || cch <= name.size()) {
+        set_eax(c, 234); // ERROR_MORE_DATA
+        return;
+    }
+    if (!gm_valid(out, uint32_t(name.size()) + 1)) {
+        set_eax(c, 87);
+        return;
+    }
+    gm_put_str(out, name.c_str(), cch);
+    set_eax(c, 0);
+}
+void a_RegEnumValueA(X86 *c) {
+    std::string path = key_path(arg(c, 0), "");
+    if (path.empty()) {
+        set_eax(c, 6);
+        return;
+    }
+    auto it = regstore().find(path);
+    if (it == regstore().end() || arg(c, 1) >= it->second.size()) {
+        set_eax(c, 259);
+        return;
+    }
+    const auto ordered = reg_in_order(it->second);
+    const auto *value = ordered[arg(c, 1)];
+    uint32_t hr = reg_write_name_a(value->first, arg(c, 2), arg(c, 3));
+    if (!hr)
+        hr = reg_read_value(value->second, false, arg(c, 5), arg(c, 6), arg(c, 7));
+    LOGV("registry: enum %s #%u \"%s\" -> %u", path.c_str(), arg(c, 1), value->first.c_str(), hr);
+    set_eax(c, hr);
+}
+void reg_query_info_key(X86 *c, bool wide) {
     std::string path = key_path(arg(c, 0), "");
     if (path.empty()) {
         set_eax(c, 6);
@@ -839,18 +982,19 @@ void a_RegQueryInfoKeyW(X86 *c) {
     auto it = regstore().find(path);
     uint32_t maxkey = 0, maxname = 0, maxdata = 0, count = 0;
     for (const auto &name : keys)
-        maxkey = std::max(maxkey, reg_units(name));
+        maxkey = std::max(maxkey, wide ? reg_units(name) : uint32_t(name.size()));
     if (it != regstore().end()) {
         count = uint32_t(it->second.size());
         for (const auto &v : it->second) {
-            maxname = std::max(maxname, reg_units(v.first));
-            maxdata = std::max(maxdata, reg_value_size(v.second, true));
+            maxname = std::max(maxname, wide ? reg_units(v.first) : uint32_t(v.first.size()));
+            maxdata = std::max(maxdata, reg_value_size(v.second, wide));
         }
     }
     uint32_t hr = 0;
     if (arg(c, 2)) {
         if (arg(c, 1))
-            hr = reg_write_name("", arg(c, 1), arg(c, 2));
+            hr = wide ? reg_write_name("", arg(c, 1), arg(c, 2))
+                      : reg_write_name_a("", arg(c, 1), arg(c, 2));
         else
             wr32(arg(c, 2), 0);
     }
@@ -862,8 +1006,18 @@ void a_RegQueryInfoKeyW(X86 *c) {
         wr64(arg(c, 11), 0);
     set_eax(c, hr);
 }
-void a_RegDeleteKeyW(X86 *c) {
-    std::string path = key_path(arg(c, 0), gm_wstr(arg(c, 1)));
+// The ANSI spelling of the same query; LHMultiplayerR's profile list sizes its
+// child-name buffer from it before RegEnumKeyA.
+void a_RegQueryInfoKeyA(X86 *c) {
+    reg_query_info_key(c, false);
+}
+void a_RegQueryInfoKeyW(X86 *c) {
+    reg_query_info_key(c, true);
+}
+// Shared by both spellings. On NT a key that still has subkeys is refused with
+// ERROR_ACCESS_DENIED and is never deleted recursively; LHNetDeleteProfile
+// deletes the profile's own subkey, which holds values, not child keys.
+void reg_delete_key(X86 *c, const std::string &path) {
     if (path.empty()) {
         set_eax(c, 6);
         return;
@@ -878,6 +1032,12 @@ void a_RegDeleteKeyW(X86 *c) {
     }
     g_registry_dirty = true;
     set_eax(c, 0);
+}
+void a_RegDeleteKeyA(X86 *c) {
+    reg_delete_key(c, key_path(arg(c, 0), gm_str(arg(c, 1), 512)));
+}
+void a_RegDeleteKeyW(X86 *c) {
+    reg_delete_key(c, key_path(arg(c, 0), gm_wstr(arg(c, 1))));
 }
 void a_RegDeleteValueW(X86 *c) {
     std::string path = key_path(arg(c, 0), "");
@@ -977,6 +1137,43 @@ void o_IsEqualGUID(X86 *c) {
     set_eax(c, a && b && gm_valid(a, 16) && gm_valid(b, 16) && !memcmp(g_mem + a, g_mem + b, 16));
 }
 
+// CoFileTimeToDosDateTime(FILETIME *pft, WORD *pFatDate, WORD *pFatTime).
+// Documented ole32 API: a FILETIME is unsigned 100 ns ticks since 1601-01-01;
+// the DOS date word is ((year-1980)<<9)|(month<<5)|day and the time word is
+// (hour<<11)|(minute<<5)|(second/2). FALSE outside the representable range.
+// The exe caller passes the file time and the two output words, so this is a
+// real conversion, not a stub.
+void o_CoFileTimeToDosDateTime(X86 *c) {
+    uint32_t ft = arg(c, 0), pdate = arg(c, 1), ptime = arg(c, 2);
+    if (!ft || !gm_valid(ft, 8) || !pdate || !ptime || !gm_valid(pdate, 2) || !gm_valid(ptime, 2)) {
+        set_eax(c, 0);
+        return;
+    }
+    const uint64_t ticks = (uint64_t)rd32(ft) | ((uint64_t)rd32(ft + 4) << 32);
+    const int64_t days = (int64_t)(ticks / 864000000000ull);
+    const int64_t secs = (int64_t)((ticks % 864000000000ull) / 10000000ull);
+    // Days since 1601-01-01 -> civil date (Howard Hinnant's civil_from_days).
+    int64_t z = days - 134774; // 1601 epoch to 1970 epoch
+    z += 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const int64_t doe = z - era * 146097;
+    const int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t year = yoe + era * 400;
+    const int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const int64_t mp = (5 * doy + 2) / 153;
+    const int64_t day = doy - (153 * mp + 2) / 5 + 1;
+    const int64_t month = mp < 10 ? mp + 3 : mp - 9;
+    year += (month <= 2);
+    if (year < 1980 || year > 2107) {
+        set_eax(c, 0);
+        return;
+    }
+    const int64_t hour = secs / 3600, minute = (secs % 3600) / 60, second = secs % 60;
+    wr16(pdate, (uint16_t)(((year - 1980) << 9) | (month << 5) | day));
+    wr16(ptime, (uint16_t)((hour << 11) | (minute << 5) | (second / 2)));
+    set_eax(c, 1);
+}
+
 // PROPVARIANT is sixteen bytes on x86: a two-byte VARTYPE, six reserved, and
 // an eight-byte union. Clearing one means releasing whatever the union owns
 // and then emptying it, and every PROPVARIANT the shims hand out is VT_EMPTY -
@@ -1029,6 +1226,26 @@ void i_ImmGetCandidateListA(X86 *c) {
 }
 void i_ImmSetCompositionWindow(X86 *c) {
     set_eax(c, 1);
+}
+// runblack.exe imports these five and the four above; the host has no input
+// method, so there is no context to return or destroy. fn_007F4300 (called by
+// pc_main) is `ImmAssociateContext(hwnd, NULL)` with the result discarded.
+void i_ImmAssociateContext(X86 *c) {
+    // (HWND, HIMC) -> the previous HIMC; there was none, and the caller in
+    // fn_007F4300 discards it.
+    set_eax(c, 0);
+}
+void i_ImmCreateContext(X86 *c) {
+    set_eax(c, 0);
+}
+void i_ImmDestroyContext(X86 *c) {
+    set_eax(c, 1);
+}
+void i_ImmGetProperty(X86 *c) {
+    set_eax(c, 0);
+}
+void i_ImmGetDescriptionA(X86 *c) {
+    set_eax(c, 0);
 }
 
 // -------------------------------------------------------------------------
@@ -1151,6 +1368,176 @@ void w_inet_ntoa(X86 *c) {
 }
 
 // -------------------------------------------------------------------------
+// Winsock with no host network. Black & White does not need the internet, so
+// every call that would open or use a socket fails the way the real stack
+// fails with no network adapter, and name lookups behave as an offline
+// machine: gethostname reports the local name, localhost resolves, every other
+// name is WSAHOST_NOT_FOUND. The byte-order and address-parsing calls need no
+// network and are the real thing. This layer is a deferred fidelity gap for
+// the networking task, not a silent stub; each distinct failing call is logged
+// once. A call whose offline behavior cannot be justified stays a loud abort
+// (see the WSA* event/overlapped entries that map to imports_unsupported).
+// -------------------------------------------------------------------------
+static constexpr int WSAENETDOWN_ = 10050;
+static constexpr int WSAENETUNREACH_ = 10051;
+static constexpr int WSAENOTSOCK_ = 10038;
+
+// SOCKET_ERROR and INVALID_SOCKET are both all-ones, and the byte-count and
+// WSAOVERLAPPED* out-parameters are left untouched: a failing call has no
+// result to report.
+static void wsa_call_failed(X86 *c, const char *fn, int error) {
+    log_once(fn, "WS2_32/WSOCK32!%s: no network host; SOCKET_ERROR, WSAGetLastError=%d", fn, error);
+    g_wsa_last_error = error;
+    set_eax(c, (uint32_t)-1);
+}
+void w_socket(X86 *c) {
+    wsa_call_failed(c, "socket", WSAENETDOWN_);
+}
+void w_bind(X86 *c) {
+    wsa_call_failed(c, "bind", WSAENETDOWN_);
+}
+void w_connect(X86 *c) {
+    wsa_call_failed(c, "connect", WSAENETUNREACH_);
+}
+void w_listen(X86 *c) {
+    wsa_call_failed(c, "listen", WSAENETDOWN_);
+}
+void w_accept(X86 *c) {
+    wsa_call_failed(c, "accept", WSAENETDOWN_);
+}
+void w_send(X86 *c) {
+    wsa_call_failed(c, "send", WSAENETDOWN_);
+}
+void w_recv(X86 *c) {
+    wsa_call_failed(c, "recv", WSAENETDOWN_);
+}
+void w_sendto(X86 *c) {
+    wsa_call_failed(c, "sendto", WSAENETDOWN_);
+}
+void w_recvfrom(X86 *c) {
+    wsa_call_failed(c, "recvfrom", WSAENETDOWN_);
+}
+void w_select(X86 *c) {
+    wsa_call_failed(c, "select", WSAENETDOWN_);
+}
+void w_shutdown(X86 *c) {
+    wsa_call_failed(c, "shutdown", WSAENETDOWN_);
+}
+void w_closesocket(X86 *c) {
+    wsa_call_failed(c, "closesocket", WSAENOTSOCK_);
+}
+void w_ioctlsocket(X86 *c) {
+    wsa_call_failed(c, "ioctlsocket", WSAENOTSOCK_);
+}
+void w_getsockopt(X86 *c) {
+    wsa_call_failed(c, "getsockopt", WSAENOTSOCK_);
+}
+void w_setsockopt(X86 *c) {
+    wsa_call_failed(c, "setsockopt", WSAENOTSOCK_);
+}
+void w_getpeername(X86 *c) {
+    wsa_call_failed(c, "getpeername", WSAENOTSOCK_);
+}
+void w_getsockname(X86 *c) {
+    wsa_call_failed(c, "getsockname", WSAENOTSOCK_);
+}
+void w_WSAIoctl(X86 *c) {
+    wsa_call_failed(c, "WSAIoctl", WSAENETDOWN_);
+}
+void w_WSARecv(X86 *c) {
+    wsa_call_failed(c, "WSARecv", WSAENETDOWN_);
+}
+void w_WSARecvFrom(X86 *c) {
+    wsa_call_failed(c, "WSARecvFrom", WSAENETDOWN_);
+}
+
+// Event and overlapped results are not sockets: WSACreateEvent returns
+// WSA_INVALID_EVENT and the rest report FALSE or WSA_WAIT_FAILED.
+void w_WSACreateEvent(X86 *c) {
+    log_once("WSACreateEvent",
+             "WS2_32!WSACreateEvent: no network host; WSA_INVALID_EVENT, WSAGetLastError=%d",
+             WSAENETDOWN_);
+    g_wsa_last_error = WSAENETDOWN_;
+    set_eax(c, 0);
+}
+void w_WSACloseEvent(X86 *c) {
+    log_once("WSACloseEvent", "WS2_32!WSACloseEvent: no network host; FALSE");
+    g_wsa_last_error = WSAENETDOWN_;
+    set_eax(c, 0);
+}
+void w_WSASetEvent(X86 *c) {
+    g_wsa_last_error = WSAENETDOWN_;
+    set_eax(c, 0);
+}
+void w_WSAResetEvent(X86 *c) {
+    g_wsa_last_error = WSAENETDOWN_;
+    set_eax(c, 0);
+}
+void w_WSAWaitForMultipleEvents(X86 *c) {
+    log_once("WSAWaitForMultipleEvents",
+             "WS2_32!WSAWaitForMultipleEvents: no network host; WSA_WAIT_FAILED");
+    g_wsa_last_error = WSAENETDOWN_;
+    set_eax(c, 0xffffffffu); // WSA_WAIT_FAILED
+}
+void w_WSAGetOverlappedResult(X86 *c) {
+    g_wsa_last_error = WSAENETDOWN_;
+    set_eax(c, 0);
+}
+
+void w_gethostbyaddr(X86 *c) {
+    log_once("WS2_32!gethostbyaddr",
+             "WS2_32!gethostbyaddr: no network host; NULL, WSAGetLastError=%d", WSAHOST_NOT_FOUND_);
+    g_wsa_last_error = WSAHOST_NOT_FOUND_;
+    set_eax(c, 0);
+}
+
+// Pure byte-order and address utilities: no network is involved.
+void w_htonl(X86 *c) {
+    set_eax(c, __builtin_bswap32(arg(c, 0)));
+}
+void w_ntohl(X86 *c) {
+    set_eax(c, __builtin_bswap32(arg(c, 0)));
+}
+void w_htons(X86 *c) {
+    set_eax(c, (uint32_t)(uint16_t)__builtin_bswap16((uint16_t)arg(c, 0)));
+}
+void w_ntohs(X86 *c) {
+    set_eax(c, (uint32_t)(uint16_t)__builtin_bswap16((uint16_t)arg(c, 0)));
+}
+void w_inet_addr(X86 *c) {
+    std::string text = gm_str(arg(c, 0), 64);
+    unsigned a = 0, b = 0, cc = 0, d = 0;
+    char extra = 0;
+    if (sscanf(text.c_str(), "%u.%u.%u.%u%c", &a, &b, &cc, &d, &extra) == 4 && a < 256 && b < 256 &&
+        cc < 256 && d < 256) {
+        set_eax(c, a | (b << 8) | (cc << 16) | (d << 24));
+    } else {
+        set_eax(c, 0xffffffffu); // INADDR_NONE
+    }
+}
+// __WSAFDIsSet(s, fd_set*): nonzero when s is in the set. fd_set is a count
+// followed by that many SOCKETs; FD_SETSIZE is 64.
+void w_wsa_fd_is_set(X86 *c) {
+    uint32_t s = arg(c, 0), set = arg(c, 1);
+    if (!set || !gm_valid(set, 4)) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t count = rd32(set);
+    if (count > 64)
+        count = 64;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!gm_valid(set + 4 + i * 4, 4))
+            break;
+        if (rd32(set + 4 + i * 4) == s) {
+            set_eax(c, 1);
+            return;
+        }
+    }
+    set_eax(c, 0);
+}
+
+// -------------------------------------------------------------------------
 // WINMM: clock, multimedia timers and mmio.
 // -------------------------------------------------------------------------
 struct MmTimer {
@@ -1219,11 +1606,52 @@ void m_timeEndPeriod(X86 *c) {
     set_eax(c, 0);
 }
 
-// mmio: a thin wrapper over the same case-insensitive file layer as CreateFileA.
+// mmio: the same case-insensitive file layer as CreateFileA, plus the
+// memory-file form LHaudiodllR uses to hand its RIFF parser a buffer. The two
+// backings share one handle table; only read/seek/write differ.
+//
+// Field offsets and error codes are the Windows mmsystem.h ones: MMIOINFO is
+// 0x48 bytes (fccIOProc 0x04, wErrorRet 0x0c, cchBuffer 0x14, pchBuffer 0x18)
+// and MMCKINFO is 0x14 bytes. The RIFF walk is what the LHaudiodllR parser
+// (0x10210910) drives: mmioOpenA(NULL, MMIOINFO{'MEM '}), then
+// mmioDescend/'WAVE'/FINDRIFF, 'fmt '/FINDCHUNK, mmioRead, mmioAscend, 'data'.
+const uint32_t MMIO_FINDCHUNK = 0x0010;
+const uint32_t MMIO_FINDRIFF = 0x0020;
+const uint32_t MMIO_FINDLIST = 0x0040;
+const uint32_t MMIOERR_FILENOTFOUND = 0x101;
+const uint32_t MMIOERR_CANNOTOPEN = 0x103;
+const uint32_t MMIOERR_CANNOTSEEK = 0x107;
+const uint32_t MMIOERR_CHUNKNOTFOUND = 0x109;
+const uint32_t MMIO_DIRTY = 0x10000000u;
+const uint32_t FOURCC_RIFF = 0x46464952u; // 'RIFF'
+const uint32_t FOURCC_LIST = 0x5453494cu; // 'LIST'
+const uint32_t FOURCC_MEM = 0x204d454du;  // 'MEM '
+enum {
+    MMIOINFO_SIZE = 0x48,
+    MMIOINFO_OFF_fccIOProc = 0x04,
+    MMIOINFO_OFF_wErrorRet = 0x0c,
+    MMIOINFO_OFF_cchBuffer = 0x14,
+    MMIOINFO_OFF_pchBuffer = 0x18,
+    MMIOINFO_OFF_pchNext = 0x1c,
+    MMIOINFO_OFF_pchEndRead = 0x20,
+    MMIOINFO_OFF_pchEndWrite = 0x24,
+    MMCKINFO_SIZE = 0x14,
+    MMCKINFO_OFF_ckid = 0x00,
+    MMCKINFO_OFF_cksize = 0x04,
+    MMCKINFO_OFF_fccType = 0x08,
+    MMCKINFO_OFF_dwDataOffset = 0x0c,
+    MMCKINFO_OFF_dwFlags = 0x10,
+};
+
 struct MmioFile {
     FILE *fp = nullptr;
     std::string path;
     bool writable = false;
+    // Memory-file form: the guest buffer and the current offset into it.
+    bool memory = false;
+    uint32_t buffer = 0;
+    uint32_t length = 0;
+    uint32_t pos = 0;
 };
 std::map<uint32_t, MmioFile> &mmios() {
     static std::map<uint32_t, MmioFile> m;
@@ -1231,20 +1659,69 @@ std::map<uint32_t, MmioFile> &mmios() {
 }
 uint32_t g_next_mmio = 0x00040004;
 
+// Reads up to n bytes at an absolute offset from either backing store into
+// host memory. Returns the number of bytes read; the file position is left at
+// offset + got.
+uint32_t mmio_read_at(MmioFile &f, uint32_t offset, void *dst, uint32_t n) {
+    if (f.memory) {
+        if (offset >= f.length)
+            return 0;
+        uint32_t avail = f.length - offset;
+        if (n > avail)
+            n = avail;
+        if (!n || !gm_valid(f.buffer + offset, n))
+            return 0;
+        memcpy(dst, g_mem + f.buffer + offset, n);
+        return n;
+    }
+    if (!f.fp || fseek(f.fp, (long)offset, SEEK_SET) != 0)
+        return 0;
+    return (uint32_t)fread(dst, 1, n, f.fp);
+}
+
 void m_mmioOpenA(X86 *c) {
-    std::string name = gm_str(arg(c, 0), 260);
+    uint32_t name_ptr = arg(c, 0);
     uint32_t pinfo = arg(c, 1), flags = arg(c, 2);
     bool write = (flags & 0x00000001) != 0;     // MMIO_WRITE
     bool readwrite = (flags & 0x00000002) != 0; // MMIO_READWRITE
     bool create = (flags & 0x00001000) != 0;    // MMIO_CREATE
 
+    // Memory-file form: a null name and lpmmioinfo naming FOURCC_MEM. The
+    // buffer is MMIOINFO.pchBuffer of cchBuffer. Windows fills the memory
+    // cursors on the way out.
+    if (!name_ptr && pinfo && gm_valid(pinfo, MMIOINFO_SIZE) &&
+        rd32(pinfo + MMIOINFO_OFF_fccIOProc) == FOURCC_MEM) {
+        uint32_t buf = rd32(pinfo + MMIOINFO_OFF_pchBuffer);
+        uint32_t len = rd32(pinfo + MMIOINFO_OFF_cchBuffer);
+        if (!buf || !len || !gm_valid(buf, len)) {
+            wr32(pinfo + MMIOINFO_OFF_wErrorRet, MMIOERR_CANNOTOPEN);
+            set_eax(c, 0);
+            return;
+        }
+        MmioFile f;
+        f.memory = true;
+        f.buffer = buf;
+        f.length = len;
+        f.pos = 0;
+        f.writable = write || readwrite || create;
+        uint32_t h = g_next_mmio;
+        g_next_mmio += 4;
+        mmios()[h] = f;
+        wr32(pinfo + MMIOINFO_OFF_pchNext, buf);
+        wr32(pinfo + MMIOINFO_OFF_pchEndRead, buf + len);
+        wr32(pinfo + MMIOINFO_OFF_pchEndWrite, buf + len);
+        set_eax(c, h);
+        return;
+    }
+
+    std::string name = gm_str(name_ptr, 260);
     std::string host = win32_host_path(name, write || readwrite || create);
     if (recomp_env("TRACE_FILES"))
         LOGW("file: mmioOpen \"%s\" -> \"%s\"", name.c_str(), host.c_str());
     if (host.empty()) {
         LOGV("mmioOpenA(%s): not found", name.c_str());
-        if (pinfo)
-            wr32(pinfo + 4, 258); // MMIOINFO.wErrorRet = MMIOERR_FILENOTFOUND
+        if (pinfo && gm_valid(pinfo, MMIOINFO_SIZE))
+            wr32(pinfo + MMIOINFO_OFF_wErrorRet, MMIOERR_FILENOTFOUND);
         set_eax(c, 0);
         return;
     }
@@ -1255,16 +1732,20 @@ void m_mmioOpenA(X86 *c) {
     FILE *fp = fopen(host.c_str(), mode);
     if (!fp) {
         LOGV("mmioOpenA(%s, mode %s): open failed", name.c_str(), mode);
-        if (pinfo)
-            wr32(pinfo + 4, 262); // MMIOERR_CANNOTOPEN
+        if (pinfo && gm_valid(pinfo, MMIOINFO_SIZE))
+            wr32(pinfo + MMIOINFO_OFF_wErrorRet, MMIOERR_CANNOTOPEN);
         set_eax(c, 0);
         return;
     }
     if (create || write || readwrite)
         win32_invalidate_dir_cache();
+    MmioFile f;
+    f.fp = fp;
+    f.path = host;
+    f.writable = write || readwrite || create;
     uint32_t h = g_next_mmio;
     g_next_mmio += 4;
-    mmios()[h] = MmioFile{fp, host, write || readwrite || create};
+    mmios()[h] = f;
     set_eax(c, h);
 }
 
@@ -1275,12 +1756,23 @@ void m_mmioWrite(X86 *c) {
         set_eax(c, 0xffffffffu);
         return;
     }
-    set_eax(c, (uint32_t)fwrite(g_mem + buf, 1, n, it->second.fp));
+    MmioFile &f = it->second;
+    if (f.memory) {
+        if (f.pos + n < f.pos || f.pos + n > f.length || !gm_valid(f.buffer + f.pos, n)) {
+            set_eax(c, 0);
+            return;
+        }
+        memcpy(g_mem + f.buffer + f.pos, g_mem + buf, n);
+        f.pos += n;
+        set_eax(c, n);
+        return;
+    }
+    set_eax(c, (uint32_t)fwrite(g_mem + buf, 1, n, f.fp));
 }
 
 void m_mmioFlush(X86 *c) {
     auto it = mmios().find(arg(c, 0));
-    if (it != mmios().end())
+    if (it != mmios().end() && !it->second.memory)
         fflush(it->second.fp);
     set_eax(c, 0);
 }
@@ -1292,8 +1784,22 @@ void m_mmioRead(X86 *c) {
         set_eax(c, 0xffffffffu);
         return;
     }
-    size_t got = fread(g_mem + buf, 1, n, it->second.fp);
-    set_eax(c, (uint32_t)got);
+    MmioFile &f = it->second;
+    if (f.memory) {
+        if (f.pos >= f.length) {
+            set_eax(c, 0);
+            return;
+        }
+        uint32_t avail = f.length - f.pos;
+        if (n > avail)
+            n = avail;
+        if (n && gm_valid(f.buffer + f.pos, n))
+            memcpy(g_mem + buf, g_mem + f.buffer + f.pos, n);
+        f.pos += n;
+        set_eax(c, n);
+        return;
+    }
+    set_eax(c, (uint32_t)fread(g_mem + buf, 1, n, f.fp));
 }
 
 void m_mmioSeek(X86 *c) {
@@ -1304,18 +1810,31 @@ void m_mmioSeek(X86 *c) {
         set_eax(c, 0xffffffffu);
         return;
     }
+    MmioFile &f = it->second;
+    if (f.memory) {
+        int64_t base = origin == 1 ? f.pos : origin == 2 ? (int64_t)f.length : 0;
+        int64_t next = base + off;
+        if (next < 0) {
+            set_eax(c, 0xffffffffu);
+            return;
+        }
+        f.pos = (uint32_t)next;
+        set_eax(c, f.pos);
+        return;
+    }
     int whence = origin == 1 ? SEEK_CUR : origin == 2 ? SEEK_END : SEEK_SET;
-    if (fseek(it->second.fp, off, whence) != 0) {
+    if (fseek(f.fp, off, whence) != 0) {
         set_eax(c, 0xffffffffu);
         return;
     }
-    set_eax(c, (uint32_t)ftell(it->second.fp));
+    set_eax(c, (uint32_t)ftell(f.fp));
 }
 
 void m_mmioClose(X86 *c) {
     auto it = mmios().find(arg(c, 0));
     if (it != mmios().end()) {
-        fclose(it->second.fp);
+        if (it->second.fp)
+            fclose(it->second.fp);
         mmios().erase(it);
     }
     set_eax(c, 0);
@@ -1324,6 +1843,86 @@ void m_mmioClose(X86 *c) {
 void m_mmioSetBuffer(X86 *c) {
     set_eax(c, 0);
 } // MMSYSERR_NOERROR
+
+// mmioDescend/hmmio, lpck, lpckParent, fuDescend). Windows walks RIFF chunks:
+// FINDRIFF selects a 'RIFF' whose fccType matches, FINDLIST a 'LIST',
+// FINDCHUNK a ckid, and no flag takes the next chunk at the current offset.
+// With a parent the search is bounded by its data; a chunk not found returns
+// MMIOERR_CHUNKNOTFOUND. cksize counts the bytes after the 8-byte header and
+// includes the form type for RIFF/LIST.
+void m_mmioDescend(X86 *c) {
+    auto it = mmios().find(arg(c, 0));
+    uint32_t pck = arg(c, 1), parent = arg(c, 2), flags = arg(c, 3);
+    if (it == mmios().end() || !pck || !gm_valid(pck, MMCKINFO_SIZE)) {
+        set_eax(c, MMIOERR_CHUNKNOTFOUND);
+        return;
+    }
+    MmioFile &f = it->second;
+    uint32_t want_ckid = rd32(pck + MMCKINFO_OFF_ckid);
+    uint32_t want_fcc = rd32(pck + MMCKINFO_OFF_fccType);
+    uint32_t start = f.pos, end = f.length;
+    if (parent && gm_valid(parent, MMCKINFO_SIZE)) {
+        uint32_t poff = rd32(parent + MMCKINFO_OFF_dwDataOffset);
+        uint32_t psize = rd32(parent + MMCKINFO_OFF_cksize);
+        uint32_t pckid = rd32(parent + MMCKINFO_OFF_ckid);
+        // For a RIFF/LIST parent dwDataOffset points at its form type; the
+        // children begin after it. cksize includes the form type, so the
+        // bound is dwDataOffset + cksize.
+        start = (pckid == FOURCC_RIFF || pckid == FOURCC_LIST) ? poff + 4 : poff;
+        end = poff + psize;
+    }
+    while (start + 8 <= end && start + 8 <= f.length) {
+        uint32_t hdr[2];
+        if (mmio_read_at(f, start, hdr, 8) != 8)
+            break;
+        uint32_t ckid = hdr[0], cksize = hdr[1];
+        bool form = ckid == FOURCC_RIFF || ckid == FOURCC_LIST;
+        uint32_t fcc = 0;
+        if (form && mmio_read_at(f, start + 8, &fcc, 4) != 4)
+            break;
+        bool match;
+        if (flags & MMIO_FINDRIFF)
+            match = ckid == FOURCC_RIFF && fcc == want_fcc;
+        else if (flags & MMIO_FINDLIST)
+            match = ckid == FOURCC_LIST && fcc == want_fcc;
+        else if (flags & MMIO_FINDCHUNK)
+            match = ckid == want_ckid;
+        else
+            match = true;
+        if (match) {
+            wr32(pck + MMCKINFO_OFF_ckid, ckid);
+            wr32(pck + MMCKINFO_OFF_cksize, cksize);
+            if (form)
+                wr32(pck + MMCKINFO_OFF_fccType, fcc);
+            wr32(pck + MMCKINFO_OFF_dwDataOffset, start + 8);
+            wr32(pck + MMCKINFO_OFF_dwFlags, 0);
+            f.pos = start + 8;
+            set_eax(c, 0);
+            return;
+        }
+        uint32_t step = 8 + ((cksize + 1) & ~1u);
+        if (step < 8 || start + step <= start)
+            break;
+        start += step;
+    }
+    set_eax(c, MMIOERR_CHUNKNOTFOUND);
+}
+
+// mmioAscend(hmmio, lpck, fuAscend): move to the byte after the chunk and
+// clear MMIO_DIRTY. The chunk's header is 8 bytes and cksize counts the data.
+void m_mmioAscend(X86 *c) {
+    auto it = mmios().find(arg(c, 0));
+    uint32_t pck = arg(c, 1);
+    if (it == mmios().end() || !pck || !gm_valid(pck, MMCKINFO_SIZE)) {
+        set_eax(c, MMIOERR_CANNOTSEEK);
+        return;
+    }
+    uint32_t off = rd32(pck + MMCKINFO_OFF_dwDataOffset);
+    uint32_t size = rd32(pck + MMCKINFO_OFF_cksize);
+    it->second.pos = off + ((size + 1) & ~1u);
+    wr32(pck + MMCKINFO_OFF_dwFlags, rd32(pck + MMCKINFO_OFF_dwFlags) & ~MMIO_DIRTY);
+    set_eax(c, 0);
+}
 
 // ---------------------------------------------------------------------------
 // MIDI out.
@@ -2055,6 +2654,33 @@ static void a_GetUserNameA(X86 *c) {
     set_eax(c, 1);
 }
 
+// The wide spelling, which LHNetCreateDefaultProfile uses: it passes a 97-TCHAR
+// stack-local buffer and aborts profile creation if this returns zero. The
+// reported size is in TCHARs (7 including the NUL), not bytes, and the buffer
+// receives UTF-16. Identical name and error conventions as the ANSI form.
+static void a_GetUserNameW(X86 *c) {
+    constexpr char16_t name[] = u"Player";
+    constexpr uint32_t required = sizeof name / sizeof name[0];
+    uint32_t out = arg(c, 0), size = arg(c, 1);
+    set_eax(c, 0);
+    if (!size || !gm_valid(size, 4)) {
+        set_last_error(87);
+        return;
+    }
+    uint32_t capacity = rd32(size);
+    wr32(size, required);
+    if (capacity < required) {
+        set_last_error(122);
+        return;
+    }
+    if (!out || !gm_valid(out, required * 2)) {
+        set_last_error(87);
+        return;
+    }
+    memcpy(g_mem + out, name, required * 2);
+    set_eax(c, 1);
+}
+
 // No AVIFile codec adapter is installed yet. Report missing codec support at
 // open instead of inventing a successful file interface and corrupting the
 // caller's stack. The game can follow its normal missing-video path.
@@ -2077,6 +2703,7 @@ static void avi_no_sample(X86 *c) {
 const ImportShim g_misc_shims[] = {
     // ADVAPI32
     {"ADVAPI32.dll", "GetUserNameA", 2, a_GetUserNameA},
+    {"ADVAPI32.dll", "GetUserNameW", 2, a_GetUserNameW},
     {"ADVAPI32.dll", "RegOpenKeyA", 3, a_RegOpenKeyA},
     {"ADVAPI32.dll", "RegOpenKeyExA", 5, a_RegOpenKeyExA},
     {"ADVAPI32.dll", "RegCreateKeyExA", 9, a_RegCreateKeyExA},
@@ -2089,8 +2716,12 @@ const ImportShim g_misc_shims[] = {
     {"ADVAPI32.dll", "RegQueryValueExW", 6, a_RegQueryValueExW},
     {"ADVAPI32.dll", "RegSetValueExW", 6, a_RegSetValueExW},
     {"ADVAPI32.dll", "RegEnumKeyExW", 8, a_RegEnumKeyExW},
+    {"ADVAPI32.dll", "RegEnumKeyA", 4, a_RegEnumKeyA},
+    {"ADVAPI32.dll", "RegEnumValueA", 8, a_RegEnumValueA},
     {"ADVAPI32.dll", "RegEnumValueW", 8, a_RegEnumValueW},
+    {"ADVAPI32.dll", "RegQueryInfoKeyA", 12, a_RegQueryInfoKeyA},
     {"ADVAPI32.dll", "RegQueryInfoKeyW", 12, a_RegQueryInfoKeyW},
+    {"ADVAPI32.dll", "RegDeleteKeyA", 2, a_RegDeleteKeyA},
     {"ADVAPI32.dll", "RegDeleteKeyW", 2, a_RegDeleteKeyW},
     {"ADVAPI32.dll", "RegDeleteValueW", 2, a_RegDeleteValueW},
     {"ADVAPI32.dll", "RegFlushKey", 1, a_RegFlushKey},
@@ -2115,6 +2746,7 @@ const ImportShim g_misc_shims[] = {
     {"ole32.dll", "CoTaskMemAlloc", 1, o_CoTaskMemAlloc},
     {"ole32.dll", "CoTaskMemFree", 1, o_CoTaskMemFree},
     {"ole32.dll", "IsEqualGUID", 2, o_IsEqualGUID},
+    {"ole32.dll", "CoFileTimeToDosDateTime", 3, o_CoFileTimeToDosDateTime},
     {"ole32.dll", "CoUninitialize", 0, o_CoUninitialize},
     {"ole32.dll", "PropVariantClear", 1, o_PropVariantClear},
     {"ole32.dll", "PropVariantCopy", 2, o_PropVariantCopy},
@@ -2126,6 +2758,11 @@ const ImportShim g_misc_shims[] = {
     {"IMM32.dll", "ImmGetCompositionStringA", 4, i_ImmGetCompositionStringA},
     {"IMM32.dll", "ImmGetCandidateListA", 4, i_ImmGetCandidateListA},
     {"IMM32.dll", "ImmSetCompositionWindow", 2, i_ImmSetCompositionWindow},
+    {"IMM32.dll", "ImmAssociateContext", 2, i_ImmAssociateContext},
+    {"IMM32.dll", "ImmCreateContext", 0, i_ImmCreateContext},
+    {"IMM32.dll", "ImmDestroyContext", 1, i_ImmDestroyContext},
+    {"IMM32.dll", "ImmGetProperty", 2, i_ImmGetProperty},
+    {"IMM32.dll", "ImmGetDescriptionA", 3, i_ImmGetDescriptionA},
     // WSOCK32. D3DPopTB.exe imports these five by ordinal, so each shim is
     // registered under both the ordinal the IAT uses and the documented name
     // (which is what GetProcAddress would ask for).
@@ -2143,6 +2780,56 @@ const ImportShim g_misc_shims[] = {
     {"WSOCK32.dll", "ord111", 0, w_WSAGetLastError},
     {"WSOCK32.dll", "WSASetLastError", 1, w_WSASetLastError},
     {"WSOCK32.dll", "ord112", 1, w_WSASetLastError},
+    // The rest of the Winsock 1.1 surface follows the same offline rules as
+    // WS2_32 above (same ordinals, same handlers).
+    {"WSOCK32.dll", "gethostbyaddr", 3, w_gethostbyaddr},
+    {"WSOCK32.dll", "ord51", 3, w_gethostbyaddr},
+    {"WSOCK32.dll", "htonl", 1, w_htonl},
+    {"WSOCK32.dll", "ord8", 1, w_htonl},
+    {"WSOCK32.dll", "htons", 1, w_htons},
+    {"WSOCK32.dll", "ord9", 1, w_htons},
+    {"WSOCK32.dll", "inet_addr", 1, w_inet_addr},
+    {"WSOCK32.dll", "ord10", 1, w_inet_addr},
+    {"WSOCK32.dll", "ntohl", 1, w_ntohl},
+    {"WSOCK32.dll", "ord14", 1, w_ntohl},
+    {"WSOCK32.dll", "ntohs", 1, w_ntohs},
+    {"WSOCK32.dll", "ord15", 1, w_ntohs},
+    {"WSOCK32.dll", "socket", 3, w_socket},
+    {"WSOCK32.dll", "ord23", 3, w_socket},
+    {"WSOCK32.dll", "bind", 3, w_bind},
+    {"WSOCK32.dll", "ord2", 3, w_bind},
+    {"WSOCK32.dll", "connect", 3, w_connect},
+    {"WSOCK32.dll", "ord4", 3, w_connect},
+    {"WSOCK32.dll", "listen", 2, w_listen},
+    {"WSOCK32.dll", "ord13", 2, w_listen},
+    {"WSOCK32.dll", "accept", 3, w_accept},
+    {"WSOCK32.dll", "ord1", 3, w_accept},
+    {"WSOCK32.dll", "send", 4, w_send},
+    {"WSOCK32.dll", "ord19", 4, w_send},
+    {"WSOCK32.dll", "recv", 4, w_recv},
+    {"WSOCK32.dll", "ord16", 4, w_recv},
+    {"WSOCK32.dll", "sendto", 6, w_sendto},
+    {"WSOCK32.dll", "ord20", 6, w_sendto},
+    {"WSOCK32.dll", "recvfrom", 6, w_recvfrom},
+    {"WSOCK32.dll", "ord17", 6, w_recvfrom},
+    {"WSOCK32.dll", "select", 5, w_select},
+    {"WSOCK32.dll", "ord18", 5, w_select},
+    {"WSOCK32.dll", "shutdown", 2, w_shutdown},
+    {"WSOCK32.dll", "ord22", 2, w_shutdown},
+    {"WSOCK32.dll", "closesocket", 1, w_closesocket},
+    {"WSOCK32.dll", "ord3", 1, w_closesocket},
+    {"WSOCK32.dll", "ioctlsocket", 3, w_ioctlsocket},
+    {"WSOCK32.dll", "ord12", 3, w_ioctlsocket},
+    {"WSOCK32.dll", "getsockopt", 5, w_getsockopt},
+    {"WSOCK32.dll", "ord7", 5, w_getsockopt},
+    {"WSOCK32.dll", "setsockopt", 5, w_setsockopt},
+    {"WSOCK32.dll", "ord21", 5, w_setsockopt},
+    {"WSOCK32.dll", "getpeername", 3, w_getpeername},
+    {"WSOCK32.dll", "ord5", 3, w_getpeername},
+    {"WSOCK32.dll", "getsockname", 3, w_getsockname},
+    {"WSOCK32.dll", "ord6", 3, w_getsockname},
+    {"WSOCK32.dll", "__WSAFDIsSet", 2, w_wsa_fd_is_set},
+    {"WSOCK32.dll", "ord151", 2, w_wsa_fd_is_set},
     // WINMM: implemented
     {"WINMM.dll", "timeGetTime", 0, m_timeGetTime},
     {"WINMM.dll", "timeGetDevCaps", 2, m_timeGetDevCaps},
@@ -2157,6 +2844,8 @@ const ImportShim g_misc_shims[] = {
     {"WINMM.dll", "mmioOpenA", 3, m_mmioOpenA},
     {"WINMM.dll", "mmioRead", 3, m_mmioRead},
     {"WINMM.dll", "mmioSeek", 3, m_mmioSeek},
+    {"WINMM.dll", "mmioDescend", 4, m_mmioDescend},
+    {"WINMM.dll", "mmioAscend", 3, m_mmioAscend},
     {"WINMM.dll", "mmioClose", 2, m_mmioClose},
     {"WINMM.dll", "mmioSetBuffer", 4, m_mmioSetBuffer},
     // Not imported by this EXE, but mmio is only coherent with both halves.
@@ -2243,38 +2932,84 @@ const ImportShim g_misc_shims[] = {
     {"WINMM.dll", "waveInStop", 1, nullptr},
     {"WINMM.dll", "waveInReset", 1, nullptr},
     {"WINMM.dll", "waveInGetPosition", 3, nullptr},
-    // Winsock 2: networking is out of scope, but the pop counts are not.
-    {"WS2_32.dll", "WSAStartup", 2, nullptr},
-    {"WS2_32.dll", "WSACleanup", 0, nullptr},
-    {"WS2_32.dll", "WSAGetLastError", 0, nullptr},
-    {"WS2_32.dll", "WSAIoctl", 9, nullptr},
-    {"WS2_32.dll", "WSACreateEvent", 0, nullptr},
-    {"WS2_32.dll", "WSACloseEvent", 1, nullptr},
-    {"WS2_32.dll", "WSASetEvent", 1, nullptr},
-    {"WS2_32.dll", "WSAResetEvent", 1, nullptr},
-    {"WS2_32.dll", "WSAWaitForMultipleEvents", 5, nullptr},
-    {"WS2_32.dll", "WSARecv", 7, nullptr},
-    {"WS2_32.dll", "WSARecvFrom", 9, nullptr},
-    {"WS2_32.dll", "WSAGetOverlappedResult", 5, nullptr},
-    {"WS2_32.dll", "socket", 3, nullptr},
-    {"WS2_32.dll", "bind", 3, nullptr},
-    {"WS2_32.dll", "connect", 3, nullptr},
-    {"WS2_32.dll", "listen", 2, nullptr},
-    {"WS2_32.dll", "accept", 3, nullptr},
-    {"WS2_32.dll", "send", 4, nullptr},
-    {"WS2_32.dll", "recv", 4, nullptr},
-    {"WS2_32.dll", "sendto", 6, nullptr},
-    {"WS2_32.dll", "recvfrom", 6, nullptr},
-    {"WS2_32.dll", "select", 5, nullptr},
-    {"WS2_32.dll", "shutdown", 2, nullptr},
-    {"WS2_32.dll", "closesocket", 1, nullptr},
-    {"WS2_32.dll", "ioctlsocket", 3, nullptr},
-    {"WS2_32.dll", "getsockopt", 5, nullptr},
-    {"WS2_32.dll", "setsockopt", 5, nullptr},
-    {"WS2_32.dll", "getpeername", 3, nullptr},
-    {"WS2_32.dll", "getsockname", 3, nullptr},
-    {"WS2_32.dll", "gethostbyname", 1, nullptr},
-    {"WS2_32.dll", "gethostname", 2, nullptr},
+    // Winsock 2, offline. LHMultiplayerR delay-loads this DLL by ordinal, so
+    // its ImgDelayDescr names ordinals rather than names; the table below
+    // covers exactly that ordinal set (plus the byte-order twins). WSAStartup
+    // and WSACleanup share the WSOCK32 implementation. Every call that would
+    // open or use a socket returns the real offline failure; name lookups
+    // resolve localhost only; the byte-order and address utilities are exact.
+    // See the offline-Winsock block above; networking is a deferred gap.
+    {"WS2_32.dll", "WSAStartup", 2, w_WSAStartup},
+    {"WS2_32.dll", "ord115", 2, w_WSAStartup},
+    {"WS2_32.dll", "WSACleanup", 0, w_WSACleanup},
+    {"WS2_32.dll", "ord116", 0, w_WSACleanup},
+    {"WS2_32.dll", "WSAGetLastError", 0, w_WSAGetLastError},
+    {"WS2_32.dll", "ord111", 0, w_WSAGetLastError},
+    {"WS2_32.dll", "WSASetLastError", 1, w_WSASetLastError},
+    {"WS2_32.dll", "ord112", 1, w_WSASetLastError},
+    {"WS2_32.dll", "accept", 3, w_accept},
+    {"WS2_32.dll", "ord1", 3, w_accept},
+    {"WS2_32.dll", "bind", 3, w_bind},
+    {"WS2_32.dll", "ord2", 3, w_bind},
+    {"WS2_32.dll", "closesocket", 1, w_closesocket},
+    {"WS2_32.dll", "ord3", 1, w_closesocket},
+    {"WS2_32.dll", "connect", 3, w_connect},
+    {"WS2_32.dll", "ord4", 3, w_connect},
+    {"WS2_32.dll", "getpeername", 3, w_getpeername},
+    {"WS2_32.dll", "ord5", 3, w_getpeername},
+    {"WS2_32.dll", "getsockname", 3, w_getsockname},
+    {"WS2_32.dll", "ord6", 3, w_getsockname},
+    {"WS2_32.dll", "getsockopt", 5, w_getsockopt},
+    {"WS2_32.dll", "ord7", 5, w_getsockopt},
+    {"WS2_32.dll", "htonl", 1, w_htonl},
+    {"WS2_32.dll", "ord8", 1, w_htonl},
+    {"WS2_32.dll", "htons", 1, w_htons},
+    {"WS2_32.dll", "ord9", 1, w_htons},
+    {"WS2_32.dll", "inet_addr", 1, w_inet_addr},
+    {"WS2_32.dll", "ord10", 1, w_inet_addr},
+    {"WS2_32.dll", "inet_ntoa", 1, w_inet_ntoa},
+    {"WS2_32.dll", "ord11", 1, w_inet_ntoa},
+    {"WS2_32.dll", "ioctlsocket", 3, w_ioctlsocket},
+    {"WS2_32.dll", "ord12", 3, w_ioctlsocket},
+    {"WS2_32.dll", "listen", 2, w_listen},
+    {"WS2_32.dll", "ord13", 2, w_listen},
+    {"WS2_32.dll", "ntohl", 1, w_ntohl},
+    {"WS2_32.dll", "ord14", 1, w_ntohl},
+    {"WS2_32.dll", "ntohs", 1, w_ntohs},
+    {"WS2_32.dll", "ord15", 1, w_ntohs},
+    {"WS2_32.dll", "recv", 4, w_recv},
+    {"WS2_32.dll", "ord16", 4, w_recv},
+    {"WS2_32.dll", "recvfrom", 6, w_recvfrom},
+    {"WS2_32.dll", "ord17", 6, w_recvfrom},
+    {"WS2_32.dll", "select", 5, w_select},
+    {"WS2_32.dll", "ord18", 5, w_select},
+    {"WS2_32.dll", "send", 4, w_send},
+    {"WS2_32.dll", "ord19", 4, w_send},
+    {"WS2_32.dll", "sendto", 6, w_sendto},
+    {"WS2_32.dll", "ord20", 6, w_sendto},
+    {"WS2_32.dll", "setsockopt", 5, w_setsockopt},
+    {"WS2_32.dll", "ord21", 5, w_setsockopt},
+    {"WS2_32.dll", "shutdown", 2, w_shutdown},
+    {"WS2_32.dll", "ord22", 2, w_shutdown},
+    {"WS2_32.dll", "socket", 3, w_socket},
+    {"WS2_32.dll", "ord23", 3, w_socket},
+    {"WS2_32.dll", "gethostbyaddr", 3, w_gethostbyaddr},
+    {"WS2_32.dll", "ord51", 3, w_gethostbyaddr},
+    {"WS2_32.dll", "gethostbyname", 1, w_gethostbyname},
+    {"WS2_32.dll", "ord52", 1, w_gethostbyname},
+    {"WS2_32.dll", "gethostname", 2, w_gethostname},
+    {"WS2_32.dll", "ord57", 2, w_gethostname},
+    {"WS2_32.dll", "__WSAFDIsSet", 2, w_wsa_fd_is_set},
+    {"WS2_32.dll", "ord151", 2, w_wsa_fd_is_set},
+    {"WS2_32.dll", "WSAIoctl", 9, w_WSAIoctl},
+    {"WS2_32.dll", "WSACreateEvent", 0, w_WSACreateEvent},
+    {"WS2_32.dll", "WSACloseEvent", 1, w_WSACloseEvent},
+    {"WS2_32.dll", "WSASetEvent", 1, w_WSASetEvent},
+    {"WS2_32.dll", "WSAResetEvent", 1, w_WSAResetEvent},
+    {"WS2_32.dll", "WSAWaitForMultipleEvents", 5, w_WSAWaitForMultipleEvents},
+    {"WS2_32.dll", "WSARecv", 7, w_WSARecv},
+    {"WS2_32.dll", "WSARecvFrom", 9, w_WSARecvFrom},
+    {"WS2_32.dll", "WSAGetOverlappedResult", 5, w_WSAGetOverlappedResult},
     {"NETAPI32.dll", "Netbios", 1, nullptr},
     {"DDRAW.dll", "DirectDrawCreate", 3, nullptr},
     {"DDRAW.dll", "DirectDrawEnumerateA", 2, nullptr},
@@ -2306,6 +3041,7 @@ const ImportShim g_misc_shims[] = {
     {"QMIXER.dll", "QSWaveMixPauseChannel", 3, nullptr},
     {"QMIXER.dll", "QSWaveMixStopChannel", 3, nullptr},
     {"QMIXER.dll", "QSWaveMixConfigureChannel", 5, nullptr},
+    {"QMIXER.dll", "QSWaveMixGetChannelParams", 3, nullptr},
     {"QMIXER.dll", "QSWaveMixEnableChannel", 4, nullptr},
     {"QMIXER.dll", "QSWaveMixOpenWaveEx", 3, nullptr},
     {"QMIXER.dll", "QSWaveMixFreeWave", 2, nullptr},

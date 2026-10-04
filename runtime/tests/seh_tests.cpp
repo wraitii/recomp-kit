@@ -252,6 +252,44 @@ static void null_call_faults() {
     wr32(c.fs_base, 0xffffffff);
 }
 
+// A DIV/IDIV by zero raises #DE. Windows delivers it to the guest's handlers
+// as STATUS_INTEGER_DIVIDE_BY_ZERO, with the faulting instruction in both the
+// exception record and the context, and no ExceptionInformation. The quotient
+// is never computed and the registers are the ones the fault found.
+static uint32_t div_faults;
+static constexpr uint32_t DIV_FAULT_EIP = 0x005bb5df;
+static void record_div_fault(X86 *c, uint32_t record, uint32_t context) {
+    ++div_faults;
+    CHECK(rd32(record) == 0xc0000094u);
+    CHECK(rd32(record + 4) == 0);
+    CHECK(rd32(record + 8) == 0);
+    CHECK(rd32(record + 12) == DIV_FAULT_EIP);
+    CHECK(rd32(record + 16) == 0);
+    CHECK(rd32(context + 0xa8) == 0);             // EDX
+    CHECK(rd32(context + 0xb0) == 0x0000893eu);   // EAX: the untouched dividend
+    CHECK(rd32(context + 0xb8) == DIV_FAULT_EIP); // context Eip: the DIV itself
+}
+static void div_error_faults() {
+    X86 c;
+    loader_init_context(&c);
+    clear_observations();
+    div_faults = 0;
+    uint32_t reg = c.r[R_ESP] - 32;
+    registration(&c, reg, 0xffffffff, handler_search);
+    c.r[R_ESP] = reg - 4;
+    c.r[R_EAX] = 0x0000893eu;
+    c.r[R_EDX] = 0;
+    c.eip = 0; // stale: the fault address must come from the caller, not EIP
+    recomp_seh_test_unhandled_hook(record_div_fault);
+    recomp_div_error(&c, DIV_FAULT_EIP);
+    CHECK(visits == 1 && seen[0] == reg && div_faults == 1);
+    CHECK(c.r[R_EAX] == 0x0000893eu && c.r[R_EDX] == 0);
+    recomp_seh_test_unhandled_hook(nullptr);
+    clear_observations();
+    c.r[R_ESP] = reg + 4;
+    wr32(c.fs_base, 0xffffffff);
+}
+
 static void unwind_and_leave() {
     X86 c;
     loader_init_context(&c);
@@ -669,6 +707,7 @@ int main(int argc, char **argv) {
     delay_load_return();
     chain_walk();
     null_call_faults();
+    div_error_faults();
     unwind_and_leave();
     landing();
     adopted_landing();

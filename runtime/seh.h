@@ -30,6 +30,10 @@ void recomp_seh_callback_leave(X86 *c, uint32_t depth);
 /* Returns zero for an exhausted chain; kernel32 retains its abort diagnostics.
  * A nonzero return is possible only through the test-only unhandled hook. */
 int recomp_seh_raise(X86 *c, uint32_t code, uint32_t flags, uint32_t nargs, uint32_t args);
+/* A CPU fault (#DE, ...): the record's ExceptionAddress and the context's Eip
+ * name the faulting instruction, not the return address RaiseException sits
+ * at, and there is no ExceptionInformation. */
+int recomp_seh_raise_fault(X86 *c, uint32_t code, uint32_t fault_eip);
 void recomp_seh_unwind(X86 *c, uint32_t target, uint32_t target_ip, uint32_t record,
                        uint32_t retval);
 

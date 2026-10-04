@@ -385,11 +385,14 @@ void load_image_a(X86 *c) {
         }
     }
     fclose(f);
-    GdiImage image;
-    bool ok = temp && gdi_decode_image(temp + 14, uint32_t(n) - 14, &image, rd32(temp + 10) - 14);
+    // LR_CREATEDIBSECTION returns a DIB section in the file's own format. The
+    // font loader's ToSprites walks the bits as packed 24-bpp, so the depth has
+    // to survive; gdi_image_bitmap would force it to 32-bpp.
+    uint32_t bitmap =
+        temp ? gdi_create_dib_from_memory(temp + 14, uint32_t(n) - 14, rd32(temp + 10) - 14) : 0;
     if (temp)
         heap_free(temp);
-    set_eax(c, ok ? gdi_image_bitmap(image) : 0);
+    set_eax(c, bitmap);
 }
 void draw_text(X86 *c) {
     set_eax(c, gdi::draw_text(arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4)));

@@ -757,18 +757,27 @@ static void test_loader() {
             uint32_t data = imports_data_address(import.dll.c_str(), import.name.c_str());
             uint32_t trampoline = imports_trampoline_for(import.dll.c_str(), import.name.c_str());
             uint32_t value = rd32(import.slot);
+            // A Lionhead import resolves to the address of a translated export
+            // inside an auxiliary module, not to a trampoline. Accept either.
+            const LoaderModule *module = loader_module_containing(value);
+            bool aux_export = module && module->base != loader_image_base();
+            bool ok;
             if (data) {
                 ++data_slots;
-                iat_ok &= value == data && !imports_is_trampoline(value);
+                ok = value == data && !imports_is_trampoline(value);
+            } else if (aux_export) {
+                ok = value != 0;
             } else {
-                iat_ok &= value == trampoline && imports_is_trampoline(value) &&
-                          imports_describe(value) != nullptr;
+                ok = value == trampoline && imports_is_trampoline(value) &&
+                     imports_describe(value) != nullptr;
             }
-            if (value != (data ? data : trampoline))
+            iat_ok &= ok;
+            if (!ok)
                 printf("  IAT mismatch at %08x for %s!%s\n", import.slot, import.dll.c_str(),
                        import.name.c_str());
         }
-        check(iat_ok, "every PE import slot holds its symbol's trampoline or data storage");
+        check(iat_ok,
+              "every PE import slot holds its symbol's trampoline, data storage or aux export");
         check(loader_iat_data_imports() == data_slots,
               "%u IAT slots hold data symbols (expected %u)", loader_iat_data_imports(),
               data_slots);
@@ -820,6 +829,27 @@ static void test_loader() {
         remove_tree(bad_dir);
     }
     check(loader_load(nullptr), "reloaded the correct image");
+
+    // A module given a base different from its PE preferred base is rebased by
+    // the loader the same way the translator's Image rebases the listing. The
+    // scratch region is the gap between the image and the heap, zero-filled by
+    // mem_init and not owned by the allocator.
+    section("auxiliary module base relocation");
+    const uint32_t scratch = 0x00fe0000u, scratch_size = 0x2000u;
+    memset(g_mem + scratch, 0, scratch_size);
+    wr32(scratch + 0x1000, 0x1800); // relocation page RVA
+    wr32(scratch + 0x1004, 10);     // block header plus one entry
+    uint16_t entry = 0x3010;        // IMAGE_REL_BASED_HIGHLOW at page + 0x10
+    memcpy(g_mem + scratch + 0x1008, &entry, sizeof entry);
+    wr32(scratch + 0x1810, 0x00400000); // an absolute dword to move
+    check(loader_test_relocate(scratch, 0x00400000, scratch_size, 0x1000, 10),
+          "rebase a HIGHLOW site from the image's preferred base: %s", loader_error());
+    check(rd32(scratch + 0x1810) == 0x00400000 + (scratch - 0x00400000),
+          "the relocation moved the dword by base - preferred");
+    check(!loader_test_relocate(scratch, 0x00400000, scratch_size, 0, 0),
+          "a rebase with no relocation table is refused: %s", loader_error());
+    check(loader_test_relocate(scratch, 0x00400000, scratch_size, 0x1000, 10),
+          "the refused probe did not disturb the table");
 }
 
 // The recorded lines of a discovery file, without its comment header.
@@ -1414,6 +1444,14 @@ static void test_files(X86 *c) {
     check(cwd_probe == (uint32_t)strlen(RECOMP_GUEST_ROOT) + 1,
           "GetCurrentDirectoryA(1, buf) reports the required size (%u)", cwd_probe);
 
+    // GetTempPathA: virtual directory with a trailing backslash; the return
+    // is the length without the null, or the required size when too small.
+    uint32_t tl = call_import(c, "KERNEL32.dll", "GetTempPathA", {260, pathbuf});
+    check(gm_str(pathbuf) == "C:\\Windows\\Temp\\" && tl == gm_str(pathbuf).size(),
+          "GetTempPathA -> \"%s\" (%u)", gm_str(pathbuf).c_str(), tl);
+    uint32_t tprobe = call_import(c, "KERNEL32.dll", "GetTempPathA", {1, pathbuf});
+    check(tprobe == tl + 1, "GetTempPathA(1, buf) reports the required size (%u)", tprobe);
+
     // The path GetModuleFileNameA hands out must open, whatever the guest
     // root's shape: a game installed under C:\GOG Games\<name> spells its
     // own files through two root components, not one.
@@ -1878,6 +1916,18 @@ static void test_misc_shims(X86 *c) {
 // checks both, plus the thread-local stability Winsock promises.
 static void test_winsock_resolver(X86 *c) {
     section("Winsock name resolution");
+    // ws2_32 ordinal 115 is WSAStartup. A game may LoadLibrary("ws2_32.dll")
+    // and resolve it by ordinal, so the ordinal spelling must reach the same
+    // trampoline as the name, and the WSADATA must be filled.
+    uint32_t wsa_name = put_str("ws2_32.dll");
+    uint32_t wsa = call_import(c, "KERNEL32.dll", "LoadLibraryA", {wsa_name});
+    check(wsa != 0 && call_import(c, "KERNEL32.dll", "GetProcAddress", {wsa, 115}) != 0,
+          "GetProcAddress(ws2_32, ordinal 115) resolves WSAStartup");
+    uint32_t wsa_data = scratch_block(400);
+    memset(g_mem + wsa_data, 0xaa, 400);
+    check(call_import(c, "WS2_32.dll", "ord115", {0x0202, wsa_data}) == 0 &&
+              rd16(wsa_data) == 0x0202 && rd16(wsa_data + 2) == 0x0202,
+          "WSAStartup by ordinal fills WSADATA and succeeds");
     uint32_t namebuf = scratch_block(256);
     check(call_import(c, "WSOCK32.dll", "gethostname", {namebuf, 256}) == 0 &&
               gm_str(namebuf).size() > 0,
@@ -1903,6 +1953,30 @@ static void test_winsock_resolver(X86 *c) {
           "an unresolvable name returns NULL");
     check(call_import(c, "WSOCK32.dll", "WSAGetLastError", {}) == 11001,
           "WSAGetLastError reports WSAHOST_NOT_FOUND");
+    check(call_import(c, "WS2_32.dll", "ord116", {}) == 0, "WSACleanup by ordinal succeeds");
+    // Offline socket calls fail the way the real stack does with no adapter:
+    // SOCKET_ERROR/INVALID_SOCKET plus a WSAGetLastError a caller can act on.
+    check(call_import(c, "WS2_32.dll", "ord23", {2, 2, 0}) == 0xffffffffu &&
+              call_import(c, "WS2_32.dll", "WSAGetLastError", {}) == 10050,
+          "socket() fails offline with INVALID_SOCKET and WSAENETDOWN");
+    check(call_import(c, "WSOCK32.dll", "connect", {0xffffffffu, 0, 16}) == 0xffffffffu &&
+              call_import(c, "WSOCK32.dll", "WSAGetLastError", {}) == 10051,
+          "connect() fails offline with SOCKET_ERROR and WSAENETUNREACH");
+    check(call_import(c, "WS2_32.dll", "gethostbyaddr", {0, 0, 0}) == 0,
+          "gethostbyaddr returns NULL offline");
+    check(call_import(c, "WSOCK32.dll", "htonl", {0x01020304u}) == 0x04030201u &&
+              call_import(c, "WSOCK32.dll", "ntohl", {0x01020304u}) == 0x04030201u &&
+              call_import(c, "WSOCK32.dll", "htons", {0x0102u}) == 0x0201u,
+          "byte-order helpers are exact");
+    check(call_import(c, "WSOCK32.dll", "inet_addr", {put_str("127.0.0.1")}) == 0x0100007fu &&
+              call_import(c, "WSOCK32.dll", "inet_addr", {put_str("not.an.ip")}) == 0xffffffffu,
+          "inet_addr parses a dotted quad and rejects anything else");
+    uint32_t fdset = scratch_block(8);
+    wr32(fdset, 1);
+    wr32(fdset + 4, 0x1234);
+    check(call_import(c, "WS2_32.dll", "__WSAFDIsSet", {0x1234, fdset}) == 1 &&
+              call_import(c, "WS2_32.dll", "__WSAFDIsSet", {0x9999, fdset}) == 0,
+          "__WSAFDIsSet reports membership");
 }
 
 // What a C++ throw looks like from the runtime: the MSVC exception record
@@ -2444,6 +2518,20 @@ static void test_windows(X86 *c) {
     check(call_import(c, "USER32.dll", "PeekMessageA", {msg, 0, 0, 0, 1}) == 1 &&
               rd32(msg + 4) == 0x0102 && rd32(msg + 8) == 'a',
           "the WM_CHAR carries 'a'");
+
+    // A host that already queued the WM_CHAR behind the keystroke: translating
+    // the keystroke must not produce a second character.
+    host_post_message(hwnd, 0x0100, 0x41, 0);
+    host_post_message(hwnd, 0x0102, 'a', 0);
+    check(call_import(c, "USER32.dll", "GetMessageA", {msg, 0, 0, 0}) == 1 &&
+              rd32(msg + 4) == 0x0100,
+          "GetMessageA returns the host's WM_KEYDOWN");
+    call_import(c, "USER32.dll", "TranslateMessage", {msg});
+    check(call_import(c, "USER32.dll", "PeekMessageA", {msg, 0, 0, 0, 1}) == 1 &&
+              rd32(msg + 4) == 0x0102 && rd32(msg + 8) == 'a',
+          "the host's WM_CHAR is delivered");
+    check(call_import(c, "USER32.dll", "PeekMessageA", {msg, 0, 0, 0, 1}) == 0,
+          "TranslateMessage did not queue a second WM_CHAR for the same keystroke");
 
     // Message filters, and an empty queue reports the documented error rather
     // than a message the system never sent.
@@ -3667,6 +3755,16 @@ static void test_callbacks(X86 *c) {
           "DefWindowProcA answers WM_NCCREATE with TRUE");
     while (call_import(c, "USER32.dll", "PeekMessageA", {msg, dhwnd, 0x0003, 0x0005, 1})) {
     }
+    // WM_SYSCOMMAND/SC_CLOSE through DefWindowProc becomes WM_CLOSE, which
+    // destroys the window (a window procedure that delegates it, as this one
+    // does, ends up closed; one that intercepts SC_CLOSE never gets here).
+    check(call_import(c, "USER32.dll", "IsWindow", {dhwnd}) == 1, "the window is live");
+    call_import(c, "USER32.dll", "DefWindowProcA", {dhwnd, 0x0112, 0xf060, 0});
+    check(call_import(c, "USER32.dll", "IsWindow", {dhwnd}) == 0,
+          "DefWindowProcA turns SC_CLOSE into WM_CLOSE and the window is destroyed");
+    // The close also queued WM_QUIT (and window messages); leave the queue as found.
+    while (call_import(c, "USER32.dll", "PeekMessageA", {msg, 0, 0, 0, 1})) {
+    }
     call_import(c, "USER32.dll", "DestroyWindow", {dhwnd});
 
     // WM_QUIT reaches the guest whatever the filter says.
@@ -3836,6 +3934,22 @@ static void test_startup_apis(X86 *c) {
           "user name includes terminator in returned size");
     check(call_import(c, "ADVAPI32.dll", "GetUserNameA", {out, 0}) == 0 && get_last_error() == 87,
           "user name rejects an invalid size pointer");
+    uint32_t wout = scratch_block(32), wsize = scratch_block(4);
+    wr32(wsize, 2);
+    wr32(wout, 0xabababab);
+    check(call_import(c, "ADVAPI32.dll", "GetUserNameW", {wout, wsize}) == 0 && rd32(wsize) == 7 &&
+              rd32(wout) == 0xabababab && get_last_error() == 122,
+          "wide user name reports the required TCHAR count without truncating");
+    wr32(wsize, 7);
+    check(call_import(c, "ADVAPI32.dll", "GetUserNameW", {wout, wsize}) == 1 &&
+              gm_wstr(wout) == "Player" && rd32(wsize) == 7 && rd16(wout + 12) == 0,
+          "wide user name writes UTF-16 and includes the terminator in the size");
+    check(call_import(c, "ADVAPI32.dll", "GetUserNameW", {wout, 0}) == 0 && get_last_error() == 87,
+          "wide user name rejects an invalid size pointer");
+    wr32(wout, 0xdeadbeef);
+    check(call_import(c, "ADVAPI32.dll", "GetUserNameW", {0, wsize}) == 0 &&
+              get_last_error() == 87 && rd32(wout) == 0xdeadbeef,
+          "wide user name rejects a null buffer without touching memory");
     wr32(out, 0xdeadbeef);
     check(call_import(c, "AVIFIL32.dll", "AVIFileOpenA", {out, 0, 0, 0}) == 0x80040154u &&
               rd32(out) == 0,
@@ -3958,6 +4072,19 @@ static void test_registry(X86 *c) {
           "RegQueryValueExA(Detail)");
     check(rd32(ptype) == 4 && rd32(pbuf) == 3, "the DWORD round tripped as %u", rd32(pbuf));
 
+    // RegEnumValue reports values in creation order, which survives the reload:
+    // InstallPath was created before Detail, and alphabetical order would put
+    // Detail first (Black & White's settings reader depends on the real order).
+    uint32_t ename = scratch_block(64), elen = scratch_block(4);
+    wr32(elen, 64);
+    check(call_import(c, "ADVAPI32.dll", "RegEnumValueA", {hk2, 0, ename, elen, 0, 0, 0, 0}) == 0 &&
+              gm_str(ename) == "InstallPath",
+          "RegEnumValueA index 0 is the first value created: \"%s\"", gm_str(ename).c_str());
+    wr32(elen, 64);
+    check(call_import(c, "ADVAPI32.dll", "RegEnumValueA", {hk2, 1, ename, elen, 0, 0, 0, 0}) == 0 &&
+              gm_str(ename) == "Detail",
+          "RegEnumValueA index 1 is the second: \"%s\"", gm_str(ename).c_str());
+
     uint32_t mixed_key = put_str("SOFTWARE\\recomptests\\REGISTRY");
     uint32_t phk3 = scratch_block(4);
     check(call_import(c, "ADVAPI32.dll", "RegOpenKeyExA",
@@ -3976,6 +4103,119 @@ static void test_registry(X86 *c) {
               2,
           "a missing value reports ERROR_FILE_NOT_FOUND");
     call_import(c, "ADVAPI32.dll", "RegCloseKey", {hk2});
+
+    // Windows creates every missing ancestor on a create, and a key that exists
+    // only as the parent of stored descendants still opens. LHMultiplayerR
+    // lists profiles by opening HKCU\...\LHMultiplayer\Profiles and enumerating
+    // it with the ANSI APIs, while LHLogR's RegistrySetVal creates only the
+    // leaf. Missing this made every launch look like the first (no profiles) and
+    // restart the new-profile flow.
+    uint32_t deep = put_str("Software\\RecompTests\\Registry\\AncestorTest\\Profile");
+    uint32_t dphk = scratch_block(4), dpdisp = scratch_block(4);
+    check(call_import(c, "ADVAPI32.dll", "RegCreateKeyExA",
+                      {0x80000002u, deep, 0, 0, 0, 0xf003f, 0, dphk, dpdisp}) == 0,
+          "create a deep leaf key");
+    call_import(c, "ADVAPI32.dll", "RegCloseKey", {rd32(dphk)});
+    uint32_t parent = put_str("Software\\RecompTests\\Registry\\AncestorTest");
+    uint32_t pphk = scratch_block(4);
+    check(call_import(c, "ADVAPI32.dll", "RegOpenKeyA", {0x80000002u, parent, pphk}) == 0,
+          "the unnamed parent of the leaf opens");
+    uint32_t qcount = scratch_block(4), qmax = scratch_block(4), qname = scratch_block(64),
+             qlen = scratch_block(4);
+    check(call_import(c, "ADVAPI32.dll", "RegQueryInfoKeyA",
+                      {rd32(pphk), 0, 0, 0, qcount, qmax, 0, 0, 0, 0, 0, 0}) == 0 &&
+              rd32(qcount) == 1,
+          "RegQueryInfoKeyA counts the child");
+    // cchName is the buffer size by value (not a pointer), including the NUL.
+    check(call_import(c, "ADVAPI32.dll", "RegEnumKeyA", {rd32(pphk), 0, qname, 7}) == 234,
+          "RegEnumKeyA reports ERROR_MORE_DATA when the NUL does not fit");
+    check(call_import(c, "ADVAPI32.dll", "RegEnumKeyA", {rd32(pphk), 0, qname, 8}) == 0 &&
+              gm_str(qname) == "Profile",
+          "RegEnumKeyA returns the child name");
+    check(call_import(c, "ADVAPI32.dll", "RegEnumKeyA", {rd32(pphk), 1, qname, 64}) == 259,
+          "RegEnumKeyA ends with ERROR_NO_MORE_ITEMS");
+    call_import(c, "ADVAPI32.dll", "RegCloseKey", {rd32(pphk)});
+
+    // RegDeleteKeyA is the ANSI spelling LHNetDeleteProfile reaches. It must
+    // delete a leaf key, refuse a key that still has subkeys with
+    // ERROR_ACCESS_DENIED (Windows NT semantics; there is no recursive form),
+    // and report a missing key as ERROR_FILE_NOT_FOUND.
+    uint32_t del_path = put_str("Software\\RecompTests\\Registry\\DeleteMe");
+    uint32_t delphk = scratch_block(4), deldisp = scratch_block(4);
+    check(call_import(c, "ADVAPI32.dll", "RegCreateKeyExA",
+                      {0x80000002u, del_path, 0, 0, 0, 0xf003f, 0, delphk, deldisp}) == 0,
+          "create the key to delete");
+    call_import(c, "ADVAPI32.dll", "RegCloseKey", {rd32(delphk)});
+    check(call_import(c, "ADVAPI32.dll", "RegDeleteKeyA", {0x80000002u, del_path}) == 0,
+          "RegDeleteKeyA removes a leaf key");
+    uint32_t delgone = scratch_block(4);
+    check(call_import(c, "ADVAPI32.dll", "RegOpenKeyA", {0x80000002u, del_path, delgone}) == 2,
+          "the deleted key no longer opens");
+    check(call_import(c, "ADVAPI32.dll", "RegDeleteKeyA", {0x80000002u, del_path}) == 2,
+          "RegDeleteKeyA reports a missing key with ERROR_FILE_NOT_FOUND");
+
+    uint32_t parent_path = put_str("Software\\RecompTests\\Registry\\WithChild");
+    uint32_t child_path = put_str("Software\\RecompTests\\Registry\\WithChild\\Leaf");
+    uint32_t cphk = scratch_block(4), cpdisp = scratch_block(4);
+    check(call_import(c, "ADVAPI32.dll", "RegCreateKeyExA",
+                      {0x80000002u, child_path, 0, 0, 0, 0xf003f, 0, cphk, cpdisp}) == 0,
+          "create a key with a subkey");
+    call_import(c, "ADVAPI32.dll", "RegCloseKey", {rd32(cphk)});
+    check(call_import(c, "ADVAPI32.dll", "RegDeleteKeyA", {0x80000002u, parent_path}) == 5,
+          "RegDeleteKeyA refuses a key that still has subkeys");
+    check(call_import(c, "ADVAPI32.dll", "RegDeleteKeyA", {0x80000002u, child_path}) == 0 &&
+              call_import(c, "ADVAPI32.dll", "RegDeleteKeyA", {0x80000002u, parent_path}) == 0,
+          "the subkey goes first, then the parent");
+
+    // LHNetGetProfileList opens the Profiles parent and counts its child keys;
+    // deleting one profile must lower that count, which is the property the
+    // profile UI relies on after RegDeleteKeyA removes the leaf.
+    uint32_t profiles_path = put_str("Software\\RecompTests\\Profiles");
+    uint32_t alpha = put_str("Software\\RecompTests\\Profiles\\Alpha");
+    uint32_t beta = put_str("Software\\RecompTests\\Profiles\\Beta");
+    uint32_t pfhk = scratch_block(4), pfdisp = scratch_block(4);
+    check(call_import(c, "ADVAPI32.dll", "RegCreateKeyExA",
+                      {0x80000002u, alpha, 0, 0, 0, 0xf003f, 0, pfhk, pfdisp}) == 0 &&
+              call_import(c, "ADVAPI32.dll", "RegCreateKeyExA",
+                          {0x80000002u, beta, 0, 0, 0, 0xf003f, 0, pfhk, pfdisp}) == 0,
+          "create two profile keys");
+    uint32_t plist = scratch_block(4), plistcount = scratch_block(4);
+    check(call_import(c, "ADVAPI32.dll", "RegOpenKeyA", {0x80000002u, profiles_path, plist}) == 0,
+          "open the profile list parent");
+    check(call_import(c, "ADVAPI32.dll", "RegQueryInfoKeyA",
+                      {rd32(plist), 0, 0, 0, plistcount, 0, 0, 0, 0, 0, 0, 0}) == 0 &&
+              rd32(plistcount) == 2,
+          "the profile list starts with two children");
+    check(call_import(c, "ADVAPI32.dll", "RegDeleteKeyA", {rd32(plist), put_str("Alpha")}) == 0,
+          "delete one profile through its parent handle");
+    check(call_import(c, "ADVAPI32.dll", "RegQueryInfoKeyA",
+                      {rd32(plist), 0, 0, 0, plistcount, 0, 0, 0, 0, 0, 0, 0}) == 0 &&
+              rd32(plistcount) == 1,
+          "the profile list count drops to one");
+    call_import(c, "ADVAPI32.dll", "RegCloseKey", {rd32(plist)});
+
+    // A registry file written before ancestors existed holds only leaves; the
+    // parent must still open and enumerate, or the first launch after the fix
+    // would still not see the profiles that are already on disk.
+    {
+        FILE *f = fopen(registry_path().c_str(), "wb");
+        if (f) {
+            fputs("{\n  \"HKEY_CURRENT_USER\\\\Software\\\\RecompTests\\\\Synth"
+                  "\\\\_z_profile\": {\n    \"login name\": {\"type\": 3, \"data\": \"0000\", "
+                  "\"seq\": 1}\n  }\n}\n",
+                  f);
+            fclose(f);
+        }
+        registry_load();
+        uint32_t synth = put_str("Software\\RecompTests\\Synth");
+        uint32_t sphk = scratch_block(4);
+        check(call_import(c, "ADVAPI32.dll", "RegOpenKeyA", {0x80000001u, synth, sphk}) == 0,
+              "a parent that exists only as stored descendants opens");
+        check(call_import(c, "ADVAPI32.dll", "RegEnumKeyA", {rd32(sphk), 0, qname, 64}) == 0 &&
+                  gm_str(qname) == "_z_profile",
+              "its child enumerates: \"%s\"", gm_str(qname).c_str());
+        call_import(c, "ADVAPI32.dll", "RegCloseKey", {rd32(sphk)});
+    }
 }
 
 // Every import in the PE must have a trampoline, and the stack discipline must
@@ -3993,6 +4233,9 @@ static void test_import_coverage(X86 *c) {
             uint32_t value = rd32(import.slot);
             if (imports_is_trampoline(value))
                 trampolines.insert(value);
+            else if (const LoaderModule *m = loader_module_containing(value);
+                     m && m->base != loader_image_base())
+                continue; // a translated auxiliary-module export, not data storage
             else
                 data.insert(value);
         }
@@ -4108,6 +4351,58 @@ static void test_lister(const char *dir, void (*emit)(void *, const char *, cons
     std::string host = g_seam_root + "/read/" + dir;
     emit(ctx, "one.txt", (host + "/one.txt").c_str());
     emit(ctx, "two.txt", (host + "/two.txt").c_str());
+}
+
+// LoadImageA(LR_LOADFROMFILE|LR_CREATEDIBSECTION) must expose the file's own
+// bit depth and row order, as Windows does. A 24-bpp BMP has to stay 24-bpp:
+// the font loader walks the bits as packed 3-byte pixels, and a 32-bpp DIB made
+// it count a glyph per misread row and spin forever.
+static void test_load_image_file_dib(X86 *c) {
+    section("LoadImageA file bitmap keeps the source DIB format");
+    std::string saved_root = g_seam_root;
+    g_seam_root = "build/recomp/load-image-file-test";
+    remove_tree(g_seam_root);
+    mkdir_p(g_seam_root + "/read");
+    // 14-byte BITMAPFILEHEADER + 40-byte BITMAPINFOHEADER + one 8-byte row:
+    // two 24-bpp pixels (BGR) plus row padding.
+    const uint32_t size = 62;
+    uint32_t bmp = scratch_block(size);
+    memset(g_mem + bmp, 0, size);
+    wr16(bmp + 0, 0x4d42);
+    wr32(bmp + 2, size);
+    wr32(bmp + 10, 54);
+    wr32(bmp + 14, 40);
+    wr32(bmp + 18, 2);
+    wr32(bmp + 22, 1);
+    wr16(bmp + 26, 1);
+    wr16(bmp + 28, 24);
+    wr8(bmp + 54, 0x11);
+    wr8(bmp + 55, 0x22);
+    wr8(bmp + 56, 0x33);
+    wr8(bmp + 57, 0x44);
+    wr8(bmp + 58, 0x55);
+    wr8(bmp + 59, 0x66);
+    FILE *f = fopen((g_seam_root + "/read/font24.bmp").c_str(), "wb");
+    check(f && fwrite(g_mem + bmp, 1, size, f) == size, "write 24-bpp BMP fixture");
+    if (f)
+        fclose(f);
+    win32_set_file_ops(test_resolver, nullptr);
+    uint32_t bitmap =
+        call_import(c, "USER32.dll", "LoadImageA", {0, put_str("font24.bmp"), 0, 0, 0, 0x2010});
+    uint32_t out = scratch_block(24);
+    check(bitmap && call_import(c, "GDI32.dll", "GetObjectA", {bitmap, 24, out}) == 24 &&
+              rd32(out + 4) == 2 && rd32(out + 8) == 1 && rd16(out + 18) == 24,
+          "LoadImageA returns a 24-bpp DIB section, not a 32-bpp one");
+    if (bitmap) {
+        uint32_t bits = rd32(out + 20);
+        check(rd8(bits) == 0x11 && rd8(bits + 1) == 0x22 && rd8(bits + 2) == 0x33 &&
+                  rd8(bits + 3) == 0x44 && rd8(bits + 4) == 0x55 && rd8(bits + 5) == 0x66,
+              "and its pixels are the file's packed BGR bytes, bottom-up");
+        call_import(c, "GDI32.dll", "DeleteObject", {bitmap});
+    }
+    win32_set_file_ops(nullptr, nullptr);
+    remove_tree(g_seam_root);
+    g_seam_root = saved_root;
 }
 
 // Runs `fn` on a real guest thread and waits for it to end. The scheduler only
@@ -5137,6 +5432,38 @@ static void test_kernel32_wide() {
           "GetDateFormatW fixed ISO picture");
     check(call_import(&c, "KERNEL32.dll", "GetDateFormatW", {0x409, 0, fd, 0, 0, 0}) == 11,
           "GetDateFormatW size includes terminator");
+    // GetTimeFormatW: 14:05:09 through the fixed en-US default picture. The
+    // size query must not touch the buffer, and the size includes the NUL.
+    memset(g_mem + fd, 0, 16);
+    wr16(fd + 8, 14);
+    wr16(fd + 10, 5);
+    wr16(fd + 12, 9);
+    check(call_import(&c, "KERNEL32.dll", "GetTimeFormatW", {0x400, 0, fd, 0, 0, 0}) == 11,
+          "GetTimeFormatW size query includes terminator");
+    check(call_import(&c, "KERNEL32.dll", "GetTimeFormatW", {0x400, 0, fd, 0, s + 192, 64}) == 11 &&
+              gm_wstr(s + 192) == "2:05:09 PM",
+          "GetTimeFormatW fixed en-US picture");
+    check(call_import(&c, "KERNEL32.dll", "GetTimeFormatW", {0x400, 0, fd, 0, s + 192, 3}) == 0 &&
+              call_import(&c, "KERNEL32.dll", "GetLastError", {}) == 122,
+          "GetTimeFormatW rejects a short buffer");
+    gm_put_wstr(fd + 32, "HH:mm", 16);
+    check(call_import(&c, "KERNEL32.dll", "GetTimeFormatW", {0x400, 0, fd, fd + 32, s + 192, 64}) ==
+                  6 &&
+              gm_wstr(s + 192) == "14:05",
+          "GetTimeFormatW explicit 24-hour picture");
+    check(call_import(&c, "KERNEL32.dll", "GetTimeFormatW", {0x400, 2, fd, 0, s + 192, 64}) == 8 &&
+              gm_wstr(s + 192) == "2:05 PM",
+          "GetTimeFormatW TIME_NOSECONDS drops the field and separator");
+    check(call_import(&c, "KERNEL32.dll", "GetTimeFormatW", {0x400, 4, fd, 0, s + 192, 64}) == 8 &&
+              gm_wstr(s + 192) == "2:05:09",
+          "GetTimeFormatW TIME_NOTIMEMARKER drops the marker and space");
+    uint32_t time_need = call_import(&c, "KERNEL32.dll", "GetTimeFormatW", {0x400, 0, 0, 0, 0, 0});
+    check(time_need > 1 && call_import(&c, "KERNEL32.dll", "GetTimeFormatW",
+                                       {0x400, 0, 0, 0, s + 192, 64}) == time_need,
+          "GetTimeFormatW null time uses the local clock and matches its size query");
+    check(call_import(&c, "KERNEL32.dll", "GetTimeFormatA", {0x400, 0, fd, 0, s + 256, 64}) == 11 &&
+              !strcmp((const char *)(g_mem + s + 256), "2:05:09 PM"),
+          "GetTimeFormatA mirrors the wide text");
     check(call_import(&c, "KERNEL32.dll", "FileTimeToDosDateTime", {s, s + 32, s + 34}) == 1 &&
               rd16(s + 32) == ((20 << 9) | (1 << 5) | 2) &&
               rd16(s + 34) == ((3 << 11) | (4 << 5) | 3),
@@ -6373,6 +6700,10 @@ static void test_user32_services() {
     check(message >= 0xc000 &&
               call_import(&c, "USER32.dll", "RegisterWindowMessageW", {s}) == message,
           "registered window message is stable");
+    // The A and W spellings share one global atom for the same name.
+    check(call_import(&c, "USER32.dll", "RegisterWindowMessageA", {put_str("Runtime.Format")}) ==
+              message,
+          "RegisterWindowMessageA shares the W atom");
     call_import(&c, "USER32.dll", "OpenClipboard", {0});
     call_import(&c, "USER32.dll", "EmptyClipboard", {});
     uint32_t data = heap_alloc(16, true);
@@ -6394,6 +6725,22 @@ static void test_user32_services() {
     uint32_t accel = call_import(&c, "USER32.dll", "CreateAcceleratorTableW", {s, 1});
     check(accel && call_import(&c, "USER32.dll", "DestroyAcceleratorTable", {accel}) == 1,
           "accelerator table copies six-byte guest entries");
+    // LoadAcceleratorsA reads the module's RT_ACCELERATOR resource. Games
+    // without one are skipped rather than failed.
+    std::vector<ResourceName> accelerators;
+    if (resource_names(9, &accelerators) && !accelerators.empty()) {
+        uint32_t resource = accelerators.front().id ? accelerators.front().id
+                                                    : put_str(accelerators.front().name.c_str());
+        uint32_t loaded =
+            call_import(&c, "USER32.dll", "LoadAcceleratorsA", {IMAGE_BASE, resource});
+        check(loaded != 0, "LoadAcceleratorsA loads an RT_ACCELERATOR resource");
+        if (loaded)
+            check(call_import(&c, "USER32.dll", "DestroyAcceleratorTable", {loaded}) == 1,
+                  "a loaded accelerator table is destroyable");
+    } else {
+        printf("  [SKIP] the image has no RT_ACCELERATOR resource\n");
+        ++g_skips;
+    }
     // Resource string lookup must keep the length prefix out of the text.
     std::vector<ResourceName> names;
     bool checked = false;
@@ -6792,6 +7139,62 @@ static void test_import_return_trace() {
     remove_tree(dir);
 }
 
+static uint32_t g_probe_eip = 0;
+static void eip_probe_shim(X86 *c) {
+    g_probe_eip = c->eip;
+}
+
+// The guest EIP is only advanced at call boundaries. A shim must see the
+// CURRENT call's return address, not the previous import's, or an abort inside
+// the shim blames the wrong call site.
+static void test_import_eip_publishes_return() {
+    section("import dispatch publishes the current return address");
+    X86 c;
+    loader_init_context(&c);
+    g_probe_eip = 0;
+    uint32_t tramp = imports_alloc_trampoline("TEST", "EipProbe", eip_probe_shim, 0);
+    uint32_t ret = 0x00401234;
+    c.r[R_ESP] -= 4;
+    wr32(c.r[R_ESP], ret);
+    imports_dispatch(&c, tramp);
+    check(g_probe_eip == ret, "EIP during the shim is the current return address %08x (got %08x)",
+          ret, g_probe_eip);
+}
+
+// With [game] strict_imports, an import whose stdcall arity is unknown must
+// stop by name instead of returning 0 with its arguments left on the stack.
+// Without it the legacy return-0 behaviour is preserved.
+static void test_strict_import_abort() {
+    section("strict unknown-arity imports");
+    char dir[] = "build/recomp/strict-import-XXXXXX";
+    if (!check(os_mkdtemp(dir) == 0, "created strict-import directory"))
+        return;
+    std::string path = std::string(dir) + "/strict.log";
+    char exe[4096];
+    if (!check(os_exe_path(exe, sizeof exe) == 0, "found strict-import executable"))
+        return;
+    const char *args[] = {exe, "--child-strict-import", path.c_str(), nullptr};
+    int64_t pid = 0;
+    int code = -1;
+    check(os_spawn(args, &pid) == 0 && os_wait(pid, &code) == 0, "ran the strict-import child");
+#if RECOMP_STRICT_IMPORTS
+    check(code == 134, "an unknown-arity import aborts (exit %d)", code);
+    std::string text;
+    if (FILE *log = fopen(path.c_str(), "r")) {
+        char line[512];
+        while (fgets(line, sizeof line, log))
+            text += line;
+        fclose(log);
+    }
+    check(text.find("unsupported import STRICT.dll!Probe") != std::string::npos,
+          "the abort names the import");
+#else
+    check(code == 0, "an unknown-arity import returns 0 when the profile is not strict (exit %d)",
+          code);
+#endif
+    remove_tree(dir);
+}
+
 // Exercise actual aborting dispatch, including arities beyond the observer's
 // eight-word limit and a preview that reaches the end of the guest arena.
 static void test_unsupported_diagnostics() {
@@ -6839,6 +7242,100 @@ static void test_unsupported_diagnostics() {
     remove_tree(dir);
 }
 
+// WINMM mmio, driven the way LHaudiodllR 0x10210910 drives it: a memory-file
+// MMIOINFO ('MEM ') is opened, the RIFF/'fmt '/'data' chunks are walked with
+// mmioDescend/mmioAscend/mmioRead, and a missing chunk reports
+// MMIOERR_CHUNKNOTFOUND. The file backing is exercised against the image
+// itself, which is not a RIFF.
+static void test_mmio(X86 *c) {
+    section("WINMM mmio: memory RIFF walk, ascend, chunk-not-found, file backing");
+
+    // RIFF/WAVE with an 18-byte fmt chunk and a 4-byte data chunk (50 bytes).
+    const uint32_t total = 50;
+    uint32_t riff = scratch_block(total);
+    wr32(riff + 0x00, 0x46464952); // 'RIFF'
+    wr32(riff + 0x04, total - 8);  // cksize
+    wr32(riff + 0x08, 0x45564157); // 'WAVE'
+    wr32(riff + 0x0c, 0x20746d66); // 'fmt '
+    wr32(riff + 0x10, 18);         // fmt cksize
+    wr16(riff + 0x14, 1);          // wFormatTag = WAVE_FORMAT_PCM
+    wr16(riff + 0x16, 1);          // nChannels
+    wr32(riff + 0x18, 8000);       // nSamplesPerSec
+    wr32(riff + 0x1c, 8000);       // nAvgBytesPerSec
+    wr16(riff + 0x20, 1);          // nBlockAlign
+    wr16(riff + 0x22, 8);          // wBitsPerSample
+    wr16(riff + 0x24, 0);          // cbSize
+    wr32(riff + 0x26, 0x61746164); // 'data'
+    wr32(riff + 0x2a, 4);          // data cksize
+    wr8(riff + 0x2e, 0x11);
+    wr8(riff + 0x2f, 0x22);
+    wr8(riff + 0x30, 0x33);
+    wr8(riff + 0x31, 0x44);
+
+    uint32_t info = scratch_block(0x48);
+    wr32(info + 0x04, 0x204d454d); // MMIOINFO.fccIOProc = 'MEM '
+    wr32(info + 0x14, total);      // cchBuffer
+    wr32(info + 0x18, riff);       // pchBuffer
+    uint32_t h = call_import(c, "WINMM.dll", "mmioOpenA", {0, info, 0});
+    check(h != 0, "mmioOpenA(memory MMIOINFO) -> %08x", h);
+    check(rd32(info + 0x1c) == riff && rd32(info + 0x20) == riff + total,
+          "mmioOpenA filled the memory cursors");
+
+    uint32_t parent = scratch_block(0x14);
+    wr32(parent + 0x08, 0x45564157); // fccType = 'WAVE'
+    uint32_t d = call_import(c, "WINMM.dll", "mmioDescend", {h, parent, 0, 0x20});
+    check(d == 0 && rd32(parent + 0x0c) == 8 && rd32(parent + 0x04) == total - 8,
+          "mmioDescend('WAVE', FINDRIFF) -> %u, data@%u size=%u", d, rd32(parent + 0x0c),
+          rd32(parent + 0x04));
+
+    uint32_t fmt = scratch_block(0x14);
+    wr32(fmt + 0x00, 0x20746d66); // ckid = 'fmt '
+    d = call_import(c, "WINMM.dll", "mmioDescend", {h, fmt, parent, 0x10});
+    check(d == 0 && rd32(fmt + 0x0c) == 20 && rd32(fmt + 0x04) == 18,
+          "mmioDescend('fmt ', FINDCHUNK) -> %u, data@%u size=%u", d, rd32(fmt + 0x0c),
+          rd32(fmt + 0x04));
+
+    uint32_t wfx = scratch_block(0x20);
+    uint32_t got = call_import(c, "WINMM.dll", "mmioRead", {h, wfx, 0x12});
+    check(got == 0x12 && rd16(wfx) == 1 && rd16(wfx + 2) == 1 && rd32(wfx + 4) == 8000 &&
+              rd16(wfx + 0x0e) == 8,
+          "mmioRead(18) -> %u bytes, PCM %u Hz %u bit", got, rd32(wfx + 4), rd16(wfx + 0x0e));
+
+    d = call_import(c, "WINMM.dll", "mmioAscend", {h, fmt, 0});
+    check(d == 0, "mmioAscend('fmt ') -> %u", d);
+
+    uint32_t data = scratch_block(0x14);
+    wr32(data + 0x00, 0x61746164); // ckid = 'data'
+    d = call_import(c, "WINMM.dll", "mmioDescend", {h, data, parent, 0x10});
+    check(d == 0 && rd32(data + 0x0c) == 46 && rd32(data + 0x04) == 4,
+          "mmioDescend('data', FINDCHUNK) -> %u, data@%u size=%u", d, rd32(data + 0x0c),
+          rd32(data + 0x04));
+    uint32_t sample = scratch_block(8);
+    got = call_import(c, "WINMM.dll", "mmioRead", {h, sample, 4});
+    check(got == 4 && (rd32(sample) & 0xff) == 0x11, "mmioRead(samples) -> %u", got);
+
+    uint32_t fact = scratch_block(0x14);
+    wr32(fact + 0x00, 0x74636166); // ckid = 'fact'
+    d = call_import(c, "WINMM.dll", "mmioDescend", {h, fact, parent, 0x10});
+    check(d == 0x109, "missing chunk -> MMIOERR_CHUNKNOTFOUND (%u)", d);
+
+    call_import(c, "WINMM.dll", "mmioClose", {h, 0});
+
+    // File backing: the image opens, reads its MZ header, and is not a RIFF.
+    uint32_t name = put_str(RECOMP_GUEST_ROOT "\\" RECOMP_EXECUTABLE);
+    uint32_t fh = call_import(c, "WINMM.dll", "mmioOpenA", {name, 0, 0});
+    check(fh != 0, "mmioOpenA(file) -> %08x", fh);
+    uint32_t hdr = scratch_block(4);
+    got = call_import(c, "WINMM.dll", "mmioRead", {fh, hdr, 2});
+    check(got == 2 && rd16(hdr) == 0x5a4d, "mmioRead(file) -> MZ (%u bytes)", got);
+    uint32_t notriff = scratch_block(0x14);
+    wr32(notriff + 0x08, 0x45564157);
+    d = call_import(c, "WINMM.dll", "mmioDescend", {fh, notriff, 0, 0x20});
+    check(d == 0x109, "non-RIFF file -> MMIOERR_CHUNKNOTFOUND (%u)", d);
+    check(call_import(c, "WINMM.dll", "mmioSeek", {fh, 0, 0}) == 0, "mmioSeek(file) to 0");
+    call_import(c, "WINMM.dll", "mmioClose", {fh, 0});
+}
+
 int main(int argc, char **argv) {
     if (argc == 4 && !strcmp(argv[1], "--child-import-diagnostic")) {
         if (!freopen(argv[3], "w", stderr))
@@ -6871,6 +7368,17 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--import-diagnostics")) {
         test_unsupported_diagnostics();
         return g_failures ? 1 : 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "--child-strict-import") == 0) {
+        if (!freopen(argv[2], "w", stderr))
+            return 2;
+        mem_init();
+        X86 c = {};
+        c.r[R_ESP] = STACK_TOP - 64;
+        wr32(c.r[R_ESP], 0x12345678);
+        uint32_t target = imports_alloc_trampoline("STRICT.dll", "Probe", nullptr, ARGC_UNKNOWN);
+        imports_dispatch(&c, target);
+        return 0;
     }
     const bool unsupported_child = argc > 3 && strcmp(argv[1], "--child-unsupported") == 0;
     const bool child = argc > 1 && strcmp(argv[1], "--child-setjmp-abort") == 0;
@@ -6934,6 +7442,7 @@ int main(int argc, char **argv) {
         return heap_alloc(0xffffffffu) == 0 ? 0 : 4;
     }
 
+    test_strict_import_abort();
     test_unsupported_diagnostics();
     test_loader();
     test_discovery_recorder();
@@ -6952,7 +7461,9 @@ int main(int argc, char **argv) {
     }
     scratch = 0x0ee00000;
     test_startup_apis(loader_context());
+    test_load_image_file_dib(loader_context());
     test_import_return_trace();
+    test_import_eip_publishes_return();
     test_modules_and_wide();
     test_preferred_ui_languages();
     test_session_notification_service_unavailable();
@@ -7002,6 +7513,7 @@ int main(int argc, char **argv) {
     test_winsock_resolver(c);
     test_windows_version(c);
     test_boot_shims(c);
+    test_mmio(c);
     test_gdi_and_com(c);
     test_cxx_throw_description(c);
     test_native_draw_waits(c);

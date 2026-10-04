@@ -144,7 +144,7 @@ def emit_entry_dispatch(prefix):
     return """
 void %(p)senter(X86 *c, uint32_t i)
 {
-    uint32_t ebp = recomp_frame_watch ? c->r[5] : 0u;
+    RecompSaved saved_; recomp_save(c, &saved_);
     if (recomp_profile_enabled) { recomp_call(c, %(p)sfunc_addrs[i]); return; }
 #ifndef RECOMP_NO_HOOKS
     if (__builtin_expect(__atomic_load_n(&%(p)shooked[i], __ATOMIC_ACQUIRE) != 0u, 0))
@@ -153,8 +153,8 @@ void %(p)senter(X86 *c, uint32_t i)
 #endif
         %(p)sbase_ptrs[i](c);
 #ifndef RECOMP_NO_HOOKS
-    if (recomp_frame_watch && c->r[5] != ebp)
-        recomp_frame_changed(c, %(p)sfunc_addrs[i], ebp, c->r[5]);
+    if (recomp_frame_watch)
+        recomp_check_saved(c, %(p)sfunc_addrs[i], &saved_);
 #endif
 }
 """ % {"p": prefix}
@@ -1118,9 +1118,16 @@ class Image(object):
     def __init__(self, path):
         import pefile
         pe = pefile.PE(path, fast_load=True)
-        self.base = pe.OPTIONAL_HEADER.ImageBase
+        preferred = pe.OPTIONAL_HEADER.ImageBase
         self.size = pe.OPTIONAL_HEADER.SizeOfImage
-        data = pe.get_memory_mapped_image()
+        # An auxiliary module is mapped at the base game.toml configures, which
+        # can differ from the PE's preferred base. RVA indexing is invariant
+        # under that shift (va - base is the same either way), but absolute
+        # values stored in the image are not, so data and code carry delta.
+        override = AUX_MODULE.get("base") if AUX_MODULE is not None else None
+        self.delta = 0 if override is None else int(override) - preferred
+        self.base = preferred if override is None else int(override)
+        data = bytearray(pe.get_memory_mapped_image())
         # get_memory_mapped_image() stops at the last section's raw end, which
         # is short of SizeOfImage; the architectural image runs to
         # base + SizeOfImage (0xd4c000 here) and those bytes read as zero.
@@ -1146,6 +1153,7 @@ class Image(object):
         except Exception:                 # a malformed table only loses names
             pass
         pe.close()
+        self.apply_relocations()
         # Section map: executable ranges are where code can live, initialized
         # data is where a pointer to it can be stored.  .reloc is the
         # relocation table and .rsrc is resource blobs; neither is data the
@@ -1176,6 +1184,43 @@ class Image(object):
             self.md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
         except ImportError:            # length checking is optional
             self.md = None
+
+    def apply_relocations(self):
+        """Rebase the mapped bytes from the PE preferred base to self.base.
+
+        The runtime loader applies the identical delta to the mapped module
+        (loader.cpp relocate_aux_module), so the translator's data reads,
+        recovered instructions and pointer evidence describe the image the
+        guest actually runs. Ghidra is exported at the configured base, so the
+        listing's absolute operands already carry it.
+        """
+        if not self.delta:
+            return
+        rva, size = self.reloc_dir
+        if not rva or not size:
+            raise TranslateError(
+                "image is given a base %08x but its PE image base is %08x, and it has no base "
+                "relocation table" % (self.base, self.base - self.delta))
+        delta = self.delta
+        off, end = rva, rva + size
+        while off + 8 <= end:
+            page = int.from_bytes(self.data[off:off + 4], "little")
+            blk = int.from_bytes(self.data[off + 4:off + 8], "little")
+            if blk < 8 or off + blk > end:
+                raise TranslateError("malformed base relocation block at %08x" % off)
+            for k in range(off + 8, off + blk, 2):
+                e = int.from_bytes(self.data[k:k + 2], "little")
+                if e >> 12 != 3:      # IMAGE_REL_BASED_HIGHLOW; ABSOLUTE is padding
+                    continue
+                site = page + (e & 0xfff)
+                if site + 4 > self.size:
+                    raise TranslateError("base relocation site %08x is outside the image" % site)
+                value = int.from_bytes(self.data[site:site + 4], "little")
+                self.data[site:site + 4] = ((value + delta) & 0xffffffff).to_bytes(4, "little")
+            off += blk
+        # pefile reports import slot addresses at the preferred base; the
+        # listing and the relocated bytes use the configured one.
+        self.iat_names = {addr + delta: name for addr, name in self.iat_names.items()}
 
     def relocated_pointers(self):
         """Every address named by a dword the loader rewrites, and where.
@@ -6357,10 +6402,10 @@ int recomp_thunk_target_kind(uint32_t target)
 static void recomp_call_inner(X86 *c, uint32_t target);
 void recomp_call(X86 *c, uint32_t target)
 {
-    uint32_t ebp_ = recomp_frame_watch ? c->r[5] : 0u;
+    RecompSaved saved_; recomp_save(c, &saved_);
     recomp_call_inner(c, target);
-    if (recomp_frame_watch && c->r[5] != ebp_)
-        recomp_frame_changed(c, target, ebp_, c->r[5]);
+    if (recomp_frame_watch)
+        recomp_check_saved(c, target, &saved_);
 }
 static void recomp_call_inner(X86 *c, uint32_t target)
 {

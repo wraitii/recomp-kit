@@ -236,9 +236,10 @@ void recomp_unknown_call(X86 *c, uint32_t target) {
             wr32(info, 8);
             wr32(info + 4, target);
             log_once("null-call",
-                     "call to %08x (return=%08x): raising an access violation, as Windows "
-                     "would, for the guest's handlers",
-                     target, ret);
+                     "call to %08x (return=%08x EAX=%08x ECX=%08x ESI=%08x EDI=%08x FS:[0]=%08x): "
+                     "raising an access violation, as Windows would, for the guest's handlers",
+                     target, ret, c->r[R_EAX], c->r[R_ECX], c->r[R_ESI], c->r[R_EDI],
+                     c->fs_base && gm_valid(c->fs_base, 4) ? rd32(c->fs_base) : 0u);
             recomp_seh_raise(c, 0xc0000005u, 0, 2, info);
         }
     }
@@ -265,10 +266,14 @@ void recomp_unknown_call(X86 *c, uint32_t target) {
 }
 
 // DIV/IDIV with a zero divisor or an out-of-range quotient. On real hardware
-// this raises #DE; there is no SEH here, so it is reported and the registers
-// are left untouched.
+// this raises #DE; deliver it to the guest's own handlers as Windows would,
+// with the record and CONTEXT naming the faulting instruction. The registers
+// are left untouched and the caller continues on the old value; with no
+// handler Windows ends the process.
 void recomp_div_error(X86 *c, uint32_t addr) {
-    LOGW("divide error at %08x (EAX=%08x EDX=%08x)", addr, c->r[R_EAX], c->r[R_EDX]);
+    LOGW("divide error at %08x (EAX=%08x EDX=%08x): raising STATUS_INTEGER_DIVIDE_BY_ZERO", addr,
+         c->r[R_EAX], c->r[R_EDX]);
+    recomp_seh_raise_fault(c, 0xc0000094u, addr);
 }
 
 // A read or a write through a pointer in the first 64 KB. Windows maps

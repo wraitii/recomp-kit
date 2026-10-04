@@ -21,6 +21,7 @@ __attribute__((weak)) const uint32_t recomp_data_seed_count = 0;
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <cctype>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -280,7 +281,12 @@ bool patch_iat(const std::vector<uint8_t> &file, size_t opt_off, uint16_t opt_ma
                 ++g_iat_data;
                 continue;
             }
-            uint32_t tramp = imports_alloc_trampoline(dll.c_str(), namebuf, nullptr, ARGC_UNKNOWN);
+            // A DLL with a shim table keeps its per-name stubs, including the
+            // deliberate logging-only ones. A DLL with no table at all is not
+            // merely unimplemented: calling into it must stop with the name of
+            // the missing dll!function rather than returning zero.
+            void (*unknown)(X86 *) = imports_has_dll(dll.c_str()) ? nullptr : imports_unsupported;
+            uint32_t tramp = imports_alloc_trampoline(dll.c_str(), namebuf, unknown, ARGC_UNKNOWN);
             if (!tramp) {
                 g_error = "ran out of import trampolines";
                 return false;
@@ -294,9 +300,12 @@ bool patch_iat(const std::vector<uint8_t> &file, size_t opt_off, uint16_t opt_ma
 
 // --------------------------------------------------------------------------
 // Auxiliary modules: DLLs game.toml names, mapped beside the main image at
-// their preferred base (no relocation support, as for the image itself) and
-// verified by content hash like it. Preserve configured installation subfolders
-// when the executable and its game directory have moved onto another device.
+// their configured base, above the shim arena block, verified by content hash
+// like the image and rebased from the PE's preferred base with the image's own
+// relocation table. The translator applies the identical delta to its listing,
+// so [modules.aux.KEY].base must name the base Ghidra exported it at.
+// Preserve configured installation subfolders when the executable and its game
+// directory have moved onto another device.
 // --------------------------------------------------------------------------
 struct AuxSpec {
     const char *name, *path, *sha256;
@@ -305,7 +314,81 @@ struct AuxSpec {
 const AuxSpec g_aux_specs[] = RECOMP_AUX_MODULES;
 std::vector<LoaderModule> g_aux;
 
-bool load_aux_module(const AuxSpec &spec) {
+// A mapped module whose IAT is not bound yet. Binding waits until every module
+// is mapped, so an import from one can see another's exports whatever order
+// game.toml lists them in.
+struct AuxPending {
+    const AuxSpec *spec;
+    std::vector<uint8_t> file;
+    size_t opt_off;
+    uint16_t opt_magic;
+    uint32_t size_image;
+    uint32_t index; // position in g_aux, which is this vector's position
+};
+std::vector<AuxPending> g_aux_pending;
+std::vector<uint32_t> g_aux_order;        // g_aux indices in DllMain dependency order
+std::vector<std::vector<int>> g_aux_deps; // g_aux[i]'s auxiliary-module dependencies
+// g_aux[i] is attached before the exe entry (it is in the executable's static
+// import closure). Runtime-only modules stay false and attach at LoadLibrary.
+std::vector<bool> g_aux_startup;
+
+// The basename, lowercased, with a .dll suffix when it has no extension. Two
+// spellings of the same import module compare equal through this.
+std::string normalize_module_name(const char *raw) {
+    std::string n = raw ? raw : "";
+    size_t s = n.find_last_of("\\/");
+    if (s != std::string::npos)
+        n = n.substr(s + 1);
+    for (char &ch : n)
+        ch = (char)tolower((unsigned char)ch);
+    if (n.find('.') == std::string::npos)
+        n += ".dll";
+    return n;
+}
+
+// Add `base - preferred` to every HIGHLOW relocation site in the mapped module.
+// The translator's Image applies the identical delta, so guest-visible absolute
+// addresses in code and data stay in step. A module given a different base
+// without a relocation table is a hard failure, never a best effort.
+bool relocate_aux_module(const char *name, uint32_t base, uint32_t preferred, uint32_t size,
+                         uint32_t reloc_rva, uint32_t reloc_size) {
+    if (base == preferred)
+        return true;
+    if (!reloc_rva || !reloc_size) {
+        g_error =
+            std::string(name) + ": configured base needs a base relocation table, and it has none";
+        return false;
+    }
+    int32_t delta = (int32_t)(base - preferred);
+    uint32_t off = reloc_rva, end = reloc_rva + reloc_size;
+    while (off + 8 <= end) {
+        if (!rva_in(size, off, 8)) {
+            g_error = std::string(name) + ": base relocation block header lies outside the image";
+            return false;
+        }
+        uint32_t page = rd32(base + off);
+        uint32_t blk = rd32(base + off + 4);
+        if (blk < 8 || off + blk > end || !rva_in(size, off, blk)) {
+            g_error = std::string(name) + ": malformed base relocation block";
+            return false;
+        }
+        for (uint32_t k = off + 8; k + 2 <= off + blk; k += 2) {
+            uint16_t e = rd16(base + k);
+            if ((e >> 12) != 3) // IMAGE_REL_BASED_HIGHLOW; ABSOLUTE padding names nothing
+                continue;
+            uint32_t site = page + (e & 0xfff);
+            if (!rva_in(size, site, 4)) {
+                g_error = std::string(name) + ": base relocation site lies outside the image";
+                return false;
+            }
+            wr32(base + site, rd32(base + site) + (uint32_t)delta);
+        }
+        off += blk;
+    }
+    return true;
+}
+
+bool map_aux_module(const AuxSpec &spec) {
     LoaderModule m;
     m.name = spec.name;
     m.path = dirname_of(g_exe_path) + "/" + spec.name;
@@ -361,32 +444,24 @@ bool load_aux_module(const AuxSpec &spec) {
     uint32_t image_base = rd<uint32_t>(file, opt_off + 28);
     uint32_t size_image = rd<uint32_t>(file, opt_off + 56);
     uint32_t size_hdrs = rd<uint32_t>(file, opt_off + 60);
-    if (image_base != spec.base) {
-        char buf[200];
-        snprintf(buf, sizeof buf,
-                 "%s: image base %08x is not the configured %08x (no relocation support)",
-                 spec.name, image_base, spec.base);
-        g_error = buf;
-        return false;
-    }
-    if (size_image > spec.size || image_base < GUEST_SHIM_END ||
-        (uint64_t)image_base + spec.size > GUEST_SIZE) {
+    if (size_image > spec.size || spec.base < GUEST_SHIM_END ||
+        (uint64_t)spec.base + spec.size > GUEST_SIZE) {
         char buf[200];
         snprintf(
             buf, sizeof buf,
             "%s: [%08x, %08x) does not fit the configured [%08x, %08x) above the arena's shims",
-            spec.name, image_base, image_base + size_image, spec.base, spec.base + spec.size);
+            spec.name, spec.base, spec.base + size_image, spec.base, spec.base + spec.size);
         g_error = buf;
         return false;
     }
     for (const LoaderModule &other : g_aux)
-        if (image_base < other.base + other.size && other.base < image_base + spec.size) {
+        if (spec.base < other.base + other.size && other.base < spec.base + spec.size) {
             g_error = std::string(spec.name) + " overlaps " + other.name;
             return false;
         }
-    m.base = image_base;
+    m.base = spec.base;
     m.size = spec.size;
-    m.entry = entry_rva ? image_base + entry_rva : 0;
+    m.entry = entry_rva ? spec.base + entry_rva : 0;
     m.attached = false;
     m.export_rva = rd<uint32_t>(file, opt_off + 96);
     m.export_size = rd<uint32_t>(file, opt_off + 100);
@@ -398,18 +473,18 @@ bool load_aux_module(const AuxSpec &spec) {
         LOGW("%s has a TLS directory, which auxiliary modules do not get", spec.name);
 
     size_t hdr_copy = size_hdrs < file.size() ? size_hdrs : file.size();
-    memcpy(g_mem + image_base, file.data(), hdr_copy);
+    memcpy(g_mem + spec.base, file.data(), hdr_copy);
     for (uint16_t i = 0; i < nsections; ++i) {
         size_t s = sh_off + 40 * i;
         char nm[9] = {0};
         memcpy(nm, file.data() + s, 8);
         uint32_t vsize = rd<uint32_t>(file, s + 8);
-        uint32_t va = image_base + rd<uint32_t>(file, s + 12);
+        uint32_t va = spec.base + rd<uint32_t>(file, s + 12);
         uint32_t raw_size = rd<uint32_t>(file, s + 16);
         uint32_t raw_ptr = rd<uint32_t>(file, s + 20);
         uint32_t span = vsize ? vsize : raw_size;
         m.sections.push_back({nm, va, vsize, raw_size, raw_ptr, rd<uint32_t>(file, s + 36)});
-        if (va < image_base || (uint64_t)va + span > (uint64_t)image_base + size_image) {
+        if (va < spec.base || (uint64_t)va + span > (uint64_t)spec.base + size_image) {
             g_error = std::string(spec.name) + ": section " + nm + " lies outside the image";
             return false;
         }
@@ -424,18 +499,95 @@ bool load_aux_module(const AuxSpec &spec) {
             memcpy(g_mem + va, file.data() + raw_ptr, copy);
         }
     }
-    if (!patch_iat(file, opt_off, opt_magic, image_base, size_image)) {
-        g_error = std::string(spec.name) + ": " + g_error;
-        return false;
+    uint32_t reloc_rva = 0, reloc_size = 0;
+    if (opt_size >= 96 + 6 * 8) {
+        reloc_rva = rd<uint32_t>(file, opt_off + 96 + 5 * 8);
+        reloc_size = rd<uint32_t>(file, opt_off + 96 + 5 * 8 + 4);
     }
-    m.initial_image.assign(g_mem + image_base, g_mem + image_base + m.size);
+    if (!relocate_aux_module(spec.name, spec.base, image_base, size_image, reloc_rva, reloc_size))
+        return false;
+    uint32_t index = (uint32_t)g_aux.size();
     g_aux.push_back(m);
+    g_aux_pending.push_back({&spec, std::move(file), opt_off, opt_magic, size_image, index});
     LOGV("mapped auxiliary module %s: base %08x size %08x entry %08x", spec.name, m.base,
          size_image, m.entry);
     return true;
 }
 
+// DLL-to-DLL edges from each mapped import descriptor, then bind every IAT in
+// dependency order. A cycle cannot occur in a well-formed PE and is reported
+// rather than guessed at. The executable is bound by its caller afterwards.
+bool bind_aux_imports() {
+    size_t n = g_aux_pending.size();
+    std::vector<std::vector<int>> deps(n);
+    for (size_t i = 0; i < n; ++i) {
+        const LoaderModule &m = g_aux[i];
+        const AuxPending &p = g_aux_pending[i];
+        uint32_t imp_rva = rd<uint32_t>(p.file, p.opt_off + 96 + 1 * 8);
+        uint32_t imp_size = rd<uint32_t>(p.file, p.opt_off + 96 + 1 * 8 + 4);
+        if (!imp_rva || !imp_size || !rva_in(p.size_image, imp_rva, imp_size))
+            continue;
+        uint32_t max_desc = imp_size / 20 + 1;
+        for (uint32_t d = 0; d < max_desc; ++d) {
+            uint32_t desc_rva = imp_rva + d * 20;
+            if (!rva_in(p.size_image, desc_rva, 20))
+                break;
+            uint32_t name_rva = rd32(m.base + desc_rva + 12);
+            uint32_t first = rd32(m.base + desc_rva + 16);
+            uint32_t orig = rd32(m.base + desc_rva + 0);
+            if (!name_rva && !first && !orig)
+                break;
+            if (!rva_in(p.size_image, name_rva, 1))
+                break;
+            std::string dll = normalize_module_name(gm_str(m.base + name_rva, 260).c_str());
+            for (size_t j = 0; j < n; ++j)
+                if (i != j && normalize_module_name(g_aux[j].name.c_str()) == dll)
+                    deps[i].push_back((int)j);
+        }
+    }
+    std::vector<bool> done(n, false);
+    std::vector<uint32_t> order;
+    while (order.size() < n) {
+        bool progress = false;
+        for (size_t i = 0; i < n; ++i) {
+            if (done[i])
+                continue;
+            bool ready = true;
+            for (int d : deps[i])
+                if (!done[(size_t)d]) {
+                    ready = false;
+                    break;
+                }
+            if (!ready)
+                continue;
+            done[i] = true;
+            order.push_back((uint32_t)i);
+            progress = true;
+        }
+        if (!progress) {
+            g_error = "auxiliary module import cycle";
+            return false;
+        }
+    }
+    for (uint32_t i : order) {
+        AuxPending &p = g_aux_pending[i];
+        if (!patch_iat(p.file, p.opt_off, p.opt_magic, g_aux[i].base, p.size_image)) {
+            g_error = g_aux[i].name + ": " + g_error;
+            return false;
+        }
+        g_aux[i].initial_image.assign(g_mem + g_aux[i].base, g_mem + g_aux[i].base + g_aux[i].size);
+    }
+    g_aux_order = order;
+    g_aux_deps = deps;
+    return true;
+}
+
 } // namespace
+
+bool loader_test_relocate(uint32_t base, uint32_t preferred, uint32_t size, uint32_t reloc_rva,
+                          uint32_t reloc_size) {
+    return relocate_aux_module("test", base, preferred, size, reloc_rva, reloc_size);
+}
 
 uint32_t loader_module_count() {
     return (uint32_t)g_aux.size();
@@ -465,6 +617,27 @@ bool loader_in_image(uint32_t addr) {
     return (addr >= g_base && addr < g_base + g_size) || loader_module_containing(addr) != nullptr;
 }
 
+// A forwarded export stores "DLL.name" or "DLL.#ord" where a code RVA would
+// be. Follow it into another mapped module. A system-DLL forwarder has no
+// mapped module here; the caller reports the missing export rather than
+// guessing at a trampoline.
+uint32_t loader_follow_forwarder(const LoaderModule &m, uint32_t rva) {
+    std::string s = gm_str(m.base + rva, std::min(260u, m.size - rva));
+    size_t dot = s.find('.');
+    if (dot == std::string::npos || dot == 0 || dot + 1 >= s.size())
+        return 0;
+    const LoaderModule *target = loader_module_named(s.substr(0, dot).c_str());
+    if (!target)
+        return 0;
+    std::string fn = s.substr(dot + 1);
+    if (!fn.empty() && fn[0] == '#') {
+        char *end = nullptr;
+        long ord = strtol(fn.c_str() + 1, &end, 10);
+        return end && *end == '\0' ? loader_module_export_ordinal(*target, (uint32_t)ord) : 0;
+    }
+    return loader_module_export(*target, fn.c_str());
+}
+
 // The PE export directory read from guest memory, so a lookup sees the mapped
 // bytes. Names are compared case sensitively, as GetProcAddress does.
 uint32_t loader_module_export(const LoaderModule &m, const char *name) {
@@ -486,16 +659,18 @@ uint32_t loader_module_export(const LoaderModule &m, const char *name) {
         if (ordinal >= nfuncs)
             return 0;
         uint32_t rva = rd32(m.base + funcs + 4 * ordinal);
-        // A forwarder (an RVA inside the export directory) is not served.
-        if (!rva || !in(rva, 1) || rva_in(m.export_size, rva - m.export_rva, 1))
+        if (!rva || !in(rva, 1))
             return 0;
+        // A forwarder (an RVA inside the export directory) names another export.
+        if (rva_in(m.export_size, rva - m.export_rva, 1))
+            return loader_follow_forwarder(m, rva);
         return m.base + rva;
     }
     return 0;
 }
 
 // Ordinals index the same address table as names, offset by the directory's
-// ordinal base. Missing entries and forwarded exports are not executable.
+// ordinal base. Missing entries and unresolved forwards are not executable.
 uint32_t loader_module_export_ordinal(const LoaderModule &m, uint32_t ordinal) {
     if (!m.export_rva || !rva_in(m.size, m.export_rva, 40))
         return 0;
@@ -505,8 +680,10 @@ uint32_t loader_module_export_ordinal(const LoaderModule &m, uint32_t ordinal) {
         !rva_in(m.size, table, 4 * count))
         return 0;
     uint32_t rva = rd32(m.base + table + 4 * (ordinal - first));
-    if (!rva || !rva_in(m.size, rva, 1) || rva_in(m.export_size, rva - m.export_rva, 1))
+    if (!rva || !rva_in(m.size, rva, 1))
         return 0;
+    if (rva_in(m.export_size, rva - m.export_rva, 1))
+        return loader_follow_forwarder(m, rva);
     return m.base + rva;
 }
 
@@ -550,6 +727,10 @@ bool loader_load(const char *exe_path) {
     g_error.clear();
     g_sections.clear();
     g_aux.clear();
+    g_aux_pending.clear();
+    g_aux_order.clear();
+    g_aux_deps.clear();
+    g_aux_startup.clear();
     g_main = LoaderModule{};
     g_iat_patched = 0;
     g_iat_data = 0;
@@ -749,11 +930,57 @@ bool loader_load(const char *exe_path) {
         }
     }
 
+    // Map and rebase every auxiliary module before binding any IAT: the
+    // executable's Lionhead imports resolve to translated export addresses,
+    // not to trampolines. DLL-to-DLL imports are bound in dependency order.
+    for (uint32_t i = 0; i < RECOMP_AUX_MODULE_COUNT; ++i)
+        if (!map_aux_module(g_aux_specs[i]))
+            return false;
+    if (!bind_aux_imports())
+        return false;
+
+    // Windows attaches a statically imported DLL's DllMain before the exe
+    // entry, and resolves the transitive closure of those imports. A module
+    // the executable does not statically import is mapped here but attached
+    // only when the guest calls LoadLibrary. Mark the startup set so
+    // loader_attach_modules runs exactly those and load_library_named owns
+    // the rest.
+    g_aux_startup.assign(g_aux.size(), false);
+    {
+        size_t dd = opt_off + 96;
+        uint32_t imp_rva = rd<uint32_t>(file, dd + 8);
+        uint32_t imp_size = rd<uint32_t>(file, dd + 12);
+        if (imp_rva && imp_size && rva_ok(imp_rva, imp_size)) {
+            for (uint32_t d = 0; d < imp_size / 20 + 1; ++d) {
+                uint32_t desc = imp_rva + d * 20;
+                if (!rva_ok(desc, 20))
+                    break;
+                uint32_t name_rva = rd32(g_base + desc + 12);
+                uint32_t first = rd32(g_base + desc + 16);
+                uint32_t orig = rd32(g_base + desc);
+                if (!name_rva && !first && !orig)
+                    break;
+                if (!rva_ok(name_rva, 1))
+                    break;
+                std::string dll = normalize_module_name(gm_str(g_base + name_rva, 260).c_str());
+                for (size_t i = 0; i < g_aux.size(); ++i)
+                    if (normalize_module_name(g_aux[i].name.c_str()) == dll)
+                        g_aux_startup[i] = true;
+            }
+        }
+    }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (size_t i = 0; i < g_aux.size(); ++i)
+            if (g_aux_startup[i])
+                for (int j : g_aux_deps[i])
+                    if (!g_aux_startup[(size_t)j]) {
+                        g_aux_startup[(size_t)j] = true;
+                        changed = true;
+                    }
+    }
     if (!patch_iat(file, opt_off, opt_magic, g_base, g_size))
         return false;
-    for (uint32_t i = 0; i < RECOMP_AUX_MODULE_COUNT; ++i)
-        if (!load_aux_module(g_aux_specs[i]))
-            return false;
 
     if (g_entry != LOADER_EXPECTED_ENTRY)
         LOGW("entry point is %08x, expected %08x", g_entry, LOADER_EXPECTED_ENTRY);
@@ -816,6 +1043,44 @@ std::string loader_hash_file(const char *path) {
     return sha256_hex(file);
 }
 
+// DllMain of every mapped auxiliary module, in the import-dependency order
+// bind_aux_imports established. A FALSE from DLL_PROCESS_ATTACH is a load
+// failure: stop with the module named instead of entering the exe with a
+// half-initialised DLL. Detach ignores the return value, as Windows does.
+void loader_attach_modules(X86 *c) {
+    for (uint32_t index : g_aux_order) {
+        LoaderModule &m = g_aux[index];
+        if (!g_aux_startup[index] || m.attached)
+            continue;
+        if (!m.entry || recomp_module_lookup(m.entry) < 0) {
+            fprintf(stderr,
+                    "[recomp] fatal: %s has no translated DllMain at %08x; its exports are not "
+                    "callable, so the process cannot start\n",
+                    m.name.c_str(), m.entry);
+            abort();
+        }
+        m.attached = true;
+        m.load_refs = 1;
+        if (!guest_call(c, m.entry, m.base, 1, 0)) {
+            fprintf(stderr, "[recomp] fatal: %s DllMain(DLL_PROCESS_ATTACH) returned FALSE\n",
+                    m.name.c_str());
+            abort();
+        }
+    }
+}
+
+void loader_detach_modules(X86 *c) {
+    for (size_t i = g_aux_order.size(); i-- > 0;) {
+        LoaderModule &m = g_aux[g_aux_order[i]];
+        if (!m.attached)
+            continue;
+        if (m.entry && recomp_module_lookup(m.entry) >= 0)
+            guest_call(c, m.entry, m.base, 0, 0);
+        m.attached = false;
+        m.load_refs = 0;
+    }
+}
+
 void run_entry(X86 *c) {
     if (!g_entry) {
         LOGW("run_entry: no image loaded");
@@ -829,6 +1094,9 @@ void run_entry(X86 *c) {
     sched_set_guest_thread(true);
     // ExitProcess/TerminateProcess/ExitThread-outside-a-thread longjmp here.
     if (setjmp(*process_exit_jmp()) == 0) {
+        // Static imports are attached before the exe entry point, as Windows
+        // does, so a DLL's globals are live before the CRT calls into it.
+        loader_attach_modules(c);
         uint32_t count = 0;
         for (uint32_t p = g_tls.callbacks; p && rva_ok(p - g_base, 4); p += 4) {
             uint32_t cb = rd32(p);
@@ -853,6 +1121,7 @@ void run_entry(X86 *c) {
         recomp_run(c, g_entry);
     } else
         LOGW("guest process exited with code %u", process_exit_code());
+    loader_detach_modules(c);
     sched_set_guest_thread(false);
 }
 

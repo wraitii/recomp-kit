@@ -310,7 +310,7 @@ bool gdi_focus_rect(uint32_t dc, int32_t l, int32_t t, int32_t r, int32_t b) {
 
 // Validate the packed DIB before reading colors or rows. Resources and BMP
 // files share this format; compressed RLE/JPEG/PNG data is not a DIB here.
-bool gdi_decode_image(uint32_t at, uint32_t bytes, GdiImage *image, uint32_t pixel_offset) {
+static bool parse_dib(uint32_t at, uint32_t bytes, Dib *out, uint32_t pixel_offset) {
     if (!at || bytes < 40 || !gm_valid(at, bytes))
         return false;
     uint32_t header = rd32(at);
@@ -357,7 +357,32 @@ bool gdi_decode_image(uint32_t at, uint32_t bytes, GdiImage *image, uint32_t pix
     d.bits = at + uint32_t(offset);
     d.stride = uint32_t(stride);
     d.size = uint32_t(stride * rows);
-    return snapshot_dib(d, image);
+    *out = d;
+    return true;
+}
+bool gdi_decode_image(uint32_t at, uint32_t bytes, GdiImage *image, uint32_t pixel_offset) {
+    Dib d;
+    return parse_dib(at, bytes, &d, pixel_offset) && snapshot_dib(d, image);
+}
+// LoadImage(LR_CREATEDIBSECTION) and CreateDIBSection expose the source DIB's
+// own bit depth and row order. Keep them: the font loader reads the pixel
+// buffer as packed 24-bpp (three bytes per pixel), so forcing a decoded image
+// back to 32-bpp made it read 32-bit rows as 24-bit and miscount glyphs.
+uint32_t gdi_create_dib_from_memory(uint32_t at, uint32_t bytes, uint32_t pixel_offset) {
+    Dib src;
+    if (!parse_dib(at, bytes, &src, pixel_offset))
+        return 0;
+    uint32_t handle = make_dib(src.width, src.height, src.bpp, src.compression, 0);
+    if (!handle)
+        return 0;
+    Dib &d = *dib_of(handle);
+    d.colors = src.colors;
+    d.masks[0] = src.masks[0];
+    d.masks[1] = src.masks[1];
+    d.masks[2] = src.masks[2];
+    if (d.size)
+        memcpy(g_mem + d.bits, g_mem + src.bits, d.size);
+    return handle;
 }
 uint32_t gdi_create_icon(const GdiImage &image) {
     if (image.pixels.empty())

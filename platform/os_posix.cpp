@@ -322,7 +322,13 @@ int os_exe_path(char *buf, size_t cap) {
 }
 
 static OsFaultFn g_fault_fn = nullptr;
-static void fault_trampoline(int sig) {
+static volatile uint64_t g_fault_addr = 0;
+uint64_t os_fault_address(void) {
+    return g_fault_addr;
+}
+static void fault_trampoline(int sig, siginfo_t *info, void *) {
+    g_fault_addr =
+        (sig == SIGSEGV || sig == SIGBUS) && info ? (uint64_t)(uintptr_t)info->si_addr : 0;
     const char *what = sig == SIGSEGV   ? "SIGSEGV"
                        : sig == SIGBUS  ? "SIGBUS"
                        : sig == SIGABRT ? "an abort from the runtime"
@@ -331,9 +337,14 @@ static void fault_trampoline(int sig) {
 }
 int os_install_fault_handlers(OsFaultFn fn) {
     g_fault_fn = fn;
-    signal(SIGSEGV, fault_trampoline);
-    signal(SIGBUS, fault_trampoline);
-    signal(SIGABRT, fault_trampoline);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = fault_trampoline;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGBUS, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);
     return 1;
 }
 

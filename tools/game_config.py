@@ -173,6 +173,11 @@ def load(game_dir):
         raise ValueError("%s: missing [game] keys: %s" % (source, ", ".join(missing)))
     game["heap_base"] = validate_heap_base(int(game.get("heap_base", HEAP_BASE_DEFAULT)))
     windows_version(game.setdefault("windows_version", "4.10"))
+    # Fail loudly rather than returning 0 from an import whose stdcall arity is
+    # unknown: the un-popped arguments otherwise drift the guest stack.
+    strict_imports = game.setdefault("strict_imports", False)
+    if not isinstance(strict_imports, bool):
+        raise ValueError("%s: [game] strict_imports must be a boolean" % source)
     translate = cfg.setdefault("translate", {})
     load_translate_intrinsics(translate, source)
     resumable = translate.setdefault("resumable_stacks", False)

@@ -47,6 +47,12 @@ void recomp_frame_changed(X86 *c, uint32_t target, uint32_t before, uint32_t aft
     frame_changes++;
 }
 
+/* recomp_check_saved routes a changed callee-saved register here; this fixture
+ * only corrupts EBP, so report it through the frame-change oracle. */
+void recomp_saved_changed(X86 *c, uint32_t target, const RecompSaved *before) {
+    recomp_frame_changed(c, target, before->ebp, c->r[R_EBP]);
+}
+
 void recomp_call(X86 *c, uint32_t target) {
     /* Profiling is disabled here; the real-table profile suite tests that
      * path. An unexpected fallback/lookup from a direct entry must fail. */

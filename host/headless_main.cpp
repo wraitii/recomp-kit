@@ -377,6 +377,26 @@ extern "C" void host_d3d_begin_scene() {
     ++g_d3d_scenes;
 }
 extern "C" void host_d3d_end_scene() {}
+// The D3D7 front end renders through the Rust d3d8-wgpu ABI and never emits a
+// HostD3DDrawSnapshot, so these are the only counters that see its work. They
+// feed the same report line; the old D3D8 command-list callbacks above stay
+// for the Direct3D 8 front end.
+extern "C" void host_d3d7_begin_scene() {
+    ReportLock held;
+    ++g_d3d_scenes;
+}
+extern "C" void host_d3d7_draw() {
+    ReportLock held;
+    ++g_d3d_draws;
+}
+extern "C" void host_d3d7_clear() {
+    ReportLock held;
+    ++g_d3d_clears;
+}
+extern "C" void host_d3d7_texture() {
+    ReportLock held;
+    ++g_d3d_textures;
+}
 extern "C" void host_d3d_draw(const HostD3DDrawSnapshot *cmd) {
     (void)cmd;
     ReportLock held;

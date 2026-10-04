@@ -15,6 +15,7 @@
 // method, not merely a missing one.
 #include "com.h"
 #include "dx.h"
+#include "dxt_decode.h"
 #include "host_api.h"
 #include "ddraw.h"
 #include "../runtime/memory.h"
@@ -75,6 +76,13 @@ static const uint8_t IID_IDirectDrawClipper_[16] =
     IID_BYTES(0x6C14DB85, 0xA733, 0x11CE, 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60);
 static const uint8_t IID_IDirectDrawColorControl_[16] =
     IID_BYTES(0x4B9F0EE0, 0x0D7E, 0x11D0, 0x9B, 0x06, 0x00, 0xA0, 0xC9, 0x03, 0xA3, 0xB8);
+static const uint8_t IID_IDirectDrawSurface7_[16] =
+    IID_BYTES(0x06675A80, 0x3B9B, 0x11D2, 0xB9, 0x2F, 0x00, 0x60, 0x97, 0x97, 0xEA, 0x5B);
+// The Direct3D 7 object is not implemented yet, but its IID is registered so
+// QueryInterface can name it and stop rather than return an error the caller
+// will not check (see ddraw_qi_unsupported).
+static const uint8_t IID_IDirect3D7_[16] =
+    IID_BYTES(0xF5049E77, 0x4861, 0x11D2, 0xA4, 0x07, 0x00, 0xA0, 0xC9, 0x06, 0x29, 0xA8);
 
 namespace {
 void (*present_first_write)() = nullptr;
@@ -321,6 +329,13 @@ uint32_t bytes_per_pixel(uint32_t bpp) {
     return bpp <= 8 ? 1u : (bpp <= 16 ? 2u : 4u);
 }
 
+// A DXT surface stores 4x4 blocks, not pixels. `bpp` stays 0 (what the driver
+// reports in DDPIXELFORMAT) and `fourcc` carries the layout; every path that
+// sizes or strides the storage has to branch on this. See dx/dxt_decode.h.
+bool surface_is_compressed(const ComObj *s) {
+    return s && dxdxt::is_dxt(s->fourcc);
+}
+
 // The recorder, defined below with the rest of the frame machinery. Declared
 // here because every write path above it has to call in.
 struct BlitKeys;
@@ -335,6 +350,80 @@ HostAccessCounts &g_access_ref();
 uint32_t pitch_for(uint32_t width, uint32_t bpp) {
     uint32_t row = width * bytes_per_pixel(bpp);
     return (row + 15u) & ~15u; // real drivers align; 16 matches every mode here
+}
+
+// The surface's pixel/block storage size. Equal to pitch*height for an
+// uncompressed surface (the DXT pitch is a block-row pitch, so it is not).
+uint64_t surface_storage_bytes(const ComObj *s) {
+    if (surface_is_compressed(s))
+        return dxdxt::linear_size(s->width, s->height, s->fourcc);
+    return (uint64_t)pitch_for(s->width, s->bpp) * s->height;
+}
+
+// ---------------------------------------------------------------------------
+// Video-memory budget
+// ---------------------------------------------------------------------------
+// The engine's LH3DVRAM prefills a pool of texture surfaces until CreateSurface
+// fails, then uses the pool as its texture cache. A driver reports
+// DDERR_OUTOFVIDEOMEMORY once VRAM is full and the pool stops; this shim's
+// surface pixels live in the guest heap, so without a cap the pool drains it
+// (~200 MB at the 256 MB MaxVRAM default) and the engine faults when a later
+// allocation cannot be made. The cap is the reported VRAM total; it is a
+// period-card 32 MB by default and can be overridden with
+// RECOMP_DDRAW_VRAM_MB (0 restores unbounded), or with ddraw_set_vram_total
+// from a test. Only explicit video-memory surfaces are charged.
+static constexpr uint32_t VRAM_UNSET = 0xffffffffu;
+uint32_t g_vram_total_override = VRAM_UNSET;
+
+uint32_t ddraw_default_vram_total() {
+    if (g_vram_total_override != VRAM_UNSET)
+        return g_vram_total_override;
+    if (const char *s = recomp_env("DDRAW_VRAM_MB")) {
+        unsigned long mb = strtoul(s, nullptr, 0);
+        return mb ? (uint32_t)mb * 1024u * 1024u : 0u;
+    }
+    return 32u * 1024u * 1024u;
+}
+
+extern "C" void ddraw_set_vram_total(uint32_t bytes) {
+    g_vram_total_override = bytes;
+}
+
+bool surface_uses_vram(const ComObj *s) {
+    return (s->caps & (DDSCAPS_VIDEOMEMORY | DDSCAPS_LOCALVIDMEM | DDSCAPS_NONLOCALVIDMEM)) != 0;
+}
+
+// The effective capacity, so a test override applies to an object created
+// before the test ran.
+uint32_t ddraw_vram_capacity(ComObj *dd) {
+    if (g_vram_total_override != VRAM_UNSET)
+        return g_vram_total_override;
+    return dd ? dd->vram_total : 0;
+}
+
+// Charge a new surface against its DirectDraw object. False means it does not
+// fit; the caller fails the create with DDERR_OUTOFVIDEOMEMORY.
+bool surface_charge_vram(ComObj *dd, ComObj *s) {
+    uint32_t capacity = ddraw_vram_capacity(dd);
+    if (!dd || !capacity || !surface_uses_vram(s))
+        return true;
+    uint64_t bytes = surface_storage_bytes(s);
+    if (dd->vram_used + bytes > capacity)
+        return false;
+    dd->vram_used += bytes;
+    s->counts_vram = true;
+    return true;
+}
+
+void surface_refund_vram(ComObj *s) {
+    if (!s->counts_vram)
+        return;
+    s->counts_vram = false;
+    ComObj *dd = s->owner_dd ? com_get(s->owner_dd) : nullptr;
+    if (!dd)
+        return;
+    uint64_t bytes = surface_storage_bytes(s);
+    dd->vram_used = dd->vram_used >= bytes ? dd->vram_used - bytes : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +450,13 @@ uint32_t desc_caps_off() {
 void write_pixel_format(uint32_t addr, const ComObj *s) {
     gm_zero(addr, DDPF_SIZE);
     wr32(addr + DDPF_OFF_dwSize, DDPF_SIZE);
+    if (surface_is_compressed(s)) {
+        // A compressed format reports DDPF_FOURCC and no bit count, exactly as
+        // the driver does; the masks stay zero.
+        wr32(addr + DDPF_OFF_dwFlags, DDPF_FOURCC);
+        wr32(addr + DDPF_OFF_dwFourCC, s->fourcc);
+        return;
+    }
     if (s->bpp <= 8) {
         wr32(addr + DDPF_OFF_dwFlags, DDPF_RGB | DDPF_PALETTEINDEXED8);
         wr32(addr + DDPF_OFF_dwRGBBitCount, 8);
@@ -384,10 +480,22 @@ void fill_desc(uint32_t addr, const ComObj *s, bool v2, uint32_t lpsurface) {
         return;
     gm_zero(addr, size);
     wr32(addr + DDSD_OFF_dwSize, size);
-    uint32_t flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PITCH | DDSD_PIXELFORMAT;
+    uint32_t flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT;
     wr32(addr + DDSD_OFF_dwHeight, s->height);
     wr32(addr + DDSD_OFF_dwWidth, s->width);
-    wr32(addr + DDSD_OFF_lPitch, s->pitch);
+    // A driver reports a compressed surface's TOP-LEVEL linear size, not the
+    // block-row pitch, and flags it DDSD_LINEARSIZE. The engine reads that
+    // dword as the byte count to copy into the surface (fn_0087F6D0), so a
+    // block-row pitch here would truncate every DXT texture to one row.
+    if (surface_is_compressed(s)) {
+        flags |= DDSD_LINEARSIZE;
+        // dwLinearSize and lPitch share offset 0x10; only the flag says which
+        // meaning applies.
+        wr32(addr + DDSD_OFF_lPitch, dxdxt::linear_size(s->width, s->height, s->fourcc));
+    } else {
+        flags |= DDSD_PITCH;
+        wr32(addr + DDSD_OFF_lPitch, s->pitch);
+    }
     write_pixel_format(addr + DDSD_OFF_ddpfPixelFormat, s);
     if (lpsurface) {
         flags |= DDSD_LPSURFACE;
@@ -411,6 +519,7 @@ void fill_desc(uint32_t addr, const ComObj *s, bool v2, uint32_t lpsurface) {
 // Surfaces
 // ---------------------------------------------------------------------------
 void surface_destroy(ComObj *s) {
+    surface_refund_vram(s);
     if (s->dc_handle)
         gdi_unbind_surface_dc(s->dc_handle);
     // A surface that is going away takes its pixels with it, and the host may
@@ -483,6 +592,26 @@ bool surface_alloc_pixels(ComObj *s) {
         LOGW("ddraw: refusing a %ux%u surface; the edge limit is %u", s->width, s->height,
              MAX_SURFACE_EDGE);
         return false;
+    }
+    if (surface_is_compressed(s)) {
+        // A compressed surface's pitch is one row of 4x4 blocks; its storage
+        // is pitch * block_rows, so the usual pitch*height is wrong.
+        s->pitch = dxdxt::pitch(s->width, s->fourcc);
+        uint64_t compressed = dxdxt::linear_size(s->width, s->height, s->fourcc);
+        if (!compressed || compressed > (uint64_t)GUEST_SIZE) {
+            LOGW("ddraw: a %ux%u DXT surface needs more than the guest arena holds", s->width,
+                 s->height);
+            return false;
+        }
+        s->pixels_bytes = (uint32_t)compressed;
+        s->pixels = heap_alloc(s->pixels_bytes, true, 16);
+        if (!s->pixels) {
+            LOGW("ddraw: out of guest memory for a %ux%u DXT surface (%u bytes)", s->width,
+                 s->height, s->pixels_bytes);
+            return false;
+        }
+        s->owns_pixels = true;
+        return true;
     }
     s->pitch = pitch_for(s->width, s->bpp);
     // pitch and height are each bounded well below 2^32, so this product is
@@ -641,6 +770,22 @@ void write_pixel(const ComObj *s, int32_t x, int32_t y, uint32_t v) {
     }
 }
 
+// Quantises an 8-bit channel into a mask's field by truncation, the same rule
+// d3d7_rgb888_to_rgb565 uses for the 32->16 boundary. The DXT decode produces
+// 8-bit channels; the destination here is one of the formats the engine
+// enumerated (A4R4G4B4 in the 1.42 run), so the pack has to honour its masks.
+uint32_t pack_channel(uint32_t value, uint32_t mask, uint32_t shift) {
+    if (!mask)
+        return 0;
+    // The masks are contiguous, so the number of set bits is the field width
+    // and the caller supplies the shift (count of trailing zero bits).
+    uint32_t bits = 0;
+    for (uint32_t m = mask; m; m &= m - 1u)
+        ++bits;
+    uint32_t v = (value >> (8u - bits)) & ((1u << bits) - 1u);
+    return v << shift;
+}
+
 // The one blit primitive behind Blt and BltFast: nearest-neighbour stretch
 // with an optional source colour key. src == null fills with `fill`.
 // The colour keys in force for one blit. A source key names the pixels of the
@@ -665,6 +810,63 @@ void blit(ComObj *dst, const int32_t d[4], const ComObj *src, const int32_t sr[4
     int32_t dw = d[2] - d[0], dh = d[3] - d[1];
     if (dw <= 0 || dh <= 0 || !dst->pixels)
         return;
+
+    // A compressed source is decoded block by block into the destination's
+    // pixels. This is the path that actually fills the engine's VRAM texture
+    // pool: LH3DVRAM Blts a DXT surface into a 16bpp pool surface and binds
+    // that. The guest's DXT bytes are never modified. `keys` still apply,
+    // compared against the destination's own pixel format.
+    if (src && !fill && surface_is_compressed(src)) {
+        if (surface_is_compressed(dst)) {
+            log_once("ddraw.blt.dxtdst",
+                     "ddraw: Blt into a DXT surface is not supported; copying nothing");
+            return;
+        }
+        int32_t sw = sr[2] - sr[0], sh = sr[3] - sr[1];
+        if (sw <= 0 || sh <= 0)
+            return;
+        auto mask_shift = [](uint32_t mask) {
+            uint32_t shift = 0;
+            while (!(mask & 1u) && shift < 32u) {
+                mask >>= 1u;
+                ++shift;
+            }
+            return shift;
+        };
+        const uint32_t rs = mask_shift(dst->rmask), gs = mask_shift(dst->gmask),
+                       bs = mask_shift(dst->bmask), as = mask_shift(dst->amask);
+        const uint8_t *base = gm_ptr(src->pixels);
+        const bool stretch = (sw != dw) || (sh != dh);
+        for (int32_t y = 0; y < dh; ++y) {
+            int32_t syy = stretch ? sr[1] + (int32_t)((int64_t)y * sh / dh) : sr[1] + y;
+            for (int32_t x = 0; x < dw; ++x) {
+                int32_t sxx = stretch ? sr[0] + (int32_t)((int64_t)x * sw / dw) : sr[0] + x;
+                dxdxt::Rgba px;
+                if (!dxdxt::sample(base, src->pitch, src->fourcc, (uint32_t)sxx, (uint32_t)syy,
+                                   &px))
+                    continue;
+                if (keys.src) {
+                    uint32_t keyed =
+                        pack_channel(px.r, dst->rmask, rs) | pack_channel(px.g, dst->gmask, gs) |
+                        pack_channel(px.b, dst->bmask, bs) | pack_channel(px.a, dst->amask, as);
+                    if (keyed >= keys.src_lo && keyed <= keys.src_hi)
+                        continue;
+                }
+                if (keys.dst) {
+                    uint32_t dv = read_pixel(dst, d[0] + x, d[1] + y);
+                    if (dv < keys.dst_lo || dv > keys.dst_hi)
+                        continue;
+                }
+                uint32_t v =
+                    pack_channel(px.r, dst->rmask, rs) | pack_channel(px.g, dst->gmask, gs) |
+                    pack_channel(px.b, dst->bmask, bs) | pack_channel(px.a, dst->amask, as);
+                write_pixel(dst, d[0] + x, d[1] + y, v);
+                if (coverage)
+                    coverage[(size_t)y * dw + x] = 1;
+            }
+        }
+        return;
+    }
 
     if (fill) {
         uint32_t bpp_bytes = bytes_per_pixel(dst->bpp);
@@ -785,10 +987,24 @@ ComObj *surface_arg(X86 *c, int i) {
     return (s && s->kind == K_SURFACE) ? s : nullptr;
 }
 
-// Whether `this` is one of the DDSURFACEDESC2-era interfaces.
+// Whether an interface is one of the DDSURFACEDESC2-era interfaces.
+bool dd_is_v2_iface(ComIface f) {
+    return f == IF_DIRECTDRAW4 || f == IF_DIRECTDRAW7;
+}
+
+// Which surface interface matches a DirectDraw or surface interface, as the
+// real runtime does: version for version.
+ComIface surface_iface_of(ComIface f) {
+    if (f == IF_DIRECTDRAW7 || f == IF_DDSURFACE7)
+        return IF_DDSURFACE7;
+    if (f == IF_DIRECTDRAW4 || f == IF_DDSURFACE4)
+        return IF_DDSURFACE4;
+    return IF_DDSURFACE;
+}
+
 bool this_is_v2_iface(X86 *c) {
     ComIface f = com_iface_of(arg(c, 0));
-    return f == IF_DDSURFACE4 || f == IF_DIRECTDRAW4;
+    return f == IF_DDSURFACE4 || f == IF_DDSURFACE7 || dd_is_v2_iface(f);
 }
 
 } // namespace
@@ -813,6 +1029,11 @@ const ComObj *ddraw_effective_palette(const ComObj *s) {
 void surface_pixels_changed(ComObj *s) {
     if (!s)
         return;
+    // A draw that samples these bytes (the D3D8 and D3D7 texture paths both
+    // key their upload cache on it) must see the new content. The generation
+    // is monotonic and shared with the D3D8 level surfaces; a DirectDraw write
+    // to one of those is equally a content change.
+    ++s->d3d8_content_generation;
     // The content is now different from whatever any record referred to.
     ddraw_after_write(s);
     if (s->is_primary) {
@@ -853,6 +1074,7 @@ void ddraw_present(ComObj *s) {
     // Whatever the Direct3D device drew belongs in these pixels before they
     // are read: on real hardware the rasterizer wrote here.
     d3d_flush_surface(s, "present");
+    d3d7_flush_surface(s);
     const ComObj *pal = s->bpp <= 8 ? effective_palette(s) : nullptr;
     if (s->bpp <= 8 && !pal) {
         log_once("ddraw.nopal", "ddraw: presenting an 8-bit primary with no palette attached; "
@@ -1571,7 +1793,7 @@ void ddraw_before_write(ComObj *s) {
     r.h = (int)s->height;
     r.pitch = (int)s->pitch;
     r.bpp = (int)s->bpp;
-    size_t n = (size_t)s->pitch * s->height;
+    size_t n = s->pixels_bytes;
     r.bytes.resize(n);
     memcpy(r.bytes.data(), gm_ptr(s->pixels), n);
     r.snapshotted = true;
@@ -1616,7 +1838,7 @@ int host_revision_lease(HostSurfaceKey key, HostPixels *out) {
         r.h = (int)s->height;
         r.pitch = (int)s->pitch;
         r.bpp = (int)s->bpp;
-        size_t n = (size_t)s->pitch * s->height;
+        size_t n = s->pixels_bytes;
         r.bytes.resize(n);
         memcpy(r.bytes.data(), gm_ptr(s->pixels), n);
         r.snapshotted = true;
@@ -2431,6 +2653,11 @@ void record_cpu_write_rects(ComObj *s, const std::vector<HostDirtyRect> &boxes) 
 void ddraw_refresh_retained_writes(ComObj *s, const int32_t rect[4]) {
     if (!s || !s->retained_pointer || !s->pixels)
         return;
+    // The pixel-diff baseline is width*height pixels; a compressed surface's
+    // block layout does not fit it and the work is never needed (DXT surfaces
+    // are decode scratch the guest fills before a Blt).
+    if (surface_is_compressed(s))
+        return;
     bool fresh = false;
     Baseline &b = baseline_of(s, &fresh);
     int32_t y0 = rect[1], y1 = rect[3];
@@ -2774,6 +3001,8 @@ void Surface_Blt(X86 *c) {
     // about to be read or written with the CPU.
     d3d_flush_surface(dst, "Blt dst");
     d3d_flush_surface(src, "Blt src");
+    d3d7_flush_surface(dst);
+    d3d7_flush_surface(src);
 
     // The destination may hang off the surface; Blt clips rather than
     // refusing, and the clip happens below once the source is known so a
@@ -2849,6 +3078,22 @@ void Surface_Blt(X86 *c) {
                      "ddraw: Blt asked for DDBLT_KEYDEST but the destination surface has "
                      "no destination colour key; writing every pixel");
         }
+        // A compressed source is decode scratch: the guest filled it and the
+        // engine is about to Blt it into a pool texture. Its block layout has
+        // no pixel revision the recorder can lease, so decode straight into
+        // the destination and skip the record. The destination's own upload
+        // path picks the new bytes up. Pixels written through a lock are not
+        // visible to the recorder either, which is why the Blt goes through
+        // the same write-then-publish sequence.
+        if (surface_is_compressed(src)) {
+            ddraw_before_write(dst);
+            blit(dst, d, src, sr, keys, false, 0, nullptr);
+            const uint32_t before = ddraw_surface_revision(dst->id);
+            surface_pixels_changed(dst);
+            baseline_absorb(dst, d, before);
+            com_ret(c, DD_OK);
+            return;
+        }
         // The source's pixels are about to be read.
         ++g_access_ref().blt_source;
         // And a destination key means the DESTINATION is read too, to decide
@@ -2893,6 +3138,8 @@ void Surface_BltFast(X86 *c) {
     }
     d3d_flush_surface(dst, "BltFast dst");
     d3d_flush_surface(src, "BltFast src");
+    d3d7_flush_surface(dst);
+    d3d7_flush_surface(src);
 
     int32_t sr[4];
     if (!read_rect(src_rect, src, sr)) {
@@ -2953,6 +3200,17 @@ void Surface_BltFast(X86 *c) {
         keys.dst_lo = dst->ckey_dst_lo;
         keys.dst_hi = dst->ckey_dst_hi;
     }
+    // A compressed source: decode straight into the destination; see
+    // Surface_Blt for why the recorder is skipped.
+    if (surface_is_compressed(src)) {
+        ddraw_before_write(dst);
+        blit(dst, d, src, sr, keys, false, 0, nullptr);
+        const uint32_t before = ddraw_surface_revision(dst->id);
+        surface_pixels_changed(dst);
+        baseline_absorb(dst, d, before);
+        com_ret(c, DD_OK);
+        return;
+    }
     ++g_access_ref().blt_source;
     if (keys.dst)
         ++g_access_ref().dstkey_read;
@@ -2997,7 +3255,7 @@ void Surface_EnumAttachedSurfaces(X86 *c) {
         return;
     }
     bool v2 = this_is_v2_iface(c);
-    ComIface want = v2 ? IF_DDSURFACE4 : IF_DDSURFACE;
+    ComIface want = surface_iface_of(com_iface_of(arg(c, 0)));
     for (uint32_t id = s->back_obj; id;) {
         ComObj *b = com_get(id);
         if (!b)
@@ -3044,6 +3302,8 @@ void Surface_Flip(X86 *c) {
     // anything the device drew has to be in it first.
     d3d_flush_surface(s, "Flip front");
     d3d_flush_surface(back, "Flip back");
+    d3d7_flush_surface(s);
+    d3d7_flush_surface(back);
     // And anything a frame still holds has to be copied out of it, because
     // after the swap each surface's revision would name the other's bytes.
     ddraw_preserve_before_storage_change(s);
@@ -3201,6 +3461,7 @@ void Surface_GetDC(X86 *c) {
         return;
     }
     d3d_read_surface(s, nullptr, HOST_READ_GETDC);
+    d3d7_flush_surface(s);
     int32_t r[4] = {0, 0, (int32_t)s->width, (int32_t)s->height};
     ddraw_before_write(s);
     if (!s->dc_handle) {
@@ -3321,19 +3582,37 @@ void Surface_Lock(X86 *c) {
     // The guest is about to hold a pointer into these pixels, so the device's
     // rendering has to be in them before it does.
     d3d_flush_surface(s, "Lock");
+    d3d7_flush_surface(s);
 
     // read_rect already clamped the rectangle to the surface, so this offset
     // is inside the allocation; the span is re-checked anyway because the
-    // pixel memory may have been replaced by SetSurfaceDesc.
-    uint64_t bpp_bytes = bytes_per_pixel(s->bpp);
-    uint64_t off = (uint64_t)(uint32_t)r[1] * s->pitch + (uint64_t)(uint32_t)r[0] * bpp_bytes;
-    // The locked region ends at the right edge of its last row, not at the
-    // start of the row after it: (h-1) whole rows plus w pixels. Counting a
-    // full trailing row would reject a legal rectangle that touches the
-    // bottom edge whenever its left edge is greater than zero.
-    uint64_t rows = (uint64_t)(uint32_t)(r[3] - r[1]);
-    uint64_t width_bytes = (uint64_t)(uint32_t)(r[2] - r[0]) * bpp_bytes;
-    uint64_t need = rows ? (rows - 1) * s->pitch + width_bytes : 0;
+    // pixel memory may have been replaced by SetSurfaceDesc. A compressed
+    // surface addresses 4x4 blocks, so the rectangle has to name whole
+    // blocks and the offset is measured in block rows.
+    uint64_t off = 0;
+    uint64_t need = 0;
+    if (surface_is_compressed(s)) {
+        if ((r[0] & 3) || (r[1] & 3)) {
+            com_ret(c, DDERR_INVALIDRECT);
+            return;
+        }
+        const uint32_t bx = (uint32_t)r[0] / 4u, by = (uint32_t)r[1] / 4u;
+        off = (uint64_t)by * s->pitch + (uint64_t)bx * dxdxt::block_bytes(s->fourcc);
+        const uint64_t block_rows = ((uint64_t)(uint32_t)(r[3] - r[1]) + 3u) / 4u;
+        const uint64_t block_cols = ((uint64_t)(uint32_t)(r[2] - r[0]) + 3u) / 4u;
+        need = block_rows ? (block_rows - 1) * s->pitch + block_cols * dxdxt::block_bytes(s->fourcc)
+                          : 0;
+    } else {
+        uint64_t bpp_bytes = bytes_per_pixel(s->bpp);
+        off = (uint64_t)(uint32_t)r[1] * s->pitch + (uint64_t)(uint32_t)r[0] * bpp_bytes;
+        // The locked region ends at the right edge of its last row, not at the
+        // start of the row after it: (h-1) whole rows plus w pixels. Counting a
+        // full trailing row would reject a legal rectangle that touches the
+        // bottom edge whenever its left edge is greater than zero.
+        uint64_t rows = (uint64_t)(uint32_t)(r[3] - r[1]);
+        uint64_t width_bytes = (uint64_t)(uint32_t)(r[2] - r[0]) * bpp_bytes;
+        need = rows ? (rows - 1) * s->pitch + width_bytes : 0;
+    }
     if (off + need > (uint64_t)s->pixels_bytes || !gm_fits(s->pixels, off + need)) {
         com_ret(c, DDERR_INVALIDRECT);
         return;
@@ -3349,8 +3628,12 @@ void Surface_Lock(X86 *c) {
     // What this region holds now, so Unlock can record what the guest's own
     // stores changed. EVERY accepted lock, not only the outermost: a nested
     // lock can name a different rectangle, and one taken beneath a read-only
-    // outer lock is the only record of what it wrote.
-    lock_shadow_take(s, r, arg(c, 3), p, true);
+    // outer lock is the only record of what it wrote. A compressed surface is
+    // a decode scratch buffer the guest fills itself and never presents, and
+    // its byte layout is blocks, which the pixel-diff machinery does not
+    // model; skip the shadow so a Lock cannot read past the block storage.
+    if (!surface_is_compressed(s))
+        lock_shadow_take(s, r, arg(c, 3), p, true);
     if (!(arg(c, 3) & DDLOCK_READONLY))
         s->retained_pointer = true;
     ++s->lock_count;
@@ -3552,7 +3835,7 @@ void Surface_Unlock(X86 *c) {
     const int32_t *unlock_rect = nullptr;
     uint32_t unlock_ptr = 0;
     uint32_t a1 = arg(c, 1);
-    if (com_iface_of(arg(c, 0)) == IF_DDSURFACE4) {
+    if (com_iface_of(arg(c, 0)) == IF_DDSURFACE4 || com_iface_of(arg(c, 0)) == IF_DDSURFACE7) {
         if (a1 && gm_valid(a1, 16)) {
             for (int i = 0; i < 4; ++i)
                 ur[i] = (int32_t)rd32(a1 + (uint32_t)i * 4);
@@ -3670,9 +3953,127 @@ void Surface_SetSurfaceDesc(X86 *c) {
 }
 
 // --- IDirectDrawSurface4 additions
-DX_STUB(Surface_SetPrivateData, DDERR_UNSUPPORTED)
-DX_STUB(Surface_GetPrivateData, DDERR_NOTFOUND)
-DX_STUB(Surface_FreePrivateData, DDERR_NOTFOUND)
+// Private data is a host-side copy of the guest's bytes, keyed by the caller's
+// GUID. It is per surface and lives exactly as long as the surface object does.
+int surface_priv_index(ComObj *s, const uint8_t *guid) {
+    for (size_t i = 0; i < s->priv_data.size(); ++i)
+        if (memcmp(s->priv_data[i].guid, guid, 16) == 0)
+            return (int)i;
+    return -1;
+}
+
+void Surface_SetPrivateData(X86 *c) {
+    ComObj *s = this_surface(c);
+    uint32_t tag = arg(c, 1), data = arg(c, 2), size = arg(c, 3);
+    if (!s || !tag || !gm_valid(tag, 16)) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    if (size && (!data || !gm_valid(data, size))) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    const uint8_t *guid = gm_ptr(tag);
+    int idx = surface_priv_index(s, guid);
+    if (idx < 0) {
+        s->priv_data.push_back(SurfacePrivateData{});
+        memcpy(s->priv_data.back().guid, guid, 16);
+        idx = (int)s->priv_data.size() - 1;
+    }
+    if (size)
+        s->priv_data[idx].bytes.assign(gm_ptr(data), gm_ptr(data) + size);
+    else
+        s->priv_data[idx].bytes.clear();
+    com_ret(c, DD_OK);
+}
+
+void Surface_GetPrivateData(X86 *c) {
+    ComObj *s = this_surface(c);
+    uint32_t tag = arg(c, 1), buf = arg(c, 2), pcb = arg(c, 3);
+    if (!s || !tag || !gm_valid(tag, 16) || !pcb || !gm_valid(pcb, 4)) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    int idx = surface_priv_index(s, gm_ptr(tag));
+    if (idx < 0) {
+        com_ret(c, DDERR_NOTFOUND);
+        return;
+    }
+    uint32_t size = (uint32_t)s->priv_data[idx].bytes.size();
+    uint32_t have = rd32(pcb);
+    wr32(pcb, size);
+    if (!buf) {
+        com_ret(c, DD_OK);
+        return;
+    }
+    if (have < size) {
+        com_ret(c, DDERR_MOREDATA);
+        return;
+    }
+    if (size && !gm_valid(buf, size)) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    if (size)
+        memcpy(gm_ptr(buf), s->priv_data[idx].bytes.data(), size);
+    com_ret(c, DD_OK);
+}
+
+void Surface_FreePrivateData(X86 *c) {
+    ComObj *s = this_surface(c);
+    uint32_t tag = arg(c, 1);
+    if (!s || !tag || !gm_valid(tag, 16)) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    int idx = surface_priv_index(s, gm_ptr(tag));
+    if (idx < 0) {
+        com_ret(c, DDERR_NOTFOUND);
+        return;
+    }
+    s->priv_data.erase(s->priv_data.begin() + idx);
+    com_ret(c, DD_OK);
+}
+
+// --- IDirectDrawSurface7 additions
+void Surface_SetPriority(X86 *c) {
+    ComObj *s = this_surface(c);
+    if (!s) {
+        com_ret(c, DDERR_INVALIDOBJECT);
+        return;
+    }
+    s->surface_priority = arg(c, 1);
+    com_ret(c, DD_OK);
+}
+void Surface_GetPriority(X86 *c) {
+    ComObj *s = this_surface(c);
+    uint32_t out = arg(c, 1);
+    if (!s || !out || !gm_valid(out, 4)) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    wr32(out, s->surface_priority);
+    com_ret(c, DD_OK);
+}
+void Surface_SetLOD(X86 *c) {
+    ComObj *s = this_surface(c);
+    if (!s) {
+        com_ret(c, DDERR_INVALIDOBJECT);
+        return;
+    }
+    s->surface_lod = arg(c, 1);
+    com_ret(c, DD_OK);
+}
+void Surface_GetLOD(X86 *c) {
+    ComObj *s = this_surface(c);
+    uint32_t out = arg(c, 1);
+    if (!s || !out || !gm_valid(out, 4)) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    wr32(out, s->surface_lod);
+    com_ret(c, DD_OK);
+}
 
 void Surface_GetUniquenessValue(X86 *c) {
     ComObj *s = this_surface(c);
@@ -3745,6 +4146,24 @@ const ComMethod g_surface4[] = {
     {"FreePrivateData", 2, Surface_FreePrivateData},
     {"GetUniquenessValue", 2, Surface_GetUniquenessValue},
     {"ChangeUniquenessValue", 1, Surface_ChangeUniquenessValue},
+};
+
+// IDirectDrawSurface7 is the surface4 table plus its four v7 slots.
+const ComMethod g_surface7[] = {
+    SURFACE_COMMON_SLOTS,
+    {"GetDDInterface", 2, Surface_GetDDInterface},
+    {"PageLock", 2, Surface_PageLock},
+    {"PageUnlock", 2, Surface_PageUnlock},
+    {"SetSurfaceDesc", 3, Surface_SetSurfaceDesc},
+    {"SetPrivateData", 5, Surface_SetPrivateData},
+    {"GetPrivateData", 4, Surface_GetPrivateData},
+    {"FreePrivateData", 2, Surface_FreePrivateData},
+    {"GetUniquenessValue", 2, Surface_GetUniquenessValue},
+    {"ChangeUniquenessValue", 1, Surface_ChangeUniquenessValue},
+    {"SetPriority", 2, Surface_SetPriority},
+    {"GetPriority", 2, Surface_GetPriority},
+    {"SetLOD", 2, Surface_SetLOD},
+    {"GetLOD", 2, Surface_GetLOD},
 };
 
 // ===========================================================================
@@ -4098,7 +4517,7 @@ void DD_CreatePalette(X86 *c) {
 }
 
 // The shared body of IDirectDraw::CreateSurface and IDirectDraw4's.
-void create_surface(X86 *c, bool v2_iface) {
+void create_surface(X86 *c, ComIface surface_iface) {
     ComObj *dd = this_ddraw(c);
     uint32_t desc = arg(c, 1);
     uint32_t out = arg(c, 2);
@@ -4107,7 +4526,7 @@ void create_surface(X86 *c, bool v2_iface) {
         return;
     }
     com_out_ptr(out, 0);
-    bool v2 = desc_is_v2(desc, v2_iface);
+    bool v2 = desc_is_v2(desc, surface_iface == IF_DDSURFACE4 || surface_iface == IF_DDSURFACE7);
     if (!gm_valid(desc, v2 ? DDSD2_SIZE : DDSD_SIZE)) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
@@ -4155,29 +4574,37 @@ void create_surface(X86 *c, bool v2_iface) {
             uint32_t pf_flags = rd32(pf + DDPF_OFF_dwFlags);
             uint32_t bits = rd32(pf + DDPF_OFF_dwRGBBitCount);
             if (pf_flags & DDPF_FOURCC) {
-                // A FourCC the driver does not have is a pixel-format
-                // refusal, not a surface-type one. GetFourCCCodes reports
-                // none and EnumTextureFormats advertises none, so a caller
-                // asking for one is asking outside the advertised set and
-                // will retry with a format that was advertised.
-                // DDERR_INVALIDSURFACETYPE would instead tell it the surface
-                // caps were wrong, and it would give up.
+                // The engine creates DXT1/DXT3 surfaces itself as decode
+                // sources: LH3DVRAM loads a compressed texture into one, then
+                // Blt-decodes it into a normal 16bpp pool texture
+                // (fn_00837DF0 -> fn_00838580 -> fn_0087F6D0, and the copy
+                // path in fn_0087F6D0). Refusing the CreateSurface made every
+                // DXT texture fail: the following Blt from the null surface
+                // failed, the pool texture stayed zeroed, and an alpha-tested
+                // foliage/tree draw then discarded every fragment.
+                //
+                // A FourCC the driver does not have is still a pixel-format
+                // refusal, not a surface-type one. PVRC stays refused.
                 uint32_t fcc = rd32(pf + DDPF_OFF_dwFourCC);
-                char txt[5] = {(char)(fcc & 0xff), (char)((fcc >> 8) & 0xff),
-                               (char)((fcc >> 16) & 0xff), (char)((fcc >> 24) & 0xff), 0};
-                for (int i = 0; i < 4; i++)
-                    if (txt[i] < 0x20 || txt[i] > 0x7e)
-                        txt[i] = '.';
-                log_once("ddraw.fourcc",
-                         "ddraw: CreateSurface FourCC '%s' (%08x) is not an "
-                         "advertised pixel format: DDERR_INVALIDPIXELFORMAT",
-                         txt, fcc);
-                com_release(s);
-                com_ret(c, DDERR_INVALIDPIXELFORMAT);
-                return;
-            }
-            if (bits)
+                if (!dxdxt::is_dxt(fcc)) {
+                    char txt[5] = {(char)(fcc & 0xff), (char)((fcc >> 8) & 0xff),
+                                   (char)((fcc >> 16) & 0xff), (char)((fcc >> 24) & 0xff), 0};
+                    for (int i = 0; i < 4; i++)
+                        if (txt[i] < 0x20 || txt[i] > 0x7e)
+                            txt[i] = '.';
+                    log_once("ddraw.fourcc",
+                             "ddraw: CreateSurface FourCC '%s' (%08x) is not an "
+                             "advertised pixel format: DDERR_INVALIDPIXELFORMAT",
+                             txt, fcc);
+                    com_release(s);
+                    com_ret(c, DDERR_INVALIDPIXELFORMAT);
+                    return;
+                }
+                s->fourcc = fcc;
+                s->bpp = 0; // a compressed format reports no bit count
+            } else if (bits) {
                 s->bpp = bits;
+            }
         }
         if (flags & DDSD_ZBUFFERBITDEPTH)
             s->bpp = rd32(desc + DDSD_OFF_dwMipMapCount);
@@ -4216,7 +4643,13 @@ void create_surface(X86 *c, bool v2_iface) {
         s->has_ckey_dst = true;
     }
 
+    if (!surface_charge_vram(dd, s)) {
+        com_release(s);
+        com_ret(c, DDERR_OUTOFVIDEOMEMORY);
+        return;
+    }
     if (!surface_alloc_pixels(s)) {
+        surface_refund_vram(s);
         com_release(s);
         com_ret(c, DDERR_OUTOFMEMORY);
         return;
@@ -4243,10 +4676,11 @@ void create_surface(X86 *c, bool v2_iface) {
         b->amask = s->amask;
         b->caps = (caps & ~(DDSCAPS_PRIMARYSURFACE | DDSCAPS_VISIBLE | DDSCAPS_FRONTBUFFER)) |
                   DDSCAPS_BACKBUFFER | DDSCAPS_FLIP;
-        if (!surface_alloc_pixels(b)) {
+        if (!surface_charge_vram(dd, b) || !surface_alloc_pixels(b)) {
+            surface_refund_vram(b);
             com_release(b);
             com_release(s);
-            com_ret(c, DDERR_OUTOFMEMORY);
+            com_ret(c, DDERR_OUTOFVIDEOMEMORY);
             return;
         }
         tail->back_obj = b->id;
@@ -4255,7 +4689,7 @@ void create_surface(X86 *c, bool v2_iface) {
         dd->surfaces.push_back(b->id);
     }
     dd->surfaces.push_back(s->id);
-    ComIface want = v2_iface ? IF_DDSURFACE4 : IF_DDSURFACE;
+    ComIface want = surface_iface;
     uint32_t view = com_view(s, want);
     if (!view) {
         com_release(s);
@@ -4273,8 +4707,8 @@ void create_surface(X86 *c, bool v2_iface) {
 
 // Keep every refusal, including repeated capability probes. The general COM
 // error logger deduplicates by HRESULT and cannot identify the requested surface.
-void create_surface_with_diagnostic(X86 *c, bool v2_iface) {
-    create_surface(c, v2_iface);
+void create_surface_with_diagnostic(X86 *c, ComIface surface_iface) {
+    create_surface(c, surface_iface);
     const uint32_t hr = c->r[R_EAX];
     if (!(hr & 0x80000000u))
         return;
@@ -4297,7 +4731,10 @@ void create_surface_with_diagnostic(X86 *c, bool v2_iface) {
          "\"surface\":\"%s\",\"descriptor_readable\":%s,\"descriptor_flags\":%u,"
          "\"caps\":%u,\"requested_width\":%u,\"requested_height\":%u,"
          "\"requested_format\":%s,\"display_mode\":[%u,%u,%u]}",
-         v2_iface ? "IDirectDraw4" : "IDirectDraw", hr,
+         surface_iface == IF_DDSURFACE7   ? "IDirectDraw7"
+         : surface_iface == IF_DDSURFACE4 ? "IDirectDraw4"
+                                          : "IDirectDraw",
+         hr,
          !readable || !(flags & DDSD_CAPS)
              ? "unknown"
              : ((caps & DDSCAPS_PRIMARYSURFACE) ? "primary" : "offscreen"),
@@ -4308,10 +4745,13 @@ void create_surface_with_diagnostic(X86 *c, bool v2_iface) {
 }
 
 void DD_CreateSurface(X86 *c) {
-    create_surface_with_diagnostic(c, false);
+    create_surface_with_diagnostic(c, IF_DDSURFACE);
 }
 void DD_CreateSurface4(X86 *c) {
-    create_surface_with_diagnostic(c, true);
+    create_surface_with_diagnostic(c, IF_DDSURFACE4);
+}
+void DD_CreateSurface7(X86 *c) {
+    create_surface_with_diagnostic(c, IF_DDSURFACE7);
 }
 
 void DD_DuplicateSurface(X86 *c) {
@@ -4328,13 +4768,15 @@ void DD_DuplicateSurface(X86 *c) {
     s->width = src->width;
     s->height = src->height;
     s->bpp = src->bpp;
+    s->fourcc = src->fourcc;
     s->rmask = src->rmask;
     s->gmask = src->gmask;
     s->bmask = src->bmask;
     s->amask = src->amask;
-    if (!surface_alloc_pixels(s)) {
+    if (!surface_charge_vram(dd, s) || !surface_alloc_pixels(s)) {
+        surface_refund_vram(s);
         com_release(s);
-        com_ret(c, DDERR_OUTOFMEMORY);
+        com_ret(c, DDERR_OUTOFVIDEOMEMORY);
         return;
     }
     // The copy reads the source with the CPU, so anything the device drew into
@@ -4344,7 +4786,7 @@ void DD_DuplicateSurface(X86 *c) {
         memcpy(gm_ptr(s->pixels), gm_ptr(src->pixels),
                std::min(s->pixels_bytes, src->pixels_bytes));
     ComIface f = com_iface_of(arg(c, 0));
-    uint32_t view = com_view(s, f == IF_DIRECTDRAW4 ? IF_DDSURFACE4 : IF_DDSURFACE);
+    uint32_t view = com_view(s, surface_iface_of(f));
     if (!view) {
         com_release(s);
         com_ret(c, E_OUTOFMEMORY);
@@ -4365,7 +4807,7 @@ void DD_EnumDisplayModes(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    bool v2 = com_iface_of(arg(c, 0)) == IF_DIRECTDRAW4;
+    bool v2 = dd_is_v2_iface(com_iface_of(arg(c, 0)));
 
     // A caller may restrict the enumeration by width, height or bit depth.
     uint32_t want_flags = 0, want_w = 0, want_h = 0, want_bpp = 0;
@@ -4426,8 +4868,8 @@ void DD_EnumSurfaces(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    bool v2 = com_iface_of(arg(c, 0)) == IF_DIRECTDRAW4;
-    ComIface want = v2 ? IF_DDSURFACE4 : IF_DDSURFACE;
+    bool v2 = dd_is_v2_iface(com_iface_of(arg(c, 0)));
+    ComIface want = surface_iface_of(com_iface_of(arg(c, 0)));
     // DDENUMSURFACES_DOESEXIST (2) over the surfaces this device made is the
     // only mode with a defined answer here.
     for (uint32_t id : dd->surfaces) {
@@ -4476,7 +4918,7 @@ void DD_GetDisplayMode(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    bool v2 = desc_is_v2(out, com_iface_of(arg(c, 0)) == IF_DIRECTDRAW4);
+    bool v2 = desc_is_v2(out, dd_is_v2_iface(com_iface_of(arg(c, 0))));
     uint32_t size = v2 ? DDSD2_SIZE : DDSD_SIZE;
     if (!gm_valid(out, size)) {
         com_ret(c, DDERR_INVALIDPARAMS);
@@ -4658,11 +5100,17 @@ void DD_WaitForVerticalBlank(X86 *c) {
 
 // --- IDirectDraw2 addition
 void DD_GetAvailableVidMem(X86 *c) {
+    ComObj *dd = this_ddraw(c);
     uint32_t total = arg(c, 2), free_ = arg(c, 3);
+    uint32_t capacity = ddraw_vram_capacity(dd);
+    if (!capacity)
+        capacity = 32u * 1024 * 1024; // unbounded shim still reports a card
+    uint64_t used = dd ? dd->vram_used : 0;
+    uint32_t available = used >= capacity ? 0u : capacity - (uint32_t)used;
     if (total && gm_valid(total, 4))
-        wr32(total, 32u * 1024 * 1024);
+        wr32(total, capacity);
     if (free_ && gm_valid(free_, 4))
-        wr32(free_, 24u * 1024 * 1024);
+        wr32(free_, available);
     com_ret(c, DD_OK);
 }
 
@@ -4753,6 +5201,23 @@ const ComMethod g_ddraw4[] = {
     {"GetDeviceIdentifier", 3, DD_GetDeviceIdentifier},
 };
 
+// IDirectDraw7 is the v4 table plus its two v7 slots. Neither mode-test method
+// is called by the game, so both stop by name rather than invent a result.
+const ComMethod g_ddraw7[] = {
+    DD_COMMON_SLOTS_HEAD,
+    {"CreateSurface", 4, DD_CreateSurface7}, // DDSURFACEDESC2, IDirectDrawSurface7 out
+    DD_COMMON_SLOTS_TAIL,
+    {"SetDisplayMode", 6, DD_SetDisplayMode2},
+    {"WaitForVerticalBlank", 3, DD_WaitForVerticalBlank},
+    {"GetAvailableVidMem", 4, DD_GetAvailableVidMem},
+    {"GetSurfaceFromDC", 3, DD_GetSurfaceFromDC},
+    {"RestoreAllSurfaces", 1, DD_RestoreAllSurfaces},
+    {"TestCooperativeLevel", 1, DD_TestCooperativeLevel},
+    {"GetDeviceIdentifier", 3, DD_GetDeviceIdentifier},
+    {"StartModeTest", 4, imports_unsupported},
+    {"EvaluateMode", 3, imports_unsupported},
+};
+
 // ===========================================================================
 // DDRAW.dll exports
 // ===========================================================================
@@ -4777,6 +5242,7 @@ void DirectDrawCreate(X86 *c) {
     dd->mode_w = 640;
     dd->mode_h = 480;
     dd->mode_bpp = 8;
+    dd->vram_total = ddraw_default_vram_total();
     uint32_t view = com_view(dd, IF_DIRECTDRAW);
     if (!view) {
         com_release(dd);
@@ -4808,7 +5274,30 @@ void DirectDrawCreateEx(X86 *c) {
         com_ret(c, CLASS_E_NOAGGREGATION);
         return;
     }
-    com_ret(c, DDERR_UNSUPPORTED);
+    ComObj *dd = com_new(K_DDRAW);
+    dd->mode_w = 640;
+    dd->mode_h = 480;
+    dd->mode_bpp = 8;
+    dd->vram_total = ddraw_default_vram_total();
+    uint32_t view = com_view(dd, IF_DIRECTDRAW7);
+    if (!view) {
+        com_release(dd);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    if (!g_primary_dd)
+        g_primary_dd = dd->id;
+    wr32(out, view);
+    LOGV("ddraw: DirectDrawCreateEx(IID_IDirectDraw7) -> %08x", view);
+    com_ret(c, DD_OK);
+}
+
+// IDirect3D7 is now implemented (dx/d3d7.cpp) and bound to K_DDRAW, so the
+// query is answered by the normal kind check. The hook stays registered as the
+// place a future unimplemented interface the guest dereferences without
+// checking its HRESULT would abort by name; today it handles none.
+bool ddraw_qi_unsupported(ComObj *, ComIface) {
+    return false;
 }
 
 void enumerate_devices(X86 *c, bool wide, bool extended) {
@@ -4913,6 +5402,7 @@ void ddraw_register() {
     com_define(IF_DIRECTDRAW, "DDRAW.dll", "IDirectDraw", g_ddraw1, std::size(g_ddraw1));
     com_define(IF_DIRECTDRAW2, "DDRAW.dll", "IDirectDraw2", g_ddraw2, std::size(g_ddraw2));
     com_define(IF_DIRECTDRAW4, "DDRAW.dll", "IDirectDraw4", g_ddraw4, std::size(g_ddraw4));
+    com_define(IF_DIRECTDRAW7, "DDRAW.dll", "IDirectDraw7", g_ddraw7, std::size(g_ddraw7));
     com_define(IF_DDSURFACE, "DDRAW.dll", "IDirectDrawSurface", g_surface1, std::size(g_surface1));
     com_define(IF_DDSURFACE2, "DDRAW.dll", "IDirectDrawSurface2", g_surface2,
                std::size(g_surface2));
@@ -4920,6 +5410,8 @@ void ddraw_register() {
                std::size(g_surface3));
     com_define(IF_DDSURFACE4, "DDRAW.dll", "IDirectDrawSurface4", g_surface4,
                std::size(g_surface4));
+    com_define(IF_DDSURFACE7, "DDRAW.dll", "IDirectDrawSurface7", g_surface7,
+               std::size(g_surface7));
     com_define(IF_DDPALETTE, "DDRAW.dll", "IDirectDrawPalette", g_palette, std::size(g_palette));
     com_define(IF_DDCLIPPER, "DDRAW.dll", "IDirectDrawClipper", g_clipper, std::size(g_clipper));
     com_define(IF_DDCOLORCONTROL, "DDRAW.dll", "IDirectDrawColorControl", g_colorcontrol,
@@ -4928,10 +5420,12 @@ void ddraw_register() {
     com_bind(IF_DIRECTDRAW, K_DDRAW);
     com_bind(IF_DIRECTDRAW2, K_DDRAW);
     com_bind(IF_DIRECTDRAW4, K_DDRAW);
+    com_bind(IF_DIRECTDRAW7, K_DDRAW);
     com_bind(IF_DDSURFACE, K_SURFACE);
     com_bind(IF_DDSURFACE2, K_SURFACE);
     com_bind(IF_DDSURFACE3, K_SURFACE);
     com_bind(IF_DDSURFACE4, K_SURFACE);
+    com_bind(IF_DDSURFACE7, K_SURFACE);
     com_bind(IF_DDPALETTE, K_PALETTE);
     com_bind(IF_DDCLIPPER, K_CLIPPER);
     com_bind(IF_DDCOLORCONTROL, K_SURFACE);
@@ -4939,16 +5433,22 @@ void ddraw_register() {
     com_register_iid(IF_DIRECTDRAW, IID_IDirectDraw_);
     com_register_iid(IF_DIRECTDRAW2, IID_IDirectDraw2_);
     com_register_iid(IF_DIRECTDRAW4, IID_IDirectDraw4_);
+    com_register_iid(IF_DIRECTDRAW7, IID_IDirectDraw7_);
     com_register_iid(IF_DDSURFACE, IID_IDirectDrawSurface_);
     com_register_iid(IF_DDSURFACE2, IID_IDirectDrawSurface2_);
     com_register_iid(IF_DDSURFACE3, IID_IDirectDrawSurface3_);
     com_register_iid(IF_DDSURFACE4, IID_IDirectDrawSurface4_);
+    com_register_iid(IF_DDSURFACE7, IID_IDirectDrawSurface7_);
+    // Registered so the QI hook below can name it when it stops the run. It
+    // is not bound to a kind and has no vtable: it is deliberately absent.
+    com_register_iid(IF_D3D7, IID_IDirect3D7_);
     com_register_iid(IF_DDPALETTE, IID_IDirectDrawPalette_);
     com_register_iid(IF_DDCLIPPER, IID_IDirectDrawClipper_);
     com_register_iid(IF_DDCOLORCONTROL, IID_IDirectDrawColorControl_);
 
     com_set_destructor(K_SURFACE, surface_destroy);
     com_set_destructor(K_DDRAW, ddraw_destroy);
+    com_set_qi_unsupported(K_DDRAW, ddraw_qi_unsupported);
 
     imports_register(g_ddraw_exports, std::size(g_ddraw_exports));
 }

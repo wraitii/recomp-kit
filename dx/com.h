@@ -27,6 +27,7 @@
 #include "dxtypes.h"
 
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -47,16 +48,21 @@ enum ComIface : uint16_t {
     IF_DIRECTDRAW,
     IF_DIRECTDRAW2,
     IF_DIRECTDRAW4,
+    IF_DIRECTDRAW7,
     IF_DDSURFACE,
     IF_DDSURFACE2,
     IF_DDSURFACE3,
     IF_DDSURFACE4,
+    IF_DDSURFACE7,
     IF_DDPALETTE,
     IF_DDCLIPPER,
     IF_DDCOLORCONTROL,
     IF_D3D,
     IF_D3D2,
     IF_D3D3,
+    IF_D3D7,
+    IF_D3DDEVICE7,
+    IF_D3DVERTEXBUFFER7,
     IF_D3DDEVICE3,
     IF_D3DVIEWPORT3,
     IF_D3DMATERIAL3,
@@ -170,6 +176,8 @@ enum ComKind : uint16_t {
     K_PALETTE,
     K_CLIPPER,
     K_D3DDEVICE,
+    K_D3D7DEVICE,
+    K_D3D7VB,
     K_VIEWPORT,
     K_MATERIAL,
     K_LIGHT,
@@ -251,6 +259,56 @@ struct JoyFormatSlot {
     uint32_t object = 0;
 };
 
+// One IDirectDrawSurface4/7 private-data record, keyed by the caller's GUID.
+// The bytes are a host-side copy of guest memory, like a texture's upload.
+struct SurfacePrivateData {
+    uint8_t guid[16] = {0};
+    std::vector<uint8_t> bytes;
+};
+
+// Per-device state for an IDirect3DDevice7 (K_D3D7DEVICE). The engine caches
+// every render/texture-stage state itself and reads it back through Get*, so
+// the front end keeps a faithful store: GetRenderState/GetTextureStageState
+// return exactly what Set* last recorded, and the documented D3D7 defaults
+// for the states never set. Held behind a shared_ptr so ComObj stays copyable
+// and so the arrays cost nothing on the thousands of surface/texture objects.
+struct D3d7DeviceState {
+    // Bounds the type loop the engine walks at 0x82c8f0: render states
+    // 0..255, texture stages 0..7 with types 0..255.
+    uint32_t render_state[256];
+    uint32_t tss[8][256];
+    // Transform states the engine uses: WORLD/VIEW/PROJECTION. Stored for
+    // every state so GetTransform is a faithful read, not a fixed three.
+    float transform[256][16];
+    bool transform_set[256];
+    // `*_set` records whether the guest ever set the state, so the Rust host
+    // device can be created lazily (the first Clear) and still receive every
+    // state the engine set before it. Defaults are preloaded into the arrays.
+    bool render_state_set[256];
+    bool tss_set[8][256];
+    float viewport[6];
+    bool viewport_set;
+    float material[68 / 4]; // D3DMATERIAL7, 17 dwords
+    bool material_set;
+    float light[104 / 4]; // D3DLIGHT7, 26 dwords
+    uint32_t light_enable[8];
+    // Bound stage textures, as K_SURFACE object ids (0 = none, D3D7 slot 0).
+    uint32_t texture[8];
+    bool in_scene;
+    uint32_t d3d_obj;       // owning K_DDRAW (IDirect3D7) object id
+    uint32_t render_target; // surface id, or 0
+    // True while the host renderer's 32-bit target holds 3D content that has
+    // not been reconciled into the guest 16bpp bytes. Cleared by a successful
+    // d3d7_writeback; set by every Clear or draw that changes the target. A
+    // surface the device has not drawn into since the last writeback needs no
+    // readback (the guest bytes are already the reconciled content), which is
+    // the lazy half of the writeback policy in docs/d3d7-inventory.md.
+    bool target_dirty;
+    // The device class that was requested: one of the two device GUIDs.
+    uint8_t device_guid[16];
+    bool tnl; // device_guid names IID_IDirect3DTnLHalDevice
+};
+
 // ---------------------------------------------------------------------------
 // The host-side object. One fat struct rather than a class hierarchy: these
 // are shims, the field set is small and fixed, and a flat record keeps every
@@ -277,12 +335,22 @@ struct ComObj {
     uint32_t mode_w = 0, mode_h = 0, mode_bpp = 0;
     bool mode_set = false;
     std::vector<uint32_t> surfaces; // ids, for RestoreAllSurfaces
+    // Video-memory accounting. The engine prefills a texture-surface pool until
+    // CreateSurface fails, so surface pixels must be bounded by the reported
+    // VRAM or the pool drains the guest heap. vram_total == 0 means unbounded
+    // (tests and RECOMP_DDRAW_VRAM_MB=0).
+    uint64_t vram_used = 0;
+    uint32_t vram_total = 0;
 
     // --- K_SURFACE
     uint32_t caps = 0;
     uint32_t width = 0, height = 0, bpp = 0, pitch = 0;
+    // Non-zero for a DXT surface (DDPF_FOURCC). Its guest bytes are the 4x4
+    // blocks themselves; bpp stays 0 as the driver reports. See dx/dxt_decode.h.
+    uint32_t fourcc = 0;
     uint32_t pixels = 0; // guest address of the pixel memory
     uint32_t pixels_bytes = 0;
+    bool counts_vram = false; // owner_dd's vram_used includes this surface
     uint32_t rmask = 0, gmask = 0, bmask = 0, amask = 0;
     uint32_t palette_obj = 0;
     uint32_t clipper_obj = 0;
@@ -307,6 +375,10 @@ struct ComObj {
     bool owns_pixels = false;
     uint32_t texture_handle = 0; // non-zero once GetHandle was called
     uint32_t dc_handle = 0;      // pseudo HDC handed out by GetDC
+    // IDirectDrawSurface4/7 private data, and the v7 priority/LOD hints.
+    std::vector<SurfacePrivateData> priv_data;
+    uint32_t surface_priority = 0;
+    uint32_t surface_lod = 0;
 
     // --- K_PALETTE
     uint32_t pal_flags = 0;
@@ -415,7 +487,27 @@ struct ComObj {
     int32_t cc_gamma = 1;
     int32_t cc_colorenable = 1;
 
-    // --- D3D8/wgpu. The Rust host device is a
+    // --- K_D3D7DEVICE / K_D3D7VB. The D3D7 device's state is behind a
+    // pointer so the big render-state arrays are not paid for by every COM
+    // object; a vertex buffer's storage is the guest `pixels` block.
+    std::shared_ptr<D3d7DeviceState> d3d7;
+    // --- K_D3D7DEVICE: the Rust d3d8-wgpu host device that owns the 32-bit
+    // internal render target, and the state-block snapshots the engine's
+    // blend-mode probe records. `d3d7_host` is null without the renderer.
+    void *d3d7_host = nullptr; // D3d8Device*; never a guest address
+    uint32_t d3d7_width = 0, d3d7_height = 0;
+    bool d3d7_recording = false;
+    uint32_t d3d7_next_stateblock = 1;
+    std::map<uint32_t, std::shared_ptr<D3d7DeviceState>> d3d7_stateblocks;
+    // --- K_SURFACE: the D3D7 device that renders into this surface, if any.
+    // The guest bytes stay authoritative; this is only how ddraw.cpp finds the
+    // Rust target to reconcile before it reads or presents those bytes.
+    uint32_t d3d7_target_device = 0;
+    uint32_t vb_fvf = 0;
+    uint32_t vb_num_vertices = 0;
+    uint32_t vb_caps = 0;
+
+    // --- K_D3D8/wgpu. The Rust host device is a
     // host-side pointer kept here, never in a guest field.
     void *d3d8_storage = nullptr; // opaque Rust CPU storage; never a guest address
     void *d3d8_device = nullptr;  // D3d8Device* from the Rust ABI
@@ -540,6 +632,15 @@ ComIface com_iface_for_iid(uint32_t guest_guid_addr);
 // false is the normal case.
 typedef ComObj *(*ComQiHook)(ComObj *self, ComIface want);
 void com_set_qi_hook(ComKind kind, ComQiHook hook);
+
+// A kind may name interfaces that must stop the run when queried, instead of
+// returning E_NOINTERFACE. This exists for an interface the original reaches
+// for and dereferences without checking the result: a returned error would
+// become a null dereference in the guest, which is a worse diagnostic than an
+// abort that names the interface it could not get. Returning true means the
+// hook handled (in practice, aborted) the query.
+typedef bool (*ComQiUnsupportedHook)(ComObj *self, ComIface want);
+void com_set_qi_unsupported(ComKind kind, ComQiUnsupportedHook hook);
 
 // ---------------------------------------------------------------------------
 // COM classes: what ole32's CoCreateInstance can make. A module registers the

@@ -958,7 +958,23 @@ void u_TranslateMessage(X86 *c) {
             bool shift = (g_key_state[0x10] & 0x80) != 0;
             if (!shift && ch >= 'A' && ch <= 'Z')
                 ch += 32;
-            host_post_message(rd32(p), msg == 0x0100 ? 0x0102 : 0x0106, ch, lparam);
+            // The host posts a WM_CHAR of its own right behind the WM_KEYDOWN it
+            // delivers (host/input_gate.cpp), for guests that never call
+            // TranslateMessage. A guest that does call it - Black & White's loop
+            // does - would then see every typed character twice. Windows
+            // generates the WM_CHAR only here, so when the matching one is
+            // already queued directly behind this keystroke it is the same
+            // keystroke's character (the host's carries the real shift and
+            // layout state) and is not generated again.
+            const uint32_t chmsg = msg == 0x0100 ? 0x0102 : 0x0106;
+            if (!queue().empty()) {
+                const Msg &next = queue().front();
+                if (next.hwnd == rd32(p) && next.message == chmsg) {
+                    set_eax(c, 1);
+                    return;
+                }
+            }
+            host_post_message(rd32(p), chmsg, ch, lparam);
             set_eax(c, 1);
             return;
         }
@@ -1109,6 +1125,10 @@ void def_window_proc(X86 *c, bool wide) {
     case 0x0014: // WM_ERASEBKGND: the background counts as erased
         set_eax(c, 1);
         return;
+    case 0x0112: // WM_SYSCOMMAND: SC_CLOSE becomes WM_CLOSE, as DefWindowProc does
+        if ((arg(c, 2) & 0xfff0u) == 0xf060u)
+            host_dispatch_to_wndproc(c, hwnd, 0x0010, 0, 0);
+        break;
     case 0x0010: // WM_CLOSE -> DestroyWindow
         destroy_window(c, hwnd);
         host_post_message(0, 0x0012 /* WM_QUIT */, 0, 0);
@@ -1784,6 +1804,43 @@ void u_MapVirtualKeyA(X86 *c) {
     set_eax(c, map_virtual_key(arg(c, 0), arg(c, 1)));
 }
 
+// GetKeyNameTextA(lParam, lpString, cchSize): the name of the key whose scan
+// code is in lParam. The runtime's table is the virtual-key/scancode map, not
+// a keyboard layout, so only the layout-independent names are returned. An
+// unknown key returns the documented 0. SHIM(temporary): locale and dead-key
+// names are not modelled.
+void u_GetKeyNameTextA(X86 *c) {
+    const uint32_t vk = map_virtual_key((arg(c, 0) >> 16) & 0xff, 1);
+    std::string text;
+    switch (vk) {
+    case 0x08:
+        text = "Backspace";
+        break;
+    case 0x09:
+        text = "Tab";
+        break;
+    case 0x0d:
+        text = "Enter";
+        break;
+    case 0x1b:
+        text = "Esc";
+        break;
+    case 0x20:
+        text = "Space";
+        break;
+    case 0x2e:
+        text = "Delete";
+        break;
+    default:
+        if (vk >= 32 && vk < 127)
+            text.assign(1, (char)vk);
+        break;
+    }
+    log_once("user32.getkeyname",
+             "SHIM(temporary): GetKeyNameTextA returns layout-independent names only");
+    set_eax(c, text.empty() ? 0 : put_text(arg(c, 1), arg(c, 2), text, false));
+}
+
 const ImportShim g_user32_shims[] = {
     {"USER32.dll", "RegisterClassA", 1, u_RegisterClassA},
     {"USER32.dll", "UnregisterClassA", 2, u_UnregisterClassA},
@@ -1858,6 +1915,7 @@ const ImportShim g_user32_shims[] = {
     {"USER32.dll", "ReleaseCapture", 0, u_ReleaseCapture},
     {"USER32.dll", "GetDesktopWindow", 0, nullptr},
     {"USER32.dll", "MapVirtualKeyA", 2, u_MapVirtualKeyA},
+    {"USER32.dll", "GetKeyNameTextA", 3, u_GetKeyNameTextA},
     {"USER32.dll", "MapVirtualKeyExA", 3, u_MapVirtualKeyA},
     {"USER32.dll", "ToUnicode", 6, nullptr},
     {"USER32.dll", "SendInput", 3, nullptr},

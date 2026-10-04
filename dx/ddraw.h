@@ -126,6 +126,12 @@ void ddraw_reset_modes(void);
 // selects 640x480x8 without first asking what is available: a list without it
 // has that call refused and the guest, which does not check, takes a SIGBUS.
 int ddraw_set_modes(const char *spec);
+// Test seam: override the video-memory budget every DirectDraw object reports
+// and enforces (bytes; 0 is unbounded). The default comes from
+// RECOMP_DDRAW_VRAM_MB, or a 32 MB period card. Restore with
+// ddraw_set_vram_total(UINT32_MAX).
+void ddraw_set_vram_total(uint32_t bytes);
+#define DDRAW_VRAM_UNSET 0xffffffffu
 // Settings add a mode without removing other resolutions from the game menu.
 int ddraw_add_mode(int w, int h, int bpp);
 

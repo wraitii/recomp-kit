@@ -410,6 +410,7 @@ dependencies = [
  "env_logger",
  "log",
  "metal",
+ "naga",
  "pollster",
  "wgpu",
  "winit",

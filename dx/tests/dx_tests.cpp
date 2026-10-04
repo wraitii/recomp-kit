@@ -21,6 +21,7 @@
 #include "../video_frame.h"
 #include "../mf_media.h"
 #include "../ddraw.h"
+#include "../dxt_decode.h"
 #include "../../runtime/memory.h"
 #include "../../runtime/win32.h"
 #include "../../platform/os.h"
@@ -617,6 +618,7 @@ enum {
     DD_CreatePalette = 5,
     DD_CreateSurface = 6,
     DD_EnumDisplayModes = 8,
+    DD_GetCaps = 11,
     DD_GetDisplayMode = 12,
     DD_GetFourCCCodes = 13,
     DD_RestoreDisplayMode = 19,
@@ -624,6 +626,8 @@ enum {
     DD_SetDisplayMode = 21,
     DD_GetAvailableVidMem = 23,
     DD_GetDeviceIdentifier = 27,
+    DD_StartModeTest = 28,
+    DD_EvaluateMode = 29,
 };
 enum {
     S_QueryInterface = 0,
@@ -641,6 +645,15 @@ enum {
     S_Lock = 25,
     S_SetPalette = 31,
     S_Unlock = 32,
+    S_SetPrivateData = 40,
+    S_GetPrivateData = 41,
+    S_FreePrivateData = 42,
+    S_GetUniquenessValue = 43,
+    S_ChangeUniquenessValue = 44,
+    S_SetPriority = 45,
+    S_GetPriority = 46,
+    S_SetLOD = 47,
+    S_GetLOD = 48,
 };
 enum { P_SetEntries = 6 };
 enum {
@@ -664,6 +677,45 @@ enum {
     DEV_SwapTextureHandles = 4,
     DEV_SetRenderTarget = 15,
     DEV_GetClipStatus = 32,
+};
+// IDirect3D7, IDirect3DDevice7 and IDirect3DVertexBuffer7 slot numbers, from
+// their D3D7 vtable order (d3d.h), spelled out for the same reason.
+enum {
+    D3D7_EnumDevices = 3,
+    D3D7_CreateDevice = 4,
+    D3D7_CreateVertexBuffer = 5,
+    D3D7_EnumZBufferFormats = 6,
+    D3D7_EvictManagedTextures = 7,
+};
+enum {
+    DEV7_GetCaps = 3,
+    DEV7_EnumTextureFormats = 4,
+    DEV7_BeginScene = 5,
+    DEV7_EndScene = 6,
+    DEV7_GetDirect3D = 7,
+    DEV7_SetRenderTarget = 8,
+    DEV7_Clear = 10,
+    DEV7_SetTransform = 11,
+    DEV7_GetTransform = 12,
+    DEV7_SetViewport = 13,
+    DEV7_GetViewport = 15,
+    DEV7_SetMaterial = 16,
+    DEV7_SetLight = 18,
+    DEV7_SetRenderState = 20,
+    DEV7_GetRenderState = 21,
+    DEV7_GetTexture = 34,
+    DEV7_SetTexture = 35,
+    DEV7_GetTextureStageState = 36,
+    DEV7_SetTextureStageState = 37,
+    DEV7_ValidateDevice = 38,
+    DEV7_LightEnable = 44,
+};
+enum {
+    VB7_Lock = 3,
+    VB7_Unlock = 4,
+    VB7_ProcessVertices = 5,
+    VB7_GetVertexBufferDesc = 6,
+    VB7_Optimize = 7,
 };
 enum { VP_SetViewport2 = 17, VP_Clear = 12, VP_SetBackground = 8 };
 enum { MAT_GetHandle = 5 };
@@ -6144,9 +6196,25 @@ static void test_directdraw_create_ex_fallback() {
     wr32(out, 0xdeadbeef);
     wr32(out + 4, 0xcafebabe);
     const uint32_t live = com_live_count();
-    CHECK_EQ(call_shim(create_ex, {0, out, iid, 0}), DDERR_UNSUPPORTED);
-    CHECK_EQ(rd32(out), 0);
+    // The version 7 factory returns a real IDirectDraw7 view.
+    CHECK_EQ(call_shim(create_ex, {0, out, iid, 0}), DD_OK);
+    const uint32_t dd7obj = rd32(out);
+    CHECK(dd7obj != 0);
+    // Only the first dword of the out pointer is written.
     CHECK_EQ(rd32(out + 4), 0xcafebabe);
+    CHECK_EQ(com_live_count(), live + 1);
+    // QueryInterface for the same interface returns the same pointer, and the
+    // object is one refcount shared across its views.
+    CHECK_EQ(call_method(dd7obj, DD_QueryInterface, {iid, sc(0x64)}), S_OK);
+    CHECK_EQ(rd32(sc(0x64)), dd7obj);
+    CHECK_EQ(call_method(rd32(sc(0x64)), DD_Release, {}), 1);
+    // The v7 vtable has StartModeTest/EvaluateMode in its two trailing slots.
+    const uint32_t vt7 = rd32(dd7obj + COM_OFF_vtbl);
+    const char *tail70 = imports_describe(rd32(vt7 + 0x70));
+    const char *tail74 = imports_describe(rd32(vt7 + 0x74));
+    CHECK(tail70 && strstr(tail70, "StartModeTest") != nullptr);
+    CHECK(tail74 && strstr(tail74, "EvaluateMode") != nullptr);
+    CHECK_EQ(call_method(dd7obj, DD_Release, {}), 0);
     CHECK_EQ(com_live_count(), live);
     CHECK_EQ(call_shim(create_ex, {0, 0, iid, 0}), DDERR_INVALIDPARAMS);
     CHECK_EQ(call_shim(create_ex, {0, out, 0, 0}), DDERR_INVALIDPARAMS);
@@ -6165,6 +6233,710 @@ static void test_directdraw_create_ex_fallback() {
     CHECK_EQ(call_method(view4, DD_Release, {}), 1);
     CHECK_EQ(call_method(dd, DD_Release, {}), 0);
     CHECK_EQ(com_live_count(), live);
+}
+
+// The IDirectDraw7 / IDirectDrawSurface7 object model: one object reachable
+// through several version views sharing a refcount, the DDSURFACEDESC2 /
+// DDSCAPS2 guest widths, and a 16bpp surface whose Lock pointer is the guest's
+// own R5G6B5 bytes.
+static void test_ddraw7_object_model() {
+    cpu_reset();
+    const uint32_t create_ex = tramp("DDRAW.dll", "DirectDrawCreateEx");
+    CHECK(create_ex != 0);
+    if (!create_ex)
+        return;
+    const uint8_t dd7[16] = {0xC0, 0x5E, 0xE6, 0x15, 0x9C, 0x3B, 0xD2, 0x11,
+                             0xB9, 0x2F, 0x00, 0x60, 0x97, 0x97, 0xEA, 0x5B};
+    const uint8_t dd4[16] = {0x9A, 0x50, 0x59, 0x9C, 0xBD, 0x39, 0xD1, 0x11,
+                             0x8C, 0x4A, 0x00, 0xC0, 0x4F, 0xD9, 0x30, 0xC5};
+    uint32_t iid = sc(0x40), out = sc(0x60);
+    memcpy(gm_ptr(iid), dd7, sizeof(dd7));
+    CHECK_EQ(call_shim(create_ex, {0, out, iid, 0}), DD_OK);
+    uint32_t dd = rd32(out);
+    CHECK(dd != 0);
+    if (!dd)
+        return;
+
+    // Guest structure widths and offsets this interface is checked against.
+    CHECK_EQ((uint32_t)DDSD_SIZE, 108u);
+    CHECK_EQ((uint32_t)DDSD2_SIZE, 124u);
+    CHECK_EQ((uint32_t)DDSD_OFF_ddsCaps, 0x68u);
+    CHECK_EQ((uint32_t)DDPF_SIZE, 32u);
+
+    // One object, several views: the DD4 view is a distinct pointer whose
+    // vtable differs, and releasing it leaves the DD7 object alive.
+    memcpy(gm_ptr(iid), dd4, sizeof(dd4));
+    CHECK_EQ(call_method(dd, DD_QueryInterface, {iid, sc(0x64)}), S_OK);
+    const uint32_t dd4view = rd32(sc(0x64));
+    CHECK(dd4view != 0 && dd4view != dd);
+    CHECK(rd32(dd4view + COM_OFF_vtbl) != rd32(dd + COM_OFF_vtbl));
+    CHECK_EQ(call_method(dd4view, DD_Release, {}), 1);
+
+    // SetDisplayMode (0x54) with the five-argument form, then GetDisplayMode
+    // (0x30) must return a DDSURFACEDESC2 with the mode just set.
+    CHECK(ddraw_set_modes("320x240x16"));
+    CHECK_EQ(call_method(dd, DD_SetDisplayMode, {320, 240, 16, 0, 0}), DD_OK);
+    uint32_t mode = sc(0x80);
+    gm_zero(mode, DDSD2_SIZE);
+    wr32(mode + DDSD_OFF_dwSize, DDSD2_SIZE);
+    CHECK_EQ(call_method(dd, DD_GetDisplayMode, {mode}), DD_OK);
+    CHECK_EQ(rd32(mode + DDSD_OFF_dwSize), (uint32_t)DDSD2_SIZE);
+    CHECK_EQ(rd32(mode + DDSD_OFF_dwWidth), 320u);
+    CHECK_EQ(rd32(mode + DDSD_OFF_dwHeight), 240u);
+
+    // GetDeviceIdentifier (0x6c) and GetCaps (0x2c) answer on the DD7 table.
+    uint32_t dev = sc(0x180);
+    CHECK_EQ(call_method(dd, DD_GetDeviceIdentifier, {dev, 0}), DD_OK);
+    CHECK(!gm_str(dev + DDDEVID_OFF_szDriver).empty());
+    uint32_t caps = sc(0x600);
+    gm_zero(caps, DDCAPS_SIZE);
+    wr32(caps, DDCAPS_SIZE);
+    CHECK_EQ(call_method(dd, DD_GetCaps, {caps, 0}), DD_OK);
+    CHECK(rd32(caps + DDCAPS_OFF_dwCaps) != 0);
+
+    // A 16bpp offscreen surface, created through the v7 CreateSurface. Its
+    // out pointer must be an IDirectDrawSurface7 view and its Lock pointer
+    // must be the guest-owned R5G6B5 bytes.
+    uint32_t desc = sc(0x900);
+    gm_zero(desc, DDSD2_SIZE);
+    wr32(desc + DDSD_OFF_dwSize, DDSD2_SIZE);
+    wr32(desc + DDSD_OFF_dwFlags, DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT);
+    wr32(desc + DDSD_OFF_dwWidth, 16);
+    wr32(desc + DDSD_OFF_dwHeight, 16);
+    wr32(desc + DDSD_OFF_ddsCaps, DDSCAPS_OFFSCREENPLAIN);
+    uint32_t pf = desc + DDSD_OFF_ddpfPixelFormat;
+    wr32(pf + DDPF_OFF_dwSize, DDPF_SIZE);
+    wr32(pf + DDPF_OFF_dwFlags, DDPF_RGB);
+    wr32(pf + DDPF_OFF_dwRGBBitCount, 16);
+    wr32(pf + DDPF_OFF_dwRBitMask, 0xf800);
+    wr32(pf + DDPF_OFF_dwGBitMask, 0x07e0);
+    wr32(pf + DDPF_OFF_dwBBitMask, 0x001f);
+    CHECK_EQ(call_method(dd, DD_CreateSurface, {desc, sc(0xa00), 0}), DD_OK);
+    uint32_t surf = rd32(sc(0xa00));
+    CHECK(surf != 0);
+    CHECK_EQ((uint32_t)com_iface_of(surf), (uint32_t)IF_DDSURFACE7);
+    // The v7 extras occupy slots 45..48: SetPriority/GetPriority/SetLOD/GetLOD.
+    const uint32_t svt = rd32(surf + COM_OFF_vtbl);
+    const char *sp = imports_describe(rd32(svt + 0xb4));
+    const char *sl = imports_describe(rd32(svt + 0xc0));
+    CHECK(sp && strstr(sp, "SetPriority") != nullptr);
+    CHECK(sl && strstr(sl, "GetLOD") != nullptr);
+
+    // Lock, write one pure-red R5G6B5 texel, Unlock, read it back.
+    uint32_t ldesc = sc(0xb00);
+    gm_zero(ldesc, DDSD2_SIZE);
+    wr32(ldesc + DDSD_OFF_dwSize, DDSD2_SIZE);
+    CHECK_EQ(call_method(surf, S_Lock, {0, ldesc, DDLOCK_WAIT, 0}), DD_OK);
+    CHECK_EQ(rd32(ldesc + DDSD_OFF_dwSize), (uint32_t)DDSD2_SIZE);
+    const uint32_t pitch = rd32(ldesc + DDSD_OFF_lPitch);
+    const uint32_t ptr = rd32(ldesc + DDSD_OFF_lpSurface);
+    CHECK(pitch >= 32u);
+    CHECK(ptr != 0);
+    wr16(ptr, 0xf800);
+    CHECK_EQ(call_method(surf, S_Unlock, {0}), DD_OK);
+    uint32_t ldesc2 = sc(0xb80);
+    gm_zero(ldesc2, DDSD2_SIZE);
+    wr32(ldesc2 + DDSD_OFF_dwSize, DDSD2_SIZE);
+    CHECK_EQ(call_method(surf, S_Lock, {0, ldesc2, DDLOCK_READONLY, 0}), DD_OK);
+    CHECK_EQ(rd16(rd32(ldesc2 + DDSD_OFF_lpSurface)), 0xf800);
+    CHECK_EQ(rd32(ldesc2 + DDSD_OFF_dwWidth), 16u);
+    CHECK_EQ(rd32(ldesc2 + DDSD_OFF_dwHeight), 16u);
+    CHECK_EQ(call_method(surf, S_Unlock, {0}), DD_OK);
+    uint32_t gpf = sc(0xc00);
+    CHECK_EQ(call_method(surf, S_GetPixelFormat, {gpf}), DD_OK);
+    CHECK_EQ(rd32(gpf + DDPF_OFF_dwRGBBitCount), 16u);
+    CHECK_EQ(rd32(gpf + DDPF_OFF_dwRBitMask), 0xf800u);
+
+    // Surface7 private data, priority and LOD are per-object state.
+    uint8_t tag[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    uint32_t tagp = sc(0xd00);
+    memcpy(gm_ptr(tagp), tag, 16);
+    uint32_t data = sc(0xd40);
+    wr32(data, 0x12345678u);
+    wr32(data + 4, 0x9abcdef0u);
+    CHECK_EQ(call_method(surf, S_SetPrivateData, {tagp, data, 8, 0}), DD_OK);
+    uint32_t got = sc(0xd80), gotlen = sc(0xdc0);
+    wr32(gotlen, 8);
+    CHECK_EQ(call_method(surf, S_GetPrivateData, {tagp, got, gotlen}), DD_OK);
+    CHECK_EQ(rd32(gotlen), 8u);
+    CHECK_EQ(rd32(got), 0x12345678u);
+    CHECK_EQ(rd32(got + 4), 0x9abcdef0u);
+    // A query-only call reports the size, then a short buffer reports MOREDATA.
+    wr32(gotlen, 0);
+    CHECK_EQ(call_method(surf, S_GetPrivateData, {tagp, 0, gotlen}), DD_OK);
+    CHECK_EQ(rd32(gotlen), 8u);
+    uint32_t shortlen = sc(0xdc4);
+    wr32(shortlen, 4);
+    CHECK_EQ(call_method(surf, S_GetPrivateData, {tagp, got, shortlen}), DDERR_MOREDATA);
+    CHECK_EQ(rd32(shortlen), 8u);
+    CHECK_EQ(call_method(surf, S_FreePrivateData, {tagp}), DD_OK);
+    CHECK_EQ(call_method(surf, S_FreePrivateData, {tagp}), DDERR_NOTFOUND);
+
+    CHECK_EQ(call_method(surf, S_SetPriority, {3}), DD_OK);
+    uint32_t prio = sc(0xe00);
+    CHECK_EQ(call_method(surf, S_GetPriority, {prio}), DD_OK);
+    CHECK_EQ(rd32(prio), 3u);
+    CHECK_EQ(call_method(surf, S_SetLOD, {2}), DD_OK);
+    uint32_t lod = sc(0xe40);
+    CHECK_EQ(call_method(surf, S_GetLOD, {lod}), DD_OK);
+    CHECK_EQ(rd32(lod), 2u);
+
+    CHECK_EQ(call_method(surf, S_Release, {}), 0);
+    CHECK_EQ(call_method(dd, DD_Release, {}), 0);
+    ddraw_reset_modes();
+}
+
+// Direct3D 7 stage 2a: QueryInterface(IID_IDirect3D7) on the DirectDraw object,
+// the enumeration callbacks, device creation and caps, the render-state store
+// and IDirect3DVertexBuffer7's guest-addressable storage.
+static void test_d3d7_pipeline() {
+    cpu_reset();
+    const uint8_t dd7[16] = {0xC0, 0x5E, 0xE6, 0x15, 0x9C, 0x3B, 0xD2, 0x11,
+                             0xB9, 0x2F, 0x00, 0x60, 0x97, 0x97, 0xEA, 0x5B};
+    const uint8_t d3d7[16] = {0x77, 0x9E, 0x04, 0xF5, 0x61, 0x48, 0xD2, 0x11,
+                              0xA4, 0x07, 0x00, 0xA0, 0xC9, 0x06, 0x29, 0xA8};
+    const uint8_t hal[16] = {0xE0, 0x3D, 0xE6, 0x84, 0xAA, 0x46, 0xCF, 0x11,
+                             0x81, 0x6F, 0x00, 0x00, 0xC0, 0x20, 0x15, 0x6E};
+    const uint8_t tnl[16] = {0x78, 0x9E, 0x04, 0xF5, 0x61, 0x48, 0xD2, 0x11,
+                             0xA4, 0x07, 0x00, 0xA0, 0xC9, 0x06, 0x29, 0xA8};
+
+    // ---- struct layouts the shim and tests agree on.
+    CHECK_EQ((uint32_t)D3DDEVICEDESC7_SIZE, 236u);
+    CHECK_EQ((uint32_t)D3DDD7_OFF_dwDevCaps, 0x00u);
+    CHECK_EQ((uint32_t)D3DDD7_OFF_dpcTriCaps, 0x3cu);
+    CHECK_EQ((uint32_t)D3DDD7_OFF_dwDeviceRenderBitDepth, 0x74u);
+    CHECK_EQ((uint32_t)D3DDD7_OFF_deviceGUID, 0xc4u);
+    CHECK_EQ((uint32_t)D3DVIEWPORT7_SIZE, 24u);
+    CHECK_EQ((uint32_t)D3DVIEWPORT7_OFF_dvMaxZ, 0x14u);
+    CHECK_EQ((uint32_t)D3DMATERIAL7_SIZE, 68u);
+    CHECK_EQ((uint32_t)D3DMATERIAL7_OFF_power, 0x40u);
+    CHECK_EQ((uint32_t)D3DLIGHT7_SIZE, 104u);
+    CHECK_EQ((uint32_t)D3DLIGHT7_OFF_dvPhi, 0x64u);
+    CHECK_EQ((uint32_t)D3DVERTEXBUFFERDESC_SIZE, 16u);
+    CHECK_EQ((uint32_t)DDPF_SIZE, 32u);
+
+    // ---- a real IDirectDraw7, then QI(IID_IDirect3D7).
+    uint32_t create_ex = tramp("DDRAW.dll", "DirectDrawCreateEx");
+    uint32_t iid = sc(0x1040), out = sc(0x1080);
+    memcpy(gm_ptr(iid), dd7, 16);
+    CHECK_EQ(call_shim(create_ex, {0, out, iid, 0}), DD_OK);
+    uint32_t dd = rd32(out);
+    CHECK(dd != 0);
+    if (!dd)
+        return;
+    memcpy(gm_ptr(iid), d3d7, 16);
+    CHECK_EQ(call_method(dd, 0, {iid, sc(0x10c0)}), S_OK);
+    uint32_t d3d = rd32(sc(0x10c0));
+    CHECK_EQ(com_iface_of(d3d), IF_D3D7);
+    // The D3D7 object shares the DirectDraw refcount: QI added one, so the
+    // object survives releasing the D3D7 view.
+    CHECK_EQ(call_method(d3d, 2, {}), 1);
+    CHECK(com_this(dd) != nullptr);
+
+    // ---- vtable order: the D3D7 slots differ from the D3D3 ones.
+    uint32_t vt = rd32(d3d + COM_OFF_vtbl);
+    CHECK(strstr(imports_describe(rd32(vt + 0x0c)), "EnumDevices"));
+    CHECK(strstr(imports_describe(rd32(vt + 0x10)), "CreateDevice"));
+    CHECK(strstr(imports_describe(rd32(vt + 0x14)), "CreateVertexBuffer"));
+    CHECK(strstr(imports_describe(rd32(vt + 0x18)), "EnumZBufferFormats"));
+    CHECK(strstr(imports_describe(rd32(vt + 0x1c)), "EvictManagedTextures"));
+
+    // ---- EnumZBufferFormats: one 16-bit DDPF_ZBUFFER entry, callback order.
+    static std::vector<uint32_t> zbuf_flags, zbuf_bits;
+    zbuf_flags.clear();
+    zbuf_bits.clear();
+    uint32_t zcb = imports_alloc_trampoline(
+        "TEST", "D3D7ZBufferFormat",
+        [](X86 *c) {
+            uint32_t pf = arg(c, 0), ctx = arg(c, 1);
+            CHECK_EQ(rd32(pf + DDPF_OFF_dwSize), (uint32_t)DDPF_SIZE);
+            CHECK_EQ(rd32(pf + DDPF_OFF_dwFlags), (uint32_t)DDPF_ZBUFFER);
+            wr32(ctx, rd32(ctx) + 1);
+            zbuf_flags.push_back(rd32(pf + DDPF_OFF_dwFlags));
+            zbuf_bits.push_back(rd32(pf + DDPF_OFF_dwRGBBitCount));
+            set_eax(c, DDENUMRET_OK);
+        },
+        2);
+    wr32(out, 0);
+    memcpy(gm_ptr(iid), hal, 16);
+    CHECK_EQ(call_method(d3d, D3D7_EnumZBufferFormats, {iid, zcb, out}), D3D_OK_);
+    CHECK_EQ(rd32(out), 1u);
+    CHECK_EQ(zbuf_flags.size(), 1u);
+    if (!zbuf_flags.empty()) {
+        CHECK_EQ(zbuf_flags[0], (uint32_t)DDPF_ZBUFFER);
+        CHECK_EQ(zbuf_bits[0], 16u);
+    }
+    // An unrecognised device class is refused, not silently accepted.
+    memcpy(gm_ptr(iid), dd7, 16);
+    CHECK_EQ(call_method(d3d, D3D7_EnumZBufferFormats, {iid, zcb, out}), DDERR_NOTFOUND);
+
+    // ---- create a device on a 3D surface and check caps.
+    uint32_t target = make_render_target_for_test(64, 64, 16);
+    CHECK(target != 0);
+    memcpy(gm_ptr(iid), hal, 16);
+    CHECK_EQ(call_method(d3d, D3D7_CreateDevice, {iid, target, out}), D3D_OK_);
+    uint32_t dev = rd32(out);
+    CHECK_EQ(com_iface_of(dev), IF_D3DDEVICE7);
+    uint32_t caps = sc(0x1400);
+    CHECK_EQ(call_method(dev, DEV7_GetCaps, {caps}), D3D_OK_);
+    CHECK_EQ(rd32(caps + D3DDD7_OFF_dwDevCaps) & D3DDEVCAPS_HWTRANSFORMANDLIGHT, 0u);
+    CHECK((rd32(caps + D3DDD7_OFF_dwDevCaps) & D3DDEVCAPS_TEXTURENONLOCALVIDMEM) != 0u);
+    CHECK_EQ(memcmp(gm_ptr(caps + D3DDD7_OFF_deviceGUID), hal, 16), 0);
+    CHECK_EQ(rd32(caps + D3DDD7_OFF_dwDeviceRenderBitDepth), (uint32_t)DDBD_16);
+    // The HAL device is not TnL; the TnL class reports the TnL cap.
+    memcpy(gm_ptr(iid), tnl, 16);
+    CHECK_EQ(call_method(d3d, D3D7_CreateDevice, {iid, target, sc(0x1480)}), D3D_OK_);
+    uint32_t tdev = rd32(sc(0x1480));
+    CHECK_EQ(call_method(tdev, DEV7_GetCaps, {caps}), D3D_OK_);
+    CHECK((rd32(caps + D3DDD7_OFF_dwDevCaps) & D3DDEVCAPS_HWTRANSFORMANDLIGHT) != 0u);
+    CHECK_EQ(memcmp(gm_ptr(caps + D3DDD7_OFF_deviceGUID), tnl, 16), 0);
+
+    // GetDirect3D round-trips to the same D3D7 view of the DirectDraw object.
+    CHECK_EQ(call_method(dev, DEV7_GetDirect3D, {out}), D3D_OK_);
+    CHECK_EQ(rd32(out), d3d);
+    call_method(rd32(out), 2, {});
+    CHECK_EQ(call_method(tdev, 2, {}), 0);
+
+    // ---- the render-state store: documented defaults, then set/get.
+    uint32_t v = sc(0x1500);
+    CHECK_EQ(call_method(dev, DEV7_GetRenderState, {8, v}), D3D_OK_); // FILLMODE
+    CHECK_EQ(rd32(v), 3u);
+    CHECK_EQ(call_method(dev, DEV7_GetRenderState, {137, v}), D3D_OK_); // LIGHTING
+    CHECK_EQ(rd32(v), 1u);
+    CHECK_EQ(call_method(dev, DEV7_GetRenderState, {143, v}), D3D_OK_); // NORMALIZENORMALS
+    CHECK_EQ(rd32(v), 0u);
+    CHECK_EQ(call_method(dev, DEV7_GetRenderState, {7, v}), D3D_OK_); // ZENABLE
+    CHECK_EQ(rd32(v), 0u);
+    CHECK_EQ(call_method(dev, DEV7_SetRenderState, {137, 0}), D3D_OK_);
+    CHECK_EQ(call_method(dev, DEV7_GetRenderState, {137, v}), D3D_OK_);
+    CHECK_EQ(rd32(v), 0u);
+    // A texture-stage default and a round trip on stage 1.
+    CHECK_EQ(call_method(dev, DEV7_GetTextureStageState, {0, 1, v}), D3D_OK_); // COLOROP
+    CHECK_EQ(rd32(v), 4u);
+    CHECK_EQ(call_method(dev, DEV7_GetTextureStageState, {1, 1, v}), D3D_OK_);
+    CHECK_EQ(rd32(v), 1u); // later stages disabled by default
+    CHECK_EQ(call_method(dev, DEV7_SetTextureStageState, {1, 1, 4}), D3D_OK_);
+    CHECK_EQ(call_method(dev, DEV7_GetTextureStageState, {1, 1, v}), D3D_OK_);
+    CHECK_EQ(rd32(v), 4u);
+    // ValidateDevice reports a usable pass count.
+    CHECK_EQ(call_method(dev, DEV7_ValidateDevice, {v}), D3D_OK_);
+    CHECK_EQ(rd32(v), 1u);
+
+    // ---- transform, viewport, material, light are recorded.
+    uint32_t mtx = sc(0x1600);
+    for (int i = 0; i < 16; ++i)
+        wrf32(mtx + (uint32_t)i * 4, float(i + 1));
+    CHECK_EQ(call_method(dev, DEV7_SetTransform, {1, mtx}), D3D_OK_);
+    uint32_t back = sc(0x1680);
+    CHECK_EQ(call_method(dev, DEV7_GetTransform, {1, back}), D3D_OK_);
+    CHECK_EQ(rd32(back), 0x3f800000u);
+    CHECK_EQ(rd32(back + 60), 0x41800000u); // 16.0f
+    uint32_t vp = sc(0x1700);
+    wr32(vp + D3DVIEWPORT7_OFF_dwWidth, 64);
+    wr32(vp + D3DVIEWPORT7_OFF_dwHeight, 48);
+    wrf32(vp + D3DVIEWPORT7_OFF_dvMaxZ, 1.0f);
+    CHECK_EQ(call_method(dev, DEV7_SetViewport, {vp}), D3D_OK_);
+    gm_zero(back, 24);
+    CHECK_EQ(call_method(dev, DEV7_GetViewport, {back}), D3D_OK_);
+    CHECK_EQ(rd32(back + D3DVIEWPORT7_OFF_dwWidth), 64u);
+    CHECK_EQ(rd32(back + D3DVIEWPORT7_OFF_dwHeight), 48u);
+
+    // ---- EnumTextureFormats: R5G6B5, A4R4G4B4, A8R8G8B8, in that order,
+    // and no DXT/FourCC entry.
+    static std::vector<uint32_t> fmt_bits, fmt_flags, fmt_fourcc;
+    fmt_bits.clear();
+    fmt_flags.clear();
+    fmt_fourcc.clear();
+    uint32_t tcb = imports_alloc_trampoline(
+        "TEST", "D3D7TextureFormat",
+        [](X86 *c) {
+            uint32_t pf = arg(c, 0);
+            CHECK_EQ(rd32(pf + DDPF_OFF_dwSize), (uint32_t)DDPF_SIZE);
+            fmt_bits.push_back(rd32(pf + DDPF_OFF_dwRGBBitCount));
+            fmt_flags.push_back(rd32(pf + DDPF_OFF_dwFlags));
+            fmt_fourcc.push_back(rd32(pf + DDPF_OFF_dwFourCC));
+            set_eax(c, DDENUMRET_OK);
+        },
+        2);
+    CHECK_EQ(call_method(dev, DEV7_EnumTextureFormats, {tcb, 0}), D3D_OK_);
+    CHECK_EQ(fmt_bits.size(), 3u);
+    if (fmt_bits.size() == 3) {
+        CHECK_EQ(fmt_bits[0], 16u);
+        CHECK_EQ(fmt_flags[0], (uint32_t)DDPF_RGB);
+        CHECK_EQ(fmt_bits[1], 16u);
+        CHECK_EQ(fmt_flags[1], (uint32_t)(DDPF_RGB | DDPF_ALPHAPIXELS));
+        CHECK_EQ(fmt_bits[2], 32u);
+        for (uint32_t f : fmt_fourcc)
+            CHECK_EQ(f, 0u);
+    }
+
+    // ---- IDirect3DVertexBuffer7: vtable order and a guest lock round trip.
+    uint32_t desc = sc(0x1800);
+    wr32(desc + D3DVBD_OFF_dwSize, D3DVERTEXBUFFERDESC_SIZE);
+    wr32(desc + D3DVBD_OFF_dwCaps, D3DVBCAPS_WRITEONLY);
+    wr32(desc + D3DVBD_OFF_dwFVF, 0x112); // XYZ | NORMAL | TEX1 = 32 bytes
+    wr32(desc + D3DVBD_OFF_dwNumVertices, 16);
+    CHECK_EQ(call_method(d3d, D3D7_CreateVertexBuffer, {desc, out, 0}), D3D_OK_);
+    uint32_t vb = rd32(out);
+    CHECK_EQ(com_iface_of(vb), IF_D3DVERTEXBUFFER7);
+    uint32_t vvt = rd32(vb + COM_OFF_vtbl);
+    CHECK(strstr(imports_describe(rd32(vvt + 0x0c)), "Lock"));
+    CHECK(strstr(imports_describe(rd32(vvt + 0x18)), "GetVertexBufferDesc"));
+    CHECK(strstr(imports_describe(rd32(vvt + 0x20)), "ProcessVerticesStrided"));
+    uint32_t data = sc(0x1900), size = sc(0x1940);
+    CHECK_EQ(call_method(vb, VB7_Lock, {0, data, size}), D3D_OK_);
+    uint32_t ptr = rd32(data), bytes = rd32(size);
+    CHECK_EQ(bytes, 16u * 32u);
+    CHECK(ptr != 0);
+    wr32(ptr, 0xdeadbeefu);
+    CHECK_EQ(call_method(vb, VB7_Unlock, {}), D3D_OK_);
+    CHECK_EQ(call_method(vb, VB7_Lock, {0, data, size}), D3D_OK_);
+    CHECK_EQ(rd32(rd32(data)), 0xdeadbeefu);
+    CHECK_EQ(call_method(vb, VB7_Unlock, {}), D3D_OK_);
+    gm_zero(desc, 16);
+    CHECK_EQ(call_method(vb, VB7_GetVertexBufferDesc, {desc}), D3D_OK_);
+    CHECK_EQ(rd32(desc + D3DVBD_OFF_dwSize), (uint32_t)D3DVERTEXBUFFERDESC_SIZE);
+    CHECK_EQ(rd32(desc + D3DVBD_OFF_dwFVF), 0x112u);
+    CHECK_EQ(rd32(desc + D3DVBD_OFF_dwNumVertices), 16u);
+    CHECK_EQ(call_method(vb, VB7_Optimize, {0, 0}), D3D_OK_);
+    call_method(vb, 2, {});
+
+    // ---- Unimplemented device slots abort by name; a draw is not silently a
+    // no-op. The abort cannot be observed from the test process, so the only
+    // thing tested here is that the slot is not shared with a state method.
+    uint32_t dvt = rd32(dev + COM_OFF_vtbl);
+    const char *draw = imports_describe(rd32(dvt + 0x68)); // DrawIndexedPrimitive
+    CHECK(draw && strstr(draw, "IDirect3DDevice7::DrawIndexedPrimitive") != nullptr);
+    const char *clear = imports_describe(rd32(dvt + 0x28)); // Clear
+    CHECK(clear && strstr(clear, "IDirect3DDevice7::Clear") != nullptr);
+
+    call_method(dev, 2, {});
+    CHECK_EQ(call_method(d3d, 2, {}), 0);
+}
+
+// The D3D7 -> D3D8 seam tables and the 8:8:8/5:6:5 boundary. These are pure
+// functions, so the table is checked without the renderer or a GPU.
+static void test_d3d7_translation() {
+    cpu_reset();
+
+    // ---- render states: D3D8-shared ids forward unchanged.
+    uint32_t ds = 0;
+    CHECK_EQ((int)d3d7_translate_render_state(7, 1, &ds), (int)D3D7_STATE_FORWARD);
+    CHECK_EQ(ds, 7u); // ZENABLE
+    CHECK_EQ((int)d3d7_translate_render_state(137, 1, &ds), (int)D3D7_STATE_FORWARD);
+    CHECK_EQ(ds, 137u); // LIGHTING
+    CHECK_EQ((int)d3d7_translate_render_state(47, 0, &ds), (int)D3D7_STATE_FORWARD);
+    CHECK_EQ(ds, 47u); // ZBIAS
+    CHECK_EQ((int)d3d7_translate_render_state(136, 1, &ds), (int)D3D7_STATE_FORWARD);
+    CHECK_EQ(ds, 136u); // CLIPPING
+    // D3D7-only states the game uses with a value ignoring is exact for.
+    CHECK_EQ((int)d3d7_translate_render_state(4, 0, &ds), (int)D3D7_STATE_IGNORE);
+    CHECK_EQ((int)d3d7_translate_render_state(41, 0, &ds), (int)D3D7_STATE_IGNORE);
+    // ... a value that would change behavior stops loudly.
+    CHECK_EQ((int)d3d7_translate_render_state(41, 1, &ds), (int)D3D7_STATE_INVALID);
+    CHECK_EQ((int)d3d7_translate_render_state(42, 0, &ds), (int)D3D7_STATE_INVALID);
+
+    // ---- transforms: D3D7 WORLD 1 -> D3D8 256, VIEW/PROJECTION unchanged.
+    CHECK(d3d7_translate_transform(1, &ds) && ds == 256u);
+    CHECK(d3d7_translate_transform(2, &ds) && ds == 2u);
+    CHECK(d3d7_translate_transform(3, &ds) && ds == 3u);
+    CHECK(d3d7_translate_transform(16, &ds) && ds == 16u);
+    CHECK(d3d7_translate_transform(23, &ds) && ds == 23u);
+    CHECK(!d3d7_translate_transform(24, &ds));
+    CHECK(!d3d7_translate_transform(255, &ds));
+
+    // ---- texture-stage states: ADDRESS (12) splits into U (13) and V (14).
+    uint32_t t[2] = {0, 0};
+    CHECK_EQ(d3d7_translate_texture_stage_state(12, t), 2);
+    CHECK_EQ(t[0], 13u);
+    CHECK_EQ(t[1], 14u);
+    CHECK_EQ(d3d7_translate_texture_stage_state(1, t), 1);
+    CHECK_EQ(t[0], 1u);
+    CHECK_EQ(d3d7_translate_texture_stage_state(16, t), 1);
+    CHECK_EQ(t[0], 16u);
+    CHECK_EQ(d3d7_translate_texture_stage_state(28, t), 1);
+    CHECK_EQ(t[0], 28u);
+    CHECK_EQ(d3d7_translate_texture_stage_state(29, t), -1);
+    CHECK_EQ(d3d7_translate_texture_stage_state(0, t), -1);
+
+    // ---- 8:8:8 -> 5:6:5 truncates the low bits (the boundary copy).
+    CHECK_EQ(d3d7_rgb888_to_rgb565(0x00000000u), 0x0000u);
+    CHECK_EQ(d3d7_rgb888_to_rgb565(0x00ffffffu), 0xffffu);
+    CHECK_EQ(d3d7_rgb888_to_rgb565(0x00ff0000u), 0xf800u);
+    CHECK_EQ(d3d7_rgb888_to_rgb565(0x0000ff00u), 0x07e0u);
+    CHECK_EQ(d3d7_rgb888_to_rgb565(0x000000ffu), 0x001fu);
+    CHECK_EQ(d3d7_rgb888_to_rgb565(0x00000007u), 0x0000u); // low bits dropped
+    CHECK_EQ(d3d7_rgb888_to_rgb565(0x00080000u), 0x0800u); // r=8 -> r5=1
+    // ---- 5:6:5 -> 8:8:8 uses the presenter's *255/max scale, so the
+    // endpoints round-trip exactly and the middle values are the PNG's.
+    CHECK_EQ(d3d7_rgb565_to_rgb888(0x0000u), 0xff000000u);
+    CHECK_EQ(d3d7_rgb565_to_rgb888(0xffffu), 0xffffffffu);
+    CHECK_EQ(d3d7_rgb565_to_rgb888(0xf800u), 0xffff0000u);
+    CHECK_EQ(d3d7_rgb565_to_rgb888(0x07e0u), 0xff00ff00u);
+    CHECK_EQ(d3d7_rgb565_to_rgb888(0x001fu), 0xff0000ffu);
+    // Bit replication would give 0xff210000 for 0x2000; the scale gives 0x20.
+    CHECK_EQ(d3d7_rgb565_to_rgb888(0x2000u), 0xff200000u);
+
+    // ---- the writeback store: RGBA8 readback -> guest surface bytes. The
+    // store is the shim's own reconcile copy, so it must produce exactly the
+    // bytes the old per-pixel wr16/wr32 path did, row by row and pitch aware.
+    {
+        // Four pixels: red, green, blue, white, as the Rust target returns
+        // them (RGBA byte order).
+        const uint8_t rgba[16] = {255, 0, 0,   255, 0,   255, 0,   255,
+                                  0,   0, 255, 255, 255, 255, 255, 255};
+        uint8_t b16[2 * 4 * 2]; // 2 rows of 4 pixels at pitch 8
+        memset(b16, 0xAA, sizeof b16);
+        CHECK(d3d7_store_rgba_surface(b16, 8, 16, 4, 1, rgba));
+        // Row 0: red 0xF800, green 0x07E0, blue 0x001F, white 0xFFFF.
+        const uint16_t row0[4] = {0xF800, 0x07E0, 0x001F, 0xFFFF};
+        CHECK_EQ(memcmp(b16, row0, 8), 0);
+        // The second row is untouched: the store is pitch aware and wrote one.
+        const uint16_t cap[4] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+        CHECK_EQ(memcmp(b16 + 8, cap, 8), 0);
+
+        uint8_t b32[4 * 4];
+        memset(b32, 0xAA, sizeof b32);
+        CHECK(d3d7_store_rgba_surface(b32, 16, 32, 4, 1, rgba));
+        const uint8_t xrow[16] = {0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0};
+        CHECK_EQ(memcmp(b32, xrow, 16), 0);
+
+        // A bpp with no store is refused and touches nothing.
+        uint8_t keep[4] = {0x11, 0x22, 0x33, 0x44};
+        CHECK(!d3d7_store_rgba_surface(keep, 4, 8, 1, 1, rgba));
+        CHECK_EQ(memcmp(keep, "\x11\x22\x33\x44", 4), 0);
+    }
+}
+
+// The DXT block decoder, with known blocks and exact expected pixels. This is
+// the path that fills the engine's VRAM texture pool: LH3DVRAM Blts a DXT
+// source surface into a 16bpp pool texture.
+static void test_dxt_decode() {
+    cpu_reset();
+    dxdxt::Rgba b[16];
+
+    // DXT1, c0 = red 0xF800 > c1 = green 0x07E0, so four-colour mode. The
+    // index word 0xE4E4E4E4 walks 0,1,2,3,0,1,2,3,... across the 16 texels.
+    const uint8_t dxt1[8] = {0x00, 0xf8, 0xe0, 0x07, 0xe4, 0xe4, 0xe4, 0xe4};
+    CHECK(dxdxt::decode_block(dxt1, dxdxt::kDxt1, b));
+    CHECK_EQ(b[0].r, 255);
+    CHECK_EQ(b[0].g, 0);
+    CHECK_EQ(b[0].b, 0);
+    CHECK_EQ(b[0].a, 255);
+    CHECK_EQ(b[1].r, 0);
+    CHECK_EQ(b[1].g, 255);
+    CHECK_EQ(b[1].b, 0);
+    CHECK_EQ(b[1].a, 255);
+    CHECK_EQ(b[2].r, 170); // (2*red + green) / 3
+    CHECK_EQ(b[2].g, 85);  // (red + 2*green) / 3 is the next texel
+    CHECK_EQ(b[2].b, 0);
+    CHECK_EQ(b[2].a, 255);
+    CHECK_EQ(b[3].r, 85);
+    CHECK_EQ(b[3].g, 170);
+    CHECK_EQ(b[3].a, 255);
+
+    // DXT1 three-colour mode: c0 <= c1, so index 2 is the midpoint and index 3
+    // is transparent black. The all-2s index word picks the midpoint.
+    const uint8_t dxt1x[8] = {0x00, 0x00, 0xff, 0xff, 0xaa, 0xaa, 0xaa, 0xaa};
+    CHECK(dxdxt::decode_block(dxt1x, dxdxt::kDxt1, b));
+    CHECK_EQ(b[0].r, 127);
+    CHECK_EQ(b[0].g, 127);
+    CHECK_EQ(b[0].a, 255);
+    const uint8_t dxt1t[8] = {0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    CHECK(dxdxt::decode_block(dxt1t, dxdxt::kDxt1, b));
+    CHECK_EQ(b[0].a, 0);
+    CHECK_EQ(b[0].r, 0);
+
+    // DXT3: alpha nibbles 0..15, then a colour block whose index word is zero,
+    // so every texel is c0 = red with its own 4-bit alpha (nibble replicated).
+    const uint8_t dxt3[16] = {0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+                              0x00, 0xf8, 0xe0, 0x07, 0x00, 0x00, 0x00, 0x00};
+    CHECK(dxdxt::decode_block(dxt3, dxdxt::kDxt3, b));
+    CHECK_EQ(b[0].a, 0);
+    CHECK_EQ(b[1].a, 17); // 1 -> (1<<4)|1
+    CHECK_EQ(b[2].a, 34);
+    CHECK_EQ(b[15].a, 255);
+    CHECK_EQ(b[0].r, 255);
+    CHECK_EQ(b[15].g, 0);
+
+    // DXT5 with the shared colour block and alpha endpoints 255 > 0.
+    const uint8_t dxt5[16] = {0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                              0x00, 0xf8, 0xe0, 0x07, 0x00, 0x00, 0x00, 0x00};
+    CHECK(dxdxt::decode_block(dxt5, dxdxt::kDxt5, b));
+    CHECK_EQ(b[0].r, 255);
+    CHECK_EQ(b[0].a, 255); // index 0 = alpha0
+
+    // DXT2/DXT4 (premultiplied) are not accepted: the caller fails loudly
+    // rather than guessing the stored colour space.
+    CHECK(!dxdxt::decode_block(dxt3, 0x32545844u, b)); // 'DXT2'
+    CHECK(!dxdxt::decode_block(dxt3, 0x34545844u, b)); // 'DXT4'
+    CHECK(!dxdxt::is_dxt(0x43525650u));                // 'PVRC'
+}
+
+// A DXT1 DirectDraw surface: CreateSurface accepts the FourCC, storage is the
+// block bytes, the Lock descriptor reports the linear size (not the block
+// pitch), and a Blt decodes into an A4R4G4B4 destination.
+static void test_dxt_surface_and_blit() {
+    cpu_reset();
+    const uint8_t dd7[16] = {0xC0, 0x5E, 0xE6, 0x15, 0x9C, 0x3B, 0xD2, 0x11,
+                             0xB9, 0x2F, 0x00, 0x60, 0x97, 0x97, 0xEA, 0x5B};
+    uint32_t iid = sc(0x40), out = sc(0x60);
+    memcpy(gm_ptr(iid), dd7, sizeof(dd7));
+    CHECK_EQ(call_shim(tramp("DDRAW.dll", "DirectDrawCreateEx"), {0, out, iid, 0}), DD_OK);
+    uint32_t dd = rd32(out);
+    CHECK(dd != 0);
+    if (!dd)
+        return;
+    // No SetDisplayMode: the offscreen surfaces here carry their own pixel
+    // format, and touching the display-mode table would leak into later tests.
+
+    auto make = [&](uint32_t w, uint32_t h, bool dxt) {
+        uint32_t desc = sc(0x900);
+        gm_zero(desc, DDSD2_SIZE);
+        wr32(desc + DDSD_OFF_dwSize, DDSD2_SIZE);
+        wr32(desc + DDSD_OFF_dwFlags, DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT);
+        wr32(desc + DDSD_OFF_dwWidth, w);
+        wr32(desc + DDSD_OFF_dwHeight, h);
+        wr32(desc + DDSD_OFF_ddsCaps, DDSCAPS_TEXTURE | DDSCAPS_SYSTEMMEMORY);
+        uint32_t pf = desc + DDSD_OFF_ddpfPixelFormat;
+        wr32(pf + DDPF_OFF_dwSize, DDPF_SIZE);
+        if (dxt) {
+            wr32(pf + DDPF_OFF_dwFlags, DDPF_FOURCC);
+            wr32(pf + DDPF_OFF_dwFourCC, 0x31545844u); // 'DXT1'
+        } else {
+            wr32(pf + DDPF_OFF_dwFlags, DDPF_RGB | DDPF_ALPHAPIXELS);
+            wr32(pf + DDPF_OFF_dwRGBBitCount, 16);
+            wr32(pf + DDPF_OFF_dwRBitMask, 0x0f00);
+            wr32(pf + DDPF_OFF_dwGBitMask, 0x00f0);
+            wr32(pf + DDPF_OFF_dwBBitMask, 0x000f);
+            wr32(pf + DDPF_OFF_dwRGBAlphaBitMask, 0xf000);
+        }
+        return call_method(dd, DD_CreateSurface, {desc, sc(0x10), 0});
+    };
+
+    CHECK_EQ(make(8, 8, true), DD_OK);
+    uint32_t src = rd32(sc(0x10));
+    CHECK(src != 0);
+    ComObj *so = src ? com_this(src) : nullptr;
+    CHECK(so != nullptr);
+    if (!so)
+        return;
+    CHECK_EQ(so->fourcc, 0x31545844u);
+    CHECK_EQ(so->bpp, 0u);
+    CHECK_EQ(so->pitch, 16u);        // 2 block columns * 8 bytes
+    CHECK_EQ(so->pixels_bytes, 32u); // 16 * 2 block rows
+
+    // Lock whole surface, write the known block, unlock.
+    uint32_t ldesc = sc(0xa00);
+    gm_zero(ldesc, DDSD2_SIZE);
+    wr32(ldesc + DDSD_OFF_dwSize, DDSD2_SIZE);
+    CHECK_EQ(call_method(src, S_Lock, {0, ldesc, DDLOCK_WAIT, 0}), DD_OK);
+    CHECK((rd32(ldesc + DDSD_OFF_dwFlags) & DDSD_LINEARSIZE) != 0);
+    CHECK_EQ(rd32(ldesc + DDSD_OFF_lPitch), 32u); // linear size, not 16
+    uint32_t pix = rd32(ldesc + DDSD_OFF_lpSurface);
+    CHECK(pix != 0);
+    const uint8_t block[8] = {0x00, 0xf8, 0xe0, 0x07, 0xe4, 0xe4, 0xe4, 0xe4};
+    for (int i = 0; i < 8; ++i)
+        wr8(pix + (uint32_t)i, block[i]);
+    CHECK_EQ(call_method(src, S_Unlock, {0}), DD_OK);
+
+    // An 8x8 A4R4G4B4 destination; Blt decodes the first 4x4 block into it.
+    CHECK_EQ(make(8, 8, false), DD_OK);
+    uint32_t dst = rd32(sc(0x10));
+    CHECK(dst != 0);
+    // Blt's `this` is the DESTINATION and arg1 is the source, so the
+    // A4R4G4B4 surface is the receiver and the DXT surface is decoded into it.
+    CHECK_EQ(call_method(dst, S_Blt, {0, src, 0, DDBLT_WAIT, 0}), DD_OK);
+    ComObj *dobj = dst ? com_this(dst) : nullptr;
+    CHECK(dobj != nullptr);
+    if (!dobj)
+        return;
+    uint32_t ddesc = sc(0xa80);
+    gm_zero(ddesc, DDSD2_SIZE);
+    wr32(ddesc + DDSD_OFF_dwSize, DDSD2_SIZE);
+    CHECK_EQ(call_method(dst, S_Lock, {0, ddesc, DDLOCK_WAIT, 0}), DD_OK);
+    uint32_t dpix = rd32(ddesc + DDSD_OFF_lpSurface);
+    auto px = [&](uint32_t x, uint32_t y) {
+        return (uint32_t)rd16(dpix + y * dobj->pitch + x * 2u);
+    };
+    CHECK_EQ(px(0, 0), 0xff00u); // a=15, r=15
+    CHECK_EQ(px(1, 0), 0xf0f0u); // a=15, g=15
+    CHECK_EQ(px(2, 0), 0xfa50u); // a=15, r=10, g=5
+    CHECK_EQ(px(3, 0), 0xf5a0u); // a=15, r=5, g=10
+    CHECK_EQ(call_method(dst, S_Unlock, {0}), DD_OK);
+    call_method(src, S_Release, {});
+    call_method(dst, S_Release, {});
+    call_method(dd, DD_Release, {});
+}
+
+// The trace's pure helpers: FVF vertex decoding and the frame-range grammar.
+static void test_d3d7_trace_helpers() {
+    cpu_reset();
+    auto putf = [](uint8_t *p, int off, float f) { memcpy(p + off, &f, 4); };
+    auto putu = [](uint8_t *p, int off, uint32_t u) { memcpy(p + off, &u, 4); };
+    // XYZRHW | DIFFUSE | SPECULAR | TEX1 (0x1c4): stride 32.
+    uint8_t v[32];
+    memset(v, 0, sizeof v);
+    putf(v, 0, 1.5f);
+    putf(v, 4, 2.5f);
+    putf(v, 8, 0.25f);
+    putf(v, 12, 1.0f);
+    putu(v, 16, 0x80112233u);
+    putu(v, 20, 0xff445566u);
+    putf(v, 24, 0.0f);
+    putf(v, 28, 1.0f);
+    std::string s = d3d7_trace_vertex(0x1c4, v);
+    CHECK(strstr(s.c_str(), "pos=(1.5,2.5,0.25,1)") != nullptr);
+    CHECK(strstr(s.c_str(), "diff=80112233") != nullptr);
+    CHECK(strstr(s.c_str(), "spec=ff445566") != nullptr);
+    CHECK(strstr(s.c_str(), "uv0=(0,1)") != nullptr);
+    // XYZ | NORMAL | TEX1 (0x112): stride 12+12+8 = 32.
+    memset(v, 0, sizeof v);
+    putf(v, 0, 1.0f);
+    putf(v, 4, 2.0f);
+    putf(v, 8, 3.0f);
+    putf(v, 12, 0.0f);
+    putf(v, 16, 1.0f);
+    putf(v, 20, 0.0f);
+    putf(v, 24, 0.0f);
+    putf(v, 28, 1.0f);
+    std::string n = d3d7_trace_vertex(0x112, v);
+    CHECK(strstr(n.c_str(), "pos=(1,2,3)") != nullptr);
+    CHECK(strstr(n.c_str(), "n=(0,1,0)") != nullptr);
+    // A position layout this front end does not decode says so rather than
+    // guessing a byte layout.
+    CHECK(strstr(d3d7_trace_vertex(0x006, v).c_str(), "undecoded") != nullptr);
+
+    // Frame-range grammar, 1-based and inclusive.
+    uint32_t lo = 99, hi = 99;
+    CHECK(d3d7_trace_parse_frames("5-10", &lo, &hi) && lo == 5 && hi == 10);
+    CHECK(d3d7_trace_parse_frames("7", &lo, &hi) && lo == 7 && hi == 7);
+    CHECK(d3d7_trace_parse_frames("7-", &lo, &hi) && lo == 7 && hi == 0xffffffffu);
+    CHECK(d3d7_trace_parse_frames("-12", &lo, &hi) && lo == 1 && hi == 12);
+    CHECK(!d3d7_trace_parse_frames("", &lo, &hi));
+    CHECK(!d3d7_trace_parse_frames("abc", &lo, &hi));
+    CHECK(!d3d7_trace_parse_frames("0-3", &lo, &hi));
+    CHECK(!d3d7_trace_parse_frames("9-4", &lo, &hi));
+
+    // Small-draw collapse: a run prints once, equal frames stay silent, and a
+    // change emits the previous frame range before the new content.
+    D3d7TraceSmallCollapser c;
+    std::string out;
+    CHECK(d3d7_trace_small_step(&c, 10, "A", &out) && out.empty());
+    CHECK(!d3d7_trace_small_step(&c, 11, "A", &out));
+    CHECK(!d3d7_trace_small_step(&c, 12, "A", &out));
+    CHECK(c.first == 10 && c.last == 12);
+    CHECK(d3d7_trace_small_step(&c, 13, "B", &out));
+    CHECK(out == "frames 10-12: unchanged");
+    CHECK(c.first == 13 && c.last == 13);
+    CHECK(!d3d7_trace_small_step(&c, 14, "B", &out));
+    CHECK(d3d7_trace_small_flush(&c, &out));
+    CHECK(out == "frames 13-14: unchanged");
+    CHECK(!d3d7_trace_small_flush(&c, &out)); // already closed
+    // A one-frame run has nothing to collapse.
+    D3d7TraceSmallCollapser d;
+    CHECK(d3d7_trace_small_step(&d, 1, "X", &out) && out.empty());
+    CHECK(!d3d7_trace_small_flush(&d, &out));
 }
 
 // QueryInterface: the DirectDraw object hands out IDirectDraw2 and 4, refuses
@@ -8638,6 +9410,73 @@ static void test_bink_handle_flag_errors() {
     CHECK(error && gm_str(error) == "memory-resident video is not supported");
 }
 
+// _BinkGetRealtime@12 fills the 0x38-byte BINKREALTIME record Process3dEngine
+// formats into its debug line. The arity and the null/unknown-player guard run
+// everywhere; the value checks need a decoded container (RECOMP_TEST_BINK_CONTAINER).
+static void test_bink_realtime() {
+    cpu_reset();
+    uint32_t realtime = tramp("binkw32.dll", "_BinkGetRealtime@12");
+    CHECK_EQ(imports_argc(realtime), 3u);
+
+    // A null or foreign handle must not write the output record.
+    uint32_t scratch = heap_alloc(0x38, true, 16);
+    CHECK(scratch != 0);
+    if (scratch) {
+        memset(g_mem + scratch, 0xa5, 0x38);
+        CHECK_EQ(call_shim(realtime, {0, scratch, 1}), 0u);
+        CHECK_EQ(call_shim(realtime, {0x12345678, scratch, 1}), 0u);
+        CHECK_EQ(rd32(scratch), 0xa5a5a5a5u);
+        heap_free(scratch);
+    }
+
+#ifdef RECOMP_HAVE_FFMPEG
+    with_bink_container([](uint32_t rec, uint32_t) {
+        uint32_t realtime = tramp("binkw32.dll", "_BinkGetRealtime@12");
+        uint32_t out = heap_alloc(0x38, true, 16);
+        CHECK(out != 0);
+        if (!out)
+            return;
+        memset(g_mem + out, 0xa5, 0x38);
+        CHECK_EQ(call_shim(realtime, {rec, out, 1}), 0u);
+        // Every dword of the 0x38-byte record must be written.
+        for (uint32_t off = 0; off < 0x38; off += 4)
+            CHECK(rd32(out + off) != 0xa5a5a5a5u);
+        uint32_t frame_num = rd32(out + 0x00);
+        uint32_t frame_rate = rd32(out + 0x04);
+        uint32_t frame_rate_div = rd32(out + 0x08);
+        uint32_t window = rd32(out + 0x0c);
+        uint32_t total = rd32(out + 0x10);
+        uint32_t video = rd32(out + 0x14);
+        uint32_t audio = rd32(out + 0x18);
+        uint32_t readfore = rd32(out + 0x1c);
+        uint32_t readidle = rd32(out + 0x20);
+        uint32_t readback = rd32(out + 0x24);
+        uint32_t blit = rd32(out + 0x28);
+        uint32_t buffer_size = rd32(out + 0x2c);
+        uint32_t buffer_used = rd32(out + 0x30);
+        CHECK_EQ(frame_num, rd32(rec + 0x14));
+        CHECK(frame_rate > 0 && frame_rate_div > 0);
+        CHECK_EQ(window, 1u);
+        CHECK(total >= 1);
+        // The measured stage times plus idle cover the host-clock total, so a
+        // percentage division can never exceed 100.
+        CHECK_EQ(video + audio + readfore + readidle + readback + blit, total);
+        CHECK_EQ(readback, 0u);
+        CHECK(buffer_size > 0);
+        CHECK(buffer_used <= buffer_size);
+        // A decoded frame advances the frame number the debug line prints.
+        call_shim(tramp("binkw32.dll", "_BinkDoFrame@4"), {rec});
+        call_shim(tramp("binkw32.dll", "_BinkNextFrame@4"), {rec});
+        CHECK_EQ(call_shim(realtime, {rec, out, 1}), 0u);
+        CHECK_EQ(rd32(out + 0x00), frame_num + 1);
+        CHECK_EQ(rd32(out + 0x00), rd32(rec + 0x14));
+        heap_free(out);
+    });
+#else
+    printf("bink realtime value test: video decoding disabled, skipped\n");
+#endif
+}
+
 static void test_bink_play() {
 #ifdef RECOMP_HAVE_FFMPEG
     const std::string path =
@@ -8824,6 +9663,266 @@ static void test_qmixer() {
 
     uint32_t close = tramp("QMIXER.dll", "QSWaveMixCloseSession");
     CHECK_EQ(call_shim(close, {hmix}), 0u);
+}
+
+// QMixer completes a channel's queued waves when it is flushed, stopped or
+// replaced. FlushChannel (0x18001810) and StopChannel (0x18004990) both reach
+// fcn.1800a380 -> fcn.1800c7d0, which invokes the play-parameters callback
+// stored on the voice node at +0x5c with its context at +0x60. FreeWave
+// (0x180018c0 -> fcn.180075c0 -> fcn.18007790 -> fcn.1800a380) does the same,
+// and a replaced wave's node is finished by the play setup (0x180060f0).
+//
+// LHaudiodllR depends on this: its sample callback 0x102108c0 is the only
+// thing that clears a sample's playing flag at +0x8c, so a dropped callback
+// leaves GScript::SaySoundEffectPlaying true forever and the Land1 FollowUs
+// wait never clears.
+static uint32_t g_complete_calls = 0;
+static uint32_t g_complete_arg0 = 0, g_complete_arg1 = 0, g_complete_arg2 = 0;
+
+static void test_qmixer_completes_on_stop_replace_free() {
+    cpu_reset();
+    qmixer_reset();
+    g_plays.clear();
+    g_complete_calls = 0;
+
+    uint32_t hmix = call_shim(tramp("QMIXER.dll", "QSWaveMixInitEx"), {0});
+    CHECK(hmix != 0);
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixActivate"), {hmix, 1}), 0u);
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixOpenChannel"), {hmix, 2, 2}), 0u);
+
+    uint32_t wfx = sc(0x200);
+    gm_zero(wfx, SDK_WAVEFORMATEX);
+    wr16(wfx + WFX_OFF_wFormatTag, WAVE_FORMAT_PCM);
+    wr16(wfx + WFX_OFF_nChannels, 1);
+    wr32(wfx + WFX_OFF_nSamplesPerSec, 22050);
+    wr32(wfx + WFX_OFF_nAvgBytesPerSec, 22050);
+    wr16(wfx + WFX_OFF_nBlockAlign, 1);
+    wr16(wfx + WFX_OFF_wBitsPerSample, 8);
+
+    uint32_t pcm = sc(0x400);
+    for (uint32_t i = 0; i < 64; ++i)
+        wr8(pcm + i, (uint8_t)i);
+
+    uint32_t owd = sc(0x300);
+    gm_zero(owd, QSWAVEMIXOPENWAVEDATA_SIZE);
+    wr32(owd + QSOWD_OFF_lpFormat, wfx);
+    wr32(owd + QSOWD_OFF_lpData, pcm);
+    wr32(owd + QSOWD_OFF_dwDataSize, 64);
+
+    static uint32_t cb = imports_alloc_trampoline(
+        "TEST", "StopComplete",
+        [](X86 *c) {
+            ++g_complete_calls;
+            g_complete_arg0 = arg(c, 0);
+            g_complete_arg1 = arg(c, 1);
+            g_complete_arg2 = arg(c, 2);
+        },
+        3);
+
+    uint32_t open_wave = tramp("QMIXER.dll", "QSWaveMixOpenWaveEx");
+    uint32_t hwave = call_shim(open_wave, {hmix, owd, 8});
+    CHECK(hwave != 0);
+
+    uint32_t params = sc(0x500);
+    gm_zero(params, 0x28);
+    wr32(params + 0x00, 0x28);
+    wr32(params + 0x0c, cb);
+    wr32(params + 0x10, 0xBEEF0000u);
+
+    uint32_t play = tramp("QMIXER.dll", "QSWaveMixPlayEx");
+    CHECK_EQ(call_shim(play, {hmix, 1, 0x20, hwave, 0, params}), 0u);
+    CHECK_EQ(g_complete_calls, 0u);
+
+    // The flush path LHSampleStopAll uses (0x10212bf0 pushes flags 0).
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixFlushChannel"), {hmix, 1, 0}), 0u);
+    CHECK_EQ(g_complete_calls, 1u);
+    CHECK_EQ(g_complete_arg0, 1u);
+    CHECK_EQ(g_complete_arg1, hwave);
+    CHECK_EQ(g_complete_arg2, 0xBEEF0000u);
+
+    // The stop path.
+    CHECK_EQ(call_shim(play, {hmix, 1, 0x20, hwave, 0, params}), 0u);
+    CHECK_EQ(g_complete_calls, 1u);
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixStopChannel"), {hmix, 1, 0}), 0u);
+    CHECK_EQ(g_complete_calls, 2u);
+
+    // A replaced wave: a second PlayEx while the channel's voice is live.
+    CHECK_EQ(call_shim(play, {hmix, 1, 0x20, hwave, 0, params}), 0u);
+    CHECK_EQ(g_complete_calls, 2u);
+    CHECK_EQ(call_shim(play, {hmix, 1, 0x20, hwave, 0, params}), 0u);
+    CHECK_EQ(g_complete_calls, 3u);
+
+    // FreeWave completes the playing wave as well.
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixFreeWave"), {hmix, hwave}), 0u);
+    CHECK_EQ(g_complete_calls, 4u);
+
+    qmixer_reset();
+}
+
+// The queue rule is queue = (flags & 0x400) && !(flags & 0x1). The game's
+// ordinary samples pass 0x421 (LHaudiodllR 0x1021293b, 0x1020527b) and must
+// replace the voice: appending a speech wave computes its completion end
+// against the earlier sound's total, so its callback runs when that sound ends,
+// clears the sample's playing flag and advances the subtitle. Music chunks pass
+// 0x400 (0x1020f4ca) and must append. This asserts both against the host.
+static void test_qmixer_queue_flag_rules() {
+    cpu_reset();
+    qmixer_reset();
+    g_plays.clear();
+    g_queues.clear();
+    g_queue_enabled = true;
+    g_queue_retired = false;
+    g_ch_loop.clear();
+
+    uint32_t hmix = call_shim(tramp("QMIXER.dll", "QSWaveMixInitEx"), {0});
+    CHECK(hmix != 0);
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixActivate"), {hmix, 1}), 0u);
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixOpenChannel"), {hmix, 2, 2}), 0u);
+
+    uint32_t wfx = sc(0x200);
+    gm_zero(wfx, SDK_WAVEFORMATEX);
+    wr16(wfx + WFX_OFF_wFormatTag, WAVE_FORMAT_PCM);
+    wr16(wfx + WFX_OFF_nChannels, 1);
+    wr32(wfx + WFX_OFF_nSamplesPerSec, 22050);
+    wr32(wfx + WFX_OFF_nAvgBytesPerSec, 22050);
+    wr16(wfx + WFX_OFF_nBlockAlign, 1);
+    wr16(wfx + WFX_OFF_wBitsPerSample, 8);
+
+    uint32_t pcm = sc(0x400);
+    for (uint32_t i = 0; i < 64; ++i)
+        wr8(pcm + i, (uint8_t)i);
+
+    uint32_t owd = sc(0x300);
+    gm_zero(owd, QSWAVEMIXOPENWAVEDATA_SIZE);
+    wr32(owd + QSOWD_OFF_lpFormat, wfx);
+    wr32(owd + QSOWD_OFF_lpData, pcm);
+    wr32(owd + QSOWD_OFF_dwDataSize, 64);
+
+    uint32_t hwave = call_shim(tramp("QMIXER.dll", "QSWaveMixOpenWaveEx"), {hmix, owd, 8});
+    CHECK(hwave != 0);
+    // The engine reads the handle as a WAVEFORMATEX prefix: HelpDude::PlaySample
+    // (runblack 0x5bb530) divides by 2 * nChannels at +2, so zero is a divide error.
+    CHECK_EQ(rd16(hwave + 0), (uint32_t)WAVE_FORMAT_PCM);
+    CHECK_EQ(rd16(hwave + 2), 1u);
+    CHECK_EQ(rd32(hwave + 4), 22050u);
+    CHECK_EQ(rd32(hwave + 8), 22050u);
+    CHECK_EQ(rd16(hwave + 12), 1u);
+    CHECK_EQ(rd16(hwave + 14), 8u);
+
+    uint32_t play = tramp("QMIXER.dll", "QSWaveMixPlayEx");
+    // First play starts the voice; the second, with the game's own 0x421, must
+    // replace it rather than queue, even though the voice is still busy.
+    CHECK_EQ(call_shim(play, {hmix, 1, 0x421, hwave, 0, 0}), 0u);
+    CHECK_EQ(g_plays.size(), 1u);
+    CHECK_EQ(g_queues.size(), 0u);
+    CHECK_EQ(call_shim(play, {hmix, 1, 0x421, hwave, 0, 0}), 0u);
+    CHECK_EQ(g_plays.size(), 2u);
+    CHECK_EQ(g_queues.size(), 0u);
+
+    // The music flag 0x400 (without 0x1) joins the playing voice.
+    CHECK_EQ(call_shim(play, {hmix, 1, 0x400, hwave, 0, 0}), 0u);
+    CHECK_EQ(g_plays.size(), 2u);
+    CHECK_EQ(g_queues.size(), 1u);
+
+    qmixer_reset();
+    g_queue_enabled = false;
+}
+
+// QSWaveMixGetPlayPosition reports the voice cursor in the units the selector
+// picks. LHaudiodllR 0x10214c00 calls it with selector 2 and uses the *lpPlayPos
+// output as a gate: it returns -1 when that frame cursor is zero, which is what
+// stopped advisor speech half a second in. These assert the frame/byte/ms
+// conversions against QMixer.dll 0x1800c590 and 0x1802cb20, plus the queued,
+// paused and stopped cases.
+static void test_qmixer_play_position() {
+    cpu_reset();
+    qmixer_reset();
+    g_plays.clear();
+    g_queues.clear();
+    g_queue_enabled = true;
+    g_queue_retired = false;
+    g_ch_loop.clear();
+    g_test_audio_pos = 0;
+
+    uint32_t hmix = call_shim(tramp("QMIXER.dll", "QSWaveMixInitEx"), {0});
+    CHECK(hmix != 0);
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixActivate"), {hmix, 1}), 0u);
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixOpenChannel"), {hmix, 1, 2}), 0u);
+
+    // 22050 Hz, stereo, 16 bit: four bytes to a sample frame.
+    uint32_t wfx = sc(0x200);
+    gm_zero(wfx, SDK_WAVEFORMATEX);
+    wr16(wfx + WFX_OFF_wFormatTag, WAVE_FORMAT_PCM);
+    wr16(wfx + WFX_OFF_nChannels, 2);
+    wr32(wfx + WFX_OFF_nSamplesPerSec, 22050);
+    wr32(wfx + WFX_OFF_nAvgBytesPerSec, 22050 * 4);
+    wr16(wfx + WFX_OFF_nBlockAlign, 4);
+    wr16(wfx + WFX_OFF_wBitsPerSample, 16);
+
+    uint32_t pcm = sc(0x400);
+    for (uint32_t i = 0; i < 64; ++i)
+        wr8(pcm + i, (uint8_t)i);
+
+    uint32_t owd = sc(0x300);
+    gm_zero(owd, QSWAVEMIXOPENWAVEDATA_SIZE);
+    wr32(owd + QSOWD_OFF_lpFormat, wfx);
+    wr32(owd + QSOWD_OFF_lpData, pcm);
+    wr32(owd + QSOWD_OFF_dwDataSize, 64);
+
+    uint32_t hwave = call_shim(tramp("QMIXER.dll", "QSWaveMixOpenWaveEx"), {hmix, owd, 8});
+    CHECK(hwave != 0);
+
+    uint32_t play = tramp("QMIXER.dll", "QSWaveMixPlayEx");
+    CHECK_EQ(call_shim(play, {hmix, 0, 0x421, hwave, 0, 0}), 0u);
+
+    uint32_t playp = sc(0x600), writep = sc(0x604);
+    uint32_t getpos = tramp("QMIXER.dll", "QSWaveMixGetPlayPosition");
+
+    // 400 bytes is 100 sample frames, 5 ms at 22050 Hz (rounded).
+    g_test_audio_pos = 400;
+    wr32(playp, 0xdeadbeefu);
+    wr32(writep, 0xdeadbeefu);
+    CHECK_EQ(call_shim(getpos, {hmix, 0, playp, writep, 0}), 0u);
+    CHECK_EQ(rd32(playp), 100u);  // sample frames, always
+    CHECK_EQ(rd32(writep), 400u); // selector 0: bytes
+
+    CHECK_EQ(call_shim(getpos, {hmix, 0, playp, writep, 1}), 0u);
+    CHECK_EQ(rd32(playp), 100u);
+    CHECK_EQ(rd32(writep), 100u); // selector 1: sample frames
+
+    // (100*1000 + 22050/2) / 22050 = 111025 / 22050 = 5.
+    CHECK_EQ(call_shim(getpos, {hmix, 0, playp, writep, 2}), 0u);
+    CHECK_EQ(rd32(playp), 100u);
+    CHECK_EQ(rd32(writep), 5u); // selector 2: milliseconds, rounded
+
+    CHECK_EQ(call_shim(getpos, {hmix, 0, playp, writep, 3}), 0u);
+    CHECK_EQ(rd32(playp), 100u);
+    CHECK_EQ(rd32(writep), 0u); // selector 3: no write cursor
+
+    // A queued chunk extends the voice; the cursor is cumulative, not reset.
+    CHECK_EQ(call_shim(play, {hmix, 0, 0x400, hwave, 0, 0}), 0u);
+    CHECK_EQ(g_queues.size(), 1u);
+    g_test_audio_pos = 800;
+    CHECK_EQ(call_shim(getpos, {hmix, 0, playp, writep, 1}), 0u);
+    CHECK_EQ(rd32(playp), 200u);
+    CHECK_EQ(rd32(writep), 200u);
+
+    // A paused voice keeps the cursor where the host stopped it.
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixPauseChannel"), {hmix, 0, 0}), 0u);
+    CHECK_EQ(call_shim(getpos, {hmix, 0, playp, writep, 2}), 0u);
+    CHECK_EQ(rd32(playp), 200u);
+    CHECK_EQ(rd32(writep), 9u); // (200*1000 + 11025) / 22050 = 9
+
+    // A stopped/flushed voice has lost its write cursor but keeps the frame
+    // position, which is what 0x1800c590 does once obj[+0xe4] is cleared.
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixFlushChannel"), {hmix, 0, 0}), 0u);
+    CHECK_EQ(call_shim(getpos, {hmix, 0, playp, writep, 1}), 0u);
+    CHECK_EQ(rd32(playp), 200u);
+    CHECK_EQ(rd32(writep), 0u);
+
+    qmixer_reset();
+    g_test_audio_pos = 0;
+    g_queue_enabled = false;
 }
 
 // weanetr: both network bring-up paths report unavailable so the game runs
@@ -9291,6 +10390,73 @@ static void test_overflow_rejection() {
     hr = call_method(dd, DD_CreateSurface, {desc, sc(4), 0});
     CHECK(hr != DD_OK);
     CHECK_EQ(rd32(sc(4)), 0);
+}
+
+// A video-memory surface must fail with DDERR_OUTOFVIDEOMEMORY once the
+// reported VRAM is full, and GetAvailableVidMem must report the same capacity
+// and fall as surfaces are charged. This is the signal the engine's LH3DVRAM
+// pool loop (0x85dd60) uses; an unbounded shim lets the pool consume the
+// 208 MB guest heap and the engine faults on a later allocation.
+static void test_vram_budget() {
+    ddraw_set_vram_total(256u * 1024u); // room for 8 x 128x128x16 surfaces
+    cpu_reset();
+    const uint8_t dd7[16] = {0xC0, 0x5E, 0xE6, 0x15, 0x9C, 0x3B, 0xD2, 0x11,
+                             0xB9, 0x2F, 0x00, 0x60, 0x97, 0x97, 0xEA, 0x5B};
+    uint32_t iid = sc(0x40), out = sc(0x60);
+    memcpy(gm_ptr(iid), dd7, sizeof(dd7));
+    CHECK_EQ(call_shim(tramp("DDRAW.dll", "DirectDrawCreateEx"), {0, out, iid, 0}), DD_OK);
+    uint32_t dd = rd32(out);
+    CHECK(dd != 0);
+    CHECK(ddraw_set_modes("320x240x16"));
+    CHECK_EQ(call_method(dd, DD_SetDisplayMode, {320, 240, 16, 0, 0}), DD_OK);
+
+    auto make = [&]() {
+        uint32_t desc = sc(0x900);
+        gm_zero(desc, DDSD2_SIZE);
+        wr32(desc + DDSD_OFF_dwSize, DDSD2_SIZE);
+        wr32(desc + DDSD_OFF_dwFlags, DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT);
+        wr32(desc + DDSD_OFF_dwWidth, 128);
+        wr32(desc + DDSD_OFF_dwHeight, 128);
+        wr32(desc + DDSD_OFF_ddsCaps, DDSCAPS_VIDEOMEMORY | DDSCAPS_LOCALVIDMEM | DDSCAPS_TEXTURE);
+        uint32_t pf = desc + DDSD_OFF_ddpfPixelFormat;
+        wr32(pf + DDPF_OFF_dwSize, DDPF_SIZE);
+        wr32(pf + DDPF_OFF_dwFlags, DDPF_RGB);
+        wr32(pf + DDPF_OFF_dwRGBBitCount, 16);
+        wr32(pf + DDPF_OFF_dwRBitMask, 0xf800);
+        wr32(pf + DDPF_OFF_dwGBitMask, 0x07e0);
+        wr32(pf + DDPF_OFF_dwBBitMask, 0x001f);
+        return call_method(dd, DD_CreateSurface, {desc, sc(0x10), 0});
+    };
+
+    uint32_t surf[8] = {0};
+    for (int i = 0; i < 8; ++i) {
+        CHECK_EQ(make(), DD_OK);
+        surf[i] = rd32(sc(0x10));
+        CHECK(surf[i] != 0);
+    }
+    CHECK_EQ(make(), DDERR_OUTOFVIDEOMEMORY);
+    CHECK_EQ(rd32(sc(0x10)), 0u);
+
+    uint32_t total = sc(0x200), free_ = sc(0x204);
+    wr32(total, 0xdeadbeefu);
+    wr32(free_, 0xdeadbeefu);
+    CHECK_EQ(call_method(dd, DD_GetAvailableVidMem, {0, total, free_}), DD_OK);
+    CHECK_EQ(rd32(total), 256u * 1024u);
+    CHECK_EQ(rd32(free_), 0u);
+
+    // Releasing one refunds its bytes, and a new surface fits again.
+    CHECK_EQ(call_method(surf[0], S_Release, {}), 0u);
+    CHECK_EQ(call_method(dd, DD_GetAvailableVidMem, {0, total, free_}), DD_OK);
+    CHECK_EQ(rd32(free_), 128u * 256u);
+    CHECK_EQ(make(), DD_OK);
+    CHECK(rd32(sc(0x10)) != 0);
+    CHECK_EQ(call_method(rd32(sc(0x10)), S_Release, {}), 0u);
+
+    for (int i = 1; i < 8; ++i)
+        call_method(surf[i], S_Release, {});
+    CHECK_EQ(call_method(dd, DD_Release, {}), 0u);
+    ddraw_reset_modes();
+    ddraw_set_vram_total(DDRAW_VRAM_UNSET);
 }
 
 // IUnknown identity is stable, DirectDraw and Direct3D query each other, and a
@@ -11148,6 +12314,179 @@ static void test_qmixer_refill_gate() {
 // gain of 0.433 and about -7.3 dB; read as hundredths of a decibel, as it was,
 // every positive number clamped to unity and every sound played at full
 // volume with no mix at all.
+// The queue rule is the fit of the two call sites: queue = (flags & 0x400) &&
+// !(flags & 0x1). Music chunks pass 0x400 and append back-to-back; ordinary
+// samples pass 0x421 (bit 0x1 set) and replace. A wave in another format cannot
+// be appended and replaces, as logged. QMixer.dll stores dwFlags verbatim at
+// +0x3c and only tests bit 0x8 there, which neither call site sets, so the
+// library alone does not settle it (see docs/shims.md).
+static void test_qmixer_queue_wave() {
+    cpu_reset();
+    qmixer_reset();
+    g_plays.clear();
+    g_queues.clear();
+    g_queue_enabled = true;
+    uint32_t hmix = call_shim(tramp("QMIXER.dll", "QSWaveMixInitEx"), {0});
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixActivate"), {hmix, 1}), 0u);
+    const auto open = [&](uint32_t where, uint32_t rate, uint16_t chans, uint32_t bytes) {
+        uint32_t wfx = sc(where);
+        gm_zero(wfx, SDK_WAVEFORMATEX);
+        wr16(wfx + WFX_OFF_wFormatTag, WAVE_FORMAT_PCM);
+        wr16(wfx + WFX_OFF_nChannels, chans);
+        wr32(wfx + WFX_OFF_nSamplesPerSec, rate);
+        wr16(wfx + WFX_OFF_nBlockAlign, (uint16_t)(chans * 2));
+        wr16(wfx + WFX_OFF_wBitsPerSample, 16);
+        uint32_t data = sc(where + 0x100);
+        for (uint32_t i = 0; i < bytes; ++i)
+            wr8(data + i, (uint8_t)i);
+        uint32_t rec = sc(where + 0x80);
+        gm_zero(rec, QSWAVEMIXOPENWAVEDATA_SIZE);
+        wr32(rec + QSOWD_OFF_lpFormat, wfx);
+        wr32(rec + QSOWD_OFF_lpData, data);
+        wr32(rec + QSOWD_OFF_dwDataSize, bytes);
+        return call_shim(tramp("QMIXER.dll", "QSWaveMixOpenWaveEx"), {hmix, rec, 8});
+    };
+    uint32_t a = open(0x2000, 22050, 2, 64), b = open(0x3000, 22050, 2, 32),
+             c2 = open(0x4000, 44100, 1, 16);
+    CHECK(a && b && c2);
+    uint32_t play = tramp("QMIXER.dll", "QSWaveMixPlayEx");
+    CHECK_EQ(call_shim(play, {hmix, 5, 0x400, a, 0, 0}), 0u);
+    CHECK_EQ(g_plays.size(), 1u);
+    CHECK_EQ(call_shim(play, {hmix, 5, 0x400, b, 0, 0}), 0u);
+    CHECK_EQ(g_plays.size(), 1u); // appended, not replaced
+    CHECK_EQ(g_queues.size(), 1u);
+    CHECK_EQ(g_queues[0].bytes, 32u);
+    // The game's ordinary 0x421 sets bit 0x1, so it clears and replaces.
+    CHECK_EQ(call_shim(play, {hmix, 5, 0x421, b, 0, 0}), 0u);
+    CHECK_EQ(g_plays.size(), 2u);
+    // A different format cannot be appended and replaces.
+    CHECK_EQ(call_shim(play, {hmix, 5, 0x400, c2, 0, 0}), 0u);
+    CHECK_EQ(g_plays.size(), 3u);
+    qmixer_reset();
+}
+
+// Completion callbacks: a static wave played with a play-parameters block
+// ({0x28, ..., callback at +0xc, context at +0x10}) has that callback called
+// as (channel, wave, context) once the host voice has played past the wave's
+// end, in order across queued waves. Without them the game never refills.
+static std::vector<std::array<uint32_t, 3>> g_completed;
+static void test_qmixer_completion_callbacks() {
+    cpu_reset();
+    qmixer_reset();
+    g_plays.clear();
+    g_queues.clear();
+    g_completed.clear();
+    g_queue_enabled = true;
+    uint32_t hmix = call_shim(tramp("QMIXER.dll", "QSWaveMixInitEx"), {0});
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixActivate"), {hmix, 1}), 0u);
+    static uint32_t cb = imports_alloc_trampoline(
+        "TEST", "PlayDoneCallback",
+        [](X86 *c) {
+            g_completed.push_back({arg(c, 0), arg(c, 1), arg(c, 2)});
+            set_eax(c, 0);
+        },
+        3);
+    const auto open = [&](uint32_t where, uint32_t bytes) {
+        uint32_t wfx = sc(where);
+        gm_zero(wfx, SDK_WAVEFORMATEX);
+        wr16(wfx + WFX_OFF_wFormatTag, WAVE_FORMAT_PCM);
+        wr16(wfx + WFX_OFF_nChannels, 2);
+        wr32(wfx + WFX_OFF_nSamplesPerSec, 22050);
+        wr16(wfx + WFX_OFF_nBlockAlign, 4);
+        wr16(wfx + WFX_OFF_wBitsPerSample, 16);
+        uint32_t data = sc(where + 0x100);
+        uint32_t rec = sc(where + 0x80);
+        gm_zero(rec, QSWAVEMIXOPENWAVEDATA_SIZE);
+        wr32(rec + QSOWD_OFF_lpFormat, wfx);
+        wr32(rec + QSOWD_OFF_lpData, data);
+        wr32(rec + QSOWD_OFF_dwDataSize, bytes);
+        return call_shim(tramp("QMIXER.dll", "QSWaveMixOpenWaveEx"), {hmix, rec, 8});
+    };
+    uint32_t a = open(0x2000, 64), b = open(0x3000, 32);
+    uint32_t params = sc(0x4000);
+    gm_zero(params, 0x28);
+    wr32(params, 0x28);
+    wr32(params + 0xc, cb);
+    wr32(params + 0x10, 0xC0DE0000u);
+    uint32_t play = tramp("QMIXER.dll", "QSWaveMixPlayEx");
+    CHECK_EQ(call_shim(play, {hmix, 7, 0x400, a, 0, params}), 0u);
+    CHECK_EQ(call_shim(play, {hmix, 7, 0x400, b, 0, params}), 0u);
+    CHECK_EQ(g_voice_remaining, 96u);
+    qmixer_frame_pump(&g_cpu);
+    CHECK_EQ(g_completed.size(), 0u); // nothing has played yet
+    g_voice_remaining = 40;           // 56 bytes played: a (64) not yet finished
+    qmixer_frame_pump(&g_cpu);
+    CHECK_EQ(g_completed.size(), 0u);
+    g_voice_remaining = 30; // 66 played: a is done, b (96) is not
+    qmixer_frame_pump(&g_cpu);
+    CHECK_EQ(g_completed.size(), 1u);
+    if (g_completed.size() == 1) {
+        CHECK_EQ(g_completed[0][0], 7u);
+        CHECK_EQ(g_completed[0][1], a);
+        CHECK_EQ(g_completed[0][2], 0xC0DE0000u);
+    }
+    g_voice_remaining = 0; // the voice drained: b is done too
+    qmixer_frame_pump(&g_cpu);
+    CHECK_EQ(g_completed.size(), 2u);
+    if (g_completed.size() == 2)
+        CHECK_EQ(g_completed[1][1], b);
+    // Drained and delivered: the channel reports done.
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixIsChannelDone"), {hmix, 7}), 1u);
+    qmixer_reset();
+}
+
+// OpenWaveEx flag 4: the record's field 0 points at a 'MEM ' MMIOINFO of a
+// RIFF/WAVE image, as LHaudiodllR 0x10211dad builds it. A PCM image opens; a
+// compressed tag is refused with a nonzero last error; and QSWaveMixGetLastError
+// takes no arguments (its caller pushes ESI only to save it).
+static void test_qmixer_riff_memory_wave() {
+    cpu_reset();
+    qmixer_reset();
+    uint32_t hmix = call_shim(tramp("QMIXER.dll", "QSWaveMixInitEx"), {0});
+    CHECK(hmix != 0);
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixActivate"), {hmix, 1}), 0u);
+    const auto put_riff = [&](uint32_t at, uint16_t tag) {
+        wr32(at, 0x46464952u); // RIFF
+        wr32(at + 4, 4 + 8 + 16 + 8 + 4);
+        wr32(at + 8, 0x45564157u);  // WAVE
+        wr32(at + 12, 0x20746d66u); // fmt
+        wr32(at + 16, 16);
+        wr16(at + 20, tag);
+        wr16(at + 22, 1);
+        wr32(at + 24, 22050);
+        wr32(at + 28, 22050);
+        wr16(at + 32, 1);
+        wr16(at + 34, 8);
+        wr32(at + 36, 0x61746164u); // data
+        wr32(at + 40, 4);
+        for (uint32_t i = 0; i < 4; ++i)
+            wr8(at + 44 + i, (uint8_t)(0x80 + i));
+        return 48u;
+    };
+    uint32_t img = sc(0x400);
+    uint32_t size = put_riff(img, WAVE_FORMAT_PCM);
+    uint32_t info = sc(0x500);
+    gm_zero(info, 0x48);
+    wr32(info + 4, 0x204d454du); // 'MEM '
+    wr32(info + 0x14, size);
+    wr32(info + 0x18, img);
+    uint32_t rec = sc(0x600);
+    gm_zero(rec, QSWAVEMIXOPENWAVEDATA_SIZE);
+    wr32(rec + QSOWD_OFF_lpFormat, info);
+    uint32_t open_wave = tramp("QMIXER.dll", "QSWaveMixOpenWaveEx");
+    uint32_t hw = call_shim(open_wave, {hmix, rec, 4});
+    CHECK(hw != 0);
+    // The guest dereferences the handle and reads the sample rate at +4
+    // (LHaudiodllR 0x10211f2d), so the handle must be a real guest record.
+    CHECK_EQ(rd32(hw + 4), 22050u);
+
+    uint32_t img2 = sc(0x700);
+    wr32(info + 0x18, img2);
+    wr32(info + 0x14, put_riff(img2, 0x55)); // MPEG layer 3: not decoded here
+    CHECK_EQ(call_shim(open_wave, {hmix, rec, 4}), 0u);
+    CHECK(call_shim(tramp("QMIXER.dll", "QSWaveMixGetLastError"), {}) != 0);
+}
+
 // ---------------------------------------------------------------------------
 static void test_qmixer_volume_scale() {
     cpu_reset();
@@ -13939,6 +15278,12 @@ int main() {
         {"re-attach a palette", test_setpalette_self},
         {"colour key at 16 bpp", test_colorkey_16bpp},
         {"DirectDrawCreateEx fallback", test_directdraw_create_ex_fallback},
+        {"IDirectDraw7 object model", test_ddraw7_object_model},
+        {"Direct3D7 stage 2a", test_d3d7_pipeline},
+        {"Direct3D7 stage 2b translation", test_d3d7_translation},
+        {"DXT block decode", test_dxt_decode},
+        {"DXT surface and Blt", test_dxt_surface_and_blit},
+        {"Direct3D7 trace helpers", test_d3d7_trace_helpers},
         {"QueryInterface", test_query_interface},
         {"display modes", test_enum_display_modes},
         {"DirectDraw enumeration", test_directdraw_enumeration},
@@ -13953,6 +15298,9 @@ int main() {
         {"DirectSound8", test_dsound8},
         {"DirectInput", test_dinput},
         {"QMixer", test_qmixer},
+        {"QMixer stop completes wave", test_qmixer_completes_on_stop_replace_free},
+        {"QMixer queue flag rules", test_qmixer_queue_flag_rules},
+        {"QMixer play position", test_qmixer_play_position},
         {"FMOD samples", test_fmod},
         {"FMOD streams", test_fmod_stream},
         {"Soundlib MIDI", test_soundlib_stub},
@@ -13968,6 +15316,7 @@ int main() {
         {"Bink play", test_bink_play},
         {"Bink open from handle", test_bink_open_from_handle},
         {"Bink handle flag errors", test_bink_handle_flag_errors},
+        {"Bink realtime", test_bink_realtime},
         {"Bink rects and pause", test_bink_rects_and_pause},
         {"Bink audio without service", test_bink_audio_without_service},
         {"Bink shutdown with open player", test_bink_shutdown_with_open_player},
@@ -13980,6 +15329,7 @@ int main() {
         {"GetDeviceData stride", test_device_data_stride16},
         {"GetClipStatus canary", test_clipstatus_canary},
         {"overflow rejection", test_overflow_rejection},
+        {"VRAM budget", test_vram_budget},
         {"identity and parent", test_identity_and_parent},
         {"duplicate PCM lifetime", test_dsound_duplicate_lifetime},
         {"SetSurfaceDesc owner", test_setsurfacedesc_ownership},
@@ -13996,6 +15346,9 @@ int main() {
         {"QMixer channels", test_qmixer_channels},
         {"QMixer frame pump", test_qmixer_frame_pump},
         {"QMixer volume scale", test_qmixer_volume_scale},
+        {"QMixer RIFF memory wave and GetLastError arity", test_qmixer_riff_memory_wave},
+        {"QMixer QUEUEWAVE for static waves", test_qmixer_queue_wave},
+        {"QMixer completion callbacks", test_qmixer_completion_callbacks},
         {"QMixer stream lifetime", test_qmixer_stream_buffer_lifetime},
         {"QMixer stream prefetch", test_qmixer_stream_prefetch},
         {"QMixer refill gate", test_qmixer_refill_gate},

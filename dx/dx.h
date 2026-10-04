@@ -27,6 +27,11 @@ void dx_reset();
 // of these; each is idempotent.
 void ddraw_register();
 void d3d_register();
+// Direct3D 7: the IDirect3D7 factory, IDirect3DDevice7 state store and
+// IDirect3DVertexBuffer7. Separate from d3d.cpp because the D3D7 tables have a
+// different slot order from Direct3D 3.
+void d3d7_register();
+void d3d7_reset();
 void d3d9_register();
 void d3dx9_register();
 // Direct3D 8: the factory/device/resource bridge onto the Rust wgpu renderer.
@@ -169,6 +174,71 @@ void d3d_upload_texture(ComObj *surface);
 // `why` names the call that asked, so one frame's worth of flushes and blits
 // reads as a sequence rather than as a pile of identical lines.
 void d3d_flush_surface(ComObj *surface, const char *why);
+// The D3D7 equivalent: if `surface` is the Direct3D 7 device's render target,
+// read the Rust device's 32-bit target back and convert it into the guest's
+// 16bpp bytes. Called beside every d3d_flush_surface above. A no-op for every
+// surface no D3D7 device renders into.
+void d3d7_flush_surface(ComObj *surface);
+
+// ---------------------------------------------------------------------------
+// D3D7 -> D3D8 state translation (dx/d3d7.cpp). Pure functions so dx_tests can
+// check the table without a GPU. Values are the raw D3D7 and D3D8 enum members.
+// ---------------------------------------------------------------------------
+typedef enum {
+    // Forward the value unchanged to *d3d8_state (the two enums agree).
+    D3D7_STATE_FORWARD = 0,
+    // No D3D8 state exists; ignoring this value is exact for the value the
+    // game uses (documented at the call site).
+    D3D7_STATE_IGNORE = 1,
+    // No D3D8 state exists and ignoring would change behavior: fail loudly.
+    D3D7_STATE_INVALID = 2,
+} D3d7StateMap;
+D3d7StateMap d3d7_translate_render_state(uint32_t d3d7_state, uint32_t value, uint32_t *d3d8_state);
+// Maps a D3D7 transform state to its D3D8 member (WORLD 1 -> 256, VIEW 2,
+// PROJECTION 3, texture 16..23). Returns false when there is no equivalent.
+bool d3d7_translate_transform(uint32_t d3d7_state, uint32_t *d3d8_state);
+// Maps a D3D7 texture-stage state to one or two D3D8 states. `out` holds at
+// most two; the count is returned, or -1 when there is no equivalent.
+int d3d7_translate_texture_stage_state(uint32_t d3d7_type, uint32_t out[2]);
+// 8:8:8 -> 5:6:5 and back. The forward direction truncates the low bits (a
+// 32-bit internal target copied to the 16bpp guest back buffer); the reverse is
+// what the headless presenter does when it expands a 16bpp frame for a PNG.
+// Bit replication and a /31 scale differ only in the middle values; the
+// presenter uses the scale, so the round trip is documented against it.
+uint16_t d3d7_rgb888_to_rgb565(uint32_t rgba);
+uint32_t d3d7_rgb565_to_rgb888(uint16_t rgb565);
+// Reconcile a tightly packed `w`x`h` RGBA8 block (the Rust target's readback)
+// into a guest surface's storage: 16bpp writes R5G6B5, 32bpp writes X8R8G8B8
+// with the alpha byte zeroed. `dst` is the surface's HOST pointer (gm_ptr of
+// its guest address) and `pitch` its byte pitch. Writes directly, so the store
+// does not run the guest write hook (this is the shim's own copy, not a guest
+// store). Returns false for an unsupported bpp and writes nothing.
+bool d3d7_store_rgba_surface(uint8_t *dst, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h,
+                             const uint8_t *rgba);
+// D3D7 trace helpers (dx/d3d7.cpp), exposed so dx_tests can check the pure
+// parts without a GPU. `d3d7_trace_vertex` decodes one vertex per the FVF the
+// same way the trace's vertex dump does. `d3d7_trace_parse_frames` parses the
+// RECOMP_TRACE_D3D7_FRAMES grammar (1-based, inclusive: "a-b", "a-", "-b",
+// "a"); it returns false and leaves the outputs untouched for an empty or
+// malformed string.
+std::string d3d7_trace_vertex(uint32_t fvf, const uint8_t *v);
+bool d3d7_trace_parse_frames(const char *s, uint32_t *lo, uint32_t *hi);
+// Collapse helper for the small-draw trace (RECOMP_TRACE_D3D7_SMALL). The
+// caller feeds one digest per frame describing the decoded small draws and
+// their state. `step` returns true when the digest changed (the caller then
+// prints that frame's draws); when it changed and the previous run spanned
+// more than one frame, `collapsed` is set to a "frames a-b: unchanged" line
+// to print first. `flush` closes a run left open at trace reset. `first` and
+// `last` are the inclusive 1-based frame range of the run being collapsed.
+struct D3d7TraceSmallCollapser {
+    std::string digest;
+    bool active = false;
+    uint32_t first = 0;
+    uint32_t last = 0;
+};
+bool d3d7_trace_small_step(D3d7TraceSmallCollapser *c, uint32_t frame, const std::string &digest,
+                           std::string *collapsed);
+bool d3d7_trace_small_flush(D3d7TraceSmallCollapser *c, std::string *collapsed);
 // Re-states the render target's memory to the host. Flip swaps the pixels
 // behind a surface, so the host has to be told when its target moves.
 void d3d_retarget_surface(ComObj *surface);

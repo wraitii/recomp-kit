@@ -1,4 +1,5 @@
 #include "imports.h"
+#include "game_config.h"
 #include "../platform/os.h"
 #include "gdi32_internal.h"
 #include "user32_internal.h"
@@ -238,6 +239,16 @@ uint32_t imports_resolve(const char *dll, const char *name) {
     if (a)
         return a;
     auto ri = registry().find(key_of(dll, name));
+    // GetProcAddress spells an ordinal "#N" while IAT imports and the shim
+    // tables register it as "ordN". They name the same export, so resolve both
+    // spellings to the one registration; otherwise a game that resolves an
+    // ordinal at run time (LHMultiplayerR asks ws2_32 for #115) misses a shim
+    // its IAT import would have found.
+    std::string ordinal;
+    if (ri == registry().end() && name && name[0] == '#') {
+        ordinal = "ord" + std::string(name + 1);
+        ri = registry().find(key_of(dll, ordinal.c_str()));
+    }
     if (ri == registry().end())
         return 0;
     return imports_alloc_trampoline(ri->second.dll, ri->second.name, ri->second.fn,
@@ -479,7 +490,7 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     // import call. `argc == ARGC_UNKNOWN` needs the description for the
     // once-only key below, and the null/unsupported shims name the import in
     // their diagnostic.
-    // RECOMP_TRACE_IMPORTS=<substring> logs every import whose "dll!name"
+    // RECOMP_TRACE_IMPORTS=<substring>[,<substring>...] logs every import whose "dll!name"
     // contains the substring, with its stdcall arguments (hex and as float)
     // and the guest return address.
     static const char *trace_filter = recomp_env("TRACE_IMPORTS");
@@ -493,8 +504,35 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     ++g_import_calls;
 
     uint32_t ret_addr = rd32(c->r[R_ESP]);
+    // The guest EIP is only advanced at call boundaries, so without this a
+    // shim that stops (an abort) reports the PREVIOUS import's return address.
+    // Nothing reads EIP across a running shim except diagnostics and SEH, and
+    // the generated code restores it from the stack on RET, so publishing the
+    // current call's return address here is the honest value.
+    c->eip = ret_addr;
     LOGV("-> %s (esp=%08x ret=%08x)", desc, c->r[R_ESP], ret_addr);
-    if (trace_filter && strstr(desc, trace_filter)) {
+    // A comma separates alternatives: RECOMP_TRACE_IMPORTS=mmio,QSWaveMix.
+    auto trace_match = [&]() {
+        if (!trace_filter)
+            return false;
+        const char *p = trace_filter;
+        while (*p) {
+            const char *e = strchr(p, ',');
+            size_t n = e ? (size_t)(e - p) : strlen(p);
+            if (n && n < 128) {
+                char part[128];
+                memcpy(part, p, n);
+                part[n] = 0;
+                if (strstr(desc, part))
+                    return true;
+            }
+            if (!e)
+                break;
+            p = e + 1;
+        }
+        return false;
+    };
+    if (trace_match()) {
         char line[512];
         int n = snprintf(line, sizeof line, "import: %s ret=%08x", desc, ret_addr);
         uint32_t na = (argc == ARGC_CDECL || argc == ARGC_UNKNOWN) ? 0u : (uint32_t)argc;
@@ -533,6 +571,12 @@ bool imports_dispatch(X86 *c, uint32_t target) {
         if (fn == imports_unsupported)
             diagnose_unsupported_import(c, desc, argc);
         fn(c);
+    } else if (RECOMP_STRICT_IMPORTS && argc == ARGC_UNKNOWN) {
+        // A game profile can require that an import with no known stdcall
+        // arity stop the run instead of returning 0 with its arguments left
+        // on the stack. Both the diagnostic and the abort name dll!function.
+        diagnose_unsupported_import(c, desc, argc);
+        imports_unsupported(c);
     } else {
         if (log_once(desc, "unimplemented import %s: returning 0", desc))
             diagnose_unsupported_import(c, desc, argc);
@@ -670,4 +714,6 @@ void imports_init() {
     gdi::register_text();
     extern void msimg32_register();
     msimg32_register();
+    extern void imagehlp_register();
+    imagehlp_register();
 }

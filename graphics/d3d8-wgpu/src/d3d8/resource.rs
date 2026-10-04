@@ -162,12 +162,31 @@ pub fn expand_indexed_into(
     draw: IndexedDraw,
 ) -> Result<(), RenderError> {
     let invalid = |cause| RenderError::invalid("DrawIndexedPrimitive", cause);
-    if draw.topology != 4 {
-        return Err(RenderError::new(
-            "DrawIndexedPrimitive",
-            "only triangle lists are implemented",
-        ));
-    }
+    // D3D7/8 index buffers name vertices; the renderer draws triangle lists.
+    // A list selects `3 * primitives` indices, a strip or fan selects
+    // `2 + primitives` and is expanded into the same list below. The strip
+    // expansion keeps each triangle's original vertex order, so the cull test
+    // sees the same winding the strip would have produced.
+    let (index_count, triangle_count) = match draw.topology {
+        4 => (
+            draw.primitive_count
+                .checked_mul(3)
+                .ok_or_else(|| invalid("index count overflow"))?,
+            draw.primitive_count,
+        ),
+        2 | 6 => (
+            draw.primitive_count
+                .checked_add(2)
+                .ok_or_else(|| invalid("index count overflow"))?,
+            draw.primitive_count,
+        ),
+        _ => {
+            return Err(RenderError::new(
+                "DrawIndexedPrimitive",
+                "unsupported topology; expected TRIANGLELIST (4), TRIANGLESTRIP (2) or TRIANGLEFAN (6)",
+            ))
+        }
+    };
     let index_size = match draw.index_format {
         101 => 2usize,
         102 => 4,
@@ -176,13 +195,9 @@ pub fn expand_indexed_into(
     if draw.stride == 0 || draw.num_vertices == 0 || draw.primitive_count == 0 {
         return Err(invalid("empty draw or zero stride"));
     }
-    let count = draw
-        .primitive_count
-        .checked_mul(3)
-        .ok_or_else(|| invalid("index count overflow"))?;
     let end = draw
         .start_index
-        .checked_add(count)
+        .checked_add(index_count)
         .ok_or_else(|| invalid("index range overflow"))?;
     if u64::from(end) * index_size as u64 > indices.len() as u64 {
         return Err(invalid("index range exceeds buffer"));
@@ -213,14 +228,35 @@ pub fn expand_indexed_into(
             return Err(invalid("index outside declared interval"));
         }
     }
-    let size = count
+    let list_indices = triangle_count
+        .checked_mul(3)
+        .ok_or_else(|| invalid("triangle count overflow"))?;
+    let size = list_indices
         .checked_mul(draw.stride)
         .ok_or_else(|| invalid("expanded size overflow"))?;
+    // The source position of output triangle vertex `t`: a list is in order, a
+    // strip is windowed (i, i+1, i+2), and a fan pins vertex 0.
+    let source = |t: usize| -> usize {
+        match draw.topology {
+            4 => t,
+            2 => {
+                let i = t / 3;
+                i + t % 3
+            }
+            _ => {
+                let i = t / 3;
+                if t % 3 == 0 {
+                    0
+                } else {
+                    i + t % 3
+                }
+            }
+        }
+    };
     output.resize(size as usize, 0);
-    for (dst, bytes) in output
-        .chunks_exact_mut(draw.stride as usize)
-        .zip(selected.chunks_exact(index_size))
-    {
+    for (t, dst) in output.chunks_exact_mut(draw.stride as usize).enumerate() {
+        let at = source(t) * index_size;
+        let bytes = &selected[at..at + index_size];
         let offset =
             (u64::from(read(bytes)) + u64::from(draw.base_vertex)) * u64::from(draw.stride);
         dst.copy_from_slice(&vertices[offset as usize..offset as usize + draw.stride as usize]);
@@ -270,6 +306,37 @@ mod tests {
             [15, 13, 14]
         );
     }
+    #[test]
+    fn indexed_strip_and_fan_expand_to_triangle_lists() {
+        let vertices = [10u8, 11, 12, 13, 14];
+        let indices = [1u16, 2, 3, 4]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let strip = IndexedDraw {
+            topology: 2,
+            index_format: 101,
+            stride: 1,
+            base_vertex: 0,
+            min_index: 1,
+            num_vertices: 4,
+            start_index: 0,
+            primitive_count: 2,
+        };
+        assert_eq!(
+            expand_indexed(&vertices, &indices, strip).unwrap(),
+            [11, 12, 13, 12, 13, 14]
+        );
+        let fan = IndexedDraw {
+            topology: 6,
+            ..strip
+        };
+        assert_eq!(
+            expand_indexed(&vertices, &indices, fan).unwrap(),
+            [11, 12, 13, 11, 13, 14]
+        );
+    }
+
     #[test]
     fn indexed_overflow_and_bounds_fail_before_allocation() {
         let indices = [1u16, 2, 3]

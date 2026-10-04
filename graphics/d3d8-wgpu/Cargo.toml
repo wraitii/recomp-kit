@@ -31,3 +31,10 @@ winit = "0.30"
 # 0.32 is the version wgpu-hal 27 exposes through `raw_handle`.
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.32"
+
+[dev-dependencies]
+# Parses and validates the WGSL strings on the CPU (no adapter/GPU), so a
+# shader-source rewrite such as `lit_shader_source` cannot silently produce
+# invalid WGSL that only fails at pipeline creation on a real device. Pinned to
+# the same naga that wgpu 27 uses so the grammar matches the runtime.
+naga = { version = "27", features = ["wgsl-in"] }

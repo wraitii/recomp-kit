@@ -31,3 +31,20 @@ void get_command_line(X86 *c);
 void startup_info(X86 *c);
 void wait_multiple_objects(X86 *c);
 void kernel32_wide_reset_command_line();
+
+// GetTimeFormatA/W dwFlags (winnt.h TIME_* values). Declared once so the ANSI
+// and wide shims interpret the same picture syntax.
+enum Kernel32TimeFlag {
+    K32_TIME_NOMINUTESORSECONDS = 0x00000001,
+    K32_TIME_NOSECONDS = 0x00000002,
+    K32_TIME_NOTIMEMARKER = 0x00000004,
+    K32_TIME_FORCE24HOURFORMAT = 0x00000008,
+};
+
+// Formats the time-of-day fields using the subset of the Windows time picture
+// syntax the engine can encounter. `picture` is UTF-8 and empty selects the
+// runtime's fixed en-US default, "h:mm:ss tt". `hour` is 0..23 and the other
+// fields are already range-checked by the caller. Shared by the ANSI and wide
+// GetTimeFormat shims so both write identical text.
+std::string kernel32_format_time(int hour, int minute, int second, const std::string &picture,
+                                 uint32_t flags);

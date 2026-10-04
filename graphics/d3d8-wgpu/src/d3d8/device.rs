@@ -1097,6 +1097,11 @@ impl Device {
                 "requires an open scene (BeginScene)",
             ));
         }
+        // A zero-primitive draw is a legal no-op in D3D, not an error. The
+        // degenerate tail of a strip or fan (two or fewer vertices) lands here.
+        if primitive_count == 0 {
+            return Ok(());
+        }
         self.draw_index += 1;
         self.frame_stats.draws += 1;
         // Survey mode records and skips a state/FVF/TSS rejection so one run
@@ -1328,8 +1333,17 @@ impl Device {
                 })
             })
         };
-        let uniform =
+        let mut uniform =
             TransformUniform::new(self.state.world, self.state.view, self.state.projection);
+        if layout.pre_transformed {
+            // XYZRHW: the vertex entry point maps screen pixels to NDC through
+            // the same viewport the rasterizer uses. `rhw[0]` marks it; the
+            // reciprocal-w field becomes clip w when nonzero (else 1.0).
+            uniform.viewport = [v.x as f32, v.y as f32, v.width as f32, v.height as f32];
+            uniform.rhw[0] = 1;
+        }
+        // D3DRS_SPECULARENABLE gates the shader's specular add.
+        uniform.rhw[1] = u32::from(self.state.specular_enable());
         let stages_uniform =
             textured.then(|| StagesUniform::for_fvf(&stage0, &stage1, layout.texcoord_sets));
         // Upload only the vertex bytes this draw reads. Both the lit stream and
@@ -1407,7 +1421,11 @@ impl Device {
                 layout: None,
                 vertex: wgpu::VertexState {
                     module: shader,
-                    entry_point: Some("vs_main"),
+                    entry_point: Some(if layout.pre_transformed {
+                        "vs_rhw_main"
+                    } else {
+                        "vs_main"
+                    }),
                     compilation_options: Default::default(),
                     buffers: &[upload_layout.vertex_buffer_layout()],
                 },
@@ -1700,11 +1718,17 @@ impl Device {
         indices: &[u8],
         draw: IndexedDraw,
     ) -> Result<(), RenderError> {
+        if draw.primitive_count == 0 {
+            return Ok(());
+        }
         let mut scratch = std::mem::take(&mut self.index_scratch);
         let result = (|| {
             expand_indexed_into(&mut scratch, vertices, indices, draw)?;
             let view = VertexBuffer::borrowed(&scratch, draw.stride)?;
-            self.draw_primitive(topology, fvf, &view, 0, draw.primitive_count)
+            // Expansion always produces a triangle list, whatever the source
+            // topology was, so the list draw path is the one to run.
+            let _ = topology;
+            self.draw_primitive(4, fvf, &view, 0, draw.primitive_count)
         })();
         self.index_scratch = scratch;
         result

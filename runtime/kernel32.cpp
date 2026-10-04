@@ -933,6 +933,42 @@ void k_GetFileSize(X86 *c) {
     set_eax(c, (uint32_t)st.size);
 }
 
+void k_GetFileInformationByHandle(X86 *c) {
+    // BY_HANDLE_FILE_INFORMATION (52 bytes). The original uses this to size a
+    // log file and read its timestamps; the host stat is the same evidence.
+    // Volume serial and link count have no host analogue and are reported as
+    // zero and one, which is what a file on a normal volume reads as.
+    HObj *o = handle_get(arg(c, 0), H_FILE);
+    uint32_t out = arg(c, 1);
+    if (!o) {
+        set_last_error(ERROR_INVALID_HANDLE_);
+        set_eax(c, 0);
+        return;
+    }
+    if (!out || !gm_valid(out, 52)) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    OsStat st{};
+    if (os_fd_stat(o->fd, &st) != 0) {
+        set_last_error(ERROR_INVALID_HANDLE_);
+        set_eax(c, 0);
+        return;
+    }
+    wr32(out, attrs_for(st));
+    put_filetime(out + 4, st.ctime);
+    put_filetime(out + 12, st.atime);
+    put_filetime(out + 20, st.mtime);
+    wr32(out + 28, 0); // dwVolumeSerialNumber: no host volume identity
+    wr32(out + 32, (uint32_t)(st.size >> 32));
+    wr32(out + 36, (uint32_t)st.size);
+    wr32(out + 40, 1); // nNumberOfLinks
+    wr32(out + 44, (uint32_t)(st.ino >> 32));
+    wr32(out + 48, (uint32_t)st.ino);
+    set_eax(c, 1);
+}
+
 void k_CloseHandle(X86 *c) {
     uint32_t h = arg(c, 0);
     HObj *o = handle_any(h);
@@ -1543,6 +1579,24 @@ void k_GetSystemDirectoryA(X86 *c) {
     set_eax(c, len);
 }
 
+// GetTempPathA(nBufferLength, lpBuffer). The guest sees a virtual
+// "C:\Windows\Temp\" (trailing backslash, as Windows returns it), like
+// GetSystemDirectoryA's virtual System32: files the guest then creates there go
+// through the normal write-resolution seam, so nothing is written to the game
+// directory by this call. Returns the length without the NUL; a buffer too
+// small gets the required size including the NUL, as Windows does.
+void k_GetTempPathA(X86 *c) {
+    static const char dir[] = "C:\\Windows\\Temp\\";
+    uint32_t size = arg(c, 0), buf = arg(c, 1);
+    uint32_t len = sizeof dir - 1;
+    if (!buf || size <= len) {
+        set_eax(c, len + 1);
+        return;
+    }
+    memcpy(g_mem + buf, dir, len + 1);
+    set_eax(c, len);
+}
+
 void k_GetLogicalDriveStringsA(X86 *c) {
     logical_drive_strings(c, false);
 }
@@ -1690,6 +1744,52 @@ void k_GetTimeZoneInformation(X86 *c) {
     if (p)
         memset(g_mem + p, 0, 172);
     set_eax(c, 0); // TIME_ZONE_ID_UNKNOWN
+}
+
+// ANSI twin of k_GetTimeFormatW (kernel32_wide.cpp); both share the picture
+// formatter so a caller that falls back from W to A sees the same text. The
+// only caller, TempleSaveGame::UpdateDateAndTime, reaches A when W fails.
+void k_GetTimeFormatA(X86 *c) {
+    uint32_t flags = arg(c, 1), input = arg(c, 2), picture = arg(c, 3);
+    uint32_t out = arg(c, 4), cap = arg(c, 5);
+    int hour, minute, second;
+    if (input) {
+        if (!gm_valid(input, 16)) {
+            set_last_error(87 /* ERROR_INVALID_PARAMETER */);
+            set_eax(c, 0);
+            return;
+        }
+        hour = rd16(input + 8);
+        minute = rd16(input + 10);
+        second = rd16(input + 12);
+    } else {
+        struct tm t{};
+        if (os_localtime((int64_t)(os_wall_time_us() / 1000000), &t) != 0) {
+            set_eax(c, 0);
+            return;
+        }
+        hour = t.tm_hour;
+        minute = t.tm_min;
+        second = t.tm_sec;
+    }
+    if (hour > 23 || minute > 59 || second > 59) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    std::string text = kernel32_format_time(hour, minute, second,
+                                            picture ? gm_str(picture) : std::string(), flags);
+    uint32_t need = (uint32_t)text.size() + 1; // bytes, including the NUL
+    if (cap == 0) {
+        set_eax(c, need);
+        return;
+    }
+    if (!out || cap < need) {
+        set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */);
+        set_eax(c, 0);
+        return;
+    }
+    set_eax(c, gm_put_str(out, text.c_str(), cap) + 1);
 }
 
 // -------------------------------------------------------------------------
@@ -4815,6 +4915,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "ReadFile", 5, k_ReadFile},
     {"KERNEL32.dll", "WriteFile", 5, k_WriteFile},
     {"KERNEL32.dll", "SetFilePointer", 4, k_SetFilePointer},
+    {"KERNEL32.dll", "GetFileInformationByHandle", 2, k_GetFileInformationByHandle},
     {"KERNEL32.dll", "GetFileSize", 2, k_GetFileSize},
     {"KERNEL32.dll", "CloseHandle", 1, k_CloseHandle},
     {"KERNEL32.dll", "FlushFileBuffers", 1, k_FlushFileBuffers},
@@ -4838,6 +4939,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "GetVolumeInformationA", 8, k_GetVolumeInformationA},
     {"KERNEL32.dll", "GetDiskFreeSpaceA", 5, k_GetDiskFreeSpaceA},
     {"KERNEL32.dll", "GetSystemDirectoryA", 2, k_GetSystemDirectoryA},
+    {"KERNEL32.dll", "GetTempPathA", 2, k_GetTempPathA},
     {"KERNEL32.dll", "GetLogicalDriveStringsA", 2, k_GetLogicalDriveStringsA},
     {"KERNEL32.dll", "GetDriveTypeA", 1, k_GetDriveTypeA},
     // modules and process state
@@ -4910,7 +5012,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "DebugBreak", 0, nullptr},
     {"KERNEL32.dll", "FatalAppExitA", 2, nullptr},
     {"KERNEL32.dll", "GetDateFormatA", 6, nullptr},
-    {"KERNEL32.dll", "GetTimeFormatA", 6, nullptr},
+    {"KERNEL32.dll", "GetTimeFormatA", 6, k_GetTimeFormatA},
     {"KERNEL32.dll", "GetDiskFreeSpaceExA", 4, nullptr},
     {"KERNEL32.dll", "GetLongPathNameA", 3, nullptr},
     {"KERNEL32.dll", "GetOverlappedResult", 4, nullptr},

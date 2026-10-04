@@ -53,6 +53,13 @@ struct LoaderModule {
     std::vector<uint8_t> initial_image;
     std::vector<SectionInfo> sections;
 };
+// Test seam: run the base-relocation walk against a synthetic image mapped at
+// `base`. The native test binary uses it to cover the loader/translator
+// agreement without a real auxiliary DLL. Named `loader_test_*` like the SEH
+// test helpers in seh.h.
+bool loader_test_relocate(uint32_t base, uint32_t preferred, uint32_t size, uint32_t reloc_rva,
+                          uint32_t reloc_size);
+
 uint32_t loader_module_count();
 const LoaderModule *loader_module(uint32_t i);
 // Count/index enumerate auxiliary modules; name/address lookups include the EXE.
@@ -87,6 +94,13 @@ void loader_init_context(X86 *c);
 // Process-wide context used by run_entry() and by hosts that do not keep their
 // own X86 instance.
 X86 *loader_context();
+
+// DLL_PROCESS_ATTACH / DLL_PROCESS_DETACH for every mapped auxiliary module,
+// in import-dependency order. Attach is called by run_entry before the exe
+// entry point; a module without a translated DllMain, or one whose DllMain
+// returns FALSE, is a hard diagnostic rather than a silent success.
+void loader_attach_modules(X86 *c);
+void loader_detach_modules(X86 *c);
 
 // Calls the PE entry point through recomp_call using loader_context().
 void run_entry();

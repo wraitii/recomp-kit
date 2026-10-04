@@ -130,6 +130,9 @@ int os_exe_path(char *buf, size_t cap); // 0 or -1; NUL-terminated
 // where the platform has no equivalent yet.
 typedef void (*OsFaultFn)(const char *what);
 int os_install_fault_handlers(OsFaultFn fn);
+// The address a memory fault touched (siginfo si_addr, or the access-violation
+// target), or 0 when the signal carries none. Valid inside the fault callback.
+uint64_t os_fault_address(void);
 // For use inside a fault handler: a raw write to the error stream and an
 // immediate process exit, neither of which touches stdio or runs destructors.
 void os_write_stderr_raw(const char *s, size_t n);

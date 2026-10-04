@@ -479,6 +479,53 @@ void k_GetDateFormatW(X86 *c) {
     set_eax(c, gm_put_wstr(out, text, cap) + 1);
 }
 
+// The caller passes LOCALE_USER_DEFAULT (0x400), but the runtime has a single
+// fixed locale, so the Locale argument is ignored exactly as k_GetDateFormatW
+// ignores it. lpTime NULL means the current local time; lpFormat NULL means the
+// locale's default picture. cchTime == 0 is a size query that writes nothing.
+void k_GetTimeFormatW(X86 *c) {
+    uint32_t flags = arg(c, 1), input = arg(c, 2), picture = arg(c, 3);
+    uint32_t out = arg(c, 4), cap = arg(c, 5);
+    int hour, minute, second;
+    if (input) {
+        if (!gm_valid(input, 16)) {
+            set_last_error(87 /* ERROR_INVALID_PARAMETER */);
+            set_eax(c, 0);
+            return;
+        }
+        hour = rd16(input + 8);
+        minute = rd16(input + 10);
+        second = rd16(input + 12);
+    } else {
+        struct tm t{};
+        if (os_localtime((int64_t)(os_wall_time_us() / 1000000), &t) != 0) {
+            set_eax(c, 0);
+            return;
+        }
+        hour = t.tm_hour;
+        minute = t.tm_min;
+        second = t.tm_sec;
+    }
+    if (hour > 23 || minute > 59 || second > 59) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    std::string text = kernel32_format_time(hour, minute, second,
+                                            picture ? gm_wstr(picture) : std::string(), flags);
+    uint32_t need = wide_units(text) + 1; // WCHAR count, including the NUL
+    if (cap == 0) {
+        set_eax(c, need);
+        return;
+    }
+    if (!out || cap < need) {
+        set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */);
+        set_eax(c, 0);
+        return;
+    }
+    set_eax(c, gm_put_wstr(out, text, cap) + 1);
+}
+
 uint32_t g_thread_lcid = 0x0409; // The runtime exposes one process-wide locale.
 void k_GetThreadLocale(X86 *c) {
     set_eax(c, g_thread_lcid);
@@ -944,6 +991,7 @@ static const ImportShim g_kernel32_wide[] = {
     {"KERNEL32.dll", "FormatMessageW", 7, k_FormatMessageW},
     {"KERNEL32.dll", "OutputDebugStringW", 1, k_OutputDebugStringW},
     {"KERNEL32.dll", "GetDateFormatW", 6, k_GetDateFormatW},
+    {"KERNEL32.dll", "GetTimeFormatW", 6, k_GetTimeFormatW},
     {"KERNEL32.dll", "FileTimeToLocalFileTime", 2, k_FileTimeToLocalFileTime},
     {"KERNEL32.dll", "FileTimeToSystemTime", 2, k_FileTimeToSystemTime},
     {"KERNEL32.dll", "FileTimeToDosDateTime", 3, k_FileTimeToDosDateTime},
@@ -975,6 +1023,118 @@ static const ImportShim g_kernel32_wide[] = {
     {"KERNEL32.dll", "QueryDosDeviceW", 3, k_QueryDosDeviceW},
 };
 } // namespace
+
+std::string kernel32_format_time(int hour, int minute, int second, const std::string &picture,
+                                 uint32_t flags) {
+    // Windows resolves an empty picture from the locale; the runtime has one
+    // fixed en-US picture. This is approximate: a non-en-US locale would differ.
+    static const std::string default_picture = "h:mm:ss tt";
+    const std::string &fmt = picture.empty() ? default_picture : picture;
+    const bool force24 = (flags & K32_TIME_FORCE24HOURFORMAT) != 0;
+    const bool no_minutes = (flags & K32_TIME_NOMINUTESORSECONDS) != 0;
+    const bool no_seconds = no_minutes || (flags & K32_TIME_NOSECONDS) != 0;
+    const bool no_marker = (flags & K32_TIME_NOTIMEMARKER) != 0;
+
+    // Tokenise the picture. 'h'/'H' hour, 'm' minute, 's' second, 't' marker;
+    // single quotes and a backslash introduce literals.
+    struct Token {
+        char type;
+        int count;
+        std::string literal;
+    };
+    std::vector<Token> tokens;
+    for (size_t i = 0; i < fmt.size();) {
+        const char ch = fmt[i];
+        if (ch == '\'') {
+            std::string literal;
+            ++i;
+            while (i < fmt.size()) {
+                if (fmt[i] == '\'') {
+                    if (i + 1 < fmt.size() && fmt[i + 1] == '\'') {
+                        literal += '\''; // '' is an escaped quote
+                        i += 2;
+                        continue;
+                    }
+                    ++i;
+                    break;
+                }
+                literal += fmt[i++];
+            }
+            tokens.push_back({'L', 0, std::move(literal)});
+        } else if (ch == '\\') {
+            if (i + 1 < fmt.size()) {
+                tokens.push_back({'L', 0, std::string(1, fmt[i + 1])});
+                i += 2;
+            } else {
+                tokens.push_back({'L', 0, "\\"});
+                ++i;
+            }
+        } else if (ch == 'h' || ch == 'H' || ch == 'm' || ch == 's' || ch == 't') {
+            size_t j = i;
+            while (j < fmt.size() && fmt[j] == ch)
+                ++j;
+            tokens.push_back({ch, (int)(j - i), std::string()});
+            i = j;
+        } else {
+            tokens.push_back({'L', 0, std::string(1, ch)});
+            ++i;
+        }
+    }
+
+    std::string out;
+    // A suppressed field also drops the separator immediately before it, which
+    // is how Windows turns "h:mm:ss tt" into "h:mm tt". Approximate for
+    // pictures whose separator is more than one character.
+    auto drop_separator = [&out]() {
+        if (!out.empty()) {
+            const char back = out.back();
+            if (back == ':' || back == '.' || back == '-' || back == '/' || back == ' ' ||
+                back == ',')
+                out.pop_back();
+        }
+    };
+    auto append_number = [&out](int value, int count) {
+        char buf[16];
+        if (count <= 1)
+            snprintf(buf, sizeof buf, "%d", value);
+        else
+            snprintf(buf, sizeof buf, "%0*d", count, value);
+        out += buf;
+    };
+    for (const Token &t : tokens) {
+        if (t.type == 'L') {
+            out += t.literal;
+        } else if (t.type == 'h' || t.type == 'H') {
+            int value = hour;
+            if (t.type == 'h' && !force24) {
+                value %= 12;
+                if (value == 0)
+                    value = 12;
+            }
+            append_number(value, t.count);
+        } else if (t.type == 'm') {
+            if (no_minutes)
+                drop_separator();
+            else
+                append_number(minute, t.count);
+        } else if (t.type == 's') {
+            if (no_seconds)
+                drop_separator();
+            else
+                append_number(second, t.count);
+        } else if (t.type == 't') {
+            // TIME_FORCE24HOURFORMAT drops the marker as well as switching 'h'
+            // to a 24-hour clock. Approximate: Windows' exact rule is untested.
+            if (no_marker || force24)
+                drop_separator();
+            else if (t.count == 1)
+                out += (hour < 12 ? 'A' : 'P');
+            else
+                out += (hour < 12 ? "AM" : "PM");
+        }
+    }
+    return out;
+}
 
 void kernel32_wide_register() {
     imports_register(g_kernel32_wide, sizeof g_kernel32_wide / sizeof g_kernel32_wide[0]);
