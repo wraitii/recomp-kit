@@ -466,6 +466,8 @@ def parse_args(argv, system=None):
     parser.add_argument("--regenerate", action="store_true", help="Regenerate and compile translated C")
     parser.add_argument("--llvm-compare", type=Path, metavar="MANIFEST",
                         help="Build-only translator C/LLVM comparison using production compile commands")
+    parser.add_argument("--llvm-compare-boundaries", action="store_true",
+                        help="Compare with the conservative runtime access-boundary ABI")
     parser.add_argument("--llvm-sweep", type=Path, metavar="MANIFEST",
                         help="Build-only full-census LLVM emission/lifting coverage survey")
     parser.add_argument("--llvm-runtime", type=Path, metavar="MANIFEST",
@@ -529,6 +531,8 @@ def parse_args(argv, system=None):
         parser.error("--llvm-compare requires native Release defaults and no translation overrides")
     if args.llvm_compare and args.llvm_sweep:
         parser.error("LLVM comparison and sweep are separate modes")
+    if args.llvm_compare_boundaries and not args.llvm_compare:
+        parser.error("--llvm-compare-boundaries requires --llvm-compare")
     if args.llvm_runtime and any((args.stub, args.config != "Release",
                                  args.preset != default_preset(system),
                                  args.target not in {"app", "headless", "smoke"},
@@ -555,7 +559,7 @@ def main():
         with buildlock.BuildLock(args.build_root.parent, "tools/build.py --llvm-compare"):
             run_comparison(args.llvm_compare, args.game_dir, args.build_root / "llvm-compare",
                            build_dir_for(args.build_root, args.preset) / "compile_commands.json",
-                           cmake_tool("cmake"), args.jobs)
+                           cmake_tool("cmake"), args.jobs, boundary_access=args.llvm_compare_boundaries)
         return
     if args.x87_llvm_experiment:
         from experiments.x87_llvm.run import run_experiment

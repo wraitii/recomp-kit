@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Expose `--llvm-compare-boundaries` alongside `--llvm-compare` to benchmark
+  the conservative native-activation access ABI separately from the direct
+  mapped-normal-exit contract. Production C stays identical; raw/lifted LLVM
+  retain opaque access boundaries and all state snapshots. This isolates
+  integration overhead without changing game dispatch or pass semantics.
+
 - Add opt-in `--llvm-runtime MANIFEST` for native Release app/headless/smoke
   builds. Fixture-backed LLVM functions link through existing guest entry thunks;
   declared callers can use retained C to avoid native overrides bypassing them.

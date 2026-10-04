@@ -236,3 +236,12 @@ def test_llvm_compare_is_separate_from_game_build_modes():
     args, _ = build_py.parse_args(['--llvm-compare', 'manifest.json'], system='Darwin')
     assert args.llvm_compare == Path('manifest.json')
     assert not args.regenerate
+
+
+def test_llvm_boundary_comparison_requires_comparison_mode():
+    import pytest
+    with pytest.raises(SystemExit):
+        build_py.parse_args(['--llvm-compare-boundaries'], system='Darwin')
+    args, _ = build_py.parse_args(['--llvm-compare', 'manifest.json',
+                                 '--llvm-compare-boundaries'], system='Darwin')
+    assert args.llvm_compare_boundaries

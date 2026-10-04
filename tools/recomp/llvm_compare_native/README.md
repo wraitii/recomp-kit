@@ -8,6 +8,18 @@ Configure/build the normal C target first (`tools/build.py --regenerate --target
 gen --game-dir /absolute/game`); subsequent comparisons do not regenerate it.
 The game wrapper supplies `--game-dir` when available.
 
+Add `--llvm-compare-boundaries` to measure the conservative synchronous
+access-boundary ABI used by native activation. It retains every CPU snapshot,
+disables effect reduction, and uses opaque access adapters for raw/lifted LLVM.
+The production C body and compiler settings remain identical. This measures
+the extra boundary cost against C, while raw versus lifted isolates lifting
+under that same conservative contract. Without the flag, the mapped-normal-exit
+comparison enables snapshot reduction and direct accesses. These are different
+observer contracts, not interchangeable performance results. Replay adapters
+include a disabled trace check during timing; game adapters omit that check.
+Results/settings record the selected ABI. Both modes overwrite `build/llvm-compare`,
+so preserve results before switching; neither changes game dispatch.
+
 Manifest (paths relative to the manifest):
 
 ```json
