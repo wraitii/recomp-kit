@@ -775,10 +775,14 @@ void handle_key(const SDL_KeyboardEvent &event, bool down) {
     e.kind = PendingInput::KEY;
     e.key = key;
     e.down = down;
-    // The character the key produces with no modifier held, which is what a
-    // WM_CHAR for it carries; keycodes above the Unicode range are not characters.
-    const SDL_Keycode plain = SDL_GetKeyFromScancode(event.scancode, SDL_KMOD_NONE, false);
-    e.character = plain < 0x40000000 && plain >= 0x20 ? (uint32_t)plain : 0u;
+    // The character the key produces with the modifiers held right now, which is
+    // what a WM_CHAR carries on Windows ('F' for Shift+F, '!' for Shift+1, and
+    // the caps-lock state). It used to be the unshifted character, which was
+    // harmless only while TranslateMessage added a second, shifted WM_CHAR of
+    // its own; a guest that calls TranslateMessage now takes this one alone, so
+    // it has to be right. Keycodes above the Unicode range are not characters.
+    const SDL_Keycode typed = SDL_GetKeyFromScancode(event.scancode, event.mod, false);
+    e.character = typed < 0x40000000 && typed >= 0x20 ? (uint32_t)typed : 0u;
     e.flags = host_modifier_flags_from_sdl(event.mod);
     queue_or_apply(e);
 }

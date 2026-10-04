@@ -1125,6 +1125,10 @@ void def_window_proc(X86 *c, bool wide) {
     case 0x0014: // WM_ERASEBKGND: the background counts as erased
         set_eax(c, 1);
         return;
+    case 0x0112: // WM_SYSCOMMAND: SC_CLOSE becomes WM_CLOSE, as DefWindowProc does
+        if ((arg(c, 2) & 0xfff0u) == 0xf060u)
+            host_dispatch_to_wndproc(c, hwnd, 0x0010, 0, 0);
+        break;
     case 0x0010: // WM_CLOSE -> DestroyWindow
         destroy_window(c, hwnd);
         host_post_message(0, 0x0012 /* WM_QUIT */, 0, 0);

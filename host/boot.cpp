@@ -697,8 +697,13 @@ void boot_request_close(const char *reason) {
     // The caller says why in its own words; boot only delivers the message,
     // which is the one thing closing a real window does.
     uint32_t hwnd = host_main_window();
+    // What closing a real window delivers is WM_SYSCOMMAND/SC_CLOSE, which
+    // DefWindowProc turns into WM_CLOSE: a guest may intercept the first, and
+    // Black & White does (its window procedure runs LHSystem::SetTerminate on
+    // SC_CLOSE and never reaches DefWindowProc, so a bare WM_CLOSE only
+    // destroyed the window and left the game running).
     if (hwnd)
-        host_post_message(hwnd, 0x0010 /* WM_CLOSE */, 0, 0);
+        host_post_message(hwnd, 0x0112 /* WM_SYSCOMMAND */, 0xf060 /* SC_CLOSE */, 0);
 }
 
 void boot_print_exit_code(FILE *out) {

@@ -3755,6 +3755,16 @@ static void test_callbacks(X86 *c) {
           "DefWindowProcA answers WM_NCCREATE with TRUE");
     while (call_import(c, "USER32.dll", "PeekMessageA", {msg, dhwnd, 0x0003, 0x0005, 1})) {
     }
+    // WM_SYSCOMMAND/SC_CLOSE through DefWindowProc becomes WM_CLOSE, which
+    // destroys the window (a window procedure that delegates it, as this one
+    // does, ends up closed; one that intercepts SC_CLOSE never gets here).
+    check(call_import(c, "USER32.dll", "IsWindow", {dhwnd}) == 1, "the window is live");
+    call_import(c, "USER32.dll", "DefWindowProcA", {dhwnd, 0x0112, 0xf060, 0});
+    check(call_import(c, "USER32.dll", "IsWindow", {dhwnd}) == 0,
+          "DefWindowProcA turns SC_CLOSE into WM_CLOSE and the window is destroyed");
+    // The close also queued WM_QUIT (and window messages); leave the queue as found.
+    while (call_import(c, "USER32.dll", "PeekMessageA", {msg, 0, 0, 0, 1})) {
+    }
     call_import(c, "USER32.dll", "DestroyWindow", {dhwnd});
 
     // WM_QUIT reaches the guest whatever the filter says.
