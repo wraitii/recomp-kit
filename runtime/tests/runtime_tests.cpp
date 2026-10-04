@@ -3934,6 +3934,22 @@ static void test_startup_apis(X86 *c) {
           "user name includes terminator in returned size");
     check(call_import(c, "ADVAPI32.dll", "GetUserNameA", {out, 0}) == 0 && get_last_error() == 87,
           "user name rejects an invalid size pointer");
+    uint32_t wout = scratch_block(32), wsize = scratch_block(4);
+    wr32(wsize, 2);
+    wr32(wout, 0xabababab);
+    check(call_import(c, "ADVAPI32.dll", "GetUserNameW", {wout, wsize}) == 0 && rd32(wsize) == 7 &&
+              rd32(wout) == 0xabababab && get_last_error() == 122,
+          "wide user name reports the required TCHAR count without truncating");
+    wr32(wsize, 7);
+    check(call_import(c, "ADVAPI32.dll", "GetUserNameW", {wout, wsize}) == 1 &&
+              gm_wstr(wout) == "Player" && rd32(wsize) == 7 && rd16(wout + 12) == 0,
+          "wide user name writes UTF-16 and includes the terminator in the size");
+    check(call_import(c, "ADVAPI32.dll", "GetUserNameW", {wout, 0}) == 0 && get_last_error() == 87,
+          "wide user name rejects an invalid size pointer");
+    wr32(wout, 0xdeadbeef);
+    check(call_import(c, "ADVAPI32.dll", "GetUserNameW", {0, wsize}) == 0 &&
+              get_last_error() == 87 && rd32(wout) == 0xdeadbeef,
+          "wide user name rejects a null buffer without touching memory");
     wr32(out, 0xdeadbeef);
     check(call_import(c, "AVIFIL32.dll", "AVIFileOpenA", {out, 0, 0, 0}) == 0x80040154u &&
               rd32(out) == 0,
@@ -4119,6 +4135,64 @@ static void test_registry(X86 *c) {
     check(call_import(c, "ADVAPI32.dll", "RegEnumKeyA", {rd32(pphk), 1, qname, 64}) == 259,
           "RegEnumKeyA ends with ERROR_NO_MORE_ITEMS");
     call_import(c, "ADVAPI32.dll", "RegCloseKey", {rd32(pphk)});
+
+    // RegDeleteKeyA is the ANSI spelling LHNetDeleteProfile reaches. It must
+    // delete a leaf key, refuse a key that still has subkeys with
+    // ERROR_ACCESS_DENIED (Windows NT semantics; there is no recursive form),
+    // and report a missing key as ERROR_FILE_NOT_FOUND.
+    uint32_t del_path = put_str("Software\\RecompTests\\Registry\\DeleteMe");
+    uint32_t delphk = scratch_block(4), deldisp = scratch_block(4);
+    check(call_import(c, "ADVAPI32.dll", "RegCreateKeyExA",
+                      {0x80000002u, del_path, 0, 0, 0, 0xf003f, 0, delphk, deldisp}) == 0,
+          "create the key to delete");
+    call_import(c, "ADVAPI32.dll", "RegCloseKey", {rd32(delphk)});
+    check(call_import(c, "ADVAPI32.dll", "RegDeleteKeyA", {0x80000002u, del_path}) == 0,
+          "RegDeleteKeyA removes a leaf key");
+    uint32_t delgone = scratch_block(4);
+    check(call_import(c, "ADVAPI32.dll", "RegOpenKeyA", {0x80000002u, del_path, delgone}) == 2,
+          "the deleted key no longer opens");
+    check(call_import(c, "ADVAPI32.dll", "RegDeleteKeyA", {0x80000002u, del_path}) == 2,
+          "RegDeleteKeyA reports a missing key with ERROR_FILE_NOT_FOUND");
+
+    uint32_t parent_path = put_str("Software\\RecompTests\\Registry\\WithChild");
+    uint32_t child_path = put_str("Software\\RecompTests\\Registry\\WithChild\\Leaf");
+    uint32_t cphk = scratch_block(4), cpdisp = scratch_block(4);
+    check(call_import(c, "ADVAPI32.dll", "RegCreateKeyExA",
+                      {0x80000002u, child_path, 0, 0, 0, 0xf003f, 0, cphk, cpdisp}) == 0,
+          "create a key with a subkey");
+    call_import(c, "ADVAPI32.dll", "RegCloseKey", {rd32(cphk)});
+    check(call_import(c, "ADVAPI32.dll", "RegDeleteKeyA", {0x80000002u, parent_path}) == 5,
+          "RegDeleteKeyA refuses a key that still has subkeys");
+    check(call_import(c, "ADVAPI32.dll", "RegDeleteKeyA", {0x80000002u, child_path}) == 0 &&
+              call_import(c, "ADVAPI32.dll", "RegDeleteKeyA", {0x80000002u, parent_path}) == 0,
+          "the subkey goes first, then the parent");
+
+    // LHNetGetProfileList opens the Profiles parent and counts its child keys;
+    // deleting one profile must lower that count, which is the property the
+    // profile UI relies on after RegDeleteKeyA removes the leaf.
+    uint32_t profiles_path = put_str("Software\\RecompTests\\Profiles");
+    uint32_t alpha = put_str("Software\\RecompTests\\Profiles\\Alpha");
+    uint32_t beta = put_str("Software\\RecompTests\\Profiles\\Beta");
+    uint32_t pfhk = scratch_block(4), pfdisp = scratch_block(4);
+    check(call_import(c, "ADVAPI32.dll", "RegCreateKeyExA",
+                      {0x80000002u, alpha, 0, 0, 0, 0xf003f, 0, pfhk, pfdisp}) == 0 &&
+              call_import(c, "ADVAPI32.dll", "RegCreateKeyExA",
+                          {0x80000002u, beta, 0, 0, 0, 0xf003f, 0, pfhk, pfdisp}) == 0,
+          "create two profile keys");
+    uint32_t plist = scratch_block(4), plistcount = scratch_block(4);
+    check(call_import(c, "ADVAPI32.dll", "RegOpenKeyA", {0x80000002u, profiles_path, plist}) == 0,
+          "open the profile list parent");
+    check(call_import(c, "ADVAPI32.dll", "RegQueryInfoKeyA",
+                      {rd32(plist), 0, 0, 0, plistcount, 0, 0, 0, 0, 0, 0, 0}) == 0 &&
+              rd32(plistcount) == 2,
+          "the profile list starts with two children");
+    check(call_import(c, "ADVAPI32.dll", "RegDeleteKeyA", {rd32(plist), put_str("Alpha")}) == 0,
+          "delete one profile through its parent handle");
+    check(call_import(c, "ADVAPI32.dll", "RegQueryInfoKeyA",
+                      {rd32(plist), 0, 0, 0, plistcount, 0, 0, 0, 0, 0, 0, 0}) == 0 &&
+              rd32(plistcount) == 1,
+          "the profile list count drops to one");
+    call_import(c, "ADVAPI32.dll", "RegCloseKey", {rd32(plist)});
 
     // A registry file written before ancestors existed holds only leaves; the
     // parent must still open and enumerate, or the first launch after the fix

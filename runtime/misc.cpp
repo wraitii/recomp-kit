@@ -1014,8 +1014,10 @@ void a_RegQueryInfoKeyA(X86 *c) {
 void a_RegQueryInfoKeyW(X86 *c) {
     reg_query_info_key(c, true);
 }
-void a_RegDeleteKeyW(X86 *c) {
-    std::string path = key_path(arg(c, 0), gm_wstr(arg(c, 1)));
+// Shared by both spellings. On NT a key that still has subkeys is refused with
+// ERROR_ACCESS_DENIED and is never deleted recursively; LHNetDeleteProfile
+// deletes the profile's own subkey, which holds values, not child keys.
+void reg_delete_key(X86 *c, const std::string &path) {
     if (path.empty()) {
         set_eax(c, 6);
         return;
@@ -1030,6 +1032,12 @@ void a_RegDeleteKeyW(X86 *c) {
     }
     g_registry_dirty = true;
     set_eax(c, 0);
+}
+void a_RegDeleteKeyA(X86 *c) {
+    reg_delete_key(c, key_path(arg(c, 0), gm_str(arg(c, 1), 512)));
+}
+void a_RegDeleteKeyW(X86 *c) {
+    reg_delete_key(c, key_path(arg(c, 0), gm_wstr(arg(c, 1))));
 }
 void a_RegDeleteValueW(X86 *c) {
     std::string path = key_path(arg(c, 0), "");
@@ -2646,6 +2654,33 @@ static void a_GetUserNameA(X86 *c) {
     set_eax(c, 1);
 }
 
+// The wide spelling, which LHNetCreateDefaultProfile uses: it passes a 97-TCHAR
+// stack-local buffer and aborts profile creation if this returns zero. The
+// reported size is in TCHARs (7 including the NUL), not bytes, and the buffer
+// receives UTF-16. Identical name and error conventions as the ANSI form.
+static void a_GetUserNameW(X86 *c) {
+    constexpr char16_t name[] = u"Player";
+    constexpr uint32_t required = sizeof name / sizeof name[0];
+    uint32_t out = arg(c, 0), size = arg(c, 1);
+    set_eax(c, 0);
+    if (!size || !gm_valid(size, 4)) {
+        set_last_error(87);
+        return;
+    }
+    uint32_t capacity = rd32(size);
+    wr32(size, required);
+    if (capacity < required) {
+        set_last_error(122);
+        return;
+    }
+    if (!out || !gm_valid(out, required * 2)) {
+        set_last_error(87);
+        return;
+    }
+    memcpy(g_mem + out, name, required * 2);
+    set_eax(c, 1);
+}
+
 // No AVIFile codec adapter is installed yet. Report missing codec support at
 // open instead of inventing a successful file interface and corrupting the
 // caller's stack. The game can follow its normal missing-video path.
@@ -2668,6 +2703,7 @@ static void avi_no_sample(X86 *c) {
 const ImportShim g_misc_shims[] = {
     // ADVAPI32
     {"ADVAPI32.dll", "GetUserNameA", 2, a_GetUserNameA},
+    {"ADVAPI32.dll", "GetUserNameW", 2, a_GetUserNameW},
     {"ADVAPI32.dll", "RegOpenKeyA", 3, a_RegOpenKeyA},
     {"ADVAPI32.dll", "RegOpenKeyExA", 5, a_RegOpenKeyExA},
     {"ADVAPI32.dll", "RegCreateKeyExA", 9, a_RegCreateKeyExA},
@@ -2685,6 +2721,7 @@ const ImportShim g_misc_shims[] = {
     {"ADVAPI32.dll", "RegEnumValueW", 8, a_RegEnumValueW},
     {"ADVAPI32.dll", "RegQueryInfoKeyA", 12, a_RegQueryInfoKeyA},
     {"ADVAPI32.dll", "RegQueryInfoKeyW", 12, a_RegQueryInfoKeyW},
+    {"ADVAPI32.dll", "RegDeleteKeyA", 2, a_RegDeleteKeyA},
     {"ADVAPI32.dll", "RegDeleteKeyW", 2, a_RegDeleteKeyW},
     {"ADVAPI32.dll", "RegDeleteValueW", 2, a_RegDeleteValueW},
     {"ADVAPI32.dll", "RegFlushKey", 1, a_RegFlushKey},
