@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <deque>
 #include <unordered_map>
 #include <vector>
 #include <iterator>
@@ -115,6 +116,15 @@ struct Channel {
     // The format of the sound the host voice was last started with, so a queued
     // wave can be appended only when it matches.
     uint32_t voice_rate = 0, voice_channels = 0, voice_bits = 0;
+    // Waves submitted to the host voice, in play order, each with the completion
+    // callback the guest named in its play parameters. `voice_total` is every
+    // byte given to the voice since it was last started, so a wave is finished
+    // when the voice has played past its `end`.
+    struct Pending {
+        uint32_t wave, end, callback, context;
+    };
+    std::deque<Pending> pending;
+    uint64_t voice_total = 0;
     bool open = false;
     bool enabled = true;
     bool paused = false;
@@ -197,7 +207,7 @@ struct Counters {
     uint32_t open_wave_refused_rec = 0, open_wave_refused_fmt = 0;
     uint32_t open_wave_refused_data = 0, open_wave_refused_stream = 0;
     uint32_t open_wave_no_session = 0;
-    uint32_t play_calls = 0, play_delivered = 0, play_queued_static = 0;
+    uint32_t play_calls = 0, play_delivered = 0, play_queued_static = 0, completions = 0;
     uint32_t drop_no_session = 0, drop_no_wave = 0, drop_no_channel = 0;
     uint32_t drop_disabled = 0, drop_paused = 0, drop_inactive = 0;
     uint32_t drop_no_voice = 0, drop_empty_wave = 0, drop_stream_dry = 0;
@@ -573,6 +583,8 @@ void stop_channel(Channel *ch) {
     if (ch->playing && ch->audio_channel >= 0)
         host_audio_stop(ch->audio_channel);
     ch->playing = false;
+    ch->pending.clear();
+    ch->voice_total = 0;
     ch->stream_wave = 0;
     ch->stream_submitted = 0;
     ch->stream_ended = false;
@@ -1059,6 +1071,8 @@ void pump_streams(X86 *c) {
     }
 }
 
+void pump_completions(X86 *c);
+
 void QSWaveMixPump(X86 *c) {
     QTRACE("qmixer: QSWaveMixPump(%08x, %08x, %08x, %08x, %08x, %08x)", arg(c, 0), arg(c, 1),
            arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5));
@@ -1068,6 +1082,7 @@ void QSWaveMixPump(X86 *c) {
     // call that did nothing would be a lie about a mixer that needs pumping.
     dsound_pump();
     pump_streams(c);
+    pump_completions(c);
     set_eax(c, QS_OK);
 }
 
@@ -1180,6 +1195,52 @@ void QSWaveMixFreeWave(X86 *c) {
 // ---------------------------------------------------------------------------
 // Playback
 // ---------------------------------------------------------------------------
+// The play-parameters block (PlayEx's last argument). Evidence: LHaudiodllR
+// 0x1020f314..0x1020f31b builds one with 0x28 at +0, the completion callback at
+// +0xc and a context pointer at +0x10; the callback 0x1020dc80 is stdcall
+// (channel, wave handle, context), frees the wave with FreeWave and marks the
+// channel's state, and the game's audio thread refills from there. Without a
+// completion callback the game queues its four pre-roll chunks and then never
+// feeds the channel again (the music stopped after about 4 seconds).
+bool read_play_callback(uint32_t params, uint32_t *cb, uint32_t *ctx) {
+    *cb = *ctx = 0;
+    if (!params || !gm_valid(params, 0x14))
+        return false;
+    if (rd32(params) < 0x14)
+        return false;
+    *cb = rd32(params + 0xc);
+    *ctx = rd32(params + 0x10);
+    return *cb != 0;
+}
+
+// Calls the guest's completion callback for one finished wave.
+void complete_wave(X86 *c, uint32_t channel, const Channel::Pending &p) {
+    if (p.callback)
+        guest_call(c, p.callback, channel, p.wave, p.context);
+}
+
+// Fires the callbacks of every wave the host voice has finished. Called from the
+// frame pump, which is guest-callable context.
+void pump_completions(X86 *c) {
+    for (size_t i = 0; i < channels().size(); ++i) {
+        // The callback is guest code and may start, stop or free anything, so the
+        // channel is re-read each time round rather than held.
+        for (;;) {
+            Channel &ch = channels()[i];
+            if (ch.pending.empty() || ch.audio_channel < 0)
+                break;
+            const uint64_t remaining = host_audio_voice_remaining_bytes(ch.audio_channel);
+            const uint64_t played = ch.voice_total > remaining ? ch.voice_total - remaining : 0;
+            const Channel::Pending front = ch.pending.front();
+            if (remaining != 0 && front.end > played)
+                break;
+            ch.pending.pop_front();
+            ++counters().completions;
+            complete_wave(c, (uint32_t)i, front);
+        }
+    }
+}
+
 void QSWaveMixPlayEx(X86 *c) {
     QTRACE("qmixer: QSWaveMixPlayEx(%08x, %u, %08x, %08x, %08x, %08x)", arg(c, 0), arg(c, 1),
            arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5));
@@ -1299,6 +1360,8 @@ void QSWaveMixPlayEx(X86 *c) {
         return;
     }
 
+    uint32_t cb = 0, ctx = 0;
+    const bool cb_ok = read_play_callback(arg(c, 5), &cb, &ctx);
     // QMIX_QUEUEWAVE (inferred flag 0x400): the wave plays after whatever is
     // already sounding on this channel instead of replacing it. Evidence: the
     // game starts a piece of music as consecutive 2.2 s chunk waves on one
@@ -1313,6 +1376,9 @@ void QSWaveMixPlayEx(X86 *c) {
             w->bits == ch->voice_bits &&
             host_audio_queue(ch->audio_channel, gm_ptr(w->pcm), w->bytes) > 0) {
             ch->wave = w->handle;
+            ch->voice_total += w->bytes;
+            if (cb_ok)
+                ch->pending.push_back({w->handle, (uint32_t)ch->voice_total, cb, ctx});
             ++counters().play_delivered;
             ++counters().play_queued_static;
             log_once("qmixer.queue",
@@ -1344,6 +1410,13 @@ void QSWaveMixPlayEx(X86 *c) {
     ch->voice_rate = (uint32_t)p.sample_rate;
     ch->voice_channels = w->channels;
     ch->voice_bits = w->bits;
+    // A new voice replaces what was playing: those waves' callbacks are not
+    // called (they would run the guest's accounting for sounds that never
+    // finished), and the new wave is the first of the voice.
+    ch->pending.clear();
+    ch->voice_total = w->bytes;
+    if (cb_ok)
+        ch->pending.push_back({w->handle, (uint32_t)w->bytes, cb, ctx});
     ++counters().host_plays;
     ++counters().play_delivered;
     ch->playing = true;
@@ -1594,10 +1667,18 @@ void QSWaveMixIsChannelDone(X86 *c) {
            arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5));
     Session *s = session_for(arg(c, 0));
     Channel *ch = channel_for(arg(c, 1), false);
+    // Done when nothing was ever played, or a static sound has drained from the
+    // host voice and every wave's completion callback has been delivered. A
+    // streamed channel is done when it is not playing.
+    bool done = !s || !ch || !ch->playing;
+    if (!done && !ch->stream_wave && ch->audio_channel >= 0 && ch->pending.empty() &&
+        host_audio_voice_remaining_bytes(ch->audio_channel) == 0)
+        done = true;
     log_once("qmixer.isdone",
-             "SHIM(temporary): QSWaveMixIsChannelDone answers from the front-end 'playing' flag, "
-             "not from the host voice");
-    set_eax(c, (!s || !ch || !ch->playing) ? 1u : 0u);
+             "SHIM(temporary): QSWaveMixIsChannelDone is true when the static voice has "
+             "drained and its completion callbacks have run; streamed channels answer from "
+             "the front-end 'playing' flag");
+    set_eax(c, done ? 1u : 0u);
 }
 
 // QSWaveMixFlushChannel(hMix, iChannel, dwFlags). Guest call sites
@@ -1900,6 +1981,7 @@ void qmixer_frame_pump(X86 *c) {
     ++counters().frame_pumps;
     dsound_pump();
     pump_streams(c);
+    pump_completions(c);
     inside = false;
 }
 

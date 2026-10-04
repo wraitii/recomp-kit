@@ -11774,6 +11774,76 @@ static void test_qmixer_queue_wave() {
     qmixer_reset();
 }
 
+// Completion callbacks: a static wave played with a play-parameters block
+// ({0x28, ..., callback at +0xc, context at +0x10}) has that callback called
+// as (channel, wave, context) once the host voice has played past the wave's
+// end, in order across queued waves. Without them the game never refills.
+static std::vector<std::array<uint32_t, 3>> g_completed;
+static void test_qmixer_completion_callbacks() {
+    cpu_reset();
+    qmixer_reset();
+    g_plays.clear();
+    g_queues.clear();
+    g_completed.clear();
+    g_queue_enabled = true;
+    uint32_t hmix = call_shim(tramp("QMIXER.dll", "QSWaveMixInitEx"), {0});
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixActivate"), {hmix, 1}), 0u);
+    static uint32_t cb = imports_alloc_trampoline(
+        "TEST", "PlayDoneCallback",
+        [](X86 *c) {
+            g_completed.push_back({arg(c, 0), arg(c, 1), arg(c, 2)});
+            set_eax(c, 0);
+        },
+        3);
+    const auto open = [&](uint32_t where, uint32_t bytes) {
+        uint32_t wfx = sc(where);
+        gm_zero(wfx, SDK_WAVEFORMATEX);
+        wr16(wfx + WFX_OFF_wFormatTag, WAVE_FORMAT_PCM);
+        wr16(wfx + WFX_OFF_nChannels, 2);
+        wr32(wfx + WFX_OFF_nSamplesPerSec, 22050);
+        wr16(wfx + WFX_OFF_nBlockAlign, 4);
+        wr16(wfx + WFX_OFF_wBitsPerSample, 16);
+        uint32_t data = sc(where + 0x100);
+        uint32_t rec = sc(where + 0x80);
+        gm_zero(rec, QSWAVEMIXOPENWAVEDATA_SIZE);
+        wr32(rec + QSOWD_OFF_lpFormat, wfx);
+        wr32(rec + QSOWD_OFF_lpData, data);
+        wr32(rec + QSOWD_OFF_dwDataSize, bytes);
+        return call_shim(tramp("QMIXER.dll", "QSWaveMixOpenWaveEx"), {hmix, rec, 8});
+    };
+    uint32_t a = open(0x2000, 64), b = open(0x3000, 32);
+    uint32_t params = sc(0x4000);
+    gm_zero(params, 0x28);
+    wr32(params, 0x28);
+    wr32(params + 0xc, cb);
+    wr32(params + 0x10, 0xC0DE0000u);
+    uint32_t play = tramp("QMIXER.dll", "QSWaveMixPlayEx");
+    CHECK_EQ(call_shim(play, {hmix, 7, 0x400, a, 0, params}), 0u);
+    CHECK_EQ(call_shim(play, {hmix, 7, 0x400, b, 0, params}), 0u);
+    CHECK_EQ(g_voice_remaining, 96u);
+    qmixer_frame_pump(&g_cpu);
+    CHECK_EQ(g_completed.size(), 0u); // nothing has played yet
+    g_voice_remaining = 40;           // 56 bytes played: a (64) not yet finished
+    qmixer_frame_pump(&g_cpu);
+    CHECK_EQ(g_completed.size(), 0u);
+    g_voice_remaining = 30; // 66 played: a is done, b (96) is not
+    qmixer_frame_pump(&g_cpu);
+    CHECK_EQ(g_completed.size(), 1u);
+    if (g_completed.size() == 1) {
+        CHECK_EQ(g_completed[0][0], 7u);
+        CHECK_EQ(g_completed[0][1], a);
+        CHECK_EQ(g_completed[0][2], 0xC0DE0000u);
+    }
+    g_voice_remaining = 0; // the voice drained: b is done too
+    qmixer_frame_pump(&g_cpu);
+    CHECK_EQ(g_completed.size(), 2u);
+    if (g_completed.size() == 2)
+        CHECK_EQ(g_completed[1][1], b);
+    // Drained and delivered: the channel reports done.
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixIsChannelDone"), {hmix, 7}), 1u);
+    qmixer_reset();
+}
+
 // OpenWaveEx flag 4: the record's field 0 points at a 'MEM ' MMIOINFO of a
 // RIFF/WAVE image, as LHaudiodllR 0x10211dad builds it. A PCM image opens; a
 // compressed tag is refused with a nonzero last error; and QSWaveMixGetLastError
@@ -14680,6 +14750,7 @@ int main() {
         {"QMixer volume scale", test_qmixer_volume_scale},
         {"QMixer RIFF memory wave and GetLastError arity", test_qmixer_riff_memory_wave},
         {"QMixer QUEUEWAVE for static waves", test_qmixer_queue_wave},
+        {"QMixer completion callbacks", test_qmixer_completion_callbacks},
         {"QMixer stream lifetime", test_qmixer_stream_buffer_lifetime},
         {"QMixer stream prefetch", test_qmixer_stream_prefetch},
         {"QMixer refill gate", test_qmixer_refill_gate},
