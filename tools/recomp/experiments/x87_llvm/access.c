@@ -71,6 +71,10 @@ void rk_access_store32(X86 *c, uint32_t address, float value) {
     event(c, address, 4, 1, bits);
     wrf32(address, value);
 }
+void rk_access_write32(X86 *c, uint32_t address, uint32_t value) {
+    event(c, address, 4, 1, value);
+    wr32(address, value);
+}
 void rk_memory_begin(unsigned mode) {
     event_count = 0;
     stop_at = 0;

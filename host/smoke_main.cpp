@@ -253,9 +253,16 @@ void write_dump(const char *name) {
 // offsets are the ones the game's tests/entity_codec.hpp encodes and decodes: flags at
 // +12, kind at +42, state at +44, owner at +47, and the position at +61 as
 // three 16-bit words, x then z then altitude. A blue brave is owner 0, kind 1.
+#if defined(RECOMP_GLOBAL_ENTITY_BASE_ADDR) && defined(RECOMP_GLOBAL_ENTITY_BASE_STRIDE) &&        \
+    defined(RECOMP_GLOBAL_ENTITY_BASE_COUNT)
 const uint32_t kEntityBase = RECOMP_GLOBAL_ENTITY_BASE_ADDR;
 const uint32_t kEntityStride = RECOMP_GLOBAL_ENTITY_BASE_STRIDE;
 const uint32_t kEntityCount = RECOMP_GLOBAL_ENTITY_BASE_COUNT; // record 0 is the null entity
+#else
+// UI/input scripts also serve games without this entity-table profile. An
+// empty table cannot produce entity evidence or scan unrelated guest memory.
+const uint32_t kEntityBase = 0, kEntityStride = 0, kEntityCount = 0;
+#endif
 const uint32_t kOffFlags = 12;
 const uint32_t kOffKind = 42;
 const uint32_t kOffState = 44;

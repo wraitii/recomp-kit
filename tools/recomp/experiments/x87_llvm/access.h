@@ -8,6 +8,7 @@ float rk_access_f32(X86 *c, uint32_t address);
 double rk_access_f64(X86 *c, uint32_t address);
 uint32_t rk_access_u32(X86 *c, uint32_t address);
 void rk_access_store32(X86 *c, uint32_t address, float value);
+void rk_access_write32(X86 *c, uint32_t address, uint32_t value);
 
 /* Focused replay hooks; mode 3 retains its older final-state-only contract. */
 void rk_memory_begin(unsigned mode);

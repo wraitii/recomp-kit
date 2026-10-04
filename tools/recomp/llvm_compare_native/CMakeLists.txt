@@ -16,6 +16,11 @@ set(TIME "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/time_command.py")
 add_llvm_pass_plugin(RecompX87 PARTIAL_SOURCES_INTENDED "${EXPERIMENT}/stack_pass.cpp")
 include("${CMAKE_BINARY_DIR}/settings.cmake")
 option(BUILD_REPLAY "Build the fixture-backed execution harness" ON)
+option(BOUNDARY_ACCESS "Use opaque synchronous access boundaries" OFF)
+set(HELPER_DEFINES)
+if(BOUNDARY_ACCESS)
+  list(APPEND HELPER_DEFINES -DRK_BOUNDARY_ACCESS=1)
+endif()
 foreach(LEAF IN LISTS LEAVES)
   set(D "${CMAKE_BINARY_DIR}/${LEAF}")
   include("${D}/settings.cmake")
@@ -38,7 +43,7 @@ foreach(LEAF IN LISTS LEAVES)
   endforeach()
   add_custom_command(OUTPUT "${D}/helpers.bc"
     COMMAND ${TIME} "${D}/time-helpers.json" "${TOOLS}/clang" ${PRODUCTION_FLAGS}
-            -include "${D}/call-dispatch.h" -O1 -emit-llvm -c "${EXPERIMENT}/helpers.c" -o "${D}/helpers.bc"
+            ${HELPER_DEFINES} -include "${D}/call-dispatch.h" -O1 -emit-llvm -c "${EXPERIMENT}/helpers.c" -o "${D}/helpers.bc"
     DEPENDS "${EXPERIMENT}/helpers.c" "${EXPERIMENT}/access.h" "${KIT}/runtime/x86.h"
             "${D}/settings.cmake" "${D}/call-dispatch.h" VERBATIM)
   add_custom_command(OUTPUT "${D}/ssa.ll" "${D}/effects.ll" "${D}/lifted.ll"

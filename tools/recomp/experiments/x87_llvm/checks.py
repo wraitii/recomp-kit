@@ -29,6 +29,11 @@ def check_pass(opt, plugin, out):
         "sync_live_call": ("call void @rk_push(ptr %cpu, double 1.0)\ncall void @rk_direct_call(ptr %cpu, i32 1, i32 2)", "call requires empty"),
         "sync_after_call": ("call void @rk_direct_call(ptr %cpu, i32 1, i32 2)\n%v = call double @rk_read(ptr %cpu, i32 0)", "locally defined"),
         "sync_bad_register": ("call void @rk_inc32(ptr %cpu, i32 8)", "register index"),
+        "boundary_contract": ("%v = call double @rk_boundary_load(ptr %cpu, i32 0)", "invalid x87 semantic"),
+        "boundary_effects": ("", "effects requires the direct-access contract"),
+        "boundary_direct_mix": ("%v = call double @rk_direct_load(ptr %cpu, i32 0)", "invalid x87 semantic"),
+        "boundary_live_call": ("call void @rk_push(ptr %cpu, double 1.0)\ncall void @rk_boundary_call(ptr %cpu, i32 1, i32 2)", "call requires empty"),
+        "boundary_after_call": ("call void @rk_boundary_call(ptr %cpu, i32 1, i32 2)\n%v = call double @rk_read(ptr %cpu, i32 0)", "locally defined"),
     }
     directory = out / 'pass-checks'
     directory.mkdir(exist_ok=True)
@@ -39,7 +44,11 @@ def check_pass(opt, plugin, out):
             attrs = ' "recomp.x87.sync"'
             if name != 'sync_contract':
                 attrs += ' "recomp.x87.direct"'
-        path.write_text(DECLARATIONS + '\ndeclare void @external(ptr)\ndeclare double @rk_direct_load(ptr, i32)\ndeclare void @rk_direct_call(ptr, i32, i32)\ndeclare void @rk_inc32(ptr, i32)\n' +
+        if name.startswith('boundary_') and name != 'boundary_contract':
+            attrs = ' "recomp.x87.boundaries" "recomp.x87.sync"'
+            if name == 'boundary_effects':
+                attrs += ' "recomp.x87.effects"'
+        path.write_text(DECLARATIONS + '\ndeclare void @external(ptr)\ndeclare double @rk_direct_load(ptr, i32)\ndeclare void @rk_direct_call(ptr, i32, i32)\ndeclare void @rk_inc32(ptr, i32)\ndeclare double @rk_boundary_load(ptr, i32)\ndeclare void @rk_boundary_call(ptr, i32, i32)\n' +
                         f'define void @bad(ptr %cpu) "recomp.x87.region"{attrs} {{\n' + body + '\nret void\n}\n')
         result = subprocess.run([str(opt), f'-load-pass-plugin={plugin}',
                                  '-passes=recomp-x87-stack', '-disable-output', str(path)],

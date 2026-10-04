@@ -1,6 +1,6 @@
 # LLVM x87 stack-to-SSA passes
 
-An opt-in LLVM **22** native-host experiment. Production C translation is unchanged.
+An opt-in LLVM **22** native-host experiment. Production C translation remains the baseline.
 A [build-only translator comparison](../../llvm_compare_native/README.md) now
 reuses this emitter and these passes with normal C translation and actual
 production compile settings. Use it for production-C codegen measurements;
@@ -311,3 +311,31 @@ A small function's improvement does not establish a game-level speedup, original
 x86 equivalence, fault equivalence, or a reason to expand the production backend.
 Caller-derived exit liveness and redundant full-boundary writes remain separate
 future optimizations; they are not claimed by this effect-summary pass.
+
+## Opt-in native activation
+
+`tools/build.py --llvm-runtime /path/to/runtime.json --target app` prepares
+fixture-backed objects and redirects only selected table entries. The manifest
+adds `activation_contract: "synchronous-access-boundaries-v1"` to the comparison
+manifest, with optional `translated_callers` profiles (executable/hash,
+entry/size/function_sha256). These are inspected, existing census functions;
+caller profiles select retained C when a native override would bypass LLVM.
+Native Release app/headless/smoke targets are supported. Normal builds clear
+activation; generated C bodies and existing native overrides remain available.
+
+The `recomp.x87.boundaries` ABI uses `rk_boundary_*` helpers. Full CPU state is
+materialized before opaque memory adapters and declared calls; every snapshot
+is retained and effect reduction is disabled. A separately compiled, non-LTO
+runtime adapter uses the existing arena accessors and write hooks. Successful
+synchronous accesses preserve CPU state; calls invalidate cached x87 values.
+This is a conservative first integration, with higher cost than the direct
+mapped-normal-exit comparison. Fault/SEH, asynchronous observation and callbacks
+that mutate CPU state during accesses remain unverified.
+
+Preparation runs the supplied full-state/memory fixtures using this ABI without
+benchmarks. It internalizes harness helpers, exports unique runtime symbols and
+records provenance under `build/llvm-runtime/activation.json`. Harness callee
+stubs establish fixture evidence only; runtime linking uses real entry thunks.
+`RECOMP_LLVM_ORIGINAL=1` restores prior native/C dispatch in the same executable.
+`RECOMP_LLVM_STATS=1` logs first entry and exit counts when selected dispatch is
+reached. Linking or a successful game launch alone is not selected-entry coverage.

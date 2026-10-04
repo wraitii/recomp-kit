@@ -216,6 +216,10 @@ static int order_double(const void *a, const void *b) {
 }
 
 static void benchmark(void) {
+    if (getenv("RK_SKIP_BENCHMARKS")) {
+        puts("BENCH skipped: validation-only replay");
+        return;
+    }
     const unsigned iterations = 1000000, trials = 9;
     for (unsigned f = 0; f < sizeof functions / sizeof *functions; ++f) {
         for (unsigned pc = 0; pc <= 2; pc += 2) {

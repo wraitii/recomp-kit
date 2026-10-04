@@ -39,8 +39,18 @@ static bool validCall(CallInst &C, Function &F) {
     StringRef N = Fn->getName();
     // Direct accesses have a different, explicit environment contract: mapped
     // memory disjoint from CPU/runtime storage, no access observers or faults.
+    bool Boundary = N.starts_with("rk_boundary_");
+    if (Boundary && !F.hasFnAttribute("recomp.x87.boundaries"))
+        return false;
     if (N.starts_with("rk_direct_") && !F.hasFnAttribute("recomp.x87.direct"))
         return false;
+    // The boundary ABI has the same operation signatures, but opaque memory
+    // adapters can observe CPU state. It never enables the effect reduction.
+    std::string Normalized;
+    if (Boundary) {
+        Normalized = "rk_direct_" + N.drop_front(12).str();
+        N = Normalized;
+    }
     FunctionType *Expected = nullptr;
     if (N == "rk_push")
         Expected = FunctionType::get(V, {P, D}, false);
@@ -92,7 +102,8 @@ class X87Analysis : public AnalysisInfoMixin<X87Analysis> {
             !F.getArg(0)->getType()->isPointerTy() || !pred_empty(&F.front()))
             return Reject("x87 region requires entry without predecessors and void(ptr) ABI");
         bool SyncCFG = F.hasFnAttribute("recomp.x87.sync");
-        if (SyncCFG && !F.hasFnAttribute("recomp.x87.direct"))
+        if (SyncCFG && !F.hasFnAttribute("recomp.x87.direct") &&
+            !F.hasFnAttribute("recomp.x87.boundaries"))
             return Reject("synchronized CFG requires direct-access contract");
         if (SyncCFG) {
             DenseMap<BasicBlock *, unsigned> Color;
@@ -151,7 +162,7 @@ class X87Analysis : public AnalysisInfoMixin<X87Analysis> {
                         if (!Index || Index->getZExtValue() >= 8)
                             return Reject("invalid guest register index");
                     }
-                    if (N == "rk_direct_call") {
+                    if (N == "rk_direct_call" || N == "rk_boundary_call") {
                         if (S.Depth)
                             return Reject("guest call requires empty local x87 stack");
                         S = {}; // A callee may replace TOP/CW/slots and metadata.
@@ -280,7 +291,7 @@ class X87SSAPass : public PassInfoMixin<X87SSAPass> {
                         else
                             Slot = C->getArgOperand(2);
                         Erase.push_back(C);
-                    } else if (N == "rk_direct_call") {
+                    } else if (N == "rk_direct_call" || N == "rk_boundary_call") {
                         Checkpoint(I);
                         IRBuilder<> After(C->getNextNode());
                         Top = After.CreateCall(TopFn, {CPU}, "after.call.top");
@@ -288,7 +299,7 @@ class X87SSAPass : public PassInfoMixin<X87SSAPass> {
                         Last = {};
                     } else if (N == "rk_fnstsw" || N == "rk_observe" || N == "rk_ret" ||
                                N == "rk_load" || N == "rk_load64" || N == "rk_store" ||
-                               N.starts_with("rk_direct_")) {
+                               N.starts_with("rk_direct_") || N.starts_with("rk_boundary_")) {
                         Checkpoint(I);
                     }
                 } else if (isa<BranchInst>(I)) {
@@ -300,7 +311,8 @@ class X87SSAPass : public PassInfoMixin<X87SSAPass> {
                 } else if (isa<ReturnInst>(I)) {
                     auto *Prev = dyn_cast_or_null<CallInst>(I.getPrevNode());
                     if (!Prev || (Prev->getCalledFunction()->getName() != "rk_ret" &&
-                                  Prev->getCalledFunction()->getName() != "rk_direct_ret"))
+                                  Prev->getCalledFunction()->getName() != "rk_direct_ret" &&
+                                  Prev->getCalledFunction()->getName() != "rk_boundary_ret"))
                         Checkpoint(I);
                 }
             }

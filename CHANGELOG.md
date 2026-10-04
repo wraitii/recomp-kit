@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Add opt-in `--llvm-runtime MANIFEST` for native Release app/headless/smoke
+  builds. Fixture-backed LLVM functions link through existing guest entry thunks;
+  declared callers can use retained C to avoid native overrides bypassing them.
+  The synchronous access-boundary ABI materializes full CPU state before opaque
+  runtime memory accesses and calls, retains snapshots, and disables dead-state
+  reduction. It preserves existing memory hooks and arithmetic; it does not
+  establish asynchronous fault/SEH equivalence or retain direct-memory speedups.
+  `RECOMP_LLVM_ORIGINAL=1` restores prior native/C dispatch;
+  `RECOMP_LLVM_STATS=1` records selected entry counts. Ordinary builds clear
+  activation. Smoke builds also tolerate profiles without an entity-table scan.
+
 - Add `tools/build.py --llvm-sweep MANIFEST` for full exported-census LLVM
   emission/lifting coverage with per-function first refusals, followed by
   production-C/raw/lifted object codegen comparisons for supported functions.

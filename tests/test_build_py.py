@@ -12,6 +12,16 @@ spec.loader.exec_module(build_py)
 
 
 class BuildPyTests(unittest.TestCase):
+    def test_llvm_runtime_is_a_native_host_mode(self):
+        for target in ("app", "headless", "smoke"):
+            args, _ = build_py.parse_args(["--llvm-runtime", "runtime.json", "--target", target], system="Darwin")
+            self.assertEqual(args.llvm_runtime, Path("runtime.json"))
+        for extra in (["--llvm-compare", "profile.json"], ["--llvm-sweep", "profile.json"],
+                      ["--stub"], ["--target", "gen"], ["--config", "Debug"],
+                      ["--x87-llvm-experiment"], ["--forget", "00400100"]):
+            with self.subTest(extra=extra), self.assertRaises(SystemExit):
+                build_py.parse_args(["--llvm-runtime", "runtime.json", *extra], system="Darwin")
+
     def test_llvm_sweep_requires_its_own_native_build_mode(self):
         args, _ = build_py.parse_args(["--llvm-sweep", "profiles.json"], system="Darwin")
         self.assertEqual(args.llvm_sweep, Path("profiles.json"))
