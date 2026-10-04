@@ -297,6 +297,13 @@ struct D3d7DeviceState {
     bool in_scene;
     uint32_t d3d_obj;       // owning K_DDRAW (IDirect3D7) object id
     uint32_t render_target; // surface id, or 0
+    // True while the host renderer's 32-bit target holds 3D content that has
+    // not been reconciled into the guest 16bpp bytes. Cleared by a successful
+    // d3d7_writeback; set by every Clear or draw that changes the target. A
+    // surface the device has not drawn into since the last writeback needs no
+    // readback (the guest bytes are already the reconciled content), which is
+    // the lazy half of the writeback policy in docs/d3d7-inventory.md.
+    bool target_dirty;
     // The device class that was requested: one of the two device GUIDs.
     uint8_t device_guid[16];
     bool tnl; // device_guid names IID_IDirect3DTnLHalDevice
@@ -338,6 +345,9 @@ struct ComObj {
     // --- K_SURFACE
     uint32_t caps = 0;
     uint32_t width = 0, height = 0, bpp = 0, pitch = 0;
+    // Non-zero for a DXT surface (DDPF_FOURCC). Its guest bytes are the 4x4
+    // blocks themselves; bpp stays 0 as the driver reports. See dx/dxt_decode.h.
+    uint32_t fourcc = 0;
     uint32_t pixels = 0; // guest address of the pixel memory
     uint32_t pixels_bytes = 0;
     bool counts_vram = false; // owner_dd's vram_used includes this surface

@@ -137,6 +137,9 @@ enum {
     DDSD_OFF_dwHeight = 0x08,
     DDSD_OFF_dwWidth = 0x0c,
     DDSD_OFF_lPitch = 0x10,
+    // DDSD_LINEARSIZE reuses the lPitch dword; ddraw.cpp's in-progress DXT
+    // path names it separately. Alias so the shared build resolves.
+    DDSD_OFF_dwLinearSize = 0x10,
     DDSD_OFF_dwBackBufferCount = 0x14,
     DDSD_OFF_dwMipMapCount = 0x18, // also dwZBufferBitDepth / dwRefreshRate
     DDSD_OFF_dwAlphaBitDepth = 0x1c,

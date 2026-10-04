@@ -15,6 +15,7 @@
 // method, not merely a missing one.
 #include "com.h"
 #include "dx.h"
+#include "dxt_decode.h"
 #include "host_api.h"
 #include "ddraw.h"
 #include "../runtime/memory.h"
@@ -328,6 +329,13 @@ uint32_t bytes_per_pixel(uint32_t bpp) {
     return bpp <= 8 ? 1u : (bpp <= 16 ? 2u : 4u);
 }
 
+// A DXT surface stores 4x4 blocks, not pixels. `bpp` stays 0 (what the driver
+// reports in DDPIXELFORMAT) and `fourcc` carries the layout; every path that
+// sizes or strides the storage has to branch on this. See dx/dxt_decode.h.
+bool surface_is_compressed(const ComObj *s) {
+    return s && dxdxt::is_dxt(s->fourcc);
+}
+
 // The recorder, defined below with the rest of the frame machinery. Declared
 // here because every write path above it has to call in.
 struct BlitKeys;
@@ -342,6 +350,14 @@ HostAccessCounts &g_access_ref();
 uint32_t pitch_for(uint32_t width, uint32_t bpp) {
     uint32_t row = width * bytes_per_pixel(bpp);
     return (row + 15u) & ~15u; // real drivers align; 16 matches every mode here
+}
+
+// The surface's pixel/block storage size. Equal to pitch*height for an
+// uncompressed surface (the DXT pitch is a block-row pitch, so it is not).
+uint64_t surface_storage_bytes(const ComObj *s) {
+    if (surface_is_compressed(s))
+        return dxdxt::linear_size(s->width, s->height, s->fourcc);
+    return (uint64_t)pitch_for(s->width, s->bpp) * s->height;
 }
 
 // ---------------------------------------------------------------------------
@@ -391,7 +407,7 @@ bool surface_charge_vram(ComObj *dd, ComObj *s) {
     uint32_t capacity = ddraw_vram_capacity(dd);
     if (!dd || !capacity || !surface_uses_vram(s))
         return true;
-    uint64_t bytes = (uint64_t)pitch_for(s->width, s->bpp) * s->height;
+    uint64_t bytes = surface_storage_bytes(s);
     if (dd->vram_used + bytes > capacity)
         return false;
     dd->vram_used += bytes;
@@ -406,7 +422,7 @@ void surface_refund_vram(ComObj *s) {
     ComObj *dd = s->owner_dd ? com_get(s->owner_dd) : nullptr;
     if (!dd)
         return;
-    uint64_t bytes = (uint64_t)pitch_for(s->width, s->bpp) * s->height;
+    uint64_t bytes = surface_storage_bytes(s);
     dd->vram_used = dd->vram_used >= bytes ? dd->vram_used - bytes : 0;
 }
 
@@ -434,6 +450,13 @@ uint32_t desc_caps_off() {
 void write_pixel_format(uint32_t addr, const ComObj *s) {
     gm_zero(addr, DDPF_SIZE);
     wr32(addr + DDPF_OFF_dwSize, DDPF_SIZE);
+    if (surface_is_compressed(s)) {
+        // A compressed format reports DDPF_FOURCC and no bit count, exactly as
+        // the driver does; the masks stay zero.
+        wr32(addr + DDPF_OFF_dwFlags, DDPF_FOURCC);
+        wr32(addr + DDPF_OFF_dwFourCC, s->fourcc);
+        return;
+    }
     if (s->bpp <= 8) {
         wr32(addr + DDPF_OFF_dwFlags, DDPF_RGB | DDPF_PALETTEINDEXED8);
         wr32(addr + DDPF_OFF_dwRGBBitCount, 8);
@@ -457,10 +480,22 @@ void fill_desc(uint32_t addr, const ComObj *s, bool v2, uint32_t lpsurface) {
         return;
     gm_zero(addr, size);
     wr32(addr + DDSD_OFF_dwSize, size);
-    uint32_t flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PITCH | DDSD_PIXELFORMAT;
+    uint32_t flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT;
     wr32(addr + DDSD_OFF_dwHeight, s->height);
     wr32(addr + DDSD_OFF_dwWidth, s->width);
-    wr32(addr + DDSD_OFF_lPitch, s->pitch);
+    // A driver reports a compressed surface's TOP-LEVEL linear size, not the
+    // block-row pitch, and flags it DDSD_LINEARSIZE. The engine reads that
+    // dword as the byte count to copy into the surface (fn_0087F6D0), so a
+    // block-row pitch here would truncate every DXT texture to one row.
+    if (surface_is_compressed(s)) {
+        flags |= DDSD_LINEARSIZE;
+        // dwLinearSize and lPitch share offset 0x10; only the flag says which
+        // meaning applies.
+        wr32(addr + DDSD_OFF_lPitch, dxdxt::linear_size(s->width, s->height, s->fourcc));
+    } else {
+        flags |= DDSD_PITCH;
+        wr32(addr + DDSD_OFF_lPitch, s->pitch);
+    }
     write_pixel_format(addr + DDSD_OFF_ddpfPixelFormat, s);
     if (lpsurface) {
         flags |= DDSD_LPSURFACE;
@@ -557,6 +592,26 @@ bool surface_alloc_pixels(ComObj *s) {
         LOGW("ddraw: refusing a %ux%u surface; the edge limit is %u", s->width, s->height,
              MAX_SURFACE_EDGE);
         return false;
+    }
+    if (surface_is_compressed(s)) {
+        // A compressed surface's pitch is one row of 4x4 blocks; its storage
+        // is pitch * block_rows, so the usual pitch*height is wrong.
+        s->pitch = dxdxt::pitch(s->width, s->fourcc);
+        uint64_t compressed = dxdxt::linear_size(s->width, s->height, s->fourcc);
+        if (!compressed || compressed > (uint64_t)GUEST_SIZE) {
+            LOGW("ddraw: a %ux%u DXT surface needs more than the guest arena holds", s->width,
+                 s->height);
+            return false;
+        }
+        s->pixels_bytes = (uint32_t)compressed;
+        s->pixels = heap_alloc(s->pixels_bytes, true, 16);
+        if (!s->pixels) {
+            LOGW("ddraw: out of guest memory for a %ux%u DXT surface (%u bytes)", s->width,
+                 s->height, s->pixels_bytes);
+            return false;
+        }
+        s->owns_pixels = true;
+        return true;
     }
     s->pitch = pitch_for(s->width, s->bpp);
     // pitch and height are each bounded well below 2^32, so this product is
@@ -715,6 +770,22 @@ void write_pixel(const ComObj *s, int32_t x, int32_t y, uint32_t v) {
     }
 }
 
+// Quantises an 8-bit channel into a mask's field by truncation, the same rule
+// d3d7_rgb888_to_rgb565 uses for the 32->16 boundary. The DXT decode produces
+// 8-bit channels; the destination here is one of the formats the engine
+// enumerated (A4R4G4B4 in the 1.42 run), so the pack has to honour its masks.
+uint32_t pack_channel(uint32_t value, uint32_t mask, uint32_t shift) {
+    if (!mask)
+        return 0;
+    // The masks are contiguous, so the number of set bits is the field width
+    // and the caller supplies the shift (count of trailing zero bits).
+    uint32_t bits = 0;
+    for (uint32_t m = mask; m; m &= m - 1u)
+        ++bits;
+    uint32_t v = (value >> (8u - bits)) & ((1u << bits) - 1u);
+    return v << shift;
+}
+
 // The one blit primitive behind Blt and BltFast: nearest-neighbour stretch
 // with an optional source colour key. src == null fills with `fill`.
 // The colour keys in force for one blit. A source key names the pixels of the
@@ -739,6 +810,63 @@ void blit(ComObj *dst, const int32_t d[4], const ComObj *src, const int32_t sr[4
     int32_t dw = d[2] - d[0], dh = d[3] - d[1];
     if (dw <= 0 || dh <= 0 || !dst->pixels)
         return;
+
+    // A compressed source is decoded block by block into the destination's
+    // pixels. This is the path that actually fills the engine's VRAM texture
+    // pool: LH3DVRAM Blts a DXT surface into a 16bpp pool surface and binds
+    // that. The guest's DXT bytes are never modified. `keys` still apply,
+    // compared against the destination's own pixel format.
+    if (src && !fill && surface_is_compressed(src)) {
+        if (surface_is_compressed(dst)) {
+            log_once("ddraw.blt.dxtdst",
+                     "ddraw: Blt into a DXT surface is not supported; copying nothing");
+            return;
+        }
+        int32_t sw = sr[2] - sr[0], sh = sr[3] - sr[1];
+        if (sw <= 0 || sh <= 0)
+            return;
+        auto mask_shift = [](uint32_t mask) {
+            uint32_t shift = 0;
+            while (!(mask & 1u) && shift < 32u) {
+                mask >>= 1u;
+                ++shift;
+            }
+            return shift;
+        };
+        const uint32_t rs = mask_shift(dst->rmask), gs = mask_shift(dst->gmask),
+                       bs = mask_shift(dst->bmask), as = mask_shift(dst->amask);
+        const uint8_t *base = gm_ptr(src->pixels);
+        const bool stretch = (sw != dw) || (sh != dh);
+        for (int32_t y = 0; y < dh; ++y) {
+            int32_t syy = stretch ? sr[1] + (int32_t)((int64_t)y * sh / dh) : sr[1] + y;
+            for (int32_t x = 0; x < dw; ++x) {
+                int32_t sxx = stretch ? sr[0] + (int32_t)((int64_t)x * sw / dw) : sr[0] + x;
+                dxdxt::Rgba px;
+                if (!dxdxt::sample(base, src->pitch, src->fourcc, (uint32_t)sxx, (uint32_t)syy,
+                                   &px))
+                    continue;
+                if (keys.src) {
+                    uint32_t keyed =
+                        pack_channel(px.r, dst->rmask, rs) | pack_channel(px.g, dst->gmask, gs) |
+                        pack_channel(px.b, dst->bmask, bs) | pack_channel(px.a, dst->amask, as);
+                    if (keyed >= keys.src_lo && keyed <= keys.src_hi)
+                        continue;
+                }
+                if (keys.dst) {
+                    uint32_t dv = read_pixel(dst, d[0] + x, d[1] + y);
+                    if (dv < keys.dst_lo || dv > keys.dst_hi)
+                        continue;
+                }
+                uint32_t v =
+                    pack_channel(px.r, dst->rmask, rs) | pack_channel(px.g, dst->gmask, gs) |
+                    pack_channel(px.b, dst->bmask, bs) | pack_channel(px.a, dst->amask, as);
+                write_pixel(dst, d[0] + x, d[1] + y, v);
+                if (coverage)
+                    coverage[(size_t)y * dw + x] = 1;
+            }
+        }
+        return;
+    }
 
     if (fill) {
         uint32_t bpp_bytes = bytes_per_pixel(dst->bpp);
@@ -1665,7 +1793,7 @@ void ddraw_before_write(ComObj *s) {
     r.h = (int)s->height;
     r.pitch = (int)s->pitch;
     r.bpp = (int)s->bpp;
-    size_t n = (size_t)s->pitch * s->height;
+    size_t n = s->pixels_bytes;
     r.bytes.resize(n);
     memcpy(r.bytes.data(), gm_ptr(s->pixels), n);
     r.snapshotted = true;
@@ -1710,7 +1838,7 @@ int host_revision_lease(HostSurfaceKey key, HostPixels *out) {
         r.h = (int)s->height;
         r.pitch = (int)s->pitch;
         r.bpp = (int)s->bpp;
-        size_t n = (size_t)s->pitch * s->height;
+        size_t n = s->pixels_bytes;
         r.bytes.resize(n);
         memcpy(r.bytes.data(), gm_ptr(s->pixels), n);
         r.snapshotted = true;
@@ -2525,6 +2653,11 @@ void record_cpu_write_rects(ComObj *s, const std::vector<HostDirtyRect> &boxes) 
 void ddraw_refresh_retained_writes(ComObj *s, const int32_t rect[4]) {
     if (!s || !s->retained_pointer || !s->pixels)
         return;
+    // The pixel-diff baseline is width*height pixels; a compressed surface's
+    // block layout does not fit it and the work is never needed (DXT surfaces
+    // are decode scratch the guest fills before a Blt).
+    if (surface_is_compressed(s))
+        return;
     bool fresh = false;
     Baseline &b = baseline_of(s, &fresh);
     int32_t y0 = rect[1], y1 = rect[3];
@@ -2945,6 +3078,22 @@ void Surface_Blt(X86 *c) {
                      "ddraw: Blt asked for DDBLT_KEYDEST but the destination surface has "
                      "no destination colour key; writing every pixel");
         }
+        // A compressed source is decode scratch: the guest filled it and the
+        // engine is about to Blt it into a pool texture. Its block layout has
+        // no pixel revision the recorder can lease, so decode straight into
+        // the destination and skip the record. The destination's own upload
+        // path picks the new bytes up. Pixels written through a lock are not
+        // visible to the recorder either, which is why the Blt goes through
+        // the same write-then-publish sequence.
+        if (surface_is_compressed(src)) {
+            ddraw_before_write(dst);
+            blit(dst, d, src, sr, keys, false, 0, nullptr);
+            const uint32_t before = ddraw_surface_revision(dst->id);
+            surface_pixels_changed(dst);
+            baseline_absorb(dst, d, before);
+            com_ret(c, DD_OK);
+            return;
+        }
         // The source's pixels are about to be read.
         ++g_access_ref().blt_source;
         // And a destination key means the DESTINATION is read too, to decide
@@ -3050,6 +3199,17 @@ void Surface_BltFast(X86 *c) {
         keys.dst = true;
         keys.dst_lo = dst->ckey_dst_lo;
         keys.dst_hi = dst->ckey_dst_hi;
+    }
+    // A compressed source: decode straight into the destination; see
+    // Surface_Blt for why the recorder is skipped.
+    if (surface_is_compressed(src)) {
+        ddraw_before_write(dst);
+        blit(dst, d, src, sr, keys, false, 0, nullptr);
+        const uint32_t before = ddraw_surface_revision(dst->id);
+        surface_pixels_changed(dst);
+        baseline_absorb(dst, d, before);
+        com_ret(c, DD_OK);
+        return;
     }
     ++g_access_ref().blt_source;
     if (keys.dst)
@@ -3426,16 +3586,33 @@ void Surface_Lock(X86 *c) {
 
     // read_rect already clamped the rectangle to the surface, so this offset
     // is inside the allocation; the span is re-checked anyway because the
-    // pixel memory may have been replaced by SetSurfaceDesc.
-    uint64_t bpp_bytes = bytes_per_pixel(s->bpp);
-    uint64_t off = (uint64_t)(uint32_t)r[1] * s->pitch + (uint64_t)(uint32_t)r[0] * bpp_bytes;
-    // The locked region ends at the right edge of its last row, not at the
-    // start of the row after it: (h-1) whole rows plus w pixels. Counting a
-    // full trailing row would reject a legal rectangle that touches the
-    // bottom edge whenever its left edge is greater than zero.
-    uint64_t rows = (uint64_t)(uint32_t)(r[3] - r[1]);
-    uint64_t width_bytes = (uint64_t)(uint32_t)(r[2] - r[0]) * bpp_bytes;
-    uint64_t need = rows ? (rows - 1) * s->pitch + width_bytes : 0;
+    // pixel memory may have been replaced by SetSurfaceDesc. A compressed
+    // surface addresses 4x4 blocks, so the rectangle has to name whole
+    // blocks and the offset is measured in block rows.
+    uint64_t off = 0;
+    uint64_t need = 0;
+    if (surface_is_compressed(s)) {
+        if ((r[0] & 3) || (r[1] & 3)) {
+            com_ret(c, DDERR_INVALIDRECT);
+            return;
+        }
+        const uint32_t bx = (uint32_t)r[0] / 4u, by = (uint32_t)r[1] / 4u;
+        off = (uint64_t)by * s->pitch + (uint64_t)bx * dxdxt::block_bytes(s->fourcc);
+        const uint64_t block_rows = ((uint64_t)(uint32_t)(r[3] - r[1]) + 3u) / 4u;
+        const uint64_t block_cols = ((uint64_t)(uint32_t)(r[2] - r[0]) + 3u) / 4u;
+        need = block_rows ? (block_rows - 1) * s->pitch + block_cols * dxdxt::block_bytes(s->fourcc)
+                          : 0;
+    } else {
+        uint64_t bpp_bytes = bytes_per_pixel(s->bpp);
+        off = (uint64_t)(uint32_t)r[1] * s->pitch + (uint64_t)(uint32_t)r[0] * bpp_bytes;
+        // The locked region ends at the right edge of its last row, not at the
+        // start of the row after it: (h-1) whole rows plus w pixels. Counting a
+        // full trailing row would reject a legal rectangle that touches the
+        // bottom edge whenever its left edge is greater than zero.
+        uint64_t rows = (uint64_t)(uint32_t)(r[3] - r[1]);
+        uint64_t width_bytes = (uint64_t)(uint32_t)(r[2] - r[0]) * bpp_bytes;
+        need = rows ? (rows - 1) * s->pitch + width_bytes : 0;
+    }
     if (off + need > (uint64_t)s->pixels_bytes || !gm_fits(s->pixels, off + need)) {
         com_ret(c, DDERR_INVALIDRECT);
         return;
@@ -3451,8 +3628,12 @@ void Surface_Lock(X86 *c) {
     // What this region holds now, so Unlock can record what the guest's own
     // stores changed. EVERY accepted lock, not only the outermost: a nested
     // lock can name a different rectangle, and one taken beneath a read-only
-    // outer lock is the only record of what it wrote.
-    lock_shadow_take(s, r, arg(c, 3), p, true);
+    // outer lock is the only record of what it wrote. A compressed surface is
+    // a decode scratch buffer the guest fills itself and never presents, and
+    // its byte layout is blocks, which the pixel-diff machinery does not
+    // model; skip the shadow so a Lock cannot read past the block storage.
+    if (!surface_is_compressed(s))
+        lock_shadow_take(s, r, arg(c, 3), p, true);
     if (!(arg(c, 3) & DDLOCK_READONLY))
         s->retained_pointer = true;
     ++s->lock_count;
@@ -4393,29 +4574,37 @@ void create_surface(X86 *c, ComIface surface_iface) {
             uint32_t pf_flags = rd32(pf + DDPF_OFF_dwFlags);
             uint32_t bits = rd32(pf + DDPF_OFF_dwRGBBitCount);
             if (pf_flags & DDPF_FOURCC) {
-                // A FourCC the driver does not have is a pixel-format
-                // refusal, not a surface-type one. GetFourCCCodes reports
-                // none and EnumTextureFormats advertises none, so a caller
-                // asking for one is asking outside the advertised set and
-                // will retry with a format that was advertised.
-                // DDERR_INVALIDSURFACETYPE would instead tell it the surface
-                // caps were wrong, and it would give up.
+                // The engine creates DXT1/DXT3 surfaces itself as decode
+                // sources: LH3DVRAM loads a compressed texture into one, then
+                // Blt-decodes it into a normal 16bpp pool texture
+                // (fn_00837DF0 -> fn_00838580 -> fn_0087F6D0, and the copy
+                // path in fn_0087F6D0). Refusing the CreateSurface made every
+                // DXT texture fail: the following Blt from the null surface
+                // failed, the pool texture stayed zeroed, and an alpha-tested
+                // foliage/tree draw then discarded every fragment.
+                //
+                // A FourCC the driver does not have is still a pixel-format
+                // refusal, not a surface-type one. PVRC stays refused.
                 uint32_t fcc = rd32(pf + DDPF_OFF_dwFourCC);
-                char txt[5] = {(char)(fcc & 0xff), (char)((fcc >> 8) & 0xff),
-                               (char)((fcc >> 16) & 0xff), (char)((fcc >> 24) & 0xff), 0};
-                for (int i = 0; i < 4; i++)
-                    if (txt[i] < 0x20 || txt[i] > 0x7e)
-                        txt[i] = '.';
-                log_once("ddraw.fourcc",
-                         "ddraw: CreateSurface FourCC '%s' (%08x) is not an "
-                         "advertised pixel format: DDERR_INVALIDPIXELFORMAT",
-                         txt, fcc);
-                com_release(s);
-                com_ret(c, DDERR_INVALIDPIXELFORMAT);
-                return;
-            }
-            if (bits)
+                if (!dxdxt::is_dxt(fcc)) {
+                    char txt[5] = {(char)(fcc & 0xff), (char)((fcc >> 8) & 0xff),
+                                   (char)((fcc >> 16) & 0xff), (char)((fcc >> 24) & 0xff), 0};
+                    for (int i = 0; i < 4; i++)
+                        if (txt[i] < 0x20 || txt[i] > 0x7e)
+                            txt[i] = '.';
+                    log_once("ddraw.fourcc",
+                             "ddraw: CreateSurface FourCC '%s' (%08x) is not an "
+                             "advertised pixel format: DDERR_INVALIDPIXELFORMAT",
+                             txt, fcc);
+                    com_release(s);
+                    com_ret(c, DDERR_INVALIDPIXELFORMAT);
+                    return;
+                }
+                s->fourcc = fcc;
+                s->bpp = 0; // a compressed format reports no bit count
+            } else if (bits) {
                 s->bpp = bits;
+            }
         }
         if (flags & DDSD_ZBUFFERBITDEPTH)
             s->bpp = rd32(desc + DDSD_OFF_dwMipMapCount);
@@ -4579,6 +4768,7 @@ void DD_DuplicateSurface(X86 *c) {
     s->width = src->width;
     s->height = src->height;
     s->bpp = src->bpp;
+    s->fourcc = src->fourcc;
     s->rmask = src->rmask;
     s->gmask = src->gmask;
     s->bmask = src->bmask;

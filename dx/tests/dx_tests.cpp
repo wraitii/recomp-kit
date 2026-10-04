@@ -21,6 +21,7 @@
 #include "../video_frame.h"
 #include "../mf_media.h"
 #include "../ddraw.h"
+#include "../dxt_decode.h"
 #include "../../runtime/memory.h"
 #include "../../runtime/win32.h"
 #include "../../platform/os.h"
@@ -6675,6 +6676,167 @@ static void test_d3d7_translation() {
     CHECK_EQ(d3d7_rgb565_to_rgb888(0x001fu), 0xff0000ffu);
     // Bit replication would give 0xff210000 for 0x2000; the scale gives 0x20.
     CHECK_EQ(d3d7_rgb565_to_rgb888(0x2000u), 0xff200000u);
+}
+
+// The DXT block decoder, with known blocks and exact expected pixels. This is
+// the path that fills the engine's VRAM texture pool: LH3DVRAM Blts a DXT
+// source surface into a 16bpp pool texture.
+static void test_dxt_decode() {
+    cpu_reset();
+    dxdxt::Rgba b[16];
+
+    // DXT1, c0 = red 0xF800 > c1 = green 0x07E0, so four-colour mode. The
+    // index word 0xE4E4E4E4 walks 0,1,2,3,0,1,2,3,... across the 16 texels.
+    const uint8_t dxt1[8] = {0x00, 0xf8, 0xe0, 0x07, 0xe4, 0xe4, 0xe4, 0xe4};
+    CHECK(dxdxt::decode_block(dxt1, dxdxt::kDxt1, b));
+    CHECK_EQ(b[0].r, 255);
+    CHECK_EQ(b[0].g, 0);
+    CHECK_EQ(b[0].b, 0);
+    CHECK_EQ(b[0].a, 255);
+    CHECK_EQ(b[1].r, 0);
+    CHECK_EQ(b[1].g, 255);
+    CHECK_EQ(b[1].b, 0);
+    CHECK_EQ(b[1].a, 255);
+    CHECK_EQ(b[2].r, 170); // (2*red + green) / 3
+    CHECK_EQ(b[2].g, 85);  // (red + 2*green) / 3 is the next texel
+    CHECK_EQ(b[2].b, 0);
+    CHECK_EQ(b[2].a, 255);
+    CHECK_EQ(b[3].r, 85);
+    CHECK_EQ(b[3].g, 170);
+    CHECK_EQ(b[3].a, 255);
+
+    // DXT1 three-colour mode: c0 <= c1, so index 2 is the midpoint and index 3
+    // is transparent black. The all-2s index word picks the midpoint.
+    const uint8_t dxt1x[8] = {0x00, 0x00, 0xff, 0xff, 0xaa, 0xaa, 0xaa, 0xaa};
+    CHECK(dxdxt::decode_block(dxt1x, dxdxt::kDxt1, b));
+    CHECK_EQ(b[0].r, 127);
+    CHECK_EQ(b[0].g, 127);
+    CHECK_EQ(b[0].a, 255);
+    const uint8_t dxt1t[8] = {0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    CHECK(dxdxt::decode_block(dxt1t, dxdxt::kDxt1, b));
+    CHECK_EQ(b[0].a, 0);
+    CHECK_EQ(b[0].r, 0);
+
+    // DXT3: alpha nibbles 0..15, then a colour block whose index word is zero,
+    // so every texel is c0 = red with its own 4-bit alpha (nibble replicated).
+    const uint8_t dxt3[16] = {0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+                              0x00, 0xf8, 0xe0, 0x07, 0x00, 0x00, 0x00, 0x00};
+    CHECK(dxdxt::decode_block(dxt3, dxdxt::kDxt3, b));
+    CHECK_EQ(b[0].a, 0);
+    CHECK_EQ(b[1].a, 17); // 1 -> (1<<4)|1
+    CHECK_EQ(b[2].a, 34);
+    CHECK_EQ(b[15].a, 255);
+    CHECK_EQ(b[0].r, 255);
+    CHECK_EQ(b[15].g, 0);
+
+    // DXT5 with the shared colour block and alpha endpoints 255 > 0.
+    const uint8_t dxt5[16] = {0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                              0x00, 0xf8, 0xe0, 0x07, 0x00, 0x00, 0x00, 0x00};
+    CHECK(dxdxt::decode_block(dxt5, dxdxt::kDxt5, b));
+    CHECK_EQ(b[0].r, 255);
+    CHECK_EQ(b[0].a, 255); // index 0 = alpha0
+
+    // DXT2/DXT4 (premultiplied) are not accepted: the caller fails loudly
+    // rather than guessing the stored colour space.
+    CHECK(!dxdxt::decode_block(dxt3, 0x32545844u, b)); // 'DXT2'
+    CHECK(!dxdxt::decode_block(dxt3, 0x34545844u, b)); // 'DXT4'
+    CHECK(!dxdxt::is_dxt(0x43525650u));                // 'PVRC'
+}
+
+// A DXT1 DirectDraw surface: CreateSurface accepts the FourCC, storage is the
+// block bytes, the Lock descriptor reports the linear size (not the block
+// pitch), and a Blt decodes into an A4R4G4B4 destination.
+static void test_dxt_surface_and_blit() {
+    cpu_reset();
+    const uint8_t dd7[16] = {0xC0, 0x5E, 0xE6, 0x15, 0x9C, 0x3B, 0xD2, 0x11,
+                             0xB9, 0x2F, 0x00, 0x60, 0x97, 0x97, 0xEA, 0x5B};
+    uint32_t iid = sc(0x40), out = sc(0x60);
+    memcpy(gm_ptr(iid), dd7, sizeof(dd7));
+    CHECK_EQ(call_shim(tramp("DDRAW.dll", "DirectDrawCreateEx"), {0, out, iid, 0}), DD_OK);
+    uint32_t dd = rd32(out);
+    CHECK(dd != 0);
+    if (!dd)
+        return;
+    // No SetDisplayMode: the offscreen surfaces here carry their own pixel
+    // format, and touching the display-mode table would leak into later tests.
+
+    auto make = [&](uint32_t w, uint32_t h, bool dxt) {
+        uint32_t desc = sc(0x900);
+        gm_zero(desc, DDSD2_SIZE);
+        wr32(desc + DDSD_OFF_dwSize, DDSD2_SIZE);
+        wr32(desc + DDSD_OFF_dwFlags, DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT);
+        wr32(desc + DDSD_OFF_dwWidth, w);
+        wr32(desc + DDSD_OFF_dwHeight, h);
+        wr32(desc + DDSD_OFF_ddsCaps, DDSCAPS_TEXTURE | DDSCAPS_SYSTEMMEMORY);
+        uint32_t pf = desc + DDSD_OFF_ddpfPixelFormat;
+        wr32(pf + DDPF_OFF_dwSize, DDPF_SIZE);
+        if (dxt) {
+            wr32(pf + DDPF_OFF_dwFlags, DDPF_FOURCC);
+            wr32(pf + DDPF_OFF_dwFourCC, 0x31545844u); // 'DXT1'
+        } else {
+            wr32(pf + DDPF_OFF_dwFlags, DDPF_RGB | DDPF_ALPHAPIXELS);
+            wr32(pf + DDPF_OFF_dwRGBBitCount, 16);
+            wr32(pf + DDPF_OFF_dwRBitMask, 0x0f00);
+            wr32(pf + DDPF_OFF_dwGBitMask, 0x00f0);
+            wr32(pf + DDPF_OFF_dwBBitMask, 0x000f);
+            wr32(pf + DDPF_OFF_dwRGBAlphaBitMask, 0xf000);
+        }
+        return call_method(dd, DD_CreateSurface, {desc, sc(0x10), 0});
+    };
+
+    CHECK_EQ(make(8, 8, true), DD_OK);
+    uint32_t src = rd32(sc(0x10));
+    CHECK(src != 0);
+    ComObj *so = src ? com_this(src) : nullptr;
+    CHECK(so != nullptr);
+    if (!so)
+        return;
+    CHECK_EQ(so->fourcc, 0x31545844u);
+    CHECK_EQ(so->bpp, 0u);
+    CHECK_EQ(so->pitch, 16u);        // 2 block columns * 8 bytes
+    CHECK_EQ(so->pixels_bytes, 32u); // 16 * 2 block rows
+
+    // Lock whole surface, write the known block, unlock.
+    uint32_t ldesc = sc(0xa00);
+    gm_zero(ldesc, DDSD2_SIZE);
+    wr32(ldesc + DDSD_OFF_dwSize, DDSD2_SIZE);
+    CHECK_EQ(call_method(src, S_Lock, {0, ldesc, DDLOCK_WAIT, 0}), DD_OK);
+    CHECK((rd32(ldesc + DDSD_OFF_dwFlags) & DDSD_LINEARSIZE) != 0);
+    CHECK_EQ(rd32(ldesc + DDSD_OFF_lPitch), 32u); // linear size, not 16
+    uint32_t pix = rd32(ldesc + DDSD_OFF_lpSurface);
+    CHECK(pix != 0);
+    const uint8_t block[8] = {0x00, 0xf8, 0xe0, 0x07, 0xe4, 0xe4, 0xe4, 0xe4};
+    for (int i = 0; i < 8; ++i)
+        wr8(pix + (uint32_t)i, block[i]);
+    CHECK_EQ(call_method(src, S_Unlock, {0}), DD_OK);
+
+    // An 8x8 A4R4G4B4 destination; Blt decodes the first 4x4 block into it.
+    CHECK_EQ(make(8, 8, false), DD_OK);
+    uint32_t dst = rd32(sc(0x10));
+    CHECK(dst != 0);
+    // Blt's `this` is the DESTINATION and arg1 is the source, so the
+    // A4R4G4B4 surface is the receiver and the DXT surface is decoded into it.
+    CHECK_EQ(call_method(dst, S_Blt, {0, src, 0, DDBLT_WAIT, 0}), DD_OK);
+    ComObj *dobj = dst ? com_this(dst) : nullptr;
+    CHECK(dobj != nullptr);
+    if (!dobj)
+        return;
+    uint32_t ddesc = sc(0xa80);
+    gm_zero(ddesc, DDSD2_SIZE);
+    wr32(ddesc + DDSD_OFF_dwSize, DDSD2_SIZE);
+    CHECK_EQ(call_method(dst, S_Lock, {0, ddesc, DDLOCK_WAIT, 0}), DD_OK);
+    uint32_t dpix = rd32(ddesc + DDSD_OFF_lpSurface);
+    auto px = [&](uint32_t x, uint32_t y) {
+        return (uint32_t)rd16(dpix + y * dobj->pitch + x * 2u);
+    };
+    CHECK_EQ(px(0, 0), 0xff00u); // a=15, r=15
+    CHECK_EQ(px(1, 0), 0xf0f0u); // a=15, g=15
+    CHECK_EQ(px(2, 0), 0xfa50u); // a=15, r=10, g=5
+    CHECK_EQ(px(3, 0), 0xf5a0u); // a=15, r=5, g=10
+    CHECK_EQ(call_method(dst, S_Unlock, {0}), DD_OK);
+    call_method(src, S_Release, {});
+    call_method(dst, S_Release, {});
+    call_method(dd, DD_Release, {});
 }
 
 // The trace's pure helpers: FVF vertex decoding and the frame-range grammar.
@@ -15069,6 +15231,8 @@ int main() {
         {"IDirectDraw7 object model", test_ddraw7_object_model},
         {"Direct3D7 stage 2a", test_d3d7_pipeline},
         {"Direct3D7 stage 2b translation", test_d3d7_translation},
+        {"DXT block decode", test_dxt_decode},
+        {"DXT surface and Blt", test_dxt_surface_and_blit},
         {"Direct3D7 trace helpers", test_d3d7_trace_helpers},
         {"QueryInterface", test_query_interface},
         {"display modes", test_enum_display_modes},
