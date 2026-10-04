@@ -48,6 +48,10 @@ HOST_DEFAULT void host_set_render_resolution(int, int) {}
 
 HOST_DEFAULT void host_d3d_begin_scene() {}
 HOST_DEFAULT void host_d3d_end_scene() {}
+HOST_DEFAULT void host_d3d7_begin_scene() {}
+HOST_DEFAULT void host_d3d7_draw() {}
+HOST_DEFAULT void host_d3d7_clear() {}
+HOST_DEFAULT void host_d3d7_texture() {}
 HOST_DEFAULT void host_d3d_draw(const HostD3DDrawSnapshot *) {}
 HOST_DEFAULT void host_d3d_clear(uint32_t, const int32_t *, uint32_t, uint32_t, float) {}
 HOST_DEFAULT void host_d3d_set_render_target(const HostD3DSurface *) {}

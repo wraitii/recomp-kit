@@ -86,6 +86,9 @@ struct BinkPlayer {
     bool paused = false;
     bool eof = false, flushed = false, failed = false;
     bool have_frame = false, audio_started = false, audio_unavailable = false;
+    // BinkSetSoundOnOff: the guest movie player enables/disables the stream's
+    // audio. Kept here because audio is host-rendered, not mixed by the guest.
+    bool sound_on = true;
 
     ~BinkPlayer() {
         if (channel >= 0) {
@@ -383,7 +386,7 @@ void BinkOpen(X86 *c) {
 // Start with PCM, convert the shared channel to a stream, then append until
 // a second is queued. Refused chunks stay pending for the next service call.
 void service_audio(uint32_t rec, BinkPlayer &p) {
-    if (p.paused || !p.audio || p.failed || p.audio_unavailable)
+    if (p.paused || !p.audio || p.failed || p.audio_unavailable || !p.sound_on)
         return;
     uint32_t block = (uint32_t)p.audio->ch_layout.nb_channels * 2;
     uint32_t ahead = (uint32_t)p.audio->sample_rate * block;
@@ -676,6 +679,28 @@ void BinkClose(X86 *c) {
         heap_free(rec);
     set_eax(c, 0);
 }
+
+// _BinkSetSoundOnOff@8(HBINK, int). The guest calls it around the pre-intro to
+// mute/unmute the movie's audio stream. The real SDK silences the Bink audio
+// track; here the decoder's audio is host-rendered (a deferred fidelity gap),
+// so the flag only gates service_audio and an active voice is stopped when the
+// guest mutes. SHIM(temporary): no Bink audio is mixed into the guest mixer.
+void BinkSetSoundOnOff(X86 *c) {
+    uint32_t rec = arg(c, 0), on = arg(c, 1);
+    if (BinkPlayer *p = player_for(rec)) {
+        p->sound_on = on != 0;
+        if (!p->sound_on && p->audio_started && p->channel >= 0) {
+            host_audio_stop(p->channel);
+            dx_free_audio_channel(p->channel);
+            p->channel = -1;
+            p->audio_started = false;
+        }
+    }
+    log_once("bink.soundonoff",
+             "SHIM(temporary): _BinkSetSoundOnOff@8 stores the flag and gates the host "
+             "audio service; Bink audio is not mixed into the guest mixer");
+    set_eax(c, 0);
+}
 #else
 // A finished record makes a guest continue past cinematics on builds without
 // FFmpeg. It is a successful skip, so GetError remains an empty string.
@@ -745,6 +770,13 @@ void BinkService(X86 *c) {
 void BinkCopyToBuffer(X86 *c) {
     ret0(c);
 }
+// No decoder to silence; the record is already finished.
+void BinkSetSoundOnOff(X86 *c) {
+    log_once("bink.soundonoff",
+             "SHIM(temporary): _BinkSetSoundOnOff@8 stores the flag and gates the host "
+             "audio service; Bink audio is not mixed into the guest mixer");
+    ret0(c);
+}
 #endif
 
 void BinkDDSurfaceType(X86 *c) {
@@ -781,6 +813,7 @@ const ImportShim g_video_shims[] = {
     BINK(Open, 8, BinkOpen),
     BINK(OpenMiles, 4, ret0),
     BINK(SetSoundSystem, 8, ret1),
+    BINK(SetSoundOnOff, 8, BinkSetSoundOnOff),
     BINK(DDSurfaceType, 4, BinkDDSurfaceType),
     BINK(DoFrame, 4, BinkDoFrame),
     BINK(NextFrame, 4, BinkNextFrame),

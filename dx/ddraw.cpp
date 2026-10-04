@@ -901,6 +901,11 @@ const ComObj *ddraw_effective_palette(const ComObj *s) {
 void surface_pixels_changed(ComObj *s) {
     if (!s)
         return;
+    // A draw that samples these bytes (the D3D8 and D3D7 texture paths both
+    // key their upload cache on it) must see the new content. The generation
+    // is monotonic and shared with the D3D8 level surfaces; a DirectDraw write
+    // to one of those is equally a content change.
+    ++s->d3d8_content_generation;
     // The content is now different from whatever any record referred to.
     ddraw_after_write(s);
     if (s->is_primary) {

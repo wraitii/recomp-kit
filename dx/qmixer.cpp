@@ -47,6 +47,19 @@ namespace {
 const uint32_t QS_OK = 0;
 const uint32_t QS_ERROR = 1;
 
+// QMixer error values. The real library's numeric codes are NOT in the
+// evidence: only the text path is (LHaudiodllR 0x10202f50/0x10202fc0 call
+// GetLastError then GetErrorText(code, buf, 0x3f6)). These values are invented
+// so the two calls can be implemented without guessing a real numbering; they
+// are distinct and nonzero, and the 'QM' high word keeps them out of the
+// Windows error space. SHIM(temporary), see docs/shims.md.
+const uint32_t QSERR_NO_SESSION = 0x514d0001u;
+const uint32_t QSERR_BAD_WAVE_RECORD = 0x514d0002u;
+const uint32_t QSERR_BAD_FORMAT = 0x514d0003u;
+const uint32_t QSERR_BAD_DATA = 0x514d0004u;
+const uint32_t QSERR_NO_CHANNEL = 0x514d0005u;
+const uint32_t QSERR_PLAY_FAILED = 0x514d0006u;
+
 // A session. The game creates exactly one, but the handle space is real.
 struct Session {
     uint32_t handle = 0;
@@ -55,6 +68,10 @@ struct Session {
     uint32_t flags = 0;
     uint32_t options = 0;
     bool alive = false;
+    // The last failure this session reported. GetLastError reads it and
+    // GetErrorText turns it into a string. Success does not clear it, matching
+    // the usual GetLastError contract.
+    uint32_t last_error = QS_OK;
 };
 
 // A wave: PCM located in guest memory, plus its format.
@@ -311,11 +328,16 @@ void read_vec3(uint32_t a, float out[3]) {
 // plays nothing is indistinguishable from working audio to everything
 // upstream. The game already handles the failure, returning -1 from its own
 // loader at 0x56f720.
-bool read_wave_record(uint32_t rec, uint32_t flags, Wave *w) {
+bool read_wave_record(uint32_t rec, uint32_t flags, Wave *w, uint32_t *error) {
+    const auto fail = [&](uint32_t code) {
+        if (error)
+            *error = code;
+        return false;
+    };
     if (!rec || !gm_valid(rec, QSWAVEMIXOPENWAVEDATA_SIZE)) {
         log_once("qmixer.rec", "qmixer: OpenWaveEx record at %08x is not 20 readable bytes", rec);
         ++counters().open_wave_refused_rec;
-        return false;
+        return fail(QSERR_BAD_WAVE_RECORD);
     }
 
     // Field 0 is the format, written at every call site.
@@ -323,7 +345,7 @@ bool read_wave_record(uint32_t rec, uint32_t flags, Wave *w) {
     if (!fmt || !gm_valid(fmt, 16)) {
         log_once("qmixer.fmt", "qmixer: OpenWaveEx format pointer %08x is not readable", fmt);
         ++counters().open_wave_refused_fmt;
-        return false;
+        return fail(QSERR_BAD_FORMAT);
     }
     uint16_t tag = rd16(fmt + WFX_OFF_wFormatTag);
     if (tag != WAVE_FORMAT_PCM) {
@@ -332,7 +354,7 @@ bool read_wave_record(uint32_t rec, uint32_t flags, Wave *w) {
                  "rather than playing the bytes as if it were",
                  tag);
         ++counters().open_wave_refused_fmt;
-        return false;
+        return fail(QSERR_BAD_FORMAT);
     }
     w->channels = rd16(fmt + WFX_OFF_nChannels);
     w->rate = rd32(fmt + WFX_OFF_nSamplesPerSec);
@@ -343,7 +365,7 @@ bool read_wave_record(uint32_t rec, uint32_t flags, Wave *w) {
                  "is not something this mixer can play",
                  w->rate, w->channels, w->bits);
         ++counters().open_wave_refused_fmt;
-        return false;
+        return fail(QSERR_BAD_FORMAT);
     }
 
     // The streaming form carries a callback instead of the samples: field 1 is
@@ -374,7 +396,7 @@ bool read_wave_record(uint32_t rec, uint32_t flags, Wave *w) {
             log_once("qmixer.streamcb", "qmixer: OpenWaveEx asked for a streamed wave with no "
                                         "callback; there is no way to obtain its samples");
             ++counters().open_wave_refused_stream;
-            return false;
+            return fail(QSERR_BAD_WAVE_RECORD);
         }
         if (!chunk || chunk > (1u << 22)) {
             log_once("qmixer.streamlen",
@@ -382,7 +404,7 @@ bool read_wave_record(uint32_t rec, uint32_t flags, Wave *w) {
                      "which is not a size this mixer will allocate",
                      chunk);
             ++counters().open_wave_refused_stream;
-            return false;
+            return fail(QSERR_BAD_FORMAT);
         }
         // Whole frames only: half a sample frame in a chunk would put every
         // later chunk out of phase with the channel interleave.
@@ -390,7 +412,7 @@ bool read_wave_record(uint32_t rec, uint32_t flags, Wave *w) {
         if (align)
             chunk -= chunk % align;
         if (!chunk)
-            return false;
+            return fail(QSERR_BAD_FORMAT);
         w->streamed = true;
         w->callback = cb;
         w->context = ctx;
@@ -401,7 +423,7 @@ bool read_wave_record(uint32_t rec, uint32_t flags, Wave *w) {
             log_once("qmixer.streambuf", "qmixer: no guest memory for a %u-byte streaming buffer",
                      w->buffer_bytes);
             ++counters().open_wave_refused_stream;
-            return false;
+            return fail(QSERR_BAD_DATA);
         }
         w->pcm = w->buffer;
         w->bytes = 0; // nothing pulled yet
@@ -416,7 +438,7 @@ bool read_wave_record(uint32_t rec, uint32_t flags, Wave *w) {
                  "inside guest memory",
                  data, bytes);
         ++counters().open_wave_refused_data;
-        return false;
+        return fail(QSERR_BAD_DATA);
     }
     w->pcm = data;
     w->bytes = bytes;
@@ -948,10 +970,14 @@ void QSWaveMixOpenWaveEx(X86 *c) {
         set_eax(c, 0);
         return;
     }
+    // The error value is read back through the session handle, so a refusal
+    // below sets it even though the guest handles the zero return.
 
     Wave w;
     w.alive = true;
-    if (!read_wave_record(data, flags, &w)) {
+    uint32_t error = QS_OK;
+    if (!read_wave_record(data, flags, &w, &error)) {
+        s->last_error = error;
         set_eax(c, 0); // the documented failure; the game handles it
         return;
     }
@@ -1029,6 +1055,7 @@ void QSWaveMixPlayEx(X86 *c) {
     if (!w) {
         ++counters().drop_no_wave;
         drop_reason("no such wave", idx, arg(c, 3));
+        s->last_error = QSERR_PLAY_FAILED;
         set_eax(c, QS_ERROR);
         return;
     }
@@ -1036,6 +1063,7 @@ void QSWaveMixPlayEx(X86 *c) {
     if (!ch) {
         ++counters().drop_no_channel;
         drop_reason("channel out of range", idx, MAX_CHANNELS);
+        s->last_error = QSERR_NO_CHANNEL;
         set_eax(c, QS_ERROR);
         return;
     }
@@ -1253,6 +1281,37 @@ void QSWaveMixEnableChannel(X86 *c) {
     set_eax(c, QS_OK);
 }
 
+// QSWaveMixGetChannelParams(hMixer, channel, params*). Evidence is the guest's
+// own use (LHaudiodllR 0x10215820, 0x1020df60, 0x1020dd50, 0x10211420): it sets
+// params[0] = 0xdc (a size, 55 dwords) before the call and then reads only the
+// dword at +4, testing the same 0x20000/0x10000/0x1000000/0x2000000 bits that it
+// passes to QSWaveMixConfigureChannel. So +4 returns the flags last configured on
+// the channel. The rest of the 0xdc-byte layout is NOT established: it is zeroed,
+// not guessed, and nothing in the guest reads it.
+// SHIM(temporary): only the flags at +4 are real; the remaining 0xd8 bytes of
+// the documented 0xdc-byte structure are zero, not a reconstructed channel
+// description. A real implementation needs the QMixer channel-parameter layout.
+void QSWaveMixGetChannelParams(X86 *c) {
+    QTRACE("qmixer: QSWaveMixGetChannelParams(%08x, %u, %08x)", arg(c, 0), arg(c, 1), arg(c, 2));
+    Session *s = session_for(arg(c, 0));
+    Channel *ch = channel_for(arg(c, 1), false);
+    uint32_t out = arg(c, 2);
+    if (!s || !out) {
+        set_eax(c, QS_ERROR);
+        return;
+    }
+    uint32_t size = rd32(out);
+    if (size < 8 || size > 0xdc)
+        size = 0xdc; // the guest always passes 0xdc; do not write past it
+    for (uint32_t off = 4; off + 4 <= size; off += 4)
+        wr32(out + off, 0);
+    wr32(out + 4, ch ? ch->config : 0);
+    log_once("qmixer.getparams",
+             "SHIM(temporary): GetChannelParams reports only the configured flags at +4; the "
+             "rest of the 0xdc-byte structure is zero (layout unverified)");
+    set_eax(c, QS_OK);
+}
+
 void QSWaveMixConfigureChannel(X86 *c) {
     QTRACE("qmixer: QSWaveMixConfigureChannel(%08x, %u, %08x, %08x, %08x, %08x)", arg(c, 0),
            arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5));
@@ -1325,6 +1384,90 @@ void QSWaveMixSetPosition(X86 *c) {
     }
     // (hMix, iChannel, dwFlags, lpPosition): the game passes a vector pointer.
     read_vec3(arg(c, 3), ch->position);
+    set_eax(c, QS_OK);
+}
+
+// QSWaveMixSetPolarPosition(hMix, iChannel, dwFlags, lpPolar). Guest call site
+// LHaudiodllR 0x1020f3f0: pushes (hMix, iChannel, 0x20, &zeroedVec). The
+// channel loop treats it as the polar-coordinate counterpart of SetPosition,
+// so the vector is stored on the channel the same way. SHIM(temporary): the
+// direction is stored, not spatialized; that matches SetPosition and is not a
+// claim about the 0x20 flag word.
+void QSWaveMixSetPolarPosition(X86 *c) {
+    QTRACE("qmixer: QSWaveMixSetPolarPosition(%08x, %u, %08x, %08x, %08x, %08x)", arg(c, 0),
+           arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5));
+    ++counters().set_position;
+    Session *s = session_for(arg(c, 0));
+    Channel *ch = channel_for(arg(c, 1), true);
+    if (!s || !ch) {
+        set_eax(c, QS_ERROR);
+        return;
+    }
+    read_vec3(arg(c, 3), ch->position);
+    log_once("qmixer.polar",
+             "SHIM(temporary): QSWaveMixSetPolarPosition stores the channel vector; it is not "
+             "spatialized and the 0x20 flag word is not interpreted");
+    set_eax(c, QS_OK);
+}
+
+// QSWaveMixIsChannelDone(hMix, iChannel). Guest call sites LHaudiodllR
+// 0x1020ec5a and 0x1020f6c5 push (hMix, iChannel) and branch on the answer to
+// decide whether to flush. Nonzero means there is nothing left to play.
+void QSWaveMixIsChannelDone(X86 *c) {
+    QTRACE("qmixer: QSWaveMixIsChannelDone(%08x, %u, %08x, %08x, %08x, %08x)", arg(c, 0), arg(c, 1),
+           arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5));
+    Session *s = session_for(arg(c, 0));
+    Channel *ch = channel_for(arg(c, 1), false);
+    log_once("qmixer.isdone",
+             "SHIM(temporary): QSWaveMixIsChannelDone answers from the front-end 'playing' flag, "
+             "not from the host voice");
+    set_eax(c, (!s || !ch || !ch->playing) ? 1u : 0u);
+}
+
+// QSWaveMixFlushChannel(hMix, iChannel, dwFlags). Guest call sites
+// LHaudiodllR 0x1020ec77 and 0x1020f6e2 push (hMix, iChannel, 0), after
+// IsChannelDone, to release a finished sound's channel. The real mixer resets
+// the channel; this stops the host voice and clears the stream state, which is
+// the same reset stop_channel performs.
+void QSWaveMixFlushChannel(X86 *c) {
+    QTRACE("qmixer: QSWaveMixFlushChannel(%08x, %u, %08x, %08x, %08x, %08x)", arg(c, 0), arg(c, 1),
+           arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5));
+    Session *s = session_for(arg(c, 0));
+    Channel *ch = channel_for(arg(c, 1), true);
+    if (!s || !ch) {
+        set_eax(c, QS_ERROR);
+        return;
+    }
+    stop_channel(ch);
+    log_once("qmixer.flush",
+             "SHIM(temporary): QSWaveMixFlushChannel is modelled as stop_channel; whether the "
+             "real mixer also frees the channel's wave association is unverified");
+    set_eax(c, QS_OK);
+}
+
+// QSWaveMixGetPlayPosition(hMix, iChannel, lpPlayPos, lpWritePos, dwFlags).
+// Guest call site LHaudiodllR 0x1020f385 pushes five words (hMix, iChannel,
+// two guest output pointers, flag 1). The host mix is rendered offline and its
+// cursor is not reported back, so the two output dwords are zeroed to keep the
+// guest from reading uninitialised memory. SHIM(temporary): the play cursor is
+// not reconstructed; a real implementation reads the host voice position.
+void QSWaveMixGetPlayPosition(X86 *c) {
+    QTRACE("qmixer: QSWaveMixGetPlayPosition(%08x, %u, %08x, %08x, %08x, %08x)", arg(c, 0),
+           arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5));
+    Session *s = session_for(arg(c, 0));
+    Channel *ch = channel_for(arg(c, 1), true);
+    if (!s || !ch) {
+        set_eax(c, QS_ERROR);
+        return;
+    }
+    uint32_t a = arg(c, 2), b = arg(c, 3);
+    if (a && gm_valid(a, 4))
+        wr32(a, 0);
+    if (b && gm_valid(b, 4))
+        wr32(b, 0);
+    log_once("qmixer.playpos",
+             "SHIM(temporary): QSWaveMixGetPlayPosition zeroes the two output positions; the "
+             "host play cursor is not reported");
     set_eax(c, QS_OK);
 }
 
@@ -1456,7 +1599,73 @@ void QSWaveMixSetSpeakerPlacement(X86 *c) {
     set_eax(c, QS_OK);
 }
 
+// QSWaveMixGetLastError(hMix): the error the session last reported. Evidence:
+// LHaudiodllR 0x10202f50 and 0x10202fc0 are the only callers; both push one
+// word (the mixer handle) and pass the result straight to GetErrorText as its
+// code argument. The returned values here are invented (see QSERR_* above).
+void QSWaveMixGetLastError(X86 *c) {
+    QTRACE("qmixer: QSWaveMixGetLastError(%08x, %08x, %08x, %08x, %08x, %08x)", arg(c, 0),
+           arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5));
+    Session *s = session_for(arg(c, 0));
+    set_eax(c, s ? s->last_error : QSERR_NO_SESSION);
+}
+
+// QSWaveMixGetErrorText(code, lpBuffer, cchBuffer). Evidence: LHaudiodllR
+// 0x10202f83 (`PUSH 0x3f6; PUSH buf(0x10242b78); PUSH code; CALL`) and
+// 0x10202fef (same shape, arg0 moved from the stack), so three args with the
+// code first and the size last. Writes a NUL-terminated message into the guest
+// buffer and returns the characters written. The code values are the invented
+// QSERR_* ones; the text is ours, not the real library's wording.
+void QSWaveMixGetErrorText(X86 *c) {
+    QTRACE("qmixer: QSWaveMixGetErrorText(%08x, %08x, %08x, %08x, %08x, %08x)", arg(c, 0),
+           arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5));
+    uint32_t code = arg(c, 0), buf = arg(c, 1), size = arg(c, 2);
+    const char *text;
+    switch (code) {
+    case QS_OK:
+        text = "No error";
+        break;
+    case QSERR_NO_SESSION:
+        text = "No mixer session";
+        break;
+    case QSERR_BAD_WAVE_RECORD:
+        text = "Invalid wave record";
+        break;
+    case QSERR_BAD_FORMAT:
+        text = "Unsupported wave format";
+        break;
+    case QSERR_BAD_DATA:
+        text = "Wave data is not readable";
+        break;
+    case QSERR_NO_CHANNEL:
+        text = "No such channel";
+        break;
+    case QSERR_PLAY_FAILED:
+        text = "The wave could not be played";
+        break;
+    default:
+        text = "Unknown QMixer error";
+        break;
+    }
+    if (!buf || !size || !gm_valid(buf, size)) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t n = 0;
+    while (n + 1 < size && text[n]) {
+        wr8(buf + n, (uint8_t)text[n]);
+        ++n;
+    }
+    wr8(buf + n, 0);
+    log_once("qmixer.errortext",
+             "SHIM(temporary): QMixer error codes/text are invented (QM prefix); only the "
+             "call shape is evidenced");
+    set_eax(c, n);
+}
+
 const ImportShim g_qmixer_shims[] = {
+    {"QMIXER.dll", "QSWaveMixGetLastError", 1, QSWaveMixGetLastError},
+    {"QMIXER.dll", "QSWaveMixGetErrorText", 3, QSWaveMixGetErrorText},
     {"QMIXER.dll", "QSWaveMixSetSpeakerPlacement", 2, QSWaveMixSetSpeakerPlacement},
     {"QMIXER.dll", "QSWaveMixSetSpeedOfSound", 3, QSWaveMixSetSpeedOfSound},
     {"QMIXER.dll", "QSWaveMixSetPanRate", 4, QSWaveMixSetPanRate},
@@ -1474,6 +1683,11 @@ const ImportShim g_qmixer_shims[] = {
     {"QMIXER.dll", "QSWaveMixPauseChannel", 3, QSWaveMixPauseChannel},
     {"QMIXER.dll", "QSWaveMixStopChannel", 3, QSWaveMixStopChannel},
     {"QMIXER.dll", "QSWaveMixConfigureChannel", 5, QSWaveMixConfigureChannel},
+    {"QMIXER.dll", "QSWaveMixGetChannelParams", 3, QSWaveMixGetChannelParams},
+    {"QMIXER.dll", "QSWaveMixSetPolarPosition", 4, QSWaveMixSetPolarPosition},
+    {"QMIXER.dll", "QSWaveMixIsChannelDone", 2, QSWaveMixIsChannelDone},
+    {"QMIXER.dll", "QSWaveMixFlushChannel", 3, QSWaveMixFlushChannel},
+    {"QMIXER.dll", "QSWaveMixGetPlayPosition", 5, QSWaveMixGetPlayPosition},
     {"QMIXER.dll", "QSWaveMixEnableChannel", 4, QSWaveMixEnableChannel},
     {"QMIXER.dll", "QSWaveMixOpenWaveEx", 3, QSWaveMixOpenWaveEx},
     {"QMIXER.dll", "QSWaveMixFreeWave", 2, QSWaveMixFreeWave},

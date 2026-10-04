@@ -23,6 +23,7 @@
 #include "ddraw.h"
 #include "dx.h"
 #include "dxtypes.h"
+#include "host_api.h"
 #include "../runtime/guest.h"
 #include "../runtime/memory.h"
 
@@ -571,6 +572,152 @@ void d3d7_writeback(ComObj *dev) {
 #endif
 }
 
+// ---------------------------------------------------------------- textures
+// A bound D3D7 texture is a guest DirectDraw surface whose pixels stay
+// authoritative. The Rust renderer samples linear RGBA8, so the 16bpp formats
+// the engine creates are expanded to A8R8G8B8 at this upload point only.
+// DIVERGENCE(original): the original D3D7 device sampled the guest's native
+// R5G6B5/A1R5G5B5/A4R4G4B4 texels in the sampler; the guest bytes are still
+// what is stored and locked, and the expansion happens solely on the way into
+// the host texture. DXT/undecoded layouts have no entry and stop by name.
+enum D3d7TexFormat {
+    D7TEX_ARGB8888,
+    D7TEX_R5G6B5,
+    D7TEX_A1R5G5B5,
+    D7TEX_A4R4G4B4,
+    D7TEX_NONE,
+};
+
+D3d7TexFormat d3d7_classify_texture(const ComObj *s) {
+    if (!s || !s->pixels)
+        return D7TEX_NONE;
+    if (s->bpp == 32)
+        return D7TEX_ARGB8888;
+    if (s->bpp != 16)
+        return D7TEX_NONE;
+    if (s->rmask == 0xf800 && s->gmask == 0x07e0 && s->bmask == 0x001f)
+        return D7TEX_R5G6B5;
+    if (s->rmask == 0x7c00 && s->gmask == 0x03e0 && s->bmask == 0x001f)
+        return D7TEX_A1R5G5B5;
+    if (s->rmask == 0x0f00 && s->gmask == 0x00f0 && s->bmask == 0x000f)
+        return D7TEX_A4R4G4B4;
+    return D7TEX_NONE;
+}
+
+// D3D8's channel expansion (bit replication), matching the renderer's
+// ColorFormat decoder so both sides agree in the middle of the range.
+uint8_t d3d7_expand_channel(uint32_t value, uint32_t bits) {
+    switch (bits) {
+    case 1:
+        return value ? 0xff : 0x00;
+    case 4:
+        return (uint8_t)((value << 4) | value);
+    case 5:
+        return (uint8_t)((value << 3) | (value >> 2));
+    default:
+        return (uint8_t)((value << 2) | (value >> 4)); // 6 bits
+    }
+}
+
+// Expand a surface into the tightly packed little-endian A8R8G8B8 block the
+// renderer uploads (`B,G,R,A`). Returns false for a layout without a decoder.
+bool d3d7_convert_texture(const ComObj *tex, std::vector<uint8_t> &out) {
+    const D3d7TexFormat fmt = d3d7_classify_texture(tex);
+    out.clear();
+    const uint32_t w = tex->width, h = tex->height;
+    if (fmt == D7TEX_NONE || !w || !h)
+        return false;
+    out.resize((size_t)w * h * 4);
+    for (uint32_t y = 0; y < h; ++y) {
+        const uint32_t row = tex->pixels + (uint32_t)((size_t)y * tex->pitch);
+        uint8_t *dst = out.data() + (size_t)y * w * 4;
+        for (uint32_t x = 0; x < w; ++x) {
+            uint32_t r, g, b, a;
+            if (fmt == D7TEX_ARGB8888) {
+                const uint32_t px = rd32(row + x * 4);
+                b = px & 0xff;
+                g = (px >> 8) & 0xff;
+                r = (px >> 16) & 0xff;
+                a = (px >> 24) & 0xff;
+            } else {
+                const uint32_t t = rd16(row + x * 2);
+                if (fmt == D7TEX_R5G6B5) {
+                    r = d3d7_expand_channel((t >> 11) & 0x1f, 5);
+                    g = d3d7_expand_channel((t >> 5) & 0x3f, 6);
+                    b = d3d7_expand_channel(t & 0x1f, 5);
+                    a = 0xff;
+                } else if (fmt == D7TEX_A1R5G5B5) {
+                    a = tex->amask ? d3d7_expand_channel((t >> 15) & 0x1, 1) : 0xff;
+                    r = d3d7_expand_channel((t >> 10) & 0x1f, 5);
+                    g = d3d7_expand_channel((t >> 5) & 0x1f, 5);
+                    b = d3d7_expand_channel(t & 0x1f, 5);
+                } else { // A4R4G4B4
+                    a = d3d7_expand_channel((t >> 12) & 0xf, 4);
+                    r = d3d7_expand_channel((t >> 8) & 0xf, 4);
+                    g = d3d7_expand_channel((t >> 4) & 0xf, 4);
+                    b = d3d7_expand_channel(t & 0xf, 4);
+                }
+            }
+            dst[x * 4 + 0] = (uint8_t)b;
+            dst[x * 4 + 1] = (uint8_t)g;
+            dst[x * 4 + 2] = (uint8_t)r;
+            dst[x * 4 + 3] = (uint8_t)a;
+        }
+    }
+    return true;
+}
+
+// Upload the stage's bound surface to the host, or unbind the stage. Called by
+// SetTexture and again before every draw, so a surface written through a Lock,
+// Blt or BltFast after SetTexture is re-uploaded. The content generation is
+// bumped by ddraw.cpp's surface_pixels_changed; a lock still open at draw time
+// forces the upload instead of trusting it.
+void d3d7_sync_texture(ComObj *dev, uint32_t stage) {
+#ifdef RECOMP_D3D8_WGPU
+    if (!dev || !dev->d3d7_host || stage >= 8)
+        return;
+    ComObj *tex = com_get(dev->d3d7->texture[stage]);
+    D3d8Error err{};
+    if (!tex || tex->kind != K_SURFACE || !tex->pixels || !tex->width || !tex->height) {
+        host_ok(d3d8_device_set_texture((D3d8Device *)dev->d3d7_host, stage, 0, 0, 0, 0, 0, 0, 0,
+                                        nullptr, 0, &err),
+                err, "SetTexture");
+        return;
+    }
+    // Reuse the previous conversion for this stage while the surface is the same
+    // object at the same content generation and not locked; draws repeat this
+    // call constantly and the expansion is the expensive part.
+    struct StageCache {
+        uint32_t id = 0;
+        uint64_t generation = 0;
+        std::vector<uint8_t> bytes;
+    };
+    static StageCache cache[8];
+    StageCache &sc = cache[stage];
+    std::vector<uint8_t> &converted = sc.bytes;
+    const bool fresh = sc.id == tex->id && sc.generation == tex->d3d8_content_generation &&
+                       tex->lock_count == 0 && !converted.empty();
+    if (!fresh && !d3d7_convert_texture(tex, converted)) {
+        LOGW("d3d7: SetTexture stage %u surface %ux%u bpp=%u masks=%08x/%08x/%08x has no decoded "
+             "format (DXT and other compressed layouts are deferred); stopping",
+             stage, tex->width, tex->height, tex->bpp, tex->rmask, tex->gmask, tex->bmask);
+        fflush(stderr);
+        abort();
+    }
+    sc.id = tex->lock_count == 0 ? tex->id : 0;
+    sc.generation = tex->d3d8_content_generation;
+    const uint32_t dirty = tex->lock_count > 0 ? 1u : 0u;
+    host_ok(d3d8_device_set_texture((D3d8Device *)dev->d3d7_host, stage, tex->id, 0,
+                                    tex->d3d8_content_generation, dirty, D3D8FMT_A8R8G8B8,
+                                    tex->width, tex->height, converted.data(),
+                                    (uint32_t)converted.size(), &err),
+            err, "SetTexture");
+#else
+    (void)dev;
+    (void)stage;
+#endif
+}
+
 // ---------------------------------------------------------------- device caps
 // Fills a D3DDEVICEDESC7. "Host truth" means it follows from what the host
 // really is; "chosen" means the value is a reasonable stand-in the renderer
@@ -819,6 +966,16 @@ void Device7_BeginScene(X86 *c) {
         return;
     }
     dev->d3d7->in_scene = true;
+    host_d3d7_begin_scene();
+#ifdef RECOMP_D3D8_WGPU
+    // The Rust draw path requires an open scene. The host exists from the
+    // first Clear onward; a scene opened before that is only recorded (the
+    // draws that need it come after the host exists).
+    if (dev->d3d7_host) {
+        D3d8Error err{};
+        host_ok(d3d8_device_begin_scene((D3d8Device *)dev->d3d7_host, &err), err, "BeginScene");
+    }
+#endif
     com_ret(c, D3D_OK_);
 }
 
@@ -833,6 +990,12 @@ void Device7_EndScene(X86 *c) {
         return;
     }
     dev->d3d7->in_scene = false;
+#ifdef RECOMP_D3D8_WGPU
+    if (dev->d3d7_host) {
+        D3d8Error err{};
+        host_ok(d3d8_device_end_scene((D3d8Device *)dev->d3d7_host, &err), err, "EndScene");
+    }
+#endif
     com_ret(c, D3D_OK_);
 }
 
@@ -1045,6 +1208,11 @@ void Device7_SetTexture(X86 *c) {
     if (ComObj *old = com_get(dev->d3d7->texture[stage]))
         com_release(old);
     dev->d3d7->texture[stage] = tex ? tex->id : 0;
+    // Forward the bind now if the host exists; draws re-sync anyway so a
+    // surface written after this call is still current.
+    d3d7_sync_texture(dev, stage);
+    if (tex)
+        host_d3d7_texture();
     com_ret(c, D3D_OK_);
 }
 
@@ -1162,14 +1330,17 @@ void Device7_Clear(X86 *c) {
         D3d8Error err{};
         int32_t status =
             d3d8_device_clear((D3d8Device *)dev->d3d7_host, 0, flags, color, z, stencil, &err);
-        if (host_ok(status, err, "Clear"))
+        if (host_ok(status, err, "Clear")) {
+            host_d3d7_clear();
             com_ret(c, D3D_OK_);
-        else
+        } else {
             com_ret(c, D3D8_ERR_INVALIDCALL);
+        }
         return;
     }
 #endif
     clear_guest_target(dev, flags, color, z, stencil);
+    host_d3d7_clear();
     com_ret(c, D3D_OK_);
 }
 
@@ -1239,6 +1410,219 @@ void Device7_DeleteStateBlock(X86 *c) {
     com_ret(c, D3D_OK_);
 }
 
+// ---------------------------------------------------------------- draws
+// D3D7 submits the same primitive types and FVF values as D3D8; the Rust
+// device owns index expansion and the fixed-function pipeline. `prims` is the
+// primitive count the renderer expects (D3D7 passes a vertex/index count).
+// The strided variants and ProcessVertices stay aborted by name.
+bool d3d7_prim_count(uint32_t type, uint32_t count, uint32_t *out) {
+    switch (type) {
+    case 4: // D3DPT_TRIANGLELIST
+        *out = count / 3;
+        return true;
+    case 2: // D3DPT_TRIANGLESTRIP
+    case 6: // D3DPT_TRIANGLEFAN
+        *out = count > 2 ? count - 2 : 0;
+        return true;
+    default:
+        return false;
+    }
+}
+
+// A draw the host renderer refused is never a silent no-op: it is the named
+// diagnosis and the run stops. The renderer's own message carries the FVF,
+// state or range that was unsupported.
+#ifdef RECOMP_D3D8_WGPU
+[[noreturn]] void draw_host_stop(const char *method, const D3d8Error &err) {
+    LOGW("d3d7: IDirect3DDevice7::%s host renderer rejected the draw: %s; stopping", method,
+         (const char *)err.message);
+    fflush(stderr);
+    abort();
+}
+#endif
+
+// Sync both implemented texture stages, then submit the draw to the host. The
+// no-renderer build and a missing host stop through needs_render after the
+// argument checks, so a malformed draw is diagnosed the same either way.
+void d3d7_submit_primitive(ComObj *dev, uint32_t type, uint32_t fvf, uint32_t verts,
+                           uint32_t vertex_bytes, uint32_t stride, uint32_t start_vertex,
+                           uint32_t prims, const char *method) {
+#ifdef RECOMP_D3D8_WGPU
+    if (ensure_host(dev)) {
+        d3d7_sync_texture(dev, 0);
+        d3d7_sync_texture(dev, 1);
+        D3d8Error err{};
+        int32_t status =
+            d3d8_device_draw_primitive((D3d8Device *)dev->d3d7_host, type, fvf, gm_ptr(verts),
+                                       vertex_bytes, stride, start_vertex, prims, &err);
+        if (status != 0)
+            draw_host_stop(method, err);
+        host_d3d7_draw();
+        return;
+    }
+#endif
+    (void)dev;
+    (void)type;
+    (void)fvf;
+    (void)verts;
+    (void)vertex_bytes;
+    (void)stride;
+    (void)start_vertex;
+    (void)prims;
+    (void)method;
+    needs_render("IDirect3DDevice7", method);
+}
+
+void d3d7_submit_indexed(ComObj *dev, uint32_t type, uint32_t fvf, uint32_t verts,
+                         uint32_t vertex_bytes, uint32_t stride, uint32_t indices,
+                         uint32_t index_bytes, uint32_t base_vertex, uint32_t min_index,
+                         uint32_t num_vertices, uint32_t prims, const char *method) {
+#ifdef RECOMP_D3D8_WGPU
+    if (ensure_host(dev)) {
+        d3d7_sync_texture(dev, 0);
+        d3d7_sync_texture(dev, 1);
+        D3d8Error err{};
+        int32_t status = d3d8_device_draw_indexed_primitive(
+            (D3d8Device *)dev->d3d7_host, type, fvf, gm_ptr(verts), vertex_bytes, stride,
+            gm_ptr(indices), index_bytes, 101 /* D3DFMT_INDEX16 */, base_vertex, min_index,
+            num_vertices, 0, prims, &err);
+        if (status != 0)
+            draw_host_stop(method, err);
+        host_d3d7_draw();
+        return;
+    }
+#endif
+    (void)dev;
+    (void)type;
+    (void)fvf;
+    (void)verts;
+    (void)vertex_bytes;
+    (void)stride;
+    (void)indices;
+    (void)index_bytes;
+    (void)base_vertex;
+    (void)min_index;
+    (void)num_vertices;
+    (void)prims;
+    (void)method;
+    needs_render("IDirect3DDevice7", method);
+}
+
+// `(this, D3DPRIMITIVETYPE, fvf, vertices, vertex_count, flags)`. Lists,
+// strips and fans are accepted (see d3d7_prim_count); other types stop by name.
+void Device7_DrawPrimitive(X86 *c) {
+    ComObj *dev = this_device7(c);
+    if (!dev) {
+        com_ret(c, DDERR_INVALIDOBJECT);
+        return;
+    }
+    const uint32_t type = arg(c, 1), fvf = arg(c, 2), verts = arg(c, 3), count = arg(c, 4);
+    const uint32_t stride = fvf_stride(fvf);
+    uint32_t prims = 0;
+    const uint64_t bytes = (uint64_t)stride * count;
+    if (!stride || !verts || !count || bytes > 0xffffffffu || !gm_valid(verts, (uint32_t)bytes) ||
+        !d3d7_prim_count(type, count, &prims)) {
+        LOGW("d3d7: DrawPrimitive(type=%u, fvf=%08x, verts=%08x, count=%u) is not a draw this "
+             "front end can submit; stopping",
+             type, fvf, verts, count);
+        fflush(stderr);
+        abort();
+    }
+    d3d7_submit_primitive(dev, type, fvf, verts, (uint32_t)bytes, stride, 0, prims,
+                          "DrawPrimitive");
+    com_ret(c, D3D_OK_);
+}
+
+// `(this, type, fvf, vertices, vertex_count, indices, index_count, flags)`.
+void Device7_DrawIndexedPrimitive(X86 *c) {
+    ComObj *dev = this_device7(c);
+    if (!dev) {
+        com_ret(c, DDERR_INVALIDOBJECT);
+        return;
+    }
+    const uint32_t type = arg(c, 1), fvf = arg(c, 2), verts = arg(c, 3), vcount = arg(c, 4),
+                   indices = arg(c, 5), icount = arg(c, 6);
+    const uint32_t stride = fvf_stride(fvf);
+    uint32_t prims = 0;
+    const uint64_t vbytes = (uint64_t)stride * vcount;
+    const uint64_t ibytes = (uint64_t)icount * 2;
+    if (!stride || !verts || !indices || !vcount || !icount || (type == 4 && (icount % 3)) ||
+        vbytes > 0xffffffffu || ibytes > 0xffffffffu || !gm_valid(verts, (uint32_t)vbytes) ||
+        !gm_valid(indices, (uint32_t)ibytes) || !d3d7_prim_count(type, icount, &prims)) {
+        LOGW("d3d7: DrawIndexedPrimitive(type=%u, fvf=%08x, verts=%08x, vcount=%u, indices=%08x, "
+             "icount=%u) is not a draw this front end can submit; stopping",
+             type, fvf, verts, vcount, indices, icount);
+        fflush(stderr);
+        abort();
+    }
+    d3d7_submit_indexed(dev, type, fvf, verts, (uint32_t)vbytes, stride, indices, (uint32_t)ibytes,
+                        0, 0, vcount, prims, "DrawIndexedPrimitive");
+    com_ret(c, D3D_OK_);
+}
+
+// `(this, type, vb, start_vertex, vertex_count, flags)`.
+void Device7_DrawPrimitiveVB(X86 *c) {
+    ComObj *dev = this_device7(c);
+    ComObj *vb = com_this(arg(c, 2));
+    if (!dev) {
+        com_ret(c, DDERR_INVALIDOBJECT);
+        return;
+    }
+    if (!vb || vb->kind != K_D3D7VB) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    const uint32_t type = arg(c, 1), start = arg(c, 3), count = arg(c, 4);
+    const uint32_t stride = fvf_stride(vb->vb_fvf);
+    uint32_t prims = 0;
+    const uint64_t end = ((uint64_t)start + count) * stride;
+    if (!stride || !vb->pixels || end > vb->pixels_bytes || !d3d7_prim_count(type, count, &prims)) {
+        LOGW("d3d7: DrawPrimitiveVB(type=%u, fvf=%08x, start=%u, count=%u) is not a draw this "
+             "front end can submit; stopping",
+             type, vb->vb_fvf, start, count);
+        fflush(stderr);
+        abort();
+    }
+    d3d7_submit_primitive(dev, type, vb->vb_fvf, vb->pixels, vb->pixels_bytes, stride, start, prims,
+                          "DrawPrimitiveVB");
+    com_ret(c, D3D_OK_);
+}
+
+// `(this, type, vb, start_vertex, vertex_count, indices, index_count, flags)`.
+// D3D7's indices are relative to StartVertex, which maps to the D3D8 base
+// vertex index. `min_index` is 0 because the interval is expressed against the
+// start of the VB.
+void Device7_DrawIndexedPrimitiveVB(X86 *c) {
+    ComObj *dev = this_device7(c);
+    ComObj *vb = com_this(arg(c, 2));
+    if (!dev) {
+        com_ret(c, DDERR_INVALIDOBJECT);
+        return;
+    }
+    if (!vb || vb->kind != K_D3D7VB) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    const uint32_t type = arg(c, 1), start = arg(c, 3), vcount = arg(c, 4), indices = arg(c, 5),
+                   icount = arg(c, 6);
+    const uint32_t stride = fvf_stride(vb->vb_fvf);
+    uint32_t prims = 0;
+    const uint64_t end = ((uint64_t)start + vcount) * stride;
+    const uint64_t ibytes = (uint64_t)icount * 2;
+    if (!stride || !vb->pixels || !indices || !icount || (type == 4 && (icount % 3)) ||
+        end > vb->pixels_bytes || ibytes > 0xffffffffu || !gm_valid(indices, (uint32_t)ibytes) ||
+        !d3d7_prim_count(type, icount, &prims)) {
+        LOGW("d3d7: DrawIndexedPrimitiveVB(type=%u, fvf=%08x, start=%u, vcount=%u, indices=%08x, "
+             "icount=%u) is not a draw this front end can submit; stopping",
+             type, vb->vb_fvf, start, vcount, indices, icount);
+        fflush(stderr);
+        abort();
+    }
+    d3d7_submit_indexed(dev, type, vb->vb_fvf, vb->pixels, vb->pixels_bytes, stride, indices,
+                        (uint32_t)ibytes, start, 0, vcount, prims, "DrawIndexedPrimitiveVB");
+    com_ret(c, D3D_OK_);
+}
+
 // --- Loudly unimplemented device slots. Naming each one is the whole point:
 // the abort's message is the diagnosis. ---
 #define D3D7_ABORT(fn, method)                                                                     \
@@ -1249,14 +1633,10 @@ void Device7_DeleteStateBlock(X86 *c) {
 D3D7_ABORT(Device7_SetRenderTarget, "SetRenderTarget")
 D3D7_ABORT(Device7_MultiplyTransform, "MultiplyTransform")
 D3D7_ABORT(Device7_PreLoad, "PreLoad")
-D3D7_ABORT(Device7_DrawPrimitive, "DrawPrimitive")
-D3D7_ABORT(Device7_DrawIndexedPrimitive, "DrawIndexedPrimitive")
 D3D7_ABORT(Device7_SetClipStatus, "SetClipStatus")
 D3D7_ABORT(Device7_GetClipStatus, "GetClipStatus")
 D3D7_ABORT(Device7_DrawPrimitiveStrided, "DrawPrimitiveStrided")
 D3D7_ABORT(Device7_DrawIndexedPrimitiveStrided, "DrawIndexedPrimitiveStrided")
-D3D7_ABORT(Device7_DrawPrimitiveVB, "DrawPrimitiveVB")
-D3D7_ABORT(Device7_DrawIndexedPrimitiveVB, "DrawIndexedPrimitiveVB")
 D3D7_ABORT(Device7_ComputeSphereVisibility, "ComputeSphereVisibility")
 D3D7_ABORT(Device7_CaptureStateBlock, "CaptureStateBlock")
 D3D7_ABORT(Device7_CreateStateBlock, "CreateStateBlock")

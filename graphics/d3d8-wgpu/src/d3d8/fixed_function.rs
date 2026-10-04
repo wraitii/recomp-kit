@@ -38,6 +38,16 @@ pub const FVF_XYZ_DIFFUSE_TEX1: u32 = 0x0142;
 /// directly.
 pub const FVF_XYZ_DIFFUSE_TEX2: u32 = 0x0242;
 
+/// `D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_SPECULAR | D3DFVF_TEX1` (0x1C4).
+/// The D3D7 front end's logo and fixed-function path submits these already
+/// transformed (screen-space `x,y`, depth `z`) vertices, so no world/view/
+/// projection transform is applied to them (the pre-transformed entry point).
+pub const FVF_XYZRHW_DIFFUSE_SPECULAR_TEX1: u32 = 0x01C4;
+
+/// `D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_SPECULAR | D3DFVF_TEX2` (0x2C4).
+/// The D3D7 sprite/text path's two-texture pre-transformed layout.
+pub const FVF_XYZRHW_DIFFUSE_SPECULAR_TEX2: u32 = 0x02C4;
+
 /// A decoded FVF: stride plus the matching WGSL vertex attributes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FvfLayout {
@@ -45,6 +55,10 @@ pub struct FvfLayout {
     pub stride: u64,
     /// Number of texture-coordinate sets the FVF carries (0, 1 or 2).
     pub texcoord_sets: u32,
+    /// True for `XYZRHW`: the vertex position is already in screen space, so
+    /// the draw uses the pre-transformed vertex entry point instead of the
+    /// world/view/projection path.
+    pub pre_transformed: bool,
     /// Vertex attributes at their byte offsets.
     pub attributes: Vec<wgpu::VertexAttribute>,
 }
@@ -61,6 +75,7 @@ impl FvfLayout {
             FVF_XYZ_DIFFUSE => Ok(Self {
                 stride: 16,
                 texcoord_sets: 0,
+                pre_transformed: false,
                 attributes: vec![
                     wgpu::VertexAttribute {
                         format: wgpu::VertexFormat::Float32x3,
@@ -77,6 +92,7 @@ impl FvfLayout {
             FVF_XYZ_DIFFUSE_TEX1 => Ok(Self {
                 stride: 24,
                 texcoord_sets: 1,
+                pre_transformed: false,
                 attributes: vec![
                     wgpu::VertexAttribute {
                         format: wgpu::VertexFormat::Float32x3,
@@ -107,6 +123,7 @@ impl FvfLayout {
             FVF_XYZ_DIFFUSE_TEX2 => Ok(Self {
                 stride: 32,
                 texcoord_sets: 2,
+                pre_transformed: false,
                 attributes: vec![
                     wgpu::VertexAttribute {
                         format: wgpu::VertexFormat::Float32x3,
@@ -135,6 +152,7 @@ impl FvfLayout {
             0x152 => Ok(Self {
                 stride: 36,
                 texcoord_sets: 1,
+                pre_transformed: false,
                 attributes: vec![
                     wgpu::VertexAttribute {
                         format: wgpu::VertexFormat::Float32x3,
@@ -158,10 +176,79 @@ impl FvfLayout {
                     },
                 ],
             }),
+            // XYZRHW | DIFFUSE | SPECULAR | TEX1. The pre-transformed path
+            // passes the 4-float screen-space position and the specular colour
+            // to `vs_rhw_main`; the fragment shader adds specular when
+            // D3DRS_SPECULARENABLE is set.
+            FVF_XYZRHW_DIFFUSE_SPECULAR_TEX1 => Ok(Self {
+                stride: 32,
+                texcoord_sets: 1,
+                pre_transformed: true,
+                attributes: vec![
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x4,
+                        offset: 0,
+                        shader_location: 0,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Uint32,
+                        offset: 16,
+                        shader_location: 1,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 24,
+                        shader_location: 2,
+                    },
+                    // Set 1 aliases set 0, as in the single-set XYZ layout.
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 24,
+                        shader_location: 3,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Uint32,
+                        offset: 20,
+                        shader_location: 4,
+                    },
+                ],
+            }),
+            FVF_XYZRHW_DIFFUSE_SPECULAR_TEX2 => Ok(Self {
+                stride: 40,
+                texcoord_sets: 2,
+                pre_transformed: true,
+                attributes: vec![
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x4,
+                        offset: 0,
+                        shader_location: 0,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Uint32,
+                        offset: 16,
+                        shader_location: 1,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 24,
+                        shader_location: 2,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 32,
+                        shader_location: 3,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Uint32,
+                        offset: 20,
+                        shader_location: 4,
+                    },
+                ],
+            }),
             _ => Err(RenderError::new(
                 "FvfLayout::decode",
                 format!(
-                    "unsupported FVF 0x{raw:08X}; only D3DFVF_XYZ | D3DFVF_DIFFUSE (0x{FVF_XYZ_DIFFUSE:08X}), D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 (0x{FVF_XYZ_DIFFUSE_TEX1:08X}), D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX2 (0x{FVF_XYZ_DIFFUSE_TEX2:08X}) and XYZ | NORMAL | DIFFUSE | TEX1 (0x00000152) are implemented"
+                    "unsupported FVF 0x{raw:08X}; only D3DFVF_XYZ | D3DFVF_DIFFUSE (0x{FVF_XYZ_DIFFUSE:08X}), D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 (0x{FVF_XYZ_DIFFUSE_TEX1:08X}), D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX2 (0x{FVF_XYZ_DIFFUSE_TEX2:08X}), XYZ | NORMAL | DIFFUSE | TEX1 (0x00000152) and XYZRHW | DIFFUSE | SPECULAR | TEX1/2 (0x000001C4/0x000002C4) are implemented"
                 ),
             )),
         }
@@ -199,14 +286,25 @@ pub fn d3dcolor_to_rgba(dword: u32) -> [f32; 4] {
 pub struct TransformUniform {
     /// Composed transform, CPU rows stored as WGSL columns.
     pub matrix: [[f32; 4]; 4],
+    /// Viewport `(x, y, width, height)` in pixels. Only the pre-transformed
+    /// (`XYZRHW`) entry point reads it; the transformed path ignores it.
+    pub viewport: [f32; 4],
+    /// Packed flags in a 16-byte-aligned vec4 so the WGSL uniform layout
+    /// matches this Rust struct byte for byte: `rhw[0]` is the pre-transformed
+    /// (XYZRHW) flag, `rhw[1]` is `D3DRS_SPECULARENABLE` as 0/1. The rest are
+    /// zero.
+    pub rhw: [u32; 4],
 }
 
 impl TransformUniform {
     /// Compose `world * view * projection` using D3D row-vector semantics and
-    /// pack it for the WGSL uniform.
+    /// pack it for the WGSL uniform. `viewport`/`rhw` are set by the draw path
+    /// before upload.
     pub fn new(world: Mat4, view: Mat4, projection: Mat4) -> Self {
         Self {
             matrix: world.mul(view).mul(projection).rows,
+            viewport: [0.0; 4],
+            rhw: [0; 4],
         }
     }
 }
@@ -219,6 +317,8 @@ impl TransformUniform {
 pub const UNLIT_WGSL: &str = r#"
 struct TransformUniform {
     matrix: mat4x4<f32>,
+    viewport: vec4<f32>,
+    rhw: vec4<u32>,
 };
 
 struct FogUniform {
@@ -261,6 +361,7 @@ struct VertexOutput {
     @location(0) color: vec4<f32>,
     @location(1) fogdist: f32,
     @location(2) fogfactor: f32,
+    @location(4) specular: vec3<f32>,
 };
 
 // D3D8 table/pixel fog uses the eye-space depth. A standard D3D perspective
@@ -288,6 +389,41 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     let g = f32((in.color >> 8u) & 0xffu) / 255.0;
     let b = f32(in.color & 0xffu) / 255.0;
     out.color = vec4<f32>(r, g, b, a);
+    out.specular = vec3<f32>(0.0);
+    return out;
+}
+
+struct VertexInputRhw {
+    @location(0) position: vec4<f32>,
+    @location(1) color: u32,
+    @location(4) specular: u32,
+};
+
+// XYZRHW vertices carry a screen-space x,y (pixels) and a depth z that is
+// already in the viewport's depth range. The rasterizer maps NDC through the
+// viewport (with the half-pixel offset the draw path sets), so invert that
+// mapping here and let the rasterizer do the rest. The reciprocal-w field is
+// ignored (`w = 1.0`): the observed D3D7 logo quad carries `rhw = 0.0` and the
+// original presented it as an orthographic full-screen quad, so this bounded
+// path does not model perspective-correct pre-transformed interpolation.
+@vertex
+fn vs_rhw_main(in: VertexInputRhw) -> VertexOutput {
+    var out: VertexOutput;
+    let vp = transform.viewport;
+    let ndc_x = 2.0 * (in.position.x - vp.x) / vp.z - 1.0;
+    let ndc_y = 1.0 - 2.0 * (in.position.y - vp.y) / vp.w;
+    out.position = vec4<f32>(ndc_x, ndc_y, in.position.z, 1.0);
+    out.fogdist = in.position.z;
+    let a = f32((in.color >> 24u) & 0xffu) / 255.0;
+    let r = f32((in.color >> 16u) & 0xffu) / 255.0;
+    let g = f32((in.color >> 8u) & 0xffu) / 255.0;
+    let b = f32(in.color & 0xffu) / 255.0;
+    out.color = vec4<f32>(r, g, b, a);
+    out.specular = vec3<f32>(
+        f32((in.specular >> 16u) & 0xffu) / 255.0,
+        f32((in.specular >> 8u) & 0xffu) / 255.0,
+        f32(in.specular & 0xffu) / 255.0,
+    );
     return out;
 }
 
@@ -340,7 +476,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (!alpha_test_pass(in.color.a)) {
         discard;
     }
-    return vec4<f32>(apply_fog(in.color.rgb, in.fogdist, in.fogfactor), in.color.a);
+    // D3DRS_SPECULARENABLE adds the vertex specular to the RGB after texture
+    // blending and before fog, clamped. Alpha is unaffected.
+    var rgb = in.color.rgb;
+    if (transform.rhw[1] != 0u) {
+        rgb = clamp(rgb + in.specular, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    return vec4<f32>(apply_fog(rgb, in.fogdist, in.fogfactor), in.color.a);
 }
 "#;
 
@@ -586,6 +728,8 @@ pub fn alpha_test_pass(func: u32, reference: u32, alpha: f32) -> bool {
 pub const TEXTURED_WGSL: &str = r#"
 struct TransformUniform {
     matrix: mat4x4<f32>,
+    viewport: vec4<f32>,
+    rhw: vec4<u32>,
 };
 
 struct StageUniform {
@@ -661,6 +805,7 @@ struct VertexOutput {
     @location(2) uv1: vec2<f32>,
     @location(3) fogdist: f32,
     @location(4) fogfactor: f32,
+    @location(5) specular: vec3<f32>,
 };
 
 @vertex
@@ -683,6 +828,40 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.color = vec4<f32>(r, g, b, a);
     out.uv0 = in.uv0;
     out.uv1 = in.uv1;
+    out.specular = vec3<f32>(0.0);
+    return out;
+}
+
+struct VertexInputRhw {
+    @location(0) position: vec4<f32>,
+    @location(1) color: u32,
+    @location(2) uv0: vec2<f32>,
+    @location(3) uv1: vec2<f32>,
+    @location(4) specular: u32,
+};
+
+// XYZRHW: see the unlit shader for the screen-space mapping. The texture
+// coordinates are passed through unchanged.
+@vertex
+fn vs_rhw_main(in: VertexInputRhw) -> VertexOutput {
+    var out: VertexOutput;
+    let vp = transform.viewport;
+    let ndc_x = 2.0 * (in.position.x - vp.x) / vp.z - 1.0;
+    let ndc_y = 1.0 - 2.0 * (in.position.y - vp.y) / vp.w;
+    out.position = vec4<f32>(ndc_x, ndc_y, in.position.z, 1.0);
+    out.fogdist = in.position.z;
+    let a = f32((in.color >> 24u) & 0xffu) / 255.0;
+    let r = f32((in.color >> 16u) & 0xffu) / 255.0;
+    let g = f32((in.color >> 8u) & 0xffu) / 255.0;
+    let b = f32(in.color & 0xffu) / 255.0;
+    out.color = vec4<f32>(r, g, b, a);
+    out.uv0 = in.uv0;
+    out.uv1 = in.uv1;
+    out.specular = vec3<f32>(
+        f32((in.specular >> 16u) & 0xffu) / 255.0,
+        f32((in.specular >> 8u) & 0xffu) / 255.0,
+        f32(in.specular & 0xffu) / 255.0,
+    );
     return out;
 }
 
@@ -877,7 +1056,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (!alpha_test_pass(r1.a)) {
         discard;
     }
-    return vec4<f32>(apply_fog(r1.rgb, in.fogdist, in.fogfactor), r1.a);
+    // D3DRS_SPECULARENABLE adds the vertex specular to the RGB after texture
+    // blending and before fog, clamped. Alpha is unaffected.
+    var rgb = r1.rgb;
+    if (transform.rhw[1] != 0u) {
+        rgb = clamp(rgb + in.specular, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    return vec4<f32>(apply_fog(rgb, in.fogdist, in.fogfactor), r1.a);
 }
 "#;
 
@@ -943,6 +1128,60 @@ mod tests {
         assert_eq!(vb.array_stride, 16);
         assert_eq!(vb.step_mode, wgpu::VertexStepMode::Vertex);
         assert_eq!(vb.attributes.len(), 2);
+    }
+
+    #[test]
+    fn decode_xyzrhw_diffuse_specular_tex1_stride_and_offsets() {
+        let layout =
+            FvfLayout::decode(FVF_XYZRHW_DIFFUSE_SPECULAR_TEX1).expect("0x1C4 must decode");
+        assert_eq!(layout.stride, 32);
+        assert_eq!(layout.texcoord_sets, 1);
+        assert!(layout.pre_transformed);
+        assert_eq!(layout.attributes[0].format, wgpu::VertexFormat::Float32x4);
+        assert_eq!(layout.attributes[0].offset, 0);
+        assert_eq!(layout.attributes[1].format, wgpu::VertexFormat::Uint32);
+        assert_eq!(layout.attributes[1].offset, 16);
+        assert_eq!(layout.attributes[2].offset, 24);
+        assert_eq!(layout.attributes[3].offset, 24);
+        // The specular colour feeds the shader's specular add.
+        assert_eq!(layout.attributes[4].format, wgpu::VertexFormat::Uint32);
+        assert_eq!(layout.attributes[4].offset, 20);
+        assert_eq!(layout.attributes[4].shader_location, 4);
+    }
+
+    #[test]
+    fn decode_xyzrhw_diffuse_specular_tex2_stride_and_offsets() {
+        let layout =
+            FvfLayout::decode(FVF_XYZRHW_DIFFUSE_SPECULAR_TEX2).expect("0x2C4 must decode");
+        assert_eq!(layout.stride, 40);
+        assert_eq!(layout.texcoord_sets, 2);
+        assert!(layout.pre_transformed);
+        assert_eq!(layout.attributes[0].format, wgpu::VertexFormat::Float32x4);
+        assert_eq!(layout.attributes[2].offset, 24);
+        assert_eq!(layout.attributes[3].offset, 32);
+        assert_eq!(layout.attributes[4].offset, 20);
+        assert_eq!(layout.attributes[4].shader_location, 4);
+    }
+
+    #[test]
+    fn all_shader_sources_parse_and_validate() {
+        // `lit_shader_source` rewrites the D3DCOLOR vertex input to a float
+        // diffuse; this catches a rewrite that corrupts the pre-transformed
+        // entry point or the specular additions, neither of which the runtime
+        // logo path exercises yet. naga is the same parser wgpu uses.
+        use naga::valid::{Capabilities, ValidationFlags, Validator};
+        let validate = |name: &str, source: &str| {
+            let module = naga::front::wgsl::parse_str(source)
+                .unwrap_or_else(|e| panic!("{name} WGSL parse failed: {e}"));
+            let mut validator = Validator::new(ValidationFlags::all(), Capabilities::all());
+            validator
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{name} WGSL validation failed: {e:?}"));
+        };
+        validate("unlit", UNLIT_WGSL);
+        validate("textured", TEXTURED_WGSL);
+        validate("lit-untextured", &lit_shader_source(false));
+        validate("lit-textured", &lit_shader_source(true));
     }
 
     #[test]
@@ -1084,8 +1323,8 @@ mod tests {
             assert_close(got, expected);
         }
 
-        // The uniform is 4 contiguous vec4 columns (64 bytes).
-        assert_eq!(bytemuck::bytes_of(&uniform).len(), 64);
+        // The uniform is the matrix (4 vec4) plus viewport and rhw (2 vec4).
+        assert_eq!(bytemuck::bytes_of(&uniform).len(), 96);
     }
 
     #[test]
@@ -1252,5 +1491,8 @@ pub fn lit_shader_source(textured: bool) -> String {
         + "    out.color = vec4<f32>(r, g, b, a);".len();
     let mut source = source.to_owned();
     source.replace_range(start..end, "    out.color = in.color;");
-    source.replace("@location(1) color: u32", "@location(1) color: vec4<f32>")
+    // Only the transformed `VertexInput` becomes a float diffuse; the
+    // pre-transformed `VertexInputRhw` keeps its D3DCOLOR and is unused by the
+    // lit entry point.
+    source.replacen("@location(1) color: u32", "@location(1) color: vec4<f32>", 1)
 }

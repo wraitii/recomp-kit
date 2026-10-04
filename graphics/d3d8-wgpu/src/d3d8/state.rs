@@ -261,6 +261,11 @@ pub struct DeviceState {
     pub view: Mat4,
     pub projection: Mat4,
     pub viewport: Viewport,
+    /// Render-target size in pixels, fixed for the device's lifetime. Used to
+    /// decide whether the viewport is the only clip bound (see the
+    /// `D3DRS_CLIPPING` divergence in [`DeviceState::validate_fixed_function`]).
+    target_width: u32,
+    target_height: u32,
     states: RenderStates,
     /// Raw `D3DTSS_*` values per texture stage, set through the fallible
     /// setter. D3D8 exposes eight fixed-function texture stages.
@@ -282,6 +287,8 @@ impl DeviceState {
             view: Mat4::IDENTITY,
             projection: Mat4::IDENTITY,
             viewport: Viewport::full(width, height),
+            target_width: width,
+            target_height: height,
             states: RenderStates::d3d_defaults(),
             texture_stages: vec![BTreeMap::new(); MAX_TEXTURE_STAGES],
             material: Material::d3d_default(),
@@ -696,6 +703,22 @@ impl DeviceState {
     /// True when depth testing is enabled (`D3DRS_ZENABLE` is not `D3DZB_FALSE`).
     /// `D3DZB_USEW` counts as enabled here; the device maps its comparison the
     /// same way because D3D8's w-buffer is not modelled separately.
+    /// `D3DRS_SPECULARENABLE`. Honoured by the shader's specular add; the
+    /// draw path forwards it in the transform uniform's flag word.
+    pub fn specular_enable(&self) -> bool {
+        self.states.specular_enable
+    }
+
+    /// True when the viewport is exactly the whole render target, so the
+    /// viewport bound *is* the target bound. Only then is `D3DRS_CLIPPING=FALSE`
+    /// unobservable on the host (see the divergence at the clipping check).
+    fn viewport_covers_target(&self) -> bool {
+        self.viewport.x == 0
+            && self.viewport.y == 0
+            && self.viewport.width == self.target_width
+            && self.viewport.height == self.target_height
+    }
+
     pub fn z_enable(&self) -> bool {
         self.states.z_enable != D3DZBUFFERTYPE::False
     }
@@ -799,23 +822,30 @@ impl DeviceState {
     /// slice. Must be called before submitting a draw.
     ///
     /// Unsupported here: fixed-function lighting, `D3DZB_USEW`, vertex/range
-    /// fog, dithering, specular adds and the stencil buffer. Table/pixel fog
+    /// fog and the stencil buffer. Table/pixel fog
     /// (EXP/EXP2/LINEAR) and the alpha test are honoured by the shader from
     /// the eye-space depth and the final stage-blended alpha respectively,
-    /// subject to the D3D8 blend-colour adjustment rule.
+    /// subject to the D3D8 blend-colour adjustment rule. `D3DRS_DITHERENABLE`
+    /// is accepted as a documented divergence (see the check below). Specular
+    /// adds are implemented by the shader for the pre-transformed layouts.
     /// Values outside Solid fill/Gouraud shade, a disabled clipper, and
     /// enabling any of the above are named errors rather than approximations. Ordinary depth test/write is supported and configured
     /// by the device from `z_enable`/`z_write_enable`/`z_func`.
     pub fn validate_unlit(&self) -> Result<(), RenderError> {
-        self.validate_fixed_function(false)
+        self.validate_fixed_function(false, false)
     }
 
     /// Validate the state consumed by the supported guest vertex layout.
     pub fn validate_draw(&self, fvf: u32) -> Result<(), RenderError> {
-        self.validate_fixed_function(fvf == 0x152)
+        let pre_transformed = matches!(fvf, 0x01C4 | 0x02C4);
+        self.validate_fixed_function(fvf == 0x152, pre_transformed)
     }
 
-    fn validate_fixed_function(&self, normals: bool) -> Result<(), RenderError> {
+    fn validate_fixed_function(
+        &self,
+        normals: bool,
+        pre_transformed: bool,
+    ) -> Result<(), RenderError> {
         let s = &self.states;
         let unsupported = |what: &str| {
             RenderError::new(
@@ -838,20 +868,26 @@ impl DeviceState {
             )));
         }
 
-        // Only the normal-bearing layout feeds the implemented lighting stage.
-        // Keep other lit FVFs unsupported until their inputs are implemented.
-        if s.lighting && !normals {
-            return Err(unsupported(
-                "D3DRS_LIGHTING must be FALSE (material/light state is stored but not applied)",
-            ));
-        }
-        // With lighting off, D3D8 takes the vertex color from the material
-        // (instead of the vertex) when COLORVERTEX is disabled. The unlit
-        // shader only implements the per-vertex source, so refuse the other.
-        if !s.color_vertex && !normals {
-            return Err(unsupported(
-                "D3DRS_COLORVERTEX must be TRUE (material-supplied vertex color is not implemented)",
-            ));
+        // XYZRHW vertices are already transformed, so fixed-function lighting
+        // and the material/vertex colour source cannot affect them: D3D8 uses
+        // the vertex diffuse directly. Those states are therefore inert for a
+        // pre-transformed draw and must not fail it.
+        if !pre_transformed {
+            // Only the normal-bearing layout feeds the implemented lighting stage.
+            // Keep other lit FVFs unsupported until their inputs are implemented.
+            if s.lighting && !normals {
+                return Err(unsupported(
+                    "D3DRS_LIGHTING must be FALSE (material/light state is stored but not applied)",
+                ));
+            }
+            // With lighting off, D3D8 takes the vertex color from the material
+            // (instead of the vertex) when COLORVERTEX is disabled. The unlit
+            // shader only implements the per-vertex source, so refuse the other.
+            if !s.color_vertex && !normals {
+                return Err(unsupported(
+                    "D3DRS_COLORVERTEX must be TRUE (material-supplied vertex color is not implemented)",
+                ));
+            }
         }
         // Ordinary depth testing/writing is honoured by the draw pipeline (the
         // device must own a depth attachment; the draw checks that separately).
@@ -895,17 +931,42 @@ impl DeviceState {
                 s.alpha_ref
             )));
         }
-        if s.dither_enable {
-            return Err(unsupported("D3DRS_DITHERENABLE must be FALSE"));
-        }
-        if s.specular_enable {
-            return Err(unsupported("D3DRS_SPECULARENABLE must be FALSE"));
-        }
+        // DIVERGENCE(original): D3DRS_DITHERENABLE is accepted and stored but
+        // not applied. The original rendered into an R5G6B5 target, where the
+        // ordered dither pattern changes the quantised output; this host target
+        // is A8R8G8B8, so a dither would be a no-op on the renderer's own
+        // surface. Faithful dithering belongs at the 32->16 writeback boundary
+        // (d3d7_writeback) and is not implemented there, so the guest's 16bpp
+        // bytes can differ from the original's dithered ones. Kept as an open
+        // fidelity gap rather than refused so the pre-transformed logo path
+        // can run. The stored value still appears in the state dump.
         if s.stencil_enable {
             return Err(unsupported("D3DRS_STENCILENABLE must be FALSE"));
         }
-        if !s.clipping {
-            return Err(unsupported("D3DRS_CLIPPING must be TRUE"));
+        // DIVERGENCE(original): D3DRS_CLIPPING=FALSE disables clipping to the
+        // viewport. The host rasterizer (wgpu) always clips to the viewport and
+        // scissor, so the only case where accepting the state is provably
+        // unobservable is a pre-transformed (XYZRHW) draw through a viewport
+        // that covers the whole render target: there the viewport bound is the
+        // render target itself, so "no viewport clipping" and "clip to the full
+        // target" produce the same pixels. For an untransformed FVF the shader
+        // emits clip-space (not screen-space) coordinates whose viewport mapping
+        // is the intended clip, and for a sub-target viewport the original would
+        // allow geometry outside the viewport to rasterize inside the target;
+        // neither is implementable here, so both stay named refusals. Do not
+        // widen this beyond that combination.
+        if !s.clipping && !(pre_transformed && self.viewport_covers_target()) {
+            return Err(unsupported(&format!(
+                "D3DRS_CLIPPING must be TRUE unless the draw is pre-transformed (XYZRHW) through a \
+                 full-target viewport; got pre_transformed={pre_transformed}, viewport=({}, {} {}x{}) \
+                 on a {}x{} target",
+                self.viewport.x,
+                self.viewport.y,
+                self.viewport.width,
+                self.viewport.height,
+                self.target_width,
+                self.target_height
+            )));
         }
         if s.fill_mode != D3DFILLMODE::Solid {
             return Err(unsupported("D3DRS_FILLMODE must be D3DFILL_SOLID"));
@@ -1102,12 +1163,78 @@ mod tests {
             })
             .contains("ALPHAREF")
         );
-        assert!(cause_after(|s| s.set_render_state(26, 1).unwrap()).contains("DITHERENABLE"));
-        assert!(cause_after(|s| s.set_render_state(29, 1).unwrap()).contains("SPECULARENABLE"));
+        // D3DRS_DITHERENABLE is a documented 32-bit-target divergence and
+        // D3DRS_SPECULARENABLE is implemented by the shader, so neither fails
+        // validation (see their dedicated tests).
         assert!(cause_after(|s| s.set_render_state(52, 1).unwrap()).contains("STENCILENABLE"));
         assert!(cause_after(|s| s.set_render_state(136, 0).unwrap()).contains("CLIPPING"));
         assert!(cause_after(|s| s.set_render_state(8, 2).unwrap()).contains("FILLMODE"));
         assert!(cause_after(|s| s.set_render_state(9, 1).unwrap()).contains("SHADEMODE"));
+    }
+
+    #[test]
+    fn dither_enable_is_accepted_as_a_32bit_target_divergence() {
+        // The original's R5G6B5 target applied ordered dithering; the host
+        // target is A8R8G8B8, where a dither is a no-op, so the state is
+        // stored and accepted rather than refused. The exact 16bpp values at
+        // the writeback boundary are an open fidelity gap.
+        let mut state = DeviceState::new(64, 64);
+        configure_probe_states(&mut state);
+        state.set_render_state(26, 1).unwrap(); // DITHERENABLE = TRUE
+        state.validate_unlit().unwrap();
+        // The value is retained for GetRenderState and the state dump.
+        let summary = state.draw_state_summary();
+        assert!(summary.contains("dither=true"), "{summary}");
+    }
+
+    #[test]
+    fn specular_enable_is_accepted_and_reported() {
+        // The D3D8 fixed-function shader adds the vertex specular to the RGB
+        // when the state is on, so the state is stored and the getter the draw
+        // path forwards in the transform uniform reports it.
+        let mut state = DeviceState::new(64, 64);
+        configure_probe_states(&mut state);
+        assert!(!state.specular_enable());
+        state.set_render_state(29, 1).unwrap(); // SPECULARENABLE = TRUE
+        state.validate_unlit().unwrap();
+        assert!(state.specular_enable());
+        let summary = state.draw_state_summary();
+        assert!(summary.contains("specular=true"), "{summary}");
+    }
+
+    #[test]
+    fn clipping_false_is_accepted_only_for_pre_transformed_full_viewport() {
+        let mut state = DeviceState::new(64, 64);
+        configure_probe_states(&mut state);
+        state.set_render_state(136, 0).unwrap(); // D3DRS_CLIPPING = FALSE
+
+        // Accepted: an XYZRHW draw through the full target, where the viewport
+        // bound is the target bound, so wgpu's always-on clipping is exact.
+        state.validate_draw(0x01C4).unwrap();
+
+        // Refused: an untransformed FVF, whose clip-space vertices rely on the
+        // viewport as the clip bound.
+        let err = state.validate_draw(0x0142).unwrap_err();
+        assert!(err.cause.contains("D3DRS_CLIPPING"), "{}", err.cause);
+        assert!(err.cause.contains("pre_transformed=false"), "{}", err.cause);
+
+        // Refused: XYZRHW through a sub-target viewport, where the original
+        // would let geometry outside the viewport rasterize inside the target.
+        let mut sub = DeviceState::new(64, 64);
+        configure_probe_states(&mut sub);
+        sub.set_render_state(136, 0).unwrap();
+        sub.viewport = Viewport {
+            x: 4,
+            y: 4,
+            width: 32,
+            height: 32,
+            min_z: 0.0,
+            max_z: 1.0,
+        };
+        let err = sub.validate_draw(0x01C4).unwrap_err();
+        assert!(err.cause.contains("pre_transformed=true"), "{}", err.cause);
+        assert!(err.cause.contains("(4, 4 32x32)"), "{}", err.cause);
+        assert!(err.cause.contains("64x64 target"), "{}", err.cause);
     }
 
     #[test]

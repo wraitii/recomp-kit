@@ -1579,6 +1579,24 @@ void k_GetSystemDirectoryA(X86 *c) {
     set_eax(c, len);
 }
 
+// GetTempPathA(nBufferLength, lpBuffer). The guest sees a virtual
+// "C:\Windows\Temp\" (trailing backslash, as Windows returns it), like
+// GetSystemDirectoryA's virtual System32: files the guest then creates there go
+// through the normal write-resolution seam, so nothing is written to the game
+// directory by this call. Returns the length without the NUL; a buffer too
+// small gets the required size including the NUL, as Windows does.
+void k_GetTempPathA(X86 *c) {
+    static const char dir[] = "C:\\Windows\\Temp\\";
+    uint32_t size = arg(c, 0), buf = arg(c, 1);
+    uint32_t len = sizeof dir - 1;
+    if (!buf || size <= len) {
+        set_eax(c, len + 1);
+        return;
+    }
+    memcpy(g_mem + buf, dir, len + 1);
+    set_eax(c, len);
+}
+
 void k_GetLogicalDriveStringsA(X86 *c) {
     logical_drive_strings(c, false);
 }
@@ -4875,6 +4893,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "GetVolumeInformationA", 8, k_GetVolumeInformationA},
     {"KERNEL32.dll", "GetDiskFreeSpaceA", 5, k_GetDiskFreeSpaceA},
     {"KERNEL32.dll", "GetSystemDirectoryA", 2, k_GetSystemDirectoryA},
+    {"KERNEL32.dll", "GetTempPathA", 2, k_GetTempPathA},
     {"KERNEL32.dll", "GetLogicalDriveStringsA", 2, k_GetLogicalDriveStringsA},
     {"KERNEL32.dll", "GetDriveTypeA", 1, k_GetDriveTypeA},
     // modules and process state

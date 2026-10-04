@@ -1011,6 +1011,43 @@ void o_IsEqualGUID(X86 *c) {
     set_eax(c, a && b && gm_valid(a, 16) && gm_valid(b, 16) && !memcmp(g_mem + a, g_mem + b, 16));
 }
 
+// CoFileTimeToDosDateTime(FILETIME *pft, WORD *pFatDate, WORD *pFatTime).
+// Documented ole32 API: a FILETIME is unsigned 100 ns ticks since 1601-01-01;
+// the DOS date word is ((year-1980)<<9)|(month<<5)|day and the time word is
+// (hour<<11)|(minute<<5)|(second/2). FALSE outside the representable range.
+// The exe caller passes the file time and the two output words, so this is a
+// real conversion, not a stub.
+void o_CoFileTimeToDosDateTime(X86 *c) {
+    uint32_t ft = arg(c, 0), pdate = arg(c, 1), ptime = arg(c, 2);
+    if (!ft || !gm_valid(ft, 8) || !pdate || !ptime || !gm_valid(pdate, 2) || !gm_valid(ptime, 2)) {
+        set_eax(c, 0);
+        return;
+    }
+    const uint64_t ticks = (uint64_t)rd32(ft) | ((uint64_t)rd32(ft + 4) << 32);
+    const int64_t days = (int64_t)(ticks / 864000000000ull);
+    const int64_t secs = (int64_t)((ticks % 864000000000ull) / 10000000ull);
+    // Days since 1601-01-01 -> civil date (Howard Hinnant's civil_from_days).
+    int64_t z = days - 134774; // 1601 epoch to 1970 epoch
+    z += 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const int64_t doe = z - era * 146097;
+    const int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t year = yoe + era * 400;
+    const int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const int64_t mp = (5 * doy + 2) / 153;
+    const int64_t day = doy - (153 * mp + 2) / 5 + 1;
+    const int64_t month = mp < 10 ? mp + 3 : mp - 9;
+    year += (month <= 2);
+    if (year < 1980 || year > 2107) {
+        set_eax(c, 0);
+        return;
+    }
+    const int64_t hour = secs / 3600, minute = (secs % 3600) / 60, second = secs % 60;
+    wr16(pdate, (uint16_t)(((year - 1980) << 9) | (month << 5) | day));
+    wr16(ptime, (uint16_t)((hour << 11) | (minute << 5) | (second / 2)));
+    set_eax(c, 1);
+}
+
 // PROPVARIANT is sixteen bytes on x86: a two-byte VARTYPE, six reserved, and
 // an eight-byte union. Clearing one means releasing whatever the union owns
 // and then emptying it, and every PROPVARIANT the shims hand out is VT_EMPTY -
@@ -1223,31 +1260,70 @@ static constexpr int WSAENOTSOCK_ = 10038;
 // WSAOVERLAPPED* out-parameters are left untouched: a failing call has no
 // result to report.
 static void wsa_call_failed(X86 *c, const char *fn, int error) {
-    log_once(fn, "WS2_32/WSOCK32!%s: no network host; SOCKET_ERROR, WSAGetLastError=%d", fn,
-             error);
+    log_once(fn, "WS2_32/WSOCK32!%s: no network host; SOCKET_ERROR, WSAGetLastError=%d", fn, error);
     g_wsa_last_error = error;
     set_eax(c, (uint32_t)-1);
 }
-void w_socket(X86 *c) { wsa_call_failed(c, "socket", WSAENETDOWN_); }
-void w_bind(X86 *c) { wsa_call_failed(c, "bind", WSAENETDOWN_); }
-void w_connect(X86 *c) { wsa_call_failed(c, "connect", WSAENETUNREACH_); }
-void w_listen(X86 *c) { wsa_call_failed(c, "listen", WSAENETDOWN_); }
-void w_accept(X86 *c) { wsa_call_failed(c, "accept", WSAENETDOWN_); }
-void w_send(X86 *c) { wsa_call_failed(c, "send", WSAENETDOWN_); }
-void w_recv(X86 *c) { wsa_call_failed(c, "recv", WSAENETDOWN_); }
-void w_sendto(X86 *c) { wsa_call_failed(c, "sendto", WSAENETDOWN_); }
-void w_recvfrom(X86 *c) { wsa_call_failed(c, "recvfrom", WSAENETDOWN_); }
-void w_select(X86 *c) { wsa_call_failed(c, "select", WSAENETDOWN_); }
-void w_shutdown(X86 *c) { wsa_call_failed(c, "shutdown", WSAENETDOWN_); }
-void w_closesocket(X86 *c) { wsa_call_failed(c, "closesocket", WSAENOTSOCK_); }
-void w_ioctlsocket(X86 *c) { wsa_call_failed(c, "ioctlsocket", WSAENOTSOCK_); }
-void w_getsockopt(X86 *c) { wsa_call_failed(c, "getsockopt", WSAENOTSOCK_); }
-void w_setsockopt(X86 *c) { wsa_call_failed(c, "setsockopt", WSAENOTSOCK_); }
-void w_getpeername(X86 *c) { wsa_call_failed(c, "getpeername", WSAENOTSOCK_); }
-void w_getsockname(X86 *c) { wsa_call_failed(c, "getsockname", WSAENOTSOCK_); }
-void w_WSAIoctl(X86 *c) { wsa_call_failed(c, "WSAIoctl", WSAENETDOWN_); }
-void w_WSARecv(X86 *c) { wsa_call_failed(c, "WSARecv", WSAENETDOWN_); }
-void w_WSARecvFrom(X86 *c) { wsa_call_failed(c, "WSARecvFrom", WSAENETDOWN_); }
+void w_socket(X86 *c) {
+    wsa_call_failed(c, "socket", WSAENETDOWN_);
+}
+void w_bind(X86 *c) {
+    wsa_call_failed(c, "bind", WSAENETDOWN_);
+}
+void w_connect(X86 *c) {
+    wsa_call_failed(c, "connect", WSAENETUNREACH_);
+}
+void w_listen(X86 *c) {
+    wsa_call_failed(c, "listen", WSAENETDOWN_);
+}
+void w_accept(X86 *c) {
+    wsa_call_failed(c, "accept", WSAENETDOWN_);
+}
+void w_send(X86 *c) {
+    wsa_call_failed(c, "send", WSAENETDOWN_);
+}
+void w_recv(X86 *c) {
+    wsa_call_failed(c, "recv", WSAENETDOWN_);
+}
+void w_sendto(X86 *c) {
+    wsa_call_failed(c, "sendto", WSAENETDOWN_);
+}
+void w_recvfrom(X86 *c) {
+    wsa_call_failed(c, "recvfrom", WSAENETDOWN_);
+}
+void w_select(X86 *c) {
+    wsa_call_failed(c, "select", WSAENETDOWN_);
+}
+void w_shutdown(X86 *c) {
+    wsa_call_failed(c, "shutdown", WSAENETDOWN_);
+}
+void w_closesocket(X86 *c) {
+    wsa_call_failed(c, "closesocket", WSAENOTSOCK_);
+}
+void w_ioctlsocket(X86 *c) {
+    wsa_call_failed(c, "ioctlsocket", WSAENOTSOCK_);
+}
+void w_getsockopt(X86 *c) {
+    wsa_call_failed(c, "getsockopt", WSAENOTSOCK_);
+}
+void w_setsockopt(X86 *c) {
+    wsa_call_failed(c, "setsockopt", WSAENOTSOCK_);
+}
+void w_getpeername(X86 *c) {
+    wsa_call_failed(c, "getpeername", WSAENOTSOCK_);
+}
+void w_getsockname(X86 *c) {
+    wsa_call_failed(c, "getsockname", WSAENOTSOCK_);
+}
+void w_WSAIoctl(X86 *c) {
+    wsa_call_failed(c, "WSAIoctl", WSAENETDOWN_);
+}
+void w_WSARecv(X86 *c) {
+    wsa_call_failed(c, "WSARecv", WSAENETDOWN_);
+}
+void w_WSARecvFrom(X86 *c) {
+    wsa_call_failed(c, "WSARecvFrom", WSAENETDOWN_);
+}
 
 // Event and overlapped results are not sockets: WSACreateEvent returns
 // WSA_INVALID_EVENT and the rest report FALSE or WSA_WAIT_FAILED.
@@ -1284,23 +1360,30 @@ void w_WSAGetOverlappedResult(X86 *c) {
 
 void w_gethostbyaddr(X86 *c) {
     log_once("WS2_32!gethostbyaddr",
-             "WS2_32!gethostbyaddr: no network host; NULL, WSAGetLastError=%d",
-             WSAHOST_NOT_FOUND_);
+             "WS2_32!gethostbyaddr: no network host; NULL, WSAGetLastError=%d", WSAHOST_NOT_FOUND_);
     g_wsa_last_error = WSAHOST_NOT_FOUND_;
     set_eax(c, 0);
 }
 
 // Pure byte-order and address utilities: no network is involved.
-void w_htonl(X86 *c) { set_eax(c, __builtin_bswap32(arg(c, 0))); }
-void w_ntohl(X86 *c) { set_eax(c, __builtin_bswap32(arg(c, 0))); }
-void w_htons(X86 *c) { set_eax(c, (uint32_t)(uint16_t)__builtin_bswap16((uint16_t)arg(c, 0))); }
-void w_ntohs(X86 *c) { set_eax(c, (uint32_t)(uint16_t)__builtin_bswap16((uint16_t)arg(c, 0))); }
+void w_htonl(X86 *c) {
+    set_eax(c, __builtin_bswap32(arg(c, 0)));
+}
+void w_ntohl(X86 *c) {
+    set_eax(c, __builtin_bswap32(arg(c, 0)));
+}
+void w_htons(X86 *c) {
+    set_eax(c, (uint32_t)(uint16_t)__builtin_bswap16((uint16_t)arg(c, 0)));
+}
+void w_ntohs(X86 *c) {
+    set_eax(c, (uint32_t)(uint16_t)__builtin_bswap16((uint16_t)arg(c, 0)));
+}
 void w_inet_addr(X86 *c) {
     std::string text = gm_str(arg(c, 0), 64);
     unsigned a = 0, b = 0, cc = 0, d = 0;
     char extra = 0;
-    if (sscanf(text.c_str(), "%u.%u.%u.%u%c", &a, &b, &cc, &d, &extra) == 4 && a < 256 &&
-        b < 256 && cc < 256 && d < 256) {
+    if (sscanf(text.c_str(), "%u.%u.%u.%u%c", &a, &b, &cc, &d, &extra) == 4 && a < 256 && b < 256 &&
+        cc < 256 && d < 256) {
         set_eax(c, a | (b << 8) | (cc << 16) | (d << 24));
     } else {
         set_eax(c, 0xffffffffu); // INADDR_NONE
@@ -1397,11 +1480,52 @@ void m_timeEndPeriod(X86 *c) {
     set_eax(c, 0);
 }
 
-// mmio: a thin wrapper over the same case-insensitive file layer as CreateFileA.
+// mmio: the same case-insensitive file layer as CreateFileA, plus the
+// memory-file form LHaudiodllR uses to hand its RIFF parser a buffer. The two
+// backings share one handle table; only read/seek/write differ.
+//
+// Field offsets and error codes are the Windows mmsystem.h ones: MMIOINFO is
+// 0x48 bytes (fccIOProc 0x04, wErrorRet 0x0c, cchBuffer 0x14, pchBuffer 0x18)
+// and MMCKINFO is 0x14 bytes. The RIFF walk is what the LHaudiodllR parser
+// (0x10210910) drives: mmioOpenA(NULL, MMIOINFO{'MEM '}), then
+// mmioDescend/'WAVE'/FINDRIFF, 'fmt '/FINDCHUNK, mmioRead, mmioAscend, 'data'.
+const uint32_t MMIO_FINDCHUNK = 0x0010;
+const uint32_t MMIO_FINDRIFF = 0x0020;
+const uint32_t MMIO_FINDLIST = 0x0040;
+const uint32_t MMIOERR_FILENOTFOUND = 0x101;
+const uint32_t MMIOERR_CANNOTOPEN = 0x103;
+const uint32_t MMIOERR_CANNOTSEEK = 0x107;
+const uint32_t MMIOERR_CHUNKNOTFOUND = 0x109;
+const uint32_t MMIO_DIRTY = 0x10000000u;
+const uint32_t FOURCC_RIFF = 0x46464952u; // 'RIFF'
+const uint32_t FOURCC_LIST = 0x5453494cu; // 'LIST'
+const uint32_t FOURCC_MEM = 0x204d454du;  // 'MEM '
+enum {
+    MMIOINFO_SIZE = 0x48,
+    MMIOINFO_OFF_fccIOProc = 0x04,
+    MMIOINFO_OFF_wErrorRet = 0x0c,
+    MMIOINFO_OFF_cchBuffer = 0x14,
+    MMIOINFO_OFF_pchBuffer = 0x18,
+    MMIOINFO_OFF_pchNext = 0x1c,
+    MMIOINFO_OFF_pchEndRead = 0x20,
+    MMIOINFO_OFF_pchEndWrite = 0x24,
+    MMCKINFO_SIZE = 0x14,
+    MMCKINFO_OFF_ckid = 0x00,
+    MMCKINFO_OFF_cksize = 0x04,
+    MMCKINFO_OFF_fccType = 0x08,
+    MMCKINFO_OFF_dwDataOffset = 0x0c,
+    MMCKINFO_OFF_dwFlags = 0x10,
+};
+
 struct MmioFile {
     FILE *fp = nullptr;
     std::string path;
     bool writable = false;
+    // Memory-file form: the guest buffer and the current offset into it.
+    bool memory = false;
+    uint32_t buffer = 0;
+    uint32_t length = 0;
+    uint32_t pos = 0;
 };
 std::map<uint32_t, MmioFile> &mmios() {
     static std::map<uint32_t, MmioFile> m;
@@ -1409,20 +1533,69 @@ std::map<uint32_t, MmioFile> &mmios() {
 }
 uint32_t g_next_mmio = 0x00040004;
 
+// Reads up to n bytes at an absolute offset from either backing store into
+// host memory. Returns the number of bytes read; the file position is left at
+// offset + got.
+uint32_t mmio_read_at(MmioFile &f, uint32_t offset, void *dst, uint32_t n) {
+    if (f.memory) {
+        if (offset >= f.length)
+            return 0;
+        uint32_t avail = f.length - offset;
+        if (n > avail)
+            n = avail;
+        if (!n || !gm_valid(f.buffer + offset, n))
+            return 0;
+        memcpy(dst, g_mem + f.buffer + offset, n);
+        return n;
+    }
+    if (!f.fp || fseek(f.fp, (long)offset, SEEK_SET) != 0)
+        return 0;
+    return (uint32_t)fread(dst, 1, n, f.fp);
+}
+
 void m_mmioOpenA(X86 *c) {
-    std::string name = gm_str(arg(c, 0), 260);
+    uint32_t name_ptr = arg(c, 0);
     uint32_t pinfo = arg(c, 1), flags = arg(c, 2);
     bool write = (flags & 0x00000001) != 0;     // MMIO_WRITE
     bool readwrite = (flags & 0x00000002) != 0; // MMIO_READWRITE
     bool create = (flags & 0x00001000) != 0;    // MMIO_CREATE
 
+    // Memory-file form: a null name and lpmmioinfo naming FOURCC_MEM. The
+    // buffer is MMIOINFO.pchBuffer of cchBuffer. Windows fills the memory
+    // cursors on the way out.
+    if (!name_ptr && pinfo && gm_valid(pinfo, MMIOINFO_SIZE) &&
+        rd32(pinfo + MMIOINFO_OFF_fccIOProc) == FOURCC_MEM) {
+        uint32_t buf = rd32(pinfo + MMIOINFO_OFF_pchBuffer);
+        uint32_t len = rd32(pinfo + MMIOINFO_OFF_cchBuffer);
+        if (!buf || !len || !gm_valid(buf, len)) {
+            wr32(pinfo + MMIOINFO_OFF_wErrorRet, MMIOERR_CANNOTOPEN);
+            set_eax(c, 0);
+            return;
+        }
+        MmioFile f;
+        f.memory = true;
+        f.buffer = buf;
+        f.length = len;
+        f.pos = 0;
+        f.writable = write || readwrite || create;
+        uint32_t h = g_next_mmio;
+        g_next_mmio += 4;
+        mmios()[h] = f;
+        wr32(pinfo + MMIOINFO_OFF_pchNext, buf);
+        wr32(pinfo + MMIOINFO_OFF_pchEndRead, buf + len);
+        wr32(pinfo + MMIOINFO_OFF_pchEndWrite, buf + len);
+        set_eax(c, h);
+        return;
+    }
+
+    std::string name = gm_str(name_ptr, 260);
     std::string host = win32_host_path(name, write || readwrite || create);
     if (recomp_env("TRACE_FILES"))
         LOGW("file: mmioOpen \"%s\" -> \"%s\"", name.c_str(), host.c_str());
     if (host.empty()) {
         LOGV("mmioOpenA(%s): not found", name.c_str());
-        if (pinfo)
-            wr32(pinfo + 4, 258); // MMIOINFO.wErrorRet = MMIOERR_FILENOTFOUND
+        if (pinfo && gm_valid(pinfo, MMIOINFO_SIZE))
+            wr32(pinfo + MMIOINFO_OFF_wErrorRet, MMIOERR_FILENOTFOUND);
         set_eax(c, 0);
         return;
     }
@@ -1433,16 +1606,20 @@ void m_mmioOpenA(X86 *c) {
     FILE *fp = fopen(host.c_str(), mode);
     if (!fp) {
         LOGV("mmioOpenA(%s, mode %s): open failed", name.c_str(), mode);
-        if (pinfo)
-            wr32(pinfo + 4, 262); // MMIOERR_CANNOTOPEN
+        if (pinfo && gm_valid(pinfo, MMIOINFO_SIZE))
+            wr32(pinfo + MMIOINFO_OFF_wErrorRet, MMIOERR_CANNOTOPEN);
         set_eax(c, 0);
         return;
     }
     if (create || write || readwrite)
         win32_invalidate_dir_cache();
+    MmioFile f;
+    f.fp = fp;
+    f.path = host;
+    f.writable = write || readwrite || create;
     uint32_t h = g_next_mmio;
     g_next_mmio += 4;
-    mmios()[h] = MmioFile{fp, host, write || readwrite || create};
+    mmios()[h] = f;
     set_eax(c, h);
 }
 
@@ -1453,12 +1630,23 @@ void m_mmioWrite(X86 *c) {
         set_eax(c, 0xffffffffu);
         return;
     }
-    set_eax(c, (uint32_t)fwrite(g_mem + buf, 1, n, it->second.fp));
+    MmioFile &f = it->second;
+    if (f.memory) {
+        if (f.pos + n < f.pos || f.pos + n > f.length || !gm_valid(f.buffer + f.pos, n)) {
+            set_eax(c, 0);
+            return;
+        }
+        memcpy(g_mem + f.buffer + f.pos, g_mem + buf, n);
+        f.pos += n;
+        set_eax(c, n);
+        return;
+    }
+    set_eax(c, (uint32_t)fwrite(g_mem + buf, 1, n, f.fp));
 }
 
 void m_mmioFlush(X86 *c) {
     auto it = mmios().find(arg(c, 0));
-    if (it != mmios().end())
+    if (it != mmios().end() && !it->second.memory)
         fflush(it->second.fp);
     set_eax(c, 0);
 }
@@ -1470,8 +1658,22 @@ void m_mmioRead(X86 *c) {
         set_eax(c, 0xffffffffu);
         return;
     }
-    size_t got = fread(g_mem + buf, 1, n, it->second.fp);
-    set_eax(c, (uint32_t)got);
+    MmioFile &f = it->second;
+    if (f.memory) {
+        if (f.pos >= f.length) {
+            set_eax(c, 0);
+            return;
+        }
+        uint32_t avail = f.length - f.pos;
+        if (n > avail)
+            n = avail;
+        if (n && gm_valid(f.buffer + f.pos, n))
+            memcpy(g_mem + buf, g_mem + f.buffer + f.pos, n);
+        f.pos += n;
+        set_eax(c, n);
+        return;
+    }
+    set_eax(c, (uint32_t)fread(g_mem + buf, 1, n, f.fp));
 }
 
 void m_mmioSeek(X86 *c) {
@@ -1482,18 +1684,31 @@ void m_mmioSeek(X86 *c) {
         set_eax(c, 0xffffffffu);
         return;
     }
+    MmioFile &f = it->second;
+    if (f.memory) {
+        int64_t base = origin == 1 ? f.pos : origin == 2 ? (int64_t)f.length : 0;
+        int64_t next = base + off;
+        if (next < 0) {
+            set_eax(c, 0xffffffffu);
+            return;
+        }
+        f.pos = (uint32_t)next;
+        set_eax(c, f.pos);
+        return;
+    }
     int whence = origin == 1 ? SEEK_CUR : origin == 2 ? SEEK_END : SEEK_SET;
-    if (fseek(it->second.fp, off, whence) != 0) {
+    if (fseek(f.fp, off, whence) != 0) {
         set_eax(c, 0xffffffffu);
         return;
     }
-    set_eax(c, (uint32_t)ftell(it->second.fp));
+    set_eax(c, (uint32_t)ftell(f.fp));
 }
 
 void m_mmioClose(X86 *c) {
     auto it = mmios().find(arg(c, 0));
     if (it != mmios().end()) {
-        fclose(it->second.fp);
+        if (it->second.fp)
+            fclose(it->second.fp);
         mmios().erase(it);
     }
     set_eax(c, 0);
@@ -1502,6 +1717,86 @@ void m_mmioClose(X86 *c) {
 void m_mmioSetBuffer(X86 *c) {
     set_eax(c, 0);
 } // MMSYSERR_NOERROR
+
+// mmioDescend/hmmio, lpck, lpckParent, fuDescend). Windows walks RIFF chunks:
+// FINDRIFF selects a 'RIFF' whose fccType matches, FINDLIST a 'LIST',
+// FINDCHUNK a ckid, and no flag takes the next chunk at the current offset.
+// With a parent the search is bounded by its data; a chunk not found returns
+// MMIOERR_CHUNKNOTFOUND. cksize counts the bytes after the 8-byte header and
+// includes the form type for RIFF/LIST.
+void m_mmioDescend(X86 *c) {
+    auto it = mmios().find(arg(c, 0));
+    uint32_t pck = arg(c, 1), parent = arg(c, 2), flags = arg(c, 3);
+    if (it == mmios().end() || !pck || !gm_valid(pck, MMCKINFO_SIZE)) {
+        set_eax(c, MMIOERR_CHUNKNOTFOUND);
+        return;
+    }
+    MmioFile &f = it->second;
+    uint32_t want_ckid = rd32(pck + MMCKINFO_OFF_ckid);
+    uint32_t want_fcc = rd32(pck + MMCKINFO_OFF_fccType);
+    uint32_t start = f.pos, end = f.length;
+    if (parent && gm_valid(parent, MMCKINFO_SIZE)) {
+        uint32_t poff = rd32(parent + MMCKINFO_OFF_dwDataOffset);
+        uint32_t psize = rd32(parent + MMCKINFO_OFF_cksize);
+        uint32_t pckid = rd32(parent + MMCKINFO_OFF_ckid);
+        // For a RIFF/LIST parent dwDataOffset points at its form type; the
+        // children begin after it. cksize includes the form type, so the
+        // bound is dwDataOffset + cksize.
+        start = (pckid == FOURCC_RIFF || pckid == FOURCC_LIST) ? poff + 4 : poff;
+        end = poff + psize;
+    }
+    while (start + 8 <= end && start + 8 <= f.length) {
+        uint32_t hdr[2];
+        if (mmio_read_at(f, start, hdr, 8) != 8)
+            break;
+        uint32_t ckid = hdr[0], cksize = hdr[1];
+        bool form = ckid == FOURCC_RIFF || ckid == FOURCC_LIST;
+        uint32_t fcc = 0;
+        if (form && mmio_read_at(f, start + 8, &fcc, 4) != 4)
+            break;
+        bool match;
+        if (flags & MMIO_FINDRIFF)
+            match = ckid == FOURCC_RIFF && fcc == want_fcc;
+        else if (flags & MMIO_FINDLIST)
+            match = ckid == FOURCC_LIST && fcc == want_fcc;
+        else if (flags & MMIO_FINDCHUNK)
+            match = ckid == want_ckid;
+        else
+            match = true;
+        if (match) {
+            wr32(pck + MMCKINFO_OFF_ckid, ckid);
+            wr32(pck + MMCKINFO_OFF_cksize, cksize);
+            if (form)
+                wr32(pck + MMCKINFO_OFF_fccType, fcc);
+            wr32(pck + MMCKINFO_OFF_dwDataOffset, start + 8);
+            wr32(pck + MMCKINFO_OFF_dwFlags, 0);
+            f.pos = start + 8;
+            set_eax(c, 0);
+            return;
+        }
+        uint32_t step = 8 + ((cksize + 1) & ~1u);
+        if (step < 8 || start + step <= start)
+            break;
+        start += step;
+    }
+    set_eax(c, MMIOERR_CHUNKNOTFOUND);
+}
+
+// mmioAscend(hmmio, lpck, fuAscend): move to the byte after the chunk and
+// clear MMIO_DIRTY. The chunk's header is 8 bytes and cksize counts the data.
+void m_mmioAscend(X86 *c) {
+    auto it = mmios().find(arg(c, 0));
+    uint32_t pck = arg(c, 1);
+    if (it == mmios().end() || !pck || !gm_valid(pck, MMCKINFO_SIZE)) {
+        set_eax(c, MMIOERR_CANNOTSEEK);
+        return;
+    }
+    uint32_t off = rd32(pck + MMCKINFO_OFF_dwDataOffset);
+    uint32_t size = rd32(pck + MMCKINFO_OFF_cksize);
+    it->second.pos = off + ((size + 1) & ~1u);
+    wr32(pck + MMCKINFO_OFF_dwFlags, rd32(pck + MMCKINFO_OFF_dwFlags) & ~MMIO_DIRTY);
+    set_eax(c, 0);
+}
 
 // ---------------------------------------------------------------------------
 // MIDI out.
@@ -2294,6 +2589,7 @@ const ImportShim g_misc_shims[] = {
     {"ole32.dll", "CoTaskMemAlloc", 1, o_CoTaskMemAlloc},
     {"ole32.dll", "CoTaskMemFree", 1, o_CoTaskMemFree},
     {"ole32.dll", "IsEqualGUID", 2, o_IsEqualGUID},
+    {"ole32.dll", "CoFileTimeToDosDateTime", 3, o_CoFileTimeToDosDateTime},
     {"ole32.dll", "CoUninitialize", 0, o_CoUninitialize},
     {"ole32.dll", "PropVariantClear", 1, o_PropVariantClear},
     {"ole32.dll", "PropVariantCopy", 2, o_PropVariantCopy},
@@ -2391,6 +2687,8 @@ const ImportShim g_misc_shims[] = {
     {"WINMM.dll", "mmioOpenA", 3, m_mmioOpenA},
     {"WINMM.dll", "mmioRead", 3, m_mmioRead},
     {"WINMM.dll", "mmioSeek", 3, m_mmioSeek},
+    {"WINMM.dll", "mmioDescend", 4, m_mmioDescend},
+    {"WINMM.dll", "mmioAscend", 3, m_mmioAscend},
     {"WINMM.dll", "mmioClose", 2, m_mmioClose},
     {"WINMM.dll", "mmioSetBuffer", 4, m_mmioSetBuffer},
     // Not imported by this EXE, but mmio is only coherent with both halves.
@@ -2586,6 +2884,7 @@ const ImportShim g_misc_shims[] = {
     {"QMIXER.dll", "QSWaveMixPauseChannel", 3, nullptr},
     {"QMIXER.dll", "QSWaveMixStopChannel", 3, nullptr},
     {"QMIXER.dll", "QSWaveMixConfigureChannel", 5, nullptr},
+    {"QMIXER.dll", "QSWaveMixGetChannelParams", 3, nullptr},
     {"QMIXER.dll", "QSWaveMixEnableChannel", 4, nullptr},
     {"QMIXER.dll", "QSWaveMixOpenWaveEx", 3, nullptr},
     {"QMIXER.dll", "QSWaveMixFreeWave", 2, nullptr},

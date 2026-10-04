@@ -1444,6 +1444,14 @@ static void test_files(X86 *c) {
     check(cwd_probe == (uint32_t)strlen(RECOMP_GUEST_ROOT) + 1,
           "GetCurrentDirectoryA(1, buf) reports the required size (%u)", cwd_probe);
 
+    // GetTempPathA: virtual directory with a trailing backslash; the return
+    // is the length without the null, or the required size when too small.
+    uint32_t tl = call_import(c, "KERNEL32.dll", "GetTempPathA", {260, pathbuf});
+    check(gm_str(pathbuf) == "C:\\Windows\\Temp\\" && tl == gm_str(pathbuf).size(),
+          "GetTempPathA -> \"%s\" (%u)", gm_str(pathbuf).c_str(), tl);
+    uint32_t tprobe = call_import(c, "KERNEL32.dll", "GetTempPathA", {1, pathbuf});
+    check(tprobe == tl + 1, "GetTempPathA(1, buf) reports the required size (%u)", tprobe);
+
     // The path GetModuleFileNameA hands out must open, whatever the guest
     // root's shape: a game installed under C:\GOG Games\<name> spells its
     // own files through two root components, not one.
@@ -7036,6 +7044,100 @@ static void test_unsupported_diagnostics() {
     remove_tree(dir);
 }
 
+// WINMM mmio, driven the way LHaudiodllR 0x10210910 drives it: a memory-file
+// MMIOINFO ('MEM ') is opened, the RIFF/'fmt '/'data' chunks are walked with
+// mmioDescend/mmioAscend/mmioRead, and a missing chunk reports
+// MMIOERR_CHUNKNOTFOUND. The file backing is exercised against the image
+// itself, which is not a RIFF.
+static void test_mmio(X86 *c) {
+    section("WINMM mmio: memory RIFF walk, ascend, chunk-not-found, file backing");
+
+    // RIFF/WAVE with an 18-byte fmt chunk and a 4-byte data chunk (50 bytes).
+    const uint32_t total = 50;
+    uint32_t riff = scratch_block(total);
+    wr32(riff + 0x00, 0x46464952); // 'RIFF'
+    wr32(riff + 0x04, total - 8);  // cksize
+    wr32(riff + 0x08, 0x45564157); // 'WAVE'
+    wr32(riff + 0x0c, 0x20746d66); // 'fmt '
+    wr32(riff + 0x10, 18);         // fmt cksize
+    wr16(riff + 0x14, 1);          // wFormatTag = WAVE_FORMAT_PCM
+    wr16(riff + 0x16, 1);          // nChannels
+    wr32(riff + 0x18, 8000);       // nSamplesPerSec
+    wr32(riff + 0x1c, 8000);       // nAvgBytesPerSec
+    wr16(riff + 0x20, 1);          // nBlockAlign
+    wr16(riff + 0x22, 8);          // wBitsPerSample
+    wr16(riff + 0x24, 0);          // cbSize
+    wr32(riff + 0x26, 0x61746164); // 'data'
+    wr32(riff + 0x2a, 4);          // data cksize
+    wr8(riff + 0x2e, 0x11);
+    wr8(riff + 0x2f, 0x22);
+    wr8(riff + 0x30, 0x33);
+    wr8(riff + 0x31, 0x44);
+
+    uint32_t info = scratch_block(0x48);
+    wr32(info + 0x04, 0x204d454d); // MMIOINFO.fccIOProc = 'MEM '
+    wr32(info + 0x14, total);      // cchBuffer
+    wr32(info + 0x18, riff);       // pchBuffer
+    uint32_t h = call_import(c, "WINMM.dll", "mmioOpenA", {0, info, 0});
+    check(h != 0, "mmioOpenA(memory MMIOINFO) -> %08x", h);
+    check(rd32(info + 0x1c) == riff && rd32(info + 0x20) == riff + total,
+          "mmioOpenA filled the memory cursors");
+
+    uint32_t parent = scratch_block(0x14);
+    wr32(parent + 0x08, 0x45564157); // fccType = 'WAVE'
+    uint32_t d = call_import(c, "WINMM.dll", "mmioDescend", {h, parent, 0, 0x20});
+    check(d == 0 && rd32(parent + 0x0c) == 8 && rd32(parent + 0x04) == total - 8,
+          "mmioDescend('WAVE', FINDRIFF) -> %u, data@%u size=%u", d, rd32(parent + 0x0c),
+          rd32(parent + 0x04));
+
+    uint32_t fmt = scratch_block(0x14);
+    wr32(fmt + 0x00, 0x20746d66); // ckid = 'fmt '
+    d = call_import(c, "WINMM.dll", "mmioDescend", {h, fmt, parent, 0x10});
+    check(d == 0 && rd32(fmt + 0x0c) == 20 && rd32(fmt + 0x04) == 18,
+          "mmioDescend('fmt ', FINDCHUNK) -> %u, data@%u size=%u", d, rd32(fmt + 0x0c),
+          rd32(fmt + 0x04));
+
+    uint32_t wfx = scratch_block(0x20);
+    uint32_t got = call_import(c, "WINMM.dll", "mmioRead", {h, wfx, 0x12});
+    check(got == 0x12 && rd16(wfx) == 1 && rd16(wfx + 2) == 1 && rd32(wfx + 4) == 8000 &&
+              rd16(wfx + 0x0e) == 8,
+          "mmioRead(18) -> %u bytes, PCM %u Hz %u bit", got, rd32(wfx + 4), rd16(wfx + 0x0e));
+
+    d = call_import(c, "WINMM.dll", "mmioAscend", {h, fmt, 0});
+    check(d == 0, "mmioAscend('fmt ') -> %u", d);
+
+    uint32_t data = scratch_block(0x14);
+    wr32(data + 0x00, 0x61746164); // ckid = 'data'
+    d = call_import(c, "WINMM.dll", "mmioDescend", {h, data, parent, 0x10});
+    check(d == 0 && rd32(data + 0x0c) == 46 && rd32(data + 0x04) == 4,
+          "mmioDescend('data', FINDCHUNK) -> %u, data@%u size=%u", d, rd32(data + 0x0c),
+          rd32(data + 0x04));
+    uint32_t sample = scratch_block(8);
+    got = call_import(c, "WINMM.dll", "mmioRead", {h, sample, 4});
+    check(got == 4 && (rd32(sample) & 0xff) == 0x11, "mmioRead(samples) -> %u", got);
+
+    uint32_t fact = scratch_block(0x14);
+    wr32(fact + 0x00, 0x74636166); // ckid = 'fact'
+    d = call_import(c, "WINMM.dll", "mmioDescend", {h, fact, parent, 0x10});
+    check(d == 0x109, "missing chunk -> MMIOERR_CHUNKNOTFOUND (%u)", d);
+
+    call_import(c, "WINMM.dll", "mmioClose", {h, 0});
+
+    // File backing: the image opens, reads its MZ header, and is not a RIFF.
+    uint32_t name = put_str(RECOMP_GUEST_ROOT "\\" RECOMP_EXECUTABLE);
+    uint32_t fh = call_import(c, "WINMM.dll", "mmioOpenA", {name, 0, 0});
+    check(fh != 0, "mmioOpenA(file) -> %08x", fh);
+    uint32_t hdr = scratch_block(4);
+    got = call_import(c, "WINMM.dll", "mmioRead", {fh, hdr, 2});
+    check(got == 2 && rd16(hdr) == 0x5a4d, "mmioRead(file) -> MZ (%u bytes)", got);
+    uint32_t notriff = scratch_block(0x14);
+    wr32(notriff + 0x08, 0x45564157);
+    d = call_import(c, "WINMM.dll", "mmioDescend", {fh, notriff, 0, 0x20});
+    check(d == 0x109, "non-RIFF file -> MMIOERR_CHUNKNOTFOUND (%u)", d);
+    check(call_import(c, "WINMM.dll", "mmioSeek", {fh, 0, 0}) == 0, "mmioSeek(file) to 0");
+    call_import(c, "WINMM.dll", "mmioClose", {fh, 0});
+}
+
 int main(int argc, char **argv) {
     if (argc == 4 && !strcmp(argv[1], "--child-import-diagnostic")) {
         if (!freopen(argv[3], "w", stderr))
@@ -7213,6 +7315,7 @@ int main(int argc, char **argv) {
     test_winsock_resolver(c);
     test_windows_version(c);
     test_boot_shims(c);
+    test_mmio(c);
     test_gdi_and_com(c);
     test_cxx_throw_description(c);
     test_native_draw_waits(c);

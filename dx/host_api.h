@@ -92,6 +92,16 @@ void host_d3d_draw(const struct HostD3DDrawSnapshot *d);
 void host_d3d_clear(uint32_t flags, const int32_t *rects, uint32_t count, uint32_t color,
                     float depth);
 
+// Direct3D 7 command accounting. The D3D7 front end submits directly to the
+// Rust d3d8-wgpu ABI rather than through the HostD3DDrawSnapshot command list
+// above, so the host callbacks above never see it. These are informational
+// only: the headless report counts them, and a renderer host ignores them.
+// They carry no data, which is why the D3D7 path needs no snapshot copy.
+void host_d3d7_begin_scene(void);
+void host_d3d7_draw(void);
+void host_d3d7_clear(void);
+void host_d3d7_texture(void);
+
 // ---------------------------------------------------------------------------
 // The Direct3D render target.
 //
