@@ -4056,6 +4056,19 @@ static void test_registry(X86 *c) {
           "RegQueryValueExA(Detail)");
     check(rd32(ptype) == 4 && rd32(pbuf) == 3, "the DWORD round tripped as %u", rd32(pbuf));
 
+    // RegEnumValue reports values in creation order, which survives the reload:
+    // InstallPath was created before Detail, and alphabetical order would put
+    // Detail first (Black & White's settings reader depends on the real order).
+    uint32_t ename = scratch_block(64), elen = scratch_block(4);
+    wr32(elen, 64);
+    check(call_import(c, "ADVAPI32.dll", "RegEnumValueA", {hk2, 0, ename, elen, 0, 0, 0, 0}) == 0 &&
+              gm_str(ename) == "InstallPath",
+          "RegEnumValueA index 0 is the first value created: \"%s\"", gm_str(ename).c_str());
+    wr32(elen, 64);
+    check(call_import(c, "ADVAPI32.dll", "RegEnumValueA", {hk2, 1, ename, elen, 0, 0, 0, 0}) == 0 &&
+              gm_str(ename) == "Detail",
+          "RegEnumValueA index 1 is the second: \"%s\"", gm_str(ename).c_str());
+
     uint32_t mixed_key = put_str("SOFTWARE\\recomptests\\REGISTRY");
     uint32_t phk3 = scratch_block(4);
     check(call_import(c, "ADVAPI32.dll", "RegOpenKeyExA",

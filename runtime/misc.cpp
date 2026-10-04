@@ -351,7 +351,13 @@ struct RegValue {
     std::string str;          // REG_SZ / REG_EXPAND_SZ
     uint32_t dword = 0;       // REG_DWORD
     std::vector<uint8_t> bin; // REG_BINARY and everything else
+    // Creation order within its key. Windows enumerates a key's values in the
+    // order they were created, and guests depend on it (Black & White's
+    // settings reader gives up on the first value that does not fit its 4-byte
+    // buffer, so the DWORD settings have to be enumerated before any string).
+    uint64_t seq = 0;
 };
+uint64_t g_reg_seq = 0;
 
 // Registry key paths and value names are case-insensitive on Windows.
 struct CiLess {
@@ -360,6 +366,16 @@ struct CiLess {
     }
 };
 typedef std::map<std::string, RegValue, CiLess> RegValues;
+
+// A key's values in creation order, as RegEnumValue reports them.
+std::vector<const std::pair<const std::string, RegValue> *> reg_in_order(const RegValues &v) {
+    std::vector<const std::pair<const std::string, RegValue> *> out;
+    for (const auto &kv : v)
+        out.push_back(&kv);
+    std::stable_sort(out.begin(), out.end(),
+                     [](const auto *a, const auto *b) { return a->second.seq < b->second.seq; });
+    return out;
+}
 
 std::map<std::string, RegValues, CiLess> &regstore() {
     static std::map<std::string, RegValues, CiLess> m;
@@ -479,8 +495,32 @@ void registry_load() {
                     rv.bin = hex_to_bytes(d->second.str);
                 }
             }
+            auto q = val.second.obj.find("seq");
+            if (q != val.second.obj.end() && q->second.kind == JValue::NUM) {
+                rv.seq = (uint64_t)q->second.num;
+                if (rv.seq > g_reg_seq)
+                    g_reg_seq = rv.seq;
+            }
             values[val.first] = rv;
         }
+    }
+    // A file written before values carried a sequence has lost its creation
+    // order. Give those values one now: DWORDs first, then the rest by name,
+    // after everything that has a real sequence. A heuristic for old files only;
+    // every value written from now on records its true position.
+    for (auto &key : regstore()) {
+        std::vector<RegValues::iterator> legacy;
+        for (auto it = key.second.begin(); it != key.second.end(); ++it)
+            if (!it->second.seq)
+                legacy.push_back(it);
+        std::stable_sort(legacy.begin(), legacy.end(),
+                         [](const RegValues::iterator &a, const RegValues::iterator &b) {
+                             const bool ad = a->second.type == 4 || a->second.type == 5;
+                             const bool bd = b->second.type == 4 || b->second.type == 5;
+                             return ad != bd ? ad : false;
+                         });
+        for (auto &it : legacy)
+            it->second.seq = ++g_reg_seq;
     }
     LOGV("registry: loaded %zu keys from %s", regstore().size(), path.c_str());
 }
@@ -508,20 +548,24 @@ void registry_flush() {
         first_key = false;
         fprintf(f, "  \"%s\": {\n", json_escape(key.first).c_str());
         bool first_val = true;
-        for (const auto &val : key.second) {
+        for (const auto *vp : reg_in_order(key.second)) {
+            const auto &val = *vp;
             if (!first_val)
                 fprintf(f, ",\n");
             first_val = false;
             const RegValue &rv = val.second;
             if (rv.type == 4 || rv.type == 5)
-                fprintf(f, "    \"%s\": {\"type\": %u, \"data\": %u}",
-                        json_escape(val.first).c_str(), rv.type, rv.dword);
+                fprintf(f, "    \"%s\": {\"type\": %u, \"data\": %u, \"seq\": %llu}",
+                        json_escape(val.first).c_str(), rv.type, rv.dword,
+                        (unsigned long long)rv.seq);
             else if (rv.type == 1 || rv.type == 2)
-                fprintf(f, "    \"%s\": {\"type\": %u, \"data\": \"%s\"}",
-                        json_escape(val.first).c_str(), rv.type, json_escape(rv.str).c_str());
+                fprintf(f, "    \"%s\": {\"type\": %u, \"data\": \"%s\", \"seq\": %llu}",
+                        json_escape(val.first).c_str(), rv.type, json_escape(rv.str).c_str(),
+                        (unsigned long long)rv.seq);
             else
-                fprintf(f, "    \"%s\": {\"type\": %u, \"data\": \"%s\"}",
-                        json_escape(val.first).c_str(), rv.type, bytes_to_hex(rv.bin).c_str());
+                fprintf(f, "    \"%s\": {\"type\": %u, \"data\": \"%s\", \"seq\": %llu}",
+                        json_escape(val.first).c_str(), rv.type, bytes_to_hex(rv.bin).c_str(),
+                        (unsigned long long)rv.seq);
         }
         fprintf(f, "\n  }");
     }
@@ -697,19 +741,23 @@ void reg_query(X86 *c, const std::string &name, bool wide) {
     std::string path =
         ki != regkeys().end() ? ki->second : std::string(hive_name(hkey) ? hive_name(hkey) : "");
     if (path.empty()) {
+        LOGV("registry: query 0x%08x \"%s\": no such key handle", hkey, name.c_str());
         set_eax(c, 6);
         return;
     }
     auto si = regstore().find(path);
     if (si == regstore().end()) {
+        LOGV("registry: query %s \"%s\": key absent", path.c_str(), name.c_str());
         set_eax(c, 2);
         return;
     }
     auto vi = si->second.find(name);
     if (vi == si->second.end()) {
+        LOGV("registry: query %s \"%s\": value absent", path.c_str(), name.c_str());
         set_eax(c, 2);
         return;
     }
+    LOGV("registry: query %s \"%s\": found", path.c_str(), name.c_str());
 
     set_eax(c, reg_read_value(vi->second, wide, ptype, pdata, pcb));
 }
@@ -739,7 +787,12 @@ void reg_set(X86 *c, const std::string &name, bool wide) {
     } else if (pdata) {
         rv.bin.assign(g_mem + pdata, g_mem + pdata + cb);
     }
-    regstore()[path][name] = rv;
+    {
+        auto &vals = regstore()[path];
+        auto old = vals.find(name);
+        rv.seq = old != vals.end() ? old->second.seq : ++g_reg_seq; // overwriting keeps its place
+        vals[name] = rv;
+    }
     g_registry_dirty = true;
     registry_flush();
     set_eax(c, 0);
@@ -822,8 +875,8 @@ void a_RegEnumValueW(X86 *c) {
         set_eax(c, 259);
         return;
     }
-    auto value = it->second.begin();
-    std::advance(value, arg(c, 1));
+    const auto ordered = reg_in_order(it->second);
+    const auto *value = ordered[arg(c, 1)];
     uint32_t hr = reg_write_name(value->first, arg(c, 2), arg(c, 3));
     if (!hr)
         hr = reg_read_value(value->second, true, arg(c, 5), arg(c, 6), arg(c, 7));
@@ -856,11 +909,12 @@ void a_RegEnumValueA(X86 *c) {
         set_eax(c, 259);
         return;
     }
-    auto value = it->second.begin();
-    std::advance(value, arg(c, 1));
+    const auto ordered = reg_in_order(it->second);
+    const auto *value = ordered[arg(c, 1)];
     uint32_t hr = reg_write_name_a(value->first, arg(c, 2), arg(c, 3));
     if (!hr)
         hr = reg_read_value(value->second, false, arg(c, 5), arg(c, 6), arg(c, 7));
+    LOGV("registry: enum %s #%u \"%s\" -> %u", path.c_str(), arg(c, 1), value->first.c_str(), hr);
     set_eax(c, hr);
 }
 void a_RegQueryInfoKeyW(X86 *c) {
