@@ -958,7 +958,23 @@ void u_TranslateMessage(X86 *c) {
             bool shift = (g_key_state[0x10] & 0x80) != 0;
             if (!shift && ch >= 'A' && ch <= 'Z')
                 ch += 32;
-            host_post_message(rd32(p), msg == 0x0100 ? 0x0102 : 0x0106, ch, lparam);
+            // The host posts a WM_CHAR of its own right behind the WM_KEYDOWN it
+            // delivers (host/input_gate.cpp), for guests that never call
+            // TranslateMessage. A guest that does call it - Black & White's loop
+            // does - would then see every typed character twice. Windows
+            // generates the WM_CHAR only here, so when the matching one is
+            // already queued directly behind this keystroke it is the same
+            // keystroke's character (the host's carries the real shift and
+            // layout state) and is not generated again.
+            const uint32_t chmsg = msg == 0x0100 ? 0x0102 : 0x0106;
+            if (!queue().empty()) {
+                const Msg &next = queue().front();
+                if (next.hwnd == rd32(p) && next.message == chmsg) {
+                    set_eax(c, 1);
+                    return;
+                }
+            }
+            host_post_message(rd32(p), chmsg, ch, lparam);
             set_eax(c, 1);
             return;
         }

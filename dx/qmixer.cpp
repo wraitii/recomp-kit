@@ -112,6 +112,9 @@ const uint32_t QSTREAM_CHUNKS = 4;
 // A channel. QMixer channels are small integers the guest chooses, so the
 // table is keyed by the guest's own index.
 struct Channel {
+    // The format of the sound the host voice was last started with, so a queued
+    // wave can be appended only when it matches.
+    uint32_t voice_rate = 0, voice_channels = 0, voice_bits = 0;
     bool open = false;
     bool enabled = true;
     bool paused = false;
@@ -194,7 +197,7 @@ struct Counters {
     uint32_t open_wave_refused_rec = 0, open_wave_refused_fmt = 0;
     uint32_t open_wave_refused_data = 0, open_wave_refused_stream = 0;
     uint32_t open_wave_no_session = 0;
-    uint32_t play_calls = 0, play_delivered = 0;
+    uint32_t play_calls = 0, play_delivered = 0, play_queued_static = 0;
     uint32_t drop_no_session = 0, drop_no_wave = 0, drop_no_channel = 0;
     uint32_t drop_disabled = 0, drop_paused = 0, drop_inactive = 0;
     uint32_t drop_no_voice = 0, drop_empty_wave = 0, drop_stream_dry = 0;
@@ -1296,6 +1299,35 @@ void QSWaveMixPlayEx(X86 *c) {
         return;
     }
 
+    // QMIX_QUEUEWAVE (inferred flag 0x400): the wave plays after whatever is
+    // already sounding on this channel instead of replacing it. Evidence: the
+    // game starts a piece of music as consecutive 2.2 s chunk waves on one
+    // channel within 105 ms, every PlayEx with flags 0x400 (LHaudiodllR
+    // 0x1020f4ca), with steadily rising peaks; replacing made only the last
+    // ~100 ms of the first chunk audible. The flag value's name is from memory
+    // of the SDK header, the behaviour from this use. SHIM(temporary): only
+    // same-format waves are appended; a different format replaces, loudly.
+    if ((flags & 0x400u) && ch->playing && host_audio_voice_remaining_bytes(ch->audio_channel)) {
+        const uint32_t rate = ch->frequency ? ch->frequency : w->rate;
+        if (rate == ch->voice_rate && w->channels == ch->voice_channels &&
+            w->bits == ch->voice_bits &&
+            host_audio_queue(ch->audio_channel, gm_ptr(w->pcm), w->bytes) > 0) {
+            ch->wave = w->handle;
+            ++counters().play_delivered;
+            ++counters().play_queued_static;
+            log_once("qmixer.queue",
+                     "qmixer: PlayEx flag 0x400 treated as QUEUEWAVE: the wave is appended to "
+                     "the channel's playing sound (inferred from use, see docs/shims.md)");
+            set_eax(c, QS_OK);
+            return;
+        }
+        log_once("qmixer.queue.fmt",
+                 "qmixer: SHIM(temporary): a queued wave (%u Hz %u ch %u bit) does not match the "
+                 "playing voice (%u Hz %u ch %u bit) and replaces it; queuing across formats "
+                 "needs resampling",
+                 rate, w->channels, w->bits, ch->voice_rate, ch->voice_channels, ch->voice_bits);
+    }
+
     HostAudioPlay p;
     memset(&p, 0, sizeof p);
     p.channel = ch->audio_channel;
@@ -1309,6 +1341,9 @@ void QSWaveMixPlayEx(X86 *c) {
     p.pan = ch->pan;
     announce_once(ch, w, w->pcm, w->bytes);
     host_audio_play(&p);
+    ch->voice_rate = (uint32_t)p.sample_rate;
+    ch->voice_channels = w->channels;
+    ch->voice_bits = w->bits;
     ++counters().host_plays;
     ++counters().play_delivered;
     ch->playing = true;

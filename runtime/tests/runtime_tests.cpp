@@ -2519,6 +2519,20 @@ static void test_windows(X86 *c) {
               rd32(msg + 4) == 0x0102 && rd32(msg + 8) == 'a',
           "the WM_CHAR carries 'a'");
 
+    // A host that already queued the WM_CHAR behind the keystroke: translating
+    // the keystroke must not produce a second character.
+    host_post_message(hwnd, 0x0100, 0x41, 0);
+    host_post_message(hwnd, 0x0102, 'a', 0);
+    check(call_import(c, "USER32.dll", "GetMessageA", {msg, 0, 0, 0}) == 1 &&
+              rd32(msg + 4) == 0x0100,
+          "GetMessageA returns the host's WM_KEYDOWN");
+    call_import(c, "USER32.dll", "TranslateMessage", {msg});
+    check(call_import(c, "USER32.dll", "PeekMessageA", {msg, 0, 0, 0, 1}) == 1 &&
+              rd32(msg + 4) == 0x0102 && rd32(msg + 8) == 'a',
+          "the host's WM_CHAR is delivered");
+    check(call_import(c, "USER32.dll", "PeekMessageA", {msg, 0, 0, 0, 1}) == 0,
+          "TranslateMessage did not queue a second WM_CHAR for the same keystroke");
+
     // Message filters, and an empty queue reports the documented error rather
     // than a message the system never sent.
     host_post_message(hwnd, 0x0201, 0, 0);

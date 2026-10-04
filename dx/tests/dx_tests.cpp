@@ -11725,6 +11725,55 @@ static void test_qmixer_refill_gate() {
 // gain of 0.433 and about -7.3 dB; read as hundredths of a decibel, as it was,
 // every positive number clamped to unity and every sound played at full
 // volume with no mix at all.
+// PlayEx flag 0x400 (QUEUEWAVE, inferred from the game's chunked music): a wave
+// started with it on a channel that is still sounding is appended to that sound
+// instead of replacing it. A wave in another format cannot be appended and
+// replaces, as logged.
+static void test_qmixer_queue_wave() {
+    cpu_reset();
+    qmixer_reset();
+    g_plays.clear();
+    g_queues.clear();
+    g_queue_enabled = true;
+    uint32_t hmix = call_shim(tramp("QMIXER.dll", "QSWaveMixInitEx"), {0});
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixActivate"), {hmix, 1}), 0u);
+    const auto open = [&](uint32_t where, uint32_t rate, uint16_t chans, uint32_t bytes) {
+        uint32_t wfx = sc(where);
+        gm_zero(wfx, SDK_WAVEFORMATEX);
+        wr16(wfx + WFX_OFF_wFormatTag, WAVE_FORMAT_PCM);
+        wr16(wfx + WFX_OFF_nChannels, chans);
+        wr32(wfx + WFX_OFF_nSamplesPerSec, rate);
+        wr16(wfx + WFX_OFF_nBlockAlign, (uint16_t)(chans * 2));
+        wr16(wfx + WFX_OFF_wBitsPerSample, 16);
+        uint32_t data = sc(where + 0x100);
+        for (uint32_t i = 0; i < bytes; ++i)
+            wr8(data + i, (uint8_t)i);
+        uint32_t rec = sc(where + 0x80);
+        gm_zero(rec, QSWAVEMIXOPENWAVEDATA_SIZE);
+        wr32(rec + QSOWD_OFF_lpFormat, wfx);
+        wr32(rec + QSOWD_OFF_lpData, data);
+        wr32(rec + QSOWD_OFF_dwDataSize, bytes);
+        return call_shim(tramp("QMIXER.dll", "QSWaveMixOpenWaveEx"), {hmix, rec, 8});
+    };
+    uint32_t a = open(0x2000, 22050, 2, 64), b = open(0x3000, 22050, 2, 32),
+             c2 = open(0x4000, 44100, 1, 16);
+    CHECK(a && b && c2);
+    uint32_t play = tramp("QMIXER.dll", "QSWaveMixPlayEx");
+    CHECK_EQ(call_shim(play, {hmix, 5, 0x400, a, 0, 0}), 0u);
+    CHECK_EQ(g_plays.size(), 1u);
+    CHECK_EQ(call_shim(play, {hmix, 5, 0x400, b, 0, 0}), 0u);
+    CHECK_EQ(g_plays.size(), 1u); // appended, not replaced
+    CHECK_EQ(g_queues.size(), 1u);
+    CHECK_EQ(g_queues[0].bytes, 32u);
+    // Without the flag a play still replaces.
+    CHECK_EQ(call_shim(play, {hmix, 5, 0x0, b, 0, 0}), 0u);
+    CHECK_EQ(g_plays.size(), 2u);
+    // A different format cannot be appended and replaces.
+    CHECK_EQ(call_shim(play, {hmix, 5, 0x400, c2, 0, 0}), 0u);
+    CHECK_EQ(g_plays.size(), 3u);
+    qmixer_reset();
+}
+
 // OpenWaveEx flag 4: the record's field 0 points at a 'MEM ' MMIOINFO of a
 // RIFF/WAVE image, as LHaudiodllR 0x10211dad builds it. A PCM image opens; a
 // compressed tag is refused with a nonzero last error; and QSWaveMixGetLastError
@@ -14630,6 +14679,7 @@ int main() {
         {"QMixer frame pump", test_qmixer_frame_pump},
         {"QMixer volume scale", test_qmixer_volume_scale},
         {"QMixer RIFF memory wave and GetLastError arity", test_qmixer_riff_memory_wave},
+        {"QMixer QUEUEWAVE for static waves", test_qmixer_queue_wave},
         {"QMixer stream lifetime", test_qmixer_stream_buffer_lifetime},
         {"QMixer stream prefetch", test_qmixer_stream_prefetch},
         {"QMixer refill gate", test_qmixer_refill_gate},
