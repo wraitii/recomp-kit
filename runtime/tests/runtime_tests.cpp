@@ -4110,11 +4110,13 @@ static void test_registry(X86 *c) {
                       {rd32(pphk), 0, 0, 0, qcount, qmax, 0, 0, 0, 0, 0, 0}) == 0 &&
               rd32(qcount) == 1,
           "RegQueryInfoKeyA counts the child");
-    wr32(qlen, 64);
-    check(call_import(c, "ADVAPI32.dll", "RegEnumKeyA", {rd32(pphk), 0, qname, qlen}) == 0 &&
+    // cchName is the buffer size by value (not a pointer), including the NUL.
+    check(call_import(c, "ADVAPI32.dll", "RegEnumKeyA", {rd32(pphk), 0, qname, 7}) == 234,
+          "RegEnumKeyA reports ERROR_MORE_DATA when the NUL does not fit");
+    check(call_import(c, "ADVAPI32.dll", "RegEnumKeyA", {rd32(pphk), 0, qname, 8}) == 0 &&
               gm_str(qname) == "Profile",
           "RegEnumKeyA returns the child name");
-    check(call_import(c, "ADVAPI32.dll", "RegEnumKeyA", {rd32(pphk), 1, qname, qlen}) == 259,
+    check(call_import(c, "ADVAPI32.dll", "RegEnumKeyA", {rd32(pphk), 1, qname, 64}) == 259,
           "RegEnumKeyA ends with ERROR_NO_MORE_ITEMS");
     call_import(c, "ADVAPI32.dll", "RegCloseKey", {rd32(pphk)});
 
@@ -4135,8 +4137,7 @@ static void test_registry(X86 *c) {
         uint32_t sphk = scratch_block(4);
         check(call_import(c, "ADVAPI32.dll", "RegOpenKeyA", {0x80000001u, synth, sphk}) == 0,
               "a parent that exists only as stored descendants opens");
-        wr32(qlen, 64);
-        check(call_import(c, "ADVAPI32.dll", "RegEnumKeyA", {rd32(sphk), 0, qname, qlen}) == 0 &&
+        check(call_import(c, "ADVAPI32.dll", "RegEnumKeyA", {rd32(sphk), 0, qname, 64}) == 0 &&
                   gm_str(qname) == "_z_profile",
               "its child enumerates: \"%s\"", gm_str(qname).c_str());
         call_import(c, "ADVAPI32.dll", "RegCloseKey", {rd32(sphk)});

@@ -938,7 +938,20 @@ void a_RegEnumKeyA(X86 *c) {
         set_eax(c, 259);
         return;
     }
-    set_eax(c, reg_write_name_a(names[arg(c, 1)], arg(c, 2), arg(c, 3)));
+    // Unlike RegEnumValue, RegEnumKey's last argument is the buffer size in
+    // bytes by value (including the NUL), not a pointer to it.
+    const std::string &name = names[arg(c, 1)];
+    uint32_t out = arg(c, 2), cch = arg(c, 3);
+    if (!out || cch <= name.size()) {
+        set_eax(c, 234); // ERROR_MORE_DATA
+        return;
+    }
+    if (!gm_valid(out, uint32_t(name.size()) + 1)) {
+        set_eax(c, 87);
+        return;
+    }
+    gm_put_str(out, name.c_str(), cch);
+    set_eax(c, 0);
 }
 void a_RegEnumValueA(X86 *c) {
     std::string path = key_path(arg(c, 0), "");
