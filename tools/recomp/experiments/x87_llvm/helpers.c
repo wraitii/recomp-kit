@@ -40,3 +40,42 @@ INLINE void rk_slot(X86 *c, unsigned physical, double v, unsigned live) {
     c->st_exact[physical] = 0;
     ftag_put(c, physical, live ? ftag_classify(v) : FTAG_EMPTY);
 }
+
+INLINE double rk_load64(X86 *c, unsigned a) {
+    (void)c;
+    return rdf64(a);
+}
+INLINE void rk_compare(X86 *c, double a, double b) {
+    fcom(c, a, b);
+}
+/* Read-only x87 observer. The harness may capture the complete state here. */
+extern void rk_observe(X86 *c);
+INLINE void rk_fnstsw(X86 *c) {
+    rk_observe(c);
+    c->r[R_EAX] = (c->r[R_EAX] & 0xffff0000u) | fstsw(c);
+}
+INLINE void rk_test_ah(X86 *c, unsigned mask) {
+    unsigned v = ((c->r[R_EAX] >> 8) & 255u) & mask;
+    c->eflags_cf = c->eflags_of = 0;
+    c->eflags_zf = v == 0;
+    c->eflags_sf = (v >> 7) & 1u;
+    c->eflags_pf = parity8(v);
+}
+INLINE void rk_xor_eax(X86 *c, unsigned unused) {
+    (void)unused;
+    c->r[R_EAX] = 0;
+    c->eflags_cf = c->eflags_of = c->eflags_sf = 0;
+    c->eflags_zf = c->eflags_pf = 1;
+}
+INLINE void rk_write_reg(X86 *c, unsigned reg, unsigned v) {
+    c->r[reg] = v;
+}
+INLINE unsigned rk_zf(X86 *c, unsigned unused) {
+    (void)unused;
+    return c->eflags_zf;
+}
+INLINE void rk_ret(X86 *c, unsigned cleanup) {
+    c->eip = rd32(c->r[R_ESP]);
+    c->r[R_ESP] += 4u + cleanup;
+    recomp_return(c);
+}

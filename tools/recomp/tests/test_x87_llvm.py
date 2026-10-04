@@ -34,3 +34,37 @@ def test_guest_address_wraps_before_memory_access():
 def test_unsupported_frontend_input_is_not_approximated(lines):
     with pytest.raises(ValueError):
         emit_llvm('test', lines, True)
+
+from experiments.x87_llvm.function import emit_function
+import translate as T
+
+
+def function_insns(lines):
+    return T.parse_listing_text('\n'.join(f'{0x1000+i:08x}  {s}' for i, s in enumerate(lines)))
+
+
+def test_function_frontend_emits_cfg_without_deciding_x87_flow():
+    insns = function_insns(['FLD float ptr [ESP + 4]', 'FNSTSW AX', 'TEST AH,0x1',
+                           'JE 0x1005', 'FCHS', 'FCOMP double ptr [ECX]', 'RET'])
+    text = emit_function('test', insns, True)
+    assert 'br i1' in text and 'label %b1005' in text
+    assert 'fneg double' in text and '@rk_load64' in text
+    assert '@rk_fnstsw' in text and '@rk_ret' in text
+    assert 'phi ' not in text and '@rk_slot' not in text
+
+
+@pytest.mark.parametrize('lines', [
+    ['FLDCW word ptr [ESI]', 'RET'], ['CALL 0x2000', 'RET'],
+    ['JZ 0x2000', 'RET'], ['FLD ST0', 'RET'],
+    ['FLD float ptr FS:[0x0]', 'RET'], ['TEST AL,0x1', 'RET'],
+    ['RET 0x4'], ['FLD float ptr [ESI]'], ['MOV AX,0x1', 'RET'],
+])
+def test_function_frontend_rejects_unsupported_forms(lines):
+    with pytest.raises(ValueError):
+        emit_function('test', function_insns(lines), True)
+
+
+def test_function_frontend_leaves_incoming_dependency_for_analysis():
+    # The frontend faithfully emits it; recomp-x87-analyze rejects it.
+    text = emit_function('test', function_insns(['FCHS', 'RET']), True)
+    assert 'call double @rk_read' in text

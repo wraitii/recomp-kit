@@ -468,6 +468,8 @@ def parse_args(argv, system=None):
                         help="Build and run the isolated x87 local-value experiment")
     parser.add_argument("--x87-llvm-experiment", action="store_true",
                         help="Build and run the isolated LLVM stack-to-SSA pass")
+    parser.add_argument("--x87-llvm-function", type=Path,
+                        help="Game-owned whole-function evidence/fixture profile for LLVM experiment")
     parser.add_argument("--allow-table-gaps", metavar="REASON", default=None,
                         help="Accept jump-table sites the translator cannot decode (passed to translate.py)")
     parser.add_argument("--forget", metavar="ADDR[,ADDR...]", default=None,
@@ -522,7 +524,7 @@ def main():
     args, parser = parse_args(sys.argv[1:])
     if args.x87_llvm_experiment:
         from experiments.x87_llvm.run import run_experiment
-        run_experiment(args.build_root / "x87-llvm-experiment", cmake_tool("cmake"), args.jobs)
+        run_experiment(args.build_root / "x87-llvm-experiment", cmake_tool("cmake"), args.jobs, args.x87_llvm_function)
         return
     if args.x87_locals_experiment:
         from experiments.x87_locals.run import run_experiment

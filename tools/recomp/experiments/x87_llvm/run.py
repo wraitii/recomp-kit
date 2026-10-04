@@ -101,13 +101,15 @@ def llvm_config():
     return found
 
 
-def run_experiment(out, cmake, jobs):
+def run_experiment(out, cmake, jobs, function_profile=None):
     """Build through CMake with one consistent LLVM toolchain, retaining every stage."""
     config = llvm_config()
     bindir = Path(subprocess.check_output([config, "--bindir"], text=True).strip())
     cmakedir = subprocess.check_output([config, "--cmakedir"], text=True).strip()
     out.mkdir(parents=True, exist_ok=True)
-    module, baseline, declarations = [DECLARATIONS], ['#include "x86.h"'], []
+    from experiments.x87_llvm.function import DECLARATIONS as FUNCTION_DECLS
+    from experiments.x87_llvm.fixtures import BODY, BASELINE
+    module, baseline, declarations = [DECLARATIONS, FUNCTION_DECLS], ['#include "x86.h"'], []
     modes = ("baseline", "llvm_raw", "llvm_lifted", "full")
     declarations += ['static const char *mode_names[] = {"baseline", "llvm_raw", "llvm_lifted", "full"};',
                      "static const unsigned normalize_empty_mask = 0, required_match_mask = 14;"]
@@ -119,13 +121,28 @@ def run_experiment(out, cmake, jobs):
                 module.append(emit_llvm(symbol, lines, mode == "llvm_lifted"))
             else:
                 baseline.append(f"void {symbol}(X86 *c) {{\n{emit_c(lines, mode)}\n}}")
+    # A CFG regression independent of any game: PHIs for a live slot AND a
+    # popped slot, followed by an observer and an aliasing memory store.
+    names = [*CASES, "cfg_join"]
+    for mode in modes:
+        symbol = f"cfg_join_{mode}"
+        declarations.append(f"void {symbol}(X86 *);")
+        if mode.startswith("llvm_"):
+            attr = ' "recomp.x87.region"' if mode == "llvm_lifted" else ''
+            module.append(f"define void @{symbol}(ptr %cpu){attr} {{\n{BODY}\n}}")
+        else:
+            baseline.append(f"void {symbol}(X86 *c) {{\n{BASELINE}\n}}")
+    if function_profile:
+        from experiments.x87_llvm.function import prepare
+        module.append(prepare(function_profile, out))
     (out / "input.ll").write_text('\n'.join(module))
     (out / "baseline.c").write_text('\n'.join(baseline))
-    declarations += ["static const char *case_names[] = {" + ','.join(f'"{n}"' for n in CASES) + "};",
+    declarations += ["static const char *case_names[] = {" + ','.join(f'"{n}"' for n in names) + "};",
                      "static void (*functions[][4])(X86 *) = {" +
-                     ','.join('{' + ','.join(f"{n}_{m}" for m in modes) + '}' for n in CASES) + "};"]
+                     ','.join('{' + ','.join(f"{n}_{m}" for m in modes) + '}' for n in names) + "};"]
     (out / "fixtures.h").write_text('\n'.join(declarations))
     subprocess.run([cmake, "-S", str(HERE), "-B", str(out),
+                    f"-DFUNCTION_TEST={'ON' if function_profile else 'OFF'}",
                     f"-DLLVM_DIR={cmakedir}", f"-DKIT_RUNTIME={KIT / 'runtime'}",
                     f"-DCMAKE_C_COMPILER={bindir / 'clang'}",
                     f"-DCMAKE_CXX_COMPILER={bindir / 'clang++'}"], check=True)
@@ -137,6 +154,10 @@ def run_experiment(out, cmake, jobs):
     result = subprocess.run([str(out / "x87_llvm")], check=True, capture_output=True, text=True)
     (out / "results.txt").write_text(result.stdout)
     print(result.stdout, end="")
+    if function_profile:
+        result = subprocess.run([str(out / "x87_function")], check=True, capture_output=True, text=True)
+        (out / "function-results.txt").write_text(result.stdout)
+        print(result.stdout, end="")
     # Structural postcondition, in addition to opt's verifier: the pass must
     # remove every stack operation from each requested region, retaining rounds.
     lifted = (out / "lifted.ll").read_text()
@@ -144,5 +165,14 @@ def run_experiment(out, cmake, jobs):
         body = lifted.split(f"define void @{name}_llvm_lifted(", 1)[1].split('\n}', 1)[0]
         assert not any(f"@rk_{op}(" in body for op in ("push", "pop", "read", "set"))
         assert body.count("@rk_round(") == sum(s.split()[0] in {"FMUL", "FSUB", "FADD", "FADDP"} for s in lines)
+    cfg_body = lifted.split("define void @cfg_join_llvm_lifted(", 1)[1].split('\n}', 1)[0]
+    assert cfg_body.count("phi double") == 2  # live AND popped value
+    assert "@rk_snapshot(" not in cfg_body
+    if function_profile:
+        body = lifted.split("define void @real_lifted(", 1)[1].split('\n}', 1)[0]
+        raw_body = lifted.split("define void @real_raw(", 1)[1].split('\n}', 1)[0]
+        for observer in ("fnstsw", "ret"):
+            assert body.count(f"@rk_{observer}(") == raw_body.count(f"@rk_{observer}(")
+        assert not any(f"@rk_{op}(" in body for op in ("push", "pop", "read", "set", "snapshot"))
     print("Verified LLVM stack elimination and retained arithmetic rounding calls.")
     print("Artifacts:", out)

@@ -18,6 +18,22 @@ void recomp_watch_hit(uint32_t a, uint32_t n, uint64_t v) {
     abort();
 }
 
+#ifndef FIXTURE_MEMORY_SIZE
+#define FIXTURE_MEMORY_SIZE 0x20000
+#endif
+#ifndef FIXTURE_SETUP
+#define FIXTURE_SETUP(c, n) ((void)0)
+#define FIXTURE_RESET(c) ((void)0)
+#define FIXTURE_BEFORE(mode) ((void)0)
+#define FIXTURE_AFTER(mode) ((void)0)
+#endif
+#ifndef FIXTURE_CUSTOM_INPUTS
+#define FIXTURE_CUSTOM_INPUTS 0
+#endif
+#ifndef FIXTURE_FINISH
+#define FIXTURE_FINISH() ((void)0)
+#endif
+
 static uint32_t seed = 123456789;
 static uint32_t random_word(void) {
     seed ^= seed << 13;
@@ -58,6 +74,7 @@ static void setup(X86 *c, unsigned n) {
         }
         memcpy(g_mem + a, &bits, 4);
     }
+    FIXTURE_SETUP(c, n);
 }
 
 /* Only the live/relaxed experimental contracts discard empty-slot contents.
@@ -82,12 +99,16 @@ static int compare(void) {
             setup(&initial, n);
             memcpy(input, g_mem + 0x10000, 256);
             expected = initial;
+            FIXTURE_BEFORE(0);
             functions[f][0](&expected);
+            FIXTURE_AFTER(0);
             memcpy(output, g_mem + 0x10000, 256);
             for (unsigned mode = 1; mode < 4; ++mode) {
                 X86 actual = initial, reference = expected;
                 memcpy(g_mem + 0x10000, input, 256);
+                FIXTURE_BEFORE(mode);
                 functions[f][mode](&actual);
+                FIXTURE_AFTER(mode);
                 int mem_diff = memcmp(output, g_mem + 0x10000, 256) != 0;
                 if (normalize_empty_mask & (1u << mode)) {
                     discard_empty_contents(&actual);
@@ -113,8 +134,9 @@ static int compare(void) {
                case_names[f], mode_names[1], differences[1], mode_names[2], differences[2],
                mode_names[3], differences[3], memory_differences, relaxed_by_pc[0],
                relaxed_by_pc[1], relaxed_by_pc[2], relaxed_by_pc[3]);
-        printf("FINITE %s last variant differences=%u/8192 ordinary finite inputs\n", case_names[f],
-               finite_differences);
+        if (!FIXTURE_CUSTOM_INPUTS)
+            printf("FINITE %s last variant differences=%u/8192 ordinary finite inputs\n",
+                   case_names[f], finite_differences);
     }
     return 0;
 }
@@ -145,6 +167,7 @@ static void benchmark(void) {
                     for (unsigned i = 0; i < iterations; ++i) {
                         /* Restore entry TOP after the live-output fragment. */
                         c.fpu_top = 0;
+                        FIXTURE_RESET(&c);
                         fn(&c);
                     }
                     samples[mode][trial] =
@@ -165,11 +188,12 @@ static void benchmark(void) {
 }
 
 int main(void) {
-    g_mem = calloc(1, 0x20000);
+    g_mem = calloc(1, FIXTURE_MEMORY_SIZE);
     if (!g_mem)
         return 2;
     if (compare())
         return 1;
+    FIXTURE_FINISH();
     benchmark();
     free(g_mem);
     return 0;
