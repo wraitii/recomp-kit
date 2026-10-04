@@ -26,6 +26,7 @@
 #include "dxtypes.h"
 #include "host_api.h"
 #include "../platform/os.h"
+#include "../platform/profile_markers.h"
 #include "../runtime/guest.h"
 #include "../runtime/memory.h"
 
@@ -1066,9 +1067,12 @@ void d3d7_writeback(ComObj *dev) {
         rgba.resize((size_t)bytes);
     uint32_t got = 0;
     D3d8Error err{};
-    if (!host_ok(d3d8_device_read_pixels((D3d8Device *)dev->d3d7_host, rgba.data(), (uint32_t)bytes,
-                                         &got, &err),
-                 err, "ReadPixels"))
+    const uint64_t marker_start = profile_marker_now();
+    const bool read_ok = host_ok(d3d8_device_read_pixels((D3d8Device *)dev->d3d7_host, rgba.data(),
+                                                         (uint32_t)bytes, &got, &err),
+                                 err, "ReadPixels");
+    profile_marker_end("readback", marker_start);
+    if (!read_ok)
         return;
     if (got != bytes) {
         log_once("d3d7.writeback.size", "d3d7: readback returned %u bytes, expected %llu", got,

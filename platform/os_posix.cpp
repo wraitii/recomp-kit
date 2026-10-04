@@ -365,6 +365,10 @@ int os_gmtime(int64_t seconds, struct tm *out) {
     return gmtime_r(&t, out) ? 0 : -1;
 }
 
+int64_t os_process_id(void) {
+    return (int64_t)getpid();
+}
+
 uint64_t os_monotonic_ns(void) {
 #ifdef __APPLE__
     // CLOCK_MONOTONIC on Darwin works out the boot time on every call

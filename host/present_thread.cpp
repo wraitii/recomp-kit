@@ -32,6 +32,7 @@
 #include <set>
 #include <thread>
 #include "../platform/os.h"
+#include "../platform/profile_markers.h"
 
 // Packed into one atomic so a producer never combines dimensions from two
 // renderer restarts. Already sealed frames retain their own target and layout.
@@ -1447,6 +1448,7 @@ extern "C" void host_frame_seal() {
     auto f = host_frame_current();
     if (!f.id)
         return;
+    profile_marker_frame();
     if (s->offscreen && s->capture_factory) {
         bool eligible = false;
         {
