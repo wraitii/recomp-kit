@@ -608,6 +608,29 @@ namespace {
 // -------------------------------------------------------------------------
 // ADVAPI32
 // -------------------------------------------------------------------------
+// Defined below the open/create entry points; forward-declared so an open can
+// see whether a key exists only as an ancestor of stored descendants.
+std::vector<std::string> reg_children(const std::string &path);
+
+// Windows creates every missing ancestor when a key is created. The store
+// otherwise only holds the exact key paths that were written, so opening the
+// parent of a stored subkey - which RegOpenKeyA/LHNetGetProfileList does -
+// would fail. Create the ancestors so the tree shape matches the original's.
+bool reg_ensure_ancestors(const std::string &path) {
+    if (path.empty())
+        return false;
+    size_t first = path.find('\\');
+    if (first == std::string::npos)
+        return false; // a predefined hive root is implicit, never stored
+    bool added = false;
+    for (size_t i = path.find('\\', first + 1); i != std::string::npos;
+         i = path.find('\\', i + 1)) {
+        if (regstore().emplace(path.substr(0, i), RegValues{}).second)
+            added = true;
+    }
+    return added;
+}
+
 void a_RegOpenKeyEx(X86 *c, uint32_t hkey, const std::string &sub, uint32_t presult) {
     std::string path = key_path(hkey, sub);
     if (path.empty()) {
@@ -622,7 +645,9 @@ void a_RegOpenKeyEx(X86 *c, uint32_t hkey, const std::string &sub, uint32_t pres
         set_eax(c, 0);
         return;
     }
-    if (regstore().find(path) == regstore().end()) {
+    // A key with descendants exists even when no value was ever written at it
+    // and it was never the target of a create call.
+    if (regstore().find(path) == regstore().end() && reg_children(path).empty()) {
         LOGV("RegOpenKeyExA(%s): not found", path.c_str());
         set_eax(c, 2); // ERROR_FILE_NOT_FOUND
         return;
@@ -650,7 +675,7 @@ void reg_create(X86 *c, const std::string &sub) {
         return;
     }
     bool existed = regstore().find(path) != regstore().end();
-    if (!existed) {
+    if (reg_ensure_ancestors(path) || !existed) {
         regstore()[path];
         g_registry_dirty = true;
     }
@@ -674,7 +699,7 @@ void a_RegCreateKeyA(X86 *c) {
         set_eax(c, 6);
         return;
     }
-    if (regstore().find(path) == regstore().end()) {
+    if (reg_ensure_ancestors(path) || regstore().find(path) == regstore().end()) {
         regstore()[path];
         g_registry_dirty = true;
     }
@@ -787,6 +812,8 @@ void reg_set(X86 *c, const std::string &name, bool wide) {
     } else if (pdata) {
         rv.bin.assign(g_mem + pdata, g_mem + pdata + cb);
     }
+    if (reg_ensure_ancestors(path))
+        g_registry_dirty = true;
     {
         auto &vals = regstore()[path];
         auto old = vals.find(name);
@@ -898,6 +925,21 @@ uint32_t reg_write_name_a(const std::string &name, uint32_t out, uint32_t len) {
     gm_put_str(out, name.c_str(), have);
     return 0;
 }
+// RegEnumKeyA is the 4-argument ANSI enumerator LHMultiplayerR's profile list
+// uses: child names are the UTF-8 the store keeps, written byte-wide.
+void a_RegEnumKeyA(X86 *c) {
+    std::string path = key_path(arg(c, 0), "");
+    if (path.empty()) {
+        set_eax(c, 6);
+        return;
+    }
+    auto names = reg_children(path);
+    if (arg(c, 1) >= names.size()) {
+        set_eax(c, 259);
+        return;
+    }
+    set_eax(c, reg_write_name_a(names[arg(c, 1)], arg(c, 2), arg(c, 3)));
+}
 void a_RegEnumValueA(X86 *c) {
     std::string path = key_path(arg(c, 0), "");
     if (path.empty()) {
@@ -917,7 +959,7 @@ void a_RegEnumValueA(X86 *c) {
     LOGV("registry: enum %s #%u \"%s\" -> %u", path.c_str(), arg(c, 1), value->first.c_str(), hr);
     set_eax(c, hr);
 }
-void a_RegQueryInfoKeyW(X86 *c) {
+void reg_query_info_key(X86 *c, bool wide) {
     std::string path = key_path(arg(c, 0), "");
     if (path.empty()) {
         set_eax(c, 6);
@@ -927,18 +969,19 @@ void a_RegQueryInfoKeyW(X86 *c) {
     auto it = regstore().find(path);
     uint32_t maxkey = 0, maxname = 0, maxdata = 0, count = 0;
     for (const auto &name : keys)
-        maxkey = std::max(maxkey, reg_units(name));
+        maxkey = std::max(maxkey, wide ? reg_units(name) : uint32_t(name.size()));
     if (it != regstore().end()) {
         count = uint32_t(it->second.size());
         for (const auto &v : it->second) {
-            maxname = std::max(maxname, reg_units(v.first));
-            maxdata = std::max(maxdata, reg_value_size(v.second, true));
+            maxname = std::max(maxname, wide ? reg_units(v.first) : uint32_t(v.first.size()));
+            maxdata = std::max(maxdata, reg_value_size(v.second, wide));
         }
     }
     uint32_t hr = 0;
     if (arg(c, 2)) {
         if (arg(c, 1))
-            hr = reg_write_name("", arg(c, 1), arg(c, 2));
+            hr = wide ? reg_write_name("", arg(c, 1), arg(c, 2))
+                      : reg_write_name_a("", arg(c, 1), arg(c, 2));
         else
             wr32(arg(c, 2), 0);
     }
@@ -949,6 +992,14 @@ void a_RegQueryInfoKeyW(X86 *c) {
     if (arg(c, 11))
         wr64(arg(c, 11), 0);
     set_eax(c, hr);
+}
+// The ANSI spelling of the same query; LHMultiplayerR's profile list sizes its
+// child-name buffer from it before RegEnumKeyA.
+void a_RegQueryInfoKeyA(X86 *c) {
+    reg_query_info_key(c, false);
+}
+void a_RegQueryInfoKeyW(X86 *c) {
+    reg_query_info_key(c, true);
 }
 void a_RegDeleteKeyW(X86 *c) {
     std::string path = key_path(arg(c, 0), gm_wstr(arg(c, 1)));
@@ -2616,8 +2667,10 @@ const ImportShim g_misc_shims[] = {
     {"ADVAPI32.dll", "RegQueryValueExW", 6, a_RegQueryValueExW},
     {"ADVAPI32.dll", "RegSetValueExW", 6, a_RegSetValueExW},
     {"ADVAPI32.dll", "RegEnumKeyExW", 8, a_RegEnumKeyExW},
+    {"ADVAPI32.dll", "RegEnumKeyA", 4, a_RegEnumKeyA},
     {"ADVAPI32.dll", "RegEnumValueA", 8, a_RegEnumValueA},
     {"ADVAPI32.dll", "RegEnumValueW", 8, a_RegEnumValueW},
+    {"ADVAPI32.dll", "RegQueryInfoKeyA", 12, a_RegQueryInfoKeyA},
     {"ADVAPI32.dll", "RegQueryInfoKeyW", 12, a_RegQueryInfoKeyW},
     {"ADVAPI32.dll", "RegDeleteKeyW", 2, a_RegDeleteKeyW},
     {"ADVAPI32.dll", "RegDeleteValueW", 2, a_RegDeleteValueW},

@@ -4087,6 +4087,60 @@ static void test_registry(X86 *c) {
               2,
           "a missing value reports ERROR_FILE_NOT_FOUND");
     call_import(c, "ADVAPI32.dll", "RegCloseKey", {hk2});
+
+    // Windows creates every missing ancestor on a create, and a key that exists
+    // only as the parent of stored descendants still opens. LHMultiplayerR
+    // lists profiles by opening HKCU\...\LHMultiplayer\Profiles and enumerating
+    // it with the ANSI APIs, while LHLogR's RegistrySetVal creates only the
+    // leaf. Missing this made every launch look like the first (no profiles) and
+    // restart the new-profile flow.
+    uint32_t deep = put_str("Software\\RecompTests\\Registry\\AncestorTest\\Profile");
+    uint32_t dphk = scratch_block(4), dpdisp = scratch_block(4);
+    check(call_import(c, "ADVAPI32.dll", "RegCreateKeyExA",
+                      {0x80000002u, deep, 0, 0, 0, 0xf003f, 0, dphk, dpdisp}) == 0,
+          "create a deep leaf key");
+    call_import(c, "ADVAPI32.dll", "RegCloseKey", {rd32(dphk)});
+    uint32_t parent = put_str("Software\\RecompTests\\Registry\\AncestorTest");
+    uint32_t pphk = scratch_block(4);
+    check(call_import(c, "ADVAPI32.dll", "RegOpenKeyA", {0x80000002u, parent, pphk}) == 0,
+          "the unnamed parent of the leaf opens");
+    uint32_t qcount = scratch_block(4), qmax = scratch_block(4), qname = scratch_block(64),
+             qlen = scratch_block(4);
+    check(call_import(c, "ADVAPI32.dll", "RegQueryInfoKeyA",
+                      {rd32(pphk), 0, 0, 0, qcount, qmax, 0, 0, 0, 0, 0, 0}) == 0 &&
+              rd32(qcount) == 1,
+          "RegQueryInfoKeyA counts the child");
+    wr32(qlen, 64);
+    check(call_import(c, "ADVAPI32.dll", "RegEnumKeyA", {rd32(pphk), 0, qname, qlen}) == 0 &&
+              gm_str(qname) == "Profile",
+          "RegEnumKeyA returns the child name");
+    check(call_import(c, "ADVAPI32.dll", "RegEnumKeyA", {rd32(pphk), 1, qname, qlen}) == 259,
+          "RegEnumKeyA ends with ERROR_NO_MORE_ITEMS");
+    call_import(c, "ADVAPI32.dll", "RegCloseKey", {rd32(pphk)});
+
+    // A registry file written before ancestors existed holds only leaves; the
+    // parent must still open and enumerate, or the first launch after the fix
+    // would still not see the profiles that are already on disk.
+    {
+        FILE *f = fopen(registry_path().c_str(), "wb");
+        if (f) {
+            fputs("{\n  \"HKEY_CURRENT_USER\\\\Software\\\\RecompTests\\\\Synth"
+                  "\\\\_z_profile\": {\n    \"login name\": {\"type\": 3, \"data\": \"0000\", "
+                  "\"seq\": 1}\n  }\n}\n",
+                  f);
+            fclose(f);
+        }
+        registry_load();
+        uint32_t synth = put_str("Software\\RecompTests\\Synth");
+        uint32_t sphk = scratch_block(4);
+        check(call_import(c, "ADVAPI32.dll", "RegOpenKeyA", {0x80000001u, synth, sphk}) == 0,
+              "a parent that exists only as stored descendants opens");
+        wr32(qlen, 64);
+        check(call_import(c, "ADVAPI32.dll", "RegEnumKeyA", {rd32(sphk), 0, qname, qlen}) == 0 &&
+                  gm_str(qname) == "_z_profile",
+              "its child enumerates: \"%s\"", gm_str(qname).c_str());
+        call_import(c, "ADVAPI32.dll", "RegCloseKey", {rd32(sphk)});
+    }
 }
 
 // Every import in the PE must have a trampoline, and the stack discipline must
