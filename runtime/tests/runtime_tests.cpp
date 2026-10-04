@@ -5303,6 +5303,38 @@ static void test_kernel32_wide() {
           "GetDateFormatW fixed ISO picture");
     check(call_import(&c, "KERNEL32.dll", "GetDateFormatW", {0x409, 0, fd, 0, 0, 0}) == 11,
           "GetDateFormatW size includes terminator");
+    // GetTimeFormatW: 14:05:09 through the fixed en-US default picture. The
+    // size query must not touch the buffer, and the size includes the NUL.
+    memset(g_mem + fd, 0, 16);
+    wr16(fd + 8, 14);
+    wr16(fd + 10, 5);
+    wr16(fd + 12, 9);
+    check(call_import(&c, "KERNEL32.dll", "GetTimeFormatW", {0x400, 0, fd, 0, 0, 0}) == 11,
+          "GetTimeFormatW size query includes terminator");
+    check(call_import(&c, "KERNEL32.dll", "GetTimeFormatW", {0x400, 0, fd, 0, s + 192, 64}) == 11 &&
+              gm_wstr(s + 192) == "2:05:09 PM",
+          "GetTimeFormatW fixed en-US picture");
+    check(call_import(&c, "KERNEL32.dll", "GetTimeFormatW", {0x400, 0, fd, 0, s + 192, 3}) == 0 &&
+              call_import(&c, "KERNEL32.dll", "GetLastError", {}) == 122,
+          "GetTimeFormatW rejects a short buffer");
+    gm_put_wstr(fd + 32, "HH:mm", 16);
+    check(call_import(&c, "KERNEL32.dll", "GetTimeFormatW", {0x400, 0, fd, fd + 32, s + 192, 64}) ==
+                  6 &&
+              gm_wstr(s + 192) == "14:05",
+          "GetTimeFormatW explicit 24-hour picture");
+    check(call_import(&c, "KERNEL32.dll", "GetTimeFormatW", {0x400, 2, fd, 0, s + 192, 64}) == 8 &&
+              gm_wstr(s + 192) == "2:05 PM",
+          "GetTimeFormatW TIME_NOSECONDS drops the field and separator");
+    check(call_import(&c, "KERNEL32.dll", "GetTimeFormatW", {0x400, 4, fd, 0, s + 192, 64}) == 8 &&
+              gm_wstr(s + 192) == "2:05:09",
+          "GetTimeFormatW TIME_NOTIMEMARKER drops the marker and space");
+    uint32_t time_need = call_import(&c, "KERNEL32.dll", "GetTimeFormatW", {0x400, 0, 0, 0, 0, 0});
+    check(time_need > 1 && call_import(&c, "KERNEL32.dll", "GetTimeFormatW",
+                                       {0x400, 0, 0, 0, s + 192, 64}) == time_need,
+          "GetTimeFormatW null time uses the local clock and matches its size query");
+    check(call_import(&c, "KERNEL32.dll", "GetTimeFormatA", {0x400, 0, fd, 0, s + 256, 64}) == 11 &&
+              !strcmp((const char *)(g_mem + s + 256), "2:05:09 PM"),
+          "GetTimeFormatA mirrors the wide text");
     check(call_import(&c, "KERNEL32.dll", "FileTimeToDosDateTime", {s, s + 32, s + 34}) == 1 &&
               rd16(s + 32) == ((20 << 9) | (1 << 5) | 2) &&
               rd16(s + 34) == ((3 << 11) | (4 << 5) | 3),

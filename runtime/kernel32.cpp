@@ -1746,6 +1746,52 @@ void k_GetTimeZoneInformation(X86 *c) {
     set_eax(c, 0); // TIME_ZONE_ID_UNKNOWN
 }
 
+// ANSI twin of k_GetTimeFormatW (kernel32_wide.cpp); both share the picture
+// formatter so a caller that falls back from W to A sees the same text. The
+// only caller, TempleSaveGame::UpdateDateAndTime, reaches A when W fails.
+void k_GetTimeFormatA(X86 *c) {
+    uint32_t flags = arg(c, 1), input = arg(c, 2), picture = arg(c, 3);
+    uint32_t out = arg(c, 4), cap = arg(c, 5);
+    int hour, minute, second;
+    if (input) {
+        if (!gm_valid(input, 16)) {
+            set_last_error(87 /* ERROR_INVALID_PARAMETER */);
+            set_eax(c, 0);
+            return;
+        }
+        hour = rd16(input + 8);
+        minute = rd16(input + 10);
+        second = rd16(input + 12);
+    } else {
+        struct tm t{};
+        if (os_localtime((int64_t)(os_wall_time_us() / 1000000), &t) != 0) {
+            set_eax(c, 0);
+            return;
+        }
+        hour = t.tm_hour;
+        minute = t.tm_min;
+        second = t.tm_sec;
+    }
+    if (hour > 23 || minute > 59 || second > 59) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    std::string text = kernel32_format_time(hour, minute, second,
+                                            picture ? gm_str(picture) : std::string(), flags);
+    uint32_t need = (uint32_t)text.size() + 1; // bytes, including the NUL
+    if (cap == 0) {
+        set_eax(c, need);
+        return;
+    }
+    if (!out || cap < need) {
+        set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */);
+        set_eax(c, 0);
+        return;
+    }
+    set_eax(c, gm_put_str(out, text.c_str(), cap) + 1);
+}
+
 // -------------------------------------------------------------------------
 // TLS, interlocked, critical sections
 // -------------------------------------------------------------------------
@@ -4966,7 +5012,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "DebugBreak", 0, nullptr},
     {"KERNEL32.dll", "FatalAppExitA", 2, nullptr},
     {"KERNEL32.dll", "GetDateFormatA", 6, nullptr},
-    {"KERNEL32.dll", "GetTimeFormatA", 6, nullptr},
+    {"KERNEL32.dll", "GetTimeFormatA", 6, k_GetTimeFormatA},
     {"KERNEL32.dll", "GetDiskFreeSpaceExA", 4, nullptr},
     {"KERNEL32.dll", "GetLongPathNameA", 3, nullptr},
     {"KERNEL32.dll", "GetOverlappedResult", 4, nullptr},
