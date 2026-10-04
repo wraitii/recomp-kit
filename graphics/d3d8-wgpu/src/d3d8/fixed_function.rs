@@ -358,10 +358,10 @@ struct VertexInput {
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
-    @location(0) color: vec4<f32>,
+    @location(0) @interpolate(linear) color: vec4<f32>,
     @location(1) fogdist: f32,
     @location(2) fogfactor: f32,
-    @location(4) specular: vec3<f32>,
+    @location(4) @interpolate(linear) specular: vec3<f32>,
 };
 
 // D3D8 table/pixel fog uses the eye-space depth. A standard D3D perspective
@@ -403,16 +403,22 @@ struct VertexInputRhw {
 // already in the viewport's depth range. The rasterizer maps NDC through the
 // viewport (with the half-pixel offset the draw path sets), so invert that
 // mapping here and let the rasterizer do the rest. The reciprocal-w field is
-// ignored (`w = 1.0`): the observed D3D7 logo quad carries `rhw = 0.0` and the
-// original presented it as an orthographic full-screen quad, so this bounded
-// path does not model perspective-correct pre-transformed interpolation.
+// used as `w = 1/rhw` when nonzero; the observed D3D7 logo quad carries
+// `rhw = 0.0` and was an orthographic full-screen quad, so that keeps `w = 1`.
 @vertex
 fn vs_rhw_main(in: VertexInputRhw) -> VertexOutput {
     var out: VertexOutput;
     let vp = transform.viewport;
     let ndc_x = 2.0 * (in.position.x - vp.x) / vp.z - 1.0;
     let ndc_y = 1.0 - 2.0 * (in.position.y - vp.y) / vp.w;
-    out.position = vec4<f32>(ndc_x, ndc_y, in.position.z, 1.0);
+    // rhw != 0: w = 1/rhw, so the rasterizer's perspective division and
+    // perspective-correct texture interpolation reproduce D3D's pre-transformed
+    // path. rhw == 0 keeps the orthographic w = 1 (the D3D7 logo quad).
+    var w = 1.0;
+    if (in.position.w > 0.0) {
+        w = 1.0 / in.position.w;
+    }
+    out.position = vec4<f32>(ndc_x * w, ndc_y * w, in.position.z * w, w);
     out.fogdist = in.position.z;
     let a = f32((in.color >> 24u) & 0xffu) / 255.0;
     let r = f32((in.color >> 16u) & 0xffu) / 255.0;
@@ -800,12 +806,12 @@ struct VertexInput {
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
-    @location(0) color: vec4<f32>,
+    @location(0) @interpolate(linear) color: vec4<f32>,
     @location(1) uv0: vec2<f32>,
     @location(2) uv1: vec2<f32>,
     @location(3) fogdist: f32,
     @location(4) fogfactor: f32,
-    @location(5) specular: vec3<f32>,
+    @location(5) @interpolate(linear) specular: vec3<f32>,
 };
 
 @vertex
@@ -848,7 +854,14 @@ fn vs_rhw_main(in: VertexInputRhw) -> VertexOutput {
     let vp = transform.viewport;
     let ndc_x = 2.0 * (in.position.x - vp.x) / vp.z - 1.0;
     let ndc_y = 1.0 - 2.0 * (in.position.y - vp.y) / vp.w;
-    out.position = vec4<f32>(ndc_x, ndc_y, in.position.z, 1.0);
+    // rhw != 0: w = 1/rhw, so the rasterizer's perspective division and
+    // perspective-correct texture interpolation reproduce D3D's pre-transformed
+    // path. rhw == 0 keeps the orthographic w = 1 (the D3D7 logo quad).
+    var w = 1.0;
+    if (in.position.w > 0.0) {
+        w = 1.0 / in.position.w;
+    }
+    out.position = vec4<f32>(ndc_x * w, ndc_y * w, in.position.z * w, w);
     out.fogdist = in.position.z;
     let a = f32((in.color >> 24u) & 0xffu) / 255.0;
     let r = f32((in.color >> 16u) & 0xffu) / 255.0;

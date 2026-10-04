@@ -6677,6 +6677,56 @@ static void test_d3d7_translation() {
     CHECK_EQ(d3d7_rgb565_to_rgb888(0x2000u), 0xff200000u);
 }
 
+// The trace's pure helpers: FVF vertex decoding and the frame-range grammar.
+static void test_d3d7_trace_helpers() {
+    cpu_reset();
+    auto putf = [](uint8_t *p, int off, float f) { memcpy(p + off, &f, 4); };
+    auto putu = [](uint8_t *p, int off, uint32_t u) { memcpy(p + off, &u, 4); };
+    // XYZRHW | DIFFUSE | SPECULAR | TEX1 (0x1c4): stride 32.
+    uint8_t v[32];
+    memset(v, 0, sizeof v);
+    putf(v, 0, 1.5f);
+    putf(v, 4, 2.5f);
+    putf(v, 8, 0.25f);
+    putf(v, 12, 1.0f);
+    putu(v, 16, 0x80112233u);
+    putu(v, 20, 0xff445566u);
+    putf(v, 24, 0.0f);
+    putf(v, 28, 1.0f);
+    std::string s = d3d7_trace_vertex(0x1c4, v);
+    CHECK(strstr(s.c_str(), "pos=(1.5,2.5,0.25,1)") != nullptr);
+    CHECK(strstr(s.c_str(), "diff=80112233") != nullptr);
+    CHECK(strstr(s.c_str(), "spec=ff445566") != nullptr);
+    CHECK(strstr(s.c_str(), "uv0=(0,1)") != nullptr);
+    // XYZ | NORMAL | TEX1 (0x112): stride 12+12+8 = 32.
+    memset(v, 0, sizeof v);
+    putf(v, 0, 1.0f);
+    putf(v, 4, 2.0f);
+    putf(v, 8, 3.0f);
+    putf(v, 12, 0.0f);
+    putf(v, 16, 1.0f);
+    putf(v, 20, 0.0f);
+    putf(v, 24, 0.0f);
+    putf(v, 28, 1.0f);
+    std::string n = d3d7_trace_vertex(0x112, v);
+    CHECK(strstr(n.c_str(), "pos=(1,2,3)") != nullptr);
+    CHECK(strstr(n.c_str(), "n=(0,1,0)") != nullptr);
+    // A position layout this front end does not decode says so rather than
+    // guessing a byte layout.
+    CHECK(strstr(d3d7_trace_vertex(0x006, v).c_str(), "undecoded") != nullptr);
+
+    // Frame-range grammar, 1-based and inclusive.
+    uint32_t lo = 99, hi = 99;
+    CHECK(d3d7_trace_parse_frames("5-10", &lo, &hi) && lo == 5 && hi == 10);
+    CHECK(d3d7_trace_parse_frames("7", &lo, &hi) && lo == 7 && hi == 7);
+    CHECK(d3d7_trace_parse_frames("7-", &lo, &hi) && lo == 7 && hi == 0xffffffffu);
+    CHECK(d3d7_trace_parse_frames("-12", &lo, &hi) && lo == 1 && hi == 12);
+    CHECK(!d3d7_trace_parse_frames("", &lo, &hi));
+    CHECK(!d3d7_trace_parse_frames("abc", &lo, &hi));
+    CHECK(!d3d7_trace_parse_frames("0-3", &lo, &hi));
+    CHECK(!d3d7_trace_parse_frames("9-4", &lo, &hi));
+}
+
 // QueryInterface: the DirectDraw object hands out IDirectDraw2 and 4, refuses
 // an interface it does not implement, and reaches Direct3D2.
 static void test_query_interface() {
@@ -14690,6 +14740,7 @@ int main() {
         {"IDirectDraw7 object model", test_ddraw7_object_model},
         {"Direct3D7 stage 2a", test_d3d7_pipeline},
         {"Direct3D7 stage 2b translation", test_d3d7_translation},
+        {"Direct3D7 trace helpers", test_d3d7_trace_helpers},
         {"QueryInterface", test_query_interface},
         {"display modes", test_enum_display_modes},
         {"DirectDraw enumeration", test_directdraw_enumeration},

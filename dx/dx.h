@@ -207,6 +207,14 @@ int d3d7_translate_texture_stage_state(uint32_t d3d7_type, uint32_t out[2]);
 // presenter uses the scale, so the round trip is documented against it.
 uint16_t d3d7_rgb888_to_rgb565(uint32_t rgba);
 uint32_t d3d7_rgb565_to_rgb888(uint16_t rgb565);
+// D3D7 trace helpers (dx/d3d7.cpp), exposed so dx_tests can check the pure
+// parts without a GPU. `d3d7_trace_vertex` decodes one vertex per the FVF the
+// same way the trace's vertex dump does. `d3d7_trace_parse_frames` parses the
+// RECOMP_TRACE_D3D7_FRAMES grammar (1-based, inclusive: "a-b", "a-", "-b",
+// "a"); it returns false and leaves the outputs untouched for an empty or
+// malformed string.
+std::string d3d7_trace_vertex(uint32_t fvf, const uint8_t *v);
+bool d3d7_trace_parse_frames(const char *s, uint32_t *lo, uint32_t *hi);
 // Re-states the render target's memory to the host. Flip swaps the pixels
 // behind a surface, so the host has to be told when its target moves.
 void d3d_retarget_surface(ComObj *surface);

@@ -24,6 +24,7 @@
 #include "dx.h"
 #include "dxtypes.h"
 #include "host_api.h"
+#include "../platform/os.h"
 #include "../runtime/guest.h"
 #include "../runtime/memory.h"
 
@@ -31,10 +32,15 @@
 #include "d3d8_abi.h"
 #endif
 
+#include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <array>
+#include <map>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -147,6 +153,374 @@ uint32_t fvf_stride(uint32_t fvf) {
         n += size == 0 ? 8 : size * 4; // 0 means the SDK's default of 2 floats
     }
     return n;
+}
+
+// ---------------------------------------------------------------- D3D7 trace
+// Env-gated diagnostic for the draw path. RECOMP_TRACE_D3D7=1 turns it on;
+// RECOMP_TRACE_D3D7_FRAMES=a-b limits it to a 1-based inclusive frame range
+// ("a-" and "-b" open one end). Two optional knobs bound the bulky parts:
+// RECOMP_TRACE_D3D7_VERTEX_FRAMES (default 3) is how many leading frames dump
+// the first vertices of the frame's biggest draw, and
+// RECOMP_TRACE_D3D7_MATRIX_FRAMES (default 3) is how many leading frames print
+// the full 4x4 world/view/projection after a change. Later frames print one
+// compact line per transform change instead.
+//
+// A frame is BeginScene..EndScene: the engine's D3D7 draws require an open
+// scene, so every drawn frame has both. Per frame the trace prints one summary
+// line per distinct draw signature (repeated identical draws are counted), the
+// vertex-buffer Lock/Unlock activity, and the first vertices of the biggest
+// draw. It writes to stderr with a `[d3d7-trace]` prefix and is independent of
+// RECOMP_LOG. It never changes the guest path.
+struct D3d7TraceConfig {
+    bool enabled = false;
+    bool inited = false;
+    uint32_t lo = 1;
+    uint32_t hi = 0xffffffffu;
+    uint32_t vertex_frames = 3;
+    uint32_t matrix_frames = 3;
+    uint32_t max_vertex_dump = 16;
+};
+
+struct D3d7TraceLockAgg {
+    uint32_t vb = 0;
+    uint32_t bytes = 0;
+    uint32_t flags = 0;
+    uint64_t locks = 0;
+    uint64_t unlocks = 0;
+};
+
+struct D3d7TraceDrawAgg {
+    std::string text;
+    uint64_t count = 0;
+};
+
+static D3d7TraceConfig g_trace;
+static uint32_t g_trace_frame = 0;
+static bool g_trace_frame_open = false;
+static bool g_trace_frame_log = false;
+// How many frames that actually contained a draw have been seen, so
+// `vertex_frames` counts drawing frames rather than startup frames (the intro
+// plays several empty scenes before the first draw).
+static uint32_t g_trace_draw_frames = 0;
+static std::vector<D3d7TraceLockAgg> g_trace_locks;
+static std::map<std::string, D3d7TraceDrawAgg> g_trace_draws;
+// The biggest draw of the frame, captured so the vertices can be printed at
+// frame end even though the guest may reuse the buffer before then.
+static bool g_trace_big_valid = false;
+static uint32_t g_trace_big_vcount = 0;
+static uint32_t g_trace_big_stride = 0;
+static uint32_t g_trace_big_fvf = 0;
+static std::string g_trace_big_kind;
+static std::vector<uint8_t> g_trace_big_bytes;
+// Last matrix logged per transform state, so a SetTransform with the same
+// value is not reported twice.
+static float g_trace_last_matrix[256][16];
+static bool g_trace_last_matrix_set[256];
+
+static void trace_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void trace_log(const char *fmt, ...) {
+    fputs("[d3d7-trace] ", stderr);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+static void trace_appendf(std::string &s, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+static void trace_appendf(std::string &s, const char *fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    s += buf;
+}
+
+static void trace_init() {
+    if (g_trace.inited)
+        return;
+    g_trace.inited = true;
+    const char *e = recomp_env("TRACE_D3D7");
+    g_trace.enabled = e && e[0] && strcmp(e, "0") != 0;
+    if (!g_trace.enabled)
+        return;
+    const char *fr = recomp_env("TRACE_D3D7_FRAMES");
+    uint32_t lo = g_trace.lo, hi = g_trace.hi;
+    if (fr && d3d7_trace_parse_frames(fr, &lo, &hi)) {
+        g_trace.lo = lo;
+        g_trace.hi = hi;
+    }
+    const char *vf = recomp_env("TRACE_D3D7_VERTEX_FRAMES");
+    if (vf && vf[0])
+        g_trace.vertex_frames = (uint32_t)strtoul(vf, nullptr, 10);
+    const char *mf = recomp_env("TRACE_D3D7_MATRIX_FRAMES");
+    if (mf && mf[0])
+        g_trace.matrix_frames = (uint32_t)strtoul(mf, nullptr, 10);
+}
+
+static float trace_f32(const uint32_t *p) {
+    float f;
+    memcpy(&f, p, 4);
+    return f;
+}
+
+// Decodes one vertex per the FVF, matching the stride rule in fvf_stride. The
+// byte layout follows the D3DFVF field order (position, normal, point size,
+// diffuse, specular, then coordinate sets).
+static std::string format_vertex(uint32_t fvf, const uint8_t *v) {
+    if (!fvf_stride(fvf))
+        return "<undecoded FVF>";
+    auto f32 = [&](size_t o) {
+        float x;
+        memcpy(&x, v + o, 4);
+        return x;
+    };
+    std::string s;
+    size_t off = 0;
+    switch (fvf & 0x00e) { // D3DFVF_POSITION_MASK
+    case 0x002:            // XYZ
+        trace_appendf(s, "pos=(%.4g,%.4g,%.4g)", f32(0), f32(4), f32(8));
+        off = 12;
+        break;
+    case 0x004: // XYZRHW
+        trace_appendf(s, "pos=(%.4g,%.4g,%.4g,%.4g)", f32(0), f32(4), f32(8), f32(12));
+        off = 16;
+        break;
+    default:
+        return "<unhandled position layout>";
+    }
+    if (fvf & 0x010) { // NORMAL
+        trace_appendf(s, " n=(%.3g,%.3g,%.3g)", f32(off), f32(off + 4), f32(off + 8));
+        off += 12;
+    }
+    if (fvf & 0x020) { // PSIZE
+        trace_appendf(s, " psize=%.3g", f32(off));
+        off += 4;
+    }
+    if (fvf & 0x040) { // DIFFUSE
+        uint32_t d;
+        memcpy(&d, v + off, 4);
+        trace_appendf(s, " diff=%08x", d);
+        off += 4;
+    }
+    if (fvf & 0x080) { // SPECULAR
+        uint32_t d;
+        memcpy(&d, v + off, 4);
+        trace_appendf(s, " spec=%08x", d);
+        off += 4;
+    }
+    uint32_t texcount = (fvf >> 8) & 0xf;
+    for (uint32_t i = 0; i < texcount && i < 4; ++i) {
+        uint32_t size = (fvf >> (16 + i * 2)) & 0x3;
+        uint32_t n = size == 0 ? 2 : size; // 0 means the SDK's default of 2 floats
+        trace_appendf(s, " uv%u=(", i);
+        for (uint32_t k = 0; k < n; ++k)
+            trace_appendf(s, "%s%.3g", k ? "," : "", f32(off + k * 4));
+        trace_appendf(s, ")");
+        off += n * 4;
+    }
+    return s;
+}
+
+static std::string trace_tex_desc(ComObj *dev, uint32_t stage) {
+    ComObj *t = com_get(dev->d3d7->texture[stage]);
+    if (!t)
+        return "-";
+    char buf[64];
+    snprintf(buf, sizeof buf, "#%u:%ux%ux%u", t->id, t->width, t->height, t->bpp);
+    return buf;
+}
+
+static std::string trace_draw_text(ComObj *dev, const char *kind, uint32_t type, uint32_t fvf,
+                                   uint32_t vcount, uint32_t icount, uint32_t stride,
+                                   uint32_t start, uint32_t vb_id, uint32_t prims) {
+    const uint32_t *rs = dev->d3d7->render_state;
+    uint32_t vx, vy, vw, vh;
+    float vmin, vmax;
+    memcpy(&vx, dev->d3d7->viewport + 0, 4);
+    memcpy(&vy, dev->d3d7->viewport + 1, 4);
+    memcpy(&vw, dev->d3d7->viewport + 2, 4);
+    memcpy(&vh, dev->d3d7->viewport + 3, 4);
+    memcpy(&vmin, dev->d3d7->viewport + 4, 4);
+    memcpy(&vmax, dev->d3d7->viewport + 5, 4);
+    std::string s;
+    trace_appendf(s,
+                  "%s type=%u fvf=%08x vcount=%u icount=%u prims=%u stride=%u vb=%s start=%u "
+                  "vp=%u,%u,%ux%u z[%.3g,%.3g]",
+                  kind, type, fvf, vcount, icount, prims, stride, vb_id ? "vb" : "inline", start,
+                  vx, vy, vw, vh, vmin, vmax);
+    if (vb_id)
+        trace_appendf(s, " vb#%u startoff=%u", vb_id, start * stride);
+    trace_appendf(s,
+                  " | z=%u,%u,%u cull=%u fog=%u,%u,%u,%.4g,%.4g,%.4g,%08x clip=%u lit=%u "
+                  "blend=%u,%u,%u atest=%u,%u,%u",
+                  rs[7], rs[14], rs[23], rs[22], rs[28], rs[35], rs[140], trace_f32(&rs[36]),
+                  trace_f32(&rs[37]), trace_f32(&rs[38]), rs[34], rs[136], rs[137], rs[27], rs[19],
+                  rs[20], rs[15], rs[24], rs[25]);
+    for (uint32_t stage = 0; stage < 2; ++stage)
+        trace_appendf(s, " tex%u=%s", stage, trace_tex_desc(dev, stage).c_str());
+    return s;
+}
+
+static void trace_frame_end();
+static void trace_frame_begin() {
+    trace_init();
+    if (!g_trace.enabled)
+        return;
+    // A well-behaved device ends every scene, but a frame left open (a present
+    // boundary or an interrupted run) should still report what it held.
+    if (g_trace_frame_open)
+        trace_frame_end();
+    ++g_trace_frame;
+    g_trace_frame_open = true;
+    g_trace_frame_log = g_trace_frame >= g_trace.lo && g_trace_frame <= g_trace.hi;
+    g_trace_locks.clear();
+    g_trace_draws.clear();
+    g_trace_big_valid = false;
+    g_trace_big_vcount = 0;
+    g_trace_big_bytes.clear();
+    if (g_trace_frame > g_trace.hi)
+        g_trace.enabled = false; // past the requested range: stop counting
+    if (g_trace_frame_log)
+        trace_log("=== frame %u begin ===", g_trace_frame);
+}
+
+static void trace_frame_end() {
+    if (!g_trace_frame_open)
+        return;
+    g_trace_frame_open = false;
+    if (!g_trace_frame_log)
+        return;
+    uint64_t total_draws = 0;
+    for (const auto &kv : g_trace_draws)
+        total_draws += kv.second.count;
+    trace_log("--- frame %u summary: %zu distinct draws, %llu total, %zu lock groups ---",
+              g_trace_frame, g_trace_draws.size(), (unsigned long long)total_draws,
+              g_trace_locks.size());
+    for (const auto &l : g_trace_locks) {
+        if (l.locks)
+            trace_log("    lock vb#%u bytes=%u flags=0x%x x%llu unlocks x%llu", l.vb, l.bytes,
+                      l.flags, (unsigned long long)l.locks, (unsigned long long)l.unlocks);
+        else
+            trace_log("    lock vb#%u bytes=%u unlock-only x%llu", l.vb, l.bytes,
+                      (unsigned long long)l.unlocks);
+    }
+    for (const auto &kv : g_trace_draws)
+        trace_log("    x%llu %s", (unsigned long long)kv.second.count, kv.first.c_str());
+    if (g_trace_big_valid) {
+        const uint32_t show =
+            (uint32_t)(g_trace_big_bytes.size() / (g_trace_big_stride ? g_trace_big_stride : 1));
+        trace_log("    biggest draw: %s fvf=%08x vcount=%u stride=%u (showing %u)",
+                  g_trace_big_kind.c_str(), g_trace_big_fvf, g_trace_big_vcount, g_trace_big_stride,
+                  show);
+        for (uint32_t i = 0; i < show; ++i) {
+            std::string vs = format_vertex(g_trace_big_fvf, g_trace_big_bytes.data() +
+                                                                (size_t)i * g_trace_big_stride);
+            trace_log("      v%u: %s", i, vs.c_str());
+        }
+    }
+    if (total_draws)
+        ++g_trace_draw_frames;
+    g_trace_frame_log = false;
+}
+
+static void trace_draw(ComObj *dev, const char *kind, uint32_t type, uint32_t fvf, uint32_t verts,
+                       uint32_t vcount, uint32_t icount, uint32_t stride, uint32_t start,
+                       uint32_t vb_id, uint32_t prims) {
+    if (!g_trace_frame_log || !dev->d3d7)
+        return;
+    std::string text =
+        trace_draw_text(dev, kind, type, fvf, vcount, icount, stride, start, vb_id, prims);
+    g_trace_draws[text].text = text;
+    ++g_trace_draws[text].count;
+    // Capture the first vertices of the frame's biggest draw, but only in the
+    // leading frames, so the dump stays small. gm_valid is re-checked because
+    // the draw's own validation may not have run in a no-renderer build.
+    if (g_trace_draw_frames < g_trace.vertex_frames && stride && vcount > g_trace_big_vcount &&
+        (uint64_t)stride * vcount <= 0xffffffffu && gm_valid(verts, stride * vcount)) {
+        uint32_t ndump = vcount < g_trace.max_vertex_dump ? vcount : g_trace.max_vertex_dump;
+        g_trace_big_valid = true;
+        g_trace_big_vcount = vcount;
+        g_trace_big_stride = stride;
+        g_trace_big_fvf = fvf;
+        g_trace_big_kind = kind;
+        g_trace_big_bytes.assign(gm_ptr(verts), gm_ptr(verts) + (size_t)ndump * stride);
+    }
+}
+
+static void trace_transform(ComObj *dev, uint32_t state) {
+    if (!g_trace_frame_log || !dev->d3d7 || state >= 256)
+        return;
+    if (state != 1 && state != 2 && state != 3 && !(state >= 16 && state <= 23))
+        return;
+    const float *m = dev->d3d7->transform[state];
+    if (g_trace_last_matrix_set[state] && memcmp(g_trace_last_matrix[state], m, 64) == 0)
+        return;
+    memcpy(g_trace_last_matrix[state], m, 64);
+    g_trace_last_matrix_set[state] = true;
+    const char *name = state == 1   ? "WORLD"
+                       : state == 2 ? "VIEW"
+                       : state == 3 ? "PROJECTION"
+                                    : "TEX";
+    if (state > 3) {
+        trace_log("frame %u transform %s(%u) changed", g_trace_frame, name, state);
+        return;
+    }
+    if (g_trace_frame <= g_trace.matrix_frames) {
+        trace_log("frame %u transform %s:", g_trace_frame, name);
+        for (int row = 0; row < 4; ++row)
+            trace_log("    [% .5f % .5f % .5f % .5f]", m[row * 4], m[row * 4 + 1], m[row * 4 + 2],
+                      m[row * 4 + 3]);
+    } else {
+        trace_log("frame %u transform %s changed: row3=(%.4f,%.4f,%.4f,%.4f)", g_trace_frame, name,
+                  m[12], m[13], m[14], m[15]);
+    }
+}
+
+static void trace_vb_lock(ComObj *vb, uint32_t flags) {
+    if (!g_trace_frame_log || !vb)
+        return;
+    for (auto &l : g_trace_locks)
+        if (l.vb == vb->id && l.bytes == vb->pixels_bytes && l.flags == flags) {
+            ++l.locks;
+            return;
+        }
+    D3d7TraceLockAgg l;
+    l.vb = vb->id;
+    l.bytes = vb->pixels_bytes;
+    l.flags = flags;
+    l.locks = 1;
+    g_trace_locks.push_back(l);
+}
+
+static void trace_vb_unlock(ComObj *vb) {
+    if (!g_trace_frame_log || !vb)
+        return;
+    for (auto &l : g_trace_locks)
+        if (l.vb == vb->id) {
+            ++l.unlocks;
+            return;
+        }
+    D3d7TraceLockAgg l;
+    l.vb = vb->id;
+    l.bytes = vb->pixels_bytes;
+    l.unlocks = 1;
+    g_trace_locks.push_back(l);
+}
+
+static void trace_reset() {
+    g_trace_frame = 0;
+    g_trace_frame_open = false;
+    g_trace_frame_log = false;
+    g_trace_draw_frames = 0;
+    g_trace_locks.clear();
+    g_trace_draws.clear();
+    g_trace_big_valid = false;
+    g_trace_big_bytes.clear();
+    memset(g_trace_last_matrix, 0, sizeof g_trace_last_matrix);
+    memset(g_trace_last_matrix_set, 0, sizeof g_trace_last_matrix_set);
 }
 
 // ---------------------------------------------------------------- defaults
@@ -967,6 +1341,7 @@ void Device7_BeginScene(X86 *c) {
     }
     dev->d3d7->in_scene = true;
     host_d3d7_begin_scene();
+    trace_frame_begin();
 #ifdef RECOMP_D3D8_WGPU
     // The Rust draw path requires an open scene. The host exists from the
     // first Clear onward; a scene opened before that is only recorded (the
@@ -996,6 +1371,7 @@ void Device7_EndScene(X86 *c) {
         host_ok(d3d8_device_end_scene((D3d8Device *)dev->d3d7_host, &err), err, "EndScene");
     }
 #endif
+    trace_frame_end();
     com_ret(c, D3D_OK_);
 }
 
@@ -1027,6 +1403,7 @@ void Device7_SetTransform(X86 *c) {
     memcpy(dev->d3d7->transform[state], gm_ptr(matrix), 64);
     dev->d3d7->transform_set[state] = true;
     forward_transform(dev, state);
+    trace_transform(dev, state);
     com_ret(c, D3D_OK_);
 }
 
@@ -1530,6 +1907,7 @@ void Device7_DrawPrimitive(X86 *c) {
     }
     d3d7_submit_primitive(dev, type, fvf, verts, (uint32_t)bytes, stride, 0, prims,
                           "DrawPrimitive");
+    trace_draw(dev, "DrawPrimitive", type, fvf, verts, count, 0, stride, 0, 0, prims);
     com_ret(c, D3D_OK_);
 }
 
@@ -1557,6 +1935,7 @@ void Device7_DrawIndexedPrimitive(X86 *c) {
     }
     d3d7_submit_indexed(dev, type, fvf, verts, (uint32_t)vbytes, stride, indices, (uint32_t)ibytes,
                         0, 0, vcount, prims, "DrawIndexedPrimitive");
+    trace_draw(dev, "DrawIndexedPrimitive", type, fvf, verts, vcount, icount, stride, 0, 0, prims);
     com_ret(c, D3D_OK_);
 }
 
@@ -1585,6 +1964,8 @@ void Device7_DrawPrimitiveVB(X86 *c) {
     }
     d3d7_submit_primitive(dev, type, vb->vb_fvf, vb->pixels, vb->pixels_bytes, stride, start, prims,
                           "DrawPrimitiveVB");
+    trace_draw(dev, "DrawPrimitiveVB", type, vb->vb_fvf, vb->pixels, count, 0, stride, start,
+               vb->id, prims);
     com_ret(c, D3D_OK_);
 }
 
@@ -1620,6 +2001,8 @@ void Device7_DrawIndexedPrimitiveVB(X86 *c) {
     }
     d3d7_submit_indexed(dev, type, vb->vb_fvf, vb->pixels, vb->pixels_bytes, stride, indices,
                         (uint32_t)ibytes, start, 0, vcount, prims, "DrawIndexedPrimitiveVB");
+    trace_draw(dev, "DrawIndexedPrimitiveVB", type, vb->vb_fvf, vb->pixels, vcount, icount, stride,
+               start, vb->id, prims);
     com_ret(c, D3D_OK_);
 }
 
@@ -1666,6 +2049,7 @@ void VB7_Lock(X86 *c) {
     if (size_out)
         wr32(size_out, vb->pixels_bytes);
     ++vb->lock_count;
+    trace_vb_lock(vb, arg(c, 1));
     com_ret(c, D3D_OK_);
 }
 
@@ -1677,6 +2061,7 @@ void VB7_Unlock(X86 *c) {
     }
     if (vb->lock_count > 0)
         --vb->lock_count;
+    trace_vb_unlock(vb);
     com_ret(c, D3D_OK_);
 }
 
@@ -1956,6 +2341,48 @@ uint32_t d3d7_rgb565_to_rgb888(uint16_t rgb565) {
     return 0xff000000u | (R << 16) | (G << 8) | B;
 }
 
+// See dx.h. The trace's vertex dump and dx_tests share this one decoder.
+std::string d3d7_trace_vertex(uint32_t fvf, const uint8_t *v) {
+    return format_vertex(fvf, v);
+}
+
+// See dx.h. Grammar: "a-b" (inclusive), "a-" (a to open end), "-b" (1 to b),
+// "a" (exactly a). Frame numbers are 1-based, so 0 is rejected.
+bool d3d7_trace_parse_frames(const char *s, uint32_t *lo, uint32_t *hi) {
+    if (!s || !s[0] || !lo || !hi)
+        return false;
+    char *end = nullptr;
+    if (s[0] == '-') {
+        unsigned long b = strtoul(s + 1, &end, 10);
+        if (end == s + 1 || *end || b == 0 || b > 0xffffffffu)
+            return false;
+        *lo = 1;
+        *hi = (uint32_t)b;
+        return true;
+    }
+    unsigned long a = strtoul(s, &end, 10);
+    if (end == s || a == 0 || a > 0xffffffffu)
+        return false;
+    if (*end == '\0') {
+        *lo = *hi = (uint32_t)a;
+        return true;
+    }
+    if (*end != '-')
+        return false;
+    const char *rest = end + 1;
+    if (*rest == '\0') {
+        *lo = (uint32_t)a;
+        *hi = 0xffffffffu;
+        return true;
+    }
+    unsigned long b = strtoul(rest, &end, 10);
+    if (end == rest || *end || b == 0 || b > 0xffffffffu || b < a)
+        return false;
+    *lo = (uint32_t)a;
+    *hi = (uint32_t)b;
+    return true;
+}
+
 // Releasing a device also releases the render target and every bound texture
 // it retained. Registered with com_set_destructor so com_destroy runs it.
 void d3d7_device_destroy(ComObj *dev) {
@@ -1995,6 +2422,7 @@ void d3d7_vb_destroy(ComObj *vb) {
 void d3d7_reset() {
     g_scratch = 0;
     g_scratch_size = 0;
+    trace_reset();
 }
 
 void d3d7_register() {

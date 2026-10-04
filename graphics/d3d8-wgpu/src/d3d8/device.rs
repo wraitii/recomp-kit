@@ -1282,7 +1282,7 @@ impl Device {
         if layout.pre_transformed {
             // XYZRHW: the vertex entry point maps screen pixels to NDC through
             // the same viewport the rasterizer uses. `rhw[0]` marks it; the
-            // reciprocal-w field is not divided out (the D3D7 path uses 1.0).
+            // reciprocal-w field becomes clip w when nonzero (else 1.0).
             uniform.viewport = [v.x as f32, v.y as f32, v.width as f32, v.height as f32];
             uniform.rhw[0] = 1;
         }
