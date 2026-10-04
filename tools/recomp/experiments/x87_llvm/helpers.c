@@ -77,3 +77,30 @@ INLINE void rk_ret(X86 *c, unsigned cleanup) {
     c->r[R_ESP] += 4u + cleanup;
     recomp_return(c);
 }
+
+/* Direct-access experiment: ordinary mapped guest memory cannot alias X86.
+ * No artificial full-CPU observer is attached to FNSTSW. Numeric helpers above
+ * are shared unchanged. Complete state is still required before dispatch. */
+INLINE double rk_direct_load(X86 *c, unsigned a) {
+    (void)c;
+    return (double)rdf32(a);
+}
+INLINE double rk_direct_load64(X86 *c, unsigned a) {
+    (void)c;
+    return rdf64(a);
+}
+INLINE void rk_direct_store(X86 *c, unsigned a, double v) {
+    wrf32(a, fto_float(c, v));
+}
+INLINE void rk_direct_fnstsw(X86 *c) {
+    c->r[R_EAX] = (c->r[R_EAX] & 0xffff0000u) | fstsw(c);
+}
+INLINE void rk_status_at(X86 *c, unsigned top) {
+    c->r[R_EAX] = (c->r[R_EAX] & 0xffff0000u) |
+                  (uint16_t)((c->fpu_sw & (uint16_t)~0x3800u) | (uint16_t)(top << 11));
+}
+INLINE void rk_direct_ret(X86 *c, unsigned cleanup) {
+    c->eip = rd32(c->r[R_ESP]);
+    c->r[R_ESP] += 4u + cleanup;
+    recomp_return(c);
+}

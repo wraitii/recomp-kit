@@ -144,6 +144,10 @@ def prepare(profile_path, out):
         raise ValueError('incomplete function decode')
     insns = [image.to_insn(i) for i in decoded]
     module = [emit_function('real_raw', insns, False), emit_function('real_lifted', insns, True)]
+    from experiments.x87_llvm.direct import direct_ir
+    for mode in ('raw', 'full', 'effects'):
+        module.append(direct_ir(emit_function(f'real_direct_{mode}', insns, mode != 'raw'),
+                                effects=mode == 'effects'))
     fn = T.Function(start, 'real_baseline', size, insns)
     fn.measure(image)
     fn.index = {i.addr: k for k, i in enumerate(insns)}
@@ -162,6 +166,12 @@ def prepare(profile_path, out):
     from experiments.x87_llvm.instrument import instrument_memory
     direct = '\n'.join(code)
     original = direct.replace('void real_baseline(', 'void real_uninstrumented(')
-    (directory / 'baseline.c').write_text(instrument_memory(direct) + '\n' + original)
+    basic = direct.replace('void real_baseline(', 'void real_basic(').replace('rk_observe(c);', '')
+    (directory / 'baseline.c').write_text(instrument_memory(direct) + '\n' + original + '\n' + basic)
+    if p.get('direct_fixture'):
+        direct_dir = out / 'function-direct'
+        direct_dir.mkdir(exist_ok=True)
+        (direct_dir / 'fixtures.h').write_text((profile_path.parent / p['direct_fixture']).read_text())
+        (direct_dir / 'baseline.c').write_text(basic)
     (directory / 'decoded.txt').write_text('\n'.join(i.raw for i in insns) + '\n')
     return '\n'.join(module)

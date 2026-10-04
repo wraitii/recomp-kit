@@ -22,10 +22,14 @@ add_custom_command(OUTPUT "${OUT}/ssa.ll"
   COMMAND "${TOOLS}/opt" -load-pass-plugin=$<TARGET_FILE:RecompX87>
           -passes=recomp-x87-analyze,recomp-x87-ssa -verify-each -S "${OUT}/input.ll" -o "${OUT}/ssa.ll"
   DEPENDS RecompX87 "${OUT}/input.ll" VERBATIM)
+add_custom_command(OUTPUT "${OUT}/effects.ll"
+  COMMAND "${TOOLS}/opt" -load-pass-plugin=$<TARGET_FILE:RecompX87>
+          -passes=recomp-x87-effects -verify-each -S "${OUT}/ssa.ll" -o "${OUT}/effects.ll"
+  DEPENDS RecompX87 "${OUT}/ssa.ll" VERBATIM)
 add_custom_command(OUTPUT "${OUT}/lifted.ll"
   COMMAND "${TOOLS}/opt" -load-pass-plugin=$<TARGET_FILE:RecompX87>
-          -passes=recomp-x87-materialize -verify-each -S "${OUT}/ssa.ll" -o "${OUT}/lifted.ll"
-  DEPENDS RecompX87 "${OUT}/ssa.ll" VERBATIM)
+          -passes=recomp-x87-materialize -verify-each -S "${OUT}/effects.ll" -o "${OUT}/lifted.ll"
+  DEPENDS RecompX87 "${OUT}/effects.ll" VERBATIM)
 add_custom_command(OUTPUT "${OUT}/optimized.ll" "${OUT}/llvm.o" "${OUT}/llvm.s"
   COMMAND "${TOOLS}/llvm-link" "${OUT}/lifted.ll" "${OUT}/helpers.bc" -o "${OUT}/linked.bc"
   COMMAND "${TOOLS}/opt" "-passes=always-inline,default<O2>" -verify-each -S
@@ -57,4 +61,27 @@ if(FUNCTION_TEST)
   if(NOT WIN32)
     target_link_libraries(x87_function PRIVATE m)
   endif()
+endif()
+
+# Headline code-generation comparison: production C emitter vs direct LLVM,
+# with equal normal-exit contracts and no artificial FNSTSW/access observers.
+function(add_direct_probe target directory)
+  add_executable(${target} "${directory}/baseline.c" ../x87_locals/harness.c boundaries.c access.c)
+  target_link_libraries(${target} PRIVATE x87_ir)
+  target_include_directories(${target} PRIVATE "${KIT_RUNTIME}" "${directory}" "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_compile_definitions(${target} PRIVATE RK_DIRECT_TEST=1)
+  target_compile_options(${target} PRIVATE -O2 -ffp-contract=off)
+  if(NOT WIN32)
+    target_link_libraries(${target} PRIVATE m)
+  endif()
+  add_custom_command(OUTPUT "${directory}/baseline.s"
+    COMMAND "${TOOLS}/clang" -O2 -ffp-contract=off -S -I "${KIT_RUNTIME}"
+            -I "${CMAKE_CURRENT_SOURCE_DIR}" "${directory}/baseline.c" -o "${directory}/baseline.s"
+    DEPENDS "${directory}/baseline.c" "${KIT_RUNTIME}/x86.h" access.h VERBATIM)
+  add_custom_target(${target}_assembly ALL DEPENDS "${directory}/baseline.s")
+endfunction()
+add_direct_probe(x87_direct "${OUT}/direct")
+if(DIRECT_FUNCTION_TEST)
+  add_direct_probe(x87_function_direct "${OUT}/function-direct")
+  target_compile_definitions(x87_function_direct PRIVATE RK_FUNCTION_TEST=1)
 endif()

@@ -11,7 +11,11 @@
   fixture. Materialization now also precedes guest-memory accesses through an
   opaque observation ABI. Replay checks ordered state/memory snapshots and
   injected pre-access exits; the function emitter retains rounding for
-  FADD/FSUB/FMUL/FADDP. This experiment does not change game translation.
+  FADD/FSUB/FMUL/FADDP. A separate direct-memory comparison now uses basic C as
+  its performance baseline. The opt-in `recomp-x87-effects` pass removes state
+  snapshots unused by direct accesses and supplies FNSTSW's TOP as an SSA value,
+  retaining complete exit state and arithmetic semantics. Strict boundary tests
+  remain separate. This experiment does not change game translation.
 
 - Add `tools/build.py --x87-locals-experiment`, an isolated local-value lifting
   probe comparing generated x87 fragments with the existing emitter. It records

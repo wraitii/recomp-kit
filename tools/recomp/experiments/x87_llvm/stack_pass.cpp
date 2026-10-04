@@ -34,22 +34,27 @@ static bool validCall(CallInst &C, Function &F) {
     Type *P = F.getArg(0)->getType(), *D = Type::getDoubleTy(Ctx);
     Type *U = Type::getInt32Ty(Ctx), *V = Type::getVoidTy(Ctx);
     StringRef N = Fn->getName();
+    // Direct accesses have a different, explicit environment contract: mapped
+    // memory disjoint from CPU/runtime storage, no access observers or faults.
+    if (N.starts_with("rk_direct_") && !F.hasFnAttribute("recomp.x87.direct"))
+        return false;
     FunctionType *Expected = nullptr;
     if (N == "rk_push")
         Expected = FunctionType::get(V, {P, D}, false);
-    if (N == "rk_pop" || N == "rk_fnstsw" || N == "rk_observe")
+    if (N == "rk_pop" || N == "rk_fnstsw" || N == "rk_observe" || N == "rk_direct_fnstsw")
         Expected = FunctionType::get(V, {P}, false);
-    if (N == "rk_read" || N == "rk_load" || N == "rk_load64")
+    if (N == "rk_read" || N == "rk_load" || N == "rk_load64" || N == "rk_direct_load" ||
+        N == "rk_direct_load64")
         Expected = FunctionType::get(D, {P, U}, false);
     if (N == "rk_reg" || N == "rk_zf")
         Expected = FunctionType::get(U, {P, U}, false);
-    if (N == "rk_set" || N == "rk_store")
+    if (N == "rk_set" || N == "rk_store" || N == "rk_direct_store")
         Expected = FunctionType::get(V, {P, U, D}, false);
     if (N == "rk_round")
         Expected = FunctionType::get(D, {P, D}, false);
     if (N == "rk_compare")
         Expected = FunctionType::get(V, {P, D, D}, false);
-    if (N == "rk_test_ah" || N == "rk_xor_eax" || N == "rk_ret")
+    if (N == "rk_test_ah" || N == "rk_xor_eax" || N == "rk_ret" || N == "rk_direct_ret")
         Expected = FunctionType::get(V, {P, U}, false);
     if (N == "rk_write_reg")
         Expected = FunctionType::get(V, {P, U, U}, false);
@@ -120,7 +125,8 @@ class X87Analysis : public AnalysisInfoMixin<X87Analysis> {
                         if (!Index || Index->getZExtValue() >= S.Depth)
                             return Reject("x87 read/set requires a locally defined stack slot");
                     }
-                    if (N == "rk_ret" && !isa<ReturnInst>(C->getNextNode()))
+                    if ((N == "rk_ret" || N == "rk_direct_ret") &&
+                        !isa<ReturnInst>(C->getNextNode()))
                         return Reject("guest return must immediately precede LLVM return");
                 } else if (auto *Op = dyn_cast<BinaryOperator>(&I)) {
                     bool Integer = (Op->getOpcode() == Instruction::Add ||
@@ -216,12 +222,14 @@ class X87SSAPass : public PassInfoMixin<X87SSAPass> {
                             Slot = C->getArgOperand(2);
                         Erase.push_back(C);
                     } else if (N == "rk_fnstsw" || N == "rk_observe" || N == "rk_ret" ||
-                               N == "rk_load" || N == "rk_load64" || N == "rk_store") {
+                               N == "rk_load" || N == "rk_load64" || N == "rk_store" ||
+                               N.starts_with("rk_direct_")) {
                         Checkpoint(I);
                     }
                 } else if (isa<ReturnInst>(I)) {
                     auto *Prev = dyn_cast_or_null<CallInst>(I.getPrevNode());
-                    if (!Prev || Prev->getCalledFunction()->getName() != "rk_ret")
+                    if (!Prev || (Prev->getCalledFunction()->getName() != "rk_ret" &&
+                                  Prev->getCalledFunction()->getName() != "rk_direct_ret"))
                         Checkpoint(I);
                 }
             }
@@ -235,7 +243,55 @@ class X87SSAPass : public PassInfoMixin<X87SSAPass> {
     }
 };
 
-// Pass 4: lower explicit snapshots to complete physical slot/TOP writes.
+// Pass 4: discharge state demands before lowering snapshots to stores.
+// The closed helper ABI is the effect summary: direct memory reads no x87
+// state; plain FNSTSW reads only SW and TOP; observers/dispatch/exits read all.
+// SW stays current in memory. Supply virtual TOP to FNSTSW as an SSA operand,
+// so neither its stack slots nor TOP need a physical write at that point.
+class X87EffectsPass : public PassInfoMixin<X87EffectsPass> {
+  public:
+    PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
+        if (!F.hasFnAttribute("recomp.x87.ssa") || !F.hasFnAttribute("recomp.x87.effects"))
+            return PreservedAnalyses::all();
+        if (!F.hasFnAttribute("recomp.x87.direct")) {
+            F.getContext().emitError("x87 effects requires the direct-access contract");
+            return PreservedAnalyses::all();
+        }
+        Type *V = Type::getVoidTy(F.getContext()), *U = Type::getInt32Ty(F.getContext());
+        auto Status =
+            F.getParent()->getOrInsertFunction("rk_status_at", V, F.getArg(0)->getType(), U);
+        SmallVector<Instruction *, 16> Erase;
+        for (BasicBlock &BB : F)
+            for (Instruction &I : BB) {
+                auto *Snapshot = dyn_cast<CallInst>(&I);
+                if (!Snapshot || Snapshot->getCalledFunction()->getName() != "rk_snapshot")
+                    continue;
+                auto *Next = dyn_cast_or_null<CallInst>(I.getNextNode());
+                if (!Next)
+                    continue; // LLVM return: preserve complete final state.
+                StringRef N = Next->getCalledFunction()->getName();
+                if (N == "rk_direct_load" || N == "rk_direct_load64" || N == "rk_direct_store")
+                    Erase.push_back(Snapshot);
+                else if (N == "rk_direct_fnstsw") {
+                    IRBuilder<> B(Next);
+                    Value *Top = B.CreateAnd(
+                        B.CreateSub(Snapshot->getArgOperand(1), Snapshot->getArgOperand(2)),
+                        B.getInt32(7));
+                    B.CreateCall(Status, {F.getArg(0), Top});
+                    Erase.push_back(Snapshot);
+                    Erase.push_back(Next);
+                }
+                // All other boundaries retain their complete snapshot. In
+                // particular an explicit observer is never inferred to be dead.
+            }
+        for (Instruction *I : Erase)
+            I->eraseFromParent();
+        F.removeFnAttr("recomp.x87.effects");
+        return PreservedAnalyses::none();
+    }
+};
+
+// Pass 5: lower explicit snapshots to complete physical slot/TOP writes.
 // Untouched slots remain intact; all touched slots retain their final contents.
 class X87MaterializePass : public PassInfoMixin<X87MaterializePass> {
   public:
@@ -287,11 +343,14 @@ extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
                         PM.addPass(RequireAnalysisPass<X87Analysis, Function>());
                     else if (Name == "recomp-x87-ssa")
                         PM.addPass(X87SSAPass());
+                    else if (Name == "recomp-x87-effects")
+                        PM.addPass(X87EffectsPass());
                     else if (Name == "recomp-x87-materialize")
                         PM.addPass(X87MaterializePass());
                     else if (Name == "recomp-x87-stack") {
                         PM.addPass(RequireAnalysisPass<X87Analysis, Function>());
                         PM.addPass(X87SSAPass());
+                        PM.addPass(X87EffectsPass());
                         PM.addPass(X87MaterializePass());
                     } else
                         return false;

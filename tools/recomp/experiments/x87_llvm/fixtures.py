@@ -54,3 +54,22 @@ rk_observe(c);
 wrf32(c->r[R_EBX], fto_float(c, ST(c, 0)));
 fdrop(c);
 '''
+
+# Unlike the real predicates, this leaves FNSTSW's TOP bits live in EAX.
+# Returning with the original TOP must not change the earlier status result.
+STATUS_BODY = """
+entry:
+  %src = call i32 @rk_reg(ptr %cpu, i32 6)
+  %v = call double @rk_load(ptr %cpu, i32 %src)
+  call void @rk_push(ptr %cpu, double %v)
+  call void @rk_fnstsw(ptr %cpu)
+  call void @rk_pop(ptr %cpu)
+  ret void
+"""
+STATUS_BASELINE = """
+fpush(c, (double)rdf32(c->r[R_ESI]));
+rk_observe(c);
+c->r[R_EAX] = (c->r[R_EAX] & 0xffff0000u) | fstsw(c);
+fdrop(c);
+"""
+EXTRA_CASES = {'cfg_join': (BODY, BASELINE), 'status_top': (STATUS_BODY, STATUS_BASELINE)}

@@ -1,6 +1,7 @@
 """Direct LLVM emission and a bounded stack-to-SSA pass; no parallel custom IR."""
 from pathlib import Path
 import os
+import json
 import shutil
 import subprocess
 
@@ -108,8 +109,17 @@ def run_experiment(out, cmake, jobs, function_profile=None):
     cmakedir = subprocess.check_output([config, "--cmakedir"], text=True).strip()
     out.mkdir(parents=True, exist_ok=True)
     from experiments.x87_llvm.function import DECLARATIONS as FUNCTION_DECLS
-    from experiments.x87_llvm.fixtures import BODY, BASELINE
-    module, baseline, declarations = [DECLARATIONS, FUNCTION_DECLS], ['#include "access.h"'], []
+    from experiments.x87_llvm.fixtures import EXTRA_CASES
+    from experiments.x87_llvm.direct import direct_ir
+    module, baseline, declarations = [DECLARATIONS, FUNCTION_DECLS,
+                                     direct_ir(DECLARATIONS + FUNCTION_DECLS)], ['#include "access.h"',
+                                     'extern void rk_observe(X86 *);'], []
+    # direct_ir also includes unchanged declarations: LLVM requires one per name.
+    module = list(dict.fromkeys('\n'.join(module).splitlines()))
+    direct_baseline = ['#include "access.h"', 'extern void rk_observe(X86 *);']
+    direct_declarations = ['static const char *mode_names[] = {"basic_c", "direct_raw", "direct_full", "direct_effects"};',
+                           'static const unsigned normalize_empty_mask = 0, required_match_mask = 14;']
+    direct_modes = ('basic', 'raw', 'full', 'effects')
     modes = ("baseline", "llvm_raw", "llvm_lifted", "full")
     declarations += ['static const char *mode_names[] = {"baseline", "llvm_raw", "llvm_lifted", "full"};',
                      "static const unsigned normalize_empty_mask = 0, required_match_mask = 14;"]
@@ -123,15 +133,40 @@ def run_experiment(out, cmake, jobs, function_profile=None):
                 baseline.append(f"void {symbol}(X86 *c) {{\n{emit_c(lines, mode)}\n}}")
     # A CFG regression independent of any game: PHIs for a live slot AND a
     # popped slot, followed by an observer and an aliasing memory store.
-    names = [*CASES, "cfg_join"]
-    for mode in modes:
-        symbol = f"cfg_join_{mode}"
-        declarations.append(f"void {symbol}(X86 *);")
-        if mode.startswith("llvm_"):
-            attr = ' "recomp.x87.region"' if mode == "llvm_lifted" else ''
-            module.append(f"define void @{symbol}(ptr %cpu){attr} {{\n{BODY}\n}}")
-        else:
-            baseline.append(f"void {symbol}(X86 *c) {{\n{BASELINE}\n}}")
+    names = [*CASES, *EXTRA_CASES]
+    for name, (body, reference) in EXTRA_CASES.items():
+        for mode in modes:
+            symbol = f"{name}_{mode}"
+            declarations.append(f"void {symbol}(X86 *);")
+            if mode.startswith("llvm_"):
+                attr = ' "recomp.x87.region"' if mode == "llvm_lifted" else ''
+                module.append(f"define void @{symbol}(ptr %cpu){attr} {{\n{body}\n}}")
+            else:
+                baseline.append(f"void {symbol}(X86 *c) {{\n{reference}\n}}")
+    for name in names:
+        for mode in direct_modes:
+            symbol = f"{name}_direct_{mode}"
+            direct_declarations.append(f"void {symbol}(X86 *);")
+            if mode == 'basic':
+                body = EXTRA_CASES[name][1] if name in EXTRA_CASES else emit_c(CASES[name], 'baseline')
+                if name == 'status_top':
+                    body = body.replace('rk_observe(c);', '')
+                direct_baseline.append(f"void {symbol}(X86 *c) {{\n{body}\n}}")
+            else:
+                if name in EXTRA_CASES:
+                    attr = ' "recomp.x87.region"' if mode != 'raw' else ''
+                    ir = f"define void @{symbol}(ptr %cpu){attr} {{\n{EXTRA_CASES[name][0]}\n}}"
+                else:
+                    ir = emit_llvm(symbol, CASES[name], mode != 'raw')
+                module.append(direct_ir(ir, effects=mode == 'effects'))
+    direct_declarations += ["static const char *case_names[] = {" + ','.join(f'"{n}"' for n in names) + "};",
+                            "static void (*functions[][4])(X86 *) = {" +
+                            ','.join('{' + ','.join(f"{n}_direct_{m}" for m in direct_modes) + '}' for n in names) + "};"]
+    direct_dir = out / 'direct'
+    direct_dir.mkdir(exist_ok=True)
+    (direct_dir / 'baseline.c').write_text('\n'.join(direct_baseline))
+    (direct_dir / 'fixtures.h').write_text('\n'.join(direct_declarations))
+    direct_function = bool(function_profile and json.loads(Path(function_profile).read_text()).get('direct_fixture'))
     if function_profile:
         from experiments.x87_llvm.function import prepare
         module.append(prepare(function_profile, out))
@@ -144,6 +179,7 @@ def run_experiment(out, cmake, jobs, function_profile=None):
     (out / "fixtures.h").write_text('\n'.join(declarations))
     subprocess.run([cmake, "-S", str(HERE), "-B", str(out),
                     f"-DFUNCTION_TEST={'ON' if function_profile else 'OFF'}",
+                    f"-DDIRECT_FUNCTION_TEST={'ON' if direct_function else 'OFF'}",
                     f"-DLLVM_DIR={cmakedir}", f"-DKIT_RUNTIME={KIT / 'runtime'}",
                     f"-DCMAKE_C_COMPILER={bindir / 'clang'}",
                     f"-DCMAKE_CXX_COMPILER={bindir / 'clang++'}"], check=True)
@@ -158,6 +194,11 @@ def run_experiment(out, cmake, jobs, function_profile=None):
     if function_profile:
         result = subprocess.run([str(out / "x87_function")], check=True, capture_output=True, text=True)
         (out / "function-results.txt").write_text(result.stdout)
+        print(result.stdout, end="")
+    for executable, result_name in [('x87_direct', 'direct-results.txt')] + (
+            [('x87_function_direct', 'function-direct-results.txt')] if direct_function else []):
+        result = subprocess.run([str(out / executable)], check=True, capture_output=True, text=True)
+        (out / result_name).write_text(result.stdout)
         print(result.stdout, end="")
     # Structural postcondition, in addition to opt's verifier: the pass must
     # remove every stack operation from each requested region, retaining rounds.
