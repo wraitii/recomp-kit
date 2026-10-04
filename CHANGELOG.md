@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Extend opt-in C x87 locals across ordered integer arena accesses and
+  single-entry branch/loop regions with consistent TOP at joins. Full slot
+  values, tags and exact-integer metadata are published on every region exit;
+  calls and unsupported observers remain boundaries. Interior faults may see
+  x87 state from the preceding publication point.
+
 - Add opt-in `[translate] x87_locals = true` C lowering. Supported straight-line
   regions keep x87 values in scalar locals and defer physical stack/tag/metadata
   writes until an observation boundary, preserving popped contents and the

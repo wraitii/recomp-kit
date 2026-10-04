@@ -36,6 +36,18 @@ PRODUCTION_CASES = {
                          "FILD qword ptr [ESI]", "FSTP float ptr [EBX]", "FSTP float ptr [EBX + 4]"],
     "register_direction": ["FLD float ptr [ESI]", "FLD float ptr [EDI]", "FMUL ST1,ST0",
                            "FSUBR ST0,ST1", "FSUBP ST1,ST0", "FSTP float ptr [EBX]"],
+    "integer_alias": ["FLD float ptr [ESI]", "FMUL float ptr [EDI]",
+                      "MOV EAX,dword ptr [ESI + 4]", "MOV dword ptr [ESI],EAX",
+                      "FADD float ptr [ESI]", "FSTP float ptr [EBX]"],
+    "diamond": ["FLD float ptr [ESI]", "FMUL float ptr [EDI]", "FADD float ptr [EDI + 4]",
+                "TEST EBX,1", "JZ 0x00100007", "FSUB float ptr [ESI]",
+                "JMP 0x00100008", "FMUL float ptr [EDI]", "FSTP float ptr [EBX]"],
+    "loop": ["MOV EAX,3", "FLD float ptr [ESI]", "FMUL float ptr [EDI]",
+             "FADD float ptr [EDI + 4]", "FSTP float ptr [EBX]", "DEC EAX",
+             "JNZ 0x00100001", "NOP"],
+    "incoming_metadata": ["TEST EBX,1", "JZ 0x00100007", "FLD float ptr [ESI]",
+                          "FMUL float ptr [EDI]", "FADD float ptr [EDI + 4]",
+                          "FSTP float ptr [EBX]", "JMP 0x00100008", "NOP", "NOP"],
 }
 
 
@@ -45,10 +57,17 @@ def emit_production(lines, enabled):
     insns = T.parse_listing_text("\n".join(f"{0x100000 + i:08x}  {s}" for i, s in enumerate(lines)))
     tr = T.Translator(None, set(), SimpleNamespace(eager_flags=True))
     fn = T.Function(0x100000, "fragment", len(insns), insns)
+    tr.prepare(fn)
+    fn.index = {ins.addr: i for i, ins in enumerate(insns)}
+    fn.pushed_continuations = set()
+    labels = {tr.branch_target(ins) for ins in insns if ins.mnem in T.JCC or ins.mnem == "JMP"}
+    labels.discard(None)
     bodies = {i: tr.emit(fn, i, T.ALL_FLAGS) for i in range(len(insns))}
     if enabled:
-        bodies, _, _ = lower_regions(fn, bodies, set(), set(), T.parse_operand)
-    return "\n".join(line for i in range(len(insns)) for line in bodies[i])
+        bodies, _, _ = lower_regions(fn, bodies, labels, set(), T.parse_operand,
+                                     cfg=(tr.successors, tr.branch_target, T.JCC, ()))
+    return "\n".join(line for i, ins in enumerate(insns)
+                     for line in ([f"L_{ins.addr:08x}: ;"] if ins.addr in labels else []) + bodies[i])
 
 
 def emit(lines, mode):

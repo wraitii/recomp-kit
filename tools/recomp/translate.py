@@ -3105,7 +3105,8 @@ class Translator(object):
             from x87_locals import lower_regions
             bodies, regions, lifted = lower_regions(
                 fn, bodies, labels, dead, parse_operand,
-                VISUAL_ANIMATION_READS | frozenset(INSTRUCTION_PATCHES))
+                VISUAL_ANIMATION_READS | frozenset(INSTRUCTION_PATCHES),
+                (self.successors, self.branch_target, JCC, entries))
             self.stats["_x87_local_regions"] += regions
             self.stats["_x87_local_instructions"] += lifted
             self.stats["_x87_local_functions"] += bool(regions)

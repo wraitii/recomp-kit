@@ -33,13 +33,47 @@ def test_full_state_and_rounding_not_dead_slot_normalization():
 
 
 @pytest.mark.parametrize("boundary", [
-    "CALL 0x00200000", "MOV EAX,dword ptr [ESI]", "MOV dword ptr [ESI],EAX",
+    "CALL 0x00200000", "MOV EAX,dword ptr FS:[ESI]",
     "PUSH EAX", "FLDCW word ptr [ESI]", "FILD qword ptr [ESI]", "FXAM",
 ])
 def test_observers_materialize_before_original_instruction(boundary):
     body, _ = translate(DOT + [boundary, "RET"])
     commit = body.index("c->fpu_top = (x87_top_")
     assert commit < body.index(f"00100003 {boundary}")
+
+
+def test_integer_accesses_keep_order_inside_region():
+    body, _ = translate(DOT + ["MOV EAX,dword ptr [ESI]", "MOV dword ptr [ESI],EAX",
+                               "FSTP float ptr [EBX]", "RET"])
+    assert body.count("local x87") == 1
+    assert body.index("00100003 MOV") < body.index("00100004 MOV") < body.index("00100005 FSTP")
+    assert body.index("00100005 FSTP") < body.index("c->st[")
+
+
+def test_diamond_join_uses_scalar_slots_and_publishes_before_return():
+    body, _ = translate(DOT + ["TEST EAX,EAX", "JZ 0x00100007", "FMUL float ptr [ESI]",
+                               "JMP 0x00100008", "FADD float ptr [EDI]",
+                               "FSTP float ptr [EBX]", "RET"])
+    assert "local x87 CFG" in body
+    assert "goto L_x87_00100007" in body and "goto L_x87_00100008" in body
+    assert body.index("c->st[") < body.index("00100009 RET")
+    assert "x87_tag7_ == 4" in body
+
+
+def test_loop_backedge_skips_initialization():
+    body, _ = translate(["MOV EAX,2", *DOT, "FSTP float ptr [EBX]", "DEC EAX",
+                         "JNZ 0x00100001", "RET"])
+    assert "local x87 CFG" in body
+    assert body.index("const unsigned x87_top_") < body.index("L_x87_00100001:")
+    assert "goto L_x87_00100001;" in body
+
+
+def test_disagreeing_top_join_and_alternate_entry_refuse_crossing():
+    lines = DOT + ["JZ 0x00100005", "FLD1", "FSTP float ptr [EBX]", "RET"]
+    assert "local x87 CFG" not in translate(lines)[0]
+    lines = DOT + ["JZ 0x00100005", "NOP", "FSTP float ptr [EBX]", "RET"]
+    body, _ = translate(lines, entries=(0x100005,))
+    assert "goto L_x87_00100005" not in body
 
 
 def test_alternate_entry_and_branch_targets_start_new_regions():

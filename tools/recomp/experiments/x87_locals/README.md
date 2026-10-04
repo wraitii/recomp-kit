@@ -31,11 +31,12 @@ aliasing reloads. Only self-contained straight-line FLD, FMUL, FADD, FSUB,
 implicit FADDP and FSTP with ordinary binary32 memory operands are supported.
 Other instructions, incoming-stack dependencies and local stack overflow fail.
 No register arguments, types, function boundaries or control flow are inferred.
-Three additional production-pass fixtures cover virtual TOP in FNSTSW followed
+Additional production-pass fixtures cover virtual TOP in FNSTSW followed
 by FCOMP, materialization before FILD with exact-integer metadata, and explicit
-register arithmetic direction/reverse subtraction. Their live/relaxed columns
-are eager controls, not weaker-contract variants. All six fixtures compare full
-state for the production pass (147,456 inputs in total).
+register arithmetic direction/reverse subtraction, integer-store aliases,
+branch joins, loops and conditional preservation of incoming slot metadata.
+Their live/relaxed columns are eager controls, not weaker-contract variants.
+All ten fixtures compare full state for the production pass (245,760 inputs).
 
 The C harness tests 24,576 inputs per fixture, with all eight entry TOPs and
 all sixteen PC/RC bit combinations (including reserved PC=01, for runtime
