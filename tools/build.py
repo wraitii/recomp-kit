@@ -355,6 +355,10 @@ def translation_fingerprint(game_dir, cfg, translate_args):
         if path.is_file():
             h.update(name.encode() + b"\0" + path.read_bytes())
     h.update(b"exe\0" + cfg["game"]["sha256"].encode())
+    if cfg.get("code_map_path"):
+        from code_map import MAP_FILES
+        for name in MAP_FILES:
+            h.update(name.encode() + b"\0" + (cfg["code_map_path"] / name).read_bytes())
     def hash_listings(listings):
         h.update(str(listings.resolve()).encode() + b"\0")
         functions_tsv = listings / "functions.tsv"
@@ -567,6 +571,8 @@ def main():
         # The lock lives at <build root>/recomp/.lock: BuildLock joins build/recomp/.lock onto its argument.
         with buildlock.BuildLock(args.build_root.parent, "tools/build.py"):
             if args.target in NEEDS_GEN and args.regenerate:
+                from code_map import ensure_listings
+                ensure_listings(cfg)
                 if not (cfg["listings_path"] / "functions.tsv").is_file():
                     parser.error("Translation listings are missing; run tools/setup.py without --link-only")
                 translate_args = {

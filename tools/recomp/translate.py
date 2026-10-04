@@ -275,6 +275,9 @@ def configure(cfg):
         else:
             value = int(r["value"]) & 0xFFFFFFFF
         DATA_SEEDS.append((int(r["addr"]), value))
+    # Public address/length metadata is decoded into private local listings.
+    from code_map import ensure_listings
+    ensure_listings(cfg)
 
 
 def visual_animation_read(addr, body):
@@ -1698,7 +1701,10 @@ class Image(object):
             return "-0x%x" % -op.imm if op.imm < 0 else "0x%x" % op.imm
         if op.type == X.X86_OP_MEM:
             word = self._size_word(op.size, mnem)
-            if word is None:
+            # Environment/state instructions have structured 14/28/94/108-byte
+            # operands. Their mnemonic determines the layout, not a scalar width.
+            structured = mnem in ("FNSTENV", "FSTENV", "FLDENV", "FNSAVE", "FSAVE", "FRSTOR")
+            if word is None and not structured:
                 raise TranslateError("unknown operand width %d" % op.size)
             parts = []
             if op.mem.base:
@@ -1710,7 +1716,8 @@ class Image(object):
                              else "0x%x" % op.mem.disp)
             inner = " + ".join(parts)
             seg = ci.reg_name(op.mem.segment).upper() if op.mem.segment else ""
-            return "%s ptr %s[%s]" % (word, seg + ":" if seg else "", inner)
+            return "%s%s[%s]" % ("" if structured else word + " ptr ",
+                                  seg + ":" if seg else "", inner)
         raise TranslateError("unknown capstone operand type %d" % op.type)
 
     def to_insn(self, ci):

@@ -68,8 +68,9 @@ translator on all three platforms. The iOS packager runs on macOS,
 including `--target ios --stub` builds. See [Contributing](CONTRIBUTING.md)
 for platform prerequisites; the commands below use a macOS shell.
 
-From the game repository, with Python 3.9 or later, Ghidra for the first
-translation, and your own copy of the game:
+From the game repository, with Python 3.9 or later and your own copy of the
+game. Ghidra is needed for listing-based games; games shipping an address/length
+code map can build without it. Follow the game repository's installation steps:
 
 ```sh
 python3 -m venv .venv

@@ -16,7 +16,7 @@ portable tests and mod examples. Open an issue before a large architecture chang
 - Native builds on Windows: LLVM's clang and a Visual Studio developer
   command prompt for the Windows SDK. On Windows, use `.venv/Scripts/python.exe`
   in place of `.venv/bin/python` in the commands below.
-- First translation: [Ghidra 12.1.3](https://github.com/NationalSecurityAgency/ghidra/releases/tag/Ghidra_12.1.3_build).
+- First translation for games without a committed code map: [Ghidra 12.1.3](https://github.com/NationalSecurityAgency/ghidra/releases/tag/Ghidra_12.1.3_build).
 - A Java runtime compatible with that Ghidra distribution. The documented setup
   was tested with OpenJDK 26.0.1; set `JAVA_HOME` to the JDK directory.
 - Your own supported installation of the game you are building. Its
@@ -49,6 +49,12 @@ annotation metadata `[setup]` names, and exports translation inputs into
 ignored `<game>/analysis/`. It does not download the game. Existing links to
 another installation and dirty metadata checkouts are preserved and reported.
 The first export can take several minutes.
+
+Games may ship an address/length map selected by `[translate] code_map`. The
+translator then verifies the private executable against both the map and game
+hash and generates assembly listings into `[translate] listings` automatically.
+That directory must be separate from the committed map and contain only the
+generated cache. Ghidra is only needed to refresh the analysis metadata.
 
 If inputs already exist, `--link-only` validates the game link without running
 Ghidra. `GHIDRA_HOME` and `JAVA_HOME` can supply the tool paths instead of flags.

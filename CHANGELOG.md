@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Support `[translate] code_map` address/length metadata. Builds verify the
+  owner's executable and decode private assembly listings locally, allowing
+  game repositories to build without Ghidra or distributed game instructions.
+  Decoder boundary disagreements fail before publishing the listing cache.
+
 - Extend opt-in C x87 locals across ordered integer arena accesses and
   single-entry branch/loop regions with consistent TOP at joins. Full slot
   values, tags and exact-integer metadata are published on every region exit;

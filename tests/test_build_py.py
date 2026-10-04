@@ -178,6 +178,20 @@ class BuildPyTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 build_py.translation_fingerprint(game, cfg, args)
 
+    def test_fingerprint_tracks_code_map_contents_without_listing_changes(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            metadata = game / "metadata"
+            metadata.mkdir()
+            for name in ("metadata.txt", "functions.tsv", "instruction_map.tsv"):
+                (metadata / name).write_text("initial")
+            cfg = {"game": {"sha256": "abc"}, "translate": {}, "code_map_path": metadata,
+                   "listings_path": game / "listings", "aux_modules": []}
+            before = build_py.translation_fingerprint(game, cfg, {})
+            (metadata / "instruction_map.tsv").write_text("new boundaries")
+            self.assertNotEqual(before, build_py.translation_fingerprint(game, cfg, {}))
+
     def test_fingerprint_tracks_auxiliary_listings(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:

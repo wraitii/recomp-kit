@@ -164,6 +164,20 @@ class LoadTests(unittest.TestCase):
             self.assertIn('#define RECOMP_GAME_DIR "%s"' % game.resolve().as_posix(), header)
             self.assertIn('#define RECOMP_KIT_DIR "%s"' % ROOT.resolve().as_posix(), header)
 
+    def test_code_map_path_is_optional_relative_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            stub = (ROOT / "games/stub/game.toml").read_text()
+            (game / "globals.toml").write_text("")
+            (game / "game.toml").write_text(stub)
+            self.assertIsNone(game_config.load(game)["code_map_path"])
+            (game / "game.toml").write_text(stub.replace('[translate]', '[translate]\ncode_map = "metadata/map"'))
+            self.assertEqual(game_config.load(game)["code_map_path"], (game / "metadata/map").resolve())
+            for value in ('""', '12', '[]'):
+                (game / "game.toml").write_text(stub.replace('[translate]', '[translate]\ncode_map = ' + value))
+                with self.assertRaisesRegex(ValueError, 'code_map'):
+                    game_config.load(game)
+
     def test_override_header_is_optional_and_must_exist(self):
         """[translate] overrides names the header the generated sources include
         before they define FN_<addr>, which is how a game replaces one

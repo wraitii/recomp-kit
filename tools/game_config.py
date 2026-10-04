@@ -234,6 +234,10 @@ def load(game_dir):
     # ignored original/ and analysis/ directories.
     cfg["developer_exe_path"] = (game_dir / game["developer_exe"]).resolve()
     cfg["listings_path"] = (game_dir / translate.get("listings", "analysis")).resolve()
+    code_map = translate.get("code_map")
+    if code_map is not None and (not isinstance(code_map, str) or not code_map):
+        raise ValueError("%s: [translate] code_map must be a non-empty path" % source)
+    cfg["code_map_path"] = (game_dir / code_map).resolve() if code_map else None
     # [translate] overrides: a header the generated sources include before they
     # define FN_<addr>, so a game can replace one translated function with a
     # native one (translate.py's RECOMP_OVERRIDE_HEADER). Absent by default,
