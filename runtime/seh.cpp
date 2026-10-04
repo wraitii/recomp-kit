@@ -133,7 +133,9 @@ struct ChainWalk {
 };
 
 // Windows' x86 integer/control CONTEXT fields, always guest arena offsets.
-void fill_context(X86 *c, uint32_t context) {
+// `eip` is the instruction the context resumes at: the faulting instruction
+// for a CPU fault, or the caller's return address for RaiseException.
+void fill_context(X86 *c, uint32_t context, uint32_t eip) {
     wr32(context, 0x10003);     // CONTEXT_i386 | CONTROL | INTEGER
     wr32(context + 0x90, 0x3b); // FS (TEB)
     wr32(context + 0x94, 0x23); // ES
@@ -141,14 +143,14 @@ void fill_context(X86 *c, uint32_t context) {
     const int regs[] = {R_EDI, R_ESI, R_EBX, R_EDX, R_ECX, R_EAX, R_EBP};
     for (uint32_t i = 0; i < 7; ++i)
         wr32(context + 0x9c + i * 4, c->r[regs[i]]);
-    wr32(context + 0xb8, rd32(c->r[R_ESP]));
+    wr32(context + 0xb8, eip);
     wr32(context + 0xbc, 0x1b); // CS
     wr32(context + 0xc0, x86_get_eflags(c));
     wr32(context + 0xc4, c->r[R_ESP]);
     wr32(context + 0xc8, 0x23); // SS
 }
 
-SehDispatch *new_dispatch(X86 *c, uint32_t supplied_record = 0) {
+SehDispatch *new_dispatch(X86 *c, uint32_t supplied_record = 0, uint32_t fault_eip = 0) {
     if (supplied_record && !gm_valid(supplied_record, RECORD_BYTES))
         invalid_chain(c, 0, supplied_record, "invalid exception record");
     uint32_t storage = heap_alloc(RECORD_BYTES + CONTEXT_BYTES, true);
@@ -157,7 +159,7 @@ SehDispatch *new_dispatch(X86 *c, uint32_t supplied_record = 0) {
     SehDispatch *d = new SehDispatch{c, storage, supplied_record ? supplied_record : storage,
                                      storage + RECORD_BYTES, recomp_callback_depth()};
     state.dispatches.push_back(d);
-    fill_context(c, d->context);
+    fill_context(c, d->context, fault_eip ? fault_eip : rd32(c->r[R_ESP]));
     return d;
 }
 
@@ -166,6 +168,45 @@ void finish_dispatch(SehDispatch *d) {
         invalid_chain(d->cpu, 0, d->record, "dispatch ownership mismatch");
     state.dispatches.pop_back();
     release_dispatch(d);
+}
+
+uint32_t call_handler(X86 *c, uint32_t reg, SehDispatch *d);
+
+int raise_dispatch(X86 *c, uint32_t code, uint32_t flags, uint32_t nargs, uint32_t args,
+                   uint32_t exception_address) {
+    recomp_seh_validate_chain(c, "raise", "");
+    X86 saved = *c;
+    if (nargs > 15)
+        nargs = 15;
+    if (nargs && (!args || !gm_valid(args, nargs * 4)))
+        invalid_chain(c, 0, args, "invalid exception information");
+    SehDispatch *d = new_dispatch(c, 0, exception_address);
+    wr32(d->record, code);
+    wr32(d->record + 4, flags);
+    wr32(d->record + 12, exception_address);
+    wr32(d->record + 16, nargs);
+    for (uint32_t i = 0; i < nargs; ++i)
+        wr32(d->record + 20 + i * 4, rd32(args + i * 4));
+    ChainWalk walk;
+    for (uint32_t reg = chain_head(c); reg != END_CHAIN;) {
+        walk.visit(c, reg, 0);
+        uint32_t next = rd32(reg);
+        call_handler(c, reg, d);
+        reg = next;
+    }
+    *c = saved; // retain the original raise's registers for the existing diagnostics
+    int intercepted = 0;
+#ifdef POPM_TESTING
+    if (unhandled_hook) {
+        unhandled_hook(c, d->record, d->context);
+        intercepted = 1;
+    }
+#endif
+    if (!intercepted)
+        LOGW("SEH: unhandled exception record=%08x context=%08x code=%08x flags=%08x", d->record,
+             d->context, code, flags);
+    finish_dispatch(d);
+    return intercepted;
 }
 
 uint32_t call_handler(X86 *c, uint32_t reg, SehDispatch *d) {
@@ -426,39 +467,11 @@ void recomp_seh_reset(X86 *c) {
 }
 
 int recomp_seh_raise(X86 *c, uint32_t code, uint32_t flags, uint32_t nargs, uint32_t args) {
-    recomp_seh_validate_chain(c, "raise", "");
-    X86 saved = *c;
-    if (nargs > 15)
-        nargs = 15;
-    if (nargs && (!args || !gm_valid(args, nargs * 4)))
-        invalid_chain(c, 0, args, "invalid exception information");
-    SehDispatch *d = new_dispatch(c);
-    wr32(d->record, code);
-    wr32(d->record + 4, flags);
-    wr32(d->record + 12, rd32(c->r[R_ESP]));
-    wr32(d->record + 16, nargs);
-    for (uint32_t i = 0; i < nargs; ++i)
-        wr32(d->record + 20 + i * 4, rd32(args + i * 4));
-    ChainWalk walk;
-    for (uint32_t reg = chain_head(c); reg != END_CHAIN;) {
-        walk.visit(c, reg, 0);
-        uint32_t next = rd32(reg);
-        call_handler(c, reg, d);
-        reg = next;
-    }
-    *c = saved; // retain the original raise's registers for the existing diagnostics
-    int intercepted = 0;
-#ifdef POPM_TESTING
-    if (unhandled_hook) {
-        unhandled_hook(c, d->record, d->context);
-        intercepted = 1;
-    }
-#endif
-    if (!intercepted)
-        LOGW("SEH: unhandled exception record=%08x context=%08x code=%08x flags=%08x", d->record,
-             d->context, code, flags);
-    finish_dispatch(d);
-    return intercepted;
+    return raise_dispatch(c, code, flags, nargs, args, rd32(c->r[R_ESP]));
+}
+
+int recomp_seh_raise_fault(X86 *c, uint32_t code, uint32_t fault_eip) {
+    return raise_dispatch(c, code, 0, 0, 0, fault_eip);
 }
 
 // Delphi passes its own next instruction as TargetIp. Returning through the
