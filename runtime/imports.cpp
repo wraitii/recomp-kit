@@ -490,7 +490,7 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     // import call. `argc == ARGC_UNKNOWN` needs the description for the
     // once-only key below, and the null/unsupported shims name the import in
     // their diagnostic.
-    // RECOMP_TRACE_IMPORTS=<substring> logs every import whose "dll!name"
+    // RECOMP_TRACE_IMPORTS=<substring>[,<substring>...] logs every import whose "dll!name"
     // contains the substring, with its stdcall arguments (hex and as float)
     // and the guest return address.
     static const char *trace_filter = recomp_env("TRACE_IMPORTS");
@@ -511,7 +511,28 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     // current call's return address here is the honest value.
     c->eip = ret_addr;
     LOGV("-> %s (esp=%08x ret=%08x)", desc, c->r[R_ESP], ret_addr);
-    if (trace_filter && strstr(desc, trace_filter)) {
+    // A comma separates alternatives: RECOMP_TRACE_IMPORTS=mmio,QSWaveMix.
+    auto trace_match = [&]() {
+        if (!trace_filter)
+            return false;
+        const char *p = trace_filter;
+        while (*p) {
+            const char *e = strchr(p, ',');
+            size_t n = e ? (size_t)(e - p) : strlen(p);
+            if (n && n < 128) {
+                char part[128];
+                memcpy(part, p, n);
+                part[n] = 0;
+                if (strstr(desc, part))
+                    return true;
+            }
+            if (!e)
+                break;
+            p = e + 1;
+        }
+        return false;
+    };
+    if (trace_match()) {
         char line[512];
         int n = snprintf(line, sizeof line, "import: %s ret=%08x", desc, ret_addr);
         uint32_t na = (argc == ARGC_CDECL || argc == ARGC_UNKNOWN) ? 0u : (uint32_t)argc;

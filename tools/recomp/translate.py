@@ -144,7 +144,7 @@ def emit_entry_dispatch(prefix):
     return """
 void %(p)senter(X86 *c, uint32_t i)
 {
-    uint32_t ebp = recomp_frame_watch ? c->r[5] : 0u;
+    RecompSaved saved_; recomp_save(c, &saved_);
     if (recomp_profile_enabled) { recomp_call(c, %(p)sfunc_addrs[i]); return; }
 #ifndef RECOMP_NO_HOOKS
     if (__builtin_expect(__atomic_load_n(&%(p)shooked[i], __ATOMIC_ACQUIRE) != 0u, 0))
@@ -153,8 +153,8 @@ void %(p)senter(X86 *c, uint32_t i)
 #endif
         %(p)sbase_ptrs[i](c);
 #ifndef RECOMP_NO_HOOKS
-    if (recomp_frame_watch && c->r[5] != ebp)
-        recomp_frame_changed(c, %(p)sfunc_addrs[i], ebp, c->r[5]);
+    if (recomp_frame_watch)
+        recomp_check_saved(c, %(p)sfunc_addrs[i], &saved_);
 #endif
 }
 """ % {"p": prefix}
@@ -6371,10 +6371,10 @@ int recomp_thunk_target_kind(uint32_t target)
 static void recomp_call_inner(X86 *c, uint32_t target);
 void recomp_call(X86 *c, uint32_t target)
 {
-    uint32_t ebp_ = recomp_frame_watch ? c->r[5] : 0u;
+    RecompSaved saved_; recomp_save(c, &saved_);
     recomp_call_inner(c, target);
-    if (recomp_frame_watch && c->r[5] != ebp_)
-        recomp_frame_changed(c, target, ebp_, c->r[5]);
+    if (recomp_frame_watch)
+        recomp_check_saved(c, target, &saved_);
 }
 static void recomp_call_inner(X86 *c, uint32_t target)
 {

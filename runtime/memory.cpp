@@ -104,6 +104,20 @@ extern "C" void recomp_frame_changed(X86 *c, uint32_t target, uint32_t before, u
              before, c ? c->eip : 0u);
 }
 
+extern "C" void recomp_saved_changed(X86 *c, uint32_t target, const RecompSaved *before) {
+    // Same rate limit as recomp_frame_changed; the register names say which
+    // part of the ABI the callee broke.
+    // Each distinct callee once: the pairs that legitimately hand a frame to
+    // their partner (enter in one call, leave in the next) would otherwise
+    // fill any fixed cap before the routine that matters has been named.
+    static std::set<uint32_t> seen;
+    if (seen.size() < 512 && seen.insert(target).second)
+        LOGW("frame: %08x returned with callee-saved registers changed: EBX %08x->%08x EBP "
+             "%08x->%08x ESI %08x->%08x EDI %08x->%08x (left at eip=%08x)",
+             target, before->ebx, c->r[R_EBX], before->ebp, c->r[R_EBP], before->esi, c->r[R_ESI],
+             before->edi, c->r[R_EDI], c->eip);
+}
+
 extern "C" void recomp_watch_hit(uint32_t addr, uint32_t n, uint64_t value) {
     // Report every write, not just the first: what matters is which of them
     // was the last one before the damage was read back, and a legitimate

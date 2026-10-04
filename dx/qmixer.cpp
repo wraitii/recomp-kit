@@ -44,6 +44,9 @@
 
 namespace {
 
+// The last error QMixer reported, process-wide: QSWaveMixGetLastError takes no
+// handle (see below), so it cannot be answered per session.
+uint32_t g_qs_last_error = 0;
 const uint32_t QS_OK = 0;
 const uint32_t QS_ERROR = 1;
 
@@ -328,6 +331,88 @@ void read_vec3(uint32_t a, float out[3]) {
 // plays nothing is indistinguishable from working audio to everything
 // upstream. The game already handles the failure, returning -1 from its own
 // loader at 0x56f720.
+// The memory-file form (flag 0x4): the record's first dword points at an
+// MMIOINFO with fccIOProc 'MEM ', cchBuffer at +0x14 and pchBuffer at +0x18,
+// and QMixer parses the RIFF/WAVE image itself. Evidence: LHaudiodllR
+// 0x10211dad..0x10211ef7 (and the same shape at 0x10211d66) clear an 18-dword
+// MMIOINFO, store 'MEM ' at +4 and the size and data pointer at +0x14/+0x18,
+// then call OpenWaveEx with flags 4 and a record whose field 0 points at it;
+// RECOMP_TRACE_IMPORTS showed the call arriving with exactly that.
+// Only PCM is played. A compressed tag (ADPCM 2, MPEG 0x55, ...) is refused by
+// name: decoding it is a separate piece of work, not something to guess at.
+bool read_riff_wave(uint32_t info, Wave *w, uint32_t *error) {
+    const auto fail = [&](uint32_t code) {
+        if (error)
+            *error = code;
+        return false;
+    };
+    if (!gm_valid(info, 0x24) || rd32(info + 4) != 0x204d454du /* 'MEM ' */) {
+        log_once("qmixer.mmio",
+                 "qmixer: OpenWaveEx flag 4 record does not point at a 'MEM ' "
+                 "MMIOINFO (%08x); refusing the wave",
+                 info);
+        ++counters().open_wave_refused_rec;
+        return fail(QSERR_BAD_WAVE_RECORD);
+    }
+    const uint32_t size = rd32(info + 0x14), base = rd32(info + 0x18);
+    if (size < 12 || !gm_fits(base, size) || rd32(base) != 0x46464952u /* RIFF */ ||
+        rd32(base + 8) != 0x45564157u /* WAVE */) {
+        log_once("qmixer.riff",
+                 "qmixer: OpenWaveEx memory image at %08x (%u bytes) is not a "
+                 "RIFF/WAVE; refusing the wave",
+                 base, size);
+        ++counters().open_wave_refused_data;
+        return fail(QSERR_BAD_DATA);
+    }
+    bool have_fmt = false;
+    uint32_t data = 0, bytes = 0;
+    uint32_t pos = 12;
+    while (pos + 8 <= size) {
+        const uint32_t id = rd32(base + pos), len = rd32(base + pos + 4), body = pos + 8;
+        if (body > size)
+            break;
+        const uint32_t avail = size - body < len ? size - body : len; // a truncated last chunk
+        if (id == 0x20746d66u /* 'fmt ' */ && avail >= 16 && !have_fmt) {
+            const uint16_t tag = rd16(base + body + WFX_OFF_wFormatTag);
+            if (tag != WAVE_FORMAT_PCM) {
+                log_once("qmixer.riff.tag",
+                         "qmixer: OpenWaveEx RIFF wave has format tag 0x%x (not PCM); compressed "
+                         "waves are not decoded here; refusing the wave",
+                         tag);
+                ++counters().open_wave_refused_fmt;
+                return fail(QSERR_BAD_FORMAT);
+            }
+            w->channels = rd16(base + body + WFX_OFF_nChannels);
+            w->rate = rd32(base + body + WFX_OFF_nSamplesPerSec);
+            w->bits = rd16(base + body + WFX_OFF_wBitsPerSample);
+            have_fmt = true;
+        } else if (id == 0x61746164u /* 'data' */ && !data) {
+            data = base + body;
+            bytes = avail;
+        }
+        pos = body + len + (len & 1u); // chunks are word aligned
+    }
+    if (!have_fmt || !data || !bytes) {
+        log_once("qmixer.riff.chunks",
+                 "qmixer: OpenWaveEx RIFF wave at %08x has no usable "
+                 "'fmt '/'data' chunks; refusing the wave",
+                 base);
+        ++counters().open_wave_refused_data;
+        return fail(QSERR_BAD_DATA);
+    }
+    if (!w->channels || w->channels > 2 || !w->rate || (w->bits != 8 && w->bits != 16)) {
+        log_once("qmixer.riff.vals",
+                 "qmixer: OpenWaveEx RIFF format is %u Hz, %u channels, %u bits, which is not "
+                 "something this mixer can play",
+                 w->rate, w->channels, w->bits);
+        ++counters().open_wave_refused_fmt;
+        return fail(QSERR_BAD_FORMAT);
+    }
+    w->pcm = data;
+    w->bytes = bytes;
+    return true;
+}
+
 bool read_wave_record(uint32_t rec, uint32_t flags, Wave *w, uint32_t *error) {
     const auto fail = [&](uint32_t code) {
         if (error)
@@ -340,7 +425,10 @@ bool read_wave_record(uint32_t rec, uint32_t flags, Wave *w, uint32_t *error) {
         return fail(QSERR_BAD_WAVE_RECORD);
     }
 
-    // Field 0 is the format, written at every call site.
+    // Field 0 is the format, written at every call site - except the memory
+    // file form, where it is the MMIOINFO of a RIFF image.
+    if (flags & 0x4u)
+        return read_riff_wave(rd32(rec + QSOWD_OFF_lpFormat), w, error);
     uint32_t fmt = rd32(rec + QSOWD_OFF_lpFormat);
     if (!fmt || !gm_valid(fmt, 16)) {
         log_once("qmixer.fmt", "qmixer: OpenWaveEx format pointer %08x is not readable", fmt);
@@ -977,7 +1065,7 @@ void QSWaveMixOpenWaveEx(X86 *c) {
     w.alive = true;
     uint32_t error = QS_OK;
     if (!read_wave_record(data, flags, &w, &error)) {
-        s->last_error = error;
+        s->last_error = error, g_qs_last_error = error;
         set_eax(c, 0); // the documented failure; the game handles it
         return;
     }
@@ -1055,7 +1143,7 @@ void QSWaveMixPlayEx(X86 *c) {
     if (!w) {
         ++counters().drop_no_wave;
         drop_reason("no such wave", idx, arg(c, 3));
-        s->last_error = QSERR_PLAY_FAILED;
+        s->last_error = QSERR_PLAY_FAILED, g_qs_last_error = QSERR_PLAY_FAILED;
         set_eax(c, QS_ERROR);
         return;
     }
@@ -1063,7 +1151,7 @@ void QSWaveMixPlayEx(X86 *c) {
     if (!ch) {
         ++counters().drop_no_channel;
         drop_reason("channel out of range", idx, MAX_CHANNELS);
-        s->last_error = QSERR_NO_CHANNEL;
+        s->last_error = QSERR_NO_CHANNEL, g_qs_last_error = QSERR_NO_CHANNEL;
         set_eax(c, QS_ERROR);
         return;
     }
@@ -1599,15 +1687,15 @@ void QSWaveMixSetSpeakerPlacement(X86 *c) {
     set_eax(c, QS_OK);
 }
 
-// QSWaveMixGetLastError(hMix): the error the session last reported. Evidence:
-// LHaudiodllR 0x10202f50 and 0x10202fc0 are the only callers; both push one
-// word (the mixer handle) and pass the result straight to GetErrorText as its
-// code argument. The returned values here are invented (see QSERR_* above).
+// QSWaveMixGetLastError(): takes NO arguments. Evidence: LHaudiodllR 0x10202f50
+// does `PUSH ESI; CALL [GetLastError]; MOV ESI,EAX; ... POP ESI`. That push is
+// the function saving ESI, not an argument; registering one argument made the
+// shim pop the saved ESI and the whole frame returned one word off (found with
+// RECOMP_WATCH_FRAME: ESI came back as the return address).
+// SHIM(temporary): the code values are invented (see QSWaveMixGetErrorText).
 void QSWaveMixGetLastError(X86 *c) {
-    QTRACE("qmixer: QSWaveMixGetLastError(%08x, %08x, %08x, %08x, %08x, %08x)", arg(c, 0),
-           arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5));
-    Session *s = session_for(arg(c, 0));
-    set_eax(c, s ? s->last_error : QSERR_NO_SESSION);
+    QTRACE("qmixer: QSWaveMixGetLastError(%s)", "");
+    set_eax(c, g_qs_last_error);
 }
 
 // QSWaveMixGetErrorText(code, lpBuffer, cchBuffer). Evidence: LHaudiodllR
@@ -1664,7 +1752,7 @@ void QSWaveMixGetErrorText(X86 *c) {
 }
 
 const ImportShim g_qmixer_shims[] = {
-    {"QMIXER.dll", "QSWaveMixGetLastError", 1, QSWaveMixGetLastError},
+    {"QMIXER.dll", "QSWaveMixGetLastError", 0, QSWaveMixGetLastError},
     {"QMIXER.dll", "QSWaveMixGetErrorText", 3, QSWaveMixGetErrorText},
     {"QMIXER.dll", "QSWaveMixSetSpeakerPlacement", 2, QSWaveMixSetSpeakerPlacement},
     {"QMIXER.dll", "QSWaveMixSetSpeedOfSound", 3, QSWaveMixSetSpeedOfSound},

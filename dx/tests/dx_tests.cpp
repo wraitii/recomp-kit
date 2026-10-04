@@ -11725,6 +11725,54 @@ static void test_qmixer_refill_gate() {
 // gain of 0.433 and about -7.3 dB; read as hundredths of a decibel, as it was,
 // every positive number clamped to unity and every sound played at full
 // volume with no mix at all.
+// OpenWaveEx flag 4: the record's field 0 points at a 'MEM ' MMIOINFO of a
+// RIFF/WAVE image, as LHaudiodllR 0x10211dad builds it. A PCM image opens; a
+// compressed tag is refused with a nonzero last error; and QSWaveMixGetLastError
+// takes no arguments (its caller pushes ESI only to save it).
+static void test_qmixer_riff_memory_wave() {
+    cpu_reset();
+    qmixer_reset();
+    uint32_t hmix = call_shim(tramp("QMIXER.dll", "QSWaveMixInitEx"), {0});
+    CHECK(hmix != 0);
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixActivate"), {hmix, 1}), 0u);
+    const auto put_riff = [&](uint32_t at, uint16_t tag) {
+        wr32(at, 0x46464952u); // RIFF
+        wr32(at + 4, 4 + 8 + 16 + 8 + 4);
+        wr32(at + 8, 0x45564157u);  // WAVE
+        wr32(at + 12, 0x20746d66u); // fmt
+        wr32(at + 16, 16);
+        wr16(at + 20, tag);
+        wr16(at + 22, 1);
+        wr32(at + 24, 22050);
+        wr32(at + 28, 22050);
+        wr16(at + 32, 1);
+        wr16(at + 34, 8);
+        wr32(at + 36, 0x61746164u); // data
+        wr32(at + 40, 4);
+        for (uint32_t i = 0; i < 4; ++i)
+            wr8(at + 44 + i, (uint8_t)(0x80 + i));
+        return 48u;
+    };
+    uint32_t img = sc(0x400);
+    uint32_t size = put_riff(img, WAVE_FORMAT_PCM);
+    uint32_t info = sc(0x500);
+    gm_zero(info, 0x48);
+    wr32(info + 4, 0x204d454du); // 'MEM '
+    wr32(info + 0x14, size);
+    wr32(info + 0x18, img);
+    uint32_t rec = sc(0x600);
+    gm_zero(rec, QSWAVEMIXOPENWAVEDATA_SIZE);
+    wr32(rec + QSOWD_OFF_lpFormat, info);
+    uint32_t open_wave = tramp("QMIXER.dll", "QSWaveMixOpenWaveEx");
+    CHECK(call_shim(open_wave, {hmix, rec, 4}) != 0);
+
+    uint32_t img2 = sc(0x700);
+    wr32(info + 0x18, img2);
+    wr32(info + 0x14, put_riff(img2, 0x55)); // MPEG layer 3: not decoded here
+    CHECK_EQ(call_shim(open_wave, {hmix, rec, 4}), 0u);
+    CHECK(call_shim(tramp("QMIXER.dll", "QSWaveMixGetLastError"), {}) != 0);
+}
+
 // ---------------------------------------------------------------------------
 static void test_qmixer_volume_scale() {
     cpu_reset();
@@ -14577,6 +14625,7 @@ int main() {
         {"QMixer channels", test_qmixer_channels},
         {"QMixer frame pump", test_qmixer_frame_pump},
         {"QMixer volume scale", test_qmixer_volume_scale},
+        {"QMixer RIFF memory wave and GetLastError arity", test_qmixer_riff_memory_wave},
         {"QMixer stream lifetime", test_qmixer_stream_buffer_lifetime},
         {"QMixer stream prefetch", test_qmixer_stream_prefetch},
         {"QMixer refill gate", test_qmixer_refill_gate},

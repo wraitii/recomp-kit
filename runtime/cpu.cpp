@@ -236,9 +236,10 @@ void recomp_unknown_call(X86 *c, uint32_t target) {
             wr32(info, 8);
             wr32(info + 4, target);
             log_once("null-call",
-                     "call to %08x (return=%08x): raising an access violation, as Windows "
-                     "would, for the guest's handlers",
-                     target, ret);
+                     "call to %08x (return=%08x EAX=%08x ECX=%08x ESI=%08x EDI=%08x FS:[0]=%08x): "
+                     "raising an access violation, as Windows would, for the guest's handlers",
+                     target, ret, c->r[R_EAX], c->r[R_ECX], c->r[R_ESI], c->r[R_EDI],
+                     c->fs_base && gm_valid(c->fs_base, 4) ? rd32(c->fs_base) : 0u);
             recomp_seh_raise(c, 0xc0000005u, 0, 2, info);
         }
     }

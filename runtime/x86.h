@@ -423,6 +423,27 @@ extern const int recomp_resumable_stacks;
  * and one compare per call, both of which the optimiser folds away. */
 extern uint32_t recomp_frame_watch;
 void recomp_frame_changed(X86 *c, uint32_t target, uint32_t before, uint32_t after);
+/* The callee-saved registers of the MSVC ABI. RECOMP_WATCH_FRAME also reports a
+ * call that returns with EBX, ESI or EDI changed: a loop that keeps its cursor
+ * in ESI, or a constant in EBX, then reads a wrong value far from the callee
+ * that broke it. */
+typedef struct {
+    uint32_t ebx, ebp, esi, edi;
+} RecompSaved;
+static inline void recomp_save(const X86 *c, RecompSaved *s) {
+    if (recomp_frame_watch) {
+        s->ebx = c->r[3];
+        s->ebp = c->r[5];
+        s->esi = c->r[6];
+        s->edi = c->r[7];
+    }
+}
+void recomp_saved_changed(X86 *c, uint32_t target, const RecompSaved *before);
+static inline void recomp_check_saved(X86 *c, uint32_t target, const RecompSaved *before) {
+    if (c->r[3] != before->ebx || c->r[5] != before->ebp || c->r[6] != before->esi ||
+        c->r[7] != before->edi)
+        recomp_saved_changed(c, target, before);
+}
 extern const int recomp_profile_enabled;
 void recomp_profile_push(uint32_t index);
 void recomp_profile_pop(void);
