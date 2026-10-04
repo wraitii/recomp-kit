@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add `tools/build.py --llvm-compare MANIFEST`, an opt-in build-only translator
+  path emitting verified complete leaf functions as production C and semantic
+  LLVM. It reuses normal C preparation/liveness, verifies byte/listing provenance
+  and an exact match to the existing production chunk, then compares production
+  compiler C, LLVM22 C, raw LLVM and lifted LLVM with the recorded build flags.
+  Native assembly, code sizes, stage costs and full-exit-state replay remain
+  inspectable under `build/llvm-compare`; game dispatch is unchanged. Requires an
+  explicit mapped-normal-exit contract; unsupported scope/settings are refused.
+
 - Add `tools/build.py --x87-llvm-experiment`: direct semantic LLVM emission,
   a bounded stack-to-SSA pass plugin, and existing-runtime comparison through
   the shared fragment harness. Requires LLVM 22; retains inspectable IR after

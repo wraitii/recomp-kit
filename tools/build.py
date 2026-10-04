@@ -464,6 +464,8 @@ def web_site(game_dir, build_root, preset, cfg):
 def parse_args(argv, system=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--regenerate", action="store_true", help="Regenerate and compile translated C")
+    parser.add_argument("--llvm-compare", type=Path, metavar="MANIFEST",
+                        help="Build-only translator C/LLVM comparison using production compile commands")
     parser.add_argument("--x87-locals-experiment", action="store_true",
                         help="Build and run the isolated x87 local-value experiment")
     parser.add_argument("--x87-llvm-experiment", action="store_true",
@@ -515,6 +517,12 @@ def parse_args(argv, system=None):
         parser.error("--target web needs the Emscripten SDK's environment (source emsdk_env.sh)")
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
+    if args.llvm_compare and any((args.stub, args.regenerate, args.config != "Release",
+                                  args.preset != default_preset(system), args.target != "app",
+                                  args.x87_llvm_experiment, args.x87_locals_experiment,
+                                  args.x87_llvm_function, args.allow_table_gaps,
+                                  args.allow_unmodelled, args.discovered, args.forget)):
+        parser.error("--llvm-compare requires native Release defaults and no translation overrides")
     args.build_root = build_root_for(args.game_dir)
     return args, parser
 
@@ -522,6 +530,13 @@ def parse_args(argv, system=None):
 def main():
     """Check inputs, translate under the build lock when needed, then configure and build."""
     args, parser = parse_args(sys.argv[1:])
+    if args.llvm_compare:
+        from llvm_compare_build import run_comparison
+        with buildlock.BuildLock(args.build_root.parent, "tools/build.py --llvm-compare"):
+            run_comparison(args.llvm_compare, args.game_dir, args.build_root / "llvm-compare",
+                           build_dir_for(args.build_root, args.preset) / "compile_commands.json",
+                           cmake_tool("cmake"), args.jobs)
+        return
     if args.x87_llvm_experiment:
         from experiments.x87_llvm.run import run_experiment
         run_experiment(args.build_root / "x87-llvm-experiment", cmake_tool("cmake"), args.jobs, args.x87_llvm_function)

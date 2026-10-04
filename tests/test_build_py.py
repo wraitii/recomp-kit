@@ -207,3 +207,13 @@ class BuildPyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_llvm_compare_is_separate_from_game_build_modes():
+    import pytest
+    for option in ('--regenerate', '--stub', '--x87-llvm-experiment', '--x87-locals-experiment'):
+        with pytest.raises(SystemExit):
+            build_py.parse_args(['--llvm-compare', 'manifest.json', option], system='Darwin')
+    args, _ = build_py.parse_args(['--llvm-compare', 'manifest.json'], system='Darwin')
+    assert args.llvm_compare == Path('manifest.json')
+    assert not args.regenerate
