@@ -22,6 +22,7 @@
 #include "com.h"
 #include "ddraw.h"
 #include "dx.h"
+#include "dxt_decode.h"
 #include "dxtypes.h"
 #include "host_api.h"
 #include "../platform/os.h"
@@ -37,10 +38,52 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <algorithm>
 #include <array>
 #include <map>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
+
+// Reconciles a readback into the guest surface. `dst` is the host pointer for
+// the surface's first row, `pitch` its byte pitch. The store is a shim copy
+// (from the GPU target), so it addresses memory directly rather than through
+// the guest store hook: the hook only exists to narrow a guest Lock's write
+// diff, and a completed Lock cannot be open for the surface being written back
+// (Flip rejects a locked chain, and Lock flushes before it opens its shadow).
+bool d3d7_store_rgba_surface(uint8_t *dst, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h,
+                             const uint8_t *rgba) {
+    if (!dst || !rgba || !w || !h)
+        return false;
+    if (bpp == 16) {
+        for (uint32_t y = 0; y < h; ++y) {
+            const uint8_t *src = rgba + (size_t)y * w * 4;
+            uint8_t *row = dst + (size_t)y * pitch;
+            for (uint32_t x = 0; x < w; ++x) {
+                uint32_t argb = ((uint32_t)src[x * 4 + 3] << 24) | ((uint32_t)src[x * 4] << 16) |
+                                ((uint32_t)src[x * 4 + 1] << 8) | (uint32_t)src[x * 4 + 2];
+                uint16_t v = d3d7_rgb888_to_rgb565(argb);
+                memcpy(row + x * 2, &v, 2);
+            }
+        }
+        return true;
+    }
+    if (bpp == 32) {
+        for (uint32_t y = 0; y < h; ++y) {
+            const uint8_t *src = rgba + (size_t)y * w * 4;
+            uint8_t *row = dst + (size_t)y * pitch;
+            for (uint32_t x = 0; x < w; ++x) {
+                row[x * 4 + 0] = src[x * 4 + 2]; // B
+                row[x * 4 + 1] = src[x * 4 + 1]; // G
+                row[x * 4 + 2] = src[x * 4 + 0]; // R
+                row[x * 4 + 3] = 0;
+            }
+        }
+        return true;
+    }
+    return false;
+}
 
 namespace {
 
@@ -165,6 +208,15 @@ uint32_t fvf_stride(uint32_t fvf) {
 // the full 4x4 world/view/projection after a change. Later frames print one
 // compact line per transform change instead.
 //
+// RECOMP_TRACE_D3D7_SMALL=1 is a separate opt-in for the flat UI quads the
+// aggregate hides: every draw with vcount <= 8 is decoded vertex by vertex
+// (position, diffuse AARRGGBB, specular) alongside the key render state
+// (blend, alpha test, z state, texture-stage 0 ops/args). Only untextured
+// draws are included by default; RECOMP_TRACE_D3D7_SMALL_TEXTURED=1 adds small
+// draws that have a texture bound on stage 0. Within a frame each distinct
+// (vertex bytes, state) pair logs once with a count; identical consecutive
+// frames collapse to one emitting frame plus a "frames a-b: unchanged" line.
+//
 // A frame is BeginScene..EndScene: the engine's D3D7 draws require an open
 // scene, so every drawn frame has both. Per frame the trace prints one summary
 // line per distinct draw signature (repeated identical draws are counted), the
@@ -179,6 +231,8 @@ struct D3d7TraceConfig {
     uint32_t vertex_frames = 3;
     uint32_t matrix_frames = 3;
     uint32_t max_vertex_dump = 16;
+    bool small = false;
+    bool small_textured = false;
 };
 
 struct D3d7TraceLockAgg {
@@ -194,6 +248,14 @@ struct D3d7TraceDrawAgg {
     uint64_t count = 0;
 };
 
+// One distinct small draw within a frame: the raw vertex bytes plus the state,
+// so a change in either is a new line. `text` is the decoded, printable form.
+struct D3d7TraceSmallDraw {
+    std::string key;
+    std::string text;
+    uint64_t count = 0;
+};
+
 static D3d7TraceConfig g_trace;
 static uint32_t g_trace_frame = 0;
 static bool g_trace_frame_open = false;
@@ -204,6 +266,9 @@ static bool g_trace_frame_log = false;
 static uint32_t g_trace_draw_frames = 0;
 static std::vector<D3d7TraceLockAgg> g_trace_locks;
 static std::map<std::string, D3d7TraceDrawAgg> g_trace_draws;
+// Small-draw trace state, independent of the aggregate map above.
+static std::vector<D3d7TraceSmallDraw> g_trace_small_draws;
+static D3d7TraceSmallCollapser g_trace_small_collapse;
 // The biggest draw of the frame, captured so the vertices can be printed at
 // frame end even though the guest may reuse the buffer before then.
 static bool g_trace_big_valid = false;
@@ -258,6 +323,10 @@ static void trace_init() {
     const char *mf = recomp_env("TRACE_D3D7_MATRIX_FRAMES");
     if (mf && mf[0])
         g_trace.matrix_frames = (uint32_t)strtoul(mf, nullptr, 10);
+    const char *sm = recomp_env("TRACE_D3D7_SMALL");
+    g_trace.small = sm && sm[0] && strcmp(sm, "0") != 0;
+    const char *smt = recomp_env("TRACE_D3D7_SMALL_TEXTURED");
+    g_trace.small_textured = smt && smt[0] && strcmp(smt, "0") != 0;
 }
 
 static float trace_f32(const uint32_t *p) {
@@ -364,6 +433,64 @@ static std::string trace_draw_text(ComObj *dev, const char *kind, uint32_t type,
     return s;
 }
 
+// The render state the small-draw trace keys on: a draw whose vertices are the
+// same but whose blend/alpha/z/texture-stage state changed is a new line.
+static std::string trace_small_state(ComObj *dev) {
+    const uint32_t *rs = dev->d3d7->render_state;
+    const uint32_t *t = dev->d3d7->tss[0];
+    char buf[256];
+    snprintf(buf, sizeof buf,
+             "blend=%u,%u,%u atest=%u,%u,%u z=%u,%u,%u tss0=col(%u,%u,%u)alpha(%u,%u,%u)", rs[27],
+             rs[19], rs[20], rs[15], rs[24], rs[25], rs[7], rs[14], rs[23], t[1], t[2], t[3], t[4],
+             t[5], t[6]);
+    return buf;
+}
+
+// Collects one small draw for the frame. Grouping is on the exact vertex bytes
+// plus state, so two floats that decode the same but differ in the low bits
+// stay distinct. The guest vertex base is offset by StartVertex, which the
+// biggest-draw dump above does not do; VB draws pass the buffer base here.
+static void trace_small_draw(ComObj *dev, const char *kind, uint32_t type, uint32_t fvf,
+                             uint32_t verts, uint32_t vcount, uint32_t icount, uint32_t stride,
+                             uint32_t start, uint32_t prims) {
+    if (!g_trace.small || !stride || !vcount || vcount > 8)
+        return;
+    const bool textured = dev->d3d7->texture[0] != 0;
+    if (textured && !g_trace.small_textured)
+        return;
+    const uint64_t voff = (uint64_t)start * stride;
+    const uint64_t bytes = (uint64_t)vcount * stride;
+    if (voff > 0xffffffffu || bytes > 0xffffffffu ||
+        !gm_valid(verts + (uint32_t)voff, (uint32_t)bytes))
+        return;
+    const uint8_t *v = gm_ptr(verts + (uint32_t)voff);
+    std::string state = trace_small_state(dev);
+    std::string key = state;
+    key += '|';
+    static const char hex[] = "0123456789abcdef";
+    for (uint64_t i = 0; i < bytes; ++i) {
+        key += hex[v[i] >> 4];
+        key += hex[v[i] & 0xf];
+    }
+    std::string text;
+    trace_appendf(text, "%s type=%u fvf=%08x vcount=%u icount=%u prims=%u stride=%u start=%u %s",
+                  kind, type, fvf, vcount, icount, prims, stride, start, state.c_str());
+    for (uint32_t i = 0; i < vcount; ++i) {
+        std::string vs = d3d7_trace_vertex(fvf, v + (size_t)i * stride);
+        trace_appendf(text, " | v%u:%s", i, vs.c_str());
+    }
+    for (auto &d : g_trace_small_draws)
+        if (d.key == key) {
+            ++d.count;
+            return;
+        }
+    D3d7TraceSmallDraw d;
+    d.key = std::move(key);
+    d.text = std::move(text);
+    d.count = 1;
+    g_trace_small_draws.push_back(std::move(d));
+}
+
 static void trace_frame_end();
 static void trace_frame_begin() {
     trace_init();
@@ -378,6 +505,7 @@ static void trace_frame_begin() {
     g_trace_frame_log = g_trace_frame >= g_trace.lo && g_trace_frame <= g_trace.hi;
     g_trace_locks.clear();
     g_trace_draws.clear();
+    g_trace_small_draws.clear();
     g_trace_big_valid = false;
     g_trace_big_vcount = 0;
     g_trace_big_bytes.clear();
@@ -423,6 +551,19 @@ static void trace_frame_end() {
     }
     if (total_draws)
         ++g_trace_draw_frames;
+    if (g_trace.small) {
+        std::string digest;
+        for (const auto &d : g_trace_small_draws)
+            trace_appendf(digest, "%s#%llu;", d.key.c_str(), (unsigned long long)d.count);
+        const bool prev_had_content = !g_trace_small_collapse.digest.empty();
+        std::string collapsed;
+        if (d3d7_trace_small_step(&g_trace_small_collapse, g_trace_frame, digest, &collapsed)) {
+            if (!collapsed.empty() && prev_had_content)
+                trace_log("%s", collapsed.c_str());
+            for (const auto &d : g_trace_small_draws)
+                trace_log("small x%llu %s", (unsigned long long)d.count, d.text.c_str());
+        }
+    }
     g_trace_frame_log = false;
 }
 
@@ -435,6 +576,7 @@ static void trace_draw(ComObj *dev, const char *kind, uint32_t type, uint32_t fv
         trace_draw_text(dev, kind, type, fvf, vcount, icount, stride, start, vb_id, prims);
     g_trace_draws[text].text = text;
     ++g_trace_draws[text].count;
+    trace_small_draw(dev, kind, type, fvf, verts, vcount, icount, stride, start, prims);
     // Capture the first vertices of the frame's biggest draw, but only in the
     // leading frames, so the dump stays small. gm_valid is re-checked because
     // the draw's own validation may not have run in a no-renderer build.
@@ -511,14 +653,21 @@ static void trace_vb_unlock(ComObj *vb) {
 }
 
 static void trace_reset() {
+    if (g_trace.small && !g_trace_small_collapse.digest.empty()) {
+        std::string collapsed;
+        if (d3d7_trace_small_flush(&g_trace_small_collapse, &collapsed) && !collapsed.empty())
+            trace_log("%s", collapsed.c_str());
+    }
     g_trace_frame = 0;
     g_trace_frame_open = false;
     g_trace_frame_log = false;
     g_trace_draw_frames = 0;
     g_trace_locks.clear();
     g_trace_draws.clear();
+    g_trace_small_draws.clear();
     g_trace_big_valid = false;
     g_trace_big_bytes.clear();
+    g_trace_small_collapse = D3d7TraceSmallCollapser{};
     memset(g_trace_last_matrix, 0, sizeof g_trace_last_matrix);
     memset(g_trace_last_matrix_set, 0, sizeof g_trace_last_matrix_set);
 }
@@ -685,6 +834,7 @@ void init_device_state(D3d7DeviceState &s) {
     s.in_scene = false;
     s.d3d_obj = 0;
     s.render_target = 0;
+    s.target_dirty = true;
     memset(s.device_guid, 0, sizeof s.device_guid);
     s.tnl = false;
 }
@@ -891,12 +1041,21 @@ bool ensure_host(ComObj *dev) {
 // surface through GDI or a Lock is not uploaded back into the 32-bit target,
 // so a surface that mixed 2D and 3D loses the 2D at the reconcile point (see
 // docs/d3d7-inventory.md open questions).
+//
+// Lazy policy: the readback only runs while `target_dirty`, i.e. since the
+// last successful reconcile a Clear or draw has changed the GPU target. A
+// flush with no such change (the ordinary repeated flush of a surface the
+// device has not rendered into this frame) is skipped, so the guest bytes are
+// left as they are. This can only avoid clobbering CPU-written bytes; it never
+// hides GPU content, because every GPU-target write sets the flag.
 void d3d7_writeback(ComObj *dev) {
 #ifdef RECOMP_D3D8_WGPU
     if (!dev || !dev->d3d7_host)
         return;
     ComObj *s = com_get(dev->d3d7->render_target);
     if (!s || s->kind != K_SURFACE || !s->pixels)
+        return;
+    if (!dev->d3d7->target_dirty)
         return;
     const uint32_t w = dev->d3d7_width, h = dev->d3d7_height;
     if (!w || !h)
@@ -916,31 +1075,12 @@ void d3d7_writeback(ComObj *dev) {
                  (unsigned long long)bytes);
         return;
     }
-    if (s->bpp == 16) {
-        for (uint32_t y = 0; y < h; ++y) {
-            const uint8_t *src = rgba.data() + (size_t)y * w * 4;
-            uint32_t row = s->pixels + (uint32_t)((size_t)y * s->pitch);
-            for (uint32_t x = 0; x < w; ++x) {
-                uint32_t argb = ((uint32_t)src[x * 4 + 3] << 24) | ((uint32_t)src[x * 4] << 16) |
-                                ((uint32_t)src[x * 4 + 1] << 8) | (uint32_t)src[x * 4 + 2];
-                wr16(row + x * 2, d3d7_rgb888_to_rgb565(argb));
-            }
-        }
-    } else if (s->bpp == 32) {
-        for (uint32_t y = 0; y < h; ++y) {
-            const uint8_t *src = rgba.data() + (size_t)y * w * 4;
-            uint8_t *dst = gm_ptr(s->pixels) + (size_t)y * s->pitch;
-            for (uint32_t x = 0; x < w; ++x) {
-                dst[x * 4 + 0] = src[x * 4 + 2]; // B
-                dst[x * 4 + 1] = src[x * 4 + 1]; // G
-                dst[x * 4 + 2] = src[x * 4 + 0]; // R
-                dst[x * 4 + 3] = 0;
-            }
-        }
-    } else {
+    if (!d3d7_store_rgba_surface(gm_ptr(s->pixels), s->pitch, s->bpp, w, h, rgba.data())) {
         log_once("d3d7.writeback.bpp", "d3d7: writeback to a %u-bpp surface is not implemented",
                  s->bpp);
+        return; // leave dirty: a later flush may still service it
     }
+    dev->d3d7->target_dirty = false;
 #else
     (void)dev;
 #endif
@@ -959,12 +1099,19 @@ enum D3d7TexFormat {
     D7TEX_R5G6B5,
     D7TEX_A1R5G5B5,
     D7TEX_A4R4G4B4,
+    D7TEX_DXT,
     D7TEX_NONE,
 };
 
 D3d7TexFormat d3d7_classify_texture(const ComObj *s) {
     if (!s || !s->pixels)
         return D7TEX_NONE;
+    // A compressed surface carries its layout in fourcc and reports bpp 0.
+    // The engine's DXT surfaces are normally DirectDraw-only decode sources
+    // (Blt into a pool texture), so this is the defensive path for a DXT
+    // surface bound directly as a texture.
+    if (dxdxt::is_dxt(s->fourcc))
+        return D7TEX_DXT;
     if (s->bpp == 32)
         return D7TEX_ARGB8888;
     if (s->bpp != 16)
@@ -1002,6 +1149,22 @@ bool d3d7_convert_texture(const ComObj *tex, std::vector<uint8_t> &out) {
     if (fmt == D7TEX_NONE || !w || !h)
         return false;
     out.resize((size_t)w * h * 4);
+    if (fmt == D7TEX_DXT) {
+        const uint8_t *base = gm_ptr(tex->pixels);
+        for (uint32_t y = 0; y < h; ++y) {
+            uint8_t *dst = out.data() + (size_t)y * w * 4;
+            for (uint32_t x = 0; x < w; ++x) {
+                dxdxt::Rgba px;
+                if (!dxdxt::sample(base, tex->pitch, tex->fourcc, x, y, &px))
+                    return false;
+                dst[x * 4 + 0] = px.b;
+                dst[x * 4 + 1] = px.g;
+                dst[x * 4 + 2] = px.r;
+                dst[x * 4 + 3] = px.a;
+            }
+        }
+        return true;
+    }
     for (uint32_t y = 0; y < h; ++y) {
         const uint32_t row = tex->pixels + (uint32_t)((size_t)y * tex->pitch);
         uint8_t *dst = out.data() + (size_t)y * w * 4;
@@ -1058,28 +1221,54 @@ void d3d7_sync_texture(ComObj *dev, uint32_t stage) {
                 err, "SetTexture");
         return;
     }
-    // Reuse the previous conversion for this stage while the surface is the same
-    // object at the same content generation and not locked; draws repeat this
-    // call constantly and the expansion is the expensive part.
-    struct StageCache {
-        uint32_t id = 0;
-        uint64_t generation = 0;
+    // Reuse the conversion of this surface while its content generation is
+    // unchanged and it is not locked. The engine rebinds dozens of distinct
+    // textures on stage 0 every frame, so the cache is per surface (ids are
+    // never reused) and not per stage; a single entry per stage was missed on
+    // nearly every bind and made the expansion about a third of the frame.
+    // Bounded by a byte budget, dropping the least recently bound surfaces.
+    struct ConvEntry {
+        uint64_t generation = UINT64_MAX; // UINT64_MAX: never fresh
+        uint64_t used = 0;
         std::vector<uint8_t> bytes;
     };
-    static StageCache cache[8];
-    StageCache &sc = cache[stage];
-    std::vector<uint8_t> &converted = sc.bytes;
-    const bool fresh = sc.id == tex->id && sc.generation == tex->d3d8_content_generation &&
-                       tex->lock_count == 0 && !converted.empty();
-    if (!fresh && !d3d7_convert_texture(tex, converted)) {
-        LOGW("d3d7: SetTexture stage %u surface %ux%u bpp=%u masks=%08x/%08x/%08x has no decoded "
-             "format (DXT and other compressed layouts are deferred); stopping",
-             stage, tex->width, tex->height, tex->bpp, tex->rmask, tex->gmask, tex->bmask);
-        fflush(stderr);
-        abort();
+    static std::unordered_map<uint32_t, ConvEntry> conv_cache;
+    static size_t conv_bytes = 0;
+    static uint64_t conv_tick = 0;
+    constexpr size_t CONV_BUDGET = 256u << 20;
+    if (conv_bytes > CONV_BUDGET) {
+        std::vector<std::pair<uint64_t, uint32_t>> order;
+        order.reserve(conv_cache.size());
+        for (const auto &kv : conv_cache)
+            if (kv.first != tex->id)
+                order.emplace_back(kv.second.used, kv.first);
+        std::sort(order.begin(), order.end());
+        for (const auto &o : order) {
+            if (conv_bytes <= CONV_BUDGET / 2)
+                break;
+            auto it = conv_cache.find(o.second);
+            conv_bytes -= it->second.bytes.size();
+            conv_cache.erase(it);
+        }
     }
-    sc.id = tex->lock_count == 0 ? tex->id : 0;
-    sc.generation = tex->d3d8_content_generation;
+    ConvEntry &sc = conv_cache[tex->id];
+    sc.used = ++conv_tick;
+    std::vector<uint8_t> &converted = sc.bytes;
+    const bool fresh =
+        sc.generation == tex->d3d8_content_generation && tex->lock_count == 0 && !converted.empty();
+    if (!fresh) {
+        conv_bytes -= converted.size();
+        const bool ok = d3d7_convert_texture(tex, converted);
+        conv_bytes += converted.size();
+        if (!ok) {
+            LOGW("d3d7: SetTexture stage %u surface %ux%u bpp=%u masks=%08x/%08x/%08x has no "
+                 "decoded format (DXT and other compressed layouts are deferred); stopping",
+                 stage, tex->width, tex->height, tex->bpp, tex->rmask, tex->gmask, tex->bmask);
+            fflush(stderr);
+            abort();
+        }
+    }
+    sc.generation = tex->lock_count == 0 ? tex->d3d8_content_generation : UINT64_MAX;
     const uint32_t dirty = tex->lock_count > 0 ? 1u : 0u;
     host_ok(d3d8_device_set_texture((D3d8Device *)dev->d3d7_host, stage, tex->id, 0,
                                     tex->d3d8_content_generation, dirty, D3D8FMT_A8R8G8B8,
@@ -1295,13 +1484,18 @@ void Device7_EnumTextureFormats(X86 *c) {
     }
     // The engine's callback at 0x85dc20 keeps the last 16-bit R5G6B5, the last
     // 16-bit A4R4G4B4 and the last 32-bit ARGB it sees, then creates every
-    // surface from those globals. Report only the formats the host will really
-    // decode when the renderer is wired in: R5G6B5, A4R4G4B4 and A8R8G8B8.
-    // DXT1/DXT3 are deliberately absent: wgpu requests no TEXTURE_COMPRESSION_BC
-    // feature, so a DXT texture could not be uploaded. The engine builds DXT
-    // surfaces itself through DirectDraw CreateSurface, which this shim
-    // accepts as guest bytes; only the D3D7 texture *format* list omits them,
-    // so nothing here promises a compressed texture it cannot honor.
+    // surface from those globals. Report only those three.
+    //
+    // DXT1/DXT3/DXT5 are deliberately absent. From the callback's own logic
+    // (0x85dc20): every branch is guarded by `dwRGBBitCount` (param[3] == 0x10
+    // or 0x20) and only records into g_texfmt16_565, g_texfmt16_Alpha or
+    // g_texfmt32_ARGB. A DDPF_FOURCC entry reports dwRGBBitCount == 0, so the
+    // callback returns DDENUMRET_OK and records nothing. Adding a DXT entry
+    // would therefore change no engine state; it would only be noise. The
+    // engine's DXT surfaces are created directly through DirectDraw
+    // CreateSurface (fn_0087F6D0) and decoded by this shim's Blt; they are not
+    // selected from this list. A format the renderer can decode is not a
+    // reason to advertise a format the guest would ignore.
     struct Fmt {
         uint32_t flags, bits, r, g, b, a;
     };
@@ -1708,6 +1902,7 @@ void Device7_Clear(X86 *c) {
         int32_t status =
             d3d8_device_clear((D3d8Device *)dev->d3d7_host, 0, flags, color, z, stencil, &err);
         if (host_ok(status, err, "Clear")) {
+            dev->d3d7->target_dirty = true;
             host_d3d7_clear();
             com_ret(c, D3D_OK_);
         } else {
@@ -1834,6 +2029,7 @@ void d3d7_submit_primitive(ComObj *dev, uint32_t type, uint32_t fvf, uint32_t ve
                                        vertex_bytes, stride, start_vertex, prims, &err);
         if (status != 0)
             draw_host_stop(method, err);
+        dev->d3d7->target_dirty = true;
         host_d3d7_draw();
         return;
     }
@@ -1865,6 +2061,7 @@ void d3d7_submit_indexed(ComObj *dev, uint32_t type, uint32_t fvf, uint32_t vert
             num_vertices, 0, prims, &err);
         if (status != 0)
             draw_host_stop(method, err);
+        dev->d3d7->target_dirty = true;
         host_d3d7_draw();
         return;
     }
@@ -2381,6 +2578,51 @@ bool d3d7_trace_parse_frames(const char *s, uint32_t *lo, uint32_t *hi) {
     *lo = (uint32_t)a;
     *hi = (uint32_t)b;
     return true;
+}
+
+// See dx.h. A run starts on the first digest and is reported as changed; equal
+// frames extend it silently, and a change emits the previous range (when it
+// spanned more than one frame) before the new run starts.
+bool d3d7_trace_small_step(D3d7TraceSmallCollapser *c, uint32_t frame, const std::string &digest,
+                           std::string *collapsed) {
+    if (!c)
+        return false;
+    if (collapsed)
+        collapsed->clear();
+    if (!c->active) {
+        c->active = true;
+        c->digest = digest;
+        c->first = c->last = frame;
+        return true;
+    }
+    if (digest == c->digest) {
+        c->last = frame;
+        return false;
+    }
+    if (collapsed && c->last > c->first)
+        *collapsed =
+            "frames " + std::to_string(c->first) + "-" + std::to_string(c->last) + ": unchanged";
+    c->digest = digest;
+    c->first = c->last = frame;
+    return true;
+}
+
+// See dx.h. Closes a run left open when the trace stops or the device resets;
+// returns true when a collapse line was produced.
+bool d3d7_trace_small_flush(D3d7TraceSmallCollapser *c, std::string *collapsed) {
+    if (!c || !c->active)
+        return false;
+    bool emitted = false;
+    if (collapsed) {
+        collapsed->clear();
+        if (c->last > c->first) {
+            *collapsed = "frames " + std::to_string(c->first) + "-" + std::to_string(c->last) +
+                         ": unchanged";
+            emitted = true;
+        }
+    }
+    c->active = false;
+    return emitted;
 }
 
 // Releasing a device also releases the render target and every bound texture

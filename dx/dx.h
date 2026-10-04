@@ -207,6 +207,14 @@ int d3d7_translate_texture_stage_state(uint32_t d3d7_type, uint32_t out[2]);
 // presenter uses the scale, so the round trip is documented against it.
 uint16_t d3d7_rgb888_to_rgb565(uint32_t rgba);
 uint32_t d3d7_rgb565_to_rgb888(uint16_t rgb565);
+// Reconcile a tightly packed `w`x`h` RGBA8 block (the Rust target's readback)
+// into a guest surface's storage: 16bpp writes R5G6B5, 32bpp writes X8R8G8B8
+// with the alpha byte zeroed. `dst` is the surface's HOST pointer (gm_ptr of
+// its guest address) and `pitch` its byte pitch. Writes directly, so the store
+// does not run the guest write hook (this is the shim's own copy, not a guest
+// store). Returns false for an unsupported bpp and writes nothing.
+bool d3d7_store_rgba_surface(uint8_t *dst, uint32_t pitch, uint32_t bpp, uint32_t w, uint32_t h,
+                             const uint8_t *rgba);
 // D3D7 trace helpers (dx/d3d7.cpp), exposed so dx_tests can check the pure
 // parts without a GPU. `d3d7_trace_vertex` decodes one vertex per the FVF the
 // same way the trace's vertex dump does. `d3d7_trace_parse_frames` parses the
@@ -215,6 +223,22 @@ uint32_t d3d7_rgb565_to_rgb888(uint16_t rgb565);
 // malformed string.
 std::string d3d7_trace_vertex(uint32_t fvf, const uint8_t *v);
 bool d3d7_trace_parse_frames(const char *s, uint32_t *lo, uint32_t *hi);
+// Collapse helper for the small-draw trace (RECOMP_TRACE_D3D7_SMALL). The
+// caller feeds one digest per frame describing the decoded small draws and
+// their state. `step` returns true when the digest changed (the caller then
+// prints that frame's draws); when it changed and the previous run spanned
+// more than one frame, `collapsed` is set to a "frames a-b: unchanged" line
+// to print first. `flush` closes a run left open at trace reset. `first` and
+// `last` are the inclusive 1-based frame range of the run being collapsed.
+struct D3d7TraceSmallCollapser {
+    std::string digest;
+    bool active = false;
+    uint32_t first = 0;
+    uint32_t last = 0;
+};
+bool d3d7_trace_small_step(D3d7TraceSmallCollapser *c, uint32_t frame, const std::string &digest,
+                           std::string *collapsed);
+bool d3d7_trace_small_flush(D3d7TraceSmallCollapser *c, std::string *collapsed);
 // Re-states the render target's memory to the host. Flip swaps the pixels
 // behind a surface, so the host has to be told when its target moves.
 void d3d_retarget_surface(ComObj *surface);

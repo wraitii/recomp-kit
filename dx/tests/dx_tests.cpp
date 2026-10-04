@@ -6676,6 +6676,36 @@ static void test_d3d7_translation() {
     CHECK_EQ(d3d7_rgb565_to_rgb888(0x001fu), 0xff0000ffu);
     // Bit replication would give 0xff210000 for 0x2000; the scale gives 0x20.
     CHECK_EQ(d3d7_rgb565_to_rgb888(0x2000u), 0xff200000u);
+
+    // ---- the writeback store: RGBA8 readback -> guest surface bytes. The
+    // store is the shim's own reconcile copy, so it must produce exactly the
+    // bytes the old per-pixel wr16/wr32 path did, row by row and pitch aware.
+    {
+        // Four pixels: red, green, blue, white, as the Rust target returns
+        // them (RGBA byte order).
+        const uint8_t rgba[16] = {255, 0, 0,   255, 0,   255, 0,   255,
+                                  0,   0, 255, 255, 255, 255, 255, 255};
+        uint8_t b16[2 * 4 * 2]; // 2 rows of 4 pixels at pitch 8
+        memset(b16, 0xAA, sizeof b16);
+        CHECK(d3d7_store_rgba_surface(b16, 8, 16, 4, 1, rgba));
+        // Row 0: red 0xF800, green 0x07E0, blue 0x001F, white 0xFFFF.
+        const uint16_t row0[4] = {0xF800, 0x07E0, 0x001F, 0xFFFF};
+        CHECK_EQ(memcmp(b16, row0, 8), 0);
+        // The second row is untouched: the store is pitch aware and wrote one.
+        const uint16_t cap[4] = {0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA};
+        CHECK_EQ(memcmp(b16 + 8, cap, 8), 0);
+
+        uint8_t b32[4 * 4];
+        memset(b32, 0xAA, sizeof b32);
+        CHECK(d3d7_store_rgba_surface(b32, 16, 32, 4, 1, rgba));
+        const uint8_t xrow[16] = {0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0};
+        CHECK_EQ(memcmp(b32, xrow, 16), 0);
+
+        // A bpp with no store is refused and touches nothing.
+        uint8_t keep[4] = {0x11, 0x22, 0x33, 0x44};
+        CHECK(!d3d7_store_rgba_surface(keep, 4, 8, 1, 1, rgba));
+        CHECK_EQ(memcmp(keep, "\x11\x22\x33\x44", 4), 0);
+    }
 }
 
 // The DXT block decoder, with known blocks and exact expected pixels. This is
@@ -6887,6 +6917,26 @@ static void test_d3d7_trace_helpers() {
     CHECK(!d3d7_trace_parse_frames("abc", &lo, &hi));
     CHECK(!d3d7_trace_parse_frames("0-3", &lo, &hi));
     CHECK(!d3d7_trace_parse_frames("9-4", &lo, &hi));
+
+    // Small-draw collapse: a run prints once, equal frames stay silent, and a
+    // change emits the previous frame range before the new content.
+    D3d7TraceSmallCollapser c;
+    std::string out;
+    CHECK(d3d7_trace_small_step(&c, 10, "A", &out) && out.empty());
+    CHECK(!d3d7_trace_small_step(&c, 11, "A", &out));
+    CHECK(!d3d7_trace_small_step(&c, 12, "A", &out));
+    CHECK(c.first == 10 && c.last == 12);
+    CHECK(d3d7_trace_small_step(&c, 13, "B", &out));
+    CHECK(out == "frames 10-12: unchanged");
+    CHECK(c.first == 13 && c.last == 13);
+    CHECK(!d3d7_trace_small_step(&c, 14, "B", &out));
+    CHECK(d3d7_trace_small_flush(&c, &out));
+    CHECK(out == "frames 13-14: unchanged");
+    CHECK(!d3d7_trace_small_flush(&c, &out)); // already closed
+    // A one-frame run has nothing to collapse.
+    D3d7TraceSmallCollapser d;
+    CHECK(d3d7_trace_small_step(&d, 1, "X", &out) && out.empty());
+    CHECK(!d3d7_trace_small_flush(&d, &out));
 }
 
 // QueryInterface: the DirectDraw object hands out IDirectDraw2 and 4, refuses
