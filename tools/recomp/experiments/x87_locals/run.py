@@ -106,7 +106,8 @@ def run_experiment(out, cmake, jobs):
         for mode in MODES:
             code.append(f"void {name}_{mode}(X86 *c) {{\n{emit(lines, mode)}\n}}")
     (out / "generated.c").write_text("\n".join(code) + "\n")
-    declarations = []
+    declarations = ['static const char *mode_names[] = {"baseline", "full", "live", "relaxed"};',
+                    "static const unsigned normalize_empty_mask = 12, required_match_mask = 6;"]
     for name in CASES:
         for mode in MODES:
             declarations.append(f"void {name}_{mode}(X86 *);")

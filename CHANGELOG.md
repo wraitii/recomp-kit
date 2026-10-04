@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add `tools/build.py --x87-llvm-experiment`: direct semantic LLVM emission,
+  a bounded stack-to-SSA pass plugin, and existing-runtime comparison through
+  the shared fragment harness. Requires LLVM 22; retains inspectable IR after
+  each stage. This experiment does not change game translation.
+
 - Add `tools/build.py --x87-locals-experiment`, an isolated local-value lifting
   probe comparing generated x87 fragments with the existing emitter. It records
   final-state comparisons, timings and optimized assembly without changing game

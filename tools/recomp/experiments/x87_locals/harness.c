@@ -89,7 +89,7 @@ static int compare(void) {
                 memcpy(g_mem + 0x10000, input, 256);
                 functions[f][mode](&actual);
                 int mem_diff = memcmp(output, g_mem + 0x10000, 256) != 0;
-                if (mode != 1) {
+                if (normalize_empty_mask & (1u << mode)) {
                     discard_empty_contents(&actual);
                     discard_empty_contents(&reference);
                 }
@@ -101,18 +101,19 @@ static int compare(void) {
                     if ((n / 128) % 3 == 1)
                         finite_differences += !!different;
                 }
-                if (mode < 3 && different) {
+                if ((required_match_mask & (1u << mode)) && different) {
                     fprintf(stderr, "FAIL %s mode=%u seed=%u memory=%d\n", case_names[f], mode, n,
                             mem_diff);
                     return 1;
                 }
             }
         }
-        printf("CHECK %s 24576 inputs: full=%u live=%u relaxed=%u (memory=%u; "
+        printf("CHECK %s 24576 inputs: %s=%u %s=%u %s=%u (last variant memory=%u; "
                "PC00/01/10/11=%u/%u/%u/%u) differences\n",
-               case_names[f], differences[1], differences[2], differences[3], memory_differences,
-               relaxed_by_pc[0], relaxed_by_pc[1], relaxed_by_pc[2], relaxed_by_pc[3]);
-        printf("FINITE %s relaxed differences=%u/8192 ordinary finite inputs\n", case_names[f],
+               case_names[f], mode_names[1], differences[1], mode_names[2], differences[2],
+               mode_names[3], differences[3], memory_differences, relaxed_by_pc[0],
+               relaxed_by_pc[1], relaxed_by_pc[2], relaxed_by_pc[3]);
+        printf("FINITE %s last variant differences=%u/8192 ordinary finite inputs\n", case_names[f],
                finite_differences);
     }
     return 0;
@@ -124,7 +125,6 @@ static int order_double(const void *a, const void *b) {
 }
 
 static void benchmark(void) {
-    const char *modes[] = {"baseline", "full", "live", "relaxed"};
     const unsigned iterations = 1000000, trials = 9;
     for (unsigned f = 0; f < sizeof functions / sizeof *functions; ++f) {
         for (unsigned pc = 0; pc <= 2; pc += 2) {
@@ -157,8 +157,8 @@ static void benchmark(void) {
             for (unsigned mode = 0; mode < 4; ++mode) {
                 qsort(samples[mode], trials, sizeof(double), order_double);
                 printf("BENCH %s PC=%u %s median=%.3f min=%.3f max=%.3f ns/fragment\n",
-                       case_names[f], pc, modes[mode], samples[mode][trials / 2], samples[mode][0],
-                       samples[mode][trials - 1]);
+                       case_names[f], pc, mode_names[mode], samples[mode][trials / 2],
+                       samples[mode][0], samples[mode][trials - 1]);
             }
         }
     }
