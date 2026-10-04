@@ -624,6 +624,37 @@ impl DeviceState {
             "D3DTSS_ADDRESSV",
             raw(Ts::AddressV, D3DTEXTUREADDRESS::Wrap.raw()),
         )?;
+        // A channel that reads TEXTURE while no texture is bound has nothing to
+        // read. The fixed-function pipeline then passes CURRENT through, as for
+        // a disabled stage, so an untextured quad keeps its diffuse alpha. The
+        // fallback white texel instead gave SELECTARG1(TEXTURE) alpha 1.0 and
+        // turned Black & White's half-transparent dialogue box opaque black
+        // once the guest switched ALPHAOP to its stage-0 default. Channels that
+        // read only DIFFUSE/CURRENT/TFACTOR are valid without a texture and are
+        // left alone.
+        let reads_texture = |op: u32, arg1: u32, arg2: u32| -> bool {
+            let t1 = arg1 & d3dta::SELECTMASK == d3dta::TEXTURE;
+            let t2 = arg2 & d3dta::SELECTMASK == d3dta::TEXTURE;
+            match D3DTEXTUREOP::from_raw(op) {
+                Ok(D3DTEXTUREOP::Disable) => false,
+                Ok(D3DTEXTUREOP::SelectArg1) => t1,
+                Ok(D3DTEXTUREOP::SelectArg2) => t2,
+                Ok(D3DTEXTUREOP::BlendTextureAlpha) => true,
+                _ => t1 || t2,
+            }
+        };
+        let disable = D3DTEXTUREOP::Disable.raw();
+        let color_op = if !texture_bound && reads_texture(color_op, color_arg1, color_arg2) {
+            disable
+        } else {
+            color_op
+        };
+        let alpha_op = if !texture_bound && reads_texture(alpha_op, alpha_arg1, alpha_arg2) {
+            disable
+        } else {
+            alpha_op
+        };
+        let active = active && (color_op != disable || alpha_op != disable);
         Ok(TextureStage {
             active,
             color_op,
@@ -1470,10 +1501,16 @@ mod tests {
         assert_eq!(stage.alpha_op, D3DTEXTUREOP::SelectArg1.raw());
         assert_eq!(stage.color_arg1, d3dta::TEXTURE);
         assert_eq!(stage.color_arg2, d3dta::CURRENT);
-        // An explicit MODULATE activates without a bound texture as well.
+        // MODULATE(TEXTURE, CURRENT) and the default SELECTARG1(TEXTURE) alpha
+        // both read a texture that is not bound: the stage passes CURRENT
+        // through instead of sampling the white fallback.
         state.set_texture_stage_state(0, 1, 4).unwrap();
         let stage = state.resolve_texture_stage(0, false).unwrap();
-        assert!(stage.active);
+        assert!(!stage.active);
+        assert_eq!(stage.color_op, D3DTEXTUREOP::Disable.raw());
+        assert_eq!(stage.alpha_op, D3DTEXTUREOP::Disable.raw());
+        // With the texture bound the same state combines.
+        assert!(state.resolve_texture_stage(0, true).unwrap().active);
         // Both ops explicitly DISABLE with no bound texture is inert.
         state
             .set_texture_stage_state(0, 1, D3DTEXTUREOP::Disable.raw())
@@ -1482,6 +1519,31 @@ mod tests {
             .set_texture_stage_state(0, 4, D3DTEXTUREOP::Disable.raw())
             .unwrap();
         assert!(!state.resolve_texture_stage(0, false).unwrap().active);
+    }
+
+    #[test]
+    fn unbound_texture_channel_keeps_the_diffuse_alpha() {
+        // Black & White's dialogue box: an untextured quad whose stage 0 has
+        // ALPHAOP = SELECTARG1(TEXTURE). With no texture bound the alpha must
+        // stay the diffuse alpha, not become the white fallback's 1.0.
+        let mut state = DeviceState::new(64, 64);
+        configure_probe_states(&mut state);
+        state.set_texture_stage_state(0, 1, 4).unwrap(); // COLOROP = MODULATE
+        state.set_texture_stage_state(0, 4, 2).unwrap(); // ALPHAOP = SELECTARG1
+        let stage = state.resolve_texture_stage(0, false).unwrap();
+        assert_eq!(stage.alpha_op, D3DTEXTUREOP::Disable.raw());
+        assert!(!stage.active);
+        // A channel that never reads TEXTURE stays honoured without one.
+        state.set_texture_stage_state(0, 4, 3).unwrap(); // ALPHAOP = SELECTARG2
+        state.set_texture_stage_state(0, 6, d3dta::DIFFUSE).unwrap(); // ALPHAARG2
+        let stage = state.resolve_texture_stage(0, false).unwrap();
+        assert_eq!(stage.alpha_op, D3DTEXTUREOP::SelectArg2.raw());
+        assert_eq!(stage.color_op, D3DTEXTUREOP::Disable.raw());
+        assert!(stage.active);
+        // With a texture bound, nothing is rewritten.
+        state.set_texture_stage_state(0, 4, 2).unwrap();
+        let stage = state.resolve_texture_stage(0, true).unwrap();
+        assert_eq!(stage.alpha_op, D3DTEXTUREOP::SelectArg1.raw());
     }
 
     #[test]
@@ -1595,7 +1657,9 @@ mod tests {
         state.set_texture_stage_state(1, 4, 3).unwrap(); // ALPHAOP SELECTARG2
         state.set_texture_stage_state(1, 6, 0).unwrap(); // ALPHAARG2 DIFFUSE
         state.set_texture_stage_state(1, 11, 1).unwrap(); // TEXCOORDINDEX 1
-        let stage0 = state.resolve_texture_stage(0, false).unwrap();
+        // Stage 0 samples TEXTURE, so it needs one bound; stage 1 reads only
+        // CURRENT and DIFFUSE.
+        let stage0 = state.resolve_texture_stage(0, true).unwrap();
         let stage1 = state.resolve_texture_stage(1, false).unwrap();
         assert!(stage0.active && stage1.active);
         assert_eq!(stage1.color_op, D3DTEXTUREOP::Add.raw());
