@@ -35,16 +35,21 @@ the game repository. Generated listings, LLVM, C and binaries stay in build/.
 `run.py` retains the original straight-line arithmetic fixtures. `function.py`
 decodes the verified function bytes through the production decoder and emits
 basic blocks, conditional/unconditional branches and explicit guest operations.
-It supports float/double memory FLD/FCOMP, FCHS, FNSTSW AX, TEST AH/immediate,
+It supports float/double memory FLD/FCOMP and FADD/FSUB/FMUL, FADDP to ST1,
+FCHS, FNSTSW AX, TEST AH/immediate,
 MOV reg32/immediate, XOR EAX/EAX, JZ/JNZ (including JE/JNE), JMP and plain RET.
 Unsupported instructions, operands, external branch targets and extent
 fallthrough fail. This intentionally small set covers the first real function.
 The C reference uses the production instruction emitter with all flags live.
+Its memory calls are routed through the same opaque adapters as LLVM, without
+changing expression ordering. A direct-memory C copy is also generated as
+`real_uninstrumented` for optional final-state comparison by a game fixture.
 
 **Preconditions:** correct entry/extent and decoded instructions; mapped ordinary
-guest memory separate from X86/runtime storage. No interior faults or host FP
-traps. **Invariant:** each emitted instruction performs the same ordered state
-transition as the current C runtime and reaches the same successor. Register and
+guest memory separate from X86/runtime storage. Accesses may abandon the call at
+the declared boundary before touching guest memory; host FP traps and arbitrary
+interior faults remain excluded. **Invariant:** each emitted instruction performs
+the same ordered state transition as the current C runtime and reaches the same successor. Register and
 address operations retain i32 widths; RET reads EIP and adjusts guest ESP before
 calling the existing return dispatcher. TEST/XOR update the defined flags, leaving
 AF as the runtime does. FCOMP uses `fcom`, not an inferred source-level comparison.
@@ -87,8 +92,8 @@ over the topological order extends the straight-line invariant to every path.
 
 Numeric, memory, register and branch operations remain in place with unchanged
 operands after substitution. The pass adds `rk_snapshot` state descriptions at
-explicit observers and exits, consumes `recomp.x87.region`, and produces
-`recomp.x87.ssa`. The intermediate `ssa.ll` exposes the PHIs and snapshots.
+explicit observers and exits (including each guest-memory access), consumes
+`recomp.x87.region`, and produces `recomp.x87.ssa`. The intermediate `ssa.ll` exposes the PHIs and snapshots.
 
 ### 4. State materialization (`recomp-x87-materialize`)
 
@@ -110,15 +115,34 @@ unchanged operations. The observation policy is explicit:
   for future read-only observers, although FNSTSW itself only needs status/TOP.
 - `rk_observe`: full materialization before a read-only observer; SSA remains
   valid afterwards. Unknown calls and mutating observers are rejected.
+- `rk_load`, `rk_load64`, `rk_store`: materialize before the helper. It calls
+  an opaque `rk_access_*` adapter, compiled in a separate translation unit with
+  `-fno-lto`, passing the CPU pointer as well as the guest address. The adapter
+  may observe complete CPU state or abandon the function before its access.
+  A successful adapter does not change X86 or guest bytes other than its store.
+  For binary32 stores, `fto_float` evaluates before adapter entry, and the pop
+  follows successful return. This runtime's conversion reads CW but does not
+  update guest status. The observer sees the converted payload and pre-write
+  memory; a failed store has not popped or written.
 - `rk_ret`: materialize before popping the guest return address and invoking the
   return dispatcher. No deferred use follows it; it must immediately precede
   LLVM return. A bare LLVM return also materializes (fragment fixtures).
 
-Guest-memory reads/writes are **not** fault checkpoints. Callbacks, signal
-handlers, traps, dirty/watch hooks and arbitrary interior fault observations are
-excluded. Guest input/output aliasing with each other is allowed. The harness
-only accepts one ordinary caller continuation; callback/tail/unknown dispatch
-aborts. This is a stub-dependent return environment, not live game execution.
+A plain inline load is insufficient: LLVM may delete or move preceding state
+stores if no defined observer can see them. The separate access ABI makes state
+observable even after O2. Its definitions never enter the optimized IR module;
+structural tests check this. No numeric operation, rounding call or memory access
+is removed by the custom passes. On successful access, the SSA invariant resumes
+because the adapter leaves X86 unchanged. On abandonment, the materialized CPU
+and prior memory writes already match the baseline; no continuation is assumed.
+
+This is an **explicit synchronous access-boundary contract**, tested with
+injected pre-access longjmp exits. It is not OS-fault/SEH or original-x86 evidence.
+Partial writes, asynchronous signals, host FP traps, mutating callbacks, watch
+hooks and faults elsewhere inside helpers remain excluded. Guest input/output
+aliasing with each other is allowed. The harness only accepts one ordinary caller
+continuation; callback/tail/unknown dispatch aborts. Returns and injected failures
+are harness-supplied environments, not live game execution.
 
 These are preservation arguments for the bounded transformation, **not a
 machine-checked proof of its implementation, LLVM or original x87**. Arithmetic
@@ -130,12 +154,22 @@ would require a stronger fault/observer contract and more evidence.
 The existing local-value C harness compares complete CPU state and scratch memory
 for baseline C, raw LLVM and lifted LLVM. Its fourth variant is local-value C for
 the original four fragments, a repeated baseline for the new CFG regression and
-complete-function replay. No empty register contents are normalized away.
+complete-function replay (a profile may instead choose the direct-memory C copy).
+No empty register contents are normalized away. The fourth variant is checked
+only at explicit FNSTSW hooks and normal exits, never for the new memory contract:
+local-value C defers state and is not valid at those interior boundaries.
 
 Five synthetic fixtures run 24,576 inputs each: stored/live dot products,
 aliasing stores/reloads, eight-slot wraparound, and a diamond with separate PHIs
 for live and popped slots, an observer and an aliasing output store. The optional
 profile reuses this harness with game-owned setup, boundary checks and timings.
+`access.c` compares the ordered access trace of raw/lifted LLVM against C: complete
+CPU, scratch bytes, guest address, width, direction and converted store payload.
+Sixteen selected states per fixture cover every PC/RC combination and all TOPs.
+For each, the harness abandons execution once at every reached access, checks the
+trace prefix and compares complete CPU/scratch after longjmp. This is a focused
+early-exit regression using a live setjmp frame, not a fault emulator or live
+shadow runner. Zero-access fixtures and over-capacity traces fail explicitly.
 Thirteen compiled rejection cases cover incoming dependencies, invalid registers,
 unknown calls, direct memory, numeric relaxations, cycles, unreachable blocks,
 and unequal depth/touched masks at joins. Separate-stage postconditions, LLVM
@@ -150,6 +184,10 @@ Artifacts under `build/x87-llvm-experiment/`:
 - Optional `function/{decoded.txt,baseline.c,fixtures.h}` and `function-results.txt`.
 
 Timings use nine rotating trials of a million calls, process CPU time, PC=00/10,
-nearest rounding. They include call/reset/loop and observer-hook overhead. A
+nearest rounding. They include call/reset/loop, observer-hook and opaque memory
+adapter overhead. Baseline C, raw LLVM and lifted LLVM use identical adapters;
+the direct-memory C copy (when selected) measures a different observation contract.
+Full repeated materialization can lose to raw LLVM; the game-owned results record
+that cost. Redundant snapshot elimination is a separate next optimization. A
 small function's improvement does not establish a game-level speedup, original
 x86 equivalence, or a reason to expand the production backend yet.

@@ -68,3 +68,29 @@ def test_function_frontend_leaves_incoming_dependency_for_analysis():
     # The frontend faithfully emits it; recomp-x87-analyze rejects it.
     text = emit_function('test', function_insns(['FCHS', 'RET']), True)
     assert 'call double @rk_read' in text
+
+@pytest.mark.parametrize('operation', ['FADD', 'FSUB', 'FMUL'])
+def test_function_arithmetic_retains_round_at_each_machine_operation(operation):
+    text = emit_function('test', function_insns([
+        'FLD float ptr [ESP + 4]', f'{operation} float ptr [ESP + 8]',
+        'FLD float ptr [ESP + 12]', 'FADDP ST1', 'RET',
+    ]), True)
+    assert text.count('@rk_round(') == 2
+    assert text.count('@rk_pop(') == 1
+    assert {'FADD': 'fadd', 'FSUB': 'fsub', 'FMUL': 'fmul'}[operation] + ' double' in text
+    assert ' fast ' not in text
+
+
+@pytest.mark.parametrize('instruction', ['FADDP ST0', 'FADDP ST2', 'FADDP ST1,ST0',
+                                          'FMUL ST1', 'FADD dword ptr FS:[0x0]'])
+def test_function_arithmetic_scope_is_explicit(instruction):
+    with pytest.raises(ValueError):
+        emit_function('test', function_insns([instruction, 'RET']), True)
+
+
+def test_access_instrumentation_preserves_store_conversion_and_pop_order():
+    from experiments.x87_llvm.instrument import instrument_memory
+    text = instrument_memory('wrf32(a, fto_float(c, ST(c, 0)));\nfdrop(c);')
+    assert text == 'rk_access_store32(c, a, fto_float(c, ST(c, 0)));\nfdrop(c);'
+    with pytest.raises(ValueError):
+        instrument_memory('wrf80(a, ST(c, 0));')

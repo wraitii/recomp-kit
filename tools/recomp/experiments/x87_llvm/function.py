@@ -52,8 +52,8 @@ def emit_function(name, insns, lift):
     def call(helper, args=''):
         out.append(f'  call void @{helper}(ptr %cpu{args})')
 
-    def read():
-        return value('call double @rk_read(ptr %cpu, i32 0)')
+    def read(index=0):
+        return value(f'call double @rk_read(ptr %cpu, i32 {index})')
 
     def memory(op):
         if op.kind != 'mem' or op.size not in {32, 64} or op.seg:
@@ -79,6 +79,17 @@ def emit_function(name, insns, lift):
         out.append(f'  ; {ins.raw}')
         if m == 'FLD' and len(ops) == 1:
             call('rk_push', f', double {memory(ops[0])}')
+        elif m in {'FADD', 'FSUB', 'FMUL'} and len(ops) == 1:
+            operand = memory(ops[0])
+            op = {'FADD': 'fadd', 'FSUB': 'fsub', 'FMUL': 'fmul'}[m]
+            result = value(f'{op} double {read()}, {operand}')
+            rounded = value(f'call double @rk_round(ptr %cpu, double {result})')
+            call('rk_set', f', i32 0, double {rounded}')
+        elif m == 'FADDP' and (not ops or ins.ops == ['ST1']):
+            result = value(f'fadd double {read(1)}, {read(0)}')
+            rounded = value(f'call double @rk_round(ptr %cpu, double {result})')
+            call('rk_set', f', i32 1, double {rounded}')
+            call('rk_pop')
         elif m == 'FCOMP' and len(ops) == 1:
             operand = memory(ops[0])
             call('rk_compare', f', double {read()}, double {operand}')
@@ -138,7 +149,7 @@ def prepare(profile_path, out):
     fn.index = {i.addr: k for k, i in enumerate(insns)}
     fn.seh_escapes, fn.pushed_continuations, fn.seh_sites = set(), set(), {}
     tr = T.Translator(image, {start}, SimpleNamespace(eager_flags=True))
-    code = ['#include "x86.h"', 'extern void rk_observe(X86 *);', 'void real_baseline(X86 *c) {']
+    code = ['#include "access.h"', 'extern void rk_observe(X86 *);', 'void real_baseline(X86 *c) {']
     for k, ins in enumerate(insns):
         code.append(f'L_{ins.addr:08x}:;')
         if ins.mnem == "FNSTSW":
@@ -148,6 +159,9 @@ def prepare(profile_path, out):
     directory = out / 'function'
     directory.mkdir(exist_ok=True)
     (directory / 'fixtures.h').write_text((profile_path.parent / p['fixture']).read_text())
-    (directory / 'baseline.c').write_text('\n'.join(code))
+    from experiments.x87_llvm.instrument import instrument_memory
+    direct = '\n'.join(code)
+    original = direct.replace('void real_baseline(', 'void real_uninstrumented(')
+    (directory / 'baseline.c').write_text(instrument_memory(direct) + '\n' + original)
     (directory / 'decoded.txt').write_text('\n'.join(i.raw for i in insns) + '\n')
     return '\n'.join(module)

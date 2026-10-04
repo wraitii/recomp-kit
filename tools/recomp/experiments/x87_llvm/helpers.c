@@ -1,7 +1,7 @@
 /* ABI adapters keep native X86 layout in C, not duplicated in the IR emitter.
  * Compiled to bitcode, linked AFTER stack lifting, then inlined by LLVM.
  */
-#include "x86.h"
+#include "access.h"
 #define INLINE __attribute__((always_inline))
 INLINE unsigned rk_reg(X86 *c, unsigned n) {
     return c->r[n];
@@ -13,11 +13,10 @@ INLINE void rk_set_top(X86 *c, unsigned n) {
     c->fpu_top = n;
 }
 INLINE double rk_load(X86 *c, unsigned a) {
-    (void)c;
-    return (double)rdf32(a);
+    return (double)rk_access_f32(c, a);
 }
 INLINE void rk_store(X86 *c, unsigned a, double v) {
-    wrf32(a, fto_float(c, v));
+    rk_access_store32(c, a, fto_float(c, v));
 }
 INLINE double rk_round(X86 *c, double v) {
     return fx87(c, v);
@@ -42,8 +41,7 @@ INLINE void rk_slot(X86 *c, unsigned physical, double v, unsigned live) {
 }
 
 INLINE double rk_load64(X86 *c, unsigned a) {
-    (void)c;
-    return rdf64(a);
+    return rk_access_f64(c, a);
 }
 INLINE void rk_compare(X86 *c, double a, double b) {
     fcom(c, a, b);
@@ -75,7 +73,7 @@ INLINE unsigned rk_zf(X86 *c, unsigned unused) {
     return c->eflags_zf;
 }
 INLINE void rk_ret(X86 *c, unsigned cleanup) {
-    c->eip = rd32(c->r[R_ESP]);
+    c->eip = rk_access_u32(c, c->r[R_ESP]);
     c->r[R_ESP] += 4u + cleanup;
     recomp_return(c);
 }

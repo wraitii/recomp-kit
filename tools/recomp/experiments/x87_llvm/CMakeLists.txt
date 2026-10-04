@@ -12,10 +12,12 @@ set(CMAKE_CXX_STANDARD 17)
 add_llvm_pass_plugin(RecompX87 PARTIAL_SOURCES_INTENDED stack_pass.cpp)
 set(TOOLS "${LLVM_TOOLS_BINARY_DIR}")
 set(OUT "${CMAKE_BINARY_DIR}")
+# State visibility depends on keeping memory adapters opaque to both emitters.
+set_source_files_properties(access.c PROPERTIES COMPILE_OPTIONS "-fno-lto")
 add_custom_command(OUTPUT "${OUT}/helpers.bc"
   COMMAND "${TOOLS}/clang" -O1 -ffp-contract=off -emit-llvm -c
           -I "${KIT_RUNTIME}" "${CMAKE_CURRENT_SOURCE_DIR}/helpers.c" -o "${OUT}/helpers.bc"
-  DEPENDS helpers.c "${KIT_RUNTIME}/x86.h" VERBATIM)
+  DEPENDS helpers.c access.h "${KIT_RUNTIME}/x86.h" VERBATIM)
 add_custom_command(OUTPUT "${OUT}/ssa.ll"
   COMMAND "${TOOLS}/opt" -load-pass-plugin=$<TARGET_FILE:RecompX87>
           -passes=recomp-x87-analyze,recomp-x87-ssa -verify-each -S "${OUT}/input.ll" -o "${OUT}/ssa.ll"
@@ -36,9 +38,10 @@ set_source_files_properties("${OUT}/llvm.o" PROPERTIES EXTERNAL_OBJECT TRUE GENE
 # directly between two executables lets Make run the optimizer twice in parallel.
 add_library(x87_ir STATIC "${OUT}/llvm.o")
 set_target_properties(x87_ir PROPERTIES LINKER_LANGUAGE C)
-add_executable(x87_llvm boundaries.c "${OUT}/baseline.c" ../x87_locals/harness.c)
+add_executable(x87_llvm boundaries.c access.c "${OUT}/baseline.c" ../x87_locals/harness.c)
 target_link_libraries(x87_llvm PRIVATE x87_ir)
-target_include_directories(x87_llvm PRIVATE "${KIT_RUNTIME}" "${OUT}")
+target_include_directories(x87_llvm PRIVATE "${KIT_RUNTIME}" "${OUT}" "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(x87_llvm PRIVATE RK_MEMORY_TEST=1)
 target_compile_options(x87_llvm PRIVATE -O2 -ffp-contract=off)
 if(NOT WIN32)
   target_link_libraries(x87_llvm PRIVATE m)
@@ -46,10 +49,10 @@ endif()
 
 if(FUNCTION_TEST)
   add_executable(x87_function "${OUT}/function/baseline.c" ../x87_locals/harness.c
-                 boundaries.c)
+                 boundaries.c access.c)
   target_link_libraries(x87_function PRIVATE x87_ir)
-  target_include_directories(x87_function PRIVATE "${KIT_RUNTIME}" "${OUT}/function")
-  target_compile_definitions(x87_function PRIVATE RK_FUNCTION_TEST=1)
+  target_include_directories(x87_function PRIVATE "${KIT_RUNTIME}" "${OUT}/function" "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_compile_definitions(x87_function PRIVATE RK_FUNCTION_TEST=1 RK_MEMORY_TEST=1)
   target_compile_options(x87_function PRIVATE -O2 -ffp-contract=off)
   if(NOT WIN32)
     target_link_libraries(x87_function PRIVATE m)

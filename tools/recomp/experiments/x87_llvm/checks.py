@@ -1,5 +1,6 @@
 """Small contract checks for the compiled pass, invoked by the build experiment."""
 import subprocess
+import re
 
 from experiments.x87_llvm.run import DECLARATIONS
 
@@ -43,6 +44,21 @@ def check_pass(opt, plugin, out):
     body = ssa.split('define void @cfg_join_llvm_lifted(', 1)[1].split('\n}', 1)[0]
     assert body.count('phi double') == 2 and '@rk_snapshot(' in body
     assert '@rk_slot(' not in body
+    # Every supported memory access has a complete snapshot immediately before
+    # it, including the return-address read. Check all transformed fixtures.
+    for name, text in re.findall(r'define void @(\w+)\([^\n]*\n(.*?)\n}', ssa, re.S):
+        if not (name.endswith('_llvm_lifted') or name == 'real_lifted'):
+            continue
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if re.search(r'@rk_(?:load|load64|store|ret)\(', line):
+                assert '@rk_snapshot(' in lines[i - 1], (name, line)
+    # ABI opacity must survive O2: access definitions never enter the IR module.
+    optimized = (out / 'optimized.ll').read_text()
+    assert not re.search(r'^define .*@rk_access_', optimized, re.M)
+    for helper in ('f32', 'f64', 'u32', 'store32'):
+        assert re.search(r'call .*@rk_access_' + helper + r'\(', optimized)
+
     # Reapplying the pass must be an identity once its attribute is consumed.
     again = directory / 'again.ll'
     subprocess.run([str(opt), f'-load-pass-plugin={plugin}', '-passes=recomp-x87-stack',

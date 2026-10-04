@@ -215,7 +215,8 @@ class X87SSAPass : public PassInfoMixin<X87SSAPass> {
                         else
                             Slot = C->getArgOperand(2);
                         Erase.push_back(C);
-                    } else if (N == "rk_fnstsw" || N == "rk_observe" || N == "rk_ret") {
+                    } else if (N == "rk_fnstsw" || N == "rk_observe" || N == "rk_ret" ||
+                               N == "rk_load" || N == "rk_load64" || N == "rk_store") {
                         Checkpoint(I);
                     }
                 } else if (isa<ReturnInst>(I)) {

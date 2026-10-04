@@ -109,7 +109,7 @@ def run_experiment(out, cmake, jobs, function_profile=None):
     out.mkdir(parents=True, exist_ok=True)
     from experiments.x87_llvm.function import DECLARATIONS as FUNCTION_DECLS
     from experiments.x87_llvm.fixtures import BODY, BASELINE
-    module, baseline, declarations = [DECLARATIONS, FUNCTION_DECLS], ['#include "x86.h"'], []
+    module, baseline, declarations = [DECLARATIONS, FUNCTION_DECLS], ['#include "access.h"'], []
     modes = ("baseline", "llvm_raw", "llvm_lifted", "full")
     declarations += ['static const char *mode_names[] = {"baseline", "llvm_raw", "llvm_lifted", "full"};',
                      "static const unsigned normalize_empty_mask = 0, required_match_mask = 14;"]
@@ -136,7 +136,8 @@ def run_experiment(out, cmake, jobs, function_profile=None):
         from experiments.x87_llvm.function import prepare
         module.append(prepare(function_profile, out))
     (out / "input.ll").write_text('\n'.join(module))
-    (out / "baseline.c").write_text('\n'.join(baseline))
+    from experiments.x87_llvm.instrument import instrument_memory
+    (out / "baseline.c").write_text(instrument_memory('\n'.join(baseline)))
     declarations += ["static const char *case_names[] = {" + ','.join(f'"{n}"' for n in names) + "};",
                      "static void (*functions[][4])(X86 *) = {" +
                      ','.join('{' + ','.join(f"{n}_{m}" for m in modes) + '}' for n in names) + "};"]
@@ -171,7 +172,7 @@ def run_experiment(out, cmake, jobs, function_profile=None):
     if function_profile:
         body = lifted.split("define void @real_lifted(", 1)[1].split('\n}', 1)[0]
         raw_body = lifted.split("define void @real_raw(", 1)[1].split('\n}', 1)[0]
-        for observer in ("fnstsw", "ret"):
+        for observer in ("fnstsw", "ret", "round"):
             assert body.count(f"@rk_{observer}(") == raw_body.count(f"@rk_{observer}(")
         assert not any(f"@rk_{op}(" in body for op in ("push", "pop", "read", "set", "snapshot"))
     print("Verified LLVM stack elimination and retained arithmetic rounding calls.")
