@@ -466,12 +466,8 @@ def parse_args(argv, system=None):
     parser.add_argument("--regenerate", action="store_true", help="Regenerate and compile translated C")
     parser.add_argument("--llvm-compare", type=Path, metavar="MANIFEST",
                         help="Build-only translator C/LLVM comparison using production compile commands")
-    parser.add_argument("--llvm-compare-boundaries", action="store_true",
-                        help="Compare with the conservative runtime access-boundary ABI")
     parser.add_argument("--llvm-sweep", type=Path, metavar="MANIFEST",
                         help="Build-only full-census LLVM emission/lifting coverage survey")
-    parser.add_argument("--llvm-runtime", type=Path, metavar="MANIFEST",
-                        help="Replay and activate bounded LLVM functions in the native host")
     parser.add_argument("--x87-locals-experiment", action="store_true",
                         help="Build and run the isolated x87 local-value experiment")
     parser.add_argument("--x87-llvm-experiment", action="store_true",
@@ -526,20 +522,11 @@ def parse_args(argv, system=None):
     if (args.llvm_compare or args.llvm_sweep) and any((args.stub, args.regenerate, args.config != "Release",
                                   args.preset != default_preset(system), args.target != "app",
                                   args.x87_llvm_experiment, args.x87_locals_experiment,
-                                  args.x87_llvm_function, args.llvm_runtime, args.allow_table_gaps,
+                                  args.x87_llvm_function, args.allow_table_gaps,
                                   args.allow_unmodelled, args.discovered, args.forget)):
         parser.error("--llvm-compare requires native Release defaults and no translation overrides")
     if args.llvm_compare and args.llvm_sweep:
         parser.error("LLVM comparison and sweep are separate modes")
-    if args.llvm_compare_boundaries and not args.llvm_compare:
-        parser.error("--llvm-compare-boundaries requires --llvm-compare")
-    if args.llvm_runtime and any((args.stub, args.config != "Release",
-                                 args.preset != default_preset(system),
-                                 args.target not in {"app", "headless", "smoke"},
-                                 args.x87_llvm_experiment, args.x87_locals_experiment,
-                                 args.x87_llvm_function, args.allow_table_gaps,
-                                 args.allow_unmodelled, args.discovered, args.forget)):
-        parser.error("--llvm-runtime requires a native Release host and no translation overrides")
     args.build_root = build_root_for(args.game_dir)
     return args, parser
 
@@ -559,7 +546,7 @@ def main():
         with buildlock.BuildLock(args.build_root.parent, "tools/build.py --llvm-compare"):
             run_comparison(args.llvm_compare, args.game_dir, args.build_root / "llvm-compare",
                            build_dir_for(args.build_root, args.preset) / "compile_commands.json",
-                           cmake_tool("cmake"), args.jobs, boundary_access=args.llvm_compare_boundaries)
+                           cmake_tool("cmake"), args.jobs)
         return
     if args.x87_llvm_experiment:
         from experiments.x87_llvm.run import run_experiment
@@ -576,7 +563,6 @@ def main():
     preset = preset_name(args.preset, args.config, stub=args.stub, target=args.target)
     build_dir = build_dir_for(args.build_root, preset)
     defines = game_defines(args.game_dir, args.build_root)
-    defines += ["-DRECOMP_LLVM_DIR=" + (str(args.build_root / "llvm-runtime") if args.llvm_runtime else "")]
     try:
         # The lock lives at <build root>/recomp/.lock: BuildLock joins build/recomp/.lock onto its argument.
         with buildlock.BuildLock(args.build_root.parent, "tools/build.py"):
@@ -614,10 +600,6 @@ def main():
                     temporary = header.with_suffix(".h.new")
                     temporary.write_bytes(current)
                     temporary.replace(header)
-            if args.llvm_runtime:
-                from llvm_runtime import prepare_runtime
-                prepare_runtime(args.llvm_runtime, args.game_dir, args.build_root / "llvm-runtime",
-                                build_dir / "compile_commands.json", cmake_tool("cmake"), args.jobs, cfg)
             if args.target == "ios":
                 if not args.stub and not (args.build_root / "recomp/gen/table.c").is_file():
                     parser.error("No translation in %s/recomp/gen; run tools/build.py --regenerate on macOS first"

@@ -2,24 +2,6 @@
  * Compiled to bitcode, linked AFTER stack lifting, then inlined by LLVM.
  */
 #include "access.h"
-#ifdef RK_BOUNDARY_ACCESS
-/* The production LLVM path uses separately compiled access adapters. Keep CPU
- * state observable at every access and preserve normal runtime write hooks. */
-#define rk_direct_load rk_boundary_load
-#define rk_direct_load64 rk_boundary_load64
-#define rk_direct_store rk_boundary_store
-#define rk_direct_fnstsw rk_boundary_fnstsw
-#define rk_direct_ret rk_boundary_ret
-#define rk_direct_load32 rk_boundary_load32
-#define rk_direct_push32 rk_boundary_push32
-#define rk_direct_pop32 rk_boundary_pop32
-#define rk_direct_call rk_boundary_call
-#define rdf32(a) rk_access_f32(c, (a))
-#define rdf64(a) rk_access_f64(c, (a))
-#define rd32(a) rk_access_u32(c, (a))
-#define wr32(a, v) rk_access_write32(c, (a), (v))
-#define wrf32(a, v) rk_access_store32(c, (a), (v))
-#endif
 #define INLINE __attribute__((always_inline))
 #ifndef RK_CALL_TARGET
 #define RK_CALL_TARGET(c, target) recomp_call(c, target)

@@ -7,7 +7,6 @@ Unsupported flags/targets fail rather than silently becoming a different test.
 from pathlib import Path
 import hashlib
 import json
-import os
 import platform
 import re
 import shlex
@@ -132,7 +131,7 @@ def function_sizes(disassembly):
     return sizes
 
 
-def run_comparison(manifest, game_dir, out, database, cmake, jobs, boundary_access=False, benchmark=True):
+def run_comparison(manifest, game_dir, out, database, cmake, jobs):
     config = llvm_config()
     bindir = Path(subprocess.check_output([config, '--bindir'], text=True).strip())
     cmakedir = subprocess.check_output([config, '--cmakedir'], text=True).strip()
@@ -142,13 +141,6 @@ def run_comparison(manifest, game_dir, out, database, cmake, jobs, boundary_acce
     subprocess.run([sys.executable, str(HERE / 'translate.py'), '--game', str(game_dir),
                     '--out', str(out), '--llvm-compare', str(Path(manifest).resolve())], check=True)
     metadata = json.loads((out / 'translation.json').read_text())
-    if boundary_access:
-        from experiments.x87_llvm.direct import boundary_ir
-        for addr in metadata['functions']:
-            path = out / addr / 'input.ll'
-            path.write_text(boundary_ir(path.read_text()))
-        metadata['contract'] = 'synchronous-access-boundaries-v1'
-        (out / 'translation.json').write_text(json.dumps(metadata, indent=2) + '\n')
     settings = production_settings(database, out, metadata, KIT / 'runtime')
     (out / 'settings.cmake').write_text('set(LEAVES ' + ' '.join(settings) + ')\n')
     report = {'translation': metadata, 'production': settings,
@@ -156,12 +148,10 @@ def run_comparison(manifest, game_dir, out, database, cmake, jobs, boundary_acce
               'llvm_version': subprocess.check_output([str(bindir / 'clang'), '--version'], text=True).splitlines()[0],
               'fp_policy': 'production flags unchanged; semantic IR has no contraction/fast-math flags',
               'execution_contract': 'complete normal-exit state; ordinary return supplied by harness'}
-    report['opaque_access_boundaries'] = boundary_access
     (out / 'build-settings.json').write_text(json.dumps(report, indent=2) + '\n')
     subprocess.run([cmake, '-S', str(CMAKE), '-B', str(out),
                     f'-DLLVM_DIR={cmakedir}', f'-DCMAKE_C_COMPILER={bindir / "clang"}',
-                    f'-DCMAKE_CXX_COMPILER={bindir / "clang++"}', f'-DPython3_EXECUTABLE={sys.executable}',
-                    f'-DBOUNDARY_ACCESS={"ON" if boundary_access else "OFF"}'], check=True)
+                    f'-DCMAKE_CXX_COMPILER={bindir / "clang++"}', f'-DPython3_EXECUTABLE={sys.executable}'], check=True)
     subprocess.run([cmake, '--build', str(out), '--parallel', str(jobs)], check=True)
     for addr in settings:
         directory = out / addr
@@ -185,20 +175,7 @@ def run_comparison(manifest, game_dir, out, database, cmake, jobs, boundary_acce
         raw = (directory / 'input.ll').read_text().split('define void @compare_raw(', 1)[1].split('\n}', 1)[0]
         assert not any(f'@rk_{op}(' in lifted for op in ('push', 'pop', 'read', 'set', 'snapshot'))
         assert lifted.count('@rk_round(') == raw.count('@rk_round(')
-        if boundary_access:
-            ssa = (directory / 'ssa.ll').read_text().split('define void @compare_lifted(', 1)[1].split('\n}', 1)[0]
-            effects = (directory / 'effects.ll').read_text().split('define void @compare_lifted(', 1)[1].split('\n}', 1)[0]
-            assert ssa == effects  # No effect-based snapshot removal in the game ABI.
-            lines = ssa.splitlines()
-            for i, line in enumerate(lines):
-                if 'call ' in line and '@rk_boundary_' in line:
-                    assert '@rk_snapshot(' in lines[i - 1], line
-        environment = os.environ.copy()
-        if benchmark:
-            environment.pop('RK_SKIP_BENCHMARKS', None)
-        else:
-            environment['RK_SKIP_BENCHMARKS'] = '1'
-        run = subprocess.run([str(directory / 'replay')], capture_output=True, text=True, check=True, env=environment)
+        run = subprocess.run([str(directory / 'replay')], capture_output=True, text=True, check=True)
         (directory / 'results.txt').write_text(run.stdout)
         print(addr + ':\n' + run.stdout, end='')
         disassembly = subprocess.check_output([str(bindir / 'llvm-objdump'), '--disassemble',
