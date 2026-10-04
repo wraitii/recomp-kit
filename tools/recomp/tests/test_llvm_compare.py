@@ -63,6 +63,13 @@ def test_profile_extent_and_bytes_are_checked():
         validate_listing(T, image, fn, dict(p, function_sha256='0' * 64))
 
 
+def test_implicit_listing_width_is_a_normalization_refusal():
+    image, fn, p = fixture_function()
+    fn.insns[0].ops = ['[ESP + 4]']
+    with pytest.raises(ValueError, match='implicit memory width; normalization unsupported'):
+        validate_listing(T, image, fn, p)
+
+
 @pytest.mark.parametrize('manifest', [{}, {'contract': 'unknown', 'functions': ['a.json']},
                                       {'contract': 'mapped-normal-exit-v1', 'functions': []}])
 def test_contract_is_explicit(tmp_path, manifest):

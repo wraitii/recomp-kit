@@ -128,3 +128,42 @@ wrapper's lock. The output is `<game build>/llvm-compare/`, separate from `recom
 The comparison is evidence about translated body code generation and the current
 double-backed runtime. It does not establish original-x86, fault/SEH, hook/entry
 cost, or game-level behavior/performance equivalence, and enables no gameplay path.
+
+## Corpus sweep
+
+```sh
+python tools/build.py --game-dir /absolute/game --llvm-sweep /absolute/path/codegen.json
+```
+
+This separate build mode uses the comparison manifest's explicit normal-exit
+contract. It visits **every exported function-census row**, including missing or
+empty listings, without recovering blocks or changing boundaries. Each row in
+`build/llvm-sweep/coverage.json` records its address, listing, instruction counts,
+byte hash, and first refusal's stage and diagnostic, or successful emission and
+lifting. Summary counts distinguish functions with x87 instructions. The sweep
+uses the real LLVM passes, not a second stack-analysis implementation; unexpected
+tool errors/crashes abort the survey. Rejected functions are not executed.
+
+The frontend and arithmetic subset are unchanged. Omitted memory widths and
+other unnormalized listing spellings remain explicit listing refusals; these
+are not all byte discrepancies. Calls require an exact matching inspected
+profile in the supplied manifest; other calls are refused. Non-profile leaves
+use the existing synchronized direct-access contract. Admission establishes
+neither valid runtime entry states nor satisfaction of the memory/fault contract.
+
+For every successfully lifted candidate, the sweep checks that its production C
+body uniquely matches a configured chunk and that the runtime header is current.
+A body mismatch is a separate codegen refusal, leaving lifting coverage intact.
+It then builds production-compiler C, LLVM-compiler C, raw LLVM and lifted LLVM
+objects with the production flags through the comparison CMake project with
+`BUILD_REPLAY=OFF`. No harness/fixtures are synthesized or run. Object spans,
+instruction counts, disassembly, assembly and stage times are saved per address;
+compiler settings and compile-database provenance are in `coverage.json`.
+Spans include alignment/cold paths up to the next text symbol or section end;
+they exclude unrelated helpers, data/debug sections and linker costs. Split-text
+object layouts are refused. Object sizes are distinct from the replay's linked
+executable spans. Compilation-cost cleanup remains deferred.
+
+This is **translation/build coverage only**. Existing fixture-backed replay
+coverage, original-x86 comparisons, faults/SEH and game execution must be reported
+separately. Nothing produced here is registered in production dispatch.

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add `tools/build.py --llvm-sweep MANIFEST` for full exported-census LLVM
+  emission/lifting coverage with per-function first refusals, followed by
+  production-C/raw/lifted object codegen comparisons for supported functions.
+  Missing listings, undeclared calls and unnormalized operand representations
+  remain explicit refusals. No replay fixtures or execution claims are inferred;
+  production dispatch and arithmetic semantics are unchanged.
+
 - Extend the build-only LLVM comparison to bounded complete functions with loops,
   binary32 stores, integer stack/register operations and declared synchronous
   calls. An opt-in synchronization policy materializes full state on every loop

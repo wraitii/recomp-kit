@@ -15,6 +15,7 @@ set(TOOLS "${LLVM_TOOLS_BINARY_DIR}")
 set(TIME "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/time_command.py")
 add_llvm_pass_plugin(RecompX87 PARTIAL_SOURCES_INTENDED "${EXPERIMENT}/stack_pass.cpp")
 include("${CMAKE_BINARY_DIR}/settings.cmake")
+option(BUILD_REPLAY "Build the fixture-backed execution harness" ON)
 foreach(LEAF IN LISTS LEAVES)
   set(D "${CMAKE_BINARY_DIR}/${LEAF}")
   include("${D}/settings.cmake")
@@ -58,6 +59,10 @@ foreach(LEAF IN LISTS LEAVES)
             -S "${D}/optimized.ll" -o "${D}/llvm.s"
     DEPENDS "${D}/lifted.ll" "${D}/helpers.bc" "${D}/settings.cmake" VERBATIM)
   set_source_files_properties("${D}/c_native.o" "${D}/c_llvm.o" "${D}/llvm.o" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+  if(NOT BUILD_REPLAY)
+    add_custom_target(codegen_${LEAF} ALL DEPENDS "${D}/c_native.o" "${D}/c_llvm.o" "${D}/llvm.o")
+    continue()
+  endif()
   add_executable(replay_${LEAF} "${D}/c_native.o" "${D}/c_llvm.o" "${D}/llvm.o"
     "${D}/callees.c"
     "${EXPERIMENT}/boundaries.c" "${EXPERIMENT}/access.c" "${EXPERIMENT}/../x87_locals/harness.c")

@@ -466,6 +466,8 @@ def parse_args(argv, system=None):
     parser.add_argument("--regenerate", action="store_true", help="Regenerate and compile translated C")
     parser.add_argument("--llvm-compare", type=Path, metavar="MANIFEST",
                         help="Build-only translator C/LLVM comparison using production compile commands")
+    parser.add_argument("--llvm-sweep", type=Path, metavar="MANIFEST",
+                        help="Build-only full-census LLVM emission/lifting coverage survey")
     parser.add_argument("--x87-locals-experiment", action="store_true",
                         help="Build and run the isolated x87 local-value experiment")
     parser.add_argument("--x87-llvm-experiment", action="store_true",
@@ -517,12 +519,14 @@ def parse_args(argv, system=None):
         parser.error("--target web needs the Emscripten SDK's environment (source emsdk_env.sh)")
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
-    if args.llvm_compare and any((args.stub, args.regenerate, args.config != "Release",
+    if (args.llvm_compare or args.llvm_sweep) and any((args.stub, args.regenerate, args.config != "Release",
                                   args.preset != default_preset(system), args.target != "app",
                                   args.x87_llvm_experiment, args.x87_locals_experiment,
                                   args.x87_llvm_function, args.allow_table_gaps,
                                   args.allow_unmodelled, args.discovered, args.forget)):
         parser.error("--llvm-compare requires native Release defaults and no translation overrides")
+    if args.llvm_compare and args.llvm_sweep:
+        parser.error("LLVM comparison and sweep are separate modes")
     args.build_root = build_root_for(args.game_dir)
     return args, parser
 
@@ -530,6 +534,13 @@ def parse_args(argv, system=None):
 def main():
     """Check inputs, translate under the build lock when needed, then configure and build."""
     args, parser = parse_args(sys.argv[1:])
+    if args.llvm_sweep:
+        from llvm_sweep import run_sweep
+        with buildlock.BuildLock(args.build_root.parent, "tools/build.py --llvm-sweep"):
+            run_sweep(args.llvm_sweep, args.game_dir, args.build_root / "llvm-sweep",
+                      cmake_tool("cmake"), args.jobs,
+                      build_dir_for(args.build_root, args.preset) / "compile_commands.json")
+        return
     if args.llvm_compare:
         from llvm_compare_build import run_comparison
         with buildlock.BuildLock(args.build_root.parent, "tools/build.py --llvm-compare"):

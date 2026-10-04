@@ -68,16 +68,23 @@ def cmake_quote(value):
     return f'[{delimiter}[{value}]{delimiter}]'
 
 
-def production_settings(database, out, metadata, runtime):
+def production_settings(database, out, metadata, runtime, refusals=None):
     rows = json.loads(Path(database).read_text())
     candidates = [row for row in rows if Path(row['file']).name.startswith('chunk_')
                   and 'recomp_gen.dir' in (row.get('command') or ' '.join(row['arguments']))]
     chunks = {row['file']: Path(row['file']).read_text() for row in candidates}
+    owners = {}
+    for row in candidates:
+        for address in re.findall(r'^void fn_([0-9a-f]{8})\(X86 \*c\)', chunks[row['file']], re.M):
+            owners.setdefault(address, []).append(row)
     settings = {}
     for addr in metadata['functions']:
         body = (out / addr / 'body.txt').read_text()
-        matches = [row for row in candidates if body in chunks[row['file']]]
+        matches = [row for row in owners.get(addr, []) if body in chunks[row['file']]]
         if len(matches) != 1:
+            if refusals is not None:
+                refusals[addr] = 'emitted body does not uniquely match production chunks'
+                continue
             raise ValueError(f'{addr}: emitted body does not uniquely match production chunks; regenerate C first')
         row = matches[0]
         # The production build deliberately includes a copied runtime header.

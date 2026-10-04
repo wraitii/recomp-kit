@@ -63,8 +63,17 @@ def validate_listing(T, image, fn, profile):
         operands = [] if m == 'FADDP' and ins.ops == ['ST1'] else ins.ops
         return ins.addr, m, ins.rep, [tuple(getattr(T.parse_operand(op), field) for field in T.Op.__slots__) for op in operands]
 
-    if [key(i) for i in fn.insns] != [key(i) for i in canonical]:
-        raise ValueError('listing instructions disagree with executable bytes')
+    if len(fn.insns) != len(canonical):
+        raise ValueError('listing instruction count disagrees with executable bytes')
+    for listed, decoded in zip(fn.insns, canonical):
+        if key(listed) != key(decoded):
+            # An omitted width is a representation limitation, not evidence of
+            # different bytes. Do not infer it or silently change frontend scope.
+            implicit = any(T.parse_operand(op).kind == 'mem' and T.parse_operand(op).size is None
+                           for op in listed.ops)
+            reason = ('listing has an implicit memory width; normalization unsupported' if implicit
+                      else 'listing instructions disagree with executable bytes')
+            raise ValueError(f'{reason}: {listed.raw} <> {decoded.raw}')
     fn.measure(image)
     if not all(fn.contiguous) or fn.fallthrough[-1] != start + size:
         raise ValueError('noncontiguous function is unsupported')
