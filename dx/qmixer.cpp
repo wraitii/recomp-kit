@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unordered_map>
 #include <vector>
 #include <iterator>
 
@@ -228,6 +229,11 @@ std::vector<Session> &sessions() {
     static auto *v = new std::vector<Session>();
     return *v;
 }
+// Wave handle (a guest-heap address) -> index in waves().
+std::unordered_map<uint32_t, size_t> &wave_index() {
+    static auto *m = new std::unordered_map<uint32_t, size_t>();
+    return *m;
+}
 std::vector<Wave> &waves() {
     static auto *v = new std::vector<Wave>();
     return *v;
@@ -273,7 +279,6 @@ float g_speed_of_sound = 331.5f;
 uint32_t g_speaker_placement = 0;
 
 const uint32_t SESSION_HANDLE_BASE = 0x00510000u;
-const uint32_t WAVE_HANDLE_BASE = 0x00520000u;
 
 Session *session_for(uint32_t h) {
     if (h < SESSION_HANDLE_BASE)
@@ -284,13 +289,17 @@ Session *session_for(uint32_t h) {
     return sessions()[i].alive ? &sessions()[i] : nullptr;
 }
 
+// A wave handle is the address of a small guest-heap record, because the guest
+// dereferences it: LHaudiodllR 0x10211f2d does `MOV EDX,[EAX+4]` on the value
+// OpenWaveEx returned and keeps that as the wave's sample rate, from which it
+// derives every SetFrequency it issues. Handles that were integers in the
+// executable's own address range made that read return code bytes, so every
+// sound was played at a nonsense rate (high-pitched static).
 Wave *wave_for(uint32_t h) {
-    if (h < WAVE_HANDLE_BASE)
+    auto it = wave_index().find(h);
+    if (it == wave_index().end() || it->second >= waves().size())
         return nullptr;
-    uint32_t i = h - WAVE_HANDLE_BASE;
-    if (i >= waves().size())
-        return nullptr;
-    return waves()[i].alive ? &waves()[i] : nullptr;
+    return waves()[it->second].alive ? &waves()[it->second] : nullptr;
 }
 
 // Channels are indexed by the guest's own number, capped so a wild index
@@ -340,6 +349,26 @@ void read_vec3(uint32_t a, float out[3]) {
 // RECOMP_TRACE_IMPORTS showed the call arriving with exactly that.
 // Only PCM is played. A compressed tag (ADPCM 2, MPEG 0x55, ...) is refused by
 // name: decoding it is a separate piece of work, not something to guess at.
+// Diagnostic, bounded: the raw format bytes and the first sample bytes of the
+// first waves opened, so a wrong rate or format can be read off the log against
+// the bytes the guest actually supplied (RECOMP_TRACE_IMPORTS shows only the
+// pointers).
+void dump_wave_bytes(const char *form, uint32_t fmt, uint32_t data, uint32_t bytes) {
+    static int said = 0;
+    if (said >= 24)
+        return;
+    ++said;
+    char f[3 * 20 + 1] = {}, d[3 * 16 + 1] = {};
+    if (gm_valid(fmt, 20))
+        for (int i = 0; i < 20; ++i)
+            snprintf(f + 3 * i, 4, "%02x ", rd8(fmt + (uint32_t)i));
+    if (data && bytes >= 16 && gm_valid(data, 16))
+        for (int i = 0; i < 16; ++i)
+            snprintf(d + 3 * i, 4, "%02x ", rd8(data + (uint32_t)i));
+    LOGW("qmixer: wave open (%s) fmt@%08x: %s| data@%08x (%u bytes): %s", form, fmt, f, data, bytes,
+         d);
+}
+
 bool read_riff_wave(uint32_t info, Wave *w, uint32_t *error) {
     const auto fail = [&](uint32_t code) {
         if (error)
@@ -365,6 +394,7 @@ bool read_riff_wave(uint32_t info, Wave *w, uint32_t *error) {
         return fail(QSERR_BAD_DATA);
     }
     bool have_fmt = false;
+    uint32_t fmt_at = 0;
     uint32_t data = 0, bytes = 0;
     uint32_t pos = 12;
     while (pos + 8 <= size) {
@@ -385,6 +415,7 @@ bool read_riff_wave(uint32_t info, Wave *w, uint32_t *error) {
             w->channels = rd16(base + body + WFX_OFF_nChannels);
             w->rate = rd32(base + body + WFX_OFF_nSamplesPerSec);
             w->bits = rd16(base + body + WFX_OFF_wBitsPerSample);
+            fmt_at = base + body;
             have_fmt = true;
         } else if (id == 0x61746164u /* 'data' */ && !data) {
             data = base + body;
@@ -408,6 +439,7 @@ bool read_riff_wave(uint32_t info, Wave *w, uint32_t *error) {
         ++counters().open_wave_refused_fmt;
         return fail(QSERR_BAD_FORMAT);
     }
+    dump_wave_bytes("riff", fmt_at, data, bytes);
     w->pcm = data;
     w->bytes = bytes;
     return true;
@@ -528,6 +560,7 @@ bool read_wave_record(uint32_t rec, uint32_t flags, Wave *w, uint32_t *error) {
         ++counters().open_wave_refused_data;
         return fail(QSERR_BAD_DATA);
     }
+    dump_wave_bytes("record", fmt, data, bytes);
     w->pcm = data;
     w->bytes = bytes;
     return true;
@@ -863,6 +896,10 @@ void QSWaveMixCloseSession(X86 *c) {
         }
         w.pcm = 0;
         w.bytes = 0;
+        if (w.alive && w.handle) { // a wave the game never freed still owns its handle record
+            wave_index().erase(w.handle);
+            heap_free(w.handle);
+        }
         w.alive = false;
     }
     s->alive = false;
@@ -1073,9 +1110,23 @@ void QSWaveMixOpenWaveEx(X86 *c) {
         ++counters().open_wave_streamed;
     else
         ++counters().open_wave_static;
+    // The handle record. Only +4 (nSamplesPerSec) is evidenced as read by the
+    // guest; the rest of the QMixer wave header is unknown and left zero.
+    // SHIM(temporary): partial QMIXWAVE layout, see docs/shims.md.
+    uint32_t h = heap_alloc(16, true, 16);
+    if (!h) {
+        if (w.buffer) {
+            heap_free(w.buffer);
+            w.buffer = 0;
+        }
+        s->last_error = QSERR_BAD_DATA, g_qs_last_error = QSERR_BAD_DATA;
+        set_eax(c, 0);
+        return;
+    }
+    wr32(h + 4, w.rate);
     waves().push_back(w);
-    uint32_t h = WAVE_HANDLE_BASE + (uint32_t)waves().size() - 1;
     waves().back().handle = h;
+    wave_index()[h] = waves().size() - 1;
     LOGV("qmixer: opened wave %08x: %u bytes, %u Hz, %u ch, %u bit", h, w.bytes, w.rate, w.channels,
          w.bits);
     set_eax(c, h);
@@ -1118,6 +1169,8 @@ void QSWaveMixFreeWave(X86 *c) {
         w->bytes = 0;
     }
     w->alive = false;
+    wave_index().erase(w->handle);
+    heap_free(w->handle);
     set_eax(c, QS_OK);
 }
 
@@ -1887,6 +1940,7 @@ void qmixer_reset() {
     }
     sessions().clear();
     waves().clear();
+    wave_index().clear();
     channels().clear();
     announced().clear();
 }

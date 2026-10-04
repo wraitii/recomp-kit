@@ -11764,7 +11764,11 @@ static void test_qmixer_riff_memory_wave() {
     gm_zero(rec, QSWAVEMIXOPENWAVEDATA_SIZE);
     wr32(rec + QSOWD_OFF_lpFormat, info);
     uint32_t open_wave = tramp("QMIXER.dll", "QSWaveMixOpenWaveEx");
-    CHECK(call_shim(open_wave, {hmix, rec, 4}) != 0);
+    uint32_t hw = call_shim(open_wave, {hmix, rec, 4});
+    CHECK(hw != 0);
+    // The guest dereferences the handle and reads the sample rate at +4
+    // (LHaudiodllR 0x10211f2d), so the handle must be a real guest record.
+    CHECK_EQ(rd32(hw + 4), 22050u);
 
     uint32_t img2 = sc(0x700);
     wr32(info + 0x18, img2);
