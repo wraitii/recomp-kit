@@ -31,6 +31,10 @@ namespace {
 
 constexpr uint32_t BINK_RECORD_BYTES = 0x100;
 constexpr uint32_t BINK_SUMMARY_BYTES = 0x7c;
+// _BinkGetRealtime@12 writes this many bytes: FrameNum, FrameRate, FrameRateDiv,
+// Frames, FramesTime and the ten stage/buffer/rate fields the shipped Bink 1.0
+// DLL fills (disassembled at binkw32.dll 0x30006380).
+constexpr uint32_t BINK_REALTIME_BYTES = 0x38;
 constexpr uint32_t BINK_FILE_HANDLE = 0x00800000;
 constexpr uint32_t BINK_FROM_MEMORY = 0x04000000;
 uint32_t g_error_string = 0;
@@ -89,6 +93,16 @@ struct BinkPlayer {
     // BinkSetSoundOnOff: the guest movie player enables/disables the stream's
     // audio. Kept here because audio is host-rendered, not mixed by the guest.
     bool sound_on = true;
+    // BinkGetRealtime accounting. Bink keeps per-frame accumulators that this
+    // shim does not reproduce; these are host-clock measurements (ms) of the
+    // work the shim actually does, plus the compressed bytes it has read.
+    uint64_t video_ms = 0, audio_ms = 0, read_ms = 0, blit_ms = 0;
+    uint64_t bytes_read = 0, total_bytes = 0;
+
+    // Playback wall time in milliseconds, pause-adjusted like BinkWait.
+    uint32_t elapsed_millis() const {
+        return (paused ? paused_at : host_millis()) - t0;
+    }
 
     ~BinkPlayer() {
         if (channel >= 0) {
@@ -266,19 +280,30 @@ bool read_packet(BinkPlayer &p) {
     AVPacket *packet = av_packet_alloc();
     if (!packet)
         return video_error("cannot allocate packet");
+    uint32_t read_start = host_millis();
     int rc = av_read_frame(p.input, packet);
+    p.read_ms += host_millis() - read_start;
     if (rc < 0) {
         av_packet_free(&packet);
         if (rc != AVERROR_EOF)
             return decoder_error("read packet", rc);
         p.eof = true;
-        return !p.audio || decode_audio(p, nullptr);
+        uint32_t drain_start = host_millis();
+        bool drained = !p.audio || decode_audio(p, nullptr);
+        p.audio_ms += host_millis() - drain_start;
+        return drained;
     }
+    p.bytes_read += (uint64_t)packet->size;
     if (packet->stream_index == p.video_index) {
         p.video_packets.push_back(packet);
         return true;
     }
-    bool ok = packet->stream_index != p.audio_index || decode_audio(p, packet);
+    bool ok = true;
+    if (packet->stream_index == p.audio_index) {
+        uint32_t audio_start = host_millis();
+        ok = decode_audio(p, packet);
+        p.audio_ms += host_millis() - audio_start;
+    }
     av_packet_free(&packet);
     return ok;
 }
@@ -324,6 +349,10 @@ void BinkOpen(X86 *c) {
         decoder_error("find stream info", rc);
         return;
     }
+    // The real Bink reader reports its byte budget in the realtime record; the
+    // custom I/O window knows its length and a regular file knows its size.
+    int64_t total = avio_size(p->input->pb);
+    p->total_bytes = total > 0 ? (uint64_t)total : (uint64_t)p->file_length;
     for (unsigned i = 0; i < p->input->nb_streams; ++i) {
         AVMediaType type = p->input->streams[i]->codecpar->codec_type;
         if (type == AVMEDIA_TYPE_VIDEO && p->video_index < 0)
@@ -459,6 +488,7 @@ void BinkDoFrame(X86 *c) {
         return;
     }
     p->have_frame = false;
+    uint32_t decode_start = host_millis();
     for (;;) {
         int rc = avcodec_receive_frame(p->video, p->frame);
         if (rc >= 0) {
@@ -471,6 +501,7 @@ void BinkDoFrame(X86 *c) {
                 break;
             }
             p->have_frame = true;
+            p->video_ms += host_millis() - decode_start;
             service_audio(rec, *p);
             return;
         }
@@ -500,6 +531,7 @@ void BinkDoFrame(X86 *c) {
         }
     }
     // Let a guest leave its playback loop after a fatal decoder error.
+    p->video_ms += host_millis() - decode_start;
     p->current = p->count;
     write_frame_count(rec, *p);
 }
@@ -554,6 +586,63 @@ void BinkGetSummary(X86 *c) {
     wr32(summary + 0x0c, (uint32_t)p->fps.num);
     wr32(summary + 0x10, (uint32_t)p->fps.den);
     wr32(summary + 0x20, p->count);
+}
+
+// _BinkGetRealtime@12(HBINK, BINKREALTIME*, u32 frames). The shipped Bink 1.0
+// DLL (binkw32.dll 0x30006380) writes a 0x38-byte record: FrameNum, FrameRate,
+// FrameRateDiv, Frames (the averaging window), FramesTime, VideoTime,
+// AudioTime, ReadForegroundTime, ReadIdleTime, ReadBackgroundTime, BlitTime,
+// BufferSize, BufferUsed and DataRate. The guest reads that whole layout after
+// this call to format a playback debug line (see docs/shims.md).
+//
+// FrameNum, FrameRate/FrameRateDiv and the window size come from the player's
+// real state. FramesTime is the pause-adjusted host clock; the stage times are
+// this shim's own measurements of demux, decode and blit work, so the
+// percentages stay consistent with real playback. Bink's per-frame history
+// arrays do not exist here, so ReadBackgroundTime is 0 and BufferUsed/DataRate
+// come from the compressed bytes actually read. SHIM(temporary).
+void BinkGetRealtime(X86 *c) {
+    set_eax(c, 0);
+    uint32_t rec = arg(c, 0), out = arg(c, 1), frames_arg = arg(c, 2);
+    BinkPlayer *p = player_for(rec);
+    if (!p || !out || !gm_valid(out, BINK_REALTIME_BYTES))
+        return;
+    uint64_t elapsed = p->elapsed_millis();
+    // Mirror the DLL's window clamp: a zero request means the whole file, and
+    // the window never exceeds the frame count.
+    uint32_t frames = frames_arg ? frames_arg : p->count;
+    if (p->count && frames > p->count)
+        frames = p->count;
+    if (!frames)
+        frames = 1;
+    uint64_t busy = p->video_ms + p->audio_ms + p->read_ms + p->blit_ms;
+    // The total is the greater of wall time and measured work so rounding a
+    // sub-millisecond call cannot make a stage percentage exceed 100.
+    uint64_t total = std::max<uint64_t>(elapsed, busy);
+    if (!total)
+        total = 1;
+    uint64_t idle = total - busy;
+    uint64_t rate = elapsed ? p->bytes_read * 1000 / elapsed : 0;
+    uint64_t used = std::min<uint64_t>(p->bytes_read, p->total_bytes);
+
+    wr32(out + 0x00, p->current);
+    wr32(out + 0x04, (uint32_t)p->fps.num);
+    wr32(out + 0x08, (uint32_t)p->fps.den);
+    wr32(out + 0x0c, frames);
+    wr32(out + 0x10, (uint32_t)total);
+    wr32(out + 0x14, (uint32_t)p->video_ms);
+    wr32(out + 0x18, (uint32_t)p->audio_ms);
+    wr32(out + 0x1c, (uint32_t)p->read_ms);
+    wr32(out + 0x20, (uint32_t)idle);
+    wr32(out + 0x24, 0); // a single-threaded shim has no background reader
+    wr32(out + 0x28, (uint32_t)p->blit_ms);
+    wr32(out + 0x2c, (uint32_t)std::min<uint64_t>(p->total_bytes, UINT32_MAX));
+    wr32(out + 0x30, (uint32_t)used);
+    wr32(out + 0x34, (uint32_t)std::min<uint64_t>(rate, UINT32_MAX));
+    log_once("bink.getrealtime",
+             "SHIM(temporary): _BinkGetRealtime@12 reports host-clock playback "
+             "accounting; stage times are measured by this shim, not Bink's own "
+             "per-frame accumulators");
 }
 
 // BinkGoto seeks to a frame (flags 0) so a guest can show one logo frame and
@@ -665,12 +754,14 @@ void BinkCopyToBuffer(X86 *c) {
         video_error("copy destination is outside guest memory or pitch");
         return;
     }
+    uint32_t blit_start = host_millis();
     for (uint32_t row = 0; row < rows; ++row)
         video_frame_convert_row(g_mem + start + row * pitch,
                                 p->frame->data[0] + (ptrdiff_t)row * p->frame->linesize[0],
                                 p->frame->data[1] + (ptrdiff_t)(row / 2) * p->frame->linesize[1],
                                 p->frame->data[2] + (ptrdiff_t)(row / 2) * p->frame->linesize[2],
                                 (uint32_t)p->frame->width, (VideoSurfaceType)type);
+    p->blit_ms += host_millis() - blit_start;
 }
 
 void BinkClose(X86 *c) {
@@ -754,6 +845,23 @@ void BinkGetSummary(X86 *c) {
     wr32(summary + 0x0c, 1);
     wr32(summary + 0x10, 1);
 }
+// The no-decoder record is already finished: report a zeroed realtime record
+// with a positive time base so the guest's percentage divisions stay defined.
+void BinkGetRealtime(X86 *c) {
+    set_eax(c, 0);
+    uint32_t rec = arg(c, 0), out = arg(c, 1);
+    if (!rec || !out || !gm_valid(out, BINK_REALTIME_BYTES))
+        return;
+    memset(g_mem + out, 0, BINK_REALTIME_BYTES);
+    wr32(out + 0x00, rd32(rec + 0x14));
+    wr32(out + 0x04, 1);
+    wr32(out + 0x08, 1);
+    wr32(out + 0x0c, 1);
+    wr32(out + 0x10, 1);
+    log_once("bink.getrealtime",
+             "SHIM(temporary): _BinkGetRealtime@12 reports a finished record on a "
+             "build without video decoding");
+}
 void BinkGoto(X86 *c) {
     // The no-decoder record is already finished; a seek is a no-op.
     ret0(c);
@@ -808,6 +916,7 @@ const ImportShim g_video_shims[] = {
     BINK(OpenDirectSound, 4, ret1),
     BINK(GetRects, 8, BinkGetRects),
     BINK(GetSummary, 8, BinkGetSummary),
+    BINK(GetRealtime, 12, BinkGetRealtime),
     BINK(Goto, 12, BinkGoto),
     BINK(Pause, 8, BinkPause),
     BINK(Open, 8, BinkOpen),

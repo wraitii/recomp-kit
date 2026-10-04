@@ -9198,6 +9198,73 @@ static void test_bink_handle_flag_errors() {
     CHECK(error && gm_str(error) == "memory-resident video is not supported");
 }
 
+// _BinkGetRealtime@12 fills the 0x38-byte BINKREALTIME record Process3dEngine
+// formats into its debug line. The arity and the null/unknown-player guard run
+// everywhere; the value checks need a decoded container (RECOMP_TEST_BINK_CONTAINER).
+static void test_bink_realtime() {
+    cpu_reset();
+    uint32_t realtime = tramp("binkw32.dll", "_BinkGetRealtime@12");
+    CHECK_EQ(imports_argc(realtime), 3u);
+
+    // A null or foreign handle must not write the output record.
+    uint32_t scratch = heap_alloc(0x38, true, 16);
+    CHECK(scratch != 0);
+    if (scratch) {
+        memset(g_mem + scratch, 0xa5, 0x38);
+        CHECK_EQ(call_shim(realtime, {0, scratch, 1}), 0u);
+        CHECK_EQ(call_shim(realtime, {0x12345678, scratch, 1}), 0u);
+        CHECK_EQ(rd32(scratch), 0xa5a5a5a5u);
+        heap_free(scratch);
+    }
+
+#ifdef RECOMP_HAVE_FFMPEG
+    with_bink_container([](uint32_t rec, uint32_t) {
+        uint32_t realtime = tramp("binkw32.dll", "_BinkGetRealtime@12");
+        uint32_t out = heap_alloc(0x38, true, 16);
+        CHECK(out != 0);
+        if (!out)
+            return;
+        memset(g_mem + out, 0xa5, 0x38);
+        CHECK_EQ(call_shim(realtime, {rec, out, 1}), 0u);
+        // Every dword of the 0x38-byte record must be written.
+        for (uint32_t off = 0; off < 0x38; off += 4)
+            CHECK(rd32(out + off) != 0xa5a5a5a5u);
+        uint32_t frame_num = rd32(out + 0x00);
+        uint32_t frame_rate = rd32(out + 0x04);
+        uint32_t frame_rate_div = rd32(out + 0x08);
+        uint32_t window = rd32(out + 0x0c);
+        uint32_t total = rd32(out + 0x10);
+        uint32_t video = rd32(out + 0x14);
+        uint32_t audio = rd32(out + 0x18);
+        uint32_t readfore = rd32(out + 0x1c);
+        uint32_t readidle = rd32(out + 0x20);
+        uint32_t readback = rd32(out + 0x24);
+        uint32_t blit = rd32(out + 0x28);
+        uint32_t buffer_size = rd32(out + 0x2c);
+        uint32_t buffer_used = rd32(out + 0x30);
+        CHECK_EQ(frame_num, rd32(rec + 0x14));
+        CHECK(frame_rate > 0 && frame_rate_div > 0);
+        CHECK_EQ(window, 1u);
+        CHECK(total >= 1);
+        // The measured stage times plus idle cover the host-clock total, so a
+        // percentage division can never exceed 100.
+        CHECK_EQ(video + audio + readfore + readidle + readback + blit, total);
+        CHECK_EQ(readback, 0u);
+        CHECK(buffer_size > 0);
+        CHECK(buffer_used <= buffer_size);
+        // A decoded frame advances the frame number the debug line prints.
+        call_shim(tramp("binkw32.dll", "_BinkDoFrame@4"), {rec});
+        call_shim(tramp("binkw32.dll", "_BinkNextFrame@4"), {rec});
+        CHECK_EQ(call_shim(realtime, {rec, out, 1}), 0u);
+        CHECK_EQ(rd32(out + 0x00), frame_num + 1);
+        CHECK_EQ(rd32(out + 0x00), rd32(rec + 0x14));
+        heap_free(out);
+    });
+#else
+    printf("bink realtime value test: video decoding disabled, skipped\n");
+#endif
+}
+
 static void test_bink_play() {
 #ifdef RECOMP_HAVE_FFMPEG
     const std::string path =
@@ -15035,6 +15102,7 @@ int main() {
         {"Bink play", test_bink_play},
         {"Bink open from handle", test_bink_open_from_handle},
         {"Bink handle flag errors", test_bink_handle_flag_errors},
+        {"Bink realtime", test_bink_realtime},
         {"Bink rects and pause", test_bink_rects_and_pause},
         {"Bink audio without service", test_bink_audio_without_service},
         {"Bink shutdown with open player", test_bink_shutdown_with_open_player},
