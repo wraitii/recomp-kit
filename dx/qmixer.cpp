@@ -579,16 +579,45 @@ bool read_wave_record(uint32_t rec, uint32_t flags, Wave *w, uint32_t *error) {
     return true;
 }
 
-void stop_channel(Channel *ch) {
+void complete_wave(X86 *c, uint32_t channel, const Channel::Pending &p, const char *why);
+
+// Delivers the completion callbacks detached by a stop.
+//
+// The real QMixer completes a channel's queued waves when it flushes, stops or
+// replaces it, and LHaudiodllR depends on that: its sample callback 0x102108c0
+// is the only thing that clears a sample's playing flag at +0x8c, so a wave
+// whose callback is dropped leaves SaySoundEffectPlaying true forever (the
+// Land1 FollowUs wait). Evidence in QMixer.dll: FlushChannel (0x18001810) and
+// StopChannel (0x18004990) reach fcn.1800a380, which calls fcn.1800c7d0; that
+// routine invokes the play-parameters callback stored on the voice node at
+// +0x5c with its context at +0x60. The flush/stop wrappers at 0x18007580 /
+// 0x18007520 walk the channel's pending wave list and call it for every node.
+// This runs on the guest thread that called the shim, the same context the
+// frame pump uses.
+void deliver_pending(X86 *c, uint32_t idx, std::deque<Channel::Pending> &finished,
+                     const char *why = "stopped") {
+    if (!c)
+        return;
+    for (const Channel::Pending &p : finished) {
+        ++counters().completions;
+        complete_wave(c, idx, p, why);
+    }
+}
+
+void stop_channel(X86 *c, Channel *ch, uint32_t idx) {
+    // Detach the callbacks before the reset so a callback that starts a new
+    // play on this channel is not wiped out by the reset below.
+    std::deque<Channel::Pending> finished;
+    finished.swap(ch->pending);
     if (ch->playing && ch->audio_channel >= 0)
         host_audio_stop(ch->audio_channel);
     ch->playing = false;
-    ch->pending.clear();
     ch->voice_total = 0;
     ch->stream_wave = 0;
     ch->stream_submitted = 0;
     ch->stream_ended = false;
     ch->stream_feed = Channel::FEED_UNKNOWN;
+    deliver_pending(c, idx, finished);
 }
 
 // ---------------------------------------------------------------------------
@@ -814,8 +843,8 @@ void QSWaveMixActivate(X86 *c) {
     }
     s->active = arg(c, 1) != 0;
     if (!s->active)
-        for (Channel &ch : channels())
-            stop_channel(&ch);
+        for (size_t i = 0; i < channels().size(); ++i)
+            stop_channel(c, &channels()[i], (uint32_t)i);
     set_eax(c, QS_OK);
 }
 
@@ -895,8 +924,9 @@ void QSWaveMixCloseSession(X86 *c) {
         set_eax(c, QS_ERROR);
         return;
     }
-    for (Channel &ch : channels()) {
-        stop_channel(&ch);
+    for (size_t i = 0; i < channels().size(); ++i) {
+        Channel &ch = channels()[i];
+        stop_channel(c, &ch, (uint32_t)i);
         if (ch.audio_channel >= 0) {
             dx_free_audio_channel(ch.audio_channel);
             ch.audio_channel = -1;
@@ -1141,7 +1171,19 @@ void QSWaveMixOpenWaveEx(X86 *c) {
         set_eax(c, 0);
         return;
     }
+    // The handle is the wave's leading WAVEFORMATEX (tag, channels, rate, avg
+    // bytes/s, block align, bits). The engine reads it directly: HelpDude's
+    // PlaySample (runblack 0x5bb530) divides a clip's byte count by
+    // 2 * [handle + 2] (nChannels) to get its length, and a zero there is a
+    // divide error that left every spoken sentence with the wrong duration.
+    // SHIM(temporary): the fields past +14 of the real header are unknown.
+    wr16(h + 0, 1); // WAVE_FORMAT_PCM: compressed waves are refused before here
+    wr16(h + 2, (uint16_t)w.channels);
     wr32(h + 4, w.rate);
+    const uint32_t block_align = w.channels * (w.bits / 8 ? w.bits / 8 : 1);
+    wr32(h + 8, w.rate * block_align);
+    wr16(h + 12, (uint16_t)block_align);
+    wr16(h + 14, (uint16_t)w.bits);
     waves().push_back(w);
     waves().back().handle = h;
     wave_index()[h] = waves().size() - 1;
@@ -1160,14 +1202,22 @@ void QSWaveMixFreeWave(X86 *c) {
         set_eax(c, QS_ERROR);
         return;
     }
+    // Invalidate the wave before any completion callback runs. The music-chunk
+    // callback 0x1020dc80 calls QSWaveMixFreeWave on its own wave; the real
+    // mixer tolerates that because it unlinks the node from the channel before
+    // the callback runs. Here the erase makes a recursive free a clean failure.
+    const uint32_t handle = w->handle;
+    w->alive = false;
+    wave_index().erase(handle);
     // A channel still playing this wave has to stop: the sample memory is the
     // guest's and it may reuse it the moment this returns.
-    for (Channel &ch : channels()) {
-        if (ch.playing && ch.wave == w->handle)
-            stop_channel(&ch);
+    for (size_t i = 0; i < channels().size(); ++i) {
+        Channel &ch = channels()[i];
+        if (ch.playing && ch.wave == handle)
+            stop_channel(c, &ch, (uint32_t)i);
         // And any channel still naming it as its stream, playing or not: the
         // buffer is about to go and the pump would read it next frame.
-        if (ch.stream_wave == w->handle) {
+        if (ch.stream_wave == handle) {
             ch.stream_wave = 0;
             ch.stream_submitted = 0;
         }
@@ -1186,9 +1236,7 @@ void QSWaveMixFreeWave(X86 *c) {
         w->pcm = 0;
         w->bytes = 0;
     }
-    w->alive = false;
-    wave_index().erase(w->handle);
-    heap_free(w->handle);
+    heap_free(handle);
     set_eax(c, QS_OK);
 }
 
@@ -1214,7 +1262,7 @@ bool read_play_callback(uint32_t params, uint32_t *cb, uint32_t *ctx) {
 }
 
 // Calls the guest's completion callback for one finished wave.
-void complete_wave(X86 *c, uint32_t channel, const Channel::Pending &p) {
+void complete_wave(X86 *c, uint32_t channel, const Channel::Pending &p, const char *why) {
     if (p.callback)
         guest_call(c, p.callback, channel, p.wave, p.context);
 }
@@ -1236,7 +1284,11 @@ void pump_completions(X86 *c) {
                 break;
             ch.pending.pop_front();
             ++counters().completions;
-            complete_wave(c, (uint32_t)i, front);
+            char why[96];
+            snprintf(why, sizeof why, "played out: remaining %llu of %llu, end %u, played %llu",
+                     (unsigned long long)remaining, (unsigned long long)ch.voice_total, front.end,
+                     (unsigned long long)played);
+            complete_wave(c, (uint32_t)i, front, why);
         }
     }
 }
@@ -1362,15 +1414,30 @@ void QSWaveMixPlayEx(X86 *c) {
 
     uint32_t cb = 0, ctx = 0;
     const bool cb_ok = read_play_callback(arg(c, 5), &cb, &ctx);
-    // QMIX_QUEUEWAVE (inferred flag 0x400): the wave plays after whatever is
-    // already sounding on this channel instead of replacing it. Evidence: the
-    // game starts a piece of music as consecutive 2.2 s chunk waves on one
-    // channel within 105 ms, every PlayEx with flags 0x400 (LHaudiodllR
-    // 0x1020f4ca), with steadily rising peaks; replacing made only the last
-    // ~100 ms of the first chunk audible. The flag value's name is from memory
-    // of the SDK header, the behaviour from this use. SHIM(temporary): only
-    // same-format waves are appended; a different format replaces, loudly.
-    if ((flags & 0x400u) && ch->playing && host_audio_voice_remaining_bytes(ch->audio_channel)) {
+    // Queueing rule. QMixer.dll alone does not settle it: the exported PlayEx
+    // stores dwFlags verbatim into the channel at +0x3c (0x1800bff0, from
+    // PlayEx arg2), and the insert routine then tests bit 0x8 of that word
+    // (18006027: mov edx,[ebx+0x3c] / shr edx,3 / testb $0x1,dl). But no code
+    // anywhere tests the 0x20 or 0x400 bits, and bit 0x8 is never passed by
+    // this game. The two call sites pin the intended behavior instead:
+    //
+    //   ordinary samples: 0x421 (LHaudiodllR 0x1021293b, 0x1020527b)
+    //   music chunks:     0x400 (LHaudiodllR 0x1020f4ca)
+    //
+    // Speech/SFX must replace the voice. Appending a speech wave computes its
+    // completion end against the earlier sound's total, so its callback runs
+    // when that sound ends, clears the sample's playing flag at +0x8c and lets
+    // the subtitle advance. Music chunks must append back-to-back or only the
+    // last one is heard. The difference is bit 0x1 (set in 0x421, clear in
+    // 0x400), so the fit is:
+    //
+    //   queue = (flags & 0x400) && !(flags & 0x1)
+    //
+    // DIVERGENCE(original): this rule is a fit of the two call sites, not the
+    // library's own bit 0x8 test; documented pending a cleaner read of QMixer.
+    // Only same-format waves are appended; a different format replaces, loudly.
+    if ((flags & 0x400u) && !(flags & 0x1u) && ch->playing &&
+        host_audio_voice_remaining_bytes(ch->audio_channel)) {
         const uint32_t rate = ch->frequency ? ch->frequency : w->rate;
         if (rate == ch->voice_rate && w->channels == ch->voice_channels &&
             w->bits == ch->voice_bits &&
@@ -1382,8 +1449,9 @@ void QSWaveMixPlayEx(X86 *c) {
             ++counters().play_delivered;
             ++counters().play_queued_static;
             log_once("qmixer.queue",
-                     "qmixer: PlayEx flag 0x400 treated as QUEUEWAVE: the wave is appended to "
-                     "the channel's playing sound (inferred from use, see docs/shims.md)");
+                     "qmixer: PlayEx flags 0x400 without 0x1 are treated as QUEUEWAVE: the "
+                     "wave is appended to the channel's playing sound (fit of the two "
+                     "call sites, see docs/shims.md)");
             set_eax(c, QS_OK);
             return;
         }
@@ -1410,18 +1478,19 @@ void QSWaveMixPlayEx(X86 *c) {
     ch->voice_rate = (uint32_t)p.sample_rate;
     ch->voice_channels = w->channels;
     ch->voice_bits = w->bits;
-    // A new voice replaces what was playing: those waves' callbacks are not
-    // called (they would run the guest's accounting for sounds that never
-    // finished), and the new wave is the first of the voice.
-    ch->pending.clear();
+    // A new voice replaces what was playing. The real mixer finishes the
+    // replaced wave (its pending node is unlinked and its callback invoked;
+    // QMixer 0x180060f0 -> fcn.18007580), so the replaced callbacks are run
+    // after the new play is in place rather than dropped.
+    std::deque<Channel::Pending> replaced;
+    replaced.swap(ch->pending);
     ch->voice_total = w->bytes;
     if (cb_ok)
         ch->pending.push_back({w->handle, (uint32_t)w->bytes, cb, ctx});
     ++counters().host_plays;
     ++counters().play_delivered;
     ch->playing = true;
-    LOGV("qmixer: play wave %08x on channel %u (flags %08x, loops %u)", w->handle, idx, flags,
-         loops);
+    deliver_pending(c, idx, replaced, "replaced");
     set_eax(c, QS_OK);
 }
 
@@ -1435,7 +1504,7 @@ void QSWaveMixStopChannel(X86 *c) {
         set_eax(c, QS_ERROR);
         return;
     }
-    stop_channel(ch);
+    stop_channel(c, ch, arg(c, 1));
     set_eax(c, QS_OK);
 }
 
@@ -1695,7 +1764,7 @@ void QSWaveMixFlushChannel(X86 *c) {
         set_eax(c, QS_ERROR);
         return;
     }
-    stop_channel(ch);
+    stop_channel(c, ch, arg(c, 1));
     log_once("qmixer.flush",
              "SHIM(temporary): QSWaveMixFlushChannel is modelled as stop_channel; whether the "
              "real mixer also frees the channel's wave association is unverified");
@@ -1703,11 +1772,33 @@ void QSWaveMixFlushChannel(X86 *c) {
 }
 
 // QSWaveMixGetPlayPosition(hMix, iChannel, lpPlayPos, lpWritePos, dwFlags).
-// Guest call site LHaudiodllR 0x1020f385 pushes five words (hMix, iChannel,
-// two guest output pointers, flag 1). The host mix is rendered offline and its
-// cursor is not reported back, so the two output dwords are zeroed to keep the
-// guest from reading uninitialised memory. SHIM(temporary): the play cursor is
-// not reconstructed; a real implementation reads the host voice position.
+//
+// Guest call sites LHaudiodllR 0x1020f385 and 0x10214c5a push five words
+// (hMix, iChannel, two guest output pointers, a unit selector). QMixer.dll
+// 0x18002ca0 -> 0x18008970 -> 0x1800c590 settles the outputs:
+//
+//   *lpPlayPos = obj[+0x40]                                (sample frames)
+//   *lpWritePos = flags & 3 == 0 ? frames * nBlockAlign    (bytes)
+//                 flags & 3 == 1 ? frames                  (sample frames)
+//                 flags & 3 == 2 ? frames*1000/nSamplesPerSec, rounded (ms)
+//                 flags & 3 == 3 ? 0
+//
+// The ms form is the signed 64-bit helper at 0x1802cb20, called from
+// 0x18024450 as (frames, 1000, nSamplesPerSec): (frames*1000 + rate/2) / rate.
+// When the channel has no voice object (obj[+0xe4] == 0, i.e. after a
+// Stop/Flush) 0x1800c590 still writes the retained frame cursor to *lpPlayPos
+// but zeroes *lpWritePos regardless of the selector.
+//
+// This is the fix for the advisor speech being cut off about half a second
+// after it starts. HelpDude::ApplyLipSync (runblack 0x5bcd00) calls
+// LHSampleGetPlayPosition (LHaudiodllR 0x10214c00) and, when that returns
+// negative, calls StopSentence once the sentence has been playing for 0.5 s.
+// That wrapper calls this function with flags 2 and then tests the QMixer
+// *lpPlayPos dword (0x10214c56..0x10214c70) and returns -1 when it is zero;
+// only a nonzero play position returns the millisecond value. The old shim
+// zeroed both outputs, so every query read as "not started yet" and the
+// sentence was abandoned half a second in. Reporting the real host cursor
+// makes the frame position nonzero and lets the lip-sync run.
 void QSWaveMixGetPlayPosition(X86 *c) {
     QTRACE("qmixer: QSWaveMixGetPlayPosition(%08x, %u, %08x, %08x, %08x, %08x)", arg(c, 0),
            arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5));
@@ -1717,14 +1808,43 @@ void QSWaveMixGetPlayPosition(X86 *c) {
         set_eax(c, QS_ERROR);
         return;
     }
-    uint32_t a = arg(c, 2), b = arg(c, 3);
-    if (a && gm_valid(a, 4))
-        wr32(a, 0);
-    if (b && gm_valid(b, 4))
-        wr32(b, 0);
-    log_once("qmixer.playpos",
-             "SHIM(temporary): QSWaveMixGetPlayPosition zeroes the two output positions; the "
-             "host play cursor is not reported");
+    // host_audio_position is the voice cursor in bytes of the voice format. It
+    // is cumulative across a queued chunk, retained across a stop (which is
+    // what a paused or flushed channel reads) and saturates at the sound's
+    // length when a one-shot finishes.
+    uint32_t pos_bytes = 0;
+    if (ch->audio_channel >= 0)
+        pos_bytes = host_audio_position(ch->audio_channel);
+    uint32_t frame_bytes = ch->voice_channels * (ch->voice_bits / 8);
+    if (!frame_bytes)
+        frame_bytes = 1;
+    const uint32_t rate = ch->voice_rate ? ch->voice_rate : 1;
+    const uint32_t frames = pos_bytes / frame_bytes;
+    // Only a live voice has a write cursor; a stopped or flushed one reports 0
+    // exactly as the real mixer does once the voice object is gone.
+    uint32_t write = 0;
+    if (ch->playing) {
+        switch (arg(c, 4) & 3u) {
+        case 0:
+            write = frames * frame_bytes;
+            break;
+        case 1:
+            write = frames;
+            break;
+        case 2:
+            write = (uint32_t)(((uint64_t)frames * 1000u + rate / 2u) / rate);
+            break;
+        case 3:
+        default:
+            write = 0;
+            break;
+        }
+    }
+    const uint32_t play_addr = arg(c, 2), write_addr = arg(c, 3);
+    if (play_addr && gm_valid(play_addr, 4))
+        wr32(play_addr, frames);
+    if (write_addr && gm_valid(write_addr, 4))
+        wr32(write_addr, write);
     set_eax(c, QS_OK);
 }
 

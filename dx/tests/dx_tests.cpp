@@ -9386,6 +9386,266 @@ static void test_qmixer() {
     CHECK_EQ(call_shim(close, {hmix}), 0u);
 }
 
+// QMixer completes a channel's queued waves when it is flushed, stopped or
+// replaced. FlushChannel (0x18001810) and StopChannel (0x18004990) both reach
+// fcn.1800a380 -> fcn.1800c7d0, which invokes the play-parameters callback
+// stored on the voice node at +0x5c with its context at +0x60. FreeWave
+// (0x180018c0 -> fcn.180075c0 -> fcn.18007790 -> fcn.1800a380) does the same,
+// and a replaced wave's node is finished by the play setup (0x180060f0).
+//
+// LHaudiodllR depends on this: its sample callback 0x102108c0 is the only
+// thing that clears a sample's playing flag at +0x8c, so a dropped callback
+// leaves GScript::SaySoundEffectPlaying true forever and the Land1 FollowUs
+// wait never clears.
+static uint32_t g_complete_calls = 0;
+static uint32_t g_complete_arg0 = 0, g_complete_arg1 = 0, g_complete_arg2 = 0;
+
+static void test_qmixer_completes_on_stop_replace_free() {
+    cpu_reset();
+    qmixer_reset();
+    g_plays.clear();
+    g_complete_calls = 0;
+
+    uint32_t hmix = call_shim(tramp("QMIXER.dll", "QSWaveMixInitEx"), {0});
+    CHECK(hmix != 0);
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixActivate"), {hmix, 1}), 0u);
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixOpenChannel"), {hmix, 2, 2}), 0u);
+
+    uint32_t wfx = sc(0x200);
+    gm_zero(wfx, SDK_WAVEFORMATEX);
+    wr16(wfx + WFX_OFF_wFormatTag, WAVE_FORMAT_PCM);
+    wr16(wfx + WFX_OFF_nChannels, 1);
+    wr32(wfx + WFX_OFF_nSamplesPerSec, 22050);
+    wr32(wfx + WFX_OFF_nAvgBytesPerSec, 22050);
+    wr16(wfx + WFX_OFF_nBlockAlign, 1);
+    wr16(wfx + WFX_OFF_wBitsPerSample, 8);
+
+    uint32_t pcm = sc(0x400);
+    for (uint32_t i = 0; i < 64; ++i)
+        wr8(pcm + i, (uint8_t)i);
+
+    uint32_t owd = sc(0x300);
+    gm_zero(owd, QSWAVEMIXOPENWAVEDATA_SIZE);
+    wr32(owd + QSOWD_OFF_lpFormat, wfx);
+    wr32(owd + QSOWD_OFF_lpData, pcm);
+    wr32(owd + QSOWD_OFF_dwDataSize, 64);
+
+    static uint32_t cb = imports_alloc_trampoline(
+        "TEST", "StopComplete",
+        [](X86 *c) {
+            ++g_complete_calls;
+            g_complete_arg0 = arg(c, 0);
+            g_complete_arg1 = arg(c, 1);
+            g_complete_arg2 = arg(c, 2);
+        },
+        3);
+
+    uint32_t open_wave = tramp("QMIXER.dll", "QSWaveMixOpenWaveEx");
+    uint32_t hwave = call_shim(open_wave, {hmix, owd, 8});
+    CHECK(hwave != 0);
+
+    uint32_t params = sc(0x500);
+    gm_zero(params, 0x28);
+    wr32(params + 0x00, 0x28);
+    wr32(params + 0x0c, cb);
+    wr32(params + 0x10, 0xBEEF0000u);
+
+    uint32_t play = tramp("QMIXER.dll", "QSWaveMixPlayEx");
+    CHECK_EQ(call_shim(play, {hmix, 1, 0x20, hwave, 0, params}), 0u);
+    CHECK_EQ(g_complete_calls, 0u);
+
+    // The flush path LHSampleStopAll uses (0x10212bf0 pushes flags 0).
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixFlushChannel"), {hmix, 1, 0}), 0u);
+    CHECK_EQ(g_complete_calls, 1u);
+    CHECK_EQ(g_complete_arg0, 1u);
+    CHECK_EQ(g_complete_arg1, hwave);
+    CHECK_EQ(g_complete_arg2, 0xBEEF0000u);
+
+    // The stop path.
+    CHECK_EQ(call_shim(play, {hmix, 1, 0x20, hwave, 0, params}), 0u);
+    CHECK_EQ(g_complete_calls, 1u);
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixStopChannel"), {hmix, 1, 0}), 0u);
+    CHECK_EQ(g_complete_calls, 2u);
+
+    // A replaced wave: a second PlayEx while the channel's voice is live.
+    CHECK_EQ(call_shim(play, {hmix, 1, 0x20, hwave, 0, params}), 0u);
+    CHECK_EQ(g_complete_calls, 2u);
+    CHECK_EQ(call_shim(play, {hmix, 1, 0x20, hwave, 0, params}), 0u);
+    CHECK_EQ(g_complete_calls, 3u);
+
+    // FreeWave completes the playing wave as well.
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixFreeWave"), {hmix, hwave}), 0u);
+    CHECK_EQ(g_complete_calls, 4u);
+
+    qmixer_reset();
+}
+
+// The queue rule is queue = (flags & 0x400) && !(flags & 0x1). The game's
+// ordinary samples pass 0x421 (LHaudiodllR 0x1021293b, 0x1020527b) and must
+// replace the voice: appending a speech wave computes its completion end
+// against the earlier sound's total, so its callback runs when that sound ends,
+// clears the sample's playing flag and advances the subtitle. Music chunks pass
+// 0x400 (0x1020f4ca) and must append. This asserts both against the host.
+static void test_qmixer_queue_flag_rules() {
+    cpu_reset();
+    qmixer_reset();
+    g_plays.clear();
+    g_queues.clear();
+    g_queue_enabled = true;
+    g_queue_retired = false;
+    g_ch_loop.clear();
+
+    uint32_t hmix = call_shim(tramp("QMIXER.dll", "QSWaveMixInitEx"), {0});
+    CHECK(hmix != 0);
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixActivate"), {hmix, 1}), 0u);
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixOpenChannel"), {hmix, 2, 2}), 0u);
+
+    uint32_t wfx = sc(0x200);
+    gm_zero(wfx, SDK_WAVEFORMATEX);
+    wr16(wfx + WFX_OFF_wFormatTag, WAVE_FORMAT_PCM);
+    wr16(wfx + WFX_OFF_nChannels, 1);
+    wr32(wfx + WFX_OFF_nSamplesPerSec, 22050);
+    wr32(wfx + WFX_OFF_nAvgBytesPerSec, 22050);
+    wr16(wfx + WFX_OFF_nBlockAlign, 1);
+    wr16(wfx + WFX_OFF_wBitsPerSample, 8);
+
+    uint32_t pcm = sc(0x400);
+    for (uint32_t i = 0; i < 64; ++i)
+        wr8(pcm + i, (uint8_t)i);
+
+    uint32_t owd = sc(0x300);
+    gm_zero(owd, QSWAVEMIXOPENWAVEDATA_SIZE);
+    wr32(owd + QSOWD_OFF_lpFormat, wfx);
+    wr32(owd + QSOWD_OFF_lpData, pcm);
+    wr32(owd + QSOWD_OFF_dwDataSize, 64);
+
+    uint32_t hwave = call_shim(tramp("QMIXER.dll", "QSWaveMixOpenWaveEx"), {hmix, owd, 8});
+    CHECK(hwave != 0);
+    // The engine reads the handle as a WAVEFORMATEX prefix: HelpDude::PlaySample
+    // (runblack 0x5bb530) divides by 2 * nChannels at +2, so zero is a divide error.
+    CHECK_EQ(rd16(hwave + 0), (uint32_t)WAVE_FORMAT_PCM);
+    CHECK_EQ(rd16(hwave + 2), 1u);
+    CHECK_EQ(rd32(hwave + 4), 22050u);
+    CHECK_EQ(rd32(hwave + 8), 22050u);
+    CHECK_EQ(rd16(hwave + 12), 1u);
+    CHECK_EQ(rd16(hwave + 14), 8u);
+
+    uint32_t play = tramp("QMIXER.dll", "QSWaveMixPlayEx");
+    // First play starts the voice; the second, with the game's own 0x421, must
+    // replace it rather than queue, even though the voice is still busy.
+    CHECK_EQ(call_shim(play, {hmix, 1, 0x421, hwave, 0, 0}), 0u);
+    CHECK_EQ(g_plays.size(), 1u);
+    CHECK_EQ(g_queues.size(), 0u);
+    CHECK_EQ(call_shim(play, {hmix, 1, 0x421, hwave, 0, 0}), 0u);
+    CHECK_EQ(g_plays.size(), 2u);
+    CHECK_EQ(g_queues.size(), 0u);
+
+    // The music flag 0x400 (without 0x1) joins the playing voice.
+    CHECK_EQ(call_shim(play, {hmix, 1, 0x400, hwave, 0, 0}), 0u);
+    CHECK_EQ(g_plays.size(), 2u);
+    CHECK_EQ(g_queues.size(), 1u);
+
+    qmixer_reset();
+    g_queue_enabled = false;
+}
+
+// QSWaveMixGetPlayPosition reports the voice cursor in the units the selector
+// picks. LHaudiodllR 0x10214c00 calls it with selector 2 and uses the *lpPlayPos
+// output as a gate: it returns -1 when that frame cursor is zero, which is what
+// stopped advisor speech half a second in. These assert the frame/byte/ms
+// conversions against QMixer.dll 0x1800c590 and 0x1802cb20, plus the queued,
+// paused and stopped cases.
+static void test_qmixer_play_position() {
+    cpu_reset();
+    qmixer_reset();
+    g_plays.clear();
+    g_queues.clear();
+    g_queue_enabled = true;
+    g_queue_retired = false;
+    g_ch_loop.clear();
+    g_test_audio_pos = 0;
+
+    uint32_t hmix = call_shim(tramp("QMIXER.dll", "QSWaveMixInitEx"), {0});
+    CHECK(hmix != 0);
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixActivate"), {hmix, 1}), 0u);
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixOpenChannel"), {hmix, 1, 2}), 0u);
+
+    // 22050 Hz, stereo, 16 bit: four bytes to a sample frame.
+    uint32_t wfx = sc(0x200);
+    gm_zero(wfx, SDK_WAVEFORMATEX);
+    wr16(wfx + WFX_OFF_wFormatTag, WAVE_FORMAT_PCM);
+    wr16(wfx + WFX_OFF_nChannels, 2);
+    wr32(wfx + WFX_OFF_nSamplesPerSec, 22050);
+    wr32(wfx + WFX_OFF_nAvgBytesPerSec, 22050 * 4);
+    wr16(wfx + WFX_OFF_nBlockAlign, 4);
+    wr16(wfx + WFX_OFF_wBitsPerSample, 16);
+
+    uint32_t pcm = sc(0x400);
+    for (uint32_t i = 0; i < 64; ++i)
+        wr8(pcm + i, (uint8_t)i);
+
+    uint32_t owd = sc(0x300);
+    gm_zero(owd, QSWAVEMIXOPENWAVEDATA_SIZE);
+    wr32(owd + QSOWD_OFF_lpFormat, wfx);
+    wr32(owd + QSOWD_OFF_lpData, pcm);
+    wr32(owd + QSOWD_OFF_dwDataSize, 64);
+
+    uint32_t hwave = call_shim(tramp("QMIXER.dll", "QSWaveMixOpenWaveEx"), {hmix, owd, 8});
+    CHECK(hwave != 0);
+
+    uint32_t play = tramp("QMIXER.dll", "QSWaveMixPlayEx");
+    CHECK_EQ(call_shim(play, {hmix, 0, 0x421, hwave, 0, 0}), 0u);
+
+    uint32_t playp = sc(0x600), writep = sc(0x604);
+    uint32_t getpos = tramp("QMIXER.dll", "QSWaveMixGetPlayPosition");
+
+    // 400 bytes is 100 sample frames, 5 ms at 22050 Hz (rounded).
+    g_test_audio_pos = 400;
+    wr32(playp, 0xdeadbeefu);
+    wr32(writep, 0xdeadbeefu);
+    CHECK_EQ(call_shim(getpos, {hmix, 0, playp, writep, 0}), 0u);
+    CHECK_EQ(rd32(playp), 100u);  // sample frames, always
+    CHECK_EQ(rd32(writep), 400u); // selector 0: bytes
+
+    CHECK_EQ(call_shim(getpos, {hmix, 0, playp, writep, 1}), 0u);
+    CHECK_EQ(rd32(playp), 100u);
+    CHECK_EQ(rd32(writep), 100u); // selector 1: sample frames
+
+    // (100*1000 + 22050/2) / 22050 = 111025 / 22050 = 5.
+    CHECK_EQ(call_shim(getpos, {hmix, 0, playp, writep, 2}), 0u);
+    CHECK_EQ(rd32(playp), 100u);
+    CHECK_EQ(rd32(writep), 5u); // selector 2: milliseconds, rounded
+
+    CHECK_EQ(call_shim(getpos, {hmix, 0, playp, writep, 3}), 0u);
+    CHECK_EQ(rd32(playp), 100u);
+    CHECK_EQ(rd32(writep), 0u); // selector 3: no write cursor
+
+    // A queued chunk extends the voice; the cursor is cumulative, not reset.
+    CHECK_EQ(call_shim(play, {hmix, 0, 0x400, hwave, 0, 0}), 0u);
+    CHECK_EQ(g_queues.size(), 1u);
+    g_test_audio_pos = 800;
+    CHECK_EQ(call_shim(getpos, {hmix, 0, playp, writep, 1}), 0u);
+    CHECK_EQ(rd32(playp), 200u);
+    CHECK_EQ(rd32(writep), 200u);
+
+    // A paused voice keeps the cursor where the host stopped it.
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixPauseChannel"), {hmix, 0, 0}), 0u);
+    CHECK_EQ(call_shim(getpos, {hmix, 0, playp, writep, 2}), 0u);
+    CHECK_EQ(rd32(playp), 200u);
+    CHECK_EQ(rd32(writep), 9u); // (200*1000 + 11025) / 22050 = 9
+
+    // A stopped/flushed voice has lost its write cursor but keeps the frame
+    // position, which is what 0x1800c590 does once obj[+0xe4] is cleared.
+    CHECK_EQ(call_shim(tramp("QMIXER.dll", "QSWaveMixFlushChannel"), {hmix, 0, 0}), 0u);
+    CHECK_EQ(call_shim(getpos, {hmix, 0, playp, writep, 1}), 0u);
+    CHECK_EQ(rd32(playp), 200u);
+    CHECK_EQ(rd32(writep), 0u);
+
+    qmixer_reset();
+    g_test_audio_pos = 0;
+    g_queue_enabled = false;
+}
+
 // weanetr: both network bring-up paths report unavailable so the game runs
 // single-player, and GetCurrentMs is a real clock.
 static void test_weanetr() {
@@ -11775,10 +12035,12 @@ static void test_qmixer_refill_gate() {
 // gain of 0.433 and about -7.3 dB; read as hundredths of a decibel, as it was,
 // every positive number clamped to unity and every sound played at full
 // volume with no mix at all.
-// PlayEx flag 0x400 (QUEUEWAVE, inferred from the game's chunked music): a wave
-// started with it on a channel that is still sounding is appended to that sound
-// instead of replacing it. A wave in another format cannot be appended and
-// replaces, as logged.
+// The queue rule is the fit of the two call sites: queue = (flags & 0x400) &&
+// !(flags & 0x1). Music chunks pass 0x400 and append back-to-back; ordinary
+// samples pass 0x421 (bit 0x1 set) and replace. A wave in another format cannot
+// be appended and replaces, as logged. QMixer.dll stores dwFlags verbatim at
+// +0x3c and only tests bit 0x8 there, which neither call site sets, so the
+// library alone does not settle it (see docs/shims.md).
 static void test_qmixer_queue_wave() {
     cpu_reset();
     qmixer_reset();
@@ -11815,8 +12077,8 @@ static void test_qmixer_queue_wave() {
     CHECK_EQ(g_plays.size(), 1u); // appended, not replaced
     CHECK_EQ(g_queues.size(), 1u);
     CHECK_EQ(g_queues[0].bytes, 32u);
-    // Without the flag a play still replaces.
-    CHECK_EQ(call_shim(play, {hmix, 5, 0x0, b, 0, 0}), 0u);
+    // The game's ordinary 0x421 sets bit 0x1, so it clears and replaces.
+    CHECK_EQ(call_shim(play, {hmix, 5, 0x421, b, 0, 0}), 0u);
     CHECK_EQ(g_plays.size(), 2u);
     // A different format cannot be appended and replaces.
     CHECK_EQ(call_shim(play, {hmix, 5, 0x400, c2, 0, 0}), 0u);
@@ -14755,6 +15017,9 @@ int main() {
         {"DirectSound8", test_dsound8},
         {"DirectInput", test_dinput},
         {"QMixer", test_qmixer},
+        {"QMixer stop completes wave", test_qmixer_completes_on_stop_replace_free},
+        {"QMixer queue flag rules", test_qmixer_queue_flag_rules},
+        {"QMixer play position", test_qmixer_play_position},
         {"FMOD samples", test_fmod},
         {"FMOD streams", test_fmod_stream},
         {"Soundlib MIDI", test_soundlib_stub},

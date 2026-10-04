@@ -1065,24 +1065,38 @@ extern "C" void host_audio_queue_report(void *file) {
 // How much of what this voice is playing is still to play - the sound itself
 // included, whether it arrived with a Play, was re-issued by a conversion, or
 // replaced what was there before.
+static uint32_t audio_advance(int32_t id, bool *playing_out);
+
 extern "C" uint32_t host_audio_voice_remaining_bytes(int32_t id) {
     if (id < 0 || id >= MAX_AUDIO_CHANNELS)
         return 0;
     std::lock_guard<std::mutex> api(g_api_mutex);
+    {
+        DataLock held;
+        Channel *channel = channel_for(id, false);
+        if (!channel || !channel->playing)
+            return 0;
+        const uint64_t appended = g_queued_total[id].load(std::memory_order_acquire);
+        if (channel->streaming) {
+            const uint64_t holding = (uint64_t)channel->stream_head + appended;
+            const uint64_t played = g_ops ? g_queued_played[id].load(std::memory_order_acquire)
+                                          : stream_played_locked(*channel);
+            return holding > played ? (uint32_t)(holding - played) : 0;
+        }
+    }
+    // A one-shot voice: `cursor` is only the start position until something
+    // asks where the play cursor is, so advance it from the audio clock first.
+    // Without this the answer never changed and a finished sound never read as
+    // finished (its completion callback, which clears the game's playing flag,
+    // never ran).
+    bool playing = false;
+    const uint32_t at = audio_advance(id, &playing);
     DataLock held;
     Channel *channel = channel_for(id, false);
     if (!channel || !channel->playing)
         return 0;
-    const uint64_t appended = g_queued_total[id].load(std::memory_order_acquire);
-    if (channel->streaming) {
-        const uint64_t holding = (uint64_t)channel->stream_head + appended;
-        const uint64_t played = g_ops ? g_queued_played[id].load(std::memory_order_acquire)
-                                      : stream_played_locked(*channel);
-        return holding > played ? (uint32_t)(holding - played) : 0;
-    }
     const uint32_t total = (uint32_t)channel->pcm.size();
-    const uint32_t at = channel->cursor < total ? channel->cursor : total;
-    return total - at;
+    return total > at ? total - at : 0;
 }
 
 // Append PCM in the channel format established by Play and return accepted bytes.
