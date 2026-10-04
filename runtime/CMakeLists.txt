@@ -4,7 +4,7 @@ set(POP_RUNTIME_SOURCES
   memory.cpp loader.cpp imports.cpp cpu.cpp thunks.cpp seh.cpp profile.cpp kernel32.cpp kernel32_wide.cpp
   resources.cpp oleaut32.cpp mods_seam.cpp user32.cpp user32_wide.cpp user32_vcl.cpp user32_static.cpp
   misc.cpp misc_dlls.cpp comctl32.cpp gdi32.cpp gdi32_draw.cpp gdi32_text.cpp gdi32_truetype.cpp msimg32.cpp
-  media_foundation.cpp layout.cpp interp.cpp discovery.cpp imagehlp.cpp)
+  media_foundation.cpp layout.cpp interp.cpp discovery.cpp imagehlp.cpp call_trace.cpp)
 
 # The faces the runtime's GDI draws Windows' own UI fonts with
 # (third_party/fonts/opensans/README.md), embedded as byte arrays.
@@ -64,6 +64,18 @@ foreach(entry_test entry_dispatch_tests entry_dispatch_nohooks_tests)
 endforeach()
 target_compile_definitions(entry_dispatch_nohooks_tests PRIVATE RECOMP_NO_HOOKS=1)
 add_custom_target(dispatch_tests DEPENDS entry_dispatch_tests entry_dispatch_nohooks_tests)
+
+# The env-gated guest call tracer, against the game-free fixture. call_trace
+# lives in recomp_runtime with weak table fallbacks; the fixture's strong tables
+# override them and provide real entry dispatch to hook.
+add_executable(call_trace_tests tests/call_trace_tests.cpp ${ENTRY_FIXTURE_SOURCES} tests/stub_recomp_call.cpp)
+target_include_directories(call_trace_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${ENTRY_FIXTURE_DIR})
+target_link_libraries(call_trace_tests PRIVATE recomp_platform recomp_runtime)
+target_compile_options(call_trace_tests PRIVATE ${POP_WARN_HOST})
+pop_optimize(call_trace_tests 1)
+pop_test_binary(call_trace_tests)
+add_test(NAME call_trace_tests COMMAND call_trace_tests WORKING_DIRECTORY ${POP_ROOT})
+set_tests_properties(call_trace_tests PROPERTIES LABELS game TIMEOUT 120)
 
 add_executable(interp_tests tests/interp_tests.cpp interp.cpp)
 target_include_directories(interp_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

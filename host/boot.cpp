@@ -11,6 +11,7 @@
 #include "../runtime/imports.h"
 #include "../runtime/win32.h"
 #include "../runtime/mods_seam.h"
+#include "../runtime/call_trace.h"
 #include "../runtime/gdi32_internal.h"
 #include "../runtime/display_seam.h"
 #include "../dx/dx.h"
@@ -522,6 +523,11 @@ bool boot_load(const BootOptions &opts) {
     }
     // The presenters ask this before they touch the page.
     host_page_set_enabled(page_enabled);
+
+    // Arm the guest call tracer (RECOMP_TRACE_CALLS) after the mods are in
+    // place, so its hook chains to any mod hook on the same address rather
+    // than being overwritten by it. A no-op without the variable.
+    recomp_trace_calls_init();
 
     g_loaded = true;
     return true;

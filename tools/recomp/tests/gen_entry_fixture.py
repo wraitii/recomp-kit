@@ -36,8 +36,8 @@ void (*const recomp_base_ptrs[])(X86 *) = {
 void (*const recomp_raw_ptrs[])(X86 *) = {
     fn_0d001000, fn_0d001010, fn_0d001020, fn_0d001030
 };
-uint8_t recomp_hooked[4];
-RecompHookFn recomp_hook_ptrs[4];
+uint8_t recomp_hooked[4] = {0};
+RecompHookFn recomp_hook_ptrs[4] = {0};
 ''' + T.emit_entry_dispatch("recomp_"))
 
 
