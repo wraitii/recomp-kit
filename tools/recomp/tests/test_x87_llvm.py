@@ -94,3 +94,31 @@ def test_access_instrumentation_preserves_store_conversion_and_pop_order():
     assert text == 'rk_access_store32(c, a, fto_float(c, ST(c, 0)));\nfdrop(c);'
     with pytest.raises(ValueError):
         instrument_memory('wrf80(a, ST(c, 0));')
+
+
+def test_synchronized_function_emits_machine_operations_without_stack_decisions():
+    text = emit_function('test', function_insns([
+        'MOV EAX,dword ptr [ESI + EDX*4 + -4]', 'PUSH EAX', 'POP ESP',
+        'FLD float ptr [ESI]', 'FSTP float ptr [ESP + 4]', 'INC EDX',
+        'DEC EAX', 'CMP EDX,EAX', 'JNZ 0x1000', 'CALL 0x2000', 'RET 0x8',
+    ]), True, synchronize_cfg=True)
+    assert '"recomp.x87.sync"' in text
+    assert '4294967292' in text and 'mul i32' in text
+    assert '@rk_direct_load32' in text and '@rk_direct_push32' in text
+    assert text.index('@rk_direct_pop32') < text.index('@rk_write_reg(ptr %cpu, i32 4')
+    assert text.index('@rk_store') < text.index('@rk_pop(')
+    assert '@rk_inc32' in text and '@rk_dec32' in text and '@rk_cmp32' in text
+    assert '@rk_direct_call(ptr %cpu, i32 8192, i32 4106)' in text
+    assert '@rk_ret(ptr %cpu, i32 8)' in text
+    assert 'phi ' not in text and '@rk_snapshot' not in text
+
+
+@pytest.mark.parametrize('instruction', [
+    'PUSH AX', 'PUSH word ptr [ESP]', 'POP word ptr [ESP]', 'MOV EAX,AX',
+    'INC AX', 'DEC dword ptr [ESI]', 'CMP AX,DX', 'CALL EAX',
+    'CALL 0x1000', 'RET 0x10000', 'MOV EAX,dword ptr FS:[0]',
+    'FSTP double ptr [ESI]',
+])
+def test_synchronized_function_does_not_approximate_unsupported_forms(instruction):
+    with pytest.raises(ValueError):
+        emit_function('test', function_insns([instruction, 'RET']), True, synchronize_cfg=True)

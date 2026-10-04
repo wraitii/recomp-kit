@@ -23,13 +23,23 @@ def check_pass(opt, plugin, out):
         "unreachable": ("ret void\nend:", "unreachable"),
         "join_depth": ("br i1 true, label %left, label %join\nleft:\ncall void @rk_push(ptr %cpu, double 1.0)\nbr label %join\njoin:", "incompatible x87 join"),
         "join_touched": ("br i1 true, label %left, label %join\nleft:\ncall void @rk_push(ptr %cpu, double 1.0)\ncall void @rk_pop(ptr %cpu)\nbr label %join\njoin:", "incompatible x87 join"),
+        "sync_contract": ("", "synchronized CFG requires direct-access contract"),
+        "sync_live_backedge": ("br label %loop\nloop:\ncall void @rk_push(ptr %cpu, double 1.0)\nbr i1 false, label %loop, label %end\nend:", "synchronization requires empty"),
+        "sync_incoming": ("br label %loop\nloop:\n%v = call double @rk_read(ptr %cpu, i32 0)\nbr i1 false, label %loop, label %end\nend:", "locally defined"),
+        "sync_live_call": ("call void @rk_push(ptr %cpu, double 1.0)\ncall void @rk_direct_call(ptr %cpu, i32 1, i32 2)", "call requires empty"),
+        "sync_after_call": ("call void @rk_direct_call(ptr %cpu, i32 1, i32 2)\n%v = call double @rk_read(ptr %cpu, i32 0)", "locally defined"),
+        "sync_bad_register": ("call void @rk_inc32(ptr %cpu, i32 8)", "register index"),
     }
     directory = out / 'pass-checks'
     directory.mkdir(exist_ok=True)
     for name, (body, diagnostic) in cases.items():
         path = directory / f'{name}.ll'
         attrs = ' "recomp.x87.effects"' if name == 'effects_contract' else ''
-        path.write_text(DECLARATIONS + '\ndeclare void @external(ptr)\ndeclare double @rk_direct_load(ptr, i32)\n' +
+        if name.startswith('sync_'):
+            attrs = ' "recomp.x87.sync"'
+            if name != 'sync_contract':
+                attrs += ' "recomp.x87.direct"'
+        path.write_text(DECLARATIONS + '\ndeclare void @external(ptr)\ndeclare double @rk_direct_load(ptr, i32)\ndeclare void @rk_direct_call(ptr, i32, i32)\ndeclare void @rk_inc32(ptr, i32)\n' +
                         f'define void @bad(ptr %cpu) "recomp.x87.region"{attrs} {{\n' + body + '\nret void\n}\n')
         result = subprocess.run([str(opt), f'-load-pass-plugin={plugin}',
                                  '-passes=recomp-x87-stack', '-disable-output', str(path)],

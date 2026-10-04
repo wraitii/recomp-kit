@@ -3,9 +3,11 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include <array>
+#include <functional>
 
 using namespace llvm;
 namespace {
@@ -19,6 +21,7 @@ struct StackPlan {
     bool Valid = false;
     SmallVector<BasicBlock *, 16> Order;
     DenseMap<BasicBlock *, Shape> In, Out;
+    SmallPtrSet<BasicBlock *, 8> Sync;
 };
 
 // A closed semantic ABI: declarations only, exact types, and one CPU object.
@@ -46,24 +49,30 @@ static bool validCall(CallInst &C, Function &F) {
     if (N == "rk_read" || N == "rk_load" || N == "rk_load64" || N == "rk_direct_load" ||
         N == "rk_direct_load64")
         Expected = FunctionType::get(D, {P, U}, false);
-    if (N == "rk_reg" || N == "rk_zf")
+    if (N == "rk_reg" || N == "rk_zf" || N == "rk_direct_load32")
         Expected = FunctionType::get(U, {P, U}, false);
+    if (N == "rk_direct_pop32")
+        Expected = FunctionType::get(U, {P}, false);
     if (N == "rk_set" || N == "rk_store" || N == "rk_direct_store")
         Expected = FunctionType::get(V, {P, U, D}, false);
     if (N == "rk_round")
         Expected = FunctionType::get(D, {P, D}, false);
     if (N == "rk_compare")
         Expected = FunctionType::get(V, {P, D, D}, false);
-    if (N == "rk_test_ah" || N == "rk_xor_eax" || N == "rk_ret" || N == "rk_direct_ret")
+    if (N == "rk_test_ah" || N == "rk_xor_eax" || N == "rk_ret" || N == "rk_direct_ret" ||
+        N == "rk_direct_push32" || N == "rk_inc32" || N == "rk_dec32")
         Expected = FunctionType::get(V, {P, U}, false);
-    if (N == "rk_write_reg")
+    if (N == "rk_write_reg" || N == "rk_cmp32" || N == "rk_direct_call")
         Expected = FunctionType::get(V, {P, U, U}, false);
+    if (N == "rk_direct_call" && !F.hasFnAttribute("recomp.x87.sync"))
+        return false;
     return Expected && C.getFunctionType() == Expected && Fn->getFunctionType() == Expected;
 }
 
 // Pass 2: validate everything before mutation; propagate depth and the set of
-// written physical positions. This first CFG milestone rejects cycles and joins
-// needing path-dependent preservation of untouched incoming slot metadata.
+// written physical positions. Optional synchronization cuts every DFS backedge
+// at its target. No local stack value may cross such a cut; all predecessors
+// must materialize, and the target starts with current physical state.
 class X87Analysis : public AnalysisInfoMixin<X87Analysis> {
     friend AnalysisInfoMixin<X87Analysis>;
     static AnalysisKey Key;
@@ -82,23 +91,52 @@ class X87Analysis : public AnalysisInfoMixin<X87Analysis> {
         if (F.empty() || F.arg_size() != 1 || !F.getReturnType()->isVoidTy() ||
             !F.getArg(0)->getType()->isPointerTy() || !pred_empty(&F.front()))
             return Reject("x87 region requires entry without predecessors and void(ptr) ABI");
+        bool SyncCFG = F.hasFnAttribute("recomp.x87.sync");
+        if (SyncCFG && !F.hasFnAttribute("recomp.x87.direct"))
+            return Reject("synchronized CFG requires direct-access contract");
+        if (SyncCFG) {
+            DenseMap<BasicBlock *, unsigned> Color;
+            std::function<void(BasicBlock *)> Visit = [&](BasicBlock *B) {
+                Color[B] = 1;
+                for (BasicBlock *Succ : successors(B)) {
+                    if (Color[Succ] == 1)
+                        P.Sync.insert(Succ);
+                    else if (!Color[Succ])
+                        Visit(Succ);
+                }
+                Color[B] = 2;
+            };
+            Visit(&F.front());
+            if (Color.size() != F.size())
+                return Reject("x87 CFG has an unreachable block");
+        }
         DenseMap<BasicBlock *, unsigned> Pending;
-        for (BasicBlock &B : F)
-            Pending[&B] = pred_size(&B);
-        P.Order.push_back(&F.front());
+        for (BasicBlock &B : F) {
+            Pending[&B] = P.Sync.contains(&B) ? 0 : pred_size(&B);
+            if (&B == &F.front() || P.Sync.contains(&B))
+                P.Order.push_back(&B);
+        }
         for (unsigned B = 0; B < P.Order.size(); ++B)
             for (BasicBlock *Succ : successors(P.Order[B]))
-                if (--Pending[Succ] == 0)
+                if (!P.Sync.contains(Succ) && --Pending[Succ] == 0)
                     P.Order.push_back(Succ);
         if (P.Order.size() != F.size())
             return Reject("x87 CFG has a cycle or unreachable block");
         for (BasicBlock *B : P.Order) {
             Shape S;
-            if (B != &F.front()) {
+            if (B != &F.front() && !P.Sync.contains(B)) {
                 S = P.Out[*pred_begin(B)];
-                for (BasicBlock *Pred : predecessors(B))
-                    if (!(P.Out[Pred] == S))
+                bool Same = true, Empty = true;
+                for (BasicBlock *Pred : predecessors(B)) {
+                    Same &= P.Out[Pred] == S;
+                    Empty &= P.Out[Pred].Depth == 0;
+                }
+                if (!Same) {
+                    if (!SyncCFG || !Empty)
                         return Reject("incompatible x87 join depth or touched slots");
+                    P.Sync.insert(B);
+                    S = {};
+                }
             }
             P.In[B] = S;
             for (Instruction &I : *B) {
@@ -107,12 +145,17 @@ class X87Analysis : public AnalysisInfoMixin<X87Analysis> {
                         return Reject(
                             "unsupported call or invalid x87 semantic helper declaration");
                     StringRef N = C->getCalledFunction()->getName();
-                    if (N == "rk_reg" || N == "rk_write_reg") {
+                    if (N == "rk_reg" || N == "rk_write_reg" || N == "rk_inc32" ||
+                        N == "rk_dec32") {
                         auto *Index = dyn_cast<ConstantInt>(C->getArgOperand(1));
                         if (!Index || Index->getZExtValue() >= 8)
                             return Reject("invalid guest register index");
                     }
-                    if (N == "rk_push") {
+                    if (N == "rk_direct_call") {
+                        if (S.Depth)
+                            return Reject("guest call requires empty local x87 stack");
+                        S = {}; // A callee may replace TOP/CW/slots and metadata.
+                    } else if (N == "rk_push") {
                         if (S.Depth == 8)
                             return Reject("x87 local stack overflow");
                         S.Touched |= 1u << S.Depth++;
@@ -152,6 +195,10 @@ class X87Analysis : public AnalysisInfoMixin<X87Analysis> {
             }
             P.Out[B] = S;
         }
+        for (BasicBlock *B : P.Sync)
+            for (BasicBlock *Pred : predecessors(B))
+                if (P.Out[Pred].Depth)
+                    return Reject("synchronization requires empty local x87 stack");
         P.Valid = true;
         return P;
     }
@@ -176,13 +223,25 @@ class X87SSAPass : public PassInfoMixin<X87SSAPass> {
         Args.append(8, D);
         auto Snapshot = F.getParent()->getOrInsertFunction(
             "rk_snapshot", FunctionType::get(Type::getVoidTy(Ctx), Args, false));
-        IRBuilder<> Entry(&*F.front().begin());
-        Value *CPU = F.getArg(0), *Top = Entry.CreateCall(TopFn, {CPU}, "entry.top");
+        Value *CPU = F.getArg(0);
         using Values = std::array<Value *, 8>;
         DenseMap<BasicBlock *, Values> Out;
+        DenseMap<BasicBlock *, Value *> OutTop;
         SmallVector<Instruction *, 32> Erase;
         for (BasicBlock *BB : P.Order) {
             Shape S = P.In.lookup(BB);
+            Value *Top;
+            if (BB == &F.front() || P.Sync.contains(BB)) {
+                IRBuilder<> Entry(&*BB->begin());
+                Top = Entry.CreateCall(TopFn, {CPU}, "region.top");
+            } else if (pred_size(BB) == 1)
+                Top = OutTop[*pred_begin(BB)];
+            else {
+                auto *Phi = PHINode::Create(U, pred_size(BB), "x87.top", BB->begin());
+                for (BasicBlock *Pred : predecessors(BB))
+                    Phi->addIncoming(OutTop[Pred], Pred);
+                Top = Phi;
+            }
             Values Last{};
             for (unsigned K = 0; K < 8; ++K) {
                 if (!(S.Touched & (1u << K)))
@@ -221,11 +280,23 @@ class X87SSAPass : public PassInfoMixin<X87SSAPass> {
                         else
                             Slot = C->getArgOperand(2);
                         Erase.push_back(C);
+                    } else if (N == "rk_direct_call") {
+                        Checkpoint(I);
+                        IRBuilder<> After(C->getNextNode());
+                        Top = After.CreateCall(TopFn, {CPU}, "after.call.top");
+                        S = {};
+                        Last = {};
                     } else if (N == "rk_fnstsw" || N == "rk_observe" || N == "rk_ret" ||
                                N == "rk_load" || N == "rk_load64" || N == "rk_store" ||
                                N.starts_with("rk_direct_")) {
                         Checkpoint(I);
                     }
+                } else if (isa<BranchInst>(I)) {
+                    for (BasicBlock *Succ : successors(BB))
+                        if (P.Sync.contains(Succ)) {
+                            Checkpoint(I);
+                            break;
+                        }
                 } else if (isa<ReturnInst>(I)) {
                     auto *Prev = dyn_cast_or_null<CallInst>(I.getPrevNode());
                     if (!Prev || (Prev->getCalledFunction()->getName() != "rk_ret" &&
@@ -234,6 +305,7 @@ class X87SSAPass : public PassInfoMixin<X87SSAPass> {
                 }
             }
             Out[BB] = Last;
+            OutTop[BB] = Top;
         }
         for (Instruction *I : Erase)
             I->eraseFromParent();
@@ -270,7 +342,8 @@ class X87EffectsPass : public PassInfoMixin<X87EffectsPass> {
                 if (!Next)
                     continue; // LLVM return: preserve complete final state.
                 StringRef N = Next->getCalledFunction()->getName();
-                if (N == "rk_direct_load" || N == "rk_direct_load64" || N == "rk_direct_store")
+                if (N == "rk_direct_load" || N == "rk_direct_load64" || N == "rk_direct_store" ||
+                    N == "rk_direct_load32" || N == "rk_direct_push32" || N == "rk_direct_pop32")
                     Erase.push_back(Snapshot);
                 else if (N == "rk_direct_fnstsw") {
                     IRBuilder<> B(Next);

@@ -26,6 +26,18 @@ raw semantic LLVM and lifted LLVM. CMake defines `RK_CODEGEN_TEST`,
 `RK_DIRECT_TEST`, and `RK_FUNCTION_TEST`; the header can reuse an experiment
 fixture using these conditionals. Numeric inputs/addresses remain game-owned.
 
+`synchronize_cfg: true` opts into bounded loops and ordinary synchronous calls.
+List every direct callee as a hex string in `call_targets`; the fixture must define
+`void rk_fixture_call(X86 *, uint32_t target)` and reject unexpected targets.
+Both C and LLVM call the same generated opaque `entry_ADDR` thunk, then the same
+harness dispatcher. There is no callee implementation or game dispatch change.
+The fixture can observe and mutate complete state; compare these boundary events
+as well as final state. Unknown, intrinsic and resumable continuations fail.
+`FIXTURE_SCRATCH_SIZE` widens the default 256-byte compared window at `0x10000`;
+all fixture writes must fit. Optional `FIXTURE_AFTER_STATE(mode,c)`,
+`FIXTURE_BENCH_SETUP(c)` and `FIXTURE_BENCH_CHECK(c)` support call-boundary checks,
+untimed geometry setup and a function-specific post-timing sanity check.
+
 ## Emission and preservation
 
 1. Load the game configuration and PE through the normal translator entry point.
@@ -35,20 +47,25 @@ fixture using these conditionals. Numeric inputs/addresses remain game-owned.
    `Translator.prepare` and `Translator.translate` with default flag liveness,
    not an instruction-only loop or eager-flags approximation. LLVM reuses the
    bounded semantic emitter and existing stack/SSA/effect/materialization passes.
-3. Refuse unsupported instructions, calls/stores, noncontiguous extents, configured
+3. Refuse unsupported instructions, noncontiguous extents, configured
    instruction rewrites, intrinsics, SEH, pushed continuations and jump tables.
-   The compiled LLVM analysis still refuses cycles, incoming stack operands and
-   incompatible joins. There is no fallback labeled as a successful LLVM result.
+   The compiled LLVM analysis refuses incoming stack operands and incompatible
+   joins. Cycles and calls are rejected by default; synchronized mode requires
+   zero local depth at each loop cut/call, full predecessor snapshots, and a fresh
+   state model after the boundary. There is no fallback labeled as successful LLVM.
 4. The build wrapper requires the resulting C body to match exactly one existing
    production chunk and its copied `x86.h` to match the canonical runtime. This
    detects unsupported production wrapper/alternate-entry differences or stale
    source/header state. Only exported symbol names change during compilation.
 
 **Precondition:** the manifest explicitly selects `mapped-normal-exit-v1`:
-ordinary mapped guest memory separate from CPU/runtime storage, stable CW, valid
+ordinary mapped guest memory separate from CPU/runtime storage, stable CW between
+declared calls, valid
 entry TOP, no interior faults, asynchronous observers or mutating hooks, and the
-harness's ordinary return continuation. The current supported leaves only read
-guest memory; runtime store/watch hooks are not exercised. Entry profiling,
+harness's ordinary return continuation. Memory stores, including stack writes,
+are supported with store/watch hooks disabled; partial writes and interior faults
+remain excluded. A declared synchronous callee may mutate state and return a new
+valid TOP/CW; subsequent incoming x87 consumption is still rejected. Entry profiling,
 frame-watch and override dispatch live outside the measured `fn_ADDR` bodies.
 The return dispatcher implementation is compiled, but its external decisions
 are supplied by the existing harness (unexpected returns abort).
@@ -94,8 +111,10 @@ wrapper's lock. The output is `<game build>/llvm-compare/`, separate from `recom
 - `translation.json`: contract, identities, listing/body provenance, dispatch off.
 - `build-settings.json`: original compile commands, flags/compiler versions,
   compile database hash and measurement contract.
-- `<address>/baseline.c`, `body.txt`, `input.ll`: translator output.
+- `<address>/baseline.c`, `body.txt`, `input.ll`: translator output;
+  `callees.c`, `call-dispatch.h`: shared test call boundary.
 - `ssa.ll`, `effects.ll`, `lifted.ll`, `optimized.ll`: inspectable LLVM stages.
+  Synchronized functions also check analysis non-mutation and pass idempotence.
 - `c_native.s`, `c_llvm.s`, `llvm.s`, `disassembly.txt`: assembly and linked code.
 - `codegen.json`: per-function native spans/instruction counts (including
   alignment and cold/dispatcher paths), ARM64 fused-operation counts.

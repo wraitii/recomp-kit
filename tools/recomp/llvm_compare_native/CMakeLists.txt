@@ -37,9 +37,9 @@ foreach(LEAF IN LISTS LEAVES)
   endforeach()
   add_custom_command(OUTPUT "${D}/helpers.bc"
     COMMAND ${TIME} "${D}/time-helpers.json" "${TOOLS}/clang" ${PRODUCTION_FLAGS}
-            -O1 -emit-llvm -c "${EXPERIMENT}/helpers.c" -o "${D}/helpers.bc"
+            -include "${D}/call-dispatch.h" -O1 -emit-llvm -c "${EXPERIMENT}/helpers.c" -o "${D}/helpers.bc"
     DEPENDS "${EXPERIMENT}/helpers.c" "${EXPERIMENT}/access.h" "${KIT}/runtime/x86.h"
-            "${D}/settings.cmake" VERBATIM)
+            "${D}/settings.cmake" "${D}/call-dispatch.h" VERBATIM)
   add_custom_command(OUTPUT "${D}/ssa.ll" "${D}/effects.ll" "${D}/lifted.ll"
     COMMAND ${TIME} "${D}/time-ssa.json" "${TOOLS}/opt" -load-pass-plugin=$<TARGET_FILE:RecompX87>
             -passes=recomp-x87-analyze,recomp-x87-ssa -verify-each -S "${D}/input.ll" -o "${D}/ssa.ll"
@@ -59,10 +59,14 @@ foreach(LEAF IN LISTS LEAVES)
     DEPENDS "${D}/lifted.ll" "${D}/helpers.bc" "${D}/settings.cmake" VERBATIM)
   set_source_files_properties("${D}/c_native.o" "${D}/c_llvm.o" "${D}/llvm.o" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
   add_executable(replay_${LEAF} "${D}/c_native.o" "${D}/c_llvm.o" "${D}/llvm.o"
+    "${D}/callees.c"
     "${EXPERIMENT}/boundaries.c" "${EXPERIMENT}/access.c" "${EXPERIMENT}/../x87_locals/harness.c")
   target_include_directories(replay_${LEAF} PRIVATE "${D}" "${EXPERIMENT}" "${KIT}/runtime")
   target_compile_options(replay_${LEAF} PRIVATE ${PRODUCTION_FLAGS})
   target_compile_definitions(replay_${LEAF} PRIVATE RK_FUNCTION_TEST=1 RK_DIRECT_TEST=1 RK_CODEGEN_TEST=1)
+  if(CALL_TEST)
+    target_compile_definitions(replay_${LEAF} PRIVATE RK_CALL_TEST=1)
+  endif()
   set_target_properties(replay_${LEAF} PROPERTIES OUTPUT_NAME replay RUNTIME_OUTPUT_DIRECTORY "${D}")
   if(NOT WIN32)
     target_link_libraries(replay_${LEAF} PRIVATE m)

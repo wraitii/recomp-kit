@@ -97,7 +97,8 @@ def production_settings(database, out, metadata, runtime):
         (out / addr / 'settings.cmake').write_text(
             'set(PRODUCTION_CC ' + cmake_quote(compiler) + ')\n' +
             'set(PRODUCTION_CWD ' + cmake_quote(row['directory']) + ')\n' +
-            'set(PRODUCTION_FLAGS ' + ' '.join(map(cmake_quote, flags)) + ')\n')
+            'set(PRODUCTION_FLAGS ' + ' '.join(map(cmake_quote, flags)) + ')\n' +
+            f'set(CALL_TEST {"ON" if metadata["functions"][addr].get("call_targets") else "OFF"})\n')
     return settings
 
 
@@ -147,6 +148,22 @@ def run_comparison(manifest, game_dir, out, database, cmake, jobs):
     subprocess.run([cmake, '--build', str(out), '--parallel', str(jobs)], check=True)
     for addr in settings:
         directory = out / addr
+        if metadata['functions'][addr].get('synchronize_cfg'):
+            # Check the actual cyclic/calling function, not only acyclic fixtures:
+            # analysis cannot rewrite it, and repeating the consumed pass is inert.
+            normalize = lambda text: '\n'.join(line for line in text.splitlines()
+                                               if not line.startswith('; ModuleID'))
+            plugin = next(p for p in out.glob('RecompX87.*') if p.suffix in {'.so', '.dylib', '.dll'})
+            for passes, source, dest in (
+                ('recomp-x87-analyze', 'input.ll', 'analysis.ll'),
+                ('verify', 'input.ll', 'verified.ll'),
+                ('recomp-x87-stack', 'lifted.ll', 'again.ll'),
+            ):
+                subprocess.run([str(bindir / 'opt'), f'-load-pass-plugin={plugin}',
+                                f'-passes={passes}', '-verify-each', '-S', str(directory / source),
+                                '-o', str(directory / dest)], check=True)
+            assert normalize((directory / 'analysis.ll').read_text()) == normalize((directory / 'verified.ll').read_text())
+            assert normalize((directory / 'again.ll').read_text()) == normalize((directory / 'lifted.ll').read_text())
         lifted = (directory / 'lifted.ll').read_text().split('define void @compare_lifted(', 1)[1].split('\n}', 1)[0]
         raw = (directory / 'input.ll').read_text().split('define void @compare_raw(', 1)[1].split('\n}', 1)[0]
         assert not any(f'@rk_{op}(' in lifted for op in ('push', 'pop', 'read', 'set', 'snapshot'))

@@ -3,6 +3,9 @@
  */
 #include "access.h"
 #define INLINE __attribute__((always_inline))
+#ifndef RK_CALL_TARGET
+#define RK_CALL_TARGET(c, target) recomp_call(c, target)
+#endif
 INLINE unsigned rk_reg(X86 *c, unsigned n) {
     return c->r[n];
 }
@@ -103,4 +106,53 @@ INLINE void rk_direct_ret(X86 *c, unsigned cleanup) {
     c->eip = rd32(c->r[R_ESP]);
     c->r[R_ESP] += 4u + cleanup;
     recomp_return(c);
+}
+
+/* Integer and call operations for synchronized CFG regions. Guest addresses
+ * wrap at 32 bits. Calls observe all state and invalidate every deferred value;
+ * only ordinary host returns are supported by this comparison contract. */
+INLINE unsigned rk_direct_load32(X86 *c, unsigned a) {
+    (void)c;
+    return rd32(a);
+}
+INLINE void rk_direct_push32(X86 *c, unsigned v) {
+    c->r[R_ESP] -= 4u;
+    wr32(c->r[R_ESP], v);
+}
+INLINE unsigned rk_direct_pop32(X86 *c) {
+    unsigned v = rd32(c->r[R_ESP]);
+    c->r[R_ESP] += 4u;
+    return v;
+}
+INLINE void rk_direct_call(X86 *c, unsigned target, unsigned continuation) {
+    rk_direct_push32(c, continuation);
+    RK_CALL_TARGET(c, target);
+}
+INLINE void rk_cmp32(X86 *c, unsigned a, unsigned b) {
+    uint64_t wide = (uint64_t)a - b;
+    uint32_t r = (uint32_t)wide;
+    c->eflags_cf = (unsigned)(wide >> 32) & 1u;
+    c->eflags_of = ((a ^ b) & (a ^ r)) >> 31;
+    c->eflags_af = ((a ^ b ^ r) >> 4) & 1u;
+    c->eflags_zf = r == 0;
+    c->eflags_sf = r >> 31;
+    c->eflags_pf = parity8(r);
+}
+INLINE void rk_inc32(X86 *c, unsigned reg) {
+    uint32_t a = c->r[reg], r = a + 1u;
+    c->r[reg] = r;
+    c->eflags_of = (~(a ^ 1u) & (a ^ r)) >> 31;
+    c->eflags_af = ((a ^ 1u ^ r) >> 4) & 1u;
+    c->eflags_zf = r == 0;
+    c->eflags_sf = r >> 31;
+    c->eflags_pf = parity8(r);
+}
+INLINE void rk_dec32(X86 *c, unsigned reg) {
+    uint32_t a = c->r[reg], r = a - 1u;
+    c->r[reg] = r;
+    c->eflags_of = ((a ^ 1u) & (a ^ r)) >> 31;
+    c->eflags_af = ((a ^ 1u ^ r) >> 4) & 1u;
+    c->eflags_zf = r == 0;
+    c->eflags_sf = r >> 31;
+    c->eflags_pf = parity8(r);
 }

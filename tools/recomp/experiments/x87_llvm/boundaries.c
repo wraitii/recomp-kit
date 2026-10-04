@@ -21,9 +21,14 @@ int32_t recomp_index_of(uint32_t a) {
     abort();
 }
 void recomp_call(X86 *c, uint32_t a) {
+#ifdef RK_CALL_TEST
+    extern void rk_fixture_call(X86 *, uint32_t);
+    rk_fixture_call(c, a);
+#else
     (void)c;
     (void)a;
     abort();
+#endif
 }
 void recomp_callback_return(X86 *c) {
     (void)c;

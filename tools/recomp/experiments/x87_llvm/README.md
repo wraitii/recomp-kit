@@ -47,9 +47,15 @@ decodes the verified function bytes through the production decoder and emits
 basic blocks, conditional/unconditional branches and explicit guest operations.
 It supports float/double memory FLD/FCOMP and FADD/FSUB/FMUL, FADDP to ST1,
 FCHS, FNSTSW AX, TEST AH/immediate,
-MOV reg32/immediate, XOR EAX/EAX, JZ/JNZ (including JE/JNE), JMP and plain RET.
+MOV reg32/immediate, XOR EAX/EAX, JZ/JNZ (including JE/JNE), JMP, binary32
+memory FSTP and plain RET. The translator comparison's optional
+`synchronize_cfg: true` profile additionally enables MOV reg32/reg32 or memory,
+PUSH/POP reg32, INC/DEC reg32, CMP reg32/reg32, direct external CALL and RET imm16.
+These extensions use the direct-access contract only. Calls require an exact
+profile `call_targets` list and ordinary, non-resumable continuations; the harness
+supplies the callees. No callee implementation is inferred from an address.
 Unsupported instructions, operands, external branch targets and extent
-fallthrough fail. This intentionally small set covers the first real function.
+fallthrough fail. This intentionally small set covers the inspected comparison functions.
 The C reference uses the production instruction emitter with all flags live.
 Its memory calls are routed through the same opaque adapters as LLVM, without
 changing expression ordering. A direct-memory C copy is also generated as
@@ -77,8 +83,9 @@ operation. No numeric identities or precision changes are introduced.
 
 `X87Analysis` validates the complete function before mutation: void(ptr) ABI,
 closed helper declarations with exact signatures, allowed instructions, no
-relaxation flags, and a reachable acyclic CFG. It propagates local depth `d` and
-touched-position mask `M` in topological order. Every incoming edge at a join
+relaxation flags, and a reachable CFG. By default it requires an acyclic CFG and
+propagates local depth `d` and touched-position mask `M` in topological order.
+Every incoming edge at a join
 must have identical `(d,M)`. Cycles, unreachable blocks, incoming x87 value
 consumption, depth outside 0..8, and incompatible joins are rejected.
 
@@ -87,7 +94,22 @@ observers/mutators. **Invariant:** `(d,M)` is the same on every path to a block;
 all reads/sets use locally defined values. Analysis does not mutate IR. Equal
 masks are conservative: a path that leaves a slot untouched cannot join a path
 that overwrites it, even if later code would overwrite it on both paths. We do
-not synthesize incoming tag/exact-integer metadata PHIs in this milestone.
+not synthesize incoming tag/exact-integer metadata PHIs.
+
+**Optional synchronized CFG (`recomp.x87.sync`):** requires the direct contract.
+A DFS marks each backedge target as a synchronization block; ignoring incoming
+dependencies at these blocks gives an acyclic analysis order without changing
+the executable CFG. Each such block starts at `(d,M)=(0,0)`. After propagation,
+**every predecessor**, including the initial forward edge, must have `d=0`.
+An ordinary join with unequal touched masks can also synchronize if all its
+predecessors have `d=0`; other inconsistent joins still fail. A guest call requires
+`d=0` and resets the local shape to `(0,0)` after it. Unreachable blocks, incoming
+stack reads and live local values across a cut/call are still rejected.
+
+`d=0` describes this region's locally defined stack, not the hardware tags or an
+assumed empty incoming FPU. After a reset, incoming physical slots and their
+metadata are retained until an explicit push overwrites them. Analysis remains
+non-mutating and validates all cut predecessors before any transformation.
 
 ### 3. Value flow and PHIs (`recomp-x87-ssa`)
 
@@ -101,8 +123,27 @@ only after lifting. **Preservation argument:** push writes L[d] and increments d
 read substitutes L[d-1-i]; set updates that value; pop decrements d without erasing
 L. At a single-predecessor block, inherit L. At a join, a double LLVM PHI for each
 touched position selects the predecessor's L, including dead stack contents.
-Compatible depths make ST indexing identical on every incoming edge. Induction
-over the topological order extends the straight-line invariant to every path.
+Compatible depths make ST indexing identical on every incoming edge. TOP also
+flows through PHIs, so different earlier calls can supply different physical
+stack origins.
+
+In synchronized CFG mode, emit a full snapshot before each predecessor branch
+to a synchronization block, even when that branch also has another successor.
+The synchronization block reloads TOP and starts with no deferred slots. Before
+`rk_direct_call`, snapshot all touched slots, including popped contents. On normal
+return, reload TOP and discard every cached slot/shape; the callee may change CW,
+TOP, tags, exact-integer metadata, registers and memory. The following region
+must define any x87 values it consumes. No pre-call snapshot can later overwrite
+callee changes.
+
+**Composition argument:** each acyclic region preserves `(T,d,M,L)` by the same
+instruction/PHI induction. Every incoming cut edge establishes complete physical
+state; the next region starts from that state. A call observes complete state and
+its successor starts from the returned state. Induction over executed regions
+therefore handles any finite loop traversal without unrolling or dropping popped
+contents. Calls must return normally with a valid TOP and mapped memory; host
+unwinding, callbacks that abandon the caller and resumable continuations are
+outside this mode. CW is stable within each region, but may change at a call.
 
 Numeric, memory, register and branch operations remain in place with unchanged
 operands after substitution. The pass adds `rk_snapshot` state descriptions at
@@ -127,10 +168,11 @@ boundaries even in a function using direct accesses.
 
 | Operation | Reads of deferred x87 state | Transformation |
 | --- | --- | --- |
-| Direct load/store | None; store conversion reads current CW, and receives the value as an operand | Remove preceding snapshot; retain access/conversion |
+| Direct load/store, integer load/push/pop | None; store conversion reads current CW, and receives the value as an operand | Remove preceding snapshot; retain access/conversion |
 | Plain FNSTSW | TOP; status remains current in memory | Replace full snapshot + `rk_direct_fnstsw` with `rk_status_at(cpu, (T-d)&7)` |
 | Rounding/comparison | CW/status and explicit numeric operands | Unchanged; status updates remain in place |
 | Explicit observer, instrumented access, dispatch or exit | Complete state | Retain full snapshot |
+| Synchronization branch, guest call | Complete state; the call may then mutate it | Retain full snapshot; SSA resets after the call |
 
 **Preservation invariant:** the pass-3 `(T,d,M,L)` still represents logical state.
 Physical slot/TOP fields may lag between retained boundaries. A removed snapshot
@@ -154,8 +196,9 @@ it sees that a return path overwrites EAX. `effects.ll` exposes this stage.
 **Preconditions:** snapshots produced by pass 3 and optionally reduced by pass 4. For each touched k, write L[k]
 to P(k), zero its integer bits/exact marker, and classify it live iff k<d; set
 TOP=(T-d)&7. Untouched fields stay intact. Each touched slot was assigned by
-push/set, which clears integer metadata; pop clears its tag/exact marker without
-erasing its contents. Thus these writes reconstruct complete current-runtime
+push/set, which clears integer metadata. Integer-preserving producers such as
+FILD are unsupported and require extending this invariant before admission.
+Pop clears its tag/exact marker without erasing its contents. Thus these writes reconstruct complete current-runtime
 x87 state, not merely the live stack. The pass consumes the SSA attribute.
 
 **Preservation invariant:** complete CPU state matches at each snapshot and final
@@ -168,7 +211,9 @@ unchanged operations. The strict access-boundary observation policy is explicit:
   guest state. Conservative full materialization also makes this a regression
   for future read-only observers, although FNSTSW itself only needs status/TOP.
 - `rk_observe`: full materialization before a read-only observer; SSA remains
-  valid afterwards. Unknown calls and mutating observers are rejected.
+  valid afterwards. Unknown helper calls and mutating observers are rejected.
+  The separately declared guest-call boundary in synchronized CFG mode snapshots
+  and invalidates the local model, as described above.
 - `rk_load`, `rk_load64`, `rk_store`: materialize before the helper. It calls
   an opaque `rk_access_*` adapter, compiled in a separate translation unit with
   `-fno-lto`, passing the CPU pointer as well as the guest address. The adapter
@@ -225,9 +270,10 @@ For each, the harness abandons execution once at every reached access, checks th
 trace prefix and compares complete CPU/scratch after longjmp. This is a focused
 early-exit regression using a live setjmp frame, not a fault emulator or live
 shadow runner. Zero-access fixtures and over-capacity traces fail explicitly.
-Fifteen compiled rejection cases cover incoming dependencies, invalid registers,
+Twenty-one compiled rejection cases cover incoming dependencies, invalid registers,
 unknown calls, direct memory, numeric relaxations, cycles, unreachable blocks,
-unequal depth/touched masks at joins, and missing direct-access contracts. Separate-stage postconditions, LLVM
+unequal depth/touched masks at joins, missing direct-access contracts, live or
+incoming values across loop/call cuts, and invalid synchronized registers. Separate-stage postconditions, LLVM
 verification and idempotence are checked. Python tests check frontend scope and
 preserved machine operations; these are regression evidence, not an x86 oracle.
 

@@ -16,10 +16,17 @@ declare void @rk_write_reg(ptr, i32, i32)
 declare i32 @rk_zf(ptr, i32)
 declare void @rk_ret(ptr, i32)
 declare void @rk_observe(ptr)
+declare i32 @rk_direct_load32(ptr, i32)
+declare void @rk_direct_push32(ptr, i32)
+declare i32 @rk_direct_pop32(ptr)
+declare void @rk_direct_call(ptr, i32, i32)
+declare void @rk_cmp32(ptr, i32, i32)
+declare void @rk_inc32(ptr, i32)
+declare void @rk_dec32(ptr, i32)
 '''
 
 
-def emit_function(name, insns, lift):
+def emit_function(name, insns, lift, synchronize_cfg=False):
     """Emit a closed CFG with explicit guest operations; refuse missing targets.
 
     Preconditions: decoded contiguous function with a known entry and exact extent.
@@ -36,7 +43,7 @@ def emit_function(name, insns, lift):
             if target not in addresses:
                 raise ValueError('branch target outside function or inside instruction')
             leaders.add(target)
-        if ins.mnem in {'JZ', 'JNZ', 'JE', 'JNE', 'JMP', 'RET'} and k + 1 < len(insns):
+        if ins.mnem in {'JZ', 'JNZ', 'JE', 'JNE', 'JMP', 'RET', 'CALL'} and k + 1 < len(insns):
             leaders.add(insns[k + 1].addr)
     if insns[-1].mnem not in {'RET', 'JMP'}:
         raise ValueError('function falls through its extent')
@@ -55,9 +62,9 @@ def emit_function(name, insns, lift):
     def read(index=0):
         return value(f'call double @rk_read(ptr %cpu, i32 {index})')
 
-    def memory(op):
+    def address(op):
         if op.kind != 'mem' or op.size not in {32, 64} or op.seg:
-            raise ValueError('requires ordinary float/double memory operand')
+            raise ValueError('requires ordinary 32/64-bit memory operand')
         a = str(op.disp & 0xffffffff)
         for reg, scale in ((op.base, 1), (op.index, op.scale)):
             if reg is not None:
@@ -65,8 +72,21 @@ def emit_function(name, insns, lift):
                 if scale != 1:
                     r = value(f'mul i32 {r}, {scale}')
                 a = value(f'add i32 {a}, {r}')
+        return a
+
+    def memory(op):
+        a = address(op)
         helper = 'rk_load' if op.size == 32 else 'rk_load64'
         return value(f'call double @{helper}(ptr %cpu, i32 {a})')
+
+    def integer(op):
+        if op.kind == 'imm':
+            return str(op.imm & 0xffffffff)
+        if op.kind == 'reg' and op.size == 32:
+            return value(f'call i32 @rk_reg(ptr %cpu, i32 {op.reg})')
+        if op.kind == 'mem' and op.size == 32 and synchronize_cfg:
+            return value(f'call i32 @rk_direct_load32(ptr %cpu, i32 {address(op)})')
+        raise ValueError('requires supported 32-bit integer operand')
 
     for k, ins in enumerate(insns):
         m, ops = ins.mnem, [T.parse_operand(o) for o in ins.ops]
@@ -79,6 +99,10 @@ def emit_function(name, insns, lift):
         out.append(f'  ; {ins.raw}')
         if m == 'FLD' and len(ops) == 1:
             call('rk_push', f', double {memory(ops[0])}')
+        elif m == 'FSTP' and len(ops) == 1 and ops[0].kind == 'mem' and ops[0].size == 32:
+            a = address(ops[0])
+            call('rk_store', f', i32 {a}, double {read()}')
+            call('rk_pop')
         elif m in {'FADD', 'FSUB', 'FMUL'} and len(ops) == 1:
             operand = memory(ops[0])
             op = {'FADD': 'fadd', 'FSUB': 'fsub', 'FMUL': 'fmul'}[m]
@@ -101,8 +125,21 @@ def emit_function(name, insns, lift):
             call('rk_fnstsw')
         elif m == 'TEST' and len(ops) == 2 and ins.ops[0] == 'AH' and ops[1].kind == 'imm' and 0 <= ops[1].imm <= 255:
             call('rk_test_ah', f', i32 {ops[1].imm}')
-        elif m == 'MOV' and len(ops) == 2 and ops[0].kind == 'reg' and ops[0].size == 32 and ops[1].kind == 'imm':
-            call('rk_write_reg', f', i32 {ops[0].reg}, i32 {ops[1].imm & 0xffffffff}')
+        elif m == 'MOV' and len(ops) == 2 and ops[0].kind == 'reg' and ops[0].size == 32 and (synchronize_cfg or ops[1].kind == 'imm'):
+            call('rk_write_reg', f', i32 {ops[0].reg}, i32 {integer(ops[1])}')
+        elif synchronize_cfg and m in {'INC', 'DEC'} and len(ops) == 1 and ops[0].kind == 'reg' and ops[0].size == 32:
+            call('rk_' + m.lower() + '32', f', i32 {ops[0].reg}')
+        elif synchronize_cfg and m == 'CMP' and len(ops) == 2 and all(o.kind == 'reg' and o.size == 32 for o in ops):
+            call('rk_cmp32', f', i32 {integer(ops[0])}, i32 {integer(ops[1])}')
+        elif synchronize_cfg and m == 'PUSH' and len(ops) == 1 and ops[0].kind == 'reg' and ops[0].size == 32:
+            call('rk_direct_push32', f', i32 {integer(ops[0])}')
+        elif synchronize_cfg and m == 'POP' and len(ops) == 1 and ops[0].kind == 'reg' and ops[0].size == 32:
+            v = value('call i32 @rk_direct_pop32(ptr %cpu)')
+            call('rk_write_reg', f', i32 {ops[0].reg}, i32 {v}')
+        elif synchronize_cfg and m == 'CALL' and len(ops) == 1 and ops[0].kind == 'imm':
+            if k + 1 == len(insns) or ops[0].imm in addresses:
+                raise ValueError('call requires external target and ordinary continuation')
+            call('rk_direct_call', f', i32 {ops[0].imm & 0xffffffff}, i32 {insns[k+1].addr}')
         elif m == 'XOR' and ins.ops == ['EAX', 'EAX']:
             call('rk_xor_eax', ', i32 0')
         elif m in {'JZ', 'JNZ', 'JE', 'JNE'}:
@@ -113,12 +150,14 @@ def emit_function(name, insns, lift):
             out.append(f'  br i1 {cond}, label %b{T.Translator.branch_target(ins):x}, label %b{insns[k+1].addr:x}')
         elif m == 'JMP':
             out.append(f'  br label %b{T.Translator.branch_target(ins):x}')
-        elif m == 'RET' and not ops:
-            call('rk_ret', ', i32 0')
+        elif m == 'RET' and (not ops or (synchronize_cfg and len(ops) == 1 and ops[0].kind == 'imm' and 0 <= ops[0].imm <= 65535)):
+            call('rk_ret', f', i32 {ops[0].imm if ops else 0}')
             out.append('  ret void')
         else:
             raise ValueError(f'unsupported function instruction: {ins.raw}')
     attr = ' "recomp.x87.region"' if lift else ''
+    if synchronize_cfg:
+        attr += ' "recomp.x87.sync"'
     return f'define void @{name}(ptr %cpu){attr} {{\n' + '\n'.join(out) + '\n}\n'
 
 

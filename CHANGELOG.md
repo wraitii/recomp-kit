@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Extend the build-only LLVM comparison to bounded complete functions with loops,
+  binary32 stores, integer stack/register operations and declared synchronous
+  calls. An opt-in synchronization policy materializes full state on every loop
+  cut and before calls, then reloads TOP and invalidates deferred values after a
+  call. Incompatible live-stack boundaries still fail. C and LLVM share the test
+  callee thunks; full call/exit state and memory can be checked by the fixture.
+  Arithmetic semantics, the C baseline and production dispatch are unchanged.
+
 - Add `tools/build.py --llvm-compare MANIFEST`, an opt-in build-only translator
   path emitting verified complete leaf functions as production C and semantic
   LLVM. It reuses normal C preparation/liveness, verifies byte/listing provenance

@@ -14,6 +14,27 @@ from llvm_compare_build import compile_settings, cmake_quote, function_sizes
 from test_translate_driver import synthetic_image
 
 
+@pytest.mark.parametrize('calls,synchronize,resumable,intrinsic,valid', [
+    ([], True, False, False, False),
+    (['0x2000'], False, False, False, False),
+    (['0x2000'], True, True, False, False),
+    (['0x2000'], True, False, True, False),
+    (['0x2000', '0x3000'], True, False, False, False),
+    (['0x2000'], True, False, False, True),
+])
+def test_calls_require_exact_declared_ordinary_boundaries(monkeypatch, calls, synchronize, resumable, intrinsic, valid):
+    from llvm_compare import validate_calls
+    fn = SimpleNamespace(insns=T.parse_listing_text('00001000  CALL 0x2000'))
+    monkeypatch.setattr(T, 'RESUMABLE_STACKS', resumable)
+    monkeypatch.setattr(T, 'INTRINSIC_BODY', {0x2000: ''} if intrinsic else {})
+    p = {'call_targets': calls, 'synchronize_cfg': synchronize}
+    if valid:
+        assert validate_calls(T, fn, p) == ({0x2000}, True)
+    else:
+        with pytest.raises(ValueError):
+            validate_calls(T, fn, p)
+
+
 def fixture_function():
     # Handwritten x86 FLD [ESP+4]; FNSTSW AX; RET (no game bytes).
     code = bytes.fromhex('d9442404dfe0c3')

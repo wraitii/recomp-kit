@@ -1,7 +1,7 @@
 """Build-only LLVM emission through the production decoder and C translator.
 
 No dispatch table, override, or production chunk is written. This deliberately
-accepts only verified, contiguous, single-entry leaves in the existing LLVM
+accepts only verified, contiguous, single-entry functions in the bounded LLVM
 subset. The caller must select the mapped-normal-exit contract explicitly.
 """
 from pathlib import Path
@@ -13,6 +13,20 @@ from experiments.x87_llvm.function import DECLARATIONS as FUNCTION_DECLS, emit_f
 from experiments.x87_llvm.run import DECLARATIONS
 
 CONTRACT = 'mapped-normal-exit-v1'
+
+
+def validate_calls(T, fn, profile):
+    """A profile names every synchronous callee; alternate continuations fail."""
+    calls = {T.Translator.branch_target(i) for i in fn.insns if i.mnem == 'CALL'}
+    declared = {int(a, 0) for a in profile.get('call_targets', [])}
+    if None in calls or calls != declared or calls & set(T.INTRINSIC_BODY):
+        raise ValueError('calls require an exact explicit list of ordinary external targets')
+    synchronize = profile.get('synchronize_cfg', False)
+    if not isinstance(synchronize, bool) or (calls and not synchronize):
+        raise ValueError('calls require synchronized CFG mode')
+    if calls and T.RESUMABLE_STACKS:
+        raise ValueError('LLVM calls require ordinary non-resumable continuations')
+    return calls, synchronize
 
 
 def read_manifest(path):
@@ -83,34 +97,45 @@ def emit_comparison(T, image, args):
             raise ValueError('configured instruction rewrites are unsupported by LLVM comparison')
         if addr in T.INTRINSIC_BODY:
             raise ValueError('runtime intrinsic is not an LLVM leaf comparison')
-        # LLVM frontend rejects calls, stores, alternate transfers and unsupported
+        calls, synchronize = validate_calls(T, fn, p)
+        # LLVM frontend rejects alternate transfers and unsupported
         # operands before any output is published. Both emitters use fn.insns.
         module = direct_ir(DECLARATIONS + FUNCTION_DECLS)
-        module += direct_ir(emit_function('compare_raw', fn.insns, False))
-        module += direct_ir(emit_function('compare_lifted', fn.insns, True), effects=True)
-        tr = T.Translator(image, {addr}, args)
+        module += direct_ir(emit_function('compare_raw', fn.insns, False, synchronize))
+        module += direct_ir(emit_function('compare_lifted', fn.insns, True, synchronize), effects=True)
+        tr = T.Translator(image, {addr} | calls, args)
         tr.prepare(fn, strict=True)
         body = '\n'.join(tr.translate(fn))
         if (fn.seh_sites or fn.seh_escapes or fn.pushed_continuations or fn.dead_addrs
                 or tr.jumptables or 'static void body_' in body):
-            raise ValueError('LLVM comparison requires an ordinary single-entry leaf')
+            raise ValueError('LLVM comparison requires an ordinary single-entry function')
         fixture = profile_path.parent / p['codegen_fixture']
-        prepared.append((f'{addr:08x}', body, module, fixture.read_text()))
+        prepared.append((f'{addr:08x}', body, module, fixture.read_text(), calls))
         rows[f'{addr:08x}'] = {'name': name, 'profile': str(profile_path),
                              'size': size, 'instructions': len(fn.insns),
                              'function_sha256': p['function_sha256'],
-                             'listing': str(listing), 'body_sha256': hashlib.sha256(body.encode()).hexdigest()}
+                             'listing': str(listing), 'body_sha256': hashlib.sha256(body.encode()).hexdigest(),
+                             'synchronize_cfg': synchronize, 'call_targets': sorted(calls)}
     out.mkdir(parents=True, exist_ok=True)
-    for addr, body, module, fixture in prepared:
+    for addr, body, module, fixture, calls in prepared:
         directory = out / addr
         directory.mkdir(exist_ok=True)
         (directory / 'body.h').write_text(T.BODY_HEADER)
         (directory / 'body.txt').write_text(body)
+        prototypes = ''.join(f'void entry_{a:08x}(X86 *);\n' for a in sorted(calls))
         (directory / 'baseline.c').write_text(
-            f'#include "body.h"\n#define fn_{addr} COMPARE_SYMBOL\n{body}\n')
+            f'#include "body.h"\n{prototypes}#define fn_{addr} COMPARE_SYMBOL\n{body}\n')
+        (directory / 'callees.c').write_text('#include "x86.h"\n' + ''.join(
+            f'void entry_{a:08x}(X86 *c) {{ recomp_call(c, 0x{a:08x}u); }}\n' for a in sorted(calls)))
+        # Inlined helper dispatch selects the same opaque entry thunk as C.
+        # This keeps the measured call boundary identical in all four variants.
+        (directory / 'call-dispatch.h').write_text('#include "x86.h"\n' + prototypes +
+            'static inline __attribute__((always_inline)) void rk_compare_dispatch(X86 *c, uint32_t target) {\n' +
+            ''.join(f'  if (target == 0x{a:08x}u) {{ entry_{a:08x}(c); return; }}\n' for a in sorted(calls)) +
+            '  recomp_call(c, target);\n}\n#define RK_CALL_TARGET(c, target) rk_compare_dispatch(c, target)\n')
         (directory / 'input.ll').write_text(module)
         (directory / 'fixtures.h').write_text(fixture)
     report = {'contract': CONTRACT, 'executable_sha256': executable_hash,
               'dispatch_enabled': False, 'functions': rows}
     (out / 'translation.json').write_text(json.dumps(report, indent=2) + '\n')
-    print(f'LLVM comparison emitted {len(rows)} leaves into {out}; production dispatch unchanged')
+    print(f'LLVM comparison emitted {len(rows)} functions into {out}; production dispatch unchanged')

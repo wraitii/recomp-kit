@@ -29,6 +29,9 @@ void recomp_watch_hit(uint32_t a, uint32_t n, uint64_t v) {
 #ifndef FIXTURE_MEMORY_SIZE
 #define FIXTURE_MEMORY_SIZE 0x20000
 #endif
+#ifndef FIXTURE_SCRATCH_SIZE
+#define FIXTURE_SCRATCH_SIZE 256
+#endif
 #ifndef FIXTURE_SETUP
 #define FIXTURE_SETUP(c, n) ((void)0)
 #define FIXTURE_RESET(c) ((void)0)
@@ -40,6 +43,15 @@ void recomp_watch_hit(uint32_t a, uint32_t n, uint64_t v) {
 #endif
 #ifndef FIXTURE_FINISH
 #define FIXTURE_FINISH() ((void)0)
+#endif
+#ifndef FIXTURE_AFTER_STATE
+#define FIXTURE_AFTER_STATE(mode, c) FIXTURE_AFTER(mode)
+#endif
+#ifndef FIXTURE_BENCH_SETUP
+#define FIXTURE_BENCH_SETUP(c) ((void)0)
+#endif
+#ifndef FIXTURE_BENCH_CHECK
+#define FIXTURE_BENCH_CHECK(c) ((c)->fpu_top <= 7 && isfinite(rdf32(0x10080)))
 #endif
 
 static uint32_t seed = 123456789;
@@ -68,7 +80,7 @@ static void setup(X86 *c, unsigned n) {
     c->r[R_EBX] = (n & 1) ? 0x10000 : ((n & 2) ? 0x10081 : 0x10080);
     const uint32_t special[] = {0,          0x80000000, 0x7f800000, 0xff800000, 0x7fc12345,
                                 0x7f812345, 1,          0x007fffff, 0x7f7fffff, 0x3f800000};
-    memset(g_mem + 0x10000, 0, 256);
+    memset(g_mem + 0x10000, 0, FIXTURE_SCRATCH_SIZE);
     for (unsigned j = 0; j < 7; ++j) {
         uint32_t a = j < 3 ? 0x10000 + 4 * j : 0x10040 + 4 * (j - 3);
         uint32_t bits;
@@ -103,25 +115,25 @@ static int compare(void) {
         unsigned relaxed_by_pc[4] = {0}, finite_differences = 0;
         for (unsigned n = 0; n < 24576; ++n) {
             X86 initial, expected;
-            uint8_t input[256], output[256];
+            uint8_t input[FIXTURE_SCRATCH_SIZE], output[FIXTURE_SCRATCH_SIZE];
             setup(&initial, n);
-            memcpy(input, g_mem + 0x10000, 256);
+            memcpy(input, g_mem + 0x10000, sizeof input);
             expected = initial;
             FIXTURE_BEFORE(0);
             rk_memory_begin(0);
             functions[f][0](&expected);
             rk_memory_end(0);
-            FIXTURE_AFTER(0);
-            memcpy(output, g_mem + 0x10000, 256);
+            FIXTURE_AFTER_STATE(0, &expected);
+            memcpy(output, g_mem + 0x10000, sizeof output);
             for (unsigned mode = 1; mode < 4; ++mode) {
                 X86 actual = initial, reference = expected;
-                memcpy(g_mem + 0x10000, input, 256);
+                memcpy(g_mem + 0x10000, input, sizeof input);
                 FIXTURE_BEFORE(mode);
                 rk_memory_begin(mode);
                 functions[f][mode](&actual);
                 rk_memory_end(mode);
-                FIXTURE_AFTER(mode);
-                int mem_diff = memcmp(output, g_mem + 0x10000, 256) != 0;
+                FIXTURE_AFTER_STATE(mode, &actual);
+                int mem_diff = memcmp(output, g_mem + 0x10000, sizeof output) != 0;
                 if (normalize_empty_mask & (1u << mode)) {
                     discard_empty_contents(&actual);
                     discard_empty_contents(&reference);
@@ -164,7 +176,7 @@ static void check_memory_failures(void) {
         unsigned failures = 0;
         for (unsigned sample = 0; sample < 16; ++sample) {
             X86 initial, expected;
-            uint8_t input[256], output[256];
+            uint8_t input[FIXTURE_SCRATCH_SIZE], output[FIXTURE_SCRATCH_SIZE];
             setup(&initial, sample * 128 + (sample * 17) % 128);
             memcpy(input, g_mem + 0x10000, sizeof input);
             expected = initial;
@@ -219,6 +231,7 @@ static void benchmark(void) {
                         wrf32(0x10000 + j * 4, (float)(j + 1) / 3);
                     for (unsigned j = 0; j < 4; ++j)
                         wrf32(0x10040 + j * 4, (float)(j + 1) / 7);
+                    FIXTURE_BENCH_SETUP(&c);
                     void (*fn)(X86 *) = functions[f][mode];
                     clock_t start = clock();
                     for (unsigned i = 0; i < iterations; ++i) {
@@ -230,7 +243,7 @@ static void benchmark(void) {
                     samples[mode][trial] =
                         (double)(clock() - start) * 1e9 / CLOCKS_PER_SEC / iterations;
                     /* Observable checksum outside the timing region. */
-                    if (c.fpu_top > 7 || !isfinite(rdf32(0x10080)))
+                    if (!FIXTURE_BENCH_CHECK(&c))
                         abort();
                 }
             }
