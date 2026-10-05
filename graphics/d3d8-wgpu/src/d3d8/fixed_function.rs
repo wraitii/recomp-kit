@@ -552,16 +552,29 @@ pub struct StageUniform {
     pub active: u32,
     /// `D3DTSS_TEXCOORDINDEX`: 0 or 1.
     pub tex_coord_index: u32,
+    /// Resolved coordinate generation: [`crate::d3d8::state::TEXCOORD_GEN_PASSTHRU`]
+    /// or [`crate::d3d8::state::TEXCOORD_GEN_CAMERASPACEPOSITION`]. The latter
+    /// ignores `tex_coord_index`/`tex_coord_available` and derives the
+    /// coordinate from the camera-space vertex position.
+    pub tex_coord_gen: u32,
     /// Nonzero when the FVF carries the set `tex_coord_index` selected. Zero
     /// makes the shader sample `(0, 0)`, matching WineD3D and DXVK for an
     /// undeclared set.
     pub tex_coord_available: u32,
     /// `D3DTSS_TEXTURETRANSFORMFLAGS`: 0 disabled, 2 (`D3DTTFF_COUNT2`)
-    /// applies `tex_transform` to the selected coordinate.
+    /// applies `tex_transform` to the selected vertex coordinate, `0x103`
+    /// (`D3DTTFF_COUNT3 | D3DTTFF_PROJECTED`) applies it to the generated
+    /// camera-space position and divides by the third output component
+    /// (`COUNT3 | PROJECTED` divides by the component `COUNT` selects).
     pub tex_transform_flags: u32,
     /// `D3DTSS_MIPMAPLODBIAS` as an `f32`. Applied with `textureSampleBias`
     /// because wgpu 27 samplers have no `lod_bias` field.
     pub lod_bias: f32,
+    /// Padding that keeps the struct a 16-byte multiple. The WGSL
+    /// `StageUniform` has matching scalar pad fields so the host and shader
+    /// layouts agree byte for byte (`wgpu` validates this at pipeline
+    /// creation).
+    pub pad: [u32; 3],
 }
 
 impl StageUniform {
@@ -578,11 +591,13 @@ impl StageUniform {
             texture_factor: stage.texture_factor,
             active: u32::from(stage.active),
             tex_coord_index: stage.tex_coord_index,
+            tex_coord_gen: stage.tex_coord_gen,
             // `Device::draw_primitive` overrides this from the FVF with
             // `StagesUniform::for_fvf`; the standalone default is available.
             tex_coord_available: 1,
             tex_transform_flags: stage.tex_transform_flags,
             lod_bias: stage.lod_bias,
+            pad: [0; 3],
         }
     }
 }
@@ -652,6 +667,10 @@ impl StagesUniform {
         for stage in &mut uniform.stages {
             stage.tex_transform = Mat4::IDENTITY.rows;
             stage.tex_transform_flags = 0;
+            // D3D8 does not generate texture coordinates for pre-transformed
+            // vertices, so an XYZRHW draw samples the vertex coordinate even
+            // when the stage asked for camera-space generation.
+            stage.tex_coord_gen = crate::d3d8::state::TEXCOORD_GEN_PASSTHRU;
         }
         uniform
     }
@@ -683,6 +702,27 @@ pub fn transform_texcoord(uv: [f32; 2], m: &Mat4, flags: u32) -> [f32; 2] {
     }
     let out = m.transform([uv[0], uv[1], 1.0, 0.0]);
     [out[0], out[1]]
+}
+
+/// CPU reference for the WGSL `camera_space_texcoord` path.
+///
+/// `cam_pos` is the camera-space vertex position `view * world * position`
+/// with `w = 1`. D3D8's `D3DTSS_TCI_CAMERASPACEPOSITION` feeds that 4-vector to
+/// the stage's `D3DTS_TEXTUREx` matrix; the game uses
+/// `D3DTTFF_COUNT3 | D3DTTFF_PROJECTED` (`0x103`). D3D's projected divide uses
+/// the last component the count selects, so with COUNT3 the matrix output's
+/// third component (`q`) divides the first two; its fourth component is not
+/// used. (A COUNT4 projected stage would divide by `w`; that is not resolved.)
+/// Applying the matrix to the interpolated position and dividing per pixel is
+/// equivalent to D3D's per-vertex transform plus perspective-correct
+/// interpolation of the projected coordinates.
+///
+/// The WGSL function must stay in sync; `camera_space_texcoord_matches_count3_projected`
+/// checks both the CPU result and the shader source.
+pub fn camera_space_texcoord(cam_pos: [f32; 4], m: &Mat4, flags: u32) -> [f32; 2] {
+    debug_assert_eq!(flags, 0x103, "only COUNT3 | PROJECTED is resolved");
+    let out = m.transform(cam_pos);
+    [out[0] / out[2], out[1] / out[2]]
 }
 
 /// Group 0 binding 2 uniform: the resolved D3D8 table/pixel fog state.
@@ -838,9 +878,13 @@ struct StageUniform {
     texture_factor: u32,
     stage_active: u32,
     tex_coord_index: u32,
+    tex_coord_gen: u32,
     tex_coord_available: u32,
     tex_transform_flags: u32,
     lod_bias: f32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 };
 
 struct StagesUniform {
@@ -902,6 +946,10 @@ struct VertexOutput {
     @location(3) fogdist: f32,
     @location(4) fogfactor: f32,
     @location(5) @interpolate(linear) specular: vec3<f32>,
+    // Camera-space position (`view * world * position`, w = 1) used by
+    // D3DTSS_TCI_CAMERASPACEPOSITION stages. Interpolated perspective-correct
+    // so the fragment stage can apply the projective texture matrix there.
+    @location(6) cam_pos: vec4<f32>,
 };
 
 @vertex
@@ -917,6 +965,9 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     }
     out.fogdist = fog_d;
     out.fogfactor = select(1.0, fog_factor(fog_d), fog.vertex_fog != 0u);
+    // Camera-space position for D3DTSS_TCI_CAMERASPACEPOSITION texgen;
+    // `fog.world_view` is `world * view`, so this is `view * world * pos`.
+    out.cam_pos = fog.world_view * vec4<f32>(in.position, 1.0);
     let a = f32((in.color >> 24u) & 0xffu) / 255.0;
     let r = f32((in.color >> 16u) & 0xffu) / 255.0;
     let g = f32((in.color >> 8u) & 0xffu) / 255.0;
@@ -960,6 +1011,9 @@ fn vs_rhw_main(in: VertexInputRhw) -> VertexOutput {
     }
     out.position = vec4<f32>(ndc_x * w, ndc_y * w, in.position.z * w, w);
     out.fogdist = in.position.z;
+    // Pre-transformed draws never generate texture coordinates; the entry
+    // point is shared, so leave an unused value.
+    out.cam_pos = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     let a = f32((in.color >> 24u) & 0xffu) / 255.0;
     let r = f32((in.color >> 16u) & 0xffu) / 255.0;
     let g = f32((in.color >> 8u) & 0xffu) / 255.0;
@@ -1093,6 +1147,20 @@ fn transform_texcoord(uv: vec2<f32>, m: mat4x4<f32>, flags: u32) -> vec2<f32> {
     return (m * vec4<f32>(uv, 1.0, 0.0)).xy;
 }
 
+// D3DTSS_TCI_CAMERASPACEPOSITION with D3DTTFF_COUNT3 | D3DTTFF_PROJECTED: the
+// stage input is the camera-space position `(x, y, z, 1)`. The texture matrix
+// is applied to the perspective-correct interpolated position and the third
+// output component (`q`, the last one COUNT3 selects) divides the first two;
+// D3D's projected divide uses the last component the count selects, not `w`.
+// Applying the matrix after interpolation is equivalent to D3D's per-vertex
+// transform followed by perspective-correct interpolation, and dividing at the
+// pixel is the projective texture mapping the fixed-function rasterizer
+// performs. See the CPU `camera_space_texcoord` below.
+fn camera_space_texcoord(pos: vec4<f32>, m: mat4x4<f32>) -> vec2<f32> {
+    let out = m * pos;
+    return out.xy / out.z;
+}
+
 // Evaluate one stage. `current` is the input current colour (diffuse for
 // stage 0, the stage-0 result for stage 1). The result is clamped to [0,1]
 // before it feeds the next stage, as D3D8 does.
@@ -1102,19 +1170,24 @@ fn eval_stage(
     diffuse: vec4<f32>,
     uv0: vec2<f32>,
     uv1: vec2<f32>,
+    cam_pos: vec4<f32>,
     tex: texture_2d<f32>,
     samp: sampler,
 ) -> vec4<f32> {
     if (s.stage_active == 0u) {
         return current;
     }
-    // An FVF that does not carry the selected set leaves the coordinate
-    // uninitialized; WineD3D and DXVK both resolve that to (0, 0).
     var uv = uv0;
-    if (s.tex_coord_index == 1u) {
-        uv = select(uv1, vec2<f32>(0.0, 0.0), s.tex_coord_available == 0u);
+    if (s.tex_coord_gen == 1u) {
+        uv = camera_space_texcoord(cam_pos, s.tex_transform);
+    } else {
+        // An FVF that does not carry the selected set leaves the coordinate
+        // uninitialized; WineD3D and DXVK both resolve that to (0, 0).
+        if (s.tex_coord_index == 1u) {
+            uv = select(uv1, vec2<f32>(0.0, 0.0), s.tex_coord_available == 0u);
+        }
+        uv = transform_texcoord(uv, s.tex_transform, s.tex_transform_flags);
     }
-    uv = transform_texcoord(uv, s.tex_transform, s.tex_transform_flags);
     // `textureSampleBias` requires uniform control flow; this call site is
     // unconditional in `fs_main` and every branch above depends only on the
     // uniform-buffer stage state, so naga's uniformity analysis accepts it.
@@ -1181,8 +1254,8 @@ fn alpha_test_pass(alpha: f32) -> bool {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let diffuse = in.color;
-    let r0 = eval_stage(stages.stages[0], diffuse, diffuse, in.uv0, in.uv1, stage0_tex, stage0_sampler);
-    let r1 = eval_stage(stages.stages[1], r0, diffuse, in.uv0, in.uv1, stage1_tex, stage1_sampler);
+    let r0 = eval_stage(stages.stages[0], diffuse, diffuse, in.uv0, in.uv1, in.cam_pos, stage0_tex, stage0_sampler);
+    let r1 = eval_stage(stages.stages[1], r0, diffuse, in.uv0, in.uv1, in.cam_pos, stage1_tex, stage1_sampler);
     if (!alpha_test_pass(r1.a)) {
         discard;
     }
@@ -1568,6 +1641,7 @@ mod tests {
             alpha_arg2: 3, // TFACTOR
             texture_factor: 0x4080_c020,
             tex_coord_index: 0,
+            tex_coord_gen: 0,
             tex_transform_flags: 0,
             tex_transform: crate::d3d8::math::Mat4::IDENTITY,
             min_filter: 2,
@@ -1586,14 +1660,14 @@ mod tests {
         assert_eq!(u.active, 1);
         assert_eq!(u.lod_bias, 0.8);
         // Texture matrix, six op/arg words, texture factor, active,
-        // coordinate index/flags, the FVF-availability word and the LOD bias.
-        assert_eq!(bytemuck::bytes_of(&u).len(), 112);
-        // std140-style layout: the bias occupies the old pad word at offset
-        // 108, immediately before the struct's 16-byte rounding. wgpu checks
-        // this host layout against the WGSL struct at pipeline creation.
-        assert_eq!(&bytemuck::bytes_of(&u)[108..112], &0.8f32.to_le_bytes());
+        // coordinate index/generation/availability, transform flags, the LOD
+        // bias and the trailing padding.
+        assert_eq!(bytemuck::bytes_of(&u).len(), 128);
+        // std140-style layout: the bias follows the transform flags. wgpu
+        // checks this host layout against the WGSL struct at pipeline creation.
+        assert_eq!(&bytemuck::bytes_of(&u)[112..116], &0.8f32.to_le_bytes());
         let both = StagesUniform::new(&stage, &stage);
-        assert_eq!(bytemuck::bytes_of(&both).len(), 224);
+        assert_eq!(bytemuck::bytes_of(&both).len(), 256);
         // The shader must sample with the bias, not plain `textureSample`.
         assert!(TEXTURED_WGSL.contains("textureSampleBias(tex, samp, uv, s.lod_bias)"));
     }
@@ -1646,6 +1720,7 @@ mod tests {
             alpha_arg2: 1, // CURRENT
             texture_factor: 0,
             tex_coord_index,
+            tex_coord_gen: 0,
             tex_transform_flags: 0,
             tex_transform: crate::d3d8::math::Mat4::IDENTITY,
             min_filter: 2,
@@ -1669,12 +1744,12 @@ mod tests {
         // FVF 0x242 carries set 1, so the same stage state is available.
         let stages = StagesUniform::for_fvf(&stage(0), &stage(1), 2);
         assert_eq!(stages.stages[1].tex_coord_available, 1);
-        assert_eq!(bytemuck::bytes_of(&stages).len(), 224);
+        assert_eq!(bytemuck::bytes_of(&stages).len(), 256);
     }
 
     #[test]
     fn pre_transformed_draw_disables_texture_transforms() {
-        // A COUNT2 matrix that a normal draw would apply.
+        // A COUNT2 matrix that a normal draw would apply to a vertex coordinate.
         let mut matrix = Mat4::IDENTITY;
         matrix.rows[0][0] = 46.0;
         matrix.rows[1][1] = 46.0;
@@ -1688,6 +1763,7 @@ mod tests {
             alpha_arg2: 1, // CURRENT
             texture_factor: 0,
             tex_coord_index: 1,
+            tex_coord_gen: crate::d3d8::state::TEXCOORD_GEN_PASSTHRU,
             tex_transform_flags: 2,
             tex_transform: matrix,
             min_filter: 2,
@@ -1708,7 +1784,65 @@ mod tests {
         for uniform in &rhw.stages {
             assert_eq!(uniform.tex_transform_flags, 0);
             assert_eq!(uniform.tex_transform, Mat4::IDENTITY.rows);
+            assert_eq!(
+                uniform.tex_coord_gen,
+                crate::d3d8::state::TEXCOORD_GEN_PASSTHRU
+            );
         }
+        // A camera-space stage is disabled the same way: D3D8 does not generate
+        // coordinates for pre-transformed vertices, so the vertex coordinate is
+        // sampled instead of the overlay projection.
+        let generated = crate::d3d8::state::TextureStage {
+            tex_coord_gen: crate::d3d8::state::TEXCOORD_GEN_CAMERASPACEPOSITION,
+            tex_transform_flags: 0x103,
+            ..stage
+        };
+        let rhw = StagesUniform::for_pre_transformed(&generated, &generated, 2);
+        for uniform in &rhw.stages {
+            assert_eq!(
+                uniform.tex_coord_gen,
+                crate::d3d8::state::TEXCOORD_GEN_PASSTHRU
+            );
+            assert_eq!(uniform.tex_transform_flags, 0);
+        }
+    }
+
+    #[test]
+    fn camera_space_texcoord_matches_count3_projected() {
+        use crate::d3d8::state::{TEXCOORD_GEN_CAMERASPACEPOSITION, TEXCOORD_GEN_PASSTHRU};
+        // Camera space for an object at the origin under a view that scales by
+        // 2 and translates by z = 4. `world_view * pos` maps (1, 2, 3, 1) to
+        // (2, 4, 10, 1).
+        let world = Mat4::translation(0.0, 0.0, 0.0);
+        let view = Mat4::scale(2.0, 2.0, 2.0).mul(Mat4::translation(0.0, 0.0, 4.0));
+        let world_view = world.mul(view);
+        let cam = world_view.transform([1.0, 2.0, 3.0, 1.0]);
+        assert_eq!(cam, [2.0, 4.0, 10.0, 1.0]);
+        // The terrain overlay's matrix: scale x by 0.435, y by 0.85, pass z
+        // through (it is the COUNT3 divisor q) and offset y by the fourth row
+        // (camera-space w = 1). The fourth output (0.5 * z + 1) is unused.
+        let mut m = Mat4::IDENTITY;
+        m.rows[0][0] = 0.435;
+        m.rows[1][1] = 0.85;
+        m.rows[2][2] = 1.0;
+        m.rows[2][3] = 0.5;
+        m.rows[3][1] = 0.25;
+        let out = camera_space_texcoord(cam, &m, 0x103);
+        // (0.435 * 2, 0.85 * 4 + 0.25) / q, with q = z = 10.
+        assert!((out[0] - (0.435 * 2.0) / 10.0).abs() < 1e-6);
+        assert!((out[1] - (0.85 * 4.0 + 0.25) / 10.0).abs() < 1e-6);
+        // The passthru CPU helper must not be used for generated coordinates;
+        // the shader takes the camera-space branch on the generation word.
+        assert_eq!(TEXCOORD_GEN_CAMERASPACEPOSITION, 1);
+        assert_eq!(TEXCOORD_GEN_PASSTHRU, 0);
+        assert!(TEXTURED_WGSL.contains("fn camera_space_texcoord(pos: vec4<f32>, m: mat4x4<f32>)"));
+        assert!(TEXTURED_WGSL.contains("if (s.tex_coord_gen == 1u)"));
+        assert!(TEXTURED_WGSL.contains(
+            "let r0 = eval_stage(stages.stages[0], diffuse, diffuse, in.uv0, in.uv1, in.cam_pos"
+        ));
+        assert!(
+            TEXTURED_WGSL.contains("out.cam_pos = fog.world_view * vec4<f32>(in.position, 1.0)")
+        );
     }
 }
 

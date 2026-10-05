@@ -462,6 +462,18 @@ impl DeviceState {
         let mut stage_transforms = [(0u32, Mat4::IDENTITY); 2];
         for (set, transform) in stage_transforms.iter_mut().enumerate().take(texcoord_sets) {
             let stage = self.resolve_texture_stage(set as u32, true)?;
+            // D3D8's ProcessVertices also honours texture-coordinate
+            // generation, but this game never selects it here: its
+            // ProcessVertices path programs plain vertex coordinate sets
+            // (`FUN_00547650`). Refuse CAMERASPACEPOSITION by name rather than
+            // feeding the vertex coordinate through the affine transform and
+            // silently producing the wrong destination coordinates.
+            if stage.tex_coord_gen != crate::d3d8::state::TEXCOORD_GEN_PASSTHRU {
+                return Err(RenderError::new(
+                    "ProcessVertices",
+                    "D3DTSS_TCI_CAMERASPACEPOSITION texture generation is not implemented for ProcessVertices",
+                ));
+            }
             *transform = (stage.tex_transform_flags, stage.tex_transform);
         }
         let mut pv_trace = ProcessTrace::new(count);

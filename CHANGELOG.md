@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- D3D8 `D3DTSS_TEXCOORDINDEX` now resolves `D3DTSS_TCI_CAMERASPACEPOSITION`
+  with `D3DTTFF_COUNT3 | D3DTTFF_PROJECTED` instead of failing the draw as an
+  unimplemented coordinate transform. `D3DTSS_TCI_CAMERASPACENORMAL` and
+  `D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR` remain named refusals. The textured
+  vertex shader carries the camera-space position (`world * view * position`,
+  `w = 1`) as a perspective-interpolated varying; the fragment stage applies
+  the stage's `D3DTS_TEXTUREx` matrix and divides by the third output component
+  (the last one `COUNT3` selects, as D3D's projected divide does), so the
+  projective divide happens at the pixel. The pre-transformed
+  (`XYZRHW`) path disables generation, matching D3D8's rule that it does not
+  transform pre-transformed vertices. A camera-space stage reaching
+  `ProcessVertices` is a named refusal: the game's `ProcessVertices` path only
+  programs vertex coordinate sets. Found in a terrain colour overlay (stage 0,
+  FVF `0x112`).
+
 - D3D8 `SetVertexShaderConstant`/`GetVertexShaderConstant` and
   `SetPixelShaderConstant`/`GetPixelShaderConstant` now store and return the
   caller's float4 registers instead of aborting through the unsupported-import

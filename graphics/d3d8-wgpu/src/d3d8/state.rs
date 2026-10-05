@@ -27,6 +27,14 @@ pub const MAX_TEXTURE_STAGES: usize = 8;
 /// active fail by name rather than being silently dropped.
 pub const MAX_SUPPORTED_TEXTURE_STAGES: u32 = 2;
 
+/// `D3DTSS_TCI_PASSTHRU`: the stage samples the vertex texture-coordinate set
+/// named by the low word of `D3DTSS_TEXCOORDINDEX`.
+pub const TEXCOORD_GEN_PASSTHRU: u32 = 0;
+
+/// `D3DTSS_TCI_CAMERASPACEPOSITION`: the stage generates its coordinate from
+/// the camera-space vertex position (`view * world * position`, `w = 1`).
+pub const TEXCOORD_GEN_CAMERASPACEPOSITION: u32 = 1;
+
 /// A resolved texture stage, ready for the pipeline/shader.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TextureStage {
@@ -43,6 +51,9 @@ pub struct TextureStage {
     /// `D3DTSS_TEXCOORDINDEX`: which vertex texture-coordinate set to sample
     /// (`0` or `1`). The guest's three TSS functions only emit plain `0`/`1`.
     pub tex_coord_index: u32,
+    /// Resolved `D3DTSS_TEXCOORDINDEX` generation mode:
+    /// [`TEXCOORD_GEN_PASSTHRU`] or [`TEXCOORD_GEN_CAMERASPACEPOSITION`].
+    pub tex_coord_gen: u32,
     /// `D3DTSS_TEXTURETRANSFORMFLAGS`: 0 when disabled, `D3DTTFF_COUNT2`
     /// (2) for the affine 4x4 transform the guest's engine emits. Other
     /// forms are refused by name in `resolve_texture_stage`.
@@ -653,14 +664,48 @@ impl DeviceState {
         let alpha_arg1 = arg("D3DTSS_ALPHAARG1", raw(Ts::AlphaArg1, d3dta::TEXTURE))?;
         let alpha_arg2 = arg("D3DTSS_ALPHAARG2", raw(Ts::AlphaArg2, d3dta::CURRENT))?;
         let tex_coord_index = raw(Ts::TexCoordIndex, 0);
-        // Only plain vertex-coordinate set 0/1 is emitted. D3D8 packs
-        // camera-space generation modes in the high bits (`D3DTSS_TCI_*`);
-        // those are a named refusal, not a silent set selection.
-        if tex_coord_index > 1 {
-            return Err(fail(format!(
-                "D3DTSS_TEXCOORDINDEX = {tex_coord_index:#010x} needs a texture-coordinate index/transform that is not implemented"
-            )));
-        }
+        // D3DTSS_TEXCOORDINDEX packs a coordinate-generation mode in the high
+        // word and the vertex coordinate-set index in the low word. Only
+        // passthru (D3DTSS_TCI_PASSTHRU, sets 0/1) and CAMERASPACEPOSITION are
+        // implemented. CAMERASPACENORMAL and CAMERASPACEREFLECTIONVECTOR are
+        // named refusals rather than silently treating the low word as a set.
+        const TCI_CAMERASPACENORMAL: u32 = 0x0001_0000;
+        const TCI_CAMERASPACEPOSITION: u32 = 0x0002_0000;
+        const TCI_CAMERASPACEREFLECTIONVECTOR: u32 = 0x0003_0000;
+        let (tex_coord_gen, tex_coord_set) = match tex_coord_index & 0xffff_0000 {
+            0 => {
+                if tex_coord_index > 1 {
+                    return Err(fail(format!(
+                        "D3DTSS_TEXCOORDINDEX = {tex_coord_index:#010x} selects vertex coordinate set {tex_coord_index}, but only sets 0 and 1 exist"
+                    )));
+                }
+                (TEXCOORD_GEN_PASSTHRU, tex_coord_index)
+            }
+            TCI_CAMERASPACEPOSITION => {
+                if tex_coord_index & 0xffff != 0 {
+                    return Err(fail(format!(
+                        "D3DTSS_TEXCOORDINDEX = {tex_coord_index:#010x} combines CAMERASPACEPOSITION with vertex coordinate set {}; the index is ignored for generated coordinates",
+                        tex_coord_index & 0xffff
+                    )));
+                }
+                (TEXCOORD_GEN_CAMERASPACEPOSITION, 0)
+            }
+            TCI_CAMERASPACENORMAL => {
+                return Err(fail(format!(
+                    "D3DTSS_TEXCOORDINDEX = {tex_coord_index:#010x} (D3DTSS_TCI_CAMERASPACENORMAL) is not implemented"
+                )));
+            }
+            TCI_CAMERASPACEREFLECTIONVECTOR => {
+                return Err(fail(format!(
+                    "D3DTSS_TEXCOORDINDEX = {tex_coord_index:#010x} (D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR) is not implemented"
+                )));
+            }
+            other => {
+                return Err(fail(format!(
+                    "D3DTSS_TEXCOORDINDEX = {tex_coord_index:#010x} uses unsupported generation mode {other:#010x}"
+                )));
+            }
+        };
         // `D3DTSS_RESULTARG` is only interesting with a temp register, which
         // the guest never uses; refuse anything but the default CURRENT.
         if let Some(result_arg) = self.texture_stage_state(stage, Ts::ResultArg.raw()) {
@@ -671,17 +716,27 @@ impl DeviceState {
             }
         }
         let transform_flags = raw(Ts::TextureTransformFlags, 0);
-        // D3DTTFF_COUNT2 transforms the selected 2D vertex coordinate as the
+        // D3DTTFF_COUNT2 transforms a passthru vertex coordinate as the
         // 4-vector `(u, v, 1, 0)` and takes the first two components (the first
-        // component not supplied by the vertex is padded to 1). Other counts
-        // and D3DTTFF_PROJECTED have no draw path yet and stay named refusals
-        // rather than being silently ignored.
-        let tex_transform = match transform_flags {
-            0 => Mat4::IDENTITY,
-            2 => self.texture_transforms[stage as usize],
-            other => {
+        // component not supplied by the vertex is padded to 1).
+        //
+        // The terrain overlay generates coordinates from the camera-space
+        // position with D3DTTFF_COUNT3 | D3DTTFF_PROJECTED (0x103): the texture
+        // matrix is applied to `(x, y, z, 1)` and the third output (`q`, the
+        // last component COUNT3 selects) divides the first two. Other counts and modes stay named refusals on each
+        // generation path rather than being silently ignored.
+        let tex_transform = match (tex_coord_gen, transform_flags) {
+            (TEXCOORD_GEN_PASSTHRU, 0) => Mat4::IDENTITY,
+            (TEXCOORD_GEN_PASSTHRU, 2) => self.texture_transforms[stage as usize],
+            (TEXCOORD_GEN_CAMERASPACEPOSITION, 0x103) => self.texture_transforms[stage as usize],
+            (TEXCOORD_GEN_PASSTHRU, other) => {
                 return Err(fail(format!(
-                    "D3DTSS_TEXTURETRANSFORMFLAGS = {other:#010x} is not DISABLE or D3DTTFF_COUNT2"
+                    "D3DTSS_TEXTURETRANSFORMFLAGS = {other:#010x} is not DISABLE or D3DTTFF_COUNT2 for a vertex texture coordinate"
+                )));
+            }
+            (_, other) => {
+                return Err(fail(format!(
+                    "D3DTSS_TEXTURETRANSFORMFLAGS = {other:#010x} is not D3DTTFF_COUNT3 | D3DTTFF_PROJECTED for D3DTSS_TCI_CAMERASPACEPOSITION"
                 )));
             }
         };
@@ -793,7 +848,8 @@ impl DeviceState {
             alpha_arg1,
             alpha_arg2,
             texture_factor: self.states.texture_factor,
-            tex_coord_index,
+            tex_coord_index: tex_coord_set,
+            tex_coord_gen,
             tex_transform_flags: transform_flags,
             tex_transform,
             min_filter,
@@ -1961,6 +2017,56 @@ mod tests {
         let stage = state.resolve_texture_stage(0, true).unwrap();
         assert_eq!(stage.tex_transform_flags, 0);
         assert_eq!(stage.tex_transform, Mat4::IDENTITY);
+    }
+
+    #[test]
+    fn camera_space_position_texgen_resolves_with_count3_projected() {
+        let mut state = DeviceState::new(64, 64);
+        // The terrain overlay's projective texture matrix: scale x/y, pass z
+        // through as the COUNT3 divisor, and offset y from the fourth row (the camera-space
+        // input has w = 1).
+        let mut m = Mat4::IDENTITY;
+        m.rows[0][0] = 0.435;
+        m.rows[1][1] = 0.85;
+        m.rows[2][2] = 1.0;
+        m.rows[2][3] = 0.5;
+        m.rows[3][1] = 0.25;
+        state.set_transform(16, m).unwrap(); // D3DTS_TEXTURE0
+        state.set_texture_stage_state(0, 11, 0x20000).unwrap(); // TCI CAMERASPACEPOSITION
+        state.set_texture_stage_state(0, 24, 0x103).unwrap(); // TTFF COUNT3 | PROJECTED
+        let stage = state.resolve_texture_stage(0, true).unwrap();
+        assert_eq!(stage.tex_coord_gen, TEXCOORD_GEN_CAMERASPACEPOSITION);
+        assert_eq!(stage.tex_coord_index, 0);
+        assert_eq!(stage.tex_transform_flags, 0x103);
+        assert_eq!(stage.tex_transform, m);
+        // The game only combines CAMERASPACEPOSITION with COUNT3 | PROJECTED;
+        // a disabled transform on generated coordinates is refused by name
+        // rather than guessing D3D's default count.
+        state.set_texture_stage_state(0, 24, 0).unwrap();
+        let err = state.resolve_texture_stage(0, true).unwrap_err();
+        assert!(err.cause.contains("COUNT3"));
+    }
+
+    #[test]
+    fn camera_space_generation_modes_outside_the_subset_fail_by_name() {
+        fn resolve(tci: u32, ttf: u32) -> String {
+            let mut state = DeviceState::new(64, 64);
+            state.set_texture_stage_state(0, 11, tci).unwrap();
+            state.set_texture_stage_state(0, 24, ttf).unwrap();
+            state.resolve_texture_stage(0, true).unwrap_err().cause
+        }
+        // The other camera-space generation modes are refused by name.
+        assert!(resolve(0x10000, 0x103).contains("CAMERASPACENORMAL"));
+        assert!(resolve(0x30000, 0x103).contains("CAMERASPACEREFLECTIONVECTOR"));
+        // A generated coordinate cannot also name a vertex set.
+        assert!(resolve(0x20001, 0x103).contains("CAMERASPACEPOSITION"));
+        // COUNT2/PROJECTED, COUNT2, COUNT3 without projected and COUNT4 with
+        // projected are not the mode the game uses.
+        assert!(resolve(0x20000, 0x102).contains("COUNT3"));
+        assert!(resolve(0x20000, 0x003).contains("COUNT3"));
+        assert!(resolve(0x20000, 0x104).contains("COUNT3"));
+        // A vertex coordinate cannot use the projective COUNT3 transform.
+        assert!(resolve(0, 0x103).contains("COUNT2"));
     }
 
     #[test]
