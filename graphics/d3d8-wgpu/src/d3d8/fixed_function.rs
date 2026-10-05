@@ -1,8 +1,10 @@
 //! FVF decoding and bounded fixed-function pipeline construction.
 //!
 //! XYZ/DIFFUSE FVFs 0x42, 0x142 and 0x242 feed unlit raster shaders.
-//! XYZ/NORMAL/DIFFUSE/TEX1 (0x152) feeds software vertex lighting and a
-//! floating diffuse raster input. Other layouts fail with a named diagnostic.
+//! XYZ/NORMAL/TEX1 (0x112) and XYZ/NORMAL/DIFFUSE/TEX1 (0x152) feed software
+//! vertex lighting and a floating diffuse raster input; 0x112 has no
+//! per-vertex diffuse, so the material supplies it. Other layouts fail with a
+//! named diagnostic.
 //!
 //! # Matrix convention
 //!
@@ -37,6 +39,12 @@ pub const FVF_XYZ_DIFFUSE_TEX1: u32 = 0x0142;
 /// set is carried by the layout but unused. A stage that selects set 1 reads it
 /// directly.
 pub const FVF_XYZ_DIFFUSE_TEX2: u32 = 0x0242;
+
+/// `D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX1` (0x0112); one 2-float texture
+/// coordinate at offset 24 and no per-vertex diffuse. The normal at offset 12
+/// feeds the same software vertex lighting as `0x152`; with lighting disabled
+/// the material supplies the diffuse because there is no COLOR1 component.
+pub const FVF_XYZ_NORMAL_TEX1: u32 = 0x0112;
 
 /// `D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_SPECULAR | D3DFVF_TEX1` (0x1C4).
 /// The D3D7 front end's logo and fixed-function path submits these already
@@ -149,6 +157,29 @@ impl FvfLayout {
                     },
                 ],
             }),
+            FVF_XYZ_NORMAL_TEX1 => Ok(Self {
+                stride: 32,
+                texcoord_sets: 1,
+                pre_transformed: false,
+                attributes: vec![
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x3,
+                        offset: 0,
+                        shader_location: 0,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 24,
+                        shader_location: 2,
+                    },
+                    // Single-set FVF: set 1 aliases set 0, as in 0x142.
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 24,
+                        shader_location: 3,
+                    },
+                ],
+            }),
             0x152 => Ok(Self {
                 stride: 36,
                 texcoord_sets: 1,
@@ -248,7 +279,7 @@ impl FvfLayout {
             _ => Err(RenderError::new(
                 "FvfLayout::decode",
                 format!(
-                    "unsupported FVF 0x{raw:08X}; only D3DFVF_XYZ | D3DFVF_DIFFUSE (0x{FVF_XYZ_DIFFUSE:08X}), D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 (0x{FVF_XYZ_DIFFUSE_TEX1:08X}), D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX2 (0x{FVF_XYZ_DIFFUSE_TEX2:08X}), XYZ | NORMAL | DIFFUSE | TEX1 (0x00000152) and XYZRHW | DIFFUSE | SPECULAR | TEX1/2 (0x000001C4/0x000002C4) are implemented"
+                    "unsupported FVF 0x{raw:08X}; only D3DFVF_XYZ | D3DFVF_DIFFUSE (0x{FVF_XYZ_DIFFUSE:08X}), D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 (0x{FVF_XYZ_DIFFUSE_TEX1:08X}), D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX2 (0x{FVF_XYZ_DIFFUSE_TEX2:08X}), XYZ | NORMAL | TEX1 (0x00000112), XYZ | NORMAL | DIFFUSE | TEX1 (0x00000152) and XYZRHW | DIFFUSE | SPECULAR | TEX1/2 (0x000001C4/0x000002C4) are implemented"
                 ),
             )),
         }
@@ -1252,6 +1283,25 @@ mod tests {
         assert_eq!(layout.attributes[3].format, wgpu::VertexFormat::Float32x2);
         assert_eq!(layout.attributes[3].offset, 24);
         assert_eq!(layout.attributes[3].shader_location, 3);
+        assert_eq!(layout.vertex_buffer_layout().array_stride, 32);
+    }
+
+    #[test]
+    fn decode_xyz_normal_tex1_stride_and_offsets() {
+        let layout = FvfLayout::decode(FVF_XYZ_NORMAL_TEX1).expect("0x112 must decode");
+        assert_eq!(layout.stride, 32);
+        assert_eq!(layout.texcoord_sets, 1);
+        assert!(!layout.pre_transformed);
+        assert_eq!(layout.attributes.len(), 3);
+        assert_eq!(layout.attributes[0].format, wgpu::VertexFormat::Float32x3);
+        assert_eq!(layout.attributes[0].offset, 0);
+        // No diffuse attribute: lighting synthesises the float diffuse.
+        assert_eq!(layout.attributes[1].shader_location, 2);
+        assert_eq!(layout.attributes[1].format, wgpu::VertexFormat::Float32x2);
+        assert_eq!(layout.attributes[1].offset, 24);
+        // Set 1 aliases set 0 for the shared two-stage shader.
+        assert_eq!(layout.attributes[2].shader_location, 3);
+        assert_eq!(layout.attributes[2].offset, 24);
         assert_eq!(layout.vertex_buffer_layout().array_stride, 32);
     }
 

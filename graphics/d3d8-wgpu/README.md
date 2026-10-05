@@ -16,7 +16,7 @@ The native resource tests link the same Rust storage without creating a GPU.
   (or a game ships its own `graphics/d3d8-wgpu`). Game-specific usage inventories and
   execution evidence belong in the game repository, alongside its README and engine notes.
 - Some draw paths cover only what a game has needed so far (for example the lit
-  `0x152` FVF); anything else fails by name rather than approximating.
+  `0x112`/`0x152` FVFs); anything else fails by name rather than approximating.
 - `reference/` is gitignored local material (Wine's D3D8 headers); the pinned copy the
   generators use is `third_party/wine-d3d8/`.
 
@@ -92,10 +92,12 @@ ignored build tree.
 
 Full-target color/depth/stencil clears, material/light storage, render/texture-stage
 state, world/view/projection transforms, viewport, scene boundaries, and unlit
-triangle-list draws with FVF 0x42/0x142/0x242 are supported. FVF 0x152 adds
-software diffuse/ambient/emissive vertex lighting (directional/point/spot),
-material sources and inverse-transpose normals, with floating diffuse passed
-to the texture/fog/alpha/depth raster path. D16/D24X8/D24S8/D32 map
+triangle-list draws with FVF 0x42/0x142/0x242 are supported. FVFs 0x112
+(XYZ/NORMAL/TEX1) and 0x152 (XYZ/NORMAL/DIFFUSE/TEX1) add software
+diffuse/ambient/emissive vertex lighting (directional/point/spot), material
+sources and inverse-transpose normals, with floating diffuse passed to the
+texture/fog/alpha/depth raster path; 0x112 has no COLOR1, so the material
+supplies the diffuse. D16/D24X8/D24S8/D32 map
 onto wgpu depth formats; the backend-defined D24 precision remains a fidelity
 caveat. Draws reject unsupported reached state by name.
 

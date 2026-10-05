@@ -6,7 +6,7 @@
 //! and depth and select `D3DCULL_NONE`.
 //!
 //! [`DeviceState::validate_unlit`] rejects a draw that reaches an unsupported
-//! combination *before* submission. The 0x152 path implements diffuse, ambient
+//! combination *before* submission. The 0x112/0x152 path implements diffuse, ambient
 //! and emissive vertex lighting. Vertex/range fog, dithering, specular adds
 //! and stencil remain unsupported. Table fog, alpha test and ordinary depth
 //! are supported.
@@ -270,7 +270,7 @@ pub struct DeviceState {
     /// Raw `D3DTSS_*` values per texture stage, set through the fallible
     /// setter. D3D8 exposes eight fixed-function texture stages.
     texture_stages: Vec<BTreeMap<u32, u32>>,
-    /// Current `D3DMATERIAL8`, consumed by the 0x152 vertex-lighting path.
+    /// Current `D3DMATERIAL8`, consumed by the 0x112/0x152 vertex-lighting path.
     material: Material,
     /// The eight `D3DLIGHT8` slots and their enable flags, indexed as the
     /// guest's `SetLight`/`LightEnable`, consumed by vertex lighting.
@@ -873,7 +873,9 @@ impl DeviceState {
     /// Validate the state consumed by the supported guest vertex layout.
     pub fn validate_draw(&self, fvf: u32) -> Result<(), RenderError> {
         let pre_transformed = matches!(fvf, 0x01C4 | 0x02C4);
-        self.validate_fixed_function(fvf == 0x152, pre_transformed)
+        // 0x112 (XYZ/NORMAL/TEX1) and 0x152 (XYZ/NORMAL/DIFFUSE/TEX1) both
+        // carry a normal, so they feed the implemented lighting stage.
+        self.validate_fixed_function(matches!(fvf, 0x0112 | 0x0152), pre_transformed)
     }
 
     fn validate_fixed_function(
@@ -908,8 +910,9 @@ impl DeviceState {
         // the vertex diffuse directly. Those states are therefore inert for a
         // pre-transformed draw and must not fail it.
         if !pre_transformed {
-            // Only the normal-bearing layout feeds the implemented lighting stage.
-            // Keep other lit FVFs unsupported until their inputs are implemented.
+            // Only the normal-bearing layouts (0x112/0x152) feed the implemented
+            // lighting stage. Keep other lit FVFs unsupported until their inputs
+            // are implemented.
             if s.lighting && !normals {
                 return Err(unsupported(
                     "D3DRS_LIGHTING must be FALSE (material/light state is stored but not applied)",
@@ -1804,3 +1807,4 @@ mod tests {
 
 #[path = "lighting.rs"]
 mod lighting;
+pub use lighting::LitInput;

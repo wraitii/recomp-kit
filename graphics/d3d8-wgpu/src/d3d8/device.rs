@@ -6,7 +6,7 @@ use super::{
         UNLIT_WGSL, lit_layout, lit_shader_source,
     },
     resource::{IndexedDraw, VertexBuffer, expand_indexed_into},
-    state::{DeviceState, MAX_TEXTURE_STAGES},
+    state::{DeviceState, LitInput, MAX_TEXTURE_STAGES},
     stats, survey,
     texture_cache::{TextureCache, TextureKey},
 };
@@ -629,8 +629,8 @@ pub struct Device {
     /// Reused index-expansion output (triangle-list expansion of a guest index
     /// buffer); sized and fully overwritten by [`Device::draw_indexed_primitive`].
     index_scratch: Vec<u8>,
-    /// Reused software-lighting output for the `0x152` FVF; sized and fully
-    /// overwritten by `light_vertices`.
+    /// Reused software-lighting output for the normal-bearing FVFs (0x112 and
+    /// 0x152); sized and fully overwritten by `light_vertices`.
     lit_scratch: Vec<u8>,
     /// One persistent buffer holding a draw's uniforms (at the `DRAW_UB_*`
     /// offsets) and vertices (at `DRAW_VERTEX_OFFSET`), filled by a single
@@ -1381,16 +1381,18 @@ impl Device {
         // start_vertex without touching unused guest vertices. The scratch is
         // moved out for the duration of the draw so the rest of this method can
         // borrow `self` mutably; it is restored below before it is reused.
-        let mut lit_scratch = if fvf == 0x152 {
-            Some(std::mem::take(&mut self.lit_scratch))
-        } else {
-            None
+        let lit_input = match fvf {
+            0x0152 => Some(LitInput::XYZ_NORMAL_DIFFUSE_TEX1),
+            0x0112 => Some(LitInput::XYZ_NORMAL_TEX1),
+            _ => None,
         };
+        let mut lit_scratch = lit_input.map(|_| std::mem::take(&mut self.lit_scratch));
         if let Some(out) = lit_scratch.as_mut() {
             if let Err(error) = self.state.light_vertices(
                 vertices.bytes(),
                 start_vertex as usize,
                 count as usize,
+                lit_input.unwrap(),
                 out,
             ) {
                 self.lit_scratch = lit_scratch.take().unwrap();
@@ -1417,7 +1419,7 @@ impl Device {
             gpu.push_error_scope(wgpu::ErrorFilter::Validation);
             self.frame_scope_open = true;
         }
-        let shader = if fvf == 0x152 {
+        let shader = if lit_input.is_some() {
             let slot = if textured {
                 &mut self.lit_textured_shader
             } else {

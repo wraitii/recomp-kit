@@ -39,8 +39,45 @@ fn inverse3(m: Mat4) -> Result<[[f32; 3]; 3], RenderError> {
     Ok(cofactors.map(|row| row.map(|v| v / det)))
 }
 
+/// Guest vertex layout consumed by [`DeviceState::light_vertices`].
+///
+/// The output is always the fixed 36-byte lit layout from
+/// [`lit_layout`](super::fixed_function::lit_layout): XYZ at 0, float RGBA
+/// diffuse at 12 and the 2-float texture coordinate at 28.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LitInput {
+    /// Bytes between consecutive input vertices.
+    pub stride: usize,
+    /// Byte offset of the 3-float normal.
+    pub normal_offset: usize,
+    /// Byte offset of the `D3DCOLOR` diffuse, or `None` when the FVF has no
+    /// COLOR1 and the material supplies it.
+    pub diffuse_offset: Option<usize>,
+    /// Byte offset of the 2-float texture coordinate.
+    pub uv_offset: usize,
+}
+
+impl LitInput {
+    /// `XYZ | NORMAL | DIFFUSE | TEX1` (0x152): diffuse at 24, UV at 28.
+    pub const XYZ_NORMAL_DIFFUSE_TEX1: Self = Self {
+        stride: 36,
+        normal_offset: 12,
+        diffuse_offset: Some(24),
+        uv_offset: 28,
+    };
+
+    /// `XYZ | NORMAL | TEX1` (0x112): no per-vertex diffuse, UV at 24.
+    pub const XYZ_NORMAL_TEX1: Self = Self {
+        stride: 32,
+        normal_offset: 12,
+        diffuse_offset: None,
+        uv_offset: 24,
+    };
+}
+
 impl DeviceState {
     /// 0x152: XYZ at 0, NORMAL at 12, D3DCOLOR at 24, float2 UV at 28.
+    /// 0x112: XYZ at 0, NORMAL at 12, float2 UV at 24, material diffuse.
     /// Evaluate in camera space and keep floating diffuse until rasterization.
     /// Equations: Microsoft Mathematics of Lighting / Diffuse Lighting /
     /// Attenuation and Spotlight Factor (fixed-function D3D8/9 model).
@@ -53,6 +90,7 @@ impl DeviceState {
         bytes: &[u8],
         start: usize,
         end: usize,
+        layout: LitInput,
         out: &mut Vec<u8>,
     ) -> Result<(), RenderError> {
         let s = &self.states;
@@ -78,28 +116,39 @@ impl DeviceState {
         } else {
             None
         };
-        let material_source = |source, material, vertex| {
+        let material_source = |source, material, vertex: Option<[f32; 4]>| {
+            // COLOR1 with no diffuse component (0x112) and COLOR2 in every lit
+            // FVF fall back to the material, matching D3D8's
+            // D3DMCS_* material-source rule for a missing vertex colour.
             if s.color_vertex && source == D3DMATERIALCOLORSOURCE::Color1 {
-                vertex
+                vertex.unwrap_or(material)
             } else {
                 material
             }
-            // COLOR2 is absent from 0x152: documented fallback is material.
         };
         let global_ambient = d3dcolor_to_rgba(s.ambient);
         out.resize(end * 36, 0);
         for index in start..end {
-            let vertex = &bytes[index * 36..(index + 1) * 36];
+            let begin = index * layout.stride;
+            let vertex = &bytes[begin..begin + layout.stride];
             let float = |offset| f32::from_le_bytes(vertex[offset..offset + 4].try_into().unwrap());
             let position = [float(0), float(4), float(8)];
-            let color = d3dcolor_to_rgba(u32::from_le_bytes(vertex[24..28].try_into().unwrap()));
+            let color = layout.diffuse_offset.map(|offset| {
+                d3dcolor_to_rgba(u32::from_le_bytes(
+                    vertex[offset..offset + 4].try_into().unwrap(),
+                ))
+            });
             let diffuse = material_source(s.diffuse_material_source, self.material.diffuse, color);
             let mut result = if s.lighting {
                 let ambient =
                     material_source(s.ambient_material_source, self.material.ambient, color);
                 let emissive =
                     material_source(s.emissive_material_source, self.material.emissive, color);
-                let normal = [float(12), float(16), float(20)];
+                let normal = [
+                    float(layout.normal_offset),
+                    float(layout.normal_offset + 4),
+                    float(layout.normal_offset + 8),
+                ];
                 let mut normal = normal_matrix.unwrap().map(|row| dot(row, normal));
                 if s.normalize_normals {
                     normal = normalize(normal);
@@ -157,7 +206,7 @@ impl DeviceState {
                     }
                 }
                 result
-            } else if s.color_vertex {
+            } else if let Some(color) = color.filter(|_| s.color_vertex) {
                 color
             } else {
                 self.material.diffuse
@@ -168,7 +217,7 @@ impl DeviceState {
             let dst = &mut out[index * 36..(index + 1) * 36];
             dst[..12].copy_from_slice(&vertex[..12]);
             dst[12..28].copy_from_slice(bytemuck::bytes_of(&result));
-            dst[28..36].copy_from_slice(&vertex[28..36]);
+            dst[28..36].copy_from_slice(&vertex[layout.uv_offset..layout.uv_offset + 8]);
         }
         Ok(())
     }
@@ -189,9 +238,26 @@ mod tests {
     fn lit_color(state: &DeviceState, normal: [f32; 3], color: u32) -> [f32; 4] {
         let mut out = Vec::new();
         state
-            .light_vertices(&vertex(normal, color), 0, 1, &mut out)
+            .light_vertices(
+                &vertex(normal, color),
+                0,
+                1,
+                LitInput::XYZ_NORMAL_DIFFUSE_TEX1,
+                &mut out,
+            )
             .unwrap();
         std::array::from_fn(|c| f32::from_le_bytes(out[12 + c * 4..16 + c * 4].try_into().unwrap()))
+    }
+
+    fn vertex_xyz_normal_tex1(normal: [f32; 3], uv: [f32; 2]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for value in [0.0f32, 0.0, 0.5].into_iter().chain(normal) {
+            bytes.extend(value.to_le_bytes());
+        }
+        for value in uv {
+            bytes.extend(value.to_le_bytes());
+        }
+        bytes
     }
     fn directional() -> DeviceState {
         let mut state = DeviceState::new(32, 32);
@@ -221,14 +287,56 @@ mod tests {
             vertex([0.0, 0.0, -1.0], 0xff00ff00),
         ]
         .concat();
-        state.light_vertices(&two, 0, 2, &mut scratch).unwrap();
+        state
+            .light_vertices(&two, 0, 2, LitInput::XYZ_NORMAL_DIFFUSE_TEX1, &mut scratch)
+            .unwrap();
         assert_eq!(scratch.len(), 72);
         let one = vertex([0.0, 0.0, -1.0], 0xff00ff00);
-        state.light_vertices(&one, 0, 1, &mut scratch).unwrap();
+        state
+            .light_vertices(&one, 0, 1, LitInput::XYZ_NORMAL_DIFFUSE_TEX1, &mut scratch)
+            .unwrap();
         let mut fresh = Vec::new();
-        state.light_vertices(&one, 0, 1, &mut fresh).unwrap();
+        state
+            .light_vertices(&one, 0, 1, LitInput::XYZ_NORMAL_DIFFUSE_TEX1, &mut fresh)
+            .unwrap();
         assert_eq!(scratch, fresh);
         assert_eq!(scratch.len(), 36);
+    }
+
+    #[test]
+    fn xyz_normal_tex1_uses_material_and_copies_uv() {
+        // 0x112 has no COLOR1, so its diffuse must equal the material diffuse
+        // (default opaque white), which the 0x152 helper can express with a
+        // white vertex colour.
+        let state = directional();
+        let mut out152 = Vec::new();
+        state
+            .light_vertices(
+                &vertex([0.0, 0.0, 1.0], 0xffff_ffff),
+                0,
+                1,
+                LitInput::XYZ_NORMAL_DIFFUSE_TEX1,
+                &mut out152,
+            )
+            .unwrap();
+        let mut out112 = Vec::new();
+        state
+            .light_vertices(
+                &vertex_xyz_normal_tex1([0.0, 0.0, 1.0], [0.25, 0.5]),
+                0,
+                1,
+                LitInput::XYZ_NORMAL_TEX1,
+                &mut out112,
+            )
+            .unwrap();
+        assert_eq!(out112.len(), 36);
+        assert_eq!(&out112[..12], &out152[..12]);
+        assert_eq!(&out112[12..28], &out152[12..28]);
+        let uv = [0.25f32, 0.5]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(&out112[28..36], uv.as_slice());
     }
 
     #[test]
