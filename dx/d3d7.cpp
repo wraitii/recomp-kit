@@ -1225,8 +1225,7 @@ void d3d7_sync_texture(ComObj *dev, uint32_t stage) {
     ComObj *tex = com_get(dev->d3d7->texture[stage]);
     D3d8Error err{};
     if (!tex || tex->kind != K_SURFACE || !tex->pixels || !tex->width || !tex->height) {
-        host_ok(d3d8_device_set_texture((D3d8Device *)dev->d3d7_host, stage, 0, 0, 0, 0, 0, 0, 0,
-                                        nullptr, 0, &err),
+        host_ok(d3d8_device_set_texture((D3d8Device *)dev->d3d7_host, stage, 0, 0, 0, nullptr, &err),
                 err, "SetTexture");
         return;
     }
@@ -1279,10 +1278,17 @@ void d3d7_sync_texture(ComObj *dev, uint32_t stage) {
     }
     sc.generation = tex->lock_count == 0 ? tex->d3d8_content_generation : UINT64_MAX;
     const uint32_t dirty = tex->lock_count > 0 ? 1u : 0u;
-    host_ok(d3d8_device_set_texture((D3d8Device *)dev->d3d7_host, stage, tex->id, 0,
-                                    tex->d3d8_content_generation, dirty, D3D8FMT_A8R8G8B8,
-                                    tex->width, tex->height, converted.data(),
-                                    (uint32_t)converted.size(), &err),
+    // D3D7 SetTexture binds one surface; hand the renderer a single base level.
+    D3d8TextureLevel lvl{};
+    lvl.level = 0;
+    lvl.width = tex->width;
+    lvl.height = tex->height;
+    lvl.dirty = dirty;
+    lvl.generation = tex->d3d8_content_generation;
+    lvl.data = converted.data();
+    lvl.bytes = (uint32_t)converted.size();
+    host_ok(d3d8_device_set_texture((D3d8Device *)dev->d3d7_host, stage, tex->id, D3D8FMT_A8R8G8B8, 1,
+                                    &lvl, &err),
             err, "SetTexture");
 #else
     (void)dev;

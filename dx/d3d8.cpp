@@ -2421,21 +2421,32 @@ bool d8_sync_texture(X86 *c, ComObj *dev, uint32_t stage) {
     if (!dev || !dev->d3d8_device || stage >= 8)
         return true;
     ComObj *tex = com_get(dev->d3d8_bound_texture[stage]);
-    ComObj *level = tex && !tex->d3d8_levels.empty() ? com_get(tex->d3d8_levels[0]) : nullptr;
     D3d8Error err{};
     int32_t status;
-    if (tex && level) {
-        const uint8_t *data = d8_buffer_bytes(level);
-        // A lock still open at draw time means the guest may be writing the
-        // staged bytes; force an upload instead of trusting the generation.
-        uint32_t dirty = level->lock_count > 0 ? 1u : 0u;
-        status =
-            d3d8_device_set_texture(host_device(dev), stage, level->id, level->d3d8_level,
-                                    level->d3d8_content_generation, dirty, tex->rmask, level->width,
-                                    level->height, data, data ? level->pixels_bytes : 0, &err);
+    if (tex && !tex->d3d8_levels.empty()) {
+        // Hand the renderer the whole mip chain (base level first). Each level
+        // carries its own content generation so re-locking level N re-uploads
+        // only N; `dirty` covers a lock still open at draw time.
+        const uint32_t count = (uint32_t)tex->d3d8_levels.size();
+        std::vector<D3d8TextureLevel> levels(count);
+        for (uint32_t l = 0; l < count; ++l) {
+            ComObj *level = com_get(tex->d3d8_levels[l]);
+            if (!level)
+                continue;
+            const uint8_t *data = d8_buffer_bytes(level);
+            D3d8TextureLevel &out = levels[l];
+            out.level = level->d3d8_level;
+            out.width = level->width;
+            out.height = level->height;
+            out.dirty = level->lock_count > 0 ? 1u : 0u;
+            out.generation = level->d3d8_content_generation;
+            out.data = data;
+            out.bytes = data ? level->pixels_bytes : 0;
+        }
+        status = d3d8_device_set_texture(host_device(dev), stage, tex->id, tex->rmask, count,
+                                         levels.data(), &err);
     } else {
-        status =
-            d3d8_device_set_texture(host_device(dev), stage, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, &err);
+        status = d3d8_device_set_texture(host_device(dev), stage, 0, 0, 0, nullptr, &err);
     }
     if (status != D3D8_STATUS_OK) {
         com_ret(c, host_result(c, status, err));

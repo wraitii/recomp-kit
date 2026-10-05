@@ -9,6 +9,7 @@
 //! lists. Other reached states are rejected; this is not a complete D3D8 model.
 
 pub mod device;
+pub mod dump;
 pub mod enums;
 pub mod fixed_function;
 pub mod format;

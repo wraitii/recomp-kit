@@ -134,6 +134,7 @@ fn trace_draw(
     vertices: &VertexBuffer,
     start_vertex: u32,
     primitive_count: u32,
+    vertex_count: u32,
     state: &DeviceState,
     textured: bool,
     stage0: Option<&BoundTexture>,
@@ -163,19 +164,58 @@ fn trace_draw(
     // two-stage world draw whose stage 1 the bridge currently drops from one
     // that is genuinely single-texture; it is diagnostic only.
     eprintln!("[d3d8-trace]   state: {}", state.draw_state_summary());
-    match stage0 {
-        Some(t) => eprintln!(
-            "[d3d8-trace]   stage0 texture {}x{} fmt={:#x}",
-            t.width, t.height, t.format
-        ),
-        None => eprintln!("[d3d8-trace]   stage0 texture none (white fallback)"),
+    for (stage, bound) in [(0u32, stage0), (1u32, stage1)] {
+        let Some(t) = bound else {
+            eprintln!("[d3d8-trace]   stage{stage} texture none (white fallback)");
+            continue;
+        };
+        // Per-level written flags and generations as the renderer recorded
+        // them, so a chain that is resident but never marked written (and so
+        // clamped to LOD 0) is distinguishable from one with no levels at all.
+        let levels: Vec<String> = (0..t.level_count as usize)
+            .map(|l| {
+                let generation = t.level_generations.get(l).copied().unwrap_or(0);
+                let written = t.written.get(l).copied().unwrap_or(false);
+                format!("l{l}:g{generation}:{}", if written { "W" } else { "-" })
+            })
+            .collect();
+        eprintln!(
+            "[d3d8-trace]   stage{stage} texture id=0x{:08x} {}x{} fmt={:#x} levels={} max_written={} written=[{}]",
+            t.texture_id, t.width, t.height, t.format, t.level_count, t.max_written_level, levels.join(",")
+        );
+        // The clamp the sampler actually used for this stage, from the same
+        // helper the draw path calls. `-` when the stage state does not
+        // resolve (the draw would already have failed, so this is diagnostic).
+        match state.resolve_texture_stage(stage, true) {
+            Ok(resolved) => {
+                let (lod_min, lod_max, filter) =
+                    mip_lod_range(&resolved, t.max_written_level);
+                eprintln!(
+                    "[d3d8-trace]   stage{stage} sampler lod=({lod_min},{lod_max}) mip_filter={filter:?} max_mip_level={} mip={:#x}",
+                    resolved.max_mip_level, resolved.mip_filter
+                );
+            }
+            Err(e) => eprintln!("[d3d8-trace]   stage{stage} sampler unresolved: {}", e.cause),
+        }
     }
-    match stage1 {
-        Some(t) => eprintln!(
-            "[d3d8-trace]   stage1 texture {}x{} fmt={:#x}",
-            t.width, t.height, t.format
-        ),
-        None => eprintln!("[d3d8-trace]   stage1 texture none"),
+    // Sampler inputs the fixed-function draw depends on. RT3's terrain looked
+    // wrong because mip filtering was missing; print the raw guest values so we
+    // can see what it sets (defaults: MIN/MAG=POINT, MIP=NONE, MAXMIPLEVEL=0,
+    // MIPMAPLODBIAS=0).
+    for stage in 0..2u32 {
+        use crate::d3d8::enums::D3DTEXTURESTAGESTATETYPE as Ts;
+        let get = |s: Ts| match state.texture_stage_state(stage, s.raw()) {
+            Some(v) => format!("{v:#x}"),
+            None => "-".to_string(),
+        };
+        eprintln!(
+            "[d3d8-trace]   tss{stage} min={} mag={} mip={} maxmip={} lodbias={}",
+            get(Ts::MinFilter),
+            get(Ts::MagFilter),
+            get(Ts::MipFilter),
+            get(Ts::MaxMipLevel),
+            get(Ts::MipMapLodBias),
+        );
     }
     let vp = state.viewport;
     eprintln!(
@@ -200,6 +240,23 @@ fn trace_draw(
     eprintln!("[d3d8-trace]   world={:?}", state.world.rows);
     eprintln!("[d3d8-trace]   view={:?}", state.view.rows);
     eprintln!("[d3d8-trace]   proj={:?}", state.projection.rows);
+    // Texture matrices are only meaningful when the stage sets
+    // D3DTSS_TEXTURETRANSFORMFLAGS; printing them lets a coordinate mismatch be
+    // attributed to the guest's matrix rather than guessed at.
+    for stage in 0..2usize {
+        eprintln!(
+            "[d3d8-trace]   tex_transform[{stage}]={:?}",
+            state.texture_transforms[stage].rows
+        );
+    }
+    // Read the vertex fields from the decoded FVF offsets. A hardcoded offset
+    // misreads the XYZRHW layout (where position is four floats and diffuse sits
+    // at 16), which is exactly the layout the pre-transformed world path uses.
+    let attr = |loc: u32| layout.attributes.iter().find(|a| a.shader_location == loc);
+    let f32_at =
+        |v: &[u8], off: usize| f32::from_le_bytes([v[off], v[off + 1], v[off + 2], v[off + 3]]);
+    let u32_at =
+        |v: &[u8], off: usize| u32::from_le_bytes([v[off], v[off + 1], v[off + 2], v[off + 3]]);
     let bytes = vertices.bytes();
     let stride = layout.stride as usize;
     for i in 0..4usize {
@@ -208,16 +265,68 @@ fn trace_draw(
             break;
         }
         let v = &bytes[off..off + stride];
-        let x = f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
-        let y = f32::from_le_bytes([v[4], v[5], v[6], v[7]]);
-        let z = f32::from_le_bytes([v[8], v[9], v[10], v[11]]);
-        let color = u32::from_le_bytes([v[12], v[13], v[14], v[15]]);
-        if stride >= 24 {
-            let u = f32::from_le_bytes([v[16], v[17], v[18], v[19]]);
-            let w = f32::from_le_bytes([v[20], v[21], v[22], v[23]]);
-            eprintln!("[d3d8-trace]   v{i} pos=({x},{y},{z}) color=0x{color:08X} uv=({u},{w})");
-        } else {
-            eprintln!("[d3d8-trace]   v{i} pos=({x},{y},{z}) color=0x{color:08X}");
+        let (x, y, z) = match attr(0) {
+            Some(p) => {
+                let o = p.offset as usize;
+                (f32_at(v, o), f32_at(v, o + 4), f32_at(v, o + 8))
+            }
+            None => (0.0, 0.0, 0.0),
+        };
+        let mut line = format!("[d3d8-trace]   v{i} pos=({x},{y},{z})");
+        if let Some(c) = attr(1) {
+            line.push_str(&format!(" color=0x{:08X}", u32_at(v, c.offset as usize)));
+        }
+        if let Some(t) = attr(2) {
+            let o = t.offset as usize;
+            line.push_str(&format!(" uv=({},{})", f32_at(v, o), f32_at(v, o + 4)));
+        }
+        eprintln!("{line}");
+    }
+    // Texture-coordinate range over the whole draw. A constant set (or a
+    // single-set FVF aliasing set 1 to set 0) collapses to min == max, which is
+    // exactly what a flat single-texel sample looks like. For the world draws
+    // set 1 is the large-scale colour texture, so this distinguishes a real
+    // per-vertex coordinate from a constant/garbage one.
+    let uv_range = |loc: u32| -> Option<([f32; 2], [f32; 2], [f32; 2], u64)> {
+        let t = attr(loc)?;
+        let o = t.offset as usize;
+        if o + 8 > stride {
+            return None;
+        }
+        let mut min = [f32::INFINITY; 2];
+        let mut max = [f32::NEG_INFINITY; 2];
+        let mut sum = [0.0f64; 2];
+        let mut n = 0u64;
+        for i in 0..vertex_count as usize {
+            let off = (start_vertex as usize + i) * stride;
+            if off + stride > bytes.len() {
+                break;
+            }
+            let v = &bytes[off..off + stride];
+            let pair = [f32_at(v, o), f32_at(v, o + 4)];
+            for c in 0..2 {
+                min[c] = min[c].min(pair[c]);
+                max[c] = max[c].max(pair[c]);
+                sum[c] += pair[c] as f64;
+            }
+            n += 1;
+        }
+        if n == 0 {
+            return None;
+        }
+        Some((
+            min,
+            max,
+            [(sum[0] / n as f64) as f32, (sum[1] / n as f64) as f32],
+            n,
+        ))
+    };
+    for (loc, name) in [(2u32, "uv0"), (3, "uv1")] {
+        if let Some((min, max, mean, n)) = uv_range(loc) {
+            eprintln!(
+                "[d3d8-trace]   {name} n={n} min=({},{}) max=({},{}) mean=({},{})",
+                min[0], min[1], max[0], max[1], mean[0], mean[1]
+            );
         }
     }
 }
@@ -233,17 +342,163 @@ struct BoundTexture {
     width: u32,
     height: u32,
     format: u32,
+    /// Highest contiguous mip level the guest has written. The sampler clamps
+    /// its upper LOD to this so an unwritten level is never sampled. `0` when
+    /// only the base level exists.
+    max_written_level: u32,
+    /// Number of mip slices in the resident wgpu texture.
+    level_count: u32,
+    /// Content generation per level, as last uploaded (`0` = never written).
+    level_generations: Vec<u64>,
+    /// Written flag per level (a generation changed or a lock was open).
+    written: Vec<bool>,
 }
 
-/// One GPU-resident texture level held in [`Device::texture_cache`]. Keyed by
-/// the guest texture identity, not by stage, so the same texture bound at two
-/// stages or across draws is uploaded once.
+/// One mip level handed to [`Device::set_texture`]. `data` is the level's CPU
+/// texel block in the source D3D8 layout.
+pub struct TextureLevelUpload<'a> {
+    pub level: u32,
+    pub generation: u64,
+    /// A lock was still open at draw time, so the bytes must not be assumed
+    /// unchanged even if the generation matches.
+    pub force_upload: bool,
+    pub width: u32,
+    pub height: u32,
+    pub data: &'a [u8],
+}
+
+/// One GPU-resident mip chain held in [`Device::texture_cache`]. Keyed by the
+/// guest texture identity, not by stage, so the same texture bound at two
+/// stages or across draws is uploaded once. Each level keeps its own content
+/// generation, so re-locking level N re-uploads only N.
 struct CachedTexture {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     width: u32,
     height: u32,
     format: u32,
+    level_generations: Vec<u64>,
+    written: Vec<bool>,
+}
+
+impl CachedTexture {
+    /// Highest contiguous written level, starting at 0.
+    fn max_written_level(&self) -> u32 {
+        contiguous_written_level(&self.written)
+    }
+}
+
+/// Highest contiguous written mip level starting at 0. Returns 0 when level 0
+/// is not written, so the sampler always has a valid upper clamp and an
+/// unwritten level is never sampled.
+fn contiguous_written_level(written: &[bool]) -> u32 {
+    let mut level = 0;
+    for (i, written) in written.iter().enumerate() {
+        if *written {
+            level = i as u32;
+        } else {
+            break;
+        }
+    }
+    level
+}
+
+/// Bytes in the source (pre-decode) level block: the block layout for a
+/// compressed format, `width * height * bytes_per_pixel` otherwise.
+fn source_level_bytes(
+    format: u32,
+    color: Option<crate::d3d8::format::ColorFormat>,
+    width: u32,
+    height: u32,
+) -> Result<usize, RenderError> {
+    Ok(match color {
+        Some(color) => {
+            (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|n| n.checked_mul(color.bytes_per_pixel() as usize))
+                .ok_or_else(|| RenderError::new("SetTexture", "level size overflow"))?
+        }
+        None => crate::d3d8::format::block_level_layout(width, height, format).1 as usize,
+    })
+}
+
+/// Convert one source level into the reusable RGBA scratch and upload it to its
+/// mip slice. Split out so every level uses the same clipped-dimension path;
+/// a block-compressed level smaller than 4x4 still decodes from a full block.
+#[allow(clippy::too_many_arguments)]
+fn upload_texture_level(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    level: u32,
+    format: u32,
+    color: Option<crate::d3d8::format::ColorFormat>,
+    width: u32,
+    height: u32,
+    data: &[u8],
+    scratch: &mut Vec<u8>,
+) -> Result<(), RenderError> {
+    let expected = source_level_bytes(format, color, width, height)?;
+    if data.len() < expected {
+        return Err(RenderError::new(
+            "SetTexture",
+            format!(
+                "level {level} has {} bytes but {width}x{height} {format} needs {expected}",
+                data.len()
+            ),
+        ));
+    }
+    match color {
+        Some(color) => color.to_rgba8_into(&data[..expected], scratch),
+        None => crate::d3d8::format::decode_block_into(
+            format,
+            &data[..expected],
+            width,
+            height,
+            scratch,
+        )?,
+    }
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: level,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        scratch,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    Ok(())
+}
+
+/// The `(lod_min, lod_max, mipmap_filter)` a stage's sampler uses for a chain
+/// with `max_written_level` written levels. `D3DTSS_MAXMIPLEVEL` selects the
+/// base (most detailed) level (WineD3D `mip_base_level`), `MIPFILTER=NONE`
+/// collapses to that single level, and POINT/LINEAR span to the last written
+/// level. The written clamp keeps a level the guest never filled unsampled.
+fn mip_lod_range(
+    stage: &crate::d3d8::state::TextureStage,
+    max_written_level: u32,
+) -> (f32, f32, wgpu::FilterMode) {
+    use crate::d3d8::enums::D3DTEXTUREFILTERTYPE as F;
+    let base = stage.max_mip_level.min(max_written_level);
+    let last = max_written_level.max(base);
+    match F::from_raw(stage.mip_filter).expect("validated mip filter") {
+        F::None => (base as f32, base as f32, wgpu::FilterMode::Nearest),
+        F::Point => (base as f32, last as f32, wgpu::FilterMode::Nearest),
+        F::Linear | F::Anisotropic => (base as f32, last as f32, wgpu::FilterMode::Linear),
+        F::PyramidQuad | F::GaussianQuad => {
+            unreachable!("validated: only POINT/LINEAR/NONE/ANISOTROPIC are accepted")
+        }
+    }
 }
 
 /// A 1x1 opaque white texture, sampled when a stage is active but no texture
@@ -290,6 +545,10 @@ fn create_white_texture(gpu: &GpuContext) -> BoundTexture {
         width: 1,
         height: 1,
         format: crate::d3d8::format::D3DFMT_A8R8G8B8,
+        max_written_level: 0,
+        level_count: 1,
+        level_generations: vec![0],
+        written: vec![true],
     }
 }
 
@@ -298,6 +557,7 @@ fn create_white_texture(gpu: &GpuContext) -> BoundTexture {
 /// `unwrap` here is on a value that passed validation.
 fn sampler_descriptor(
     stage: &crate::d3d8::state::TextureStage,
+    max_written_level: u32,
 ) -> wgpu::SamplerDescriptor<'static> {
     use crate::d3d8::enums::{D3DTEXTUREADDRESS as A, D3DTEXTUREFILTERTYPE as F};
     let address = |value: u32| match A::from_raw(value).expect("validated address mode") {
@@ -318,14 +578,17 @@ fn sampler_descriptor(
     };
     let border = matches!(A::from_raw(stage.address_u), Ok(A::Border))
         || matches!(A::from_raw(stage.address_v), Ok(A::Border));
+    let (lod_min_clamp, lod_max_clamp, mipmap_filter) = mip_lod_range(stage, max_written_level);
     wgpu::SamplerDescriptor {
-        label: Some("D3D8 stage 0 sampler"),
+        label: Some("D3D8 stage sampler"),
         address_mode_u: address(stage.address_u),
         address_mode_v: address(stage.address_v),
         address_mode_w: wgpu::AddressMode::ClampToEdge,
         mag_filter: filter(stage.mag_filter),
         min_filter: filter(stage.min_filter),
-        mipmap_filter: filter(stage.mip_filter),
+        mipmap_filter,
+        lod_min_clamp,
+        lod_max_clamp,
         border_color: border.then_some(wgpu::SamplerBorderColor::TransparentBlack),
         ..Default::default()
     }
@@ -373,16 +636,26 @@ struct SamplerKey {
     mag_filter: u32,
     min_filter: u32,
     mip_filter: u32,
+    /// `D3DTSS_MAXMIPLEVEL` and the bound chain's written-level count fully
+    /// determine the clamp; two stages with the same filters but different
+    /// chains must not share a sampler.
+    max_mip_level: u32,
+    max_written_level: u32,
 }
 
 impl SamplerKey {
-    fn from_stage(stage: &crate::d3d8::state::TextureStage) -> Self {
+    fn from_stage(
+        stage: &crate::d3d8::state::TextureStage,
+        max_written_level: u32,
+    ) -> Self {
         Self {
             address_u: stage.address_u,
             address_v: stage.address_v,
             mag_filter: stage.mag_filter,
             min_filter: stage.min_filter,
             mip_filter: stage.mip_filter,
+            max_mip_level: stage.max_mip_level,
+            max_written_level,
         }
     }
 }
@@ -771,33 +1044,23 @@ impl Device {
         Ok(())
     }
 
-    /// `IDirect3DDevice8::SetTexture`. `data` is the level-0 CPU texel block
-    /// (`width * height * bytes_per_pixel`, in the source D3D8 layout); empty
-    /// or `texture_id == 0` unbinds and samples the default white texture.
+    /// `IDirect3DDevice8::SetTexture`. Each entry of `levels` is one mip slice
+    /// (`level`, `generation`, the current lock state and the CPU texel block
+    /// in the source D3D8 layout). An empty slice or `texture_id == 0` unbinds
+    /// and samples the default white texture.
     ///
-    /// `texture_id`/`level`/`generation` are the kit's identity and content
-    /// version for the level (see [`crate::d3d8::texture_cache`]);
-    /// `force_upload` is set while a lock is still open. An unchanged level at
-    /// the same generation is a cache hit and reuses its wgpu texture, so the
-    /// same texture bound at either stage or on a later draw costs one upload.
-    ///
-    /// Textures are converted to linear UNORM `Rgba8Unorm` on upload; the
-    /// supported source formats are `A8R8G8B8`, `X8R8G8B8`, `R5G6B5`,
-    /// `A1R5G5B5` and `A4R4G4B4`, and every other format is a named error. Mip
-    /// level 0 is the only level uploaded, matching the bounded
-    /// `D3DTSS_MIPFILTER` handling in [`DeviceState::resolve_texture_stage`].
-    #[allow(clippy::too_many_arguments)]
+    /// The wgpu texture holds the whole chain with `mip_level_count = N`. Every
+    /// level tracks its own content generation, so re-locking level N re-uploads
+    /// only N, and a base-dimension change rebuilds the chain. Content is
+    /// converted to linear UNORM `Rgba8Unorm`; a block-compressed level decodes
+    /// from its full block layout but keeps the clipped `width`/`height` (a 1x1
+    /// DXT level still occupies one 4x4 block in the source).
     pub fn set_texture(
         &mut self,
         stage: u32,
         texture_id: u32,
-        level: u32,
-        generation: u64,
-        force_upload: bool,
         format: u32,
-        width: u32,
-        height: u32,
-        data: &[u8],
+        levels: &[TextureLevelUpload<'_>],
     ) -> Result<(), RenderError> {
         use crate::d3d8::format::ColorFormat;
         if stage as usize >= MAX_TEXTURE_STAGES {
@@ -806,136 +1069,140 @@ impl Device {
                 format!("stage {stage} is beyond D3D8's {MAX_TEXTURE_STAGES} texture stages"),
             ));
         }
-        if data.is_empty() || texture_id == 0 {
+        if texture_id == 0 || levels.is_empty() {
             self.stage_textures[stage as usize] = None;
             return Ok(());
         }
-        if width == 0 || height == 0 {
+        let base_width = levels[0].width;
+        let base_height = levels[0].height;
+        if base_width == 0 || base_height == 0 {
             return Err(RenderError::new(
                 "SetTexture",
                 "bound texture dimensions must be nonzero",
             ));
         }
         // Block-compressed levels are sized by their block layout; the rest by
-        // their per-texel layout. Both decode to the same upload shape below.
+        // their per-texel layout. Both decode to the same RGBA upload shape.
         let block = crate::d3d8::format::block_bytes(format);
         let color = if block == 0 {
             Some(ColorFormat::from_d3dformat(format)?)
         } else {
             None
         };
-        let expected = if let Some(color) = color {
-            (width as usize) * (height as usize) * (color.bytes_per_pixel() as usize)
-        } else {
-            crate::d3d8::format::block_level_layout(width, height, format).1 as usize
-        };
-        if data.len() < expected {
+        let level_count = levels
+            .iter()
+            .map(|l| l.level)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| RenderError::new("SetTexture", "mip level overflow"))?;
+        if level_count > 16 {
             return Err(RenderError::new(
                 "SetTexture",
-                format!(
-                    "bound level has {} bytes but {width}x{height} {format} needs {expected}",
-                    data.len()
-                ),
+                format!("bound texture has {level_count} mip levels; D3D8 caps at 16"),
             ));
         }
         let max = self.gpu.device.limits().max_texture_dimension_2d;
-        if width > max || height > max {
+        if base_width > max || base_height > max {
             return Err(RenderError::new(
                 "SetTexture",
-                format!("bound texture {width}x{height} exceeds max_texture_dimension_2d {max}"),
+                format!(
+                    "bound texture {base_width}x{base_height} exceeds max_texture_dimension_2d {max}"
+                ),
             ));
         }
 
+        // Temporary diagnostic (`RECOMP_D3D8_DUMP_TEXTURES`): decode the same
+        // bytes a real upload would convert and write each level as a PNG.
+        if crate::d3d8::dump::texture_enabled() {
+            for l in levels {
+                let Ok(expected) = source_level_bytes(format, color, l.width, l.height) else {
+                    continue;
+                };
+                if l.data.len() < expected {
+                    continue;
+                }
+                let mut rgba = Vec::new();
+                let decoded = match color {
+                    Some(color) => {
+                        color.to_rgba8_into(&l.data[..expected], &mut rgba);
+                        Ok(())
+                    }
+                    None => crate::d3d8::format::decode_block_into(
+                        format,
+                        &l.data[..expected],
+                        l.width,
+                        l.height,
+                        &mut rgba,
+                    ),
+                };
+                if decoded.is_ok() {
+                    crate::d3d8::dump::texture(
+                        stage,
+                        texture_id,
+                        l.level,
+                        l.generation,
+                        format,
+                        l.width,
+                        l.height,
+                        &rgba,
+                    );
+                }
+            }
+        }
+
         stats::record_bind();
-        let key = TextureKey::new(texture_id, level);
+        let key = TextureKey::new(texture_id, 0);
+        // A render-target-backed level keeps its existing path; its sampling
+        // chain is still level 0 only (mip render targets are a separate path).
         if self.targets.textures.contains_key(&key) {
+            let base = &levels[0];
             self.flush_draws();
-            self.sync_target_cpu(key, generation, format, width, height, data, force_upload)?;
+            self.sync_target_cpu(
+                key,
+                base.generation,
+                format,
+                base_width,
+                base_height,
+                base.data,
+                base.force_upload,
+            )?;
             let rt = &self.targets.textures[&key];
             self.stage_textures[stage as usize] = Some(BoundTexture {
                 _texture: rt.surface.texture.clone(),
                 view: rt.surface.view.clone(),
                 texture_id,
-                width,
-                height,
+                width: base_width,
+                height: base_height,
                 format,
-            });
-            return Ok(());
-        }
-        if self
-            .texture_cache
-            .lookup(key, generation, force_upload, width, height, format)
-        {
-            let cached = self
-                .texture_cache
-                .resource(key)
-                .expect("hit implies present");
-            self.stage_textures[stage as usize] = Some(BoundTexture {
-                _texture: cached.texture.clone(),
-                view: cached.view.clone(),
-                texture_id,
-                width,
-                height,
-                format,
+                max_written_level: 0,
+                level_count: 1,
+                level_generations: vec![base.generation],
+                written: vec![true],
             });
             return Ok(());
         }
 
-        // Miss: convert into the reusable scratch buffer, then either update
-        // the resident texture in place (same shape) or create one. Conversion
-        // happens only on a real content change now.
-        // The upload below may rewrite a texture earlier recorded draws sample.
-        self.flush_draws();
-        match color {
-            Some(color) => color.to_rgba8_into(&data[..expected], &mut self.scratch_rgba),
-            None => crate::d3d8::format::decode_block_into(
-                format,
-                &data[..expected],
-                width,
-                height,
-                &mut self.scratch_rgba,
-            )?,
-        }
-        stats::record_upload();
-        let same_shape = self
+        let existing_shape = self
             .texture_cache
             .resource(key)
-            .is_some_and(|c| c.width == width && c.height == height && c.format == format);
-        if same_shape {
-            let cached = self.texture_cache.resource(key).expect("checked above");
-            self.gpu.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &cached.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &self.scratch_rgba,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(width * 4),
-                    rows_per_image: Some(height),
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
-            self.texture_cache
-                .mark_uploaded(key, generation, width, height, format);
-        } else {
+            .map(|c| (c.width, c.height, c.format, c.level_generations.len() as u32));
+        let needs_new = existing_shape != Some((base_width, base_height, format, level_count));
+
+        if needs_new {
+            // Replacing the chain may rewrite a texture recorded draws sample.
+            self.flush_draws();
             self.gpu
                 .device
                 .push_error_scope(wgpu::ErrorFilter::Validation);
             let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("D3D8 stage texture"),
                 size: wgpu::Extent3d {
-                    width,
-                    height,
+                    width: base_width,
+                    height: base_height,
                     depth_or_array_layers: 1,
                 },
-                mip_level_count: 1,
+                mip_level_count: level_count,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
@@ -945,49 +1212,100 @@ impl Device {
             if let Some(err) = pollster::block_on(self.gpu.device.pop_error_scope()) {
                 return Err(RenderError::new("SetTexture", err.to_string()));
             }
-            self.gpu.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &self.scratch_rgba,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(width * 4),
-                    rows_per_image: Some(height),
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
+            let mut level_generations = vec![0u64; level_count as usize];
+            let mut written = vec![false; level_count as usize];
+            for l in levels {
+                if l.level as usize >= level_count as usize {
+                    continue;
+                }
+                upload_texture_level(
+                    &self.gpu.queue,
+                    &texture,
+                    l.level,
+                    format,
+                    color,
+                    l.width,
+                    l.height,
+                    l.data,
+                    &mut self.scratch_rgba,
+                )?;
+                level_generations[l.level as usize] = l.generation;
+                written[l.level as usize] = l.generation != 0 || l.force_upload;
+                stats::record_upload();
+            }
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             self.texture_cache.insert(
                 key,
                 CachedTexture {
                     texture,
                     view,
-                    width,
-                    height,
+                    width: base_width,
+                    height: base_height,
                     format,
+                    level_generations,
+                    written,
                 },
-                generation,
-                width,
-                height,
+                0,
+                base_width,
+                base_height,
                 format,
             );
+        } else {
+            // Same shape: re-upload only the levels whose generation changed
+            // (or whose lock is still open).
+            let changed: Vec<usize> = levels
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| {
+                    self.texture_cache
+                        .resource(key)
+                        .and_then(|c| c.level_generations.get(l.level as usize))
+                        != Some(&l.generation)
+                        || l.force_upload
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if !changed.is_empty() {
+                self.flush_draws();
+                for i in changed {
+                    let l = &levels[i];
+                    let cached = self.texture_cache.resource(key).expect("chain present");
+                    upload_texture_level(
+                        &self.gpu.queue,
+                        &cached.texture,
+                        l.level,
+                        format,
+                        color,
+                        l.width,
+                        l.height,
+                        l.data,
+                        &mut self.scratch_rgba,
+                    )?;
+                    stats::record_upload();
+                    if let Some(cached) = self.texture_cache.resource_mut(key) {
+                        if let Some(slot) = cached.level_generations.get_mut(l.level as usize) {
+                            *slot = l.generation;
+                        }
+                        if let Some(slot) = cached.written.get_mut(l.level as usize) {
+                            *slot = true;
+                        }
+                    }
+                }
+            }
         }
         let cached = self.texture_cache.resource(key).expect("just stored");
+        let max_written_level = cached.max_written_level();
         self.stage_textures[stage as usize] = Some(BoundTexture {
             _texture: cached.texture.clone(),
             view: cached.view.clone(),
             texture_id,
-            width,
-            height,
+            width: base_width,
+            height: base_height,
             format,
+            max_written_level,
+            level_count: cached.level_generations.len() as u32,
+            level_generations: cached.level_generations.clone(),
+            written: cached.written.clone(),
         });
         Ok(())
     }
@@ -1322,6 +1640,7 @@ impl Device {
             vertices,
             start_vertex,
             primitive_count,
+            count,
             &self.state,
             textured,
             self.stage_textures[0].as_ref(),
@@ -1457,8 +1776,13 @@ impl Device {
         }
         // D3DRS_SPECULARENABLE gates the shader's specular add.
         uniform.rhw[1] = u32::from(self.state.specular_enable());
-        let stages_uniform =
-            textured.then(|| StagesUniform::for_fvf(&stage0, &stage1, layout.texcoord_sets));
+        let stages_uniform = textured.then(|| {
+            if layout.pre_transformed {
+                StagesUniform::for_pre_transformed(&stage0, &stage1, layout.texcoord_sets)
+            } else {
+                StagesUniform::for_fvf(&stage0, &stage1, layout.texcoord_sets)
+            }
+        });
         // Upload only the vertex bytes this draw reads. Both the lit stream and
         // `count * stride` are multiples of `COPY_BUFFER_ALIGNMENT` (4), which
         // `queue.write_buffer_with` requires; the guest buffer's trailing bytes
@@ -1578,15 +1902,23 @@ impl Device {
                 .as_ref()
                 .map(|t| &t.view)
                 .unwrap_or(&self.white.view);
+            // Clamp the mip LOD to the levels the chain actually has;
+            // an unwritten level must never be sampled.
+            let max_written0 = self.stage_textures[0]
+                .as_ref()
+                .map_or(0, |t| t.max_written_level);
+            let max_written1 = self.stage_textures[1]
+                .as_ref()
+                .map_or(0, |t| t.max_written_level);
             let sampler0 = self
                 .samplers
-                .get_or_insert_with(SamplerKey::from_stage(&stage0), || {
-                    gpu.create_sampler(&sampler_descriptor(&stage0))
+                .get_or_insert_with(SamplerKey::from_stage(&stage0, max_written0), || {
+                    gpu.create_sampler(&sampler_descriptor(&stage0, max_written0))
                 });
             let sampler1 = self
                 .samplers
-                .get_or_insert_with(SamplerKey::from_stage(&stage1), || {
-                    gpu.create_sampler(&sampler_descriptor(&stage1))
+                .get_or_insert_with(SamplerKey::from_stage(&stage1, max_written1), || {
+                    gpu.create_sampler(&sampler_descriptor(&stage1, max_written1))
                 });
             Some(StageBindings {
                 view0: view0.clone(),
@@ -2225,6 +2557,7 @@ mod tests {
             min_filter: 2,
             mag_filter: 2,
             mip_filter: 1,
+            max_mip_level: 0,
             address_u: 1,
             address_v: 1,
         };
@@ -2238,10 +2571,83 @@ mod tests {
             ..stage
         };
         // Combine state that does not affect the sampler must not split the
-        // cache; a sampling-mode difference must.
-        assert_eq!(K::from_stage(&stage), K::from_stage(&same));
-        assert_ne!(K::from_stage(&stage), K::from_stage(&other));
-        let _: fn(&TextureStage) -> SamplerKey = K::from_stage;
+        // cache; a sampling-mode difference must. The chain's written-level
+        // count and MAXMIPLEVEL are sampler inputs too.
+        assert_eq!(K::from_stage(&stage, 3), K::from_stage(&same, 3));
+        assert_ne!(K::from_stage(&stage, 3), K::from_stage(&other, 3));
+        assert_ne!(K::from_stage(&stage, 3), K::from_stage(&stage, 2));
+        let shifted = TextureStage {
+            max_mip_level: 1,
+            ..stage
+        };
+        assert_ne!(K::from_stage(&stage, 3), K::from_stage(&shifted, 3));
+        let _: fn(&TextureStage, u32) -> SamplerKey = K::from_stage;
+    }
+
+    fn stage_with_mips(mip_filter: u32, max_mip_level: u32) -> crate::d3d8::state::TextureStage {
+        crate::d3d8::state::TextureStage {
+            active: true,
+            color_op: 4,
+            color_arg1: 2,
+            color_arg2: 1,
+            alpha_op: 1,
+            alpha_arg1: 2,
+            alpha_arg2: 1,
+            texture_factor: 0,
+            tex_coord_index: 0,
+            tex_transform_flags: 0,
+            tex_transform: crate::d3d8::math::Mat4::IDENTITY,
+            min_filter: 2,
+            mag_filter: 2,
+            mip_filter,
+            max_mip_level,
+            address_u: 1,
+            address_v: 1,
+        }
+    }
+
+    #[test]
+    fn mip_lod_range_maps_d3d_filters_and_clamps_to_written_levels() {
+        use super::mip_lod_range;
+        // MIPFILTER=NONE collapses to a single level even with more written.
+        assert_eq!(
+            mip_lod_range(&stage_with_mips(0, 0), 3),
+            (0.0, 0.0, wgpu::FilterMode::Nearest)
+        );
+        // POINT spans the written chain with nearest mip selection.
+        assert_eq!(
+            mip_lod_range(&stage_with_mips(1, 0), 3),
+            (0.0, 3.0, wgpu::FilterMode::Nearest)
+        );
+        // LINEAR is trilinear across the written chain.
+        assert_eq!(
+            mip_lod_range(&stage_with_mips(2, 0), 3),
+            (0.0, 3.0, wgpu::FilterMode::Linear)
+        );
+        // MAXMIPLEVEL shifts the base; it is clamped to the written chain.
+        assert_eq!(
+            mip_lod_range(&stage_with_mips(2, 2), 3),
+            (2.0, 3.0, wgpu::FilterMode::Linear)
+        );
+        assert_eq!(
+            mip_lod_range(&stage_with_mips(2, 9), 3),
+            (3.0, 3.0, wgpu::FilterMode::Linear)
+        );
+        // Only level 0 written: no filter may reach an unwritten level.
+        assert_eq!(
+            mip_lod_range(&stage_with_mips(1, 0), 0),
+            (0.0, 0.0, wgpu::FilterMode::Nearest)
+        );
+    }
+
+    #[test]
+    fn contiguous_written_level_stops_at_the_first_gap() {
+        use super::contiguous_written_level as c;
+        assert_eq!(c(&[]), 0);
+        assert_eq!(c(&[false, true, true]), 0);
+        assert_eq!(c(&[true, false, true]), 0);
+        assert_eq!(c(&[true, true, false]), 1);
+        assert_eq!(c(&[true, true, true]), 2);
     }
 
     #[test]

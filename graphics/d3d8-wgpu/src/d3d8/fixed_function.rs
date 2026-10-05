@@ -625,12 +625,55 @@ impl StagesUniform {
         }
         Self { stages }
     }
+
+    /// Pack both resolved stages for a pre-transformed (`XYZRHW`) draw.
+    ///
+    /// D3D8 does not transform the texture coordinates of pre-transformed
+    /// vertices (`Texture Coordinate Transformations`: "Direct3D does not
+    /// modify transformed and lit vertices"); `ProcessVertices` already baked
+    /// each stage's transform into the destination coordinate. The shader
+    /// therefore sees a disabled transform, so the draw cannot apply it a
+    /// second time.
+    pub fn for_pre_transformed(
+        stage0: &crate::d3d8::state::TextureStage,
+        stage1: &crate::d3d8::state::TextureStage,
+        texcoord_sets: u32,
+    ) -> Self {
+        let mut uniform = Self::for_fvf(stage0, stage1, texcoord_sets);
+        for stage in &mut uniform.stages {
+            stage.tex_transform = Mat4::IDENTITY.rows;
+            stage.tex_transform_flags = 0;
+        }
+        uniform
+    }
 }
 
 /// True when an FVF carrying `texcoord_sets` coordinate sets contains the set
 /// `tex_coord_index` selected by `D3DTSS_TEXCOORDINDEX`.
 pub fn texcoord_available(tex_coord_index: u32, texcoord_sets: u32) -> bool {
     tex_coord_index < texcoord_sets
+}
+
+/// CPU reference for the WGSL `transform_texcoord` COUNT2 path.
+///
+/// D3D's fixed-function pipeline expands a COUNT2 texture coordinate to
+/// `(u, v, 1, 0)` before applying the texture matrix: the first component not
+/// supplied by the vertex is padded to 1, the remaining components to 0. WineD3D
+/// documents this in `compute_texture_matrix` (`dlls/wined3d/utils.c`) and
+/// `d3d9/tests/visual.c::test_texture_transform_flags` constructs the same
+/// `(..., 1, 0)` input for `D3DTTFF_COUNT2`; DXVK's `transformTexCoord`
+/// (`src/d3d9/shaders/d3d9_fixed_function_vert.vert`) pads the same component.
+/// Under D3D's row-vector convention `v * M` the translation therefore comes
+/// from the matrix's third row (`_31`/`_32`), not the fourth (`_41`/`_42`).
+///
+/// The WGSL function must stay in sync; `count2_texcoord_expands_to_u_v_1_0`
+/// checks both the CPU result and the shader source.
+pub fn transform_texcoord(uv: [f32; 2], m: &Mat4, flags: u32) -> [f32; 2] {
+    if flags == 0 {
+        return uv;
+    }
+    let out = m.transform([uv[0], uv[1], 1.0, 0.0]);
+    [out[0], out[1]]
 }
 
 /// Group 0 binding 2 uniform: the resolved D3D8 table/pixel fog state.
@@ -1019,14 +1062,19 @@ fn alpha_op(
     return r;
 }
 
-// D3DTTFF_COUNT2: transform the selected 2D coordinate as `(u, v, 0, 1)`
-// and keep the first two components. The shader matrix is the CPU row-major
-// matrix uploaded as WGSL columns, so `mat * v` is `v * M`.
+// D3DTTFF_COUNT2: the fixed-function pipeline expands the selected 2D
+// coordinate to `(u, v, 1, 0)` before the texture matrix, then keeps the first
+// two components. The `1` sits in the first component the vertex does not
+// supply, so under the row-vector convention `v * M` the translation comes from
+// the matrix's third row (`_31`/`_32`), not the fourth (`_41`/`_42`). See the
+// CPU `transform_texcoord` below for the WineD3D/DXVK/D3D-test evidence. The
+// shader matrix is the CPU row-major matrix uploaded as WGSL columns, so
+// `mat * v` is `v * M`.
 fn transform_texcoord(uv: vec2<f32>, m: mat4x4<f32>, flags: u32) -> vec2<f32> {
     if (flags == 0u) {
         return uv;
     }
-    return (m * vec4<f32>(uv, 0.0, 1.0)).xy;
+    return (m * vec4<f32>(uv, 1.0, 0.0)).xy;
 }
 
 // Evaluate one stage. `current` is the input current colour (diffuse for
@@ -1505,6 +1553,7 @@ mod tests {
             min_filter: 2,
             mag_filter: 2,
             mip_filter: 0,
+            max_mip_level: 0,
             address_u: 1,
             address_v: 1,
         };
@@ -1519,6 +1568,42 @@ mod tests {
         assert_eq!(bytemuck::bytes_of(&u).len(), 112);
         let both = StagesUniform::new(&stage, &stage);
         assert_eq!(bytemuck::bytes_of(&both).len(), 224);
+    }
+
+    #[test]
+    fn count2_texcoord_expands_to_u_v_1_0() {
+        // Translation in the fourth row (`_41`/`_42`, where `Mat4::translation`
+        // and D3DXMatrixTranslation put it) must not shift a COUNT2 coordinate:
+        // D3D pads the input to `(u, v, 1, 0)`, so the fourth row is unused.
+        let mut translation = Mat4::IDENTITY;
+        translation.rows[3][0] = 10.0;
+        translation.rows[3][1] = 20.0;
+        assert_eq!(
+            transform_texcoord([0.25, 0.5], &translation, 2),
+            [0.25, 0.5]
+        );
+
+        // The third row (`_31`/`_32`) is where the COUNT2 translation lands.
+        let mut third = Mat4::IDENTITY;
+        third.rows[2][0] = 10.0;
+        third.rows[2][1] = 20.0;
+        assert_eq!(transform_texcoord([0.25, 0.5], &third, 2), [10.25, 20.5]);
+
+        // Scale still applies from the diagonal, and a disabled transform is a
+        // pass-through even when a matrix is stored.
+        let mut scale = Mat4::IDENTITY;
+        scale.rows[0][0] = 2.0;
+        scale.rows[1][1] = 4.0;
+        assert_eq!(transform_texcoord([0.25, 0.5], &scale, 2), [0.5, 2.0]);
+        assert_eq!(transform_texcoord([0.25, 0.5], &third, 0), [0.25, 0.5]);
+
+        // Guard against the WGSL mirror drifting back to the shader-style
+        // `(u, v, 0, 1)` padding.
+        assert!(
+            TEXTURED_WGSL.contains("vec4<f32>(uv, 1.0, 0.0)"),
+            "COUNT2 must pad with (..., 1, 0)"
+        );
+        assert!(!TEXTURED_WGSL.contains("vec4<f32>(uv, 0.0, 1.0)"));
     }
 
     #[test]
@@ -1538,6 +1623,7 @@ mod tests {
             min_filter: 2,
             mag_filter: 2,
             mip_filter: 0,
+            max_mip_level: 0,
             address_u: 1,
             address_v: 1,
         };
@@ -1555,6 +1641,44 @@ mod tests {
         let stages = StagesUniform::for_fvf(&stage(0), &stage(1), 2);
         assert_eq!(stages.stages[1].tex_coord_available, 1);
         assert_eq!(bytemuck::bytes_of(&stages).len(), 224);
+    }
+
+    #[test]
+    fn pre_transformed_draw_disables_texture_transforms() {
+        // A COUNT2 matrix that a normal draw would apply.
+        let mut matrix = Mat4::IDENTITY;
+        matrix.rows[0][0] = 46.0;
+        matrix.rows[1][1] = 46.0;
+        let stage = crate::d3d8::state::TextureStage {
+            active: true,
+            color_op: 8,   // ADDSIGNED
+            color_arg1: 2, // TEXTURE
+            color_arg2: 1, // CURRENT
+            alpha_op: 1,   // DISABLE
+            alpha_arg1: 2, // TEXTURE
+            alpha_arg2: 1, // CURRENT
+            texture_factor: 0,
+            tex_coord_index: 1,
+            tex_transform_flags: 2,
+            tex_transform: matrix,
+            min_filter: 2,
+            mag_filter: 2,
+            mip_filter: 2,
+            max_mip_level: 0,
+            address_u: 1,
+            address_v: 1,
+        };
+        // A world (non-RHW) draw keeps the matrix so the shader applies it.
+        let world = StagesUniform::for_fvf(&stage, &stage, 2);
+        assert_eq!(world.stages[0].tex_transform_flags, 2);
+        assert_eq!(world.stages[0].tex_transform[0][0], 46.0);
+        // A pre-transformed (XYZRHW) draw drops it: ProcessVertices already
+        // baked the coordinate.
+        let rhw = StagesUniform::for_pre_transformed(&stage, &stage, 2);
+        for uniform in &rhw.stages {
+            assert_eq!(uniform.tex_transform_flags, 0);
+            assert_eq!(uniform.tex_transform, Mat4::IDENTITY.rows);
+        }
     }
 }
 
@@ -1580,5 +1704,9 @@ pub fn lit_shader_source(textured: bool) -> String {
     // Only the transformed `VertexInput` becomes a float diffuse; the
     // pre-transformed `VertexInputRhw` keeps its D3DCOLOR and is unused by the
     // lit entry point.
-    source.replacen("@location(1) color: u32", "@location(1) color: vec4<f32>", 1)
+    source.replacen(
+        "@location(1) color: u32",
+        "@location(1) color: vec4<f32>",
+        1,
+    )
 }

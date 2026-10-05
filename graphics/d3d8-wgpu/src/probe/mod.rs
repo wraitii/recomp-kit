@@ -1,10 +1,33 @@
 //! Bounded clear, transformed unlit triangle, readback and presentation checks.
 use crate::{
     backend::GpuContext,
-    d3d8::{device::Device, math::Mat4, resource::VertexBuffer},
+    d3d8::{
+        device::{Device, TextureLevelUpload},
+        math::Mat4,
+        resource::VertexBuffer,
+    },
 };
 use std::sync::Arc;
 use winit::window::Window;
+
+/// One base-level texture upload. The probe only exercises level 0; mip chains
+/// are covered by the device unit tests.
+fn level0<'a>(
+    generation: u64,
+    force_upload: bool,
+    width: u32,
+    height: u32,
+    data: &'a [u8],
+) -> [TextureLevelUpload<'a>; 1] {
+    [TextureLevelUpload {
+        level: 0,
+        generation,
+        force_upload,
+        width,
+        height,
+        data,
+    }]
+}
 
 /// Options for a probe run.
 #[derive(Clone, Debug)]
@@ -669,18 +692,18 @@ fn run_with_gpu(
         Ok(pixels[center..center + 4].try_into().unwrap())
     };
     let first = {
-        device.set_texture(0, 77, 0, 1, false, 21, 1, 1, &cache_red)?;
+        device.set_texture(0, 77, 21, &level0(1, false, 1, 1, &cache_red))?;
         sample_cached(&mut device)?
     };
     // Same identity, generation and bytes: must hit the cache.
-    device.set_texture(0, 77, 0, 1, false, 21, 1, 1, &cache_red)?;
+    device.set_texture(0, 77, 21, &level0(1, false, 1, 1, &cache_red))?;
     let hit = sample_cached(&mut device)?;
     // Bumped generation: must re-upload the new green content.
-    device.set_texture(0, 77, 0, 2, false, 21, 1, 1, &cache_green)?;
+    device.set_texture(0, 77, 21, &level0(2, false, 1, 1, &cache_green))?;
     let bumped = sample_cached(&mut device)?;
     // Released identity: the cache entry is gone, so this is a fresh upload.
     device.release_texture(77);
-    device.set_texture(0, 77, 0, 2, false, 21, 1, 1, &cache_green)?;
+    device.set_texture(0, 77, 21, &level0(2, false, 1, 1, &cache_green))?;
     let released = sample_cached(&mut device)?;
     let cache_ok = first == [255, 0, 0, 255]
         && hit == first
@@ -802,8 +825,8 @@ fn run_with_gpu(
     for (name, s0, s1, diffuse, t0, t1, expected, tol) in cases {
         let d0 = [t0[2], t0[1], t0[0], t0[3]];
         let d1 = [t1[2], t1[1], t1[0], t1[3]];
-        device.set_texture(0, 1, 0, 0, true, 21, 1, 1, &d0)?;
-        device.set_texture(1, 2, 0, 0, true, 21, 1, 1, &d1)?;
+        device.set_texture(0, 1, 21, &level0(0, true, 1, 1, &d0))?;
+        device.set_texture(1, 2, 21, &level0(0, true, 1, 1, &d1))?;
         let seen = draw_two_stage_quad(
             &mut device,
             &s0,
@@ -831,8 +854,8 @@ fn run_with_gpu(
             d[i * 4 + 3] = t[3];
         }
         let d0 = [tex0[2], tex0[1], tex0[0], tex0[3]];
-        device.set_texture(0, 1, 0, 0, true, 21, 1, 1, &d0)?;
-        device.set_texture(1, 3, 0, 0, true, 21, 2, 1, &d)?;
+        device.set_texture(0, 1, 21, &level0(0, true, 1, 1, &d0))?;
+        device.set_texture(1, 3, 21, &level0(0, true, 2, 1, &d))?;
         let seen = draw_two_stage_quad(
             &mut device,
             &select_tex0,
@@ -890,7 +913,7 @@ fn run_with_gpu(
             .state
             .set_texture_stage_state(0, 1, if textured { 4 } else { 1 })?;
         if textured {
-            device.set_texture(0, 999, 0, 1, false, 21, 1, 1, &[255; 4])?;
+            device.set_texture(0, 999, 21, &level0(1, false, 1, 1, &[255; 4]))?;
             device.state.set_texture_stage_state(0, 2, 2)?;
             device.state.set_texture_stage_state(0, 3, 0)?;
             device.state.set_texture_stage_state(0, 4, 4)?;
@@ -1013,10 +1036,10 @@ fn run_with_gpu(
     device.state.set_texture_stage_state(1, 1, 1)?;
     device.state.set_texture_stage_state(1, 4, 1)?;
     for i in 0..4098u32 {
-        device.set_texture(1, 10000 + i, 0, 1, false, 21, 1, 1, &[255, 0, 0, 255])?;
+        device.set_texture(1, 10000 + i, 21, &level0(1, false, 1, 1, &[255, 0, 0, 255]))?;
     }
-    device.set_texture(1, 0, 0, 0, false, 0, 0, 0, &[])?;
-    device.set_texture(0, 901, 0, 7, false, 21, rt_width, rt_height, &stale_cpu)?;
+    device.set_texture(1, 0, 0, &[])?;
+    device.set_texture(0, 901, 21, &level0(7, false, rt_width, rt_height, &stale_cpu))?;
     device.begin_scene()?;
     device.draw_primitive(4, 0x142, &green_quad, 0, 2)?;
     device.end_scene()?;
@@ -1024,7 +1047,7 @@ fn run_with_gpu(
     let sample: [u8; 4] = sampled[outside..outside + 4].try_into().unwrap();
     // Explicit CPU generation change must update the GPU surface, too.
     let new_cpu = [0u8, 255, 0, 255].repeat(rt_width as usize * rt_height as usize);
-    device.set_texture(0, 901, 0, 8, false, 21, rt_width, rt_height, &new_cpu)?;
+    device.set_texture(0, 901, 21, &level0(8, false, rt_width, rt_height, &new_cpu))?;
     device.begin_scene()?;
     device.draw_primitive(4, 0x142, &red_quad, 0, 2)?;
     device.end_scene()?;

@@ -53,6 +53,12 @@ pub struct TextureStage {
     pub min_filter: u32,
     pub mag_filter: u32,
     pub mip_filter: u32,
+    /// `D3DTSS_MAXMIPLEVEL`: the base (most detailed) mip level the stage may
+    /// sample. D3D's default 0 selects the texture's base level; WineD3D maps
+    /// it to the sampler's `mip_base_level`. A nonzero `D3DTSS_MIPMAPLODBIAS`
+    /// is refused in `resolve_texture_stage` because wgpu 27 has no LOD bias
+    /// field.
+    pub max_mip_level: u32,
     pub address_u: u32,
     pub address_v: u32,
 }
@@ -326,9 +332,7 @@ impl DeviceState {
             other => {
                 return Err(RenderError::new(
                     "d3d8::state::set_transform",
-                    format!(
-                        "transform state {other} is not world/view/projection or TEXTURE0-7"
-                    ),
+                    format!("transform state {other} is not world/view/projection or TEXTURE0-7"),
                 ));
             }
         }
@@ -505,9 +509,10 @@ impl DeviceState {
     /// stage. D3D8's stage-0 defaults are `COLOROP=MODULATE`,
     /// `COLORARG1=TEXTURE`, `COLORARG2=CURRENT`, `ALPHAOP=SELECTARG1`,
     /// `ALPHAARG1=TEXTURE`, filters `POINT`/`POINT`/`NONE` and address `WRAP`.
-    /// The bridge only treats a stage as *active* when the guest set an op
-    /// explicitly or a texture is bound, so an untextured FVF that never
-    /// touched a stage keeps its existing untextured path.
+    /// Stages >= 1 default to `COLOROP=DISABLE`/`ALPHAOP=DISABLE`. The bridge
+    /// only treats a stage as *active* when the guest set an op explicitly or a
+    /// texture is bound, so an untextured FVF that never touched a stage keeps
+    /// its existing untextured path.
     ///
     /// Stages 0 and 1 are implemented. The op set is the one the guest's TSS
     /// setup functions (`FUN_007c2940`, `FUN_007c2c70`, `FUN_007c2f80` and the
@@ -538,8 +543,21 @@ impl DeviceState {
         };
         let explicit_color = self.texture_stage_state(stage, Ts::ColorOp.raw());
         let explicit_alpha = self.texture_stage_state(stage, Ts::AlphaOp.raw());
-        let color_op = raw(Ts::ColorOp, D3DTEXTUREOP::Modulate.raw());
-        let alpha_op = raw(Ts::AlphaOp, D3DTEXTUREOP::SelectArg1.raw());
+        // D3D8's defaults are stage-dependent: stage 0 is
+        // MODULATE/SELECTARG1, every later stage is DISABLE/DISABLE. WineD3D's
+        // `init_default_texture_state` (`dlls/wined3d/stateblock.c`) sets
+        // `COLOR_OP = i ? DISABLE : MODULATE` and
+        // `ALPHA_OP = i ? DISABLE : SELECT_ARG1`, and the D3D8/D3D9 test
+        // suites use `{COLOROP, DISABLE}`/`{ALPHAOP, DISABLE}` as the per-stage
+        // default (d3d8/tests/visual.c `default_stage_state`). A bound texture
+        // alone therefore does not activate a stage >= 1.
+        let (default_color, default_alpha) = if stage == 0 {
+            (D3DTEXTUREOP::Modulate, D3DTEXTUREOP::SelectArg1)
+        } else {
+            (D3DTEXTUREOP::Disable, D3DTEXTUREOP::Disable)
+        };
+        let color_op = raw(Ts::ColorOp, default_color.raw());
+        let alpha_op = raw(Ts::AlphaOp, default_alpha.raw());
         // A stage is active when an op is explicitly set to something other
         // than DISABLE, or when a texture is bound and the resolved default/op
         // actually combines it. With no explicit op and no bound texture the
@@ -614,10 +632,11 @@ impl DeviceState {
             }
         }
         let transform_flags = raw(Ts::TextureTransformFlags, 0);
-        // D3DTTFF_COUNT2 transforms the selected 2D vertex coordinate as a
-        // 4-vector `(u, v, 0, 1)` and takes the first two components. Other
-        // counts and D3DTTFF_PROJECTED have no draw path yet and stay named
-        // refusals rather than being silently ignored.
+        // D3DTTFF_COUNT2 transforms the selected 2D vertex coordinate as the
+        // 4-vector `(u, v, 1, 0)` and takes the first two components (the first
+        // component not supplied by the vertex is padded to 1). Other counts
+        // and D3DTTFF_PROJECTED have no draw path yet and stay named refusals
+        // rather than being silently ignored.
         let tex_transform = match transform_flags {
             0 => Mat4::IDENTITY,
             2 => self.texture_transforms[stage as usize],
@@ -637,10 +656,11 @@ impl DeviceState {
                 // filtering. RT3 sets it for its world textures; the sampler
                 // maps it to Linear. The two cubic modes stay refused.
                 D3DTEXTUREFILTERTYPE::Anisotropic => Ok(value),
-                D3DTEXTUREFILTERTYPE::PyramidQuad
-                | D3DTEXTUREFILTERTYPE::GaussianQuad => Err(fail(format!(
-                    "{name} = {value:#x} is not POINT/LINEAR/NONE in the bounded subset"
-                ))),
+                D3DTEXTUREFILTERTYPE::PyramidQuad | D3DTEXTUREFILTERTYPE::GaussianQuad => {
+                    Err(fail(format!(
+                        "{name} = {value:#x} is not POINT/LINEAR/NONE in the bounded subset"
+                    )))
+                }
             }
         };
         let address = |name: &str, value: u32| -> Result<u32, RenderError> {
@@ -666,6 +686,21 @@ impl DeviceState {
             "D3DTSS_MIPFILTER",
             raw(Ts::MipFilter, D3DTEXTUREFILTERTYPE::None.raw()),
         )?;
+        // D3DTSS_MAXMIPLEVEL shifts the base (most detailed) level the sampler
+        // may use; WineD3D folds it into `mip_base_level`. The stage resolver
+        // does not see the bound texture's level count, so the draw clamps it
+        // against the chain that was actually uploaded.
+        let max_mip_level = raw(Ts::MaxMipLevel, 0);
+        // wgpu 27's `SamplerDescriptor` has no `lod_bias`, so a nonzero
+        // D3DTSS_MIPMAPLODBIAS cannot be honoured. Fail by name rather than
+        // silently ignoring it (AGENTS.md: unsupported state must be named).
+        if let Some(bias) = self.texture_stage_state(stage, Ts::MipMapLodBias.raw()) {
+            if bias != 0 {
+                return Err(fail(format!(
+                    "D3DTSS_MIPMAPLODBIAS = {bias:#010x} has no wgpu equivalent"
+                )));
+            }
+        }
         let address_u = address(
             "D3DTSS_ADDRESSU",
             raw(Ts::AddressU, D3DTEXTUREADDRESS::Wrap.raw()),
@@ -720,6 +755,7 @@ impl DeviceState {
             min_filter,
             mag_filter,
             mip_filter,
+            max_mip_level,
             address_u,
             address_v,
         })
@@ -1577,6 +1613,43 @@ mod tests {
     }
 
     #[test]
+    fn stages_after_zero_default_to_disable() {
+        let mut state = DeviceState::new(64, 64);
+        configure_probe_states(&mut state);
+        // Stage 1 with nothing set: both ops default to DISABLE, so a bound
+        // texture does not activate it. Arguments still default to
+        // TEXTURE/CURRENT.
+        let stage = state.resolve_texture_stage(1, true).unwrap();
+        assert!(!stage.active);
+        assert_eq!(stage.color_op, D3DTEXTUREOP::Disable.raw());
+        assert_eq!(stage.alpha_op, D3DTEXTUREOP::Disable.raw());
+        assert_eq!(stage.color_arg1, d3dta::TEXTURE);
+        assert_eq!(stage.color_arg2, d3dta::CURRENT);
+        assert_eq!(stage.alpha_arg1, d3dta::TEXTURE);
+        assert_eq!(stage.alpha_arg2, d3dta::CURRENT);
+
+        // The world-draw shape: stage 1 COLOROP = ADDSIGNED with ALPHAOP left
+        // unset. It combines colour and must pass stage 0's alpha through; the
+        // alpha default is DISABLE, not SELECTARG1(TEXTURE). Regression guard
+        // for the 512x512 stage-1 texture leaking its alpha into the result.
+        state
+            .set_texture_stage_state(1, 1, D3DTEXTUREOP::AddSigned.raw())
+            .unwrap(); // COLOROP
+        let stage = state.resolve_texture_stage(1, true).unwrap();
+        assert!(stage.active);
+        assert_eq!(stage.color_op, D3DTEXTUREOP::AddSigned.raw());
+        assert_eq!(stage.alpha_op, D3DTEXTUREOP::Disable.raw());
+
+        // An explicit stage-1 ALPHAOP is honoured and activates the stage.
+        state
+            .set_texture_stage_state(1, 4, D3DTEXTUREOP::SelectArg1.raw())
+            .unwrap();
+        let stage = state.resolve_texture_stage(1, true).unwrap();
+        assert!(stage.active);
+        assert_eq!(stage.alpha_op, D3DTEXTUREOP::SelectArg1.raw());
+    }
+
+    #[test]
     fn unbound_texture_channel_keeps_the_diffuse_alpha() {
         // Black & White's dialogue box: an untextured quad whose stage 0 has
         // ALPHAOP = SELECTARG1(TEXTURE). With no texture bound the alpha must
@@ -1783,6 +1856,26 @@ mod tests {
         let stage = state.resolve_texture_stage(0, true).unwrap();
         assert_eq!(stage.tex_transform_flags, 0);
         assert_eq!(stage.tex_transform, Mat4::IDENTITY);
+    }
+
+    #[test]
+    fn max_mip_level_is_carried_and_nonzero_lod_bias_is_refused() {
+        let mut state = DeviceState::new(64, 64);
+        state
+            .set_texture_stage_state(0, 20, 2)
+            .unwrap(); // D3DTSS_MAXMIPLEVEL
+        let stage = state.resolve_texture_stage(0, true).unwrap();
+        assert_eq!(stage.max_mip_level, 2);
+        // The default (and an explicit zero) LOD bias is accepted.
+        state.set_texture_stage_state(0, 19, 0).unwrap(); // D3DTSS_MIPMAPLODBIAS
+        assert!(state.resolve_texture_stage(0, true).is_ok());
+        // wgpu 27 has no lod_bias, so a nonzero bias must fail by name rather
+        // than be silently ignored.
+        state
+            .set_texture_stage_state(0, 19, 1.0f32.to_bits())
+            .unwrap();
+        let err = state.resolve_texture_stage(0, true).unwrap_err();
+        assert!(err.cause.contains("MIPMAPLODBIAS"), "{}", err.cause);
     }
 
     #[test]

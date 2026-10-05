@@ -12,7 +12,7 @@
 
 use crate::RenderError;
 use crate::backend::GpuContext;
-use crate::d3d8::device::Device;
+use crate::d3d8::device::{Device, TextureLevelUpload};
 use crate::d3d8::math::Mat4;
 use crate::d3d8::resource::{
     CpuStorage, D3d8LevelLayout, IndexedDraw, VertexBuffer, format_bytes, level_layout,
@@ -23,7 +23,8 @@ use crate::d3d8::state::{Light, LitInput, Material, Viewport};
 ///
 /// 5: adds `IDirect3DDevice8::Reset` (implicit swap-chain recreation).
 /// 6: adds `IDirect3DDevice8::SetTexture` (level-0 upload + sampling).
-pub const ABI_VERSION: u32 = 6;
+/// 7: `SetTexture` carries the whole mip chain (one generation per level).
+pub const ABI_VERSION: u32 = 7;
 
 /// Opaque device handle. The bridge never inspects the pointee.
 pub struct D3d8Device {
@@ -553,57 +554,64 @@ pub extern "C" fn d3d8_device_set_texture_stage_state(
     )
 }
 
-/// `IDirect3DDevice8::SetTexture` for one stage. `data` is the guest's
-/// level-0 CPU texel block in D3D8 `B,G,R,A` order; a null/empty block or
-/// `texture_id == 0` unbinds the stage and selects the default white texture.
-///
-/// `texture_id`/`level` identify the guest texture (the kit's level-surface COM identity,
-/// unique for the process lifetime) and its mip level; `generation` is the
-/// kit's content version, bumped on every write path. Together with
-/// `force_upload` (a lock still open at draw time) they let the device reuse a
-/// resident upload without converting or copying unchanged bytes. The bridge
-/// converts the guest COM texture into these plain bytes; no guest address
-/// reaches the renderer's stored state.
-#[allow(clippy::too_many_arguments)]
+/// One mip level of a bound texture, in D3D8 `B,G,R,A` order. `data`/`bytes`
+/// point at the guest's CPU texel block for that level; `dirty` is nonzero
+/// while a lock is still open, so the bytes must not be assumed unchanged.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct D3d8TextureLevel {
+    pub level: u32,
+    pub width: u32,
+    pub height: u32,
+    pub dirty: u32,
+    pub generation: u64,
+    pub data: *const u8,
+    pub bytes: u32,
+    pub reserved: u32,
+}
+
+/// `IDirect3DDevice8::SetTexture` for one stage. `levels` is the bound
+/// texture's whole mip chain (base level first); a null pointer, `level_count
+/// == 0` or `texture_id == 0` unbinds the stage and selects the default white
+/// texture. Each level carries its own content generation, so re-locking level
+/// N re-uploads only N. No guest address is stored by the renderer.
 #[unsafe(no_mangle)]
 pub extern "C" fn d3d8_device_set_texture(
     dev: *mut D3d8Device,
     stage: u32,
     texture_id: u32,
-    level: u32,
-    generation: u64,
-    force_upload: u32,
     format: u32,
-    width: u32,
-    height: u32,
-    data: *const u8,
-    bytes: u32,
+    level_count: u32,
+    levels: *const D3d8TextureLevel,
     err: *mut D3d8Error,
 ) -> i32 {
     let Some(device) = device_ref(dev) else {
         write_error(err, D3d8Status::InvalidArgument, "set_texture: null device");
         return D3d8Status::InvalidArgument as i32;
     };
-    let slice: &[u8] = if data.is_null() || bytes == 0 {
-        &[]
-    } else {
-        // SAFETY: the caller promises `bytes` readable bytes at `data`.
-        unsafe { core::slice::from_raw_parts(data, bytes as usize) }
-    };
-    report(
-        err,
-        device.set_texture(
-            stage,
-            texture_id,
-            level,
-            generation,
-            force_upload != 0,
-            format,
-            width,
-            height,
-            slice,
-        ),
-    )
+    let mut uploads = Vec::new();
+    if texture_id != 0 && level_count != 0 && !levels.is_null() {
+        uploads.reserve(level_count as usize);
+        for i in 0..level_count as usize {
+            // SAFETY: the caller promises `level_count` readable descriptors,
+            // each with `bytes` readable bytes at `data` (empty when null/0).
+            let level = unsafe { &*levels.add(i) };
+            let data: &[u8] = if level.data.is_null() || level.bytes == 0 {
+                &[]
+            } else {
+                unsafe { core::slice::from_raw_parts(level.data, level.bytes as usize) }
+            };
+            uploads.push(TextureLevelUpload {
+                level: level.level,
+                generation: level.generation,
+                force_upload: level.dirty != 0,
+                width: level.width,
+                height: level.height,
+                data,
+            });
+        }
+    }
+    report(err, device.set_texture(stage, texture_id, format, &uploads))
 }
 
 /// Bind a level identity, or id zero for the implicit backbuffer. The bridge
@@ -1129,6 +1137,9 @@ pub extern "C" fn d3d8_device_process_vertices(
         );
         return D3d8Status::InvalidArgument as i32;
     }
+    device
+        .state
+        .trace_process_vertices(src_fvf, dest_fvf, src_stride, count);
     // SAFETY: the caller promises readable `src_bytes` at `src` and writable
     // `dest_bytes` at `dest`.
     let source = unsafe { core::slice::from_raw_parts(src, src_bytes as usize) };

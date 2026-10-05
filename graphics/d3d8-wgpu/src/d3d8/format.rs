@@ -819,6 +819,22 @@ mod tests {
     }
 
     #[test]
+    fn block_levels_smaller_than_a_block_still_decode_one_block() {
+        // A mip-tail level (2x2, then 1x1) still occupies one full 4x4 block in
+        // the source layout; the RGBA output is clipped to the level's pixels.
+        assert_eq!(block_level_layout(2, 2, D3DFMT_DXT1), (8, 8));
+        assert_eq!(block_level_layout(1, 1, D3DFMT_DXT1), (8, 8));
+        let data = vec![0xFFu8; 8];
+        let mut out = Vec::new();
+        decode_block_into(D3DFMT_DXT1, &data, 2, 2, &mut out).unwrap();
+        assert_eq!(out.len(), 2 * 2 * 4);
+        decode_block_into(D3DFMT_DXT1, &data, 1, 1, &mut out).unwrap();
+        assert_eq!(out.len(), 1 * 1 * 4);
+        // A too-short level is still refused.
+        assert!(decode_block_into(D3DFMT_DXT1, &data[..4], 2, 2, &mut out).is_err());
+    }
+
+    #[test]
     fn depth_formats_map_to_honest_wgpu_formats() {
         use wgpu::TextureFormat as F;
         assert_eq!(

@@ -5,7 +5,7 @@
 //! Specular lighting is computed only for `ProcessVertices`; a draw that needs
 //! the vertex specular input still fails by name.
 use super::*;
-use crate::d3d8::fixed_function::d3dcolor_to_rgba;
+use crate::d3d8::fixed_function::{d3dcolor_to_rgba, transform_texcoord};
 
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
@@ -330,6 +330,50 @@ impl DeviceState {
         })
     }
 
+    /// Diagnostic for the first `ProcessVertices` calls. Enabled by
+    /// `RECOMP_D3D8_TRACE_PROCESS_VERTICES`; the value is the number of calls
+    /// to print (default 8). Unset means no work is done. Prints the source
+    /// and destination FVF/stride/count plus each stage's `TEXCOORDINDEX`,
+    /// `TEXTURETRANSFORMFLAGS` and `D3DTS_TEXTUREN` matrix, so the guest's
+    /// pre-draw transform setup can be compared with the following draw.
+    pub(crate) fn trace_process_vertices(
+        &self,
+        src_fvf: u32,
+        dest_fvf: u32,
+        src_stride: u32,
+        count: u32,
+    ) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNT: AtomicU32 = AtomicU32::new(0);
+        let Ok(raw) = std::env::var("RECOMP_D3D8_TRACE_PROCESS_VERTICES") else {
+            return;
+        };
+        let limit: u32 = raw.parse().unwrap_or(8);
+        let n = COUNT.fetch_add(1, Ordering::Relaxed);
+        if n >= limit {
+            return;
+        }
+        use crate::d3d8::enums::D3DTEXTURESTAGESTATETYPE as Ts;
+        eprintln!(
+            "[d3d8-trace] process_vertices {n}: src_fvf=0x{src_fvf:06X} stride={src_stride} dest_fvf=0x{dest_fvf:06X} count={count}"
+        );
+        for stage in 0..2u32 {
+            let get = |s: Ts| match self.texture_stage_state(stage, s.raw()) {
+                Some(v) => format!("{v:#x}"),
+                None => "-".to_string(),
+            };
+            eprintln!(
+                "[d3d8-trace]   pv stage{stage} tci={} ttf={}",
+                get(Ts::TexCoordIndex),
+                get(Ts::TextureTransformFlags)
+            );
+            eprintln!(
+                "[d3d8-trace]   pv stage{stage} texture_matrix={:?}",
+                self.texture_transforms[stage as usize].rows
+            );
+        }
+    }
+
     /// 0x152: XYZ at 0, NORMAL at 12, D3DCOLOR at 24, float2 UV at 28.
     /// 0x112: XYZ at 0, NORMAL at 12, float2 UV at 24, material diffuse.
     /// Evaluate in camera space and keep floating diffuse until rasterization.
@@ -402,6 +446,24 @@ impl DeviceState {
         let setup = self.lighting_setup()?;
         let world_view_projection = self.world.mul(self.view).mul(self.projection);
         let vp = self.viewport;
+        // D3D8's fixed-function `ProcessVertices` generates the destination
+        // texture coordinates from the texture stages active at call time:
+        // output set N comes from texture stage N, transformed by its
+        // `D3DTS_TEXTUREN` matrix when `D3DTSS_TEXTURETRANSFORMFLAGS` is not
+        // DISABLE. The application then reprograms `D3DTSS_TEXCOORDINDEX` to
+        // point at the generated set and resets the transform before drawing
+        // the pre-transformed vertices (see `IDirect3DDevice9::ProcessVertices`
+        // and the "Fixed Function Vertex Processing" page: "Texture
+        // coordinates are generated when texture transform or texture
+        // generation is enabled"). This source FVF carries one coordinate set,
+        // so every stage's `TEXCOORDINDEX` selects that set. The later `XYZRHW`
+        // draw must not re-apply the transform, or it would be applied twice.
+        let texcoord_sets = out_layout.texcoord_bytes / 8;
+        let mut stage_transforms = [(0u32, Mat4::IDENTITY); 2];
+        for (set, transform) in stage_transforms.iter_mut().enumerate().take(texcoord_sets) {
+            let stage = self.resolve_texture_stage(set as u32, true)?;
+            *transform = (stage.tex_transform_flags, stage.tex_transform);
+        }
         for i in 0..count {
             let begin = (src_start + i) * layout.stride;
             let vertex = &src[begin..begin + layout.stride];
@@ -426,15 +488,23 @@ impl DeviceState {
             dst[12..16].copy_from_slice(&rhw.to_le_bytes());
             dst[16..20].copy_from_slice(&rgba_to_d3dcolor(lit.diffuse).to_le_bytes());
             dst[20..24].copy_from_slice(&rgba_to_d3dcolor(lit.specular).to_le_bytes());
-            // The source FVFs carry one texture-coordinate set. A 0x2c4
-            // destination names a second set that the engine generates from the
-            // same coordinate through the stage-1 texture matrix; the draw's
-            // shader applies that transform, so the same untransformed
-            // coordinate is written to both sets.
-            dst[24..32].copy_from_slice(&vertex[layout.uv_offset..layout.uv_offset + 8]);
-            if out_layout.texcoord_bytes > 8 {
-                dst[32..32 + out_layout.texcoord_bytes - 8]
-                    .copy_from_slice(&vertex[layout.uv_offset..layout.uv_offset + 8]);
+            let uv = [
+                f32::from_le_bytes(
+                    vertex[layout.uv_offset..layout.uv_offset + 4]
+                        .try_into()
+                        .unwrap(),
+                ),
+                f32::from_le_bytes(
+                    vertex[layout.uv_offset + 4..layout.uv_offset + 8]
+                        .try_into()
+                        .unwrap(),
+                ),
+            ];
+            for (set, (flags, matrix)) in stage_transforms.iter().enumerate().take(texcoord_sets) {
+                let transformed = transform_texcoord(uv, matrix, *flags);
+                let offset = 24 + set * 8;
+                dst[offset..offset + 4].copy_from_slice(&transformed[0].to_le_bytes());
+                dst[offset + 4..offset + 8].copy_from_slice(&transformed[1].to_le_bytes());
             }
         }
         Ok(())
@@ -809,5 +879,51 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn process_vertices_bakes_stage_texture_transforms_into_destination_sets() {
+        use crate::d3d8::enums::D3DTEXTURESTAGESTATETYPE as Ts;
+        let mut state = directional();
+        // Stage 0: COUNT2 with a per-axis scale.
+        let mut scale0 = Mat4::IDENTITY;
+        scale0.rows[0][0] = 2.0;
+        scale0.rows[1][1] = 4.0;
+        state
+            .set_texture_stage_state(0, Ts::TextureTransformFlags.raw(), 2)
+            .unwrap();
+        state.set_transform(16, scale0).unwrap(); // D3DTS_TEXTURE0
+        // Stage 1: the guest's detail tiling, COUNT2 with a 46x uniform scale.
+        let mut scale1 = Mat4::IDENTITY;
+        scale1.rows[0][0] = 46.0;
+        scale1.rows[1][1] = 46.0;
+        state
+            .set_texture_stage_state(1, Ts::TextureTransformFlags.raw(), 2)
+            .unwrap();
+        state
+            .set_texture_stage_state(1, Ts::TexCoordIndex.raw(), 0)
+            .unwrap();
+        state.set_transform(17, scale1).unwrap(); // D3DTS_TEXTURE1
+        let source = vertex_xyz_normal_tex1([0.0, 0.0, 1.0], [0.25, 0.5]);
+        let mut dest = vec![0u8; 40];
+        state
+            .process_vertices(
+                &source,
+                0,
+                1,
+                LitInput::XYZ_NORMAL_TEX1,
+                0x02c4,
+                0,
+                &mut dest,
+            )
+            .unwrap();
+        let f = |o: usize| f32::from_le_bytes(dest[o..o + 4].try_into().unwrap());
+        // Destination set N is texture stage N, transformed at process time.
+        assert_eq!([f(24), f(28)], [0.5, 2.0]);
+        assert_eq!([f(32), f(36)], [11.5, 23.0]);
+        // The matrices are consumed by ProcessVertices, so they must remain
+        // in device state for the reprocessing case; the draw path drops them
+        // only for the pre-transformed draw itself (tested in fixed_function).
+        assert_eq!(state.texture_transforms[1].rows[0][0], 46.0);
     }
 }
