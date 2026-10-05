@@ -9,6 +9,7 @@
 #include <execinfo.h>
 #endif
 #include <algorithm>
+#include <deque>
 #include <map>
 #include <stdio.h>
 #include <stdlib.h>
@@ -427,6 +428,113 @@ void drop_block(std::map<uint32_t, Blk>::iterator it) {
     g_blocks->erase(it);
 }
 
+
+// Optional redzones (RECOMP_HEAP_CANARY=1, =2 aborts on the first hit). Every
+// block is over-allocated by at least 16 bytes and the bytes between the
+// requested size and the end of the block are filled with a pattern. A guest
+// overrun (or a helper that writes past the size it was given) damages the
+// pattern; it is checked at free/realloc and by a periodic sweep of every
+// live block (RECOMP_HEAP_CANARY_PERIOD allocator calls, default 4096), and a
+// hit names the block, its allocation site and the current guest context.
+// The block layout changes while it is on, so it is a diagnostic only.
+bool g_canary = false;
+int g_canary_mode = 0;
+uint32_t g_canary_period = 1024, g_canary_ticks = 0;
+const uint32_t CANARY_PAD = 16;
+const uint8_t CANARY_BYTE = 0xfd;
+std::set<uint32_t> g_canary_reported;
+
+// Quarantine state (RECOMP_HEAP_QUARANTINE, implied by the canary): freed
+// blocks held back from reuse, oldest first. With the canary on they are also
+// filled with a poison byte, so a write into freed memory is detectable.
+const uint8_t POISON_BYTE = 0xdd;
+std::deque<uint32_t> g_held;
+uint64_t g_held_bytes = 0;
+std::map<uint32_t, uint32_t> g_free_site; // held block -> guest eip when it was freed
+
+inline uint32_t canary_pad() {
+    return g_canary ? CANARY_PAD : 0;
+}
+void canary_fill(uint32_t addr, const Blk &b) {
+    if (g_canary && b.size > b.req)
+        memset(g_mem + addr + b.req, CANARY_BYTE, b.size - b.req);
+}
+// Reports the first damaged redzone byte of a used block; once per block.
+bool canary_check(uint32_t addr, const Blk &b, const char *when) {
+    if (!g_canary || !b.used || b.size <= b.req)
+        return true;
+    const uint8_t *z = g_mem + addr + b.req;
+    uint32_t n = b.size - b.req, bad = 0;
+    while (bad < n && z[bad] == CANARY_BYTE)
+        ++bad;
+    if (bad == n)
+        return true;
+    if (!g_canary_reported.insert(addr).second)
+        return false;
+    char dump[160];
+    int len = 0;
+    for (uint32_t i = bad; i < n && i < bad + 24; ++i)
+        len += snprintf(dump + len, sizeof dump - len, "%02x ", z[i]);
+    auto live = g_live->find(addr);
+    LOGW("heap canary: block %08x req %u size %u damaged at +%u past the request (%s): %s",
+         addr, b.req, b.size, bad, when, dump);
+    if (live != g_live->end())
+        LOGW("heap canary:   allocated near guest eip %08x", live->second.site);
+    if (const X86 *c = guest_current_context()) {
+        LOGW("heap canary:   now eip=%08x esp=%08x ebp=%08x", c->eip, c->r[R_ESP], c->r[R_EBP]);
+        auto chain = win32_return_chain(c->r[R_EBP], 8);
+        for (size_t i = 0; i < chain.size(); ++i)
+            LOGW("heap canary:   frame %zu returns to %08x", i, chain[i]);
+    }
+    if (g_canary_mode >= 2)
+        abort();
+    return false;
+}
+// A held (freed, quarantined) block whose poison was disturbed was written
+// after free: by the guest through a stale pointer, or by a helper.
+void poison_check(uint32_t addr, const Blk &b, const char *when) {
+    if (!g_canary || b.used)
+        return;
+    const uint8_t *z = g_mem + addr;
+    uint32_t bad = 0;
+    while (bad < b.size && z[bad] == POISON_BYTE)
+        ++bad;
+    if (bad == b.size || !g_canary_reported.insert(addr).second)
+        return;
+    char dump[160];
+    int len = 0;
+    for (uint32_t i = bad; i < b.size && i < bad + 24; ++i)
+        len += snprintf(dump + len, sizeof dump - len, "%02x ", z[i]);
+    auto fs = g_free_site.find(addr);
+    LOGW("heap canary: freed block %08x size %u written after free at +%u (%s): %s", addr, b.size,
+         bad, when, dump);
+    LOGW("heap canary:   freed near guest eip %08x", fs != g_free_site.end() ? fs->second : 0);
+    if (const X86 *c = guest_current_context()) {
+        LOGW("heap canary:   now eip=%08x esp=%08x ebp=%08x", c->eip, c->r[R_ESP], c->r[R_EBP]);
+        auto chain = win32_return_chain(c->r[R_EBP], 8);
+        for (size_t i = 0; i < chain.size(); ++i)
+            LOGW("heap canary:   frame %zu returns to %08x", i, chain[i]);
+    }
+    if (g_canary_mode >= 2)
+        abort();
+}
+void canary_sweep(const char *when) {
+    for (auto &kv : *g_blocks)
+        if (kv.second.used)
+            canary_check(kv.first, kv.second, when);
+    for (uint32_t a : g_held) {
+        auto it = g_blocks->find(a);
+        if (it != g_blocks->end())
+            poison_check(a, it->second, when);
+    }
+}
+void canary_tick() {
+    if (g_canary && ++g_canary_ticks >= g_canary_period) {
+        g_canary_ticks = 0;
+        canary_sweep("sweep");
+    }
+}
+
 void heap_reset() {
     if (!g_blocks)
         g_blocks = new std::map<uint32_t, Blk>();
@@ -435,6 +543,21 @@ void heap_reset() {
     if (!g_live)
         g_live = new std::map<uint32_t, LiveAlloc>();
     g_heap_trace = recomp_env("HEAP_TRACE") != nullptr;
+    if (const char *e = recomp_env("HEAP_CANARY")) {
+        g_canary_mode = atoi(e);
+        g_canary = g_canary_mode > 0;
+        g_heap_trace = g_heap_trace || g_canary; // the live map supplies allocation sites
+        if (const char *per = recomp_env("HEAP_CANARY_PERIOD"))
+            g_canary_period = (uint32_t)strtoul(per, nullptr, 0);
+        if (!g_canary_period)
+            g_canary_period = 1;
+        g_canary_ticks = 0;
+        g_canary_reported.clear();
+    }
+    g_held.clear();
+    g_held_bytes = 0;
+    g_free_site.clear();
+    g_live->clear();
     g_blocks->clear();
     g_free->clear();
     g_live->clear();
@@ -512,7 +635,7 @@ uint32_t heap_alloc(uint32_t size, bool zero, uint32_t align) {
     }
     if (align < 16)
         align = 16;
-    uint32_t need = align_up(size ? size : 1, 16);
+    uint32_t need = align_up((size ? size : 1) + canary_pad(), 16);
 
     for (uint32_t start : *g_free) {
         auto it = g_blocks->find(start);
@@ -537,6 +660,8 @@ uint32_t heap_alloc(uint32_t size, bool zero, uint32_t align) {
             memset(g_mem + user, 0, need);
         ++g_total_allocs;
         live_set(user, heap_site(), size);
+        canary_fill(user, (*g_blocks)[user]);
+        canary_tick();
         return user;
     }
     LOGW("heap_alloc: out of guest heap (%u bytes requested)", size);
@@ -570,34 +695,13 @@ uint32_t heap_size(uint32_t addr) {
     return it->second.req;
 }
 
-bool heap_free(uint32_t addr) {
-    if (!g_blocks || !addr)
-        return false;
-    auto it = g_blocks->find(addr);
-    if (it == g_blocks->end() || !it->second.used) {
-        LOGW("heap_free: %08x is not a live allocation", addr);
-        return false;
-    }
-    it->second.used = false;
-    it->second.req = 0;
-    ++g_total_frees;
-    live_erase(addr);
-
-    // RECOMP_HEAP_QUARANTINE=1 retires a block instead of returning it: the
-    // address is never handed out again, and no neighbour absorbs it either.
-    // A guest that goes on using memory it has already freed then reads its
-    // own dead object rather than whatever was allocated over the top of it,
-    // which is the difference between a fault that names the culprit and one
-    // that does not. Off by default, and a run with it on gives up every byte
-    // it frees, so it is a diagnostic rather than a way to play.
-    static const bool quarantine = recomp_env("HEAP_QUARANTINE") != nullptr;
-    if (quarantine)
-        return true;
-    g_free->insert(addr);
-
+// Returns a freed block to the free list and merges it with free neighbours.
+static void release_free_block(std::map<uint32_t, Blk>::iterator it) {
+    g_free->insert(it->first);
+    // Merge only with blocks on the free list: a quarantined block is free but held.
     // Coalesce with the following block.
     auto next = std::next(it);
-    if (next != g_blocks->end() && !next->second.used &&
+    if (next != g_blocks->end() && g_free->count(next->first) &&
         next->first == it->first + it->second.size) {
         it->second.size += next->second.size;
         drop_block(next);
@@ -605,11 +709,80 @@ bool heap_free(uint32_t addr) {
     // Coalesce with the preceding block.
     if (it != g_blocks->begin()) {
         auto prev = std::prev(it);
-        if (!prev->second.used && prev->first + prev->second.size == it->first) {
+        if (g_free->count(prev->first) && prev->first + prev->second.size == it->first) {
             prev->second.size += it->second.size;
             drop_block(it);
         }
     }
+}
+
+bool heap_free(uint32_t addr) {
+    if (!g_blocks || !addr)
+        return false;
+    auto it = g_blocks->find(addr);
+    if (it == g_blocks->end() || !it->second.used) {
+        LOGW("heap_free: %08x is not a live allocation", addr);
+        if (g_canary) {
+            auto fs = g_free_site.find(addr);
+            if (fs != g_free_site.end())
+                LOGW("heap canary: double free; first freed near guest eip %08x", fs->second);
+            if (const X86 *c = guest_current_context()) {
+                LOGW("heap canary:   now eip=%08x esp=%08x ebp=%08x", c->eip, c->r[R_ESP],
+                     c->r[R_EBP]);
+                auto chain = win32_return_chain(c->r[R_EBP], 8);
+                for (size_t i = 0; i < chain.size(); ++i)
+                    LOGW("heap canary:   frame %zu returns to %08x", i, chain[i]);
+            }
+            if (g_canary_mode >= 2)
+                abort();
+        }
+        return false;
+    }
+    canary_check(addr, it->second, "free");
+    g_canary_reported.erase(addr);
+    it->second.used = false;
+    it->second.req = 0;
+    ++g_total_frees;
+    live_erase(addr);
+    canary_tick();
+
+    // RECOMP_HEAP_QUARANTINE=1 holds a freed block back instead of returning
+    // it: its address is not handed out again, and no neighbour absorbs it. A
+    // guest that goes on using memory it has already freed then reads its own
+    // dead object rather than whatever was allocated over the top of it, which
+    // is the difference between a fault that names the culprit and one that
+    // does not. The hold is a FIFO bounded by RECOMP_HEAP_QUARANTINE_MB (default
+    // 48): past that the oldest block is released for reuse, so the heap lasts
+    // and a stale use is caught for as long as the window covers. Off by
+    // default; a diagnostic rather than a way to play.
+    static const bool quarantine = recomp_env("HEAP_QUARANTINE") != nullptr || g_canary;
+    if (quarantine) {
+        static const uint64_t budget = [] {
+            const char *e = recomp_env("HEAP_QUARANTINE_MB");
+            return (uint64_t)(e ? strtoul(e, nullptr, 0) : 48ul) << 20;
+        }();
+        if (g_canary) {
+            memset(g_mem + addr, POISON_BYTE, it->second.size);
+            const X86 *c = guest_current_context();
+            g_free_site[addr] = c ? c->eip : 0;
+        }
+        g_held.push_back(addr);
+        g_held_bytes += it->second.size;
+        while (g_held_bytes > budget && !g_held.empty()) {
+            uint32_t old = g_held.front();
+            g_held.pop_front();
+            auto oit = g_blocks->find(old);
+            if (oit == g_blocks->end() || oit->second.used)
+                continue;
+            poison_check(old, oit->second, "release");
+            g_free_site.erase(old);
+            g_canary_reported.erase(old);
+            g_held_bytes -= oit->second.size;
+            release_free_block(oit);
+        }
+        return true;
+    }
+    release_free_block(it);
     return true;
 }
 
@@ -630,8 +803,10 @@ uint32_t heap_realloc(uint32_t addr, uint32_t new_size, bool zero) {
         LOGW("heap_realloc: %08x is not a live allocation", addr);
         return 0;
     }
+    canary_check(addr, it->second, "realloc");
+    g_canary_reported.erase(addr);
     uint32_t old_req = it->second.req;
-    uint32_t need = align_up(new_size ? new_size : 1, 16);
+    uint32_t need = align_up((new_size ? new_size : 1) + canary_pad(), 16);
     uint32_t have = it->second.size;
 
     if (need <= have) {
@@ -639,7 +814,7 @@ uint32_t heap_realloc(uint32_t addr, uint32_t new_size, bool zero) {
         if (tail >= 16) {
             it->second.size = need;
             auto next = std::next(it);
-            if (next != g_blocks->end() && !next->second.used && next->first == addr + have) {
+            if (next != g_blocks->end() && g_free->count(next->first) && next->first == addr + have) {
                 uint32_t merged = tail + next->second.size;
                 drop_block(next);
                 put_block(addr + need, merged, 0, false);
@@ -651,12 +826,13 @@ uint32_t heap_realloc(uint32_t addr, uint32_t new_size, bool zero) {
         live_set(addr, heap_site(), new_size);
         if (zero && new_size > old_req)
             memset(g_mem + addr + old_req, 0, new_size - old_req);
+        canary_fill(addr, it->second);
         return addr;
     }
 
     // Try to grow into a free neighbour.
     auto next = std::next(it);
-    if (next != g_blocks->end() && !next->second.used && next->first == addr + have &&
+    if (next != g_blocks->end() && g_free->count(next->first) && next->first == addr + have &&
         have + next->second.size >= need) {
         uint32_t total = have + next->second.size;
         drop_block(next);
@@ -668,6 +844,7 @@ uint32_t heap_realloc(uint32_t addr, uint32_t new_size, bool zero) {
             put_block(addr + need, tail, 0, false);
         if (zero)
             memset(g_mem + addr + old_req, 0, new_size - old_req);
+        canary_fill(addr, it->second);
         return addr;
     }
 
