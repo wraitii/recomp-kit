@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- D3D8 `GetDeviceCaps` now advertises `D3DCAPS8.AlphaCmpCaps` (`+0x34`)
+  with all eight `D3DCMPCAPS_*` bits. A guest can gate its
+  `D3DRS_ALPHATESTENABLE` setup on the compare function it intends to use, so
+  a zero field silently left alpha testing off and alpha-tested textures drew
+  opaque (punch-through holes showed the texture's black RGB). The
+  fixed-function shader already implements every `D3DCMPFUNC`, so the cap now
+  matches the renderer and the D3D9 bridge.
+
 - D3D8 `D3DTSS_TEXCOORDINDEX` now resolves `D3DTSS_TCI_CAMERASPACEPOSITION`
   with `D3DTTFF_COUNT3 | D3DTTFF_PROJECTED` instead of failing the draw as an
   unimplemented coordinate transform. `D3DTSS_TCI_CAMERASPACENORMAL` and

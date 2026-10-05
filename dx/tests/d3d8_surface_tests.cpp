@@ -829,6 +829,12 @@ static void test_caps() {
     // forces the software `0x112`/`0x152` terrain fallback.
     check((rd32(caps + 0x1c) & D3DDEVCAPS_HWTRANSFORMANDLIGHT) != 0,
           "DevCaps advertises hardware transform and lighting");
+    // A guest may gate its `D3DRS_ALPHATESTENABLE` setup on
+    // `D3DPCMPCAPS_GREATEREQUAL`; without the bit it leaves alpha testing off
+    // and alpha-tested textures draw opaque. The fixed-function shader
+    // implements all eight compare functions.
+    check((rd32(caps + 0x34) & 0x00000040u) != 0,
+          "AlphaCmpCaps advertises D3DPCMPCAPS_GREATEREQUAL");
     check(rd32(caps + 0x58) == 2048, "MaxTextureWidth is advertised");
     check(rd32(caps + 0x5c) == 2048, "MaxTextureHeight is advertised");
     // Guest 0x007c2160 sizes its texture stage setup from these; zero means

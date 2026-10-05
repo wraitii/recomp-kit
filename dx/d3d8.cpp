@@ -280,6 +280,16 @@ void write_caps(uint32_t addr) {
     // DIVERGENCE(original): only this one bit is advertised; the reference
     // adapter reported its full DevCaps, which the shim does not model.
     wr32(addr + 0x1c, D3DDEVCAPS_HWTRANSFORMANDLIGHT);
+    // AlphaCmpCaps (+0x34). A guest can gate its `D3DRS_ALPHATESTENABLE`
+    // setup on the compare function it intends to use; a zero field silently
+    // renders alpha-tested geometry opaque even when the bridge would honour
+    // the state. The fixed-function shader implements every `D3DCMPFUNC`
+    // (`NEVER` .. `ALWAYS`), so advertise all eight bits. This matches the D3D9
+    // bridge's `AlphaCmpCaps`.
+    //
+    // DIVERGENCE(original): the reference adapter reported its hardware's
+    // compare-function set; the bridge supports the full D3D8 enum.
+    wr32(addr + 0x34, 0x000000ffu);
     // MaxTextureWidth/MaxTextureHeight (D3DCAPS8 +0x58/+0x5c). A game that
     // sizes textures against these (Ghost Recon's 0x004eac20 halves an image
     // until it fits) collapses every texture to 1x1 when they read 0. 2048 is
