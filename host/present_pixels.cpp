@@ -107,6 +107,16 @@ extern "C" void host_present_expand_indexed(const uint8_t *src, int w, int h, in
     memcpy(out, rgba.data(), rgba.size() * sizeof(pop::RGBA8));
 }
 
+// Exact integer forms of the `* 255 / 31` and `* 255 / 63` scales (checked
+// over every input by test_rgb565_expansion_exhaustive), so the loop has no
+// division and the compiler vectorizes it at -O2: 5 bits -> (v * 1053) >> 7, 6 bits -> 4v + ((v * 49) >> 10).
+static inline uint8_t expand5(uint32_t v) {
+    return (uint8_t)((v * 1053u) >> 7);
+}
+static inline uint8_t expand6(uint32_t v) {
+    return (uint8_t)(4u * v + ((v * 49u) >> 10));
+}
+
 extern "C" void host_present_expand_rgb565(const uint8_t *src, int w, int h, int pitch,
                                            uint8_t *out) {
     if (!src || !out || w <= 0 || h <= 0)
@@ -117,9 +127,9 @@ extern "C" void host_present_expand_rgb565(const uint8_t *src, int w, int h, int
         for (int x = 0; x < w; ++x) {
             uint32_t p = (uint32_t)(row[2 * x] | (row[2 * x + 1] << 8));
             // Scaled, not shifted: 31 has to become 255 or white is not white.
-            o[4 * x + 0] = (uint8_t)(((p >> 11) & 0x1f) * 255 / 31);
-            o[4 * x + 1] = (uint8_t)(((p >> 5) & 0x3f) * 255 / 63);
-            o[4 * x + 2] = (uint8_t)((p & 0x1f) * 255 / 31);
+            o[4 * x + 0] = expand5((p >> 11) & 0x1f);
+            o[4 * x + 1] = expand6((p >> 5) & 0x3f);
+            o[4 * x + 2] = expand5(p & 0x1f);
             o[4 * x + 3] = 255;
         }
     }

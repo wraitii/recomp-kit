@@ -3,7 +3,7 @@ if(WIN32)
 else()
   set(POP_OS_SOURCE os_posix.cpp)
 endif()
-add_library(recomp_platform OBJECT ${POP_OS_SOURCE} env.cpp)
+add_library(recomp_platform OBJECT ${POP_OS_SOURCE} env.cpp profile_markers.cpp)
 target_include_directories(recomp_platform PUBLIC ${POP_ROOT})
 if(WIN32)
   # os_win32.cpp resolves host names through Winsock's getaddrinfo.

@@ -3085,7 +3085,15 @@ void sched_leave_critsec(uint32_t cs) {
     wr32(cs + CS_OFF_LOCK_COUNT, rec ? rec - 1 : 0xffffffffu);
     if (!rec) {
         wr32(cs + CS_OFF_OWNER, 0);
-        g_sched_cv.notify_all();
+        // Only a thread blocked on this very section can be released by it, and
+        // it still has to be handed the baton before it runs. Waking every
+        // parked host thread for each release made them all contend for
+        // g_sched_m (the common case is an uncontended section nobody waits on).
+        for (GuestThread *t : threads())
+            if (t->blocked && t->wait_kind == W_CRITSEC && t->wait_cs == cs) {
+                g_sched_cv.notify_all();
+                break;
+            }
     }
     g_sched_m.unlock();
 }

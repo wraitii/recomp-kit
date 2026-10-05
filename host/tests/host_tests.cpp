@@ -177,6 +177,28 @@ static void test_palette_expansion() {
     CHECK_EQ(grey[8], 255);
 }
 
+static void test_rgb565_expansion_exhaustive() {
+    // Every 16-bit value, at a width that exercises both the vector body and
+    // the scalar tail, against the defining `* 255 / max` formula.
+    const int w = 65536 + 3, pitch = w * 2;
+    std::vector<uint8_t> src((size_t)pitch), out((size_t)w * 4);
+    for (int i = 0; i < w; ++i) {
+        uint16_t v = (uint16_t)i;
+        src[2 * i] = (uint8_t)(v & 0xff);
+        src[2 * i + 1] = (uint8_t)(v >> 8);
+    }
+    host_present_expand_rgb565(src.data(), w, 1, pitch, out.data());
+    int bad = 0;
+    for (int i = 0; i < w; ++i) {
+        uint32_t p = (uint16_t)i;
+        bad += out[4 * i + 0] != ((p >> 11) & 0x1f) * 255 / 31;
+        bad += out[4 * i + 1] != ((p >> 5) & 0x3f) * 255 / 63;
+        bad += out[4 * i + 2] != (p & 0x1f) * 255 / 31;
+        bad += out[4 * i + 3] != 255;
+    }
+    CHECK_EQ(bad, 0);
+}
+
 static void test_rgb565_expansion() {
     const int w = 4, h = 1, pitch = 16;
     uint8_t src[pitch];
@@ -10052,6 +10074,7 @@ int main(int argc, char **argv) {
         {"presentation service", test_presentation_service},
         {"palette expansion", test_palette_expansion},
         {"5-6-5 expansion", test_rgb565_expansion},
+        {"5-6-5 expansion, every value", test_rgb565_expansion_exhaustive},
         {"letterbox geometry", test_letterbox},
         {"window size for a guest mode", test_window_size},
         {"scan code map", test_scancodes},

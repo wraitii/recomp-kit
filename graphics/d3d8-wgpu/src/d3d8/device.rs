@@ -451,6 +451,14 @@ pub struct FrameHandoff {
 /// Flush a recorded batch once its CPU-side block data reaches this size.
 const BATCH_FLUSH_BYTES: usize = 8 << 20;
 
+type TextureGroupKey = (
+    wgpu::TextureView,
+    wgpu::Sampler,
+    wgpu::TextureView,
+    wgpu::Sampler,
+);
+const MAX_TEXTURE_GROUPS: usize = 512;
+
 /// Texture/sampler pairs of a textured draw, captured when it is recorded.
 struct StageBindings {
     view0: wgpu::TextureView,
@@ -489,12 +497,82 @@ struct DrawBatch {
     depth: Option<(wgpu::TextureView, bool)>,
 }
 
-fn uniform_binding<T>(buffer: &wgpu::Buffer, offset: u64) -> wgpu::BindingResource<'_> {
-    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-        buffer,
-        offset,
-        size: wgpu::BufferSize::new(std::mem::size_of::<T>() as u64),
-    })
+/// Explicit bind group layouts for the draw pipelines. Group 0 binds the four
+/// per-draw uniform blocks with dynamic offsets into the shared draw buffer, so
+/// one bind group serves every draw; group 1 (textured only) holds the stage
+/// textures and samplers.
+struct DrawLayouts {
+    /// Pipeline layout for unlit draws: group 0 = transform, fog, alpha test.
+    unlit: wgpu::PipelineLayout,
+    /// Pipeline layout for textured draws: group 0 adds the stages block.
+    textured: wgpu::PipelineLayout,
+    bgl_unlit: wgpu::BindGroupLayout,
+    bgl_textured: wgpu::BindGroupLayout,
+    bgl_stage_textures: wgpu::BindGroupLayout,
+}
+
+impl DrawLayouts {
+    fn new(gpu: &wgpu::Device) -> Self {
+        let uniform = |binding: u32, size: usize| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: true,
+                min_binding_size: wgpu::BufferSize::new(size as u64),
+            },
+            count: None,
+        };
+        let transform = uniform(0, std::mem::size_of::<TransformUniform>());
+        let stages = uniform(1, std::mem::size_of::<StagesUniform>());
+        let fog = uniform(2, std::mem::size_of::<FogUniform>());
+        let alpha = uniform(3, std::mem::size_of::<AlphaTestUniform>());
+        let bgl_unlit = gpu.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("D3D8 unlit uniforms"),
+            entries: &[transform, fog, alpha],
+        });
+        let bgl_textured = gpu.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("D3D8 textured uniforms"),
+            entries: &[transform, stages, fog, alpha],
+        });
+        let tex = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let samp = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
+        let bgl_stage_textures = gpu.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("D3D8 stage textures"),
+            entries: &[tex(0), samp(1), tex(2), samp(3)],
+        });
+        let unlit = gpu.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("D3D8 unlit pipeline layout"),
+            bind_group_layouts: &[&bgl_unlit],
+            push_constant_ranges: &[],
+        });
+        let textured = gpu.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("D3D8 textured pipeline layout"),
+            bind_group_layouts: &[&bgl_textured, &bgl_stage_textures],
+            push_constant_ranges: &[],
+        });
+        Self {
+            unlit,
+            textured,
+            bgl_unlit,
+            bgl_textured,
+            bgl_stage_textures,
+        }
+    }
 }
 
 /// `RECOMP_D3D8_DRAW_STATS=1` per-frame counters. Deltas are reset after each
@@ -559,6 +637,13 @@ pub struct Device {
     /// (queue writes are ordered before the following submit); batching submits
     /// would require a per-draw ring.
     draw_buffer: std::cell::RefCell<Option<wgpu::Buffer>>,
+    draw_layouts: DrawLayouts,
+    /// Group-0 bind groups over `draw_buffer` (unlit, textured); the real block
+    /// offsets are dynamic. Dropped when the buffer is recreated.
+    uniform_groups: std::cell::RefCell<[Option<wgpu::BindGroup>; 2]>,
+    /// Stage texture/sampler groups, keyed by the bound objects. Cleared when
+    /// it grows past `MAX_TEXTURE_GROUPS` so it cannot pin textures forever.
+    texture_groups: std::cell::RefCell<std::collections::HashMap<TextureGroupKey, wgpu::BindGroup>>,
     batch: std::cell::RefCell<DrawBatch>,
     /// Present handoff ring (see [`FrameRing`]); created on first use.
     frame_ring: std::cell::RefCell<Option<FrameRing>>,
@@ -592,6 +677,7 @@ impl Device {
     ) -> Result<Self, RenderError> {
         let target = gpu.create_target(width, height, format, depth_format)?;
         let white = create_white_texture(&gpu);
+        let draw_layouts = DrawLayouts::new(&gpu.device);
         let survey = survey::enabled();
         if survey {
             survey::register_exit_report();
@@ -613,6 +699,9 @@ impl Device {
             index_scratch: Vec::new(),
             lit_scratch: Vec::new(),
             draw_buffer: Default::default(),
+            draw_layouts,
+            uniform_groups: Default::default(),
+            texture_groups: Default::default(),
             batch: Default::default(),
             frame_ring: Default::default(),
             publish_pending: Default::default(),
@@ -1418,7 +1507,11 @@ impl Device {
                 } else {
                     "D3D8 unlit triangle"
                 }),
-                layout: None,
+                layout: Some(if textured {
+                    &self.draw_layouts.textured
+                } else {
+                    &self.draw_layouts.unlit
+                }),
                 vertex: wgpu::VertexState {
                     module: shader,
                     entry_point: Some(if layout.pre_transformed {
@@ -1527,9 +1620,41 @@ impl Device {
             }));
             self.buffers_created_at_flush
                 .set(self.buffers_created_at_flush.get() + 1);
+            *self.uniform_groups.borrow_mut() = [None, None];
         }
         let db = slot.as_ref().unwrap();
         self.gpu.queue.write_buffer(db, 0, &batch.data);
+        {
+            let mut groups = self.uniform_groups.borrow_mut();
+            let entry = |binding: u32, size: usize| wgpu::BindGroupEntry {
+                binding,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: db,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(size as u64),
+                }),
+            };
+            let t = entry(0, std::mem::size_of::<TransformUniform>());
+            let st = entry(1, std::mem::size_of::<StagesUniform>());
+            let f = entry(2, std::mem::size_of::<FogUniform>());
+            let a = entry(3, std::mem::size_of::<AlphaTestUniform>());
+            if groups[0].is_none() {
+                groups[0] = Some(gpu.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("D3D8 unlit uniforms binding"),
+                    layout: &self.draw_layouts.bgl_unlit,
+                    entries: &[t.clone(), f.clone(), a.clone()],
+                }));
+            }
+            if groups[1].is_none() {
+                groups[1] = Some(gpu.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("D3D8 textured uniforms binding"),
+                    layout: &self.draw_layouts.bgl_textured,
+                    entries: &[t, st, f, a],
+                }));
+            }
+        }
+        let uniform_groups = self.uniform_groups.borrow();
+        let mut texture_groups = self.texture_groups.borrow_mut();
         let color_view = batch.color_view.take().expect("batch has a color target");
         let depth = batch.depth.take();
         let mut encoder = gpu.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1565,93 +1690,61 @@ impl Device {
                 ..Default::default()
             });
             for d in &batch.draws {
-                // A bind group built from an automatic pipeline layout is
-                // exclusive to that pipeline, so groups are built per draw.
-                let t = d.ub_base + DRAW_UB_TRANSFORM;
-                let group = if d.stages {
-                    gpu.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("D3D8 transform+stage binding"),
-                        layout: &d.pipeline.get_bind_group_layout(0),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: uniform_binding::<TransformUniform>(db, t),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: uniform_binding::<StagesUniform>(
-                                    db,
-                                    d.ub_base + DRAW_UB_STAGES,
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: uniform_binding::<FogUniform>(
-                                    db,
-                                    d.ub_base + DRAW_UB_FOG,
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: uniform_binding::<AlphaTestUniform>(
-                                    db,
-                                    d.ub_base + DRAW_UB_ALPHA_TEST,
-                                ),
-                            },
-                        ],
-                    })
-                } else {
-                    gpu.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("D3D8 transform binding"),
-                        layout: &d.pipeline.get_bind_group_layout(0),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: uniform_binding::<TransformUniform>(db, t),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: uniform_binding::<FogUniform>(
-                                    db,
-                                    d.ub_base + DRAW_UB_FOG,
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: uniform_binding::<AlphaTestUniform>(
-                                    db,
-                                    d.ub_base + DRAW_UB_ALPHA_TEST,
-                                ),
-                            },
-                        ],
-                    })
-                };
+                // Uniform blocks are addressed by dynamic offset into the one
+                // draw buffer, so a single group per layout serves every draw.
+                let kind = usize::from(d.stages);
+                let group = uniform_groups[kind].as_ref().unwrap();
+                let base = d.ub_base;
+                let offsets = [
+                    (base + DRAW_UB_TRANSFORM) as u32,
+                    (base + DRAW_UB_STAGES) as u32,
+                    (base + DRAW_UB_FOG) as u32,
+                    (base + DRAW_UB_ALPHA_TEST) as u32,
+                ];
                 pass.set_pipeline(&d.pipeline);
-                pass.set_bind_group(0, &group, &[]);
+                // Binding order: transform, [stages], fog, alpha test.
+                if d.stages {
+                    pass.set_bind_group(0, group, &offsets);
+                } else {
+                    pass.set_bind_group(0, group, &[offsets[0], offsets[2], offsets[3]]);
+                }
                 if let Some(t) = &d.textures {
-                    let texture_group = gpu.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("D3D8 stage textures binding"),
-                        layout: &d.pipeline.get_bind_group_layout(1),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(&t.view0),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(&t.sampler0),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::TextureView(&t.view1),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: wgpu::BindingResource::Sampler(&t.sampler1),
-                            },
-                        ],
-                    });
-                    pass.set_bind_group(1, &texture_group, &[]);
+                    if texture_groups.len() >= MAX_TEXTURE_GROUPS {
+                        // Groups already recorded in this pass stay alive in it.
+                        texture_groups.clear();
+                    }
+                    let texture_group = texture_groups
+                        .entry((
+                            t.view0.clone(),
+                            t.sampler0.clone(),
+                            t.view1.clone(),
+                            t.sampler1.clone(),
+                        ))
+                        .or_insert_with(|| {
+                            gpu.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("D3D8 stage textures binding"),
+                                layout: &self.draw_layouts.bgl_stage_textures,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: wgpu::BindingResource::TextureView(&t.view0),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: wgpu::BindingResource::Sampler(&t.sampler0),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 2,
+                                        resource: wgpu::BindingResource::TextureView(&t.view1),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 3,
+                                        resource: wgpu::BindingResource::Sampler(&t.sampler1),
+                                    },
+                                ],
+                            })
+                        });
+                    pass.set_bind_group(1, &*texture_group, &[]);
                 }
                 let vstart = d.vertex_base;
                 pass.set_vertex_buffer(0, db.slice(vstart..vstart + d.vertex_len));

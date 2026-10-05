@@ -142,6 +142,7 @@ void os_exit_immediately(int code);
 // Time.
 // ---------------------------------------------------------------------------
 uint64_t os_monotonic_ns(void); // never goes backwards; arbitrary origin
+int64_t os_process_id(void);
 // Broken-down local and UTC time for a Unix timestamp; 0 or -1.
 int os_localtime(int64_t seconds, struct tm *out);
 int os_gmtime(int64_t seconds, struct tm *out);

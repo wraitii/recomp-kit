@@ -6706,6 +6706,32 @@ static void test_d3d7_translation() {
         CHECK(!d3d7_store_rgba_surface(keep, 4, 8, 1, 1, rgba));
         CHECK_EQ(memcmp(keep, "\x11\x22\x33\x44", 4), 0);
     }
+    {
+        // A large pseudo-random block (odd width, padded pitch) against the
+        // per-pixel conversion the store is defined by.
+        const uint32_t w = 301, h = 7, pitch = w * 2 + 6;
+        std::vector<uint8_t> rgba((size_t)w * h * 4), dst((size_t)pitch * h, 0xAA);
+        uint32_t seed = 12345;
+        for (auto &b : rgba) {
+            seed = seed * 1664525u + 1013904223u;
+            b = (uint8_t)(seed >> 24);
+        }
+        CHECK(d3d7_store_rgba_surface(dst.data(), pitch, 16, w, h, rgba.data()));
+        int bad = 0;
+        for (uint32_t y = 0; y < h; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                const uint8_t *p = &rgba[((size_t)y * w + x) * 4];
+                uint16_t want = d3d7_rgb888_to_rgb565(
+                    ((uint32_t)p[3] << 24) | ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2]);
+                uint16_t got;
+                memcpy(&got, &dst[(size_t)y * pitch + x * 2], 2);
+                bad += got != want;
+            }
+            for (uint32_t i = w * 2; i < pitch; ++i)
+                bad += dst[(size_t)y * pitch + i] != 0xAA; // padding untouched
+        }
+        CHECK_EQ(bad, 0);
+    }
 }
 
 // The DXT block decoder, with known blocks and exact expected pixels. This is
