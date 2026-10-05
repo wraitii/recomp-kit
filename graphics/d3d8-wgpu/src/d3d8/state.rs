@@ -1858,6 +1858,28 @@ mod tests {
     }
 
     #[test]
+    fn unbound_tfactor_modulate_passes_current_and_keeps_tfactor_alpha() {
+        // The probe's unbound case: MODULATE(TFACTOR, TEXTURE) with
+        // ALPHAOP=SELECTARG2(TFACTOR). Wine's is_invalid_op rewrites the colour
+        // op (it reads TEXTURE) to SELECTARG1(CURRENT), while the alpha op does
+        // not read TEXTURE and stays. Mirrors `resolve_texture_stage` disabling
+        // only the texture-reading channel.
+        let mut state = DeviceState::new(64, 64);
+        configure_probe_states(&mut state);
+        state.set_texture_stage_state(0, 1, 4).unwrap(); // COLOROP MODULATE
+        state.set_texture_stage_state(0, 2, 3).unwrap(); // COLORARG1 TFACTOR
+        state.set_texture_stage_state(0, 3, 2).unwrap(); // COLORARG2 TEXTURE
+        state.set_texture_stage_state(0, 4, 3).unwrap(); // ALPHAOP SELECTARG2
+        state.set_texture_stage_state(0, 6, 3).unwrap(); // ALPHAARG2 TFACTOR
+        let stage = state.resolve_texture_stage(0, false).unwrap();
+        assert!(stage.active);
+        assert_eq!(stage.color_op, D3DTEXTUREOP::Disable.raw());
+        assert_eq!(stage.alpha_op, D3DTEXTUREOP::SelectArg2.raw());
+        assert_eq!(stage.color_arg1, 3); // TFACTOR, unbounded but unused
+        assert_eq!(stage.alpha_arg2, 3); // TFACTOR
+    }
+
+    #[test]
     fn stages_after_zero_default_to_disable() {
         let mut state = DeviceState::new(64, 64);
         configure_probe_states(&mut state);

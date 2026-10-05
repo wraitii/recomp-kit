@@ -161,6 +161,13 @@ fn checked_pixels(pixels: &[u8], width: u32, height: u32) -> Result<(), ProbeErr
     Ok(())
 }
 
+/// The centre pixel `[R, G, B, A]` of a tightly packed RGBA8 readback.
+fn center_pixel(pixels: &[u8], options: &ProbeOptions) -> [u8; 4] {
+    let center =
+        (options.width as usize / 2) + (options.height as usize / 2) * options.width as usize;
+    pixels[center * 4..center * 4 + 4].try_into().unwrap()
+}
+
 /// Draw a full-screen quad with FVF `0x242` (`XYZ|DIFFUSE|TEX2`, stride 32)
 /// under two resolved texture stages and return the centre pixel. `stage0` and
 /// `stage1` are `[color_op, color_arg1, color_arg2, alpha_op, alpha_arg1,
@@ -246,6 +253,7 @@ fn run_with_gpu(
             "cull winding/readback",
             "alpha test/readback",
             "texture factor/readback",
+            "unbound stage/readback",
             "two-stage op family/readback",
             "texture upload cache/readback",
             "vertex lighting/readback",
@@ -658,10 +666,11 @@ fn run_with_gpu(
     });
 
     // Texture factor (D3DRS_TEXTUREFACTOR) as D3DTA_TFACTOR: COLOROP=MODULATE
-    // of TFACTOR and the default white texture yields the factor's RGB, and
+    // of TFACTOR and a bound texture yields TFACTOR*texel RGB, and
     // ALPHAOP=SELECTARG2 with ALPHAARG2=TFACTOR yields its alpha. The factor is
     // ARGB 0x4080c020 -> RGB [0x80,0xc0,0x20], alpha 0x40. The draw needs the
-    // textured path (0x142); the unbound stage samples the 1x1 white default.
+    // textured path (0x142); a white 1x1 texture makes the modulate a no-op so
+    // the check isolates the TFACTOR path with a real binding.
     device.state.set_render_state(60, 0x4080_c020)?; // D3DRS_TEXTUREFACTOR
     device.state.set_render_state(27, 0)?; // ALPHABLENDENABLE off
     device.state.set_texture_stage_state(0, 1, 4)?; // COLOROP = MODULATE
@@ -686,14 +695,17 @@ fn run_with_gpu(
     }
     device.clear(0, 1 | 2, 0x00000000, 1.0, 0)?;
     let tf_vb = VertexBuffer::new(&tf_bytes, 24)?;
+    const TF_TEX_ID: u32 = 88;
+    // Source texels are D3D8 B,G,R,A; opaque white. MODULATE(TFACTOR, white) is
+    // the factor, so this isolates TFACTOR with a real bound texture.
+    let tf_white = [0xffu8, 0xff, 0xff, 0xff];
+    device.set_texture(0, TF_TEX_ID, 21, &level0(1, false, 1, 1, &tf_white))?;
     device.begin_scene()?;
     device.draw_primitive(4, 0x142, &tf_vb, 0, 1)?;
     device.end_scene()?;
     let tf_pixels = device.read_pixels()?;
     checked_pixels(&tf_pixels, options.width, options.height)?;
-    let tf_center =
-        ((options.width as usize / 2) + (options.height as usize / 2) * options.width as usize) * 4;
-    let tf_seen: [u8; 4] = tf_pixels[tf_center..tf_center + 4].try_into().unwrap();
+    let tf_seen = center_pixel(&tf_pixels, options);
     let tf_ok = tf_seen == [0x80, 0xc0, 0x20, 0x40];
     report.checks.push(CheckResult {
         name: "texture factor/readback",
@@ -703,6 +715,34 @@ fn run_with_gpu(
             Outcome::Failed
         },
         detail: format!("center={tf_seen:?}, expected [128, 192, 32, 64]"),
+    });
+
+    // Unbound-texture stage: with no texture set, Wine's `is_invalid_op`
+    // rewrites MODULATE(TFACTOR, TEXTURE) to SELECTARG1(CURRENT)
+    // (dlls/wined3d/utils.c at Wine commit
+    // 455e3509b98a6919fd4ad1def4803e08c41c03b2). COLOROP reads TEXTURE, so it
+    // passes CURRENT through (the white vertex diffuse); ALPHAOP=SELECTARG2
+    // (TFACTOR) does not read TEXTURE, so alpha stays the TFACTOR alpha. The
+    // renderer must not sample the white fallback for the RGB.
+    device.release_texture(TF_TEX_ID);
+    device.clear(0, 1 | 2, 0x00000000, 1.0, 0)?;
+    device.begin_scene()?;
+    device.draw_primitive(4, 0x142, &tf_vb, 0, 1)?;
+    device.end_scene()?;
+    let unbound_pixels = device.read_pixels()?;
+    checked_pixels(&unbound_pixels, options.width, options.height)?;
+    let unbound_seen = center_pixel(&unbound_pixels, options);
+    // Diffuse is opaque white, so CURRENT RGB is [255,255,255] and alpha is the
+    // TFACTOR alpha 0x40.
+    let unbound_ok = unbound_seen == [0xff, 0xff, 0xff, 0x40];
+    report.checks.push(CheckResult {
+        name: "unbound stage/readback",
+        outcome: if unbound_ok {
+            Outcome::Passed
+        } else {
+            Outcome::Failed
+        },
+        detail: format!("center={unbound_seen:?}, expected [255, 255, 255, 64]"),
     });
 
     // Upload-cache wiring: an unchanged bind reuses the resident texture, a
@@ -851,6 +891,29 @@ fn run_with_gpu(
             [105, 60, 40, 128],
             1,
         ),
+        // BLENDTEXTUREALPHA is Arg1 * alpha + Arg2 * (1 - alpha) (Wine
+        // `mix(arg2, arg1, alpha)`): alpha 255 keeps Arg1 (CURRENT, tex0) and alpha 0
+        // keeps Arg2 (diffuse). A symmetric 0.5 alpha cannot tell the operand order apart.
+        (
+            "blendtexalpha a=255",
+            select_tex0,
+            [13, 1, 0, 2, 2, 1],
+            0xff0a_141e,
+            tex0,
+            [40, 80, 160, 255],
+            [200, 100, 50, 255],
+            1,
+        ),
+        (
+            "blendtexalpha a=0",
+            select_tex0,
+            [13, 1, 0, 2, 2, 1],
+            0xff0a_141e,
+            tex0,
+            [40, 80, 160, 0],
+            [10, 20, 30, 0],
+            1,
+        ),
     ];
     // A 2x1 texture for the TEXCOORDINDEX-1 row: set 0 samples the left texel,
     // set 1 the right one.
@@ -891,29 +954,6 @@ fn run_with_gpu(
             d[i * 4 + 2] = t[0];
             d[i * 4 + 3] = t[3];
         }
-        // BLENDTEXTUREALPHA is Arg1 * alpha + Arg2 * (1 - alpha) (Wine
-        // `mix(arg2, arg1, alpha)`): alpha 255 keeps Arg1 (CURRENT, tex0) and alpha 0
-        // keeps Arg2 (diffuse). A symmetric 0.5 alpha cannot tell the operand order apart.
-        (
-            "blendtexalpha a=255",
-            select_tex0,
-            [13, 1, 0, 2, 2, 1],
-            0xff0a_141e,
-            tex0,
-            [40, 80, 160, 255],
-            [200, 100, 50, 255],
-            1,
-        ),
-        (
-            "blendtexalpha a=0",
-            select_tex0,
-            [13, 1, 0, 2, 2, 1],
-            0xff0a_141e,
-            tex0,
-            [40, 80, 160, 0],
-            [10, 20, 30, 0],
-            1,
-        ),
         let d0 = [tex0[2], tex0[1], tex0[0], tex0[3]];
         device.set_texture(0, 1, 21, &level0(0, true, 1, 1, &d0))?;
         device.set_texture(1, 3, 21, &level0(0, true, 2, 1, &d))?;

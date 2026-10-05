@@ -858,8 +858,12 @@ pub fn alpha_test_pass(func: u32, reference: u32, alpha: f32) -> bool {
 /// Textured XYZ + diffuse + TEX1 WGSL. `vs_main` decodes the D3DCOLOR and
 /// passes the texture coordinate through; `fs_main` samples stage 0 and
 /// applies the resolved COLOROP/ALPHAOP subset. The sampler and 2D texture
-/// are group 1 bindings 0 and 1; the unbound case binds a 1x1 white texture,
-/// so an active stage with no `SetTexture` samples white exactly as D3D8 does.
+/// are group 1 bindings 0 and 1; the unbound case binds a 1x1 white texture as
+/// a fallback, but an unbound stage does not simply sample white. Wine's
+/// `is_invalid_op` (dlls/wined3d/utils.c) rewrites a stage op that reads
+/// TEXTURE with no texture to SELECTARG1(CURRENT), which
+/// `DeviceState::resolve_texture_stage` mirrors; the white fallback is only
+/// read by stages whose op does not reference TEXTURE.
 pub const TEXTURED_WGSL: &str = r#"
 struct TransformUniform {
     matrix: mat4x4<f32>,

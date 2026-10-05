@@ -88,6 +88,11 @@ failure, or 2 for unavailable/unsupported operations. A missing requested check
 or an unsupported result cannot count as a pass. Cargo outputs stay under the
 ignored build tree.
 
+Draw diagnostics: `RECOMP_D3D8_TRACE_DRAWS=<n>` prints up to `n` draws with
+both stage bindings (texture id or unbound), `RECOMP_D3D8_TRACE_DRAWS_START=<n>`
+skips that many draws first, and `RECOMP_D3D8_TRACE_STAGE1=1` restricts the trace
+to draws with a stage-1 texture bound.
+
 ## Supported slice and remaining work
 
 Full-target color/depth/stencil clears, material/light storage, render/texture-stage

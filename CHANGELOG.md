@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- D3D8/wgpu `D3DTOP_BLENDDIFFUSEALPHA`, `BLENDTEXTUREALPHA`, `BLENDFACTORALPHA`
+  and `BLENDCURRENTALPHA` blended with their operands swapped. D3D8 defines
+  them as `Arg1 * alpha + Arg2 * (1 - alpha)` (Wine `mix(arg2, arg1, alpha)`);
+  the shader computed `mix(arg1, arg2, alpha)`. The two-stage probe's old
+  alpha-0.5 case could not see the swap, so it gained alpha 255 and alpha 0
+  rows. Railroad Tycoon 3's night building pass (`BLENDCURRENTALPHA` against
+  the texture factor) drew the building body as the flat factor colour.
+
 - D3D8/wgpu `DrawIndexedPrimitive` now treats `NumVertices`/`MinIndex` as the
   hints Wine's d3d8 does instead of rejecting the draw: the parameters never
   bound which vertices the draw reads, so a caller passing `NumVertices=0`
@@ -14,13 +22,11 @@
   draw trace also gained `RECOMP_D3D8_TRACE_DRAWS_START=<n>` to skip the first
   `n` draws.
 
-- D3D8/wgpu `D3DTOP_BLENDDIFFUSEALPHA`, `BLENDTEXTUREALPHA`, `BLENDFACTORALPHA`
-  and `BLENDCURRENTALPHA` blended with their operands swapped. D3D8 defines
-  them as `Arg1 * alpha + Arg2 * (1 - alpha)` (Wine `mix(arg2, arg1, alpha)`);
-  the shader computed `mix(arg1, arg2, alpha)`. The two-stage probe's old
-  alpha-0.5 case could not see the swap, so it gained alpha 255 and alpha 0
-  rows. Railroad Tycoon 3's night building pass (`BLENDCURRENTALPHA` against
-  the texture factor) drew the building body as the flat factor colour.
+- The d3d8-wgpu probe's `texture factor/readback` check now binds a real white
+  texture so it exercises `MODULATE(TFACTOR, TEXTURE)`. A new
+  `unbound stage/readback` check documents Wine's `is_invalid_op` result for
+  the same op with no texture: the texture-reading colour op passes `CURRENT`
+  through and only the `TFACTOR` alpha is applied.
 
 - D3D8/wgpu `DrawPrimitive` now rasterizes `D3DPT_POINTLIST` (1) through
   wgpu's `PrimitiveTopology::PointList`. wgpu always rasterizes one pixel and

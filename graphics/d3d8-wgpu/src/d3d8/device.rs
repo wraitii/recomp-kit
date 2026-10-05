@@ -216,7 +216,8 @@ fn cull_override() -> Option<CullOverride> {
 /// FVF, counts, viewport, transforms and the first four vertices so a
 /// rasterization or coverage mismatch can be attributed to real inputs.
 /// Enabled by `RECOMP_D3D8_TRACE_DRAWS`; the value is the number of draws to
-/// print (default 8). Unset means no work is done.
+/// print (default 8), and `RECOMP_D3D8_TRACE_DRAWS_START` skips that many
+/// draws first (default 0). Unset means no work is done.
 fn trace_draw(
     fvf: u32,
     topology: u32,
@@ -236,13 +237,20 @@ fn trace_draw(
         return;
     };
     let limit: u32 = raw.parse().unwrap_or(8);
+    // `RECOMP_D3D8_TRACE_DRAWS_START=<n>` skips the first `n` traced draws so a
+    // later draw can be captured; `RECOMP_D3D8_TRACE_DRAWS` still caps how many
+    // are printed from that offset.
+    let start: u32 = std::env::var("RECOMP_D3D8_TRACE_DRAWS_START")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     // `RECOMP_D3D8_TRACE_STAGE1=1` counts and prints only draws with a texture
     // bound at stage 1 (the world draws), so the cap is not spent on menus.
     if std::env::var_os("RECOMP_D3D8_TRACE_STAGE1").is_some() && stage1.is_none() {
         return;
     }
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
-    if n >= limit {
+    if n < start || n >= start.saturating_add(limit) {
         return;
     }
     eprintln!(
@@ -256,7 +264,7 @@ fn trace_draw(
     eprintln!("[d3d8-trace]   state: {}", state.draw_state_summary());
     for (stage, bound) in [(0u32, stage0), (1u32, stage1)] {
         let Some(t) = bound else {
-            eprintln!("[d3d8-trace]   stage{stage} texture none (white fallback)");
+            eprintln!("[d3d8-trace]   stage{stage} texture unbound (white fallback)");
             continue;
         };
         // Per-level written flags and generations as the renderer recorded
@@ -640,9 +648,12 @@ fn mip_lod_range(
     }
 }
 
-/// A 1x1 opaque white texture, sampled when a stage is active but no texture
-/// is bound. D3D8's default texture is white, so an unbound active stage
-/// modulates the vertex color by white (a no-op), which this reproduces.
+/// A 1x1 opaque white texture bound as the sampler fallback when a stage is
+/// active but no texture is set. It is not what an unbound stage necessarily
+/// samples: Wine's `is_invalid_op` (dlls/wined3d/utils.c) rewrites a stage op
+/// that reads TEXTURE with no texture to SELECTARG1(CURRENT), which
+/// `DeviceState::resolve_texture_stage` mirrors, so the white texel is only
+/// read by ops that do not reference TEXTURE or after a real texture is bound.
 fn create_white_texture(gpu: &GpuContext) -> BoundTexture {
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("D3D8 default white texture"),
@@ -1188,8 +1199,9 @@ impl Device {
 
     /// `IDirect3DDevice8::SetTexture`. Each entry of `levels` is one mip slice
     /// (`level`, `generation`, the current lock state and the CPU texel block
-    /// in the source D3D8 layout). An empty slice or `texture_id == 0` unbinds
-    /// and samples the default white texture.
+    /// in the source D3D8 layout). An empty slice or `texture_id == 0` unbinds;
+    /// the sampler keeps the white fallback, but a stage op that reads TEXTURE
+    /// is rewritten to SELECTARG1(CURRENT) by `resolve_texture_stage`.
     ///
     /// The wgpu texture holds the whole chain with `mip_level_count = N`. Every
     /// level tracks its own content generation, so re-locking level N re-uploads

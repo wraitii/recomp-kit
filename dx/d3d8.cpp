@@ -2675,8 +2675,12 @@ void Dev_CopyRects(X86 *c) {
 #ifdef RECOMP_D3D8_WGPU
 // Hand the bound stage-0 texture's level-0 CPU bytes to the renderer. Called
 // immediately before each draw so a level locked after SetTexture samples its
-// newest content. A null binding sends an empty block, which selects the
-// renderer's default white texture, matching D3D8's unbound-stage default.
+// newest content. A null binding sends an empty block; the renderer keeps a
+// white fallback bound there, but an unbound stage does not simply sample
+// white. Wine's is_invalid_op (dlls/wined3d/utils.c) rewrites a stage op that
+// reads TEXTURE with no texture to SELECTARG1(CURRENT), and
+// DeviceState::resolve_texture_stage applies the same rule, so the stage passes
+// CURRENT (the vertex diffuse at stage 0) through instead of the white texel.
 //
 // Returns false when the renderer rejected the bind; the diagnostic has already
 // been reported through host_result() and the caller must not draw. This
