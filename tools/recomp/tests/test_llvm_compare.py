@@ -9,8 +9,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import translate as T
-from llvm_compare import read_manifest, validate_listing, emit_comparison
-from llvm_compare_build import compile_settings, cmake_quote, function_sizes
+from corpus.llvm_emit import read_manifest, validate_listing, emit_comparison
+from corpus.llvm_build import compile_settings, cmake_quote, function_sizes
 from test_translate_driver import synthetic_image
 
 
@@ -23,7 +23,7 @@ from test_translate_driver import synthetic_image
     (['0x2000'], True, False, False, True),
 ])
 def test_calls_require_exact_declared_ordinary_boundaries(monkeypatch, calls, synchronize, resumable, intrinsic, valid):
-    from llvm_compare import validate_calls
+    from corpus.llvm_emit import validate_calls
     fn = SimpleNamespace(insns=T.parse_listing_text('00001000  CALL 0x2000'))
     monkeypatch.setattr(T, 'RESUMABLE_STACKS', resumable)
     monkeypatch.setattr(T, 'INTRINSIC_BODY', {0x2000: ''} if intrinsic else {})
@@ -131,7 +131,7 @@ def test_macho_sizes_use_boundaries_not_zero_nm_sizes():
 
 @pytest.mark.parametrize('stale_body', [True, False])
 def test_stale_production_source_or_runtime_is_refused(tmp_path, stale_body):
-    from llvm_compare_build import production_settings
+    from corpus.llvm_build import production_settings
     out, runtime, gen = (tmp_path / name for name in ('compare', 'runtime', 'gen'))
     for directory in (out / '00400100', runtime, gen):
         directory.mkdir(parents=True)

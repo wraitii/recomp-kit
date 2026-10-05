@@ -1,6 +1,6 @@
 # Translator C/LLVM comparison
 
-`tools/build.py --llvm-compare /absolute/path/codegen.json` is an opt-in,
+`tools/build.py --corpus-llvm /absolute/path/codegen.json` is an opt-in,
 **build-only** path through `translate.py`. It does not modify production chunks,
 dispatch tables, overrides, or the application's backend. Requires LLVM 22 plus
 an existing native Release C translation and its CMake `compile_commands.json`.
@@ -18,7 +18,7 @@ Manifest (paths relative to the manifest):
 ```
 
 Each function profile uses the existing
-[x87 LLVM profile fields](../experiments/x87_llvm/README.md), plus
+[x87 LLVM profile fields](../../experiments/x87_llvm/README.md), plus
 `codegen_fixture`: a game-owned header using the shared harness with four
 functions `compare_c_native`, `compare_c_llvm`, `compare_raw`, `compare_lifted`.
 Its mode table labels should distinguish the production compiler, LLVM22 C,
@@ -106,7 +106,7 @@ for helper preparation, then always-inline/O2, as in the original experiment.
 Codegen and replay use the recorded production O2 setting.
 
 All compilation runs through the comparison CMake project, under the build
-wrapper's lock. The output is `<game build>/llvm-compare/`, separate from `recomp/gen`:
+wrapper's lock. The output is `<game build>/function-corpus-llvm/`, separate from `recomp/gen`:
 
 - `translation.json`: contract, identities, listing/body provenance, dispatch off.
 - `build-settings.json`: original compile commands, flags/compiler versions,
@@ -132,13 +132,13 @@ cost, or game-level behavior/performance equivalence, and enables no gameplay pa
 ## Corpus sweep
 
 ```sh
-python tools/build.py --game-dir /absolute/game --llvm-sweep /absolute/path/codegen.json
+python tools/build.py --game-dir /absolute/game --corpus-llvm-sweep /absolute/path/codegen.json
 ```
 
 This separate build mode uses the comparison manifest's explicit normal-exit
 contract. It visits **every exported function-census row**, including missing or
 empty listings, without recovering blocks or changing boundaries. Each row in
-`build/llvm-sweep/coverage.json` records its address, listing, instruction counts,
+`build/function-corpus-sweep/coverage.json` records its address, listing, instruction counts,
 byte hash, and first refusal's stage and diagnostic, or successful emission and
 lifting. Summary counts distinguish functions with x87 instructions. The sweep
 uses the real LLVM passes, not a second stack-analysis implementation; unexpected

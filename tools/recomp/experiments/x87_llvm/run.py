@@ -6,7 +6,7 @@ import shutil
 import subprocess
 
 import translate as T
-from experiments.x87_locals.run import CASES as BASE_CASES, emit as emit_c
+from corpus.fragments.run import CASES as BASE_CASES, emit as emit_c
 
 CASES = dict(BASE_CASES, deep_stack=["FLD float ptr [ESI]"] * 8 + ["FADDP"] * 7 + ["FSTP float ptr [EBX]"])
 

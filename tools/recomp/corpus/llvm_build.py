@@ -15,9 +15,9 @@ import sys
 
 from experiments.x87_llvm.run import llvm_config
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent.parent
 KIT = HERE.parents[1]
-CMAKE = HERE / 'llvm_compare_native'
+CMAKE = HERE / 'corpus/llvm'
 
 
 def compile_settings(row):

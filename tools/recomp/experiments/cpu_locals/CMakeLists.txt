@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(cpu_locals_checks C)
 foreach(target cpu_locals cpu_locals_null_checks)
-  add_executable(${target} "${CMAKE_BINARY_DIR}/generated.c" support.c ../x87_locals/harness.c)
+  add_executable(${target} "${CMAKE_BINARY_DIR}/generated.c" support.c ../../corpus/fragments/harness.c)
   target_include_directories(${target} PRIVATE "${KIT_RUNTIME}" "${CMAKE_BINARY_DIR}")
   target_compile_definitions(${target} PRIVATE FIXTURE_CHECK_ONLY=1)
   target_compile_options(${target} PRIVATE -O2 -ffp-contract=off -Wall -Wextra)

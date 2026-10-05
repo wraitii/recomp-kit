@@ -5,7 +5,7 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from experiments.x87_locals.run import emit, CASES, MODES
+from corpus.fragments.run import emit, CASES, MODES
 
 
 @pytest.mark.parametrize("mode", MODES)

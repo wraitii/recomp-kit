@@ -1,13 +1,13 @@
 # LLVM x87 stack-to-SSA passes
 
 An opt-in LLVM **22** native-host experiment. Production C translation is unchanged.
-A [build-only translator comparison](../../llvm_compare_native/README.md) now
+A [build-only translator comparison](../../corpus/llvm/README.md) now
 reuses this emitter and these passes with normal C translation and actual
 production compile settings. Use it for production-C codegen measurements;
 this experiment retains the isolated strict/direct regression suite.
 `tools/build.py --llvm-sweep /path/to/codegen.json` surveys every row of the
 configured exported function census, then compiles all supported bodies without
-executing them. See [the sweep contract](../../llvm_compare_native/README.md#corpus-sweep).
+executing them. See [the sweep contract](../../corpus/llvm/README.md#corpus-sweep).
 LLVM IR remains the optimization representation throughout:
 
 ```text

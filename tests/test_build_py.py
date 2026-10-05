@@ -13,13 +13,13 @@ spec.loader.exec_module(build_py)
 
 class BuildPyTests(unittest.TestCase):
     def test_llvm_sweep_requires_its_own_native_build_mode(self):
-        args, _ = build_py.parse_args(["--llvm-sweep", "profiles.json"], system="Darwin")
-        self.assertEqual(args.llvm_sweep, Path("profiles.json"))
-        for extra in (["--llvm-compare", "profiles.json"], ["--regenerate"],
+        args, _ = build_py.parse_args(["--corpus-llvm-sweep", "profiles.json"], system="Darwin")
+        self.assertEqual(args.corpus_llvm_sweep, Path("profiles.json"))
+        for extra in (["--corpus-llvm", "profiles.json"], ["--regenerate"],
                       ["--stub"], ["--target", "headless"], ["--config", "Debug"],
                       ["--x87-llvm-experiment"], ["--forget", "00400100"]):
             with self.subTest(extra=extra), self.assertRaises(SystemExit):
-                build_py.parse_args(["--llvm-sweep", "profiles.json", *extra], system="Darwin")
+                build_py.parse_args(["--corpus-llvm-sweep", "profiles.json", *extra], system="Darwin")
 
     def test_default_preset_follows_the_operating_system(self):
         self.assertEqual(build_py.default_preset("Darwin"), "macos")
@@ -234,9 +234,20 @@ if __name__ == "__main__":
 
 def test_llvm_compare_is_separate_from_game_build_modes():
     import pytest
-    for option in ('--regenerate', '--stub', '--x87-llvm-experiment', '--x87-locals-experiment'):
+    for option in ('--regenerate', '--stub', '--x87-llvm-experiment', '--corpus-fragments'):
         with pytest.raises(SystemExit):
-            build_py.parse_args(['--llvm-compare', 'manifest.json', option], system='Darwin')
-    args, _ = build_py.parse_args(['--llvm-compare', 'manifest.json'], system='Darwin')
-    assert args.llvm_compare == Path('manifest.json')
+            build_py.parse_args(['--corpus-llvm', 'manifest.json', option], system='Darwin')
+    args, _ = build_py.parse_args(['--corpus-llvm', 'manifest.json'], system='Darwin')
+    assert args.corpus_llvm == Path('manifest.json')
     assert not args.regenerate
+
+
+def test_function_corpus_is_isolated_and_does_not_regenerate_game():
+    import pytest
+    args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-calls', '0'], system='Darwin')
+    assert args.function_corpus == Path('manifest.json')
+    assert args.corpus_calls == 0
+    for extra in (['--regenerate'], ['--stub'], ['--corpus-fragments'],
+                  ['--corpus-llvm', 'llvm.json'], ['--cpu-locals-checks']):
+        with pytest.raises(SystemExit):
+            build_py.parse_args(['--function-corpus', 'manifest.json', *extra], system='Darwin')

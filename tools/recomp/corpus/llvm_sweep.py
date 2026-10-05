@@ -12,12 +12,12 @@ import subprocess
 import sys
 from translate import TranslateError
 
-from llvm_compare import CONTRACT, read_manifest, validate_calls, validate_listing
+from corpus.llvm_emit import CONTRACT, read_manifest, validate_calls, validate_listing
 from experiments.x87_llvm.direct import direct_ir
 from experiments.x87_llvm.function import DECLARATIONS as FUNCTION_DECLS, emit_function
 from experiments.x87_llvm.run import DECLARATIONS, llvm_config
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent.parent
 
 
 def census(T):
@@ -117,7 +117,7 @@ def emit_sweep(T, image, args):
               'census_sha256': hashlib.sha256(Path(T.FUNCS_TSV).read_bytes()).hexdigest(),
               'manifest_sha256': hashlib.sha256(Path(args.llvm_sweep).read_bytes()).hexdigest(),
               'source_sha256': {str(p.relative_to(HERE)): hashlib.sha256(p.read_bytes()).hexdigest()
-                                for p in (HERE / 'llvm_sweep.py', HERE / 'llvm_compare.py',
+                                for p in (HERE / 'corpus/llvm_sweep.py', HERE / 'corpus/llvm_emit.py',
                                           HERE / 'translate.py',
                                           HERE / 'experiments/x87_llvm/function.py',
                                           HERE / 'experiments/x87_llvm/stack_pass.cpp')},
@@ -194,7 +194,7 @@ def object_sizes(symbols, disassembly):
 
 def codegen_candidates(out, database, cmake, jobs, bindir, cmakedir):
     """Compile eligible C/raw/lifted bodies with production settings; never execute."""
-    from llvm_compare_build import production_settings
+    from corpus.llvm_build import production_settings
     import translate as T
     report = json.loads((out / 'coverage.json').read_text())
     supported = {r['address']: r for r in report['functions'] if r['status'] == 'supported'}
@@ -225,7 +225,7 @@ def codegen_candidates(out, database, cmake, jobs, bindir, cmakedir):
                          'span_kind': 'relocatable objects; includes alignment; excludes other symbols'}
     write_report(out, report)
     (out / 'settings.cmake').write_text('set(LEAVES ' + ' '.join(settings) + ')\n')
-    subprocess.run([cmake, '-S', str(HERE / 'llvm_compare_native'), '-B', str(out),
+    subprocess.run([cmake, '-S', str(HERE / 'corpus/llvm'), '-B', str(out),
                     f'-DLLVM_DIR={cmakedir}', f'-DCMAKE_C_COMPILER={bindir / "clang"}',
                     f'-DCMAKE_CXX_COMPILER={bindir / "clang++"}', f'-DPython3_EXECUTABLE={sys.executable}',
                     '-DBUILD_REPLAY=OFF'], check=True)
@@ -260,7 +260,7 @@ def run_sweep(manifest, game, out, cmake, jobs, database):
     plugin_dir = out / 'plugin'
     plugin_dir.mkdir(exist_ok=True)
     (plugin_dir / 'settings.cmake').write_text('set(LEAVES)\n')
-    subprocess.run([cmake, '-S', str(HERE / 'llvm_compare_native'), '-B', str(plugin_dir),
+    subprocess.run([cmake, '-S', str(HERE / 'corpus/llvm'), '-B', str(plugin_dir),
                     f'-DLLVM_DIR={cmakedir}', f'-DCMAKE_C_COMPILER={bindir / "clang"}',
                     f'-DCMAKE_CXX_COMPILER={bindir / "clang++"}'], check=True)
     subprocess.run([cmake, '--build', str(plugin_dir), '--target', 'RecompX87',

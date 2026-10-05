@@ -42,7 +42,7 @@ set_source_files_properties("${OUT}/llvm.o" PROPERTIES EXTERNAL_OBJECT TRUE GENE
 # directly between two executables lets Make run the optimizer twice in parallel.
 add_library(x87_ir STATIC "${OUT}/llvm.o")
 set_target_properties(x87_ir PROPERTIES LINKER_LANGUAGE C)
-add_executable(x87_llvm boundaries.c access.c "${OUT}/baseline.c" ../x87_locals/harness.c)
+add_executable(x87_llvm boundaries.c access.c "${OUT}/baseline.c" ../../corpus/fragments/harness.c)
 target_link_libraries(x87_llvm PRIVATE x87_ir)
 target_include_directories(x87_llvm PRIVATE "${KIT_RUNTIME}" "${OUT}" "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(x87_llvm PRIVATE RK_MEMORY_TEST=1)
@@ -52,7 +52,7 @@ if(NOT WIN32)
 endif()
 
 if(FUNCTION_TEST)
-  add_executable(x87_function "${OUT}/function/baseline.c" ../x87_locals/harness.c
+  add_executable(x87_function "${OUT}/function/baseline.c" ../../corpus/fragments/harness.c
                  boundaries.c access.c)
   target_link_libraries(x87_function PRIVATE x87_ir)
   target_include_directories(x87_function PRIVATE "${KIT_RUNTIME}" "${OUT}/function" "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -66,7 +66,7 @@ endif()
 # Headline code-generation comparison: production C emitter vs direct LLVM,
 # with equal normal-exit contracts and no artificial FNSTSW/access observers.
 function(add_direct_probe target directory)
-  add_executable(${target} "${directory}/baseline.c" ../x87_locals/harness.c boundaries.c access.c)
+  add_executable(${target} "${directory}/baseline.c" ../../corpus/fragments/harness.c boundaries.c access.c)
   target_link_libraries(${target} PRIVATE x87_ir)
   target_include_directories(${target} PRIVATE "${KIT_RUNTIME}" "${directory}" "${CMAKE_CURRENT_SOURCE_DIR}")
   target_compile_definitions(${target} PRIVATE RK_DIRECT_TEST=1)

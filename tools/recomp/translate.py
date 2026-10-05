@@ -4557,11 +4557,11 @@ def main():
                       "size": 0}  # the image's extent, filled in once it is read
     image = Image(BINARY)
     if args.llvm_sweep:
-        from llvm_sweep import emit_sweep
+        from corpus.llvm_sweep import emit_sweep
         emit_sweep(sys.modules[__name__], image, args)
         return
     if args.llvm_compare:
-        from llvm_compare import emit_comparison
+        from corpus.llvm_emit import emit_comparison
         emit_comparison(sys.modules[__name__], image, args)
         return
     discovered = []

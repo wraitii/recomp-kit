@@ -217,6 +217,14 @@
   double arithmetic, every predecessor must prove a narrow value, and unknown
   direction or oversized CFGs retain conservative lowering. Default off:
   additional precision selectors can increase native code and spills.
+||||||| parent of 3edaa15 (Consolidate codegen experiments into native-reference corpus tools)
+- Consolidate x87 fragment and C/LLVM comparison tools under
+  `tools/recomp/corpus/`, retaining their regressions and optional LLVM coverage.
+  Add `--function-corpus` for byte-verified game functions with typed native C
+  references, full-state/observable-result checks, code sizes, rotating-order
+  microbenchmarks and JSON/CSV/Markdown reports. Replace the old experimental
+  build flags with `--corpus-fragments`, `--corpus-llvm` and
+  `--corpus-llvm-sweep`; native references remain game-owned and out of gameplay.
 
 - Add opt-in `[translate] cpu_locals = true`: keep reused GPRs and arithmetic
   flags in C locals across function control flow and x87 regions, publishing
@@ -328,7 +336,7 @@
 - Add `tools/build.py --x87-locals-experiment`, an isolated local-value lifting
   probe comparing generated x87 fragments with the existing emitter. It records
   final-state comparisons, timings and optimized assembly without changing game
-  translation. See `tools/recomp/experiments/x87_locals/README.md` for its limits.
+  translation. See `tools/recomp/corpus/fragments/README.md` for its limits.
 
 - Add an optional scene post-process to the D3D8/wgpu renderer. A game's native
   override calls `d3d8_scene_boundary(c, mode)` (`runtime/native_seam.h`) at the

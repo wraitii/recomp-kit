@@ -90,6 +90,15 @@ also checks CPU state at an injected access failure. These are synthetic mapped
 tests against the current runtime, not original-x86, real hooks, real guest SEH
 or gameplay evidence. No benchmarks or profile captures run in this mode.
 
+Real game-function corpora run through `tools/build.py --function-corpus MANIFEST`.
+Use `--corpus-calls 0` for correctness and code sizes without timing. They compare
+four translated C modes in full CPU/scratch state, then compare a reviewed typed
+native reference using explicit game-owned observations. Timing reports separate
+guest-state adapters from direct typed native kernels. See
+[the corpus tools](../tools/recomp/corpus/README.md) for provenance, measurement
+contracts and the consolidated fragment/LLVM modes. Game assembly and outputs
+remain private; these checks do not establish original-x86 equivalence.
+
 The differential harness compares translated routines with original instructions
 under Unicorn. Unicorn is a development tool, not part of the playable app.
 

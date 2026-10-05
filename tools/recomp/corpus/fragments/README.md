@@ -3,12 +3,12 @@
 Run through the build wrapper (a game repository's wrapper works too):
 
 ```sh
-python tools/build.py --x87-locals-experiment
+python tools/build.py --corpus-fragments
 ```
 
 No game files are needed. Uses the host CMake compiler at `-O2
 -ffp-contract=off`, without LTO or fast-math. Outputs are in the selected game's
-`build/x87-locals-experiment/` (the kit's build root for its stub game).
+`build/function-corpus-fragments/` (the kit's build root for its stub game).
 This is an opt-in research tool; the production translator does not import it.
 The experiment is currently intended for Clang/GCC host builds, not cross builds.
 
