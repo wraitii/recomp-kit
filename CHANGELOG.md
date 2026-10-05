@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- D3D8 device-owned implicit surfaces and standalone depth-stencil surfaces.
+  The implicit backbuffer/autodepth are now owned by the device and `Get*`
+  returns an extra AddRef, so a guest that saves and releases those handles —
+  as `RenderingContext::__init_direct3d` (`0x005492d0`) does before
+  `ensureLightingUpload` (`0x00547610`) re-binds them — no longer leaves
+  dangling pointers that abort `SetRenderTarget`. `CreateDepthStencilSurface`
+  is implemented and `SetRenderTarget` accepts any depth surface owned by the
+  device. Packed 16-bit render-target formats (R5G6B5/A1R5G5B5/A4R4G4B4) are
+  accepted end to end, and render-target readback re-encodes wgpu RGBA8 into
+  the level's D3D8 layout. Depth contents remain the shared autodepth
+  attachment (DIVERGENCE). A rejected `CreateTexture` now prints its device,
+  dimensions, levels, usage, format and pool to stderr.
+
 - D3D8 fixed-function progress: `SetTransform` accepts `D3DTS_TEXTURE0`..
   `TEXTURE7`, `D3DTSS_TEXTURETRANSFORMFLAGS = D3DTTFF_COUNT2` is applied by the
   stage shader, and `IDirect3DDevice8::ProcessVertices` processes the engine's

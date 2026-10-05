@@ -68,12 +68,16 @@ impl Device {
             }
         }
         if let Some(key) = key {
-            if !matches!(format, 21 | 22) || level != 0 {
+            if level != 0 {
                 return Err(RenderError::new(
                     "SetRenderTarget",
-                    "only level-0 A8R8G8B8/X8R8G8B8 color targets are implemented",
+                    "only level-0 color targets are implemented",
                 ));
             }
+            // Keep the accepted set equal to the CPU/GPU conversion table:
+            // 32-bit ARGB plus the packed 16-bit color formats. create_target,
+            // upload and readback all use the same table.
+            crate::d3d8::format::ColorFormat::from_d3dformat(format)?;
             if !self.targets.textures.contains_key(&key) {
                 let surface = self.gpu.create_target(width, height, format, 0)?;
                 self.upload_target(&surface, format, data)?;
@@ -298,10 +302,12 @@ impl Device {
                 RenderError::new("ReadTexture", "no GPU-rendered level for this identity")
             })?;
         let mut pixels = self.gpu.read_pixels(&rt.surface)?;
-        // COM staging uses the original little-endian ARGB guest byte layout.
-        for pixel in pixels.chunks_exact_mut(4) {
-            pixel.swap(0, 2);
-        }
+        // Re-encode wgpu's RGBA8 into this level's D3D8 format so a packed
+        // 16-bit render target reads back at its true bytes per texel.
+        let color = crate::d3d8::format::ColorFormat::from_d3dformat(rt.surface.d3d_format())?;
+        let mut out = Vec::new();
+        color.from_rgba8_into(&pixels, &mut out);
+        pixels = out;
         Ok(pixels)
     }
 }

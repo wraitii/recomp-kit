@@ -211,6 +211,60 @@ impl ColorFormat {
             Self::R5G6B5 | Self::A1R5G5B5 | Self::A4R4G4B4 => decode_16_into(data, self, out),
         }
     }
+
+    /// Inverse of [`ColorFormat::to_rgba8_into`]: pack tightly packed `R,G,B,A`
+    /// bytes back into this format's little-endian D3D8 layout. This is the
+    /// render-target readback path. `data` must hold whole RGBA texels and is
+    /// truncated to the largest whole-texel prefix. Channels are truncated to
+    /// the destination width; the matching decode expands by bit replication,
+    /// so the round trip is exact only for values that came from that decode.
+    pub fn from_rgba8_into(self, data: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        match self {
+            Self::A8R8G8B8 | Self::X8R8G8B8 => {
+                let opaque = self.is_opaque();
+                out.reserve(data.len());
+                for px in data.chunks_exact(4) {
+                    out.extend_from_slice(&[
+                        px[2],
+                        px[1],
+                        px[0],
+                        if opaque { 0xFF } else { px[3] },
+                    ]);
+                }
+            }
+            Self::R5G6B5 => {
+                out.reserve(data.len() / 2);
+                for px in data.chunks_exact(4) {
+                    let texel = (((px[0] as u16) >> 3) << 11)
+                        | (((px[1] as u16) >> 2) << 5)
+                        | ((px[2] as u16) >> 3);
+                    out.extend_from_slice(&texel.to_le_bytes());
+                }
+            }
+            Self::A1R5G5B5 => {
+                out.reserve(data.len() / 2);
+                for px in data.chunks_exact(4) {
+                    let alpha = if px[3] >= 0x80 { 1u16 } else { 0 };
+                    let texel = (alpha << 15)
+                        | (((px[0] as u16) >> 3) << 10)
+                        | (((px[1] as u16) >> 3) << 5)
+                        | ((px[2] as u16) >> 3);
+                    out.extend_from_slice(&texel.to_le_bytes());
+                }
+            }
+            Self::A4R4G4B4 => {
+                out.reserve(data.len() / 2);
+                for px in data.chunks_exact(4) {
+                    let texel = (((px[3] as u16) >> 4) << 12)
+                        | (((px[0] as u16) >> 4) << 8)
+                        | (((px[1] as u16) >> 4) << 4)
+                        | ((px[2] as u16) >> 4);
+                    out.extend_from_slice(&texel.to_le_bytes());
+                }
+            }
+        }
+    }
 }
 
 /// Swizzle D3D8 little-endian `A8R8G8B8`/`X8R8G8B8` texels (`B,G,R,A`) into
@@ -646,6 +700,54 @@ mod tests {
             ColorFormat::X8R8G8B8.to_rgba8(&[0x44, 0x33, 0x22, 0x11]),
             [0x22, 0x33, 0x44, 0xFF]
         );
+    }
+
+    #[test]
+    fn from_rgba8_into_round_trips_each_color_format() {
+        // Every decodable texel must re-encode to the byte it came from.
+        let cases: [(ColorFormat, Vec<u8>); 5] = [
+            (
+                ColorFormat::A8R8G8B8,
+                vec![0x11, 0x22, 0x33, 0x44, 0xFF, 0x00, 0x80, 0x7F],
+            ),
+            (
+                ColorFormat::X8R8G8B8,
+                // X8 has no alpha: its decode/re-encode normalizes to 0xFF.
+                vec![0x11, 0x22, 0x33, 0xFF, 0xFF, 0x00, 0x80, 0xFF],
+            ),
+            (
+                ColorFormat::R5G6B5,
+                vec![0x00, 0xF8, 0xE0, 0x07, 0x1F, 0x00],
+            ),
+            (
+                ColorFormat::A1R5G5B5,
+                vec![0x00, 0xFC, 0x1F, 0x00, 0x1F, 0x80],
+            ),
+            (
+                ColorFormat::A4R4G4B4,
+                vec![0x0F, 0x00, 0xF0, 0xFF, 0x12, 0x34],
+            ),
+        ];
+        for (color, texels) in cases {
+            let rgba = color.to_rgba8(texels.as_slice());
+            let mut back = Vec::new();
+            color.from_rgba8_into(&rgba, &mut back);
+            assert_eq!(back, texels, "round trip for {color:?}");
+        }
+    }
+
+    #[test]
+    fn from_rgba8_into_truncates_channels_and_forces_opaque() {
+        let mut out = Vec::new();
+        ColorFormat::X8R8G8B8.from_rgba8_into(&[1, 2, 3, 4], &mut out);
+        assert_eq!(out, [3, 2, 1, 0xFF]);
+        ColorFormat::A8R8G8B8.from_rgba8_into(&[1, 2, 3, 4], &mut out);
+        assert_eq!(out, [3, 2, 1, 4]);
+        // 5/6-bit truncation keeps the high bits; the full-white texel is exact.
+        ColorFormat::R5G6B5.from_rgba8_into(&[0xFF, 0xFF, 0xFF, 0xFF], &mut out);
+        assert_eq!(out, [0xFF, 0xFF]);
+        ColorFormat::A4R4G4B4.from_rgba8_into(&[0xFF, 0x00, 0xFF, 0x80], &mut out);
+        assert_eq!(out, [0x0F, 0x8F]); // A=8, R=F, G=0, B=F
     }
 
     #[test]

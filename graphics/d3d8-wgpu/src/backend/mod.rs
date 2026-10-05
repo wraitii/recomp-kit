@@ -305,8 +305,9 @@ impl GpuContext {
 
     /// Allocate an offscreen render target for a raw `D3DFORMAT`.
     ///
-    /// Only `A8R8G8B8` and `X8R8G8B8` are accepted; every other value is a named
-    /// error. The returned target is always a linear `Rgba8Unorm` texture.
+    /// The five color formats `ColorFormat` decodes are accepted; every other
+    /// value is a named error. The returned target is always a linear
+    /// `Rgba8Unorm` texture and readback re-encodes into the source layout.
     pub fn create_target(
         &self,
         width: u32,

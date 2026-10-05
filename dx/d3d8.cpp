@@ -523,28 +523,58 @@ void device_unbind_targets(ComObj *dev) {
         com_release_internal(o);
 }
 
-// The device's implicit autodepth surface, made on demand and kept via the
-// device's weak cache. The actual depth bytes live in the Rust target; this
-// guest object is the handle GetDepthStencilSurface returns and SetRenderTarget
-// accepts. The surface retains the device, not the reverse.
+// A device-owned implicit surface. Real D3D8 keeps the implicit swap-chain
+// color and depth surfaces alive until the device is reset or released, so the
+// device holds one internal reference and the guest's Get* result is an
+// additional AddRef. That reference is what surface_refs_changed turns into
+// device retention; internal ownership does not retain the device, so there is
+// no device <-> surface cycle.
+ComObj *device_implicit_surface(ComObj *dev, uint32_t w, uint32_t h, uint32_t format, bool depth) {
+    ComObj *surface = com_new(K_D3D8SURFACE);
+    if (!surface)
+        return nullptr;
+    surface->d3d8_owner = dev->id;
+    surface->width = w;
+    surface->height = h;
+    surface->rmask = format;
+    surface->d3d8_depth = depth;
+    surface->d3d8_usage = depth ? D8USAGE_DEPTHSTENCIL : D8USAGE_RENDERTARGET;
+    com_internalize(surface); // the device's ownership reference
+    return surface;
+}
+
+// The implicit color surface, made on demand and kept via the device's weak
+// cache. Returns a new guest reference.
+ComObj *device_backbuffer(ComObj *dev) {
+    ComObj *surface = com_get(dev->d3d8_backbuffer);
+    if (surface) {
+        com_addref(surface);
+        return surface;
+    }
+    surface =
+        device_implicit_surface(dev, dev->d3d8_width, dev->d3d8_height, dev->d3d8_format, false);
+    if (!surface)
+        return nullptr;
+    dev->d3d8_backbuffer = surface->id;
+    com_addref(surface); // the guest's returned reference
+    return surface;
+}
+
+// The implicit autodepth surface, made on demand. The actual depth bytes live
+// in the Rust target; this guest object is the handle GetDepthStencilSurface
+// returns and SetRenderTarget accepts. Returns a new guest reference.
 ComObj *device_depthbuffer(ComObj *dev) {
     ComObj *surface = com_get(dev->d3d8_depthbuffer);
     if (surface) {
         com_addref(surface);
         return surface;
     }
-    surface = com_new(K_D3D8SURFACE);
+    surface = device_implicit_surface(dev, dev->d3d8_width, dev->d3d8_height,
+                                      dev->d3d8_depth_format, true);
     if (!surface)
         return nullptr;
-    surface->d3d8_owner = dev->id;
-    surface->d3d8_owner_retained = true;
-    com_addref(dev);
-    surface->d3d8_depth = true;
-    surface->d3d8_usage = D8USAGE_DEPTHSTENCIL;
-    surface->rmask = dev->d3d8_depth_format;
-    surface->width = dev->d3d8_width;
-    surface->height = dev->d3d8_height;
     dev->d3d8_depthbuffer = surface->id;
+    com_addref(surface);
     return surface;
 }
 
@@ -637,13 +667,20 @@ void D8_CreateDevice(X86 *c) {
 // IDirect3DDevice8
 // ---------------------------------------------------------------------------
 
-// Drop the device's weak references to the implicit backbuffer and autodepth
-// surfaces so Reset can lazily build replacements. Any guest reference keeps
-// the old object alive; com_release only destroys it when that was the last.
+// Drop the device's references to the implicit backbuffer and autodepth
+// surfaces so Reset or destruction can retire them. Any guest reference keeps
+// the old object alive; the weak cache is cleared so a future Get* builds a
+// fresh surface against the new target.
 void device_discard_implicit_surfaces(ComObj *dev) {
     device_unbind_targets(dev);
+    ComObj *backbuffer = com_get(dev->d3d8_backbuffer);
+    ComObj *depthbuffer = com_get(dev->d3d8_depthbuffer);
     dev->d3d8_backbuffer = 0;
     dev->d3d8_depthbuffer = 0;
+    if (backbuffer)
+        com_release_internal(backbuffer);
+    if (depthbuffer)
+        com_release_internal(depthbuffer);
     dev->d3d8_depth_detached = false;
 }
 
@@ -1103,17 +1140,10 @@ void Dev_GetBackBuffer(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    ComObj *surface = com_get(dev->d3d8_backbuffer);
-    if (surface) {
-        com_addref(surface);
-    } else {
-        surface = com_new(K_D3D8SURFACE);
-        surface->d3d8_owner = dev->id;
-        surface->d3d8_owner_retained = true;
-        // Only external surface references retain the device. A weak cache
-        // avoids a device <-> implicit surface reference cycle.
-        com_addref(dev);
-        dev->d3d8_backbuffer = surface->id;
+    ComObj *surface = device_backbuffer(dev);
+    if (!surface) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
     }
     uint32_t view = com_view(surface, IF_D3D8SURFACE8);
     if (!view) {
@@ -1134,29 +1164,27 @@ void Dev_GetRenderTarget(X86 *c) {
         return;
     }
     wr32(out, 0);
-    ComObj *surface = com_get(dev->d3d8_target ? dev->d3d8_target : dev->d3d8_backbuffer);
-    bool fresh = false;
-    if (!surface && !dev->d3d8_target) {
-        surface = com_new(K_D3D8SURFACE);
-        surface->d3d8_owner = dev->id;
-        surface->d3d8_owner_retained = true;
-        com_addref(dev);
-        dev->d3d8_backbuffer = surface->id;
-        fresh = true;
+    // A bound color surface keeps its internal binding reference; the guest's
+    // returned handle is one more. With no explicit target the implicit
+    // backbuffer supplies the reference.
+    ComObj *surface;
+    if (dev->d3d8_target) {
+        surface = com_get(dev->d3d8_target);
+        if (surface)
+            com_addref(surface);
+    } else {
+        surface = device_backbuffer(dev);
     }
-    if (!surface || !out || !gm_valid(out, 4)) {
-        com_ret(c, D8_ERR_INVALIDCALL);
+    if (!surface) {
+        com_ret(c, E_OUTOFMEMORY);
         return;
     }
     uint32_t view = com_view(surface, IF_D3D8SURFACE8);
     if (!view) {
-        if (fresh)
-            com_release(surface);
+        com_release(surface);
         com_ret(c, E_OUTOFMEMORY);
         return;
     }
-    if (!fresh)
-        com_addref(surface);
     wr32(out, view);
     com_ret(c, D8_OK);
 }
@@ -1250,8 +1278,7 @@ void Dev_SetRenderTarget(X86 *c) {
     ComObj *rt = rt_arg ? com_this(rt_arg, IF_D3D8SURFACE8) : nullptr;
     ComObj *ds = ds_arg ? com_this(ds_arg, IF_D3D8SURFACE8) : nullptr;
     bool rejected = !dev || (rt_arg && (!rt || rt->d3d8_depth || rt->d3d8_owner != dev->id)) ||
-                    (ds_arg && (!ds || !ds->d3d8_depth || ds->d3d8_owner != dev->id ||
-                                ds->id != dev->d3d8_depthbuffer));
+                    (ds_arg && (!ds || !ds->d3d8_depth || ds->d3d8_owner != dev->id));
     if (dev && rt && rt->id != dev->d3d8_backbuffer &&
         (!(rt->d3d8_usage & D8USAGE_RENDERTARGET) || rt->d3d8_pool != D8POOL_DEFAULT ||
          rt->d3d8_level != 0 || !rt->pixels_bytes || rt->lock_count))
@@ -1273,6 +1300,10 @@ void Dev_SetRenderTarget(X86 *c) {
         return;
     }
 #ifdef RECOMP_D3D8_WGPU
+    // DIVERGENCE(original): `ds` is validated for owner, size and format, but
+    // the renderer attaches the device's shared implicit autodepth rather than
+    // the standalone surface's own storage, so depth contents are shared
+    // between render targets.
     D3d8Error err{};
     int32_t status = d3d8_device_set_render_target(
         host_device(dev), texture ? rt->id : 0, texture ? rt->d3d8_level : 0,
@@ -1300,6 +1331,18 @@ void Dev_SetRenderTarget(X86 *c) {
     com_ret(c, D8_OK);
 }
 
+// CreateTexture has several D3DERR_INVALIDCALL paths and the guest rarely
+// inspects which one fired. Print the whole descriptor on stderr so a run can
+// attribute the rejection without guessing from the HRESULT.
+void diagnose_create_texture(const char *reason, ComObj *dev, uint32_t w, uint32_t h,
+                             uint32_t levels, uint32_t usage, uint32_t format, uint32_t pool) {
+    fprintf(stderr,
+            "d3d8: CreateTexture failed: %s (device=%u %ux%u levels=%u usage=0x%x format=0x%x "
+            "pool=%u)\n",
+            reason, dev ? dev->id : 0, w, h, levels, usage, format, pool);
+    fflush(stderr);
+}
+
 // (this, Width, Height, Levels, Usage, Format, Pool, ppTexture). Every level
 // is a real, separately sized CPU surface. D3DUSAGE_RENDERTARGET is accepted and
 // kept CPU-backed (see the DIVERGENCE below); D3DUSAGE_DEPTHSTENCIL still stops
@@ -1316,18 +1359,21 @@ void Dev_CreateTexture(X86 *c) {
     uint32_t bpp = d8_format_bytes(format);
     uint32_t block = d8_block_bytes(format);
     if (!dev || !w || !h || w > 16384 || h > 16384) {
+        diagnose_create_texture("invalid device or dimensions", dev, w, h, levels, usage, format,
+                                pool);
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
     if (!bpp && !block) {
-        LOGW("d3d8: CreateTexture format 0x%x is not representable", format);
+        diagnose_create_texture("format is not representable", dev, w, h, levels, usage, format,
+                                pool);
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
     if (usage & D8USAGE_DEPTHSTENCIL) {
-        LOGW("d3d8: CreateTexture usage 0x%x needs device depth-stencil storage, which is not "
-             "implemented",
-             usage);
+        diagnose_create_texture(
+            "D3DUSAGE_DEPTHSTENCIL textures are not implemented; use CreateDepthStencilSurface",
+            dev, w, h, levels, usage, format, pool);
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
@@ -1335,6 +1381,8 @@ void Dev_CreateTexture(X86 *c) {
     D3d8LevelLayout first{};
     D3d8Error layout_err{};
     if (d3d8_texture_level_layout(w, h, levels, 0, format, &first, &layout_err) != D3D8_STATUS_OK) {
+        diagnose_create_texture(reinterpret_cast<const char *>(layout_err.message), dev, w, h,
+                                levels, usage, format, pool);
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
@@ -1373,6 +1421,8 @@ void Dev_CreateTexture(X86 *c) {
         D3d8LevelLayout layout{};
         if (d3d8_texture_level_layout(w, h, levels, l, format, &layout, &layout_err) !=
             D3D8_STATUS_OK) {
+            diagnose_create_texture(reinterpret_cast<const char *>(layout_err.message), dev, w, h,
+                                    levels, usage, format, pool);
             com_release(tex);
             com_ret(c, D8_ERR_INVALIDCALL);
             return;
@@ -1386,6 +1436,10 @@ void Dev_CreateTexture(X86 *c) {
             if (level)
                 com_release(level);
             com_release(tex);
+            fprintf(stderr,
+                    "d3d8: CreateTexture failed: CPU storage (device=%u level=%u bytes=%llu)\n",
+                    dev->id, l, (unsigned long long)bytes);
+            fflush(stderr);
             com_ret(c, E_OUTOFMEMORY);
             return;
         }
@@ -1420,6 +1474,57 @@ void Dev_CreateTexture(X86 *c) {
     }
     LOGV("d3d8: CreateTexture %ux%u levels=%u fmt=0x%x pool=%u -> %08x into %08x", w, h, levels,
          format, pool, view, out);
+    wr32(out, view);
+    com_ret(c, D8_OK);
+}
+
+// (this, Width, Height, Format, MultiSampleType, ppSurface). A standalone
+// depth-stencil surface the guest can bind with SetRenderTarget. D3D8 accepts
+// D16, D24X8, D24S8 and D32. The object stores the descriptor and is retired
+// with the device; the depth bytes stay in the Rust target.
+//
+// DIVERGENCE(original): the renderer's depth attachment is the device's shared
+// implicit autodepth, not this surface's own storage (see Dev_SetRenderTarget),
+// so depth contents are shared across render targets rather than independent.
+void Dev_CreateDepthStencilSurface(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t w = arg(c, 1), h = arg(c, 2), format = arg(c, 3), ms = arg(c, 4), out = arg(c, 5);
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, 0);
+    if (!dev || !w || !h || w > 16384 || h > 16384 || ms != 0 || !d8_depth_format(format)) {
+        fprintf(stderr,
+                "d3d8: CreateDepthStencilSurface rejected (device=%u %ux%u format=0x%x ms=%u)\n",
+                dev ? dev->id : 0, w, h, format, ms);
+        fflush(stderr);
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    ComObj *surface = com_new(K_D3D8SURFACE);
+    if (!surface) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    // A returned resource holds its own reference and retains the device, the
+    // same lifetime rule as a texture level.
+    surface->d3d8_owner = dev->id;
+    com_addref(dev);
+    surface->d3d8_owner_retained = true;
+    surface->d3d8_depth = true;
+    surface->d3d8_usage = D8USAGE_DEPTHSTENCIL;
+    surface->rmask = format;
+    surface->width = w;
+    surface->height = h;
+    uint32_t view = com_view(surface, IF_D3D8SURFACE8);
+    if (!view) {
+        com_release(surface);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    LOGV("d3d8: CreateDepthStencilSurface %ux%u fmt=0x%x -> %08x into %08x", w, h, format, view,
+         out);
     wr32(out, view);
     com_ret(c, D8_OK);
 }
@@ -2424,7 +2529,7 @@ static const ImportShim g_d3d8_exports[] = {
 };
 
 void device_destroy(ComObj *o) {
-    device_unbind_targets(o);
+    device_discard_implicit_surfaces(o);
 #ifdef RECOMP_D3D8_WGPU
     if (o->d3d8_device) {
         d3d8_device_destroy(static_cast<D3d8Device *>(o->d3d8_device));

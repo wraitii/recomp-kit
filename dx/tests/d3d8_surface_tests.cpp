@@ -89,7 +89,8 @@ static void test_backbuffer(uint32_t format) {
     check(dev->refs == 2, "external surface retains device");
     check(call_method(device, 16, {0, 0, sc(4)}) == 0 && rd32(sc(4)) == surface,
           "repeated GetBackBuffer preserves identity and adds a reference");
-    check(obj->refs == 2, "two GetBackBuffer calls hold two surface references");
+    check(obj->refs == 3,
+          "two GetBackBuffer calls hold two guest references plus device ownership");
 
     // Every slot carries the real D3D8 arity, including unsupported methods.
     const uint8_t arities[] = {3, 1, 1, 2, 5, 4, 2, 3, 2, 4, 1};
@@ -115,7 +116,7 @@ static void test_backbuffer(uint32_t format) {
     for (uint32_t iid : {sc(128), sc(144)}) {
         check(call_method(surface, 0, {iid, sc(8)}) == 0 && rd32(sc(8)) == surface,
               "QueryInterface retains canonical surface identity");
-        check(call_method(surface, 2) == 2, "release QueryInterface reference");
+        check(call_method(surface, 2) == 3, "release QueryInterface reference");
     }
     check(call_method(surface, 3, {sc(12)}) == 0 && rd32(sc(12)) == device,
           "GetDevice returns owning device");
@@ -131,15 +132,16 @@ static void test_backbuffer(uint32_t format) {
     check(call_method(device, 16, {0, 0, 0}) == 0x8876086c, "reject null backbuffer output");
     check(call_method(device, 16, {0, 0, GUEST_SIZE - 2}) == 0x8876086c,
           "reject truncated backbuffer output");
-    check(obj->refs == 2 && dev->refs == 2, "invalid calls leak no references");
+    check(obj->refs == 3 && dev->refs == 2, "invalid calls leak no references");
 
     uint32_t surface_id = obj->id;
-    check(call_method(surface, 2) == 1, "release first surface reference");
-    check(call_method(surface, 2) == 0, "release final surface reference");
-    check(!com_get(surface_id) && dev->refs == 1 && !dev->d3d8_backbuffer,
-          "surface destruction clears weak cache and releases device");
-    check(call_method(device, 16, {0, 0, sc(0)}) == 0,
-          "backbuffer remains available after external references are released");
+    check(call_method(surface, 2) == 2, "release first surface reference");
+    check(call_method(surface, 2) == 1 && com_get(surface_id) == obj,
+          "device ownership keeps the surface alive after guest references are released");
+    check(!obj->d3d8_owner_retained && dev->refs == 1 && dev->d3d8_backbuffer == surface_id,
+          "internal-only surface does not retain the device and stays weakly cached");
+    check(call_method(device, 16, {0, 0, sc(0)}) == 0 && rd32(sc(0)) == surface,
+          "backbuffer remains available and is the device-owned surface");
     surface = rd32(sc(0));
     check(call_method(device, 2) == 1, "surface keeps device alive after caller releases it");
     check(call_method(surface, 8, {sc(68)}) == 0, "retained surface descriptor remains valid");
@@ -414,10 +416,12 @@ static void test_depth() {
     uint32_t depth = rd32(sc(0));
     check(depth != 0, "GetDepthStencilSurface writes a real interface");
     ComObj *d = depth ? com_this(depth, IF_D3D8SURFACE8) : nullptr;
+    uint32_t depth_id = d ? d->id : 0;
     check(d && d->d3d8_depth, "depth surface is marked as depth");
     check(call_method(device, 33, {sc(4)}) == 0 && rd32(sc(4)) == depth,
           "repeated GetDepthStencilSurface preserves identity");
-    check(d && d->refs == 2, "two GetDepthStencilSurface calls hold two references");
+    check(d && d->refs == 3,
+          "two GetDepthStencilSurface calls hold two guest references plus device ownership");
     call_method(depth, 2);
 
     // Descriptor: depth usage, D16 format, 2 bytes per texel.
@@ -436,10 +440,100 @@ static void test_depth() {
     check(call_method(device, 33, {sc(12)}) == 0x88760866 && rd32(sc(12)) == 0,
           "NULL depth detaches; GetDepthStencilSurface returns NOTFOUND");
     call_method(backbuffer, 2);
-    check(call_method(depth, 2) == 0, "last depth reference releases the depth surface");
-    check(!dev->d3d8_depthbuffer, "depth surface destruction clears the weak cache");
+    check(call_method(depth, 2) == 1 && com_get(depth_id) == d,
+          "device ownership keeps the depth surface alive after guest references are released");
+    check(!d->d3d8_owner_retained && dev->refs == 1,
+          "internal-only depth surface does not retain the device");
     call_method(device, 2);
-    check(dev->refs == 0, "device is released after the depth handle");
+    check(dev->refs == 0 && !com_get(depth_id),
+          "device release destroys the device-owned depth surface");
+}
+
+// CreateDepthStencilSurface creates a standalone depth handle the guest can
+// bind. It is a real D3D8 resource with its own lifetime; the renderer still
+// uses the shared autodepth attachment (DIVERGENCE in dx/d3d8.cpp).
+static void test_create_depth_stencil_surface() {
+    cpu_reset();
+    ComObj *dev = make_test_device(64, 48, 22);
+    uint32_t device = com_view(dev, IF_D3D8DEVICE);
+
+    // (this, Width, Height, Format, MultiSampleType, ppSurface). Slot 26.
+    wr32(sc(0), 0xfeedface);
+    check(call_method(device, 26, {32, 16, 77, 0, sc(0)}) == 0,
+          "CreateDepthStencilSurface succeeds");
+    uint32_t surface = rd32(sc(0));
+    check(surface != 0, "CreateDepthStencilSurface writes a real interface");
+    ComObj *depth = surface ? com_this(surface, IF_D3D8SURFACE8) : nullptr;
+    uint32_t depth_id = depth ? depth->id : 0;
+    check(depth && depth->d3d8_depth && depth->rmask == 77 && depth->width == 32 &&
+              depth->height == 16,
+          "standalone depth surface records its descriptor");
+    check(depth && depth->d3d8_owner == dev->id && depth->d3d8_owner_retained && dev->refs == 2,
+          "standalone depth surface retains its device");
+
+    // Descriptor: D24X8, depth usage, 4 bytes per texel.
+    check(call_method(surface, 8, {sc(64)}) == 0 && rd32(sc(64)) == 77 && rd32(sc(72)) == 2 &&
+              rd32(sc(80)) == 32 * 16 * 4 && rd32(sc(88)) == 32 && rd32(sc(92)) == 16,
+          "standalone depth descriptor");
+
+    // It can bind as the depth argument of a render-target texture.
+    check(call_method(device, 20, {32, 16, 1, 1, 22, 0, sc(8)}) == 0, "create RT texture");
+    uint32_t texture = rd32(sc(8));
+    check(call_method(texture, 15, {0, sc(12)}) == 0, "get RT level surface");
+    uint32_t color = rd32(sc(12));
+    check(call_method(device, 31, {color, surface}) == 0,
+          "SetRenderTarget accepts a standalone depth surface");
+    check(dev->d3d8_target_depth == depth_id, "binding records the standalone depth identity");
+    call_method(color, 2);
+    call_method(texture, 2);
+    check(call_method(device, 31, {0, 0}) == 0, "detach the standalone depth");
+    check(call_method(surface, 2) == 0, "releasing the standalone depth destroys it");
+    check(!com_get(depth_id), "standalone depth is gone after its last reference");
+    call_method(device, 2);
+    check(dev->refs == 0, "device released after standalone depth");
+
+    // Rejected cases: bad format, zero size and multisample.
+    ComObj *dev2 = make_test_device(64, 48, 22);
+    uint32_t device2 = com_view(dev2, IF_D3D8DEVICE);
+    wr32(sc(0), 0xfeedface);
+    check(call_method(device2, 26, {32, 16, 21, 0, sc(0)}) == 0x8876086c && rd32(sc(0)) == 0,
+          "a color format is not a depth-stencil surface");
+    check(call_method(device2, 26, {0, 16, 77, 0, sc(0)}) == 0x8876086c,
+          "zero-width depth-stencil surface is rejected");
+    check(call_method(device2, 26, {32, 16, 77, 2, sc(0)}) == 0x8876086c,
+          "multisampled depth-stencil surface is rejected");
+    call_method(device2, 2);
+}
+
+// The game's own sequence: GetRenderTarget/GetDepthStencilSurface, release the
+// returned references, and later SetRenderTarget with the saved 32-bit
+// pointers. Real D3D8 keeps the implicit surfaces alive because the device owns
+// them; the bridge must not leave dangling handles.
+static void test_implicit_surface_lifetime() {
+    cpu_reset();
+    ComObj *dev = make_test_device(64, 48, 22);
+    dev->d3d8_depth_format = 77;
+    uint32_t device = com_view(dev, IF_D3D8DEVICE);
+
+    // __init_direct3d saves these two handles and releases its references.
+    check(call_method(device, 32, {sc(0)}) == 0, "save the implicit render target");
+    uint32_t saved_color = rd32(sc(0));
+    check(call_method(device, 33, {sc(4)}) == 0, "save the implicit depth surface");
+    uint32_t saved_depth = rd32(sc(4));
+    check(call_method(saved_color, 2) == 1, "release the saved color reference");
+    check(call_method(saved_depth, 2) == 1, "release the saved depth reference");
+
+    // ensureLightingUpload then restores the saved pointers.
+    check(call_method(device, 31, {saved_color, saved_depth}) == 0,
+          "SetRenderTarget accepts the saved device-owned handles");
+    check(dev->d3d8_target == com_this(saved_color, IF_D3D8SURFACE8)->id &&
+              dev->d3d8_target_depth == com_this(saved_depth, IF_D3D8SURFACE8)->id,
+          "restored handles resolve to the device-owned surfaces");
+    check(dev->d3d8_backbuffer != 0 && dev->d3d8_depthbuffer != 0,
+          "implicit surface caches were not cleared by the guest releases");
+    check(call_method(device, 31, {0, 0}) == 0, "detach for teardown");
+    call_method(device, 2);
+    check(dev->refs == 0, "device release retires the implicit surfaces");
 }
 
 // Bound surface storage survives releasing the texture and temporary surface
@@ -712,6 +806,8 @@ int main(int argc, char **argv) {
     test_bind_texture();
     test_caps();
     test_depth();
+    test_create_depth_stencil_surface();
+    test_implicit_surface_lifetime();
     test_render_target_switching();
     test_buffers();
     // Live locked CPU resources must be retired when mem_init discards guest
