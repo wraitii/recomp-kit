@@ -183,6 +183,9 @@ def load(game_dir):
     resumable = translate.setdefault("resumable_stacks", False)
     if not isinstance(resumable, bool):
         raise ValueError("%s: [translate] resumable_stacks must be a boolean" % source)
+    cfg_widths = translate.setdefault("x87_cfg_widths", False)
+    if not isinstance(cfg_widths, bool):
+        raise ValueError("%s: [translate] x87_cfg_widths must be a boolean" % source)
     locals_x87 = translate.setdefault("x87_locals", False)
     if not isinstance(locals_x87, bool):
         raise ValueError("%s: [translate] x87_locals must be a boolean" % source)

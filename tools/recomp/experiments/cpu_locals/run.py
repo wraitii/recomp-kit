@@ -41,6 +41,31 @@ CASES = {
                  "FSTP float ptr [EBX]", "ADC EAX,ECX", "RET"],
     "alternate": ["ADD EAX,ECX", "XOR ECX,EAX", "MOV EDX,EAX", "ADD EAX,EDX",
                   "TEST EAX,ECX", "MOV dword ptr [EBX],EAX", "RET"],
+    "width_diamond_loop": ["MOV ECX,3", "FLD float ptr [ESI]", "FMUL float ptr [EDI]",
+                           "FADD float ptr [EDI + 4]", "TEST EAX,1", "JZ 0x00100008",
+                           "FSUB float ptr [ESI]", "JMP 0x00100009", "FMUL float ptr [EDI]",
+                           "FMUL float ptr [ESI]", "DEC ECX", "JNZ 0x00100004",
+                           "FNSTSW AX", "FCOMP float ptr [EDI]", "RET"],
+    "width_mixed_join": ["FLD float ptr [ESI]", "FMUL float ptr [EDI]",
+                         "FADD float ptr [EDI + 4]", "TEST EAX,1", "JZ 0x00100007",
+                         "FSTP float ptr [EBX]", "FLD double ptr [ESI]",
+                         "FMUL float ptr [EDI]", "FSTP float ptr [EBX]", "RET"],
+    "width_incoming_loop": ["MOV ECX,3", "FMUL float ptr [EDI]", "FADD float ptr [EDI + 4]",
+                            "FSUB float ptr [ESI]", "DEC ECX", "JNZ 0x00100001",
+                            "FNSTSW AX", "FSTP float ptr [EBX]", "RET"],
+    "width_widening_backedge": ["MOV ECX,3", "FLD float ptr [ESI]", "FMUL float ptr [EDI]",
+                                "FADD float ptr [EDI + 4]", "FSUB float ptr [ESI]",
+                                "FSTP float ptr [EBX]", "FLD double ptr [ESI]",
+                                "DEC ECX", "JNZ 0x00100002", "FNSTSW AX",
+                                "FSTP float ptr [EBX]", "RET"],
+    "width_alias": ["FLD float ptr [ESI]", "FMUL float ptr [EDI]", "FADD float ptr [EDI + 4]",
+                    "TEST EAX,1", "JZ 0x00100006", "MOV dword ptr [ESI],EDX",
+                    "FMUL float ptr [ESI]", "FSTP float ptr [EBX]", "RET"],
+    "width_observer_call": ["FLD float ptr [ESI]", "FMUL float ptr [EDI]",
+                            "FADD float ptr [EDI + 4]", "TEST EAX,1", "JZ 0x00100006",
+                            "FMUL float ptr [ESI]", "FNSTSW AX", "CALL 0x00200000",
+                            "FMUL float ptr [EDI]", "FADD float ptr [EDI + 4]",
+                            "FSUB float ptr [ESI]", "FSTP float ptr [EBX]", "RET"],
 }
 
 
@@ -50,7 +75,7 @@ def emit(name, lines, mode):
     fn = T.Function(0x100000, name, len(insns), insns)
     cpu, x87 = MODES[mode]
     tr = T.Translator(None, {fn.addr, 0x200000}, SimpleNamespace(
-        eager_flags=True, cpu_locals=cpu, x87_locals=x87))
+        eager_flags=True, cpu_locals=cpu, x87_locals=x87, x87_cfg_widths=mode == 2))
     tr.prepare(fn)
     entries = (0x100001,) if name == "alternate" else ()
     code = "\n".join(tr.translate(fn, entries))

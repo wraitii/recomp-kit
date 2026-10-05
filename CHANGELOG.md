@@ -202,6 +202,14 @@
 ||||||| parent of 0e1dd6f (Keep x87 control and status local and specialize binary32 arithmetic)
 ||||||| parent of ffed73d (Keep local x87 register transfers in straight-line C regions)
 ||||||| parent of 3ad1d5c (Keep CPU values local across function control flow)
+||||||| parent of 6bd4c1e (Add experimental decoded x87 CFG width analysis)
+- Add experimental `[translate] x87_cfg_widths = true` alongside `x87_locals`.
+  Decode x87 width effects and propagate PC=00 binary32 proofs through region
+  joins and backedges by a bounded must-analysis. Incoming/wide values retain
+  double arithmetic, every predecessor must prove a narrow value, and unknown
+  direction or oversized CFGs retain conservative lowering. Default off:
+  additional precision selectors can increase native code and spills.
+
 - Add opt-in `[translate] cpu_locals = true`: keep reused GPRs and arithmetic
   flags in C locals across function control flow and x87 regions, publishing
   before calls/opaque helpers and reloading after mutation. ESP/EBP/EIP remain
