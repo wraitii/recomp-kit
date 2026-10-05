@@ -197,6 +197,11 @@
   so the declared size runs past the buffer even though the bytes written stay
   inside it. Rejecting those locks stalled the shared UI vertex buffer and left
   it reading zeroed vertices, which flickered the front end.
+||||||| parent of 80c8753 (Add shared scripted input to headless and desktop hosts)
+- Add `RECOMP_INPUT_SCRIPT` for timed keyboard and mouse input in headless and
+  desktop windowed hosts. Reuse the smoke parser and normal input paths without
+  requiring game-specific smoke globals; reject unsupported script operations
+  before boot and hold automatic clicks for at least four presented frames.
 
 - Support `[translate] code_map` address/length metadata. Builds verify the
   owner's executable and decode private assembly listings locally, allowing
