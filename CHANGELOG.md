@@ -7,6 +7,12 @@
   game repositories to build without Ghidra or distributed game instructions.
   Decoder boundary disagreements fail before publishing the listing cache.
 
+- Trackpad and fractional wheel input: the SDL host carries the remainder of
+  small scroll steps and delivers whole 120-unit notches instead of rounding
+  each event to zero. `GetSystemMetrics(SM_MOUSEWHEELPRESENT)` now reports a
+  wheel, since SDL cannot query one and guests pick default bindings from it.
+  `RECOMP_TRACE_WHEEL=1` logs each stage of a scroll.
+
 - Extend opt-in C x87 locals across ordered integer arena accesses and
   single-entry branch/loop regions with consistent TOP at joins. Full slot
   values, tags and exact-integer metadata are published on every region exit;

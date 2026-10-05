@@ -197,6 +197,8 @@ static void test_model() {
     uint32_t screen_h = call_import(&c, "USER32.dll", "GetSystemMetrics", {1});
     check(screen_w == 800 && screen_h == 600,
           "the smoke drawable selects the virtual screen before a DirectDraw mode");
+    check(call_import(&c, "USER32.dll", "GetSystemMetrics", {75}) == 1,
+          "SM_MOUSEWHEELPRESENT reports a wheel, which guests use to pick default bindings");
     gdi_present_windows(true);
     check(presented_w == 800 && presented_h == 600 && presented_w == int(screen_w) &&
               presented_h == int(screen_h),

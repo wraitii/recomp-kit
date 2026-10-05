@@ -1311,6 +1311,12 @@ void u_GetSystemMetrics(X86 *c) {
     case 43: // SM_CMOUSEBUTTONS
         v = 2;
         break;
+    case 75: // SM_MOUSEWHEELPRESENT
+        // SDL cannot say whether a mouse has a wheel, and nearly every mouse
+        // and trackpad scrolls, so always report one. Guests choose their
+        // default mouse bindings from this.
+        v = 1;
+        break;
     case 80: // SM_CMONITORS
         v = 1;
         break;

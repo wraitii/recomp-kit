@@ -388,6 +388,19 @@ static void trace_state(const char *what) {
     if (trace)
         fprintf(stderr, "[state %.3f] %s\n", double(os_monotonic_ns()) / 1e9, what);
 }
+// Wheel pipeline trace: TRACE_WHEEL=1 logs each stage a scroll passes through.
+static bool trace_wheel_on() {
+    static const bool on = recomp_env("TRACE_WHEEL") != nullptr;
+    return on;
+}
+#define TRACE_WHEEL(...)                                                                           \
+    do {                                                                                           \
+        if (trace_wheel_on()) {                                                                    \
+            fprintf(stderr, "[wheel %.3f] ", double(os_monotonic_ns()) / 1e9);                     \
+            fprintf(stderr, __VA_ARGS__);                                                          \
+            fputc('\n', stderr);                                                                   \
+        }                                                                                          \
+    } while (0)
 void apply_pointer_capture(bool want) {
     // No pointer to capture on a touch platform: fingers are placed absolutely.
     want = want && platform_ui_pointer_capture_supported();
@@ -709,8 +722,10 @@ void handle_button(const SDL_MouseButtonEvent &event, int button, bool down) {
 // and the two kinds of key state they need. What is left here is the SDL
 // event decoding.
 void apply_wheel(int32_t dz, int32_t x, int32_t y) {
-    if (host_gate_wheel(dz))
+    if (host_gate_wheel(dz)) {
+        TRACE_WHEEL("apply dz=%d consumed by gate", dz);
         return;
+    }
     int32_t dx, dy;
     HitResult hit;
     if (kRelativeMouseCapture && host_pointer_captured()) {
@@ -720,10 +735,13 @@ void apply_wheel(int32_t dz, int32_t x, int32_t y) {
     } else {
         hit = host_gate_window_pointer(x, y, &dx, &dy);
     }
-    if (hit.kind == HitResult::HIT_NONE)
+    if (hit.kind == HitResult::HIT_NONE) {
+        TRACE_WHEEL("apply dz=%d dropped: pointer (%d,%d) hit nothing", dz, x, y);
         return;
+    }
     x = hit.gx;
     y = hit.gy;
+    TRACE_WHEEL("apply dz=%d delivered at guest (%d,%d)", dz, x, y);
     host_input_motion(x, y, dx, dy);
     host_input_wheel(dz);
     post(WM_MOUSEWHEEL_, ((uint32_t)dz << 16) | mouse_wparam(), make_lparam(x, y));
@@ -1054,6 +1072,7 @@ bool handle_editor_event(const SDL_Event &event) {
         return true;
     }
     case SDL_EVENT_MOUSE_WHEEL:
+        TRACE_WHEEL("event swallowed by the controls editor");
         controls::host_editor_wheel(
             event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event.wheel.y : event.wheel.y);
         return true;
@@ -1140,12 +1159,28 @@ void handle_event(const SDL_Event &event) {
         }
         break;
     case SDL_EVENT_MOUSE_WHEEL:
+        TRACE_WHEEL("SDL wheel x=%.3f y=%.3f int_y=%d dir=%d window=%u ours=%u", event.wheel.x,
+                    event.wheel.y, (int)event.wheel.integer_y, (int)event.wheel.direction,
+                    (unsigned)event.wheel.windowID, (unsigned)ours);
         if (event.wheel.windowID == ours) {
             PendingInput e;
             e.kind = PendingInput::WHEEL;
             const double steps =
                 event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event.wheel.y : event.wheel.y;
-            e.dz = (int32_t)lround(steps * 120.0);
+            // A trackpad sends many fractional steps; rounding each one lost
+            // nearly all of them. Carry the remainder and deliver whole
+            // WHEEL_DELTA notches, as the game expects from a wheel. A reversal
+            // drops the leftover so a flick back responds at once.
+            static double wheel_remainder = 0.0;
+            if (steps != 0.0 && (steps < 0.0) != (wheel_remainder < 0.0))
+                wheel_remainder = 0.0;
+            wheel_remainder += steps;
+            const double notches = std::trunc(wheel_remainder);
+            wheel_remainder -= notches;
+            TRACE_WHEEL("steps=%.3f remainder=%.3f notches=%.0f", steps, wheel_remainder, notches);
+            if (notches == 0.0)
+                break;
+            e.dz = (int32_t)notches * 120;
             // WM_MOUSEWHEEL carries the position of the wheel event itself.
             view_point_to_drawable(event.wheel.mouse_x, event.wheel.mouse_y, &e.x, &e.y,
                                    &e.drawable_w, &e.drawable_h);

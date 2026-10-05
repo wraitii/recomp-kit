@@ -235,6 +235,10 @@ void poll_device(ComObj *d) {
 
     host_input_pointer_correction(&dx, &dy);
 
+    static const bool trace_wheel = recomp_env("TRACE_WHEEL") != nullptr;
+    if (trace_wheel && dz)
+        fprintf(stderr, "[wheel dinput] poll took dz=%d buffer_size=%u\n", dz, d->buffer_size);
+
     if (dx && d->buffer_size)
         d->events.push_back(pack_event(DIMOFS_X, dx));
     if (dy && d->buffer_size)
@@ -482,6 +486,10 @@ void Device_GetDeviceState(X86 *c) {
     gm_zero(out, size);
     // The deltas poll_device just consumed are this frame's motion.
     if (size >= 12) {
+        static const bool trace_wheel = recomp_env("TRACE_WHEEL") != nullptr;
+        if (trace_wheel && d->last_z)
+            fprintf(stderr, "[wheel dinput] GetDeviceState size=%u reports lZ=%d\n", size,
+                    d->last_z);
         wr32(out + DIMS_OFF_lX, (uint32_t)d->last_x);
         wr32(out + DIMS_OFF_lY, (uint32_t)d->last_y);
         wr32(out + DIMS_OFF_lZ, (uint32_t)d->last_z);
