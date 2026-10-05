@@ -428,7 +428,6 @@ void drop_block(std::map<uint32_t, Blk>::iterator it) {
     g_blocks->erase(it);
 }
 
-
 // Optional redzones (RECOMP_HEAP_CANARY=1, =2 aborts on the first hit). Every
 // block is over-allocated by at least 16 bytes and the bytes between the
 // requested size and the end of the block are filled with a pattern. A guest
@@ -476,8 +475,8 @@ bool canary_check(uint32_t addr, const Blk &b, const char *when) {
     for (uint32_t i = bad; i < n && i < bad + 24; ++i)
         len += snprintf(dump + len, sizeof dump - len, "%02x ", z[i]);
     auto live = g_live->find(addr);
-    LOGW("heap canary: block %08x req %u size %u damaged at +%u past the request (%s): %s",
-         addr, b.req, b.size, bad, when, dump);
+    LOGW("heap canary: block %08x req %u size %u damaged at +%u past the request (%s): %s", addr,
+         b.req, b.size, bad, when, dump);
     if (live != g_live->end())
         LOGW("heap canary:   allocated near guest eip %08x", live->second.site);
     if (const X86 *c = guest_current_context()) {
@@ -814,7 +813,8 @@ uint32_t heap_realloc(uint32_t addr, uint32_t new_size, bool zero) {
         if (tail >= 16) {
             it->second.size = need;
             auto next = std::next(it);
-            if (next != g_blocks->end() && g_free->count(next->first) && next->first == addr + have) {
+            if (next != g_blocks->end() && g_free->count(next->first) &&
+                next->first == addr + have) {
                 uint32_t merged = tail + next->second.size;
                 drop_block(next);
                 put_block(addr + need, merged, 0, false);

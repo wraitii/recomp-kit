@@ -7172,15 +7172,15 @@ static void test_enum_display_modes() {
     g_enum_count = 0;
     uint32_t hr = call_method(dd, DD_EnumDisplayModes, {0, 0, 0, cb});
     CHECK_EQ(hr, DD_OK);
-    CHECK_EQ(g_enum_count, 10);
+    CHECK_EQ(g_enum_count, 12);
     CHECK_EQ(g_enum_modes[0][0], 640);
     CHECK_EQ(g_enum_modes[0][1], 480);
     CHECK_EQ(g_enum_modes[0][2], 8);
     CHECK_EQ(g_enum_modes[5][0], 1024);
     CHECK_EQ(g_enum_modes[5][2], 16);
-    CHECK_EQ(g_enum_modes[9][0], 3840);
-    CHECK_EQ(g_enum_modes[9][1], 2160);
-    CHECK_EQ(g_enum_modes[9][2], 16);
+    CHECK_EQ(g_enum_modes[11][0], 3840);
+    CHECK_EQ(g_enum_modes[11][1], 2160);
+    CHECK_EQ(g_enum_modes[11][2], 16);
     CHECK_EQ(call_method(dd, DD_SetDisplayMode, {800, 600, 8}), DD_OK);
     CHECK(ddraw_display_mode(&mw, &mh, &mbpp));
     CHECK_EQ(mw, 800);
@@ -7527,10 +7527,10 @@ static void test_configurable_display_modes() {
         ddraw_reset_modes();
         dd = fresh_dd();
         enum_modes_now(dd, cb);
-        if (g_enum_count != 10)
-            printf("  RECOMP_DDRAW_MODES=\"%s\" gave %u modes, wanted the built-in 10\n", spec,
+        if (g_enum_count != 12)
+            printf("  RECOMP_DDRAW_MODES=\"%s\" gave %u modes, wanted the built-in 12\n", spec,
                    g_enum_count);
-        CHECK_EQ(g_enum_count, 10u);
+        CHECK_EQ(g_enum_count, 12u);
         CHECK_EQ(call_method(dd, DD_SetDisplayMode, {800, 600, 16}), DD_OK);
     }
 
@@ -7559,7 +7559,7 @@ static void test_configurable_display_modes() {
     // And an empty spec puts the built-in list back.
     CHECK_EQ(ddraw_set_modes(nullptr), 1);
     enum_modes_now(dd, cb);
-    CHECK_EQ(g_enum_count, 10u);
+    CHECK_EQ(g_enum_count, 12u);
 
     // Unset is the same list as well, which is the state every other test runs in -
     // so this one has to leave it that way.
@@ -7567,15 +7567,15 @@ static void test_configurable_display_modes() {
     ddraw_reset_modes();
     dd = fresh_dd();
     enum_modes_now(dd, cb);
-    CHECK_EQ(g_enum_count, 10u);
+    CHECK_EQ(g_enum_count, 12u);
     CHECK_EQ(g_enum_modes[5][0], 1024u);
-    CHECK_EQ(call_method(dd, DD_SetDisplayMode, {1280, 960, 16}), DDERR_INVALIDPARAMS);
-    CHECK_EQ(ddraw_add_mode(1280, 960, 16), 1);
-    CHECK_EQ(ddraw_add_mode(1280, 960, 16), 1); // duplicate request adds no duplicate row
+    CHECK_EQ(call_method(dd, DD_SetDisplayMode, {1366, 768, 16}), DDERR_INVALIDPARAMS);
+    CHECK_EQ(ddraw_add_mode(1366, 768, 16), 1);
+    CHECK_EQ(ddraw_add_mode(1366, 768, 16), 1); // duplicate request adds no duplicate row
     CHECK_EQ(ddraw_add_mode(1920, 1080, 32), 0);
     enum_modes_now(dd, cb);
-    CHECK_EQ(g_enum_count, 11u);
-    CHECK_EQ(call_method(dd, DD_SetDisplayMode, {1280, 960, 16}), DD_OK);
+    CHECK_EQ(g_enum_count, 13u);
+    CHECK_EQ(call_method(dd, DD_SetDisplayMode, {1366, 768, 16}), DD_OK);
     CHECK_EQ(call_method(dd, DD_SetDisplayMode, {3840, 2160, 16}), DD_OK);
     ddraw_reset_modes();
 }
