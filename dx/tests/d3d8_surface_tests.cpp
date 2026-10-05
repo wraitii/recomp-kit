@@ -736,6 +736,10 @@ static void test_caps() {
     // the game never binds a texture.
     check(rd32(caps + 0x94) == 2, "MaxTextureBlendStages matches the two-stage renderer");
     check(rd32(caps + 0x98) == 2, "MaxSimultaneousTextures matches the two-stage renderer");
+    // TextureOpCaps must advertise at least DOTPRODUCT3: a guest may use it as
+    // its compressed-texture capability gate, so a zero value disables DXT
+    // textures even when CheckDeviceFormat accepts them.
+    check((rd32(caps + 0x90) & 0x00800000u) != 0, "TextureOpCaps advertises DOTPRODUCT3");
     check(call_method(device, 7, {0}) == 0x8876086c, "null caps output is rejected");
     call_method(device, 2);
 }

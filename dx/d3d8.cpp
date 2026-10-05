@@ -289,6 +289,14 @@ void write_caps(uint32_t addr) {
     // DIVERGENCE(original): the reference adapter reported its hardware's count.
     wr32(addr + 0x94, 2);
     wr32(addr + 0x98, 2);
+    // TextureOpCaps (+0x90). The fixed-function path resolves the core
+    // modulate/add/blend ops; the value matches the D3D9 bridge's declared
+    // capability. A guest can read D3DTEXOPCAPS_DOTPRODUCT3 (0x00800000) as a
+    // stand-in for "a real 3D adapter" when deciding whether compressed
+    // (S3TC/DXT) textures are usable, so leaving this zero silently disables
+    // them even though CheckDeviceFormat accepts the DXT formats. Advertising
+    // the bit is what original hardware reported.
+    wr32(addr + 0x90, 0x03feffffu);
 }
 
 // The DirectDraw table holds the front end's 8/16-bit modes, so filtering it
