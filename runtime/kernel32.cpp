@@ -4036,6 +4036,9 @@ void k_GetEnvironmentVariableA(X86 *c) {
 void k_GetUserDefaultLCID(X86 *c) {
     set_eax(c, 0x0409);
 }
+void k_GetUserDefaultLangID(X86 *c) {
+    set_eax(c, 0x0409); // en-US LANGID
+}
 void k_IsValidCodePage(X86 *c) {
     uint32_t cp = arg(c, 0);
     set_eax(
@@ -5108,6 +5111,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "GetLocaleInfoA", 4, k_GetLocaleInfoA},
     {"KERNEL32.dll", "GetEnvironmentVariableA", 3, k_GetEnvironmentVariableA},
     {"KERNEL32.dll", "GetUserDefaultLCID", 0, k_GetUserDefaultLCID},
+    {"KERNEL32.dll", "GetUserDefaultLangID", 0, k_GetUserDefaultLangID},
     {"KERNEL32.dll", "GetSystemDefaultLCID", 0, k_GetUserDefaultLCID},
     {"KERNEL32.dll", "IsValidCodePage", 1, k_IsValidCodePage},
     {"KERNEL32.dll", "IsValidLocale", 2, k_IsValidLocale},

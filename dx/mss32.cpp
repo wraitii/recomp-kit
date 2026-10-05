@@ -264,6 +264,25 @@ void ail_wave_open(X86 *c) {
     LOGV("mss32: opened digital driver %08x (%u Hz)", id, rd32(fmt + 4));
     set_eax(c, 0);
 }
+// AIL_open_digital_driver(frequency, bits, channels, flags) returns the
+// HDIGDRIVER directly rather than through an out parameter. RT3 opens the
+// driver at the game's mixed rate (22050 Hz, 16-bit stereo). A zero rate
+// selects Miles' default; the shim records the requested shape so
+// digital_configuration and sample volume answer consistently.
+void ail_open_digital_driver(X86 *c) {
+    uint32_t rate = arg(c, 0), bits = arg(c, 1), channels = arg(c, 2);
+    if (!rate)
+        rate = 22050;
+    if (bits != 8 && bits != 16)
+        bits = 16;
+    if (channels != 1 && channels != 2)
+        channels = 2;
+    uint32_t id = g_next_driver++;
+    g_drivers[id] = {rate, bits, channels, 127};
+    LOGV("mss32: opened digital driver %08x (%u Hz, %u-bit, %u ch)", id, rate, bits, channels);
+    set_eax(c, id);
+}
+
 void ail_wave_close(X86 *c) {
     for (auto &s : g_samples)
         if (s.alive && s.driver == arg(c, 0)) {
@@ -319,6 +338,37 @@ void ail_start_sample(X86 *c) {
 void ail_end_sample(X86 *c) {
     if (Sample *s = sample_for(arg(c, 0)))
         sample_stop(*s);
+    set_eax(c, 0);
+}
+
+// AIL_lock/AIL_unlock serialize access to Miles' global state. The shim's
+// state is touched only from the guest's own thread seam, so there is nothing
+// to guard; returning zero matches the API's void-like result.
+void ail_lock(X86 *c) {
+    set_eax(c, 0);
+}
+void ail_unlock(X86 *c) {
+    set_eax(c, 0);
+}
+
+void ail_stop_sample(X86 *c) {
+    if (Sample *s = sample_for(arg(c, 0)))
+        sample_stop(*s);
+    set_eax(c, 0);
+}
+
+// AIL_resume_sample continues a sample the engine stopped. The shim has no
+// separate paused state, so a stopped sample with PCM restarts from its first
+// channel and re-submits the image.
+void ail_resume_sample(X86 *c) {
+    if (Sample *s = sample_for(arg(c, 0)); s && !s->playing && s->wave.pcm_bytes) {
+        if (s->channel < 0)
+            s->channel = dx_alloc_audio_channel();
+        if (s->channel >= 0) {
+            s->remaining = s->loops;
+            sample_play(*s);
+        }
+    }
     set_eax(c, 0);
 }
 
@@ -545,10 +595,19 @@ void ret_done(X86 *c) {
 const ImportShim g_mss32_shims[] = {
     AIL(startup, 0, ret1),
     AIL(shutdown, 0, ret0),
+    // AIL_set_redist_directory tells Miles where to find its own runtime
+    // modules. The shim is the runtime, so the path is irrelevant; the engine
+    // ignores the result and calls AIL_startup next.
+    AIL(set_redist_directory, 4, ret1),
+    AIL(lock, 0, ail_lock),
+    AIL(unlock, 0, ail_unlock),
+    AIL(stop_sample, 4, ail_stop_sample),
+    AIL(resume_sample, 4, ail_resume_sample),
     AIL(set_preference, 8, ail_preference),
     AIL(get_preference, 4, ail_get_preference),
     AIL(waveOutOpen, 16, ail_wave_open),
     AIL(waveOutClose, 4, ail_wave_close),
+    AIL(open_digital_driver, 16, ail_open_digital_driver),
     AIL(digital_configuration, 16, ail_configuration),
     AIL(set_digital_master_volume, 8, ail_master_volume),
     AIL(set_named_sample_file, 20, ail_set_named_sample_file),
