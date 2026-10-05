@@ -14,7 +14,7 @@ The native resource tests link the same Rust storage without creating a GPU.
 
 - Lives in recomp-kit and is built by `dx/CMakeLists.txt` when `RECOMP_D3D8_WGPU` is on
   (or a game ships its own `graphics/d3d8-wgpu`). Game-specific usage inventories and
-  work plans belong in the game repository; Ghost Recon's are in its `docs/d3d8-wgpu/`.
+  execution evidence belong in the game repository, alongside its README and engine notes.
 - Some draw paths cover only what a game has needed so far (for example the lit
   `0x152` FVF); anything else fails by name rather than approximating.
 - `reference/` is gitignored local material (Wine's D3D8 headers); the pinned copy the
@@ -38,7 +38,7 @@ The Metal headless probe passed clear/readback, transformed triangles and depth
 occlusion on Apple M1 Max. Startup replay produced one 640x480 PNG, then failed
 loudly at `IDirect3DDevice8::Reset`. This is bounded execution evidence, not game
 playability or original-D3D8 equivalence. The current validation and exact kit
-revision are recorded in the game repository's `docs/recompilation.md`.
+revision are recorded in the game repository's README.
 
 ## Layout
 
