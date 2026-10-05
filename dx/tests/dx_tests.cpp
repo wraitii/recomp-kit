@@ -6890,6 +6890,28 @@ static void test_dxt_surface_and_blit() {
     CHECK_EQ(px(2, 0), 0xfa50u); // a=15, r=10, g=5
     CHECK_EQ(px(3, 0), 0xf5a0u); // a=15, r=5, g=10
     CHECK_EQ(call_method(dst, S_Unlock, {0}), DD_OK);
+
+    // A 16bpp surface Blt into a DXT surface copies nothing. The pixel path
+    // used to treat the compressed destination as 8bpp with block-row pitch
+    // and write past its storage (the save-game picture overran its block).
+    CHECK_EQ(make(8, 8, true), DD_OK);
+    uint32_t cdst = rd32(sc(0x10));
+    ComObj *cobj = cdst ? com_this(cdst) : nullptr;
+    CHECK(cobj != nullptr);
+    if (cobj) {
+        const uint32_t base = cobj->pixels, bytes = cobj->pixels_bytes;
+        CHECK_EQ(bytes, 32u);
+        gm_zero(base, bytes);
+        std::vector<uint8_t> before(bytes + 128);
+        for (uint32_t i = 0; i < before.size(); ++i)
+            before[i] = rd8(base + i);
+        CHECK_EQ(call_method(cdst, S_Blt, {0, dst, 0, DDBLT_WAIT, 0}), DD_OK);
+        bool untouched = true;
+        for (uint32_t i = 0; i < before.size(); ++i)
+            untouched = untouched && rd8(base + i) == before[i];
+        CHECK(untouched);
+        call_method(cdst, S_Release, {});
+    }
     call_method(src, S_Release, {});
     call_method(dst, S_Release, {});
     call_method(dd, DD_Release, {});

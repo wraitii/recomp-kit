@@ -811,17 +811,23 @@ void blit(ComObj *dst, const int32_t d[4], const ComObj *src, const int32_t sr[4
     if (dw <= 0 || dh <= 0 || !dst->pixels)
         return;
 
+    // A compressed destination keeps 4x4 blocks, not pixel rows: its bpp is 0 and
+    // its pitch strides block rows. The pixel paths below would treat it as 8bpp
+    // and write rows at pixel-row offsets, far past the allocation (a 16bpp
+    // screen capture Blt into the save-game picture's DXT texture overran its
+    // 32 KB block). No compressor exists here, so the Blt or fill copies nothing.
+    if (surface_is_compressed(dst)) {
+        log_once("ddraw.blt.dxtdst",
+                 "ddraw: Blt into a DXT surface is not supported; copying nothing");
+        return;
+    }
+
     // A compressed source is decoded block by block into the destination's
     // pixels. This is the path that actually fills the engine's VRAM texture
     // pool: LH3DVRAM Blts a DXT surface into a 16bpp pool surface and binds
     // that. The guest's DXT bytes are never modified. `keys` still apply,
     // compared against the destination's own pixel format.
     if (src && !fill && surface_is_compressed(src)) {
-        if (surface_is_compressed(dst)) {
-            log_once("ddraw.blt.dxtdst",
-                     "ddraw: Blt into a DXT surface is not supported; copying nothing");
-            return;
-        }
         int32_t sw = sr[2] - sr[0], sh = sr[3] - sr[1];
         if (sw <= 0 || sh <= 0)
             return;
