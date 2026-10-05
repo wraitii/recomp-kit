@@ -267,19 +267,99 @@ uint32_t host_result(X86 *c, int32_t status, const D3d8Error &err) {
 
 // ---------------------------------------------------------------------------
 // D3DCAPS8 describes this bounded renderer, not wgpu's potential capabilities.
+//
+// The values mirror a period GeForce3/4-class DX8.1 HAL where the bridge has a
+// path for the feature, and are deliberately conservative where the shim has
+// no equivalent. A bit a period HAL would report but this shim does not is
+// called out with a comment so the omission is a decision, not an accident.
+// The feature a bit gates is checked at draw time by the bridge and fails by
+// name when unimplemented, which is how the remaining gaps are found.
 // ---------------------------------------------------------------------------
 void write_caps(uint32_t addr) {
     memset(gm_ptr(addr), 0, 212);
     wr32(addr, D8_DEVTYPE_HAL);
-    wr32(addr + 12, 0x00080000u); // D3DCAPS2_CANRENDERWINDOWED
-    // DevCaps (+0x1c). Advertise hardware transform and lighting: a guest that
-    // gates its configurable T&L path on this bit otherwise forces the software
-    // fallback. The guest-side evidence and addresses live in the game
-    // repository's docs/engine-info.md.
+    // Caps (+0x08) stays zero: the only D3D8 bit is D3DCAPS_READ_SCANLINE
+    // (0x20000), i.e. IDirect3DDevice8::GetRasterStatus, which the bridge does
+    // not implement. (Caps3 +0x10 also stays zero: ALPHA_FULLSCREEN_FLIP_OR_
+    // DISCARD is about a real fullscreen flip chain, which the host present
+    // seam does not have.)
     //
-    // DIVERGENCE(original): only this one bit is advertised; the reference
-    // adapter reported its full DevCaps, which the shim does not model.
-    wr32(addr + 0x1c, D3DDEVCAPS_HWTRANSFORMANDLIGHT);
+    // Caps2 (+0x0c). Windowed rendering is the normal host path; the arena owns
+    // all resources so managed textures are manageable; every texture lock is
+    // serviced from CPU storage, so dynamic textures are honest. Not advertised:
+    // D3DCAPS2_FULLSCREENGAMMA / CANCALIBRATEGAMMA (no SetGammaRamp path) and
+    // D3DCAPS2_NO2DDURING3DSCENE (inert: the host always composites 2D).
+    wr32(addr + 0x0c, 0x00080000u | 0x10000000u | 0x20000000u);
+    // PresentationIntervals (+0x14). The host present is not throttled against
+    // a refresh count, so only IMMEDIATE is truthful. The ONE..FOUR vblank
+    // intervals are not modelled and are left out.
+    wr32(addr + 0x14, D8PRESENT_INTERVAL_IMMEDIATE);
+    // CursorCaps (+0x18) stays zero: SetCursorProperties/ShowCursor are not
+    // implemented, so a hardware-color cursor must not be advertised (a period
+    // HAL reported D3DCURSORCAPS_COLOR).
+    //
+    // DevCaps (+0x1c). HWTRANSFORMANDLIGHT is load-bearing: a guest that gates
+    // its configurable T&L path on this bit otherwise forces the software
+    // fallback. The rest describe a DX8 HAL whose vertices and textures live in
+    // system memory (the bridge's CPU storage) and that rasterizes and draws
+    // primitives itself. Not advertised: EXECUTEVIDEOMEMORY /
+    // TLVERTEXVIDEOMEMORY (no separate video memory), CANRENDERAFTERFLIP /
+    // SEPARATETEXTUREMEMORIES / CANBLTSYSTONONLOCAL / PUREDEVICE (no flip
+    // chain, one texture memory, no non-local blit, not pure) and the
+    // RT/N-patch bits (no tessellation). The guest-side evidence and addresses
+    // live in the game repository's docs/engine-info.md.
+    //
+    // DIVERGENCE(original): the reference adapter reported its full DevCaps.
+    wr32(addr + 0x1c,
+         0x00000010u |     // D3DDEVCAPS_EXECUTESYSTEMMEMORY
+             0x00000040u | // D3DDEVCAPS_TLVERTEXSYSTEMMEMORY
+             0x00000100u | // D3DDEVCAPS_TEXTURESYSTEMMEMORY
+             0x00000200u | // D3DDEVCAPS_TEXTUREVIDEOMEMORY
+             0x00000400u | // D3DDEVCAPS_DRAWPRIMTLVERTEX
+             0x00001000u | // D3DDEVCAPS_TEXTURENONLOCALVIDMEM
+             0x00002000u | // D3DDEVCAPS_DRAWPRIMITIVES2
+             0x00008000u | // D3DDEVCAPS_DRAWPRIMITIVES2EX
+             0x00010000u | // D3DDEVCAPS_HWTRANSFORMANDLIGHT
+             0x00080000u); // D3DDEVCAPS_HWRASTERIZATION
+    // PrimitiveMiscCaps (+0x20). Z-write masking, all three cull modes, the
+    // per-channel color-write mask and blend ops are honoured by the draw
+    // pipeline. CLIPTLVERTS matches the pre-transformed (XYZRHW) path, whose
+    // clipping is only accepted when it is provably unobservable. Not
+    // advertised: LINEPATTERNREP (no patterned lines), CLIPPLANESCALEDPOINTS,
+    // TSSARGTEMP (no temp register) and NULLREFERENCE/CULLNONE-only quirks.
+    wr32(addr + 0x20,
+         0x00000002u |     // D3DPMISCCAPS_MASKZ
+             0x00000010u | // D3DPMISCCAPS_CULLNONE
+             0x00000020u | // D3DPMISCCAPS_CULLCW
+             0x00000040u | // D3DPMISCCAPS_CULLCCW
+             0x00000080u | // D3DPMISCCAPS_COLORWRITEENABLE
+             0x00000200u | // D3DPMISCCAPS_CLIPTLVERTS
+             0x00000800u); // D3DPMISCCAPS_BLENDOP
+    // RasterCaps (+0x24). The bridge honours depth test, vertex and table fog,
+    // D3DRS_RANGEFOGENABLE, LOD bias, ZBIAS, anisotropic filtering (at
+    // MaxAnisotropy = 1, i.e. linear) and perspective-correct interpolation.
+    // DITHER is stored but is a documented no-op (the host target is 32-bit),
+    // so it is advertised although it changes no pixels. Not advertised:
+    // PAT/ANTIALIASEDGES (no patterned or antialiased lines),
+    // ZBUFFERLESSHSR, WFOG/ZFOG (ordinary w/eye-space depth is used),
+    // STRETCHBLTMULTISAMPLE.
+    wr32(addr + 0x24,
+         0x00000001u |     // D3DPRASTERCAPS_DITHER
+             0x00000010u | // D3DPRASTERCAPS_ZTEST
+             0x00000080u | // D3DPRASTERCAPS_FOGVERTEX
+             0x00000100u | // D3DPRASTERCAPS_FOGTABLE
+             0x00002000u | // D3DPRASTERCAPS_MIPMAPLODBIAS
+             0x00004000u | // D3DPRASTERCAPS_ZBIAS
+             0x00010000u | // D3DPRASTERCAPS_FOGRANGE
+             0x00020000u | // D3DPRASTERCAPS_ANISOTROPY
+             0x00400000u); // D3DPRASTERCAPS_COLORPERSPECTIVE
+    // ZCmpCaps (+0x28), SrcBlendCaps (+0x2c), DestBlendCaps (+0x30). The
+    // fixed-function shader maps every D3DCMPFUNC and every D3DBLEND factor
+    // except BOTHSRCALPHA/BOTHINVSRCALPHA, which wgpu cannot express; those
+    // two bits are omitted (a period HAL reported them).
+    wr32(addr + 0x28, 0x000000ffu);
+    wr32(addr + 0x2c, 0x000007ffu);
+    wr32(addr + 0x30, 0x000007ffu);
     // AlphaCmpCaps (+0x34). A guest can gate its `D3DRS_ALPHATESTENABLE`
     // setup on the compare function it intends to use; a zero field silently
     // renders alpha-tested geometry opaque even when the bridge would honour
@@ -290,6 +370,30 @@ void write_caps(uint32_t addr) {
     // DIVERGENCE(original): the reference adapter reported its hardware's
     // compare-function set; the bridge supports the full D3D8 enum.
     wr32(addr + 0x34, 0x000000ffu);
+    // ShadeCaps (+0x38). Gouraud RGB and specular shading, per-vertex alpha and
+    // fog, are all implemented; flat/Phong shading stay refusals. Not
+    // advertised: COLORFLATRGB / SPECULARFLATRGB / ALPHAFLATBLEND (flat is a
+    // named refusal) and the per-pixel *PHONGRGB forms.
+    wr32(addr + 0x38, 0x00084208u);
+    // TextureCaps (+0x3c). Perspective-correct 2D textures with alpha, mipmaps
+    // and projected (COUNT3|PROJECTED) coordinates are supported; wgpu handles
+    // non-power-of-two sizes. Not advertised: POW2/SQUAREONLY (wgpu does not
+    // require them, so a HAL would leave them clear), ALPHAPALETTE /
+    // MIPVOLUMEMAP / VOLUMEMAP / CUBEMAP / MIPCUBEMAP and their POW2 variants
+    // (no cube/volume textures), NONPOW2CONDITIONAL and
+    // TEXREPEATNOTSCALEDBYSIZE (no such restriction).
+    wr32(addr + 0x3c, 0x00004405u);
+    // TextureFilterCaps (+0x40). Point, linear and anisotropic (linear at
+    // MaxAnisotropy = 1), with point/linear mip filters. Cubic stays a named
+    // refusal. Cube/volume filter caps (+0x44/+0x48) stay zero: no cube or
+    // volume textures.
+    wr32(addr + 0x40, 0x07030700u);
+    // TextureAddressCaps (+0x4c). Wrap, mirror, clamp, border and independent
+    // U/V are honoured. MIRRORONCE has no wgpu equivalent and is omitted.
+    // VolumeTextureAddressCaps (+0x50) stays zero (no volume textures).
+    wr32(addr + 0x4c, 0x0000001fu);
+    // LineCaps (+0x54) stays zero: DrawPrimitive accepts only TRIANGLELIST, so
+    // textured/z-tested/blended/alpha-tested/fogged lines are not offered.
     // MaxTextureWidth/MaxTextureHeight (D3DCAPS8 +0x58/+0x5c). A game that
     // sizes textures against these (Ghost Recon's 0x004eac20 halves an image
     // until it fits) collapses every texture to 1x1 when they read 0. 2048 is
@@ -298,6 +402,29 @@ void write_caps(uint32_t addr) {
     // DIVERGENCE(original): the reference adapter reported its hardware's limit.
     wr32(addr + 0x58, 2048);
     wr32(addr + 0x5c, 2048);
+    // MaxVolumeExtent (+0x60) stays zero: no volume textures.
+    // MaxTextureRepeat / MaxTextureAspectRatio (+0x64/+0x68): 0 means "no
+    // limit" in D3D8 and matches the sampler, which wraps and filters freely.
+    // MaxAnisotropy (+0x6c): the bridge maps D3DTEXF_ANISOTROPIC to linear
+    // filtering, so the only honest maximum is 1.
+    wr32(addr + 0x6c, 1);
+    // MaxVertexW, guard band and ExtentsAdjust (+0x70..+0x84) stay zero. There
+    // is no w-buffer and wgpu clips at the view volume, so a guard band would
+    // be a promise the host does not keep.
+    // StencilCaps (+0x88) stays zero: D3DRS_STENCILENABLE is a named refusal,
+    // so no stencil operation is offered (the D3D7 bridge does the same).
+    // FVFCaps (+0x8c). D3DFVFCAPS_TEXCOORDCOUNTMASK is the number of texture
+    // coordinate sets the FVF decoder carries; it handles two. PSIZE (point
+    // size) is not offered, so its bit stays clear.
+    wr32(addr + 0x8c, 2);
+    // TextureOpCaps (+0x90). The fixed-function path resolves the core
+    // modulate/add/blend ops; the value matches the D3D9 bridge's declared
+    // capability. A guest can read D3DTEXOPCAPS_DOTPRODUCT3 (0x00800000) as a
+    // stand-in for "a real 3D adapter" when deciding whether compressed
+    // (S3TC/DXT) textures are usable, so leaving this zero silently disables
+    // them even though CheckDeviceFormat accepts the DXT formats. Advertising
+    // the bit is what original hardware reported.
+    wr32(addr + 0x90, 0x03feffffu);
     // MaxTextureBlendStages/MaxSimultaneousTextures (+0x94/+0x98). Guest
     // 0x007c2160 clamps both to 2 and only sets up (and later binds) that many
     // texture stages; at 0 the game renders everything untextured, and at 1 it
@@ -307,14 +434,31 @@ void write_caps(uint32_t addr) {
     // DIVERGENCE(original): the reference adapter reported its hardware's count.
     wr32(addr + 0x94, 2);
     wr32(addr + 0x98, 2);
-    // TextureOpCaps (+0x90). The fixed-function path resolves the core
-    // modulate/add/blend ops; the value matches the D3D9 bridge's declared
-    // capability. A guest can read D3DTEXOPCAPS_DOTPRODUCT3 (0x00800000) as a
-    // stand-in for "a real 3D adapter" when deciding whether compressed
-    // (S3TC/DXT) textures are usable, so leaving this zero silently disables
-    // them even though CheckDeviceFormat accepts the DXT formats. Advertising
-    // the bit is what original hardware reported.
-    wr32(addr + 0x90, 0x03feffffu);
+    // VertexProcessingCaps (+0x9c). Texture-coordinate generation,
+    // COLOR1/COLOR2 material sources, directional/point/spot lights, the local
+    // viewer and the no-UBYTE4 rule are implemented. Not advertised: TWEENING
+    // (no vertex blending).
+    wr32(addr + 0x9c, 0x000000bbu);
+    // MaxActiveLights (+0xa0) matches the bridge's eight-light state;
+    // MaxUserClipPlanes (+0xa4), MaxVertexBlendMatrices (+0xa8) and
+    // MaxVertexBlendMatrixIndex (+0xac) stay zero because clip planes and
+    // vertex blending are named refusals.
+    wr32(addr + 0xa0, 8);
+    // MaxPointSize (+0xb0) stays zero: point primitives are not a supported
+    // topology.
+    // MaxPrimitiveCount (+0xb4) is the DX8 HAL-scale batch limit; a draw is not
+    // otherwise bounded by the bridge. MaxVertexIndex (+0xb8) is the 16-bit
+    // vertex-index ceiling; MaxStreams (+0xbc) is one because SetStreamSource
+    // accepts only stream 0. MaxStreamStride (+0xc0) is the DX8 HAL maximum.
+    wr32(addr + 0xb4, 0x00555555u);
+    wr32(addr + 0xb8, 0x0000ffffu);
+    wr32(addr + 0xbc, 1);
+    wr32(addr + 0xc0, 508);
+    // VertexShaderVersion / MaxVertexShaderConst (+0xc4/+0xc8) and
+    // PixelShaderVersion / MaxPixelShaderValue (+0xcc/+0xd0) stay zero:
+    // programmable shaders are not implemented yet. A non-zero version makes
+    // the engine call CreateVertexShader/CreatePixelShader, which abort; these
+    // will be advertised when shader support lands.
 }
 
 // The DirectDraw table holds the front end's 8/16-bit modes, so filtering it
@@ -374,8 +518,13 @@ bool d8_depth_format(uint32_t fmt) {
 bool check_device_format_ok(uint32_t usage, uint32_t rtype, uint32_t fmt) {
     if (usage & D8USAGE_DEPTHSTENCIL)
         return rtype == D8_RTYPE_SURFACE && d8_depth_format(fmt);
-    if (usage & D8USAGE_RENDERTARGET)
-        return rtype == D8_RTYPE_SURFACE && color_format(fmt);
+    if (usage & D8USAGE_RENDERTARGET) {
+        // A render target is either a standalone surface or a level-0
+        // DEFAULT-pool texture; the bridge keeps the latter CPU-backed and
+        // binds it through SetRenderTarget. Both are limited to the color
+        // formats the offscreen target can hold.
+        return (rtype == D8_RTYPE_SURFACE || rtype == D8_RTYPE_TEXTURE) && color_format(fmt);
+    }
     if (rtype == D8_RTYPE_TEXTURE)
         return d8_format_bytes(fmt) != 0 || d8_block_bytes(fmt) != 0;
     return false;

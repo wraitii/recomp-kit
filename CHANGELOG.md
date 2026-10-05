@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- D3D8 `CheckDeviceFormat` now answers `D3D_OK` for a render-target texture
+  (`D3DUSAGE_RENDERTARGET` with `D3DRTYPE_TEXTURE` and an offscreen color
+  format) instead of only for a standalone render-target surface. The bridge
+  already accepts a level-0 `D3DPOOL_DEFAULT` render-target texture and binds
+  it through `SetRenderTarget`, so a guest that probed before creating one was
+  told the format was unavailable. Plain and depth uses are unchanged.
+
+- D3D8 `GetDeviceCaps` (`dx/d3d8.cpp::write_caps`) now fills the whole
+  `D3DCAPS8` with a period DX8 HAL surface instead of a handful of fields. New
+  values: `Caps2` windowed/managed/dynamic; `PresentationIntervals` immediate
+  only; the full `DevCaps` system-memory/raster/draw set; `PrimitiveMiscCaps`,
+  `RasterCaps` (fog, LOD bias, ZBIAS, anisotropy, perspective),
+  `ZCmpCaps`/`SrcBlendCaps`/`DestBlendCaps`/`ShadeCaps`, `TextureCaps`,
+  `TextureFilterCaps`, `TextureAddressCaps`, `FVFCaps` (two texcoord sets),
+  `VertexProcessingCaps`, `MaxActiveLights`, `MaxPrimitiveCount`,
+  `MaxVertexIndex`, `MaxStreams` and `MaxStreamStride`. Caps the bridge cannot
+  keep stay zero and are documented in the source: scanline reads, gamma,
+  hardware cursor, cube/volume textures, stencil, clip planes, vertex
+  blending, line/point primitives, guard band and the programmable-shader
+  versions. `MaxTextureWidth/Height` and the two-stage texture limits are
+  unchanged. A guest that gates a feature on a newly advertised cap now
+  reaches the bridge path; an unhonoured state still fails by name at draw
+  time. The `test_caps` contract test pins every non-zero field.
+
 - D3D8 `GetDeviceCaps` now advertises `D3DCAPS8.AlphaCmpCaps` (`+0x34`)
   with all eight `D3DCMPCAPS_*` bits. A guest can gate its
   `D3DRS_ALPHATESTENABLE` setup on the compare function it intends to use, so

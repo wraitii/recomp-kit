@@ -811,10 +811,11 @@ static void test_shader_constants() {
     call_method(device, 2);
 }
 
-// D3DCAPS8 texture limits. Ghost Recon's 0x004eac20 halves every texture
-// until it fits MaxTextureWidth/MaxTextureHeight, so a zero here silently
-// collapses all sampled textures to 1x1. The renderer's declared limits must
-// stay non-zero and non-trivial.
+// D3DCAPS8 limits and the broader HAL surface. Ghost Recon's 0x004eac20
+// halves every texture until it fits MaxTextureWidth/Height, so a zero there
+// silently collapses all sampled textures to 1x1. The rest of the table pins
+// the fields write_caps advertises so a change to the bridge's fixed-function
+// slice has to update this contract deliberately.
 static void test_caps() {
     cpu_reset();
     ComObj *dev = make_test_device(4, 4, 22);
@@ -824,23 +825,140 @@ static void test_caps() {
         wr32(caps + i, 0xcdcdcdcd);
     check(call_method(device, 7, {caps}) == 0, "GetDeviceCaps succeeds");
     check(rd32(caps) == 1, "device type is D3DDEVTYPE_HAL");
-    // Railroad Tycoon 3's `__init_direct3d` (0x005492d0) keeps its configured
-    // hardware T&L state only when this bit is set; without it the engine
-    // forces the software `0x112`/`0x152` terrain fallback.
-    check((rd32(caps + 0x1c) & D3DDEVCAPS_HWTRANSFORMANDLIGHT) != 0,
+
+    // Exact DWORDs. Every field the shim sets to a single value is pinned here.
+    struct CapsField {
+        const char *name;
+        uint32_t off;
+        uint32_t value;
+    };
+    static const CapsField fields[] = {
+        {"Caps2", 0x0c, 0x30080000u},                 // windowed + managed + dynamic
+        {"PresentationIntervals", 0x14, 0x80000000u}, // IMMEDIATE only
+        {"ZCmpCaps", 0x28, 0x000000ffu},              // all eight compare funcs
+        {"SrcBlendCaps", 0x2c, 0x000007ffu},          // no BOTH* variants
+        {"DestBlendCaps", 0x30, 0x000007ffu},         // no BOTH* variants
+        {"AlphaCmpCaps", 0x34, 0x000000ffu},          // all eight compare funcs
+        {"ShadeCaps", 0x38, 0x00084208u},             // gouraud color/specular/alpha/fog
+        {"TextureCaps", 0x3c, 0x00004405u},           // perspective/alpha/projected/mipmap
+        {"TextureFilterCaps", 0x40, 0x07030700u},     // point/linear/aniso + mips
+        {"TextureAddressCaps", 0x4c, 0x0000001fu},    // wrap/mirror/clamp/border/indep UV
+        {"MaxTextureWidth", 0x58, 2048u},
+        {"MaxTextureHeight", 0x5c, 2048u},
+        {"MaxAnisotropy", 0x6c, 1u},          // anisotropic is linear
+        {"FVFCaps", 0x8c, 2u},                // two texcoord sets
+        {"TextureOpCaps", 0x90, 0x03feffffu}, // includes DOTPRODUCT3
+        {"MaxTextureBlendStages", 0x94, 2u},
+        {"MaxSimultaneousTextures", 0x98, 2u},
+        {"VertexProcessingCaps", 0x9c, 0x000000bbu},
+        {"MaxActiveLights", 0xa0, 8u},
+        {"MaxPrimitiveCount", 0xb4, 0x00555555u},
+        {"MaxVertexIndex", 0xb8, 0x0000ffffu},
+        {"MaxStreams", 0xbc, 1u},
+        {"MaxStreamStride", 0xc0, 508u},
+        {"VertexShaderVersion", 0xc4, 0u},
+        {"MaxVertexShaderConst", 0xc8, 0u},
+        {"PixelShaderVersion", 0xcc, 0u},
+        {"MaxPixelShaderValue", 0xd0, 0u},
+        {"MaxUserClipPlanes", 0xa4, 0u},
+        {"MaxVertexBlendMatrices", 0xa8, 0u},
+        {"MaxVertexBlendMatrixIndex", 0xac, 0u},
+    };
+    for (const CapsField &field : fields)
+        check(rd32(caps + field.off) == field.value, field.name);
+
+    // Fields a period HAL reports but the shim must leave zero because the
+    // bridge has no equivalent (or no source of the value at all).
+    static const struct {
+        const char *name;
+        uint32_t off;
+    } zeroes[] = {
+        {"Caps", 0x08},
+        {"Caps3", 0x10},
+        {"CursorCaps", 0x18},
+        {"CubeTextureFilterCaps", 0x44},
+        {"VolumeTextureFilterCaps", 0x48},
+        {"VolumeTextureAddressCaps", 0x50},
+        {"LineCaps", 0x54},
+        {"MaxVolumeExtent", 0x60},
+        {"MaxTextureRepeat", 0x64},
+        {"MaxTextureAspectRatio", 0x68},
+        {"MaxVertexW", 0x70},
+        {"GuardBandLeft", 0x74},
+        {"GuardBandTop", 0x78},
+        {"GuardBandRight", 0x7c},
+        {"GuardBandBottom", 0x80},
+        {"ExtentsAdjust", 0x84},
+        {"StencilCaps", 0x88},
+        {"MaxPointSize", 0xb0},
+    };
+    for (const auto &field : zeroes)
+        check(rd32(caps + field.off) == 0, field.name);
+
+    // DevCaps bits the draw pipeline can keep.
+    const uint32_t devcaps = rd32(caps + 0x1c);
+    check((devcaps & 0x00000010u) != 0, "DevCaps EXECUTESYSTEMMEMORY");
+    check((devcaps & 0x00000040u) != 0, "DevCaps TLVERTEXSYSTEMMEMORY");
+    check((devcaps & 0x00000100u) != 0, "DevCaps TEXTURESYSTEMMEMORY");
+    check((devcaps & 0x00000200u) != 0, "DevCaps TEXTUREVIDEOMEMORY");
+    check((devcaps & 0x00000400u) != 0, "DevCaps DRAWPRIMTLVERTEX");
+    check((devcaps & 0x00001000u) != 0, "DevCaps TEXTURENONLOCALVIDMEM");
+    check((devcaps & 0x00002000u) != 0, "DevCaps DRAWPRIMITIVES2");
+    check((devcaps & 0x00008000u) != 0, "DevCaps DRAWPRIMITIVES2EX");
+    check((devcaps & D3DDEVCAPS_HWTRANSFORMANDLIGHT) != 0,
           "DevCaps advertises hardware transform and lighting");
-    // A guest may gate its `D3DRS_ALPHATESTENABLE` setup on
-    // `D3DPCMPCAPS_GREATEREQUAL`; without the bit it leaves alpha testing off
-    // and alpha-tested textures draw opaque. The fixed-function shader
-    // implements all eight compare functions.
+    check((devcaps & 0x00080000u) != 0, "DevCaps HWRASTERIZATION");
+    check((devcaps & 0x00000020u) == 0, "DevCaps EXECUTEVIDEOMEMORY stays clear");
+    check((devcaps & 0x00000080u) == 0, "DevCaps TLVERTEXVIDEOMEMORY stays clear");
+    check((devcaps & 0x00000800u) == 0, "DevCaps CANRENDERAFTERFLIP stays clear");
+    check((devcaps & 0x00004000u) == 0, "DevCaps SEPARATETEXTUREMEMORIES stays clear");
+    check((devcaps & 0x00020000u) == 0, "DevCaps CANBLTSYSTONONLOCAL stays clear");
+    check((devcaps & 0x00100000u) == 0, "DevCaps PUREDEVICE stays clear");
+
+    // PrimitiveMiscCaps: cull modes, maskz, color-write enable, blend op.
+    const uint32_t misc = rd32(caps + 0x20);
+    check((misc & 0x00000002u) != 0, "PrimitiveMiscCaps MASKZ");
+    check((misc & 0x00000010u) != 0, "PrimitiveMiscCaps CULLNONE");
+    check((misc & 0x00000020u) != 0, "PrimitiveMiscCaps CULLCW");
+    check((misc & 0x00000040u) != 0, "PrimitiveMiscCaps CULLCCW");
+    check((misc & 0x00000080u) != 0, "PrimitiveMiscCaps COLORWRITEENABLE");
+    check((misc & 0x00000200u) != 0, "PrimitiveMiscCaps CLIPTLVERTS");
+    check((misc & 0x00000800u) != 0, "PrimitiveMiscCaps BLENDOP");
+    check((misc & 0x00000400u) == 0, "PrimitiveMiscCaps TSSARGTEMP stays clear");
+
+    // RasterCaps: depth test, both fog paths, LOD bias, ZBIAS, aniso, perspective.
+    const uint32_t raster = rd32(caps + 0x24);
+    check((raster & 0x00000001u) != 0, "RasterCaps DITHER");
+    check((raster & 0x00000010u) != 0, "RasterCaps ZTEST");
+    check((raster & 0x00000080u) != 0, "RasterCaps FOGVERTEX");
+    check((raster & 0x00000100u) != 0, "RasterCaps FOGTABLE");
+    check((raster & 0x00002000u) != 0, "RasterCaps MIPMAPLODBIAS");
+    check((raster & 0x00004000u) != 0, "RasterCaps ZBIAS");
+    check((raster & 0x00010000u) != 0, "RasterCaps FOGRANGE");
+    check((raster & 0x00020000u) != 0, "RasterCaps ANISOTROPY");
+    check((raster & 0x00400000u) != 0, "RasterCaps COLORPERSPECTIVE");
+    check((raster & 0x00100000u) == 0, "RasterCaps WFOG stays clear");
+    check((raster & 0x00200000u) == 0, "RasterCaps ZFOG stays clear");
+
+    // Blend caps: BOTHSRCALPHA/BOTHINVSRCALPHA are not representable in wgpu.
+    check((rd32(caps + 0x2c) & 0x00001800u) == 0, "SrcBlendCaps omits BOTH* variants");
+    check((rd32(caps + 0x30) & 0x00001800u) == 0, "DestBlendCaps omits BOTH* variants");
     check((rd32(caps + 0x34) & 0x00000040u) != 0,
           "AlphaCmpCaps advertises D3DPCMPCAPS_GREATEREQUAL");
-    check(rd32(caps + 0x58) == 2048, "MaxTextureWidth is advertised");
-    check(rd32(caps + 0x5c) == 2048, "MaxTextureHeight is advertised");
-    // Guest 0x007c2160 sizes its texture stage setup from these; zero means
-    // the game never binds a texture.
-    check(rd32(caps + 0x94) == 2, "MaxTextureBlendStages matches the two-stage renderer");
-    check(rd32(caps + 0x98) == 2, "MaxSimultaneousTextures matches the two-stage renderer");
+
+    // Texture caps and filters: no cube/volume, no cubic filter, no mirror-once.
+    check((rd32(caps + 0x3c) & 0x00000800u) == 0, "TextureCaps omits CUBEMAP");
+    check((rd32(caps + 0x3c) & 0x00002000u) == 0, "TextureCaps omits VOLUMEMAP");
+    check((rd32(caps + 0x40) & 0x08000000u) == 0, "TextureFilterCaps omits cubic");
+    check((rd32(caps + 0x4c) & 0x00000020u) == 0, "TextureAddressCaps omits MIRRORONCE");
+
+    // Vertex processing: TEXGEN and all three light types, but no tweening.
+    const uint32_t vpc = rd32(caps + 0x9c);
+    check((vpc & 0x00000001u) != 0, "VertexProcessingCaps TEXGEN");
+    check((vpc & 0x00000008u) != 0, "VertexProcessingCaps DIRECTIONALLIGHTS");
+    check((vpc & 0x00000010u) != 0, "VertexProcessingCaps POSITIONALLIGHTS");
+    check((vpc & 0x00000040u) == 0, "VertexProcessingCaps omits TWEENING");
+
     // TextureOpCaps must advertise at least DOTPRODUCT3: a guest may use it as
     // its compressed-texture capability gate, so a zero value disables DXT
     // textures even when CheckDeviceFormat accepts them.
