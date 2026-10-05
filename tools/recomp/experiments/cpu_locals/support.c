@@ -9,6 +9,8 @@
 const int recomp_resumable_stacks = 0;
 void fixture_call(X86 *c) {
     memcpy(g_mem + 0x10200, c, sizeof *c);
+    /* A callee can alias caller spills; invalidate any forwarded stack value. */
+    wr32(c->r[R_ESP] + 16u, rd32(c->r[R_ESP] + 16u) ^ 0x13579bdfu);
     c->r[R_EAX] ^= 0xa5a5a5a5u;
     c->r[R_ECX] += 0x12345678u;
     c->r[R_EDX] -= 0x87654321u;

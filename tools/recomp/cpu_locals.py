@@ -85,7 +85,7 @@ def transparent(body):
     return re.search(r"\bc\b", code) is None
 
 
-def lower_function(bodies):
+def lower_function(bodies, decoded=False):
     """Return rewritten bodies, entry declarations and exit publications.
 
     Every label belongs to the existing function scope; initialize before the
@@ -96,6 +96,9 @@ def lower_function(bodies):
     Select reused fields with a bounded live set: at most six fields in integer
     code and one or two alongside floating-point lowering. The source-shape
     heuristic is a register-pressure guard, never an execution-speed claim.
+    Decoded mode additionally carries all written flags as scalars: instruction
+    liveness removes dead definitions, and the compiler can sink remaining
+    recipes onto exits instead of repeatedly publishing them in loops.
     """
     safe = {i for i, body in bodies.items() if transparent(body)}
     uses = Counter()
@@ -127,12 +130,19 @@ def lower_function(bodies):
     # Spend fewer GPR/flag registers alongside them, and leave float-dominated
     # leaf arithmetic eager when scalar CPU traffic is too small to justify it.
     budget = (1 if floating > 128 else 2) if floating else 6
+    cache_flags = decoded and any(count >= 3 for name, count in reads.items() if name.startswith("eflags_"))
+    if cache_flags:
+        candidates = [name for name in candidates if name.startswith("r")]
+    if cache_flags:
+        budget = 6  # All audited GPR fields; deferred flags can sink onto exits.
     names = sorted(sorted(candidates, key=lambda name: (-reads[name], -uses[name], name))[:budget])
     # Eager writes to other GPRs do not pay for the cached field's live range.
     # Count only selected GPR writes: newly transparent float regions must not
     # activate a sparse cache merely because they contain many unrelated moves.
+    if cache_flags:
+        names = sorted(set(names) | {name for name in written if not name.startswith("r")})
     gp_writes = sum(writes[name] for name in names if name.startswith("r"))
-    if floating and (floating > 8 * gp_writes or (gp_writes <= 8 and floating > gp_writes)):
+    if not cache_flags and floating and (floating > 8 * gp_writes or (gp_writes <= 8 and floating > gp_writes)):
         return bodies, [], [], 0
     if not names or not (written & set(names)):
         return bodies, [], [], 0
@@ -169,7 +179,15 @@ def lower_function(bodies):
                 result[i].append(FIELD.sub(replace, line))
                 result[i] += [f"{local(name)} = {cpu_field(name)};" for name in sorted(touched)]
         else:
-            result[i] = publish + body + reload
+            # Opaque multi-instruction regions can update eager fields and
+            # leave through a branch before the fall-through reload. Refresh
+            # locals on each such edge before later publication can overwrite
+            # those updates. Internal region edges are harmless refreshes too.
+            edge_reload = " ".join(reload)
+            eager_body = [re.sub(r"\bgoto\s+(L_\w+)\s*;",
+                                 lambda m: "{ " + edge_reload + " goto " + m[1] + "; }", line)
+                          for line in body]
+            result[i] = publish + eager_body + reload
     return result, declarations, publish, len(names)
 
 

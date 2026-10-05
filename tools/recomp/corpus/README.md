@@ -78,3 +78,33 @@ for gameplay or silently included in the native-reference report.
 
 Use the game's build wrapper for every native compilation. Do not invoke
 compilers directly or retain private bytes/generated code in Git.
+
+`--corpus-stack-forwarding` additionally enables bounded binary32 guest-stack
+forwarding and requires `--corpus-x87-dataflow`. The separate setting is
+`[translate].x87_stack_forwarding` (default false, requires `x87_dataflow`).
+Within an admitted decoded region, up to four stores can supply later FLD
+reloads along a single basic block, at most 32 instructions away. Guest stores
+and their `fto_float` conversion remain; possible writes, ESP mutations,
+branches, calls and observers kill the proof. Nothing is forwarded across a
+join or call. `report.json` records both experimental settings.
+
+`--x87-dataflow-checks` also exercises forwarding in its x87 variants, including
+rounded reloads, partial aliases, a status/plane loop and a mutating call.
+
+`--corpus-decoded-dataflow` requires `--corpus-x87-dataflow` and enables
+`[translate].decoded_dataflow` only in the combined variant. The whole-image
+setting defaults false and requires `cpu_locals` plus `x87_dataflow`. A bounded
+2048-instruction decoded CFG analysis tracks definitions and consumed flags
+through loads and audited x87 instructions. Unknown instructions, integer
+stores with observer callbacks, calls and external exits require every flag.
+Logical instructions preserve runtime AF. Branch-heavy bodies can carry all
+six audited GPRs plus written flags; opaque edges publish and refresh locals.
+No outgoing CPU residue or guest stores are discarded, and no callee ABI is
+assumed. `RECOMP_NULL_CHECKS` uses eager flag recipes and CPU lvalues.
+
+`--decoded-dataflow-checks` runs the full-state synthetic fixtures with the
+combined variant enabling decoded flags and forwarding. Both ordinary and
+null-check binaries run, including aliases, opaque region exits and mutating
+callees. The corpus eager variant emits every flag, providing a stronger oracle
+than the older conventionally optimized eager variant. Current-runtime matches
+still do not establish original-x86 equivalence.

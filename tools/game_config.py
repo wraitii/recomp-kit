@@ -191,6 +191,16 @@ def load(game_dir):
         raise ValueError("%s: [translate] x87_dataflow must be a boolean" % source)
     if dataflow_x87 and not locals_x87:
         raise ValueError("%s: [translate] x87_dataflow requires x87_locals" % source)
+    forward_stack = translate.setdefault("x87_stack_forwarding", False)
+    if not isinstance(forward_stack, bool):
+        raise ValueError("%s: [translate] x87_stack_forwarding must be a boolean" % source)
+    if forward_stack and not dataflow_x87:
+        raise ValueError("%s: [translate] x87_stack_forwarding requires x87_dataflow" % source)
+    decoded = translate.setdefault("decoded_dataflow", False)
+    if not isinstance(decoded, bool):
+        raise ValueError("%s: [translate] decoded_dataflow must be a boolean" % source)
+    if decoded and not (dataflow_x87 and translate.get("cpu_locals", False)):
+        raise ValueError("%s: [translate] decoded_dataflow requires x87_dataflow and cpu_locals" % source)
     locals_cpu = translate.setdefault("cpu_locals", False)
     if not isinstance(locals_cpu, bool):
         raise ValueError("%s: [translate] cpu_locals must be a boolean" % source)

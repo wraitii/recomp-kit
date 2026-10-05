@@ -1067,7 +1067,7 @@ def test_liveness_materializes_flags_at_external_boundaries():
         "0d040007  XOR EDX,EDX\n"
         "0d040009  RET\n")
     assert live[0] == T.ALL_FLAGS
-    assert live[1] == T.NO_FLAGS
+    assert live[1] == frozenset({"af"})
     assert live[2] == T.ALL_FLAGS
     _fn, live = _liveness(
         "0d040000  ADD EAX,EBX\n"
@@ -1077,13 +1077,13 @@ def test_liveness_materializes_flags_at_external_boundaries():
 
 
 def test_liveness_kills_a_flag_overwritten_before_any_read():
-    """The first CMP's flags are dead: XOR redefines all of them and the RET
-    reads the XOR result, not the comparison."""
+    """XOR redefines the comparison flags except AF, which the runtime
+    preserves through logic instructions and publishes at RET."""
     _fn, live = _liveness(
         "0d040000  CMP EAX,EBX\n"
         "0d040002  XOR EAX,EAX\n"
         "0d040004  RET\n")
-    assert live[0] == T.NO_FLAGS
+    assert live[0] == frozenset({"af"})
     assert live[1] == T.ALL_FLAGS
 
 
@@ -1115,7 +1115,7 @@ def test_liveness_treats_unknown_jumps_and_traps_as_observers():
 
 def test_liveness_drops_flags_both_arms_overwrite_before_ret():
     """Both arms of the JZ run through XOR ECX,ECX, which redefines every
-    flag before RET, so only the ZF the branch itself reads is live at the
+    defined flag before RET except preserved AF, so ZF and AF are live at the
     CMP.  The old straight-line pass kept all six live at the JZ."""
     _fn, live = _liveness(
         "0d040000  CMP EAX,EBX\n"
@@ -1124,8 +1124,8 @@ def test_liveness_drops_flags_both_arms_overwrite_before_ret():
         "0d040009  NOP\n"
         "0d04000a  XOR ECX,ECX\n"
         "0d04000c  RET\n")
-    assert live[0] == frozenset(("zf",))
-    assert live[1] == T.NO_FLAGS
+    assert live[0] == frozenset(("zf", "af"))
+    assert live[1] == frozenset({"af"})
 
 
 def test_liveness_external_conditional_target_is_an_observer():
@@ -1203,7 +1203,7 @@ def test_liveness_follows_internal_listing_gap_instead_of_next_line():
         "0d040005  SETC CL\n"
         "0d040008  XOR EDX,EDX\n"
         "0d04000a  RET\n", mutate=make_gap)
-    assert live[0] == frozenset(("cf",))
+    assert live[0] == frozenset(("cf", "af"))
 
 
 def test_segment_forms_are_flag_observers():
@@ -1238,10 +1238,10 @@ def test_sse_arithmetic_and_wait_are_flag_observers():
 
 def test_lea_is_transparent_despite_a_memory_shaped_operand():
     """LEA names an address but never dereferences it, so it stays neutral and
-    a later XOR can still kill the flags before RET."""
+    a later XOR can kill the defined flags while preserving AF before RET."""
     _fn, live = _liveness(
         "0d040000  ADD EAX,EBX\n"
         "0d040002  LEA ECX,[EDX + ESI*0x4]\n"
         "0d040006  XOR EDX,EDX\n"
         "0d040008  RET\n")
-    assert live[0] == T.NO_FLAGS
+    assert live[0] == frozenset({"af"})

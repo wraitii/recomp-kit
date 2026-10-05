@@ -155,3 +155,14 @@ def test_gap_and_final_fallthrough_publish():
     tr.prepare(fn)
     body = "\n".join(tr.translate(fn))
     assert body.index("c->r[0] = (*cpu_r0_ptr_);") < body.index("recomp_jump")
+
+
+def test_opaque_region_exit_refreshes_locals_before_leaving():
+    from cpu_locals import lower_function
+    bodies = {0: ["c->r[0] = c->r[0] + c->r[0];"],
+              1: ["unknown(c); c->r[0] = 7; if (c->eflags_zf) { goto L_00100002; }"],
+              2: ["c->r[0] = c->r[0] + c->r[0];"]}
+    result, _, _, count = lower_function(bodies)
+    assert count
+    edge = result[1][1]
+    assert "{ (*cpu_r0_ptr_) = c->r[0]; goto L_00100002; }" in edge

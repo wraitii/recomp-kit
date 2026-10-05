@@ -255,3 +255,27 @@ def test_function_corpus_is_isolated_and_does_not_regenerate_game():
                   ['--corpus-llvm', 'llvm.json'], ['--cpu-locals-checks']):
         with pytest.raises(SystemExit):
             build_py.parse_args(['--function-corpus', 'manifest.json', *extra], system='Darwin')
+
+
+def test_corpus_stack_forwarding_requires_dataflow():
+    import pytest
+    args, _ = build_py.parse_args(['--function-corpus', 'manifest.json',
+                                  '--corpus-x87-dataflow', '--corpus-stack-forwarding'], system='Darwin')
+    assert args.corpus_stack_forwarding
+    with pytest.raises(SystemExit):
+        build_py.parse_args(['--corpus-stack-forwarding'], system='Darwin')
+    with pytest.raises(SystemExit):
+        build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-stack-forwarding'], system='Darwin')
+
+
+def test_decoded_dataflow_build_modes():
+    import pytest
+    args, _ = build_py.parse_args(['--decoded-dataflow-checks'], system='Darwin')
+    assert args.decoded_dataflow_checks
+    args, _ = build_py.parse_args(['--function-corpus', 'manifest.json',
+                                  '--corpus-x87-dataflow', '--corpus-decoded-dataflow'], system='Darwin')
+    assert args.corpus_decoded_dataflow
+    with pytest.raises(SystemExit):
+        build_py.parse_args(['--corpus-decoded-dataflow'], system='Darwin')
+    with pytest.raises(SystemExit):
+        build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-decoded-dataflow'], system='Darwin')

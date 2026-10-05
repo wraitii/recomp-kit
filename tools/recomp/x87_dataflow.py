@@ -6,7 +6,8 @@ division keeps the eager runtime's double operation and ZE/status handling.
 Unknown effects, calls, observers, alternate entries and gaps are publication
 boundaries. Inconsistent TOP joins retain the existing local/eager lowering.
 
-This does not promote guest memory or relax outgoing state. The existing
+Optional bounded stack forwarding retains stores and rounded float reload values;
+it does not relax outgoing state. The existing
 x87-local-status/binary32 interior-fault and exponent-range policies still apply.
 
 DIVERGENCE(original): [x87-local-status] interior faults can see the preceding
@@ -199,6 +200,44 @@ def solve(start, end, effects, successors):
     return Plan(start, end, tops, widths, modified)
 
 
+def stack_forwarding(fn, start, end, preds, effects, parse_operand):
+    """Forward binary32 stack spills within one decoded basic block.
+
+    At most four store locals and 32 instructions per proof. Every intervening
+    write (even a disjoint-looking pointer), ESP/subregister mutation, branch,
+    observer or unsupported effect kills the proof. Memory reads may alias the
+    spill: retaining the original store preserves their order and result.
+    No cross-join/backedge speculation or assumption of nonescaping stack.
+    """
+    stores, reloads, live = {}, {}, {}
+    for i in range(start, end):
+        if i != start and preds[i] != {i - 1}:
+            live.clear()
+        ins, e = fn.insns[i], effects[i]
+        ops = [parse_operand(o) for o in ins.ops]
+        stack = (ops[0] if len(ops) == 1 and ops[0].kind == 'mem' and
+                 ops[0].size == 32 and ops[0].base == 4 and
+                 ops[0].index is None and not ops[0].seg else None)
+        if ins.mnem == 'FLD' and stack is not None:
+            source = live.get(stack.disp)
+            if source is not None and i - source <= 32:
+                if source in stores or len(stores) < 4:
+                    stores[source] = f'stack_float_{source}_'
+                    reloads[i] = stores[source]
+        # Only audited instructions with read-only guest memory can intervene.
+        readonly = (e.kind in ('push', 'arithmetic', 'compare', 'copy', 'swap', 'sign') or
+                    (ins.mnem == 'FNSTSW' and ops and ops[0].kind == 'reg') or
+                    (e.kind == 'integer' and ins.mnem not in ('PUSH', 'POP') and
+                     (not ops or ops[0].kind != 'mem' or ins.mnem in ('CMP', 'TEST')) and
+                     (not ops or ops[0].kind != 'reg' or ops[0].reg != 4 or
+                      ins.mnem in ('CMP', 'TEST'))))
+        if not readonly:
+            live.clear()
+        if ins.mnem in ('FST', 'FSTP') and stack is not None:
+            live[stack.disp] = i
+    return stores, reloads
+
+
 class DataflowRegion(BranchRegion):
     """Reuse baseline arithmetic expressions, with complete copy metadata."""
     def __init__(self):
@@ -262,13 +301,14 @@ class DataflowRegion(BranchRegion):
         return lines
 
 
-def lower_function(fn, bodies, labels, dead, parse_operand, protected, cfg, image=None):
+def lower_function(fn, bodies, labels, dead, parse_operand, protected, cfg, image=None, forward_stack=False):
     """Plan from decoded effects, then emit bounded regions with full exits.
 
     Leave ordinary regions to the established pass. This stage is admitted
-    only where divisions, exchanges or copies previously cut local dataflow.
+    where divisions, exchanges or copies previously cut local dataflow, or where
+    a supported stack reload can be forwarded.
     """
-    if not any(ins.mnem in EXTRA or
+    if not forward_stack and not any(ins.mnem in EXTRA or
                (ins.mnem in ('FLD', 'FST', 'FSTP') and
                 any(parse_operand(o).kind == 'st' for o in ins.ops)) for ins in fn.insns):
         return dict(bodies), set(), 0
@@ -313,7 +353,10 @@ def lower_function(fn, bodies, labels, dead, parse_operand, protected, cfg, imag
             ranges.append((a, b))
     result, consumed, count = dict(bodies), set(), 0
     for a, b in sorted(ranges):
-        if b - a > MAX_INSTRUCTIONS or not any(
+        if b - a > MAX_INSTRUCTIONS:
+            continue
+        stores, reloads = stack_forwarding(fn, a, b, preds, effects, parse_operand) if forward_stack else ({}, {})
+        if not reloads and not any(
                 fn.insns[i].mnem in EXTRA or effects[i].kind == 'copy' for i in range(a, b)):
             continue
         plan = solve(a, b, effects, succ)
@@ -323,12 +366,33 @@ def lower_function(fn, bodies, labels, dead, parse_operand, protected, cfg, imag
         for i in range(a, b):
             region.top, region.single = plan.tops[i], set(plan.widths[i])
             region.lines = []
-            if not region.append_effect(i, bodies[i], fn.insns[i], effects[i]):
+            body = list(bodies[i])
+            if i in stores:
+                # Capture the existing fto_float result, preserving CW rounding,
+                # signaling-NaN conversion and the actual guest write.
+                from translate import addr_expr
+                operand = parse_operand(fn.insns[i].ops[0])
+                if not any('wrf32(' + addr_expr(operand) + ', fto_float(c, ST(c, 0))' in line for line in body):
+                    break
+                body = [re.sub(r'(wrf32\(.*?, )(fto_float\(c, ST\(c, 0\)\))',
+                               lambda m: m[1] + '(' + stores[i] + ' = ' + m[2] + ')', line)
+                        for line in body]
+                if not any(stores[i] in line for line in body):
+                    break
+            if i in reloads:
+                from translate import addr_expr
+                operand = parse_operand(fn.insns[i].ops[0])
+                expr = 'rdf32(' + addr_expr(operand) + ')'
+                if not any(expr in line for line in body):
+                    break
+                body = [line.replace(expr, reloads[i]) for line in body]
+            if not region.append_effect(i, body, fn.insns[i], effects[i]):
                 break
             rewritten[i] = region.lines
         if len(rewritten) != b - a or region.writes < 3:
             continue
         lines = region.declarations(fn.insns[a].addr)
+        lines.extend(f"float {name};" for name in stores.values())
         for i in range(a, b):
             addr = fn.insns[i].addr
             if addr in labels or i == a:

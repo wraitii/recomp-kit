@@ -149,6 +149,14 @@ static int compare(void) {
                 if ((required_match_mask & (1u << mode)) && different) {
                     fprintf(stderr, "FAIL %s mode=%u seed=%u memory=%d\n", case_names[f], mode, n,
                             mem_diff);
+                    for (unsigned k = 0; k < sizeof output; k++)
+                        if (output[k] != g_mem[0x10000 + k])
+                            fprintf(stderr, "memory +%x: %02x / %02x\n", k, output[k],
+                                    g_mem[0x10000 + k]);
+                    for (unsigned k = 0; k < sizeof actual; k++)
+                        if (((uint8_t *)&reference)[k] != ((uint8_t *)&actual)[k])
+                            fprintf(stderr, "CPU +%x: %02x / %02x\n", k, ((uint8_t *)&reference)[k],
+                                    ((uint8_t *)&actual)[k]);
                     return 1;
                 }
             }

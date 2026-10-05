@@ -172,6 +172,8 @@ EXTRA_ENTRY_POINTS = frozenset()
 RESUMABLE_STACKS = False
 X87_LOCALS = False
 X87_DATAFLOW = False
+X87_STACK_FORWARDING = False
+DECODED_DATAFLOW = False
 CPU_LOCALS = False
 FUNCTION_ALIGNMENT = 16
 
@@ -210,11 +212,13 @@ def configure_module(cfg, key):
     reads, no curated symbols (those describe the executable)."""
     global LISTINGS, FUNCS_TSV, BINARY, CURATED, ANIMATION_COUNTER, VISUAL_ANIMATION_READS
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT, SYMBOL_PREFIX, AUX_MODULE
-    global RESUMABLE_STACKS, X87_LOCALS, X87_DATAFLOW, CPU_LOCALS
+    global RESUMABLE_STACKS, X87_LOCALS, X87_DATAFLOW, X87_STACK_FORWARDING, DECODED_DATAFLOW, CPU_LOCALS
     configure_intrinsics({"translate": {"intrinsics": {}}})
     RESUMABLE_STACKS = cfg["translate"].get("resumable_stacks", False)
     X87_LOCALS = cfg["translate"].get("x87_locals", False)
     X87_DATAFLOW = cfg["translate"].get("x87_dataflow", False)
+    X87_STACK_FORWARDING = cfg["translate"].get("x87_stack_forwarding", False)
+    DECODED_DATAFLOW = cfg["translate"].get("decoded_dataflow", False)
     CPU_LOCALS = cfg["translate"].get("cpu_locals", False)
     mods = {m["key"]: m for m in cfg.get("aux_modules", [])}
     if key not in mods:
@@ -262,10 +266,12 @@ def configure(cfg):
     ANIMATION_COUNTER = cfg["translate"]["animation_counter"]
     VISUAL_ANIMATION_READS = frozenset(cfg["translate"].get("volatile_reads", ()))
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT
-    global RESUMABLE_STACKS, X87_LOCALS, X87_DATAFLOW, CPU_LOCALS
+    global RESUMABLE_STACKS, X87_LOCALS, X87_DATAFLOW, X87_STACK_FORWARDING, DECODED_DATAFLOW, CPU_LOCALS
     RESUMABLE_STACKS = cfg["translate"].get("resumable_stacks", False)
     X87_LOCALS = cfg["translate"].get("x87_locals", False)
     X87_DATAFLOW = cfg["translate"].get("x87_dataflow", False)
+    X87_STACK_FORWARDING = cfg["translate"].get("x87_stack_forwarding", False)
+    DECODED_DATAFLOW = cfg["translate"].get("decoded_dataflow", False)
     CPU_LOCALS = cfg["translate"].get("cpu_locals", False)
     EXTRA_ENTRY_POINTS = frozenset(int(a) for a in cfg["translate"].get("entry_points", ()))
     FUNCTION_ALIGNMENT = cfg["translate"].get("function_alignment", 16)
@@ -881,7 +887,7 @@ FCMOVCC = {"FCMOV" + k: COND[v] for k, v in (
     ("NB", "NB"), ("NE", "NE"), ("NBE", "NBE"), ("NU", "NP"))}
 
 ARITH_ALL = ALL_FLAGS
-LOGIC_DEF = ALL_FLAGS           # AF is architecturally undefined; treat as killed
+LOGIC_DEF = ALL_FLAGS - {"af"}  # Runtime logical operations preserve undefined AF.
 INCDEC_DEF = frozenset(("zf", "sf", "of", "pf", "af"))
 
 #: A shift or rotate with a zero count leaves every flag untouched, so it only
@@ -3085,10 +3091,18 @@ class Translator(object):
             entries = [e for e in entries if e in fn.index]
         fn.return_jumps = self.popped_return_jumps(fn, entries)
         fn.seh_escapes = self.seh_escaping_returns(fn)
+        decoded = getattr(self.opts, "decoded_dataflow", DECODED_DATAFLOW) and not self.opts.eager_flags
         if self.opts.eager_flags:
             live_out = [ALL_FLAGS] * len(fn.insns)
         else:
             live_out = self.liveness(fn)
+        if decoded:
+            from decoded_dataflow import flag_liveness
+            planned = flag_liveness(self, fn)
+            if planned is not None:
+                live_out = planned
+            else:
+                decoded = False
         dead = self.dead_after_noreturn(fn, entries)
         fn.dead_addrs = {fn.insns[i].addr for i in dead}
         self.dead_after_noreturn_addrs.update(fn.dead_addrs)
@@ -3158,7 +3172,22 @@ class Translator(object):
             if head:
                 out.append("    goto L_%08x;" % fn.addr)
         prologue = len(out)          # everything emitted so far is dispatch
+        if decoded:
+            # Conditional eager/optimized host recipes must still expose the
+            # actual guest entry before their preprocessor directive, even
+            # when the CPU-local budget admits no cached fields.
+            labels.add(fn.addr)
         bodies = {i: self.emit(fn, i, live_out[i]) for i in range(len(fn.insns)) if i not in dead}
+        if decoded:
+            conservative = [ALL_FLAGS] * len(fn.insns)
+            for i in bodies:
+                stats = self.stats.copy()
+                eager = self.emit(fn, i, conservative[i])
+                self.stats = stats
+                if eager != bodies[i]:
+                    bodies[i] = ['#if defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS',
+                                 *eager, '#else', *bodies[i], '#endif']
+            self.stats['_decoded_dataflow_functions'] += 1
         if getattr(self.opts, "x87_locals", X87_LOCALS):
             consumed = set()
             if getattr(self.opts, "x87_dataflow", X87_DATAFLOW):
@@ -3166,7 +3195,8 @@ class Translator(object):
                 bodies, consumed, regions = lower_function(
                     fn, bodies, labels, dead, parse_operand,
                     VISUAL_ANIMATION_READS | frozenset(INSTRUCTION_PATCHES),
-                    (self.successors, self.branch_target, JCC, entries), self.image)
+                    (self.successors, self.branch_target, JCC, entries), self.image,
+                    getattr(self.opts, "x87_stack_forwarding", X87_STACK_FORWARDING))
                 self.stats["_x87_dataflow_regions"] += regions
                 self.stats["_x87_dataflow_instructions"] += len(consumed)
                 self.stats["_x87_dataflow_functions"] += bool(regions)
@@ -3181,7 +3211,7 @@ class Translator(object):
         cpu_publish = []
         if getattr(self.opts, "cpu_locals", CPU_LOCALS):
             from cpu_locals import lower_function
-            bodies, declarations, cpu_publish, fields = lower_function(bodies)
+            bodies, declarations, cpu_publish, fields = lower_function(bodies, decoded)
             # Initialize before the alternate-entry switch or any head jump.
             out[1:1] = ["    " + line for line in declarations]
             prologue += len(declarations)

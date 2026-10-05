@@ -58,6 +58,13 @@ CASES = {
 }
 
 DATAFLOW_CASES = {
+    # A casted bitwise operand makes this whole x87 region opaque to CPU
+    # scalarization. Both branch edges must refresh changed eager registers.
+    "opaque_region_exit": ["MOV ECX,3", "TEST EAX,EAX", "FLD float ptr [ESI]",
+                           "FLD ST0", "FDIV float ptr [EDI]", "MOV EAX,dword ptr [ESI]",
+                           "MOV ECX,dword ptr [EDI]", "TEST AH,0x41", "JZ 0x0010000b",
+                           "FSTP float ptr [EBX]", "FSTP float ptr [EBX + 4]",
+                           "ADD EAX,ECX", "CALL 0x00200000", "RET"],
     "division_chain": ["FLD float ptr [ESI]", "FDIV float ptr [EDI]",
                        "MOV EAX,dword ptr [ESI + 4]", "FST float ptr [EBX]",
                        "FLD ST0", "FMUL float ptr [ESI]", "FSTP float ptr [EBX + 4]",
@@ -95,14 +102,48 @@ DATAFLOW_CASES = {
 }
 
 
-def emit(name, lines, mode, x87_dataflow=False):
+# Binary32 reloads retain the rounded spill, including when inputs alias it.
+STACK_CASES = {
+    "rounded_stack": ["FLD float ptr [ESI]", "FDIV float ptr [EDI]",
+                      "FST float ptr [ESP + 12]", "FMUL float ptr [ESI + 4]",
+                      "FLD float ptr [ESP + 12]", "FMUL float ptr [EDI + 4]",
+                      "FLD float ptr [ESP + 12]", "FSTP float ptr [EBX]",
+                      "FSTP float ptr [EBX + 4]", "FSTP float ptr [EBX + 8]", "RET"],
+    "unaligned_stack": ["FLD float ptr [ESI]", "FDIV float ptr [EDI]",
+                        "FST float ptr [ESP + 13]", "FMUL float ptr [ESI + 4]",
+                        "FLD float ptr [ESP + 13]", "FMUL float ptr [EDI + 4]",
+                        "FSTP float ptr [EBX]", "FSTP float ptr [EBX + 4]", "RET"],
+    "stack_read_alias": ["LEA ESI,[ESP + 13]", "FLD float ptr [EDI]",
+                         "FST float ptr [ESP + 12]", "FMUL float ptr [ESI]",
+                         "FLD float ptr [ESP + 12]", "FMUL float ptr [EDI + 4]",
+                         "FSTP float ptr [EBX]", "FSTP float ptr [EBX + 4]", "RET"],
+    # This partial write exposes signaling-NaN round trips. Keep the arithmetic
+    # and second store: optimized casts previously lost quieting at that store.
+    "stack_write_alias": ["LEA EDI,[ESP + 13]", "FLD float ptr [ESI]",
+                          "FST float ptr [ESP + 12]", "MOV byte ptr [EDI],AL",
+                          "FLD float ptr [ESP + 12]", "FMUL float ptr [ESI + 4]",
+                          "FSTP float ptr [EBX]", "FSTP float ptr [EBX + 4]", "RET"],
+    "stack_plane_loop": ["MOV EDX,3", "FLD float ptr [ESI]",
+                         "FSTP float ptr [ESP + 12]", "FLD float ptr [EDI]",
+                         "FCOMP float ptr [ESI]", "FLD float ptr [ESP + 12]",
+                         "FNSTSW AX", "FCOMP float ptr [EDI]", "TEST AH,1",
+                         "DEC EDX", "JNZ 0x00100001", "CALL 0x00200000", "RET"],
+    "stack_call_reload": ["FLD float ptr [ESI]", "FDIV float ptr [EDI]",
+                          "FST float ptr [ESP + 12]", "FLD float ptr [ESP + 12]",
+                          "FSTP float ptr [EBX]", "FSTP float ptr [EBX + 4]",
+                          "CALL 0x00200000", "FLD float ptr [ESP + 12]",
+                          "FMUL float ptr [EDI]", "FSTP float ptr [EBX]", "RET"],
+}
+
+
+def emit(name, lines, mode, x87_dataflow=False, decoded=False):
     """Exercise the complete driver, including entry adapters and RET emission."""
     insns = T.parse_listing_text("\n".join(f"{0x100000+i:08x}  {s}" for i, s in enumerate(lines)))
     fn = T.Function(0x100000, name, len(insns), insns)
     cpu, x87 = MODES[mode]
     tr = T.Translator(None, {fn.addr, 0x200000}, SimpleNamespace(
-        eager_flags=True, cpu_locals=cpu, x87_locals=x87,
-        x87_dataflow=x87_dataflow and x87))
+        eager_flags=not (decoded and mode == 2), cpu_locals=cpu, x87_locals=x87,
+        x87_dataflow=x87_dataflow and x87, x87_stack_forwarding=x87_dataflow and x87, decoded_dataflow=decoded and mode == 2))
     tr.prepare(fn)
     entries = (0x100001,) if name == "alternate" else ()
     code = "\n".join(tr.translate(fn, entries))
@@ -113,7 +154,7 @@ def emit(name, lines, mode, x87_dataflow=False):
     return code, f"{name}_{mode}_fn_{entry:08x}"
 
 
-def run_checks(out, cmake, jobs, x87_dataflow=False):
+def run_checks(out, cmake, jobs, x87_dataflow=False, decoded=False):
     """Compile via the build wrapper and compare mapped CPU/memory exits."""
     out.mkdir(parents=True, exist_ok=True)
     code = ['#include "x86.h"', 'void fixture_call(X86 *c);',
@@ -132,18 +173,18 @@ def run_checks(out, cmake, jobs, x87_dataflow=False):
         'void fixture_finish(void);', '#define FIXTURE_FINISH() fixture_finish()',
     ]
     functions = []
-    cases = {**CASES, **(DATAFLOW_CASES if x87_dataflow else {})}
+    cases = {**CASES, **({**DATAFLOW_CASES, **STACK_CASES} if x87_dataflow else {})}
     for name, lines in cases.items():
         symbols = []
         for mode in range(4):
-            body, symbol = emit(name, lines, mode, x87_dataflow)
+            body, symbol = emit(name, lines, mode, x87_dataflow, decoded)
             code.append(body)
             declarations.append(f"void {symbol}(X86 *);")
             symbols.append(symbol)
         functions.append("{" + ",".join(symbols) + "}")
     for mode in range(4):
         body, _ = emit("null_fault", ["MOV EAX,ECX", "ADD EAX,EDX", "XOR ECX,EAX",
-                                       "MOV EDX,dword ptr [0x10]", "RET"], mode)
+                                       "MOV EDX,dword ptr [0x10]", "RET"], mode, decoded=decoded)
         code.append(body)
     declarations += ["static const char *case_names[] = {" +
                      ",".join(f'"{name}"' for name in cases) + "};",

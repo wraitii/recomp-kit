@@ -476,6 +476,10 @@ def parse_args(argv, system=None):
     parser.add_argument("--corpus-trials", type=int, default=9)
     parser.add_argument("--corpus-x87-dataflow", action="store_true",
                         help="Try decoded x87 dataflow in the native-reference corpus")
+    parser.add_argument("--corpus-decoded-dataflow", action="store_true",
+                        help="Try whole-function decoded integer and flag dataflow")
+    parser.add_argument("--corpus-stack-forwarding", action="store_true",
+                        help="Try bounded guest-stack forwarding with decoded x87 dataflow")
     parser.add_argument("--corpus-llvm", type=Path, metavar="MANIFEST",
                         help="Build-only translator C/LLVM comparison using production compile commands")
     parser.add_argument("--corpus-llvm-sweep", type=Path, metavar="MANIFEST",
@@ -484,6 +488,8 @@ def parse_args(argv, system=None):
                         help="Build and run the isolated x87 local-value experiment")
     parser.add_argument("--cpu-locals-checks", action="store_true",
                         help="Build and run full-state CPU/x87 locals checks without benchmarks")
+    parser.add_argument("--decoded-dataflow-checks", action="store_true",
+                        help="Build/check decoded integer/flag dataflow with full outgoing state")
     parser.add_argument("--x87-dataflow-checks", action="store_true",
                         help="Build and run decoded x87 dataflow full-state checks")
     parser.add_argument("--x87-llvm-experiment", action="store_true",
@@ -538,7 +544,7 @@ def parse_args(argv, system=None):
     if (args.corpus_llvm or args.corpus_llvm_sweep) and any((args.stub, args.regenerate, args.config != "Release",
                                   args.preset != default_preset(system), args.target != "app",
                                   args.x87_llvm_experiment, args.corpus_fragments, args.cpu_locals_checks,
-                                  args.x87_dataflow_checks, args.corpus_x87_dataflow,
+                                  args.x87_dataflow_checks, args.decoded_dataflow_checks, args.corpus_x87_dataflow, args.corpus_stack_forwarding, args.corpus_decoded_dataflow,
                                   args.x87_llvm_function, args.allow_table_gaps,
                                   args.allow_unmodelled, args.discovered, args.forget)):
         parser.error("--corpus-llvm requires native Release defaults and no translation overrides")
@@ -546,13 +552,17 @@ def parse_args(argv, system=None):
         parser.error("LLVM comparison and sweep are separate modes")
     if args.function_corpus and any((args.regenerate, args.stub, args.corpus_llvm,
                                       args.corpus_llvm_sweep, args.corpus_fragments,
-                                      args.cpu_locals_checks, args.x87_dataflow_checks, args.x87_llvm_experiment,
+                                      args.cpu_locals_checks, args.x87_dataflow_checks, args.decoded_dataflow_checks, args.x87_llvm_experiment,
                                       args.x87_llvm_function, args.allow_unmodelled,
                                       args.allow_table_gaps, args.forget, args.discovered,
                                       args.config != "Release", args.target != "app")):
         parser.error("--function-corpus is an isolated native Release build mode")
     if args.corpus_x87_dataflow and not args.function_corpus:
         parser.error("--corpus-x87-dataflow requires --function-corpus")
+    if args.corpus_stack_forwarding and not (args.function_corpus and args.corpus_x87_dataflow):
+        parser.error("--corpus-stack-forwarding requires --function-corpus and --corpus-x87-dataflow")
+    if args.corpus_decoded_dataflow and not (args.function_corpus and args.corpus_x87_dataflow):
+        parser.error("--corpus-decoded-dataflow requires --function-corpus and --corpus-x87-dataflow")
     args.build_root = build_root_for(args.game_dir)
     return args, parser
 
@@ -565,7 +575,7 @@ def main():
         with buildlock.BuildLock(args.build_root.parent, "tools/build.py --function-corpus"):
             run_corpus(args.function_corpus, args.game_dir, args.build_root / "function-corpus",
                        cmake_tool("cmake"), args.jobs, args.corpus_checks,
-                       args.corpus_calls, args.corpus_trials, args.corpus_x87_dataflow)
+                       args.corpus_calls, args.corpus_trials, args.corpus_x87_dataflow, args.corpus_stack_forwarding, args.corpus_decoded_dataflow)
         return
     if args.corpus_llvm_sweep:
         from corpus.llvm_sweep import run_sweep
@@ -589,10 +599,10 @@ def main():
         from corpus.fragments.run import run_experiment
         run_experiment(args.build_root / "function-corpus-fragments", cmake_tool("cmake"), args.jobs)
         return
-    if args.cpu_locals_checks or args.x87_dataflow_checks:
+    if args.cpu_locals_checks or args.x87_dataflow_checks or args.decoded_dataflow_checks:
         from experiments.cpu_locals.run import run_checks
-        name = "x87-dataflow-checks" if args.x87_dataflow_checks else "cpu-locals-checks"
-        run_checks(args.build_root / name, cmake_tool("cmake"), args.jobs, args.x87_dataflow_checks)
+        name = "decoded-dataflow-checks" if args.decoded_dataflow_checks else ("x87-dataflow-checks" if args.x87_dataflow_checks else "cpu-locals-checks")
+        run_checks(args.build_root / name, cmake_tool("cmake"), args.jobs, args.x87_dataflow_checks or args.decoded_dataflow_checks, args.decoded_dataflow_checks)
         return
     cfg = game_config.load(args.game_dir)
     # Regenerating needs the game and its listings.

@@ -220,6 +220,27 @@
 ||||||| parent of 3edaa15 (Consolidate codegen experiments into native-reference corpus tools)
 ||||||| parent of aa07dfe (Allow reviewed direct callees in function corpus)
 ||||||| parent of ab04cac (Add opt-in decoded x87 dataflow lowering)
+||||||| parent of 2980029 (Add bounded decoded flag dataflow and rounded stack forwarding)
+- Add opt-in `[translate] decoded_dataflow = true` (requires `cpu_locals` and
+  `x87_dataflow`): bounded decoded flag analysis crosses ordinary loads and
+  audited x87 instructions, retaining all outgoing flags and opaque call state.
+  Branch-heavy functions carry up to six GPR locals alongside deferred flags;
+  null-check builds use eager flag definitions. Evaluate with
+  `--corpus-decoded-dataflow` or `--decoded-dataflow-checks`.
+- Refresh CPU locals on branch exits from opaque multi-instruction regions,
+  preventing later publication from overwriting the region's eager updates.
+  Preserve runtime AF through logical instructions in flag liveness, and make
+  the corpus eager comparison emit every flag rather than optimized recipes.
+
+- Add experimental `[translate] x87_stack_forwarding = true` (requires
+  `x87_dataflow`): bounded binary32 spill/reload proofs retain guest stores,
+  float-store rounding and all outgoing state. Calls, joins, possible writes
+  and ESP mutations stop forwarding. `--corpus-stack-forwarding` evaluates it
+  alongside `--corpus-x87-dataflow`; production defaults remain off.
+- Preserve signaling-NaN quieting in float stores when optimized x87 locals
+  allow the compiler to cancel float/double round trips. Native full-state
+  fixtures cover partial stack aliases and retained outgoing spill bytes.
+
 - Add experimental `[translate] x87_dataflow = true` (requires `x87_locals`):
   decoded TOP/width/write analysis carries x87 copies, exchanges and division
   through bounded CFG regions, retaining exact metadata and full state at

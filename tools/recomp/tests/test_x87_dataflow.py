@@ -122,3 +122,53 @@ def test_config_is_boolean_and_requires_existing_local_mode(tmp_path):
         (tmp_path / 'game.toml').write_text(text.replace('[translate]', '[translate]\nx87_dataflow = ' + setting))
         with pytest.raises(ValueError, match=message):
             T.game_config.load(tmp_path)
+
+
+def forward(lines, entries=(), gap=None):
+    insns = T.parse_listing_text('\n'.join(f'{0x100000+i:08x}  {s}' for i, s in enumerate(lines)))
+    fn = T.Function(0x100000, 'forward', len(insns), insns)
+    tr = T.Translator(None, {fn.addr, 0x200000}, SimpleNamespace(
+        eager_flags=True, cpu_locals=False, x87_locals=True, x87_dataflow=True,
+        x87_stack_forwarding=True))
+    tr.prepare(fn)
+    if gap is not None:
+        fn.contiguous[gap] = False
+        fn.fallthrough[gap] = fn.insns[gap + 1].addr
+    return '\n'.join(tr.translate(fn, entries))
+
+
+SPILL = ['FLD double ptr [ESI]', 'FST float ptr [ESP + 12]']
+RELOAD = ['FLD float ptr [ESP + 12]', 'FMUL float ptr [EDI]',
+          'FSTP float ptr [EBX]', 'FSTP ST0', 'RET']
+
+
+def test_stack_forwarding_keeps_rounding_store_and_reloads_rounded_value():
+    body = forward([*SPILL, 'FMUL float ptr [EDI]', *RELOAD])
+    assert 'stack_float_1_ = fto_float(&x87_env_,' in body
+    assert 'wrf32((c->r[4] + 0xcu), (stack_float_1_' in body
+    assert '(double)stack_float_1_' in body
+    assert 'rdf32((c->r[4] + 0xcu))' not in body
+
+
+@pytest.mark.parametrize('barrier', ['MOV byte ptr [EDI],AL', 'FST float ptr [EDI]',
+    'ADD ESP,4', 'MOV SP,AX', 'PUSH EAX', 'POP EDX', 'CALL 0x00200000',
+    'FLDCW word ptr [EDI]', 'FNSTSW word ptr [EDI]'])
+def test_stack_forwarding_refuses_alias_writes_stack_mutations_and_observers(barrier):
+    assert 'stack_float_' not in forward([*SPILL, barrier, *RELOAD])
+
+
+def test_stack_forwarding_refuses_external_entries_gaps_and_proof_budget():
+    lines = [*SPILL, *RELOAD]
+    assert 'stack_float_' not in forward(lines, entries=(0x100002,))
+    assert 'stack_float_' not in forward(lines, gap=1)
+    assert 'stack_float_' not in forward([*SPILL, *(['NOP'] * 33), *RELOAD])
+    # A branch into the reload skips the spill; no cross-join proof.
+    assert 'stack_float_' not in forward(['TEST EAX,EAX', 'JZ 0x00100004', *SPILL, *RELOAD])
+
+
+def test_stack_forwarding_config_requires_dataflow(tmp_path):
+    text = (Path(__file__).resolve().parents[3] / 'games/stub/game.toml').read_text()
+    for value, message in [('"yes"', 'must be a boolean'), ('true', 'requires x87_dataflow')]:
+        (tmp_path / 'game.toml').write_text(text.replace('[translate]', '[translate]\nx87_stack_forwarding = ' + value))
+        with pytest.raises(ValueError, match=message):
+            T.game_config.load(tmp_path)

@@ -1507,6 +1507,17 @@ static inline void x87_frstor(X86 *c, uint32_t a) {
 static inline float fto_float(const X86 *c, double v) {
     unsigned rc = (c->fpu_cw >> 10) & 3u;
     float f = (float)v;
+    /* A float load followed by double widening and float narrowing must quiet
+     * an sNaN as the eager host conversion does. Optimizers can otherwise
+     * cancel the casts when the double is local, retaining a signaling payload
+     * in guest FST memory even though the widened x87 slot is quiet. */
+    if (v != v) {
+        uint32_t bits;
+        memcpy(&bits, &f, sizeof bits);
+        bits |= 0x00400000u;
+        memcpy(&f, &bits, sizeof f);
+        return f;
+    }
     double back;
     if (rc == 0 || v != v || isinf(v) || (double)f == v)
         return f;
