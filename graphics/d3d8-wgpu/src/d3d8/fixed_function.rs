@@ -445,8 +445,15 @@ fn vs_rhw_main(in: VertexInputRhw) -> VertexOutput {
     // rhw != 0: w = 1/rhw, so the rasterizer's perspective division and
     // perspective-correct texture interpolation reproduce D3D's pre-transformed
     // path. rhw == 0 keeps the orthographic w = 1 (the D3D7 logo quad).
+    // DIVERGENCE(original): a negative rhw (a vertex behind the eye, as written
+    // by `ProcessVertices`, which keeps the sign of 1/clip.w) keeps its sign, so
+    // `ndc * w` rebuilds the exact clip-space position and the rasterizer clips
+    // triangles that straddle the eye plane against the near plane. Forcing
+    // `w = 1` for rhw <= 0 mirrored those vertices to enormous screen positions
+    // (terrain "curtains"). The original runtime's behaviour for such triangles
+    // is not evidenced; this is the geometric clip the game's terrain needs.
     var w = 1.0;
-    if (in.position.w > 0.0) {
+    if (in.position.w != 0.0) {
         w = 1.0 / in.position.w;
     }
     out.position = vec4<f32>(ndc_x * w, ndc_y * w, in.position.z * w, w);
@@ -938,8 +945,15 @@ fn vs_rhw_main(in: VertexInputRhw) -> VertexOutput {
     // rhw != 0: w = 1/rhw, so the rasterizer's perspective division and
     // perspective-correct texture interpolation reproduce D3D's pre-transformed
     // path. rhw == 0 keeps the orthographic w = 1 (the D3D7 logo quad).
+    // DIVERGENCE(original): a negative rhw (a vertex behind the eye, as written
+    // by `ProcessVertices`, which keeps the sign of 1/clip.w) keeps its sign, so
+    // `ndc * w` rebuilds the exact clip-space position and the rasterizer clips
+    // triangles that straddle the eye plane against the near plane. Forcing
+    // `w = 1` for rhw <= 0 mirrored those vertices to enormous screen positions
+    // (terrain "curtains"). The original runtime's behaviour for such triangles
+    // is not evidenced; this is the geometric clip the game's terrain needs.
     var w = 1.0;
-    if (in.position.w > 0.0) {
+    if (in.position.w != 0.0) {
         w = 1.0 / in.position.w;
     }
     out.position = vec4<f32>(ndc_x * w, ndc_y * w, in.position.z * w, w);

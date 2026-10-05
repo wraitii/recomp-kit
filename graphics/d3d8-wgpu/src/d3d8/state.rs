@@ -180,6 +180,10 @@ struct RenderStates {
     dest_blend: D3DBLEND,
     cull_mode: D3DCULL,
     z_func: D3DCMPFUNC,
+    /// `D3DRS_ZBIAS`, an integer in D3D8's documented 0..=16 range. The unit is
+    /// the smallest depth increment, applied by the rasterizer as a constant
+    /// bias toward the viewer (positive D3D8 values bring geometry forward).
+    z_bias: u32,
     alpha_ref: u32,
     alpha_func: D3DCMPFUNC,
     dither_enable: bool,
@@ -231,6 +235,7 @@ impl RenderStates {
             dest_blend: D3DBLEND::Zero,
             cull_mode: D3DCULL::Ccw,
             z_func: D3DCMPFUNC::LessEqual,
+            z_bias: 0,
             alpha_ref: 0,
             alpha_func: D3DCMPFUNC::Always,
             dither_enable: false,
@@ -409,6 +414,17 @@ impl DeviceState {
             Rs::DestBlend => self.states.dest_blend = D3DBLEND::from_raw(value)?,
             Rs::CullMode => self.states.cull_mode = D3DCULL::from_raw(value)?,
             Rs::ZFunc => self.states.z_func = D3DCMPFUNC::from_raw(value)?,
+            Rs::ZBias => {
+                // D3D8 documents an integer 0..=16. A value outside that is a
+                // named refusal rather than a silently truncated bias.
+                if value > 16 {
+                    return Err(RenderError::new(
+                        "d3d8::state::set_render_state",
+                        format!("D3DRS_ZBIAS = {value:#010x} is outside D3D8's 0..16 range"),
+                    ));
+                }
+                self.states.z_bias = value;
+            }
             Rs::AlphaRef => self.states.alpha_ref = value,
             Rs::AlphaFunc => self.states.alpha_func = D3DCMPFUNC::from_raw(value)?,
             Rs::DitherEnable => {
@@ -788,7 +804,7 @@ impl DeviceState {
             )
         };
         format!(
-            "lighting={} colorvertex={} fog={} fogcolor={:#010x} fogtable={} fogvertex={} rangefog={} fogstart={} fogend={} fogdensity={} z={:?} zwrite={} zfunc={:?} alpha_test={} dither={} specular={} stencil={} clip={} fill={:?} shade={:?} cull={:?} blend={} src={:?} dst={:?} blendop={:?} {} {}",
+            "lighting={} colorvertex={} fog={} fogcolor={:#010x} fogtable={} fogvertex={} rangefog={} fogstart={} fogend={} fogdensity={} z={:?} zwrite={} zfunc={:?} zbias={} alpha_test={} dither={} specular={} stencil={} clip={} fill={:?} shade={:?} cull={:?} blend={} src={:?} dst={:?} blendop={:?} {} {}",
             s.lighting,
             s.color_vertex,
             s.fog_enable,
@@ -802,6 +818,7 @@ impl DeviceState {
             s.z_enable,
             s.z_write_enable,
             s.z_func,
+            s.z_bias,
             s.alpha_test_enable,
             s.dither_enable,
             s.specular_enable,
@@ -850,6 +867,12 @@ impl DeviceState {
     /// `D3DRS_ZFUNC`.
     pub fn z_func(&self) -> D3DCMPFUNC {
         self.states.z_func
+    }
+
+    /// `D3DRS_ZBIAS` (0..=16 minimum-resolvable depth steps). Honoured by the
+    /// rasterizer as a constant depth bias toward the viewer.
+    pub fn z_bias(&self) -> u32 {
+        self.states.z_bias
     }
 
     /// `D3DRS_FOGENABLE`.
@@ -1146,7 +1169,7 @@ fn raw_state_reached(state: u32, value: u32) -> bool {
         | Ok(Rs::Wrap5) | Ok(Rs::Wrap6) | Ok(Rs::Wrap7) => false,
         // States whose default value is a no-op: they only constrain the draw
         // once the guest asks for something the path does not implement.
-        Ok(Rs::ZBias) => value != 0,
+        // (D3DRS_ZBIAS is typed now and applied by the depth-stencil state.)
         Ok(Rs::ClipPlaneEnable) => value != 0,
         Ok(Rs::VertexBlend) => value != 0, // D3DVBF_DISABLE
         Ok(Rs::ColorWriteEnable) => value != 0x0000_000f, // RGBA channels
@@ -1572,10 +1595,31 @@ mod tests {
     fn stored_but_unhonoured_state_fails_the_draw() {
         let mut state = DeviceState::new(64, 64);
         configure_probe_states(&mut state);
-        state.set_render_state(47, 0x0000_0001).unwrap(); // D3DRS_ZBIAS
+        state.set_render_state(151, 1).unwrap(); // D3DRS_VERTEXBLEND
         let err = state.validate_unlit().unwrap_err();
         assert_eq!(err.operation, "d3d8::state::validate_unlit");
         assert!(err.cause.contains("not honoured"), "{}", err.cause);
+    }
+
+    #[test]
+    fn z_bias_is_stored_validated_and_honoured() {
+        let mut state = DeviceState::new(64, 64);
+        configure_probe_states(&mut state);
+        // D3D8's whole documented range is accepted and reaches the draw path.
+        for bias in 0..=16u32 {
+            state.set_render_state(47, bias).unwrap(); // D3DRS_ZBIAS
+            assert_eq!(state.z_bias(), bias);
+        }
+        // The bias is a real draw input, so the draw still validates.
+        state.set_render_state(47, 2).unwrap();
+        state.validate_unlit().unwrap();
+        assert!(state.draw_state_summary().contains("zbias=2"));
+        // Outside 0..=16 is a named set-time refusal.
+        let err = state.set_render_state(47, 17).unwrap_err();
+        assert_eq!(err.operation, "d3d8::state::set_render_state");
+        assert!(err.cause.contains("ZBIAS"), "{}", err.cause);
+        // A failed set leaves the previous value in place.
+        assert_eq!(state.z_bias(), 2);
     }
 
     #[test]

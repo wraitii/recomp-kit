@@ -272,6 +272,14 @@ void write_caps(uint32_t addr) {
     memset(gm_ptr(addr), 0, 212);
     wr32(addr, D8_DEVTYPE_HAL);
     wr32(addr + 12, 0x00080000u); // D3DCAPS2_CANRENDERWINDOWED
+    // DevCaps (+0x1c). Advertise hardware transform and lighting: a guest that
+    // gates its configurable T&L path on this bit otherwise forces the software
+    // fallback. The guest-side evidence and addresses live in the game
+    // repository's docs/engine-info.md.
+    //
+    // DIVERGENCE(original): only this one bit is advertised; the reference
+    // adapter reported its full DevCaps, which the shim does not model.
+    wr32(addr + 0x1c, D3DDEVCAPS_HWTRANSFORMANDLIGHT);
     // MaxTextureWidth/MaxTextureHeight (D3DCAPS8 +0x58/+0x5c). A game that
     // sizes textures against these (Ghost Recon's 0x004eac20 halves an image
     // until it fits) collapses every texture to 1x1 when they read 0. 2048 is

@@ -464,6 +464,7 @@ impl DeviceState {
             let stage = self.resolve_texture_stage(set as u32, true)?;
             *transform = (stage.tex_transform_flags, stage.tex_transform);
         }
+        let mut pv_trace = ProcessTrace::new(count);
         for i in 0..count {
             let begin = (src_start + i) * layout.stride;
             let vertex = &src[begin..begin + layout.stride];
@@ -472,6 +473,7 @@ impl DeviceState {
                 |offset: usize| f32::from_le_bytes(vertex[offset..offset + 4].try_into().unwrap());
             let clip = world_view_projection.transform([float(0), float(4), float(8), 1.0]);
             let w = clip[3];
+            pv_trace.record(i, w, [float(0), float(4), float(8)]);
             let rhw = if w != 0.0 && w.is_finite() {
                 1.0 / w
             } else {
@@ -507,7 +509,135 @@ impl DeviceState {
                 dst[offset + 4..offset + 8].copy_from_slice(&transformed[1].to_le_bytes());
             }
         }
+        pv_trace.finish(src_start, dest_index, dest_fvf);
+        trace_source_triangles(src, src_start, count, layout);
         Ok(())
+    }
+}
+
+/// Camera-independent check of the `ProcessVertices` *source* mesh: treats the
+/// stream as a triangle list and reports the triangles with the longest
+/// world-space edge (with each vertex's position, normal and uv), so bad mesh
+/// data can be told apart from projection artefacts. Same env var and line cap
+/// as `ProcessTrace`; one report per call, only when an edge exceeds 1000.
+fn trace_source_triangles(src: &[u8], src_start: usize, count: usize, layout: LitInput) {
+    static PRINTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let limit = ProcessTrace::limit();
+    if limit == 0 || PRINTED.load(std::sync::atomic::Ordering::Relaxed) >= limit {
+        return;
+    }
+    let f = |v: usize, off: usize| {
+        let b = (src_start + v) * layout.stride + off;
+        f32::from_le_bytes(src[b..b + 4].try_into().unwrap())
+    };
+    let pos = |v: usize| [f(v, 0), f(v, 4), f(v, 8)];
+    let dist = |a: [f32; 3], b: [f32; 3]| {
+        ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+    };
+    let mut worst: Vec<(f32, usize)> = Vec::new();
+    let mut over_1000 = 0usize;
+    let mut non_finite = 0usize;
+    for t in 0..count / 3 {
+        let (a, b, c) = (pos(t * 3), pos(t * 3 + 1), pos(t * 3 + 2));
+        let e = dist(a, b).max(dist(b, c)).max(dist(c, a));
+        if !e.is_finite() {
+            non_finite += 1;
+        } else if e > 1000.0 {
+            over_1000 += 1;
+            worst.push((e, t));
+        }
+    }
+    if over_1000 == 0 && non_finite == 0 {
+        return;
+    }
+    PRINTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+    eprintln!(
+        "[d3d8-trace] src_mesh src_start={src_start} count={count} tris={} edge>1000:{over_1000} non_finite:{non_finite}",
+        count / 3
+    );
+    for (e, t) in worst.iter().take(3) {
+        for k in 0..3 {
+            let v = t * 3 + k;
+            eprintln!(
+                "[d3d8-trace]   src_mesh tri={t} edge={e} v{k}(idx {v}) pos={:?} normal=[{},{},{}] uv=[{},{}]",
+                pos(v),
+                f(v, 12),
+                f(v, 16),
+                f(v, 20),
+                f(v, layout.uv_offset),
+                f(v, layout.uv_offset + 4)
+            );
+        }
+    }
+}
+
+/// `RECOMP_D3D8_TRACE_PROCESS_VERTICES=<max lines>` summarises each
+/// `ProcessVertices` call whose clip-space `w` is not safely positive
+/// (`w <= 0`, or `0 < w < 1`), to see whether the XYZRHW draws that later
+/// stretch across the screen were fed vertices at or behind the eye.
+struct ProcessTrace {
+    enabled: bool,
+    count: usize,
+    non_positive: usize,
+    tiny: usize,
+    min_w: f32,
+    min_at: usize,
+    min_pos: [f32; 3],
+}
+
+impl ProcessTrace {
+    fn limit() -> usize {
+        static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *LIMIT.get_or_init(|| {
+            std::env::var("RECOMP_D3D8_TRACE_PROCESS_VERTICES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        })
+    }
+
+    fn new(count: usize) -> Self {
+        Self {
+            enabled: Self::limit() > 0,
+            count,
+            non_positive: 0,
+            tiny: 0,
+            min_w: f32::INFINITY,
+            min_at: 0,
+            min_pos: [0.0; 3],
+        }
+    }
+
+    fn record(&mut self, index: usize, w: f32, pos: [f32; 3]) {
+        if !self.enabled {
+            return;
+        }
+        if w <= 0.0 || !w.is_finite() {
+            self.non_positive += 1;
+        } else if w < 1.0 {
+            self.tiny += 1;
+        }
+        if w < self.min_w {
+            self.min_w = w;
+            self.min_at = index;
+            self.min_pos = pos;
+        }
+    }
+
+    fn finish(&self, src_start: usize, dest_index: usize, dest_fvf: u32) {
+        static PRINTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if !self.enabled || (self.non_positive == 0 && self.tiny == 0) {
+            return;
+        }
+        if PRINTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= Self::limit() {
+            return;
+        }
+        eprintln!(
+            "[d3d8-trace] process_vertices src_start={src_start} dest_index={dest_index} \
+             dest_fvf=0x{dest_fvf:X} count={} w<=0:{} 0<w<1:{} min_w={} at={} src_pos={:?}",
+            self.count, self.non_positive, self.tiny, self.min_w, self.min_at, self.min_pos
+        );
     }
 }
 
@@ -830,6 +960,37 @@ mod tests {
         assert_eq!(f(4), 50.0);
         assert_eq!(f(8), 1.0);
         assert_eq!(f(12), 0.5);
+    }
+
+    #[test]
+    fn process_vertices_keeps_sign_of_rhw_behind_the_eye() {
+        let mut state = directional();
+        let mut projection = Mat4::IDENTITY;
+        projection.rows[2] = [0.0, 0.0, 1.0, 1.0];
+        projection.rows[3] = [0.0, 0.0, 0.0, 0.0];
+        state.projection = projection;
+        state.viewport = Viewport {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+            min_z: 0.0,
+            max_z: 1.0,
+        };
+        // Vertex at view z = -2: clip = (2, 0, -2, -2), so rhw = -0.5 and
+        // ndc = (-1, 0, 1). The XYZRHW shader rebuilds clip = ndc * (1/rhw).
+        let source = vertex_at_xyz_normal_tex1([2.0, 0.0, -2.0], [0.0, 0.0, 1.0], [0.0, 0.0]);
+        let mut dest = vec![0u8; 32];
+        state
+            .process_vertices(&source, 0, 1, LitInput::XYZ_NORMAL_TEX1, 0x01c4, 0, &mut dest)
+            .unwrap();
+        let f = |o: usize| f32::from_le_bytes(dest[o..o + 4].try_into().unwrap());
+        let (sx, sy, sz, rhw) = (f(0), f(4), f(8), f(12));
+        assert_eq!(rhw, -0.5);
+        let w = 1.0 / rhw;
+        let ndc_x = 2.0 * sx / 100.0 - 1.0;
+        let ndc_y = 1.0 - 2.0 * sy / 100.0;
+        assert_eq!((ndc_x * w, ndc_y * w, sz * w, w), (2.0, 0.0, -2.0, -2.0));
     }
 
     #[test]

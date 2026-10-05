@@ -84,6 +84,58 @@ fn blend_factor(factor: crate::d3d8::enums::D3DBLEND) -> Result<wgpu::BlendFacto
     })
 }
 
+/// `RECOMP_D3D8_SKIP_FVF=0x2C4,0x112` drops every draw with one of the listed
+/// FVFs. Diagnostic only: it bisects which pass produces an artefact and is
+/// never on by default.
+fn skipped_fvf(fvf: u32) -> bool {
+    static LIST: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("RECOMP_D3D8_SKIP_FVF")
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|t| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+    .contains(&fvf)
+}
+
+/// Map `D3DRS_ZBIAS` (D3D8's documented 0..=16 range) onto wgpu's constant
+/// depth bias. A guest uses it to separate coplanar overlay layers, so only a
+/// small monotonic bias is required.
+///
+/// D3D8 biases positive values toward the viewer; Wine's wined3d maps it to
+/// `glPolygonOffset(0, -zbias)`, the same convention. WebGPU/Vulkan add a
+/// positive constant away from the viewer, so the sign is negated. D3DRS_ZBIAS
+/// has no slope-scaled component, so `slope_scale` and `clamp` stay zero.
+///
+/// DIVERGENCE(original): the authored D3D8 ZBIAS step is driver-defined at the
+/// hardware level and cannot be recovered from the guest. One wgpu depth unit
+/// per ZBIAS step (the reference minimum-resolvable step) was observed to be
+/// too small in Railroad Tycoon 3: the CPU-projected (`ProcessVertices`) terrain
+/// and the GPU-transformed `0x142` overlay layers differ by more than that in
+/// depth rounding, so the overlays z-fight the ground. Measured in the running
+/// game (zoomed in, 1600x1200, D24X8): 64 units per step left patches, 256
+/// removed them. `ZBIAS_UNITS_PER_STEP` is that empirically chosen step;
+/// `RECOMP_D3D8_ZBIAS_SCALE=<n>` overrides it for experiments.
+const ZBIAS_UNITS_PER_STEP: i32 = 256;
+
+fn z_bias_state(z_bias: u32) -> wgpu::DepthBiasState {
+    static SCALE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    let scale = *SCALE.get_or_init(|| {
+        std::env::var("RECOMP_D3D8_ZBIAS_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(ZBIAS_UNITS_PER_STEP)
+    });
+    wgpu::DepthBiasState {
+        constant: -(z_bias as i32).saturating_mul(scale),
+        slope_scale: 0.0,
+        clamp: 0.0,
+    }
+}
+
 /// DIAGNOSTIC ONLY: opt-in cull override from `RECOMP_D3D8_CULL`. This exists
 /// to separate a bridge cull-winding bug from guest-side visibility culling in
 /// one windowed run; it deviates from faithful D3D8 behaviour and must not be
@@ -219,7 +271,7 @@ fn trace_draw(
     }
     let vp = state.viewport;
     eprintln!(
-        "[d3d8-trace]   viewport=({},{}) {}x{} z=[{},{}] z_enable={} z_write={} z_func={:?}",
+        "[d3d8-trace]   viewport=({},{}) {}x{} z=[{},{}] z_enable={} z_write={} z_func={:?} z_bias={}",
         vp.x,
         vp.y,
         vp.width,
@@ -228,7 +280,8 @@ fn trace_draw(
         vp.max_z,
         state.z_enable(),
         state.z_write_enable(),
-        state.z_func()
+        state.z_func(),
+        state.z_bias()
     );
     eprintln!(
         "[d3d8-trace]   cull={:?} blend={} src={:?} dst={:?}",
@@ -297,8 +350,10 @@ fn trace_draw(
         let mut max = [f32::NEG_INFINITY; 2];
         let mut sum = [0.0f64; 2];
         let mut n = 0u64;
-        for i in 0..vertex_count as usize {
-            let off = (start_vertex as usize + i) * stride;
+        // `vertex_count` is the absolute end vertex index (`start + 3*prims`),
+        // not a count: scan `start..vertex_count`.
+        for index in start_vertex as usize..vertex_count as usize {
+            let off = index * stride;
             if off + stride > bytes.len() {
                 break;
             }
@@ -328,6 +383,52 @@ fn trace_draw(
                 min[0], min[1], max[0], max[1], mean[0], mean[1]
             );
         }
+    }
+    // Longest triangle edge over the whole draw. A stale ring region, a vertex
+    // buffer read with the wrong stride, or a bad index expansion shows up as
+    // one triangle edge far longer than the mesh's normal spacing; printing the
+    // worst edge per draw attributes a "stretched triangle" to real vertex bytes
+    // instead of guessing. Diagnostic only.
+    if let Some(p) = attr(0) {
+        let po = p.offset as usize;
+        let pos_at = |index: usize| -> Option<[f32; 3]> {
+            let off = index * stride;
+            if off + stride > bytes.len() {
+                return None;
+            }
+            let v = &bytes[off..off + stride];
+            Some([f32_at(v, po), f32_at(v, po + 4), f32_at(v, po + 8)])
+        };
+        let mut worst = 0.0f64;
+        let mut worst_tri = start_vertex as usize;
+        let mut worst_pair = ([0.0f32; 3], [0.0f32; 3]);
+        let mut tri = start_vertex as usize;
+        while tri + 2 < vertex_count as usize {
+            if let (Some(a), Some(b), Some(c)) = (pos_at(tri), pos_at(tri + 1), pos_at(tri + 2)) {
+                for (p, q) in [(a, b), (b, c), (c, a)] {
+                    let d = f64::from(p[0] - q[0]).powi(2)
+                        + f64::from(p[1] - q[1]).powi(2)
+                        + f64::from(p[2] - q[2]).powi(2);
+                    if d > worst {
+                        worst = d;
+                        worst_tri = tri;
+                        worst_pair = (p, q);
+                    }
+                }
+            }
+            tri += 3;
+        }
+        eprintln!(
+            "[d3d8-trace]   max_edge={:.3} tri_v={} a=({},{},{}) b=({},{},{})",
+            worst.sqrt(),
+            worst_tri,
+            worst_pair.0[0],
+            worst_pair.0[1],
+            worst_pair.0[2],
+            worst_pair.1[0],
+            worst_pair.1[1],
+            worst_pair.1[2]
+        );
     }
 }
 
@@ -876,6 +977,7 @@ struct DrawPipelineKey {
     z_enable: bool,
     z_write: bool,
     z_func: u32,
+    z_bias: u32,
     blend: u32,
     cull: u32,
 }
@@ -1363,12 +1465,13 @@ impl Device {
         } else {
             (wgpu::CompareFunction::Always, false)
         };
+        let bias = z_bias_state(self.state.z_bias());
         Some(wgpu::DepthStencilState {
             format: depth.format,
             depth_write_enabled: write,
             depth_compare: compare,
             stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
+            bias,
         })
     }
 
@@ -1533,6 +1636,9 @@ impl Device {
         }
         self.draw_index += 1;
         self.frame_stats.draws += 1;
+        if skipped_fvf(fvf) {
+            return Ok(());
+        }
         // Survey mode records and skips a state/FVF/TSS rejection so one run
         // can enumerate every unsupported draw. Argument/range errors below
         // deliberately bypass this and stay hard failures.
@@ -1684,6 +1790,7 @@ impl Device {
             } else {
                 8
             },
+            z_bias: self.state.z_bias(),
             blend: self.blend_key(),
             cull: self.effective_cull_mode().raw(),
         };
@@ -2670,6 +2777,28 @@ mod tests {
         assert_eq!(created, 2);
         assert_eq!(cache.hits, 2);
         assert_eq!(cache.misses, 2);
+    }
+
+    #[test]
+    fn z_bias_maps_d3d8_steps_to_a_viewer_side_constant() {
+        use super::{z_bias_state, ZBIAS_UNITS_PER_STEP};
+        assert_eq!(z_bias_state(0), wgpu::DepthBiasState::default());
+        assert_eq!(
+            z_bias_state(1),
+            wgpu::DepthBiasState {
+                constant: -ZBIAS_UNITS_PER_STEP,
+                slope_scale: 0.0,
+                clamp: 0.0,
+            }
+        );
+        assert_eq!(
+            z_bias_state(16),
+            wgpu::DepthBiasState {
+                constant: -16 * ZBIAS_UNITS_PER_STEP,
+                slope_scale: 0.0,
+                clamp: 0.0,
+            }
+        );
     }
 
     #[test]

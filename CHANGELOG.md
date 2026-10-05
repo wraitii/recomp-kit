@@ -6,6 +6,30 @@
   key-state array for the en-US layout; dead keys and non-US layouts remain
   `SHIM(temporary)`.
 
+- D3D8 `D3DRS_ZBIAS` is now honoured instead of failing the draw as stored but
+  unapplied state. It is typed (validated to D3D8's 0..=16 range), part of the
+  draw-pipeline key, and mapped onto wgpu's constant depth bias: positive D3D8
+  values bias toward the viewer, matching wined3d's `glPolygonOffset(0, -zbias)`.
+  A guest uses small biases to separate coplanar overlay layers. The exact
+  hardware step was driver-defined; the step is 256 wgpu depth units per ZBIAS
+  level, chosen from observation in Railroad Tycoon 3 (64 left z-fighting
+  between CPU-projected terrain and GPU-transformed overlays, 256 cleared it)
+  and overridable with `RECOMP_D3D8_ZBIAS_SCALE` (DIVERGENCE).
+
+- D3D8 XYZRHW draws keep the sign of `rhw`: `ProcessVertices` writes
+  `rhw = 1/clip.w` including negative values for vertices behind the eye, and
+  the pre-transformed vertex shaders now rebuild `clip = ndc * (1/rhw)` instead
+  of forcing `w = 1` for `rhw < 0`, so wgpu clips triangles straddling the eye
+  plane against the near plane (DIVERGENCE; the original runtime's handling is
+  not evidenced). Fixes stretched terrain triangles when the camera is low.
+
+- D3D8 diagnostics: `RECOMP_D3D8_SKIP_FVF` drops draws by FVF,
+  `RECOMP_D3D8_TRACE_PROCESS_VERTICES` and `RECOMP_D3D8_TRACE_DRAWN_TRIS`
+  report ProcessVertices inputs with non-positive or tiny clip `w` and indexed
+  triangles with enormous edges.
+
+- D3D8 `GetDeviceCaps` advertises `D3DDEVCAPS_HWTRANSFORMANDLIGHT` in `DevCaps`.
+
 - D3D8 device-owned implicit surfaces and standalone depth-stencil surfaces.
   The implicit backbuffer/autodepth are now owned by the device and `Get*`
   returns an extra AddRef, so a guest that saves and releases those handles —

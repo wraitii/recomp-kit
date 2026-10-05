@@ -730,6 +730,11 @@ static void test_caps() {
         wr32(caps + i, 0xcdcdcdcd);
     check(call_method(device, 7, {caps}) == 0, "GetDeviceCaps succeeds");
     check(rd32(caps) == 1, "device type is D3DDEVTYPE_HAL");
+    // Railroad Tycoon 3's `__init_direct3d` (0x005492d0) keeps its configured
+    // hardware T&L state only when this bit is set; without it the engine
+    // forces the software `0x112`/`0x152` terrain fallback.
+    check((rd32(caps + 0x1c) & D3DDEVCAPS_HWTRANSFORMANDLIGHT) != 0,
+          "DevCaps advertises hardware transform and lighting");
     check(rd32(caps + 0x58) == 2048, "MaxTextureWidth is advertised");
     check(rd32(caps + 0x5c) == 2048, "MaxTextureHeight is advertised");
     // Guest 0x007c2160 sizes its texture stage setup from these; zero means

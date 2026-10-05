@@ -267,6 +267,7 @@ pub fn expand_indexed_into(
             }
         }
     };
+    trace_drawn_triangles(vertices, selected, index_size, &draw, triangle_count as usize);
     output.resize(size as usize, 0);
     for (t, dst) in output.chunks_exact_mut(draw.stride as usize).enumerate() {
         let at = source(t) * index_size;
@@ -276,6 +277,79 @@ pub fn expand_indexed_into(
         dst.copy_from_slice(&vertices[offset as usize..offset as usize + draw.stride as usize]);
     }
     Ok(())
+}
+
+/// `RECOMP_D3D8_TRACE_DRAWN_TRIS=<max reports>`: for indexed triangle-list
+/// draws, reports triangles whose longest edge over the first three floats of
+/// each vertex exceeds 5000 (world units for XYZ streams, pixels for XYZRHW),
+/// with the three raw index values and each vertex's first six floats, so a bad
+/// index can be told from a bad vertex. Indices are pre-`base_vertex`.
+fn trace_drawn_triangles(
+    vertices: &[u8],
+    selected: &[u8],
+    index_size: usize,
+    draw: &IndexedDraw,
+    triangle_count: usize,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static PRINTED: AtomicUsize = AtomicUsize::new(0);
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("RECOMP_D3D8_TRACE_DRAWN_TRIS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    });
+    if limit == 0 || draw.topology != 4 || PRINTED.load(Ordering::Relaxed) >= limit {
+        return;
+    }
+    let stride = draw.stride as usize;
+    let index = |i: usize| -> u32 {
+        let b = &selected[i * index_size..(i + 1) * index_size];
+        if index_size == 2 {
+            u32::from(u16::from_le_bytes(b.try_into().unwrap()))
+        } else {
+            u32::from_le_bytes(b.try_into().unwrap())
+        }
+    };
+    let floats = |idx: u32, n: usize| -> Vec<f32> {
+        let at = (idx as usize + draw.base_vertex as usize) * stride;
+        (0..n.min(stride / 4))
+            .map(|k| f32::from_le_bytes(vertices[at + k * 4..at + k * 4 + 4].try_into().unwrap()))
+            .collect()
+    };
+    let dist = |a: &[f32], b: &[f32]| {
+        (0..3.min(a.len()))
+            .map(|k| (a[k] - b[k]).powi(2))
+            .sum::<f32>()
+            .sqrt()
+    };
+    let mut bad = Vec::new();
+    for t in 0..triangle_count {
+        let ids = [index(t * 3), index(t * 3 + 1), index(t * 3 + 2)];
+        let p = [floats(ids[0], 3), floats(ids[1], 3), floats(ids[2], 3)];
+        let e = dist(&p[0], &p[1]).max(dist(&p[1], &p[2])).max(dist(&p[2], &p[0]));
+        if !(e <= 5000.0) {
+            bad.push((e, t, ids));
+        }
+    }
+    if bad.is_empty() {
+        return;
+    }
+    PRINTED.fetch_add(1, Ordering::Relaxed);
+    bad.sort_by(|a, b| b.0.total_cmp(&a.0));
+    eprintln!(
+        "[d3d8-trace] drawn_tris stride={stride} start_index={} min_index={} num_vertices={} base_vertex={} tris={triangle_count} edge>5000:{}",
+        draw.start_index, draw.min_index, draw.num_vertices, draw.base_vertex, bad.len()
+    );
+    for (e, t, ids) in bad.iter().take(3) {
+        eprintln!(
+            "[d3d8-trace]   drawn_tri {t} edge={e} idx={ids:?} v0={:?} v1={:?} v2={:?}",
+            floats(ids[0], 6),
+            floats(ids[1], 6),
+            floats(ids[2], 6)
+        );
+    }
 }
 
 #[cfg(test)]
