@@ -335,9 +335,11 @@ static void test_texture() {
     check(call_method(locked_tex, 2) == 0, "release the locked texture");
     check(heap_size(staged) == 0xffffffff, "destroying a locked level frees its staging block");
 
-    // An unrepresentable format fails without fabricating a texture.
+    // An unrepresentable format fails without fabricating a texture. DXT1 is
+    // representable now (compressed texture support), so use an unknown
+    // FourCC here.
     wr32(sc(0), 0xfeedface);
-    check(call_method(device2, 20, {4, 4, 1, 0, 0x31545844, 2, sc(0)}) == 0x8876086c,
+    check(call_method(device2, 20, {4, 4, 1, 0, 0xfeedface, 2, sc(0)}) == 0x8876086c,
           "an unrepresentable texture format is rejected");
     check(rd32(sc(0)) == 0, "failed CreateTexture clears the output pointer");
     call_method(device2, 2);
