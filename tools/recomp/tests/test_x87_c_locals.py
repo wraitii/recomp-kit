@@ -22,7 +22,7 @@ def translate(lines, enabled=True, entries=()):
 
 def test_full_state_and_rounding_not_dead_slot_normalization():
     body, tr = translate(DOT + ["FSTP float ptr [EBX]", "RET"])
-    assert body.count("fx87(c,") == 2
+    assert body.count("fx87(&x87_env_,") == 2
     assert "fpush(c," not in body and "fdrop(c);" not in body
     assert "st_bits[" in body and "st_exact[" in body
     assert "FTAG_EMPTY" in body and "c->st[" in body
@@ -48,6 +48,23 @@ def test_integer_accesses_keep_order_inside_region():
     assert body.count("local x87") == 1
     assert body.index("00100003 MOV") < body.index("00100004 MOV") < body.index("00100005 FSTP")
     assert body.index("00100005 FSTP") < body.index("c->st[")
+
+
+def test_binary32_arithmetic_requires_operand_provenance():
+    body, _ = translate(["FLD double ptr [ESI]", "FMUL float ptr [EDI]",
+                         "FADD float ptr [EDI + 4]", "FSTP float ptr [EBX]", "RET"])
+    # The first arithmetic consumes the wide input. Its PC=00 result then
+    # provides a proven binary32 operand for the second operation.
+    assert body.count("fx87_exact(&x87_env_,") == 1
+    assert "(x87_env_.fpu_cw & 0x300u) == 0u" in body
+
+
+def test_binary32_provenance_does_not_cross_a_join():
+    body, _ = translate([*DOT, "TEST EAX,EAX", "JZ 0x00100007",
+                         "FSTP float ptr [EBX]", "FLD double ptr [ESI]",
+                         "FMUL float ptr [EDI]", "FSTP float ptr [EBX]", "RET"])
+    # The join can receive the original narrow value or the replacement double.
+    assert body.count("fx87_exact(&x87_env_,") == 2
 
 
 def test_diamond_join_uses_scalar_slots_and_publishes_before_return():
@@ -88,8 +105,8 @@ def test_alternate_entry_and_branch_targets_start_new_regions():
 def test_virtual_top_for_status_and_eager_comparison():
     body, _ = translate(DOT + ["FNSTSW AX", "FCOMP float ptr [EDI]", "RET"])
     assert "fstsw(c)" not in body
-    assert "c->fpu_sw & (uint16_t)~0x3800u" in body
-    assert "fcom(c, x87_v2_" in body
+    assert "x87_env_.fpu_sw & (uint16_t)~0x3800u" in body
+    assert "fcom(&x87_env_, x87_v2_" in body
     assert "FTAG_EMPTY" in body
 
 

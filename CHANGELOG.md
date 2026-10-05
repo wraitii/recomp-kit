@@ -199,6 +199,16 @@
   it reading zeroed vertices, which flickered the front end.
 ||||||| parent of 80c8753 (Add shared scripted input to headless and desktop hosts)
 ||||||| parent of 699fd3a (Emit Samply frame markers in the headless presenter)
+||||||| parent of 0e1dd6f (Keep x87 control and status local and specialize binary32 arithmetic)
+- Keep x87 control/status in a nonescaping helper context within C local-value
+  regions, removing repeated CPU-field accesses across guest loads/stores and
+  integer register updates. Use existing arithmetic/comparison/conversion
+  helpers; FNSTSW sees local status and every exit publishes it. Interior faults
+  may see status from the preceding publication point (`x87-local-status`).
+  For PC=00 and proven binary32 operands, emit separate native float arithmetic
+  with existing NaN/status handling, retaining double-backed arithmetic for
+  other precision settings and unproven operands (`x87-binary32`).
+
 - Emit Samply frame spans from the headless presenter, including runs with
   `RECOMP_FRAME_EVERY=0`. Enabled under Samply or with `RECOMP_PROFILE_MARKERS=1`.
 

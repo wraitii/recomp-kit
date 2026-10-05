@@ -30,6 +30,8 @@ CASES = {
                      "FMUL float ptr [EDI + 0x4]", "FSTP float ptr [EBX + 0x4]"],
 }
 PRODUCTION_CASES = {
+    "binary64_input": ["FLD double ptr [ESI]", "FMUL float ptr [EDI]",
+                       "FADD float ptr [EDI + 4]", "FSTP float ptr [EBX]"],
     "compare_status": ["FLD float ptr [ESI]", "FMUL float ptr [EDI]", "FADD float ptr [EDI + 4]",
                        "FNSTSW AX", "FCOMP float ptr [EDI]"],
     "integer_boundary": ["FLD float ptr [ESI]", "FMUL float ptr [EDI]", "FADD float ptr [EDI + 4]",
