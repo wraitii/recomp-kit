@@ -492,7 +492,7 @@ pub fn decode_block_into(
         ));
     }
     out.clear();
-    out.reserve((width as usize) * (height as usize) * 4);
+    out.resize((width as usize) * (height as usize) * 4, 0);
     let mut block = [[0u8; 4]; 16];
     let block_cols = (width + 3) / 4;
     let block_rows = (height + 3) / 4;
@@ -516,7 +516,8 @@ pub fn decode_block_into(
                     if x >= width {
                         break;
                     }
-                    out.extend_from_slice(&block[(py * 4 + px) as usize]);
+                    let o = ((y * width + x) * 4) as usize;
+                    out[o..o + 4].copy_from_slice(&block[(py * 4 + px) as usize]);
                 }
             }
         }
