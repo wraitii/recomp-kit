@@ -115,6 +115,7 @@ def parse_results(output, rows, checks, calls, trials):
 def markdown(report):
     lines = ['# Function corpus report', '',
              f"Host: {report['host']}. Compiler: {report['compiler']}.", '',
+             f"Decoded x87 dataflow: {'enabled' if report.get('x87_dataflow') else 'disabled'}.", '',
              'Native is reviewed C plus its ABI adapter; kernel text is also shown separately.',
              'Translated/native-adapter times include entry reset and indirect-call overhead.',
              'Native-kernel times use the typed host ABI, without guest state/reset. No LTO, FMA or fast-math.',
@@ -139,7 +140,8 @@ def markdown(report):
     return '\n'.join(lines)
 
 
-def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, trials=9):
+def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, trials=9,
+               x87_dataflow=False):
     """Decode the selected instructions, build isolated variants, validate, report."""
     if checks < 1 or calls < 0 or trials < 3:
         raise ValueError('checks must be positive, calls nonnegative, trials at least three')
@@ -197,7 +199,8 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
         write_input(directory / 'original.bin', raw)
         for mode in MODES[:-1]:
             options = SimpleNamespace(eager_flags=False, cpu_locals=mode in ('cpu', 'combined'),
-                                      x87_locals=mode in ('x87', 'combined'))
+                                      x87_locals=mode in ('x87', 'combined'),
+                                      x87_dataflow=x87_dataflow and mode in ('x87', 'combined'))
             tr = T.Translator(image, set(functions), options)
             fn = T.Function(addr, name, size, insns)
             fn.measure(image)
@@ -287,6 +290,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
     import shlex
     compiler = compiler_rows[0].get('arguments', []) or shlex.split(compiler_rows[0]['command'])
     report = {'contract': spec['contract'], 'host': platform.platform(),
+              'x87_dataflow': x87_dataflow,
               'compiler': subprocess.check_output([compiler[0], '--version'], text=True).splitlines()[0],
               'compile_commands': compiler_rows, 'manifest_sha256': hashlib.sha256(manifest.read_bytes()).hexdigest(),
               'executable_sha256': cfg['game']['sha256'],

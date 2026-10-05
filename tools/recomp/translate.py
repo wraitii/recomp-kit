@@ -171,6 +171,7 @@ VISUAL_ANIMATION_READS = frozenset()
 EXTRA_ENTRY_POINTS = frozenset()
 RESUMABLE_STACKS = False
 X87_LOCALS = False
+X87_DATAFLOW = False
 CPU_LOCALS = False
 FUNCTION_ALIGNMENT = 16
 
@@ -209,10 +210,11 @@ def configure_module(cfg, key):
     reads, no curated symbols (those describe the executable)."""
     global LISTINGS, FUNCS_TSV, BINARY, CURATED, ANIMATION_COUNTER, VISUAL_ANIMATION_READS
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT, SYMBOL_PREFIX, AUX_MODULE
-    global RESUMABLE_STACKS, X87_LOCALS, CPU_LOCALS
+    global RESUMABLE_STACKS, X87_LOCALS, X87_DATAFLOW, CPU_LOCALS
     configure_intrinsics({"translate": {"intrinsics": {}}})
     RESUMABLE_STACKS = cfg["translate"].get("resumable_stacks", False)
     X87_LOCALS = cfg["translate"].get("x87_locals", False)
+    X87_DATAFLOW = cfg["translate"].get("x87_dataflow", False)
     CPU_LOCALS = cfg["translate"].get("cpu_locals", False)
     mods = {m["key"]: m for m in cfg.get("aux_modules", [])}
     if key not in mods:
@@ -260,9 +262,10 @@ def configure(cfg):
     ANIMATION_COUNTER = cfg["translate"]["animation_counter"]
     VISUAL_ANIMATION_READS = frozenset(cfg["translate"].get("volatile_reads", ()))
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT
-    global RESUMABLE_STACKS, X87_LOCALS, CPU_LOCALS
+    global RESUMABLE_STACKS, X87_LOCALS, X87_DATAFLOW, CPU_LOCALS
     RESUMABLE_STACKS = cfg["translate"].get("resumable_stacks", False)
     X87_LOCALS = cfg["translate"].get("x87_locals", False)
+    X87_DATAFLOW = cfg["translate"].get("x87_dataflow", False)
     CPU_LOCALS = cfg["translate"].get("cpu_locals", False)
     EXTRA_ENTRY_POINTS = frozenset(int(a) for a in cfg["translate"].get("entry_points", ()))
     FUNCTION_ALIGNMENT = cfg["translate"].get("function_alignment", 16)
@@ -3157,9 +3160,19 @@ class Translator(object):
         prologue = len(out)          # everything emitted so far is dispatch
         bodies = {i: self.emit(fn, i, live_out[i]) for i in range(len(fn.insns)) if i not in dead}
         if getattr(self.opts, "x87_locals", X87_LOCALS):
+            consumed = set()
+            if getattr(self.opts, "x87_dataflow", X87_DATAFLOW):
+                from x87_dataflow import lower_function
+                bodies, consumed, regions = lower_function(
+                    fn, bodies, labels, dead, parse_operand,
+                    VISUAL_ANIMATION_READS | frozenset(INSTRUCTION_PATCHES),
+                    (self.successors, self.branch_target, JCC, entries), self.image)
+                self.stats["_x87_dataflow_regions"] += regions
+                self.stats["_x87_dataflow_instructions"] += len(consumed)
+                self.stats["_x87_dataflow_functions"] += bool(regions)
             from x87_locals import lower_regions
             bodies, regions, lifted = lower_regions(
-                fn, bodies, labels, dead, parse_operand,
+                fn, bodies, labels, dead | consumed, parse_operand,
                 VISUAL_ANIMATION_READS | frozenset(INSTRUCTION_PATCHES),
                 (self.successors, self.branch_target, JCC, entries))
             self.stats["_x87_local_regions"] += regions

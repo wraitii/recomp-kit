@@ -37,6 +37,13 @@ C in full CPU and scratch memory at normal exit. The native reference compares
 only the game's declared observations, making its missing machine bookkeeping
 explicit. These are current-runtime comparisons, not an original-x86 oracle.
 
+`--corpus-x87-dataflow` enables decoded x87 dataflow only in x87-local and
+combined modes. The default is off; `report.json` records `x87_dataflow` and
+Markdown identifies the selected setting. This does not change the game
+configuration. A whole-image experiment can set `[translate].x87_dataflow = true`
+with `x87_locals = true` and regenerate, but needs its own build and replay
+validation; corpus results alone do not establish whole-image correctness.
+
 Reports include linked native spans/instruction counts, separate native adapter
 and kernel sizes, all timing trials, compile commands, provenance hashes and
 generation/build wall times. Function text spans exclude separately compiled

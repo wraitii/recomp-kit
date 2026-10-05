@@ -57,14 +57,52 @@ CASES = {
                          "CALL 0x00200000", "MOV dword ptr [EBX],ECX", "RET"],
 }
 
+DATAFLOW_CASES = {
+    "division_chain": ["FLD float ptr [ESI]", "FDIV float ptr [EDI]",
+                       "MOV EAX,dword ptr [ESI + 4]", "FST float ptr [EBX]",
+                       "FLD ST0", "FMUL float ptr [ESI]", "FSTP float ptr [EBX + 4]",
+                       "FSTP float ptr [EBX + 8]", "RET"],
+    "reverse_division": ["FLD double ptr [ESI]", "FLD float ptr [EDI]",
+                         "FDIVR ST0,ST1", "FDIVRP ST1,ST0", "FCHS",
+                         "FSTP double ptr [EBX]", "RET"],
+    "incoming_copy": ["FLD ST0", "FNSTSW AX", "FXCH ST1", "FST ST2",
+                      "FSTP ST0", "FSTP ST0", "RET"],
+    "exact_copy": ["FILD qword ptr [ESI]", "FLD ST0", "FXCH ST2", "FST ST3",
+                   "FSTP ST0", "FLD float ptr [EDI]", "FDIV float ptr [ESI]",
+                   "FSTP double ptr [EBX]", "RET"],
+    "copy_loop": ["MOV EDX,3", "FLD double ptr [ESI]", "FLD ST0",
+                  "FDIV float ptr [EDI]", "FSTP double ptr [EBX]", "DEC EDX",
+                  "JNZ 0x00100002", "FSTP float ptr [EBX + 8]", "RET"],
+    "copy_diamond": ["FLD double ptr [ESI]", "TEST EAX,1", "JZ 0x00100006",
+                     "FLD float ptr [EDI]", "FXCH ST1", "JMP 0x00100007",
+                     "FLD ST0", "FDIV ST0,ST1", "FSTP float ptr [EBX]",
+                     "FSTP double ptr [EBX + 8]", "RET"],
+    "division_call": ["FLD float ptr [ESI]", "FDIV float ptr [EDI]", "FLD ST0",
+                      "CALL 0x00200000", "FXCH ST1", "FDIVR float ptr [ESI]",
+                      "FSTP float ptr [EBX]", "FSTP double ptr [EBX + 8]", "RET"],
+    "stack_interleave": ["FLD float ptr [ESI]", "PUSH EAX", "FDIV float ptr [EDI]",
+                         "POP EDX", "FLD ST0", "FMUL float ptr [ESI]",
+                         "FSTP float ptr [EBX]", "FSTP float ptr [EBX + 4]", "RET"],
+    "wide_copy_wrap": ["FLD double ptr [ESI]"] * 8 +
+                      ["FLD ST7", "FXCH ST7", "FST ST6", "FSTP ST0", "RET"],
+    "environment_observer": ["FLD double ptr [ESI]", "FDIV float ptr [EDI]",
+                             "FLD ST0", "FNSTENV [EBX]", "FXCH ST1",
+                             "FDIVR float ptr [ESI]", "FSTP double ptr [EBX + 32]",
+                             "FSTP double ptr [EBX + 40]", "RET"],
+    "control_boundary": ["FLD float ptr [ESI]", "FDIV float ptr [EDI]", "FLD ST0",
+                         "FLDCW word ptr [ESI + 4]", "FXCH ST1", "FDIVR float ptr [EDI]",
+                         "FSTP double ptr [EBX]", "FSTP double ptr [EBX + 8]", "RET"],
+}
 
-def emit(name, lines, mode):
+
+def emit(name, lines, mode, x87_dataflow=False):
     """Exercise the complete driver, including entry adapters and RET emission."""
     insns = T.parse_listing_text("\n".join(f"{0x100000+i:08x}  {s}" for i, s in enumerate(lines)))
     fn = T.Function(0x100000, name, len(insns), insns)
     cpu, x87 = MODES[mode]
     tr = T.Translator(None, {fn.addr, 0x200000}, SimpleNamespace(
-        eager_flags=True, cpu_locals=cpu, x87_locals=x87))
+        eager_flags=True, cpu_locals=cpu, x87_locals=x87,
+        x87_dataflow=x87_dataflow and x87))
     tr.prepare(fn)
     entries = (0x100001,) if name == "alternate" else ()
     code = "\n".join(tr.translate(fn, entries))
@@ -75,7 +113,7 @@ def emit(name, lines, mode):
     return code, f"{name}_{mode}_fn_{entry:08x}"
 
 
-def run_checks(out, cmake, jobs):
+def run_checks(out, cmake, jobs, x87_dataflow=False):
     """Compile via the build wrapper and compare mapped CPU/memory exits."""
     out.mkdir(parents=True, exist_ok=True)
     code = ['#include "x86.h"', 'void fixture_call(X86 *c);',
@@ -94,10 +132,11 @@ def run_checks(out, cmake, jobs):
         'void fixture_finish(void);', '#define FIXTURE_FINISH() fixture_finish()',
     ]
     functions = []
-    for name, lines in CASES.items():
+    cases = {**CASES, **(DATAFLOW_CASES if x87_dataflow else {})}
+    for name, lines in cases.items():
         symbols = []
         for mode in range(4):
-            body, symbol = emit(name, lines, mode)
+            body, symbol = emit(name, lines, mode, x87_dataflow)
             code.append(body)
             declarations.append(f"void {symbol}(X86 *);")
             symbols.append(symbol)
@@ -107,7 +146,7 @@ def run_checks(out, cmake, jobs):
                                        "MOV EDX,dword ptr [0x10]", "RET"], mode)
         code.append(body)
     declarations += ["static const char *case_names[] = {" +
-                     ",".join(f'"{name}"' for name in CASES) + "};",
+                     ",".join(f'"{name}"' for name in cases) + "};",
                      "static void (*functions[][4])(X86 *) = {" + ",".join(functions) + "};"]
     (out / "generated.c").write_text("\n".join(code) + "\n")
     (out / "fixtures.h").write_text("\n".join(declarations) + "\n")

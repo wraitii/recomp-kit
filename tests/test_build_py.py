@@ -247,6 +247,10 @@ def test_function_corpus_is_isolated_and_does_not_regenerate_game():
     args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-calls', '0'], system='Darwin')
     assert args.function_corpus == Path('manifest.json')
     assert args.corpus_calls == 0
+    args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-x87-dataflow'], system='Darwin')
+    assert args.corpus_x87_dataflow
+    with pytest.raises(SystemExit):
+        build_py.parse_args(['--corpus-x87-dataflow'], system='Darwin')
     for extra in (['--regenerate'], ['--stub'], ['--corpus-fragments'],
                   ['--corpus-llvm', 'llvm.json'], ['--cpu-locals-checks']):
         with pytest.raises(SystemExit):

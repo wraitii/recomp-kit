@@ -219,6 +219,15 @@
   additional precision selectors can increase native code and spills.
 ||||||| parent of 3edaa15 (Consolidate codegen experiments into native-reference corpus tools)
 ||||||| parent of aa07dfe (Allow reviewed direct callees in function corpus)
+||||||| parent of ab04cac (Add opt-in decoded x87 dataflow lowering)
+- Add experimental `[translate] x87_dataflow = true` (requires `x87_locals`):
+  decoded TOP/width/write analysis carries x87 copies, exchanges and division
+  through bounded CFG regions, retaining exact metadata and full state at
+  observers. Per-exit publication omits only slots proven unwritten on that
+  path. `--corpus-x87-dataflow` evaluates it without changing game settings;
+  `--x87-dataflow-checks` compares native full-state fixtures with eager C.
+  Defaults remain unchanged; whole-game benefit is not established.
+
 - Allow explicit direct callees in the native-reference function corpus. Calls
   bind to byte-verified corpus rows in the same translation mode; mapped return
   continuations are accepted without introducing stubs or general dispatch.
