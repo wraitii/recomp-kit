@@ -5,6 +5,7 @@
 // (Task 7) pushes real events in with host_post_message() and the guest pulls
 // them out through PeekMessageA/GetMessageA exactly as it would on Win32.
 #include "user32_internal.h"
+#include "key_names.h"
 #include "gdi_image.h"
 #include "win32.h"
 #include "../platform/os.h"
@@ -1806,150 +1807,25 @@ void u_MapVirtualKeyA(X86 *c) {
     set_eax(c, map_virtual_key(arg(c, 0), arg(c, 1)));
 }
 
-// GetKeyNameText's name table, shared with the W shim (user32_wide.cpp). See
-// key_name_text in user32_internal.h for the lParam layout. Window's names for
-// the US layout are layout-independent, so the runtime can supply them without
-// a real keyboard layout. Modifier keys are named generically when bit 25 is
-// set (which is the form this game asks for) and by side otherwise.
+// GetKeyNameText's names, shared with the W shim (user32_wide.cpp) and with
+// DirectInput's DIPROP_KEYNAME through key_names.h. lParam carries the scan code
+// in bits 16-23 and the extended flag in bit 24, which is bit 7 of the DIK code.
+// Bit 25 asks for no left/right distinction, so the right-hand modifiers are
+// named like the left ones. The names are the US layout's.
 std::string key_name_text(uint32_t lparam) {
-    const uint32_t scan = (lparam >> 16) & 0xff;
-    const bool ext = (lparam & 0x01000000u) != 0;
-    const bool generic = (lparam & 0x02000000u) != 0;
-    auto side = [&](const char *generic_name, const char *left, const char *right) {
-        return std::string(generic ? generic_name : (scan == 0x36 || ext ? right : left));
-    };
-    switch (scan) {
-    case 0x2a:
-    case 0x36:
-        return side("Shift", "Left Shift", "Right Shift");
-    case 0x1d:
-        return side("Ctrl", "Left Ctrl", "Right Ctrl");
-    case 0x38:
-        return side("Alt", "Left Alt", "Right Alt");
-    default:
-        break;
+    uint32_t dik = (lparam >> 16) & 0x7f;
+    if (lparam & 0x01000000u)
+        dik |= 0x80;
+    if (lparam & 0x02000000u) {
+        if (dik == 0x36)
+            dik = 0x2a; // Right Shift -> Shift
+        else if (dik == 0x9d)
+            dik = 0x1d; // Right Ctrl -> Ctrl
+        else if (dik == 0xb8)
+            dik = 0x38; // Right Alt -> Alt
     }
-    // The numpad and the navigation cluster share scan codes; only the
-    // extended flag tells them apart. Windows names the unextended ones
-    // "Num N" regardless of Num Lock.
-    if (!ext && scan >= 0x47 && scan <= 0x53) {
-        static const char *numpad[13] = {"Num 7", "Num 8", "Num 9", "Num -", "Num 4",
-                                         "Num 5", "Num 6", "Num +", "Num 1", "Num 2",
-                                         "Num 3", "Num 0", "Num ."};
-        return numpad[scan - 0x47];
-    }
-    // Extended set-1 codes the virtual-key table does not carry.
-    if (ext) {
-        switch (scan) {
-        case 0x1c:
-            return "Enter";
-        case 0x35:
-            return "Num /";
-        case 0x37:
-            return "Print Screen";
-        case 0x47:
-            return "Home";
-        case 0x48:
-            return "Up";
-        case 0x49:
-            return "Page Up";
-        case 0x4b:
-            return "Left";
-        case 0x4d:
-            return "Right";
-        case 0x4f:
-            return "End";
-        case 0x50:
-            return "Down";
-        case 0x51:
-            return "Page Down";
-        case 0x52:
-            return "Insert";
-        case 0x53:
-            return "Delete";
-        case 0x5b:
-            return "Left Windows";
-        case 0x5c:
-            return "Right Windows";
-        case 0x5d:
-            return "Applications";
-        default:
-            return "";
-        }
-    }
-    const uint32_t vk = map_virtual_key(scan, 1);
-    // Named keys first: several virtual-key codes overlap printable ASCII
-    // (VK_F1 is 0x70, 'p'; VK_NUMPAD0 is 0x60, '`'), so the printable fallback
-    // must come after every table entry that claims one of those values.
-    switch (vk) {
-    case 0x08:
-        return "Backspace";
-    case 0x09:
-        return "Tab";
-    case 0x0d:
-        return "Enter";
-    case 0x13:
-        return "Pause";
-    case 0x14:
-        return "Caps Lock";
-    case 0x1b:
-        return "Esc";
-    case 0x20:
-        return "Space";
-    case 0x21:
-        return "Page Up";
-    case 0x22:
-        return "Page Down";
-    case 0x23:
-        return "End";
-    case 0x24:
-        return "Home";
-    case 0x25:
-        return "Left";
-    case 0x26:
-        return "Up";
-    case 0x27:
-        return "Right";
-    case 0x28:
-        return "Down";
-    case 0x2c:
-        return "Print Screen";
-    case 0x2d:
-        return "Insert";
-    case 0x2e:
-        return "Delete";
-    case 0x5b:
-        return "Left Windows";
-    case 0x5c:
-        return "Right Windows";
-    case 0x5d:
-        return "Applications";
-    case 0x5f:
-        return "Sleep";
-    case 0x90:
-        return "Num Lock";
-    case 0x91:
-        return "Scroll Lock";
-    default:
-        break;
-    }
-    if (vk >= 0x60 && vk <= 0x69)
-        return "Num " + std::to_string(vk - 0x60);
-    if (vk == 0x6a)
-        return "Num *";
-    if (vk == 0x6b)
-        return "Num +";
-    if (vk == 0x6d)
-        return "Num -";
-    if (vk == 0x6e)
-        return "Num .";
-    if (vk == 0x6f)
-        return "Num /";
-    if (vk >= 0x70 && vk <= 0x87)
-        return "F" + std::to_string(vk - 0x6f);
-    if (vk >= 0x20 && vk < 0x7f)
-        return std::string(1, char(vk));
-    return "";
+    const char *name = dik_key_name(dik);
+    return name ? name : "";
 }
 void u_GetKeyNameTextA(X86 *c) {
     const std::string text = key_name_text(arg(c, 0));

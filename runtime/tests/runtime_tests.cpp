@@ -6811,13 +6811,14 @@ static void test_user32_key_names() {
     check(name_w(0x022a0000u) == "Shift", "W: left Shift without a side");
     check(name_a(0x022a0000u) == "Shift", "A: left Shift without a side");
     check(name_w(0x02360000u) == "Shift", "W: right Shift without a side");
-    check(name_a(0x002a0000u) == "Left Shift", "A: left Shift with the side bit clear");
+    check(name_a(0x002a0000u) == "Shift", "A: left Shift is plain Shift with the side bit clear");
     check(name_w(0x021d0000u) == "Ctrl", "W: left Ctrl");
     check(name_w(0x031d0000u) == "Ctrl", "W: extended (right) Ctrl");
     check(name_w(0x02380000u) == "Alt", "W: left Alt");
     check(name_w(0x03380000u) == "Alt", "W: extended (right) Alt");
     check(name_w(0x021c0000u) == "Enter", "W: Enter");
-    check(name_w(0x00380000u) == "Left Alt", "W: side when bit 25 is clear");
+    check(name_w(0x00380000u) == "Alt" && name_w(0x01380000u) == "Right Alt",
+          "W: Alt and Right Alt with bit 25 clear");
     check(name_a(0x020e0000u) == "Backspace", "A: Backspace");
     check(name_w(0x00470000u) == "Num 7", "W: keypad 7");
     check(name_w(0x03480000u) == "Up", "W: extended Up");
