@@ -16,6 +16,13 @@
   between CPU-projected terrain and GPU-transformed overlays, 256 cleared it)
   and overridable with `RECOMP_D3D8_ZBIAS_SCALE` (DIVERGENCE).
 
+- D3D8 `D3DRS_COLORWRITEENABLE` is now honoured instead of failing the draw as
+  stored but unapplied state. It is typed (validated to D3D8's 4-bit R/G/B/A
+  mask, default `0xF`), intersected with the render target's own channel rule,
+  and part of the draw-pipeline key. A guest that clears the mask for a
+  depth-only prepass renders it through `wgpu::ColorWrites::empty()` rather
+  than aborting the process through the unsupported-state path.
+
 - D3D8 XYZRHW draws keep the sign of `rhw`: `ProcessVertices` writes
   `rhw = 1/clip.w` including negative values for vertices behind the eye, and
   the pre-transformed vertex shaders now rebuild `clip = ndc * (1/rhw)` instead

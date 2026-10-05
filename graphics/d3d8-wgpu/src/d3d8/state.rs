@@ -184,6 +184,10 @@ struct RenderStates {
     /// the smallest depth increment, applied by the rasterizer as a constant
     /// bias toward the viewer (positive D3D8 values bring geometry forward).
     z_bias: u32,
+    /// `D3DRS_COLORWRITEENABLE`, a 4-bit mask (`R`/`G`/`B`/`A` = 1/2/4/8). The
+    /// device ANDs it with the target's own channel rule, so `0` is a
+    /// depth-only draw and the documented default `0xF` writes every channel.
+    color_write_mask: u32,
     alpha_ref: u32,
     alpha_func: D3DCMPFUNC,
     dither_enable: bool,
@@ -236,6 +240,7 @@ impl RenderStates {
             cull_mode: D3DCULL::Ccw,
             z_func: D3DCMPFUNC::LessEqual,
             z_bias: 0,
+            color_write_mask: 0xF,
             alpha_ref: 0,
             alpha_func: D3DCMPFUNC::Always,
             dither_enable: false,
@@ -424,6 +429,20 @@ impl DeviceState {
                     ));
                 }
                 self.states.z_bias = value;
+            }
+            Rs::ColorWriteEnable => {
+                // D3D8 only defines the low four bits (R/G/B/A). Higher bits
+                // are outside the implemented slice and are refused rather
+                // than silently masked.
+                if value > 0xF {
+                    return Err(RenderError::new(
+                        "d3d8::state::set_render_state",
+                        format!(
+                            "D3DRS_COLORWRITEENABLE = {value:#010x} is outside D3D8's 0..0xF mask"
+                        ),
+                    ));
+                }
+                self.states.color_write_mask = value;
             }
             Rs::AlphaRef => self.states.alpha_ref = value,
             Rs::AlphaFunc => self.states.alpha_func = D3DCMPFUNC::from_raw(value)?,
@@ -804,7 +823,7 @@ impl DeviceState {
             )
         };
         format!(
-            "lighting={} colorvertex={} fog={} fogcolor={:#010x} fogtable={} fogvertex={} rangefog={} fogstart={} fogend={} fogdensity={} z={:?} zwrite={} zfunc={:?} zbias={} alpha_test={} dither={} specular={} stencil={} clip={} fill={:?} shade={:?} cull={:?} blend={} src={:?} dst={:?} blendop={:?} {} {}",
+            "lighting={} colorvertex={} fog={} fogcolor={:#010x} fogtable={} fogvertex={} rangefog={} fogstart={} fogend={} fogdensity={} z={:?} zwrite={} zfunc={:?} zbias={} cwm={:#x} alpha_test={} dither={} specular={} stencil={} clip={} fill={:?} shade={:?} cull={:?} blend={} src={:?} dst={:?} blendop={:?} {} {}",
             s.lighting,
             s.color_vertex,
             s.fog_enable,
@@ -819,6 +838,7 @@ impl DeviceState {
             s.z_write_enable,
             s.z_func,
             s.z_bias,
+            s.color_write_mask,
             s.alpha_test_enable,
             s.dither_enable,
             s.specular_enable,
@@ -873,6 +893,12 @@ impl DeviceState {
     /// rasterizer as a constant depth bias toward the viewer.
     pub fn z_bias(&self) -> u32 {
         self.states.z_bias
+    }
+
+    /// `D3DRS_COLORWRITEENABLE`, the 4-bit R/G/B/A channel mask. `0` disables
+    /// every color write (a depth-only pass); `0xF` is the D3D8 default.
+    pub fn color_write_mask(&self) -> u32 {
+        self.states.color_write_mask
     }
 
     /// `D3DRS_FOGENABLE`.
@@ -1172,7 +1198,8 @@ fn raw_state_reached(state: u32, value: u32) -> bool {
         // (D3DRS_ZBIAS is typed now and applied by the depth-stencil state.)
         Ok(Rs::ClipPlaneEnable) => value != 0,
         Ok(Rs::VertexBlend) => value != 0, // D3DVBF_DISABLE
-        Ok(Rs::ColorWriteEnable) => value != 0x0000_000f, // RGBA channels
+        // (D3DRS_COLORWRITEENABLE is typed now and combined with the target's
+        // own channel rule by the draw pipeline.)
         // Everything else stored is a state this path cannot honour.
         _ => true,
     }
@@ -1620,6 +1647,30 @@ mod tests {
         assert!(err.cause.contains("ZBIAS"), "{}", err.cause);
         // A failed set leaves the previous value in place.
         assert_eq!(state.z_bias(), 2);
+    }
+
+    #[test]
+    fn color_write_enable_is_stored_validated_and_honoured() {
+        let mut state = DeviceState::new(64, 64);
+        configure_probe_states(&mut state);
+        // D3D8's documented default writes every channel.
+        assert_eq!(state.color_write_mask(), 0xF);
+        // The whole 4-bit mask reaches the draw path instead of failing it.
+        for mask in 0..=0xFu32 {
+            state.set_render_state(168, mask).unwrap(); // D3DRS_COLORWRITEENABLE
+            assert_eq!(state.color_write_mask(), mask);
+            state.validate_unlit().unwrap();
+        }
+        // Disabling every channel is a legal depth-only prepass.
+        state.set_render_state(168, 0).unwrap();
+        state.validate_unlit().unwrap();
+        assert!(state.draw_state_summary().contains("cwm=0x0"));
+        // Bits above the R/G/B/A mask are a named set-time refusal.
+        let err = state.set_render_state(168, 0x10).unwrap_err();
+        assert_eq!(err.operation, "d3d8::state::set_render_state");
+        assert!(err.cause.contains("COLORWRITEENABLE"), "{}", err.cause);
+        // A failed set leaves the previous value in place.
+        assert_eq!(state.color_write_mask(), 0);
     }
 
     #[test]

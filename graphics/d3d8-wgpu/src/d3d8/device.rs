@@ -84,6 +84,14 @@ fn blend_factor(factor: crate::d3d8::enums::D3DBLEND) -> Result<wgpu::BlendFacto
     })
 }
 
+/// Map D3D8's `D3DRS_COLORWRITEENABLE` 4-bit mask to wgpu's channel write mask.
+/// D3D8's bit order (R=1, G=2, B=4, A=8) matches `wgpu::ColorWrites`, so the
+/// bits carry over directly. The draw pipeline intersects this with the render
+/// target's own channel rule before using it.
+fn color_writes_from_mask(mask: u32) -> wgpu::ColorWrites {
+    wgpu::ColorWrites::from_bits_truncate(mask & 0xF)
+}
+
 /// `RECOMP_D3D8_SKIP_FVF=0x2C4,0x112` drops every draw with one of the listed
 /// FVFs. Diagnostic only: it bisects which pass produces an artefact and is
 /// never on by default.
@@ -962,11 +970,12 @@ struct DrawStats {
     submits: u64,
 }
 
-/// Everything that varies a cached draw pipeline. The attachment formats and
-/// color write mask belong to the bound render target, which changes on every
-/// `SetRenderTarget`, so they are part of the key (clearing the cache on a
-/// target switch recompiled every pipeline each frame once shadows rendered
-/// to texture targets).
+/// Everything that varies a cached draw pipeline. The attachment formats belong
+/// to the bound render target, which changes on every `SetRenderTarget`, so they
+/// are part of the key; the effective color write mask combines the target's
+/// channel rule with `D3DRS_COLORWRITEENABLE`. (Clearing the whole cache on a
+/// target switch recompiled every pipeline each frame once shadows rendered to
+/// texture targets.)
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct DrawPipelineKey {
     color_format: wgpu::TextureFormat,
@@ -1779,7 +1788,8 @@ impl Device {
         let (cull_mode, front_face) = self.cull_state();
         let key = DrawPipelineKey {
             color_format: self.target.format,
-            color_write_mask: self.target.color_write_mask(),
+            color_write_mask: color_writes_from_mask(self.state.color_write_mask())
+                & self.target.color_write_mask(),
             depth_format: self.target.depth.as_ref().map(|d| d.format),
             fvf,
             textured,
@@ -1992,7 +2002,8 @@ impl Device {
                     targets: &[Some(wgpu::ColorTargetState {
                         format: self.target.format,
                         blend,
-                        write_mask: self.target.color_write_mask(),
+                        write_mask: color_writes_from_mask(self.state.color_write_mask())
+                            & self.target.color_write_mask(),
                     })],
                 }),
                 multiview: None,
@@ -2643,6 +2654,19 @@ mod tests {
         assert!(err.cause.contains("BOTHSRCALPHA"), "{}", err.cause);
         let err = blend_factor(D3DBLEND::BothInvSrcAlpha).unwrap_err();
         assert!(err.cause.contains("BOTHINVSRCALPHA"), "{}", err.cause);
+    }
+
+    #[test]
+    fn color_write_masks_map_to_the_wgpu_channel_bits() {
+        use super::color_writes_from_mask;
+        // D3D8 R/G/B/A and wgpu RED/GREEN/BLUE/ALPHA share the same bit order.
+        assert_eq!(color_writes_from_mask(0x0), wgpu::ColorWrites::empty());
+        assert_eq!(color_writes_from_mask(0xF), wgpu::ColorWrites::ALL);
+        assert_eq!(color_writes_from_mask(0x1), wgpu::ColorWrites::RED);
+        assert_eq!(color_writes_from_mask(0x8), wgpu::ColorWrites::ALPHA);
+        // Bits above the 4-bit mask are not representable and are dropped; the
+        // state setter refuses them before they reach the draw path.
+        assert_eq!(color_writes_from_mask(0x30), wgpu::ColorWrites::empty());
     }
 
     #[test]
