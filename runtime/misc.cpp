@@ -820,6 +820,17 @@ void reg_set(X86 *c, const std::string &name, bool wide) {
         rv.seq = old != vals.end() ? old->second.seq : ++g_reg_seq; // overwriting keeps its place
         vals[name] = rv;
     }
+    if (log_level() >= 2) {
+        char numbuf[32];
+        const char *valdesc = "<binary>";
+        if (type == 4 || type == 5) {
+            snprintf(numbuf, sizeof numbuf, "%u", rv.dword);
+            valdesc = numbuf;
+        } else if (type == 1 || type == 2) {
+            valdesc = rv.str.c_str();
+        }
+        LOGV("registry: set %s \"%s\" type=%u value=%s", path.c_str(), name.c_str(), type, valdesc);
+    }
     g_registry_dirty = true;
     registry_flush();
     set_eax(c, 0);
@@ -904,9 +915,16 @@ void a_RegEnumValueW(X86 *c) {
     }
     const auto ordered = reg_in_order(it->second);
     const auto *value = ordered[arg(c, 1)];
+    const uint32_t name_cap = arg(c, 3) && gm_valid(arg(c, 3), 4) ? rd32(arg(c, 3)) : 0;
     uint32_t hr = reg_write_name(value->first, arg(c, 2), arg(c, 3));
-    if (!hr)
+    if (!hr) {
         hr = reg_read_value(value->second, true, arg(c, 5), arg(c, 6), arg(c, 7));
+        // A data buffer that is too small fails the call without touching the
+        // name length: callers retry with the same variable (LHLogR's
+        // RegistryRetrieveVal sets it once, before its first call).
+        if (hr == 234 && arg(c, 3))
+            wr32(arg(c, 3), name_cap);
+    }
     set_eax(c, hr);
 }
 // The ANSI spelling of the same enumeration: value names are the UTF-8 the
@@ -966,9 +984,15 @@ void a_RegEnumValueA(X86 *c) {
     }
     const auto ordered = reg_in_order(it->second);
     const auto *value = ordered[arg(c, 1)];
+    const uint32_t name_cap = arg(c, 3) && gm_valid(arg(c, 3), 4) ? rd32(arg(c, 3)) : 0;
     uint32_t hr = reg_write_name_a(value->first, arg(c, 2), arg(c, 3));
-    if (!hr)
+    if (!hr) {
         hr = reg_read_value(value->second, false, arg(c, 5), arg(c, 6), arg(c, 7));
+        // See RegEnumValueW: a too-small data buffer leaves the name length as
+        // the caller set it, so its retry still has the whole name buffer.
+        if (hr == 234 && arg(c, 3))
+            wr32(arg(c, 3), name_cap);
+    }
     LOGV("registry: enum %s #%u \"%s\" -> %u", path.c_str(), arg(c, 1), value->first.c_str(), hr);
     set_eax(c, hr);
 }

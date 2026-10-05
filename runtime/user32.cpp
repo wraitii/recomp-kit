@@ -1242,8 +1242,10 @@ void u_GetSystemMetrics(X86 *c) {
     case 35:
         v = 27;
         break;
-    case 36:
-    case 37:
+    case 36: // SM_CXDOUBLECLK
+    case 37: // SM_CYDOUBLECLK
+        v = (uint32_t)double_click_slop_px;
+        break;
     case 49:
     case 50:
         v = 4;
@@ -1446,7 +1448,7 @@ void u_GetClipCursor(X86 *c) {
 }
 
 void u_GetDoubleClickTime(X86 *c) {
-    set_eax(c, 500);
+    set_eax(c, double_click_time_ms);
 }
 void u_GetKeyboardType(X86 *c) {
     switch (arg(c, 0)) {
@@ -1804,40 +1806,153 @@ void u_MapVirtualKeyA(X86 *c) {
     set_eax(c, map_virtual_key(arg(c, 0), arg(c, 1)));
 }
 
-// GetKeyNameTextA(lParam, lpString, cchSize): the name of the key whose scan
-// code is in lParam. The runtime's table is the virtual-key/scancode map, not
-// a keyboard layout, so only the layout-independent names are returned. An
-// unknown key returns the documented 0. SHIM(temporary): locale and dead-key
-// names are not modelled.
-void u_GetKeyNameTextA(X86 *c) {
-    const uint32_t vk = map_virtual_key((arg(c, 0) >> 16) & 0xff, 1);
-    std::string text;
-    switch (vk) {
-    case 0x08:
-        text = "Backspace";
-        break;
-    case 0x09:
-        text = "Tab";
-        break;
-    case 0x0d:
-        text = "Enter";
-        break;
-    case 0x1b:
-        text = "Esc";
-        break;
-    case 0x20:
-        text = "Space";
-        break;
-    case 0x2e:
-        text = "Delete";
-        break;
+// GetKeyNameText's name table, shared with the W shim (user32_wide.cpp). See
+// key_name_text in user32_internal.h for the lParam layout. Window's names for
+// the US layout are layout-independent, so the runtime can supply them without
+// a real keyboard layout. Modifier keys are named generically when bit 25 is
+// set (which is the form this game asks for) and by side otherwise.
+std::string key_name_text(uint32_t lparam) {
+    const uint32_t scan = (lparam >> 16) & 0xff;
+    const bool ext = (lparam & 0x01000000u) != 0;
+    const bool generic = (lparam & 0x02000000u) != 0;
+    auto side = [&](const char *generic_name, const char *left, const char *right) {
+        return std::string(generic ? generic_name : (scan == 0x36 || ext ? right : left));
+    };
+    switch (scan) {
+    case 0x2a:
+    case 0x36:
+        return side("Shift", "Left Shift", "Right Shift");
+    case 0x1d:
+        return side("Ctrl", "Left Ctrl", "Right Ctrl");
+    case 0x38:
+        return side("Alt", "Left Alt", "Right Alt");
     default:
-        if (vk >= 32 && vk < 127)
-            text.assign(1, (char)vk);
         break;
     }
-    log_once("user32.getkeyname",
-             "SHIM(temporary): GetKeyNameTextA returns layout-independent names only");
+    // The numpad and the navigation cluster share scan codes; only the
+    // extended flag tells them apart. Windows names the unextended ones
+    // "Num N" regardless of Num Lock.
+    if (!ext && scan >= 0x47 && scan <= 0x53) {
+        static const char *numpad[13] = {"Num 7", "Num 8", "Num 9", "Num -", "Num 4",
+                                         "Num 5", "Num 6", "Num +", "Num 1", "Num 2",
+                                         "Num 3", "Num 0", "Num ."};
+        return numpad[scan - 0x47];
+    }
+    // Extended set-1 codes the virtual-key table does not carry.
+    if (ext) {
+        switch (scan) {
+        case 0x1c:
+            return "Enter";
+        case 0x35:
+            return "Num /";
+        case 0x37:
+            return "Print Screen";
+        case 0x47:
+            return "Home";
+        case 0x48:
+            return "Up";
+        case 0x49:
+            return "Page Up";
+        case 0x4b:
+            return "Left";
+        case 0x4d:
+            return "Right";
+        case 0x4f:
+            return "End";
+        case 0x50:
+            return "Down";
+        case 0x51:
+            return "Page Down";
+        case 0x52:
+            return "Insert";
+        case 0x53:
+            return "Delete";
+        case 0x5b:
+            return "Left Windows";
+        case 0x5c:
+            return "Right Windows";
+        case 0x5d:
+            return "Applications";
+        default:
+            return "";
+        }
+    }
+    const uint32_t vk = map_virtual_key(scan, 1);
+    // Named keys first: several virtual-key codes overlap printable ASCII
+    // (VK_F1 is 0x70, 'p'; VK_NUMPAD0 is 0x60, '`'), so the printable fallback
+    // must come after every table entry that claims one of those values.
+    switch (vk) {
+    case 0x08:
+        return "Backspace";
+    case 0x09:
+        return "Tab";
+    case 0x0d:
+        return "Enter";
+    case 0x13:
+        return "Pause";
+    case 0x14:
+        return "Caps Lock";
+    case 0x1b:
+        return "Esc";
+    case 0x20:
+        return "Space";
+    case 0x21:
+        return "Page Up";
+    case 0x22:
+        return "Page Down";
+    case 0x23:
+        return "End";
+    case 0x24:
+        return "Home";
+    case 0x25:
+        return "Left";
+    case 0x26:
+        return "Up";
+    case 0x27:
+        return "Right";
+    case 0x28:
+        return "Down";
+    case 0x2c:
+        return "Print Screen";
+    case 0x2d:
+        return "Insert";
+    case 0x2e:
+        return "Delete";
+    case 0x5b:
+        return "Left Windows";
+    case 0x5c:
+        return "Right Windows";
+    case 0x5d:
+        return "Applications";
+    case 0x5f:
+        return "Sleep";
+    case 0x90:
+        return "Num Lock";
+    case 0x91:
+        return "Scroll Lock";
+    default:
+        break;
+    }
+    if (vk >= 0x60 && vk <= 0x69)
+        return "Num " + std::to_string(vk - 0x60);
+    if (vk == 0x6a)
+        return "Num *";
+    if (vk == 0x6b)
+        return "Num +";
+    if (vk == 0x6d)
+        return "Num -";
+    if (vk == 0x6e)
+        return "Num .";
+    if (vk == 0x6f)
+        return "Num /";
+    if (vk >= 0x70 && vk <= 0x87)
+        return "F" + std::to_string(vk - 0x6f);
+    if (vk >= 0x20 && vk < 0x7f)
+        return std::string(1, char(vk));
+    return "";
+}
+void u_GetKeyNameTextA(X86 *c) {
+    const std::string text = key_name_text(arg(c, 0));
     set_eax(c, text.empty() ? 0 : put_text(arg(c, 1), arg(c, 2), text, false));
 }
 

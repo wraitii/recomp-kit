@@ -511,15 +511,9 @@ void map_key(X86 *c) {
     set_eax(c, result);
 }
 void key_name(X86 *c) {
-    uint32_t scan = (arg(c, 0) >> 16) & 255, vk = 0;
-    uint32_t args[] = {scan, 1};
-    vk = guest_call(c, imports_resolve("USER32.dll", "MapVirtualKeyW"), args, 2);
-    std::string text = vk >= 32 && vk < 127 ? std::string(1, char(vk))
-                                            : (vk == 13   ? "Enter"
-                                               : vk == 27 ? "Esc"
-                                               : vk == 9  ? "Tab"
-                                                          : "");
-    set_eax(c, put_text(arg(c, 1), arg(c, 2), text, true));
+    // Shared with the ANSI shim, so Shift/Ctrl/Alt and the named keys do not
+    // change with the call form the game happens to use.
+    set_eax(c, put_text(arg(c, 1), arg(c, 2), key_name_text(arg(c, 0)), true));
 }
 void layout_name(X86 *c) {
     set_eax(c, put_text(arg(c, 0), 9, "00000409", true) == 8);

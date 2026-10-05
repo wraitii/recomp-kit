@@ -59,6 +59,15 @@ struct Msg {
     uint32_t hwnd, message, wparam, lparam, time, ptx, pty;
 };
 
+// Windows' default double-click test: the window the second press must land
+// within, and the width/height of the rectangle around the first press's point.
+// GetDoubleClickTime and GetSystemMetrics(SM_CXDOUBLECLK/SM_CYDOUBLECLK) report
+// these same values, and the runtime synthesizes WM_*BUTTONDBLCLK from them for
+// a window whose class asked for it with CS_DBLCLKS.
+constexpr uint32_t double_click_time_ms = 500;
+constexpr int32_t double_click_slop_px = 4;
+constexpr uint32_t CS_DBLCLKS = 0x0008;
+
 std::map<std::string, WndClass> &classes();
 std::map<uint32_t, Window> &windows();
 std::deque<Msg> &queue();
@@ -96,6 +105,13 @@ void alias_ansi(X86 *c, const char *name);
 // Registers the system control classes (STATIC) on first use.
 void ensure_system_classes();
 } // namespace user32
+
+// GetKeyNameText's name for the key in lParam: scan code in bits 16-23, the
+// extended flag in bit 24 and "do not distinguish left/right" in bit 25. The
+// layout is the US one the runtime keyboard table models. Shared by the A and
+// W shims so the two cannot drift.
+std::string key_name_text(uint32_t lparam);
+
 void user32_wide_register();
 
 void user32_vcl_register();

@@ -22,6 +22,15 @@ struct MouseInput {
 };
 std::deque<MouseInput> mouse_input;
 bool routing_mouse = false;
+// The press Windows tests the next one against, per left/right/middle button.
+// The point is in screen coordinates and the time is the message's own
+// timestamp, so the judgment matches the raw input queue's.
+struct LastPress {
+    bool primed = false;
+    int32_t x = 0, y = 0;
+    uint32_t time = 0;
+};
+LastPress last_press[3];
 struct Timer {
     uint32_t hwnd, id, interval, due, callback, thread;
 };
@@ -136,6 +145,44 @@ void pump_mouse_input(X86 *c) {
     int32_t x, y;
     client_origin(hwnd, &x, &y);
     uint32_t lp = (uint32_t(uint16_t(int64_t(input.y) - y)) << 16) | uint16_t(int64_t(input.x) - x);
+    // Windows synthesizes WM_*BUTTONDBLCLK for the second press of a
+    // double-click when the target's class registered CS_DBLCLKS; the press is
+    // replaced and the release that follows stays an ordinary WM_*BUTTONUP.
+    // GameWindowProc (0x007dbf30) turns WM_LBUTTONDBLCLK into
+    // LHMouse::SetButtons(0x10), which is the engine's only source of a
+    // double-click. The comparison is the previous press of the same button:
+    // inside GetDoubleClickTime and the SM_*DOUBLECLK rectangle around its
+    // point.
+    static const uint32_t press_message[3] = {0x201, 0x204, 0x207};
+    static const uint32_t double_message[3] = {0x203, 0x206, 0x209};
+    for (int button = 0; button < 3; ++button) {
+        if (input.message != press_message[button])
+            continue;
+        uint32_t class_style = 0;
+        if (const Window *target = find_window(hwnd)) {
+            auto found = classes().find(target->cls);
+            if (found != classes().end())
+                class_style = found->second.style;
+        }
+        auto near = [](int32_t a, int32_t b) {
+            int32_t delta = a - b;
+            // The rectangle is SM_CXDOUBLECLK wide, centered on the first press.
+            return delta >= -double_click_slop_px / 2 && delta <= double_click_slop_px / 2;
+        };
+        LastPress &previous = last_press[button];
+        if ((class_style & CS_DBLCLKS) != 0 && previous.primed &&
+            uint32_t(input.time - previous.time) <= double_click_time_ms &&
+            near(input.x, previous.x) && near(input.y, previous.y)) {
+            input.message = double_message[button];
+            previous.primed = false; // a third press starts a new sequence
+            break;
+        }
+        previous.primed = true;
+        previous.time = input.time;
+        previous.x = input.x;
+        previous.y = input.y;
+        break;
+    }
     LOGV("host mouse %04x screen=(%d,%d) -> hwnd=%08x client=(%d,%d) mk=%x", input.message, input.x,
          input.y, hwnd, int16_t(lp), int16_t(lp >> 16), input.mk);
     queue().push_back(

@@ -4085,6 +4085,27 @@ static void test_registry(X86 *c) {
               gm_str(ename) == "Detail",
           "RegEnumValueA index 1 is the second: \"%s\"", gm_str(ename).c_str());
 
+    // A data buffer that is too small fails with ERROR_MORE_DATA and the needed
+    // size, but leaves the name length alone: LHLogR's RegistryRetrieveVal sets
+    // it once and retries with the same variable. Overwriting it with the name
+    // length made the retry's name buffer one char short ("file" with 4), which
+    // failed again, so no profile key setting after the first string value was
+    // ever read back.
+    uint32_t small_data = scratch_block(4), data_size = scratch_block(4);
+    wr32(elen, 64);
+    wr32(data_size, 4);
+    check(call_import(c, "ADVAPI32.dll", "RegEnumValueA",
+                      {hk2, 0, ename, elen, 0, 0, small_data, data_size}) == 234,
+          "RegEnumValueA with a too-small data buffer is ERROR_MORE_DATA");
+    check(rd32(data_size) == sizeof(RECOMP_GUEST_ROOT), "it reports the data size needed: %u",
+          rd32(data_size));
+    check(rd32(elen) == 64, "and leaves the name length as the caller set it: %u", rd32(elen));
+    uint32_t big_data = scratch_block(sizeof(RECOMP_GUEST_ROOT) + 8);
+    check(call_import(c, "ADVAPI32.dll", "RegEnumValueA",
+                      {hk2, 0, ename, elen, 0, 0, big_data, data_size}) == 0 &&
+              gm_str(ename) == "InstallPath",
+          "the retry with the needed size succeeds");
+
     uint32_t mixed_key = put_str("SOFTWARE\\recomptests\\REGISTRY");
     uint32_t phk3 = scratch_block(4);
     check(call_import(c, "ADVAPI32.dll", "RegOpenKeyExA",
@@ -4103,6 +4124,54 @@ static void test_registry(X86 *c) {
               2,
           "a missing value reports ERROR_FILE_NOT_FOUND");
     call_import(c, "ADVAPI32.dll", "RegCloseKey", {hk2});
+
+    // Overwriting an existing value replaces its data in place and keeps the
+    // position it first occupied: Windows enumerates it where it first
+    // appeared, and the controls screen rewrites "Key N Primary" on every
+    // save. A shim that appended a second copy, ignored the write, or moved
+    // the value would make the loader pair the wrong data with the name.
+    uint32_t ophk = scratch_block(4);
+    check(call_import(c, "ADVAPI32.dll", "RegOpenKeyExA", {0x80000002u, sub, 0, 0x20019, ophk}) ==
+              0,
+          "reopen the key for the overwrite");
+    uint32_t ohk = rd32(ophk);
+    wr32(ddata, 42);
+    check(call_import(c, "ADVAPI32.dll", "RegSetValueExA", {ohk, dname, 0, 4, ddata, 4}) == 0,
+          "RegSetValueExA overwrites an existing value");
+    wr32(pcb, sizeof(RECOMP_GUEST_ROOT) + 64);
+    check(call_import(c, "ADVAPI32.dll", "RegQueryValueExA", {ohk, dname, 0, ptype, pbuf, pcb}) ==
+                  0 &&
+              rd32(pbuf) == 42,
+          "the overwrite is visible by name: %u", rd32(pbuf));
+    wr32(elen, 64);
+    check(call_import(c, "ADVAPI32.dll", "RegEnumValueA", {ohk, 0, ename, elen, 0, 0, 0, 0}) == 0 &&
+              gm_str(ename) == "InstallPath",
+          "the value before it keeps position 0 after the overwrite: \"%s\"",
+          gm_str(ename).c_str());
+    wr32(elen, 64);
+    check(call_import(c, "ADVAPI32.dll", "RegEnumValueA", {ohk, 1, ename, elen, 0, 0, 0, 0}) == 0 &&
+              gm_str(ename) == "Detail",
+          "the overwritten value keeps position 1, not appended: \"%s\"", gm_str(ename).c_str());
+    call_import(c, "ADVAPI32.dll", "RegCloseKey", {ohk});
+
+    // The overwrite must survive a reload from disk as well, since a restart
+    // is exactly when the controls binding has to come back.
+    registry_load();
+    uint32_t rphk = scratch_block(4);
+    check(call_import(c, "ADVAPI32.dll", "RegOpenKeyExA", {0x80000002u, sub, 0, 0x20019, rphk}) ==
+              0,
+          "reopen after the overwrite reload");
+    uint32_t rhk = rd32(rphk);
+    wr32(pcb, sizeof(RECOMP_GUEST_ROOT) + 64);
+    check(call_import(c, "ADVAPI32.dll", "RegQueryValueExA", {rhk, dname, 0, ptype, pbuf, pcb}) ==
+                  0 &&
+              rd32(pbuf) == 42,
+          "the overwrite survived the reload: %u", rd32(pbuf));
+    wr32(elen, 64);
+    check(call_import(c, "ADVAPI32.dll", "RegEnumValueA", {rhk, 1, ename, elen, 0, 0, 0, 0}) == 0 &&
+              gm_str(ename) == "Detail",
+          "and it kept position 1 after the reload: \"%s\"", gm_str(ename).c_str());
+    call_import(c, "ADVAPI32.dll", "RegCloseKey", {rhk});
 
     // Windows creates every missing ancestor on a create, and a key that exists
     // only as the parent of stored descendants still opens. LHMultiplayerR
@@ -6636,6 +6705,126 @@ static void test_host_mouse_routing() {
         call_import(&c, "USER32.dll", "DestroyWindow", {w});
 }
 
+// A double-click is not a DirectInput event. Windows synthesizes
+// WM_*BUTTONDBLCLK for the second press of a double-click, but only for a
+// window whose class registered CS_DBLCLKS. GameWindowProc (0x007dbf30) turns
+// WM_LBUTTONDBLCLK into LHMouse::SetButtons(0x10), the engine's only source of
+// a double-click, so the runtime has to synthesize it.
+static void test_host_mouse_double_click() {
+    section("host mouse double-click synthesis");
+    X86 c;
+    loader_init_context(&c);
+    uint32_t s = 0x00314000, msg = s + 0x400;
+    uint32_t proc = imports_alloc_trampoline(
+        "TEST", "DoubleClickWindowProc",
+        [](X86 *cc) {
+            if (arg(cc, 1) == 0x21) { // WM_MOUSEACTIVATE
+                set_eax(cc, 1);       // MA_ACTIVATE
+                return;
+            }
+            set_eax(cc, arg(cc, 1) == 0x81 ? 1 : 0); // WM_NCCREATE
+        },
+        4);
+    gm_put_wstr(s + 0x100, "DoubleClickClass", 32);
+    gm_put_wstr(s + 0x300, "PlainClickClass", 32);
+    auto define_class = [&](uint32_t block, uint32_t name, uint32_t style) {
+        memset(g_mem + block, 0, 40);
+        wr32(block + 0, style);
+        wr32(block + 4, proc);
+        wr32(block + 36, name);
+        check(call_import(&c, "USER32.dll", "RegisterClassW", {block}) != 0,
+              "a class with style %x registers", style);
+    };
+    define_class(s, s + 0x100, 0x8); // CS_DBLCLKS
+    define_class(s + 0x200, s + 0x300, 0);
+    auto window = [&](uint32_t name, int x) {
+        return call_import(
+            &c, "USER32.dll", "CreateWindowExW",
+            {0, name, 0, 0x10000000u, uint32_t(x), 0, 100, 100, 0, 0, IMAGE_BASE, 0});
+    };
+    uint32_t dbl = window(s + 0x100, 0);
+    uint32_t plain = window(s + 0x300, 200);
+    auto take = [&]() -> uint32_t {
+        if (call_import(&c, "USER32.dll", "PeekMessageW", {msg, 0, 0x200, 0x209, 1}) != 1)
+            return 0;
+        return rd32(msg + 4);
+    };
+    // Pin the clock so "in time" and "too late" are exact, not a race.
+    host_set_time_source_pinned(1000, 100);
+    host_post_mouse_message(0x201, 1, 50, 50);
+    check(take() == 0x201, "the first press is WM_LBUTTONDOWN");
+    host_post_mouse_message(0x202, 0, 50, 50);
+    check(take() == 0x202, "the first release is WM_LBUTTONUP");
+    host_pinned_clock_advance(); // 1100, inside GetDoubleClickTime
+    host_post_mouse_message(0x201, 1, 50, 50);
+    check(take() == 0x203, "a second press in time and place is WM_LBUTTONDBLCLK");
+    host_post_mouse_message(0x202, 0, 50, 50);
+    check(take() == 0x202, "the release after a double-click is WM_LBUTTONUP");
+    for (int i = 0; i < 6; ++i)
+        host_pinned_clock_advance(); // 1700, past GetDoubleClickTime
+    host_post_mouse_message(0x201, 1, 50, 50);
+    check(take() == 0x201, "a press past GetDoubleClickTime is not a double-click");
+    host_post_mouse_message(0x202, 0, 50, 50);
+    take();
+    host_pinned_clock_advance(); // 1800, inside the time
+    host_post_mouse_message(0x201, 1, 60, 50);
+    check(take() == 0x201, "a press outside the double-click rectangle is not a double-click");
+    host_post_mouse_message(0x202, 0, 60, 50);
+    take();
+    // The class without CS_DBLCLKS never gets the synthesized message.
+    call_import(&c, "USER32.dll", "SetActiveWindow", {plain});
+    host_pinned_clock_advance(); // 1900
+    host_post_mouse_message(0x201, 1, 250, 50);
+    check(take() == 0x201, "a plain class gets its first WM_LBUTTONDOWN");
+    host_post_mouse_message(0x202, 0, 250, 50);
+    check(take() == 0x202, "and its first WM_LBUTTONUP");
+    host_pinned_clock_advance(); // 2000
+    host_post_mouse_message(0x201, 1, 250, 50);
+    check(take() == 0x201, "a plain class never gets WM_LBUTTONDBLCLK");
+    host_post_mouse_message(0x202, 0, 250, 50);
+    check(take() == 0x202, "and its second release is WM_LBUTTONUP too");
+    host_clear_time_source();
+    call_import(&c, "USER32.dll", "DestroyWindow", {dbl});
+    call_import(&c, "USER32.dll", "DestroyWindow", {plain});
+}
+
+// The controls screen names a captured key with GetKeyNameTextW, falling back
+// to GetKeyNameTextA only when the wide call leaves the buffer empty
+// (fn_0046EE60 at 0x0046ee60). Both forms share one table, so a key that has a
+// name in one has it in the other. The game builds lParam with bit 25 set, so
+// modifier keys must read "Shift"/"Ctrl"/"Alt" rather than a side.
+static void test_user32_key_names() {
+    section("GetKeyNameText names");
+    X86 c;
+    loader_init_context(&c);
+    auto name_a = [&](uint32_t lparam) {
+        uint32_t out = scratch_block(64);
+        uint32_t n = call_import(&c, "USER32.dll", "GetKeyNameTextA", {lparam, out, 64});
+        return n ? gm_str(out) : std::string();
+    };
+    auto name_w = [&](uint32_t lparam) {
+        uint32_t out = scratch_block(64);
+        uint32_t n = call_import(&c, "USER32.dll", "GetKeyNameTextW", {lparam, out, 32});
+        return n ? gm_wstr(out) : std::string();
+    };
+    const uint32_t generic = 0x02000000u;
+    check(name_w(0x022a0000u) == "Shift", "W: left Shift without a side");
+    check(name_a(0x022a0000u) == "Shift", "A: left Shift without a side");
+    check(name_w(0x02360000u) == "Shift", "W: right Shift without a side");
+    check(name_a(0x002a0000u) == "Left Shift", "A: left Shift with the side bit clear");
+    check(name_w(0x021d0000u) == "Ctrl", "W: left Ctrl");
+    check(name_w(0x031d0000u) == "Ctrl", "W: extended (right) Ctrl");
+    check(name_w(0x02380000u) == "Alt", "W: left Alt");
+    check(name_w(0x03380000u) == "Alt", "W: extended (right) Alt");
+    check(name_w(0x021c0000u) == "Enter", "W: Enter");
+    check(name_w(0x00380000u) == "Left Alt", "W: side when bit 25 is clear");
+    check(name_a(0x020e0000u) == "Backspace", "A: Backspace");
+    check(name_w(0x00470000u) == "Num 7", "W: keypad 7");
+    check(name_w(0x03480000u) == "Up", "W: extended Up");
+    check(name_w(0x023b0000u) == "F1", "W: F1");
+    check(name_a(0x021e0000u) == "A", "A: letter names itself");
+}
+
 static void test_user32_services() {
     section("menus, scrollbars, clipboard, resources and drawing");
     X86 c;
@@ -7481,6 +7670,8 @@ int main(int argc, char **argv) {
     test_user32_vcl();
     test_user32_window_model();
     test_host_mouse_routing();
+    test_host_mouse_double_click();
+    test_user32_key_names();
     test_user32_services();
     X86 *c = loader_context();
     if (child)
