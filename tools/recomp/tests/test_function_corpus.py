@@ -5,7 +5,36 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from corpus.run import parse_results, symbol_sizes
+from corpus.run import parse_results, symbol_sizes, reviewed_calls, bind_reviewed_calls
+from types import SimpleNamespace
+
+
+def test_direct_calls_require_reviewed_rows_and_mapped_returns():
+    row = {'address': '00100000', 'callees': ['00200000']}
+    insns = [SimpleNamespace(addr=0x100000, mnem='CALL', ops=['0x200000']),
+             SimpleNamespace(addr=0x100005, mnem='RET', ops=[])]
+    assert reviewed_calls(row, ['00100000', '00200000'], insns) == [0x100005]
+    with pytest.raises(ValueError, match='reviewed corpus rows'):
+        reviewed_calls(row, ['00100000'], insns)
+    with pytest.raises(ValueError, match='undeclared/indirect'):
+        reviewed_calls({'address': '00100000'}, ['00100000', '00200000'], insns)
+    insns[0].ops = ['EAX']
+    with pytest.raises(ValueError, match='undeclared/indirect'):
+        reviewed_calls(row, ['00100000', '00200000'], insns)
+    insns[0].ops = ['0x200000']
+    with pytest.raises(ValueError, match='mapped continuation'):
+        reviewed_calls(row, ['00100000', '00200000'], insns[:1])
+    with pytest.raises(ValueError, match='differ from decoded'):
+        reviewed_calls(row, ['00100000', '00200000'], insns[1:])
+
+
+def test_call_binding_preserves_mode_and_rejects_dispatch_or_extra_targets():
+    assert bind_reviewed_calls('CALL_FN(00200000);', ['00200000'], 'combined') == \
+        'combined_fn_00200000(c);'
+    for body in ('CALL_FN(00300000);', 'recomp_call(c, target);',
+                 'CALL_FN(00200000); recomp_jump(c, target);', ''):
+        with pytest.raises(ValueError, match='unsupported emitted'):
+            bind_reviewed_calls(body, ['00200000'], 'eager')
 
 
 def test_linked_spans_include_padding_and_keep_helpers_separate():

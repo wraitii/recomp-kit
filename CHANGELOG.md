@@ -218,6 +218,11 @@
   direction or oversized CFGs retain conservative lowering. Default off:
   additional precision selectors can increase native code and spills.
 ||||||| parent of 3edaa15 (Consolidate codegen experiments into native-reference corpus tools)
+||||||| parent of aa07dfe (Allow reviewed direct callees in function corpus)
+- Allow explicit direct callees in the native-reference function corpus. Calls
+  bind to byte-verified corpus rows in the same translation mode; mapped return
+  continuations are accepted without introducing stubs or general dispatch.
+
 - Consolidate x87 fragment and C/LLVM comparison tools under
   `tools/recomp/corpus/`, retaining their regressions and optional LLVM coverage.
   Add `--function-corpus` for byte-verified game functions with typed native C

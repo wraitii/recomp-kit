@@ -17,6 +17,12 @@ Outputs stay under the game's ignored `build/function-corpus/`. A manifest uses
 and unique nonnegative `fixture_id`. Sources/header resolve inside the manifest
 directory. The kit verifies the executable and the instruction-span hashes,
 decodes the public code-map boundaries and refuses rewrites/outward transfers.
+An optional per-row `callees` list names other reviewed corpus rows: only those
+decoded direct calls are permitted, and each invokes the callee in the same
+translation mode, in a separate translation unit. Callee rows retain their own
+byte hashes, fixtures and native references. Only mapped CALL continuations and
+the fixture's return sentinel are accepted as returns; indirect calls, tail
+transfers, SEH and undeclared dispatch still fail. No callee is stubbed.
 
 The game fixture header declares its arena, image base, scratch window, ordinary
 return sentinel and benchmark input. It supplies `corpus_setup`, entry reset,
@@ -33,7 +39,10 @@ explicit. These are current-runtime comparisons, not an original-x86 oracle.
 
 Reports include linked native spans/instruction counts, separate native adapter
 and kernel sizes, all timing trials, compile commands, provenance hashes and
-generation/build wall times. Timing failures and incomplete checks fail the run;
+generation/build wall times. Function text spans exclude separately compiled
+callee bodies; call-path timings include the actual executed callees. Native
+kernel spans likewise exclude out-of-line native callees. Timing failures and
+incomplete checks fail the run;
 no successful report is emitted for a failed corpus. `llvm-objdump` is required.
 Static SP accesses currently recognize arm64 addressing. Compiler settings are
 controlled O2/no contraction/no builtin substitution, not copied production

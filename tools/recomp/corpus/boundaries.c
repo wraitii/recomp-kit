@@ -9,9 +9,11 @@ static void unexpected(const char *name, uint32_t address) {
     abort();
 }
 int recomp_is_call_return(uint32_t address) {
-    if (address != CORPUS_RETURN)
-        unexpected("return", address);
-    return 1;
+    for (unsigned i = 0; i < sizeof corpus_call_returns / sizeof corpus_call_returns[0]; ++i)
+        if (address == corpus_call_returns[i])
+            return 1;
+    unexpected("return", address);
+    return 0;
 }
 int recomp_module_is_call_return(uint32_t address) {
     unexpected("module return", address);

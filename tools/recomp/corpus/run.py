@@ -25,6 +25,40 @@ KIT = HERE.parents[2]
 MODES = ('eager', 'cpu', 'x87', 'combined', 'native')
 
 
+def reviewed_calls(row, addresses, insns):
+    """Allow only declared direct calls to independently byte-verified rows.
+
+    Callees use the caller's translation mode in separate translation units.
+    No host stub, replacement, indirect dispatch or tail transfer is implied.
+    """
+    declared = row.get('callees', [])
+    if (not isinstance(declared, list) or any(not isinstance(a, str) for a in declared)
+            or len(set(declared)) != len(declared) or not set(declared) <= set(addresses)):
+        raise ValueError(f"{row['address']}: callees must name unique reviewed corpus rows")
+    targets, returns = set(), []
+    for index, ins in enumerate(insns):
+        if ins.mnem != 'CALL':
+            continue
+        target = T.Translator.branch_target(ins)
+        if target is None or f'{target:08x}' not in declared:
+            raise ValueError(f"{row['address']}: undeclared/indirect call at {ins.addr:08x}")
+        if index + 1 == len(insns):
+            raise ValueError(f"{row['address']}: call without mapped continuation")
+        targets.add(f'{target:08x}')
+        returns.append(insns[index + 1].addr)
+    if targets != set(declared):
+        raise ValueError(f"{row['address']}: declared callees differ from decoded calls")
+    return returns
+
+
+def bind_reviewed_calls(body, callees, mode):
+    """Bind explicit calls without accepting other emitted dispatch paths."""
+    targets = set(re.findall(r'\bCALL_FN\(([0-9a-f]{8})\)', body))
+    if targets != set(callees) or re.search(r'\brecomp_(?:call|jump|setjmp|seh|unknown_call)\b', body):
+        raise ValueError('undeclared or unsupported emitted call/transfer')
+    return re.sub(r'\bCALL_FN\(([0-9a-f]{8})\)', lambda m: f'{mode}_fn_{m[1]}(c)', body)
+
+
 def write_input(path, contents):
     """Preserve timestamps when emission is unchanged for incremental CMake."""
     data = contents.encode() if isinstance(contents, str) else contents
@@ -85,6 +119,7 @@ def markdown(report):
              'Translated/native-adapter times include entry reset and indirect-call overhead.',
              'Native-kernel times use the typed host ABI, without guest state/reset. No LTO, FMA or fast-math.',
              'Text spans include alignment and exclude out-of-line helper bodies; see JSON helper sizes.',
+             'Declared direct callees use the same translation mode; per-function spans exclude callee bodies.',
              'Original x86 bytes and host text sizes describe different architectures.', '',
              '| Function | Original bytes / x87 instructions | Eager bytes | Combined bytes | Native adapter / kernel bytes | Combined / native kernel ns per call |',
              '| --- | ---: | ---: | ---: | ---: | ---: |']
@@ -136,6 +171,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
         (out / filename).unlink(missing_ok=True)
     sources = []
     provenance = []
+    call_returns = set()
     started = time.monotonic()
     for row in rows:
         addr = int(row['address'], 16)
@@ -148,8 +184,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
             raise ValueError(f'{addr:08x}: reviewed instruction hash mismatch')
         if not re.fullmatch(r'clean_[a-zA-Z0-9_]+', row['kernel']):
             raise ValueError('invalid native kernel symbol')
-        if any(i.mnem == 'CALL' for i in insns):
-            raise ValueError(f'{addr:08x}: calls require a future explicit callee fixture')
+        call_returns.update(reviewed_calls(row, addresses, insns))
         instruction_addresses = {i.addr for i in insns}
         if any(T.Translator.branch_target(i) not in instruction_addresses
                for i in insns if i.mnem in T.JCC or i.mnem == 'JMP'):
@@ -170,11 +205,11 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
             if fn.seh_sites or fn.pushed_continuations:
                 raise ValueError(f'{addr:08x}: SEH/continuation entries require an explicit fixture')
             body = '\n'.join(tr.translate(fn))
-            if re.search(r'\bCALL_FN\(', body):
-                raise ValueError(f'{addr:08x}: undeclared outward transfer')
             body = re.sub(r'\b(fn|body|entry)_([0-9a-f]{8})\b', lambda m: mode + '_' + m[0], body)
+            body = bind_reviewed_calls(body, row.get('callees', []), mode)
+            prototypes = ''.join(f'void {mode}_fn_{a}(X86 *);\n' for a in row.get('callees', []))
             path = directory / (mode + '.c')
-            write_input(path, '#include "x86.h"\n' + body + '\n')
+            write_input(path, '#include "x86.h"\n' + prototypes + body + '\n')
             sources.append(path)
         provenance.append({**row, 'analysis_name': name, 'original_bytes': len(raw),
                            'original_instructions': len(insns),
@@ -193,6 +228,8 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
     quote = lambda p: json.dumps(str(p))
     write_input(out / 'sources.cmake', 'set(CORPUS_SOURCES\n' + '\n'.join(map(quote, sources)) + '\n)\n')
     declarations = [f'#include {quote(header)}', f'#define CORPUS_COUNT {len(rows)}', '#define CORPUS_MODES 5']
+    declarations.append('static const uint32_t corpus_call_returns[] = {CORPUS_RETURN' +
+                        ''.join(f',0x{a:08x}u' for a in sorted(call_returns)) + '};')
     for addr in addresses:
         for mode in MODES:
             symbol = f'{mode}_fn_{addr}' if mode != 'native' else f'native_{addr}'
