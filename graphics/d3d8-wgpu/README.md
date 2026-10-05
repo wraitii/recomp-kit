@@ -92,7 +92,10 @@ ignored build tree.
 
 Full-target color/depth/stencil clears, material/light storage, render/texture-stage
 state, world/view/projection transforms, viewport, scene boundaries, and unlit
-triangle-list draws with FVF 0x42/0x142/0x242 are supported. FVFs 0x112
+triangle-list draws with FVF 0x42/0x142/0x242 are supported. `D3DPT_POINTLIST`
+is also supported through wgpu's fixed one-pixel `PointList`, but only in D3D8's
+default point state: a non-default `D3DRS_POINTSIZE`, `D3DRS_POINTSCALEENABLE`
+or `D3DRS_POINTSPRITEENABLE` fails by name. FVFs 0x112
 (XYZ/NORMAL/TEX1) and 0x152 (XYZ/NORMAL/DIFFUSE/TEX1) add software
 diffuse/ambient/emissive vertex lighting (directional/point/spot), material
 sources and inverse-transpose normals, with floating diffuse passed to the
@@ -110,8 +113,8 @@ renderer. Headless present completes the offscreen frame; the guest bridge
 reads it back and presents through the host display seam.
 
 Specular lighting, programmable
-shaders, other FVFs/topologies and resource lock flags remain incomplete or
-unsupported. The light-index range is currently bounded to eight slots, an
+shaders, other FVFs, line and triangle-strip/fan topologies and resource lock
+flags remain incomplete or unsupported. The light-index range is currently bounded to eight slots, an
 implementation limit that must not be confused with D3D8's active-light capacity.
 Guest COM execution, GPU probes and original-D3D8 comparisons are different
 levels of evidence; the latter remain outstanding. Half-pixel raster coverage,

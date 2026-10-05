@@ -392,8 +392,9 @@ void write_caps(uint32_t addr) {
     // U/V are honoured. MIRRORONCE has no wgpu equivalent and is omitted.
     // VolumeTextureAddressCaps (+0x50) stays zero (no volume textures).
     wr32(addr + 0x4c, 0x0000001fu);
-    // LineCaps (+0x54) stays zero: DrawPrimitive accepts only TRIANGLELIST, so
-    // textured/z-tested/blended/alpha-tested/fogged lines are not offered.
+    // LineCaps (+0x54) stays zero: DrawPrimitive accepts only POINTLIST and
+    // TRIANGLELIST, so textured/z-tested/blended/alpha-tested/fogged lines are
+    // not offered.
     // MaxTextureWidth/MaxTextureHeight (D3DCAPS8 +0x58/+0x5c). A game that
     // sizes textures against these (Ghost Recon's 0x004eac20 halves an image
     // until it fits) collapses every texture to 1x1 when they read 0. 2048 is
@@ -444,8 +445,10 @@ void write_caps(uint32_t addr) {
     // MaxVertexBlendMatrixIndex (+0xac) stay zero because clip planes and
     // vertex blending are named refusals.
     wr32(addr + 0xa0, 8);
-    // MaxPointSize (+0xb0) stays zero: point primitives are not a supported
-    // topology.
+    // MaxPointSize (+0xb0) stays zero: POINTLIST draws at wgpu's fixed
+    // one-pixel point size, which is D3D8's default 1.0 and the only size the
+    // bridge honours (see `d3d8-wgpu::Device::draw_primitive` and
+    // `DeviceState::validate_point_draw`), so no larger size is offered.
     // MaxPrimitiveCount (+0xb4) is the DX8 HAL-scale batch limit; a draw is not
     // otherwise bounded by the bridge. MaxVertexIndex (+0xb8) is the 16-bit
     // vertex-index ceiling; MaxStreams (+0xbc) is one because SetStreamSource
@@ -2763,6 +2766,12 @@ void Dev_DrawIndexedPrimitive(X86 *c) {
     const uint8_t *ibytes = d8_buffer_bytes(ib);
     uint32_t stride = dev->d3d8_stream_stride;
     if (!vbytes || !ibytes || !stride || !num_vertices || !prim_count) {
+        // Name which precondition failed; a bare INVALIDCALL hides whether the
+        // guest drew with no stream/index buffer bound or with a zero count.
+        LOGW("d3d8: DrawIndexedPrimitive rejected: vb=%s ib=%s stride=%u num_vertices=%u "
+             "prim_count=%u topology=%u fvf=%08x",
+             vbytes ? "bound" : "none", ibytes ? "bound" : "none", stride, num_vertices,
+             prim_count, topology, dev->d3d8_fvf);
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }

@@ -109,6 +109,36 @@ fn skipped_fvf(fvf: u32) -> bool {
     .contains(&fvf)
 }
 
+/// D3DPRIMITIVETYPE value for a non-indexed draw, mapped to the number of
+/// vertices each primitive consumes.
+///
+/// Only POINTLIST (1) and TRIANGLELIST (4) are implemented. The guest draws
+/// points for the star field (`FUN_00545ca0`) and triangle lists for everything
+/// else; strips, fans and lines are unused and fail by name rather than being
+/// expanded or silently dropped.
+fn topology_vertex_count(topology: u32, primitive_count: u32) -> Result<u32, RenderError> {
+    match topology {
+        // D3DPT_POINTLIST: one vertex per point.
+        1 => Ok(primitive_count),
+        // D3DPT_TRIANGLELIST: three vertices per triangle.
+        4 => primitive_count
+            .checked_mul(3)
+            .ok_or_else(|| RenderError::new("DrawPrimitive", "vertex range overflow")),
+        other => Err(RenderError::new(
+            "DrawPrimitive",
+            format!("unsupported topology {other}; expected POINTLIST (1) or TRIANGLELIST (4)"),
+        )),
+    }
+}
+
+/// Translate a validated D3DPRIMITIVETYPE into its wgpu topology.
+fn wgpu_topology(topology: u32) -> wgpu::PrimitiveTopology {
+    match topology {
+        1 => wgpu::PrimitiveTopology::PointList,
+        _ => wgpu::PrimitiveTopology::TriangleList,
+    }
+}
+
 /// Map `D3DRS_ZBIAS` (D3D8's documented 0..=16 range) onto wgpu's constant
 /// depth bias. A guest uses it to separate coplanar overlay layers, so only a
 /// small monotonic bias is required.
@@ -978,6 +1008,7 @@ struct DrawStats {
 /// texture targets.)
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct DrawPipelineKey {
+    topology: wgpu::PrimitiveTopology,
     color_format: wgpu::TextureFormat,
     color_write_mask: wgpu::ColorWrites,
     depth_format: Option<wgpu::TextureFormat>,
@@ -1664,17 +1695,21 @@ impl Device {
                 }
             };
         }
-        if topology != 4 {
-            let error = RenderError::new(
-                "DrawPrimitive",
-                format!("unsupported topology {topology}; expected TRIANGLELIST (4)"),
-            );
-            if self.note_draw_rejection(&error, topology, fvf, vertices.stride) {
-                return Ok(());
+        let vertex_count = match topology_vertex_count(topology, primitive_count) {
+            Ok(count) => count,
+            Err(error) => {
+                if self.note_draw_rejection(&error, topology, fvf, vertices.stride) {
+                    return Ok(());
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
         survey_or_skip!(self.state.validate_draw(fvf));
+        if topology == 1 {
+            // wgpu's PointList is fixed at one pixel; only D3D8's default point
+            // configuration is faithful (see `validate_point_draw`).
+            survey_or_skip!(self.state.validate_point_draw());
+        }
         if self.state.z_enable() && !self.has_depth() {
             let error = RenderError::new(
                 "DrawPrimitive",
@@ -1693,9 +1728,8 @@ impl Device {
             }
             return Err(error);
         }
-        let count = primitive_count
-            .checked_mul(3)
-            .and_then(|n| start_vertex.checked_add(n))
+        let count = start_vertex
+            .checked_add(vertex_count)
             .ok_or_else(|| RenderError::new("DrawPrimitive", "vertex range overflow"))?;
         if count as u64 * layout.stride > vertices.bytes().len() as u64 {
             return Err(RenderError::new(
@@ -1785,8 +1819,15 @@ impl Device {
         // varies vertex layout and effective depth/blend pipeline state.
         let depth_state = self.depth_stencil_state();
         let blend = survey_or_skip!(self.blend_state());
-        let (cull_mode, front_face) = self.cull_state();
+        let (cull_mode, front_face) = if topology == 1 {
+            // Culling does not apply to points; keep the pipeline independent
+            // of the triangle cull state.
+            (None, wgpu::FrontFace::Ccw)
+        } else {
+            self.cull_state()
+        };
         let key = DrawPipelineKey {
+            topology: wgpu_topology(topology),
             color_format: self.target.format,
             color_write_mask: color_writes_from_mask(self.state.color_write_mask())
                 & self.target.color_write_mask(),
@@ -1988,7 +2029,7 @@ impl Device {
                     buffers: &[upload_layout.vertex_buffer_layout()],
                 },
                 primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    topology: wgpu_topology(topology),
                     cull_mode,
                     front_face,
                     ..Default::default()
@@ -2602,6 +2643,23 @@ impl Device {
 mod tests {
     use super::blend_factor;
     use crate::d3d8::enums::D3DBLEND;
+
+    #[test]
+    fn point_and_triangle_topologies_consume_the_right_vertex_count() {
+        use super::{topology_vertex_count, wgpu_topology};
+        // POINTLIST: one vertex per point.
+        assert_eq!(topology_vertex_count(1, 7).unwrap(), 7);
+        assert_eq!(wgpu_topology(1), wgpu::PrimitiveTopology::PointList);
+        // TRIANGLELIST: three vertices per triangle.
+        assert_eq!(topology_vertex_count(4, 7).unwrap(), 21);
+        assert_eq!(wgpu_topology(4), wgpu::PrimitiveTopology::TriangleList);
+        // Overflow and the unimplemented line/strip/fan topologies fail by name.
+        assert!(topology_vertex_count(4, u32::MAX).is_err());
+        for topology in [0, 2, 3, 5, 6, 7] {
+            let err = topology_vertex_count(topology, 1).unwrap_err();
+            assert!(err.cause.contains("expected POINTLIST (1) or TRIANGLELIST (4)"));
+        }
+    }
 
     #[test]
     fn cull_modes_map_to_the_d3d8_winding() {

@@ -203,6 +203,26 @@ struct RenderStates {
     /// device ANDs it with the target's own channel rule, so `0` is a
     /// depth-only draw and the documented default `0xF` writes every channel.
     color_write_mask: u32,
+    /// `D3DRS_POINTSIZE` as the raw float bit pattern. D3D8 defaults to `1.0`;
+    /// wgpu's `PointList` is fixed at one pixel, so a point draw only accepts
+    /// the default size (see [`DeviceState::validate_point_draw`]).
+    point_size: u32,
+    /// `D3DRS_POINTSIZE_MIN` raw float bits (D3D8 default `1.0`).
+    point_size_min: u32,
+    /// `D3DRS_POINTSIZE_MAX` raw float bits (D3D8 default `64.0`).
+    point_size_max: u32,
+    /// `D3DRS_POINTSPRITEENABLE`. D3D8 defaults to FALSE; wgpu has no
+    /// `gl_PointCoord`, so the enabled state is a named refusal.
+    point_sprite_enable: bool,
+    /// `D3DRS_POINTSCALEENABLE`. D3D8 defaults to FALSE; wgpu cannot vary
+    /// point size by distance, so the enabled state is a named refusal.
+    point_scale_enable: bool,
+    /// `D3DRS_POINTSCALE_A/B/C` raw float bits (defaults `1.0`/`0.0`/`0.0`).
+    /// Stored faithfully for state round-trip and diagnostics; a draw that
+    /// enables `D3DRS_POINTSCALEENABLE` is refused before they are applied.
+    point_scale_a: u32,
+    point_scale_b: u32,
+    point_scale_c: u32,
     alpha_ref: u32,
     alpha_func: D3DCMPFUNC,
     dither_enable: bool,
@@ -256,6 +276,14 @@ impl RenderStates {
             z_func: D3DCMPFUNC::LessEqual,
             z_bias: 0,
             color_write_mask: 0xF,
+            point_size: 1.0f32.to_bits(),
+            point_size_min: 1.0f32.to_bits(),
+            point_size_max: 64.0f32.to_bits(),
+            point_sprite_enable: false,
+            point_scale_enable: false,
+            point_scale_a: 1.0f32.to_bits(),
+            point_scale_b: 0.0f32.to_bits(),
+            point_scale_c: 0.0f32.to_bits(),
             alpha_ref: 0,
             alpha_func: D3DCMPFUNC::Always,
             dither_enable: false,
@@ -459,6 +487,18 @@ impl DeviceState {
                 }
                 self.states.color_write_mask = value;
             }
+            Rs::PointSize => self.states.point_size = value,
+            Rs::PointSizeMin => self.states.point_size_min = value,
+            Rs::PointSizeMax => self.states.point_size_max = value,
+            Rs::PointSpriteEnable => {
+                self.states.point_sprite_enable = bool_state(Rs::PointSpriteEnable, value)?;
+            }
+            Rs::PointScaleEnable => {
+                self.states.point_scale_enable = bool_state(Rs::PointScaleEnable, value)?;
+            }
+            Rs::PointScaleA => self.states.point_scale_a = value,
+            Rs::PointScaleB => self.states.point_scale_b = value,
+            Rs::PointScaleC => self.states.point_scale_c = value,
             Rs::AlphaRef => self.states.alpha_ref = value,
             Rs::AlphaFunc => self.states.alpha_func = D3DCMPFUNC::from_raw(value)?,
             Rs::DitherEnable => {
@@ -1069,6 +1109,57 @@ impl DeviceState {
         self.validate_fixed_function(false, false)
     }
 
+    /// Validate the D3D8 point state for a `POINTLIST` draw.
+    ///
+    /// wgpu rasterizes `PrimitiveTopology::PointList` as exactly one pixel and
+    /// exposes no point-size or point-sprite input (WGSL has no `gl_PointSize`
+    /// or `gl_PointCoord`). That is faithful to D3D8 only when
+    /// `D3DRS_POINTSCALEENABLE` and `D3DRS_POINTSPRITEENABLE` are FALSE and the
+    /// MIN/MAX-clamped `D3DRS_POINTSIZE` is `1.0`. Every other configuration
+    /// fails by name instead of silently drawing a differently sized or
+    /// untextured point. The guest's star field (`FUN_00545ca0`) sets only
+    /// `D3DRS_POINTSCALE_A = 1.0` and leaves the rest at these defaults, so it
+    /// passes.
+    pub fn validate_point_draw(&self) -> Result<(), RenderError> {
+        let s = &self.states;
+        let unsupported = |what: &str| {
+            RenderError::new(
+                "d3d8::state::validate_point_draw",
+                format!("unsupported state for POINTLIST draw: {what}"),
+            )
+        };
+        if s.point_scale_enable {
+            return Err(unsupported(
+                "D3DRS_POINTSCALEENABLE is TRUE; wgpu PointList cannot apply distance-scaled point size",
+            ));
+        }
+        if s.point_sprite_enable {
+            return Err(unsupported(
+                "D3DRS_POINTSPRITEENABLE is TRUE; wgpu PointList has no gl_PointCoord for per-point sprite texture coordinates",
+            ));
+        }
+        // D3D8 clamps D3DRS_POINTSIZE into [MIN, MAX] before rasterization.
+        // wgpu always draws one pixel, so only an effective size of 1.0 is
+        // faithful. A NaN size propagates through the comparisons and is
+        // refused rather than guessed at.
+        let size = f32::from_bits(s.point_size);
+        let min = f32::from_bits(s.point_size_min).max(0.0);
+        let max = f32::from_bits(s.point_size_max).max(0.0);
+        let effective = if size < min {
+            min
+        } else if size > max {
+            max
+        } else {
+            size
+        };
+        if effective != 1.0 {
+            return Err(unsupported(&format!(
+                "D3DRS_POINTSIZE is {size} (clamped to {effective} by MIN/MAX); wgpu PointList is fixed at one pixel"
+            )));
+        }
+        Ok(())
+    }
+
     /// Validate the state consumed by the supported guest vertex layout.
     pub fn validate_draw(&self, fvf: u32) -> Result<(), RenderError> {
         let pre_transformed = matches!(fvf, 0x01C4 | 0x02C4);
@@ -1230,19 +1321,12 @@ fn raw_state_reached(state: u32, value: u32) -> bool {
         | Ok(Rs::StencilRef)
         | Ok(Rs::StencilMask)
         | Ok(Rs::StencilWriteMask) => false,
-        // Software-rasterizer details and line/point/patch state do not affect
-        // a hardware triangle.
+        // Software-rasterizer details and line/patch state do not affect a
+        // hardware triangle. (The point states are typed now and are checked
+        // by `validate_point_draw`, so they never reach the raw map.)
         Ok(Rs::LinePattern)
         | Ok(Rs::LastPixel)
         | Ok(Rs::EdgeAntiAlias)
-        | Ok(Rs::PointSize)
-        | Ok(Rs::PointSizeMin)
-        | Ok(Rs::PointSpriteEnable)
-        | Ok(Rs::PointScaleEnable)
-        | Ok(Rs::PointScaleA)
-        | Ok(Rs::PointScaleB)
-        | Ok(Rs::PointScaleC)
-        | Ok(Rs::PointSizeMax)
         | Ok(Rs::PatchEdgeStyle)
         | Ok(Rs::PatchSegments)
         | Ok(Rs::DebugMonitorToken)
@@ -2120,6 +2204,35 @@ mod tests {
     }
 
     #[test]
+    fn point_state_accepts_only_the_wgpu_pointlist_configuration() {
+        let mut state = DeviceState::new(64, 64);
+        // Defaults plus the guest's POINTSCALE_A = 1.0 pass.
+        state.set_render_state(158, 1.0f32.to_bits()).unwrap();
+        state.validate_point_draw().unwrap();
+        // A non-default point size has no wgpu equivalent.
+        state.set_render_state(154, 2.0f32.to_bits()).unwrap();
+        assert!(state.validate_point_draw().is_err());
+        state.set_render_state(154, 1.0f32.to_bits()).unwrap();
+        state.validate_point_draw().unwrap();
+        // A point sprite needs gl_PointCoord.
+        state.set_render_state(156, 1).unwrap();
+        assert!(state.validate_point_draw().is_err());
+        state.set_render_state(156, 0).unwrap();
+        // Distance-scaled size is not representable.
+        state.set_render_state(157, 1).unwrap();
+        assert!(state.validate_point_draw().is_err());
+        state.set_render_state(157, 0).unwrap();
+        // A MIN/MAX clamp that moves the size away from 1.0 is refused too.
+        state.set_render_state(155, 2.0f32.to_bits()).unwrap();
+        assert!(state.validate_point_draw().is_err());
+        state.set_render_state(155, 1.0f32.to_bits()).unwrap();
+        state.set_render_state(166, 0.5f32.to_bits()).unwrap();
+        assert!(state.validate_point_draw().is_err());
+        state.set_render_state(166, 64.0f32.to_bits()).unwrap();
+        state.validate_point_draw().unwrap();
+    }
+
+    #[test]
     fn table_fog_states_are_stored_and_validated() {
         let mut state = DeviceState::new(64, 64);
         configure_probe_states(&mut state);
@@ -2191,6 +2304,14 @@ mod tests {
         assert_eq!(s.cull_mode, D3DCULL::Ccw);
         assert_eq!(s.z_func, D3DCMPFUNC::LessEqual);
         assert_eq!(s.alpha_func, D3DCMPFUNC::Always);
+        assert_eq!(s.point_size, 1.0f32.to_bits());
+        assert_eq!(s.point_size_min, 1.0f32.to_bits());
+        assert_eq!(s.point_size_max, 64.0f32.to_bits());
+        assert!(!s.point_sprite_enable);
+        assert!(!s.point_scale_enable);
+        assert_eq!(s.point_scale_a, 1.0f32.to_bits());
+        assert_eq!(s.point_scale_b, 0.0f32.to_bits());
+        assert_eq!(s.point_scale_c, 0.0f32.to_bits());
         assert!(!s.alpha_blend_enable);
         assert!(!s.fog_enable);
         assert!(s.clipping);

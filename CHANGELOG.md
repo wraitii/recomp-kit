@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- D3D8/wgpu `DrawPrimitive` now rasterizes `D3DPT_POINTLIST` (1) through
+  wgpu's `PrimitiveTopology::PointList`. wgpu always rasterizes one pixel and
+  exposes no point size or point sprite, which is exactly D3D8's default point
+  state (`D3DRS_POINTSIZE` 1.0, no scale, no sprite), so that configuration is
+  accepted. Non-default size, `D3DRS_POINTSCALEENABLE` or
+  `D3DRS_POINTSPRITEENABLE` fail by name instead of drawing a differently sized
+  or untextured point. A `POINTLIST` indexed draw is still refused by name
+  (`resource.rs`), and the UP variants remain unsupported imports. Railroad
+  Tycoon 3's star field (`FUN_00545ca0`) is the motivating caller; the offscreen
+  probe gained a `point list/readback` check.
+
 - D3D8 `CheckDeviceFormat` now answers `D3D_OK` for a render-target texture
   (`D3DUSAGE_RENDERTARGET` with `D3DRTYPE_TEXTURE` and an offscreen color
   format) instead of only for a standalone render-target surface. The bridge

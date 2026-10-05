@@ -240,6 +240,7 @@ fn run_with_gpu(
             "direct readback ABI bounds",
             "clear/readback",
             "transformed triangle/readback",
+            "point list/readback",
             "depth test/readback",
             "table fog/readback",
             "cull winding/readback",
@@ -393,6 +394,43 @@ fn run_with_gpu(
         && background == CLEAR
         && order_sensitive == CLEAR;
     report.checks.push(CheckResult { name: "transformed triangle/readback", outcome: if passed { Outcome::Passed } else { Outcome::Failed }, detail: format!("translated interior={interior:?}, vacated location={old_location:?}, background={background:?}, order-sensitive background={order_sensitive:?}") });
+
+    // POINTLIST: D3D8's default point state (POINTSIZE 1.0, no scale, no
+    // sprite) rasterizes a single pixel. wgpu `PointList` has the same fixed
+    // one-pixel coverage, so a point at NDC centre must land on the centre
+    // pixel with the vertex diffuse colour. This is the GPU-side validation of
+    // the topology the guest's star field (`FUN_00545ca0`) draws.
+    device.clear(0, 1 | 2, 0x00000000, 1.0, 0)?;
+    // The preceding triangle check left translated matrices in place; a point
+    // at NDC centre must be drawn with the identity transform to land on the
+    // centre pixel.
+    device.state.world = Mat4::IDENTITY;
+    device.state.view = Mat4::IDENTITY;
+    device.state.projection = Mat4::IDENTITY;
+    let mut point_bytes = Vec::new();
+    for component in [0.0f32, 0.0, 0.5] {
+        point_bytes.extend_from_slice(&component.to_le_bytes());
+    }
+    point_bytes.extend_from_slice(&0xff20d0f0u32.to_le_bytes());
+    let point = VertexBuffer::new(&point_bytes, 16)?;
+    device.begin_scene()?;
+    device.draw_primitive(1, 0x42, &point, 0, 1)?;
+    device.end_scene()?;
+    let point_pixels = device.read_pixels()?;
+    checked_pixels(&point_pixels, options.width, options.height)?;
+    let point_center =
+        ((options.width as usize / 2) + (options.height as usize / 2) * options.width as usize) * 4;
+    let point_sample: [u8; 4] = point_pixels[point_center..point_center + 4].try_into().unwrap();
+    let point_ok = point_sample == [0x20, 0xd0, 0xf0, 0xff];
+    report.checks.push(CheckResult {
+        name: "point list/readback",
+        outcome: if point_ok {
+            Outcome::Passed
+        } else {
+            Outcome::Failed
+        },
+        detail: format!("centre pixel={point_sample:?}, expected [0x20, 0xd0, 0xf0, 0xff]"),
+    });
 
     // Depth test: with ZENABLE on, a nearer triangle drawn first must not be
     // overwritten by a farther one drawn second. A pipeline/pass attachment
