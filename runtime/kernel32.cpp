@@ -616,7 +616,17 @@ void fill_find_data(uint32_t addr, const std::string &host_path, const std::stri
                     bool wide) {
     memset(g_mem + addr, 0, wide ? 592 : 320);
     OsStat st{};
-    if (os_stat(host_path.c_str(), &st) == 0) {
+    bool have_stat = os_stat(host_path.c_str(), &st) == 0;
+    if (name == "." || name == "..") {
+        // Windows' synthetic directory entries always report as directories
+        // with no file size; only the timestamps come from the directory.
+        wr32(addr + 0, FILE_ATTRIBUTE_DIRECTORY_);
+        if (have_stat) {
+            put_filetime(addr + 4, st.ctime);
+            put_filetime(addr + 12, st.atime);
+            put_filetime(addr + 20, st.mtime);
+        }
+    } else if (have_stat) {
         wr32(addr + 0, attrs_for(st));
         put_filetime(addr + 4, st.ctime);
         put_filetime(addr + 12, st.atime);
@@ -4511,6 +4521,24 @@ void find_first_named(X86 *c, const std::string &pattern, bool wide) {
     uint32_t h = handle_new(H_FIND);
     HObj &o = handles()[h];
 
+    // A real Win32 directory search reports "." and ".." at the head of the
+    // results whenever the mask matches them ("*" and "*.*" do, "*.tga"
+    // does not). os_listdir drops those entries because its other consumers
+    // need them gone, so synthesize them here in Win32 order. The game's
+    // GrafxResMgr::ScanAndRegisterFiles skips the first two FindNextFileA
+    // results assuming they are "." and ".."; without them it eats the first
+    // two real map files and the terrain colour never loads.
+    std::string host_dir = dirpart.empty() ? win32_host_path_op(".", WIN32_FILE_LIST)
+                                           : win32_host_path_op(dirpart, WIN32_FILE_LIST);
+    auto add_dot = [&](const char *name) {
+        o.matches.push_back(name);
+        o.match_paths.push_back(host_dir);
+    };
+    if (wildcard_match(leaf.c_str(), "."))
+        add_dot(".");
+    if (wildcard_match(leaf.c_str(), ".."))
+        add_dot("..");
+
     if (g_file_list) {
         // The lister is given the SAME normalised relative directory a file
         // open would produce, so a listing and an open agree about what path
@@ -4526,6 +4554,8 @@ void find_first_named(X86 *c, const std::string &pattern, bool wide) {
             rel.c_str(),
             [](void *p, const char *nm, const char *host) {
                 Ctx *cx = (Ctx *)p;
+                if (strcmp(nm, ".") == 0 || strcmp(nm, "..") == 0)
+                    return; // synthesized above in Win32 order
                 if (!wildcard_match(cx->leaf, nm))
                     return;
                 cx->o->matches.push_back(nm);
@@ -4533,8 +4563,6 @@ void find_first_named(X86 *c, const std::string &pattern, bool wide) {
             },
             &ctx);
     } else {
-        std::string host_dir = dirpart.empty() ? win32_host_path_op(".", WIN32_FILE_LIST)
-                                               : win32_host_path_op(dirpart, WIN32_FILE_LIST);
         if (host_dir.empty()) {
             handles().erase(h);
             set_last_error(ERROR_PATH_NOT_FOUND_);

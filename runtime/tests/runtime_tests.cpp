@@ -4422,6 +4422,10 @@ static void test_lister(const char *dir, void (*emit)(void *, const char *, cons
     emit(ctx, "two.txt", (host + "/two.txt").c_str());
 }
 
+// A lister that reports an empty directory, used to pin the synthetic dot
+// entries in the mod-lister branch.
+static void test_empty_lister(const char *, void (*)(void *, const char *, const char *), void *) {}
+
 // LoadImageA(LR_LOADFROMFILE|LR_CREATEDIBSECTION) must expose the file's own
 // bit depth and row order, as Windows does. A 24-bpp BMP has to stay 24-bpp:
 // the font loader walks the bits as packed 3-byte pixels, and a 32-bpp DIB made
@@ -4801,6 +4805,140 @@ static void test_mod_seams(X86 *c) {
 
     check(std::string(loader_exe_sha256()) == std::string(LOADER_EXPECTED_SHA256),
           "the loader reports the digest of the image it actually mapped");
+}
+
+// A Win32 directory search reports "." and ".." first whenever the mask
+// matches them. The host's os_listdir strips them for its other consumers, so
+// the shim synthesizes them; these checks pin the ordering the game's
+// terrain-file scan depends on.
+static void test_find_win32_dot_entries(X86 *c) {
+    section("Win32 find reports \".\" and \"..\" first");
+    uint32_t fd = scratch_block(0x140);
+
+    // The default (non-lister) branch enumerates a real directory under the
+    // game directory, so the names and their order are known.
+    const std::string base = "recomp-find-dot-test";
+    const std::string dir = win32_game_dir() + "/" + base;
+    const std::string empty = base + "-empty";
+    const std::string emptydir = win32_game_dir() + "/" + empty;
+    remove_tree(dir);
+    remove_tree(emptydir);
+    mkdir_p(dir);
+    mkdir_p(emptydir);
+    FILE *f = fopen((dir + "/Alpha.tga").c_str(), "wb");
+    check(f != nullptr, "created Alpha.tga fixture");
+    if (f) {
+        fputs("tga", f);
+        fclose(f);
+    }
+    f = fopen((dir + "/Beta.txt").c_str(), "wb");
+    check(f != nullptr, "created Beta.txt fixture");
+    if (f) {
+        fputs("txt", f);
+        fclose(f);
+    }
+    win32_invalidate_dir_cache();
+
+    // The guest's FindFirst/FindNext/FindNext skip pattern must consume the
+    // two synthetic entries and then see the first real file, not drop it.
+    {
+        uint32_t pat = put_str((base + "\\*.*").c_str());
+        uint32_t h = call_import(c, "KERNEL32.dll", "FindFirstFileA", {pat, fd});
+        check(h != 0xffffffffu, "FindFirstFileA(\"%s\\*.*\") finds the directory", base.c_str());
+        if (h != 0xffffffffu) {
+            check(gm_str(fd + 44) == "." && (rd32(fd) & 0x10),
+                  "\"*.*\" first entry is \".\" and reports a directory");
+            check(rd32(fd + 28) == 0 && rd32(fd + 32) == 0, "and \".\" has zero size");
+            check(call_import(c, "KERNEL32.dll", "FindNextFileA", {h, fd}) == 1 &&
+                      gm_str(fd + 44) == ".." && (rd32(fd) & 0x10),
+                  "\"*.*\" second entry is \"..\" and reports a directory");
+            check(call_import(c, "KERNEL32.dll", "FindNextFileA", {h, fd}) == 1 &&
+                      gm_str(fd + 44) == "Alpha.tga",
+                  "the two Win32 skips land on the first real file");
+            call_import(c, "KERNEL32.dll", "FindClose", {h});
+        }
+    }
+
+    // A concrete extension excludes the synthetic directory entries.
+    {
+        uint32_t pat = put_str((base + "\\*.tga").c_str());
+        uint32_t h = call_import(c, "KERNEL32.dll", "FindFirstFileA", {pat, fd});
+        check(h != 0xffffffffu && gm_str(fd + 44) == "Alpha.tga",
+              "\"*.tga\" excludes \".\" and \"..\"");
+        if (h != 0xffffffffu) {
+            check(call_import(c, "KERNEL32.dll", "FindNextFileA", {h, fd}) == 0 &&
+                      call_import(c, "KERNEL32.dll", "GetLastError", {}) == 18,
+                  "and ends after the single real match");
+            call_import(c, "KERNEL32.dll", "FindClose", {h});
+        }
+    }
+
+    // A non-wildcard path lookup is unchanged: exactly that file.
+    {
+        uint32_t pat = put_str((base + "\\Alpha.tga").c_str());
+        uint32_t h = call_import(c, "KERNEL32.dll", "FindFirstFileA", {pat, fd});
+        check(h != 0xffffffffu && gm_str(fd + 44) == "Alpha.tga",
+              "a non-wildcard name matches only itself");
+        if (h != 0xffffffffu) {
+            check(call_import(c, "KERNEL32.dll", "FindNextFileA", {h, fd}) == 0,
+                  "and has no second entry");
+            call_import(c, "KERNEL32.dll", "FindClose", {h});
+        }
+    }
+
+    // An empty directory still yields "." and ".." for a matching mask.
+    {
+        uint32_t pat = put_str((empty + "\\*.*").c_str());
+        uint32_t h = call_import(c, "KERNEL32.dll", "FindFirstFileA", {pat, fd});
+        check(h != 0xffffffffu && gm_str(fd + 44) == ".",
+              "an empty directory still reports \".\" first");
+        if (h != 0xffffffffu) {
+            check(call_import(c, "KERNEL32.dll", "FindNextFileA", {h, fd}) == 1 &&
+                      gm_str(fd + 44) == "..",
+                  "then \"..\"");
+            check(call_import(c, "KERNEL32.dll", "FindNextFileA", {h, fd}) == 0 &&
+                      call_import(c, "KERNEL32.dll", "GetLastError", {}) == 18,
+                  "and nothing else");
+            call_import(c, "KERNEL32.dll", "FindClose", {h});
+        }
+    }
+
+    // A mask that matches neither a dot entry nor a real file fails the same
+    // way an unmatched directory always did.
+    {
+        uint32_t pat = put_str((base + "\\*.zzz").c_str());
+        uint32_t h = call_import(c, "KERNEL32.dll", "FindFirstFileA", {pat, fd});
+        check(h == 0xffffffffu && call_import(c, "KERNEL32.dll", "GetLastError", {}) == 2,
+              "a non-matching mask is ERROR_FILE_NOT_FOUND");
+    }
+
+    // The mod-lister branch synthesizes the same two entries, even when the
+    // lister reports an empty directory.
+    {
+        g_seam_root = "build/recomp/find-dot-lister-test";
+        remove_tree(g_seam_root);
+        mkdir_p(g_seam_root + "/read");
+        win32_set_file_ops(test_resolver, test_empty_lister);
+        uint32_t pat = put_str("nothing\\*.*");
+        uint32_t h = call_import(c, "KERNEL32.dll", "FindFirstFileA", {pat, fd});
+        check(h != 0xffffffffu && gm_str(fd + 44) == ".",
+              "a lister that emits nothing still gets \".\" first");
+        if (h != 0xffffffffu) {
+            check(call_import(c, "KERNEL32.dll", "FindNextFileA", {h, fd}) == 1 &&
+                      gm_str(fd + 44) == "..",
+                  "then \"..\"");
+            check(call_import(c, "KERNEL32.dll", "FindNextFileA", {h, fd}) == 0,
+                  "and no real entries");
+            call_import(c, "KERNEL32.dll", "FindClose", {h});
+        }
+        win32_set_file_ops(nullptr, nullptr);
+        remove_tree(g_seam_root);
+        g_seam_root.clear();
+    }
+
+    remove_tree(dir);
+    remove_tree(emptydir);
+    win32_invalidate_dir_cache();
 }
 
 // ---------------------------------------------------------------------------
@@ -7717,6 +7855,7 @@ int main(int argc, char **argv) {
     test_scheduling(c);
     test_exit_process_stops_workers(c);
     test_mod_seams(c);
+    test_find_win32_dot_entries(c);
     test_input_wakes_a_parked_thread(c);
     test_intrinsics(c);
     test_undeliverable_calls(c);
