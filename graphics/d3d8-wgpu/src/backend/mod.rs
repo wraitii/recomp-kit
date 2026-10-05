@@ -243,10 +243,16 @@ impl GpuContext {
         window: Option<Arc<winit::window::Window>>,
     ) -> Result<Self, RenderError> {
         let adapter_info = adapter.get_info();
+        // D3DTADDRESS_BORDER maps to ClampToBorder, an optional wgpu feature.
+        // Request it only when the adapter has it; a guest that then selects
+        // border addressing fails with a named sampler error on adapters
+        // without it instead of the whole device failing to open.
+        let required_features =
+            adapter.features() & wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("d3d8-wgpu"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: wgpu::Limits::default(),
                 ..Default::default()
             })

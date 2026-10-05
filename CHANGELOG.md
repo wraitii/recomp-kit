@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- d3d8-wgpu requests wgpu's `ADDRESS_MODE_CLAMP_TO_BORDER` feature when the adapter offers it, so a guest using `D3DTADDRESS_BORDER` gets a valid sampler instead of a validation failure at sampler creation. The border color stays transparent black (`D3DTSS_BORDERCOLOR` is not yet honoured).
+
 - USER32 `ToAscii`/`ToAsciiEx` translate a virtual key against the caller's
   key-state array for the en-US layout; dead keys and non-US layouts remain
   `SHIM(temporary)`.
