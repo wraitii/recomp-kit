@@ -267,8 +267,7 @@ class Region:
         return lines
 
 
-def lower_regions(fn, bodies, labels, dead, parse_operand, protected=(), cfg=None,
-                  cfg_widths=False):
+def lower_regions(fn, bodies, labels, dead, parse_operand, protected=(), cfg=None):
     """Replace supported regions without moving accesses or crossing entries.
 
     Result maps original instruction indices to output; interior indices of an
@@ -281,8 +280,7 @@ def lower_regions(fn, bodies, labels, dead, parse_operand, protected=(), cfg=Non
     consumed = set()
     count = instructions = 0
     if cfg is not None:
-        consumed, count = lower_branch_regions(fn, result, labels, dead, parse_operand,
-                                               protected, *cfg, cfg_widths=cfg_widths)
+        consumed, count = lower_branch_regions(fn, result, labels, dead, parse_operand, protected, *cfg)
         instructions = len(consumed)
     region = Region()
 
@@ -375,7 +373,7 @@ class BranchRegion(Region):
 
 
 def lower_branch_regions(fn, bodies, labels, dead, parse_operand, protected,
-                         successors, branch_target, conditional, entries, cfg_widths=False):
+                         successors, branch_target, conditional, entries):
     """Lower contiguous single-entry CFGs, refusing inconsistent TOP joins.
 
     External/indirect transfers, listing gaps and helper bodies are barriers.
@@ -457,26 +455,15 @@ def lower_branch_regions(fn, bodies, labels, dead, parse_operand, protected,
                     queue.append(j)
         if not consistent or len(tops) != b - a:
             continue
-        widths = None
-        if cfg_widths:
-            from x87_dataflow import width_effect, binary32_inputs
-            effects = {i: width_effect(fn.insns[i], tops[i], parse_operand)
-                       for i in range(a, b)}
-            # Check decoded stack effects against the comparison emitter.
-            # Refusal keeps the previous basic-block provenance path.
-            if all(effect is not None and effect.delta == delta[i]
-                   for i, effect in effects.items()):
-                widths = binary32_inputs(effects, succ, a)
         region = BranchRegion()
         rewritten = {}
         for i in range(a, b):
             region.top = tops[i]
             region.lines = []
-            # Optional decoded must-proofs require every incoming CFG edge.
-            # The comparison path proves widths only within basic blocks.
-            if widths is not None:
-                region.single = set(widths[i])
-            elif (fn.insns[i].addr in labels or i == a or
+            # Prove widths locally within each basic block. A label or branch
+            # cuts provenance, so joins/backedges never inherit another path's
+            # speculative input widths. Local values themselves remain live.
+            if (fn.insns[i].addr in labels or i == a or
                     fn.insns[i-1].mnem in conditional or fn.insns[i-1].mnem == "JMP"):
                 region.single.clear()
             if not region.append(i, bodies[i], fn.insns[i].mnem in FLOAT_OPS):

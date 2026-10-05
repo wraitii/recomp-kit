@@ -20,23 +20,6 @@ gen_game_config = load_module("gen_game_config")
 
 
 class LoadTests(unittest.TestCase):
-    def test_x87_cfg_widths_defaults_and_rejects_non_boolean(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            game = Path(tmp)
-            stub = (ROOT / "games/stub/game.toml").read_text()
-            (game / "globals.toml").write_text("")
-            (game / "game.toml").write_text(stub)
-            self.assertFalse(game_config.load(game)["translate"]["x87_cfg_widths"])
-            for value in ("true", "false", "1", '"true"'):
-                (game / "game.toml").write_text(stub.replace(
-                    "[translate]\n", "[translate]\nx87_cfg_widths = " + value + "\n"))
-                if value in ("true", "false"):
-                    self.assertEqual(game_config.load(game)["translate"]["x87_cfg_widths"],
-                                     value == "true")
-                else:
-                    with self.assertRaisesRegex(ValueError, "x87_cfg_widths"):
-                        game_config.load(game)
-
     def test_cpu_locals_defaults_and_rejects_non_boolean(self):
         with tempfile.TemporaryDirectory() as tmp:
             game = Path(tmp)

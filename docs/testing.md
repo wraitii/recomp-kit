@@ -90,15 +90,6 @@ also checks CPU state at an injected access failure. These are synthetic mapped
 tests against the current runtime, not original-x86, real hooks, real guest SEH
 or gameplay evidence. No benchmarks or profile captures run in this mode.
 
-The CPU+x87 variant also enables experimental `x87_cfg_widths`; the x87-only
-variant retains preceding basic-block width proofs. Fixtures cover narrow and
-mixed-width joins, loop-carried incoming exact metadata, aliases, status reads
-and a mutating callee. All three variants must match eager CPU and memory;
-no additional divergence is normalized. Width proofs are conditional on PC=00,
-with the existing precision selector and double path for other settings.
-`test_x87_c_locals.py` covers decoded effects, alternate entries, ambiguous
-register arithmetic and bounded-analysis fallback in the portable suite.
-
 The differential harness compares translated routines with original instructions
 under Unicorn. Unicorn is a development tool, not part of the playable app.
 

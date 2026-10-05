@@ -12,11 +12,10 @@ import translate as T
 DOT = ["FLD float ptr [ESI]", "FMUL float ptr [EDI]", "FADD float ptr [EDI + 4]"]
 
 
-def translate(lines, enabled=True, entries=(), widths=False):
+def translate(lines, enabled=True, entries=()):
     insns = T.parse_listing_text("\n".join(f"{0x100000+i:08x}  {s}" for i, s in enumerate(lines)))
     fn = T.Function(0x100000, "synthetic", len(insns), insns)
-    tr = T.Translator(None, {fn.addr, 0x200000}, SimpleNamespace(
-        eager_flags=False, x87_locals=enabled, x87_cfg_widths=widths))
+    tr = T.Translator(None, {fn.addr, 0x200000}, SimpleNamespace(eager_flags=False, x87_locals=enabled))
     tr.prepare(fn)
     return "\n".join(tr.translate(fn, entries)), tr
 
@@ -66,78 +65,6 @@ def test_binary32_provenance_does_not_cross_a_join():
                          "FMUL float ptr [EDI]", "FSTP float ptr [EBX]", "RET"])
     # The join can receive the original narrow value or the replacement double.
     assert body.count("fx87_exact(&x87_env_,") == 2
-
-
-def test_proven_widths_cross_diamond_and_backedge():
-    lines = [*DOT, "TEST EAX,EAX", "JZ 0x00100007", "FMUL float ptr [ESI]",
-             "JMP 0x00100008", "FADD float ptr [EDI]", "FMUL float ptr [EDI]",
-             "DEC ECX", "JNZ 0x00100003", "FSTP float ptr [EBX]", "RET"]
-    old = translate(lines)[0]
-    new = translate(lines, widths=True)[0]
-    assert old.count("fx87_exact(&x87_env_,") == 2
-    assert new.count("fx87_exact(&x87_env_,") == 5
-
-
-def test_width_join_requires_every_incoming_path():
-    lines = [*DOT, "TEST EAX,EAX", "JZ 0x00100007", "FSTP float ptr [EBX]",
-             "FLD double ptr [ESI]", "FMUL float ptr [EDI]", "FSTP float ptr [EBX]", "RET"]
-    assert translate(lines, widths=True)[0].count("fx87_exact(&x87_env_,") == 2
-
-
-def test_incoming_loop_value_cannot_prove_itself_narrow():
-    lines = ["MOV ECX,3", "FMUL float ptr [EDI]", "FADD float ptr [EDI + 4]",
-             "FSUB float ptr [ESI]", "DEC ECX", "JNZ 0x00100001", "FSTP float ptr [EBX]", "RET"]
-    # First iteration can consume an incoming wide value or exact integer.
-    assert translate(lines, widths=True)[0].count("fx87_exact(&x87_env_,") == 2
-
-
-def test_width_effects_retain_popped_values_and_store_source_width():
-    from x87_dataflow import width_effect, binary32_inputs, WidthEffect
-    insns = T.parse_listing_text("00100000  FLD double ptr [ESI]\n"
-                                 "00100001  FSTP float ptr [EBX]\n"
-                                 "00100002  FADDP ST2,ST0")
-    wide = width_effect(insns[0], 0, T.parse_operand)
-    store = width_effect(insns[1], 7, T.parse_operand)
-    pop = width_effect(insns[2], 7, T.parse_operand)
-    assert wide.delta == -1 and wide.transfer(frozenset(range(8))) == frozenset(range(7))
-    assert store.delta == 1 and store.transfer(frozenset((7,))) == frozenset((7,))
-    assert pop.delta == 1 and pop.binary32 == frozenset((1,))
-    assert binary32_inputs({0: WidthEffect()}, [[]], 0, max_nodes=0) is None
-    assert binary32_inputs({0: WidthEffect()}, [[0]], 0, max_edges=0) is None
-    assert binary32_inputs({0: WidthEffect(), 1: WidthEffect()}, [[], []], 0) is None
-
-
-def test_ambiguous_register_arithmetic_forgets_widths():
-    from x87_dataflow import width_effect
-    ins = T.parse_listing_text("00100000  FMUL ST1")[0]
-    effect = width_effect(ins, 7, T.parse_operand)
-    assert effect.delta == 0
-    assert not effect.transfer(frozenset(range(8)))
-
-
-def test_wide_backedge_invalidates_initial_narrow_fact():
-    lines = [*DOT, "FSUB float ptr [ESI]", "FSTP float ptr [EBX]",
-             "FLD double ptr [ESI]", "DEC ECX", "JNZ 0x00100001",
-             "FSTP float ptr [EBX]", "RET"]
-    assert translate(lines, widths=True)[0].count("fx87_exact(&x87_env_,") == 2
-
-
-def test_analysis_refusal_retains_comparison_lowering(monkeypatch):
-    import x87_dataflow
-    lines = [*DOT, "TEST EAX,1", "JZ 0x00100006", "NOP",
-             "FMUL float ptr [EDI]", "FSTP float ptr [EBX]", "RET"]
-    monkeypatch.setattr(x87_dataflow, "binary32_inputs", lambda *args: None)
-    assert translate(lines, widths=True)[0] == translate(lines)[0]
-
-
-def test_alternate_entry_and_control_observers_cut_width_proofs():
-    lines = [*DOT, "TEST EAX,1", "JZ 0x00100006", "NOP",
-             "FMUL float ptr [EDI]", "FADD float ptr [EDI + 4]",
-             "FSUB float ptr [ESI]", "RET"]
-    body = translate(lines, entries=(0x100006,), widths=True)[0]
-    assert "goto L_x87_00100006" not in body
-    body = translate([*DOT, "FLDCW word ptr [ESI]", *lines[3:]], widths=True)[0]
-    assert body.index("c->fpu_sw = x87_env_.fpu_sw;") < body.index("00100003 FLDCW")
 
 
 def test_diamond_join_uses_scalar_slots_and_publishes_before_return():
