@@ -636,6 +636,7 @@ void dx_reset() {
     d3d8_reset();
     d3dx9_reset();
     dsound_reset();
+    mss32_reset();
     dshow_reset();
     dinput_reset();
     bink_reset();

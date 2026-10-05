@@ -14,6 +14,7 @@
 // from code, so all three are implemented rather than refused.
 #include "com.h"
 #include "dx.h"
+#include "audio3d.h"
 #include "host_api.h"
 #include "../runtime/memory.h"
 #include "../runtime/win32.h"
@@ -404,62 +405,10 @@ float g_distance_factor = 1.0f, g_doppler_factor = 1.0f, g_rolloff_factor = 1.0f
 enum { DS3DMODE_NORMAL = 0, DS3DMODE_HEADRELATIVE = 1, DS3DMODE_DISABLE = 2 };
 enum { DS3D_IMMEDIATE = 0, DS3D_DEFERRED = 1 };
 static const uint32_t DSBCAPS_MUTE3DATMAXDISTANCE_ = 0x00020000u;
-static const float PI_F_ = 3.14159265358979323846f;
 
-struct V3 {
-    float x, y, z;
-};
-static inline float v3_dot(const V3 &a, const V3 &b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-static inline V3 v3_cross(const V3 &a, const V3 &b) {
-    V3 c;
-    c.x = a.y * b.z - a.z * b.y;
-    c.y = a.z * b.x - a.x * b.z;
-    c.z = a.x * b.y - a.y * b.x;
-    return c;
-}
-static inline float v3_len(const V3 &a) {
-    return sqrtf(v3_dot(a, a));
-}
-static float v3_angle(const V3 &a, const V3 &b) {
-    float la = v3_len(a), lb = v3_len(b);
-    if (!la || !lb)
-        return 0.0f;
-    float c = v3_dot(a, b) / (la * lb);
-    if (c > 1.0f)
-        c = 1.0f;
-    if (c < -1.0f)
-        c = -1.0f;
-    // Wine's AngleBetweenVectorsRad computes the cosine in float and calls the
-    // double acos(), rounding once on return. acosf(-1.0f) on macOS is one ulp
-    // short of pi, which moves an exactly-sideways source a hair off the
-    // speaker axis; the double call rounds to the nearest float and keeps the
-    // reference's hard-side pan.
-    return (float)acos((double)c);
-}
-
-// Wine's stereo speaker mix for a pan angle in radians, and the two gains
-// before the buffer/distance volume is folded in.
-static void stereo_gains(float angle, float *left, float *right) {
-    const float half_pi = PI_F_ / 2.0f;
-    float a;
-    if (angle >= -half_pi && angle < half_pi) {
-        a = (angle + half_pi) / PI_F_;
-        *left = sqrtf(1.0f - a);
-        *right = sqrtf(a);
-        return;
-    }
-    if (angle < -half_pi)
-        angle += 2.0f * PI_F_;
-    a = (angle - half_pi) / PI_F_;
-    if (a < 0.0f)
-        a = 0.0f;
-    if (a > 1.0f)
-        a = 1.0f;
-    *right = sqrtf(1.0f - a);
-    *left = sqrtf(a);
-}
+// The vector maths and speaker mix live in audio3d.h so the Miles software
+// provider places a source the same way DirectSound3D does.
+using namespace audio3d;
 
 // The host volume and pan for one buffer right now. For a non-3D buffer, or a
 // 3D buffer whose mode is DS3DMODE_DISABLE, that is simply its own SetVolume

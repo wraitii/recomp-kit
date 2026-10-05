@@ -117,6 +117,9 @@ void dsound_pump();
 void qmixer_frame_pump(X86 *c);
 // Refills Miles streams on the guest frame seam.
 void mss32_frame_pump(X86 *c);
+// Drops the Miles sample/driver/3D state, whose guest addresses and host
+// channels the arena teardown is about to discard.
+void mss32_reset();
 // Decode FMOD streams and schedule Soundlib MIDI events on the guest thread.
 void fmod_frame_pump(X86 *c);
 void soundlib_frame_pump(X86 *c);

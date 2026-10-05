@@ -8533,6 +8533,33 @@ static void test_mss32_arities() {
         {"_AIL_set_3D_position@16", 4},
         {"_AIL_set_3D_orientation@28", 7},
         {"_AIL_3D_update_position@8", 2},
+        {"_AIL_set_sample_playback_rate@8", 2},
+        {"_AIL_set_sample_volume_levels@12", 3},
+        {"_AIL_set_sample_volume_pan@12", 3},
+        {"_AIL_register_EOS_callback@8", 2},
+        {"_AIL_register_stream_callback@8", 2},
+        {"_AIL_WAV_info@8", 2},
+        {"_AIL_open_3D_listener@4", 1},
+        {"_AIL_close_3D_listener@4", 1},
+        {"_AIL_3D_speaker_type@4", 1},
+        {"_AIL_set_3D_speaker_type@8", 2},
+        {"_AIL_3D_room_type@4", 1},
+        {"_AIL_set_3D_distance_factor@8", 2},
+        {"_AIL_stop_3D_sample@4", 1},
+        {"_AIL_resume_3D_sample@4", 1},
+        {"_AIL_set_3D_sample_distances@12", 3},
+        {"_AIL_set_3D_sample_effects_level@8", 2},
+        {"_AIL_set_3D_sample_occlusion@8", 2},
+        {"_AIL_set_3D_sample_playback_rate@8", 2},
+        {"_AIL_register_3D_EOS_callback@8", 2},
+        {"_AIL_set_stream_volume_levels@12", 3},
+        {"_AIL_pause_stream@8", 2},
+        {"_AIL_register_timer@4", 1},
+        {"_AIL_release_timer_handle@4", 1},
+        {"_AIL_set_timer_user@8", 2},
+        {"_AIL_set_timer_frequency@8", 2},
+        {"_AIL_start_timer@4", 1},
+        {"_AIL_stop_timer@4", 1},
     };
     for (auto &e : expected) {
         uint32_t t = tramp("mss32.dll", e.name);
@@ -8543,16 +8570,30 @@ static void test_mss32_arities() {
     CHECK_EQ(imports_argc(TRAMP_BASE + 1), 0u);
     CHECK_EQ(imports_argc(TRAMP_BASE + imports_count() * TRAMP_STRIDE), 0u);
     CHECK_EQ(call_shim(tramp("mss32.dll", "_AIL_startup@0"), {}), 1u);
-    CHECK_EQ(call_shim(tramp("mss32.dll", "_AIL_enumerate_3D_providers@12"), {0, 0, 0}), 0u);
-    CHECK_EQ(call_shim(tramp("mss32.dll", "_AIL_open_3D_provider@4"), {0}), 1u);
+    // Enumeration reports the one software provider and leaves its name in
+    // guest memory, because the engine keeps the char* Miles hands it.
+    uint32_t cursor = sc(0x40), provider = sc(0x44), name = sc(0x48);
+    wr32(cursor, 0);
+    CHECK_EQ(
+        call_shim(tramp("mss32.dll", "_AIL_enumerate_3D_providers@12"), {cursor, provider, name}),
+        1u);
+    CHECK(rd32(name) != 0);
+    CHECK(gm_str(rd32(name)) == "DirectSound3D 7+ Software - Pan and Volume");
+    CHECK_EQ(
+        call_shim(tramp("mss32.dll", "_AIL_enumerate_3D_providers@12"), {cursor, provider, name}),
+        0u);
+    // A Miles provider opens with a zero result, not a failure.
+    CHECK_EQ(call_shim(tramp("mss32.dll", "_AIL_open_3D_provider@4"), {rd32(provider)}), 0u);
     uint32_t sample = call_shim(tramp("mss32.dll", "_AIL_allocate_sample_handle@4"), {0});
     CHECK(sample != 0);
     call_shim(tramp("mss32.dll", "_AIL_release_sample_handle@4"), {sample});
-    CHECK_EQ(call_shim(tramp("mss32.dll", "_AIL_allocate_3D_sample_handle@4"), {0}), 0u);
+    uint32_t sample3d = call_shim(tramp("mss32.dll", "_AIL_allocate_3D_sample_handle@4"), {0});
+    CHECK(sample3d != 0);
+    call_shim(tramp("mss32.dll", "_AIL_release_3D_sample_handle@4"), {sample3d});
     CHECK_EQ(call_shim(tramp("mss32.dll", "_AIL_open_stream@12"), {0, 0, 0}), 0u);
     CHECK_EQ(call_shim(tramp("mss32.dll", "_AIL_sample_status@4"), {0}), 1u);
     CHECK_EQ(call_shim(tramp("mss32.dll", "_AIL_stream_status@4"), {0}), 2u);
-    CHECK_EQ(call_shim(tramp("mss32.dll", "_AIL_3D_sample_status@4"), {0}), 2u);
+    CHECK_EQ(call_shim(tramp("mss32.dll", "_AIL_3D_sample_status@4"), {0}), 1u);
     CHECK_EQ(call_shim(tramp("mss32.dll", "_AIL_set_3D_orientation@28"), {0, 0, 0, 0, 0, 0, 0}),
              0u);
 }
@@ -9024,6 +9065,82 @@ static void test_mss32_sample() {
     CHECK_EQ(call_shim(read, {name, 0}), 0u);
     CHECK_EQ(remove(file.c_str()), 0);
     CHECK_EQ(os_rmdir(dir), 0);
+    g_sample_playing.clear();
+    g_sample_tracking = false;
+}
+
+// A Miles 3D sample plays through the host mixer with a pan and a distance
+// gain derived from its listener-relative position. This is the path RT3's
+// AIL3dContext uses for every positional sound, and the provider enumeration
+// above it is what its audio init gates on: without a provider the whole
+// MusicSystem failed to start and the settings UI reported no sound
+// capabilities.
+static void test_mss32_3d() {
+    cpu_reset();
+    g_plays.clear();
+    g_audio_volumes.clear();
+    g_audio_pans.clear();
+    g_sample_playing.clear();
+    g_sample_tracking = true;
+
+    uint32_t wav = build_test_wave();
+    uint32_t cursor = sc(0x40), provider = sc(0x44), name = sc(0x48);
+    wr32(cursor, 0);
+    CHECK_EQ(
+        call_shim(tramp("mss32.dll", "_AIL_enumerate_3D_providers@12"), {cursor, provider, name}),
+        1u);
+    uint32_t p = rd32(provider);
+    CHECK_EQ(call_shim(tramp("mss32.dll", "_AIL_open_3D_provider@4"), {p}), 0u);
+    uint32_t listener = call_shim(tramp("mss32.dll", "_AIL_open_3D_listener@4"), {p});
+    CHECK(listener != 0);
+    uint32_t h = call_shim(tramp("mss32.dll", "_AIL_allocate_3D_sample_handle@4"), {p});
+    CHECK(h != 0);
+    if (!h)
+        return;
+    CHECK_EQ(call_shim(tramp("mss32.dll", "_AIL_set_3D_sample_file@8"), {h, wav}), 1u);
+    // MinDistance 1, MaxDistance 100.
+    call_shim(tramp("mss32.dll", "_AIL_set_3D_sample_distances@12"),
+              {h, fbits(100.0f), fbits(1.0f)});
+
+    // Exactly to the right of the listener: hard right, no attenuation below
+    // MinDistance.
+    call_shim(tramp("mss32.dll", "_AIL_set_3D_position@16"), {h, fbits(1.0f), 0, 0});
+    call_shim(tramp("mss32.dll", "_AIL_start_3D_sample@4"), {h});
+    CHECK_EQ(g_plays.size(), 1u);
+    if (g_plays.size() != 1)
+        return;
+    int32_t channel = g_plays[0].channel;
+    CHECK_EQ(g_plays[0].bytes, 8u);
+    CHECK_EQ(g_plays[0].pan, 10000);
+    CHECK_EQ(g_plays[0].volume, 0);
+
+    // Moving a playing source pans and attenuates the live channel; it does
+    // not submit the sound again.
+    call_shim(tramp("mss32.dll", "_AIL_set_3D_position@16"), {h, fbits(-1.0f), 0, 0});
+    CHECK_EQ(g_plays.size(), 1u);
+    CHECK_EQ(g_audio_pans[channel], -10000);
+    call_shim(tramp("mss32.dll", "_AIL_set_3D_position@16"), {h, 0, 0, fbits(100.0f)});
+    CHECK_EQ(g_audio_pans[channel], 0);
+    // min/(min + (100-1)) = 1/100 -> -4000 in hundredths of a dB.
+    CHECK_EQ(g_audio_volumes[channel], -4000);
+
+    // The 3D volume is a 0..1 gain folded into the same host volume.
+    call_shim(tramp("mss32.dll", "_AIL_set_3D_position@16"), {h, 0, 0, 0});
+    call_shim(tramp("mss32.dll", "_AIL_set_3D_sample_volume@8"), {h, fbits(0.5f)});
+    CHECK_EQ(g_audio_volumes[channel], (int32_t)lround(2000.0 * log10(0.5)));
+
+    // The listener orientation decides which side a source falls on: with
+    // front +x a source at +x is dead ahead and centred.
+    call_shim(tramp("mss32.dll", "_AIL_set_3D_orientation@28"),
+              {listener, fbits(1.0f), 0, 0, 0, fbits(1.0f), 0});
+    call_shim(tramp("mss32.dll", "_AIL_set_3D_position@16"), {h, fbits(1.0f), 0, 0});
+    CHECK_EQ(g_audio_pans[channel], 0);
+
+    call_shim(tramp("mss32.dll", "_AIL_end_3D_sample@4"), {h});
+    call_shim(tramp("mss32.dll", "_AIL_release_3D_sample_handle@4"), {h});
+    // Restore the identity listener for the tests that follow.
+    call_shim(tramp("mss32.dll", "_AIL_set_3D_orientation@28"),
+              {listener, 0, 0, fbits(1.0f), 0, fbits(1.0f), 0});
     g_sample_playing.clear();
     g_sample_tracking = false;
 }
@@ -15369,6 +15486,7 @@ int main() {
         {"Miles arities", test_mss32_arities},
         {"RIFF WAVE", test_riff_parse},
         {"Miles samples", test_mss32_sample},
+        {"Miles 3D", test_mss32_3d},
         {"Legacy audio", test_legacy_audio},
         {"AVI reader", test_avi_reader},
         {"Miles streams", test_mss32_stream},
