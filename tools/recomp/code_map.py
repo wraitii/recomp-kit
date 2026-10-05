@@ -110,6 +110,13 @@ def ensure_listings(cfg):
     if root == destination or root in destination.parents or destination in root.parents:
         raise ValueError('code map and generated listings must be separate directories')
     metadata, functions = read_map(root)
+    # A game may temporarily keep functions the translator cannot lower yet
+    # ([translate] skip_functions). They are dropped from the generated listings
+    # and so from translation; reaching one at run time is a fault until the
+    # corresponding lowering lands. Addresses are guest VAs.
+    skip = frozenset(int(a) for a in cfg.get('translate', {}).get('skip_functions', ()))
+    if skip:
+        functions = {addr: value for addr, value in functions.items() if addr not in skip}
     executable = Path(cfg['developer_exe_path'])
     sha = hashlib.sha256(executable.read_bytes()).hexdigest()
     if sha != cfg['game']['sha256'] or sha != metadata['executable_sha256']:
@@ -146,7 +153,13 @@ def ensure_listings(cfg):
     stage = Path(tempfile.mkdtemp(prefix='.code-map-', dir=destination.parent))
     try:
         (stage / 'functions').mkdir()
-        shutil.copyfile(root / 'functions.tsv', stage / 'functions.tsv')
+        header = 'address\tname\tbytes\n' if skip else None
+        rows = (''.join('%08x\t%s\t%d\n' % (addr, value[0], value[1])
+                        for addr, value in functions.items()) if skip else None)
+        if skip:
+            (stage / 'functions.tsv').write_text(header + rows)
+        else:
+            shutil.copyfile(root / 'functions.tsv', stage / 'functions.tsv')
         hashes = {'functions.tsv': hashlib.sha256((stage / 'functions.tsv').read_bytes()).hexdigest()}
         for addr, (_, _, spans) in functions.items():
             lines = [insn.raw for start, lengths in spans for insn in decode_span(image, start, lengths)]
