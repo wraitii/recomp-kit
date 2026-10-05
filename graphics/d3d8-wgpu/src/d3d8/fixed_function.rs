@@ -559,7 +559,9 @@ pub struct StageUniform {
     /// `D3DTSS_TEXTURETRANSFORMFLAGS`: 0 disabled, 2 (`D3DTTFF_COUNT2`)
     /// applies `tex_transform` to the selected coordinate.
     pub tex_transform_flags: u32,
-    pub pad2: u32,
+    /// `D3DTSS_MIPMAPLODBIAS` as an `f32`. Applied with `textureSampleBias`
+    /// because wgpu 27 samplers have no `lod_bias` field.
+    pub lod_bias: f32,
 }
 
 impl StageUniform {
@@ -580,7 +582,7 @@ impl StageUniform {
             // `StagesUniform::for_fvf`; the standalone default is available.
             tex_coord_available: 1,
             tex_transform_flags: stage.tex_transform_flags,
-            pad2: 0,
+            lod_bias: stage.lod_bias,
         }
     }
 }
@@ -838,7 +840,7 @@ struct StageUniform {
     tex_coord_index: u32,
     tex_coord_available: u32,
     tex_transform_flags: u32,
-    pad2: u32,
+    lod_bias: f32,
 };
 
 struct StagesUniform {
@@ -1113,7 +1115,11 @@ fn eval_stage(
         uv = select(uv1, vec2<f32>(0.0, 0.0), s.tex_coord_available == 0u);
     }
     uv = transform_texcoord(uv, s.tex_transform, s.tex_transform_flags);
-    let texel = textureSample(tex, samp, uv);
+    // `textureSampleBias` requires uniform control flow; this call site is
+    // unconditional in `fs_main` and every branch above depends only on the
+    // uniform-buffer stage state, so naga's uniformity analysis accepts it.
+    // A zero bias is identical to `textureSample`.
+    let texel = textureSampleBias(tex, samp, uv, s.lod_bias);
     let tfactor = vec4<f32>(
         f32((s.texture_factor >> 16u) & 0xffu) / 255.0,
         f32((s.texture_factor >> 8u) & 0xffu) / 255.0,
@@ -1568,6 +1574,7 @@ mod tests {
             mag_filter: 2,
             mip_filter: 0,
             max_mip_level: 0,
+            lod_bias: 0.8,
             address_u: 1,
             address_v: 1,
         };
@@ -1577,11 +1584,18 @@ mod tests {
         assert_eq!(u.color_arg2, 2);
         assert_eq!(u.alpha_arg2, 3);
         assert_eq!(u.active, 1);
+        assert_eq!(u.lod_bias, 0.8);
         // Texture matrix, six op/arg words, texture factor, active,
-        // coordinate index/flags and the FVF-availability word.
+        // coordinate index/flags, the FVF-availability word and the LOD bias.
         assert_eq!(bytemuck::bytes_of(&u).len(), 112);
+        // std140-style layout: the bias occupies the old pad word at offset
+        // 108, immediately before the struct's 16-byte rounding. wgpu checks
+        // this host layout against the WGSL struct at pipeline creation.
+        assert_eq!(&bytemuck::bytes_of(&u)[108..112], &0.8f32.to_le_bytes());
         let both = StagesUniform::new(&stage, &stage);
         assert_eq!(bytemuck::bytes_of(&both).len(), 224);
+        // The shader must sample with the bias, not plain `textureSample`.
+        assert!(TEXTURED_WGSL.contains("textureSampleBias(tex, samp, uv, s.lod_bias)"));
     }
 
     #[test]
@@ -1638,6 +1652,7 @@ mod tests {
             mag_filter: 2,
             mip_filter: 0,
             max_mip_level: 0,
+            lod_bias: 0.0,
             address_u: 1,
             address_v: 1,
         };
@@ -1679,6 +1694,7 @@ mod tests {
             mag_filter: 2,
             mip_filter: 2,
             max_mip_level: 0,
+            lod_bias: 0.0,
             address_u: 1,
             address_v: 1,
         };

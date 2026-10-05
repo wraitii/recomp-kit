@@ -2689,6 +2689,7 @@ mod tests {
             mag_filter: 2,
             mip_filter: 1,
             max_mip_level: 0,
+            lod_bias: 0.0,
             address_u: 1,
             address_v: 1,
         };
@@ -2732,6 +2733,7 @@ mod tests {
             mag_filter: 2,
             mip_filter,
             max_mip_level,
+            lod_bias: 0.0,
             address_u: 1,
             address_v: 1,
         }

@@ -55,10 +55,14 @@ pub struct TextureStage {
     pub mip_filter: u32,
     /// `D3DTSS_MAXMIPLEVEL`: the base (most detailed) mip level the stage may
     /// sample. D3D's default 0 selects the texture's base level; WineD3D maps
-    /// it to the sampler's `mip_base_level`. A nonzero `D3DTSS_MIPMAPLODBIAS`
-    /// is refused in `resolve_texture_stage` because wgpu 27 has no LOD bias
-    /// field.
+    /// it to the sampler's `mip_base_level`.
     pub max_mip_level: u32,
+    /// `D3DTSS_MIPMAPLODBIAS` decoded from its DWORD bit pattern as an `f32`.
+    /// Added to the computed LOD. wgpu 27's `SamplerDescriptor` has no
+    /// `lod_bias`, so this is carried in the stage uniform and applied by the
+    /// shader with `textureSampleBias`, matching WineD3D's GL_TEXTURE_LOD_BIAS
+    /// treatment. D3D's default is 0.
+    pub lod_bias: f32,
     pub address_u: u32,
     pub address_v: u32,
 }
@@ -726,16 +730,21 @@ impl DeviceState {
         // does not see the bound texture's level count, so the draw clamps it
         // against the chain that was actually uploaded.
         let max_mip_level = raw(Ts::MaxMipLevel, 0);
-        // wgpu 27's `SamplerDescriptor` has no `lod_bias`, so a nonzero
-        // D3DTSS_MIPMAPLODBIAS cannot be honoured. Fail by name rather than
-        // silently ignoring it (AGENTS.md: unsupported state must be named).
-        if let Some(bias) = self.texture_stage_state(stage, Ts::MipMapLodBias.raw()) {
-            if bias != 0 {
-                return Err(fail(format!(
-                    "D3DTSS_MIPMAPLODBIAS = {bias:#010x} has no wgpu equivalent"
-                )));
-            }
-        }
+        // `D3DTSS_MIPMAPLODBIAS` is a float stored in the state DWORD. wgpu
+        // 27's `SamplerDescriptor` has no `lod_bias`, so decode the bit pattern
+        // here and carry it in the stage uniform; the fixed-function shader
+        // applies it with `textureSampleBias`. WineD3D maps TSS 19 to
+        // `WINED3D_SAMP_MIPMAP_LOD_BIAS`, reinterprets the DWORD as a float and
+        // calls `glSamplerParameterf(GL_TEXTURE_LOD_BIAS, ...)`, which adds it
+        // to the computed LOD in mip levels (positive blurs, negative
+        // sharpens).
+        //
+        // Both GL and WGSL apply the bias through the sampler's mipmap filter.
+        // WineD3D sets the GL bias unconditionally but maps `MIPFILTER=NONE` to
+        // a non-mipmapped GL min filter (`minMipLookup`, `dlls/wined3d/directx.c`
+        // at the pinned Wine commit), so the bias has no effect; here the wgpu
+        // sampler collapses to a single level, so the result matches.
+        let lod_bias = f32::from_bits(raw(Ts::MipMapLodBias, 0));
         let address_u = address(
             "D3DTSS_ADDRESSU",
             raw(Ts::AddressU, D3DTEXTUREADDRESS::Wrap.raw()),
@@ -791,6 +800,7 @@ impl DeviceState {
             mag_filter,
             mip_filter,
             max_mip_level,
+            lod_bias,
             address_u,
             address_v,
         })
@@ -1954,23 +1964,29 @@ mod tests {
     }
 
     #[test]
-    fn max_mip_level_is_carried_and_nonzero_lod_bias_is_refused() {
+    fn max_mip_level_and_lod_bias_are_carried() {
         let mut state = DeviceState::new(64, 64);
         state
             .set_texture_stage_state(0, 20, 2)
             .unwrap(); // D3DTSS_MAXMIPLEVEL
+        // The default LOD bias is 0.0 bits, carried through as a float.
         let stage = state.resolve_texture_stage(0, true).unwrap();
         assert_eq!(stage.max_mip_level, 2);
-        // The default (and an explicit zero) LOD bias is accepted.
+        assert_eq!(stage.lod_bias, 0.0);
+        // An explicit zero keeps the previous behaviour (plain sampling).
         state.set_texture_stage_state(0, 19, 0).unwrap(); // D3DTSS_MIPMAPLODBIAS
-        assert!(state.resolve_texture_stage(0, true).is_ok());
-        // wgpu 27 has no lod_bias, so a nonzero bias must fail by name rather
-        // than be silently ignored.
+        assert_eq!(state.resolve_texture_stage(0, true).unwrap().lod_bias, 0.0);
+        // 0x3f4ccccd is the float 0.8: the state DWORD is decoded as f32 and
+        // carried, rather than refused (wgpu 27 has no sampler `lod_bias`).
         state
-            .set_texture_stage_state(0, 19, 1.0f32.to_bits())
+            .set_texture_stage_state(0, 19, 0.8f32.to_bits())
             .unwrap();
-        let err = state.resolve_texture_stage(0, true).unwrap_err();
-        assert!(err.cause.contains("MIPMAPLODBIAS"), "{}", err.cause);
+        assert_eq!(state.resolve_texture_stage(0, true).unwrap().lod_bias, 0.8);
+        // A negative bias (sharper) is allowed too.
+        state
+            .set_texture_stage_state(0, 19, (-1.5f32).to_bits())
+            .unwrap();
+        assert_eq!(state.resolve_texture_stage(0, true).unwrap().lod_bias, -1.5);
     }
 
     #[test]

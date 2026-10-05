@@ -23,6 +23,15 @@
   depth-only prepass renders it through `wgpu::ColorWrites::empty()` rather
   than aborting the process through the unsupported-state path.
 
+- D3D8 `D3DTSS_MIPMAPLODBIAS` is now honoured instead of failing the draw as
+  stored but unapplied state. The state DWORD is decoded as the `f32` D3D8
+  passes, carried per stage in the fixed-function stage uniform, and applied
+  with WGSL `textureSampleBias` (wgpu 27 samplers have no `lod_bias` field).
+  Zero keeps the previous behaviour. When `D3DTSS_MIPFILTER` is `NONE` the
+  sampler collapses to one mip level, so the bias has no visible effect,
+  matching WineD3D's GL_TEXTURE_LOD_BIAS treatment through a non-mipmapped GL
+  min filter. The bias is uniform state, not part of the sampler key.
+
 - D3D8 XYZRHW draws keep the sign of `rhw`: `ProcessVertices` writes
   `rhw = 1/clip.w` including negative values for vertices behind the eye, and
   the pre-transformed vertex shaders now rebuild `clip = ndc * (1/rhw)` instead
