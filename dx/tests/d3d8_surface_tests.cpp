@@ -717,6 +717,100 @@ static void test_bind_texture() {
     check(dev->refs == 0, "device released after the binding test");
 }
 
+// D3D8 stores programmable shader constants on the device and returns the
+// same bits. The bridge must not round-trip them through float, and a range
+// or guest-pointer violation is an ordinary D3DERR_INVALIDCALL error, not an
+// unsupported-import abort: the water path writes a constant while no
+// programmable shader is bound, which real D3D8 permits and which has no
+// effect on fixed-function draws. Fixture devices only; no GPU work.
+static void test_shader_constants() {
+    cpu_reset();
+    ComObj *dev = make_test_device(4, 4, 22);
+    uint32_t device = com_view(dev, IF_D3D8DEVICE);
+    const uint32_t set_vs = 79, get_vs = 80, set_ps = 91, get_ps = 92;
+    const uint32_t in = sc(0x200), out = sc(0x300);
+
+    // Bit patterns a float conversion would lose: quiet and signalling NaNs,
+    // both infinities, negative zero, subnormals and ordinary values.
+    const uint32_t bits[8][4] = {
+        {0x7fc00000u, 0xffc00000u, 0x7f800000u, 0xff800000u},
+        {0x80000000u, 0x00000001u, 0x007fffffu, 0x3f800000u},
+        {0xdeadbeefu, 0xffffffffu, 0x12345678u, 0xcdcdcdcdu},
+        {0x00000000u, 0x7f7fffffu, 0xff7fffffu, 0x40000000u},
+        {0x00000001u, 0x80000001u, 0x00800000u, 0x80800000u},
+        {0x3eaaaaabu, 0xbeaaaaabu, 0x4b000000u, 0xcb000000u},
+        {0x7f000000u, 0xff000000u, 0x00ffffffu, 0x7fffffffu},
+        {0x80000000u, 0x7fc00001u, 0xffc00001u, 0x00000000u},
+    };
+    for (uint32_t i = 0; i < 8; ++i)
+        for (uint32_t k = 0; k < 4; ++k)
+            wr32(in + (i * 4 + k) * 4, bits[i][k]);
+
+    // The water path's call shape: one vertex constant. Set and Get are
+    // separate dispatches, so the bank must survive between calls.
+    check(call_method(device, set_vs, {7, in, 1}) == 0, "vertex constant register 7 is accepted");
+    wr32(out, 0xfeedface);
+    check(call_method(device, get_vs, {7, out, 1}) == 0, "GetVertexShaderConstant succeeds");
+    for (uint32_t k = 0; k < 4; ++k)
+        check(rd32(out + k * 4) == bits[0][k], "vertex constant bit-exact across calls");
+
+    // The pixel bank is separate; writing it leaves the vertex bank alone.
+    check(call_method(device, set_ps, {7, in, 1}) == 0, "pixel constant register 7 is accepted");
+    wr32(out, 0xfeedface);
+    check(call_method(device, get_ps, {7, out, 1}) == 0 && rd32(out) == bits[0][0],
+          "pixel constant is bit-exact");
+    check(call_method(device, get_vs, {7, out, 1}) == 0 && rd32(out) == bits[0][0],
+          "a pixel write leaves the vertex bank alone");
+
+    // A block fill and read-back of the whole vs.1.1 bank.
+    check(call_method(device, set_vs, {0, in, 8}) == 0, "eight vertex constants are accepted");
+    memset(gm_ptr(out), 0, 128);
+    check(call_method(device, get_vs, {0, out, 8}) == 0, "GetVertexShaderConstant reads a block");
+    for (uint32_t i = 0; i < 8; ++i)
+        for (uint32_t k = 0; k < 4; ++k)
+            check(rd32(out + (i * 4 + k) * 4) == bits[i][k], "vertex constant block bit-exact");
+
+    // Bounds: 96 vertex and 8 pixel registers, addressed as [reg, reg + count).
+    check(call_method(device, set_vs, {0, in, 96}) == 0, "the whole 96-register bank is writable");
+    check(call_method(device, set_vs, {96, in, 1}) == 0x8876086c, "register 96 is rejected");
+    check(call_method(device, set_vs, {95, in, 2}) == 0x8876086c,
+          "a range past register 95 is rejected");
+    check(call_method(device, set_vs, {0, in, 97}) == 0x8876086c, "97 registers are rejected");
+    check(call_method(device, set_vs, {1, in, 96}) == 0x8876086c,
+          "a shifted 96-register block is rejected");
+    check(call_method(device, get_vs, {96, in, 1}) == 0x8876086c, "Get rejects register 96");
+    check(call_method(device, get_vs, {0, in, 97}) == 0x8876086c, "Get rejects 97 registers");
+    check(call_method(device, set_ps, {8, in, 1}) == 0x8876086c, "pixel register 8 is rejected");
+    check(call_method(device, set_ps, {0, in, 9}) == 0x8876086c,
+          "nine pixel registers are rejected");
+    check(call_method(device, get_ps, {7, in, 2}) == 0x8876086c,
+          "Get rejects a pixel range past 7");
+
+    // Count 0 copies nothing and touches no register, so a null pointer is
+    // harmless; a non-zero count needs a live guest buffer.
+    check(call_method(device, set_vs, {0, 0, 0}) == 0, "a zero-count Set is a no-op");
+    check(call_method(device, set_vs, {96, 0, 0}) == 0, "a zero-count Set ignores the register");
+    check(call_method(device, get_ps, {0, 0, 0}) == 0, "a zero-count Get is a no-op");
+    check(call_method(device, set_vs, {0, 0, 1}) == 0x8876086c, "a null Set pointer is rejected");
+    check(call_method(device, get_vs, {0, 0, 1}) == 0x8876086c, "a null Get pointer is rejected");
+    check(call_method(device, set_vs, {0, GUEST_SIZE - 8, 1}) == 0x8876086c,
+          "a truncated Set pointer is rejected");
+    check(call_method(device, get_ps, {7, GUEST_SIZE - 8, 1}) == 0x8876086c,
+          "a truncated Get pointer is rejected");
+    wr32(out, 0xfeedface);
+    check(call_method(device, get_vs, {96, out, 1}) == 0x8876086c && rd32(out) == 0xfeedface,
+          "a rejected Get writes no output");
+
+    // Per-device state: a second device starts at zero.
+    ComObj *dev2 = make_test_device(4, 4, 22);
+    uint32_t device2 = com_view(dev2, IF_D3D8DEVICE);
+    wr32(out, 0xfeedface);
+    check(call_method(device2, get_vs, {7, out, 1}) == 0 && rd32(out) == 0,
+          "a second device has its own zeroed constant bank");
+    call_method(device2, 2);
+    call_method(device, 2);
+}
+
 // D3DCAPS8 texture limits. Ghost Recon's 0x004eac20 halves every texture
 // until it fits MaxTextureWidth/MaxTextureHeight, so a zero here silently
 // collapses all sampled textures to 1x1. The renderer's declared limits must
@@ -754,7 +848,7 @@ int main(int argc, char **argv) {
     imports_init();
     dx_register_shims();
     g_stack_top = STACK_TOP - 0x1000;
-    g_scratch = heap_alloc(0x400, true, 16);
+    g_scratch = heap_alloc(0x1000, true, 16);
     if (!g_scratch)
         return 1;
     if (argc == 2 && strcmp(argv[1], "--unsupported-lock") == 0) {
@@ -813,6 +907,7 @@ int main(int argc, char **argv) {
     test_texture();
     test_render_target_texture();
     test_bind_texture();
+    test_shader_constants();
     test_caps();
     test_depth();
     test_create_depth_stencil_surface();
@@ -834,7 +929,7 @@ int main(int argc, char **argv) {
     mem_init();
     imports_init();
     dx_reset();
-    g_scratch = heap_alloc(0x400, true, 16);
+    g_scratch = heap_alloc(0x1000, true, 16);
     test_backbuffer(22);
     test_buffers();
     printf("d3d8 surface: %d checks, %d failures\n", g_checks, g_failures);

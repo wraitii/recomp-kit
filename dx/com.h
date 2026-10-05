@@ -309,6 +309,18 @@ struct D3d7DeviceState {
     bool tnl; // device_guid names IID_IDirect3DTnLHalDevice
 };
 
+// Per-device programmable shader constant registers for an
+// IDirect3DDevice8. D3D8 guarantees at least 96 float4 vertex-shader constants
+// for vs.1.1 hardware, and the water path addresses eight pixel-shader
+// constants. Storage holds the exact 32-bit float bit patterns the guest
+// wrote; nothing here interprets them. Held behind a shared_ptr so the arrays
+// are not paid for by every surface/texture/buffer object, the same reason
+// D3d7DeviceState is shared.
+struct D3d8DeviceState {
+    uint32_t vconst[96][4] = {};
+    uint32_t pconst[8][4] = {};
+};
+
 // ---------------------------------------------------------------------------
 // The host-side object. One fat struct rather than a class hierarchy: these
 // are shims, the field set is small and fixed, and a flat record keeps every
@@ -507,6 +519,10 @@ struct ComObj {
     uint32_t vb_num_vertices = 0;
     uint32_t vb_caps = 0;
 
+    // --- K_D3D8DEVICE: shader constant registers. D3D8 keeps these on the
+    // device even when no programmable shader is bound, so Set/Get round-trip
+    // them without affecting fixed-function drawing (see d3d8.cpp).
+    std::shared_ptr<D3d8DeviceState> d3d8_constants;
     // --- K_D3D8/wgpu. The Rust host device is a
     // host-side pointer kept here, never in a guest field.
     void *d3d8_storage = nullptr; // opaque Rust CPU storage; never a guest address

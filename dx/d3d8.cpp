@@ -2264,6 +2264,100 @@ void Dev_GetVertexShader(X86 *c) {
     com_ret(c, D8_OK);
 }
 
+// ---------------------------------------------------------------------------
+// Programmable shader constants. D3D8 keeps float4 register banks on the
+// device; Set/Get copy the 32-bit float bit patterns verbatim and never
+// convert or interpret them. The constants have no effect on the
+// fixed-function pipeline, which is all the bridge draws with until a
+// programmable draw path exists; this is faithful storage, not a stub. A
+// guest may set constants while no programmable shader is bound, and the
+// water path does, so failing the call would abort it. The banks live on the
+// device object, behind a shared_ptr, so Set and Get round-trip across calls.
+// ---------------------------------------------------------------------------
+constexpr uint32_t D8_VERTEX_CONSTANT_REGISTERS = 96;
+constexpr uint32_t D8_PIXEL_CONSTANT_REGISTERS = 8;
+
+// Lazily allocates the per-device constant banks. Only a K_D3D8DEVICE touches
+// them; every other object carries just the shared_ptr.
+D3d8DeviceState *d8_constants(ComObj *dev) {
+    if (!dev->d3d8_constants)
+        dev->d3d8_constants = std::make_shared<D3d8DeviceState>();
+    return dev->d3d8_constants.get();
+}
+
+// True when Set/Get may touch [reg, reg + count) and read/write the guest
+// buffer at `data`. A zero count copies nothing and touches no register, so it
+// succeeds even with a null pointer. count <= limit <= 96, so count * 16
+// cannot overflow.
+bool d8_constant_range(uint32_t reg, uint32_t count, uint32_t limit, uint32_t data) {
+    if (count == 0)
+        return true;
+    if (reg >= limit || count > limit - reg)
+        return false;
+    return data && gm_valid(data, count * 16u);
+}
+
+// Copies `count` float4 registers between the guest buffer at `data` and the
+// device's 32-bit bank. `to_guest` selects Get (true) or Set (false).
+void d8_copy_registers(uint32_t (*bank)[4], uint32_t reg, uint32_t data, uint32_t count,
+                       bool to_guest) {
+    for (uint32_t i = 0; i < count; ++i)
+        for (uint32_t k = 0; k < 4; ++k) {
+            uint32_t off = data + (i * 4 + k) * 4;
+            if (to_guest)
+                wr32(off, bank[reg + i][k]);
+            else
+                bank[reg + i][k] = rd32(off);
+        }
+}
+
+// (this, Register, pConstantData, ConstantCount). A range or pointer violation
+// is an ordinary D3D error, not an unsupported-import abort.
+void Dev_SetVertexShaderConstant(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t reg = arg(c, 1), data = arg(c, 2), count = arg(c, 3);
+    if (!dev || !d8_constant_range(reg, count, D8_VERTEX_CONSTANT_REGISTERS, data)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    if (count)
+        d8_copy_registers(d8_constants(dev)->vconst, reg, data, count, false);
+    com_ret(c, D8_OK);
+}
+void Dev_GetVertexShaderConstant(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t reg = arg(c, 1), data = arg(c, 2), count = arg(c, 3);
+    if (!dev || !d8_constant_range(reg, count, D8_VERTEX_CONSTANT_REGISTERS, data)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    if (count)
+        d8_copy_registers(d8_constants(dev)->vconst, reg, data, count, true);
+    com_ret(c, D8_OK);
+}
+void Dev_SetPixelShaderConstant(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t reg = arg(c, 1), data = arg(c, 2), count = arg(c, 3);
+    if (!dev || !d8_constant_range(reg, count, D8_PIXEL_CONSTANT_REGISTERS, data)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    if (count)
+        d8_copy_registers(d8_constants(dev)->pconst, reg, data, count, false);
+    com_ret(c, D8_OK);
+}
+void Dev_GetPixelShaderConstant(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t reg = arg(c, 1), data = arg(c, 2), count = arg(c, 3);
+    if (!dev || !d8_constant_range(reg, count, D8_PIXEL_CONSTANT_REGISTERS, data)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    if (count)
+        d8_copy_registers(d8_constants(dev)->pconst, reg, data, count, true);
+    com_ret(c, D8_OK);
+}
+
 // The bytes to draw from right now: the guest heap while the buffer is locked,
 // otherwise the host copy the last Unlock wrote back.
 const uint8_t *d8_buffer_bytes(ComObj *o) {

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- D3D8 `SetVertexShaderConstant`/`GetVertexShaderConstant` and
+  `SetPixelShaderConstant`/`GetPixelShaderConstant` now store and return the
+  caller's float4 registers instead of aborting through the unsupported-import
+  path. The 96 vertex and 8 pixel registers are per-device host state holding
+  the exact 32-bit float bit patterns; an out-of-range register/count or an
+  invalid guest pointer returns `D3DERR_INVALIDCALL`. The constants do not
+  affect fixed-function draws, matching real D3D8, so shader capability caps
+  are unchanged and no draw behaves differently yet. A guest may set constants
+  while no programmable shader is bound, as the game's water path does.
+
 - d3d8-wgpu requests wgpu's `ADDRESS_MODE_CLAMP_TO_BORDER` feature when the adapter offers it, so a guest using `D3DTADDRESS_BORDER` gets a valid sampler instead of a validation failure at sampler creation. The border color stays transparent black (`D3DTSS_BORDERCOLOR` is not yet honoured).
 
 - USER32 `ToAscii`/`ToAsciiEx` translate a virtual key against the caller's
