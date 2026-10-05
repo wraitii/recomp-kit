@@ -527,8 +527,14 @@ static void test_buffers() {
     check(call_method(vb, 11, {12, 4, sc(8), 0}) == 0 && rd32(sc(8)) == base + 12,
           "a sub-range lock returns base + offset");
     call_method(vb, 12, {});
-    check(call_method(vb, 11, {92, 8, sc(8), 0}) == 0x8876086c,
-          "a lock past the buffer end is rejected");
+    // The engine's LockVB passes an end vertex as SizeToLock, so a size that
+    // runs past the buffer is valid while the offset is inside it. Only an
+    // offset past the end is rejected.
+    check(call_method(vb, 11, {92, 8, sc(8), 0}) == 0 && rd32(sc(8)) == base + 92,
+          "an over-large SizeToLock is accepted when the offset is in range");
+    call_method(vb, 12, {});
+    check(call_method(vb, 11, {97, 4, sc(8), 0}) == 0x8876086c,
+          "an offset past the buffer end is rejected");
     check(call_method(vb, 11, {0, 0, 0, 0}) == 0x8876086c, "null Lock output is rejected");
 
     // Destroying a still-locked buffer must free its staging block.

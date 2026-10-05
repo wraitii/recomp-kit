@@ -279,6 +279,198 @@ fn decode_16_into(data: &[u8], format: ColorFormat, out: &mut Vec<u8>) {
     }
 }
 
+/// S3TC / BC block FourCCs, written as the little-endian D3D8 values so
+/// `0x31545844` reads `'DXT1'` in a hex dump. The guest's compressed block
+/// bytes stay authoritative in CPU storage; these formats are decoded to
+/// linear RGBA only at the wgpu upload point.
+pub const D3DFMT_DXT1: u32 = 0x3154_5844;
+pub const D3DFMT_DXT3: u32 = 0x3354_5844;
+pub const D3DFMT_DXT5: u32 = 0x3554_5844;
+
+/// Bytes per 4x4 block: DXT1 is 8, the explicit-alpha formats are 16.
+pub const fn block_bytes(format: u32) -> u32 {
+    match format {
+        D3DFMT_DXT1 => 8,
+        D3DFMT_DXT3 | D3DFMT_DXT5 => 16,
+        _ => 0,
+    }
+}
+
+/// True for the block-compressed formats this bridge stores and decodes.
+pub const fn is_block_format(format: u32) -> bool {
+    block_bytes(format) != 0
+}
+
+/// Effective block-row pitch and total byte size of one block-format level.
+/// Width and height are texels; the last row/column of blocks is partial and
+/// still stores a whole block, matching D3D8's `LockRect` pitch.
+pub fn block_level_layout(width: u32, height: u32, format: u32) -> (u32, u32) {
+    let bb = block_bytes(format);
+    if bb == 0 {
+        return (0, 0);
+    }
+    let pitch = ((width + 3) / 4) * bb;
+    let size = pitch * ((height + 3) / 4);
+    (pitch, size)
+}
+
+/// 5:6:5 to 8:8:8 by bit replication, the same rule the uncompressed 16-bit
+/// path and the DirectDraw/D3D7 decoder use.
+fn dxt_expand5(v: u32) -> u8 {
+    ((v << 3) | (v >> 2)) as u8
+}
+fn dxt_expand6(v: u32) -> u8 {
+    ((v << 2) | (v >> 4)) as u8
+}
+
+/// Decode the four-colour half of a DXT1/3/5 block. `always_four` selects the
+/// DXT3/5 rule where the third and fourth colours are always interpolated;
+/// DXT1's `c0 <= c1` mode leaves the fourth entry transparent.
+fn decode_dxt_colour_block(p: &[u8], always_four: bool, out: &mut [[u8; 4]; 16]) {
+    let c0 = u16::from_le_bytes([p[0], p[1]]);
+    let c1 = u16::from_le_bytes([p[2], p[3]]);
+    let r0 = dxt_expand5((c0 >> 11) as u32 & 0x1f);
+    let g0 = dxt_expand6((c0 >> 5) as u32 & 0x3f);
+    let b0 = dxt_expand5(c0 as u32 & 0x1f);
+    let r1 = dxt_expand5((c1 >> 11) as u32 & 0x1f);
+    let g1 = dxt_expand6((c1 >> 5) as u32 & 0x3f);
+    let b1 = dxt_expand5(c1 as u32 & 0x1f);
+    let mut pal = [[0u8; 4]; 4];
+    pal[0] = [r0, g0, b0, 0xff];
+    pal[1] = [r1, g1, b1, 0xff];
+    if always_four || c0 > c1 {
+        pal[2] = [
+            ((2 * r0 as u32 + r1 as u32) / 3) as u8,
+            ((2 * g0 as u32 + g1 as u32) / 3) as u8,
+            ((2 * b0 as u32 + b1 as u32) / 3) as u8,
+            0xff,
+        ];
+        pal[3] = [
+            ((r0 as u32 + 2 * r1 as u32) / 3) as u8,
+            ((g0 as u32 + 2 * g1 as u32) / 3) as u8,
+            ((b0 as u32 + 2 * b1 as u32) / 3) as u8,
+            0xff,
+        ];
+    } else {
+        pal[2] = [
+            ((r0 as u32 + r1 as u32) / 2) as u8,
+            ((g0 as u32 + g1 as u32) / 2) as u8,
+            ((b0 as u32 + b1 as u32) / 2) as u8,
+            0xff,
+        ];
+        pal[3] = [0, 0, 0, 0]; // transparent in DXT1's three-colour mode
+    }
+    let bits = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
+    for (i, entry) in out.iter_mut().enumerate() {
+        *entry = pal[((bits >> (2 * i)) & 3) as usize];
+    }
+}
+
+/// DXT3: sixteen 4-bit alpha values, then an always-four-colour block.
+fn decode_dxt3(p: &[u8], out: &mut [[u8; 4]; 16]) {
+    let mut colour = [[0u8; 4]; 16];
+    decode_dxt_colour_block(&p[8..], true, &mut colour);
+    for i in 0..16 {
+        let a = (p[i >> 1] >> ((i & 1) * 4)) & 0xf;
+        out[i] = [colour[i][0], colour[i][1], colour[i][2], (a << 4) | a];
+    }
+}
+
+/// DXT5: two 8-bit alpha endpoints and 48 bits of 3-bit indices, then an
+/// always-four-colour block.
+fn decode_dxt5(p: &[u8], out: &mut [[u8; 4]; 16]) {
+    let a0 = p[0];
+    let a1 = p[1];
+    let mut abits = 0u64;
+    for i in 0..6 {
+        abits |= (p[2 + i] as u64) << (8 * i);
+    }
+    let mut alpha = [0u8; 8];
+    alpha[0] = a0;
+    alpha[1] = a1;
+    if a0 > a1 {
+        for i in 1..=6u32 {
+            alpha[i as usize + 1] =
+                (((7 - i) as u32 * a0 as u32 + i * a1 as u32) / 7) as u8;
+        }
+    } else {
+        for i in 1..=4u32 {
+            alpha[i as usize + 1] =
+                (((5 - i) as u32 * a0 as u32 + i * a1 as u32) / 5) as u8;
+        }
+        alpha[6] = 0x00;
+        alpha[7] = 0xff;
+    }
+    let mut colour = [[0u8; 4]; 16];
+    decode_dxt_colour_block(&p[8..], true, &mut colour);
+    for i in 0..16 {
+        let idx = ((abits >> (3 * i)) & 7) as usize;
+        out[i] = [colour[i][0], colour[i][1], colour[i][2], alpha[idx]];
+    }
+}
+
+/// Decode a whole block-format level into tightly packed `R,G,B,A` bytes at
+/// `width * height * 4`. `data` must hold the complete block layout from
+/// [`block_level_layout`]; the final partial block row/column is clipped, not
+/// sampled. Unsupported formats are a named error.
+pub fn decode_block_into(
+    format: u32,
+    data: &[u8],
+    width: u32,
+    height: u32,
+    out: &mut Vec<u8>,
+) -> Result<(), RenderError> {
+    let bb = block_bytes(format);
+    if bb == 0 {
+        return Err(RenderError::new(
+            "format::decode_block",
+            format!("unsupported block D3DFORMAT {format}"),
+        ));
+    }
+    if width == 0 || height == 0 {
+        return Err(RenderError::invalid("format::decode_block", "zero dimension"));
+    }
+    let (pitch, size) = block_level_layout(width, height, format);
+    if data.len() < size as usize {
+        return Err(RenderError::invalid(
+            "format::decode_block",
+            "block level is shorter than its layout",
+        ));
+    }
+    out.clear();
+    out.reserve((width as usize) * (height as usize) * 4);
+    let mut block = [[0u8; 4]; 16];
+    let block_cols = (width + 3) / 4;
+    let block_rows = (height + 3) / 4;
+    for by in 0..block_rows {
+        for bx in 0..block_cols {
+            let off = (by * pitch + bx * bb) as usize;
+            let p = &data[off..off + bb as usize];
+            match format {
+                D3DFMT_DXT1 => decode_dxt_colour_block(p, false, &mut block),
+                D3DFMT_DXT3 => decode_dxt3(p, &mut block),
+                D3DFMT_DXT5 => decode_dxt5(p, &mut block),
+                _ => unreachable!("block format checked above"),
+            }
+            for py in 0..4 {
+                let y = by * 4 + py;
+                if y >= height {
+                    break;
+                }
+                for px in 0..4 {
+                    let x = bx * 4 + px;
+                    if x >= width {
+                        break;
+                    }
+                    out.extend_from_slice(&block[(py * 4 + px) as usize]);
+                }
+            }
+        }
+    }
+    debug_assert_eq!(out.len(), (width as usize) * (height as usize) * 4);
+    Ok(())
+}
+
 /// Map a raw `D3DFORMAT` to a wgpu texture format, rejecting unsupported values.
 pub fn d3d_to_wgpu_color(raw: u32) -> Result<wgpu::TextureFormat, RenderError> {
     Ok(ColorFormat::from_d3dformat(raw)?.wgpu_format())
@@ -454,6 +646,73 @@ mod tests {
             ColorFormat::X8R8G8B8.to_rgba8(&[0x44, 0x33, 0x22, 0x11]),
             [0x22, 0x33, 0x44, 0xFF]
         );
+    }
+
+    #[test]
+    fn dxt1_decodes_four_and_three_colour_blocks() {
+        // c0 = red (0xF800), c1 = blue (0x001F), c0 > c1: four colours.
+        // Index bits 0b11_10_01_00 (packed per texel) select each palette entry.
+        let mut data = vec![0u8; 8];
+        data[0..2].copy_from_slice(&0xF800u16.to_le_bytes());
+        data[2..4].copy_from_slice(&0x001Fu16.to_le_bytes());
+        data[4..8].copy_from_slice(&0b0000_0000_1110_0100u32.to_le_bytes());
+        let mut out = Vec::new();
+        decode_block_into(D3DFMT_DXT1, &data, 4, 4, &mut out).unwrap();
+        assert_eq!(&out[0..4], [0xFF, 0, 0, 0xFF]); // palette 0: red
+        assert_eq!(&out[4..8], [0, 0, 0xFF, 0xFF]); // palette 1: blue
+        // palette 2 = (2*red + blue)/3, palette 3 = (red + 2*blue)/3
+        assert_eq!(&out[8..12], [(2 * 255 / 3) as u8, 0, 85, 0xFF]);
+        assert_eq!(&out[12..16], [(255 / 3) as u8, 0, 170, 0xFF]);
+
+        // c0 < c1: three-colour mode, palette entry 3 is transparent black.
+        let mut data = vec![0u8; 8];
+        data[0..2].copy_from_slice(&0x001Fu16.to_le_bytes());
+        data[2..4].copy_from_slice(&0xF800u16.to_le_bytes());
+        // texel 0 -> palette 0, texel 3 -> palette 3 (transparent).
+        data[4..8].copy_from_slice(&0b0000_0000_1100_0000u32.to_le_bytes());
+        let mut out = Vec::new();
+        decode_block_into(D3DFMT_DXT1, &data, 4, 4, &mut out).unwrap();
+        assert_eq!(&out[0..4], [0, 0, 0xFF, 0xFF]);
+        assert_eq!(&out[12..16], [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn dxt3_and_dxt5_decode_explicit_alpha() {
+        // DXT3: a fully opaque alpha nibble pair then a white colour block.
+        let mut data = vec![0u8; 16];
+        data[0..8].fill(0xFF);
+        data[8..10].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        data[10..12].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        let mut out = Vec::new();
+        decode_block_into(D3DFMT_DXT3, &data, 4, 4, &mut out).unwrap();
+        assert_eq!(&out[0..4], [0xFF, 0xFF, 0xFF, 0xFF]);
+
+        // DXT5: a0 = 0xFF, a1 = 0x00, all index bits 0 -> alpha 0xFF.
+        let mut data = vec![0u8; 16];
+        data[0] = 0xFF;
+        data[1] = 0x00;
+        data[8..10].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        data[10..12].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        let mut out = Vec::new();
+        decode_block_into(D3DFMT_DXT5, &data, 4, 4, &mut out).unwrap();
+        assert_eq!(&out[0..4], [0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn block_layout_rounds_up_and_clips_partial_blocks() {
+        assert_eq!(block_bytes(D3DFMT_DXT1), 8);
+        assert_eq!(block_bytes(D3DFMT_DXT3), 16);
+        assert_eq!(block_bytes(D3DFMT_DXT5), 16);
+        assert!(is_block_format(D3DFMT_DXT1) && !is_block_format(D3DFMT_A8R8G8B8));
+        // 6x6 is 2x2 blocks: DXT1 pitch 16, size 32.
+        assert_eq!(block_level_layout(6, 6, D3DFMT_DXT1), (16, 32));
+        let mut out = Vec::new();
+        // Two blocks' worth of nonzero bytes; the 2x2 output only keeps 4x4 texels total.
+        let data = vec![0xFFu8; 32];
+        decode_block_into(D3DFMT_DXT1, &data, 6, 6, &mut out).unwrap();
+        assert_eq!(out.len(), 6 * 6 * 4);
+        assert!(decode_block_into(D3DFMT_DXT1, &data[..8], 6, 6, &mut out).is_err());
+        assert!(decode_block_into(D3DFMT_A8R8G8B8, &data, 6, 6, &mut out).is_err());
     }
 
     #[test]

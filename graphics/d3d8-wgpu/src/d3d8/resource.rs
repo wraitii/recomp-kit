@@ -34,6 +34,12 @@ pub fn format_bytes(format: u32) -> u32 {
     }
 }
 
+/// True for a block-compressed format. These have no per-texel byte count:
+/// their levels are laid out in 4x4 blocks by [`crate::d3d8::format`].
+pub fn is_block_format(format: u32) -> bool {
+    crate::d3d8::format::is_block_format(format)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct D3d8LevelLayout {
@@ -53,7 +59,8 @@ pub fn level_layout(
     format: u32,
 ) -> Result<D3d8LevelLayout, RenderError> {
     let bpp = format_bytes(format);
-    if width == 0 || height == 0 || width > 16384 || height > 16384 || bpp == 0 {
+    let block = crate::d3d8::format::block_bytes(format);
+    if width == 0 || height == 0 || width > 16384 || height > 16384 || (bpp == 0 && block == 0) {
         return Err(RenderError::invalid(
             "CreateTexture",
             "invalid dimensions or CPU format",
@@ -72,12 +79,19 @@ pub fn level_layout(
     }
     let width = (width >> level).max(1);
     let height = (height >> level).max(1);
-    let pitch = width
-        .checked_mul(bpp)
-        .ok_or_else(|| RenderError::invalid("CreateTexture", "pitch overflow"))?;
-    let size = pitch
-        .checked_mul(height)
-        .ok_or_else(|| RenderError::invalid("CreateTexture", "size overflow"))?;
+    let (pitch, size) = if block != 0 {
+        // A block format's pitch is a block-row pitch and its extent is in
+        // blocks; the last row/column stores a full block (D3D8 LockRect pitch).
+        crate::d3d8::format::block_level_layout(width, height, format)
+    } else {
+        let pitch = width
+            .checked_mul(bpp)
+            .ok_or_else(|| RenderError::invalid("CreateTexture", "pitch overflow"))?;
+        let size = pitch
+            .checked_mul(height)
+            .ok_or_else(|| RenderError::invalid("CreateTexture", "size overflow"))?;
+        (pitch, size)
+    };
     Ok(D3d8LevelLayout {
         width,
         height,

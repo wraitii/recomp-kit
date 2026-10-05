@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Accept an out-of-range `SizeToLock` in `IDirect3DVertexBuffer8::Lock` when the
+  lock offset is inside the buffer. The original engine's
+  `RenderingContext::LockVB` (`00545b50`) passes the caller's end vertex as the
+  size (`WorldModule::LockVb`, `00523cf0`, calls it with `(start, start+count)`),
+  so the declared size runs past the buffer even though the bytes written stay
+  inside it. Rejecting those locks stalled the shared UI vertex buffer and left
+  it reading zeroed vertices, which flickered the front end.
+
 - Support `[translate] code_map` address/length metadata. Builds verify the
   owner's executable and decode private assembly listings locally, allowing
   game repositories to build without Ghidra or distributed game instructions.

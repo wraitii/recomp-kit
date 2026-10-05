@@ -35,6 +35,23 @@ constexpr uint32_t D8_ERR_INVALIDCALL = 0x8876086Cu;
 constexpr uint32_t D8_ERR_NOTAVAILABLE = 0x8876086Au;
 constexpr uint32_t D8_DEVTYPE_HAL = 1;
 
+// D3DSWAPEFFECT. The host owns presentation: a single offscreen target is
+// blitted to the window, so DISCARD (1), FLIP (2) and COPY_VSYNC (4) all mean
+//
+//   "render into the target, then present the completed frame".
+//
+// FLIP is what the original asks for in fullscreen (with Windowed == FALSE).
+// DIVERGENCE(original): real FLIP rotates back-buffer ownership; the bridge's
+// presentation seam coalesces the effects.
+constexpr uint32_t D8SWAPEFFECT_DISCARD = 1;
+constexpr uint32_t D8SWAPEFFECT_FLIP = 2;
+constexpr uint32_t D8SWAPEFFECT_COPY_VSYNC = 4;
+
+// D3DPRESENT_INTERVAL_*. Default (0) and IMMEDIATE both mean "do not throttle
+// this Present against a refresh count"; the host present is not vsync-bound,
+// so either is serviceable. The ONE..FOUR vblank counts are not modeled.
+constexpr uint32_t D8PRESENT_INTERVAL_IMMEDIATE = 0x80000000u;
+
 // Depth formats supported by the Rust offscreen attachment.
 constexpr uint32_t D8FMT_D16 = 80;
 constexpr uint32_t D8FMT_D24S8 = 75;
@@ -122,6 +139,17 @@ uint32_t d8_format_bytes(uint32_t fmt) {
         return 0;
     }
 #endif
+}
+
+// Bytes per 4x4 block for the S3TC/BC formats the Rust renderer decodes at
+// upload (graphics/d3d8-wgpu/src/d3d8/format.rs). 0 marks a non-block format.
+// The guest's compressed bytes are authoritative in CPU storage; a level's
+// pitch and size are block-based (see d3d8_texture_level_layout).
+constexpr uint32_t D8FMT_DXT1 = 0x31545844u; // 'DXT1'
+constexpr uint32_t D8FMT_DXT3 = 0x33545844u; // 'DXT3'
+constexpr uint32_t D8FMT_DXT5 = 0x35545844u; // 'DXT5'
+uint32_t d8_block_bytes(uint32_t fmt) {
+    return fmt == D8FMT_DXT1 ? 8u : (fmt == D8FMT_DXT3 || fmt == D8FMT_DXT5 ? 16u : 0u);
 }
 
 // Adapter facts. d3d8_adapter_info builds a wgpu context, so query it once.
@@ -323,7 +351,7 @@ bool check_device_format_ok(uint32_t usage, uint32_t rtype, uint32_t fmt) {
     if (usage & D8USAGE_RENDERTARGET)
         return rtype == D8_RTYPE_SURFACE && color_format(fmt);
     if (rtype == D8_RTYPE_TEXTURE)
-        return d8_format_bytes(fmt) != 0;
+        return d8_format_bytes(fmt) != 0 || d8_block_bytes(fmt) != 0;
     return false;
 }
 
@@ -543,17 +571,22 @@ void D8_CreateDevice(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    // DISCARD (1) and COPY_VSYNC (4) are the swap effects the host can honour
-    // by presenting a completed frame; reject any other semantics instead of
-    // silently dropping them. Windowed (0) and fullscreen (1) present through
-    // the same host target, so the flag is not a constraint. An autodepth
-    // request is accepted only for a depth format the backend maps; the depth
-    // attachment is owned by the Rust target and the guest surface is its
-    // handle.
-    uint32_t depth = rd32(pp + 32), depth_format = rd32(pp + 36);
-    if (rd32(pp + 12) > 1 || rd32(pp + 16) || (swap != 1 && swap != 4) ||
+    // DISCARD (1), FLIP (2) and COPY_VSYNC (4) are the swap effects the host
+    // can honour by presenting a completed frame; reject any other semantics
+    // instead of silently dropping them. FLIP is fullscreen-only in real D3D8,
+    // so gate it on Windowed == FALSE. Windowed and fullscreen themselves
+    // present through the same host target, so the flag is otherwise not a
+    // constraint. An autodepth request is accepted only for a depth format the
+    // backend maps; the depth attachment is owned by the Rust target and the
+    // guest surface is its handle. The presentation interval accepts Default
+    // and IMMEDIATE, the ways RT3 asks for an unthrottled Present.
+    uint32_t depth = rd32(pp + 32), depth_format = rd32(pp + 36), interval = rd32(pp + 48);
+    bool swap_ok = swap == D8SWAPEFFECT_DISCARD || swap == D8SWAPEFFECT_COPY_VSYNC ||
+                   (swap == D8SWAPEFFECT_FLIP && !windowed);
+    bool interval_ok = interval == 0 || interval == D8PRESENT_INTERVAL_IMMEDIATE;
+    if (rd32(pp + 12) > 1 || rd32(pp + 16) || !swap_ok ||
         (depth && !d8_depth_format(depth_format)) || rd32(pp + 40) || rd32(pp + 44) ||
-        rd32(pp + 48)) {
+        !interval_ok) {
         com_ret(c, D8_ERR_NOTAVAILABLE);
         return;
     }
@@ -669,6 +702,23 @@ void Dev_Reset(X86 *c) {
 void Dev_TestCooperativeLevel(X86 *c) {
     com_ret(c, D8_OK);
 }
+// (this, DWORD *pNumPasses). The engine's DoTextureTests (guest 0x005489f0)
+// probes the current texture/blend state and only keeps its texture path when
+// the probe reports S_OK and exactly one pass. The host composites the two
+// texture stages in a single pass, so every state the bridge accepts is valid
+// with one pass; reporting a pass count of 1 is the modelled answer, not a
+// driver query. Rejecting a state here would make the engine drop a mode it
+// later needs.
+void Dev_ValidateDevice(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t out = arg(c, 1);
+    if (!dev || !out || !gm_valid(out, 4)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, 1);
+    com_ret(c, D8_OK);
+}
 // The renderer stores this as its texture-memory budget (Ghidra 0x007c70b0
 // reads IDirect3DDevice8 slot 4 into renderer +4/+8). Return the modeled
 // available texture memory rather than a fabricated GPU size.
@@ -777,6 +827,31 @@ void Dev_SetViewport(X86 *c) {
         D3d8Error err{};
         int32_t status = d3d8_device_set_viewport(host_device(dev), rd32(vp), rd32(vp + 4),
                                                   rd32(vp + 8), rd32(vp + 12), min_z, max_z, &err);
+        com_ret(c, host_result(c, status, err));
+        return;
+    }
+#endif
+    com_ret(c, D8_ERR_INVALIDCALL);
+}
+// (this, D3DVIEWPORT8 *pViewport). D3D8 returns the viewport currently set,
+// not a query of the host rasterizer, so an out-of-range SetViewport value is
+// still reported back verbatim.
+void Dev_GetViewport(X86 *c) {
+#ifdef RECOMP_D3D8_WGPU
+    ComObj *dev = d8_dev(c);
+    uint32_t out = arg(c, 1);
+    if (dev && dev->d3d8_device && out && gm_valid(out, 24)) {
+        D3d8Viewport vp{};
+        D3d8Error err{};
+        int32_t status = d3d8_device_get_viewport(host_device(dev), &vp, &err);
+        if (status == D3D8_STATUS_OK) {
+            wr32(out + 0, vp.x);
+            wr32(out + 4, vp.y);
+            wr32(out + 8, vp.width);
+            wr32(out + 12, vp.height);
+            memcpy(gm_ptr(out + 16), &vp.min_z, 4);
+            memcpy(gm_ptr(out + 20), &vp.max_z, 4);
+        }
         com_ret(c, host_result(c, status, err));
         return;
     }
@@ -1239,11 +1314,12 @@ void Dev_CreateTexture(X86 *c) {
     }
     wr32(out, 0);
     uint32_t bpp = d8_format_bytes(format);
+    uint32_t block = d8_block_bytes(format);
     if (!dev || !w || !h || w > 16384 || h > 16384) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if (!bpp) {
+    if (!bpp && !block) {
         LOGW("d3d8: CreateTexture format 0x%x is not representable", format);
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
@@ -1323,8 +1399,15 @@ void Dev_CreateTexture(X86 *c) {
         level->d3d8_pool = pool;
         level->width = lw;
         level->height = lh;
+#ifdef RECOMP_D3D8_RESOURCES
+        // A block format reports a block-row pitch; its bytes-per-texel is
+        // meaningless and d8_lock_offset uses the block path below.
+        level->bpp = block ? 0 : bpp * 8;
+        level->pitch = layout.pitch;
+#else
         level->bpp = bpp * 8;
         level->pitch = lw * bpp;
+#endif
         // The initial reference is the texture's ownership of the level.
         tex->d3d8_levels.push_back(level->id);
         com_internalize(level);
@@ -1463,7 +1546,17 @@ bool d8_lock_offset(const ComObj *level, uint32_t rect, uint32_t *offset) {
     if (left < 0 || top < 0 || right > (int32_t)level->width || bottom > (int32_t)level->height ||
         right <= left || bottom <= top)
         return false;
-    *offset = (uint32_t)top * level->pitch + (uint32_t)left * (level->bpp / 8);
+    // Block formats are addressed in 4x4 blocks: the top-left of the rect's
+    // block is the byte offset. D3D8 requires such a rect to be block-aligned;
+    // a non-aligned lock would let the guest write into the previous block, so
+    // reject it rather than returning a wrong pointer.
+    if (uint32_t bb = d8_block_bytes(level->rmask)) {
+        if ((left & 3) || (top & 3))
+            return false;
+        *offset = (uint32_t)(top / 4) * level->pitch + (uint32_t)(left / 4) * bb;
+    } else {
+        *offset = (uint32_t)top * level->pitch + (uint32_t)left * (level->bpp / 8);
+    }
     return true;
 }
 
@@ -1483,7 +1576,9 @@ void Surface_GetDesc(X86 *c) {
         pool = surface->d3d8_pool;
         width = surface->width;
         height = surface->height;
-        size = surface->pitch * surface->height;
+        // pixels_bytes already carries the block-aware size for a compressed
+        // level; pitch * height would over-report it.
+        size = surface->pixels_bytes;
     } else if (surface->d3d8_depth) {
         // Autodepth handle. Its bytes live in the Rust target; the descriptor
         // reports the D3D8 depth size (D16 is 2 bytes/texel, the rest 4).
@@ -1653,7 +1748,7 @@ void Tex_GetLevelDesc(X86 *c) {
     wr32(out + 4, D8_TYPE_SURFACE);
     wr32(out + 8, level->d3d8_usage);
     wr32(out + 12, level->d3d8_pool);
-    wr32(out + 16, level->pitch * level->height);
+    wr32(out + 16, level->pixels_bytes);
     wr32(out + 20, 0); // D3DMULTISAMPLE_NONE
     wr32(out + 24, level->width);
     wr32(out + 28, level->height);
@@ -1793,15 +1888,20 @@ void Buffer_GetDevice(X86 *c) {
 // lock, so the pointer the guest receives is the staged block plus the offset.
 void Buffer_Lock(X86 *c) {
     ComObj *o = d8_buffer(c);
-    uint32_t offset = arg(c, 1), size = arg(c, 2), out = arg(c, 3);
+    uint32_t offset = arg(c, 1), out = arg(c, 3);
     if (!o || !o->pixels_bytes || !out || !gm_valid(out, 4)) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    uint32_t total = o->pixels_bytes;
-    if (!size)
-        size = total - offset;
-    if (offset > total || size > total - offset) {
+    // The engine's RenderingContext::LockVB (00545b50) passes the caller's end
+    // vertex as SizeToLock: WorldModule::LockVb (00523cf0) calls it with
+    // (start, start + count), and LockVB scales both by the 24-byte stride. The
+    // declared size can therefore run past the buffer while the bytes actually
+    // written (count) stay inside it; the original D3D8 accepts this. Rejecting
+    // it stalls the vertex buffer and the next draw reads stale (zero) vertices,
+    // which is what flickered the UI. SizeToLock (argument 2) is not used beyond
+    // validation - the whole blob is staged - so only the offset must be in range.
+    if (offset > o->pixels_bytes) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
@@ -2053,6 +2153,90 @@ const uint8_t *d8_buffer_bytes(ComObj *o) {
     return storage_data(o);
 }
 
+// (this, pSourceSurface, pSourceRectsArray, cRects, pDestinationSurface,
+// pDestPointsArray). D3D8's rectangle blit between two surfaces that must have
+// the same format. The shim's surfaces are CPU storage, so this copies the
+// requested rows directly; a surface with an open lock contributes the staged
+// guest heap bytes, exactly as a draw or a read would see them. A mismatched
+// format is a caller error: the engine's DoTextureTests helper falls back to a
+// manual conversion when this returns failure, so it must fail rather than
+// guess. A null destination-points array copies each rect to its own corner.
+void Dev_CopyRects(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    ComObj *src = com_this(arg(c, 1), IF_D3D8SURFACE8);
+    ComObj *dst = com_this(arg(c, 4), IF_D3D8SURFACE8);
+    uint32_t rects = arg(c, 2), count = arg(c, 3), points = arg(c, 5);
+    if (!dev || !src || !dst || !count || src->rmask != dst->rmask || src->d3d8_depth ||
+        dst->d3d8_depth) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    if (!gm_valid(rects, count * 16) || (points && !gm_valid(points, count * 8))) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    if (!storage_data(src) || !storage_data(dst)) {
+        fprintf(stderr, "d3d8: CopyRects on a host render target is not implemented\n");
+        fflush(stderr);
+        imports_unsupported(c);
+        return;
+    }
+    sync_rendered_level(src);
+    sync_rendered_level(dst);
+    const uint8_t *sbase = d8_buffer_bytes(src);
+    uint8_t *dbase = const_cast<uint8_t *>(d8_buffer_bytes(dst));
+    if (!sbase || !dbase) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    const uint32_t block = d8_block_bytes(src->rmask);
+    const uint32_t texel = block ? block : src->bpp / 8;
+    for (uint32_t i = 0; i < count; ++i) {
+        int32_t left = (int32_t)rd32(rects + i * 16);
+        int32_t top = (int32_t)rd32(rects + i * 16 + 4);
+        int32_t right = (int32_t)rd32(rects + i * 16 + 8);
+        int32_t bottom = (int32_t)rd32(rects + i * 16 + 12);
+        int32_t dx = left, dy = top;
+        if (points) {
+            dx = (int32_t)rd32(points + i * 8);
+            dy = (int32_t)rd32(points + i * 8 + 4);
+        }
+        if (left < 0 || top < 0 || right > (int32_t)src->width || bottom > (int32_t)src->height ||
+            right <= left || bottom <= top || dx < 0 || dy < 0 ||
+            dx + (right - left) > (int32_t)dst->width ||
+            dy + (bottom - top) > (int32_t)dst->height) {
+            com_ret(c, D8_ERR_INVALIDCALL);
+            return;
+        }
+        if (block) {
+            // Block formats address 4x4 blocks; D3D8 requires a block-aligned
+            // rect. The block row pitch is the level pitch.
+            if ((left & 3) || (top & 3) || (dx & 3) || (dy & 3) || ((right - left) & 3) ||
+                ((bottom - top) & 3)) {
+                com_ret(c, D8_ERR_INVALIDCALL);
+                return;
+            }
+            const uint32_t row = uint32_t(right - left) / 4 * block;
+            const uint32_t rows = uint32_t(bottom - top) / 4;
+            const uint8_t *s =
+                sbase + (uint32_t)(top / 4) * src->pitch + (uint32_t)(left / 4) * block;
+            uint8_t *d = dbase + (uint32_t)(dy / 4) * dst->pitch + (uint32_t)(dx / 4) * block;
+            for (uint32_t y = 0; y < rows; ++y)
+                memcpy(d + (size_t)y * dst->pitch, s + (size_t)y * src->pitch, row);
+        } else {
+            const uint32_t row = uint32_t(right - left) * texel;
+            const uint32_t rows = uint32_t(bottom - top);
+            const uint8_t *s = sbase + (size_t)top * src->pitch + (size_t)left * texel;
+            uint8_t *d = dbase + (size_t)dy * dst->pitch + (size_t)dx * texel;
+            for (uint32_t y = 0; y < rows; ++y)
+                memcpy(d + (size_t)y * dst->pitch, s + (size_t)y * src->pitch, row);
+        }
+    }
+    // The destination content changed; any resident GPU copy is now stale.
+    ++dst->d3d8_content_generation;
+    com_ret(c, D8_OK);
+}
+
 #ifdef RECOMP_D3D8_WGPU
 // Hand the bound stage-0 texture's level-0 CPU bytes to the renderer. Called
 // immediately before each draw so a level locked after SetTexture samples its
@@ -2176,6 +2360,9 @@ void d3d8_Direct3DCreate8(X86 *c) {
 
 static const ImportShim g_d3d8_exports[] = {
     {"d3d8.dll", "Direct3DCreate8", 1, d3d8_Direct3DCreate8},
+    // Railroad Tycoon 3 loads its shipping d8tx.dll wrapper, whose only export
+    // forwards to Direct3DCreate8. Treat it as the d3d8.dll entry point.
+    {"d8tx.dll", "Direct3DCreate8", 1, d3d8_Direct3DCreate8},
 };
 
 void device_destroy(ComObj *o) {

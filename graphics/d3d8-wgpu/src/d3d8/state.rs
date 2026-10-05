@@ -586,8 +586,12 @@ impl DeviceState {
                 D3DTEXTUREFILTERTYPE::None
                 | D3DTEXTUREFILTERTYPE::Point
                 | D3DTEXTUREFILTERTYPE::Linear => Ok(value),
-                D3DTEXTUREFILTERTYPE::Anisotropic
-                | D3DTEXTUREFILTERTYPE::PyramidQuad
+                // The bridge advertises D3DCAPS8.MaxAnisotropy == 1 (see
+                // write_caps), so D3DTEXF_ANISOTROPIC asks for exactly linear
+                // filtering. RT3 sets it for its world textures; the sampler
+                // maps it to Linear. The two cubic modes stay refused.
+                D3DTEXTUREFILTERTYPE::Anisotropic => Ok(value),
+                D3DTEXTUREFILTERTYPE::PyramidQuad
                 | D3DTEXTUREFILTERTYPE::GaussianQuad => Err(fail(format!(
                     "{name} = {value:#x} is not POINT/LINEAR/NONE in the bounded subset"
                 ))),
@@ -1566,6 +1570,21 @@ mod tests {
     }
 
     #[test]
+    fn anisotropic_filter_is_linear_at_max_anisotropy_one() {
+        let mut state = DeviceState::new(64, 64);
+        // D3DTSS_MINFILTER = 17, D3DTSS_MAGFILTER = 16 in this enum.
+        state
+            .set_texture_stage_state(0, 17, D3DTEXTUREFILTERTYPE::Anisotropic.raw())
+            .unwrap();
+        state
+            .set_texture_stage_state(0, 16, D3DTEXTUREFILTERTYPE::Anisotropic.raw())
+            .unwrap();
+        let stage = state.resolve_texture_stage(0, true).unwrap();
+        assert_eq!(stage.min_filter, D3DTEXTUREFILTERTYPE::Anisotropic.raw());
+        assert_eq!(stage.mag_filter, D3DTEXTUREFILTERTYPE::Anisotropic.raw());
+    }
+
+    #[test]
     fn texture_stage_unsupported_values_fail_by_name() {
         fn resolve(mutate: impl FnOnce(&mut DeviceState)) -> String {
             let mut state = DeviceState::new(64, 64);
@@ -1610,10 +1629,10 @@ mod tests {
             })
             .contains("TEXTURETRANSFORMFLAGS")
         );
-        // An anisotropic filter and MIRRORONCE addressing.
+        // The cubic filters and MIRRORONCE addressing stay refused.
         assert!(
             resolve(|s| {
-                s.set_texture_stage_state(0, 17, D3DTEXTUREFILTERTYPE::Anisotropic.raw())
+                s.set_texture_stage_state(0, 17, D3DTEXTUREFILTERTYPE::PyramidQuad.raw())
                     .unwrap();
             })
             .contains("MINFILTER")

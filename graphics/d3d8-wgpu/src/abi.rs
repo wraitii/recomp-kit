@@ -115,6 +115,18 @@ pub struct D3d8Material {
     pub power: f32,
 }
 
+/// `D3DVIEWPORT8`, 24 bytes: `X, Y, Width, Height` then `MinZ, MaxZ`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct D3d8Viewport {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub min_z: f32,
+    pub max_z: f32,
+}
+
 /// `D3DLIGHT8`, 104 bytes, field-for-field.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -398,13 +410,18 @@ pub extern "C" fn d3d8_device_reset(
 }
 
 /// Validate the `D3DPRESENT_PARAMETERS` subset the bridge accepts, matching
-/// `D8_CreateDevice`: one backbuffer, no multisampling, DISCARD (1) or
-/// COPY_VSYNC (4) swap effect, zero flags/refresh/interval, and an autodepth
-/// format the backend maps. Returns the depth format to hand the target (0 when
-/// autodepth is off). Bad values are `InvalidArgument` (the bridge's
+/// `D8_CreateDevice`: one backbuffer, no multisampling, DISCARD (1), FLIP (2,
+/// fullscreen-only) or COPY_VSYNC (4) swap effect, zero flags/refresh, a
+/// Default or IMMEDIATE presentation interval, and an autodepth format the
+/// backend maps. Returns the depth format to hand the target (0 when autodepth
+/// is off). Bad values are `InvalidArgument` (the bridge's
 /// `D3DERR_INVALIDCALL`), never a fail-loud unsupported abort.
 fn validate_present_params(p: &D3d8PresentParams) -> Result<u32, RenderError> {
     use crate::d3d8::format::{self, DepthFormat};
+    const SWAPEFFECT_DISCARD: u32 = 1;
+    const SWAPEFFECT_FLIP: u32 = 2;
+    const SWAPEFFECT_COPY_VSYNC: u32 = 4;
+    const PRESENT_INTERVAL_IMMEDIATE: u32 = 0x8000_0000;
     let invalid = |what: &str| RenderError::invalid("reset", what);
     if p.back_buffer_width == 0 || p.back_buffer_height == 0 {
         return Err(invalid("zero backbuffer dimension"));
@@ -420,10 +437,18 @@ fn validate_present_params(p: &D3d8PresentParams) -> Result<u32, RenderError> {
     if p.back_buffer_count > 1 || p.multisample_type != 0 {
         return Err(invalid("unsupported backbuffer count or multisample type"));
     }
-    if p.swap_effect != 1 && p.swap_effect != 4 {
+    // FLIP is fullscreen-only in real D3D8 (Windowed == FALSE), matching
+    // `D8_CreateDevice`. The presentation seam coalesces the effects either
+    // way.
+    let swap_ok = p.swap_effect == SWAPEFFECT_DISCARD
+        || p.swap_effect == SWAPEFFECT_COPY_VSYNC
+        || (p.swap_effect == SWAPEFFECT_FLIP && p.windowed == 0);
+    if !swap_ok {
         return Err(invalid("unsupported swap effect"));
     }
-    if p.flags != 0 || p.fullscreen_refresh_rate != 0 || p.fullscreen_presentation_interval != 0 {
+    let interval_ok = p.fullscreen_presentation_interval == 0
+        || p.fullscreen_presentation_interval == PRESENT_INTERVAL_IMMEDIATE;
+    if p.flags != 0 || p.fullscreen_refresh_rate != 0 || !interval_ok {
         return Err(invalid("unsupported present flags/refresh/interval"));
     }
     let depth = DepthFormat::from_d3dformat(p.auto_depth_stencil_format)
@@ -756,6 +781,47 @@ pub extern "C" fn d3d8_device_set_viewport(
         min_z,
         max_z,
     };
+    write_error(err, D3d8Status::Ok, "");
+    D3d8Status::Ok as i32
+}
+
+/// `IDirect3DDevice8::GetViewport`. Writes the viewport the rasterizer is
+/// currently using; `SetViewport` accepts values wgpu later rejects, so the
+/// queried value is the stored state, as D3D8 promises.
+#[unsafe(no_mangle)]
+pub extern "C" fn d3d8_device_get_viewport(
+    dev: *mut D3d8Device,
+    out: *mut D3d8Viewport,
+    err: *mut D3d8Error,
+) -> i32 {
+    let Some(device) = device_ref(dev) else {
+        write_error(
+            err,
+            D3d8Status::InvalidArgument,
+            "get_viewport: null device",
+        );
+        return D3d8Status::InvalidArgument as i32;
+    };
+    if out.is_null() {
+        write_error(
+            err,
+            D3d8Status::InvalidArgument,
+            "get_viewport: null output",
+        );
+        return D3d8Status::InvalidArgument as i32;
+    }
+    let v = device.state.viewport;
+    // SAFETY: the caller passes a writable D3d8Viewport.
+    unsafe {
+        *out = D3d8Viewport {
+            x: v.x,
+            y: v.y,
+            width: v.width,
+            height: v.height,
+            min_z: v.min_z,
+            max_z: v.max_z,
+        };
+    }
     write_error(err, D3d8Status::Ok, "");
     D3d8Status::Ok as i32
 }

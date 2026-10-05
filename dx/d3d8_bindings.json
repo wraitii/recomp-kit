@@ -49,6 +49,7 @@
       "Clear": "Dev_Clear",
       "SetTransform": "Dev_SetTransform",
       "SetViewport": "Dev_SetViewport",
+      "GetViewport": "Dev_GetViewport",
       "SetMaterial": "Dev_SetMaterial",
       "GetMaterial": "Dev_GetMaterial",
       "SetLight": "Dev_SetLight",
@@ -64,7 +65,9 @@
       "SetVertexShader": "Dev_SetVertexShader",
       "GetVertexShader": "Dev_GetVertexShader",
       "SetStreamSource": "Dev_SetStreamSource",
-      "SetIndices": "Dev_SetIndices"
+      "SetIndices": "Dev_SetIndices",
+      "CopyRects": "Dev_CopyRects",
+      "ValidateDevice": "Dev_ValidateDevice"
     }
   },
   {

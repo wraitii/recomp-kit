@@ -308,10 +308,12 @@ fn sampler_descriptor(
         A::MirrorOnce => unreachable!("validated: MIRRORONCE is refused"),
     };
     let filter = |value: u32| match F::from_raw(value).expect("validated filter") {
-        F::Linear => wgpu::FilterMode::Linear,
+        // MaxAnisotropy is 1, so ANISOTROPIC is linear filtering (see
+        // DeviceState::resolve_texture_stage).
+        F::Linear | F::Anisotropic => wgpu::FilterMode::Linear,
         F::None | F::Point => wgpu::FilterMode::Nearest,
-        F::Anisotropic | F::PyramidQuad | F::GaussianQuad => {
-            unreachable!("validated: only POINT/LINEAR/NONE are accepted")
+        F::PyramidQuad | F::GaussianQuad => {
+            unreachable!("validated: only POINT/LINEAR/NONE/ANISOTROPIC are accepted")
         }
     };
     let border = matches!(A::from_raw(stage.address_u), Ok(A::Border))
@@ -814,8 +816,19 @@ impl Device {
                 "bound texture dimensions must be nonzero",
             ));
         }
-        let color = ColorFormat::from_d3dformat(format)?;
-        let expected = (width as usize) * (height as usize) * (color.bytes_per_pixel() as usize);
+        // Block-compressed levels are sized by their block layout; the rest by
+        // their per-texel layout. Both decode to the same upload shape below.
+        let block = crate::d3d8::format::block_bytes(format);
+        let color = if block == 0 {
+            Some(ColorFormat::from_d3dformat(format)?)
+        } else {
+            None
+        };
+        let expected = if let Some(color) = color {
+            (width as usize) * (height as usize) * (color.bytes_per_pixel() as usize)
+        } else {
+            crate::d3d8::format::block_level_layout(width, height, format).1 as usize
+        };
         if data.len() < expected {
             return Err(RenderError::new(
                 "SetTexture",
@@ -873,7 +886,16 @@ impl Device {
         // happens only on a real content change now.
         // The upload below may rewrite a texture earlier recorded draws sample.
         self.flush_draws();
-        color.to_rgba8_into(&data[..expected], &mut self.scratch_rgba);
+        match color {
+            Some(color) => color.to_rgba8_into(&data[..expected], &mut self.scratch_rgba),
+            None => crate::d3d8::format::decode_block_into(
+                format,
+                &data[..expected],
+                width,
+                height,
+                &mut self.scratch_rgba,
+            )?,
+        }
         stats::record_upload();
         let same_shape = self
             .texture_cache
