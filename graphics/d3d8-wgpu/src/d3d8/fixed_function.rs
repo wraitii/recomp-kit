@@ -1093,10 +1093,12 @@ fn color_op(
         case 8u: { r = a.rgb + b.rgb - 0.5; }         // ADDSIGNED
         case 9u: { r = (a.rgb + b.rgb - 0.5) * 2.0; } // ADDSIGNED2X
         case 10u: { r = a.rgb - b.rgb; }              // SUBTRACT
-        case 12u: { r = mix(a.rgb, b.rgb, vec3<f32>(diffuse.a)); }
-        case 13u: { r = mix(a.rgb, b.rgb, vec3<f32>(texel.a)); }
-        case 14u: { r = mix(a.rgb, b.rgb, vec3<f32>(tfactor.a)); }
-        case 16u: { r = mix(a.rgb, b.rgb, vec3<f32>(current.a)); }
+        // BLEND*ALPHA: Arg1 * alpha + Arg2 * (1 - alpha), i.e. mix(Arg2, Arg1, alpha)
+        // (Wine glsl_shader.c shader_glsl_ffp_fragment_op).
+        case 12u: { r = mix(b.rgb, a.rgb, vec3<f32>(diffuse.a)); }
+        case 13u: { r = mix(b.rgb, a.rgb, vec3<f32>(texel.a)); }
+        case 14u: { r = mix(b.rgb, a.rgb, vec3<f32>(tfactor.a)); }
+        case 16u: { r = mix(b.rgb, a.rgb, vec3<f32>(current.a)); }
         default: { r = current.rgb; }
     }
     return r;
@@ -1123,10 +1125,10 @@ fn alpha_op(
         case 8u: { r = a + b - 0.5; }
         case 9u: { r = (a + b - 0.5) * 2.0; }
         case 10u: { r = a - b; }
-        case 12u: { r = mix(a, b, diffuse.a); }
-        case 13u: { r = mix(a, b, texel.a); }
-        case 14u: { r = mix(a, b, tfactor.a); }
-        case 16u: { r = mix(a, b, current.a); }
+        case 12u: { r = mix(b, a, diffuse.a); }
+        case 13u: { r = mix(b, a, texel.a); }
+        case 14u: { r = mix(b, a, tfactor.a); }
+        case 16u: { r = mix(b, a, current.a); }
         default: { r = current.a; }
     }
     return r;

@@ -784,7 +784,7 @@ fn run_with_gpu(
         [u8; 4],
         [u8; 4],
         i32,
-    ); 6] = [
+    ); 8] = [
         // stage-1 SELECTARG1: final colour is texture 1, stage 0 discarded.
         (
             "select",
@@ -891,6 +891,29 @@ fn run_with_gpu(
             d[i * 4 + 2] = t[0];
             d[i * 4 + 3] = t[3];
         }
+        // BLENDTEXTUREALPHA is Arg1 * alpha + Arg2 * (1 - alpha) (Wine
+        // `mix(arg2, arg1, alpha)`): alpha 255 keeps Arg1 (CURRENT, tex0) and alpha 0
+        // keeps Arg2 (diffuse). A symmetric 0.5 alpha cannot tell the operand order apart.
+        (
+            "blendtexalpha a=255",
+            select_tex0,
+            [13, 1, 0, 2, 2, 1],
+            0xff0a_141e,
+            tex0,
+            [40, 80, 160, 255],
+            [200, 100, 50, 255],
+            1,
+        ),
+        (
+            "blendtexalpha a=0",
+            select_tex0,
+            [13, 1, 0, 2, 2, 1],
+            0xff0a_141e,
+            tex0,
+            [40, 80, 160, 0],
+            [10, 20, 30, 0],
+            1,
+        ),
         let d0 = [tex0[2], tex0[1], tex0[0], tex0[3]];
         device.set_texture(0, 1, 21, &level0(0, true, 1, 1, &d0))?;
         device.set_texture(1, 3, 21, &level0(0, true, 2, 1, &d))?;

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- D3D8/wgpu `D3DTOP_BLENDDIFFUSEALPHA`, `BLENDTEXTUREALPHA`, `BLENDFACTORALPHA`
+  and `BLENDCURRENTALPHA` blended with their operands swapped. D3D8 defines
+  them as `Arg1 * alpha + Arg2 * (1 - alpha)` (Wine `mix(arg2, arg1, alpha)`);
+  the shader computed `mix(arg1, arg2, alpha)`. The two-stage probe's old
+  alpha-0.5 case could not see the swap, so it gained alpha 255 and alpha 0
+  rows. Railroad Tycoon 3's night building pass (`BLENDCURRENTALPHA` against
+  the texture factor) drew the building body as the flat factor colour.
+
 - D3D8/wgpu `DrawPrimitive` now rasterizes `D3DPT_POINTLIST` (1) through
   wgpu's `PrimitiveTopology::PointList`. wgpu always rasterizes one pixel and
   exposes no point size or point sprite, which is exactly D3D8's default point
