@@ -140,8 +140,12 @@ impl<'a> VertexBuffer<'a> {
     }
 }
 
-/// Arguments retain D3D8's distinction between the raw index interval and the
-/// base vertex applied when accessing the stream. Expansion preserves ordering.
+/// Arguments retain D3D8's distinction between the raw indices and the base
+/// vertex applied when accessing the stream. `min_index`/`num_vertices` are the
+/// API's hints: Wine only passes `num_vertices` to the sysmem vertex-buffer
+/// upload and never uses either to bound the draw's index reads
+/// (`d3d8_device_DrawIndexedPrimitive`, dlls/d3d8/device.c at Wine commit
+/// 455e3509b98a6919fd4ad1def4803e08c41c03b2). Expansion preserves ordering.
 #[derive(Clone, Copy, Debug)]
 pub struct IndexedDraw {
     pub topology: u32,
@@ -206,8 +210,18 @@ pub fn expand_indexed_into(
         102 => 4,
         _ => return Err(invalid("invalid index format")),
     };
-    if draw.stride == 0 || draw.num_vertices == 0 || draw.primitive_count == 0 {
-        return Err(invalid("empty draw or zero stride"));
+    // Wine's d3d8_device_DrawIndexedPrimitive does not reject a zero primitive
+    // count and passes NumVertices only to the sysmem vertex-buffer upload; the
+    // draw itself uses the indices and BaseVertexIndex
+    // (dlls/d3d8/device.c at Wine commit 455e3509b98a6919fd4ad1def4803e08c41c03b2).
+    // A zero count expands to no indices and is a no-op; NumVertices=0 is a
+    // valid hint. Only a zero stride is a draw error.
+    if draw.stride == 0 {
+        return Err(invalid("zero stride"));
+    }
+    if draw.primitive_count == 0 {
+        output.clear();
+        return Ok(());
     }
     let end = draw
         .start_index
@@ -216,18 +230,10 @@ pub fn expand_indexed_into(
     if u64::from(end) * index_size as u64 > indices.len() as u64 {
         return Err(invalid("index range exceeds buffer"));
     }
-    let raw_end = draw
-        .min_index
-        .checked_add(draw.num_vertices)
-        .ok_or_else(|| invalid("vertex interval overflow"))?;
-    let actual_end = draw
-        .base_vertex
-        .checked_add(raw_end)
-        .ok_or_else(|| invalid("base vertex overflow"))?;
-    if u64::from(actual_end) * u64::from(draw.stride) > vertices.len() as u64 {
-        return Err(invalid("vertex range exceeds buffer"));
-    }
-    // Validate all indices before allocating or reading a vertex.
+    // Validate all indices before allocating or reading a vertex. Every index
+    // is bounds-checked as `(index + base_vertex) * stride` against the real
+    // vertex buffer; MinIndex/NumVertices are not a range (Wine only uses
+    // NumVertices for the upload, never to bound the draw's index reads).
     let selected = &indices[draw.start_index as usize * index_size..end as usize * index_size];
     let read = |bytes: &[u8]| {
         if index_size == 2 {
@@ -237,9 +243,10 @@ pub fn expand_indexed_into(
         }
     };
     for bytes in selected.chunks_exact(index_size) {
-        let raw = read(bytes);
-        if raw < draw.min_index || raw >= raw_end {
-            return Err(invalid("index outside declared interval"));
+        let vertex = u64::from(read(bytes)) + u64::from(draw.base_vertex);
+        let byte_offset = vertex * u64::from(draw.stride);
+        if byte_offset + u64::from(draw.stride) > vertices.len() as u64 {
+            return Err(invalid("index outside vertex buffer"));
         }
     }
     let list_indices = triangle_count
@@ -441,15 +448,7 @@ mod tests {
                 ..draw()
             },
             IndexedDraw {
-                min_index: u32::MAX,
-                ..draw()
-            },
-            IndexedDraw {
                 base_vertex: u32::MAX,
-                ..draw()
-            },
-            IndexedDraw {
-                num_vertices: 9,
                 ..draw()
             },
             IndexedDraw {
@@ -459,7 +458,81 @@ mod tests {
         ] {
             assert!(expand_indexed(&[0; 6], &indices, d).is_err());
         }
-        assert!(expand_indexed(&[0; 6], &[0, 0, 0, 0, 0, 0, 0, 0], draw()).is_err());
+        // An index that reads past the real vertex buffer is a named error even
+        // though it lies inside the declared MinIndex/NumVertices interval.
+        let err = expand_indexed(
+            &[0; 4],
+            &[0u16, 1, 2]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+            IndexedDraw {
+                base_vertex: 2,
+                min_index: 0,
+                num_vertices: 0,
+                start_index: 0,
+                ..draw()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.cause.contains("index outside vertex buffer"),
+            "{}",
+            err.cause
+        );
+        // A short index buffer still fails the index-range check (start_index 1
+        // with one listed triangle needs 8 bytes).
+        assert!(
+            expand_indexed(
+                &[0; 6],
+                &[0, 0, 0, 0, 0, 0],
+                IndexedDraw {
+                    min_index: 0,
+                    ..draw()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn num_vertices_is_only_a_hint_and_zero_draws_nothing() {
+        // Wine passes NumVertices to the sysmem vertex-buffer upload only; the
+        // draw uses the indices and BaseVertexIndex. NumVertices=0 must still
+        // expand, with each index bounds-checked against the real buffer.
+        let indices = [3u16, 1, 2]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let vertices = [10u8, 11, 12, 13, 14, 15];
+        let expanded = expand_indexed(
+            &vertices,
+            &indices,
+            IndexedDraw {
+                base_vertex: 1,
+                min_index: 0,
+                num_vertices: 0,
+                start_index: 0,
+                primitive_count: 1,
+                ..draw()
+            },
+        )
+        .unwrap();
+        assert_eq!(expanded, [14, 12, 13]);
+        // A zero primitive count is a D3D_OK no-op: the caller's scratch is
+        // emptied rather than filled from stale data.
+        let mut output = vec![0xAA; 8];
+        expand_indexed_into(
+            &mut output,
+            &vertices,
+            &indices,
+            IndexedDraw {
+                primitive_count: 0,
+                ..draw()
+            },
+        )
+        .unwrap();
+        assert!(output.is_empty());
     }
     #[test]
     fn mip_layout_and_cpu_formats() {

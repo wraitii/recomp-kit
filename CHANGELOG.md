@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- D3D8/wgpu `DrawIndexedPrimitive` now treats `NumVertices`/`MinIndex` as the
+  hints Wine's d3d8 does instead of rejecting the draw: the parameters never
+  bound which vertices the draw reads, so a caller passing `NumVertices=0`
+  (Railroad Tycoon 3's `renderOtherUnknownEffects` at `0x54e31e`) now draws.
+  Every index is still bounds-checked as `(index + BaseVertexIndex) * stride`
+  against the real vertex buffer, and a read past it stays a named error. No
+  index buffer bound now returns `D3D_OK` and a zero primitive count is a
+  `D3D_OK` no-op, matching Wine's `d3d8_device_DrawIndexedPrimitive`; a zero
+  stride or missing vertex buffer keeps its named `D3DERR_INVALIDCALL`. The
+  draw trace also gained `RECOMP_D3D8_TRACE_DRAWS_START=<n>` to skip the first
+  `n` draws.
+
 - D3D8/wgpu `D3DTOP_BLENDDIFFUSEALPHA`, `BLENDTEXTUREALPHA`, `BLENDFACTORALPHA`
   and `BLENDCURRENTALPHA` blended with their operands swapped. D3D8 defines
   them as `Arg1 * alpha + Arg2 * (1 - alpha)` (Wine `mix(arg2, arg1, alpha)`);

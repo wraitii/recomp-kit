@@ -2765,13 +2765,31 @@ void Dev_DrawIndexedPrimitive(X86 *c) {
     const uint8_t *vbytes = d8_buffer_bytes(vb);
     const uint8_t *ibytes = d8_buffer_bytes(ib);
     uint32_t stride = dev->d3d8_stream_stride;
-    if (!vbytes || !ibytes || !stride || !num_vertices || !prim_count) {
+    // Wine's d3d8_device_DrawIndexedPrimitive returns D3D_OK immediately when
+    // no index buffer is bound and submits no draw (dlls/d3d8/device.c at Wine
+    // commit 455e3509b98a6919fd4ad1def4803e08c41c03b2). NumVertices and
+    // MinIndex are draw hints there: only NumVertices is passed to the sysmem
+    // vertex-buffer upload, and neither bounds which vertices the draw reads.
+    if (!ib || !ibytes) {
+        com_ret(c, D8_OK);
+        return;
+    }
+    // A zero primitive count is a D3D_OK no-op: Wine computes an index count of
+    // zero and emits a zero-length draw. The hint `num_vertices` may be zero.
+    if (!prim_count) {
+        com_ret(c, D8_OK);
+        return;
+    }
+    if (!vbytes || !stride) {
         // Name which precondition failed; a bare INVALIDCALL hides whether the
-        // guest drew with no stream/index buffer bound or with a zero count.
-        LOGW("d3d8: DrawIndexedPrimitive rejected: vb=%s ib=%s stride=%u num_vertices=%u "
-             "prim_count=%u topology=%u fvf=%08x",
-             vbytes ? "bound" : "none", ibytes ? "bound" : "none", stride, num_vertices,
-             prim_count, topology, dev->d3d8_fvf);
+        // guest drew with no stream bound or with a zero stride. Wine only
+        // requires the index buffer and defers a missing stream to wined3d;
+        // this renderer needs real vertex bytes, so it stays a named rejection.
+        // DIVERGENCE(original): the original driver's result for an unbound
+        // stream is not evidenced, so it is not guessed at here.
+        LOGW("d3d8: DrawIndexedPrimitive rejected: vb=%s stride=%u prim_count=%u topology=%u "
+             "fvf=%08x",
+             vbytes ? "bound" : "none", stride, prim_count, topology, dev->d3d8_fvf);
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
