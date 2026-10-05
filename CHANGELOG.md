@@ -198,6 +198,10 @@
   inside it. Rejecting those locks stalled the shared UI vertex buffer and left
   it reading zeroed vertices, which flickered the front end.
 ||||||| parent of 80c8753 (Add shared scripted input to headless and desktop hosts)
+||||||| parent of 699fd3a (Emit Samply frame markers in the headless presenter)
+- Emit Samply frame spans from the headless presenter, including runs with
+  `RECOMP_FRAME_EVERY=0`. Enabled under Samply or with `RECOMP_PROFILE_MARKERS=1`.
+
 - Add `RECOMP_INPUT_SCRIPT` for timed keyboard and mouse input in headless and
   desktop windowed hosts. Reuse the smoke parser and normal input paths without
   requiring game-specific smoke globals; reject unsupported script operations

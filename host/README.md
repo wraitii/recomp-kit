@@ -424,6 +424,12 @@ intervals without one, window refreshes resume over the idle primary's pixels.
 samples every Nth present (0 disables writes). The smoke host's existing
 scripted dumps remain available independently.
 
+Under Samply, the headless presenter also emits `frame` marker spans between
+present boundaries. Set `RECOMP_PROFILE_MARKERS=1` to force marker-file output
+outside Samply. Markers remain enabled when frame writes are disabled; these
+spans include headless capture and diagnostic work and are not isolated guest
+CPU frame timings.
+
 Activation is synthesised there rather than delivered: a window that has just
 been shown and holds the focus gets `WM_ACTIVATEAPP`, `WM_ACTIVATE` and
 `WM_SETFOCUS`. The game's WNDPROC at `004b0870` reads `WM_ACTIVATEAPP`'s wParam

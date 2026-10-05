@@ -37,6 +37,7 @@
 #include "audio.h"
 #include "audio_capture.h"
 #include "../platform/os.h"
+#include "../platform/profile_markers.h"
 #include "boot.h"
 #include "input.h"
 #include "input_script.h"
@@ -177,6 +178,9 @@ extern "C" void host_present(const void *pixels, int w, int h, int bpp, const ui
     // The frame boundary, and so the one thing that moves a pinned clock. See
     // boot.cpp; on an unpinned run this does nothing.
     boot_clock_advance();
+    // Headless present boundaries include capture/diagnostic work between presents.
+    // Emit even when frame writes are disabled so Samply can select frame spans.
+    profile_marker_frame();
     uint32_t index;
     {
         ReportLock held;
