@@ -41,6 +41,20 @@ CASES = {
                  "FSTP float ptr [EBX]", "ADC EAX,ECX", "RET"],
     "alternate": ["ADD EAX,ECX", "XOR ECX,EAX", "MOV EDX,EAX", "ADD EAX,EDX",
                   "TEST EAX,ECX", "MOV dword ptr [EBX],EAX", "RET"],
+    "integer_x87": ["MOV EAX,ECX", "ADD EAX,EDX", "XOR ECX,EAX",
+                    "FILD qword ptr [ESI]", "FIST word ptr [EBX]",
+                    "FIST dword ptr [EBX + 4]", "FISTP qword ptr [EBX + 8]",
+                    "ADC EAX,ECX", "CALL 0x00200000", "ADD EAX,ECX", "RET"],
+    "integer_x87_round": ["MOV EAX,ECX", "ADD EAX,EDX", "XOR ECX,EAX",
+                          "FLD float ptr [ESI]", "FIST word ptr [EBX]",
+                          "FIST dword ptr [EBX + 4]", "FISTP qword ptr [EBX + 8]",
+                          "ADC EAX,ECX", "CALL 0x00200000", "ADD EAX,ECX", "RET"],
+    "bitwise_values": ["MOV EAX,ECX", "ADD EAX,EDX", "AND EAX,ECX", "TEST EAX,EDX",
+                       "JZ 0x00100007", "XOR ECX,EAX", "JMP 0x00100008", "SUB ECX,EAX",
+                       "MOV dword ptr [EBX],ECX", "RET"],
+    "signed_predicate": ["MOV EAX,ECX", "ADD EAX,EDX", "CMP EAX,ECX", "JG 0x00100006",
+                         "AND EAX,ECX", "JMP 0x00100007", "OR EAX,ECX", "ADC ECX,EAX",
+                         "CALL 0x00200000", "MOV dword ptr [EBX],ECX", "RET"],
 }
 
 

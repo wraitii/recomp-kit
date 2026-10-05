@@ -83,6 +83,43 @@ def test_opaque_helpers_and_escapes_are_not_guessed():
     assert transparent(["fdivz(c, ST(c, 0), rdf32(c->r[0]));"])
 
 
+def test_integer_x87_helpers_keep_cpu_locals_without_publication():
+    assert transparent(["fpush_int(c, (int64_t)rd64(c->r[0]));"])
+    for size in (16, 32, 64):
+        assert transparent([f"wr{size}(c->r[3], fist_i{size}(c));"])
+    # x87 integer metadata and conversion status are eager. Only unrelated
+    # GPR/flag publication disappears; helpers and guest accesses stay ordered.
+    lines = ARITH + ["FILD qword ptr [ESI]", "FIST word ptr [EBX]",
+                     "FIST dword ptr [EBX + 4]", "FISTP qword ptr [EBX + 8]",
+                     "ADD EAX,ECX", "RET"]
+    body, _ = translate(lines)
+    start = body.rfind("\n", 0, body.index("00100004 FILD"))
+    end = body.index("00100008 ADD")
+    assert "fpush_int(c," in body[start:end]
+    assert "c->r[0] = (*cpu_r0_ptr_);" not in body[:end]
+    assert "(*cpu_r0_ptr_) = c->r[0];" not in body[start:end]
+    assert not transparent(["fcomi(c, ST(c, 0), ST(c, 1));"])
+    assert not transparent(["fucomi(c, ST(c, 0), ST(c, 1));"])
+
+
+def test_value_ampersands_do_not_force_cpu_publication():
+    assert transparent(["uint32_t r_ = c->r[0] & c->r[1];"])
+    assert transparent(["if (!c->eflags_zf && c->eflags_sf == c->eflags_of) goto L_1;"])
+    assert transparent(["uint32_t r_ = (uint16_t)c->r[0] & c->r[1];"])
+    assert transparent(["uint32_t r_ = c->r[0] & (c->r[1]);"])
+    for body in ("opaque(&c->r[0]);", "return &c->r[0];",
+                 "void *p = (void *)&c->r[0];", "void *p = yes ? &c->r[0] : 0;",
+                 "opaque(yes && &c->r[0]);", "opaque(yes &&&c->r[0]);",
+                 "opaque(&(c->r[0]));", "opaque(& ((c->r[0])));",
+                 "c->r[0] & c->r[1]; opaque(&c->r[0]);"):
+        assert not transparent([body])
+    body, _ = translate(ARITH + ["JG 0x00100000", "RET"])
+    end = body.index("00100005 RET")
+    # TEST and JG read CPU values; neither takes a CPU field's address.
+    assert body[:end].count("c->r[0] = (*cpu_r0_ptr_);") == 1  # RET publication only
+    assert "(*cpu_r0_ptr_) & (*cpu_r1_ptr_)" in body
+
+
 def test_unconsumed_flags_do_not_extend_native_live_ranges():
     body, _ = translate(ARITH + ["RET"])
     assert "cpu_eflags_of_ptr_" not in body
@@ -94,6 +131,16 @@ def test_float_dominated_leaf_keeps_comparison_shape():
                           *["FMUL float ptr [EDI]"] * 20, "FSTP float ptr [EBX]", "RET"], x87=True)
     assert tr.stats["_cpu_local_functions"] == 0
     assert "cpu_r0_ptr_" not in body
+
+
+def test_unrelated_eager_writes_do_not_admit_sparse_float_cache():
+    lines = ["MOV EAX,ESI", *["MOV EDX,EAX"] * 24, "FLD float ptr [EAX]",
+             *["FMUL float ptr [EAX]"] * 64, "FSTP float ptr [EBX]", "RET"]
+    body, tr = translate(lines, x87=True)
+    # The one-field budget would pick EAX, written once. Twenty-four eager EDX
+    # writes cannot justify carrying that local through the floating-point work.
+    assert tr.stats["_cpu_local_functions"] == 0
+    assert body == translate(lines, enabled=False, x87=True)[0]
 
 
 def test_gap_and_final_fallthrough_publish():

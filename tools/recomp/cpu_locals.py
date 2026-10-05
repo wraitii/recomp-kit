@@ -23,12 +23,18 @@ from collections import Counter
 
 FIELD = re.compile(r"c->(?:r\[([012367])\]|eflags_(cf|zf|sf|of|pf|af)\b)")
 COMMENTS = re.compile(r"/\*.*?\*/", re.S)
+ADDRESS_OF = re.compile(r"&\s*(?:\(\s*)*c->")
+# A bare CPU field is a value operand before '&', never a cast or keyword.
+# Recognize only this bounded emitter shape; other apparent escapes stay eager.
+BINARY_AND = re.compile(
+    r"(c->(?:r\[[0-7]\]|eflags_(?:cf|zf|sf|of|pf|af)\b))\s*&\s*(?=(?:\(\s*)*c->)")
 INITIALIZATION_BEGIN = "/* local CPU values; eager lvalues with guest null checks */"
 INITIALIZATION_END = "/* end local CPU initialization */"
 # Only these helpers' CPU arguments are known to access exclusively x87 state.
 # All GPR/flag helpers remain barriers, even if their mnemonic is supported.
 X87_HELPER = re.compile(
-    r"\b(?:ST|fpush|fpush_st|fset|fcopy|fdrop|ftag_of|ftag_put|fstsw|"
+    r"\b(?:ST|fpush|fpush_int|fpush_st|fset|fcopy|fdrop|ftag_of|ftag_put|fstsw|"
+    r"fist_i(?:16|32|64)|"
     r"fx87|fx87_exact|fdivz|fcom|fucom|fto_float)\(c(?=\s*[,\)])")
 FLAG_HELPER = re.compile(
     r"\b((?:shl|shr|sar|rol|ror|rcl|rcr)(?:8|16|32)_f|"
@@ -63,8 +69,9 @@ def transparent(body):
     requires eager state rather than guessing which cached fields it uses.
     """
     code = COMMENTS.sub("", "\n".join(body))
+    escape_code = BINARY_AND.sub(r"\1 bitwise_and ", code).replace("&&", " logical_and ")
     if ("recomp_" in code or "CALL_FN" in code or
-            re.search(r"&\s*c->", code)):
+            ADDRESS_OF.search(escape_code)):
         return False
     code = FIELD.sub("field_", code)
     if "c->r[" in code:
@@ -120,10 +127,13 @@ def lower_function(bodies):
     # Spend fewer GPR/flag registers alongside them, and leave float-dominated
     # leaf arithmetic eager when scalar CPU traffic is too small to justify it.
     budget = (1 if floating > 128 else 2) if floating else 6
-    gp_writes = sum(writes[name] for name in written if name.startswith("r"))
+    names = sorted(sorted(candidates, key=lambda name: (-reads[name], -uses[name], name))[:budget])
+    # Eager writes to other GPRs do not pay for the cached field's live range.
+    # Count only selected GPR writes: newly transparent float regions must not
+    # activate a sparse cache merely because they contain many unrelated moves.
+    gp_writes = sum(writes[name] for name in names if name.startswith("r"))
     if floating and (floating > 8 * gp_writes or (gp_writes <= 8 and floating > gp_writes)):
         return bodies, [], [], 0
-    names = sorted(sorted(candidates, key=lambda name: (-reads[name], -uses[name], name))[:budget])
     if not names or not (written & set(names)):
         return bodies, [], [], 0
     selected = set(names)

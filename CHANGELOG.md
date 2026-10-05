@@ -226,6 +226,9 @@
   Bound cached-field lifetimes alongside x87 lowering, leave float-dominated
   leaves eager, and synchronize only affected flags around audited shift,
   rotate and two-operand multiply helpers. Unknown helpers retain full state.
+  Keep CPU locals across bitwise/logical value expressions and audited integer
+  x87 helpers; actual CPU-field address escapes still publish. Float-heavy
+  cache admission counts writes to selected GPRs rather than unrelated fields.
   `tools/build.py --cpu-locals-checks` compares complete CPU and scratch memory
   against eager C, including call snapshots, mutating callees, alternate entries
   and an injected null-fault fallback check; it runs no benchmarks.
