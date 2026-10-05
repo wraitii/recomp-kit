@@ -1838,6 +1838,107 @@ void u_GetKeyNameTextA(X86 *c) {
     set_eax(c, text.empty() ? 0 : put_text(arg(c, 1), arg(c, 2), text, false));
 }
 
+// The single character the en-US layout produces for a key, or -1 when the key
+// has no character. `ks` is a caller-provided 256-byte key-state array. The
+// virtual-key table supplies the unshifted base; Shift selects the crossed
+// character for the digit row and OEM punctuation, Caps Lock flips letters,
+// Control turns a letter into 0x01..0x1A, and the numpad digits and decimal
+// need Num Lock (the numpad operators do not). The layout-independent keys
+// (Enter, Tab, Backspace, Esc, Space) pass through the shared table unchanged.
+static int to_ascii_char(uint32_t vk, const uint8_t *ks) {
+    const bool shift = (ks[0x10] & 0x80) || (ks[0xa0] & 0x80) || (ks[0xa1] & 0x80);
+    const bool ctrl = (ks[0x11] & 0x80) != 0;
+    const bool caps = (ks[0x14] & 1) != 0;
+    const bool numlock = (ks[0x90] & 1) != 0;
+    if (vk >= 'A' && vk <= 'Z') {
+        if (ctrl)
+            return (int)(vk - 'A' + 1);
+        return shift != caps ? (int)vk : (int)(vk - 'A' + 'a');
+    }
+    // With Num Lock off the numpad virtual keys are navigation keys; the
+    // operator keys are unaffected by it.
+    if (vk >= 0x60 && vk <= 0x69)
+        return numlock ? (int)('0' + (vk - 0x60)) : -1;
+    switch (vk) {
+    case 0x6a:
+        return '*';
+    case 0x6b:
+        return '+';
+    case 0x6d:
+        return '-';
+    case 0x6e:
+        return numlock ? '.' : -1;
+    case 0x6f:
+        return '/';
+    }
+    const uint32_t base = map_virtual_key(vk, 2);
+    if (base >= '0' && base <= '9') {
+        static const char shifted[] = ")!@#$%^&*(";
+        return (int)(shift ? shifted[base - '0'] : base);
+    }
+    if (!base)
+        return -1;
+    if (shift) {
+        switch (base) {
+        case ';':
+            return ':';
+        case '=':
+            return '+';
+        case ',':
+            return '<';
+        case '-':
+            return '_';
+        case '.':
+            return '>';
+        case '/':
+            return '?';
+        case '`':
+            return '~';
+        case '[':
+            return '{';
+        case '\\':
+            return '|';
+        case ']':
+            return '}';
+        case '\'':
+            return '"';
+        }
+    }
+    return (int)base;
+}
+
+// ToAscii(uVirtKey, uScanCode, lpKeyState, lpChar, uFlags): the one en-US
+// character for a key, using the key-state array the caller passed rather than
+// the host's own keyboard state. A successful translation returns 1 and writes
+// a single WORD; a key with no character returns 0 and leaves lpChar alone.
+// uScanCode is ignored because a US layout maps one virtual key to one
+// character. SHIM(temporary): dead keys (and their return of 2), non-US
+// layouts, the AltGr/right-Alt layer and the uFlags "menu is active" bit are
+// not modelled.
+void u_ToAscii(X86 *c) {
+    const uint32_t state = arg(c, 2);
+    if (!state || !gm_valid(state, 256)) {
+        set_eax(c, 0);
+        return;
+    }
+    uint8_t ks[256];
+    memcpy(ks, g_mem + state, sizeof ks);
+    const int ch = to_ascii_char(arg(c, 0) & 0xff, ks);
+    const uint32_t out = arg(c, 3);
+    if (ch < 0 || !out || !gm_valid(out, 2)) {
+        set_eax(c, 0);
+        return;
+    }
+    wr16(out, (uint16_t)ch);
+    set_eax(c, 1);
+}
+
+// ToAsciiEx is ToAscii with a trailing HKL. Only the en-US layout is modelled,
+// so the character does not depend on it and the body is shared.
+void u_ToAsciiEx(X86 *c) {
+    u_ToAscii(c);
+}
+
 const ImportShim g_user32_shims[] = {
     {"USER32.dll", "RegisterClassA", 1, u_RegisterClassA},
     {"USER32.dll", "UnregisterClassA", 2, u_UnregisterClassA},
@@ -1914,6 +2015,8 @@ const ImportShim g_user32_shims[] = {
     {"USER32.dll", "MapVirtualKeyA", 2, u_MapVirtualKeyA},
     {"USER32.dll", "GetKeyNameTextA", 3, u_GetKeyNameTextA},
     {"USER32.dll", "MapVirtualKeyExA", 3, u_MapVirtualKeyA},
+    {"USER32.dll", "ToAscii", 5, u_ToAscii},
+    {"USER32.dll", "ToAsciiEx", 6, u_ToAsciiEx},
     {"USER32.dll", "ToUnicode", 6, nullptr},
     {"USER32.dll", "SendInput", 3, nullptr},
     {"USER32.dll", "PostThreadMessageA", 4, u_PostThreadMessageA},

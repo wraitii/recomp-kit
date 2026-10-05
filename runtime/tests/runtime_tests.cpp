@@ -6964,6 +6964,76 @@ static void test_user32_key_names() {
     check(name_a(0x021e0000u) == "A", "A: letter names itself");
 }
 
+// ToAscii translates a virtual key against the 256-byte key-state array the
+// guest passes in, not the host's own keyboard state.
+static void test_user32_to_ascii() {
+    section("ToAscii translation from caller key state");
+    X86 c;
+    loader_init_context(&c);
+    uint32_t s = 0x00330000, ks = s + 0x100, out = s + 0x300;
+    auto reset = [&]() {
+        memset(g_mem + ks, 0, 256);
+        wr32(out, 0xdeadbeef);
+    };
+    auto call = [&](uint32_t vk, uint32_t flags = 0) {
+        return call_import(&c, "USER32.dll", "ToAscii", {vk, 0, ks, out, flags});
+    };
+    reset();
+    check(call('A') == 1 && rd32(out) == 0xdead0061,
+          "an unshifted letter is lowercase and writes one WORD");
+    reset();
+    g_mem[ks + 0x10] = 0x80;
+    check(call('A') == 1 && rd32(out) == 0xdead0041, "Shift uppercases a letter");
+    reset();
+    g_mem[ks + 0xa1] = 0x80;
+    check(call('A') == 1 && rd32(out) == 0xdead0041, "the right Shift works too");
+    reset();
+    g_mem[ks + 0x14] = 1;
+    check(call('A') == 1 && rd32(out) == 0xdead0041, "Caps Lock uppercases a letter");
+    reset();
+    g_mem[ks + 0x10] = 0x80;
+    g_mem[ks + 0x14] = 1;
+    check(call('A') == 1 && rd32(out) == 0xdead0061,
+          "Caps Lock and Shift together cancel for a letter");
+    reset();
+    g_mem[ks + 0x11] = 0x80;
+    check(call('A') == 1 && rd32(out) == 0xdead0001,
+          "Control turns a letter into its control character");
+    reset();
+    check(call('1') == 1 && rd32(out) == 0xdead0031, "an unshifted digit is itself");
+    reset();
+    g_mem[ks + 0x10] = 0x80;
+    check(call('1') == 1 && rd32(out) == 0xdead0021, "Shift selects the digit-row symbol");
+    reset();
+    check(call(0xba) == 1 && rd32(out) == 0xdead003b, "an OEM key gives its unshifted symbol");
+    reset();
+    g_mem[ks + 0x10] = 0x80;
+    check(call(0xba) == 1 && rd32(out) == 0xdead003a, "Shift selects the OEM symbol");
+    reset();
+    g_mem[ks + 0x90] = 1;
+    check(call(0x60) == 1 && rd32(out) == 0xdead0030, "a numpad digit needs Num Lock");
+    reset();
+    check(call(0x60) == 0 && rd32(out) == 0xdeadbeef,
+          "a numpad digit with Num Lock off leaves the buffer alone");
+    reset();
+    check(call(0x0d) == 1 && rd32(out) == 0xdead000d, "Enter is a real character");
+    reset();
+    check(call(0x25) == 0 && rd32(out) == 0xdeadbeef,
+          "an arrow key returns 0 and leaves the buffer alone");
+    reset();
+    check(call('A', 1) == 1 && rd32(out) == 0xdead0061,
+          "the uFlags menu bit is accepted but ignored");
+    reset();
+    check(call_import(&c, "USER32.dll", "ToAsciiEx", {'B', 0, ks, out, 0, 0x04090409}) == 1 &&
+              rd32(out) == 0xdead0062,
+          "ToAsciiEx shares the translation with its HKL argument");
+    reset();
+    check(call_import(&c, "USER32.dll", "ToAscii", {'A', 0, ks, 0xffffffffu, 0}) == 0,
+          "an invalid output pointer is refused");
+    check(call_import(&c, "USER32.dll", "ToAscii", {'A', 0, 0xffffffffu, out, 0}) == 0,
+          "an invalid key-state pointer is refused");
+}
+
 static void test_user32_services() {
     section("menus, scrollbars, clipboard, resources and drawing");
     X86 c;
@@ -7808,6 +7878,7 @@ int main(int argc, char **argv) {
     test_display_settings();
     test_user32_vcl();
     test_user32_window_model();
+    test_user32_to_ascii();
     test_host_mouse_routing();
     test_host_mouse_double_click();
     test_user32_key_names();

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- USER32 `ToAscii`/`ToAsciiEx` translate a virtual key against the caller's
+  key-state array for the en-US layout; dead keys and non-US layouts remain
+  `SHIM(temporary)`.
+
 - D3D8 device-owned implicit surfaces and standalone depth-stencil surfaces.
   The implicit backbuffer/autodepth are now owned by the device and `Get*`
   returns an extra AddRef, so a guest that saves and releases those handles —
