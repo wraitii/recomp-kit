@@ -201,6 +201,19 @@
 ||||||| parent of 699fd3a (Emit Samply frame markers in the headless presenter)
 ||||||| parent of 0e1dd6f (Keep x87 control and status local and specialize binary32 arithmetic)
 ||||||| parent of ffed73d (Keep local x87 register transfers in straight-line C regions)
+||||||| parent of 3ad1d5c (Keep CPU values local across function control flow)
+- Add opt-in `[translate] cpu_locals = true`: keep reused GPRs and arithmetic
+  flags in C locals across function control flow and x87 regions, publishing
+  before calls/opaque helpers and reloading after mutation. ESP/EBP/EIP remain
+  eager; `RECOMP_NULL_CHECKS` builds use eager CPU lvalues. Interior fatal faults
+  may see preceding published scratch registers/flags (`cpu-locals`).
+  Bound cached-field lifetimes alongside x87 lowering, leave float-dominated
+  leaves eager, and synchronize only affected flags around audited shift,
+  rotate and two-operand multiply helpers. Unknown helpers retain full state.
+  `tools/build.py --cpu-locals-checks` compares complete CPU and scratch memory
+  against eager C, including call snapshots, mutating callees, alternate entries
+  and an injected null-fault fallback check; it runs no benchmarks.
+
 - Keep locally defined x87 register copies (`FLD ST(i)` and `FST[P] ST(i)`)
   in straight-line C regions, preserving copied tags and physical-slot
   wraparound. Incoming values and register-copy CFG boundaries remain eager;

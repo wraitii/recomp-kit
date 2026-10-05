@@ -186,6 +186,9 @@ def load(game_dir):
     locals_x87 = translate.setdefault("x87_locals", False)
     if not isinstance(locals_x87, bool):
         raise ValueError("%s: [translate] x87_locals must be a boolean" % source)
+    locals_cpu = translate.setdefault("cpu_locals", False)
+    if not isinstance(locals_cpu, bool):
+        raise ValueError("%s: [translate] cpu_locals must be a boolean" % source)
     alignment = translate.setdefault("function_alignment", 16)
     if type(alignment) is not int or alignment <= 0:
         raise ValueError("%s: [translate] function_alignment must be a positive integer" % source)

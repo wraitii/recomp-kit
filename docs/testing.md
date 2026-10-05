@@ -81,6 +81,15 @@ decodes the jump-table shapes on synthetic functions over a fake image;
 leaves behind. Add a case there first when the translator meets an
 instruction or table shape it does not handle.
 
+`tools/recomp/tests/test_cpu_c_locals.py` also runs in the portable suite. Native
+CPU/x87 local-value checks run through `tools/build.py --cpu-locals-checks`.
+They use the production driver and compare full CPU/scratch memory for eager,
+CPU-local, CPU+x87-local and x87-local variants in ordinary and null-check builds.
+Opaque callees record entry state and mutate cached fields; the null-check build
+also checks CPU state at an injected access failure. These are synthetic mapped
+tests against the current runtime, not original-x86, real hooks, real guest SEH
+or gameplay evidence. No benchmarks or profile captures run in this mode.
+
 The differential harness compares translated routines with original instructions
 under Unicorn. Unicorn is a development tool, not part of the playable app.
 

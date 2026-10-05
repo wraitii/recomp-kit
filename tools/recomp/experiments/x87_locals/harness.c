@@ -210,6 +210,7 @@ static void check_memory_failures(void) {
 }
 #endif
 
+#ifndef FIXTURE_CHECK_ONLY
 static int order_double(const void *a, const void *b) {
     double x = *(const double *)a, y = *(const double *)b;
     return (x > y) - (x < y);
@@ -256,6 +257,7 @@ static void benchmark(void) {
         }
     }
 }
+#endif
 
 int main(void) {
     g_mem = calloc(1, FIXTURE_MEMORY_SIZE);
@@ -267,7 +269,9 @@ int main(void) {
 #ifdef RK_MEMORY_TEST
     check_memory_failures();
 #endif
+#ifndef FIXTURE_CHECK_ONLY
     benchmark();
+#endif
     free(g_mem);
     return 0;
 }

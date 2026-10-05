@@ -171,6 +171,7 @@ VISUAL_ANIMATION_READS = frozenset()
 EXTRA_ENTRY_POINTS = frozenset()
 RESUMABLE_STACKS = False
 X87_LOCALS = False
+CPU_LOCALS = False
 FUNCTION_ALIGNMENT = 16
 
 #: game.toml [translate] rewrites: an instruction's memory operand moved to a
@@ -208,10 +209,11 @@ def configure_module(cfg, key):
     reads, no curated symbols (those describe the executable)."""
     global LISTINGS, FUNCS_TSV, BINARY, CURATED, ANIMATION_COUNTER, VISUAL_ANIMATION_READS
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT, SYMBOL_PREFIX, AUX_MODULE
-    global RESUMABLE_STACKS, X87_LOCALS
+    global RESUMABLE_STACKS, X87_LOCALS, CPU_LOCALS
     configure_intrinsics({"translate": {"intrinsics": {}}})
     RESUMABLE_STACKS = cfg["translate"].get("resumable_stacks", False)
     X87_LOCALS = cfg["translate"].get("x87_locals", False)
+    CPU_LOCALS = cfg["translate"].get("cpu_locals", False)
     mods = {m["key"]: m for m in cfg.get("aux_modules", [])}
     if key not in mods:
         raise SystemExit("game.toml has no [modules.aux.%s]" % key)
@@ -258,9 +260,10 @@ def configure(cfg):
     ANIMATION_COUNTER = cfg["translate"]["animation_counter"]
     VISUAL_ANIMATION_READS = frozenset(cfg["translate"].get("volatile_reads", ()))
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT
-    global RESUMABLE_STACKS, X87_LOCALS
+    global RESUMABLE_STACKS, X87_LOCALS, CPU_LOCALS
     RESUMABLE_STACKS = cfg["translate"].get("resumable_stacks", False)
     X87_LOCALS = cfg["translate"].get("x87_locals", False)
+    CPU_LOCALS = cfg["translate"].get("cpu_locals", False)
     EXTRA_ENTRY_POINTS = frozenset(int(a) for a in cfg["translate"].get("entry_points", ()))
     FUNCTION_ALIGNMENT = cfg["translate"].get("function_alignment", 16)
     global OPERAND_REDIRECTS, INSTRUCTION_PATCHES, DATA_SEEDS
@@ -3162,6 +3165,17 @@ class Translator(object):
             self.stats["_x87_local_regions"] += regions
             self.stats["_x87_local_instructions"] += lifted
             self.stats["_x87_local_functions"] += bool(regions)
+        cpu_publish = []
+        if getattr(self.opts, "cpu_locals", CPU_LOCALS):
+            from cpu_locals import lower_function
+            bodies, declarations, cpu_publish, fields = lower_function(bodies)
+            # Initialize before the alternate-entry switch or any head jump.
+            out[1:1] = ["    " + line for line in declarations]
+            prologue += len(declarations)
+            self.stats["_cpu_local_functions"] += bool(fields)
+            self.stats["_cpu_local_fields"] += fields
+            if fields:
+                labels.add(fn.addr)
         for i, ins in enumerate(fn.insns):
             if i in dead:
                 continue
@@ -3179,6 +3193,7 @@ class Translator(object):
                 self.stats["_listing_gap"] += 1
                 self.notes.append(
                     "%08x: listing gap, %s falls through to %08x" % (ins.addr, ins.mnem, t))
+                out.extend("    " + line for line in cpu_publish)
                 for line in self.goto_target(fn, t, ins):
                     out.append("    " + line)
         # A function whose last listed instruction is not a terminator falls
@@ -3189,6 +3204,7 @@ class Translator(object):
                 and not self.never_returns(last)):
             t = fn.fallthrough[last_i] or fn.end
             self.stats["_fallthrough_exit"] += 1
+            out.extend("    " + line for line in cpu_publish)
             out.append("    " + " ".join(self.goto_target(fn, t, last)))
         # Invariant: the first thing fn_ADDR does is reach ADDR.  Checked
         # here rather than trusted, because getting it wrong corrupts the
@@ -6103,6 +6119,7 @@ def main():
     # before it does anything else.  Recursive descent can pull in addresses
     # below the entry, and falling into whichever sorts first made
     # fn_00565e1e start on a POP that ate its caller's return address.
+    from cpu_locals import after_initialization
     wrong_entry = []
     for fn in ok:
         body = bodies[fn.addr]
@@ -6111,6 +6128,7 @@ def main():
         if body and body[0].startswith("static void body_"):
             continue                      # multi-entry form, dispatched below
         lines = [l for l in body[1:] if l.strip()]
+        lines = after_initialization(lines)
         # Host-only ownership bookkeeping does not execute a guest instruction
         # or modify its CPU. The first guest operation must still reach ADDR.
         if lines and lines[0].strip() == "uint64_t seh_mark_ = recomp_seh_frame_mark(c);":

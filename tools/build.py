@@ -474,6 +474,8 @@ def parse_args(argv, system=None):
                         help="Build-only full-census LLVM emission/lifting coverage survey")
     parser.add_argument("--x87-locals-experiment", action="store_true",
                         help="Build and run the isolated x87 local-value experiment")
+    parser.add_argument("--cpu-locals-checks", action="store_true",
+                        help="Build and run full-state CPU/x87 locals checks without benchmarks")
     parser.add_argument("--x87-llvm-experiment", action="store_true",
                         help="Build and run the isolated LLVM stack-to-SSA pass")
     parser.add_argument("--x87-llvm-function", type=Path,
@@ -525,7 +527,7 @@ def parse_args(argv, system=None):
         parser.error("--jobs must be at least 1")
     if (args.llvm_compare or args.llvm_sweep) and any((args.stub, args.regenerate, args.config != "Release",
                                   args.preset != default_preset(system), args.target != "app",
-                                  args.x87_llvm_experiment, args.x87_locals_experiment,
+                                  args.x87_llvm_experiment, args.x87_locals_experiment, args.cpu_locals_checks,
                                   args.x87_llvm_function, args.allow_table_gaps,
                                   args.allow_unmodelled, args.discovered, args.forget)):
         parser.error("--llvm-compare requires native Release defaults and no translation overrides")
@@ -559,6 +561,10 @@ def main():
     if args.x87_locals_experiment:
         from experiments.x87_locals.run import run_experiment
         run_experiment(args.build_root / "x87-locals-experiment", cmake_tool("cmake"), args.jobs)
+        return
+    if args.cpu_locals_checks:
+        from experiments.cpu_locals.run import run_checks
+        run_checks(args.build_root / "cpu-locals-checks", cmake_tool("cmake"), args.jobs)
         return
     cfg = game_config.load(args.game_dir)
     # Regenerating needs the game and its listings.
