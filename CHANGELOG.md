@@ -200,6 +200,12 @@
 ||||||| parent of 80c8753 (Add shared scripted input to headless and desktop hosts)
 ||||||| parent of 699fd3a (Emit Samply frame markers in the headless presenter)
 ||||||| parent of 0e1dd6f (Keep x87 control and status local and specialize binary32 arithmetic)
+||||||| parent of ffed73d (Keep local x87 register transfers in straight-line C regions)
+- Keep locally defined x87 register copies (`FLD ST(i)` and `FST[P] ST(i)`)
+  in straight-line C regions, preserving copied tags and physical-slot
+  wraparound. Incoming values and register-copy CFG boundaries remain eager;
+  existing branch-region lowering remains available around those boundaries.
+
 - Keep x87 control/status in a nonescaping helper context within C local-value
   regions, removing repeated CPU-field accesses across guest loads/stores and
   integer register updates. Use existing arithmetic/comparison/conversion

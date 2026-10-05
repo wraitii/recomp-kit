@@ -36,7 +36,11 @@ by FCOMP, materialization before FILD with exact-integer metadata, and explicit
 register arithmetic direction/reverse subtraction, integer-store aliases,
 branch joins, loops and conditional preservation of incoming slot metadata.
 Their live/relaxed columns are eager controls, not weaker-contract variants.
-All ten fixtures compare full state for the production pass (245,760 inputs).
+Additional register-copy fixtures cover locally defined `FLD ST(i)` and
+`FST[P] ST(i)`, empty source tags, physical-slot wraparound and exact-integer
+fallback boundaries. Register copies stay eager in CFG regions, where incoming
+metadata can depend on the path. All fifteen fixtures compare full state for
+the production pass (368,640 inputs).
 
 The C harness tests 24,576 inputs per fixture, with all eight entry TOPs and
 all sixteen PC/RC bit combinations (including reserved PC=01, for runtime

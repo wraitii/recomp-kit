@@ -116,6 +116,25 @@ def test_incoming_integer_state_is_not_assumed_float():
     assert "fpush_int(c," in body
 
 
+def test_local_register_copies_and_pop_keep_one_region():
+    body, tr = translate(["FLD float ptr [ESI]", "FLD ST0", "FADD float ptr [EDI]",
+                          "FST ST1", "FSTP ST0", "FSTP float ptr [EBX]", "RET"])
+    assert tr.stats["_x87_local_regions"] == 1
+    assert "fpush_st(c," not in body and "fcopy(c," not in body
+    assert "fdrop(c);" not in body
+    assert "fto_float(&x87_env_," in body
+
+
+def test_incoming_register_copy_and_cfg_metadata_remain_eager():
+    body, _ = translate(["FILD qword ptr [ESI]", "FLD ST0", *DOT, "RET"])
+    assert "fpush_st(c, 0);" in body
+    body, _ = translate(["FLD float ptr [ESI]", *DOT, "TEST EAX,EAX",
+                         "JZ 0x00100007", "FST ST1", "NOP", "RET"])
+    assert "local x87 CFG" in body
+    assert "fcopy(c, 1, 0);" in body
+    assert body.index("c->st[") < body.index("fcopy(c, 1, 0);")
+
+
 def test_listing_gap_cuts_even_without_a_label():
     from x87_locals import lower_regions
     insns = T.parse_listing_text("\n".join(f"{0x100000+i:08x}  {s}" for i, s in enumerate(DOT * 2)))

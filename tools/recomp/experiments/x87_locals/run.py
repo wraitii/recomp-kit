@@ -30,6 +30,14 @@ CASES = {
                      "FMUL float ptr [EDI + 0x4]", "FSTP float ptr [EBX + 0x4]"],
 }
 PRODUCTION_CASES = {
+    "register_copy": ["FLD float ptr [ESI]", "FLD ST0", "FADD float ptr [EDI]",
+                      "FST ST1", "FSTP ST0", "FSTP float ptr [EBX]"],
+    "copy_empty_tag": ["FLD float ptr [ESI]", "FSTP ST0", "FLD float ptr [EDI]",
+                       "FLD ST1", "FSTP float ptr [EBX]", "FSTP ST0"],
+    "copy_wrap": ["FLD float ptr [ESI]"] * 8 + ["FLD ST7", "FST ST7", "FSTP ST0"],
+    "copy_integer_boundary": ["FILD qword ptr [ESI]", "FLD ST0", "FSTP ST1",
+                              "FLD float ptr [ESI]", "FLD ST0", "FADD float ptr [EDI]",
+                              "FSTP float ptr [EBX]", "FSTP ST0"],
     "binary64_input": ["FLD double ptr [ESI]", "FMUL float ptr [EDI]",
                        "FADD float ptr [EDI + 4]", "FSTP float ptr [EBX]"],
     "compare_status": ["FLD float ptr [ESI]", "FMUL float ptr [EDI]", "FADD float ptr [EDI + 4]",

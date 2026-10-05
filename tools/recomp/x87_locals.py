@@ -38,6 +38,8 @@ REGISTER_OPS = frozenset((
 ST = re.compile(r"ST\(c, (\d+)\)")
 PUSH = re.compile(r"fpush\(c, (.*)\);")
 SET = re.compile(r"fset\(c, (\d+), (.*)\);")
+PUSH_ST = re.compile(r"fpush_st\(c, (\d+)\);")
+COPY = re.compile(r"fcopy\(c, (\d+), (\d+)\);")
 LOAD = re.compile(r"double v_ = (.*);")
 # These helpers access only CW/SW, never registers, tags or stack values. A
 # separate nonescaping object lets the C compiler keep both fields in native
@@ -69,9 +71,11 @@ def eligible(ins, parse_operand):
     if ins.mnem == "FNSTSW":
         return len(ops) == 1 and ops[0].kind == "reg" and ops[0].reg == 0 and ops[0].size == 16
     if ins.mnem == "FLD":
-        return len(ops) == 1 and ops[0].kind == "mem" and ops[0].size in (32, 64)
+        return len(ops) == 1 and (ops[0].kind == "st" or
+                                 (ops[0].kind == "mem" and ops[0].size in (32, 64)))
     if ins.mnem in ("FST", "FSTP"):
-        return len(ops) == 1 and ops[0].kind == "mem" and ops[0].size in (32, 64)
+        return len(ops) == 1 and (ops[0].kind == "st" or
+                                 (ops[0].kind == "mem" and ops[0].size in (32, 64)))
     return all(o.kind != "mem" or o.size in (32, 64) for o in ops)
 
 
@@ -145,6 +149,23 @@ class Region:
         self.writes += 1
         return f"double {name} = {expr};"
 
+    def copy(self, src, dst):
+        """Copy a locally defined float, including its possibly empty tag.
+
+        Straight-line locals have zero integer bits/exactness. Incoming slots
+        still cut the region; never substitute fset's tag classification for
+        the register move's tag copy. Capture before writing for FLD ST7.
+        """
+        if src not in self.values:
+            raise ValueError("incoming x87 copy")
+        expr, tag, single = self.values[src], self.tags[src], src in self.single
+        line = self.value(expr, dst)
+        self.tags[dst] = tag
+        self.single.discard(dst)
+        if single:
+            self.single.add(dst)
+        return line
+
     def append(self, i, body, floating=False):
         """Use the baseline's expressions; roll back on an incoming operand."""
         if any("recomp_" in line or "CALL_FN(" in line for line in body):
@@ -170,7 +191,18 @@ class Region:
                     source = load[1]
                     continue
                 push, assign = PUSH.fullmatch(stripped), SET.fullmatch(stripped)
-                if push:
+                push_st, copy = PUSH_ST.fullmatch(stripped), COPY.fullmatch(stripped)
+                if push_st or copy:
+                    if push_st:
+                        src = (self.top + int(push_st[1])) & 7
+                        dst = (self.top - 1) & 7
+                    else:
+                        src = (self.top + int(copy[2])) & 7
+                        dst = (self.top + int(copy[1])) & 7
+                    line = self.copy(src, dst) + suffix
+                    if push_st:
+                        self.top = dst
+                elif push:
                     expr = ST.sub(self.read, push[1])
                     single = self.binary32(expr)
                     self.top = (self.top - 1) & 7
@@ -296,6 +328,11 @@ class BranchRegion(Region):
         self.used.add(slot)
         return self.values[slot]
 
+    def copy(self, src, dst):
+        # CFG locals can contain incoming exact integers or path-dependent
+        # metadata. Keep copies eager until all four fields are tracked here.
+        raise ValueError("CFG x87 register copy")
+
     def value(self, expr, slot):
         self.used.add(slot)
         self.modified.add(slot)
@@ -362,7 +399,13 @@ def lower_branch_regions(fn, bodies, labels, dead, parse_operand, protected,
             return False
         if ins.mnem in conditional or ins.mnem == "JMP":
             return branch_target(ins) in fn.index
-        return eligible(ins, parse_operand)
+        if not eligible(ins, parse_operand):
+            return False
+        # Register transfers are currently straight-line-only. Keep their
+        # previous CFG boundaries rather than admitting one and rejecting the
+        # whole surrounding interval later, losing unrelated branch lowering.
+        return not (ins.mnem in ("FLD", "FST", "FSTP") and any(
+            parse_operand(o).kind == "st" for o in ins.ops))
 
     ranges = []
     start = None
