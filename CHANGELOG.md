@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- D3D8 fixed-function progress: `SetTransform` accepts `D3DTS_TEXTURE0`..
+  `TEXTURE7`, `D3DTSS_TEXTURETRANSFORMFLAGS = D3DTTFF_COUNT2` is applied by the
+  stage shader, and `IDirect3DDevice8::ProcessVertices` processes the engine's
+  `0x112` (`XYZ|NORMAL|TEX1`) source into `0x1c4`/`0x2c4` XYZRHW destinations.
+  The Rust layer owns the FVF layouts, world/view/projection + viewport
+  transform, fixed-function diffuse/specular lighting and packing; the bridge
+  only stages bytes. An unsupported/failed process is reported as an ordinary
+  D3D error rather than an unsupported-import abort, so the engine can take its
+  own `ResetAndUploadRenderStateBlock` fallback.
+
 - Accept an out-of-range `SizeToLock` in `IDirect3DVertexBuffer8::Lock` when the
   lock offset is inside the buffer. The original engine's
   `RenderingContext::LockVB` (`00545b50`) passes the caller's end vertex as the

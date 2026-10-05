@@ -2220,6 +2220,8 @@ mod tests {
             alpha_arg2: 0,
             texture_factor: 0,
             tex_coord_index: 0,
+            tex_transform_flags: 0,
+            tex_transform: crate::d3d8::math::Mat4::IDENTITY,
             min_filter: 2,
             mag_filter: 2,
             mip_filter: 1,

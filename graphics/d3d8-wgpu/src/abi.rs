@@ -17,7 +17,7 @@ use crate::d3d8::math::Mat4;
 use crate::d3d8::resource::{
     CpuStorage, D3d8LevelLayout, IndexedDraw, VertexBuffer, format_bytes, level_layout,
 };
-use crate::d3d8::state::{Light, Material, Viewport};
+use crate::d3d8::state::{Light, LitInput, Material, Viewport};
 
 /// Version of the C ABI described by this module.
 ///
@@ -706,7 +706,8 @@ pub extern "C" fn d3d8_device_release_texture(dev: *mut D3d8Device, texture_id: 
     }
 }
 
-/// `IDirect3DDevice8::SetTransform` for `D3DTS_*` world/view/projection.
+/// `IDirect3DDevice8::SetTransform` for `D3DTS_*`: world, view, projection and
+/// `TEXTURE0`..`TEXTURE7`.
 #[unsafe(no_mangle)]
 pub extern "C" fn d3d8_device_set_transform(
     dev: *mut D3d8Device,
@@ -734,22 +735,7 @@ pub extern "C" fn d3d8_device_set_transform(
     let value = Mat4 {
         rows: unsafe { (*matrix).rows },
     };
-    let target = match kind {
-        256 => &mut device.state.world,    // D3DTS_WORLD
-        2 => &mut device.state.view,       // D3DTS_VIEW
-        3 => &mut device.state.projection, // D3DTS_PROJECTION
-        other => {
-            write_error(
-                err,
-                D3d8Status::Unsupported,
-                &format!("set_transform: unsupported transform {other}"),
-            );
-            return D3d8Status::Unsupported as i32;
-        }
-    };
-    *target = value;
-    write_error(err, D3d8Status::Ok, "");
-    D3d8Status::Ok as i32
+    report(err, device.state.set_transform(kind, value))
 }
 
 /// `IDirect3DDevice8::SetViewport`.
@@ -1078,6 +1064,86 @@ pub extern "C" fn d3d8_device_draw_primitive(
     report(
         err,
         device.draw_primitive(topology, fvf, &buffer, start_vertex, primitive_count),
+    )
+}
+
+/// `IDirect3DDevice8::ProcessVertices` with caller-supplied CPU source and
+/// destination buffers.
+///
+/// The bridge passes whole host buffers plus a destination vertex index; this
+/// crate owns the FVF/layout arithmetic and the fixed-function transform,
+/// lighting and viewport mapping. A failure is a capability report the engine
+/// routes through its own software fallback, so the bridge must not treat it as
+/// an abort.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn d3d8_device_process_vertices(
+    dev: *mut D3d8Device,
+    src: *const u8,
+    src_bytes: u32,
+    src_fvf: u32,
+    src_stride: u32,
+    dest: *mut u8,
+    dest_bytes: u32,
+    dest_fvf: u32,
+    src_start: u32,
+    dest_index: u32,
+    count: u32,
+    err: *mut D3d8Error,
+) -> i32 {
+    let Some(device) = device_ref(dev) else {
+        write_error(
+            err,
+            D3d8Status::InvalidArgument,
+            "process_vertices: null device",
+        );
+        return D3d8Status::InvalidArgument as i32;
+    };
+    if src.is_null() || dest.is_null() || src_bytes == 0 || dest_bytes == 0 {
+        write_error(
+            err,
+            D3d8Status::InvalidArgument,
+            "process_vertices: null or empty source/destination",
+        );
+        return D3d8Status::InvalidArgument as i32;
+    }
+    let layout = match LitInput::from_fvf(src_fvf) {
+        Ok(layout) => layout,
+        Err(error) => {
+            write_error(
+                err,
+                D3d8Status::Unsupported,
+                &format!("{}: {}", error.operation, error.cause),
+            );
+            return D3d8Status::Unsupported as i32;
+        }
+    };
+    if src_stride as usize != layout.stride {
+        write_error(
+            err,
+            D3d8Status::InvalidArgument,
+            &format!(
+                "process_vertices: stream stride {src_stride} does not match FVF {src_fvf:#06x} stride {}",
+                layout.stride
+            ),
+        );
+        return D3d8Status::InvalidArgument as i32;
+    }
+    // SAFETY: the caller promises readable `src_bytes` at `src` and writable
+    // `dest_bytes` at `dest`.
+    let source = unsafe { core::slice::from_raw_parts(src, src_bytes as usize) };
+    let destination = unsafe { core::slice::from_raw_parts_mut(dest, dest_bytes as usize) };
+    report(
+        err,
+        device.state.process_vertices(
+            source,
+            src_start as usize,
+            count as usize,
+            layout,
+            dest_fvf,
+            dest_index as usize,
+            destination,
+        ),
     )
 }
 

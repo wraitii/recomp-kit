@@ -2153,6 +2153,64 @@ const uint8_t *d8_buffer_bytes(ComObj *o) {
     return storage_data(o);
 }
 
+// (this, SrcStartIndex, DestIndex, VertexCount, pDestBuffer, Flags). Fixed-
+// function vertex processing into a software-processed destination buffer. The
+// Rust renderer owns the transform/lighting/viewport math and the FVF layout;
+// this bridge stages the source stream and the destination buffer bytes.
+//
+// A failure here is a capability report the engine handles: when ProcessVertices
+// fails, ResetAndUploadRenderStateBlock takes its own fallback path. It is
+// therefore returned as an ordinary D3D error, not an unsupported-import abort,
+// so the engine decides what to do.
+void Dev_ProcessVertices(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    ComObj *dest = com_this(arg(c, 4));
+    uint32_t src_start = arg(c, 1), dest_index = arg(c, 2), count = arg(c, 3), flags = arg(c, 5);
+    ComObj *vb = dev ? com_get(dev->d3d8_stream_vb) : nullptr;
+    if (!dev || !dest || dest->kind != K_D3D8VERTEXBUFFER || !vb || !count) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    // D3DPV_DONOTCOPYDATA (1) asks the processor to skip unchanged vertex
+    // data; the fixed-function path rewrites every component, so accepting it
+    // changes nothing. No other flag is defined in D3D8.
+    if (flags & ~1u) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+#ifdef RECOMP_D3D8_WGPU
+    if (!dev->d3d8_device) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    const uint8_t *src = d8_buffer_bytes(vb);
+    uint8_t *dst = storage_data(dest);
+    if (!src || !dst || !vb->pixels_bytes || !dest->pixels_bytes) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    D3d8Error err{};
+    int32_t status = d3d8_device_process_vertices(
+        host_device(dev), src, vb->pixels_bytes, dev->d3d8_fvf, dev->d3d8_stream_stride, dst,
+        dest->pixels_bytes, dest->d3d8_buffer_fvf, src_start, dest_index, count, &err);
+    if (status != D3D8_STATUS_OK) {
+        fprintf(stderr, "d3d8: ProcessVertices: %s\n", reinterpret_cast<const char *>(err.message));
+        fflush(stderr);
+        // The engine's fallback replaces a zero return, so a named capability
+        // failure is D3DERR_NOTAVAILABLE rather than an abort. A malformed call
+        // is still the caller's error.
+        com_ret(c,
+                status == D3D8_STATUS_INVALID_ARGUMENT ? D8_ERR_INVALIDCALL : D8_ERR_NOTAVAILABLE);
+        return;
+    }
+    com_ret(c, D8_OK);
+#else
+    (void)src_start;
+    (void)dest_index;
+    com_ret(c, D8_ERR_NOTAVAILABLE);
+#endif
+}
+
 // (this, pSourceSurface, pSourceRectsArray, cRects, pDestinationSurface,
 // pDestPointsArray). D3D8's rectangle blit between two surfaces that must have
 // the same format. The shim's surfaces are CPU storage, so this copies the

@@ -28,7 +28,7 @@ pub const MAX_TEXTURE_STAGES: usize = 8;
 pub const MAX_SUPPORTED_TEXTURE_STAGES: u32 = 2;
 
 /// A resolved texture stage, ready for the pipeline/shader.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TextureStage {
     /// True when the stage samples/combines; false keeps the untextured path.
     pub active: bool,
@@ -43,6 +43,13 @@ pub struct TextureStage {
     /// `D3DTSS_TEXCOORDINDEX`: which vertex texture-coordinate set to sample
     /// (`0` or `1`). The guest's three TSS functions only emit plain `0`/`1`.
     pub tex_coord_index: u32,
+    /// `D3DTSS_TEXTURETRANSFORMFLAGS`: 0 when disabled, `D3DTTFF_COUNT2`
+    /// (2) for the affine 4x4 transform the guest's engine emits. Other
+    /// forms are refused by name in `resolve_texture_stage`.
+    pub tex_transform_flags: u32,
+    /// The stage's `D3DTS_TEXTUREx` matrix, applied when
+    /// `tex_transform_flags != 0`. Identity otherwise.
+    pub tex_transform: Mat4,
     pub min_filter: u32,
     pub mag_filter: u32,
     pub mip_filter: u32,
@@ -260,6 +267,12 @@ pub struct DeviceState {
     pub world: Mat4,
     pub view: Mat4,
     pub projection: Mat4,
+    /// `D3DTS_TEXTURE0`..`D3DTS_TEXTURE7` (16..=23), one per fixed-function
+    /// stage. D3D8 keeps these even when `D3DTSS_TEXTURETRANSFORMFLAGS` is
+    /// disabled, in which case the matrix has no effect on the generated
+    /// coordinate; the bridge stores them faithfully and only consumes them
+    /// where the stage resolution says the transform is enabled.
+    pub texture_transforms: [Mat4; MAX_TEXTURE_STAGES],
     pub viewport: Viewport,
     /// Render-target size in pixels, fixed for the device's lifetime. Used to
     /// decide whether the viewport is the only clip bound (see the
@@ -286,6 +299,7 @@ impl DeviceState {
             world: Mat4::IDENTITY,
             view: Mat4::IDENTITY,
             projection: Mat4::IDENTITY,
+            texture_transforms: [Mat4::IDENTITY; MAX_TEXTURE_STAGES],
             viewport: Viewport::full(width, height),
             target_width: width,
             target_height: height,
@@ -295,6 +309,30 @@ impl DeviceState {
             lights: [Light::default(); MAX_LIGHTS],
             light_enabled: [false; MAX_LIGHTS],
         }
+    }
+
+    /// `IDirect3DDevice8::SetTransform`. Accepts `D3DTS_WORLD`, `D3DTS_VIEW`,
+    /// `D3DTS_PROJECTION` and the eight `D3DTS_TEXTURE0`..`D3DTS_TEXTURE7`
+    /// states. The world/view/projection matrices drive the raster transform;
+    /// a texture matrix is stored faithfully and only consumed where the
+    /// stage's `D3DTSS_TEXTURETRANSFORMFLAGS`/`D3DTSS_TEXCOORDINDEX` says it is
+    /// applied. Any other `D3DTRANSFORMSTATETYPE` is a named refusal.
+    pub fn set_transform(&mut self, kind: u32, value: Mat4) -> Result<(), RenderError> {
+        match kind {
+            256 => self.world = value,    // D3DTS_WORLD
+            2 => self.view = value,       // D3DTS_VIEW
+            3 => self.projection = value, // D3DTS_PROJECTION
+            16..=23 => self.texture_transforms[(kind - 16) as usize] = value,
+            other => {
+                return Err(RenderError::new(
+                    "d3d8::state::set_transform",
+                    format!(
+                        "transform state {other} is not world/view/projection or TEXTURE0-7"
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// `IDirect3DDevice8::SetMaterial`. The full record is stored verbatim.
@@ -576,11 +614,19 @@ impl DeviceState {
             }
         }
         let transform_flags = raw(Ts::TextureTransformFlags, 0);
-        if transform_flags != 0 {
-            return Err(fail(format!(
-                "D3DTSS_TEXTURETRANSFORMFLAGS = {transform_flags:#010x} is not implemented"
-            )));
-        }
+        // D3DTTFF_COUNT2 transforms the selected 2D vertex coordinate as a
+        // 4-vector `(u, v, 0, 1)` and takes the first two components. Other
+        // counts and D3DTTFF_PROJECTED have no draw path yet and stay named
+        // refusals rather than being silently ignored.
+        let tex_transform = match transform_flags {
+            0 => Mat4::IDENTITY,
+            2 => self.texture_transforms[stage as usize],
+            other => {
+                return Err(fail(format!(
+                    "D3DTSS_TEXTURETRANSFORMFLAGS = {other:#010x} is not DISABLE or D3DTTFF_COUNT2"
+                )));
+            }
+        };
         let filter = |name: &str, value: u32| -> Result<u32, RenderError> {
             match D3DTEXTUREFILTERTYPE::from_raw(value)? {
                 D3DTEXTUREFILTERTYPE::None
@@ -669,6 +715,8 @@ impl DeviceState {
             alpha_arg2,
             texture_factor: self.states.texture_factor,
             tex_coord_index,
+            tex_transform_flags: transform_flags,
+            tex_transform,
             min_filter,
             mag_filter,
             mip_filter,
@@ -1625,10 +1673,11 @@ mod tests {
             })
             .contains("TEXCOORDINDEX")
         );
-        // A texture coordinate transform.
+        // A texture coordinate transform: COUNT2 is applied, other forms stay
+        // refused.
         assert!(
             resolve(|s| {
-                s.set_texture_stage_state(0, 24, 2).unwrap();
+                s.set_texture_stage_state(0, 24, 1).unwrap();
             })
             .contains("TEXTURETRANSFORMFLAGS")
         );
@@ -1697,6 +1746,43 @@ mod tests {
         let stage1 = state.resolve_texture_stage(1, false).unwrap();
         assert_eq!(stage1.color_arg1, d3dta::CURRENT | d3dta::COMPLEMENT);
         assert_eq!(stage1.color_arg2, d3dta::DIFFUSE | d3dta::ALPHAREPLICATE);
+    }
+
+    #[test]
+    fn set_transform_stores_texture_matrices_and_refuses_unknown_states() {
+        let mut state = DeviceState::new(64, 64);
+        let mut m = Mat4::IDENTITY;
+        m.rows[3][0] = 2.0;
+        state.set_transform(16, m).unwrap(); // D3DTS_TEXTURE0
+        state.set_transform(23, m).unwrap(); // D3DTS_TEXTURE7
+        assert_eq!(state.texture_transforms[0], m);
+        assert_eq!(state.texture_transforms[7], m);
+        state.set_transform(256, m).unwrap(); // D3DTS_WORLD
+        assert_eq!(state.world, m);
+        // Outside the fixed-function state set is a named refusal, not a
+        // silent write or a panic.
+        let err = state.set_transform(255, m).unwrap_err();
+        assert_eq!(err.kind, crate::RenderErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn texture_transform_count2_is_resolved_with_the_stage_matrix() {
+        let mut state = DeviceState::new(64, 64);
+        // Texture matrix scales u by 2 and offsets v by 3 (row-vector form:
+        // translation in the last row).
+        let mut m = Mat4::IDENTITY;
+        m.rows[0][0] = 2.0;
+        m.rows[3][0] = 3.0;
+        state.set_transform(16, m).unwrap(); // D3DTS_TEXTURE0
+        state.set_texture_stage_state(0, 24, 2).unwrap(); // TTF = COUNT2
+        let stage = state.resolve_texture_stage(0, true).unwrap();
+        assert_eq!(stage.tex_transform_flags, 2);
+        assert_eq!(stage.tex_transform, m);
+        // A disabled transform keeps identity even if a matrix is stored.
+        state.set_texture_stage_state(0, 24, 0).unwrap();
+        let stage = state.resolve_texture_stage(0, true).unwrap();
+        assert_eq!(stage.tex_transform_flags, 0);
+        assert_eq!(stage.tex_transform, Mat4::IDENTITY);
     }
 
     #[test]

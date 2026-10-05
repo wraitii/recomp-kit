@@ -528,8 +528,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 /// The fields are the raw D3D8 op/argument values; the WGSL fragment stage
 /// interprets them with the same bounded subset the CPU validator enforced.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct StageUniform {
+    /// `D3DTS_TEXTUREx` applied when `tex_transform_flags != 0`; identity
+    /// otherwise. Stored as CPU rows (WGSL columns bound to `matrix`).
+    pub tex_transform: [[f32; 4]; 4],
     pub color_op: u32,
     pub color_arg1: u32,
     pub color_arg2: u32,
@@ -546,14 +549,17 @@ pub struct StageUniform {
     /// makes the shader sample `(0, 0)`, matching WineD3D and DXVK for an
     /// undeclared set.
     pub tex_coord_available: u32,
+    /// `D3DTSS_TEXTURETRANSFORMFLAGS`: 0 disabled, 2 (`D3DTTFF_COUNT2`)
+    /// applies `tex_transform` to the selected coordinate.
+    pub tex_transform_flags: u32,
     pub pad2: u32,
-    pub pad3: u32,
 }
 
 impl StageUniform {
     /// Pack a resolved [`crate::d3d8::state::TextureStage`].
     pub fn new(stage: &crate::d3d8::state::TextureStage) -> Self {
         Self {
+            tex_transform: stage.tex_transform.rows,
             color_op: stage.color_op,
             color_arg1: stage.color_arg1,
             color_arg2: stage.color_arg2,
@@ -566,8 +572,8 @@ impl StageUniform {
             // `Device::draw_primitive` overrides this from the FVF with
             // `StagesUniform::for_fvf`; the standalone default is available.
             tex_coord_available: 1,
+            tex_transform_flags: stage.tex_transform_flags,
             pad2: 0,
-            pad3: 0,
         }
     }
 }
@@ -576,7 +582,7 @@ impl StageUniform {
 /// stage 1, in order. `StagesUniform` keeps the array a single 16-byte-aligned
 /// binding so the shader indexes it with a constant.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct StagesUniform {
     pub stages: [StageUniform; 2],
 }
@@ -770,6 +776,7 @@ struct TransformUniform {
 };
 
 struct StageUniform {
+    tex_transform: mat4x4<f32>,
     color_op: u32,
     color_arg1: u32,
     color_arg2: u32,
@@ -780,8 +787,8 @@ struct StageUniform {
     stage_active: u32,
     tex_coord_index: u32,
     tex_coord_available: u32,
+    tex_transform_flags: u32,
     pad2: u32,
-    pad3: u32,
 };
 
 struct StagesUniform {
@@ -1012,6 +1019,16 @@ fn alpha_op(
     return r;
 }
 
+// D3DTTFF_COUNT2: transform the selected 2D coordinate as `(u, v, 0, 1)`
+// and keep the first two components. The shader matrix is the CPU row-major
+// matrix uploaded as WGSL columns, so `mat * v` is `v * M`.
+fn transform_texcoord(uv: vec2<f32>, m: mat4x4<f32>, flags: u32) -> vec2<f32> {
+    if (flags == 0u) {
+        return uv;
+    }
+    return (m * vec4<f32>(uv, 0.0, 1.0)).xy;
+}
+
 // Evaluate one stage. `current` is the input current colour (diffuse for
 // stage 0, the stage-0 result for stage 1). The result is clamped to [0,1]
 // before it feeds the next stage, as D3D8 does.
@@ -1033,6 +1050,7 @@ fn eval_stage(
     if (s.tex_coord_index == 1u) {
         uv = select(uv1, vec2<f32>(0.0, 0.0), s.tex_coord_available == 0u);
     }
+    uv = transform_texcoord(uv, s.tex_transform, s.tex_transform_flags);
     let texel = textureSample(tex, samp, uv);
     let tfactor = vec4<f32>(
         f32((s.texture_factor >> 16u) & 0xffu) / 255.0,
@@ -1482,6 +1500,8 @@ mod tests {
             alpha_arg2: 3, // TFACTOR
             texture_factor: 0x4080_c020,
             tex_coord_index: 0,
+            tex_transform_flags: 0,
+            tex_transform: crate::d3d8::math::Mat4::IDENTITY,
             min_filter: 2,
             mag_filter: 2,
             mip_filter: 0,
@@ -1494,10 +1514,11 @@ mod tests {
         assert_eq!(u.color_arg2, 2);
         assert_eq!(u.alpha_arg2, 3);
         assert_eq!(u.active, 1);
-        // Six op/arg words, texture factor, active, coordinate index and pads.
-        assert_eq!(bytemuck::bytes_of(&u).len(), 48);
+        // Texture matrix, six op/arg words, texture factor, active,
+        // coordinate index/flags and the FVF-availability word.
+        assert_eq!(bytemuck::bytes_of(&u).len(), 112);
         let both = StagesUniform::new(&stage, &stage);
-        assert_eq!(bytemuck::bytes_of(&both).len(), 96);
+        assert_eq!(bytemuck::bytes_of(&both).len(), 224);
     }
 
     #[test]
@@ -1512,6 +1533,8 @@ mod tests {
             alpha_arg2: 1, // CURRENT
             texture_factor: 0,
             tex_coord_index,
+            tex_transform_flags: 0,
+            tex_transform: crate::d3d8::math::Mat4::IDENTITY,
             min_filter: 2,
             mag_filter: 2,
             mip_filter: 0,
@@ -1531,7 +1554,7 @@ mod tests {
         // FVF 0x242 carries set 1, so the same stage state is available.
         let stages = StagesUniform::for_fvf(&stage(0), &stage(1), 2);
         assert_eq!(stages.stages[1].tex_coord_available, 1);
-        assert_eq!(bytemuck::bytes_of(&stages).len(), 96);
+        assert_eq!(bytemuck::bytes_of(&stages).len(), 224);
     }
 }
 

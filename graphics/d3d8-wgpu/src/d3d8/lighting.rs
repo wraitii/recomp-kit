@@ -1,6 +1,9 @@
 //! Bounded software fixed-function vertex lighting. Guest stream bytes are
-//! never modified. Output XYZ/float RGBA/UV feeds the existing raster shaders.
-//! Specular and vertex blending remain named draw rejections.
+//! never modified. Output XYZ/float RGBA/UV feeds the existing raster shaders;
+//! the same evaluation also feeds `ProcessVertices`, which bakes lighting and
+//! the world/view/projection transform into an XYZRHW destination buffer.
+//! Specular lighting is computed only for `ProcessVertices`; a draw that needs
+//! the vertex specular input still fails by name.
 use super::*;
 use crate::d3d8::fixed_function::d3dcolor_to_rgba;
 
@@ -39,9 +42,10 @@ fn inverse3(m: Mat4) -> Result<[[f32; 3]; 3], RenderError> {
     Ok(cofactors.map(|row| row.map(|v| v / det)))
 }
 
-/// Guest vertex layout consumed by [`DeviceState::light_vertices`].
+/// Guest vertex layout consumed by [`DeviceState::light_vertices`] and
+/// [`DeviceState::process_vertices`].
 ///
-/// The output is always the fixed 36-byte lit layout from
+/// `light_vertices` always writes the fixed 36-byte lit layout from
 /// [`lit_layout`](super::fixed_function::lit_layout): XYZ at 0, float RGBA
 /// diffuse at 12 and the 2-float texture coordinate at 28.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,26 +77,226 @@ impl LitInput {
         diffuse_offset: None,
         uv_offset: 24,
     };
+
+    /// The lit FVFs `ProcessVertices` accepts as a source. Other FVFs would
+    /// need a lighting path the engine does not ask for here, so they are
+    /// named refusals rather than silently unlit output.
+    pub(crate) fn from_fvf(fvf: u32) -> Result<Self, RenderError> {
+        match fvf {
+            0x0152 => Ok(Self::XYZ_NORMAL_DIFFUSE_TEX1),
+            0x0112 => Ok(Self::XYZ_NORMAL_TEX1),
+            other => Err(RenderError::new(
+                "ProcessVertices",
+                format!("source FVF {other:#06x} is not 0x152 or 0x112"),
+            )),
+        }
+    }
+}
+
+/// A `ProcessVertices` destination layout. The engine creates the destination
+/// buffer with FVF `0x1c4` (`XYZRHW | DIFFUSE | SPECULAR | TEX1`, stride 32) or
+/// `0x2c4` (adds `TEX2`, stride 40); [`DeviceState::process_vertices`] writes
+/// exactly the components those FVFs name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessDest {
+    stride: usize,
+    /// Bytes of texture coordinates the destination carries (one or two
+    /// 2-float sets).
+    texcoord_bytes: usize,
+}
+
+impl ProcessDest {
+    fn decode(fvf: u32) -> Result<Self, RenderError> {
+        match fvf {
+            0x01c4 => Ok(Self {
+                stride: 32,
+                texcoord_bytes: 8,
+            }),
+            0x02c4 => Ok(Self {
+                stride: 40,
+                texcoord_bytes: 16,
+            }),
+            other => Err(RenderError::new(
+                "ProcessVertices",
+                format!("destination FVF {other:#06x} is not 0x1c4 or 0x2c4"),
+            )),
+        }
+    }
+}
+
+/// Quantize a clamped float RGBA to a `D3DCOLOR` (`ARGB`). The raster shader
+/// decodes each byte as `value / 255`, so this is the inverse the pre-transformed
+/// path sees.
+fn rgba_to_d3dcolor(c: [f32; 4]) -> u32 {
+    let byte = |v: f32| ((v.clamp(0.0, 1.0) * 255.0).round() as u32) & 0xff;
+    (byte(c[3]) << 24) | (byte(c[0]) << 16) | (byte(c[1]) << 8) | byte(c[2])
+}
+
+/// Fixed-function lighting output for one vertex.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LitResult {
+    diffuse: [f32; 4],
+    specular: [f32; 4],
+}
+
+/// Precomputed lighting environment shared by every vertex of a pass, so the
+/// light list, normal matrix and ambient term are not rebuilt per vertex.
+struct LightingSetup<'a> {
+    state: &'a DeviceState,
+    enabled: Vec<&'a Light>,
+    world_view: Mat4,
+    normal_matrix: Option<[[f32; 3]; 3]>,
+    global_ambient: [f32; 4],
+}
+
+impl LightingSetup<'_> {
+    /// Evaluate the fixed-function lighting model for one source vertex.
+    /// Equations: Microsoft Mathematics of Lighting / Diffuse Lighting /
+    /// Attenuation and Spotlight Factor, plus the D3D8 specular term using the
+    /// local or infinite viewer selected by `D3DRS_LOCALVIEWER`.
+    fn evaluate(&self, vertex: &[u8], layout: LitInput) -> Result<LitResult, RenderError> {
+        let s = &self.state.states;
+        let material = &self.state.material;
+        let float =
+            |offset: usize| f32::from_le_bytes(vertex[offset..offset + 4].try_into().unwrap());
+        let position = [float(0), float(4), float(8)];
+        let color = layout.diffuse_offset.map(|offset| {
+            d3dcolor_to_rgba(u32::from_le_bytes(
+                vertex[offset..offset + 4].try_into().unwrap(),
+            ))
+        });
+        // COLOR1 with no diffuse component (0x112) and COLOR2 in every lit FVF
+        // fall back to the material, matching D3D8's D3DMCS_* material-source
+        // rule for a missing vertex colour.
+        let material_source = |source, mat, vertex_color: Option<[f32; 4]>| {
+            if s.color_vertex && source == D3DMATERIALCOLORSOURCE::Color1 {
+                vertex_color.unwrap_or(mat)
+            } else {
+                mat
+            }
+        };
+        let mut diffuse;
+        let mut specular;
+        if s.lighting {
+            let ambient = material_source(s.ambient_material_source, material.ambient, color);
+            let emissive = material_source(s.emissive_material_source, material.emissive, color);
+            let source_diffuse =
+                material_source(s.diffuse_material_source, material.diffuse, color);
+            let source_specular =
+                material_source(s.specular_material_source, material.specular, color);
+            let normal = [
+                float(layout.normal_offset),
+                float(layout.normal_offset + 4),
+                float(layout.normal_offset + 8),
+            ];
+            let mut normal = self
+                .normal_matrix
+                .expect("normal matrix prepared with lighting")
+                .map(|row| dot(row, normal));
+            if s.normalize_normals {
+                normal = normalize(normal);
+            }
+            let view_position = transform(self.world_view, position, 1.0);
+            // Camera at the view-space origin. `D3DRS_LOCALVIEWER` selects the
+            // per-vertex eye vector; otherwise the viewer is at infinity.
+            let eye = if s.local_viewer {
+                normalize([-view_position[0], -view_position[1], -view_position[2]])
+            } else {
+                [0.0, 0.0, -1.0]
+            };
+            diffuse = [0.0; 4];
+            specular = [0.0; 4];
+            for c in 0..3 {
+                diffuse[c] = emissive[c] + ambient[c] * self.global_ambient[c];
+            }
+            // Lighting changes RGB; alpha comes from the diffuse source.
+            diffuse[3] = source_diffuse[3];
+            // A disabled specular input stays fully zero, matching the draw
+            // path's specular default; alpha is only carried when enabled.
+            specular[3] = if s.specular_enable {
+                source_specular[3]
+            } else {
+                0.0
+            };
+            for light in &self.enabled {
+                let (direction, mut attenuation) = if light.light_type == 3 {
+                    (
+                        normalize(transform(self.state.view, light.direction, 0.0)).map(|v| -v),
+                        1.0,
+                    )
+                } else {
+                    let light_position = transform(self.state.view, light.position, 1.0);
+                    let delta = std::array::from_fn(|c| light_position[c] - view_position[c]);
+                    let distance = dot(delta, delta).sqrt();
+                    if distance > light.range {
+                        continue;
+                    }
+                    let denominator = light.attenuation0
+                        + light.attenuation1 * distance
+                        + light.attenuation2 * distance * distance;
+                    if denominator <= 0.0 || !denominator.is_finite() {
+                        return Err(RenderError::new(
+                            "vertex lighting",
+                            "nonpositive/nonfinite point/spot attenuation denominator",
+                        ));
+                    }
+                    (normalize(delta), 1.0 / denominator)
+                };
+                if light.light_type == 2 {
+                    let spot_direction =
+                        normalize(transform(self.state.view, light.direction, 0.0));
+                    let rho = -dot(direction, spot_direction);
+                    let inner = (light.theta * 0.5).cos();
+                    let outer = (light.phi * 0.5).cos();
+                    let spot = if rho > inner {
+                        1.0
+                    } else if rho <= outer {
+                        0.0
+                    } else {
+                        ((rho - outer) / (inner - outer)).powf(light.falloff)
+                    };
+                    attenuation *= spot;
+                }
+                let lambert = dot(normal, direction).max(0.0);
+                for c in 0..3 {
+                    diffuse[c] += attenuation
+                        * (ambient[c] * light.ambient[c]
+                            + source_diffuse[c] * light.diffuse[c] * lambert);
+                }
+                if s.specular_enable {
+                    let halfway = normalize([
+                        direction[0] + eye[0],
+                        direction[1] + eye[1],
+                        direction[2] + eye[2],
+                    ]);
+                    let n_dot_h = dot(normal, halfway).max(0.0);
+                    let factor = n_dot_h.powf(material.power);
+                    for c in 0..3 {
+                        specular[c] +=
+                            attenuation * source_specular[c] * light.specular[c] * factor;
+                    }
+                }
+            }
+        } else {
+            diffuse = if let Some(color) = color.filter(|_| s.color_vertex) {
+                color
+            } else {
+                material.diffuse
+            };
+            specular = [0.0; 4];
+        }
+        for value in &mut diffuse {
+            *value = value.clamp(0.0, 1.0);
+        }
+        for value in &mut specular {
+            *value = value.clamp(0.0, 1.0);
+        }
+        Ok(LitResult { diffuse, specular })
+    }
 }
 
 impl DeviceState {
-    /// 0x152: XYZ at 0, NORMAL at 12, D3DCOLOR at 24, float2 UV at 28.
-    /// 0x112: XYZ at 0, NORMAL at 12, float2 UV at 24, material diffuse.
-    /// Evaluate in camera space and keep floating diffuse until rasterization.
-    /// Equations: Microsoft Mathematics of Lighting / Diffuse Lighting /
-    /// Attenuation and Spotlight Factor (fixed-function D3D8/9 model).
-    /// Writes exactly `end * 36` bytes into `out`, overwriting every byte of
-    /// the `start..end` vertex range. `out` is a caller-owned scratch buffer so
-    /// a draw loop reuses one allocation; `resize` only zero-fills the first
-    /// time a larger draw grows it.
-    pub(crate) fn light_vertices(
-        &self,
-        bytes: &[u8],
-        start: usize,
-        end: usize,
-        layout: LitInput,
-        out: &mut Vec<u8>,
-    ) -> Result<(), RenderError> {
+    fn lighting_setup(&self) -> Result<LightingSetup<'_>, RenderError> {
         let s = &self.states;
         let enabled: Vec<_> = self
             .lights
@@ -116,108 +320,122 @@ impl DeviceState {
         } else {
             None
         };
-        let material_source = |source, material, vertex: Option<[f32; 4]>| {
-            // COLOR1 with no diffuse component (0x112) and COLOR2 in every lit
-            // FVF fall back to the material, matching D3D8's
-            // D3DMCS_* material-source rule for a missing vertex colour.
-            if s.color_vertex && source == D3DMATERIALCOLORSOURCE::Color1 {
-                vertex.unwrap_or(material)
-            } else {
-                material
-            }
-        };
         let global_ambient = d3dcolor_to_rgba(s.ambient);
+        Ok(LightingSetup {
+            state: self,
+            enabled,
+            world_view,
+            normal_matrix,
+            global_ambient,
+        })
+    }
+
+    /// 0x152: XYZ at 0, NORMAL at 12, D3DCOLOR at 24, float2 UV at 28.
+    /// 0x112: XYZ at 0, NORMAL at 12, float2 UV at 24, material diffuse.
+    /// Evaluate in camera space and keep floating diffuse until rasterization.
+    /// Writes exactly `end * 36` bytes into `out`, overwriting every byte of
+    /// the `start..end` vertex range. `out` is a caller-owned scratch buffer so
+    /// a draw loop reuses one allocation; `resize` only zero-fills the first
+    /// time a larger draw grows it.
+    pub(crate) fn light_vertices(
+        &self,
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+        layout: LitInput,
+        out: &mut Vec<u8>,
+    ) -> Result<(), RenderError> {
+        let setup = self.lighting_setup()?;
         out.resize(end * 36, 0);
         for index in start..end {
             let begin = index * layout.stride;
             let vertex = &bytes[begin..begin + layout.stride];
-            let float = |offset| f32::from_le_bytes(vertex[offset..offset + 4].try_into().unwrap());
-            let position = [float(0), float(4), float(8)];
-            let color = layout.diffuse_offset.map(|offset| {
-                d3dcolor_to_rgba(u32::from_le_bytes(
-                    vertex[offset..offset + 4].try_into().unwrap(),
-                ))
-            });
-            let diffuse = material_source(s.diffuse_material_source, self.material.diffuse, color);
-            let mut result = if s.lighting {
-                let ambient =
-                    material_source(s.ambient_material_source, self.material.ambient, color);
-                let emissive =
-                    material_source(s.emissive_material_source, self.material.emissive, color);
-                let normal = [
-                    float(layout.normal_offset),
-                    float(layout.normal_offset + 4),
-                    float(layout.normal_offset + 8),
-                ];
-                let mut normal = normal_matrix.unwrap().map(|row| dot(row, normal));
-                if s.normalize_normals {
-                    normal = normalize(normal);
-                }
-                let position = transform(world_view, position, 1.0);
-                let mut result = [0.0; 4];
-                for c in 0..3 {
-                    result[c] = emissive[c] + ambient[c] * global_ambient[c];
-                }
-                // Lighting changes RGB; alpha comes from the diffuse source.
-                result[3] = diffuse[3];
-                for light in &enabled {
-                    let (direction, mut attenuation) = if light.light_type == 3 {
-                        (
-                            normalize(transform(self.view, light.direction, 0.0)).map(|v| -v),
-                            1.0,
-                        )
-                    } else {
-                        let light_position = transform(self.view, light.position, 1.0);
-                        let delta = std::array::from_fn(|c| light_position[c] - position[c]);
-                        let distance = dot(delta, delta).sqrt();
-                        if distance > light.range {
-                            continue;
-                        }
-                        let denominator = light.attenuation0
-                            + light.attenuation1 * distance
-                            + light.attenuation2 * distance * distance;
-                        if denominator <= 0.0 || !denominator.is_finite() {
-                            return Err(RenderError::new(
-                                "vertex lighting",
-                                "nonpositive/nonfinite point/spot attenuation denominator",
-                            ));
-                        }
-                        (normalize(delta), 1.0 / denominator)
-                    };
-                    if light.light_type == 2 {
-                        let spot_direction = normalize(transform(self.view, light.direction, 0.0));
-                        let rho = -dot(direction, spot_direction);
-                        let inner = (light.theta * 0.5).cos();
-                        let outer = (light.phi * 0.5).cos();
-                        let spot = if rho > inner {
-                            1.0
-                        } else if rho <= outer {
-                            0.0
-                        } else {
-                            ((rho - outer) / (inner - outer)).powf(light.falloff)
-                        };
-                        attenuation *= spot;
-                    }
-                    let lambert = dot(normal, direction).max(0.0);
-                    for c in 0..3 {
-                        result[c] += attenuation
-                            * (ambient[c] * light.ambient[c]
-                                + diffuse[c] * light.diffuse[c] * lambert);
-                    }
-                }
-                result
-            } else if let Some(color) = color.filter(|_| s.color_vertex) {
-                color
-            } else {
-                self.material.diffuse
-            };
-            for value in &mut result {
-                *value = value.clamp(0.0, 1.0);
-            }
+            let lit = setup.evaluate(vertex, layout)?;
             let dst = &mut out[index * 36..(index + 1) * 36];
             dst[..12].copy_from_slice(&vertex[..12]);
-            dst[12..28].copy_from_slice(bytemuck::bytes_of(&result));
+            dst[12..28].copy_from_slice(bytemuck::bytes_of(&lit.diffuse));
             dst[28..36].copy_from_slice(&vertex[layout.uv_offset..layout.uv_offset + 8]);
+        }
+        Ok(())
+    }
+
+    /// `IDirect3DDevice8::ProcessVertices` fixed-function output. Reads `count`
+    /// source vertices starting at `src_start`, applies the current
+    /// world/view/projection transform, lighting and viewport, and writes them
+    /// at `dest_index` in the destination layout `dest_fvf`. `dest` is the whole
+    /// destination buffer; the write range is bounds-checked inside. The
+    /// destination buffer's FVF is the output format, as D3D8 defines it.
+    pub(crate) fn process_vertices(
+        &self,
+        src: &[u8],
+        src_start: usize,
+        count: usize,
+        layout: LitInput,
+        dest_fvf: u32,
+        dest_index: usize,
+        dest: &mut [u8],
+    ) -> Result<(), RenderError> {
+        let out_layout = ProcessDest::decode(dest_fvf)?;
+        let src_end = src_start
+            .checked_add(count)
+            .and_then(|n| n.checked_mul(layout.stride))
+            .ok_or_else(|| RenderError::new("ProcessVertices", "source range overflow"))?;
+        if src_end > src.len() {
+            return Err(RenderError::new(
+                "ProcessVertices",
+                "source vertex range exceeds the bound stream",
+            ));
+        }
+        let dst_begin = dest_index
+            .checked_mul(out_layout.stride)
+            .ok_or_else(|| RenderError::new("ProcessVertices", "destination offset overflow"))?;
+        let dst_end = count
+            .checked_mul(out_layout.stride)
+            .and_then(|n| dst_begin.checked_add(n))
+            .ok_or_else(|| RenderError::new("ProcessVertices", "destination range overflow"))?;
+        if dst_end > dest.len() {
+            return Err(RenderError::new(
+                "ProcessVertices",
+                "destination vertex range exceeds the buffer",
+            ));
+        }
+        let setup = self.lighting_setup()?;
+        let world_view_projection = self.world.mul(self.view).mul(self.projection);
+        let vp = self.viewport;
+        for i in 0..count {
+            let begin = (src_start + i) * layout.stride;
+            let vertex = &src[begin..begin + layout.stride];
+            let lit = setup.evaluate(vertex, layout)?;
+            let float =
+                |offset: usize| f32::from_le_bytes(vertex[offset..offset + 4].try_into().unwrap());
+            let clip = world_view_projection.transform([float(0), float(4), float(8), 1.0]);
+            let w = clip[3];
+            let rhw = if w != 0.0 && w.is_finite() {
+                1.0 / w
+            } else {
+                0.0
+            };
+            let ndc = [clip[0] * rhw, clip[1] * rhw, clip[2] * rhw];
+            let sx = (ndc[0] + 1.0) * vp.width as f32 * 0.5 + vp.x as f32;
+            let sy = (1.0 - ndc[1]) * vp.height as f32 * 0.5 + vp.y as f32;
+            let sz = vp.min_z + ndc[2] * (vp.max_z - vp.min_z);
+            let dst = &mut dest[dst_begin + i * out_layout.stride..][..out_layout.stride];
+            dst[0..4].copy_from_slice(&sx.to_le_bytes());
+            dst[4..8].copy_from_slice(&sy.to_le_bytes());
+            dst[8..12].copy_from_slice(&sz.to_le_bytes());
+            dst[12..16].copy_from_slice(&rhw.to_le_bytes());
+            dst[16..20].copy_from_slice(&rgba_to_d3dcolor(lit.diffuse).to_le_bytes());
+            dst[20..24].copy_from_slice(&rgba_to_d3dcolor(lit.specular).to_le_bytes());
+            // The source FVFs carry one texture-coordinate set. A 0x2c4
+            // destination names a second set that the engine generates from the
+            // same coordinate through the stage-1 texture matrix; the draw's
+            // shader applies that transform, so the same untransformed
+            // coordinate is written to both sets.
+            dst[24..32].copy_from_slice(&vertex[layout.uv_offset..layout.uv_offset + 8]);
+            if out_layout.texcoord_bytes > 8 {
+                dst[32..32 + out_layout.texcoord_bytes - 8]
+                    .copy_from_slice(&vertex[layout.uv_offset..layout.uv_offset + 8]);
+            }
         }
         Ok(())
     }
@@ -250,11 +468,11 @@ mod tests {
     }
 
     fn vertex_xyz_normal_tex1(normal: [f32; 3], uv: [f32; 2]) -> Vec<u8> {
+        vertex_at_xyz_normal_tex1([0.0, 0.0, 0.5], normal, uv)
+    }
+    fn vertex_at_xyz_normal_tex1(position: [f32; 3], normal: [f32; 3], uv: [f32; 2]) -> Vec<u8> {
         let mut bytes = Vec::new();
-        for value in [0.0f32, 0.0, 0.5].into_iter().chain(normal) {
-            bytes.extend(value.to_le_bytes());
-        }
-        for value in uv {
+        for value in position.into_iter().chain(normal).chain(uv) {
             bytes.extend(value.to_le_bytes());
         }
         bytes
@@ -419,6 +637,177 @@ mod tests {
         assert_eq!(
             lit_color(&state, [0.0, 0.0, 1.0], 0xffffffff),
             [0.0, 0.0, 0.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn process_vertices_writes_specular_only_when_enabled() {
+        let mut state = directional();
+        state.material.specular = [1.0, 1.0, 1.0, 1.0];
+        state.material.power = 1.0;
+        state.lights[0].specular = [1.0; 4];
+        // Off-axis vertex: the eye is not opposite the light, so the halfway
+        // vector is not the normal and the specular term is nonzero.
+        let source = vertex_at_xyz_normal_tex1([3.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0]);
+        let mut dest = vec![0u8; 32];
+        state
+            .process_vertices(
+                &source,
+                0,
+                1,
+                LitInput::XYZ_NORMAL_TEX1,
+                0x01c4,
+                0,
+                &mut dest,
+            )
+            .unwrap();
+        assert_eq!(dest[20..24], [0, 0, 0, 0]);
+        state.set_render_state(29, 1).unwrap(); // D3DRS_SPECULARENABLE
+        state
+            .process_vertices(
+                &source,
+                0,
+                1,
+                LitInput::XYZ_NORMAL_TEX1,
+                0x01c4,
+                0,
+                &mut dest,
+            )
+            .unwrap();
+        assert!(dest[20] > 0, "specular bytes {:?}", &dest[20..24]);
+    }
+
+    #[test]
+    fn process_vertices_transforms_and_packs_xyzrhw() {
+        let mut state = directional();
+        // Identity world/view/projection and a full viewport with a nonzero
+        // origin exercises the screen mapping and rhw without a projection.
+        state.viewport = Viewport {
+            x: 10,
+            y: 20,
+            width: 200,
+            height: 100,
+            min_z: 0.0,
+            max_z: 1.0,
+        };
+        let source = vertex_xyz_normal_tex1([0.0, 0.0, 1.0], [0.25, 0.5]);
+        let mut dest = vec![0u8; 32];
+        state
+            .process_vertices(
+                &source,
+                0,
+                1,
+                LitInput::XYZ_NORMAL_TEX1,
+                0x01c4,
+                0,
+                &mut dest,
+            )
+            .unwrap();
+        let f = |o: usize| f32::from_le_bytes(dest[o..o + 4].try_into().unwrap());
+        // NDC (0,0,0) maps to the viewport centre.
+        assert_eq!(f(0), 110.0);
+        assert_eq!(f(4), 70.0);
+        assert_eq!(f(8), 0.5);
+        assert_eq!(f(12), 1.0);
+        // Diffuse from the directional light, specular disabled -> 0.
+        assert_eq!(
+            dest[16..20],
+            rgba_to_d3dcolor([1.0, 1.0, 1.0, 1.0]).to_le_bytes()
+        );
+        assert_eq!(dest[20..24], [0, 0, 0, 0]);
+        assert_eq!(dest[24..32], {
+            let mut uv = Vec::new();
+            for v in [0.25f32, 0.5] {
+                uv.extend(v.to_le_bytes());
+            }
+            uv
+        });
+    }
+
+    #[test]
+    fn process_vertices_divides_by_clip_w() {
+        let mut state = directional();
+        // A perspective-style projection: row 3 carries no w contribution and
+        // row 2's last column feeds clip.w, so clip.w is the view-space z.
+        let mut projection = Mat4::IDENTITY;
+        projection.rows[2] = [0.0, 0.0, 1.0, 1.0];
+        projection.rows[3] = [0.0, 0.0, 0.0, 0.0];
+        state.projection = projection;
+        state.viewport = Viewport {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+            min_z: 0.0,
+            max_z: 1.0,
+        };
+        let source = vertex_at_xyz_normal_tex1([0.0, 0.0, 2.0], [0.0, 0.0, 1.0], [0.0, 0.0]);
+        let mut dest = vec![0u8; 32];
+        state
+            .process_vertices(
+                &source,
+                0,
+                1,
+                LitInput::XYZ_NORMAL_TEX1,
+                0x01c4,
+                0,
+                &mut dest,
+            )
+            .unwrap();
+        let f = |o: usize| f32::from_le_bytes(dest[o..o + 4].try_into().unwrap());
+        // clip = (0, 0, 2, 2), rhw = 0.5, ndc = (0, 0, 1).
+        assert_eq!(f(0), 50.0);
+        assert_eq!(f(4), 50.0);
+        assert_eq!(f(8), 1.0);
+        assert_eq!(f(12), 0.5);
+    }
+
+    #[test]
+    fn process_vertices_rejects_unknown_formats_and_ranges() {
+        let state = directional();
+        let source = vertex_xyz_normal_tex1([0.0, 0.0, 1.0], [0.0, 0.0]);
+        let mut dest = vec![0u8; 32];
+        assert!(
+            state
+                .process_vertices(
+                    &source,
+                    0,
+                    1,
+                    LitInput::XYZ_NORMAL_TEX1,
+                    0x0042,
+                    0,
+                    &mut dest
+                )
+                .is_err()
+        );
+        assert!(LitInput::from_fvf(0x0042).is_err());
+        // One vertex does not fit in a destination smaller than its stride.
+        assert!(
+            state
+                .process_vertices(
+                    &source,
+                    0,
+                    1,
+                    LitInput::XYZ_NORMAL_TEX1,
+                    0x01c4,
+                    0,
+                    &mut vec![0u8; 16],
+                )
+                .is_err()
+        );
+        // The source range must stay inside the passed stream.
+        assert!(
+            state
+                .process_vertices(
+                    &source,
+                    1,
+                    1,
+                    LitInput::XYZ_NORMAL_TEX1,
+                    0x01c4,
+                    0,
+                    &mut dest,
+                )
+                .is_err()
         );
     }
 }

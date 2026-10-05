@@ -62,6 +62,7 @@
       "SetTexture": "Dev_SetTexture",
       "DrawPrimitive": "Dev_DrawPrimitive",
       "DrawIndexedPrimitive": "Dev_DrawIndexedPrimitive",
+      "ProcessVertices": "Dev_ProcessVertices",
       "SetVertexShader": "Dev_SetVertexShader",
       "GetVertexShader": "Dev_GetVertexShader",
       "SetStreamSource": "Dev_SetStreamSource",
