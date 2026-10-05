@@ -680,15 +680,46 @@ enum {
 };
 static const uint16_t WAVE_FORMAT_PCM = 1;
 
-// DSCAPS, 96 bytes.
-enum { DSCAPS_SIZE = 96, DSCAPS_OFF_dwSize = 0x00, DSCAPS_OFF_dwFlags = 0x04 };
+// DSCAPS, 96 bytes: dwSize, dwFlags, then the sample-rate, buffer-count and
+// memory fields in dsound.h order.
+enum {
+    DSCAPS_SIZE = 96,
+    DSCAPS_OFF_dwSize = 0x00,
+    DSCAPS_OFF_dwFlags = 0x04,
+    DSCAPS_OFF_dwMinSecondarySampleRate = 0x08,
+    DSCAPS_OFF_dwMaxSecondarySampleRate = 0x0c,
+    DSCAPS_OFF_dwPrimaryBuffers = 0x10,
+    DSCAPS_OFF_dwMaxHwMixingAllBuffers = 0x14,
+    DSCAPS_OFF_dwMaxHwMixingStaticBuffers = 0x18,
+    DSCAPS_OFF_dwMaxHwMixingStreamingBuffers = 0x1c,
+    DSCAPS_OFF_dwFreeHwMixingAllBuffers = 0x20,
+    DSCAPS_OFF_dwFreeHwMixingStaticBuffers = 0x24,
+    DSCAPS_OFF_dwFreeHwMixingStreamingBuffers = 0x28,
+    DSCAPS_OFF_dwMaxHw3DAllBuffers = 0x2c,
+    DSCAPS_OFF_dwMaxHw3DStaticBuffers = 0x30,
+    DSCAPS_OFF_dwMaxHw3DStreamingBuffers = 0x34,
+    DSCAPS_OFF_dwFreeHw3DAllBuffers = 0x38,
+    DSCAPS_OFF_dwFreeHw3DStaticBuffers = 0x3c,
+    DSCAPS_OFF_dwFreeHw3DStreamingBuffers = 0x40,
+    DSCAPS_OFF_dwTotalHwMemBytes = 0x44,
+    DSCAPS_OFF_dwFreeHwMemBytes = 0x48,
+    DSCAPS_OFF_dwMaxContigFreeHwMemBytes = 0x4c,
+    DSCAPS_OFF_dwUnlockTransferRateHwBuffers = 0x50,
+    DSCAPS_OFF_dwPlayCpuOverheadSwBuffers = 0x54,
+    DSCAPS_OFF_dwReserved1 = 0x58,
+    DSCAPS_OFF_dwReserved2 = 0x5c,
+};
+static const uint32_t DSCAPS_PRIMARYMONO = 0x00000001u;
+static const uint32_t DSCAPS_PRIMARYSTEREO = 0x00000002u;
+static const uint32_t DSCAPS_PRIMARY8BIT = 0x00000004u;
 static const uint32_t DSCAPS_PRIMARY16BIT = 0x00000008u;
-static const uint32_t DSCAPS_PRIMARYSTEREO = 0x00000004u;
 static const uint32_t DSCAPS_CONTINUOUSRATE = 0x00000010u;
 static const uint32_t DSCAPS_EMULDRIVER = 0x00000020u;
 static const uint32_t DSCAPS_CERTIFIED = 0x00000040u;
+static const uint32_t DSCAPS_SECONDARYMONO = 0x00000100u;
+static const uint32_t DSCAPS_SECONDARYSTEREO = 0x00000200u;
+static const uint32_t DSCAPS_SECONDARY8BIT = 0x00000400u;
 static const uint32_t DSCAPS_SECONDARY16BIT = 0x00000800u;
-static const uint32_t DSCAPS_SECONDARYSTEREO = 0x00000400u;
 
 // DSBCAPS (the query structure), 20 bytes.
 enum { DSBCAPS_SIZE = 20 };

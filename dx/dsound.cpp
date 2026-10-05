@@ -2096,6 +2096,12 @@ void DS_CreateSoundBuffer(X86 *c) {
     com_ret(c, DS_OK);
 }
 
+// The host mixer converts every source to the output rate, so the whole
+// DirectSound secondary frequency range is honored. The buffer formats the
+// mixer accepts are 8/16-bit mono/stereo for both the primary and secondary
+// buffers; mixing is software, so no hardware buffer or memory counts are
+// reported. The engine reads dwFlags and the sample-rate fields when it builds
+// its audio-capabilities string (FUN_00545e30).
 void DS_GetCaps(X86 *c) {
     uint32_t out = arg(c, 1);
     if (!out || !gm_valid(out, 4)) {
@@ -2108,9 +2114,13 @@ void DS_GetCaps(X86 *c) {
         return;
     }
     gm_zero(out + 4, size - 4);
-    wr32(out + DSCAPS_OFF_dwFlags, DSCAPS_PRIMARY16BIT | DSCAPS_PRIMARYSTEREO |
-                                       DSCAPS_SECONDARY16BIT | DSCAPS_SECONDARYSTEREO |
-                                       DSCAPS_CONTINUOUSRATE | DSCAPS_CERTIFIED);
+    wr32(out + DSCAPS_OFF_dwFlags,
+         DSCAPS_PRIMARYMONO | DSCAPS_PRIMARYSTEREO | DSCAPS_PRIMARY8BIT | DSCAPS_PRIMARY16BIT |
+             DSCAPS_CONTINUOUSRATE | DSCAPS_CERTIFIED | DSCAPS_SECONDARYMONO |
+             DSCAPS_SECONDARYSTEREO | DSCAPS_SECONDARY8BIT | DSCAPS_SECONDARY16BIT);
+    wr32(out + DSCAPS_OFF_dwMinSecondarySampleRate, 100);
+    wr32(out + DSCAPS_OFF_dwMaxSecondarySampleRate, 200000);
+    wr32(out + DSCAPS_OFF_dwPrimaryBuffers, 1);
     com_ret(c, DS_OK);
 }
 

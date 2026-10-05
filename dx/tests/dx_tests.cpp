@@ -722,6 +722,7 @@ enum { MAT_GetHandle = 5 };
 enum { TEX_GetHandle = 3, TEX_PaletteChanged = 4, TEX_Load = 5 };
 enum {
     DS_CreateSoundBuffer = 3,
+    DS_GetCaps = 4,
     DS_SetCooperativeLevel = 6,
     B_QueryInterface = 0,
     B_GetCaps = 3,
@@ -7926,6 +7927,19 @@ static void test_dsound() {
     CHECK_EQ(hr, DS_OK);
     uint32_t ds = rd32(sc(0));
     CHECK(ds != 0);
+
+    // GetCaps reports a stereo-capable software mixer. The exact flag word
+    // pins the D3D8 DSCAPS values: PRIMARYSTEREO is 0x2 and SECONDARYSTEREO is
+    // 0x200, not the 0x4/0x400 that an earlier definition used.
+    uint32_t caps = sc(0x600);
+    gm_zero(caps, DSCAPS_SIZE);
+    wr32(caps + DSCAPS_OFF_dwSize, DSCAPS_SIZE);
+    hr = call_method(ds, DS_GetCaps, {caps});
+    CHECK_EQ(hr, DS_OK);
+    CHECK_EQ(rd32(caps + DSCAPS_OFF_dwFlags), 0x00000F5Fu);
+    CHECK_EQ(rd32(caps + DSCAPS_OFF_dwMinSecondarySampleRate), 100u);
+    CHECK_EQ(rd32(caps + DSCAPS_OFF_dwMaxSecondarySampleRate), 200000u);
+    CHECK_EQ(rd32(caps + DSCAPS_OFF_dwPrimaryBuffers), 1u);
 
     hr = call_method(ds, DS_SetCooperativeLevel, {0x20004, 3});
     CHECK_EQ(hr, DS_OK);

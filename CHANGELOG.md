@@ -12,6 +12,12 @@
   D3D error rather than an unsupported-import abort, so the engine can take its
   own `ResetAndUploadRenderStateBlock` fallback.
 
+- DirectSound `IDirectSound8::GetCaps` fills the whole `DSCAPS` record. The
+  D3D8 `DSCAPS_PRIMARYSTEREO` (`0x2`) and `DSCAPS_SECONDARYSTEREO` (`0x200`)
+  constants were wrong (`0x4`/`0x400`, the 8-bit flags), so the engine's
+  `FUN_00545e30` capability string read the mixer as 8-bit mono. The sample
+  rates and primary-buffer count are reported now as well.
+
 - Accept an out-of-range `SizeToLock` in `IDirect3DVertexBuffer8::Lock` when the
   lock offset is inside the buffer. The original engine's
   `RenderingContext::LockVB` (`00545b50`) passes the caller's end vertex as the
