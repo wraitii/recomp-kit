@@ -73,7 +73,16 @@
       "SetStreamSource": "Dev_SetStreamSource",
       "SetIndices": "Dev_SetIndices",
       "CopyRects": "Dev_CopyRects",
-      "ValidateDevice": "Dev_ValidateDevice"
+      "ValidateDevice": "Dev_ValidateDevice",
+      "CreateVertexShader": "Dev_CreateVertexShader",
+      "CreatePixelShader": "Dev_CreatePixelShader",
+      "SetPixelShader": "Dev_SetPixelShader",
+      "GetPixelShader": "Dev_GetPixelShader",
+      "DeleteVertexShader": "Dev_DeleteVertexShader",
+      "DeletePixelShader": "Dev_DeletePixelShader",
+      "GetVertexShaderDeclaration": "Dev_GetVertexShaderDeclaration",
+      "GetVertexShaderFunction": "Dev_GetVertexShaderFunction",
+      "GetPixelShaderFunction": "Dev_GetPixelShaderFunction"
     }
   },
   {

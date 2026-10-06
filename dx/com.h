@@ -316,7 +316,14 @@ struct D3d7DeviceState {
 // wrote; nothing here interprets them. Held behind a shared_ptr so the arrays
 // are not paid for by every surface/texture/buffer object, the same reason
 // D3d7DeviceState is shared.
+struct D3d8Shader {
+    bool pixel = false;
+    std::vector<uint32_t> declaration, function;
+};
 struct D3d8DeviceState {
+    std::unordered_map<uint32_t, D3d8Shader> shaders;
+    uint32_t next_shader = 0xf0000001u;
+    uint32_t pixel_shader = 0;
     uint32_t vconst[96][4] = {};
     uint32_t pconst[8][4] = {};
 };
@@ -573,7 +580,7 @@ struct ComObj {
     uint32_t d3d8_stream_stride = 0;
     uint32_t d3d8_indices = 0;            // bound K_D3D8INDEXBUFFER object id
     uint32_t d3d8_base_vertex = 0;        // SetIndices base vertex index
-    uint32_t d3d8_fvf = 0;                // fixed-function FVF from SetVertexShader
+    uint32_t d3d8_fvf = 0;                // FVF or device-owned shader handle
     uint32_t d3d8_bound_texture[8] = {0}; // bound K_D3D8TEXTURE id per texture stage
 };
 

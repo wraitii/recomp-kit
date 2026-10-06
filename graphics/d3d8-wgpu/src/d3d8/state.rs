@@ -580,6 +580,45 @@ impl DeviceState {
         Ok(())
     }
 
+    /// Shader sampling consumes sampler state, independently of combiner/texgen
+    /// state. Reuse the same validation and sampler defaults as fixed function.
+    pub fn resolve_shader_sampler(&self, stage: usize) -> Result<TextureStage, RenderError> {
+        let mut copy = self.clone();
+        copy.texture_stages[0] = self.texture_stages[stage].clone();
+        for (id, value) in [
+            (1, 4),
+            (2, 2),
+            (3, 1),
+            (4, 2),
+            (5, 2),
+            (6, 1),
+            (11, 0),
+            (24, 0),
+        ] {
+            copy.texture_stages[0].insert(id, value);
+        }
+        copy.resolve_texture_stage(0, true)
+    }
+
+    /// A programmable VS supplies oTn directly; TEXCOORDINDEX and texture
+    /// transforms belong to fixed-function vertex processing and are inert.
+    pub fn resolve_shader_fixed_pixel_stage(
+        &self,
+        stage: u32,
+        bound: bool,
+    ) -> Result<TextureStage, RenderError> {
+        let mut copy = self.clone();
+        copy.texture_stages[stage as usize].insert(11, stage);
+        copy.texture_stages[stage as usize].insert(24, 0);
+        copy.resolve_texture_stage(stage, bound)
+    }
+
+    /// Fixed-function vertex lighting/material and fog-generation switches are
+    /// inert with a programmable vertex shader; raster state still validates.
+    pub fn validate_shader_draw(&self) -> Result<(), RenderError> {
+        self.validate_fixed_function(true, false)
+    }
+
     /// The raw value of one texture-stage state, or `None` when never set.
     pub fn texture_stage_state(&self, stage: u32, state: u32) -> Option<u32> {
         self.texture_stages
@@ -2178,9 +2217,7 @@ mod tests {
     #[test]
     fn max_mip_level_and_lod_bias_are_carried() {
         let mut state = DeviceState::new(64, 64);
-        state
-            .set_texture_stage_state(0, 20, 2)
-            .unwrap(); // D3DTSS_MAXMIPLEVEL
+        state.set_texture_stage_state(0, 20, 2).unwrap(); // D3DTSS_MAXMIPLEVEL
         // The default LOD bias is 0.0 bits, carried through as a float.
         let stage = state.resolve_texture_stage(0, true).unwrap();
         assert_eq!(stage.max_mip_level, 2);

@@ -1,0 +1,85 @@
+# D3D8 shader-model 1.1
+
+The guest bridge implements Create/Set/Get/DeleteVertexShader and PixelShader,
+GetVertexShaderDeclaration/Function and GetPixelShaderFunction. It copies guest
+bytecode and declarations into device-owned storage. Handles are above
+`0xf0000000`, distinct from FVF values and shader version tokens. Queries return
+required byte counts and `D3DERR_MOREDATA` for short buffers. Invalid or deleted
+handles return `D3DERR_INVALIDCALL`. Reset clears bindings and device constants
+and retains shader objects; deleting a bound shader restores its fixed stage.
+
+`src/d3d8/shader.rs` decodes tokens and emits WGSL. Vertex and fragment stages
+can be selected independently, alongside the existing fixed-function stages.
+Pipelines/modules are cached by program identities and vertex layout. Draws
+retain pipelines, texture views/samplers and copies of both constant banks and
+bump state, preserving queued work across later state changes and deletion.
+
+## Supported slice
+
+- `vs.1.1`, `ps.1.1`; other versions fail during creation by name.
+- Stream-0 declarations: FLOAT1/2/3/4, D3DCOLOR, UBYTE4, SHORT2/4, SKIP and
+  CONST. Float inputs extend with zero components and w=1. Packed D3DCOLOR is
+  BGRA bytes converted to floating RGBA. Declaration-only shaders support the
+  existing packed fixed-function FVFs; other layouts fail by name.
+- 96 vertex and eight pixel float4 constants. Declaration CONST and shader DEF
+  are local to the program, independent of the Set/Get device banks.
+- MOV, ADD, SUB, MAD, MUL, RCP, RSQ, DP3/4, MIN/MAX, SLT/SGE, EXP/LOG,
+  EXPP/LOGP, LIT, DST, LRP, FRC, M4x4/M4x3/M3x4/M3x3/M3x2, CND and DEF.
+  Stage-specific instructions are rejected where not implemented. Source
+  swizzles, negation, bias, signed scale (`_bx2`), complement, destination
+  masks, saturation and shift modifiers are decoded. Temporaries preserve
+  aliasing across partial destination writes. Relative vertex constant indexing
+  uses a0.x; `DIVERGENCE(original):` indices outside the bank clamp to its bounds (original behavior
+  outside the valid constant range is unverified).
+- oPos, oFog, oD0/1 and oT0..7 vertex registers; four 2D texture coordinates
+  reach the fragment shader. TEXCOORD, TEXKILL, TEX, TEXBEM/TEXBEML and
+  TEXREG2AR/GB use four retained texture/sampler bindings. TEXBEM uses its
+  **destination** stage's BUMPENVMAT00/01/10/11 state; TEXBEML also uses that
+  stage's luminance scale/offset. Combiner and fixed vertex texgen/transform
+  state do not affect programmable stages. Sampler filters/addressing/mip
+  limits/LOD bias still apply. Alpha test and fog remain raster operations.
+
+The renderer advertises vs.1.1 / ps.1.1, 96 vertex constants,
+MaxPixelShaderValue=1.0 and four simultaneous textures. Its fixed-function
+combiner capacity remains two stages. These are bounded implementation caps,
+not a claim of complete shader-model conformance.
+
+Unsupported features include instruction coissue, texture matrix instruction
+families, point-size outputs, multistream/tessellator declarations, shader
+versions beyond 1.1, cube/volume textures and additional signed bump texture
+formats. A fixed-function VS combined with a PS currently requires an existing
+textured FVF and no texture transforms or generated texture coordinates. These
+combinations fail by name. Full original GPU precision and
+out-of-range arithmetic equivalence are unverified. Fixed-function D3D7 uses
+the same renderer but gains no new bump combiner capability in this change.
+
+## Reference and validation
+
+The token/declaration definitions are the unchanged Wine 11.0 headers in
+[third_party/wine-d3d8](../../third_party/wine-d3d8/README.md). Semantic evidence
+uses that same commit's [D3D8 device](https://github.com/wine-mirror/wine/blob/db11d0fe6a169c457e23d007e20404643d067aa8/dlls/d3d8/device.c),
+[declaration constants](https://github.com/wine-mirror/wine/blob/db11d0fe6a169c457e23d007e20404643d067aa8/dlls/d3d8/vertexdeclaration.c),
+[SM1 decoder](https://github.com/wine-mirror/wine/blob/db11d0fe6a169c457e23d007e20404643d067aa8/dlls/wined3d/shader_sm1.c)
+and [GLSL operations](https://github.com/wine-mirror/wine/blob/db11d0fe6a169c457e23d007e20404643d067aa8/dlls/wined3d/glsl_shader.c).
+The WGSL emitter is first-party code; Wine source is semantic reference.
+
+From the game repository, using its Python environment:
+
+```sh
+tools/.venv/bin/python recomp-kit/tools/test.py --game-dir "$PWD" --d3d8-wgpu test
+tools/.venv/bin/python recomp-kit/tools/test.py --game-dir "$PWD" --d3d8-wgpu probe
+```
+
+The Rust suite validates composed stages with naga, rejects unsupported and
+truncated tokens, checks declaration layout and embedded END bit patterns, and
+performs GPU readback for independent queued pixel constant changes,
+declaration-local constants and a dependent stage-3 texture read with an
+off-diagonal bump matrix, independent fixed-function vertex/pixel shader
+selection and padded stream-stride pipeline caching. Guest COM fixture tests
+cover shader handle ownership, binding/deletion, bytecode/declaration size
+queries and short-buffer behavior without a GPU. The existing headless probe checks fixed-function
+rendering after the binding-layout extension. These tests require GPU access;
+they do not establish original-D3D8 equivalence or game playability.
+
+`RECOMP_D3D8_TRACE_SHADERS=1` prints creation handles, versions and token counts.
+No original shader source or bytecode fixtures are committed.

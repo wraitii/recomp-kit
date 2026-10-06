@@ -121,3 +121,9 @@ unknown name fails generation, and a constant the Rust ABI header also defines i
 `static_assert`ed equal to the Wine value.
 Ghost Recon's parent `tools/d3d8_codegen.py` checks both this boundary and its
 cbindgen-generated host ABI. Generator regressions run in the portable suite.
+
+The Rust D3D8 renderer tests and offscreen probe can be run through
+`tools/test.py --game-dir /abs/game --d3d8-wgpu test` and `--d3d8-wgpu probe`.
+They require graphics adapter access; an unavailable adapter fails the requested
+suite. Shader tests include WGSL validation and Metal readback for constants
+and dependent bump sampling; see [shader coverage](../graphics/d3d8-wgpu/SHADERS.md).

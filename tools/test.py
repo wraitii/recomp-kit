@@ -159,6 +159,7 @@ def main():
     """Choose portable, compile-only or game-backed suites and check their prerequisites."""
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group()
+    group.add_argument("--d3d8-wgpu", choices=["test", "probe"], help="Rust D3D8 model tests or headless GPU probe")
     group.add_argument("--native", action="store_true", help="Build and run the native suites")
     group.add_argument("--mods", action="store_true", help="Real game-backed mod tests")
     group.add_argument("--gameplay", action="store_true", help="Scripted native Options and gameplay run")
@@ -184,7 +185,14 @@ def main():
     env = probe_module().without_switches(os.environ)
     env["PY"] = sys.executable
     try:
-        if args.gameplay:
+        if args.d3d8_wgpu:
+            rust_env = dict(env, CARGO_TARGET_DIR=str(build_root / "d3d8-wgpu/rust"))
+            manifest = ROOT / "graphics/d3d8-wgpu/Cargo.toml"
+            if args.d3d8_wgpu == "test":
+                run(["cargo", "test", "--locked", "--lib", "--manifest-path", manifest], rust_env)
+            else:
+                run(["cargo", "run", "--locked", "--bin", "probe-headless", "--manifest-path", manifest], rust_env)
+        elif args.gameplay:
             gameplay(args.jobs, args.game_dir, build_root)
         elif args.mods:
             mods(args.preset, env, args.jobs, args.game_dir, build_root)

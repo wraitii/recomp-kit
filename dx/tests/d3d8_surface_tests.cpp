@@ -811,6 +811,60 @@ static void test_shader_constants() {
     call_method(device, 2);
 }
 
+// Seed host fixture programs to test guest COM ownership and query semantics
+// without a GPU. Real Create*Shader execution is covered by the game startup;
+// token translation and rendering are covered by the Rust shader tests.
+static void test_shader_lifecycle() {
+    cpu_reset();
+    ComObj *dev = make_test_device(4, 4, 22);
+    uint32_t device = com_view(dev, IF_D3D8DEVICE), out = sc(0x200), size = sc(0x300);
+    dev->d3d8_constants = std::make_shared<D3d8DeviceState>();
+    const uint32_t vs = 0xf0000001u, ps = 0xf0000002u;
+    D3d8Shader vertex;
+    vertex.declaration = {0x20000000, 0x40020000, 0xffffffff};
+    vertex.function = {0xfffe0101, 1, 0xc00f0000, 0x90e40000, 0xffff};
+    D3d8Shader pixel;
+    pixel.pixel = true;
+    pixel.function = {0xffff0101, 1, 0x800f0000, 0xa0e40000, 0xffff};
+    dev->d3d8_constants->shaders.emplace(vs, vertex);
+    dev->d3d8_constants->shaders.emplace(ps, pixel);
+    check(call_method(device, 76, {vs}) == 0, "bind fixture vertex shader");
+    check(call_method(device, 77, {out}) == 0 && rd32(out) == vs,
+          "vertex shader handle round trip");
+    check(call_method(device, 88, {ps}) == 0, "bind fixture pixel shader");
+    check(call_method(device, 89, {out}) == 0 && rd32(out) == ps, "pixel shader handle round trip");
+    check(call_method(device, 76, {ps}) == 0x8876086c, "pixel handle rejected as vertex shader");
+    check(call_method(device, 88, {vs}) == 0x8876086c, "vertex handle rejected as pixel shader");
+    check(call_method(device, 82, {vs, 0, size}) == 0 && rd32(size) == 20,
+          "vertex bytecode size query");
+    wr32(size, 4);
+    wr32(out, 0xdeadbeef);
+    check(call_method(device, 82, {vs, out, size}) == 0x88760867,
+          "short bytecode query reports MOREDATA");
+    check(rd32(size) == 20 && rd32(out) == 0xdeadbeef, "short query updates size without copying");
+    check(call_method(device, 82, {vs, out, size}) == 0, "vertex bytecode copy succeeds");
+    for (uint32_t i = 0; i < vertex.function.size(); ++i)
+        check(rd32(out + i * 4) == vertex.function[i], "vertex bytecode copy preserves tokens");
+    check(call_method(device, 81, {vs, 0, size}) == 0 && rd32(size) == 12,
+          "vertex declaration size query");
+    check(call_method(device, 93, {ps, 0, size}) == 0 && rd32(size) == 20,
+          "pixel bytecode size query");
+    check(call_method(device, 82, {ps, 0, size}) == 0x8876086c, "wrong shader type query rejected");
+    ComObj *other = make_test_device(4, 4, 22);
+    check(call_method(com_view(other, IF_D3D8DEVICE), 88, {ps}) == 0x8876086c,
+          "shader handles belong to their device");
+    check(call_method(device, 78, {vs}) == 0, "delete bound vertex shader");
+    check(call_method(device, 77, {out}) == 0 && rd32(out) == 0, "vertex deletion clears binding");
+    check(call_method(device, 90, {ps}) == 0, "delete bound pixel shader");
+    check(call_method(device, 89, {out}) == 0 && rd32(out) == 0, "pixel deletion clears binding");
+    check(call_method(device, 88, {ps}) == 0x8876086c, "deleted shader cannot be rebound");
+    check(call_method(device, 90, {ps}) == 0x8876086c, "double shader deletion rejected");
+    check(call_method(device, 76, {0x112}) == 0, "FVF restores fixed-function vertex stage");
+    check(call_method(device, 77, {out}) == 0 && rd32(out) == 0x112, "FVF handle round trip");
+    call_method(com_view(other, IF_D3D8DEVICE), 2);
+    call_method(device, 2);
+}
+
 // D3DCAPS8 limits and the broader HAL surface. Ghost Recon's 0x004eac20
 // halves every texture until it fits MaxTextureWidth/Height, so a zero there
 // silently collapses all sampled textures to 1x1. The rest of the table pins
@@ -1032,6 +1086,7 @@ int main(int argc, char **argv) {
     test_render_target_texture();
     test_bind_texture();
     test_shader_constants();
+    test_shader_lifecycle();
     test_caps();
     test_depth();
     test_create_depth_stencil_surface();

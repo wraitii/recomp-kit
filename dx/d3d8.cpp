@@ -414,7 +414,11 @@ void write_caps(uint32_t addr) {
     //
     // DIVERGENCE(original): the reference adapter reported its hardware's count.
     wr32(addr + 0x94, 2);
+#ifdef RECOMP_D3D8_WGPU
+    wr32(addr + 0x98, 4); // ps.1.1 has four independent samplers
+#else
     wr32(addr + 0x98, 2);
+#endif
     // VertexProcessingCaps (+0x9c). Texture-coordinate generation,
     // COLOR1/COLOR2 material sources, directional/point/spot lights, the local
     // viewer and the no-UBYTE4 rule are implemented. Not advertised: TWEENING
@@ -439,11 +443,12 @@ void write_caps(uint32_t addr) {
     wr32(addr + 0xb8, 0x0000ffffu);
     wr32(addr + 0xbc, 1);
     wr32(addr + 0xc0, 508);
-    // VertexShaderVersion / MaxVertexShaderConst (+0xc4/+0xc8) and
-    // PixelShaderVersion / MaxPixelShaderValue (+0xcc/+0xd0) stay zero:
-    // programmable shaders are not implemented yet. A non-zero version makes
-    // the engine call CreateVertexShader/CreatePixelShader, which abort; these
-    // will be advertised when shader support lands.
+#ifdef RECOMP_D3D8_WGPU
+    wr32(addr + 0xc4, 0xfffe0101u); // vs.1.1
+    wr32(addr + 0xc8, 96);
+    wr32(addr + 0xcc, 0xffff0101u); // ps.1.1
+    wr32(addr + 0xd0, 0x3f800000u); // MaxPixelShaderValue = 1.0
+#endif
 }
 
 // The DirectDraw table holds the front end's 8/16-bit modes, so filtering it
@@ -890,6 +895,12 @@ void Dev_Reset(X86 *c) {
     dev->d3d8_depth_format =
         params.enable_auto_depth_stencil ? params.auto_depth_stencil_format : 0;
     device_discard_implicit_surfaces(dev);
+    dev->d3d8_fvf = 0;
+    if (dev->d3d8_constants) {
+        dev->d3d8_constants->pixel_shader = 0;
+        memset(dev->d3d8_constants->vconst, 0, sizeof(dev->d3d8_constants->vconst));
+        memset(dev->d3d8_constants->pconst, 0, sizeof(dev->d3d8_constants->pconst));
+    }
     com_ret(c, D8_OK);
 #else
     com_ret(c, D8_ERR_NOTAVAILABLE);
@@ -2374,10 +2385,10 @@ void Dev_SetIndices(X86 *c) {
     com_ret(c, D8_OK);
 }
 
-// (this, Handle). For fixed-function rendering the handle is the FVF code.
-// D3D8 programable vertex shader handles have the top 16 bits set (0xFFFE);
-// none can exist because CreateVertexShader is not implemented, so such a
-// handle is a named failure rather than a silent store.
+D3d8DeviceState *d8_constants(ComObj *dev);
+
+// (this, Handle). Wine uses handles above VS_HIGHESTFIXEDFXF (0xf0000000),
+// independently of the 0xfffe0101 vertex bytecode version token.
 void Dev_SetVertexShader(X86 *c) {
     ComObj *dev = d8_dev(c);
     uint32_t handle = arg(c, 1);
@@ -2385,15 +2396,22 @@ void Dev_SetVertexShader(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if ((handle & 0xFFFE0000u) == 0xFFFE0000u) {
-        fprintf(stderr,
-                "d3d8: SetVertexShader handle 0x%08x is a programable shader, which is "
-                "not implemented\n",
-                handle);
-        fflush(stderr);
-        imports_unsupported(c);
+    auto *state = d8_constants(dev);
+    auto it = state->shaders.find(handle);
+    if (handle > 0xf0000000u && (it == state->shaders.end() || it->second.pixel)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
+#ifdef RECOMP_D3D8_WGPU
+    D3d8Error err{};
+    int32_t status =
+        d3d8_device_shader_action(host_device(dev), handle > 0xf0000000u ? handle : 0, 0, 0, &err);
+    if (status) {
+        com_ret(c, host_result(c, status, err));
+        return;
+    }
+
+#endif
     dev->d3d8_fvf = handle;
     com_ret(c, D8_OK);
 }
@@ -2412,8 +2430,8 @@ void Dev_GetVertexShader(X86 *c) {
 // Programmable shader constants. D3D8 keeps float4 register banks on the
 // device; Set/Get copy the 32-bit float bit patterns verbatim and never
 // convert or interpret them. The constants have no effect on the
-// fixed-function pipeline, which is all the bridge draws with until a
-// programmable draw path exists; this is faithful storage, not a stub. A
+// fixed-function pipeline. Programmable draws snapshot these banks through
+// the host ABI. A
 // guest may set constants while no programmable shader is bound, and the
 // water path does, so failing the call would abort it. The banks live on the
 // device object, behind a shared_ptr, so Set and Get round-trip across calls.
@@ -2466,6 +2484,17 @@ void Dev_SetVertexShaderConstant(X86 *c) {
     }
     if (count)
         d8_copy_registers(d8_constants(dev)->vconst, reg, data, count, false);
+#ifdef RECOMP_D3D8_WGPU
+    if (count && dev->d3d8_device) {
+        D3d8Error err{};
+        int32_t status = d3d8_device_shader_constants(
+            host_device(dev), 0, reg, &d8_constants(dev)->vconst[reg][0], count, &err);
+        if (status) {
+            com_ret(c, host_result(c, status, err));
+            return;
+        }
+    }
+#endif
     com_ret(c, D8_OK);
 }
 void Dev_GetVertexShaderConstant(X86 *c) {
@@ -2488,6 +2517,17 @@ void Dev_SetPixelShaderConstant(X86 *c) {
     }
     if (count)
         d8_copy_registers(d8_constants(dev)->pconst, reg, data, count, false);
+#ifdef RECOMP_D3D8_WGPU
+    if (count && dev->d3d8_device) {
+        D3d8Error err{};
+        int32_t status = d3d8_device_shader_constants(
+            host_device(dev), 1, reg, &d8_constants(dev)->pconst[reg][0], count, &err);
+        if (status) {
+            com_ret(c, host_result(c, status, err));
+            return;
+        }
+    }
+#endif
     com_ret(c, D8_OK);
 }
 void Dev_GetPixelShaderConstant(X86 *c) {
@@ -2500,6 +2540,232 @@ void Dev_GetPixelShaderConstant(X86 *c) {
     if (count)
         d8_copy_registers(d8_constants(dev)->pconst, reg, data, count, true);
     com_ret(c, D8_OK);
+}
+
+// Read bounded guest token streams at token boundaries. DEF immediates and
+// declaration constants may contain END bits; never scan them as opcodes.
+// Creation copies all bytes before the guest assembler buffer can be freed.
+bool d8_shader_words(uint32_t addr, bool declaration, std::vector<uint32_t> &out) {
+    if (!addr)
+        return false;
+    for (uint32_t n = 0; n < 4096;) {
+        if (!gm_valid(addr, 4))
+            return false;
+        uint32_t token = rd32(addr), extra = 0;
+        if (declaration) {
+            if (token == 0xffffffffu) {
+                out.push_back(token);
+                return true;
+            }
+            if ((token >> 29) == 4)
+                extra = ((token >> 25) & 15) * 4;
+            else if ((token >> 29) == 5)
+                extra = (token >> 24) & 31;
+        } else if (n) {
+            uint32_t op = token & 0xffff;
+            if (op == 0xffff) {
+                out.push_back(token);
+                return true;
+            }
+            if (op == 0xfffe)
+                extra = (token >> 16) & 0x7fff;
+            else if (op == 0)
+                extra = 0;
+            else if (op == 81)
+                extra = 5;
+            else if (op == 1 || (op >= 6 && op <= 7) || (op >= 14 && op <= 16) || op == 19 ||
+                     op == 78 || op == 79)
+                extra = 2;
+            else if (op == 4 || op == 18 || op == 80)
+                extra = 4;
+            else if (op >= 64 && op <= 66)
+                extra = 1;
+            else if (op == 2 || op == 3 || op == 5 || (op >= 8 && op <= 13) || op == 17 ||
+                     (op >= 20 && op <= 24) || (op >= 67 && op <= 70))
+                extra = 3;
+            else {
+                fprintf(stderr, "d3d8: unsupported shader opcode %u\n", op);
+                return false;
+            }
+        }
+        if (extra >= 4096 - n || !gm_valid(addr, (extra + 1) * 4))
+            return false;
+        for (uint32_t i = 0; i <= extra; ++i)
+            out.push_back(rd32(addr + i * 4));
+        n += extra + 1;
+        if (addr > UINT32_MAX - (extra + 1) * 4)
+            return false;
+        addr += (extra + 1) * 4;
+    }
+    return false;
+}
+
+// Create a device-owned program after copying and validating its token streams.
+// Only the opaque numeric handle crosses into guest fields.
+void d8_create_shader(X86 *c, bool pixel) {
+    auto *dev = d8_dev(c);
+    uint32_t output = arg(c, pixel ? 2 : 3);
+    if (!dev || !output || !gm_valid(output, 4)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    wr32(output, 0);
+    D3d8Shader shader;
+    shader.pixel = pixel;
+    if ((!pixel && (arg(c, 4) & ~0x10u)) ||
+        (!pixel && !d8_shader_words(arg(c, 1), true, shader.declaration)) ||
+        ((pixel || arg(c, 2)) && !d8_shader_words(arg(c, pixel ? 1 : 2), false, shader.function))) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+#ifdef RECOMP_D3D8_WGPU
+    auto *state = d8_constants(dev);
+    uint32_t handle = state->next_shader;
+    if (handle == UINT32_MAX) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    D3d8Error err{};
+    int32_t status =
+        d3d8_device_create_shader(host_device(dev), handle, pixel, shader.declaration.data(),
+                                  uint32_t(shader.declaration.size()), shader.function.data(),
+                                  uint32_t(shader.function.size()), &err);
+    if (status) {
+        com_ret(c, host_result(c, status, err));
+        return;
+    }
+    ++state->next_shader;
+    if (recomp_env("D3D8_TRACE_SHADERS"))
+        fprintf(
+            stderr, "d3d8: Create%sShader handle=0x%08x version=0x%08x words=%zu declaration=%zu\n",
+            pixel ? "Pixel" : "Vertex", handle, shader.function.empty() ? 0 : shader.function[0],
+            shader.function.size(), shader.declaration.size());
+    state->shaders.emplace(handle, std::move(shader));
+    wr32(output, handle);
+    com_ret(c, D8_OK);
+#else
+    com_ret(c, D8_ERR_NOTAVAILABLE);
+#endif
+}
+void Dev_CreateVertexShader(X86 *c) {
+    d8_create_shader(c, false);
+}
+void Dev_CreatePixelShader(X86 *c) {
+    d8_create_shader(c, true);
+}
+
+void Dev_SetPixelShader(X86 *c) {
+    auto *dev = d8_dev(c);
+    uint32_t handle = arg(c, 1);
+    if (!dev) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    auto *state = d8_constants(dev);
+    auto it = state->shaders.find(handle);
+    if (handle && (it == state->shaders.end() || !it->second.pixel)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+#ifdef RECOMP_D3D8_WGPU
+    D3d8Error err{};
+    int32_t status = d3d8_device_shader_action(host_device(dev), handle, 1, 0, &err);
+    if (status) {
+        com_ret(c, host_result(c, status, err));
+        return;
+    }
+#endif
+    state->pixel_shader = handle;
+    com_ret(c, D8_OK);
+}
+void Dev_GetPixelShader(X86 *c) {
+    auto *dev = d8_dev(c);
+    uint32_t out = arg(c, 1);
+    if (!dev || !out || !gm_valid(out, 4)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, d8_constants(dev)->pixel_shader);
+    com_ret(c, D8_OK);
+}
+// Deleting a bound program clears that stage; queued host draws retain it.
+void d8_delete_shader(X86 *c, bool pixel) {
+    auto *dev = d8_dev(c);
+    uint32_t handle = arg(c, 1);
+    if (!dev) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    auto *state = d8_constants(dev);
+    auto it = state->shaders.find(handle);
+    if (it == state->shaders.end() || it->second.pixel != pixel) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+#ifdef RECOMP_D3D8_WGPU
+    D3d8Error err{};
+    int32_t status = d3d8_device_shader_action(host_device(dev), handle, pixel, 1, &err);
+    if (status) {
+        com_ret(c, host_result(c, status, err));
+        return;
+    }
+#endif
+    if (pixel && state->pixel_shader == handle)
+        state->pixel_shader = 0;
+    if (!pixel && dev->d3d8_fvf == handle)
+        dev->d3d8_fvf = 0;
+    state->shaders.erase(it);
+    com_ret(c, D8_OK);
+}
+void Dev_DeleteVertexShader(X86 *c) {
+    d8_delete_shader(c, false);
+}
+void Dev_DeletePixelShader(X86 *c) {
+    d8_delete_shader(c, true);
+}
+
+// D3D8 query convention: null data asks for size; a short buffer reports
+// D3DERR_MOREDATA and required bytes without a partial copy (Wine device.c).
+void d8_get_shader(X86 *c, bool pixel, bool declaration) {
+    auto *dev = d8_dev(c);
+    uint32_t data = arg(c, 2), size = arg(c, 3);
+    if (!dev || !size || !gm_valid(size, 4)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    auto *state = d8_constants(dev);
+    auto it = state->shaders.find(arg(c, 1));
+    if (it == state->shaders.end() || it->second.pixel != pixel) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    const auto &words = declaration ? it->second.declaration : it->second.function;
+    uint32_t required = uint32_t(words.size() * 4), available = rd32(size);
+    wr32(size, required);
+    if (!data) {
+        com_ret(c, D8_OK);
+        return;
+    }
+    if (available < required) {
+        com_ret(c, 0x88760867u);
+        return;
+    }
+    if (!gm_valid(data, required)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    for (size_t i = 0; i < words.size(); ++i)
+        wr32(data + uint32_t(i * 4), words[i]);
+    com_ret(c, D8_OK);
+}
+void Dev_GetVertexShaderDeclaration(X86 *c) {
+    d8_get_shader(c, false, true);
+}
+void Dev_GetVertexShaderFunction(X86 *c) {
+    d8_get_shader(c, false, false);
+}
+void Dev_GetPixelShaderFunction(X86 *c) {
+    d8_get_shader(c, true, false);
 }
 
 // The bytes to draw from right now: the guest heap while the buffer is locked,
@@ -2721,7 +2987,7 @@ void Dev_DrawPrimitive(X86 *c) {
         return;
     }
     // The bridge composites two stages, so both bindings must be current.
-    for (uint32_t stage = 0; stage < 2; ++stage)
+    for (uint32_t stage = 0; stage < (d8_constants(dev)->pixel_shader ? 4u : 2u); ++stage)
         if (!d8_sync_texture(c, dev, stage))
             return;
     D3d8Error err{};
@@ -2780,7 +3046,7 @@ void Dev_DrawIndexedPrimitive(X86 *c) {
         return;
     }
     // The bridge composites two stages, so both bindings must be current.
-    for (uint32_t stage = 0; stage < 2; ++stage)
+    for (uint32_t stage = 0; stage < (d8_constants(dev)->pixel_shader ? 4u : 2u); ++stage)
         if (!d8_sync_texture(c, dev, stage))
             return;
     D3d8Error err{};

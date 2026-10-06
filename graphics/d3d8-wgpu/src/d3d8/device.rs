@@ -6,6 +6,7 @@ use super::{
         UNLIT_WGSL, lit_layout, lit_shader_source,
     },
     resource::{IndexedDraw, VertexBuffer, expand_indexed_into},
+    shader::{self, Declaration, Program},
     state::{DeviceState, LitInput, MAX_TEXTURE_STAGES},
     stats, survey,
     texture_cache::{TextureCache, TextureKey},
@@ -279,21 +280,29 @@ fn trace_draw(
             .collect();
         eprintln!(
             "[d3d8-trace]   stage{stage} texture id=0x{:08x} {}x{} fmt={:#x} levels={} max_written={} written=[{}]",
-            t.texture_id, t.width, t.height, t.format, t.level_count, t.max_written_level, levels.join(",")
+            t.texture_id,
+            t.width,
+            t.height,
+            t.format,
+            t.level_count,
+            t.max_written_level,
+            levels.join(",")
         );
         // The clamp the sampler actually used for this stage, from the same
         // helper the draw path calls. `-` when the stage state does not
         // resolve (the draw would already have failed, so this is diagnostic).
         match state.resolve_texture_stage(stage, true) {
             Ok(resolved) => {
-                let (lod_min, lod_max, filter) =
-                    mip_lod_range(&resolved, t.max_written_level);
+                let (lod_min, lod_max, filter) = mip_lod_range(&resolved, t.max_written_level);
                 eprintln!(
                     "[d3d8-trace]   stage{stage} sampler lod=({lod_min},{lod_max}) mip_filter={filter:?} max_mip_level={} mip={:#x}",
                     resolved.max_mip_level, resolved.mip_filter
                 );
             }
-            Err(e) => eprintln!("[d3d8-trace]   stage{stage} sampler unresolved: {}", e.cause),
+            Err(e) => eprintln!(
+                "[d3d8-trace]   stage{stage} sampler unresolved: {}",
+                e.cause
+            ),
         }
     }
     // Sampler inputs the fixed-function draw depends on. RT3's terrain looked
@@ -559,12 +568,10 @@ fn source_level_bytes(
     height: u32,
 ) -> Result<usize, RenderError> {
     Ok(match color {
-        Some(color) => {
-            (width as usize)
-                .checked_mul(height as usize)
-                .and_then(|n| n.checked_mul(color.bytes_per_pixel() as usize))
-                .ok_or_else(|| RenderError::new("SetTexture", "level size overflow"))?
-        }
+        Some(color) => (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(color.bytes_per_pixel() as usize))
+            .ok_or_else(|| RenderError::new("SetTexture", "level size overflow"))?,
         None => crate::d3d8::format::block_level_layout(width, height, format).1 as usize,
     })
 }
@@ -794,10 +801,7 @@ struct SamplerKey {
 }
 
 impl SamplerKey {
-    fn from_stage(
-        stage: &crate::d3d8::state::TextureStage,
-        max_written_level: u32,
-    ) -> Self {
+    fn from_stage(stage: &crate::d3d8::state::TextureStage, max_written_level: u32) -> Self {
         Self {
             address_u: stage.address_u,
             address_v: stage.address_v,
@@ -816,7 +820,8 @@ const DRAW_UB_TRANSFORM: u64 = 0;
 const DRAW_UB_FOG: u64 = 256;
 const DRAW_UB_ALPHA_TEST: u64 = 512;
 const DRAW_UB_STAGES: u64 = 768;
-const DRAW_VERTEX_OFFSET: u64 = 1024;
+const DRAW_UB_PROGRAM: u64 = 1024;
+const DRAW_VERTEX_OFFSET: u64 = 3072;
 const _: () = {
     assert!(std::mem::size_of::<TransformUniform>() <= 256);
     assert!(std::mem::size_of::<FogUniform>() <= 256);
@@ -876,20 +881,12 @@ pub struct FrameHandoff {
 /// Flush a recorded batch once its CPU-side block data reaches this size.
 const BATCH_FLUSH_BYTES: usize = 8 << 20;
 
-type TextureGroupKey = (
-    wgpu::TextureView,
-    wgpu::Sampler,
-    wgpu::TextureView,
-    wgpu::Sampler,
-);
+type TextureGroupKey = [(wgpu::TextureView, wgpu::Sampler); 4];
 const MAX_TEXTURE_GROUPS: usize = 512;
 
-/// Texture/sampler pairs of a textured draw, captured when it is recorded.
+/// Retained bindings for all four shader-model 1.1 texture registers.
 struct StageBindings {
-    view0: wgpu::TextureView,
-    view1: wgpu::TextureView,
-    sampler0: wgpu::Sampler,
-    sampler1: wgpu::Sampler,
+    pairs: TextureGroupKey,
 }
 
 /// One recorded draw. Its uniforms live in `DrawBatch::data` at `ub_base`
@@ -952,13 +949,14 @@ impl DrawLayouts {
         let stages = uniform(1, std::mem::size_of::<StagesUniform>());
         let fog = uniform(2, std::mem::size_of::<FogUniform>());
         let alpha = uniform(3, std::mem::size_of::<AlphaTestUniform>());
+        let program = uniform(4, std::mem::size_of::<shader::Uniform>());
         let bgl_unlit = gpu.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("D3D8 unlit uniforms"),
             entries: &[transform, fog, alpha],
         });
         let bgl_textured = gpu.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("D3D8 textured uniforms"),
-            entries: &[transform, stages, fog, alpha],
+            entries: &[transform, stages, fog, alpha, program],
         });
         let tex = |binding: u32| wgpu::BindGroupLayoutEntry {
             binding,
@@ -978,7 +976,16 @@ impl DrawLayouts {
         };
         let bgl_stage_textures = gpu.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("D3D8 stage textures"),
-            entries: &[tex(0), samp(1), tex(2), samp(3)],
+            entries: &[
+                tex(0),
+                samp(1),
+                tex(2),
+                samp(3),
+                tex(4),
+                samp(5),
+                tex(6),
+                samp(7),
+            ],
         });
         let unlit = gpu.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("D3D8 unlit pipeline layout"),
@@ -1024,6 +1031,9 @@ struct DrawPipelineKey {
     color_write_mask: wgpu::ColorWrites,
     depth_format: Option<wgpu::TextureFormat>,
     fvf: u32,
+    vs: u32,
+    ps: u32,
+    stride: u64,
     textured: bool,
     z_enable: bool,
     z_write: bool,
@@ -1034,6 +1044,11 @@ struct DrawPipelineKey {
 }
 
 pub struct Device {
+    pub shaders: std::collections::HashMap<u32, (Option<Declaration>, Program)>,
+    pub vertex_shader: u32,
+    pub pixel_shader: u32,
+    pub shader_uniform: shader::Uniform,
+    programmable_modules: std::collections::HashMap<(u32, u32, u32), wgpu::ShaderModule>,
     shader: Option<wgpu::ShaderModule>,
     textured_shader: Option<wgpu::ShaderModule>,
     lit_shader: Option<wgpu::ShaderModule>,
@@ -1114,6 +1129,11 @@ impl Device {
         let draw_stats_enabled = std::env::var("RECOMP_D3D8_DRAW_STATS").as_deref() == Ok("1");
         stats::register_exit_report();
         Ok(Self {
+            shaders: Default::default(),
+            vertex_shader: 0,
+            pixel_shader: 0,
+            shader_uniform: Default::default(),
+            programmable_modules: Default::default(),
             shader: None,
             textured_shader: None,
             lit_shader: None,
@@ -1337,10 +1357,14 @@ impl Device {
             return Ok(());
         }
 
-        let existing_shape = self
-            .texture_cache
-            .resource(key)
-            .map(|c| (c.width, c.height, c.format, c.level_generations.len() as u32));
+        let existing_shape = self.texture_cache.resource(key).map(|c| {
+            (
+                c.width,
+                c.height,
+                c.format,
+                c.level_generations.len() as u32,
+            )
+        });
         let needs_new = existing_shape != Some((base_width, base_height, format, level_count));
 
         if needs_new {
@@ -1649,6 +1673,16 @@ impl Device {
         )
     }
 
+    /// Release device cache entries for a deleted shader. Already queued
+    /// draws retain cloned pipelines, so retirement does not alter them.
+    pub fn retire_shader(&mut self, handle: u32) {
+        self.shaders.remove(&handle);
+        self.programmable_modules
+            .retain(|&(vs, ps, _), _| vs != handle && ps != handle);
+        self.pipelines
+            .retain(|key, _| key.vs != handle && key.ps != handle);
+    }
+
     pub fn begin_scene(&mut self) -> Result<(), RenderError> {
         if self.scene {
             return Err(RenderError::new("BeginScene", "scene already open"));
@@ -1716,7 +1750,24 @@ impl Device {
                 return Err(error);
             }
         };
-        survey_or_skip!(self.state.validate_draw(fvf));
+        let bound_vs = self.shaders.get(&self.vertex_shader);
+        let fvf = if let Some((Some(d), p)) = bound_vs {
+            if p.declaration_only {
+                d.fixed_fvf()?
+            } else {
+                fvf
+            }
+        } else {
+            fvf
+        };
+        let vs = bound_vs.filter(|(_, p)| !p.declaration_only);
+        let ps = self.shaders.get(&self.pixel_shader).map(|s| &s.1);
+        let programmable = vs.is_some() || ps.is_some();
+        if vs.is_some() {
+            survey_or_skip!(self.state.validate_shader_draw());
+        } else {
+            survey_or_skip!(self.state.validate_draw(fvf));
+        }
         if topology == 1 {
             // wgpu's PointList is fixed at one pixel; only D3D8's default point
             // configuration is faithful (see `validate_point_draw`).
@@ -1732,7 +1783,14 @@ impl Device {
             }
             return Err(error);
         }
-        let layout = survey_or_skip!(FvfLayout::decode(fvf));
+        let mut layout = if let Some((Some(decl), _)) = vs {
+            decl.layout.clone()
+        } else {
+            survey_or_skip!(FvfLayout::decode(fvf))
+        };
+        if vs.is_some() && u64::from(vertices.stride) >= layout.stride {
+            layout.stride = u64::from(vertices.stride);
+        }
         if u64::from(vertices.stride) != layout.stride {
             let error = RenderError::new("SetStreamSource", "stride does not match FVF");
             if self.note_draw_rejection(&error, topology, fvf, vertices.stride) {
@@ -1753,17 +1811,36 @@ impl Device {
         // bound texture stays inactive and passes CURRENT through, preserving
         // the established untextured path. Stage >= 2 that is active fails by
         // name inside the resolver and is recorded by the survey.
-        let stage0 = survey_or_skip!(
-            self.state
-                .resolve_texture_stage(0, self.stage_textures[0].is_some())
-        );
-        let stage1 = survey_or_skip!(
-            self.state
-                .resolve_texture_stage(1, self.stage_textures[1].is_some())
-        );
-        let textured = stage0.active || stage1.active;
+        let inactive_sampler = DeviceState::new(1, 1).resolve_texture_stage(1, false)?;
+        let mut stages = Vec::new();
+        for stage in 0..4 {
+            let resolved = if let Some(ps) = ps {
+                if ps.samplers[stage] {
+                    survey_or_skip!(self.state.resolve_shader_sampler(stage))
+                } else {
+                    inactive_sampler
+                }
+            } else if stage < 2 && vs.is_some() {
+                survey_or_skip!(self.state.resolve_shader_fixed_pixel_stage(
+                    stage as u32,
+                    self.stage_textures[stage].is_some()
+                ))
+            } else if stage < 2 {
+                survey_or_skip!(
+                    self.state
+                        .resolve_texture_stage(stage as u32, self.stage_textures[stage].is_some())
+                )
+            } else {
+                inactive_sampler
+            };
+            stages.push(resolved);
+        }
+        let stage0 = stages[0];
+        let stage1 = stages[1];
+        let textured = programmable || stage0.active || stage1.active;
         if let Some(key) = self.targets.current {
-            for (stage, active) in [(0, stage0.active), (1, stage1.active)] {
+            for (stage, resolved) in stages.iter().enumerate() {
+                let active = resolved.active;
                 if active
                     && self.stage_textures[stage]
                         .as_ref()
@@ -1776,7 +1853,7 @@ impl Device {
                 }
             }
         }
-        if textured && !layout.attributes.iter().any(|a| a.shader_location == 2) {
+        if textured && vs.is_none() && !layout.attributes.iter().any(|a| a.shader_location == 2) {
             let error = RenderError::new(
                 "DrawPrimitive",
                 "an active texture stage requires D3DFVF_TEX1 texture coordinates",
@@ -1845,6 +1922,9 @@ impl Device {
                 & self.target.color_write_mask(),
             depth_format: self.target.depth.as_ref().map(|d| d.format),
             fvf,
+            vs: self.vertex_shader,
+            ps: self.pixel_shader,
+            stride: layout.stride,
             textured,
             z_enable: self.state.z_enable(),
             z_write: self.state.z_enable() && self.state.z_write_enable(),
@@ -1859,7 +1939,52 @@ impl Device {
         };
         // Resolve fog and alpha-test state before the shader borrow because
         // these methods read several state fields (a call borrows all of `self`).
-        let fog_uniform = self.fog_uniform();
+        let mut fog_uniform = self.fog_uniform();
+        if vs.is_some() && self.state.fog_table_mode() == 0 {
+            fog_uniform.vertex_fog = 1;
+        }
+        let mut program_uniform = self.shader_uniform;
+        for stage in 0..4 {
+            program_uniform.bump[stage] = std::array::from_fn(|i| {
+                f32::from_bits(
+                    self.state
+                        .texture_stage_state(stage as u32, 7 + i as u32)
+                        .unwrap_or(0),
+                )
+            });
+            program_uniform.lum[stage][0] = f32::from_bits(
+                self.state
+                    .texture_stage_state(stage as u32, 22)
+                    .unwrap_or(0),
+            );
+            program_uniform.lum[stage][1] = f32::from_bits(
+                self.state
+                    .texture_stage_state(stage as u32, 23)
+                    .unwrap_or(0),
+            );
+            program_uniform.lod[stage][0] = stages[stage].lod_bias;
+            if ps.is_some() && vs.is_none() && stages[stage].active {
+                let coord = self
+                    .state
+                    .texture_stage_state(stage as u32, 11)
+                    .unwrap_or(stage as u32);
+                let flags = self
+                    .state
+                    .texture_stage_state(stage as u32, 24)
+                    .unwrap_or(0);
+                if coord & !0xffff != 0 || flags != 0 {
+                    return Err(RenderError::new(
+                        "DrawPrimitive",
+                        "fixed-function vertex texgen/texture transforms with a pixel shader are unsupported",
+                    ));
+                }
+                program_uniform.lod[stage][1] = if coord < layout.texcoord_sets {
+                    coord as f32
+                } else {
+                    8.0
+                };
+            }
+        }
         let alpha_test_uniform = AlphaTestUniform::new(
             self.state.alpha_test_enable(),
             self.state.alpha_func().raw(),
@@ -1870,10 +1995,14 @@ impl Device {
         // start_vertex without touching unused guest vertices. The scratch is
         // moved out for the duration of the draw so the rest of this method can
         // borrow `self` mutably; it is restored below before it is reused.
-        let lit_input = match fvf {
-            0x0152 => Some(LitInput::XYZ_NORMAL_DIFFUSE_TEX1),
-            0x0112 => Some(LitInput::XYZ_NORMAL_TEX1),
-            _ => None,
+        let lit_input = if vs.is_some() {
+            None
+        } else {
+            match fvf {
+                0x0152 => Some(LitInput::XYZ_NORMAL_DIFFUSE_TEX1),
+                0x0112 => Some(LitInput::XYZ_NORMAL_TEX1),
+                _ => None,
+            }
         };
         let mut lit_scratch = lit_input.map(|_| std::mem::take(&mut self.lit_scratch));
         if let Some(out) = lit_scratch.as_mut() {
@@ -1908,7 +2037,21 @@ impl Device {
             gpu.push_error_scope(wgpu::ErrorFilter::Validation);
             self.frame_scope_open = true;
         }
-        let shader = if lit_input.is_some() {
+        let shader = if programmable {
+            self.programmable_modules
+                .entry((self.vertex_shader, self.pixel_shader, fvf))
+                .or_insert_with(|| {
+                    let source = shader::compose(
+                        vs.and_then(|(d, p)| d.as_ref().map(|d| (d, p))),
+                        ps,
+                        lit_input.is_some(),
+                    );
+                    gpu.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("D3D8 shader-model 1.1"),
+                        source: wgpu::ShaderSource::Wgsl(source.into()),
+                    })
+                })
+        } else if lit_input.is_some() {
             let slot = if textured {
                 &mut self.lit_textured_shader
             } else {
@@ -1981,6 +2124,11 @@ impl Device {
             let put = |region: &mut [u8], offset: u64, bytes: &[u8]| {
                 region[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
             };
+            put(
+                &mut ub,
+                DRAW_UB_PROGRAM,
+                bytemuck::bytes_of(&program_uniform),
+            );
             put(&mut ub, DRAW_UB_TRANSFORM, bytemuck::bytes_of(&uniform));
             put(&mut ub, DRAW_UB_FOG, bytemuck::bytes_of(&fog_uniform));
             put(
@@ -2065,38 +2213,21 @@ impl Device {
         });
         let pipeline = pipeline.clone();
         let textures = if textured {
-            let view0 = self.stage_textures[0]
-                .as_ref()
-                .map(|t| &t.view)
-                .unwrap_or(&self.white.view);
-            let view1 = self.stage_textures[1]
-                .as_ref()
-                .map(|t| &t.view)
-                .unwrap_or(&self.white.view);
-            // Clamp the mip LOD to the levels the chain actually has;
-            // an unwritten level must never be sampled.
-            let max_written0 = self.stage_textures[0]
-                .as_ref()
-                .map_or(0, |t| t.max_written_level);
-            let max_written1 = self.stage_textures[1]
-                .as_ref()
-                .map_or(0, |t| t.max_written_level);
-            let sampler0 = self
-                .samplers
-                .get_or_insert_with(SamplerKey::from_stage(&stage0, max_written0), || {
-                    gpu.create_sampler(&sampler_descriptor(&stage0, max_written0))
-                });
-            let sampler1 = self
-                .samplers
-                .get_or_insert_with(SamplerKey::from_stage(&stage1, max_written1), || {
-                    gpu.create_sampler(&sampler_descriptor(&stage1, max_written1))
-                });
-            Some(StageBindings {
-                view0: view0.clone(),
-                view1: view1.clone(),
-                sampler0,
-                sampler1,
-            })
+            let pairs = std::array::from_fn(|stage| {
+                let texture = if stages[stage].active {
+                    self.stage_textures[stage].as_ref()
+                } else {
+                    None
+                };
+                let view = texture.map(|t| &t.view).unwrap_or(&self.white.view).clone();
+                let max_written = texture.map_or(0, |t| t.max_written_level);
+                let sampler = self.samplers.get_or_insert_with(
+                    SamplerKey::from_stage(&stages[stage], max_written),
+                    || gpu.create_sampler(&sampler_descriptor(&stages[stage], max_written)),
+                );
+                (view, sampler)
+            });
+            Some(StageBindings { pairs })
         } else {
             None
         };
@@ -2165,6 +2296,7 @@ impl Device {
             let st = entry(1, std::mem::size_of::<StagesUniform>());
             let f = entry(2, std::mem::size_of::<FogUniform>());
             let a = entry(3, std::mem::size_of::<AlphaTestUniform>());
+            let p = entry(4, std::mem::size_of::<shader::Uniform>());
             if groups[0].is_none() {
                 groups[0] = Some(gpu.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("D3D8 unlit uniforms binding"),
@@ -2176,7 +2308,7 @@ impl Device {
                 groups[1] = Some(gpu.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("D3D8 textured uniforms binding"),
                     layout: &self.draw_layouts.bgl_textured,
-                    entries: &[t, st, f, a],
+                    entries: &[t, st, f, a, p],
                 }));
             }
         }
@@ -2227,6 +2359,7 @@ impl Device {
                     (base + DRAW_UB_STAGES) as u32,
                     (base + DRAW_UB_FOG) as u32,
                     (base + DRAW_UB_ALPHA_TEST) as u32,
+                    (base + DRAW_UB_PROGRAM) as u32,
                 ];
                 pass.set_pipeline(&d.pipeline);
                 // Binding order: transform, [stages], fog, alpha test.
@@ -2240,35 +2373,29 @@ impl Device {
                         // Groups already recorded in this pass stay alive in it.
                         texture_groups.clear();
                     }
-                    let texture_group = texture_groups
-                        .entry((
-                            t.view0.clone(),
-                            t.sampler0.clone(),
-                            t.view1.clone(),
-                            t.sampler1.clone(),
-                        ))
-                        .or_insert_with(|| {
+                    let texture_group =
+                        texture_groups.entry(t.pairs.clone()).or_insert_with(|| {
+                            let entries: Vec<_> = t
+                                .pairs
+                                .iter()
+                                .enumerate()
+                                .flat_map(|(stage, (view, sampler))| {
+                                    [
+                                        wgpu::BindGroupEntry {
+                                            binding: stage as u32 * 2,
+                                            resource: wgpu::BindingResource::TextureView(view),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: stage as u32 * 2 + 1,
+                                            resource: wgpu::BindingResource::Sampler(sampler),
+                                        },
+                                    ]
+                                })
+                                .collect();
                             gpu.create_bind_group(&wgpu::BindGroupDescriptor {
                                 label: Some("D3D8 stage textures binding"),
                                 layout: &self.draw_layouts.bgl_stage_textures,
-                                entries: &[
-                                    wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: wgpu::BindingResource::TextureView(&t.view0),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 1,
-                                        resource: wgpu::BindingResource::Sampler(&t.sampler0),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 2,
-                                        resource: wgpu::BindingResource::TextureView(&t.view1),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 3,
-                                        resource: wgpu::BindingResource::Sampler(&t.sampler1),
-                                    },
-                                ],
+                                entries: &entries,
                             })
                         });
                     pass.set_bind_group(1, &*texture_group, &[]);
@@ -2394,6 +2521,9 @@ impl Device {
             z_enable,
         )?;
         self.pipelines.clear();
+        self.vertex_shader = 0;
+        self.pixel_shader = 0;
+        self.shader_uniform = Default::default();
         self.stage_textures = std::array::from_fn(|_| None);
         self.texture_cache.clear();
         self.scratch_rgba.clear();
@@ -2669,7 +2799,10 @@ mod tests {
         assert!(topology_vertex_count(4, u32::MAX).is_err());
         for topology in [0, 2, 3, 5, 6, 7] {
             let err = topology_vertex_count(topology, 1).unwrap_err();
-            assert!(err.cause.contains("expected POINTLIST (1) or TRIANGLELIST (4)"));
+            assert!(
+                err.cause
+                    .contains("expected POINTLIST (1) or TRIANGLELIST (4)")
+            );
         }
     }
 
@@ -2879,7 +3012,7 @@ mod tests {
 
     #[test]
     fn z_bias_maps_d3d8_steps_to_a_viewer_side_constant() {
-        use super::{z_bias_state, ZBIAS_UNITS_PER_STEP};
+        use super::{ZBIAS_UNITS_PER_STEP, z_bias_state};
         assert_eq!(z_bias_state(0), wgpu::DepthBiasState::default());
         assert_eq!(
             z_bias_state(1),

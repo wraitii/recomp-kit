@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- D3D8/wgpu creates, binds, queries and deletes shader-model 1.1 programs,
+  translates stream-0 vertex declarations and arithmetic/texture instructions,
+  and snapshots shader constants and bump matrices per draw. Four samplers
+  support TEXBEM/TEXBEML dependent reads. Shader caps now enable the
+  programmable path; unsupported instruction families remain named failures.
+  See [shader coverage](graphics/d3d8-wgpu/SHADERS.md).
+
 - D3D8/wgpu `D3DTOP_BLENDDIFFUSEALPHA`, `BLENDTEXTUREALPHA`, `BLENDFACTORALPHA`
   and `BLENDCURRENTALPHA` blended with their operands swapped. D3D8 defines
   them as `Arg1 * alpha + Arg2 * (1 - alpha)` (Wine `mix(arg2, arg1, alpha)`);

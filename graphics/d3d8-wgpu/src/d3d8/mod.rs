@@ -19,3 +19,5 @@ pub mod state;
 pub mod stats;
 pub mod survey;
 pub mod texture_cache;
+
+pub mod shader;

@@ -24,7 +24,8 @@ use crate::d3d8::state::{Light, LitInput, Material, Viewport};
 /// 5: adds `IDirect3DDevice8::Reset` (implicit swap-chain recreation).
 /// 6: adds `IDirect3DDevice8::SetTexture` (level-0 upload + sampling).
 /// 7: `SetTexture` carries the whole mip chain (one generation per level).
-pub const ABI_VERSION: u32 = 7;
+/// 8: shader-model 1.1 programs, bindings and draw constant snapshots.
+pub const ABI_VERSION: u32 = 8;
 
 /// Opaque device handle. The bridge never inspects the pointee.
 pub struct D3d8Device {
@@ -1602,4 +1603,164 @@ mod tests {
         );
         assert!(err.message.starts_with(b"get_light_enable: null device"));
     }
+}
+
+/// Create a device-owned shader from bounded host token arrays. The caller
+/// retains its own bytecode for D3D8 Get*Function/Get*Declaration round trips.
+#[unsafe(no_mangle)]
+pub extern "C" fn d3d8_device_create_shader(
+    dev: *mut D3d8Device,
+    handle: u32,
+    pixel: u32,
+    decl: *const u32,
+    decl_count: u32,
+    words: *const u32,
+    word_count: u32,
+    err: *mut D3d8Error,
+) -> i32 {
+    let Some(device) = device_ref(dev) else {
+        write_error(
+            err,
+            D3d8Status::InvalidArgument,
+            "create_shader: null device",
+        );
+        return 1;
+    };
+    if (pixel == 0 && (decl.is_null() || decl_count == 0))
+        || (pixel != 0 && word_count == 0)
+        || (word_count != 0 && words.is_null())
+        || word_count > 4096
+        || decl_count > 4096
+        || (decl_count != 0 && decl.is_null())
+    {
+        write_error(
+            err,
+            D3d8Status::InvalidArgument,
+            "create_shader: invalid token array",
+        );
+        return 1;
+    }
+    // SAFETY: the caller supplies readable arrays for the indicated counts.
+    let words = if word_count == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(words, word_count as usize) }
+    };
+    let result = (|| {
+        let program = if words.is_empty() {
+            crate::d3d8::shader::Program {
+                pixel: false,
+                declaration_only: true,
+                body: String::new(),
+                samplers: [false; 4],
+            }
+        } else {
+            crate::d3d8::shader::Program::parse(words, pixel != 0)?
+        };
+        let declaration = if pixel == 0 {
+            Some(crate::d3d8::shader::Declaration::parse(unsafe {
+                core::slice::from_raw_parts(decl, decl_count as usize)
+            })?)
+        } else {
+            None
+        };
+        if program.declaration_only {
+            declaration.as_ref().unwrap().fixed_fvf()?;
+        }
+        device.shaders.insert(handle, (declaration, program));
+        Ok(())
+    })();
+    report(err, result)
+}
+
+/// Bind or delete a shader. Zero binds the fixed-function stage. Pending
+/// draws already retain their pipeline and uniform bytes independently.
+#[unsafe(no_mangle)]
+pub extern "C" fn d3d8_device_shader_action(
+    dev: *mut D3d8Device,
+    handle: u32,
+    pixel: u32,
+    delete: u32,
+    err: *mut D3d8Error,
+) -> i32 {
+    let Some(device) = device_ref(dev) else {
+        write_error(
+            err,
+            D3d8Status::InvalidArgument,
+            "shader_action: null device",
+        );
+        return 1;
+    };
+    if handle != 0
+        && !device
+            .shaders
+            .get(&handle)
+            .is_some_and(|(_, p)| p.pixel == (pixel != 0))
+    {
+        write_error(
+            err,
+            D3d8Status::InvalidArgument,
+            "shader_action: invalid shader handle",
+        );
+        return 1;
+    }
+    if delete != 0 {
+        device.retire_shader(handle);
+        if pixel != 0 && device.pixel_shader == handle {
+            device.pixel_shader = 0;
+        }
+        if pixel == 0 && device.vertex_shader == handle {
+            device.vertex_shader = 0;
+        }
+    } else {
+        if pixel != 0 {
+            device.pixel_shader = handle;
+        } else {
+            device.vertex_shader = handle;
+        }
+    }
+    report(err, Ok(()))
+}
+
+/// Copy constant bit patterns into the render state; each draw snapshots them.
+#[unsafe(no_mangle)]
+pub extern "C" fn d3d8_device_shader_constants(
+    dev: *mut D3d8Device,
+    pixel: u32,
+    reg: u32,
+    data: *const u32,
+    count: u32,
+    err: *mut D3d8Error,
+) -> i32 {
+    let Some(device) = device_ref(dev) else {
+        write_error(
+            err,
+            D3d8Status::InvalidArgument,
+            "shader_constants: null device",
+        );
+        return 1;
+    };
+    let bank: &mut [[f32; 4]] = if pixel != 0 {
+        &mut device.shader_uniform.pc
+    } else {
+        &mut device.shader_uniform.vc
+    };
+    if reg as usize > bank.len()
+        || count as usize > bank.len() - reg as usize
+        || (count != 0 && data.is_null())
+    {
+        write_error(
+            err,
+            D3d8Status::InvalidArgument,
+            "shader_constants: invalid range",
+        );
+        return 1;
+    }
+    for i in 0..count as usize {
+        for k in 0..4 {
+            // SAFETY: caller supplies count float4 values, bounded above.
+            bank[reg as usize + i][k] = f32::from_bits(unsafe { *data.add(i * 4 + k) });
+        }
+    }
+    report(err, Ok(()))
 }

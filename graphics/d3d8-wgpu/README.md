@@ -28,7 +28,7 @@ in Rust using checked arithmetic and D3D8's base-relative index interval. Direct
 vertex uploads borrow the bridge's bytes. Shaders and supported render pipelines
 are cached per device; uniforms and GPU vertex uploads remain per draw.
 
-ABI version 4 is generated from Rust with cbindgen 0.29.4. COM IIDs, slots and
+ABI version 8 (including programmable shaders) is generated from Rust with cbindgen 0.29.4. COM IIDs, slots and
 arities are generated from the pinned Wine header with a reviewed handler map.
 Normal CMake builds regenerate the header and COM tables under
 `build/d3d8-generated/`; generated code is not tracked. Install the header generator with
@@ -71,16 +71,15 @@ Unsupported operations must fail with a named diagnostic, never silently succeed
 
 - [Pinned D3D8 headers](../../third_party/wine-d3d8/README.md): unchanged Wine API references.
 
-Programmable shader translation is outside the current scope. Fixed-function
-WGSL generation remains part of the triangle milestone.
+Shader-model 1.1 token translation and declarations are implemented alongside
+the fixed-function stages. See [shader support and validation](SHADERS.md) for
+the supported instruction slice and remaining fidelity gaps.
 
 From the repository root:
 
 ```sh
-python3 tools/build.py --d3d8-wgpu test
-python3 tools/build.py --d3d8-wgpu check --all-targets
-python3 tools/build.py --d3d8-wgpu run --bin probe-headless
-python3 tools/build.py --d3d8-wgpu run --bin probe-windowed
+python3 tools/test.py --d3d8-wgpu test
+python3 tools/test.py --d3d8-wgpu probe
 ```
 
 The probes exit 0 only when every requested check passed, 1 for a pixel/report
@@ -117,8 +116,7 @@ The optional no-Rust kit profile retains CPU storage in C++ and advertises no
 renderer. Headless present completes the offscreen frame; the guest bridge
 reads it back and presents through the host display seam.
 
-Specular lighting, programmable
-shaders, other FVFs, line and triangle-strip/fan topologies and resource lock
+Specular lighting, other FVFs, line and triangle-strip/fan topologies and resource lock
 flags remain incomplete or unsupported. The light-index range is currently bounded to eight slots, an
 implementation limit that must not be confused with D3D8's active-light capacity.
 Guest COM execution, GPU probes and original-D3D8 comparisons are different
