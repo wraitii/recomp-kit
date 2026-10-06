@@ -567,6 +567,12 @@ fn source_level_bytes(
     width: u32,
     height: u32,
 ) -> Result<usize, RenderError> {
+    if format == crate::d3d8::format::D3DFMT_V8U8 {
+        return (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| RenderError::new("SetTexture", "level size overflow"));
+    }
     Ok(match color {
         Some(color) => (width as usize)
             .checked_mul(height as usize)
@@ -601,15 +607,18 @@ fn upload_texture_level(
             ),
         ));
     }
-    match color {
-        Some(color) => color.to_rgba8_into(&data[..expected], scratch),
-        None => crate::d3d8::format::decode_block_into(
-            format,
-            &data[..expected],
-            width,
-            height,
-            scratch,
-        )?,
+    let signed_bump = format == crate::d3d8::format::D3DFMT_V8U8;
+    if !signed_bump {
+        match color {
+            Some(color) => color.to_rgba8_into(&data[..expected], scratch),
+            None => crate::d3d8::format::decode_block_into(
+                format,
+                &data[..expected],
+                width,
+                height,
+                scratch,
+            )?,
+        }
     }
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
@@ -618,10 +627,14 @@ fn upload_texture_level(
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        scratch,
+        if signed_bump {
+            &data[..expected]
+        } else {
+            scratch
+        },
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(width * 4),
+            bytes_per_row: Some(width * if signed_bump { 2 } else { 4 }),
             rows_per_image: Some(height),
         },
         wgpu::Extent3d {
@@ -1226,7 +1239,8 @@ impl Device {
     /// The wgpu texture holds the whole chain with `mip_level_count = N`. Every
     /// level tracks its own content generation, so re-locking level N re-uploads
     /// only N, and a base-dimension change rebuilds the chain. Content is
-    /// converted to linear UNORM `Rgba8Unorm`; a block-compressed level decodes
+    /// converted to linear UNORM `Rgba8Unorm`, except V8U8 which retains its
+    /// signed bytes in `Rg8Snorm`; a block-compressed level decodes
     /// from its full block layout but keeps the clipped `width`/`height` (a 1x1
     /// DXT level still occupies one 4x4 block in the source).
     pub fn set_texture(
@@ -1256,9 +1270,11 @@ impl Device {
             ));
         }
         // Block-compressed levels are sized by their block layout; the rest by
-        // their per-texel layout. Both decode to the same RGBA upload shape.
+        // their per-texel layout. V8U8 uploads signed bytes directly; color
+        // and block-compressed formats decode to RGBA.
         let block = crate::d3d8::format::block_bytes(format);
-        let color = if block == 0 {
+        let signed_bump = format == crate::d3d8::format::D3DFMT_V8U8;
+        let color = if block == 0 && !signed_bump {
             Some(ColorFormat::from_d3dformat(format)?)
         } else {
             None
@@ -1297,18 +1313,27 @@ impl Device {
                     continue;
                 }
                 let mut rgba = Vec::new();
-                let decoded = match color {
-                    Some(color) => {
-                        color.to_rgba8_into(&l.data[..expected], &mut rgba);
-                        Ok(())
+                // PNG diagnostics visualize signed U,V biased to [0,255].
+                // The GPU upload retains the original signed bytes.
+                let decoded = if signed_bump {
+                    for uv in l.data[..expected].chunks_exact(2) {
+                        rgba.extend_from_slice(&[uv[0] ^ 0x80, uv[1] ^ 0x80, 0, 255]);
                     }
-                    None => crate::d3d8::format::decode_block_into(
-                        format,
-                        &l.data[..expected],
-                        l.width,
-                        l.height,
-                        &mut rgba,
-                    ),
+                    Ok(())
+                } else {
+                    match color {
+                        Some(color) => {
+                            color.to_rgba8_into(&l.data[..expected], &mut rgba);
+                            Ok(())
+                        }
+                        None => crate::d3d8::format::decode_block_into(
+                            format,
+                            &l.data[..expected],
+                            l.width,
+                            l.height,
+                            &mut rgba,
+                        ),
+                    }
                 };
                 if decoded.is_ok() {
                     crate::d3d8::dump::texture(
@@ -1383,7 +1408,11 @@ impl Device {
                 mip_level_count: level_count,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                format: if signed_bump {
+                    wgpu::TextureFormat::Rg8Snorm
+                } else {
+                    wgpu::TextureFormat::Rgba8Unorm
+                },
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });

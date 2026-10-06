@@ -37,7 +37,9 @@ bump state, preserving queued work across later state changes and deletion.
   **destination** stage's BUMPENVMAT00/01/10/11 state; TEXBEML also uses that
   stage's luminance scale/offset. Combiner and fixed vertex texgen/transform
   state do not affect programmable stages. Sampler filters/addressing/mip
-  limits/LOD bias still apply. Alpha test and fog remain raster operations.
+  limits/LOD bias still apply. V8U8 bump textures retain signed U,V bytes
+  through guest locks and mip uploads and sample as Rg8Snorm (B=0, A=1).
+  Alpha test and fog remain raster operations.
 
 The renderer advertises vs.1.1 / ps.1.1, 96 vertex constants,
 MaxPixelShaderValue=1.0 and four simultaneous textures. Its fixed-function
@@ -46,8 +48,8 @@ not a claim of complete shader-model conformance.
 
 Unsupported features include instruction coissue, texture matrix instruction
 families, point-size outputs, multistream/tessellator declarations, shader
-versions beyond 1.1, cube/volume textures and additional signed bump texture
-formats. A fixed-function VS combined with a PS currently requires an existing
+versions beyond 1.1, cube/volume textures and signed bump texture formats
+other than V8U8. A fixed-function VS combined with a PS currently requires an existing
 textured FVF and no texture transforms or generated texture coordinates. These
 combinations fail by name. Full original GPU precision and
 out-of-range arithmetic equivalence are unverified. Fixed-function D3D7 uses
@@ -75,7 +77,9 @@ truncated tokens, checks declaration layout and embedded END bit patterns, and
 performs GPU readback for independent queued pixel constant changes,
 declaration-local constants and a dependent stage-3 texture read with an
 off-diagonal bump matrix, independent fixed-function vertex/pixel shader
-selection and padded stream-stride pipeline caching. Guest COM fixture tests
+selection and padded stream-stride pipeline caching. Signed V8U8 tests cover positive,
+negative and zero offsets in both channels, mip selection and texture re-upload.
+Guest COM fixture tests
 cover shader handle ownership, binding/deletion, bytecode/declaration size
 queries and short-buffer behavior without a GPU. The existing headless probe checks fixed-function
 rendering after the binding-layout extension. These tests require GPU access;

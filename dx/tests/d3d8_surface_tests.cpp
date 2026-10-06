@@ -337,6 +337,25 @@ static void test_texture() {
     check(call_method(locked_tex, 2) == 0, "release the locked texture");
     check(heap_size(staged) == 0xffffffff, "destroying a locked level frees its staging block");
 
+    // Signed bump maps keep native U,V bytes in guest locks at every mip.
+    check(call_method(device2, 20, {128, 128, 5, 0, 60, 1, sc(0)}) == 0,
+          "CreateTexture V8U8 managed mip chain succeeds");
+    uint32_t bump = rd32(sc(0));
+    for (uint32_t level = 0; level < 5; ++level) {
+        uint32_t width = 128 >> level;
+        check(call_method(bump, 14, {level, sc(32)}) == 0 && rd32(sc(32)) == 60 &&
+                  rd32(sc(44)) == 1 && rd32(sc(48)) == width * width * 2 && rd32(sc(56)) == width,
+              "V8U8 descriptor preserves format and mip extent");
+        check(call_method(bump, 16, {level, sc(8), 0, 0}) == 0 && rd32(sc(8)) == width * 2,
+              "V8U8 LockRect uses two bytes per texel");
+        wr16(rd32(sc(12)), 0x7f80);
+        check(call_method(bump, 17, {level}) == 0, "unlock signed bump mip");
+        check(call_method(bump, 16, {level, sc(8), 0, 0}) == 0 && rd16(rd32(sc(12))) == 0x7f80,
+              "signed bump bytes survive unlock and relock");
+        call_method(bump, 17, {level});
+    }
+    call_method(bump, 2);
+
     // An unrepresentable format fails without fabricating a texture. DXT1 is
     // representable now (compressed texture support), so use an unknown
     // FourCC here.

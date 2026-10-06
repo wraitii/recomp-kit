@@ -847,6 +847,79 @@ mod gpu_tests {
             &pixels[(32 * 64 + 32) * 4..(32 * 64 + 32) * 4 + 4],
             &[0, 0, 255, 255]
         );
+        // Signed bump textures must retain negative U and V through upload,
+        // mip selection and re-upload. An unsigned conversion selects blue
+        // for negative bytes here instead of the expected red texel.
+        for (generation, uv, matrix, expected) in [
+            (1, [127u8, 0], 7, [0u8, 0, 255, 255]),
+            (2, [128u8, 0], 7, [255u8, 0, 0, 255]),
+            (3, [0u8, 127], 9, [0u8, 0, 255, 255]),
+            (4, [0u8, 129], 9, [255u8, 0, 0, 255]),
+            (5, [0u8, 0], 7, [255u8, 0, 0, 255]),
+        ] {
+            device.state.set_texture_stage_state(3, 7, 0).unwrap();
+            device.state.set_texture_stage_state(3, 9, 0).unwrap();
+            device
+                .state
+                .set_texture_stage_state(3, matrix, 0.45f32.to_bits())
+                .unwrap();
+            let base = [127u8, 127].repeat(4);
+            device
+                .set_texture(
+                    1,
+                    42,
+                    60,
+                    &[
+                        TextureLevelUpload {
+                            level: 0,
+                            generation,
+                            force_upload: false,
+                            width: 2,
+                            height: 2,
+                            data: &base,
+                        },
+                        TextureLevelUpload {
+                            level: 1,
+                            generation,
+                            force_upload: false,
+                            width: 1,
+                            height: 1,
+                            data: &uv,
+                        },
+                    ],
+                )
+                .unwrap();
+            device.state.set_texture_stage_state(1, 20, 1).unwrap(); // MAXMIPLEVEL
+            device.begin_scene().unwrap();
+            device.draw_primitive(4, 0x10000, &vertices, 0, 1).unwrap();
+            device.end_scene().unwrap();
+            let pixels = device.read_pixels().unwrap();
+            assert_eq!(
+                &pixels[(32 * 64 + 32) * 4..(32 * 64 + 32) * 4 + 4],
+                &expected
+            );
+        }
+        device.state.set_texture_stage_state(1, 20, 0).unwrap();
+        device.state.set_texture_stage_state(3, 7, 0).unwrap();
+        device
+            .state
+            .set_texture_stage_state(3, 9, 0.45f32.to_bits())
+            .unwrap();
+        device
+            .set_texture(
+                1,
+                2,
+                21,
+                &[TextureLevelUpload {
+                    level: 0,
+                    generation: 1,
+                    force_upload: false,
+                    width: 1,
+                    height: 1,
+                    data: &[0, 255, 0, 255],
+                }],
+            )
+            .unwrap();
         // Changing only the VS preserves the PS; TEXCOORDINDEX selects
         // the second FVF UV set for t3 instead of silently aliasing UV0.
         assert_eq!(d3d8_device_shader_action(raw, 0, 0, 0, &mut err), 0);

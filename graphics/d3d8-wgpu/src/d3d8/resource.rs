@@ -27,7 +27,7 @@ impl CpuStorage {
 pub fn format_bytes(format: u32) -> u32 {
     match format {
         21 | 22 | 31..=35 => 4,
-        23..=26 | 29 | 30 | 51 => 2,
+        23..=26 | 29 | 30 | 51 | 60 => 2,
         27 | 28 | 50 | 52 => 1,
         36 => 8,
         _ => 0,
@@ -551,6 +551,12 @@ mod tests {
         assert!(level_layout(u32::MAX, 1, 1, 0, 21).is_err());
         assert_eq!(format_bytes(41), 0); // P8 requires palette support.
         assert_eq!(format_bytes(36), 8);
+        assert_eq!(format_bytes(60), 2);
+        let bump = level_layout(128, 128, 5, 4, 60).unwrap();
+        assert_eq!(
+            (bump.width, bump.height, bump.pitch, bump.size),
+            (8, 8, 16, 128)
+        );
     }
     #[test]
     fn borrowed_vertices_keep_original_storage_and_trailing_bytes() {

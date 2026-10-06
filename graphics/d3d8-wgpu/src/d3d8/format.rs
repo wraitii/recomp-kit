@@ -36,6 +36,10 @@ pub const D3DFMT_R5G6B5: u32 = 23;
 pub const D3DFMT_A1R5G5B5: u32 = 25;
 /// `D3DFMT_A4R4G4B4` from `d3d8types.h`.
 pub const D3DFMT_A4R4G4B4: u32 = 26;
+/// Signed bump offsets: little-endian U,V bytes, sampled as R,G in [-1,1].
+/// Microsoft maps D3DFMT_V8U8 to R8G8_SNORM; missing B,A sample as 0,1.
+/// https://learn.microsoft.com/en-us/windows/uwp/gaming/feature-mapping
+pub const D3DFMT_V8U8: u32 = 60;
 
 /// Byte order produced by [`d3dcolor_to_rgba8`] and by readback.
 pub const READBACK_ORDER: &str = "RGBA8 (R,G,B,A), tightly packed, row-major";

@@ -67,7 +67,8 @@ constexpr uint32_t D8_AVAILABLE_TEXTURE_MEM = 384u * 1024u * 1024u;
 // D3D8 texel pitch unit: a R5G6B5 level of width w has pitch 2*w, and the
 // bytes the guest reads and writes through LockRect are in that native
 // layout. The host renderer samples the 32-bit ARGB formats and the packed
-// 16-bit R5G6B5/A1R5G5B5/A4R4G4B4 formats; a level in any other format is
+// 16-bit R5G6B5/A1R5G5B5/A4R4G4B4 and signed V8U8 formats; a level in
+// any other format is
 // still an honest CPU texture and is refused by name when something tries to
 // give it to the device.
 //
@@ -87,6 +88,7 @@ uint32_t d8_format_bytes(uint32_t fmt) {
     case 26: // A4R4G4B4
     case 29: // A8R3G3B2
     case 30: // X4R4G4B4
+    case 60: // V8U8: signed U then V bytes
     case 51: // A8L8
         return 2;
     case 27: // R3G3B2

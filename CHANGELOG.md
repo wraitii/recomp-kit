@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- D3D8 textures support `D3DFMT_V8U8` signed bump offsets. Guest locks keep
+  native two-byte texels and mip pitches; the renderer uploads Rg8Snorm so
+  TEXBEM reads negative U,V correctly. This fixes texture creation failures
+  for games using signed water bump maps. PNG dumps bias U,V for visualization.
+
 - D3D8/wgpu creates, binds, queries and deletes shader-model 1.1 programs,
   translates stream-0 vertex declarations and arithmetic/texture instructions,
   and snapshots shader constants and bump matrices per draw. Four samplers
