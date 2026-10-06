@@ -1,0 +1,264 @@
+"""Scalar x87 regions with exact state at the existing observation boundaries.
+
+Slots are named relative to a captured entry TOP. Push/pop/copy change this
+compile-time mapping, not the physical CPU array. Values, exact-integer shadows,
+tags and popped residue are written back before accesses, edges and opaque
+effects. Only CW/SW helpers use a private nonescaping X86 context; no helper
+receives it unless its recipe accesses those two fields exclusively.
+
+This is an instruction-derived representation change, not dead-state removal,
+memory forwarding, a native call ABI or a floating-point approximation.
+
+DIVERGENCE(original): [ssa-x87-scalar] performance mode publishes at stores,
+control-flow edges, opaque effects and exits. Ordinary interior load faults may
+see the preceding published x87 state, within the agreed performance-mode
+contract. observe_loads=True keeps pre-load publication for comparison.
+
+DIVERGENCE(original): [ssa-x87-binary32] common PC=00 arithmetic with proven
+binary32 operands uses the documented float exponent-range policy. Other
+precision settings and unproven operands retain the audited double helpers.
+No reassociation, contraction or division approximation is introduced.
+"""
+from dataclasses import dataclass, field
+from typing import Optional
+
+from . import x87
+
+
+@dataclass
+class Slot:
+    value: Optional[str] = None
+    bits: Optional[str] = None
+    exact: Optional[str] = None
+    tag: Optional[str] = None
+    narrow: bool = False  # Proven binary32 when PC=00, not an incoming-state guess.
+    dirty: set = field(default_factory=set)
+
+
+class X87Scalar:
+    """Track all eight physical residues within a single-entry linear region."""
+
+    def __init__(self, observe_loads=False):
+        self.serial = 0
+        self.temps = []
+        self.observe_loads = observe_loads
+        self.binary32 = True
+        self.reset()
+
+    def declarations(self):
+        return ["X86 x87_env_;", "uint32_t x87_top_;"]
+
+    def reset(self):
+        self.active = False
+        self.top = 0
+        self.top_dirty = False
+        self.status_dirty = False
+        self.slots = {}
+
+    def _activate(self, lines):
+        if not self.active:
+            lines.extend(["x87_top_ = c->fpu_top;",
+                          "x87_env_.fpu_cw = c->fpu_cw;",
+                          "x87_env_.fpu_sw = c->fpu_sw;"])
+            self.active = True
+
+    def _temp(self, expr, lines, ctype="double"):
+        name = "x87s%d" % self.serial
+        self.serial += 1
+        self.temps.append("%s %s;" % (ctype, name))
+        lines.append("%s = %s;" % (name, expr))
+        return name
+
+    def _phys(self, offset):
+        return "(x87_top_ + %du) & 7u" % offset
+
+    def _slot(self, logical=0):
+        offset = (self.top + logical) & 7
+        return offset, self.slots.setdefault(offset, Slot())
+
+    def _read(self, logical, part, lines):
+        offset, slot = self._slot(logical)
+        if getattr(slot, part) is None:
+            phys = self._phys(offset)
+            expr = ("ftag_of(c, %s)" % phys if part == "tag" else
+                    "c->%s[%s]" % ({"value": "st", "bits": "st_bits",
+                                    "exact": "st_exact"}[part], phys))
+            ctype = {"value": "double", "bits": "uint64_t",
+                     "exact": "uint8_t", "tag": "unsigned"}[part]
+            setattr(slot, part, self._temp(expr, lines, ctype))
+        return getattr(slot, part)
+
+    def _assign(self, logical, narrow=None, **parts):
+        _, slot = self._slot(logical)
+        if narrow is not None:
+            slot.narrow = narrow
+        for part, expr in parts.items():
+            setattr(slot, part, expr)
+            slot.dirty.add(part)
+
+    def _set(self, logical, expr, lines, bits="0", exact="0", tag=None, narrow=False):
+        value = self._temp(expr, lines)
+        self._assign(logical, value=value, bits=bits, exact=exact,
+                     tag=tag or "ftag_classify(%s)" % value, narrow=narrow)
+
+    def _move_top(self, delta):
+        self.top = (self.top + delta) & 7
+        self.top_dirty = True
+
+    def _drop(self):
+        # Preserve both value and integer shadow in the popped physical slot.
+        self._assign(0, exact="0", tag="FTAG_EMPTY")
+        self._move_top(1)
+
+    def flush(self):
+        """Publish only changed components; retain scalar knowledge afterward."""
+        if not self.active:
+            return []
+        lines, tags = [], []
+        for offset, slot in sorted(self.slots.items()):
+            phys = self._phys(offset)
+            for part, array in (("value", "st"), ("bits", "st_bits"),
+                                ("exact", "st_exact")):
+                if part in slot.dirty:
+                    lines.append("c->%s[%s] = %s;" % (array, phys, getattr(slot, part)))
+            if "tag" in slot.dirty:
+                tags.append((phys, slot.tag))
+            slot.dirty.clear()
+        if tags:
+            masks = " | ".join("(3u << (2u * (%s)))" % phys for phys, _ in tags)
+            values = " | ".join("((%s) << (2u * (%s)))" % (tag, phys) for phys, tag in tags)
+            lines.append("c->fpu_tag = (uint16_t)((c->fpu_tag & ~(%s)) | %s);" % (masks, values))
+        if self.top_dirty:
+            lines.append("c->fpu_top = (%s);" % self._phys(self.top))
+            self.top_dirty = False
+        if self.status_dirty:
+            lines.append("c->fpu_sw = x87_env_.fpu_sw;")
+            self.status_dirty = False
+        return lines
+
+    def statements(self, data, address=None, result=None):
+        """Lower common audited effects; materialize before other runtime recipes."""
+        m, operands = data["mnem"], data["operands"]
+        memory = [size for kind, size in operands if kind == "mem"]
+        slots = [index for kind, index in operands if kind == "st"]
+        bits = memory[0] * 8 if memory else 0
+        lines = []
+        self._activate(lines)
+        # Strict mode keeps every pre-access snapshot. Both modes publish
+        # before stores; performance mode defers across ordinary reads.
+        if address is not None and (self.observe_loads or m in
+                ("FST", "FSTP", "FIST", "FISTP", "FNSTSW", "FNSTCW")):
+            lines.extend(self.flush())
+
+        def read(index):
+            return self._read(index, "value", lines)
+
+        def mem(integer=False):
+            expr = ("(int%d_t)rd%d((uint32_t)%s)" % (bits, bits, address) if integer else
+                    "rdf%d((uint32_t)%s)" % (bits, address))
+            return self._temp(expr, lines, "int64_t" if integer else "double")
+
+        if m in x87.CONSTANTS and not operands:
+            self._move_top(-1)
+            self._set(0, x87.CONSTANTS[m], lines, narrow=m in ("FLD1", "FLDZ"))
+        elif m == "FLD":
+            if slots:
+                # Capture all source components before TOP moves (FLD ST7).
+                parts = {part: self._read(slots[0], part, lines)
+                         for part in ("value", "bits", "exact", "tag")}
+                narrow = self._slot(slots[0])[1].narrow
+                self._move_top(-1)
+                self._assign(0, narrow=narrow, **parts)
+            else:
+                value = mem()
+                self._move_top(-1)
+                self._set(0, value, lines, narrow=bits == 32)
+        elif m == "FILD":
+            value = mem(True)
+            self._move_top(-1)
+            self._set(0, "(double)%s" % value, lines, bits="(uint64_t)%s" % value, exact="1")
+        elif m in ("FST", "FSTP"):
+            if slots:
+                if slots[0]:
+                    parts = {part: self._read(0, part, lines)
+                             for part in ("value", "bits", "exact", "tag")}
+                    self._assign(slots[0], narrow=self._slot(0)[1].narrow, **parts)
+            else:
+                value = read(0)
+                if bits == 32:
+                    value = "fto_float(&x87_env_, %s)" % value
+                lines.append("wrf%d((uint32_t)%s, %s);" % (bits, address, value))
+            if m == "FSTP":
+                self._drop()
+        elif m in x87.ARITH or m in x87.INTEGER_ARITH or (m.endswith("P") and m[:-1] in x87.ARITH):
+            pop = m.endswith("P")
+            base = m[:-1] if pop else m
+            integer = base in x87.INTEGER_ARITH
+            operator = (x87.INTEGER_ARITH if integer else x87.ARITH)[base]
+            if memory:
+                rhs = mem(integer)
+                dst, lhs = 0, read(0)
+                narrow = self._slot(0)[1].narrow and not integer and bits == 32
+            elif slots:
+                dst = slots[0] if len(slots) == 2 or pop else 0
+                src = slots[1] if len(slots) == 2 else (0 if pop else slots[0])
+                lhs, rhs = read(dst), read(src)
+                narrow = self._slot(dst)[1].narrow and self._slot(src)[1].narrow
+            else:
+                dst, lhs, rhs = 1, read(1), read(0)
+                narrow = self._slot(1)[1].narrow and self._slot(0)[1].narrow
+            if base.endswith("R"):
+                lhs, rhs = rhs, lhs
+            value = ("fdivz(&x87_env_, %s, %s)" % (lhs, rhs) if operator == "/" else
+                     "%s %s %s" % (lhs, operator, rhs))
+            value = "fx87(&x87_env_, %s)" % value
+            if narrow and operator in ("+", "-", "*") and not self.observe_loads and self.binary32:
+                value = ("((x87_env_.fpu_cw & 0x300u) == 0u ? "
+                         "fx87_exact(&x87_env_, (double)((float)(%s) %s (float)(%s))) : %s)" %
+                         (lhs, operator, rhs, value))
+            self._set(dst, value, lines, narrow=True)
+            self.status_dirty = True
+            if pop:
+                self._drop()
+        elif m in ("FCOM", "FCOMP", "FUCOM", "FUCOMP", "FICOM", "FICOMP", "FCOMPP", "FUCOMPP", "FTST"):
+            other = (mem(m.startswith("FI")) if memory else
+                     "0.0" if m == "FTST" else read(slots[-1] if slots else 1))
+            lines.append("%s(&x87_env_, %s, %s);" %
+                         ("fucom" if m.startswith("FU") else "fcom", read(0), other))
+            self.status_dirty = True
+            for _ in range(2 if m.endswith("PP") else int(m.endswith("P"))):
+                self._drop()
+        elif m in x87.UNARY:
+            narrow = self._slot(0)[1].narrow if m in ("FABS", "FCHS") else m == "FSQRT"
+            self._set(0, (x87.UNARY[m] % read(0)).replace("(c,", "(&x87_env_,"), lines, narrow=narrow)
+            self.status_dirty = True
+        elif m in ("FPREM", "FPREM1"):
+            self._set(0, "fprem_common(&x87_env_, %s, %s, %d)" %
+                      (read(0), read(1), int(m == "FPREM1")), lines)
+            self.status_dirty = True
+        elif m == "FXCH":
+            other = slots[-1] if slots else 1
+            a = {part: self._read(0, part, lines) for part in ("value", "bits", "exact", "tag")}
+            b = {part: self._read(other, part, lines) for part in a}
+            a_narrow, b_narrow = self._slot(0)[1].narrow, self._slot(other)[1].narrow
+            self._assign(0, narrow=b_narrow, **b)
+            self._assign(other, narrow=a_narrow, **a)
+        elif m == "FNSTSW" and operands == (("ax", 0),):
+            lines.append("%s = (uint16_t)((x87_env_.fpu_sw & (uint16_t)~0x3800u) | ((%s) << 11));" %
+                         (result, self._phys(self.top)))
+        elif m in ("FNCLEX", "FCLEX"):
+            lines.append("x87_env_.fpu_sw &= (uint16_t)~0x80ffu;")
+            self.status_dirty = True
+        elif m in ("FDECSTP", "FINCSTP"):
+            self._move_top(-1 if m == "FDECSTP" else 1)
+            lines.append("x87_env_.fpu_sw &= (uint16_t)~0x0200u;")
+            self.status_dirty = True
+        elif m == "FNOP":
+            pass
+        else:
+            # State-reading helpers (FXAM/FIST/FINIT/CW changes) remain audited
+            # runtime effects. Afterward no scalar or environment fact survives.
+            lines.extend(self.flush())
+            lines.extend(x87.statements(data, address, result))
+            self.reset()
+        return lines

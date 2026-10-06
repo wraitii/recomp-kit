@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include "fixtures.h"
+#define FIXTURE_MODES (sizeof functions[0] / sizeof functions[0][0])
 #ifdef RK_MEMORY_TEST
 #include "access.h"
 #else
@@ -20,10 +21,14 @@ uint8_t *g_mem;
 uint32_t g_watch_base, g_watch_len, g_dirty_count, g_store_hook;
 RecompDirty g_dirty[RECOMP_DIRTY_SLOTS];
 void recomp_watch_hit(uint32_t a, uint32_t n, uint64_t v) {
+#ifdef FIXTURE_WATCH_HIT
+    FIXTURE_WATCH_HIT(a, n, v);
+#else
     (void)a;
     (void)n;
     (void)v;
     abort();
+#endif
 }
 
 #ifndef FIXTURE_MEMORY_SIZE
@@ -111,7 +116,7 @@ static void discard_empty_contents(X86 *c) {
 static int compare(void) {
     const unsigned cases = sizeof functions / sizeof *functions;
     for (unsigned f = 0; f < cases; ++f) {
-        unsigned differences[4] = {0}, memory_differences = 0;
+        unsigned differences[FIXTURE_MODES] = {0}, memory_differences = 0;
         unsigned relaxed_by_pc[4] = {0}, finite_differences = 0;
         for (unsigned n = 0; n < 24576; ++n) {
             X86 initial, expected;
@@ -125,7 +130,7 @@ static int compare(void) {
             rk_memory_end(0);
             FIXTURE_AFTER_STATE(0, &expected);
             memcpy(output, g_mem + 0x10000, sizeof output);
-            for (unsigned mode = 1; mode < 4; ++mode) {
+            for (unsigned mode = 1; mode < FIXTURE_MODES; ++mode) {
                 X86 actual = initial, reference = expected;
                 memcpy(g_mem + 0x10000, input, sizeof input);
                 FIXTURE_BEFORE(mode);
@@ -140,7 +145,7 @@ static int compare(void) {
                 }
                 int different = mem_diff || memcmp(&actual, &reference, sizeof actual);
                 differences[mode] += !!different;
-                if (mode == 3) {
+                if (mode == FIXTURE_MODES - 1) {
                     memory_differences += mem_diff;
                     relaxed_by_pc[(initial.fpu_cw >> 8) & 3] += !!different;
                     if ((n / 128) % 3 == 1)
@@ -161,11 +166,12 @@ static int compare(void) {
                 }
             }
         }
-        printf("CHECK %s 24576 inputs: %s=%u %s=%u %s=%u (last variant memory=%u; "
-               "PC00/01/10/11=%u/%u/%u/%u) differences\n",
-               case_names[f], mode_names[1], differences[1], mode_names[2], differences[2],
-               mode_names[3], differences[3], memory_differences, relaxed_by_pc[0],
-               relaxed_by_pc[1], relaxed_by_pc[2], relaxed_by_pc[3]);
+        printf("CHECK %s 24576 inputs:", case_names[f]);
+        for (unsigned mode = 1; mode < FIXTURE_MODES; ++mode)
+            printf(" %s=%u", mode_names[mode], differences[mode]);
+        printf(" (last variant memory=%u; PC00/01/10/11=%u/%u/%u/%u) differences\n",
+               memory_differences, relaxed_by_pc[0], relaxed_by_pc[1], relaxed_by_pc[2],
+               relaxed_by_pc[3]);
         rk_memory_report(case_names[f]);
         if (!FIXTURE_CUSTOM_INPUTS)
             printf("FINITE %s last variant differences=%u/8192 ordinary finite inputs\n",
@@ -228,10 +234,10 @@ static void benchmark(void) {
     const unsigned iterations = 1000000, trials = 9;
     for (unsigned f = 0; f < sizeof functions / sizeof *functions; ++f) {
         for (unsigned pc = 0; pc <= 2; pc += 2) {
-            double samples[4][9];
+            double samples[FIXTURE_MODES][9];
             for (unsigned trial = 0; trial < trials; ++trial) {
-                for (unsigned k = 0; k < 4; ++k) {
-                    unsigned mode = (k + trial) % 4;
+                for (unsigned k = 0; k < FIXTURE_MODES; ++k) {
+                    unsigned mode = (k + trial) % FIXTURE_MODES;
                     X86 c;
                     setup(&c, 0);
                     c.fpu_cw = 0x7f | (pc << 8);
@@ -256,7 +262,7 @@ static void benchmark(void) {
                         abort();
                 }
             }
-            for (unsigned mode = 0; mode < 4; ++mode) {
+            for (unsigned mode = 0; mode < FIXTURE_MODES; ++mode) {
                 qsort(samples[mode], trials, sizeof(double), order_double);
                 printf("BENCH %s PC=%u %s median=%.3f min=%.3f max=%.3f ns/fragment\n",
                        case_names[f], pc, mode_names[mode], samples[mode][trials / 2],

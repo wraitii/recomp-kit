@@ -97,3 +97,23 @@ def test_fixture_mismatch_fails_before_compilation(tmp_path):
     (tmp_path / 'build').mkdir()
     with pytest.raises(ValueError, match='explicit mapped-native'):
         run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1)
+
+
+def test_ir_ssa_x87_mode_is_validated_before_any_game_work(tmp_path):
+    import json
+    from corpus.run import run_corpus
+    p = tmp_path / 'manifest.json'
+    p.write_text(json.dumps({'contract': 'mapped-native-corpus-v1', 'functions': []}))
+    (tmp_path / 'build').mkdir()
+    with pytest.raises(ValueError, match='x87 mode must be'):
+        run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1,
+                   ir_ssa=True, ir_ssa_x87='bogus')
+    with pytest.raises(ValueError, match='requires IR SSA'):
+        run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1,
+                   ir_ssa=False, ir_ssa_x87='values')
+    with pytest.raises(ValueError, match='requires IR SSA'):
+        run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1,
+                   ir_ssa=False, ir_ssa_state='locals')
+    with pytest.raises(ValueError, match='state policy must be'):
+        run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1,
+                   ir_ssa=True, ir_ssa_state='bogus')

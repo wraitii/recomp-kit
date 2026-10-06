@@ -1827,6 +1827,7 @@ def _rebase_image(base=0x00100000, size=0x3000, delta=0x100000):
     img.delta = delta
     img.reloc_dir = (0x1000, 10)
     img.iat_names = {0x00001234: "SymInitialize"}
+    img.iat_dlls = {0x00001234: "dbghelp.dll"}
     data = bytearray(size)
     data[0x1000:0x1004] = struct.pack("<I", 0x2000)   # page RVA
     data[0x1004:0x1008] = struct.pack("<I", 10)       # block size: header + one entry
@@ -1844,6 +1845,7 @@ def test_apply_relocations_shifts_highlow_sites_and_import_slots():
     img.apply_relocations()
     assert struct.unpack("<I", img.data[0x2004:0x2008])[0] == 0x00101234
     assert img.iat_names == {0x00101234: "SymInitialize"}
+    assert img.iat_dlls == {0x00101234: "dbghelp.dll"}
 
 
 def test_apply_relocations_is_a_no_op_at_the_preferred_base():

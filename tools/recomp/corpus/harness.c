@@ -21,6 +21,26 @@ static void fail(unsigned row, unsigned input, unsigned mode, const char *reason
     fprintf(stderr, "%s input %u mode %u: %s\n", corpus_names[row], input, mode, reason);
     exit(1);
 }
+/* First differing CPU bytes and scratch bytes on a translation mismatch. This
+ * is a diagnostic only; the checks themselves remain full memcmp. */
+static void report_diff(const X86 *a, const X86 *b, const uint8_t *want, unsigned row) {
+    const unsigned char *pa = (const unsigned char *)a, *pb = (const unsigned char *)b;
+    unsigned shown = 0;
+    for (size_t i = 0; i < sizeof *a && shown < 8; ++i) {
+        if (pa[i] != pb[i]) {
+            fprintf(stderr, "  cpu+0x%03zx: eager=%02x actual=%02x\n", i, pa[i], pb[i]);
+            ++shown;
+        }
+    }
+    (void)row;
+    for (size_t i = 0; i < CORPUS_SCRATCH_SIZE && shown < 16; ++i) {
+        if (want[i] != g_mem[CORPUS_SCRATCH + i]) {
+            fprintf(stderr, "  scratch+0x%03zx: eager=%02x actual=%02x\n", i, want[i],
+                    g_mem[CORPUS_SCRATCH + i]);
+            ++shown;
+        }
+    }
+}
 static void validate(unsigned count) {
     uint8_t expected[CORPUS_SCRATCH_SIZE];
     for (unsigned row = 0; row < CORPUS_COUNT; ++row) {
@@ -38,6 +58,7 @@ static void validate(unsigned count) {
                         fail(row, input, mode, "native observable result mismatch");
                 } else if (memcmp(&eager, &actual, sizeof actual) ||
                            memcmp(expected, g_mem + CORPUS_SCRATCH, sizeof expected)) {
+                    report_diff(&eager, &actual, expected, row);
                     fail(row, input, mode, "translated full CPU/memory mismatch");
                 }
             }

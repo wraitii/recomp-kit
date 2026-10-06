@@ -1158,6 +1158,7 @@ class Image(object):
         #: so that what a compiler put after a throw, such as a switch table,
         #: is not decoded as code.
         self.iat_names = {}
+        self.iat_dlls = {}
         try:
             pe.parse_data_directories(directories=[
                 pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
@@ -1165,6 +1166,7 @@ class Image(object):
                 for imp in entry.imports:
                     if imp.name:
                         self.iat_names[imp.address] = imp.name.decode("ascii", "replace")
+                        self.iat_dlls[imp.address] = entry.dll.decode("ascii", "replace").lower()
         except Exception:                 # a malformed table only loses names
             pass
         pe.close()
@@ -1236,6 +1238,7 @@ class Image(object):
         # pefile reports import slot addresses at the preferred base; the
         # listing and the relocated bytes use the configured one.
         self.iat_names = {addr + delta: name for addr, name in self.iat_names.items()}
+        self.iat_dlls = {addr + delta: name for addr, name in self.iat_dlls.items()}
 
     def relocated_pointers(self):
         """Every address named by a dword the loader rewrites, and where.
@@ -4580,6 +4583,9 @@ def main():
                          "game (tools/lazy_static.py).")
     ap.add_argument("--module", default=None, metavar="KEY",
                     help="translate the auxiliary module [modules.aux.KEY] instead of the executable")
+    ap.add_argument("--ir-census", default=None, metavar="FILE",
+                    help="infer every function's calling convention from SLEIGH p-code "
+                         "and write the census as JSON (tools/recomp/ir)")
     args = ap.parse_args()
     if (args.llvm_compare or args.llvm_sweep) and any((args.only is not None, args.eager_flags, args.check_flags,
                                   args.allow_unmodelled, args.allow_table_gaps, args.forget,
@@ -5848,6 +5854,12 @@ def main():
     entries_by_fn = defaultdict(set)
     for t, fn in extra.items():
         entries_by_fn[fn.addr].add(t)
+
+    if args.ir_census:
+        from ir.census import run_census
+        failed = {a for a, _ in failures}
+        run_census(tr, [fn for fn in parsed if fn.addr not in failed], args.ir_census,
+                   entries_by_fn, quiet=args.quiet)
 
     bodies = {}
     for fn in parsed:

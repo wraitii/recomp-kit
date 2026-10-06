@@ -221,6 +221,40 @@
 ||||||| parent of aa07dfe (Allow reviewed direct callees in function corpus)
 ||||||| parent of ab04cac (Add opt-in decoded x87 dataflow lowering)
 ||||||| parent of 2980029 (Add bounded decoded flag dataflow and rounded stack forwarding)
+||||||| parent of 5ddde93 (Add experimental SSA corpus with scalar x87 and local CPU state)
+- Add opt-in SSA `scalar`/`scalar-strict` x87 corpus modes: scalar stack values,
+  exact-integer shadows and residues, a local control/status environment, and
+  proven binary32 arithmetic with a general precision path. Optional
+  `--corpus-ir-ssa-state locals` defers ordinary-read register/flag snapshots;
+  stores, calls, division and returns retain complete required state. Null-check
+  builds select strict publication. The native suite compares six SSA variants
+  against eager C in ordinary and null-check builds. Production emission remains
+  unchanged.
+
+- Add integer p-code SSA and experimental `--corpus-ir-ssa` C emission in the
+  mapped function corpus's combined variant. Byte lanes preserve register
+  aliases; phi edges use parallel copies and memory accesses remain ordered.
+  Unsupported functions retain the existing emitter with reported reasons.
+  Explicitly bound direct calls publish/reload tracked state; production
+  dispatch integration remains unsupported. Audited x87
+  forms use ordered effects with original-byte operand validation and the
+  runtime's rounding/status/tag/exact-integer helpers; raw FLOAT p-code remains
+  unsupported. Additional integer forms include MOVSX/MOVZX, register XCHG,
+  NOT, LEAVE, register-destination ADC and corrected memory RMW arithmetic.
+  Integer emission includes register INC/DEC/SUB/SBB with AF corrections,
+  SHL/SHR using the runtime's flag recipes, checked DIV32/IDIV32, CDQ, IMUL,
+  SETcc, register NEG/SAR, and explicit absolute-memory normalization.
+  Wider register phis and changed-field CPU publication reduce executed
+  bookkeeping while retaining memory observations and conservative DIV32
+  invalidation. Bounded x87 value reuse and observation-aware arithmetic
+  publication are selectable corpus modes. `--ir-ssa-checks` compares native
+  synthetic fixtures in full state, including CPU snapshots at every store.
+
+- Add experimental `translate.py --ir-census FILE`: SLEIGH instruction lifting
+  and whole-image calling-convention summaries, including aligned frames,
+  tail-target fallback and runtime import cleanup metadata. This analysis
+  does not change generated code. See `docs/ir.md` for assumptions and gaps.
+
 - Add opt-in `[translate] decoded_dataflow = true` (requires `cpu_locals` and
   `x87_dataflow`): bounded decoded flag analysis crosses ordinary loads and
   audited x87 instructions, retaining all outgoing flags and opaque call state.

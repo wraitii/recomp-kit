@@ -107,6 +107,25 @@ guest-state adapters from direct typed native kernels. See
 contracts and the consolidated fragment/LLVM modes. Game assembly and outputs
 remain private; these checks do not establish original-x86 equivalence.
 
+`tools/build.py --ir-ssa-checks` compares the experimental integer SSA C emitter
+with eager C using 142 byte-backed synthetic fixtures, 24576 inputs each,
+and complete CPU/2 KiB scratch comparisons. It covers partial registers, loops,
+memory aliases, INC/DEC/SBB/ADC, memory RMW snapshots, extensions, masked shifts,
+checked signed/unsigned division, multiplication, all SETcc conditions, absolute
+memory accesses and declared calls with both mock and byte-translated callees.
+Effects, cached values, region, scalar, scalar-strict and scalar/local-state
+are compared in ordinary and null-check builds. Scalar/local-state retains
+complete outgoing state and integer-store snapshots while deferring ordinary
+load observations; null-check builds select strict publication. x87 checks cover all TOP,
+PC and RC combinations, exact integer metadata, special and finite inputs,
+80-bit memory, register directions, status/rounding/remainder and classification.
+Native read-only store observers additionally compare complete CPU snapshots,
+addresses, widths and values, with explicit branch-join, loop-backedge and
+partial-word-update fixtures.
+Zero-divisor and overflow fixtures use a mock returning error handler that
+records CPU/fault address and changes EAX/EDX. These are current-runtime checks,
+not original-x86, actual guest SEH or interior memory-fault equivalence.
+
 The differential harness compares translated routines with original instructions
 under Unicorn. Unicorn is a development tool, not part of the playable app.
 

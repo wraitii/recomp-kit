@@ -118,6 +118,8 @@ def markdown(report):
              f"Decoded x87 dataflow: {'enabled' if report.get('x87_dataflow') else 'disabled'}.",
              f"Guest-stack forwarding: {'enabled' if report.get('x87_stack_forwarding') else 'disabled'}.",
              f"Decoded integer dataflow: {'enabled' if report.get('decoded_dataflow') else 'disabled'}.", '',
+             f"IR SSA in combined mode: {sum(r.get('ir_ssa', {}).get('emitted', False) for r in report['functions'])} functions emitted; x87 comparison mode: {report.get('ir_ssa_x87', 'effects')}; per-function fallbacks are in JSON.", '',
+             f"IR SSA CPU publication policy: {report.get('ir_ssa_state', 'strict')}.", '',
              'Native is reviewed C plus its ABI adapter; kernel text is also shown separately.',
              'Translated/native-adapter times include entry reset and indirect-call overhead.',
              'Native-kernel times use the typed host ABI, without guest state/reset. No LTO, FMA or fast-math.',
@@ -143,10 +145,21 @@ def markdown(report):
 
 
 def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, trials=9,
-               x87_dataflow=False, x87_stack_forwarding=False, decoded_dataflow=False):
+               x87_dataflow=False, x87_stack_forwarding=False, decoded_dataflow=False,
+               ir_ssa=False, ir_ssa_x87="effects", ir_ssa_state="strict"):
     """Decode the selected instructions, build isolated variants, validate, report."""
+    if ir_ssa_state not in ("strict", "locals"):
+        raise ValueError("IR SSA state policy must be strict or locals")
+    if ir_ssa_state != "strict" and not ir_ssa:
+        raise ValueError("IR SSA state policy requires IR SSA")
+    if ir_ssa_x87 not in ("effects", "values", "region", "scalar", "scalar-strict"):
+        raise ValueError("IR SSA x87 mode must be effects, values, region, scalar or scalar-strict")
+    if ir_ssa_x87 != "effects" and not ir_ssa:
+        raise ValueError("IR SSA x87 comparison mode requires IR SSA")
     if decoded_dataflow and not x87_dataflow:
         raise ValueError('decoded dataflow requires decoded x87 dataflow')
+    if ir_ssa and (x87_dataflow or x87_stack_forwarding or decoded_dataflow):
+        raise ValueError('IR SSA and decoded-dataflow corpus modes must run separately')
     if x87_stack_forwarding and not x87_dataflow:
         raise ValueError('guest-stack forwarding requires decoded x87 dataflow')
     if checks < 1 or calls < 0 or trials < 3:
@@ -203,6 +216,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
         directory.mkdir(exist_ok=True)
         write_input(directory / 'original.asm', '\n'.join(i.raw for i in insns) + '\n')
         write_input(directory / 'original.bin', raw)
+        ir_result = {'emitted': False, 'reason': 'disabled'}
         for mode in MODES[:-1]:
             options = SimpleNamespace(eager_flags=mode == "eager", cpu_locals=mode in ('cpu', 'combined'),
                                       x87_locals=mode in ('x87', 'combined'),
@@ -218,11 +232,34 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
             body = '\n'.join(tr.translate(fn))
             body = re.sub(r'\b(fn|body|entry)_([0-9a-f]{8})\b', lambda m: mode + '_' + m[0], body)
             body = bind_reviewed_calls(body, row.get('callees', []), mode)
+            if ir_ssa and mode == 'combined':
+                from ir.lift import Lifter, LiftError
+                from ir.census import function_ir
+                from ir.ssa import SSAError
+                from ir.emit_c import emit
+                # Only byte-verified, declared direct callees may be bound; an
+                # undeclared or indirect call stays a whole-function fallback.
+                call_symbols = {int(a, 16): f'{mode}_fn_{a}'
+                                for a in row.get('callees', [])}
+                try:
+                    lifter = Lifter()
+                    fir = function_ir(tr, lifter, fn)
+                    body = emit(fir, f'{mode}_fn_{addr:08x}', call_symbols=call_symbols,
+                                x87_values=(ir_ssa_x87 == 'values'),
+                                x87_region=(ir_ssa_x87 == 'region'),
+                                x87_scalar=ir_ssa_x87 in ('scalar', 'scalar-strict'),
+                                x87_scalar_strict=(ir_ssa_x87 == 'scalar-strict'),
+                                local_state=(ir_ssa_state == 'locals'),
+                                resumable_stacks=getattr(T, 'RESUMABLE_STACKS', False))
+                    ir_result = {'emitted': True, 'reason': None}
+                except (SSAError, LiftError) as error:
+                    ir_result = {'emitted': False, 'reason': str(error)}
             prototypes = ''.join(f'void {mode}_fn_{a}(X86 *);\n' for a in row.get('callees', []))
             path = directory / (mode + '.c')
             write_input(path, '#include "x86.h"\n' + prototypes + body + '\n')
             sources.append(path)
         provenance.append({**row, 'analysis_name': name, 'original_bytes': len(raw),
+                           'ir_ssa': ir_result,
                            'original_instructions': len(insns),
                            'x87_instructions': sum(i.mnem.startswith('F') for i in insns),
                            'spans': spans})
@@ -299,6 +336,8 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
     compiler = compiler_rows[0].get('arguments', []) or shlex.split(compiler_rows[0]['command'])
     report = {'contract': spec['contract'], 'host': platform.platform(),
               'x87_dataflow': x87_dataflow, 'x87_stack_forwarding': x87_stack_forwarding, 'decoded_dataflow': decoded_dataflow,
+              'ir_ssa': ir_ssa,
+              'ir_ssa_x87': ir_ssa_x87, 'ir_ssa_state': ir_ssa_state,
               'compiler': subprocess.check_output([compiler[0], '--version'], text=True).splitlines()[0],
               'compile_commands': compiler_rows, 'manifest_sha256': hashlib.sha256(manifest.read_bytes()).hexdigest(),
               'executable_sha256': cfg['game']['sha256'],
