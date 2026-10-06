@@ -5,7 +5,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from corpus.run import parse_results, symbol_sizes, reviewed_calls, bind_reviewed_calls
+from corpus.run import (parse_results, parse_coverage, symbol_sizes, reviewed_calls,
+                        bind_reviewed_calls, review_boundaries, bind_boundary_calls,
+                        wrap_string_helpers, wrap_string_helpers_ssa, boundary_wrappers,
+                        ssa_call_symbols, validate_code_map_metadata, markdown)
 from types import SimpleNamespace
 
 
@@ -13,19 +16,26 @@ def test_direct_calls_require_reviewed_rows_and_mapped_returns():
     row = {'address': '00100000', 'callees': ['00200000']}
     insns = [SimpleNamespace(addr=0x100000, mnem='CALL', ops=['0x200000']),
              SimpleNamespace(addr=0x100005, mnem='RET', ops=[])]
-    assert reviewed_calls(row, ['00100000', '00200000'], insns) == [0x100005]
+    sizes = [5, 1]
+    assert reviewed_calls(row, ['00100000', '00200000'], insns, sizes) == [0x100005]
     with pytest.raises(ValueError, match='reviewed corpus rows'):
-        reviewed_calls(row, ['00100000'], insns)
+        reviewed_calls(row, ['00100000'], insns, sizes)
     with pytest.raises(ValueError, match='undeclared/indirect'):
-        reviewed_calls({'address': '00100000'}, ['00100000', '00200000'], insns)
+        reviewed_calls({'address': '00100000'}, ['00100000', '00200000'], insns, sizes)
     insns[0].ops = ['EAX']
     with pytest.raises(ValueError, match='undeclared/indirect'):
-        reviewed_calls(row, ['00100000', '00200000'], insns)
+        reviewed_calls(row, ['00100000', '00200000'], insns, sizes)
     insns[0].ops = ['0x200000']
     with pytest.raises(ValueError, match='mapped continuation'):
-        reviewed_calls(row, ['00100000', '00200000'], insns[:1])
+        reviewed_calls(row, ['00100000', '00200000'], insns[:1], sizes[:1])
+    with pytest.raises(ValueError, match='size unavailable'):
+        reviewed_calls(row, ['00100000', '00200000'], insns)
+    noncanonical = [SimpleNamespace(addr=0x100000, mnem='CALL', ops=['0x200000']),
+                    SimpleNamespace(addr=0x100006, mnem='RET', ops=[])]
+    with pytest.raises(ValueError, match='non-canonical'):
+        reviewed_calls(row, ['00100000', '00200000'], noncanonical, [5, 1])
     with pytest.raises(ValueError, match='differ from decoded'):
-        reviewed_calls(row, ['00100000', '00200000'], insns[1:])
+        reviewed_calls(row, ['00100000', '00200000'], insns[1:], sizes[1:])
 
 
 def test_call_binding_preserves_mode_and_rejects_dispatch_or_extra_targets():
@@ -85,6 +95,191 @@ def test_timings_require_all_rotating_trials_and_positive_values():
         parse_results(output.rsplit('TIME', 1)[0], 1, 16, 100, 3)
     with pytest.raises(ValueError, match='duplicate or invalid'):
         parse_results(output.replace('TIME 0 0 0 1.0', 'TIME 0 0 0 0.0'), 1, 16, 100, 3)
+
+
+def test_code_map_metadata_must_pin_executable_and_image_base():
+    cfg = {'game': {'sha256': 'a' * 64, 'image_base': 0x400000}}
+    validate_code_map_metadata({'executable_sha256': 'a' * 64, 'image_base': '00400000'}, cfg)
+    with pytest.raises(ValueError, match='executable hash'):
+        validate_code_map_metadata({'executable_sha256': 'b' * 64, 'image_base': '00400000'}, cfg)
+    with pytest.raises(ValueError, match='image base'):
+        validate_code_map_metadata({'executable_sha256': 'a' * 64, 'image_base': '00401000'}, cfg)
+
+
+def test_boundary_partition_requires_exact_decoded_calls_and_declared_sites():
+    row = {'address': '00100000', 'callees': ['00200000'],
+           'boundary_stubs': {'00300000': 'fixture_stub'},
+           'indirect_calls': ['00100010'],
+           'indirect_targets': {'00400000': 'fixture_indirect'}}
+    insns = [SimpleNamespace(addr=0x100000, mnem='CALL', ops=['0x200000']),
+             SimpleNamespace(addr=0x100005, mnem='RET', ops=[]),
+             SimpleNamespace(addr=0x10000a, mnem='CALL', ops=['0x300000']),
+             SimpleNamespace(addr=0x10000f, mnem='NOP', ops=[]),
+             SimpleNamespace(addr=0x100010, mnem='CALL', ops=['EAX']),
+             SimpleNamespace(addr=0x100015, mnem='RET', ops=[])]
+    sizes = [5, 1, 5, 1, 5, 1]
+    direct, sites, targets, returns = review_boundaries(row, ['00100000', '00200000'], insns, sizes)
+    assert direct == {'00200000': ('callee', None), '00300000': ('stub', 'fixture_stub')}
+    assert sites == ['00100010']
+    assert targets == {'00400000': 'fixture_indirect'}
+    assert returns == {0x100005, 0x10000f, 0x100015}
+
+
+def test_boundary_validation_rejects_bad_targets_sites_and_overlap():
+    insns = [SimpleNamespace(addr=0x100000, mnem='CALL', ops=['0x200000']),
+             SimpleNamespace(addr=0x100005, mnem='RET', ops=[])]
+    sizes = [5, 1]
+    good = {'address': '00100000', 'callees': ['00200000']}
+    assert review_boundaries(good, ['00100000', '00200000'], insns, sizes)[0] == {
+        '00200000': ('callee', None)}
+    bad_stub = {**good, 'boundary_stubs': {'00999999': 'stub'}}
+    with pytest.raises(ValueError, match='partition decoded direct calls'):
+        review_boundaries(bad_stub, ['00100000', '00200000'], insns, sizes)
+    overlap = {**good, 'boundary_stubs': {'00200000': 'stub'}}
+    with pytest.raises(ValueError, match='partition decoded direct calls'):
+        review_boundaries(overlap, ['00100000', '00200000'], insns, sizes)
+    bad_site = {**good, 'indirect_calls': ['00100009']}
+    with pytest.raises(ValueError, match='indirect_calls differ'):
+        review_boundaries(bad_site, ['00100000', '00200000'], insns, sizes)
+    no_targets = {'address': '00100000', 'callees': [], 'indirect_calls': ['00100000']}
+    with pytest.raises(ValueError, match='indirect_targets required'):
+        review_boundaries(no_targets, ['00100000'],
+                          [SimpleNamespace(addr=0x100000, mnem='CALL', ops=['EAX']),
+                           SimpleNamespace(addr=0x100005, mnem='RET', ops=[])], sizes)
+    orphan_targets = {**good, 'indirect_targets': {'00400000': 'fixture_indirect'}}
+    with pytest.raises(ValueError, match='without indirect calls'):
+        review_boundaries(orphan_targets, ['00100000', '00200000'], insns, sizes)
+    bad_symbol = {**good, 'boundary_stubs': {'00300000': '1bad'}}
+    with pytest.raises(ValueError, match='ASCII C identifier'):
+        review_boundaries(bad_symbol, ['00100000', '00200000'],
+                          [SimpleNamespace(addr=0x100000, mnem='CALL', ops=['0x200000']),
+                           SimpleNamespace(addr=0x100005, mnem='RET', ops=[]),
+                           SimpleNamespace(addr=0x10000a, mnem='CALL', ops=['0x300000']),
+                           SimpleNamespace(addr=0x10000f, mnem='RET', ops=[])],
+                          [5, 1, 5, 1])
+    bad_indirect_symbol = {**good, 'indirect_calls': ['00100000'],
+                           'indirect_targets': {'00400000': 'bad symbol'}}
+    with pytest.raises(ValueError, match='ASCII C identifier'):
+        review_boundaries(bad_indirect_symbol, ['00100000', '00200000'],
+                          [SimpleNamespace(addr=0x100000, mnem='CALL', ops=['EAX']),
+                           SimpleNamespace(addr=0x100005, mnem='RET', ops=[])], sizes)
+    noncanonical = {**good, 'indirect_calls': ['00100000'],
+                    'indirect_targets': {'00400000': 'fixture_indirect'}}
+    with pytest.raises(ValueError, match='non-canonical'):
+        review_boundaries(noncanonical, ['00100000', '00200000'],
+                          [SimpleNamespace(addr=0x100000, mnem='CALL', ops=['EAX']),
+                           SimpleNamespace(addr=0x100006, mnem='CALL', ops=['0x200000']),
+                           SimpleNamespace(addr=0x10000b, mnem='RET', ops=[])],
+                          [5, 5, 1])
+
+
+def test_ssa_call_symbols_keep_v1_callees_and_use_boundary_wrappers():
+    assert ssa_call_symbols('combined', False, {}, ['00200000']) == {
+        0x200000: 'combined_fn_00200000'}
+    assert ssa_call_symbols('eager', True,
+                            {'00200000': ('callee', None), '00300000': ('stub', 'stub')},
+                            ['00200000']) == {
+        0x200000: 'eager_fnwrap_00200000', 0x300000: 'eager_fnwrap_00300000'}
+
+
+def test_boundary_binding_uses_wrappers_and_one_dispatch():
+    direct = {'00200000': ('callee', None), '00300000': ('stub', 'fixture_stub')}
+    body = ('CALL_FN(00200000); CALL_FN(00300000); uint32_t t_ = c->r[0]; '
+            'c->r[4] -= 4; wr32(c->r[4], 0x00100015u); recomp_call(c, t_);')
+    bound = bind_boundary_calls(body, 'eager', '00100000', direct, ['00100010'])
+    assert 'eager_fnwrap_00200000(c)' in bound
+    assert 'eager_fnwrap_00300000(c)' in bound
+    assert 'eager_indirect_00100000(c, t_)' in bound
+    assert 'recomp_call' not in bound
+    with pytest.raises(ValueError, match='sites differ'):
+        bind_boundary_calls('CALL_FN(00200000); CALL_FN(00300000);', 'eager', '00100000',
+                            direct, ['00100010'])
+    with pytest.raises(ValueError, match='direct calls differ'):
+        bind_boundary_calls('CALL_FN(00200000);', 'eager', '00100000', direct, [])
+    with pytest.raises(ValueError, match='unsupported emitted transfer'):
+        bind_boundary_calls('CALL_FN(00200000); CALL_FN(00300000); recomp_jump(c, t_);',
+                            'eager', '00100000', direct, ['00100010'])
+
+
+def test_boundary_wrappers_call_corpus_boundary_and_fail_named():
+    direct = {'00200000': ('callee', None), '00300000': ('stub', 'fixture_stub')}
+    source = boundary_wrappers('combined', '00100000', direct, ['00100010'],
+                               {'00400000': 'fixture_indirect'})
+    assert 'corpus_boundary(c, 0x00200000u);' in source
+    assert 'combined_fn_00200000(c);' in source
+    assert 'fixture_stub(c);' in source
+    assert 'combined_indirect_00100000' in source
+    assert 'unbound indirect target' in source
+
+
+def test_string_helpers_wrap_by_instruction_site_and_never_go_unattributed():
+    body = ('movsd(c);  /* 00123456 MOVSD */\n'
+            'rep_movsd(c);  /* 00123460 REP MOVSD */')
+    wrapped = wrap_string_helpers(body)
+    assert 'CORPUS_MOVSD(c, 0x00123456u)' in wrapped
+    assert 'CORPUS_REP_MOVSD(c, 0x00123460u)' in wrapped
+    assert 'rep_CORPUS' not in wrapped
+    with pytest.raises(ValueError, match='without an instruction site'):
+        wrap_string_helpers('movsd(c);')
+
+
+def test_ssa_string_helpers_wrap_from_block_index():
+    insns = [SimpleNamespace(addr=0x100000 + 5 * i, mnem='NOP', ops=[]) for i in range(5)]
+    body = 'B3:;\n{ movsd(c); }\nB4:;\n{ rep_movsd(c); }'
+    wrapped = wrap_string_helpers_ssa(body, insns)
+    assert 'CORPUS_MOVSD(c, 0x0010000fu)' in wrapped
+    assert 'CORPUS_REP_MOVSD(c, 0x00100014u)' in wrapped
+    with pytest.raises(ValueError, match='without an instruction site'):
+        wrap_string_helpers_ssa('movsd(c);', insns)
+    with pytest.raises(ValueError, match='outside decoded instructions'):
+        wrap_string_helpers_ssa('B9:;\nmovsd(c);', insns)
+
+
+def test_coverage_requires_exactly_one_valid_object_for_required_rows():
+    output = 'COVERAGE 7 {"paths":2,"indirect":1}\n'
+    assert parse_coverage(output, [7, 8], [0]) == {0: {'paths': 2, 'indirect': 1}}
+    with pytest.raises(ValueError, match='missing coverage'):
+        parse_coverage(output, [7, 8], [0, 1])
+    with pytest.raises(ValueError, match='duplicate coverage'):
+        parse_coverage(output + output, [7], [0])
+    with pytest.raises(ValueError, match='unknown fixture'):
+        parse_coverage('COVERAGE 9 {"paths":1}\n', [7], [])
+    with pytest.raises(ValueError, match='nonnegative integer'):
+        parse_coverage('COVERAGE 7 {"paths":-1}\n', [7], [0])
+    with pytest.raises(ValueError, match='nonnegative integer'):
+        parse_coverage('COVERAGE 7 {"paths":true}\n', [7], [0])
+
+
+def test_variable_mode_trials_reject_incomplete_rows_but_keep_defaults():
+    output = 'CHECK 0 16\n' + ''.join(f'TIME 0 {m} {t} {m+t+1}.0\n'
+                                      for m in range(4) for t in range(3))
+    assert len(parse_results(output, 1, 16, 100, 3, row_modes=[4], row_has_native=[False])) == 12
+    with pytest.raises(ValueError, match='incomplete benchmark'):
+        parse_results(output.rsplit('TIME', 1)[0], 1, 16, 100, 3,
+                      row_modes=[4], row_has_native=[False])
+    mixed = ('CHECK 0 16\nCHECK 1 16\n'
+             + ''.join(f'TIME 0 {m} {t} {m+t+1}.0\n' for m in range(4) for t in range(3))
+             + ''.join(f'TIME 1 {m} {t} {m+t+1}.5\n' for m in range(6) for t in range(3)))
+    times = parse_results(mixed, 2, 16, 100, 3,
+                          row_modes=[4, 5], row_has_native=[False, True])
+    assert len(times) == 30
+    with pytest.raises(ValueError, match='incomplete benchmark'):
+        parse_results(mixed, 2, 16, 100, 3, row_modes=[4, 5], row_has_native=[False, False])
+
+
+def test_translation_report_exposes_control_timings_boundaries_and_coverage():
+    row = {'address': '00100000', 'name': 'Workload', 'comparison': 'translation-only',
+           'original_bytes': 16, 'x87_instructions': 2,
+           'variants': {'eager': {'span_bytes': 64, 'timing_ns': {'median': 123.0}},
+                        'combined': {'span_bytes': 32, 'timing_ns': {'median': 45.0}}},
+           'boundary_stubs': {'00200000': 'fixture_stub'}, 'coverage': {'copies': 7}}
+    result = markdown({'host': 'test', 'compiler': 'test', 'contract': 'mapped-comparison-corpus-v2',
+                       'checks_per_function': 16, 'functions': [row]})
+    assert '| 123.00 / 45.00 / — |' in result
+    assert '| — / — |' in result
+    assert '00200000->fixture_stub' in result
+    assert 'copies=7' in result
+    assert 'native-reference rows also matched' not in result
 
 
 def test_fixture_mismatch_fails_before_compilation(tmp_path):

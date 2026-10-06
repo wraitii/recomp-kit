@@ -1,7 +1,8 @@
 # Function corpus tools
 
-Game-owned real-function corpora pair original instruction provenance with typed
-native C, deterministic inputs and explicit observable-result contracts. The kit
+Game-owned real-function corpora pair original instruction provenance with
+deterministic inputs and explicit comparison contracts, optionally including
+typed native C references. The kit
 owns their build, comparison, timing and report machinery. It never owns game
 addresses or reconstructed game logic.
 
@@ -12,24 +13,83 @@ python tools/build.py --game-dir /absolute/game --function-corpus /absolute/mani
 ```
 
 Outputs stay under the game's ignored `build/function-corpus/`. A manifest uses
-`contract: "mapped-native-corpus-v1"`, a fixture `header`, fixture `sources` and
-`functions` rows containing `address`, `name`, `instructions_sha256`, `kernel`
-and unique nonnegative `fixture_id`. Sources/header resolve inside the manifest
-directory. The kit verifies the executable and the instruction-span hashes,
-decodes the public code-map boundaries and refuses rewrites/outward transfers.
-An optional per-row `callees` list names other reviewed corpus rows: only those
-decoded direct calls are permitted, and each invokes the callee in the same
-translation mode, in a separate translation unit. Callee rows retain their own
-byte hashes, fixtures and native references. Only mapped CALL continuations and
-the fixture's return sentinel are accepted as returns; indirect calls, tail
-transfers, SEH and undeclared dispatch still fail. No callee is stubbed.
+`contract: "mapped-native-corpus-v1"` or `"mapped-comparison-corpus-v2"`, a
+fixture `header`, fixture `sources` and `functions` rows containing `address`,
+`name`, `instructions_sha256` and unique nonnegative `fixture_id`. Sources and
+header resolve inside the manifest directory. The kit verifies the executable
+and the instruction-span hashes, decodes the public code-map boundaries and
+refuses rewrites/outward transfers.
 
-The game fixture header declares its arena, image base, scratch window, ordinary
-return sentinel and benchmark input. It supplies `corpus_setup`, entry reset,
-observable-result comparison, post-timing sanity checks and
-`corpus_native_trial` for direct typed-API timing. Native adapters export
-`native_ADDRESS(X86 *)`; kernels use ordinary host types and pointers, compiled
-separately with no LTO. See a game's corpus README for its exact contract.
+`mapped-native-corpus-v1` is unchanged: every row has a `kernel`, and an
+optional per-row `callees` list names other reviewed corpus rows. Only those
+decoded direct calls are permitted, each invokes the callee in the same
+translation mode in a separate translation unit, and no callee is stubbed.
+Indirect calls, tail transfers, SEH, boundary declarations and undeclared
+dispatch fail.
+
+`mapped-comparison-corpus-v2` preserves every native-reference row and adds
+explicit `comparison: "translation-only"` rows that have no native kernel or
+adapter. Translation-only rows omit adapter/kernel results from generated
+tables, timing, JSON, CSV and Markdown; the runner never fabricates native
+results. The v1 `callees` contract still applies. A row may additionally declare
+modeled boundaries, which are validated exactly against the decoded calls:
+
+- `memory_ranges`: a nonempty list of `[start, size]` integer pairs. The harness
+  snapshots those guest ranges in declaration order and compares every byte
+  against eager C. Omitted, it defaults to the header's
+  `CORPUS_SCRATCH`/`CORPUS_SCRATCH_SIZE` window, which is not enlarged.
+- `boundary_stubs`: a map of original direct-call target `address` to fixture
+  function symbol. The stub and `callees` declarations must exactly partition
+  the decoded direct calls and be disjoint.
+- `indirect_calls`: the exact original CALL instruction site addresses.
+- `indirect_targets`: a map of guest fixture target token to fixture symbol, the
+  explicit whitelist for those sites.
+
+A row with `boundary_stubs` or `indirect_calls` is a boundary row. Generated
+per-mode wrappers call `corpus_boundary(c, target)` before every declared direct
+callee or fixture stub. Each indirect site is rewritten from the runtime
+`recomp_call`/`CALLIND` path to one generated mode dispatch that calls
+`corpus_boundary` and then the whitelisted fixture symbol; an unknown target
+aborts with a named diagnostic. `recomp_jump` and external tail transfers stay
+rejected. Stub target addresses mark modeled boundaries and are explicitly
+reported; real callees retain independently byte-verified translated bodies.
+
+The game fixture header declares its arena, image base, ordinary return sentinel
+and benchmark input. It supplies `corpus_setup`, entry reset, observable-result
+comparison, post-timing sanity checks and `corpus_native_trial` for direct
+typed-API timing. Native adapters export `native_ADDRESS(X86 *)`; kernels use
+ordinary host types and pointers, compiled separately with no LTO. See a game's
+corpus README for its exact contract.
+
+### Boundary hooks (v2)
+
+A v2 fixture header may define `CORPUS_BOUNDARY_HOOKS` and provide:
+
+```c
+void corpus_boundary(X86 *c, uint32_t target);
+void corpus_movs_site(X86 *c, int rep, uint32_t site);
+void corpus_variant_begin(unsigned fixture, unsigned mode, int checking);
+void corpus_variant_end(unsigned fixture);
+void corpus_validation_end(unsigned fixture, unsigned checks);
+```
+
+The harness calls `corpus_variant_begin` **before** `corpus_setup` (setup calls
+its own `corpus_boundary_case_begin` and expects the active mode), runs the
+variant, then calls `corpus_variant_end`. The same bracket wraps each timed
+workload with `checking = 0`. `corpus_validation_end` runs once per row after
+its checks. A mapped `movsd`/`rep_movsd` in a v2 translation is rewritten to
+`corpus_movs_site(c, rep, site)` using the decoded instruction EIP (from the
+instruction comment; for IR SSA, from the emitter's `B<index>` block, which is
+an index into `fir.insns`). The hook runs the selected runtime move helper exactly once; its
+instrumentation must not alter guest state. Any helper call that cannot be
+attributed to a site fails generation rather than silently skipping coverage.
+
+`corpus_validation_end` may print one `COVERAGE <fixture_id> <json>` line whose
+payload is an object of nonnegative integer counts. Native-reference rows may
+omit it; every translation-only row must emit exactly one. The runner rejects
+missing, duplicate, unknown-fixture, non-object and negative/non-integer
+records and records the object as row coverage. Coverage is game evidence and
+is reported alongside, not instead of, the byte comparisons.
 
 Four translated modes (eager, CPU locals, x87 locals, combined) share the same
 instruction-derived CFG and flag liveness. All optimized modes must match eager

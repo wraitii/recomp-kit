@@ -224,6 +224,34 @@
 ||||||| parent of 5ddde93 (Add experimental SSA corpus with scalar x87 and local CPU state)
 ||||||| parent of 7491db2 (Enable opt-in production SSA with decoded fallback reporting)
 ||||||| parent of 28e2bc9 (Expand production SSA helper and indirect call coverage)
+||||||| parent of 1e58bd9 (Add explicit comparison workloads to the function corpus)
+- Add `mapped-comparison-corpus-v2` to the function corpus. It preserves the
+  existing native-reference rows and admits explicit `comparison:
+  "translation-only"` rows with no native adapter or kernel, so generated
+  tables, timing, JSON, CSV and Markdown omit native results rather than
+  fabricating them. V2 rows may declare `memory_ranges` (default
+  `CORPUS_SCRATCH`/`CORPUS_SCRATCH_SIZE`, not enlarged), `boundary_stubs`,
+  `indirect_calls` and `indirect_targets`; the runner validates the stubs and
+  callees exactly partition decoded direct calls and that indirect sites match
+  the decoded CALL sites. Boundary wrappers call `corpus_boundary` before every
+  declared direct callee or stub, and `recomp_call`/`CALLIND` at approved sites
+  is rewritten to one mode dispatch that whitelists fixture targets and aborts
+  with a named diagnostic otherwise. `recomp_jump` stays rejected. V1 rejects
+  all v2 boundary declarations.
+
+- Add optional v2 boundary hooks. A fixture defining `CORPUS_BOUNDARY_HOOKS`
+  provides `corpus_variant_begin` (called before `corpus_setup`, so the
+  fixture's case begin sees the active mode), `corpus_variant_end`,
+  `corpus_validation_end` and `corpus_movs_site(X86 *, int rep, uint32_t site)`.
+  The harness brackets every validation variant and timed workload. Decoded string
+  helpers are rewritten to `corpus_movs_site` from the instruction comment; IR
+  SSA emits are wrapped from the `B<index>` block map into `fir.insns`. The
+  instrumentation preserves guest state and runs the selected helper exactly
+  once; an unattributable helper fails generation.
+  `corpus_validation_end` coverage is parsed as one exact nonnegative
+  integer-count JSON object per translation-only row; the raw coverage result
+  is reported as game evidence, not a substitute for the byte checks.
+
 - Include nested translator packages in the regeneration cache fingerprint,
   so edits to SSA lowering regenerate production bodies through `--regenerate`.
 
