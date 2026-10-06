@@ -2961,8 +2961,12 @@ bool d8_sync_texture(X86 *c, ComObj *dev, uint32_t stage) {
             out.data = data;
             out.bytes = data ? level->pixels_bytes : 0;
         }
-        status = d3d8_device_set_texture(host_device(dev), stage, tex->id, tex->rmask, count,
-                                         levels.data(), &err);
+        // The renderer keys a mip chain by its level-0 surface identity.
+        // SetRenderTarget/readback/destruction already use that identity;
+        // using the parent texture id here creates a second stale CPU upload
+        // instead of sampling the GPU-rendered reflection surface.
+        status = d3d8_device_set_texture(host_device(dev), stage, tex->d3d8_levels[0], tex->rmask,
+                                         count, levels.data(), &err);
     } else {
         status = d3d8_device_set_texture(host_device(dev), stage, 0, 0, 0, nullptr, &err);
     }

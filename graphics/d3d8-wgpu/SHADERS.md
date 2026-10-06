@@ -87,3 +87,11 @@ they do not establish original-D3D8 equivalence or game playability.
 
 `RECOMP_D3D8_TRACE_SHADERS=1` prints creation handles, versions and token counts.
 No original shader source or bytecode fixtures are committed.
+
+`RECOMP_D3D8_TRACE_SHADER_DRAWS=<n>` reports up to n programmable draws,
+including all four bindings, the constant banks, bump/luminance state and
+sample vertices. `RECOMP_D3D8_TRACE_SHADER_STAGE2=1` restricts captures to
+programs sampling stage 2. `RECOMP_D3D8_TRACE_SHADER_DIR=<dir>` saves rendered
+inputs from GPU readback; CPU texture dumps alone cannot show a rendered
+reflection. Capturing these inputs forces submissions/readback and is for
+diagnosis only, not performance measurement.

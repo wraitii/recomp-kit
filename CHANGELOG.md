@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- D3D8 texture sampling now uses the level-0 surface identity shared by
+  render-target binding, readback and destruction. Previously sampling a
+  render-target texture uploaded stale CPU bytes under its parent texture id,
+  hiding rendered reflections without an error. A guest COM/Metal regression
+  verifies the render-to-texture round trip. Bounded shader-draw tracing now
+  captures four bindings, constants and GPU-rendered input images.
+
 - D3D8 textures support `D3DFMT_V8U8` signed bump offsets. Guest locks keep
   native two-byte texels and mip pitches; the renderer uploads Rg8Snorm so
   TEXBEM reads negative U,V correctly. This fixes texture creation failures

@@ -646,6 +646,101 @@ fn upload_texture_level(
     Ok(())
 }
 
+/// Bounded programmable-draw capture. Stage-2 filtering keeps menu/terrain
+/// draws from consuming the capture budget. Rendered textures are read from
+/// the GPU: their CPU lock storage can be stale after a reflection pass.
+fn trace_shader_draw(
+    device: &Device,
+    uniform: &shader::Uniform,
+    samplers: &[bool; 4],
+    vertices: &VertexBuffer,
+    start: u32,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    let Some(limit) = std::env::var("RECOMP_D3D8_TRACE_SHADER_DRAWS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    else {
+        return;
+    };
+    if std::env::var_os("RECOMP_D3D8_TRACE_SHADER_STAGE2").is_some() && !samplers[2] {
+        return;
+    }
+    let capture = COUNT.fetch_add(1, Ordering::Relaxed);
+    if capture >= limit {
+        return;
+    }
+    eprintln!(
+        "[d3d8-shader-draw] capture={capture} draw={} vs={:#x} ps={:#x} target={:?} viewport={:?}",
+        device.draw_index,
+        device.vertex_shader,
+        device.pixel_shader,
+        device.targets.current,
+        device.state.viewport
+    );
+    eprintln!(
+        "[d3d8-shader-draw] vc={:?} pc={:?} bump={:?} lum={:?}",
+        &uniform.vc[..15],
+        uniform.pc,
+        uniform.bump,
+        uniform.lum
+    );
+    let at = start as usize * vertices.stride as usize;
+    let end = (at + vertices.stride as usize * 3).min(vertices.bytes().len());
+    let sample: Vec<f32> = vertices.bytes()[at..end]
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    eprintln!(
+        "[d3d8-shader-draw] stride={} first_vertices={sample:?}",
+        vertices.stride
+    );
+    for (stage, used) in samplers.iter().enumerate() {
+        let Some(texture) = &device.stage_textures[stage] else {
+            eprintln!("[d3d8-shader-draw] stage={stage} used={used} unbound");
+            continue;
+        };
+        let rt = device
+            .targets
+            .textures
+            .get(&TextureKey::new(texture.texture_id, 0));
+        eprintln!(
+            "[d3d8-shader-draw] stage={stage} used={used} id={} {}x{} fmt={:#x} gpu_rendered={} generations={:?}",
+            texture.texture_id,
+            texture.width,
+            texture.height,
+            texture.format,
+            rt.is_some(),
+            texture.level_generations
+        );
+        if let (Some(rt), Some(dir)) = (rt, std::env::var_os("RECOMP_D3D8_TRACE_SHADER_DIR")) {
+            device.flush_draws();
+            let dir = std::path::PathBuf::from(dir);
+            let result = std::fs::create_dir_all(&dir)
+                .map_err(|e| e.to_string())
+                .and_then(|_| {
+                    device
+                        .gpu
+                        .read_pixels(&rt.surface)
+                        .map_err(|e| e.to_string())
+                })
+                .and_then(|pixels| {
+                    crate::d3d8::dump::write_png(
+                        &dir.join(format!("shader{capture}_stage{stage}_rendered.png")),
+                        texture.width,
+                        texture.height,
+                        &pixels,
+                    )
+                    .map_err(|e| e.to_string())
+                });
+            if let Err(error) = result {
+                eprintln!("[d3d8-shader-draw] capture failed: {error}");
+            }
+        }
+    }
+}
+
 /// The `(lod_min, lod_max, mipmap_filter)` a stage's sampler uses for a chain
 /// with `max_written_level` written levels. `D3DTSS_MAXMIPLEVEL` selects the
 /// base (most detailed) level (WineD3D `mip_base_level`), `MIPFILTER=NONE`
@@ -2013,6 +2108,9 @@ impl Device {
                     8.0
                 };
             }
+        }
+        if let Some(ps) = ps {
+            trace_shader_draw(self, &program_uniform, &ps.samplers, vertices, start_vertex);
         }
         let alpha_test_uniform = AlphaTestUniform::new(
             self.state.alpha_test_enable(),

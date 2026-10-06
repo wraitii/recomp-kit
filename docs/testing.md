@@ -122,6 +122,12 @@ unknown name fails generation, and a constant the Rust ABI header also defines i
 Ghost Recon's parent `tools/d3d8_codegen.py` checks both this boundary and its
 cbindgen-generated host ABI. Generator regressions run in the portable suite.
 
+When the Rust renderer is enabled, `d3d8_render_tests` (`gpu`) calls the
+production D3D8 bridge through guest COM, clears a texture's level surface,
+and samples the parent texture with a synthetic pixel shader. Metal readback
+must show the rendered color rather than stale CPU staging bytes; a readonly
+surface lock checks the corresponding guest readback identity.
+
 The Rust D3D8 renderer tests and offscreen probe can be run through
 `tools/test.py --game-dir /abs/game --d3d8-wgpu test` and `--d3d8-wgpu probe`.
 They require graphics adapter access; an unavailable adapter fails the requested
