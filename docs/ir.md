@@ -3,7 +3,8 @@
 `tools/recomp/ir/` is an experimental frontend over the same original image
 bytes and instruction boundaries used by the production translator. It currently
 provides lifting, a whole-image calling-convention census, integer SSA and an
-opt-in mapped-corpus C emitter. Production C and LLVM emission still uses the
+opt-in C emitter for the mapped corpus and admitted production functions.
+Production discovery and fallback C, and experimental LLVM emission, use the
 existing decoded-instruction frontend. Census coverage is analysis evidence,
 not execution, equivalence or a measured performance gain.
 
@@ -166,8 +167,9 @@ known CPU fields before each access and on return. A conservative publication
 analysis omits field stores only when their values are already published on
 every incoming path. It also uses wider register phis, width-aware
 canonicalization and dead-value elimination, without summary-driven calls.
-It is only available in the isolated mapped corpus, with no production
-dispatch, alternate entry, hook, SEH or scheduler integration. State publication
+The mapped corpus binds reviewed callees directly; the production adapter below
+uses existing entry dispatch and rejects unsupported host-frame contracts.
+State publication
 alone does not establish interior fault equivalence with the existing emitter;
 instruction-level update order still requires differential fault checks.
 
@@ -240,8 +242,9 @@ fallthrough; indirect, unbound and missing-continuation calls fail closed.
 The guest return-address store remains ordered and observable. Callees own
 ESP cleanup and EIP restoration. All tracked register lanes and flags are
 reloaded afterward, and the x87 cache is invalidated. Resumable mode checks
-EIP before continuing. These bindings do not provide production dispatch,
-hooks, SEH, imports or a summary-based call ABI.
+EIP before continuing. Corpus bindings do not provide production dispatch,
+hooks, SEH, imports or a summary-based call ABI. The production adapter binds
+ordinary direct calls through stable entry thunks.
 
 SLEIGH can encode an absolute memory operand as a `ram` varnode rather than an
 explicit LOAD/STORE. Codegen normalizes source operands to one captured read
@@ -402,6 +405,47 @@ generation time, cold compiler cost, native text and execution separately.
 Basic-block formation and expression inlining remain unimplemented. Source
 reduction by itself does not establish faster or smaller native code; the game's
 corpus documentation records those measurements separately.
+
+## Production selection
+
+Select SSA in the game's `game.toml`:
+
+```toml
+[translate]
+ir_ssa = true
+ir_ssa_x87 = "scalar"  # effects (default), values, region, scalar, scalar-strict
+ir_ssa_state = "locals"  # strict (default), locals
+```
+
+Regenerate through `tools/build.py --regenerate`. Setting `ir_ssa = false`
+restores decoded emission. Discovery, entry ownership and decoded dispatch
+validation still run first. `ir/production.py` then replaces supported final
+bodies while keeping stable entry thunks and the existing raw/base/hooked
+tables. SSA direct calls use `CALL_FN`, publishing and reloading required state;
+there is no summary-driven calling-convention optimization. Ordinary decoded
+callees and SSA callees can be mixed, including replacement/hook selection.
+
+Alternate-entry bodies, SEH frames/helpers/restores, pushed continuations,
+nonreturning control flow, audited instruction/operand/visual-clock rewrites,
+division error seams and auxiliary modules keep whole-function decoded C.
+Indirect calls, jump tables, external tail transfers and unsupported instructions
+also fall back through named SSA/lift diagnostics. A 2048-instruction budget and
+Python graph recursion limit retain decoded C for expensive constructions.
+Original interior fault/SEH equivalence remains unverified; null-check builds
+compile conservative publication inside admitted functions.
+
+The translation JSON report includes an `ir_ssa` object with emitted/fallback
+counts and percentages, policy names, aggregated fallback reasons and a
+per-function map. Its denominator is the final emitted function bodies,
+including recovered bodies, with alternate entry wrappers counted only under
+their owning body. These are automatically generated frontend coverage metrics,
+not a reconstruction census, execution coverage or equivalence evidence.
+
+`test_ir_production.py` exercises final-driver selection/reporting, mixed
+SSA/decoded direct calls through thunk declarations and conservative exclusions
+over actual synthetic instruction bytes. The native SSA comparison suite checks
+body semantics; production entry-dispatch tests check replacement/hook/profile
+policy. A real replay is still needed before performance capture.
 
 ## Remaining code-generation work
 

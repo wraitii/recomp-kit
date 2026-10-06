@@ -65,6 +65,13 @@ def test_default_no_calls_rejects_direct_call_with_named_diagnostic():
         emit(caller("bb01000000"), "test_fn")
 
 
+def test_reused_lifter_keeps_identical_codegen_across_bodies_and_policies():
+    for fir in (function("40", "8903", "c3"), caller("bb01000000"),
+                function("d906", "d80e", "d806", "d91b", "c3")):
+        options = dict(call_symbols={TARGET: "callee"}, x87_scalar=True, local_state=True)
+        assert emit(fir, "test_fn", lifter=LIFTER, **options) == emit(fir, "test_fn", **options)
+
+
 def test_indirect_and_unsupported_transfers_still_require_fallback():
     with pytest.raises(SSAError):
         build(function("ffd0", "c3"))  # call eax

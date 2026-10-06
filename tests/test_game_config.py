@@ -20,6 +20,23 @@ gen_game_config = load_module("gen_game_config")
 
 
 class LoadTests(unittest.TestCase):
+    def test_production_ssa_defaults_and_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            stub = (ROOT / "games/stub/game.toml").read_text()
+            (game / "globals.toml").write_text("")
+            (game / "game.toml").write_text(stub)
+            settings = game_config.load(game)["translate"]
+            self.assertFalse(settings["ir_ssa"])
+            self.assertEqual(settings["ir_ssa_x87"], "effects")
+            self.assertEqual(settings["ir_ssa_state"], "strict")
+            for key, value in (("ir_ssa", "1"), ("ir_ssa_x87", '"bad"'),
+                               ("ir_ssa_state", '"bad"')):
+                (game / "game.toml").write_text(stub.replace(
+                    "[translate]\n", "[translate]\n%s = %s\n" % (key, value)))
+                with self.assertRaisesRegex(ValueError, key):
+                    game_config.load(game)
+
     def test_cpu_locals_defaults_and_rejects_non_boolean(self):
         with tempfile.TemporaryDirectory() as tmp:
             game = Path(tmp)

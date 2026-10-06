@@ -222,21 +222,29 @@
 ||||||| parent of ab04cac (Add opt-in decoded x87 dataflow lowering)
 ||||||| parent of 2980029 (Add bounded decoded flag dataflow and rounded stack forwarding)
 ||||||| parent of 5ddde93 (Add experimental SSA corpus with scalar x87 and local CPU state)
+||||||| parent of 7491db2 (Enable opt-in production SSA with decoded fallback reporting)
+- Add opt-in production `[translate] ir_ssa = true`, with `ir_ssa_x87` and
+  `ir_ssa_state` comparison policies. SSA replaces supported final function
+  bodies after decoded boundary recovery and validation; direct calls use
+  existing entry thunks and retain replacement/hook/profiling policy. Unsupported
+  functions keep decoded C whole. Translation reports include exact emitted
+  and fallback counts, percentages and per-function reasons. SEH, alternate
+  entries, continuations, division error seams and auxiliary modules remain
+  decoded; graph construction has a 2048-instruction budget.
+
 - Add opt-in SSA `scalar`/`scalar-strict` x87 corpus modes: scalar stack values,
   exact-integer shadows and residues, a local control/status environment, and
   proven binary32 arithmetic with a general precision path. Optional
   `--corpus-ir-ssa-state locals` defers ordinary-read register/flag snapshots;
   stores, calls, division and returns retain complete required state. Null-check
   builds select strict publication. The native suite compares six SSA variants
-  against eager C in ordinary and null-check builds. Production emission remains
-  unchanged.
+  against eager C in ordinary and null-check builds.
 
 - Add integer p-code SSA and experimental `--corpus-ir-ssa` C emission in the
   mapped function corpus's combined variant. Byte lanes preserve register
   aliases; phi edges use parallel copies and memory accesses remain ordered.
   Unsupported functions retain the existing emitter with reported reasons.
-  Explicitly bound direct calls publish/reload tracked state; production
-  dispatch integration remains unsupported. Audited x87
+  Explicitly bound direct calls publish/reload tracked state. Audited x87
   forms use ordered effects with original-byte operand validation and the
   runtime's rounding/status/tag/exact-integer helpers; raw FLOAT p-code remains
   unsupported. Additional integer forms include MOVSX/MOVZX, register XCHG,

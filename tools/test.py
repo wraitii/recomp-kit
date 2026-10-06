@@ -37,6 +37,7 @@ PORTABLE_TESTS = [
     "tools/recomp/tests/test_ir_ssa.py",
     "tools/recomp/tests/test_ir_x87.py",
     "tools/recomp/tests/test_ir_calls.py",
+    "tools/recomp/tests/test_ir_production.py",
     "tools/recomp/tests/test_ir_integer_extra.py",
     "tools/recomp/tests/test_ir_x87_values.py",
     "tools/recomp/tests/test_ir_x87_scalar.py",

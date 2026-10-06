@@ -204,6 +204,14 @@ def load(game_dir):
     locals_cpu = translate.setdefault("cpu_locals", False)
     if not isinstance(locals_cpu, bool):
         raise ValueError("%s: [translate] cpu_locals must be a boolean" % source)
+    ssa = translate.setdefault("ir_ssa", False)
+    if not isinstance(ssa, bool):
+        raise ValueError("%s: [translate] ir_ssa must be a boolean" % source)
+    for key, default, choices in (
+            ("ir_ssa_x87", "effects", ("effects", "values", "region", "scalar", "scalar-strict")),
+            ("ir_ssa_state", "strict", ("strict", "locals"))):
+        if translate.setdefault(key, default) not in choices:
+            raise ValueError("%s: [translate] %s must be one of %s" % (source, key, choices))
     alignment = translate.setdefault("function_alignment", 16)
     if type(alignment) is not int or alignment <= 0:
         raise ValueError("%s: [translate] function_alignment must be a positive integer" % source)

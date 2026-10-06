@@ -1,7 +1,8 @@
-"""Experimental mapped-corpus C emission from integer SSA.
+"""Experimental C emission from integer SSA.
 
-This is not a production dispatch entry: hooks, SEH, scheduler observations and
-interior fault equivalence have not been validated. A direct CALL is emitted
+The production adapter admits a restricted subset through existing entry thunks;
+this emitter alone does not implement hooks, SEH or alternate entries. Original
+interior fault equivalence has not been validated. A direct CALL is emitted
 only when the caller supplies an explicit target-to-symbol binding; otherwise
 it is a whole-function fallback. Audited x87 effects use the comparison
 runtime's helpers, with an opt-in write-through value tracker. Memory uses the
@@ -127,7 +128,7 @@ def codegen_ir(fir, lifter):
 def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=True,
          call_symbols=None, x87_values=False, x87_region=False, x87_scalar=False,
          x87_scalar_strict=False, local_state=False, resumable_stacks=False,
-         _guard_null_checks=True):
+         lifter=None, _guard_null_checks=True):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
     `call_symbols` maps an allowed direct-call target address to the C symbol
@@ -137,6 +138,10 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     """
     if not symbol.isidentifier() or not symbol.isascii():
         raise SSAError("invalid C symbol")
+    # The register model and operand corrections are immutable across bodies.
+    # Reuse the image's SLEIGH context instead of reparsing its specification
+    # for every function and both null-check policy variants.
+    lifter = lifter if lifter is not None else Lifter()
     try:
         entries = list(dict(call_symbols or {}).items())
     except (TypeError, ValueError):
@@ -162,7 +167,8 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         # Compile the strict observation path whenever that facility is enabled.
         options = dict(optimize=optimize, publish_changed=publish_changed, wide_registers=wide_registers,
                        call_symbols=call_symbols, x87_values=x87_values, x87_region=x87_region,
-                       x87_scalar=x87_scalar, resumable_stacks=resumable_stacks, _guard_null_checks=False)
+                       x87_scalar=x87_scalar, resumable_stacks=resumable_stacks,
+                       lifter=lifter, _guard_null_checks=False)
         strict = emit(fir, symbol, x87_scalar_strict=True, local_state=False, **options)
         fast = emit(fir, symbol, x87_scalar_strict=x87_scalar_strict, local_state=local_state, **options)
         return "#if defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS\n%s\n#else\n%s\n#endif" % (strict, fast)
@@ -181,7 +187,6 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             return x87_statements(data, address, result, values=tracker)
         return x87_statements(data, address, result)
 
-    lifter = Lifter()
     # Keep a raw-SSA comparison path for measuring the passes independently.
     # Each SLEIGH register byte must map to a known runtime field.
     fields = []

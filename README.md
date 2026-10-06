@@ -278,7 +278,10 @@ with their game.
 
 The experimental [instruction IR](docs/ir.md) lifts original x86 bytes with
 SLEIGH and supports `translate.py --ir-census FILE` for calling-convention
-analysis. Production emission is unchanged. Integer SSA and an initial C emitter
+analysis. Opt-in `[translate] ir_ssa = true` now selects supported production
+function bodies after decoded boundary discovery, retaining decoded fallback
+and the existing dispatch ABI. Translation reports record emitted/fallback
+percentages and reasons. Integer SSA and an initial C emitter
 with corrected ordered x87 effects can be checked in an isolated function corpus
 with `--corpus-ir-ssa`; unsupported
 functions retain the existing emitter, with per-function fallback reasons.
