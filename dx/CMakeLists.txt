@@ -25,7 +25,20 @@ add_custom_command(OUTPUT "${RECOMP_D3D8_COM_TABLES}"
   DEPENDS "${POP_ROOT}/tools/gen_com_interfaces.py"
           "${POP_ROOT}/third_party/wine-d3d8/d3d8.h" "${CMAKE_CURRENT_SOURCE_DIR}/d3d8_bindings.json"
   VERBATIM)
-add_custom_target(d3d8_com_tables DEPENDS "${RECOMP_D3D8_COM_TABLES}")
+set(RECOMP_D3D8_CONSTANTS "${RECOMP_D3D8_GENERATED_DIR}/d3d8_constants.inc")
+add_custom_command(OUTPUT "${RECOMP_D3D8_CONSTANTS}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${RECOMP_D3D8_GENERATED_DIR}"
+  COMMAND ${Python3_EXECUTABLE} "${POP_ROOT}/tools/gen_d3d8_constants.py"
+          --reference "${POP_ROOT}/third_party/wine-d3d8/d3d8types.h"
+                      "${POP_ROOT}/third_party/wine-d3d8/d3d8caps.h"
+          --names "${CMAKE_CURRENT_SOURCE_DIR}/d3d8_constants.json"
+          --output "${RECOMP_D3D8_CONSTANTS}"
+  DEPENDS "${POP_ROOT}/tools/gen_d3d8_constants.py"
+          "${POP_ROOT}/third_party/wine-d3d8/d3d8types.h"
+          "${POP_ROOT}/third_party/wine-d3d8/d3d8caps.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/d3d8_constants.json"
+  VERBATIM)
+add_custom_target(d3d8_com_tables DEPENDS "${RECOMP_D3D8_COM_TABLES}" "${RECOMP_D3D8_CONSTANTS}")
 
 add_library(recomp_dx OBJECT ${POP_DX_SOURCES})
 add_dependencies(recomp_dx d3d8_com_tables)

@@ -69,7 +69,7 @@ Unsupported operations must fail with a named diagnostic, never silently succeed
 
 ## Implementation handoff
 
-- [Pinned D3D8 headers](reference/wine/README.md): unchanged Wine API references.
+- [Pinned D3D8 headers](../../third_party/wine-d3d8/README.md): unchanged Wine API references.
 
 Programmable shader translation is outside the current scope. Fixed-function
 WGSL generation remains part of the triangle milestone.

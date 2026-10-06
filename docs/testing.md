@@ -115,5 +115,9 @@ Unmapped methods become named unsupported calls. Use `--reference third_party/wi
 --bindings dx/d3d8_bindings.json --output build/d3d8-generated/d3d8_interfaces.inc`; `--check`
 verifies drift without writing. CMake generates the include into the build
 tree automatically; it records the source hash. No generated code is tracked.
+`tools/gen_d3d8_constants.py` likewise resolves the names in `dx/d3d8_constants.json`
+from `d3d8types.h`/`d3d8caps.h` into `build/d3d8-generated/d3d8_constants.inc`; an
+unknown name fails generation, and a constant the Rust ABI header also defines is
+`static_assert`ed equal to the Wine value.
 Ghost Recon's parent `tools/d3d8_codegen.py` checks both this boundary and its
 cbindgen-generated host ABI. Generator regressions run in the portable suite.

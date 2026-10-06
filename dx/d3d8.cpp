@@ -33,53 +33,24 @@ namespace {
 constexpr uint32_t D8_OK = 0;
 constexpr uint32_t D8_ERR_INVALIDCALL = 0x8876086Cu;
 constexpr uint32_t D8_ERR_NOTAVAILABLE = 0x8876086Au;
-constexpr uint32_t D8_DEVTYPE_HAL = 1;
+
+// D3D8 enum/flag values come from the pinned Wine headers
+// (third_party/wine-d3d8), resolved by tools/gen_d3d8_constants.py from
+// dx/d3d8_constants.json under the headers' own names.
+#include "d3d8_constants.inc"
 
 // D3DSWAPEFFECT. The host owns presentation: a single offscreen target is
-// blitted to the window, so DISCARD (1), FLIP (2) and COPY_VSYNC (4) all mean
+// blitted to the window, so DISCARD, FLIP and COPY_VSYNC all mean
 //
 //   "render into the target, then present the completed frame".
 //
 // FLIP is what the original asks for in fullscreen (with Windowed == FALSE).
 // DIVERGENCE(original): real FLIP rotates back-buffer ownership; the bridge's
 // presentation seam coalesces the effects.
-constexpr uint32_t D8SWAPEFFECT_DISCARD = 1;
-constexpr uint32_t D8SWAPEFFECT_FLIP = 2;
-constexpr uint32_t D8SWAPEFFECT_COPY_VSYNC = 4;
-
+//
 // D3DPRESENT_INTERVAL_*. Default (0) and IMMEDIATE both mean "do not throttle
 // this Present against a refresh count"; the host present is not vsync-bound,
 // so either is serviceable. The ONE..FOUR vblank counts are not modeled.
-constexpr uint32_t D8PRESENT_INTERVAL_IMMEDIATE = 0x80000000u;
-
-// Depth formats supported by the Rust offscreen attachment.
-constexpr uint32_t D8FMT_D16 = 80;
-constexpr uint32_t D8FMT_D24S8 = 75;
-constexpr uint32_t D8FMT_D24X8 = 77;
-constexpr uint32_t D8FMT_D32 = 71;
-
-// D3DUSAGE / D3DRESOURCETYPE / D3DPOOL bits the texture path reasons about.
-constexpr uint32_t D8USAGE_RENDERTARGET = 0x1;
-constexpr uint32_t D8USAGE_DEPTHSTENCIL = 0x2;
-constexpr uint32_t D8_RTYPE_SURFACE = 1;
-constexpr uint32_t D8_RTYPE_VOLUMETEXTURE = 2;
-constexpr uint32_t D8_RTYPE_TEXTURE = 3;
-constexpr uint32_t D8_RTYPE_CUBETEXTURE = 4;
-constexpr uint32_t D8_TYPE_SURFACE = 1;
-constexpr uint32_t D8_TYPE_TEXTURE = 3;
-constexpr uint32_t D8_TYPE_VERTEXBUFFER = 6;
-constexpr uint32_t D8_TYPE_INDEXBUFFER = 7;
-
-// D3DFORMAT values a vertex/index buffer descriptor reports.
-constexpr uint32_t D8FMT_VERTEXDATA = 100;
-constexpr uint32_t D8FMT_INDEX16 = 101;
-constexpr uint32_t D8FMT_INDEX32 = 102;
-
-// D3DPOOL. UpdateTexture's contract distinguishes the two pools it names.
-constexpr uint32_t D8POOL_DEFAULT = 0;
-constexpr uint32_t D8POOL_MANAGED = 1;
-constexpr uint32_t D8POOL_SYSTEMMEM = 2;
-constexpr uint32_t D8POOL_SCRATCH = 3;
 
 // D3D8's GetAvailableTextureMem reports free texture memory, which on the
 // modeled unified-memory machine is the runtime's deterministic available
@@ -87,10 +58,6 @@ constexpr uint32_t D8POOL_SCRATCH = 3;
 // backend exposes no VRAM budget, so this is the modeled figure, not a live
 // wgpu query.
 constexpr uint32_t D8_AVAILABLE_TEXTURE_MEM = 384u * 1024u * 1024u;
-
-constexpr uint32_t D8FMT_A8R8G8B8 = 21;
-constexpr uint32_t D8FMT_R5G6B5 = 23;
-constexpr uint32_t D8FMT_X8R8G8B8 = 0x16;
 
 // Bytes per pixel for the uncompressed D3D8 formats the bridge can hold in
 // system memory. 0 marks a format the shim does not represent (compressed DXT
@@ -111,10 +78,10 @@ uint32_t d8_format_bytes(uint32_t fmt) {
     return d3d8_format_bytes(fmt);
 #else
     switch (fmt) {
-    case D8FMT_A8R8G8B8:
-    case D8FMT_X8R8G8B8:
+    case D3DFMT_A8R8G8B8:
+    case D3DFMT_X8R8G8B8:
         return 4;
-    case D8FMT_R5G6B5:
+    case D3DFMT_R5G6B5:
     case 24: // X1R5G5B5
     case 25: // A1R5G5B5
     case 26: // A4R4G4B4
@@ -145,11 +112,8 @@ uint32_t d8_format_bytes(uint32_t fmt) {
 // upload (graphics/d3d8-wgpu/src/d3d8/format.rs). 0 marks a non-block format.
 // The guest's compressed bytes are authoritative in CPU storage; a level's
 // pitch and size are block-based (see d3d8_texture_level_layout).
-constexpr uint32_t D8FMT_DXT1 = 0x31545844u; // 'DXT1'
-constexpr uint32_t D8FMT_DXT3 = 0x33545844u; // 'DXT3'
-constexpr uint32_t D8FMT_DXT5 = 0x35545844u; // 'DXT5'
 uint32_t d8_block_bytes(uint32_t fmt) {
-    return fmt == D8FMT_DXT1 ? 8u : (fmt == D8FMT_DXT3 || fmt == D8FMT_DXT5 ? 16u : 0u);
+    return fmt == D3DFMT_DXT1 ? 8u : (fmt == D3DFMT_DXT3 || fmt == D3DFMT_DXT5 ? 16u : 0u);
 }
 
 // Adapter facts. d3d8_adapter_info builds a wgpu context, so query it once.
@@ -277,7 +241,7 @@ uint32_t host_result(X86 *c, int32_t status, const D3d8Error &err) {
 // ---------------------------------------------------------------------------
 void write_caps(uint32_t addr) {
     memset(gm_ptr(addr), 0, 212);
-    wr32(addr, D8_DEVTYPE_HAL);
+    wr32(addr, D3DDEVTYPE_HAL);
     // Caps (+0x08) stays zero: the only D3D8 bit is D3DCAPS_READ_SCANLINE
     // (0x20000), i.e. IDirect3DDevice8::GetRasterStatus, which the bridge does
     // not implement. (Caps3 +0x10 also stays zero: ALPHA_FULLSCREEN_FLIP_OR_
@@ -289,11 +253,12 @@ void write_caps(uint32_t addr) {
     // serviced from CPU storage, so dynamic textures are honest. Not advertised:
     // D3DCAPS2_FULLSCREENGAMMA / CANCALIBRATEGAMMA (no SetGammaRamp path) and
     // D3DCAPS2_NO2DDURING3DSCENE (inert: the host always composites 2D).
-    wr32(addr + 0x0c, 0x00080000u | 0x10000000u | 0x20000000u);
+    wr32(addr + 0x0c,
+         D3DCAPS2_CANRENDERWINDOWED | D3DCAPS2_CANMANAGERESOURCE | D3DCAPS2_DYNAMICTEXTURES);
     // PresentationIntervals (+0x14). The host present is not throttled against
     // a refresh count, so only IMMEDIATE is truthful. The ONE..FOUR vblank
     // intervals are not modelled and are left out.
-    wr32(addr + 0x14, D8PRESENT_INTERVAL_IMMEDIATE);
+    wr32(addr + 0x14, D3DPRESENT_INTERVAL_IMMEDIATE);
     // CursorCaps (+0x18) stays zero: SetCursorProperties/ShowCursor are not
     // implemented, so a hardware-color cursor must not be advertised (a period
     // HAL reported D3DCURSORCAPS_COLOR).
@@ -382,16 +347,21 @@ void write_caps(uint32_t addr) {
     // MIPVOLUMEMAP / VOLUMEMAP / CUBEMAP / MIPCUBEMAP and their POW2 variants
     // (no cube/volume textures), NONPOW2CONDITIONAL and
     // TEXREPEATNOTSCALEDBYSIZE (no such restriction).
-    wr32(addr + 0x3c, 0x00004405u);
+    wr32(addr + 0x3c, D3DPTEXTURECAPS_PERSPECTIVE | D3DPTEXTURECAPS_ALPHA |
+                          D3DPTEXTURECAPS_PROJECTED | D3DPTEXTURECAPS_MIPMAP);
     // TextureFilterCaps (+0x40). Point, linear and anisotropic (linear at
     // MaxAnisotropy = 1), with point/linear mip filters. Cubic stays a named
     // refusal. Cube/volume filter caps (+0x44/+0x48) stay zero: no cube or
     // volume textures.
-    wr32(addr + 0x40, 0x07030700u);
+    wr32(addr + 0x40, D3DPTFILTERCAPS_MINFPOINT | D3DPTFILTERCAPS_MINFLINEAR |
+                          D3DPTFILTERCAPS_MINFANISOTROPIC | D3DPTFILTERCAPS_MIPFPOINT |
+                          D3DPTFILTERCAPS_MIPFLINEAR | D3DPTFILTERCAPS_MAGFPOINT |
+                          D3DPTFILTERCAPS_MAGFLINEAR | D3DPTFILTERCAPS_MAGFANISOTROPIC);
     // TextureAddressCaps (+0x4c). Wrap, mirror, clamp, border and independent
     // U/V are honoured. MIRRORONCE has no wgpu equivalent and is omitted.
     // VolumeTextureAddressCaps (+0x50) stays zero (no volume textures).
-    wr32(addr + 0x4c, 0x0000001fu);
+    wr32(addr + 0x4c, D3DPTADDRESSCAPS_WRAP | D3DPTADDRESSCAPS_MIRROR | D3DPTADDRESSCAPS_CLAMP |
+                          D3DPTADDRESSCAPS_BORDER | D3DPTADDRESSCAPS_INDEPENDENTUV);
     // LineCaps (+0x54) stays zero: DrawPrimitive accepts only POINTLIST and
     // TRIANGLELIST, so textured/z-tested/blended/alpha-tested/fogged lines are
     // not offered.
@@ -417,7 +387,7 @@ void write_caps(uint32_t addr) {
     // FVFCaps (+0x8c). D3DFVFCAPS_TEXCOORDCOUNTMASK is the number of texture
     // coordinate sets the FVF decoder carries; it handles two. PSIZE (point
     // size) is not offered, so its bit stays clear.
-    wr32(addr + 0x8c, 2);
+    wr32(addr + 0x8c, 2); // D3DFVFCAPS_TEXCOORDCOUNTMASK field: two sets
     // TextureOpCaps (+0x90). The fixed-function path resolves the core
     // modulate/add/blend ops; the value matches the D3D9 bridge's declared
     // capability. A guest can read D3DTEXOPCAPS_DOTPRODUCT3 (0x00800000) as a
@@ -425,7 +395,17 @@ void write_caps(uint32_t addr) {
     // (S3TC/DXT) textures are usable, so leaving this zero silently disables
     // them even though CheckDeviceFormat accepts the DXT formats. Advertising
     // the bit is what original hardware reported.
-    wr32(addr + 0x90, 0x03feffffu);
+    wr32(addr + 0x90,
+         D3DTEXOPCAPS_DISABLE | D3DTEXOPCAPS_SELECTARG1 | D3DTEXOPCAPS_SELECTARG2 |
+             D3DTEXOPCAPS_MODULATE | D3DTEXOPCAPS_MODULATE2X | D3DTEXOPCAPS_MODULATE4X |
+             D3DTEXOPCAPS_ADD | D3DTEXOPCAPS_ADDSIGNED | D3DTEXOPCAPS_ADDSIGNED2X |
+             D3DTEXOPCAPS_SUBTRACT | D3DTEXOPCAPS_ADDSMOOTH | D3DTEXOPCAPS_BLENDDIFFUSEALPHA |
+             D3DTEXOPCAPS_BLENDTEXTUREALPHA | D3DTEXOPCAPS_BLENDFACTORALPHA |
+             D3DTEXOPCAPS_BLENDTEXTUREALPHAPM | D3DTEXOPCAPS_BLENDCURRENTALPHA |
+             D3DTEXOPCAPS_MODULATEALPHA_ADDCOLOR | D3DTEXOPCAPS_MODULATECOLOR_ADDALPHA |
+             D3DTEXOPCAPS_MODULATEINVALPHA_ADDCOLOR | D3DTEXOPCAPS_MODULATEINVCOLOR_ADDALPHA |
+             D3DTEXOPCAPS_BUMPENVMAP | D3DTEXOPCAPS_BUMPENVMAPLUMINANCE | D3DTEXOPCAPS_DOTPRODUCT3 |
+             D3DTEXOPCAPS_MULTIPLYADD | D3DTEXOPCAPS_LERP);
     // MaxTextureBlendStages/MaxSimultaneousTextures (+0x94/+0x98). Guest
     // 0x007c2160 clamps both to 2 and only sets up (and later binds) that many
     // texture stages; at 0 the game renders everything untextured, and at 1 it
@@ -439,7 +419,9 @@ void write_caps(uint32_t addr) {
     // COLOR1/COLOR2 material sources, directional/point/spot lights, the local
     // viewer and the no-UBYTE4 rule are implemented. Not advertised: TWEENING
     // (no vertex blending).
-    wr32(addr + 0x9c, 0x000000bbu);
+    wr32(addr + 0x9c, D3DVTXPCAPS_TEXGEN | D3DVTXPCAPS_MATERIALSOURCE7 |
+                          D3DVTXPCAPS_DIRECTIONALLIGHTS | D3DVTXPCAPS_POSITIONALLIGHTS |
+                          D3DVTXPCAPS_LOCALVIEWER | D3DVTXPCAPS_NO_VSDT_UBYTE4);
     // MaxActiveLights (+0xa0) matches the bridge's eight-light state;
     // MaxUserClipPlanes (+0xa4), MaxVertexBlendMatrices (+0xa8) and
     // MaxVertexBlendMatrixIndex (+0xac) stay zero because clip planes and
@@ -482,7 +464,7 @@ std::vector<DisplayMode> display_modes() {
     uint32_t dw = 0, dh = 0, dbpp = 0;
     win32_display_mode(&dw, &dh, &dbpp);
     if (dw && dh)
-        result.push_back({dw, dh, 0, D8FMT_X8R8G8B8});
+        result.push_back({dw, dh, 0, D3DFMT_X8R8G8B8});
     static const uint32_t kStandard[][2] = {
         {640, 480},
         {800, 600},
@@ -497,21 +479,21 @@ std::vector<DisplayMode> display_modes() {
     };
     for (const auto &m : kStandard)
         if (m[0] != dw || m[1] != dh)
-            result.push_back({m[0], m[1], 0, D8FMT_X8R8G8B8});
+            result.push_back({m[0], m[1], 0, D3DFMT_X8R8G8B8});
     return result;
 }
 
 bool adapter_type(X86 *c) {
-    return arg(c, 1) == 0 && arg(c, 2) == D8_DEVTYPE_HAL && ensure_adapter();
+    return arg(c, 1) == 0 && arg(c, 2) == D3DDEVTYPE_HAL && ensure_adapter();
 }
 bool color_format(uint32_t format) {
-    return format == D8FMT_A8R8G8B8 || format == D8FMT_X8R8G8B8;
+    return format == D3DFMT_A8R8G8B8 || format == D3DFMT_X8R8G8B8;
 }
 
 // True when a raw D3DFORMAT is one of the four depth/stencil formats the
 // wgpu backend maps to an honest format (see graphics/d3d8-wgpu format.rs).
 bool d8_depth_format(uint32_t fmt) {
-    return fmt == D8FMT_D16 || fmt == D8FMT_D24S8 || fmt == D8FMT_D24X8 || fmt == D8FMT_D32;
+    return fmt == D3DFMT_D16 || fmt == D3DFMT_D24S8 || fmt == D3DFMT_D24X8 || fmt == D3DFMT_D32;
 }
 
 // True when CheckDeviceFormat should answer D3D_OK for a usage/rtype/format
@@ -519,16 +501,16 @@ bool d8_depth_format(uint32_t fmt) {
 // a device. Depth-stencil use is backed for the four mapped depth formats; the
 // CPU formats and GPU sampling support are separate capabilities.
 bool check_device_format_ok(uint32_t usage, uint32_t rtype, uint32_t fmt) {
-    if (usage & D8USAGE_DEPTHSTENCIL)
-        return rtype == D8_RTYPE_SURFACE && d8_depth_format(fmt);
-    if (usage & D8USAGE_RENDERTARGET) {
+    if (usage & D3DUSAGE_DEPTHSTENCIL)
+        return rtype == D3DRTYPE_SURFACE && d8_depth_format(fmt);
+    if (usage & D3DUSAGE_RENDERTARGET) {
         // A render target is either a standalone surface or a level-0
         // DEFAULT-pool texture; the bridge keeps the latter CPU-backed and
         // binds it through SetRenderTarget. Both are limited to the color
         // formats the offscreen target can hold.
-        return (rtype == D8_RTYPE_SURFACE || rtype == D8_RTYPE_TEXTURE) && color_format(fmt);
+        return (rtype == D3DRTYPE_SURFACE || rtype == D3DRTYPE_TEXTURE) && color_format(fmt);
     }
-    if (rtype == D8_RTYPE_TEXTURE)
+    if (rtype == D3DRTYPE_TEXTURE)
         return d8_format_bytes(fmt) != 0 || d8_block_bytes(fmt) != 0;
     return false;
 }
@@ -609,7 +591,7 @@ void D8_GetAdapterDisplayMode(X86 *c) {
         com_ret(c, D8_ERR_NOTAVAILABLE);
         return;
     }
-    write_display_mode(out, {w, h, 0, D8FMT_X8R8G8B8});
+    write_display_mode(out, {w, h, 0, D3DFMT_X8R8G8B8});
     com_ret(c, D8_OK);
 }
 void D8_CheckDeviceType(X86 *c) {
@@ -633,7 +615,7 @@ void D8_CheckDeviceFormat(X86 *c) {
     // refuses to sample a non-ARGB format by name if one is ever bound.
     uint32_t usage = arg(c, 4), rtype = arg(c, 5), fmt = arg(c, 6);
     bool ok = false;
-    if (adapter_type(c) && arg(c, 3) == D8FMT_X8R8G8B8) {
+    if (adapter_type(c) && arg(c, 3) == D3DFMT_X8R8G8B8) {
         if (check_device_format_ok(usage, rtype, fmt))
             ok = true;
     }
@@ -716,7 +698,7 @@ ComObj *device_implicit_surface(ComObj *dev, uint32_t w, uint32_t h, uint32_t fo
     surface->height = h;
     surface->rmask = format;
     surface->d3d8_depth = depth;
-    surface->d3d8_usage = depth ? D8USAGE_DEPTHSTENCIL : D8USAGE_RENDERTARGET;
+    surface->d3d8_usage = depth ? D3DUSAGE_DEPTHSTENCIL : D3DUSAGE_RENDERTARGET;
     com_internalize(surface); // the device's ownership reference
     return surface;
 }
@@ -789,9 +771,9 @@ void D8_CreateDevice(X86 *c) {
     // guest surface is its handle. The presentation interval accepts Default
     // and IMMEDIATE, the ways RT3 asks for an unthrottled Present.
     uint32_t depth = rd32(pp + 32), depth_format = rd32(pp + 36), interval = rd32(pp + 48);
-    bool swap_ok = swap == D8SWAPEFFECT_DISCARD || swap == D8SWAPEFFECT_COPY_VSYNC ||
-                   (swap == D8SWAPEFFECT_FLIP && !windowed);
-    bool interval_ok = interval == 0 || interval == D8PRESENT_INTERVAL_IMMEDIATE;
+    bool swap_ok = swap == D3DSWAPEFFECT_DISCARD || swap == D3DSWAPEFFECT_COPY_VSYNC ||
+                   (swap == D3DSWAPEFFECT_FLIP && !windowed);
+    bool interval_ok = interval == 0 || interval == D3DPRESENT_INTERVAL_IMMEDIATE;
     if (rd32(pp + 12) > 1 || rd32(pp + 16) || !swap_ok ||
         (depth && !d8_depth_format(depth_format)) || rd32(pp + 40) || rd32(pp + 44) ||
         !interval_ok) {
@@ -1427,7 +1409,7 @@ void diagnose_render_target(X86 *c, ComObj *dev, uint32_t rt_arg, ComObj *rt, ui
                 label, pointer, o->id, o->d3d8_owner, o->d3d8_texture, o->d3d8_level,
                 implicit ? owner->d3d8_width : o->width, implicit ? owner->d3d8_height : o->height,
                 implicit ? owner->d3d8_format : o->rmask,
-                implicit ? D8USAGE_RENDERTARGET : o->d3d8_usage, o->d3d8_pool,
+                implicit ? D3DUSAGE_RENDERTARGET : o->d3d8_usage, o->d3d8_pool,
                 unsigned(o->d3d8_depth), unsigned(implicit));
     };
     surface("backbuffer", 0, dev ? com_get(dev->d3d8_backbuffer) : nullptr);
@@ -1458,7 +1440,7 @@ void Dev_SetRenderTarget(X86 *c) {
     bool rejected = !dev || (rt_arg && (!rt || rt->d3d8_depth || rt->d3d8_owner != dev->id)) ||
                     (ds_arg && (!ds || !ds->d3d8_depth || ds->d3d8_owner != dev->id));
     if (dev && rt && rt->id != dev->d3d8_backbuffer &&
-        (!(rt->d3d8_usage & D8USAGE_RENDERTARGET) || rt->d3d8_pool != D8POOL_DEFAULT ||
+        (!(rt->d3d8_usage & D3DUSAGE_RENDERTARGET) || rt->d3d8_pool != D3DPOOL_DEFAULT ||
          rt->d3d8_level != 0 || !rt->pixels_bytes || rt->lock_count))
         rejected = true;
     if (rejected) {
@@ -1548,7 +1530,7 @@ void Dev_CreateTexture(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if (usage & D8USAGE_DEPTHSTENCIL) {
+    if (usage & D3DUSAGE_DEPTHSTENCIL) {
         diagnose_create_texture(
             "D3DUSAGE_DEPTHSTENCIL textures are not implemented; use CreateDepthStencilSurface",
             dev, w, h, levels, usage, format, pool);
@@ -1691,7 +1673,7 @@ void Dev_CreateDepthStencilSurface(X86 *c) {
     com_addref(dev);
     surface->d3d8_owner_retained = true;
     surface->d3d8_depth = true;
-    surface->d3d8_usage = D8USAGE_DEPTHSTENCIL;
+    surface->d3d8_usage = D3DUSAGE_DEPTHSTENCIL;
     surface->rmask = format;
     surface->width = w;
     surface->height = h;
@@ -1744,7 +1726,7 @@ void Dev_UpdateTexture(X86 *c) {
         return;
     }
     if (src->rmask != dst->rmask || src->d3d8_levels.size() != dst->d3d8_levels.size() ||
-        src->d3d8_pool != D8POOL_SYSTEMMEM || dst->d3d8_pool != D8POOL_DEFAULT) {
+        src->d3d8_pool != D3DPOOL_SYSTEMMEM || dst->d3d8_pool != D3DPOOL_DEFAULT) {
         LOGW("d3d8: UpdateTexture needs equal formats and level counts, SYSTEMMEM source and "
              "DEFAULT destination (fmt 0x%x/0x%x, pools %u/%u)",
              src->rmask, dst->rmask, src->d3d8_pool, dst->d3d8_pool);
@@ -1866,11 +1848,11 @@ void Surface_GetDesc(X86 *c) {
         // Autodepth handle. Its bytes live in the Rust target; the descriptor
         // reports the D3D8 depth size (D16 is 2 bytes/texel, the rest 4).
         format = surface->rmask;
-        usage = D8USAGE_DEPTHSTENCIL;
+        usage = D3DUSAGE_DEPTHSTENCIL;
         pool = 0; // D3DPOOL_DEFAULT
         width = surface->width;
         height = surface->height;
-        size = width * height * (surface->rmask == D8FMT_D16 ? 2u : 4u);
+        size = width * height * (surface->rmask == D3DFMT_D16 ? 2u : 4u);
     } else {
         ComObj *dev = com_get(surface->d3d8_owner);
         if (!dev) {
@@ -1878,14 +1860,14 @@ void Surface_GetDesc(X86 *c) {
             return;
         }
         format = dev->d3d8_format;
-        usage = D8USAGE_RENDERTARGET;
+        usage = D3DUSAGE_RENDERTARGET;
         pool = 0; // D3DPOOL_DEFAULT
         width = dev->d3d8_width;
         height = dev->d3d8_height;
         size = width * height * 4;
     }
     wr32(out + 0, format);
-    wr32(out + 4, D8_TYPE_SURFACE);
+    wr32(out + 4, D3DRTYPE_SURFACE);
     wr32(out + 8, usage);
     wr32(out + 12, pool);
     wr32(out + 16, size);
@@ -2002,7 +1984,7 @@ void Tex_PreLoad(X86 *c) {
     com_ret(c, D8_OK);
 }
 void Tex_GetType(X86 *c) {
-    com_ret(c, D8_TYPE_TEXTURE);
+    com_ret(c, D3DRTYPE_TEXTURE);
 }
 void Tex_SetLOD(X86 *c) {
     ComObj *tex = d8_tex(c);
@@ -2028,7 +2010,7 @@ void Tex_GetLevelDesc(X86 *c) {
         return;
     }
     wr32(out + 0, level->rmask);
-    wr32(out + 4, D8_TYPE_SURFACE);
+    wr32(out + 4, D3DRTYPE_SURFACE);
     wr32(out + 8, level->d3d8_usage);
     wr32(out + 12, level->d3d8_pool);
     wr32(out + 16, level->pixels_bytes);
@@ -2215,7 +2197,7 @@ void Buffer_GetType(X86 *c) {
     ComObj *o = d8_buffer(c);
     uint32_t type = 0;
     if (o)
-        type = o->kind == K_D3D8VERTEXBUFFER ? D8_TYPE_VERTEXBUFFER : D8_TYPE_INDEXBUFFER;
+        type = o->kind == K_D3D8VERTEXBUFFER ? D3DRTYPE_VERTEXBUFFER : D3DRTYPE_INDEXBUFFER;
     com_ret(c, type);
 }
 // D3DVERTEXBUFFER_DESC is 24 bytes, D3DINDEXBUFFER_DESC is 20. A vertex
@@ -2234,8 +2216,8 @@ void Buffer_GetDesc(X86 *c) {
             com_ret(c, D8_ERR_INVALIDCALL);
             return;
         }
-        wr32(out + 0, D8FMT_VERTEXDATA);
-        wr32(out + 4, D8_TYPE_VERTEXBUFFER);
+        wr32(out + 0, D3DFMT_VERTEXDATA);
+        wr32(out + 4, D3DRTYPE_VERTEXBUFFER);
         wr32(out + 8, o->d3d8_buffer_usage);
         wr32(out + 12, o->d3d8_buffer_pool);
         wr32(out + 16, size);
@@ -2246,7 +2228,7 @@ void Buffer_GetDesc(X86 *c) {
             return;
         }
         wr32(out + 0, o->d3d8_buffer_format);
-        wr32(out + 4, D8_TYPE_INDEXBUFFER);
+        wr32(out + 4, D3DRTYPE_INDEXBUFFER);
         wr32(out + 8, o->d3d8_buffer_usage);
         wr32(out + 12, o->d3d8_buffer_pool);
         wr32(out + 16, size);
@@ -2314,7 +2296,7 @@ void Dev_CreateIndexBuffer(X86 *c) {
     if (out && gm_valid(out, 4))
         wr32(out, 0);
     if (!dev || !out || !gm_valid(out, 4) || !bytes ||
-        (format != D8FMT_INDEX16 && format != D8FMT_INDEX32)) {
+        (format != D3DFMT_INDEX16 && format != D3DFMT_INDEX32)) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
