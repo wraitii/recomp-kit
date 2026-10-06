@@ -28,6 +28,9 @@ static const uint32_t DD_OK = 0u;
 static const uint32_t DDERR_GENERIC = E_FAIL;
 static const uint32_t DDERR_INVALIDPARAMS = E_INVALIDARG;
 static const uint32_t DDERR_INVALIDOBJECT = MAKE_DDHRESULT(130);
+static const uint32_t DDERR_INVALIDCAPS = MAKE_DDHRESULT(100);
+static const uint32_t DDERR_CANNOTATTACHSURFACE = MAKE_DDHRESULT(10);
+static const uint32_t DDERR_CANNOTDETACHSURFACE = MAKE_DDHRESULT(20);
 static const uint32_t DDERR_OUTOFMEMORY = E_OUTOFMEMORY;
 // A video-memory surface could not be allocated. A real driver returns this
 // when VRAM is full, and the engine's texture-pool loop stops on it.
@@ -219,6 +222,7 @@ static const uint32_t DDSCAPS_OWNDC = 0x00040000u;
 static const uint32_t DDSCAPS_LIVEVIDEO = 0x00080000u;
 static const uint32_t DDSCAPS_MODEX = 0x00200000u;
 static const uint32_t DDSCAPS_MIPMAP = 0x00400000u;
+static const uint32_t DDSCAPS2_MIPMAPSUBLEVEL = 0x00010000u;
 static const uint32_t DDSCAPS_ALLOCONLOAD = 0x04000000u;
 static const uint32_t DDSCAPS_LOCALVIDMEM = 0x10000000u;
 static const uint32_t DDSCAPS_NONLOCALVIDMEM = 0x20000000u;
@@ -912,3 +916,14 @@ static_assert(sizeof(D3D11_BLEND_DESC) == 264 &&
               offsetof(D3D11_RENDER_TARGET_BLEND_DESC, RenderTargetWriteMask) == 28);
 static_assert(sizeof(D3D11_SAMPLER_DESC) == 52 && offsetof(D3D11_SAMPLER_DESC, BorderColor) == 28);
 static_assert(sizeof(D3D11_INPUT_ELEMENT_DESC) == 28 && sizeof(D3D11_RASTERIZER_DESC) == 40);
+
+// Shared D3D7/D3D8 capability bits (pinned Wine d3d8caps.h).
+enum : uint32_t {
+    D3DPTEXTURECAPS_MIPMAP = 0x00004000,
+    D3DPTFILTERCAPS_MINFPOINT = 0x00000100,
+    D3DPTFILTERCAPS_MINFLINEAR = 0x00000200,
+    D3DPTFILTERCAPS_MIPFPOINT = 0x00010000,
+    D3DPTFILTERCAPS_MIPFLINEAR = 0x00020000,
+    D3DPTFILTERCAPS_MAGFPOINT = 0x01000000,
+    D3DPTFILTERCAPS_MAGFLINEAR = 0x02000000,
+};

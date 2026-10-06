@@ -377,6 +377,10 @@ struct ComObj {
     uint32_t front_obj = 0;           // the primary this back buffer belongs to
     bool implicit_backbuffer = false; // CreateSurface child: lifetime belongs to the flip chain
     uint32_t zbuffer_obj = 0;         // the Z buffer attached to this surface
+    // Implicit mip children have guest-addressable storage and die with their
+    // texture root. This link is separate from the flip/depth attachments.
+    uint32_t mip_next = 0;
+    bool mip_sublevel = false;
     // Pixels changed while this surface had no texture handle. GetHandle
     // sends them when the handle is made, so a texture that was filled before
     // anything asked for its handle is not uploaded empty.

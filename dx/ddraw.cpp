@@ -471,6 +471,14 @@ void write_pixel_format(uint32_t addr, const ComObj *s) {
     }
 }
 
+// Each level describes the remaining chain, as DirectDraw's Lock/GetDesc do.
+static uint32_t mip_count(const ComObj *surface) {
+    uint32_t count = 0;
+    for (const ComObj *level = surface; level; level = com_get(level->mip_next))
+        ++count;
+    return count;
+}
+
 // Fills a surface description. `lpsurface` non-zero adds DDSD_LPSURFACE and
 // the pointer, which is what Lock does and GetSurfaceDesc does not.
 void fill_desc(uint32_t addr, const ComObj *s, bool v2, uint32_t lpsurface) {
@@ -482,6 +490,10 @@ void fill_desc(uint32_t addr, const ComObj *s, bool v2, uint32_t lpsurface) {
     gm_zero(addr, size);
     wr32(addr + DDSD_OFF_dwSize, size);
     uint32_t flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT;
+    if (s->caps & DDSCAPS_MIPMAP) {
+        flags |= DDSD_MIPMAPCOUNT;
+        wr32(addr + DDSD_OFF_dwMipMapCount, mip_count(s));
+    }
     wr32(addr + DDSD_OFF_dwHeight, s->height);
     wr32(addr + DDSD_OFF_dwWidth, s->width);
     // A driver reports a compressed surface's TOP-LEVEL linear size, not the
@@ -514,12 +526,20 @@ void fill_desc(uint32_t addr, const ComObj *s, bool v2, uint32_t lpsurface) {
     }
     wr32(addr + DDSD_OFF_dwFlags, flags);
     wr32(addr + desc_caps_off(), s->caps); // DDSCAPS2's upper dwords stay zero
+    if (v2 && s->mip_sublevel)
+        wr32(addr + desc_caps_off() + 4, DDSCAPS2_MIPMAPSUBLEVEL);
 }
 
 // ---------------------------------------------------------------------------
 // Surfaces
 // ---------------------------------------------------------------------------
 void surface_destroy(ComObj *s) {
+    // Implicit mip interfaces have independent external references, but the
+    // complex texture owns their storage/lifetime (Wine surface cleanup).
+    if (ComObj *child = com_get(s->mip_next)) {
+        s->mip_next = 0;
+        com_destroy(child);
+    }
     surface_refund_vram(s);
     if (s->dc_handle)
         gdi_unbind_surface_dc(s->dc_handle);
@@ -2964,6 +2984,12 @@ void Surface_AddAttachedSurface(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
+    // Surface7 permits explicit depth attachments, not mip attachments.
+    // Mip chains are created implicitly by CreateSurface (Wine/MSDN).
+    if ((s->caps & a->caps & DDSCAPS_MIPMAP) != 0) {
+        com_ret(c, DDERR_CANNOTATTACHSURFACE);
+        return;
+    }
     // The only attachments this shim models are a flip chain's back buffer and
     // a Z buffer.
     //
@@ -3244,6 +3270,10 @@ void Surface_DeleteAttachedSurface(X86 *c) {
         com_ret(c, DDERR_INVALIDOBJECT);
         return;
     }
+    if (a && s->mip_next == a->id) {
+        com_ret(c, DDERR_CANNOTDETACHSURFACE);
+        return;
+    }
     if (a && s->back_obj == a->id) {
         s->back_obj = 0;
         a->front_obj = 0;
@@ -3265,6 +3295,16 @@ void Surface_EnumAttachedSurfaces(X86 *c) {
     }
     bool v2 = this_is_v2_iface(c);
     ComIface want = surface_iface_of(com_iface_of(arg(c, 0)));
+    if (ComObj *mip = com_get(s->mip_next)) {
+        uint32_t desc = scratch(DDSD2_SIZE);
+        fill_desc(desc, mip, v2, 0);
+        uint32_t view = com_view(mip, want);
+        com_addref(mip);
+        if (guest_call(c, cb, view, desc, ctx) != DDENUMRET_OK) {
+            com_ret(c, DD_OK);
+            return;
+        }
+    }
     for (uint32_t id = s->back_obj; id;) {
         ComObj *b = com_get(id);
         if (!b)
@@ -3363,6 +3403,22 @@ void Surface_GetAttachedSurface(X86 *c) {
     }
     com_out_ptr(out, 0);
     uint32_t want = caps_addr && gm_valid(caps_addr, 4) ? rd32(caps_addr) : 0;
+    if (ComObj *mip = com_get(s->mip_next)) {
+        uint32_t want2 =
+            this_is_v2_iface(c) && caps_addr && gm_valid(caps_addr, 16) ? rd32(caps_addr + 4) : 0;
+        if ((mip->caps & want) == want && (want2 & ~DDSCAPS2_MIPMAPSUBLEVEL) == 0) {
+            ComIface f = com_iface_of(arg(c, 0));
+            uint32_t view = com_view(mip, f == IF_NONE ? IF_DDSURFACE : f);
+            if (!view) {
+                com_ret(c, E_OUTOFMEMORY);
+                return;
+            }
+            com_addref(mip);
+            com_out_ptr(out, view);
+            com_ret(c, DD_OK);
+            return;
+        }
+    }
     // The Z buffer is attached to the surface itself rather than being a link
     // in the flip chain, so it is looked at first.
     if (s->zbuffer_obj && (want & DDSCAPS_ZBUFFER)) {
@@ -3420,6 +3476,8 @@ void Surface_GetCaps(X86 *c) {
     }
     gm_zero(out, caps_bytes);
     wr32(out, s->caps);
+    if (caps_bytes == 16 && s->mip_sublevel)
+        wr32(out + 4, DDSCAPS2_MIPMAPSUBLEVEL);
     com_ret(c, DD_OK);
 }
 
@@ -4547,6 +4605,11 @@ void create_surface(X86 *c, ComIface surface_iface) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
+    if ((caps & DDSCAPS_MIPMAP) && (!(caps & DDSCAPS_TEXTURE) || (caps & DDSCAPS_FLIP) ||
+                                    ((flags & DDSD_MIPMAPCOUNT) && !(caps & DDSCAPS_COMPLEX)))) {
+        com_ret(c, DDERR_INVALIDCAPS);
+        return;
+    }
 
     ComObj *s = com_new(K_SURFACE);
     s->caps = caps;
@@ -4623,6 +4686,22 @@ void create_surface(X86 *c, ComIface surface_iface) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
+    uint32_t levels = 1;
+    if ((caps & (DDSCAPS_MIPMAP | DDSCAPS_COMPLEX)) == (DDSCAPS_MIPMAP | DDSCAPS_COMPLEX)) {
+        // v7 follows the longest edge to 1x1; older interfaces stop when the
+        // shorter edge reaches 1. Explicit counts include the base level.
+        uint32_t edge = surface_iface == IF_DDSURFACE7 ? std::max(s->width, s->height)
+                                                       : std::min(s->width, s->height);
+        uint32_t full = 1;
+        for (; edge > 1; edge >>= 1)
+            ++full;
+        levels = flags & DDSD_MIPMAPCOUNT ? rd32(desc + DDSD_OFF_dwMipMapCount) : full;
+        if (!levels || levels > full) {
+            com_release(s);
+            com_ret(c, DDERR_INVALIDPARAMS);
+            return;
+        }
+    }
     set_rgb_masks(s);
     // Honour an explicit RGB mask so a 16-bit 5-5-5 surface is not silently
     // reported as 5-6-5.
@@ -4662,6 +4741,34 @@ void create_surface(X86 *c, ComIface surface_iface) {
         com_release(s);
         com_ret(c, DDERR_OUTOFMEMORY);
         return;
+    }
+
+    // Allocate every implicit level through the ordinary surface allocator:
+    // each Lock has its own guest pointer/pitch, VRAM charge and generation.
+    ComObj *mip_tail = s;
+    for (uint32_t level = 1; level < levels; ++level) {
+        ComObj *mip = com_new(K_SURFACE);
+        mip->owner_dd = dd->id;
+        mip->caps = s->caps;
+        mip->mip_sublevel = true;
+        mip->width = std::max(1u, mip_tail->width / 2);
+        mip->height = std::max(1u, mip_tail->height / 2);
+        mip->bpp = s->bpp;
+        mip->fourcc = s->fourcc;
+        mip->rmask = s->rmask;
+        mip->gmask = s->gmask;
+        mip->bmask = s->bmask;
+        mip->amask = s->amask;
+        const bool charged = surface_charge_vram(dd, mip);
+        if (!charged || !surface_alloc_pixels(mip)) {
+            com_release(mip);
+            com_release(s);
+            com_ret(c, charged ? DDERR_OUTOFMEMORY : DDERR_OUTOFVIDEOMEMORY);
+            return;
+        }
+        mip_tail->mip_next = mip->id;
+        mip_tail = mip;
+        dd->surfaces.push_back(mip->id);
     }
 
     // A complex flip chain: build dwBackBufferCount back buffers behind the
