@@ -64,15 +64,17 @@ class SSA:
 MEMORY = ("memory", 0)
 
 
-def build(fir, *, register_groups=(), call_targets=()):
+def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None):
     """Build SSA for reachable integer instructions using the supplied CFG.
 
     A direct CALL is admitted only when its literal target appears in
     `call_targets`; the caller that binds the target to a C symbol owns that
-    mapping. Indirect calls, raw x87 and intra-instruction branches still need
-    additional state/CFG models and are deliberately rejected. A ram varnode is
-    a control target only; ordinary guest memory remains behind LOAD/STORE and
-    the memory token.
+    mapping. Indirect calls are admitted only when `indirect_call_symbol` names
+    the runtime dispatch used for them, and must have a canonical fallthrough;
+    the caller/user is responsible for the target value's 32-bit width. Raw
+    x87 and intra-instruction branches still need additional state/CFG models
+    and are deliberately rejected. A ram varnode is a control target only;
+    ordinary guest memory remains behind LOAD/STORE and the memory token.
     """
     call_targets = frozenset(call_targets)
     if not fir.insns or len(fir.succ) != len(fir.insns):
@@ -108,8 +110,23 @@ def build(fir, *, register_groups=(), call_targets=()):
             fall_index = indices.get(ins.addr + ins.length)
             if fall_index is None or set(fir.succ[i]) != {fall_index}:
                 raise SSAError("%08x: direct call lacks its canonical fallthrough" % ins.addr)
+        indirect_ops = [op for op in ins.ops if op.opc == "CALLIND"]
+        if indirect_ops:
+            if indirect_call_symbol is None:
+                raise SSAError("%08x: opaque effect CALLIND" % ins.addr)
+            if len(indirect_ops) > 1:
+                raise SSAError("%08x: multiple indirect calls in one instruction" % ins.addr)
+            target = indirect_ops[0].ins
+            if (len(target) != 1 or target[0][0] == "ram" or target[0][2] != 4):
+                raise SSAError("%08x: indirect call target is not a 32-bit value" % ins.addr)
+            # Indirect calls must also continue exactly at their own
+            # fallthrough; noreturn/tail/alternate-entry shapes stay fallback.
+            fall_index = indices.get(ins.addr + ins.length)
+            if fall_index is None or set(fir.succ[i]) != {fall_index}:
+                raise SSAError("%08x: indirect call lacks its canonical fallthrough" % ins.addr)
         for op in ins.ops:
-            if op.opc in ("CALLIND", "BRANCHIND", "CALLOTHER"):
+            if op.opc in ("BRANCHIND", "CALLOTHER") or (
+                    op.opc == "CALLIND" and indirect_call_symbol is None):
                 raise SSAError("%08x: opaque effect %s" % (ins.addr, op.opc))
             control_target = op.ins[0] if op.opc in ("BRANCH", "CBRANCH", "CALL") and op.ins else None
             for v in (op.out,) + op.ins:
@@ -188,6 +205,22 @@ def build(fir, *, register_groups=(), call_targets=()):
                         # a reload that no later observation uses.
                         state[key] = emit("CALL_RELOAD", s.inputs[key].size, [value], data=key)
                 continue
+            if op.opc == "CALLIND":
+                # An opaque indirect call: publish the pre-call CPU (including
+                # the target), dispatch through the runtime, then reload every
+                # tracked register lane, flag and the memory token. The target
+                # expression was read before the return-address store that the
+                # lifted CALL sequence already emitted, so ESP-relative reads
+                # keep their instruction order.
+                target = read(op.ins[0])
+                before = dict(state)
+                value = emit("CALLIND", 0, [state[MEMORY], target], data=indirect_call_symbol)
+                b.snapshots[value.id] = before
+                state[MEMORY] = emit("MEMORY", 0, [value])
+                for key in keys:
+                    if key != MEMORY:
+                        state[key] = emit("CALL_RELOAD", s.inputs[key].size, [value], data=key)
+                continue
             args = [read(v) for v in op.ins]
             if op.opc in ORDERED:
                 before = dict(state)
@@ -199,6 +232,14 @@ def build(fir, *, register_groups=(), call_targets=()):
                 value = emit(op.opc, op.out[2] if op.out else 0, args, op.data)
             if op.out is not None:
                 write(op.out, value)
+            if op.opc in ("DIV32", "IDIV32", "MOVS32"):
+                # A returning divide-error handler and the string helper's
+                # fault path may leave arbitrary CPU state behind. Reload every
+                # tracked lane and flag from the helper's result state, exactly
+                # as the eager emitter publishes and reloads live locals.
+                for key in keys:
+                    if key != MEMORY:
+                        state[key] = emit("CALL_RELOAD", s.inputs[key].size, [value], data=key)
         b.exit = state
         branches = [op for op in b.insn.ops if op.opc in BRANCHES]
         if len(branches) > 1:

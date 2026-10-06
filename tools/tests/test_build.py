@@ -12,6 +12,32 @@ build = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(build)
 
 
+def test_translation_fingerprint_tracks_nested_frontend_sources(tmp_path, monkeypatch):
+    kit = tmp_path / "kit"
+    for name in ("tools/recomp/translate.py", "tools/recomp/ir/emit_c.py",
+                 "tools/game_config.py", "tools/gen_game_config.py"):
+        path = kit / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("initial\n")
+    game = tmp_path / "game"
+    game.mkdir()
+    listings = game / "listings"
+    listings.mkdir()
+    cfg = {"translate": {}, "game": {"sha256": "image-identity"},
+           "listings_path": listings, "aux_modules": []}
+    monkeypatch.setattr(build, "ROOT", kit)
+    initial = build.translation_fingerprint(game, cfg, {})
+    emitter = kit / "tools/recomp/ir/emit_c.py"
+    emitter.write_text("changed lowering\n")
+    changed = build.translation_fingerprint(game, cfg, {})
+    assert changed != initial
+    assert build.translation_fingerprint(game, cfg, {}) == changed
+    tests = kit / "tools/recomp/tests/test_emitter.py"
+    tests.parent.mkdir()
+    tests.write_text("test-only edit\n")
+    assert build.translation_fingerprint(game, cfg, {}) == changed
+
+
 def test_mods_targets_match_the_game_fixture(tmp_path):
     spec = importlib.util.spec_from_file_location("test_runner", build.ROOT / "tools/test.py")
     test_runner = importlib.util.module_from_spec(spec)

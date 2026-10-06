@@ -5,7 +5,8 @@ move effects: even unused LOAD results retain their access and pre-access state.
 The passes work on SSA rather than C spelling and can serve other consumers.
 """
 
-EFFECTS = frozenset(("LOAD", "STORE", "DIV32", "IDIV32", "X87_MEM", "CALL"))
+EFFECTS = frozenset(("LOAD", "STORE", "DIV32", "IDIV32", "X87_MEM", "CALL",
+                     "CALLIND", "MOVS32"))
 ORDERED = EFFECTS | {"X87_REG"}
 TERMINATORS = frozenset(("BRANCH", "CBRANCH", "RETURN"))
 PURE = frozenset((

@@ -346,10 +346,14 @@ def translation_fingerprint(game_dir, cfg, translate_args):
     every listing would cost more than it saves."""
     h = hashlib.sha256()
     h.update(b"recomp-translate-v2\n")
-    sources = sorted((ROOT / "tools/recomp").glob("*.py"))
+    translator_root = ROOT / "tools/recomp"
+    # Frontend packages (notably ir/) affect production output just as the
+    # top-level translator does. Keep tests out of the cache identity.
+    sources = sorted(path for path in translator_root.rglob("*.py")
+                     if "tests" not in path.relative_to(translator_root).parts)
     sources += [ROOT / "tools/game_config.py", ROOT / "tools/gen_game_config.py"]
     for path in sources:
-        h.update(path.name.encode() + b"\0" + path.read_bytes())
+        h.update(path.relative_to(ROOT).as_posix().encode() + b"\0" + path.read_bytes())
     for name in ("game.toml", cfg["translate"].get("globals", "globals.toml")):
         path = game_dir / name
         if path.is_file():

@@ -108,11 +108,14 @@ contracts and the consolidated fragment/LLVM modes. Game assembly and outputs
 remain private; these checks do not establish original-x86 equivalence.
 
 `tools/build.py --ir-ssa-checks` compares the experimental integer SSA C emitter
-with eager C using 142 byte-backed synthetic fixtures, 24576 inputs each,
+with eager C using 151 byte-backed synthetic fixtures, 24576 inputs each,
 and complete CPU/2 KiB scratch comparisons. It covers partial registers, loops,
 memory aliases, INC/DEC/SBB/ADC, memory RMW snapshots, extensions, masked shifts,
 checked signed/unsigned division, multiplication, all SETcc conditions, absolute
-memory accesses and declared calls with both mock and byte-translated callees.
+memory accesses and declared calls with both mock and byte-translated callees. Explicit indirect
+call fixtures cover register and ESP-relative targets, live x87 state, and normal
+or diverted resumable continuation. Dword string moves cover zero count, both
+DF directions and overlapping copies with store observations.
 Effects, cached values, region, scalar, scalar-strict and scalar/local-state
 are compared in ordinary and null-check builds. Scalar/local-state retains
 complete outgoing state and integer-store snapshots while deferring ordinary
@@ -123,7 +126,7 @@ Native read-only store observers additionally compare complete CPU snapshots,
 addresses, widths and values, with explicit branch-join, loop-backedge and
 partial-word-update fixtures.
 Zero-divisor and overflow fixtures use a mock returning error handler that
-records CPU/fault address and changes EAX/EDX. These are current-runtime checks,
+records CPU/fault address and changes EAX/EDX, EBX/ESI and arithmetic flags. These are current-runtime checks,
 not original-x86, actual guest SEH or interior memory-fault equivalence.
 
 The differential harness compares translated routines with original instructions

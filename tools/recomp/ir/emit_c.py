@@ -23,6 +23,7 @@ from . import x87
 SUPPORTED_MNEMONICS = frozenset((
     "MOV", "MOVSX", "MOVZX", "XCHG", "NOT", "LEAVE", "LEA", "PUSH", "POP", "RET", "NOP", "ADD", "SUB", "CMP", "INC", "DEC",
     "ADC", "SBB", "SHL", "SHR", "DIV",
+    "CLD", "STD",
     "TEST", "AND", "OR", "XOR", "JMP", "JZ", "JNZ", "JE", "JNE",
     "JA", "JAE", "JB", "JBE", "JC", "JNC", "JG", "JGE", "JL", "JLE", "JS", "JNS",
     "JO", "JNO", "JP", "JNP", "JPE", "JPO", "CALL",
@@ -105,6 +106,16 @@ def codegen_ir(fir, lifter):
             insns.append(Insn(ins.addr, ins.length, ins.mnem, ops, 0,
                               False, False, [], ins.raw))
             continue
+        # String MOVSD is byte-audited to the runtime helper rather than the
+        # raw SLEIGH loop: SLEIGH advances ESI/EDI and decrements ECX before
+        # the access, while the helper accesses first and then advances. Only
+        # dword MOVSD (bare A5 and REP F3 A5) is admitted; SSE MOVSD and
+        # address-size or other prefixes stay unsupported fallbacks.
+        if mnem in ("MOVSD", "MOVSD.REP") and ins.raw in (b"\xa5", b"\xf3\xa5"):
+            ops = [Op("MOVS32", None, [], {"rep": ins.raw.startswith(b"\xf3")})]
+            insns.append(Insn(ins.addr, ins.length, ins.mnem, ops, 0,
+                              False, False, [], ins.raw))
+            continue
         if mnem not in SUPPORTED_MNEMONICS:
             raise SSAError("%08x: C emitter: unsupported instruction %s" % (ins.addr, mnem))
         ops = normalize_direct_ram(ins, lifter)
@@ -128,12 +139,15 @@ def codegen_ir(fir, lifter):
 def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=True,
          call_symbols=None, x87_values=False, x87_region=False, x87_scalar=False,
          x87_scalar_strict=False, local_state=False, resumable_stacks=False,
-         lifter=None, _guard_null_checks=True):
+         lifter=None, indirect_call_symbol=None, _guard_null_checks=True):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
     `call_symbols` maps an allowed direct-call target address to the C symbol
     that implements it. With no mapping, a direct CALL is rejected rather than
-    dispatched or approximated. `x87_values` enables the bounded write-through
+    dispatched or approximated. `indirect_call_symbol` is the explicit opt-in
+    for indirect CALL effects: when set, CALLIND lowers to that runtime
+    dispatch and reloads all tracked state; when None, indirect calls stay a
+    whole-function fallback. `x87_values` enables the bounded write-through
     x87 value tracker; it is off by default and only active with `optimize`.
     """
     if not symbol.isidentifier() or not symbol.isascii():
@@ -157,6 +171,11 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         if not isinstance(name, str) or not name.isidentifier() or not name.isascii():
             raise SSAError("invalid call symbol %r for target %08x" % (name, target))
         call_symbols[target] = name
+    if indirect_call_symbol is not None and (
+            not isinstance(indirect_call_symbol, str)
+            or not indirect_call_symbol.isidentifier()
+            or not indirect_call_symbol.isascii()):
+        raise SSAError("invalid indirect call symbol %r" % (indirect_call_symbol,))
     x87_statements = x87.statements
     # The tracker reuses only reads; every helper call still runs. It is
     # invalidated at opaque effects and control-flow joins below.
@@ -168,7 +187,8 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         options = dict(optimize=optimize, publish_changed=publish_changed, wide_registers=wide_registers,
                        call_symbols=call_symbols, x87_values=x87_values, x87_region=x87_region,
                        x87_scalar=x87_scalar, resumable_stacks=resumable_stacks,
-                       lifter=lifter, _guard_null_checks=False)
+                       lifter=lifter, indirect_call_symbol=indirect_call_symbol,
+                       _guard_null_checks=False)
         strict = emit(fir, symbol, x87_scalar_strict=True, local_state=False, **options)
         fast = emit(fir, symbol, x87_scalar_strict=x87_scalar_strict, local_state=local_state, **options)
         return "#if defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS\n%s\n#else\n%s\n#endif" % (strict, fast)
@@ -203,7 +223,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
               for (_, off, size), _ in fields]
     s = build(codegen_ir(fir, lifter),
               register_groups=groups if optimize and wide_registers else (),
-              call_targets=call_symbols)
+              call_targets=call_symbols, indirect_call_symbol=indirect_call_symbol)
     if any(key != MEMORY and key not in mapping for key in s.inputs):
         raise SSAError("unmapped runtime register")
     publications = None
@@ -360,7 +380,8 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                     if m in ("FXAM", "FIST", "FISTP", "FLDCW", "FNINIT", "FINIT") or (
                             v.opc == "X87_MEM" and m in ("FST", "FSTP", "FNSTSW", "FNSTCW")):
                         finish_scalar_run()
-                elif v.opc in ("STORE", "DIV32", "IDIV32", "CALL", "RETURN", "BRANCH", "CBRANCH"):
+                elif v.opc in ("STORE", "DIV32", "IDIV32", "CALL", "CALLIND", "MOVS32",
+                               "RETURN", "BRANCH", "CBRANCH"):
                     finish_scalar_run()
             prev = i
         finish_scalar_run()
@@ -415,6 +436,33 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 # Complete, callee-agnostic reload of one mapped state field.
                 field, lane = mapping[v.data]
                 lines.append("v%d = (%s >> %d) & %s;" % (v.id, field, lane * 8, mask(v.size)))
+            elif v.opc == "CALLIND":
+                lines.extend(flush_x87())
+                if scalar is not None:
+                    scalar.reset()
+                # Publish the required pre-call state, including the target,
+                # then dispatch through the runtime. The return address was
+                # already stored by the preceding lifted CALL sequence, and the
+                # SSA builder reloads every tracked lane/flag afterward.
+                lines.extend(publish(b.snapshots[v.id], v))
+                if tracker is not None:
+                    tracker.invalidate()
+                lines.append("%s(c, (uint32_t)%s);" % (v.data, ref(v.args[1])))
+                if resumable_stacks:
+                    lines.append("if (c->eip != 0x%x) return;" % (
+                        b.insn.addr + b.insn.length))
+            elif v.opc == "MOVS32":
+                lines.extend(flush_x87())
+                if scalar is not None:
+                    scalar.reset()
+                # Byte-audited dword string move. Publication before the helper
+                # and reloads afterward keep guest memory observers and fault
+                # snapshots in access-then-advance order; the helper owns
+                # EDI/ESI/ECX/DF exactly as the eager emitter's rep_movsd does.
+                lines.extend(publish(b.snapshots[v.id], v))
+                if tracker is not None:
+                    tracker.invalidate()
+                lines.append("rep_movsd(c);" if v.data.get("rep") else "movsd(c);")
             elif v.opc in ("LOAD", "STORE", "DIV32", "IDIV32"):
                 if scalar is None or scalar.observe_loads or v.opc != "LOAD":
                     lines.extend(flush_x87())

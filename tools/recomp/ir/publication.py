@@ -55,10 +55,10 @@ Starting with no facts gives a conservative least fixed point for loops.
                         required.extend(keys)
                     known[n] = current
                 publications[v.id] = tuple(required)
-                if v.opc in ("DIV32", "IDIV32", "CALL"):
-                    # A division error handler and an opaque callee may leave
-                    # arbitrary CPU state behind, so no must-fact survives.
-                    # IDIV32 is reserved for the pending signed-division helper.
+                if v.opc in ("DIV32", "IDIV32", "CALL", "CALLIND", "MOVS32"):
+                    # A division error handler, an opaque callee and the string
+                    # helper's fault path may leave arbitrary CPU state behind,
+                    # so no must-fact survives.
                     known.clear()
             outgoing = {n for n, keys in enumerate(groups)
                         if known.get(n) == values(b.exit, keys)}

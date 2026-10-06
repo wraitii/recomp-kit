@@ -110,13 +110,33 @@ int32_t recomp_module_lookup(uint32_t addr) {
 }
 
 void recomp_call(X86 *c, uint32_t addr) {
-    (void)c;
-    unexpected("call", addr);
+    /* Generated dispatch table for the synthetic indirect-call fixtures. */
+    extern void ir_indirect_dispatch(X86 * c, uint32_t addr);
+    ir_indirect_dispatch(c, addr);
+}
+
+void ir_unexpected_call(uint32_t target) {
+    unexpected("indirect call", target);
 }
 
 void recomp_div_error(X86 *c, uint32_t addr) {
     memcpy(g_mem + 0x10200, c, sizeof *c);
     wr32(0x107f0, addr);
+    /* A returning divide-error handler may mutate arbitrary guest state. Move
+     * EAX/EDX (the division result registers), a preserved-looking GPR and
+     * every flag so a variant that fails to reload non-EAX/EDX fields differs
+     * from the eager comparison body. The eager and SSA bodies share this seam,
+     * so this checks reload coverage rather than inventing handler behavior. */
     c->r[R_EAX] ^= 0x1234u;
     c->r[R_EDX] ^= 0x4567u;
+    /* Keep the non-EAX/EDX mutations small so a fixture that uses EBX/ESI as a
+     * scratch pointer after the divide cannot leave the mapped arena. */
+    c->r[R_EBX] ^= 0x20u;
+    c->r[R_ESI] ^= 0x10u;
+    c->eflags_cf ^= 1;
+    c->eflags_zf ^= 1;
+    c->eflags_sf ^= 1;
+    c->eflags_of ^= 1;
+    c->eflags_pf ^= 1;
+    c->eflags_af ^= 1;
 }

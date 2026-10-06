@@ -34,10 +34,10 @@ def fixture(code):
 
 def test_mixed_callees_use_stable_thunks_and_chunk_declarations(tmp_path):
     # Caller: mov eax,1; call; add eax,ebx; fld1; fstp [ebx]; ret.
-    # Callee's CLD is unsupported SSA, so it remains decoded C.
+    # Callee: STOSD is unsupported SSA, so it remains decoded C.
     raw = b"\xb8\x01\x00\x00\x00\xe8" + struct.pack("<i", CALLEE - ENTRY - 10)
     raw += b"\x01\xd8\xd9\xe8\xd9\x1b\xc3"
-    tr, functions, bodies = fixture({ENTRY: raw, CALLEE: b"\xfc\xc3"})
+    tr, functions, bodies = fixture({ENTRY: raw, CALLEE: b"\xab\xc3"})
     original = bodies[CALLEE][:]
     report = apply(tr, functions, bodies, {}, SETTINGS, quiet=True)
     assert report["emitted"] == report["fallback"] == 1
@@ -84,8 +84,7 @@ def test_host_contracts_keep_whole_decoded_body(contract, reason):
 
 
 @pytest.mark.parametrize("raw,reason", [
-    (b"\xff\xd0\xc3", "direct call target is not bound"),
-    (b"\xf7\xf1\xc3", "division error seam"),
+    (b"\xff\xe0\xc3", "opaque effect BRANCHIND"),
 ])
 def test_unsupported_effects_fallback_without_losing_diagnostics(raw, reason):
     tr, functions, bodies = fixture({ENTRY: raw})
@@ -93,8 +92,21 @@ def test_unsupported_effects_fallback_without_losing_diagnostics(raw, reason):
     report = apply(tr, functions, bodies, {}, SETTINGS, quiet=True)
     assert report["fallback"] == 1
     actual = report["per_function"]["%08x" % ENTRY]["reason"]
-    assert reason in actual or (raw[0] == 0xff and "CALLIND" in actual)
+    assert reason in actual
     assert bodies[ENTRY] == original
+
+
+def test_division_and_indirect_call_emit_with_production_contract():
+    # div ecx; ret: checked DIV32 and the full post-division state reload.
+    tr, functions, bodies = fixture({ENTRY: b"\xf7\xf1\xc3"})
+    report = apply(tr, functions, bodies, {}, SETTINGS, quiet=True)
+    assert report["emitted"] == 1, report["per_function"]
+    assert "div32(c," in "\n".join(bodies[ENTRY])
+    # call eax; ret: production opts into recomp_call and reloads tracked state.
+    tr, functions, bodies = fixture({ENTRY: b"\xff\xd0\xc3"})
+    report = apply(tr, functions, bodies, {}, SETTINGS, quiet=True)
+    assert report["emitted"] == 1, report["per_function"]
+    assert "recomp_call(c, (uint32_t)" in "\n".join(bodies[ENTRY])
 
 
 def test_direct_seh_helper_call_is_not_bound():

@@ -3,8 +3,9 @@
 Run only after decoded discovery and its boundary/dispatch checks have completed.
 Unsupported bodies retain decoded C whole; no summary changes the guest ABI.
 Calls publish/reload complete tracked state and use the production entry thunk,
-including replacement, hook, profiling and frame-watch policy. Complex host-frame
-ownership and returning division-error handlers remain on the decoded path.
+including replacement, hook, profiling and frame-watch policy. Indirect calls
+are admitted only through the explicit `recomp_call` opt-in; complex host-frame
+ownership and unsupported division shapes remain on the decoded path.
 """
 from collections import Counter
 import re
@@ -40,10 +41,6 @@ def exclusion(tr, fn, entries, policies):
                  | set(policies.get("volatile_reads", ())))
     if fn.addrs & rewritten:
         return "audited instruction rewrite"
-    if any(ins.mnem in ("DIV", "IDIV") for ins in fn.insns):
-        # Corpus handlers mutate only EAX/EDX. Production handlers can mutate
-        # other fields or transfer control; do not infer a narrow return ABI.
-        return "division error seam"
     return None
 
 
@@ -78,6 +75,7 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
                               x87_scalar_strict=mode == "scalar-strict",
                               local_state=state == "locals",
                               resumable_stacks=policies.get("resumable_stacks", False),
+                              indirect_call_symbol="recomp_call",
                               lifter=lifter)
             except (SSAError, LiftError) as error:
                 reason = str(error)

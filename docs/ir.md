@@ -134,10 +134,11 @@ for partial writes and snapshots. Trivial phis are simplified. LOAD and STORE
 thread an explicit memory token; no inter-instruction forwarding or store removal
 occurs. Corrected x87 effects thread that same token. FPU state remains resident
 in the CPU object at observations; optional straight-line caches are described
-below. Raw FLOAT operations, unbound calls, user operations, indirect transfers and
-intra-instruction control flow remain rejected. Bound direct calls publish
-tracked state, run the declared callee, and reload all tracked lanes and flags;
-no calling-convention summary permits dropping state.
+below. Raw FLOAT operations, unbound calls, user operations, unbound indirect
+transfers and intra-instruction control flow remain rejected. Bound direct calls
+and, under the emitter's explicit `indirect_call_symbol` opt-in, indirect calls
+publish tracked state, run the declared callee or `recomp_call`, and reload all
+tracked lanes and flags; no calling-convention summary permits dropping state.
 
 `emit_c.py` lowers integer values to unsigned, width-masked C, with staged
 parallel phi copies on edges. Comparisons use sign-bit bias and p-code shifts
@@ -162,6 +163,22 @@ of the same RMW operand become copies of one captured read/result, and flag
 assignments occur after the guest STORE, matching the existing emitter's fault
 and watch snapshots. This is not general memory forwarding. Other RMW shapes
 and implicit-lock memory XCHG retain named fallback diagnostics.
+
+Production SSA additionally admits three audited effects. A direct or indirect
+`CALL` publishes the pre-call CPU, dispatches through the bound entry thunk or
+the explicit `indirect_call_symbol` (`recomp_call` for production), and reloads
+every tracked lane/flag and the memory token; an indirect target must be a
+readable 32-bit value with a canonical fallthrough, and raw/unbound `CALLIND`
+stays fallback. Checked `DIV32`/`IDIV32` reload all tracked state after the
+helper, so a returning divide-error handler that mutates non-EAX/EDX state is
+observed; narrow and unsupported division shapes remain fallbacks. Dword
+`MOVSD` string moves (bare `A5`, REP `F3 A5`, named `MOVSD` or `MOVSD.REP`)
+lower to the existing `movsd`/`rep_movsd` runtime helpers in
+access-then-advance order with publication and full reload; SSE `MOVSD`, other
+string widths and address-size/unsupported prefixes stay fallbacks. `CLD` and
+`STD` are admitted as plain DF writes. These effects keep the eager comparison
+body as the oracle; they add no inferred calling convention and no new
+floating-point relaxation.
 Guest accesses use the runtime's ordered read/write helpers and publish
 known CPU fields before each access and on return. A conservative publication
 analysis omits field stores only when their values are already published on
@@ -195,8 +212,10 @@ byte-backed synthetic fixtures against eager C, comparing every CPU field
 and 2 KiB of scratch for 24576 inputs per fixture. They cover register aliases,
 loops, memory aliases, INC/DEC and carry-dependent subtraction, variable and
 immediate shifts, and unsigned division. A mocked error handler records the
-complete CPU and fault address, then returns with changed EAX/EDX; zero-divisor
-and overflow cases check both the snapshot and continuation. A read-only native
+complete CPU and fault address, then returns having changed EAX/EDX and other
+GPRs/flags; zero-divisor and overflow cases check both the snapshot and
+continuation, and every tracked field is reloaded from the helper's result
+state. A read-only native
 watch callback compares complete CPU snapshots, addresses, widths and values at
 every store, including division-handler stores. Branch joins, loop publication
 and partial-word updates have explicit fixtures. Eighteen x87 fixtures exercise
@@ -238,7 +257,9 @@ passes below keep the same full-state observation contract.
 The emitter requires an explicit `call_symbols` map of 32-bit guest targets to
 C identifiers. The mapped corpus supplies only independently reviewed declared
 callees, each translated in the same mode. A call requires its exact mapped
-fallthrough; indirect, unbound and missing-continuation calls fail closed.
+fallthrough; unbound and missing-continuation calls fail closed. Production
+binds `indirect_call_symbol` to `recomp_call`, which validates the 32-bit target
+and reloads all tracked state; without that opt-in indirect calls fail closed.
 The guest return-address store remains ordered and observable. Callees own
 ESP cleanup and EIP restoration. All tracked register lanes and flags are
 reloaded afterward, and the x87 cache is invalidated. Resumable mode checks
@@ -311,7 +332,7 @@ CPU and x87 publication and general arithmetic for guest exception dispatch.
 Real interior fault/SEH equivalence remains unverified.
 
 The native suite compares eager C with effects, values, region, scalar,
-scalar-strict and scalar/local-state for 142 byte-backed fixtures × 24576 inputs
+scalar-strict and scalar/local-state for 151 byte-backed fixtures × 24576 inputs
 in both ordinary and null-check builds. Complete outgoing CPU/scratch state and
 integer-store snapshots remain exact; no residue is normalized away. Dedicated
 fixtures cover full stack wraparound, exact qword copies, reversed arithmetic,
@@ -362,8 +383,9 @@ CALL effects also invalidate those facts. On normal continuation
 LOAD/STORE accessors do not mutate CPU state: watch/dirty observers are read-only,
 and an armed null fault either transfers control through SEH or terminates.
 Any future returning CPU-mutating observer needs explicit invalidation and an SSA
-effect model before admission. The mock division handler still changes only
-EAX/EDX; arbitrary handler changes are not modeled.
+effect model before admission. The native mock division handler mutates
+EAX/EDX, EBX, ESI and every flag; the SSA reloads all tracked fields after the
+checked divide. Arbitrary handler changes remain outside the model.
 
 The C consumer can disable these passes independently with
 `publish_changed=False` and `wide_registers=False` for runtime comparisons.
@@ -427,9 +449,9 @@ callees and SSA callees can be mixed, including replacement/hook selection.
 
 Alternate-entry bodies, SEH frames/helpers/restores, pushed continuations,
 nonreturning control flow, audited instruction/operand/visual-clock rewrites,
-division error seams and auxiliary modules keep whole-function decoded C.
-Indirect calls, jump tables, external tail transfers and unsupported instructions
-also fall back through named SSA/lift diagnostics. A 2048-instruction budget and
+unsupported division shapes and auxiliary modules keep whole-function decoded C.
+Unbound indirect calls, jump tables, external tail transfers and unsupported
+instructions also fall back through named SSA/lift diagnostics. A 2048-instruction budget and
 Python graph recursion limit retain decoded C for expensive constructions.
 Original interior fault/SEH equivalence remains unverified; null-check builds
 compile conservative publication inside admitted functions.

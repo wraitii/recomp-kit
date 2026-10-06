@@ -60,6 +60,10 @@ def run(fir, **regs):
         _, off, size = LIFTER.register(name)
         for n in range(size):
             register_bytes[("register", off + n)] = (value >> (8 * n)) & 0xff
+    # Modeled CPU state: CALL_RELOAD reads whatever the helper left here, not
+    # the initial inputs. Only HELPER register writes need mirroring because
+    # ordinary SSA writes are replayed through `values`/`b.exit`.
+    cpu = dict(register_bytes)
     s = build(corrected(fir))
     values = {}
 
@@ -83,6 +87,13 @@ def run(fir, **regs):
     for v in b.ops:
         a = [read(arg) for arg in v.args]
         opc, size = v.opc, v.size
+        if opc in ("DIV32", "IDIV32"):
+            # The pre-helper snapshot is the CPU the helper and any returning
+            # handler observe. Publish it into the modeled CPU so CALL_RELOAD
+            # reads the current, not the initial, register/flag values.
+            for key, value in b.snapshots.get(v.id, {}).items():
+                if key[0] != "memory":
+                    cpu[key] = read(value) & 0xff
         if opc == "PACK":
             r = sum(value << (8 * n) for n, value in enumerate(a))
         elif opc == "BYTE":
@@ -160,13 +171,30 @@ def run(fir, **regs):
             if q < -(1 << 31) or q > (1 << 31) - 1:
                 raise Fault()
             r = (q & 0xffffffff) | (((numerator - q * divisor) & 0xffffffff) << 32)
+        elif opc == "DIV32":
+            base = 1 if len(v.args) == 4 else 0  # ordered effects prepend MEMORY
+            numerator = a[base]
+            divisor = a[base + 1] & 0xffffffff
+            if divisor == 0 or numerator // divisor > 0xffffffff:
+                raise Fault()
+            q = numerator // divisor
+            r = (q & 0xffffffff) | ((numerator % divisor) << 32)
         elif opc == "MEMORY":
             r = 0
+        elif opc == "CALL_RELOAD":
+            # Post-helper CPU reload from the modeled helper state.
+            r = cpu.get(v.data, 0) & 0xff if size else 0
         elif opc == "RETURN":
             return merged_state()
         else:
             raise AssertionError("interpreter does not model %s" % opc)
         values[v.id] = r & ((1 << (8 * size)) - 1) if size else 0
+        if opc in ("DIV32", "IDIV32") and size == 8:
+            _, eax_off, _ = LIFTER.register("EAX")
+            _, edx_off, _ = LIFTER.register("EDX")
+            for n in range(4):
+                cpu[("register", eax_off + n)] = (r >> (8 * n)) & 0xff
+                cpu[("register", edx_off + n)] = (r >> (32 + 8 * n)) & 0xff
     return merged_state()
 
 

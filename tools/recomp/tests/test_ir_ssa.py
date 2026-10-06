@@ -488,3 +488,86 @@ def test_memory_rmw_reads_once_and_keeps_old_flags_at_store_observation():
 def test_implicit_atomic_memory_exchange_requires_whole_function_fallback():
     with pytest.raises(SSAError, match="opaque effect CALLOTHER"):
         emit(function("8703", "c3"), "test_fn")
+
+
+def named_function(pairs):
+    """Like `function`, but with the translator's capstone mnemonic supplied."""
+    at, insns = 0x1000, []
+    for h, mnem in pairs:
+        raw = bytes.fromhex(h)
+        insns.append(LIFTER.lift(at, raw, mnem=mnem))
+        at += len(raw)
+    return FunctionIR(0x1000, insns, default_successors(insns))
+
+
+def test_rep_movsd_lowers_to_audited_runtime_helper_only():
+    # The production decoder names the string form MOVSD; the bare pypcode
+    # lifter names it MOVSD.REP. Both must resolve to the same audited bytes.
+    for mnem in ("MOVSD", "MOVSD.REP"):
+        rep = named_function([("f3a5", mnem), ("c3", "RET")])
+        body = emit(rep, "test_fn")
+        assert "rep_movsd(c);" in body
+        assert any(op.opc == "MOVS32" and op.data == {"rep": True}
+                   for ins in codegen_ir(rep, LIFTER).insns for op in ins.ops)
+    bare = named_function([("a5", "MOVSD"), ("c3", "RET")])
+    assert "movsd(c);" in emit(bare, "test_fn")
+    # SSE MOVSD, other string widths and address-size/other prefixes stay
+    # whole-function fallbacks rather than becoming an unaudited helper call.
+    for h, mnem in (("f20f10c1", "MOVSD"), ("f3a4", "MOVSB"),
+                    ("66a5", "MOVSW"), ("67a5", "MOVSD")):
+        with pytest.raises(SSAError, match="unsupported instruction"):
+            emit(named_function([(h, mnem), ("c3", "RET")]), "test_fn")
+
+
+def test_rep_movsd_reloads_indices_count_and_flags_after_helper():
+    # ECX is written locally before the move, so it must be published before the
+    # helper and reloaded after it along with every other tracked lane/flag.
+    f = codegen_ir(named_function([("b909000000", "MOV"), ("f3a5", "MOVSD"),
+                                   ("c3", "RET")]), LIFTER)
+    s = build(f, register_groups=runtime_groups())
+    moves = [v for b in s.blocks.values() for v in b.ops if v.opc == "MOVS32"]
+    assert len(moves) == 1
+    block = next(b for b in s.blocks.values() if moves[0] in b.ops)
+    after = block.ops[block.ops.index(moves[0]) + 1:]
+    reloaded = {v.data for v in after if v.opc == "CALL_RELOAD"}
+    assert {key for key in s.inputs if key != MEMORY} <= reloaded
+
+
+def test_indirect_call_requires_explicit_symbol_and_canonical_fallthrough():
+    with pytest.raises(SSAError, match="opaque effect CALLIND"):
+        emit(function("ffd0", "c3"), "test_fn")
+    body = emit(function("ffd0", "c3"), "test_fn", indirect_call_symbol="recomp_call")
+    assert "recomp_call(c, (uint32_t)" in body
+    with pytest.raises(SSAError, match="invalid indirect call symbol"):
+        emit(function("ffd0", "c3"), "test_fn", indirect_call_symbol="not a symbol")
+    # A non-canonical successor set is a tail/noreturn shape, not a call.
+    f = function("ffd0", "c3")
+    f.succ[0] = []
+    with pytest.raises(SSAError, match="indirect call lacks its canonical fallthrough"):
+        build(f, indirect_call_symbol="recomp_call")
+
+
+def test_indirect_call_reads_memory_target_before_return_push():
+    # call dword ptr [esp+4]: the target load must be emitted before the return
+    # address store, matching the original instruction's access order.
+    import re
+    body = emit(function("ff542404", "c3"), "test_fn", indirect_call_symbol="recomp_call")
+    lines = body.splitlines()
+    call = next(l for l in lines if "recomp_call(c," in l)
+    target = re.search(r"recomp_call\(c, \(uint32_t\)(v\d+)\);", call).group(1)
+    assigned = next(i for i, l in enumerate(lines) if l.strip().startswith(target + " ="))
+    pushed = next(i for i, l in enumerate(lines) if "wr32(" in l)
+    assert assigned < pushed
+
+
+def test_division_reloads_every_tracked_field_after_helper():
+    # div ecx; mov [ebx],eax: after DIV32 every tracked lane/flag is re-read from
+    # the helper's result state, so a returning divide-error handler that mutates
+    # EBX/ECX or flags cannot leave stale SSA values behind.
+    f = codegen_ir(function("f7f1", "8903", "c3"), LIFTER)
+    s = build(f, register_groups=runtime_groups())
+    division = next(v for b in s.blocks.values() for v in b.ops if v.opc == "DIV32")
+    block = next(b for b in s.blocks.values() if division in b.ops)
+    after = block.ops[block.ops.index(division) + 1:]
+    reloaded = {v.data for v in after if v.opc == "CALL_RELOAD"}
+    assert {key for key in s.inputs if key != MEMORY} <= reloaded

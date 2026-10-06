@@ -223,13 +223,33 @@
 ||||||| parent of 2980029 (Add bounded decoded flag dataflow and rounded stack forwarding)
 ||||||| parent of 5ddde93 (Add experimental SSA corpus with scalar x87 and local CPU state)
 ||||||| parent of 7491db2 (Enable opt-in production SSA with decoded fallback reporting)
+||||||| parent of 28e2bc9 (Expand production SSA helper and indirect call coverage)
+- Include nested translator packages in the regeneration cache fingerprint,
+  so edits to SSA lowering regenerate production bodies through `--regenerate`.
+
+- Extend production SSA final bodies with conservative helper effects. Indirect
+  calls (`CALLIND`) are admitted only through an explicit
+  `indirect_call_symbol` emit option that production binds to `recomp_call`;
+  the target is a 32-bit value with a canonical fallthrough. Calls publish
+  and reload all tracked state while preserving ordered memory effects. Checked
+  `DIV32`/`IDIV32` now reload all tracked state after the helper (not only
+  EAX/EDX), so a returning divide-error handler's mutations are observed;
+  narrow/unsupported division shapes still fall back. Dword `MOVSD` string
+  moves (bare `A5`, REP `F3 A5`, named `MOVSD` or `MOVSD.REP`) lower to the
+  runtime `movsd`/`rep_movsd` helper with access-then-advance ordering; SSE
+  `MOVSD`, other widths and address-size/unsupported prefixes stay fallbacks.
+  `CLD`/`STD` are admitted as plain flag writes. `--ir-ssa-checks` covers a
+  divide handler that mutates EBX/ESI/flags, zero-count/both-DF/overlapping REP
+  MOVSD, and register/memory/ESP-relative indirect calls including normal and
+  diverted resumable continuation.
+
 - Add opt-in production `[translate] ir_ssa = true`, with `ir_ssa_x87` and
   `ir_ssa_state` comparison policies. SSA replaces supported final function
   bodies after decoded boundary recovery and validation; direct calls use
   existing entry thunks and retain replacement/hook/profiling policy. Unsupported
   functions keep decoded C whole. Translation reports include exact emitted
   and fallback counts, percentages and per-function reasons. SEH, alternate
-  entries, continuations, division error seams and auxiliary modules remain
+  entries, continuations, unsupported division shapes and auxiliary modules remain
   decoded; graph construction has a 2048-instruction budget.
 
 - Add opt-in SSA `scalar`/`scalar-strict` x87 corpus modes: scalar stack values,

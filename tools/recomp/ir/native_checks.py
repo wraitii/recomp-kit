@@ -90,6 +90,16 @@ CASES = {
     "absolute_movsx_source": ("b8ffffffff", "0fbe0580000100", "8903", "c3"),
     "absolute_word_read": ("66a180000100", "8903", "c3"),
     "absolute_word_write": ("66a380000100", "c3"),
+    # Post-helper reload coverage: a returning divide-error handler mutates
+    # EBX/ESI/flags. Every variant must re-read them from the helper's result
+    # state, not only the EAX/EDX division registers.
+    "div_handler_mutates_siblings": ("bb44332211", "31c9", "f7f1", "89d8", "c3"),
+    # Byte-audited REP MOVSD: zero count, both DF directions and an overlapping
+    # forward copy that exposes the runtime helper's access-then-advance order.
+    "rep_movsd_zero": ("31c9", "f3a5", "c3"),
+    "rep_movsd_df0": ("fc", "b903000000", "f3a5", "c3"),
+    "rep_movsd_df1": ("be20000100", "bf60000100", "fd", "b903000000", "f3a5", "c3"),
+    "rep_movsd_overlap": ("be00000100", "bf02000100", "b904000000", "fc", "f3a5", "c3"),
 }
 
 # Signed-integer (CDQ/IMUL/IDIV/NEG/SAR/SETcc) and x87 region-run cases that
@@ -236,8 +246,85 @@ BYTE_CALL_CASES = {
 }
 
 
-def call_sources(name, hexes, callee_addr, resumable=False):
-    """Eager caller plus plain/cache/region IR callers and CALL fallthroughs."""
+#: Distinct synthetic targets let one generated dispatcher serve every
+#: indirect fixture without cross-case callee collisions.
+INDIRECT_CASES = {
+    "callind_register": {
+        # fld1; mov eax,0x200100; call eax; fadd st0,st1; fstp qword ptr [0x10800];
+        # add eax,ebx; ret  -- live x87 spans the indirect call so the opaque
+        # barrier must flush before and invalidate after the helper.
+        "hexes": ["d9e8", "b800012000", "ffd0", "d8c1", "d91d00080100", "01d8", "c3"],
+        "target": 0x200100,
+        "callee": """static void callind_register_callee(X86 *c) {
+    uint32_t ret = rd32(c->r[R_ESP]);
+    c->r[R_ESP] += 4;
+    c->r[R_EAX] = 0x0badf00du;
+    c->r[R_EBX] ^= 0x55aa55aau;
+    c->r[R_ECX] = 0x99887766u;
+    c->r[R_EDX] = 0xdeadbeefu;
+    c->eflags_cf = 1; c->eflags_zf = 0; c->eflags_sf = 1;
+    c->eflags_of = 0; c->eflags_pf = 1; c->eflags_af = 0;
+    fpush(c, 2.5);
+    c->eip = ret;
+}
+""",
+        "resumable": False,
+    },
+    "callind_esp_relative": {
+        # push 0x200200; call dword ptr [esp]; add esp,4; add eax,ebx; ret
+        # The target load is before the call's return-address store.
+        "hexes": ["6800022000", "ff1424", "83c404", "01d8", "c3"],
+        "target": 0x200200,
+        "callee": """static void callind_esp_relative_callee(X86 *c) {
+    uint32_t ret = rd32(c->r[R_ESP]);
+    c->r[R_ESP] += 4;
+    c->r[R_EAX] = 0x11112222u;
+    c->r[R_ESI] ^= 0x0f0f0f0fu;
+    c->r[R_EDI] = 0x33334444u;
+    c->eflags_zf = 1; c->eflags_cf = 0; c->eflags_sf = 0;
+    fpush(c, 7.25);
+    c->eip = ret;
+}
+""",
+        "resumable": False,
+    },
+    "callind_resumable_normal": {
+        # A resumable body whose callee resumes at the call fallthrough must
+        # continue normally.
+        "hexes": ["6800042000", "ff1424", "83c404", "01d8", "c3"],
+        "target": 0x200400,
+        "callee": """static void callind_resumable_normal_callee(X86 *c) {
+    uint32_t ret = rd32(c->r[R_ESP]);
+    c->r[R_ESP] += 4;
+    c->r[R_EAX] = 0x55667788u;
+    c->eflags_cf = 1; c->eflags_zf = 0;
+    c->eip = ret;
+}
+""",
+        "resumable": True,
+    },
+    "callind_resumable_divert": {
+        # The callee leaves EIP elsewhere: a resumable body must bail out
+        # instead of continuing at the call fallthrough.
+        "hexes": ["6800032000", "ff1424", "83c404", "01d8", "c3"],
+        "target": 0x200300,
+        "callee": """static void callind_resumable_divert_callee(X86 *c) {
+    c->r[R_ESP] += 4;
+    c->r[R_EAX] = 0xabcd1234u;
+    c->eip = 0xdeadbeefu;
+}
+""",
+        "resumable": True,
+    },
+}
+
+
+def call_sources(name, hexes, callee_addr, resumable=False, indirect=False):
+    """Eager caller plus plain/cache/region IR callers and CALL fallthroughs.
+
+    `indirect` selects the explicit production-style `recomp_call` opt-in for
+    indirect CALL effects; without it those effects stay a fallback.
+    """
     chunks = [bytes.fromhex(h) for h in hexes]
     image = T.Image.__new__(T.Image)
     image.base, image.data = ENTRY, b"".join(chunks)
@@ -262,19 +349,22 @@ def call_sources(name, hexes, callee_addr, resumable=False):
         addr += len(raw)
     fir = FunctionIR(ENTRY, lifted, default_successors(lifted))
     symbols = {callee_addr: name + "_callee"}
+    indirect_symbol = "recomp_call" if indirect else None
     plain = emit(fir, name + "_ir_plain", call_symbols=symbols,
-                 resumable_stacks=resumable)
+                 indirect_call_symbol=indirect_symbol, resumable_stacks=resumable)
     cache = emit(fir, name + "_ir_cache", call_symbols=symbols, x87_values=True,
-                 resumable_stacks=resumable)
+                 indirect_call_symbol=indirect_symbol, resumable_stacks=resumable)
     region = emit(fir, name + "_ir_region", call_symbols=symbols, x87_region=True,
-                  resumable_stacks=resumable)
+                  indirect_call_symbol=indirect_symbol, resumable_stacks=resumable)
     fallthroughs = [ins.addr + ins.length for ins in lifted if ins.mnem.upper() == "CALL"]
     scalar = emit(fir, name + "_ir_scalar", call_symbols=symbols, x87_scalar=True,
-                  resumable_stacks=resumable)
+                  indirect_call_symbol=indirect_symbol, resumable_stacks=resumable)
     strict = emit(fir, name + "_ir_strict", call_symbols=symbols, x87_scalar=True,
-                  x87_scalar_strict=True, resumable_stacks=resumable)
+                  x87_scalar_strict=True, indirect_call_symbol=indirect_symbol,
+                  resumable_stacks=resumable)
     local = emit(fir, name + "_ir_local", call_symbols=symbols, x87_scalar=True,
-                 local_state=True, resumable_stacks=resumable)
+                 local_state=True, indirect_call_symbol=indirect_symbol,
+                 resumable_stacks=resumable)
     return eager, plain, cache, region, scalar, strict, local, fallthroughs
 
 
@@ -370,6 +460,19 @@ def run_checks(out, cmake, jobs):
         callee = _eager_callee(name + "_callee", CALLEE, spec["callee_hexes"])
         add_case(name, eager, [plain, cache, region, scalar, strict, local], extra=[callee],
                  fallthroughs=returns)
+    dispatch = []
+    for name, spec in INDIRECT_CASES.items():
+        eager, plain, cache, region, scalar, strict, local, returns = call_sources(
+            name, spec["hexes"], spec["target"], spec["resumable"], indirect=True)
+        add_case(name, eager, [plain, cache, region, scalar, strict, local],
+                 extra=[spec["callee"]], fallthroughs=returns)
+        dispatch.append((spec["target"], name + "_callee"))
+    code.extend(['void ir_unexpected_call(uint32_t);',
+                 'void ir_indirect_dispatch(X86 *c, uint32_t target) {',
+                 '    switch (target) {']
+                + ['    case 0x%x: %s(c); return;' % (t, s) for t, s in dispatch]
+                + ['    default: ir_unexpected_call(target); }',
+                   '}'])
     declarations.extend([
         'static const char *mode_names[] = {"eager", "plain", "cache", "region", "scalar", "strict", "local"};',
         'static const unsigned normalize_empty_mask = 0, required_match_mask = 126;',
@@ -389,7 +492,8 @@ def run_checks(out, cmake, jobs):
         '#define FIXTURE_AFTER_STATE(mode, c) ir_observer_compare(mode)',
         'static const char *case_names[] = {'
         + ','.join('"%s"' % name
-                   for name in list(CASES) + list(CALL_CASES) + list(BYTE_CALL_CASES))
+                   for name in list(CASES) + list(CALL_CASES) + list(BYTE_CALL_CASES)
+                   + list(INDIRECT_CASES))
         + '};',
         'static void (*functions[][7])(X86 *) = {' + ','.join(rows) + '};',
     ])
