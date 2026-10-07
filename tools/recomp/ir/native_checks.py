@@ -398,7 +398,8 @@ def call_sources(name, hexes, callee_addr, resumable=False, indirect=False):
     strict = emit(fir, name + "_ir_strict", x87_scalar_strict=True, local_state=False,
                   msvc_convention=False, **options)
     local = emit(fir, name + "_ir_local", **options)
-    return eager, raw, scalar, strict, local, fallthroughs
+    lazy = emit(fir, name + "_ir_lazy", lazy_nan=True, **options)
+    return eager, raw, scalar, strict, local, lazy, fallthroughs
 
 
 def _eager_callee(symbol, base, hexes):
@@ -422,7 +423,7 @@ def _eager_callee(symbol, base, hexes):
 
 
 def sources(name, hexes):
-    """Decode and lift the exact same byte boundaries for all five consumers."""
+    """Decode and lift the exact same byte boundaries for all six consumers."""
     chunks = [bytes.fromhex(h) for h in hexes]
     image = T.Image.__new__(T.Image)
     image.base, image.data = ENTRY, b"".join(chunks)
@@ -445,7 +446,8 @@ def sources(name, hexes):
     strict = emit(fir, name + "_ir_strict", x87_scalar_strict=True, local_state=False,
                   msvc_convention=False)
     local = emit(fir, name + "_ir_local")
-    return eager, raw, scalar, strict, local
+    lazy = emit(fir, name + "_ir_lazy", lazy_nan=True)
+    return eager, raw, scalar, strict, local, lazy
 
 
 def _checked_wrapper(symbol, fallthroughs):
@@ -472,7 +474,8 @@ def run_checks(out, cmake, jobs):
         code.extend(extra)
         code.extend([eager, *variants])
         symbols = [name + "_eager_fn_%08x" % ENTRY, name + "_ir_raw",
-                   name + "_ir_scalar", name + "_ir_strict", name + "_ir_local"]
+                   name + "_ir_scalar", name + "_ir_strict", name + "_ir_local",
+                   name + "_ir_lazy"]
         for symbol in symbols:
             code.append(_checked_wrapper(symbol, fallthroughs))
         checked = [symbol + "_checked" for symbol in symbols]
@@ -480,15 +483,15 @@ def run_checks(out, cmake, jobs):
         rows.append("{" + ",".join(checked) + "}")
 
     for name, hexes in CASES.items():
-        eager, raw, scalar, strict, local = sources(name, hexes)
-        add_case(name, eager, [raw, scalar, strict, local])
+        eager, raw, scalar, strict, local, lazy = sources(name, hexes)
+        add_case(name, eager, [raw, scalar, strict, local, lazy])
     for name, spec in CALL_CASES.items():
-        eager, raw, scalar, strict, local, returns = call_sources(
+        eager, raw, scalar, strict, local, lazy, returns = call_sources(
             name, spec["hexes"], CALLEE, spec["resumable"])
-        add_case(name, eager, [raw, scalar, strict, local], extra=[spec["callee"]],
+        add_case(name, eager, [raw, scalar, strict, local, lazy], extra=[spec["callee"]],
                  fallthroughs=returns)
     for name, spec in BYTE_CALL_CASES.items():
-        eager, raw, scalar, strict, local, returns = call_sources(
+        eager, raw, scalar, strict, local, lazy, returns = call_sources(
             name, spec["hexes"], CALLEE, spec["resumable"])
         callee = _eager_callee(name + "_callee", CALLEE, spec["callee_hexes"])
         extra = [callee]
@@ -500,13 +503,14 @@ def run_checks(out, cmake, jobs):
             fir = FunctionIR(CALLEE, lifted, default_successors(lifted))
             extra.append(emit(fir, name + "_callee_local"))
             local = local.replace(name + "_callee(c)", name + "_callee_local(c)")
-        add_case(name, eager, [raw, scalar, strict, local], extra=extra,
+            lazy = lazy.replace(name + "_callee(c)", name + "_callee_local(c)")
+        add_case(name, eager, [raw, scalar, strict, local, lazy], extra=extra,
                  fallthroughs=returns)
     dispatch = []
     for name, spec in INDIRECT_CASES.items():
-        eager, raw, scalar, strict, local, returns = call_sources(
+        eager, raw, scalar, strict, local, lazy, returns = call_sources(
             name, spec["hexes"], spec["target"], spec["resumable"], indirect=True)
-        add_case(name, eager, [raw, scalar, strict, local],
+        add_case(name, eager, [raw, scalar, strict, local, lazy],
                  extra=[spec["callee"]], fallthroughs=returns)
         dispatch.append((spec["target"], name + "_callee"))
     code.extend(['void ir_unexpected_call(uint32_t);',
@@ -516,10 +520,11 @@ def run_checks(out, cmake, jobs):
                 + ['    default: ir_unexpected_call(target); }',
                    '}'])
     declarations.extend([
-        'static const char *mode_names[] = {"eager", "raw", "scalar", "strict", "local"};',
-        'static const unsigned normalize_empty_mask = 0, required_match_mask = 30;',
-        # The production local column also uses ir_ssa_msvc_convention.
-        '#define FIXTURE_CONVENTION_MASK 16u',
+        'static const char *mode_names[] = {"eager", "raw", "scalar", "strict", "local", "lazy"};',
+        'static const unsigned normalize_empty_mask = 0, required_match_mask = 62;',
+        # The production local column uses ir_ssa_msvc_convention; the lazy
+        # column adds ir_ssa_x87_lazy_nan on top of it.
+        '#define FIXTURE_CONVENTION_MASK 48u',
         '#define FIXTURE_SCRATCH_SIZE 2048',
         '#define FIXTURE_CUSTOM_INPUTS 1',
         '#define FIXTURE_SETUP(c, n) do { (c)->r[R_ESP] = 0x10100; '
@@ -533,16 +538,16 @@ def run_checks(out, cmake, jobs):
         'void ir_observe_store(uint32_t, uint32_t, uint64_t);',
         'void ir_observer_compare(unsigned, int);',
         '#define FIXTURE_WATCH_HIT(a, n, v) ir_observe_store(a, n, v)',
-        # Performance-mode scalar x87 (scalar and local columns) publishes no
-        # x87 state at guest stores, and local state defers GPRs/flags except
+        # Performance-mode scalar x87 (scalar, local and lazy columns) publishes
+        # no x87 state at guest stores, and local state defers GPRs/flags except
         # ESP/EBP/EIP there; strict and raw keep complete snapshots.
-        '#define FIXTURE_AFTER_STATE(mode, c) ir_observer_compare(mode, (mode) == 4 ? 2 : (mode) == 2)',
+        '#define FIXTURE_AFTER_STATE(mode, c) ir_observer_compare(mode, ((mode) == 4 || (mode) == 5) ? 2 : (mode) == 2)',
         'static const char *case_names[] = {'
         + ','.join('"%s"' % name
                    for name in list(CASES) + list(CALL_CASES) + list(BYTE_CALL_CASES)
                    + list(INDIRECT_CASES))
         + '};',
-        'static void (*functions[][5])(X86 *) = {' + ','.join(rows) + '};',
+        'static void (*functions[][6])(X86 *) = {' + ','.join(rows) + '};',
     ])
     (out / "generated.c").write_text("\n".join(code) + "\n")
     (out / "fixtures.h").write_text("\n".join(declarations) + "\n")

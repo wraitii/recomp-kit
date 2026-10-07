@@ -330,6 +330,22 @@ proven-binary32 operands use native float add/sub/mul plus the runtime's
 NaN/status normalization when a linear run has at least two arithmetic effects;
 division and unproven operands use the double helpers.
 
+`ir_ssa_x87_lazy_nan` is a representation change on top of that removal: a
+basic-arithmetic result stays in full precision with no NaN branch, and the
+`isnan`/indefinite fold happens where the value stops flowing into more
+NaN-propagating arithmetic. Folding is per `Slot` and block-local; every
+non-linear internal edge folds and canonicalises before the carried value is
+snapshotted (so `CarryShape` is unchanged), and `flush()` folds before any
+`c->st`/`c->fpu_sw` publication. `FCHS`/`FABS`, the comparisons, `FST`/`FSTP`,
+`FNSTSW`, `FSTCW`/`FLDCW` and the opaque fallbacks are sinks; `FCLEX`
+canonicalises without raising IE, then clears the status as eager does; pure
+moves (`FXCH`, `FLD`/`FST ST(i)`) carry the pending flag. Loaded NaN payloads
+are never marked pending, so they pass through untouched. Host `+ - * /` and
+`sqrt` propagate NaN, and IE is sticky, so the sole observable difference from
+an eager per-op check is when the fold is computed, never its result. The
+relaxation is disabled for strict x87, the exact flush, the ceiling column and
+`optimize=False`, where emission is byte-identical to the eager helpers.
+
 The `locals` state policy defers GPR/flag publication at guest loads and
 stores (integer and x87), keeping EIP/ESP/EBP for diagnostics; no runtime
 observer reads other CPU fields there. Division, string-helper, call and return
@@ -361,11 +377,13 @@ Policies and where they apply:
 | `ir_ssa_x87` | `scalar` (default), `scalar-strict` | strict publishes x87 state before loads and stores and uses general arithmetic recipes |
 | `ir_ssa_state` | `locals` (default), `strict` | strict keeps every pre-access GPR/flag snapshot |
 | `ir_ssa_msvc_convention` | `true` (default), `false` | false publishes complete x87 state at calls and returns; flags stay exact in both modes |
+| `ir_ssa_x87_lazy_nan` | `true` (default), `false` | defer the per-arithmetic NaN/IE check and indefinite canonicalisation to sinks and internal CFG edges; `false` restores the eager `fx87`/`fx87_exact` emission byte for byte |
 
-`RECOMP_NULL_CHECKS=1` builds always compile the strict forms of all three: `emit`
+`RECOMP_NULL_CHECKS=1` builds always compile the strict forms of all of these: `emit`
 emits a strict/fast `#if` pair whenever any policy is relaxed. `emit()`
 defaults to the production policy (`x87_scalar_strict=False, local_state=True,
-msvc_convention=True`).
+msvc_convention=True`); the lazy-NaN parameter is opt-in at the `emit` layer and
+the production selector reads `ir_ssa_x87_lazy_nan` with a default of `true`.
 
 DIVERGENCE(original): [ssa-x87-scalar] interior access faults and store watch
 callbacks may expose the preceding published x87 state, and internal CFG edges
@@ -442,6 +460,7 @@ ir_ssa = true
 ir_ssa_x87 = "scalar"    # scalar (default) or scalar-strict
 ir_ssa_state = "locals"  # locals (default) or strict
 ir_ssa_msvc_convention = true  # false: conservative call/return publication
+ir_ssa_x87_lazy_nan = true  # false: eager per-op NaN/IE checks
 ```
 
 Regenerate with `tools/build.py --regenerate`; `ir_ssa = false` restores decoded

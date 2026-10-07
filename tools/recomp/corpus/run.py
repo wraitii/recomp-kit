@@ -592,7 +592,7 @@ def markdown(report):
 def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0, trials=9,
                x87_dataflow=False, x87_stack_forwarding=False, decoded_dataflow=False,
                ir_ssa=False, ir_ssa_x87=None, ir_ssa_state=None, ir_ssa_convention=None,
-               ir_ssa_ceiling=None, asan=False):
+               ir_ssa_lazy_nan=None, ir_ssa_ceiling=None, asan=False):
     """Decode the selected instructions, build isolated variants, validate, report.
 
     ``ir_ssa_ceiling`` (e.g. ``"A,C"``/``"all"``) adds the UNPROVEN, corpus-only
@@ -602,13 +602,17 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
     ``ir_ssa_convention`` (default True with ``ir_ssa``) mirrors
     ``ir_ssa_msvc_convention``; the combined column then compares with the
     convention's dead fields cleared (``corpus_convention_canonical``).
+    ``ir_ssa_lazy_nan`` (default True with ``ir_ssa``) mirrors
+    ``ir_ssa_x87_lazy_nan``; the combined column defers the per-op NaN check.
     """
     from ir.ceiling import parse_relaxations, label as ceiling_label
     if asan and trial_ms:
         raise ValueError("an AddressSanitizer corpus build is for correctness only; use a zero trial budget")
-    if (ir_ssa_x87 is not None or ir_ssa_state is not None or ir_ssa_convention is not None) and not ir_ssa:
-        raise ValueError("IR SSA x87, state and convention policies require IR SSA")
+    if (ir_ssa_x87 is not None or ir_ssa_state is not None or ir_ssa_convention is not None
+            or ir_ssa_lazy_nan is not None) and not ir_ssa:
+        raise ValueError("IR SSA x87, state, convention and lazy-NaN policies require IR SSA")
     ir_ssa_convention = bool(ir_ssa) and ir_ssa_convention is not False
+    ir_ssa_lazy_nan = bool(ir_ssa) and ir_ssa_lazy_nan is not False
     # Plain --ir-ssa is the production policy: scalar x87, local CPU state.
     ir_ssa_x87, ir_ssa_state = ir_ssa_x87 or "scalar", ir_ssa_state or "locals"
     ceiling = parse_relaxations(ir_ssa_ceiling)
@@ -754,6 +758,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
                                 x87_scalar_strict=(ir_ssa_x87 == 'scalar-strict'),
                                 local_state=(ir_ssa_state == 'locals'),
                                 msvc_convention=ir_ssa_convention,
+                                lazy_nan=ir_ssa_lazy_nan,
                                 resumable_stacks=getattr(T, 'RESUMABLE_STACKS', False),
                                 _ceiling=relax)
                 try:
@@ -964,6 +969,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
               'ir_ssa': ir_ssa,
               'ir_ssa_x87': ir_ssa_x87, 'ir_ssa_state': ir_ssa_state,
               'ir_ssa_msvc_convention': ir_ssa_convention,
+              'ir_ssa_lazy_nan': ir_ssa_lazy_nan,
               'ir_ssa_ceiling': {'enabled': bool(ceiling), 'relaxations': sorted(ceiling),
                                  'label': ceiling_label(ceiling) if ceiling else None,
                                  'unproven': 'corpus-only experiment, not the agreed performance-mode contract'},

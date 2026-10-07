@@ -242,6 +242,23 @@
   x87 flushes skip popped residue, assuming registers above TOP are tagged empty.
 ||||||| parent of 8962fdc (Add modular observable-contract analysis over shared CFGs)
 ||||||| parent of 76dedd4 (Carry scalar x87 state across internal CFG edges in SSA bodies)
+||||||| parent of 0336a4b (Defer x87 NaN/IE checks to sinks in scalar SSA bodies)
+- Defer the per-arithmetic x87 NaN/IE check to sinks in scalar SSA bodies. A
+  new `[translate] ir_ssa_x87_lazy_nan` (default `true`) leaves basic-arithmetic
+  results in full precision with no NaN branch and folds
+  `x87_env_.fpu_sw |= (v != v)` plus the indefinite canonicalisation where the
+  value stops flowing into more NaN-propagating arithmetic: non-linear internal
+  CFG edges, `flush()`/publication, stores, `FCHS`/`FABS`, compares, `FNSTSW`
+  and the opaque fallbacks. `FCLEX` canonicalises without raising IE before it
+  clears the status; pure moves carry the pending flag; loaded NaN payloads are
+  never deferred. Host `+ - * /` propagation plus sticky IE make the result
+  observably identical to the eager per-op `fx87`/`fx87_exact` emission, so it
+  carries no `DIVERGENCE` tag. The relaxation is off for strict x87, the exact
+  flush, the ceiling column and `optimize=False`, whose output stays
+  byte-identical. The synthetic IR checks gain a sixth `lazy` column (164
+  fixtures × 24,576 inputs × ordinary and null-check builds) and ten targeted
+  lazy-NaN fixtures; the corpus takes `--corpus-ir-ssa-lazy-nan on|off`.
+
 - Carry unpublished scalar x87 state across internal CFG edges in performance
   mode. `x87_carry.py` computes a fixed-point join shape per block, predecessors
   normalize TOP and write canonical slot variables, and successors copy them

@@ -141,8 +141,8 @@ def codegen_ir(fir, lifter):
 
 def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=True,
          call_symbols=None, x87_scalar_strict=False, local_state=True, msvc_convention=True,
-         resumable_stacks=False, lifter=None, indirect_call_symbol=None, _guard_null_checks=True,
-         _ceiling=frozenset(), facts=None):
+         lazy_nan=False, resumable_stacks=False, lifter=None, indirect_call_symbol=None,
+         _guard_null_checks=True, _ceiling=frozenset(), facts=None):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
     `call_symbols` maps an allowed direct-call target address to the C symbol
@@ -159,6 +159,13 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     x87 stack convention at calls and returns: flushes skip popped residue under
     the empty-above-TOP invariant (`x87_scalar.py`). False restores the
     conservative publication; null-check builds compile it False.
+
+    `lazy_nan` (the `ir_ssa_x87_lazy_nan` setting) defers the per-arithmetic
+    NaN check and indefinite canonicalisation to sinks and internal CFG edges,
+    folding IE before any status read or publication. It is a representation
+    change: with it off the emitted body is byte-identical to the eager
+    `fx87`/`fx87_exact` forms. It is ignored by strict x87, the exact flush,
+    the ceiling column and `optimize=False`.
 
     `_ceiling` is private to the function corpus: a set of UNPROVEN relaxation
     letters from `ceiling.py` (A, C, D, E). It is not part of the agreed performance
@@ -211,6 +218,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         options = dict(optimize=optimize, publish_changed=publish_changed, wide_registers=wide_registers,
                        call_symbols=call_symbols, resumable_stacks=resumable_stacks,
                        lifter=lifter, indirect_call_symbol=indirect_call_symbol,
+                       lazy_nan=lazy_nan,
                        _guard_null_checks=False)
         strict = emit(fir, symbol, x87_scalar_strict=True, local_state=False, msvc_convention=False,
                       **options)
@@ -223,7 +231,11 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     # register above TOP, so those functions keep the exact x87 flush.
     x87_convention = msvc_convention and not any(
         ins.mnem.upper().removeprefix("WAIT ") in ("FINCSTP", "FDECSTP") for ins in fir.insns)
-    scalar = X87Scalar(observe_loads=x87_scalar_strict, convention=x87_convention) if optimize else None
+    # Lazy NaN needs per-op deferral, so it is off for the exact flush (which
+    # resets at edges), strict x87, the ceiling column and raw emission.
+    defer_ie = lazy_nan and not x87_scalar_strict and msvc_convention and not _ceiling
+    scalar = X87Scalar(observe_loads=x87_scalar_strict, convention=x87_convention,
+                       lazy_nan=defer_ie) if optimize else None
     if scalar is not None and _ceiling:
         if _ceiling & X87_RELAXATIONS:
             from .x87_ceiling import X87Ceiling  # UNPROVEN ceiling C/D/E lowering.
@@ -495,6 +507,9 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         def transition(source, targets):
             active = []
             fallback = False
+            # Deferred NaNs never cross a non-linear internal edge: fold IE and
+            # canonicalise the carried value so the planned shape is unchanged.
+            scalar.fold_pending(lines)
             live = scalar.snapshot()
             for target in targets:
                 shape = entry_shape.get(target)

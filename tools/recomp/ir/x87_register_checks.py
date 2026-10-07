@@ -200,4 +200,110 @@ CASES = {
         "d95b04",      # FSTP dword [EBX+4]
         "c3",
     ),
+    # Lazy NaN: a long arithmetic chain from a loaded NaN reaches FNSTSW. IE
+    # must be set exactly as the eager per-op checks would, even though the
+    # arithmetic itself is deferred.
+    "x87_lazy_nan_chain_fnstsw": (
+        "d906",        # FLD dword [ESI]
+        "d8c0",        # FADD ST(0), ST(0)
+        "d8c8",        # FMUL ST(0), ST(0)
+        "d9e8",        # FLD1
+        "dec1",        # FADDP ST(1), ST(0)
+        "d9e8",        # FLD1
+        "dec1",        # FADDP ST(1), ST(0)
+        "dfe0",        # FNSTSW AX
+        "8903",        # MOV [EBX], EAX
+        "c3",
+    ),
+    # Lazy NaN: inf - inf produces the indefinite NaN which is popped without
+    # ever being an operand of a propagating op. The fold at FSTP ST(0) must
+    # raise IE; nothing downstream would.
+    "x87_lazy_invalid_sub_popped": (
+        "d906",        # FLD dword [ESI]
+        "d9c0",        # FLD ST(0)
+        "dee9",        # FSUBP ST(1), ST(0) -> inf - inf = NaN, pop
+        "ddd8",        # FSTP ST(0) (discard the NaN)
+        "dfe0",        # FNSTSW AX
+        "8903",        # MOV [EBX], EAX
+        "c3",
+    ),
+    # Lazy NaN: 0 * inf is the other invalid-op product shape.
+    "x87_lazy_invalid_mul_popped": (
+        "d906",        # FLD dword [ESI]
+        "d9ee",        # FLDZ
+        "dec9",        # FMULP ST(1), ST(0) -> inf * 0 = NaN, pop
+        "ddd8",        # FSTP ST(0) (discard the NaN)
+        "dfe0",        # FNSTSW AX
+        "8903",        # MOV [EBX], EAX
+        "c3",
+    ),
+    # Lazy NaN: a pending NaN reaches a non-arithmetic overwrite (FST ST(1))
+    # and must be folded before it is lost.
+    "x87_lazy_nan_overwrite": (
+        "d906",        # FLD dword [ESI]
+        "d8c0",        # FADD ST(0), ST(0) -> NaN pending
+        "d9e8",        # FLD1
+        "ddd1",        # FST ST(1) (overwrites the pending ST(1))
+        "d95b04",      # FSTP dword [EBX+4]
+        "c3",
+    ),
+    # Lazy NaN: the pending value crosses a loop backedge.
+    "x87_lazy_nan_backedge": (
+        "b902000000",  # MOV ECX, 2
+        "d906",        # FLD dword [ESI]     <- loop top
+        "d8c0",        # FADD ST(0), ST(0)
+        "d9e8",        # FLD1
+        "dec1",        # FADDP ST(1), ST(0)
+        "49",          # DEC ECX
+        "75f5",        # JNZ -11 -> loop top
+        "dfe0",        # FNSTSW AX
+        "8903",        # MOV [EBX], EAX
+        "c3",
+    ),
+    # Lazy NaN: the pending value crosses a forward join.
+    "x87_lazy_nan_join": (
+        "d906",        # FLD dword [ESI]
+        "d8c0",        # FADD ST(0), ST(0)
+        "a901000000",  # TEST EAX, 1
+        "7404",        # JZ +4 -> FNSTSW
+        "d9e8",        # FLD1
+        "dec1",        # FADDP ST(1), ST(0)
+        "dfe0",        # FNSTSW AX (join)
+        "8903",        # MOV [EBX], EAX
+        "c3",
+    ),
+    # Lazy NaN: FCHS/FABS are payload/sign-sensitive, so they must act on the
+    # canonical indefinite exactly as eager does.
+    "x87_lazy_fchs_store": (
+        "d906",        # FLD dword [ESI]
+        "d8c0",        # FADD ST(0), ST(0)
+        "d9e0",        # FCHS
+        "d95b04",      # FSTP dword [EBX+4]
+        "c3",
+    ),
+    "x87_lazy_fabs_store": (
+        "d906",        # FLD dword [ESI]
+        "d8c0",        # FADD ST(0), ST(0)
+        "d9e1",        # FABS
+        "d95b04",      # FSTP dword [EBX+4]
+        "c3",
+    ),
+    # Lazy NaN: FUCOM on a quiet arithmetic NaN gets IE from the fold, since
+    # FUCOM itself only raises IE for a signalling NaN.
+    "x87_lazy_fucom": (
+        "d906",        # FLD dword [ESI]
+        "d8c0",        # FADD ST(0), ST(0)
+        "d9e8",        # FLD1
+        "dde1",        # FUCOM ST(1)
+        "dfe0",        # FNSTSW AX
+        "8903",        # MOV [EBX], EAX
+        "c3",
+    ),
+    # Lazy NaN: a loaded NaN payload is never arithmetic, so it must pass
+    # through untouched rather than being canonicalised.
+    "x87_lazy_loaded_nan": (
+        "d906",        # FLD dword [ESI]
+        "d95b04",      # FSTP dword [EBX+4]
+        "c3",
+    ),
 }

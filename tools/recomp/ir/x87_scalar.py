@@ -58,6 +58,7 @@ class Slot:
     tag: Optional[str] = None
     narrow: bool = False  # Proven binary32 when PC=00, not an incoming-state guess.
     dirty: set = field(default_factory=set)
+    pending: bool = False  # Arithmetic NaN whose IE check/canonicalisation is deferred.
 
 
 #: Slot components carried across an internal CFG edge.
@@ -164,11 +165,12 @@ def merge_shapes(shapes):
 class X87Scalar:
     """Track all eight physical residues within a single-entry linear region."""
 
-    def __init__(self, observe_loads=False, convention=False):
+    def __init__(self, observe_loads=False, convention=False, lazy_nan=False):
         self.serial = 0
         self.temps = []
         self.observe_loads = observe_loads
         self.convention = convention
+        self.lazy_nan = lazy_nan
         self.binary32 = True
         self.reset()
 
@@ -221,18 +223,75 @@ class X87Scalar:
             setattr(slot, part, self._temp(expr, lines, ctype))
         return getattr(slot, part)
 
-    def _assign(self, logical, narrow=None, **parts):
+    def _assign(self, logical, narrow=None, pending=None, **parts):
         _, slot = self._slot(logical)
         if narrow is not None:
             slot.narrow = narrow
         for part, expr in parts.items():
             setattr(slot, part, expr)
             slot.dirty.add(part)
+        if pending is not None:
+            slot.pending = pending
 
-    def _set(self, logical, expr, lines, bits="0", exact="0", tag=None, narrow=False):
+    def _fold_slot(self, slot, lines, emit_ie=True, canonical=True):
+        """Fold one deferred arithmetic NaN: raise IE and canonicalise its bits.
+
+        A deferred value is always bound to a simple local by `_set`/`_read`;
+        the guard below keeps a future caller from duplicating a compound
+        expression in the `v != v ? indef : v` ternary.
+        """
+        if not slot.pending:
+            return slot.value
+        value = slot.value
+        if value is None:
+            slot.pending = False
+            return None
+        if not value.isidentifier():
+            value = self._temp("(%s)" % value, lines, "double")
+        if emit_ie:
+            # IE is bit 0, so a branchless boolean OR raises it exactly when
+            # the value is NaN, mirroring `fx87`'s NaN branch.
+            lines.append("x87_env_.fpu_sw |= (uint16_t)(%s != %s);" % (value, value))
+            self.status_dirty = True
+        if canonical:
+            slot.value = self._temp(
+                "(%s != %s ? x87_indefinite() : %s)" % (value, value, value),
+                lines, "double")
+            slot.dirty.add("value")
+        slot.pending = False
+        return slot.value
+
+    def _fold(self, logical, lines, emit_ie=True, canonical=True):
+        _, slot = self._slot(logical)
+        return self._fold_slot(slot, lines, emit_ie, canonical)
+
+    def _fold_all(self, lines, emit_ie=True, canonical=True):
+        for _, slot in sorted(self.slots.items()):
+            if slot.pending:
+                self._fold_slot(slot, lines, emit_ie, canonical)
+
+    def fold_pending(self, lines):
+        """Fold every deferred NaN before an internal CFG edge or publication."""
+        if self.active:
+            self._fold_all(lines)
+
+    def _release(self, logical, lines, subsumed=False):
+        """Discard the slot at `logical`; fold IE unless the new value subsumes it."""
+        _, slot = self._slot(logical)
+        if not slot.pending:
+            return
+        if subsumed:
+            slot.pending = False
+        else:
+            self._fold_slot(slot, lines)
+
+    def _set(self, logical, expr, lines, bits="0", exact="0", tag=None, narrow=False,
+             pending=False, subsumed=False):
+        self._release(logical, lines, subsumed=subsumed)
         value = self._temp(expr, lines)
         self._assign(logical, value=value, bits=bits, exact=exact,
-                     tag=tag or "ftag_classify(%s)" % value, narrow=narrow)
+                     tag=tag or "ftag_classify(%s)" % value, narrow=narrow,
+                     pending=pending)
 
     def _move_top(self, delta):
         self.top = (self.top + delta) & 7
@@ -240,8 +299,10 @@ class X87Scalar:
         self.position += delta
         self.low = min(self.low, self.position)
 
-    def _drop(self):
+    def _drop(self, lines=None, subsumed=False):
         # Preserve both value and integer shadow in the popped physical slot.
+        if lines is not None:
+            self._release(0, lines, subsumed=subsumed)
         self._assign(0, exact="0", tag="FTAG_EMPTY")
         self._move_top(1)
 
@@ -290,10 +351,12 @@ class X87Scalar:
         """Publish only changed components; retain scalar knowledge afterward."""
         if not self.active:
             return []
+        folded = []
+        self._fold_all(folded)
         if self.convention:
             lines = self._convention_flush()
             if lines is not None:
-                return lines
+                return folded + lines
         lines, tags = [], []
         for offset, slot in sorted(self.slots.items()):
             phys = self._phys(offset)
@@ -315,7 +378,7 @@ class X87Scalar:
         if self.status_dirty:
             lines.append("c->fpu_sw = x87_env_.fpu_sw;")
             self.status_dirty = False
-        return lines
+        return folded + lines
 
     def snapshot(self):
         """Current unpublished state as a carry shape relative to the live TOP.
@@ -427,8 +490,13 @@ class X87Scalar:
                 parts = {part: self._read(slots[0], part, lines)
                          for part in ("value", "bits", "exact", "tag")}
                 narrow = self._slot(slots[0])[1].narrow
+                pending = self._slot(slots[0])[1].pending if self.lazy_nan else False
                 self._move_top(-1)
-                self._assign(0, narrow=narrow, **parts)
+                if self.lazy_nan:
+                    self._release(0, lines)
+                    self._assign(0, narrow=narrow, pending=pending, **parts)
+                else:
+                    self._assign(0, narrow=narrow, **parts)
             else:
                 value = mem()
                 self._move_top(-1)
@@ -442,14 +510,28 @@ class X87Scalar:
                 if slots[0]:
                     parts = {part: self._read(0, part, lines)
                              for part in ("value", "bits", "exact", "tag")}
-                    self._assign(slots[0], narrow=self._slot(0)[1].narrow, **parts)
+                    narrow = self._slot(0)[1].narrow
+                    if self.lazy_nan:
+                        # The copy carries any deferred NaN; fold the value the
+                        # destination is about to lose (not an operand).
+                        pending = self._slot(0)[1].pending
+                        self._release(slots[0], lines)
+                        self._assign(slots[0], narrow=narrow, pending=pending, **parts)
+                    else:
+                        self._assign(slots[0], narrow=narrow, **parts)
             else:
+                if self.lazy_nan:
+                    # Store to memory is a sink: canonicalise the double before
+                    # any narrowing conversion, matching eager's fx87 result.
+                    self._fold(0, lines)
                 value = read(0)
                 if bits == 32:
                     value = "fto_float(&x87_env_, %s)" % value
                 lines.append("wrf%d((uint32_t)%s, %s);" % (bits, address, value))
             if m == "FSTP":
-                self._drop()
+                # A register copy already carried the value to its destination;
+                # a plain FSTP ST(0) discards it and must fold.
+                self._drop(lines, subsumed=self.lazy_nan and bool(slots and slots[0]))
         elif m in x87.ARITH or m in x87.INTEGER_ARITH or (m.endswith("P") and m[:-1] in x87.ARITH):
             pop = m.endswith("P")
             base = m[:-1] if pop else m
@@ -469,28 +551,64 @@ class X87Scalar:
                 narrow = self._slot(1)[1].narrow and self._slot(0)[1].narrow
             if base.endswith("R"):
                 lhs, rhs = rhs, lhs
-            value = ("fdivz(&x87_env_, %s, %s)" % (lhs, rhs) if operator == "/" else
-                     "%s %s %s" % (lhs, operator, rhs))
-            value = "fx87(&x87_env_, %s)" % value
-            if narrow and operator in ("+", "-", "*") and not self.observe_loads and self.binary32:
-                value = ("((x87_env_.fpu_cw & 0x300u) == 0u ? "
-                         "fx87_exact(&x87_env_, (double)((float)(%s) %s (float)(%s))) : %s)" %
-                         (lhs, operator, rhs, value))
-            self._set(dst, value, lines, narrow=True)
+            if self.lazy_nan:
+                # NaN-propagating: keep the full-precision result, apply PC
+                # rounding per op, and defer the IE check/canonicalisation.
+                # The destination slot was an operand, so the pending result
+                # subsumes its old IE, and so does a popped operand.
+                raw = ("fdivz(&x87_env_, %s, %s)" % (lhs, rhs) if operator == "/" else
+                       "%s %s %s" % (lhs, operator, rhs))
+                if narrow and operator in ("+", "-", "*") and not self.observe_loads and self.binary32:
+                    value = ("((x87_env_.fpu_cw & 0x300u) == 0u ? "
+                             "(double)((float)(%s) %s (float)(%s)) : %s)" %
+                             (lhs, operator, rhs, raw))
+                else:
+                    value = ("((x87_env_.fpu_cw & 0x300u) == 0u ? "
+                             "(double)(float)(%s) : (%s))" % (raw, raw))
+                self._set(dst, value, lines, narrow=True, pending=True, subsumed=True)
+            else:
+                value = ("fdivz(&x87_env_, %s, %s)" % (lhs, rhs) if operator == "/" else
+                         "%s %s %s" % (lhs, operator, rhs))
+                value = "fx87(&x87_env_, %s)" % value
+                if narrow and operator in ("+", "-", "*") and not self.observe_loads and self.binary32:
+                    value = ("((x87_env_.fpu_cw & 0x300u) == 0u ? "
+                             "fx87_exact(&x87_env_, (double)((float)(%s) %s (float)(%s))) : %s)" %
+                             (lhs, operator, rhs, value))
+                self._set(dst, value, lines, narrow=True)
             self.status_dirty = True
             if pop:
-                self._drop()
+                self._drop(lines, subsumed=True)
         elif m in ("FCOM", "FCOMP", "FUCOM", "FUCOMP", "FICOM", "FICOMP", "FCOMPP", "FUCOMPP", "FTST"):
-            other = (mem(m.startswith("FI")) if memory else
-                     "0.0" if m == "FTST" else read(slots[-1] if slots else 1))
-            lines.append("%s(&x87_env_, %s, %s);" %
-                         ("fucom" if m.startswith("FU") else "fcom", read(0), other))
+            if self.lazy_nan:
+                # Compare is a sink: FUCOM would not raise IE for a quiet
+                # arithmetic NaN, so fold both operands first.
+                self._fold(0, lines)
+                a = read(0)
+                if memory:
+                    other = mem(m.startswith("FI"))
+                elif m == "FTST":
+                    other = "0.0"
+                else:
+                    logical = slots[-1] if slots else 1
+                    self._fold(logical, lines)
+                    other = read(logical)
+                lines.append("%s(&x87_env_, %s, %s);" %
+                             ("fucom" if m.startswith("FU") else "fcom", a, other))
+            else:
+                other = (mem(m.startswith("FI")) if memory else
+                         "0.0" if m == "FTST" else read(slots[-1] if slots else 1))
+                lines.append("%s(&x87_env_, %s, %s);" %
+                             ("fucom" if m.startswith("FU") else "fcom", read(0), other))
             self.status_dirty = True
             for _ in range(2 if m.endswith("PP") else int(m.endswith("P"))):
-                self._drop()
+                self._drop(lines)
         elif m in x87.UNARY:
             narrow = self._slot(0)[1].narrow if m in ("FABS", "FCHS") else m == "FSQRT"
-            self._set(0, (x87.UNARY[m] % read(0)).replace("(c,", "(&x87_env_,"), lines, narrow=narrow)
+            if self.lazy_nan and m in ("FABS", "FCHS"):
+                # Sign/payload-sensitive: eager acts on the canonical indefinite.
+                self._fold(0, lines)
+            self._set(0, (x87.UNARY[m] % read(0)).replace("(c,", "(&x87_env_,"), lines,
+                      narrow=narrow, subsumed=self.lazy_nan and m in ("FSQRT", "FRNDINT"))
             self.status_dirty = True
         elif m in ("FPREM", "FPREM1"):
             self._set(0, "fprem_common(&x87_env_, %s, %s, %d)" %
@@ -501,12 +619,23 @@ class X87Scalar:
             a = {part: self._read(0, part, lines) for part in ("value", "bits", "exact", "tag")}
             b = {part: self._read(other, part, lines) for part in a}
             a_narrow, b_narrow = self._slot(0)[1].narrow, self._slot(other)[1].narrow
-            self._assign(0, narrow=b_narrow, **b)
-            self._assign(other, narrow=a_narrow, **a)
+            if self.lazy_nan:
+                # A pure swap moves the deferred NaN with its value.
+                a_pending, b_pending = self._slot(0)[1].pending, self._slot(other)[1].pending
+                self._assign(0, narrow=b_narrow, pending=b_pending, **b)
+                self._assign(other, narrow=a_narrow, pending=a_pending, **a)
+            else:
+                self._assign(0, narrow=b_narrow, **b)
+                self._assign(other, narrow=a_narrow, **a)
         elif m == "FNSTSW" and operands == (("ax", 0),):
+            if self.lazy_nan:
+                self._fold_all(lines)
             lines.append("%s = (uint16_t)((x87_env_.fpu_sw & (uint16_t)~0x3800u) | ((%s) << 11));" %
                          (result, self._phys(self.top)))
         elif m in ("FNCLEX", "FCLEX"):
+            if self.lazy_nan:
+                # Eager canonicalised before clearing; suppress the IE it cleared.
+                self._fold_all(lines, emit_ie=False)
             lines.append("x87_env_.fpu_sw &= (uint16_t)~0x80ffu;")
             self.status_dirty = True
         elif m in ("FDECSTP", "FINCSTP"):

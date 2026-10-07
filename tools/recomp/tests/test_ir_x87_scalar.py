@@ -153,3 +153,64 @@ def test_merge_shapes_rejects_an_overfull_window():
                       base=0, low=0, high=8)
     assert merge_shapes([over]) is UNSAFE
     assert merge_shapes([wide, over]) is UNSAFE
+
+
+def _arith_fnstsw():
+    # fld1; fld1; faddp; fld1; faddp; fnstsw ax; mov [ebx],eax; ret
+    return function("d9e8", "d9e8", "dec1", "d9e8", "dec1", "dfe0",
+                    "8903", "c3")
+
+
+def test_lazy_nan_off_is_the_eager_fx87_emission():
+    f = _arith_fnstsw()
+    eager = emit(f, "t", _guard_null_checks=False)
+    lazy = emit(f, "t", lazy_nan=True, _guard_null_checks=False)
+    assert eager != lazy
+    # Off keeps the per-op helper; on defers the only IE check to FNSTSW.
+    assert eager.count("fx87(&x87_env_,") >= 2
+    assert "fx87(&x87_env_," not in lazy
+    assert lazy.count("x87_env_.fpu_sw |= (uint16_t)(") == 1
+
+
+def test_lazy_nan_fold_uses_a_bound_local():
+    import re
+    lazy = emit(_arith_fnstsw(), "t", lazy_nan=True, _guard_null_checks=False)
+    assert "x87_indefinite()" in lazy
+    # The ternary repeats only the bound local, never an arithmetic expression.
+    assert re.search(r"\w+ = \((\w+) != \1 \? x87_indefinite\(\) : \1\);", lazy)
+
+
+def test_lazy_nan_disabled_for_raw_strict_exact_and_ceiling():
+    f = _arith_fnstsw()
+    assert (emit(f, "t", optimize=False, lazy_nan=True)
+            == emit(f, "t", optimize=False, lazy_nan=False))
+    assert (emit(f, "t", x87_scalar_strict=True, local_state=False, msvc_convention=False,
+                 lazy_nan=True, _guard_null_checks=False)
+            == emit(f, "t", x87_scalar_strict=True, local_state=False, msvc_convention=False,
+                    lazy_nan=False, _guard_null_checks=False))
+    assert (emit(f, "t", msvc_convention=False, lazy_nan=True, _guard_null_checks=False)
+            == emit(f, "t", msvc_convention=False, lazy_nan=False, _guard_null_checks=False))
+    assert (emit(f, "t", _ceiling=frozenset("D"), lazy_nan=True)
+            == emit(f, "t", _ceiling=frozenset("D"), lazy_nan=False))
+
+
+def test_lazy_nan_fchs_folds_before_negation():
+    # fld [esi]; fadd st0,st0; fchs; fstp [ebx+4]; ret
+    lazy = emit(function("d906", "d8c0", "d9e0", "d95b04", "c3"), "t",
+                lazy_nan=True, _guard_null_checks=False)
+    assert lazy.index("x87_indefinite()") < lazy.index("= -(")
+
+
+def test_lazy_nan_fclex_canonicalises_without_ie():
+    # fld [esi]; fadd st0,st0; fnclex; fnstsw ax; mov [ebx],eax; ret
+    lazy = emit(function("d906", "d8c0", "dbe2", "dfe0", "8903", "c3"), "t",
+                lazy_nan=True, _guard_null_checks=False)
+    assert lazy.count("x87_env_.fpu_sw |= (uint16_t)(") == 0
+    assert lazy.count("x87_indefinite()") == 1
+
+
+def test_lazy_nan_dropped_value_folds_ie():
+    # fld [esi]; fld st0; fsubp; fstp st0; fnstsw ax; mov [ebx],eax; ret
+    lazy = emit(function("d906", "d9c0", "dee9", "ddd8", "dfe0", "8903", "c3"), "t",
+                lazy_nan=True, _guard_null_checks=False)
+    assert lazy.count("x87_env_.fpu_sw |= (uint16_t)(") == 1

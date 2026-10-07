@@ -483,6 +483,9 @@ def parse_args(argv, system=None):
     parser.add_argument("--corpus-ir-ssa-convention", choices=("msvc", "exact"), default=None,
                         type=str, help="Call convention for --corpus-ir-ssa: msvc (default, "
                         "ir_ssa_msvc_convention) or exact (conservative publication)")
+    parser.add_argument("--corpus-ir-ssa-lazy-nan", choices=("on", "off"), default=None,
+                        help="Defer the per-op NaN/IE check to sinks for --corpus-ir-ssa: "
+                             "on (default, ir_ssa_x87_lazy_nan) or off (eager fx87 emission)")
     parser.add_argument("--corpus-ir-ssa-ceiling", metavar="A,C,D,E|all", default=None,
                         help="Add the UNPROVEN, corpus-only SSA ceiling column with these relaxations "
                              "(requires --corpus-ir-ssa scalar x87 and locals state)")
@@ -576,8 +579,12 @@ def parse_args(argv, system=None):
         parser.error("--corpus-ir-ssa-state requires --corpus-ir-ssa")
     if args.corpus_ir_ssa_convention is not None and not args.corpus_ir_ssa:
         parser.error("--corpus-ir-ssa-convention requires --corpus-ir-ssa")
+    if args.corpus_ir_ssa_lazy_nan is not None and not args.corpus_ir_ssa:
+        parser.error("--corpus-ir-ssa-lazy-nan requires --corpus-ir-ssa")
     if args.corpus_ir_ssa_convention is not None:
         args.corpus_ir_ssa_convention = args.corpus_ir_ssa_convention == "msvc"
+    if args.corpus_ir_ssa_lazy_nan is not None:
+        args.corpus_ir_ssa_lazy_nan = args.corpus_ir_ssa_lazy_nan == "on"
     if args.corpus_ir_ssa and (args.corpus_x87_dataflow or args.corpus_stack_forwarding or args.corpus_decoded_dataflow):
         parser.error("--corpus-ir-ssa and decoded-dataflow corpus modes must run separately")
     if args.ir_ssa_checks and any((args.regenerate, args.stub, args.corpus_fragments,
@@ -609,6 +616,7 @@ def main():
                        args.corpus_trial_ms, args.corpus_trials, args.corpus_x87_dataflow, args.corpus_stack_forwarding, args.corpus_decoded_dataflow,
                        args.corpus_ir_ssa, args.corpus_ir_ssa_x87,
                        args.corpus_ir_ssa_state, ir_ssa_convention=args.corpus_ir_ssa_convention,
+                       ir_ssa_lazy_nan=args.corpus_ir_ssa_lazy_nan,
                        ir_ssa_ceiling=args.corpus_ir_ssa_ceiling, asan=args.corpus_asan)
         return
     if args.corpus_fragments:
