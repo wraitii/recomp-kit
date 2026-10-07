@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- D3D8 GPU-indexed triangle lists now include programmable vertex shaders,
+  using declaration-derived layouts and effective padded strides. Lit lists
+  pack distinct referenced vertices before the existing CPU lighting pass and
+  remap indices, avoiding duplicate evaluation and never evaluating sparse
+  gaps. Expansion remains available for unsupported topology/large unlit
+  spans, diagnostics and `RECOMP_D3D8_EXPAND_INDICES=1`. CPU lighting byte
+  equivalence and Metal readback cover both lit layouts, both guest index
+  widths, padded shader strides, base/start offsets and immutable snapshots.
+  Both indexed paths also reject extreme index/base/stride combinations
+  without overflowing host bounds arithmetic.
+
 - Compact unlit D3D8 triangle lists queue GPU indices and the referenced vertex
   interval instead of expanding duplicate vertices. Bounds, base/start offsets,
   ignored upload hints and immutable draw snapshots remain validated. Lit,

@@ -244,8 +244,9 @@ pub fn expand_indexed_into(
     };
     for bytes in selected.chunks_exact(index_size) {
         let vertex = u64::from(read(bytes)) + u64::from(draw.base_vertex);
-        let byte_offset = vertex * u64::from(draw.stride);
-        if byte_offset + u64::from(draw.stride) > vertices.len() as u64 {
+        // Divide before comparing: (index + base + 1) * stride can exceed
+        // u64 even though each guest argument is only 32 bits.
+        if vertex >= vertices.len() as u64 / u64::from(draw.stride) {
             return Err(invalid("index outside vertex buffer"));
         }
     }
@@ -297,6 +298,45 @@ pub fn indexed_list_into(
     indices: &[u8],
     draw: IndexedDraw,
 ) -> Result<Option<(usize, usize)>, RenderError> {
+    indexed_list_bounds(output, vertices, indices, draw, true)
+}
+
+/// Pack only distinct referenced vertices in first-use order. In particular,
+/// sparse gaps are never copied or evaluated by fixed-function lighting.
+/// All source reads are validated before the packed output is modified.
+pub fn packed_indexed_list_into(
+    output: &mut Vec<u8>,
+    remapped: &mut Vec<u32>,
+    vertices: &[u8],
+    indices: &[u8],
+    draw: IndexedDraw,
+) -> Result<(), RenderError> {
+    let Some((begin, _)) = indexed_list_bounds(remapped, vertices, indices, draw, false)? else {
+        output.clear();
+        return Ok(());
+    };
+    output.clear();
+    let mut slots = std::collections::HashMap::new();
+    let stride = draw.stride as usize;
+    for index in remapped.iter_mut() {
+        let next = slots.len() as u32;
+        let slot = *slots.entry(*index).or_insert_with(|| {
+            let at = begin + *index as usize * stride;
+            output.extend_from_slice(&vertices[at..at + stride]);
+            next
+        });
+        *index = slot;
+    }
+    Ok(())
+}
+
+fn indexed_list_bounds(
+    output: &mut Vec<u32>,
+    vertices: &[u8],
+    indices: &[u8],
+    draw: IndexedDraw,
+    compact_only: bool,
+) -> Result<Option<(usize, usize)>, RenderError> {
     let invalid = |cause| RenderError::invalid("DrawIndexedPrimitive", cause);
     let count = draw
         .primitive_count
@@ -330,7 +370,7 @@ pub fn indexed_list_into(
     for b in selected.chunks_exact(size) {
         let index = read(b);
         let vertex = u64::from(index) + u64::from(draw.base_vertex);
-        if (vertex + 1) * u64::from(draw.stride) > vertices.len() as u64 {
+        if vertex >= vertices.len() as u64 / u64::from(draw.stride) {
             return Err(invalid("index outside vertex buffer"));
         }
         min = min.min(index);
@@ -341,7 +381,7 @@ pub fn indexed_list_into(
         return Ok(None);
     }
     let span = u64::from(max) - u64::from(min) + 1;
-    if span > u64::from(count) {
+    if compact_only && span > u64::from(count) {
         return Ok(None);
     }
     output.clear();
@@ -445,6 +485,32 @@ mod tests {
             primitive_count: 1,
         }
     }
+    #[test]
+    fn extreme_index_base_and_stride_reject_without_arithmetic_overflow() {
+        let indices = [u32::MAX; 3]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let d = IndexedDraw {
+            topology: 4,
+            index_format: 102,
+            stride: u32::MAX,
+            base_vertex: u32::MAX,
+            min_index: 0,
+            num_vertices: 0,
+            start_index: 0,
+            primitive_count: 1,
+        };
+        let mut packed = vec![7];
+        let mut remapped = Vec::new();
+        assert!(expand_indexed_into(&mut packed, &[0; 8], &indices, d).is_err());
+        assert!(indexed_list_into(&mut remapped, &[0; 8], &indices, d).is_err());
+        assert!(
+            packed_indexed_list_into(&mut packed, &mut remapped, &[0; 8], &indices, d).is_err()
+        );
+        assert_eq!(packed, [7]);
+    }
+
     #[test]
     fn native_indices_rebase_and_match_expansion() {
         for format in [101, 102] {

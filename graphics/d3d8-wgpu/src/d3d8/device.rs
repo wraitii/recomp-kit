@@ -5,7 +5,9 @@ use super::{
         AlphaTestUniform, FogUniform, FvfLayout, StagesUniform, TEXTURED_WGSL, TransformUniform,
         UNLIT_WGSL, lit_layout, lit_shader_source,
     },
-    resource::{IndexedDraw, VertexBuffer, expand_indexed_into, indexed_list_into},
+    resource::{
+        IndexedDraw, VertexBuffer, expand_indexed_into, indexed_list_into, packed_indexed_list_into,
+    },
     shader::{self, Declaration, Program},
     state::{DeviceState, LitInput, MAX_TEXTURE_STAGES},
     stats, survey,
@@ -2616,7 +2618,9 @@ impl Device {
     }
 
     /// `DrawIndexedPrimitive`: snapshot compact triangle lists as GPU-indexed
-    /// draws; retain expansion for lighting, sparse ranges and other topologies.
+    /// draws, including declaration-derived programmable layouts. Lit lists
+    /// pack distinct referenced vertices before CPU lighting; unlit sparse
+    /// ranges and other topologies retain expansion.
     /// Both paths validate actual index reads rather than the upload hints.
     pub fn draw_indexed_primitive(
         &mut self,
@@ -2629,8 +2633,7 @@ impl Device {
         if draw.primitive_count == 0 {
             return Ok(());
         }
-        // Preserve the expansion path for software lighting (which must only
-        // evaluate referenced vertices), strips/fans and diagnostic traces.
+        // Preserve expansion for strips/fans and diagnostic traces.
         // The switch also permits before/after profiling of the same scene.
         static EXPAND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let expand = *EXPAND.get_or_init(|| {
@@ -2643,12 +2646,27 @@ impl Device {
             .iter()
             .any(|key| std::env::var_os(key).is_some())
         });
-        if !expand
-            && draw.topology == 4
-            && topology == 4
-            && !self.shaders.contains_key(&self.vertex_shader)
-            && !matches!(fvf, 0x0152 | 0x0112)
-        {
+        let effective_fvf = match self.shaders.get(&self.vertex_shader) {
+            Some((Some(decl), program)) if program.declaration_only => decl.fixed_fvf()?,
+            Some((_, program)) if !program.declaration_only => 0,
+            _ => fvf,
+        };
+        if !expand && draw.topology == 4 && topology == 4 {
+            // Keep CPU lighting math unchanged, but evaluate each referenced
+            // source vertex once. Never evaluate unused sparse gaps. The normal
+            // draw path lights the packed stream and queues immutable snapshots.
+            if matches!(effective_fvf, 0x0152 | 0x0112) {
+                let mut packed = std::mem::take(&mut self.index_scratch);
+                let mut remapped = std::mem::take(&mut self.index_rebased);
+                let result = (|| {
+                    packed_indexed_list_into(&mut packed, &mut remapped, vertices, indices, draw)?;
+                    let view = VertexBuffer::borrowed(&packed, draw.stride)?;
+                    self.draw_stream(4, fvf, &view, 0, draw.primitive_count, Some(&remapped))
+                })();
+                self.index_scratch = packed;
+                self.index_rebased = remapped;
+                return result;
+            }
             let mut rebased = std::mem::take(&mut self.index_rebased);
             let result = (|| match indexed_list_into(&mut rebased, vertices, indices, draw)? {
                 Some((begin, end)) => {
@@ -3114,6 +3132,170 @@ mod tests {
                 assert_eq!(
                     &pixels[(16 * 64 + x) * 4..(16 * 64 + x) * 4 + 4],
                     &[0, 255, 0, 255]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_shader_and_sparse_lighting_match_expansion() {
+        use super::*;
+        use crate::{backend::GpuContext, d3d8::state::Light};
+        let gpu = pollster::block_on(GpuContext::new_headless()).expect("Metal adapter");
+        let mut device = Device::new(gpu, 64, 32, 21, 0).unwrap();
+        device.state.set_render_state(7, 0).unwrap();
+        device.state.set_render_state(22, 1).unwrap();
+        // Input registers differ from fixed-function attribute locations.
+        let decl = Declaration::parse(&[0x20000000, 0x40030002, 0x40030005, u32::MAX]).unwrap();
+        let program = Program::parse(
+            &[
+                0xfffe0101, 1, 0xc00f0000, 0x90e40002, 5, 0xd00f0000, 0x90e40005, 0xa0e40000,
+                0xffff,
+            ],
+            false,
+        )
+        .unwrap(); // mov oPos,v2; mul oD0,v5,c0
+        device.shaders.insert(0x10000, (Some(decl), program));
+        device
+            .state
+            .set_light(
+                0,
+                Light {
+                    light_type: 3,
+                    direction: [0.0, 0.0, -1.0],
+                    diffuse: [1.0; 4],
+                    ..Light::default()
+                },
+            )
+            .unwrap();
+        device.state.light_enable(0, true).unwrap();
+        for (fvf, stride, sparse) in [
+            (0x10000, 32, false),
+            (0x10000, 48, false),
+            (0x112, 32, true),
+            (0x152, 36, true),
+        ] {
+            device.vertex_shader = if fvf == 0x10000 { fvf } else { 0 };
+            device
+                .state
+                .set_render_state(137, u32::from(sparse))
+                .unwrap();
+            for format in [101, 102] {
+                let slots = if sparse { [2usize, 17, 41] } else { [2, 3, 4] };
+                // Every unused vertex has a NaN normal/position. Sparse gaps
+                // must never be evaluated or included in the lighting output.
+                let mut vertices = vec![0; (slots[2] + 5) * stride];
+                for chunk in vertices.chunks_exact_mut(4) {
+                    chunk.copy_from_slice(&f32::NAN.to_le_bytes());
+                }
+                for (n, pos) in [[-0.8f32, -0.8, 0.5], [0.8, -0.8, 0.5], [0.0, 0.8, 0.5]]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let at = (slots[n] + 3) * stride;
+                    let dst = &mut vertices[at..at + stride];
+                    dst.fill(0);
+                    dst[..12].copy_from_slice(bytemuck::cast_slice(&pos));
+                    if sparse {
+                        dst[20..24].copy_from_slice(&1.0f32.to_le_bytes());
+                        if fvf == 0x152 {
+                            dst[24..28].copy_from_slice(
+                                &[0xff0000ffu32, 0xff00ff00, 0xffff0000][n].to_le_bytes(),
+                            );
+                        }
+                    } else {
+                        dst[12..16].copy_from_slice(&1.0f32.to_le_bytes());
+                        let color = [
+                            [1.0f32, 0.2, 0.1, 1.0],
+                            [0.1, 1.0, 0.2, 1.0],
+                            [0.2, 0.1, 1.0, 1.0],
+                        ][n];
+                        dst[16..32].copy_from_slice(bytemuck::cast_slice(&color));
+                    }
+                }
+                let raw = [
+                    999u32,
+                    slots[2] as u32,
+                    slots[0] as u32,
+                    slots[1] as u32,
+                    slots[2] as u32,
+                    slots[0] as u32,
+                    slots[1] as u32,
+                ];
+                let mut indices: Vec<u8> = raw
+                    .into_iter()
+                    .flat_map(|i| {
+                        if format == 101 {
+                            (i as u16).to_le_bytes().to_vec()
+                        } else {
+                            i.to_le_bytes().to_vec()
+                        }
+                    })
+                    .collect();
+                let draw = IndexedDraw {
+                    topology: 4,
+                    index_format: format,
+                    stride: stride as u32,
+                    base_vertex: 3,
+                    min_index: u32::MAX,
+                    num_vertices: 0,
+                    start_index: 1,
+                    primitive_count: 2,
+                };
+                let mut expanded = Vec::new();
+                expand_indexed_into(&mut expanded, &vertices, &indices, draw).unwrap();
+                device.shader_uniform.vc[0] = [0.5, 0.75, 1.0, 1.0];
+                device.clear(0, 1, 0xff000000, 1.0, 0).unwrap();
+                device.begin_scene().unwrap();
+                device.state.viewport.x = 0;
+                device.state.viewport.width = 32;
+                device
+                    .draw_indexed_primitive(4, fvf, &vertices, &indices, draw)
+                    .unwrap();
+                {
+                    let batch = device.batch.borrow();
+                    let queued = batch.draws.last().unwrap();
+                    assert!(queued.indices.is_some());
+                    assert_eq!(
+                        queued.vertex_len,
+                        3 * if sparse { 36 } else { stride } as u64
+                    );
+                    assert_eq!(queued.count, 6);
+                }
+                // Neither mutable guest storage nor subsequent constants may
+                // change the previously queued indexed draw.
+                vertices.fill(0);
+                indices.fill(0);
+                device.shader_uniform.vc[0] = [0.0; 4];
+                device.shader_uniform.vc[0] = [0.5, 0.75, 1.0, 1.0];
+                device.state.viewport.x = 32;
+                device
+                    .draw_primitive(
+                        4,
+                        fvf,
+                        &VertexBuffer::borrowed(&expanded, stride as u32).unwrap(),
+                        0,
+                        2,
+                    )
+                    .unwrap();
+                device.shader_uniform.vc[0] = [0.0; 4];
+                device.end_scene().unwrap();
+                let pixels = device.read_pixels().unwrap();
+                let mut colored = 0;
+                for y in 0..32 {
+                    for x in 0..32 {
+                        let left = &pixels[(y * 64 + x) * 4..(y * 64 + x + 1) * 4];
+                        let right = &pixels[(y * 64 + x + 32) * 4..(y * 64 + x + 33) * 4];
+                        assert_eq!(
+                            left, right,
+                            "fvf={fvf:#x} stride={stride} format={format} pixel={x},{y}"
+                        );
+                        colored += usize::from(left[..3] != [0, 0, 0]);
+                    }
+                }
+                assert!(
+                    colored > 100,
+                    "test must render visible pixels: fvf={fvf:#x} stride={stride} format={format}"
                 );
             }
         }

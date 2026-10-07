@@ -22,11 +22,15 @@ The native resource tests link the same Rust storage without creating a GPU.
 
 ## Status
 
-Resource/ABI cleanup, 2026-10-02: the bridge uses opaque Rust storage for texture
-levels and vertex/index buffers. Indexed triangle lists are validated and expanded
-in Rust using checked arithmetic and D3D8's base-relative index interval. Direct
-vertex uploads borrow the bridge's bytes. Shaders and supported render pipelines
-are cached per device; uniforms and GPU vertex uploads remain per draw.
+The bridge uses opaque Rust storage for texture levels and vertex/index buffers.
+Compact triangle lists queue GPU indices, including programmable shaders with
+stream-0 declaration layouts and padded strides. Fixed-function lit lists pack
+only distinct referenced vertices before CPU lighting and remap the GPU indices;
+unused sparse gaps are never evaluated. Checked arithmetic validates actual
+indices and base/start offsets rather than upload hints. Sparse unlit spans,
+strips/fans and diagnostic draws retain expansion; `RECOMP_D3D8_EXPAND_INDICES=1`
+forces it for comparisons. Queued vertex/index bytes and constants are immutable
+snapshots. Shaders and supported render pipelines are cached per device.
 
 ABI version 8 (including programmable shaders) is generated from Rust with cbindgen 0.29.4. COM IIDs, slots and
 arities are generated from the pinned Wine header with a reviewed handler map.

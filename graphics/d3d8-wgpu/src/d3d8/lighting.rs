@@ -707,6 +707,112 @@ mod tests {
         state
     }
     #[test]
+    fn packed_indexed_lighting_matches_expanded_bytes_and_skips_invalid_gaps() {
+        use crate::d3d8::resource::{IndexedDraw, expand_indexed_into, packed_indexed_list_into};
+        let state = directional();
+        for layout in [LitInput::XYZ_NORMAL_TEX1, LitInput::XYZ_NORMAL_DIFFUSE_TEX1] {
+            let mut vertices = vec![0; 70 * layout.stride];
+            for chunk in vertices.chunks_exact_mut(4) {
+                chunk.copy_from_slice(&f32::NAN.to_le_bytes());
+            }
+            for (slot, normal, color) in [
+                (5, [0.0, 0.0, 1.0], 0xff408020),
+                (33, [0.0, 0.6, 0.8], 0xff204080),
+                (64, [0.0, 0.0, -1.0], 0xff804020),
+            ] {
+                let mut v = vertex(normal, color);
+                if layout.diffuse_offset.is_none() {
+                    v.drain(24..28);
+                }
+                vertices[slot * layout.stride..(slot + 1) * layout.stride].copy_from_slice(&v);
+            }
+            for format in [101, 102] {
+                let indices: Vec<u8> = [999u32, 62, 3, 31, 3, 62, 31]
+                    .into_iter()
+                    .flat_map(|i| {
+                        if format == 101 {
+                            (i as u16).to_le_bytes().to_vec()
+                        } else {
+                            i.to_le_bytes().to_vec()
+                        }
+                    })
+                    .collect();
+                let draw = IndexedDraw {
+                    topology: 4,
+                    index_format: format,
+                    stride: layout.stride as u32,
+                    base_vertex: 2,
+                    min_index: u32::MAX,
+                    num_vertices: 0,
+                    start_index: 1,
+                    primitive_count: 2,
+                };
+                let (mut packed, mut remapped, mut expanded) = (Vec::new(), Vec::new(), Vec::new());
+                packed_indexed_list_into(&mut packed, &mut remapped, &vertices, &indices, draw)
+                    .unwrap();
+                assert_eq!(remapped, [0, 1, 2, 1, 0, 2]);
+                assert_eq!(packed.len(), 3 * layout.stride);
+                expand_indexed_into(&mut expanded, &vertices, &indices, draw).unwrap();
+                let (mut lit, mut reference) = (Vec::new(), Vec::new());
+                state
+                    .light_vertices(&packed, 0, 3, layout, &mut lit)
+                    .unwrap();
+                state
+                    .light_vertices(&expanded, 0, 6, layout, &mut reference)
+                    .unwrap();
+                let unpacked: Vec<u8> = remapped
+                    .iter()
+                    .flat_map(|i| {
+                        lit[*i as usize * 36..(*i as usize + 1) * 36]
+                            .iter()
+                            .copied()
+                    })
+                    .collect();
+                assert_eq!(unpacked, reference);
+                // Invalid reads must reject before overwriting packed bytes.
+                let old = packed.clone();
+                for bad in [
+                    IndexedDraw {
+                        base_vertex: u32::MAX,
+                        ..draw
+                    },
+                    IndexedDraw {
+                        start_index: u32::MAX,
+                        ..draw
+                    },
+                    IndexedDraw {
+                        index_format: 0,
+                        ..draw
+                    },
+                    IndexedDraw { stride: 0, ..draw },
+                ] {
+                    assert!(
+                        packed_indexed_list_into(
+                            &mut packed,
+                            &mut remapped,
+                            &vertices,
+                            &indices,
+                            bad
+                        )
+                        .is_err()
+                    );
+                    assert_eq!(packed, old);
+                }
+                assert!(
+                    packed_indexed_list_into(
+                        &mut packed,
+                        &mut remapped,
+                        &vertices,
+                        &indices[..1],
+                        draw
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn reused_scratch_truncates_and_matches_a_fresh_lighting() {
         let state = directional();
         let mut scratch = Vec::new();
