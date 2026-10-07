@@ -118,10 +118,10 @@ or diverted resumable continuation. Dword string moves cover zero count, both
 DF directions and overlapping copies with store observations.
 Raw (`optimize=False`), scalar with strict state, scalar-strict and the
 production scalar/local-state policy are compared in ordinary and null-check builds. Scalar/local-state retains
-complete outgoing state and integer-store GPR/flag snapshots while deferring ordinary
-load observations; the scalar and scalar/local-state columns compare store snapshots
-without x87 stack, tag, TOP and status fields, which scalar x87 does not publish at
-guest accesses. Null-check builds select strict publication. x87 checks cover all TOP,
+complete outgoing state while deferring load and store observations: the scalar column
+compares store snapshots without x87 stack, tag, TOP and status fields, which scalar x87
+does not publish at guest accesses, and the scalar/local-state column also without GPRs
+other than ESP/EBP and the arithmetic flags. Null-check builds select strict publication. x87 checks cover all TOP,
 PC and RC combinations, exact integer metadata, special and finite inputs,
 80-bit memory, register directions, status/rounding/remainder and classification.
 Native read-only store observers additionally compare complete CPU snapshots,

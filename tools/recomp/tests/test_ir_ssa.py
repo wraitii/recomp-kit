@@ -24,7 +24,7 @@ def function(*hexes):
     return FunctionIR(0x1000, insns, default_successors(insns))
 
 
-def execute(s, registers, memory=None, publications=None, read_fields=None):
+def execute(s, registers, memory=None, publications=None, access_fields=None):
     """Small test interpreter; expected machine results are asserted separately."""
     values, memory = {}, dict(memory or {})
 
@@ -48,7 +48,7 @@ def execute(s, registers, memory=None, publications=None, read_fields=None):
             published[key[1]] = read(state[key])
         # Every field must match, even if the plan omitted its assignment.
         for key, value in state.items():
-            if v.opc == "LOAD" and read_fields is not None and key not in read_fields:
+            if v.opc in ("LOAD", "STORE") and access_fields is not None and key not in access_fields:
                 continue
             if key != MEMORY:
                 assert published.get(key[1], 0) == read(value), (v.id, key)
@@ -409,16 +409,16 @@ def test_publication_and_wide_phis_preserve_every_observed_field(hexes, wide):
     ("85c0", "7405", "ba11223344", "8b01", "8901", "c3"),
     ("8b01", "83c101", "83f904", "72f6", "8901", "c3"),
 ])
-def test_deferred_reads_still_publish_exact_stores_and_returns(hexes):
+def test_deferred_accesses_still_publish_exact_returns(hexes):
     f = codegen_ir(function(*hexes), LIFTER)
     s = build(f, register_groups=runtime_groups())
     canonicalize(s)
-    read_fields = {key for group in runtime_groups()[4:6] + runtime_groups()[8:9] for key in group}
-    pubs = plan(s, f.succ, runtime_groups(), read_fields=read_fields)
+    access_fields = {key for group in runtime_groups()[4:6] + runtime_groups()[8:9] for key in group}
+    pubs = plan(s, f.succ, runtime_groups(), access_fields=access_fields)
     simplify(s)  # Retain snapshots for independent interpreter assertions.
     for eax in (0, 0x1234abcd, 0xffffffff):
         inputs = initial(EAX=eax, EDX=22, ECX=1, ESP=0x8000)
-        assert execute(s, inputs, publications=pubs, read_fields=read_fields) == execute(build(f), inputs)
+        assert execute(s, inputs, publications=pubs, access_fields=access_fields) == execute(build(f), inputs)
 
 
 def test_publication_after_division_invalidates_all_field_facts():

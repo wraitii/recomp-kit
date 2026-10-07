@@ -1,7 +1,8 @@
 """Conservative must-analysis for already-published CPU fields.
 
-The default retains every memory observation. Optional read_fields restricts
-ordinary-read publication under an explicitly selected performance policy. A field store is redundant only when
+The default retains every memory observation. Optional access_fields restricts
+publication at guest loads and stores under an explicitly selected performance
+policy. A field store is redundant only when
 all incoming paths prove its current value already resides in the CPU. Facts
 are relative to block entry/exit state, so a loop phi's previous iteration can
 never be mistaken for its newly assigned value. Helpers invalidate facts.
@@ -9,11 +10,14 @@ never be mistaken for its newly assigned value. Helpers invalidate facts.
 from .simplify import EFFECTS
 
 
-def plan(s, successors, fields, *, read_fields=None, unpublished=frozenset()):
+def plan(s, successors, fields, *, access_fields=None, unpublished=frozenset()):
     """Return required register-lane keys for each effect and return snapshot.
 
 `fields` groups register lanes by runtime field. LOAD/STORE have read-only CPU
-observers on normal continuation in the current accessor contract. DIV32 may
+observers on normal continuation in the current accessor contract: the store
+watchpoint reads only the address and value, and null-check builds, whose fault
+dispatch exposes the CPU, compile the strict form. access_fields (the locals
+policy) therefore names the only fields published at accesses. DIV32 may
 return through an error handler; it therefore invalidates all publication facts.
 At joins a field is known only if every predecessor published its exit value.
 Starting with no facts gives a conservative least fixed point for loops.
@@ -24,7 +28,7 @@ It defaults to empty and is never supplied by production selection.
 """
     groups = [tuple(key for key in keys if key in s.inputs) for keys in fields]
     groups = [keys for keys in groups if keys]
-    read_fields = None if read_fields is None else frozenset(read_fields)
+    access_fields = None if access_fields is None else frozenset(access_fields)
     predecessors = {i: [] for i in s.blocks}
     predecessors[s.entry].append(-1)
     for i in s.blocks:
@@ -49,11 +53,10 @@ It defaults to empty and is never supplied by production selection.
                     publications[v.id] = ()
                     continue
                 state = b.exit if v.opc == "RETURN" else b.snapshots[v.id]
-                read_only = v.opc == "LOAD" or (v.opc == "X87_MEM" and
-                    v.data["mnem"] not in ("FST", "FSTP", "FIST", "FISTP", "FNSTSW", "FNSTCW"))
+                access = v.opc in ("LOAD", "STORE", "X87_MEM")
                 required = []
                 for n, keys in enumerate(groups):
-                    if read_only and read_fields is not None and not any(key in read_fields for key in keys):
+                    if access and access_fields is not None and not any(key in access_fields for key in keys):
                         # A skipped snapshot does not make a publication fact.
                         # The older CPU value stays known until a real observer.
                         continue

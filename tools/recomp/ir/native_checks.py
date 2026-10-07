@@ -480,8 +480,9 @@ def run_checks(out, cmake, jobs):
         'void ir_observer_compare(unsigned, int);',
         '#define FIXTURE_WATCH_HIT(a, n, v) ir_observe_store(a, n, v)',
         # Performance-mode scalar x87 (scalar and local columns) publishes no
-        # x87 state at guest stores; strict and raw keep complete snapshots.
-        '#define FIXTURE_AFTER_STATE(mode, c) ir_observer_compare(mode, (mode) == 2 || (mode) == 4)',
+        # x87 state at guest stores, and local state defers GPRs/flags except
+        # ESP/EBP/EIP there; strict and raw keep complete snapshots.
+        '#define FIXTURE_AFTER_STATE(mode, c) ir_observer_compare(mode, (mode) == 4 ? 2 : (mode) == 2)',
         'static const char *case_names[] = {'
         + ','.join('"%s"' % name
                    for name in list(CASES) + list(CALL_CASES) + list(BYTE_CALL_CASES)

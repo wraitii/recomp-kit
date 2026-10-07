@@ -12,9 +12,9 @@ way to select them (a regression test enforces this).
 
 Relaxations (each independently switchable):
 
-A  no store snapshots: ordinary guest stores publish no GPR/flag state. Only
-   calls, returns, division/string seams publish. (Production scalar x87
-   already publishes no x87 state at loads or stores.)
+A  no access snapshots: loads and stores also skip EIP/ESP/EBP. (Production
+   scalar x87 and the locals state policy already defer every other field
+   there.) Only calls, returns, division/string seams publish.
 B  flags dead at call/return boundaries: CF/PF/AF/ZF/SF/OF are not live-in,
    not live-out at return and neither published before nor reloaded after a
    call (DF stays exact). Flags consumed inside the function stay exact.

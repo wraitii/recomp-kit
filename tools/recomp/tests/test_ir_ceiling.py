@@ -83,16 +83,18 @@ def stores_then_publish(text):
     return not re.search(r"c->r\[\d\] = ", text[:last_store])
 
 
-def test_a_removes_store_snapshots_but_keeps_return_state():
-    strict = base(INT_STORE)
-    relaxed = ceil(INT_STORE, "A")
+def test_store_snapshots_are_strict_only_and_return_state_stays():
+    # Production locals defers GPR/flag snapshots at stores like ceiling A,
+    # which additionally drops EIP/ESP/EBP; strict state keeps them all.
+    strict = emit(INT_STORE, "t", local_state=False, _guard_null_checks=False)
     assert not stores_then_publish(strict)
-    assert stores_then_publish(relaxed)
     assert "c->eflags_zf =" in strict.split("wr32(")[0]
-    assert "c->eflags_zf =" not in relaxed.split("wr32(")[0]
-    # Return still publishes ESP/EIP/EAX.
-    tail = relaxed[relaxed.rindex("wr32("):]
-    assert "c->r[0] = " in tail and "recomp_return(c);" in tail
+    for relaxed in (base(INT_STORE), ceil(INT_STORE, "A")):
+        assert stores_then_publish(relaxed)
+        assert "c->eflags_zf =" not in relaxed.split("wr32(")[0]
+        # Return still publishes ESP/EIP/EAX.
+        tail = relaxed[relaxed.rindex("wr32("):]
+        assert "c->r[0] = " in tail and "recomp_return(c);" in tail
 
 
 def test_x87_flush_before_stores_is_strict_only():

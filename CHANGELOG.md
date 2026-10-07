@@ -243,7 +243,9 @@
   watchpoint also sees them; in null-check builds they also take the null guard.
 
 - Scalar SSA x87 no longer publishes x87 state before guest loads and stores,
-  matching decoded `x87_locals`; strict x87 still does.
+  matching decoded `x87_locals`, and the `locals` state policy now defers
+  GPR/flag snapshots at stores as it did at loads (EIP/ESP/EBP stay eager).
+  The strict policies still publish before every access.
 
 - Add `--corpus-asan` to the function corpus: an AddressSanitizer build for
   correctness runs (it requires `--corpus-trial-ms 0`; code sizes are not comparable).

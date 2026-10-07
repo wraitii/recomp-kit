@@ -70,20 +70,29 @@ void ir_observe_store(uint32_t addr, uint32_t width, uint64_t value) {
     o->value = value;
 }
 
-/* Scalar x87 publishes no x87 state at guest stores (see x87_scalar.py), so
- * those columns compare store snapshots with the x87 stack, tags, TOP and
- * status cleared. CW, GPRs, flags and the store itself stay exact; the final
- * state comparison still covers every x87 field. */
-static void clear_x87_store_state(StoreObservation *o) {
+/* Scalar x87 publishes no x87 state at guest stores (see x87_scalar.py), and
+ * the locals state policy publishes only EIP/ESP/EBP there (publication.py).
+ * Those columns compare store snapshots with the deferred fields cleared; CW,
+ * the store itself and every final field stay exact. */
+static void clear_deferred_store_state(StoreObservation *o, int level) {
     memset(o->cpu.st, 0, sizeof o->cpu.st);
     memset(o->cpu.st_bits, 0, sizeof o->cpu.st_bits);
     memset(o->cpu.st_exact, 0, sizeof o->cpu.st_exact);
     o->cpu.fpu_top = 0;
     o->cpu.fpu_sw = 0;
     o->cpu.fpu_tag = 0;
+    if (level < 2)
+        return;
+    for (int r = 0; r < 8; ++r)
+        if (r != R_ESP && r != R_EBP)
+            o->cpu.r[r] = 0;
+    o->cpu.eflags_cf = o->cpu.eflags_zf = o->cpu.eflags_sf = 0;
+    o->cpu.eflags_of = o->cpu.eflags_pf = o->cpu.eflags_af = 0;
 }
 
-void ir_observer_compare(unsigned mode, int x87_deferred_at_stores) {
+/* level 0 compares complete snapshots, 1 defers x87 state, 2 also GPRs other
+ * than ESP/EBP and the arithmetic flags. */
+void ir_observer_compare(unsigned mode, int level) {
     static StoreObservation expected[32];
     if (!mode) {
         reference_count = observation_count;
@@ -91,10 +100,10 @@ void ir_observer_compare(unsigned mode, int x87_deferred_at_stores) {
         return;
     }
     memcpy(expected, reference, sizeof expected);
-    if (x87_deferred_at_stores) {
+    if (level) {
         for (unsigned i = 0; i < 32; ++i) {
-            clear_x87_store_state(&expected[i]);
-            clear_x87_store_state(&observations[i]);
+            clear_deferred_store_state(&expected[i], level);
+            clear_deferred_store_state(&observations[i], level);
         }
     }
     if (observation_count != reference_count || memcmp(expected, observations, sizeof expected)) {

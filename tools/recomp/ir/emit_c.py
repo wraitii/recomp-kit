@@ -243,19 +243,20 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     if optimize:
         canonicalize(s)
         if publish_changed:
-            # DIVERGENCE(original): [ssa-state-locals] ordinary load faults may
-            # observe earlier GPR/flag values under the agreed performance-mode
-            # policy. Keep diagnostic EIP/ESP/EBP eager; stores, division, calls
-            # and returns still publish every required field. The strict path
-            # remains the default and keeps all pre-access snapshots.
-            read_fields = {key for key, (field, _) in mapping.items()
-                           if field in ("c->eip", "c->r[4]", "c->r[5]")} if local_state else None
+            # DIVERGENCE(original): [ssa-state-locals] guest load/store faults
+            # and store watch callbacks may observe earlier GPR/flag values
+            # under the agreed performance-mode policy. Keep diagnostic
+            # EIP/ESP/EBP eager; division, string helpers, calls and returns
+            # still publish every required field. The strict path keeps all
+            # pre-access snapshots.
+            access_fields = {key for key, (field, _) in mapping.items()
+                             if field in ("c->eip", "c->r[4]", "c->r[5]")} if local_state else None
             plan_groups = [g for g, (_, field) in zip(groups, fields)
                            if not ("B" in _ceiling and field in FLAG_FIELDS)]
             # UNPROVEN ceiling A: guest memory accesses publish nothing.
             unpublished = (frozenset(("LOAD", "STORE", "X87_MEM"))
                            if "A" in _ceiling else frozenset())
-            publications = plan(s, fir.succ, plan_groups, read_fields=read_fields,
+            publications = plan(s, fir.succ, plan_groups, access_fields=access_fields,
                                 unpublished=unpublished)
         live = simplify(s, publications)
     else:

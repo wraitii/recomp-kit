@@ -50,17 +50,20 @@ def test_scalar_environment_is_invalidated_after_control_word_change():
     assert text.index("c->st[") < text.index("x87_set_cw(c,")
 
 
-def test_deferred_reads_do_not_claim_unpublished_cpu_fields():
+def test_deferred_accesses_do_not_claim_unpublished_cpu_fields():
     f = function("83c007", "8b16", "8903", "c3")
     s = build(f)
     canonicalize(s)
     pubs = plan(s, f.succ, [[key] for key in s.inputs if key[0] == "register"],
-                read_fields=())
+                access_fields=())
     load = next(v for b in s.blocks.values() for v in b.ops if v.opc == "LOAD")
     store = next(v for b in s.blocks.values() for v in b.ops if v.opc == "STORE")
-    assert not pubs[load.id]
+    assert not pubs[load.id] and not pubs[store.id]
+    # Neither access claimed EAX, so the return still publishes it.
+    ret = next(b for b in s.blocks.values() if any(v.opc == "RETURN" for v in b.ops))
     eax = Lifter().register("EAX")
-    assert ("register", eax[1]) in pubs[store.id]
+    assert any(key[1] == eax[1] for key in plan(s, f.succ, [[key] for key in s.inputs if key[0] == "register"],
+                                                 access_fields=()).get(next(v.id for v in ret.ops if v.opc == "RETURN"), ()))
     simplify(s, pubs)
     assert any(load in b.ops for b in s.blocks.values())
 

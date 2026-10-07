@@ -137,8 +137,9 @@ proven-binary32 operands use native float add/sub/mul plus the runtime's
 NaN/status normalization when a linear run has at least two arithmetic effects;
 division and unproven operands use the double helpers.
 
-The `locals` state policy defers GPR/flag publication at ordinary integer and
-x87 reads, keeping EIP/ESP/EBP for diagnostics. Store, division, call and return
+The `locals` state policy defers GPR/flag publication at guest loads and
+stores (integer and x87), keeping EIP/ESP/EBP for diagnostics; no runtime
+observer reads other CPU fields there. Division, string-helper, call and return
 snapshots stay complete. The must-analysis never claims a skipped field was
 published, so dead-value elimination can drop intermediate flags overwritten
 before a real observer.
@@ -156,7 +157,7 @@ defaults to the production policy (`x87_scalar_strict=False, local_state=True`).
 
 DIVERGENCE(original): [ssa-x87-scalar] interior access faults and store watch
 callbacks may expose the preceding published x87 state. [ssa-state-locals] likewise defers GPR/flag
-state except EIP/ESP/EBP. [ssa-x87-binary32] uses the documented binary32
+state except EIP/ESP/EBP at loads and stores. [ssa-x87-binary32] uses the documented binary32
 exponent-range policy. Accesses and faults are never removed. Interior
 fault/SEH equivalence remains unverified.
 
@@ -240,7 +241,7 @@ spells it `--ir-ssa-ceiling`).
 
 | Letter | Relaxation |
 | --- | --- |
-| A | No store snapshots: LOAD/STORE effects publish no GPR/flag state (production scalar x87 already publishes none there); only calls, returns and division/string seams do |
+| A | No access snapshots at all, dropping EIP/ESP/EBP too (production `locals` already defers every other field at loads and stores) |
 | B | Arithmetic flags are dead across entry, call and return (DF stays exact) |
 | C | MSVC x87 call convention: values only, no tags/residue/exact shadows, popped slots never published |
 | D | No sticky exception bits; NaN canonicalised only at stores |
