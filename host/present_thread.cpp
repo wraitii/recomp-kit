@@ -1840,6 +1840,9 @@ extern "C" void host_present_seal_window() {
     auto s = active.load();
     if (!s)
         return;
+    // Window presents (including D3D8 native-texture and RGBA handoffs) bypass
+    // host_frame_seal, but are the same guest-side frame boundary for profiling.
+    profile_marker_frame();
     // A separate sequence avoids collisions with DirectDraw's frame leases.
     static uint64_t next = uint64_t(1) << 63;
     attach_settings_page(s);

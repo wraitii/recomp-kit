@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Samply frame markers now include window presents, including D3D8 native
+  texture handoff and CPU readback, using the existing `RECOMP_PROFILE_MARKERS`
+  opt-in or automatic detection when launched under samply.
+
 - Fixed-function diffuse/ambient/emissive lighting for D3D8 0x112/0x152 now
   runs in a vertex shader for indexed and nonindexed draws, including pixel
   shader combinations. Immutable uniforms retain material sources, light order,
