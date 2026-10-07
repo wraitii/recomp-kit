@@ -37,6 +37,9 @@ OsThreadId os_thread_id_of(const OsThread *t);
 // Virtual memory: a zero-filled, readable, writable, page-aligned region.
 // ---------------------------------------------------------------------------
 void *os_vm_reserve(size_t bytes); // NULL on failure
+// The same region at exactly `address`, or NULL if any of it is taken. Never
+// replaces an existing mapping.
+void *os_vm_reserve_at(void *address, size_t bytes);
 void os_vm_release(void *p, size_t bytes);
 
 // ---------------------------------------------------------------------------

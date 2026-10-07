@@ -52,6 +52,11 @@ struct WatchArm {
         }
         if (base >= GUEST_SIZE)
             return;
+        if (!RECOMP_STORE_HOOKS) {
+            fprintf(stderr, "[recomp] RECOMP_WATCH ignored: this build has no store hooks "
+                            "([game] store_hooks = false)\n");
+            return;
+        }
         if (len == 0 || len > GUEST_SIZE - base)
             len = GUEST_SIZE - base;
         g_watch_base = (uint32_t)base;
@@ -572,13 +577,37 @@ void mem_init() {
         os_vm_release(g_mem, GUEST_SIZE);
         g_mem = nullptr;
     }
-    void *p = os_vm_reserve(GUEST_SIZE);
-    if (!p) {
-        fprintf(stderr, "[recomp] fatal: cannot map %u bytes of guest memory\n", GUEST_SIZE);
+    if (!os_vm_reserve_at(RECOMP_ARENA, GUEST_SIZE)) {
+        fprintf(stderr,
+                "[recomp] fatal: cannot map %u bytes of guest memory at host address %#llx\n",
+                GUEST_SIZE, (unsigned long long)RECOMP_ARENA_ADDRESS);
         abort();
     }
-    g_mem = (uint8_t *)p;
+    g_mem = RECOMP_ARENA;
     heap_reset();
+}
+
+void recomp_arena_swap(uint8_t *other, size_t size) {
+    if (!g_mem) {
+        if (!os_vm_reserve_at(RECOMP_ARENA, GUEST_SIZE)) {
+            fprintf(stderr, "[recomp] fatal: cannot map guest memory at host address %#llx\n",
+                    (unsigned long long)RECOMP_ARENA_ADDRESS);
+            abort();
+        }
+        g_mem = RECOMP_ARENA;
+    }
+    if (size > GUEST_SIZE) {
+        fprintf(stderr, "[recomp] fatal: arena swap of %zu bytes exceeds the %u-byte arena\n", size,
+                GUEST_SIZE);
+        abort();
+    }
+    uint8_t chunk[4096];
+    for (size_t at = 0; at < size; at += sizeof chunk) {
+        const size_t n = std::min(sizeof chunk, size - at);
+        memcpy(chunk, other + at, n);
+        memcpy(other + at, RECOMP_ARENA + at, n);
+        memcpy(RECOMP_ARENA + at, chunk, n);
+    }
 }
 
 void mem_shutdown() {

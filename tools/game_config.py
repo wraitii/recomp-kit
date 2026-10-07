@@ -58,6 +58,32 @@ HEAP_END = 0x0e000000        # runtime/x86.h GUEST_HEAP_END; the mods' heap star
 GUEST_SIZE_DEFAULT = 0x10000000   # runtime/x86.h GUEST_SIZE: the arena, 256 MB unless a module needs more
 AUX_REQUIRED_KEYS = ("name", "path", "sha256", "base", "size")
 
+# The production translation profile: every optimization the kit has. load()
+# fills these when a game omits them, and translate.py reads the same values as
+# its fallback so a caller that bypasses load (tests, direct driver calls)
+# cannot silently select a different profile. ir_ssa = false translates
+# everything through decoded C; fault_state = "exact" gives up CPU/x87 locals
+# and the relaxed SSA scalar/state policies.
+TRANSLATE_DEFAULTS = {
+    "ir_ssa": True,
+    "fault_state": "relaxed",
+    "msvc_x87_convention": True,
+}
+
+# Earlier [translate] keys, folded into ir_ssa / fault_state /
+# msvc_x87_convention; naming one is an error that says what replaced it.
+REMOVED_TRANSLATE_KEYS = {
+    "x87_locals": 'use fault_state = "relaxed" (or "exact")',
+    "cpu_locals": 'use fault_state = "relaxed" (or "exact")',
+    "ir_ssa_x87": 'use fault_state = "relaxed" (or "exact")',
+    "ir_ssa_state": 'use fault_state = "relaxed" (or "exact")',
+    "ir_ssa_msvc_convention": "use msvc_x87_convention",
+    "ir_ssa_x87_lazy_nan": "lazy x87 NaN checks are exact and always on",
+    "x87_dataflow": "removed experiment; production uses SSA or decoded C",
+    "x87_stack_forwarding": "removed experiment; production uses SSA or decoded C",
+    "decoded_dataflow": "removed experiment; production uses SSA or decoded C",
+}
+
 
 def windows_version(value):
     """Decode major.minor[.build]; keep the historical 9x default and 6.1 SP1."""
@@ -175,6 +201,11 @@ def load(game_dir):
     windows_version(game.setdefault("windows_version", "4.10"))
     # Fail loudly rather than returning 0 from an import whose stdcall arity is
     # unknown: the un-popped arguments otherwise drift the guest stack.
+    # Store hooks (the guest watchpoint and DirectDraw dirty tracking) cost a
+    # test and an aliasing reload on every guest store. Off, RECOMP_WATCH is
+    # unavailable and a DirectDraw Unlock compares the whole surface.
+    if not isinstance(game.setdefault("store_hooks", True), bool):
+        raise ValueError("%s: [game] store_hooks must be a boolean" % source)
     strict_imports = game.setdefault("strict_imports", False)
     if not isinstance(strict_imports, bool):
         raise ValueError("%s: [game] strict_imports must be a boolean" % source)
@@ -183,9 +214,23 @@ def load(game_dir):
     resumable = translate.setdefault("resumable_stacks", False)
     if not isinstance(resumable, bool):
         raise ValueError("%s: [translate] resumable_stacks must be a boolean" % source)
-    locals_x87 = translate.setdefault("x87_locals", False)
-    if not isinstance(locals_x87, bool):
-        raise ValueError("%s: [translate] x87_locals must be a boolean" % source)
+    for key, replacement in REMOVED_TRANSLATE_KEYS.items():
+        if key in translate:
+            raise ValueError("%s: [translate] %s was removed; %s" % (source, key, replacement))
+    ssa = translate.setdefault("ir_ssa", TRANSLATE_DEFAULTS["ir_ssa"])
+    if not isinstance(ssa, bool):
+        raise ValueError("%s: [translate] ir_ssa must be a boolean" % source)
+    # "relaxed" keeps CPU and x87 state in host locals between observation
+    # points, so an interior fault may see stale scratch state (DIVERGENCE
+    # tags cpu-locals, ssa-x87-scalar, ssa-state-locals); "exact" publishes it
+    # at every instruction. Null-check builds always use the exact form.
+    if translate.setdefault("fault_state", TRANSLATE_DEFAULTS["fault_state"]) not in ("relaxed", "exact"):
+        raise ValueError('%s: [translate] fault_state must be "relaxed" or "exact"' % source)
+    # Calls and returns follow the MSVC x87 stack convention: popped x87
+    # residue is dead there (DIVERGENCE ssa-x87-convention). Arithmetic flags
+    # stay published either way. False restores conservative publication.
+    if not isinstance(translate.setdefault("msvc_x87_convention", TRANSLATE_DEFAULTS["msvc_x87_convention"]), bool):
+        raise ValueError("%s: [translate] msvc_x87_convention must be a boolean" % source)
     alignment = translate.setdefault("function_alignment", 16)
     if type(alignment) is not int or alignment <= 0:
         raise ValueError("%s: [translate] function_alignment must be a positive integer" % source)

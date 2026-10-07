@@ -1,4 +1,4 @@
-#define RECOMP_GUEST_MEMORY_OWNER 1 /* points g_mem at a replay arena around each call */
+/* Swaps a replay arena into guest memory around each call. */
 // The mods test builder globs tests/*.cpp and is the only POPM_TESTING build.
 #ifdef POPM_TESTING
 #include "../native/replay.cpp"
@@ -16,7 +16,7 @@
 namespace {
 // Only for the hand-audited pure leaf below. This adapter does not provide
 // complete shim interception, so it must never be used for arbitrary targets.
-void translated_leaf(pop_cpu_v1 &cpu, uint8_t *arena, size_t, pop_replay::Seams &) {
+void translated_leaf(pop_cpu_v1 &cpu, uint8_t *arena, size_t arena_size, pop_replay::Seams &) {
     X86 c{};
 #define REG(f, r_) c.r[r_] = cpu.f
     REG(eax, R_EAX);
@@ -43,10 +43,9 @@ void translated_leaf(pop_cpu_v1 &cpu, uint8_t *arena, size_t, pop_replay::Seams 
     c.fpu_cw = cpu.fpu_cw;
     c.fpu_sw = cpu.fpu_sw;
     c.fpu_tag = cpu.fpu_tag;
-    auto saved = g_mem;
-    g_mem = arena;
+    recomp_arena_swap(arena, arena_size);
     recomp_call(&c, 0x00401000);
-    g_mem = saved;
+    recomp_arena_swap(arena, arena_size);
 #define REG(f, r_) cpu.f = c.r[r_]
     REG(eax, R_EAX);
     REG(ecx, R_ECX);
@@ -444,13 +443,13 @@ MOD_TEST_SUITE(capture_to_file_and_replay_with_intercepted_shims) {
     // A candidate that makes the same two calls, through the same dispatcher,
     // with the record served in the shims' place.
     auto order = [](uint32_t first, uint32_t second) {
-        return [first, second](pop_cpu_v1 &cpu, uint8_t *arena, size_t, pop_replay::Seams &seams) {
+        return [first, second](pop_cpu_v1 &cpu, uint8_t *arena, size_t arena_size,
+                               pop_replay::Seams &seams) {
             std::string failure;
             uint32_t a = 0, b = 0;
             {
                 pop_replay::ServeRecordedShims serving(seams);
-                auto saved = g_mem;
-                g_mem = arena;
+                recomp_arena_swap(arena, arena_size);
                 X86 x{};
                 x.r[R_ESP] = cpu.esp;
                 imports_dispatch(&x, first);
@@ -458,7 +457,7 @@ MOD_TEST_SUITE(capture_to_file_and_replay_with_intercepted_shims) {
                 x.r[R_ESP] = cpu.esp;
                 imports_dispatch(&x, second);
                 b = x.r[R_EAX];
-                g_mem = saved;
+                recomp_arena_swap(arena, arena_size);
                 failure = serving.failed();
             }
             cpu.eax = a + b;
@@ -479,15 +478,15 @@ MOD_TEST_SUITE(capture_to_file_and_replay_with_intercepted_shims) {
     MOD_CHECK(wrong.find("mismatch") != std::string::npos);
 
     // And a candidate that makes one call too few fails on the unused record.
-    auto once = [tid](pop_cpu_v1 &cpu, uint8_t *arena, size_t, pop_replay::Seams &seams) {
+    auto once = [tid](pop_cpu_v1 &cpu, uint8_t *arena, size_t arena_size,
+                      pop_replay::Seams &seams) {
         pop_replay::ServeRecordedShims serving(seams);
-        auto saved = g_mem;
-        g_mem = arena;
+        recomp_arena_swap(arena, arena_size);
         X86 x{};
         x.r[R_ESP] = cpu.esp;
         imports_dispatch(&x, tid);
         cpu.eax = 0x11112222u;
-        g_mem = saved;
+        recomp_arena_swap(arena, arena_size);
     };
     MOD_CHECK(!pop_replay::run(loaded, once).empty());
 }

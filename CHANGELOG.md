@@ -57,6 +57,18 @@
   retain their inputs; Metal readback and queued-byte regressions cover both.
   The guest-store watch/dirty gate is forced inline to avoid a helper call on
   every write while retaining armed diagnostics and dirty tracking.
+- Fold the translation settings into a three-key profile whose defaults are
+  every optimization the kit has: `ir_ssa = true`, `fault_state = "relaxed"`
+  (was `x87_locals`, `cpu_locals`, `ir_ssa_x87 = "scalar"` and
+  `ir_ssa_state = "locals"`; `"exact"` selects all of their strict forms) and
+  `msvc_x87_convention = true` (was `ir_ssa_msvc_convention`). Lazy x87 NaN
+  checks are exact and lose their `ir_ssa_x87_lazy_nan` switch. The old keys
+  fail with the name of their replacement. Games that relied on the previous
+  conservative defaults (SSA off, eager decoded C) now get the full profile;
+  set `ir_ssa = false` or `fault_state = "exact"` to opt out. Corpus flags
+  follow: `--corpus-fault-state` and `--corpus-msvc-x87-convention` replace
+  `--corpus-ir-ssa-x87/-state/-convention/-lazy-nan`. Ghost Recon regenerates
+  byte-identically.
 
 - D3D8 texture sampling now uses the level-0 surface identity shared by
   render-target binding, readback and destruction. Previously sampling a
@@ -253,6 +265,301 @@
   so the declared size runs past the buffer even though the bytes written stay
   inside it. Rejecting those locks stalled the shared UI vertex buffer and left
   it reading zeroed vertices, which flickered the front end.
+- Add experimental `[translate] x87_cfg_widths = true` alongside `x87_locals`.
+  Decode x87 width effects and propagate PC=00 binary32 proofs through region
+  joins and backedges by a bounded must-analysis. Incoming/wide values retain
+  double arithmetic, every predecessor must prove a narrow value, and unknown
+  direction or oversized CFGs retain conservative lowering. Default off:
+  additional precision selectors can increase native code and spills.
+
+- Add experimental `[translate] x87_cfg_widths = true` alongside `x87_locals`.
+  Decode x87 width effects and propagate PC=00 binary32 proofs through region
+  joins and backedges by a bounded must-analysis. Incoming/wide values retain
+  double arithmetic, every predecessor must prove a narrow value, and unknown
+  direction or oversized CFGs retain conservative lowering. Default off:
+  additional precision selectors can increase native code and spills.
+- Add `[translate] ir_ssa_msvc_convention` (default `true`). SSA bodies treat
+  calls and returns as following the MSVC convention: arithmetic flags
+  (CF/PF/AF/ZF/SF/OF) are no longer published before calls or at returns, and
+  x87 flushes skip popped residue, assuming registers above TOP are tagged empty.
+- Add `[translate] ir_ssa_msvc_convention` (default `true`). SSA bodies treat
+  calls and returns as following the MSVC convention: arithmetic flags
+  (CF/PF/AF/ZF/SF/OF) are no longer published before calls or at returns, and
+  x87 flushes skip popped residue, assuming registers above TOP are tagged empty.
+- Store a proven-binary32 x87 slot to `m32` without `fto_float`'s
+  directed-rounding round trip. Under PC=00 a narrow slot already holds an
+  exact float (FLD m32, FLD1/FLDZ, PC-rounded arithmetic and FSQRT; FLDCW and
+  other opaque ops reset the tracker, joins intersect), so scalar SSA bodies
+  emit `PC == 00 && v == v ? (float)v : fto_float(...)`; NaNs still take the
+  helper, which quiets an sNaN payload. Exact, so no toggle. Two native-check
+  cases sweep PC/RC with sNaN/qNaN inputs. Corpus SSA/eager, paired: matrix-
+  vector −8%, quaternion multiply −9%, adjugate −14%, projection −16%.
+
+- Compile with `-ffp-contract=off` everywhere (CMake, the translation test
+  harnesses, `lazy_static.py`, core plugins), as the corpus and IR checks
+  already did. Clang fused `A - part * scale` in `fprem_common`'s partial
+  reduction, changing its result per target; a harness check pins the
+  unfused value.
+
+- Emit production SSA bodies in a process pool. `production.apply` lifts in
+  the parent and emits batches on one worker per core (`RECOMP_SSA_JOBS`
+  overrides; under 64 functions stays in-process), combining results in
+  function order. Carried x87 parts now iterate in a fixed `PART_ORDER`
+  instead of `frozenset` order, so emitted text no longer depends on the
+  Python hash seed. `canonicalize` drops its redundant trailing pass and the
+  production emitter no longer canonicalizes twice. Full-game SSA stage:
+  333 s serial to 62 s on 10 workers; generated sources, per-function
+  results, census and fallback reasons are byte-identical.
+
+- Defer the per-arithmetic x87 NaN/IE check to sinks in scalar SSA bodies. A
+  new `[translate] ir_ssa_x87_lazy_nan` (default `true`) leaves basic-arithmetic
+  results in full precision with no NaN branch and folds
+  `x87_env_.fpu_sw |= (v != v)` plus the indefinite canonicalisation where the
+  value stops flowing into more NaN-propagating arithmetic: non-linear internal
+  CFG edges, `flush()`/publication, stores, `FCHS`/`FABS`, compares, `FNSTSW`
+  and the opaque fallbacks. `FCLEX` canonicalises without raising IE before it
+  clears the status; pure moves carry the pending flag; loaded NaN payloads are
+  never deferred. Host `+ - * /` propagation plus sticky IE make the result
+  observably identical to the eager per-op `fx87`/`fx87_exact` emission, so it
+  carries no `DIVERGENCE` tag. The relaxation is off for strict x87, the exact
+  flush, the ceiling column and `optimize=False`, whose output stays
+  byte-identical. The synthetic IR checks gain a sixth `lazy` column (164
+  fixtures × 24,576 inputs × ordinary and null-check builds) and ten targeted
+  lazy-NaN fixtures; the corpus takes `--corpus-ir-ssa-lazy-nan on|off`.
+
+- Carry unpublished scalar x87 state across internal CFG edges in performance
+  mode. `x87_carry.py` computes a fixed-point join shape per block, predecessors
+  normalize TOP and write canonical slot variables, and successors copy them
+  into fresh locals; joins union parts and dirty flags, intersect `narrow`, take
+  conservative counter extremes (an inactive predecessor counts as published at
+  its TOP), republish TOP only when predecessors' published TOPs disagree, and
+  fall back to the per-edge flush on an eight-slot window overflow. Emission
+  fails closed with `SSAError` if the live tracker leaves the planned shape.
+  Carry requires the MSVC convention; exact-flush functions keep the per-edge
+  flush. Publication now happens at calls, division seams, opaque effects and
+  returns (and at every access in strict mode). Strict x87, the ceiling column
+  and `optimize=False` emission are byte-identical; only the production scalar
+  body changes. Cull `0081ae30`'s fast path drops from 25 to 8 `c->st`/`c->fpu_*`
+  accesses, none left in its plane loop.
+
+- Add an analysis-only observable-contract foundation with immutable effect and
+  observer models, CFG demand propagation, recursive call-effect composition,
+  and byte-verified corpus inventory reports (`tools/recomp/analyze_contracts.py`).
+  Shared instruction CFG/lifting/SCC helpers now live in `ir/cfg.py`, with
+  compatibility exports retained. Unknown observers and missing callees stay
+  conservative; reports never authorize private ABIs or change production code.
+
+- Add `[translate] ir_ssa_msvc_convention` (default `true`). SSA x87
+  flushes skip popped residue, assuming registers above TOP are tagged empty.
+  Arithmetic flags remain published at calls and returns: CRT assembly helpers
+  can pass flags across these boundaries. The earlier flag-elision assumption
+  caused incorrect math results and is removed, with a byte-backed regression.
+  The tag word, TOP, DF and live registers stay exact. `false` restores the
+  conservative publication; null-check builds always compile it. The
+  translation report's `ir_ssa.convention_census` counts bodies that read a
+  flag at entry or after a call. Ceiling relaxation B is retired, and the
+  function corpus takes `--corpus-ir-ssa-convention msvc|exact`.
+
+- Guest memory now lives at a fixed host address (`RECOMP_ARENA`, reserved
+  through the new `os_vm_reserve_at`), so translated loads and stores index a
+  constant base that a guest store cannot alias. Replay and test harnesses swap
+  their arenas in with `recomp_arena_swap` instead of repointing `g_mem`; harness
+  CMake projects include `tools/recomp/harness_platform.cmake`.
+
+- Add `[game] store_hooks` (default `true`). `false` builds every guest store
+  without the watchpoint/DirectDraw dirty test: `RECOMP_WATCH` is refused with a
+  diagnostic and a DirectDraw Unlock compares the whole locked surface. Float
+  and BCD stores now go through the same hook as integer stores, so the
+  watchpoint also sees them; in null-check builds they also take the null guard.
+
+- Scalar SSA x87 no longer publishes x87 state before guest loads and stores,
+  matching decoded `x87_locals`, and the `locals` state policy now defers
+  GPR/flag snapshots at stores as it did at loads (EIP/ESP/EBP stay eager).
+  The strict policies still publish before every access.
+
+- Add `--corpus-asan` to the function corpus: an AddressSanitizer build for
+  correctness runs (it requires `--corpus-trial-ms 0`; code sizes are not comparable).
+
+- Remove the LLVM corpus experiments: `--corpus-llvm`, `--corpus-llvm-sweep`,
+  `--x87-llvm-experiment`, `--x87-llvm-function`, `translate.py --llvm-compare` and
+  `--llvm-sweep`, with their backends under `tools/recomp/corpus/llvm*` and
+  `tools/recomp/experiments/x87_llvm`. Nothing in production translation used them.
+
+- Retire the SSA x87 `effects`, `values` and `region` modes and the value tracker
+  behind them. `ir_ssa_x87` now accepts `scalar` (default) or `scalar-strict`,
+  `ir_ssa_state` accepts `locals` (default) or `strict`, and plain
+  `--corpus-ir-ssa` is the production scalar/locals policy. `emit()` defaults to
+  that policy; `optimize=False` keeps the raw ordered-effects lowering. The
+  `--ir-ssa-checks` suite compares raw, scalar, scalar-strict and scalar/locals
+  against eager C.
+
+- Function-corpus timing is now time-budgeted. `--corpus-trial-ms N` (default
+  10) replaces `--corpus-calls`: each row's call count is calibrated once, untimed,
+  by doubling an eager batch until it takes N ms, then shared by every variant and
+  trial of that row. Calibrated counts and the budget are recorded in the reports.
+
+- Add `mapped-comparison-corpus-v2` to the function corpus. It preserves the
+  existing native-reference rows and admits explicit `comparison:
+  "translation-only"` rows with no native adapter or kernel, so generated
+  tables, timing, JSON, CSV and Markdown omit native results rather than
+  fabricating them. V2 rows may declare `memory_ranges` (default
+  `CORPUS_SCRATCH`/`CORPUS_SCRATCH_SIZE`, not enlarged), `boundary_stubs`,
+  `indirect_calls` and `indirect_targets`; the runner validates the stubs and
+  callees exactly partition decoded direct calls and that indirect sites match
+  the decoded CALL sites. Boundary wrappers call `corpus_boundary` before every
+  declared direct callee or stub, and `recomp_call`/`CALLIND` at approved sites
+  is rewritten to one mode dispatch that whitelists fixture targets and aborts
+  with a named diagnostic otherwise. `recomp_jump` stays rejected. V1 rejects
+  all v2 boundary declarations.
+
+- Add optional v2 boundary hooks. A fixture defining `CORPUS_BOUNDARY_HOOKS`
+  provides `corpus_variant_begin` (called before `corpus_setup`, so the
+  fixture's case begin sees the active mode), `corpus_variant_end`,
+  `corpus_validation_end` and `corpus_movs_site(X86 *, int rep, uint32_t site)`.
+  The harness brackets every validation variant and timed workload. Decoded string
+  helpers are rewritten to `corpus_movs_site` from the instruction comment; IR
+  SSA emits are wrapped from the `B<index>` block map into `fir.insns`. The
+  instrumentation preserves guest state and runs the selected helper exactly
+  once; an unattributable helper fails generation.
+  `corpus_validation_end` coverage is parsed as one exact nonnegative
+  integer-count JSON object per translation-only row; the raw coverage result
+  is reported as game evidence, not a substitute for the byte checks.
+
+- Include nested translator packages in the regeneration cache fingerprint,
+  so edits to SSA lowering regenerate production bodies through `--regenerate`.
+
+- Extend production SSA final bodies with conservative helper effects. Indirect
+  calls (`CALLIND`) are admitted only through an explicit
+  `indirect_call_symbol` emit option that production binds to `recomp_call`;
+  the target is a 32-bit value with a canonical fallthrough. Calls publish
+  and reload all tracked state while preserving ordered memory effects. Checked
+  `DIV32`/`IDIV32` now reload all tracked state after the helper (not only
+  EAX/EDX), so a returning divide-error handler's mutations are observed;
+  narrow/unsupported division shapes still fall back. Dword `MOVSD` string
+  moves (bare `A5`, REP `F3 A5`, named `MOVSD` or `MOVSD.REP`) lower to the
+  runtime `movsd`/`rep_movsd` helper with access-then-advance ordering; SSE
+  `MOVSD`, other widths and address-size/unsupported prefixes stay fallbacks.
+  `CLD`/`STD` are admitted as plain flag writes. `--ir-ssa-checks` covers a
+  divide handler that mutates EBX/ESI/flags, zero-count/both-DF/overlapping REP
+  MOVSD, and register/memory/ESP-relative indirect calls including normal and
+  diverted resumable continuation.
+
+- Add opt-in production `[translate] ir_ssa = true`, with `ir_ssa_x87` and
+  `ir_ssa_state` comparison policies. SSA replaces supported final function
+  bodies after decoded boundary recovery and validation; direct calls use
+  existing entry thunks and retain replacement/hook/profiling policy. Unsupported
+  functions keep decoded C whole. Translation reports include exact emitted
+  and fallback counts, percentages and per-function reasons. SEH, alternate
+  entries, continuations, unsupported division shapes and auxiliary modules remain
+  decoded; graph construction has a 2048-instruction budget.
+
+- Add opt-in SSA `scalar`/`scalar-strict` x87 corpus modes: scalar stack values,
+  exact-integer shadows and residues, a local control/status environment, and
+  proven binary32 arithmetic with a general precision path. Optional
+  `--corpus-ir-ssa-state locals` defers ordinary-read register/flag snapshots;
+  stores, calls, division and returns retain complete required state. Null-check
+  builds select strict publication. The native suite compares six SSA variants
+  against eager C in ordinary and null-check builds.
+
+- Add integer p-code SSA and experimental `--corpus-ir-ssa` C emission in the
+  mapped function corpus's combined variant. Byte lanes preserve register
+  aliases; phi edges use parallel copies and memory accesses remain ordered.
+  Unsupported functions retain the existing emitter with reported reasons.
+  Explicitly bound direct calls publish/reload tracked state. Audited x87
+  forms use ordered effects with original-byte operand validation and the
+  runtime's rounding/status/tag/exact-integer helpers; raw FLOAT p-code remains
+  unsupported. Additional integer forms include MOVSX/MOVZX, register XCHG,
+  NOT, LEAVE, register-destination ADC and corrected memory RMW arithmetic.
+  Integer emission includes register INC/DEC/SUB/SBB with AF corrections,
+  SHL/SHR using the runtime's flag recipes, checked DIV32/IDIV32, CDQ, IMUL,
+  SETcc, register NEG/SAR, and explicit absolute-memory normalization.
+  Wider register phis and changed-field CPU publication reduce executed
+  bookkeeping while retaining memory observations and conservative DIV32
+  invalidation. Bounded x87 value reuse and observation-aware arithmetic
+  publication are selectable corpus modes. `--ir-ssa-checks` compares native
+  synthetic fixtures in full state, including CPU snapshots at every store.
+
+- Add experimental `translate.py --ir-census FILE`: SLEIGH instruction lifting
+  and whole-image calling-convention summaries, including aligned frames,
+  tail-target fallback and runtime import cleanup metadata. This analysis
+  does not change generated code. See `docs/ir.md` for assumptions and gaps.
+
+- Add opt-in `[translate] decoded_dataflow = true` (requires `cpu_locals` and
+  `x87_dataflow`): bounded decoded flag analysis crosses ordinary loads and
+  audited x87 instructions, retaining all outgoing flags and opaque call state.
+  Branch-heavy functions carry up to six GPR locals alongside deferred flags;
+  null-check builds use eager flag definitions. Evaluate with
+  `--corpus-decoded-dataflow` or `--decoded-dataflow-checks`.
+- Refresh CPU locals on branch exits from opaque multi-instruction regions,
+  preventing later publication from overwriting the region's eager updates.
+  Preserve runtime AF through logical instructions in flag liveness, and make
+  the corpus eager comparison emit every flag rather than optimized recipes.
+
+- Add experimental `[translate] x87_stack_forwarding = true` (requires
+  `x87_dataflow`): bounded binary32 spill/reload proofs retain guest stores,
+  float-store rounding and all outgoing state. Calls, joins, possible writes
+  and ESP mutations stop forwarding. `--corpus-stack-forwarding` evaluates it
+  alongside `--corpus-x87-dataflow`; production defaults remain off.
+- Preserve signaling-NaN quieting in float stores when optimized x87 locals
+  allow the compiler to cancel float/double round trips. Native full-state
+  fixtures cover partial stack aliases and retained outgoing spill bytes.
+
+- Add experimental `[translate] x87_dataflow = true` (requires `x87_locals`):
+  decoded TOP/width/write analysis carries x87 copies, exchanges and division
+  through bounded CFG regions, retaining exact metadata and full state at
+  observers. Per-exit publication omits only slots proven unwritten on that
+  path. `--corpus-x87-dataflow` evaluates it without changing game settings;
+  `--x87-dataflow-checks` compares native full-state fixtures with eager C.
+  Defaults remain unchanged; whole-game benefit is not established.
+
+- Allow explicit direct callees in the native-reference function corpus. Calls
+  bind to byte-verified corpus rows in the same translation mode; mapped return
+  continuations are accepted without introducing stubs or general dispatch.
+
+- Consolidate x87 fragment and C/LLVM comparison tools under
+  `tools/recomp/corpus/`, retaining their regressions and optional LLVM coverage.
+  Add `--function-corpus` for byte-verified game functions with typed native C
+  references, full-state/observable-result checks, code sizes, rotating-order
+  microbenchmarks and JSON/CSV/Markdown reports. Replace the old experimental
+  build flags with `--corpus-fragments`, `--corpus-llvm` and
+  `--corpus-llvm-sweep`; native references remain game-owned and out of gameplay.
+
+- Add opt-in `[translate] cpu_locals = true`: keep reused GPRs and arithmetic
+  flags in C locals across function control flow and x87 regions, publishing
+  before calls/opaque helpers and reloading after mutation. ESP/EBP/EIP remain
+  eager; `RECOMP_NULL_CHECKS` builds use eager CPU lvalues. Interior fatal faults
+  may see preceding published scratch registers/flags (`cpu-locals`).
+  Bound cached-field lifetimes alongside x87 lowering, leave float-dominated
+  leaves eager, and synchronize only affected flags around audited shift,
+  rotate and two-operand multiply helpers. Unknown helpers retain full state.
+  Keep CPU locals across bitwise/logical value expressions and audited integer
+  x87 helpers; actual CPU-field address escapes still publish. Float-heavy
+  cache admission counts writes to selected GPRs rather than unrelated fields.
+  `tools/build.py --cpu-locals-checks` compares complete CPU and scratch memory
+  against eager C, including call snapshots, mutating callees, alternate entries
+  and an injected null-fault fallback check; it runs no benchmarks.
+
+- Keep locally defined x87 register copies (`FLD ST(i)` and `FST[P] ST(i)`)
+  in straight-line C regions, preserving copied tags and physical-slot
+  wraparound. Incoming values and register-copy CFG boundaries remain eager;
+  existing branch-region lowering remains available around those boundaries.
+
+- Keep x87 control/status in a nonescaping helper context within C local-value
+  regions, removing repeated CPU-field accesses across guest loads/stores and
+  integer register updates. Use existing arithmetic/comparison/conversion
+  helpers; FNSTSW sees local status and every exit publishes it. Interior faults
+  may see status from the preceding publication point (`x87-local-status`).
+  For PC=00 and proven binary32 operands, emit separate native float arithmetic
+  with existing NaN/status handling, retaining double-backed arithmetic for
+  other precision settings and unproven operands (`x87-binary32`).
+
+- Emit Samply frame spans from the headless presenter, including runs with
+  `RECOMP_FRAME_EVERY=0`. Enabled under Samply or with `RECOMP_PROFILE_MARKERS=1`.
+
+- Add `RECOMP_INPUT_SCRIPT` for timed keyboard and mouse input in headless and
+  desktop windowed hosts. Reuse the smoke parser and normal input paths without
+  requiring game-specific smoke globals; reject unsupported script operations
+  before boot and hold automatic clicks for at least four presented frames.
 
 - Support `[translate] code_map` address/length metadata. Builds verify the
   owner's executable and decode private assembly listings locally, allowing
@@ -327,7 +634,7 @@
 - Add `tools/build.py --x87-locals-experiment`, an isolated local-value lifting
   probe comparing generated x87 fragments with the existing emitter. It records
   final-state comparisons, timings and optimized assembly without changing game
-  translation. See `tools/recomp/experiments/x87_locals/README.md` for its limits.
+  translation. See `tools/recomp/corpus/fragments/README.md` for its limits.
 
 - Add an optional scene post-process to the D3D8/wgpu renderer. A game's native
   override calls `d3d8_scene_boundary(c, mode)` (`runtime/native_seam.h`) at the

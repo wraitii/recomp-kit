@@ -2530,9 +2530,11 @@ void baseline_resync(const ComObj *s) {
 }
 
 // The dirty range for a surface's pixels, opened by a guest Lock and closed
-// by its Unlock. Four at most; a fifth lock simply is not tracked.
+// by its Unlock. Four at most; a fifth lock simply is not tracked, and neither
+// is any lock in a build without store hooks: Unlock then compares the whole
+// surface.
 bool dirty_open(const ComObj *s) {
-    if (g_dirty_count >= RECOMP_DIRTY_SLOTS)
+    if (!RECOMP_STORE_HOOKS || g_dirty_count >= RECOMP_DIRTY_SLOTS)
         return false;
     RecompDirty &d = g_dirty[g_dirty_count++];
     recomp_store_hook_update();

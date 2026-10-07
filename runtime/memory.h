@@ -7,6 +7,11 @@
 // state. Aborts on failure.
 void mem_init();
 void mem_shutdown();
+// Exchanges guest bytes [0, size) with `other`, mapping the arena first if no
+// one has. Translated code addresses one fixed arena, so a caller that runs
+// guest code against other memory (a replay) swaps it in, runs, and swaps
+// again to restore both. Not for concurrent guest execution.
+void recomp_arena_swap(uint8_t *other, size_t size);
 
 // First-fit free-list allocator over HEAP_BASE..HEAP_LIMIT.
 // Returns a guest address, or 0 on failure. Sizes are rounded up to a multiple

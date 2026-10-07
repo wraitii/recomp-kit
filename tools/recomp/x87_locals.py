@@ -11,6 +11,17 @@ fault, x87 state may still reflect the preceding published boundary. Fatal
 host fault diagnostics read EIP/ESP/EBP, which this pass leaves eager. The pass
 is opt-in: runtimes exposing x87 at asynchronous/access boundaries must disable
 it. CPU contexts must be outside the guest arena, as in the kit runtime.
+
+DIVERGENCE(original): [x87-local-status] control and status stay in a private
+helper context within a region. Guest FNSTSW reads the current local status;
+every exit publishes it. Interior fault diagnostics can see the preceding
+published status, matching the pass's deferred stack-state observation policy.
+
+DIVERGENCE(original): [x87-binary32] under PC=00, arithmetic with proven
+binary32 operands uses a separate native float operation. This shares the
+existing runtime's float exponent range rather than x87's wider range. Other
+precision settings and unproven operands retain the double-backed helper.
+Operation order, rounding points and canonical invalid status are retained.
 """
 import re
 
@@ -27,7 +38,19 @@ REGISTER_OPS = frozenset((
 ST = re.compile(r"ST\(c, (\d+)\)")
 PUSH = re.compile(r"fpush\(c, (.*)\);")
 SET = re.compile(r"fset\(c, (\d+), (.*)\);")
+PUSH_ST = re.compile(r"fpush_st\(c, (\d+)\);")
+COPY = re.compile(r"fcopy\(c, (\d+), (\d+)\);")
 LOAD = re.compile(r"double v_ = (.*);")
+# These helpers access only CW/SW, never registers, tags or stack values. A
+# separate nonescaping object lets the C compiler keep both fields in native
+# registers despite guest accesses and eager integer CPU writes in the region.
+ENV_HELPERS = re.compile(r"\b(fx87|fx87_exact|fcom|fucom|fto_float)\(c,")
+
+
+def environment():
+    return ["X86 x87_env_;",
+            "x87_env_.fpu_cw = c->fpu_cw;",
+            "x87_env_.fpu_sw = c->fpu_sw;"]
 
 
 def eligible(ins, parse_operand):
@@ -48,9 +71,11 @@ def eligible(ins, parse_operand):
     if ins.mnem == "FNSTSW":
         return len(ops) == 1 and ops[0].kind == "reg" and ops[0].reg == 0 and ops[0].size == 16
     if ins.mnem == "FLD":
-        return len(ops) == 1 and ops[0].kind == "mem" and ops[0].size in (32, 64)
+        return len(ops) == 1 and (ops[0].kind == "st" or
+                                 (ops[0].kind == "mem" and ops[0].size in (32, 64)))
     if ins.mnem in ("FST", "FSTP"):
-        return len(ops) == 1 and ops[0].kind == "mem" and ops[0].size in (32, 64)
+        return len(ops) == 1 and (ops[0].kind == "st" or
+                                 (ops[0].kind == "mem" and ops[0].size in (32, 64)))
     return all(o.kind != "mem" or o.size in (32, 64) for o in ops)
 
 
@@ -69,6 +94,46 @@ class Region:
         self.lines = []
         self.indices = []
         self.writes = 0
+        self.single = set()
+
+    def binary32(self, expr):
+        """Prove representability on PC=00, without assuming incoming widths."""
+        expr = expr.strip()
+        while expr.startswith("(") and expr.endswith(")"):
+            depth = 0
+            for i, ch in enumerate(expr):
+                depth += (ch == "(") - (ch == ")")
+                if depth == 0:
+                    break
+            if i != len(expr) - 1:
+                break
+            expr = expr[1:-1].strip()
+        return (expr.startswith("(double)rdf32(") or expr in ("0.0", "1.0") or
+                any(expr == self.values[s] for s in self.single))
+
+    def arithmetic(self, expr):
+        """Use one binary32 operation only for two evidenced binary32 inputs.
+
+        The alternative retains the original double operation and helper. No
+        reassociation or contraction is introduced; NaNs still use the runtime
+        canonicalization/status helper. The selector is invariant in a region.
+        """
+        prefix = "fx87(c, "
+        if not expr.startswith(prefix) or not expr.endswith(")"):
+            return expr, self.binary32(expr)
+        body = expr[len(prefix):-1]
+        depth = 0
+        for i, ch in enumerate(body):
+            depth += (ch == "(") - (ch == ")")
+            if depth == 0 and ch in "+-*" and body[i-1:i] == " " and body[i+1:i+2] == " ":
+                lhs, rhs = body[:i].strip(), body[i+1:].strip()
+                if self.binary32(lhs) and self.binary32(rhs):
+                    expr = ("((x87_env_.fpu_cw & 0x300u) == 0u ? "
+                            f"fx87_exact(c, (double)((float)({lhs}) {ch} (float)({rhs}))) : {expr})")
+                break
+        # Even with wider operands, the existing PC=00 helper rounds its
+        # result to float (or returns a canonical NaN) for the next instruction.
+        return expr, True
 
     def read(self, match):
         slot = (self.top + int(match[1])) & 7
@@ -84,11 +149,28 @@ class Region:
         self.writes += 1
         return f"double {name} = {expr};"
 
+    def copy(self, src, dst):
+        """Copy a locally defined float, including its possibly empty tag.
+
+        Straight-line locals have zero integer bits/exactness. Incoming slots
+        still cut the region; never substitute fset's tag classification for
+        the register move's tag copy. Capture before writing for FLD ST7.
+        """
+        if src not in self.values:
+            raise ValueError("incoming x87 copy")
+        expr, tag, single = self.values[src], self.tags[src], src in self.single
+        line = self.value(expr, dst)
+        self.tags[dst] = tag
+        self.single.discard(dst)
+        if single:
+            self.single.add(dst)
+        return line
+
     def append(self, i, body, floating=False):
         """Use the baseline's expressions; roll back on an incoming operand."""
         if any("recomp_" in line or "CALL_FN(" in line for line in body):
             return False
-        saved = self.top, self.values.copy(), self.tags.copy(), self.serial, self.writes
+        saved = self.top, self.values.copy(), self.tags.copy(), self.serial, self.writes, self.single.copy()
         lines = []
         source = None
         instruction_comment = ""
@@ -109,16 +191,35 @@ class Region:
                     source = load[1]
                     continue
                 push, assign = PUSH.fullmatch(stripped), SET.fullmatch(stripped)
-                if push:
+                push_st, copy = PUSH_ST.fullmatch(stripped), COPY.fullmatch(stripped)
+                if push_st or copy:
+                    if push_st:
+                        src = (self.top + int(push_st[1])) & 7
+                        dst = (self.top - 1) & 7
+                    else:
+                        src = (self.top + int(copy[2])) & 7
+                        dst = (self.top + int(copy[1])) & 7
+                    line = self.copy(src, dst) + suffix
+                    if push_st:
+                        self.top = dst
+                elif push:
                     expr = ST.sub(self.read, push[1])
+                    single = self.binary32(expr)
                     self.top = (self.top - 1) & 7
                     line = " " * (len(line) - len(line.lstrip())) + self.value(expr, self.top) + suffix
+                    self.single.discard(self.top)
+                    if single:
+                        self.single.add(self.top)
                 elif assign:
                     expr = ST.sub(self.read, assign[2])
                     if source is not None:
                         expr = re.sub(r"\bv_\b", lambda _: f"({source})", expr)
                     slot = (self.top + int(assign[1])) & 7
+                    expr, single = self.arithmetic(expr)
                     line = " " * (len(line) - len(line.lstrip())) + self.value(expr, slot) + suffix
+                    self.single.discard(slot)
+                    if single:
+                        self.single.add(slot)
                 elif stripped == "fdrop(c);" or stripped == "fdrop(c); fdrop(c);":
                     for _ in range(stripped.count("fdrop")):
                         if self.top not in self.values:
@@ -131,9 +232,11 @@ class Region:
                     status = ("(uint16_t)((c->fpu_sw & (uint16_t)~0x3800u) | "
                               f"(((x87_top_ + {self.top}u) & 7u) << 11))")
                     line = line.replace("fstsw(c)", status)
+                line = ENV_HELPERS.sub(r"\1(&x87_env_,", line)
+                line = line.replace("c->fpu_sw", "x87_env_.fpu_sw")
                 lines.append(line)
         except ValueError:
-            self.top, self.values, self.tags, self.serial, self.writes = saved
+            self.top, self.values, self.tags, self.serial, self.writes, self.single = saved
             return False
         if lines and instruction_comment:
             lines[0] += instruction_comment
@@ -149,6 +252,7 @@ class Region:
     def emit(self, entry):
         lines = [f"{{ /* {entry:08x} local x87 values; full state at region exit */",
                  "    const unsigned x87_top_ = c->fpu_top;"]
+        lines += ["    " + line for line in environment()]
         lines += ["    " + line for line in self.lines]
         for slot, value in sorted(self.values.items()):
             phys = f"((x87_top_ + {slot}u) & 7u)"
@@ -158,6 +262,7 @@ class Region:
                       f"    ftag_put(c, {phys}, {self.tags[slot]});"]
         if self.top:
             lines.append(f"    c->fpu_top = (x87_top_ + {self.top}u) & 7u;")
+        lines.append("    c->fpu_sw = x87_env_.fpu_sw;")
         lines.append("}")
         return lines
 
@@ -223,6 +328,11 @@ class BranchRegion(Region):
         self.used.add(slot)
         return self.values[slot]
 
+    def copy(self, src, dst):
+        # CFG locals can contain incoming exact integers or path-dependent
+        # metadata. Keep copies eager until all four fields are tracked here.
+        raise ValueError("CFG x87 register copy")
+
     def value(self, expr, slot):
         self.used.add(slot)
         self.modified.add(slot)
@@ -238,7 +348,7 @@ class BranchRegion(Region):
         return [f"x87_exact{slot}_ = 0; x87_tag{slot}_ = FTAG_EMPTY;"]
 
     def commit(self, top):
-        lines = []
+        lines = ["c->fpu_sw = x87_env_.fpu_sw;"]
         for slot in sorted(self.modified):
             phys = f"((x87_top_ + {slot}u) & 7u)"
             lines += [f"c->st[{phys}] = x87_s{slot}_;",
@@ -251,6 +361,7 @@ class BranchRegion(Region):
     def declarations(self, entry):
         lines = [f"{{ /* {entry:08x} local x87 CFG; full state at exits */",
                  "const unsigned x87_top_ = c->fpu_top;"]
+        lines += environment()
         for slot in sorted(self.used):
             phys = f"((x87_top_ + {slot}u) & 7u)"
             lines.append(f"double x87_s{slot}_ = c->st[{phys}];")
@@ -288,7 +399,13 @@ def lower_branch_regions(fn, bodies, labels, dead, parse_operand, protected,
             return False
         if ins.mnem in conditional or ins.mnem == "JMP":
             return branch_target(ins) in fn.index
-        return eligible(ins, parse_operand)
+        if not eligible(ins, parse_operand):
+            return False
+        # Register transfers are currently straight-line-only. Keep their
+        # previous CFG boundaries rather than admitting one and rejecting the
+        # whole surrounding interval later, losing unrelated branch lowering.
+        return not (ins.mnem in ("FLD", "FST", "FSTP") and any(
+            parse_operand(o).kind == "st" for o in ins.ops))
 
     ranges = []
     start = None
@@ -343,6 +460,12 @@ def lower_branch_regions(fn, bodies, labels, dead, parse_operand, protected,
         for i in range(a, b):
             region.top = tops[i]
             region.lines = []
+            # Prove widths locally within each basic block. A label or branch
+            # cuts provenance, so joins/backedges never inherit another path's
+            # speculative input widths. Local values themselves remain live.
+            if (fn.insns[i].addr in labels or i == a or
+                    fn.insns[i-1].mnem in conditional or fn.insns[i-1].mnem == "JMP"):
+                region.single.clear()
             if not region.append(i, bodies[i], fn.insns[i].mnem in FLOAT_OPS):
                 consistent = False
                 break

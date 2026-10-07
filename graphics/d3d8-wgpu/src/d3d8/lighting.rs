@@ -238,7 +238,12 @@ impl LightingSetup<'_> {
                     if denominator <= 0.0 || !denominator.is_finite() {
                         return Err(RenderError::new(
                             "vertex lighting",
-                            "nonpositive/nonfinite point/spot attenuation denominator",
+                            format!(
+                                "nonpositive/nonfinite point/spot attenuation denominator: \
+                                 denominator={denominator:?}, distance={distance:?}, \
+                                 position={position:?}, attenuation={:?}",
+                                [light.attenuation0, light.attenuation1, light.attenuation2]
+                            ),
                         ));
                     }
                     (normalize(delta), 1.0 / denominator)

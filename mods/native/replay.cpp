@@ -1,8 +1,9 @@
-#define RECOMP_GUEST_MEMORY_OWNER 1 /* points g_mem at a replay arena around each call */
+/* Swaps a replay arena into guest memory around each call. */
 #include "replay.h"
 #include "shim_capture.h"
 #include "../../runtime/guest.h"
 #include "../../runtime/imports.h"
+#include "../../runtime/memory.h"
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
@@ -732,7 +733,7 @@ size_t ServeRecordedShims::served() const {
 // Adapt a translated guest function to the isolated replay-candidate interface.
 // Transfer registers/flags both ways and report seam failures after copying back the resulting CPU state.
 Candidate translated(uint32_t target) {
-    return [target](pop_cpu_v1 &cpu, uint8_t *arena, size_t, Seams &seams) {
+    return [target](pop_cpu_v1 &cpu, uint8_t *arena, size_t arena_size, Seams &seams) {
         X86 c{};
 #define IN(f, r_) c.r[r_] = cpu.f
         IN(eax, R_EAX);
@@ -763,10 +764,9 @@ Candidate translated(uint32_t target) {
         std::string failure;
         {
             ServeRecordedShims serving(seams);
-            uint8_t *saved_mem = g_mem;
-            g_mem = arena;
+            recomp_arena_swap(arena, arena_size);
             recomp_call(&c, target);
-            g_mem = saved_mem;
+            recomp_arena_swap(arena, arena_size);
             failure = serving.failed();
         }
 

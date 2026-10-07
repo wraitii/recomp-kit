@@ -79,6 +79,18 @@ void *os_vm_reserve(size_t bytes) {
     void *p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     return p == MAP_FAILED ? nullptr : p;
 }
+void *os_vm_reserve_at(void *address, size_t bytes) {
+    // A hint without MAP_FIXED never replaces a mapping; the kernel places the
+    // region elsewhere when the range is taken, which is then a failure here.
+    void *p = mmap(address, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED)
+        return nullptr;
+    if (p != address) {
+        munmap(p, bytes);
+        return nullptr;
+    }
+    return p;
+}
 void os_vm_release(void *p, size_t bytes) {
     munmap(p, bytes);
 }

@@ -81,6 +81,51 @@ decodes the jump-table shapes on synthetic functions over a fake image;
 leaves behind. Add a case there first when the translator meets an
 instruction or table shape it does not handle.
 
+`tools/recomp/tests/test_cpu_c_locals.py` also runs in the portable suite. Native
+CPU/x87 local-value checks run through `tools/build.py --cpu-locals-checks`.
+They use the production driver and compare full CPU/scratch memory for eager,
+CPU-local, CPU+x87-local and x87-local variants in ordinary and null-check builds.
+Opaque callees record entry state and mutate cached fields; the null-check build
+also checks CPU state at an injected access failure. These are synthetic mapped
+tests against the current runtime, not original-x86, real hooks, real guest SEH
+or gameplay evidence. No benchmarks or profile captures run in this mode.
+
+Real game-function corpora run through `tools/build.py --function-corpus MANIFEST`.
+Use `--corpus-trial-ms 0` for correctness and code sizes without timing. They compare
+four translated C modes in full CPU/scratch state, then compare a reviewed typed
+native reference using explicit game-owned observations. Timing reports separate
+guest-state adapters from direct typed native kernels. See
+[the corpus tools](../tools/recomp/corpus/README.md) for provenance, measurement
+contracts and the consolidated fragment modes. Game assembly and outputs
+remain private; these checks do not establish original-x86 equivalence.
+
+`tools/build.py --ir-ssa-checks` compares the experimental integer SSA C emitter
+with eager C using 163 byte-backed synthetic fixtures, 24576 inputs each,
+and complete CPU/2 KiB scratch comparisons. It covers partial registers, loops,
+memory aliases, INC/DEC/SBB/ADC, memory RMW snapshots, extensions, masked shifts,
+checked signed/unsigned division, multiplication, all SETcc conditions, absolute
+memory accesses and declared calls with both mock and byte-translated callees. Explicit indirect
+call fixtures cover register and ESP-relative targets, live x87 state, and normal
+or diverted resumable continuation. Dword string moves cover zero count, both
+DF directions and overlapping copies with store observations.
+Raw (`optimize=False`), scalar with strict state, scalar-strict and the
+production scalar/local-state policy are compared in ordinary and null-check builds. Scalar/local-state retains
+complete outgoing state while deferring load and store observations: the scalar column
+compares store snapshots without x87 stack, tag, TOP and status fields, which scalar x87
+does not publish at guest accesses, and the scalar/local-state column also without GPRs
+other than ESP/EBP and the arithmetic flags. Null-check builds select strict publication. x87 checks cover all TOP,
+PC and RC combinations, exact integer metadata, special and finite inputs,
+80-bit memory, register directions, status/rounding/remainder and classification.
+Native read-only store observers additionally compare complete CPU snapshots,
+addresses, widths and values, with explicit branch-join, loop-backedge and
+partial-word-update fixtures. Carried x87 fixtures cover forward joins at
+different depths, mixed dirty parts, FXCH and live values on loop backedges,
+a Cull-style FCOMP/FNSTSW branch, popped-tag publication, an unbalanced loop
+that must fall back and a join with a path that went through a call.
+Zero-divisor and overflow fixtures use a mock returning error handler that
+records CPU/fault address and changes EAX/EDX, EBX/ESI and arithmetic flags. These are current-runtime checks,
+not original-x86, actual guest SEH or interior memory-fault equivalence.
+
 The differential harness compares translated routines with original instructions
 under Unicorn. Unicorn is a development tool, not part of the playable app.
 

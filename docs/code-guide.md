@@ -22,6 +22,7 @@ translated locally into `build/recomp/gen/` and are never edited in place.
 | Imports, startup, memory | [Guest runtime](../runtime/README.md) | `loader_load`, `patch_iat`, `imports_dispatch`, `heap_realloc` |
 | Mod lifecycle and hooks | [loader.cpp](../mods/loader.cpp), [hooks.cpp](../mods/hooks.cpp) | `mods_load_all`, `build_api`, `mods_hook_dispatch`, `mods_call_next` |
 | Instruction translation | [translate.py](../tools/recomp/translate.py), [x86.h](../runtime/x86.h) | Instruction emitters and register/flag helpers |
+| Observable region analysis | [IR contracts](ir.md#observable-contract-foundation), [cfg.py](../tools/recomp/ir/cfg.py) | Shared CFG; immutable observations/effects; conservative demand and call-graph solvers |
 | Native replacement validation | [replay.cpp](../mods/native/replay.cpp), [page_track.cpp](../mods/native/page_track.cpp) | `load`, `run`, `translated`, `begin`, `end` |
 
 ## Follow one live setting

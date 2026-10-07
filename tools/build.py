@@ -346,10 +346,14 @@ def translation_fingerprint(game_dir, cfg, translate_args):
     every listing would cost more than it saves."""
     h = hashlib.sha256()
     h.update(b"recomp-translate-v2\n")
-    sources = sorted((ROOT / "tools/recomp").glob("*.py"))
+    translator_root = ROOT / "tools/recomp"
+    # Frontend packages (notably ir/) affect production output just as the
+    # top-level translator does. Keep tests out of the cache identity.
+    sources = sorted(path for path in translator_root.rglob("*.py")
+                     if "tests" not in path.relative_to(translator_root).parts)
     sources += [ROOT / "tools/game_config.py", ROOT / "tools/gen_game_config.py"]
     for path in sources:
-        h.update(path.name.encode() + b"\0" + path.read_bytes())
+        h.update(path.relative_to(ROOT).as_posix().encode() + b"\0" + path.read_bytes())
     for name in ("game.toml", cfg["translate"].get("globals", "globals.toml")):
         path = game_dir / name
         if path.is_file():
@@ -468,16 +472,27 @@ def web_site(game_dir, build_root, preset, cfg):
 def parse_args(argv, system=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--regenerate", action="store_true", help="Regenerate and compile translated C")
-    parser.add_argument("--llvm-compare", type=Path, metavar="MANIFEST",
-                        help="Build-only translator C/LLVM comparison using production compile commands")
-    parser.add_argument("--llvm-sweep", type=Path, metavar="MANIFEST",
-                        help="Build-only full-census LLVM emission/lifting coverage survey")
-    parser.add_argument("--x87-locals-experiment", action="store_true",
+    parser.add_argument("--function-corpus", type=Path, metavar="MANIFEST",
+                        help="Build/check/report a game-owned native-reference function corpus")
+    parser.add_argument("--corpus-ir-ssa", action="store_true",
+                        help="Try integer IR SSA in the corpus combined mode, recording fallbacks")
+    parser.add_argument("--corpus-fault-state", choices=("relaxed", "exact"), default=None,
+                        help="[translate] fault_state for --corpus-ir-ssa (default: relaxed)")
+    parser.add_argument("--corpus-msvc-x87-convention", choices=("on", "off"), default=None,
+                        help="[translate] msvc_x87_convention for --corpus-ir-ssa (default: on)")
+    parser.add_argument("--corpus-checks", type=int, default=4096)
+    parser.add_argument("--corpus-asan", action="store_true",
+                        help="Build the corpus with AddressSanitizer; correctness only (needs --corpus-trial-ms 0)")
+    parser.add_argument("--corpus-trial-ms", type=float, default=10.0,
+                        help="Time budget per eager trial in milliseconds; each row's call count is "
+                             "calibrated once to fill it. Zero runs correctness/size only")
+    parser.add_argument("--corpus-trials", type=int, default=9)
+    parser.add_argument("--corpus-fragments", action="store_true",
                         help="Build and run the isolated x87 local-value experiment")
-    parser.add_argument("--x87-llvm-experiment", action="store_true",
-                        help="Build and run the isolated LLVM stack-to-SSA pass")
-    parser.add_argument("--x87-llvm-function", type=Path,
-                        help="Game-owned whole-function evidence/fixture profile for LLVM experiment")
+    parser.add_argument("--cpu-locals-checks", action="store_true",
+                        help="Build and run full-state CPU/x87 locals checks without benchmarks")
+    parser.add_argument("--ir-ssa-checks", action="store_true",
+                        help="Build/run byte-backed integer SSA full-state synthetic checks")
     parser.add_argument("--allow-table-gaps", metavar="REASON", default=None,
                         help="Accept jump-table sites the translator cannot decode (passed to translate.py)")
     parser.add_argument("--forget", metavar="ADDR[,ADDR...]", default=None,
@@ -523,14 +538,29 @@ def parse_args(argv, system=None):
         parser.error("--target web needs the Emscripten SDK's environment (source emsdk_env.sh)")
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
-    if (args.llvm_compare or args.llvm_sweep) and any((args.stub, args.regenerate, args.config != "Release",
-                                  args.preset != default_preset(system), args.target != "app",
-                                  args.x87_llvm_experiment, args.x87_locals_experiment,
-                                  args.x87_llvm_function, args.allow_table_gaps,
-                                  args.allow_unmodelled, args.discovered, args.forget)):
-        parser.error("--llvm-compare requires native Release defaults and no translation overrides")
-    if args.llvm_compare and args.llvm_sweep:
-        parser.error("LLVM comparison and sweep are separate modes")
+    if args.function_corpus and any((args.regenerate, args.stub, args.corpus_fragments,
+                                      args.cpu_locals_checks, args.ir_ssa_checks,
+                                      args.allow_unmodelled,
+                                      args.allow_table_gaps, args.forget, args.discovered,
+                                      args.config != "Release", args.target != "app")):
+        parser.error("--function-corpus is an isolated native Release build mode")
+    if args.corpus_ir_ssa and not args.function_corpus:
+        parser.error("--corpus-ir-ssa requires --function-corpus")
+    if args.corpus_asan and not args.function_corpus:
+        parser.error("--corpus-asan requires --function-corpus")
+    if args.corpus_asan and args.corpus_trial_ms != 0:
+        parser.error("--corpus-asan is a correctness build; pass --corpus-trial-ms 0")
+    if args.corpus_fault_state is not None and not args.corpus_ir_ssa:
+        parser.error("--corpus-fault-state requires --corpus-ir-ssa")
+    if args.corpus_msvc_x87_convention is not None and not args.corpus_ir_ssa:
+        parser.error("--corpus-msvc-x87-convention requires --corpus-ir-ssa")
+    if args.corpus_msvc_x87_convention is not None:
+        args.corpus_msvc_x87_convention = args.corpus_msvc_x87_convention == "on"
+    if args.ir_ssa_checks and any((args.regenerate, args.stub, args.corpus_fragments,
+                                  args.cpu_locals_checks,
+                                  args.config != "Release",
+                                  args.preset != default_preset(system), args.target != "app")):
+        parser.error("--ir-ssa-checks is an isolated native Release check mode")
     args.build_root = build_root_for(args.game_dir)
     return args, parser
 
@@ -538,27 +568,27 @@ def parse_args(argv, system=None):
 def main():
     """Check inputs, translate under the build lock when needed, then configure and build."""
     args, parser = parse_args(sys.argv[1:])
-    if args.llvm_sweep:
-        from llvm_sweep import run_sweep
-        with buildlock.BuildLock(args.build_root.parent, "tools/build.py --llvm-sweep"):
-            run_sweep(args.llvm_sweep, args.game_dir, args.build_root / "llvm-sweep",
-                      cmake_tool("cmake"), args.jobs,
-                      build_dir_for(args.build_root, args.preset) / "compile_commands.json")
+    if args.ir_ssa_checks:
+        from ir.native_checks import run_checks
+        with buildlock.BuildLock(args.build_root.parent, "tools/build.py --ir-ssa-checks"):
+            run_checks(args.build_root / "ir-ssa-checks", cmake_tool("cmake"), args.jobs)
         return
-    if args.llvm_compare:
-        from llvm_compare_build import run_comparison
-        with buildlock.BuildLock(args.build_root.parent, "tools/build.py --llvm-compare"):
-            run_comparison(args.llvm_compare, args.game_dir, args.build_root / "llvm-compare",
-                           build_dir_for(args.build_root, args.preset) / "compile_commands.json",
-                           cmake_tool("cmake"), args.jobs)
+    if args.function_corpus:
+        from corpus.run import run_corpus
+        with buildlock.BuildLock(args.build_root.parent, "tools/build.py --function-corpus"):
+            run_corpus(args.function_corpus, args.game_dir, args.build_root / "function-corpus",
+                       cmake_tool("cmake"), args.jobs, args.corpus_checks,
+                       args.corpus_trial_ms, args.corpus_trials,
+                       args.corpus_ir_ssa, fault_state=args.corpus_fault_state,
+                       msvc_x87_convention=args.corpus_msvc_x87_convention, asan=args.corpus_asan)
         return
-    if args.x87_llvm_experiment:
-        from experiments.x87_llvm.run import run_experiment
-        run_experiment(args.build_root / "x87-llvm-experiment", cmake_tool("cmake"), args.jobs, args.x87_llvm_function)
+    if args.corpus_fragments:
+        from corpus.fragments.run import run_experiment
+        run_experiment(args.build_root / "function-corpus-fragments", cmake_tool("cmake"), args.jobs)
         return
-    if args.x87_locals_experiment:
-        from experiments.x87_locals.run import run_experiment
-        run_experiment(args.build_root / "x87-locals-experiment", cmake_tool("cmake"), args.jobs)
+    if args.cpu_locals_checks:
+        from experiments.cpu_locals.run import run_checks
+        run_checks(args.build_root / "cpu-locals-checks", cmake_tool("cmake"), args.jobs)
         return
     cfg = game_config.load(args.game_dir)
     # Regenerating needs the game and its listings.

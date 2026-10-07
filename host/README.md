@@ -291,6 +291,28 @@ never installed a notifier says so the first time input changes: the whole class
 of bug here is a call that does nothing and reports nothing, and the symptom of
 every version of it is a mouse that appears dead.
 
+## Scripted input in headless and desktop hosts
+
+Set `RECOMP_INPUT_SCRIPT=/absolute/path/to/menu.script` before starting
+`pop_headless` or the desktop app. This uses the smoke parser with a portable
+input subset: `wait`, `move`, `moveby`, `click`, `guestclick`, `button`, `key` and
+`quit`. Unsupported operations fail before guest startup. The full smoke host
+remains responsible for scene assertions and game-specific operations.
+
+Actions run under the guest scheduler baton through the shared input filters,
+DirectInput state and notifications, and Win32 message queue. `wait` uses the
+guest clock, including `RECOMP_PIN_CLOCK` when set. Automatic `click` and
+`guestclick` releases require at least four presented frames; later steps pause
+until release, retaining the waits after a click. Explicit `button down/up`
+steps use their scripted timing. `quit` releases input and requests normal
+window closure. The usual frame and wall-clock caps still apply.
+
+For a relative-input game, use `moveby -2000 -2000` to reach a corner, wait for
+the guest to consume the motion, then move toward the target and press/release
+with `button`. Absolute guest-coordinate messages alone may not position a
+game's own DirectInput cursor. Capture frames to establish the coordinates and
+use guest function tracing to confirm the intended action ran.
+
 ## The smoke run
 
 `make recomp-smoke` boots the game, presses the buttons in
@@ -389,7 +411,8 @@ and no audio device is created.
 Unlike the parity fixture it is **not** built with `-DRECOMP_NULL_HOST`,
 because the whole point is that presented frames reach a file. No window is
 opened, no device is created, no audio stream is started, no input device is
-touched; the Direct3D and audio callbacks count and discard.
+touched; optional scripted input supplies keyboard and mouse state through the
+shared input path. The Direct3D and audio callbacks count and discard.
 
 Headless and smoke also refresh visible GDI window surfaces at the virtual
 display's 60 Hz rate, even when an unchanged window needs no new WM_PAINT.
@@ -400,6 +423,12 @@ intervals without one, window refreshes resume over the idle primary's pixels.
 `RECOMP_FRAMES` selects frame captures in either host, and `RECOMP_FRAME_EVERY`
 samples every Nth present (0 disables writes). The smoke host's existing
 scripted dumps remain available independently.
+
+Under Samply, the headless presenter also emits `frame` marker spans between
+present boundaries. Set `RECOMP_PROFILE_MARKERS=1` to force marker-file output
+outside Samply. Markers remain enabled when frame writes are disabled; these
+spans include headless capture and diagnostic work and are not isolated guest
+CPU frame timings.
 
 Activation is synthesised there rather than delivered: a window that has just
 been shown and holds the focus gets `WM_ACTIVATEAPP`, `WM_ACTIVATE` and

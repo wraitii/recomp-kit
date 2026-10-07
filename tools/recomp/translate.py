@@ -171,6 +171,7 @@ VISUAL_ANIMATION_READS = frozenset()
 EXTRA_ENTRY_POINTS = frozenset()
 RESUMABLE_STACKS = False
 X87_LOCALS = False
+CPU_LOCALS = False
 FUNCTION_ALIGNMENT = 16
 
 #: game.toml [translate] rewrites: an instruction's memory operand moved to a
@@ -208,10 +209,12 @@ def configure_module(cfg, key):
     reads, no curated symbols (those describe the executable)."""
     global LISTINGS, FUNCS_TSV, BINARY, CURATED, ANIMATION_COUNTER, VISUAL_ANIMATION_READS
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT, SYMBOL_PREFIX, AUX_MODULE
-    global RESUMABLE_STACKS, X87_LOCALS
+    global RESUMABLE_STACKS, X87_LOCALS, CPU_LOCALS
     configure_intrinsics({"translate": {"intrinsics": {}}})
-    RESUMABLE_STACKS = cfg["translate"].get("resumable_stacks", False)
-    X87_LOCALS = cfg["translate"].get("x87_locals", False)
+    tl = cfg.get("translate", {})
+    RESUMABLE_STACKS = tl.get("resumable_stacks", False)
+    X87_LOCALS = tl.get("fault_state", game_config.TRANSLATE_DEFAULTS["fault_state"]) == "relaxed"
+    CPU_LOCALS = X87_LOCALS
     mods = {m["key"]: m for m in cfg.get("aux_modules", [])}
     if key not in mods:
         raise SystemExit("game.toml has no [modules.aux.%s]" % key)
@@ -250,26 +253,28 @@ def configure(cfg):
     """Point the translator at one game's listings, binary and audited reads."""
     global LISTINGS, FUNCS_TSV, BINARY, CURATED, ANIMATION_COUNTER, VISUAL_ANIMATION_READS
     configure_intrinsics(cfg)
+    translate = cfg.get("translate", {})
     listings = str(cfg["listings_path"])
     LISTINGS = os.path.join(listings, "functions")
     FUNCS_TSV = os.path.join(listings, "functions.tsv")
     BINARY = str(cfg["developer_exe_path"])
-    CURATED = os.path.join(str(cfg["dir"]), cfg["translate"].get("globals", "globals.toml"))
-    ANIMATION_COUNTER = cfg["translate"]["animation_counter"]
-    VISUAL_ANIMATION_READS = frozenset(cfg["translate"].get("volatile_reads", ()))
+    CURATED = os.path.join(str(cfg["dir"]), translate.get("globals", "globals.toml"))
+    ANIMATION_COUNTER = translate["animation_counter"]
+    VISUAL_ANIMATION_READS = frozenset(translate.get("volatile_reads", ()))
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT
-    global RESUMABLE_STACKS, X87_LOCALS
-    RESUMABLE_STACKS = cfg["translate"].get("resumable_stacks", False)
-    X87_LOCALS = cfg["translate"].get("x87_locals", False)
-    EXTRA_ENTRY_POINTS = frozenset(int(a) for a in cfg["translate"].get("entry_points", ()))
-    FUNCTION_ALIGNMENT = cfg["translate"].get("function_alignment", 16)
+    global RESUMABLE_STACKS, X87_LOCALS, CPU_LOCALS
+    RESUMABLE_STACKS = translate.get("resumable_stacks", False)
+    X87_LOCALS = translate.get("fault_state", game_config.TRANSLATE_DEFAULTS["fault_state"]) == "relaxed"
+    CPU_LOCALS = X87_LOCALS
+    EXTRA_ENTRY_POINTS = frozenset(int(a) for a in translate.get("entry_points", ()))
+    FUNCTION_ALIGNMENT = translate.get("function_alignment", 16)
     global OPERAND_REDIRECTS, INSTRUCTION_PATCHES, DATA_SEEDS
     OPERAND_REDIRECTS = {int(r["at"]): (int(r["from"]), int(r["to"]))
-                         for r in cfg["translate"].get("operand_redirects", ())}
+                         for r in translate.get("operand_redirects", ())}
     INSTRUCTION_PATCHES = {int(r["at"]): str(r["text"])
-                           for r in cfg["translate"].get("instruction_patches", ())}
+                           for r in translate.get("instruction_patches", ())}
     DATA_SEEDS = []
-    for r in cfg["translate"].get("data_seeds", ()):
+    for r in translate.get("data_seeds", ()):
         if "float" in r:
             value = struct.unpack("<I", struct.pack("<f", float(r["float"])))[0]
         else:
@@ -437,7 +442,7 @@ INTRINSIC_BODY = {}
 def configure_intrinsics(cfg):
     """Install only the runtime intrinsic addresses declared for this image."""
     global INTRINSIC_SETJMP, INTRINSIC_LONGJMP, INTRINSIC_BODY
-    configured = cfg["translate"].get("intrinsics", {})
+    configured = cfg.get("translate", {}).get("intrinsics", {})
     if not isinstance(configured, dict):
         raise TranslateError("[translate.intrinsics] must be a table")
     unknown = set(configured) - {"setjmp", "longjmp"}
@@ -875,7 +880,7 @@ FCMOVCC = {"FCMOV" + k: COND[v] for k, v in (
     ("NB", "NB"), ("NE", "NE"), ("NBE", "NBE"), ("NU", "NP"))}
 
 ARITH_ALL = ALL_FLAGS
-LOGIC_DEF = ALL_FLAGS           # AF is architecturally undefined; treat as killed
+LOGIC_DEF = ALL_FLAGS - {"af"}  # Runtime logical operations preserve undefined AF.
 INCDEC_DEF = frozenset(("zf", "sf", "of", "pf", "af"))
 
 #: A shift or rotate with a zero count leaves every flag untouched, so it only
@@ -1146,6 +1151,7 @@ class Image(object):
         #: so that what a compiler put after a throw, such as a switch table,
         #: is not decoded as code.
         self.iat_names = {}
+        self.iat_dlls = {}
         try:
             pe.parse_data_directories(directories=[
                 pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
@@ -1153,6 +1159,7 @@ class Image(object):
                 for imp in entry.imports:
                     if imp.name:
                         self.iat_names[imp.address] = imp.name.decode("ascii", "replace")
+                        self.iat_dlls[imp.address] = entry.dll.decode("ascii", "replace").lower()
         except Exception:                 # a malformed table only loses names
             pass
         pe.close()
@@ -1224,6 +1231,7 @@ class Image(object):
         # pefile reports import slot addresses at the preferred base; the
         # listing and the relocated bytes use the configured one.
         self.iat_names = {addr + delta: name for addr, name in self.iat_names.items()}
+        self.iat_dlls = {addr + delta: name for addr, name in self.iat_dlls.items()}
 
     def relocated_pointers(self):
         """Every address named by a dword the loader rewrites, and where.
@@ -3154,14 +3162,26 @@ class Translator(object):
         prologue = len(out)          # everything emitted so far is dispatch
         bodies = {i: self.emit(fn, i, live_out[i]) for i in range(len(fn.insns)) if i not in dead}
         if getattr(self.opts, "x87_locals", X87_LOCALS):
+            consumed = set()
             from x87_locals import lower_regions
             bodies, regions, lifted = lower_regions(
-                fn, bodies, labels, dead, parse_operand,
+                fn, bodies, labels, dead | consumed, parse_operand,
                 VISUAL_ANIMATION_READS | frozenset(INSTRUCTION_PATCHES),
                 (self.successors, self.branch_target, JCC, entries))
             self.stats["_x87_local_regions"] += regions
             self.stats["_x87_local_instructions"] += lifted
             self.stats["_x87_local_functions"] += bool(regions)
+        cpu_publish = []
+        if getattr(self.opts, "cpu_locals", CPU_LOCALS):
+            from cpu_locals import lower_function
+            bodies, declarations, cpu_publish, fields = lower_function(bodies)
+            # Initialize before the alternate-entry switch or any head jump.
+            out[1:1] = ["    " + line for line in declarations]
+            prologue += len(declarations)
+            self.stats["_cpu_local_functions"] += bool(fields)
+            self.stats["_cpu_local_fields"] += fields
+            if fields:
+                labels.add(fn.addr)
         for i, ins in enumerate(fn.insns):
             if i in dead:
                 continue
@@ -3179,6 +3199,7 @@ class Translator(object):
                 self.stats["_listing_gap"] += 1
                 self.notes.append(
                     "%08x: listing gap, %s falls through to %08x" % (ins.addr, ins.mnem, t))
+                out.extend("    " + line for line in cpu_publish)
                 for line in self.goto_target(fn, t, ins):
                     out.append("    " + line)
         # A function whose last listed instruction is not a terminator falls
@@ -3189,6 +3210,7 @@ class Translator(object):
                 and not self.never_returns(last)):
             t = fn.fallthrough[last_i] or fn.end
             self.stats["_fallthrough_exit"] += 1
+            out.extend("    " + line for line in cpu_publish)
             out.append("    " + " ".join(self.goto_target(fn, t, last)))
         # Invariant: the first thing fn_ADDR does is reach ADDR.  Checked
         # here rather than trusted, because getting it wrong corrupts the
@@ -4484,10 +4506,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True, help="where the generated sources go (build/recomp/gen)")
     ap.add_argument("--only", nargs="*", default=None)
-    ap.add_argument("--llvm-compare", type=Path, metavar="MANIFEST",
-                    help="Emit build-only C/LLVM leaf comparisons under an explicit observation contract")
-    ap.add_argument("--llvm-sweep", type=Path, metavar="MANIFEST",
-                    help="Survey every census row with the bounded LLVM frontend; no dispatch output")
     ap.add_argument("--eager-flags", action="store_true",
                     help="compute every flag at every instruction (debug)")
     ap.add_argument("--check-flags", action="store_true",
@@ -4521,13 +4539,10 @@ def main():
                          "game (tools/lazy_static.py).")
     ap.add_argument("--module", default=None, metavar="KEY",
                     help="translate the auxiliary module [modules.aux.KEY] instead of the executable")
+    ap.add_argument("--ir-census", default=None, metavar="FILE",
+                    help="infer every function's calling convention from SLEIGH p-code "
+                         "and write the census as JSON (tools/recomp/ir)")
     args = ap.parse_args()
-    if (args.llvm_compare or args.llvm_sweep) and any((args.only is not None, args.eager_flags, args.check_flags,
-                                  args.allow_unmodelled, args.allow_table_gaps, args.forget,
-                                  args.discovered, args.as_module, args.module)):
-        ap.error("--llvm-compare is a separate bounded mode; translation overrides are unsupported")
-    if args.llvm_compare and args.llvm_sweep:
-        ap.error("LLVM comparison and sweep are separate modes")
     cfg = game_config.load(args.game)
     configure(cfg)
     if args.module:
@@ -4540,14 +4555,6 @@ def main():
         AUX_MODULE = {"name": args.as_module, "base": cfg["game"]["image_base"],
                       "size": 0}  # the image's extent, filled in once it is read
     image = Image(BINARY)
-    if args.llvm_sweep:
-        from llvm_sweep import emit_sweep
-        emit_sweep(sys.modules[__name__], image, args)
-        return
-    if args.llvm_compare:
-        from llvm_compare import emit_comparison
-        emit_comparison(sys.modules[__name__], image, args)
-        return
     discovered = []
     if args.discovered:
         global EXTRA_ENTRY_POINTS
@@ -5790,6 +5797,12 @@ def main():
     for t, fn in extra.items():
         entries_by_fn[fn.addr].add(t)
 
+    if args.ir_census:
+        from ir.census import run_census
+        failed = {a for a, _ in failures}
+        run_census(tr, [fn for fn in parsed if fn.addr not in failed], args.ir_census,
+                   entries_by_fn, quiet=args.quiet)
+
     bodies = {}
     for fn in parsed:
         if fn.addr in [a for a, _ in failures]:
@@ -6103,6 +6116,7 @@ def main():
     # before it does anything else.  Recursive descent can pull in addresses
     # below the entry, and falling into whichever sorts first made
     # fn_00565e1e start on a POP that ate its caller's return address.
+    from cpu_locals import after_initialization
     wrong_entry = []
     for fn in ok:
         body = bodies[fn.addr]
@@ -6111,6 +6125,7 @@ def main():
         if body and body[0].startswith("static void body_"):
             continue                      # multi-entry form, dispatched below
         lines = [l for l in body[1:] if l.strip()]
+        lines = after_initialization(lines)
         # Host-only ownership bookkeeping does not execute a guest instruction
         # or modify its CPU. The first guest operation must still reach ADDR.
         if lines and lines[0].strip() == "uint64_t seh_mark_ = recomp_seh_frame_mark(c);":
@@ -6183,6 +6198,20 @@ def main():
                              ", ".join("%08x" % a for a in missing_patches))
 
     # funcs.h ---------------------------------------------------------------
+    # Boundary recovery and all decoded dispatch gates above stay authoritative.
+    # SSA only replaces admitted final bodies, using the same stable entries.
+    ir_ssa_report = {"enabled": False}
+    translate_cfg = cfg.get("translate", {})
+    if translate_cfg.get("ir_ssa", game_config.TRANSLATE_DEFAULTS["ir_ssa"]):
+        from ir.production import apply
+        ir_ssa_report = apply(tr, ok, bodies, entries_by_fn, translate_cfg,
+                              module=bool(args.as_module or AUX_MODULE), quiet=args.quiet,
+                              policies={"intrinsic_bodies": INTRINSIC_BODY,
+                                        "instruction_patches": INSTRUCTION_PATCHES,
+                                        "operand_redirects": OPERAND_REDIRECTS,
+                                        "volatile_reads": VISUAL_ANIMATION_READS,
+                                        "resumable_stacks": RESUMABLE_STACKS})
+
     with open(os.path.join(args.out, "funcs.h"), "w") as fh:
         fh.write("/* generated by tools/recomp/translate.py -- do not edit */\n")
         fh.write("#ifndef RECOMP_FUNCS_H\n#define RECOMP_FUNCS_H\n")
@@ -6570,6 +6599,7 @@ void recomp_unknown_jump(X86 *c, uint32_t target)
                 "image_base": "%08x" % image.base,
                 "functions_total": len(parsed),
                 "functions_ok": len(ok),
+                "ir_ssa": ir_ssa_report,
                 "entry_points": len(entry_names),
                 "alternate_entries": ["%08x" % a for a in sorted(extra)],
                 "entry_points_from_data_pointers": discovered_by_scan[0],

@@ -5,7 +5,7 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from experiments.x87_locals.run import emit, CASES, MODES
+from corpus.fragments.run import emit, CASES, MODES
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -30,5 +30,6 @@ def test_preserved_rounding_points(name):
     """Local lifting must retain one runtime rounding per arithmetic instruction."""
     expected = sum(line.split()[0] in {"FMUL", "FADD", "FSUB", "FADDP"} for line in CASES[name])
     for mode in ("baseline", "full", "live"):
-        assert emit(CASES[name], mode).count("fx87(c,") == expected
+        helper = "fx87(&x87_env_," if mode == "full" else "fx87(c,"
+        assert emit(CASES[name], mode).count(helper) == expected
     assert "fx87(c," not in emit(CASES[name], "relaxed")

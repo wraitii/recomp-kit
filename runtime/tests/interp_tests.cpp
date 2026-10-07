@@ -1,4 +1,5 @@
 #define RECOMP_GUEST_MEMORY_OWNER 1 /* defines and maps g_mem */
+#include "../platform/os.h"
 // interp_tests.cpp - the heap-code interpreter (runtime/interp.cpp).
 //
 //   interp_tests               the checks below
@@ -305,7 +306,7 @@ extern "C" void watchdog(int) {
 #endif
 
 int main(int argc, char **argv) {
-    g_mem = (uint8_t *)calloc(GUEST_SIZE, 1);
+    g_mem = (uint8_t *)os_vm_reserve_at(RECOMP_ARENA, GUEST_SIZE);
     if (!g_mem)
         return 1;
     if (argc == 3 && !strcmp(argv[1], "--run"))

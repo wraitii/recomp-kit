@@ -12,15 +12,6 @@ spec.loader.exec_module(build_py)
 
 
 class BuildPyTests(unittest.TestCase):
-    def test_llvm_sweep_requires_its_own_native_build_mode(self):
-        args, _ = build_py.parse_args(["--llvm-sweep", "profiles.json"], system="Darwin")
-        self.assertEqual(args.llvm_sweep, Path("profiles.json"))
-        for extra in (["--llvm-compare", "profiles.json"], ["--regenerate"],
-                      ["--stub"], ["--target", "headless"], ["--config", "Debug"],
-                      ["--x87-llvm-experiment"], ["--forget", "00400100"]):
-            with self.subTest(extra=extra), self.assertRaises(SystemExit):
-                build_py.parse_args(["--llvm-sweep", "profiles.json", *extra], system="Darwin")
-
     def test_default_preset_follows_the_operating_system(self):
         self.assertEqual(build_py.default_preset("Darwin"), "macos")
         self.assertEqual(build_py.default_preset("Linux"), "linux")
@@ -232,11 +223,84 @@ if __name__ == "__main__":
     unittest.main()
 
 
-def test_llvm_compare_is_separate_from_game_build_modes():
+def test_function_corpus_is_isolated_and_does_not_regenerate_game():
     import pytest
-    for option in ('--regenerate', '--stub', '--x87-llvm-experiment', '--x87-locals-experiment'):
+    args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-trial-ms', '0'], system='Darwin')
+    assert args.function_corpus == Path('manifest.json')
+    assert args.corpus_trial_ms == 0
+    for extra in (['--regenerate'], ['--stub'], ['--corpus-fragments'],
+                  ['--cpu-locals-checks']):
         with pytest.raises(SystemExit):
-            build_py.parse_args(['--llvm-compare', 'manifest.json', option], system='Darwin')
-    args, _ = build_py.parse_args(['--llvm-compare', 'manifest.json'], system='Darwin')
-    assert args.llvm_compare == Path('manifest.json')
-    assert not args.regenerate
+            build_py.parse_args(['--function-corpus', 'manifest.json', *extra], system='Darwin')
+
+
+def test_ir_ssa_corpus_mode_requires_isolation():
+    import pytest
+    args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa'], system='Darwin')
+    assert args.corpus_ir_ssa
+    with pytest.raises(SystemExit):
+        build_py.parse_args(['--corpus-ir-ssa'], system='Darwin')
+
+
+def test_ir_ssa_native_checks_require_isolation():
+    import pytest
+    args, _ = build_py.parse_args(['--ir-ssa-checks'], system='Darwin')
+    assert args.ir_ssa_checks
+    for extra in (['--regenerate'], ['--stub'], ['--cpu-locals-checks'],
+                  ['--function-corpus', 'manifest.json']):
+        with pytest.raises(SystemExit):
+            build_py.parse_args(['--ir-ssa-checks', *extra], system='Darwin')
+
+
+def test_retired_dataflow_experiment_options_are_rejected():
+    import pytest
+    for option in (['--corpus-x87-dataflow'], ['--corpus-stack-forwarding'],
+                   ['--corpus-decoded-dataflow'], ['--x87-dataflow-checks'],
+                   ['--decoded-dataflow-checks']):
+        with pytest.raises(SystemExit):
+            build_py.parse_args(['--function-corpus', 'manifest.json', *option], system='Darwin')
+
+
+def test_retired_ceiling_corpus_option_is_rejected():
+    import pytest
+    with pytest.raises(SystemExit):
+        build_py.parse_args(['--function-corpus', 'manifest.json',
+                             '--corpus-ir-ssa-ceiling', 'A'], system='Darwin')
+
+
+def test_corpus_asan_is_a_correctness_build_of_the_function_corpus():
+    import pytest
+    args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-asan',
+                                   '--corpus-trial-ms', '0'], system='Darwin')
+    assert args.corpus_asan
+    with pytest.raises(SystemExit):
+        build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-asan'], system='Darwin')
+    with pytest.raises(SystemExit):
+        build_py.parse_args(['--corpus-asan', '--corpus-trial-ms', '0'], system='Darwin')
+
+
+def test_retired_llvm_experiment_options_are_rejected():
+    import pytest
+    for option in (['--corpus-llvm', 'm.json'], ['--corpus-llvm-sweep', 'm.json'],
+                   ['--x87-llvm-experiment'], ['--x87-llvm-function', 'f.json']):
+        with pytest.raises(SystemExit):
+            build_py.parse_args(option, system='Darwin')
+
+
+def test_corpus_fault_state_and_convention_require_ir_ssa():
+    import pytest
+    args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa',
+                                   '--corpus-fault-state', 'exact',
+                                   '--corpus-msvc-x87-convention', 'off'], system='Darwin')
+    assert args.corpus_fault_state == 'exact'
+    assert args.corpus_msvc_x87_convention is False
+    args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa'], system='Darwin')
+    assert args.corpus_fault_state is None and args.corpus_msvc_x87_convention is None
+    for flags in (['--corpus-fault-state', 'relaxed'], ['--corpus-msvc-x87-convention', 'on']):
+        with pytest.raises(SystemExit):
+            build_py.parse_args(['--function-corpus', 'manifest.json', *flags], system='Darwin')
+    for retired in (['--corpus-ir-ssa-x87', 'scalar'], ['--corpus-ir-ssa-state', 'locals'],
+                    ['--corpus-ir-ssa-lazy-nan', 'on'], ['--corpus-fault-state', 'bogus']):
+        with pytest.raises(SystemExit):
+            build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa', *retired],
+                                system='Darwin')

@@ -44,6 +44,14 @@ extern "C" {
 #define GUEST_SIZE 0x10000000u /* 256 MB arena; RECOMP_GUEST_SIZE grows it for auxiliary modules */
 #endif
 
+/* The arena lives at one fixed host address, so translated accessors index a
+ * constant: no base pointer to load, and a guest store cannot alias it the
+ * way it aliases a global pointer, which made clang reload the base after
+ * every store. Whoever maps guest memory reserves exactly this range with
+ * os_vm_reserve_at; g_mem is RECOMP_ARENA once that has happened and NULL
+ * before, for host code that asks whether the arena exists yet. */
+#define RECOMP_ARENA_ADDRESS 0x300000000ull
+#define RECOMP_ARENA ((uint8_t *)(uintptr_t)RECOMP_ARENA_ADDRESS)
 extern uint8_t *g_mem;
 
 /* Guest memory layout (see plan Global constraints, as corrected):
@@ -106,23 +114,23 @@ void recomp_null_access(uint32_t addr, int write);
 /* Little-endian host (ARM64) matches the guest, so memcpy is a plain load. */
 RECOMP_HOT_INLINE uint8_t rd8(uint32_t a) {
     RECOMP_NULL_GUARD(a, 0);
-    return g_mem[a];
+    return RECOMP_ARENA[a];
 }
 RECOMP_HOT_INLINE uint16_t rd16(uint32_t a) {
     RECOMP_NULL_GUARD(a, 0);
     uint16_t v;
-    memcpy(&v, g_mem + a, 2);
+    memcpy(&v, RECOMP_ARENA + a, 2);
     return v;
 }
 RECOMP_HOT_INLINE uint32_t rd32(uint32_t a) {
     RECOMP_NULL_GUARD(a, 0);
     uint32_t v;
-    memcpy(&v, g_mem + a, 4);
+    memcpy(&v, RECOMP_ARENA + a, 4);
     return v;
 }
 RECOMP_HOT_INLINE uint64_t rd64(uint32_t a) {
     uint64_t v;
-    memcpy(&v, g_mem + a, 8);
+    memcpy(&v, RECOMP_ARENA + a, 8);
     return v;
 }
 /* A guest-memory watchpoint.  RECOMP_WATCH=<hex address>[:<length>] reports
@@ -161,10 +169,19 @@ static inline void recomp_dirty(uint32_t a, uint32_t n) {
     }
 }
 
-/* g_store_hook is g_watch_len | g_dirty_count, kept by whoever changes either
- * (recomp_store_hook_update). Every guest store tests it, and a store through
- * g_mem may alias anything, so the compiler reloads each global it reads after
- * every store: one word is one load where the two counters were two. */
+/* Store hooks: the watchpoint and DirectDraw dirty tracking. A game opts out
+ * with [game] store_hooks = false, which builds RECOMP_STORE_HOOKS=0: no guest
+ * store then tests anything, RECOMP_WATCH refuses to arm with a diagnostic and
+ * a DirectDraw Unlock compares the whole locked surface. The test costs more
+ * than its load and branch: every store may alias g_store_hook, so it is
+ * reloaded after each one, and the stored value stays live for the call.
+ *
+ * g_store_hook is g_watch_len | g_dirty_count, kept by whoever changes either
+ * (recomp_store_hook_update): one word is one load where the two counters
+ * were two. */
+#ifndef RECOMP_STORE_HOOKS
+#define RECOMP_STORE_HOOKS 1
+#endif
 extern uint32_t g_store_hook;
 static inline void recomp_store_hook_update(void) {
     g_store_hook = g_watch_len | g_dirty_count;
@@ -176,7 +193,7 @@ RECOMP_HOT_INLINE void recomp_watch(uint32_t a, uint32_t n, uint64_t v) {
     // diagnostic and a locked DirectDraw surface is rare), so one predictable
     // branch covers both. Arm and dirty state are set on this same guest
     // thread, so the value read here is the one the original two checks saw.
-    if (RECOMP_UNLIKELY(g_store_hook != 0)) {
+    if (RECOMP_STORE_HOOKS && RECOMP_UNLIKELY(g_store_hook != 0)) {
         if (g_watch_len != 0 && a < g_watch_base + g_watch_len && g_watch_base < a + n)
             recomp_watch_hit(a, n, v);
         if (g_dirty_count != 0)
@@ -186,42 +203,42 @@ RECOMP_HOT_INLINE void recomp_watch(uint32_t a, uint32_t n, uint64_t v) {
 
 RECOMP_HOT_INLINE void wr8(uint32_t a, uint8_t v) {
     RECOMP_NULL_GUARD(a, 1);
-    g_mem[a] = v;
+    RECOMP_ARENA[a] = v;
     recomp_watch(a, 1, v);
 }
 RECOMP_HOT_INLINE void wr16(uint32_t a, uint16_t v) {
     RECOMP_NULL_GUARD(a, 1);
-    memcpy(g_mem + a, &v, 2);
+    memcpy(RECOMP_ARENA + a, &v, 2);
     recomp_watch(a, 2, v);
 }
 RECOMP_HOT_INLINE void wr32(uint32_t a, uint32_t v) {
     RECOMP_NULL_GUARD(a, 1);
-    memcpy(g_mem + a, &v, 4);
+    memcpy(RECOMP_ARENA + a, &v, 4);
     recomp_watch(a, 4, v);
 }
 RECOMP_HOT_INLINE void wr64(uint32_t a, uint64_t v) {
-    memcpy(g_mem + a, &v, 8);
+    memcpy(RECOMP_ARENA + a, &v, 8);
     recomp_watch(a, 8, v);
 }
 RECOMP_HOT_INLINE float rdf32(uint32_t a) {
     float v;
-    memcpy(&v, g_mem + a, 4);
+    memcpy(&v, RECOMP_ARENA + a, 4);
     return v;
 }
 RECOMP_HOT_INLINE double rdf64(uint32_t a) {
     double v;
-    memcpy(&v, g_mem + a, 8);
+    memcpy(&v, RECOMP_ARENA + a, 8);
     return v;
 }
 RECOMP_HOT_INLINE void wrf32(uint32_t a, float v) {
-    memcpy(g_mem + a, &v, 4);
-    if (g_dirty_count != 0)
-        recomp_dirty(a, 4);
+    uint32_t bits;
+    memcpy(&bits, &v, 4);
+    wr32(a, bits);
 }
 RECOMP_HOT_INLINE void wrf64(uint32_t a, double v) {
-    memcpy(g_mem + a, &v, 8);
-    if (g_dirty_count != 0)
-        recomp_dirty(a, 8);
+    uint64_t bits;
+    memcpy(&bits, &v, 8);
+    wr64(a, bits);
 }
 
 /* 80-bit x87 extended precision.  x87 registers are `double` here (plan
@@ -273,9 +290,12 @@ static inline void wrbcd80(uint32_t a, double v) {
     double r = nearbyint(v);
     if (!(fabs(r) < 1e18)) {
         static const uint8_t indefinite[10] = {0, 0, 0, 0, 0, 0, 0, 0xc0, 0xff, 0xff};
-        memcpy(g_mem + a, indefinite, 10);
-        if (g_dirty_count != 0)
-            recomp_dirty(a, 10);
+        memcpy(RECOMP_ARENA + a, indefinite, 10);
+        {
+            uint64_t low;
+            memcpy(&low, indefinite, 8);
+            recomp_watch(a, 10, low);
+        }
         return;
     }
     uint64_t m = (uint64_t)fabs(r);
@@ -288,9 +308,12 @@ static inline void wrbcd80(uint32_t a, double v) {
     }
     if (r < 0 || (r == 0 && signbit(v)))
         out[9] = 0x80;
-    memcpy(g_mem + a, out, 10);
-    if (g_dirty_count != 0)
-        recomp_dirty(a, 10);
+    memcpy(RECOMP_ARENA + a, out, 10);
+    {
+        uint64_t low;
+        memcpy(&low, out, 8);
+        recomp_watch(a, 10, low);
+    }
 }
 
 /* ------------------------------------------------------------- cpu state */
@@ -1509,6 +1532,17 @@ static inline void x87_frstor(X86 *c, uint32_t a) {
 static inline float fto_float(const X86 *c, double v) {
     unsigned rc = (c->fpu_cw >> 10) & 3u;
     float f = (float)v;
+    /* A float load followed by double widening and float narrowing must quiet
+     * an sNaN as the eager host conversion does. Optimizers can otherwise
+     * cancel the casts when the double is local, retaining a signaling payload
+     * in guest FST memory even though the widened x87 slot is quiet. */
+    if (v != v) {
+        uint32_t bits;
+        memcpy(&bits, &f, sizeof bits);
+        bits |= 0x00400000u;
+        memcpy(&f, &bits, sizeof f);
+        return f;
+    }
     double back;
     if (rc == 0 || v != v || isinf(v) || (double)f == v)
         return f;

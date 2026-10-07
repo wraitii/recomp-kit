@@ -11,6 +11,7 @@
 
 #include "x86.h"
 #include "intrinsics.h"
+#include "platform/os.h"
 
 uint8_t *g_mem;
 const int recomp_resumable_stacks = 0;
@@ -163,10 +164,12 @@ uint64_t harness_x86_size(void) {
 uint8_t *harness_mem(void) {
     if (!g_mem) {
         /* Test-only: 4 GB so a wild guest address from a randomised sweep
-         * cannot fault the host.  The game runtime allocates GUEST_SIZE. */
-        g_mem = (uint8_t *)calloc(1, 0x100000000ull);
+         * cannot fault the host.  The game runtime maps GUEST_SIZE. Both sit
+         * at the fixed RECOMP_ARENA, so one harness library per process. */
+        g_mem = (uint8_t *)os_vm_reserve_at(RECOMP_ARENA, 0x100000000ull);
         if (!g_mem) {
-            fprintf(stderr, "harness: out of memory\n");
+            fprintf(stderr, "harness: cannot map the guest arena at %#llx\n",
+                    (unsigned long long)RECOMP_ARENA_ADDRESS);
             abort();
         }
     }
@@ -463,6 +466,10 @@ uint32_t harness_header_selftest(void) {
             CHECK(part == fmod(ldexp(1.0, 70), 3.0));
         }
     }
+    /* The partial step rounds part * scale before subtracting; a fused
+     * multiply-subtract (contraction left on) gives 0x1.7c99934cb42cep+53. */
+    c.fpu_sw = 0;
+    CHECK(fprem_common(&c, 0x1.2265b1f236eb0p+86, 0x1.414c3423c5fd7p+2, 0) == 0x1.7c99ap+53);
     /* FPREM1 rounds the quotient to nearest, so its remainder can go negative */
     c.fpu_sw = 0;
     /* IEEE: 37/5 rounds to 7, so the remainder is 37 - 35 = 2. */

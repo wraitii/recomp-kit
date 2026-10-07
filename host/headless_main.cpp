@@ -30,19 +30,24 @@
 //   RECOMP_FRAME_EVERY=N    write every Nth frame (default 1; 0 writes none)
 // Static GDI windows refresh at the offscreen display's 60 Hz rate. Each
 // refresh is a present and advances RECOMP_PIN_CLOCK just like DirectDraw.
+//   RECOMP_INPUT_SCRIPT=PATH timed keyboard/mouse script (optional)
 //   RECOMP_EXE=PATH         image to load (default the loader's)
 //   RECOMP_NO_ACTIVATE=1    do not synthesise activation (diagnostics)
 //   RECOMP_LOG, RECOMP_IMPORT_STATS  as documented in runtime/README.md
 #include "audio.h"
 #include "audio_capture.h"
 #include "../platform/os.h"
+#include "../platform/profile_markers.h"
 #include "boot.h"
+#include "input.h"
+#include "input_script.h"
 #include "page_overlay.h"
 #include "../runtime/guest.h"
 #include "../runtime/loader.h"
 #include "../runtime/win32.h"
 #include "../runtime/gdi32_internal.h"
 #include "../dx/host_api.h"
+#include "../dx/dx.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -173,6 +178,9 @@ extern "C" void host_present(const void *pixels, int w, int h, int bpp, const ui
     // The frame boundary, and so the one thing that moves a pinned clock. See
     // boot.cpp; on an unpinned run this does nothing.
     boot_clock_advance();
+    // Headless present boundaries include capture/diagnostic work between presents.
+    // Emit even when frame writes are disabled so Samply can select frame spans.
+    profile_marker_frame();
     uint32_t index;
     {
         ReportLock held;
@@ -515,13 +523,6 @@ void audio_offline_end() {
 
 } // namespace
 
-extern "C" void host_input_state(HostInputState *out) {
-    // No mouse, no keyboard: a session where nobody touches anything. Zeroing
-    // is what DirectInput reports for an idle device, and it is the truth here.
-    if (out)
-        memset(out, 0, sizeof *out);
-}
-
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -534,6 +535,7 @@ void headless_tick() {
     // This is also the only thing that moves a play cursor here, so it runs
     // before the caps are looked at and on every turn.
     audio_pump();
+    host_input_script_tick(g_present_count);
     if (boot_close_requested())
         return;
     if (g_present_count < g_max_frames)
@@ -658,6 +660,9 @@ int main(int argc, char **argv) {
     opts.deadline_grace = 30.0;
     opts.close_unwind_grace = 15.0;
 
+    if (!host_input_script_load())
+        return 2;
+    host_input_set_notify(dinput_host_input_changed);
     if (!boot_load(opts)) {
         fprintf(stderr, "headless: loader_load: %s\n", loader_error());
         return 2;

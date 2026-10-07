@@ -56,6 +56,13 @@ pop_test_binary(compositor_tests)
 add_test(NAME compositor_tests COMMAND compositor_tests WORKING_DIRECTORY ${POP_ROOT})
 set_tests_properties(compositor_tests PROPERTIES LABELS gpu)
 
+add_executable(input_script_tests ${HOST}/input_script.cpp ${HOST}/script.cpp ${HOST}/tests/input_script_tests.cpp)
+target_include_directories(input_script_tests PRIVATE ${POP_ROOT} ${CMAKE_BINARY_DIR}/generated)
+target_compile_options(input_script_tests PRIVATE ${POP_WARN_WERROR})
+pop_test_binary(input_script_tests)
+add_test(NAME input_script_tests COMMAND input_script_tests WORKING_DIRECTORY ${POP_ROOT})
+set_tests_properties(input_script_tests PROPERTIES LABELS nogame)
+
 add_executable(input_touch_tests ${HOST}/input_touch.cpp ${HOST}/tests/input_touch_tests.cpp)
 target_include_directories(input_touch_tests PRIVATE ${POP_ROOT})
 target_compile_options(input_touch_tests PRIVATE ${POP_WARN_WERROR})
@@ -209,7 +216,8 @@ endif()
 if(TARGET recomp_gen)
   if(NOT IOS AND NOT ANDROID)
   pop_host(pop_headless GEN
-    SOURCES ${HOST}/headless_main.cpp ${HOST}/page_overlay.cpp ${POP_AUDIO_SOURCES}
+    SOURCES ${HOST}/headless_main.cpp ${HOST}/input.cpp ${HOST}/input_gate.cpp ${HOST}/compositor.cpp
+            ${HOST}/script.cpp ${HOST}/input_script.cpp ${HOST}/input_script_host.cpp ${HOST}/page_overlay.cpp ${POP_AUDIO_SOURCES}
     LIBS ${POP_CORE_LIBS}
     FRAMEWORKS ${FW_FOUNDATION})
   pop_link_sdl(pop_headless)
@@ -236,7 +244,8 @@ if(TARGET recomp_gen)
   endif()
 
   pop_host(recomp_app GEN UI_LAYER OPT 2
-    SOURCES ${HOST}/sdl/main.cpp ${HOST}/sdl/keymap.cpp ${POP_PLATFORM_UI} ${POP_LAUNCHER_SOURCES}
+    SOURCES ${HOST}/input_script.cpp ${HOST}/input_script_host.cpp ${HOST}/script.cpp
+            ${HOST}/sdl/main.cpp ${HOST}/sdl/keymap.cpp ${POP_PLATFORM_UI} ${POP_LAUNCHER_SOURCES}
             ${HOST}/controls/controls_host.cpp ${HOST}/controls/gamepad_sdl.cpp
             ${HOST}/controls/vpad_host_api.cpp
             ${HOST}/game_path.cpp ${HOST}/present.cpp
@@ -340,6 +349,8 @@ endif()
 if(NOT IOS AND NOT ANDROID)
 pop_host(headless_tests
   SOURCES ${HOST}/tests/headless_tests.cpp ${POP_ROOT}/runtime/tests/stub_recomp_call.cpp
+          ${HOST}/input.cpp ${HOST}/input_gate.cpp ${HOST}/compositor.cpp ${HOST}/script.cpp
+          ${HOST}/input_script.cpp ${HOST}/input_script_host.cpp
           ${HOST}/page_overlay.cpp ${POP_AUDIO_SOURCES}
   LIBS recomp_platform recomp_runtime recomp_dx host_common
   FRAMEWORKS ${FW_FOUNDATION})

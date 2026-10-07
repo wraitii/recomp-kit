@@ -24,6 +24,7 @@
 #include "../audio.h"
 #include "../audio_capture.h"
 #include "../boot.h"
+#include "../input_script.h"
 #include "../../runtime/display_seam.h"
 #include "../d3d_render.h"
 #include "../game_path.h"
@@ -1549,6 +1550,7 @@ void pump() {
     service(0.0);
     after_events();
     host_gate_pointer_tick();
+    host_input_script_tick(host_present_count());
 
     // A bounded run for automated verification: the same MAX_FRAMES /
     // MAX_SECONDS the headless host honours. Unset, this is two comparisons
@@ -2037,6 +2039,8 @@ int main(int argc, char **argv) {
     options.close_unwind_grace = 15.0;
     options.close_watchdog_grace = 30.0;
 
+    if (!host_input_script_load())
+        return 2;
     if (!boot_load(options)) {
         host_present_stop();
         fprintf(stderr, RECOMP_APP_NAME ": %s\n", loader_error());
