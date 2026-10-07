@@ -245,6 +245,10 @@ impl Device {
         }
         if rt.generation != generation {
             let surface = rt.surface.clone();
+            // A CPU rewrite must follow queued draws sampling the old content.
+            // Rebinding unchanged GPU content leaves their snapshots intact
+            // and can stay in the same batch.
+            self.flush_draws();
             self.upload_target(&surface, format, data)?;
             self.targets.textures.get_mut(&key).unwrap().generation = generation;
             if self.targets.current == Some(key)

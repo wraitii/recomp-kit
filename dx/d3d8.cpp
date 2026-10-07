@@ -181,6 +181,8 @@ std::unordered_set<ComObj *> live_devices;
 std::unordered_set<ComObj *> live_resources;
 
 uint8_t *storage_data(ComObj *o) {
+    if (o->d3d8_guest_backing)
+        return gm_ptr(o->d3d8_guest_backing);
 #ifdef RECOMP_D3D8_RESOURCES
     return d3d8_storage_data(static_cast<D3d8Storage *>(o->d3d8_storage));
 #else
@@ -207,6 +209,12 @@ bool storage_alloc(ComObj *o, uint32_t bytes) {
     return true;
 }
 void storage_destroy(ComObj *o) {
+    if (o->d3d8_guest_backing) {
+        heap_free(o->d3d8_guest_backing);
+        o->d3d8_guest_backing = 0;
+        o->pixels = 0;
+        o->lock_count = 0;
+    }
 #ifdef RECOMP_D3D8_RESOURCES
     d3d8_storage_destroy(static_cast<D3d8Storage *>(o->d3d8_storage));
     o->d3d8_storage = nullptr;
@@ -1776,11 +1784,16 @@ void Dev_UpdateTexture(X86 *c) {
     }
     com_ret(c, D8_OK);
 }
-// LockRect hands the guest a heap copy; UnlockRect copies it back and frees
-// it. The guest pointer is never stored in a host field beyond the lock.
+// Texture/surface locks stage a guest heap copy. Vertex/index buffers instead
+// alias lifetime-owned guest backing; no host pointer enters a guest field.
 static uint32_t d8_stage_lock(ComObj *o) {
     if (!o || !o->pixels_bytes)
         return 0;
+    if (o->d3d8_guest_backing) {
+        ++o->lock_count;
+        o->pixels = o->d3d8_guest_backing;
+        return o->pixels;
+    }
     if (o->lock_count == 0)
         sync_rendered_level(o);
     if (o->lock_count++ == 0) {
@@ -1797,8 +1810,10 @@ static void d8_stage_unlock(ComObj *o) {
     if (!o || o->lock_count <= 0)
         return;
     if (--o->lock_count == 0 && o->pixels) {
-        memcpy(storage_data(o), gm_ptr(o->pixels), o->pixels_bytes);
-        heap_free(o->pixels);
+        if (!o->d3d8_guest_backing) {
+            memcpy(storage_data(o), gm_ptr(o->pixels), o->pixels_bytes);
+            heap_free(o->pixels);
+        }
         o->pixels = 0;
         // The level's bytes now differ from any resident GPU copy. A nested
         // lock (count > 1) writes through the same staged block and is still
@@ -2116,18 +2131,19 @@ void surface_destroy(ComObj *surface) {
 }
 
 // ---------------------------------------------------------------------------
-// IDirect3DVertexBuffer8 / IDirect3DIndexBuffer8. Storage is real host memory
-// (Rust storage when configured); Lock stages it into the guest heap and
-// Unlock copies it back, so the
-// bytes the guest writes survive for the draw path to consume. A buffer is
-// bound weakly by the device; the guest's reference is the only owner.
+// IDirect3DVertexBuffer8 / IDirect3DIndexBuffer8. Lifetime-owned guest backing
+// serves locks, draws and ProcessVertices directly, avoiding whole-buffer
+// staging copies. The renderer snapshots consumed bytes when queuing a draw;
+// later locks cannot mutate an already queued draw. A buffer is bound weakly.
 // ---------------------------------------------------------------------------
 bool d8_buffer_alloc(ComObj *o, uint32_t bytes) {
     if (!bytes)
         return false;
-    if (!storage_alloc(o, bytes))
+    o->d3d8_guest_backing = heap_alloc(bytes, true, 16);
+    if (!o->d3d8_guest_backing)
         return false;
-    o->pixels = 0;
+    o->pixels_bytes = bytes;
+    live_resources.insert(o);
     return true;
 }
 
@@ -2162,8 +2178,8 @@ void Buffer_GetDevice(X86 *c) {
 }
 
 // (this, OffsetToLock, SizeToLock, ppbData, Flags). A zero SizeToLock means
-// "to the end of the buffer", as in D3D8. The whole blob is staged around the
-// lock, so the pointer the guest receives is the staged block plus the offset.
+// "to the end of the buffer", as in D3D8. The pointer is into lifetime-owned
+// guest backing at the requested offset.
 void Buffer_Lock(X86 *c) {
     ComObj *o = d8_buffer(c);
     uint32_t offset = arg(c, 1), out = arg(c, 3);
@@ -2178,7 +2194,8 @@ void Buffer_Lock(X86 *c) {
     // written (count) stay inside it; the original D3D8 accepts this. Rejecting
     // it stalls the vertex buffer and the next draw reads stale (zero) vertices,
     // which is what flickered the UI. SizeToLock (argument 2) is not used beyond
-    // validation - the whole blob is staged - so only the offset must be in range.
+    // validation - the backing covers the whole buffer - so only the offset
+    // must be in range.
     if (offset > o->pixels_bytes) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
@@ -2250,9 +2267,6 @@ void Buffer_GetDesc(X86 *c) {
 }
 
 void buffer_destroy(ComObj *o) {
-    if (o->pixels)
-        heap_free(o->pixels);
-    o->pixels = 0;
     storage_destroy(o);
     // The owning device binds buffers weakly; drop any binding that points here
     // so a later draw does not resolve a dead object id.
@@ -2770,8 +2784,8 @@ void Dev_GetPixelShaderFunction(X86 *c) {
     d8_get_shader(c, true, false);
 }
 
-// The bytes to draw from right now: the guest heap while the buffer is locked,
-// otherwise the host copy the last Unlock wrote back.
+// Buffers retain guest backing for their whole lifetime. Texture levels use
+// their staging block while locked and host storage otherwise.
 const uint8_t *d8_buffer_bytes(ComObj *o) {
     if (!o || !o->pixels_bytes)
         return nullptr;
@@ -3226,7 +3240,16 @@ void d3d8_reset() {
 #endif
     live_devices.clear();
     // Guest allocations were discarded by mem_init; release only host storage.
-    while (!live_resources.empty())
-        storage_destroy(*live_resources.begin());
+    while (!live_resources.empty()) {
+        ComObj *o = *live_resources.begin();
+        // mem_init already discarded guest backing; do not free an address
+        // that may now belong to the new generation's heap.
+        if (o->d3d8_guest_backing) {
+            o->pixels = 0;
+            o->lock_count = 0;
+            o->d3d8_guest_backing = 0;
+        }
+        storage_destroy(o);
+    }
     adapter_cache() = {};
 }

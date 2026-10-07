@@ -629,13 +629,20 @@ static void test_buffers() {
               rd32(sc(48)) == 96 && rd32(sc(52)) == 0x142,
           "D3DVERTEXBUFFER_DESC fields");
 
-    // Lock writes into guest heap; Unlock copies back. Locking to the end with
-    // size 0 and a sub-range both return the staged block plus the offset.
+    // Locks share lifetime-owned guest backing, including nested subranges.
     check(call_method(vb, 11, {0, 0, sc(8), 0}) == 0, "vertex buffer Lock succeeds");
     uint32_t base = rd32(sc(8));
     check(base != 0 && heap_size(base) != 0xffffffff, "Lock returns live guest storage");
     wr32(base, 0x11223344);
+    check(call_method(vb, 11, {12, 4, sc(12), 0}) == 0 && rd32(sc(12)) == base + 12,
+          "nested buffer lock aliases the same guest backing");
+    wr32(rd32(sc(12)), 0x55667788);
+    check(call_method(vb, 12, {}) == 0 && v->lock_count == 1,
+          "nested unlock retains the outer lock");
     check(call_method(vb, 12, {}) == 0, "vertex buffer Unlock succeeds");
+    check(v->d3d8_guest_backing == base && heap_size(base) != 0xffffffff &&
+              rd32(base + 12) == 0x55667788 && v->pixels == 0 && v->lock_count == 0,
+          "final unlock retains backing and both lock writes without staging");
     check(call_method(vb, 11, {0, 0, sc(8), 0}) == 0 && rd32(rd32(sc(8))) == 0x11223344,
           "unlocked vertex bytes survive to the next lock");
     call_method(vb, 12, {});
@@ -685,6 +692,7 @@ static void test_buffers() {
     check(call_method(device, 85, {ib, 3}) == 0, "SetIndices stores the index buffer");
     check(dev->d3d8_indices == i->id && dev->d3d8_base_vertex == 3, "base vertex is stored");
     check(call_method(vb, 2) == 0, "release the vertex buffer destroys it");
+    check(heap_size(base) == 0xffffffff, "release frees unlocked lifetime-owned backing");
     check(dev->d3d8_stream_vb == 0, "destroying the vertex buffer clears the stream binding");
     check(call_method(ib, 2) == 0, "release the index buffer destroys it");
     check(dev->d3d8_indices == 0, "destroying the index buffer clears the indices binding");
@@ -1117,7 +1125,7 @@ int main(int argc, char **argv) {
     ComObj *reset_device = make_test_device(4, 4, 22);
     uint32_t reset_view = com_view(reset_device, IF_D3D8DEVICE);
     check(call_method(reset_view, 23, {32, 0, 0x42, 0, sc(0)}) == 0,
-          "create live Rust-backed buffer for generation reset");
+          "create live guest-backed buffer for generation reset");
     check(call_method(rd32(sc(0)), 11, {0, 0, sc(8), 0}) == 0,
           "lock live buffer before generation reset");
     check(call_method(reset_view, 20, {4, 4, 0, 0, 21, 2, sc(16)}) == 0,

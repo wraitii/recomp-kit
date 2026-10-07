@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- D3D8 vertex/index buffers use lifetime-owned guest-arena backing instead of
+  copying entire buffers into and out of temporary lock storage. Nested locks,
+  ProcessVertices, draw snapshots, release and generation reset keep their
+  ownership contracts. Rebinding unchanged render-target texture content no
+  longer flushes queued draws; CPU content rewrites still flush before upload.
+  Guest COM lifetime tests and Metal old/new-content readback cover these paths.
+
 - D3D8 draws snapshot and upload only the requested vertex interval, excluding
   unused prefixes before StartVertex. Software lighting also packs its scratch
   output from slot zero. Nonzero-offset fixed-function and programmable draws

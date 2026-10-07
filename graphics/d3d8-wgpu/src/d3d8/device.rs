@@ -1450,7 +1450,6 @@ impl Device {
         // chain is still level 0 only (mip render targets are a separate path).
         if self.targets.textures.contains_key(&key) {
             let base = &levels[0];
-            self.flush_draws();
             self.sync_target_cpu(
                 key,
                 base.generation,
@@ -2911,6 +2910,74 @@ impl Device {
 mod tests {
     use super::blend_factor;
     use crate::d3d8::enums::D3DBLEND;
+
+    #[test]
+    fn unchanged_render_texture_bind_keeps_batch_and_rewrite_orders_old_draws() {
+        use super::{Device, TextureLevelUpload};
+        use crate::{backend::GpuContext, d3d8::resource::VertexBuffer};
+        let gpu = pollster::block_on(GpuContext::new_headless()).expect("Metal adapter");
+        let mut device = Device::new(gpu, 64, 32, 21, 0).unwrap();
+        device.state.set_render_state(7, 0).unwrap();
+        device.state.set_render_state(137, 0).unwrap();
+        device.state.set_render_state(22, 1).unwrap();
+        // A8R8G8B8 CPU bytes are BGRA; texture begins red.
+        device
+            .set_render_target(901, 0, 1, 21, 1, 1, &[0, 0, 255, 255], false, true)
+            .unwrap();
+        device
+            .set_render_target(0, 0, 0, 21, 0, 0, &[], false, true)
+            .unwrap();
+        let upload = |generation, force_upload, data| TextureLevelUpload {
+            level: 0,
+            generation,
+            force_upload,
+            width: 1,
+            height: 1,
+            data,
+        };
+        device
+            .set_texture(0, 901, 21, &[upload(1, false, &[0, 0, 255, 255])])
+            .unwrap();
+        let mut bytes = Vec::new();
+        for pos in [[-1.0f32, -1.0, 0.5], [3.0, -1.0, 0.5], [-1.0, 3.0, 0.5]] {
+            for f in pos {
+                bytes.extend(f.to_le_bytes());
+            }
+            bytes.extend(u32::MAX.to_le_bytes());
+            bytes.extend([0; 8]);
+        }
+        let vb = VertexBuffer::borrowed(&bytes, 24).unwrap();
+        device.begin_scene().unwrap();
+        device.state.viewport.width = 32;
+        device.draw_primitive(4, 0x142, &vb, 0, 1).unwrap();
+        device
+            .set_texture(0, 901, 21, &[upload(1, false, &[0, 0, 255, 255])])
+            .unwrap();
+        assert_eq!(device.batch.borrow().draws.len(), 1);
+        assert!(
+            device
+                .set_texture(0, 901, 21, &[upload(1, true, &[0, 0, 255, 255])])
+                .is_err()
+        );
+        assert_eq!(device.batch.borrow().draws.len(), 1);
+        // A new CPU generation must flush the red draw before uploading green.
+        device
+            .set_texture(0, 901, 21, &[upload(2, false, &[0, 255, 0, 255])])
+            .unwrap();
+        assert!(device.batch.borrow().draws.is_empty());
+        device.state.viewport.x = 32;
+        device.draw_primitive(4, 0x142, &vb, 0, 1).unwrap();
+        device.end_scene().unwrap();
+        let pixels = device.read_pixels().unwrap();
+        assert_eq!(
+            &pixels[(16 * 64 + 16) * 4..(16 * 64 + 16) * 4 + 4],
+            &[255, 0, 0, 255]
+        );
+        assert_eq!(
+            &pixels[(16 * 64 + 48) * 4..(16 * 64 + 48) * 4 + 4],
+            &[0, 255, 0, 255]
+        );
+    }
 
     #[test]
     fn queued_draws_exclude_unused_vertex_prefixes() {

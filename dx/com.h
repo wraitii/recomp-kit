@@ -532,8 +532,9 @@ struct ComObj {
     std::shared_ptr<D3d8DeviceState> d3d8_constants;
     // --- K_D3D8/wgpu. The Rust host device is a
     // host-side pointer kept here, never in a guest field.
-    void *d3d8_storage = nullptr; // opaque Rust CPU storage; never a guest address
-    void *d3d8_device = nullptr;  // D3d8Device* from the Rust ABI
+    uint32_t d3d8_guest_backing = 0; // lifetime-owned vertex/index bytes in guest arena
+    void *d3d8_storage = nullptr;    // opaque Rust CPU storage; never a guest address
+    void *d3d8_device = nullptr;     // D3d8Device* from the Rust ABI
     uint32_t d3d8_width = 0, d3d8_height = 0, d3d8_format = 0;
     uint32_t d3d8_factory = 0; // K_D3D8DEVICE: its IDirect3D8 object id
     uint32_t d3d8_owner = 0;   // K_D3D8SURFACE/K_D3D8TEXTURE: retained device object id
