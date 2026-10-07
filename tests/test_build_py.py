@@ -283,6 +283,17 @@ def test_decoded_dataflow_build_modes():
         build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-decoded-dataflow'], system='Darwin')
 
 
+def test_corpus_asan_is_a_correctness_build_of_the_function_corpus():
+    import pytest
+    args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-asan',
+                                   '--corpus-trial-ms', '0'], system='Darwin')
+    assert args.corpus_asan
+    with pytest.raises(SystemExit):
+        build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-asan'], system='Darwin')
+    with pytest.raises(SystemExit):
+        build_py.parse_args(['--corpus-asan', '--corpus-trial-ms', '0'], system='Darwin')
+
+
 def test_retired_llvm_experiment_options_are_rejected():
     import pytest
     for option in (['--corpus-llvm', 'm.json'], ['--corpus-llvm-sweep', 'm.json'],

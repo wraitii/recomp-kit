@@ -228,6 +228,10 @@
 ||||||| parent of 9a48b36 (Time-budget function corpus trials instead of fixed call counts)
 ||||||| parent of d6f8703 (Retire SSA x87 effects, values and region modes)
 ||||||| parent of 7345cd1 (Remove the LLVM corpus experiments)
+||||||| parent of 8cd6a8e (Add an AddressSanitizer option to the function corpus)
+- Add `--corpus-asan` to the function corpus: an AddressSanitizer build for
+  correctness runs (it requires `--corpus-trial-ms 0`; code sizes are not comparable).
+
 - Remove the LLVM corpus experiments: `--corpus-llvm`, `--corpus-llvm-sweep`,
   `--x87-llvm-experiment`, `--x87-llvm-function`, `translate.py --llvm-compare` and
   `--llvm-sweep`, with their backends under `tools/recomp/corpus/llvm*` and

@@ -495,6 +495,8 @@ def markdown(report):
     lines = ['# Function corpus report', '',
              f"Host: {report['host']}. Compiler: {report['compiler']}.", '',
              f"Contract: {report['contract']}.",
+             *(["AddressSanitizer build: code sizes include instrumentation and are not comparable."]
+               if report.get('asan') else []),
              f"Decoded x87 dataflow: {'enabled' if report.get('x87_dataflow') else 'disabled'}.",
              f"Guest-stack forwarding: {'enabled' if report.get('x87_stack_forwarding') else 'disabled'}.",
              f"Decoded integer dataflow: {'enabled' if report.get('decoded_dataflow') else 'disabled'}.", '',
@@ -589,7 +591,7 @@ def markdown(report):
 
 def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0, trials=9,
                x87_dataflow=False, x87_stack_forwarding=False, decoded_dataflow=False,
-               ir_ssa=False, ir_ssa_x87=None, ir_ssa_state=None, ir_ssa_ceiling=None):
+               ir_ssa=False, ir_ssa_x87=None, ir_ssa_state=None, ir_ssa_ceiling=None, asan=False):
     """Decode the selected instructions, build isolated variants, validate, report.
 
     ``ir_ssa_ceiling`` (e.g. ``"A,B"``/``"all"``) adds the UNPROVEN, corpus-only
@@ -598,6 +600,8 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
     local-state SSA, which also supply its per-function fallback body.
     """
     from ir.ceiling import parse_relaxations, label as ceiling_label
+    if asan and trial_ms:
+        raise ValueError("an AddressSanitizer corpus build is for correctness only; use a zero trial budget")
     if (ir_ssa_x87 is not None or ir_ssa_state is not None) and not ir_ssa:
         raise ValueError("IR SSA x87 and state policies require IR SSA")
     # Plain --ir-ssa is the production policy: scalar x87, local CPU state.
@@ -877,7 +881,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
     started = time.monotonic()
     subprocess.run([cmake, '-S', str(HERE), '-B', str(out), '-DCMAKE_BUILD_TYPE=Release',
                     '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON', f'-DKIT_RUNTIME={KIT / "runtime"}',
-                    f'-DCORPUS_FIXTURES={fixture_dir}'], check=True)
+                    f'-DCORPUS_FIXTURES={fixture_dir}', f'-DCORPUS_ASAN={"ON" if asan else "OFF"}'], check=True)
     subprocess.run([cmake, '--build', str(out), '--parallel', str(jobs)], check=True)
     build_seconds = time.monotonic() - started
     compiler_rows = json.loads((out / 'compile_commands.json').read_text())
@@ -961,7 +965,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
               'runtime_sha256': hashlib.sha256((KIT / 'runtime/x86.h').read_bytes()).hexdigest(),
               'runner_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               'generation_seconds': generation_seconds, 'build_seconds': build_seconds,
-              'checks_per_function': checks, 'trial_ms': trial_ms, 'trials': trials,
+              'checks_per_function': checks, 'trial_ms': trial_ms, 'trials': trials, 'asan': asan,
               'row_modes': row_modes, 'row_has_native': row_has_native,
               'benchmark': spec.get('benchmark', {}),
               'native_executable_sha256': hashlib.sha256(executable.read_bytes()).hexdigest(),

@@ -21,6 +21,9 @@ of the row, so ratios within a row stay paired. The calibrated count is printed
 and `.md`. Rows are calibrated just before their own trials, so a thermally
 throttled machine affects each row's calibration instead of skewing late rows.
 
+`--corpus-asan` builds the corpus with AddressSanitizer for correctness runs; it
+requires `--corpus-trial-ms 0`, and the report notes that code sizes are instrumented.
+
 Outputs stay under the game's ignored `build/function-corpus/`. A manifest uses
 `contract: "mapped-native-corpus-v1"` or `"mapped-comparison-corpus-v2"`, a
 fixture `header`, fixture `sources` and `functions` rows containing `address`,

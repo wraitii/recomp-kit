@@ -331,6 +331,16 @@ def test_ir_ssa_x87_mode_is_validated_before_any_game_work(tmp_path):
                    ir_ssa=True, ir_ssa_state='bogus')
 
 
+def test_asan_corpus_build_refuses_timing(tmp_path):
+    import json
+    from corpus.run import run_corpus
+    p = tmp_path / 'manifest.json'
+    p.write_text(json.dumps({'contract': 'mapped-native-corpus-v1', 'functions': []}))
+    (tmp_path / 'build').mkdir()
+    with pytest.raises(ValueError, match='AddressSanitizer corpus build is for correctness only'):
+        run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1, trial_ms=10.0, asan=True)
+
+
 def test_ceiling_mode_precedes_native_and_default_order_is_unchanged():
     assert corpus_modes() == MODES == ('eager', 'cpu', 'x87', 'combined', 'native')
     assert corpus_modes(True) == ('eager', 'cpu', 'x87', 'combined', 'ceiling', 'native')
