@@ -206,8 +206,6 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         if _ceiling & X87_RELAXATIONS:
             from .x87_ceiling import X87Ceiling  # UNPROVEN ceiling C/D/E lowering.
             scalar = X87Ceiling(_ceiling)
-        elif "A" in _ceiling:
-            scalar.store_flush = False  # UNPROVEN ceiling A: no x87 store publication.
 
     def flush_x87():
         return scalar.flush() if scalar is not None else []
@@ -468,8 +466,10 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 lines.extend(publish(b.snapshots[v.id], v))
                 lines.append("rep_movsd(c);" if v.data.get("rep") else "movsd(c);")
             elif v.opc in ("LOAD", "STORE", "DIV32", "IDIV32"):
-                ceiling_a = "A" in _ceiling and v.opc in ("LOAD", "STORE")
-                if not ceiling_a and (scalar is None or scalar.observe_loads or v.opc != "LOAD"):
+                # Guest accesses do not observe x87 state (see x87_scalar.py);
+                # only strict mode publishes before them. The division seam
+                # always sees the complete CPU.
+                if scalar is not None and (scalar.observe_loads or v.opc not in ("LOAD", "STORE")):
                     lines.extend(flush_x87())
                 lines.extend(publish(b.snapshots[v.id], v))
                 if v.opc in ("DIV32", "IDIV32"):

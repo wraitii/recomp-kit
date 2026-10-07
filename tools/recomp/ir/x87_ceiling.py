@@ -32,7 +32,6 @@ class X87Ceiling(X87Scalar):
         self.lite = "C" in relax
         self.nosticky = "D" in relax
         self.f32 = "E" in relax
-        self.store_flush = "A" not in relax
         self.vtype = "float" if self.f32 else "double"
 
     def _parts(self):
@@ -106,8 +105,6 @@ class X87Ceiling(X87Scalar):
         bits = memory[0] * 8 if memory else 0
         lines = []
         self._activate(lines)
-        if address is not None and self.store_flush and m in ("FST", "FSTP"):
-            lines.extend(self.flush())
 
         def fail():
             raise SSAError("ceiling x87: unsupported %s %r" % (m, operands))

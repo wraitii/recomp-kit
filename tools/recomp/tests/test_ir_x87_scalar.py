@@ -29,9 +29,9 @@ def test_scalar_load_boundary_retains_a_strict_comparison():
     f = function("d9e8", "d906", "dec1", "8903", "c3")
     fast = emit(f, "fast").split("\n#else\n", 1)[1]
     strict = emit(f, "strict", x87_scalar_strict=True)
-    # After FLD1, strict publishes before FLD [esi]; fast publishes at the
-    # integer store, still before its observer runs.
-    assert fast.index("rdf32(") < fast.index("c->st[") < fast.index("wr32(")
+    # After FLD1, strict publishes before FLD [esi]. Guest accesses do not
+    # observe x87 state, so fast defers past the integer store to RET.
+    assert fast.index("rdf32(") < fast.index("wr32(") < fast.index("c->st[")
     assert strict.index("c->st[") < strict.index("rdf32(")
 
 

@@ -127,9 +127,12 @@ Scalar x87 (`x87_scalar.py`) is the optimized lowering; the raw path keeps order
 helpers. It replaces physical push/pop/copy updates with scalar values indexed
 relative to the entry TOP, tracking all eight physical residues, tags and
 exact-integer shadows. CW/SW helpers use a private non-escaping environment.
-Stores, CFG edges, division seams, calls and returns materialize required FPU
-state; opaque recipes materialize and invalidate the tracker. Values survive a
-read-only access but not joins or opaque calls. Under PC=00, operations on
+CFG edges, division seams, calls and returns materialize required FPU state;
+opaque recipes materialize and invalidate the tracker. Guest loads and stores
+do not observe x87 state in the kit runtime (the watchpoint and dirty tracking
+read only address and value), so performance mode publishes none there, as the
+decoded `x87_locals` pass already does; strict mode publishes before every
+access. Values survive accesses but not joins or opaque calls. Under PC=00, operations on
 proven-binary32 operands use native float add/sub/mul plus the runtime's
 NaN/status normalization when a linear run has at least two arithmetic effects;
 division and unproven operands use the double helpers.
@@ -144,15 +147,15 @@ Policies and where they apply:
 
 | Setting | Values | Meaning |
 | --- | --- | --- |
-| `ir_ssa_x87` | `scalar` (default), `scalar-strict` | strict publishes x87 state before loads and uses general arithmetic recipes |
+| `ir_ssa_x87` | `scalar` (default), `scalar-strict` | strict publishes x87 state before loads and stores and uses general arithmetic recipes |
 | `ir_ssa_state` | `locals` (default), `strict` | strict keeps every pre-access GPR/flag snapshot |
 
 `RECOMP_NULL_CHECKS=1` builds always compile the strict forms of both: `emit`
 emits a strict/fast `#if` pair whenever either policy is relaxed. `emit()`
 defaults to the production policy (`x87_scalar_strict=False, local_state=True`).
 
-DIVERGENCE(original): [ssa-x87-scalar] ordinary interior load faults may expose
-the preceding published x87 state. [ssa-state-locals] likewise defers GPR/flag
+DIVERGENCE(original): [ssa-x87-scalar] interior access faults and store watch
+callbacks may expose the preceding published x87 state. [ssa-state-locals] likewise defers GPR/flag
 state except EIP/ESP/EBP. [ssa-x87-binary32] uses the documented binary32
 exponent-range policy. Accesses and faults are never removed. Interior
 fault/SEH equivalence remains unverified.
@@ -237,7 +240,7 @@ spells it `--ir-ssa-ceiling`).
 
 | Letter | Relaxation |
 | --- | --- |
-| A | No store snapshots: LOAD/STORE/x87-memory effects publish no state; only calls, returns and division/string seams do |
+| A | No store snapshots: LOAD/STORE effects publish no GPR/flag state (production scalar x87 already publishes none there); only calls, returns and division/string seams do |
 | B | Arithmetic flags are dead across entry, call and return (DF stays exact) |
 | C | MSVC x87 call convention: values only, no tags/residue/exact shadows, popped slots never published |
 | D | No sticky exception bits; NaN canonicalised only at stores |

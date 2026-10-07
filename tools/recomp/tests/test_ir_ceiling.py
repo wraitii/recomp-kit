@@ -95,12 +95,14 @@ def test_a_removes_store_snapshots_but_keeps_return_state():
     assert "c->r[0] = " in tail and "recomp_return(c);" in tail
 
 
-def test_a_skips_x87_flush_before_stores():
-    strict = base(X87_ADD)
-    relaxed = ceil(X87_ADD, "A")
+def test_x87_flush_before_stores_is_strict_only():
+    # Production scalar x87 already defers past stores, so A relaxes only
+    # GPR/flag snapshots; strict x87 keeps publication before the store.
+    strict = base(X87_ADD, x87_scalar_strict=True)
+    for text in (base(X87_ADD), ceil(X87_ADD, "A")):
+        assert text.index("wrf32(") < text.index("c->fpu_top =")
+        assert "c->st[" not in text.split("wrf32(")[0]
     assert strict.index("c->st[") < strict.index("wrf32(")
-    assert relaxed.index("wrf32(") < relaxed.index("c->fpu_top =")
-    assert "c->st[" not in relaxed.split("wrf32(")[0]
 
 
 def test_a_plan_leaves_known_facts_for_unpublished_effects():
@@ -145,7 +147,7 @@ def test_b_flags_are_neither_published_nor_reloaded_around_calls():
 def test_c_drops_tags_integer_shadows_and_residue():
     strict = base(X87_ADD)
     lite = ceil(X87_ADD, "C")
-    for name in ("st_bits", "st_exact", "fpu_tag", "FTAG_EMPTY", "ftag_classify"):
+    for name in ("st_bits", "st_exact", "fpu_tag", "FTAG_EMPTY"):
         assert name in strict
         assert name not in lite
     assert "c->fpu_top =" in lite  # TOP still published at return

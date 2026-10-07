@@ -477,9 +477,11 @@ def run_checks(out, cmake, jobs):
         '#define FIXTURE_RESET(c) ((void)0)', '#define FIXTURE_BEFORE(mode) ((void)0)',
         '#define FIXTURE_AFTER(mode) ((void)0)',
         'void ir_observe_store(uint32_t, uint32_t, uint64_t);',
-        'void ir_observer_compare(unsigned);',
+        'void ir_observer_compare(unsigned, int);',
         '#define FIXTURE_WATCH_HIT(a, n, v) ir_observe_store(a, n, v)',
-        '#define FIXTURE_AFTER_STATE(mode, c) ir_observer_compare(mode)',
+        # Performance-mode scalar x87 (scalar and local columns) publishes no
+        # x87 state at guest stores; strict and raw keep complete snapshots.
+        '#define FIXTURE_AFTER_STATE(mode, c) ir_observer_compare(mode, (mode) == 2 || (mode) == 4)',
         'static const char *case_names[] = {'
         + ','.join('"%s"' % name
                    for name in list(CASES) + list(CALL_CASES) + list(BYTE_CALL_CASES)

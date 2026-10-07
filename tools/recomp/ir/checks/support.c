@@ -70,12 +70,34 @@ void ir_observe_store(uint32_t addr, uint32_t width, uint64_t value) {
     o->value = value;
 }
 
-void ir_observer_compare(unsigned mode) {
+/* Scalar x87 publishes no x87 state at guest stores (see x87_scalar.py), so
+ * those columns compare store snapshots with the x87 stack, tags, TOP and
+ * status cleared. CW, GPRs, flags and the store itself stay exact; the final
+ * state comparison still covers every x87 field. */
+static void clear_x87_store_state(StoreObservation *o) {
+    memset(o->cpu.st, 0, sizeof o->cpu.st);
+    memset(o->cpu.st_bits, 0, sizeof o->cpu.st_bits);
+    memset(o->cpu.st_exact, 0, sizeof o->cpu.st_exact);
+    o->cpu.fpu_top = 0;
+    o->cpu.fpu_sw = 0;
+    o->cpu.fpu_tag = 0;
+}
+
+void ir_observer_compare(unsigned mode, int x87_deferred_at_stores) {
+    static StoreObservation expected[32];
     if (!mode) {
         reference_count = observation_count;
         memcpy(reference, observations, sizeof reference);
-    } else if (observation_count != reference_count ||
-               memcmp(reference, observations, sizeof reference)) {
+        return;
+    }
+    memcpy(expected, reference, sizeof expected);
+    if (x87_deferred_at_stores) {
+        for (unsigned i = 0; i < 32; ++i) {
+            clear_x87_store_state(&expected[i]);
+            clear_x87_store_state(&observations[i]);
+        }
+    }
+    if (observation_count != reference_count || memcmp(expected, observations, sizeof expected)) {
         fprintf(stderr, "IR checks: store CPU observations differ in mode %u\n", mode);
         abort();
     }

@@ -2,17 +2,26 @@
 
 Slots are named relative to a captured entry TOP. Push/pop/copy change this
 compile-time mapping, not the physical CPU array. Values, exact-integer shadows,
-tags and popped residue are written back before accesses, edges and opaque
-effects. Only CW/SW helpers use a private nonescaping X86 context; no helper
-receives it unless its recipe accesses those two fields exclusively.
+tags and popped residue are written back before edges, division seams, calls,
+opaque effects and exits. Only CW/SW helpers use a private nonescaping X86
+context; no helper receives it unless its recipe accesses those two fields
+exclusively.
 
 This is an instruction-derived representation change, not dead-state removal,
 memory forwarding, a native call ABI or a floating-point approximation.
 
-DIVERGENCE(original): [ssa-x87-scalar] performance mode publishes at stores,
-control-flow edges, opaque effects and exits. Ordinary interior load faults may
-see the preceding published x87 state, within the agreed performance-mode
-contract. observe_loads=True keeps pre-load publication for comparison.
+Guest loads and stores do not observe x87 state in the kit runtime: the
+watchpoint and DirectDraw dirty tracking read only the address and value, and
+null-check builds, whose fault dispatch exposes the CPU, compile the strict
+form. This is the decoded `x87_locals.py` contract, which also leaves x87 state
+unpublished at arena accesses. A runtime that exposes x87 state at accesses
+must use the strict form.
+
+DIVERGENCE(original): [ssa-x87-scalar] performance mode publishes at
+control-flow edges, division seams, calls, opaque effects and exits, but not at
+loads or stores. Interior access faults and store watch callbacks may see the
+preceding published x87 state, within the agreed performance-mode contract.
+observe_loads=True (strict) keeps publication before every guest access.
 
 DIVERGENCE(original): [ssa-x87-binary32] common PC=00 arithmetic with proven
 binary32 operands uses the documented float exponent-range policy. Other
@@ -42,9 +51,6 @@ class X87Scalar:
         self.serial = 0
         self.temps = []
         self.observe_loads = observe_loads
-        # Corpus-only ceiling relaxation A (`ceiling.py`) clears this so memory
-        # stores no longer publish x87 state. Production keeps it True.
-        self.store_flush = True
         self.binary32 = True
         self.reset()
 
@@ -147,10 +153,9 @@ class X87Scalar:
         bits = memory[0] * 8 if memory else 0
         lines = []
         self._activate(lines)
-        # Strict mode keeps every pre-access snapshot. Both modes publish
-        # before stores; performance mode defers across ordinary reads.
-        if address is not None and (self.observe_loads or (self.store_flush and m in
-                ("FST", "FSTP", "FIST", "FISTP", "FNSTSW", "FNSTCW"))):
+        # Strict mode keeps every pre-access snapshot; performance mode defers
+        # across loads and stores, which do not observe x87 state.
+        if address is not None and self.observe_loads:
             lines.extend(self.flush())
 
         def read(index):
