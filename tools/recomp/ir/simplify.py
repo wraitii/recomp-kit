@@ -90,9 +90,9 @@ output width and p-code's zero result for shifts beyond the input width.
                 assert replacement.size == v.size
                 s.aliases[v.id] = replacement
                 changed = True
-    # Canonical operands include phis and memory tokens, not only emitted ops.
-    for v in s.values:
-        v.args = tuple(s.resolve(a) for a in v.args)
+    # Every non-aliased value's args were resolved by the last pass above;
+    # an aliased value's args are never read because consumers resolve first.
+    # The trailing all-values pass this replaced only repeated that work.
 
 
 def live_values(s, publications=None):
@@ -127,9 +127,16 @@ Memory tokens retain the dependency chain without authorizing load forwarding.
     return live
 
 
-def simplify(s, publications=None):
-    """Canonicalize to a fixed point, then eliminate unobserved pure values."""
-    canonicalize(s)
+def simplify(s, publications=None, *, canonical=True):
+    """Canonicalize to a fixed point, then eliminate unobserved pure values.
+
+    ``canonical=False`` skips the canonicalization pass for a caller that has
+    already run it and made no operand change since (the production emitter
+    canonicalizes before the publication plan). The pass is idempotent, so
+    the emitted body is byte-identical; this only avoids the repeated work.
+    """
+    if canonical:
+        canonicalize(s)
     live = live_values(s, publications)
     for b in s.blocks.values():
         b.ops = [v for v in b.ops if v.id in live and s.resolve(v) is v]

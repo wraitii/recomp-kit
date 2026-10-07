@@ -289,7 +289,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             # summaries prove which fields a boundary does not observe.
             publications = plan(s, fir.succ, groups, access_fields=access_fields,
                                 unpublished=unpublished)
-        live = simplify(s, publications)
+        live = simplify(s, publications, canonical=False)
     else:
         live = {v.id for v in s.values}
     if facts is not None:
@@ -448,7 +448,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     entry_shape = None
     if carry_mode:
         from .x87_carry import analyze as analyze_carry, assert_covers
-        from .x87_scalar import PART_TYPES, UNSAFE, carry_var
+        from .x87_scalar import PART_TYPES, UNSAFE, carry_var, ordered_parts
 
         def carry_factory():
             return X87Scalar(observe_loads=False, convention=x87_convention)
@@ -462,7 +462,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             if shape is None or shape is UNSAFE or not shape.active:
                 continue
             for position, slot in shape.slots:
-                for part in slot.parts:
+                for part in ordered_parts(slot.parts):
                     if part not in dict(slot.const):
                         declared.add((position, part))
         lines[scalar_declarations:scalar_declarations] = [
@@ -498,7 +498,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             exprs = {}
             for position, slot in shape.slots:
                 agreements = dict(slot.const)
-                for part in slot.parts:
+                for part in ordered_parts(slot.parts):
                     if part not in agreements:
                         exprs[(position, part)] = scalar._temp(
                             carry_var(position, part), lines, PART_TYPES[part])
@@ -534,7 +534,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 for target, shape in active:
                     for position, slot in shape.slots:
                         agreements = dict(slot.const)
-                        for part in slot.parts:
+                        for part in ordered_parts(slot.parts):
                             name = carry_var(position, part)
                             if part not in agreements and name not in assignments:
                                 assignments[name] = scalar._read(position, part, lines)

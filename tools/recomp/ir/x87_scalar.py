@@ -65,6 +65,20 @@ class Slot:
 PARTS = ("value", "bits", "exact", "tag")
 PART_TYPES = {"value": "double", "bits": "uint64_t",
               "exact": "uint8_t", "tag": "unsigned"}
+
+#: Canonical iteration order for the parts of a carried slot. The emitter used
+#: to walk ``SlotShape.parts`` (a frozenset), whose order follows the process
+#: hash seed; that made the generated temp numbering and edge assignments vary
+#: between runs. This order is exactly what the reference PYTHONHASHSEED=0 run
+#: produced, now made explicit so every process emits identical text. Any part
+#: not named here sorts after the known four.
+PART_ORDER = ("bits", "exact", "value", "tag")
+
+
+def ordered_parts(parts):
+    """Return ``parts`` in a hash-seed-independent code-generation order."""
+    known = [part for part in PART_ORDER if part in parts]
+    return known + sorted(part for part in parts if part not in PART_ORDER)
 #: Literal expressions whose agreement survives a join (the convention flush
 #: tests `slot.exact != "0"`, so `0`/`FTAG_EMPTY`/`1` must stay constants).
 CARRY_LITERALS = frozenset(("0", "1", "FTAG_EMPTY"))

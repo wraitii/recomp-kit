@@ -243,6 +243,17 @@
 ||||||| parent of 8962fdc (Add modular observable-contract analysis over shared CFGs)
 ||||||| parent of 76dedd4 (Carry scalar x87 state across internal CFG edges in SSA bodies)
 ||||||| parent of 0336a4b (Defer x87 NaN/IE checks to sinks in scalar SSA bodies)
+||||||| parent of c79eb6b (Emit production SSA bodies in a process pool with seed-independent output)
+- Emit production SSA bodies in a process pool. `production.apply` lifts in
+  the parent and emits batches on one worker per core (`RECOMP_SSA_JOBS`
+  overrides; under 64 functions stays in-process), combining results in
+  function order. Carried x87 parts now iterate in a fixed `PART_ORDER`
+  instead of `frozenset` order, so emitted text no longer depends on the
+  Python hash seed. `canonicalize` drops its redundant trailing pass and the
+  production emitter no longer canonicalizes twice. Full-game SSA stage:
+  333 s serial to 62 s on 10 workers; generated sources, per-function
+  results, census and fallback reasons are byte-identical.
+
 - Defer the per-arithmetic x87 NaN/IE check to sinks in scalar SSA bodies. A
   new `[translate] ir_ssa_x87_lazy_nan` (default `true`) leaves basic-arithmetic
   results in full precision with no NaN branch and folds
