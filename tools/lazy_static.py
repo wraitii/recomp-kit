@@ -78,7 +78,7 @@ def main(argv=None):
     sources = sorted(stage.glob("chunk_*.c")) + [stage / "table.c"]
     out = (args.out or discovered.with_suffix(
         ".dylib" if sys.platform == "darwin" else ".so")).resolve()
-    command = [clang, "-O2", "-std=c11", "-fPIC", "-shared",
+    command = [clang, "-O2", "-ffp-contract=off", "-std=c11", "-fPIC", "-shared",
                "-I", str(stage), "-I", str(ROOT / "runtime"), "-I", str(generated),
                "-DGUEST_IMAGE_BASE=" + cmake_value(macros, "RECOMP_IMAGE_BASE"),
                "-DGUEST_HEAP_BASE=" + cmake_value(macros, "RECOMP_HEAP_BASE"),

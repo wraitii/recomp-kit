@@ -244,6 +244,13 @@
 ||||||| parent of 76dedd4 (Carry scalar x87 state across internal CFG edges in SSA bodies)
 ||||||| parent of 0336a4b (Defer x87 NaN/IE checks to sinks in scalar SSA bodies)
 ||||||| parent of c79eb6b (Emit production SSA bodies in a process pool with seed-independent output)
+||||||| parent of 66a8209 (Compile with FP contraction off everywhere)
+- Compile with `-ffp-contract=off` everywhere (CMake, the translation test
+  harnesses, `lazy_static.py`, core plugins), as the corpus and IR checks
+  already did. Clang fused `A - part * scale` in `fprem_common`'s partial
+  reduction, changing its result per target; a harness check pins the
+  unfused value.
+
 - Emit production SSA bodies in a process pool. `production.apply` lifts in
   the parent and emits batches on one worker per core (`RECOMP_SSA_JOBS`
   overrides; under 64 functions stays in-process), combining results in

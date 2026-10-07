@@ -106,6 +106,18 @@ add_compile_definitions(GUEST_HEAP_BASE=${RECOMP_HEAP_BASE})
 add_compile_definitions(GUEST_SIZE=${RECOMP_GUEST_SIZE})
 add_compile_definitions(RECOMP_STORE_HOOKS=${RECOMP_STORE_HOOKS})
 
+# Never fuse a*b+c into an FMA: the x87 helpers and native replacements must
+# round each operation as written, identically on every target. Clang contracts
+# within an expression by default and GCC across statements; cl does not
+# contract under its default /fp:precise.
+if(CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+  if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/clang:-ffp-contract=off>")
+  endif()
+else()
+  add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>:-ffp-contract=off>")
+endif()
+
 if(IOS)
   set(RECOMP_IOS_TEAM "$ENV{RECOMP_IOS_TEAM}" CACHE STRING "Apple development team for automatic signing")
   if(RECOMP_IOS_TEAM STREQUAL "" AND NOT POP_TRANSLATE STREQUAL "STUB")

@@ -466,6 +466,10 @@ uint32_t harness_header_selftest(void) {
             CHECK(part == fmod(ldexp(1.0, 70), 3.0));
         }
     }
+    /* The partial step rounds part * scale before subtracting; a fused
+     * multiply-subtract (contraction left on) gives 0x1.7c99934cb42cep+53. */
+    c.fpu_sw = 0;
+    CHECK(fprem_common(&c, 0x1.2265b1f236eb0p+86, 0x1.414c3423c5fd7p+2, 0) == 0x1.7c99ap+53);
     /* FPREM1 rounds the quotient to nearest, so its remainder can go negative */
     c.fpu_sw = 0;
     /* IEEE: 37/5 rounds to 7, so the remainder is 37 - 35 = 2. */
