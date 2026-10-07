@@ -498,8 +498,8 @@ def markdown(report):
              f"Decoded x87 dataflow: {'enabled' if report.get('x87_dataflow') else 'disabled'}.",
              f"Guest-stack forwarding: {'enabled' if report.get('x87_stack_forwarding') else 'disabled'}.",
              f"Decoded integer dataflow: {'enabled' if report.get('decoded_dataflow') else 'disabled'}.", '',
-             f"IR SSA in combined mode: {sum(r.get('ir_ssa', {}).get('emitted', False) for r in report['functions'])} functions emitted; x87 comparison mode: {report.get('ir_ssa_x87', 'effects')}; per-function fallbacks are in JSON.", '',
-             f"IR SSA CPU publication policy: {report.get('ir_ssa_state', 'strict')}.", '',
+             f"IR SSA in combined mode: {sum(r.get('ir_ssa', {}).get('emitted', False) for r in report['functions'])} functions emitted; x87 comparison mode: {report.get('ir_ssa_x87', 'scalar')}; per-function fallbacks are in JSON.", '',
+             f"IR SSA CPU publication policy: {report.get('ir_ssa_state', 'locals')}.", '',
              'Native is reviewed C plus its ABI adapter; kernel text is also shown separately.',
              'Translation-only rows have no native reference and omit adapter/kernel results entirely.',
              'Translated/native-adapter times include entry reset and indirect-call overhead.',
@@ -589,7 +589,7 @@ def markdown(report):
 
 def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0, trials=9,
                x87_dataflow=False, x87_stack_forwarding=False, decoded_dataflow=False,
-               ir_ssa=False, ir_ssa_x87="effects", ir_ssa_state="strict", ir_ssa_ceiling=None):
+               ir_ssa=False, ir_ssa_x87=None, ir_ssa_state=None, ir_ssa_ceiling=None):
     """Decode the selected instructions, build isolated variants, validate, report.
 
     ``ir_ssa_ceiling`` (e.g. ``"A,B"``/``"all"``) adds the UNPROVEN, corpus-only
@@ -598,18 +598,18 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
     local-state SSA, which also supply its per-function fallback body.
     """
     from ir.ceiling import parse_relaxations, label as ceiling_label
+    if (ir_ssa_x87 is not None or ir_ssa_state is not None) and not ir_ssa:
+        raise ValueError("IR SSA x87 and state policies require IR SSA")
+    # Plain --ir-ssa is the production policy: scalar x87, local CPU state.
+    ir_ssa_x87, ir_ssa_state = ir_ssa_x87 or "scalar", ir_ssa_state or "locals"
     ceiling = parse_relaxations(ir_ssa_ceiling)
     if ceiling and not (ir_ssa and ir_ssa_x87 == "scalar" and ir_ssa_state == "locals"):
         raise ValueError("SSA ceiling requires --ir-ssa with scalar x87 and locals state")
     modes = corpus_modes(bool(ceiling))
     if ir_ssa_state not in ("strict", "locals"):
         raise ValueError("IR SSA state policy must be strict or locals")
-    if ir_ssa_state != "strict" and not ir_ssa:
-        raise ValueError("IR SSA state policy requires IR SSA")
-    if ir_ssa_x87 not in ("effects", "values", "region", "scalar", "scalar-strict"):
-        raise ValueError("IR SSA x87 mode must be effects, values, region, scalar or scalar-strict")
-    if ir_ssa_x87 != "effects" and not ir_ssa:
-        raise ValueError("IR SSA x87 comparison mode requires IR SSA")
+    if ir_ssa_x87 not in ("scalar", "scalar-strict"):
+        raise ValueError("IR SSA x87 mode must be scalar or scalar-strict")
     if decoded_dataflow and not x87_dataflow:
         raise ValueError('decoded dataflow requires decoded x87 dataflow')
     if ir_ssa and (x87_dataflow or x87_stack_forwarding or decoded_dataflow):
@@ -742,9 +742,6 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
                 def ssa_emit(relax):
                     return emit(fir, f'{mode}_fn_{addr:08x}', call_symbols=call_symbols,
                                 indirect_call_symbol=indirect_symbol,
-                                x87_values=(ir_ssa_x87 == 'values'),
-                                x87_region=(ir_ssa_x87 == 'region'),
-                                x87_scalar=ir_ssa_x87 in ('scalar', 'scalar-strict'),
                                 x87_scalar_strict=(ir_ssa_x87 == 'scalar-strict'),
                                 local_state=(ir_ssa_state == 'locals'),
                                 resumable_stacks=getattr(T, 'RESUMABLE_STACKS', False),

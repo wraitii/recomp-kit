@@ -133,7 +133,7 @@ registers through entry values and phis; byte lanes remain the aliasing interfac
 for partial writes and snapshots. Trivial phis are simplified. LOAD and STORE
 thread an explicit memory token; no inter-instruction forwarding or store removal
 occurs. Corrected x87 effects thread that same token. FPU state remains resident
-in the CPU object at observations; optional straight-line caches are described
+in the CPU object at observations; the scalar x87 tracker is described
 below. Raw FLOAT operations, unbound calls, user operations, unbound indirect
 transfers and intra-instruction control flow remain rejected. Bound direct calls
 and, under the emitter's explicit `indirect_call_symbol` opt-in, indirect calls
@@ -262,7 +262,7 @@ binds `indirect_call_symbol` to `recomp_call`, which validates the 32-bit target
 and reloads all tracked state; without that opt-in indirect calls fail closed.
 The guest return-address store remains ordered and observable. Callees own
 ESP cleanup and EIP restoration. All tracked register lanes and flags are
-reloaded afterward, and the x87 cache is invalidated. Resumable mode checks
+reloaded afterward, and the scalar x87 state is flushed. Resumable mode checks
 EIP before continuing. Corpus bindings do not provide production dispatch,
 hooks, SEH, imports or a summary-based call ABI. The production adapter binds
 ordinary direct calls through stable entry thunks.
@@ -275,31 +275,10 @@ is rejected pending ordered-store corrections. Raw census input is unchanged.
 The SSA builder rejects unnormalized data-position `ram`, preventing addresses
 from being silently used as loaded values.
 
-## Bounded x87 values and publication
-
-`x87_values.py` tracks three logical stack values in double locals. The `values`
-mode substitutes those locals for repeated `ST` loads while retaining all
-physical helpers. The `region` mode additionally defers arithmetic `fset`
-bookkeeping until an observation. It keeps TOP and structural push/pop/copy
-operations eager. Dirty values, zeroed exact-integer metadata and tags are
-materialized before guest accesses, opaque calls, division error seams, exits
-and control-flow boundaries. A popped dirty value is written before the pop,
-preserving physical residue. Window eviction flushes; joins and backedges reset
-only after incoming edges have flushed. Register copies and exchanges flush
-slots their helpers read. Status updates and PC/RC behavior still use the
-existing runtime helpers; there is no memory forwarding or fast math.
-
-The emitter exposes `x87_values=True` and `x87_region=True` as mutually exclusive
-comparison options; `optimize=False` disables both. The corpus CLI selects
-`--corpus-ir-ssa-x87 effects|values|region` with `--corpus-ir-ssa` and records the
-mode in its report. Native checks compare the three SSA modes with eager C,
-including dirty popped residue, ST7 wraparound, outside-window exchanges,
-integer store observations, branch joins, loops and calls. Real interior
-memory-fault/SEH equivalence remains unverified.
-
 ## Scalar x87 and local CPU state
 
-The opt-in corpus mode `--corpus-ir-ssa-x87 scalar` replaces physical x87
+The scalar x87 tracker (the default and the only optimized x87 lowering;
+`optimize=False` keeps ordered runtime helpers) replaces physical x87
 push/pop/copy updates with scalar values indexed relative to entry TOP. It tracks
 all eight physical residues, tags and exact-integer shadows, including wrapped
 copies and popped contents. CW/SW helpers use a private nonescaping environment.
@@ -316,12 +295,12 @@ Specialization requires at least two arithmetic effects in a linear run before
 an observation boundary, avoiding selector overhead for isolated operations.
 `scalar-strict` keeps pre-load publication and the general arithmetic recipes.
 
-`--corpus-ir-ssa-state locals` separately defers GPR/flag publication at ordinary
+The `locals` state policy (default) separately defers GPR/flag publication at ordinary
 integer and x87 reads, retaining EIP/ESP/EBP for diagnostics. Required store,
 division, call and return snapshots remain complete. The must-analysis does not
 claim skipped fields were published; this lets dead-value elimination remove
-intermediate flags overwritten before a real observer. `strict` remains the
-default state policy, independently of the chosen x87 mode.
+intermediate flags overwritten before a real observer. `strict` keeps every
+pre-access snapshot, independently of the chosen x87 policy.
 
 DIVERGENCE(original): [ssa-x87-scalar] ordinary interior load faults may expose
 preceding published x87 state. [ssa-state-locals] similarly defers GPR/flag state
@@ -331,8 +310,9 @@ modes; accesses and faults are not removed. `RECOMP_NULL_CHECKS=1` selects stric
 CPU and x87 publication and general arithmetic for guest exception dispatch.
 Real interior fault/SEH equivalence remains unverified.
 
-The native suite compares eager C with effects, values, region, scalar,
-scalar-strict and scalar/local-state for 151 byte-backed fixtures × 24576 inputs
+The native suite compares eager C with raw (`optimize=False`), scalar with strict
+state, scalar-strict and scalar/local-state (the production policy) for 151
+byte-backed fixtures × 24576 inputs
 in both ordinary and null-check builds. Complete outgoing CPU/scratch state and
 integer-store snapshots remain exact; no residue is normalized away. Dedicated
 fixtures cover full stack wraparound, exact qword copies, reversed arithmetic,
@@ -435,8 +415,8 @@ Select SSA in the game's `game.toml`:
 ```toml
 [translate]
 ir_ssa = true
-ir_ssa_x87 = "scalar"  # effects (default), values, region, scalar, scalar-strict
-ir_ssa_state = "locals"  # strict (default), locals
+ir_ssa_x87 = "scalar"    # scalar (default) or scalar-strict
+ir_ssa_state = "locals"  # locals (default) or strict
 ```
 
 Regenerate through `tools/build.py --regenerate`. Setting `ir_ssa = false`

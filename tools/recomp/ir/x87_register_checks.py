@@ -1,44 +1,18 @@
 """Byte-backed x87 register-run cases for the native full-state checks.
 
-These are extra entries intended to be merged into
-``tools/recomp/ir/native_checks.py``'s ``CASES`` map (or driven through the same
-eager-vs-IR fixture harness with ``emit(..., x87_region=True)``).  Each tuple is
-the exact instruction stream, at synthetic guest base ``0x100000``; the fixture
+``native_checks.py`` merges ``CASES`` into its fixture map. Each tuple is the
+exact instruction stream at synthetic guest base ``0x100000``; the fixture
 supplies ``ESI=0x10000``, ``EDI=0x10040`` and an output address in ``EBX``, so
-the scratch region and all CPU fields including empty-slot residue are
-compared.
+the scratch region and every CPU field, including empty-slot residue, are
+compared with eager C. They stress the scalar tracker's deferred state:
+popped dirty residue, ``FXCH``/``FLD`` outside the recent slots, physical
+wraparound, a watched integer store between deferred arithmetic, and dirty
+state at a forward join or loop backedge.
 
-The cases target behaviours the write-through cache cannot exercise:
-
-``x87_region_dirty_pop_residue``
-    A deferred arithmetic result is popped.  Eager ``fset`` writes the value and
-    bits before ``fdrop`` clears the tag and exact flag; the region must write
-    the same residue immediately before the pop.
-
-``x87_region_outside_fxch``
-    ``FXCH ST(3)`` is outside the three-slot window.  The tracker must forget
-    the old ST(0) rather than keep a stale local for the swapped-in value.
-
-``x87_region_st7_wrap``
-    ``FLD ST(7)`` pushes a copy of a slot outside the window, exercising the
-    physical wraparound path.
-
-``x87_region_integer_watched_store``
-    A guest integer store sits between deferred arithmetic.  The store observer
-    snapshots the complete CPU, so the FPU state must be materialised first.
-
-``x87_region_branch_join``
-    Dirty state reaches a conditional branch and a forward join.
-
-``x87_region_backedge``
-    Dirty state reaches a loop backedge; the header is a join and must reset
-    after every incoming edge flushed.
-
-The encodings are the ordinary 32-bit forms:
-``d9e8`` FLD1, ``dec1`` FADDP ST(1),ST(0), ``d9cb`` FXCH ST(3),
-``d9c7`` FLD ST(7), ``d95b04`` FSTP dword [EBX+4], ``8903`` MOV [EBX],EAX,
-``a901000000`` TEST EAX,1, ``7404`` JZ +4, ``b903000000`` MOV ECX,3,
-``49`` DEC ECX, ``75f7`` JNZ -9, ``c3`` RET.
+Encodings are the ordinary 32-bit forms: ``d9e8`` FLD1, ``dec1`` FADDP
+ST(1),ST(0), ``d9cb`` FXCH ST(3), ``d9c7`` FLD ST(7), ``d95b04`` FSTP dword
+[EBX+4], ``8903`` MOV [EBX],EAX, ``a901000000`` TEST EAX,1, ``7404`` JZ +4,
+``b903000000`` MOV ECX,3, ``49`` DEC ECX, ``75f7`` JNZ -9, ``c3`` RET.
 """
 
 CASES = {
@@ -68,15 +42,15 @@ CASES = {
         "83c007", "8b16", "83c001", "8b4e04", "83c002", "8903", "c3",
     ),
     # Deferred arithmetic result popped: the residue must match eager.
-    "x87_region_dirty_pop_residue": (
+    "x87_run_dirty_pop_residue": (
         "d9e8",    # FLD1
         "d9e8",    # FLD1
         "dec1",    # FADDP ST(1), ST(0)  -> deferred result
         "dec1",    # FADDP ST(1), ST(0)  -> pops the dirty residue
         "c3",      # RET
     ),
-    # FXCH ST(3) is outside the tracked window.
-    "x87_region_outside_fxch": (
+    # FXCH ST(3) reaches a slot below the recent window.
+    "x87_run_outside_fxch": (
         "d9e8",    # FLD1
         "d9e8",    # FLD1
         "d9cb",    # FXCH ST(3)
@@ -85,7 +59,7 @@ CASES = {
         "c3",
     ),
     # FLD ST(7) wraps the physical register file.
-    "x87_region_st7_wrap": (
+    "x87_run_st7_wrap": (
         "d9e8",    # FLD1
         "d9e8",    # FLD1
         "d9c7",    # FLD ST(7)
@@ -94,7 +68,7 @@ CASES = {
         "c3",
     ),
     # Watched integer store between deferred arithmetic.
-    "x87_region_integer_watched_store": (
+    "x87_run_integer_watched_store": (
         "d9e8",    # FLD1
         "d9e8",    # FLD1
         "dec1",    # FADDP ST(1), ST(0)  -> dirty
@@ -105,7 +79,7 @@ CASES = {
         "c3",
     ),
     # Conditional branch with dirty state and a forward join.
-    "x87_region_branch_join": (
+    "x87_run_branch_join": (
         "d9e8",        # FLD1
         "d9e8",        # FLD1
         "a901000000",  # TEST EAX, 1
@@ -116,7 +90,7 @@ CASES = {
         "c3",
     ),
     # Loop backedge; the header is a join.
-    "x87_region_backedge": (
+    "x87_run_backedge": (
         "b903000000",  # MOV ECX, 3
         "d9e8",        # FLD1                <- loop top at +5
         "d9e8",        # FLD1

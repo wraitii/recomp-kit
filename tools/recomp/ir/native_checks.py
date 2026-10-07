@@ -11,7 +11,7 @@ from .lift import Lifter
 from .summary import FunctionIR, default_successors
 from .emit_c import emit
 from .integer_extra_checks import CASES as INTEGER_EXTRA_CASES
-from .x87_value_checks import CASES as X87_REGION_CASES
+from .x87_register_checks import CASES as X87_REGISTER_CASES
 
 HERE = Path(__file__).resolve().parent
 KIT = HERE.parents[2]
@@ -102,10 +102,10 @@ CASES = {
     "rep_movsd_overlap": ("be00000100", "bf02000100", "b904000000", "fc", "f3a5", "c3"),
 }
 
-# Signed-integer (CDQ/IMUL/IDIV/NEG/SAR/SETcc) and x87 region-run cases that
-# other workers own. They are plain byte tuples and merge directly here so the
-# four-column eager/plain/cache/region harness covers them.
-CASES = {**CASES, **INTEGER_EXTRA_CASES, **X87_REGION_CASES}
+# Signed-integer (CDQ/IMUL/IDIV/NEG/SAR/SETcc) and x87 register-run cases kept
+# in their own modules. They are plain byte tuples and merge directly here so the
+# five-column eager/raw/scalar/strict/local harness covers them.
+CASES = {**CASES, **INTEGER_EXTRA_CASES, **X87_REGISTER_CASES}
 
 
 CALLEE = 0x200000  # Synthetic callee address, never a game entry point.
@@ -133,7 +133,7 @@ def _loop_caller():
 
 # Byte-backed callers with explicit host callees. The callee models a guest
 # function: mutate state, pop the return address (RET or RET n) and set EIP.
-# The plain/cache/region IR callers are compared against the eager caller for
+# The raw/scalar/strict/local IR callers are compared against the eager caller for
 # the same bytes under the same full-state obligations.
 CALL_CASES = {
     "call_cdecl_mutate": {
@@ -237,8 +237,8 @@ BYTE_CALL_CASES = {
     },
     "call_x87_join": {
         # fld1; call; test eax,eax; jz skip; fadd st0,st1; skip: fstp [ebx+4]; ret
-        # callee: fld1; ret -- the caller's cache/region tracker must be
-        # invalidated by the call and reset again at the conditional join.
+        # callee: fld1; ret -- the caller's scalar x87 state must be
+        # flushed by the call and reset again at the conditional join.
         "hexes": _caller(["d9e8"], ["85c0", "7402", "d8c1", "d95b04", "c3"]),
         "callee_hexes": ["d9e8", "c3"],
         "resumable": False,
@@ -320,7 +320,7 @@ INDIRECT_CASES = {
 
 
 def call_sources(name, hexes, callee_addr, resumable=False, indirect=False):
-    """Eager caller plus plain/cache/region IR callers and CALL fallthroughs.
+    """Eager caller plus raw/scalar/strict/local IR callers and CALL fallthroughs.
 
     `indirect` selects the explicit production-style `recomp_call` opt-in for
     indirect CALL effects; without it those effects stay a fallback.
@@ -350,22 +350,14 @@ def call_sources(name, hexes, callee_addr, resumable=False, indirect=False):
     fir = FunctionIR(ENTRY, lifted, default_successors(lifted))
     symbols = {callee_addr: name + "_callee"}
     indirect_symbol = "recomp_call" if indirect else None
-    plain = emit(fir, name + "_ir_plain", call_symbols=symbols,
-                 indirect_call_symbol=indirect_symbol, resumable_stacks=resumable)
-    cache = emit(fir, name + "_ir_cache", call_symbols=symbols, x87_values=True,
-                 indirect_call_symbol=indirect_symbol, resumable_stacks=resumable)
-    region = emit(fir, name + "_ir_region", call_symbols=symbols, x87_region=True,
-                  indirect_call_symbol=indirect_symbol, resumable_stacks=resumable)
+    options = dict(call_symbols=symbols, indirect_call_symbol=indirect_symbol,
+                   resumable_stacks=resumable)
+    raw = emit(fir, name + "_ir_raw", optimize=False, **options)
     fallthroughs = [ins.addr + ins.length for ins in lifted if ins.mnem.upper() == "CALL"]
-    scalar = emit(fir, name + "_ir_scalar", call_symbols=symbols, x87_scalar=True,
-                  indirect_call_symbol=indirect_symbol, resumable_stacks=resumable)
-    strict = emit(fir, name + "_ir_strict", call_symbols=symbols, x87_scalar=True,
-                  x87_scalar_strict=True, indirect_call_symbol=indirect_symbol,
-                  resumable_stacks=resumable)
-    local = emit(fir, name + "_ir_local", call_symbols=symbols, x87_scalar=True,
-                 local_state=True, indirect_call_symbol=indirect_symbol,
-                 resumable_stacks=resumable)
-    return eager, plain, cache, region, scalar, strict, local, fallthroughs
+    scalar = emit(fir, name + "_ir_scalar", local_state=False, **options)
+    strict = emit(fir, name + "_ir_strict", x87_scalar_strict=True, local_state=False, **options)
+    local = emit(fir, name + "_ir_local", **options)
+    return eager, raw, scalar, strict, local, fallthroughs
 
 
 def _eager_callee(symbol, base, hexes):
@@ -389,7 +381,7 @@ def _eager_callee(symbol, base, hexes):
 
 
 def sources(name, hexes):
-    """Decode and lift the exact same byte boundaries for all seven consumers."""
+    """Decode and lift the exact same byte boundaries for all five consumers."""
     chunks = [bytes.fromhex(h) for h in hexes]
     image = T.Image.__new__(T.Image)
     image.base, image.data = ENTRY, b"".join(chunks)
@@ -407,13 +399,11 @@ def sources(name, hexes):
         lifted.append(lifter.lift(addr, raw, ins.mnem))
         addr += len(raw)
     fir = FunctionIR(ENTRY, lifted, default_successors(lifted))
-    plain = emit(fir, name + "_ir_plain")
-    cache = emit(fir, name + "_ir_cache", x87_values=True)
-    region = emit(fir, name + "_ir_region", x87_region=True)
-    scalar = emit(fir, name + "_ir_scalar", x87_scalar=True)
-    strict = emit(fir, name + "_ir_strict", x87_scalar=True, x87_scalar_strict=True)
-    local = emit(fir, name + "_ir_local", x87_scalar=True, local_state=True)
-    return eager, plain, cache, region, scalar, strict, local
+    raw = emit(fir, name + "_ir_raw", optimize=False)
+    scalar = emit(fir, name + "_ir_scalar", local_state=False)
+    strict = emit(fir, name + "_ir_strict", x87_scalar_strict=True, local_state=False)
+    local = emit(fir, name + "_ir_local")
+    return eager, raw, scalar, strict, local
 
 
 def _checked_wrapper(symbol, fallthroughs):
@@ -426,8 +416,9 @@ def _checked_wrapper(symbol, fallthroughs):
 def run_checks(out, cmake, jobs):
     """Build via tools/build.py, then compare every CPU field and scratch byte.
 
-    The seven harness columns compare eager, effects, values, region, scalar,
-    scalar-strict and scalar/local-state with the same full-state obligations.
+    The five harness columns compare eager, raw (unoptimized ordered effects),
+    scalar, scalar-strict and scalar/local-state with the same full-state
+    obligations.
     """
     out.mkdir(parents=True, exist_ok=True)
     code, rows, declarations = ['#include "x86.h"',
@@ -437,8 +428,7 @@ def run_checks(out, cmake, jobs):
     def add_case(name, eager, variants, extra=(), fallthroughs=()):
         code.extend(extra)
         code.extend([eager, *variants])
-        symbols = [name + "_eager_fn_%08x" % ENTRY,
-                   name + "_ir_plain", name + "_ir_cache", name + "_ir_region",
+        symbols = [name + "_eager_fn_%08x" % ENTRY, name + "_ir_raw",
                    name + "_ir_scalar", name + "_ir_strict", name + "_ir_local"]
         for symbol in symbols:
             code.append(_checked_wrapper(symbol, fallthroughs))
@@ -447,24 +437,24 @@ def run_checks(out, cmake, jobs):
         rows.append("{" + ",".join(checked) + "}")
 
     for name, hexes in CASES.items():
-        eager, plain, cache, region, scalar, strict, local = sources(name, hexes)
-        add_case(name, eager, [plain, cache, region, scalar, strict, local])
+        eager, raw, scalar, strict, local = sources(name, hexes)
+        add_case(name, eager, [raw, scalar, strict, local])
     for name, spec in CALL_CASES.items():
-        eager, plain, cache, region, scalar, strict, local, returns = call_sources(
+        eager, raw, scalar, strict, local, returns = call_sources(
             name, spec["hexes"], CALLEE, spec["resumable"])
-        add_case(name, eager, [plain, cache, region, scalar, strict, local], extra=[spec["callee"]],
+        add_case(name, eager, [raw, scalar, strict, local], extra=[spec["callee"]],
                  fallthroughs=returns)
     for name, spec in BYTE_CALL_CASES.items():
-        eager, plain, cache, region, scalar, strict, local, returns = call_sources(
+        eager, raw, scalar, strict, local, returns = call_sources(
             name, spec["hexes"], CALLEE, spec["resumable"])
         callee = _eager_callee(name + "_callee", CALLEE, spec["callee_hexes"])
-        add_case(name, eager, [plain, cache, region, scalar, strict, local], extra=[callee],
+        add_case(name, eager, [raw, scalar, strict, local], extra=[callee],
                  fallthroughs=returns)
     dispatch = []
     for name, spec in INDIRECT_CASES.items():
-        eager, plain, cache, region, scalar, strict, local, returns = call_sources(
+        eager, raw, scalar, strict, local, returns = call_sources(
             name, spec["hexes"], spec["target"], spec["resumable"], indirect=True)
-        add_case(name, eager, [plain, cache, region, scalar, strict, local],
+        add_case(name, eager, [raw, scalar, strict, local],
                  extra=[spec["callee"]], fallthroughs=returns)
         dispatch.append((spec["target"], name + "_callee"))
     code.extend(['void ir_unexpected_call(uint32_t);',
@@ -474,8 +464,8 @@ def run_checks(out, cmake, jobs):
                 + ['    default: ir_unexpected_call(target); }',
                    '}'])
     declarations.extend([
-        'static const char *mode_names[] = {"eager", "plain", "cache", "region", "scalar", "strict", "local"};',
-        'static const unsigned normalize_empty_mask = 0, required_match_mask = 126;',
+        'static const char *mode_names[] = {"eager", "raw", "scalar", "strict", "local"};',
+        'static const unsigned normalize_empty_mask = 0, required_match_mask = 30;',
         '#define FIXTURE_SCRATCH_SIZE 2048',
         '#define FIXTURE_CUSTOM_INPUTS 1',
         '#define FIXTURE_SETUP(c, n) do { (c)->r[R_ESP] = 0x10100; '
@@ -495,7 +485,7 @@ def run_checks(out, cmake, jobs):
                    for name in list(CASES) + list(CALL_CASES) + list(BYTE_CALL_CASES)
                    + list(INDIRECT_CASES))
         + '};',
-        'static void (*functions[][7])(X86 *) = {' + ','.join(rows) + '};',
+        'static void (*functions[][5])(X86 *) = {' + ','.join(rows) + '};',
     ])
     (out / "generated.c").write_text("\n".join(code) + "\n")
     (out / "fixtures.h").write_text("\n".join(declarations) + "\n")

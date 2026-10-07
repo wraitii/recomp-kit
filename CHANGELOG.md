@@ -226,6 +226,15 @@
 ||||||| parent of 28e2bc9 (Expand production SSA helper and indirect call coverage)
 ||||||| parent of 1e58bd9 (Add explicit comparison workloads to the function corpus)
 ||||||| parent of 9a48b36 (Time-budget function corpus trials instead of fixed call counts)
+||||||| parent of d6f8703 (Retire SSA x87 effects, values and region modes)
+- Retire the SSA x87 `effects`, `values` and `region` modes and the value tracker
+  behind them. `ir_ssa_x87` now accepts `scalar` (default) or `scalar-strict`,
+  `ir_ssa_state` accepts `locals` (default) or `strict`, and plain
+  `--corpus-ir-ssa` is the production scalar/locals policy. `emit()` defaults to
+  that policy; `optimize=False` keeps the raw ordered-effects lowering. The
+  `--ir-ssa-checks` suite compares raw, scalar, scalar-strict and scalar/locals
+  against eager C.
+
 - Function-corpus timing is now time-budgeted. `--corpus-trial-ms N` (default
   10) replaces `--corpus-calls`: each row's call count is calibrated once, untimed,
   by doubling an eager batch until it takes N ms, then shared by every variant and

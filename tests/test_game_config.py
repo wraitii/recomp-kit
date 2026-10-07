@@ -28,8 +28,8 @@ class LoadTests(unittest.TestCase):
             (game / "game.toml").write_text(stub)
             settings = game_config.load(game)["translate"]
             self.assertFalse(settings["ir_ssa"])
-            self.assertEqual(settings["ir_ssa_x87"], "effects")
-            self.assertEqual(settings["ir_ssa_state"], "strict")
+            self.assertEqual(settings["ir_ssa_x87"], "scalar")
+            self.assertEqual(settings["ir_ssa_state"], "locals")
             for key, value in (("ir_ssa", "1"), ("ir_ssa_x87", '"bad"'),
                                ("ir_ssa_state", '"bad"')):
                 (game / "game.toml").write_text(stub.replace(

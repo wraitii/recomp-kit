@@ -116,8 +116,8 @@ memory accesses and declared calls with both mock and byte-translated callees. E
 call fixtures cover register and ESP-relative targets, live x87 state, and normal
 or diverted resumable continuation. Dword string moves cover zero count, both
 DF directions and overlapping copies with store observations.
-Effects, cached values, region, scalar, scalar-strict and scalar/local-state
-are compared in ordinary and null-check builds. Scalar/local-state retains
+Raw (`optimize=False`), scalar with strict state, scalar-strict and the
+production scalar/local-state policy are compared in ordinary and null-check builds. Scalar/local-state retains
 complete outgoing state and integer-store snapshots while deferring ordinary
 load observations; null-check builds select strict publication. x87 checks cover all TOP,
 PC and RC combinations, exact integer metadata, special and finite inputs,

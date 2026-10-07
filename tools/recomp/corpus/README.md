@@ -152,12 +152,11 @@ compilers directly or retain private bytes/generated code in Git.
 combined variant, preserving the same full-state checks against eager C.
 Unsupported functions use the existing emitter; each row's `ir_ssa` records
 whether emission succeeded and the fallback reason. Audited x87 instructions
-use byte-backed ordered effects and the eager runtime's helpers; raw floating
+use byte-backed effects lowered by the scalar x87 tracker; raw floating
 p-code, unsupported x87 forms, locked operations and unbound calls retain fallback.
 Declared reviewed direct callees are bound explicitly and use the same mode.
-`--corpus-ir-ssa-x87 effects|values|region` selects eager x87 effects (default),
-bounded value reuse, or value reuse with deferred arithmetic bookkeeping.
-The selected mode is recorded in JSON and Markdown.
+The policy (default scalar x87 and local CPU state, the production policy) is
+recorded in JSON and Markdown.
 This mode runs separately from decoded-dataflow experiments and does not enable
 production IR emission. See [IR limitations](../../../docs/ir.md).
 
@@ -191,12 +190,12 @@ callees. The corpus eager variant emits every flag, providing a stronger oracle
 than the older conventionally optimized eager variant. Current-runtime matches
 still do not establish original-x86 equivalence.
 
-`--corpus-ir-ssa-x87 scalar` uses scalar x87 stack/environment state with exact
-outgoing residues; `scalar-strict` retains pre-load observations and general
-arithmetic. `--corpus-ir-ssa-state locals` separately defers ordinary read
-GPR/flag snapshots, retaining diagnostics and complete store/call/exit state.
-Both performance policies keep a strict path under `RECOMP_NULL_CHECKS=1` and
-record their selection in the report. See [the IR contracts](../../../docs/ir.md#scalar-x87-and-local-cpu-state).
+The default `--corpus-ir-ssa-x87 scalar` uses scalar x87 stack/environment state
+with exact outgoing residues; `scalar-strict` retains pre-load observations and
+general arithmetic. The default `--corpus-ir-ssa-state locals` separately defers
+ordinary read GPR/flag snapshots, retaining diagnostics and complete
+store/call/exit state; `strict` keeps them. The default policies keep a strict
+path under `RECOMP_NULL_CHECKS=1`, and the report records the selection. See [the IR contracts](../../../docs/ir.md#scalar-x87-and-local-cpu-state).
 
 ### Experimental SSA ceiling column
 

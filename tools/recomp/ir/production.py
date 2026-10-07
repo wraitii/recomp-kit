@@ -53,8 +53,8 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
     known = {fn.addr for fn in functions}
     forbidden = (set(tr.seh_helpers) | set(tr.noreturn_callees)
                  | set(policies.get("intrinsic_bodies", {})))
-    mode = settings.get("ir_ssa_x87", "effects")
-    state = settings.get("ir_ssa_state", "strict")
+    mode = settings.get("ir_ssa_x87", "scalar")
+    state = settings.get("ir_ssa_state", "locals")
     results, reasons = {}, Counter()
     for index, fn in enumerate(functions, 1):
         reason = "auxiliary module" if module else exclusion(
@@ -70,8 +70,6 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
             try:
                 fir = function_ir(tr, lifter, fn)
                 source = emit(fir, "fn_%08x" % fn.addr, call_symbols=calls,
-                              x87_values=mode == "values", x87_region=mode == "region",
-                              x87_scalar=mode in ("scalar", "scalar-strict"),
                               x87_scalar_strict=mode == "scalar-strict",
                               local_state=state == "locals",
                               resumable_stacks=policies.get("resumable_stacks", False),

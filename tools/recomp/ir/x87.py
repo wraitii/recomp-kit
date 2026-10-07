@@ -6,10 +6,8 @@ the existing helpers retain PC/RC, NaNs, exceptions, tags, exact integer metadat
 and popped-slot residue. These are effect nodes, not scalar floating SSA yet.
 No game addresses or inferred dead FPU fields appear in this adapter.
 
-An optional `x87_values.X87Values` tracker lets straight-line callers reuse the
-scalar double a preceding effect produced instead of reloading `c->st`, while
-still emitting every physical helper call. Without a tracker the recipes are
-byte-for-byte the audited eager lowering.
+`statements` is the audited ordered lowering: it is the raw `optimize=False`
+path and the fallback for shapes the scalar tracker (`x87_scalar.py`) delegates.
 """
 import capstone
 from capstone import x86_const as X
@@ -104,14 +102,8 @@ The descriptor carries validated operand roles rather than generated C text.
     return ops
 
 
-def statements(data, address=None, result=None, values=None):
-    """Lower a validated effect using the comparison runtime's exact recipes.
-
-`values` is an optional `x87_values.X87Values` tracker. When supplied, reads
-of a known slot use the tracked scalar and writes record their result, but every
-helper call and its argument order is unchanged; when omitted the output is the
-original eager lowering.
-"""
+def statements(data, address=None, result=None):
+    """Lower a validated effect using the comparison runtime's exact recipes."""
     m, operands = data["mnem"], data["operands"]
     memory = [size for kind, size in operands if kind == "mem"]
     slots = [index for kind, index in operands if kind == "st"]
@@ -120,10 +112,7 @@ original eager lowering.
     lines = []
 
     def read(index):
-        return values.read(index, st(index)) if values is not None else st(index)
-
-    def push(expr):
-        return values.push(expr, lines) if values is not None else expr
+        return st(index)
 
     def fail():
         raise SSAError("unsupported x87 operand shape %s %r" % (m, operands))
@@ -138,47 +127,21 @@ original eager lowering.
         return "rdf%d((uint32_t)%s)" % (bits, address)
 
     def set_slot(index, value):
-        if values is not None:
-            store = getattr(values, "store", None)
-            if store is not None:
-                value, emit = store(index, value, lines)
-                if not emit:
-                    return
-            else:
-                value = values.write(index, value, lines)
         lines.append("fset(c, %d, %s);" % (index, value))
 
-    def flush_values():
-        # Materialise a deferred register run before an observation.  Plain
-        # X87Values has no flush and is unaffected.
-        flush = getattr(values, "flush", None)
-        if flush is not None:
-            lines.extend(flush())
-
-    if values is not None and address is not None:
-        # A guest memory access (and any fault handler it can raise) observes
-        # the full FPU state.
-        flush_values()
-
     if m in CONSTANTS and not operands:
-        lines.append("fpush(c, %s);" % push(CONSTANTS[m]))
+        lines.append("fpush(c, %s);" % CONSTANTS[m])
     elif m == "FLD" and len(operands) == 1:
         if slots:
-            if values is not None:
-                values.push_copy(slots[0], lines)
             lines.append("fpush_st(c, %d);" % slots[0])
         else:
-            lines.append("fpush(c, %s);" % push(mem_value()))
+            lines.append("fpush(c, %s);" % mem_value())
     elif m == "FILD" and len(memory) == 1 and len(operands) == 1:
         # The helper sets exact-integer metadata from the promoted value, so
         # bind nothing here: the slot value is only later read through `c`.
-        if values is not None:
-            values.push(None, lines)
         lines.append("fpush_int(c, %s);" % mem_value(True))
     elif m in ("FST", "FSTP") and len(operands) == 1:
         if slots:
-            if values is not None:
-                values.copy(slots[0], 0, lines)
             if slots[0]:
                 lines.append("fcopy(c, %d, 0);" % slots[0])
         elif bits in (32, 64, 80):
@@ -187,15 +150,10 @@ original eager lowering.
         else:
             fail()
         if m == "FSTP":
-            if values is not None:
-                values.drop(lines)
             lines.append("fdrop(c);")
     elif m in ("FIST", "FISTP") and len(operands) == 1 and bits in (16, 32, 64):
-        flush_values()
         lines.append("wr%d((uint32_t)%s, (uint%d_t)fist_i%d(c));" % (bits, address, bits, bits))
         if m == "FISTP":
-            if values is not None:
-                values.drop(lines)
             lines.append("fdrop(c);")
     elif m in ARITH or m in INTEGER_ARITH or (m.endswith("P") and m[:-1] in ARITH):
         pop = m.endswith("P")
@@ -218,8 +176,6 @@ original eager lowering.
         value = "fdivz(c, %s, %s)" % (lhs, rhs) if operator == "/" else "%s %s %s" % (lhs, operator, rhs)
         set_slot(dst, "fx87(c, %s)" % value)
         if pop:
-            if values is not None:
-                values.drop(lines)
             lines.append("fdrop(c);")
     elif m in ("FCOM", "FCOMP", "FUCOM", "FUCOMP", "FICOM", "FICOMP", "FCOMPP", "FUCOMPP"):
         if memory and len(operands) == 1 and not m.endswith("PP"):
@@ -231,8 +187,6 @@ original eager lowering.
             fail()
         lines.append("%s(c, %s, %s);" % ("fucom" if m.startswith("FU") else "fcom", read(0), other))
         for _ in range(2 if m.endswith("PP") else int(m.endswith("P"))):
-            if values is not None:
-                values.drop(lines)
             lines.append("fdrop(c);")
     elif m in UNARY and not operands:
         set_slot(0, UNARY[m] % read(0))
@@ -240,14 +194,11 @@ original eager lowering.
         set_slot(0, "fprem_common(c, %s, %s, %d)" % (read(0), read(1), int(m == "FPREM1")))
     elif m == "FXCH" and not memory and len(slots) == len(operands) and len(slots) <= 2:
         other = slots[-1] if slots else 1
-        if values is not None:
-            values.swap(other, lines)
         lines.append("fxch(c, %d);" % other)
     elif m == "FTST" and not operands:
         lines.append("fcom(c, %s, 0.0);" % read(0))
     elif m == "FXAM" and not operands:
         # fxam reads c->st[0] itself, so a dirty ST(0) must be materialised.
-        flush_values()
         lines.append("fxam(c);")
     elif m in ("FNCLEX", "FCLEX") and not operands:
         lines.append("c->fpu_sw &= (uint16_t)~0x80ffu;")
@@ -259,17 +210,10 @@ original eager lowering.
         else:
             lines.append("wr16((uint32_t)%s, %s);" % (address, "fstsw(c)" if m == "FNSTSW" else "c->fpu_cw"))
     elif m in ("FNINIT", "FINIT") and not operands:
-        if values is not None:
-            values.invalidate(lines)
         lines.append("x87_finit(c);")
     elif m in ("FDECSTP", "FINCSTP") and not operands:
         # TOP moves without touching a value slot: old ST(i-1) becomes ST(i)
         # for FDECSTP, old ST(i+1) becomes ST(i) for FINCSTP.
-        if values is not None:
-            if m == "FDECSTP":
-                values.push(None, lines)
-            else:
-                values.drop(lines)
         lines.extend(["c->fpu_top = (c->fpu_top %s 1u) & 7u;" % ("-" if m == "FDECSTP" else "+"),
                       "c->fpu_sw &= (uint16_t)~0x0200u;"])
     elif m == "FNOP" and not operands:

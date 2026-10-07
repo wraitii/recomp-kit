@@ -34,7 +34,7 @@ def function(*hexes):
 ])
 def test_known_sleigh_gaps_use_runtime_semantics_before_admission(hexes, helper):
     f = function(*hexes)
-    assert helper in emit(f, "test_fn")
+    assert helper in emit(f, "test_fn", optimize=False)
     corrected = codegen_ir(f, Lifter())
     assert not any(op.opc.startswith("FLOAT_") for ins in corrected.insns for op in ins.ops)
     s = build(corrected)
@@ -54,7 +54,7 @@ def test_known_sleigh_gaps_use_runtime_semantics_before_admission(hexes, helper)
     ("dee9", "ST(c, 1) - ST(c, 0)"),
 ])
 def test_register_operand_direction_comes_from_bytes(hexcode, expected):
-    body = emit(function(hexcode, "c3"), "test_fn")
+    body = emit(function(hexcode, "c3"), "test_fn", optimize=False)
     assert expected in body
     assert ("fset(c, 1," in body) == hexcode.startswith(("dc", "de"))
 
@@ -68,18 +68,18 @@ def test_register_operand_direction_comes_from_bytes(hexcode, expected):
 ])
 def test_unmodeled_x87_effects_retain_named_fallback(hexcode, reason):
     with pytest.raises(SSAError, match=reason):
-        emit(function(hexcode, "c3"), "test_fn")
+        emit(function(hexcode, "c3"), "test_fn", optimize=False)
 
 
 def test_original_bytes_are_required_for_x87_operand_corrections():
     f = function("d906", "c3")
     f.insns[0].raw = None
     with pytest.raises(SSAError, match="x87 requires original bytes"):
-        emit(f, "test_fn")
+        emit(f, "test_fn", optimize=False)
 
 
 def test_mismatched_original_boundary_is_rejected():
     f = function("d906", "c3")
     f.insns[0].length = 3
     with pytest.raises(SSAError, match="operand decode disagrees with boundary"):
-        emit(f, "test_fn")
+        emit(f, "test_fn", optimize=False)

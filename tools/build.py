@@ -476,10 +476,10 @@ def parse_args(argv, system=None):
                         help="Build/check/report a game-owned native-reference function corpus")
     parser.add_argument("--corpus-ir-ssa", action="store_true",
                         help="Try integer IR SSA in the corpus combined mode, recording fallbacks")
-    parser.add_argument("--corpus-ir-ssa-x87", choices=("effects", "values", "region", "scalar", "scalar-strict"), default=None,
-                        help="x87 comparison mode for --corpus-ir-ssa (default: effects)")
+    parser.add_argument("--corpus-ir-ssa-x87", choices=("scalar", "scalar-strict"), default=None,
+                        help="x87 policy for --corpus-ir-ssa (default: scalar, the production policy)")
     parser.add_argument("--corpus-ir-ssa-state", choices=("strict", "locals"), default=None,
-                        help="CPU publication policy for --corpus-ir-ssa (default: strict)")
+                        help="CPU publication policy for --corpus-ir-ssa (default: locals, the production policy)")
     parser.add_argument("--corpus-ir-ssa-ceiling", metavar="A,B,C,D,E|all", default=None,
                         help="Add the UNPROVEN, corpus-only SSA ceiling column with these relaxations "
                              "(requires --corpus-ir-ssa scalar x87 and locals state)")
@@ -612,8 +612,8 @@ def main():
             run_corpus(args.function_corpus, args.game_dir, args.build_root / "function-corpus",
                        cmake_tool("cmake"), args.jobs, args.corpus_checks,
                        args.corpus_trial_ms, args.corpus_trials, args.corpus_x87_dataflow, args.corpus_stack_forwarding, args.corpus_decoded_dataflow,
-                       args.corpus_ir_ssa, args.corpus_ir_ssa_x87 or "effects",
-                       args.corpus_ir_ssa_state or "strict", args.corpus_ir_ssa_ceiling)
+                       args.corpus_ir_ssa, args.corpus_ir_ssa_x87,
+                       args.corpus_ir_ssa_state, args.corpus_ir_ssa_ceiling)
         return
     if args.corpus_llvm_sweep:
         from corpus.llvm_sweep import run_sweep

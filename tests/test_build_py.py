@@ -305,15 +305,19 @@ def test_decoded_dataflow_build_modes():
 def test_corpus_ir_ssa_x87_mode_is_explicit_and_requires_ir_ssa():
     import pytest
     args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa',
-                                   '--corpus-ir-ssa-x87', 'values'], system='Darwin')
-    assert args.corpus_ir_ssa_x87 == 'values'
+                                   '--corpus-ir-ssa-x87', 'scalar-strict'], system='Darwin')
+    assert args.corpus_ir_ssa_x87 == 'scalar-strict'
     args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa'], system='Darwin')
     assert args.corpus_ir_ssa_x87 is None
     with pytest.raises(SystemExit):
-        build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa-x87', 'region'],
+        build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa-x87', 'scalar'],
                             system='Darwin')
     with pytest.raises(SystemExit):
-        build_py.parse_args(['--corpus-ir-ssa-x87', 'region'], system='Darwin')
+        build_py.parse_args(['--corpus-ir-ssa-x87', 'scalar'], system='Darwin')
+    for retired in ('effects', 'values', 'region'):
+        with pytest.raises(SystemExit):
+            build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa',
+                                 '--corpus-ir-ssa-x87', retired], system='Darwin')
     with pytest.raises(SystemExit):
         build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa',
                              '--corpus-ir-ssa-x87', 'bogus'], system='Darwin')

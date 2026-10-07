@@ -4,8 +4,9 @@ The production adapter admits a restricted subset through existing entry thunks;
 this emitter alone does not implement hooks, SEH or alternate entries. Original
 interior fault equivalence has not been validated. A direct CALL is emitted
 only when the caller supplies an explicit target-to-symbol binding; otherwise
-it is a whole-function fallback. Audited x87 effects use the comparison
-runtime's helpers, with an opt-in write-through value tracker. Memory uses the
+it is a whole-function fallback. Optimized bodies lower audited x87 effects
+through the scalar tracker (`x87_scalar.py`); the raw `optimize=False` path uses
+the comparison runtime's ordered helpers directly. Memory uses the
 existing guest accessors, in instruction order, with explicit state
 publication. No inferred convention permits discarding guest state.
 """
@@ -16,7 +17,6 @@ from .ssa import SSAError, MEMORY, build
 from .summary import FunctionIR
 from .simplify import canonicalize, simplify
 from .publication import plan
-from .x87_values import X87Values, X87Region
 from . import x87
 
 
@@ -137,8 +137,7 @@ def codegen_ir(fir, lifter):
 
 
 def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=True,
-         call_symbols=None, x87_values=False, x87_region=False, x87_scalar=False,
-         x87_scalar_strict=False, local_state=False, resumable_stacks=False,
+         call_symbols=None, x87_scalar_strict=False, local_state=True, resumable_stacks=False,
          lifter=None, indirect_call_symbol=None, _guard_null_checks=True, _ceiling=frozenset()):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
@@ -147,12 +146,14 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     dispatched or approximated. `indirect_call_symbol` is the explicit opt-in
     for indirect CALL effects: when set, CALLIND lowers to that runtime
     dispatch and reloads all tracked state; when None, indirect calls stay a
-    whole-function fallback. `x87_values` enables the bounded write-through
-    x87 value tracker; it is off by default and only active with `optimize`.
+    whole-function fallback. The defaults are the production policy (scalar x87,
+    local CPU state). `x87_scalar_strict=True` keeps pre-load x87 observations and
+    `local_state=False` keeps every pre-access GPR/flag snapshot; null-check
+    builds compile both strict forms, and either can be requested explicitly.
 
     `_ceiling` is private to the function corpus: a set of UNPROVEN relaxation
     letters from `ceiling.py` (A-E). It is not part of the agreed performance
-    mode contract, requires scalar x87 and local-state SSA, and production
+    mode contract, requires optimized non-strict x87 and local-state SSA, and production
     selection never passes it.
     """
     if not symbol.isidentifier() or not symbol.isascii():
@@ -187,42 +188,33 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     if _ceiling:
         if not _ceiling <= frozenset(RELAXATIONS):
             raise SSAError("unknown ceiling relaxation %s" % ",".join(sorted(_ceiling - frozenset(RELAXATIONS))))
-        if not (optimize and x87_scalar and not x87_scalar_strict and local_state):
+        if not (optimize and not x87_scalar_strict and local_state):
             raise SSAError("ceiling relaxations require optimized scalar x87 and local-state SSA")
-    # The tracker reuses only reads; every helper call still runs. It is
-    # invalidated at opaque effects and control-flow joins below.
-    if sum((x87_values, x87_region, x87_scalar)) > 1:
-        raise SSAError("x87_values, x87_region and x87_scalar are separate comparison modes")
-    if optimize and _guard_null_checks and not _ceiling and (local_state or (x87_scalar and not x87_scalar_strict)):
+    if optimize and _guard_null_checks and not _ceiling and (local_state or not x87_scalar_strict):
         # Null-fault dispatch can expose CPU state to guest exception handlers.
         # Compile the strict observation path whenever that facility is enabled.
         options = dict(optimize=optimize, publish_changed=publish_changed, wide_registers=wide_registers,
-                       call_symbols=call_symbols, x87_values=x87_values, x87_region=x87_region,
-                       x87_scalar=x87_scalar, resumable_stacks=resumable_stacks,
+                       call_symbols=call_symbols, resumable_stacks=resumable_stacks,
                        lifter=lifter, indirect_call_symbol=indirect_call_symbol,
                        _guard_null_checks=False)
         strict = emit(fir, symbol, x87_scalar_strict=True, local_state=False, **options)
         fast = emit(fir, symbol, x87_scalar_strict=x87_scalar_strict, local_state=local_state, **options)
         return "#if defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS\n%s\n#else\n%s\n#endif" % (strict, fast)
     from .x87_scalar import X87Scalar
-    scalar = X87Scalar(observe_loads=x87_scalar_strict) if (optimize and x87_scalar) else None
+    scalar = X87Scalar(observe_loads=x87_scalar_strict) if optimize else None
     if scalar is not None and _ceiling:
         if _ceiling & X87_RELAXATIONS:
             from .x87_ceiling import X87Ceiling  # UNPROVEN ceiling C/D/E lowering.
             scalar = X87Ceiling(_ceiling)
         elif "A" in _ceiling:
             scalar.store_flush = False  # UNPROVEN ceiling A: no x87 store publication.
-    region = X87Region() if (optimize and x87_region) else None
-    tracker = region or (X87Values() if (optimize and x87_values) else None)
 
     def flush_x87():
-        return scalar.flush() if scalar is not None else region.flush() if region is not None else []
+        return scalar.flush() if scalar is not None else []
 
     def lower_x87(data, address, result):
         if scalar is not None:
             return scalar.statements(data, address, result)
-        if tracker is not None:
-            return x87_statements(data, address, result, values=tracker)
         return x87_statements(data, address, result)
 
     # Keep a raw-SSA comparison path for measuring the passes independently.
@@ -363,9 +355,6 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     for v in s.values:
         if v.id in live and v.size and v.opc not in ("CONST", "TARGET") and s.resolve(v) is v:
             lines.append("uint64_t v%d;" % v.id)
-    if tracker is not None and any(v.opc in ("X87_REG", "X87_MEM")
-                                   for b in s.blocks.values() for v in b.ops):
-        lines.extend(tracker.declarations())
     scalar_declarations = len(lines)
     if scalar is not None:
         lines.extend(scalar.declarations())
@@ -419,14 +408,6 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         if scalar is not None and (previous is None or set(fir.succ[previous]) != {i}
                                   or predecessors[i] != {previous}):
             scalar.reset()
-        if tracker is not None and (previous is None or set(fir.succ[previous]) != {i}
-                                    or predecessors[i] != {previous}):
-            # Only a single-entry/single-exit fallthrough keeps the straight-line
-            # slot model valid; every join, branch or loop edge forgets it.
-            if region is not None:
-                region.reset()  # Every incoming non-linear edge flushed below.
-            else:
-                tracker.invalidate()
         lines.append("B%d:;" % i)
         for v in b.ops:
             if v.opc == "MEMORY":
@@ -453,8 +434,6 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 if name is None:
                     raise SSAError("%08x: no C symbol bound for call target %08x"
                                    % (b.insn.addr, v.data))
-                if tracker is not None:
-                    tracker.invalidate()
                 lines.append("%s(c);" % name)
                 if resumable_stacks:
                     # Match the eager emitter's resumable-stack contract: a
@@ -474,8 +453,6 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 # already stored by the preceding lifted CALL sequence, and the
                 # SSA builder reloads every tracked lane/flag afterward.
                 lines.extend(publish(b.snapshots[v.id], v))
-                if tracker is not None:
-                    tracker.invalidate()
                 lines.append("%s(c, (uint32_t)%s);" % (v.data, ref(v.args[1])))
                 if resumable_stacks:
                     lines.append("if (c->eip != 0x%x) return;" % (
@@ -489,8 +466,6 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 # snapshots in access-then-advance order; the helper owns
                 # EDI/ESI/ECX/DF exactly as the eager emitter's rep_movsd does.
                 lines.extend(publish(b.snapshots[v.id], v))
-                if tracker is not None:
-                    tracker.invalidate()
                 lines.append("rep_movsd(c);" if v.data.get("rep") else "movsd(c);")
             elif v.opc in ("LOAD", "STORE", "DIV32", "IDIV32"):
                 ceiling_a = "A" in _ceiling and v.opc in ("LOAD", "STORE")
@@ -500,8 +475,6 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 if v.opc in ("DIV32", "IDIV32"):
                     if scalar is not None:
                         scalar.reset()
-                    if tracker is not None:
-                        tracker.invalidate()
                     helper = "div32" if v.opc == "DIV32" else "idiv32"
                     lines.append("%s(c, (uint32_t)%s, (uint32_t)%s);"
                                  % (helper, ref(v.args[2]), ref(v.args[3])))

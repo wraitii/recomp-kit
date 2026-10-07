@@ -317,10 +317,13 @@ def test_ir_ssa_x87_mode_is_validated_before_any_game_work(tmp_path):
     with pytest.raises(ValueError, match='x87 mode must be'):
         run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1,
                    ir_ssa=True, ir_ssa_x87='bogus')
-    with pytest.raises(ValueError, match='requires IR SSA'):
+    with pytest.raises(ValueError, match='x87 mode must be'):
         run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1,
-                   ir_ssa=False, ir_ssa_x87='values')
-    with pytest.raises(ValueError, match='requires IR SSA'):
+                   ir_ssa=True, ir_ssa_x87='values')
+    with pytest.raises(ValueError, match='require IR SSA'):
+        run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1,
+                   ir_ssa=False, ir_ssa_x87='scalar')
+    with pytest.raises(ValueError, match='require IR SSA'):
         run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1,
                    ir_ssa=False, ir_ssa_state='locals')
     with pytest.raises(ValueError, match='state policy must be'):
@@ -339,8 +342,9 @@ def test_ceiling_option_is_validated_before_any_game_work(tmp_path):
     p = tmp_path / 'manifest.json'
     p.write_text(json.dumps({'contract': 'mapped-native-corpus-v1', 'functions': []}))
     (tmp_path / 'build').mkdir()
-    for kwargs in ({}, {'ir_ssa': True}, {'ir_ssa': True, 'ir_ssa_x87': 'scalar'},
-                   {'ir_ssa': True, 'ir_ssa_x87': 'scalar', 'ir_ssa_state': 'strict'}):
+    for kwargs in ({}, {'ir_ssa': True, 'ir_ssa_x87': 'scalar-strict'},
+                   {'ir_ssa': True, 'ir_ssa_state': 'strict'},
+                   {'ir_ssa': True, 'ir_ssa_x87': 'scalar-strict', 'ir_ssa_state': 'strict'}):
         with pytest.raises(ValueError, match='ceiling requires --ir-ssa with scalar x87 and locals'):
             run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1, ir_ssa_ceiling='A', **kwargs)
     with pytest.raises(ValueError, match='unknown ceiling relaxation Q'):

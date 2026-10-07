@@ -31,11 +31,11 @@ def function(*hexes):
 
 
 def ceil(f, relax, **kw):
-    return emit(f, "t", x87_scalar=True, local_state=True, _ceiling=frozenset(relax), **kw)
+    return emit(f, "t", local_state=True, _ceiling=frozenset(relax), **kw)
 
 
 def base(f, **kw):
-    return emit(f, "t", x87_scalar=True, local_state=True, _guard_null_checks=False, **kw)
+    return emit(f, "t", local_state=True, _guard_null_checks=False, **kw)
 
 
 # mov eax,[esi]; add eax,1; mov [edi],eax; ret
@@ -59,18 +59,17 @@ def test_parse_relaxations_and_labels():
 
 
 def test_ceiling_requires_scalar_locals_and_known_letters():
-    with pytest.raises(SSAError, match="require optimized scalar x87"):
-        emit(INT_STORE, "t", _ceiling=frozenset("A"))
-    with pytest.raises(SSAError, match="require optimized scalar x87"):
-        emit(INT_STORE, "t", x87_scalar=True, _ceiling=frozenset("A"))
+    for policy in (dict(x87_scalar_strict=True), dict(local_state=False), dict(optimize=False)):
+        with pytest.raises(SSAError, match="require optimized scalar x87"):
+            emit(INT_STORE, "t", _ceiling=frozenset("A"), **policy)
     with pytest.raises(SSAError, match="unknown ceiling relaxation Z"):
         ceil(INT_STORE, "Z")
 
 
 def test_empty_ceiling_is_byte_identical_and_unreachable_from_production():
     for f in (INT_STORE, X87_ADD, X87_MUL, X87_CMP):
-        plain = emit(f, "t", x87_scalar=True, local_state=True)
-        assert plain == emit(f, "t", x87_scalar=True, local_state=True, _ceiling=frozenset())
+        plain = emit(f, "t", local_state=True)
+        assert plain == emit(f, "t", local_state=True, _ceiling=frozenset())
         assert "__builtin_nan" not in plain
     # Production never names the experiment, and the emit argument is private.
     assert "ceiling" not in inspect.getsource(production).lower()

@@ -68,7 +68,7 @@ def test_default_no_calls_rejects_direct_call_with_named_diagnostic():
 def test_reused_lifter_keeps_identical_codegen_across_bodies_and_policies():
     for fir in (function("40", "8903", "c3"), caller("bb01000000"),
                 function("d906", "d80e", "d806", "d91b", "c3")):
-        options = dict(call_symbols={TARGET: "callee"}, x87_scalar=True, local_state=True)
+        options = dict(call_symbols={TARGET: "callee"}, local_state=True)
         assert emit(fir, "test_fn", lifter=LIFTER, **options) == emit(fir, "test_fn", **options)
 
 
@@ -115,7 +115,7 @@ def test_call_without_canonical_fallthrough_is_rejected():
 
 def test_bound_call_emits_symbol_snapshot_and_complete_reload():
     body = emit(caller("bb01000000", "b9cc000000"), "test_fn",
-                call_symbols={TARGET: "callee_fn"})
+                call_symbols={TARGET: "callee_fn"}, _guard_null_checks=False)
     assert "callee_fn(c);" in body
     assert body.count("callee_fn(c);") == 1
 
@@ -275,17 +275,6 @@ def test_absolute_not_read_modify_write_lowers_to_ordered_load_compute_store():
 def test_ssa_rejects_a_raw_data_ram_operand():
     with pytest.raises(SSAError, match="requires normalization"):
         build(function("a1dcd48d00", "c3"))
-
-
-def test_x87_value_cache_is_invalidated_at_an_opaque_call():
-    # fld1; call; fstp [ecx]; ret -- the tracked ST(0) must not cross the call.
-    call = CALLER + 2  # FLD1 is two bytes
-    f = function("d9e8", rel32(call, TARGET), "d919", "c3")
-    cached = emit(f, "test_fn", call_symbols={TARGET: "callee_fn"}, x87_values=True)
-    plain = emit(f, "test_fn", call_symbols={TARGET: "callee_fn"})
-    assert "x87v0" in cached          # the pre-call FLD1 was tracked
-    assert "ST(c, 0)" in cached       # the post-call FSTP re-reads physical state
-    assert "x87v0" not in plain
 
 
 def test_simplify_keeps_call_snapshot_and_reloads_live():

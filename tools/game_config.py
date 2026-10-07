@@ -208,8 +208,8 @@ def load(game_dir):
     if not isinstance(ssa, bool):
         raise ValueError("%s: [translate] ir_ssa must be a boolean" % source)
     for key, default, choices in (
-            ("ir_ssa_x87", "effects", ("effects", "values", "region", "scalar", "scalar-strict")),
-            ("ir_ssa_state", "strict", ("strict", "locals"))):
+            ("ir_ssa_x87", "scalar", ("scalar", "scalar-strict")),
+            ("ir_ssa_state", "locals", ("strict", "locals"))):
         if translate.setdefault(key, default) not in choices:
             raise ValueError("%s: [translate] %s must be one of %s" % (source, key, choices))
     alignment = translate.setdefault("function_alignment", 16)
