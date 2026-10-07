@@ -13,6 +13,12 @@ sys.path.insert(0, os.path.join(ROOT, "tools/recomp"))
 import translate as T  # noqa: E402
 
 
+# Driver-level tests assert decoded C, so they pin the decode-only profile
+# instead of inheriting game_config's full-optimization default. State a key
+# here only to select the profile a test actually needs.
+DECODED_PROFILE = {"translate": {"ir_ssa": False, "fault_state": "exact"}}
+
+
 def test_a_withdrawn_block_leaves_a_trap_where_it_was_dispatched_to():
     """A function whose listing ends on a call that never returns (a C++
     throw, `exit`) falls through to padding.  The sweep recovers a block
@@ -223,7 +229,7 @@ def test_output_records_the_loaded_image_base(tmp_path, monkeypatch, artifact, p
     out = tmp_path / "gen"
     report = out / "translate-report.json"
     monkeypatch.setattr(T, "configure", lambda cfg: None)
-    monkeypatch.setattr(T.game_config, "load", lambda path: {})
+    monkeypatch.setattr(T.game_config, "load", lambda path: DECODED_PROFILE)
     monkeypatch.setattr(T, "LISTINGS", str(listings))
     monkeypatch.setattr(T, "FUNCS_TSV", str(table))
     monkeypatch.setattr(T, "BINARY", str(binary))
@@ -264,7 +270,7 @@ def test_computed_returns_use_sorted_call_continuations(tmp_path, monkeypatch, r
     curated.write_text("")
     out = tmp_path / "gen"
     monkeypatch.setattr(T, "configure", lambda cfg: None)
-    monkeypatch.setattr(T.game_config, "load", lambda path: {})
+    monkeypatch.setattr(T.game_config, "load", lambda path: DECODED_PROFILE)
     for name, value in (("LISTINGS", listings), ("FUNCS_TSV", table),
                         ("BINARY", binary), ("CURATED", curated)):
         monkeypatch.setattr(T, name, str(value))
@@ -328,7 +334,7 @@ def test_call_return_bitset_matches_the_sorted_array(tmp_path, monkeypatch):
     curated.write_text("")
     out = tmp_path / "gen"
     monkeypatch.setattr(T, "configure", lambda cfg: None)
-    monkeypatch.setattr(T.game_config, "load", lambda path: {})
+    monkeypatch.setattr(T.game_config, "load", lambda path: DECODED_PROFILE)
     for name, value in (("LISTINGS", listings), ("FUNCS_TSV", table),
                         ("BINARY", binary), ("CURATED", curated)):
         monkeypatch.setattr(T, name, str(value))
@@ -526,7 +532,7 @@ def test_finally_cleanup_and_epilogue_belong_to_establishing_body(
     curated.write_text("")
     out = tmp_path / "gen"
     monkeypatch.setattr(T, "configure", lambda cfg: None)
-    monkeypatch.setattr(T.game_config, "load", lambda path: {})
+    monkeypatch.setattr(T.game_config, "load", lambda path: DECODED_PROFILE)
     for name, value in (("LISTINGS", listings), ("FUNCS_TSV", table),
                         ("BINARY", binary), ("CURATED", curated)):
         monkeypatch.setattr(T, name, str(value))
@@ -733,7 +739,7 @@ def test_except_calls_push_decoded_returns_after_short_jump(tmp_path, monkeypatc
     curated.write_text("")
     out = tmp_path / "gen"
     monkeypatch.setattr(T, "configure", lambda cfg: None)
-    monkeypatch.setattr(T.game_config, "load", lambda path: {})
+    monkeypatch.setattr(T.game_config, "load", lambda path: DECODED_PROFILE)
     for name, value in (("LISTINGS", listings), ("FUNCS_TSV", table),
                         ("BINARY", binary), ("CURATED", curated)):
         monkeypatch.setattr(T, name, str(value))
@@ -869,7 +875,7 @@ def test_nested_except_join_keeps_outer_finally_in_establishing_body(tmp_path, m
     binary.write_bytes(img.data)
     curated.write_text('')
     monkeypatch.setattr(T, 'configure', lambda cfg: None)
-    monkeypatch.setattr(T.game_config, 'load', lambda path: {})
+    monkeypatch.setattr(T.game_config, 'load', lambda path: DECODED_PROFILE)
     for name, value in (('LISTINGS', listings), ('FUNCS_TSV', table), ('BINARY', binary), ('CURATED', curated)):
         monkeypatch.setattr(T, name, str(value))
     monkeypatch.setattr(T, 'EXTRA_ENTRY_POINTS', frozenset())
@@ -914,7 +920,7 @@ def test_span_recovers_a_chain_of_omitted_pushed_continuations(tmp_path, monkeyp
     binary.write_bytes(img.data)
     curated.write_text("")
     monkeypatch.setattr(T, "configure", lambda cfg: None)
-    monkeypatch.setattr(T.game_config, "load", lambda path: {})
+    monkeypatch.setattr(T.game_config, "load", lambda path: DECODED_PROFILE)
     for name, value in (("LISTINGS", listings), ("FUNCS_TSV", table), ("BINARY", binary), ("CURATED", curated)):
         monkeypatch.setattr(T, name, str(value))
     monkeypatch.setattr(T, "EXTRA_ENTRY_POINTS", frozenset())
@@ -966,7 +972,7 @@ def translate_entry_fixture(tmp_path, monkeypatch, img, listings_at):
     binary.write_bytes(img.data)
     curated.write_text("")
     monkeypatch.setattr(T, "configure", lambda cfg: None)
-    monkeypatch.setattr(T.game_config, "load", lambda path: {})
+    monkeypatch.setattr(T.game_config, "load", lambda path: DECODED_PROFILE)
     for name, value in (("LISTINGS", listings), ("FUNCS_TSV", table),
                         ("BINARY", binary), ("CURATED", curated)):
         monkeypatch.setattr(T, name, str(value))
@@ -1501,7 +1507,7 @@ def test_auxiliary_module_emits_prefixed_tables_that_self_register(tmp_path, mon
     curated.write_text("")
     out = tmp_path / "gen"
     monkeypatch.setattr(T, "configure", lambda cfg: None)
-    monkeypatch.setattr(T.game_config, "load", lambda path: {})
+    monkeypatch.setattr(T.game_config, "load", lambda path: DECODED_PROFILE)
     for name, value in (("LISTINGS", listings), ("FUNCS_TSV", table),
                         ("BINARY", binary), ("CURATED", curated)):
         monkeypatch.setattr(T, name, str(value))

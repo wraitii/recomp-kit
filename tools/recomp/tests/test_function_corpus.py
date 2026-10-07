@@ -308,27 +308,21 @@ def test_fixture_mismatch_fails_before_compilation(tmp_path):
         run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1)
 
 
-def test_ir_ssa_x87_mode_is_validated_before_any_game_work(tmp_path):
+def test_ir_ssa_fault_state_is_validated_before_any_game_work(tmp_path):
     import json
     from corpus.run import run_corpus
     p = tmp_path / 'manifest.json'
     p.write_text(json.dumps({'contract': 'mapped-native-corpus-v1', 'functions': []}))
     (tmp_path / 'build').mkdir()
-    with pytest.raises(ValueError, match='x87 mode must be'):
+    with pytest.raises(ValueError, match='fault state must be'):
         run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1,
-                   ir_ssa=True, ir_ssa_x87='bogus')
-    with pytest.raises(ValueError, match='x87 mode must be'):
-        run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1,
-                   ir_ssa=True, ir_ssa_x87='values')
+                   ir_ssa=True, fault_state='bogus')
     with pytest.raises(ValueError, match='require IR SSA'):
         run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1,
-                   ir_ssa=False, ir_ssa_x87='scalar')
+                   ir_ssa=False, fault_state='relaxed')
     with pytest.raises(ValueError, match='require IR SSA'):
         run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1,
-                   ir_ssa=False, ir_ssa_state='locals')
-    with pytest.raises(ValueError, match='state policy must be'):
-        run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1,
-                   ir_ssa=True, ir_ssa_state='bogus')
+                   ir_ssa=False, msvc_x87_convention=True)
 
 
 def test_asan_corpus_build_refuses_timing(tmp_path):
@@ -352,14 +346,12 @@ def test_ceiling_option_is_validated_before_any_game_work(tmp_path):
     p = tmp_path / 'manifest.json'
     p.write_text(json.dumps({'contract': 'mapped-native-corpus-v1', 'functions': []}))
     (tmp_path / 'build').mkdir()
-    for kwargs in ({}, {'ir_ssa': True, 'ir_ssa_x87': 'scalar-strict'},
-                   {'ir_ssa': True, 'ir_ssa_state': 'strict'},
-                   {'ir_ssa': True, 'ir_ssa_x87': 'scalar-strict', 'ir_ssa_state': 'strict'}):
-        with pytest.raises(ValueError, match='ceiling requires --ir-ssa with scalar x87 and locals'):
+    for kwargs in ({}, {'ir_ssa': True, 'fault_state': 'exact'}):
+        with pytest.raises(ValueError, match='ceiling requires --ir-ssa with relaxed fault state'):
             run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1, ir_ssa_ceiling='A', **kwargs)
     with pytest.raises(ValueError, match='unknown ceiling relaxation Q'):
         run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1, ir_ssa=True,
-                   ir_ssa_x87='scalar', ir_ssa_state='locals', ir_ssa_ceiling='A,Q')
+                   ir_ssa_ceiling='A,Q')
 
 
 def test_ceiling_records_require_one_exact_row_each():

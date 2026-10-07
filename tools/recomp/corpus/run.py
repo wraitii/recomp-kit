@@ -500,8 +500,7 @@ def markdown(report):
              f"Decoded x87 dataflow: {'enabled' if report.get('x87_dataflow') else 'disabled'}.",
              f"Guest-stack forwarding: {'enabled' if report.get('x87_stack_forwarding') else 'disabled'}.",
              f"Decoded integer dataflow: {'enabled' if report.get('decoded_dataflow') else 'disabled'}.", '',
-             f"IR SSA in combined mode: {sum(r.get('ir_ssa', {}).get('emitted', False) for r in report['functions'])} functions emitted; x87 comparison mode: {report.get('ir_ssa_x87', 'scalar')}; per-function fallbacks are in JSON.", '',
-             f"IR SSA CPU publication policy: {report.get('ir_ssa_state', 'locals')}.", '',
+             f"IR SSA in combined mode: {sum(r.get('ir_ssa', {}).get('emitted', False) for r in report['functions'])} functions emitted; fault state: {report.get('fault_state', 'relaxed')}; per-function fallbacks are in JSON.", '',
              'Native is reviewed C plus its ABI adapter; kernel text is also shown separately.',
              'Translation-only rows have no native reference and omit adapter/kernel results entirely.',
              'Translated/native-adapter times include entry reset and indirect-call overhead.',
@@ -591,38 +590,33 @@ def markdown(report):
 
 def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0, trials=9,
                x87_dataflow=False, x87_stack_forwarding=False, decoded_dataflow=False,
-               ir_ssa=False, ir_ssa_x87=None, ir_ssa_state=None, ir_ssa_convention=None,
-               ir_ssa_lazy_nan=None, ir_ssa_ceiling=None, asan=False):
+               ir_ssa=False, fault_state=None, msvc_x87_convention=None,
+               ir_ssa_ceiling=None, asan=False):
     """Decode the selected instructions, build isolated variants, validate, report.
 
     ``ir_ssa_ceiling`` (e.g. ``"A,C"``/``"all"``) adds the UNPROVEN, corpus-only
     "SSA ceiling" column; see ``ir/ceiling.py``. It is judged against declared
     observations rather than full-state equality and requires scalar x87 and
     local-state SSA, which also supply its per-function fallback body.
-    ``ir_ssa_convention`` (default True with ``ir_ssa``) mirrors
-    ``ir_ssa_msvc_convention``; the combined column then compares with the
-    convention's dead fields cleared (``corpus_convention_canonical``).
-    ``ir_ssa_lazy_nan`` (default True with ``ir_ssa``) mirrors
-    ``ir_ssa_x87_lazy_nan``; the combined column defers the per-op NaN check.
+    ``fault_state`` ("relaxed" by default with ``ir_ssa``) and
+    ``msvc_x87_convention`` (default True) mirror the ``[translate]`` keys; with
+    the convention the combined column compares with its dead fields cleared
+    (``corpus_convention_canonical``).
     """
     from ir.ceiling import parse_relaxations, label as ceiling_label
     if asan and trial_ms:
         raise ValueError("an AddressSanitizer corpus build is for correctness only; use a zero trial budget")
-    if (ir_ssa_x87 is not None or ir_ssa_state is not None or ir_ssa_convention is not None
-            or ir_ssa_lazy_nan is not None) and not ir_ssa:
-        raise ValueError("IR SSA x87, state, convention and lazy-NaN policies require IR SSA")
-    ir_ssa_convention = bool(ir_ssa) and ir_ssa_convention is not False
-    ir_ssa_lazy_nan = bool(ir_ssa) and ir_ssa_lazy_nan is not False
-    # Plain --ir-ssa is the production policy: scalar x87, local CPU state.
-    ir_ssa_x87, ir_ssa_state = ir_ssa_x87 or "scalar", ir_ssa_state or "locals"
+    if (fault_state is not None or msvc_x87_convention is not None) and not ir_ssa:
+        raise ValueError("IR SSA fault-state and convention policies require IR SSA")
+    msvc_x87_convention = bool(ir_ssa) and msvc_x87_convention is not False
+    # Plain --ir-ssa is the production policy.
+    fault_state = fault_state or "relaxed"
+    if fault_state not in ("relaxed", "exact"):
+        raise ValueError("IR SSA fault state must be relaxed or exact")
     ceiling = parse_relaxations(ir_ssa_ceiling)
-    if ceiling and not (ir_ssa and ir_ssa_x87 == "scalar" and ir_ssa_state == "locals"):
-        raise ValueError("SSA ceiling requires --ir-ssa with scalar x87 and locals state")
+    if ceiling and not (ir_ssa and fault_state == "relaxed"):
+        raise ValueError("SSA ceiling requires --ir-ssa with relaxed fault state")
     modes = corpus_modes(bool(ceiling))
-    if ir_ssa_state not in ("strict", "locals"):
-        raise ValueError("IR SSA state policy must be strict or locals")
-    if ir_ssa_x87 not in ("scalar", "scalar-strict"):
-        raise ValueError("IR SSA x87 mode must be scalar or scalar-strict")
     if decoded_dataflow and not x87_dataflow:
         raise ValueError('decoded dataflow requires decoded x87 dataflow')
     if ir_ssa and (x87_dataflow or x87_stack_forwarding or decoded_dataflow):
@@ -755,10 +749,10 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
                 def ssa_emit(relax):
                     return emit(fir, f'{mode}_fn_{addr:08x}', call_symbols=call_symbols,
                                 indirect_call_symbol=indirect_symbol,
-                                x87_scalar_strict=(ir_ssa_x87 == 'scalar-strict'),
-                                local_state=(ir_ssa_state == 'locals'),
-                                msvc_convention=ir_ssa_convention,
-                                lazy_nan=ir_ssa_lazy_nan,
+                                x87_scalar_strict=(fault_state == 'exact'),
+                                local_state=(fault_state == 'relaxed'),
+                                msvc_convention=msvc_x87_convention,
+                                lazy_nan=True,
                                 resumable_stacks=getattr(T, 'RESUMABLE_STACKS', False),
                                 _ceiling=relax)
                 try:
@@ -834,7 +828,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
     declarations = [f'#include {quote(header)}', f'#define CORPUS_COUNT {len(rows)}',
                     f'#define CORPUS_MODES {len(modes)}',
                     f'#define CORPUS_MODE_NATIVE {len(modes) - 1}']
-    if ir_ssa_convention:
+    if msvc_x87_convention:
         declarations.append(f'#define CORPUS_MODE_CONVENTION {modes.index("combined")}')
     if ceiling:
         declarations.append(f'#define CORPUS_MODE_CEILING {modes.index(CEILING_MODE)}')
@@ -967,9 +961,8 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
     report = {'contract': contract, 'host': platform.platform(),
               'x87_dataflow': x87_dataflow, 'x87_stack_forwarding': x87_stack_forwarding, 'decoded_dataflow': decoded_dataflow,
               'ir_ssa': ir_ssa,
-              'ir_ssa_x87': ir_ssa_x87, 'ir_ssa_state': ir_ssa_state,
-              'ir_ssa_msvc_convention': ir_ssa_convention,
-              'ir_ssa_lazy_nan': ir_ssa_lazy_nan,
+              'fault_state': fault_state,
+              'msvc_x87_convention': msvc_x87_convention,
               'ir_ssa_ceiling': {'enabled': bool(ceiling), 'relaxations': sorted(ceiling),
                                  'label': ceiling_label(ceiling) if ceiling else None,
                                  'unproven': 'corpus-only experiment, not the agreed performance-mode contract'},

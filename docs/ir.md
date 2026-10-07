@@ -280,7 +280,7 @@ Calls and boundaries:
   calls: the target must be a readable 32-bit value with a canonical fallthrough.
   Without it they fail closed. `resumable_stacks` checks EIP before continuing.
 - No per-callee summary permits dropping register or flag state at a call.
-  `ir_ssa_msvc_convention` only elides popped x87 residue. The corpus binds
+  `msvc_x87_convention` only elides popped x87 residue. The corpus binds
   independently reviewed callees in the same mode; production dispatch goes
   through stable entry thunks (`CALL_FN`).
 - SLEIGH's absolute `ram` memory operands are normalized to one captured read or
@@ -330,7 +330,7 @@ proven-binary32 operands use native float add/sub/mul plus the runtime's
 NaN/status normalization when a linear run has at least two arithmetic effects;
 division and unproven operands use the double helpers.
 
-`ir_ssa_x87_lazy_nan` is a representation change on top of that removal: a
+Lazy NaN checks are a representation change on top of that removal: a
 basic-arithmetic result stays in full precision with no NaN branch, and the
 `isnan`/indefinite fold happens where the value stops flowing into more
 NaN-propagating arithmetic. Folding is per `Slot` and block-local; every
@@ -353,7 +353,7 @@ snapshots stay complete. The must-analysis never claims a skipped field was
 published, so dead-value elimination can drop intermediate flags overwritten
 before a real observer.
 
-The `ir_ssa_msvc_convention` policy assumes the MSVC x87 stack invariant:
+The `msvc_x87_convention` policy assumes the MSVC x87 stack invariant:
 every register above TOP is tagged empty. Arithmetic flags stay published at
 calls and returns. CRT assembly helpers can return flags or consume entry flags;
 a compiler ABI is insufficient evidence that those values are dead. Dropping
@@ -372,18 +372,17 @@ report's `ir_ssa.convention_census`, a sanity census rather than a gate.
 
 Policies and where they apply:
 
-| Setting | Values | Meaning |
+| `[translate]` key | Values | `emit` parameters |
 | --- | --- | --- |
-| `ir_ssa_x87` | `scalar` (default), `scalar-strict` | strict publishes x87 state before loads and stores and uses general arithmetic recipes |
-| `ir_ssa_state` | `locals` (default), `strict` | strict keeps every pre-access GPR/flag snapshot |
-| `ir_ssa_msvc_convention` | `true` (default), `false` | false publishes complete x87 state at calls and returns; flags stay exact in both modes |
-| `ir_ssa_x87_lazy_nan` | `true` (default), `false` | defer the per-arithmetic NaN/IE check and indefinite canonicalisation to sinks and internal CFG edges; `false` restores the eager `fx87`/`fx87_exact` emission byte for byte |
+| `fault_state` | `"relaxed"` (default), `"exact"` | relaxed: `x87_scalar_strict=False, local_state=True`; exact: strict x87 (publish before loads and stores, general arithmetic recipes) and every pre-access GPR/flag snapshot. The decoded fallback's `x87_locals`/`cpu_locals` follow the same key |
+| `msvc_x87_convention` | `true` (default), `false` | `msvc_convention`; false publishes complete x87 state at calls and returns. Flags stay exact in both modes |
 
-`RECOMP_NULL_CHECKS=1` builds always compile the strict forms of all of these: `emit`
-emits a strict/fast `#if` pair whenever any policy is relaxed. `emit()`
-defaults to the production policy (`x87_scalar_strict=False, local_state=True,
-msvc_convention=True`); the lazy-NaN parameter is opt-in at the `emit` layer and
-the production selector reads `ir_ssa_x87_lazy_nan` with a default of `true`.
+Lazy NaN/IE checks (`lazy_nan=True`) are exact and always on in production; the
+`emit` parameter remains so the synthetic checks can compare against the eager
+`fx87`/`fx87_exact` emission. `RECOMP_NULL_CHECKS=1` builds always compile the
+strict forms: `emit` emits a strict/fast `#if` pair whenever any policy is
+relaxed. `emit()` defaults to the production policy except `lazy_nan`, which is
+opt-in at that layer.
 
 DIVERGENCE(original): [ssa-x87-scalar] interior access faults and store watch
 callbacks may expose the preceding published x87 state, and internal CFG edges
@@ -456,12 +455,14 @@ is additional evidence, not a replacement for conservative analysis.
 
 ```toml
 [translate]
-ir_ssa = true
-ir_ssa_x87 = "scalar"    # scalar (default) or scalar-strict
-ir_ssa_state = "locals"  # locals (default) or strict
-ir_ssa_msvc_convention = true  # false: conservative call/return publication
-ir_ssa_x87_lazy_nan = true  # false: eager per-op NaN/IE checks
+ir_ssa = true                # false: decoded C only
+fault_state = "relaxed"      # "exact": publish state at every instruction
+msvc_x87_convention = true   # false: conservative call/return publication
 ```
+
+These are the defaults. Earlier keys (`x87_locals`, `cpu_locals`, `ir_ssa_x87`,
+`ir_ssa_state`, `ir_ssa_msvc_convention`, `ir_ssa_x87_lazy_nan`) are rejected
+with the name of their replacement.
 
 Regenerate with `tools/build.py --regenerate`; `ir_ssa = false` restores decoded
 emission. Discovery, entry ownership and decoded dispatch validation run first;

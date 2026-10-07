@@ -476,16 +476,10 @@ def parse_args(argv, system=None):
                         help="Build/check/report a game-owned native-reference function corpus")
     parser.add_argument("--corpus-ir-ssa", action="store_true",
                         help="Try integer IR SSA in the corpus combined mode, recording fallbacks")
-    parser.add_argument("--corpus-ir-ssa-x87", choices=("scalar", "scalar-strict"), default=None,
-                        help="x87 policy for --corpus-ir-ssa (default: scalar, the production policy)")
-    parser.add_argument("--corpus-ir-ssa-state", choices=("strict", "locals"), default=None,
-                        help="CPU publication policy for --corpus-ir-ssa (default: locals, the production policy)")
-    parser.add_argument("--corpus-ir-ssa-convention", choices=("msvc", "exact"), default=None,
-                        type=str, help="Call convention for --corpus-ir-ssa: msvc (default, "
-                        "ir_ssa_msvc_convention) or exact (conservative publication)")
-    parser.add_argument("--corpus-ir-ssa-lazy-nan", choices=("on", "off"), default=None,
-                        help="Defer the per-op NaN/IE check to sinks for --corpus-ir-ssa: "
-                             "on (default, ir_ssa_x87_lazy_nan) or off (eager fx87 emission)")
+    parser.add_argument("--corpus-fault-state", choices=("relaxed", "exact"), default=None,
+                        help="[translate] fault_state for --corpus-ir-ssa (default: relaxed)")
+    parser.add_argument("--corpus-msvc-x87-convention", choices=("on", "off"), default=None,
+                        help="[translate] msvc_x87_convention for --corpus-ir-ssa (default: on)")
     parser.add_argument("--corpus-ir-ssa-ceiling", metavar="A,C,D,E|all", default=None,
                         help="Add the UNPROVEN, corpus-only SSA ceiling column with these relaxations "
                              "(requires --corpus-ir-ssa scalar x87 and locals state)")
@@ -573,18 +567,12 @@ def parse_args(argv, system=None):
         parser.error("--corpus-asan is a correctness build; pass --corpus-trial-ms 0")
     if args.corpus_ir_ssa_ceiling is not None and not args.corpus_ir_ssa:
         parser.error("--corpus-ir-ssa-ceiling requires --corpus-ir-ssa")
-    if args.corpus_ir_ssa_x87 is not None and not args.corpus_ir_ssa:
-        parser.error("--corpus-ir-ssa-x87 requires --corpus-ir-ssa")
-    if args.corpus_ir_ssa_state is not None and not args.corpus_ir_ssa:
-        parser.error("--corpus-ir-ssa-state requires --corpus-ir-ssa")
-    if args.corpus_ir_ssa_convention is not None and not args.corpus_ir_ssa:
-        parser.error("--corpus-ir-ssa-convention requires --corpus-ir-ssa")
-    if args.corpus_ir_ssa_lazy_nan is not None and not args.corpus_ir_ssa:
-        parser.error("--corpus-ir-ssa-lazy-nan requires --corpus-ir-ssa")
-    if args.corpus_ir_ssa_convention is not None:
-        args.corpus_ir_ssa_convention = args.corpus_ir_ssa_convention == "msvc"
-    if args.corpus_ir_ssa_lazy_nan is not None:
-        args.corpus_ir_ssa_lazy_nan = args.corpus_ir_ssa_lazy_nan == "on"
+    if args.corpus_fault_state is not None and not args.corpus_ir_ssa:
+        parser.error("--corpus-fault-state requires --corpus-ir-ssa")
+    if args.corpus_msvc_x87_convention is not None and not args.corpus_ir_ssa:
+        parser.error("--corpus-msvc-x87-convention requires --corpus-ir-ssa")
+    if args.corpus_msvc_x87_convention is not None:
+        args.corpus_msvc_x87_convention = args.corpus_msvc_x87_convention == "on"
     if args.corpus_ir_ssa and (args.corpus_x87_dataflow or args.corpus_stack_forwarding or args.corpus_decoded_dataflow):
         parser.error("--corpus-ir-ssa and decoded-dataflow corpus modes must run separately")
     if args.ir_ssa_checks and any((args.regenerate, args.stub, args.corpus_fragments,
@@ -614,9 +602,8 @@ def main():
             run_corpus(args.function_corpus, args.game_dir, args.build_root / "function-corpus",
                        cmake_tool("cmake"), args.jobs, args.corpus_checks,
                        args.corpus_trial_ms, args.corpus_trials, args.corpus_x87_dataflow, args.corpus_stack_forwarding, args.corpus_decoded_dataflow,
-                       args.corpus_ir_ssa, args.corpus_ir_ssa_x87,
-                       args.corpus_ir_ssa_state, ir_ssa_convention=args.corpus_ir_ssa_convention,
-                       ir_ssa_lazy_nan=args.corpus_ir_ssa_lazy_nan,
+                       args.corpus_ir_ssa, fault_state=args.corpus_fault_state,
+                       msvc_x87_convention=args.corpus_msvc_x87_convention,
                        ir_ssa_ceiling=args.corpus_ir_ssa_ceiling, asan=args.corpus_asan)
         return
     if args.corpus_fragments:

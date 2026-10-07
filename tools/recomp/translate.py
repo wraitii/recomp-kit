@@ -214,12 +214,13 @@ def configure_module(cfg, key):
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT, SYMBOL_PREFIX, AUX_MODULE
     global RESUMABLE_STACKS, X87_LOCALS, X87_DATAFLOW, X87_STACK_FORWARDING, DECODED_DATAFLOW, CPU_LOCALS
     configure_intrinsics({"translate": {"intrinsics": {}}})
-    RESUMABLE_STACKS = cfg["translate"].get("resumable_stacks", False)
-    X87_LOCALS = cfg["translate"].get("x87_locals", False)
-    X87_DATAFLOW = cfg["translate"].get("x87_dataflow", False)
-    X87_STACK_FORWARDING = cfg["translate"].get("x87_stack_forwarding", False)
-    DECODED_DATAFLOW = cfg["translate"].get("decoded_dataflow", False)
-    CPU_LOCALS = cfg["translate"].get("cpu_locals", False)
+    tl = cfg.get("translate", {})
+    RESUMABLE_STACKS = tl.get("resumable_stacks", False)
+    X87_LOCALS = tl.get("fault_state", game_config.TRANSLATE_DEFAULTS["fault_state"]) == "relaxed"
+    X87_DATAFLOW = tl.get("x87_dataflow", False)
+    X87_STACK_FORWARDING = tl.get("x87_stack_forwarding", False)
+    DECODED_DATAFLOW = tl.get("decoded_dataflow", False)
+    CPU_LOCALS = X87_LOCALS
     mods = {m["key"]: m for m in cfg.get("aux_modules", [])}
     if key not in mods:
         raise SystemExit("game.toml has no [modules.aux.%s]" % key)
@@ -258,30 +259,31 @@ def configure(cfg):
     """Point the translator at one game's listings, binary and audited reads."""
     global LISTINGS, FUNCS_TSV, BINARY, CURATED, ANIMATION_COUNTER, VISUAL_ANIMATION_READS
     configure_intrinsics(cfg)
+    translate = cfg.get("translate", {})
     listings = str(cfg["listings_path"])
     LISTINGS = os.path.join(listings, "functions")
     FUNCS_TSV = os.path.join(listings, "functions.tsv")
     BINARY = str(cfg["developer_exe_path"])
-    CURATED = os.path.join(str(cfg["dir"]), cfg["translate"].get("globals", "globals.toml"))
-    ANIMATION_COUNTER = cfg["translate"]["animation_counter"]
-    VISUAL_ANIMATION_READS = frozenset(cfg["translate"].get("volatile_reads", ()))
+    CURATED = os.path.join(str(cfg["dir"]), translate.get("globals", "globals.toml"))
+    ANIMATION_COUNTER = translate["animation_counter"]
+    VISUAL_ANIMATION_READS = frozenset(translate.get("volatile_reads", ()))
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT
     global RESUMABLE_STACKS, X87_LOCALS, X87_DATAFLOW, X87_STACK_FORWARDING, DECODED_DATAFLOW, CPU_LOCALS
-    RESUMABLE_STACKS = cfg["translate"].get("resumable_stacks", False)
-    X87_LOCALS = cfg["translate"].get("x87_locals", False)
-    X87_DATAFLOW = cfg["translate"].get("x87_dataflow", False)
-    X87_STACK_FORWARDING = cfg["translate"].get("x87_stack_forwarding", False)
-    DECODED_DATAFLOW = cfg["translate"].get("decoded_dataflow", False)
-    CPU_LOCALS = cfg["translate"].get("cpu_locals", False)
-    EXTRA_ENTRY_POINTS = frozenset(int(a) for a in cfg["translate"].get("entry_points", ()))
-    FUNCTION_ALIGNMENT = cfg["translate"].get("function_alignment", 16)
+    RESUMABLE_STACKS = translate.get("resumable_stacks", False)
+    X87_LOCALS = translate.get("fault_state", game_config.TRANSLATE_DEFAULTS["fault_state"]) == "relaxed"
+    X87_DATAFLOW = translate.get("x87_dataflow", False)
+    X87_STACK_FORWARDING = translate.get("x87_stack_forwarding", False)
+    DECODED_DATAFLOW = translate.get("decoded_dataflow", False)
+    CPU_LOCALS = X87_LOCALS
+    EXTRA_ENTRY_POINTS = frozenset(int(a) for a in translate.get("entry_points", ()))
+    FUNCTION_ALIGNMENT = translate.get("function_alignment", 16)
     global OPERAND_REDIRECTS, INSTRUCTION_PATCHES, DATA_SEEDS
     OPERAND_REDIRECTS = {int(r["at"]): (int(r["from"]), int(r["to"]))
-                         for r in cfg["translate"].get("operand_redirects", ())}
+                         for r in translate.get("operand_redirects", ())}
     INSTRUCTION_PATCHES = {int(r["at"]): str(r["text"])
-                           for r in cfg["translate"].get("instruction_patches", ())}
+                           for r in translate.get("instruction_patches", ())}
     DATA_SEEDS = []
-    for r in cfg["translate"].get("data_seeds", ()):
+    for r in translate.get("data_seeds", ()):
         if "float" in r:
             value = struct.unpack("<I", struct.pack("<f", float(r["float"])))[0]
         else:
@@ -449,7 +451,7 @@ INTRINSIC_BODY = {}
 def configure_intrinsics(cfg):
     """Install only the runtime intrinsic addresses declared for this image."""
     global INTRINSIC_SETJMP, INTRINSIC_LONGJMP, INTRINSIC_BODY
-    configured = cfg["translate"].get("intrinsics", {})
+    configured = cfg.get("translate", {}).get("intrinsics", {})
     if not isinstance(configured, dict):
         raise TranslateError("[translate.intrinsics] must be a table")
     unknown = set(configured) - {"setjmp", "longjmp"}
@@ -6241,9 +6243,10 @@ def main():
     # Boundary recovery and all decoded dispatch gates above stay authoritative.
     # SSA only replaces admitted final bodies, using the same stable entries.
     ir_ssa_report = {"enabled": False}
-    if cfg.get("translate", {}).get("ir_ssa", False):
+    translate_cfg = cfg.get("translate", {})
+    if translate_cfg.get("ir_ssa", game_config.TRANSLATE_DEFAULTS["ir_ssa"]):
         from ir.production import apply
-        ir_ssa_report = apply(tr, ok, bodies, entries_by_fn, cfg["translate"],
+        ir_ssa_report = apply(tr, ok, bodies, entries_by_fn, translate_cfg,
                               module=bool(args.as_module or AUX_MODULE), quiet=args.quiet,
                               policies={"intrinsic_bodies": INTRINSIC_BODY,
                                         "instruction_patches": INSTRUCTION_PATCHES,

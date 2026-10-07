@@ -103,15 +103,14 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
     known = {fn.addr for fn in functions}
     forbidden = (set(tr.seh_helpers) | set(tr.noreturn_callees)
                  | set(policies.get("intrinsic_bodies", {})))
-    mode = settings.get("ir_ssa_x87", "scalar")
-    state = settings.get("ir_ssa_state", "locals")
-    convention = settings.get("ir_ssa_msvc_convention", True)
-    lazy_nan = settings.get("ir_ssa_x87_lazy_nan", True)
+    relaxed = settings.get("fault_state", "relaxed") == "relaxed"
+    mode, state = ("scalar", "locals") if relaxed else ("scalar-strict", "strict")
+    convention = settings.get("msvc_x87_convention", True)
     common = {
-        "x87_scalar_strict": mode == "scalar-strict",
-        "local_state": state == "locals",
+        "x87_scalar_strict": not relaxed,
+        "local_state": relaxed,
         "msvc_convention": convention,
-        "lazy_nan": lazy_nan,
+        "lazy_nan": True,
         "resumable_stacks": policies.get("resumable_stacks", False),
         "indirect_call_symbol": "recomp_call",
     }
@@ -195,7 +194,7 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
     emitted = sum(row["emitted"] for row in results.values())
     report = {
         "enabled": True, "x87": mode, "state": state, "msvc_convention": convention,
-        "lazy_nan": lazy_nan,
+        "lazy_nan": True,
         "functions": total, "emitted": emitted, "fallback": total - emitted,
         "emitted_percent": 100 * emitted / total if total else 0,
         "fallback_percent": 100 * (total - emitted) / total if total else 0,

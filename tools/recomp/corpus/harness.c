@@ -17,7 +17,7 @@
 int corpus_relaxed_boundaries;
 unsigned corpus_relaxed_boundary_mismatches;
 
-/* ir_ssa_msvc_convention: the combined SSA variant leaves
+/* msvc_x87_convention: the combined SSA variant leaves
  * popped x87 residue unpublished at calls and returns. That mode, and boundary
  * hooks while it runs, compare canonical copies with the value/bits/exact of
  * empty registers and the bits of registers whose exact flag is clear (no

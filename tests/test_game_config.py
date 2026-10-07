@@ -20,39 +20,37 @@ gen_game_config = load_module("gen_game_config")
 
 
 class LoadTests(unittest.TestCase):
-    def test_production_ssa_defaults_and_validation(self):
+    def test_translation_profile_defaults_and_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
             game = Path(tmp)
             stub = (ROOT / "games/stub/game.toml").read_text()
             (game / "globals.toml").write_text("")
             (game / "game.toml").write_text(stub)
             settings = game_config.load(game)["translate"]
-            self.assertFalse(settings["ir_ssa"])
-            self.assertEqual(settings["ir_ssa_x87"], "scalar")
-            self.assertEqual(settings["ir_ssa_state"], "locals")
-            for key, value in (("ir_ssa", "1"), ("ir_ssa_x87", '"bad"'),
-                               ("ir_ssa_state", '"bad"')):
+            self.assertTrue(settings["ir_ssa"])
+            self.assertEqual(settings["fault_state"], "relaxed")
+            self.assertTrue(settings["msvc_x87_convention"])
+            for key, value in (("ir_ssa", "1"), ("fault_state", '"strict"'),
+                               ("msvc_x87_convention", '"yes"')):
                 (game / "game.toml").write_text(stub.replace(
                     "[translate]\n", "[translate]\n%s = %s\n" % (key, value)))
                 with self.assertRaisesRegex(ValueError, key):
                     game_config.load(game)
 
-    def test_cpu_locals_defaults_and_rejects_non_boolean(self):
+    def test_removed_translation_keys_name_their_replacement(self):
         with tempfile.TemporaryDirectory() as tmp:
             game = Path(tmp)
             stub = (ROOT / "games/stub/game.toml").read_text()
             (game / "globals.toml").write_text("")
-            (game / "game.toml").write_text(stub)
-            self.assertFalse(game_config.load(game)["translate"]["cpu_locals"])
-            for value in ("true", "false", "1", '"true"'):
-                (game / "game.toml").write_text(stub.replace(
-                    "[translate]\n", "[translate]\ncpu_locals = " + value + "\n"))
-                if value in ("true", "false"):
-                    self.assertEqual(game_config.load(game)["translate"]["cpu_locals"],
-                                     value == "true")
-                else:
-                    with self.assertRaisesRegex(ValueError, "cpu_locals"):
-                        game_config.load(game)
+            for key, replacement in (("cpu_locals = true", "fault_state"),
+                                     ("x87_locals = true", "fault_state"),
+                                     ('ir_ssa_x87 = "scalar"', "fault_state"),
+                                     ('ir_ssa_state = "locals"', "fault_state"),
+                                     ("ir_ssa_msvc_convention = true", "msvc_x87_convention"),
+                                     ("ir_ssa_x87_lazy_nan = true", "always on")):
+                (game / "game.toml").write_text(stub.replace("[translate]\n", "[translate]\n%s\n" % key))
+                with self.assertRaisesRegex(ValueError, "removed; .*%s" % replacement):
+                    game_config.load(game)
 
     def test_cd_tracks_preserve_disc_order_and_reject_non_strings(self):
         with tempfile.TemporaryDirectory() as tmp:

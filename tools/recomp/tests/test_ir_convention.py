@@ -129,5 +129,5 @@ def test_null_check_builds_compile_the_conservative_form():
 
 def test_production_passes_the_setting_and_reports_it():
     source = Path(production.__file__).read_text()
-    assert 'settings.get("ir_ssa_msvc_convention", True)' in source
+    assert 'settings.get("msvc_x87_convention", True)' in source
     assert "\"msvc_convention\": convention" in source and '"convention_census"' in source

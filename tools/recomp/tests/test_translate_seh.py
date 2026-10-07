@@ -7,6 +7,7 @@ import pytest
 
 from test_translate_driver import synthetic_image
 from test_translate_driver import translate_entry_fixture
+from test_translate_driver import DECODED_PROFILE
 from test_translate_insns import Case, T, translate_case
 
 BASE = 0x0D02A000
@@ -203,7 +204,7 @@ def test_omitted_landing_is_a_structural_entry(tmp_path, monkeypatch, typed, def
     out = tmp_path / "gen"
     report = out / "translate-report.json"
     monkeypatch.setattr(T, "configure", lambda cfg: None)
-    monkeypatch.setattr(T.game_config, "load", lambda path: {})
+    monkeypatch.setattr(T.game_config, "load", lambda path: DECODED_PROFILE)
     for name, value in (("LISTINGS", listings), ("FUNCS_TSV", table),
                         ("BINARY", binary), ("CURATED", curated)):
         monkeypatch.setattr(T, name, str(value))
@@ -272,7 +273,7 @@ def test_constructor_helper_checkpoint_belongs_to_its_caller(tmp_path, monkeypat
     curated.write_text("")
     out = tmp_path / "gen"
     monkeypatch.setattr(T, "configure", lambda cfg: None)
-    monkeypatch.setattr(T.game_config, "load", lambda path: {})
+    monkeypatch.setattr(T.game_config, "load", lambda path: DECODED_PROFILE)
     for name, value in (("LISTINGS", listings), ("FUNCS_TSV", table),
                         ("BINARY", binary), ("CURATED", curated)):
         monkeypatch.setattr(T, name, str(value))

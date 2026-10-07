@@ -183,12 +183,13 @@ callees. The corpus eager variant emits every flag, providing a stronger oracle
 than the older conventionally optimized eager variant. Current-runtime matches
 still do not establish original-x86 equivalence.
 
-The default `--corpus-ir-ssa-x87 scalar` uses scalar x87 stack/environment state
-with exact outgoing residues; `scalar-strict` retains pre-load observations and
-general arithmetic. The default `--corpus-ir-ssa-state locals` separately defers
+The default `--corpus-fault-state relaxed` (the `[translate] fault_state` key)
+uses scalar x87 stack/environment state with exact outgoing residues and defers
 ordinary read GPR/flag snapshots, retaining diagnostics and complete
-store/call/exit state; `strict` keeps them. The default policies keep a strict
-path under `RECOMP_NULL_CHECKS=1`, and the report records the selection. See [the IR contracts](../../../docs/ir.md#scalar-x87-and-local-cpu-state).
+store/call/exit state; `exact` retains pre-load observations, general arithmetic
+and every snapshot. `--corpus-msvc-x87-convention off` restores conservative
+call/return publication. The relaxed policies keep a strict path under
+`RECOMP_NULL_CHECKS=1`, and the report records the selection. See [the IR contracts](../../../docs/ir.md#scalar-x87-and-local-cpu-state).
 
 ### Experimental SSA ceiling column
 

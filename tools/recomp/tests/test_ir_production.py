@@ -14,7 +14,7 @@ from ir.production import apply, MAX_INSTRUCTIONS
 from test_translate_driver import synthetic_image
 
 ENTRY, CALLEE = 0x00401000, 0x00401100
-SETTINGS = {"ir_ssa_x87": "scalar", "ir_ssa_state": "locals"}
+SETTINGS = {"fault_state": "relaxed", "msvc_x87_convention": True}
 
 
 def fixture(code):

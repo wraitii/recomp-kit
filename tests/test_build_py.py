@@ -302,34 +302,20 @@ def test_retired_llvm_experiment_options_are_rejected():
             build_py.parse_args(option, system='Darwin')
 
 
-def test_corpus_ir_ssa_x87_mode_is_explicit_and_requires_ir_ssa():
+def test_corpus_fault_state_and_convention_require_ir_ssa():
     import pytest
     args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa',
-                                   '--corpus-ir-ssa-x87', 'scalar-strict'], system='Darwin')
-    assert args.corpus_ir_ssa_x87 == 'scalar-strict'
+                                   '--corpus-fault-state', 'exact',
+                                   '--corpus-msvc-x87-convention', 'off'], system='Darwin')
+    assert args.corpus_fault_state == 'exact'
+    assert args.corpus_msvc_x87_convention is False
     args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa'], system='Darwin')
-    assert args.corpus_ir_ssa_x87 is None
-    with pytest.raises(SystemExit):
-        build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa-x87', 'scalar'],
-                            system='Darwin')
-    with pytest.raises(SystemExit):
-        build_py.parse_args(['--corpus-ir-ssa-x87', 'scalar'], system='Darwin')
-    for retired in ('effects', 'values', 'region'):
+    assert args.corpus_fault_state is None and args.corpus_msvc_x87_convention is None
+    for flags in (['--corpus-fault-state', 'relaxed'], ['--corpus-msvc-x87-convention', 'on']):
         with pytest.raises(SystemExit):
-            build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa',
-                                 '--corpus-ir-ssa-x87', retired], system='Darwin')
-    with pytest.raises(SystemExit):
-        build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa',
-                             '--corpus-ir-ssa-x87', 'bogus'], system='Darwin')
-
-
-def test_corpus_ir_ssa_local_state_requires_explicit_ssa():
-    import pytest
-    args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa',
-                                  '--corpus-ir-ssa-x87', 'scalar', '--corpus-ir-ssa-state', 'locals'],
-                                 system='Darwin')
-    assert args.corpus_ir_ssa_state == 'locals'
-    assert args.corpus_ir_ssa_x87 == 'scalar'
-    with pytest.raises(SystemExit):
-        build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa-state', 'locals'],
-                            system='Darwin')
+            build_py.parse_args(['--function-corpus', 'manifest.json', *flags], system='Darwin')
+    for retired in (['--corpus-ir-ssa-x87', 'scalar'], ['--corpus-ir-ssa-state', 'locals'],
+                    ['--corpus-ir-ssa-lazy-nan', 'on'], ['--corpus-fault-state', 'bogus']):
+        with pytest.raises(SystemExit):
+            build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa', *retired],
+                                system='Darwin')

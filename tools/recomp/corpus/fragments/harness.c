@@ -106,7 +106,7 @@ static void discard_empty_contents(X86 *c) {
         }
 }
 
-/* Columns in FIXTURE_CONVENTION_MASK use ir_ssa_msvc_convention: arithmetic
+/* Columns in FIXTURE_CONVENTION_MASK use msvc_x87_convention: arithmetic
  * popped x87 residue is dead at calls and returns. They compare
  * with the value/bits/exact of empty registers and the
  * bits of registers whose exact flag is clear (unread) cleared; DF, TOP, tags,

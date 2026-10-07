@@ -115,13 +115,17 @@ def test_early_dispatch_exit_does_not_publish_unwritten_slots():
     assert 'c->fpu_sw = x87_env_.fpu_sw;' in branch
 
 
-def test_config_is_boolean_and_requires_existing_local_mode(tmp_path):
+def test_config_is_boolean_and_requires_relaxed_fault_state(tmp_path):
     cfg = T.game_config.load(Path(__file__).resolve().parents[3] / 'games/stub')
     text = (cfg['dir'] / 'game.toml').read_text()
-    for setting, message in [('"yes"', 'must be a boolean'), ('true', 'requires x87_locals')]:
-        (tmp_path / 'game.toml').write_text(text.replace('[translate]', '[translate]\nx87_dataflow = ' + setting))
-        with pytest.raises(ValueError, match=message):
-            T.game_config.load(tmp_path)
+    (tmp_path / 'game.toml').write_text(text.replace(
+        '[translate]', '[translate]\nx87_dataflow = "yes"'))
+    with pytest.raises(ValueError, match='must be a boolean'):
+        T.game_config.load(tmp_path)
+    (tmp_path / 'game.toml').write_text(text.replace(
+        '[translate]', '[translate]\nfault_state = "exact"\nx87_dataflow = true'))
+    with pytest.raises(ValueError, match='requires fault_state'):
+        T.game_config.load(tmp_path)
 
 
 def forward(lines, entries=(), gap=None):

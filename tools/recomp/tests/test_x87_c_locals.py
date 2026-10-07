@@ -148,8 +148,8 @@ def test_listing_gap_cuts_even_without_a_label():
 
 def test_config_is_opt_in_and_boolean(tmp_path):
     cfg = T.game_config.load(Path(__file__).resolve().parents[3] / "games/stub")
-    assert cfg["translate"]["x87_locals"] is False
-    text = (cfg["dir"] / "game.toml").read_text().replace("[translate]", '[translate]\nx87_locals = "yes"')
+    assert cfg["translate"]["fault_state"] == "relaxed"
+    text = (cfg["dir"] / "game.toml").read_text().replace("[translate]", '[translate]\nfault_state = "strict"')
     (tmp_path / "game.toml").write_text(text)
-    with pytest.raises(ValueError, match="x87_locals must be a boolean"):
+    with pytest.raises(ValueError, match="fault_state must be"):
         T.game_config.load(tmp_path)

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Fold the translation settings into a three-key profile whose defaults are
+  every optimization the kit has: `ir_ssa = true`, `fault_state = "relaxed"`
+  (was `x87_locals`, `cpu_locals`, `ir_ssa_x87 = "scalar"` and
+  `ir_ssa_state = "locals"`; `"exact"` selects all of their strict forms) and
+  `msvc_x87_convention = true` (was `ir_ssa_msvc_convention`). Lazy x87 NaN
+  checks are exact and lose their `ir_ssa_x87_lazy_nan` switch. The old keys
+  fail with the name of their replacement. Games that relied on the previous
+  conservative defaults (SSA off, eager decoded C) now get the full profile;
+  set `ir_ssa = false` or `fault_state = "exact"` to opt out. Corpus flags
+  follow: `--corpus-fault-state` and `--corpus-msvc-x87-convention` replace
+  `--corpus-ir-ssa-x87/-state/-convention/-lazy-nan`. Ghost Recon regenerates
+  byte-identically.
+
 - D3D8 texture sampling now uses the level-0 surface identity shared by
   render-target binding, readback and destruction. Previously sampling a
   render-target texture uploaded stale CPU bytes under its parent texture id,

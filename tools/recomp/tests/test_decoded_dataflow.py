@@ -75,7 +75,7 @@ def test_analysis_budget_retains_conservative_fallback():
 
 def test_decoded_settings_require_existing_stages(tmp_path):
     text = (Path(__file__).resolve().parents[3] / 'games/stub/game.toml').read_text()
-    for value, message in [('"yes"', 'must be a boolean'), ('true', 'requires x87_dataflow and cpu_locals')]:
+    for value, message in [('"yes"', 'must be a boolean'), ('true', 'requires x87_dataflow')]:
         (tmp_path / 'game.toml').write_text(text.replace('[translate]', '[translate]\ndecoded_dataflow = ' + value))
         with pytest.raises(ValueError, match=message):
             T.game_config.load(tmp_path)
