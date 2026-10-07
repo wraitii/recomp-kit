@@ -34,6 +34,7 @@ PORTABLE_TESTS = [
     "tools/recomp/tests/test_translate_insns.py", "tools/recomp/tests/test_jumptables.py",
     "tools/recomp/tests/test_translate_driver.py",
     "tools/recomp/tests/test_ir_summary.py",
+    "tools/recomp/tests/test_ir_contracts.py",
     "tools/recomp/tests/test_ir_ssa.py",
     "tools/recomp/tests/test_ir_x87.py",
     "tools/recomp/tests/test_ir_calls.py",

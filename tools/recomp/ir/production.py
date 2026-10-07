@@ -11,7 +11,7 @@ from collections import Counter
 import re
 import time
 
-from .census import function_ir
+from .cfg import function_ir
 from .emit_c import emit
 from .lift import Lifter, LiftError
 from .ssa import SSAError

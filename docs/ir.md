@@ -1,10 +1,10 @@
-# Instruction IR, SSA and calling-convention analysis
+# Instruction IR, analysis and observable contracts
 
 `tools/recomp/ir/` is a frontend over the same original image bytes and
 instruction boundaries the production translator uses. It provides lifting, a
-whole-image calling-convention census, integer SSA with scalar x87 tracking, and
-a C emitter for the mapped function corpus and for admitted production
-functions. Discovery, entry ownership and fallback C stay with the decoded
+whole-image calling-convention census, observable-contract analysis, integer SSA
+with scalar x87 tracking, and a C emitter for the mapped function corpus and
+admitted production functions. Discovery, entry ownership and fallback C stay with the decoded
 instruction frontend. Census coverage is analysis evidence, not execution,
 equivalence or a performance claim. Game measurements and the optimization plan
 live in the game repository's working doc (`docs/translation-optimization.md`).
@@ -16,6 +16,13 @@ has an opcode, optional output and input varnodes `(space, offset, size)`;
 memory, register byte lanes and arithmetic flags stay explicit. Boundaries come
 from the translator's resolved functions; no alternate decoder boundaries or
 guessed entry points are introduced. Folded WAIT prefixes lift in order.
+
+`cfg.py` owns `FunctionIR`, byte-backed lifting through the production resolver,
+the fixture-only default successors and iterative call-graph SCC traversal.
+Calling-convention inference, observable-contract analysis and emission share
+this representation. Compatibility exports remain in `summary.py`/`census.py`;
+new consumers import the CFG directly. Analyses must not discover alternate
+instruction boundaries or derive evidence from an already optimized emission.
 
 The frontend folds same-operand identities such as `XOR EBX,EBX` but keeps
 consumed carry dependencies such as `SBB EAX,EAX`. It normalizes x87 register
@@ -66,6 +73,160 @@ categories (failed, standard, nonstandard with entry EBP input, other
 nonstandard). Entry EBP input alone does not classify a function as an unwind
 funclet. `tools/recomp/tests/test_ir_summary.py` checks the analyses on real
 instruction bytes.
+
+## Observable region contracts
+
+Region analysis bounds observability around connected code, using the shared
+CFG and original semantics. The analysis foundation below inventories effects
+and demands; private region emission remains future work.
+
+An **observable contract** describes what an outside continuation can distinguish
+about an execution: its boundary events, state visible at those events, possible
+responses, and exit behavior. It belongs to a region **and its environment**,
+not just to a function signature. The same function can have a narrow private
+contract inside a reviewed caller and a complete guest-state contract at its
+public entry. Changing the observer configuration changes the contract.
+
+For admitted inputs and the same external responses, the original and optimized
+region must produce matching projected event traces and matching state at each
+exit. Internal register assignments, physical x87 stack manipulations and
+private spills are absent from that projection only when no admitted observer
+can distinguish them. Dead representation is removable; arithmetic and control
+that influence an observation remain consequential. Timing imports retain their
+positions and dependencies; matching recorded responses is a validation method,
+not permission to replace live clocks or change scheduling policy.
+
+### Contract contents
+
+A complete region contract needs the following facts. The current inventory
+implements machine masks, may-effects and observer boundaries; admitted domains,
+alias/escape proofs and reconstruction plans remain future work. Every narrowed field needs instruction/runtime evidence; unknown means
+conservative, not empty.
+
+| Field | Required information |
+| --- | --- |
+| Identity and scope | Original byte identity, entries, included CFG/callees, all normal/abnormal exits, and observation policy. External entry at an internal address keeps its public thunk. |
+| Admitted domain | Pointer validity and lifetimes, possible overlap, x87 environment/depth, target sets, hook/replacement configuration, threading and fault assumptions. Guarded facts must be checked before any irreversible effect. |
+| Entry dependencies | Register byte lanes, individual flags, logical x87 values/environment and guest memory read before definition, including address/control dependencies and transitive callee reads. |
+| Memory effects | Symbolic guest ranges or reachable objects, reads, may/must writes, escaping addresses, alias relations and unchanged memory. A may-write set bounds damage; it does not permit arbitrary contents inside it. |
+| Boundary events | Site and target, arguments/state and memory the observer can read, writes/clobbers it can perform, callback/reentry/yield behavior, and required ordering. Imports and unknown calls start as complete guest-state boundaries. |
+| Exit obligations | Per-exit live machine state, memory/results, stack cleanup, continuation identity, exceptions, termination and divergence. Preservation of an input can be an obligation even if the region never computes with it. |
+| Reconstruction | A mapping from private values to required guest state at every actual side exit, including intermediate fault/SEH state where supported. Resuming an original continuation must not duplicate completed effects. |
+| Evidence and status | Byte-backed analysis, runtime observer review, unresolved facts, guards, differential cases and covered paths. Distinguish conservative, candidate, guarded and validated facts; testing alone is not a universal proof. |
+
+Boundary contracts are bidirectional. Before an external call, commit memory and
+state it can read. After it returns, invalidate/reload everything it may change,
+including memory reachable through aliases or callbacks. Unknown readers/writers
+may touch arbitrary mapped guest memory; a small fixture snapshot is not a bound
+on their production footprint. If it may not return, model that exit. A read-only
+observer still makes values observable; its required state must be published.
+
+A private representation may use native locals for proven non-escaping spills,
+or resolve guest addresses to borrowed host pointers for a bounded lifetime.
+Guest-visible pointers and object layouts remain 32-bit. Copying guest objects
+into native aggregates additionally requires alias, escape, lifetime and
+intermediate-observer evidence, plus correct writeback/reconstruction; it is not
+implied by a narrow CPU mask. Such representations are future consumers of the
+contract, not part of the inventory tool.
+
+At an unknown guest continuation, keep the production guest state, with only
+already documented divergences. A narrower exit mask requires analysis of the
+actual continuation's reads before overwrite, including later calls and status
+observers. A conventional EAX/ST0 return signature is insufficient. Avoid
+circular proofs: establish dependency facts from original semantics, not from an
+emission that already discarded the state being classified. Separate inputs
+needed for computation from untouched inputs that must survive for a later
+observer: both constrain a private implementation, but only the former need
+participate in its arithmetic.
+
+### What creates an observation point
+
+- **Outside code:** fallback bodies, unresolved direct/indirect calls, imports,
+  callbacks, hooks and native replacements. A reviewed call included in the
+  region is an internal edge; a call is not inherently an observation point.
+- **Guest-visible memory:** commit before a reader can execute. Until escape and
+  alias proofs exist, retain guest accesses and their order. Private stack slots
+  can become locals only if no callback, unwind path or escaping pointer exposes
+  them. Allocation/address identity and shared-object changes are also effects.
+- **Machine-state observers:** flag consumers, x87 status/control/environment
+  instructions, SEH contexts, and resumable returns. These can be represented
+  as ordinary SSA data inside a region; at outside boundaries they need guest
+  state or an explicit private interface.
+- **Scheduling and services:** imports are scheduler checkpoints in the current
+  runtime, even when the individual shim appears read-only. Other guest threads
+  can observe memory after a yield. Preserve checkpoints and reload shared state
+  after external execution; one execution baton is not whole-region immutability.
+- **Faults and exceptional exits:** an access or divide can terminate or expose
+  intermediate effects/state to a handler. Normal-return equivalence is weaker
+  than this contract. First production regions need supported reconstruction or
+  conservative seams; mapped-input corpus tests do not establish fault fidelity.
+- **Instrumentation:** active entry hooks observe CPU/stack and can change control.
+  Store-watch/dirty observers see accesses. A private path must preserve these
+  events or use the conservative path under a proven configuration guard.
+  Decide explicitly which profiling/diagnostic events are retained; do not
+  silently turn a source-level instrumentation boundary into an internal edge.
+
+Retain original order for external calls, RNG steps, guest writes and potentially
+faulting accesses initially. Later transformations may relax order only with
+specific independence and fault/observer evidence. Equality of final memory
+alone misses a write followed by an external read and then an overwrite.
+
+### Composition
+
+Compute conservative effects from original lifted instructions and reviewed
+runtime observers. Propagate known callee contracts bottom-up, and propagate
+which produced state callers/continuations can observe backward from the
+region's external edges. Iterate recursive components conservatively. Unknown
+targets and incomplete summaries retain complete boundaries. Enlarging a region
+removes an internal publication seam, not the underlying value dependency.
+
+### Observable-contract foundation
+
+`ir/contracts/` is an analysis-only layer. It does not change production
+publication, dispatch, hooks, x87 policy or the corpus comparison contract.
+
+| Module | Responsibility |
+| --- | --- |
+| `model.py` | Immutable CPU/memory masks, may-effects, bidirectional observer contracts, instruction nodes and function facts. Unknown is universal, distinct from empty. Masks can express all state except definitely overwritten lanes. |
+| `dataflow.py` | Backward CPU demands over CFG joins/loops, reachable may-effects and transitive call effects. Recursive components converge by monotone union; missing callees contribute universal effects. Cycles conservatively may not return. |
+| `lifted.py` | Original lifted instructions to conservative facts. Calls stay outside boundaries even when their callees are known. Loads/stores retain fault observers; raw x87/opaque effects contribute universal state/memory effects. |
+| `report.py` | Deterministic inventory and per-node demands with explicit limitations. Every report sets `optimization_authorized: false`. |
+
+An observer records both reads before outside execution and possible response
+clobbers/events. A possible write is not a definite overwrite and cannot kill
+backward demand. The default observer can read/write all CPU and memory, yield,
+callback, fault or fail to return; no Win32 convention is imported as evidence.
+Node definitions concern normal continuation only. Fault reconstruction and
+memory liveness need separate analyses before private regions can be emitted.
+
+Raw SLEIGH lacks complete arithmetic flags and x87 semantics. Arithmetic flag
+writes get unknown CPU-write effects and no definite definitions. x87 and other
+unmodeled operations retain universal effects. Integer register reads are a
+syntactic inventory, not precise semantic inputs. Public exits remain complete.
+Effect sets report possibilities; the original CFG retains sequencing, and an
+effect union never authorizes reordering or removal of events.
+
+Inventory a game's byte-pinned corpus without compiling or timing:
+
+```sh
+/path/to/game/tools/.venv/bin/python tools/recomp/analyze_contracts.py \
+  --game-dir /path/to/game --manifest /path/to/game/benchmarks/functions/corpus.json \
+  --out /path/to/game/build/function-contracts/report.json
+```
+
+The tool verifies executable, map and instruction hashes, rejects configured
+instruction rewrites, and lifts original bytes with production CFG successors.
+Reports stay in the game's ignored build tree. Fixture stubs, native comparison
+masks and legacy convention summaries never narrow production boundaries.
+`test_ir_contracts.py` covers the mask lattice, byte lanes, joins/loops,
+alternative entries, observer clobbers, unresolved/recursive/deep call graphs,
+byte-backed effect inventories and input-provenance failures.
+
+Extend the corrected instruction-effect adapter and memory/escape analysis next;
+then introduce explicit observer policies and a validated reconstruction plan.
+Keep diagnostic inventories separate from any future codegen admission type.
+Neither a successful report nor a narrowed test mask establishes a safe private
+ABI. Full-state production/corpus checks remain the comparison baseline.
 
 ## SSA and C emission
 
@@ -199,6 +360,20 @@ terminates; a future returning, CPU-mutating observer needs an explicit SSA
 effect model before admission.
 
 ## Validation
+
+### Validation obligations
+
+Keep the current full-state column as an oracle. Add a separate region column
+that compares at actual external cuts: ordered boundary events, declared
+CPU/memory observations, injected external responses and all admitted exit
+obligations. Internal calls should remain available as diagnostic checkpoints,
+without requiring an artificial physical register file there. Test aliasing,
+NaNs/signed zero/subnormals, PC/RC/TOP, multiple and early exits, boundary clobbers,
+hooks, reentry and failures according to the claimed domain. Vary state declared
+irrelevant while holding dependencies fixed to detect missed dependencies; this
+is additional evidence, not a replacement for conservative analysis.
+
+### Existing checks
 
 - `tools/recomp/tests/test_ir_*.py` (portable suite): byte-backed lifting, SSA
   interpreter checks, pass idempotence, publication plans, emitter admission and

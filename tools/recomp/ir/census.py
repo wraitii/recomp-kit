@@ -11,26 +11,8 @@ import time
 
 from .imports import read_import_cleanup
 from .lift import Lifter, LiftError
-from .summary import FunctionIR, summarize_all
-
-
-def function_ir(tr, lifter, fn):
-    """Lift `fn`'s listed instructions from the image bytes with the
-    translator's successors."""
-    image = tr.image
-    if not hasattr(fn, "index"):
-        tr.prepare(fn)
-    insns = []
-    for i, ins in enumerate(fn.insns):
-        end = fn.fallthrough[i] if fn.fallthrough[i] is not None else image.insn_end(
-            ins.addr, ins.mnem)
-        if end is None or end <= ins.addr:
-            raise LiftError("%08x: instruction length unknown" % ins.addr)
-        lo = ins.addr - image.base
-        insns.append(lifter.lift(ins.addr, bytes(image.data[lo:lo + end - ins.addr]),
-                                 mnem=ins.mnem))
-    succ = [tr.successors(fn, i) for i in range(len(fn.insns))]
-    return FunctionIR(fn.addr, insns, succ)
+from .cfg import function_ir  # compatibility export
+from .summary import summarize_all
 
 
 def direct_targets(fn):

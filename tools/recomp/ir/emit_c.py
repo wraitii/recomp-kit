@@ -14,7 +14,7 @@ from .lift import Lifter, Insn, Op
 from .integer import memory_arithmetic, shift, divide
 from .integer_extra import EXTRA_MNEMONICS, correct as correct_extra
 from .ssa import SSAError, MEMORY, build
-from .summary import FunctionIR
+from .cfg import FunctionIR
 from .simplify import canonicalize, simplify
 from .publication import plan
 from . import x87

@@ -240,6 +240,14 @@
   calls and returns as following the MSVC convention: arithmetic flags
   (CF/PF/AF/ZF/SF/OF) are no longer published before calls or at returns, and
   x87 flushes skip popped residue, assuming registers above TOP are tagged empty.
+||||||| parent of 8962fdc (Add modular observable-contract analysis over shared CFGs)
+- Add an analysis-only observable-contract foundation with immutable effect and
+  observer models, CFG demand propagation, recursive call-effect composition,
+  and byte-verified corpus inventory reports (`tools/recomp/analyze_contracts.py`).
+  Shared instruction CFG/lifting/SCC helpers now live in `ir/cfg.py`, with
+  compatibility exports retained. Unknown observers and missing callees stay
+  conservative; reports never authorize private ABIs or change production code.
+
 - Add `[translate] ir_ssa_msvc_convention` (default `true`). SSA x87
   flushes skip popped residue, assuming registers above TOP are tagged empty.
   Arithmetic flags remain published at calls and returns: CRT assembly helpers

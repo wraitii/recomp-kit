@@ -8,7 +8,7 @@ import capstone
 import translate as T
 from code_map import decode_span
 from .lift import Lifter
-from .summary import FunctionIR, default_successors
+from .cfg import FunctionIR, default_successors
 from .emit_c import emit
 from .integer_extra_checks import CASES as INTEGER_EXTRA_CASES
 from .x87_register_checks import CASES as X87_REGISTER_CASES

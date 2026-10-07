@@ -739,7 +739,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
             wrapped = False
             if ir_ssa and mode in ('combined', CEILING_MODE):
                 from ir.lift import Lifter, LiftError
-                from ir.census import function_ir
+                from ir.cfg import function_ir
                 from ir.ssa import SSAError
                 from ir.emit_c import emit
                 # Only byte-verified, declared direct callees may be bound; an
