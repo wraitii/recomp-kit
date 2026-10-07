@@ -145,7 +145,12 @@ uint32_t imports_alloc_trampoline(const char *dll, const char *name, void (*fn)(
         Tramp &t = tramps()[it->second];
         if (fn) {
             t.fn = fn;
-            t.argc = argc_stdcall;
+            // The loader can reinstall its unsupported handler on image reload.
+            // An unknown replacement signature must not erase known ABI evidence.
+            if (argc_stdcall != ARGC_UNKNOWN)
+                t.argc = argc_stdcall;
+            if (t.argc == ARGC_UNKNOWN)
+                t.argc = decorated_stdcall_args(name);
         }
         return TRAMP_BASE + TRAMP_STRIDE * it->second;
     }

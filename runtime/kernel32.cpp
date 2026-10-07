@@ -5018,6 +5018,9 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "IsBadWritePtr", 2, k_IsBadWritePtr},
     {"KERNEL32.dll", "IsBadCodePtr", 1, k_IsBadCodePtr},
     // ABI known; these APIs remain unsupported and stop with a named diagnostic.
+    {"KERNEL32.dll", "GetComputerNameA", 2, imports_unsupported},
+    {"KERNEL32.dll", "WinExec", 2, imports_unsupported},
+    {"KERNEL32.dll", "lstrcpynA", 3, imports_unsupported},
     {"KERNEL32.dll", "FormatMessageA", 7, imports_unsupported},
     {"KERNEL32.dll", "IsProcessorFeaturePresent", 1, k_IsProcessorFeaturePresent},
     // time

@@ -3966,6 +3966,10 @@ static void test_startup_apis(X86 *c) {
             call_import(c, "abi-test.dll", name, {1, 2});
         else
             call_import(c, "abi-test.dll", name, {1, 2, 3, 4});
+        check(imports_alloc_trampoline("abi-test.dll", name, imports_unsupported, ARGC_UNKNOWN) ==
+                      tramp &&
+                  imports_argc(tramp) == count,
+              "reloading an unsupported decorated import retains its arity: %s", name);
     }
     for (const char *name : {"_bad@3", "_bad@", "_bad@8x", "_bad@99999999999", "@fast@8"}) {
         uint32_t tramp = imports_alloc_trampoline("abi-test.dll", name, nullptr, ARGC_UNKNOWN);
@@ -3999,6 +4003,9 @@ static void test_startup_apis(X86 *c) {
           "LoadImageA(LR_LOADFROMFILE) fails for a missing bitmap");
     uint32_t cdecl = imports_alloc_trampoline("abi-test.dll", "_explicit@8", nullptr, ARGC_CDECL);
     check(imports_argc(cdecl) == ARGC_CDECL, "explicit signature overrides decorated spelling");
+    imports_alloc_trampoline("abi-test.dll", "_explicit@8", imports_unsupported, ARGC_UNKNOWN);
+    check(imports_argc(cdecl) == ARGC_CDECL,
+          "unknown replacement signature retains an explicit calling convention");
 }
 
 static void test_registry(X86 *c) {
@@ -4298,12 +4305,17 @@ static void test_import_coverage(X86 *c) {
     std::string err;
     if (check(pefile_sections(expect, err), "read PE imports for coverage: %s", err.c_str())) {
         std::set<uint32_t> trampolines, data;
+        uint32_t pe_unknown = 0;
         for (const auto &import : expect.imports) {
             uint32_t value = rd32(import.slot);
-            if (imports_is_trampoline(value))
+            if (imports_is_trampoline(value)) {
                 trampolines.insert(value);
-            else if (const LoaderModule *m = loader_module_containing(value);
-                     m && m->base != loader_image_base())
+                if (imports_argc(value) == ARGC_UNKNOWN) {
+                    ++pe_unknown;
+                    printf("  unknown PE import: %s!%s\n", import.dll.c_str(), import.name.c_str());
+                }
+            } else if (const LoaderModule *m = loader_module_containing(value);
+                       m && m->base != loader_image_base())
                 continue; // a translated auxiliary-module export, not data storage
             else
                 data.insert(value);
@@ -4338,6 +4350,9 @@ static void test_import_coverage(X86 *c) {
               user32_checked, user32_missing);
         check(missing == 0, "Delphi DLL argument counts: %u imports checked, %u unknown", checked,
               missing);
+        // Negative ABI tests intentionally register malformed exports. Coverage
+        // of the executable must inspect its IAT rather than those test fixtures.
+        check(pe_unknown == 0, "%u PE imports have an unknown argument count", pe_unknown);
         check(imports_count() >= trampolines.size(),
               "%u trampolines allocated; the IAT references %zu distinct trampolines",
               imports_count(), trampolines.size());
@@ -4359,7 +4374,6 @@ static void test_import_coverage(X86 *c) {
     uint32_t impl = 0, log_only = 0, unknown = 0;
     imports_coverage(&impl, &log_only, &unknown);
     check(impl + log_only == imports_count(), "%u implemented, %u logging-only", impl, log_only);
-    check(unknown == 0, "%u imports have an unknown argument count", unknown);
     if (unknown) {
         // Reuse the runtime's classification rather than duplicating its shim
         // registry in this test. Limit the diagnostic to the first 40 names.

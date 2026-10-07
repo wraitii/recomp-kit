@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Import coverage checks the executable's IAT separately from deliberately
+  malformed ABI test exports. Reloading an unsupported import retains known
+  calling conventions, including decorated stdcall counts. Additional ANSI
+  Win32 signatures have explicit argument counts; their unimplemented APIs
+  still stop with named diagnostics.
+
 - Samply frame markers now include window presents, including D3D8 native
   texture handoff and CPU readback, using the existing `RECOMP_PROFILE_MARKERS`
   opt-in or automatic detection when launched under samply.

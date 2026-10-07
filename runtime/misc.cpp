@@ -2725,6 +2725,10 @@ static void avi_no_sample(X86 *c) {
 }
 
 const ImportShim g_misc_shims[] = {
+    // Published Win32 stdcall signatures; unsupported calls retain named faults.
+    {"comdlg32.dll", "GetOpenFileNameA", 1, imports_unsupported},
+    {"GDI32.dll", "GetTextFaceA", 3, imports_unsupported},
+    {"GDI32.dll", "CreateFontIndirectA", 1, imports_unsupported},
     // ADVAPI32
     {"ADVAPI32.dll", "GetUserNameA", 2, a_GetUserNameA},
     {"ADVAPI32.dll", "GetUserNameW", 2, a_GetUserNameW},

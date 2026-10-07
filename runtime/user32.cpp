@@ -1940,6 +1940,13 @@ void u_ToAsciiEx(X86 *c) {
 }
 
 const ImportShim g_user32_shims[] = {
+    // Published Win32 stdcall signatures; unsupported calls retain named faults.
+    {"USER32.dll", "GetMenuStringA", 5, imports_unsupported},
+    {"USER32.dll", "VkKeyScanA", 1, imports_unsupported},
+    {"USER32.dll", "CharNextExA", 3, imports_unsupported},
+    {"USER32.dll", "CharPrevExA", 4, imports_unsupported},
+    {"USER32.dll", "DrawTextA", 5, imports_unsupported},
+    {"USER32.dll", "keybd_event", 4, imports_unsupported},
     {"USER32.dll", "RegisterClassA", 1, u_RegisterClassA},
     {"USER32.dll", "UnregisterClassA", 2, u_UnregisterClassA},
     {"USER32.dll", "CreateWindowExA", 12, u_CreateWindowExA},
