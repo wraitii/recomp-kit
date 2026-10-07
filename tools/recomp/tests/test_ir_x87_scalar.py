@@ -203,7 +203,7 @@ def test_lazy_nan_fold_uses_a_bound_local():
     assert re.search(r"\w+ = \((\w+) != \1 \? x87_indefinite\(\) : \1\);", lazy)
 
 
-def test_lazy_nan_disabled_for_raw_strict_exact_and_ceiling():
+def test_lazy_nan_disabled_for_raw_strict_exact():
     f = _arith_fnstsw()
     assert (emit(f, "t", optimize=False, lazy_nan=True)
             == emit(f, "t", optimize=False, lazy_nan=False))
@@ -213,8 +213,6 @@ def test_lazy_nan_disabled_for_raw_strict_exact_and_ceiling():
                     lazy_nan=False, _guard_null_checks=False))
     assert (emit(f, "t", msvc_convention=False, lazy_nan=True, _guard_null_checks=False)
             == emit(f, "t", msvc_convention=False, lazy_nan=False, _guard_null_checks=False))
-    assert (emit(f, "t", _ceiling=frozenset("D"), lazy_nan=True)
-            == emit(f, "t", _ceiling=frozenset("D"), lazy_nan=False))
 
 
 def test_lazy_nan_fchs_folds_before_negation():

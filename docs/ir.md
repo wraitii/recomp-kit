@@ -320,8 +320,8 @@ predecessor counted as published at its TOP); TOP is republished when the
 predecessors' published TOPs disagree, and a window of eight or more slots
 falls back to the per-edge flush. Emission checks every carried edge against
 the planned shape and raises `SSAError` (whole-function fallback) on drift.
-Carry requires the MSVC convention: exact-flush bodies, the ceiling column and
-strict mode keep the per-edge flush. Guest loads and stores do not
+Carry requires the MSVC convention: exact-flush bodies and strict mode keep the
+per-edge flush. Guest loads and stores do not
 observe x87 state in the kit runtime (the watchpoint and dirty tracking read
 only address and value), so performance mode publishes none there, as the
 decoded `x87_locals` pass already does; strict mode publishes before every
@@ -343,7 +343,7 @@ moves (`FXCH`, `FLD`/`FST ST(i)`) carry the pending flag. Loaded NaN payloads
 are never marked pending, so they pass through untouched. Host `+ - * /` and
 `sqrt` propagate NaN, and IE is sticky, so the sole observable difference from
 an eager per-op check is when the fold is computed, never its result. The
-relaxation is disabled for strict x87, the exact flush, the ceiling column and
+relaxation is disabled for strict x87, the exact flush and
 `optimize=False`, where emission is byte-identical to the eager helpers.
 
 The `locals` state policy defers GPR/flag publication at guest loads and
@@ -480,30 +480,3 @@ recursion limit keep decoded C for expensive bodies. The translation report's
 fallback reasons per final body; these are frontend coverage metrics, not
 execution coverage or equivalence evidence.
 
-## SSA ceiling experiment (corpus-only, unproven)
-
-`ir/ceiling.py` defines four aggressive relaxations that the function corpus can
-apply as one extra "SSA ceiling" column to measure what they could buy before any
-is proven. They are not part of the agreed performance-mode contract and never
-reach `game.toml` or `ir/production.py`: the only entry is the private `_ceiling`
-argument of `emit_c.emit`, a regression test checks production never passes it,
-and every other variant is byte-identical when the option is absent. Select them
-with `--corpus-ir-ssa --corpus-ir-ssa-ceiling A,C,D,E|all` (the game wrapper
-spells it `--ir-ssa-ceiling`).
-
-| Letter | Relaxation |
-| --- | --- |
-| A | No access snapshots at all, dropping EIP/ESP/EBP too (production `locals` already defers every other field at loads and stores) |
-| C | x87 values only: no tags or exact shadows, at edges as well as calls and returns |
-| D | No sticky exception bits; NaN canonicalised only at stores |
-| E | Constant PC=00/RC=nearest; slots are plain C `float` |
-
-C, D and E lower only the x87 forms the corpus contains; any other form raises a
-named `SSAError`, and the runner keeps the ordinary scalar/locals body for that
-function and records the reason. The ceiling column is judged on declared
-observations, not full-state equality: native rows use the fixture's observable
-contract; translation-only rows compare declared guest ranges, EAX, ST0 and
-relaxed boundary snapshots. Mismatches are counted, never fatal. With D, sticky IE
-is absent from a status word a guest reads through `FNSTSW AX`. The former B (flags
-dead across calls and returns) was rejected after a CRT flag ABI caused an
-in-game regression. The column is built on top of the production policy.

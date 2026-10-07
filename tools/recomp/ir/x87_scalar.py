@@ -5,7 +5,7 @@ compile-time mapping, not the physical CPU array. Values, exact-integer shadows,
 tags and popped residue are written back before calls, division seams, opaque
 effects and exits. In performance mode the tracker also carries unpublished
 state across internal CFG edges as a fixed-point join shape (`x87_carry.py`);
-strict mode and the ceiling subclass keep publishing at every edge. Only CW/SW
+strict mode keeps publishing at every edge. Only CW/SW
 helpers use a private nonescaping X86 context; no helper receives it unless its
 recipe accesses those two fields exclusively.
 
@@ -24,8 +24,8 @@ division seams, opaque effects and exits, and carries unpublished x87 state
 across internal CFG edges instead of publishing there; loads and stores still
 do not publish. Interior access faults and store watch callbacks may see the
 preceding published x87 state, within the agreed performance-mode contract.
-observe_loads=True (strict) keeps publication before every guest access, and
-the ceiling subclass keeps the per-edge flush.
+observe_loads=True (strict) keeps publication before every guest access and
+the per-edge flush.
 
 DIVERGENCE(original): [ssa-x87-binary32] common PC=00 arithmetic with proven
 binary32 operands uses the documented float exponent-range policy. Other

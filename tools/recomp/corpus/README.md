@@ -153,14 +153,3 @@ and every snapshot. `--corpus-msvc-x87-convention off` restores conservative
 call/return publication. The relaxed policies keep a strict path under
 `RECOMP_NULL_CHECKS=1`, and the report records the selection. See [the IR contracts](../../../docs/ir.md#scalar-x87-and-local-cpu-state).
 
-### Experimental SSA ceiling column
-
-`--corpus-ir-ssa-ceiling A,C,D,E|all` (requires `--corpus-ir-ssa`, scalar x87 and
-locals state) adds an unproven, corpus-only variant between `combined` and
-`native`; see [the IR contract](../../../docs/ir.md#ssa-ceiling-experiment-corpus-only-unproven).
-Its harness records start with `CEILING row checked skipped observation memory eax st0 boundary
-first_input reason` and `CEILING_BENCH row valid`. The default mode order, generated
-tables and existing variants are unchanged when the option is omitted. Fixtures
-may read `corpus_relaxed_boundaries`/`corpus_relaxed_boundary_mismatches` (defined
-by the harness) in their boundary hooks to count rather than abort for that variant.
-

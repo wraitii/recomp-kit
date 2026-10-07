@@ -480,9 +480,6 @@ def parse_args(argv, system=None):
                         help="[translate] fault_state for --corpus-ir-ssa (default: relaxed)")
     parser.add_argument("--corpus-msvc-x87-convention", choices=("on", "off"), default=None,
                         help="[translate] msvc_x87_convention for --corpus-ir-ssa (default: on)")
-    parser.add_argument("--corpus-ir-ssa-ceiling", metavar="A,C,D,E|all", default=None,
-                        help="Add the UNPROVEN, corpus-only SSA ceiling column with these relaxations "
-                             "(requires --corpus-ir-ssa scalar x87 and locals state)")
     parser.add_argument("--corpus-checks", type=int, default=4096)
     parser.add_argument("--corpus-asan", action="store_true",
                         help="Build the corpus with AddressSanitizer; correctness only (needs --corpus-trial-ms 0)")
@@ -553,8 +550,6 @@ def parse_args(argv, system=None):
         parser.error("--corpus-asan requires --function-corpus")
     if args.corpus_asan and args.corpus_trial_ms != 0:
         parser.error("--corpus-asan is a correctness build; pass --corpus-trial-ms 0")
-    if args.corpus_ir_ssa_ceiling is not None and not args.corpus_ir_ssa:
-        parser.error("--corpus-ir-ssa-ceiling requires --corpus-ir-ssa")
     if args.corpus_fault_state is not None and not args.corpus_ir_ssa:
         parser.error("--corpus-fault-state requires --corpus-ir-ssa")
     if args.corpus_msvc_x87_convention is not None and not args.corpus_ir_ssa:
@@ -585,8 +580,7 @@ def main():
                        cmake_tool("cmake"), args.jobs, args.corpus_checks,
                        args.corpus_trial_ms, args.corpus_trials,
                        args.corpus_ir_ssa, fault_state=args.corpus_fault_state,
-                       msvc_x87_convention=args.corpus_msvc_x87_convention,
-                       ir_ssa_ceiling=args.corpus_ir_ssa_ceiling, asan=args.corpus_asan)
+                       msvc_x87_convention=args.corpus_msvc_x87_convention, asan=args.corpus_asan)
         return
     if args.corpus_fragments:
         from corpus.fragments.run import run_experiment

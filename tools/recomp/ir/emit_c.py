@@ -142,7 +142,7 @@ def codegen_ir(fir, lifter):
 def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=True,
          call_symbols=None, x87_scalar_strict=False, local_state=True, msvc_convention=True,
          lazy_nan=False, resumable_stacks=False, lifter=None, indirect_call_symbol=None,
-         _guard_null_checks=True, _ceiling=frozenset(), facts=None):
+         _guard_null_checks=True, facts=None):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
     `call_symbols` maps an allowed direct-call target address to the C symbol
@@ -164,13 +164,8 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     NaN check and indefinite canonicalisation to sinks and internal CFG edges,
     folding IE before any status read or publication. It is a representation
     change: with it off the emitted body is byte-identical to the eager
-    `fx87`/`fx87_exact` forms. It is ignored by strict x87, the exact flush,
-    the ceiling column and `optimize=False`.
-
-    `_ceiling` is private to the function corpus: a set of UNPROVEN relaxation
-    letters from `ceiling.py` (A, C, D, E). It is not part of the agreed performance
-    mode contract, requires optimized non-strict x87 and local-state SSA, and production
-    selection never passes it.
+    `fx87`/`fx87_exact` forms. It is ignored by strict x87, the exact flush
+    and `optimize=False`.
 
     `facts`, when a dict, receives census facts about the performance body:
     whether an arithmetic flag is read from the CPU at entry or after a call,
@@ -204,14 +199,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             or not indirect_call_symbol.isascii()):
         raise SSAError("invalid indirect call symbol %r" % (indirect_call_symbol,))
     x87_statements = x87.statements
-    from .ceiling import RELAXATIONS, X87_RELAXATIONS
-    _ceiling = frozenset(_ceiling or ())
-    if _ceiling:
-        if not _ceiling <= frozenset(RELAXATIONS):
-            raise SSAError("unknown ceiling relaxation %s" % ",".join(sorted(_ceiling - frozenset(RELAXATIONS))))
-        if not (optimize and not x87_scalar_strict and local_state):
-            raise SSAError("ceiling relaxations require optimized scalar x87 and local-state SSA")
-    if optimize and _guard_null_checks and not _ceiling and (
+    if optimize and _guard_null_checks and (
             local_state or not x87_scalar_strict or msvc_convention):
         # Null-fault dispatch can expose CPU state to guest exception handlers.
         # Compile the strict observation path whenever that facility is enabled.
@@ -232,14 +220,10 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     x87_convention = msvc_convention and not any(
         ins.mnem.upper().removeprefix("WAIT ") in ("FINCSTP", "FDECSTP") for ins in fir.insns)
     # Lazy NaN needs per-op deferral, so it is off for the exact flush (which
-    # resets at edges), strict x87, the ceiling column and raw emission.
-    defer_ie = lazy_nan and not x87_scalar_strict and msvc_convention and not _ceiling
+    # resets at edges), strict x87 and raw emission.
+    defer_ie = lazy_nan and not x87_scalar_strict and msvc_convention
     scalar = X87Scalar(observe_loads=x87_scalar_strict, convention=x87_convention,
                        lazy_nan=defer_ie) if optimize else None
-    if scalar is not None and _ceiling:
-        if _ceiling & X87_RELAXATIONS:
-            from .x87_ceiling import X87Ceiling  # UNPROVEN ceiling C/D/E lowering.
-            scalar = X87Ceiling(_ceiling, convention=x87_convention)
 
     def flush_x87():
         return scalar.flush() if scalar is not None else []
@@ -280,15 +264,11 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             # pre-access snapshots.
             access_fields = {key for key, (field, _) in mapping.items()
                              if field in ("c->eip", "c->r[4]", "c->r[5]")} if local_state else None
-            # UNPROVEN ceiling A: guest memory accesses publish nothing.
-            unpublished = (frozenset(("LOAD", "STORE", "X87_MEM"))
-                           if "A" in _ceiling else frozenset())
             # Compiler conventions do not cover every binary boundary: CRT
             # assembly helpers can return flags or consume incoming flags.
             # Keep flag publication at calls/returns until actual call
             # summaries prove which fields a boundary does not observe.
-            publications = plan(s, fir.succ, groups, access_fields=access_fields,
-                                unpublished=unpublished)
+            publications = plan(s, fir.succ, groups, access_fields=access_fields)
         live = simplify(s, publications, canonical=False)
     else:
         live = {v.id for v in s.values}
@@ -443,8 +423,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     # Exact-flush functions (msvc_convention=False or FINCSTP/FDECSTP) keep the
     # per-edge flush. Carry only under the MSVC convention, where popped residue
     # may be relaxed; x87_scalar.snapshot() carries all popped parts otherwise.
-    carry_mode = (scalar is not None and not scalar.observe_loads and scalar.convention
-                  and not _ceiling)
+    carry_mode = scalar is not None and not scalar.observe_loads and scalar.convention
     entry_shape = None
     if carry_mode:
         from .x87_carry import analyze as analyze_carry, assert_covers

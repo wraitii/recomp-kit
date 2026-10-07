@@ -261,6 +261,13 @@ def test_retired_dataflow_experiment_options_are_rejected():
             build_py.parse_args(['--function-corpus', 'manifest.json', *option], system='Darwin')
 
 
+def test_retired_ceiling_corpus_option_is_rejected():
+    import pytest
+    with pytest.raises(SystemExit):
+        build_py.parse_args(['--function-corpus', 'manifest.json',
+                             '--corpus-ir-ssa-ceiling', 'A'], system='Darwin')
+
+
 def test_corpus_asan_is_a_correctness_build_of_the_function_corpus():
     import pytest
     args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-asan',
