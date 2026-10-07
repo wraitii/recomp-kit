@@ -244,9 +244,9 @@ def test_llvm_compare_is_separate_from_game_build_modes():
 
 def test_function_corpus_is_isolated_and_does_not_regenerate_game():
     import pytest
-    args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-calls', '0'], system='Darwin')
+    args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-trial-ms', '0'], system='Darwin')
     assert args.function_corpus == Path('manifest.json')
-    assert args.corpus_calls == 0
+    assert args.corpus_trial_ms == 0
     args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-x87-dataflow'], system='Darwin')
     assert args.corpus_x87_dataflow
     with pytest.raises(SystemExit):

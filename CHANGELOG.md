@@ -225,6 +225,12 @@
 ||||||| parent of 7491db2 (Enable opt-in production SSA with decoded fallback reporting)
 ||||||| parent of 28e2bc9 (Expand production SSA helper and indirect call coverage)
 ||||||| parent of 1e58bd9 (Add explicit comparison workloads to the function corpus)
+||||||| parent of 9a48b36 (Time-budget function corpus trials instead of fixed call counts)
+- Function-corpus timing is now time-budgeted. `--corpus-trial-ms N` (default
+  10) replaces `--corpus-calls`: each row's call count is calibrated once, untimed,
+  by doubling an eager batch until it takes N ms, then shared by every variant and
+  trial of that row. Calibrated counts and the budget are recorded in the reports.
+
 - Add `mapped-comparison-corpus-v2` to the function corpus. It preserves the
   existing native-reference rows and admits explicit `comparison:
   "translation-only"` rows with no native adapter or kernel, so generated

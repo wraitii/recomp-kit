@@ -99,7 +99,7 @@ joins, exit publication and fallback. Unicorn tests need permission to map JIT
 memory; a sandbox mapping failure is not a successful differential check.
 
 Real game-function corpora run through `tools/build.py --function-corpus MANIFEST`.
-Use `--corpus-calls 0` for correctness and code sizes without timing. They compare
+Use `--corpus-trial-ms 0` for correctness and code sizes without timing. They compare
 four translated C modes in full CPU/scratch state, then compare a reviewed typed
 native reference using explicit game-owned observations. Timing reports separate
 guest-state adapters from direct typed native kernels. See

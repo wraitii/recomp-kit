@@ -9,8 +9,17 @@ addresses or reconstructed game logic.
 ```sh
 python tools/build.py --game-dir /absolute/game --function-corpus /absolute/game/benchmarks/functions/corpus.json
 # Correctness and size only:
-python tools/build.py --game-dir /absolute/game --function-corpus /absolute/manifest.json --corpus-calls 0
+python tools/build.py --game-dir /absolute/game --function-corpus /absolute/manifest.json --corpus-trial-ms 0
 ```
+
+Timing is budgeted, not counted: `--corpus-trial-ms N` (default 10) gives each
+eager trial N ms. For every row the harness first doubles a call count, untimed,
+until one eager batch (the slowest translated variant) reaches the budget, then
+uses that one count for every variant, the native kernel and every rotating trial
+of the row, so ratios within a row stay paired. The calibrated count is printed
+(`CALLS row n`) and recorded per row, with the budget, in `report.json`, `.csv`
+and `.md`. Rows are calibrated just before their own trials, so a thermally
+throttled machine affects each row's calibration instead of skewing late rows.
 
 Outputs stay under the game's ignored `build/function-corpus/`. A manifest uses
 `contract: "mapped-native-corpus-v1"` or `"mapped-comparison-corpus-v2"`, a

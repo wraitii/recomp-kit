@@ -484,8 +484,9 @@ def parse_args(argv, system=None):
                         help="Add the UNPROVEN, corpus-only SSA ceiling column with these relaxations "
                              "(requires --corpus-ir-ssa scalar x87 and locals state)")
     parser.add_argument("--corpus-checks", type=int, default=4096)
-    parser.add_argument("--corpus-calls", type=int, default=100000,
-                        help="Calls per timing trial; zero runs correctness/size only")
+    parser.add_argument("--corpus-trial-ms", type=float, default=10.0,
+                        help="Time budget per eager trial in milliseconds; each row's call count is "
+                             "calibrated once to fill it. Zero runs correctness/size only")
     parser.add_argument("--corpus-trials", type=int, default=9)
     parser.add_argument("--corpus-x87-dataflow", action="store_true",
                         help="Try decoded x87 dataflow in the native-reference corpus")
@@ -610,7 +611,7 @@ def main():
         with buildlock.BuildLock(args.build_root.parent, "tools/build.py --function-corpus"):
             run_corpus(args.function_corpus, args.game_dir, args.build_root / "function-corpus",
                        cmake_tool("cmake"), args.jobs, args.corpus_checks,
-                       args.corpus_calls, args.corpus_trials, args.corpus_x87_dataflow, args.corpus_stack_forwarding, args.corpus_decoded_dataflow,
+                       args.corpus_trial_ms, args.corpus_trials, args.corpus_x87_dataflow, args.corpus_stack_forwarding, args.corpus_decoded_dataflow,
                        args.corpus_ir_ssa, args.corpus_ir_ssa_x87 or "effects",
                        args.corpus_ir_ssa_state or "strict", args.corpus_ir_ssa_ceiling)
         return

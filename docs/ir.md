@@ -194,7 +194,7 @@ Run through the game build wrapper, using its Python environment:
 
 ```sh
 /path/to/game/tools/.venv/bin/python tools/build.py --game-dir /path/to/game \
-  --function-corpus MANIFEST --corpus-ir-ssa --corpus-calls 0
+  --function-corpus MANIFEST --corpus-ir-ssa --corpus-trial-ms 0
 ```
 
 The flag replaces the combined variant only when the entire function is

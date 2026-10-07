@@ -305,6 +305,22 @@ static double trial(unsigned row, unsigned mode, unsigned calls) {
     return (double)(end - start) * 1e9 / CLOCKS_PER_SEC / calls;
 }
 
+/* Pick one call count per row so every variant and trial runs the same work.
+ * The eager variant is the slowest translated variant, so doubling its batch
+ * until it takes at least the budget leaves every other variant at or above
+ * the budget too. Calibration is untimed for reporting and runs before any
+ * trial of the row; a clock too coarse to see the batch just keeps doubling. */
+#define CORPUS_CALIBRATION_START 1024u
+#define CORPUS_CALIBRATION_LIMIT (1u << 30)
+
+static unsigned calibrate(unsigned row, double budget_ms) {
+    double budget_ns = budget_ms * 1e6;
+    unsigned calls = CORPUS_CALIBRATION_START;
+    while (calls < CORPUS_CALIBRATION_LIMIT && trial(row, 0, calls) * calls < budget_ns)
+        calls *= 2;
+    return calls;
+}
+
 int main(int argc, char **argv) {
     if (argc != 6)
         return 2;
@@ -318,11 +334,13 @@ int main(int argc, char **argv) {
         return 2;
     fclose(image);
     unsigned checks = strtoul(argv[3], NULL, 10);
-    unsigned calls = strtoul(argv[4], NULL, 10);
+    double trial_ms = strtod(argv[4], NULL); /* 0 = correctness only, no timing */
     unsigned trials = strtoul(argv[5], NULL, 10);
     validate(checks);
-    if (calls)
+    if (trial_ms > 0)
         for (unsigned row = 0; row < CORPUS_COUNT; ++row) {
+            unsigned calls = calibrate(row, trial_ms);
+            printf("CALLS %u %u\n", row, calls);
             unsigned modes = corpus_row_modes[row];
             unsigned total = modes + (corpus_has_native[row] ? 1 : 0);
             unsigned fixture = corpus_fixture_ids[row];

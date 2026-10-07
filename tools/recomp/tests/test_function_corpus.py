@@ -6,7 +6,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from corpus.run import (parse_results, parse_coverage, symbol_sizes, reviewed_calls,
-                        bind_reviewed_calls, review_boundaries, bind_boundary_calls,
+                        parse_calls, bind_reviewed_calls, review_boundaries, bind_boundary_calls,
                         wrap_string_helpers, wrap_string_helpers_ssa, boundary_wrappers,
                         ssa_call_symbols, validate_code_map_metadata, markdown,
                         corpus_modes, parse_ceiling, parse_ceiling_bench, ceiling_note, MODES)
@@ -249,6 +249,19 @@ def test_coverage_requires_exactly_one_valid_object_for_required_rows():
         parse_coverage('COVERAGE 7 {"paths":-1}\n', [7], [0])
     with pytest.raises(ValueError, match='nonnegative integer'):
         parse_coverage('COVERAGE 7 {"paths":true}\n', [7], [0])
+
+
+def test_calibrated_call_counts_are_required_for_every_row_of_a_timed_run():
+    assert parse_calls('CALLS 0 4096\nCALLS 1 1024\n', 2, 10.0) == {0: 4096, 1: 1024}
+    assert parse_calls('CHECK 0 16\n', 1, 0) == {}
+    with pytest.raises(ValueError, match='incomplete calibrated'):
+        parse_calls('CALLS 0 4096\n', 2, 10.0)
+    with pytest.raises(ValueError, match='incomplete calibrated'):
+        parse_calls('CALLS 0 4096\n', 1, 0)
+    with pytest.raises(ValueError, match='duplicate or invalid'):
+        parse_calls('CALLS 0 4096\nCALLS 0 4096\n', 1, 10.0)
+    with pytest.raises(ValueError, match='duplicate or invalid'):
+        parse_calls('CALLS 0 0\n', 1, 10.0)
 
 
 def test_variable_mode_trials_reject_incomplete_rows_but_keep_defaults():

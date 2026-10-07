@@ -323,7 +323,22 @@ def symbol_sizes(disassembly):
     return result
 
 
-def parse_results(output, rows, checks, calls, trials, row_modes=None, row_has_native=None):
+def parse_calls(output, rows, trial_ms):
+    """Per-row calibrated call counts; required for every row of a timed run."""
+    counts = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if parts[:1] == ['CALLS']:
+            row, count = map(int, parts[1:])
+            if row in counts or not count > 0:
+                raise ValueError('duplicate or invalid calibrated call count')
+            counts[row] = count
+    if set(counts) != (set(range(rows)) if trial_ms else set()):
+        raise ValueError('incomplete calibrated call counts')
+    return counts
+
+
+def parse_results(output, rows, checks, trial_ms, trials, row_modes=None, row_has_native=None):
     """Refuse missing checks/trials rather than presenting partial runs as passes.
 
     ``row_modes`` gives the number of translated-plus-adapter modes per row
@@ -349,12 +364,12 @@ def parse_results(output, rows, checks, calls, trials, row_modes=None, row_has_n
             key = (row, mode, trial)
             value = float(parts[4])
             if key in times or not value > 0:
-                raise ValueError('duplicate or invalid timing trial; increase call count')
+                raise ValueError('duplicate or invalid timing trial; increase the trial budget')
             times[key] = value
     if checked != dict.fromkeys(range(rows), checks):
         raise ValueError('incomplete correctness checks')
     expected = set()
-    if calls:
+    if trial_ms:
         for r in range(rows):
             for m in range(row_modes[r]):
                 for t in range(trials):
@@ -492,8 +507,11 @@ def markdown(report):
              'Text spans include alignment and exclude out-of-line helper bodies; see JSON helper sizes.',
              'Declared direct callees use the same translation mode; per-function spans exclude callee bodies.',
              'Original x86 bytes and host text sizes describe different architectures.', '',
-             '| Function | Contract | Original bytes / x87 instructions | Eager bytes | Combined bytes | Native adapter / kernel bytes | Eager / combined / native kernel ns per call |',
-             '| --- | --- | ---: | ---: | ---: | ---: | ---: |']
+             (f"Timing: {report['trial_ms']:g} ms budget per eager trial, {report['trials']} rotating trials; "
+              "each row's call count is calibrated once and shared by every variant and trial of that row."
+              if report.get('trial_ms') else 'Timing: not run.'), '',
+             '| Function | Contract | Original bytes / x87 instructions | Eager bytes | Combined bytes | Native adapter / kernel bytes | Eager / combined / native kernel ns per call | Calls per trial |',
+             '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |']
     for row in report['functions']:
         def timing(mode):
             values = row['variants'].get(mode, {}).get('timing_ns')
@@ -507,7 +525,8 @@ def markdown(report):
         lines.append(f"| {row['address']} {row['name']} | {row.get('comparison', NATIVE_REFERENCE)} | "
                      f"{row['original_bytes']} / {row['x87_instructions']} | "
                      f"{variants['eager']['span_bytes']} | {variants['combined']['span_bytes']} | "
-                     f"{native_bytes} / {kernel_bytes} | {timing('eager')} / {timing('combined')} / {kernel_ns} |")
+                     f"{native_bytes} / {kernel_bytes} | {timing('eager')} / {timing('combined')} / {kernel_ns} | "
+                     f"{row.get('calls_per_trial', '—')} |")
     info = report.get('ir_ssa_ceiling', {})
     if info.get('enabled'):
         lines += ['', f"## {info['label']} (UNPROVEN, corpus-only)", '',
@@ -568,7 +587,7 @@ def markdown(report):
     return '\n'.join(lines)
 
 
-def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, trials=9,
+def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0, trials=9,
                x87_dataflow=False, x87_stack_forwarding=False, decoded_dataflow=False,
                ir_ssa=False, ir_ssa_x87="effects", ir_ssa_state="strict", ir_ssa_ceiling=None):
     """Decode the selected instructions, build isolated variants, validate, report.
@@ -597,8 +616,8 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
         raise ValueError('IR SSA and decoded-dataflow corpus modes must run separately')
     if x87_stack_forwarding and not x87_dataflow:
         raise ValueError('guest-stack forwarding requires decoded x87 dataflow')
-    if checks < 1 or calls < 0 or trials < 3:
-        raise ValueError('checks must be positive, calls nonnegative, trials at least three')
+    if checks < 1 or trial_ms < 0 or trials < 3:
+        raise ValueError('checks must be positive, trial budget nonnegative, trials at least three')
     game_dir, manifest, out = Path(game_dir).resolve(), Path(manifest).resolve(), Path(out).resolve()
     build = game_config.build_root_for(game_dir).resolve() if hasattr(game_config, 'build_root_for') else game_dir / 'build'
     if build not in out.parents:
@@ -877,16 +896,17 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
     assembly = subprocess.check_output([objdump, '--disassemble', '--no-show-raw-insn', str(executable)], text=True)
     (out / 'native.asm').write_text(assembly)
     sizes = symbol_sizes(assembly)
-    completed = subprocess.run([str(executable), str(out / 'image.bin'), str(image.size), str(checks), str(calls), str(trials)],
+    completed = subprocess.run([str(executable), str(out / 'image.bin'), str(image.size), str(checks), repr(float(trial_ms)), str(trials)],
                                capture_output=True, text=True)
     (out / 'results.txt').write_text(completed.stdout + completed.stderr)
     if completed.returncode:
         raise ValueError(f'corpus failed; see {out / "results.txt"}: {completed.stderr.strip()}')
-    times = parse_results(completed.stdout, len(rows), checks, calls, trials, row_modes, row_has_native)
+    times = parse_results(completed.stdout, len(rows), checks, trial_ms, trials, row_modes, row_has_native)
+    row_calls = parse_calls(completed.stdout, len(rows), trial_ms)
     required_coverage = [r for r, row in enumerate(provenance) if row['comparison'] == TRANSLATION_ONLY]
     coverage = parse_coverage(completed.stdout, fixture_ids, required_coverage)
     ceiling_records = parse_ceiling(completed.stdout, len(rows)) if ceiling else {}
-    ceiling_bench_invalid = parse_ceiling_bench(completed.stdout, len(rows)) if ceiling and calls else set()
+    ceiling_bench_invalid = parse_ceiling_bench(completed.stdout, len(rows)) if ceiling and trial_ms else set()
     report_rows = []
     for r, row in enumerate(provenance):
         translation_only = row['comparison'] == TRANSLATION_ONLY
@@ -899,14 +919,16 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
             if mode != 'native':
                 source = out / row['address'] / (mode + '.c')
                 variants[mode]['source_sha256'] = hashlib.sha256(source.read_bytes()).hexdigest()
-            if calls:
+            if trial_ms:
                 values = [times[r, m, t] for t in range(trials)]
                 variants[mode]['timing_ns'] = {'median': statistics.median(values), 'min': min(values),
                                              'max': max(values), 'trials': values}
         entry = {**row, 'variants': variants}
+        if trial_ms:
+            entry['calls_per_trial'] = row_calls[r]
         if not translation_only:
             kernel = dict(sizes[row['kernel']])
-            if calls:
+            if trial_ms:
                 values = [times[r, len(modes), t] for t in range(trials)]
                 kernel['timing_ns'] = {'median': statistics.median(values), 'min': min(values),
                                        'max': max(values), 'trials': values}
@@ -919,7 +941,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
                 **row['ir_ssa_ceiling'], 'relaxations': sorted(ceiling),
                 'method': 'translation-only: guest ranges (minus stack residue), EAX, ST0 vs eager'
                           if translation_only else 'declared native observations (object window, EAX/AL/ST0)',
-                'timing_sanity': 'FAILED' if r in ceiling_bench_invalid else ('pass' if calls else 'not run'),
+                'timing_sanity': 'FAILED' if r in ceiling_bench_invalid else ('pass' if trial_ms else 'not run'),
                 'observation': {**record, 'mismatches': ceiling_mismatches(record),
                                 'status': ('no in-domain inputs' if not record['checked'] else
                                            'pass' if not ceiling_mismatches(record) else 'mismatch')}}
@@ -942,7 +964,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
               'runtime_sha256': hashlib.sha256((KIT / 'runtime/x86.h').read_bytes()).hexdigest(),
               'runner_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               'generation_seconds': generation_seconds, 'build_seconds': build_seconds,
-              'checks_per_function': checks, 'calls_per_trial': calls, 'trials': trials,
+              'checks_per_function': checks, 'trial_ms': trial_ms, 'trials': trials,
               'row_modes': row_modes, 'row_has_native': row_has_native,
               'benchmark': spec.get('benchmark', {}),
               'native_executable_sha256': hashlib.sha256(executable.read_bytes()).hexdigest(),
@@ -952,7 +974,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
     (out / 'report.md').write_text(markdown(report))
     with (out / 'report.csv').open('w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=['address', 'name', 'comparison', 'variant', 'original_bytes',
-                                              'x87_instructions', 'span_bytes', 'instructions',
+                                              'x87_instructions', 'span_bytes', 'instructions', 'calls_per_trial',
                                               'median_ns', 'min_ns', 'max_ns', 'note'])
         writer.writeheader()
         for row in report_rows:
@@ -964,6 +986,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
                                  'comparison': row['comparison'], 'variant': mode,
                                  'original_bytes': row['original_bytes'], 'x87_instructions': row['x87_instructions'],
                                  'span_bytes': v['span_bytes'], 'instructions': v['instructions'],
+                                 'calls_per_trial': row.get('calls_per_trial', ''),
                                  **{key+'_ns': v.get('timing_ns', {}).get(key, '') for key in ('median', 'min', 'max')},
                                  'note': ceiling_note(row) if mode == CEILING_MODE else ''})
     print((out / 'report.md').read_text())
