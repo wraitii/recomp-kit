@@ -881,7 +881,9 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
     started = time.monotonic()
     subprocess.run([cmake, '-S', str(HERE), '-B', str(out), '-DCMAKE_BUILD_TYPE=Release',
                     '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON', f'-DKIT_RUNTIME={KIT / "runtime"}',
-                    f'-DCORPUS_FIXTURES={fixture_dir}', f'-DCORPUS_ASAN={"ON" if asan else "OFF"}'], check=True)
+                    f'-DCORPUS_FIXTURES={fixture_dir}', f'-DCORPUS_ASAN={"ON" if asan else "OFF"}',
+                    # Measure the game's own store-hook build ([game] store_hooks).
+                    f'-DCORPUS_STORE_HOOKS={int(cfg["game"]["store_hooks"])}'], check=True)
     subprocess.run([cmake, '--build', str(out), '--parallel', str(jobs)], check=True)
     build_seconds = time.monotonic() - started
     compiler_rows = json.loads((out / 'compile_commands.json').read_text())

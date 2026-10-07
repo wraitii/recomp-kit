@@ -83,6 +83,7 @@ def main(argv=None):
                "-DGUEST_IMAGE_BASE=" + cmake_value(macros, "RECOMP_IMAGE_BASE"),
                "-DGUEST_HEAP_BASE=" + cmake_value(macros, "RECOMP_HEAP_BASE"),
                "-DGUEST_SIZE=" + cmake_value(macros, "RECOMP_GUEST_SIZE"),
+               "-DRECOMP_STORE_HOOKS=" + cmake_value(macros, "RECOMP_STORE_HOOKS"),
                # The host resolves the runtime's symbols when it loads this.
                "-Wl,-undefined,dynamic_lookup" if sys.platform == "darwin" else "-Wl,--allow-shlib-undefined",
                ] + [str(s) for s in sources] + ["-o", str(out)]

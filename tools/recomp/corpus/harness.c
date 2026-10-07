@@ -4,6 +4,7 @@
  * indirect call and native adapter. Optional boundary hooks bracket every
  * variant and every timed workload for the fixture's coverage accounting. */
 #include "x86.h"
+#include "platform/os.h"
 #include "corpus-config.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -324,7 +325,7 @@ static unsigned calibrate(unsigned row, double budget_ms) {
 int main(int argc, char **argv) {
     if (argc != 6)
         return 2;
-    g_mem = calloc(1, CORPUS_MEMORY_SIZE);
+    g_mem = os_vm_reserve_at(RECOMP_ARENA, CORPUS_MEMORY_SIZE);
     if (!g_mem)
         return 2;
     FILE *image = fopen(argv[1], "rb");
@@ -366,6 +367,6 @@ int main(int argc, char **argv) {
     for (unsigned row = 0; row < CORPUS_COUNT; ++row)
         printf("CEILING_BENCH %u %d\n", row, ceiling_rows[row].bench_invalid ? 0 : 1);
 #endif
-    free(g_mem);
+    os_vm_release(g_mem, CORPUS_MEMORY_SIZE);
     return 0;
 }

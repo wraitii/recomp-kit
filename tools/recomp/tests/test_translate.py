@@ -218,11 +218,16 @@ def build(verbose=True):
     if verbose:
         print("== linking test dylib ==")
     synth = generate_synthetic(os.path.join(BUILD_ROOT, "recomp/synth.c"))
+    # The harness maps the guest arena through the platform layer.
+    os_object = os.path.join(BUILD_ROOT, "recomp/harness_os_posix.o")
+    subprocess.check_call([
+        "xcrun", "clang", "-x", "c++", "-std=c++17", "-O1", "-fno-exceptions", "-c",
+        os.path.join(ROOT, "platform/os_posix.cpp"), "-o", os_object])
     subprocess.check_call([
         "xcrun", "clang", "-O1", "-g", "-std=c11", "-Wall", "-Wextra",
         "-Wno-unused", "-I", GEN, "-I", ROOT,
         "-I", os.path.join(ROOT, "runtime"), "-dynamiclib",
-        os.path.join(ROOT, "tools/recomp/tests/harness.c"), synth,
+        os.path.join(ROOT, "tools/recomp/tests/harness.c"), synth, os_object,
         "-Wl,-force_load," + LIB_A, "-o", DYLIB])
 
 

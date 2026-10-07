@@ -104,6 +104,7 @@ include_directories(${CMAKE_BINARY_DIR}/generated)
 add_compile_definitions(GUEST_IMAGE_BASE=${RECOMP_IMAGE_BASE})
 add_compile_definitions(GUEST_HEAP_BASE=${RECOMP_HEAP_BASE})
 add_compile_definitions(GUEST_SIZE=${RECOMP_GUEST_SIZE})
+add_compile_definitions(RECOMP_STORE_HOOKS=${RECOMP_STORE_HOOKS})
 
 if(IOS)
   set(RECOMP_IOS_TEAM "$ENV{RECOMP_IOS_TEAM}" CACHE STRING "Apple development team for automatic signing")

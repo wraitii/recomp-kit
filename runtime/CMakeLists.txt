@@ -79,6 +79,7 @@ set_tests_properties(call_trace_tests PROPERTIES LABELS game TIMEOUT 120)
 
 add_executable(interp_tests tests/interp_tests.cpp interp.cpp)
 target_include_directories(interp_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(interp_tests PRIVATE recomp_platform)
 target_compile_options(interp_tests PRIVATE ${POP_WARN_HOST})
 pop_test_binary(interp_tests)
 add_test(NAME interp_tests COMMAND interp_tests WORKING_DIRECTORY ${POP_ROOT})

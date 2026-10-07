@@ -11,6 +11,7 @@
 
 #include "x86.h"
 #include "intrinsics.h"
+#include "platform/os.h"
 
 uint8_t *g_mem;
 const int recomp_resumable_stacks = 0;
@@ -163,10 +164,12 @@ uint64_t harness_x86_size(void) {
 uint8_t *harness_mem(void) {
     if (!g_mem) {
         /* Test-only: 4 GB so a wild guest address from a randomised sweep
-         * cannot fault the host.  The game runtime allocates GUEST_SIZE. */
-        g_mem = (uint8_t *)calloc(1, 0x100000000ull);
+         * cannot fault the host.  The game runtime maps GUEST_SIZE. Both sit
+         * at the fixed RECOMP_ARENA, so one harness library per process. */
+        g_mem = (uint8_t *)os_vm_reserve_at(RECOMP_ARENA, 0x100000000ull);
         if (!g_mem) {
-            fprintf(stderr, "harness: out of memory\n");
+            fprintf(stderr, "harness: cannot map the guest arena at %#llx\n",
+                    (unsigned long long)RECOMP_ARENA_ADDRESS);
             abort();
         }
     }

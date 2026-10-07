@@ -3,6 +3,7 @@
  * All variants are separately compiled from this harness, without LTO.
  */
 #include "x86.h"
+#include "platform/os.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -217,7 +218,7 @@ static void benchmark(void) {
 #endif
 
 int main(void) {
-    g_mem = calloc(1, FIXTURE_MEMORY_SIZE);
+    g_mem = os_vm_reserve_at(RECOMP_ARENA, FIXTURE_MEMORY_SIZE);
     if (!g_mem)
         return 2;
     if (compare())
@@ -226,6 +227,6 @@ int main(void) {
 #ifndef FIXTURE_CHECK_ONLY
     benchmark();
 #endif
-    free(g_mem);
+    os_vm_release(g_mem, FIXTURE_MEMORY_SIZE);
     return 0;
 }

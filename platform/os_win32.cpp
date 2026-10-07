@@ -200,6 +200,15 @@ OsThreadId os_thread_id_of(const OsThread *t) {
 void *os_vm_reserve(size_t bytes) {
     return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 }
+void *os_vm_reserve_at(void *address, size_t bytes) {
+    // VirtualAlloc at an explicit address fails rather than relocating.
+    void *p = VirtualAlloc(address, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (p && p != address) {
+        VirtualFree(p, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    return p;
+}
 void os_vm_release(void *p, size_t bytes) {
     (void)bytes;
     VirtualFree(p, 0, MEM_RELEASE);

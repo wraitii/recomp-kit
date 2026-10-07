@@ -2956,11 +2956,12 @@ static void test_lock_write_tracking() {
 
     // The same store with nothing in between is not the guest's and not an
     // import's, so nothing looks for it: only those two write a locked surface.
+    // Without store hooks every Unlock compares the whole lock and finds it.
     reset_ddraw_for_test();
     CHECK_EQ(call_method(rt, S_Lock, {0, desc, DDLOCK_WAIT, 0}), DD_OK);
     gm_ptr(o->pixels + 50 * o->pitch + 7)[0] = 4;
     CHECK_EQ(call_method(rt, S_Unlock, {0}), DD_OK);
-    CHECK_EQ(record_rows(&y0, &h), 0u);
+    CHECK_EQ(record_rows(&y0, &h), RECOMP_STORE_HOOKS ? 0u : 1u);
 
     // Critical sections write no surface, so they leave the narrowing on:
     // a store is still found, and one elsewhere is still not looked for.
@@ -2974,9 +2975,11 @@ static void test_lock_write_tracking() {
     gm_ptr(o->pixels + 60 * o->pitch + 1)[0] = 3;
     call_shim(tramp("KERNEL32.dll", "LeaveCriticalSection"), {cs});
     CHECK_EQ(call_method(rt, S_Unlock, {0}), DD_OK);
-    CHECK_EQ(record_rows(&y0, &h), 1u);
-    CHECK_EQ(y0, 10);
-    CHECK_EQ(h, 1);
+    if (RECOMP_STORE_HOOKS) {
+        CHECK_EQ(record_rows(&y0, &h), 1u);
+        CHECK_EQ(y0, 10);
+        CHECK_EQ(h, 1);
+    }
     call_shim(tramp("KERNEL32.dll", "DeleteCriticalSection"), {cs});
     CHECK_EQ(g_dirty_count, 0u); // every range closed with its lock
     reset_ddraw_for_test();

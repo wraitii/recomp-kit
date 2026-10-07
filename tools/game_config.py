@@ -175,6 +175,11 @@ def load(game_dir):
     windows_version(game.setdefault("windows_version", "4.10"))
     # Fail loudly rather than returning 0 from an import whose stdcall arity is
     # unknown: the un-popped arguments otherwise drift the guest stack.
+    # Store hooks (the guest watchpoint and DirectDraw dirty tracking) cost a
+    # test and an aliasing reload on every guest store. Off, RECOMP_WATCH is
+    # unavailable and a DirectDraw Unlock compares the whole surface.
+    if not isinstance(game.setdefault("store_hooks", True), bool):
+        raise ValueError("%s: [game] store_hooks must be a boolean" % source)
     strict_imports = game.setdefault("strict_imports", False)
     if not isinstance(strict_imports, bool):
         raise ValueError("%s: [game] strict_imports must be a boolean" % source)

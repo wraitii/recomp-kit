@@ -855,10 +855,14 @@ def built():
                  "    if (target == 0x%08xu) { c->eip = target; return; }\n"
                  "    recomp_call(c, target);\n}\n" % MAGIC_RET)
     lib = os.path.join(work, "libinsns" + (".dylib" if platform.system() == "Darwin" else ".so"))
+    # The harness maps the guest arena through the platform layer.
+    os_object = os.path.join(work, "os_posix.o")
+    subprocess.check_call([clang, "-x", "c++", "-std=c++17", "-O1", "-fPIC", "-fno-exceptions",
+                           "-c", os.path.join(ROOT, "platform", "os_posix.cpp"), "-o", os_object])
     subprocess.check_call([clang, "-O1", "-g", "-std=c11", "-Wall", "-Wextra", "-Wno-unused",
-                           "-fPIC", "-shared", "-I", os.path.join(ROOT, "runtime"),
+                           "-fPIC", "-shared", "-I", os.path.join(ROOT, "runtime"), "-I", ROOT,
                            os.path.join(HERE, "harness.c"), os.path.join(work, "synth.c"),
-                           os.path.join(work, "table.c"), "-o", lib])
+                           os.path.join(work, "table.c"), os_object, "-o", lib])
     return Native(lib), errors
 
 

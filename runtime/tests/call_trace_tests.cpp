@@ -66,8 +66,9 @@ static void put32(uint32_t addr, uint32_t value) {
 
 int main(void) {
     // A small arena is enough: the test sets ESP into it and reads only there.
-    static uint8_t arena[65536];
-    g_mem = arena;
+    g_mem = (uint8_t *)os_vm_reserve_at(RECOMP_ARENA, 65536);
+    if (!g_mem)
+        return 1;
 
     printf("\n== call trace\n");
 

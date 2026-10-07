@@ -229,6 +229,22 @@
 ||||||| parent of d6f8703 (Retire SSA x87 effects, values and region modes)
 ||||||| parent of 7345cd1 (Remove the LLVM corpus experiments)
 ||||||| parent of 8cd6a8e (Add an AddressSanitizer option to the function corpus)
+||||||| parent of e484f73 (Map guest memory at a fixed address and make store hooks optional)
+- Guest memory now lives at a fixed host address (`RECOMP_ARENA`, reserved
+  through the new `os_vm_reserve_at`), so translated loads and stores index a
+  constant base that a guest store cannot alias. Replay and test harnesses swap
+  their arenas in with `recomp_arena_swap` instead of repointing `g_mem`; harness
+  CMake projects include `tools/recomp/harness_platform.cmake`.
+
+- Add `[game] store_hooks` (default `true`). `false` builds every guest store
+  without the watchpoint/DirectDraw dirty test: `RECOMP_WATCH` is refused with a
+  diagnostic and a DirectDraw Unlock compares the whole locked surface. Float
+  and BCD stores now go through the same hook as integer stores, so the
+  watchpoint also sees them; in null-check builds they also take the null guard.
+
+- Scalar SSA x87 no longer publishes x87 state before guest loads and stores,
+  matching decoded `x87_locals`; strict x87 still does.
+
 - Add `--corpus-asan` to the function corpus: an AddressSanitizer build for
   correctness runs (it requires `--corpus-trial-ms 0`; code sizes are not comparable).
 
