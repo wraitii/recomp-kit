@@ -219,6 +219,17 @@ CALL_CASES = {
 # callee's RET goes through recomp_return and is accepted by the wrapper's
 # ir_accept_call_return registration.
 BYTE_CALL_CASES = {
+    "call_flags_return_consumed": {
+        # A CRT-style classifier returns ZF as well as EAX. The caller turns
+        # ZF into guest memory, so canonicalizing dead return flags cannot
+        # hide a lost flag result. Exercise a production SSA callee too.
+        "hexes": _caller(["31c0", "680000e03f", "6a00"],
+                         ["0f94c1", "0fb6c9", "894b04", "83c408", "c3"]),
+        "callee_hexes": ["8b442408", "250000f07f", "3d0000f07f", "7401", "c3",
+                          "8b442408", "c3"],
+        "ssa_callee": True,
+        "resumable": False,
+    },
     "call_translated_callee": {
         # mov eax,0x11111111; push 0x22; call; pop ecx; mov [ebx],eax; ret
         # callee: mov eax,[esp+4]; add eax,0x33; fld1; ret
@@ -433,8 +444,8 @@ def run_checks(out, cmake, jobs):
 
     The five harness columns compare eager, raw (unoptimized ordered effects),
     scalar, scalar-strict and scalar/local-state with the same full-state
-    obligations. The last is the production policy, including the MSVC call
-    convention, and compares with that convention's dead fields cleared.
+    obligations. The last is the production policy, including the MSVC x87
+    convention, and compares with only its dead x87 fields cleared.
     """
     out.mkdir(parents=True, exist_ok=True)
     code, rows, declarations = ['#include "x86.h"',
@@ -464,7 +475,16 @@ def run_checks(out, cmake, jobs):
         eager, raw, scalar, strict, local, returns = call_sources(
             name, spec["hexes"], CALLEE, spec["resumable"])
         callee = _eager_callee(name + "_callee", CALLEE, spec["callee_hexes"])
-        add_case(name, eager, [raw, scalar, strict, local], extra=[callee],
+        extra = [callee]
+        if spec.get("ssa_callee"):
+            lifter, addr, lifted = Lifter(), CALLEE, []
+            for raw_bytes in map(bytes.fromhex, spec["callee_hexes"]):
+                lifted.append(lifter.lift(addr, raw_bytes))
+                addr += len(raw_bytes)
+            fir = FunctionIR(CALLEE, lifted, default_successors(lifted))
+            extra.append(emit(fir, name + "_callee_local"))
+            local = local.replace(name + "_callee(c)", name + "_callee_local(c)")
+        add_case(name, eager, [raw, scalar, strict, local], extra=extra,
                  fallthroughs=returns)
     dispatch = []
     for name, spec in INDIRECT_CASES.items():

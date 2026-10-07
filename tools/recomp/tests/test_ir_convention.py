@@ -1,4 +1,4 @@
-"""`ir_ssa_msvc_convention`: flags dead across CALL/RET and x87 residue skipped.
+"""`ir_ssa_msvc_convention`: x87 residue skipped; boundary flags stay exact.
 
 Shape tests for the emitted publication. Execution evidence comes from
 `tools/build.py --ir-ssa-checks` (the production column compares with the
@@ -35,16 +35,16 @@ def arithmetic_flags(text):
             if "c->eflags_" in line and "c->eflags_df" not in line]
 
 
-def test_flags_are_not_published_at_return():
+def test_flags_are_published_at_return():
     producer = function("39d8", "c3")  # cmp eax,ebx; ret
     assert "c->eflags_zf =" in exact(producer)
-    assert not arithmetic_flags(fast(producer))
+    assert "c->eflags_zf =" in fast(producer)
 
 
 def test_flags_consumed_inside_the_function_stay_exact():
     # cmp eax,ebx; jz skip; inc eax; skip: ret
     text = fast(function("39d8", "7401", "40", "c3"))
-    assert "if (" in text and not arithmetic_flags(text)
+    assert "if (" in text and "c->eflags_zf =" in text
 
 
 def test_incoming_flags_are_still_read_when_consumed():
@@ -55,13 +55,13 @@ def test_incoming_flags_are_still_read_when_consumed():
     assert facts["flags_read_at_entry"] and not facts["flags_read_after_call"]
 
 
-def test_flags_are_not_published_before_calls_but_df_is():
+def test_flags_and_df_are_published_before_calls():
     # std; cmp eax,ebx; call 0x2000; ret
     f = function("fd", "39d8", "e8f80f0000", "c3")
     calls = {0x2000: "callee"}
     assert "c->eflags_zf =" in exact(f, call_symbols=calls)
     text = fast(f, call_symbols=calls)
-    assert not arithmetic_flags(text.split("callee(c);")[0])
+    assert "c->eflags_zf =" in text.split("callee(c);")[0]
     assert "c->eflags_df =" in text
 
 
@@ -124,7 +124,7 @@ def test_null_check_builds_compile_the_conservative_form():
     text = emit(f, "t")
     strict, relaxed = text.split("#else")
     assert "c->eflags_zf =" in strict
-    assert "c->eflags_zf =" not in relaxed
+    assert "c->eflags_zf =" in relaxed
 
 
 def test_production_passes_the_setting_and_reports_it():

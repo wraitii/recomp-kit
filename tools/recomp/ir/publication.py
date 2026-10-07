@@ -10,8 +10,7 @@ never be mistaken for its newly assigned value. Helpers invalidate facts.
 from .simplify import EFFECTS
 
 
-def plan(s, successors, fields, *, access_fields=None, unpublished=frozenset(),
-         boundary_skip=frozenset()):
+def plan(s, successors, fields, *, access_fields=None, unpublished=frozenset()):
     """Return required register-lane keys for each effect and return snapshot.
 
 `fields` groups register lanes by runtime field. LOAD/STORE have read-only CPU
@@ -27,9 +26,6 @@ Starting with no facts gives a conservative least fixed point for loops.
 named effect opcodes publish nothing and leave the known-field facts untouched.
 It defaults to empty and is never supplied by production selection.
 
-`boundary_skip` names register lanes that CALL, CALLIND and RETURN do not
-publish: the MSVC-convention arithmetic flags (`ir_ssa_msvc_convention`).
-Like a skipped access snapshot, skipping creates no publication fact.
 """
     groups = [tuple(key for key in keys if key in s.inputs) for keys in fields]
     groups = [keys for keys in groups if keys]
@@ -59,11 +55,8 @@ Like a skipped access snapshot, skipping creates no publication fact.
                     continue
                 state = b.exit if v.opc == "RETURN" else b.snapshots[v.id]
                 access = v.opc in ("LOAD", "STORE", "X87_MEM")
-                boundary = v.opc in ("CALL", "CALLIND", "RETURN")
                 required = []
                 for n, keys in enumerate(groups):
-                    if boundary and all(key in boundary_skip for key in keys):
-                        continue
                     if access and access_fields is not None and not any(key in access_fields for key in keys):
                         # A skipped snapshot does not make a publication fact.
                         # The older CPU value stays known until a real observer.

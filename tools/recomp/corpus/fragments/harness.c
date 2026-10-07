@@ -107,16 +107,14 @@ static void discard_empty_contents(X86 *c) {
 }
 
 /* Columns in FIXTURE_CONVENTION_MASK use ir_ssa_msvc_convention: arithmetic
- * flags and popped x87 residue are dead at calls and returns. They compare
- * with CF/PF/AF/ZF/SF/OF, the value/bits/exact of empty registers and the
+ * popped x87 residue is dead at calls and returns. They compare
+ * with the value/bits/exact of empty registers and the
  * bits of registers whose exact flag is clear (unread) cleared; DF, TOP, tags,
  * status and live registers still compare. */
 #ifndef FIXTURE_CONVENTION_MASK
 #define FIXTURE_CONVENTION_MASK 0u
 #endif
 static void discard_convention_dead(X86 *c) {
-    c->eflags_cf = c->eflags_pf = c->eflags_af = 0;
-    c->eflags_zf = c->eflags_sf = c->eflags_of = 0;
     for (unsigned i = 0; i < 8; ++i) {
         if (ftag_of(c, i) == FTAG_EMPTY) {
             c->st[i] = 0;

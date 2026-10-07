@@ -17,20 +17,18 @@
 int corpus_relaxed_boundaries;
 unsigned corpus_relaxed_boundary_mismatches;
 
-/* ir_ssa_msvc_convention: the combined SSA variant leaves arithmetic flags and
+/* ir_ssa_msvc_convention: the combined SSA variant leaves
  * popped x87 residue unpublished at calls and returns. That mode, and boundary
- * hooks while it runs, compare canonical copies with those fields cleared:
- * CF/PF/AF/ZF/SF/OF, the value/bits/exact of empty registers and the bits of
- * registers whose exact flag is clear (no helper reads them). TOP, tags, DF,
- * status and every live register still compare. -1 when not relaxed. */
+ * hooks while it runs, compare canonical copies with the value/bits/exact of
+ * empty registers and the bits of registers whose exact flag is clear (no
+ * helper reads them). Flags, TOP, tags, status and every live register still
+ * compare. -1 when not relaxed. */
 #if defined(CORPUS_MODE_CONVENTION)
 int corpus_convention_mode = CORPUS_MODE_CONVENTION;
 #else
 int corpus_convention_mode = -1;
 #endif
 void corpus_convention_canonical(X86 *c) {
-    c->eflags_cf = c->eflags_pf = c->eflags_af = 0;
-    c->eflags_zf = c->eflags_sf = c->eflags_of = 0;
     for (unsigned i = 0; i < 8; ++i) {
         if (ftag_of(c, i) == FTAG_EMPTY) {
             c->st[i] = 0;
@@ -179,7 +177,8 @@ static void ceiling_check(unsigned row, unsigned input, const X86 *entry, const 
     snapshot(row, actual_mem);
     uint32_t final_esp = eager->r[R_ESP];
     uint32_t low = entry->r[R_ESP] > CORPUS_CEILING_STACK_WINDOW
-                       ? entry->r[R_ESP] - CORPUS_CEILING_STACK_WINDOW : 0;
+                       ? entry->r[R_ESP] - CORPUS_CEILING_STACK_WINDOW
+                       : 0;
     size_t offset = 0;
     int memory_bad = 0;
     const struct corpus_range *ranges = corpus_memory_ranges[row];

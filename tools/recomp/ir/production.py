@@ -106,7 +106,7 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
         "fallback_percent": 100 * (total - emitted) / total if total else 0,
         "denominator": "Final emitted function bodies, including recovered bodies; alternate entries are not separate functions.",
         "fallback_reasons": dict(reasons.most_common()),
-        # Emitted bodies that read a flag the MSVC convention calls dead, or
+        # Emitted bodies that read flags at an entry/call boundary, or
         # kept the exact x87 flush. A sanity census, not an admission gate.
         "convention_census": {key: census[key] for key in (
             "flags_read_at_entry", "flags_read_after_call", "x87_exact_flush")},

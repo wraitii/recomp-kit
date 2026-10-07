@@ -100,8 +100,8 @@ Calls and boundaries:
 - `indirect_call_symbol` (production passes `recomp_call`) opts in to indirect
   calls: the target must be a readable 32-bit value with a canonical fallthrough.
   Without it they fail closed. `resumable_stacks` checks EIP before continuing.
-- No per-callee summary permits dropping state at a call; only the
-  `ir_ssa_msvc_convention` policy below does, uniformly. The corpus binds
+- No per-callee summary permits dropping register or flag state at a call.
+  `ir_ssa_msvc_convention` only elides popped x87 residue. The corpus binds
   independently reviewed callees in the same mode; production dispatch goes
   through stable entry thunks (`CALL_FN`).
 - SLEIGH's absolute `ram` memory operands are normalized to one captured read or
@@ -145,11 +145,11 @@ snapshots stay complete. The must-analysis never claims a skipped field was
 published, so dead-value elimination can drop intermediate flags overwritten
 before a real observer.
 
-The `ir_ssa_msvc_convention` policy assumes MSVC-compiled callers and callees.
-Arithmetic flags (CF/PF/AF/ZF/SF/OF) are dead across `CALL` and `RET`, so they
-are not published before a call or at return. Entry and post-call reads still
-load the CPU, and DF, division and string-helper snapshots stay complete. For
-x87 the assumed invariant is that every register above TOP is tagged empty.
+The `ir_ssa_msvc_convention` policy assumes the MSVC x87 stack invariant:
+every register above TOP is tagged empty. Arithmetic flags stay published at
+calls and returns. CRT assembly helpers can return flags or consume entry flags;
+a compiler ABI is insufficient evidence that those values are dead. Dropping
+boundary flags requires actual call summaries, including decoded fallback bodies.
 Every runtime push and `fset` rewrites `st`, `st_bits` and `st_exact`, and
 `st_bits` is read only while `st_exact` is set. A flush therefore writes no
 value, bits or exact flag for popped registers, and leaves the tag of a
@@ -168,7 +168,7 @@ Policies and where they apply:
 | --- | --- | --- |
 | `ir_ssa_x87` | `scalar` (default), `scalar-strict` | strict publishes x87 state before loads and stores and uses general arithmetic recipes |
 | `ir_ssa_state` | `locals` (default), `strict` | strict keeps every pre-access GPR/flag snapshot |
-| `ir_ssa_msvc_convention` | `true` (default), `false` | false publishes flags and complete x87 state at calls and returns |
+| `ir_ssa_msvc_convention` | `true` (default), `false` | false publishes complete x87 state at calls and returns; flags stay exact in both modes |
 
 `RECOMP_NULL_CHECKS=1` builds always compile the strict forms of all three: `emit`
 emits a strict/fast `#if` pair whenever any policy is relaxed. `emit()`
@@ -178,8 +178,9 @@ msvc_convention=True`).
 DIVERGENCE(original): [ssa-x87-scalar] interior access faults and store watch
 callbacks may expose the preceding published x87 state. [ssa-state-locals] likewise defers GPR/flag
 state except EIP/ESP/EBP at loads and stores. [ssa-x87-binary32] uses the documented binary32
-exponent-range policy. [ssa-flags-convention] and [ssa-x87-convention] leave
-arithmetic flags and popped x87 residue unpublished at calls and returns.
+exponent-range policy. [ssa-x87-convention] leaves popped x87 residue unpublished at calls and returns.
+The former [ssa-flags-convention] assumption was rejected after a CRT flag ABI
+caused an in-game regression.
 Accesses and faults are never removed. Interior
 fault/SEH equivalence remains unverified.
 
@@ -277,5 +278,5 @@ observations, not full-state equality: native rows use the fixture's observable
 contract; translation-only rows compare declared guest ranges, EAX, ST0 and
 relaxed boundary snapshots. Mismatches are counted, never fatal. With D, sticky IE
 is absent from a status word a guest reads through `FNSTSW AX`. The former B (flags
-dead across calls and returns) is now production `ir_ssa_msvc_convention`. The
-column is built on top of the production policy.
+dead across calls and returns) was rejected after a CRT flag ABI caused an
+in-game regression. The column is built on top of the production policy.

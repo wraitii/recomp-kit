@@ -30,7 +30,7 @@ SUPPORTED_MNEMONICS = frozenset((
 )) | EXTRA_MNEMONICS
 
 
-# Arithmetic flags the MSVC convention treats as dead across CALL and RET.
+# Arithmetic flags tracked by the calling-convention census.
 FLAG_FIELDS = frozenset("c->eflags_" + n for n in ("cf", "pf", "af", "zf", "sf", "of"))
 
 _RAM_CONTROL = frozenset(("BRANCH", "CBRANCH", "CALL", "CALLIND", "BRANCHIND", "CALLOTHER"))
@@ -156,8 +156,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     builds compile both strict forms, and either can be requested explicitly.
 
     `msvc_convention` (the `ir_ssa_msvc_convention` setting) assumes the MSVC
-    call convention at calls and returns: arithmetic flags CF/PF/AF/ZF/SF/OF
-    are not published there (DF is), and x87 flushes skip popped residue under
+    x87 stack convention at calls and returns: flushes skip popped residue under
     the empty-above-TOP invariant (`x87_scalar.py`). False restores the
     conservative publication; null-check builds compile it False.
 
@@ -167,8 +166,8 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     selection never passes it.
 
     `facts`, when a dict, receives census facts about the performance body:
-    whether an arithmetic flag is read from the CPU at entry or after a call
-    (the MSVC convention says it is dead there) and whether the x87 flush kept
+    whether an arithmetic flag is read from the CPU at entry or after a call,
+    and whether the x87 flush kept
     the exact form. They describe the code; they do not gate emission.
     """
     if not symbol.isidentifier() or not symbol.isascii():
@@ -272,16 +271,12 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             # UNPROVEN ceiling A: guest memory accesses publish nothing.
             unpublished = (frozenset(("LOAD", "STORE", "X87_MEM"))
                            if "A" in _ceiling else frozenset())
-            # DIVERGENCE(original): [ssa-flags-convention] under the MSVC
-            # convention arithmetic flags are dead across CALL and RET: they
-            # are not published before a call or at return. Entry and
-            # post-call values still read the CPU, and DF, division and
-            # string-helper snapshots stay exact.
-            boundary_skip = (frozenset(key for key, (field, _) in mapping.items()
-                                       if field in FLAG_FIELDS)
-                             if msvc_convention else frozenset())
+            # Compiler conventions do not cover every binary boundary: CRT
+            # assembly helpers can return flags or consume incoming flags.
+            # Keep flag publication at calls/returns until actual call
+            # summaries prove which fields a boundary does not observe.
             publications = plan(s, fir.succ, groups, access_fields=access_fields,
-                                unpublished=unpublished, boundary_skip=boundary_skip)
+                                unpublished=unpublished)
         live = simplify(s, publications)
     else:
         live = {v.id for v in s.values}

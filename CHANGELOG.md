@@ -235,6 +235,16 @@
   calls and returns as following the MSVC convention: arithmetic flags
   (CF/PF/AF/ZF/SF/OF) are no longer published before calls or at returns, and
   x87 flushes skip popped residue, assuming registers above TOP are tagged empty.
+||||||| parent of 5179d25 (Preserve arithmetic flags across SSA call boundaries)
+- Add `[translate] ir_ssa_msvc_convention` (default `true`). SSA bodies treat
+  calls and returns as following the MSVC convention: arithmetic flags
+  (CF/PF/AF/ZF/SF/OF) are no longer published before calls or at returns, and
+  x87 flushes skip popped residue, assuming registers above TOP are tagged empty.
+- Add `[translate] ir_ssa_msvc_convention` (default `true`). SSA x87
+  flushes skip popped residue, assuming registers above TOP are tagged empty.
+  Arithmetic flags remain published at calls and returns: CRT assembly helpers
+  can pass flags across these boundaries. The earlier flag-elision assumption
+  caused incorrect math results and is removed, with a byte-backed regression.
   The tag word, TOP, DF and live registers stay exact. `false` restores the
   conservative publication; null-check builds always compile it. The
   translation report's `ir_ssa.convention_census` counts bodies that read a
