@@ -742,7 +742,10 @@ mod gpu_tests {
         let data: [f32; 12] = [
             -1.0, -1.0, 0.5, 1.0, 3.0, -1.0, 0.5, 1.0, -1.0, 3.0, 0.5, 1.0,
         ];
-        let vertices = VertexBuffer::borrowed(bytemuck::cast_slice(&data), 16).unwrap();
+        // Nonzero StartVertex must preserve programmable inputs and constants.
+        let mut prefixed = vec![0; 4096 * 16];
+        prefixed.extend_from_slice(bytemuck::cast_slice(&data));
+        let vertices = VertexBuffer::borrowed(&prefixed, 16).unwrap();
         device.clear(0, 1, 0xff000000, 1.0, 0).unwrap();
         device.begin_scene().unwrap();
         for (x, color) in [(0, [1.0f32, 0.0, 0.0, 1.0]), (32, [0.0, 1.0, 0.0, 1.0])] {
@@ -753,7 +756,9 @@ mod gpu_tests {
             );
             device.state.viewport.x = x;
             device.state.viewport.width = 32;
-            device.draw_primitive(4, 0x10000, &vertices, 0, 1).unwrap();
+            device
+                .draw_primitive(4, 0x10000, &vertices, 4096, 1)
+                .unwrap();
         }
         device.end_scene().unwrap();
         let pixels = device.read_pixels().unwrap();
@@ -840,7 +845,9 @@ mod gpu_tests {
         device.state.viewport.x = 0;
         device.state.viewport.width = 64;
         device.begin_scene().unwrap();
-        device.draw_primitive(4, 0x10000, &vertices, 0, 1).unwrap();
+        device
+            .draw_primitive(4, 0x10000, &vertices, 4096, 1)
+            .unwrap();
         device.end_scene().unwrap();
         let pixels = device.read_pixels().unwrap();
         assert_eq!(
@@ -891,7 +898,9 @@ mod gpu_tests {
                 .unwrap();
             device.state.set_texture_stage_state(1, 20, 1).unwrap(); // MAXMIPLEVEL
             device.begin_scene().unwrap();
-            device.draw_primitive(4, 0x10000, &vertices, 0, 1).unwrap();
+            device
+                .draw_primitive(4, 0x10000, &vertices, 4096, 1)
+                .unwrap();
             device.end_scene().unwrap();
             let pixels = device.read_pixels().unwrap();
             assert_eq!(

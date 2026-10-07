@@ -169,7 +169,9 @@ extern uint32_t g_store_hook;
 static inline void recomp_store_hook_update(void) {
     g_store_hook = g_watch_len | g_dirty_count;
 }
-static inline void recomp_watch(uint32_t a, uint32_t n, uint64_t v) {
+/* Keep the inactive gate in the store's caller: an outlined call for every
+ * guest write costs more than the diagnostic check itself. */
+RECOMP_HOT_INLINE void recomp_watch(uint32_t a, uint32_t n, uint64_t v) {
     // Both features are disarmed on the ordinary write (the watchpoint is a
     // diagnostic and a locked DirectDraw surface is rare), so one predictable
     // branch covers both. Arm and dirty state are set on this same guest

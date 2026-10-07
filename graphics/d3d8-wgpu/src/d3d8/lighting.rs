@@ -377,9 +377,9 @@ impl DeviceState {
     /// 0x152: XYZ at 0, NORMAL at 12, D3DCOLOR at 24, float2 UV at 28.
     /// 0x112: XYZ at 0, NORMAL at 12, float2 UV at 24, material diffuse.
     /// Evaluate in camera space and keep floating diffuse until rasterization.
-    /// Writes exactly `end * 36` bytes into `out`, overwriting every byte of
-    /// the `start..end` vertex range. `out` is a caller-owned scratch buffer so
-    /// a draw loop reuses one allocation; `resize` only zero-fills the first
+    /// Writes exactly `(end - start) * 36` bytes into `out`, packing the
+    /// `start..end` vertex range from output slot zero. The caller-owned scratch
+    /// buffer lets a draw loop reuse one allocation; `resize` only zero-fills the first
     /// time a larger draw grows it.
     pub(crate) fn light_vertices(
         &self,
@@ -390,12 +390,13 @@ impl DeviceState {
         out: &mut Vec<u8>,
     ) -> Result<(), RenderError> {
         let setup = self.lighting_setup()?;
-        out.resize(end * 36, 0);
+        out.resize((end - start) * 36, 0);
         for index in start..end {
             let begin = index * layout.stride;
             let vertex = &bytes[begin..begin + layout.stride];
             let lit = setup.evaluate(vertex, layout)?;
-            let dst = &mut out[index * 36..(index + 1) * 36];
+            let slot = index - start;
+            let dst = &mut out[slot * 36..(slot + 1) * 36];
             dst[..12].copy_from_slice(&vertex[..12]);
             dst[12..28].copy_from_slice(bytemuck::bytes_of(&lit.diffuse));
             dst[28..36].copy_from_slice(&vertex[layout.uv_offset..layout.uv_offset + 8]);
@@ -734,6 +735,30 @@ mod tests {
     }
 
     #[test]
+    fn nonzero_start_packs_only_requested_vertices() {
+        let state = directional();
+        let selected = vertex([0.0, 0.0, 1.0], 0x80402010);
+        // An invalid normal in the unused prefix must never be evaluated.
+        let bytes = [vertex([f32::NAN; 3], 0), selected.clone()].concat();
+        let mut packed = vec![0xff; 108];
+        state
+            .light_vertices(&bytes, 1, 2, LitInput::XYZ_NORMAL_DIFFUSE_TEX1, &mut packed)
+            .unwrap();
+        let mut fresh = Vec::new();
+        state
+            .light_vertices(
+                &selected,
+                0,
+                1,
+                LitInput::XYZ_NORMAL_DIFFUSE_TEX1,
+                &mut fresh,
+            )
+            .unwrap();
+        assert_eq!(packed, fresh);
+        assert_eq!(packed.len(), 36);
+    }
+
+    #[test]
     fn xyz_normal_tex1_uses_material_and_copies_uv() {
         // 0x112 has no COLOR1, so its diffuse must equal the material diffuse
         // (default opaque white), which the 0x152 helper can express with a
@@ -994,7 +1019,15 @@ mod tests {
         let source = vertex_at_xyz_normal_tex1([2.0, 0.0, -2.0], [0.0, 0.0, 1.0], [0.0, 0.0]);
         let mut dest = vec![0u8; 32];
         state
-            .process_vertices(&source, 0, 1, LitInput::XYZ_NORMAL_TEX1, 0x01c4, 0, &mut dest)
+            .process_vertices(
+                &source,
+                0,
+                1,
+                LitInput::XYZ_NORMAL_TEX1,
+                0x01c4,
+                0,
+                &mut dest,
+            )
             .unwrap();
         let f = |o: usize| f32::from_le_bytes(dest[o..o + 4].try_into().unwrap());
         let (sx, sy, sz, rhw) = (f(0), f(4), f(8), f(12));

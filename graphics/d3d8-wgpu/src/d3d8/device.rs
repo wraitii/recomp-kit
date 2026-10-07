@@ -1008,7 +1008,6 @@ struct PendingDraw {
     stages: bool,
     textures: Option<StageBindings>,
     viewport: crate::d3d8::state::Viewport,
-    first_vertex: u32,
     count: u32,
 }
 
@@ -2118,9 +2117,8 @@ impl Device {
             self.state.alpha_ref(),
         );
         // Compute fixed-function vertex lighting before rasterization. Only
-        // the requested vertex interval is read; prefix slots preserve draw's
-        // start_vertex without touching unused guest vertices. The scratch is
-        // moved out for the duration of the draw so the rest of this method can
+        // the requested vertex interval is read and packed from slot zero. The
+        // scratch is moved out for the duration of the draw so the rest of this method can
         // borrow `self` mutably; it is restored below before it is reused.
         let lit_input = if vs.is_some() {
             None
@@ -2223,15 +2221,17 @@ impl Device {
                 StagesUniform::for_fvf(&stage0, &stage1, layout.texcoord_sets)
             }
         });
-        // Upload only the vertex bytes this draw reads. Both the lit stream and
-        // `count * stride` are multiples of `COPY_BUFFER_ALIGNMENT` (4), which
-        // `queue.write_buffer_with` requires; the guest buffer's trailing bytes
-        // are not part of the draw and are not uploaded.
+        // Pack only the requested interval: uploading 0..count repeats the
+        // unused prefix on every draw into a shared guest vertex buffer. D3D8
+        // shader-model 1.1 has no vertex-index input, so rebasing the host draw
+        // to zero preserves every shader input. Guest indices and traces keep
+        // their original offsets; queued bytes remain an immutable snapshot.
         let (vertex_source, vertex_len) = if let Some(lit) = lit_bytes {
             (lit, lit.len())
         } else {
-            let used = count as usize * vertices.stride as usize;
-            (&vertices.bytes()[..used], used)
+            let begin = start_vertex as usize * vertices.stride as usize;
+            let end = count as usize * vertices.stride as usize;
+            (&vertices.bytes()[begin..end], end - begin)
         };
         let (ub_base, vertex_base) = {
             let mut batch = self.batch.borrow_mut();
@@ -2366,8 +2366,7 @@ impl Device {
             stages: stages_uniform.is_some(),
             textures,
             viewport: *v,
-            first_vertex: start_vertex,
-            count,
+            count: vertex_count,
         });
         self.publish_pending.set(true);
         if self.strict_scopes || self.batch.borrow().data.len() >= BATCH_FLUSH_BYTES {
@@ -2539,7 +2538,7 @@ impl Device {
                     v.min_z,
                     v.max_z,
                 );
-                pass.draw(d.first_vertex..d.count, 0..1);
+                pass.draw(0..d.count, 0..1);
             }
         }
         self.gpu.queue.submit([encoder.finish()]);
@@ -2912,6 +2911,43 @@ impl Device {
 mod tests {
     use super::blend_factor;
     use crate::d3d8::enums::D3DBLEND;
+
+    #[test]
+    fn queued_draws_exclude_unused_vertex_prefixes() {
+        use super::Device;
+        use crate::{backend::GpuContext, d3d8::resource::VertexBuffer};
+        let gpu = pollster::block_on(GpuContext::new_headless()).expect("Metal adapter");
+        let mut device = Device::new(gpu, 16, 16, 21, 0).unwrap();
+        device.state.set_render_state(7, 0).unwrap();
+        device.state.set_render_state(22, 1).unwrap();
+        device.begin_scene().unwrap();
+        // Large offsets must neither trigger the 8 MiB flush nor contribute
+        // unused bytes to the queued GPU upload. Exercise lit and unlit paths.
+        for (fvf, stride) in [(0x42, 16), (0x152, 36)] {
+            device
+                .state
+                .set_render_state(137, u32::from(fvf == 0x152))
+                .unwrap();
+            let mut source = vec![0; (65536 + 3) * stride];
+            for slot in 65536..65539 {
+                source[slot * stride + 8..slot * stride + 12]
+                    .copy_from_slice(&0.5f32.to_le_bytes());
+                if fvf == 0x152 {
+                    source[slot * stride + 20..slot * stride + 24]
+                        .copy_from_slice(&1.0f32.to_le_bytes());
+                }
+            }
+            let vertices = VertexBuffer::borrowed(&source, stride as u32).unwrap();
+            device.draw_primitive(4, fvf, &vertices, 65536, 1).unwrap();
+            let batch = device.batch.borrow();
+            let draw = batch.draws.last().unwrap();
+            assert_eq!(draw.count, 3);
+            assert_eq!(draw.vertex_len, 3 * stride as u64);
+            assert!(batch.data.len() < 8192);
+        }
+        assert_eq!(device.batch.borrow().draws.len(), 2);
+        device.end_scene().unwrap();
+    }
 
     #[test]
     fn point_and_triangle_topologies_consume_the_right_vertex_count() {

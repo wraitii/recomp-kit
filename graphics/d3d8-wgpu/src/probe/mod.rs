@@ -381,9 +381,12 @@ fn run_with_gpu(
         }
         bytes.extend_from_slice(&0xffd05020u32.to_le_bytes());
     }
-    let vertices = VertexBuffer::new(&bytes, 16)?;
+    // A large unused prefix catches uploading/drawing the wrong interval.
+    let mut prefixed = vec![0; 4096 * 16];
+    prefixed.extend_from_slice(&bytes);
+    let vertices = VertexBuffer::new(&prefixed, 16)?;
     device.begin_scene()?;
-    device.draw_primitive(4, 0x42, &vertices, 0, 1)?;
+    device.draw_primitive(4, 0x42, &vertices, 4096, 1)?;
     device.end_scene()?;
     let pixels = device.read_pixels()?;
     checked_pixels(&pixels, options.width, options.height)?;
@@ -428,7 +431,9 @@ fn run_with_gpu(
     checked_pixels(&point_pixels, options.width, options.height)?;
     let point_center =
         ((options.width as usize / 2) + (options.height as usize / 2) * options.width as usize) * 4;
-    let point_sample: [u8; 4] = point_pixels[point_center..point_center + 4].try_into().unwrap();
+    let point_sample: [u8; 4] = point_pixels[point_center..point_center + 4]
+        .try_into()
+        .unwrap();
     let point_ok = point_sample == [0x20, 0xd0, 0xf0, 0xff];
     report.checks.push(CheckResult {
         name: "point list/readback",
@@ -1044,10 +1049,12 @@ fn run_with_gpu(
             bytes.extend(0x80ffffffu32.to_le_bytes());
             bytes.extend([0; 8]);
         }
-        let vertices = VertexBuffer::new(&bytes, 36)?;
+        let mut prefixed = vec![0; 4096 * 36];
+        prefixed.extend_from_slice(&bytes);
+        let vertices = VertexBuffer::new(&prefixed, 36)?;
         device.clear(0, 3, 0, 1.0, 0)?;
         device.begin_scene()?;
-        device.draw_primitive(4, 0x152, &vertices, 0, 1)?;
+        device.draw_primitive(4, 0x152, &vertices, 4096, 1)?;
         device.end_scene()?;
         let pixels = device.read_pixels()?;
         let seen: [u8; 4] = pixels[center..center + 4].try_into().unwrap();
@@ -1140,7 +1147,12 @@ fn run_with_gpu(
         device.set_texture(1, 10000 + i, 21, &level0(1, false, 1, 1, &[255, 0, 0, 255]))?;
     }
     device.set_texture(1, 0, 0, &[])?;
-    device.set_texture(0, 901, 21, &level0(7, false, rt_width, rt_height, &stale_cpu))?;
+    device.set_texture(
+        0,
+        901,
+        21,
+        &level0(7, false, rt_width, rt_height, &stale_cpu),
+    )?;
     device.begin_scene()?;
     device.draw_primitive(4, 0x142, &green_quad, 0, 2)?;
     device.end_scene()?;

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- D3D8 draws snapshot and upload only the requested vertex interval, excluding
+  unused prefixes before StartVertex. Software lighting also packs its scratch
+  output from slot zero. Nonzero-offset fixed-function and programmable draws
+  retain their inputs; Metal readback and queued-byte regressions cover both.
+  The guest-store watch/dirty gate is forced inline to avoid a helper call on
+  every write while retaining armed diagnostics and dirty tracking.
+
 - D3D8 texture sampling now uses the level-0 surface identity shared by
   render-target binding, readback and destruction. Previously sampling a
   render-target texture uploaded stale CPU bytes under its parent texture id,
