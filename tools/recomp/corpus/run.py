@@ -32,6 +32,18 @@ from code_map import read_map, decode_span
 HERE = Path(__file__).resolve().parent
 KIT = HERE.parents[2]
 MODES = ('eager', 'cpu', 'x87', 'combined', 'native')
+CEILING_MODE = 'ceiling'
+# Fields of one parsed `CEILING` harness record (see harness.c).
+CEILING_FIELDS = ('checked', 'skipped', 'observation', 'memory', 'eax', 'st0', 'boundary', 'first_input')
+
+
+def corpus_modes(ceiling=False):
+    """Mode names in harness order: the experimental ceiling precedes native.
+
+    The ceiling column is appended only when requested, so the default order,
+    indices and generated tables are unchanged.
+    """
+    return MODES[:-1] + ((CEILING_MODE,) if ceiling else ()) + MODES[-1:]
 NATIVE_REFERENCE = 'native-reference'
 TRANSLATION_ONLY = 'translation-only'
 COMPARISONS = (NATIVE_REFERENCE, TRANSLATION_ONLY)
@@ -398,6 +410,72 @@ def parse_coverage(output, fixture_ids, required_rows):
     return coverage
 
 
+def parse_ceiling(output, rows, required=True):
+    """Parse one exact `CEILING row ...` record per row (experimental column).
+
+    Fields: checked skipped observation memory eax st0 boundary first_input,
+    followed by a free-text first-mismatch reason. Counts are nonnegative
+    integers; ``first_input`` is -1 when there was no mismatch. A missing or
+    duplicate record is an error, never a silent pass.
+    """
+    records = {}
+    for line in output.splitlines():
+        parts = line.split(None, 2 + len(CEILING_FIELDS))
+        if parts[:1] != ['CEILING']:
+            continue
+        if len(parts) < 2 + len(CEILING_FIELDS):
+            raise ValueError('malformed ceiling record')
+        try:
+            row = int(parts[1])
+            values = [int(v) for v in parts[2:2 + len(CEILING_FIELDS)]]
+        except ValueError:
+            raise ValueError('malformed ceiling record')
+        if not 0 <= row < rows or row in records:
+            raise ValueError('ceiling record for unknown or duplicate row')
+        if any(v < 0 for v in values[:-1]) or values[-1] < -1:
+            raise ValueError('negative ceiling count')
+        record = dict(zip(CEILING_FIELDS, values))
+        record['reason'] = parts[2 + len(CEILING_FIELDS)].strip() if len(parts) > 2 + len(CEILING_FIELDS) else ''
+        records[row] = record
+    if required and set(records) != set(range(rows)):
+        raise ValueError('missing ceiling record')
+    return records
+
+
+def parse_ceiling_bench(output, rows):
+    """Rows whose post-timing sanity check failed in the ceiling variant."""
+    seen, invalid = set(), set()
+    for line in output.splitlines():
+        parts = line.split()
+        if parts[:1] != ['CEILING_BENCH']:
+            continue
+        row, valid = int(parts[1]), int(parts[2])
+        if not 0 <= row < rows or row in seen or valid not in (0, 1):
+            raise ValueError('malformed ceiling bench record')
+        seen.add(row)
+        if not valid:
+            invalid.add(row)
+    if seen and seen != set(range(rows)):
+        raise ValueError('incomplete ceiling bench records')
+    return invalid
+
+
+def ceiling_mismatches(record):
+    """Total mismatching observations in one parsed ceiling record."""
+    return sum(record[k] for k in ('observation', 'memory', 'eax', 'st0', 'boundary'))
+
+
+def ceiling_note(row):
+    """One-line CSV/Markdown summary of a row's experimental ceiling status."""
+    info = row.get('ceiling')
+    if not info:
+        return ''
+    obs = info['observation']
+    status = 'emitted' if info['emitted'] else f"fallback:{info['fallback']}"
+    return (f"relax={','.join(info['relaxations'])}; {status}; observation={obs['status']} "
+            f"(checked {obs['checked']}, skipped {obs['skipped']}, mismatches {obs['mismatches']})")
+
+
 def markdown(report):
     lines = ['# Function corpus report', '',
              f"Host: {report['host']}. Compiler: {report['compiler']}.", '',
@@ -430,6 +508,34 @@ def markdown(report):
                      f"{row['original_bytes']} / {row['x87_instructions']} | "
                      f"{variants['eager']['span_bytes']} | {variants['combined']['span_bytes']} | "
                      f"{native_bytes} / {kernel_bytes} | {timing('eager')} / {timing('combined')} / {kernel_ns} |")
+    info = report.get('ir_ssa_ceiling', {})
+    if info.get('enabled'):
+        lines += ['', f"## {info['label']} (UNPROVEN, corpus-only)", '',
+                  'Relaxations A-E are unproven measurement ceilings, not the agreed performance-mode contract; '
+                  'they never apply to production. Full-state equality with eager C is not expected. '
+                  'Native rows are checked against declared native observations; translation-only rows against '
+                  'eager guest memory ranges (excluding stack residue below the final ESP), EAX and ST0. '
+                  'Mismatches are counted, not fatal; inputs outside PC=00/RC=nearest/masked are skipped when E is enabled.', '',
+                  '| Function | SSA scalar/locals ns | Ceiling ns | Native adapter ns | SSA bytes | Ceiling bytes | Status | Observation check |',
+                  '| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |']
+        for row in report['functions']:
+            variants = row['variants']
+
+            def t(mode):
+                values = variants.get(mode, {}).get('timing_ns')
+                return f"{values['median']:.2f}" if values else '—'
+            c = row['ceiling']
+            o = c['observation']
+            status = 'emitted' if c['emitted'] else f"fallback ({c['fallback']}): {c['reason']}"
+            if o['mismatches']:
+                check = (f"MISMATCH {o['mismatches']} (obs {o['observation']}, mem {o['memory']}, eax {o['eax']}, "
+                         f"st0 {o['st0']}, boundary {o['boundary']}) of {o['checked']}; first input {o['first_input']}: {o['reason']}")
+            else:
+                check = f"{o['status']} ({o['checked']} checked, {o['skipped']} skipped)"
+            if c.get('timing_sanity') == 'FAILED':
+                check += '; timed-workload sanity check FAILED'
+            lines.append(f"| {row['address']} {row['name']} | {t('combined')} | {t('ceiling')} | {t('native')} | "
+                         f"{variants['combined']['span_bytes']} | {variants['ceiling']['span_bytes']} | {status} | {check} |")
     boundary_rows = [row for row in report['functions']
                      if row.get('boundary_stubs') or row.get('indirect_calls')]
     if boundary_rows:
@@ -450,8 +556,10 @@ def markdown(report):
         for row in coverage_rows:
             counts = ', '.join(f'{key}={value}' for key, value in row['coverage'].items())
             lines.append(f"| {row['address']} {row['name']} | {counts} |")
+    ceiling_note_text = (' (eager, CPU locals, x87 locals and combined; the experimental ceiling column is judged '
+                         'separately above)' if info.get('enabled') else '')
     lines += ['', f"All {report['checks_per_function']} inputs/function passed full-state translation checks"
-              + ("; native-reference rows also matched their declared observations." if
+              + ceiling_note_text + ("; native-reference rows also matched their declared observations." if
                  any(r.get('comparison', NATIVE_REFERENCE) == NATIVE_REFERENCE for r in report['functions'])
                  else "."),
               '', 'Native contracts are restricted to the inputs/settings documented by the game fixtures. '
@@ -462,8 +570,19 @@ def markdown(report):
 
 def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, trials=9,
                x87_dataflow=False, x87_stack_forwarding=False, decoded_dataflow=False,
-               ir_ssa=False, ir_ssa_x87="effects", ir_ssa_state="strict"):
-    """Decode the selected instructions, build isolated variants, validate, report."""
+               ir_ssa=False, ir_ssa_x87="effects", ir_ssa_state="strict", ir_ssa_ceiling=None):
+    """Decode the selected instructions, build isolated variants, validate, report.
+
+    ``ir_ssa_ceiling`` (e.g. ``"A,B"``/``"all"``) adds the UNPROVEN, corpus-only
+    "SSA ceiling" column; see ``ir/ceiling.py``. It is judged against declared
+    observations rather than full-state equality and requires scalar x87 and
+    local-state SSA, which also supply its per-function fallback body.
+    """
+    from ir.ceiling import parse_relaxations, label as ceiling_label
+    ceiling = parse_relaxations(ir_ssa_ceiling)
+    if ceiling and not (ir_ssa and ir_ssa_x87 == "scalar" and ir_ssa_state == "locals"):
+        raise ValueError("SSA ceiling requires --ir-ssa with scalar x87 and locals state")
+    modes = corpus_modes(bool(ceiling))
     if ir_ssa_state not in ("strict", "locals"):
         raise ValueError("IR SSA state policy must be strict or locals")
     if ir_ssa_state != "strict" and not ir_ssa:
@@ -570,9 +689,10 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
         write_input(directory / 'original.asm', '\n'.join(i.raw for i in insns) + '\n')
         write_input(directory / 'original.bin', raw)
         ir_result = {'emitted': False, 'reason': 'disabled'}
-        for mode in MODES[:-1]:
-            options = SimpleNamespace(eager_flags=mode == "eager", cpu_locals=mode in ('cpu', 'combined'),
-                                      x87_locals=mode in ('x87', 'combined'),
+        ceiling_result = None
+        for mode in modes[:-1]:
+            options = SimpleNamespace(eager_flags=mode == "eager", cpu_locals=mode in ('cpu', 'combined', CEILING_MODE),
+                                      x87_locals=mode in ('x87', 'combined', CEILING_MODE),
                                       x87_dataflow=x87_dataflow and mode in ('x87', 'combined'),
                                       x87_stack_forwarding=x87_stack_forwarding and mode in ('x87', 'combined'),
                                       decoded_dataflow=decoded_dataflow and mode == 'combined')
@@ -589,7 +709,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
             else:
                 body = bind_reviewed_calls(body, row.get('callees', []), mode)
             wrapped = False
-            if ir_ssa and mode == 'combined':
+            if ir_ssa and mode in ('combined', CEILING_MODE):
                 from ir.lift import Lifter, LiftError
                 from ir.census import function_ir
                 from ir.ssa import SSAError
@@ -599,23 +719,42 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
                 call_symbols = ssa_call_symbols(mode, boundary, direct, row.get('callees', []))
                 indirect_symbol = (f'{mode}_indirect_{row["address"]}'
                                    if boundary and indirect_sites else None)
-                try:
-                    lifter = Lifter()
-                    fir = function_ir(tr, lifter, fn)
-                    body = emit(fir, f'{mode}_fn_{addr:08x}', call_symbols=call_symbols,
+
+                def ssa_emit(relax):
+                    return emit(fir, f'{mode}_fn_{addr:08x}', call_symbols=call_symbols,
                                 indirect_call_symbol=indirect_symbol,
                                 x87_values=(ir_ssa_x87 == 'values'),
                                 x87_region=(ir_ssa_x87 == 'region'),
                                 x87_scalar=ir_ssa_x87 in ('scalar', 'scalar-strict'),
                                 x87_scalar_strict=(ir_ssa_x87 == 'scalar-strict'),
                                 local_state=(ir_ssa_state == 'locals'),
-                                resumable_stacks=getattr(T, 'RESUMABLE_STACKS', False))
+                                resumable_stacks=getattr(T, 'RESUMABLE_STACKS', False),
+                                _ceiling=relax)
+                try:
+                    lifter = Lifter()
+                    fir = function_ir(tr, lifter, fn)
+                    if mode == CEILING_MODE:
+                        # UNPROVEN ceiling: any unsupported shape keeps the ordinary
+                        # SSA scalar/locals body for the whole function.
+                        try:
+                            body = ssa_emit(ceiling)
+                            ceiling_result = {'emitted': True, 'reason': None, 'fallback': None}
+                        except SSAError as error:
+                            body = ssa_emit(frozenset())
+                            ceiling_result = {'emitted': False, 'reason': str(error),
+                                              'fallback': 'ssa-scalar-locals'}
+                    else:
+                        body = ssa_emit(frozenset())
                     if contract == 'mapped-comparison-corpus-v2':
                         body = wrap_string_helpers_ssa(body, insns)
                         wrapped = True
-                    ir_result = {'emitted': True, 'reason': None}
+                    if mode == 'combined':
+                        ir_result = {'emitted': True, 'reason': None}
                 except (SSAError, LiftError) as error:
-                    ir_result = {'emitted': False, 'reason': str(error)}
+                    if mode == CEILING_MODE:
+                        ceiling_result = {'emitted': False, 'reason': str(error), 'fallback': 'decoded'}
+                    else:
+                        ir_result = {'emitted': False, 'reason': str(error)}
             if not wrapped and contract == 'mapped-comparison-corpus-v2':
                 body = wrap_string_helpers(body)
             prototypes = ''.join(f'void {mode}_fn_{a}(X86 *);\n' for a in row.get('callees', []))
@@ -642,10 +781,11 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
             sources.append(path)
         provenance.append({**row, 'comparison': comparison, 'analysis_name': name,
                            'original_bytes': len(raw), 'ir_ssa': ir_result,
+                           **({'ir_ssa_ceiling': ceiling_result} if ceiling else {}),
                            'original_instructions': len(insns),
                            'x87_instructions': sum(i.mnem.startswith('F') for i in insns),
                            'spans': spans})
-        row_modes.append(4 if translation_only else len(MODES))
+        row_modes.append(len(modes) - 1 if translation_only else len(modes))
         row_has_native.append(0 if translation_only else 1)
         row_boundary.append(1 if boundary else 0)
     generation_seconds = time.monotonic() - started
@@ -661,11 +801,17 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
     quote = lambda p: json.dumps(str(p))
     write_input(out / 'sources.cmake', 'set(CORPUS_SOURCES\n' + '\n'.join(map(quote, sources)) + '\n)\n')
     declarations = [f'#include {quote(header)}', f'#define CORPUS_COUNT {len(rows)}',
-                    f'#define CORPUS_MODES {len(MODES)}']
+                    f'#define CORPUS_MODES {len(modes)}',
+                    f'#define CORPUS_MODE_NATIVE {len(modes) - 1}']
+    if ceiling:
+        declarations.append(f'#define CORPUS_MODE_CEILING {modes.index(CEILING_MODE)}')
+        if 'E' in ceiling:
+            # Ceiling E assumes PC=00/nearest/masked; only such inputs are compared.
+            declarations.append('#define CORPUS_CEILING_E_DOMAIN 1')
     declarations.append('static const uint32_t corpus_call_returns[] = {CORPUS_RETURN' +
                         ''.join(f',0x{a:08x}u' for a in sorted(call_returns)) + '};')
     for row in provenance:
-        for mode in MODES:
+        for mode in modes:
             if row['comparison'] == TRANSLATION_ONLY and mode == 'native':
                 continue
             symbol = f'{mode}_fn_{row["address"]}' if mode != 'native' else f'native_{row["address"]}'
@@ -705,11 +851,11 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
     declarations.append('static const unsigned corpus_row_modes[] = {' + ','.join(map(str, row_modes)) + '};')
     declarations.append('static const unsigned corpus_has_native[] = {' + ','.join(map(str, row_has_native)) + '};')
     declarations.append('static const unsigned corpus_is_boundary[] = {' + ','.join(map(str, row_boundary)) + '};')
-    declarations.append('static void (*corpus_functions[][5])(X86 *) = {' + ','.join(
+    declarations.append(f'static void (*corpus_functions[][{len(modes)}])(X86 *) = {{' + ','.join(
         '{' + ','.join(
             (f'{m}_fn_{r["address"]}' if m != 'native' else f'native_{r["address"]}')
             if not (r['comparison'] == TRANSLATION_ONLY and m == 'native') else '0'
-            for m in MODES) + '}' for r in provenance) + '};')
+            for m in modes) + '}' for r in provenance) + '};')
     write_input(out / 'corpus-config.h', '\n'.join(declarations) + '\n')
     write_input(out / 'image.bin', image.data)
     started = time.monotonic()
@@ -739,11 +885,13 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
     times = parse_results(completed.stdout, len(rows), checks, calls, trials, row_modes, row_has_native)
     required_coverage = [r for r, row in enumerate(provenance) if row['comparison'] == TRANSLATION_ONLY]
     coverage = parse_coverage(completed.stdout, fixture_ids, required_coverage)
+    ceiling_records = parse_ceiling(completed.stdout, len(rows)) if ceiling else {}
+    ceiling_bench_invalid = parse_ceiling_bench(completed.stdout, len(rows)) if ceiling and calls else set()
     report_rows = []
     for r, row in enumerate(provenance):
         translation_only = row['comparison'] == TRANSLATION_ONLY
         variants = {}
-        for m, mode in enumerate(MODES):
+        for m, mode in enumerate(modes):
             if translation_only and mode == 'native':
                 continue
             symbol = f'{mode}_fn_{row["address"]}' if mode != 'native' else f'native_{row["address"]}'
@@ -759,12 +907,22 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
         if not translation_only:
             kernel = dict(sizes[row['kernel']])
             if calls:
-                values = [times[r, len(MODES), t] for t in range(trials)]
+                values = [times[r, len(modes), t] for t in range(trials)]
                 kernel['timing_ns'] = {'median': statistics.median(values), 'min': min(values),
                                        'max': max(values), 'trials': values}
             entry['native_kernel'] = kernel
         if r in coverage:
             entry['coverage'] = coverage[r]
+        if ceiling:
+            record = ceiling_records[r]
+            entry['ceiling'] = {
+                **row['ir_ssa_ceiling'], 'relaxations': sorted(ceiling),
+                'method': 'translation-only: guest ranges (minus stack residue), EAX, ST0 vs eager'
+                          if translation_only else 'declared native observations (object window, EAX/AL/ST0)',
+                'timing_sanity': 'FAILED' if r in ceiling_bench_invalid else ('pass' if calls else 'not run'),
+                'observation': {**record, 'mismatches': ceiling_mismatches(record),
+                                'status': ('no in-domain inputs' if not record['checked'] else
+                                           'pass' if not ceiling_mismatches(record) else 'mismatch')}}
         report_rows.append(entry)
     import shlex
     compiler = compiler_rows[0].get('arguments', []) or shlex.split(compiler_rows[0]['command'])
@@ -772,6 +930,9 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
               'x87_dataflow': x87_dataflow, 'x87_stack_forwarding': x87_stack_forwarding, 'decoded_dataflow': decoded_dataflow,
               'ir_ssa': ir_ssa,
               'ir_ssa_x87': ir_ssa_x87, 'ir_ssa_state': ir_ssa_state,
+              'ir_ssa_ceiling': {'enabled': bool(ceiling), 'relaxations': sorted(ceiling),
+                                 'label': ceiling_label(ceiling) if ceiling else None,
+                                 'unproven': 'corpus-only experiment, not the agreed performance-mode contract'},
               'compiler': subprocess.check_output([compiler[0], '--version'], text=True).splitlines()[0],
               'compile_commands': compiler_rows, 'manifest_sha256': hashlib.sha256(manifest.read_bytes()).hexdigest(),
               'executable_sha256': cfg['game']['sha256'],
@@ -785,14 +946,14 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
               'row_modes': row_modes, 'row_has_native': row_has_native,
               'benchmark': spec.get('benchmark', {}),
               'native_executable_sha256': hashlib.sha256(executable.read_bytes()).hexdigest(),
-              'helper_text': {k: v for k, v in sizes.items() if not re.match(r'(?:eager|cpu|x87|combined|native|clean)_', k)},
+              'helper_text': {k: v for k, v in sizes.items() if not re.match(r'(?:eager|cpu|x87|combined|ceiling|native|clean)_', k)},
               'functions': report_rows}
     (out / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
     (out / 'report.md').write_text(markdown(report))
     with (out / 'report.csv').open('w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=['address', 'name', 'comparison', 'variant', 'original_bytes',
                                               'x87_instructions', 'span_bytes', 'instructions',
-                                              'median_ns', 'min_ns', 'max_ns'])
+                                              'median_ns', 'min_ns', 'max_ns', 'note'])
         writer.writeheader()
         for row in report_rows:
             sources = dict(row['variants'])
@@ -803,6 +964,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, calls=100000, 
                                  'comparison': row['comparison'], 'variant': mode,
                                  'original_bytes': row['original_bytes'], 'x87_instructions': row['x87_instructions'],
                                  'span_bytes': v['span_bytes'], 'instructions': v['instructions'],
-                                 **{key+'_ns': v.get('timing_ns', {}).get(key, '') for key in ('median', 'min', 'max')}})
+                                 **{key+'_ns': v.get('timing_ns', {}).get(key, '') for key in ('median', 'min', 'max')},
+                                 'note': ceiling_note(row) if mode == CEILING_MODE else ''})
     print((out / 'report.md').read_text())
     print('Artifacts:', out)

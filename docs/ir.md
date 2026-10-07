@@ -469,6 +469,51 @@ over actual synthetic instruction bytes. The native SSA comparison suite checks
 body semantics; production entry-dispatch tests check replacement/hook/profile
 policy. A real replay is still needed before performance capture.
 
+## SSA ceiling experiment (corpus-only, unproven)
+
+`ir/ceiling.py` defines five aggressive relaxations that the function corpus can
+apply as one extra "SSA ceiling" column, to measure how much speed they could buy
+*before* any is proven. They are **not** part of the agreed performance-mode
+contract, never reach `game.toml` or `ir/production.py` (the only entry is the
+private `_ceiling` argument of `emit_c.emit`, which production never passes, and
+a regression test enforces this), and every existing variant stays byte-identical
+when the option is absent. Select them with `tools/build.py ... --corpus-ir-ssa
+--corpus-ir-ssa-x87 scalar --corpus-ir-ssa-state locals --corpus-ir-ssa-ceiling
+A,B,C,D,E|all` (the game wrapper spells it `--ir-ssa-ceiling`).
+
+| Letter | Relaxation | Where it is applied |
+| --- | --- | --- |
+| A | No store snapshots: LOAD/STORE/x87-memory effects publish no GPR/flag/x87 state; only calls, returns and division/string seams do | `publication.plan(unpublished=...)`, `emit_c`, `X87Scalar.store_flush` |
+| B | CF/PF/AF/ZF/SF/OF are not live-in, not live-out, not published before a call and constant 0 after it; DIV/MOVS seams pass them through; DF stays exact | `ssa.build(dead_flag_keys=...)`, plan groups |
+| C | MSVC x87 convention: values only (no st_bits/st_exact/tags), popped slots are never published, flushes write live values and TOP. The "ST0 is live at return" test is inferred from which slots remain pushed (no summary depth is consulted). FILD/FISTP exact-integer shadows are dropped, not kept | `x87_ceiling.X87Ceiling` |
+| D | No sticky IE/ZE and no per-op NaN canonicalization; stores of a NaN write the x87 indefinite; FCOM keeps exact C0/C2/C3 inline | `X87Ceiling` |
+| E | PC=00/RC=nearest assumed, no control-word selector, slots are C `float`, plain float arithmetic (the corpus still builds with `-ffp-contract=off`) | `X87Ceiling` |
+
+C, D and E lower only the instruction forms the corpus contains (loads, stores,
+basic and integer-memory arithmetic, compares, FCHS/FABS/FSQRT, FXCH, FNSTSW AX).
+Any other x87 form (FLDCW, FIST*, FPREM, FRNDINT, FXAM, FINIT...) raises a named
+`SSAError`; the runner then keeps the ordinary scalar/locals SSA body for that
+whole function and records the reason. No FLDCW-affected-region split exists. The
+null-check dual body is skipped for ceiling output.
+
+The runner builds the ceiling column between `combined` and `native`
+(`corpus_modes(True)`), emits `CORPUS_MODE_CEILING` into the generated config, and
+judges it on declared observations because full-state equality is expected to
+fail. Native-reference rows use the fixture's `corpus_observable_equal` contract.
+Translation-only rows compare declared guest ranges (excluding
+`[entry ESP - 0x1000, final ESP)` stack residue), EAX and the ST0 return, plus
+boundary hooks that consult `corpus_relaxed_boundaries` and count GPR/EIP/TOP/
+stack/target/order differences. With E, inputs whose control word is not
+PC=00/RC=nearest/masked are skipped and reported as `skipped`. Mismatches are
+counted per row and never abort; a failed timed-workload sanity check is
+recorded rather than fatal. Report JSON carries the relaxation set, emitted or
+fallback status and reason, the observation counts with the first failing input,
+and a one-line CSV note.
+
+Known consequence: with D, sticky IE is absent from the status word a guest reads
+through `FNSTSW AX`, so a boundary or return EAX can differ in its low status
+bits even when no consumed condition bit does.
+
 ## Remaining code-generation work
 
 Extend SSA beyond the admitted integer and corrected x87 effects, preserving

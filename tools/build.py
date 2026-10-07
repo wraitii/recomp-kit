@@ -480,6 +480,9 @@ def parse_args(argv, system=None):
                         help="x87 comparison mode for --corpus-ir-ssa (default: effects)")
     parser.add_argument("--corpus-ir-ssa-state", choices=("strict", "locals"), default=None,
                         help="CPU publication policy for --corpus-ir-ssa (default: strict)")
+    parser.add_argument("--corpus-ir-ssa-ceiling", metavar="A,B,C,D,E|all", default=None,
+                        help="Add the UNPROVEN, corpus-only SSA ceiling column with these relaxations "
+                             "(requires --corpus-ir-ssa scalar x87 and locals state)")
     parser.add_argument("--corpus-checks", type=int, default=4096)
     parser.add_argument("--corpus-calls", type=int, default=100000,
                         help="Calls per timing trial; zero runs correctness/size only")
@@ -573,6 +576,8 @@ def parse_args(argv, system=None):
         parser.error("--corpus-x87-dataflow requires --function-corpus")
     if args.corpus_ir_ssa and not args.function_corpus:
         parser.error("--corpus-ir-ssa requires --function-corpus")
+    if args.corpus_ir_ssa_ceiling is not None and not args.corpus_ir_ssa:
+        parser.error("--corpus-ir-ssa-ceiling requires --corpus-ir-ssa")
     if args.corpus_ir_ssa_x87 is not None and not args.corpus_ir_ssa:
         parser.error("--corpus-ir-ssa-x87 requires --corpus-ir-ssa")
     if args.corpus_ir_ssa_state is not None and not args.corpus_ir_ssa:
@@ -607,7 +612,7 @@ def main():
                        cmake_tool("cmake"), args.jobs, args.corpus_checks,
                        args.corpus_calls, args.corpus_trials, args.corpus_x87_dataflow, args.corpus_stack_forwarding, args.corpus_decoded_dataflow,
                        args.corpus_ir_ssa, args.corpus_ir_ssa_x87 or "effects",
-                       args.corpus_ir_ssa_state or "strict")
+                       args.corpus_ir_ssa_state or "strict", args.corpus_ir_ssa_ceiling)
         return
     if args.corpus_llvm_sweep:
         from corpus.llvm_sweep import run_sweep

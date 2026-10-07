@@ -64,7 +64,7 @@ class SSA:
 MEMORY = ("memory", 0)
 
 
-def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None):
+def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None, dead_flag_keys=()):
     """Build SSA for reachable integer instructions using the supplied CFG.
 
     A direct CALL is admitted only when its literal target appears in
@@ -75,8 +75,15 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
     x87 and intra-instruction branches still need additional state/CFG models
     and are deliberately rejected. A ram varnode is a control target only;
     ordinary guest memory remains behind LOAD/STORE and the memory token.
+
+    `dead_flag_keys` is a corpus-only, UNPROVEN ceiling relaxation (see
+    `ceiling.py`; never reachable from production): the named register lanes
+    are not live-in at entry (they start as constant 0), are not reloaded after
+    a call (constant 0), and pass through DIV32/IDIV32/MOVS32 seams unchanged.
+    Empty (the default) leaves the construction untouched.
     """
     call_targets = frozenset(call_targets)
+    dead_flag_keys = frozenset(dead_flag_keys)
     if not fir.insns or len(fir.succ) != len(fir.insns):
         raise SSAError("empty function or invalid successor table")
     indices = {ins.addr: i for i, ins in enumerate(fir.insns)}
@@ -146,7 +153,10 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
     s = SSA()
     s.entry = entry
     for key in keys:
-        s.inputs[key] = s.value("INPUT", 0 if key == MEMORY else 1, data=key)
+        if key in dead_flag_keys:
+            s.inputs[key] = s.value("CONST", 1, data=0)  # Ceiling B: not live-in.
+        else:
+            s.inputs[key] = s.value("INPUT", 0 if key == MEMORY else 1, data=key)
     predecessors = {i: [] for i in reachable}
     predecessors[entry].append(-1)
     for i in sorted(reachable):
@@ -199,7 +209,9 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                 b.snapshots[value.id] = before
                 state[MEMORY] = emit("MEMORY", 0, [value])
                 for key in keys:
-                    if key != MEMORY:
+                    if key in dead_flag_keys:
+                        state[key] = s.value("CONST", 1, data=0)  # Ceiling B.
+                    elif key != MEMORY:
                         # Pure read of the callee's result state; the call value
                         # keeps it ordered after the call and lets simplify drop
                         # a reload that no later observation uses.
@@ -218,7 +230,9 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                 b.snapshots[value.id] = before
                 state[MEMORY] = emit("MEMORY", 0, [value])
                 for key in keys:
-                    if key != MEMORY:
+                    if key in dead_flag_keys:
+                        state[key] = s.value("CONST", 1, data=0)  # Ceiling B.
+                    elif key != MEMORY:
                         state[key] = emit("CALL_RELOAD", s.inputs[key].size, [value], data=key)
                 continue
             args = [read(v) for v in op.ins]
@@ -238,7 +252,7 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                 # tracked lane and flag from the helper's result state, exactly
                 # as the eager emitter publishes and reloads live locals.
                 for key in keys:
-                    if key != MEMORY:
+                    if key != MEMORY and key not in dead_flag_keys:  # Ceiling B: flags pass through.
                         state[key] = emit("CALL_RELOAD", s.inputs[key].size, [value], data=key)
         b.exit = state
         branches = [op for op in b.insn.ops if op.opc in BRANCHES]

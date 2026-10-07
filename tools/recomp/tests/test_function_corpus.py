@@ -8,7 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from corpus.run import (parse_results, parse_coverage, symbol_sizes, reviewed_calls,
                         bind_reviewed_calls, review_boundaries, bind_boundary_calls,
                         wrap_string_helpers, wrap_string_helpers_ssa, boundary_wrappers,
-                        ssa_call_symbols, validate_code_map_metadata, markdown)
+                        ssa_call_symbols, validate_code_map_metadata, markdown,
+                        corpus_modes, parse_ceiling, parse_ceiling_bench, ceiling_note, MODES)
 from types import SimpleNamespace
 
 
@@ -312,3 +313,76 @@ def test_ir_ssa_x87_mode_is_validated_before_any_game_work(tmp_path):
     with pytest.raises(ValueError, match='state policy must be'):
         run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1,
                    ir_ssa=True, ir_ssa_state='bogus')
+
+
+def test_ceiling_mode_precedes_native_and_default_order_is_unchanged():
+    assert corpus_modes() == MODES == ('eager', 'cpu', 'x87', 'combined', 'native')
+    assert corpus_modes(True) == ('eager', 'cpu', 'x87', 'combined', 'ceiling', 'native')
+
+
+def test_ceiling_option_is_validated_before_any_game_work(tmp_path):
+    import json
+    from corpus.run import run_corpus
+    p = tmp_path / 'manifest.json'
+    p.write_text(json.dumps({'contract': 'mapped-native-corpus-v1', 'functions': []}))
+    (tmp_path / 'build').mkdir()
+    for kwargs in ({}, {'ir_ssa': True}, {'ir_ssa': True, 'ir_ssa_x87': 'scalar'},
+                   {'ir_ssa': True, 'ir_ssa_x87': 'scalar', 'ir_ssa_state': 'strict'}):
+        with pytest.raises(ValueError, match='ceiling requires --ir-ssa with scalar x87 and locals'):
+            run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1, ir_ssa_ceiling='A', **kwargs)
+    with pytest.raises(ValueError, match='unknown ceiling relaxation Q'):
+        run_corpus(p, tmp_path, tmp_path / 'build/corpus', 'unused', 1, ir_ssa=True,
+                   ir_ssa_x87='scalar', ir_ssa_state='locals', ir_ssa_ceiling='A,Q')
+
+
+def test_ceiling_records_require_one_exact_row_each():
+    good = ('CEILING 0 4096 0 0 0 0 0 0 -1 \n'
+            'CEILING 1 256 3840 0 2 0 0 5 17 EAX differs\n')
+    records = parse_ceiling(good, 2)
+    assert records[0]['checked'] == 4096 and records[0]['first_input'] == -1 and records[0]['reason'] == ''
+    assert records[1]['skipped'] == 3840 and records[1]['memory'] == 2 and records[1]['reason'] == 'EAX differs'
+    for bad, match in (('CEILING 0 1 0 0 0 0 0 0 -1\n', 'missing'),
+                       (good + 'CEILING 1 1 0 0 0 0 0 0 -1\n', 'duplicate'),
+                       ('CEILING 2 1 0 0 0 0 0 0 -1\nCEILING 0 1 0 0 0 0 0 0 -1\n', 'unknown'),
+                       ('CEILING 0 1 0 0 0 0 0\n', 'malformed'),
+                       ('CEILING 0 x 0 0 0 0 0 0 -1\n', 'malformed'),
+                       ('CEILING 0 -1 0 0 0 0 0 0 0\nCEILING 1 1 0 0 0 0 0 0 -1\n', 'negative')):
+        with pytest.raises(ValueError, match=match):
+            parse_ceiling(bad, 2)
+
+
+def test_ceiling_bench_records_name_failed_timing_sanity():
+    assert parse_ceiling_bench('CEILING_BENCH 0 1\nCEILING_BENCH 1 0\n', 2) == {1}
+    assert parse_ceiling_bench('', 2) == set()
+    with pytest.raises(ValueError, match='incomplete'):
+        parse_ceiling_bench('CEILING_BENCH 0 1\n', 2)
+
+
+def ceiling_row(address, mismatches=0, emitted=True):
+    observation = {'checked': 256, 'skipped': 3840, 'observation': 0, 'memory': mismatches,
+                   'eax': 0, 'st0': 0, 'boundary': 0, 'first_input': 3 if mismatches else -1,
+                   'reason': 'guest memory differs' if mismatches else '',
+                   'mismatches': mismatches, 'status': 'mismatch' if mismatches else 'pass'}
+    return {'address': address, 'name': 'Workload ' + address, 'comparison': 'translation-only',
+            'original_bytes': 16, 'x87_instructions': 2,
+            'variants': {'eager': {'span_bytes': 64, 'timing_ns': {'median': 123.0}},
+                         'combined': {'span_bytes': 32, 'timing_ns': {'median': 45.0}},
+                         'ceiling': {'span_bytes': 20, 'timing_ns': {'median': 30.0}}},
+            'ceiling': {'emitted': emitted, 'reason': None if emitted else 'ceiling x87: unsupported FLDCW',
+                        'fallback': None if emitted else 'ssa-scalar-locals', 'relaxations': ['A', 'B'],
+                        'timing_sanity': 'pass', 'observation': observation}}
+
+
+def test_report_lists_relaxations_status_and_observation_outcome():
+    rows = [ceiling_row('00100000'), ceiling_row('00100100', mismatches=2, emitted=False)]
+    result = markdown({'host': 'test', 'compiler': 'test', 'contract': 'mapped-comparison-corpus-v2',
+                       'checks_per_function': 16, 'functions': rows,
+                       'ir_ssa_ceiling': {'enabled': True, 'relaxations': ['A', 'B'],
+                                          'label': 'SSA ceiling [A,B]'}})
+    assert '## SSA ceiling [A,B] (UNPROVEN, corpus-only)' in result
+    assert '| 45.00 | 30.00 | — | 32 | 20 | emitted | pass (256 checked, 3840 skipped) |' in result
+    assert 'fallback (ssa-scalar-locals): ceiling x87: unsupported FLDCW' in result
+    assert 'MISMATCH 2' in result and 'first input 3: guest memory differs' in result
+    assert 'experimental ceiling column is judged separately' in result
+    assert 'relax=A,B; emitted; observation=pass (checked 256, skipped 3840, mismatches 0)' == ceiling_note(rows[0])
+    assert ceiling_note({'variants': {}}) == ''

@@ -139,7 +139,7 @@ def codegen_ir(fir, lifter):
 def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=True,
          call_symbols=None, x87_values=False, x87_region=False, x87_scalar=False,
          x87_scalar_strict=False, local_state=False, resumable_stacks=False,
-         lifter=None, indirect_call_symbol=None, _guard_null_checks=True):
+         lifter=None, indirect_call_symbol=None, _guard_null_checks=True, _ceiling=frozenset()):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
     `call_symbols` maps an allowed direct-call target address to the C symbol
@@ -149,6 +149,11 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     dispatch and reloads all tracked state; when None, indirect calls stay a
     whole-function fallback. `x87_values` enables the bounded write-through
     x87 value tracker; it is off by default and only active with `optimize`.
+
+    `_ceiling` is private to the function corpus: a set of UNPROVEN relaxation
+    letters from `ceiling.py` (A-E). It is not part of the agreed performance
+    mode contract, requires scalar x87 and local-state SSA, and production
+    selection never passes it.
     """
     if not symbol.isidentifier() or not symbol.isascii():
         raise SSAError("invalid C symbol")
@@ -177,11 +182,18 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             or not indirect_call_symbol.isascii()):
         raise SSAError("invalid indirect call symbol %r" % (indirect_call_symbol,))
     x87_statements = x87.statements
+    from .ceiling import RELAXATIONS, X87_RELAXATIONS, FLAG_FIELDS
+    _ceiling = frozenset(_ceiling or ())
+    if _ceiling:
+        if not _ceiling <= frozenset(RELAXATIONS):
+            raise SSAError("unknown ceiling relaxation %s" % ",".join(sorted(_ceiling - frozenset(RELAXATIONS))))
+        if not (optimize and x87_scalar and not x87_scalar_strict and local_state):
+            raise SSAError("ceiling relaxations require optimized scalar x87 and local-state SSA")
     # The tracker reuses only reads; every helper call still runs. It is
     # invalidated at opaque effects and control-flow joins below.
     if sum((x87_values, x87_region, x87_scalar)) > 1:
         raise SSAError("x87_values, x87_region and x87_scalar are separate comparison modes")
-    if optimize and _guard_null_checks and (local_state or (x87_scalar and not x87_scalar_strict)):
+    if optimize and _guard_null_checks and not _ceiling and (local_state or (x87_scalar and not x87_scalar_strict)):
         # Null-fault dispatch can expose CPU state to guest exception handlers.
         # Compile the strict observation path whenever that facility is enabled.
         options = dict(optimize=optimize, publish_changed=publish_changed, wide_registers=wide_registers,
@@ -194,6 +206,12 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         return "#if defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS\n%s\n#else\n%s\n#endif" % (strict, fast)
     from .x87_scalar import X87Scalar
     scalar = X87Scalar(observe_loads=x87_scalar_strict) if (optimize and x87_scalar) else None
+    if scalar is not None and _ceiling:
+        if _ceiling & X87_RELAXATIONS:
+            from .x87_ceiling import X87Ceiling  # UNPROVEN ceiling C/D/E lowering.
+            scalar = X87Ceiling(_ceiling)
+        elif "A" in _ceiling:
+            scalar.store_flush = False  # UNPROVEN ceiling A: no x87 store publication.
     region = X87Region() if (optimize and x87_region) else None
     tracker = region or (X87Values() if (optimize and x87_values) else None)
 
@@ -221,9 +239,14 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             mapping[("register", off + n)] = (field, n)
     groups = [[("register", off + n) for n in range(size)]
               for (_, off, size), _ in fields]
+    # UNPROVEN ceiling B (corpus-only): flag lanes are dead across entry, calls
+    # and return. Never populated by production selection.
+    dead_flags = frozenset(key for key, (field, _) in mapping.items()
+                           if field in FLAG_FIELDS) if "B" in _ceiling else frozenset()
     s = build(codegen_ir(fir, lifter),
               register_groups=groups if optimize and wide_registers else (),
-              call_targets=call_symbols, indirect_call_symbol=indirect_call_symbol)
+              call_targets=call_symbols, indirect_call_symbol=indirect_call_symbol,
+              dead_flag_keys=dead_flags)
     if any(key != MEMORY and key not in mapping for key in s.inputs):
         raise SSAError("unmapped runtime register")
     publications = None
@@ -237,7 +260,13 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             # remains the default and keeps all pre-access snapshots.
             read_fields = {key for key, (field, _) in mapping.items()
                            if field in ("c->eip", "c->r[4]", "c->r[5]")} if local_state else None
-            publications = plan(s, fir.succ, groups, read_fields=read_fields)
+            plan_groups = [g for g, (_, field) in zip(groups, fields)
+                           if not ("B" in _ceiling and field in FLAG_FIELDS)]
+            # UNPROVEN ceiling A: guest memory accesses publish nothing.
+            unpublished = (frozenset(("LOAD", "STORE", "X87_MEM"))
+                           if "A" in _ceiling else frozenset())
+            publications = plan(s, fir.succ, plan_groups, read_fields=read_fields,
+                                unpublished=unpublished)
         live = simplify(s, publications)
     else:
         live = {v.id for v in s.values}
@@ -464,7 +493,8 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                     tracker.invalidate()
                 lines.append("rep_movsd(c);" if v.data.get("rep") else "movsd(c);")
             elif v.opc in ("LOAD", "STORE", "DIV32", "IDIV32"):
-                if scalar is None or scalar.observe_loads or v.opc != "LOAD":
+                ceiling_a = "A" in _ceiling and v.opc in ("LOAD", "STORE")
+                if not ceiling_a and (scalar is None or scalar.observe_loads or v.opc != "LOAD"):
                     lines.extend(flush_x87())
                 lines.extend(publish(b.snapshots[v.id], v))
                 if v.opc in ("DIV32", "IDIV32"):

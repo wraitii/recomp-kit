@@ -42,6 +42,9 @@ class X87Scalar:
         self.serial = 0
         self.temps = []
         self.observe_loads = observe_loads
+        # Corpus-only ceiling relaxation A (`ceiling.py`) clears this so memory
+        # stores no longer publish x87 state. Production keeps it True.
+        self.store_flush = True
         self.binary32 = True
         self.reset()
 
@@ -146,8 +149,8 @@ class X87Scalar:
         self._activate(lines)
         # Strict mode keeps every pre-access snapshot. Both modes publish
         # before stores; performance mode defers across ordinary reads.
-        if address is not None and (self.observe_loads or m in
-                ("FST", "FSTP", "FIST", "FISTP", "FNSTSW", "FNSTCW")):
+        if address is not None and (self.observe_loads or (self.store_flush and m in
+                ("FST", "FSTP", "FIST", "FISTP", "FNSTSW", "FNSTCW"))):
             lines.extend(self.flush())
 
         def read(index):

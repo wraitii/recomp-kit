@@ -9,7 +9,7 @@ never be mistaken for its newly assigned value. Helpers invalidate facts.
 from .simplify import EFFECTS
 
 
-def plan(s, successors, fields, *, read_fields=None):
+def plan(s, successors, fields, *, read_fields=None, unpublished=frozenset()):
     """Return required register-lane keys for each effect and return snapshot.
 
 `fields` groups register lanes by runtime field. LOAD/STORE have read-only CPU
@@ -17,6 +17,10 @@ observers on normal continuation in the current accessor contract. DIV32 may
 return through an error handler; it therefore invalidates all publication facts.
 At joins a field is known only if every predecessor published its exit value.
 Starting with no facts gives a conservative least fixed point for loops.
+
+`unpublished` is a corpus-only, UNPROVEN ceiling relaxation (`ceiling.py`): the
+named effect opcodes publish nothing and leave the known-field facts untouched.
+It defaults to empty and is never supplied by production selection.
 """
     groups = [tuple(key for key in keys if key in s.inputs) for keys in fields]
     groups = [keys for keys in groups if keys]
@@ -40,6 +44,9 @@ Starting with no facts gives a conservative least fixed point for loops.
                      if all(p == -1 or n in known_exit[p] for p in predecessors[i])}
             for v in b.ops:
                 if v.opc not in EFFECTS and v.opc != "RETURN":
+                    continue
+                if v.opc in unpublished:
+                    publications[v.id] = ()
                     continue
                 state = b.exit if v.opc == "RETURN" else b.snapshots[v.id]
                 read_only = v.opc == "LOAD" or (v.opc == "X87_MEM" and
