@@ -104,7 +104,7 @@ four translated C modes in full CPU/scratch state, then compare a reviewed typed
 native reference using explicit game-owned observations. Timing reports separate
 guest-state adapters from direct typed native kernels. See
 [the corpus tools](../tools/recomp/corpus/README.md) for provenance, measurement
-contracts and the consolidated fragment/LLVM modes. Game assembly and outputs
+contracts and the consolidated fragment modes. Game assembly and outputs
 remain private; these checks do not establish original-x86 equivalence.
 
 `tools/build.py --ir-ssa-checks` compares the experimental integer SSA C emitter

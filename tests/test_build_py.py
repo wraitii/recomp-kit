@@ -12,15 +12,6 @@ spec.loader.exec_module(build_py)
 
 
 class BuildPyTests(unittest.TestCase):
-    def test_llvm_sweep_requires_its_own_native_build_mode(self):
-        args, _ = build_py.parse_args(["--corpus-llvm-sweep", "profiles.json"], system="Darwin")
-        self.assertEqual(args.corpus_llvm_sweep, Path("profiles.json"))
-        for extra in (["--corpus-llvm", "profiles.json"], ["--regenerate"],
-                      ["--stub"], ["--target", "headless"], ["--config", "Debug"],
-                      ["--x87-llvm-experiment"], ["--forget", "00400100"]):
-            with self.subTest(extra=extra), self.assertRaises(SystemExit):
-                build_py.parse_args(["--corpus-llvm-sweep", "profiles.json", *extra], system="Darwin")
-
     def test_default_preset_follows_the_operating_system(self):
         self.assertEqual(build_py.default_preset("Darwin"), "macos")
         self.assertEqual(build_py.default_preset("Linux"), "linux")
@@ -232,16 +223,6 @@ if __name__ == "__main__":
     unittest.main()
 
 
-def test_llvm_compare_is_separate_from_game_build_modes():
-    import pytest
-    for option in ('--regenerate', '--stub', '--x87-llvm-experiment', '--corpus-fragments'):
-        with pytest.raises(SystemExit):
-            build_py.parse_args(['--corpus-llvm', 'manifest.json', option], system='Darwin')
-    args, _ = build_py.parse_args(['--corpus-llvm', 'manifest.json'], system='Darwin')
-    assert args.corpus_llvm == Path('manifest.json')
-    assert not args.regenerate
-
-
 def test_function_corpus_is_isolated_and_does_not_regenerate_game():
     import pytest
     args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-trial-ms', '0'], system='Darwin')
@@ -252,7 +233,7 @@ def test_function_corpus_is_isolated_and_does_not_regenerate_game():
     with pytest.raises(SystemExit):
         build_py.parse_args(['--corpus-x87-dataflow'], system='Darwin')
     for extra in (['--regenerate'], ['--stub'], ['--corpus-fragments'],
-                  ['--corpus-llvm', 'llvm.json'], ['--cpu-locals-checks']):
+                  ['--cpu-locals-checks']):
         with pytest.raises(SystemExit):
             build_py.parse_args(['--function-corpus', 'manifest.json', *extra], system='Darwin')
 
@@ -284,7 +265,7 @@ def test_ir_ssa_native_checks_require_isolation():
     args, _ = build_py.parse_args(['--ir-ssa-checks'], system='Darwin')
     assert args.ir_ssa_checks
     for extra in (['--regenerate'], ['--stub'], ['--cpu-locals-checks'],
-                  ['--function-corpus', 'manifest.json'], ['--corpus-llvm', 'manifest.json']):
+                  ['--function-corpus', 'manifest.json']):
         with pytest.raises(SystemExit):
             build_py.parse_args(['--ir-ssa-checks', *extra], system='Darwin')
 
@@ -300,6 +281,14 @@ def test_decoded_dataflow_build_modes():
         build_py.parse_args(['--corpus-decoded-dataflow'], system='Darwin')
     with pytest.raises(SystemExit):
         build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-decoded-dataflow'], system='Darwin')
+
+
+def test_retired_llvm_experiment_options_are_rejected():
+    import pytest
+    for option in (['--corpus-llvm', 'm.json'], ['--corpus-llvm-sweep', 'm.json'],
+                   ['--x87-llvm-experiment'], ['--x87-llvm-function', 'f.json']):
+        with pytest.raises(SystemExit):
+            build_py.parse_args(option, system='Darwin')
 
 
 def test_corpus_ir_ssa_x87_mode_is_explicit_and_requires_ir_ssa():

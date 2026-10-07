@@ -4546,10 +4546,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True, help="where the generated sources go (build/recomp/gen)")
     ap.add_argument("--only", nargs="*", default=None)
-    ap.add_argument("--llvm-compare", type=Path, metavar="MANIFEST",
-                    help="Emit build-only C/LLVM leaf comparisons under an explicit observation contract")
-    ap.add_argument("--llvm-sweep", type=Path, metavar="MANIFEST",
-                    help="Survey every census row with the bounded LLVM frontend; no dispatch output")
     ap.add_argument("--eager-flags", action="store_true",
                     help="compute every flag at every instruction (debug)")
     ap.add_argument("--check-flags", action="store_true",
@@ -4587,12 +4583,6 @@ def main():
                     help="infer every function's calling convention from SLEIGH p-code "
                          "and write the census as JSON (tools/recomp/ir)")
     args = ap.parse_args()
-    if (args.llvm_compare or args.llvm_sweep) and any((args.only is not None, args.eager_flags, args.check_flags,
-                                  args.allow_unmodelled, args.allow_table_gaps, args.forget,
-                                  args.discovered, args.as_module, args.module)):
-        ap.error("--llvm-compare is a separate bounded mode; translation overrides are unsupported")
-    if args.llvm_compare and args.llvm_sweep:
-        ap.error("LLVM comparison and sweep are separate modes")
     cfg = game_config.load(args.game)
     configure(cfg)
     if args.module:
@@ -4605,14 +4595,6 @@ def main():
         AUX_MODULE = {"name": args.as_module, "base": cfg["game"]["image_base"],
                       "size": 0}  # the image's extent, filled in once it is read
     image = Image(BINARY)
-    if args.llvm_sweep:
-        from corpus.llvm_sweep import emit_sweep
-        emit_sweep(sys.modules[__name__], image, args)
-        return
-    if args.llvm_compare:
-        from corpus.llvm_emit import emit_comparison
-        emit_comparison(sys.modules[__name__], image, args)
-        return
     discovered = []
     if args.discovered:
         global EXTRA_ENTRY_POINTS

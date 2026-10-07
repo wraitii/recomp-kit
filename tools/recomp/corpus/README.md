@@ -122,28 +122,18 @@ incomplete checks fail the run;
 no successful report is emitted for a failed corpus. `llvm-objdump` is required.
 Static SP accesses currently recognize arm64 addressing. Compiler settings are
 controlled O2/no contraction/no builtin substitution, not copied production
-commands; optional LLVM comparisons below retain their stronger production
-configuration checks.
+commands.
 
-## Consolidated regression and LLVM tools
+## Consolidated regression tools
 
-The former `experiments/x87_locals` and `llvm_compare_native` directories and
-their build flags have been replaced by this suite:
+The former `experiments/x87_locals` directory and its build flag have been
+replaced by this suite. The LLVM comparison, sweep and x87 stack-to-SSA
+experiments were removed once none of them fed production; their history is in Git.
 
 - `--corpus-fragments`: [synthetic x87 fixtures](fragments/README.md), preserving
   historical state/rounding regressions and explicitly weaker diagnostic modes.
 - `--cpu-locals-checks`: full-state integer/x87 synthetic checks, sharing the
   migrated fragment harness, including null-check fallback and mutating callees.
-- `--corpus-llvm MANIFEST`: [optional C/LLVM comparison backend](llvm/README.md),
-  preserving byte verification, exact production compile settings, fixture
-  checks and raw/lifted LLVM evidence. Outputs: `build/function-corpus-llvm/`.
-- `--corpus-llvm-sweep MANIFEST`: optional full-census build/size coverage,
-  outputting `build/function-corpus-sweep/`; unfixtureed functions are not run.
-
-LLVM profile manifests use their existing `mapped-normal-exit-v1` schema; they
-are not interchangeable with native-reference corpus manifests. Migrating a
-function's input contract to LLVM remains explicit. No LLVM mode is activated
-for gameplay or silently included in the native-reference report.
 
 Use the game's build wrapper for every native compilation. Do not invoke
 compilers directly or retain private bytes/generated code in Git.

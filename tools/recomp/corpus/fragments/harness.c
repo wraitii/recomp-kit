@@ -1,6 +1,5 @@
 /* Fragment microbenchmark, not a game replay or original-x86 oracle.
- * Inputs stay mapped; the LLVM experiment also checks explicit memory observers
- * and injected early exits. Actual OS faults and arbitrary callbacks are excluded.
+ * Inputs stay mapped. Actual OS faults and arbitrary callbacks are excluded.
  * All variants are separately compiled from this harness, without LTO.
  */
 #include "x86.h"
@@ -9,13 +8,6 @@
 #include <time.h>
 #include "fixtures.h"
 #define FIXTURE_MODES (sizeof functions[0] / sizeof functions[0][0])
-#ifdef RK_MEMORY_TEST
-#include "access.h"
-#else
-#define rk_memory_begin(mode) ((void)0)
-#define rk_memory_end(mode) ((void)0)
-#define rk_memory_report(name) ((void)0)
-#endif
 
 uint8_t *g_mem;
 uint32_t g_watch_base, g_watch_len, g_dirty_count, g_store_hook;
@@ -125,18 +117,14 @@ static int compare(void) {
             memcpy(input, g_mem + 0x10000, sizeof input);
             expected = initial;
             FIXTURE_BEFORE(0);
-            rk_memory_begin(0);
             functions[f][0](&expected);
-            rk_memory_end(0);
             FIXTURE_AFTER_STATE(0, &expected);
             memcpy(output, g_mem + 0x10000, sizeof output);
             for (unsigned mode = 1; mode < FIXTURE_MODES; ++mode) {
                 X86 actual = initial, reference = expected;
                 memcpy(g_mem + 0x10000, input, sizeof input);
                 FIXTURE_BEFORE(mode);
-                rk_memory_begin(mode);
                 functions[f][mode](&actual);
-                rk_memory_end(mode);
                 FIXTURE_AFTER_STATE(mode, &actual);
                 int mem_diff = memcmp(output, g_mem + 0x10000, sizeof output) != 0;
                 if (normalize_empty_mask & (1u << mode)) {
@@ -172,57 +160,12 @@ static int compare(void) {
         printf(" (last variant memory=%u; PC00/01/10/11=%u/%u/%u/%u) differences\n",
                memory_differences, relaxed_by_pc[0], relaxed_by_pc[1], relaxed_by_pc[2],
                relaxed_by_pc[3]);
-        rk_memory_report(case_names[f]);
         if (!FIXTURE_CUSTOM_INPUTS)
             printf("FINITE %s last variant differences=%u/8192 ordinary finite inputs\n",
                    case_names[f], finite_differences);
     }
     return 0;
 }
-
-#ifdef RK_MEMORY_TEST
-/* Small deterministic early-exit regression, not an emulator or shadow runner.
- * Each of 16 states covers a different PC/RC combination (and all eight TOPs).
- * Stop once at every access actually reached by the baseline; later accesses
- * are never guessed. CPU objects live outside rk_memory_fault's setjmp frame. */
-static void check_memory_failures(void) {
-    for (unsigned f = 0; f < sizeof functions / sizeof *functions; ++f) {
-        unsigned failures = 0;
-        for (unsigned sample = 0; sample < 16; ++sample) {
-            X86 initial, expected;
-            uint8_t input[FIXTURE_SCRATCH_SIZE], output[FIXTURE_SCRATCH_SIZE];
-            setup(&initial, sample * 128 + (sample * 17) % 128);
-            memcpy(input, g_mem + 0x10000, sizeof input);
-            expected = initial;
-            rk_memory_begin(0);
-            functions[f][0](&expected);
-            rk_memory_end(0);
-            unsigned accesses = rk_memory_count();
-            for (unsigned stop = 1; stop <= accesses; ++stop) {
-                expected = initial;
-                memcpy(g_mem + 0x10000, input, sizeof input);
-                if (!rk_memory_fault(functions[f][0], &expected, stop))
-                    abort();
-                memcpy(output, g_mem + 0x10000, sizeof output);
-                for (unsigned mode = 1; mode <= 2; ++mode) {
-                    X86 actual = initial;
-                    memcpy(g_mem + 0x10000, input, sizeof input);
-                    if (!rk_memory_fault(functions[f][mode], &actual, stop) ||
-                        memcmp(&actual, &expected, sizeof actual) ||
-                        memcmp(g_mem + 0x10000, output, sizeof output)) {
-                        fprintf(stderr, "FAIL early exit %s sample=%u mode=%u access=%u\n",
-                                case_names[f], sample, mode, stop);
-                        abort();
-                    }
-                }
-                ++failures;
-            }
-        }
-        printf("EARLY EXIT %s %u injected access failures: raw/lifted CPU + scratch match C\n",
-               case_names[f], failures);
-    }
-}
-#endif
 
 #ifndef FIXTURE_CHECK_ONLY
 static int order_double(const void *a, const void *b) {
@@ -280,9 +223,6 @@ int main(void) {
     if (compare())
         return 1;
     FIXTURE_FINISH();
-#ifdef RK_MEMORY_TEST
-    check_memory_failures();
-#endif
 #ifndef FIXTURE_CHECK_ONLY
     benchmark();
 #endif

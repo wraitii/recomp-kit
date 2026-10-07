@@ -67,5 +67,4 @@ do not represent cache behavior, call boundaries or whole-game performance.
 Artifacts: `generated.c`, `results.txt`, `assembly-counts.json`, executable and
 CMake build products. Clang's `-save-temps=obj` also retains the optimized `.s`
 and LLVM `.bc` actually used by the build. Assembly counts include cold paths;
-they are static counts, not executed instruction counts. No direct LLVM backend
-is implemented or benchmarked by this probe.
+they are static counts, not executed instruction counts.

@@ -227,6 +227,12 @@
 ||||||| parent of 1e58bd9 (Add explicit comparison workloads to the function corpus)
 ||||||| parent of 9a48b36 (Time-budget function corpus trials instead of fixed call counts)
 ||||||| parent of d6f8703 (Retire SSA x87 effects, values and region modes)
+||||||| parent of 7345cd1 (Remove the LLVM corpus experiments)
+- Remove the LLVM corpus experiments: `--corpus-llvm`, `--corpus-llvm-sweep`,
+  `--x87-llvm-experiment`, `--x87-llvm-function`, `translate.py --llvm-compare` and
+  `--llvm-sweep`, with their backends under `tools/recomp/corpus/llvm*` and
+  `tools/recomp/experiments/x87_llvm`. Nothing in production translation used them.
+
 - Retire the SSA x87 `effects`, `values` and `region` modes and the value tracker
   behind them. `ir_ssa_x87` now accepts `scalar` (default) or `scalar-strict`,
   `ir_ssa_state` accepts `locals` (default) or `strict`, and plain

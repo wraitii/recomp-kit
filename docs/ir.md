@@ -4,8 +4,8 @@
 bytes and instruction boundaries used by the production translator. It currently
 provides lifting, a whole-image calling-convention census, integer SSA and an
 opt-in C emitter for the mapped corpus and admitted production functions.
-Production discovery and fallback C, and experimental LLVM emission, use the
-existing decoded-instruction frontend. Census coverage is analysis evidence,
+Production discovery and fallback C use the existing decoded-instruction
+frontend. Census coverage is analysis evidence,
 not execution, equivalence or a measured performance gain.
 
 ## Lifting

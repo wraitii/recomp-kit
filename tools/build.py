@@ -494,10 +494,6 @@ def parse_args(argv, system=None):
                         help="Try whole-function decoded integer and flag dataflow")
     parser.add_argument("--corpus-stack-forwarding", action="store_true",
                         help="Try bounded guest-stack forwarding with decoded x87 dataflow")
-    parser.add_argument("--corpus-llvm", type=Path, metavar="MANIFEST",
-                        help="Build-only translator C/LLVM comparison using production compile commands")
-    parser.add_argument("--corpus-llvm-sweep", type=Path, metavar="MANIFEST",
-                        help="Build-only full-census LLVM emission/lifting coverage survey")
     parser.add_argument("--corpus-fragments", action="store_true",
                         help="Build and run the isolated x87 local-value experiment")
     parser.add_argument("--cpu-locals-checks", action="store_true",
@@ -508,10 +504,6 @@ def parse_args(argv, system=None):
                         help="Build/check decoded integer/flag dataflow with full outgoing state")
     parser.add_argument("--x87-dataflow-checks", action="store_true",
                         help="Build and run decoded x87 dataflow full-state checks")
-    parser.add_argument("--x87-llvm-experiment", action="store_true",
-                        help="Build and run the isolated LLVM stack-to-SSA pass")
-    parser.add_argument("--x87-llvm-function", type=Path,
-                        help="Game-owned whole-function evidence/fixture profile for LLVM experiment")
     parser.add_argument("--allow-table-gaps", metavar="REASON", default=None,
                         help="Accept jump-table sites the translator cannot decode (passed to translate.py)")
     parser.add_argument("--forget", metavar="ADDR[,ADDR...]", default=None,
@@ -557,19 +549,9 @@ def parse_args(argv, system=None):
         parser.error("--target web needs the Emscripten SDK's environment (source emsdk_env.sh)")
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
-    if (args.corpus_llvm or args.corpus_llvm_sweep) and any((args.stub, args.regenerate, args.config != "Release",
-                                  args.preset != default_preset(system), args.target != "app",
-                                  args.x87_llvm_experiment, args.corpus_fragments, args.cpu_locals_checks, args.ir_ssa_checks,
-                                  args.x87_dataflow_checks, args.decoded_dataflow_checks, args.corpus_x87_dataflow, args.corpus_stack_forwarding, args.corpus_decoded_dataflow,
-                                  args.x87_llvm_function, args.allow_table_gaps,
-                                  args.allow_unmodelled, args.discovered, args.forget)):
-        parser.error("--corpus-llvm requires native Release defaults and no translation overrides")
-    if args.corpus_llvm and args.corpus_llvm_sweep:
-        parser.error("LLVM comparison and sweep are separate modes")
-    if args.function_corpus and any((args.regenerate, args.stub, args.corpus_llvm,
-                                      args.corpus_llvm_sweep, args.corpus_fragments,
-                                      args.cpu_locals_checks, args.ir_ssa_checks, args.x87_dataflow_checks, args.decoded_dataflow_checks, args.x87_llvm_experiment,
-                                      args.x87_llvm_function, args.allow_unmodelled,
+    if args.function_corpus and any((args.regenerate, args.stub, args.corpus_fragments,
+                                      args.cpu_locals_checks, args.ir_ssa_checks, args.x87_dataflow_checks, args.decoded_dataflow_checks,
+                                      args.allow_unmodelled,
                                       args.allow_table_gaps, args.forget, args.discovered,
                                       args.config != "Release", args.target != "app")):
         parser.error("--function-corpus is an isolated native Release build mode")
@@ -587,7 +569,7 @@ def parse_args(argv, system=None):
         parser.error("--corpus-ir-ssa and decoded-dataflow corpus modes must run separately")
     if args.ir_ssa_checks and any((args.regenerate, args.stub, args.corpus_fragments,
                                   args.cpu_locals_checks, args.x87_dataflow_checks, args.decoded_dataflow_checks,
-                                  args.x87_llvm_experiment, args.x87_llvm_function, args.config != "Release",
+                                  args.config != "Release",
                                   args.preset != default_preset(system), args.target != "app")):
         parser.error("--ir-ssa-checks is an isolated native Release check mode")
     if args.corpus_stack_forwarding and not (args.function_corpus and args.corpus_x87_dataflow):
@@ -614,24 +596,6 @@ def main():
                        args.corpus_trial_ms, args.corpus_trials, args.corpus_x87_dataflow, args.corpus_stack_forwarding, args.corpus_decoded_dataflow,
                        args.corpus_ir_ssa, args.corpus_ir_ssa_x87,
                        args.corpus_ir_ssa_state, args.corpus_ir_ssa_ceiling)
-        return
-    if args.corpus_llvm_sweep:
-        from corpus.llvm_sweep import run_sweep
-        with buildlock.BuildLock(args.build_root.parent, "tools/build.py --corpus-llvm-sweep"):
-            run_sweep(args.corpus_llvm_sweep, args.game_dir, args.build_root / "function-corpus-sweep",
-                      cmake_tool("cmake"), args.jobs,
-                      build_dir_for(args.build_root, args.preset) / "compile_commands.json")
-        return
-    if args.corpus_llvm:
-        from corpus.llvm_build import run_comparison
-        with buildlock.BuildLock(args.build_root.parent, "tools/build.py --corpus-llvm"):
-            run_comparison(args.corpus_llvm, args.game_dir, args.build_root / "function-corpus-llvm",
-                           build_dir_for(args.build_root, args.preset) / "compile_commands.json",
-                           cmake_tool("cmake"), args.jobs)
-        return
-    if args.x87_llvm_experiment:
-        from experiments.x87_llvm.run import run_experiment
-        run_experiment(args.build_root / "x87-llvm-experiment", cmake_tool("cmake"), args.jobs, args.x87_llvm_function)
         return
     if args.corpus_fragments:
         from corpus.fragments.run import run_experiment
