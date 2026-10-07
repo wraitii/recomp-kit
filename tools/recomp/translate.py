@@ -1690,6 +1690,9 @@ class Image(object):
     MNEM_ALIAS = {"POPAL": "POPAD", "PUSHAL": "PUSHAD",
                   "POPFL": "POPFD", "PUSHFL": "PUSHFD",
                   "CWTL": "CWDE", "CLTD": "CDQ", "CBTW": "CBW",
+                  # Capstone names the popping compares FCOMPI/FUCOMPI;
+                  # listings and the emitter use Intel FCOMIP/FUCOMIP.
+                  "FCOMPI": "FCOMIP", "FUCOMPI": "FUCOMIP",
                   "IRETD": "IRET"}
 
     def _size_word(self, nbytes, mnem):

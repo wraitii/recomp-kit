@@ -2,6 +2,7 @@
 import hashlib
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import capstone
 import pytest
@@ -144,3 +145,18 @@ def test_non_cache_export_is_never_overwritten(tmp_path):
 
 def test_legacy_games_need_no_map_or_executable():
     M.ensure_listings({})
+
+
+@pytest.mark.parametrize('raw,mnem', [('dff1', 'FCOMIP'), ('dfe9', 'FUCOMIP')])
+def test_popping_compare_aliases_reach_existing_x87_lowering(raw, mnem):
+    img = image(bytes.fromhex(raw))
+    ins = list(M.decode_span(img, img.base, '2'))[0]
+    assert (ins.mnem, ins.ops) == (mnem, ['ST1'])
+    # Speculative recovery and mapped decoding share the same adapter.
+    assert img.instruction_at(img.base).mnem == mnem
+    tr = T.Translator(img, set(), SimpleNamespace())
+    emitted = tr.emit_x87(None, ins, ins.mnem,
+                          [T.parse_operand(op) for op in ins.ops])
+    assert any(('fucomi(' if mnem == 'FUCOMIP' else 'fcomi(') in line
+               for line in emitted)
+    assert 'fdrop(c);' in ' '.join(emitted)

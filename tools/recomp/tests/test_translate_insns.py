@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 
+import capstone
 import pytest
 from unicorn import Uc, UC_ARCH_X86, UC_MODE_32, UC_HOOK_INTR, UcError
 from unicorn.x86_const import (
@@ -809,6 +810,29 @@ class Native(object):
 
     def zero(self, addr, n):
         C.memset(C.addressof(self.mem.contents) + addr, 0, n)
+
+
+def popping_compare_setup(rng):
+    left = rng.choice([-2.0, 0.0, 1.0, 4.0])
+    right = rng.choice([-2.0, 0.0, 1.0, 4.0])
+    return {"regs": rand_regs(rng, EDX=SCRATCH),
+            "mem": [(SCRATCH, struct.pack("<dd", left, right))]}
+
+
+# Decode the actual compare bytes so the adapter is part of the differential
+# test. Stores expose both the surviving ST0 value and the final stack TOP.
+for i, raw in enumerate(("dff1", "dfe9")):
+    decoder = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+    decoder.detail = True
+    image = T.Image.__new__(T.Image)
+    compare = image.to_insn(next(decoder.disasm(bytes.fromhex(raw), 0)))
+    CASES.append(Case(
+        "%s decoded alias sets flags and pops once" % compare.mnem,
+        0x0D02FE00 + i * 0x100,
+        [(0, "FLD double ptr [EDX]"), (2, "FLD double ptr [EDX + 0x8]"),
+         (5, compare.mnem + " ST1"), (7, "FSTP double ptr [EDX + 0x10]"),
+         (10, "FNSTSW word ptr [EDX + 0x18]"), (13, "RET")],
+        "dd02 dd4208 " + raw + " dd5a10 dd7a18 c3", popping_compare_setup))
 
 
 @pytest.fixture(scope="module")

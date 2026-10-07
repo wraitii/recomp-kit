@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Normalize Capstone FCOMPI/FUCOMPI to FCOMIP/FUCOMIP in mapped and
+  recovered instruction decoding, using the existing flag-setting and x87-pop
+  lowering instead of an unmodelled-instruction trap.
+
 - Import coverage checks the executable's IAT separately from deliberately
   malformed ABI test exports. Reloading an unsupported import retains known
   calling conventions, including decorated stdcall counts. Additional ANSI
