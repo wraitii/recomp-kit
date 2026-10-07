@@ -540,7 +540,22 @@ class X87Scalar:
                     self._fold(0, lines)
                 value = read(0)
                 if bits == 32:
-                    value = "fto_float(&x87_env_, %s)" % value
+                    # A narrow slot is exactly a binary32 when PC=00 (every
+                    # FLD m32, FLD1/FLDZ and PC=00 arithmetic result has been
+                    # widened from a float), so (float)v is exact and the RC
+                    # stepper in fto_float is dead. Keep the NaN arm: fto_float
+                    # quiets an sNaN payload that clang could otherwise retain
+                    # by cancelling the widening/narrowing casts. The runtime
+                    # PC test keeps the general double path for PC!=0.
+                    narrow = self._slot(0)[1].narrow
+                    if narrow and not self.observe_loads:
+                        if not value.isidentifier():
+                            value = self._temp("(%s)" % value, lines, "double")
+                        value = ("((x87_env_.fpu_cw & 0x300u) == 0u && %s == %s) ? "
+                                 "(float)(%s) : fto_float(&x87_env_, %s)" %
+                                 (value, value, value, value))
+                    else:
+                        value = "fto_float(&x87_env_, %s)" % value
                 lines.append("wrf%d((uint32_t)%s, %s);" % (bits, address, value))
             if m == "FSTP":
                 # A register copy already carried the value to its destination;

@@ -77,6 +77,29 @@ def test_binary32_requires_proven_operands_and_keeps_a_general_precision_path():
     assert "(float)(" not in incoming
 
 
+def test_narrow_fstp_m32_skips_the_redundant_rounding_step():
+    # fld dword [esi]; fstp dword [ebx]; ret
+    narrow = function("d906", "d91b", "c3")
+    for lazy in (False, True):
+        text = emit(narrow, "t", lazy_nan=lazy, _guard_null_checks=False)
+        # Proven binary32 under PC=00: plain cast, but the NaN arm still calls
+        # the helper so an sNaN payload is quieted.
+        assert "(x87_env_.fpu_cw & 0x300u) == 0u && x87s" in text
+        assert "? (float)(x87s" in text and ": fto_float(&x87_env_, x87s" in text
+        assert text.count("fto_float(&x87_env_,") == 1
+    # Arithmetic -> FSTP m32 keeps the same fast arm.
+    arith = emit(function("d906", "d84604", "d84604", "d91b", "c3"), "t",
+                 lazy_nan=True, _guard_null_checks=False)
+    assert "(x87_env_.fpu_cw & 0x300u) == 0u && x87s" in arith
+    # A double load is not proven binary32: keep the general helper.
+    wide = emit(function("dd06", "d91b", "c3"), "t", _guard_null_checks=False)
+    assert "== 0u && " not in wide
+    assert "fto_float(&x87_env_," in wide
+    # Strict x87 keeps the pre-access observation form, so no fast arm.
+    strict = emit(narrow, "t", x87_scalar_strict=True, _guard_null_checks=False)
+    assert "== 0u && " not in strict and "fto_float(&x87_env_," in strict
+
+
 def test_isolated_arithmetic_keeps_general_recipe_to_bound_selector_cost():
     text = emit(function("d906", "d806", "d91b", "c3"), "single")
     assert "fx87_exact(&x87_env_, (double)((float)" not in text

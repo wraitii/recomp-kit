@@ -54,6 +54,11 @@ CASES = {
     "not_memory": ("f713", "c3"),
     "leave": ("55", "89e5", "50", "c9", "c3"),
     "x87_load_store": ("d906", "d903", "d9c1", "d9c9", "d95b04", "ddd9", "c3"),
+    # Narrow (proven binary32) FSTP m32 skips the redundant fto_float rounding
+    # step under PC=00 but must still quiet an sNaN payload. The harness sweeps
+    # every PC/RC combination and the special-input table includes sNaN/qNaN.
+    "x87_narrow_store": ("d906", "d91b", "c3"),
+    "x87_narrow_arith_store": ("d906", "d84604", "d84604", "d91b", "c3"),
     "x87_double_store": ("dd06", "dd13", "dd5b08", "c3"),
     "x87_extended_store": ("db2e", "db3b", "c3"),
     "x87_arithmetic": ("d906", "d94604", "d80e", "d85e08", "d806", "d9c9", "dee1", "d91b", "c3"),

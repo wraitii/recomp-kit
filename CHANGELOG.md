@@ -245,6 +245,16 @@
 ||||||| parent of 0336a4b (Defer x87 NaN/IE checks to sinks in scalar SSA bodies)
 ||||||| parent of c79eb6b (Emit production SSA bodies in a process pool with seed-independent output)
 ||||||| parent of 66a8209 (Compile with FP contraction off everywhere)
+||||||| parent of fc39069 (Store proven-binary32 x87 slots to m32 without the rounding round trip)
+- Store a proven-binary32 x87 slot to `m32` without `fto_float`'s
+  directed-rounding round trip. Under PC=00 a narrow slot already holds an
+  exact float (FLD m32, FLD1/FLDZ, PC-rounded arithmetic and FSQRT; FLDCW and
+  other opaque ops reset the tracker, joins intersect), so scalar SSA bodies
+  emit `PC == 00 && v == v ? (float)v : fto_float(...)`; NaNs still take the
+  helper, which quiets an sNaN payload. Exact, so no toggle. Two native-check
+  cases sweep PC/RC with sNaN/qNaN inputs. Corpus SSA/eager, paired: matrix-
+  vector −8%, quaternion multiply −9%, adjugate −14%, projection −16%.
+
 - Compile with `-ffp-contract=off` everywhere (CMake, the translation test
   harnesses, `lazy_static.py`, core plugins), as the corpus and IR checks
   already did. Clang fused `A - part * scale` in `fprem_common`'s partial
