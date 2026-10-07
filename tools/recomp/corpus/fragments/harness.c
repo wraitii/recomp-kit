@@ -106,6 +106,27 @@ static void discard_empty_contents(X86 *c) {
         }
 }
 
+/* Columns in FIXTURE_CONVENTION_MASK use ir_ssa_msvc_convention: arithmetic
+ * flags and popped x87 residue are dead at calls and returns. They compare
+ * with CF/PF/AF/ZF/SF/OF, the value/bits/exact of empty registers and the
+ * bits of registers whose exact flag is clear (unread) cleared; DF, TOP, tags,
+ * status and live registers still compare. */
+#ifndef FIXTURE_CONVENTION_MASK
+#define FIXTURE_CONVENTION_MASK 0u
+#endif
+static void discard_convention_dead(X86 *c) {
+    c->eflags_cf = c->eflags_pf = c->eflags_af = 0;
+    c->eflags_zf = c->eflags_sf = c->eflags_of = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+        if (ftag_of(c, i) == FTAG_EMPTY) {
+            c->st[i] = 0;
+            c->st_exact[i] = 0;
+        }
+        if (!c->st_exact[i])
+            c->st_bits[i] = 0;
+    }
+}
+
 static int compare(void) {
     const unsigned cases = sizeof functions / sizeof *functions;
     for (unsigned f = 0; f < cases; ++f) {
@@ -131,6 +152,10 @@ static int compare(void) {
                 if (normalize_empty_mask & (1u << mode)) {
                     discard_empty_contents(&actual);
                     discard_empty_contents(&reference);
+                }
+                if (FIXTURE_CONVENTION_MASK & (1u << mode)) {
+                    discard_convention_dead(&actual);
+                    discard_convention_dead(&reference);
                 }
                 int different = mem_diff || memcmp(&actual, &reference, sizeof actual);
                 differences[mode] += !!different;

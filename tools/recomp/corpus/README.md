@@ -192,7 +192,7 @@ path under `RECOMP_NULL_CHECKS=1`, and the report records the selection. See [th
 
 ### Experimental SSA ceiling column
 
-`--corpus-ir-ssa-ceiling A,B,C,D,E|all` (requires `--corpus-ir-ssa`, scalar x87 and
+`--corpus-ir-ssa-ceiling A,C,D,E|all` (requires `--corpus-ir-ssa`, scalar x87 and
 locals state) adds an unproven, corpus-only variant between `combined` and
 `native`; see [the IR contract](../../../docs/ir.md#ssa-ceiling-experiment-corpus-only-unproven).
 Its harness records start with `CEILING row checked skipped observation memory eax st0 boundary

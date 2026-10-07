@@ -65,6 +65,11 @@ CASES = {
     "x87_round_control": ("dd06", "d9fc", "dd1b", "c3"),
     "x87_integer_store": ("d906", "df13", "db5304", "df7b08", "c3"),
     "x87_exact_integer": ("df2e", "d9c0", "df3b", "d9c0", "db5b08", "dddb", "c3"),
+    # fild qword [ebx]; ret -- a live exact-integer return keeps its shadow.
+    "x87_fild_return": ("df2b", "c3"),
+    # fild qword [ebx]; fstp st0; fld1; fistp qword [ebx+8]; ret -- the
+    # register reused after a pop must not keep the popped exact shadow.
+    "x87_exact_reuse": ("df2b", "ddd8", "d9e8", "df7b08", "c3"),
     "x87_integer_arithmetic": ("df06", "da06", "da2e", "da36", "da3e", "da16", "da1e", "c3"),
     "x87_partial_remainder": ("d94604", "d906", "d9f8", "dfe0", "8903", "d9f5", "d91b", "c3"),
     "x87_clear_status": ("dbe2", "dfe0", "8903", "c3"),
@@ -235,6 +240,14 @@ BYTE_CALL_CASES = {
         "callee_hexes": ["41", "c3"],
         "resumable": False,
     },
+    "call_x87_empty_fxam": {
+        # fld1; fld1; faddp; fstp [ebx+4]; call; mov [ebx+8],eax; ret
+        # callee: fxam; fnstsw ax; ret -- under the MSVC convention the
+        # caller's pushed-and-popped registers must still read as empty.
+        "hexes": _caller(["d9e8", "d9e8", "dec1", "d95b04"], ["894308", "c3"]),
+        "callee_hexes": ["d9e5", "dfe0", "c3"],
+        "resumable": False,
+    },
     "call_x87_join": {
         # fld1; call; test eax,eax; jz skip; fadd st0,st1; skip: fstp [ebx+4]; ret
         # callee: fld1; ret -- the caller's scalar x87 state must be
@@ -354,8 +367,9 @@ def call_sources(name, hexes, callee_addr, resumable=False, indirect=False):
                    resumable_stacks=resumable)
     raw = emit(fir, name + "_ir_raw", optimize=False, **options)
     fallthroughs = [ins.addr + ins.length for ins in lifted if ins.mnem.upper() == "CALL"]
-    scalar = emit(fir, name + "_ir_scalar", local_state=False, **options)
-    strict = emit(fir, name + "_ir_strict", x87_scalar_strict=True, local_state=False, **options)
+    scalar = emit(fir, name + "_ir_scalar", local_state=False, msvc_convention=False, **options)
+    strict = emit(fir, name + "_ir_strict", x87_scalar_strict=True, local_state=False,
+                  msvc_convention=False, **options)
     local = emit(fir, name + "_ir_local", **options)
     return eager, raw, scalar, strict, local, fallthroughs
 
@@ -400,8 +414,9 @@ def sources(name, hexes):
         addr += len(raw)
     fir = FunctionIR(ENTRY, lifted, default_successors(lifted))
     raw = emit(fir, name + "_ir_raw", optimize=False)
-    scalar = emit(fir, name + "_ir_scalar", local_state=False)
-    strict = emit(fir, name + "_ir_strict", x87_scalar_strict=True, local_state=False)
+    scalar = emit(fir, name + "_ir_scalar", local_state=False, msvc_convention=False)
+    strict = emit(fir, name + "_ir_strict", x87_scalar_strict=True, local_state=False,
+                  msvc_convention=False)
     local = emit(fir, name + "_ir_local")
     return eager, raw, scalar, strict, local
 
@@ -418,7 +433,8 @@ def run_checks(out, cmake, jobs):
 
     The five harness columns compare eager, raw (unoptimized ordered effects),
     scalar, scalar-strict and scalar/local-state with the same full-state
-    obligations.
+    obligations. The last is the production policy, including the MSVC call
+    convention, and compares with that convention's dead fields cleared.
     """
     out.mkdir(parents=True, exist_ok=True)
     code, rows, declarations = ['#include "x86.h"',
@@ -466,6 +482,8 @@ def run_checks(out, cmake, jobs):
     declarations.extend([
         'static const char *mode_names[] = {"eager", "raw", "scalar", "strict", "local"};',
         'static const unsigned normalize_empty_mask = 0, required_match_mask = 30;',
+        # The production local column also uses ir_ssa_msvc_convention.
+        '#define FIXTURE_CONVENTION_MASK 16u',
         '#define FIXTURE_SCRATCH_SIZE 2048',
         '#define FIXTURE_CUSTOM_INPUTS 1',
         '#define FIXTURE_SETUP(c, n) do { (c)->r[R_ESP] = 0x10100; '

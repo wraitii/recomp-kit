@@ -100,7 +100,8 @@ Calls and boundaries:
 - `indirect_call_symbol` (production passes `recomp_call`) opts in to indirect
   calls: the target must be a readable 32-bit value with a canonical fallthrough.
   Without it they fail closed. `resumable_stacks` checks EIP before continuing.
-- No calling-convention summary permits dropping state at a call. The corpus binds
+- No per-callee summary permits dropping state at a call; only the
+  `ir_ssa_msvc_convention` policy below does, uniformly. The corpus binds
   independently reviewed callees in the same mode; production dispatch goes
   through stable entry thunks (`CALL_FN`).
 - SLEIGH's absolute `ram` memory operands are normalized to one captured read or
@@ -144,21 +145,42 @@ snapshots stay complete. The must-analysis never claims a skipped field was
 published, so dead-value elimination can drop intermediate flags overwritten
 before a real observer.
 
+The `ir_ssa_msvc_convention` policy assumes MSVC-compiled callers and callees.
+Arithmetic flags (CF/PF/AF/ZF/SF/OF) are dead across `CALL` and `RET`, so they
+are not published before a call or at return. Entry and post-call reads still
+load the CPU, and DF, division and string-helper snapshots stay complete. For
+x87 the assumed invariant is that every register above TOP is tagged empty.
+Every runtime push and `fset` rewrites `st`, `st_bits` and `st_exact`, and
+`st_bits` is read only while `st_exact` is set. A flush therefore writes no
+value, bits or exact flag for popped registers, and leaves the tag of a
+register pushed and popped within the region untouched (it is already empty).
+It retags empty a register popped from the region-start stack, writes live
+`st_bits` only when `st_exact` may be set, and writes TOP only when it moved.
+The tag word, TOP, status and live registers stay exact, so FXAM, `FLD ST(i)`,
+FXCH and environment stores are unaffected. Functions with FINCSTP/FDECSTP keep
+the exact flush. `emit(..., facts=dict)` reports whether a body reads a flag at
+entry or after a call, or kept the exact flush. Production sums these into the
+report's `ir_ssa.convention_census`, a sanity census rather than a gate.
+
 Policies and where they apply:
 
 | Setting | Values | Meaning |
 | --- | --- | --- |
 | `ir_ssa_x87` | `scalar` (default), `scalar-strict` | strict publishes x87 state before loads and stores and uses general arithmetic recipes |
 | `ir_ssa_state` | `locals` (default), `strict` | strict keeps every pre-access GPR/flag snapshot |
+| `ir_ssa_msvc_convention` | `true` (default), `false` | false publishes flags and complete x87 state at calls and returns |
 
-`RECOMP_NULL_CHECKS=1` builds always compile the strict forms of both: `emit`
-emits a strict/fast `#if` pair whenever either policy is relaxed. `emit()`
-defaults to the production policy (`x87_scalar_strict=False, local_state=True`).
+`RECOMP_NULL_CHECKS=1` builds always compile the strict forms of all three: `emit`
+emits a strict/fast `#if` pair whenever any policy is relaxed. `emit()`
+defaults to the production policy (`x87_scalar_strict=False, local_state=True,
+msvc_convention=True`).
 
 DIVERGENCE(original): [ssa-x87-scalar] interior access faults and store watch
 callbacks may expose the preceding published x87 state. [ssa-state-locals] likewise defers GPR/flag
 state except EIP/ESP/EBP at loads and stores. [ssa-x87-binary32] uses the documented binary32
-exponent-range policy. Accesses and faults are never removed. Interior
+exponent-range policy. [ssa-flags-convention] and [ssa-x87-convention] leave
+arithmetic flags and popped x87 residue unpublished at calls and returns.
+Accesses and faults are never removed. Interior
 fault/SEH equivalence remains unverified.
 
 ### Reduction passes
@@ -182,7 +204,8 @@ effect model before admission.
   rejection, production selection.
 - `tools/build.py --ir-ssa-checks`: the byte-backed synthetic fixtures in
   `ir/native_checks.py` run against eager C as five columns (eager, raw,
-  scalar with strict state, scalar-strict, scalar/locals), each in an ordinary and
+  scalar with strict state, scalar-strict, and the production scalar/locals with the MSVC convention, which
+  compares with that convention's dead fields cleared), each in an ordinary and
   a null-check build, comparing every CPU field, 2 KiB of scratch and read-only
   store-watch snapshots over 24576 inputs per fixture, including all x87 TOP, PC
   and RC combinations. A mocked divide-error handler mutates other GPRs/flags and
@@ -210,6 +233,7 @@ effect model before admission.
 ir_ssa = true
 ir_ssa_x87 = "scalar"    # scalar (default) or scalar-strict
 ir_ssa_state = "locals"  # locals (default) or strict
+ir_ssa_msvc_convention = true  # false: conservative call/return publication
 ```
 
 Regenerate with `tools/build.py --regenerate`; `ir_ssa = false` restores decoded
@@ -230,20 +254,19 @@ execution coverage or equivalence evidence.
 
 ## SSA ceiling experiment (corpus-only, unproven)
 
-`ir/ceiling.py` defines five aggressive relaxations that the function corpus can
+`ir/ceiling.py` defines four aggressive relaxations that the function corpus can
 apply as one extra "SSA ceiling" column to measure what they could buy before any
 is proven. They are not part of the agreed performance-mode contract and never
 reach `game.toml` or `ir/production.py`: the only entry is the private `_ceiling`
 argument of `emit_c.emit`, a regression test checks production never passes it,
 and every other variant is byte-identical when the option is absent. Select them
-with `--corpus-ir-ssa --corpus-ir-ssa-ceiling A,B,C,D,E|all` (the game wrapper
+with `--corpus-ir-ssa --corpus-ir-ssa-ceiling A,C,D,E|all` (the game wrapper
 spells it `--ir-ssa-ceiling`).
 
 | Letter | Relaxation |
 | --- | --- |
 | A | No access snapshots at all, dropping EIP/ESP/EBP too (production `locals` already defers every other field at loads and stores) |
-| B | Arithmetic flags are dead across entry, call and return (DF stays exact) |
-| C | MSVC x87 call convention: values only, no tags/residue/exact shadows, popped slots never published |
+| C | x87 values only: no tags or exact shadows, at edges as well as calls and returns |
 | D | No sticky exception bits; NaN canonicalised only at stores |
 | E | Constant PC=00/RC=nearest; slots are plain C `float` |
 
@@ -253,4 +276,6 @@ function and records the reason. The ceiling column is judged on declared
 observations, not full-state equality: native rows use the fixture's observable
 contract; translation-only rows compare declared guest ranges, EAX, ST0 and
 relaxed boundary snapshots. Mismatches are counted, never fatal. With D, sticky IE
-is absent from a status word a guest reads through `FNSTSW AX`.
+is absent from a status word a guest reads through `FNSTSW AX`. The former B (flags
+dead across calls and returns) is now production `ir_ssa_msvc_convention`. The
+column is built on top of the production policy.

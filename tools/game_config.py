@@ -217,6 +217,10 @@ def load(game_dir):
             ("ir_ssa_state", "locals", ("strict", "locals"))):
         if translate.setdefault(key, default) not in choices:
             raise ValueError("%s: [translate] %s must be one of %s" % (source, key, choices))
+    # Calls and returns follow the MSVC convention: arithmetic flags and x87
+    # residue are dead there. False restores the conservative publication.
+    if not isinstance(translate.setdefault("ir_ssa_msvc_convention", True), bool):
+        raise ValueError("%s: [translate] ir_ssa_msvc_convention must be a boolean" % source)
     alignment = translate.setdefault("function_alignment", 16)
     if type(alignment) is not int or alignment <= 0:
         raise ValueError("%s: [translate] function_alignment must be a positive integer" % source)

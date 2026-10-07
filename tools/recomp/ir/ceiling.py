@@ -15,14 +15,12 @@ Relaxations (each independently switchable):
 A  no access snapshots: loads and stores also skip EIP/ESP/EBP. (Production
    scalar x87 and the locals state policy already defer every other field
    there.) Only calls, returns, division/string seams publish.
-B  flags dead at call/return boundaries: CF/PF/AF/ZF/SF/OF are not live-in,
-   not live-out at return and neither published before nor reloaded after a
-   call (DF stays exact). Flags consumed inside the function stay exact.
-C  x87 MSVC call convention: popped-slot residue, tags, st_bits and st_exact
-   are neither maintained nor published. The stack is assumed empty at
-   calls/return except for values still live (ST0 of a float return), inferred
-   from which slots remain pushed. Exact-integer (FILD/FISTP m64) shadows are
-   simply dropped.
+C  x87 values only: tags, st_bits and st_exact are neither maintained nor
+   published, at edges as well as calls and returns, and popped values are
+   never written back. Exact-integer (FILD/FISTP m64) shadows are dropped.
+   Production `ir_ssa_msvc_convention` already skips popped residue under an
+   exact tag word; C measures the remaining live-register bookkeeping.
+
 D  no sticky IE/ZE status and no per-operation NaN canonicalization; the
    indefinite NaN is produced only when a value is stored to guest memory.
    FCOM condition bits C0/C2/C3 stay exact.
@@ -30,10 +28,12 @@ E  constant control word (PC=00, RC=nearest, no selector) with every x87 slot
    a binary32 C float and plain float arithmetic. Functions containing FLDCW
    (or any x87 instruction the ceiling lowering does not model) take the
    ordinary SSA body whole; no partial-region application exists.
+
+The former B (flags dead across calls and returns) landed as production
+`ir_ssa_msvc_convention`; the letter is retired.
 """
 
-RELAXATIONS = "ABCDE"
-FLAG_FIELDS = frozenset("c->eflags_" + n for n in ("cf", "pf", "af", "zf", "sf", "of"))
+RELAXATIONS = "ACDE"
 X87_RELAXATIONS = frozenset("CDE")
 
 
@@ -53,7 +53,7 @@ def parse_relaxations(text):
     items = [str(item).upper() for item in items]
     unknown = sorted(set(items) - set(RELAXATIONS))
     if unknown:
-        raise ValueError("unknown ceiling relaxation %s (choose from A,B,C,D,E or all)" % ",".join(unknown))
+        raise ValueError("unknown ceiling relaxation %s (choose from A,C,D,E or all)" % ",".join(unknown))
     return frozenset(items)
 
 

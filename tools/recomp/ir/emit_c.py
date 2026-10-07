@@ -30,6 +30,9 @@ SUPPORTED_MNEMONICS = frozenset((
 )) | EXTRA_MNEMONICS
 
 
+# Arithmetic flags the MSVC convention treats as dead across CALL and RET.
+FLAG_FIELDS = frozenset("c->eflags_" + n for n in ("cf", "pf", "af", "zf", "sf", "of"))
+
 _RAM_CONTROL = frozenset(("BRANCH", "CBRANCH", "CALL", "CALLIND", "BRANCHIND", "CALLOTHER"))
 
 
@@ -137,8 +140,9 @@ def codegen_ir(fir, lifter):
 
 
 def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=True,
-         call_symbols=None, x87_scalar_strict=False, local_state=True, resumable_stacks=False,
-         lifter=None, indirect_call_symbol=None, _guard_null_checks=True, _ceiling=frozenset()):
+         call_symbols=None, x87_scalar_strict=False, local_state=True, msvc_convention=True,
+         resumable_stacks=False, lifter=None, indirect_call_symbol=None, _guard_null_checks=True,
+         _ceiling=frozenset(), facts=None):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
     `call_symbols` maps an allowed direct-call target address to the C symbol
@@ -151,10 +155,21 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     `local_state=False` keeps every pre-access GPR/flag snapshot; null-check
     builds compile both strict forms, and either can be requested explicitly.
 
+    `msvc_convention` (the `ir_ssa_msvc_convention` setting) assumes the MSVC
+    call convention at calls and returns: arithmetic flags CF/PF/AF/ZF/SF/OF
+    are not published there (DF is), and x87 flushes skip popped residue under
+    the empty-above-TOP invariant (`x87_scalar.py`). False restores the
+    conservative publication; null-check builds compile it False.
+
     `_ceiling` is private to the function corpus: a set of UNPROVEN relaxation
-    letters from `ceiling.py` (A-E). It is not part of the agreed performance
+    letters from `ceiling.py` (A, C, D, E). It is not part of the agreed performance
     mode contract, requires optimized non-strict x87 and local-state SSA, and production
     selection never passes it.
+
+    `facts`, when a dict, receives census facts about the performance body:
+    whether an arithmetic flag is read from the CPU at entry or after a call
+    (the MSVC convention says it is dead there) and whether the x87 flush kept
+    the exact form. They describe the code; they do not gate emission.
     """
     if not symbol.isidentifier() or not symbol.isascii():
         raise SSAError("invalid C symbol")
@@ -183,29 +198,37 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             or not indirect_call_symbol.isascii()):
         raise SSAError("invalid indirect call symbol %r" % (indirect_call_symbol,))
     x87_statements = x87.statements
-    from .ceiling import RELAXATIONS, X87_RELAXATIONS, FLAG_FIELDS
+    from .ceiling import RELAXATIONS, X87_RELAXATIONS
     _ceiling = frozenset(_ceiling or ())
     if _ceiling:
         if not _ceiling <= frozenset(RELAXATIONS):
             raise SSAError("unknown ceiling relaxation %s" % ",".join(sorted(_ceiling - frozenset(RELAXATIONS))))
         if not (optimize and not x87_scalar_strict and local_state):
             raise SSAError("ceiling relaxations require optimized scalar x87 and local-state SSA")
-    if optimize and _guard_null_checks and not _ceiling and (local_state or not x87_scalar_strict):
+    if optimize and _guard_null_checks and not _ceiling and (
+            local_state or not x87_scalar_strict or msvc_convention):
         # Null-fault dispatch can expose CPU state to guest exception handlers.
         # Compile the strict observation path whenever that facility is enabled.
         options = dict(optimize=optimize, publish_changed=publish_changed, wide_registers=wide_registers,
                        call_symbols=call_symbols, resumable_stacks=resumable_stacks,
                        lifter=lifter, indirect_call_symbol=indirect_call_symbol,
                        _guard_null_checks=False)
-        strict = emit(fir, symbol, x87_scalar_strict=True, local_state=False, **options)
-        fast = emit(fir, symbol, x87_scalar_strict=x87_scalar_strict, local_state=local_state, **options)
+        strict = emit(fir, symbol, x87_scalar_strict=True, local_state=False, msvc_convention=False,
+                      **options)
+        fast = emit(fir, symbol, x87_scalar_strict=x87_scalar_strict, local_state=local_state,
+                    msvc_convention=msvc_convention, facts=facts, **options)
         return "#if defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS\n%s\n#else\n%s\n#endif" % (strict, fast)
     from .x87_scalar import X87Scalar
-    scalar = X87Scalar(observe_loads=x87_scalar_strict) if optimize else None
+    msvc_convention = msvc_convention and optimize
+    # DIVERGENCE(original): [ssa-x87-convention] FINCSTP/FDECSTP leave a tagged
+    # register above TOP, so those functions keep the exact x87 flush.
+    x87_convention = msvc_convention and not any(
+        ins.mnem.upper().removeprefix("WAIT ") in ("FINCSTP", "FDECSTP") for ins in fir.insns)
+    scalar = X87Scalar(observe_loads=x87_scalar_strict, convention=x87_convention) if optimize else None
     if scalar is not None and _ceiling:
         if _ceiling & X87_RELAXATIONS:
             from .x87_ceiling import X87Ceiling  # UNPROVEN ceiling C/D/E lowering.
-            scalar = X87Ceiling(_ceiling)
+            scalar = X87Ceiling(_ceiling, convention=x87_convention)
 
     def flush_x87():
         return scalar.flush() if scalar is not None else []
@@ -229,14 +252,9 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             mapping[("register", off + n)] = (field, n)
     groups = [[("register", off + n) for n in range(size)]
               for (_, off, size), _ in fields]
-    # UNPROVEN ceiling B (corpus-only): flag lanes are dead across entry, calls
-    # and return. Never populated by production selection.
-    dead_flags = frozenset(key for key, (field, _) in mapping.items()
-                           if field in FLAG_FIELDS) if "B" in _ceiling else frozenset()
     s = build(codegen_ir(fir, lifter),
               register_groups=groups if optimize and wide_registers else (),
-              call_targets=call_symbols, indirect_call_symbol=indirect_call_symbol,
-              dead_flag_keys=dead_flags)
+              call_targets=call_symbols, indirect_call_symbol=indirect_call_symbol)
     if any(key != MEMORY and key not in mapping for key in s.inputs):
         raise SSAError("unmapped runtime register")
     publications = None
@@ -251,16 +269,29 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             # pre-access snapshots.
             access_fields = {key for key, (field, _) in mapping.items()
                              if field in ("c->eip", "c->r[4]", "c->r[5]")} if local_state else None
-            plan_groups = [g for g, (_, field) in zip(groups, fields)
-                           if not ("B" in _ceiling and field in FLAG_FIELDS)]
             # UNPROVEN ceiling A: guest memory accesses publish nothing.
             unpublished = (frozenset(("LOAD", "STORE", "X87_MEM"))
                            if "A" in _ceiling else frozenset())
-            publications = plan(s, fir.succ, plan_groups, access_fields=access_fields,
-                                unpublished=unpublished)
+            # DIVERGENCE(original): [ssa-flags-convention] under the MSVC
+            # convention arithmetic flags are dead across CALL and RET: they
+            # are not published before a call or at return. Entry and
+            # post-call values still read the CPU, and DF, division and
+            # string-helper snapshots stay exact.
+            boundary_skip = (frozenset(key for key, (field, _) in mapping.items()
+                                       if field in FLAG_FIELDS)
+                             if msvc_convention else frozenset())
+            publications = plan(s, fir.succ, groups, access_fields=access_fields,
+                                unpublished=unpublished, boundary_skip=boundary_skip)
         live = simplify(s, publications)
     else:
         live = {v.id for v in s.values}
+    if facts is not None:
+        flag_keys = {key for key, (field, _) in mapping.items() if field in FLAG_FIELDS}
+        read = [v for v in s.values if v.id in live and s.resolve(v) is v
+                and v.opc in ("INPUT", "CALL_RELOAD") and v.data in flag_keys]
+        facts["flags_read_at_entry"] = any(v.opc == "INPUT" for v in read)
+        facts["flags_read_after_call"] = any(v.opc == "CALL_RELOAD" for v in read)
+        facts["x87_exact_flush"] = msvc_convention and not x87_convention
 
     def ref(v):
         v = s.resolve(v)

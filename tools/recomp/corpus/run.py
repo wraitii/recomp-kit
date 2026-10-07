@@ -532,7 +532,7 @@ def markdown(report):
     info = report.get('ir_ssa_ceiling', {})
     if info.get('enabled'):
         lines += ['', f"## {info['label']} (UNPROVEN, corpus-only)", '',
-                  'Relaxations A-E are unproven measurement ceilings, not the agreed performance-mode contract; '
+                  'Relaxations A, C, D and E are unproven measurement ceilings, not the agreed performance-mode contract; '
                   'they never apply to production. Full-state equality with eager C is not expected. '
                   'Native rows are checked against declared native observations; translation-only rows against '
                   'eager guest memory ranges (excluding stack residue below the final ESP), EAX and ST0. '
@@ -591,19 +591,24 @@ def markdown(report):
 
 def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0, trials=9,
                x87_dataflow=False, x87_stack_forwarding=False, decoded_dataflow=False,
-               ir_ssa=False, ir_ssa_x87=None, ir_ssa_state=None, ir_ssa_ceiling=None, asan=False):
+               ir_ssa=False, ir_ssa_x87=None, ir_ssa_state=None, ir_ssa_convention=None,
+               ir_ssa_ceiling=None, asan=False):
     """Decode the selected instructions, build isolated variants, validate, report.
 
-    ``ir_ssa_ceiling`` (e.g. ``"A,B"``/``"all"``) adds the UNPROVEN, corpus-only
+    ``ir_ssa_ceiling`` (e.g. ``"A,C"``/``"all"``) adds the UNPROVEN, corpus-only
     "SSA ceiling" column; see ``ir/ceiling.py``. It is judged against declared
     observations rather than full-state equality and requires scalar x87 and
     local-state SSA, which also supply its per-function fallback body.
+    ``ir_ssa_convention`` (default True with ``ir_ssa``) mirrors
+    ``ir_ssa_msvc_convention``; the combined column then compares with the
+    convention's dead fields cleared (``corpus_convention_canonical``).
     """
     from ir.ceiling import parse_relaxations, label as ceiling_label
     if asan and trial_ms:
         raise ValueError("an AddressSanitizer corpus build is for correctness only; use a zero trial budget")
-    if (ir_ssa_x87 is not None or ir_ssa_state is not None) and not ir_ssa:
-        raise ValueError("IR SSA x87 and state policies require IR SSA")
+    if (ir_ssa_x87 is not None or ir_ssa_state is not None or ir_ssa_convention is not None) and not ir_ssa:
+        raise ValueError("IR SSA x87, state and convention policies require IR SSA")
+    ir_ssa_convention = bool(ir_ssa) and ir_ssa_convention is not False
     # Plain --ir-ssa is the production policy: scalar x87, local CPU state.
     ir_ssa_x87, ir_ssa_state = ir_ssa_x87 or "scalar", ir_ssa_state or "locals"
     ceiling = parse_relaxations(ir_ssa_ceiling)
@@ -748,6 +753,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
                                 indirect_call_symbol=indirect_symbol,
                                 x87_scalar_strict=(ir_ssa_x87 == 'scalar-strict'),
                                 local_state=(ir_ssa_state == 'locals'),
+                                msvc_convention=ir_ssa_convention,
                                 resumable_stacks=getattr(T, 'RESUMABLE_STACKS', False),
                                 _ceiling=relax)
                 try:
@@ -823,6 +829,8 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
     declarations = [f'#include {quote(header)}', f'#define CORPUS_COUNT {len(rows)}',
                     f'#define CORPUS_MODES {len(modes)}',
                     f'#define CORPUS_MODE_NATIVE {len(modes) - 1}']
+    if ir_ssa_convention:
+        declarations.append(f'#define CORPUS_MODE_CONVENTION {modes.index("combined")}')
     if ceiling:
         declarations.append(f'#define CORPUS_MODE_CEILING {modes.index(CEILING_MODE)}')
         if 'E' in ceiling:
@@ -955,6 +963,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
               'x87_dataflow': x87_dataflow, 'x87_stack_forwarding': x87_stack_forwarding, 'decoded_dataflow': decoded_dataflow,
               'ir_ssa': ir_ssa,
               'ir_ssa_x87': ir_ssa_x87, 'ir_ssa_state': ir_ssa_state,
+              'ir_ssa_msvc_convention': ir_ssa_convention,
               'ir_ssa_ceiling': {'enabled': bool(ceiling), 'relaxations': sorted(ceiling),
                                  'label': ceiling_label(ceiling) if ceiling else None,
                                  'unproven': 'corpus-only experiment, not the agreed performance-mode contract'},

@@ -49,9 +49,11 @@ X87_CMP = function("d906", "d81f", "dfe0", "c3")
 
 
 def test_parse_relaxations_and_labels():
-    assert ceiling.parse_relaxations("all") == frozenset("ABCDE")
+    assert ceiling.parse_relaxations("all") == frozenset("ACDE")
     assert ceiling.parse_relaxations("a, c") == frozenset("AC")
-    assert ceiling.parse_relaxations("BDE") == frozenset("BDE")
+    assert ceiling.parse_relaxations("CDE") == frozenset("CDE")
+    with pytest.raises(ValueError, match="unknown ceiling relaxation B"):
+        ceiling.parse_relaxations("B")  # retired: production ir_ssa_msvc_convention
     assert ceiling.parse_relaxations(None) == frozenset() == ceiling.parse_relaxations("")
     assert ceiling.label(frozenset("EA")) == "SSA ceiling [A,E]"
     with pytest.raises(ValueError, match="unknown ceiling relaxation F"):
@@ -102,7 +104,7 @@ def test_x87_flush_before_stores_is_strict_only():
     # GPR/flag snapshots; strict x87 keeps publication before the store.
     strict = base(X87_ADD, x87_scalar_strict=True)
     for text in (base(X87_ADD), ceil(X87_ADD, "A")):
-        assert text.index("wrf32(") < text.index("c->fpu_top =")
+        assert text.index("wrf32(") < text.index("c->fpu_sw =")
         assert "c->st[" not in text.split("wrf32(")[0]
     assert strict.index("c->st[") < strict.index("wrf32(")
 
@@ -118,41 +120,16 @@ def test_a_plan_leaves_known_facts_for_unpublished_effects():
     assert plan(s, f.succ, groups)[store.id] != ()
 
 
-def test_b_flags_are_not_live_in_or_live_out():
-    # jz +1; nop; ret consumes the incoming ZF; cmp/ret leaves flags live-out.
-    consumer = function("7401", "90", "c3")
-    assert "c->eflags_zf" in base(consumer)
-    assert "c->eflags_zf" not in ceil(consumer, "B")
-    producer = function("39d8", "c3")  # cmp eax,ebx; ret
-    assert "c->eflags_zf =" in base(producer)
-    assert "c->eflags_" not in ceil(producer, "B").replace("c->eflags_df", "")
-
-
-def test_b_flags_consumed_inside_the_function_stay_exact():
-    # cmp eax,ebx; jz skip; inc eax; skip: ret
-    f = function("39d8", "7401", "40", "c3")
-    text = ceil(f, "B")
-    assert "0x1ull" in text and "if (" in text  # a branch condition computed from live ALU flags
-    assert "c->eflags_" not in text
-
-
-def test_b_flags_are_neither_published_nor_reloaded_around_calls():
-    # call 0x2000; cmp eax,ebx; ret
-    f = function("e8fb0f0000", "39d8", "c3")
-    strict = base(f, call_symbols={0x2000: "callee"})
-    relaxed = ceil(f, "B", call_symbols={0x2000: "callee"})
-    assert "c->eflags_zf" in strict
-    assert "c->eflags_" not in relaxed
-    assert "callee(c);" in relaxed
-
-
-def test_c_drops_tags_integer_shadows_and_residue():
-    strict = base(X87_ADD)
-    lite = ceil(X87_ADD, "C")
-    for name in ("st_bits", "st_exact", "fpu_tag", "FTAG_EMPTY"):
+def test_c_drops_live_tags_and_integer_shadows():
+    # fld1; fld1; faddp; ret -- production publishes the returned ST0 with its
+    # tag and exact flag; C publishes the value and TOP only.
+    f = function("d9e8", "d9e8", "dec1", "c3")
+    strict = base(f)
+    lite = ceil(f, "C")
+    for name in ("st_exact", "fpu_tag"):
         assert name in strict
         assert name not in lite
-    assert "c->fpu_top =" in lite  # TOP still published at return
+    assert "c->fpu_top =" in lite and "c->st[" in lite
 
 
 def test_c_does_not_publish_popped_values_but_publishes_returned_st0():
@@ -207,14 +184,14 @@ def test_x87_shapes_outside_the_ceiling_model_raise_named_fallbacks():
         for relax in ("C", "D", "E"):
             with pytest.raises(SSAError, match="ceiling x87: unsupported %s" % name):
                 ceil(f, relax)
-        # A and B alone retain the exact general x87 recipes for these shapes.
-        assert ceil(f, "AB")
+        # A alone retains the exact general x87 recipes for these shapes.
+        assert ceil(f, "A")
 
 
 def test_each_relaxation_alone_emits_valid_shape_for_every_sample():
     samples = (INT_STORE, X87_ADD, X87_MUL, X87_CMP, function("39d8", "7401", "40", "c3"))
     for f in samples:
-        for relax in "ABCDE":
+        for relax in "ACDE":
             text = ceil(f, relax)
             assert text.startswith("void t(X86 *c) {") and text.rstrip().endswith("}")
             assert "RECOMP_NULL_CHECKS" not in text  # ceiling skips the dual null-check body

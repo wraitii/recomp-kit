@@ -55,7 +55,8 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
                  | set(policies.get("intrinsic_bodies", {})))
     mode = settings.get("ir_ssa_x87", "scalar")
     state = settings.get("ir_ssa_state", "locals")
-    results, reasons = {}, Counter()
+    convention = settings.get("ir_ssa_msvc_convention", True)
+    results, reasons, census = {}, Counter(), Counter()
     for index, fn in enumerate(functions, 1):
         reason = "auxiliary module" if module else exclusion(
             tr, fn, entries_by_fn.get(fn.addr, ()), policies)
@@ -67,14 +68,16 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
                     target = tr.branch_target(ins)
                     if target in known and target not in forbidden:
                         calls[target] = "entry_%08x" % target
+            facts = {}
             try:
                 fir = function_ir(tr, lifter, fn)
                 source = emit(fir, "fn_%08x" % fn.addr, call_symbols=calls,
                               x87_scalar_strict=mode == "scalar-strict",
                               local_state=state == "locals",
+                              msvc_convention=convention,
                               resumable_stacks=policies.get("resumable_stacks", False),
                               indirect_call_symbol="recomp_call",
-                              lifter=lifter)
+                              lifter=lifter, facts=facts)
             except (SSAError, LiftError) as error:
                 reason = str(error)
             except RecursionError:
@@ -84,6 +87,7 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
             # retargeting and dispatch checks already understand this seam.
             source = re.sub(r"\bentry_([0-9a-f]{8})\(c\);", r"CALL_FN(\1);", source)
             bodies[fn.addr] = source.splitlines()
+            census.update(key for key, value in facts.items() if value)
         else:
             reasons[re.sub(r"^[0-9a-f]{8}: ", "", reason)] += 1
         results["%08x" % fn.addr] = {
@@ -96,12 +100,16 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
     total = len(results)
     emitted = sum(row["emitted"] for row in results.values())
     report = {
-        "enabled": True, "x87": mode, "state": state,
+        "enabled": True, "x87": mode, "state": state, "msvc_convention": convention,
         "functions": total, "emitted": emitted, "fallback": total - emitted,
         "emitted_percent": 100 * emitted / total if total else 0,
         "fallback_percent": 100 * (total - emitted) / total if total else 0,
         "denominator": "Final emitted function bodies, including recovered bodies; alternate entries are not separate functions.",
         "fallback_reasons": dict(reasons.most_common()),
+        # Emitted bodies that read a flag the MSVC convention calls dead, or
+        # kept the exact x87 flush. A sanity census, not an admission gate.
+        "convention_census": {key: census[key] for key in (
+            "flags_read_at_entry", "flags_read_after_call", "x87_exact_flush")},
         "seconds": round(time.monotonic() - started, 3), "per_function": results,
     }
     if not quiet:

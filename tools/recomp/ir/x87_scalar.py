@@ -27,6 +27,18 @@ DIVERGENCE(original): [ssa-x87-binary32] common PC=00 arithmetic with proven
 binary32 operands uses the documented float exponent-range policy. Other
 precision settings and unproven operands retain the audited double helpers.
 No reassociation, contraction or division approximation is introduced.
+
+DIVERGENCE(original): [ssa-x87-convention] with `convention=True` (the
+`ir_ssa_msvc_convention` setting) a flush assumes the MSVC invariant at region
+start: every register above TOP is tagged empty. Popped registers publish no
+value, `st_bits` or `st_exact` (residue: every push and `fset` rewrites all
+three), and a register pushed and popped within the region keeps its
+untouched, already-empty tag. A register popped from the region-start stack is
+retagged empty. Live registers publish `st_bits` only when `st_exact` may be
+set, the only case a runtime helper reads it, and TOP only when it moved. The
+tag word, TOP and live registers stay exact; only popped residue differs.
+Functions containing FINCSTP/FDECSTP, which break the invariant inside a
+region, keep the exact flush.
 """
 from dataclasses import dataclass, field
 from typing import Optional
@@ -47,10 +59,11 @@ class Slot:
 class X87Scalar:
     """Track all eight physical residues within a single-entry linear region."""
 
-    def __init__(self, observe_loads=False):
+    def __init__(self, observe_loads=False, convention=False):
         self.serial = 0
         self.temps = []
         self.observe_loads = observe_loads
+        self.convention = convention
         self.binary32 = True
         self.reset()
 
@@ -61,6 +74,10 @@ class X87Scalar:
         self.active = False
         self.top = 0
         self.top_dirty = False
+        # Unbounded stack positions relative to the region's captured TOP
+        # (negative = pushed). `base` is the last published TOP, `low` the
+        # deepest push since then and `high` the highest position accessed.
+        self.position = self.base = self.low = self.high = 0
         self.status_dirty = False
         self.slots = {}
 
@@ -82,6 +99,7 @@ class X87Scalar:
         return "(x87_top_ + %du) & 7u" % offset
 
     def _slot(self, logical=0):
+        self.high = max(self.high, self.position + logical)
         offset = (self.top + logical) & 7
         return offset, self.slots.setdefault(offset, Slot())
 
@@ -113,16 +131,63 @@ class X87Scalar:
     def _move_top(self, delta):
         self.top = (self.top + delta) & 7
         self.top_dirty = True
+        self.position += delta
+        self.low = min(self.low, self.position)
 
     def _drop(self):
         # Preserve both value and integer shadow in the popped physical slot.
         self._assign(0, exact="0", tag="FTAG_EMPTY")
         self._move_top(1)
 
+    def _convention_flush(self):
+        """Publish under the MSVC stack invariant, or None when ambiguous.
+
+        Every tracked physical slot maps to one position in [low, low + 8)
+        unless the region touched a position eight or more above its deepest
+        push (only possible on a stack overflow); then the exact flush runs.
+        """
+        if self.high >= self.low + 8 or self.position >= self.low + 8:
+            return None
+        lines, tags = [], []
+        for offset, slot in sorted(self.slots.items()):
+            phys = self._phys(offset)
+            position = self.low + ((offset - self.low) & 7)
+            if position < self.position:
+                # Popped residue. Only a register that was on the stack when
+                # the region began needs its (dirty) empty tag.
+                if position >= self.base and "tag" in slot.dirty:
+                    tags.append((phys, slot.tag))
+            else:
+                if "value" in slot.dirty:
+                    lines.append("c->st[%s] = %s;" % (phys, slot.value))
+                if "exact" in slot.dirty:
+                    lines.append("c->st_exact[%s] = %s;" % (phys, slot.exact))
+                if "bits" in slot.dirty and slot.exact != "0":
+                    lines.append("c->st_bits[%s] = %s;" % (phys, slot.bits))
+                if "tag" in slot.dirty:
+                    tags.append((phys, slot.tag))
+            slot.dirty.clear()
+        if tags:
+            masks = " | ".join("(3u << (2u * (%s)))" % phys for phys, _ in tags)
+            values = " | ".join("((%s) << (2u * (%s)))" % (tag, phys) for phys, tag in tags)
+            lines.append("c->fpu_tag = (uint16_t)((c->fpu_tag & ~(%s)) | %s);" % (masks, values))
+        if self.position != self.base:
+            lines.append("c->fpu_top = (%s);" % self._phys(self.top))
+        self.top_dirty = False
+        self.base = self.low = self.high = self.position
+        if self.status_dirty:
+            lines.append("c->fpu_sw = x87_env_.fpu_sw;")
+            self.status_dirty = False
+        return lines
+
     def flush(self):
         """Publish only changed components; retain scalar knowledge afterward."""
         if not self.active:
             return []
+        if self.convention:
+            lines = self._convention_flush()
+            if lines is not None:
+                return lines
         lines, tags = [], []
         for offset, slot in sorted(self.slots.items()):
             phys = self._phys(offset)
@@ -140,6 +205,7 @@ class X87Scalar:
         if self.top_dirty:
             lines.append("c->fpu_top = (%s);" % self._phys(self.top))
             self.top_dirty = False
+        self.base = self.low = self.high = self.position
         if self.status_dirty:
             lines.append("c->fpu_sw = x87_env_.fpu_sw;")
             self.status_dirty = False

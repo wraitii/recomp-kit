@@ -27,8 +27,8 @@ _INDEF64 = '-__builtin_nan("")'
 
 
 class X87Ceiling(X87Scalar):
-    def __init__(self, relax):
-        super().__init__(observe_loads=False)
+    def __init__(self, relax, convention=False):
+        super().__init__(observe_loads=False, convention=convention)
         self.lite = "C" in relax
         self.nosticky = "D" in relax
         self.f32 = "E" in relax

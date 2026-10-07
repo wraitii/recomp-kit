@@ -230,6 +230,17 @@
 ||||||| parent of 7345cd1 (Remove the LLVM corpus experiments)
 ||||||| parent of 8cd6a8e (Add an AddressSanitizer option to the function corpus)
 ||||||| parent of e484f73 (Map guest memory at a fixed address and make store hooks optional)
+||||||| parent of 64d3c8b (Treat calls and returns as following the MSVC convention in SSA bodies)
+- Add `[translate] ir_ssa_msvc_convention` (default `true`). SSA bodies treat
+  calls and returns as following the MSVC convention: arithmetic flags
+  (CF/PF/AF/ZF/SF/OF) are no longer published before calls or at returns, and
+  x87 flushes skip popped residue, assuming registers above TOP are tagged empty.
+  The tag word, TOP, DF and live registers stay exact. `false` restores the
+  conservative publication; null-check builds always compile it. The
+  translation report's `ir_ssa.convention_census` counts bodies that read a
+  flag at entry or after a call. Ceiling relaxation B is retired, and the
+  function corpus takes `--corpus-ir-ssa-convention msvc|exact`.
+
 - Guest memory now lives at a fixed host address (`RECOMP_ARENA`, reserved
   through the new `os_vm_reserve_at`), so translated loads and stores index a
   constant base that a guest store cannot alias. Replay and test harnesses swap
