@@ -171,6 +171,24 @@ faulting accesses initially. Later transformations may relax order only with
 specific independence and fault/observer evidence. Equality of final memory
 alone misses a write followed by an external read and then an overwrite.
 
+### Representation versus obligations
+
+Two kinds of relaxation are easy to conflate. A *representation* change keeps
+state in host locals between observation points but still computes everything
+the eager emitter would publish, and publishes it at the same points. Scalar
+x87 tracking, deferred GPR/flag publication at accesses and carried x87 state
+across internal CFG edges (`x87_carry.py`) are of this kind. They need no
+contract facts, only the statement that the skipped points have no observer,
+and full-state eager comparison checks them.
+
+An *obligation* change omits computing state because no admitted observer at a
+region exit or boundary reads it. Examples are sticky status bits, flags or x87
+residue at an internal callee's return, a private stack slot's guest store, or
+values passed through a private call interface. That requires the contract
+analysis described here and the region comparison column. A larger
+representation region does not imply narrower obligations at its exits:
+carried x87 state is still exact at every call and return.
+
 ### Composition
 
 Compute conservative effects from original lifted instructions and reviewed
