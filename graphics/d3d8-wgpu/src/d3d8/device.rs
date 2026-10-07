@@ -5,7 +5,7 @@ use super::{
         AlphaTestUniform, FogUniform, FvfLayout, StagesUniform, TEXTURED_WGSL, TransformUniform,
         UNLIT_WGSL, lit_layout, lit_shader_source,
     },
-    resource::{IndexedDraw, VertexBuffer, expand_indexed_into},
+    resource::{IndexedDraw, VertexBuffer, expand_indexed_into, indexed_list_into},
     shader::{self, Declaration, Program},
     state::{DeviceState, LitInput, MAX_TEXTURE_STAGES},
     stats, survey,
@@ -1009,6 +1009,7 @@ struct PendingDraw {
     textures: Option<StageBindings>,
     viewport: crate::d3d8::state::Viewport,
     count: u32,
+    indices: Option<(u64, u64)>,
 }
 
 /// Consecutive draws into one render target, replayed as a single render pass
@@ -1177,6 +1178,8 @@ pub struct Device {
     /// Reused index-expansion output (triangle-list expansion of a guest index
     /// buffer); sized and fully overwritten by [`Device::draw_indexed_primitive`].
     index_scratch: Vec<u8>,
+    /// Reused rebased GPU indices; batch data owns the queued snapshot.
+    index_rebased: Vec<u32>,
     /// Reused software-lighting output for the normal-bearing FVFs (0x112 and
     /// 0x152); sized and fully overwritten by `light_vertices`.
     lit_scratch: Vec<u8>,
@@ -1252,6 +1255,7 @@ impl Device {
             scratch_rgba: Vec::new(),
             samplers: KeyedCache::default(),
             index_scratch: Vec::new(),
+            index_rebased: Vec::new(),
             lit_scratch: Vec::new(),
             draw_buffer: Default::default(),
             draw_layouts,
@@ -1831,6 +1835,20 @@ impl Device {
         start_vertex: u32,
         primitive_count: u32,
     ) -> Result<(), RenderError> {
+        self.draw_stream(topology, fvf, vertices, start_vertex, primitive_count, None)
+    }
+
+    // Indexed streams use the same state validation and immutable batch data
+    // as ordinary draws; their consumed vertex count comes from the range.
+    fn draw_stream(
+        &mut self,
+        topology: u32,
+        fvf: u32,
+        vertices: &VertexBuffer,
+        start_vertex: u32,
+        primitive_count: u32,
+        indices: Option<&[u32]>,
+    ) -> Result<(), RenderError> {
         if !self.scene {
             return Err(RenderError::new(
                 "DrawPrimitive",
@@ -1920,6 +1938,11 @@ impl Device {
             }
             return Err(error);
         }
+        let vertex_count = if indices.is_some() {
+            (vertices.bytes().len() / vertices.stride as usize) as u32
+        } else {
+            vertex_count
+        };
         let count = start_vertex
             .checked_add(vertex_count)
             .ok_or_else(|| RenderError::new("DrawPrimitive", "vertex range overflow"))?;
@@ -2232,7 +2255,7 @@ impl Device {
             let end = count as usize * vertices.stride as usize;
             (&vertices.bytes()[begin..end], end - begin)
         };
-        let (ub_base, vertex_base) = {
+        let (ub_base, vertex_base, index_range) = {
             let mut batch = self.batch.borrow_mut();
             if batch.draws.is_empty() {
                 batch.color_view = Some(self.target.view.clone());
@@ -2286,7 +2309,13 @@ impl Device {
             // `write_buffer` needs a multiple of COPY_BUFFER_ALIGNMENT.
             let padded = batch.data.len().next_multiple_of(4);
             batch.data.resize(padded, 0);
-            (ub_base as u64, vertex_base as u64)
+            let index_range = indices.map(|indices| {
+                let at = batch.data.len();
+                let bytes = bytemuck::cast_slice(indices);
+                batch.data.extend_from_slice(bytes);
+                (at as u64, bytes.len() as u64)
+            });
+            (ub_base as u64, vertex_base as u64, index_range)
         };
         self.frame_stats.uniform_writes += 1;
         if let Some(scratch) = lit_scratch.take() {
@@ -2365,7 +2394,8 @@ impl Device {
             stages: stages_uniform.is_some(),
             textures,
             viewport: *v,
-            count: vertex_count,
+            count: indices.map_or(vertex_count, |i| i.len() as u32),
+            indices: index_range,
         });
         self.publish_pending.set(true);
         if self.strict_scopes || self.batch.borrow().data.len() >= BATCH_FLUSH_BYTES {
@@ -2398,6 +2428,7 @@ impl Device {
                 size: needed.next_power_of_two().max(4096),
                 usage: wgpu::BufferUsages::UNIFORM
                     | wgpu::BufferUsages::VERTEX
+                    | wgpu::BufferUsages::INDEX
                     | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
@@ -2537,7 +2568,12 @@ impl Device {
                     v.min_z,
                     v.max_z,
                 );
-                pass.draw(0..d.count, 0..1);
+                if let Some((at, len)) = d.indices {
+                    pass.set_index_buffer(db.slice(at..at + len), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..d.count, 0, 0..1);
+                } else {
+                    pass.draw(0..d.count, 0..1);
+                }
             }
         }
         self.gpu.queue.submit([encoder.finish()]);
@@ -2579,9 +2615,9 @@ impl Device {
         Ok(())
     }
 
-    /// `DrawIndexedPrimitive`: expand the guest index buffer into a reused
-    /// scratch vertex stream, then draw it. Expansion errors keep their kind so
-    /// the ABI layer can apply survey-mode rejection exactly as before.
+    /// `DrawIndexedPrimitive`: snapshot compact triangle lists as GPU-indexed
+    /// draws; retain expansion for lighting, sparse ranges and other topologies.
+    /// Both paths validate actual index reads rather than the upload hints.
     pub fn draw_indexed_primitive(
         &mut self,
         topology: u32,
@@ -2592,6 +2628,40 @@ impl Device {
     ) -> Result<(), RenderError> {
         if draw.primitive_count == 0 {
             return Ok(());
+        }
+        // Preserve the expansion path for software lighting (which must only
+        // evaluate referenced vertices), strips/fans and diagnostic traces.
+        // The switch also permits before/after profiling of the same scene.
+        static EXPAND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let expand = *EXPAND.get_or_init(|| {
+            [
+                "RECOMP_D3D8_EXPAND_INDICES",
+                "RECOMP_D3D8_TRACE_DRAWS",
+                "RECOMP_D3D8_TRACE_DRAWN_TRIS",
+                "RECOMP_D3D8_TRACE_SHADER_DRAWS",
+            ]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some())
+        });
+        if !expand
+            && draw.topology == 4
+            && topology == 4
+            && !self.shaders.contains_key(&self.vertex_shader)
+            && !matches!(fvf, 0x0152 | 0x0112)
+        {
+            let mut rebased = std::mem::take(&mut self.index_rebased);
+            let result = (|| match indexed_list_into(&mut rebased, vertices, indices, draw)? {
+                Some((begin, end)) => {
+                    let view = VertexBuffer::borrowed(&vertices[begin..end], draw.stride)?;
+                    self.draw_stream(4, fvf, &view, 0, draw.primitive_count, Some(&rebased))
+                        .map(Some)
+                }
+                None => Ok(None),
+            })();
+            self.index_rebased = rebased;
+            if result?.is_some() {
+                return Ok(());
+            }
         }
         let mut scratch = std::mem::take(&mut self.index_scratch);
         let result = (|| {
@@ -2977,6 +3047,76 @@ mod tests {
             &pixels[(16 * 64 + 48) * 4..(16 * 64 + 48) * 4 + 4],
             &[0, 255, 0, 255]
         );
+    }
+
+    #[test]
+    fn native_indexed_draw_matches_expansion_and_snapshots_bytes() {
+        use super::*;
+        use crate::backend::GpuContext;
+        let gpu = pollster::block_on(GpuContext::new_headless()).expect("Metal adapter");
+        let mut device = Device::new(gpu, 64, 32, 21, 0).unwrap();
+        device.state.set_render_state(7, 0).unwrap();
+        device.state.set_render_state(137, 0).unwrap();
+        device.state.set_render_state(22, 1).unwrap();
+        let mut vertices = vec![0; 4 * 16];
+        for pos in [[-1.0f32, -1.0, 0.5], [3.0, -1.0, 0.5], [-1.0, 3.0, 0.5]] {
+            for f in pos {
+                vertices.extend(f.to_le_bytes());
+            }
+            vertices.extend(0xff00ff00u32.to_le_bytes());
+        }
+        for format in [101, 102] {
+            device.clear(0, 1, 0, 1.0, 0).unwrap();
+            let mut indices: Vec<u8> = [99u32, 2, 0, 1, 2, 0, 1]
+                .into_iter()
+                .flat_map(|i| {
+                    if format == 101 {
+                        (i as u16).to_le_bytes().to_vec()
+                    } else {
+                        i.to_le_bytes().to_vec()
+                    }
+                })
+                .collect();
+            let draw = IndexedDraw {
+                topology: 4,
+                index_format: format,
+                stride: 16,
+                base_vertex: 4,
+                min_index: u32::MAX,
+                num_vertices: 0,
+                start_index: 1,
+                primitive_count: 2,
+            };
+            device.begin_scene().unwrap();
+            device.state.viewport.x = 0;
+            device.state.viewport.width = 32;
+            device
+                .draw_indexed_primitive(4, 0x42, &vertices, &indices, draw)
+                .unwrap();
+            {
+                let batch = device.batch.borrow();
+                let queued = batch.draws.last().unwrap();
+                assert!(queued.indices.is_some());
+                assert_eq!(queued.vertex_len, 48);
+                assert_eq!(queued.count, 6);
+            }
+            let expanded = expand_indexed_into;
+            let mut bytes = Vec::new();
+            expanded(&mut bytes, &vertices, &indices, draw).unwrap();
+            indices.fill(0); // queued draw must own its index snapshot
+            device.state.viewport.x = 32;
+            device
+                .draw_primitive(4, 0x42, &VertexBuffer::borrowed(&bytes, 16).unwrap(), 0, 2)
+                .unwrap();
+            device.end_scene().unwrap();
+            let pixels = device.read_pixels().unwrap();
+            for x in [16, 48] {
+                assert_eq!(
+                    &pixels[(16 * 64 + x) * 4..(16 * 64 + x) * 4 + 4],
+                    &[0, 255, 0, 255]
+                );
+            }
+        }
     }
 
     #[test]

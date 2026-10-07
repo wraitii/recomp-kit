@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Compact unlit D3D8 triangle lists queue GPU indices and the referenced vertex
+  interval instead of expanding duplicate vertices. Bounds, base/start offsets,
+  ignored upload hints and immutable draw snapshots remain validated. Lit,
+  sparse, strip/fan, vertex-shader and diagnostic draws retain expansion;
+  `RECOMP_D3D8_EXPAND_INDICES=1` forces that path for comparisons. CPU index
+  regressions and Metal readback cover both guest index widths.
+
 - D3D8 vertex/index buffers use lifetime-owned guest-arena backing instead of
   copying entire buffers into and out of temporary lock storage. Nested locks,
   ProcessVertices, draw snapshots, release and generation reset keep their

@@ -202,7 +202,7 @@ pub fn expand_indexed_into(
             return Err(RenderError::new(
                 "DrawIndexedPrimitive",
                 "unsupported topology; expected TRIANGLELIST (4), TRIANGLESTRIP (2) or TRIANGLEFAN (6)",
-            ))
+            ));
         }
     };
     let index_size = match draw.index_format {
@@ -266,15 +266,17 @@ pub fn expand_indexed_into(
             }
             _ => {
                 let i = t / 3;
-                if t % 3 == 0 {
-                    0
-                } else {
-                    i + t % 3
-                }
+                if t % 3 == 0 { 0 } else { i + t % 3 }
             }
         }
     };
-    trace_drawn_triangles(vertices, selected, index_size, &draw, triangle_count as usize);
+    trace_drawn_triangles(
+        vertices,
+        selected,
+        index_size,
+        &draw,
+        triangle_count as usize,
+    );
     output.resize(size as usize, 0);
     for (t, dst) in output.chunks_exact_mut(draw.stride as usize).enumerate() {
         let at = source(t) * index_size;
@@ -284,6 +286,69 @@ pub fn expand_indexed_into(
         dst.copy_from_slice(&vertices[offset as usize..offset as usize + draw.stride as usize]);
     }
     Ok(())
+}
+
+/// Validate a triangle-list draw and rebase its indices to the smallest
+/// contiguous vertex interval. MinIndex/NumVertices remain upload hints.
+/// Returns None when that interval would upload more vertices than expansion.
+pub fn indexed_list_into(
+    output: &mut Vec<u32>,
+    vertices: &[u8],
+    indices: &[u8],
+    draw: IndexedDraw,
+) -> Result<Option<(usize, usize)>, RenderError> {
+    let invalid = |cause| RenderError::invalid("DrawIndexedPrimitive", cause);
+    let count = draw
+        .primitive_count
+        .checked_mul(3)
+        .ok_or_else(|| invalid("index count overflow"))?;
+    let size = match draw.index_format {
+        101 => 2,
+        102 => 4,
+        _ => return Err(invalid("invalid index format")),
+    };
+    if draw.stride == 0 {
+        return Err(invalid("zero stride"));
+    }
+    let end = draw
+        .start_index
+        .checked_add(count)
+        .ok_or_else(|| invalid("index range overflow"))?;
+    if u64::from(end) * size as u64 > indices.len() as u64 {
+        return Err(invalid("index range exceeds buffer"));
+    }
+    let selected = &indices[draw.start_index as usize * size..end as usize * size];
+    let read = |b: &[u8]| {
+        if size == 2 {
+            u32::from(u16::from_le_bytes(b.try_into().unwrap()))
+        } else {
+            u32::from_le_bytes(b.try_into().unwrap())
+        }
+    };
+    let mut min = u32::MAX;
+    let mut max = 0;
+    for b in selected.chunks_exact(size) {
+        let index = read(b);
+        let vertex = u64::from(index) + u64::from(draw.base_vertex);
+        if (vertex + 1) * u64::from(draw.stride) > vertices.len() as u64 {
+            return Err(invalid("index outside vertex buffer"));
+        }
+        min = min.min(index);
+        max = max.max(index);
+    }
+    if count == 0 {
+        output.clear();
+        return Ok(None);
+    }
+    let span = u64::from(max) - u64::from(min) + 1;
+    if span > u64::from(count) {
+        return Ok(None);
+    }
+    output.clear();
+    output.extend(selected.chunks_exact(size).map(|b| read(b) - min));
+    let begin = (u64::from(draw.base_vertex) + u64::from(min)) * u64::from(draw.stride);
+    let end = begin + span * u64::from(draw.stride);
+    Ok(Some((begin as usize, end as usize)))
 }
 
 /// `RECOMP_D3D8_TRACE_DRAWN_TRIS=<max reports>`: for indexed triangle-list
@@ -335,7 +400,9 @@ fn trace_drawn_triangles(
     for t in 0..triangle_count {
         let ids = [index(t * 3), index(t * 3 + 1), index(t * 3 + 2)];
         let p = [floats(ids[0], 3), floats(ids[1], 3), floats(ids[2], 3)];
-        let e = dist(&p[0], &p[1]).max(dist(&p[1], &p[2])).max(dist(&p[2], &p[0]));
+        let e = dist(&p[0], &p[1])
+            .max(dist(&p[1], &p[2]))
+            .max(dist(&p[2], &p[0]));
         if !(e <= 5000.0) {
             bad.push((e, t, ids));
         }
@@ -347,7 +414,11 @@ fn trace_drawn_triangles(
     bad.sort_by(|a, b| b.0.total_cmp(&a.0));
     eprintln!(
         "[d3d8-trace] drawn_tris stride={stride} start_index={} min_index={} num_vertices={} base_vertex={} tris={triangle_count} edge>5000:{}",
-        draw.start_index, draw.min_index, draw.num_vertices, draw.base_vertex, bad.len()
+        draw.start_index,
+        draw.min_index,
+        draw.num_vertices,
+        draw.base_vertex,
+        bad.len()
     );
     for (e, t, ids) in bad.iter().take(3) {
         eprintln!(
@@ -374,6 +445,62 @@ mod tests {
             primitive_count: 1,
         }
     }
+    #[test]
+    fn native_indices_rebase_and_match_expansion() {
+        for format in [101, 102] {
+            let raw = [99u32, 3, 1, 2];
+            let indices: Vec<u8> = raw
+                .into_iter()
+                .flat_map(|i| {
+                    if format == 101 {
+                        (i as u16).to_le_bytes().to_vec()
+                    } else {
+                        i.to_le_bytes().to_vec()
+                    }
+                })
+                .collect();
+            let vertices = [10, 11, 12, 13, 14, 15];
+            let d = IndexedDraw {
+                index_format: format,
+                min_index: u32::MAX,
+                num_vertices: 0,
+                ..draw()
+            };
+            let mut rebased = Vec::new();
+            let (begin, end) = indexed_list_into(&mut rebased, &vertices, &indices, d)
+                .unwrap()
+                .unwrap();
+            assert_eq!((begin, end), (3, 6));
+            assert_eq!(rebased, [2, 0, 1]);
+            assert_eq!(
+                rebased
+                    .iter()
+                    .map(|i| vertices[begin + *i as usize])
+                    .collect::<Vec<_>>(),
+                expand_indexed(&vertices, &indices, d).unwrap()
+            );
+            assert!(indexed_list_into(&mut rebased, &vertices[..5], &indices, d).is_err());
+            assert!(indexed_list_into(&mut rebased, &vertices, &indices[..1], d).is_err());
+        }
+        let indices = [0u16, 0, 7]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert!(
+            indexed_list_into(
+                &mut Vec::new(),
+                &[0; 16],
+                &indices,
+                IndexedDraw {
+                    start_index: 0,
+                    ..draw()
+                }
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
     #[test]
     fn indexed_interval_is_relative_before_base_vertex() {
         let indices = [99u16, 3, 1, 2]
