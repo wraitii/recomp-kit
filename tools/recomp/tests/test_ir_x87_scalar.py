@@ -15,6 +15,7 @@ from ir.ssa import SSAError, build
 from ir.simplify import canonicalize, simplify
 from ir.publication import plan
 from ir.summary import FunctionIR, default_successors
+from ir.x87_scalar import INACTIVE, CarryShape, SlotShape, UNSAFE, X87Scalar, merge_shapes
 
 
 def function(*hexes):
@@ -95,3 +96,60 @@ def test_null_checks_select_strict_state_and_x87_publication():
     assert strict.index("c->st[") < strict.index("rd32(")
     assert strict.index("c->r[0] =") < strict.index("rd32(")
     assert fast.index("rd32(") < fast.index("c->st[")
+
+
+def test_carry_shape_keeps_popped_parts_only_under_the_convention():
+    # Regression: snapshot() drops popped value/bits/exact under the MSVC
+    # convention, but the exact flush (msvc_convention=False or FINCSTP/
+    # FDECSTP) must carry and republish them.
+    for convention, expected in ((False, {"value", "bits", "exact", "tag"}),
+                                 (True, {"tag"})):
+        scalar = X87Scalar(convention=convention)
+        scalar.statements({"mnem": "FLD1", "operands": ()}, None, None)
+        scalar.statements({"mnem": "FADDP", "operands": ()}, None, None)
+        popped = {part for position, slot in scalar.snapshot().slots
+                  if position < 0 for part in slot.parts}
+        assert popped == expected, (convention, popped)
+
+
+def test_merge_shapes_takes_conservative_extremes():
+    left = CarryShape(True, ((-1, SlotShape(frozenset(("tag",)), True,
+                                            (("tag", "FTAG_EMPTY"),))),
+                             (0, SlotShape(frozenset(("value", "exact")), False,
+                                           (("exact", "0"),)))),
+                      base=-1, low=-1, high=0, status_dirty=False)
+    right = CarryShape(True, ((0, SlotShape(frozenset(("value", "exact")), True,
+                                             (("exact", "0"),))),),
+                       base=0, low=0, high=1, status_dirty=True)
+    merged = merge_shapes([left, right])
+    slots = dict(merged.slots)
+    assert set(slots) == {-1, 0}
+    assert slots[-1].parts == frozenset(("tag",))
+    assert slots[0].parts == frozenset(("value", "exact"))
+    # `narrow` intersects; agreement on `exact` survives, while `value` (not
+    # carried by every predecessor) is a runtime variable.
+    assert slots[0].narrow is False
+    assert dict(slots[0].const) == {"exact": "0"}
+    assert (merged.base, merged.low, merged.high) == (-1, -1, 1)
+    # The predecessors published different TOPs, so TOP must be republished.
+    assert merged.top_unknown and merged.status_dirty
+
+
+def test_merge_shapes_forces_top_only_when_published_tops_disagree():
+    moved = CarryShape(True, (), base=1, low=0, high=1)
+    same = CarryShape(True, (), base=1, low=0, high=0)
+    assert not merge_shapes([moved, same]).top_unknown
+    # An inactive predecessor published its current TOP (relative base 0).
+    assert merge_shapes([moved, INACTIVE]).top_unknown
+    assert not merge_shapes([CarryShape(True, ()), INACTIVE]).top_unknown
+
+
+def test_merge_shapes_rejects_an_overfull_window():
+    wide = CarryShape(True, ((0, SlotShape(frozenset(("value",)))),
+                             (7, SlotShape(frozenset(("value",))))),
+                      base=0, low=0, high=7)
+    assert merge_shapes([wide]) is not UNSAFE
+    over = CarryShape(True, ((8, SlotShape(frozenset(("value",)))),),
+                      base=0, low=0, high=8)
+    assert merge_shapes([over]) is UNSAFE
+    assert merge_shapes([wide, over]) is UNSAFE

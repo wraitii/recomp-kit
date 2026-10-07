@@ -186,6 +186,22 @@ CALL_CASES = {
 """,
         "resumable": False,
     },
+    "call_x87_carry_join": {
+        # mov ecx,0x10600; fld1; test eax,1; jz +5 (over the call); call;
+        # fadd st0,st1; fstp [ecx]; mov eax,[ecx]; ret. The called path resets
+        # the scalar tracker and pushes, the other carries a dirty FLD1, so the
+        # join merges an inactive and an active predecessor at different TOPs.
+        "hexes": _caller(["b900060100", "d9e8", "a901000000", "7405"],
+                         ["d8c1", "d919", "8b01", "c3"]),
+        "callee": """static void call_x87_carry_join_callee(X86 *c) {
+    uint32_t ret = rd32(c->r[R_ESP]);
+    c->r[R_ESP] += 4;
+    fpush(c, 4.0);
+    c->eip = ret;
+}
+""",
+        "resumable": False,
+    },
     "call_resumable": {
         # mov ebx,1; call; add ebx,1; ret  (callee resumes normally)
         "hexes": _caller(["bb01000000"], ["83c301", "c3"]),

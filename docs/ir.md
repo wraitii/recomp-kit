@@ -289,12 +289,25 @@ Scalar x87 (`x87_scalar.py`) is the optimized lowering; the raw path keeps order
 helpers. It replaces physical push/pop/copy updates with scalar values indexed
 relative to the entry TOP, tracking all eight physical residues, tags and
 exact-integer shadows. CW/SW helpers use a private non-escaping environment.
-CFG edges, division seams, calls and returns materialize required FPU state;
-opaque recipes materialize and invalidate the tracker. Guest loads and stores
-do not observe x87 state in the kit runtime (the watchpoint and dirty tracking
-read only address and value), so performance mode publishes none there, as the
+Division seams, calls, opaque recipes and returns materialize required FPU
+state; opaque recipes then invalidate the tracker. In performance mode
+unpublished state also survives internal CFG edges: `x87_carry.py` computes a
+fixed-point join shape per block, each predecessor normalizes the runtime TOP
+and writes function-scope canonical slot variables, and the successor copies
+them into fresh locals. Only the parts that still need publishing are carried;
+under the MSVC convention a popped register contributes just its empty tag.
+The shape is conservative at joins (union of parts and dirty flags, `narrow`
+intersected, `base`/`low` minimised and `high` maximised, with an inactive
+predecessor counted as published at its TOP); TOP is republished when the
+predecessors' published TOPs disagree, and a window of eight or more slots
+falls back to the per-edge flush. Emission checks every carried edge against
+the planned shape and raises `SSAError` (whole-function fallback) on drift.
+Carry requires the MSVC convention: exact-flush bodies, the ceiling column and
+strict mode keep the per-edge flush. Guest loads and stores do not
+observe x87 state in the kit runtime (the watchpoint and dirty tracking read
+only address and value), so performance mode publishes none there, as the
 decoded `x87_locals` pass already does; strict mode publishes before every
-access. Values survive accesses but not joins or opaque calls. Under PC=00, operations on
+access. Under PC=00, operations on
 proven-binary32 operands use native float add/sub/mul plus the runtime's
 NaN/status normalization when a linear run has at least two arithmetic effects;
 division and unproven operands use the double helpers.
@@ -337,7 +350,8 @@ defaults to the production policy (`x87_scalar_strict=False, local_state=True,
 msvc_convention=True`).
 
 DIVERGENCE(original): [ssa-x87-scalar] interior access faults and store watch
-callbacks may expose the preceding published x87 state. [ssa-state-locals] likewise defers GPR/flag
+callbacks may expose the preceding published x87 state, and internal CFG edges
+carry the scalar representation instead of publishing it. [ssa-state-locals] likewise defers GPR/flag
 state except EIP/ESP/EBP at loads and stores. [ssa-x87-binary32] uses the documented binary32
 exponent-range policy. [ssa-x87-convention] leaves popped x87 residue unpublished at calls and returns.
 The former [ssa-flags-convention] assumption was rejected after a CRT flag ABI

@@ -241,6 +241,22 @@
   (CF/PF/AF/ZF/SF/OF) are no longer published before calls or at returns, and
   x87 flushes skip popped residue, assuming registers above TOP are tagged empty.
 ||||||| parent of 8962fdc (Add modular observable-contract analysis over shared CFGs)
+||||||| parent of 76dedd4 (Carry scalar x87 state across internal CFG edges in SSA bodies)
+- Carry unpublished scalar x87 state across internal CFG edges in performance
+  mode. `x87_carry.py` computes a fixed-point join shape per block, predecessors
+  normalize TOP and write canonical slot variables, and successors copy them
+  into fresh locals; joins union parts and dirty flags, intersect `narrow`, take
+  conservative counter extremes (an inactive predecessor counts as published at
+  its TOP), republish TOP only when predecessors' published TOPs disagree, and
+  fall back to the per-edge flush on an eight-slot window overflow. Emission
+  fails closed with `SSAError` if the live tracker leaves the planned shape.
+  Carry requires the MSVC convention; exact-flush functions keep the per-edge
+  flush. Publication now happens at calls, division seams, opaque effects and
+  returns (and at every access in strict mode). Strict x87, the ceiling column
+  and `optimize=False` emission are byte-identical; only the production scalar
+  body changes. Cull `0081ae30`'s fast path drops from 25 to 8 `c->st`/`c->fpu_*`
+  accesses, none left in its plane loop.
+
 - Add an analysis-only observable-contract foundation with immutable effect and
   observer models, CFG demand propagation, recursive call-effect composition,
   and byte-verified corpus inventory reports (`tools/recomp/analyze_contracts.py`).

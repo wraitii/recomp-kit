@@ -428,12 +428,117 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                     finish_scalar_run()
             prev = i
         finish_scalar_run()
+    # Exact-flush functions (msvc_convention=False or FINCSTP/FDECSTP) keep the
+    # per-edge flush. Carry only under the MSVC convention, where popped residue
+    # may be relaxed; x87_scalar.snapshot() carries all popped parts otherwise.
+    carry_mode = (scalar is not None and not scalar.observe_loads and scalar.convention
+                  and not _ceiling)
+    entry_shape = None
+    if carry_mode:
+        from .x87_carry import analyze as analyze_carry, assert_covers
+        from .x87_scalar import PART_TYPES, UNSAFE, carry_var
+
+        def carry_factory():
+            return X87Scalar(observe_loads=False, convention=x87_convention)
+
+        # The fixed point is needed because a loop header's shape depends on
+        # its own backedge; see x87_carry.py.
+        entry_shape, _exit_shape = analyze_carry(s, fir, carry_factory, scalar_binary32)
+        declared = set()
+        for i, b in s.blocks.items():
+            shape = entry_shape.get(i)
+            if shape is None or shape is UNSAFE or not shape.active:
+                continue
+            for position, slot in shape.slots:
+                for part in slot.parts:
+                    if part not in dict(slot.const):
+                        declared.add((position, part))
+        lines[scalar_declarations:scalar_declarations] = [
+            "%s %s;" % (PART_TYPES[part], carry_var(position, part))
+            for position, part in sorted(declared)]
+
+        # Only non-linear edges cut the tracker. A plain fallthrough from the
+        # previous instruction keeps the live scalar locals and needs neither
+        # canonical assignment nor entry reload.
+        linear_prev = {}
+        for i in s.blocks:
+            preds = predecessors[i]
+            if len(preds) != 1:
+                continue
+            prev = next(iter(preds))
+            if prev == -1:
+                continue
+            shape = entry_shape.get(i)
+            if shape is None or shape is UNSAFE:
+                # The successor must reset, so this edge is a real cut and
+                # must publish before it even though it looks like a
+                # fallthrough.
+                continue
+            if (i == prev + 1 and set(fir.succ[prev]) == {i}
+                    and not any(op.opc in ("BRANCH", "CBRANCH", "RETURN")
+                                for op in s.blocks[prev].ops)):
+                linear_prev[i] = prev
+
+        def seed_block(shape):
+            if shape is None or shape is UNSAFE or not shape.active:
+                scalar.reset()
+                return
+            exprs = {}
+            for position, slot in shape.slots:
+                agreements = dict(slot.const)
+                for part in slot.parts:
+                    if part not in agreements:
+                        exprs[(position, part)] = scalar._temp(
+                            carry_var(position, part), lines, PART_TYPES[part])
+            scalar.seed(shape, exprs)
+
+        def transition(source, targets):
+            active = []
+            fallback = False
+            live = scalar.snapshot()
+            for target in targets:
+                shape = entry_shape.get(target)
+                if shape is None or shape is UNSAFE:
+                    fallback = True
+                elif shape.active:
+                    active.append((target, shape))
+                else:
+                    assert_covers(shape, live, "B%d->B%d" % (source, target))
+            if active:
+                scalar.normalize(lines)
+                # Check every target against the edge state before any
+                # materialization read: reading a slot another predecessor
+                # dirtied raises the tracker's `high` mark, which is bookkeeping
+                # for this edge, not state the other target inherits.
+                live = scalar.snapshot()
+                for target, shape in active:
+                    assert_covers(shape, live, "B%d->B%d" % (source, target))
+                # Both CBRANCH targets read the same tracker, so one canonical
+                # assignment per (position, part) serves every carried target.
+                assignments = {}
+                for target, shape in active:
+                    for position, slot in shape.slots:
+                        agreements = dict(slot.const)
+                        for part in slot.parts:
+                            name = carry_var(position, part)
+                            if part not in agreements and name not in assignments:
+                                assignments[name] = scalar._read(position, part, lines)
+                for name, expr in assignments.items():
+                    lines.append("%s = %s;" % (name, expr))
+            if fallback:
+                lines.extend(flush_x87())
+
     previous = None
     for i, b in s.blocks.items():
-        if scalar is not None and (previous is None or set(fir.succ[previous]) != {i}
-                                  or predecessors[i] != {previous}):
-            scalar.reset()
         lines.append("B%d:;" % i)
+        if carry_mode:
+            # Seeding must run on every entry, including a branch that jumps
+            # straight to this label, so it follows the label.
+            if i not in linear_prev:
+                seed_block(entry_shape.get(i))
+        elif scalar is not None and (previous is None or set(fir.succ[previous]) != {i}
+                                     or predecessors[i] != {previous}):
+            scalar.reset()
         for v in b.ops:
             if v.opc == "MEMORY":
                 continue
@@ -516,22 +621,40 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 lines.extend(publish(b.exit, v))
                 lines.extend(["recomp_return(c);", "return;"])
             elif v.opc == "BRANCH":
-                lines.extend(flush_x87())
-                lines.extend(edge(i, indices[v.args[0].data]))
+                if carry_mode:
+                    target = indices[v.args[0].data]
+                    transition(i, [target])
+                    lines.extend(edge(i, target))
+                else:
+                    lines.extend(flush_x87())
+                    lines.extend(edge(i, indices[v.args[0].data]))
             elif v.opc == "CBRANCH":
-                lines.extend(flush_x87())
-                lines.append("if (%s)" % ref(v.args[1]))
-                lines.extend(edge(i, indices[v.args[0].data]))
-                lines.extend(edge(i, indices[b.insn.addr + b.insn.length]))
+                if carry_mode:
+                    taken = indices[v.args[0].data]
+                    fallthrough = indices[b.insn.addr + b.insn.length]
+                    transition(i, [taken, fallthrough])
+                    lines.append("if (%s)" % ref(v.args[1]))
+                    lines.extend(edge(i, taken))
+                    lines.extend(edge(i, fallthrough))
+                else:
+                    lines.extend(flush_x87())
+                    lines.append("if (%s)" % ref(v.args[1]))
+                    lines.extend(edge(i, indices[v.args[0].data]))
+                    lines.extend(edge(i, indices[b.insn.addr + b.insn.length]))
             else:
                 lines.append("v%d = (%s) & %s;" % (v.id, expression(v), mask(v.size)))
         if not any(v.opc in ("BRANCH", "CBRANCH", "RETURN") for v in b.ops):
             target = fir.succ[i][0]
-            # A non-linear edge must publish before its goto. Never emit a
-            # predecessor-specific flush at a shared destination label.
-            if predecessors[target] != {i} or target != i + 1:
-                lines.extend(flush_x87())
-            lines.extend(edge(i, target))
+            if carry_mode:
+                if linear_prev.get(target) != i:
+                    transition(i, [target])
+                lines.extend(edge(i, target))
+            else:
+                # A non-linear edge must publish before its goto. Never emit a
+                # predecessor-specific flush at a shared destination label.
+                if predecessors[target] != {i} or target != i + 1:
+                    lines.extend(flush_x87())
+                lines.extend(edge(i, target))
         previous = i
     lines.append("}")
     if scalar is not None:

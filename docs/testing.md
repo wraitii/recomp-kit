@@ -108,7 +108,7 @@ contracts and the consolidated fragment modes. Game assembly and outputs
 remain private; these checks do not establish original-x86 equivalence.
 
 `tools/build.py --ir-ssa-checks` compares the experimental integer SSA C emitter
-with eager C using 151 byte-backed synthetic fixtures, 24576 inputs each,
+with eager C using 163 byte-backed synthetic fixtures, 24576 inputs each,
 and complete CPU/2 KiB scratch comparisons. It covers partial registers, loops,
 memory aliases, INC/DEC/SBB/ADC, memory RMW snapshots, extensions, masked shifts,
 checked signed/unsigned division, multiplication, all SETcc conditions, absolute
@@ -126,7 +126,10 @@ PC and RC combinations, exact integer metadata, special and finite inputs,
 80-bit memory, register directions, status/rounding/remainder and classification.
 Native read-only store observers additionally compare complete CPU snapshots,
 addresses, widths and values, with explicit branch-join, loop-backedge and
-partial-word-update fixtures.
+partial-word-update fixtures. Carried x87 fixtures cover forward joins at
+different depths, mixed dirty parts, FXCH and live values on loop backedges,
+a Cull-style FCOMP/FNSTSW branch, popped-tag publication, an unbalanced loop
+that must fall back and a join with a path that went through a call.
 Zero-divisor and overflow fixtures use a mock returning error handler that
 records CPU/fault address and changes EAX/EDX, EBX/ESI and arithmetic flags. These are current-runtime checks,
 not original-x86, actual guest SEH or interior memory-fault equivalence.

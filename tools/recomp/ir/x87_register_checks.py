@@ -100,4 +100,104 @@ CASES = {
         "d95b04",      # FSTP dword [EBX+4]
         "c3",
     ),
+    # Carried value across a forward join: path A loads and adds a second
+    # value while path B leaves a single register. The join must carry the
+    # union of both live-slot sets.
+    "x87_carry_forward_join": (
+        "d9e8",        # FLD1
+        "a901000000",  # TEST EAX, 1
+        "7404",        # JZ +4 -> FSTP
+        "d906",        # FLD dword [ESI]
+        "d8c1",        # FADD ST(0), ST(1)
+        "d95b04",      # FSTP dword [EBX+4] (join)
+        "c3",
+    ),
+    # Different dirty parts per predecessor: path A creates an exact-integer
+    # slot while path B only has plain values; the join must union exact/bits
+    # with the value-only slot.
+    "x87_carry_dirty_parts": (
+        "d9e8",        # FLD1
+        "d9e8",        # FLD1
+        "a901000000",  # TEST EAX, 1
+        "7402",        # JZ +2 -> FXCH
+        "df06",        # FILD dword [ESI]
+        "d9c9",        # FXCH ST(1) (join)
+        "d95b04",      # FSTP dword [EBX+4]
+        "c3",
+    ),
+    # FXCH inside a loop body: the parallel-copy shape must survive the
+    # backedge and the two registers must not alias during materialization.
+    "x87_carry_fxch_loop": (
+        "b902000000",  # MOV ECX, 2
+        "d9e8",        # FLD1                <- loop top
+        "d9e8",        # FLD1
+        "d9c9",        # FXCH ST(1)
+        "49",          # DEC ECX
+        "75f7",        # JNZ -9 -> loop top
+        "d95b04",      # FSTP dword [EBX+4]
+        "c3",
+    ),
+    # Live value and popped residue carried on a loop backedge.
+    "x87_carry_backedge_live": (
+        "b903000000",  # MOV ECX, 3
+        "d9e8",        # FLD1                <- loop top
+        "d9e8",        # FLD1
+        "dec1",        # FADDP ST(1), ST(0)
+        "49",          # DEC ECX
+        "75f7",        # JNZ -9
+        "d95b04",      # FSTP dword [EBX+4]
+        "c3",
+    ),
+    # Cull-style FCOMP / FNSTSW AX / TEST AH,1 / JE with a live value still on
+    # the stack at the branch.
+    "x87_carry_fcomp_branch": (
+        "d9e8",        # FLD1
+        "d906",        # FLD dword [ESI]
+        "d81e",        # FCOMP dword [ESI]
+        "dfe0",        # FNSTSW AX
+        "f6c401",      # TEST AH, 1
+        "7402",        # JE +2 -> FSTP
+        "dec1",        # FADDP ST(1), ST(0)
+        "d95b04",      # FSTP dword [EBX+4]
+        "c3",
+    ),
+    # Popped dirty registers must still be retagged empty after a carried
+    # join; path A pushes again while path B leaves the residue.
+    "x87_carry_pop_tag": (
+        "d9e8",        # FLD1
+        "d9e8",        # FLD1
+        "d9e8",        # FLD1
+        "dec1",        # FADDP ST(1), ST(0)  -> result, one residue
+        "dec1",        # FADDP ST(1), ST(0)  -> result, two residues
+        "a901000000",  # TEST EAX, 1
+        "7402",        # JZ +2 -> FSTP
+        "d9e8",        # FLD1 (path A overwrites the popped slot)
+        "d95b04",      # FSTP dword [EBX+4] (join)
+        "c3",
+    ),
+    # A branch whose join target needs a slot only another predecessor
+    # dirtied (FXCH reaches the entry ST0). Materializing it for the join must
+    # not disturb the check of the other, fallthrough target (CRT __nan2 shape).
+    "x87_carry_join_reads_other_slot": (
+        "d95b08",      # FSTP dword [EBX+8] (pop, then reload at the same depth)
+        "d906",        # FLD dword [ESI]
+        "a901000000",  # TEST EAX, 1
+        "740b",        # JZ +11 -> FSTP (join)
+        "d9c9",        # FXCH ST(1)
+        "a902000000",  # TEST EAX, 2
+        "7402",        # JZ +2 -> FSTP (join)
+        "d9e0",        # FCHS
+        "d95b04",      # FSTP dword [EBX+4] (join)
+        "c3",
+    ),
+    # A loop that pushes every iteration: the join window must overflow and
+    # fall back to the exact flush/reset instead of growing forever.
+    "x87_carry_unbalanced_loop": (
+        "b903000000",  # MOV ECX, 3
+        "d9e8",        # FLD1                <- loop top
+        "49",          # DEC ECX
+        "75fb",        # JNZ -5 -> loop top
+        "d95b04",      # FSTP dword [EBX+4]
+        "c3",
+    ),
 }

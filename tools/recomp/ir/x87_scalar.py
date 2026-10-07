@@ -2,10 +2,12 @@
 
 Slots are named relative to a captured entry TOP. Push/pop/copy change this
 compile-time mapping, not the physical CPU array. Values, exact-integer shadows,
-tags and popped residue are written back before edges, division seams, calls,
-opaque effects and exits. Only CW/SW helpers use a private nonescaping X86
-context; no helper receives it unless its recipe accesses those two fields
-exclusively.
+tags and popped residue are written back before calls, division seams, opaque
+effects and exits. In performance mode the tracker also carries unpublished
+state across internal CFG edges as a fixed-point join shape (`x87_carry.py`);
+strict mode and the ceiling subclass keep publishing at every edge. Only CW/SW
+helpers use a private nonescaping X86 context; no helper receives it unless its
+recipe accesses those two fields exclusively.
 
 This is an instruction-derived representation change, not dead-state removal,
 memory forwarding, a native call ABI or a floating-point approximation.
@@ -17,11 +19,13 @@ form. This is the decoded `x87_locals.py` contract, which also leaves x87 state
 unpublished at arena accesses. A runtime that exposes x87 state at accesses
 must use the strict form.
 
-DIVERGENCE(original): [ssa-x87-scalar] performance mode publishes at
-control-flow edges, division seams, calls, opaque effects and exits, but not at
-loads or stores. Interior access faults and store watch callbacks may see the
+DIVERGENCE(original): [ssa-x87-scalar] performance mode publishes at calls,
+division seams, opaque effects and exits, and carries unpublished x87 state
+across internal CFG edges instead of publishing there; loads and stores still
+do not publish. Interior access faults and store watch callbacks may see the
 preceding published x87 state, within the agreed performance-mode contract.
-observe_loads=True (strict) keeps publication before every guest access.
+observe_loads=True (strict) keeps publication before every guest access, and
+the ceiling subclass keeps the per-edge flush.
 
 DIVERGENCE(original): [ssa-x87-binary32] common PC=00 arithmetic with proven
 binary32 operands uses the documented float exponent-range policy. Other
@@ -56,6 +60,107 @@ class Slot:
     dirty: set = field(default_factory=set)
 
 
+#: Slot components carried across an internal CFG edge.
+PARTS = ("value", "bits", "exact", "tag")
+PART_TYPES = {"value": "double", "bits": "uint64_t",
+              "exact": "uint8_t", "tag": "unsigned"}
+#: Literal expressions whose agreement survives a join (the convention flush
+#: tests `slot.exact != "0"`, so `0`/`FTAG_EMPTY`/`1` must stay constants).
+CARRY_LITERALS = frozenset(("0", "1", "FTAG_EMPTY"))
+
+
+@dataclass(frozen=True)
+class SlotShape:
+    """Unpublished parts of one physical slot, keyed by relative position."""
+    parts: frozenset = frozenset()          # dirty parts that must be carried
+    narrow: bool = False
+    const: tuple = ()                       # sorted (part, literal) agreements
+
+
+@dataclass(frozen=True)
+class CarryShape:
+    """Canonical x87 state at a block entry, relative to the runtime TOP.
+
+    Slots are keyed by signed relative position `p` (0 = ST(0), negative =
+    popped residue). Only parts that still need publishing are carried; clean
+    parts are reloaded from `c` on demand. Counters are relative to the same
+    reference and merge conservatively."""
+    active: bool
+    slots: tuple = ()                       # sorted ((p, SlotShape), ...)
+    base: int = 0
+    low: int = 0
+    high: int = 0
+    # Predecessors disagree on the last published TOP relative to this one,
+    # so the next flush must publish TOP even if `position == base`.
+    top_unknown: bool = False
+    status_dirty: bool = False
+
+
+#: No predecessor carries x87 state (all inactive/reset).
+INACTIVE = CarryShape(False)
+#: A merged join that exceeds the eight-slot window; callers must reset.
+UNSAFE = object()
+
+
+def carry_var(position, part):
+    """Stable function-scope C name for one carried slot component."""
+    tag = "m%d" % -position if position < 0 else "%d" % position
+    return "x87c%s_%s" % (tag, part)
+
+
+def merge_shapes(shapes):
+    """Merge predecessor edge shapes into a block entry shape.
+
+    Known parts and dirty flags union, `narrow` intersects, counters take the
+    conservative extremes (min base/low, max high) and activity/dirty flags
+    OR. Returns ``None`` when a predecessor is still unknown and ``UNSAFE``
+    when the merged window cannot be represented by eight physical slots."""
+    known = [s for s in shapes if s is not None]
+    if len(known) != len(shapes) or not known:
+        return None
+    if not any(s.active for s in known):
+        return INACTIVE
+    slots = {}
+    for shape in known:
+        if not shape.active:
+            continue
+        for p, slot in shape.slots:
+            slots.setdefault(p, []).append(slot)
+    merged = []
+    for p in sorted(slots):
+        entries = slots[p]
+        parts = frozenset().union(*(e.parts for e in entries))
+        narrow = all(e.narrow for e in entries)
+        const = []
+        for part in sorted(parts):
+            literals = set()
+            ok = True
+            for e in entries:
+                agreement = dict(e.const)
+                if part not in e.parts or part not in agreement:
+                    ok = False
+                    break
+                literals.add(agreement[part])
+            if ok and len(literals) == 1:
+                const.append((part, literals.pop()))
+        merged.append((p, SlotShape(parts, narrow, tuple(const))))
+    positions = [p for p, _ in merged]
+    # An inactive predecessor activates at the edge with everything published
+    # at its current TOP, i.e. relative base/low/high of zero.
+    low = min(s.low if s.active else 0 for s in known)
+    high = max(s.high if s.active else 0 for s in known)
+    base = min(s.base if s.active else 0 for s in known)
+    if (high - low >= 8 or (positions and max(positions) - min(positions) >= 8)):
+        return UNSAFE
+    # An inactive predecessor has published its current TOP (relative base 0).
+    # The min base only widens popped-tag publication; TOP itself needs an
+    # explicit flag when the predecessors' published TOPs differ.
+    published = {s.base if s.active else 0 for s in known}
+    top_unknown = len(published) > 1 or any(s.top_unknown for s in known)
+    return CarryShape(True, tuple(merged), base, low, high, top_unknown,
+                      any(s.status_dirty for s in known))
+
+
 class X87Scalar:
     """Track all eight physical residues within a single-entry linear region."""
 
@@ -74,6 +179,7 @@ class X87Scalar:
         self.active = False
         self.top = 0
         self.top_dirty = False
+        self.top_unknown = False  # see CarryShape.top_unknown
         # Unbounded stack positions relative to the region's captured TOP
         # (negative = pushed). `base` is the last published TOP, `low` the
         # deepest push since then and `high` the highest position accessed.
@@ -171,9 +277,9 @@ class X87Scalar:
             masks = " | ".join("(3u << (2u * (%s)))" % phys for phys, _ in tags)
             values = " | ".join("((%s) << (2u * (%s)))" % (tag, phys) for phys, tag in tags)
             lines.append("c->fpu_tag = (uint16_t)((c->fpu_tag & ~(%s)) | %s);" % (masks, values))
-        if self.position != self.base:
+        if self.position != self.base or self.top_unknown:
             lines.append("c->fpu_top = (%s);" % self._phys(self.top))
-        self.top_dirty = False
+        self.top_dirty = self.top_unknown = False
         self.base = self.low = self.high = self.position
         if self.status_dirty:
             lines.append("c->fpu_sw = x87_env_.fpu_sw;")
@@ -202,14 +308,94 @@ class X87Scalar:
             masks = " | ".join("(3u << (2u * (%s)))" % phys for phys, _ in tags)
             values = " | ".join("((%s) << (2u * (%s)))" % (tag, phys) for phys, tag in tags)
             lines.append("c->fpu_tag = (uint16_t)((c->fpu_tag & ~(%s)) | %s);" % (masks, values))
-        if self.top_dirty:
+        if self.top_dirty or self.top_unknown:
             lines.append("c->fpu_top = (%s);" % self._phys(self.top))
-            self.top_dirty = False
+            self.top_dirty = self.top_unknown = False
         self.base = self.low = self.high = self.position
         if self.status_dirty:
             lines.append("c->fpu_sw = x87_env_.fpu_sw;")
             self.status_dirty = False
         return lines
+
+    def snapshot(self):
+        """Current unpublished state as a carry shape relative to the live TOP.
+
+        Under the MSVC convention a popped register only needs its empty tag
+        retagged; its value, bits and exact shadow are relaxed and dropped so a
+        join does not copy dead residue. Live slots carry every dirty part."""
+        if not self.active:
+            return INACTIVE
+        slots = []
+        for offset, slot in self.slots.items():
+            if not slot.dirty:
+                continue
+            position = self.low + ((offset - self.low) & 7) - self.position
+            parts = frozenset(slot.dirty)
+            if position < 0 and self.convention:
+                # Only the MSVC convention relaxes popped residue. With an exact
+                # flush (msvc_convention=False or FINCSTP/FDECSTP) the successor
+                # must be able to republish the popped value, bits and shadow.
+                parts &= frozenset(("tag",))
+                if not parts:
+                    continue
+            const = tuple((part, getattr(slot, part)) for part in sorted(parts)
+                          if getattr(slot, part) in CARRY_LITERALS)
+            slots.append((position, SlotShape(parts, slot.narrow, const)))
+        slots.sort()
+        return CarryShape(True, tuple(slots), self.base - self.position,
+                          self.low - self.position, self.high - self.position,
+                          self.top_unknown, self.status_dirty)
+
+    def seed(self, shape, exprs=None):
+        """Replace this tracker with a carried shape from a block entry.
+
+        `exprs` maps (position, part) to the fresh C local holding the carried
+        value; const parts come from the shape. With no `exprs` (fixed-point
+        replay) placeholder expressions stand in for the locals."""
+        self.reset()
+        if not shape.active:
+            return
+        self.active = True
+        self.top = 0
+        self.position = 0
+        self.base, self.low, self.high = shape.base, shape.low, shape.high
+        self.top_unknown = shape.top_unknown
+        self.status_dirty = shape.status_dirty
+        for position, slot_shape in shape.slots:
+            slot = Slot(narrow=slot_shape.narrow, dirty=set(slot_shape.parts))
+            agreements = dict(slot_shape.const)
+            for part in slot_shape.parts:
+                if part in agreements:
+                    expr = agreements[part]
+                elif exprs is not None:
+                    expr = exprs[(position, part)]
+                else:
+                    expr = "_"
+                setattr(slot, part, expr)
+            self.slots[position & 7] = slot
+
+    def normalize(self, lines):
+        """Activate or re-anchor the tracker to the current physical TOP.
+
+        Afterward `top == position == 0` and slot keys are relative positions,
+        so an edge can publish `x87_top_` and index `slots` consistently even
+        when predecessors reached the block from different activations."""
+        if not self.active:
+            lines.extend(["x87_top_ = c->fpu_top;",
+                          "x87_env_.fpu_cw = c->fpu_cw;",
+                          "x87_env_.fpu_sw = c->fpu_sw;"])
+            self.active = True
+            return
+        if self.top != 0:
+            lines.append("x87_top_ = (x87_top_ + %du) & 7u;" % self.top)
+            self.slots = {((offset - self.top) & 7): slot
+                          for offset, slot in self.slots.items()}
+        delta = self.position
+        self.top = 0
+        self.position -= delta
+        self.base -= delta
+        self.low -= delta
+        self.high -= delta
 
     def statements(self, data, address=None, result=None):
         """Lower common audited effects; materialize before other runtime recipes."""
