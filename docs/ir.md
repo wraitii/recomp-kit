@@ -1,107 +1,59 @@
-# Instruction IR and calling-convention analysis
+# Instruction IR, SSA and calling-convention analysis
 
-`tools/recomp/ir/` is an experimental frontend over the same original image
-bytes and instruction boundaries used by the production translator. It currently
-provides lifting, a whole-image calling-convention census, integer SSA and an
-opt-in C emitter for the mapped corpus and admitted production functions.
-Production discovery and fallback C use the existing decoded-instruction
-frontend. Census coverage is analysis evidence,
-not execution, equivalence or a measured performance gain.
+`tools/recomp/ir/` is a frontend over the same original image bytes and
+instruction boundaries the production translator uses. It provides lifting, a
+whole-image calling-convention census, integer SSA with scalar x87 tracking, and
+a C emitter for the mapped function corpus and for admitted production
+functions. Discovery, entry ownership and fallback C stay with the decoded
+instruction frontend. Census coverage is analysis evidence, not execution,
+equivalence or a performance claim. Game measurements and the optimization plan
+live in the game repository's working doc (`docs/translation-optimization.md`).
 
 ## Lifting
 
 `lift.py` uses pinned `pypcode` SLEIGH semantics for 32-bit x86. Each operation
-has an opcode, optional output and input varnodes `(space, offset, size)`.
-Memory, register byte lanes and arithmetic flags remain explicit. Instruction
-boundaries come from the translator's resolved functions; no alternate decoder
-boundaries or guessed game entry points are introduced. Folded WAIT prefixes
-are lifted in instruction order.
+has an opcode, optional output and input varnodes `(space, offset, size)`;
+memory, register byte lanes and arithmetic flags stay explicit. Boundaries come
+from the translator's resolved functions; no alternate decoder boundaries or
+guessed entry points are introduced. Folded WAIT prefixes lift in order.
 
-The frontend folds same-operand identities such as `XOR EBX,EBX`, while keeping
-consumed carry dependencies such as `SBB EAX,EAX`. It normalizes the physical
-x87 register shuffles into pre-instruction `stin(i)` and post-instruction
-`stout(i)` slots plus a signed stack-depth change. Diagnostic FPU pointer and
-opcode writes are omitted under the documented diagnostic-snapshot tradeoff.
-These omissions must remain explicit if a future consumer observes that state.
+The frontend folds same-operand identities such as `XOR EBX,EBX` but keeps
+consumed carry dependencies such as `SBB EAX,EAX`. It normalizes x87 register
+shuffles into pre-instruction `stin(i)` and post-instruction `stout(i)` slots
+plus a signed depth change. Diagnostic FPU pointer and opcode writes are omitted
+under the documented diagnostic-snapshot tradeoff.
 
-Raw SLEIGH is not yet a faithful replacement for the kit's x87 runtime semantics.
-FIST/FISTP and FRNDINT rounding, FPREM quotient truncation, FCOM/FNCLEX status
-merging, FXAM classification and tags require correction before code generation
-uses them directly. `x87.py` now corrects these shapes for code generation by
-lowering byte-backed operands to ordered effects using the audited runtime
-helpers; raw lifting/census still retain the gaps. Slot-depth normalization
-alone does not establish floating-point
-value or exception equivalence.
+Raw SLEIGH is not a faithful replacement for the runtime's x87 semantics
+(FIST/FISTP, FRNDINT, FPREM, FCOM/FNCLEX status, FXAM, tags). `x87.py` corrects
+these for code generation by lowering byte-backed operands to ordered effects
+that call the audited runtime helpers; raw lifting and the census keep the gaps.
+SLEIGH also omits arithmetic AF; the C emitter supplies AF for its supported
+ADD/SUB/INC/DEC/SBB/ADC/NEG/CMP shapes. Raw lifting and census AF facts are not
+code-generation proofs.
 
-SLEIGH also omits arithmetic AF definitions. The experimental C consumer supplies
-AF for its supported ADD/SUB/INC/DEC/SBB/ADC, NEG and CMP shapes, including folded
-same-operand arithmetic, capturing operands before a destination changes. INC
-and DEC retain CF. Additional integer corrections are described below.
-Raw lifting and census summaries still have this gap;
-their AF preservation facts are not code-generation proofs.
+## Summaries and census
 
-## Summaries
+`summary.py` does forward abstract value tracking and backward byte-lane
+liveness over the translator's CFG, including resolved jump tables. A summary
+records register/flag inputs, preserved GPRs, stack argument extent and purge,
+x87 input depth and depth change, and known exit register/stack values. Forward
+values are constants, entry registers plus offsets, import-slot loads and aligned
+stack bases (`(entry ESP + anchor) & -alignment` with an independent offset,
+never a guessed entry-relative offset). Direct callees are analyzed before
+callers; recursive components iterate to a bounded fixed point. Failed callee
+summaries are not reliable facts, and unknown tail targets keep unknown purge and
+x87 effects.
 
-`summary.py` performs forward abstract value tracking and backward strong
-liveness over the translator's CFG, including its resolved jump tables.
-Summaries record register/flag inputs, preserved GPRs, stack argument extent,
-stack purge, x87 input depth and depth change, and known exit register/stack
-values. Liveness distinguishes register byte lanes internally; exported register
-inputs currently aggregate those lanes into register names.
+`imports.py` reads cleanup metadata from literal `ImportShim` arrays in the
+runtime and DirectX sources; conflicts or unsupported expressions stay unknown.
+`argc_stdcall` gives cleanup bytes and a conservative argument extent;
+`ARGC_CDECL` gives zero cleanup, not an argument count. Unknown calls assume the
+standard Win32 preserved-register set, infer cleanup from pushes and caller
+cleanup, and add no register inputs. These assumptions limit what `ok` and
+`standard` mean: neither proves guest state can be discarded at a call, and the
+reader is a census input, not authorization for an optimized call ABI.
 
-Forward values describe constants, entry registers plus offsets, absolute
-memory loads used to identify imports, and aligned stack bases. An aligned
-base is `(entry ESP + anchor) & -alignment`, with an independent offset. It
-never becomes a guessed entry-relative offset. Push/pop traffic below that
-base remains traceable, including a saved frame pointer that contains the
-pre-alignment ESP. `MOV ESP,EBP` or LEAVE restores the original coordinate
-system. Stores invalidate tracked slots on another base whenever their possible
-byte ranges overlap. A return that still depends on an aligned ESP fails exact
-purge analysis.
-
-Direct callees are analyzed before callers. Recursive strongly connected
-components iterate to a bounded fixed point. Failed callee summaries are not
-used as reliable facts; agreeing syntactic RET operands can still supply their
-cleanup. Unknown tail targets retain unknown purge and x87 effects rather than
-inventing zero effects. Failed known functions and missing function targets have
-separate diagnostics. RET's implicit return-address fetch is excluded from the
-explicit return-address-read diagnostic; an ordinary load or pop of that address
-still counts.
-
-Stack-slot liveness prevents saved registers and `push ecx` local reservations
-from automatically becoming inputs. It tracks known exit values from helpers
-that construct their caller's frame as well as ordinary frame-pointer prologues.
-
-## Import metadata and assumptions
-
-`imports.py` reads cleanup metadata from literal `ImportShim` arrays in the kit's
-runtime and DirectX sources, including their supported single-DLL macros. Keys
-include both the lowercase DLL and exact export name. Conflicts or unsupported
-expressions stay unknown. The translator retains the DLL for each named IAT
-slot and rebases its address alongside the import name.
-
-A numeric `argc_stdcall` specifies both cleanup bytes and a conservative stack
-argument extent. `ARGC_CDECL` specifies zero cleanup, not an argument count;
-argument pushes remain call-site evidence. This reader does not recover return
-types, x87 results, register inputs, callbacks, or runtime registration overrides.
-It is a census input, not sufficient authorization for an optimized call ABI.
-
-Unknown calls assume the standard Win32 preserved-register set. Cleanup without
-metadata is inferred from pushes and immediate caller cleanup. A bounded
-straight-line lookahead also recognizes trailing import arguments pushed before
-a getter call: when the next literal IAT call consumes exactly the earlier and
-later push group, the getter is inferred to pop zero. Branches, other stack
-updates and unrelated calls stop this inference. An unresolved
-float return is inferred when the next x87 instruction consumes it. Unknown
-calls do not add register inputs, so a future emitter must still pass current
-register values at opaque boundaries. Saved-register slots are assumed immune
-to opaque callee/pointer stores; escaped local stack storage is conservatively
-live. These assumptions and unknown effects limit the meaning of `ok` and
-`standard`: neither is a proof that all guest state can be discarded at a call.
-
-## Census and validation
-
-Run from a kit checkout, supplying the game repository and private image:
+Run the census from a kit checkout, supplying the game repository and image:
 
 ```sh
 /path/to/game/tools/.venv/bin/python tools/recomp/translate.py \
@@ -109,308 +61,145 @@ Run from a kit checkout, supplying the game repository and private image:
   --ir-census /path/to/game/analysis/ir-census/census.json
 ```
 
-The JSON includes per-function summaries, overlapping reason counters, and
-mutually exclusive categories: failed, standard, nonstandard with entry EBP
-input, and other nonstandard. Entry EBP inputs include unwind funclets that use
-a parent's frame. That input trait alone does not establish unwinder-only
-reachability; the kit does not classify them by game-specific address ranges.
-The report also records how many named IAT slots have known cleanup metadata.
-
-Synthetic tests in `tools/recomp/tests/test_ir_summary.py` exercise actual
-instruction bytes through SLEIGH, including aligned frames, partial aliasing,
-frame-building helpers, recursion, imports and tail fallback. They run in the
-portable test suite. The driver relocation tests check both IAT names and DLLs.
-Whole-image census runs test analysis coverage, without executing the game.
+The JSON has per-function summaries, overlapping reason counters and exclusive
+categories (failed, standard, nonstandard with entry EBP input, other
+nonstandard). Entry EBP input alone does not classify a function as an unwind
+funclet. `tools/recomp/tests/test_ir_summary.py` checks the analyses on real
+instruction bytes.
 
 ## SSA and C emission
 
-`ssa.py` builds SSA over reachable integer p-code using the supplied instruction
-CFG. Registers and instruction-local unique storage use byte lanes, preserving
-AL/AH/AX/EAX aliases and overlapping unique reads/writes. Each instruction starts
-as a block; joins have phi values, including a virtual entry predecessor for
-backedges to the function entry. An optional register-group pass carries complete
-registers through entry values and phis; byte lanes remain the aliasing interface
-for partial writes and snapshots. Trivial phis are simplified. LOAD and STORE
-thread an explicit memory token; no inter-instruction forwarding or store removal
-occurs. Corrected x87 effects thread that same token. FPU state remains resident
-in the CPU object at observations; the scalar x87 tracker is described
-below. Raw FLOAT operations, unbound calls, user operations, unbound indirect
-transfers and intra-instruction control flow remain rejected. Bound direct calls
-and, under the emitter's explicit `indirect_call_symbol` opt-in, indirect calls
-publish tracked state, run the declared callee or `recomp_call`, and reload all
-tracked lanes and flags; no calling-convention summary permits dropping state.
+`ssa.py` builds SSA over reachable integer p-code on the instruction CFG.
+Registers and instruction-local unique storage use byte lanes, preserving
+AL/AH/AX/EAX aliasing. Each instruction is a block; joins have phis, with a
+virtual entry predecessor for backedges to the entry. LOAD, STORE and corrected
+x87 effects thread one memory token; there is no memory forwarding or store
+removal. Raw FLOAT operations, unbound calls, user operations, unbound indirect
+transfers and intra-instruction control flow are rejected (whole-function
+fallback with a named reason).
 
-`emit_c.py` lowers integer values to unsigned, width-masked C, with staged
-parallel phi copies on edges. Comparisons use sign-bit bias and p-code shifts
-guard counts outside the value width, avoiding signed overflow and oversized C
-shifts. Register SHL/SHR retain masked counts, zero-count flags and AF, and use
-the existing runtime's deterministic OF recipe for nonzero counts (OF is
-architecturally undefined for counts greater than one). Unsigned dword DIV
-lowers to an explicit `DIV32` effect using checked `div32`, with CPU publication
-and packed quotient/remainder results. Division by zero and quotient overflow
-reach the existing error seam with the original instruction address, rather
-than unchecked C division. Signed dword IDIV uses the same ordered model with checked `idiv32`; narrow
-divisions remain unsupported. CDQ, IMUL and all SETcc conditions are admitted.
-Register NEG restores AF; register SAR preserves zero-count flags and uses the
-existing runtime OF recipe for nonzero counts. P-code arithmetic shifts use
-unsigned sign-bit bias with explicit saturation, without C signed overflow or
-x86 count remasking. Memory NEG/SAR remain named fallbacks.
-MOVSX/MOVZX, register XCHG, NOT, LEAVE, register-destination ADC and ordinary
-memory-source arithmetic are also admitted. Sign extension uses unsigned
-sign-bit bias and width masks, without signed-overflow assumptions. Memory
-ADD/SUB/INC/DEC use an instruction-local correction: SLEIGH's repeated LOADs
-of the same RMW operand become copies of one captured read/result, and flag
-assignments occur after the guest STORE, matching the existing emitter's fault
-and watch snapshots. This is not general memory forwarding. Other RMW shapes
-and implicit-lock memory XCHG retain named fallback diagnostics.
+`emit_c.py` lowers integer values to unsigned, width-masked C with staged
+parallel phi copies. Comparisons and arithmetic shifts use sign-bit bias and
+saturating counts, avoiding signed overflow and oversized shifts. Shifts keep
+masked counts, zero-count flags, AF and the runtime's deterministic OF recipe.
+Dword DIV/IDIV lower to checked `div32`/`idiv32` effects that reach the existing
+error seam with the original address and reload all tracked state afterwards;
+narrow division is unsupported. CDQ, IMUL, SETcc, MOVSX/MOVZX, XCHG, NOT, LEAVE,
+ADC and CLD/STD are admitted. Memory ADD/SUB/INC/DEC use one captured read and
+emit flags after the guest STORE, matching the decoded emitter's fault and watch
+snapshots. Dword `MOVSD`/`REP MOVSD` call the runtime helpers in
+access-then-advance order. Other RMW shapes, locked XCHG, SSE `MOVSD` and other
+string widths stay named fallbacks.
 
-Production SSA additionally admits three audited effects. A direct or indirect
-`CALL` publishes the pre-call CPU, dispatches through the bound entry thunk or
-the explicit `indirect_call_symbol` (`recomp_call` for production), and reloads
-every tracked lane/flag and the memory token; an indirect target must be a
-readable 32-bit value with a canonical fallthrough, and raw/unbound `CALLIND`
-stays fallback. Checked `DIV32`/`IDIV32` reload all tracked state after the
-helper, so a returning divide-error handler that mutates non-EAX/EDX state is
-observed; narrow and unsupported division shapes remain fallbacks. Dword
-`MOVSD` string moves (bare `A5`, REP `F3 A5`, named `MOVSD` or `MOVSD.REP`)
-lower to the existing `movsd`/`rep_movsd` runtime helpers in
-access-then-advance order with publication and full reload; SSE `MOVSD`, other
-string widths and address-size/unsupported prefixes stay fallbacks. `CLD` and
-`STD` are admitted as plain DF writes. These effects keep the eager comparison
-body as the oracle; they add no inferred calling convention and no new
-floating-point relaxation.
-Guest accesses use the runtime's ordered read/write helpers and publish
-known CPU fields before each access and on return. A conservative publication
-analysis omits field stores only when their values are already published on
-every incoming path. It also uses wider register phis, width-aware
-canonicalization and dead-value elimination, without summary-driven calls.
-The mapped corpus binds reviewed callees directly; the production adapter below
-uses existing entry dispatch and rejects unsupported host-frame contracts.
-State publication
-alone does not establish interior fault equivalence with the existing emitter;
-instruction-level update order still requires differential fault checks.
+Calls and boundaries:
 
-Run through the game build wrapper, using its Python environment:
+- A direct `CALL` requires an explicit `call_symbols` map from 32-bit target to C
+  symbol and its canonical fallthrough. It publishes the pre-call CPU, calls the
+  symbol, and reloads every tracked lane, flag and the memory token; the callee
+  owns ESP cleanup and EIP restoration. Unbound calls fail closed.
+- `indirect_call_symbol` (production passes `recomp_call`) opts in to indirect
+  calls: the target must be a readable 32-bit value with a canonical fallthrough.
+  Without it they fail closed. `resumable_stacks` checks EIP before continuing.
+- No calling-convention summary permits dropping state at a call. The corpus binds
+  independently reviewed callees in the same mode; production dispatch goes
+  through stable entry thunks (`CALL_FN`).
+- SLEIGH's absolute `ram` memory operands are normalized to one captured read or
+  an explicit store; absolute RMW with flag writes is rejected.
 
-```sh
-/path/to/game/tools/.venv/bin/python tools/build.py --game-dir /path/to/game \
-  --function-corpus MANIFEST --corpus-ir-ssa --corpus-trial-ms 0
-```
+State publication alone does not establish interior-fault equivalence with the
+decoded emitter. `emit(..., optimize=False)` is the raw SSA emission used for pass
+comparisons; `publish_changed=False` and `wide_registers=False` disable those
+passes individually.
 
-The flag replaces the combined variant only when the entire function is
-supported. Otherwise the existing emitter supplies that whole function. JSON
-records an `ir_ssa` emitted/fallback result and reason per function; Markdown
-reports the emitted count. This mode runs separately from decoded-dataflow
-experiments. The eager variant remains the full CPU/scratch-state oracle.
+### Corrected x87 effects
 
-`test_ir_ssa.py` exercises actual instruction bytes, partial registers, wrapping
-arithmetic/AF, loop backedges to entry, memory alias order, overlapping uniques,
-instruction-local temporary lifetimes and conservative rejection. Its small
-SSA interpreter checks independently expected results. Native corpus checks
-exercise the admitted real functions. `tools/build.py --ir-ssa-checks` builds
-byte-backed synthetic fixtures against eager C, comparing every CPU field
-and 2 KiB of scratch for 24576 inputs per fixture. They cover register aliases,
-loops, memory aliases, INC/DEC and carry-dependent subtraction, variable and
-immediate shifts, and unsigned division. A mocked error handler records the
-complete CPU and fault address, then returns having changed EAX/EDX and other
-GPRs/flags; zero-divisor and overflow cases check both the snapshot and
-continuation, and every tracked field is reloaded from the helper's result
-state. A read-only native
-watch callback compares complete CPU snapshots, addresses, widths and values at
-every store, including division-handler stores. Branch joins, loop publication
-and partial-word updates have explicit fixtures. Eighteen x87 fixtures exercise
-all TOP/PC/RC combinations, randomized status and exact-integer metadata, special
-and finite memory inputs, 32/64/80-bit floating memory, integer conversions,
-register directions, remainder, comparison, classification and control words.
-Float stores retain their actual `wrf*` accessors; the watch callback observes
-integer stores rather than inventing watch calls for float stores. This does not
-validate real guest SEH or handlers that mutate other state. Original-x86 and
-interior memory-fault differential checks remain to be added.
+`Insn.raw` keeps the original bytes so `x87.py` can recover memory width, address
+and register-operand direction (FS/GS and 16-bit addressing are rejected).
+`X87_MEM` and `X87_REG` are ordered effects with structured operand descriptors;
+they share the memory token with guest accesses. They use the eager runtime's
+`fx87` precision and NaN rules, `fdivz`, `fset`, tags, exact-FILD metadata, FIST
+and FRNDINT rounding, status merging, FXAM and partial FPREM; no approximation is
+added. FCOMI/FCMOV, transcendental and environment operations stay fallbacks.
 
-## Corrected x87 effects
+### Scalar x87 and local CPU state
 
-`Insn.raw` retains private original bytes for operand validation. `x87.py` decodes
-only those bytes, at the supplied boundary, to recover memory width, address and
-register operand direction. A folded WAIT prefix is accepted in instruction
-order. Memory address expressions become width-masked integer p-code. FS/GS and
-16-bit address forms are rejected; they need an explicit segment model.
+Scalar x87 (`x87_scalar.py`) is the optimized lowering; the raw path keeps ordered
+helpers. It replaces physical push/pop/copy updates with scalar values indexed
+relative to the entry TOP, tracking all eight physical residues, tags and
+exact-integer shadows. CW/SW helpers use a private non-escaping environment.
+Stores, CFG edges, division seams, calls and returns materialize required FPU
+state; opaque recipes materialize and invalidate the tracker. Values survive a
+read-only access but not joins or opaque calls. Under PC=00, operations on
+proven-binary32 operands use native float add/sub/mul plus the runtime's
+NaN/status normalization when a linear run has at least two arithmetic effects;
+division and unproven operands use the double helpers.
 
-`X87_MEM` and `X87_REG` are first-class ordered effects, with validated structured
-operand descriptors rather than C snippets. Their shared token keeps x87 effects
-and guest accesses in instruction order. CPU publication occurs before an x87
-memory effect; FPU state is already resident in `c`. Register operations call the
-runtime helpers without publishing unrelated integer fields. FNSTSW AX returns
-an integer SSA value and updates AX through the existing partial-register model.
+The `locals` state policy defers GPR/flag publication at ordinary integer and
+x87 reads, keeping EIP/ESP/EBP for diagnostics. Store, division, call and return
+snapshots stay complete. The must-analysis never claims a skipped field was
+published, so dead-value elimination can drop intermediate flags overwritten
+before a real observer.
 
-This path uses the same `fx87` precision/NaN rules, `fdivz` exceptions, `fset`,
-push/pop/copy tags, exact FILD metadata, FIST/FRNDINT rounding, FCOM/FNCLEX status
-merging, FXAM classification and partial FPREM behavior as eager C. It inherits
-the documented binary64 x87 representation; it does not add an approximation.
-It does not emit raw SLEIGH FLOAT arithmetic or silently discard popped residue.
-Unsupported transcendental/environment operations, FCOMI/FCMOV, locked integer
-operations and unbound calls retain whole-function fallback. General floating
-SSA across CFG joins remains future work; the bounded value and publication
-passes below keep the same full-state observation contract.
+Policies and where they apply:
 
-## Direct calls and absolute memory
+| Setting | Values | Meaning |
+| --- | --- | --- |
+| `ir_ssa_x87` | `scalar` (default), `scalar-strict` | strict publishes x87 state before loads and uses general arithmetic recipes |
+| `ir_ssa_state` | `locals` (default), `strict` | strict keeps every pre-access GPR/flag snapshot |
 
-The emitter requires an explicit `call_symbols` map of 32-bit guest targets to
-C identifiers. The mapped corpus supplies only independently reviewed declared
-callees, each translated in the same mode. A call requires its exact mapped
-fallthrough; unbound and missing-continuation calls fail closed. Production
-binds `indirect_call_symbol` to `recomp_call`, which validates the 32-bit target
-and reloads all tracked state; without that opt-in indirect calls fail closed.
-The guest return-address store remains ordered and observable. Callees own
-ESP cleanup and EIP restoration. All tracked register lanes and flags are
-reloaded afterward, and the scalar x87 state is flushed. Resumable mode checks
-EIP before continuing. Corpus bindings do not provide production dispatch,
-hooks, SEH, imports or a summary-based call ABI. The production adapter binds
-ordinary direct calls through stable entry thunks.
-
-SLEIGH can encode an absolute memory operand as a `ram` varnode rather than an
-explicit LOAD/STORE. Codegen normalizes source operands to one captured read
-shared by flag/result consumers, and pure destinations to explicit stores.
-Single-operation NOT is supported; absolute destination RMW with flag writes
-is rejected pending ordered-store corrections. Raw census input is unchanged.
-The SSA builder rejects unnormalized data-position `ram`, preventing addresses
-from being silently used as loaded values.
-
-## Scalar x87 and local CPU state
-
-The scalar x87 tracker (the default and the only optimized x87 lowering;
-`optimize=False` keeps ordered runtime helpers) replaces physical x87
-push/pop/copy updates with scalar values indexed relative to entry TOP. It tracks
-all eight physical residues, tags and exact-integer shadows, including wrapped
-copies and popped contents. CW/SW helpers use a private nonescaping environment.
-All guest accesses remain ordered. Stores, CFG edges, division seams, calls and
-returns materialize the required FPU state; opaque recipes materialize and
-invalidate the tracker. Scalar values can survive a read-only access, but not
-joins or opaque calls. No floating SSA phis or memory forwarding are introduced.
-
-Under PC=00, operations on proven binary32 operands can use one native float
-addition/subtraction/multiplication plus the runtime's NaN/status normalization.
-Other precision settings and unproven operands use the existing double helpers.
-Division is unchanged. PC=00 alone never proves an incoming operand's width.
-Specialization requires at least two arithmetic effects in a linear run before
-an observation boundary, avoiding selector overhead for isolated operations.
-`scalar-strict` keeps pre-load publication and the general arithmetic recipes.
-
-The `locals` state policy (default) separately defers GPR/flag publication at ordinary
-integer and x87 reads, retaining EIP/ESP/EBP for diagnostics. Required store,
-division, call and return snapshots remain complete. The must-analysis does not
-claim skipped fields were published; this lets dead-value elimination remove
-intermediate flags overwritten before a real observer. `strict` keeps every
-pre-access snapshot, independently of the chosen x87 policy.
+`RECOMP_NULL_CHECKS=1` builds always compile the strict forms of both: `emit`
+emits a strict/fast `#if` pair whenever either policy is relaxed. `emit()`
+defaults to the production policy (`x87_scalar_strict=False, local_state=True`).
 
 DIVERGENCE(original): [ssa-x87-scalar] ordinary interior load faults may expose
-preceding published x87 state. [ssa-state-locals] similarly defers GPR/flag state
-except EIP/ESP/EBP. [ssa-x87-binary32] uses the existing documented binary32
-exponent-range policy. These apply only to explicitly selected performance
-modes; accesses and faults are not removed. `RECOMP_NULL_CHECKS=1` selects strict
-CPU and x87 publication and general arithmetic for guest exception dispatch.
-Real interior fault/SEH equivalence remains unverified.
+the preceding published x87 state. [ssa-state-locals] likewise defers GPR/flag
+state except EIP/ESP/EBP. [ssa-x87-binary32] uses the documented binary32
+exponent-range policy. Accesses and faults are never removed. Interior
+fault/SEH equivalence remains unverified.
 
-The native suite compares eager C with raw (`optimize=False`), scalar with strict
-state, scalar-strict and scalar/local-state (the production policy) for 151
-byte-backed fixtures × 24576 inputs
-in both ordinary and null-check builds. Complete outgoing CPU/scratch state and
-integer-store snapshots remain exact; no residue is normalized away. Dedicated
-fixtures cover full stack wraparound, exact qword copies, reversed arithmetic,
-status after float stores, CW changes, and deferred flags before watched stores.
-The null-check build exercises its conservative compiled path on mapped inputs;
-it does not inject actual null faults or validate guest SEH.
+### Reduction passes
 
-## Reducing SSA and emitted C
+`simplify.py` runs `canonicalize` (trivial phis, width-aware COPY/ZEXT
+propagation, constant arithmetic and shifts, BYTE-of-PACK and PACK-of-BYTE
+folding) and `live_values` dead-value elimination. Potentially faulting loads,
+stores, branches, returns, division effects and unknown operations remain roots.
+`coalesce.py` carries whole runtime registers through entry values and phis, and
+`publication.py` computes must-facts for whole CPU fields: a field is known
+published at block entry only if every predecessor published it, so uncertainty
+keeps the assignment. DIV32, IDIV32 and bound CALL invalidate all facts. Watch
+and dirty observers are read-only and an armed null fault transfers control or
+terminates; a future returning, CPU-mutating observer needs an explicit SSA
+effect model before admission.
 
-The builder prioritizes an explicit state graph over compact output. Every
-listed instruction is a block, every referenced register byte gets an entry
-phi, and wide reads/writes initially pack/extract bytes. Later passes coalesce
-register groups and omit redundant CPU field stores at memory effects.
+## Validation
 
-`simplify.py` runs reusable SSA passes before C emission. `canonicalize` iterates
-trivial-phi simplification, equal-width COPY/ZEXT propagation, width-masked
-constant arithmetic and shifts, BYTE-of-PACK selection, and PACK-of-BYTE
-reassembly of a complete source. Narrow copies and partial reassembly stay
-explicit. It does not use host signed arithmetic or infer undefined flags.
-`live_values` traces the resulting dependencies from every LOAD, STORE, DIV32,
-terminator, effect snapshot and return state. Unknown operations also remain
-roots so the emitter must diagnose them. When given a publication plan, snapshot
-roots include only the fields that need assignments; already-published values
-remain observable in the CPU without redundant SSA computations. `simplify` removes dead or aliased
-operations and phis from block lists; stable IDs and the value table remain
-available for diagnostics. No memory effects, snapshots or publication barriers
-are removed, and no memory forwarding or guest-store elimination occurs. The C
-consumer declares and initializes only reachable values. `emit(...,
-optimize=False)` retains the raw SSA emission for pass comparisons; the
-production decoded emitter remains separate and unchanged.
+- `tools/recomp/tests/test_ir_*.py` (portable suite): byte-backed lifting, SSA
+  interpreter checks, pass idempotence, publication plans, emitter admission and
+  rejection, production selection.
+- `tools/build.py --ir-ssa-checks`: the byte-backed synthetic fixtures in
+  `ir/native_checks.py` run against eager C as five columns (eager, raw,
+  scalar with strict state, scalar-strict, scalar/locals), each in an ordinary and
+  a null-check build, comparing every CPU field, 2 KiB of scratch and read-only
+  store-watch snapshots over 24576 inputs per fixture, including all x87 TOP, PC
+  and RC combinations. A mocked divide-error handler mutates other GPRs/flags and
+  the checks require every tracked field to be reloaded. The null-check build runs
+  its conservative path on mapped inputs; it does not inject null faults or
+  validate guest SEH.
+- The function corpus (`tools/recomp/corpus/README.md`) compares each variant with
+  eager C on real game bytes:
 
-`coalesce.py` introduces wider inputs and phis for complete runtime register
-groups before lane-phi simplification. BYTE operations bridge the wider values
-to existing p-code lanes; predecessor PACK operations build parallel edge copies.
-Canonicalization removes complete reassembly/extraction pairs, so full-register
-loop updates no longer require four live byte phis. Partial writes retain the
-unwritten lanes explicitly. Groups lacking any lane stay in the existing byte
-representation. This is not a new call ABI or permission to discard upper bits.
+  ```sh
+  /path/to/game/tools/.venv/bin/python tools/build.py --game-dir /path/to/game \
+    --function-corpus MANIFEST --corpus-ir-ssa --corpus-trial-ms 0
+  ```
 
-`publication.py` computes must-facts for whole CPU fields. A block entry field
-is known only when every predecessor has published its exit value; the virtual
-entry contributes the initial CPU state. Facts are relative to block entry/exit
-values rather than raw phi IDs, so a backedge cannot confuse an older published
-phi with its next iteration. Each access and return compares the required state
-against those facts. Uncertainty retains the assignment. DIV32 invalidates all
-facts because the error seam can return through a handler. IDIV32 and bound
-CALL effects also invalidate those facts. On normal continuation
-LOAD/STORE accessors do not mutate CPU state: watch/dirty observers are read-only,
-and an armed null fault either transfers control through SEH or terminates.
-Any future returning CPU-mutating observer needs explicit invalidation and an SSA
-effect model before admission. The native mock division handler mutates
-EAX/EDX, EBX, ESI and every flag; the SSA reloads all tracked fields after the
-checked divide. Arbitrary handler changes remain outside the model.
-
-The C consumer can disable these passes independently with
-`publish_changed=False` and `wide_registers=False` for runtime comparisons.
-
-The byte-backed SSA tests compare interpreter results before and after the
-passes, exercise loop-carried parallel copies and overlapping uniques, and
-check pass idempotence, narrow COPY widths, constant shift boundaries,
-unused faulting loads, pre-load state and unknown-operation diagnostics.
-Additional interpreter checks validate the complete expected CPU at every
-planned observation, including omitted assignments, branches, entry backedges,
-partial-register joins and wide loop phis. Native watchers independently compare
-executed store snapshots against eager C.
-
-Before these passes, the game's integer string-comparison function illustrates the cost: 54 original
-instructions generate 3389 C lines, with 1109 value declarations, 382 staged
-phi-copy temporaries and 192 CPU-field publication statements. Its graph has
-189 PACK and 380 BYTE operations. These are source/graph counts, not executed
-instruction counts or proof of a speedup from any proposed change.
-
-Further reduction should proceed in this order:
-
-1. Extend width-aware canonicalization where measured output justifies it.
-   Retain potentially faulting loads, stores, branches, returns, division
-   effects and every required CPU snapshot; outgoing flags and memory residue
-   stay live. Pure value numbering needs dominance and loop-aware reasoning.
-2. Form actual basic blocks and construct phis only at joins for live inputs.
-   Keep the virtual entry predecessor and parallel copies for loop edges. This
-   removes instruction-by-instruction gotos and most transient state versions.
-3. Extend the current register-group coalescing where native measurements
-   justify it. Partial writes currently keep explicit byte operations; consider
-   wider insert/extract operations while retaining byte-range alias analysis.
-4. Extend publication must-facts only with explicit helper/observer contracts.
-   Preserve required fault snapshots; reducing the number of observation
-   barriers needs separate evidence.
-
-After canonicalization, emit short expressions for single-use values and retain
-typed temporaries for reused values and ordered effects. Measure C source size,
-generation time, cold compiler cost, native text and execution separately.
-Basic-block formation and expression inlining remain unimplemented. Source
-reduction by itself does not establish faster or smaller native code; the game's
-corpus documentation records those measurements separately.
+  `--corpus-ir-ssa` replaces the combined variant only when the whole function is
+  supported; otherwise the decoded emitter supplies it, and JSON records an
+  `ir_ssa` emitted/fallback result per function. The eager variant is the
+  full-state oracle. Original-x86 and interior-fault differential checks are not
+  part of any of these.
 
 ## Production selection
-
-Select SSA in the game's `game.toml`:
 
 ```toml
 [translate]
@@ -419,92 +208,45 @@ ir_ssa_x87 = "scalar"    # scalar (default) or scalar-strict
 ir_ssa_state = "locals"  # locals (default) or strict
 ```
 
-Regenerate through `tools/build.py --regenerate`. Setting `ir_ssa = false`
-restores decoded emission. Discovery, entry ownership and decoded dispatch
-validation still run first. `ir/production.py` then replaces supported final
-bodies while keeping stable entry thunks and the existing raw/base/hooked
-tables. SSA direct calls use `CALL_FN`, publishing and reloading required state;
-there is no summary-driven calling-convention optimization. Ordinary decoded
-callees and SSA callees can be mixed, including replacement/hook selection.
+Regenerate with `tools/build.py --regenerate`; `ir_ssa = false` restores decoded
+emission. Discovery, entry ownership and decoded dispatch validation run first;
+`ir/production.py` then replaces supported final bodies while keeping stable entry
+thunks and the raw/base/hooked tables. SSA and decoded callees can mix, including
+replacement and hook selection.
 
 Alternate-entry bodies, SEH frames/helpers/restores, pushed continuations,
 nonreturning control flow, audited instruction/operand/visual-clock rewrites,
-unsupported division shapes and auxiliary modules keep whole-function decoded C.
-Unbound indirect calls, jump tables, external tail transfers and unsupported
-instructions also fall back through named SSA/lift diagnostics. A 2048-instruction budget and
-Python graph recursion limit retain decoded C for expensive constructions.
-Original interior fault/SEH equivalence remains unverified; null-check builds
-compile conservative publication inside admitted functions.
-
-The translation JSON report includes an `ir_ssa` object with emitted/fallback
-counts and percentages, policy names, aggregated fallback reasons and a
-per-function map. Its denominator is the final emitted function bodies,
-including recovered bodies, with alternate entry wrappers counted only under
-their owning body. These are automatically generated frontend coverage metrics,
-not a reconstruction census, execution coverage or equivalence evidence.
-
-`test_ir_production.py` exercises final-driver selection/reporting, mixed
-SSA/decoded direct calls through thunk declarations and conservative exclusions
-over actual synthetic instruction bytes. The native SSA comparison suite checks
-body semantics; production entry-dispatch tests check replacement/hook/profile
-policy. A real replay is still needed before performance capture.
+unsupported division shapes and auxiliary modules keep decoded C. Unbound
+indirect calls, jump tables, external tail transfers and unsupported instructions
+fall back with named SSA/lift diagnostics, and a 2048-instruction budget and graph
+recursion limit keep decoded C for expensive bodies. The translation report's
+`ir_ssa` object lists emitted/fallback counts, policy names and aggregated
+fallback reasons per final body; these are frontend coverage metrics, not
+execution coverage or equivalence evidence.
 
 ## SSA ceiling experiment (corpus-only, unproven)
 
 `ir/ceiling.py` defines five aggressive relaxations that the function corpus can
-apply as one extra "SSA ceiling" column, to measure how much speed they could buy
-*before* any is proven. They are **not** part of the agreed performance-mode
-contract, never reach `game.toml` or `ir/production.py` (the only entry is the
-private `_ceiling` argument of `emit_c.emit`, which production never passes, and
-a regression test enforces this), and every existing variant stays byte-identical
-when the option is absent. Select them with `tools/build.py ... --corpus-ir-ssa
---corpus-ir-ssa-x87 scalar --corpus-ir-ssa-state locals --corpus-ir-ssa-ceiling
-A,B,C,D,E|all` (the game wrapper spells it `--ir-ssa-ceiling`).
+apply as one extra "SSA ceiling" column to measure what they could buy before any
+is proven. They are not part of the agreed performance-mode contract and never
+reach `game.toml` or `ir/production.py`: the only entry is the private `_ceiling`
+argument of `emit_c.emit`, a regression test checks production never passes it,
+and every other variant is byte-identical when the option is absent. Select them
+with `--corpus-ir-ssa --corpus-ir-ssa-ceiling A,B,C,D,E|all` (the game wrapper
+spells it `--ir-ssa-ceiling`).
 
-| Letter | Relaxation | Where it is applied |
-| --- | --- | --- |
-| A | No store snapshots: LOAD/STORE/x87-memory effects publish no GPR/flag/x87 state; only calls, returns and division/string seams do | `publication.plan(unpublished=...)`, `emit_c`, `X87Scalar.store_flush` |
-| B | CF/PF/AF/ZF/SF/OF are not live-in, not live-out, not published before a call and constant 0 after it; DIV/MOVS seams pass them through; DF stays exact | `ssa.build(dead_flag_keys=...)`, plan groups |
-| C | MSVC x87 convention: values only (no st_bits/st_exact/tags), popped slots are never published, flushes write live values and TOP. The "ST0 is live at return" test is inferred from which slots remain pushed (no summary depth is consulted). FILD/FISTP exact-integer shadows are dropped, not kept | `x87_ceiling.X87Ceiling` |
-| D | No sticky IE/ZE and no per-op NaN canonicalization; stores of a NaN write the x87 indefinite; FCOM keeps exact C0/C2/C3 inline | `X87Ceiling` |
-| E | PC=00/RC=nearest assumed, no control-word selector, slots are C `float`, plain float arithmetic (the corpus still builds with `-ffp-contract=off`) | `X87Ceiling` |
+| Letter | Relaxation |
+| --- | --- |
+| A | No store snapshots: LOAD/STORE/x87-memory effects publish no state; only calls, returns and division/string seams do |
+| B | Arithmetic flags are dead across entry, call and return (DF stays exact) |
+| C | MSVC x87 call convention: values only, no tags/residue/exact shadows, popped slots never published |
+| D | No sticky exception bits; NaN canonicalised only at stores |
+| E | Constant PC=00/RC=nearest; slots are plain C `float` |
 
-C, D and E lower only the instruction forms the corpus contains (loads, stores,
-basic and integer-memory arithmetic, compares, FCHS/FABS/FSQRT, FXCH, FNSTSW AX).
-Any other x87 form (FLDCW, FIST*, FPREM, FRNDINT, FXAM, FINIT...) raises a named
-`SSAError`; the runner then keeps the ordinary scalar/locals SSA body for that
-whole function and records the reason. No FLDCW-affected-region split exists. The
-null-check dual body is skipped for ceiling output.
-
-The runner builds the ceiling column between `combined` and `native`
-(`corpus_modes(True)`), emits `CORPUS_MODE_CEILING` into the generated config, and
-judges it on declared observations because full-state equality is expected to
-fail. Native-reference rows use the fixture's `corpus_observable_equal` contract.
-Translation-only rows compare declared guest ranges (excluding
-`[entry ESP - 0x1000, final ESP)` stack residue), EAX and the ST0 return, plus
-boundary hooks that consult `corpus_relaxed_boundaries` and count GPR/EIP/TOP/
-stack/target/order differences. With E, inputs whose control word is not
-PC=00/RC=nearest/masked are skipped and reported as `skipped`. Mismatches are
-counted per row and never abort; a failed timed-workload sanity check is
-recorded rather than fatal. Report JSON carries the relaxation set, emitted or
-fallback status and reason, the observation counts with the first failing input,
-and a one-line CSV note.
-
-Known consequence: with D, sticky IE is absent from the status word a guest reads
-through `FNSTSW AX`, so a boundary or return EAX can differ in its low status
-bits even when no consumed condition bit does.
-
-## Remaining code-generation work
-
-Extend SSA beyond the admitted integer and corrected x87 effects, preserving
-guest widths, wrapping arithmetic, consumed flags, memory effects and faults. Treat unknown or partial
-summaries as opaque boundaries. Summary-driven direct calls need explicit state
-publication rules for hooks, imports, SEH, scheduler/runtime observers, and the
-comparison path. Correct remaining raw x87 gaps before emitting scalar floating
-operations directly rather than using the audited effects.
-
-Continue with the game's existing function corpus and full CPU/memory comparison
-checks. Keep the production C emitter available and measure correctness,
-compile cost and execution separately. Any broader fidelity tradeoff requires
-an explicit agreement; this frontend does not change the game's optimization
-contract.
+C, D and E lower only the x87 forms the corpus contains; any other form raises a
+named `SSAError`, and the runner keeps the ordinary scalar/locals body for that
+function and records the reason. The ceiling column is judged on declared
+observations, not full-state equality: native rows use the fixture's observable
+contract; translation-only rows compare declared guest ranges, EAX, ST0 and
+relaxed boundary snapshots. Mismatches are counted, never fatal. With D, sticky IE
+is absent from a status word a guest reads through `FNSTSW AX`.
