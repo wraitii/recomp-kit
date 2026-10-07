@@ -228,25 +228,10 @@ def test_function_corpus_is_isolated_and_does_not_regenerate_game():
     args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-trial-ms', '0'], system='Darwin')
     assert args.function_corpus == Path('manifest.json')
     assert args.corpus_trial_ms == 0
-    args, _ = build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-x87-dataflow'], system='Darwin')
-    assert args.corpus_x87_dataflow
-    with pytest.raises(SystemExit):
-        build_py.parse_args(['--corpus-x87-dataflow'], system='Darwin')
     for extra in (['--regenerate'], ['--stub'], ['--corpus-fragments'],
                   ['--cpu-locals-checks']):
         with pytest.raises(SystemExit):
             build_py.parse_args(['--function-corpus', 'manifest.json', *extra], system='Darwin')
-
-
-def test_corpus_stack_forwarding_requires_dataflow():
-    import pytest
-    args, _ = build_py.parse_args(['--function-corpus', 'manifest.json',
-                                  '--corpus-x87-dataflow', '--corpus-stack-forwarding'], system='Darwin')
-    assert args.corpus_stack_forwarding
-    with pytest.raises(SystemExit):
-        build_py.parse_args(['--corpus-stack-forwarding'], system='Darwin')
-    with pytest.raises(SystemExit):
-        build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-stack-forwarding'], system='Darwin')
 
 
 def test_ir_ssa_corpus_mode_requires_isolation():
@@ -255,9 +240,6 @@ def test_ir_ssa_corpus_mode_requires_isolation():
     assert args.corpus_ir_ssa
     with pytest.raises(SystemExit):
         build_py.parse_args(['--corpus-ir-ssa'], system='Darwin')
-    for option in ('--corpus-x87-dataflow', '--corpus-stack-forwarding', '--corpus-decoded-dataflow'):
-        with pytest.raises(SystemExit):
-            build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-ir-ssa', option], system='Darwin')
 
 
 def test_ir_ssa_native_checks_require_isolation():
@@ -270,17 +252,13 @@ def test_ir_ssa_native_checks_require_isolation():
             build_py.parse_args(['--ir-ssa-checks', *extra], system='Darwin')
 
 
-def test_decoded_dataflow_build_modes():
+def test_retired_dataflow_experiment_options_are_rejected():
     import pytest
-    args, _ = build_py.parse_args(['--decoded-dataflow-checks'], system='Darwin')
-    assert args.decoded_dataflow_checks
-    args, _ = build_py.parse_args(['--function-corpus', 'manifest.json',
-                                  '--corpus-x87-dataflow', '--corpus-decoded-dataflow'], system='Darwin')
-    assert args.corpus_decoded_dataflow
-    with pytest.raises(SystemExit):
-        build_py.parse_args(['--corpus-decoded-dataflow'], system='Darwin')
-    with pytest.raises(SystemExit):
-        build_py.parse_args(['--function-corpus', 'manifest.json', '--corpus-decoded-dataflow'], system='Darwin')
+    for option in (['--corpus-x87-dataflow'], ['--corpus-stack-forwarding'],
+                   ['--corpus-decoded-dataflow'], ['--x87-dataflow-checks'],
+                   ['--decoded-dataflow-checks']):
+        with pytest.raises(SystemExit):
+            build_py.parse_args(['--function-corpus', 'manifest.json', *option], system='Darwin')
 
 
 def test_corpus_asan_is_a_correctness_build_of_the_function_corpus():

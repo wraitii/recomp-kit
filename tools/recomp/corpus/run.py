@@ -497,9 +497,6 @@ def markdown(report):
              f"Contract: {report['contract']}.",
              *(["AddressSanitizer build: code sizes include instrumentation and are not comparable."]
                if report.get('asan') else []),
-             f"Decoded x87 dataflow: {'enabled' if report.get('x87_dataflow') else 'disabled'}.",
-             f"Guest-stack forwarding: {'enabled' if report.get('x87_stack_forwarding') else 'disabled'}.",
-             f"Decoded integer dataflow: {'enabled' if report.get('decoded_dataflow') else 'disabled'}.", '',
              f"IR SSA in combined mode: {sum(r.get('ir_ssa', {}).get('emitted', False) for r in report['functions'])} functions emitted; fault state: {report.get('fault_state', 'relaxed')}; per-function fallbacks are in JSON.", '',
              'Native is reviewed C plus its ABI adapter; kernel text is also shown separately.',
              'Translation-only rows have no native reference and omit adapter/kernel results entirely.',
@@ -589,7 +586,6 @@ def markdown(report):
 
 
 def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0, trials=9,
-               x87_dataflow=False, x87_stack_forwarding=False, decoded_dataflow=False,
                ir_ssa=False, fault_state=None, msvc_x87_convention=None,
                ir_ssa_ceiling=None, asan=False):
     """Decode the selected instructions, build isolated variants, validate, report.
@@ -617,12 +613,6 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
     if ceiling and not (ir_ssa and fault_state == "relaxed"):
         raise ValueError("SSA ceiling requires --ir-ssa with relaxed fault state")
     modes = corpus_modes(bool(ceiling))
-    if decoded_dataflow and not x87_dataflow:
-        raise ValueError('decoded dataflow requires decoded x87 dataflow')
-    if ir_ssa and (x87_dataflow or x87_stack_forwarding or decoded_dataflow):
-        raise ValueError('IR SSA and decoded-dataflow corpus modes must run separately')
-    if x87_stack_forwarding and not x87_dataflow:
-        raise ValueError('guest-stack forwarding requires decoded x87 dataflow')
     if checks < 1 or trial_ms < 0 or trials < 3:
         raise ValueError('checks must be positive, trial budget nonnegative, trials at least three')
     game_dir, manifest, out = Path(game_dir).resolve(), Path(manifest).resolve(), Path(out).resolve()
@@ -718,10 +708,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
         ceiling_result = None
         for mode in modes[:-1]:
             options = SimpleNamespace(eager_flags=mode == "eager", cpu_locals=mode in ('cpu', 'combined', CEILING_MODE),
-                                      x87_locals=mode in ('x87', 'combined', CEILING_MODE),
-                                      x87_dataflow=x87_dataflow and mode in ('x87', 'combined'),
-                                      x87_stack_forwarding=x87_stack_forwarding and mode in ('x87', 'combined'),
-                                      decoded_dataflow=decoded_dataflow and mode == 'combined')
+                                      x87_locals=mode in ('x87', 'combined', CEILING_MODE))
             tr = T.Translator(image, set(functions), options)
             fn = T.Function(addr, name, size, insns)
             fn.measure(image)
@@ -959,7 +946,6 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
     import shlex
     compiler = compiler_rows[0].get('arguments', []) or shlex.split(compiler_rows[0]['command'])
     report = {'contract': contract, 'host': platform.platform(),
-              'x87_dataflow': x87_dataflow, 'x87_stack_forwarding': x87_stack_forwarding, 'decoded_dataflow': decoded_dataflow,
               'ir_ssa': ir_ssa,
               'fault_state': fault_state,
               'msvc_x87_convention': msvc_x87_convention,

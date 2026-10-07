@@ -490,22 +490,12 @@ def parse_args(argv, system=None):
                         help="Time budget per eager trial in milliseconds; each row's call count is "
                              "calibrated once to fill it. Zero runs correctness/size only")
     parser.add_argument("--corpus-trials", type=int, default=9)
-    parser.add_argument("--corpus-x87-dataflow", action="store_true",
-                        help="Try decoded x87 dataflow in the native-reference corpus")
-    parser.add_argument("--corpus-decoded-dataflow", action="store_true",
-                        help="Try whole-function decoded integer and flag dataflow")
-    parser.add_argument("--corpus-stack-forwarding", action="store_true",
-                        help="Try bounded guest-stack forwarding with decoded x87 dataflow")
     parser.add_argument("--corpus-fragments", action="store_true",
                         help="Build and run the isolated x87 local-value experiment")
     parser.add_argument("--cpu-locals-checks", action="store_true",
                         help="Build and run full-state CPU/x87 locals checks without benchmarks")
     parser.add_argument("--ir-ssa-checks", action="store_true",
                         help="Build/run byte-backed integer SSA full-state synthetic checks")
-    parser.add_argument("--decoded-dataflow-checks", action="store_true",
-                        help="Build/check decoded integer/flag dataflow with full outgoing state")
-    parser.add_argument("--x87-dataflow-checks", action="store_true",
-                        help="Build and run decoded x87 dataflow full-state checks")
     parser.add_argument("--allow-table-gaps", metavar="REASON", default=None,
                         help="Accept jump-table sites the translator cannot decode (passed to translate.py)")
     parser.add_argument("--forget", metavar="ADDR[,ADDR...]", default=None,
@@ -552,13 +542,11 @@ def parse_args(argv, system=None):
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
     if args.function_corpus and any((args.regenerate, args.stub, args.corpus_fragments,
-                                      args.cpu_locals_checks, args.ir_ssa_checks, args.x87_dataflow_checks, args.decoded_dataflow_checks,
+                                      args.cpu_locals_checks, args.ir_ssa_checks,
                                       args.allow_unmodelled,
                                       args.allow_table_gaps, args.forget, args.discovered,
                                       args.config != "Release", args.target != "app")):
         parser.error("--function-corpus is an isolated native Release build mode")
-    if args.corpus_x87_dataflow and not args.function_corpus:
-        parser.error("--corpus-x87-dataflow requires --function-corpus")
     if args.corpus_ir_ssa and not args.function_corpus:
         parser.error("--corpus-ir-ssa requires --function-corpus")
     if args.corpus_asan and not args.function_corpus:
@@ -573,17 +561,11 @@ def parse_args(argv, system=None):
         parser.error("--corpus-msvc-x87-convention requires --corpus-ir-ssa")
     if args.corpus_msvc_x87_convention is not None:
         args.corpus_msvc_x87_convention = args.corpus_msvc_x87_convention == "on"
-    if args.corpus_ir_ssa and (args.corpus_x87_dataflow or args.corpus_stack_forwarding or args.corpus_decoded_dataflow):
-        parser.error("--corpus-ir-ssa and decoded-dataflow corpus modes must run separately")
     if args.ir_ssa_checks and any((args.regenerate, args.stub, args.corpus_fragments,
-                                  args.cpu_locals_checks, args.x87_dataflow_checks, args.decoded_dataflow_checks,
+                                  args.cpu_locals_checks,
                                   args.config != "Release",
                                   args.preset != default_preset(system), args.target != "app")):
         parser.error("--ir-ssa-checks is an isolated native Release check mode")
-    if args.corpus_stack_forwarding and not (args.function_corpus and args.corpus_x87_dataflow):
-        parser.error("--corpus-stack-forwarding requires --function-corpus and --corpus-x87-dataflow")
-    if args.corpus_decoded_dataflow and not (args.function_corpus and args.corpus_x87_dataflow):
-        parser.error("--corpus-decoded-dataflow requires --function-corpus and --corpus-x87-dataflow")
     args.build_root = build_root_for(args.game_dir)
     return args, parser
 
@@ -601,7 +583,7 @@ def main():
         with buildlock.BuildLock(args.build_root.parent, "tools/build.py --function-corpus"):
             run_corpus(args.function_corpus, args.game_dir, args.build_root / "function-corpus",
                        cmake_tool("cmake"), args.jobs, args.corpus_checks,
-                       args.corpus_trial_ms, args.corpus_trials, args.corpus_x87_dataflow, args.corpus_stack_forwarding, args.corpus_decoded_dataflow,
+                       args.corpus_trial_ms, args.corpus_trials,
                        args.corpus_ir_ssa, fault_state=args.corpus_fault_state,
                        msvc_x87_convention=args.corpus_msvc_x87_convention,
                        ir_ssa_ceiling=args.corpus_ir_ssa_ceiling, asan=args.corpus_asan)
@@ -610,10 +592,9 @@ def main():
         from corpus.fragments.run import run_experiment
         run_experiment(args.build_root / "function-corpus-fragments", cmake_tool("cmake"), args.jobs)
         return
-    if args.cpu_locals_checks or args.x87_dataflow_checks or args.decoded_dataflow_checks:
+    if args.cpu_locals_checks:
         from experiments.cpu_locals.run import run_checks
-        name = "decoded-dataflow-checks" if args.decoded_dataflow_checks else ("x87-dataflow-checks" if args.x87_dataflow_checks else "cpu-locals-checks")
-        run_checks(args.build_root / name, cmake_tool("cmake"), args.jobs, args.x87_dataflow_checks or args.decoded_dataflow_checks, args.decoded_dataflow_checks)
+        run_checks(args.build_root / "cpu-locals-checks", cmake_tool("cmake"), args.jobs)
         return
     cfg = game_config.load(args.game_dir)
     # Regenerating needs the game and its listings.

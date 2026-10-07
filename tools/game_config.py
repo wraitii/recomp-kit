@@ -79,6 +79,9 @@ REMOVED_TRANSLATE_KEYS = {
     "ir_ssa_state": 'use fault_state = "relaxed" (or "exact")',
     "ir_ssa_msvc_convention": "use msvc_x87_convention",
     "ir_ssa_x87_lazy_nan": "lazy x87 NaN checks are exact and always on",
+    "x87_dataflow": "removed experiment; production uses SSA or decoded C",
+    "x87_stack_forwarding": "removed experiment; production uses SSA or decoded C",
+    "decoded_dataflow": "removed experiment; production uses SSA or decoded C",
 }
 
 
@@ -228,22 +231,6 @@ def load(game_dir):
     # stay published either way. False restores conservative publication.
     if not isinstance(translate.setdefault("msvc_x87_convention", TRANSLATE_DEFAULTS["msvc_x87_convention"]), bool):
         raise ValueError("%s: [translate] msvc_x87_convention must be a boolean" % source)
-    relaxed = translate["fault_state"] == "relaxed"
-    dataflow_x87 = translate.setdefault("x87_dataflow", False)
-    if not isinstance(dataflow_x87, bool):
-        raise ValueError("%s: [translate] x87_dataflow must be a boolean" % source)
-    if dataflow_x87 and not relaxed:
-        raise ValueError('%s: [translate] x87_dataflow requires fault_state = "relaxed"' % source)
-    forward_stack = translate.setdefault("x87_stack_forwarding", False)
-    if not isinstance(forward_stack, bool):
-        raise ValueError("%s: [translate] x87_stack_forwarding must be a boolean" % source)
-    if forward_stack and not dataflow_x87:
-        raise ValueError("%s: [translate] x87_stack_forwarding requires x87_dataflow" % source)
-    decoded = translate.setdefault("decoded_dataflow", False)
-    if not isinstance(decoded, bool):
-        raise ValueError("%s: [translate] decoded_dataflow must be a boolean" % source)
-    if decoded and not dataflow_x87:
-        raise ValueError("%s: [translate] decoded_dataflow requires x87_dataflow" % source)
     alignment = translate.setdefault("function_alignment", 16)
     if type(alignment) is not int or alignment <= 0:
         raise ValueError("%s: [translate] function_alignment must be a positive integer" % source)

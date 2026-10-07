@@ -90,14 +90,6 @@ also checks CPU state at an injected access failure. These are synthetic mapped
 tests against the current runtime, not original-x86, real hooks, real guest SEH
 or gameplay evidence. No benchmarks or profile captures run in this mode.
 
-Decoded x87 dataflow is opt-in. `tools/build.py --x87-dataflow-checks` extends
-the CPU-local native checks with division, register copies/exchanges, exact
-integer metadata, branch joins, loops, stack wraparound, call snapshots and
-control/environment observers (currently 27 fixtures).
-`tools/recomp/tests/test_x87_dataflow.py` checks decoded effects, TOP and width
-joins, exit publication and fallback. Unicorn tests need permission to map JIT
-memory; a sandbox mapping failure is not a successful differential check.
-
 Real game-function corpora run through `tools/build.py --function-corpus MANIFEST`.
 Use `--corpus-trial-ms 0` for correctness and code sizes without timing. They compare
 four translated C modes in full CPU/scratch state, then compare a reviewed typed
