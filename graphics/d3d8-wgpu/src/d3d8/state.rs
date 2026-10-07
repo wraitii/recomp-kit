@@ -2383,4 +2383,5 @@ mod tests {
 
 #[path = "lighting.rs"]
 mod lighting;
+pub(crate) use lighting::LightingUniform;
 pub use lighting::LitInput;

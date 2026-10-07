@@ -1,8 +1,8 @@
 //! FVF decoding and bounded fixed-function pipeline construction.
 //!
 //! XYZ/DIFFUSE FVFs 0x42, 0x142 and 0x242 feed unlit raster shaders.
-//! XYZ/NORMAL/TEX1 (0x112) and XYZ/NORMAL/DIFFUSE/TEX1 (0x152) feed software
-//! vertex lighting and a floating diffuse raster input; 0x112 has no
+//! XYZ/NORMAL/TEX1 (0x112) and XYZ/NORMAL/DIFFUSE/TEX1 (0x152) feed GPU
+//! diffuse lighting, with CPU comparison/fallback; 0x112 has no
 //! per-vertex diffuse, so the material supplies it. Other layouts fail with a
 //! named diagnostic.
 //!
@@ -42,7 +42,7 @@ pub const FVF_XYZ_DIFFUSE_TEX2: u32 = 0x0242;
 
 /// `D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX1` (0x0112); one 2-float texture
 /// coordinate at offset 24 and no per-vertex diffuse. The normal at offset 12
-/// feeds the same software vertex lighting as `0x152`; with lighting disabled
+/// feeds the same vertex lighting as `0x152`; with lighting disabled
 /// the material supplies the diffuse because there is no COLOR1 component.
 pub const FVF_XYZ_NORMAL_TEX1: u32 = 0x0112;
 
@@ -1391,6 +1391,11 @@ mod tests {
         validate("textured", TEXTURED_WGSL);
         validate("lit-untextured", &lit_shader_source(false));
         validate("lit-textured", &lit_shader_source(true));
+        for fvf in [0x112, 0x152] {
+            for textured in [false, true] {
+                validate("GPU-lit", &gpu_lit_shader_source(textured, fvf));
+            }
+        }
     }
 
     #[test]
@@ -1879,4 +1884,48 @@ pub fn lit_shader_source(textured: bool) -> String {
         "@location(1) color: vec4<f32>",
         1,
     )
+}
+
+/// Guest XYZ/NORMAL stream layout for diffuse lighting in the vertex shader.
+pub fn gpu_lit_layout(fvf: u32) -> FvfLayout {
+    let mut layout = FvfLayout::decode(fvf).unwrap();
+    layout.attributes.push(wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x3,
+        offset: 12,
+        shader_location: 4,
+    });
+    layout
+}
+
+/// Retain the existing raster/texture/fog stages, replacing only diffuse
+/// evaluation and adding the guest normal attribute. No guest bytes change.
+pub fn gpu_lit_shader_source(textured: bool, fvf: u32) -> String {
+    gpu_lit_source(lit_shader_source(textured), fvf)
+}
+
+/// Also used for fixed-function vertices paired with a programmable pixel stage.
+pub fn gpu_lit_source(mut source: String, fvf: u32) -> String {
+    source = source.replacen(
+        "struct VertexInput {",
+        "struct VertexInput {\n    @location(4) normal: vec3<f32>,",
+        1,
+    );
+    let color = if fvf == 0x152 {
+        source = source.replacen(
+            "@location(1) color: vec4<f32>",
+            "@location(1) color: u32",
+            1,
+        );
+        "lighting_color(in.color), true"
+    } else {
+        source = source.replacen("    @location(1) color: vec4<f32>,", "", 1);
+        "vec4<f32>(0.0), false"
+    };
+    source = source.replacen(
+        "    out.color = in.color;",
+        &format!("    out.color = evaluate_lighting(in.position, in.normal, {color});"),
+        1,
+    );
+    source.push_str(include_str!("gpu_lighting.wgsl"));
+    source
 }

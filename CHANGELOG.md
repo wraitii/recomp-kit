@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Fixed-function diffuse/ambient/emissive lighting for D3D8 0x112/0x152 now
+  runs in a vertex shader for indexed and nonindexed draws, including pixel
+  shader combinations. Immutable uniforms retain material sources, light order,
+  normal transforms and diffuse alpha; light transforms and spotlight cone
+  cosines are prepared once per draw. Ordinary fixed-function draws reuse the
+  unused program-uniform bank without enlarging uploads. CPU lighting remains
+  available through `RECOMP_D3D8_CPU_LIGHTING=1`, for unsafe/nonfinite states
+  and positional inputs, and for `ProcessVertices`. Specular draws remain
+  unsupported. `DIVERGENCE(original):` shader float rounding/normalization/pow
+  can differ from original hardware and CPU lighting. Metal comparisons cover
+  both layouts, all light types, sources, normalization, indexed/nonindexed
+  inputs, textures, pixel shaders, fog/alpha and snapshots, within two 8-bit
+  channel levels. Gameplay performance needs a fresh profile.
+
 - D3D8 GPU-indexed triangle lists now include programmable vertex shaders,
   using declaration-derived layouts and effective padded strides. Lit lists
   pack distinct referenced vertices before the existing CPU lighting pass and

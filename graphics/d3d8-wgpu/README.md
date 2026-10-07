@@ -25,7 +25,7 @@ The native resource tests link the same Rust storage without creating a GPU.
 The bridge uses opaque Rust storage for texture levels and vertex/index buffers.
 Compact triangle lists queue GPU indices, including programmable shaders with
 stream-0 declaration layouts and padded strides. Fixed-function lit lists pack
-only distinct referenced vertices before CPU lighting and remap the GPU indices;
+only distinct referenced vertices for GPU lighting or CPU fallback and remap indices;
 unused sparse gaps are never evaluated. Checked arithmetic validates actual
 indices and base/start offsets rather than upload hints. Sparse unlit spans,
 strips/fans and diagnostic draws retain expansion; `RECOMP_D3D8_EXPAND_INDICES=1`
@@ -104,17 +104,33 @@ triangle-list draws with FVF 0x42/0x142/0x242 are supported. `D3DPT_POINTLIST`
 is also supported through wgpu's fixed one-pixel `PointList`, but only in D3D8's
 default point state: a non-default `D3DRS_POINTSIZE`, `D3DRS_POINTSCALEENABLE`
 or `D3DRS_POINTSPRITEENABLE` fails by name. FVFs 0x112
-(XYZ/NORMAL/TEX1) and 0x152 (XYZ/NORMAL/DIFFUSE/TEX1) add software
+(XYZ/NORMAL/TEX1) and 0x152 (XYZ/NORMAL/DIFFUSE/TEX1) use GPU
 diffuse/ambient/emissive vertex lighting (directional/point/spot), material
 sources and inverse-transpose normals, with floating diffuse passed to the
 texture/fog/alpha/depth raster path; 0x112 has no COLOR1, so the material
-supplies the diffuse. D16/D24X8/D24S8/D32 map
+supplies the diffuse. Both indexed and nonindexed draws use this path,
+including fixed-function vertices paired with pixel shaders. Immutable per-draw
+uniforms retain light/material state and precompute light transforms and cone
+cosines. `RECOMP_D3D8_CPU_LIGHTING=1` forces the CPU reference. Unsafe positional
+attenuation, nonfinite state/positional inputs and `ProcessVertices` retain CPU
+processing and its diagnostics. Specular draws remain unsupported.
+
+`DIVERGENCE(original):` GPU rounding, normalization and `pow` can differ from
+original D3D8 hardware and the CPU evaluator. Metal synthetic comparisons allow
+at most two 8-bit channel levels per pixel; they cover both FVFs, both index
+widths, sparse/repeated indices, nonzero offsets, directional/point/spot/mixed
+lights, material sources, normal normalization, lighting-disabled output,
+textures, pixel shaders, fog, alpha testing and queued snapshots. No original
+D3D8 visual equivalence or gameplay performance gain is established.
+
+D16/D24X8/D24S8/D32 map
 onto wgpu depth formats; the backend-defined D24 precision remains a fidelity
 caveat. Draws reject unsupported reached state by name.
 
-CPU textures keep native texel layouts and stage locks through guest memory;
-this does not provide GPU texture sampling. Indexed triangle lists currently
-expand vertices rather than submitting a GPU index buffer. Resource pool/usage,
+CPU textures keep native texel layouts and stage locks through guest memory.
+GPU sampling and indexed triangle lists use immutable draw snapshots, with
+expansion available for other supported topologies and diagnostic comparisons.
+Resource pool/usage,
 LOD/priority, COM identity and binding bookkeeping still live in the bridge.
 The optional no-Rust kit profile retains CPU storage in C++ and advertises no
 renderer. Headless present completes the offscreen frame; the guest bridge

@@ -1,5 +1,6 @@
-//! Bounded software fixed-function vertex lighting. Guest stream bytes are
-//! never modified. Output XYZ/float RGBA/UV feeds the existing raster shaders;
+//! Fixed-function lighting state and the bounded CPU reference/fallback.
+//! GPU draws snapshot prepared light/material uniforms; guest stream bytes
+//! are never modified. CPU XYZ/float RGBA/UV feeds the existing raster shaders;
 //! the same evaluation also feeds `ProcessVertices`, which bakes lighting and
 //! the world/view/projection transform into an XYZRHW destination buffer.
 //! Specular lighting is computed only for `ProcessVertices`; a draw that needs
@@ -295,7 +296,144 @@ impl LightingSetup<'_> {
     }
 }
 
+/// Immutable per-draw GPU diffuse-lighting snapshot. Every field is vec4-sized
+/// (normal rows are padded) to match WGSL uniform alignment exactly.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct GpuLight {
+    position_type: [f32; 4],
+    direction: [f32; 4],
+    diffuse: [f32; 4],
+    ambient: [f32; 4],
+    attenuation_range: [f32; 4],
+    spot: [f32; 4],
+}
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct LightingUniform {
+    world_view: [[f32; 4]; 4],
+    normal: [[f32; 4]; 3],
+    diffuse: [f32; 4],
+    ambient: [f32; 4],
+    emissive: [f32; 4],
+    global_ambient: [f32; 4],
+    flags: [u32; 4],
+    lights: [GpuLight; MAX_LIGHTS],
+}
+
 impl DeviceState {
+    /// Prepare GPU diffuse lighting without reading any source vertices.
+    /// Unsafe positional attenuation stays on the CPU path, which retains its
+    /// named per-vertex denominator diagnostic. Specular draws remain rejected
+    /// by validate_draw; ProcessVertices always retains the CPU evaluator.
+    pub(crate) fn gpu_lighting_uniform(&self) -> Result<Option<LightingUniform>, RenderError> {
+        use bytemuck::Zeroable;
+        let setup = self.lighting_setup()?;
+        let s = &self.states;
+        let mut out = LightingUniform::zeroed();
+        out.world_view = setup.world_view.rows;
+        if let Some(normal) = setup.normal_matrix {
+            out.normal = normal.map(|r| [r[0], r[1], r[2], 0.0]);
+        }
+        out.diffuse = self.material.diffuse;
+        out.ambient = self.material.ambient;
+        out.emissive = self.material.emissive;
+        out.global_ambient = setup.global_ambient;
+        let color_source = |src| u32::from(s.color_vertex && src == D3DMATERIALCOLORSOURCE::Color1);
+        out.flags = [
+            u32::from(s.lighting),
+            u32::from(s.normalize_normals),
+            color_source(s.diffuse_material_source)
+                | color_source(s.ambient_material_source) << 1
+                | color_source(s.emissive_material_source) << 2
+                | u32::from(s.color_vertex) << 3,
+            0,
+        ];
+        if s.lighting {
+            for (i, light) in setup.enabled.iter().enumerate() {
+                if light.light_type != 3
+                    && (!(light.attenuation0 > 0.0)
+                        || light.attenuation1 < 0.0
+                        || light.attenuation2 < 0.0)
+                {
+                    return Ok(None);
+                }
+                if light.light_type != 3 {
+                    let r = light.range.max(0.0);
+                    let max_denominator =
+                        light.attenuation0 + light.attenuation1 * r + light.attenuation2 * r * r;
+                    if !max_denominator.is_finite() {
+                        return Ok(None);
+                    }
+                }
+                let position = transform(self.view, light.position, 1.0);
+                let direction = normalize(transform(self.view, light.direction, 0.0));
+                out.lights[i] = GpuLight {
+                    position_type: [
+                        position[0],
+                        position[1],
+                        position[2],
+                        light.light_type as f32,
+                    ],
+                    direction: [direction[0], direction[1], direction[2], 0.0],
+                    diffuse: light.diffuse,
+                    ambient: light.ambient,
+                    attenuation_range: [
+                        light.attenuation0,
+                        light.attenuation1,
+                        light.attenuation2,
+                        light.range,
+                    ],
+                    spot: [
+                        (light.theta * 0.5).cos(),
+                        (light.phi * 0.5).cos(),
+                        light.falloff,
+                        0.0,
+                    ],
+                };
+                out.flags[3] += 1;
+            }
+        }
+        // Nonfinite state remains CPU-evaluated, including legacy quirks.
+        let floats = bytemuck::cast_slice::<LightingUniform, f32>(std::slice::from_ref(&out));
+        if floats.iter().any(|v| !v.is_finite()) {
+            return Ok(None);
+        }
+        Ok(Some(out))
+    }
+
+    /// Preserve CPU error handling for nonfinite positional inputs. This is a
+    /// single transform per source vertex, not a lighting evaluation; indexed
+    /// streams have already packed only their referenced vertices. Directional
+    /// passes need no position preflight.
+    pub(crate) fn gpu_lighting_positions_supported(
+        &self,
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+        stride: usize,
+    ) -> bool {
+        if !self.states.lighting
+            || !self
+                .lights
+                .iter()
+                .zip(self.light_enabled)
+                .any(|(l, enabled)| enabled && l.light_type != 3)
+        {
+            return true;
+        }
+        let world_view = self.world.mul(self.view);
+        (start..end).all(|i| {
+            let at = i * stride;
+            let pos = std::array::from_fn(|k| {
+                f32::from_le_bytes(bytes[at + k * 4..at + k * 4 + 4].try_into().unwrap())
+            });
+            transform(world_view, pos, 1.0)
+                .iter()
+                .all(|v| v.is_finite())
+        })
+    }
+
     fn lighting_setup(&self) -> Result<LightingSetup<'_>, RenderError> {
         let s = &self.states;
         let enabled: Vec<_> = self
@@ -706,6 +844,74 @@ mod tests {
         state.light_enable(0, true).unwrap();
         state
     }
+    #[test]
+    fn gpu_uniform_layout_and_cpu_fallback_keep_diagnostics() {
+        assert_eq!(std::mem::size_of::<GpuLight>(), 96);
+        assert_eq!(std::mem::size_of::<LightingUniform>(), 960);
+        assert_eq!(std::mem::offset_of!(LightingUniform, flags), 176);
+        assert_eq!(std::mem::offset_of!(LightingUniform, lights), 192);
+        let mut state = directional();
+        assert!(state.gpu_lighting_uniform().unwrap().is_some());
+        for attenuation0 in [0.0, -1.0, f32::INFINITY, f32::NAN] {
+            state
+                .set_light(
+                    0,
+                    Light {
+                        light_type: 1,
+                        position: [0.0, 0.0, 1.0],
+                        range: 10.0,
+                        attenuation0,
+                        ..Light::default()
+                    },
+                )
+                .unwrap();
+            assert!(state.gpu_lighting_uniform().unwrap().is_none());
+            assert!(
+                state
+                    .light_vertices(
+                        &vertex([0.0, 0.0, 1.0], u32::MAX),
+                        0,
+                        1,
+                        LitInput::XYZ_NORMAL_DIFFUSE_TEX1,
+                        &mut Vec::new()
+                    )
+                    .unwrap_err()
+                    .to_string()
+                    .contains("attenuation denominator")
+            );
+        }
+        state
+            .set_light(
+                0,
+                Light {
+                    light_type: 1,
+                    position: [0.0, 0.0, 1.0],
+                    range: 10.0,
+                    attenuation0: 1.0,
+                    ..Light::default()
+                },
+            )
+            .unwrap();
+        let valid = vertex([0.0, 0.0, 1.0], u32::MAX);
+        let mut bad = valid.clone();
+        bad[..4].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(state.gpu_lighting_positions_supported(&valid, 0, 1, 36));
+        assert!(!state.gpu_lighting_positions_supported(&bad, 0, 1, 36));
+        state
+            .set_light(
+                0,
+                Light {
+                    light_type: 99,
+                    ..Light::default()
+                },
+            )
+            .unwrap();
+        assert!(state.gpu_lighting_uniform().is_err());
+        state.light_enable(0, false).unwrap();
+        state.world = Mat4::scale(0.0, 1.0, 1.0);
+        assert!(state.gpu_lighting_uniform().is_err());
+    }
+
     #[test]
     fn packed_indexed_lighting_matches_expanded_bytes_and_skips_invalid_gaps() {
         use crate::d3d8::resource::{IndexedDraw, expand_indexed_into, packed_indexed_list_into};

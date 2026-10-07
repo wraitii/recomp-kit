@@ -3,13 +3,14 @@
 use super::{
     fixed_function::{
         AlphaTestUniform, FogUniform, FvfLayout, StagesUniform, TEXTURED_WGSL, TransformUniform,
-        UNLIT_WGSL, lit_layout, lit_shader_source,
+        UNLIT_WGSL, gpu_lit_layout, gpu_lit_shader_source, gpu_lit_source, lit_layout,
+        lit_shader_source,
     },
     resource::{
         IndexedDraw, VertexBuffer, expand_indexed_into, indexed_list_into, packed_indexed_list_into,
     },
     shader::{self, Declaration, Program},
-    state::{DeviceState, LitInput, MAX_TEXTURE_STAGES},
+    state::{DeviceState, LightingUniform, LitInput, MAX_TEXTURE_STAGES},
     stats, survey,
     texture_cache::{TextureCache, TextureKey},
 };
@@ -931,12 +932,18 @@ const DRAW_UB_FOG: u64 = 256;
 const DRAW_UB_ALPHA_TEST: u64 = 512;
 const DRAW_UB_STAGES: u64 = 768;
 const DRAW_UB_PROGRAM: u64 = 1024;
+// Fixed-function lighting reuses the otherwise unused program bank. Only a
+// GPU-lit draw with a pixel shader needs both immutable banks simultaneously.
+const DRAW_UB_LIGHTING: u64 = DRAW_UB_PROGRAM;
 const DRAW_VERTEX_OFFSET: u64 = 3072;
+const DRAW_UB_LIGHTING_EXTENDED: u64 = DRAW_VERTEX_OFFSET;
+const DRAW_EXTENDED_VERTEX_OFFSET: u64 = 4096;
 const _: () = {
     assert!(std::mem::size_of::<TransformUniform>() <= 256);
     assert!(std::mem::size_of::<FogUniform>() <= 256);
     assert!(std::mem::size_of::<AlphaTestUniform>() <= 256);
     assert!(std::mem::size_of::<StagesUniform>() <= 256);
+    assert!(std::mem::size_of::<LightingUniform>() <= 1024);
 };
 
 /// The raw `MTLTexture*` behind a wgpu texture. Only the Metal backend has one.
@@ -1005,6 +1012,7 @@ struct StageBindings {
 struct PendingDraw {
     pipeline: wgpu::RenderPipeline,
     ub_base: u64,
+    lighting_offset: u64,
     vertex_base: u64,
     vertex_len: u64,
     stages: bool,
@@ -1023,13 +1031,13 @@ struct PendingDraw {
 struct DrawBatch {
     draws: Vec<PendingDraw>,
     data: Vec<u8>,
-    /// Offset of the most recent uniform block in `data`, for sharing.
-    last_ub: Option<usize>,
+    /// Offset and length of the most recent uniform block, for sharing.
+    last_ub: Option<(usize, usize)>,
     color_view: Option<wgpu::TextureView>,
     depth: Option<(wgpu::TextureView, bool)>,
 }
 
-/// Explicit bind group layouts for the draw pipelines. Group 0 binds the four
+/// Explicit bind group layouts for the draw pipelines. Group 0 binds the
 /// per-draw uniform blocks with dynamic offsets into the shared draw buffer, so
 /// one bind group serves every draw; group 1 (textured only) holds the stage
 /// textures and samplers.
@@ -1060,13 +1068,14 @@ impl DrawLayouts {
         let fog = uniform(2, std::mem::size_of::<FogUniform>());
         let alpha = uniform(3, std::mem::size_of::<AlphaTestUniform>());
         let program = uniform(4, std::mem::size_of::<shader::Uniform>());
+        let lighting = uniform(5, std::mem::size_of::<LightingUniform>());
         let bgl_unlit = gpu.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("D3D8 unlit uniforms"),
-            entries: &[transform, fog, alpha],
+            entries: &[transform, fog, alpha, lighting],
         });
         let bgl_textured = gpu.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("D3D8 textured uniforms"),
-            entries: &[transform, stages, fog, alpha, program],
+            entries: &[transform, stages, fog, alpha, program, lighting],
         });
         let tex = |binding: u32| wgpu::BindGroupLayoutEntry {
             binding,
@@ -1136,6 +1145,7 @@ struct DrawStats {
 /// texture targets.)
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct DrawPipelineKey {
+    gpu_lighting: bool,
     topology: wgpu::PrimitiveTopology,
     color_format: wgpu::TextureFormat,
     color_write_mask: wgpu::ColorWrites,
@@ -1158,11 +1168,14 @@ pub struct Device {
     pub vertex_shader: u32,
     pub pixel_shader: u32,
     pub shader_uniform: shader::Uniform,
-    programmable_modules: std::collections::HashMap<(u32, u32, u32), wgpu::ShaderModule>,
+    programmable_modules: std::collections::HashMap<(u32, u32, u32, bool), wgpu::ShaderModule>,
     shader: Option<wgpu::ShaderModule>,
     textured_shader: Option<wgpu::ShaderModule>,
     lit_shader: Option<wgpu::ShaderModule>,
     lit_textured_shader: Option<wgpu::ShaderModule>,
+    gpu_lit_shaders: std::collections::HashMap<(u32, bool), wgpu::ShaderModule>,
+    /// Comparison switch; ProcessVertices and unsupported states remain CPU-lit.
+    cpu_lighting: bool,
     pipelines: std::collections::HashMap<DrawPipelineKey, wgpu::RenderPipeline>,
     pub state: DeviceState,
     pub gpu: GpuContext,
@@ -1185,12 +1198,8 @@ pub struct Device {
     /// Reused software-lighting output for the normal-bearing FVFs (0x112 and
     /// 0x152); sized and fully overwritten by `light_vertices`.
     lit_scratch: Vec<u8>,
-    /// One persistent buffer holding a draw's uniforms (at the `DRAW_UB_*`
-    /// offsets) and vertices (at `DRAW_VERTEX_OFFSET`), filled by a single
-    /// `queue.write_buffer_with` per draw (five separate writes allocated five
-    /// staging buffers). Safe because each draw submits its own command buffer
-    /// (queue writes are ordered before the following submit); batching submits
-    /// would require a per-draw ring.
+    /// Persistent upload buffer for immutable batched uniforms, vertices and
+    /// indices. One queue write and submission per flush preserves draw order.
     draw_buffer: std::cell::RefCell<Option<wgpu::Buffer>>,
     draw_layouts: DrawLayouts,
     /// Group-0 bind groups over `draw_buffer` (unlit, textured); the real block
@@ -1250,6 +1259,8 @@ impl Device {
             textured_shader: None,
             lit_shader: None,
             lit_textured_shader: None,
+            gpu_lit_shaders: Default::default(),
+            cpu_lighting: std::env::var_os("RECOMP_D3D8_CPU_LIGHTING").is_some(),
             pipelines: std::collections::HashMap::new(),
             state: DeviceState::new(width, height),
             stage_textures: std::array::from_fn(|_| None),
@@ -1806,7 +1817,7 @@ impl Device {
     pub fn retire_shader(&mut self, handle: u32) {
         self.shaders.remove(&handle);
         self.programmable_modules
-            .retain(|&(vs, ps, _), _| vs != handle && ps != handle);
+            .retain(|&(vs, ps, _, _), _| vs != handle && ps != handle);
         self.pipelines
             .retain(|key, _| key.vs != handle && key.ps != handle);
     }
@@ -2062,7 +2073,30 @@ impl Device {
         } else {
             self.cull_state()
         };
+        let lighting_uniform = if !self.cpu_lighting && vs.is_none() && matches!(fvf, 0x112 | 0x152)
+        {
+            if self.state.gpu_lighting_positions_supported(
+                vertices.bytes(),
+                start_vertex as usize,
+                count as usize,
+                vertices.stride as usize,
+            ) {
+                survey_or_skip!(self.state.gpu_lighting_uniform())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let gpu_lighting = lighting_uniform.is_some();
+        let extended_lighting = gpu_lighting && ps.is_some();
+        let lighting_offset = if extended_lighting {
+            DRAW_UB_LIGHTING_EXTENDED
+        } else {
+            DRAW_UB_LIGHTING
+        };
         let key = DrawPipelineKey {
+            gpu_lighting,
             topology: wgpu_topology(topology),
             color_format: self.target.format,
             color_write_mask: color_writes_from_mask(self.state.color_write_mask())
@@ -2140,10 +2174,9 @@ impl Device {
             self.state.alpha_func().raw(),
             self.state.alpha_ref(),
         );
-        // Compute fixed-function vertex lighting before rasterization. Only
-        // the requested vertex interval is read and packed from slot zero. The
-        // scratch is moved out for the duration of the draw so the rest of this method can
-        // borrow `self` mutably; it is restored below before it is reused.
+        // GPU lighting consumes raw guest attributes and the immutable light
+        // snapshot. CPU fallback packs only the requested vertex interval;
+        // move its reusable scratch out while this method borrows self.
         let lit_input = if vs.is_some() {
             None
         } else {
@@ -2153,7 +2186,9 @@ impl Device {
                 _ => None,
             }
         };
-        let mut lit_scratch = lit_input.map(|_| std::mem::take(&mut self.lit_scratch));
+        let mut lit_scratch = lit_input
+            .filter(|_| !gpu_lighting)
+            .map(|_| std::mem::take(&mut self.lit_scratch));
         if let Some(out) = lit_scratch.as_mut() {
             if let Err(error) = self.state.light_vertices(
                 vertices.bytes(),
@@ -2170,7 +2205,9 @@ impl Device {
             }
         }
         let lit_bytes = lit_scratch.as_deref();
-        let upload_layout = if lit_bytes.is_some() {
+        let upload_layout = if gpu_lighting {
+            gpu_lit_layout(fvf)
+        } else if lit_bytes.is_some() {
             lit_layout()
         } else {
             layout.clone()
@@ -2186,15 +2223,29 @@ impl Device {
             gpu.push_error_scope(wgpu::ErrorFilter::Validation);
             self.frame_scope_open = true;
         }
-        let shader = if programmable {
-            self.programmable_modules
-                .entry((self.vertex_shader, self.pixel_shader, fvf))
+        let shader = if gpu_lighting && !programmable {
+            self.gpu_lit_shaders
+                .entry((fvf, textured))
                 .or_insert_with(|| {
-                    let source = shader::compose(
+                    gpu.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("D3D8 GPU diffuse lighting"),
+                        source: wgpu::ShaderSource::Wgsl(
+                            gpu_lit_shader_source(textured, fvf).into(),
+                        ),
+                    })
+                })
+        } else if programmable {
+            self.programmable_modules
+                .entry((self.vertex_shader, self.pixel_shader, fvf, gpu_lighting))
+                .or_insert_with(|| {
+                    let mut source = shader::compose(
                         vs.and_then(|(d, p)| d.as_ref().map(|d| (d, p))),
                         ps,
                         lit_input.is_some(),
                     );
+                    if gpu_lighting {
+                        source = gpu_lit_source(source, fvf);
+                    }
                     gpu.create_shader_module(wgpu::ShaderModuleDescriptor {
                         label: Some("D3D8 shader-model 1.1"),
                         source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -2271,36 +2322,42 @@ impl Device {
             // previous draw when byte-identical: state rarely changes between
             // consecutive draws, and the block is 1 KB against a few hundred
             // bytes of vertices.
-            let mut ub = [0u8; DRAW_VERTEX_OFFSET as usize];
+            let mut ub_storage = [0u8; DRAW_EXTENDED_VERTEX_OFFSET as usize];
+            let ub_len = if extended_lighting {
+                DRAW_EXTENDED_VERTEX_OFFSET
+            } else {
+                DRAW_VERTEX_OFFSET
+            } as usize;
+            let ub = &mut ub_storage[..ub_len];
             let put = |region: &mut [u8], offset: u64, bytes: &[u8]| {
                 region[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
             };
+            put(ub, DRAW_UB_PROGRAM, bytemuck::bytes_of(&program_uniform));
+            if let Some(lighting) = &lighting_uniform {
+                put(ub, lighting_offset, bytemuck::bytes_of(lighting));
+            }
+            put(ub, DRAW_UB_TRANSFORM, bytemuck::bytes_of(&uniform));
+            put(ub, DRAW_UB_FOG, bytemuck::bytes_of(&fog_uniform));
             put(
-                &mut ub,
-                DRAW_UB_PROGRAM,
-                bytemuck::bytes_of(&program_uniform),
-            );
-            put(&mut ub, DRAW_UB_TRANSFORM, bytemuck::bytes_of(&uniform));
-            put(&mut ub, DRAW_UB_FOG, bytemuck::bytes_of(&fog_uniform));
-            put(
-                &mut ub,
+                ub,
                 DRAW_UB_ALPHA_TEST,
                 bytemuck::bytes_of(&alpha_test_uniform),
             );
             if let Some(stages) = &stages_uniform {
-                put(&mut ub, DRAW_UB_STAGES, bytemuck::bytes_of(stages));
+                put(ub, DRAW_UB_STAGES, bytemuck::bytes_of(stages));
             }
             let shared = batch
                 .last_ub
-                .filter(|&at| batch.data[at..at + ub.len()] == ub);
+                .filter(|&(at, len)| len == ub.len() && batch.data[at..at + len] == *ub)
+                .map(|(at, _)| at);
             let ub_base = match shared {
                 Some(at) => at,
                 None => {
                     // Uniform binding offsets need 256-byte alignment.
                     let at = batch.data.len().next_multiple_of(256);
                     batch.data.resize(at, 0);
-                    batch.data.extend_from_slice(&ub);
-                    batch.last_ub = Some(at);
+                    batch.data.extend_from_slice(ub);
+                    batch.last_ub = Some((at, ub.len()));
                     at
                 }
             };
@@ -2391,6 +2448,7 @@ impl Device {
         self.batch.borrow_mut().draws.push(PendingDraw {
             pipeline,
             ub_base,
+            lighting_offset,
             vertex_base,
             vertex_len: vertex_len as u64,
             stages: stages_uniform.is_some(),
@@ -2455,18 +2513,19 @@ impl Device {
             let f = entry(2, std::mem::size_of::<FogUniform>());
             let a = entry(3, std::mem::size_of::<AlphaTestUniform>());
             let p = entry(4, std::mem::size_of::<shader::Uniform>());
+            let l = entry(5, std::mem::size_of::<LightingUniform>());
             if groups[0].is_none() {
                 groups[0] = Some(gpu.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("D3D8 unlit uniforms binding"),
                     layout: &self.draw_layouts.bgl_unlit,
-                    entries: &[t.clone(), f.clone(), a.clone()],
+                    entries: &[t.clone(), f.clone(), a.clone(), l.clone()],
                 }));
             }
             if groups[1].is_none() {
                 groups[1] = Some(gpu.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("D3D8 textured uniforms binding"),
                     layout: &self.draw_layouts.bgl_textured,
-                    entries: &[t, st, f, a, p],
+                    entries: &[t, st, f, a, p, l],
                 }));
             }
         }
@@ -2518,13 +2577,18 @@ impl Device {
                     (base + DRAW_UB_FOG) as u32,
                     (base + DRAW_UB_ALPHA_TEST) as u32,
                     (base + DRAW_UB_PROGRAM) as u32,
+                    (base + d.lighting_offset) as u32,
                 ];
                 pass.set_pipeline(&d.pipeline);
-                // Binding order: transform, [stages], fog, alpha test.
+                // Binding order: transform, [stages], fog, alpha, [program], lighting.
                 if d.stages {
                     pass.set_bind_group(0, group, &offsets);
                 } else {
-                    pass.set_bind_group(0, group, &[offsets[0], offsets[2], offsets[3]]);
+                    pass.set_bind_group(
+                        0,
+                        group,
+                        &[offsets[0], offsets[2], offsets[3], offsets[5]],
+                    );
                 }
                 if let Some(t) = &d.textures {
                     if texture_groups.len() >= MAX_TEXTURE_GROUPS {
@@ -2606,6 +2670,7 @@ impl Device {
             self.textured_shader = None;
             self.lit_shader = None;
             self.lit_textured_shader = None;
+            self.gpu_lit_shaders.clear();
             return Err(RenderError::new(
                 "DrawPrimitive",
                 format!(
@@ -2619,7 +2684,7 @@ impl Device {
 
     /// `DrawIndexedPrimitive`: snapshot compact triangle lists as GPU-indexed
     /// draws, including declaration-derived programmable layouts. Lit lists
-    /// pack distinct referenced vertices before CPU lighting; unlit sparse
+    /// pack distinct referenced vertices for GPU lighting or CPU fallback; unlit sparse
     /// ranges and other topologies retain expansion.
     /// Both paths validate actual index reads rather than the upload hints.
     pub fn draw_indexed_primitive(
@@ -2652,9 +2717,9 @@ impl Device {
             _ => fvf,
         };
         if !expand && draw.topology == 4 && topology == 4 {
-            // Keep CPU lighting math unchanged, but evaluate each referenced
-            // source vertex once. Never evaluate unused sparse gaps. The normal
-            // draw path lights the packed stream and queues immutable snapshots.
+            // Pack only referenced sources: GPU lighting consumes their raw
+            // attributes, CPU fallback evaluates each source once. Sparse gaps
+            // are never evaluated; queued snapshots own all required bytes.
             if matches!(effective_fvf, 0x0152 | 0x0112) {
                 let mut packed = std::mem::take(&mut self.index_scratch);
                 let mut remapped = std::mem::take(&mut self.index_rebased);
@@ -3143,6 +3208,7 @@ mod tests {
         use crate::{backend::GpuContext, d3d8::state::Light};
         let gpu = pollster::block_on(GpuContext::new_headless()).expect("Metal adapter");
         let mut device = Device::new(gpu, 64, 32, 21, 0).unwrap();
+        device.cpu_lighting = true;
         device.state.set_render_state(7, 0).unwrap();
         device.state.set_render_state(22, 1).unwrap();
         // Input registers differ from fixed-function attribute locations.
@@ -3297,6 +3363,275 @@ mod tests {
                     colored > 100,
                     "test must render visible pixels: fvf={fvf:#x} stride={stride} format={format}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_lighting_matches_cpu_for_draw_types_and_snapshots() {
+        use super::*;
+        use crate::{
+            backend::GpuContext,
+            d3d8::{
+                math::Mat4,
+                state::{Light, Material},
+            },
+        };
+        let gpu = pollster::block_on(GpuContext::new_headless()).expect("Metal adapter");
+        let mut device = Device::new(gpu, 64, 32, 21, 0).unwrap();
+        device.state.set_render_state(7, 0).unwrap();
+        device.state.set_render_state(22, 1).unwrap();
+        let light = |kind| Light {
+            light_type: kind,
+            position: [0.3, 0.1, 2.0],
+            direction: [0.0, 0.0, -1.0],
+            diffuse: [0.6, 0.4, 0.2, 1.0],
+            ambient: [0.05, 0.07, 0.09, 1.0],
+            range: 20.0,
+            attenuation0: 1.0,
+            attenuation1: 0.1,
+            attenuation2: 0.03,
+            theta: 0.3,
+            phi: 1.5,
+            falloff: 2.3,
+            ..Light::default()
+        };
+        device.state.world = Mat4::scale(0.8, 0.7, 1.3).mul(Mat4::translation(0.05, -0.05, 0.0));
+        device.state.view = Mat4::translation(0.03, 0.02, 0.0);
+        device.shaders.insert(
+            0x10001,
+            (
+                None,
+                Program::parse(&[0xffff0101, 1, 0x800f0000, 0x90e40000, 0xffff], true).unwrap(),
+            ),
+        ); // mov r0,v0: fixed vertices + pixel shader
+        for fvf in [0x112, 0x152] {
+            let stride = if fvf == 0x112 { 32usize } else { 36 };
+            let mut source = vec![0; 50 * stride];
+            for chunk in source.chunks_exact_mut(4) {
+                chunk.copy_from_slice(&f32::NAN.to_le_bytes());
+            }
+            let verts: Vec<Vec<u8>> = [[-0.8f32, -0.8, 0.4], [0.8, -0.8, 0.4], [0.0, 0.8, 0.4]]
+                .into_iter()
+                .enumerate()
+                .map(|(n, pos)| {
+                    let mut v = Vec::new();
+                    for f in pos
+                        .into_iter()
+                        .chain([[0.0, 0.0, 0.0], [0.3, 0.0, 0.7], [0.0, 0.2, 1.8]][n])
+                    {
+                        v.extend(f.to_le_bytes());
+                    }
+                    if fvf == 0x152 {
+                        v.extend([0x80402080u32, 0xc0804020, 0xff208040][n].to_le_bytes());
+                    }
+                    v.extend([0.2f32, 0.7].into_iter().flat_map(f32::to_le_bytes));
+                    v
+                })
+                .collect();
+            for (n, v) in verts.iter().enumerate() {
+                source[(7 + n) * stride..(8 + n) * stride].copy_from_slice(v);
+                source[[5, 22, 43][n] * stride..([5, 22, 43][n] + 1) * stride].copy_from_slice(v);
+            }
+            for case in 0..10 {
+                for slot in 0..8 {
+                    device.state.light_enable(slot, false).unwrap();
+                }
+                let kinds: &[u32] = match case {
+                    0 => &[3],
+                    1 => &[1],
+                    2 => &[2],
+                    _ => &[3, 1, 2],
+                };
+                for (slot, kind) in kinds.iter().enumerate() {
+                    device.state.set_light(slot as u32, light(*kind)).unwrap();
+                    device.state.light_enable(slot as u32, true).unwrap();
+                }
+                device
+                    .state
+                    .set_render_state(137, u32::from(case != 4))
+                    .unwrap();
+                device
+                    .state
+                    .set_render_state(143, u32::from(case % 2 == 1))
+                    .unwrap(); // NORMALIZENORMALS
+                device
+                    .state
+                    .set_render_state(141, u32::from(case != 5))
+                    .unwrap(); // COLORVERTEX
+                for rs in [145, 146, 147] {
+                    // diffuse/specular/ambient sources
+                    device
+                        .state
+                        .set_render_state(rs, if case == 6 { 0 } else { 1 })
+                        .unwrap();
+                }
+                device
+                    .state
+                    .set_render_state(148, if case == 6 { 1 } else { 0 })
+                    .unwrap(); // emissive source
+                device.state.set_render_state(139, 0xff304050).unwrap(); // AMBIENT
+                let material = Material {
+                    diffuse: [0.4, 0.6, 0.8, 0.7],
+                    ambient: [0.2, 0.1, 0.3, 1.0],
+                    emissive: [0.03, 0.01, 0.04, 1.0],
+                    ..Material::d3d_default()
+                };
+                device.state.set_material(material);
+                device.pixel_shader = if case == 7 { 0x10001 } else { 0 };
+                if case == 8 {
+                    device
+                        .set_texture(
+                            0,
+                            987,
+                            21,
+                            &[TextureLevelUpload {
+                                level: 0,
+                                generation: 1,
+                                force_upload: false,
+                                width: 1,
+                                height: 1,
+                                data: &[96, 160, 224, 192],
+                            }],
+                        )
+                        .unwrap();
+                } else {
+                    device.set_texture(0, 0, 0, &[]).unwrap();
+                }
+                device
+                    .state
+                    .set_render_state(28, u32::from(case == 9))
+                    .unwrap(); // FOGENABLE
+                device.state.set_render_state(35, 3).unwrap(); // linear table fog
+                device.state.set_render_state(36, 0.0f32.to_bits()).unwrap();
+                device.state.set_render_state(37, 2.0f32.to_bits()).unwrap();
+                device.state.set_render_state(34, 0xff204080).unwrap();
+                device
+                    .state
+                    .set_render_state(15, u32::from(case == 9))
+                    .unwrap(); // ALPHATESTENABLE
+                device.state.set_render_state(24, 32).unwrap(); // ALPHAREF
+                device.state.set_render_state(25, 7).unwrap(); // GREATEREQUAL
+
+                for format in [0, 101, 102] {
+                    let mut bytes = source.clone();
+                    let mut indices: Vec<u8> = [999u32, 40, 2, 19, 40, 2, 19]
+                        .into_iter()
+                        .flat_map(|i| {
+                            if format == 101 {
+                                (i as u16).to_le_bytes().to_vec()
+                            } else {
+                                i.to_le_bytes().to_vec()
+                            }
+                        })
+                        .collect();
+                    device.clear(0, 1, 0xff000000, 1.0, 0).unwrap();
+                    device.begin_scene().unwrap();
+                    device.state.viewport.width = 32;
+                    device.state.viewport.x = 0;
+                    device.cpu_lighting = false;
+                    if format == 0 {
+                        device
+                            .draw_primitive(
+                                4,
+                                fvf,
+                                &VertexBuffer::borrowed(&bytes, stride as u32).unwrap(),
+                                7,
+                                1,
+                            )
+                            .unwrap();
+                    } else {
+                        device
+                            .draw_indexed_primitive(
+                                4,
+                                fvf,
+                                &bytes,
+                                &indices,
+                                IndexedDraw {
+                                    topology: 4,
+                                    index_format: format,
+                                    stride: stride as u32,
+                                    base_vertex: 3,
+                                    min_index: u32::MAX,
+                                    num_vertices: 0,
+                                    start_index: 1,
+                                    primitive_count: 2,
+                                },
+                            )
+                            .unwrap();
+                    }
+                    {
+                        let batch = device.batch.borrow();
+                        assert_eq!(batch.draws.last().unwrap().vertex_len, (3 * stride) as u64);
+                        assert!(
+                            device
+                                .pipelines
+                                .keys()
+                                .any(|k| k.gpu_lighting && k.fvf == fvf)
+                        );
+                    }
+                    bytes.fill(0);
+                    indices.fill(0); // immutable queued inputs
+                    device.state.set_material(Material {
+                        diffuse: [0.0; 4],
+                        ..material
+                    });
+                    device.state.set_material(material);
+                    device.state.viewport.x = 32;
+                    device.cpu_lighting = true;
+                    let cpu_vertices = if format == 0 {
+                        verts.concat()
+                    } else {
+                        [
+                            verts[2].clone(),
+                            verts[0].clone(),
+                            verts[1].clone(),
+                            verts[2].clone(),
+                            verts[0].clone(),
+                            verts[1].clone(),
+                        ]
+                        .concat()
+                    };
+                    device
+                        .draw_primitive(
+                            4,
+                            fvf,
+                            &VertexBuffer::borrowed(&cpu_vertices, stride as u32).unwrap(),
+                            0,
+                            if format == 0 { 1 } else { 2 },
+                        )
+                        .unwrap();
+                    // Change all lights/material after queuing both draws.
+                    device.state.set_material(Material {
+                        diffuse: [0.0; 4],
+                        ..material
+                    });
+                    for slot in 0..8 {
+                        device.state.light_enable(slot, false).unwrap();
+                    }
+                    device.end_scene().unwrap();
+                    let pixels = device.read_pixels().unwrap();
+                    let mut visible = 0;
+                    for y in 0..32 {
+                        for x in 0..32 {
+                            let left = &pixels[(y * 64 + x) * 4..(y * 64 + x + 1) * 4];
+                            let right = &pixels[(y * 64 + x + 32) * 4..(y * 64 + x + 33) * 4];
+                            for c in 0..4 {
+                                assert!(
+                                    left[c].abs_diff(right[c]) <= 2,
+                                    "fvf={fvf:#x} case={case} format={format} pixel={x},{y}: GPU={left:?} CPU={right:?}"
+                                );
+                            }
+                            visible += usize::from(left[..3] != [0, 0, 0]);
+                        }
+                    }
+                    assert!(visible > 100);
+                    device.state.set_material(material);
+                    for (slot, kind) in kinds.iter().enumerate() {
+                        device.state.set_light(slot as u32, light(*kind)).unwrap();
+                        device.state.light_enable(slot as u32, true).unwrap();
+                    }
+                }
             }
         }
     }
