@@ -34,10 +34,10 @@ def fixture(code):
 
 def test_mixed_callees_use_stable_thunks_and_chunk_declarations(tmp_path):
     # Caller: mov eax,1; call; add eax,ebx; fld1; fstp [ebx]; ret.
-    # Callee: STOSD is unsupported SSA, so it remains decoded C.
+    # Callee: RDTSC is unsupported SSA, so it remains decoded C.
     raw = b"\xb8\x01\x00\x00\x00\xe8" + struct.pack("<i", CALLEE - ENTRY - 10)
     raw += b"\x01\xd8\xd9\xe8\xd9\x1b\xc3"
-    tr, functions, bodies = fixture({ENTRY: raw, CALLEE: b"\xab\xc3"})
+    tr, functions, bodies = fixture({ENTRY: raw, CALLEE: b"\x0f\x31\xc3"})
     original = bodies[CALLEE][:]
     report = apply(tr, functions, bodies, {}, SETTINGS, quiet=True)
     assert report["emitted"] == report["fallback"] == 1

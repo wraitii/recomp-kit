@@ -306,4 +306,27 @@ CASES = {
         "d95b04",      # FSTP dword [EBX+4]
         "c3",
     ),
+
+    # Transcendentals: full-precision results through the scalar tracker (unary)
+    # and the audited runtime recipe (push/pop forms). The FADD first leaves a
+    # lazy-NaN pending value for NaN inputs.
+    "x87_fsin": ("d906", "d9fe", "dd1b", "c3"),
+    "x87_fsin_pending": ("d906", "d8c0", "d9fe", "dd1b", "c3"),
+    "x87_fsin_status": ("d906", "d9fe", "d95b08", "dfe0", "8903", "c3"),
+    "x87_fcos": ("d906", "d9ff", "dd1b", "c3"),
+    "x87_fcos_pending": ("d906", "d8c0", "d9ff", "dd1b", "c3"),
+    "x87_fcos_status": ("d906", "d9ff", "d95b08", "dfe0", "8903", "c3"),
+    "x87_f2xm1": ("d906", "d9f0", "dd1b", "c3"),
+    "x87_f2xm1_pending": ("d906", "d8c0", "d9f0", "dd1b", "c3"),
+    "x87_f2xm1_status": ("d906", "d9f0", "d95b08", "dfe0", "8903", "c3"),
+    "x87_fptan": ("d906", "d9f2", "dd1b", "dd5b08", "c3"),
+    "x87_fptan_pending": ("d906", "d8c0", "d9f2", "dd1b", "dd5b08", "c3"),
+    "x87_fsincos": ("d906", "d9fb", "dd1b", "dd5b08", "c3"),
+    "x87_fsincos_pending": ("d906", "d8c0", "d9fb", "dd1b", "dd5b08", "c3"),
+    "x87_fscale": ("d94604", "d906", "d9fd", "dd1b", "dd5b08", "c3"),
+    "x87_fpatan": ("d94604", "d906", "d9f3", "dd1b", "c3"),
+    "x87_fpatan_pending": ("d94604", "d8c0", "d906", "d8c0", "d9f3", "dd1b", "c3"),
+    "x87_fyl2x": ("d94604", "d906", "d9f1", "dd1b", "c3"),
+    "x87_fyl2xp1": ("d94604", "d906", "d9f9", "dd1b", "c3"),
+    "x87_fyl2x_status": ("d94604", "d906", "d9f1", "dfe0", "8903", "c3"),
 }

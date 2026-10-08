@@ -110,6 +110,28 @@ CASES = {
     "rep_movsd_df0": ("fc", "b903000000", "f3a5", "c3"),
     "rep_movsd_df1": ("be20000100", "bf60000100", "fd", "b903000000", "f3a5", "c3"),
     "rep_movsd_overlap": ("be00000100", "bf02000100", "b904000000", "fc", "f3a5", "c3"),
+    # Remaining byte-audited string forms and bare WAIT/SAHF/MUL. Flags after
+    # REPNE SCASB / REPE CMPSB depend on where the scan stops.
+    "rep_movsb_df0": ("be00000100", "bf20000100", "fc", "b907000000", "f3a4", "c3"),
+    "rep_movsb_df1": ("be20000100", "bf60000100", "fd", "b905000000", "f3a4", "c3"),
+    "rep_movsw": ("be00000100", "bf20000100", "fc", "b903000000", "66f3a5", "c3"),
+    "movsb_single": ("be00000100", "bf20000100", "a4", "c3"),
+    "rep_stosd": ("bf00000100", "fc", "b904000000", "f3ab", "c3"),
+    "rep_stosb_df1": ("bf20000100", "fd", "b905000000", "f3aa", "c3"),
+    "stosw_single": ("bf00000100", "66ab", "c3"),
+    "repne_scasb": ("bf00000100", "fc", "b908000000", "f2ae", "c3"),
+    "repne_scasb_zero_count": ("bf00000100", "31c9", "f2ae", "c3"),
+    "repe_scasb": ("bf00000100", "fc", "b908000000", "f3ae", "c3"),
+    "scasd_single": ("bf00000100", "af", "c3"),
+    "repe_cmpsb": ("be00000100", "bf20000100", "fc", "b908000000", "f3a6", "c3"),
+    "repne_cmpsd": ("be00000100", "bf20000100", "fc", "b904000000", "f2a7", "c3"),
+    "wait_nop": ("9b", "c3"),
+    "sahf": ("9e", "c3"),
+    "sahf_then_branch": ("9e", "7502", "ffc0", "c3"),
+    "mul8": ("f6e1", "c3"),
+    "mul16": ("66f7e1", "c3"),
+    "mul32": ("f7e1", "c3"),
+    "mul32_mem": ("f723", "c3"),
 }
 
 # Signed-integer (CDQ/IMUL/IDIV/NEG/SAR/SETcc) and x87 register-run cases kept

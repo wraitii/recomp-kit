@@ -23,12 +23,37 @@ from . import x87
 SUPPORTED_MNEMONICS = frozenset((
     "MOV", "MOVSX", "MOVZX", "XCHG", "NOT", "LEAVE", "LEA", "PUSH", "POP", "RET", "NOP", "ADD", "SUB", "CMP", "INC", "DEC",
     "ADC", "SBB", "SHL", "SHR", "DIV",
-    "CLD", "STD",
+    "CLD", "STD", "SAHF", "MUL",
     "TEST", "AND", "OR", "XOR", "JMP", "JZ", "JNZ", "JE", "JNE",
     "JA", "JAE", "JB", "JBE", "JC", "JNC", "JG", "JGE", "JL", "JLE", "JS", "JNS",
     "JO", "JNO", "JP", "JNP", "JPE", "JPO", "CALL",
 )) | EXTRA_MNEMONICS
 
+
+def _string_helpers():
+    """Map the audited string-instruction encodings to their runtime helpers."""
+    table = {}
+    for opcode, name in ((0xa4, "movs"), (0xa5, "movs"), (0xaa, "stos"), (0xab, "stos"),
+                         (0xa6, "cmps"), (0xa7, "cmps"), (0xae, "scas"), (0xaf, "scas")):
+        for size_prefix, wide in ((b"", "d"), (b"\x66", "w")):
+            if opcode & 1 == 0:
+                if size_prefix:
+                    continue
+                suffix = "b"
+            else:
+                suffix = wide
+            single = bytes([opcode])
+            table[size_prefix + single] = name + suffix
+            if name in ("movs", "stos"):
+                table[size_prefix + b"\xf3" + single] = "rep_" + name + suffix
+            else:
+                table[b"\xf3" + size_prefix + single] = "repe_" + name + suffix
+                table[b"\xf2" + size_prefix + single] = "repne_" + name + suffix
+    return table
+
+
+#: Raw encodings (bare, REP, REPE, REPNE; byte, word, dword) -> runtime helper.
+STRING_HELPERS = _string_helpers()
 
 # Arithmetic flags tracked by the calling-convention census.
 FLAG_FIELDS = frozenset("c->eflags_" + n for n in ("cf", "pf", "af", "zf", "sf", "of"))
@@ -109,14 +134,21 @@ def codegen_ir(fir, lifter):
             insns.append(Insn(ins.addr, ins.length, ins.mnem, ops, 0,
                               False, False, [], ins.raw))
             continue
-        # String MOVSD is byte-audited to the runtime helper rather than the
-        # raw SLEIGH loop: SLEIGH advances ESI/EDI and decrements ECX before
-        # the access, while the helper accesses first and then advances. Only
-        # dword MOVSD (bare A5 and REP F3 A5) is admitted; SSE MOVSD and
-        # address-size or other prefixes stay unsupported fallbacks.
-        if mnem in ("MOVSD", "MOVSD.REP") and ins.raw in (b"\xa5", b"\xf3\xa5"):
-            ops = [Op("MOVS32", None, [], {"rep": ins.raw.startswith(b"\xf3")})]
+        # String instructions are byte-audited to the runtime helpers rather
+        # than the raw SLEIGH loops: SLEIGH advances ESI/EDI and decrements ECX
+        # before the access, while the helpers access first and then advance.
+        # Only the exact byte sequences in STRING_HELPERS are admitted; SSE
+        # MOVSD, address-size and other prefixes stay unsupported fallbacks.
+        helper = STRING_HELPERS.get(ins.raw)
+        if helper is not None:
+            ops = [Op("STRINGOP", None, [], {"helper": helper})]
             insns.append(Insn(ins.addr, ins.length, ins.mnem, ops, 0,
+                              False, False, [], ins.raw))
+            continue
+        if mnem == "WAIT":
+            # A bare WAIT only synchronises pending x87 exceptions; the port's
+            # eager emitter treats it as a no-op, and no exception is delivered.
+            insns.append(Insn(ins.addr, ins.length, ins.mnem, [], 0,
                               False, False, [], ins.raw))
             continue
         if mnem not in SUPPORTED_MNEMONICS:
@@ -415,7 +447,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                     if m in ("FXAM", "FIST", "FISTP", "FLDCW", "FNINIT", "FINIT") or (
                             v.opc == "X87_MEM" and m in ("FST", "FSTP", "FNSTSW", "FNSTCW")):
                         finish_scalar_run()
-                elif v.opc in ("STORE", "DIV32", "IDIV32", "CALL", "CALLIND", "MOVS32",
+                elif v.opc in ("STORE", "DIV32", "IDIV32", "CALL", "CALLIND", "STRINGOP",
                                "RETURN", "BRANCH", "CBRANCH"):
                     finish_scalar_run()
             prev = i
@@ -581,16 +613,16 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 if resumable_stacks:
                     lines.append("if (c->eip != 0x%x) return;" % (
                         b.insn.addr + b.insn.length))
-            elif v.opc == "MOVS32":
+            elif v.opc == "STRINGOP":
                 lines.extend(flush_x87())
                 if scalar is not None:
                     scalar.reset()
-                # Byte-audited dword string move. Publication before the helper
+                # Byte-audited string instruction. Publication before the helper
                 # and reloads afterward keep guest memory observers and fault
                 # snapshots in access-then-advance order; the helper owns
-                # EDI/ESI/ECX/DF exactly as the eager emitter's rep_movsd does.
+                # EDI/ESI/ECX/DF exactly as the eager emitter's string calls do.
                 lines.extend(publish(b.snapshots[v.id], v))
-                lines.append("rep_movsd(c);" if v.data.get("rep") else "movsd(c);")
+                lines.append("%s(c);" % v.data["helper"])
             elif v.opc in ("LOAD", "STORE", "DIV32", "IDIV32"):
                 # Guest accesses do not observe x87 state (see x87_scalar.py);
                 # only strict mode publishes before them. The division seam

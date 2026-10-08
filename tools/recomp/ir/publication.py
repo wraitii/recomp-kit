@@ -59,7 +59,7 @@ Starting with no facts gives a conservative least fixed point for loops.
                         required.extend(keys)
                     known[n] = current
                 publications[v.id] = tuple(required)
-                if v.opc in ("DIV32", "IDIV32", "CALL", "CALLIND", "MOVS32"):
+                if v.opc in ("DIV32", "IDIV32", "CALL", "CALLIND", "STRINGOP"):
                     # A division error handler, an opaque callee and the string
                     # helper's fault path may leave arbitrary CPU state behind,
                     # so no must-fact survives.

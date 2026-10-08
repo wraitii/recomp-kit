@@ -507,16 +507,33 @@ def test_rep_movsd_lowers_to_audited_runtime_helper_only():
         rep = named_function([("f3a5", mnem), ("c3", "RET")])
         body = emit(rep, "test_fn")
         assert "rep_movsd(c);" in body
-        assert any(op.opc == "MOVS32" and op.data == {"rep": True}
+        assert any(op.opc == "STRINGOP" and op.data == {"helper": "rep_movsd"}
                    for ins in codegen_ir(rep, LIFTER).insns for op in ins.ops)
     bare = named_function([("a5", "MOVSD"), ("c3", "RET")])
     assert "movsd(c);" in emit(bare, "test_fn")
-    # SSE MOVSD, other string widths and address-size/other prefixes stay
-    # whole-function fallbacks rather than becoming an unaudited helper call.
-    for h, mnem in (("f20f10c1", "MOVSD"), ("f3a4", "MOVSB"),
-                    ("66a5", "MOVSW"), ("67a5", "MOVSD")):
+    # SSE MOVSD and address-size/other prefixes stay whole-function fallbacks
+    # rather than becoming an unaudited helper call.
+    for h, mnem in (("f20f10c1", "MOVSD"), ("67a5", "MOVSD"), ("f2a5", "MOVSD")):
         with pytest.raises(SSAError, match="unsupported instruction"):
             emit(named_function([(h, mnem), ("c3", "RET")]), "test_fn")
+
+
+@pytest.mark.parametrize("hexcode,mnem,helper", [
+    ("f3a4", "MOVSB", "rep_movsb"), ("a4", "MOVSB", "movsb"), ("66a5", "MOVSW", "movsw"),
+    ("f3aa", "STOSB", "rep_stosb"), ("f3ab", "STOSD", "rep_stosd"), ("aa", "STOSB", "stosb"),
+    ("f2ae", "SCASB", "repne_scasb"), ("f3ae", "SCASB", "repe_scasb"), ("ae", "SCASB", "scasb"),
+    ("f2af", "SCASD", "repne_scasd"), ("f3a6", "CMPSB", "repe_cmpsb"), ("f2a7", "CMPSD", "repne_cmpsd"),
+])
+def test_audited_string_instructions_call_runtime_helpers(hexcode, mnem, helper):
+    body = emit(named_function([(hexcode, mnem), ("c3", "RET")]), "test_fn")
+    assert "%s(c);" % helper in body
+
+
+def test_bare_wait_is_a_no_op_and_sahf_mul_are_admitted():
+    emit(named_function([("9b", "WAIT"), ("c3", "RET")]), "test_fn")
+    emit(named_function([("9e", "SAHF"), ("c3", "RET")]), "test_fn")
+    for h in ("f7e1", "f6e1", "66f7e1"):
+        emit(named_function([(h, "MUL"), ("c3", "RET")]), "test_fn")
 
 
 def test_rep_movsd_reloads_indices_count_and_flags_after_helper():
@@ -525,7 +542,7 @@ def test_rep_movsd_reloads_indices_count_and_flags_after_helper():
     f = codegen_ir(named_function([("b909000000", "MOV"), ("f3a5", "MOVSD"),
                                    ("c3", "RET")]), LIFTER)
     s = build(f, register_groups=runtime_groups())
-    moves = [v for b in s.blocks.values() for v in b.ops if v.opc == "MOVS32"]
+    moves = [v for b in s.blocks.values() for v in b.ops if v.opc == "STRINGOP"]
     assert len(moves) == 1
     block = next(b for b in s.blocks.values() if moves[0] in b.ops)
     after = block.ops[block.ops.index(moves[0]) + 1:]

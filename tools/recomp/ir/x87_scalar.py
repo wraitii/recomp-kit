@@ -637,7 +637,7 @@ class X87Scalar:
                 # Sign/payload-sensitive: eager acts on the canonical indefinite.
                 self._fold(0, lines)
             self._set(0, (x87.UNARY[m] % read(0)).replace("(c,", "(&x87_env_,"), lines,
-                      narrow=narrow, subsumed=self.lazy_nan and m in ("FSQRT", "FRNDINT"))
+                      narrow=narrow, subsumed=self.lazy_nan and m in ("FSQRT", "FRNDINT", "FSIN", "FCOS", "F2XM1"))
             self.status_dirty = True
         elif m in ("FPREM", "FPREM1"):
             self._set(0, "fprem_common(&x87_env_, %s, %s, %d)" %

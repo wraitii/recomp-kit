@@ -62,7 +62,7 @@ def test_register_operand_direction_comes_from_bytes(hexcode, expected):
 @pytest.mark.parametrize("hexcode,reason", [
     ("64d900", "unsupported x87 addressing"),
     ("67d900", "unsupported x87 addressing"),
-    ("d9fb", "unsupported x87 instruction FSINCOS"),
+    ("d9f4", "unsupported x87 instruction FXTRACT"),
     ("d933", "unsupported x87 instruction FNSTENV"),
     ("dbe9", "unsupported x87 instruction FUCOMI"),
 ])

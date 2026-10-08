@@ -232,7 +232,7 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                 value = emit(op.opc, op.out[2] if op.out else 0, args, op.data)
             if op.out is not None:
                 write(op.out, value)
-            if op.opc in ("DIV32", "IDIV32", "MOVS32"):
+            if op.opc in ("DIV32", "IDIV32", "STRINGOP"):
                 # A returning divide-error handler and the string helper's
                 # fault path may leave arbitrary CPU state behind. Reload every
                 # tracked lane and flag from the helper's result state, exactly

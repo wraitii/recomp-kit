@@ -6,7 +6,7 @@ The passes work on SSA rather than C spelling and can serve other consumers.
 """
 
 EFFECTS = frozenset(("LOAD", "STORE", "DIV32", "IDIV32", "X87_MEM", "CALL",
-                     "CALLIND", "MOVS32"))
+                     "CALLIND", "STRINGOP"))
 ORDERED = EFFECTS | {"X87_REG"}
 TERMINATORS = frozenset(("BRANCH", "CBRANCH", "RETURN"))
 PURE = frozenset((

@@ -22,13 +22,17 @@ CONSTANTS = {"FLD1": "1.0", "FLDZ": "0.0", "FLDPI": "3.14159265358979323846",
              "FLDLN2": "0.69314718055994530942", "FLDL2E": "1.44269504088896340736",
              "FLDLG2": "0.30102999566398119521", "FLDL2T": "3.32192809488736234787"}
 UNARY = {"FABS": "fabs(%s)", "FCHS": "-(%s)", "FSQRT": "fx87(c, sqrt(%s))",
-         "FRNDINT": "fx87_exact(c, fround_cw(c, %s))"}
+         "FRNDINT": "fx87_exact(c, fround_cw(c, %s))",
+         # Transcendentals keep the register's full precision (PC applies only
+         # to arithmetic and FSQRT); F2XM1 uses expm1 to avoid cancellation.
+         "FSIN": "fx87_exact(c, sin(%s))", "FCOS": "fx87_exact(c, cos(%s))",
+         "F2XM1": "fx87_exact(c, expm1(%s * M_LN2))"}
 SUPPORTED = frozenset(ARITH) | frozenset(INTEGER_ARITH) | frozenset(CONSTANTS) | frozenset(UNARY) | {
     *(name + "P" for name in ARITH), "FLD", "FILD", "FST", "FSTP", "FIST", "FISTP",
     "FCOM", "FCOMP", "FCOMPP", "FUCOM", "FUCOMP", "FUCOMPP", "FICOM", "FICOMP",
     "FTST", "FXAM", "FXCH", "FPREM", "FPREM1", "FNCLEX", "FCLEX",
     "FNSTSW", "FSTSW", "FNSTCW", "FSTCW", "FLDCW", "FNINIT", "FINIT",
-    "FDECSTP", "FINCSTP", "FNOP",
+    "FDECSTP", "FINCSTP", "FNOP", "FPTAN", "FSINCOS", "FSCALE", "FPATAN", "FYL2X", "FYL2XP1",
 }
 
 
@@ -192,6 +196,23 @@ def statements(data, address=None, result=None):
         set_slot(0, UNARY[m] % read(0))
     elif m in ("FPREM", "FPREM1") and not operands:
         set_slot(0, "fprem_common(c, %s, %s, %d)" % (read(0), read(1), int(m == "FPREM1")))
+    elif m == "FPTAN" and not operands:
+        lines.extend(["double v_ = %s;" % read(0), "fset(c, 0, fx87_exact(c, tan(v_)));", "fpush(c, 1.0);"])
+    elif m == "FSINCOS" and not operands:
+        lines.extend(["double v_ = %s;" % read(0), "fset(c, 0, fx87_exact(c, sin(v_)));",
+                      "fpush(c, fx87_exact(c, cos(v_)));"])
+    elif m == "FSCALE" and not operands:
+        set_slot(0, "fx87_exact(c, fscale(%s, %s))" % (read(0), read(1)))
+    elif m == "FPATAN" and not operands:
+        set_slot(1, "fx87_exact(c, atan2(%s, %s))" % (read(1), read(0)))
+        lines.append("fdrop(c);")
+    elif m == "FYL2X" and not operands:
+        set_slot(1, "fx87_exact(c, %s * log2(%s))" % (read(1), read(0)))
+        lines.append("fdrop(c);")
+    elif m == "FYL2XP1" and not operands:
+        # log1p keeps the bits log2(x+1) loses for small x.
+        set_slot(1, "fx87_exact(c, %s * log1p(%s) / M_LN2)" % (read(1), read(0)))
+        lines.append("fdrop(c);")
     elif m == "FXCH" and not memory and len(slots) == len(operands) and len(slots) <= 2:
         other = slots[-1] if slots else 1
         lines.append("fxch(c, %d);" % other)
