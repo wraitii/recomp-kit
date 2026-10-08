@@ -73,8 +73,13 @@ def _jobs(count):
 
 def exclusion(tr, fn, entries, policies):
     """Reject production contracts the corpus emitter does not implement."""
-    if entries:
+    external = set(entries) - tr.internal_entries.get(fn.addr, set())
+    if external:
         return "alternate entries"
+    if entries:
+        # Only switch-case blocks: not an entry problem. The SSA builder decides
+        # whether it can lower the table jump (today it names BRANCHIND).
+        return "jump table"
     if fn.addr in policies.get("intrinsic_bodies", {}):
         return "runtime intrinsic"
     if (fn.seh_sites or fn.seh_restores or fn.seh_escapes

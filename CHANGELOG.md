@@ -61,6 +61,18 @@
   retain their inputs; Metal readback and queued-byte regressions cover both.
   The guest-store watch/dirty gate is forced inline to avoid a helper call on
   every write while retaining armed diagnostics and dirty tracking.
+- Jump-table bounds are found past a store scheduled between the `CMP` and its
+  guard: the search used `flag_effect`, a liveness query that treats every
+  memory access as observing all flags, so `CMP / MOV [mem],reg / JA` fell
+  through to the read-until-implausible path and over-read the table. It now
+  asks for architectural flag effects only and stops if the compared register
+  is rewritten. `[translate] entry_scan = false` skips the data-pointer and
+  instruction-immediate entry scans, so the listing plus structural evidence
+  is the entry set; `[translate] alternate_entries` lists interior addresses
+  (such as EH catch continuations) that the program enters by address. A
+  switch-case block no other code reaches no longer reports "alternate
+  entries" as the SSA fallback reason; it reports "jump table".
+
 - Fold the translation settings into a three-key profile whose defaults are
   every optimization the kit has: `ir_ssa = true`, `fault_state = "relaxed"`
   (was `x87_locals`, `cpu_locals`, `ir_ssa_x87 = "scalar"` and

@@ -231,6 +231,15 @@ def load(game_dir):
     # stay published either way. False restores conservative publication.
     if not isinstance(translate.setdefault("msvc_x87_convention", TRANSLATE_DEFAULTS["msvc_x87_convention"]), bool):
         raise ValueError("%s: [translate] msvc_x87_convention must be a boolean" % source)
+    # Entry discovery from the data/immediate scans (`True`, the kit default) adds
+    # function starts and alternate entries that no listing names and no control
+    # flow reaches. `False` trusts the Ghidra listing plus structural evidence
+    # (calls, branches, jump tables, __initterm, SEH, curated entries).
+    if not isinstance(translate.setdefault("entry_scan", True), bool):
+        raise ValueError("%s: [translate] entry_scan must be a boolean" % source)
+    alts = translate.setdefault("alternate_entries", [])
+    if not isinstance(alts, list) or not all(type(v) is int for v in alts):
+        raise ValueError("%s: [translate] alternate_entries must be a list of addresses" % source)
     alignment = translate.setdefault("function_alignment", 16)
     if type(alignment) is not int or alignment <= 0:
         raise ValueError("%s: [translate] function_alignment must be a positive integer" % source)

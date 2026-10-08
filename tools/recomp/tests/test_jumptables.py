@@ -232,3 +232,17 @@ def test_negated_index_after_a_guard_reads_downwards():
     entries[1] = GARBAGE
     targets, _ = decode(lines, table(entries))
     assert targets == [FN + 0x20 + 0x10 * k for k in range(8)]
+
+
+def test_store_scheduled_between_the_compare_and_its_guard_keeps_the_bound():
+    # `CMP EAX,4 / MOV [mem],reg / JA default / JMP [EAX*4 + T]`: a store leaves
+    # the flags alone, so the guard still bounds the table at five entries.
+    lines = [(0x00, "CMP EAX,0x4"), (0x03, "MOV dword ptr [ESP + 0x4],EBX"),
+             (0x07, "JA 0x%08x" % (FN + 0x70)),
+             (0x09, "JMP dword ptr [EAX*0x4 + 0x%x]" % TABLE)] + \
+            [(0x20 + 0x10 * k, "RET") for k in range(5)] + [(0x70, "RET")]
+    entries = {k: FN + 0x20 + 0x10 * k for k in range(5)}
+    entries[5] = FN + 0x20            # a plausible target: only the guard excludes it
+    targets, _ = decode(lines, table(entries))
+    assert targets == [FN + 0x20 + 0x10 * k for k in range(5)]
+

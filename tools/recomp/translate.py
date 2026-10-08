@@ -170,6 +170,12 @@ ANIMATION_COUNTER = 0
 VISUAL_ANIMATION_READS = frozenset()
 EXTRA_ENTRY_POINTS = frozenset()
 RESUMABLE_STACKS = False
+#: [translate] entry_scan: admit entries found by the data-pointer and immediate scans.
+ENTRY_SCAN = True
+#: [translate] alternate_entries: instruction addresses inside a function that
+#: the program enters by address (EH catch continuations returned from a
+#: funclet), curated with binary evidence.
+ALTERNATE_ENTRIES = frozenset()
 X87_LOCALS = False
 CPU_LOCALS = False
 FUNCTION_ALIGNMENT = 16
@@ -262,8 +268,10 @@ def configure(cfg):
     ANIMATION_COUNTER = translate["animation_counter"]
     VISUAL_ANIMATION_READS = frozenset(translate.get("volatile_reads", ()))
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT
-    global RESUMABLE_STACKS, X87_LOCALS, CPU_LOCALS
+    global RESUMABLE_STACKS, X87_LOCALS, CPU_LOCALS, ENTRY_SCAN, ALTERNATE_ENTRIES
     RESUMABLE_STACKS = translate.get("resumable_stacks", False)
+    ENTRY_SCAN = translate.get("entry_scan", True)
+    ALTERNATE_ENTRIES = frozenset(int(a) for a in translate.get("alternate_entries", ()))
     X87_LOCALS = translate.get("fault_state", game_config.TRANSLATE_DEFAULTS["fault_state"]) == "relaxed"
     CPU_LOCALS = X87_LOCALS
     EXTRA_ENTRY_POINTS = frozenset(int(a) for a in translate.get("entry_points", ()))
@@ -2090,6 +2098,8 @@ class Translator(object):
         self.allow_unmodelled = getattr(opts, "allow_unmodelled", None)
         self.notes = []
         self.jumptables = {}
+        #: owner -> switch-case targets that are internal blocks, not entries
+        self.internal_entries = {}
         self.unlisted_targets = set()
         self.all_insn_addrs = set()
         #: byte ranges holding decoded jump tables; an address inside one is
@@ -3010,6 +3020,23 @@ class Translator(object):
         # necessarily the next one: MSVC schedules unrelated moves in between.
         for k in range(j + 1, min(len(fn.insns), j + 10)):
             nxt = fn.insns[k]
+            # Only the architectural flag effect matters here. `flag_effect` is
+            # a liveness tool and reports every memory access as an observer of
+            # all flags, so a `MOV [mem],reg` scheduled between the compare and
+            # its guard would end the search before the guard was reached.
+            if nxt.mnem not in self.GUARD_BOUND:
+                if self.writes_reg32(nxt, idx_reg):
+                    return None             # the compared value is gone
+                if (nxt.mnem in JCC or nxt.mnem in SETCC or nxt.mnem in CMOVCC
+                        or nxt.mnem in FCMOVCC or nxt.mnem in SHIFT_MAYDEF):
+                    return None
+                effect = FLAG_EFFECT.get(nxt.mnem)
+                if effect is not None:
+                    if effect[0] or effect[1]:
+                        return None
+                elif not self.leaves_eflags(nxt):
+                    return None
+                continue
             d, u = flag_effect(nxt)
             if u:
                 delta = self.GUARD_BOUND.get(nxt.mnem)
@@ -3026,6 +3053,21 @@ class Translator(object):
             if d:
                 return None
         return None
+
+    #: x87 instructions that write EFLAGS (the rest only touch x87 state).
+    EFLAGS_X87 = frozenset(("FCOMI", "FCOMIP", "FUCOMI", "FUCOMIP"))
+
+    @classmethod
+    def leaves_eflags(cls, ins):
+        """Architecturally leaves the arithmetic flags alone, whatever memory
+        it touches: the question `cmp_bound_here` asks between a compare and
+        its guard, as opposed to the liveness question `flag_effect` answers."""
+        m = ins.mnem
+        if m in FLAG_NEUTRAL or m in FCMOVCC:
+            return m in FLAG_NEUTRAL
+        if m in ("PUSH", "POP") and ins.ops:
+            return True
+        return m.startswith("F") and m not in cls.EFLAGS_X87
 
     @staticmethod
     def writes_reg32(ins, reg):
@@ -5458,6 +5500,12 @@ def main():
                 if resolve(t, listed, why="initterm"):
                     changed = True
                     initterm_found[0] += 1
+            for t in sorted(ALTERNATE_ENTRIES):
+                if not image.is_exec(t):
+                    raise TranslateError("[translate] alternate_entries: %08x is not in a code section" % t)
+                hook_evidence[t].add("curated")
+                if resolve(t, listed, why="config"):
+                    changed = True
             # Addresses inside a decoded jump table are table storage, not
             # code: 0x4422c0 is 16-aligned and follows a RET, so it passes
             # every static signal there is.
@@ -5497,6 +5545,11 @@ def main():
             immediate_candidates = {t for t in immediates
                                     if not any(lo <= t < hi for lo, hi in tr.table_ranges)
                                     and (t in owner or image.plausible_immediate_target(t))}
+            if not ENTRY_SCAN:
+                # The listing is the authority: a dword in data or an immediate
+                # that happens to name an executable address is not control flow.
+                # Relocated pointers (the linker's own record) stay.
+                starts, interior, immediate_candidates = set(), set(), set()
             # A raw dword hit inside a pointer-named routine's instruction
             # is weaker evidence than that routine and its direct callees.
             # Follow validated CALL edges before guesses become boundaries:
@@ -5799,6 +5852,23 @@ def main():
     entries_by_fn = defaultdict(set)
     for t, fn in extra.items():
         entries_by_fn[fn.addr].add(t)
+
+    # Switch-case blocks are alternates only because recomp_jump must reach
+    # them. A table target that nothing outside its own body branches to, calls,
+    # or names is an internal block, not a second way into the function.
+    outside_refs = set()
+    for fn in parsed:
+        for ins in fn.insns:
+            if ins.mnem == "CALL" or ins.mnem == "JMP" or ins.mnem in JCC:
+                t = tr.branch_target(ins)
+                if t in extra and extra[t].addr != fn.addr:
+                    outside_refs.add(t)
+    tr.internal_entries = defaultdict(set)
+    for (fn_addr, _at), targets in tr.jumptables.items():
+        for t in targets:
+            if (t in extra and extra[t].addr == fn_addr and provenance.get(t) == "table"
+                    and not hook_evidence.get(t) and t not in outside_refs):
+                tr.internal_entries[fn_addr].add(t)
 
     if args.ir_census:
         from ir.census import run_census
