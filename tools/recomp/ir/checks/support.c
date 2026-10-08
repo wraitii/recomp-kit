@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* No mod hooks in the checks; contract call sites take the fast path. */
+uint8_t recomp_hooks_ever = 0;
+
 const int recomp_resumable_stacks = 0;
 
 static void unexpected(const char *name, uint32_t addr) {

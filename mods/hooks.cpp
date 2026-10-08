@@ -537,6 +537,9 @@ void publish(int32_t index) {
     if (any) {
         // Pointer first, then the flag, both with release: a call site that
         // sees the flag is guaranteed to see the pointer.
+        // Before the flag: a call site that dispatches to the hook has
+        // already published the fields its call contract would drop.
+        __atomic_store_n(&recomp_hooks_ever, (uint8_t)1, __ATOMIC_RELEASE);
         __atomic_store_n(&recomp_hook_ptrs[index], (RecompHookFn)mods_hook_dispatch,
                          __ATOMIC_RELEASE);
         __atomic_store_n(&recomp_hooked[index], (uint8_t)1, __ATOMIC_RELEASE);

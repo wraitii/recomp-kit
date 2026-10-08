@@ -493,6 +493,9 @@ def parse_args(argv, system=None):
                         help="Build and run full-state CPU/x87 locals checks without benchmarks")
     parser.add_argument("--ir-ssa-checks", action="store_true",
                         help="Build/run byte-backed integer SSA full-state synthetic checks")
+    parser.add_argument("--contract-poison", action="store_true",
+                        help="Compile with RECOMP_CONTRACT_POISON=1: direct calls overwrite "
+                             "fields their call contract dropped, so a wrong summary fails")
     parser.add_argument("--allow-table-gaps", metavar="REASON", default=None,
                         help="Accept jump-table sites the translator cannot decode (passed to translate.py)")
     parser.add_argument("--forget", metavar="ADDR[,ADDR...]", default=None,
@@ -597,6 +600,9 @@ def main():
     preset = preset_name(args.preset, args.config, stub=args.stub, target=args.target)
     build_dir = build_dir_for(args.build_root, preset)
     defines = game_defines(args.game_dir, args.build_root)
+    # Always explicit: the CMake cache would otherwise keep a poison build's
+    # setting for the next ordinary build.
+    defines = defines + ["-DRECOMP_CONTRACT_POISON=%s" % ("ON" if args.contract_poison else "OFF")]
     try:
         # The lock lives at <build root>/recomp/.lock: BuildLock joins build/recomp/.lock onto its argument.
         with buildlock.BuildLock(args.build_root.parent, "tools/build.py"):

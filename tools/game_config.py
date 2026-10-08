@@ -68,6 +68,7 @@ TRANSLATE_DEFAULTS = {
     "ir_ssa": True,
     "fault_state": "relaxed",
     "msvc_x87_convention": True,
+    "call_contracts": True,
 }
 
 # Earlier [translate] keys, folded into ir_ssa / fault_state /
@@ -231,6 +232,11 @@ def load(game_dir):
     # stay published either way. False restores conservative publication.
     if not isinstance(translate.setdefault("msvc_x87_convention", TRANSLATE_DEFAULTS["msvc_x87_convention"]), bool):
         raise ValueError("%s: [translate] msvc_x87_convention must be a boolean" % source)
+    # Per-function reads/kills contracts let a direct CALL omit publication of
+    # a field the callee neither reads nor preserves (DIVERGENCE
+    # ssa-call-contracts). False publishes every field at every call.
+    if not isinstance(translate.setdefault("call_contracts", TRANSLATE_DEFAULTS["call_contracts"]), bool):
+        raise ValueError("%s: [translate] call_contracts must be a boolean" % source)
     # Entry discovery from the data/immediate scans (`True`, the kit default) adds
     # function starts and alternate entries that no listing names and no control
     # flow reaches. `False` trusts the Ghidra listing plus structural evidence

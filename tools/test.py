@@ -42,6 +42,7 @@ PORTABLE_TESTS = [
     "tools/recomp/tests/test_ir_integer_extra.py",
     "tools/recomp/tests/test_ir_x87_scalar.py",
     "tools/recomp/tests/test_ir_lazy_flags.py",
+    "tools/recomp/tests/test_ir_call_contracts.py",
     "tools/recomp/tests/test_cpu_c_locals.py",
     "tools/recomp/tests/test_function_corpus.py",
     "tools/recomp/tests/test_codegen_chunks.py",

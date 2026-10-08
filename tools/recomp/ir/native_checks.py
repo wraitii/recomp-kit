@@ -409,6 +409,60 @@ BYTE_CALL_CASES = {
         "ssa_callee": True,
         "resumable": False,
     },
+    # Cross-function contract fixtures. The production local/lazy columns run
+    # with the callee's summarized reads/kills; ir_ssa_contract_checks poisons
+    # the killed-but-dropped fields so a wrong summary fails the full-state
+    # comparison.
+    "contract_callee_kills_eax": {
+        # mov eax,0x44332211; call; ret -- the callee overwrites EAX and every
+        # flag it defines, so the caller need not publish its pre-call EAX.
+        "hexes": _caller(["b844332211"], ["c3"]),
+        "callee_hexes": ["31c0", "c3"],
+        "contract": True,
+        "resumable": False,
+    },
+    "contract_callee_reads_zf": {
+        # cmp eax,ebx; call; ret -- the callee reads ZF (setz al) and then
+        # overwrites the flags (inc ecx), so a summary that dropped the ZF read
+        # would poison it and change setz's result.
+        "hexes": _caller(["39d8"], ["c3"]),
+        "callee_hexes": ["0f94c0", "41", "c3"],
+        "contract": True,
+        "resumable": False,
+    },
+    "contract_preserves_ebx": {
+        # mov ebx,0x44332211; call; ret -- the callee saves and restores EBX.
+        # The push reads EBX, so EBX must stay published even though the pop
+        # writes it; poisoning it would corrupt the restored value.
+        "hexes": _caller(["bb44332211"], ["c3"]),
+        "callee_hexes": ["53", "bbffffffff", "5b", "c3"],
+        "contract": True,
+        "resumable": False,
+    },
+    "contract_preserves_ebx_dead": {
+        # mov ebx,0x44332211; call; ret -- the callee does not touch EBX, so it
+        # preserves it and EBX is not in its kills.  Even though this caller
+        # never reads EBX again, the preserved CPU value flows out to *its*
+        # caller; dropping EBX here would leak the stale field.  This is the
+        # regression for the rejected 'caller does not read after' half of the
+        # skip rule.
+        "hexes": _caller(["bb44332211"], ["c3"]),
+        "callee_hexes": ["31c0", "c3"],
+        "contract": True,
+        "resumable": False,
+    },
+    "contract_return_zf": {
+        # cmp eax,ebx; call; jz +5; mov eax,1; mov [ebx],eax; ret
+        # A contract-aware 006ff798 shape: the callee returns ZF and the
+        # caller's JZ consumes it, so the caller must observe the callee's
+        # recomputed ZF rather than its own pre-call descriptor.
+        "hexes": _caller(["39d8"], ["7405", "b801000000", "8903", "c3"]),
+        "callee_hexes": ["8b442408", "250000f07f", "3d0000f07f", "7401", "c3",
+                          "8b442408", "c3"],
+        "contract": True,
+        "ssa_callee": True,
+        "resumable": False,
+    },
 }
 
 # Generated op x width x seam matrix; kept out of the literal for readability.
@@ -488,11 +542,13 @@ INDIRECT_CASES = {
 }
 
 
-def call_sources(name, hexes, callee_addr, resumable=False, indirect=False):
+def call_sources(name, hexes, callee_addr, resumable=False, indirect=False, contracts=None):
     """Eager caller plus raw/scalar/strict/local IR callers and CALL fallthroughs.
 
     `indirect` selects the explicit production-style `recomp_call` opt-in for
     indirect CALL effects; without it those effects stay a fallback.
+    `contracts` is an optional target-to-contract map applied to the production
+    local/lazy columns so the poison build can validate it.
     """
     chunks = [bytes.fromhex(h) for h in hexes]
     image = T.Image.__new__(T.Image)
@@ -526,9 +582,21 @@ def call_sources(name, hexes, callee_addr, resumable=False, indirect=False):
     scalar = emit(fir, name + "_ir_scalar", local_state=False, msvc_convention=False, **options)
     strict = emit(fir, name + "_ir_strict", x87_scalar_strict=True, local_state=False,
                   msvc_convention=False, **options)
-    local = emit(fir, name + "_ir_local", **options)
-    lazy = emit(fir, name + "_ir_lazy", lazy_nan=True, lazy_flags=True, **options)
+    local = emit(fir, name + "_ir_local", call_contracts=contracts, **options)
+    lazy = emit(fir, name + "_ir_lazy", lazy_nan=True, lazy_flags=True,
+                call_contracts=contracts, **options)
     return eager, raw, scalar, strict, local, lazy, fallthroughs
+
+
+def callee_contract(hexes, base=CALLEE):
+    """Summarize a byte-backed synthetic callee for the call fixtures."""
+    from .call_contracts import summarize
+    lifter, addr, lifted = Lifter(), base, []
+    for raw in map(bytes.fromhex, hexes):
+        lifted.append(lifter.lift(addr, raw))
+        addr += len(raw)
+    fir = FunctionIR(base, lifted, default_successors(lifted))
+    return summarize(fir, lambda target: None)
 
 
 def _eager_callee(symbol, base, hexes):
@@ -627,8 +695,11 @@ def run_checks(out, cmake, jobs):
         add_case(name, eager, [raw, scalar, strict, local, lazy], extra=[spec["callee"]],
                  fallthroughs=returns)
     for name, spec in BYTE_CALL_CASES.items():
+        contracts = None
+        if spec.get("contract"):
+            contracts = {CALLEE: callee_contract(spec["callee_hexes"])}
         eager, raw, scalar, strict, local, lazy, returns = call_sources(
-            name, spec["hexes"], CALLEE, spec["resumable"])
+            name, spec["hexes"], CALLEE, spec["resumable"], contracts=contracts)
         callee = _eager_callee(name + "_callee", CALLEE, spec["callee_hexes"])
         extra = [callee]
         if spec.get("ssa_callee"):
@@ -694,9 +765,11 @@ def run_checks(out, cmake, jobs):
                     "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
                     "-DKIT_RUNTIME=%s" % (KIT / "runtime")], check=True)
     subprocess.run([cmake, "--build", str(out), "--parallel", str(jobs)], check=True)
-    for target in ("ir_ssa_checks", "ir_ssa_null_checks"):
+    for target, log in (("ir_ssa_checks", "results.txt"),
+                        ("ir_ssa_null_checks", "null-results.txt"),
+                        ("ir_ssa_contract_checks", "contract-results.txt")):
         result = subprocess.run([str(out / target)], capture_output=True, text=True)
-        (out / ("results.txt" if target == "ir_ssa_checks" else "null-results.txt")).write_text(result.stdout + result.stderr)
+        (out / log).write_text(result.stdout + result.stderr)
         result.check_returncode()
         print(target + ":")
         print(result.stdout, end="")

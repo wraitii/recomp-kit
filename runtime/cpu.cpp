@@ -89,6 +89,9 @@ extern "C" {
 
 const int recomp_resumable_stacks = RECOMP_RESUMABLE_STACKS;
 
+// See x86.h: set by the mod hook installer, read by contract call sites.
+uint8_t recomp_hooks_ever = 0;
+
 // A switched guest stack owns its saved registers and return address. A
 // generated CALL propagates a mismatched EIP here instead of continuing in
 // the wrong native caller. All CALL continuations are dispatch entries in

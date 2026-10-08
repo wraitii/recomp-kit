@@ -58,6 +58,26 @@ STRING_HELPERS = _string_helpers()
 # Arithmetic flags tracked by the calling-convention census.
 FLAG_FIELDS = frozenset("c->eflags_" + n for n in ("cf", "pf", "af", "zf", "sf", "of"))
 
+# Call-contract fields.  The mask order is the poison helper's (see x86.h).
+CONTRACT_GPRS = ("EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI")
+CONTRACT_FLAGS = ("CF", "PF", "AF", "ZF", "SF", "OF")
+CONTRACT_FIELDS = frozenset(CONTRACT_GPRS) | frozenset(CONTRACT_FLAGS)
+#: The guest frame pointer and stack pointer are call-helper state even when a
+#: contract says the callee overwrites them; never drop their publication.
+CONTRACT_NEVER_SKIP = frozenset(("ESP", "EBP"))
+
+
+def contract_poison_mask(fields):
+    """Bitmask for `RECOMP_CONTRACT_POISON_CALL`: GPRs low, flags high."""
+    mask = 0
+    for index, name in enumerate(CONTRACT_GPRS):
+        if name in fields:
+            mask |= 1 << index
+    for index, name in enumerate(CONTRACT_FLAGS):
+        if name in fields:
+            mask |= 1 << (8 + index)
+    return mask
+
 #: Lazy-flag producers recognised at a seam: (kind, primary p-code opcode).
 #: The primary op must write a non-flag destination.  SUB/CMP, ADD, logic/TEST
 #: and INC/DEC are the initial set; everything else stays eager.
@@ -230,7 +250,8 @@ def codegen_ir(fir, lifter):
 def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=True,
          call_symbols=None, x87_scalar_strict=False, local_state=True, msvc_convention=True,
          lazy_nan=False, lazy_flags=False, resumable_stacks=False, lifter=None,
-         indirect_call_symbol=None, _guard_null_checks=True, facts=None):
+         indirect_call_symbol=None, _guard_null_checks=True, facts=None,
+         call_contracts=None):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
     `call_symbols` maps an allowed direct-call target address to the C symbol
@@ -254,6 +275,15 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     change: with it off the emitted body is byte-identical to the eager
     `fx87`/`fx87_exact` forms. It is ignored by strict x87, the exact flush
     and `optimize=False`.
+
+    `call_contracts` maps a direct-call target address to a contract
+    (``reads``/``kills`` field sets, e.g. from ``call_contracts.py``). When
+    given, a direct CALL drops publication of a field the callee neither reads
+    nor preserves (``F not in reads and F in kills``). A preserved field is
+    never dropped: its CPU value can still flow out to this body's caller even
+    when this body does not read it back. The mapping is plain data so it
+    survives the emission process pool; a missing target keeps the conservative
+    full publication. ESP/EBP are never dropped.
 
     `facts`, when a dict, receives census facts about the performance body:
     whether an arithmetic flag is read from the CPU at entry or after a call,
@@ -294,7 +324,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         options = dict(optimize=optimize, publish_changed=publish_changed, wide_registers=wide_registers,
                        call_symbols=call_symbols, resumable_stacks=resumable_stacks,
                        lifter=lifter, indirect_call_symbol=indirect_call_symbol,
-                       lazy_nan=lazy_nan,
+                       lazy_nan=lazy_nan, call_contracts=call_contracts,
                        _guard_null_checks=False)
         strict = emit(fir, symbol, x87_scalar_strict=True, local_state=False, msvc_convention=False,
                       lazy_flags=False, **options)
@@ -346,6 +376,19 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     flag_keys = {key for key, (field, _) in mapping.items() if field in FLAG_FIELDS}
     groups = [[("register", off + n) for n in range(size)]
               for (_, off, size), _ in fields]
+    lane_field, field_lanes = {}, {}
+    for name in CONTRACT_GPRS:
+        _, off, size = lifter.register(name)
+        for lane in range(size):
+            key = ("register", off + lane)
+            lane_field[key] = name
+            field_lanes.setdefault(name, set()).add(key)
+    for name in CONTRACT_FLAGS:
+        _, off, size = lifter.register(name)
+        for n in range(size):
+            key = ("register", off + n)
+            lane_field[key] = name
+            field_lanes.setdefault(name, set()).add(key)
     s = build(codegen_ir(fir, lifter),
               register_groups=groups if optimize and wide_registers else (),
               call_targets=call_symbols, indirect_call_symbol=indirect_call_symbol,
@@ -369,6 +412,44 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             # Keep flag publication at calls/returns until actual call
             # summaries prove which fields a boundary does not observe.
             publications = plan(s, fir.succ, groups, access_fields=access_fields)
+    # Cross-function contracts: a direct CALL may omit publication of a field
+    # the callee neither reads nor preserves.  A field the callee preserves is
+    # not droppable even when this body does not read it back: the field's CPU
+    # value can still flow out to this body's own caller, and the publication
+    # plan's must-facts may not republish it at RET.
+    contract_skip, contract_guard, contract_roots, contract_stats = {}, {}, [], [0, 0]
+    if optimize and publications is not None and call_contracts:
+        for b in s.blocks.values():
+            for v in b.ops:
+                if v.opc != "CALL":
+                    continue
+                contract = call_contracts.get(v.data)
+                if contract is None:
+                    continue
+                reads, kills = contract.reads, contract.kills
+                skipped = set()
+                for field in field_lanes:
+                    if field in CONTRACT_NEVER_SKIP or field in reads or field not in kills:
+                        continue
+                    skipped.add(field)
+                if not skipped:
+                    continue
+                contract_skip[v.id] = skipped
+                contract_stats[0] += 1
+                contract_stats[1] += len(skipped)
+                # A mod hook installed on the callee at runtime observes the
+                # full CPU, so the dropped fields stay publishable behind
+                # recomp_hooks_ever; keep their values live for that path.
+                guarded = tuple(key for key in publications[v.id]
+                                if lane_field.get(key) in skipped)
+                contract_guard[v.id] = guarded
+                state = b.snapshots[v.id]
+                contract_roots.extend(state[key] for key in guarded if key in state)
+                publications[v.id] = tuple(
+                    key for key in publications[v.id] if lane_field.get(key) not in skipped)
+    if facts is not None:
+        facts["call_contract_calls"] = contract_stats[0]
+        facts["call_contract_fields_skipped"] = contract_stats[1]
     # Decide which seams defer their flags as a descriptor before dead-value
     # elimination, so the descriptor's operands can be kept live as roots.
     cc_plan, cc_roots = {}, []
@@ -399,7 +480,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 cc_roots.extend(x for x in (record.a, record.b, record.res) if x is not None)
     if optimize:
         if publications is not None:
-            live = simplify(s, publications, canonical=False, extra_roots=cc_roots)
+            live = simplify(s, publications, canonical=False, extra_roots=cc_roots + contract_roots)
         else:
             live = simplify(s, canonical=False)
     else:
@@ -486,6 +567,19 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     cc_touch = [reads_entry_flags or reads_after_call]
     CC_SETTLE = "/*cc-settle*/"
 
+    def store_fields(state, required):
+        """Direct field stores for the required keys (no descriptor)."""
+        lines = []
+        for (_, off, size), field in fields:
+            keys = [("register", off + n) for n in range(size)]
+            if not any(key in required for key in keys):
+                continue
+            parts = ["(%s << %d)" % (ref(state[key]), n * 8)
+                     if key in state else "(%s & 0x%xu)" % (field, 255 << (n * 8))
+                     for n, key in enumerate(keys)]
+            lines.append("%s = (uint32_t)(%s);" % (field, " | ".join(parts)))
+        return lines
+
     def publish(state, event):
         lines = []
         required = state if publications is None else publications[event.id]
@@ -525,6 +619,11 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             lines.append("c->cc_res = (uint32_t)%s;" % ref(record.res))
         elif lazy_flags and stored_flag:
             # A direct field write must not leave an older descriptor pending.
+            lines.append("c->cc_op = X86_CC_NONE;")
+        if lazy_flags and event.id in contract_skip \
+                and (contract_skip[event.id] & set(CONTRACT_FLAGS)) and record is None:
+            # The dropped flags have no descriptor at this seam, so an older
+            # pending descriptor must not materialise into them after the call.
             lines.append("c->cc_op = X86_CC_NONE;")
         return lines
 
@@ -728,6 +827,17 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 # the guest return address already stored by the preceding
                 # CALL push, so its own RET owns ESP/EIP restoration.
                 lines.extend(publish(b.snapshots[v.id], v))
+                if v.id in contract_skip:
+                    # Validation builds poison the killed fields this contract
+                    # dropped; production builds compile the macro to a no-op.
+                    lines.append("RECOMP_CONTRACT_POISON_CALL(c, 0x%xu);"
+                                 % contract_poison_mask(contract_skip[v.id]))
+                # After poison, so a hooked run sees real values.
+                if contract_guard.get(v.id):
+                    guarded = store_fields(b.snapshots[v.id], contract_guard[v.id])
+                    lines.append("if (RECOMP_UNLIKELY(recomp_hooks_ever)) {")
+                    lines.extend(guarded)
+                    lines.append("}")
                 name = call_symbols.get(v.data)
                 if name is None:
                     raise SSAError("%08x: no C symbol bound for call target %08x"

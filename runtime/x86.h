@@ -590,6 +590,10 @@ extern void (*const recomp_base_ptrs[])(X86 *c);
 extern void (*const recomp_raw_ptrs[])(X86 *c);
 extern RecompHookFn recomp_hook_ptrs[];
 extern uint8_t recomp_hooked[];
+/* Set once any mod hook is installed and never cleared.  A call whose
+ * contract dropped CPU fields publishes them anyway while this is set,
+ * because a hook callback observes the full register file. */
+extern uint8_t recomp_hooks_ever;
 
 uint32_t recomp_override_count(void);
 uint64_t recomp_override_hash(void);
@@ -758,8 +762,41 @@ RECOMP_HOT_INLINE void x86_cc_settle(X86 *c) {
  * A producer that ran with a pending descriptor must call this first (the
  * decoded/interpreter paths settle at entry, so this is defence in depth). */
 static inline void x86_cc_drop(X86 *c) {
+    /* Clear the payload too, so a dropped descriptor leaves the same state as
+     * a settled one. */
     c->cc_op = X86_CC_NONE;
+    c->cc_size = c->cc_mask = 0;
+    c->cc_a = c->cc_b = c->cc_res = 0;
 }
+
+/* --------------------------------------------------- call contract poison */
+
+/* Validation aid for cross-function call contracts.  At a direct call whose
+ * contract lets the emitter omit publishing a CPU field, the generated body
+ * names the dropped fields in this mask (GPRs in R_EAX..R_EDI order in the low
+ * byte, CF/PF/AF/ZF/SF/OF above).  A build with -DRECOMP_CONTRACT_POISON=1
+ * overwrites those fields with distinctive garbage before the call, so a wrong
+ * reads/kills summary makes the callee observe corrupt input and fails the
+ * full-state comparison loudly.  Production builds compile the call away. */
+#if defined(RECOMP_CONTRACT_POISON) && RECOMP_CONTRACT_POISON
+RECOMP_HOT_INLINE void recomp_contract_poison(X86 *c, uint32_t mask) {
+    for (int i = 0; i < 8; ++i)
+        if (mask & (1u << i))
+            c->r[i] = 0xC0DEC0DEu ^ (uint32_t)i;
+    /* The pending descriptor still carries the flags this call publishes;
+     * materialise it so poisoning the dropped ones cannot lose them. */
+    x86_cc_settle(c);
+    if (mask & (1u << 8)) c->eflags_cf = 0x51u;
+    if (mask & (1u << 9)) c->eflags_pf = 0x52u;
+    if (mask & (1u << 10)) c->eflags_af = 0x54u;
+    if (mask & (1u << 11)) c->eflags_zf = 0x58u;
+    if (mask & (1u << 12)) c->eflags_sf = 0x59u;
+    if (mask & (1u << 13)) c->eflags_of = 0x5bu;
+}
+#define RECOMP_CONTRACT_POISON_CALL(c, mask) recomp_contract_poison((c), (mask))
+#else
+#define RECOMP_CONTRACT_POISON_CALL(c, mask) ((void)0)
+#endif
 
 /* Bits x86_get_eflags/x86_set_eflags build from the individual fields; every
  * other bit lives in eflags_misc so PUSHFD/POPFD is lossless. */

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `[translate] call_contracts` (default on): per-function reads/kills
+  summaries over the GPRs and arithmetic flags let an SSA direct call skip
+  publishing a field the callee never reads and always overwrites. Unknown,
+  indirect, SEH, alternate-entry, rewritten and natively replaced callees stay
+  conservative; skipped fields are still published once any mod hook has been
+  installed (`recomp_hooks_ever`). `tools/build.py --contract-poison` builds a
+  validation binary that overwrites skipped fields with garbage. Tagged
+  `DIVERGENCE(original): [ssa-call-contracts]` for fault contexts inside the
+  callee.
+
 - SSA bodies now defer ADD/SUB/CMP/logic/INC/DEC flag materialisation into an
   `X86` descriptor (`cc_op`/`cc_size`/`cc_mask`/`cc_a`/`cc_b`/`cc_res`) and
   settle it at call and return seams instead of writing the six flag fields.

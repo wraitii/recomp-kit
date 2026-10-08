@@ -367,6 +367,49 @@ DIVERGENCE tag. The representation only pays off when a consumer can skip the
 settle, which needs call summaries proving the callee does not observe the
 flags; that is the next step toward the cross-function contracts.
 
+### Cross-function call contracts
+
+`call_contracts.py` summarizes each final body - decoded fallbacks included -
+over the runtime CPU fields: the eight GPRs and the six arithmetic flags. Its
+`reads` set is a backward may-liveness of entry values (transitively through
+direct callees); its `kills` set is a forward must-definite over every path to
+a return, with a GPR killed only when all four byte lanes are written. A
+save/restore (`push ebx`/`pop ebx`) reads the register, so it stays in `reads`
+and is never dropped. Recursive components start from empty `reads` and
+`kills`: the least fixed point is sound for the may-analysis and conservative
+for the must-analysis; an
+unconverged component falls back to `reads=all, kills=none` rather than publish
+an under-approximation.
+
+At a direct CALL in an SSA body, `emit` may drop publication of field `F` when
+`F not in callee.reads and F in callee.kills`, shrinking the lazy-flag
+descriptor's mask (or omitting it) and clearing a stale descriptor when flags
+are dropped. A field the callee *preserves* is never dropped even when this
+body does not read it back, because its CPU value can still flow out to this
+body's caller. ESP and EBP are never dropped, since the stable entry thunk and
+frame diagnostics read them. Indirect calls, CALLOTHER, unbound targets, failed
+lifts, SEH and alternate-entry bodies, audited instruction rewrites and
+configured native replacements are `reads=all, kills=none`. A mod hook can be
+installed on any function at runtime and its callback sees the full register
+file, so every contract call site still publishes its dropped fields behind
+`recomp_hooks_ever`, a flag the installer sets once and never clears. Call contracts are
+disabled under `resumable_stacks`, where a callee may divert EIP to a
+continuation the call's contract does not cover. The `[translate]`
+`call_contracts` key (default on) disables the optimization and restores full
+publication. `RECOMP_CONTRACT_POISON=1` overwrites every dropped killed field
+with distinctive garbage before the call (after materialising a pending
+lazy-flags descriptor, which still carries the flags the call publishes), so a
+wrong summary fails the full-state comparison loudly; it is a validation build
+only.
+
+DIVERGENCE(original): [ssa-call-contracts] a fault or SEH context raised inside
+the callee before it overwrites a dropped field shows the caller's stale value
+rather than the published one, as with [ssa-state-locals]. Runtime hook
+installation from a host thread is applied at a scheduler checkpoint; a hook
+that lands between a call site's `recomp_hooks_ever` test and its dispatch sees
+the dropped fields unpublished for that one call. The translation
+report records the summarized-body, call-site and skipped-field counts.
+
 The `locals` state policy defers GPR/flag publication at guest loads and
 stores (integer and x87), keeping EIP/ESP/EBP for diagnostics; no runtime
 observer reads other CPU fields there. Division, string-helper, call and return

@@ -105,6 +105,12 @@ add_compile_definitions(GUEST_IMAGE_BASE=${RECOMP_IMAGE_BASE})
 add_compile_definitions(GUEST_HEAP_BASE=${RECOMP_HEAP_BASE})
 add_compile_definitions(GUEST_SIZE=${RECOMP_GUEST_SIZE})
 add_compile_definitions(RECOMP_STORE_HOOKS=${RECOMP_STORE_HOOKS})
+# Validation build: generated call sites poison the fields their call contract
+# dropped (tools/build.py --contract-poison). Never on in a shipped build.
+option(RECOMP_CONTRACT_POISON "Poison CPU fields dropped by call contracts" OFF)
+if(RECOMP_CONTRACT_POISON)
+    add_compile_definitions(RECOMP_CONTRACT_POISON=1)
+endif()
 
 # Never fuse a*b+c into an FMA: the x87 helpers and native replacements must
 # round each operation as written, identically on every target. Clang contracts

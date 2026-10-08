@@ -13,6 +13,7 @@ import os
 import re
 import time
 
+from .call_contracts import analyze as analyze_contracts
 from .cfg import function_ir
 from .emit_c import emit
 from .lift import Lifter, LiftError
@@ -134,7 +135,53 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
         "resumable_stacks": policies.get("resumable_stacks", False),
         "indirect_call_symbol": "recomp_call",
     }
+    # Cross-function field contracts: compute once, then hand the plain
+    # reads/kills data to every worker.  Roots are the bodies actually emitted
+    # through SSA; the reachable closure supplies their callees' contracts.
+    # A resumable-stack callee may divert EIP to a continuation other than the
+    # call's fallthrough, which can read fields this call's contract does not
+    # cover.  Disable contracts rather than summarize an unknown continuation.
+    contracts_on = settings.get("call_contracts", True) \
+        and not policies.get("resumable_stacks", False)
+    contracts, lifted = {}, {}
+    if contracts_on:
+        conservative = set(policies.get("conservative_contracts", ()))
+        rewritten = (set(policies.get("instruction_patches", ()))
+                     | set(policies.get("operand_redirects", ()))
+                     | set(policies.get("volatile_reads", ())))
+        by_addr = {fn.addr: fn for fn in functions}
+
+        def contract_analyzable(addr):
+            fn = by_addr.get(addr)
+            if fn is None or addr in conservative:
+                return False
+            if entries_by_fn.get(addr):
+                return False
+            if seh_hooks(tr, fn):
+                return False
+            if fn.pushed_continuations or fn.return_jumps:
+                return False
+            if fn.dead_addrs or addr in tr.noreturn_callees:
+                return False
+            if addr in policies.get("intrinsic_bodies", {}):
+                return False
+            if fn.addrs & rewritten:
+                return False
+            return True
+
+        roots = [fn.addr for fn in functions
+                 if exclusion(tr, fn, entries_by_fn.get(fn.addr, ()), policies) is None]
+
+        def contract_progress(done, total):
+            if not quiet and (done % 2000 == 0 or done == total):
+                print("  ir contracts: %d/%d bodies" % (done, total), flush=True)
+
+        contracts = analyze_contracts(tr, functions, analyzable=contract_analyzable,
+                                      roots=roots, progress=contract_progress, lifted=lifted)
+        if not quiet:
+            print("  ir contracts: %d summaries" % len(contracts), flush=True)
     results, reasons, census = {}, Counter(), Counter()
+    contract_calls = contract_skipped = 0
     # Lifting needs the parent's image and SLEIGH context; emission does not.
     # Lift here, then emit each batch in workers. Tasks carry their function
     # index so ordered combination is exact, and the emitted text is
@@ -172,7 +219,8 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
                         if target in known and target not in forbidden:
                             calls[target] = "entry_%08x" % target
                 try:
-                    fir = function_ir(tr, lifter, fn)
+                    # The contract pass already lifted most bodies.
+                    fir = lifted.pop(fn.addr, None) or function_ir(tr, lifter, fn)
                 except (SSAError, LiftError) as error:
                     reason = str(error)
                 except RecursionError:
@@ -180,6 +228,11 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
                 else:
                     options = dict(common)
                     options["call_symbols"] = calls
+                    if contracts:
+                        # Only this body's bound targets: the whole table would
+                        # be pickled into every worker task.
+                        options["call_contracts"] = {
+                            t: contracts[t] for t in calls if t in contracts}
                     batch.append((index, fn, fir, options))
                     if len(batch) >= _EMIT_BATCH * jobs:
                         flush()
@@ -217,6 +270,8 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
         if reason is None:
             bodies[fn.addr] = merged
             census.update(key for key, value in facts.items() if value)
+            contract_calls += facts.get("call_contract_calls", 0)
+            contract_skipped += facts.get("call_contract_fields_skipped", 0)
         else:
             reasons[re.sub(r"^[0-9a-f]{8}: ", "", reason)] += 1
         results["%08x" % fn.addr] = {
@@ -239,6 +294,12 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
         "convention_census": {key: census[key] for key in (
             "flags_read_at_entry", "flags_read_after_call", "x87_exact_flush")},
         "lazy_flag_bodies": census.get("lazy_flags", 0),
+        "call_contracts": {
+            "enabled": bool(contracts_on),
+            "functions_summarized": len(contracts),
+            "call_sites": contract_calls,
+            "fields_skipped": contract_skipped,
+        },
         "seconds": round(time.monotonic() - started, 3), "per_function": results,
     }
     if not quiet:
