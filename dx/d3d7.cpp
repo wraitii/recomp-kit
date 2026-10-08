@@ -1225,8 +1225,9 @@ void d3d7_sync_texture(ComObj *dev, uint32_t stage) {
     ComObj *tex = com_get(dev->d3d7->texture[stage]);
     D3d8Error err{};
     if (!tex || tex->kind != K_SURFACE || !tex->pixels || !tex->width || !tex->height) {
-        host_ok(d3d8_device_set_texture((D3d8Device *)dev->d3d7_host, stage, 0, 0, 0, nullptr, &err),
-                err, "SetTexture");
+        host_ok(
+            d3d8_device_set_texture((D3d8Device *)dev->d3d7_host, stage, 0, 0, 0, nullptr, &err),
+            err, "SetTexture");
         return;
     }
     // Reuse the conversion of this surface while its content generation is
@@ -1287,8 +1288,8 @@ void d3d7_sync_texture(ComObj *dev, uint32_t stage) {
     lvl.generation = tex->d3d8_content_generation;
     lvl.data = converted.data();
     lvl.bytes = (uint32_t)converted.size();
-    host_ok(d3d8_device_set_texture((D3d8Device *)dev->d3d7_host, stage, tex->id, D3D8FMT_A8R8G8B8, 1,
-                                    &lvl, &err),
+    host_ok(d3d8_device_set_texture((D3d8Device *)dev->d3d7_host, stage, tex->id, D3D8FMT_A8R8G8B8,
+                                    1, &lvl, &err),
             err, "SetTexture");
 #else
     (void)dev;
