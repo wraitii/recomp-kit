@@ -44,7 +44,7 @@ guest stack operations. Replacement headers are compilation dependencies of
 
 Body chunks contain only local callee declarations, with no global function
 census or hook indices. They start in fixed 16 KiB guest-address buckets and
-split by address until their emitted bodies fit a 512 KiB source budget.
+split by address until their emitted bodies fit a 2 MiB source budget.
 Oversized functions, including their alternate entries, stay intact in separate
 files scheduled first by the build. A change can repack its own bucket, but
 cannot move functions across the rest of the image. Dense-index changes can

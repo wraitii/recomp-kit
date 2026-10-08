@@ -38,8 +38,10 @@ from ir import flag_region  # noqa: E402
 
 # Stable address buckets prevent an insertion from repacking the entire image.
 # Oversize functions stand alone; recursively split only an over-budget bucket.
+# SSA bodies are larger per guest instruction than decoded ones; at 512 KiB the
+# median bucket chunk compiled in ~0.2 s, so per-file overhead dominated.
 CHUNK_ADDRESS_BITS = 14
-CHUNK_SOURCE_BUDGET = 512 * 1024
+CHUNK_SOURCE_BUDGET = 2 * 1024 * 1024
 ENTRY_ADDRESS_BITS = 16
 
 BODY_HEADER = """/* generated -- translated bodies do not depend on replacement policy */

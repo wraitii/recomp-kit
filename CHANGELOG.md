@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Translated body chunks use a 2 MiB source budget (was 512 KiB), so the
+  larger SSA bodies pack into fewer, less overhead-bound compile units.
+
 - Native replacements can hand generated files to original guest loaders through
   read-only file aliases, with guest-heap allocation and temporary-file helpers.
   Aliases precede overlay resolution and never redirect writes or deletes.
