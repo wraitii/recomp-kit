@@ -95,7 +95,7 @@ output width and p-code's zero result for shifts beyond the input width.
     # The trailing all-values pass this replaced only repeated that work.
 
 
-def live_values(s, publications=None, extra_roots=()):
+def live_values(s, publications=None, extra_roots=(), removable=()):
     """Find values needed by effects, control flow and observable CPU states.
 
     Outgoing state is observable on return. Each required effect snapshot is a
@@ -103,13 +103,18 @@ root, including registers/flags used only by a fault or helper observation.
 An optional publication plan identifies fields that already reside in the CPU
 and therefore need no SSA computation or assignment at that observation.
 Memory tokens retain the dependency chain without authorizing load forwarding.
+
+``removable`` names opcodes that are otherwise treated as roots but that a
+caller may ignore when asking what a value is needed for.  The SSA emitter uses
+it for ``CALL_RELOAD``: a callee-state read is emitted even when its value is
+unused, so a settle decision needs a use-only view.
 """
     todo = list(extra_roots)
     for b in s.blocks.values():
         for v in b.ops:
             # Unknown operations must survive to the consumer's diagnostic;
             # absence of a result use is not proof of absent effects.
-            if v.opc not in PURE:
+            if v.opc not in PURE and v.opc not in removable:
                 todo.append(v)
                 if v.opc in EFFECTS:
                     state = b.snapshots[v.id]

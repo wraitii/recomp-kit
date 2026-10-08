@@ -178,6 +178,14 @@ def _caller(prefix, suffix, callee=CALLEE):
     return prefix + [_call_bytes(addr, callee)] + suffix
 
 
+def _two_callers(between, after, callee=CALLEE):
+    """Two CALLs to the same target with bytes between and after them."""
+    first = _call_bytes(ENTRY, callee)
+    second_addr = ENTRY + 5 + sum(len(bytes.fromhex(h)) for h in between)
+    second = _call_bytes(second_addr, callee)
+    return [first] + list(between) + [second] + list(after)
+
+
 def _loop_caller():
     """Loop with a call inside the body; the backedge targets the call itself."""
     call_addr = ENTRY + 5
@@ -532,6 +540,55 @@ BYTE_CALL_CASES = {
         "ssa_callee": True,
         "pending": True,
         "modes": 0x60,  # lazy (bit 5) and decoded-lazy (bit 6)
+        "resumable": False,
+    },
+    # Per-call SSA reload granularity.  ``live_flag_reload_calls`` forces a
+    # settle only for a call whose arithmetic-flag reload is actually needed,
+    # so a call whose flags are shadowed by a later instruction keeps its
+    # region decision.  Each caller ends with a flag consumer, so the lazy and
+    # decoded-lazy columns must materialise the descriptor in the right place.
+    "settle_postcall_two_calls_first_shadowed": {
+        # call; add eax,ebx; call; setc al; mov [ebx],al; ret -- the ADD kills
+        # all six flags before the second call, so the first post-call settle
+        # is a DROP and only the second site must settle for setc.
+        "hexes": _two_callers(["01d8"], ["0f92c0", "8803", "c3"]),
+        "callee_hexes": ["8b442404", "c3"],
+        "ssa_callee": True,
+        "contract": True,
+        "resumable": False,
+    },
+    "settle_postcall_two_calls_second_shadowed": {
+        # call; setc al; mov [ebx],al; call; add eax,ebx; ret -- the first
+        # reload feeds setc, while the ADD shadows the second call's flags, so
+        # the first site settles and the second is a DROP.
+        "hexes": _two_callers(["0f92c0", "8803"], ["01d8", "c3"]),
+        "callee_hexes": ["8b442404", "c3"],
+        "ssa_callee": True,
+        "contract": True,
+        "resumable": False,
+    },
+    "settle_postcall_two_calls_preserving_second": {
+        # call; call; setc al; mov [ebx],al; ret -- the second callee reads CF
+        # and leaves every flag intact, so the first call's flag reload is
+        # published before it (and therefore needs its settle), and the second
+        # is read by setc.  A per-call rule must keep both settles.
+        "hexes": _two_callers([], ["0f92c0", "8803", "c3"]),
+        "callee_hexes": ["0f92c0", "8803", "c3"],
+        "ssa_callee": True,
+        "contract": True,
+        "resumable": False,
+    },
+    "settle_postcall_two_calls_merge": {
+        # call; jz +5; call; setc al; mov [ebx],al; ret -- CF reaches the
+        # consumer through a phi that merges the taken path (call 1's reload)
+        # with the fallthrough (call 2's reload).  ZF from the flag-killing
+        # callee makes the branch deterministic; the phi keeps both reloads
+        # live, so neither settle may be elided.
+        "hexes": [_call_bytes(ENTRY, CALLEE), "7405",
+                  _call_bytes(ENTRY + 7, CALLEE), "0f92c0", "8803", "c3"],
+        "callee_hexes": ["31c0", "c3"],
+        "ssa_callee": True,
+        "contract": True,
         "resumable": False,
     },
 }

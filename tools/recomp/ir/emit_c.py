@@ -15,7 +15,7 @@ from .integer import memory_arithmetic, shift, divide
 from .integer_extra import EXTRA_MNEMONICS, correct as correct_extra
 from .ssa import SSAError, MEMORY, build
 from .cfg import FunctionIR
-from .simplify import canonicalize, simplify, EFFECTS
+from .simplify import canonicalize, simplify, live_values, EFFECTS
 from .publication import plan
 from . import flag_region
 from . import x87
@@ -321,6 +321,31 @@ def ssa_settle_plan(cgi, flag_off_name, resumable_stacks):
     return entry, calls
 
 
+def live_flag_reload_calls(s, live, flag_keys):
+    """Block indices whose call leaves a live arithmetic-flag reload.
+
+    The SSA builder replaces every tracked flag with a fresh ``CALL_RELOAD``
+    of the callee's fields after a call.  ``simplify`` keeps only the live,
+    un-forwarded reloads, and the emitter lowers each surviving one to a
+    direct read of the flag fields right after the site's settle.  A reload
+    can be live because a guest instruction later reads it, because a RET
+    publishes it, or because a following call's publication snapshot (a
+    callee that reads or preserves flags) roots it.  Only the call that owns
+    such a reload needs to materialise the descriptor; its neighbours keep
+    their region decision.
+    """
+    calls = set()
+    for index, block in s.blocks.items():
+        if not any(v.opc in ("CALL", "CALLIND") for v in block.ops):
+            continue
+        for v in block.ops:
+            if (v.opc == "CALL_RELOAD" and v.data in flag_keys
+                    and v.id in live and s.resolve(v) is v):
+                calls.add(index)
+                break
+    return calls
+
+
 def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=True,
          call_symbols=None, x87_scalar_strict=False, local_state=True, msvc_convention=True,
          lazy_nan=False, lazy_flags=False, resumable_stacks=False, lifter=None,
@@ -566,18 +591,34 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             live = simplify(s, canonical=False)
     else:
         live = {v.id for v in s.values}
+    reload_live = live
+    if lazy_flags and optimize:
+        # ``CALL_RELOAD`` is itself a liveness root: the builder emits the
+        # callee-state read even when no observation uses its value.  A
+        # post-call settle decision cares only about reloads whose value is
+        # actually needed, so recompute liveness with those roots ignored.
+        # Entry INPUTs, effect snapshots and publication roots are unaffected.
+        reload_live = live_values(s, publications,
+                                  extra_roots=cc_roots + contract_roots,
+                                  removable=frozenset(("CALL_RELOAD",)))
     reads_entry_flags = any(
         v.opc == "INPUT" and v.data in flag_keys and v.id in live and s.resolve(v) is v
         for v in s.values)
     reads_after_call = any(
-        v.opc == "CALL_RELOAD" and v.data in flag_keys and v.id in live and s.resolve(v) is v
+        v.opc == "CALL_RELOAD" and v.data in flag_keys and v.id in reload_live
+        and s.resolve(v) is v
         for v in s.values)
-    if reads_after_call:
-        # The SSA builder reloads the callee's flags after every call and that
-        # reload reads the fields directly.  A pending callee descriptor must be
-        # materialised even when no guest instruction later reads a flag, so no
-        # post-call site may remove or drop its settle.
-        cc_calls = {index: flag_region.SETTLE for index in cc_calls}
+    if lazy_flags and optimize and reads_after_call:
+        # Only the call whose flag reload is needed materialises the callee's
+        # descriptor: that reload reads the fields directly, right after the
+        # site's settle.  A call whose flag reload is dead (shadowed by a
+        # later call or a region that overwrites all six) keeps its region
+        # decision.  This matters for a reload that is needed only as a
+        # following call's publication root: a callee that reads or preserves
+        # flags forces the caller to publish the fields before that call, so
+        # the earlier reload must not read a stale field.
+        for index in live_flag_reload_calls(s, reload_live, flag_keys):
+            cc_calls[index] = flag_region.SETTLE
     if reads_entry_flags:
         # The SSA builder loads live entry flag INPUTs straight from the fields,
         # immediately after the entry settle.  Those loads are not codegen ops,

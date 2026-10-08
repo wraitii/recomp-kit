@@ -15,7 +15,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ir.lift import Lifter
 from ir.summary import FunctionIR, default_successors
-from ir.emit_c import emit
+from ir.emit_c import emit, codegen_ir, ssa_settle_plan
+from ir import flag_region
 
 LIFTER = Lifter()
 ENTRY = 0x1000
@@ -126,3 +127,62 @@ def test_lazy_flags_flag_off_is_the_eager_emission():
     assert eager != lazy
     assert "c->cc_op" not in eager
     assert "c->cc_op" in lazy
+
+
+# ---- per-call post-call settle decisions ----------------------------------
+
+def flag_names():
+    names = {}
+    for name in ("CF", "PF", "AF", "ZF", "SF", "OF"):
+        _, off, size = LIFTER.register(name)
+        for n in range(size):
+            names[off + n] = name.lower()
+    return names
+
+
+def test_postcall_plan_first_shadowed_second_needed():
+    # call; add eax,ebx; call; setc al; mov [ebx],al; ret -- the ADD kills all
+    # six flags before the second call, so the first reload is dead and only
+    # the second site must settle.
+    body = fast(function(rel32(ENTRY), "01d8", rel32(ENTRY + 7),
+                         "0f92c0", "8803", "c3"))
+    assert body.count("x86_cc_drop(c);") == 1
+    assert body.count("x86_cc_settle(c);") == 1
+    assert body.index("x86_cc_drop(c);") < body.index("x86_cc_settle(c);")
+
+
+def test_postcall_plan_second_shadowed_first_needed():
+    # call; setc al; mov [ebx],al; call; add eax,ebx; ret -- the second reload
+    # is shadowed by the ADD, so only the first site settles.
+    body = fast(function(rel32(ENTRY), "0f92c0", "8803", rel32(ENTRY + 10),
+                         "01d8", "c3"))
+    assert body.count("x86_cc_drop(c);") == 1
+    assert body.count("x86_cc_settle(c);") == 1
+    assert body.index("x86_cc_settle(c);") < body.index("x86_cc_drop(c);")
+
+
+def test_postcall_plan_merge_keeps_both():
+    # call; jz +5; call; setc al; mov [ebx],al; ret -- CF reaches the consumer
+    # through a phi from both calls, and ZF forces the first site; neither may
+    # be elided.
+    body = fast(function(rel32(ENTRY), "7405", rel32(ENTRY + 7),
+                         "0f92c0", "8803", "c3"))
+    assert body.count("x86_cc_settle(c);") == 2
+    assert "x86_cc_drop" not in body
+
+
+def test_ssa_settle_plan_is_per_call():
+    # The region walk alone decides each call's post-call action.
+    fir = function(rel32(ENTRY), "01d8", rel32(ENTRY + 7),
+                   "0f92c0", "8803", "c3")
+    calls = ssa_settle_plan(codegen_ir(fir, LIFTER), flag_names(), False)[1]
+    assert calls[0] == flag_region.DROP
+    assert calls[2] == flag_region.SETTLE
+
+
+def test_ssa_settle_plan_is_per_call_inverse():
+    fir = function(rel32(ENTRY), "0f92c0", "8803", rel32(ENTRY + 10),
+                   "01d8", "c3")
+    calls = ssa_settle_plan(codegen_ir(fir, LIFTER), flag_names(), False)[1]
+    assert calls[0] == flag_region.SETTLE
+    assert calls[3] == flag_region.DROP

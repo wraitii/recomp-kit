@@ -43,8 +43,10 @@ def test_mixed_callees_use_stable_thunks_and_chunk_declarations(tmp_path):
     assert report["emitted"] == report["fallback"] == 1
     assert report["emitted_percent"] == report["fallback_percent"] == 50
     # Per-site lazy-flag settle census is part of the report; the emitted
-    # caller's entry region is call-only, so its entry settle is removed.
+    # caller's entry region is call-only, so its entry settle is removed, and
+    # the post-call region's ADD kills all six flags, so that settle drops.
     assert report["ssa_settles"]["entry"]["remove"] >= 1
+    assert report["ssa_settles"]["postcall"]["drop"] >= 1
     assert set(report["ssa_settles"]["postcall"]) == {"remove", "drop", "settle"}
     source = "\n".join(bodies[ENTRY])
     assert "CALL_FN(%08x);" % CALLEE in source

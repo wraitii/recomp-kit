@@ -375,6 +375,13 @@ fail closed); SSA bodies apply the same classification over their p-code ops.
 When the `locals` policy caches a flag, its C-local is initialised after the
 entry settle and reloaded after the post-call settle, so a cached value never
 predates the descriptor whose fields it copies.
+An SSA body reloads every tracked flag from the callee directly after a call.
+Only a call whose arithmetic-flag reload is actually needed is forced to
+settle: that is the call the reload belongs to, and a reload is needed when a
+later observation reads it, when a `RET` publishes it, or when a following
+call's publication snapshot roots it (a callee that reads or preserves
+flags).  A dead reload is still emitted, but it forces no settle, so its
+shadowed value is never observed.
 A call whose return can continue somewhere other than its fallthrough - a
 resumable-stack diversion, an SEH frame adoption, a noreturn callee or setjmp -
 keeps the settle, as does any region with a path that leaves the body without
