@@ -146,6 +146,10 @@ static int compare(void) {
                 FIXTURE_BEFORE(mode);
                 functions[f][mode](&actual);
                 FIXTURE_AFTER_STATE(mode, &actual);
+                /* A lazy-flags column may hold a pending descriptor; compare the
+                 * materialised guest state.  The eager reference has none. */
+                x86_cc_settle(&actual);
+                x86_cc_settle(&reference);
                 int mem_diff = memcmp(output, g_mem + 0x10000, sizeof output) != 0;
                 if (normalize_empty_mask & (1u << mode)) {
                     discard_empty_contents(&actual);

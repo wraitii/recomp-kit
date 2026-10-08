@@ -66,6 +66,8 @@ class X86(C.Structure):
         ("eflags_sf", C.c_uint32), ("eflags_of", C.c_uint32),
         ("eflags_pf", C.c_uint32), ("eflags_af", C.c_uint32),
         ("eflags_df", C.c_uint32), ("eflags_misc", C.c_uint32),
+        ("cc_op", C.c_uint8), ("cc_size", C.c_uint8), ("cc_mask", C.c_uint8), ("cc_pad0", C.c_uint8),
+        ("cc_a", C.c_uint32), ("cc_b", C.c_uint32), ("cc_res", C.c_uint32),
         ("st", C.c_double * 8), ("st_bits", C.c_uint64 * 8),
         ("st_exact", C.c_uint8 * 8), ("fpu_top", C.c_uint32),
         ("fpu_cw", C.c_uint16), ("fpu_sw", C.c_uint16),

@@ -95,7 +95,7 @@ output width and p-code's zero result for shifts beyond the input width.
     # The trailing all-values pass this replaced only repeated that work.
 
 
-def live_values(s, publications=None):
+def live_values(s, publications=None, extra_roots=()):
     """Find values needed by effects, control flow and observable CPU states.
 
     Outgoing state is observable on return. Each required effect snapshot is a
@@ -104,7 +104,7 @@ An optional publication plan identifies fields that already reside in the CPU
 and therefore need no SSA computation or assignment at that observation.
 Memory tokens retain the dependency chain without authorizing load forwarding.
 """
-    todo = []
+    todo = list(extra_roots)
     for b in s.blocks.values():
         for v in b.ops:
             # Unknown operations must survive to the consumer's diagnostic;
@@ -127,7 +127,7 @@ Memory tokens retain the dependency chain without authorizing load forwarding.
     return live
 
 
-def simplify(s, publications=None, *, canonical=True):
+def simplify(s, publications=None, *, canonical=True, extra_roots=()):
     """Canonicalize to a fixed point, then eliminate unobserved pure values.
 
     ``canonical=False`` skips the canonicalization pass for a caller that has
@@ -137,7 +137,7 @@ def simplify(s, publications=None, *, canonical=True):
     """
     if canonical:
         canonicalize(s)
-    live = live_values(s, publications)
+    live = live_values(s, publications, extra_roots)
     for b in s.blocks.values():
         b.ops = [v for v in b.ops if v.id in live and s.resolve(v) is v]
         b.phis = [v for v in b.phis if v.id in live and s.resolve(v) is v]

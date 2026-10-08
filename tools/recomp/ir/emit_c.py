@@ -15,7 +15,7 @@ from .integer import memory_arithmetic, shift, divide
 from .integer_extra import EXTRA_MNEMONICS, correct as correct_extra
 from .ssa import SSAError, MEMORY, build
 from .cfg import FunctionIR
-from .simplify import canonicalize, simplify
+from .simplify import canonicalize, simplify, EFFECTS
 from .publication import plan
 from . import x87
 
@@ -57,6 +57,56 @@ STRING_HELPERS = _string_helpers()
 
 # Arithmetic flags tracked by the calling-convention census.
 FLAG_FIELDS = frozenset("c->eflags_" + n for n in ("cf", "pf", "af", "zf", "sf", "of"))
+
+#: Lazy-flag producers recognised at a seam: (kind, primary p-code opcode).
+#: The primary op must write a non-flag destination.  SUB/CMP, ADD, logic/TEST
+#: and INC/DEC are the initial set; everything else stays eager.
+CC_PRIMARY = {
+    "ADD": ("add", "INT_ADD"),
+    "SUB": ("sub", "INT_SUB"),
+    "CMP": ("cmp", "INT_SUB"),
+    "INC": ("inc", "INT_ADD"),
+    "DEC": ("dec", "INT_SUB"),
+    "AND": ("logic", "INT_AND"),
+    "OR": ("logic", "INT_OR"),
+    "XOR": ("logic", "INT_XOR"),
+    "TEST": ("logic", "INT_AND"),
+}
+
+
+def _flag_producer(mnem, ops, flag_offsets):
+    """Return the primary op metadata for a recognised lazy-flag producer."""
+    info = CC_PRIMARY.get(mnem)
+    if info is None:
+        return None
+    kind, opc = info
+    for op in ops:
+        if op.opc != opc or op.out is None:
+            continue
+        space, off, size = op.out
+        if space not in ("register", "unique"):
+            continue
+        if space == "register" and any((off + n) in flag_offsets for n in range(size)):
+            continue
+        return {"kind": kind, "opc": opc, "size": size, "result": op.out}
+    return None
+
+
+#: Which arithmetic flags a recognised producer defines.  Flags absent are
+#: preserved; the emitter stores them directly at the seam.
+CC_DEFINES = {
+    "add": ("cf", "pf", "af", "zf", "sf", "of"),
+    "sub": ("cf", "pf", "af", "zf", "sf", "of"),
+    "cmp": ("cf", "pf", "af", "zf", "sf", "of"),
+    "logic": ("cf", "of", "zf", "sf", "pf"),
+    "inc": ("pf", "af", "zf", "sf", "of"),
+    "dec": ("pf", "af", "zf", "sf", "of"),
+}
+CC_OP_CONST = {"add": "X86_CC_ADD", "sub": "X86_CC_SUB", "cmp": "X86_CC_SUB",
+               "logic": "X86_CC_LOGIC", "inc": "X86_CC_INC", "dec": "X86_CC_DEC"}
+CC_BIT_VALUES = {"cf": 1, "pf": 2, "af": 4, "zf": 8, "sf": 0x10, "of": 0x20}
+#: Seams whose observer may read the guest's fields directly, so flags stay eager.
+CC_EAGER_EVENTS = frozenset(("DIV32", "IDIV32", "STRINGOP", "BRANCHIND"))
 
 _RAM_CONTROL = frozenset(("BRANCH", "CBRANCH", "CALL", "CALLIND", "BRANCHIND", "CALLOTHER"))
 
@@ -126,6 +176,10 @@ def normalize_direct_ram(ins, lifter):
 
 def codegen_ir(fir, lifter):
     """Apply audited integer/x87 corrections without changing raw census input."""
+    flag_offsets = set()
+    for name in ("CF", "PF", "AF", "ZF", "SF", "OF"):
+        _, off, size = lifter.register(name)
+        flag_offsets.update(range(off, off + size))
     insns = []
     for ins in fir.insns:
         mnem = ins.mnem.upper()
@@ -166,15 +220,17 @@ def codegen_ir(fir, lifter):
             ops = divide(normalized, lifter)
         else:
             ops = normalized.ops
-        insns.append(Insn(ins.addr, ins.length, ins.mnem, ops, ins.x87_delta,
-                          ins.x87, ins.internal_flow, ins.userops, ins.raw))
+        result = Insn(ins.addr, ins.length, ins.mnem, ops, ins.x87_delta,
+                      ins.x87, ins.internal_flow, ins.userops, ins.raw)
+        result.cc = _flag_producer(mnem, ops, flag_offsets)
+        insns.append(result)
     return FunctionIR(fir.addr, insns, fir.succ, fir.tables)
 
 
 def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=True,
          call_symbols=None, x87_scalar_strict=False, local_state=True, msvc_convention=True,
-         lazy_nan=False, resumable_stacks=False, lifter=None, indirect_call_symbol=None,
-         _guard_null_checks=True, facts=None):
+         lazy_nan=False, lazy_flags=False, resumable_stacks=False, lifter=None,
+         indirect_call_symbol=None, _guard_null_checks=True, facts=None):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
     `call_symbols` maps an allowed direct-call target address to the C symbol
@@ -241,9 +297,9 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                        lazy_nan=lazy_nan,
                        _guard_null_checks=False)
         strict = emit(fir, symbol, x87_scalar_strict=True, local_state=False, msvc_convention=False,
-                      **options)
+                      lazy_flags=False, **options)
         fast = emit(fir, symbol, x87_scalar_strict=x87_scalar_strict, local_state=local_state,
-                    msvc_convention=msvc_convention, facts=facts, **options)
+                    msvc_convention=msvc_convention, lazy_flags=lazy_flags, facts=facts, **options)
         return "#if defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS\n%s\n#else\n%s\n#endif" % (strict, fast)
     from .x87_scalar import X87Scalar
     msvc_convention = msvc_convention and optimize
@@ -280,11 +336,20 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     for (_, off, size), field in fields:
         for n in range(size):
             mapping[("register", off + n)] = (field, n)
+    flag_off_name = {}
+    flag_first_key = {}
+    for name in ("CF", "PF", "AF", "ZF", "SF", "OF"):
+        _, off, size = lifter.register(name)
+        flag_first_key[name.lower()] = ("register", off)
+        for n in range(size):
+            flag_off_name[off + n] = name.lower()
+    flag_keys = {key for key, (field, _) in mapping.items() if field in FLAG_FIELDS}
     groups = [[("register", off + n) for n in range(size)]
               for (_, off, size), _ in fields]
     s = build(codegen_ir(fir, lifter),
               register_groups=groups if optimize and wide_registers else (),
-              call_targets=call_symbols, indirect_call_symbol=indirect_call_symbol)
+              call_targets=call_symbols, indirect_call_symbol=indirect_call_symbol,
+              flag_off_name=flag_off_name)
     if any(key != MEMORY and key not in mapping for key in s.inputs):
         raise SSAError("unmapped runtime register")
     publications = None
@@ -304,16 +369,52 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             # Keep flag publication at calls/returns until actual call
             # summaries prove which fields a boundary does not observe.
             publications = plan(s, fir.succ, groups, access_fields=access_fields)
-        live = simplify(s, publications, canonical=False)
+    # Decide which seams defer their flags as a descriptor before dead-value
+    # elimination, so the descriptor's operands can be kept live as roots.
+    cc_plan, cc_roots = {}, []
+    if lazy_flags and optimize and publications is not None:
+        for b in s.blocks.values():
+            for v in b.ops:
+                if v.opc not in EFFECTS and v.opc not in ("RETURN", "BRANCHIND"):
+                    continue
+                record = b.cc_exit if v.opc == "RETURN" else b.cc_snapshots.get(v.id)
+                if record is None:
+                    continue
+                state = b.exit if v.opc in ("RETURN", "BRANCHIND") else b.snapshots[v.id]
+                required = publications[v.id]
+                defines = set(CC_DEFINES[record.kind])
+                mask = 0
+                for name, key in flag_first_key.items():
+                    if name not in defines or key not in required:
+                        continue
+                    rec = record.flags.get(name)
+                    cur = state.get(key)
+                    if rec is None or cur is None or s.resolve(cur) is not s.resolve(rec):
+                        mask = 0
+                        break
+                    mask |= CC_BIT_VALUES[name]
+                if not mask or v.opc in CC_EAGER_EVENTS:
+                    continue
+                cc_plan[v.id] = (record, mask)
+                cc_roots.extend(x for x in (record.a, record.b, record.res) if x is not None)
+    if optimize:
+        if publications is not None:
+            live = simplify(s, publications, canonical=False, extra_roots=cc_roots)
+        else:
+            live = simplify(s, canonical=False)
     else:
         live = {v.id for v in s.values}
+    reads_entry_flags = any(
+        v.opc == "INPUT" and v.data in flag_keys and v.id in live and s.resolve(v) is v
+        for v in s.values)
+    reads_after_call = any(
+        v.opc == "CALL_RELOAD" and v.data in flag_keys and v.id in live and s.resolve(v) is v
+        for v in s.values)
     if facts is not None:
-        flag_keys = {key for key, (field, _) in mapping.items() if field in FLAG_FIELDS}
-        read = [v for v in s.values if v.id in live and s.resolve(v) is v
-                and v.opc in ("INPUT", "CALL_RELOAD") and v.data in flag_keys]
-        facts["flags_read_at_entry"] = any(v.opc == "INPUT" for v in read)
-        facts["flags_read_after_call"] = any(v.opc == "CALL_RELOAD" for v in read)
+        facts["flags_read_at_entry"] = reads_entry_flags
+        facts["flags_read_after_call"] = reads_after_call
         facts["x87_exact_flush"] = msvc_convention and not x87_convention
+        facts["lazy_flags"] = bool(cc_plan)
 
     def ref(v):
         v = s.resolve(v)
@@ -378,17 +479,53 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             return "(%s << %d) | %s" % (a[0], v.args[1].size * 8, a[1])
         raise SSAError("unsupported integer operation %s" % opc)
 
+    # Whether this body writes any flag state.  Such a body must settle a
+    # descriptor left by its caller or a callee before writing, or the fields
+    # a newer descriptor does not cover would be lost (INC after a caller's
+    # CMP keeps CF).  A body that never touches flags passes it through.
+    cc_touch = [reads_entry_flags or reads_after_call]
+    CC_SETTLE = "/*cc-settle*/"
+
     def publish(state, event):
         lines = []
         required = state if publications is None else publications[event.id]
+        if lazy_flags and getattr(event, "opc", None) in CC_EAGER_EVENTS:
+            # These helpers may write flag fields directly.
+            cc_touch[0] = True
+        cc = cc_plan.get(event.id)
+        record = None
+        mask = 0
+        covered = set()
+        if cc is not None:
+            record, mask = cc
+            covered = {"c->eflags_%s" % name for name in CC_DEFINES[record.kind]}
+        stored_flag = False
         for (_, off, size), field in fields:
             keys = [("register", off + n) for n in range(size)]
             if not any(key in required for key in keys):
+                continue
+            if field in covered:
                 continue
             parts = ["(%s << %d)" % (ref(state[key]), n * 8)
                      if key in state else "(%s & 0x%xu)" % (field, 255 << (n * 8))
                      for n, key in enumerate(keys)]
             lines.append("%s = (uint32_t)(%s);" % (field, " | ".join(parts)))
+            if field in FLAG_FIELDS:
+                stored_flag = True
+        if record is not None or stored_flag:
+            cc_touch[0] = True
+        if record is not None:
+            lines.append("c->cc_op = %s;" % CC_OP_CONST[record.kind])
+            lines.append("c->cc_size = %du;" % record.size)
+            lines.append("c->cc_mask = 0x%xu;" % mask)
+            lines.append("c->cc_a = (uint32_t)%s;" % (
+                ref(record.a) if record.a is not None else "0"))
+            lines.append("c->cc_b = (uint32_t)%s;" % (
+                ref(record.b) if record.b is not None else "0"))
+            lines.append("c->cc_res = (uint32_t)%s;" % ref(record.res))
+        elif lazy_flags and stored_flag:
+            # A direct field write must not leave an older descriptor pending.
+            lines.append("c->cc_op = X86_CC_NONE;")
         return lines
 
     def edge(source, target):
@@ -410,6 +547,8 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     scalar_declarations = len(lines)
     if scalar is not None:
         lines.extend(scalar.declarations())
+    if lazy_flags:
+        lines.append(CC_SETTLE)
     for v in s.values:
         if v.opc != "INPUT" or not v.size or v.id not in live or s.resolve(v) is not v:
             continue
@@ -594,6 +733,9 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                     raise SSAError("%08x: no C symbol bound for call target %08x"
                                    % (b.insn.addr, v.data))
                 lines.append("%s(c);" % name)
+                if lazy_flags:
+                    # A callee (SSA or otherwise) may leave a pending descriptor.
+                    lines.append(CC_SETTLE)
                 if resumable_stacks:
                     # Match the eager emitter's resumable-stack contract: a
                     # callee that diverted EIP did not resume the continuation.
@@ -613,6 +755,8 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 # SSA builder reloads every tracked lane/flag afterward.
                 lines.extend(publish(b.snapshots[v.id], v))
                 lines.append("%s(c, (uint32_t)%s);" % (v.data, ref(v.args[1])))
+                if lazy_flags:
+                    lines.append(CC_SETTLE)
                 if resumable_stacks:
                     lines.append("if (c->eip != 0x%x) return;" % (
                         b.insn.addr + b.insn.length))
@@ -709,6 +853,10 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 lines.extend(edge(i, target))
         previous = i
     lines.append("}")
+    if lazy_flags:
+        settle = "x86_cc_settle(c);" if cc_touch[0] else None
+        lines = [settle if line == CC_SETTLE else line for line in lines
+                 if line != CC_SETTLE or settle]
     if scalar is not None:
         lines[scalar_declarations:scalar_declarations] = scalar.temps
     return "\n".join(lines)

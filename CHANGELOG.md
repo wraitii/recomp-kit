@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- SSA bodies now defer ADD/SUB/CMP/logic/INC/DEC flag materialisation into an
+  `X86` descriptor (`cc_op`/`cc_size`/`cc_mask`/`cc_a`/`cc_b`/`cc_res`) and
+  settle it at call and return seams instead of writing the six flag fields.
+  The interpreter, the decoded fallback and `recomp_call` settle at entry and
+  after calls; a body that writes any flag state settles before writing, and a
+  body that never touches flags passes the descriptor through. The materialised
+  flags match eager emission exactly, so there is no `DIVERGENCE(original)`
+  tag; skipping a settle needs call summaries and is left to the cross-function
+  contract work.
+
 - Normalize Capstone FCOMPI/FUCOMPI to FCOMIP/FUCOMIP in mapped and
   recovered instruction decoding, using the existing flag-setting and x87-pop
   lowering instead of an unmodelled-instruction trap.

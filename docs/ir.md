@@ -346,6 +346,27 @@ an eager per-op check is when the fold is computed, never its result. The
 relaxation is disabled for strict x87, the exact flush and
 `optimize=False`, where emission is byte-identical to the eager helpers.
 
+Lazy arithmetic flags are a second representation change on the same seams.
+`X86` carries a descriptor (`cc_op`, `cc_size`, `cc_mask`, `cc_a`, `cc_b`,
+`cc_res`) for the last recognised ADD/SUB/CMP/logic/INC/DEC instead of
+materialising the six flag fields. `cc_op` is `X86_CC_NONE` when the fields are
+current; otherwise `cc_op` names the operation, `cc_size` is 1/2/4, `cc_mask`
+names the fields the operation defines (logic preserves AF, INC/DEC preserve
+CF), and `cc_a`/`cc_b`/`cc_res` are the masked operands and the wrapped result.
+`x86_cc_settle` writes the fields and clears the descriptor;
+`x86_get_eflags`, `x86_set_eflags`, `x86_sahf` and `recomp_comis` settle or drop
+it first, and the interpreter, decoded bodies and `recomp_call` settle at entry
+and after every call. An SSA body publishes a descriptor at a call or return
+seam only while the seam's required flag values still resolve to that producer's
+result. A body that writes any flag state must settle at entry and after each
+call, or a newer descriptor would discard a field it does not define (an INC
+after a caller's CMP would lose CF); a body that never touches flags passes the
+descriptor through untouched. Like lazy NaN this is exact - the descriptor
+materialises to the same fields eager emission writes - so it carries no
+DIVERGENCE tag. The representation only pays off when a consumer can skip the
+settle, which needs call summaries proving the callee does not observe the
+flags; that is the next step toward the cross-function contracts.
+
 The `locals` state policy defers GPR/flag publication at guest loads and
 stores (integer and x87), keeping EIP/ESP/EBP for diagnostics; no runtime
 observer reads other CPU fields there. Division, string-helper, call and return

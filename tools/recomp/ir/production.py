@@ -130,6 +130,7 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
         "local_state": relaxed,
         "msvc_convention": convention,
         "lazy_nan": True,
+        "lazy_flags": relaxed,
         "resumable_stacks": policies.get("resumable_stacks", False),
         "indirect_call_symbol": "recomp_call",
     }
@@ -227,6 +228,7 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
     report = {
         "enabled": True, "x87": mode, "state": state, "msvc_convention": convention,
         "lazy_nan": True,
+        "lazy_flags": True,
         "functions": total, "emitted": emitted, "fallback": total - emitted,
         "emitted_percent": 100 * emitted / total if total else 0,
         "fallback_percent": 100 * (total - emitted) / total if total else 0,
@@ -236,6 +238,7 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
         # kept the exact x87 flush. A sanity census, not an admission gate.
         "convention_census": {key: census[key] for key in (
             "flags_read_at_entry", "flags_read_after_call", "x87_exact_flush")},
+        "lazy_flag_bodies": census.get("lazy_flags", 0),
         "seconds": round(time.monotonic() - started, 3), "per_function": results,
     }
     if not quiet:

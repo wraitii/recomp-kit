@@ -188,6 +188,49 @@ def _loop_caller():
     return ["b900000000", call, "83c101", "83f903", "72%02x" % rel, "890b", "c3"]
 
 
+# Byte encodings for the flag-producing shapes the lazy descriptor covers, at
+# byte/word/dword width. CMP/SUB lower to X86_CC_SUB; TEST lowers to
+# X86_CC_LOGIC, the same descriptor an AND/OR/XOR would use.
+FLAG_ABI_ENCODINGS = {
+    "cmp": {"8": "38d8", "16": "6639d8", "32": "39d8"},
+    "sub": {"8": "28d8", "16": "6629d8", "32": "29d8"},
+    "add": {"8": "00d8", "16": "6601d8", "32": "01d8"},
+    "test": {"8": "84d8", "16": "6685d8", "32": "85d8"},
+    "inc": {"8": "fec0", "16": "6640", "32": "40"},
+    "dec": {"8": "fec8", "16": "6648", "32": "48"},
+}
+#: `setz al; mov [ebx],al` makes ZF observable after a seam. Every producer in
+#: FLAG_ABI_ENCODINGS defines ZF.
+FLAG_CONSUMER = ["0f94c0", "8803", "c3"]
+
+
+def _flag_abi_cases():
+    """CMP/SUB/ADD/TEST/INC/DEC at 8/16/32-bit across CALL and RET seams.
+
+    The `_call` rows put the producer in the caller and observe the flags after
+    a callee that touches no flags, so a descriptor written at the call seam
+    must survive the call. The `_ret` rows put the producer in a byte-backed
+    SSA callee and observe the flags it returns, so the callee's RET descriptor
+    must materialise for the caller's consumer.
+    """
+    cases = {}
+    for op, widths in FLAG_ABI_ENCODINGS.items():
+        for width, code in widths.items():
+            cases["flags_%s%s_call" % (op, width)] = {
+                "hexes": _caller([code], FLAG_CONSUMER),
+                "callee_hexes": ["8b442404", "c3"],  # mov eax,[esp+4]; ret
+                "ssa_callee": True,
+                "resumable": False,
+            }
+            cases["flags_%s%s_ret" % (op, width)] = {
+                "hexes": _caller([], FLAG_CONSUMER),
+                "callee_hexes": [code, "c3"],
+                "ssa_callee": True,
+                "resumable": False,
+            }
+    return cases
+
+
 # Byte-backed callers with explicit host callees. The callee models a guest
 # function: mutate state, pop the return address (RET or RET n) and set EIP.
 # The raw/scalar/strict/local IR callers are compared against the eager caller for
@@ -335,7 +378,41 @@ BYTE_CALL_CASES = {
         "callee_hexes": ["d9e8", "c3"],
         "resumable": False,
     },
+    "call_flags_inc_preserves_cf": {
+        # cmp eax,ebx; call; setc al; mov [ebx],al; ret
+        # callee: inc ecx; ret -- INC leaves CF, so the caller's CMP carry must
+        # survive the callee's INC descriptor. A callee that overwrote the
+        # caller's pending CMP descriptor would lose it.
+        "hexes": _caller(["39d8"], ["0f92c0", "8803", "c3"]),
+        "callee_hexes": ["41", "c3"],
+        "ssa_callee": True,
+        "resumable": False,
+    },
+    "call_flags_noflag_passthrough": {
+        # cmp eax,ebx; call; setc al; mov [ebx],al; ret
+        # callee: mov eax,[esp+4]; ret -- touches no flags at all, so the
+        # caller's pending descriptor passes through the callee unsettled and
+        # the caller settles it after the return.
+        "hexes": _caller(["39d8"], ["0f92c0", "8803", "c3"]),
+        "callee_hexes": ["8b442404", "c3"],
+        "ssa_callee": True,
+        "resumable": False,
+    },
+    "call_flags_return_jz": {
+        # call; jz +5; mov eax,1; mov [ebx],eax; ret
+        # The 006ff798 CRT classifier returns ZF; a lazy callee leaves a
+        # descriptor at RET and the caller's JZ must materialise it instead of
+        # reading a stale field.
+        "hexes": _caller([], ["7405", "b801000000", "8903", "c3"]),
+        "callee_hexes": ["8b442408", "250000f07f", "3d0000f07f", "7401", "c3",
+                          "8b442408", "c3"],
+        "ssa_callee": True,
+        "resumable": False,
+    },
 }
+
+# Generated op x width x seam matrix; kept out of the literal for readability.
+BYTE_CALL_CASES.update(_flag_abi_cases())
 
 
 #: Distinct synthetic targets let one generated dispatcher serve every
@@ -450,7 +527,7 @@ def call_sources(name, hexes, callee_addr, resumable=False, indirect=False):
     strict = emit(fir, name + "_ir_strict", x87_scalar_strict=True, local_state=False,
                   msvc_convention=False, **options)
     local = emit(fir, name + "_ir_local", **options)
-    lazy = emit(fir, name + "_ir_lazy", lazy_nan=True, **options)
+    lazy = emit(fir, name + "_ir_lazy", lazy_nan=True, lazy_flags=True, **options)
     return eager, raw, scalar, strict, local, lazy, fallthroughs
 
 
@@ -505,7 +582,7 @@ def sources(name, hexes):
     strict = emit(fir, name + "_ir_strict", x87_scalar_strict=True, local_state=False,
                   msvc_convention=False)
     local = emit(fir, name + "_ir_local")
-    lazy = emit(fir, name + "_ir_lazy", lazy_nan=True)
+    lazy = emit(fir, name + "_ir_lazy", lazy_nan=True, lazy_flags=True)
     return eager, raw, scalar, strict, local, lazy
 
 
@@ -561,8 +638,11 @@ def run_checks(out, cmake, jobs):
                 addr += len(raw_bytes)
             fir = FunctionIR(CALLEE, lifted, default_successors(lifted))
             extra.append(emit(fir, name + "_callee_local"))
+            # The lazy caller needs a lazy callee to exercise a descriptor the
+            # callee leaves pending at its return; the local column stays eager.
+            extra.append(emit(fir, name + "_callee_lazy", lazy_flags=True))
             local = local.replace(name + "_callee(c)", name + "_callee_local(c)")
-            lazy = lazy.replace(name + "_callee(c)", name + "_callee_local(c)")
+            lazy = lazy.replace(name + "_callee(c)", name + "_callee_lazy(c)")
         add_case(name, eager, [raw, scalar, strict, local, lazy], extra=extra,
                  fallthroughs=returns)
     dispatch = []

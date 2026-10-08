@@ -218,7 +218,7 @@ void harness_cpuid(uint32_t leaf, uint32_t out[4]) {
     out[3] = c.r[R_EDX];
 }
 
-uint32_t harness_eflags(const X86 *c) {
+uint32_t harness_eflags(X86 *c) {
     return x86_get_eflags(c);
 }
 

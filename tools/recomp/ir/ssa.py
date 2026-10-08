@@ -24,7 +24,24 @@ class Block:
     def __init__(self, index, insn):
         self.index, self.insn = index, insn
         self.phis, self.ops, self.snapshots = [], [], {}
+        # Lazy-flag producer active at each publication snapshot, and at exit.
+        self.cc_snapshots = {}
+        self.cc_exit = None
         self.state, self.exit = {}, {}
+
+
+class CcRecord:
+    """A recognised lazy-flag producer: operands and the flag values it wrote.
+
+    The producer is only usable at a seam while the SSA flag values still
+    resolve to the values this record wrote; the emitter re-checks identity.
+    """
+    __slots__ = ("kind", "size", "a", "b", "res", "flags")
+
+    def __init__(self, kind, size):
+        self.kind, self.size = kind, size
+        self.a = self.b = self.res = None
+        self.flags = {}
 
 
 class SSA:
@@ -64,7 +81,8 @@ class SSA:
 MEMORY = ("memory", 0)
 
 
-def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None):
+def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None,
+          flag_off_name=None):
     """Build SSA for reachable integer instructions using the supplied CFG.
 
     A direct CALL is admitted only when its literal target appears in
@@ -164,6 +182,16 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
             b.state[key] = phi
     for i, b in s.blocks.items():
         state, temps = dict(b.state), {}
+        ins_cc = b.insn.cc
+        cc_rec = CcRecord(ins_cc["kind"], ins_cc["size"]) if ins_cc is not None else None
+        cc_ready = False  # the primary result has been seen
+        cc_active = None  # last complete producer, valid across this block
+        # Carry a producer along a single-predecessor edge (the common
+        # straight-line `cmp; ret`/`cmp; call` block pair).  Joins and loop
+        # backedges fall back to eager flags rather than threading a phi.
+        preds = predecessors[i]
+        if len(preds) == 1 and preds[0] != -1 and preds[0] in s.blocks:
+            cc_active = s.blocks[preds[0]].cc_exit
 
         def emit(opc, size, args=(), data=None):
             v = s.value(opc, size, args, data)
@@ -184,9 +212,20 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
             return lanes[0] if size == 1 else emit("PACK", size, lanes)
 
         def write(dst, value):
+            nonlocal cc_active
             space, off, size = dst
             if space not in ("register", "unique"):
                 raise SSAError("unsupported output space %s" % space)
+            if space == "register" and flag_off_name:
+                for n in range(size):
+                    name = flag_off_name.get(off + n)
+                    if name is None:
+                        continue
+                    if cc_rec is not None:
+                        cc_rec.flags[name] = value
+                    else:
+                        # An unrecognised flag write invalidates the pending one.
+                        cc_active = None
             storage = state if space == "register" else temps
             for n in range(size):
                 storage[(space, off + n)] = value if size == 1 else emit("BYTE", 1, [value], n)
@@ -200,6 +239,7 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                 before = dict(state)
                 value = emit("CALL", 0, [state[MEMORY]], data=op.ins[0][1])
                 b.snapshots[value.id] = before
+                b.cc_snapshots[value.id] = cc_active
                 state[MEMORY] = emit("MEMORY", 0, [value])
                 for key in keys:
                     if key != MEMORY:
@@ -207,6 +247,9 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                         # keeps it ordered after the call and lets simplify drop
                         # a reload that no later observation uses.
                         state[key] = emit("CALL_RELOAD", s.inputs[key].size, [value], data=key)
+                # The callee's flags replace the caller's; a descriptor left by
+                # an SSA callee is materialised by the emitter before reload.
+                cc_active = None
                 continue
             if op.opc == "CALLIND":
                 # An opaque indirect call: publish the pre-call CPU (including
@@ -219,20 +262,33 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                 before = dict(state)
                 value = emit("CALLIND", 0, [state[MEMORY], target], data=indirect_call_symbol)
                 b.snapshots[value.id] = before
+                b.cc_snapshots[value.id] = cc_active
                 state[MEMORY] = emit("MEMORY", 0, [value])
                 for key in keys:
                     if key != MEMORY:
                         state[key] = emit("CALL_RELOAD", s.inputs[key].size, [value], data=key)
+                cc_active = None
                 continue
             args = [read(v) for v in op.ins]
+            primary = (ins_cc is not None and not cc_ready
+                       and op.opc == ins_cc["opc"] and op.out == ins_cc["result"])
+            if primary:
+                if len(args) > 0:
+                    cc_rec.a = args[0]
+                if len(args) > 1:
+                    cc_rec.b = args[1]
             if op.opc in ORDERED:
                 before = dict(state)
                 value = emit(op.opc, op.out[2] if op.out else 0,
                              [state[MEMORY]] + args, op.data)
                 b.snapshots[value.id] = before
+                b.cc_snapshots[value.id] = cc_rec if cc_ready else cc_active
                 state[MEMORY] = emit("MEMORY", 0, [value])
             else:
                 value = emit(op.opc, op.out[2] if op.out else 0, args, op.data)
+            if primary:
+                cc_rec.res = value
+                cc_ready = True
             if op.out is not None:
                 write(op.out, value)
             if op.opc in ("DIV32", "IDIV32", "STRINGOP"):
@@ -243,6 +299,10 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                 for key in keys:
                     if key != MEMORY:
                         state[key] = emit("CALL_RELOAD", s.inputs[key].size, [value], data=key)
+                cc_active = None
+        if cc_rec is not None and cc_ready:
+            cc_active = cc_rec
+        b.cc_exit = cc_active
         b.exit = state
         branches = [op for op in b.insn.ops if op.opc in BRANCHES]
         if len(branches) > 1:

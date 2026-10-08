@@ -3190,6 +3190,8 @@ class Translator(object):
         prologue = 0                 # lines before the first instruction
         if entries:
             out.append("static void body_%08x(X86 *c, uint32_t entry_) {" % fn.addr)
+            # A caller (translated or host) may have left a pending descriptor.
+            out.append("    x86_cc_settle(c);")
             if fn.seh_escapes:
                 out.append("    uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
             out.append("    switch (entry_) {")
@@ -3200,6 +3202,8 @@ class Translator(object):
             out.append("    }")
         else:
             out.append("void fn_%08x(X86 *c) {" % fn.addr)
+            # A caller (translated or host) may have left a pending descriptor.
+            out.append("    x86_cc_settle(c);")
             if fn.seh_escapes:
                 out.append("    uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
             if head:
@@ -3743,6 +3747,9 @@ class Translator(object):
                     self.reject_offimage_call(t)
                     self.stats["_call_unknown"] += 1
                     L.append("recomp_call(c, %s);" % hexlit(t))
+                # An SSA callee may return with a pending flags descriptor; the
+                # decoded caller reads the guest's fields directly.
+                L.append("x86_cc_settle(c);")
                 if RESUMABLE_STACKS:
                     L.append("if (c->eip != %s) return;" % hexlit(nxt))
                 if t in self.seh_helpers:
@@ -3759,6 +3766,7 @@ class Translator(object):
             L.append("uint32_t t_ = %s;" % read_op(ops[0], 32))
             L.append("c->r[4] -= 4; wr32(c->r[4], %s);" % hexlit(nxt))
             L.append("recomp_call(c, t_);")
+            L.append("x86_cc_settle(c);")
             if RESUMABLE_STACKS:
                 L.append("if (c->eip != %s) return;" % hexlit(nxt))
             self.stats["_call_indirect"] += 1
@@ -6201,6 +6209,8 @@ def main():
         lines = after_initialization(lines)
         # Host-only ownership bookkeeping does not execute a guest instruction
         # or modify its CPU. The first guest operation must still reach ADDR.
+        if lines and lines[0].strip() == "x86_cc_settle(c);":
+            lines = lines[1:]
         if lines and lines[0].strip() == "uint64_t seh_mark_ = recomp_seh_frame_mark(c);":
             lines = lines[1:]
         if not lines:
@@ -6511,6 +6521,8 @@ int recomp_thunk_target_kind(uint32_t target)
 static void recomp_call_inner(X86 *c, uint32_t target);
 void recomp_call(X86 *c, uint32_t target)
 {
+    // Unknown, indirect and shim targets read the guest's own flag fields.
+    x86_cc_settle(c);
     RecompSaved saved_; recomp_save(c, &saved_);
     recomp_call_inner(c, target);
     if (recomp_frame_watch)

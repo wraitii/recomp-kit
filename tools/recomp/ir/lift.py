@@ -75,7 +75,7 @@ class Insn(object):
     TOP movement in slots (+1 per push).
     """
     __slots__ = ("addr", "length", "mnem", "ops", "x87_delta", "x87", "internal_flow",
-                 "userops", "raw")
+                 "userops", "raw", "cc")
 
     def __init__(self, addr, length, mnem, ops, x87_delta, x87, internal_flow, userops, raw=None):
         self.addr = addr
@@ -87,6 +87,9 @@ class Insn(object):
         self.internal_flow = internal_flow
         self.userops = userops
         self.raw = raw
+        # Optional lazy-flag producer metadata: kind, size and the primary
+        # p-code result varnode, set by the C emitter's codegen corrections.
+        self.cc = None
 
     def __repr__(self):
         return "%08x %s" % (self.addr, self.mnem)

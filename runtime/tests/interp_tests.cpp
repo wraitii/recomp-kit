@@ -265,6 +265,169 @@ static void test_step_budget() {
     CHECK(c.r[R_EAX] == 8 && c.eip == RETURN);
 }
 
+// ---- lazy arithmetic flag descriptor (x86.h) --------------------------
+//
+// x86_cc_settle materialises a pending ADD/SUB/LOGIC/INC/DEC descriptor. Its
+// recipes must match the eager ones the decoded emitter and the interpreter
+// use, for every operation and operand width. Compare them over random
+// operands rather than the fixed register table the interpreter fixtures use.
+struct EagerFlags {
+    uint32_t cf, pf, af, zf, sf, of;
+};
+
+static uint32_t width_mask(int bits) {
+    return bits == 32 ? 0xffffffffu : (1u << bits) - 1u;
+}
+
+// CMP and TEST share the SUB and LOGIC descriptor kinds, so this covers all
+// six integer flag producers. Flags an operation does not define keep the
+// incoming field, matching the eager publication.
+static EagerFlags eager_flags(int op, int bits, uint32_t a, uint32_t b, const EagerFlags &before) {
+    const uint32_t m = width_mask(bits), sign = 1u << (bits - 1);
+    EagerFlags f = before;
+    a &= m;
+    b &= m;
+    uint32_t r = 0;
+    switch (op) {
+    case X86_CC_ADD:
+        r = (a + b) & m;
+        f.cf = r < a;
+        f.of = (((a ^ r) & (b ^ r)) >> (bits - 1)) & 1u;
+        f.af = ((a ^ b ^ r) >> 4) & 1u;
+        f.zf = r == 0;
+        f.sf = (r >> (bits - 1)) & 1u;
+        f.pf = parity8(r);
+        break;
+    case X86_CC_SUB:
+        r = (a - b) & m;
+        f.cf = a < b;
+        f.of = (((a ^ b) & (a ^ r)) >> (bits - 1)) & 1u;
+        f.af = ((a ^ b ^ r) >> 4) & 1u;
+        f.zf = r == 0;
+        f.sf = (r >> (bits - 1)) & 1u;
+        f.pf = parity8(r);
+        break;
+    case X86_CC_LOGIC:
+        r = a & b;
+        f.cf = 0;
+        f.of = 0; // AF is preserved.
+        f.zf = r == 0;
+        f.sf = (r >> (bits - 1)) & 1u;
+        f.pf = parity8(r);
+        break;
+    case X86_CC_INC:
+        r = (a + 1u) & m;
+        f.of = r == sign;
+        f.af = ((a ^ r) >> 4) & 1u; // CF is preserved.
+        f.zf = r == 0;
+        f.sf = (r >> (bits - 1)) & 1u;
+        f.pf = parity8(r);
+        break;
+    case X86_CC_DEC:
+        r = (a - 1u) & m;
+        f.of = r == (sign - 1u);
+        f.af = ((a ^ r) >> 4) & 1u; // CF is preserved.
+        f.zf = r == 0;
+        f.sf = (r >> (bits - 1)) & 1u;
+        f.pf = parity8(r);
+        break;
+    default:
+        break;
+    }
+    return f;
+}
+
+static uint32_t g_flag_seed = 0x9e3779b9u;
+static uint32_t flag_random(void) {
+    g_flag_seed ^= g_flag_seed << 13;
+    g_flag_seed ^= g_flag_seed >> 17;
+    g_flag_seed ^= g_flag_seed << 5;
+    return g_flag_seed;
+}
+
+static void test_lazy_flags() {
+    static const uint8_t ops[] = {X86_CC_ADD, X86_CC_SUB, X86_CC_LOGIC, X86_CC_INC, X86_CC_DEC};
+    static const uint8_t masks[] = {0x3fu, 0x3fu, 0x3bu, 0x3eu, 0x3eu};
+    for (int bits = 8; bits <= 32; bits *= 2) {
+        for (unsigned oi = 0; oi < sizeof ops / sizeof *ops; ++oi) {
+            for (int t = 0; t < 4096; ++t) {
+                EagerFlags before = {flag_random() & 1u, flag_random() & 1u, flag_random() & 1u,
+                                     flag_random() & 1u, flag_random() & 1u, flag_random() & 1u};
+                X86 c;
+                memset(&c, 0, sizeof c);
+                c.eflags_cf = before.cf;
+                c.eflags_pf = before.pf;
+                c.eflags_af = before.af;
+                c.eflags_zf = before.zf;
+                c.eflags_sf = before.sf;
+                c.eflags_of = before.of;
+                const uint32_t a = flag_random();
+                const uint32_t b = flag_random();
+                const uint32_t m = width_mask(bits);
+                const uint32_t xa = a & m;
+                const uint32_t xb = (ops[oi] == X86_CC_INC || ops[oi] == X86_CC_DEC) ? 1u : (b & m);
+                c.cc_op = ops[oi];
+                c.cc_size = (uint8_t)(bits / 8);
+                c.cc_mask = masks[oi];
+                c.cc_a = a;
+                c.cc_b = (ops[oi] == X86_CC_INC || ops[oi] == X86_CC_DEC) ? 1u : b;
+                if (ops[oi] == X86_CC_ADD)
+                    c.cc_res = (xa + xb) & m;
+                else if (ops[oi] == X86_CC_SUB)
+                    c.cc_res = (xa - xb) & m;
+                else if (ops[oi] == X86_CC_LOGIC)
+                    c.cc_res = xa & xb;
+                else if (ops[oi] == X86_CC_INC)
+                    c.cc_res = (xa + 1u) & m;
+                else
+                    c.cc_res = (xa - 1u) & m;
+                // Capture the expected result before x86_cc_settle clears the
+                // descriptor fields it was built from.
+                const EagerFlags want = eager_flags(ops[oi], bits, a, c.cc_b, before);
+                x86_cc_settle(&c);
+                CHECK(c.cc_op == X86_CC_NONE);
+                CHECK(c.eflags_cf == want.cf && c.eflags_pf == want.pf && c.eflags_af == want.af &&
+                      c.eflags_zf == want.zf && c.eflags_sf == want.sf && c.eflags_of == want.of);
+            }
+        }
+    }
+    // A partial mask writes only the named fields and leaves the rest.
+    X86 c;
+    memset(&c, 0, sizeof c);
+    c.eflags_cf = 1;
+    c.eflags_af = 1;
+    c.eflags_of = 1;
+    c.eflags_sf = 1;
+    c.cc_op = X86_CC_SUB;
+    c.cc_size = 4;
+    c.cc_mask = X86_CCF_ZF;
+    c.cc_a = 5;
+    c.cc_b = 5;
+    c.cc_res = 0;
+    x86_cc_settle(&c);
+    CHECK(c.eflags_zf == 1 && c.eflags_cf == 1 && c.eflags_af == 1 && c.eflags_of == 1 &&
+          c.eflags_sf == 1 && c.eflags_pf == 0);
+    // x86_get_eflags settles first, so PUSHFD cannot read a stale field while a
+    // descriptor is pending.
+    memset(&c, 0, sizeof c);
+    c.eflags_misc = 0x202;
+    c.cc_op = X86_CC_SUB;
+    c.cc_size = 4;
+    c.cc_mask = 0x3fu;
+    c.cc_a = 5;
+    c.cc_b = 7;
+    c.cc_res = 5u - 7u;
+    const EagerFlags want = eager_flags(X86_CC_SUB, 32, c.cc_a, c.cc_b, EagerFlags{});
+    const uint32_t eflags = x86_get_eflags(&c);
+    CHECK(c.cc_op == X86_CC_NONE);
+    CHECK(((eflags >> 0) & 1u) == want.cf);
+    CHECK(((eflags >> 2) & 1u) == want.pf);
+    CHECK(((eflags >> 4) & 1u) == want.af);
+    CHECK(((eflags >> 6) & 1u) == want.zf);
+    CHECK(((eflags >> 7) & 1u) == want.sf);
+    CHECK(((eflags >> 11) & 1u) == want.of);
+}
+
 // The state test_interp_unicorn.py mirrors: registers from a fixed table,
 // ESI and EBX pointing into a data page filled with a pattern.
 static int run_hex(const char *hex) {
@@ -322,6 +485,7 @@ int main(int argc, char **argv) {
     test_tail_call_out();
     test_refusals();
     test_step_budget();
+    test_lazy_flags();
     printf("interp: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

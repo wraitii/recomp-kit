@@ -35,7 +35,10 @@ def test_cfg_values_and_fault_diagnostics():
 def test_entry_validation_skips_only_marked_host_initialization():
     body, _ = translate(ARITH + ["RET"])
     lines = [line for line in body.splitlines()[1:] if line.strip()]
-    assert after_initialization(lines)[0].strip() == "L_00100000: ;"
+    lines = after_initialization(lines)
+    if lines and lines[0].strip() == "x86_cc_settle(c);":
+        lines = lines[1:]
+    assert lines[0].strip() == "L_00100000: ;"
     bad = [INITIALIZATION_BEGIN, "guest_operation();"]
     assert after_initialization(bad) == bad
     ordinary = ["/* unrelated comment */", INITIALIZATION_END, "guest_operation();"]

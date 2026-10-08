@@ -806,7 +806,8 @@ static void test_loader() {
     check(rd32(0x0fe00018) == 0x0fe00000u, "FS:[0x18] points at the TEB");
     check(rd32(0x0fe0002c) == 0x0fe01000u, "FS:[0x2c] points at the TLS array");
     check(loader_context()->fs_base == 0x0fe00000u, "fs_base is the TEB");
-    const X86 *ic = loader_context();
+    // x86_get_eflags settles a pending descriptor, so it needs a mutable CPU.
+    X86 *ic = loader_context();
     check(ic->fpu_cw == 0x037f && ic->fpu_sw == 0 && ic->fpu_tag == 0xffff && ic->fpu_top == 0,
           "the x87 starts at cw=%04x sw=%04x tag=%04x top=%u", ic->fpu_cw, ic->fpu_sw, ic->fpu_tag,
           ic->fpu_top);

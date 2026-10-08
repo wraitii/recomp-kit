@@ -884,7 +884,7 @@ def test_nested_except_join_keeps_outer_finally_in_establishing_body(tmp_path, m
     assert T.main() == 0
     text = '\n'.join(p.read_text() for p in out.glob('chunk_*.c'))
     for stub in (outer_stub, inner_stub):
-        assert "void fn_%08x(X86 *c) {\n    CALL_FN(%08x); return;" % (stub, dispatcher) in text
+        assert "void fn_%08x(X86 *c) {\n    x86_cc_settle(c);\n    CALL_FN(%08x); return;" % (stub, dispatcher) in text
     # Normal execution must retain the frame until the epilogue restores ESP/EBP.
     assert 'void fn_%08x(X86 *c) { body_%08x(c, %s); }' % (cleanup, entry, T.hexlit(cleanup)) in text
     body = text.split('static void body_%08x(' % entry, 1)[1].split('void fn_%08x(' % entry, 1)[0]

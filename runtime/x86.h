@@ -340,6 +340,31 @@ static inline void wrbcd80(uint32_t a, double v) {
 /* Register indices into X86.r */
 enum { R_EAX = 0, R_ECX, R_EDX, R_EBX, R_ESP, R_EBP, R_ESI, R_EDI };
 
+/* Lazy arithmetic flags: the operands of the last flag-producing integer
+ * instruction, kept in X86 instead of materialising all six flag fields at a
+ * seam.  x86_cc_settle writes the fields and clears the descriptor.  NONE
+ * means the fields are current.  Only ADD/SUB/CMP/LOGIC/INC/DEC are encoded;
+ * everything else writes the fields eagerly and stores NONE. */
+enum X86CcOp {
+    X86_CC_NONE = 0,
+    X86_CC_ADD,
+    X86_CC_SUB,
+    X86_CC_LOGIC,
+    X86_CC_INC,
+    X86_CC_DEC,
+};
+
+/* Which flag fields a pending descriptor defines and must write.  Flags not in
+ * the mask keep their current field value, matching the eager publication. */
+enum {
+    X86_CCF_CF = 1u << 0,
+    X86_CCF_PF = 1u << 1,
+    X86_CCF_AF = 1u << 2,
+    X86_CCF_ZF = 1u << 3,
+    X86_CCF_SF = 1u << 4,
+    X86_CCF_OF = 1u << 5,
+};
+
 struct X86 {
     uint32_t r[8]; /* EAX ECX EDX EBX ESP EBP ESI EDI */
     uint32_t eip;
@@ -347,6 +372,11 @@ struct X86 {
     /* Every EFLAGS bit other than CF PF AF ZF SF DF OF, so PUSHFD/POPFD
      * round-trip (the CPUID probe toggles the ID bit).  Initialise to 0x202. */
     uint32_t eflags_misc;
+    /* Pending arithmetic flags (see enum X86CcOp).  cc_size is 1/2/4 bytes;
+     * cc_mask names the fields to write; cc_a/cc_b are the operands and
+     * cc_res the wrapped result. */
+    uint8_t cc_op, cc_size, cc_mask, cc_pad0;
+    uint32_t cc_a, cc_b, cc_res;
     double st[8]; /* x87 stack, physical slots */
     /* FILD integers retain all 64 mantissa bits until arithmetic replaces
      * them. The double alone cannot preserve qword copies above 2^53. */
@@ -439,6 +469,7 @@ static inline float recomp_sse_sqrtf(float v) {
  * between the two forms is only which NaNs raise an exception, and this kit
  * raises none. */
 static inline void recomp_comis(X86 *c, double a, double b) {
+    c->cc_op = X86_CC_NONE;
     c->eflags_of = c->eflags_af = c->eflags_sf = 0;
     if (a != a || b != b) {
         c->eflags_zf = c->eflags_pf = c->eflags_cf = 1;
@@ -628,17 +659,114 @@ RECOMP_HOT_INLINE uint32_t parity8(uint32_t v) {
     return (~v) & 1u;
 }
 
+/* Materialise pending arithmetic flags into the fields.  The NONE test is the
+ * only cost on the common path where nothing is pending.  Recipes match the
+ * interpreter's and the decoded emitter's: logic leaves AF, INC/DEC leave CF,
+ * and MUL/IMUL are not encoded here. */
+static inline void x86_cc_settle(X86 *c) {
+    const uint32_t op = c->cc_op;
+    if (op == X86_CC_NONE)
+        return;
+    const uint32_t bits = (uint32_t)c->cc_size * 8u;
+    const uint32_t shift = bits - 1u;
+    const uint32_t sign = 1u << shift;
+    const uint32_t mask = bits == 32u ? 0xffffffffu : ((1u << bits) - 1u);
+    const uint32_t fields = c->cc_mask;
+    const uint32_t a = c->cc_a & mask, b = c->cc_b & mask, r = c->cc_res & mask;
+    c->cc_op = X86_CC_NONE;
+    c->cc_mask = 0;
+    c->cc_size = 0;
+    c->cc_a = c->cc_b = c->cc_res = 0;
+    switch (op) {
+    case X86_CC_ADD:
+        if (fields & X86_CCF_CF)
+            c->eflags_cf = (r < a);
+        if (fields & X86_CCF_OF)
+            c->eflags_of = (((a ^ r) & (b ^ r)) >> shift) & 1u;
+        if (fields & X86_CCF_AF)
+            c->eflags_af = ((a ^ b ^ r) >> 4) & 1u;
+        if (fields & X86_CCF_ZF)
+            c->eflags_zf = (r == 0);
+        if (fields & X86_CCF_SF)
+            c->eflags_sf = (r >> shift) & 1u;
+        if (fields & X86_CCF_PF)
+            c->eflags_pf = parity8(r);
+        break;
+    case X86_CC_SUB:
+        if (fields & X86_CCF_CF)
+            c->eflags_cf = (a < b);
+        if (fields & X86_CCF_OF)
+            c->eflags_of = (((a ^ b) & (a ^ r)) >> shift) & 1u;
+        if (fields & X86_CCF_AF)
+            c->eflags_af = ((a ^ b ^ r) >> 4) & 1u;
+        if (fields & X86_CCF_ZF)
+            c->eflags_zf = (r == 0);
+        if (fields & X86_CCF_SF)
+            c->eflags_sf = (r >> shift) & 1u;
+        if (fields & X86_CCF_PF)
+            c->eflags_pf = parity8(r);
+        break;
+    case X86_CC_LOGIC:
+        if (fields & X86_CCF_CF)
+            c->eflags_cf = 0;
+        if (fields & X86_CCF_OF)
+            c->eflags_of = 0;
+        if (fields & X86_CCF_ZF)
+            c->eflags_zf = (r == 0);
+        if (fields & X86_CCF_SF)
+            c->eflags_sf = (r >> shift) & 1u;
+        if (fields & X86_CCF_PF)
+            c->eflags_pf = parity8(r);
+        break; /* AF is preserved by the decoded emitter. */
+    case X86_CC_INC:
+        if (fields & X86_CCF_OF)
+            c->eflags_of = (r == sign);
+        if (fields & X86_CCF_AF)
+            c->eflags_af = ((a ^ r) >> 4) & 1u;
+        if (fields & X86_CCF_ZF)
+            c->eflags_zf = (r == 0);
+        if (fields & X86_CCF_SF)
+            c->eflags_sf = (r >> shift) & 1u;
+        if (fields & X86_CCF_PF)
+            c->eflags_pf = parity8(r);
+        break; /* CF is preserved. */
+    case X86_CC_DEC:
+        if (fields & X86_CCF_OF)
+            c->eflags_of = (r == (sign - 1u));
+        if (fields & X86_CCF_AF)
+            c->eflags_af = ((a ^ r) >> 4) & 1u;
+        if (fields & X86_CCF_ZF)
+            c->eflags_zf = (r == 0);
+        if (fields & X86_CCF_SF)
+            c->eflags_sf = (r >> shift) & 1u;
+        if (fields & X86_CCF_PF)
+            c->eflags_pf = parity8(r);
+        break; /* CF is preserved. */
+    default:
+        break;
+    }
+}
+
+/* Drop a pending descriptor without materialising it: a direct field writer.
+ * A producer that ran with a pending descriptor must call this first (the
+ * decoded/interpreter paths settle at entry, so this is defence in depth). */
+static inline void x86_cc_drop(X86 *c) {
+    c->cc_op = X86_CC_NONE;
+}
+
 /* Bits x86_get_eflags/x86_set_eflags build from the individual fields; every
  * other bit lives in eflags_misc so PUSHFD/POPFD is lossless. */
 #define X86_EFLAGS_SPLIT 0x00000cd5u /* CF PF AF ZF SF DF OF */
 
-static inline uint32_t x86_get_eflags(const X86 *c) {
+static inline uint32_t x86_get_eflags(X86 *c) {
+    x86_cc_settle(c);
     return (c->eflags_misc & ~X86_EFLAGS_SPLIT) | 0x00000002u /* reserved bit 1 reads as 1 */
            | (c->eflags_cf << 0) | (c->eflags_pf << 2) | (c->eflags_af << 4) | (c->eflags_zf << 6) |
            (c->eflags_sf << 7) | (c->eflags_df << 10) | (c->eflags_of << 11);
 }
 
 static inline void x86_set_eflags(X86 *c, uint32_t v) {
+    x86_cc_drop(c);
     c->eflags_misc = (v & ~X86_EFLAGS_SPLIT) | 0x00000002u;
     c->eflags_cf = (v >> 0) & 1u;
     c->eflags_pf = (v >> 2) & 1u;
@@ -652,6 +780,7 @@ static inline void x86_set_eflags(X86 *c, uint32_t v) {
 /* SAHF: AH -> SF ZF AF PF CF */
 static inline void x86_sahf(X86 *c) {
     uint32_t ah = (c->r[R_EAX] >> 8) & 0xffu;
+    x86_cc_drop(c);
     c->eflags_cf = (ah >> 0) & 1u;
     c->eflags_pf = (ah >> 2) & 1u;
     c->eflags_af = (ah >> 4) & 1u;

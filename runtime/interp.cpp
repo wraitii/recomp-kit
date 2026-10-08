@@ -689,6 +689,9 @@ void run(X86 *c, const Routine &r) {
     // branches all land inside it can still never reach its RET.
     const Ins *const code = r.code.data();
     const Ins *ip = code;
+    // The caller (translated code, an import shim or the host) may have left a
+    // pending descriptor; the interpreter reads the guest's own flag fields.
+    x86_cc_settle(c);
     Flags f;
     for (;;) {
         const Ins &in = *ip;
@@ -793,6 +796,9 @@ void run(X86 *c, const Routine &r) {
             push(c, in.addr + in.len);
             flags_settle(c, f); // translated code reads the guest's own fields
             recomp_call(c, target);
+            // A translated SSA callee may return with a pending descriptor.
+            x86_cc_settle(c);
+            f = Flags{};
             break;
         }
         case RET:
