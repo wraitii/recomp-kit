@@ -26,6 +26,35 @@ int recomp_writable_path(const char *guest_path, char *out, size_t out_len);
  * then the game directory. Zero when the path cannot be resolved. */
 int recomp_readable_path(const char *guest_path, char *out, size_t out_len);
 
+/* Reserve `size` bytes in the guest heap and return a guest address, or 0.
+ * The block is 16-byte aligned and zero filled; safe from any guest thread. */
+uint32_t recomp_guest_alloc(uint32_t size);
+/* Release a block returned by recomp_guest_alloc. */
+void recomp_guest_free(uint32_t addr);
+
+/* Alias a synthetic guest path to a host file for READS only. The resolver
+ * answers `guest_path` with `host_path` ahead of the overlay and the game
+ * directory, so a generated file can be handed to the original loader without
+ * writing anything into the game directory. Returns non-zero on success.
+ *
+ * LIFE CYCLE. An alias lives until recomp_file_alias_remove or process exit;
+ * it is never cleared by an overlay reset, so the caller owns removal and must
+ * keep the host file readable while the alias exists. The path is normalised
+ * like any other guest path (drive/root stripped, case-insensitive matches),
+ * writes and deletes ignore aliases entirely, and adding the same guest path
+ * again replaces the old target. */
+int recomp_file_alias_add(const char *guest_path, const char *host_path);
+/* Drop an alias added by recomp_file_alias_add; a missing alias is a no-op. */
+void recomp_file_alias_remove(const char *guest_path);
+
+/* Create a unique host file under the platform temp directory, write `len`
+ * bytes and close it. `suffix` is appended verbatim to the generated name
+ * (pass its leading dot). `out` receives the path, which the caller owns and
+ * removes when done; on any failure `out` is an empty string and no file is
+ * left behind. `data` may be null only when `len` is zero. Returns non-zero on
+ * success. */
+int recomp_temp_file(const char *suffix, const void *data, size_t len, char *out, size_t out_len);
+
 /* Offer a DirectDraw display mode, as the host does for its own modes. */
 int ddraw_add_mode(int w, int h, int bpp);
 

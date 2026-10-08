@@ -28,6 +28,7 @@
 #include <time.h>
 
 #include <map>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -394,6 +395,107 @@ std::string normalised_relative(const std::string &guest_path) {
     return serialise_relative(normalise_components(guest_path));
 }
 
+// A read alias consulted before the overlay and game directory. A generated
+// file handed to the original loader must not live in the game directory and
+// must not depend on an overlay layer existing. `g_file_alias_live` keeps the
+// unaliased read path free of the map lock once every alias is gone.
+static std::mutex g_file_alias_lock;
+static std::map<std::string, std::string> &file_aliases() {
+    static std::map<std::string, std::string> m;
+    return m;
+}
+// Read outside the lock as a fast path; only ever a hint. The map itself is
+// always consulted under the lock, so a stale value costs one unnecessary lock
+// and never a wrong answer. release publishes the populated map to another
+// thread that sees the acquire.
+static std::atomic<bool> g_file_alias_live{false};
+
+extern "C" int recomp_file_alias_add(const char *guest_path, const char *host_path) {
+    if (!guest_path || !guest_path[0] || !host_path || !host_path[0])
+        return 0;
+    // The guest file system is case-insensitive, so the alias key is too. A
+    // lowercased key is the one normalised spelling both sides agree on.
+    const std::string rel = lower(normalised_relative(guest_path));
+    if (rel.empty())
+        return 0;
+    std::lock_guard<std::mutex> lock(g_file_alias_lock);
+    file_aliases()[rel] = host_path;
+    g_file_alias_live.store(true, std::memory_order_release);
+    return 1;
+}
+
+extern "C" void recomp_file_alias_remove(const char *guest_path) {
+    if (!guest_path || !guest_path[0])
+        return;
+    const std::string rel = lower(normalised_relative(guest_path));
+    std::lock_guard<std::mutex> lock(g_file_alias_lock);
+    file_aliases().erase(rel);
+    g_file_alias_live.store(!file_aliases().empty(), std::memory_order_release);
+}
+
+extern "C" int recomp_temp_file(const char *suffix, const void *data, size_t len, char *out,
+                                size_t out_len) {
+    if (!out || !out_len)
+        return 0;
+    out[0] = 0; // every failure leaves a usable empty string behind
+    if (len != 0 && !data)
+        return 0;
+    // os_mkstemp replaces a TRAILING XXXXXX; the Windows implementation
+    // rejects any other placement, so the suffix is appended after creation
+    // and the file is renamed into place. The rename is same-directory and so
+    // atomic on every platform the runtime serves.
+    char tmpl[1024];
+    int n = snprintf(tmpl, sizeof tmpl, "%s/recomp-XXXXXX", os_temp_dir());
+    if (n < 0 || (size_t)n >= sizeof tmpl)
+        return 0;
+    int fd = os_mkstemp(tmpl);
+    if (fd < 0)
+        return 0;
+    const uint8_t *p = (const uint8_t *)data;
+    size_t off = 0;
+    while (off < len) {
+        int64_t w = os_fd_write(fd, p + off, len - off);
+        if (w <= 0) {
+            os_fd_close(fd);
+            remove(tmpl);
+            return 0;
+        }
+        off += (size_t)w;
+    }
+    if (os_fd_close(fd) != 0) {
+        remove(tmpl);
+        return 0;
+    }
+    char final_path[1024];
+    int fn = snprintf(final_path, sizeof final_path, "%s%s", tmpl, suffix ? suffix : "");
+    if (fn < 0 || (size_t)fn >= sizeof final_path) {
+        remove(tmpl);
+        return 0;
+    }
+    if (strcmp(final_path, tmpl) != 0) {
+        if (os_rename(tmpl, final_path) != 0) {
+            remove(tmpl);
+            return 0;
+        }
+    }
+    size_t need = strlen(final_path) + 1;
+    if (need > out_len) {
+        remove(final_path);
+        return 0;
+    }
+    memcpy(out, final_path, need);
+    return 1;
+}
+
+extern "C" uint32_t recomp_guest_alloc(uint32_t size) {
+    return size ? heap_alloc(size, true, 16) : 0;
+}
+
+extern "C" void recomp_guest_free(uint32_t addr) {
+    if (addr)
+        heap_free(addr);
+}
+
 // The case-insensitive walk through the game directory, unchanged.
 static std::string resolve_in_game_dir(const std::vector<std::string> &norm, bool for_create) {
     std::string host = g_game_dir;
@@ -421,6 +523,12 @@ std::string win32_host_path_op(const std::string &guest_path, int op) {
     if (guest_path.empty())
         return std::string();
     std::vector<std::string> norm = normalise_components(guest_path);
+    if (op == WIN32_FILE_READ && g_file_alias_live.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(g_file_alias_lock);
+        auto it = file_aliases().find(lower(serialise_relative(norm)));
+        if (it != file_aliases().end())
+            return it->second;
+    }
     if (g_file_resolve) {
         std::string rel = serialise_relative(norm);
         char out[1024];

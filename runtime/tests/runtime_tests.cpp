@@ -13,6 +13,7 @@
 #include "../discovery.h"
 #include "../memory.h"
 #include "../win32.h"
+#include "../native_seam.h"
 #include "../../platform/os.h"
 #include "game_config.h"
 
@@ -4612,6 +4613,103 @@ static void test_mod_seams(X86 *c) {
     std::string w = win32_host_path_op("data\\shared.txt", WIN32_FILE_WRITE);
     check(w == g_seam_root + "/write/data/shared.txt",
           "a write resolves through the write tier, not the read tier");
+
+    // File read aliases: a synthetic guest path resolves to a host file ahead
+    // of the overlay and the game directory, for reads only. The game hands a
+    // generated resource to the original loader this way, so the alias must
+    // win over a resolver answer and must never answer a write.
+    {
+        std::string alias_host = g_seam_root + "/host-alias.bin";
+        FILE *af = fopen(alias_host.c_str(), "wb");
+        fputs("aliased", af);
+        fclose(af);
+        check(recomp_file_alias_add("data\\alias.bin", alias_host.c_str()),
+              "a guest path accepts a read alias");
+        g_seam_calls.clear();
+        check(win32_host_path_op("data\\alias.bin", WIN32_FILE_READ) == alias_host &&
+                  g_seam_calls.empty(),
+              "an aliased read returns the host file and does not call the resolver");
+        check(win32_host_path_op("DATA\\ALIAS.BIN", WIN32_FILE_READ) == alias_host,
+              "alias lookup is case-insensitive and normalised");
+        check(win32_host_path_op("data\\alias.bin", WIN32_FILE_WRITE) != alias_host,
+              "a write never resolves through a read alias");
+        check(win32_host_path_op("data\\alias.bin", WIN32_FILE_DELETE) != alias_host,
+              "a delete never resolves through a read alias");
+
+        // A second alias is independent, and adding the same path replaces.
+        std::string alias2 = g_seam_root + "/host-alias2.bin";
+        FILE *a2 = fopen(alias2.c_str(), "wb");
+        fputs("two", a2);
+        fclose(a2);
+        check(recomp_file_alias_add("data\\alias2.bin", alias2.c_str()) &&
+                  win32_host_path_op("data\\alias2.bin", WIN32_FILE_READ) == alias2,
+              "a second read alias is independent");
+        check(recomp_file_alias_add("data\\alias.bin", alias2.c_str()) &&
+                  win32_host_path_op("data\\alias.bin", WIN32_FILE_READ) == alias2,
+              "re-adding a guest path replaces its target");
+
+        recomp_file_alias_remove("data\\alias.bin");
+        check(win32_host_path_op("data\\alias.bin", WIN32_FILE_READ) != alias2,
+              "removing an alias restores normal resolution");
+        check(win32_host_path_op("data\\alias2.bin", WIN32_FILE_READ) == alias2,
+              "removing one alias leaves the others");
+        recomp_file_alias_remove("data\\alias2.bin");
+        recomp_file_alias_remove("data\\alias2.bin");
+        check(!recomp_file_alias_add(nullptr, alias2.c_str()) &&
+                  !recomp_file_alias_add("", alias2.c_str()),
+              "an empty guest path or target is refused");
+    }
+
+    // Guest heap wrappers used by native overrides to build guest strings.
+    {
+        uint32_t ga = recomp_guest_alloc(37);
+        check(ga != 0 && (ga & 15u) == 0, "guest_alloc returns an aligned guest block");
+        if (ga) {
+            memset(g_mem + ga, 0xab, 37);
+            check(rd8(ga) == 0xab && rd8(ga + 36) == 0xab && heap_owns(ga),
+                  "the block is readable guest memory");
+            recomp_guest_free(ga);
+            check(!heap_owns(ga), "guest_free releases the block");
+        }
+        check(recomp_guest_alloc(0) == 0, "a zero-size guest_alloc is refused");
+        recomp_guest_free(0);
+    }
+
+    // The native temp-file seam an override uses to hand the original loader a
+    // generated resource. The name must carry the caller's suffix even though
+    // the Windows mkstemp only accepts a TRAILING XXXXXX, every failure must
+    // leave an empty string, and a null buffer with a non-zero length is
+    // refused rather than dereferenced.
+    section("native temp file seam");
+    {
+        char out[1024];
+        const char payload[] = "recomp-temp-payload";
+        memset(out, 0x7f, sizeof out);
+        check(recomp_temp_file(".res", payload, sizeof payload, out, sizeof out) == 1,
+              "recomp_temp_file creates a file");
+        check(strlen(out) > 4 && strcmp(out + strlen(out) - 4, ".res") == 0,
+              "the generated name carries the suffix");
+        FILE *f = fopen(out, "rb");
+        char got[64] = {0};
+        size_t gotn = f ? fread(got, 1, sizeof got - 1, f) : 0;
+        if (f)
+            fclose(f);
+        check(f != nullptr && gotn == sizeof payload && memcmp(got, payload, sizeof payload) == 0,
+              "the written bytes read back");
+        remove(out);
+
+        char short_out[4];
+        memset(short_out, 0x7f, sizeof short_out);
+        check(recomp_temp_file(".res", payload, sizeof payload, short_out, sizeof short_out) == 0,
+              "a buffer too short for the path fails");
+        check(short_out[0] == '\0', "the short-buffer failure clears the output");
+
+        char null_out[256];
+        memset(null_out, 0x7f, sizeof null_out);
+        check(recomp_temp_file(".res", nullptr, 7, null_out, sizeof null_out) == 0,
+              "null data with a non-zero length fails");
+        check(null_out[0] == '\0', "the null-data failure clears the output");
+    }
 
     // CreateFileA with GENERIC_WRITE and OPEN_EXISTING opens through the READ
     // tier and defers the write classification to the first WriteFile. A game

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Native replacements can hand generated files to original guest loaders through
+  read-only file aliases, with guest-heap allocation and temporary-file helpers.
+  Aliases precede overlay resolution and never redirect writes or deletes.
+
 - `[translate] call_contracts` (default on): per-function reads/kills
   summaries over the GPRs and arithmetic flags let an SSA direct call skip
   publishing a field the callee never reads and always overwrites. Unknown,
