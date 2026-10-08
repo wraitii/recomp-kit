@@ -33,9 +33,11 @@ extern "C" {
 #if defined(__GNUC__) || defined(__clang__)
 #define RECOMP_HOT_INLINE static inline __attribute__((always_inline))
 #define RECOMP_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define RECOMP_COLD static __attribute__((noinline, cold))
 #else
 #define RECOMP_HOT_INLINE static inline
 #define RECOMP_UNLIKELY(x) (x)
+#define RECOMP_COLD static
 #endif
 
 /* ---------------------------------------------------------------- memory */
@@ -659,14 +661,12 @@ RECOMP_HOT_INLINE uint32_t parity8(uint32_t v) {
     return (~v) & 1u;
 }
 
-/* Materialise pending arithmetic flags into the fields.  The NONE test is the
- * only cost on the common path where nothing is pending.  Recipes match the
+/* Materialise pending arithmetic flags into the fields and clear the
+ * descriptor; callers go through x86_cc_settle.  Recipes match the
  * interpreter's and the decoded emitter's: logic leaves AF, INC/DEC leave CF,
  * and MUL/IMUL are not encoded here. */
-static inline void x86_cc_settle(X86 *c) {
+RECOMP_COLD void x86_cc_materialize(X86 *c) {
     const uint32_t op = c->cc_op;
-    if (op == X86_CC_NONE)
-        return;
     const uint32_t bits = (uint32_t)c->cc_size * 8u;
     const uint32_t shift = bits - 1u;
     const uint32_t sign = 1u << shift;
@@ -745,6 +745,13 @@ static inline void x86_cc_settle(X86 *c) {
     default:
         break;
     }
+}
+
+/* Settle sits at every decoded entry and call return, so only the NONE test
+ * is inlined; the materialising switch stays out of line. */
+RECOMP_HOT_INLINE void x86_cc_settle(X86 *c) {
+    if (RECOMP_UNLIKELY(c->cc_op != X86_CC_NONE))
+        x86_cc_materialize(c);
 }
 
 /* Drop a pending descriptor without materialising it: a direct field writer.
