@@ -201,6 +201,25 @@ RECOMP_HOT_INLINE void recomp_watch(uint32_t a, uint32_t n, uint64_t v) {
     }
 }
 
+/* The bit copy behind float guest stores. __builtin_memcpy is spelled out
+ * because the corpus and checks build with -fno-builtin, where plain memcpy
+ * from a float local left a store/reload through the stack in the hot x87
+ * store path. Both spellings copy the same 4 bytes. */
+#if defined(__GNUC__) || defined(__clang__)
+#define RECOMP_BITCOPY(d, s, n) __builtin_memcpy((d), (s), (n))
+#else
+#define RECOMP_BITCOPY(d, s, n) memcpy((d), (s), (n))
+#endif
+/* The store hook of a binary32 store: the watch and dirty checks see the
+ * stored bit pattern, computed only when a hook is armed. */
+static inline void recomp_watch_f32(uint32_t a, float v) {
+    if (RECOMP_STORE_HOOKS && RECOMP_UNLIKELY(g_store_hook != 0)) {
+        uint32_t bits;
+        RECOMP_BITCOPY(&bits, &v, 4);
+        recomp_watch(a, 4, bits);
+    }
+}
+
 RECOMP_HOT_INLINE void wr8(uint32_t a, uint8_t v) {
     RECOMP_NULL_GUARD(a, 1);
     RECOMP_ARENA[a] = v;
@@ -231,9 +250,9 @@ RECOMP_HOT_INLINE double rdf64(uint32_t a) {
     return v;
 }
 RECOMP_HOT_INLINE void wrf32(uint32_t a, float v) {
-    uint32_t bits;
-    memcpy(&bits, &v, 4);
-    wr32(a, bits);
+    RECOMP_NULL_GUARD(a, 1);
+    RECOMP_BITCOPY(RECOMP_ARENA + a, &v, 4);
+    recomp_watch_f32(a, v);
 }
 RECOMP_HOT_INLINE void wrf64(uint32_t a, double v) {
     uint64_t bits;
