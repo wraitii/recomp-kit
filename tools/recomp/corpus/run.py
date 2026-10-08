@@ -623,6 +623,9 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
                                 local_state=(fault_state == 'relaxed'),
                                 msvc_convention=msvc_x87_convention,
                                 lazy_nan=True,
+                                # Production (ir/production.py) defers flags
+                                # as a descriptor under the relaxed policy.
+                                lazy_flags=(fault_state == 'relaxed'),
                                 resumable_stacks=getattr(T, 'RESUMABLE_STACKS', False))
                 try:
                     lifter = Lifter()
