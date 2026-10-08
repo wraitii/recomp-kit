@@ -588,3 +588,18 @@ def test_division_reloads_every_tracked_field_after_helper():
     after = block.ops[block.ops.index(division) + 1:]
     reloaded = {v.data for v in after if v.opc == "CALL_RELOAD"}
     assert {key for key in s.inputs if key != MEMORY} <= reloaded
+
+
+def test_decoded_jump_table_lowers_to_switch_with_runtime_jump_default():
+    from recomp.ir.native_checks import TABLE_CASE, sources
+    local = sources("jump_table_switch", TABLE_CASE)[4]
+    assert "switch ((uint32_t)" in local
+    # Cases 0 and 2 share a block: one edge, two labels.
+    assert local.count("goto B") >= 3
+    assert "default:" in local and "recomp_jump(c, (uint32_t)" in local
+    assert "c->eip = 0x100005u;" in local
+
+
+def test_computed_jump_without_decoded_table_stays_opaque():
+    with pytest.raises(SSAError, match="opaque effect BRANCHIND"):
+        emit(function("ffe0", "c3"), "test_fn")

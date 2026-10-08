@@ -146,6 +146,12 @@ void recomp_call(X86 *c, uint32_t addr) {
     ir_indirect_dispatch(c, addr);
 }
 
+void recomp_jump(X86 *c, uint32_t addr) {
+    /* A bounded table never reaches its default arm in these fixtures. */
+    (void)c;
+    unexpected("runtime jump", addr);
+}
+
 void ir_unexpected_call(uint32_t target) {
     unexpected("indirect call", target);
 }

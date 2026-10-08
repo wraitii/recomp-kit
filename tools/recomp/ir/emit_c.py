@@ -168,7 +168,7 @@ def codegen_ir(fir, lifter):
             ops = normalized.ops
         insns.append(Insn(ins.addr, ins.length, ins.mnem, ops, ins.x87_delta,
                           ins.x87, ins.internal_flow, ins.userops, ins.raw))
-    return FunctionIR(fir.addr, insns, fir.succ)
+    return FunctionIR(fir.addr, insns, fir.succ, fir.tables)
 
 
 def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=True,
@@ -451,7 +451,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                             v.opc == "X87_MEM" and m in ("FST", "FSTP", "FNSTSW", "FNSTCW")):
                         finish_scalar_run()
                 elif v.opc in ("STORE", "DIV32", "IDIV32", "CALL", "CALLIND", "STRINGOP",
-                               "RETURN", "BRANCH", "CBRANCH"):
+                               "RETURN", "BRANCH", "CBRANCH", "BRANCHIND"):
                     finish_scalar_run()
             prev = i
         finish_scalar_run()
@@ -501,7 +501,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 # fallthrough.
                 continue
             if (i == prev + 1 and set(fir.succ[prev]) == {i}
-                    and not any(op.opc in ("BRANCH", "CBRANCH", "RETURN")
+                    and not any(op.opc in ("BRANCH", "CBRANCH", "RETURN", "BRANCHIND")
                                 for op in s.blocks[prev].ops)):
                 linear_prev[i] = prev
 
@@ -649,6 +649,29 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 lines.extend(flush_x87())
                 lines.extend(publish(b.exit, v))
                 lines.extend(["recomp_return(c);", "return;"])
+            elif v.opc == "BRANCHIND":
+                # A decoded jump table: the target address selects a case, any
+                # other value is a runtime jump exactly like the decoded
+                # emitter's default arm (publish everything, set EIP to the
+                # jump, `recomp_jump`). Case edges are ordinary internal edges.
+                grouped = {}
+                for j in sorted(set(fir.succ[i])):
+                    grouped.setdefault(j, fir.insns[j].addr)
+                targets = list(grouped)
+                if carry_mode:
+                    transition(i, targets)
+                else:
+                    lines.extend(flush_x87())
+                lines.append("switch ((uint32_t)%s) {" % ref(v.args[0]))
+                for j, addr in grouped.items():
+                    lines.append("case 0x%xu:" % addr)
+                    lines.extend(edge(i, j))
+                lines.append("default:")
+                lines.extend(flush_x87() if carry_mode else [])
+                lines.extend(publish(b.exit, v))
+                lines.append("c->eip = 0x%xu; recomp_jump(c, (uint32_t)%s); return;" % (
+                    b.insn.addr, ref(v.args[0])))
+                lines.append("}")
             elif v.opc == "BRANCH":
                 if carry_mode:
                     target = indices[v.args[0].data]
@@ -672,7 +695,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                     lines.extend(edge(i, indices[b.insn.addr + b.insn.length]))
             else:
                 lines.append("v%d = (%s) & %s;" % (v.id, expression(v), mask(v.size)))
-        if not any(v.opc in ("BRANCH", "CBRANCH", "RETURN") for v in b.ops):
+        if not any(v.opc in ("BRANCH", "CBRANCH", "RETURN", "BRANCHIND") for v in b.ops):
             target = fir.succ[i][0]
             if carry_mode:
                 if linear_prev.get(target) != i:

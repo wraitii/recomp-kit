@@ -168,3 +168,29 @@ def test_pop_chain_restore_keeps_its_runtime_hook():
     assert "recomp_seh_frame_leave" in "\n".join(bodies[ENTRY])
     report = apply(tr, functions, bodies, {}, SETTINGS, quiet=True)
     assert report["fallback_reasons"] == {"SEH frame ownership": 1}
+
+
+def test_internal_switch_entries_keep_decoded_wrappers_and_get_ssa_main_entry():
+    # cmp eax,3; ja end; jmp [eax*4+table]; two case blocks; ret; table (data).
+    code = bytes.fromhex("83f803" "7717" "ff2485") + struct.pack("<I", ENTRY + 29)
+    code += bytes.fromhex("b901000000" "eb09" "b902000000" "eb02" "ffc3" "c3")
+    code += b"".join(struct.pack("<I", ENTRY + o) for o in (12, 19, 12, 26))
+    image = synthetic_image({ENTRY: code})
+    tr = T.Translator(image, {ENTRY}, SimpleNamespace(eager_flags=True))
+    insns = list(decode_span(image, ENTRY, "327525221"))
+    fn = T.Function(ENTRY, "fixture_%08x" % ENTRY, 29, insns)
+    fn.measure(image)
+    tr.prepare(fn, strict=True)
+    cases = {ENTRY + 12, ENTRY + 19, ENTRY + 26}
+    tr.internal_entries = {ENTRY: set(cases)}
+    bodies = {ENTRY: tr.translate(fn, cases)}
+    assert any(line.startswith("void fn_%08x(X86 *c) { body_" % ENTRY) for line in bodies[ENTRY])
+    report = apply(tr, [fn], bodies, {ENTRY: set(cases)}, SETTINGS, quiet=True)
+    assert report["emitted"] == 1, report["per_function"]
+    text = "\n".join(bodies[ENTRY])
+    assert "static void body_%08x(X86 *c, uint32_t entry_)" % ENTRY in text
+    assert "void fn_%08x(X86 *c) { body_" % ENTRY not in text
+    # The SSA body, once per RECOMP_NULL_CHECKS arm.
+    assert text.count("void fn_%08x(X86 *c) {" % ENTRY) == 2
+    for case in cases:
+        assert "void fn_%08x(X86 *c) { body_%08x(c, " % (case, ENTRY) in text

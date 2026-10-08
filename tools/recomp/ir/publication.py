@@ -44,9 +44,9 @@ Starting with no facts gives a conservative least fixed point for loops.
             known = {n: values(b.state, keys) for n, keys in enumerate(groups)
                      if all(p == -1 or n in known_exit[p] for p in predecessors[i])}
             for v in b.ops:
-                if v.opc not in EFFECTS and v.opc != "RETURN":
+                if v.opc not in EFFECTS and v.opc not in ("RETURN", "BRANCHIND"):
                     continue
-                state = b.exit if v.opc == "RETURN" else b.snapshots[v.id]
+                state = b.exit if v.opc in ("RETURN", "BRANCHIND") else b.snapshots[v.id]
                 access = v.opc in ("LOAD", "STORE", "X87_MEM")
                 required = []
                 for n, keys in enumerate(groups):
@@ -57,7 +57,10 @@ Starting with no facts gives a conservative least fixed point for loops.
                     current = values(state, keys)
                     if known.get(n) != current:
                         required.extend(keys)
-                    known[n] = current
+                    if v.opc != "BRANCHIND":
+                        # Only a table jump's default arm publishes; its case
+                        # edges leave the CPU as it was.
+                        known[n] = current
                 publications[v.id] = tuple(required)
                 if v.opc in ("DIV32", "IDIV32", "CALL", "CALLIND", "STRINGOP"):
                     # A division error handler, an opaque callee and the string

@@ -125,6 +125,9 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
             if fall_index is None or set(fir.succ[i]) != {fall_index}:
                 raise SSAError("%08x: indirect call lacks its canonical fallthrough" % ins.addr)
         for op in ins.ops:
+            if (op.opc == "BRANCHIND" and i in fir.tables and len(ins.ops) > 0
+                    and len(op.ins) == 1 and op.ins[0][0] != "ram" and op.ins[0][2] == 4):
+                continue
             if op.opc in ("BRANCHIND", "CALLOTHER") or (
                     op.opc == "CALLIND" and indirect_call_symbol is None):
                 raise SSAError("%08x: opaque effect %s" % (ins.addr, op.opc))
@@ -258,6 +261,9 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
         elif branches and branches[0].opc == "RETURN":
             if fir.succ[i]:
                 raise SSAError("return has successors")
+        elif branches and branches[0].opc == "BRANCHIND":
+            if i not in fir.tables or not fir.succ[i]:
+                raise SSAError("computed jump without a decoded table")
         elif len(set(fir.succ[i])) != 1:
             raise SSAError("instruction requires one fallthrough successor")
     for i, b in s.blocks.items():

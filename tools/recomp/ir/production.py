@@ -92,10 +92,9 @@ def exclusion(tr, fn, entries, policies):
     external = set(entries) - tr.internal_entries.get(fn.addr, set())
     if external:
         return "alternate entries"
-    if entries:
-        # Only switch-case blocks: not an entry problem. The SSA builder decides
-        # whether it can lower the table jump (today it names BRANCHIND).
-        return "jump table"
+    # Entries left over are switch-case blocks reached only from this body. The
+    # SSA builder decides whether it can lower the table jump (it names
+    # BRANCHIND otherwise); `apply` keeps the decoded body for their wrappers.
     if fn.addr in policies.get("intrinsic_bodies", {}):
         return "runtime intrinsic"
     if seh_hooks(tr, fn):
@@ -198,11 +197,24 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
             source, reason, facts = outcomes[index]
         else:
             source, reason, facts = None, reasons_by_index[index], {}
+        merged = None
         if reason is None:
             # Keep the production CALL_FN spelling: local declarations, module
             # retargeting and dispatch checks already understand this seam.
             source = re.sub(r"\bentry_([0-9a-f]{8})\(c\);", r"CALL_FN(\1);", source)
-            bodies[fn.addr] = source.splitlines()
+            merged = source.splitlines()
+            if entries_by_fn.get(fn.addr):
+                # Internal switch-case entries keep their decoded wrappers and
+                # `body_` for any runtime jump to a case; only the normal entry
+                # `fn_X` is replaced by the SSA body.
+                head = "void fn_%08x(X86 *c) {" % fn.addr
+                kept = [line for line in bodies[fn.addr] if not line.startswith(head)]
+                if len(kept) == len(bodies[fn.addr]) - 1:
+                    merged = kept + merged
+                else:
+                    reason, merged = "%08x: entry wrapper layout" % fn.addr, None
+        if reason is None:
+            bodies[fn.addr] = merged
             census.update(key for key, value in facts.items() if value)
         else:
             reasons[re.sub(r"^[0-9a-f]{8}: ", "", reason)] += 1

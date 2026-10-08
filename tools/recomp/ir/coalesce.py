@@ -41,7 +41,7 @@ def registers(s, groups):
                 # Keep the terminator last. These pure copies do not move or
                 # change any access or its captured state.
                 at = next((n for n, v in enumerate(b.ops)
-                           if v.opc in ("BRANCH", "CBRANCH", "RETURN")), len(b.ops))
+                           if v.opc in ("BRANCH", "CBRANCH", "RETURN", "BRANCHIND")), len(b.ops))
                 b.ops.insert(at, packed)
                 args.append(packed)
             phi.args = tuple(args)

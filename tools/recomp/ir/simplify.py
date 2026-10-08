@@ -8,7 +8,7 @@ The passes work on SSA rather than C spelling and can serve other consumers.
 EFFECTS = frozenset(("LOAD", "STORE", "DIV32", "IDIV32", "X87_MEM", "CALL",
                      "CALLIND", "STRINGOP"))
 ORDERED = EFFECTS | {"X87_REG"}
-TERMINATORS = frozenset(("BRANCH", "CBRANCH", "RETURN"))
+TERMINATORS = frozenset(("BRANCH", "CBRANCH", "RETURN", "BRANCHIND"))
 PURE = frozenset((
     "PACK", "BYTE", "COPY", "INT_ZEXT", "INT_SEXT", "INT_ADD", "INT_SUB", "INT_MULT",
     "INT_AND", "INT_OR", "INT_XOR", "INT_EQUAL", "INT_NOTEQUAL", "INT_LESS",
@@ -115,7 +115,7 @@ Memory tokens retain the dependency chain without authorizing load forwarding.
                     state = b.snapshots[v.id]
                     todo.extend(state[key] for key in (
                         state if publications is None else publications[v.id]))
-                elif v.opc == "RETURN":
+                elif v.opc in ("RETURN", "BRANCHIND"):
                     todo.extend(b.exit[key] for key in (
                         b.exit if publications is None else publications[v.id]))
     live = set()

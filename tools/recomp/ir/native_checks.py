@@ -145,6 +145,26 @@ CASES = {
 CASES = {**CASES, **INTEGER_EXTRA_CASES, **X87_REGISTER_CASES}
 
 
+def _table_case():
+    """A bounded jump table in the image: `cmp eax,3; ja end; jmp [eax*4+table]`.
+
+    Cases 0 and 2 share a block, so the SSA switch groups two labels on one
+    edge. The table is image data after the RET, never decoded as code.
+    Layout: cmp 0, ja 3, jmp 5, block0 12 (mov+jmp), block1 19 (mov+jmp),
+    block2 26 (inc), ret 28, table 29.
+    """
+    code = ("83f803", "7717", "ff2485" + (ENTRY + 29).to_bytes(4, "little").hex(),
+            "b901000000", "eb09", "b902000000", "eb02", "ffc3", "c3")
+    targets = [ENTRY + 12, ENTRY + 19, ENTRY + 12, ENTRY + 26]
+    return code, b"".join(t.to_bytes(4, "little") for t in targets)
+
+
+TABLE_CASE, TABLE_DATA_BYTES = _table_case()
+#: Cases whose image carries data after the code (name -> bytes).
+TABLE_DATA = {"jump_table_switch": TABLE_DATA_BYTES}
+CASES["jump_table_switch"] = TABLE_CASE
+
+
 CALLEE = 0x200000  # Synthetic callee address, never a game entry point.
 
 
@@ -458,13 +478,13 @@ def sources(name, hexes):
     """Decode and lift the exact same byte boundaries for all six consumers."""
     chunks = [bytes.fromhex(h) for h in hexes]
     image = T.Image.__new__(T.Image)
-    image.base, image.data = ENTRY, b"".join(chunks)
+    image.base, image.data = ENTRY, b"".join(chunks) + TABLE_DATA.get(name, b"")
     image.end = ENTRY + len(image.data)
     image.is_exec = lambda addr: ENTRY <= addr < image.end
     image.md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
     decoded = list(decode_span(image, ENTRY, "".join("%x" % len(raw) for raw in chunks)))
     tr = T.Translator(image, {ENTRY}, SimpleNamespace(eager_flags=True))
-    fn = T.Function(ENTRY, name, len(image.data), decoded)
+    fn = T.Function(ENTRY, name, len(b"".join(chunks)), decoded)
     tr.prepare(fn, strict=True)
     eager = re.sub(r"\b(fn|body)_([0-9a-f]{8})\b", lambda m: name + "_eager_" + m[0],
                    "\n".join(tr.translate(fn)))
@@ -472,7 +492,14 @@ def sources(name, hexes):
     for raw, ins in zip(chunks, decoded):
         lifted.append(lifter.lift(addr, raw, ins.mnem))
         addr += len(raw)
-    fir = FunctionIR(ENTRY, lifted, default_successors(lifted))
+    if name in TABLE_DATA:
+        from .cfg import table_jumps
+        assert tr.jumptables, "fixture table was not decoded"
+        fir = FunctionIR(ENTRY, lifted, [tr.successors(fn, i) for i in range(len(decoded))],
+                         table_jumps(tr, fn))
+        assert fir.tables, "fixture table jump was not admitted"
+    else:
+        fir = FunctionIR(ENTRY, lifted, default_successors(lifted))
     raw = emit(fir, name + "_ir_raw", optimize=False)
     scalar = emit(fir, name + "_ir_scalar", local_state=False, msvc_convention=False)
     strict = emit(fir, name + "_ir_strict", x87_scalar_strict=True, local_state=False,

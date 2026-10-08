@@ -14,10 +14,14 @@ class FunctionIR(object):
     (jump tables, noreturn calls, pushed continuations).
     """
 
-    def __init__(self, addr, insns, succ):
+    def __init__(self, addr, insns, succ, tables=None):
         self.addr = addr
         self.insns = insns
         self.succ = succ
+        #: Indices of computed jumps whose complete target set is `succ[i]`:
+        #: decoded jump tables with every case inside this body. Any other
+        #: BRANCHIND stays an opaque effect.
+        self.tables = frozenset(tables or ())
 
 
 def default_successors(insns):
@@ -59,7 +63,26 @@ def function_ir(tr, lifter, fn):
         insns.append(lifter.lift(ins.addr, bytes(image.data[lo:lo + end - ins.addr]),
                                  mnem=ins.mnem))
     succ = [tr.successors(fn, i) for i in range(len(fn.insns))]
-    return FunctionIR(fn.addr, insns, succ)
+    return FunctionIR(fn.addr, insns, succ, table_jumps(tr, fn))
+
+
+def table_jumps(tr, fn):
+    """Indices of table jumps the decoded emitter lowers to a pure in-body switch.
+
+    Mirrors `emit_indirect_jump`: a JMP that is not a proven return jump and has
+    a decoded table. A table naming a target outside this body is excluded, since
+    the decoded emitter tail-calls those (`CALL_FN`) and the SSA CFG has no such
+    edge.
+    """
+    result = set()
+    return_jumps = getattr(fn, "return_jumps", ())
+    for i, ins in enumerate(fn.insns):
+        if ins.mnem != "JMP" or not ins.ops or ins.ops[0].startswith("0x") or i in return_jumps:
+            continue
+        targets = tr.jumptables.get((fn.addr, ins.addr))
+        if targets and all(t in fn.index for t in targets):
+            result.add(i)
+    return result
 
 
 def call_graph(functions, direct_targets):
