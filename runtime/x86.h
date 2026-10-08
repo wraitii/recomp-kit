@@ -1546,6 +1546,30 @@ static inline void x87_frstor(X86 *c, uint32_t a) {
     c->fpu_tag = rd16(a + 8);
 }
 
+/* One binary32 ULP toward +infinity (up) or -infinity, bit for bit what
+ * nextafterf gives for the inputs the directed-rounding step reaches: finite
+ * nonzero values, infinities (stepping FLT_MAX out of an infinity) and zero
+ * (stepping to the smallest subnormal of the requested sign). Integer work
+ * only: a call here kept every value live across the store in a callee-saved
+ * register, costing a 96-byte frame in 0081ae30, while the rare RC != 0
+ * correction needs no call at all. */
+static inline float fto_float_step(float f, int up) {
+    uint32_t b, neg, mag;
+    RECOMP_BITCOPY(&b, &f, 4);
+    neg = b >> 31;
+    mag = b & 0x7fffffffu;
+    if (mag == 0) {
+        b = up ? 0x00000001u : 0x80000001u;
+    } else {
+        /* Away from zero is +1 on a positive value stepping up or a negative
+         * value stepping down; otherwise toward zero. */
+        mag = (up == (neg == 0)) ? mag + 1 : mag - 1;
+        b = (neg << 31) | mag;
+    }
+    RECOMP_BITCOPY(&f, &b, 4);
+    return f;
+}
+
 /* FST/FSTP to a float, rounded per RC.  The host conversion rounds to
  * nearest; for the directed modes, step one ULP if it went the wrong way. */
 static inline float fto_float(const X86 *c, double v) {
@@ -1562,16 +1586,19 @@ static inline float fto_float(const X86 *c, double v) {
         memcpy(&f, &bits, sizeof f);
         return f;
     }
-    double back;
     if (rc == 0 || v != v || isinf(v) || (double)f == v)
         return f;
-    back = (double)f;
-    if (rc == 1 && back > v)
-        return nextafterf(f, -(float)INFINITY); /* down */
-    if (rc == 2 && back < v)
-        return nextafterf(f, (float)INFINITY); /* up */
-    if (rc == 3 && ((v > 0 && back > v) || (v < 0 && back < v)))
-        return nextafterf(f, 0.0f); /* truncate */
+    /* The host conversion rounded to nearest; step one ULP toward the mode's
+     * direction when it went the wrong way. */
+    {
+        double back = (double)f;
+        if (rc == 1 && back > v)
+            return fto_float_step(f, 0); /* down */
+        if (rc == 2 && back < v)
+            return fto_float_step(f, 1); /* up */
+        if (rc == 3 && ((v > 0 && back > v) || (v < 0 && back < v)))
+            return fto_float_step(f, f < 0.0f); /* truncate toward zero */
+    }
     return f;
 }
 
