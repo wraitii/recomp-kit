@@ -22,7 +22,6 @@
 #include "../runtime/memory.h"
 #include "../platform/os.h"
 #include "../runtime/mods_seam.h"
-#include "../mods/sprite_view.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -103,7 +102,7 @@ std::map<uint32_t, uint32_t> &uploaded_revisions() {
     static std::map<uint32_t, uint32_t> revisions;
     return revisions;
 }
-// handle -> ComObj id, for both kinds. Draws and sprite provenance resolve
+// handle -> ComObj id, for both kinds. Draws and revision queries resolve
 // these repeatedly; lookup must not scan every texture loaded by the game.
 // Keep IDs rather than pointers so com_get still rejects released objects.
 std::unordered_map<uint32_t, uint32_t> &handles() {
@@ -684,7 +683,6 @@ void submit(X86 *c, ComObj *dev, uint32_t prim, uint32_t vtype, uint32_t vertice
     screen_bounds(d, &d->screen_min_x, &d->screen_min_y, &d->screen_max_x, &d->screen_max_y);
     ddraw_note_render_surface(g_render_target);
     ddraw_record_draw(d);
-    host_sprite_record_draw(d);
     encode_snapshot(d);
     (void)c;
 }
@@ -2767,12 +2765,9 @@ extern "C" int d3d_draw_inside_rect(const HostD3DDrawSnapshot *d, int32_t x0, in
     return draw_inside(d, x0, y0, x1, y1);
 }
 
-// Read-only provenance seam: the resolver has already selected/filled the
-// surface. Use the same handle table and content revision as DrawPrimitive.
-extern "C" uint64_t host_sprite_frame_id() {
-    return host_frame_current().id;
-}
-extern "C" uint32_t host_sprite_texture_revision(uint32_t handle) {
+// Resolve the current content revision through the same handle table used by
+// DrawPrimitive. Invalid or released handles have no revision.
+uint32_t d3d_texture_revision(uint32_t handle) {
     ComObj *surface = object_for_handle(handle);
     return surface ? ddraw_surface_revision(surface->id) : 0;
 }

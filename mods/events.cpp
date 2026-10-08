@@ -1,18 +1,11 @@
-#include "display_settings.h"
 // events.cpp - named originals re-exposed as registrations.
 //
 // The runtime installs these hooks BEFORE any user mod loads and owns them:
 // they are attributed to MODS_OWNER_RUNTIME, so no user mod's rollback can
 // remove them.
 //
-//   on_turn        before/after on the inner scheduler   004ec6f0
-//   on_frame       before/after on the outer driver      004a5590
-//   on_level_load  after load_objs (0040c690), fired only when its AL result
-//                  is non-zero - that byte IS objs0_loaded, the game's own
-//                  record that the object set loaded
-//   on_level_end   before the next-level tail            0042c6d0
+// Event names and addresses come from the selected game's configuration.
 //
-// Pause has no event: mods poll mods_game_paused().
 #include "mods_internal.h"
 #include "../runtime/mods_seam.h"
 
@@ -76,12 +69,8 @@ void frame_after(const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {
     fire(0, POP_EVENT_AFTER);
 }
 
-void level_load_after(const PopModApi *, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
-    // load_objs returns objs0_loaded in AL. A failed load - a missing
-    // objects/objs0_<n>.ver, which read_obj_hdr reports - leaves it zero and
-    // jumps straight to the epilogue, so nothing fires.
-    if ((cpu->eax & 0xffu) != 0u)
-        fire(2, 0);
+void level_load_after(const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {
+    fire(2, 0);
 }
 void level_end_before(const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {
     mods_present_level_end();
@@ -132,19 +121,23 @@ bool mods_events_init() {
                      w.name);
             continue;
         }
-        if (!mods_symbol_hookable(addr) ||
-            mods_hook_install_ex(MODS_OWNER_RUNTIME, addr, 0, w.fn, w.mode, POP_HOOK_NO_GAME_VIEW,
-                                 nullptr, &id) != POP_OK) {
+        if (!mods_symbol_hookable(addr) || mods_hook_install_ex(MODS_OWNER_RUNTIME, addr, 0, w.fn,
+                                                                w.mode, nullptr, &id) != POP_OK) {
             LOGW("mods: event %s is not a hookable entry symbol (%08x)", w.name, addr);
             return false;
         }
         g_hook_ids[i] = id;
     }
-    // Forwarders read no entity state. fire() takes a separate immutable view
-    // for each actual subscriber, including nested callbacks.
+    // Each subscriber gets a tracked callback scope, including nested events.
     g_installed = true;
     return true;
 }
+
+#ifdef POPM_TESTING
+extern "C" void mods_events_test_fire(int32_t which, int32_t phase) {
+    fire(which, phase);
+}
+#endif
 
 void mods_events_reset() {
     // Called from mods_hooks_reset, which has already emptied the registry: the
@@ -202,15 +195,5 @@ void mods_fill_events_api(PopModApi *api) {
     };
     api->on_mouse = [](const PopModApi *a, PopMouseFn f, void *u, uint32_t *id) {
         return mods_on_mouse(a->mod_index, f, u, id);
-    };
-    api->entity_count = [](const PopModApi *) { return mods_entity_count(); };
-    api->entity_slot = [](const PopModApi *, uint32_t n, uint32_t *s) {
-        return mods_entity_slot(n, s);
-    };
-    api->entity = [](const PopModApi *, uint32_t slot, PopEntityView *out) {
-        return mods_entity(slot, out);
-    };
-    api->tribe = [](const PopModApi *, uint32_t i, PopTribeView *out) {
-        return mods_tribe(i, out);
     };
 }

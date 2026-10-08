@@ -10,14 +10,13 @@ these inputs.
 - Vertex buffer slot 0: `HostD3DVertex` (14 floats: x y z w, u v, r g b a, sr sg sb sa), `d3d_render.h`.
 - Vertex and fragment bytes slot 1: `D3DUniforms` (`d3d_render.h`): `float mvp[16]` column-major, then
   `uint32 pretransformed, textured, texblend, alphatest, alphafunc; float alpharef; uint32 specular,
-  texture_has_alpha, fogmode; float fogstart, fogend, fogdensity, fogr, fogg, fogb, pointsize;
-  uint32 terrain_detail`. 132 bytes of fields; the C struct is 16-byte aligned (144 bytes) and
-  the backend receives it whole.
-- Fragment texture 0 + sampler 0: the draw's texture. Fragment texture 1 + sampler 1: terrain detail.
+  texture_has_alpha, fogmode; float fogstart, fogend, fogdensity, fogr, fogg, fogb, pointsize`.
+  128 bytes; the C struct is 16-byte aligned and the backend receives it whole.
+- Fragment texture 0 + sampler 0: the draw's texture.
 - Outputs: colour attachment 0 (BGRA8) and coverage attachment 1 (R8, 1.0 for every surviving fragment).
 - Semantics: texblend cases 1/7 decal, 2 modulate, 3 decal alpha, 4 modulate alpha, 5 decal mask,
   8 add; alpha test with D3D compare functions 1..8; fog modes 1 vertex (specular alpha), 2 exp,
-  3 exp2, 4 linear; terrain detail modulates by chroma-derived material weights.
+  3 exp2, 4 linear.
 
 ## `surface_upload` (render pipeline)
 

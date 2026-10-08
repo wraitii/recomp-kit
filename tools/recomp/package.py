@@ -5,8 +5,8 @@
 
 macOS: <App>-<v>-macos-arm64.zip holding <App>.app (as finish_bundle.py
 built it), the game's LICENSE, NOTICE and tools/release/README.txt. Windows and
-Linux: an <App> folder with the executable, resources/{mods/core,texture-pack,
-classic-modes.json} and the same documents, zipped (Windows) or tar.gz'd (Linux).
+Linux: an <App> folder with the executable, resources/{mods/core,texture-pack}
+and the same documents, zipped (Windows) or tar.gz'd (Linux).
 The build is read from the game's build root (<game>/build)."""
 import argparse
 import os
@@ -28,7 +28,6 @@ SUFFIX = {"macos": "macos-arm64", "linux": "linux-x64", "windows": "windows-x64"
 def stage_resources(dest, cc, game_dir, build_root):
     resources = dest / "resources"
     resources.mkdir(parents=True)
-    shutil.copy(ROOT / "tools/recomp/baseline/classic-modes.json", resources / "classic-modes.json")
     bank = ROOT / "third_party/soundfonts/generaluser-gs"
     shutil.copy(bank / "GeneralUser-GS.sf2", resources / "general-midi.sf2")
     shutil.copy(bank / "LICENSE", resources / "general-midi-LICENSE.txt")

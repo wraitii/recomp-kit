@@ -393,7 +393,7 @@ uint64_t hash_tree(const std::string &dir, uint64_t h, bool *missing, int depth)
 // directory recursion running before main.
 __attribute__((constructor)) void capture_build() {
     // PRESENCE disables, whatever the value, because that is what the hosts
-    // do: boot.cpp and fixture.cpp both ask !recomp_env("NO_MODS"). Asking
+    // do: boot.cpp asks !recomp_env("NO_MODS"). Asking
     // whether the value was non-empty made RECOMP_NO_MODS="" a run with mods
     // off that recorded itself as a run with mods on - the one field whose
     // whole job is to tell those two apart.
@@ -407,10 +407,8 @@ __attribute__((constructor)) void capture_build() {
 
     const uint64_t seed = 1469598103934665603ull;
     bool missing = false;
-    // The translated archive lives under the checkout's build/recomp (a game
-    // repository's, or the kit's for its stub); never relative to the working
-    // directory, which is the kit even when the game lives elsewhere.
-    uint64_t archive = hash_file(host_state_file("librecomp_gen.a").c_str(), seed, &missing);
+    // CMake supplies the actual archive path for this build and platform.
+    uint64_t archive = hash_file(RECOMP_GENERATED_ARCHIVE_PATH, seed, &missing);
     uint64_t symbols = hash_file(host_resource("symbols.json").c_str(), seed, &missing);
     if (!missing) {
         g_archive_hash = archive;

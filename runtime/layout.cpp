@@ -47,7 +47,7 @@ HostLayout compute() {
     // build/) or, for the kit's own stub builds, the kit itself.
     std::string up = dir;
     for (int depth = 0; depth < 12 && !up.empty(); ++depth) {
-        if (exists(up + "/game.toml") || exists(up + "/tools/recomp/baseline/classic-modes.json")) {
+        if (exists(up + "/game.toml") || exists(up + "/AGENTS.md")) {
             l.checkout_root = up;
             l.developer = true;
             break;
@@ -129,13 +129,6 @@ std::string host_resource(const char *rel) {
             const char *const bank = "/third_party/soundfonts/generaluser-gs/GeneralUser-GS.sf2";
             const std::string own = l.checkout_root + bank;
             return exists(own) ? own : std::string(RECOMP_KIT_DIR) + bank;
-        }
-        if (strcmp(rel, "classic-modes.json") == 0) {
-            // The kit's committed probe list, wherever the kit is relative to the game.
-            const std::string own = l.checkout_root + "/tools/recomp/baseline/classic-modes.json";
-            return exists(own)
-                       ? own
-                       : std::string(RECOMP_KIT_DIR) + "/tools/recomp/baseline/classic-modes.json";
         }
     }
     return l.resources_dir + "/" + rel;

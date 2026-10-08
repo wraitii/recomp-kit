@@ -84,8 +84,8 @@ void prepare() {
     imports_init();
 }
 
-constexpr uint32_t CAPTURE_TARGET = 0x00401000u;
-constexpr uint32_t UNWIND_TARGET = 0x0040c690u;
+uint32_t CAPTURE_TARGET = 0;
+uint32_t UNWIND_TARGET = 0;
 PopModApi capture_test_api{};
 
 bool prepare_capture_hooks() {
@@ -101,6 +101,20 @@ bool prepare_capture_hooks() {
     const bool symbols = mods_symbols_load(nullptr);
     MOD_CHECK(symbols);
     if (!symbols)
+        return false;
+    for (uint32_t i = 0; i < recomp_func_count; ++i) {
+        const uint32_t addr = recomp_func_addrs[i];
+        if (!mods_symbol_hookable(addr))
+            continue;
+        if (!CAPTURE_TARGET)
+            CAPTURE_TARGET = addr;
+        else if (addr != CAPTURE_TARGET) {
+            UNWIND_TARGET = addr;
+            break;
+        }
+    }
+    MOD_CHECK(CAPTURE_TARGET != 0 && UNWIND_TARGET != 0);
+    if (!CAPTURE_TARGET || !UNWIND_TARGET)
         return false;
     capture_test_api = {};
     capture_test_api.version = POP_MOD_API_VERSION;
@@ -133,7 +147,7 @@ bool install_capture_test_hook(uint32_t target, PopHookFn callback, void *user =
 void invoke_capture_test_hook(uint32_t target, uint32_t esp) {
     X86 c{};
     c.r[R_ESP] = esp;
-    wr32(esp, 0x00401000u);
+    wr32(esp, 0x12345678u);
     const int32_t index = recomp_index_of(target);
     MOD_CHECK(index >= 0);
     if (index < 0)

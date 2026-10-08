@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(PopulousRecomp LANGUAGES C CXX)
+project(RecompKit LANGUAGES C CXX)
 if(APPLE)
   enable_language(OBJCXX)
 endif()
@@ -66,7 +66,6 @@ set(POP_OUT ${POP_BUILD_DIR}/recomp)
 # both mobile and desktop builds; never let one preset overwrite another's libs.
 set(POP_ARCHIVE_DIR ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${POP_OUT})
-set(POP_TRACE_DIR "" CACHE PATH "Snapshot directory for pop_fixture_trace")
 
 # tools/build.py passes its own interpreter; a bare configure finds one.
 if(NOT Python3_EXECUTABLE)

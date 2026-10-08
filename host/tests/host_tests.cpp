@@ -35,7 +35,6 @@
 #include "../midi.h"
 #include "../script.h"
 #include "../smoke_dumpat.h"
-#include "../landmark.h"
 #include <filesystem>
 #include <fstream>
 #include "../../platform/os.h"
@@ -647,9 +646,7 @@ static void test_script_parsing() {
     CHECK_NEAR(steps[6].threshold, 0.3, 1e-9);
     CHECK_EQ(steps[7].op, HOST_SCRIPT_QUIT);
 
-    // Relative motion, which is all a DirectInput mouse reports. A script uses
-    // it to pin the game's own pointer to a corner, because the game
-    // integrates the deltas itself and started its pointer wherever it chose.
+    // Relative motion is delivered as signed deltas to the guest input path.
     const char *relative = "moveby -2000 -2000\nmoveby 320 140\n";
     CHECK_EQ(host_script_parse(relative, steps, 64, err, sizeof err), 2);
 
@@ -717,32 +714,25 @@ static void test_script_parsing() {
         CHECK(strstr(err, "line 1") != nullptr);
     }
 
-    // Reading guest memory and following an entity, which is how a run says
-    // what the game thought happened rather than what it drew.
-    const char *memory = "peek 0x8e0428 179\n"
-                         "peek 4096 16\n"
-                         "watch 0 1\n";
-    CHECK_EQ(host_script_parse(memory, steps, 64, err, sizeof err), 3);
+    // Guest-memory peeks accept decimal and hexadecimal addresses without
+    // baking any game's guest layout into this generic parser test.
+    const char *memory = "peek 0x1000 16\n"
+                         "peek 4096 16\n";
+    CHECK_EQ(host_script_parse(memory, steps, 64, err, sizeof err), 2);
     CHECK_EQ(steps[0].op, HOST_SCRIPT_PEEK);
-    CHECK_EQ(steps[0].addr, 0x8e0428u); // hex, the way every note writes it
-    CHECK_EQ(steps[0].len, 179u);
-    CHECK_EQ(steps[1].addr, 4096u); // and decimal, the way none of them do
+    CHECK_EQ(steps[0].addr, 0x1000u);
+    CHECK_EQ(steps[0].len, 16u);
+    CHECK_EQ(steps[1].addr, 4096u);
     CHECK_EQ(steps[1].len, 16u);
-    CHECK_EQ(steps[2].op, HOST_SCRIPT_WATCH);
-    CHECK_EQ(steps[2].owner, 0);
-    CHECK_EQ(steps[2].kind, 1);
 
-    // A peek big enough to bury the log is a mistake in the script, and so is
-    // an owner or a kind that is not a byte.
-    CHECK_EQ(host_script_parse("peek 0x8e0428 4096\n", steps, 64, err, sizeof err), -1);
-    CHECK_EQ(host_script_parse("peek 0x8e0428 0\n", steps, 64, err, sizeof err), -1);
-    CHECK_EQ(host_script_parse("peek 0x8e0428\n", steps, 64, err, sizeof err), -1);
-    CHECK_EQ(host_script_parse("watch 0\n", steps, 64, err, sizeof err), -1);
-    CHECK_EQ(host_script_parse("watch 0 999\n", steps, 64, err, sizeof err), -1);
+    // A peek big enough to bury the log is a mistake in the script.
+    CHECK_EQ(host_script_parse("peek 0x1000 4096\n", steps, 64, err, sizeof err), -1);
+    CHECK_EQ(host_script_parse("peek 0x1000 0\n", steps, 64, err, sizeof err), -1);
+    CHECK_EQ(host_script_parse("peek 0x1000\n", steps, 64, err, sizeof err), -1);
 
-    // `await` waits on the game rather than on the clock, and its hold is what
-    // makes it usable on a screen that fades in: a fade passes through every
-    // value on its way up, so a claim that is only momentarily true has to be
+    // `await` waits on a metric rather than on the script clock. A hold is useful
+    // for conditions that pass through a threshold: a claim that is only
+    // momentarily true has to be
     // rejected. Both clauses are optional and take either order.
     const char *awaits = "await picture>0.98\n"
                          "await picture>0.98 for 2000 within 45000\n"
@@ -758,20 +748,12 @@ static void test_script_parsing() {
     CHECK_EQ(steps[2].hold_ms, 500u);
     CHECK_EQ(steps[2].timeout_ms, 30000u);
 
-    CHECK_EQ(host_script_parse("await entity_body 1815 within 20000\n"
-                               "await dumpat_fired>=1 within 120000\n",
-                               steps, 64, err, sizeof err),
-             2);
+    CHECK_EQ(host_script_parse("await dumpat_fired>=1 within 120000\n", steps, 64, err, sizeof err),
+             1);
     CHECK_EQ(steps[0].op, HOST_SCRIPT_AWAIT);
-    CHECK(strcmp(steps[0].name, "entity_body") == 0);
-    CHECK_EQ(steps[0].entity_id, 1815);
-    CHECK_EQ(steps[0].timeout_ms, 20000u);
-    CHECK_EQ(steps[0].threshold, 0.0);
-    CHECK(!steps[0].at_least); // missing BODY (zero) never passes
-    CHECK_EQ(steps[1].op, HOST_SCRIPT_AWAIT);
-    CHECK(strcmp(steps[1].name, "dumpat_fired") == 0);
-    CHECK_EQ(steps[1].threshold, 1.0);
-    CHECK(steps[1].at_least);
+    CHECK(strcmp(steps[0].name, "dumpat_fired") == 0);
+    CHECK_EQ(steps[0].threshold, 1.0);
+    CHECK(steps[0].at_least);
 
     // --- one numeric rule, and one name rule, for every verb ----------------
     //
@@ -790,15 +772,10 @@ static void test_script_parsing() {
         {"click left 1 y\n", "click y is a number"},
         {"wait 5x\n", "wait needs a number of ms"},
         {"peek 0xzz 4\n", "peek address is a number"},
-        {"peek 0x8e0428 4bytes\n", "peek length is a number"},
-        {"watch 0 one\n", "watch kind is a byte"},
+        {"peek 0x1000 4bytes\n", "peek length is a number"},
         {"expect textures>lots\n", "expect needs a number after >"},
+        {"expect textures>=1\n", "expect needs a number after >"},
         {"await picture>soon\n", "await needs a number after >"},
-        {"await entity_body\n", "needs an entity id"},
-        {"await entity_body -1\n", "needs an entity id"},
-        {"await entity_body 65536\n", "needs an entity id"},
-        {"await entity_body 1815x\n", "needs an entity id"},
-        {"await entity_body 1815 within 0\n", "timeout above zero"},
         {"await picture>0.5 within abc\n", "await needs a number of ms"},
         {"dump sub/name\n", "letters, digits"},
         {"dump .hidden\n", "cannot start with a dot"},
@@ -812,103 +789,72 @@ static void test_script_parsing() {
         CHECK(strstr(err, b.fragment) != nullptr);
     }
 
-    // And what the rule must NOT reject: everything the shipped scripts write,
-    // including the hex a peek is written in and the decimal a watch is.
+    // Valid generic commands remain accepted, including both peek address forms.
     const char *still_fine = "wait 400\n"
                              "move -2000 -2000\n"
                              "moveby -2000 -2000\n"
                              "click left 320 140\n"
-                             "peek 0x8e0428 179\n"
+                             "peek 0x1000 179\n"
                              "peek 4096 16\n"
-                             "watch 0 1\n"
                              "dump level_start\n"
                              "expect scene_nonblack>0.50\n"
                              "await picture>0.98 for 2000 within 60000\n";
     err[0] = 0;
-    CHECK_EQ(host_script_parse(still_fine, steps, 64, err, sizeof err), 9);
+    CHECK_EQ(host_script_parse(still_fine, steps, 64, err, sizeof err), 8);
     CHECK_EQ(err[0], 0);
 
-    // --- the display verbs -------------------------------------------------
-    //
-    // Round trip first: every field a step carries, including the two defaults
-    // that are not written down (a mode's twenty-second timeout and a
-    // guestclick's sixty-millisecond hold), because a default nobody asserts
-    // is a default nobody notices changing.
-    const char *display = "mode 800 600 16\n"
-                          "mode 1280 960 16\n"
-                          "guestclick 320 140\n"
+    // --- the reusable pixel and capture verbs ------------------------------
+    const char *display = "guestclick 320 140\n"
                           "guestclick 12 34 right hold 250\n"
                           "probe 640 360 255 0 0\n"
                           "probe 1 2 3 4 5 8\n"
                           "dumpc widescreen\n"
-                          "landmark 41 expect visible\n"
-                          "landmark 7 expect hidden within 5000\n"
                           "dumpat turn>=100 ref_t100\n"
                           "dumpat picture>0.5 bright\n"
                           "dumpat ref_c840 command_frame>=840\n";
-    CHECK_EQ(host_script_parse(display, steps, 64, err, sizeof err), 12);
+    CHECK_EQ(host_script_parse(display, steps, 64, err, sizeof err), 8);
 
-    CHECK_EQ(steps[0].op, HOST_SCRIPT_MODE);
-    CHECK_EQ(steps[0].w, 800);
-    CHECK_EQ(steps[0].h, 600);
-    CHECK_EQ(steps[0].bpp, 16);
-    // No timeout: `mode` arms rather than waits, because the game applies a
-    // mode only when a level starts and recreates its surfaces.
-    CHECK_EQ(steps[0].timeout_ms, 0u);
-    CHECK_EQ(steps[1].w, 1280);
-    CHECK_EQ(steps[1].h, 960);
-    CHECK_EQ(steps[1].bpp, 16);
-    CHECK_EQ(steps[1].timeout_ms, 0u);
+    CHECK_EQ(steps[0].op, HOST_SCRIPT_GUESTCLICK);
+    CHECK_EQ(steps[0].x, 320);
+    CHECK_EQ(steps[0].y, 140);
+    CHECK_EQ(steps[0].button, 0);     // left unless said otherwise
+    CHECK_EQ(steps[0].press_ms, 60u); // and the default hold
+    CHECK_EQ(steps[1].x, 12);
+    CHECK_EQ(steps[1].y, 34);
+    CHECK_EQ(steps[1].button, 1);
+    CHECK_EQ(steps[1].press_ms, 250u);
 
-    CHECK_EQ(steps[2].op, HOST_SCRIPT_GUESTCLICK);
-    CHECK_EQ(steps[2].x, 320);
-    CHECK_EQ(steps[2].y, 140);
-    CHECK_EQ(steps[2].button, 0);     // left unless said otherwise
-    CHECK_EQ(steps[2].press_ms, 60u); // and the default hold
-    CHECK_EQ(steps[3].x, 12);
-    CHECK_EQ(steps[3].y, 34);
-    CHECK_EQ(steps[3].button, 1);
-    CHECK_EQ(steps[3].press_ms, 250u);
+    CHECK_EQ(steps[2].op, HOST_SCRIPT_PROBE);
+    CHECK_EQ(steps[2].x, 640);
+    CHECK_EQ(steps[2].y, 360);
+    CHECK_EQ(steps[2].r, 255);
+    CHECK_EQ(steps[2].g, 0);
+    CHECK_EQ(steps[2].b, 0);
+    CHECK_EQ(steps[2].tol, 0); // exact unless asked otherwise
+    CHECK_EQ(steps[3].tol, 8);
 
-    CHECK_EQ(steps[4].op, HOST_SCRIPT_PROBE);
-    CHECK_EQ(steps[4].x, 640);
-    CHECK_EQ(steps[4].y, 360);
-    CHECK_EQ(steps[4].r, 255);
-    CHECK_EQ(steps[4].g, 0);
-    CHECK_EQ(steps[4].b, 0);
-    CHECK_EQ(steps[4].tol, 0); // exact unless asked otherwise
-    CHECK_EQ(steps[5].tol, 8);
-
-    CHECK_EQ(steps[6].op, HOST_SCRIPT_DUMPC);
-    CHECK(strcmp(steps[6].name, "widescreen") == 0);
-
-    CHECK_EQ(steps[7].op, HOST_SCRIPT_LANDMARK);
-    CHECK_EQ(steps[7].entity_id, 41);
-    CHECK_EQ(steps[7].want_visible, 1);
-    CHECK_EQ(steps[7].timeout_ms, 20000u);
-    CHECK_EQ(steps[8].entity_id, 7);
-    CHECK_EQ(steps[8].want_visible, 0);
-    CHECK_EQ(steps[8].timeout_ms, 5000u);
+    CHECK_EQ(steps[4].op, HOST_SCRIPT_DUMPC);
+    CHECK(strcmp(steps[4].name, "widescreen") == 0);
 
     // dumpat carries the metric in `name` and the dump's own name in `text`,
     // because it needs both and one field cannot hold two.
-    CHECK_EQ(steps[9].op, HOST_SCRIPT_DUMPAT);
-    CHECK(strcmp(steps[9].name, "turn") == 0);
-    CHECK(strcmp(steps[9].text, "ref_t100") == 0);
-    CHECK(steps[9].at_least);
-    CHECK(steps[9].threshold > 99.9 && steps[9].threshold < 100.1);
-    CHECK_EQ(steps[10].op, HOST_SCRIPT_DUMPAT);
-    CHECK(strcmp(steps[10].name, "picture") == 0);
-    CHECK(strcmp(steps[10].text, "bright") == 0);
-    CHECK(!steps[10].at_least);
+    CHECK_EQ(steps[5].op, HOST_SCRIPT_DUMPAT);
+    CHECK(strcmp(steps[5].name, "turn") == 0);
+    CHECK(strcmp(steps[5].text, "ref_t100") == 0);
+    CHECK(steps[5].at_least);
+    CHECK(steps[5].threshold > 99.9 && steps[5].threshold < 100.1);
+    CHECK_EQ(steps[6].op, HOST_SCRIPT_DUMPAT);
+    CHECK(strcmp(steps[6].name, "picture") == 0);
+    CHECK(strcmp(steps[6].text, "bright") == 0);
+    CHECK(!steps[6].at_least);
 
-    CHECK_EQ(steps[11].op, HOST_SCRIPT_DUMPAT);
-    CHECK(strcmp(steps[11].name, "command_frame") == 0);
-    CHECK(strcmp(steps[11].text, "ref_c840") == 0);
-    CHECK_EQ(steps[11].threshold, 840.0);
-    CHECK(steps[11].at_least);
+    CHECK_EQ(steps[7].op, HOST_SCRIPT_DUMPAT);
+    CHECK(strcmp(steps[7].name, "command_frame") == 0);
+    CHECK(strcmp(steps[7].text, "ref_c840") == 0);
+    CHECK_EQ(steps[7].threshold, 840.0);
+    CHECK(steps[7].at_least);
 #if defined(RECOMP_GLOBAL_SIMULATION_TURN_ADDR) && defined(RECOMP_GLOBAL_COMMAND_FRAME_ADDR)
-    // This host test binary has no mod runtime/game view linked or loaded.
+    // Counter metrics read directly from the configured guest globals.
     const uint32_t saved_turn = rd32(RECOMP_GLOBAL_SIMULATION_TURN_ADDR);
     const uint32_t saved_command = rd32(RECOMP_GLOBAL_COMMAND_FRAME_ADDR);
     wr32(RECOMP_GLOBAL_SIMULATION_TURN_ADDR, 820);
@@ -916,13 +862,13 @@ static void test_script_parsing() {
     CHECK_EQ(host_script_counter_metric("turn", rd32), 820.0);
     CHECK_EQ(host_script_counter_metric("command_frame", rd32), 839.0);
     CHECK_EQ(host_script_counter_metric("unknown", rd32), -1.0);
-    CHECK(!host_dumpat_should_fire(1, 1, host_script_counter_metric(steps[11].name, rd32),
-                                   steps[11].threshold, steps[11].at_least));
+    CHECK(!host_dumpat_should_fire(1, 1, host_script_counter_metric(steps[7].name, rd32),
+                                   steps[7].threshold, steps[7].at_least));
     // The next completed present can skip the requested command frame.
     for (uint32_t actual : {840u, 842u}) {
         wr32(RECOMP_GLOBAL_COMMAND_FRAME_ADDR, actual);
-        CHECK(host_dumpat_should_fire(1, 1, host_script_counter_metric(steps[11].name, rd32),
-                                      steps[11].threshold, steps[11].at_least));
+        CHECK(host_dumpat_should_fire(1, 1, host_script_counter_metric(steps[7].name, rd32),
+                                      steps[7].threshold, steps[7].at_least));
     }
     wr32(RECOMP_GLOBAL_SIMULATION_TURN_ADDR, 860);
     CHECK_EQ(host_script_counter_metric("turn", rd32), 860.0);
@@ -934,24 +880,11 @@ static void test_script_parsing() {
     CHECK_EQ(host_script_counter_metric("command_frame", rd32), -1.0);
 #endif
 
-    // Five malformed forms for each of the five verbs. The categories the
-    // brief names are missing operand, non-integer, unknown enum, extra token
-    // and negative. Three of the verbs have no enum of their own, so the
-    // nearest real rejection stands in its place and is named here rather than
-    // quietly dropped: for `mode` a depth DirectDraw does not have, for
-    // `probe` a colour component out of range, and for `dumpc`, which takes no
-    // number at all, a name that could not be a filename.
+    // Malformed generic display verbs fail before a run starts.
     struct {
         const char *text;
         const char *fragment;
     } bad_display[] = {
-        {"mode 640 480\n", "width, a height and a depth"},
-        {"mode 640 x 8\n", "height is a number"},
-        {"mode 640 480 7\n", "8 or 16"},
-        {"mode 640 480 24\n", "8 or 16"},
-        {"mode 640 480 32\n", "8 or 16"},
-        {"mode 640 480 8 within 5000\n", "too many words"},
-        {"mode -640 480 8\n", "width is a number"},
 
         {"guestclick 320\n", "x and y in guest pixels"},
         {"guestclick 320 14o\n", "y is a guest pixel"},
@@ -973,12 +906,6 @@ static void test_script_parsing() {
         {"dumpc aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
          "too long"},
 
-        {"landmark 41 expect\n", "id, `expect` and visible|hidden"},
-        {"landmark forty expect visible\n", "id is an entity index"},
-        {"landmark 41 expect maybe\n", "visible or hidden"},
-        {"landmark 41 expect visible within 5000 9\n", "too many words"},
-        {"landmark -1 expect visible\n", "id is an entity index"},
-
         {"dumpat turn>=100\n", "metric>=value and a name"},
         {"dumpat turn 100 name\n", "metric>value or metric>=value"},
         {"dumpat turn>=abc name\n", "needs a number after >"},
@@ -988,9 +915,7 @@ static void test_script_parsing() {
     for (const auto &b : bad_display) {
         err[0] = 0;
         CHECK_EQ(host_script_parse(b.text, steps, 64, err, sizeof err), -1);
-        // Say which line failed and what it actually said. A table of
-        // twenty-five entries that reports only "a fragment was missing" is a
-        // test that costs more to read than it saves.
+        // Include the actual diagnostic when a malformed form changes behavior.
         if (!strstr(err, b.fragment))
             printf("  malformed form not rejected as expected: %.*s -> \"%s\" "
                    "(wanted \"%s\")\n",
@@ -999,15 +924,18 @@ static void test_script_parsing() {
         CHECK(strstr(err, "line 1") != nullptr);
     }
 
-    // The clause keywords are the other half of `unknown enum`: a verb that
-    // takes `within` must not silently accept a word that is not it, or a
-    // script would read as if it had asked for a timeout it never got.
-    CHECK_EQ(
-        host_script_parse("landmark 4 expect visible until 5000\n", steps, 64, err, sizeof err),
-        -1);
-    CHECK(strstr(err, "landmark takes `within`") != nullptr);
-    CHECK_EQ(host_script_parse("landmark 4 wants visible\n", steps, 64, err, sizeof err), -1);
-    CHECK(strstr(err, "landmark takes `expect`") != nullptr);
+    // Former game-specific directives are rejected instead of silently
+    // assigning unsupported game behavior to generic smoke commands.
+    for (const char *unsupported : {"camera 1 2\n", "viewmove 1 2\n", "viewclick 1 2\n",
+                                    "watch 0 1\n", "landmark 1 expect visible\n", "simdump frame\n",
+                                    "click entity 1\n", "click world 1 2 3\n", "move entity 1\n",
+                                    "move world 1 2 3\n", "await entity_body 1 within 1000\n"}) {
+        CHECK_EQ(host_script_parse(unsupported, steps, 64, err, sizeof err), -1);
+        CHECK(strstr(err, "unsupported game-specific") != nullptr);
+    }
+    CHECK_EQ(host_script_parse("mode 800 600 16\n", steps, 64, err, sizeof err), -1);
+    CHECK(strstr(err, "unknown command") != nullptr);
+
     // And a timeout of zero is a script that means something it cannot have.
     CHECK_EQ(host_script_parse("guestclick 1 2 hold 0\n", steps, 64, err, sizeof err), -1);
     CHECK(strstr(err, "hold above zero") != nullptr);
@@ -1027,6 +955,7 @@ static void test_script_parsing() {
 // The runtime's idle wait returns as soon as input arrives rather than sitting
 // out its slice. The wait itself is AppKit and cannot run without a window;
 // the rule it turns on is this, and it is checked against the real counter.
+
 static void test_idle_wait_early_return() {
     host_input_reset();
     host_input_set_notify(nullptr);
@@ -2491,17 +2420,12 @@ static void test_audio_voice_remaining_versus_queued() {
     host_audio_offline_end();
 }
 
-// The music, which is MIDI through a SoundFont: the one the game ships when
-// it is here, else the kit's bundled General MIDI bank, which is always here.
+// MIDI playback uses the kit's bundled General MIDI bank.
 // This plays a note and renders the engine offline: no audio device is opened
 // and nothing comes out of the speakers, but what is measured is exactly what
 // would have.
 static void test_midi_soundfont() {
-    std::string bank = "original/gog/Sound/POPFIGHT.SF2";
-    if (FILE *f = fopen(bank.c_str(), "rb"))
-        fclose(f);
-    else
-        bank = host_resource("general-midi.sf2");
+    const std::string bank = host_resource("general-midi.sf2");
     CHECK(!bank.empty());
     const char *sf2 = bank.c_str();
     printf("  (the synth plays %s)\n", sf2);
@@ -6233,115 +6157,6 @@ static void test_hd_pack_and_classic_isolation(D3DRenderer *original) {
     std::filesystem::remove_all(dir);
 }
 
-static void test_terrain_material_detail(D3DRenderer *original) {
-    char dir[512];
-    snprintf(dir, sizeof dir, "%s/pop-terrain-detail-XXXXXX", os_temp_dir());
-    CHECK(os_mkdtemp(dir) == 0);
-    const auto file = std::filesystem::path(dir) / "terrain-detail.popt";
-    uint8_t header[32]{};
-    memcpy(header, "POPRGBA1", 8);
-    header[8] = header[12] = 128;
-    header[16] = 8;
-    {
-        std::ofstream out(file, std::ios::binary);
-        out.write((char *)header, 32);
-        std::vector<uint8_t> pixels(pop_hd::mip_bytes(128, 128, 8), 255);
-        out.write((const char *)pixels.data(), pixels.size());
-    }
-    // A genuinely larger authored replacement already owns its fine detail.
-    header[8] = header[12] = 0;
-    header[9] = header[13] = 1;
-    header[16] = 9;
-    header[24] = 0x56;
-    header[25] = 0x34;
-    {
-        std::ofstream out(std::filesystem::path(dir) / "0000000000003456.popt", std::ios::binary);
-        out.write((char *)header, 32);
-        const uint16_t color = 0x6c23;
-        const uint8_t rgba[] = {uint8_t(((color >> 11) & 31) * 255 / 31),
-                                uint8_t(((color >> 5) & 63) * 255 / 63),
-                                uint8_t((color & 31) * 255 / 31), 255};
-        for (uint64_t i = 0; i < pop_hd::mip_bytes(256, 256, 9) / 4; ++i)
-            out.write((const char *)rgba, 4);
-    }
-    const char *env = recomp_env("TEXTURE_PACK_DIR");
-    bool had = env;
-    std::string saved = env ? env : "";
-    os_setenv("RECOMP_TEXTURE_PACK_DIR", dir);
-    auto renderer = make_renderer();
-    CHECK(renderer != nullptr);
-    D3DRenderer::setShared(renderer);
-    for (int variant = 0; renderer && variant < 9; ++variant) {
-        renderer->discard();
-        host_d3d_reset_coherence();
-        test_hd = variant != 1;
-        test_classic = variant == 2;
-        g_t5_legacy_frame = variant == 3 ? 9988 : 0;
-        host_present_start_offscreen(128, 128);
-        Surface surface(884, 64, 64);
-        host_d3d_bind_generation(&surface.desc, 1, 9988);
-        const uint16_t color = variant == 4 ? 0x19b0 : 0x6c23; // blue water / olive land
-        std::vector<uint16_t> pixels(16 * 16, color);
-        // The sky dome is a 16x16 vertical gradient, opaque 5-6-5 like a
-        // terrain tile. Its rows are uniform; only the red rises down the
-        // tile, so the sampled green is the flat tile's and must stay so.
-        if (variant == 8)
-            for (int y = 0; y < 16; ++y)
-                for (int x = 0; x < 16; ++x)
-                    pixels[y * 16 + x] = uint16_t((color & 0x07ff) | ((y * 2) << 11));
-        HostD3DTexture t{};
-        t.handle = 992;
-        t.revision = variant + 1;
-        t.width = t.height = 16;
-        t.pitch = 32;
-        t.bpp = 16;
-        t.rmask = 0xf800;
-        t.gmask = 0x7e0;
-        t.bmask = 31;
-        t.pixels = pixels.data();
-        if (variant == 7)
-            t.content_hash = 0x3456;
-        if (variant == 6)
-            t.amask = 0x8000; // a sprite format must remain untouched
-        renderer->uploadTexture(&t);
-        Command q;
-        q.cmd.primitive_type = 5;
-        q.cmd.texture_handle = 992;
-        q.state[1] = 992;
-        q.state[21] = 1;
-        q.state[7] = q.state[14] = 1;
-        const float hi = variant == 5 ? .5f : 1.f;
-        q.tlvertex(0, 0, .5f, 0xffffffff, 0, 0);
-        q.tlvertex(64, 0, .5f, 0xffffffff, hi, 0);
-        q.tlvertex(0, 64, .5f, 0xffffffff, 0, hi);
-        q.tlvertex(64, 64, .5f, 0xffffffff, hi, hi);
-        renderer->clearFlags(3, nullptr, 0, 0xff000000, 1);
-        renderer->draw(&q.cmd, variant + 1);
-        auto rb = read_target(renderer);
-        int r, g, b, a;
-        rb.rgb(32, 32, &r, &g, &b, &a);
-        const int expected_g = ((color >> 5) & 63) * 255 / 63;
-        if (variant == 0)
-            CHECK(g > expected_g + 20);
-        else
-            CHECK_NEAR(g, expected_g, 1);
-        host_present_stop();
-        host_d3d_retire_frame(9988);
-        renderer->discard();
-    }
-    CHECK_EQ(renderer->hdTextureStats().detail_draws,
-             2); // land and water; water's shader mask is zero, the gradient is not a tile
-    CHECK(renderer->hdTextureStats().resident_bytes <= renderer->hdTextureStats().budget_bytes);
-    test_hd = test_classic = 0;
-    g_t5_legacy_frame = 0;
-    D3DRenderer::setShared(original);
-    if (had)
-        os_setenv("RECOMP_TEXTURE_PACK_DIR", saved.c_str());
-    else
-        os_unsetenv("RECOMP_TEXTURE_PACK_DIR");
-    std::filesystem::remove_all(dir);
-}
-
 static void test_native_tile_borders(D3DRenderer *renderer) {
     // Red/green opposite texture edges expose accidental wrap filtering:
     // a complete native tile must stay red at its left edge. Repeating UVs,
@@ -6720,123 +6535,6 @@ static void test_script_await_at_least() {
 // way, with the same signature as the fixed-wait flake before them.
 // Exercise the same body resolver and waiting state used by semantic gestures.
 // Missing/shadow/stale evidence must never become an injected click.
-static void test_entity_click_wait() {
-    HostEntityWait wait;
-    using Result = HostEntityWaitResult;
-    uint32_t clock = 100;
-    CHECK(wait.poll(1000, 50, 1544, 50, false) == Result::pending);
-    for (uint32_t ms = 1001; ms < 2000; ++ms)
-        CHECK(wait.poll(ms, 50, 1544, 50, false) == Result::pending);
-    CHECK(wait.last_frame == 1544); // polling is not a presented frame
-    CHECK(wait.poll(2000, 51, 1544, 49, true) == Result::pending); // stale body
-
-    HostD3DDrawSnapshot draw{};
-    draw.kind = HOST_DRAW_PRIMITIVE;
-    draw.texture_handle = 7;
-    draw.texture_revision = 2;
-    draw.screen_min_x = 200;
-    draw.screen_max_x = 220;
-    draw.screen_min_y = 210;
-    draw.screen_max_y = 220; // only a shadow at feet
-    LandmarkSpriteEvidence sprite{1546, 1815, 7, 2, true};
-    int32_t x = -1, y = -1;
-    auto body = [&] {
-        return landmark_click_point(true, 1815, sprite.frame, true, 210, 210, 640, 480, sprite,
-                                    &draw, 1, 0, 0, &x, &y);
-    };
-    CHECK(!body());
-    CHECK(!host_entity_body_ready(52, sprite.frame, 52, body())); // shadow only
-    CHECK(wait.poll(2050, 52, sprite.frame, 52, body()) == Result::pending);
-    draw.screen_min_y = 180; // a BODY arrives on a later frame
-    sprite.frame = 1547;
-    CHECK(!host_entity_body_ready(53, 0, 53, body()));            // no frame
-    CHECK(!host_entity_body_ready(53, sprite.frame, 51, body())); // stale BODY
-    CHECK(host_entity_body_ready(53, sprite.frame, 52, body()));  // preceding completed present
-    CHECK(host_entity_body_ready(53, sprite.frame, 53, body()));
-    CHECK(wait.poll(2100, 53, sprite.frame, 53, body()) == Result::ready);
-    CHECK(x == 210 && y == 195);
-    CHECK(wait.last_frame == 1547);
-    wait.finish(2100, clock);
-    CHECK(!wait.active && clock == 1200); // following 800 ms stays 800 ms
-    CHECK(2100 - clock == 1000 - 100);
-
-    // Fresh state for the next gesture; no remembered successful body.
-    CHECK(wait.poll(3000, 80, 1600, 80, false) == Result::pending);
-    CHECK(wait.poll(8950, 199, 1719, 199, false) == Result::pending);
-    CHECK(wait.poll(9000, 200, 1720, 200, false) == Result::timed_out);
-    CHECK(wait.last_frame == 1720);
-    wait.finish(9000, clock);
-    CHECK(clock == 7200 && !wait.active);
-
-    // The final allowed present can satisfy the click, but a later one cannot.
-    CHECK(wait.poll(0, 0, 1, 0, false) == Result::pending);
-    CHECK(wait.poll(6000, 120, 121, 120, true) == Result::ready);
-    wait.finish(6000, clock);
-    CHECK(wait.poll(0, 0, 1, 0, false) == Result::pending);
-    CHECK(wait.poll(6050, 121, 122, 121, true) == Result::timed_out);
-    wait.finish(6050, clock);
-    // No usable frame: fail boundedly without reporting stale data as examined.
-    CHECK(wait.poll(0, 0, 999, 99, true) == Result::pending);
-    CHECK(wait.poll(6000, 120, 999, 99, true) == Result::timed_out);
-    CHECK(wait.last_frame == 0);
-}
-
-// Synthetic per-entity attribution store, shared with the smoke resolver.
-static void test_entity_completed_present_freshness() {
-    HostEntityBodyStore store;
-    using Result = HostEntityWaitResult;
-    uint32_t completed = 2084;
-    store.record(1815, {1961, completed, 491, 184});
-    auto body = store.get(1815);
-    CHECK(body.ready(completed));
-    CHECK(body.ready(completed + 1));
-    CHECK(!body.ready(completed + 2));
-    CHECK(!body.ready(completed - 1));        // in-flight/future record
-    CHECK(!store.get(1816).ready(completed)); // another entity is not evidence
-    // A completed capture without this entity's BODY retains its own point.
-    store.record(1816, {1962, completed + 1, 300, 200});
-    store.record(1815, {}); // no BODY cannot overwrite the last attribution
-    body = store.get(1815);
-    CHECK_EQ(body.frame, 1961u);
-    CHECK_EQ(body.present, completed);
-    CHECK_EQ(body.x, 491);
-    CHECK_EQ(body.y, 184);
-    CHECK(body.ready(completed + 1));
-
-    // Assertion and both gestures consume this same record/predicate; fresh
-    // evidence must resolve immediately, including at the preceding present.
-    for (uint32_t age = 0; age <= 2; ++age) {
-        HostEntityWait wait;
-        auto result = wait.poll(100, completed + age, body.frame, body.present, true);
-        CHECK((result == Result::ready) == body.ready(completed + age));
-        CHECK(result == (age <= 1 ? Result::ready : Result::pending));
-    }
-    // Polling or an in-flight present must not consume the completed budget.
-    HostEntityWait wait;
-    body = store.get(1900);
-    CHECK(wait.poll(0, completed, body.frame, body.present, false) == Result::pending);
-    CHECK(wait.poll(50000, completed, body.frame, body.present, false) == Result::pending);
-    for (uint32_t n = 1; n < HostEntityWait::max_presents; ++n)
-        CHECK(wait.poll(50000 + n, completed + n, body.frame, body.present, false) ==
-              Result::pending);
-    completed += HostEntityWait::max_presents;
-    CHECK(wait.poll(60000, completed, body.frame, body.present, false) == Result::timed_out);
-    char diagnostic[256];
-    host_entity_body_diagnostic(diagnostic, sizeof diagnostic, 1900, completed, body, false);
-    CHECK(strcmp(diagnostic,
-                 "entity_body 1900: FAIL no fresh attributed BODY frame 0, "
-                 "last record present 0, current completed present 2204 (no record)") == 0);
-    body = store.get(1815);
-    host_entity_body_diagnostic(diagnostic, sizeof diagnostic, 1815, completed, body, false);
-    CHECK(strcmp(diagnostic, "entity_body 1815: FAIL no fresh attributed BODY frame 1961, "
-                             "last record present 2084, current completed present 2204") == 0);
-    store.record(1815, {2100, completed, 492, 185});
-    body = store.get(1815);
-    CHECK(body.ready(completed));
-    CHECK_EQ(body.x, 492);
-    CHECK_EQ(body.y, 185);
-}
-
 static void test_script_hold_frames() {
     // The case every shipped script depends on.
     CHECK_EQ(host_script_hold_frames(2000, 50), 40u);
@@ -7384,70 +7082,10 @@ static void test_drain_wanted() {
     st.guestclick_reached = 1;
     CHECK(host_script_drain_wanted(&st));
 
-    // A recorded path being replayed is the script while it lasts, and an
-    // await behind it does not suppress it.
-    fresh();
-    st.sub_active = 1;
-    st.sub_step_due = 1;
-    st.await_started = 1;
-    CHECK(host_script_drain_wanted(&st));
-    st.sub_step_due = 0;
-    CHECK(!host_script_drain_wanted(&st));
-
     CHECK(!host_script_drain_wanted(nullptr));
 }
 
-#include "../landmark.h"
 #include <algorithm>
-static void test_landmark_hidden_evidence() {
-    // Simulate the arena disappearing between capture and the landmark
-    // executor. The exact JSON consumed by Gate C must retain the own draw.
-    HostD3DDrawSnapshot draw{};
-    draw.texture_handle = 65673;
-    draw.texture_revision = 21979;
-    draw.seq = 376;
-    draw.screen_min_x = 190;
-    draw.screen_min_y = 220;
-    draw.screen_max_x = 210;
-    draw.screen_max_y = 250;
-    LandmarkDrawEvidence record(1828, 1904, draw);
-    draw = {};
-    char path[512];
-    snprintf(path, sizeof path, "%s/pop-landmark-evidence.XXXXXX", os_temp_dir());
-    int fd = os_mkstemp(path);
-    CHECK(fd >= 0);
-    FILE *file = fd >= 0 ? fdopen(fd, "w+") : nullptr;
-    CHECK(file != nullptr);
-    if (file) {
-        record.write(file);
-        rewind(file);
-        char json[512]{};
-        CHECK(fgets(json, sizeof json, file) != nullptr);
-        CHECK(strcmp(json, "{\"entity_id\":1828,\"frame\":1904,\"handle\":65673,\"revision\":21979,"
-                           "\"seq\":376,\"bounds\":[190,220,210,250]}") == 0);
-        fclose(file);
-    } else if (fd >= 0)
-        os_fd_close(fd);
-    if (fd >= 0)
-        os_unlink(path);
-    LandmarkSpriteEvidence no_sprite{31, 1815, 0, 0, true};
-    CHECK(landmark_visibility(true, 1815, 31, true, -80.5f, 230.375f, 540, 480, no_sprite, nullptr,
-                              0) == LandmarkVisibility::hidden);
-    CHECK(landmark_visibility(false, 1815, 31, true, -80.5f, 230.375f, 540, 480, no_sprite, nullptr,
-                              0) == LandmarkVisibility::unavailable);
-    CHECK(landmark_visibility(true, 1815, 31, false, -80.5f, 230.375f, 540, 480, no_sprite, nullptr,
-                              0) == LandmarkVisibility::unavailable);
-    CHECK(landmark_visibility(true, 1815, 31, true, 75.5f, 230.375f, 852, 480, no_sprite, nullptr,
-                              0) == LandmarkVisibility::not_drawn);
-    HostScriptStep steps[4]{};
-    char error[256]{};
-    CHECK_EQ(
-        host_script_parse("await turn>=861 within 120000\nlandmark 1815 expect hidden within 0\n",
-                          steps, 4, error, sizeof error),
-        2);
-    CHECK_EQ(steps[1].timeout_ms, 0u);
-}
-
 static void test_probe_and_dumpat_decisions() {
     // A 4x2 frame: red, green, blue, white on the top row; black beneath.
     const uint8_t frame[4 * 2 * 3] = {
@@ -7518,33 +7156,19 @@ static void test_probe_and_dumpat_decisions() {
     CHECK(!host_dumpat_should_fire(1, 1, 99.0, 100.0, 1));
 }
 
-// Exercise the real host_frame_seal factory with a CPU presenter: no Metal,
-// guest boot, window, or app. Only guest memory/JSON contents are fixture data.
+// Exercise the production host_frame_seal capture factory with a CPU presenter.
+// Generic synthetic capture metadata for dumpat tests. This contains no guest
+// object layouts or captured game memory.
 static HostDumpAt dumpat_request;
-static HostDumpAtSample dumpat_sample{true, 0,     821, 839,
-                                      1969, 99450, 0,   "pinned start=100 step=50"};
+static HostDumpAtSample dumpat_sample{true, 0, 821, 839, 1969, 99450, 0, "pinned"};
 static std::string dumpat_dir;
 static unsigned dumpat_factory_calls = 0;
-static bool dumpat_fixture_write(const char *name) {
-    const uint8_t entities[] = {1, 2, 3, 4}, tribes[] = {5, 6, 7};
-    return host_write_simdump(
-        dumpat_dir.c_str(), name,
-        {{"entities", entities, sizeof entities},
-         {"tribes", tribes, sizeof tribes},
-         {"turn", &dumpat_sample.turn, 4},
-         {"command", &dumpat_sample.command_frame, 4}},
-        [](FILE *f) {
-            return fprintf(f, "{\"turn\":%u,\"command_frame\":%u,\"entities\":[]}\n",
-                           dumpat_sample.turn, dumpat_sample.command_frame) > 0;
-        });
-}
 static bool dumpat_fixture_fire(HostScreenClass cls) {
     dumpat_sample.gameplay = cls == HOST_SCREEN_GAMEPLAY;
     dumpat_sample.value =
         dumpat_request.metric == "turn" ? dumpat_sample.turn : dumpat_sample.command_frame;
     dumpat_sample.frame_id = host_frame_current().id;
-    return host_dumpat_fire(dumpat_request, dumpat_sample, dumpat_dir.c_str(), true,
-                            dumpat_fixture_write);
+    return host_dumpat_fire(dumpat_request, dumpat_sample, dumpat_dir.c_str());
 }
 static HostFrameCapture dumpat_fixture_factory(HostScreenClass cls) {
     ++dumpat_factory_calls;
@@ -7556,11 +7180,12 @@ static std::string dumpat_read(const std::string &path) {
     std::ifstream f(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
 }
-// A late turn await passes without a present. The explicit fired await must
-// keep the second request unarmed until the first has actually been captured.
-static void test_reference_dump_serialization() {
+
+// Turn thresholds only advance the script. Capturing requires an eligible
+// completed present, and the evidence records the frame sampled at that edge.
+static void test_dumpat_provenance_await_sequence() {
     char tmp[512];
-    snprintf(tmp, sizeof tmp, "%s/pop-reference-dump-test-XXXXXX", os_temp_dir());
+    snprintf(tmp, sizeof tmp, "%s/dumpat-provenance-XXXXXX", os_temp_dir());
     const char *dir = os_mkdtemp(tmp) == 0 ? tmp : nullptr;
     CHECK(dir != nullptr);
     if (!dir)
@@ -7593,7 +7218,7 @@ static void test_reference_dump_serialization() {
         CHECK_EQ(next, initial < 820 ? 1 : 2);
         CHECK(request.armed && request.name == "ref_t820");
         sample.turn = initial < 820 ? 820 : initial;
-        tick(); // the turn passes, but no capture has fired yet
+        tick();
         CHECK_EQ(next, 2);
         CHECK_EQ(request.fired, 0u);
         for (int n = 0; n < 20; ++n)
@@ -7605,7 +7230,7 @@ static void test_reference_dump_serialization() {
             sample.command_frame = sample.turn + 19;
             ++sample.present;
             sample.guest_ms += 50;
-            return host_dumpat_fire(request, sample, dir, false, [](const char *) { return true; });
+            return host_dumpat_fire(request, sample, dir);
         };
         CHECK(present());
         CHECK_EQ(request.fired, 1u);
@@ -7629,9 +7254,11 @@ static void test_reference_dump_serialization() {
     std::filesystem::remove(dir);
 }
 
+// Exercise the production capture-factory edge with a CPU presenter: no GPU,
+// guest boot, window, audio, or game-memory snapshots are involved.
 static void test_dumpat_present_and_seal() {
     char tmp[512];
-    snprintf(tmp, sizeof tmp, "%s/pop-dumpat-test-XXXXXX", os_temp_dir());
+    snprintf(tmp, sizeof tmp, "%s/dumpat-seal-XXXXXX", os_temp_dir());
     const char *dir = os_mkdtemp(tmp) == 0 ? tmp : nullptr;
     CHECK(dir != nullptr);
     if (!dir)
@@ -7639,27 +7266,31 @@ static void test_dumpat_present_and_seal() {
     dumpat_dir = dir;
     std::string reference;
     for (bool seal : {false, true}) {
-        host_present_test_begin(true, true); // offscreen: capture factory active
+        std::filesystem::remove(dumpat_dir + "/smoke_anchor_provenance.txt");
+        host_present_test_begin(true, true);
         host_present_set_capture_factory(dumpat_fixture_factory);
         dumpat_factory_calls = 0;
         dumpat_request = {};
+        dumpat_sample = {true, 0, 821, 839, 1969, 99450, 0, "pinned"};
         test_frame_builder frame;
         g_present_test_current = frame.frame;
         auto present = [&](HostScreenClass cls, uint32_t command, uint32_t turn) {
             frame.screen_class = cls;
             dumpat_sample.command_frame = command;
             dumpat_sample.turn = turn;
+            ++dumpat_sample.present;
+            dumpat_sample.guest_ms += 50;
             if (seal) {
                 host_present_acquire_target(4, 4, 4, 4);
-                host_frame_seal(); // actual production factory entry, not test_seal
+                host_frame_seal();
                 host_present_tick_for_test(0);
             } else
                 dumpat_fixture_fire(cls);
         };
-        dumpat_request.arm("command_frame", "gate_c_t1", 840, true);
+        dumpat_request.arm("command_frame", "anchor", 840, true);
         present(HOST_SCREEN_GAMEPLAY, 839, 821);
         CHECK(dumpat_request.armed);
-        CHECK(!std::filesystem::exists(dumpat_dir + "/gate_c_t1.command.bin"));
+        CHECK(!std::filesystem::exists(dumpat_dir + "/smoke_anchor_provenance.txt"));
         present(HOST_SCREEN_MENU, 840, 821);
         CHECK(dumpat_request.armed);
         present(HOST_SCREEN_GAMEPLAY, 840, 821);
@@ -7667,49 +7298,33 @@ static void test_dumpat_present_and_seal() {
         CHECK_EQ(dumpat_request.fired, 1u);
         CHECK_EQ(dumpat_request.unfired(), 0u);
         CHECK_EQ(dumpat_request.write_failures, 0u);
-        CHECK_EQ(dumpat_read(dumpat_dir + "/gate_c_t1.entities.bin").size(), 4u);
-        CHECK_EQ(dumpat_read(dumpat_dir + "/gate_c_t1.tribes.bin").size(), 3u);
-        for (const auto &counter : {std::pair{"turn", 821u}, std::pair{"command", 840u}}) {
-            auto data = dumpat_read(dumpat_dir + "/gate_c_t1." + counter.first + ".bin");
-            CHECK_EQ(data.size(), 4u);
-            uint32_t value = 0;
-            if (data.size() == 4)
-                memcpy(&value, data.data(), 4);
-            CHECK_EQ(value, counter.second);
-        }
-        CHECK(dumpat_read(dumpat_dir + "/gate_c_t1.entities.json").find("\"command_frame\":840") !=
-              std::string::npos);
-        auto provenance = dumpat_read(dumpat_dir + "/smoke_gate_c_t1_provenance.txt");
-        CHECK(provenance.find("armed_on command_frame>=840\nturn 821\ncommand_frame 840\npresent "
-                              "1969\nguest_ms 99450\nclock pinned start=100 step=50\n") !=
-              std::string::npos);
-        // The fixture frame ID differs between iterations; all other evidence is identical.
-        auto common = provenance.substr(0, provenance.find("frame_id "));
+        auto provenance = dumpat_read(dumpat_dir + "/smoke_anchor_provenance.txt");
+        CHECK(provenance.find("armed_on command_frame>=840\n") != std::string::npos);
+        CHECK(provenance.find("turn 821\ncommand_frame 840\n") != std::string::npos);
+        CHECK(provenance.find("clock pinned\n") != std::string::npos);
+        const auto common = provenance.substr(0, provenance.find("frame_id "));
         if (!seal)
             reference = common;
         else
             CHECK(common == reference);
         present(HOST_SCREEN_GAMEPLAY, 845, 825);
         CHECK_EQ(dumpat_request.fired, 1u);
-        CHECK(dumpat_read(dumpat_dir + "/smoke_gate_c_t1_provenance.txt") == provenance);
+        CHECK(dumpat_read(dumpat_dir + "/smoke_anchor_provenance.txt") == provenance);
         dumpat_request.arm("turn", "turn_anchor", 830, true);
         present(HOST_SCREEN_GAMEPLAY, 850, 829);
         CHECK(dumpat_request.armed);
-        present(HOST_SCREEN_GAMEPLAY, 853, 832); // first present overshoots anchor
+        present(HOST_SCREEN_GAMEPLAY, 853, 832);
         CHECK_EQ(dumpat_request.fired, 2u);
         CHECK(dumpat_read(dumpat_dir + "/smoke_turn_anchor_provenance.txt")
                   .find("turn 832\ncommand_frame 853\n") != std::string::npos);
         dumpat_request.arm("command_frame", "never", 900, true);
         present(HOST_SCREEN_GAMEPLAY, 899, 880);
         present(HOST_SCREEN_MENU, 901, 882);
-        CHECK_EQ(dumpat_request.unfired(), 1u); // production end-of-run failure tally
-        CHECK(!std::filesystem::exists(dumpat_dir + "/never.command.bin"));
+        CHECK_EQ(dumpat_request.unfired(), 1u);
         dumpat_request.arm("turn", "replacement", 999, true);
-        CHECK_EQ(dumpat_request.unfired(), 2u); // replaced plus still armed
-        CHECK_EQ(dumpat_request.unfired(), 2u); // tally must be idempotent
+        CHECK_EQ(dumpat_request.unfired(), 2u);
         if (seal)
             CHECK_EQ(dumpat_factory_calls, 8u);
-        // Evidence write failure must also fail a request that did fire.
         const auto saved_dir = dumpat_dir;
         dumpat_dir += "/missing";
         present(HOST_SCREEN_GAMEPLAY, 1100, 1000);
@@ -7717,9 +7332,9 @@ static void test_dumpat_present_and_seal() {
         dumpat_dir = saved_dir;
         host_present_stop();
         g_present_test_current = {};
-        for (const auto &entry : std::filesystem::directory_iterator(dumpat_dir))
-            std::filesystem::remove(entry.path());
     }
+    for (const auto &entry : std::filesystem::directory_iterator(dumpat_dir))
+        std::filesystem::remove(entry.path());
     std::filesystem::remove(dumpat_dir);
 }
 
@@ -9965,13 +9580,9 @@ static void test_d3d9_gpu_renderer() {
 
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--dumpat-only")) {
+        test_dumpat_provenance_await_sequence();
         test_dumpat_present_and_seal();
         printf("dumpat integration: %d checks, %d failures\n", g_checks, g_failures);
-        return g_failures ? 1 : 0;
-    }
-    if (argc == 2 && !strcmp(argv[1], "--landmark-only")) {
-        test_landmark_hidden_evidence();
-        printf("landmark: %d checks, %d failures\n", g_checks, g_failures);
         return g_failures ? 1 : 0;
     }
     if (argc == 2 && !strcmp(argv[1], "--display-only")) {
@@ -10033,9 +9644,8 @@ int main(int argc, char **argv) {
     // services. The default suite still runs every test and reports failures.
     if (argc == 2 && !strcmp(argv[1], "--script-only")) {
         test_script_parsing();
-        test_reference_dump_serialization();
-        test_entity_click_wait();
-        test_entity_completed_present_freshness();
+        test_dumpat_provenance_await_sequence();
+        test_dumpat_present_and_seal();
         test_drain_wanted();
         test_present_suspend_flag();
         printf("script: %d checks, %d failures\n", g_checks, g_failures);
@@ -10082,11 +9692,9 @@ int main(int argc, char **argv) {
         {"input gate", test_input_gate},
         {"input gate modifiers", test_input_gate_modifiers},
         {"guest click injection", test_guest_click_injection},
-        {"landmark hidden evidence", test_landmark_hidden_evidence},
         {"probe and dumpat", test_probe_and_dumpat_decisions},
+        {"dumpat provenance sequence", test_dumpat_provenance_await_sequence},
         {"dumpat present and seal", test_dumpat_present_and_seal},
-        {"reference dump serialization", test_reference_dump_serialization},
-        {"entity completed present freshness", test_entity_completed_present_freshness},
         {"drain wanted", test_drain_wanted},
         {"run unfinished", test_run_unfinished},
         {"page draws on a copy", test_page_draws_on_a_copy},
@@ -10129,7 +9737,6 @@ int main(int argc, char **argv) {
         {"stats line format", test_stats_line_format},
         {"await at least", test_script_await_at_least},
         {"await hold in frames", test_script_hold_frames},
-        {"entity click waits", test_entity_click_wait},
         {"a click is not applied in one turn", test_input_batch_limit},
         {"input hold in frames", test_script_input_hold_frames},
     };
@@ -10196,7 +9803,6 @@ int main(int argc, char **argv) {
             {"blend and alpha test", test_render_blend_and_alpha_test},
             {"fog", test_render_fog},
             {"HD pack / Classic isolation", test_hd_pack_and_classic_isolation},
-            {"terrain material detail", test_terrain_material_detail},
             {"textures", test_render_texture},
             {"32-bit texture + alpha", test_render_rgba32},
             {"texture versioning", test_render_texture_versioning},

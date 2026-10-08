@@ -194,13 +194,6 @@ def build(args):
     manifest = dict(version=1, max_dimension=4096, rgba8=True, generator="texture_pack.py",
                     note="Original art enlarged offline; matching PNGs restore pre-RGB565 colors. No invented detail.",
                     textures=records)
-    # Rebuilding captured replacements must not disconnect independently
-    # compiled material detail from the packaged manifest.
-    old_manifest = output / "manifest.json"
-    if old_manifest.exists():
-        detail = json.loads(old_manifest.read_text()).get("terrain_detail")
-        if detail:
-            manifest["terrain_detail"] = detail
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps(dict(textures=len(records), restored=sum(r["kind"] == "restored-full-color" for r in records),
                           bytes=sum(r["bytes"] for r in records), output=str(output)), indent=2))

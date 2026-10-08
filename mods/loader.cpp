@@ -21,8 +21,6 @@
 #include "builtin_mods.h"
 #include "../runtime/layout.h"
 #include "controls_settings.h"
-#include "options_menu.h"
-#include "sprite_view.h"
 #include "manifest_types.h"
 #include "roots.h"
 // sched_guest_threads_stopped: a plugin may not be unloaded while a guest
@@ -230,18 +228,6 @@ const char *guarded_dir(const PopModApi *api) {
     return fn ? fn(api) : "";
 }
 
-uint32_t guarded_count(const PopModApi *api) {
-    uint32_t (*fn)(const PopModApi *) = nullptr;
-    {
-        GuardScope in_flight;
-        ModContext *c = context_of(api);
-        if (!c || c->revoked.load(std::memory_order_acquire))
-            return 0;
-        fn = c->live.entity_count;
-    }
-    return fn ? fn(api) : 0;
-}
-
 uint32_t guarded_elements(const PopModApi *api, uint64_t *ids, uint32_t max) {
     ApiFn<&PopModApi::ui_elements> fn = nullptr;
     {
@@ -337,9 +323,6 @@ void build_api(ModContext &c) {
     c.api.guest_write_u32 = guarded<&PopModApi::guest_write_u32>;
     c.api.guest_alloc = guarded<&PopModApi::guest_alloc>;
     c.api.guest_free = guarded<&PopModApi::guest_free>;
-    c.api.entity_slot = guarded<&PopModApi::entity_slot>;
-    c.api.entity = guarded<&PopModApi::entity>;
-    c.api.tribe = guarded<&PopModApi::tribe>;
     c.api.on_frame = guarded<&PopModApi::on_frame>;
     c.api.on_turn = guarded<&PopModApi::on_turn>;
     c.api.on_level_load = guarded<&PopModApi::on_level_load>;
@@ -353,7 +336,6 @@ void build_api(ModContext &c) {
     c.api.overlay_push = guarded<&PopModApi::overlay_push>;
     c.api.open_settings_page = guarded<&PopModApi::open_settings_page>;
     c.api.mod_dir = guarded_dir;
-    c.api.entity_count = guarded_count;
     c.api.set_anchor = guarded<&PopModApi::set_anchor>;
     c.api.clear_anchor = guarded<&PopModApi::clear_anchor>;
     c.api.ui_elements = guarded_elements;
@@ -587,8 +569,6 @@ bool mods_load_all() {
         return false;
     }
     // Runtime observation is always on, including RECOMP_NO_MODS.
-    if (!mods_sprite_hooks_init())
-        return false;
     if (recomp_env("NO_MODS"))
         return true;
     // Every module asks mods_api_for; from here on it is this loader that
@@ -603,12 +583,6 @@ bool mods_load_all() {
         return nullptr;
     });
     if (!mods_events_init())
-        return false;
-    if (!mods_animation_init())
-        return false;
-    if (!mods_game_settings_init())
-        return false;
-    if (!mods_options_init())
         return false;
     // The settings page is NOT armed here. Arming a keyboard handler for a
     // page the host may never draw is the host's decision, not the loader's,
@@ -877,7 +851,6 @@ void shutdown_now() {
     // The runtime's own registrations go last, so nothing is left believing it
     // has hooks in a registry that is about to be gone.
     mods_events_reset();
-    mods_animation_reset();
     mods_hooks_remove_all(MODS_OWNER_RUNTIME);
     mods_host_services_remove_all(MODS_OWNER_RUNTIME);
     mods_lua_shutdown();

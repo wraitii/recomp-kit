@@ -1,10 +1,12 @@
-/* entry_hook.c - hooks the process entry symbol during pop_mod_init.
+/* entry_hook.c - installs a hook during pop_mod_init on the first eligible
+ * symbol in the test's symbol catalog.
  *
  * The point of this fixture is timing, not behaviour: the hook is installed
  * while the loader is running, which is before any guest thread exists, so it
  * is queued rather than applied. If the loader does not publish the queue
  * before the entry point is called, this counter stays at zero for ever. */
 #include "pop_mod_api.h"
+#include "hook_first_entry.h"
 
 POP_MOD_DECLARE_ABI();
 
@@ -24,8 +26,7 @@ static void before(const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *inv
 
 PopModStatus pop_mod_init(const PopModApi *api) {
     uint32_t addr = 0, id = 0;
-    if (api->symbol(api, "entry", &addr) != POP_OK)
-        return POP_E_NOSYMBOL;
-    g_entry_hook_install_status = api->hook_install(api, addr, before, POP_HOOK_BEFORE, 0, &id);
+    g_entry_hook_install_status =
+        fixture_hook_first_entry(api, before, POP_HOOK_BEFORE, &addr, &id);
     return (PopModStatus)g_entry_hook_install_status;
 }

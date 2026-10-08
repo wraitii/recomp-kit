@@ -232,13 +232,8 @@ if(TARGET recomp_gen)
     LIBS ${POP_CORE_LIBS}
     FRAMEWORKS ${FW_FOUNDATION} ${FW_METAL})
   pop_link_sdl(pop_smoke)
-  # Each target is optional on its own: a game can ship core mods without a
-  # smoke probe, and depending on one that does not exist fails generation.
   if(TARGET core_mods)
     add_dependencies(pop_smoke core_mods)
-  endif()
-  if(TARGET smoke_probe)
-    add_dependencies(pop_smoke smoke_probe)
   endif()
 
   endif()
@@ -274,7 +269,6 @@ if(TARGET recomp_gen)
     set(web_resources ${POP_OUT}/web-resources)
     file(REMOVE_RECURSE ${web_resources})
     file(MAKE_DIRECTORY ${web_resources})
-    file(COPY ${POP_ROOT}/tools/recomp/baseline/classic-modes.json DESTINATION ${web_resources})
     if(EXISTS ${POP_BUILD_ROOT}/recomp/symbols.json)
       file(COPY ${POP_BUILD_ROOT}/recomp/symbols.json DESTINATION ${web_resources})
     endif()
@@ -305,16 +299,6 @@ if(TARGET recomp_gen)
     endif()
   endif()
 
-  if(APPLE AND NOT IOS AND NOT ANDROID AND EXISTS ${RECOMP_GAME_DIR}/mods/examples/luawalk/main.lua) # Objective-C++ source; a desktop test
-    # Real loader, hooks and DirectDraw seal/service with fake GPU acks.
-    pop_host(present_events_tests GEN UI_LAYER
-      SOURCES ${POP_ROOT}/mods/tests/present_events_tests.mm
-              ${HOST}/page_overlay.cpp ${POP_PRESENT_SOURCES} ${HOST}/input.cpp ${HOST}/input_gate.cpp
-      LIBS recomp_platform recomp_runtime_testing recomp_snapshot recomp_dx recomp_mods_testing lua gpu_backend
-      FRAMEWORKS ${FW_FOUNDATION} ${FW_METAL})
-    add_test(NAME present_events_tests COMMAND present_events_tests ${POP_BUILD_ROOT}/.. WORKING_DIRECTORY ${POP_ROOT})
-    set_tests_properties(present_events_tests PROPERTIES LABELS mods ENVIRONMENT RECOMP_GAME_DIR=${RECOMP_GAME_DIR})
-  endif()
 endif()
 
 # Host tests: offscreen GPU work and the mixer rendered offline, no window and

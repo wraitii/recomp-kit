@@ -82,16 +82,15 @@ requests for the guest thread rather than directly executing guest functions.
 5. `host/compositor.cpp` combines world, UI and overlays for presentation.
 6. Completion acknowledgements release resources and update frame-pacing samples.
 
-Classic renders at the selected game resolution and aspect-fits the image.
-Enhanced can render the world at drawable resolution with separately scaled UI.
-Wide view expands the world only when the drawable is wider than the selected
-game canvas. The game's own docs (populous-recomp's `docs/DISPLAY.md`) describe the visible behavior.
+The Classic profile aspect-fits the selected game resolution. Enhanced can
+render the world at drawable resolution with separately scaled UI. Wide view
+expands the world only when the drawable is wider than the selected game canvas.
+Each game repository documents which rendering profiles its build supports.
 
 ## Timing, input and settings
 
-The render limit and animation clock are separate from the simulation clock.
-Increasing the presentation limit must not advance game logic or animations faster.
-`mods/animation_timing.cpp` redirects only reviewed visual clock reads.
+The presentation limit is separate from simulation scheduling. Changing it must
+not change the scheduler's guest-time accounting.
 
 `host/input_gate.cpp` maps window coordinates through the published frame layout,
 corrects the original relative cursor, and handles edge scrolling and focus.
@@ -102,9 +101,10 @@ mouse (or, in `native` mode, into the DirectInput joystick and XInput devices
 in `dx/`), the overlay that draws it and the on-device editor. Everything but
 the overlay and the SDL glue is SDL-free and unit-tested in `controls_tests`.
 See `docs/superpowers/specs/2026-09-17-touch-controls-design.md`.
-`mods/options_menu.cpp` extends the original Options page and queues changes at
-guest-safe boundaries. `mods/game_settings.cpp` persists original graphics choices;
-`mods/settings.cpp` atomically persists host/mod settings in the selected profile.
+`mods/display_settings.cpp` validates host display choices and applies rendering
+and projection changes at the frame boundary. `mods/settings.cpp` atomically
+persists host and mod settings in the selected profile; each game's own menu can
+open the shared settings page through the mod API.
 
 ## Discovery, and code a build does not carry
 

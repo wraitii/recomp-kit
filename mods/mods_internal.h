@@ -29,10 +29,6 @@
 extern "C" {
 
 uint32_t mods_hook_ancestor_stack(uint32_t addr);
-bool mods_animation_init();
-void mods_animation_reset();
-bool mods_game_settings_init();
-void mods_game_settings_reset();
 #ifdef POPM_TESTING
 uint64_t mods_view_test_push_count();
 #endif
@@ -41,7 +37,7 @@ uint64_t mods_view_test_push_count();
 PopModStatus mods_hook_install(uint32_t owner, uint32_t addr, PopHookFn fn, int32_t mode,
                                void *user, uint32_t *out_id);
 PopModStatus mods_hook_install_ex(uint32_t owner, uint32_t addr, uint32_t return_pc, PopHookFn fn,
-                                  int32_t mode, uint32_t flags, void *user, uint32_t *out_id);
+                                  int32_t mode, void *user, uint32_t *out_id);
 PopModStatus mods_hook_install_at_callsite(uint32_t owner, uint32_t addr, uint32_t return_pc,
                                            PopHookFn fn, int32_t mode, void *user,
                                            uint32_t *out_id);
@@ -79,8 +75,8 @@ void mods_registry_pump_preentry(void);
 // thread, or "". Never allocates and never formats.
 const char *mods_active_callback_desc(void);
 void mods_hooks_unwind_to_esp(uint32_t esp);
-// How deep this thread is in hook invocations and in view snapshots; used by
-// the unwind tests and by the view layer to restore an outer scope exactly.
+// How deep this thread is in hook invocations and callback scopes; unwinds
+// restore an outer scope exactly.
 uint32_t mods_hook_depth(void);
 // Attribution shared by every callback kind - hooks, events, input, providers.
 // mods_intern_desc returns a pointer that is stable for the life of the
@@ -124,8 +120,11 @@ bool mods_overlay_sealed(void);
 uint32_t mods_overlay_layer_count(void);
 void mods_fill_overlay_api(PopModApi *api);
 
-// ---- events, game view, input (T8) ---------------------------------------
+// ---- events, callback scopes, input (T8) ---------------------------------
 bool mods_events_init(void);
+#ifdef POPM_TESTING
+void mods_events_test_fire(int32_t which, int32_t phase);
+#endif
 void mods_events_remove_all(uint32_t owner);
 // Drops every subscription AND the runtime's own installed event hooks, so a
 // suite or a shutdown starts from a registry that holds nothing.
@@ -138,23 +137,15 @@ PopModStatus mods_on_key(uint32_t owner, PopKeyFn fn, void *u, uint32_t *id);
 PopModStatus mods_on_mouse(uint32_t owner, PopMouseFn fn, void *u, uint32_t *id);
 void mods_fill_events_api(PopModApi *api);
 
-// One snapshot scope per callback, nested per guest thread.
+// One callback scope per invocation, nested per guest thread.
 void mods_view_push(void);
-void mods_view_push_disabled(void);
 void mods_view_pop(void);
 uint32_t mods_view_depth(void);
-// Drops the snapshots above `depth` on this thread and keeps the outer ones.
+// Drops the scopes above `depth` on this thread and keeps the outer ones.
 void mods_view_truncate(uint32_t depth);
-// Drops every snapshot on this thread; called when an unwind abandons frames.
+// Drops every scope on this thread; called when an unwind abandons frames.
 void mods_view_reset(void);
 bool mods_view_active(void);
-uint32_t mods_entity_count(void);
-PopModStatus mods_entity_slot(uint32_t nth, uint32_t *out_slot);
-PopModStatus mods_entity(uint32_t slot, PopEntityView *out);
-PopModStatus mods_tribe(uint32_t i, PopTribeView *out);
-bool mods_game_paused(void);
-uint32_t mods_simulation_turn(void);
-uint32_t mods_command_frame(void);
 
 bool mods_input_key(uint8_t dik, uint8_t vk, bool down);
 bool mods_input_button(int button, bool down, int32_t x, int32_t y);
@@ -219,7 +210,6 @@ void mods_fill_host_api(PopModApi *api);
 
 void mods_page_init(void);
 PopModStatus mods_page_open(const char *mod_id);
-void mods_options_request(void);
 void mods_page_close(void);
 bool mods_page_visible(void);
 uint32_t mods_page_cursor(void);
@@ -284,10 +274,6 @@ const char *mods_lua_eval(uint32_t owner, const char *chunk);
 // mods/lua/bindings.cpp, and implemented in terms of the API's own
 // symbol lookup and bounds-checked reads, so that every guest byte a Lua
 // binding can reach goes through the same check and there is no second path.
-#define MODS_PINNED_PAUSED 0
-#define MODS_PINNED_SIMULATION_TURN 1
-#define MODS_PINNED_COMMAND_FRAME 2
-PopModStatus mods_lua_read_pinned(const PopModApi *api, int32_t which, int64_t *out);
 // Lifecycle step 2: the Lua runtime's own init, ordered before every user mod.
 bool mods_lua_core_init(void);
 void mods_lua_drop_mod(uint32_t owner);

@@ -1,5 +1,4 @@
 #include "display_settings.h"
-#include "sprite_view.h"
 // hooks.cpp - the mutable dispatch layer.
 //
 // Translated code is immutable. Every generated call site reads
@@ -20,7 +19,6 @@
 // a scheduler checkpoint, because the host has no baton and no right to touch
 // a table a guest thread is dispatching through.
 #include "mods_internal.h"
-#include "options_menu.h"
 #include "../runtime/mods_seam.h"
 #include "../runtime/imports.h"
 #include "../runtime/win32.h"
@@ -38,7 +36,6 @@ namespace {
 
 struct Hook {
     uint32_t id = 0, owner = 0, order = 0, seq = 0, addr = 0;
-    uint32_t flags = 0;
     uint32_t return_pc = 0; // zero is the unfiltered API
     int32_t mode = POP_HOOK_BEFORE;
     PopHookFn fn = nullptr;
@@ -115,7 +112,6 @@ struct HookRef {
     uint32_t owner;
     uint32_t bound;
     const char *desc;
-    uint32_t flags;
 };
 
 struct PopHookInvocation {
@@ -135,7 +131,7 @@ struct PopHookInvocation {
     // in run_one is not enough on its own.
     const char *active_desc;
     uint32_t phase;
-    uint32_t view_depth; // snapshots that existed before this invocation
+    uint32_t view_depth; // callback scopes that existed before this invocation
     uint8_t base_ran, ret_done;
 };
 
@@ -323,18 +319,14 @@ void run_one(PopHookInvocation *inv, const HookRef &h, pop_cpu_v1 *cpu) {
     const char *prev_in_frame = inv->active_desc;
     inv->active_desc = h.desc;
     inv->cur_bound = h.bound; // already passed through transfer_bound
-    // One immutable game-view snapshot per callback, nested: a hook that calls
-    // the original, which runs a hook of its own, gets its own view back when
-    // the inner one returns.
+    // Track each callback scope so nested calls and guest unwinds restore the
+    // exact surviving outer scope.
     uint32_t views_before = mods_view_depth();
-    if (h.flags & POP_HOOK_NO_GAME_VIEW)
-        mods_view_push_disabled();
-    else
-        mods_view_push();
+    mods_view_push();
     h.fn(mods_api_for(h.owner), cpu, inv, h.user);
     // Restore to a DEPTH, never an unconditional pop. A callback that unwound
-    // past its own frame has already had its views truncated by the unwind, and
-    // popping again would take a snapshot belonging to an outer invocation that
+    // past its own frame has already had its scopes truncated by the unwind, and
+    // popping again would remove a scope belonging to an outer invocation that
     // is still using it.
     if (mods_view_depth() > views_before)
         mods_view_truncate(views_before);
@@ -355,7 +347,7 @@ void copy_chain(const std::vector<Hook> &src, HookRef *dst, uint32_t *n, uint32_
             continue;
         if (*n >= MODS_MAX_CHAIN)
             break;
-        dst[*n] = {h.fn, h.user, h.owner, transfer_bound(cpu_bound_for(h.owner)), h.desc, h.flags};
+        dst[*n] = {h.fn, h.user, h.owner, transfer_bound(cpu_bound_for(h.owner)), h.desc};
         ++*n;
     }
 }
@@ -712,9 +704,6 @@ bool erase_id(std::vector<Hook> &v, uint32_t id) {
 
 namespace {
 void apply_reset_tables() {
-    // Native menu records belong to guest memory. Restore/free them only
-    // where a queued reset has acquired the guest baton too.
-    mods_options_reset();
     for (size_t i = 0; i < entries().size(); ++i) {
         entries()[i] = Entry();
         if (i < (size_t)recomp_func_count)
@@ -730,12 +719,10 @@ void apply_reset_tables() {
 // Validate and register a hook owned by one mod at a recognized function/call site.
 // Keep registration under the scheduler registry lock so publication is atomic to dispatch.
 static PopModStatus install_hook(uint32_t owner, uint32_t addr, uint32_t return_pc, PopHookFn fn,
-                                 int32_t mode, uint32_t flags, void *user, uint32_t *out_id) {
+                                 int32_t mode, void *user, uint32_t *out_id) {
     if (!fn || !out_id)
         return POP_E_INVAL;
     *out_id = 0;
-    if (flags & ~POP_HOOK_NO_GAME_VIEW)
-        return POP_E_INVAL;
     if (recomp_index_of(addr) < 0)
         return POP_E_NOSYMBOL;
     // Being in the dispatch table is not enough: only a listed function start
@@ -751,13 +738,12 @@ static PopModStatus install_hook(uint32_t owner, uint32_t addr, uint32_t return_
     h.order = order_of(owner);
     h.addr = addr;
     h.return_pc = return_pc;
-    h.flags = flags;
     h.mode = mode; // wrap stays wrap, all the way through
     h.fn = fn;
     h.user = user;
 
-    // "mod popre.widescreen hook on 004ec6f0 (before)". The mod's ID, because
-    // a crash report saying "mod 3" names nothing anyone can act on. Interned
+    // "mod example.mod hook on 12345678 (before)". The mod's ID, because a
+    // crash report saying "mod 3" names nothing anyone can act on. Interned
     // once and never formatted again, so a fault handler can print it.
     const PopModApi *api = mods_api_for(owner);
     char buf[128];
@@ -806,12 +792,12 @@ static PopModStatus install_hook(uint32_t owner, uint32_t addr, uint32_t return_
 
 PopModStatus mods_hook_install(uint32_t owner, uint32_t addr, PopHookFn fn, int32_t mode,
                                void *user, uint32_t *out_id) {
-    return install_hook(owner, addr, 0, fn, mode, 0, user, out_id);
+    return install_hook(owner, addr, 0, fn, mode, user, out_id);
 }
 
 PopModStatus mods_hook_install_ex(uint32_t owner, uint32_t addr, uint32_t return_pc, PopHookFn fn,
-                                  int32_t mode, uint32_t flags, void *user, uint32_t *out_id) {
-    return install_hook(owner, addr, return_pc, fn, mode, flags, user, out_id);
+                                  int32_t mode, void *user, uint32_t *out_id) {
+    return install_hook(owner, addr, return_pc, fn, mode, user, out_id);
 }
 
 PopModStatus mods_hook_install_at_callsite(uint32_t owner, uint32_t addr, uint32_t return_pc,
@@ -822,7 +808,7 @@ PopModStatus mods_hook_install_at_callsite(uint32_t owner, uint32_t addr, uint32
             *out_id = 0;
         return POP_E_INVAL;
     }
-    return install_hook(owner, addr, return_pc, fn, mode, 0, user, out_id);
+    return install_hook(owner, addr, return_pc, fn, mode, user, out_id);
 }
 
 // Remove a hook only when its handle belongs to the requesting mod.
@@ -1043,9 +1029,6 @@ void mods_hooks_reset() {
     t_stack.depth = 0;
     t_stack.active = nullptr;
     mods_view_reset();
-    mods_sprite_reset();
-    mods_animation_reset();
-    mods_game_settings_reset();
     // The events module installed hooks of its own and remembers that it did;
     // a registry holding nothing must not leave it believing otherwise.
     mods_events_reset();
@@ -1254,8 +1237,8 @@ void mods_hooks_unwind_to_esp(uint32_t esp) {
 
 void mods_fill_hooks_api(PopModApi *api) {
     api->hook_install_ex = [](const PopModApi *a, uint32_t addr, uint32_t return_pc, PopHookFn fn,
-                              int32_t mode, uint32_t flags, void *user, uint32_t *out_id) {
-        return mods_hook_install_ex(a->mod_index, addr, return_pc, fn, mode, flags, user, out_id);
+                              int32_t mode, void *user, uint32_t *out_id) {
+        return mods_hook_install_ex(a->mod_index, addr, return_pc, fn, mode, user, out_id);
     };
     api->hook_install_at_callsite = [](const PopModApi *a, uint32_t addr, uint32_t return_pc,
                                        PopHookFn fn, int32_t mode, void *user, uint32_t *out_id) {
@@ -1274,17 +1257,15 @@ void mods_fill_hooks_api(PopModApi *api) {
     api->hook_return = mods_hook_return;
 }
 
-// Task 6 owns hook eligibility and Task 8 owns the game view; both are weak
-// here so this task's tests link in its own wave, and the owning module's
-// definition wins in every build that has one.
+// Hook tests can link this module without the optional symbol index or scope
+// tracker; the production modules provide these definitions.
 extern "C" __attribute__((weak)) bool mods_symbol_hookable(uint32_t addr) {
-    return recomp_index_of(addr) >= 0 && addr != 0x0055dafcu && addr != 0x0055db78u;
+    return recomp_index_of(addr) >= 0;
 }
 // Defined for real by mods/capture_seam.cpp when the capture
 // harness is linked in. See the call site in mods_hooks_unwind_to_esp.
 extern "C" __attribute__((weak)) void mods_capture_unwound(void) {}
 extern "C" __attribute__((weak)) void mods_view_push(void) {}
-extern "C" __attribute__((weak)) void mods_view_push_disabled(void) {}
 extern "C" __attribute__((weak)) void mods_view_pop(void) {}
 extern "C" __attribute__((weak)) void mods_view_reset(void) {}
 extern "C" __attribute__((weak)) uint32_t mods_view_depth(void) {

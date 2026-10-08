@@ -66,22 +66,9 @@ bool host_key_event(uint16_t mac_keycode, bool down, uint32_t character);
 // two masks in play; nothing needs that today and whoever does will have to
 // say which one the message should carry.
 //
-// WHAT THIS GAME DOES WITH IT, MEASURED
-//
-// It delivers. It does not place. A guestclick at (320, 140) on the main menu
-// - New Game's row - selected MULTIPLAYER instead, the row under the game's
-// own cursor at the time, and the run came back showing "no multiplayer
-// services available". The press and release went out on all four paths and
-// the guest read them; what it ignored was the position, on both the
-// DirectInput immediate state and the message's lParam.
-//
-// So Populous hit-tests its menus against the pointer IT integrates from
-// relative motion, and nothing a host places absolutely moves that pointer.
-// A script that needs a particular menu item still has to walk the game's
-// cursor there with relative motion, which is what `click` and the corner pin
-// in level1.script do. This verb is for a screen that reads the position it
-// is given, and whether any screen in this game does is a question for
-// whoever drives one.
+// This sends an absolute guest-coordinate click through the available input
+// paths. The host delivers the coordinates and button state; whether a game
+// consumes absolute positioning is determined by that game's input code.
 bool host_gate_inject_guest_click(int32_t gx, int32_t gy, int button, bool down);
 
 // A modifier flags change, diffed per side and delivered per key. macOS
@@ -207,9 +194,8 @@ void host_gate_end_drag(void);
 void host_gate_set_layout(const CompositorInput *layout);
 // Used only until the presenter publishes its first layout. Called under baton.
 void host_gate_fallback_layout(int drawable_w, int drawable_h);
-// Decoded positions/deltas are drawable pixels, never window points. Produces
-// the relative correction as well as the absolute position: Populous ignores
-// absolute placement and integrates DirectInput motion for its hit tests.
+// Decoded positions/deltas are drawable pixels, never window points. Return
+// both the absolute location and relative correction for the input backend.
 HitResult host_gate_pointer_event(int32_t x, int32_t y, double dx, double dy, int32_t *guest_dx,
                                   int32_t *guest_dy);
 

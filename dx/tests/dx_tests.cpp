@@ -1,5 +1,4 @@
 #include "game_config.h"
-#include "../../mods/sprite_view.h"
 #include "../passes.h"
 // dx_tests.cpp - headless tests for the DirectX, audio and input shims.
 //
@@ -5449,16 +5448,15 @@ static void test_draw_leases_its_texture_revision() {
         return;
     CHECK_EQ(d->texture_handle, handle);
     CHECK_EQ(d->texture_revision, rev);
-    CHECK_EQ(host_sprite_frame_id(), f.id);
-    CHECK_EQ(host_sprite_texture_revision(handle), d->texture_revision);
-    CHECK_EQ(host_sprite_texture_revision(0xffffffffu), 0u);
+    CHECK_EQ(d3d_texture_revision(handle), d->texture_revision);
+    CHECK_EQ(d3d_texture_revision(0xffffffffu), 0u);
     CHECK_EQ(leases_for_test(handle, rev), 1u);
 
     // The guest writes the texture again: a new revision, and the frame is
     // still holding the old one.
     fill_for_test(texsurf, 7);
     CHECK(host_surface_revision_for_test(to->id) != rev);
-    CHECK_EQ(host_sprite_texture_revision(handle), host_surface_revision_for_test(to->id));
+    CHECK_EQ(d3d_texture_revision(handle), host_surface_revision_for_test(to->id));
     CHECK_EQ(d->texture_revision, rev); // the older draw is still its own revision
     CHECK_EQ(leases_for_test(handle, rev), 1u);
 
@@ -5538,8 +5536,8 @@ static void test_every_upload_path_bumps_the_revision() {
     CHECK(ra2 != rb);
     CHECK(rb2 != ra);
     CHECK(ra2 != rb2);
-    CHECK_EQ(host_sprite_texture_revision(ha), rb2);
-    CHECK_EQ(host_sprite_texture_revision(hb), ra2);
+    CHECK_EQ(d3d_texture_revision(ha), rb2);
+    CHECK_EQ(d3d_texture_revision(hb), ra2);
 }
 
 // Lookup must retain object identity as the table grows, rejects released
@@ -5563,21 +5561,21 @@ static void test_texture_handle_lifetime() {
     }
     for (const auto &t : textures) {
         CHECK(t.revision != 0);
-        CHECK_EQ(host_sprite_texture_revision(t.handle), t.revision);
+        CHECK_EQ(d3d_texture_revision(t.handle), t.revision);
         CHECK_EQ(call_method(t.view, TEX_GetHandle, {0, sc(28)}), D3D_OK_);
         CHECK_EQ(rd32(sc(28)), t.handle);
     }
     for (size_t i = 0; i < textures.size(); i += 2) {
         CHECK_EQ(call_method(textures[i].surface, S_Release, {}), 0u);
-        CHECK_EQ(host_sprite_texture_revision(textures[i].handle), 0u);
+        CHECK_EQ(d3d_texture_revision(textures[i].handle), 0u);
     }
     for (size_t i = 1; i < textures.size(); i += 2)
-        CHECK_EQ(host_sprite_texture_revision(textures[i].handle), textures[i].revision);
-    CHECK_EQ(host_sprite_texture_revision(0), 0u);
-    CHECK_EQ(host_sprite_texture_revision(0xffffffffu), 0u);
+        CHECK_EQ(d3d_texture_revision(textures[i].handle), textures[i].revision);
+    CHECK_EQ(d3d_texture_revision(0), 0u);
+    CHECK_EQ(d3d_texture_revision(0xffffffffu), 0u);
     d3d_reset();
     for (const auto &t : textures)
-        CHECK_EQ(host_sprite_texture_revision(t.handle), 0u);
+        CHECK_EQ(d3d_texture_revision(t.handle), 0u);
     uint32_t surface = rec_make_surface(1, 1, 8, DDSCAPS_TEXTURE);
     ComObj *o = rec_obj(surface);
     CHECK(o != nullptr);
@@ -5586,7 +5584,7 @@ static void test_texture_handle_lifetime() {
     uint32_t view = com_view(o, IF_D3DTEXTURE2);
     CHECK_EQ(call_method(view, TEX_GetHandle, {0, sc(28)}), D3D_OK_);
     CHECK_EQ(rd32(sc(28)), textures.front().handle);
-    CHECK_EQ(host_sprite_texture_revision(rd32(sc(28))), host_surface_revision_for_test(o->id));
+    CHECK_EQ(d3d_texture_revision(rd32(sc(28))), host_surface_revision_for_test(o->id));
 }
 
 // Revisions come from one counter for the whole process, so no two surfaces
@@ -7358,17 +7356,16 @@ static char **process_environ() {
 }
 #endif
 
-static void test_classic_probe_surface_creation() {
-    // Match mode_probe.py: scrub inherited POP tuning, preserve runtime paths,
-    // offer both boot depths plus the candidate, then reapply after Classic init.
+static void test_display_mode_surface_creation() {
+    // Exercise primary-surface boot depths and candidate display modes with
+    // isolated runtime switches, restoring the caller's environment afterward.
     struct ProbeEnvironment {
         std::map<std::string, std::string> saved;
         static std::map<std::string, std::string> take() {
             std::map<std::string, std::string> values;
             for (char **p = process_environ(); *p; ++p) {
                 std::string entry(*p);
-                if (entry.starts_with("POPM_") || entry.starts_with("POP_SMOKE_") ||
-                    entry.starts_with("POP_HOST_") || entry.starts_with("POP_RECOMP_")) {
+                if (entry.starts_with("RECOMP_")) {
                     auto equal = entry.find('=');
                     values.emplace(entry.substr(0, equal), entry.substr(equal + 1));
                 }
@@ -7385,8 +7382,6 @@ static void test_classic_probe_surface_creation() {
             ddraw_reset_modes();
         }
     } environment;
-    char root[4096];
-    CHECK(os_getcwd(root, sizeof root) == 0);
     const uint32_t sizes[][2] = {{640, 480},   {800, 600},   {1024, 768},  {1280, 960},
                                  {1600, 1200}, {1920, 1440}, {2560, 1920}, {3840, 2880},
                                  {1280, 720},  {1920, 1080}, {2560, 1440}, {3840, 2160}};
@@ -7397,13 +7392,7 @@ static void test_classic_probe_surface_creation() {
             std::string list = "640x480x8,640x480x16";
             if (size[0] != 640 || size[1] != 480)
                 list += "," + target;
-            std::string path = std::string(root) + "/build/recomp/mode-probe/" + target;
             os_setenv("RECOMP_DDRAW_MODES", list.c_str());
-            os_setenv("RECOMP_NO_MODS", "1");
-            os_setenv("RECOMP_PIN_CLOCK", "1");
-            os_setenv("RECOMP_SCRIPT", (path + "/probe.script").c_str());
-            os_setenv("RECOMP_HOST_DUMP_DIR", path.c_str());
-            os_setenv("RECOMP_SMOKE_CLASSIC_PROBE", target.c_str());
             ddraw_reset_modes();
             CHECK_EQ(ddraw_set_modes(recomp_env("DDRAW_MODES")), 1);
             cpu_reset();
@@ -15472,7 +15461,7 @@ int main() {
         {"exclusive DirectDraw window mode", test_exclusive_ddraw_notifies_window_mode},
         {"release restores desktop", test_release_restores_desktop_mode},
         {"configurable modes", test_configurable_display_modes},
-        {"Classic probe surfaces", test_classic_probe_surface_creation},
+        {"Display mode surfaces", test_display_mode_surface_creation},
         {"Direct3D pipeline", test_d3d_pipeline},
         {"Direct3D3 pipeline", test_d3d3_pipeline},
         {"DirectSound", test_dsound},

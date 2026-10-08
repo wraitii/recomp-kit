@@ -92,13 +92,6 @@ def render_header(cfg):
         '{%s, %s, %s, %s, 0x%08xu}' % (c_string(m["name"]), c_string(m["path"].as_posix()), c_string(m["sha256"]),
                                         c_hex(m["base"]), m["size"])
         for m in cfg["aux_modules"]) if cfg["aux_modules"] else "#define RECOMP_AUX_MODULES {{0, 0, 0, 0u, 0u}}")
-    # The mod runtime's built-in game integrations (animation clock, native
-    # options menu, settings persistence, sprite view) were written against
-    # Populous and hook its routines by address. Another game turns them off.
-    builtin = cfg.get("mods", {}).get("builtin", "populous")
-    if builtin not in ("populous", "none"):
-        raise ValueError('[mods] builtin must be "populous" or "none", not %r' % builtin)
-    lines.append("#define RECOMP_MODS_BUILTIN_POPULOUS %d" % (1 if builtin == "populous" else 0))
     # One bit per settings-page row, in game_config.SETTINGS_ROWS order.
     mask = sum(1 << i for i, row in enumerate(game_config.SETTINGS_ROWS) if row in cfg["settings"]["rows"])
     lines.append("#define RECOMP_SETTINGS_ROWS 0x%03xu" % mask)

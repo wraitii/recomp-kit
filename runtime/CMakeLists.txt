@@ -89,7 +89,7 @@ add_test(NAME interp_tests COMMAND interp_tests WORKING_DIRECTORY ${POP_ROOT})
 set_tests_properties(interp_tests PROPERTIES LABELS nogame TIMEOUT 120)
 endif()
 
-# Linked by the hosts, the fixture and the mod tests, not by the unit tests.
+# Linked by the hosts and mod tests, not by the unit tests.
 add_library(recomp_snapshot OBJECT snapshot.cpp)
 target_link_libraries(recomp_snapshot PUBLIC recomp_runtime)
 target_compile_options(recomp_snapshot PRIVATE ${POP_WARN_HOST})
@@ -130,16 +130,6 @@ set_tests_properties(gdi_draw_tests PROPERTIES LABELS nogame)
 endif()
 
 if(POP_REAL_GEN AND NOT IOS AND NOT ANDROID)
-  # The headless parity fixture: null host, real generated code, core mods installed.
-  add_executable(pop_fixture fixture.cpp)
-  target_link_libraries(pop_fixture PRIVATE recomp_platform recomp_runtime recomp_snapshot recomp_dx_null recomp_mods lua)
-  target_compile_options(pop_fixture PRIVATE ${POP_WARN_HOST})
-  pop_optimize(pop_fixture 1)
-  pop_link_gen(pop_fixture)
-  if(TARGET core_mods)
-    add_dependencies(pop_fixture core_mods)
-  endif()
-
   # CALL_FN takes an address token (without 0x), not a numeric expression.
   # Select the first generated entry; define the suite only when one exists.
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${POP_GEN_DIR}/funcs.h)
@@ -163,19 +153,4 @@ if(POP_REAL_GEN AND NOT IOS AND NOT ANDROID)
   else()
     message(STATUS "profile_tests: the translation has no FIDX entry; suite not defined")
   endif()
-endif()
-
-if(POP_TRACE_DIR AND NOT IOS AND NOT ANDROID)
-  # Caller-supplied trace wrappers over a snapshot of gen/: the override header
-  # is force-included ahead of funcs.h so every FN_<addr> macro is already set.
-  file(GLOB POP_TRACE_SOURCES CONFIGURE_DEPENDS ${POP_TRACE_DIR}/gen/chunk_*.c ${POP_TRACE_DIR}/gen/table.c)
-  add_library(recomp_gen_trace OBJECT ${POP_TRACE_SOURCES} ${POP_TRACE_DIR}/trace_wrappers.c)
-  target_include_directories(recomp_gen_trace PRIVATE ${POP_TRACE_DIR} ${POP_TRACE_DIR}/gen ${POP_ROOT} ${POP_ROOT}/runtime)
-  target_compile_options(recomp_gen_trace PRIVATE ${POP_WARN_GEN} -include ${POP_TRACE_DIR}/trace_override.h)
-  pop_optimize(recomp_gen_trace 1)
-  add_executable(pop_fixture_trace fixture.cpp)
-  target_link_libraries(pop_fixture_trace PRIVATE recomp_platform recomp_runtime recomp_snapshot recomp_dx_null recomp_mods lua recomp_gen_trace)
-  target_include_directories(pop_fixture_trace PRIVATE ${POP_TRACE_DIR}/gen)
-  target_compile_options(pop_fixture_trace PRIVATE ${POP_WARN_HOST})
-  pop_optimize(pop_fixture_trace 1)
 endif()

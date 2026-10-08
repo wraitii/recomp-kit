@@ -1,10 +1,6 @@
 // midi_synth.cpp - the game's music, which is MIDI through a SoundFont.
 //
-// Populous has no streamed music. It looks for a midiOut device whose name
-// begins with "SoundFont", opens it, sends a twelve-byte sysex, and then plays
-// the score note by note with midiOutShortMsg. The bank it means is
-// Sound/POPFIGHT.SF2, which ships with the game. Nothing in the game renders
-// a note itself, so with no host synth there is simply no music.
+// The host renders guest MIDI messages using a configured SoundFont bank.
 //
 // The synth here is TinySoundFont, rendered by the mixer as its music source:
 // one output, so the music and the effects never compete for the device, and

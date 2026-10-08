@@ -26,9 +26,8 @@ int mods_display_scene_width(int guest_w, int guest_h);
 int mods_display_fps(void);      /* 0 original, otherwise requested new-frame limit */
 int mods_display_overlay(void);  /* 0 off, 1 counters, 2 frame-time graph */
 int mods_display_textures(void); /* 0 original, 1 HD pack */
-/* What the renderer's texture pack holds, once opened: replacement textures
- * and the authored terrain detail. It words the Textures row. */
-void mods_display_texture_pack(uint32_t replacements, int terrain_detail);
+/* Number of authored replacement textures, once the pack is opened. */
+void mods_display_texture_pack(uint32_t replacements);
 int mods_display_filtering(void); /* 0 original, 1 trilinear, 2 4x, 3 8x, 4 16x */
 #ifdef __cplusplus
 }

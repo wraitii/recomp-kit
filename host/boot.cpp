@@ -60,10 +60,9 @@ double now_seconds() {
 // FRAME. Nothing else moves it, so two runs of the same script see the same
 // time at the same point in the game whatever the machine was doing.
 //
-// This is the parity fixture's pin (fixture.cpp, start 100 step 50) brought to
-// the hosts that run the real game. The fixture could pin the clock trivially
-// because it drives the frames itself; a host does not, so the step has to
-// hang off the one thing the guest does exactly once per frame.
+// The default starts at 100 ms and advances by 50 ms per frame. Pinning here
+// gives every host the same deterministic clock while still letting it boot
+// and run the guest through the ordinary entry point.
 //
 // WHY A FRAME AND NOT A TICK
 //
@@ -97,7 +96,7 @@ double now_seconds() {
 // the game believes it is running at 20 frames a second no matter how fast the
 // machine really is, so a pinned run is not a timing measurement of anything.
 // The counter itself is in the runtime (host_set_time_source_pinned), so that
-// the parity fixture and every host pin the SAME clock rather than each
+// every host pins the SAME clock rather than each
 // keeping its own. What stays here is the part that is the host's: reading the
 // environment, and the stall breaker below, which is about how a host paces a
 // pinned clock and not about what a pinned clock is.

@@ -1,6 +1,7 @@
 /* bad_init.c - fails after registering everything a mod can register, so the
  * test can check that a failed init leaves no trace of any of it. */
 #include "pop_mod_api.h"
+#include "hook_first_entry.h"
 
 POP_MOD_DECLARE_ABI();
 
@@ -80,10 +81,8 @@ static int32_t tex(const PopModApi *a, uint64_t h, int32_t w, int32_t ht, int32_
 PopModStatus pop_mod_init(const PopModApi *api) {
     uint32_t addr = 0, id = 0, mem = 0;
     ++g_bad_init_ran;
-    if (api->symbol)
-        api->symbol(api, "main_loop_outer", &addr);
-    if (api->hook_install)
-        g_bad_hook_st = api->hook_install(api, addr, hook, POP_HOOK_BEFORE, 0, &id);
+    if (api->hook_install && api->symbols_matching)
+        g_bad_hook_st = fixture_hook_first_entry(api, hook, POP_HOOK_BEFORE, &addr, &id);
     if (api->on_turn)
         g_bad_turn_st = api->on_turn(api, POP_EVENT_BEFORE, ev, 0, &id);
     if (api->on_key)

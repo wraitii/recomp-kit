@@ -1,6 +1,6 @@
 // smoke_main.mm - the recompiled game, driven by a script, with no window.
 //
-// build/recomp/pop_smoke exists so gameplay is checked before a person sees a
+// build/recomp/smoke exists so gameplay is checked before a person sees a
 // build. It boots the real game exactly as the windowed host does, presses the
 // buttons a script tells it to through exactly the paths a person's input
 // takes, runs the real Metal renderer against an offscreen target, and then
@@ -31,11 +31,7 @@
 #include "controls/binding.h"
 #include "sdl/keymap.h"
 #include "smoke_dumpat.h"
-#include "landmark.h"
-#include "fixture_view.h"
 #include "../mods/mods_internal.h"
-#include "../mods/sprite_view.h"
-#include <map>
 #include "input.h"
 #include "input_gate.h"
 #include "page_overlay.h"
@@ -243,314 +239,7 @@ void write_dump(const char *name) {
     }
 }
 
-// --- what the game itself thinks is true ------------------------------------
-//
-// A picture cannot say whether a unit was selected or whether it walked: the
-// level is a camera flyby for the first twenty seconds and every frame differs
-// from the last whatever the player does. The game's own record can say it.
-//
-// The entity table is 2000 records of 179 bytes at 0x8e0428, and the field
-// offsets are the ones the game's tests/entity_codec.hpp encodes and decodes: flags at
-// +12, kind at +42, state at +44, owner at +47, and the position at +61 as
-// three 16-bit words, x then z then altitude. A blue brave is owner 0, kind 1.
-const uint32_t kEntityBase = RECOMP_GLOBAL_ENTITY_BASE_ADDR;
-const uint32_t kEntityStride = RECOMP_GLOBAL_ENTITY_BASE_STRIDE;
-const uint32_t kEntityCount = RECOMP_GLOBAL_ENTITY_BASE_COUNT; // record 0 is the null entity
-const uint32_t kOffFlags = 12;
-const uint32_t kOffKind = 42;
-const uint32_t kOffState = 44;
-const uint32_t kOffOwner = 47;
-const uint32_t kOffPosition = 61;
-// The selection flag. docs/COMMANDS.md records it as "the person flag at
-// original offset 0x7a", set by the selection eligibility code at 004e3430 /
-// 004458d0, and a run confirms it: clicking a brave writes byte +122 of that
-// brave's record and of no other's. It is how this host finds out which entity
-// a click selected, there being no projection from the screen into the world
-// anywhere in it.
-const uint32_t kOffSelected = 122;
-
-uint8_t guest_u8(uint32_t a) {
-    return gm_valid(a, 1) ? *gm_ptr(a) : 0;
-}
-uint16_t guest_u16(uint32_t a) {
-    if (!gm_valid(a, 2))
-        return 0;
-    const uint8_t *p = gm_ptr(a);
-    return (uint16_t)(p[0] | (p[1] << 8));
-}
-uint32_t guest_u32(uint32_t a) {
-    if (!gm_valid(a, 4))
-        return 0;
-    return (uint32_t)guest_u16(a) | ((uint32_t)guest_u16(a + 2) << 16);
-}
-
-// The map wraps, so the distance between two coordinates is the short way
-// round: a 16-bit difference read as signed is exactly that.
-double axis_delta(uint16_t a, uint16_t b) {
-    return (double)(int16_t)(uint16_t)(a - b);
-}
-
-struct EntitySample {
-    double at_ms;
-    uint16_t x, z;
-    uint8_t state;
-    uint32_t flags;
-};
-
-uint32_t g_watch_addr = 0; // 0 until a `watch` step latches one
-int32_t g_watch_index = -1;
-int32_t g_watch_owner = -1, g_watch_kind = -1;
-uint32_t g_watch_matches = 0; // how many entities the scan matched
-// Every match, with where it was when the scan found it. The run watches the
-// first one, but a run that fails wants to know what all of them did: a level
-// where nothing moved at all is a different fault from one where the order
-// missed.
-struct WatchedOther {
-    uint32_t addr;
-    uint32_t index;
-    uint16_t x, z;
-    uint8_t state;
-    uint8_t first[kEntityStride];
-    uint8_t changed[kEntityStride];
-    uint8_t selected_before; // byte +122 as it was when a click went down
-};
-std::vector<WatchedOther> g_watch_all;
-std::vector<EntitySample> g_watch_samples;
-double g_watch_last_sample = -1e9;
-int g_watch_order_at = -1; // first sample taken at the order
-// How a click becomes a selection and the next one becomes an order:
-//
-//   a click goes down          -> remember every candidate's +122
-//   one of them changes        -> that is the entity the game selected, and it
-//                                 is the one this run follows from here
-//   the next click             -> that is the order, and the walk is measured
-//                                 from the position and state at that moment
-//
-// Nothing here decides what was clicked from the pixels. The game decides, and
-// this reads its answer out of the record it wrote.
-bool g_select_pending = false;   // a click is waiting to be attributed
-bool g_watch_selected = false;   // the followed entity came from a click
-bool g_order_next = false;       // the next click is the order
-int32_t g_select_entity_id = -1; // semantic selection must latch this id
-const size_t kMaxSamples = 8192;
-const double kSampleEveryMs = 50.0;
-
-// Which bytes of the watched record ever changed. A record nothing writes to
-// says the game is not simulating that unit at all, which is a different
-// finding from an order that missed, and the two are not distinguishable from
-// the position alone.
-uint8_t g_watch_first[kEntityStride];
-uint8_t g_watch_changed[kEntityStride];
-bool g_watch_have_first = false;
-
-// Every match, not only the one being followed. Which record the game wrote to
-// after a click is how a run finds out which entity was clicked, and there is
-// no projection from the screen to the world anywhere in this host to tell it
-// any other way.
-void note_all_changes() {
-    for (WatchedOther &o : g_watch_all) {
-        if (!gm_valid(o.addr, kEntityStride))
-            continue;
-        const uint8_t *p = gm_ptr(o.addr);
-        for (uint32_t i = 0; i < kEntityStride; ++i)
-            if (p[i] != o.first[i])
-                o.changed[i] = 1;
-    }
-}
-
-void note_record_changes() {
-    if (!g_watch_addr || !gm_valid(g_watch_addr, kEntityStride))
-        return;
-    const uint8_t *p = gm_ptr(g_watch_addr);
-    if (!g_watch_have_first) {
-        memcpy(g_watch_first, p, kEntityStride);
-        memset(g_watch_changed, 0, kEntityStride);
-        g_watch_have_first = true;
-        return;
-    }
-    for (uint32_t i = 0; i < kEntityStride; ++i)
-        if (p[i] != g_watch_first[i])
-            g_watch_changed[i] = 1;
-}
-
-EntitySample read_watched() {
-    EntitySample s;
-    s.at_ms = boot_guest_millis();
-    s.x = guest_u16(g_watch_addr + kOffPosition);
-    s.z = guest_u16(g_watch_addr + kOffPosition + 2);
-    s.state = guest_u8(g_watch_addr + kOffState);
-    s.flags = guest_u32(g_watch_addr + kOffFlags);
-    return s;
-}
-
-// The entity whose selection flag the last click changed, if one has by now.
-void latch_selected();
-
-void sample_watched(bool force) {
-    if (!g_watch_addr || g_watch_samples.size() >= kMaxSamples)
-        return;
-    double now = boot_guest_millis();
-    if (!force && now - g_watch_last_sample < kSampleEveryMs)
-        return;
-    g_watch_last_sample = now;
-    latch_selected();
-    note_record_changes();
-    note_all_changes();
-    g_watch_samples.push_back(read_watched());
-}
-
-// Resolve a pending selection from the guest entity flags and latch its identity.
-// Movement assertions subsequently follow that entity rather than just a screen pixel.
-void latch_selected() {
-    if (!g_select_pending)
-        return;
-    for (WatchedOther &o : g_watch_all) {
-        uint8_t now = guest_u8(o.addr + kOffSelected);
-        if (g_select_entity_id >= 0 &&
-            (guest_u16(o.addr + 36) != g_select_entity_id || !(now & 0x80)))
-            continue;
-        if (now == o.selected_before)
-            continue;
-        g_select_pending = false;
-        g_watch_selected = true;
-        g_order_next = true;
-        g_watch_addr = o.addr;
-        g_watch_index = (int32_t)o.index;
-        g_watch_samples.clear();
-        g_watch_order_at = -1;
-        g_watch_have_first = false;
-        sample_watched(true);
-        printf("[smoke] the click selected entity %u at %08x (its flag at +%u "
-               "went %u -> %u); following that one\n",
-               o.index, o.addr, kOffSelected, o.selected_before, now);
-        fflush(stdout);
-        return;
-    }
-}
-
-// Finds the first live entity with this owner and kind and follows it. Live
-// means it has a kind at all and a position that is not the origin, which is
-// what an unused record looks like.
-void watch_entity(int32_t owner, int32_t kind) {
-    g_watch_owner = owner;
-    g_watch_kind = kind;
-    g_watch_matches = 0;
-    g_watch_addr = 0;
-    g_watch_index = -1;
-    g_watch_all.clear();
-    g_watch_have_first = false;
-    g_select_pending = false;
-    g_watch_selected = false;
-    g_order_next = false;
-    g_select_entity_id = -1;
-    for (uint32_t i = 1; i < kEntityCount; ++i) {
-        uint32_t at = kEntityBase + i * kEntityStride;
-        if (!gm_valid(at, kEntityStride))
-            break;
-        if (guest_u8(at + kOffKind) != (uint8_t)kind)
-            continue;
-        if (guest_u8(at + kOffOwner) != (uint8_t)owner)
-            continue;
-        uint16_t x = guest_u16(at + kOffPosition);
-        uint16_t z = guest_u16(at + kOffPosition + 2);
-        if (!x && !z)
-            continue;
-        ++g_watch_matches;
-        if (g_watch_all.size() < 64) {
-            WatchedOther o;
-            o.addr = at;
-            o.index = i;
-            o.x = x;
-            o.z = z;
-            o.state = guest_u8(at + kOffState);
-            memcpy(o.first, gm_ptr(at), kEntityStride);
-            memset(o.changed, 0, kEntityStride);
-            o.selected_before = guest_u8(at + kOffSelected);
-            g_watch_all.push_back(o);
-        }
-        if (g_watch_addr)
-            continue;
-        g_watch_addr = at;
-        g_watch_index = (int32_t)i;
-    }
-    if (!g_watch_addr) {
-        printf("[smoke] watch owner %d kind %d: nothing matched in the entity "
-               "table; the level is probably not loaded yet\n",
-               owner, kind);
-        fflush(stdout);
-        return;
-    }
-    g_watch_samples.clear();
-    g_watch_order_at = -1;
-    sample_watched(true);
-    const EntitySample &s = g_watch_samples.back();
-    printf("[smoke] watching entity %d at %08x (owner %d kind %d): %u of them, "
-           "this one at (%u, %u), state %u, flags %08x\n",
-           g_watch_index, g_watch_addr, owner, kind, g_watch_matches, s.x, s.z, s.state, s.flags);
-    fflush(stdout);
-}
-
-// Distance in world units between a sample and the one taken at the order.
-double distance_from(const EntitySample &a, const EntitySample &b) {
-    double dx = axis_delta(a.x, b.x);
-    double dz = axis_delta(a.z, b.z);
-    return sqrt(dx * dx + dz * dz);
-}
-
-// How far the watched entity got from where it was when the order was given.
-double watch_moved() {
-    if (g_watch_order_at < 0 || g_watch_order_at >= (int)g_watch_samples.size())
-        return 0.0;
-    const EntitySample &from = g_watch_samples[(size_t)g_watch_order_at];
-    double best = 0.0;
-    for (size_t i = (size_t)g_watch_order_at + 1; i < g_watch_samples.size(); ++i) {
-        double d = distance_from(g_watch_samples[i], from);
-        if (d > best)
-            best = d;
-    }
-    return best;
-}
-
-// The share of steps after the order that did not move the entity further from
-// where it finished. A unit walking to an ordered place gets closer to it and
-// keeps getting closer; one milling about does not. The target here is where
-// it actually ended up, because the order was given in screen coordinates and
-// nothing in this host projects those into the world - so this asserts that
-// the walk was a walk to somewhere, not that the somewhere was the pixel that
-// was clicked.
-double watch_toward_target() {
-    if (g_watch_order_at < 0)
-        return 0.0;
-    size_t first = (size_t)g_watch_order_at;
-    if (g_watch_samples.size() < first + 3)
-        return 0.0;
-    const EntitySample &target = g_watch_samples.back();
-    size_t good = 0, total = 0;
-    double previous = distance_from(g_watch_samples[first], target);
-    for (size_t i = first + 1; i < g_watch_samples.size(); ++i) {
-        double d = distance_from(g_watch_samples[i], target);
-        ++total;
-        if (d <= previous)
-            ++good;
-        previous = d;
-    }
-    return total ? (double)good / (double)total : 0.0;
-}
-
-// How many times its state byte changed after the order. A brave standing
-// still keeps one state; one that was told to go somewhere leaves it.
-double watch_state_changes() {
-    if (g_watch_order_at < 0)
-        return 0.0;
-    uint32_t changes = 0;
-    for (size_t i = (size_t)g_watch_order_at + 1; i < g_watch_samples.size(); ++i)
-        if (g_watch_samples[i].state != g_watch_samples[i - 1].state)
-            ++changes;
-    return changes;
-}
-
-// Prints guest memory, and decodes it as an entity when the length says that
-// is what it is. A script peeks so a failure can be read rather than guessed.
+// Print a bounded guest-memory sample for script diagnostics.
 void peek(uint32_t addr, uint32_t len) {
     if (!gm_valid(addr, len)) {
         printf("[smoke] peek %08x+%u: outside the guest address space\n", addr, len);
@@ -565,30 +254,17 @@ void peek(uint32_t addr, uint32_t len) {
         printf(" %02x", p[i]);
     }
     printf("\n");
-    if (len >= kEntityStride && addr >= kEntityBase && (addr - kEntityBase) % kEntityStride == 0) {
-        printf("    entity %u: kind %u, state %u, owner %u, flags %08x, "
-               "position (%u, %u), altitude %u\n",
-               (addr - kEntityBase) / kEntityStride, guest_u8(addr + kOffKind),
-               guest_u8(addr + kOffState), guest_u8(addr + kOffOwner), guest_u32(addr + kOffFlags),
-               guest_u16(addr + kOffPosition), guest_u16(addr + kOffPosition + 2),
-               guest_u16(addr + kOffPosition + 4));
-    }
     fflush(stdout);
 }
 
-bool entity_body_ready(int32_t id);
 HostDumpAt g_dumpat;
 
 // The metrics a script may make a claim about.
-double metric(const char *name, int32_t entity_id = -1) {
-    if (!strcmp(name, "entity_body"))
-        return entity_body_ready(entity_id) ? 1.0 : 0.0;
+double metric(const char *name) {
     if (!strcmp(name, "dumpat_fired"))
         return g_dumpat.fired;
     if (!strcmp(name, "hd_draws"))
         return g_renderer ? g_renderer->hdTextureStats().draws : 0;
-    if (!strcmp(name, "terrain_detail_draws"))
-        return g_renderer ? g_renderer->hdTextureStats().detail_draws : 0;
     if (!strcmp(name, "hd_refused"))
         return g_renderer ? g_renderer->hdTextureStats().refused : 0;
     if (!strcmp(name, "textures"))
@@ -623,27 +299,13 @@ double metric(const char *name, int32_t entity_id = -1) {
         return g_scene_nonblack;
     if (!strcmp(name, "present_nonblack"))
         return g_present_nonblack;
-    // What the game's own entity table says happened.
-    if (!strcmp(name, "entities"))
-        return g_watch_matches;
-    if (!strcmp(name, "watch_found"))
-        return g_watch_addr ? 1.0 : 0.0;
-    if (!strcmp(name, "watch_selected"))
-        return g_watch_selected ? 1.0 : 0.0;
-    if (!strcmp(name, "watch_samples"))
-        return (double)g_watch_samples.size();
-    if (!strcmp(name, "watch_moved"))
-        return watch_moved();
-    if (!strcmp(name, "watch_toward_target"))
-        return watch_toward_target();
-    if (!strcmp(name, "watch_state_changes"))
-        return watch_state_changes();
-    // Read the guest even in display-gate controls with RECOMP_NO_MODS set.
-    // command_frame (0089d184) can advance several times per present;
-    // turn (0089d188) is coarser. The loaded game view is diagnostic only.
-    const bool cross_check = !recomp_env("NO_MODS") && mods_symbols_count() != 0;
-    return host_script_counter_metric(name, guest_u32, cross_check ? mods_simulation_turn : nullptr,
-                                      cross_check ? mods_command_frame : nullptr);
+    return host_script_counter_metric(name, [](uint32_t address) -> uint32_t {
+        if (!gm_valid(address, 4))
+            return 0;
+        const uint8_t *p = gm_ptr(address);
+        return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) |
+               (uint32_t(p[3]) << 24);
+    });
 }
 
 // Where the script's pointer is, so a move can report the distance travelled
@@ -931,196 +593,6 @@ int g_readfile_misses = 0;
 // that failed one has not passed.
 int g_probe_misses = 0;
 
-// DISP-T13: unavailable entity/sprite provenance must fail both expectations.
-// In particular, a missing producer cannot be treated as a hidden landmark.
-int g_landmark_misses = 0;
-std::map<uint32_t, LandmarkVisibility> g_landmarks;
-std::vector<LandmarkDrawEvidence> g_landmark_draws;
-std::map<uint32_t, std::vector<PopSpriteView>> g_landmark_sprites;
-uint64_t g_landmark_frame = 0;
-uint32_t g_landmark_present = 0, g_landmark_since = 0;
-bool g_landmark_waiting = false;
-int g_simdump_failures = 0;
-int g_semantic_click_failures = 0;
-HostEntityWait g_entity_wait, g_entity_await;
-HostEntityBodyStore g_entity_bodies;
-FixtureWorldProjection g_world_projection;
-
-bool entity_body_ready(int32_t id) {
-    return g_entity_bodies.get((uint32_t)id).ready(g_completed_presents);
-}
-
-// Called under the guest baton before the frame's arena is sealed/released.
-void capture_landmarks(bool completed = false) {
-    HostFrameHandle frame = host_frame_current();
-    g_landmarks.clear();
-    g_world_projection = {};
-    g_landmark_draws.clear();
-    g_landmark_sprites.clear();
-    g_landmark_frame = frame.id;
-    g_landmark_present = g_presents;
-    if (host_frame_class(frame) != HOST_SCREEN_GAMEPLAY)
-        return;
-    std::vector<HostD3DDrawSnapshot> draws;
-    for (uint32_t i = 0; i < host_frame_draw_count(frame); ++i) {
-        const auto *d = host_frame_draw(frame, i);
-        if (d)
-            draws.push_back(*d); // only scalar bounds/identity read below
-    }
-    host_sprite_projection(frame.id, &g_world_projection);
-    mods_view_push();
-    for (uint32_t i = 0; i < mods_entity_count(); ++i) {
-        uint32_t slot = 0;
-        PopEntityView e{};
-        if (mods_entity_slot(i, &slot) != POP_OK || mods_entity(slot, &e) != POP_OK)
-            continue;
-        LandmarkVisibility result = LandmarkVisibility::unavailable;
-        PopSpriteView v{};
-        for (uint32_t n = 0; mods_entity_sprite(e.id, frame.id, n, &v); ++n) {
-            // Hidden uses the dump entity's world position and this frame's
-            // recorded globals, even if classic culling skipped its hook.
-            if (!v.drawn) {
-                v.projected = fixture_project_world(g_world_projection, e.x, e.z,
-                                                    (int16_t)e.altitude, &v.x, &v.y);
-                v.width = g_world_projection.width;
-                v.height = g_world_projection.height;
-                v.origin_x = g_world_projection.origin_x;
-                v.origin_y = g_world_projection.origin_y;
-            }
-            g_landmark_sprites[e.id].push_back(v);
-            if (v.slot == e.slot && v.entity_id == e.id && v.frame == frame.id && v.drawn) {
-                for (const auto &d : draws) {
-                    if (d.kind == HOST_DRAW_PRIMITIVE && d.seq == v.draw_seq &&
-                        d.texture_handle == v.texture_handle &&
-                        d.texture_revision == v.texture_revision)
-                        g_landmark_draws.emplace_back(e.id, frame.id, d);
-                }
-            }
-            LandmarkSpriteEvidence own{v.frame, v.entity_id, v.drawn ? v.texture_handle : 0,
-                                       v.drawn ? v.texture_revision : 0, g_world_projection.valid};
-            auto value = landmark_visibility(v.slot == e.slot, e.id, frame.id, v.projected, v.x,
-                                             v.y, v.width, v.height, own, draws.data(),
-                                             draws.size(), v.origin_x, v.origin_y);
-            HostEntityBodyRecord point{frame.id, g_completed_presents};
-            if (landmark_click_point(v.slot == e.slot, e.id, frame.id, v.projected, v.x, v.y,
-                                     v.width, v.height, own, draws.data(), draws.size(), v.origin_x,
-                                     v.origin_y, &point.x, &point.y)) {
-                if (completed)
-                    g_entity_bodies.record(e.id, point);
-            }
-            // A visible shadow proves the landmark, but cannot supply the
-            // person click. Keep inspecting layers until the body is found.
-            if (value == LandmarkVisibility::visible)
-                result = value;
-            else if (result != LandmarkVisibility::visible &&
-                     (n == 0 || value == LandmarkVisibility::unavailable))
-                result = value;
-        }
-        g_landmarks[e.id] = result;
-    }
-    mods_view_pop();
-}
-
-bool write_simdump(const char *name) {
-    const auto region = [](const char *name, const char *symbol, bool counter = false) {
-        const uint32_t addr = mods_symbol_global(symbol);
-        const uint32_t bytes =
-            counter ? 4 : mods_symbol_global_count(symbol) * mods_symbol_global_stride(symbol);
-        return HostSimDumpRegion{
-            name, addr && bytes && gm_valid(addr, bytes) ? gm_ptr(addr) : nullptr, bytes};
-    };
-    const bool ok = host_write_simdump(
-        host_dump_dir(), name,
-        {region("entities", "entity_base"), region("tribes", "tribe_base"),
-         region("turn", "simulation_turn", true), region("command", "command_frame", true)},
-        [](FILE *f) {
-            bool ok = true;
-            uint32_t camera = rd32(RECOMP_HOOK_CAMERA);
-            bool camera_ok = camera && gm_valid(camera, 0x28);
-            fprintf(f, "{\"turn\":%u,\"command_frame\":%u,\"frame\":%llu,\"camera\":",
-                    (uint32_t)metric("turn"), (uint32_t)metric("command_frame"),
-                    (unsigned long long)g_landmark_frame);
-            if (camera_ok)
-                fprintf(f, "{\"ptr\":%u,\"x\":%u,\"z\":%u}", camera, rd16(camera + 0x24),
-                        rd16(camera + 0x26));
-            else {
-                fprintf(f, "null");
-                ok = false;
-            }
-            const auto &p = g_world_projection;
-            fprintf(f, ",\"projection\":{\"recorded\":%s,\"frame\":%llu,\"matrix\":[",
-                    p.valid ? "true" : "false", (unsigned long long)g_landmark_frame);
-            for (int i = 0; i < 9; ++i)
-                fprintf(f, "%s%d", i ? "," : "", p.matrix[i]);
-            fprintf(f,
-                    "],\"camera_x\":%d,\"camera_z\":%d,\"zoom\":%d,\"curvature\":%d,\"depth\":%d,"
-                    "\"perspective\":%d,\"center_x\":%d,\"center_y\":%d,\"width\":%d,\"height\":%d,"
-                    "\"shift_x\":%u,\"shift_y\":%u,\"scale_x\":%.9g,\"scale_y\":%.9g,\"origin_x\":%"
-                    ".9g,\"origin_y\":%.9g}",
-                    p.camera_x, p.camera_z, p.zoom, p.curvature, p.depth, p.perspective, p.center_x,
-                    p.center_y, p.width, p.height, p.shift_x, p.shift_y, p.scale_x, p.scale_y,
-                    p.origin_x, p.origin_y);
-            fprintf(f, ",\"entities\":[");
-            mods_view_push();
-            for (uint32_t i = 0; i < mods_entity_count(); ++i) {
-                uint32_t slot;
-                PopEntityView e{};
-                mods_entity_slot(i, &slot);
-                mods_entity(slot, &e);
-                fprintf(f,
-                        "%s{\"slot\":%u,\"id\":%u,\"kind\":%u,\"model\":%u,\"owner\":%u,\"x\":%u,"
-                        "\"z\":%u,\"altitude\":%u,\"sprites\":[",
-                        i ? "," : "", e.slot, e.id, e.kind, e.model, e.owner, e.x, e.z, e.altitude);
-                bool sprite_comma = false;
-                for (const auto &v : g_landmark_sprites[e.id]) {
-                    fprintf(f,
-                            "%s{\"handle\":%u,\"revision\":%u,\"x\":%.9g,\"y\":%.9g,\"width\":%d,"
-                            "\"height\":%d,\"origin_x\":%.9g,\"origin_y\":%.9g,\"drawn\":%s,\"draw_"
-                            "seq\":%u}",
-                            sprite_comma ? "," : "", v.texture_handle, v.texture_revision, v.x, v.y,
-                            v.width, v.height, v.origin_x, v.origin_y, v.drawn ? "true" : "false",
-                            v.draw_seq);
-                    sprite_comma = true;
-                }
-                float px = 0, py = 0;
-                bool projected = fixture_project_world(p, e.x, e.z, (int16_t)e.altitude, &px, &py);
-                auto verdict = g_landmarks.find(e.id);
-                const char *name = verdict == g_landmarks.end()                     ? "unavailable"
-                                   : verdict->second == LandmarkVisibility::visible ? "visible"
-                                   : verdict->second == LandmarkVisibility::hidden  ? "hidden"
-                                   : verdict->second == LandmarkVisibility::not_drawn
-                                       ? "not_drawn_in_view"
-                                       : "unavailable";
-                fprintf(f,
-                        "],\"world_projection\":{\"valid\":%s,\"x\":%.9g,\"y\":%.9g,\"outside\":%s}"
-                        ",\"verdict\":\"%s\"}",
-                        projected ? "true" : "false", px, py,
-                        projected && (px < 0 || px >= p.width || py < 0 || py >= p.height)
-                            ? "true"
-                            : "false",
-                        name);
-            }
-            mods_view_pop();
-            // The verdict and these scalar records were captured together before
-            // present released the arena. host_frame_current() is now too late.
-            fprintf(f, "],\"draws\":[");
-            bool comma = false;
-            for (const auto &d : g_landmark_draws) {
-                if (comma)
-                    fprintf(f, ",");
-                d.write(f);
-                comma = true;
-            }
-            fprintf(f, "]}\n");
-            return ok;
-        });
-    if (!ok)
-        ++g_simdump_failures;
-    printf("[smoke] simdump %s turn %u: %s\n", name, (uint32_t)metric("turn"),
-           ok ? "written" : "FAILED");
-    return ok;
-}
-
 // An armed dumpat: the claim it is waiting for, and the name to write when it
 // fires. Only one can be armed at a time - the script arms it and the next
 // present fires it - so this is a single slot rather than a queue, and a
@@ -1139,26 +611,6 @@ uint32_t g_guestclick_release_at = 0;
 // would have to rebase every later step's time and would run out of the fixed
 // array, and a sub-script that finishes and hands back is the same shape the
 // verb reads as.
-const int MAX_SUB_STEPS = 64;
-HostScriptStep g_sub_steps[MAX_SUB_STEPS];
-int g_sub_count = 0;
-int g_sub_next = 0;
-bool g_sub_active = false;
-uint32_t g_sub_start_ms = 0;
-
-// The armed mode claim. `mode` cannot wait for its own answer: the game
-// applies a mode when a level starts and recreates its surfaces, not when the
-// options screen is left. So the claim is armed here, answered the moment the
-// host is told of a mode change, and failed at the end if it never was.
-// A `mode` step that could not even be started. Counted like an unfired
-// dumpat: a run that asked for a mode, failed to ask the game for it, and then
-// passed would be reporting on a resolution nobody selected.
-int g_mode_faults = 0;
-
-bool g_mode_armed = false;
-bool g_mode_arrived = false;
-int32_t g_mode_want_w = 0, g_mode_want_h = 0, g_mode_want_bpp = 0;
-
 std::atomic<unsigned> g_completed_captures{0}, g_capture_failures{0};
 HostFrameCapture fire_dumpat(HostScreenClass cls, bool at_seal);
 
@@ -1193,89 +645,9 @@ bool produces_input(int op);
 // parser the main script uses, so a mistake in it is caught the same way and
 // says the same thing.
 // Where this binary was started from, so a path in the tree can be found
-// whatever the working directory is. build/recomp/pop_smoke is three levels
+// whatever the working directory is. build/recomp/smoke is three levels
 // below the root.
 std::string g_argv0;
-
-std::string repo_relative(const char *rel) {
-    if (g_argv0.empty())
-        return rel;
-    std::string p = g_argv0;
-    for (int i = 0; i < 3; ++i) {
-        size_t slash = p.find_last_of('/');
-        if (slash == std::string::npos)
-            return rel;
-        p.erase(slash);
-    }
-    return p + "/" + rel;
-}
-
-// Load and parse a nested smoke script, resolving paths relative to the run or binary.
-// Reset its start time only after the commands have been accepted.
-bool load_sub_script(const char *rel) {
-    // The path as given first, so a run from the root behaves as it always
-    // did, then the one worked out from this binary's own location. A gate
-    // that runs the smoke from somewhere else would otherwise be told the
-    // recorded path does not exist.
-    std::string tried = rel;
-    FILE *f = fopen(tried.c_str(), "rb");
-    if (!f) {
-        tried = repo_relative(rel);
-        f = fopen(tried.c_str(), "rb");
-    }
-    if (!f) {
-        printf("[smoke] cannot open %s, and not at %s either\n", rel, repo_relative(rel).c_str());
-        fflush(stdout);
-        return false;
-    }
-    const char *path = tried.c_str();
-    std::string text;
-    char buf[4096];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof buf, f)) > 0)
-        text.append(buf, n);
-    fclose(f);
-    char err[256] = {0};
-    int count = host_script_parse(text.c_str(), g_sub_steps, MAX_SUB_STEPS, err, sizeof err);
-    if (count < 0) {
-        printf("[smoke] %s: %s\n", path, err);
-        fflush(stdout);
-        return false;
-    }
-    g_sub_count = count;
-    g_sub_next = 0;
-    g_sub_active = count > 0;
-    g_sub_start_ms = boot_guest_millis();
-    return g_sub_active;
-}
-
-// Both the main script and recorded paths pause their own clocks while waiting.
-// Success still runs the ordinary move/click path, including input hold/release.
-bool semantic_step_ready(const HostScriptStep &step, uint32_t &script_start_ms, bool &timed_out) {
-    timed_out = false;
-    if (step.op != HOST_SCRIPT_ENTITYCLICK && step.op != HOST_SCRIPT_ENTITYMOVE)
-        return true;
-    const uint32_t now = boot_guest_millis();
-    const auto body = g_entity_bodies.get((uint32_t)step.entity_id);
-    const auto result =
-        g_entity_wait.poll(now, g_completed_presents, body.frame, body.present, body.frame != 0);
-    if (result == HostEntityWaitResult::pending)
-        return false;
-    if (result == HostEntityWaitResult::timed_out) {
-        char diagnostic[256];
-        host_entity_body_diagnostic(diagnostic, sizeof diagnostic, step.entity_id,
-                                    g_completed_presents, body, false);
-        printf("[smoke] %s entity %d: timeout within %u completed presents; %s\n",
-               step.op == HOST_SCRIPT_ENTITYMOVE ? "move" : "click", step.entity_id,
-               HostEntityWait::max_presents, diagnostic);
-        ++g_semantic_click_failures;
-        timed_out = true;
-    }
-    g_entity_wait.finish(now, script_start_ms);
-    // The caller consumes a timed-out step without injecting input or counting
-    // a second failure in run_step's immediate semantic resolver.
-    return true;
-}
 
 // Defined with the rest of the frame handling, below the executor that calls
 // them, because they read the presented frame and belong beside it.
@@ -1291,73 +663,6 @@ void run_step(const HostScriptStep &step) {
     const uint32_t notify_before = produces_input(step.op) ? host_input_notify_count() : 0;
     const int32_t px_before = g_pointer_x, py_before = g_pointer_y;
     switch (step.op) {
-    case HOST_SCRIPT_CAMERA:
-        if (!fixture_camera_position(step.x, step.y))
-            ++g_simdump_failures;
-        printf("[smoke] fixture camera (%d,%d)\n", step.x, step.y);
-        break;
-    case HOST_SCRIPT_ENTITYCLICK:
-    case HOST_SCRIPT_WORLDCLICK:
-    case HOST_SCRIPT_ENTITYMOVE:
-    case HOST_SCRIPT_WORLDMOVE: {
-        const bool moving = step.op == HOST_SCRIPT_ENTITYMOVE || step.op == HOST_SCRIPT_WORLDMOVE;
-        const bool entity = step.op == HOST_SCRIPT_ENTITYCLICK || step.op == HOST_SCRIPT_ENTITYMOVE;
-        HostScriptStep mapped = step;
-        mapped.op = moving ? HOST_SCRIPT_MOVE : HOST_SCRIPT_CLICK;
-        bool resolved = g_landmark_frame && g_landmark_present == g_presents;
-        if (entity) {
-            const auto body = g_entity_bodies.get((uint32_t)step.entity_id);
-            resolved = entity_body_ready(step.entity_id);
-            if (resolved) {
-                mapped.x = body.x;
-                mapped.y = body.y;
-            }
-            printf("[smoke] %s entity %d: %s frame %llu", moving ? "move" : "click", step.entity_id,
-                   resolved ? "resolved" : "FAIL no fresh attributed body",
-                   (unsigned long long)body.frame);
-        } else {
-            resolved = resolved && fixture_world_point(g_world_projection, step.x, step.y,
-                                                       step.altitude, &mapped.x, &mapped.y);
-            printf("[smoke] %s world (%d,%d,%d): %s frame %llu", moving ? "move" : "click", step.x,
-                   step.y, step.altitude,
-                   resolved ? "resolved" : "FAIL projection unavailable or target outside view",
-                   (unsigned long long)g_landmark_frame);
-        }
-        if (!resolved) {
-            ++g_semantic_click_failures;
-            printf("\n");
-            break;
-        }
-        printf(" -> guest (%d,%d)\n", mapped.x, mapped.y);
-        if (!moving && entity)
-            g_select_entity_id = step.entity_id;
-        if (!moving && !entity && g_select_entity_id >= 0 && !g_watch_all.empty() &&
-            (!g_watch_selected || !g_watch_addr ||
-             guest_u16(g_watch_addr + 36) != g_select_entity_id ||
-             !(guest_u8(g_watch_addr + kOffSelected) & 0x80))) {
-            printf("[smoke] FAIL world order: entity %d has not registered as selected\n",
-                   g_select_entity_id);
-            ++g_semantic_click_failures;
-            break;
-        }
-        if (recomp_env("SMOKE_WINDOW_INPUT"))
-            g_window_gestures = true;
-        run_step(mapped); // normal selection/order, press, hold and release
-        break;
-    }
-    case HOST_SCRIPT_VIEWMOVE:
-    case HOST_SCRIPT_VIEWCLICK: {
-        HostScriptStep mapped = step;
-        if (!fixture_view_point(step.x, step.y, &mapped.x, &mapped.y)) {
-            ++g_simdump_failures;
-            break;
-        }
-        mapped.op = step.op == HOST_SCRIPT_VIEWMOVE ? HOST_SCRIPT_MOVE : HOST_SCRIPT_CLICK;
-        printf("[smoke] view gesture (%d,%d) -> guest (%d,%d)\n", step.x, step.y, mapped.x,
-               mapped.y);
-        run_step(mapped); // preserve selection/watch/order and hold bookkeeping
-        break;
-    }
     case HOST_SCRIPT_MOVE:
         move_pointer(step.x, step.y);
         break;
@@ -1366,23 +671,6 @@ void run_step(const HostScriptStep &step) {
         break;
     case HOST_SCRIPT_CLICK:
         move_pointer(step.x, step.y);
-        if (g_order_next && g_watch_addr) {
-            // The click after the one that selected is the order, and the
-            // order is the moment everything after it is measured from.
-            g_order_next = false;
-            sample_watched(true);
-            g_watch_order_at = (int)g_watch_samples.size() - 1;
-            const EntitySample &s = g_watch_samples.back();
-            printf("[smoke] order given with entity %d at (%u, %u), state %u\n", g_watch_index, s.x,
-                   s.z, s.state);
-            fflush(stdout);
-        } else if (!g_watch_all.empty() && !g_watch_selected) {
-            // A click that might select something: remember what every
-            // candidate's flag looked like before it.
-            for (WatchedOther &o : g_watch_all)
-                o.selected_before = guest_u8(o.addr + kOffSelected);
-            g_select_pending = true;
-        }
         // Only a press that was actually delivered owes a release. A press
         // the mod layer consumed never reached the guest, and a release for it
         // would be a lone up-transition the guest never saw a down for.
@@ -1494,89 +782,8 @@ void run_step(const HostScriptStep &step) {
         g_guestclick_release_at =
             g_presents + host_script_input_hold_frames(step.press_ms, host_pinned_clock_step());
         break;
-    case HOST_SCRIPT_MODE: {
-        // The offered list, set at RUNTIME and not through the environment.
-        // The variable restricts the list from process start, and this game
-        // selects 640x480x8 at startup without asking what is available and
-        // without checking the refusal, so a list that leaves the boot mode
-        // out crashes it. The boot mode stays in for that reason, and the
-        // requested mode is the one step along from it - which is what the
-        // recorded path's single arrow click takes.
-        // BOTH depths of the boot resolution, not just the one the game
-        // starts in. It selects 640x480x8 first and 640x480x16 a moment
-        // later - the front end runs at both - and a list without the second
-        // has that call refused. Measured: with only 640x480x8 and the target
-        // offered, the run died on "SetDisplayMode(640, 480, 16) is not one
-        // of the offered modes" and a jump through a null target.
-        // The boot resolution is not a target. The recorded path advances the
-        // resolution by one step, and 640x480 is where it starts: asking for
-        // it would replay a path that moves away from what was asked for, and
-        // the claim could only be answered by the mode the game was already
-        // in. Refused with a message rather than quietly measuring nothing.
-        if (step.w == 640 && step.h == 480) {
-            printf("[smoke] mode %dx%dx%d: 640x480 is the mode the front end "
-                   "already runs in, at both depths, so it cannot be the "
-                   "target of a path that advances by one step\n",
-                   step.w, step.h, step.bpp);
-            fflush(stdout);
-            ++g_mode_faults;
-            break;
-        }
-        if (g_mode_armed) {
-            // Two shapes, and they are different mistakes. One still waiting
-            // is a script that asked twice and will never learn whether the
-            // first arrived; one that already arrived is a script asking the
-            // game to change mode twice in a run, which the recorded path
-            // cannot do - it advances from 640x480, and the game is no longer
-            // there.
-            if (g_mode_arrived)
-                printf("[smoke] mode %dx%dx%d asked for after %dx%d %dbpp had "
-                       "already been applied; the recorded path advances from "
-                       "640x480 and the game has left it\n",
-                       step.w, step.h, step.bpp, g_mode_want_w, g_mode_want_h, g_mode_want_bpp);
-            else
-                printf("[smoke] mode %dx%dx%d asked for while %dx%d %dbpp was "
-                       "still armed and had not arrived\n",
-                       step.w, step.h, step.bpp, g_mode_want_w, g_mode_want_h, g_mode_want_bpp);
-            fflush(stdout);
-            ++g_mode_faults;
-            break;
-        }
-        char spec[96];
-        snprintf(spec, sizeof spec, "640x480x8,640x480x16,%dx%dx%d", step.w, step.h, step.bpp);
-        if (!ddraw_set_modes(spec)) {
-            printf("[smoke] mode %dx%dx%d: the shim refused the list \"%s\"\n", step.w, step.h,
-                   step.bpp, spec);
-            fflush(stdout);
-            ++g_mode_faults;
-            break;
-        }
-        if (!load_sub_script(RECOMP_GAME_DIR "/smoke/mode-select.script")) {
-            ++g_mode_faults;
-            break;
-        }
-        g_mode_armed = true;
-        g_mode_arrived = false;
-        g_mode_want_w = step.w;
-        g_mode_want_h = step.h;
-        g_mode_want_bpp = step.bpp;
-        printf("[smoke] mode %dx%dx%d asked for; driving the game's own "
-               "options path, and the claim is armed until a level applies "
-               "it\n",
-               step.w, step.h, step.bpp);
-        fflush(stdout);
-        break;
-    }
-    case HOST_SCRIPT_LANDMARK:
-        break; // the tick holds this step until its evidence or timeout
-    case HOST_SCRIPT_SIMDUMP:
-        write_simdump(step.name);
-        break;
     case HOST_SCRIPT_PEEK:
         peek(step.addr, step.len);
-        break;
-    case HOST_SCRIPT_WATCH:
-        watch_entity(step.owner, step.kind);
         break;
     case HOST_SCRIPT_READFILE:
         read_guest_file(step.name, step.text);
@@ -1615,7 +822,6 @@ bool produces_input(int op) {
     case HOST_SCRIPT_WAIT:
     case HOST_SCRIPT_DUMP:
     case HOST_SCRIPT_PEEK:
-    case HOST_SCRIPT_WATCH:
     case HOST_SCRIPT_READFILE:
     case HOST_SCRIPT_EXPECT:
     case HOST_SCRIPT_AWAIT:
@@ -1626,7 +832,6 @@ bool produces_input(int op) {
     // exists to prevent.
     case HOST_SCRIPT_PROBE:
     case HOST_SCRIPT_DUMPC:
-    case HOST_SCRIPT_LANDMARK:
     case HOST_SCRIPT_DUMPAT:
         return false;
     default:
@@ -1712,42 +917,6 @@ void tick() {
         g_guestclick_held = false;
         return;
     }
-    // The watched entity, read straight out of guest memory. This runs on the
-    // run thread inside the guest's own clock read, which is where the guest
-    // is not running, so the record is not being written while it is read.
-    sample_watched(false);
-
-    // The recorded path runs first and to the end. While it is running the
-    // main script is held where it is, and the main clock is moved on by
-    // whatever the path took, so the waits after a `mode` keep the spacing
-    // they were written with - the same rule an await follows.
-    if (g_sub_active) {
-        uint32_t sub_elapsed = boot_guest_millis() - g_sub_start_ms;
-        while (g_sub_next < g_sub_count && g_sub_steps[g_sub_next].at_ms <= sub_elapsed) {
-            if (g_holding_button >= 0 || g_guestclick_held)
-                return;
-            const HostScriptStep &sub = g_sub_steps[g_sub_next];
-            bool timed_out = false;
-            const uint32_t previous_start = g_sub_start_ms;
-            if (!semantic_step_ready(sub, g_sub_start_ms, timed_out))
-                return;
-            // The parent is held for the path's waits as well as its timeline.
-            g_script_start_ms += g_sub_start_ms - previous_start;
-            sub_elapsed = boot_guest_millis() - g_sub_start_ms;
-            if (!timed_out)
-                run_step(sub);
-            ++g_sub_next;
-            if (produces_input(sub.op))
-                return;
-        }
-        if (g_sub_next < g_sub_count)
-            return;
-        g_sub_active = false;
-        g_script_start_ms += sub_elapsed;
-        printf("[smoke] the recorded path finished after %.1fs\n", sub_elapsed / 1000.0);
-        fflush(stdout);
-    }
-
     uint32_t elapsed = boot_guest_millis() - g_script_start_ms;
     while (g_next_step < g_step_count && g_steps[g_next_step].at_ms <= elapsed) {
         if (g_holding_button >= 0)
@@ -1759,55 +928,13 @@ void tick() {
         // step after it is timed from the moment it passed, so the waits that
         // follow keep the spacing they were written with however long the game
         // took to get here.
-        if (step.op == HOST_SCRIPT_LANDMARK) {
-            if (!g_landmark_waiting) {
-                g_landmark_waiting = true;
-                g_landmark_since = boot_guest_millis();
-            }
-            auto it = g_landmarks.find((uint32_t)step.entity_id);
-            auto value = it == g_landmarks.end() ? LandmarkVisibility::unavailable : it->second;
-            bool passed = g_landmark_present == g_presents &&
-                          value == (step.want_visible ? LandmarkVisibility::visible
-                                                      : LandmarkVisibility::hidden);
-            uint32_t waited = boot_guest_millis() - g_landmark_since;
-            if (!passed && waited < step.timeout_ms)
-                break;
-            printf("[smoke] landmark %d expect %s: %s frame %llu evidence %s\n", step.entity_id,
-                   step.want_visible ? "visible" : "hidden", passed ? "PASS" : "FAIL",
-                   (unsigned long long)g_landmark_frame,
-                   value == LandmarkVisibility::unavailable ? "unavailable"
-                   : value == LandmarkVisibility::visible   ? "visible"
-                   : value == LandmarkVisibility::hidden    ? "hidden"
-                                                            : "not_drawn_in_view");
-            if (value == LandmarkVisibility::hidden)
-                printf(
-                    "[smoke] landmark %d hidden facts: entity present in simdump; world position "
-                    "projected outside recorded viewport; no attributed own-sprite draw; turn %u\n",
-                    step.entity_id, (uint32_t)metric("turn"));
-            char evidence_name[64];
-            snprintf(evidence_name, sizeof evidence_name, "landmark_%d", step.entity_id);
-            write_simdump(evidence_name);
-            if (!passed)
-                ++g_landmark_misses;
-            g_landmark_waiting = false;
-            g_script_start_ms += waited;
-            elapsed = boot_guest_millis() - g_script_start_ms;
-            ++g_next_step;
-            continue;
-        }
         if (step.op == HOST_SCRIPT_AWAIT) {
             if (!g_await_started) {
                 g_await_started = true;
                 g_await_since = boot_guest_millis();
                 g_await_true = false;
             }
-            const bool entity_assertion = !strcmp(step.name, "entity_body");
-            const auto body = g_entity_bodies.get((uint32_t)step.entity_id);
-            const auto entity_result =
-                entity_assertion ? g_entity_await.poll(boot_guest_millis(), g_completed_presents,
-                                                       body.frame, body.present, body.frame != 0)
-                                 : HostEntityWaitResult::pending;
-            double now = metric(step.name, step.entity_id);
+            double now = metric(step.name);
             uint32_t at = boot_guest_millis();
             if (step.at_least ? now >= step.threshold : now > step.threshold) {
                 if (!g_await_true) {
@@ -1833,10 +960,7 @@ void tick() {
             // seconds Gate B was written to wait for.
             bool passed = g_await_true && held >= need && held_ms >= step.hold_ms;
             uint32_t waited = at - g_await_since;
-            if (entity_assertion && entity_result == HostEntityWaitResult::timed_out)
-                passed = false;
-            if (!passed && waited < step.timeout_ms &&
-                (!entity_assertion || entity_result != HostEntityWaitResult::timed_out))
+            if (!passed && waited < step.timeout_ms)
                 break;
             // The value reached is printed whether the wait passed or not. A
             // timeout that says only "did NOT hold above 100" leaves the
@@ -1848,19 +972,10 @@ void tick() {
                    step.name, passed ? "held above" : "did NOT hold above",
                    step.at_least ? " or equal to" : "", step.threshold, now, held, held_ms,
                    step.hold_ms, waited / 1000.0);
-            if (entity_assertion) {
-                char diagnostic[256];
-                host_entity_body_diagnostic(diagnostic, sizeof diagnostic, step.entity_id,
-                                            g_completed_presents, body, passed);
-                printf("[smoke] %s; budget %u completed presents\n", diagnostic,
-                       HostEntityWait::max_presents);
-                g_entity_await = {};
-            }
             fflush(stdout);
             if (!passed)
                 ++g_await_timeouts;
-            if (!passed &&
-                (!strcmp(step.name, "entity_body") || !strcmp(step.name, "dumpat_fired"))) {
+            if (!passed && !strcmp(step.name, "dumpat_fired")) {
                 g_await_started = false;
                 g_quit_requested = true;
                 boot_request_close("script readiness assertion timed out");
@@ -1878,12 +993,7 @@ void tick() {
             ++g_next_step;
             continue;
         }
-        bool timed_out = false;
-        if (!semantic_step_ready(step, g_script_start_ms, timed_out))
-            break;
-        elapsed = boot_guest_millis() - g_script_start_ms;
-        if (!timed_out)
-            run_step(step);
+        run_step(step);
         ++g_next_step;
         // ONE INPUT-PRODUCING STEP PER HOST TURN.
         //
@@ -1907,7 +1017,7 @@ void tick() {
         // millisecond and the script gets a turn between the two moves every
         // time, which is why unpinned runs never showed it.
         //
-        // Steps that produce no input - dump, peek, watch, expect, readfile -
+        // Steps that produce no input - dump, peek, expect, readfile -
         // still drain in the same turn, so this costs a script nothing except
         // where it matters. It also subsumes the click case: the
         // `g_holding_button >= 0` break above is one instance of this rule.
@@ -1947,10 +1057,7 @@ bool script_pending() {
     st.hold_reached = g_presents >= g_release_at_presents ? 1 : 0;
     st.guestclick_held = g_guestclick_held ? 1 : 0;
     st.guestclick_reached = g_presents >= g_guestclick_release_at ? 1 : 0;
-    st.sub_active = g_sub_active ? 1 : 0;
-    st.sub_step_due = !g_entity_wait.active && g_sub_active && g_sub_next < g_sub_count &&
-                      g_sub_steps[g_sub_next].at_ms <= boot_guest_millis() - g_sub_start_ms;
-    st.await_started = (g_await_started || g_landmark_waiting || g_entity_wait.active) ? 1 : 0;
+    st.await_started = g_await_started ? 1 : 0;
     st.script_started = g_script_started ? 1 : 0;
     st.steps_left = g_next_step < g_step_count ? 1 : 0;
     st.step_due = g_next_step < g_step_count && g_script_started &&
@@ -1982,7 +1089,7 @@ int idle_wait(double seconds) {
     return 0;
 }
 
-// Report script progress, rendering evidence and watched entity state for this run.
+// Report script progress and rendering evidence for this run.
 // Shared metric formatters keep smoke reports comparable with the interactive host.
 void report(FILE *out, bool abnormal) {
     (void)abnormal;
@@ -2003,8 +1110,6 @@ void report(FILE *out, bool abnormal) {
                 (unsigned long long)hd.draws, (unsigned long long)hd.loads,
                 (unsigned long long)hd.hits, (unsigned long long)hd.refused,
                 (unsigned long long)hd.resident_bytes, (unsigned long long)hd.budget_bytes);
-        fprintf(out, "terrain detail:     %llu world tile draws\n",
-                (unsigned long long)hd.detail_draws);
     }
     fprintf(out, "Direct3D:           %u draws, %u textures, %u write-backs\n",
             host_d3d_total_draws(), host_d3d_total_textures(), host_d3d_total_flushes());
@@ -2023,55 +1128,6 @@ void report(FILE *out, bool abnormal) {
             fprintf(out, "gameplay: %s\n", line);
         if (host_stats_access_line(line, sizeof line))
             fprintf(out, "%s\n", line);
-    }
-    if (g_watch_owner >= 0) {
-        fprintf(out, "entities:           %u with owner %d kind %d\n", g_watch_matches,
-                g_watch_owner, g_watch_kind);
-    }
-    for (const WatchedOther &o : g_watch_all) {
-        fprintf(out, "  entity %-5u %08x  (%u, %u) state %u  ->  (%u, %u) state %u  written at",
-                o.index, o.addr, o.x, o.z, o.state, guest_u16(o.addr + kOffPosition),
-                guest_u16(o.addr + kOffPosition + 2), guest_u8(o.addr + kOffState));
-        uint32_t n = 0;
-        for (uint32_t i = 0; i < kEntityStride; ++i)
-            if (o.changed[i]) {
-                fprintf(out, " +%u", i);
-                ++n;
-            }
-        if (!n)
-            fprintf(out, " nothing");
-        fprintf(out, "\n");
-    }
-    if (g_watch_addr && !g_watch_samples.empty()) {
-        const EntitySample &first = g_watch_samples.front();
-        const EntitySample &last = g_watch_samples.back();
-        fprintf(out, "watched entity:     %d at %08x, %zu samples%s\n", g_watch_index, g_watch_addr,
-                g_watch_samples.size(),
-                g_watch_selected ? " (the one the click selected)"
-                                 : " (nothing was selected; this is the first match)");
-        fprintf(out, "                    (%u, %u) state %u  ->  (%u, %u) state %u\n", first.x,
-                first.z, first.state, last.x, last.z, last.state);
-        uint32_t changed = 0;
-        for (uint32_t i = 0; i < kEntityStride; ++i)
-            changed += g_watch_changed[i];
-        fprintf(out, "  bytes written:    %u of %u", changed, kEntityStride);
-        if (changed) {
-            fprintf(out, " at");
-            for (uint32_t i = 0; i < kEntityStride; ++i)
-                if (g_watch_changed[i])
-                    fprintf(out, " +%u", i);
-        }
-        fprintf(out, "\n");
-        if (g_watch_order_at >= 0) {
-            const EntitySample &order = g_watch_samples[(size_t)g_watch_order_at];
-            fprintf(out,
-                    "  after the order:  from (%u, %u) state %u, moved %.1f units, "
-                    "%.3f of steps toward where it ended, %.0f state changes\n",
-                    order.x, order.z, order.state, watch_moved(), watch_toward_target(),
-                    watch_state_changes());
-        } else {
-            fprintf(out, "  after the order:  no order was given\n");
-        }
     }
     boot_print_dx_objects(out);
     boot_print_exit_code(out);
@@ -2100,11 +1156,6 @@ extern "C" void host_set_display_mode(int w, int h, int bpp) {
     // The armed claim, answered here because this is the moment the game
     // applies a mode - when it recreates its surfaces at a level start, not
     // when the options screen is left.
-    if (g_mode_armed && !g_mode_arrived && w == g_mode_want_w && h == g_mode_want_h &&
-        bpp == g_mode_want_bpp) {
-        g_mode_arrived = true;
-        printf("[smoke] the mode asked for arrived: %dx%d %dbpp\n", w, h, bpp);
-    }
     printf("[smoke] display mode %dx%d %dbpp\n", w, h, bpp);
     fflush(stdout);
 }
@@ -2242,10 +1293,8 @@ extern "C" void host_present(const void *pixels, int w, int h, int bpp, const ui
     // surface refresh. Both paths publish BODY records before firing dumpat.
     if (!recomp_env("SMOKE_DRAWABLE")) {
         ++g_completed_presents;
-        capture_landmarks(true);
         fire_dumpat(host_frame_class(host_frame_current()), false);
     } else {
-        capture_landmarks();
     }
 
     // A cheap hash over a sample of the frame: enough to tell one picture from
@@ -2314,9 +1363,7 @@ HostFrameCapture fire_dumpat(HostScreenClass cls, bool at_seal) {
                                   (uint32_t)metric("turn"),    (uint32_t)metric("command_frame"),
                                   g_completed_presents,        boot_guest_millis(),
                                   host_frame_current().id,     host_clock_description()};
-    if (!host_dumpat_fire(g_dumpat, sample, host_dump_dir(),
-                          recomp_env("SMOKE_SIM_REGIONS") != nullptr,
-                          [](const char *name) { return write_simdump(name); }))
+    if (!host_dumpat_fire(g_dumpat, sample, host_dump_dir()))
         return {};
     const std::string base = std::string(host_dump_dir()) + "/smoke_" + g_dumpat.name;
     g_dumps.push_back(base + "_provenance.txt");
@@ -2364,15 +1411,14 @@ HostFrameCapture fire_dumpat(HostScreenClass cls, bool at_seal) {
 
 HostFrameCapture capture_at_seal(HostScreenClass cls) {
     ++g_completed_presents;
-    capture_landmarks(true);
     return fire_dumpat(cls, true);
 }
 
 void write_composite_dump(const char *name) {
-    if (recomp_env("SMOKE_CLASSIC_PROBE") || recomp_env("SMOKE_DRAWABLE")) {
+    if (recomp_env("SMOKE_DRAWABLE")) {
         HostCompletedComposite frame;
         if (!host_present_copy_composite(&frame)) {
-            fprintf(stderr, "[smoke] Classic dumpc FAILED: no completed composition\n");
+            fprintf(stderr, "[smoke] Drawable dumpc FAILED: no completed composition\n");
             ++g_probe_misses;
             return;
         }
@@ -2386,7 +1432,7 @@ void write_composite_dump(const char *name) {
             return;
         }
         g_dumps.push_back(path);
-        printf("[smoke] Classic dumpc completed frame=%llu class=%d guest=%dx%d drawable=%dx%d\n",
+        printf("[smoke] Drawable dumpc completed frame=%llu class=%d guest=%dx%d drawable=%dx%d\n",
                (unsigned long long)frame.frame_id, int(frame.cls), frame.guest_w, frame.guest_h,
                frame.w, frame.h);
         return;
@@ -2625,26 +1671,6 @@ int main(int argc, char **argv) {
             fprintf(stderr, "smoke: %s\n", loader_error());
             return 2;
         }
-        if (recomp_env("SMOKE_CLASSIC_PROBE")) {
-            // The probe deliberately tests candidates before any survive the
-            // committed list. The native compatibility hooks stay active; the
-            // probe environment isolates user settings and external plugins.
-            mods_host_set_main_thread();
-            mods_display_reset();
-            mods_display_init();
-            if (mods_display_set(DISPLAY_RENDERING, 1) != POP_OK)
-                return 2;
-            int w = 0, h = 0, bpp = 0;
-            char extra = 0;
-            const char *target = recomp_env("SMOKE_CLASSIC_PROBE");
-            if (sscanf(target, "%dx%dx%d%c", &w, &h, &bpp, &extra) != 3 || w <= 0 || h <= 0 ||
-                (bpp != 8 && bpp != 16))
-                return 2;
-            if (!ddraw_set_modes(recomp_env("DDRAW_MODES")))
-                return 2;
-            host_present_resize(w, h);
-            printf("[smoke] Classic probe active: %dx%dx%d\n", w, h, bpp);
-        }
         printf("[smoke] %s, entry %08x\n", loader_exe_path().c_str(), loader_entry_point());
         fflush(stdout);
         boot_run();
@@ -2685,19 +1711,6 @@ int main(int argc, char **argv) {
                g_next_step < g_step_count ? g_next_step : g_step_count, g_step_count);
         ++failed;
     }
-    if (g_mode_faults) {
-        printf("\n%d mode step%s never reached the game\n", g_mode_faults,
-               g_mode_faults == 1 ? "" : "s");
-        failed += g_mode_faults;
-    }
-    if (g_mode_armed && !g_mode_arrived) {
-        printf("\n%dx%d %dbpp was asked for and never applied; the game "
-               "applies a mode when a level starts and recreates its "
-               "surfaces, so a script that asks for one has to enter a "
-               "level\n",
-               g_mode_want_w, g_mode_want_h, g_mode_want_bpp);
-        ++failed;
-    }
     if (recomp_env("SMOKE_DRAWABLE") &&
         (g_completed_captures.load() != g_dumpat.fired || g_capture_failures.load())) {
         fprintf(stderr,
@@ -2710,18 +1723,9 @@ int main(int argc, char **argv) {
                g_probe_misses == 1 ? "" : "s");
         failed += g_probe_misses;
     }
-    failed += g_simdump_failures;
     if (g_window_mapping_failures) {
         printf("%d window mapping failures\n", g_window_mapping_failures);
         failed += g_window_mapping_failures;
-    }
-    if (g_semantic_click_failures) {
-        printf("\n%d semantic clicks failed\n", g_semantic_click_failures);
-        failed += g_semantic_click_failures;
-    }
-    if (g_landmark_misses) {
-        printf("\n%d landmark expectations failed\n", g_landmark_misses);
-        failed += g_landmark_misses;
     }
     // An armed dumpat that never fired means the reference frame it was for
     // does not exist, and a run that quietly produced no reference is worse

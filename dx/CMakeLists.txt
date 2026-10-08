@@ -120,8 +120,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND RECOMP_D3D8_WGPU_DIR AND EXISTS "${RE
 endif()
 
 # The same shims with every host callback a strong no-op: a binary linking
-# these can neither draw nor play sound. The parity fixture and the profile
-# tests use it.
+# these can neither draw nor play sound. Profile and mod tests use it.
 add_library(recomp_dx_null OBJECT ${POP_DX_SOURCES})
 add_dependencies(recomp_dx_null d3d8_com_tables)
 target_include_directories(recomp_dx_null PRIVATE "${RECOMP_D3D8_GENERATED_DIR}")

@@ -1,7 +1,7 @@
 // hooks_tests.cpp - the mutable dispatch layer over immutable translated code.
 //
-// Every test drives a real translated function through the real generated
-// tables. Headless: the guest image is mapped, nothing is displayed.
+// Tests drive the selected image's dispatch tables with returning replacement
+// hooks. No original game routine runs; the guest image is mapped headlessly.
 #include "mods_tests.h"
 #include "shim_call.h"
 #include "../mods_internal.h"
@@ -18,17 +18,10 @@
 
 namespace {
 
-// Two real entry symbols. 004ec6f0 is the turn scheduler; 0040c690 is
-// load_objs, whose AL result the level-load event reads.
-const uint32_t TURN = 0x004ec6f0u;
-const uint32_t LOAD = 0x0040c690u;
-const uint32_t RET_ADDR = 0x00401000u;
-// Real entries from build/recomp/symbols.json that dispatch knows and
-// eligibility refuses: a listing-gap continuation and an internal block. Both
-// are in recomp_func_addrs, so a test using them exercises the eligibility
-// check rather than the "not in the table" path.
-const uint32_t CONTINUATION = 0x00401004u;   // calc_distance_1d_wraparound.blk_...
-const uint32_t INTERNAL_BLOCK = 0x00401920u; // sub_00401920.blk_00401920
+// Select entries from the current image's verified hook catalog, rather than
+// assigning gameplay meanings to addresses from another game.
+uint32_t OUTER = 0, INNER = 0;
+const uint32_t RET_ADDR = 0x03000000u; // test-only return sentinel
 
 std::vector<std::string> g_log;
 PopModApi g_api[4]; // stable instances, one per test owner
@@ -60,6 +53,22 @@ void reset_world() {
     mods_hooks_reset();
     mem_init();
     loader_load(nullptr);
+    MOD_CHECK(mods_symbols_load(nullptr));
+    OUTER = INNER = 0;
+    for (uint32_t i = 0; i < recomp_func_count; ++i) {
+        if (!mods_symbol_hookable(recomp_func_addrs[i]))
+            continue;
+        if (!OUTER)
+            OUTER = recomp_func_addrs[i];
+        else {
+            INNER = recomp_func_addrs[i];
+            break;
+        }
+    }
+    if (!OUTER || !INNER) {
+        mod_test_fail("hook tests require two verified entries", __FILE__, __LINE__);
+        abort();
+    }
     for (uint32_t i = 0; i < 4; ++i) {
         memset(&g_api[i], 0, sizeof g_api[i]);
         g_api[i].version = POP_MOD_API_VERSION;
@@ -94,15 +103,32 @@ void pump_on_guest_thread() {
     mod_test_call_import(c, "KERNEL32.dll", "CloseHandle", {th});
 }
 
-// Enter a hooked function the way a generated call site does: push a return
-// address, then dispatch through the table.
+// Supply a returning replacement when a test exercises only before/after
+// callbacks. This keeps arbitrary original game bodies out of framework tests.
+void dispatch_test(X86 *c, uint32_t addr) {
+    uint32_t fallback = 0;
+    const auto status = mods_hook_install(
+        0, addr,
+        [](const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
+            MOD_CHECK_EQ(api->hook_return(api, cpu, cpu->eax, 0), POP_OK);
+        },
+        POP_HOOK_REPLACE, nullptr, &fallback);
+    MOD_CHECK(status == POP_OK || status == POP_E_CONFLICT);
+    const int32_t i = recomp_index_of(addr);
+    MOD_CHECK(i >= 0);
+    if (i >= 0)
+        recomp_hook_ptrs[i](c, (uint32_t)i);
+    if (fallback)
+        MOD_CHECK_EQ(mods_hook_remove(0, fallback), POP_OK);
+}
+
+// Push the test return sentinel exactly as a generated call site would.
 void enter(uint32_t addr) {
     X86 *c = loader_context();
     loader_init_context(c);
     c->r[R_ESP] -= 4;
     wr32(c->r[R_ESP], RET_ADDR);
-    int32_t i = recomp_index_of(addr);
-    recomp_hook_ptrs[i](c, (uint32_t)i);
+    dispatch_test(c, addr);
 }
 
 } // namespace
@@ -138,7 +164,7 @@ MOD_TEST_SUITE(hook_guest_call_import_preserves_registers) {
     };
     const uint32_t entry = loader_entry_point();
     MOD_CHECK_EQ(g_api[0].hook_install_ex(&g_api[0], entry, 0, callback, POP_HOOK_REPLACE,
-                                          POP_HOOK_NO_GAME_VIEW, (void *)&trampoline, &id),
+                                          (void *)&trampoline, &id),
                  POP_OK);
     if (id) {
         enter(entry);
@@ -212,113 +238,32 @@ MOD_TEST_SUITE(hook_callsite_filter_snapshot_and_entry_identity) {
     MOD_CHECK_EQ(recomp_hooked[recomp_index_of(target)], 0u);
 }
 
-MOD_TEST_SUITE(hook_explicit_no_view_preserves_nested_snapshots) {
-    reset_world();
-    mods_view_reset();
-    MOD_CHECK(mods_symbols_load(nullptr));
-    auto install = g_api[0].hook_install_ex;
-    MOD_CHECK(install != nullptr);
-    uint32_t ids[3] = {};
-    auto inner = [](const PopModApi *a, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
-        MOD_CHECK(mods_view_active());
-        MOD_CHECK_EQ(mods_view_depth(), 3u);
-        note("normal-inner");
-        MOD_CHECK_EQ(a->hook_return(a, cpu, 42, 0), POP_OK);
-    };
-    auto no_view = [](const PopModApi *a, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *) {
-        auto unavailable = [] {
-            MOD_CHECK(!mods_view_active());
-            MOD_CHECK_EQ(mods_view_depth(), 2u);
-            MOD_CHECK_EQ(mods_entity_count(), 0u);
-            uint32_t slot = 0;
-            PopEntityView entity{};
-            PopTribeView tribe{};
-            MOD_CHECK_EQ(mods_entity_slot(0, &slot), POP_E_STATE);
-            MOD_CHECK_EQ(mods_entity(0, &entity), POP_E_STATE);
-            MOD_CHECK_EQ(mods_tribe(0, &tribe), POP_E_STATE);
-        };
-        unavailable();
-        note("no-view-in");
-        MOD_CHECK_EQ(a->call_next(a, inv, cpu), POP_OK);
-        unavailable();
-        MOD_CHECK_EQ(cpu->eax, 42u);
-        note("no-view-out");
-    };
-    auto ordinary = [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {
-        MOD_CHECK(mods_view_active());
-        MOD_CHECK_EQ(mods_view_depth(), 2u);
-        note("normal-before");
-    };
-    ids[0] = 99;
-    MOD_CHECK_EQ(install(&g_api[0], LOAD, 0, no_view, POP_HOOK_WRAP, 2, nullptr, &ids[0]),
-                 POP_E_INVAL);
-    MOD_CHECK_EQ(ids[0], 0u);
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, inner, POP_HOOK_REPLACE, nullptr, &ids[0]), POP_OK);
-    MOD_CHECK_EQ(install(&g_api[0], LOAD, RET_ADDR, no_view, POP_HOOK_WRAP, POP_HOOK_NO_GAME_VIEW,
-                         nullptr, &ids[1]),
-                 POP_OK);
-    MOD_CHECK_EQ(install(&g_api[0], LOAD, 0, ordinary, POP_HOOK_BEFORE, 0, nullptr, &ids[2]),
-                 POP_OK);
-    mods_view_push();
-    const auto snapshots = mods_view_test_push_count();
-    enter(LOAD);
-    MOD_CHECK_EQ(mods_view_test_push_count() - snapshots, 2u); // only ordinary callbacks
-    MOD_CHECK_EQ(g_log.size(), 4u);
-    if (g_log.size() == 4) {
-        MOD_CHECK_STR(g_log[0].c_str(), "normal-before");
-        MOD_CHECK_STR(g_log[1].c_str(), "no-view-in");
-        MOD_CHECK_STR(g_log[2].c_str(), "normal-inner");
-        MOD_CHECK_STR(g_log[3].c_str(), "no-view-out");
-    }
-    MOD_CHECK(mods_view_active());
-    MOD_CHECK_EQ(mods_view_depth(), 1u);
-    MOD_CHECK_EQ(mods_hook_depth(), 0u);
-    mods_view_pop();
-    for (auto id : ids)
-        MOD_CHECK_EQ(mods_hook_remove(0, id), POP_OK);
-}
-
 MOD_TEST_SUITE(hook_install_eligibility) {
     reset_world();
     uint32_t id = 0;
     auto nop = [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {};
 
-    MOD_CHECK_EQ(mods_hook_install(0, TURN, nop, POP_HOOK_BEFORE, nullptr, &id), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, OUTER, nop, POP_HOOK_BEFORE, nullptr, &id), POP_OK);
     MOD_CHECK(id != 0);
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(TURN)], 1);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(OUTER)], 1);
 
-    // Every kind of address that is not an eligible entry symbol is
-    // POP_E_NOSYMBOL, not a silent no-op. These are real entries taken from
-    // symbols.json rather than arbitrary interior addresses: each one IS in
-    // the dispatch table, so only the eligibility check can refuse it, which
-    // is the thing being tested.
+    // All dispatchable non-entry symbols must fail eligibility. Some images
+    // have no such symbols; the absent-address checks still run for them.
     uint32_t id2 = 0;
-    // A listing-gap continuation: dispatchable, but not a symbol a mod can
-    // name across builds.
-    MOD_CHECK(recomp_index_of(CONTINUATION) >= 0);
-    MOD_CHECK_EQ(mods_hook_install(0, CONTINUATION, nop, POP_HOOK_BEFORE, nullptr, &id2),
-                 POP_E_NOSYMBOL);
-    // An internal block of a larger function, likewise.
-    MOD_CHECK(recomp_index_of(INTERNAL_BLOCK) >= 0);
-    MOD_CHECK_EQ(mods_hook_install(0, INTERNAL_BLOCK, nop, POP_HOOK_BEFORE, nullptr, &id2),
-                 POP_E_NOSYMBOL);
-    // And an address that is not in the table at all.
-    MOD_CHECK(recomp_index_of(TURN + 3) < 0);
-    MOD_CHECK_EQ(mods_hook_install(0, TURN + 3, nop, POP_HOOK_BEFORE, nullptr, &id2),
-                 POP_E_NOSYMBOL);
+    for (uint32_t i = 0; i < recomp_func_count; ++i) {
+        const uint32_t addr = recomp_func_addrs[i];
+        if (!mods_symbol_hookable(addr))
+            MOD_CHECK_EQ(mods_hook_install(0, addr, nop, POP_HOOK_BEFORE, nullptr, &id2),
+                         POP_E_NOSYMBOL);
+    }
     MOD_CHECK_EQ(mods_hook_install(0, TRAMP_BASE, nop, POP_HOOK_BEFORE, nullptr, &id2),
                  POP_E_NOSYMBOL);
     MOD_CHECK_EQ(mods_hook_install(0, 0u, nop, POP_HOOK_BEFORE, nullptr, &id2), POP_E_NOSYMBOL);
-    // An entry that dispatch knows but symbols.json marks unhookable - an
-    // intrinsic substitution - is refused as well.
-    MOD_CHECK(recomp_index_of(0x0055db78u) >= 0);
-    MOD_CHECK_EQ(mods_hook_install(0, 0x0055db78u, nop, POP_HOOK_BEFORE, nullptr, &id2),
-                 POP_E_NOSYMBOL);
 
     MOD_CHECK_EQ(mods_hook_remove(0, id), POP_OK);
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(TURN)], 0);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(OUTER)], 0);
     uint32_t id3 = 0;
-    MOD_CHECK_EQ(mods_hook_install(0, TURN, nop, POP_HOOK_BEFORE, nullptr, &id3), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, OUTER, nop, POP_HOOK_BEFORE, nullptr, &id3), POP_OK);
     MOD_CHECK(id3 != id); // handles are never reused
     MOD_CHECK_EQ(mods_hook_remove(0, id), POP_E_NOTFOUND);
 
@@ -326,8 +271,8 @@ MOD_TEST_SUITE(hook_install_eligibility) {
     // a running invocation.
     reset_world();
     for (int i = 0; i < 16; ++i)
-        MOD_CHECK_EQ(mods_hook_install(0, TURN, nop, POP_HOOK_BEFORE, nullptr, &id), POP_OK);
-    MOD_CHECK_EQ(mods_hook_install(0, TURN, nop, POP_HOOK_BEFORE, nullptr, &id), POP_E_LIMIT);
+        MOD_CHECK_EQ(mods_hook_install(0, OUTER, nop, POP_HOOK_BEFORE, nullptr, &id), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, OUTER, nop, POP_HOOK_BEFORE, nullptr, &id), POP_E_LIMIT);
 }
 
 MOD_TEST_SUITE(hook_replace_conflict_and_wrap) {
@@ -336,9 +281,9 @@ MOD_TEST_SUITE(hook_replace_conflict_and_wrap) {
     auto ret0 = [](const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
         api->hook_return(api, cpu, 0, 0);
     };
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, ret0, POP_HOOK_REPLACE, nullptr, &a), POP_OK);
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, ret0, POP_HOOK_REPLACE, nullptr, &b), POP_E_CONFLICT);
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, ret0, POP_HOOK_WRAP, nullptr, &w), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, ret0, POP_HOOK_REPLACE, nullptr, &a), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, ret0, POP_HOOK_REPLACE, nullptr, &b), POP_E_CONFLICT);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, ret0, POP_HOOK_WRAP, nullptr, &w), POP_OK);
 }
 
 MOD_TEST_SUITE(hook_before_order_cancel_and_registers) {
@@ -349,32 +294,32 @@ MOD_TEST_SUITE(hook_before_order_cancel_and_registers) {
     // the skipped hook was supposed to set.
     uint32_t id = 0;
     MOD_CHECK_EQ(mods_hook_install(
-                     1, LOAD,
+                     1, INNER,
                      [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {
                          note("before-1-must-not-run");
                      },
                      POP_HOOK_BEFORE, nullptr, &id),
                  POP_OK);
     MOD_CHECK_EQ(mods_hook_install(
-                     0, LOAD,
+                     0, INNER,
                      [](const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
                          note("before-0");
                          MOD_CHECK_EQ(api->mod_index, 0u); // its own API
                          MOD_CHECK_EQ(cpu->phase, (uint32_t)POP_PHASE_BEFORE);
-                         MOD_CHECK_EQ(cpu->eip, LOAD); // normalised entry
-                         MOD_CHECK_EQ(cpu->target, LOAD);
+                         MOD_CHECK_EQ(cpu->eip, INNER); // normalised entry
+                         MOD_CHECK_EQ(cpu->target, INNER);
                          cpu->ebx = 0x0b0b0b0bu;                 // an edit that sticks
                          api->hook_return(api, cpu, 0x1234u, 0); // cancel
                      },
                      POP_HOOK_BEFORE, nullptr, &id),
                  POP_OK);
     MOD_CHECK_EQ(mods_hook_install(
-                     1, LOAD,
+                     1, INNER,
                      [](const PopModApi *, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
                          note("after-1");
                          MOD_CHECK_EQ(cpu->phase, (uint32_t)POP_PHASE_AFTER);
                          MOD_CHECK_EQ(cpu->eip, RET_ADDR); // the RET already ran
-                         MOD_CHECK_EQ(cpu->target, LOAD);
+                         MOD_CHECK_EQ(cpu->target, INNER);
                          MOD_CHECK_EQ(cpu->eax, 0x1234u); // the cancel's result
                          cpu->eax = 0x5678u;              // after may edit eax
                          cpu->ebx = 0xdeadbeefu;          // and this is ignored
@@ -382,19 +327,19 @@ MOD_TEST_SUITE(hook_before_order_cancel_and_registers) {
                      POP_HOOK_AFTER, nullptr, &id),
                  POP_OK);
     MOD_CHECK_EQ(mods_hook_install(
-                     0, LOAD,
+                     0, INNER,
                      [](const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *) {
                          note("after-0");
                          // An after hook cannot cancel, delegate or return: the guest RET
                          // has already happened.
                          MOD_CHECK_EQ(api->hook_return(api, cpu, 1, 0), POP_E_STATE);
-                         MOD_CHECK_EQ(api->call_original(api, LOAD, cpu), POP_E_STATE);
+                         MOD_CHECK_EQ(api->call_original(api, INNER, cpu), POP_E_STATE);
                          MOD_CHECK_EQ(api->call_next(api, inv, cpu), POP_E_STATE);
                      },
                      POP_HOOK_AFTER, nullptr, &id),
                  POP_OK);
 
-    enter(LOAD);
+    enter(INNER);
 
     // Three entries: the cancelling before hook, then both after hooks in the
     // reverse of before order. The skipped hook logged nothing.
@@ -416,7 +361,7 @@ MOD_TEST_SUITE(hook_a_handle_belongs_to_the_mod_that_made_it) {
     const uint32_t A = MODS_OWNER_FIRST_MOD, B = MODS_OWNER_FIRST_MOD + 1;
 
     uint32_t mine = 0;
-    MOD_CHECK_EQ(mods_hook_install(A, TURN, nop, POP_HOOK_BEFORE, nullptr, &mine), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(A, OUTER, nop, POP_HOOK_BEFORE, nullptr, &mine), POP_OK);
     MOD_CHECK_EQ(mods_hooks_installed_count(), 1u);
 
     // Handles are small integers from one sequence, so another mod can name
@@ -426,7 +371,7 @@ MOD_TEST_SUITE(hook_a_handle_belongs_to_the_mod_that_made_it) {
     // would be a removal of something it never registered.
     MOD_CHECK_EQ(mods_hook_remove(B, mine), POP_E_NOTFOUND);
     MOD_CHECK_EQ(mods_hooks_installed_count(), 1u);
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(TURN)], 1);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(OUTER)], 1);
     // The runtime's own owner has no special claim on it either.
     MOD_CHECK_EQ(mods_hook_remove(MODS_OWNER_RUNTIME, mine), POP_E_NOTFOUND);
     MOD_CHECK_EQ(mods_hooks_installed_count(), 1u);
@@ -434,7 +379,7 @@ MOD_TEST_SUITE(hook_a_handle_belongs_to_the_mod_that_made_it) {
     // And a queued handle is protected the same way, before it is published.
     uint32_t queued = 0;
     std::thread([&] {
-        MOD_CHECK_EQ(mods_hook_install(A, LOAD, nop, POP_HOOK_BEFORE, nullptr, &queued), POP_OK);
+        MOD_CHECK_EQ(mods_hook_install(A, INNER, nop, POP_HOOK_BEFORE, nullptr, &queued), POP_OK);
     }).join();
     MOD_CHECK_EQ(mods_hook_remove(B, queued), POP_E_NOTFOUND);
     pump_on_guest_thread();
@@ -449,123 +394,11 @@ MOD_TEST_SUITE(hook_a_handle_belongs_to_the_mod_that_made_it) {
     // A rollback of one mod leaves another's alone, which is the property the
     // ownership check exists to keep true.
     uint32_t keep = 0, drop = 0;
-    MOD_CHECK_EQ(mods_hook_install(A, TURN, nop, POP_HOOK_BEFORE, nullptr, &keep), POP_OK);
-    MOD_CHECK_EQ(mods_hook_install(B, TURN, nop, POP_HOOK_BEFORE, nullptr, &drop), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(A, OUTER, nop, POP_HOOK_BEFORE, nullptr, &keep), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(B, OUTER, nop, POP_HOOK_BEFORE, nullptr, &drop), POP_OK);
     mods_hooks_remove_all(B);
     MOD_CHECK_EQ(mods_hooks_installed_count(), 1u);
     MOD_CHECK_EQ(mods_hook_remove(A, keep), POP_OK);
-}
-
-MOD_TEST_SUITE(hook_every_field_comes_back_after_delegation) {
-    reset_world();
-    uint32_t id = 0;
-    // A replace hook that delegates and then edits registers the old
-    // copy-back dropped: everything but eax and edx was discarded once the
-    // RET had happened, though the contract for before and replace is that
-    // every field inside `size` comes back.
-    MOD_CHECK_EQ(mods_hook_install(
-                     0, LOAD,
-                     [](const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
-                         wr32(cpu->esp + 4, 2u);
-                         MOD_CHECK_EQ(api->call_original(api, cpu->target, cpu), POP_OK);
-                         // After the original returned, and after the RET.
-                         cpu->eax = 0x11110000u;
-                         cpu->esi = 0x5151abcdu;
-                         cpu->ebx = 0x0b0b0b0bu;
-                         cpu->fpu_cw = 0x0e7fu;
-                         cpu->st[0] = 12.5;
-                         // These two must NOT come back: the RET has happened, and putting
-                         // either of them back over it would undo the return.
-                         cpu->esp = 0xdeadbee0u;
-                         cpu->eip = 0xdeadbee4u;
-                     },
-                     POP_HOOK_REPLACE, nullptr, &id),
-                 POP_OK);
-
-    X86 *c = loader_context();
-    enter(LOAD);
-    MOD_CHECK_EQ(c->r[R_EAX], 0x11110000u);
-    MOD_CHECK_EQ(c->r[R_ESI], 0x5151abcdu);
-    MOD_CHECK_EQ(c->r[R_EBX], 0x0b0b0b0bu);
-    MOD_CHECK_EQ(c->fpu_cw, 0x0e7f);
-    MOD_CHECK(c->st[0] == 12.5);
-    // And the two that cannot: the frame the return landed on is still the
-    // one the caller is standing in.
-    MOD_CHECK_EQ(c->eip, RET_ADDR);
-    MOD_CHECK(c->r[R_ESP] != 0xdeadbee0u);
-}
-
-MOD_TEST_SUITE(hook_replace_delegates_and_refuses_reentry) {
-    reset_world();
-    uint32_t id = 0;
-    MOD_CHECK_EQ(mods_hook_install(
-                     0, LOAD,
-                     [](const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
-                         note("replace");
-                         MOD_CHECK_EQ(cpu->phase, (uint32_t)POP_PHASE_REPLACE);
-                         // load_objs takes one byte argument at [ESP+4]; give it an object
-                         // set the game has, so the original really runs.
-                         wr32(cpu->esp + 4, 2u);
-                         MOD_CHECK_EQ(api->call_original(api, cpu->target, cpu), POP_OK);
-                         // Delegation refreshed the view of the CPU for this callback.
-                         MOD_CHECK_EQ(cpu->phase, (uint32_t)POP_PHASE_REPLACE);
-                         // Reaching the base twice in one invocation is refused.
-                         MOD_CHECK_EQ(api->call_original(api, cpu->target, cpu), POP_E_REENTRY);
-                         // A delegating hook must NOT call hook_return: the RET already
-                         // happened inside the original.
-                         MOD_CHECK_EQ(api->hook_return(api, cpu, 0, 0), POP_E_REENTRY);
-                     },
-                     POP_HOOK_REPLACE, nullptr, &id),
-                 POP_OK);
-
-    enter(LOAD);
-    MOD_CHECK_EQ(g_log.size(), 1u);
-    X86 *c = loader_context();
-    MOD_CHECK_EQ(c->eip, RET_ADDR); // the original's RET landed
-}
-
-MOD_TEST_SUITE(hook_wrap_chain_reaches_the_base_once) {
-    reset_world();
-    uint32_t id = 0;
-    auto outer = [](const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *) {
-        note("outer-in");
-        MOD_CHECK_EQ(api->call_next(api, inv, cpu), POP_OK);
-        note("outer-out");
-    };
-    auto inner = [](const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *) {
-        note("inner-in");
-        wr32(cpu->esp + 4, 2u);
-        MOD_CHECK_EQ(api->call_next(api, inv, cpu), POP_OK);
-        MOD_CHECK_EQ(api->call_next(api, inv, cpu), POP_E_REENTRY);
-        note("inner-out");
-    };
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, inner, POP_HOOK_REPLACE, nullptr, &id), POP_OK);
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, outer, POP_HOOK_WRAP, nullptr, &id), POP_OK);
-
-    enter(LOAD);
-    MOD_CHECK_EQ(g_log.size(), 4u);
-    MOD_CHECK_STR(g_log[0].c_str(), "outer-in");
-    MOD_CHECK_STR(g_log[1].c_str(), "inner-in");
-    MOD_CHECK_STR(g_log[2].c_str(), "inner-out");
-    MOD_CHECK_STR(g_log[3].c_str(), "outer-out");
-}
-
-MOD_TEST_SUITE(hook_non_delegating_replace_still_returns) {
-    reset_world();
-    uint32_t id = 0;
-    // A replace hook that neither delegates nor returns is a mod bug. The
-    // runtime must still leave the guest able to continue, and must say whose
-    // hook it was.
-    MOD_CHECK_EQ(mods_hook_install(
-                     0, LOAD,
-                     [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {
-                         note("does-nothing");
-                     },
-                     POP_HOOK_REPLACE, nullptr, &id),
-                 POP_OK);
-    enter(LOAD);
-    X86 *c = loader_context();
-    MOD_CHECK_EQ(c->eip, RET_ADDR); // the base ran and returned for it
 }
 
 MOD_TEST_SUITE(hook_mid_callback_install_takes_effect_next_time) {
@@ -573,12 +406,12 @@ MOD_TEST_SUITE(hook_mid_callback_install_takes_effect_next_time) {
     static uint32_t added = 0;
     uint32_t id = 0;
     MOD_CHECK_EQ(mods_hook_install(
-                     0, LOAD,
+                     0, INNER,
                      [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {
                          note("first");
                          if (!added)
                              mods_hook_install(
-                                 0, LOAD,
+                                 0, INNER,
                                  [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {
                                      note("second");
                                  },
@@ -587,9 +420,9 @@ MOD_TEST_SUITE(hook_mid_callback_install_takes_effect_next_time) {
                      POP_HOOK_BEFORE, nullptr, &id),
                  POP_OK);
 
-    enter(LOAD);
+    enter(INNER);
     MOD_CHECK_EQ(g_log.size(), 1u); // the new hook did not join this one
-    enter(LOAD);
+    enter(INNER);
     MOD_CHECK_EQ(g_log.size(), 3u); // and runs from the next invocation
 }
 
@@ -602,7 +435,7 @@ MOD_TEST_SUITE(hook_unwind_abandons_only_the_frames_above_it) {
     // same function never runs and the dispatcher must not pop a frame that is
     // no longer its own.
     MOD_CHECK_EQ(mods_hook_install(
-                     0, LOAD,
+                     0, INNER,
                      [](const PopModApi *, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
                          note("before");
                          esp_seen = cpu->esp;
@@ -613,14 +446,14 @@ MOD_TEST_SUITE(hook_unwind_abandons_only_the_frames_above_it) {
                      POP_HOOK_BEFORE, nullptr, &id),
                  POP_OK);
     MOD_CHECK_EQ(mods_hook_install(
-                     0, LOAD,
+                     0, INNER,
                      [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {
                          note("after-must-not-run");
                      },
                      POP_HOOK_AFTER, nullptr, &id),
                  POP_OK);
 
-    enter(LOAD);
+    enter(INNER);
     MOD_CHECK(esp_seen != 0);
     MOD_CHECK_EQ(g_log.size(), 1u);
     MOD_CHECK_STR(g_log[0].c_str(), "before");
@@ -630,8 +463,7 @@ MOD_TEST_SUITE(hook_unwind_abandons_only_the_frames_above_it) {
     // intact: an unwind drops the frames above an ESP, not everything the
     // thread has.
     //
-    // The nesting is made explicitly rather than by hoping the turn
-    // scheduler's original happens to reach the level path. The outer callback
+    // The nesting is made explicitly through framework dispatch. The outer callback
     // dispatches the inner function exactly as a generated call site does -
     // push a return address, then call through recomp_hook_ptrs - so the inner
     // hook is guaranteed to run and the two frames' ESPs differ by exactly the
@@ -641,36 +473,29 @@ MOD_TEST_SUITE(hook_unwind_abandons_only_the_frames_above_it) {
     static uint32_t depth_in_inner = 0;
     static uint32_t depth_after_inner = 0;
     static uint32_t views_before = 0, views_after = 0;
-    static uint32_t entities_before = 0, entities_after = 0;
     static bool view_still_active = false;
     MOD_CHECK_EQ(mods_hook_install(
-                     0, TURN,
+                     0, OUTER,
                      [](const PopModApi *, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
                          note("outer-in");
                          outer_esp = cpu->esp;
                          MOD_CHECK_EQ(mods_hook_depth(), 1u);
-                         // The snapshot this callback is reading through. It must still be
-                         // the same one, and still readable, after the inner invocation has
-                         // abandoned itself: an unwind drops the views above an ESP, not
-                         // the one the surviving callback is using.
+                         // The outer callback scope must survive an inner unwind.
                          views_before = mods_view_depth();
                          MOD_CHECK(mods_view_active());
-                         entities_before = mods_entity_count();
                          X86 *c = loader_context();
                          c->r[R_ESP] -= 4;
                          wr32(c->r[R_ESP], RET_ADDR);
-                         int32_t li = recomp_index_of(LOAD);
-                         recomp_hook_ptrs[li](c, (uint32_t)li);
+                         dispatch_test(c, INNER);
                          depth_after_inner = mods_hook_depth();
                          views_after = mods_view_depth();
                          view_still_active = mods_view_active();
-                         entities_after = mods_entity_count();
                          note("outer-out");
                      },
                      POP_HOOK_BEFORE, nullptr, &id),
                  POP_OK);
     MOD_CHECK_EQ(mods_hook_install(
-                     0, LOAD,
+                     0, INNER,
                      [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {
                          note("inner");
                          depth_in_inner = mods_hook_depth();
@@ -681,7 +506,7 @@ MOD_TEST_SUITE(hook_unwind_abandons_only_the_frames_above_it) {
                      POP_HOOK_BEFORE, nullptr, &id),
                  POP_OK);
 
-    enter(TURN);
+    enter(OUTER);
     MOD_CHECK_EQ(g_log.size(), 3u);
     MOD_CHECK_STR(g_log[0].c_str(), "outer-in");
     MOD_CHECK_STR(g_log[1].c_str(), "inner");
@@ -691,11 +516,9 @@ MOD_TEST_SUITE(hook_unwind_abandons_only_the_frames_above_it) {
     MOD_CHECK_EQ(depth_in_inner, 2u);
     MOD_CHECK_EQ(depth_after_inner, 1u);
     MOD_CHECK_EQ(mods_hook_depth(), 0u);
-    // And the outer callback's own snapshot survived the inner unwind: same
-    // depth, still active, and still reading the values it read before.
+    // The outer callback scope survives the inner unwind at the same depth.
     MOD_CHECK_EQ(views_after, views_before);
     MOD_CHECK(view_still_active);
-    MOD_CHECK_EQ(entities_after, entities_before);
 }
 
 MOD_TEST_SUITE(hook_bounds_every_cpu_transfer) {
@@ -710,7 +533,7 @@ MOD_TEST_SUITE(hook_bounds_every_cpu_transfer) {
 
     uint32_t id = 0;
     MOD_CHECK_EQ(mods_hook_install(
-                     2, LOAD,
+                     2, INNER,
                      [](const PopModApi *, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
                          MOD_CHECK_EQ(cpu->size, declared);
                          MOD_CHECK_EQ(cpu->eax, 0xfeedfaceu);
@@ -729,8 +552,7 @@ MOD_TEST_SUITE(hook_bounds_every_cpu_transfer) {
     c->r[R_EAX] = 0xfeedfaceu;
     c->r[R_ESP] -= 4;
     wr32(c->r[R_ESP], RET_ADDR);
-    int32_t i = recomp_index_of(LOAD);
-    recomp_hook_ptrs[i](c, (uint32_t)i);
+    dispatch_test(c, INNER);
     MOD_CHECK_EQ(g_log.size(), 1u);
 
     // Storage smaller than the declared size bounds the transfer too. Three
@@ -743,7 +565,7 @@ MOD_TEST_SUITE(hook_bounds_every_cpu_transfer) {
     mods_hooks_set_cpu_size(2, POP_CPU_V1_BASELINE_SIZE); // the plugin is new
     uint32_t id2 = 0;
     MOD_CHECK_EQ(mods_hook_install(
-                     2, LOAD,
+                     2, INNER,
                      [](const PopModApi *, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
                          MOD_CHECK_EQ(cpu->size, (uint32_t)sizeof small);
                          note("small");
@@ -753,7 +575,7 @@ MOD_TEST_SUITE(hook_bounds_every_cpu_transfer) {
     loader_init_context(c);
     c->r[R_ESP] -= 4;
     wr32(c->r[R_ESP], RET_ADDR);
-    recomp_hook_ptrs[i](c, (uint32_t)i);
+    dispatch_test(c, INNER);
     MOD_CHECK_EQ(g_log.size(), 1u);
     MOD_CHECK_STR(g_log[0].c_str(), "small");
     mods_hooks_set_test_cpu_buffer(nullptr, 0);
@@ -763,12 +585,14 @@ MOD_TEST_SUITE(hook_attribution_and_rollback) {
     reset_world();
     uint32_t id = 0;
     MOD_CHECK_EQ(mods_hook_install(
-                     0, LOAD,
+                     0, INNER,
                      [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {
                          // A crash here names this hook and its owner, from a preformatted
                          // string a fault handler can print without allocating.
                          const char *d = mods_active_callback_desc();
-                         MOD_CHECK(strstr(d, "0040c690") != nullptr);
+                         char addr[16];
+                         snprintf(addr, sizeof addr, "%08x", INNER);
+                         MOD_CHECK(strstr(d, addr) != nullptr);
                          MOD_CHECK(strstr(d, "before") != nullptr);
                          // The mod's ID, not just an index: a crash report saying "mod 0"
                          // names nothing anyone can act on.
@@ -776,13 +600,13 @@ MOD_TEST_SUITE(hook_attribution_and_rollback) {
                      },
                      POP_HOOK_BEFORE, nullptr, &id),
                  POP_OK);
-    enter(LOAD);
+    enter(INNER);
     MOD_CHECK_STR(mods_active_callback_desc(), ""); // nothing active now
 
     MOD_CHECK_EQ(mods_hooks_installed_count(), 1u);
     mods_hooks_remove_all(0);
     MOD_CHECK_EQ(mods_hooks_installed_count(), 0u);
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(LOAD)], 0);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(INNER)], 0);
     // A reset returns the counter to zero as well, so a later suite starts
     // from a clean registry.
     mods_hooks_reset();
@@ -796,13 +620,13 @@ MOD_TEST_SUITE(hook_mutation_off_the_baton_is_validated_then_queued) {
     auto ret0 = [](const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
         api->hook_return(api, cpu, 0, 0);
     };
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, ret0, POP_HOOK_REPLACE, nullptr, &replaced), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, ret0, POP_HOOK_REPLACE, nullptr, &replaced), POP_OK);
 
     PopModStatus queued = POP_OK, conflict = POP_OK, removed = POP_OK, absent = POP_OK;
     std::thread([&] {
         // No baton here, so the mutation is queued - but it is VALIDATED now.
-        queued = mods_hook_install(0, TURN, nop, POP_HOOK_BEFORE, nullptr, &id);
-        conflict = mods_hook_install(0, LOAD, ret0, POP_HOOK_REPLACE, nullptr, &extra);
+        queued = mods_hook_install(0, OUTER, nop, POP_HOOK_BEFORE, nullptr, &id);
+        conflict = mods_hook_install(0, INNER, ret0, POP_HOOK_REPLACE, nullptr, &extra);
         removed = mods_hook_remove(0, replaced);
         absent = mods_hook_remove(0, 0xbeefu);
     }).join();
@@ -813,16 +637,16 @@ MOD_TEST_SUITE(hook_mutation_off_the_baton_is_validated_then_queued) {
     MOD_CHECK(id != 0);
 
     // Nothing published yet: the tables belong to whoever holds the baton.
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(TURN)], 0);
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(LOAD)], 1);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(OUTER)], 0);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(INNER)], 1);
     // A pump from a thread with no baton does nothing either.
     std::thread([] { mods_registry_pump(); }).join();
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(TURN)], 0);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(OUTER)], 0);
     // The test drives the pump the way the scheduler checkpoint does, from a
     // thread that holds the baton.
     pump_on_guest_thread();
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(TURN)], 1);
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(LOAD)], 0);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(OUTER)], 1);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(INNER)], 0);
     MOD_CHECK_EQ(mods_hooks_installed_count(), 1u);
 }
 
@@ -837,12 +661,13 @@ MOD_TEST_SUITE(hook_wrap_wraps_an_existing_replacement) {
         note("outer");
         api->call_next(api, inv, cpu);
     };
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, inner, POP_HOOK_REPLACE, nullptr, &id), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, inner, POP_HOOK_REPLACE, nullptr, &id), POP_OK);
     // wrap is its own mode all the way through validation: converting it to
     // replace first would refuse exactly the case it exists for.
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, outer, POP_HOOK_WRAP, nullptr, &id), POP_OK);
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, inner, POP_HOOK_REPLACE, nullptr, &id), POP_E_CONFLICT);
-    enter(LOAD);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, outer, POP_HOOK_WRAP, nullptr, &id), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, inner, POP_HOOK_REPLACE, nullptr, &id),
+                 POP_E_CONFLICT);
+    enter(INNER);
     MOD_CHECK_EQ(g_log.size(), 2u);
     MOD_CHECK_STR(g_log[0].c_str(), "outer");
     MOD_CHECK_STR(g_log[1].c_str(), "inner");
@@ -864,8 +689,8 @@ MOD_TEST_SUITE(hook_queued_installs_are_registry_state) {
     // Two replacements queued from a thread with no baton: the second must be
     // refused now, not accepted now and discarded later.
     std::thread([&] {
-        first = mods_hook_install(0, LOAD, nop, POP_HOOK_REPLACE, nullptr, &a);
-        second = mods_hook_install(0, LOAD, nop, POP_HOOK_REPLACE, nullptr, &b);
+        first = mods_hook_install(0, INNER, nop, POP_HOOK_REPLACE, nullptr, &a);
+        second = mods_hook_install(0, INNER, nop, POP_HOOK_REPLACE, nullptr, &b);
     }).join();
     MOD_CHECK_EQ(first, POP_OK);
     MOD_CHECK_EQ(second, POP_E_CONFLICT);
@@ -873,7 +698,7 @@ MOD_TEST_SUITE(hook_queued_installs_are_registry_state) {
     // An inline replacement competing with the queued one is refused too: the
     // queued install reserved the chain when it was accepted.
     uint32_t c = 0;
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, nop, POP_HOOK_REPLACE, nullptr, &c), POP_E_CONFLICT);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, nop, POP_HOOK_REPLACE, nullptr, &c), POP_E_CONFLICT);
 
     // Sixteen queued before-hooks fill the chain; the seventeenth is refused
     // while all sixteen are still only queued.
@@ -882,9 +707,9 @@ MOD_TEST_SUITE(hook_queued_installs_are_registry_state) {
     std::thread([&] {
         uint32_t id = 0;
         for (int i = 0; i < 16; ++i)
-            if (mods_hook_install(0, TURN, nop, POP_HOOK_BEFORE, nullptr, &id) != POP_OK)
+            if (mods_hook_install(0, OUTER, nop, POP_HOOK_BEFORE, nullptr, &id) != POP_OK)
                 last = POP_E_STATE; // an early refusal is itself a failure
-        last = mods_hook_install(0, TURN, nop, POP_HOOK_BEFORE, nullptr, &id);
+        last = mods_hook_install(0, OUTER, nop, POP_HOOK_BEFORE, nullptr, &id);
     }).join();
     MOD_CHECK_EQ(last, POP_E_LIMIT);
 
@@ -904,7 +729,7 @@ MOD_TEST_SUITE(hook_removing_a_queued_install_cancels_it) {
     uint32_t id = 0;
     PopModStatus queued = POP_OK;
     std::thread([&] {
-        queued = mods_hook_install(0, TURN, nop, POP_HOOK_BEFORE, nullptr, &id);
+        queued = mods_hook_install(0, OUTER, nop, POP_HOOK_BEFORE, nullptr, &id);
     }).join();
     MOD_CHECK_EQ(queued, POP_OK);
     MOD_CHECK(id != 0);
@@ -915,7 +740,7 @@ MOD_TEST_SUITE(hook_removing_a_queued_install_cancels_it) {
     MOD_CHECK_EQ(mods_hook_remove(0, id), POP_E_NOTFOUND);
 
     pump_on_guest_thread();
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(TURN)], 0);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(OUTER)], 0);
     MOD_CHECK_EQ(mods_hooks_installed_count(), 0u);
 }
 
@@ -927,25 +752,25 @@ MOD_TEST_SUITE(hook_bulk_mutations_wait_for_the_baton) {
     reset_world();
     auto nop = [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {};
     uint32_t id = 0;
-    MOD_CHECK_EQ(mods_hook_install(0, TURN, nop, POP_HOOK_BEFORE, nullptr, &id), POP_OK);
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(TURN)], 1);
+    MOD_CHECK_EQ(mods_hook_install(0, OUTER, nop, POP_HOOK_BEFORE, nullptr, &id), POP_OK);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(OUTER)], 1);
 
     // Off the baton, remove_all changes nothing that is published.
     std::thread([] { mods_hooks_remove_all(0); }).join();
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(TURN)], 1);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(OUTER)], 1);
     MOD_CHECK_EQ(mods_hooks_installed_count(), 1u);
 
     pump_on_guest_thread();
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(TURN)], 0);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(OUTER)], 0);
     MOD_CHECK_EQ(mods_hooks_installed_count(), 0u);
 
     // The same for a reset.
-    MOD_CHECK_EQ(mods_hook_install(0, TURN, nop, POP_HOOK_BEFORE, nullptr, &id), POP_OK);
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(TURN)], 1);
+    MOD_CHECK_EQ(mods_hook_install(0, OUTER, nop, POP_HOOK_BEFORE, nullptr, &id), POP_OK);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(OUTER)], 1);
     std::thread([] { mods_hooks_reset(); }).join();
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(TURN)], 1);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(OUTER)], 1);
     pump_on_guest_thread();
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(TURN)], 0);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(OUTER)], 0);
     MOD_CHECK_EQ(mods_hooks_installed_count(), 0u);
 }
 
@@ -968,10 +793,10 @@ MOD_TEST_SUITE(hook_inner_results_reach_the_outer_view) {
         MOD_CHECK_EQ(cpu->eax, 0x2222u);
         cpu->eax = 0x3333u; // and the outer may edit it again
     };
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, inner, POP_HOOK_REPLACE, nullptr, &id), POP_OK);
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, outer, POP_HOOK_WRAP, nullptr, &id), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, inner, POP_HOOK_REPLACE, nullptr, &id), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, outer, POP_HOOK_WRAP, nullptr, &id), POP_OK);
     MOD_CHECK_EQ(mods_hook_install(
-                     0, LOAD,
+                     0, INNER,
                      [](const PopModApi *, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
                          note("after");
                          MOD_CHECK_EQ(cpu->eax, 0x3333u);
@@ -979,7 +804,7 @@ MOD_TEST_SUITE(hook_inner_results_reach_the_outer_view) {
                      POP_HOOK_AFTER, nullptr, &id),
                  POP_OK);
 
-    enter(LOAD);
+    enter(INNER);
     MOD_CHECK_EQ(g_log.size(), 3u);
     MOD_CHECK_EQ(loader_context()->r[R_EAX], 0x3333u);
 }
@@ -1002,17 +827,17 @@ MOD_TEST_SUITE(hook_unwind_through_a_wrap_stops_every_later_phase) {
         api->call_next(api, inv, cpu);
         note("outer-out");
     };
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, inner, POP_HOOK_REPLACE, nullptr, &id), POP_OK);
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, outer, POP_HOOK_WRAP, nullptr, &id), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, inner, POP_HOOK_REPLACE, nullptr, &id), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, outer, POP_HOOK_WRAP, nullptr, &id), POP_OK);
     MOD_CHECK_EQ(mods_hook_install(
-                     0, LOAD,
+                     0, INNER,
                      [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {
                          note("after-must-not-run");
                      },
                      POP_HOOK_AFTER, nullptr, &id),
                  POP_OK);
 
-    enter(LOAD);
+    enter(INNER);
     // The outer callback still returns - its own C frame is real - but no
     // later phase of the invocation runs.
     MOD_CHECK_EQ(g_log.size(), 3u);
@@ -1038,20 +863,19 @@ MOD_TEST_SUITE(hook_attribution_survives_a_partial_unwind) {
     // The same explicit nesting the unwind test uses, so both callbacks are
     // guaranteed to run rather than left to the game's control flow.
     MOD_CHECK_EQ(mods_hook_install(
-                     0, TURN,
+                     0, OUTER,
                      [](const PopModApi *, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
                          note("outer");
                          unwind_esp = cpu->esp;
                          X86 *c = loader_context();
                          c->r[R_ESP] -= 4;
                          wr32(c->r[R_ESP], RET_ADDR);
-                         int32_t li = recomp_index_of(LOAD);
-                         recomp_hook_ptrs[li](c, (uint32_t)li);
+                         dispatch_test(c, INNER);
                      },
                      POP_HOOK_BEFORE, nullptr, &id),
                  POP_OK);
     MOD_CHECK_EQ(mods_hook_install(
-                     0, LOAD,
+                     0, INNER,
                      [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {
                          note("inner");
                          inner_ran = true;
@@ -1065,7 +889,7 @@ MOD_TEST_SUITE(hook_attribution_survives_a_partial_unwind) {
                      POP_HOOK_BEFORE, nullptr, &id),
                  POP_OK);
 
-    enter(TURN);
+    enter(OUTER);
     MOD_CHECK(inner_ran);
     MOD_CHECK_EQ(g_log.size(), 2u);
     MOD_CHECK_STR(g_log[0].c_str(), "outer");
@@ -1090,33 +914,33 @@ MOD_TEST_SUITE(hook_inline_and_queued_agree_in_both_orders) {
     uint32_t qid = 0, iid = 0;
     PopModStatus queued = POP_OK, inline_st = POP_OK;
     std::thread([&] {
-        queued = mods_hook_install(0, LOAD, nop, POP_HOOK_REPLACE, nullptr, &qid);
+        queued = mods_hook_install(0, INNER, nop, POP_HOOK_REPLACE, nullptr, &qid);
     }).join();
     MOD_CHECK_EQ(queued, POP_OK);
-    inline_st = mods_hook_install(0, LOAD, nop, POP_HOOK_WRAP, nullptr, &iid);
+    inline_st = mods_hook_install(0, INNER, nop, POP_HOOK_WRAP, nullptr, &iid);
     MOD_CHECK_EQ(inline_st, POP_OK);
     pump_on_guest_thread();
     // Neither was silently dropped: two hooks on one entry.
     MOD_CHECK_EQ(mods_hooks_installed_count(), 2u);
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(LOAD)], 1);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(INNER)], 1);
 
     // Queued WRAP, then inline REPLACE. The wrap is applied first, so the
     // replace chain is no longer empty and the plain replacement must be
     // refused NOW rather than accepted and dropped later.
     reset_world();
     std::thread([&] {
-        queued = mods_hook_install(0, LOAD, nop, POP_HOOK_WRAP, nullptr, &qid);
+        queued = mods_hook_install(0, INNER, nop, POP_HOOK_WRAP, nullptr, &qid);
     }).join();
     MOD_CHECK_EQ(queued, POP_OK);
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, nop, POP_HOOK_REPLACE, nullptr, &iid), POP_E_CONFLICT);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, nop, POP_HOOK_REPLACE, nullptr, &iid), POP_E_CONFLICT);
     pump_on_guest_thread();
     MOD_CHECK_EQ(mods_hooks_installed_count(), 1u);
 
     // Inline REPLACE, then queued WRAP: the mirror image, and both survive.
     reset_world();
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, nop, POP_HOOK_REPLACE, nullptr, &iid), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, nop, POP_HOOK_REPLACE, nullptr, &iid), POP_OK);
     std::thread([&] {
-        queued = mods_hook_install(0, LOAD, nop, POP_HOOK_WRAP, nullptr, &qid);
+        queued = mods_hook_install(0, INNER, nop, POP_HOOK_WRAP, nullptr, &qid);
     }).join();
     MOD_CHECK_EQ(queued, POP_OK);
     pump_on_guest_thread();
@@ -1124,9 +948,9 @@ MOD_TEST_SUITE(hook_inline_and_queued_agree_in_both_orders) {
 
     // Inline REPLACE, then queued REPLACE: refused at the moment it is asked.
     reset_world();
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, nop, POP_HOOK_REPLACE, nullptr, &iid), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, nop, POP_HOOK_REPLACE, nullptr, &iid), POP_OK);
     std::thread([&] {
-        queued = mods_hook_install(0, LOAD, nop, POP_HOOK_REPLACE, nullptr, &qid);
+        queued = mods_hook_install(0, INNER, nop, POP_HOOK_REPLACE, nullptr, &qid);
     }).join();
     MOD_CHECK_EQ(queued, POP_E_CONFLICT);
     pump_on_guest_thread();
@@ -1147,16 +971,16 @@ MOD_TEST_SUITE(hook_validation_sees_queued_removals_too) {
     // counting only queued installs was written to prevent.
     reset_world();
     uint32_t first = 0, second = 0;
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, nop, POP_HOOK_REPLACE, nullptr, &first), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, nop, POP_HOOK_REPLACE, nullptr, &first), POP_OK);
     MOD_CHECK_EQ(mods_hooks_installed_count(), 1u);
     std::thread([&] { MOD_CHECK_EQ(mods_hook_remove(0, first), POP_OK); }).join();
     MOD_CHECK_EQ(mods_hooks_installed_count(), 1u); // queued, not applied
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, nop, POP_HOOK_REPLACE, nullptr, &second), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, nop, POP_HOOK_REPLACE, nullptr, &second), POP_OK);
     // Queued behind the removal, and the pair leaves exactly one replacement.
     MOD_CHECK_EQ(mods_hooks_installed_count(), 1u);
     pump_on_guest_thread();
     MOD_CHECK_EQ(mods_hooks_installed_count(), 1u);
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(LOAD)], 1);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(INNER)], 1);
     // And it is the second one that is there: removing it empties the chain.
     MOD_CHECK_EQ(mods_hook_remove(0, second), POP_OK);
     MOD_CHECK_EQ(mods_hooks_installed_count(), 0u);
@@ -1165,11 +989,11 @@ MOD_TEST_SUITE(hook_validation_sees_queued_removals_too) {
     reset_world();
     uint32_t ids[16] = {0};
     for (int i = 0; i < 16; ++i)
-        MOD_CHECK_EQ(mods_hook_install(0, TURN, nop, POP_HOOK_BEFORE, nullptr, &ids[i]), POP_OK);
+        MOD_CHECK_EQ(mods_hook_install(0, OUTER, nop, POP_HOOK_BEFORE, nullptr, &ids[i]), POP_OK);
     uint32_t over = 0;
-    MOD_CHECK_EQ(mods_hook_install(0, TURN, nop, POP_HOOK_BEFORE, nullptr, &over), POP_E_LIMIT);
+    MOD_CHECK_EQ(mods_hook_install(0, OUTER, nop, POP_HOOK_BEFORE, nullptr, &over), POP_E_LIMIT);
     std::thread([&] { MOD_CHECK_EQ(mods_hook_remove(0, ids[0]), POP_OK); }).join();
-    MOD_CHECK_EQ(mods_hook_install(0, TURN, nop, POP_HOOK_BEFORE, nullptr, &over), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, OUTER, nop, POP_HOOK_BEFORE, nullptr, &over), POP_OK);
     MOD_CHECK_EQ(mods_hooks_installed_count(), 16u); // neither applied yet
     pump_on_guest_thread();
     MOD_CHECK_EQ(mods_hooks_installed_count(), 16u); // one out, one in
@@ -1179,7 +1003,7 @@ MOD_TEST_SUITE(hook_validation_sees_queued_removals_too) {
     // which is the failure a synchronous status exists to rule out.
     reset_world();
     uint32_t once = 0;
-    MOD_CHECK_EQ(mods_hook_install(0, TURN, nop, POP_HOOK_BEFORE, nullptr, &once), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, OUTER, nop, POP_HOOK_BEFORE, nullptr, &once), POP_OK);
     std::thread([&] { MOD_CHECK_EQ(mods_hook_remove(0, once), POP_OK); }).join();
     MOD_CHECK_EQ(mods_hook_remove(0, once), POP_E_NOTFOUND);
     // Queued twice is the same question asked from the other side.
@@ -1191,14 +1015,14 @@ MOD_TEST_SUITE(hook_validation_sees_queued_removals_too) {
     // is checked against nothing and applies after it.
     reset_world();
     uint32_t taken = 0, after_reset = 0;
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, nop, POP_HOOK_REPLACE, nullptr, &taken), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, nop, POP_HOOK_REPLACE, nullptr, &taken), POP_OK);
     std::thread([] { mods_hooks_reset(); }).join();
     // Without the reset in view this would be POP_E_CONFLICT.
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, nop, POP_HOOK_REPLACE, nullptr, &after_reset), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, nop, POP_HOOK_REPLACE, nullptr, &after_reset), POP_OK);
     MOD_CHECK_EQ(mods_hooks_installed_count(), 1u); // still the first
     pump_on_guest_thread();
     MOD_CHECK_EQ(mods_hooks_installed_count(), 1u); // now only the second
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(LOAD)], 1);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(INNER)], 1);
     MOD_CHECK_EQ(mods_hook_remove(0, taken), POP_E_NOTFOUND);
     MOD_CHECK_EQ(mods_hook_remove(0, after_reset), POP_OK);
 }
@@ -1210,7 +1034,7 @@ MOD_TEST_SUITE(hook_an_inline_call_never_publishes_the_queue) {
     // and must not fire during an unrelated inline call afterwards.
     reset_world();
     uint32_t a = 0, b = 0;
-    MOD_CHECK_EQ(mods_hook_install(0, TURN, nop, POP_HOOK_BEFORE, nullptr, &a), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, OUTER, nop, POP_HOOK_BEFORE, nullptr, &a), POP_OK);
     MOD_CHECK_EQ(mods_hooks_installed_count(), 1u);
 
     std::thread([] { mods_hooks_reset(); }).join(); // queued, not applied
@@ -1218,16 +1042,16 @@ MOD_TEST_SUITE(hook_an_inline_call_never_publishes_the_queue) {
 
     // An unrelated inline install: it is queued behind the reset, and the
     // reset still has not run.
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, nop, POP_HOOK_BEFORE, nullptr, &b), POP_OK);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, nop, POP_HOOK_BEFORE, nullptr, &b), POP_OK);
     MOD_CHECK_EQ(mods_hooks_installed_count(), 1u);
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(TURN)], 1);
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(LOAD)], 0);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(OUTER)], 1);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(INNER)], 0);
 
     // Only at the checkpoint does any of it happen, and then in order: the
     // reset erases the first install, then the second one applies.
     pump_on_guest_thread();
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(TURN)], 0);
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(LOAD)], 1);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(OUTER)], 0);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(INNER)], 1);
     MOD_CHECK_EQ(mods_hooks_installed_count(), 1u);
 
     // A failed inline mutation changes nothing at all, including the queue.
@@ -1235,13 +1059,13 @@ MOD_TEST_SUITE(hook_an_inline_call_never_publishes_the_queue) {
     uint32_t q = 0, bad = 0;
     PopModStatus queued = POP_OK;
     std::thread([&] {
-        queued = mods_hook_install(0, LOAD, nop, POP_HOOK_REPLACE, nullptr, &q);
+        queued = mods_hook_install(0, INNER, nop, POP_HOOK_REPLACE, nullptr, &q);
     }).join();
     MOD_CHECK_EQ(queued, POP_OK);
     // Refused, because the queued replacement already reserved the chain.
-    MOD_CHECK_EQ(mods_hook_install(0, LOAD, nop, POP_HOOK_REPLACE, nullptr, &bad), POP_E_CONFLICT);
+    MOD_CHECK_EQ(mods_hook_install(0, INNER, nop, POP_HOOK_REPLACE, nullptr, &bad), POP_E_CONFLICT);
     // The refusal published nothing: the queued install is still queued.
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(LOAD)], 0);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(INNER)], 0);
     MOD_CHECK_EQ(mods_hooks_installed_count(), 0u);
     pump_on_guest_thread();
     MOD_CHECK_EQ(mods_hooks_installed_count(), 1u);
@@ -1249,12 +1073,12 @@ MOD_TEST_SUITE(hook_an_inline_call_never_publishes_the_queue) {
     // A removal that finds nothing is equally inert.
     reset_world();
     std::thread([&] {
-        queued = mods_hook_install(0, TURN, nop, POP_HOOK_BEFORE, nullptr, &q);
+        queued = mods_hook_install(0, OUTER, nop, POP_HOOK_BEFORE, nullptr, &q);
     }).join();
     MOD_CHECK_EQ(mods_hook_remove(0, 0xbeefu), POP_E_NOTFOUND);
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(TURN)], 0); // still queued
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(OUTER)], 0); // still queued
     pump_on_guest_thread();
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(TURN)], 1);
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(OUTER)], 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1296,7 +1120,7 @@ MOD_TEST_SUITE(hook_queued_input_waits_for_the_callback_to_return) {
 
     uint32_t id = 0;
     MOD_CHECK_EQ(mods_hook_install(
-                     0, LOAD,
+                     0, INNER,
                      [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {
                          note("in-callback");
                          // Input is queued while this callback is on the stack, and this
@@ -1314,7 +1138,7 @@ MOD_TEST_SUITE(hook_queued_input_waits_for_the_callback_to_return) {
                      POP_HOOK_BEFORE, nullptr, &id),
                  POP_OK);
 
-    enter(LOAD);
+    enter(INNER);
 
     MOD_CHECK_EQ(g_log.size(), 2u);
     MOD_CHECK_STR(g_log[0].c_str(), "in-callback");
@@ -1343,7 +1167,7 @@ MOD_TEST_SUITE(wide_view_keeps_resolution_callbacks_active) {
     g_api[2].mod_id = "core.display";
     uint32_t id = 0;
     MOD_CHECK_EQ(mods_hook_install(
-                     0, LOAD,
+                     0, INNER,
                      [](const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
                          api->hook_return(api, cpu, 1, 0);
                      },
@@ -1352,20 +1176,20 @@ MOD_TEST_SUITE(wide_view_keeps_resolution_callbacks_active) {
     static int calls = 0;
     calls = 0;
     MOD_CHECK_EQ(mods_hook_install(
-                     2, LOAD,
+                     2, INNER,
                      [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) { ++calls; },
                      POP_HOOK_AFTER, nullptr, &id),
                  POP_OK);
     mods_display_transition(1, HOST_SCREEN_GAMEPLAY);
     MOD_CHECK_EQ(mods_display_set(DISPLAY_WIDE, 0), POP_OK);
-    enter(LOAD);
+    enter(INNER);
     MOD_CHECK_EQ(calls, 1); // queued, still enabled
     mods_display_transition(2, HOST_SCREEN_GAMEPLAY);
-    enter(LOAD);
+    enter(INNER);
     MOD_CHECK_EQ(calls, 2); // sky/resolution correction remains active
     MOD_CHECK_EQ(mods_display_set(DISPLAY_WIDE, 1), POP_OK);
     mods_display_transition(3, HOST_SCREEN_GAMEPLAY);
-    enter(LOAD);
+    enter(INNER);
     MOD_CHECK_EQ(calls, 3); // no reload or lost callback
     mods_hooks_reset();
     mods_display_reset();

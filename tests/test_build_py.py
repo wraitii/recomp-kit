@@ -30,7 +30,7 @@ class BuildPyTests(unittest.TestCase):
 
     def test_desktop_hosts_are_allowed_on_linux_and_windows(self):
         for system, preset in (("Linux", "linux"), ("Windows", "windows")):
-            for target in ("app", "smoke", "headless", "fixture"):
+            for target in ("app", "smoke", "headless"):
                 for extra in ([], ["--regenerate"]):
                     with self.subTest(system=system, target=target, extra=extra):
                         args, _ = build_py.parse_args(["--target", target] + extra, system=system)

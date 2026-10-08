@@ -20,7 +20,7 @@ struct HostLayout {
 };
 const HostLayout &host_layout();
 // resources_dir + "/" + rel, with the developer mapping for the names
-// "mods/core", "texture-pack", "classic-modes.json", "general-midi.sf2",
+// "mods/core", "texture-pack", "general-midi.sf2",
 // "symbols.json" and "controls" (the game's on-screen controls layouts: a
 // game repository's layouts/); "" when unknown.
 std::string host_resource(const char *rel);

@@ -58,11 +58,6 @@ def main():
     resources = contents / "Resources"
     resources.mkdir(parents=True, exist_ok=True)
     rename_identity(contents / "Info.plist", args.name, args.version)
-    # The committed probe list. A missing list is labelled a baseline fallback
-    # by the settings layer; packaging never manufactures measurements.
-    probes = ROOT / "tools/recomp/baseline/classic-modes.json"
-    if probes.is_file():
-        shutil.copy(probes, resources / "classic-modes.json")
     # The General MIDI bank for a game that ships none, with its licence.
     shutil.copy2(GENERAL_MIDI, resources / "general-midi.sf2")
     shutil.copy2(GENERAL_MIDI.parent / "LICENSE", resources / "general-midi-LICENSE.txt")

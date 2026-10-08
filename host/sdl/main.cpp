@@ -686,7 +686,7 @@ void apply_button(int button, bool down, int32_t x, int32_t y, bool inside, bool
         host_gate_begin_drag(&hit);
     g_cursor_x = x;
     g_cursor_y = y;
-    // Absolute placement alone does not move Populous's integrated cursor.
+    // Some guests integrate relative motion to position their own cursor.
     host_input_motion(x, y, dx, dy);
     post(WM_MOUSEMOVE_, mouse_wparam(), make_lparam(x, y));
     if (down)
@@ -1630,10 +1630,6 @@ void report(FILE *out, bool abnormal) {
 // The .app can be started from anywhere, and the guest's file system is rooted
 // at the directory holding the EXE. Walking up from the executable finds the
 // checkout whichever way the app was launched.
-std::string classic_modes_path() {
-    std::string p = host_resource("classic-modes.json");
-    return p.empty() ? "tools/recomp/baseline/classic-modes.json" : p;
-}
 
 void post_drawable_size() {
     int bw, bh, dw, dh;
@@ -1780,7 +1776,6 @@ int web_main(int argc, char **argv) {
     host_present_set_device(g_gpu.get());
     mods_display_live_defaults();
     mods_display_default_overlay(platform_ui_default_overlay());
-    mods_display_load_modes(classic_modes_path().c_str());
     host_present_on_mode_change(on_mode_change);
     host_input_set_notify(dinput_host_input_changed);
     host_present_start(g_surface, dw, dh);
@@ -1986,7 +1981,6 @@ int main(int argc, char **argv) {
             "Mouse capture: click inside to capture; Ctrl+Alt+M or switch apps to release.\n");
     mods_display_live_defaults();
     mods_display_default_overlay(platform_ui_default_overlay());
-    mods_display_load_modes(classic_modes_path().c_str());
     host_present_on_mode_change(on_mode_change);
     // Every change to the input state wakes the guest's DirectInput threads,
     // which wait on an event rather than polling. Installed here rather than

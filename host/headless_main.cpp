@@ -2,8 +2,8 @@
 // with no window, no device and no audio, and writes every presented frame to
 // a file.
 //
-// This is the real path, not the parity fixture: it runs `entry` (0055d6c0),
-// which runs the CRT startup, WinMain, the graphics initialisation and the
+// It runs the guest through `entry`, which runs the CRT startup, WinMain,
+// graphics initialisation and the
 // game's own main loop. Everything the guest asks the operating system for is
 // answered by runtime; everything it asks DirectDraw/Direct3D for
 // is answered by dx.

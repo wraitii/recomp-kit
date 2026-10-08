@@ -38,7 +38,6 @@ def stage(app_binary: Path, cfg: dict, out_dir: Path, system=None, build_dir=Non
     copy(app_binary, staged / binary_name)
     for name in ("LICENSE", "NOTICE"):
         copy(ROOT / name, staged / name)
-    copy(ROOT / "tools/recomp/baseline/classic-modes.json", resources / "classic-modes.json")
     # The General MIDI bank for a game that ships none, with its licence.
     bank = ROOT / "third_party/soundfonts/generaluser-gs"
     copy(bank / "GeneralUser-GS.sf2", resources / "general-midi.sf2")

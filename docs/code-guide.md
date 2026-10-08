@@ -8,9 +8,7 @@ translated locally into `build/recomp/gen/` and are never edited in place.
 
 | Change | Start here | Major entry points |
 | --- | --- | --- |
-| Options controls or labels | [options_menu.cpp](../mods/options_menu.cpp) | `attach`, `action`, `update`, `draw`, `mods_options_frame` |
-| Live display settings | [display_settings.cpp](../mods/display_settings.cpp) | `mods_display_init`, `mods_display_set`, `apply_transition` |
-| Saved graphics choices, new resolutions | [game_settings.cpp](../mods/game_settings.cpp) | `flush_changed`, `enumerate_modes`, `enumerate_display_mode`, `scale_camera_for_resolution` |
+| Host display settings | [display_settings.cpp](../mods/display_settings.cpp), [settings_page.cpp](../mods/settings_page.cpp) | `mods_display_init`, `mods_display_set`, `apply_transition` |
 | Mouse edges, coordinate mapping | [input_gate.cpp](../host/input_gate.cpp) | `take_layout`, `host_gate_pointer_event`, `pointer_correction` |
 | Window, focus, quit (SDL3) | [sdl/main.cpp](../host/sdl/main.cpp) | `handle_event`, `apply_focus`, `apply_window_mode`, `pump`, `applicationShouldTerminate` |
 | Frame lifetime and pacing | [present_thread.cpp](../host/present_thread.cpp) | `acquire`, `host_frame_seal`, `sweep` |
@@ -25,22 +23,13 @@ translated locally into `build/recomp/gen/` and are never edited in place.
 | Observable region analysis | [IR contracts](ir.md#observable-contract-foundation), [cfg.py](../tools/recomp/ir/cfg.py) | Shared CFG; immutable observations/effects; conservative demand and call-graph solvers |
 | Native replacement validation | [replay.cpp](../mods/native/replay.cpp), [page_track.cpp](../mods/native/page_track.cpp) | `load`, `run`, `translated`, `begin`, `end` |
 
-## Follow one live setting
+## Follow display settings
 
-A click in an added Options row calls `action`, which uses
-`mods_display_nudge` / `mods_display_set`. The setter validates the choice and
-persists it through the shared settings store. Simple values are published to
-host readers immediately. Rendering and projection changes are committed
-together by `apply_transition` at the next frame boundary.
-
-Resolution has one visible selector in the original Graphics tab. Programmatic
-requests also reach the original resolution callback through
-`mods_options_frame`; that callback owns the surface teardown and rebuild.
-Adding a second independent host resolution control would bypass this lifecycle.
-
-The menu's 640×480 coordinate constants describe the original normalized layout.
-They do not select the framebuffer size. Glyph measurement, glyph quads, camera
-zoom and minimap storage adapt to the selected mode through documented hooks.
+The settings page calls `mods_display_nudge` and `mods_display_set`. The setter
+validates choices and persists them through the shared settings store. Host-only
+values publish immediately; render and projection changes pass through
+`apply_transition` at the frame boundary. Game-owned menus can open the shared
+settings page through the mod API.
 
 ## Read guest-facing code
 

@@ -1951,16 +1951,7 @@ void m_mmioAscend(X86 *c) {
 // ---------------------------------------------------------------------------
 // MIDI out.
 //
-// The game's music is MIDI through a SoundFont. 0x575e40 walks the midiOut
-// devices, calls midiOutGetDevCapsA on each, and compares the first nine
-// characters of szPname against "SoundFont" at 0x5eb5b0; if no device matches
-// it returns -1 and there is no music. It then opens that device with a null
-// callback, sends a twelve-byte sysex through midiOutPrepareHeader and
-// midiOutLongMsg, and drives the music note by note with midiOutShortMsg
-// (0x576140 is its all-notes-off: control change 0x7b on channel 0).
-//
-// So the device this reports has to be named the way the game is looking for,
-// and the bank it plays is Sound/POPFIGHT.SF2 next to the executable.
+// MIDI messages are forwarded to the host synthesizer.
 // ---------------------------------------------------------------------------
 const uint32_t MMSYSERR_NOERROR = 0;
 const uint32_t MMSYSERR_BADDEVICEID = 2;
@@ -1997,26 +1988,8 @@ MidiOut &midi() {
     return m;
 }
 
-// Where the bank lives. A game that ships its own never names it -
-// SFMAN32.DLL would have - so the path is the one the retail install uses,
-// resolved through the file shim so it follows whatever root this run was
-// given. A game with no bank of its own played through Windows' General MIDI
-// synthesizer, which cannot be redistributed; it gets the kit's bundled
-// General MIDI bank instead (third_party/soundfonts/generaluser-gs).
+// Use the bundled General MIDI bank through the host resource layout.
 std::string midi_soundfont_path() {
-    static const char *candidates[] = {
-        "Sound\\POPFIGHT.SF2",
-        "sound\\popfight.sf2",
-        "POPFIGHT.SF2",
-    };
-    for (const char *g : candidates) {
-        std::string host = win32_host_path(g);
-        if (host.empty())
-            continue;
-        OsStat st;
-        if (os_stat(host.c_str(), &st) == 0 && st.is_regular)
-            return host;
-    }
     const std::string bundled = host_resource("general-midi.sf2");
     OsStat st;
     if (!bundled.empty() && os_stat(bundled.c_str(), &st) == 0 && st.is_regular)
@@ -2116,7 +2089,7 @@ void m_midiOutOpen(X86 *c) {
         log_once("midiOutOpen",
                  "midiOutOpen: the host has no synth%s, so the music is "
                  "accepted and not heard",
-                 sf2.empty() ? " and Sound/POPFIGHT.SF2 was not found" : "");
+                 sf2.empty() ? " and no General MIDI bank was found" : "");
     } else {
         LOGW("midiOutOpen: SoundFont synth open on %s", sf2.c_str());
     }

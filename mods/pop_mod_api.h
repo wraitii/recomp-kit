@@ -1,12 +1,12 @@
-/* pop_mod_api.h - the mod C API for the recompiled Populous: The Beginning.
+/* pop_mod_api.h - the mod C API for the recompiled game.
  *
  * C only, macOS arm64, fixed-width types, C linkage. A mod includes exactly
  * this header and nothing else from the repository: nothing in the API is a
  * C++ symbol and no call reaches an internal function.
  *
- * VERSIONING. PopModApi carries version/size and is append-only: a plugin
- * built against an older header reads only the fields inside its own compiled
- * size, which it declares through POP_MOD_DECLARE_ABI(). Guest CPU state is
+ * VERSIONING. PopModApi carries version/size. Incompatible API changes bump
+ * POP_MOD_API_VERSION; the loader rejects plugins built for another version.
+ * Guest CPU state is
  * versioned separately as pop_cpu_v1, so a CPU-layout change ships as
  * pop_cpu_v2 without bumping PopModApi.version.
  *
@@ -15,8 +15,7 @@
  * stable for the life of the process.
  *
  * OWNERSHIP. guest_alloc returns mod-owned memory in a heap region separate
- * from the game's, which the mod must guest_free; the game view is loaned for
- * the callback's duration; API-returned strings are owned by the API and valid
+ * from the game's, which the mod must guest_free; API-returned strings are owned by the API and valid
  * until the next call on the same thread.
  */
 #ifndef POP_MOD_API_H
@@ -29,7 +28,7 @@
 extern "C" {
 #endif
 
-#define POP_MOD_API_VERSION 1
+#define POP_MOD_API_VERSION 2
 
 typedef int32_t PopModStatus;
 
@@ -101,9 +100,6 @@ typedef struct PopHookInvocation PopHookInvocation;
 #define POP_HOOK_REPLACE 2
 #define POP_HOOK_WRAP 3
 
-/* Explicit opt-out for callbacks that use only CPU/guest/host services. */
-#define POP_HOOK_NO_GAME_VIEW 1u
-
 #define POP_EVENT_BEFORE 0
 #define POP_EVENT_AFTER 1
 
@@ -142,39 +138,6 @@ typedef struct PopTextureReplacement {
 typedef int32_t (*PopTextureProviderExFn)(const PopModApi *api, uint64_t hash64, int32_t w,
                                           int32_t h, int32_t format, PopTextureReplacement *out,
                                           void *user);
-
-/* ------------------------------------------------------------ game view -- */
-
-/* An immutable snapshot taken at the callback's entry and valid only until
- * that callback returns. `slot` is the PHYSICAL slot index, which is also the
- * index entity() takes; `id` is the entity's own id, a different number. */
-typedef struct PopEntityView {
-    uint32_t size;
-    uint32_t slot;
-    uint32_t guest_addr;
-    uint32_t flags, render_flags, motion_flags, animation_tick;
-    uint16_t id, angle;
-    uint8_t kind, model, state, state_2, class_counter, owner, index, counter, counter_2;
-    int32_t x, z, altitude;
-    int32_t dx, dz, daltitude;
-    uint8_t raw[179];
-} PopEntityView;
-
-/* One of the four records at tribe_base. `raw` is a snapshot copy the
- * callback owns for its duration; the named fields are the ones this
- * repository's own oracle probes already decode. */
-typedef struct PopTribeView {
-    uint32_t size;
-    uint32_t index;
-    uint32_t guest_addr;
-    uint32_t bytes;   /* 0xc65 */
-    uint8_t type;     /* +0xc1f: 1 = computer */
-    uint8_t active;   /* +0xc20 */
-    uint8_t tribe_id; /* +0xc22 */
-    uint8_t reserved0;
-    uint32_t control_flags; /* +0x596 */
-    const uint8_t *raw;
-} PopTribeView;
 
 #define POP_SETTING_BOOL 0
 #define POP_SETTING_INT 1
@@ -225,15 +188,6 @@ struct PopModApi {
     PopModStatus (*guest_alloc)(const PopModApi *api, uint32_t size, uint32_t *out_addr);
     PopModStatus (*guest_free)(const PopModApi *api, uint32_t addr);
 
-    /* game view, read-only */
-    uint32_t (*entity_count)(const PopModApi *api);
-    /* nth allocated slot, in ascending slot order, for iteration. */
-    PopModStatus (*entity_slot)(const PopModApi *api, uint32_t nth, uint32_t *out_slot);
-    /* `slot` is the physical slot index; POP_E_NOTFOUND when it is not
-     * allocated in this callback's snapshot. */
-    PopModStatus (*entity)(const PopModApi *api, uint32_t slot, PopEntityView *out);
-    PopModStatus (*tribe)(const PopModApi *api, uint32_t i, PopTribeView *out);
-
     /* events */
     PopModStatus (*on_frame)(const PopModApi *api, int32_t phase, PopEventFn fn, void *user,
                              uint32_t *out_id);
@@ -276,14 +230,10 @@ struct PopModApi {
     PopModStatus (*hook_install_at_callsite)(const PopModApi *api, uint32_t addr,
                                              uint32_t return_pc, PopHookFn fn, int32_t mode,
                                              void *user, uint32_t *out_id);
-    /* Optional v1 tail. return_pc=0 disables filtering; flags=0 preserves
-     * normal snapshots. NO_GAME_VIEW hides even an enclosing callback's view:
-     * entity_count=0 and entity/slot/tribe return POP_E_STATE in this callback.
-     * Nested ordinary hooks still capture their own immutable entry view.
-     * Unknown flags are rejected. All ordering/unwind/removal rules apply. */
+    /* Optional v1 tail. return_pc=0 disables filtering. All ordering, unwind
+     * and removal rules apply. */
     PopModStatus (*hook_install_ex)(const PopModApi *api, uint32_t addr, uint32_t return_pc,
-                                    PopHookFn fn, int32_t mode, uint32_t flags, void *user,
-                                    uint32_t *out_id);
+                                    PopHookFn fn, int32_t mode, void *user, uint32_t *out_id);
     /* Size-gated optional tail; original providers continue to work. */
     PopModStatus (*texture_override_provider_ex)(const PopModApi *api, PopTextureProviderExFn cb,
                                                  void *user);

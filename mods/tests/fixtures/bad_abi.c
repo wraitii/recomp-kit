@@ -4,7 +4,7 @@
 #include "pop_mod_api.h"
 
 const PopModAbi pop_mod_abi = {(uint32_t)sizeof(PopModAbi),
-                               99, /* not this host's POP_MOD_API_VERSION */
+                               1, /* the obsolete API v1 layout is incompatible */
                                (uint32_t)sizeof(PopModApi), (uint32_t)sizeof(pop_cpu_v1)};
 
 PopModStatus pop_mod_init(const PopModApi *api) {

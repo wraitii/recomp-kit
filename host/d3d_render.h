@@ -58,7 +58,6 @@ struct HostCommandStorageStats {
 };
 struct HostHDTextureStats {
     uint64_t draws, loads, hits, refused, resident_bytes, budget_bytes;
-    uint64_t detail_draws;
 };
 // Totals, for the run report.
 uint32_t host_d3d_total_draws(void);

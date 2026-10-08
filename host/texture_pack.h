@@ -78,13 +78,8 @@ struct Pack {
             File f;
             if (!inspect(it->path(), f))
                 continue;
-            if (it->path().filename() == "terrain-detail.popt" && !f.hash && !f.flags &&
-                f.width == f.height && f.width >= 128 && f.width <= 2048) {
-                files.emplace(0, std::move(f));
-                continue;
-            }
             if (!f.hash)
-                continue; // zero belongs only to the named data texture
+                continue;
             char expected[32];
             snprintf(expected, sizeof(expected), "%016llx.popt", (unsigned long long)f.hash);
             if (it->path().filename() != expected)

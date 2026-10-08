@@ -133,7 +133,7 @@ __attribute__((weak)) int mods_display_wide() {
     return 1;
 }
 __attribute__((weak)) void mods_display_scene_domain(int, int) {}
-__attribute__((weak)) void mods_display_texture_pack(uint32_t, int) {}
+__attribute__((weak)) void mods_display_texture_pack(uint32_t) {}
 __attribute__((weak)) int mods_display_scene_width(int w, int) {
     return w;
 }
@@ -144,18 +144,6 @@ __attribute__((weak)) int mods_display_overlay() {
     return 0;
 }
 }
-
-extern "C" __attribute__((weak)) uint64_t host_sprite_frame_id() {
-    return 0;
-}
-extern "C" __attribute__((weak)) uint32_t host_sprite_texture_revision(uint32_t) {
-    return 0;
-}
-
-struct HostD3DDrawSnapshot;
-extern "C" __attribute__((weak)) void host_sprite_record_draw(const HostD3DDrawSnapshot *) {}
-
-extern "C" __attribute__((weak)) void mods_options_request() {}
 
 extern "C" __attribute__((weak)) int mods_display_textures() {
     return 0;

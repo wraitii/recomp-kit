@@ -97,15 +97,12 @@ struct Uniforms {
     alpharef: f32,
     specular: u32, texture_has_alpha: u32, fogmode: u32,
     fogstart: f32, fogend: f32, fogdensity: f32, fogr: f32, fogg: f32, fogb: f32, pointsize: f32,
-    terrain_detail: u32,
 };
 @group(0) @binding(0) var<storage, read> verts: array<HVertex>;
 @group(0) @binding(1) var<storage, read> vu: Uniforms;
 @group(0) @binding(5) var<storage, read> u: Uniforms;
 @group(0) @binding(16) var tex: texture_2d<f32>;
-@group(0) @binding(17) var detail: texture_2d<f32>;
 @group(0) @binding(24) var tex_s: sampler;
-@group(0) @binding(25) var detail_s: sampler;
 struct V2F {
     @builtin(position) pos: vec4f,
     @location(0) uv: vec2f,
@@ -130,20 +127,7 @@ struct PSOut { @location(0) color: vec4f, @location(1) coverage: f32 };
 @fragment fn fs_main(i: V2F) -> PSOut {
     var c = i.color;
     var t = textureSample(tex, tex_s, i.uv);
-    let structure_sample = textureSample(detail, detail_s, i.uv);
     if (u.textured != 0u) {
-        if (u.terrain_detail != 0u) {
-            let chroma = t.rgb / max(max(t.r, t.g), max(t.b, 0.01));
-            let land = 1.0 - smoothstep(0.02, 0.22, chroma.b - chroma.r);
-            let grass = smoothstep(-0.03, 0.16, chroma.g - chroma.r);
-            let stone = 1.0 - smoothstep(0.06, 0.28, max(chroma.r, chroma.g) - min(chroma.r, min(chroma.g, chroma.b)));
-            let sand = smoothstep(0.28, 0.62, max(t.r, t.g));
-            let structure = (structure_sample * 255.0 - 128.0) / 128.0;
-            var material = mix(structure.a, structure.g, sand);
-            material = mix(material, structure.b, stone);
-            material = mix(material, structure.r, grass);
-            t = vec4f(sat3(t.rgb * (1.0 + material * 0.85 * land)), t.a);
-        }
         var ta = i.color.a;
         if (u.texture_has_alpha != 0u) { ta = t.a; }
         switch (u.texblend) {

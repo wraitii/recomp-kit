@@ -9,7 +9,7 @@ MOD_TEST_SUITE(classic_page_lists_exactly_survivors) {
     mods_display_reset();
     mods_host_set_main_thread();
     char path[512];
-    snprintf(path, sizeof path, "%s/pop-classic-list-XXXXXX", os_temp_dir());
+    snprintf(path, sizeof path, "%s/display-mode-list-XXXXXX", os_temp_dir());
     int fd = os_mkstemp(path);
     MOD_CHECK(fd >= 0);
     if (fd < 0)
@@ -29,7 +29,7 @@ MOD_TEST_SUITE(classic_page_lists_exactly_survivors) {
         {"w":1920,"h":1080,"bpp":16,"passed":true}]})";
     }
     MOD_CHECK(mods_display_load_modes(path));
-    // A resource explicitly loaded by main.mm wins over the repository file.
+    // The explicitly loaded synthetic report remains active through page setup.
     mods_page_init();
     mods_page_open(nullptr);
     MOD_CHECK_EQ(mods_display_set(DISPLAY_CLASSIC_MODE, 0), POP_OK);
@@ -58,24 +58,4 @@ MOD_TEST_SUITE(classic_page_lists_exactly_survivors) {
     mods_settings_reset();
     mods_display_reset();
     os_unlink(path);
-}
-
-MOD_TEST_SUITE(classic_page_committed_survivors) {
-    mods_settings_reset();
-    mods_display_reset();
-    mods_host_set_main_thread();
-    MOD_CHECK(mods_display_load_modes("tools/recomp/baseline/classic-modes.json"));
-    mods_page_init();
-    mods_page_open(nullptr);
-    const char *expected[] = {"640x480",   "800x600",   "1024x768", "1280x720",
-                              "1920x1080", "2560x1440", "3840x2160"};
-    for (int i = 0; i < 7; ++i) {
-        MOD_CHECK_EQ(mods_display_set(DISPLAY_CLASSIC_MODE, i), POP_OK);
-        MOD_CHECK(std::string(mods_page_line(4)) == std::string("Resolution: ") + expected[i]);
-    }
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_CLASSIC_MODE, 7), POP_E_RANGE);
-    mods_page_close();
-    mods_input_remove_all(MODS_OWNER_RUNTIME);
-    mods_settings_reset();
-    mods_display_reset();
 }

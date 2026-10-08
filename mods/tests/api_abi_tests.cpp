@@ -8,18 +8,18 @@
 MOD_TEST_SUITE(api_abi) {
     MOD_CHECK_EQ(offsetof(PopModApi, version), 0u);
     MOD_CHECK_EQ(offsetof(PopModApi, size), 4u);
-    MOD_CHECK_EQ(POP_MOD_API_VERSION, 1);
-    MOD_CHECK_EQ(offsetof(PopModApi, open_settings_page), 296u);
-    MOD_CHECK_EQ(offsetof(PopModApi, set_anchor), 304u);
-    MOD_CHECK_EQ(offsetof(PopModApi, clear_anchor), 312u);
-    MOD_CHECK_EQ(offsetof(PopModApi, ui_elements), 320u);
-    MOD_CHECK_EQ(offsetof(PopModApi, host_aspect), 328u);
-    MOD_CHECK_EQ(offsetof(PopModApi, display_transition), 336u);
-    MOD_CHECK_EQ(offsetof(PopModApi, set_scene_domain), 344u);
-    MOD_CHECK_EQ(offsetof(PopModApi, hook_install_at_callsite), 352u);
-    MOD_CHECK_EQ(offsetof(PopModApi, hook_install_ex), 360u);
-    MOD_CHECK_EQ(offsetof(PopModApi, texture_override_provider_ex), 368u);
-    MOD_CHECK_EQ(sizeof(PopModApi), 376u);
+    MOD_CHECK_EQ(POP_MOD_API_VERSION, 2);
+    MOD_CHECK_EQ(offsetof(PopModApi, open_settings_page), 264u);
+    MOD_CHECK_EQ(offsetof(PopModApi, set_anchor), 272u);
+    MOD_CHECK_EQ(offsetof(PopModApi, clear_anchor), 280u);
+    MOD_CHECK_EQ(offsetof(PopModApi, ui_elements), 288u);
+    MOD_CHECK_EQ(offsetof(PopModApi, host_aspect), 296u);
+    MOD_CHECK_EQ(offsetof(PopModApi, display_transition), 304u);
+    MOD_CHECK_EQ(offsetof(PopModApi, set_scene_domain), 312u);
+    MOD_CHECK_EQ(offsetof(PopModApi, hook_install_at_callsite), 320u);
+    MOD_CHECK_EQ(offsetof(PopModApi, hook_install_ex), 328u);
+    MOD_CHECK_EQ(offsetof(PopModApi, texture_override_provider_ex), 336u);
+    MOD_CHECK_EQ(sizeof(PopModApi), 344u);
 
     pop_cpu_v1 cpu;
     pop_cpu_v1_init(&cpu);

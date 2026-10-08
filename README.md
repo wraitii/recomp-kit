@@ -3,10 +3,9 @@
 A static recompilation kit: 32-bit x86 Windows games become native
 applications for macOS, iOS, Android, Linux and Windows, with no JIT and no
 emulator at run time. The design is in
-`docs/superpowers/specs/2026-09-13-recomp-kit-design.md`. Populous: The
-Beginning is the first supported game; it lives in its own repository,
-[populous-recomp](https://github.com/veritr1x/populous-recomp), which pulls
-this kit in as a submodule.
+`docs/superpowers/specs/2026-09-13-recomp-kit-design.md`. Game configurations,
+assets and game-backed evidence live in their own repositories, which pull this
+kit in as a submodule.
 
 ## Layout
 
@@ -16,9 +15,9 @@ this kit in as a submodule.
 | `dx/` | DirectDraw, Direct3D 2, DirectSound, DirectInput, QMixer shims |
 | `host/` | SDL3 host, Metal/Vulkan/fake GPU backends, audio mixer, presentation |
 | `platform/` | `os.h`, the only place that talks to the operating system |
-| `mods/` | the mod foundation (Lua 5.4) and its native capture instruments |
+| `mods/` | the mod foundation (Lua 5.4), loader and lifecycle services |
 | `games/stub/` | a game that does not exist: the values game-free builds and CI configure with |
-| `tools/` | translator, oracle, build and test scripts |
+| `tools/` | translator, build and test scripts |
 | `third_party/` | vendored Lua, TinySoundFont, minimp3, stb_truetype, volk, Vulkan headers |
 
 ## Games live in their own repositories

@@ -85,38 +85,20 @@ void setup() {
 }
 
 void run_turn() {
-    X86 *c = loader_context();
-    loader_init_context(c);
-    c->r[R_ESP] -= 4;
-    wr32(c->r[R_ESP], 0x00401000u);
-    int32_t i = recomp_index_of(0x004ec6f0u);
-    recomp_hook_ptrs[i](c, (uint32_t)i);
+    mods_events_test_fire(1, POP_EVENT_BEFORE);
+    mods_events_test_fire(1, POP_EVENT_AFTER);
 }
 
 } // namespace
 
-MOD_TEST_SUITE(lua_reads_entities_through_the_view) {
+MOD_TEST_SUITE(lua_event_callback_runs) {
     setup();
-    // Put two allocated entities where the view will find them, so "it read
-    // entities" is a fact about content and not about a zero that happens to
-    // satisfy >= 0.
-    uint32_t base = mods_symbol_global("entity_base");
-    for (uint32_t slot = 1; slot <= 2; ++slot) {
-        uint32_t p = base + slot * 179;
-        memset(gm_ptr(p), 0, 179);
-        // Allocated is the kind byte at +42 being non-zero, not a flag bit at
-        // +12 (plan and spec amended in e3b6a72, applied by T8 in d0a77c0).
-        wr8(p + 42, 1);                       // allocated: kind
-        wr16(p + 36, (uint16_t)(100 + slot)); // its id
-    }
     MOD_CHECK(!mods_lua_run_script(OWNER, "mods/tests/fixtures/good.lua"));
     run_turn();
 
-    int64_t seen = -1, ids = -1;
-    MOD_CHECK(mods_lua_global_int(OWNER, "seen_entities", &seen));
-    MOD_CHECK(mods_lua_global_int(OWNER, "seen_ids", &ids));
-    MOD_CHECK_EQ(seen, 2);
-    MOD_CHECK_EQ(ids, 2);
+    int64_t seen = -1;
+    MOD_CHECK(mods_lua_global_int(OWNER, "seen_turns", &seen));
+    MOD_CHECK_EQ(seen, 1);
     MOD_CHECK_EQ(mods_lua_errors(), 0u);
 }
 
@@ -151,12 +133,12 @@ MOD_TEST_SUITE(lua_dropping_a_mod_unsubscribes_first) {
     MOD_CHECK(!mods_lua_run_script(OWNER, "mods/tests/fixtures/good.lua"));
     run_turn();
     int64_t before = 0;
-    MOD_CHECK(mods_lua_global_int(OWNER, "seen_entities", &before));
+    MOD_CHECK(mods_lua_global_int(OWNER, "seen_turns", &before));
     // Dropping the mod removes its subscriptions BEFORE its interpreter goes
     // away, so a later turn cannot reach a freed lua_State.
     mods_lua_drop_mod(OWNER);
     run_turn();
-    MOD_CHECK(!mods_lua_global_int(OWNER, "seen_entities", &before));
+    MOD_CHECK(!mods_lua_global_int(OWNER, "seen_turns", &before));
     MOD_CHECK_EQ(mods_lua_errors(), 0u);
 }
 
@@ -168,15 +150,11 @@ MOD_TEST_SUITE(lua_the_rest_of_the_surface_answers) {
     MOD_CHECK(!mods_lua_run_script(OWNER, "mods/tests/fixtures/good.lua"));
 
     // Reads and symbols work outside a callback: they are not snapshots.
-    uint32_t turn_addr = mods_symbol_global("simulation_turn");
-    wr32(turn_addr, 4242u);
-    MOD_CHECK_STR(mods_lua_eval(OWNER, "return tostring(pop.symbol('main_loop_inner'))"),
-                  "5162736"); // 0x004ec6f0
     MOD_CHECK_STR(mods_lua_eval(OWNER, "return tostring(pop.symbol('no.such.symbol'))"), "nil");
     MOD_CHECK_STR(mods_lua_eval(OWNER, "return tostring(pop.guest_read_u32(0xffffff00))"),
                   "nil"); // out of range, not a crash
-    MOD_CHECK_STR(mods_lua_eval(OWNER, "return type(pop.guest_read_u8(0x401000))"), "number");
-    MOD_CHECK_STR(mods_lua_eval(OWNER, "return type(pop.guest_read_u16(0x401000))"), "number");
+    MOD_CHECK_STR(mods_lua_eval(OWNER, "return type(pop.guest_read_u8(0x1000))"), "number");
+    MOD_CHECK_STR(mods_lua_eval(OWNER, "return type(pop.guest_read_u16(0x1000))"), "number");
 
     // The settings round trip, through the same owner the script runs as.
     mods_settings_declare(OWNER, "test.lua", "speed", "Speed", POP_SETTING_INT, 3, 0, 10);
@@ -185,36 +163,19 @@ MOD_TEST_SUITE(lua_the_rest_of_the_surface_answers) {
     MOD_CHECK_STR(mods_lua_eval(OWNER, "return tostring(pop.settings_get('speed'))"), "7");
     MOD_CHECK_STR(mods_lua_eval(OWNER, "return tostring(pop.mod_id())"), "test.lua");
 
-    // The view-dependent readings, taken where a mod would take them: inside a
-    // callback, where the snapshot exists.
-    // The newlines are load-bearing: adjacent string literals concatenate
-    // without them and Lua sees `1end`.
+    // A callback can use its own API instance and settings from the event.
     MOD_CHECK_STR(mods_lua_eval(OWNER, "pop.on_turn('after', function()\n"
-                                       "  probe_turn = pop.simulation_turn()\n"
-                                       "  probe_frame = pop.command_frame()\n"
-                                       "  probe_paused = pop.paused() and 1 or 0\n"
-                                       "  local t = pop.tribe(0)\n"
-                                       "  probe_tribe_bytes = t and t.bytes or -1\n"
-                                       "  probe_tribe_index = t and t.index or -1\n"
+                                       "  probe_id = pop.mod_id()\n"
+                                       "  probe_speed = pop.settings_get('speed')\n"
                                        "end)\n"
                                        "return 'ok'\n"),
                   "ok");
     run_turn();
 
     int64_t v = -1;
-    MOD_CHECK(mods_lua_global_int(OWNER, "probe_turn", &v));
-    // The turn this callback ran on, which is the one the guest holds by the
-    // time it returns: the hook is on the turn function, so the counter has
-    // already moved past the 4242 written above.
-    MOD_CHECK_EQ(v, (int64_t)rd32(turn_addr));
-    MOD_CHECK(v == 4242 || v == 4243);
-    MOD_CHECK(mods_lua_global_int(OWNER, "probe_frame", &v));
-    MOD_CHECK(mods_lua_global_int(OWNER, "probe_paused", &v));
-    MOD_CHECK(v == 0 || v == 1);
-    MOD_CHECK(mods_lua_global_int(OWNER, "probe_tribe_bytes", &v));
-    MOD_CHECK_EQ(v, 0xc65);
-    MOD_CHECK(mods_lua_global_int(OWNER, "probe_tribe_index", &v));
-    MOD_CHECK_EQ(v, 0);
+    MOD_CHECK_STR(mods_lua_eval(OWNER, "return tostring(probe_id)"), "test.lua");
+    MOD_CHECK(mods_lua_global_int(OWNER, "probe_speed", &v));
+    MOD_CHECK_EQ(v, 7);
     MOD_CHECK_EQ(mods_lua_errors(), 0u);
 }
 

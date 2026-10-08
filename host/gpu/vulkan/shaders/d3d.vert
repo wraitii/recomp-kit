@@ -6,7 +6,6 @@ struct Uniforms {
     float alpharef;
     uint specular, texture_has_alpha, fogmode;
     float fogstart, fogend, fogdensity, fogr, fogg, fogb, pointsize;
-    uint terrain_detail;
 };
 layout(std430, set = 0, binding = 0) readonly buffer Vertices { HVertex v[]; };
 layout(std430, set = 0, binding = 1) readonly buffer UniformBlock { Uniforms u; };

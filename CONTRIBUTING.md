@@ -140,8 +140,7 @@ using an isolated `RECOMP_PROFILE_DIR`. Bundling signs the libraries before
 the app and includes the FFmpeg notice in `Contents/Resources`.
 
 `--target smoke` builds the offscreen scripted host, `--target headless` the
-minimal boot host, `--target fixture` the parity fixture and `--target plugins`
-every mod plugin. `--preset` and `--config Debug` pick the CMake preset; the
+minimal boot host and `--target plugins` every mod plugin. `--preset` and `--config Debug` pick the CMake preset; the
 CMake tree lives in `<build root>/cmake/<preset>` and every artifact keeps its
 documented path under that build root: the game's `build/` when the game lives
 outside the kit, the kit's `build/` for the stub. Your default writable profile
@@ -151,9 +150,8 @@ configuring its game path.
 
 ## Add a game
 
-Make a repository for it with `game.toml` and `globals.toml` at its root,
-following `games/stub/` for the keys and populous-recomp for a complete
-example, and add this kit as a submodule at `kit/`. Build with
+Make a repository for the game with `game.toml` and `globals.toml` at its root,
+following `games/stub/` for the keys, and add this kit as a submodule at `kit/`. Build with
 `kit/tools/build.py --game-dir "$PWD"`. Nothing under `runtime/`, `dx/`,
 `host/` or `platform/` may name your game; put addresses under `[hooks]` and
 use the generated `RECOMP_HOOK_*` macros.
@@ -165,7 +163,6 @@ use the generated `RECOMP_HOOK_*` macros.
 .venv/bin/python tools/format.py         # Check handwritten C/C++/Objective-C
 .venv/bin/python tools/test.py --native  # Runtime, DirectX and Metal tests on macOS; portable suites everywhere
 .venv/bin/python tools/test.py --mods    # Build the app first; real game-backed mod tests
-.venv/bin/python tools/test.py --gameplay # Build the app first; isolated native Options/gameplay run
 ```
 
 The test runner describes missing prerequisites rather than silently skipping a

@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
-#include <initializer_list>
 
 struct HostDumpAt {
     bool armed = false, at_least = false;
@@ -34,47 +33,15 @@ struct HostDumpAtSample {
     const char *clock;
 };
 
-struct HostSimDumpRegion {
-    const char *name;
-    const void *data;
-    size_t bytes;
-};
-
-// Both live and fixture writers use the same filenames, checked writes and
-// close handling. The JSON producer runs synchronously under the guest baton.
-template <class WriteJson>
-bool host_write_simdump(const char *dir, const char *name,
-                        std::initializer_list<HostSimDumpRegion> regions, WriteJson write_json) {
-    const std::string base = std::string(dir) + "/" + name;
-    bool ok = true;
-    for (const auto &r : regions) {
-        FILE *f = fopen((base + "." + r.name + ".bin").c_str(), "wb");
-        bool written = f && r.data && r.bytes;
-        if (written)
-            written = fwrite(r.data, 1, r.bytes, f) == r.bytes;
-        if (f && fclose(f))
-            written = false;
-        ok = written && ok;
-    }
-    FILE *f = fopen((base + ".entities.json").c_str(), "wb");
-    if (!f)
-        return false;
-    const bool written = write_json(f) && !ferror(f);
-    const bool closed = fclose(f) == 0;
-    return ok && written && closed;
-}
-
 // Called at the first eligible completed guest present, before releasing its
-// arena/baton. Image completion can be deferred, but guest evidence cannot.
-template <class WriteSimDump>
-bool host_dumpat_fire(HostDumpAt &request, const HostDumpAtSample &s, const char *dir,
-                      bool sim_regions, WriteSimDump write_simdump) {
+// arena/baton. The image and provenance are captured at the same boundary.
+inline bool host_dumpat_fire(HostDumpAt &request, const HostDumpAtSample &s, const char *dir) {
     if (!host_dumpat_should_fire(request.armed, s.gameplay, s.value, request.threshold,
                                  request.at_least))
         return false;
     request.armed = false;
     ++request.fired;
-    bool ok = !sim_regions || write_simdump(request.name.c_str());
+    bool ok = true;
     const auto path = std::string(dir) + "/smoke_" + request.name + "_provenance.txt";
     if (FILE *f = fopen(path.c_str(), "wb")) {
         fprintf(f, "name %s\narmed_on %s%s%g\n", request.name.c_str(), request.metric.c_str(),

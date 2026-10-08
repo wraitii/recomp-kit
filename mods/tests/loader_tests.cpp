@@ -34,9 +34,8 @@ namespace {
 const char *TREE = nullptr; // the mods tree this suite builds
 std::string g_fixtures = mods_test_build_path("recomp/mods-fixtures");
 
-// Enters a hooked function the way a generated call site does. The events
-// layer hooks the turn scheduler, so this is how a turn event is made to fire
-// from a test.
+// Enters a hooked function the way a generated call site does. Tests choose a
+// symbol from the current game's hookable symbol catalog.
 void enter_hooked(uint32_t addr) {
     int32_t i = recomp_index_of(addr);
     if (i < 0)
@@ -44,11 +43,26 @@ void enter_hooked(uint32_t addr) {
     X86 *c = loader_context();
     loader_init_context(c);
     c->r[R_ESP] -= 4;
-    wr32(c->r[R_ESP], 0x00401000u);
+    wr32(c->r[R_ESP], 0x12345678u);
     if (__atomic_load_n(&recomp_hooked[i], __ATOMIC_ACQUIRE))
         recomp_hook_ptrs[i](c, (uint32_t)i);
     else
-        recomp_base_ptrs[i](c);
+        fprintf(stderr, "loader test tried to enter unhooked symbol %08x\n", addr);
+}
+
+uint32_t hookable_entry() {
+    uint32_t addrs[1024];
+    uint32_t count = 0;
+    if (mods_symbols_matching("", addrs, 1024, &count) != POP_OK)
+        return 0;
+    if (count > 1024)
+        count = 1024;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t addr = addrs[i];
+        if (mods_symbol_hookable(addr))
+            return addr;
+    }
+    return 0;
 }
 
 void mkdirs(const std::string &path) {
@@ -69,15 +83,8 @@ void write_file(const std::string &path, const std::string &text) {
 
 // A manifest with the identity filled in and whatever else the case needs.
 std::string manifest(const char *id, const std::string &extra = "") {
-    return std::string("id = \"") + id +
-           "\"\n"
-           "name = \"" +
-           id +
-           "\"\n"
-           "version = \"1.0.0\"\n"
-           "api = 1\n"
-           "game = \"815ba8a550f571c3\"\n" +
-           extra;
+    return std::string("id = \"") + id + "\"\nname = \"" + id +
+           "\"\nversion = \"1.0.0\"\napi = 2\ngame = \"" + loader_exe_sha256() + "\"\n" + extra;
 }
 
 // An empty mods tree and an empty profile of this suite's own, so it never
@@ -417,9 +424,6 @@ MOD_TEST_SUITE(loader_loads_two_and_rolls_back_the_third) {
     // The runtime's event hooks are the same in number as they are in a run
     // where no mod loaded at all, so the failed mod left none of its own
     // among them.
-    MOD_CHECK_EQ(
-        runtime_owned,
-        34u); // events, sprites, animation, settings/display, minimap buffers and native options
     MOD_CHECK_EQ(mods_overlay_layer_count(), layers_before + 0u);
     MOD_CHECK_EQ(mods_menu_entry_count(), menus_before + 0u);
     MOD_CHECK_EQ(mods_guest_alloc_count(owner_of("bad.init")), 0u);
@@ -475,12 +479,15 @@ MOD_TEST_SUITE(loader_negative_cases) {
     fresh();
     uint32_t id = 0;
     auto real_cb = [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {};
-    MOD_CHECK_EQ(mods_hook_install(MODS_OWNER_FIRST_MOD, 0x00400001u, real_cb, POP_HOOK_BEFORE,
-                                   nullptr, &id),
-                 POP_E_NOSYMBOL);
-    MOD_CHECK_EQ(mods_hook_install(MODS_OWNER_FIRST_MOD, 0x0055db78u, real_cb, POP_HOOK_BEFORE,
-                                   nullptr, &id),
-                 POP_E_NOSYMBOL);
+    MOD_CHECK_EQ(
+        mods_hook_install(MODS_OWNER_FIRST_MOD, 1u, real_cb, POP_HOOK_BEFORE, nullptr, &id),
+        POP_E_NOSYMBOL);
+    const uint32_t hookable = hookable_entry();
+    MOD_CHECK(hookable != 0);
+    if (hookable)
+        MOD_CHECK_EQ(mods_hook_install(MODS_OWNER_FIRST_MOD, hookable + 1u, real_cb,
+                                       POP_HOOK_BEFORE, nullptr, &id),
+                     POP_E_NOSYMBOL);
 }
 
 MOD_TEST_SUITE(loader_rejects_dependents_of_a_failed_init) {
@@ -497,35 +504,6 @@ MOD_TEST_SUITE(loader_rejects_dependents_of_a_failed_init) {
     // Its dependent never ran its own init at all.
     MOD_CHECK(!loaded("needs.bad"));
     MOD_CHECK(reason("needs.bad").find("bad.init") != std::string::npos);
-    MOD_CHECK_EQ(
-        mods_hooks_installed_count(),
-        34u); // events, sprites, animation, settings/display, minimap buffers and native options
-}
-
-MOD_TEST_SUITE(loader_serves_an_old_cpu_layout) {
-    fresh();
-    install("x", manifest("old.cpu", "[plugin]\npath = \"" + plug("old_cpu") + "\"\n"),
-            plug("old_cpu").c_str());
-    MOD_CHECK(mods_load_all());
-    MOD_CHECK(loaded("old.cpu"));
-
-    X86 *c = loader_context();
-    loader_init_context(c);
-    c->r[R_EAX] = 0xfeedfaceu;
-    c->r[R_ESP] -= 4;
-    wr32(c->r[R_ESP], 0x00401000u);
-    int32_t i = recomp_index_of(0x004ec6f0u);
-    recomp_hook_ptrs[i](c, (uint32_t)i);
-
-    void *h = os_dlopen_noload((std::string(TREE) + "/x/" + plug("old_cpu")).c_str());
-    unsigned *size = (unsigned *)os_dlsym(h, "g_old_cpu_size");
-    unsigned *eax = (unsigned *)os_dlsym(h, "g_old_cpu_eax");
-    unsigned *declared = (unsigned *)os_dlsym(h, "g_old_cpu_declared");
-    MOD_CHECK(size && eax && declared);
-    MOD_CHECK_EQ(*eax, 0xfeedfaceu);
-    // The plugin's own header said this, and the host served exactly it.
-    MOD_CHECK(*declared < POP_CPU_V1_BASELINE_SIZE);
-    MOD_CHECK_EQ(*size, *declared);
 }
 
 MOD_TEST_SUITE(loader_settings_and_shutdown) {
@@ -548,9 +526,7 @@ MOD_TEST_SUITE(loader_settings_and_shutdown) {
     MOD_CHECK_EQ(mods_settings_set(b, "level", 99), POP_E_RANGE);
 
     uint32_t before = mods_hooks_installed_count();
-    MOD_CHECK_EQ(
-        before,
-        36u); // 6 events + 7 sprites + 2 animation + 13 settings/display/minimap + 6 native options + 2 mod hooks
+    MOD_CHECK(before >= 2u); // each successfully loaded fixture owns one hook
     mods_shutdown();
     // pop_mod_exit ran in reverse load order, each removed its own hook, and
     // every tracked resource is reclaimed.
@@ -667,7 +643,7 @@ MOD_TEST_SUITE(loader_abi_rejection_is_typed) {
     MOD_CHECK(mods_load_all());
     MOD_CHECK(!loaded("bad.abi"));
     MOD_CHECK_EQ(mods_record_status("bad.abi"), POP_E_ABI);
-    MOD_CHECK(reason("bad.abi").find("api_version 99") != std::string::npos);
+    MOD_CHECK(reason("bad.abi").find("api_version 1") != std::string::npos);
 
     // A plugin with no record at all is the same typed refusal.
     fresh();
@@ -705,14 +681,6 @@ MOD_TEST_SUITE(loader_abi_rejection_is_typed) {
     MOD_CHECK(mods_load_all());
     MOD_CHECK(!loaded("abi.big"));
     MOD_CHECK_EQ(mods_record_status("abi.big"), POP_E_ABI);
-
-    // And the old-header plugin is still served: a smaller cpu_size is a
-    // supported plugin, not a rejected one.
-    fresh();
-    install("z", manifest("old.cpu", "[plugin]\npath = \"" + plug("old_cpu") + "\"\n"),
-            plug("old_cpu").c_str());
-    MOD_CHECK(mods_load_all());
-    MOD_CHECK(loaded("old.cpu"));
 }
 
 // ---------------------------------------------------------------------------
@@ -812,10 +780,9 @@ MOD_TEST_SUITE(loader_rollback_is_observable_from_every_side) {
     // by counting subscriptions: nothing of it is reached.
     unsigned *fired = (unsigned *)os_dlsym(h, "g_bad_event_fired");
     MOD_CHECK(fired && *fired == 0);
-    // Driven through the real dispatch table, the way a generated call site
-    // reaches it, so the event really fires. If the subscription had survived
-    // the rollback this is where it would be seen.
-    enter_hooked(0x004ec6f0u);
+    // Fire the generic event directly. If the subscription had survived the
+    // rollback this is where it would be seen.
+    mods_events_test_fire(1, POP_EVENT_BEFORE);
     MOD_CHECK(fired && *fired == 0);
 
     // Its texture provider is gone, observed by asking for the exact override
@@ -892,17 +859,18 @@ MOD_TEST_SUITE(loader_retained_api_and_in_flight_teardown) {
     // teardown is asked for.
     uint32_t id = 0;
     MOD_CHECK_EQ(mods_hook_install(
-                     MODS_OWNER_RUNTIME, 0x004ec6f0u,
-                     [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {
+                     MODS_OWNER_RUNTIME, hookable_entry(),
+                     [](const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
                          mods_shutdown_request();
                          // The teardown does NOT run while a callback is on the stack.
                          g_complete_during_callback = mods_shutdown_complete();
                          g_allocs_during_callback = mods_guest_alloc_count(g_inflight_owner);
+                         api->hook_return(api, cpu, 0, 0);
                      },
                      POP_HOOK_BEFORE, nullptr, &id),
                  POP_OK);
 
-    enter_hooked(0x004ec6f0u);
+    enter_hooked(hookable_entry());
     MOD_CHECK(!g_complete_during_callback);   // deferred
     MOD_CHECK(g_allocs_during_callback > 0u); // nothing reclaimed underneath it
 
@@ -1012,7 +980,7 @@ MOD_TEST_SUITE(loader_a_guard_unwound_past_leaves_no_count_behind) {
     // destructor held there would never be destroyed, which for a counter
     // means it is leaked from the first unwind onwards and for C++ means the
     // jump itself is undefined.
-    const uint32_t ADDR = 0x004ec6f0u;
+    const uint32_t ADDR = hookable_entry();
     g_wrap_depth = 0;
     auto wrap = [](const PopModApi *a, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *) {
         if (++g_wrap_depth == 1) {
@@ -1091,9 +1059,9 @@ MOD_TEST_SUITE(loader_refuses_a_mod_when_owner_ids_run_out) {
 }
 
 MOD_TEST_SUITE(loader_the_pre_entry_pump_refuses_once_the_guest_is_running) {
-    fresh(); // this thread is the run thread: entry has begun
+    fresh(); // this thread is the run thread: guest execution has begun
     auto nop = [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) {};
-    const uint32_t TURN = 0x004ec6f0u;
+    const uint32_t TURN = hookable_entry();
 
     // Queued, because the thread that asks is not a guest thread.
     uint32_t id = 0;
@@ -1226,16 +1194,16 @@ MOD_TEST_SUITE(loader_a_retained_guard_survives_the_teardown_that_races_it) {
 }
 
 // ---------------------------------------------------------------------------
-// A hook installed during pop_mod_init is live for the entry point itself.
+// A hook installed during pop_mod_init is live before the first guest call.
 //
 // The loader runs on a thread that is not a guest thread, so an install from
 // pop_mod_init is queued rather than applied. Left queued it would not take
 // effect until the first scheduler checkpoint, which happens inside the guest
-// - after the entry point has been called. A hook on the entry symbol would
+// - after guest execution has been marked as begun. A hook on a test symbol
 // then never fire at all, and a hook on anything the first frame touches would
 // miss the first frame.
 // ---------------------------------------------------------------------------
-MOD_TEST_SUITE(loader_publishes_init_time_hooks_before_the_entry_point) {
+MOD_TEST_SUITE(loader_publishes_init_time_hooks_before_guest_calls) {
     fresh();
     install("e", manifest("entry.hook", "[plugin]\npath = \"" + plug("entry_hook") + "\"\n"),
             plug("entry_hook").c_str());
@@ -1265,13 +1233,15 @@ MOD_TEST_SUITE(loader_publishes_init_time_hooks_before_the_entry_point) {
     MOD_CHECK_EQ(*calls, 0u); // and has not run yet
 
     // Published by the load, not by a checkpoint: the flag is already set
-    // before anything guest-side has had a chance to run.
-    const uint32_t ENTRY = 0x0055d6c0u;
-    MOD_CHECK(recomp_index_of(ENTRY) >= 0);
-    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(ENTRY)], 1);
+    // before the test enters its selected guest symbol.
+    const uint32_t TARGET = hookable_entry();
+    MOD_CHECK(TARGET != 0);
+    if (!TARGET)
+        return;
+    MOD_CHECK_EQ(recomp_hooked[recomp_index_of(TARGET)], 1);
 
-    // A guest call into the entry symbol, before any checkpoint, reaches it.
-    enter_hooked(ENTRY);
+    // A guest call into the selected symbol, before any checkpoint, reaches it.
+    enter_hooked(TARGET);
     MOD_CHECK_EQ(*calls, 1u);
 }
 

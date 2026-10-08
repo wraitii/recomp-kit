@@ -33,7 +33,6 @@ TARGETS = {
     "app": ["recomp_app"],
     "smoke": ["pop_smoke"],
     "headless": ["pop_headless"],
-    "fixture": ["pop_fixture"],
     "gen": ["recomp_gen"],
     "dispatch-tests": ["dispatch_tests"],
     "plugins": ["plugins"],
@@ -42,7 +41,7 @@ TARGETS = {
     "web": ["recomp_app"],
 }
 MACOS_ONLY = {"ios"}
-NEEDS_GEN = {"app", "smoke", "headless", "fixture", "gen", "dispatch-tests", "ios", "android", "web"}
+NEEDS_GEN = {"app", "smoke", "headless", "gen", "dispatch-tests", "ios", "android", "web"}
 # Targets with presets of their own, whatever the host system.
 OWN_PRESET = {"ios", "android", "web"}
 
@@ -446,21 +445,6 @@ def run_translator(stage, game_dir, build_root, allow_table_gaps=None, aux_modul
         subprocess.run(module, cwd=ROOT, check=True)
 
 
-def texture_pack(game_dir, build_root):
-    """Compile the redistributable material-detail layer when its inputs are newer.
-    Original-game replacement textures remain optional, locally prepared pack entries.
-    A game without artwork has no texture pack."""
-    detail = Path(build_root) / "texture-pack/terrain-detail.popt"
-    artwork = Path(game_dir) / "assets/terrain/materials-v1.png"
-    compiler = ROOT / "tools/recomp/terrain_detail.py"
-    if not artwork.is_file():
-        return
-    if (not detail.is_file() or not (detail.parent / "manifest.json").is_file()
-            or detail.stat().st_mtime < max(artwork.stat().st_mtime, compiler.stat().st_mtime)):
-        subprocess.run([sys.executable, str(compiler), "--source", str(artwork),
-                        "--output", str(detail.parent)], cwd=ROOT, check=True)
-
-
 def web_site(game_dir, build_root, preset, cfg):
     """The launcher page with this game's web build beside it, ready to serve."""
     site = Path(build_root) / (preset + "-site")
@@ -654,9 +638,6 @@ def main():
                     device = args.device or pick_device(devicectl_list())
                     install_and_launch(app, cfg["game"]["bundle_id"], device, args.console)
             else:
-                # A link-only build ships no texture pack, and its CI has no numpy.
-                if args.target == "app" and not args.stub:
-                    texture_pack(args.game_dir, args.build_root)
                 configure(preset, defines, build_dir=build_dir)
                 build(preset, TARGETS[args.target], args.jobs, build_dir=build_dir, config=args.config)
                 if args.target == "web":

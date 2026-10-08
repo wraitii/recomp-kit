@@ -23,7 +23,7 @@ static int g_checks = 0, g_failures = 0;
 // paths are built from a root spelled that way too.
 static std::string temp_root() {
     char dir[512];
-    snprintf(dir, sizeof dir, "%s/pop-layout-XXXXXX", os_temp_dir());
+    snprintf(dir, sizeof dir, "%s/layout-tests-XXXXXX", os_temp_dir());
     if (os_mkdtemp(dir) != 0)
         return "";
     std::string root = dir;
@@ -71,20 +71,17 @@ int main() {
     touch(root + "/X.app/Contents/MacOS/X");
     host_layout_set_exe_path_for_test((root + "/X.app/Contents/MacOS/X").c_str());
     CHECK(host_layout().resources_dir == root + "/X.app/Contents/Resources");
-    CHECK(host_resource("classic-modes.json") ==
-          root + "/X.app/Contents/Resources/classic-modes.json");
-    // 3. A checkout: the marker file above the executable.
-    mkdir_p(root + "/co/tools/recomp/baseline");
+    CHECK(host_resource("resource.dat") == root + "/X.app/Contents/Resources/resource.dat");
+    // 3. The kit checkout marker above the executable.
     mkdir_p(root + "/co/build/recomp");
-    touch(root + "/co/tools/recomp/baseline/classic-modes.json");
+    touch(root + "/co/AGENTS.md");
     touch(root + "/co/build/recomp/pop_headless");
     host_layout_set_exe_path_for_test((root + "/co/build/recomp/pop_headless").c_str());
     CHECK(host_layout().developer);
     CHECK(host_layout().checkout_root == root + "/co");
     CHECK(host_resource("mods/core") == root + "/co/build/recomp/mods/core");
     CHECK(host_resource("texture-pack") == root + "/co/build/texture-pack");
-    CHECK(host_resource("classic-modes.json") ==
-          root + "/co/tools/recomp/baseline/classic-modes.json");
+    CHECK(host_resource("resource.dat") == root + "/co/resource.dat");
     CHECK(host_layout().profile_dir == root + "/co/build/recomp/profile");
     // 4. RECOMP_PROFILE_DIR wins everywhere.
     os_setenv("RECOMP_PROFILE_DIR", "/elsewhere/profile");
@@ -121,8 +118,7 @@ int main() {
     CHECK(host_layout().checkout_root == root + "/game");
     CHECK(host_resource("symbols.json") == root + "/game/build/recomp/symbols.json");
     CHECK(host_resource("mods/core") == root + "/game/build/recomp/mods/core");
-    CHECK(host_resource("classic-modes.json") ==
-          std::string(RECOMP_KIT_DIR) + "/tools/recomp/baseline/classic-modes.json");
+    CHECK(host_resource("resource.dat") == root + "/game/resource.dat");
     CHECK(host_layout().profile_dir == root + "/game/build/recomp/profile");
     // 8. A flat bundle (iOS): Info.plist beside the executable, no Contents/MacOS.
     mkdir_p(root + "/Flat.app");
@@ -131,7 +127,7 @@ int main() {
     host_layout_set_exe_path_for_test((root + "/Flat.app/Flat").c_str());
     CHECK(host_layout().resources_dir == root + "/Flat.app");
     CHECK(!host_layout().developer);
-    CHECK(host_resource("classic-modes.json") == root + "/Flat.app/classic-modes.json");
+    CHECK(host_resource("resource.dat") == root + "/Flat.app/resource.dat");
 
     // 9. RECOMP_RESOURCES_DIR wins everywhere: the Android host points the
     // layout at its app data folder, where no executable path could lead.
@@ -140,7 +136,7 @@ int main() {
     CHECK(host_layout().resources_dir == "/data/app-files");
     CHECK(!host_layout().developer);
     CHECK(host_resource("controls") == "/data/app-files/controls");
-    CHECK(host_resource("classic-modes.json") == "/data/app-files/classic-modes.json");
+    CHECK(host_resource("resource.dat") == "/data/app-files/resource.dat");
     // Set after the layout was first asked for, as for the profile.
     os_setenv("RECOMP_RESOURCES_DIR", "/data/other-files");
     CHECK(host_layout().resources_dir == "/data/other-files");

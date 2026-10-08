@@ -10,14 +10,6 @@ from pathlib import Path
 source, target = map(Path, sys.argv[1:])
 manifest = json.loads((source / 'manifest.json').read_text())
 files = ['manifest.json', 'preload.txt']
-detail = manifest.get('terrain_detail')
-if detail:
-    if detail['file'] != 'terrain-detail.popt':
-        raise ValueError('invalid terrain detail filename')
-    asset = source / detail['file']
-    if asset.stat().st_size != detail['bytes'] or hashlib.sha256(asset.read_bytes()).hexdigest() != detail['sha256']:
-        raise ValueError('terrain detail differs from its manifest')
-    files.append(detail['file'])
 for item in manifest['textures']:
     if not re.fullmatch('[0-9a-f]{16}', item['hash']):
         raise ValueError('invalid texture hash')
@@ -36,4 +28,4 @@ for name in files:
 for old in target.glob('*.popt'):
     if old.name not in files:
         old.unlink()
-print(f'packaged {len(manifest["textures"])} replacements and {int(bool(detail))} terrain detail resource into {target}')
+print(f'packaged {len(manifest["textures"])} replacements into {target}')

@@ -59,15 +59,13 @@ def test_linux_archive_contents(tmp_path, monkeypatch, machine, arch):
     monkeypatch.setattr(package_desktop.platform, "machine", lambda: machine)
     out = package_desktop.stage(exe, cfg, tmp_path / "out", system="Linux")
     expected = {"StubRecomp", "LICENSE", "NOTICE", "README.txt", "resources",
-                "resources/classic-modes.json", "resources/symbols.json",
+                "resources/symbols.json",
                 "resources/general-midi.sf2", "resources/general-midi-LICENSE.txt"}
     assert {p.relative_to(out).as_posix() for p in out.rglob("*")} == expected
     assert (out / "StubRecomp").read_bytes() == exe.read_bytes()
     assert stat.S_IMODE((out / "StubRecomp").stat().st_mode) == stat.S_IMODE(exe.stat().st_mode)
     for name in ("LICENSE", "NOTICE"):
         assert (out / name).read_bytes() == (package_desktop.ROOT / name).read_bytes()
-    assert (out / "resources/classic-modes.json").read_bytes() == (
-        package_desktop.ROOT / "tools/recomp/baseline/classic-modes.json").read_bytes()
     assert (out / "resources/symbols.json").read_bytes() == (tmp_path / "symbols.json").read_bytes()
     # The kit's own General MIDI bank ships; the game's private one does not.
     bank = package_desktop.ROOT / "third_party/soundfonts/generaluser-gs"
@@ -130,7 +128,6 @@ def test_windows_folder(tmp_path):
     assert (out / "StubRecomp.exe").read_bytes() == b"MZ"
     assert (out / "NOTICE").is_file()
     assert (out / "LICENSE").is_file()
-    assert (out / "resources/classic-modes.json").is_file()
     assert not (out / "resources/symbols.json").exists()
     assert not list((tmp_path / "out").glob("*.tar.gz"))
     readme = (out / "README.txt").read_text()
@@ -217,7 +214,6 @@ def test_build_packages_only_successful_desktop_apps(tmp_path, monkeypatch, syst
     monkeypatch.setattr(build.sys, "argv", argv)
     monkeypatch.setattr(build.platform, "system", lambda: system)
     monkeypatch.setattr(build.game_config, "load", lambda path: cfg)
-    monkeypatch.setattr(build, "texture_pack", lambda *args: None)
     monkeypatch.setattr(build, "configure", lambda *args, **kw: None)
     binary = tmp_path / "build/recomp" / ("StubRecomp.exe" if system == "Windows" else "StubRecomp")
     calls = []

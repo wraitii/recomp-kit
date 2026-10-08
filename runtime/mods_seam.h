@@ -4,8 +4,8 @@
 // Every name here is also declared in mods/mods_internal.h with the
 // identical signature and identical (C) linkage; the mods module defines them
 // strongly and mods_seam.cpp defines them weakly, so a build without the mods
-// module - the runtime tests, the parity fixture with mods disabled - links
-// and behaves exactly as it did before the foundation existed.
+// module - the runtime tests or a host with mods disabled - links without the
+// plugin implementation.
 //
 // mods/tests/seam_contract_test.cpp includes both headers, so a
 // signature that drifts is a compile error rather than two symbols.
@@ -19,8 +19,6 @@ extern "C" {
 
 // Presentation transition notification. No-op in hosts without a presenter.
 void mods_present_level_end(void);
-// Thread-safe application Settings command, drained by the guest frame loop.
-void mods_options_request(void);
 
 // Lifecycle, called by the host.
 bool mods_load_all(void);

@@ -169,6 +169,8 @@ const ComObj *ddraw_effective_palette(const ComObj *surface);
 // Uploads a texture surface to the host renderer, for IDirect3DTexture2::Load
 // and for the first GetHandle.
 void d3d_upload_texture(ComObj *surface);
+// Current surface content revision for a texture handle; zero if invalid.
+uint32_t d3d_texture_revision(uint32_t handle);
 // The Direct3D device rasterizes into a DirectDraw surface, so anything it has
 // drawn has to be in that surface's own memory before the guest reads it,
 // writes it or presents it. ddraw.cpp calls this from Lock, Blt, BltFast,

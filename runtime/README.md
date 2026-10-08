@@ -197,20 +197,19 @@ let another thread reach the same section.
 
 A thread that has not finished reports `STILL_ACTIVE` from
 `GetExitCodeThread`, which is itself a scheduling point because a caller
-polling it is spinning (`0052d580` does exactly this), and leaves a wait on its
-handle unsatisfied. `ExitThread` ends its own thread. `ExitProcess` called from
+polling it is spinning, and leaves a wait on its handle unsatisfied. `ExitThread` ends its own thread. `ExitProcess` called from
 a guest thread cannot longjmp, because the landing pad is on the main thread's
 stack: it records the request, hands the baton to the main thread and ends
 itself, and the main thread performs the exit as soon as it is running again.
 
 ## The guest file system
 
-The guest root `C:\Populous\` maps to the directory holding the loaded EXE
-(`original/gog` by default). Path resolution converts `\` to `/`, resolves
-`.`/`..`, and matches each component case-insensitively against the real
-directory (cached per directory, invalidated on create/delete/rename). Relative
-paths resolve against the guest current directory, which starts at
-`C:\Populous`.
+The guest root from `game.toml` (`executable.guest_root`) maps to the
+directory holding the loaded EXE. Path resolution converts `\\` to `/`,
+resolves `.`/`..`, and matches each component case-insensitively against the
+real directory (cached per directory, invalidated on create/delete/rename).
+Relative paths resolve against the guest current directory, which starts at
+the configured guest root.
 
 ## Environment variables
 
@@ -237,31 +236,16 @@ and check that every shim leaves ESP balanced.
 
 ## MIDI out
 
-The game's music is MIDI played through a SoundFont, and the device name is the
-whole gate. `0x575e40` walks the `midiOut` devices, calls `midiOutGetDevCapsA`
-on each, and keeps the first whose `szPname` begins with the nine characters
-`SoundFont` (the literal at `0x5eb5b0`); if none matches it returns -1 and there
-is no music at all. It tries `SFMAN32.DLL` first - the Creative SoundFont
-manager - which this build reports as missing, so the plain `midiOut` path is
-the one that runs. It then opens with a null callback, sends a twelve-byte
-sysex through `midiOutPrepareHeader` and `midiOutLongMsg`, and plays note by
-note with `midiOutShortMsg` (`0x576140` is its all-notes-off: control change
-`0x7b` on channel 0).
-
-So `midiOutGetDevCapsA` reports one device called "SoundFont Synth", and the
-bank is `Sound/POPFIGHT.SF2` beside the executable, resolved through the file
-shim and handed to the host as a path. `host_midi_open/short/sysex/reset/close`
-in `win32.h` are the whole contract; the weak defaults in `misc.cpp` accept
-every message and play nothing, so a build with no host links and reports a
-device that is simply silent. That is deliberate: the game has one MIDI path
-and no fallback, so failing the open would lose the music and gain nothing.
+`midiOutGetDevCapsA` reports one device called "SoundFont Synth".
+`host_midi_open/short/sysex/reset/close` in `win32.h` are the host contract;
+the weak defaults in `misc.cpp` accept every message and play nothing.
+The host uses TinySoundFont with the bank selected during startup, before
+the guest begins executing. A host without a synth remains silent.
 
 Every one of these runs on a guest thread and holds the scheduler baton for the
 whole call, so a host that blocks inside one stops every guest thread and not
 just the caller. `host_midi_short` is the hot one, called per note, and must
-not take a lock an audio thread can hold. `host_midi_open` is the slow one: the
-retail bank is 485 KB and parses quickly, but a host that loaded a large one
-synchronously would freeze the game at the moment the music starts with nothing
+not take a lock an audio thread can hold. Loading a large bank synchronously would freeze the game at the moment the music starts with nothing
 to say why, so the open is timed.
 
 The host now builds the synth and loads the bank before the guest starts, so

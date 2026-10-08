@@ -4,6 +4,7 @@
 #include "../../platform/os.h"
 #include "../mods_internal.h"
 #include <string>
+#include <fstream>
 #include <thread>
 
 static const PopModApi *test_provider(uint32_t owner);
@@ -331,10 +332,24 @@ MOD_TEST_SUITE(display_settings_apply_at_next_frame_without_epoch_change) {
 }
 MOD_TEST_SUITE(enhanced_preserves_selected_resolution) {
     setup();
-    MOD_CHECK(mods_display_load_modes("tools/recomp/baseline/classic-modes.json"));
+    mods_display_reset();
+    char path[512];
+    snprintf(path, sizeof path, "%s/display-modes-XXXXXX", os_temp_dir());
+    int fd = os_mkstemp(path);
+    MOD_CHECK(fd >= 0);
+    if (fd < 0)
+        return;
+    os_fd_close(fd);
+    {
+        std::ofstream f(path);
+        f << R"({"modes":[{"w":640,"h":480,"bpp":16,"passed":true},
+                       {"w":800,"h":600,"bpp":16,"passed":true}]})";
+    }
+    MOD_CHECK(mods_display_load_modes(path));
+    os_unlink(path);
     mode_offers = 0;
     mods_display_init();
-    MOD_CHECK_EQ(mode_offers, 0); // startup keeps the saved game mode
+    MOD_CHECK_EQ(mode_offers, 0); // startup keeps the current mode
     MOD_CHECK_EQ(mods_display_set(DISPLAY_CLASSIC_MODE, 1), POP_OK);
     MOD_CHECK_EQ(mods_display_set(DISPLAY_RENDERING, 1), POP_OK);
     MOD_CHECK_EQ(mode_offers, 1);
@@ -342,13 +357,13 @@ MOD_TEST_SUITE(enhanced_preserves_selected_resolution) {
     MOD_CHECK_EQ(offered_h, 600);
     MOD_CHECK_EQ(mods_display_set(DISPLAY_RENDERING, 0), POP_OK);
     mods_display_transition(12, HOST_SCREEN_MENU);
-    MOD_CHECK_EQ(mode_offers, 1); // no 640x480 replacement on returning to Enhanced
+    MOD_CHECK_EQ(mode_offers, 1); // returning to Enhanced keeps the selected mode
     mods_display_reset();
 }
 MOD_TEST_SUITE(display_page_and_passing_mode_list) {
     setup();
     char path[512];
-    snprintf(path, sizeof path, "%s/pop-display-modes-XXXXXX", os_temp_dir());
+    snprintf(path, sizeof path, "%s/display-modes-XXXXXX", os_temp_dir());
     int fd = os_mkstemp(path);
     MOD_CHECK(fd >= 0);
     if (fd < 0)

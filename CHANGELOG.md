@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Remove Populous-only fixture capture, decoder/oracle and mode probes, gameplay
+  runner, host integration script, terrain-material generation/rendering,
+  built-in menu/settings/animation hooks, entity and sprite decoders, and built-in
+  mod selection from the shared kit. Remove the shipped Populous display-mode
+  qualification report and game-specific SoundFont lookup; document the generic
+  host and use the bundled General MIDI bank. Replacement texture packs remain available
+  as an optional generic tool. The reduced mod API is version 2; version 1
+  plugins are rejected and must be rebuilt against the current header.
+
 - Translated body chunks use a 2 MiB source budget (was 512 KiB), so the
   larger SSA bodies pack into fewer, less overhead-bound compile units.
 

@@ -262,11 +262,11 @@ MOD_TEST_SUITE(page_shows_only_the_rows_the_game_lists) {
 MOD_TEST_SUITE(textures_row_says_what_the_pack_holds) {
     mods_display_reset();
     MOD_CHECK(mods_display_line(DISPLAY_TEXTURES) == "Textures: HD pack");
-    mods_display_texture_pack(0, 1);
-    MOD_CHECK(mods_display_line(DISPLAY_TEXTURES) == "Terrain detail: on");
-    mods_display_texture_pack(12, 1);
+    mods_display_texture_pack(0);
+    MOD_CHECK(mods_display_line(DISPLAY_TEXTURES) == "Textures: original (no texture pack)");
+    mods_display_texture_pack(12);
     MOD_CHECK(mods_display_line(DISPLAY_TEXTURES) == "Textures: HD pack");
-    mods_display_texture_pack(0, 0);
+    mods_display_texture_pack(0);
     MOD_CHECK(mods_display_line(DISPLAY_TEXTURES) == "Textures: original (no texture pack)");
     mods_display_reset();
 }

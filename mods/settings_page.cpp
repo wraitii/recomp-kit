@@ -10,7 +10,6 @@
 // there. The test that matters checks a buffer standing in for the guest's
 // pixels comes back untouched.
 #include "mods_internal.h"
-#include "options_menu.h"
 #include "display_settings.h"
 #include "controls_settings.h"
 #include "game_config.h"
@@ -166,14 +165,10 @@ int32_t on_key(const PopModApi *, int32_t dik, int32_t, int32_t down, void *) {
         return 1;
     }
     if (dik == 0x44) { // DIK_F10, reserved
-        if (down) {
-            if (mods_options_open(nullptr, true))
-                mods_page_close();
-            else if (g_open)
-                mods_page_close();
-            else
-                mods_page_open(nullptr);
-        }
+        if (down && g_open)
+            mods_page_close();
+        else if (down)
+            mods_page_open(nullptr);
         return 1;
     }
     if (!g_open)
@@ -244,9 +239,6 @@ void put_pixel(void *pixels, int w, int h, int bpp, int pitch, int x, int y, uin
 // same key. The page is the only runtime-owned key handler there is; the
 // runtime's other registrations are hooks, which this does not touch.
 void mods_page_init() {
-    // Packaged hosts load their resource before reaching this point. Other
-    // hosts use the same committed list from the repository working directory.
-    mods_display_load_modes("tools/recomp/baseline/classic-modes.json");
     mods_display_init();
     mods_controls_init(RECOMP_CONTROLS_DEFAULT_LAYOUT);
     mods_input_remove_all(MODS_OWNER_RUNTIME);
@@ -256,10 +248,6 @@ void mods_page_init() {
 }
 
 PopModStatus mods_page_open(const char *mod_id) {
-    if (mods_options_open(mod_id)) {
-        g_open = false;
-        return POP_OK;
-    }
     g_filter = mod_id ? mod_id : "";
     g_cursor = 0;
     g_open = true;

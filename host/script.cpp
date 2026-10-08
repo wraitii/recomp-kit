@@ -6,31 +6,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-double host_script_counter_metric(const char *name, uint32_t (*guest_u32)(uint32_t),
-                                  uint32_t (*view_turn)(), uint32_t (*view_command_frame)()) {
+double host_script_counter_metric(const char *name, uint32_t (*guest_u32)(uint32_t)) {
     const bool is_turn = !strcmp(name, "turn");
     if (!is_turn && strcmp(name, "command_frame"))
         return -1.0;
 #if defined(RECOMP_GLOBAL_SIMULATION_TURN_ADDR) && defined(RECOMP_GLOBAL_COMMAND_FRAME_ADDR)
-    const uint32_t value =
-        guest_u32(is_turn ? RECOMP_GLOBAL_SIMULATION_TURN_ADDR : RECOMP_GLOBAL_COMMAND_FRAME_ADDR);
-    auto view = is_turn ? view_turn : view_command_frame;
-    if (view) {
-        const uint32_t observed = view();
-        // Report each counter's first mismatch without flooding a long await.
-        static bool warned[2] = {};
-        if (observed != value && !warned[is_turn]) {
-            warned[is_turn] = true;
-            fprintf(stderr, "[smoke] %s game-view cross-check mismatch: guest %u, view %u\n", name,
-                    value, observed);
-        }
-    }
-    return value;
+    return guest_u32(is_turn ? RECOMP_GLOBAL_SIMULATION_TURN_ADDR
+                             : RECOMP_GLOBAL_COMMAND_FRAME_ADDR);
 #else
-    // A game that configures no counter globals has no such metric.
     (void)guest_u32;
-    (void)view_turn;
-    (void)view_command_frame;
     return -1.0;
 #endif
 }
@@ -79,9 +63,8 @@ char *word(char **p) {
 // the same, so "12abc" parses as 12 and "abc" parses as 0. That is how a typo
 // in a script becomes a silent zero and a run tests the wrong thing: `move abc
 // def` moved the pointer to the top-left corner for as long as nobody looked.
-// Every verb goes through one of these three now. Checked before the rule went
-// in: no line of any of the game's smoke scripts is rejected by it, so it
-// changes what is accepted and not what runs.
+// Every numeric operand goes through a whole-token check, so malformed values
+// fail during parsing instead of silently becoming zero.
 bool whole(const char *s, long *out) {
     if (!s || !*s)
         return false;
@@ -93,8 +76,7 @@ bool whole(const char *s, long *out) {
     return true;
 }
 
-// The same, in the base the verb reads: `peek` and `watch` take 0x-hex because
-// that is how every note about this game writes an address.
+// The same check using base-0 parsing, for decimal or 0x-prefixed addresses.
 bool whole_base0(const char *s, long *out) {
     if (!s || !*s)
         return false;
@@ -197,6 +179,11 @@ int host_script_parse(const char *text, HostScriptStep *out, int max, char *erro
         if (!verb)
             continue;
 
+        if (equal_nocase(verb, "camera") || equal_nocase(verb, "viewmove") ||
+            equal_nocase(verb, "viewclick") || equal_nocase(verb, "watch") ||
+            equal_nocase(verb, "simdump") || equal_nocase(verb, "landmark"))
+            return fail(line_number, "unsupported game-specific smoke directive", verb);
+
         if (count >= max)
             return fail(line_number, "too many steps", nullptr);
         HostScriptStep step;
@@ -239,20 +226,6 @@ int host_script_parse(const char *text, HostScriptStep *out, int max, char *erro
             step.op = HOST_SCRIPT_PAD;
             step.button = index;
             step.x = (int32_t)v;
-        } else if (equal_nocase(verb, "viewmove") || equal_nocase(verb, "viewclick") ||
-                   equal_nocase(verb, "camera")) {
-            char *x = word(&cursor);
-            char *y = word(&cursor);
-            long vx = 0, vy = 0;
-            const bool camera = equal_nocase(verb, "camera");
-            if (!x || !y || !whole(x, &vx) || !whole(y, &vy) || vx < (camera ? 0 : -32767) ||
-                vx > (camera ? 65535 : 32767) || vy < 0 || vy > (camera ? 65535 : 32767))
-                return fail(line_number, "invalid view/camera coordinates", nullptr);
-            step.op = camera                           ? HOST_SCRIPT_CAMERA
-                      : equal_nocase(verb, "viewmove") ? HOST_SCRIPT_VIEWMOVE
-                                                       : HOST_SCRIPT_VIEWCLICK;
-            step.x = (int32_t)vx;
-            step.y = (int32_t)vy;
         } else if (equal_nocase(verb, "moveby")) {
             char *dx = word(&cursor);
             char *dy = word(&cursor);
@@ -280,27 +253,9 @@ int host_script_parse(const char *text, HostScriptStep *out, int max, char *erro
             const bool moving = equal_nocase(verb, "move");
             char *which = word(&cursor);
             if (which && equal_nocase(which, "entity")) {
-                char *id = word(&cursor);
-                long value = 0;
-                if (!id || !whole(id, &value) || value < 0 || value > 65535)
-                    return fail(line_number, "entity gesture needs an entity id (0..65535)", id);
-                step.op = moving ? HOST_SCRIPT_ENTITYMOVE : HOST_SCRIPT_ENTITYCLICK;
-                step.entity_id = (int32_t)value;
+                return fail(line_number, "unsupported game-specific smoke gesture", which);
             } else if (which && equal_nocase(which, "world")) {
-                char *x = word(&cursor);
-                char *z = word(&cursor);
-                char *altitude = word(&cursor);
-                long vx = 0, vz = 0, va = 0;
-                if (!x || !z || !altitude || !whole(x, &vx) || !whole(z, &vz) ||
-                    !whole(altitude, &va) || vx < 0 || vx > 65535 || vz < 0 || vz > 65535 ||
-                    va < -32768 || va > 32767)
-                    return fail(line_number,
-                                "world gesture needs x z (0..65535) altitude (-32768..32767)",
-                                nullptr);
-                step.op = moving ? HOST_SCRIPT_WORLDMOVE : HOST_SCRIPT_WORLDCLICK;
-                step.x = (int32_t)vx;
-                step.y = (int32_t)vz;
-                step.altitude = (int32_t)va;
+                return fail(line_number, "unsupported game-specific smoke gesture", which);
             } else if (moving) {
                 char *y = word(&cursor);
                 long vx = 0, vy = 0;
@@ -380,14 +335,6 @@ int host_script_parse(const char *text, HostScriptStep *out, int max, char *erro
             else
                 return fail(line_number, "focus needs on or off", state);
             step.op = HOST_SCRIPT_FOCUS;
-        } else if (equal_nocase(verb, "simdump")) {
-            char *name = word(&cursor);
-            if (!name)
-                return fail(line_number, "simdump needs a name", nullptr);
-            if (const char *why = name_fault(name, sizeof step.name))
-                return fail(line_number, why, name);
-            step.op = HOST_SCRIPT_SIMDUMP;
-            snprintf(step.name, sizeof step.name, "%s", name);
         } else if (equal_nocase(verb, "dump")) {
             char *name = word(&cursor);
             if (!name)
@@ -417,8 +364,7 @@ int host_script_parse(const char *text, HostScriptStep *out, int max, char *erro
             char *len = word(&cursor);
             if (!addr || !len)
                 return fail(line_number, "peek needs an address and a length", nullptr);
-            // Base 0 so a script may write the addresses the way every note
-            // about this game writes them, as 0x8e0428.
+            // Base 0 accepts decimal or 0x-prefixed addresses.
             long a = 0, n = 0;
             if (!whole_base0(addr, &a) || a < 0)
                 return fail(line_number, "peek address is a number", addr);
@@ -433,19 +379,6 @@ int host_script_parse(const char *text, HostScriptStep *out, int max, char *erro
             step.op = HOST_SCRIPT_PEEK;
             step.addr = (uint32_t)a;
             step.len = (uint32_t)n;
-        } else if (equal_nocase(verb, "watch")) {
-            char *owner = word(&cursor);
-            char *kind = word(&cursor);
-            if (!owner || !kind)
-                return fail(line_number, "watch needs an owner and a kind", nullptr);
-            long o = 0, k = 0;
-            if (!whole_base0(owner, &o) || o < 0 || o > 255)
-                return fail(line_number, "watch owner is a byte", owner);
-            if (!whole_base0(kind, &k) || k < 0 || k > 255)
-                return fail(line_number, "watch kind is a byte", kind);
-            step.op = HOST_SCRIPT_WATCH;
-            step.owner = (int32_t)o;
-            step.kind = (int32_t)k;
         } else if (equal_nocase(verb, "readfile")) {
             char *path = word(&cursor);
             const char *want = word(&cursor);
@@ -458,15 +391,10 @@ int host_script_parse(const char *text, HostScriptStep *out, int max, char *erro
             char *claim = word(&cursor);
             if (!claim)
                 return fail(line_number, "await needs metric>value", nullptr);
-            const bool entity_body = equal_nocase(claim, "entity_body");
+            if (equal_nocase(claim, "entity_body"))
+                return fail(line_number, "unsupported game-specific await metric", claim);
             char *gt = strchr(claim, '>');
-            if (entity_body) {
-                char *id = word(&cursor);
-                long value = 0;
-                if (!id || !whole(id, &value) || value < 0 || value > 65535)
-                    return fail(line_number, "entity_body needs an entity id (0..65535)", id);
-                step.entity_id = (int32_t)value;
-            } else if (!gt || gt == claim || !gt[1])
+            if (!gt || gt == claim || !gt[1])
                 return fail(line_number, "await must be metric>value or metric>=value", claim);
             // `>=` as well as `>`. A turn is a counter and the natural way to
             // wait for one is "at least N"; writing turn>699 to mean turn>=700
@@ -475,17 +403,15 @@ int host_script_parse(const char *text, HostScriptStep *out, int max, char *erro
             // parser split it on the '>' and reported "needs a number after >:
             // =700", which is what it did to the first reference script.
             double value = 0.0;
-            if (!entity_body) {
-                char *number = gt + 1;
-                step.at_least = (*number == '=');
-                if (step.at_least)
-                    ++number;
-                *gt = 0;
-                if (!real(number, &value))
-                    return fail(line_number, "await needs a number after >", number);
-            }
+            char *number = gt + 1;
+            step.at_least = (*number == '=');
+            if (step.at_least)
+                ++number;
+            *gt = 0;
+            if (!real(number, &value))
+                return fail(line_number, "await needs a number after >", number);
             step.op = HOST_SCRIPT_AWAIT;
-            snprintf(step.name, sizeof step.name, "%s", entity_body ? "entity_body" : claim);
+            snprintf(step.name, sizeof step.name, "%s", claim);
             step.threshold = value;
             // `for <ms>` how long the claim must stay true, `within <ms>`
             // how long to wait for that before giving up. Either order, both
@@ -515,35 +441,6 @@ int host_script_parse(const char *text, HostScriptStep *out, int max, char *erro
             }
             if (step.hold_ms >= step.timeout_ms)
                 return fail(line_number, "await would time out before it could hold", verb);
-        } else if (equal_nocase(verb, "mode")) {
-            char *w = word(&cursor);
-            char *h = word(&cursor);
-            char *bpp = word(&cursor);
-            long vw = 0, vh = 0, vb = 0;
-            if (!w || !h || !bpp)
-                return fail(line_number, "mode needs a width, a height and a depth", nullptr);
-            if (!whole(w, &vw) || vw < 1 || vw > 16384)
-                return fail(line_number, "mode width is a number of pixels", w);
-            if (!whole(h, &vh) || vh < 1 || vh > 16384)
-                return fail(line_number, "mode height is a number of pixels", h);
-            // The depths DirectDraw has. A mode the game could never be asked
-            // for is a mistake in the script, and rejecting it here is cheaper
-            // than a run that waits twenty seconds to find out.
-            // Eight and sixteen only. Those are the two pixel formats the
-            // DirectDraw shim's enumeration can describe, so a script that
-            // asks for 24 or 32 parses a mode the game can never be offered
-            // and then waits twenty seconds to be told so.
-            if (!whole(bpp, &vb) || (vb != 8 && vb != 16))
-                return fail(line_number, "mode depth is 8 or 16", bpp);
-            step.op = HOST_SCRIPT_MODE;
-            step.w = (int32_t)vw;
-            step.h = (int32_t)vh;
-            step.bpp = (int32_t)vb;
-            // No `within`. The game applies a mode when a level starts and it
-            // recreates its surfaces, not when the options screen is left, so
-            // there is no interval this verb could wait out: it arms the
-            // claim and the run answers it at the end. The script's own awaits
-            // are what bound the run.
         } else if (equal_nocase(verb, "guestclick")) {
             char *gx = word(&cursor);
             char *gy = word(&cursor);
@@ -670,52 +567,6 @@ int host_script_parse(const char *text, HostScriptStep *out, int max, char *erro
             // metric. Reusing one field for both would make the executor read
             // the metric out of a field the parser had overwritten.
             snprintf(step.text, sizeof step.text, "%s", name);
-        } else if (equal_nocase(verb, "landmark")) {
-            char *id = word(&cursor);
-            char *expect = word(&cursor);
-            const char *want = word(&cursor);
-            long vid = 0;
-            if (!id || !expect || !want)
-                return fail(line_number, "landmark needs an id, `expect` and visible|hidden",
-                            nullptr);
-            if (!whole(id, &vid) || vid < 0 || vid > 65535)
-                return fail(line_number, "landmark id is an entity index", id);
-            if (!equal_nocase(expect, "expect"))
-                return fail(line_number, "landmark takes `expect`", expect);
-            if (*want == '$') {
-                const char *name = want + 1;
-                if (!*name ||
-                    ((*name < 'A' || *name > 'Z') && (*name < 'a' || *name > 'z') && *name != '_'))
-                    return fail(line_number, "invalid landmark environment name", want);
-                for (const char *c = name; *c; ++c)
-                    if ((*c < 'A' || *c > 'Z') && (*c < 'a' || *c > 'z') &&
-                        (*c < '0' || *c > '9') && *c != '_')
-                        return fail(line_number, "invalid landmark environment name", want);
-                want = getenv(name);
-                if (!want || !*want)
-                    return fail(line_number, "landmark environment is unset or empty", name);
-            }
-            if (equal_nocase(want, "visible"))
-                step.want_visible = 1;
-            else if (equal_nocase(want, "hidden"))
-                step.want_visible = 0;
-            else
-                return fail(line_number, "landmark expects visible or hidden", want);
-            step.op = HOST_SCRIPT_LANDMARK;
-            step.entity_id = (int32_t)vid;
-            step.timeout_ms = 20000;
-            char *clause = word(&cursor);
-            if (clause) {
-                if (!equal_nocase(clause, "within"))
-                    return fail(line_number, "landmark takes `within`", clause);
-                char *ms = word(&cursor);
-                long v = 0;
-                if (!ms)
-                    return fail(line_number, "landmark needs a number after", clause);
-                if (!whole(ms, &v) || v < 0)
-                    return fail(line_number, "landmark needs a nonnegative timeout", ms);
-                step.timeout_ms = (uint32_t)v;
-            }
         } else if (equal_nocase(verb, "quit")) {
             step.op = HOST_SCRIPT_QUIT;
         } else {
@@ -757,9 +608,6 @@ int host_script_drain_wanted(const HostScriptDrainState *s) {
         return s->hold_reached ? 1 : 0;
     if (s->guestclick_held)
         return s->guestclick_reached ? 1 : 0;
-    // A recorded path being replayed is the script, for as long as it lasts.
-    if (s->sub_active)
-        return s->sub_step_due ? 1 : 0;
     // An await is NOT work the drain can finish: draining runs the tick, the
     // tick looks at the claim, and if it has not passed nothing has changed.
     // The tick still looks on every clock read, which is where an await was
@@ -776,37 +624,4 @@ int host_script_drain_wanted(const HostScriptDrainState *s) {
 uint32_t host_script_input_hold_frames(uint32_t hold_ms, uint32_t step_ms) {
     uint32_t frames = host_script_hold_frames(hold_ms, step_ms);
     return frames < 4u ? 4u : frames;
-}
-
-HostEntityWaitResult HostEntityWait::poll(uint32_t now_ms, uint32_t presents, uint64_t frame,
-                                          uint32_t captured_present, bool body_present) {
-    if (!active) {
-        active = true;
-        since_ms = now_ms;
-        since_present = presents;
-        last_frame = 0;
-    }
-    const uint32_t waited = presents - since_present;
-    if (host_entity_body_ready(presents, frame, captured_present, true)) {
-        last_frame = frame;
-        if (host_entity_body_ready(presents, frame, captured_present, body_present) &&
-            waited <= max_presents)
-            return HostEntityWaitResult::ready;
-    }
-    return waited >= max_presents ? HostEntityWaitResult::timed_out : HostEntityWaitResult::pending;
-}
-
-void HostEntityWait::finish(uint32_t now_ms, uint32_t &script_start_ms) {
-    script_start_ms += now_ms - since_ms; // preserve waits after this gesture
-    *this = {};
-}
-
-void host_entity_body_diagnostic(char *out, size_t size, int32_t id, uint32_t completed_present,
-                                 const HostEntityBodyRecord &body, bool passed) {
-    snprintf(out, size,
-             "entity_body %d: %s frame %llu, last record present %u, "
-             "current completed present %u%s",
-             id, passed ? "PASS attributed BODY" : "FAIL no fresh attributed BODY",
-             (unsigned long long)body.frame, body.present, completed_present,
-             body.frame ? "" : " (no record)");
 }

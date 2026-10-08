@@ -400,9 +400,8 @@ struct alignas(16) Uniforms {
     float fogstart, fogend, fogdensity;
     float fogr, fogg, fogb;
     float pointsize;
-    uint32_t terrain_detail;
 };
-static_assert(sizeof(Uniforms) == 144, "shaders.md documents this layout");
+static_assert(sizeof(Uniforms) == 128, "shaders.md documents this layout");
 
 gpu::Blend blend_factor(uint32_t d3d, bool for_dest, bool *both) {
     *both = false;
@@ -553,32 +552,6 @@ void mask_shape(uint32_t mask, int *shift, uint32_t *max) {
 
 D3DRenderer *g_shared = nullptr;
 
-// A tile whose rows are uniform and whose colour changes down the rows is a
-// gradient - the sky dome's 16x16 gradient, not a terrain material - and the
-// terrain detail must not be laid over it. Measured on the game's own tiles:
-// the sky's mean horizontal neighbour difference is 2.6 levels against 7.4 or
-// more for every terrain tile, and its vertical difference is nearly three
-// times its horizontal one, where terrain is isotropic. A flat tile (no
-// variation at all) is not a gradient.
-bool gradient_tile(const uint8_t *rgba, int w, int h) {
-    if (!rgba || w < 2 || h < 2)
-        return false;
-    double horizontal = 0, vertical = 0;
-    for (int y = 0; y < h; ++y)
-        for (int x = 0; x + 1 < w; ++x)
-            for (int k = 0; k < 3; ++k)
-                horizontal +=
-                    std::abs(int(rgba[(y * w + x) * 4 + k]) - int(rgba[(y * w + x + 1) * 4 + k]));
-    for (int y = 0; y + 1 < h; ++y)
-        for (int x = 0; x < w; ++x)
-            for (int k = 0; k < 3; ++k)
-                vertical +=
-                    std::abs(int(rgba[(y * w + x) * 4 + k]) - int(rgba[((y + 1) * w + x) * 4 + k]));
-    horizontal /= double(h) * (w - 1) * 3;
-    vertical /= double(h - 1) * w * 3;
-    return horizontal < 5.0 && vertical > 2.0 * horizontal;
-}
-
 // A texture the renderer allocated, destroyed with its last reference. The
 // backend keeps the storage alive for commands already encoded against it,
 // so dropping the reference while a frame is in flight is safe.
@@ -703,7 +676,6 @@ struct HDCache {
     std::map<std::pair<uint64_t, uint64_t>, std::shared_ptr<HDTexture>> entries;
     uint64_t budget = 512ull * 1024 * 1024, used = 0, clock = 0, hits = 0, loads = 0, refused = 0,
              draws = 0;
-    uint64_t detail_draws = 0;
     bool reserve(uint64_t bytes) {
         if (bytes > budget) {
             ++refused;
@@ -780,12 +752,10 @@ struct D3DRenderer::Impl {
         std::shared_ptr<HDTexture> enhanced;
         bool alpha = false;
         bool colorkey = false;
-        bool smallOpaqueTile = false;
         uint32_t leases = 0;
     };
     std::map<uint64_t, TexEntry> textures_;
     HDCache hd_;
-    std::shared_ptr<HDTexture> terrain_detail_;
     // handle -> the revision most recently uploaded, which is what a draw that
     // names no revision gets.
     std::map<uint32_t, uint32_t> texture_current_;
@@ -1027,12 +997,7 @@ D3DRenderer::Impl::Impl(gpu::Device *device) : device_(device) {
     }
     hd_.pack.open(packPath);
     ok_ = true;
-    terrain_detail_ = packTexture(0, 0, 0);
-    {
-        const bool detail = hd_.pack.files.count(0) != 0;
-        mods_display_texture_pack(uint32_t(hd_.pack.files.size() - (detail ? 1 : 0)),
-                                  terrain_detail_ ? 1 : 0);
-    }
+    mods_display_texture_pack(uint32_t(hd_.pack.files.size()));
     // Preload the pack's priority list before the first game frame. Stop at
     // 75% of the budget, leaving headroom for textures encountered later.
     std::ifstream preload(std::filesystem::path(packPath) / "preload.txt");
@@ -2675,8 +2640,7 @@ void D3DRenderer::Impl::draw(const HostD3DDraw *cmd, uint32_t revision) {
 
     // --- texture ---
     gpu::Texture texture = white_;
-    int texture_levels = 1, texture_width = 1;
-    bool smallOpaqueTile = false;
+    int texture_levels = 1;
     if (cmd->texture_handle) {
         // The revision this draw named, and only that one, when it named one.
         // Falling back to the current revision for a named-but-missing one
@@ -2689,10 +2653,8 @@ void D3DRenderer::Impl::draw(const HostD3DDraw *cmd, uint32_t revision) {
         }
         auto it = textures_.find(tex_key(cmd->texture_handle, want));
         if (it != textures_.end() && it->second.texture) {
-            smallOpaqueTile = it->second.smallOpaqueTile;
             texture = it->second.texture->texture;
             texture_levels = it->second.texture->levels;
-            texture_width = it->second.texture->width;
             u.texture_has_alpha = it->second.alpha ? 1 : 0;
             // Legacy RGB colour keys supply alpha at texture upload. With
             // COLORKEYENABLE and no explicit alpha test, DX5/6 drivers reject
@@ -2711,7 +2673,6 @@ void D3DRenderer::Impl::draw(const HostD3DDraw *cmd, uint32_t revision) {
                 !host_frame_legacy({slots_[active_slot_].frame})) {
                 texture = it->second.enhanced->texture->texture;
                 texture_levels = it->second.enhanced->texture->levels;
-                texture_width = it->second.enhanced->texture->width;
                 u.texture_has_alpha = it->second.alpha || it->second.enhanced->alpha;
                 ++hd_.draws;
                 it->second.enhanced->lastUse = command_;
@@ -2762,13 +2723,6 @@ void D3DRenderer::Impl::draw(const HostD3DDraw *cmd, uint32_t revision) {
         }
         if (tile && lo_u && hi_u && lo_v && hi_v) {
             addr_u = addr_v = 3;
-            // Larger artist replacements already contain their own detail.
-            if (smallOpaqueTile && texture_width <= 128 && terrain_detail_ &&
-                terrain_detail_->texture && mods_display_textures()) {
-                u.terrain_detail = 1;
-                ++hd_.detail_draws;
-                terrain_detail_->lastUse = command_;
-            }
             const int filter = mods_display_filtering();
             if (filter) {
                 mag = minf = gpu::Filter::Linear;
@@ -2779,10 +2733,6 @@ void D3DRenderer::Impl::draw(const HostD3DDraw *cmd, uint32_t revision) {
     }
 
     device_->set_texture(command_, gpu::Stage::Fragment, 0, texture);
-    device_->set_texture(command_, gpu::Stage::Fragment, 1,
-                         u.terrain_detail ? terrain_detail_->texture->texture : white_);
-    setSampler(1, gpu::Address::Repeat, gpu::Address::Repeat, gpu::Filter::Linear,
-               gpu::Filter::Linear, gpu::MipFilter::Linear, std::max(4, anisotropy));
     setSampler(0, address_mode(addr_u), address_mode(addr_v), mag, minf, mip, anisotropy);
     device_->set_bytes(command_, gpu::Stage::Vertex, 1, &u, sizeof u);
     device_->set_bytes(command_, gpu::Stage::Fragment, 1, &u, sizeof u);
@@ -2967,16 +2917,6 @@ void D3DRenderer::Impl::uploadTexture(const HostD3DTexture *t) {
     e.enhanced.reset();
     const auto &source = t->original ? *t->original : *t;
     e.colorkey = source.has_colorkey && !source.amask;
-    // Original landscape cache entries are complete opaque 16/32-square
-    // RGB565 tiles. The draw gate additionally requires depth-writing world
-    // triangles with full 0..1 UVs: skies, atlases and sprites are excluded.
-    // A provider owns its artwork; do not add host detail on top of it.
-    // upload_scratch_ still holds the base texture's decode from makeTexture.
-    e.smallOpaqueTile = !t->original && !e.alpha && source.width == source.height &&
-                        (source.width == 16 || source.width == 32) && source.bpp == 16 &&
-                        source.rmask == 0xf800 && source.gmask == 0x07e0 &&
-                        source.bmask == 0x001f &&
-                        !gradient_tile(upload_scratch_.data(), source.width, source.height);
     if (t->original) {
         const uint64_t bytes =
             pop_hd::mip_bytes(t->width, t->height, pop_hd::mip_levels(t->width, t->height));
@@ -3460,7 +3400,7 @@ gpu::CommandBuffer D3DRenderer::completionForFrame(uint64_t frame) {
 }
 HostHDTextureStats D3DRenderer::hdTextureStats() const {
     const HDCache &hd = impl_->hd_;
-    return {hd.draws, hd.loads, hd.hits, hd.refused, hd.used, hd.budget, hd.detail_draws};
+    return {hd.draws, hd.loads, hd.hits, hd.refused, hd.used, hd.budget};
 }
 HostCommandStorageStats D3DRenderer::commandStorageStats() const {
     return impl_->storage_stats_;

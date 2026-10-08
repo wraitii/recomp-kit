@@ -69,7 +69,6 @@ struct Uniforms {
     float fogstart, fogend, fogdensity;
     float fogr, fogg, fogb;
     float pointsize;
-    uint terrain_detail;
 };
 struct VOut {
     float4 position [[position]];
@@ -103,33 +102,14 @@ vertex VOut d3d_vertex(uint vid [[vertex_id]],
     return o;
 }
 
-// Shade a world fragment using the guest material and optional terrain detail.
 // Apply the legacy texture/alpha rules before writing color and coverage attachments.
 fragment FOut d3d_fragment(VOut in [[stage_in]],
                            constant Uniforms& u [[buffer(1)]],
                            texture2d<float> tex [[texture(0)]],
-                           sampler samp [[sampler(0)]],
-                           texture2d<float> detail [[texture(1)]],
-                           sampler detail_samp [[sampler(1)]]) {
+                           sampler samp [[sampler(0)]]) {
     float4 c = in.color;
     if (u.textured != 0) {
         float4 t = tex.sample(samp, in.uv);
-        if (u.terrain_detail != 0) {
-            // An independent material sample supplies real fine structures;
-            // enlarging the guest's 16/32 texels cannot create those. The
-            // source remains the color/lighting/coastline mask. Blue water
-            // fades this land-only layer out, including mixed shore texels.
-            float3 chroma = t.rgb / max(max(t.r, t.g), max(t.b, 0.01f));
-            float land = 1.0f - smoothstep(0.02f, 0.22f, chroma.b - chroma.r);
-            float grass = smoothstep(-0.03f, 0.16f, chroma.g - chroma.r);
-            float stone = 1.0f - smoothstep(0.06f, 0.28f, max(chroma.r, chroma.g) - min(chroma.r, min(chroma.g, chroma.b)));
-            float sand = smoothstep(0.28f, 0.62f, max(t.r, t.g));
-            float4 structure = (detail.sample(detail_samp, in.uv) * 255.0f - 128.0f) / 128.0f;
-            float material = mix(structure.a, structure.g, sand);
-            material = mix(material, structure.b, stone);
-            material = mix(material, structure.r, grass);
-            t.rgb = saturate(t.rgb * (1.0f + material * 0.85f * land));
-        }
         switch (u.texblend) {
             case 1: case 7:                                   // DECAL, COPY
                 c = t; break;

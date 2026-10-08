@@ -1,5 +1,4 @@
 #include "display_settings.h"
-#include "options_menu.h"
 #include "mods_internal.h"
 #include "game_config.h"
 #include "../dx/host_api.h"
@@ -17,7 +16,7 @@ const char *keys[] = {"rendering",        "ui_scale",    "wide_view",           
 int desired[DISPLAY_ROW_COUNT] = {0, 0, 1, 0, 0, 0, 0, 1, 3};
 std::atomic<int> classic{0}, scale{0}, wide{1}, fps{0}, overlay{0}, textures{1}, filtering{3};
 int scene_w = 0, scene_h = 0; // guest baton only
-// -1 not reported (no renderer), 0 empty, 1 replacement textures, 2 terrain detail only
+// -1 not reported (no renderer), 0 empty, 1 replacement textures
 std::atomic<int> pack_contents{-1};
 const int rates[] = {0, 40, 60, 120};
 bool initialized = false, probed = false;
@@ -128,21 +127,10 @@ bool mods_display_row_applies(DisplayRow row) {
     }
 }
 int mods_display_value(DisplayRow row) {
-    if (row == DISPLAY_CLASSIC_MODE && mods_options_resolution_count())
-        return mods_options_resolution_value();
     return desired[row];
 }
 PopModStatus mods_display_nudge(DisplayRow row, int delta) {
-    const int counts[] = {
-        2,
-        5,
-        2,
-        3,
-        mods_options_resolution_count() ? mods_options_resolution_count() : int(modes.size()),
-        4,
-        3,
-        2,
-        5};
+    const int counts[] = {2, 5, 2, 3, int(modes.size()), 4, 3, 2, 5};
     if (row < 0 || row >= DISPLAY_ROW_COUNT || !counts[row])
         return POP_E_RANGE;
     const int current = mods_display_value(row);
@@ -163,34 +151,20 @@ PopModStatus mods_display_set(DisplayRow row, int value) {
         return POP_E_INVAL;
     if (!mods_settings_row_listed(row))
         return POP_E_STATE; // this game has no such row
-    if (modes.empty() && !mods_options_resolution_count() &&
-        ((row == DISPLAY_RENDERING && value) || row == DISPLAY_CLASSIC_MODE))
+    if (modes.empty() && ((row == DISPLAY_RENDERING && value) || row == DISPLAY_CLASSIC_MODE))
         return POP_E_STATE;
-    const int maximum[] = {1,
-                           4,
-                           1,
-                           2,
-                           mods_options_resolution_count() ? mods_options_resolution_count() - 1
-                                                           : int(modes.size()) - 1,
-                           3,
-                           2,
-                           1,
-                           4};
+    const int maximum[] = {1, 4, 1, 2, int(modes.size()) - 1, 3, 2, 1, 4};
     if (value < 0 || value > maximum[row])
         return POP_E_RANGE;
-    if (row == DISPLAY_CLASSIC_MODE && !mods_options_resolution_count()) {
+    if (row == DISPLAY_CLASSIC_MODE) {
         const auto m = modes[value];
         if (!host_display_offer_mode(m.w, m.h, m.bpp))
             return POP_E_STATE;
     }
-    const auto status = row == DISPLAY_CLASSIC_MODE && mods_options_resolution_count()
-                            ? POP_OK
-                            : mods_settings_set(MODS_OWNER_RUNTIME, keys[row], value);
+    const auto status = mods_settings_set(MODS_OWNER_RUNTIME, keys[row], value);
     if (status != POP_OK)
         return status;
     desired[row] = value;
-    if (row == DISPLAY_CLASSIC_MODE && mods_options_resolution_count())
-        mods_options_resolution_request(value);
     if (row == DISPLAY_UI_SCALE)
         scale = value;
     if (row == DISPLAY_FPS)
@@ -232,8 +206,8 @@ extern "C" int mods_display_scene_width(int w, int h) {
 extern "C" int mods_display_fps() {
     return fps.load();
 }
-extern "C" void mods_display_texture_pack(uint32_t replacements, int terrain_detail) {
-    pack_contents = replacements ? 1 : terrain_detail ? 2 : 0;
+extern "C" void mods_display_texture_pack(uint32_t replacements) {
+    pack_contents = replacements ? 1 : 0;
 }
 extern "C" int mods_display_textures() {
     return textures.load();
@@ -270,12 +244,8 @@ std::string mods_display_line(DisplayRow row) {
                  std::vector<const char *>{"off", "counters", "graph"}[desired[row]];
         break;
     case DISPLAY_TEXTURES: {
-        // Worded by what the pack holds: a pack with only the authored
-        // terrain detail switches that, not HD textures.
         const int pack = pack_contents.load();
-        if (pack == 2)
-            result = std::string("Terrain detail: ") + (desired[row] ? "on" : "off");
-        else if (pack == 0)
+        if (pack == 0)
             result = "Textures: original (no texture pack)";
         else
             result = std::string("Textures: ") + (desired[row] ? "HD pack" : "original");
@@ -287,10 +257,6 @@ std::string mods_display_line(DisplayRow row) {
                                            "8x anisotropic", "16x anisotropic"}[desired[row]];
         break;
     case DISPLAY_CLASSIC_MODE: {
-        if (mods_options_resolution_count()) {
-            result = "Resolution: " + mods_options_resolution_label();
-            break;
-        }
         if (modes.empty()) {
             result = "Resolution: unavailable";
             break;

@@ -64,20 +64,6 @@ class TexturePackTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 p.read_capture(path)
 
-    def test_rebuilding_replacements_keeps_independent_terrain_detail(self):
-        with tempfile.TemporaryDirectory() as d:
-            source, output = Path(d)/'capture', Path(d)/'pack'
-            source.mkdir(); output.mkdir()
-            (source/'0000000000001234.pam').write_bytes(
-                b'P7\nWIDTH 4\nHEIGHT 4\nDEPTH 4\nMAXVAL 255\nENDHDR\n' + bytes((19, 73, 141, 255))*16)
-            (source/'textures.tsv').write_text('')
-            detail = dict(file='terrain-detail.popt', sha256='independent-resource')
-            (output/'manifest.json').write_text(json.dumps(dict(textures=[], terrain_detail=detail)))
-            p.build(SimpleNamespace(capture=source, output=output, original=None, scale=4))
-            rebuilt = json.loads((output/'manifest.json').read_text())
-            self.assertEqual(rebuilt['terrain_detail'], detail)
-            self.assertEqual(len(rebuilt['textures']), 1)
-
 
 if __name__ == '__main__':
     unittest.main()

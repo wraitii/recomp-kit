@@ -1,10 +1,7 @@
-/* Swaps a replay arena into guest memory around each call. */
 // The mods test builder globs tests/*.cpp and is the only POPM_TESTING build.
 #ifdef POPM_TESTING
 #include "../native/replay.cpp"
 #include "../native/tests/replay_tests.cpp"
-#endif
-#ifdef POPM_TESTING
 #include "../../runtime/guest.h"
 #include "../mods_internal.h"
 #include "../../runtime/win32.h"
@@ -13,200 +10,6 @@
 #include "../native/shim_capture.h"
 #include <utility>
 #include "../../platform/os.h"
-namespace {
-// Only for the hand-audited pure leaf below. This adapter does not provide
-// complete shim interception, so it must never be used for arbitrary targets.
-void translated_leaf(pop_cpu_v1 &cpu, uint8_t *arena, size_t arena_size, pop_replay::Seams &) {
-    X86 c{};
-#define REG(f, r_) c.r[r_] = cpu.f
-    REG(eax, R_EAX);
-    REG(ecx, R_ECX);
-    REG(edx, R_EDX);
-    REG(ebx, R_EBX);
-    REG(esp, R_ESP);
-    REG(ebp, R_EBP);
-    REG(esi, R_ESI);
-    REG(edi, R_EDI);
-#undef REG
-    c.eip = cpu.eip;
-#define FLAG(f) c.eflags_##f = cpu.f
-    FLAG(cf);
-    FLAG(zf);
-    FLAG(sf);
-    FLAG(of);
-    FLAG(pf);
-    FLAG(af);
-    FLAG(df);
-#undef FLAG
-    std::memcpy(c.st, cpu.st, sizeof c.st);
-    c.fpu_top = cpu.fpu_top;
-    c.fpu_cw = cpu.fpu_cw;
-    c.fpu_sw = cpu.fpu_sw;
-    c.fpu_tag = cpu.fpu_tag;
-    recomp_arena_swap(arena, arena_size);
-    recomp_call(&c, 0x00401000);
-    recomp_arena_swap(arena, arena_size);
-#define REG(f, r_) cpu.f = c.r[r_]
-    REG(eax, R_EAX);
-    REG(ecx, R_ECX);
-    REG(edx, R_EDX);
-    REG(ebx, R_EBX);
-    REG(esp, R_ESP);
-    REG(ebp, R_EBP);
-    REG(esi, R_ESI);
-    REG(edi, R_EDI);
-#undef REG
-    cpu.eip = c.eip;
-#define FLAG(f) cpu.f = c.eflags_##f
-    FLAG(cf);
-    FLAG(zf);
-    FLAG(sf);
-    FLAG(of);
-    FLAG(pf);
-    FLAG(af);
-    FLAG(df);
-#undef FLAG
-    std::memcpy(cpu.st, c.st, sizeof cpu.st);
-    cpu.fpu_top = c.fpu_top;
-    cpu.fpu_cw = c.fpu_cw;
-    cpu.fpu_sw = c.fpu_sw;
-    cpu.fpu_tag = c.fpu_tag;
-}
-} // namespace
-MOD_TEST_SUITE(replay_real_translated_leaf) {
-    sched_set_guest_thread(true);
-    mods_hooks_reset();
-    pop_replay::Capture c;
-    c.arena_size = 8192;
-    c.page_size = 4096;
-    pop_cpu_v1_init(&c.entry);
-    c.entry.eip = c.entry.target = 0x00401000;
-    c.entry.esp = 4096 + 128;
-    pop_replay::Page p;
-    p.address = 4096;
-    p.read = true;
-    p.entry.resize(4096);
-    uint32_t stack[] = {0x00401000, 100, 40};
-    std::memcpy(p.entry.data() + 128, stack, sizeof stack);
-    c.pages.push_back(p);
-    c.exit = c.entry;
-    std::vector<uint8_t> initial(c.arena_size);
-    std::copy(p.entry.begin(), p.entry.end(), initial.begin() + p.address);
-    pop_replay::Seams seams(c.calls);
-    translated_leaf(c.exit, initial.data(), initial.size(), seams);
-    MOD_CHECK_EQ(c.exit.eax, 60);
-    MOD_CHECK_EQ(c.exit.esp, c.entry.esp + 4);
-    MOD_CHECK(pop_replay::run(c, translated_leaf).empty());
-    ++c.exit.eax;
-    MOD_CHECK(pop_replay::run(c, translated_leaf).rfind("CPU differs: eax", 0) == 0);
-}
-
-// The loop closed: capture a real translated call with nothing supplied by
-// hand, then replay it. The test above builds its corpus from a page list
-// someone wrote down, so it proves replay and says nothing about acquisition.
-// This one takes the page set from the fault tracker and the shim record from
-// the dispatcher, which is the only evidence that what a capture discovers is
-// what a replay needs.
-MOD_TEST_SUITE(capture_a_real_call_and_replay_it) {
-    os_setenv("RECOMP_TESTING", "1");
-    sched_set_guest_thread(true);
-    mods_hooks_reset();
-    mem_init();
-
-    pop_cpu_v1 entry;
-    pop_cpu_v1_init(&entry);
-    entry.eip = entry.target = 0x00401000;
-    entry.esp = 0x00300000;
-    // The call frame: return address then the two arguments the leaf reads.
-    wr32(entry.esp, 0x00401000);
-    wr32(entry.esp + 4, 100);
-    wr32(entry.esp + 8, 40);
-
-    MOD_CHECK(pop_shimcap::begin(64));
-    MOD_CHECK(pop_pagetrack::begin(64));
-    X86 c{};
-    c.r[R_ESP] = entry.esp;
-    c.eip = entry.eip;
-    recomp_call(&c, 0x00401000);
-
-    const pop_pagetrack::Touch *touches = nullptr;
-    size_t touch_count = 0;
-    const char *page_why = "";
-    const bool pages_ok = pop_pagetrack::end(&touches, &touch_count, &page_why);
-    const pop_shimcap::Call *seams = nullptr;
-    size_t seam_count = 0;
-    const char *seam_why = "";
-    const bool seams_ok = pop_shimcap::end(&seams, &seam_count, &seam_why);
-    MOD_CHECK(pages_ok);
-    MOD_CHECK(seams_ok);
-    // A leaf that only reads its own stack calls nothing, and the page it read
-    // is the stack page. Both are properties of THIS function, so a tracker
-    // that recorded the whole arena or nothing at all fails here.
-    MOD_CHECK_EQ(seam_count, 0u);
-    MOD_CHECK(touch_count >= 1);
-    MOD_CHECK(touch_count < 64);
-    MOD_CHECK_EQ(c.r[R_EAX], 60u);
-
-    const size_t page = pop_pagetrack::page_size();
-    pop_replay::Capture cap;
-    cap.arena_size = GUEST_SIZE;
-    cap.page_size = (uint32_t)page;
-    cap.live_flags = 0;
-    cap.entry = entry;
-    // Every field replay compares, taken from the CPU the call left behind.
-    // Copying only the ones this leaf was expected to change would make the
-    // test agree with its own guess instead of with the run.
-    cap.exit = entry;
-#define OUT(f, r_) cap.exit.f = c.r[r_]
-    OUT(eax, R_EAX);
-    OUT(ecx, R_ECX);
-    OUT(edx, R_EDX);
-    OUT(ebx, R_EBX);
-    OUT(esp, R_ESP);
-    OUT(ebp, R_EBP);
-    OUT(esi, R_ESI);
-    OUT(edi, R_EDI);
-#undef OUT
-    cap.exit.eip = c.eip;
-    cap.exit.cf = c.eflags_cf;
-    cap.exit.zf = c.eflags_zf;
-    cap.exit.sf = c.eflags_sf;
-    cap.exit.of = c.eflags_of;
-    cap.exit.pf = c.eflags_pf;
-    cap.exit.af = c.eflags_af;
-    cap.exit.df = c.eflags_df;
-    std::memcpy(cap.exit.st, c.st, sizeof cap.exit.st);
-    cap.exit.fpu_top = c.fpu_top;
-    cap.exit.fpu_cw = c.fpu_cw;
-    cap.exit.fpu_sw = c.fpu_sw;
-    cap.exit.fpu_tag = c.fpu_tag;
-    bool found_stack = false;
-    for (size_t i = 0; i < touch_count; ++i) {
-        pop_replay::Page p;
-        p.address = touches[i].address;
-        p.read = touches[i].read;
-        p.written = touches[i].written;
-        p.entry.assign(touches[i].entry, touches[i].entry + page);
-        if (p.written)
-            p.exit.assign(g_mem + p.address, g_mem + p.address + page);
-        if (p.address <= entry.esp && entry.esp < p.address + page)
-            found_stack = true;
-        cap.pages.push_back(std::move(p));
-    }
-    MOD_CHECK(found_stack);
-    MOD_CHECK(pop_replay::validate(cap).empty());
-    const std::string replayed = pop_replay::run(cap, translated_leaf);
-    if (!replayed.empty())
-        std::fprintf(stderr, "replay said: %s\n", replayed.c_str());
-    MOD_CHECK(replayed.empty());
-
-    // And it is a real comparison: a corpus claiming the wrong exit value is
-    // rejected by the same replay.
-    ++cap.exit.eax;
-    MOD_CHECK(pop_replay::run(cap, translated_leaf).rfind("CPU differs: eax", 0) == 0);
-}
-#endif
-#ifdef POPM_TESTING
 namespace {
 char capture_last_log[256];
 PopModStatus capture_log(const PopModApi *, const char *message) {
@@ -238,7 +41,7 @@ MOD_TEST_SUITE(capture_fixture_fails_closed) {
     const char *saved = recomp_env("TESTING");
     std::string keep = saved ? saved : "";
     os_unsetenv("RECOMP_TESTING");
-    os_setenv("RECOMP_CAPTURE_TARGET", "0x00401000");
+    os_setenv("RECOMP_CAPTURE_TARGET", "0x12340000");
     os_setenv("RECOMP_CAPTURE_OUT", mods_test_build_path("recomp/should-not-exist.json").c_str());
     capture_last_log[0] = 0;
     MOD_CHECK_EQ(init(&api), POP_E_STATE);
@@ -266,10 +69,10 @@ MOD_TEST_SUITE(capture_fixture_fails_closed) {
     MOD_CHECK_EQ(os_dlclose(library), 0);
 }
 #endif
+#ifdef POPM_TESTING
 #include "../native/tests/page_track_tests.cpp"
 #include "../native/tests/shim_capture_tests.cpp"
 #include <algorithm>
-#ifdef POPM_TESTING
 // The corpus writer. Until this suite existed the only thing that exercised it
 // was a live capture run, which is a poor place to discover that a field is
 // missing or that a rejected capture left a file behind.
@@ -317,7 +120,7 @@ MOD_TEST_SUITE(capture_corpus_has_every_field_replay_needs) {
 
     pop_cpu_v1 entry;
     pop_cpu_v1_init(&entry);
-    entry.target = 0x0040c670;
+    entry.target = 0x12340000;
     entry.esp = 0x03100000;
 
     MOD_CHECK(pop_capture_begin(64, 8) == 1);
@@ -326,7 +129,7 @@ MOD_TEST_SUITE(capture_corpus_has_every_field_replay_needs) {
     (void)seen;
     X86 c{};
     c.r[R_ESP] = entry.esp;
-    wr32(entry.esp, 0x00401234);
+    wr32(entry.esp, 0x12345678);
     imports_dispatch(&c, tid);
 
     pop_cpu_v1 exit_state = entry;
@@ -339,7 +142,7 @@ MOD_TEST_SUITE(capture_corpus_has_every_field_replay_needs) {
     MOD_CHECK(!text.empty());
     // Everything pop_replay::validate and the replay itself read back.
     MOD_CHECK(text.find("\"version\": 1") != std::string::npos);
-    MOD_CHECK(text.find("\"target\": 4245104") != std::string::npos);
+    MOD_CHECK(text.find("\"target\": 305397760") != std::string::npos);
     MOD_CHECK(text.find("\"arena_size\": 268435456") != std::string::npos);
     MOD_CHECK(text.find("\"live_flags\": 0") != std::string::npos);
     MOD_CHECK(text.find("\"entry\": {") != std::string::npos);
@@ -397,9 +200,9 @@ MOD_TEST_SUITE(capture_to_file_and_replay_with_intercepted_shims) {
     const uint32_t stack = 0x07000000u & ~(uint32_t)(page - 1);
     pop_cpu_v1 entry;
     pop_cpu_v1_init(&entry);
-    entry.target = 0x0040c670;
+    entry.target = 0x12340000;
     entry.esp = stack + (uint32_t)page / 2;
-    wr32(entry.esp, 0x00401234);
+    wr32(entry.esp, 0x12345678);
 
     // Capture: the two seams, in this order, through the real dispatcher.
     MOD_CHECK_EQ(pop_capture_begin(64, 8), 1);
@@ -492,96 +295,6 @@ MOD_TEST_SUITE(capture_to_file_and_replay_with_intercepted_shims) {
 }
 #endif
 #ifdef POPM_TESTING
-// Replays a corpus captured from a live run.
-//
-// RECOMP_REPLAY_CORPUS names the file; without it the suite captures a small one
-// of its own first, so it always exercises the same path and never passes by
-// being skipped. With it, this is the check that a corpus taken from the real
-// game replays: load it, run the original at its own recorded target through
-// the dispatch table with the recorded shim calls served in the shims' place,
-// and require every live register and every written page to match.
-MOD_TEST_SUITE(replay_a_captured_corpus_at_its_own_target) {
-    os_setenv("RECOMP_TESTING", "1");
-    sched_set_guest_thread(true);
-    mods_hooks_reset();
-    mem_init();
-    imports_init();
-
-    std::string path;
-    const char *named = recomp_env("REPLAY_CORPUS");
-    if (named && *named) {
-        path = named;
-        std::fprintf(stderr, "[replay] using the corpus at %s\n", path.c_str());
-    } else {
-        // One of our own, from the leaf the translated adapter tests use, so
-        // this suite has something real to replay in every run.
-        const size_t page = pop_pagetrack::page_size();
-        const uint32_t stack = 0x08000000u & ~(uint32_t)(page - 1);
-        pop_cpu_v1 entry;
-        pop_cpu_v1_init(&entry);
-        entry.eip = entry.target = 0x00401000;
-        entry.esp = stack + (uint32_t)page / 2;
-        wr32(entry.esp, 0x00401000);
-        wr32(entry.esp + 4, 100);
-        wr32(entry.esp + 8, 40);
-
-        MOD_CHECK_EQ(pop_capture_begin(64, 8), 1);
-        X86 c{};
-        c.r[R_ESP] = entry.esp;
-        c.eip = entry.eip;
-        recomp_call(&c, 0x00401000);
-        pop_cpu_v1 exit_state = entry;
-#define OUT(f, r_) exit_state.f = c.r[r_]
-        OUT(eax, R_EAX);
-        OUT(ecx, R_ECX);
-        OUT(edx, R_EDX);
-        OUT(ebx, R_EBX);
-        OUT(esp, R_ESP);
-        OUT(ebp, R_EBP);
-        OUT(esi, R_ESI);
-        OUT(edi, R_EDI);
-#undef OUT
-        exit_state.eip = c.eip;
-        exit_state.df = c.eflags_df;
-        std::memcpy(exit_state.st, c.st, sizeof exit_state.st);
-        exit_state.fpu_top = c.fpu_top;
-        exit_state.fpu_cw = c.fpu_cw;
-        exit_state.fpu_sw = c.fpu_sw;
-        exit_state.fpu_tag = c.fpu_tag;
-        path = std::string(mod_test_dir("replay_at_target")) + "/corpus.json";
-        const char *why = "unset";
-        MOD_CHECK_EQ(pop_capture_write(path.c_str(), entry.target, &entry, &exit_state, 0, &why),
-                     1);
-    }
-
-    pop_replay::Capture c;
-    const std::string bad = pop_replay::load(path, &c);
-    if (!bad.empty())
-        std::fprintf(stderr, "[replay] load said: %s\n", bad.c_str());
-    MOD_CHECK(bad.empty());
-    if (!bad.empty())
-        return;
-
-    // The target comes from the corpus, not from a constant in this file.
-    // That was the review's point about the old adapter.
-    const uint32_t target = c.entry.target;
-    MOD_CHECK(target != 0);
-    std::fprintf(stderr, "[replay] target %08x, %zu pages, %zu shim calls\n", target,
-                 c.pages.size(), c.calls.size());
-
-    const std::string verdict = pop_replay::run(c, pop_replay::translated(target));
-    if (!verdict.empty())
-        std::fprintf(stderr, "[replay] %s\n", verdict.c_str());
-    MOD_CHECK(verdict.empty());
-
-    // And it is a real comparison: a corpus claiming a different exit value is
-    // rejected by the same replay.
-    if (verdict.empty()) {
-        pop_replay::Capture wrong = c;
-        ++wrong.exit.eax;
-        MOD_CHECK(!pop_replay::run(wrong, pop_replay::translated(target)).empty());
-    }
-}
 
 namespace {
 std::pair<std::string, std::string> loader_rule_corpus(const char *suite) {
@@ -593,7 +306,7 @@ std::pair<std::string, std::string> loader_rule_corpus(const char *suite) {
     std::string path = std::string(mod_test_dir(suite)) + "/corpus.json";
     pop_cpu_v1 cpu;
     pop_cpu_v1_init(&cpu);
-    cpu.target = cpu.eip = 0x00401000u;
+    cpu.target = cpu.eip = 0x12340000u;
     cpu.st[0] = -1.5;
     MOD_CHECK_EQ(pop_capture_begin(8, 8), 1);
     wr32(0x08000000u, 0x1234u);
@@ -713,7 +426,7 @@ MOD_TEST_SUITE(replay_loader_rejects_oversized_geometry) {
 
 MOD_TEST_SUITE(replay_loader_rejects_oversized_target_and_live_flags) {
     auto [path, text] = loader_rule_corpus("loader_metadata_range");
-    for (const auto &[key, value] : {std::pair<const char *, uint64_t>{"target", 0x00401000u},
+    for (const auto &[key, value] : {std::pair<const char *, uint64_t>{"target", 0x12340000u},
                                      std::pair<const char *, uint64_t>{"live_flags", 0}}) {
         std::string edited = text;
         const std::string field = std::string("\"") + key + "\": ";

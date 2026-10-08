@@ -30,6 +30,7 @@ endif()
 add_library(recomp_mods OBJECT ${POP_MODS_SOURCES})
 target_include_directories(recomp_mods PUBLIC ${POP_ROOT} ${POP_ROOT}/runtime)
 target_link_libraries(recomp_mods PUBLIC lua recomp_runtime recomp_builtin_defaults)
+target_compile_definitions(recomp_mods PRIVATE RECOMP_GENERATED_ARCHIVE_PATH="$<TARGET_FILE:recomp_gen>")
 target_compile_options(recomp_mods PRIVATE ${POP_WARN_HOST})
 pop_optimize(recomp_mods 2)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -42,6 +43,7 @@ add_library(recomp_mods_testing OBJECT ${POP_MODS_SOURCES})
 target_include_directories(recomp_mods_testing PUBLIC ${POP_ROOT} ${POP_ROOT}/runtime)
 target_link_libraries(recomp_mods_testing PUBLIC lua recomp_runtime_testing recomp_builtin_defaults)
 target_compile_definitions(recomp_mods_testing PUBLIC POPM_TESTING=1)
+target_compile_definitions(recomp_mods_testing PRIVATE RECOMP_GENERATED_ARCHIVE_PATH="$<TARGET_FILE:recomp_gen>")
 target_compile_options(recomp_mods_testing PRIVATE ${POP_WARN_HOST})
 pop_optimize(recomp_mods_testing 1)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -50,32 +52,19 @@ endif()
 endif()
 
 # Plugin fixtures the loader tests load. Every .c becomes a module of the same
-# name; old_cpu is built with the older header AHEAD of the real one so its
-# sizeof(pop_cpu_v1) really is the older value.
+# name.
 if(NOT IOS AND NOT ANDROID)
 file(GLOB POP_FIXTURE_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/*.c)
 add_custom_target(mod_fixtures)
 foreach(src ${POP_FIXTURE_SOURCES})
   get_filename_component(stem ${src} NAME_WE)
-  set(first "")
-  if(stem STREQUAL "old_cpu")
-    set(first INCLUDE_FIRST ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/old_header)
-  endif()
   # capture_mod calls the host's capture seam directly, which a Windows DLL
   # cannot import; the replay suite that loads it is not built there either.
   if(WIN32 AND stem STREQUAL "capture_mod")
     continue()
   endif()
-  # display_projection wraps the game's own display mod; without that game
-  # there is nothing to wrap.
-  if(stem STREQUAL "display_projection")
-    if(NOT EXISTS ${RECOMP_GAME_DIR}/mods/core/display/display.c)
-      continue()
-    endif()
-    set(first INCLUDE_FIRST ${RECOMP_GAME_DIR})
-  endif()
   pop_add_plugin(fixture_${stem} SOURCE ${src} OUTPUT_DIR ${POP_OUT}/mods-fixtures
-    OUTPUT_NAME ${stem} ${first} OPTIONS -g)
+    OUTPUT_NAME ${stem} OPTIONS -g)
   add_dependencies(mod_fixtures fixture_${stem})
 endforeach()
 endif()
@@ -102,10 +91,6 @@ if(TARGET recomp_gen AND NOT IOS AND NOT ANDROID)
   file(GLOB POP_MODS_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp)
   # layout_tests is its own nogame executable with its own main.
   list(REMOVE_ITEM POP_MODS_TEST_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/tests/layout_tests.cpp)
-  # game_view_tests decodes the game's entity records with the game's own codec.
-  if(NOT EXISTS ${RECOMP_GAME_DIR}/tests/entity_codec.hpp)
-    list(REMOVE_ITEM POP_MODS_TEST_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/tests/game_view_tests.cpp)
-  endif()
   if(WIN32)
     # The replay bridge includes the native page tracker (mprotect, signal
     # handlers); Windows has the capture seam stub instead.
@@ -113,7 +98,9 @@ if(TARGET recomp_gen AND NOT IOS AND NOT ANDROID)
   endif()
   add_executable(mods_tests ${POP_MODS_TEST_SOURCES} $<TARGET_OBJECTS:mods_api_header_test>)
   target_include_directories(mods_tests PRIVATE ${RECOMP_GAME_DIR})
-  target_link_libraries(mods_tests PRIVATE recomp_platform recomp_runtime_testing recomp_snapshot recomp_mods_testing lua)
+  # Game-native translation sources can call the DirectX boundary. Supply its
+  # null-host implementation so framework tests never create graphics/audio devices.
+  target_link_libraries(mods_tests PRIVATE recomp_platform recomp_runtime_testing recomp_snapshot recomp_dx_null recomp_mods_testing lua)
   target_compile_options(mods_tests PRIVATE ${POP_WARN_HOST})
   pop_optimize(mods_tests 1)
   pop_link_gen(mods_tests)
