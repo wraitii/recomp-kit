@@ -148,3 +148,23 @@ def test_production_driver_selects_ssa_and_reports_final_bodies(tmp_path, monkey
     assert coverage["functions"] == coverage["emitted"] == 1
     assert coverage["fallback"] == 0
     assert any("B0:;" in p.read_text() for p in out.glob("chunk_*.c"))
+
+
+def test_mov_chain_restore_without_sites_is_an_ordinary_store():
+    # mov ecx,[esp+4]; mov fs:[0],ecx; ret. The decoded emitter attaches no SEH
+    # hook to a MOV-form unlink in a body with no establishing site, so the SSA
+    # body is the same plain FS:[0] store and must be admitted.
+    tr, functions, bodies = fixture({ENTRY: b"\x8b\x4c\x24\x04\x64\x89\x0d\x00\x00\x00\x00\xc3"})
+    assert functions[0].seh_restores and not functions[0].seh_sites
+    assert "recomp_seh" not in "\n".join(bodies[ENTRY])
+    report = apply(tr, functions, bodies, {}, SETTINGS, quiet=True)
+    assert report["emitted"] == 1, report["per_function"]
+    assert "recomp_seh" not in "\n".join(bodies[ENTRY])
+
+
+def test_pop_chain_restore_keeps_its_runtime_hook():
+    # pop dword ptr fs:[0]; ret: the decoded emitter calls recomp_seh_frame_leave.
+    tr, functions, bodies = fixture({ENTRY: b"\x64\x8f\x05\x00\x00\x00\x00\xc3"})
+    assert "recomp_seh_frame_leave" in "\n".join(bodies[ENTRY])
+    report = apply(tr, functions, bodies, {}, SETTINGS, quiet=True)
+    assert report["fallback_reasons"] == {"SEH frame ownership": 1}

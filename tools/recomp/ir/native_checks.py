@@ -125,6 +125,11 @@ CASES = {
     "scasd_single": ("bf00000100", "af", "c3"),
     "repe_cmpsb": ("be00000100", "bf20000100", "fc", "b908000000", "f3a6", "c3"),
     "repne_cmpsd": ("be00000100", "bf20000100", "fc", "b904000000", "f2a7", "c3"),
+    # FS:[0] chain-head reads and the MSVC epilogue unlink store (no SEH hook:
+    # the decoded emitter attaches none to a body without establishing sites).
+    "fs_chain_read": ("64a100000000", "8903", "c3"),
+    "fs_chain_restore": ("8b0b", "64890d00000000", "c3"),
+    "fs_chain_push_pop": ("64ff3500000000", "5a", "8913", "c3"),
     "wait_nop": ("9b", "c3"),
     "sahf": ("9e", "c3"),
     "sahf_then_branch": ("9e", "7502", "ffc0", "c3"),
@@ -554,7 +559,7 @@ def run_checks(out, cmake, jobs):
         '#define FIXTURE_CONVENTION_MASK 48u',
         '#define FIXTURE_SCRATCH_SIZE 2048',
         '#define FIXTURE_CUSTOM_INPUTS 1',
-        '#define FIXTURE_SETUP(c, n) do { (c)->r[R_ESP] = 0x10100; '
+        '#define FIXTURE_SETUP(c, n) do { (c)->r[R_ESP] = 0x10100; (c)->fs_base = 0x10600; '
         'wr32(0x10100, GUEST_RETURN_SENTINEL); '
         '(c)->r[R_ECX] = ((c)->r[R_ECX] & 0xffffff00u) | ((n) & 255u); '
         '(c)->eflags_cf = ((n) >> 8) & 1; (c)->eflags_zf = ((n) >> 9) & 1; '

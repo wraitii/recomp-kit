@@ -71,6 +71,22 @@ def _jobs(count):
     return max(1, min(count, os.cpu_count() or 1))
 
 
+def seh_hooks(tr, fn):
+    """Does the decoded emitter attach SEH runtime hooks to this body?
+
+    Mirrors translate.py: `recomp_seh_frame_enter`/`_leave`/`_orphan`/`_adopt`
+    are emitted for establishing sites, escaping returns, helper calls and
+    POP-form chain restores. A MOV-form chain restore emits a hook only in a
+    body that also has establishing sites, so with none it is a plain FS:[0]
+    store with no runtime effect, and the SSA path models it as one.
+    """
+    if fn.seh_sites or fn.seh_escapes or fn.addr in tr.seh_helpers:
+        return True
+    # Calls to helpers (`recomp_seh_frame_adopt`) are rejected later as unbound
+    # callees, since `apply` forbids every helper as a direct-call target.
+    return any(fn.insns[i].mnem == "POP" for i in fn.seh_restores)
+
+
 def exclusion(tr, fn, entries, policies):
     """Reject production contracts the corpus emitter does not implement."""
     external = set(entries) - tr.internal_entries.get(fn.addr, set())
@@ -82,8 +98,7 @@ def exclusion(tr, fn, entries, policies):
         return "jump table"
     if fn.addr in policies.get("intrinsic_bodies", {}):
         return "runtime intrinsic"
-    if (fn.seh_sites or fn.seh_restores or fn.seh_escapes
-            or fn.addr in tr.seh_helpers):
+    if seh_hooks(tr, fn):
         return "SEH frame ownership"
     if fn.pushed_continuations or fn.return_jumps:
         return "guest continuations"

@@ -271,6 +271,9 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     for index, name in enumerate(("EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI")):
         fields.append((lifter.register(name), "c->r[%d]" % index))
     fields.append((lifter.register("EIP"), "c->eip"))
+    # FS-relative accesses (the SEH chain head, TLS reads) lift to FS_OFFSET plus
+    # the displacement. It is read-only guest state: no instruction here writes it.
+    fields.append((lifter.register("FS_OFFSET"), "c->fs_base"))
     for name in ("CF", "PF", "AF", "ZF", "SF", "OF", "DF"):
         fields.append((lifter.register(name), "c->eflags_%s" % name.lower()))
     mapping = {}
