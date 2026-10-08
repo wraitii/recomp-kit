@@ -242,11 +242,12 @@ def wrap_string_helpers_ssa(body, insns):
 
     ``emit`` numbers its blocks by index into ``fir.insns``, which is built
     one-to-one from the decoded ``fn.insns``. The SSA emitter has no per-
-    instruction comments, so the block label supplies the helper site. """
+    instruction comments, so the block label supplies the helper site. A
+    fast x87 CW clone labels the same blocks ``F<index>``. """
     site = None
     lines = []
     for line in body.splitlines():
-        found = re.match(r'\s*B(\d+):', line)
+        found = re.match(r'\s*[BF](\d+):', line)
         if found:
             index = int(found.group(1))
             if index >= len(insns):

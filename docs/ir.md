@@ -335,6 +335,26 @@ proven-binary32 operands use native float add/sub/mul plus the runtime's
 NaN/status normalization when a linear run has at least two arithmetic effects;
 division and unproven operands use the double helpers.
 
+A body with at least four PC/RC-sensitive x87 operations (arithmetic, FSQRT,
+FRNDINT, FST m), one per eight instructions, and a single tracker window
+(one guarded activation: no calls or opaque x87 recipes resetting it) is
+emitted twice in one C
+function under `[translate] x87_cw_clone` (default on). The fast clone runs
+first; each tracker activation - the only point a tracker window reads the
+guest CW, since FLDCW and calls reset the tracker - tests
+`(cw & 0xf00) == 0` (PC = 24-bit, RC = nearest: the D3D8 control word
+`0x007f`) and otherwise jumps to the same activation in the general clone.
+Both clones replay identical tracker transitions, share the integer SSA and
+carry locals, and at an activation all x87 state is published, so the jump
+needs no state transfer. Past the guard the fast clone folds every CW use to
+the constant 0 (helpers read only PC/RC), removing the precision selects and
+rounding tests. It is exact and carries no divergence tag; emission raises
+`SSAError` if the clones' activation counts differ. Corpus effect at CW
+`0x007f`: single-window matrix/quaternion rows 5-27% faster for ~20-50%
+more code. Multi-window bodies are not cloned: the clones share every C
+local, so values live at each guard stay live into the general clone, and
+RayTestTriangles (13 guards) spilled more and ran ~3% slower.
+
 Lazy NaN checks are a representation change on top of that removal: a
 basic-arithmetic result stays in full precision with no NaN branch, and the
 `isnan`/indefinite fold happens where the value stops flowing into more
@@ -479,6 +499,7 @@ Policies and where they apply:
 | --- | --- | --- |
 | `fault_state` | `"relaxed"` (default), `"exact"` | relaxed: `x87_scalar_strict=False, local_state=True`; exact: strict x87 (publish before loads and stores, general arithmetic recipes) and every pre-access GPR/flag snapshot. The decoded fallback's `x87_locals`/`cpu_locals` follow the same key |
 | `msvc_x87_convention` | `true` (default), `false` | `msvc_convention`; false publishes complete x87 state at calls and returns. Flags stay exact in both modes |
+| `x87_cw_clone` | `true` (default), `false` | `x87_cw_clone`; false emits only the general body (no PC = RC = 0 fast clone) |
 
 Lazy NaN/IE checks (`lazy_nan=True`) are exact and always on in production; the
 `emit` parameter remains so the synthetic checks can compare against the eager
@@ -561,6 +582,7 @@ is additional evidence, not a replacement for conservative analysis.
 ir_ssa = true                # false: decoded C only
 fault_state = "relaxed"      # "exact": publish state at every instruction
 msvc_x87_convention = true   # false: conservative call/return publication
+x87_cw_clone = true          # false: no fast PC=RC=0 x87 clone
 ```
 
 These are the defaults. Earlier keys (`x87_locals`, `cpu_locals`, `ir_ssa_x87`,

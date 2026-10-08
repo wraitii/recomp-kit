@@ -134,6 +134,7 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
         "lazy_flags": relaxed,
         "resumable_stacks": policies.get("resumable_stacks", False),
         "indirect_call_symbol": "recomp_call",
+        "x87_cw_clone": settings.get("x87_cw_clone", True),
     }
     # Cross-function field contracts: compute once, then hand the plain
     # reads/kills data to every worker.  Roots are the bodies actually emitted
@@ -298,6 +299,7 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
         "convention_census": {key: census[key] for key in (
             "flags_read_at_entry", "flags_read_after_call", "x87_exact_flush")},
         "lazy_flag_bodies": census.get("lazy_flags", 0),
+        "x87_cw_clone_bodies": census.get("x87_cw_clone", 0),
         "call_contracts": {
             "enabled": bool(contracts_on),
             "functions_summarized": len(contracts),

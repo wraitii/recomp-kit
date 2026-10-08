@@ -235,3 +235,33 @@ def test_lazy_nan_dropped_value_folds_ie():
     lazy = emit(function("d906", "d9c0", "dee9", "ddd8", "dfe0", "8903", "c3"), "t",
                 lazy_nan=True, _guard_null_checks=False)
     assert lazy.count("x87_sw_ |= (uint16_t)(") == 1
+
+
+def test_cw_clone_guards_each_activation_and_folds_the_fast_cw():
+    # fld [esi]; fmul [esi+4] x3; fstp [ebx]; ret: four PC/RC-sensitive ops.
+    f = function("d906", "d84e04", "d84e04", "d84e04", "d91b", "c3")
+    facts = {}
+    text = emit(f, "t", lazy_nan=True, _guard_null_checks=False, facts=facts)
+    assert facts["x87_cw_clone"]
+    fast, general = text.split("\nX87CW0:;\n", 1)
+    # The fast clone enters first, guards its activation and never reads CW
+    # again; the general clone keeps every PC/RC select.
+    assert "goto F" in fast and "goto B" not in fast and "goto F" not in general
+    assert fast.count("goto X87CW0;") == 1 and "goto X87CW" not in general
+    assert "x87_cw_ & 0x300u" not in fast and "fto_float_cw(0u," in fast
+    assert "x87_cw_ & 0x300u" in general and "fto_float_cw(x87_cw_," in general
+    assert "X87CW1" not in text
+    # Disabled, or below the operation threshold, the body is not cloned.
+    plain = emit(f, "t", lazy_nan=True, _guard_null_checks=False, x87_cw_clone=False)
+    assert "X87CW" not in plain and "F0:;" not in plain
+    small = emit(function("d906", "d84e04", "d91b", "c3"), "t", _guard_null_checks=False)
+    assert "X87CW" not in small
+    # Strict x87 never clones.
+    strict = emit(f, "t", x87_scalar_strict=True, _guard_null_checks=False)
+    assert "X87CW" not in strict
+    # FXAM resets the tracker, so the next FMUL opens a second window: two
+    # guards share live locals across both clones, so emit one body.
+    split = function("d906", "d84e04", "d84e04", "d9e5", "d84e04", "d91b", "c3")
+    facts = {}
+    single = emit(split, "t", lazy_nan=True, _guard_null_checks=False, facts=facts)
+    assert "X87CW" not in single and not facts["x87_cw_clone"]

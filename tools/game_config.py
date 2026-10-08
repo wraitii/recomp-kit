@@ -69,6 +69,7 @@ TRANSLATE_DEFAULTS = {
     "fault_state": "relaxed",
     "msvc_x87_convention": True,
     "call_contracts": True,
+    "x87_cw_clone": True,
 }
 
 # Earlier [translate] keys, folded into ir_ssa / fault_state /
@@ -237,6 +238,11 @@ def load(game_dir):
     # ssa-call-contracts). False publishes every field at every call.
     if not isinstance(translate.setdefault("call_contracts", TRANSLATE_DEFAULTS["call_contracts"]), bool):
         raise ValueError("%s: [translate] call_contracts must be a boolean" % source)
+    # FP-heavy SSA bodies get a fast clone specialised for PC = RC = 0 that
+    # falls back to the general body when the guest CW differs. Exact; false
+    # emits the general body alone.
+    if not isinstance(translate.setdefault("x87_cw_clone", TRANSLATE_DEFAULTS["x87_cw_clone"]), bool):
+        raise ValueError("%s: [translate] x87_cw_clone must be a boolean" % source)
     # Entry discovery from the data/immediate scans (`True`, the kit default) adds
     # function starts and alternate entries that no listing names and no control
     # flow reaches. `False` trusts the Ghidra listing plus structural evidence

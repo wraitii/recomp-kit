@@ -346,11 +346,20 @@ def live_flag_reload_calls(s, live, flag_keys):
     return calls
 
 
+#: Minimum PC/RC-sensitive x87 operations for a fast CW clone (x87_cw_clone).
+CW_CLONE_MIN_OPS = 4
+#: ...and at least one per this many instructions of the body.
+CW_CLONE_DENSITY = 8
+#: ...and at most this many guarded tracker activations: a leaf FP body that
+#: is one tracker window.
+CW_CLONE_MAX_GUARDS = 1
+
+
 def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=True,
          call_symbols=None, x87_scalar_strict=False, local_state=True, msvc_convention=True,
          lazy_nan=False, lazy_flags=False, resumable_stacks=False, lifter=None,
          indirect_call_symbol=None, _guard_null_checks=True, facts=None,
-         call_contracts=None):
+         call_contracts=None, x87_cw_clone=True):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
     `call_symbols` maps an allowed direct-call target address to the C symbol
@@ -384,11 +393,22 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     survives the emission process pool; a missing target keeps the conservative
     full publication. ESP/EBP are never dropped.
 
+    `x87_cw_clone` (the `x87_cw_clone` setting) emits a performance body with
+    at least `CW_CLONE_MIN_OPS` precision/rounding-sensitive x87 operations,
+    and one per `CW_CLONE_DENSITY` instructions, whose fast clone guards at
+    most `CW_CLONE_MAX_GUARDS` tracker activations,
+    twice in one C function: a fast clone whose tracker activations guard
+    PC = RC = 0 (the D3D8 single-precision, round-to-nearest control word)
+    and fold CW to that constant, then the general clone it falls back to at
+    the same activation. It is exact: the guard covers every other CW. Strict
+    x87 and raw emission never clone.
+
     `facts`, when a dict, receives census facts about the performance body:
     whether an arithmetic flag is read from the CPU at entry or after a call,
     and whether the x87 flush kept
     the exact form. They describe the code; they do not gate emission.
     """
+    arguments = dict(locals())
     if not symbol.isidentifier() or not symbol.isascii():
         raise SSAError("invalid C symbol")
     # The register model and operand corrections are immutable across bodies.
@@ -428,7 +448,8 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         strict = emit(fir, symbol, x87_scalar_strict=True, local_state=False, msvc_convention=False,
                       lazy_flags=False, **options)
         fast = emit(fir, symbol, x87_scalar_strict=x87_scalar_strict, local_state=local_state,
-                    msvc_convention=msvc_convention, lazy_flags=lazy_flags, facts=facts, **options)
+                    msvc_convention=msvc_convention, lazy_flags=lazy_flags, facts=facts,
+                    x87_cw_clone=x87_cw_clone, **options)
         return "#if defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS\n%s\n#else\n%s\n#endif" % (strict, fast)
     from .x87_scalar import X87Scalar
     msvc_convention = msvc_convention and optimize
@@ -764,8 +785,30 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             arg = v.args[v.data[1].index(source)]
             lines.append("uint64_t p%d = %s;" % (v.id, ref(arg)))
         lines.extend("v%d = p%d;" % (v.id, v.id) for v in phis)
-        lines.extend(["goto B%d;" % target, "}"])
+        lines.extend(["goto %s%d;" % (block_label, target), "}"])
         return lines
+
+    # Fast CW clone: worth its size only when enough operations read PC/RC.
+    cw_sensitive = 0
+    if x87_cw_clone and scalar is not None and not scalar.observe_loads:
+        for v in s.values:
+            if v.opc not in ("X87_REG", "X87_MEM") or v.id not in live:
+                continue
+            m = v.data["mnem"]
+            if (m.rstrip("P") in x87.ARITH or m.rstrip("P") in x87.INTEGER_ARITH
+                    or m in ("FSQRT", "FRNDINT")
+                    or (v.opc == "X87_MEM" and m in ("FST", "FSTP"))):
+                cw_sensitive += 1
+    # The clone duplicates the integer code too; a mostly-integer body
+    # (ProjectionMeshBuilder::Build: 25 x87 of ~300 instructions) doubled in
+    # size for a 3% corpus gain, so also require a minimum x87 density.
+    clones = (("fast", "general")
+              if cw_sensitive >= CW_CLONE_MIN_OPS
+              and cw_sensitive * CW_CLONE_DENSITY >= len(fir.insns)
+              else (None,))
+    if facts is not None:
+        facts["x87_cw_clone"] = clones[0] is not None
+    block_label = "F" if clones[0] == "fast" else "B"
 
     lines = ["void %s(X86 *c) {" % symbol]
     for v in s.values:
@@ -923,173 +966,192 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             if fallback:
                 lines.extend(flush_x87())
 
-    previous = None
-    for i, b in s.blocks.items():
-        lines.append("B%d:;" % i)
-        if carry_mode:
-            # Seeding must run on every entry, including a branch that jumps
-            # straight to this label, so it follows the label.
-            if i not in linear_prev:
-                seed_block(entry_shape.get(i))
-        elif scalar is not None and (previous is None or set(fir.succ[previous]) != {i}
-                                     or predecessors[i] != {previous}):
+    activations = []
+    for clone in clones:
+        if clone is not None:
+            # Each clone replays the tracker from a clean state, so their
+            # activation sequences line up; see X87Scalar._activation.
+            block_label = "F" if clone == "fast" else "B"
             scalar.reset()
-        for v in b.ops:
-            if v.opc == "MEMORY":
-                continue
-            if v.opc in ("X87_REG", "X87_MEM"):
-                if scalar is not None:
-                    scalar.binary32 = v.id in scalar_binary32
-                if v.opc == "X87_MEM":
-                    lines.extend(publish(b.snapshots[v.id], v))
-                lines.append("{")
-                lines.extend(lower_x87(v.data, ref(v.args[1]) if v.opc == "X87_MEM" else None,
-                                       "v%d" % v.id if v.size else None))
-                lines.append("}")
-            elif v.opc == "CALL":
-                lines.extend(flush_x87())
-                if scalar is not None:
-                    scalar.reset()
-                # Publish every required field before the callee runs, then
-                # invoke only the explicitly bound symbol. The callee receives
-                # the guest return address already stored by the preceding
-                # CALL push, so its own RET owns ESP/EIP restoration.
-                lines.extend(publish(b.snapshots[v.id], v))
-                if v.id in contract_skip:
-                    # Validation builds poison the killed fields this contract
-                    # dropped; production builds compile the macro to a no-op.
-                    lines.append("RECOMP_CONTRACT_POISON_CALL(c, 0x%xu);"
-                                 % contract_poison_mask(contract_skip[v.id]))
-                # After poison, so a hooked run sees real values.
-                if contract_guard.get(v.id):
-                    guarded = store_fields(b.snapshots[v.id], contract_guard[v.id])
-                    lines.append("if (RECOMP_UNLIKELY(recomp_hooks_ever)) {")
-                    lines.extend(guarded)
+            scalar.clone, scalar.activations = clone, 0
+        previous = None
+        for i, b in s.blocks.items():
+            lines.append("%s%d:;" % (block_label, i))
+            if carry_mode:
+                # Seeding must run on every entry, including a branch that jumps
+                # straight to this label, so it follows the label.
+                if i not in linear_prev:
+                    seed_block(entry_shape.get(i))
+            elif scalar is not None and (previous is None or set(fir.succ[previous]) != {i}
+                                         or predecessors[i] != {previous}):
+                scalar.reset()
+            for v in b.ops:
+                if v.opc == "MEMORY":
+                    continue
+                if v.opc in ("X87_REG", "X87_MEM"):
+                    if scalar is not None:
+                        scalar.binary32 = v.id in scalar_binary32
+                    if v.opc == "X87_MEM":
+                        lines.extend(publish(b.snapshots[v.id], v))
+                    lines.append("{")
+                    lines.extend(lower_x87(v.data, ref(v.args[1]) if v.opc == "X87_MEM" else None,
+                                           "v%d" % v.id if v.size else None))
                     lines.append("}")
-                name = call_symbols.get(v.data)
-                if name is None:
-                    raise SSAError("%08x: no C symbol bound for call target %08x"
-                                   % (b.insn.addr, v.data))
-                lines.append("%s(c);" % name)
-                if lazy_flags:
-                    # A callee (SSA or otherwise) may leave a pending descriptor.
-                    lines.extend(cc_action_lines(cc_calls.get(b.index)))
-                if resumable_stacks:
-                    # Match the eager emitter's resumable-stack contract: a
-                    # callee that diverted EIP did not resume the continuation.
-                    lines.append("if (c->eip != 0x%x) return;" % (
-                        b.insn.addr + b.insn.length))
-            elif v.opc == "CALL_RELOAD":
-                # Complete, callee-agnostic reload of one mapped state field.
-                field, lane = mapping[v.data]
-                lines.append("v%d = (%s >> %d) & %s;" % (v.id, field, lane * 8, mask(v.size)))
-            elif v.opc == "CALLIND":
-                lines.extend(flush_x87())
-                if scalar is not None:
-                    scalar.reset()
-                # Publish the required pre-call state, including the target,
-                # then dispatch through the runtime. The return address was
-                # already stored by the preceding lifted CALL sequence, and the
-                # SSA builder reloads every tracked lane/flag afterward.
-                lines.extend(publish(b.snapshots[v.id], v))
-                lines.append("%s(c, (uint32_t)%s);" % (v.data, ref(v.args[1])))
-                if lazy_flags:
-                    lines.extend(cc_action_lines(cc_calls.get(b.index)))
-                if resumable_stacks:
-                    lines.append("if (c->eip != 0x%x) return;" % (
-                        b.insn.addr + b.insn.length))
-            elif v.opc == "STRINGOP":
-                lines.extend(flush_x87())
-                if scalar is not None:
-                    scalar.reset()
-                # Byte-audited string instruction. Publication before the helper
-                # and reloads afterward keep guest memory observers and fault
-                # snapshots in access-then-advance order; the helper owns
-                # EDI/ESI/ECX/DF exactly as the eager emitter's string calls do.
-                lines.extend(publish(b.snapshots[v.id], v))
-                lines.append("%s(c);" % v.data["helper"])
-            elif v.opc in ("LOAD", "STORE", "DIV32", "IDIV32"):
-                # Guest accesses do not observe x87 state (see x87_scalar.py);
-                # only strict mode publishes before them. The division seam
-                # always sees the complete CPU.
-                if scalar is not None and (scalar.observe_loads or v.opc not in ("LOAD", "STORE")):
+                elif v.opc == "CALL":
                     lines.extend(flush_x87())
-                lines.extend(publish(b.snapshots[v.id], v))
-                if v.opc in ("DIV32", "IDIV32"):
                     if scalar is not None:
                         scalar.reset()
-                    helper = "div32" if v.opc == "DIV32" else "idiv32"
-                    lines.append("%s(c, (uint32_t)%s, (uint32_t)%s);"
-                                 % (helper, ref(v.args[2]), ref(v.args[3])))
-                    lines.append("v%d = c->r[R_EAX] | ((uint64_t)c->r[R_EDX] << 32);" % v.id)
-                elif v.opc == "LOAD":
-                    lines.append("v%d = rd%d((uint32_t)%s);" % (v.id, v.size * 8, ref(v.args[1])))
-                else:
-                    lines.append("wr%d((uint32_t)%s, (uint%d_t)%s);" % (
-                        v.args[2].size * 8, ref(v.args[1]), v.args[2].size * 8, ref(v.args[2])))
-            elif v.opc == "RETURN":
-                lines.extend(flush_x87())
-                lines.extend(publish(b.exit, v))
-                lines.extend(["recomp_return(c);", "return;"])
-            elif v.opc == "BRANCHIND":
-                # A decoded jump table: the target address selects a case, any
-                # other value is a runtime jump exactly like the decoded
-                # emitter's default arm (publish everything, set EIP to the
-                # jump, `recomp_jump`). Case edges are ordinary internal edges.
-                grouped = {}
-                for j in sorted(set(fir.succ[i])):
-                    grouped.setdefault(j, fir.insns[j].addr)
-                targets = list(grouped)
-                if carry_mode:
-                    transition(i, targets)
-                else:
+                    # Publish every required field before the callee runs, then
+                    # invoke only the explicitly bound symbol. The callee receives
+                    # the guest return address already stored by the preceding
+                    # CALL push, so its own RET owns ESP/EIP restoration.
+                    lines.extend(publish(b.snapshots[v.id], v))
+                    if v.id in contract_skip:
+                        # Validation builds poison the killed fields this contract
+                        # dropped; production builds compile the macro to a no-op.
+                        lines.append("RECOMP_CONTRACT_POISON_CALL(c, 0x%xu);"
+                                     % contract_poison_mask(contract_skip[v.id]))
+                    # After poison, so a hooked run sees real values.
+                    if contract_guard.get(v.id):
+                        guarded = store_fields(b.snapshots[v.id], contract_guard[v.id])
+                        lines.append("if (RECOMP_UNLIKELY(recomp_hooks_ever)) {")
+                        lines.extend(guarded)
+                        lines.append("}")
+                    name = call_symbols.get(v.data)
+                    if name is None:
+                        raise SSAError("%08x: no C symbol bound for call target %08x"
+                                       % (b.insn.addr, v.data))
+                    lines.append("%s(c);" % name)
+                    if lazy_flags:
+                        # A callee (SSA or otherwise) may leave a pending descriptor.
+                        lines.extend(cc_action_lines(cc_calls.get(b.index)))
+                    if resumable_stacks:
+                        # Match the eager emitter's resumable-stack contract: a
+                        # callee that diverted EIP did not resume the continuation.
+                        lines.append("if (c->eip != 0x%x) return;" % (
+                            b.insn.addr + b.insn.length))
+                elif v.opc == "CALL_RELOAD":
+                    # Complete, callee-agnostic reload of one mapped state field.
+                    field, lane = mapping[v.data]
+                    lines.append("v%d = (%s >> %d) & %s;" % (v.id, field, lane * 8, mask(v.size)))
+                elif v.opc == "CALLIND":
                     lines.extend(flush_x87())
-                lines.append("switch ((uint32_t)%s) {" % ref(v.args[0]))
-                for j, addr in grouped.items():
-                    lines.append("case 0x%xu:" % addr)
-                    lines.extend(edge(i, j))
-                lines.append("default:")
-                lines.extend(flush_x87() if carry_mode else [])
-                lines.extend(publish(b.exit, v))
-                lines.append("c->eip = 0x%xu; recomp_jump(c, (uint32_t)%s); return;" % (
-                    b.insn.addr, ref(v.args[0])))
-                lines.append("}")
-            elif v.opc == "BRANCH":
+                    if scalar is not None:
+                        scalar.reset()
+                    # Publish the required pre-call state, including the target,
+                    # then dispatch through the runtime. The return address was
+                    # already stored by the preceding lifted CALL sequence, and the
+                    # SSA builder reloads every tracked lane/flag afterward.
+                    lines.extend(publish(b.snapshots[v.id], v))
+                    lines.append("%s(c, (uint32_t)%s);" % (v.data, ref(v.args[1])))
+                    if lazy_flags:
+                        lines.extend(cc_action_lines(cc_calls.get(b.index)))
+                    if resumable_stacks:
+                        lines.append("if (c->eip != 0x%x) return;" % (
+                            b.insn.addr + b.insn.length))
+                elif v.opc == "STRINGOP":
+                    lines.extend(flush_x87())
+                    if scalar is not None:
+                        scalar.reset()
+                    # Byte-audited string instruction. Publication before the helper
+                    # and reloads afterward keep guest memory observers and fault
+                    # snapshots in access-then-advance order; the helper owns
+                    # EDI/ESI/ECX/DF exactly as the eager emitter's string calls do.
+                    lines.extend(publish(b.snapshots[v.id], v))
+                    lines.append("%s(c);" % v.data["helper"])
+                elif v.opc in ("LOAD", "STORE", "DIV32", "IDIV32"):
+                    # Guest accesses do not observe x87 state (see x87_scalar.py);
+                    # only strict mode publishes before them. The division seam
+                    # always sees the complete CPU.
+                    if scalar is not None and (scalar.observe_loads or v.opc not in ("LOAD", "STORE")):
+                        lines.extend(flush_x87())
+                    lines.extend(publish(b.snapshots[v.id], v))
+                    if v.opc in ("DIV32", "IDIV32"):
+                        if scalar is not None:
+                            scalar.reset()
+                        helper = "div32" if v.opc == "DIV32" else "idiv32"
+                        lines.append("%s(c, (uint32_t)%s, (uint32_t)%s);"
+                                     % (helper, ref(v.args[2]), ref(v.args[3])))
+                        lines.append("v%d = c->r[R_EAX] | ((uint64_t)c->r[R_EDX] << 32);" % v.id)
+                    elif v.opc == "LOAD":
+                        lines.append("v%d = rd%d((uint32_t)%s);" % (v.id, v.size * 8, ref(v.args[1])))
+                    else:
+                        lines.append("wr%d((uint32_t)%s, (uint%d_t)%s);" % (
+                            v.args[2].size * 8, ref(v.args[1]), v.args[2].size * 8, ref(v.args[2])))
+                elif v.opc == "RETURN":
+                    lines.extend(flush_x87())
+                    lines.extend(publish(b.exit, v))
+                    lines.extend(["recomp_return(c);", "return;"])
+                elif v.opc == "BRANCHIND":
+                    # A decoded jump table: the target address selects a case, any
+                    # other value is a runtime jump exactly like the decoded
+                    # emitter's default arm (publish everything, set EIP to the
+                    # jump, `recomp_jump`). Case edges are ordinary internal edges.
+                    grouped = {}
+                    for j in sorted(set(fir.succ[i])):
+                        grouped.setdefault(j, fir.insns[j].addr)
+                    targets = list(grouped)
+                    if carry_mode:
+                        transition(i, targets)
+                    else:
+                        lines.extend(flush_x87())
+                    lines.append("switch ((uint32_t)%s) {" % ref(v.args[0]))
+                    for j, addr in grouped.items():
+                        lines.append("case 0x%xu:" % addr)
+                        lines.extend(edge(i, j))
+                    lines.append("default:")
+                    lines.extend(flush_x87() if carry_mode else [])
+                    lines.extend(publish(b.exit, v))
+                    lines.append("c->eip = 0x%xu; recomp_jump(c, (uint32_t)%s); return;" % (
+                        b.insn.addr, ref(v.args[0])))
+                    lines.append("}")
+                elif v.opc == "BRANCH":
+                    if carry_mode:
+                        target = indices[v.args[0].data]
+                        transition(i, [target])
+                        lines.extend(edge(i, target))
+                    else:
+                        lines.extend(flush_x87())
+                        lines.extend(edge(i, indices[v.args[0].data]))
+                elif v.opc == "CBRANCH":
+                    if carry_mode:
+                        taken = indices[v.args[0].data]
+                        fallthrough = indices[b.insn.addr + b.insn.length]
+                        transition(i, [taken, fallthrough])
+                        lines.append("if (%s)" % ref(v.args[1]))
+                        lines.extend(edge(i, taken))
+                        lines.extend(edge(i, fallthrough))
+                    else:
+                        lines.extend(flush_x87())
+                        lines.append("if (%s)" % ref(v.args[1]))
+                        lines.extend(edge(i, indices[v.args[0].data]))
+                        lines.extend(edge(i, indices[b.insn.addr + b.insn.length]))
+                else:
+                    lines.append("v%d = (%s) & %s;" % (v.id, expression(v), mask(v.size)))
+            if not any(v.opc in ("BRANCH", "CBRANCH", "RETURN", "BRANCHIND") for v in b.ops):
+                target = fir.succ[i][0]
                 if carry_mode:
-                    target = indices[v.args[0].data]
-                    transition(i, [target])
+                    if linear_prev.get(target) != i:
+                        transition(i, [target])
                     lines.extend(edge(i, target))
                 else:
-                    lines.extend(flush_x87())
-                    lines.extend(edge(i, indices[v.args[0].data]))
-            elif v.opc == "CBRANCH":
-                if carry_mode:
-                    taken = indices[v.args[0].data]
-                    fallthrough = indices[b.insn.addr + b.insn.length]
-                    transition(i, [taken, fallthrough])
-                    lines.append("if (%s)" % ref(v.args[1]))
-                    lines.extend(edge(i, taken))
-                    lines.extend(edge(i, fallthrough))
-                else:
-                    lines.extend(flush_x87())
-                    lines.append("if (%s)" % ref(v.args[1]))
-                    lines.extend(edge(i, indices[v.args[0].data]))
-                    lines.extend(edge(i, indices[b.insn.addr + b.insn.length]))
-            else:
-                lines.append("v%d = (%s) & %s;" % (v.id, expression(v), mask(v.size)))
-        if not any(v.opc in ("BRANCH", "CBRANCH", "RETURN", "BRANCHIND") for v in b.ops):
-            target = fir.succ[i][0]
-            if carry_mode:
-                if linear_prev.get(target) != i:
-                    transition(i, [target])
-                lines.extend(edge(i, target))
-            else:
-                # A non-linear edge must publish before its goto. Never emit a
-                # predecessor-specific flush at a shared destination label.
-                if predecessors[target] != {i} or target != i + 1:
-                    lines.extend(flush_x87())
-                lines.extend(edge(i, target))
-        previous = i
+                    # A non-linear edge must publish before its goto. Never emit a
+                    # predecessor-specific flush at a shared destination label.
+                    if predecessors[target] != {i} or target != i + 1:
+                        lines.extend(flush_x87())
+                    lines.extend(edge(i, target))
+            previous = i
+        if clone is not None:
+            activations.append(scalar.activations)
+    if len(set(activations)) > 1:
+        raise SSAError("x87 CW clones activate at different points: %r" % activations)
+    if activations and activations[0] > CW_CLONE_MAX_GUARDS:
+        # Several tracker windows (calls, opaque recipes, reset edges): the
+        # shared locals stay live across every guard into the general clone,
+        # and the extra register pressure outweighed the folded selects
+        # (RayTestTriangles 323 -> 331 ns with 13 guards). Emit one body.
+        arguments["x87_cw_clone"] = False
+        return emit(**arguments)
     lines.append("}")
     if scalar is not None:
         lines[scalar_declarations:scalar_declarations] = scalar.temps
