@@ -409,6 +409,60 @@ BYTE_CALL_CASES = {
         "ssa_callee": True,
         "resumable": False,
     },
+    # Byte-backed rule fixtures for the settle-elision region analysis.  Each
+    # is entered with a pending SUB descriptor (``pending``), so a column that
+    # removes a settle it needs, or drops a descriptor whose flags it does not
+    # overwrite, fails the final full-state comparison.  Only the lazy columns
+    # (SSA lazy and decoded-lazy) consume the descriptor; the eager columns are
+    # covered by the existing comparison matrix.
+    "settle_entry_passthrough": {
+        # call; mov [ebx],eax; ret -- neither the entry region (just the call)
+        # nor the post-call region touches a flag, so both settles are REMOVEd
+        # and the caller's descriptor must pass through untouched.
+        "hexes": _caller([], ["8903", "c3"]),
+        "callee_hexes": ["8b442404", "c3"],
+        "ssa_callee": True,
+        "pending": True,
+        "modes": 0x60,
+        "contract": True,
+        "resumable": False,
+    },
+    "settle_entry_kill_all": {
+        # add eax,ebx; call; mov [ebx],eax; ret -- the entry region writes all
+        # six flags before the call, so the entry settle becomes a DROP.  A
+        # removed settle would leave the caller's descriptor to overwrite the
+        # ADD result at the next materialisation.
+        "hexes": _caller(["01d8"], ["8903", "c3"]),
+        "callee_hexes": ["8b442404", "c3"],
+        "ssa_callee": True,
+        "pending": True,
+        "modes": 0x60,
+        "contract": True,
+        "resumable": False,
+    },
+    "settle_entry_inc_preserves_cf": {
+        # inc eax; call; mov [ebx],eax; ret -- INC writes ZF/OF/AF/SF/PF but
+        # preserves CF, so the entry region does not kill all six and the
+        # settle must stay; dropping it would lose the caller's pending CF.
+        "hexes": _caller(["40"], ["8903", "c3"]),
+        "callee_hexes": ["8b442404", "c3"],
+        "ssa_callee": True,
+        "pending": True,
+        "modes": 0x60,
+        "contract": True,
+        "resumable": False,
+    },
+    "settle_postcall_kill_all": {
+        # call; add eax,ebx; mov [ebx],eax; ret -- the post-call region writes
+        # all six flags, so the post-call settle becomes a DROP.
+        "hexes": _caller([], ["01d8", "8903", "c3"]),
+        "callee_hexes": ["8b442404", "c3"],
+        "ssa_callee": True,
+        "pending": True,
+        "modes": 0x60,
+        "contract": True,
+        "resumable": False,
+    },
     # Cross-function contract fixtures. The production local/lazy columns run
     # with the callee's summarized reads/kills; ir_ssa_contract_checks poisons
     # the killed-but-dropped fields so a wrong summary fails the full-state
@@ -461,6 +515,23 @@ BYTE_CALL_CASES = {
                           "8b442408", "c3"],
         "contract": True,
         "ssa_callee": True,
+        "resumable": False,
+    },
+    "contract_flags_preserved_entry_pending": {
+        # Entered with a pending descriptor: call; jz +5; mov eax,1;
+        # mov [ebx],eax; ret.  The callee (mov eax,[esp+4]; ret) preserves
+        # every flag, so the caller's entry ZF INPUT stays live across the
+        # call.  The SSA entry region is call-only with no flag reads, so the
+        # plan REMOVEs the entry settle; the live INPUT is then loaded from a
+        # stale field before the call and the JZ reads it.  The entry must
+        # settle whenever a flag INPUT is live.  Only the lazy and
+        # decoded-lazy columns may be armed with the descriptor here.
+        "hexes": _caller([], ["7405", "b801000000", "8903", "c3"]),
+        "callee_hexes": ["8b442404", "c3"],
+        "contract": True,
+        "ssa_callee": True,
+        "pending": True,
+        "modes": 0x60,  # lazy (bit 5) and decoded-lazy (bit 6)
         "resumable": False,
     },
 }
@@ -565,9 +636,21 @@ def call_sources(name, hexes, callee_addr, resumable=False, indirect=False, cont
         tr.prepare(fn, strict=True)
         eager = re.sub(r"\b(fn|body)_([0-9a-f]{8})\b", lambda m: name + "_eager_" + m[0],
                        "\n".join(tr.translate(fn)))
+        # A second decoded translation with the lazy-flag settle plan enabled is
+        # the comparison target for the decoded elision path (production runs
+        # with lazy flags). CPU/x87 locals are off so the two decoded columns
+        # differ only in the entry/post-call settle decision.
+        trl = T.Translator(image, {ENTRY, callee_addr},
+                           SimpleNamespace(eager_flags=False, x87_locals=False, cpu_locals=False))
+        fnl = T.Function(ENTRY, name, len(image.data), decoded)
+        trl.prepare(fnl, strict=True)
+        decoded_lazy = re.sub(r"\b(fn|body)_([0-9a-f]{8})\b",
+                              lambda m: name + "_decoded_lazy_" + m[0],
+                              "\n".join(trl.translate(fnl)))
     finally:
         T.RESUMABLE_STACKS = previous
     eager = re.sub(r"CALL_FN\(%08x\)" % callee_addr, name + "_callee(c)", eager)
+    decoded_lazy = re.sub(r"CALL_FN\(%08x\)" % callee_addr, name + "_callee(c)", decoded_lazy)
     lifter, addr, lifted = Lifter(), ENTRY, []
     for raw, ins in zip(chunks, decoded):
         lifted.append(lifter.lift(addr, raw, ins.mnem))
@@ -585,7 +668,7 @@ def call_sources(name, hexes, callee_addr, resumable=False, indirect=False, cont
     local = emit(fir, name + "_ir_local", call_contracts=contracts, **options)
     lazy = emit(fir, name + "_ir_lazy", lazy_nan=True, lazy_flags=True,
                 call_contracts=contracts, **options)
-    return eager, raw, scalar, strict, local, lazy, fallthroughs
+    return eager, raw, scalar, strict, local, lazy, decoded_lazy, fallthroughs
 
 
 def callee_contract(hexes, base=CALLEE):
@@ -633,6 +716,15 @@ def sources(name, hexes):
     tr.prepare(fn, strict=True)
     eager = re.sub(r"\b(fn|body)_([0-9a-f]{8})\b", lambda m: name + "_eager_" + m[0],
                    "\n".join(tr.translate(fn)))
+    # Production decoded translation with lazy-flag settle elision, CPU/x87
+    # locals off to isolate the settle decision.
+    trl = T.Translator(image, {ENTRY},
+                       SimpleNamespace(eager_flags=False, x87_locals=False, cpu_locals=False))
+    fnl = T.Function(ENTRY, name, len(b"".join(chunks)), decoded)
+    trl.prepare(fnl, strict=True)
+    decoded_lazy = re.sub(r"\b(fn|body)_([0-9a-f]{8})\b",
+                          lambda m: name + "_decoded_lazy_" + m[0],
+                          "\n".join(trl.translate(fnl)))
     lifter, addr, lifted = Lifter(), ENTRY, []
     for raw, ins in zip(chunks, decoded):
         lifted.append(lifter.lift(addr, raw, ins.mnem))
@@ -651,7 +743,7 @@ def sources(name, hexes):
                   msvc_convention=False)
     local = emit(fir, name + "_ir_local")
     lazy = emit(fir, name + "_ir_lazy", lazy_nan=True, lazy_flags=True)
-    return eager, raw, scalar, strict, local, lazy
+    return eager, raw, scalar, strict, local, lazy, decoded_lazy
 
 
 def _checked_wrapper(symbol, fallthroughs):
@@ -659,6 +751,18 @@ def _checked_wrapper(symbol, fallthroughs):
     register = "".join("ir_accept_call_return(0x%x); " % addr for addr in fallthroughs)
     return ("void %s_checked(X86 *c) { ir_observer_begin(c); %s%s(c); ir_observer_end(); }"
             % (symbol, register, symbol))
+
+
+def _checked_wrapper_pending(symbol, fallthroughs):
+    """Wrapper that enters the body with a pending SUB descriptor.
+
+    The descriptor's payload is deliberately different from the setup flag
+    fields, so a body that reads a stale flag field instead of materialising it
+    diverges from the eager reference.
+    """
+    register = "".join("ir_accept_call_return(0x%x); " % addr for addr in fallthroughs)
+    return ("void %s_checked(X86 *c) { ir_observer_begin(c); %sir_arm_pending(c); "
+            "%s(c); ir_observer_end(); }" % (symbol, register, symbol))
 
 
 def run_checks(out, cmake, jobs):
@@ -670,35 +774,49 @@ def run_checks(out, cmake, jobs):
     convention, and compares with only its dead x87 fields cleared.
     """
     out.mkdir(parents=True, exist_ok=True)
-    code, rows, declarations = ['#include "x86.h"',
+    code, rows, masks, declarations = ['#include "x86.h"',
         'void ir_observer_begin(X86 *);', 'void ir_observer_end(void);',
-        'void ir_accept_call_return(uint32_t);'], [], []
+        'void ir_accept_call_return(uint32_t);',
+        'static void ir_arm_pending(X86 *c) {',
+        '    c->cc_op = X86_CC_SUB; c->cc_size = 4; c->cc_mask = 0x3Fu;',
+        '    c->cc_a = 0; c->cc_b = 0; c->cc_res = 0;',
+        '}'], [], [], []
+    null_masks = []
 
-    def add_case(name, eager, variants, extra=(), fallthroughs=()):
+    def add_case(name, eager, variants, extra=(), fallthroughs=(), modes=None, pending=False):
+        nonlocal null_masks
         code.extend(extra)
         code.extend([eager, *variants])
         symbols = [name + "_eager_fn_%08x" % ENTRY, name + "_ir_raw",
                    name + "_ir_scalar", name + "_ir_strict", name + "_ir_local",
-                   name + "_ir_lazy"]
+                   name + "_ir_lazy", name + "_decoded_lazy_fn_%08x" % ENTRY]
+        wrap = _checked_wrapper_pending if pending else _checked_wrapper
         for symbol in symbols:
-            code.append(_checked_wrapper(symbol, fallthroughs))
+            code.append(wrap(symbol, fallthroughs))
         checked = [symbol + "_checked" for symbol in symbols]
         declarations.extend("void %s(X86 *);" % symbol for symbol in checked)
         rows.append("{" + ",".join(checked) + "}")
+        # Mode 0 is the eager reference; default compares modes 1..6.  Under
+        # RECOMP_NULL_CHECKS the SSA lazy column compiles to the eager strict
+        # path, so a fixture that arms a pending descriptor (valid only for the
+        # lazy column) must not compare that mode there.
+        mask = 0x7E if modes is None else modes
+        masks.append(mask)
+        null_masks.append(mask & ~0x20 if pending else mask)
 
     for name, hexes in CASES.items():
-        eager, raw, scalar, strict, local, lazy = sources(name, hexes)
-        add_case(name, eager, [raw, scalar, strict, local, lazy])
+        eager, raw, scalar, strict, local, lazy, decoded_lazy = sources(name, hexes)
+        add_case(name, eager, [raw, scalar, strict, local, lazy, decoded_lazy])
     for name, spec in CALL_CASES.items():
-        eager, raw, scalar, strict, local, lazy, returns = call_sources(
+        eager, raw, scalar, strict, local, lazy, decoded_lazy, returns = call_sources(
             name, spec["hexes"], CALLEE, spec["resumable"])
-        add_case(name, eager, [raw, scalar, strict, local, lazy], extra=[spec["callee"]],
-                 fallthroughs=returns)
+        add_case(name, eager, [raw, scalar, strict, local, lazy, decoded_lazy],
+                 extra=[spec["callee"]], fallthroughs=returns)
     for name, spec in BYTE_CALL_CASES.items():
         contracts = None
         if spec.get("contract"):
             contracts = {CALLEE: callee_contract(spec["callee_hexes"])}
-        eager, raw, scalar, strict, local, lazy, returns = call_sources(
+        eager, raw, scalar, strict, local, lazy, decoded_lazy, returns = call_sources(
             name, spec["hexes"], CALLEE, spec["resumable"], contracts=contracts)
         callee = _eager_callee(name + "_callee", CALLEE, spec["callee_hexes"])
         extra = [callee]
@@ -714,13 +832,13 @@ def run_checks(out, cmake, jobs):
             extra.append(emit(fir, name + "_callee_lazy", lazy_flags=True))
             local = local.replace(name + "_callee(c)", name + "_callee_local(c)")
             lazy = lazy.replace(name + "_callee(c)", name + "_callee_lazy(c)")
-        add_case(name, eager, [raw, scalar, strict, local, lazy], extra=extra,
-                 fallthroughs=returns)
+        add_case(name, eager, [raw, scalar, strict, local, lazy, decoded_lazy], extra=extra,
+                 fallthroughs=returns, modes=spec.get("modes"), pending=spec.get("pending", False))
     dispatch = []
     for name, spec in INDIRECT_CASES.items():
-        eager, raw, scalar, strict, local, lazy, returns = call_sources(
+        eager, raw, scalar, strict, local, lazy, decoded_lazy, returns = call_sources(
             name, spec["hexes"], spec["target"], spec["resumable"], indirect=True)
-        add_case(name, eager, [raw, scalar, strict, local, lazy],
+        add_case(name, eager, [raw, scalar, strict, local, lazy, decoded_lazy],
                  extra=[spec["callee"]], fallthroughs=returns)
         dispatch.append((spec["target"], name + "_callee"))
     code.extend(['void ir_unexpected_call(uint32_t);',
@@ -730,8 +848,14 @@ def run_checks(out, cmake, jobs):
                 + ['    default: ir_unexpected_call(target); }',
                    '}'])
     declarations.extend([
-        'static const char *mode_names[] = {"eager", "raw", "scalar", "strict", "local", "lazy"};',
-        'static const unsigned normalize_empty_mask = 0, required_match_mask = 62;',
+        'static const char *mode_names[] = {"eager", "raw", "scalar", "strict", "local", "lazy", "decoded-lazy"};',
+        'static const unsigned normalize_empty_mask = 0, required_match_mask = 126;',
+        '#if defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS',
+        'static const unsigned case_mode_masks[] = {'
+        + ','.join(str(m) for m in null_masks) + '};',
+        '#else',
+        'static const unsigned case_mode_masks[] = {' + ','.join(str(m) for m in masks) + '};',
+        '#endif',
         # The production local column uses ir_ssa_msvc_convention; the lazy
         # column adds ir_ssa_x87_lazy_nan on top of it.
         '#define FIXTURE_CONVENTION_MASK 48u',
@@ -757,7 +881,7 @@ def run_checks(out, cmake, jobs):
                    for name in list(CASES) + list(CALL_CASES) + list(BYTE_CALL_CASES)
                    + list(INDIRECT_CASES))
         + '};',
-        'static void (*functions[][6])(X86 *) = {' + ','.join(rows) + '};',
+        'static void (*functions[][7])(X86 *) = {' + ','.join(rows) + '};',
     ])
     (out / "generated.c").write_text("\n".join(code) + "\n")
     (out / "fixtures.h").write_text("\n".join(declarations) + "\n")

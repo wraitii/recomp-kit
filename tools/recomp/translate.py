@@ -30,7 +30,11 @@ from bisect import bisect_right
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+# This file is also loaded standalone by tests and by the driver; make its own
+# directory importable so the `ir` package resolves without an installed tree.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import game_config  # noqa: E402
+from ir import flag_region  # noqa: E402
 
 # Stable address buckets prevent an insertion from repacking the entire image.
 # Oversize functions stand alone; recursively split only an over-budget bucket.
@@ -147,9 +151,13 @@ void %(p)senter(X86 *c, uint32_t i)
     RecompSaved saved_; recomp_save(c, &saved_);
     if (recomp_profile_enabled) { recomp_call(c, %(p)sfunc_addrs[i]); return; }
 #ifndef RECOMP_NO_HOOKS
-    if (__builtin_expect(__atomic_load_n(&%(p)shooked[i], __ATOMIC_ACQUIRE) != 0u, 0))
+    if (__builtin_expect(__atomic_load_n(&%(p)shooked[i], __ATOMIC_ACQUIRE) != 0u, 0)) {
+        /* A hook callback observes the full register file, so a pending lazy
+         * descriptor must be materialised before it runs.  The callee's own
+         * entry settle may have been elided. */
+        x86_cc_settle(c);
         %(p)shook_ptrs[i](c, i);
-    else
+    } else
 #endif
         %(p)sbase_ptrs[i](c);
 #ifndef RECOMP_NO_HOOKS
@@ -179,6 +187,10 @@ ALTERNATE_ENTRIES = frozenset()
 X87_LOCALS = False
 CPU_LOCALS = False
 FUNCTION_ALIGNMENT = 16
+#: [translate] call_contracts: elide decoded-body lazy-flag settles where the
+#: region analysis proves the descriptor passes through, can be dropped, or is
+#: not needed.  Off restores the unconditional entry/post-call settle.
+CALL_CONTRACTS = True
 
 #: game.toml [translate] rewrites: an instruction's memory operand moved to a
 #: free address, and the words the loader seeds before the game runs.
@@ -215,12 +227,13 @@ def configure_module(cfg, key):
     reads, no curated symbols (those describe the executable)."""
     global LISTINGS, FUNCS_TSV, BINARY, CURATED, ANIMATION_COUNTER, VISUAL_ANIMATION_READS
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT, SYMBOL_PREFIX, AUX_MODULE
-    global RESUMABLE_STACKS, X87_LOCALS, CPU_LOCALS
+    global RESUMABLE_STACKS, X87_LOCALS, CPU_LOCALS, CALL_CONTRACTS
     configure_intrinsics({"translate": {"intrinsics": {}}})
     tl = cfg.get("translate", {})
     RESUMABLE_STACKS = tl.get("resumable_stacks", False)
     X87_LOCALS = tl.get("fault_state", game_config.TRANSLATE_DEFAULTS["fault_state"]) == "relaxed"
     CPU_LOCALS = X87_LOCALS
+    CALL_CONTRACTS = tl.get("call_contracts", game_config.TRANSLATE_DEFAULTS["call_contracts"])
     mods = {m["key"]: m for m in cfg.get("aux_modules", [])}
     if key not in mods:
         raise SystemExit("game.toml has no [modules.aux.%s]" % key)
@@ -269,11 +282,13 @@ def configure(cfg):
     VISUAL_ANIMATION_READS = frozenset(translate.get("volatile_reads", ()))
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT
     global RESUMABLE_STACKS, X87_LOCALS, CPU_LOCALS, ENTRY_SCAN, ALTERNATE_ENTRIES
+    global CALL_CONTRACTS
     RESUMABLE_STACKS = translate.get("resumable_stacks", False)
     ENTRY_SCAN = translate.get("entry_scan", True)
     ALTERNATE_ENTRIES = frozenset(int(a) for a in translate.get("alternate_entries", ()))
     X87_LOCALS = translate.get("fault_state", game_config.TRANSLATE_DEFAULTS["fault_state"]) == "relaxed"
     CPU_LOCALS = X87_LOCALS
+    CALL_CONTRACTS = translate.get("call_contracts", game_config.TRANSLATE_DEFAULTS["call_contracts"])
     EXTRA_ENTRY_POINTS = frozenset(int(a) for a in translate.get("entry_points", ()))
     FUNCTION_ALIGNMENT = translate.get("function_alignment", 16)
     global OPERAND_REDIRECTS, INSTRUCTION_PATCHES, DATA_SEEDS
@@ -1126,6 +1141,53 @@ def flag_effect(insn):
         return (NO_FLAGS, NO_FLAGS)
     # Unknown, helper-backed or faulting: assume it can read every flag.
     return (NO_FLAGS, ALL_FLAGS)
+
+
+def region_flag_access(ins):
+    """(reads, writes) of the six arithmetic flags for the region classifier.
+
+    This is the lazy-descriptor question, not the eager-store liveness question
+    `flag_effect` answers.  It names helper-backed writes (DIV/IDIV, the string
+    compares) explicitly, treats architecturally flag-neutral stack and move
+    forms as neutral, and returns ``None`` for anything it does not classify,
+    so an unknown mnemonic fails closed to a settle.
+    """
+    m = ins.mnem
+    if m in JCC:
+        return (frozenset(JCC[m][1]), NO_FLAGS)
+    if m in SETCC:
+        return (frozenset(SETCC[m][1]), NO_FLAGS)
+    if m in CMOVCC:
+        return (frozenset(CMOVCC[m][1]), NO_FLAGS)
+    if m in FCMOVCC:
+        return (frozenset(FCMOVCC[m][1]), NO_FLAGS)
+    if m in SHIFT_MAYDEF:
+        reads = frozenset(("cf",)) if m in ("RCL", "RCR") else NO_FLAGS
+        return (reads, SHIFT_MAYDEF[m])
+    effect = FLAG_EFFECT.get(m)
+    if effect is not None:
+        return (frozenset(effect[1]), frozenset(effect[0]))
+    if m in Translator.EFLAGS_X87:
+        return (NO_FLAGS, ALL_FLAGS)
+    if m in FLAG_NEUTRAL:
+        return (NO_FLAGS, NO_FLAGS)
+    if m.startswith("F"):
+        return (NO_FLAGS, NO_FLAGS)
+    if m in ("PUSH", "POP", "PUSHA", "POPA", "PUSHAD", "POPAD", "LEAVE",
+             "CALL", "RET"):
+        return (NO_FLAGS, NO_FLAGS)
+    if m in Translator.STRING_MNEM:
+        return (NO_FLAGS, NO_FLAGS)
+    return None
+
+
+def cc_settle_lines(action):
+    """The runtime statement for one region decision (``None`` settles)."""
+    if action == flag_region.DROP:
+        return ["x86_cc_drop(c);"]
+    if action == flag_region.REMOVE:
+        return []
+    return ["x86_cc_settle(c);"]
 
 
 # ------------------------------------------------------------------- image --
@@ -2650,6 +2712,63 @@ class Translator(object):
                     changed = True
         return live_in, live_out
 
+    def flag_settle_plan(self, fn, dead=frozenset()):
+        """Per-site lazy-flag decisions for one decoded body.
+
+        Returns ``(entry, calls)``: the decision at the function's own entry,
+        and a mapping from each CALL instruction index to the decision for the
+        region that follows it.  ``entry`` is ``None`` when ``[translate]
+        call_contracts`` is off, which keeps the unconditional settle.
+        """
+        if not CALL_CONTRACTS:
+            return None, {}
+        n = len(fn.insns)
+
+        def successors(i):
+            return [j for j in self.liveness_successors(fn, i)
+                    if 0 <= j < n and j not in dead]
+
+        def access(i):
+            ins = fn.insns[i]
+            if ins.mnem in ("CALL", "RET"):
+                return (NO_FLAGS, NO_FLAGS)
+            return region_flag_access(ins)
+
+        def is_end(i):
+            return fn.insns[i].mnem in ("CALL", "RET")
+
+        def leaves(i):
+            ins = fn.insns[i]
+            if i in dead or ins.mnem == "INT3" or self.never_returns(ins):
+                return True
+            return self.liveness_exit(fn, i, ins)
+
+        def classify(start):
+            return flag_region.analyze(start, successors, access, is_end, leaves, n)
+
+        entry_index = fn.index.get(fn.addr)
+        entry = classify(entry_index) if entry_index is not None else flag_region.SETTLE
+        calls = {}
+        for i, ins in enumerate(fn.insns):
+            if ins.mnem != "CALL":
+                continue
+            # A call whose return can continue somewhere other than its own
+            # fallthrough leaves the region by a path the CFG does not model:
+            # a resumable-stack diversion, an SEH frame adoption that can
+            # resume through the handler, or a noreturn callee.  Keep the
+            # settle there rather than let a descriptor cross that seam.
+            target = self.branch_target(ins)
+            unusual = (RESUMABLE_STACKS or target in self.seh_helpers
+                       or target in self.noreturn_callees
+                       or (INTRINSIC_SETJMP is not None and target == INTRINSIC_SETJMP))
+            # A call's region starts at its canonical fallthrough.
+            after = successors(i)
+            if unusual or not after:
+                calls[i] = flag_region.SETTLE
+            else:
+                calls[i] = classify(after[0])
+        return entry, calls
+
     # -- jump tables -------------------------------------------------------
 
     def is_table_site(self, ins):
@@ -3139,6 +3258,16 @@ class Translator(object):
         dead = self.dead_after_noreturn(fn, entries)
         fn.dead_addrs = {fn.insns[i].addr for i in dead}
         self.dead_after_noreturn_addrs.update(fn.dead_addrs)
+        # Lazy-flag settle elision for this decoded body.  Region boundaries
+        # are calls, returns and anything that leaves the body; the analysis
+        # sees the same instruction effects the emitter does.
+        cc_entry, cc_calls = (None, {})
+        if not self.opts.eager_flags:
+            cc_entry, cc_calls = self.flag_settle_plan(fn, set(dead))
+            if cc_entry is not None:
+                self.stats["_cc_decoded_entry_" + cc_entry] += 1
+                for action in cc_calls.values():
+                    self.stats["_cc_decoded_postcall_" + action] += 1
 
         labels = set(fn.pushed_continuations)
         # RTL fill/move routines compute addresses within unrolled code rather
@@ -3200,16 +3329,26 @@ class Translator(object):
             out.append("    default: goto L_%08x;" % fn.addr if head else
                        "    default: break;")
             out.append("    }")
+            cpu_decl_pos = 2      # after the unconditional entry settle
         else:
             out.append("void fn_%08x(X86 *c) {" % fn.addr)
             # A caller (translated or host) may have left a pending descriptor.
-            out.append("    x86_cc_settle(c);")
+            # The single-entry form can prove whether it is needed at all.
+            settle_lines = cc_settle_lines(cc_entry)
+            out.extend("    " + line for line in settle_lines)
             if fn.seh_escapes:
                 out.append("    uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
             if head:
                 out.append("    goto L_%08x;" % fn.addr)
+            # CPU/GPR flag locals must be initialised from the *settled* fields,
+            # after the entry settle, not from a pending descriptor's stale
+            # fields.  A REMOVE entry has no settle line and no later guest
+            # read before the flag is written, so initialising at index 1 is
+            # still correct there.
+            cpu_decl_pos = 1 + len(settle_lines)
         prologue = len(out)          # everything emitted so far is dispatch
-        bodies = {i: self.emit(fn, i, live_out[i]) for i in range(len(fn.insns)) if i not in dead}
+        bodies = {i: self.emit(fn, i, live_out[i], cc_calls.get(i))
+                  for i in range(len(fn.insns)) if i not in dead}
         if getattr(self.opts, "x87_locals", X87_LOCALS):
             consumed = set()
             from x87_locals import lower_regions
@@ -3224,8 +3363,10 @@ class Translator(object):
         if getattr(self.opts, "cpu_locals", CPU_LOCALS):
             from cpu_locals import lower_function
             bodies, declarations, cpu_publish, fields = lower_function(bodies)
-            # Initialize before the alternate-entry switch or any head jump.
-            out[1:1] = ["    " + line for line in declarations]
+            # Initialize after the entry settle (so the cached values come from
+            # settled fields) and before the alternate-entry switch or any head
+            # jump, so no entry skips initialization.
+            out[cpu_decl_pos:cpu_decl_pos] = ["    " + line for line in declarations]
             prologue += len(declarations)
             self.stats["_cpu_local_functions"] += bool(fields)
             self.stats["_cpu_local_fields"] += fields
@@ -3333,7 +3474,7 @@ class Translator(object):
 
     # ---- the instruction dispatcher --------------------------------------
 
-    def emit(self, fn, i, live):
+    def emit(self, fn, i, live, cc_settle=None):
         # Instructions replaced by a trap, reported at the end of a run so a
         # listing that is decoding data as code is visible rather than silent.
 
@@ -3344,7 +3485,7 @@ class Translator(object):
         # also skip past it. The return address belongs to the instruction.
         nxt = fn.fallthrough[i] or (fn.insns[i + 1].addr if i + 1 < len(fn.insns) else fn.end)
         try:
-            body = self._emit(fn, i, ins, m, nxt, live)
+            body = self._emit(fn, i, ins, m, nxt, live, cc_settle)
             body = visual_animation_read(ins.addr, body)
         except TranslateError as e:
             # An instruction this translator cannot model becomes a trap at its
@@ -3375,7 +3516,7 @@ class Translator(object):
                              # whole build over a byte nothing executes.
                              "INSB", "INSW", "INSD", "OUTSB", "OUTSW", "OUTSD"))
 
-    def _emit(self, fn, i, ins, m, nxt, live):
+    def _emit(self, fn, i, ins, m, nxt, live, cc_settle=None):
         if any(AVX_OPERAND_RE.search(o) for o in ins.ops or ()):
             # Never modelled, and its operands do not parse: trap it here,
             # before parsing refuses the whole function over a path CPUID
@@ -3749,7 +3890,7 @@ class Translator(object):
                     L.append("recomp_call(c, %s);" % hexlit(t))
                 # An SSA callee may return with a pending flags descriptor; the
                 # decoded caller reads the guest's fields directly.
-                L.append("x86_cc_settle(c);")
+                L.extend(cc_settle_lines(cc_settle))
                 if RESUMABLE_STACKS:
                     L.append("if (c->eip != %s) return;" % hexlit(nxt))
                 if t in self.seh_helpers:
@@ -3766,7 +3907,7 @@ class Translator(object):
             L.append("uint32_t t_ = %s;" % read_op(ops[0], 32))
             L.append("c->r[4] -= 4; wr32(c->r[4], %s);" % hexlit(nxt))
             L.append("recomp_call(c, t_);")
-            L.append("x86_cc_settle(c);")
+            L.extend(cc_settle_lines(cc_settle))
             if RESUMABLE_STACKS:
                 L.append("if (c->eip != %s) return;" % hexlit(nxt))
             self.stats["_call_indirect"] += 1
@@ -6206,11 +6347,13 @@ def main():
         if body and body[0].startswith("static void body_"):
             continue                      # multi-entry form, dispatched below
         lines = [l for l in body[1:] if l.strip()]
-        lines = after_initialization(lines)
         # Host-only ownership bookkeeping does not execute a guest instruction
-        # or modify its CPU. The first guest operation must still reach ADDR.
-        if lines and lines[0].strip() == "x86_cc_settle(c);":
+        # or modify its CPU. The entry settle and the CPU/GPR flag locals it
+        # feeds are host initialization; the first guest operation must still
+        # reach ADDR.
+        if lines and lines[0].strip() in ("x86_cc_settle(c);", "x86_cc_drop(c);"):
             lines = lines[1:]
+        lines = after_initialization(lines)
         if lines and lines[0].strip() == "uint64_t seh_mark_ = recomp_seh_frame_mark(c);":
             lines = lines[1:]
         if not lines:
@@ -6582,10 +6725,14 @@ void recomp_jump(X86 *c, uint32_t target)
 #ifdef RECOMP_NO_HOOKS
         recomp_base_ptrs[i](c);
 #else
-        if (__atomic_load_n(&recomp_hooked[i], __ATOMIC_ACQUIRE))
+        if (__atomic_load_n(&recomp_hooked[i], __ATOMIC_ACQUIRE)) {
+            /* A jump into a hooked entry must publish a pending descriptor
+             * before the callback reads the CPU. */
+            x86_cc_settle(c);
             recomp_hook_ptrs[i](c, (uint32_t)i);
-        else
+        } else {
             recomp_base_ptrs[i](c);
+        }
 #endif
         if (recomp_profile_enabled) recomp_profile_pop();
         return;
@@ -6704,6 +6851,11 @@ void recomp_unknown_jump(X86 *c, uint32_t target)
                 "functions_total": len(parsed),
                 "functions_ok": len(ok),
                 "ir_ssa": ir_ssa_report,
+                "decoded_settles": {
+                    kind: {action: tr.stats.get("_cc_decoded_%s_%s" % (kind, action), 0)
+                           for action in ("remove", "drop", "settle")}
+                    for kind in ("entry", "postcall")
+                },
                 "entry_points": len(entry_names),
                 "alternate_entries": ["%08x" % a for a in sorted(extra)],
                 "entry_points_from_data_pointers": discovered_by_scan[0],

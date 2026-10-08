@@ -17,6 +17,7 @@ from .ssa import SSAError, MEMORY, build
 from .cfg import FunctionIR
 from .simplify import canonicalize, simplify, EFFECTS
 from .publication import plan
+from . import flag_region
 from . import x87
 
 
@@ -247,6 +248,79 @@ def codegen_ir(fir, lifter):
     return FunctionIR(fir.addr, insns, fir.succ, fir.tables)
 
 
+#: Codegen ops whose seams materialise flags eagerly before or after running.
+#: They end the region as observers, so the settle is kept.
+_SSA_EAGER_OPS = frozenset(("DIV32", "IDIV32", "STRINGOP", "BRANCHIND", "CALLOTHER"))
+
+
+def cc_action_lines(action):
+    """The C statement for one lazy-flag region decision."""
+    if action == flag_region.DROP:
+        return ["x86_cc_drop(c);"]
+    if action == flag_region.REMOVE:
+        return []
+    return ["x86_cc_settle(c);"]
+
+
+def ssa_settle_plan(cgi, flag_off_name, resumable_stacks):
+    """Per-site lazy-flag decisions for one SSA body.
+
+    Returns ``(entry, calls)``: the decision at the body entry and a mapping
+    from each call instruction index to the post-call decision.  The
+    classification is over the codegen ops, so it matches what the emitter
+    actually materialises: an eager seam is an observer, a call is a normal
+    region boundary, and unknown forms settle.
+    """
+    n = len(cgi.insns)
+
+    def access(i):
+        ins = cgi.insns[i]
+        if ins.mnem.upper() in ("CALL", "RET"):
+            return (frozenset(), frozenset())
+        if any(op.opc in _SSA_EAGER_OPS for op in ins.ops):
+            return None
+        reads, writes = set(), set()
+        for op in ins.ops:
+            if op.out is not None and op.out[0] == "register":
+                for k in range(op.out[2]):
+                    name = flag_off_name.get(op.out[1] + k)
+                    if name:
+                        writes.add(name)
+            for v in op.ins:
+                if v is not None and v[0] == "register":
+                    for k in range(v[2]):
+                        name = flag_off_name.get(v[1] + k)
+                        if name:
+                            reads.add(name)
+        return (frozenset(reads), frozenset(writes))
+
+    def successors(i):
+        # Out-of-body targets stay in the list: the analysis treats them as
+        # observers rather than silently ending the path.
+        return list(cgi.succ[i])
+
+    def is_end(i):
+        return cgi.insns[i].mnem.upper() in ("CALL", "RET")
+
+    def classify(start):
+        return flag_region.analyze(start, successors, access, is_end,
+                                   lambda i: False, n)
+
+    indices = {ins.addr: k for k, ins in enumerate(cgi.insns)}
+    start = indices.get(cgi.addr)
+    entry = classify(start) if start is not None else flag_region.SETTLE
+    calls = {}
+    for i, ins in enumerate(cgi.insns):
+        if ins.mnem.upper() != "CALL":
+            continue
+        after = successors(i)
+        if resumable_stacks or not after:
+            calls[i] = flag_region.SETTLE
+        else:
+            calls[i] = classify(after[0])
+    return entry, calls
+
+
 def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=True,
          call_symbols=None, x87_scalar_strict=False, local_state=True, msvc_convention=True,
          lazy_nan=False, lazy_flags=False, resumable_stacks=False, lifter=None,
@@ -389,7 +463,14 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             key = ("register", off + n)
             lane_field[key] = name
             field_lanes.setdefault(name, set()).add(key)
-    s = build(codegen_ir(fir, lifter),
+    cgi = codegen_ir(fir, lifter)
+    # Per-site lazy-flag settle decisions over the same codegen ops the
+    # emitter lowers, so an eager seam or a call boundary is classified the
+    # way the generated body actually behaves.
+    cc_entry, cc_calls = flag_region.SETTLE, {}
+    if lazy_flags and optimize:
+        cc_entry, cc_calls = ssa_settle_plan(cgi, flag_off_name, resumable_stacks)
+    s = build(cgi,
               register_groups=groups if optimize and wide_registers else (),
               call_targets=call_symbols, indirect_call_symbol=indirect_call_symbol,
               flag_off_name=flag_off_name)
@@ -491,11 +572,29 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     reads_after_call = any(
         v.opc == "CALL_RELOAD" and v.data in flag_keys and v.id in live and s.resolve(v) is v
         for v in s.values)
+    if reads_after_call:
+        # The SSA builder reloads the callee's flags after every call and that
+        # reload reads the fields directly.  A pending callee descriptor must be
+        # materialised even when no guest instruction later reads a flag, so no
+        # post-call site may remove or drop its settle.
+        cc_calls = {index: flag_region.SETTLE for index in cc_calls}
+    if reads_entry_flags:
+        # The SSA builder loads live entry flag INPUTs straight from the fields,
+        # immediately after the entry settle.  Those loads are not codegen ops,
+        # so the region walk cannot see them: it may have classified the entry
+        # region as REMOVE or DROP while a caller descriptor is still pending,
+        # and the later guest read would use a stale field.  Settle first.
+        cc_entry = flag_region.SETTLE
     if facts is not None:
         facts["flags_read_at_entry"] = reads_entry_flags
         facts["flags_read_after_call"] = reads_after_call
         facts["x87_exact_flush"] = msvc_convention and not x87_convention
         facts["lazy_flags"] = bool(cc_plan)
+        if lazy_flags:
+            facts["cc_settle_entry_%s" % cc_entry] = 1
+            for action in cc_calls.values():
+                key = "cc_settle_postcall_%s" % action
+                facts[key] = facts.get(key, 0) + 1
 
     def ref(v):
         v = s.resolve(v)
@@ -560,13 +659,6 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             return "(%s << %d) | %s" % (a[0], v.args[1].size * 8, a[1])
         raise SSAError("unsupported integer operation %s" % opc)
 
-    # Whether this body writes any flag state.  Such a body must settle a
-    # descriptor left by its caller or a callee before writing, or the fields
-    # a newer descriptor does not cover would be lost (INC after a caller's
-    # CMP keeps CF).  A body that never touches flags passes it through.
-    cc_touch = [reads_entry_flags or reads_after_call]
-    CC_SETTLE = "/*cc-settle*/"
-
     def store_fields(state, required):
         """Direct field stores for the required keys (no descriptor)."""
         lines = []
@@ -583,9 +675,6 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     def publish(state, event):
         lines = []
         required = state if publications is None else publications[event.id]
-        if lazy_flags and getattr(event, "opc", None) in CC_EAGER_EVENTS:
-            # These helpers may write flag fields directly.
-            cc_touch[0] = True
         cc = cc_plan.get(event.id)
         record = None
         mask = 0
@@ -606,8 +695,6 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             lines.append("%s = (uint32_t)(%s);" % (field, " | ".join(parts)))
             if field in FLAG_FIELDS:
                 stored_flag = True
-        if record is not None or stored_flag:
-            cc_touch[0] = True
         if record is not None:
             lines.append("c->cc_op = %s;" % CC_OP_CONST[record.kind])
             lines.append("c->cc_size = %du;" % record.size)
@@ -647,7 +734,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     if scalar is not None:
         lines.extend(scalar.declarations())
     if lazy_flags:
-        lines.append(CC_SETTLE)
+        lines.extend(cc_action_lines(cc_entry))
     for v in s.values:
         if v.opc != "INPUT" or not v.size or v.id not in live or s.resolve(v) is not v:
             continue
@@ -845,7 +932,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 lines.append("%s(c);" % name)
                 if lazy_flags:
                     # A callee (SSA or otherwise) may leave a pending descriptor.
-                    lines.append(CC_SETTLE)
+                    lines.extend(cc_action_lines(cc_calls.get(b.index)))
                 if resumable_stacks:
                     # Match the eager emitter's resumable-stack contract: a
                     # callee that diverted EIP did not resume the continuation.
@@ -866,7 +953,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 lines.extend(publish(b.snapshots[v.id], v))
                 lines.append("%s(c, (uint32_t)%s);" % (v.data, ref(v.args[1])))
                 if lazy_flags:
-                    lines.append(CC_SETTLE)
+                    lines.extend(cc_action_lines(cc_calls.get(b.index)))
                 if resumable_stacks:
                     lines.append("if (c->eip != 0x%x) return;" % (
                         b.insn.addr + b.insn.length))
@@ -963,10 +1050,6 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 lines.extend(edge(i, target))
         previous = i
     lines.append("}")
-    if lazy_flags:
-        settle = "x86_cc_settle(c);" if cc_touch[0] else None
-        lines = [settle if line == CC_SETTLE else line for line in lines
-                 if line != CC_SETTLE or settle]
     if scalar is not None:
         lines[scalar_declarations:scalar_declarations] = scalar.temps
     return "\n".join(lines)

@@ -8,11 +8,11 @@ import translate as T
 from cpu_locals import transparent, after_initialization, INITIALIZATION_BEGIN, INITIALIZATION_END
 
 
-def translate(lines, enabled=True, entries=(), x87=False):
+def translate(lines, enabled=True, entries=(), x87=False, eager=True):
     insns = T.parse_listing_text("\n".join(f"{0x100000+i:08x}  {s}" for i, s in enumerate(lines)))
     fn = T.Function(0x100000, "synthetic", len(insns), insns)
     tr = T.Translator(None, {fn.addr, 0x200000}, SimpleNamespace(
-        eager_flags=True, cpu_locals=enabled, x87_locals=x87))
+        eager_flags=eager, cpu_locals=enabled, x87_locals=x87))
     tr.prepare(fn)
     return "\n".join(tr.translate(fn, entries)), tr
 
@@ -35,9 +35,11 @@ def test_cfg_values_and_fault_diagnostics():
 def test_entry_validation_skips_only_marked_host_initialization():
     body, _ = translate(ARITH + ["RET"])
     lines = [line for line in body.splitlines()[1:] if line.strip()]
+    # The entry settle runs before the CPU locals are initialised so the cached
+    # values come from settled fields, not a pending descriptor.
+    assert lines[0].strip() == "x86_cc_settle(c);"
+    lines = lines[1:]
     lines = after_initialization(lines)
-    if lines and lines[0].strip() == "x86_cc_settle(c);":
-        lines = lines[1:]
     assert lines[0].strip() == "L_00100000: ;"
     bad = [INITIALIZATION_BEGIN, "guest_operation();"]
     assert after_initialization(bad) == bad
@@ -169,3 +171,49 @@ def test_opaque_region_exit_refreshes_locals_before_leaving():
     assert count
     edge = result[1][1]
     assert "{ (*cpu_r0_ptr_) = c->r[0]; goto L_00100002; }" in edge
+
+
+def test_decoded_flag_settle_plan_actions():
+    # The production decoded plan (eager_flags off) classifies the region from
+    # the entry or a call return.  These bodies pin each rule and the per-site
+    # counters that feed the translation report.
+    call = "CALL 0x00200000"
+
+    # call; ret -- neither region touches a flag: both settles removed.
+    body, tr = translate([call, "RET"], eager=False)
+    assert "x86_cc_settle" not in body and "x86_cc_drop" not in body
+    assert tr.stats["_cc_decoded_entry_remove"] == 1
+    assert tr.stats["_cc_decoded_postcall_remove"] == 1
+
+    # add eax,ebx; call; ret -- the entry region kills all six: drop.
+    body, tr = translate(["ADD EAX,EBX", call, "RET"], eager=False)
+    assert body.count("x86_cc_drop(c);") == 1
+    assert tr.stats["_cc_decoded_entry_drop"] == 1
+
+    # inc eax; call; ret -- INC preserves CF, so the descriptor cannot be
+    # dropped; the entry settle stays.
+    body, tr = translate(["INC EAX", call, "RET"], eager=False)
+    assert body.count("x86_cc_settle(c);") == 1
+    assert tr.stats["_cc_decoded_entry_settle"] == 1
+
+    # call; jz +0; ret -- the post-call JZ reads ZF, so that region settles.
+    body, tr = translate([call, "JZ 0x00100002", "RET"], eager=False)
+    assert tr.stats["_cc_decoded_entry_remove"] == 1
+    assert tr.stats["_cc_decoded_postcall_settle"] == 1
+
+    # call; add eax,ebx; ret -- the post-call region kills all six: drop.
+    body, tr = translate([call, "ADD EAX,EBX", "RET"], eager=False)
+    assert body.count("x86_cc_drop(c);") == 1
+    assert tr.stats["_cc_decoded_postcall_drop"] == 1
+
+
+def test_decoded_flag_settle_plan_off_keeps_unconditional_settle():
+    # call_contracts off restores the unconditional entry/call settles.
+    previous = T.CALL_CONTRACTS
+    T.CALL_CONTRACTS = False
+    try:
+        body, tr = translate(["MOV EAX,ECX", "CALL 0x00200000", "RET"], eager=False)
+    finally:
+        T.CALL_CONTRACTS = previous
+    assert body.count("x86_cc_settle(c);") >= 2
+    assert "_cc_decoded_entry_remove" not in tr.stats

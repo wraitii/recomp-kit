@@ -71,6 +71,7 @@ void ir_observe_store(uint32_t addr, uint32_t width, uint64_t value) {
     /* Materialise a lazy descriptor in the copy only: the live CPU stays as the
      * callback found it, and the eager reference has no descriptor. */
     x86_cc_settle(&o->cpu);
+    x86_cc_canonicalize(&o->cpu);
     o->addr = addr;
     o->width = width;
     o->value = value;

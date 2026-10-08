@@ -130,6 +130,7 @@ static int compare(void) {
     for (unsigned f = 0; f < cases; ++f) {
         unsigned differences[FIXTURE_MODES] = {0}, memory_differences = 0;
         unsigned relaxed_by_pc[4] = {0}, finite_differences = 0;
+        const unsigned mode_mask = case_mode_masks[f];
         for (unsigned n = 0; n < 24576; ++n) {
             X86 initial, expected;
             uint8_t input[FIXTURE_SCRATCH_SIZE], output[FIXTURE_SCRATCH_SIZE];
@@ -141,6 +142,8 @@ static int compare(void) {
             FIXTURE_AFTER_STATE(0, &expected);
             memcpy(output, g_mem + 0x10000, sizeof output);
             for (unsigned mode = 1; mode < FIXTURE_MODES; ++mode) {
+                if (!(mode_mask & (1u << mode)))
+                    continue;
                 X86 actual = initial, reference = expected;
                 memcpy(g_mem + 0x10000, input, sizeof input);
                 FIXTURE_BEFORE(mode);
@@ -150,6 +153,10 @@ static int compare(void) {
                  * materialised guest state.  The eager reference has none. */
                 x86_cc_settle(&actual);
                 x86_cc_settle(&reference);
+                /* A dropped descriptor leaves its payload dead; clear it so a
+                 * full-struct comparison sees canonical NONE bytes. */
+                x86_cc_canonicalize(&actual);
+                x86_cc_canonicalize(&reference);
                 int mem_diff = memcmp(output, g_mem + 0x10000, sizeof output) != 0;
                 if (normalize_empty_mask & (1u << mode)) {
                     discard_empty_contents(&actual);

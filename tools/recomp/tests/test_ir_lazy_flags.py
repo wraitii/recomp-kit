@@ -88,11 +88,15 @@ def test_flags_dead_body_has_no_descriptor():
 
 
 def test_touch_rule_settles_at_entry_and_after_call():
-    # cmp eax,ebx; call; setz al; mov [ebx],al; ret
+    # cmp eax,ebx; setz al; mov [ebx],al; call; ret
     body = fast(caller("39d8", "0f94c0", "8803"))
-    assert body.count("x86_cc_settle(c);") == 2
-    # Entry settle precedes the first body statement; the second follows callee.
-    assert body.index("x86_cc_settle(c);") < body.index("c->cc_op = X86_CC_SUB;")
+    # The CMP kills all six flags before the call, so the entry settle is a
+    # drop; the callee's flags are reloaded and published after the call, so
+    # the post-call settle stays.
+    assert body.count("x86_cc_drop(c);") == 1
+    assert body.count("x86_cc_settle(c);") == 1
+    # The drop precedes the first body statement; the settle follows callee.
+    assert body.index("x86_cc_drop(c);") < body.index("c->cc_op = X86_CC_SUB;")
     assert "callee(c);\nx86_cc_settle(c);" in body
     # The producer's descriptor is published before the call.
     assert body.index("c->cc_op = X86_CC_SUB;") < body.index("callee(c);")

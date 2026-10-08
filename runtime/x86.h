@@ -760,13 +760,22 @@ RECOMP_HOT_INLINE void x86_cc_settle(X86 *c) {
 
 /* Drop a pending descriptor without materialising it: a direct field writer.
  * A producer that ran with a pending descriptor must call this first (the
- * decoded/interpreter paths settle at entry, so this is defence in depth). */
+ * decoded/interpreter paths settle at entry, so this is defence in depth).
+ * Only cc_op is cleared: the payload is dead once cc_op is NONE, and the hot
+ * path keeps the single store.  Test/diagnostic comparisons canonicalise the
+ * payload explicitly through x86_cc_canonicalize. */
 static inline void x86_cc_drop(X86 *c) {
-    /* Clear the payload too, so a dropped descriptor leaves the same state as
-     * a settled one. */
     c->cc_op = X86_CC_NONE;
-    c->cc_size = c->cc_mask = 0;
-    c->cc_a = c->cc_b = c->cc_res = 0;
+}
+
+/* Clear the dead descriptor payload so a full-struct comparison does not see
+ * bytes left over from an earlier descriptor.  Production never reads them
+ * while cc_op is NONE, so this is a test/diagnostic helper. */
+static inline void x86_cc_canonicalize(X86 *c) {
+    if (c->cc_op == X86_CC_NONE) {
+        c->cc_size = c->cc_mask = 0;
+        c->cc_a = c->cc_b = c->cc_res = 0;
+    }
 }
 
 /* --------------------------------------------------- call contract poison */
@@ -786,6 +795,7 @@ RECOMP_HOT_INLINE void recomp_contract_poison(X86 *c, uint32_t mask) {
     /* The pending descriptor still carries the flags this call publishes;
      * materialise it so poisoning the dropped ones cannot lose them. */
     x86_cc_settle(c);
+    x86_cc_canonicalize(c);
     if (mask & (1u << 8)) c->eflags_cf = 0x51u;
     if (mask & (1u << 9)) c->eflags_pf = 0x52u;
     if (mask & (1u << 10)) c->eflags_af = 0x54u;

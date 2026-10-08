@@ -355,17 +355,37 @@ names the fields the operation defines (logic preserves AF, INC/DEC preserve
 CF), and `cc_a`/`cc_b`/`cc_res` are the masked operands and the wrapped result.
 `x86_cc_settle` writes the fields and clears the descriptor;
 `x86_get_eflags`, `x86_set_eflags`, `x86_sahf` and `recomp_comis` settle or drop
-it first, and the interpreter, decoded bodies and `recomp_call` settle at entry
-and after every call. An SSA body publishes a descriptor at a call or return
-seam only while the seam's required flag values still resolve to that producer's
-result. A body that writes any flag state must settle at entry and after each
-call, or a newer descriptor would discard a field it does not define (an INC
-after a caller's CMP would lose CF); a body that never touches flags passes the
-descriptor through untouched. Like lazy NaN this is exact - the descriptor
-materialises to the same fields eager emission writes - so it carries no
-DIVERGENCE tag. The representation only pays off when a consumer can skip the
-settle, which needs call summaries proving the callee does not observe the
-flags; that is the next step toward the cross-function contracts.
+it first, and the interpreter and `recomp_call` settle at entry and after every
+call. An SSA body publishes a descriptor at a call or return seam only while
+the seam's required flag values still resolve to that producer's result.
+
+Settle sites are elided per site under `[translate] call_contracts` (default
+on) by a region analysis (`ir/flag_region.py`). From the function entry or the
+instruction after a call, the region walks in-body control flow to the next
+CALL/CALLIND/RET. If it reads no flag before writing it and writes no flag
+field, the descriptor passes through untouched and the settle is removed. If it
+reads no flag before writing it and writes all six flags on every path to a
+region boundary, the descriptor can be cleared without materialising it, and
+the settle becomes `x86_cc_drop` (a single `cc_op = NONE` store; the dead
+payload is canonicalized only by the comparison harness and the poison build).
+Otherwise the
+settle stays. Decoded bodies use an explicit per-mnemonic flag-effect table
+(helper-backed DIV/IDIV and string compares name their writes; unknown forms
+fail closed); SSA bodies apply the same classification over their p-code ops.
+When the `locals` policy caches a flag, its C-local is initialised after the
+entry settle and reloaded after the post-call settle, so a cached value never
+predates the descriptor whose fields it copies.
+A call whose return can continue somewhere other than its fallthrough - a
+resumable-stack diversion, an SEH frame adoption, a noreturn callee or setjmp -
+keeps the settle, as does any region with a path that leaves the body without
+reaching CALL/CALLIND/RET (a tail jump or trap). A mod hook callback observes the full register file, so the
+generated entry thunks and `recomp_jump` settle before dispatching a hook.
+
+Like lazy NaN this is exact - the descriptor materialises to the same fields
+eager emission writes - so it carries no DIVERGENCE tag of its own. The
+representation only pays off when a consumer can skip the settle, which needs
+call summaries proving the callee does not observe the flags; the
+cross-function call contracts below provide those summaries.
 
 ### Cross-function call contracts
 
@@ -404,11 +424,18 @@ only.
 
 DIVERGENCE(original): [ssa-call-contracts] a fault or SEH context raised inside
 the callee before it overwrites a dropped field shows the caller's stale value
-rather than the published one, as with [ssa-state-locals]. Runtime hook
-installation from a host thread is applied at a scheduler checkpoint; a hook
-that lands between a call site's `recomp_hooks_ever` test and its dispatch sees
-the dropped fields unpublished for that one call. The translation
-report records the summarized-body, call-site and skipped-field counts.
+rather than the published one, as with [ssa-state-locals]. The same applies at
+an elided settle site: a fault or SEH context raised between a `x86_cc_drop`
+and the writes that kill all six flags, or between a removed settle and a later
+flag read, observes the stale `eflags_*` fields rather than the pending
+descriptor's values. Every ordinary flag read is preceded by a settle on its
+path, so guest reads see the descriptor's values. Runtime hook installation from a
+host thread is applied at a scheduler checkpoint; a hook that lands between a
+call site's `recomp_hooks_ever` test and its dispatch sees the dropped fields
+unpublished for that one call. The translation report records the
+summarized-body, call-site, skipped-field and per-site elision counts. The
+decoded `decoded_settles` and the SSA `ir_ssa.ssa_settles` counters break the
+entry and post-call decisions down by `remove`/`drop`/`settle`.
 
 The `locals` state policy defers GPR/flag publication at guest loads and
 stores (integer and x87), keeping EIP/ESP/EBP for diagnostics; no runtime

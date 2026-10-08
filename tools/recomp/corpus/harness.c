@@ -149,10 +149,18 @@ static void validate(unsigned count) {
                 } else {
                     snapshot(row, actual_mem);
                     X86 want = eager;
+                    /* A decoded lazy-flags variant can return with a pending
+                     * descriptor; materialise it before comparing, then clear
+                     * the dead payload a drop leaves so the full-struct compare
+                     * sees canonical NONE bytes. */
+                    x86_cc_settle(&want);
+                    x86_cc_settle(&actual);
                     if ((int)mode == corpus_convention_mode) {
                         corpus_convention_canonical(&want);
                         corpus_convention_canonical(&actual);
                     }
+                    x86_cc_canonicalize(&want);
+                    x86_cc_canonicalize(&actual);
                     if (memcmp(&want, &actual, sizeof actual) ||
                         memcmp(expected, actual_mem, bytes)) {
                         report_diff(&want, &actual, row, expected);

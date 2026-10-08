@@ -182,6 +182,7 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
             print("  ir contracts: %d summaries" % len(contracts), flush=True)
     results, reasons, census = {}, Counter(), Counter()
     contract_calls = contract_skipped = 0
+    ssa_settles = Counter()
     # Lifting needs the parent's image and SLEIGH context; emission does not.
     # Lift here, then emit each batch in workers. Tasks carry their function
     # index so ordered combination is exact, and the emitted text is
@@ -270,6 +271,9 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
         if reason is None:
             bodies[fn.addr] = merged
             census.update(key for key, value in facts.items() if value)
+            for key, value in facts.items():
+                if key.startswith("cc_settle_"):
+                    ssa_settles[key[len("cc_settle_"):]] += value
             contract_calls += facts.get("call_contract_calls", 0)
             contract_skipped += facts.get("call_contract_fields_skipped", 0)
         else:
@@ -299,6 +303,11 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
             "functions_summarized": len(contracts),
             "call_sites": contract_calls,
             "fields_skipped": contract_skipped,
+        },
+        "ssa_settles": {
+            kind: {action: ssa_settles.get("%s_%s" % (kind, action), 0)
+                   for action in ("remove", "drop", "settle")}
+            for kind in ("entry", "postcall")
         },
         "seconds": round(time.monotonic() - started, 3), "per_function": results,
     }
