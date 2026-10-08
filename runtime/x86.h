@@ -1785,22 +1785,6 @@ static inline float fto_float_step(float f, int up) {
     return f;
 }
 
-/* The directed-rounding correction of an inexact, finite FST m32. Out of line
- * and cold: RC != 0 only occurs inside the CRT's ftol window, which stores no
- * float, so inlining the per-mode compare/step ladder at every FST cost ~40
- * instructions per store for a path production never takes. Pure, so calling
- * it does not make the caller's CW/SW locals escape. */
-RECOMP_COLD inline float fto_float_directed(unsigned rc, double v, float f) {
-    double back = (double)f;
-    if (rc == 1 && back > v)
-        return fto_float_step(f, 0); /* down */
-    if (rc == 2 && back < v)
-        return fto_float_step(f, 1); /* up */
-    if (rc == 3 && ((v > 0 && back > v) || (v < 0 && back < v)))
-        return fto_float_step(f, f < 0.0f); /* truncate toward zero */
-    return f;
-}
-
 /* FST/FSTP to a float, rounded per RC.  The host conversion rounds to
  * nearest; for the directed modes, step one ULP if it went the wrong way. */
 RECOMP_HOT_INLINE float fto_float_cw(uint16_t cw, double v) {
@@ -1820,8 +1804,20 @@ RECOMP_HOT_INLINE float fto_float_cw(uint16_t cw, double v) {
     if (!RECOMP_UNLIKELY(rc != 0) || isinf(v) || (double)f == v)
         return f;
     /* The host conversion rounded to nearest; step one ULP toward the mode's
-     * direction when it went the wrong way. */
-    return fto_float_directed(rc, v, f);
+     * direction when it went the wrong way. Kept inline: with an out-of-line
+     * cold helper (1d72468) as its only new callee, 0081ae30's frame grew
+     * 0x70 -> 0xd0 (saving d8/d9) and its in-game self time ~12% over two
+     * paired captures, as with the earlier nextafterf call above. */
+    {
+        double back = (double)f;
+        if (rc == 1 && back > v)
+            return fto_float_step(f, 0); /* down */
+        if (rc == 2 && back < v)
+            return fto_float_step(f, 1); /* up */
+        if (rc == 3 && ((v > 0 && back > v) || (v < 0 && back < v)))
+            return fto_float_step(f, f < 0.0f); /* truncate toward zero */
+    }
+    return f;
 }
 static inline float fto_float(const X86 *c, double v) {
     return fto_float_cw(c->fpu_cw, v);
