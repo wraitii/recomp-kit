@@ -30,6 +30,6 @@ def test_preserved_rounding_points(name):
     """Local lifting must retain one runtime rounding per arithmetic instruction."""
     expected = sum(line.split()[0] in {"FMUL", "FADD", "FSUB", "FADDP"} for line in CASES[name])
     for mode in ("baseline", "full", "live"):
-        helper = "fx87(&x87_env_," if mode == "full" else "fx87(c,"
+        helper = "fx87_sw(&x87_sw_, x87_cw_," if mode == "full" else "fx87(c,"
         assert emit(CASES[name], mode).count(helper) == expected
     assert "fx87(c," not in emit(CASES[name], "relaxed")

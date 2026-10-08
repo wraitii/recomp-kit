@@ -22,7 +22,7 @@ def translate(lines, enabled=True, entries=()):
 
 def test_full_state_and_rounding_not_dead_slot_normalization():
     body, tr = translate(DOT + ["FSTP float ptr [EBX]", "RET"])
-    assert body.count("fx87(&x87_env_,") == 2
+    assert body.count("fx87_sw(&x87_sw_, x87_cw_,") == 2
     assert "fpush(c," not in body and "fdrop(c);" not in body
     assert "st_bits[" in body and "st_exact[" in body
     assert "FTAG_EMPTY" in body and "c->st[" in body
@@ -55,8 +55,8 @@ def test_binary32_arithmetic_requires_operand_provenance():
                          "FADD float ptr [EDI + 4]", "FSTP float ptr [EBX]", "RET"])
     # The first arithmetic consumes the wide input. Its PC=00 result then
     # provides a proven binary32 operand for the second operation.
-    assert body.count("fx87_exact(&x87_env_,") == 1
-    assert "(x87_env_.fpu_cw & 0x300u) == 0u" in body
+    assert body.count("fx87_exact_sw(&x87_sw_,") == 1
+    assert "(x87_cw_ & 0x300u) == 0u" in body
 
 
 def test_binary32_provenance_does_not_cross_a_join():
@@ -64,7 +64,7 @@ def test_binary32_provenance_does_not_cross_a_join():
                          "FSTP float ptr [EBX]", "FLD double ptr [ESI]",
                          "FMUL float ptr [EDI]", "FSTP float ptr [EBX]", "RET"])
     # The join can receive the original narrow value or the replacement double.
-    assert body.count("fx87_exact(&x87_env_,") == 2
+    assert body.count("fx87_exact_sw(&x87_sw_,") == 2
 
 
 def test_diamond_join_uses_scalar_slots_and_publishes_before_return():
@@ -105,8 +105,8 @@ def test_alternate_entry_and_branch_targets_start_new_regions():
 def test_virtual_top_for_status_and_eager_comparison():
     body, _ = translate(DOT + ["FNSTSW AX", "FCOMP float ptr [EDI]", "RET"])
     assert "fstsw(c)" not in body
-    assert "x87_env_.fpu_sw & (uint16_t)~0x3800u" in body
-    assert "fcom(&x87_env_, x87_v2_" in body
+    assert "x87_sw_ & (uint16_t)~0x3800u" in body
+    assert "fcom_sw(&x87_sw_, x87_v2_" in body
     assert "FTAG_EMPTY" in body
 
 
@@ -122,7 +122,7 @@ def test_local_register_copies_and_pop_keep_one_region():
     assert tr.stats["_x87_local_regions"] == 1
     assert "fpush_st(c," not in body and "fcopy(c," not in body
     assert "fdrop(c);" not in body
-    assert "fto_float(&x87_env_," in body
+    assert "fto_float_cw(x87_cw_," in body
 
 
 def test_incoming_register_copy_and_cfg_metadata_remain_eager():

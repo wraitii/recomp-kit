@@ -306,7 +306,12 @@ added. FCOMI/FCMOV, transcendental and environment operations stay fallbacks.
 Scalar x87 (`x87_scalar.py`) is the optimized lowering; the raw path keeps ordered
 helpers. It replaces physical push/pop/copy updates with scalar values indexed
 relative to the entry TOP, tracking all eight physical residues, tags and
-exact-integer shadows. CW/SW helpers use a private non-escaping environment.
+exact-integer shadows. CW and SW live in two scalar locals: helpers take CW by
+value and SW through always-inlined `_sw` forms (`fx87_sw`, `fdivz_sw`,
+`fcom_sw`, `fto_float_cw`, ...), so neither escapes and clang keeps both in
+registers rather than reloading stack slots around every operation. The
+directed-rounding step of a float store is out of line and cold
+(`fto_float_directed`); round-to-nearest stores inline only the conversion.
 Division seams, calls, opaque recipes and returns materialize required FPU
 state; opaque recipes then invalidate the tracker. In performance mode
 unpublished state also survives internal CFG edges: `x87_carry.py` computes a

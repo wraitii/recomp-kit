@@ -41,16 +41,23 @@ SET = re.compile(r"fset\(c, (\d+), (.*)\);")
 PUSH_ST = re.compile(r"fpush_st\(c, (\d+)\);")
 COPY = re.compile(r"fcopy\(c, (\d+), (\d+)\);")
 LOAD = re.compile(r"double v_ = (.*);")
-# These helpers access only CW/SW, never registers, tags or stack values. A
-# separate nonescaping object lets the C compiler keep both fields in native
-# registers despite guest accesses and eager integer CPU writes in the region.
+# These helpers access only CW/SW, never registers, tags or stack values. Two
+# nonescaping locals let the C compiler keep both words in native registers
+# despite guest accesses and eager integer CPU writes in the region.
 ENV_HELPERS = re.compile(r"\b(fx87|fx87_exact|fcom|fucom|fto_float)\(c,")
+#: Scalar CW/SW forms of the helpers above. CW is passed by value and SW by
+#: the address of a local through always-inlined helpers, so neither escapes.
+ENV_FORMS = {"fx87": "fx87_sw(&x87_sw_, x87_cw_,",
+             "fx87_exact": "fx87_exact_sw(&x87_sw_,",
+             "fcom": "fcom_sw(&x87_sw_,",
+             "fucom": "fucom_sw(&x87_sw_,",
+             "fto_float": "fto_float_cw(x87_cw_,"}
 
 
 def environment():
-    return ["X86 x87_env_;",
-            "x87_env_.fpu_cw = c->fpu_cw;",
-            "x87_env_.fpu_sw = c->fpu_sw;"]
+    return ["uint16_t x87_cw_, x87_sw_;",
+            "x87_cw_ = c->fpu_cw;",
+            "x87_sw_ = c->fpu_sw;"]
 
 
 def eligible(ins, parse_operand):
@@ -128,7 +135,7 @@ class Region:
             if depth == 0 and ch in "+-*" and body[i-1:i] == " " and body[i+1:i+2] == " ":
                 lhs, rhs = body[:i].strip(), body[i+1:].strip()
                 if self.binary32(lhs) and self.binary32(rhs):
-                    expr = ("((x87_env_.fpu_cw & 0x300u) == 0u ? "
+                    expr = ("((x87_cw_ & 0x300u) == 0u ? "
                             f"fx87_exact(c, (double)((float)({lhs}) {ch} (float)({rhs}))) : {expr})")
                 break
         # Even with wider operands, the existing PC=00 helper rounds its
@@ -232,8 +239,8 @@ class Region:
                     status = ("(uint16_t)((c->fpu_sw & (uint16_t)~0x3800u) | "
                               f"(((x87_top_ + {self.top}u) & 7u) << 11))")
                     line = line.replace("fstsw(c)", status)
-                line = ENV_HELPERS.sub(r"\1(&x87_env_,", line)
-                line = line.replace("c->fpu_sw", "x87_env_.fpu_sw")
+                line = ENV_HELPERS.sub(lambda match: ENV_FORMS[match[1]], line)
+                line = line.replace("c->fpu_sw", "x87_sw_")
                 lines.append(line)
         except ValueError:
             self.top, self.values, self.tags, self.serial, self.writes, self.single = saved
@@ -262,7 +269,7 @@ class Region:
                       f"    ftag_put(c, {phys}, {self.tags[slot]});"]
         if self.top:
             lines.append(f"    c->fpu_top = (x87_top_ + {self.top}u) & 7u;")
-        lines.append("    c->fpu_sw = x87_env_.fpu_sw;")
+        lines.append("    c->fpu_sw = x87_sw_;")
         lines.append("}")
         return lines
 
@@ -348,7 +355,7 @@ class BranchRegion(Region):
         return [f"x87_exact{slot}_ = 0; x87_tag{slot}_ = FTAG_EMPTY;"]
 
     def commit(self, top):
-        lines = ["c->fpu_sw = x87_env_.fpu_sw;"]
+        lines = ["c->fpu_sw = x87_sw_;"]
         for slot in sorted(self.modified):
             phys = f"((x87_top_ + {slot}u) & 7u)"
             lines += [f"c->st[{phys}] = x87_s{slot}_;",

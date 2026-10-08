@@ -796,12 +796,18 @@ RECOMP_HOT_INLINE void recomp_contract_poison(X86 *c, uint32_t mask) {
      * materialise it so poisoning the dropped ones cannot lose them. */
     x86_cc_settle(c);
     x86_cc_canonicalize(c);
-    if (mask & (1u << 8)) c->eflags_cf = 0x51u;
-    if (mask & (1u << 9)) c->eflags_pf = 0x52u;
-    if (mask & (1u << 10)) c->eflags_af = 0x54u;
-    if (mask & (1u << 11)) c->eflags_zf = 0x58u;
-    if (mask & (1u << 12)) c->eflags_sf = 0x59u;
-    if (mask & (1u << 13)) c->eflags_of = 0x5bu;
+    if (mask & (1u << 8))
+        c->eflags_cf = 0x51u;
+    if (mask & (1u << 9))
+        c->eflags_pf = 0x52u;
+    if (mask & (1u << 10))
+        c->eflags_af = 0x54u;
+    if (mask & (1u << 11))
+        c->eflags_zf = 0x58u;
+    if (mask & (1u << 12))
+        c->eflags_sf = 0x59u;
+    if (mask & (1u << 13))
+        c->eflags_of = 0x5bu;
 }
 #define RECOMP_CONTRACT_POISON_CALL(c, mask) recomp_contract_poison((c), (mask))
 #else
@@ -1505,31 +1511,45 @@ static inline double x87_indefinite(void) {
 /* x87 raises #Z when a finite non-zero dividend meets a zero divisor.  This
  * is the one exception besides IE that the parity oracle also reports, so
  * modelling it keeps the exemption down to IE alone. */
-RECOMP_HOT_INLINE double fdivz(X86 *c, double a, double b) {
+/* The `_sw` forms take the status word as a scalar and the control word by
+ * value. Scalar x87 SSA bodies keep CW/SW in two function locals; passing a
+ * whole X86 environment by address made it escape into helpers clang did not
+ * always inline, pinning both words to stack slots reloaded around every
+ * operation. Every `_sw` helper is always inlined, so the locals stay SSA. */
+RECOMP_HOT_INLINE double fdivz_sw(uint16_t *sw, double a, double b) {
     if (b == 0.0 && a == a && !isinf(a) && a != 0.0)
-        c->fpu_sw |= 0x0004u;
+        *sw |= 0x0004u;
     return a / b;
 }
+RECOMP_HOT_INLINE double fdivz(X86 *c, double a, double b) {
+    return fdivz_sw(&c->fpu_sw, a, b);
+}
 
-RECOMP_HOT_INLINE double fx87_exact(X86 *c, double r) {
+RECOMP_HOT_INLINE double fx87_exact_sw(uint16_t *sw, double r) {
     if (r == r)
         return r;
-    c->fpu_sw |= 0x0001u; /* IE: invalid operation */
+    *sw |= 0x0001u; /* IE: invalid operation */
     return x87_indefinite();
+}
+RECOMP_HOT_INLINE double fx87_exact(X86 *c, double r) {
+    return fx87_exact_sw(&c->fpu_sw, r);
 }
 
 /* An x87 result from one of the basic arithmetic instructions, which do
  * observe the precision-control field.  PC=00 rounds to single; PC=10
  * (53-bit) and PC=11 (64-bit) both land on the double we store, 64-bit
  * approximated by 53 per the plan ruling. */
-RECOMP_HOT_INLINE double fx87(X86 *c, double r) {
+RECOMP_HOT_INLINE double fx87_sw(uint16_t *sw, uint16_t cw, double r) {
     if (r != r) {
-        c->fpu_sw |= 0x0001u;
+        *sw |= 0x0001u;
         return x87_indefinite();
     }
-    if (((c->fpu_cw >> 8) & 3u) == 0u)
+    if (((cw >> 8) & 3u) == 0u)
         return (double)(float)r;
     return r;
+}
+RECOMP_HOT_INLINE double fx87(X86 *c, double r) {
+    return fx87_sw(&c->fpu_sw, c->fpu_cw, r);
 }
 
 /* A signalling NaN has the quiet bit (mantissa MSB) clear. */
@@ -1543,8 +1563,8 @@ RECOMP_HOT_INLINE int is_snan(double v) {
 /* FCOM/FUCOM: C3 C2 C0 = ZF PF CF of the comparison.  They differ only in
  * which NaNs raise the invalid-operation exception: FCOM raises on any NaN,
  * FUCOM only on a signalling one. */
-RECOMP_HOT_INLINE void fcom_common(X86 *c, double a, double b, int quiet) {
-    uint16_t sw = (uint16_t)(c->fpu_sw & (uint16_t)~0x4700u);
+RECOMP_HOT_INLINE void fcom_status(uint16_t *status, double a, double b, int quiet) {
+    uint16_t sw = (uint16_t)(*status & (uint16_t)~0x4700u);
     if (isnan(a) || isnan(b)) {
         sw |= 0x4500u; /* unordered: C3 C2 C0 */
         if (!quiet || is_snan(a) || is_snan(b))
@@ -1553,7 +1573,16 @@ RECOMP_HOT_INLINE void fcom_common(X86 *c, double a, double b, int quiet) {
         sw |= 0x0100u; /* C0 */
     else if (a == b)
         sw |= 0x4000u; /* C3 */
-    c->fpu_sw = sw;
+    *status = sw;
+}
+RECOMP_HOT_INLINE void fcom_sw(uint16_t *status, double a, double b) {
+    fcom_status(status, a, b, 0);
+}
+RECOMP_HOT_INLINE void fucom_sw(uint16_t *status, double a, double b) {
+    fcom_status(status, a, b, 1);
+}
+RECOMP_HOT_INLINE void fcom_common(X86 *c, double a, double b, int quiet) {
+    fcom_status(&c->fpu_sw, a, b, quiet);
 }
 RECOMP_HOT_INLINE void fcom(X86 *c, double a, double b) {
     fcom_common(c, a, b, 0);
@@ -1629,9 +1658,9 @@ static inline void fxam(X86 *c) {
  * representable 4503599627370497 into ...498.  For |v| >= 2^52 floor and ceil
  * are both v, so the tie branch returns v unchanged.
  */
-static inline double fround_cw(const X86 *c, double v) {
+static inline double fround_rc(uint16_t cw, double v) {
     double lo, hi, dlo, dhi;
-    switch ((c->fpu_cw >> 10) & 3u) {
+    switch ((cw >> 10) & 3u) {
     case 1:
         return floor(v);
     case 2:
@@ -1649,6 +1678,9 @@ static inline double fround_cw(const X86 *c, double v) {
             return hi;
         return fmod(lo, 2.0) == 0.0 ? lo : hi; /* tie: to even */
     }
+}
+static inline double fround_cw(const X86 *c, double v) {
+    return fround_rc(c->fpu_cw, v);
 }
 
 /* FLDCW.  Nothing outside fpu_cw has to change: rounding reads the field
@@ -1753,10 +1785,26 @@ static inline float fto_float_step(float f, int up) {
     return f;
 }
 
+/* The directed-rounding correction of an inexact, finite FST m32. Out of line
+ * and cold: RC != 0 only occurs inside the CRT's ftol window, which stores no
+ * float, so inlining the per-mode compare/step ladder at every FST cost ~40
+ * instructions per store for a path production never takes. Pure, so calling
+ * it does not make the caller's CW/SW locals escape. */
+RECOMP_COLD inline float fto_float_directed(unsigned rc, double v, float f) {
+    double back = (double)f;
+    if (rc == 1 && back > v)
+        return fto_float_step(f, 0); /* down */
+    if (rc == 2 && back < v)
+        return fto_float_step(f, 1); /* up */
+    if (rc == 3 && ((v > 0 && back > v) || (v < 0 && back < v)))
+        return fto_float_step(f, f < 0.0f); /* truncate toward zero */
+    return f;
+}
+
 /* FST/FSTP to a float, rounded per RC.  The host conversion rounds to
  * nearest; for the directed modes, step one ULP if it went the wrong way. */
-static inline float fto_float(const X86 *c, double v) {
-    unsigned rc = (c->fpu_cw >> 10) & 3u;
+RECOMP_HOT_INLINE float fto_float_cw(uint16_t cw, double v) {
+    unsigned rc = (cw >> 10) & 3u;
     float f = (float)v;
     /* A float load followed by double widening and float narrowing must quiet
      * an sNaN as the eager host conversion does. Optimizers can otherwise
@@ -1769,20 +1817,14 @@ static inline float fto_float(const X86 *c, double v) {
         memcpy(&f, &bits, sizeof f);
         return f;
     }
-    if (rc == 0 || v != v || isinf(v) || (double)f == v)
+    if (!RECOMP_UNLIKELY(rc != 0) || isinf(v) || (double)f == v)
         return f;
     /* The host conversion rounded to nearest; step one ULP toward the mode's
      * direction when it went the wrong way. */
-    {
-        double back = (double)f;
-        if (rc == 1 && back > v)
-            return fto_float_step(f, 0); /* down */
-        if (rc == 2 && back < v)
-            return fto_float_step(f, 1); /* up */
-        if (rc == 3 && ((v > 0 && back > v) || (v < 0 && back < v)))
-            return fto_float_step(f, f < 0.0f); /* truncate toward zero */
-    }
-    return f;
+    return fto_float_directed(rc, v, f);
+}
+static inline float fto_float(const X86 *c, double v) {
+    return fto_float_cw(c->fpu_cw, v);
 }
 
 /* FIST/FISTP: round per the control word, and store the "integer indefinite"
@@ -1854,8 +1896,8 @@ static inline unsigned fprem_low_bits(double A, double B) {
     return (unsigned)(n & 7);
 }
 
-static inline void fprem_flags(X86 *c, unsigned bits, int incomplete) {
-    uint16_t sw = (uint16_t)(c->fpu_sw & (uint16_t)~0x4700u);
+static inline void fprem_flags(uint16_t *status, unsigned bits, int incomplete) {
+    uint16_t sw = (uint16_t)(*status & (uint16_t)~0x4700u);
     if (incomplete) {
         sw |= 0x0400u; /* C2: reduction not finished */
     } else {
@@ -1866,18 +1908,18 @@ static inline void fprem_flags(X86 *c, unsigned bits, int incomplete) {
         if (bits & 1)
             sw |= 0x0200u; /* C1 = quotient bit 0 */
     }
-    c->fpu_sw = sw;
+    *status = sw;
 }
 
-static inline double fprem_common(X86 *c, double a, double b, int ieee) {
+static inline double fprem_sw(uint16_t *sw, double a, double b, int ieee) {
     double A, B, r;
     int ea, eb;
     if (b == 0.0 || isnan(a) || isnan(b) || isinf(a)) {
-        c->fpu_sw = (uint16_t)((c->fpu_sw & (uint16_t)~0x4700u) | 0x0001u);
+        *sw = (uint16_t)((*sw & (uint16_t)~0x4700u) | 0x0001u);
         return x87_indefinite();
     }
     if (a == 0.0 || isinf(b)) { /* already reduced */
-        fprem_flags(c, 0, 0);
+        fprem_flags(sw, 0, 0);
         return a;
     }
     A = fabs(a);
@@ -1890,7 +1932,7 @@ static inline double fprem_common(X86 *c, double a, double b, int ieee) {
         double scale = scalbn(B, ea - eb - 32);
         double part = trunc(A / scale);
         r = A - part * scale;
-        fprem_flags(c, 0, 1);
+        fprem_flags(sw, 0, 1);
         return a < 0 ? -r : r;
     }
     r = fmod(A, B);
@@ -1908,11 +1950,14 @@ static inline double fprem_common(X86 *c, double a, double b, int ieee) {
             r -= B;
             bits = (bits + 1) & 7;
         }
-        fprem_flags(c, bits, 0);
+        fprem_flags(sw, bits, 0);
         return a < 0 ? -r : r;
     }
-    fprem_flags(c, fprem_low_bits(A, B), 0);
+    fprem_flags(sw, fprem_low_bits(A, B), 0);
     return a < 0 ? -r : r;
+}
+static inline double fprem_common(X86 *c, double a, double b, int ieee) {
+    return fprem_sw(&c->fpu_sw, a, b, ieee);
 }
 
 /* FSCALE: ST(0) *= 2 ** trunc(ST(1)) */

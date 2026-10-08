@@ -41,13 +41,13 @@ def test_scalar_pop_keeps_residue_without_physical_stack_helpers():
                 "scalar")
     assert "fpush(" not in text and "fdrop(" not in text and "fset(" not in text
     assert "FTAG_EMPTY" in text and "c->st_bits[" in text
-    assert "c->fpu_sw = x87_env_.fpu_sw;" in text
+    assert "c->fpu_sw = x87_sw_;" in text
 
 
 def test_scalar_environment_is_invalidated_after_control_word_change():
     text = emit(function("d9e8", "d92e", "d9e8", "dec1", "c3"),
                 "scalar").split("\n#else\n", 1)[1]
-    assert text.count("x87_env_.fpu_cw = c->fpu_cw;") == 2
+    assert text.count("x87_cw_ = c->fpu_cw;") == 2
     assert text.index("c->st[") < text.index("x87_set_cw(c,")
 
 
@@ -72,8 +72,8 @@ def test_deferred_accesses_do_not_claim_unpublished_cpu_fields():
 def test_binary32_requires_proven_operands_and_keeps_a_general_precision_path():
     proven = emit(function("d906", "d906", "d8c8", "dec1", "c3"), "proven")
     incoming = emit(function("d806", "c3"), "incoming")
-    assert "(float)(" in proven and "fpu_cw & 0x300u" in proven
-    assert "fx87_exact(&x87_env_," in proven and "fx87(&x87_env_," in proven
+    assert "(float)(" in proven and "x87_cw_ & 0x300u" in proven
+    assert "fx87_exact_sw(&x87_sw_," in proven and "fx87_sw(&x87_sw_, x87_cw_," in proven
     assert "(float)(" not in incoming
 
 
@@ -84,25 +84,25 @@ def test_narrow_fstp_m32_skips_the_redundant_rounding_step():
         text = emit(narrow, "t", lazy_nan=lazy, _guard_null_checks=False)
         # Proven binary32 under PC=00: plain cast, but the NaN arm still calls
         # the helper so an sNaN payload is quieted.
-        assert "(x87_env_.fpu_cw & 0x300u) == 0u && x87s" in text
-        assert "? (float)(x87s" in text and ": fto_float(&x87_env_, x87s" in text
-        assert text.count("fto_float(&x87_env_,") == 1
+        assert "(x87_cw_ & 0x300u) == 0u && x87s" in text
+        assert "? (float)(x87s" in text and ": fto_float_cw(x87_cw_, x87s" in text
+        assert text.count("fto_float_cw(x87_cw_,") == 1
     # Arithmetic -> FSTP m32 keeps the same fast arm.
     arith = emit(function("d906", "d84604", "d84604", "d91b", "c3"), "t",
                  lazy_nan=True, _guard_null_checks=False)
-    assert "(x87_env_.fpu_cw & 0x300u) == 0u && x87s" in arith
+    assert "(x87_cw_ & 0x300u) == 0u && x87s" in arith
     # A double load is not proven binary32: keep the general helper.
     wide = emit(function("dd06", "d91b", "c3"), "t", _guard_null_checks=False)
     assert "== 0u && " not in wide
-    assert "fto_float(&x87_env_," in wide
+    assert "fto_float_cw(x87_cw_," in wide
     # Strict x87 keeps the pre-access observation form, so no fast arm.
     strict = emit(narrow, "t", x87_scalar_strict=True, _guard_null_checks=False)
-    assert "== 0u && " not in strict and "fto_float(&x87_env_," in strict
+    assert "== 0u && " not in strict and "fto_float_cw(x87_cw_," in strict
 
 
 def test_isolated_arithmetic_keeps_general_recipe_to_bound_selector_cost():
     text = emit(function("d906", "d806", "d91b", "c3"), "single")
-    assert "fx87_exact(&x87_env_, (double)((float)" not in text
+    assert "fx87_exact_sw(&x87_sw_, (double)((float)" not in text
 
 
 def test_raw_emission_ignores_scalar_and_local_state_options():
@@ -190,9 +190,9 @@ def test_lazy_nan_off_is_the_eager_fx87_emission():
     lazy = emit(f, "t", lazy_nan=True, _guard_null_checks=False)
     assert eager != lazy
     # Off keeps the per-op helper; on defers the only IE check to FNSTSW.
-    assert eager.count("fx87(&x87_env_,") >= 2
-    assert "fx87(&x87_env_," not in lazy
-    assert lazy.count("x87_env_.fpu_sw |= (uint16_t)(") == 1
+    assert eager.count("fx87_sw(&x87_sw_, x87_cw_,") >= 2
+    assert "fx87_sw(&x87_sw_, x87_cw_," not in lazy
+    assert lazy.count("x87_sw_ |= (uint16_t)(") == 1
 
 
 def test_lazy_nan_fold_uses_a_bound_local():
@@ -226,7 +226,7 @@ def test_lazy_nan_fclex_canonicalises_without_ie():
     # fld [esi]; fadd st0,st0; fnclex; fnstsw ax; mov [ebx],eax; ret
     lazy = emit(function("d906", "d8c0", "dbe2", "dfe0", "8903", "c3"), "t",
                 lazy_nan=True, _guard_null_checks=False)
-    assert lazy.count("x87_env_.fpu_sw |= (uint16_t)(") == 0
+    assert lazy.count("x87_sw_ |= (uint16_t)(") == 0
     assert lazy.count("x87_indefinite()") == 1
 
 
@@ -234,4 +234,4 @@ def test_lazy_nan_dropped_value_folds_ie():
     # fld [esi]; fld st0; fsubp; fstp st0; fnstsw ax; mov [ebx],eax; ret
     lazy = emit(function("d906", "d9c0", "dee9", "ddd8", "dfe0", "8903", "c3"), "t",
                 lazy_nan=True, _guard_null_checks=False)
-    assert lazy.count("x87_env_.fpu_sw |= (uint16_t)(") == 1
+    assert lazy.count("x87_sw_ |= (uint16_t)(") == 1

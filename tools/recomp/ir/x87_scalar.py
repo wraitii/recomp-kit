@@ -5,9 +5,10 @@ compile-time mapping, not the physical CPU array. Values, exact-integer shadows,
 tags and popped residue are written back before calls, division seams, opaque
 effects and exits. In performance mode the tracker also carries unpublished
 state across internal CFG edges as a fixed-point join shape (`x87_carry.py`);
-strict mode keeps publishing at every edge. Only CW/SW
-helpers use a private nonescaping X86 context; no helper receives it unless its
-recipe accesses those two fields exclusively.
+strict mode keeps publishing at every edge. CW and SW live
+in two scalar locals (`x87_cw_`, `x87_sw_`); helpers take the control word by
+value and the status word by address through always-inlined `_sw` forms, so
+neither local escapes and both stay SSA values instead of stack slots.
 
 This is an instruction-derived representation change, not dead-state removal,
 memory forwarding, a native call ABI or a floating-point approximation.
@@ -176,6 +177,24 @@ def merge_shapes(shapes):
                       any(s.status_dirty for s in known))
 
 
+#: Runtime recipes on the full CPU and their forms on the scalar CW/SW locals.
+SCALAR_ENV = (("fx87_exact(c, ", "fx87_exact_sw(&x87_sw_, "),
+              ("fx87(c, ", "fx87_sw(&x87_sw_, x87_cw_, "),
+              ("fround_cw(c, ", "fround_rc(x87_cw_, "))
+
+
+def scalar_env(expr):
+    """Rewrite a `c`-based x87 recipe onto the scalar CW/SW locals.
+
+    Any `c` argument left after the rewrite would read guest CW/SW that the
+    tracker has not published, so it fails closed instead."""
+    for old, new in SCALAR_ENV:
+        expr = expr.replace(old, new)
+    if "(c," in expr or "(c)" in expr:
+        raise ValueError("x87 recipe still reads the CPU: %s" % expr)
+    return expr
+
+
 class X87Scalar:
     """Track all eight physical residues within a single-entry linear region."""
 
@@ -189,7 +208,7 @@ class X87Scalar:
         self.reset()
 
     def declarations(self):
-        return ["X86 x87_env_;", "uint32_t x87_top_;"]
+        return ["uint16_t x87_cw_;", "uint16_t x87_sw_;", "uint32_t x87_top_;"]
 
     def reset(self):
         self.active = False
@@ -206,8 +225,8 @@ class X87Scalar:
     def _activate(self, lines):
         if not self.active:
             lines.extend(["x87_top_ = c->fpu_top;",
-                          "x87_env_.fpu_cw = c->fpu_cw;",
-                          "x87_env_.fpu_sw = c->fpu_sw;"])
+                          "x87_cw_ = c->fpu_cw;",
+                          "x87_sw_ = c->fpu_sw;"])
             self.active = True
 
     def _temp(self, expr, lines, ctype="double"):
@@ -265,7 +284,7 @@ class X87Scalar:
         if emit_ie:
             # IE is bit 0, so a branchless boolean OR raises it exactly when
             # the value is NaN, mirroring `fx87`'s NaN branch.
-            lines.append("x87_env_.fpu_sw |= (uint16_t)(%s != %s);" % (value, value))
+            lines.append("x87_sw_ |= (uint16_t)(%s != %s);" % (value, value))
             self.status_dirty = True
         if canonical:
             slot.value = self._temp(
@@ -357,7 +376,7 @@ class X87Scalar:
         self.top_dirty = self.top_unknown = False
         self.base = self.low = self.high = self.position
         if self.status_dirty:
-            lines.append("c->fpu_sw = x87_env_.fpu_sw;")
+            lines.append("c->fpu_sw = x87_sw_;")
             self.status_dirty = False
         return lines
 
@@ -390,7 +409,7 @@ class X87Scalar:
             self.top_dirty = self.top_unknown = False
         self.base = self.low = self.high = self.position
         if self.status_dirty:
-            lines.append("c->fpu_sw = x87_env_.fpu_sw;")
+            lines.append("c->fpu_sw = x87_sw_;")
             self.status_dirty = False
         return folded + lines
 
@@ -459,8 +478,8 @@ class X87Scalar:
         when predecessors reached the block from different activations."""
         if not self.active:
             lines.extend(["x87_top_ = c->fpu_top;",
-                          "x87_env_.fpu_cw = c->fpu_cw;",
-                          "x87_env_.fpu_sw = c->fpu_sw;"])
+                          "x87_cw_ = c->fpu_cw;",
+                          "x87_sw_ = c->fpu_sw;"])
             self.active = True
             return
         if self.top != 0:
@@ -551,11 +570,11 @@ class X87Scalar:
                     if narrow and not self.observe_loads:
                         if not value.isidentifier():
                             value = self._temp("(%s)" % value, lines, "double")
-                        value = ("((x87_env_.fpu_cw & 0x300u) == 0u && %s == %s) ? "
-                                 "(float)(%s) : fto_float(&x87_env_, %s)" %
+                        value = ("((x87_cw_ & 0x300u) == 0u && %s == %s) ? "
+                                 "(float)(%s) : fto_float_cw(x87_cw_, %s)" %
                                  (value, value, value, value))
                     else:
-                        value = "fto_float(&x87_env_, %s)" % value
+                        value = "fto_float_cw(x87_cw_, %s)" % value
                 lines.append("wrf%d((uint32_t)%s, %s);" % (bits, address, value))
             if m == "FSTP":
                 # A register copy already carried the value to its destination;
@@ -585,23 +604,23 @@ class X87Scalar:
                 # rounding per op, and defer the IE check/canonicalisation.
                 # The destination slot was an operand, so the pending result
                 # subsumes its old IE, and so does a popped operand.
-                raw = ("fdivz(&x87_env_, %s, %s)" % (lhs, rhs) if operator == "/" else
+                raw = ("fdivz_sw(&x87_sw_, %s, %s)" % (lhs, rhs) if operator == "/" else
                        "%s %s %s" % (lhs, operator, rhs))
                 if narrow and operator in ("+", "-", "*") and not self.observe_loads and self.binary32:
-                    value = ("((x87_env_.fpu_cw & 0x300u) == 0u ? "
+                    value = ("((x87_cw_ & 0x300u) == 0u ? "
                              "(double)((float)(%s) %s (float)(%s)) : %s)" %
                              (lhs, operator, rhs, raw))
                 else:
-                    value = ("((x87_env_.fpu_cw & 0x300u) == 0u ? "
+                    value = ("((x87_cw_ & 0x300u) == 0u ? "
                              "(double)(float)(%s) : (%s))" % (raw, raw))
                 self._set(dst, value, lines, narrow=True, pending=True, subsumed=True)
             else:
-                value = ("fdivz(&x87_env_, %s, %s)" % (lhs, rhs) if operator == "/" else
+                value = ("fdivz_sw(&x87_sw_, %s, %s)" % (lhs, rhs) if operator == "/" else
                          "%s %s %s" % (lhs, operator, rhs))
-                value = "fx87(&x87_env_, %s)" % value
+                value = "fx87_sw(&x87_sw_, x87_cw_, %s)" % value
                 if narrow and operator in ("+", "-", "*") and not self.observe_loads and self.binary32:
-                    value = ("((x87_env_.fpu_cw & 0x300u) == 0u ? "
-                             "fx87_exact(&x87_env_, (double)((float)(%s) %s (float)(%s))) : %s)" %
+                    value = ("((x87_cw_ & 0x300u) == 0u ? "
+                             "fx87_exact_sw(&x87_sw_, (double)((float)(%s) %s (float)(%s))) : %s)" %
                              (lhs, operator, rhs, value))
                 self._set(dst, value, lines, narrow=True)
             self.status_dirty = True
@@ -621,13 +640,13 @@ class X87Scalar:
                     logical = slots[-1] if slots else 1
                     self._fold(logical, lines)
                     other = read(logical)
-                lines.append("%s(&x87_env_, %s, %s);" %
-                             ("fucom" if m.startswith("FU") else "fcom", a, other))
+                lines.append("%s(&x87_sw_, %s, %s);" %
+                             ("fucom_sw" if m.startswith("FU") else "fcom_sw", a, other))
             else:
                 other = (mem(m.startswith("FI")) if memory else
                          "0.0" if m == "FTST" else read(slots[-1] if slots else 1))
-                lines.append("%s(&x87_env_, %s, %s);" %
-                             ("fucom" if m.startswith("FU") else "fcom", read(0), other))
+                lines.append("%s(&x87_sw_, %s, %s);" %
+                             ("fucom_sw" if m.startswith("FU") else "fcom_sw", read(0), other))
             self.status_dirty = True
             for _ in range(2 if m.endswith("PP") else int(m.endswith("P"))):
                 self._drop(lines)
@@ -636,11 +655,11 @@ class X87Scalar:
             if self.lazy_nan and m in ("FABS", "FCHS"):
                 # Sign/payload-sensitive: eager acts on the canonical indefinite.
                 self._fold(0, lines)
-            self._set(0, (x87.UNARY[m] % read(0)).replace("(c,", "(&x87_env_,"), lines,
+            self._set(0, scalar_env(x87.UNARY[m] % read(0)), lines,
                       narrow=narrow, subsumed=self.lazy_nan and m in ("FSQRT", "FRNDINT", "FSIN", "FCOS", "F2XM1"))
             self.status_dirty = True
         elif m in ("FPREM", "FPREM1"):
-            self._set(0, "fprem_common(&x87_env_, %s, %s, %d)" %
+            self._set(0, "fprem_sw(&x87_sw_, %s, %s, %d)" %
                       (read(0), read(1), int(m == "FPREM1")), lines)
             self.status_dirty = True
         elif m == "FXCH":
@@ -659,17 +678,17 @@ class X87Scalar:
         elif m == "FNSTSW" and operands == (("ax", 0),):
             if self.lazy_nan:
                 self._fold_all(lines)
-            lines.append("%s = (uint16_t)((x87_env_.fpu_sw & (uint16_t)~0x3800u) | ((%s) << 11));" %
+            lines.append("%s = (uint16_t)((x87_sw_ & (uint16_t)~0x3800u) | ((%s) << 11));" %
                          (result, self._phys(self.top)))
         elif m in ("FNCLEX", "FCLEX"):
             if self.lazy_nan:
                 # Eager canonicalised before clearing; suppress the IE it cleared.
                 self._fold_all(lines, emit_ie=False)
-            lines.append("x87_env_.fpu_sw &= (uint16_t)~0x80ffu;")
+            lines.append("x87_sw_ &= (uint16_t)~0x80ffu;")
             self.status_dirty = True
         elif m in ("FDECSTP", "FINCSTP"):
             self._move_top(-1 if m == "FDECSTP" else 1)
-            lines.append("x87_env_.fpu_sw &= (uint16_t)~0x0200u;")
+            lines.append("x87_sw_ &= (uint16_t)~0x0200u;")
             self.status_dirty = True
         elif m == "FNOP":
             pass

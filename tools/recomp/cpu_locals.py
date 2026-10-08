@@ -121,7 +121,7 @@ def lower_function(bodies):
     # eager. Bound the remaining live set instead of caching every CPU field.
     candidates = [name for name, count in uses.items() if count >= 3 and
                   (name.startswith("r") or reads[name])]
-    floating = sum(len(re.findall(r"\b(?:fx87|fx87_exact|fcom|fucom|fto_float|fdivz)\(",
+    floating = sum(len(re.findall(r"\b(?:fx87|fx87_exact|fcom|fucom|fto_float|fdivz)(?:_sw|_cw)?\(",
                                  COMMENTS.sub("", "\n".join(body)))) for body in bodies.values())
     # Existing x87 locals can already carry several value/tag/exact tuples.
     # Spend fewer GPR/flag registers alongside them, and leave float-dominated
