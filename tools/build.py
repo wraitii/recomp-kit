@@ -329,9 +329,7 @@ def translation_fingerprint(game_dir, cfg, translate_args):
     The 39k-function pass takes well over a minute, so a repeated
     `--regenerate` with the same inputs should not run it again. The hash
     covers the translator and game configuration, the executable identity,
-    and the listing set; the listings are fingerprinted by name/size/mtime
-    rather than content because re-exporting rewrites mtimes and hashing
-    every listing would cost more than it saves."""
+    and the code map."""
     h = hashlib.sha256()
     h.update(b"recomp-translate-v2\n")
     translator_root = ROOT / "tools/recomp"
@@ -351,19 +349,8 @@ def translation_fingerprint(game_dir, cfg, translate_args):
         from code_map import MAP_FILES
         for name in MAP_FILES:
             h.update(name.encode() + b"\0" + (cfg["code_map_path"] / name).read_bytes())
-    def hash_listings(listings):
-        h.update(str(listings.resolve()).encode() + b"\0")
-        functions_tsv = listings / "functions.tsv"
-        if functions_tsv.is_file():
-            h.update(b"tsv\0" + functions_tsv.read_bytes())
-        for path in sorted((listings / "functions").glob("*.asm")):
-            st = path.stat()
-            h.update(("%s:%d:%d\n" % (path.name, st.st_size, st.st_mtime_ns)).encode())
-
-    hash_listings(cfg["listings_path"])
     for module in cfg["aux_modules"]:
         h.update(b"aux\0" + module["key"].encode())
-        hash_listings(module["listings_path"])
     discovered = translate_args.get("discovered")
     if discovered:
         # Runs append new entries to the same discovery file. Its path alone
@@ -558,10 +545,8 @@ def main():
         # The lock lives at <build root>/recomp/.lock: BuildLock joins build/recomp/.lock onto its argument.
         with buildlock.BuildLock(args.build_root.parent, "tools/build.py"):
             if args.target in NEEDS_GEN and args.regenerate:
-                from code_map import ensure_listings
-                ensure_listings(cfg)
-                if not (cfg["listings_path"] / "functions.tsv").is_file():
-                    parser.error("Translation listings are missing; run tools/setup.py without --link-only")
+                if not cfg.get("code_map_path"):
+                    parser.error("Translation needs the game's code map: set [translate] code_map in game.toml")
                 translate_args = {
                     "allow_table_gaps": args.allow_table_gaps,
                     "allow_unmodelled": args.allow_unmodelled,

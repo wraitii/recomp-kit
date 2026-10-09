@@ -5,6 +5,7 @@ non-returning functions; the PE supplies bytes and imports; SLEIGH supplies
 instruction effects. Nothing here decodes with Capstone or scans for code.
 Unknown control flow fails with a named diagnostic: fix Ghidra and re-export.
 """
+from bisect import bisect_right
 from pathlib import Path
 
 import code_map
@@ -87,6 +88,9 @@ class Program(object):
         self.lifter = Lifter()
         self._instructions = {}
         self._owner = None
+        self._entries = None
+        self._spans = sorted((start, start + size, addr)
+                             for addr, fn in self.functions.items() for start, size, _ in fn.spans)
 
     def instructions(self, addr):
         """[(address, length)] of one function, in address order."""
@@ -115,11 +119,32 @@ class Program(object):
                            for at, _ in self.instructions(addr)}
         return self._owner
 
+    def containing(self, addr):
+        """The function whose span holds `addr`, or None."""
+        k = bisect_right(self._spans, (addr, 1 << 32, 0)) - 1
+        if k >= 0 and addr < self._spans[k][1]:
+            return self._spans[k][2]
+        return None
+
+    def interior_entries(self):
+        """{function: sorted entries inside it}: every entry that is not a function start."""
+        found = {}
+        for addr in self.entries():
+            if addr in self.functions:
+                continue
+            owner = self.containing(addr)
+            if owner is None:
+                raise ProgramError("%08x: entry outside every mapped function; fix Ghidra and re-export" % addr)
+            found.setdefault(owner, []).append(addr)
+        return {owner: sorted(addrs) for owner, addrs in found.items()}
+
     def entries(self):
         """Every address generated code can be entered at, with why.
 
         Function starts, jump-table targets, interior entries Ghidra found
         referenced from elsewhere, and the game's configured entries."""
+        if self._entries is not None:
+            return self._entries
         found = {addr: "function" for addr in self.functions}
         for targets in self.tables.values():
             for target in targets:
@@ -128,6 +153,7 @@ class Program(object):
             found.setdefault(addr, kind)
         for addr in self.configured_entries:
             found.setdefault(addr, "config")
+        self._entries = found
         return found
 
     def body(self, addr):

@@ -101,16 +101,18 @@ def _flag_producer(mnem, ops, flag_offsets):
     if info is None:
         return None
     kind, opc = info
-    for op in reversed(ops):
-        if op.opc != opc or op.out is None:
+    found = None
+    for op in ops:
+        if op.out is None:
             continue
         space, off, size = op.out
-        if space not in ("register", "unique"):
-            continue
         if space == "register" and any((off + n) in flag_offsets for n in range(size)):
+            if op.opc == "INT_EQUAL" and op.ins[1] == ("const", 0, op.ins[0][2]):
+                break
             continue
-        return {"kind": kind, "opc": opc, "size": size, "result": op.out}
-    return None
+        if op.opc == opc and space in ("register", "unique"):
+            found = {"kind": kind, "opc": opc, "size": size, "result": op.out}
+    return found
 
 
 #: Which arithmetic flags a recognised producer defines.  Flags absent are

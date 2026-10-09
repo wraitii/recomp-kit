@@ -27,8 +27,8 @@ lifted instructions are the evidence; no emission is inspected.
 """
 from collections import namedtuple
 
-from .lift import Lifter, LiftError
-from .cfg import FunctionIR, call_graph, function_ir
+from .lift import Lifter
+from .cfg import call_graph
 
 GPRS = ("EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI")
 ARITH_FLAGS = ("CF", "PF", "AF", "ZF", "SF", "OF")
@@ -251,21 +251,23 @@ def _is_return(ins):
     return ins.mnem.upper() == "RET" or any(op.opc == "RETURN" for op in ins.ops)
 
 
-def summarize(fir, callee_lookup, cells=None, prepared=None):
-    """Compute one function's contract from its lifted CFG.
+def prepare(fir):
+    """The callee-independent facts of one lifted body, None unless its CFG is closed.
 
-    ``callee_lookup(target)`` returns a Contract or None for no summary.  The
-    result is conservative when the body is empty, missing its entry or has no
-    path to a return.  ``prepared`` reuses this body's callee-independent facts
-    across fixed-point iterations.
-    """
+    Plain data, so workers can hand it to the process that solves the call graph."""
+    if not fir.insns or not cfg_is_closed(fir):
+        return None
+    cells = mapping()
+    p = _Prepared(fir, cells, _bits(cells))
+    return None if p.entry is None else p
+
+
+def summarize(p, callee_lookup, cells=None):
+    """Compute one function's contract from its prepared facts.
+
+    ``callee_lookup(target)`` returns a Contract or None for no summary."""
     cells = cells or mapping()
     bits = _bits(cells)
-    if not fir.insns:
-        return CONSERVATIVE
-    p = prepared or _Prepared(fir, cells, bits)
-    if p.entry is None:
-        return CONSERVATIVE
     use, defs = dict(p.use), dict(p.defs)
     for i, target in p.call.items():
         if target is None:
@@ -353,66 +355,30 @@ def cfg_is_closed(fir):
     return True
 
 
-def direct_targets(tr, fn):
-    """Direct CALL targets of a decoded function, in instruction order."""
-    out = []
-    for ins in fn.insns:
-        if ins.mnem == "CALL":
-            target = tr.branch_target(ins)
-            if target is not None:
-                out.append(target)
-    return out
-
-
-def analyze(tr, functions, *, analyzable, roots=None, progress=None, lifted=None):
+def analyze(targets, prepared, *, analyzable, roots, progress=None):
     """Contracts for every analyzable body reachable from `roots`.
 
-    `analyzable(addr)` decides which functions have liftable, trustworthy
-    bodies (no SEH, alternate entries, rewrites, hooks or replacements).
-    Functions outside the reachable set or an analyzable closure are not in the
-    result; a call-site lookup that misses them must treat them as
-    ``CONSERVATIVE``.  ``lifted``, when a dict, receives every body lifted here
-    so the caller can reuse it instead of lifting again.  Direct callees are analyzed before callers; recursive
-    components iterate to a fixed point.
+    `targets[addr]` lists a function's direct CALL targets, `prepared[addr]` is
+    its `prepare` result or None, and `analyzable(addr)` decides which
+    functions have trustworthy bodies (no SEH, alternate entries, rewrites,
+    hooks or replacements). Functions outside the reachable set or an
+    analyzable closure are not in the result; a call-site lookup that misses
+    them must treat them as ``CONSERVATIVE``. Direct callees are analyzed
+    before callers; recursive components iterate to a fixed point.
     """
-    by_addr = {fn.addr: fn for fn in functions}
-    targets = {addr: direct_targets(tr, fn) for addr, fn in by_addr.items()}
-    root_list = sorted(roots) if roots is not None else sorted(by_addr)
     needed, stack = set(), []
-    for addr in root_list:
+    for addr in sorted(roots):
         if analyzable(addr) and addr not in needed:
             needed.add(addr)
             stack.append(addr)
-        for target in targets.get(addr, ()):
-            if analyzable(target) and target not in needed:
-                needed.add(target)
-                stack.append(target)
     while stack:
         addr = stack.pop()
         for target in targets.get(addr, ()):
             if analyzable(target) and target not in needed:
                 needed.add(target)
                 stack.append(target)
-
-    lifter = Lifter()
-    firs, dropped = {}, set()
-    for addr in sorted(needed):
-        fn = by_addr.get(addr)
-        if fn is None:
-            dropped.add(addr)
-            continue
-        try:
-            fir = function_ir(tr, lifter, fn)
-        except (LiftError, RecursionError):
-            dropped.add(addr)
-            continue
-        if lifted is not None:
-            lifted[addr] = fir
-        if not cfg_is_closed(fir):
-            dropped.add(addr)
-            continue
-        firs[addr] = fir
-    needed -= dropped
+    firs = {addr: prepared[addr] for addr in needed if prepared.get(addr) is not None}
+    needed &= set(firs)
     cells = mapping()
     contracts = {}
     components = call_graph(sorted(needed),
@@ -433,14 +399,13 @@ def analyze(tr, functions, *, analyzable, roots=None, progress=None, lifted=None
         # and kills.  If the safety cap is hit the result is not a fixed point,
         # and a non-converged may-analysis would under-approximate reads, so
         # fall back to the conservative contract for the whole component.
-        prepared = {a: _Prepared(firs[a], cells, _bits(cells)) for a in comp if a in firs}
         recursive = len(comp) > 1 or any(
             t == comp[0] for t in targets.get(comp[0], ()))
         if not recursive:
             # No call into the component: one pass is the fixed point.
             for addr in comp:
                 if addr in firs:
-                    contracts[addr] = summarize(firs[addr], lookup, cells, prepared[addr])
+                    contracts[addr] = summarize(firs[addr], lookup, cells)
                     done += 1
                     if progress is not None:
                         progress(done, len(needed))
@@ -451,7 +416,7 @@ def analyze(tr, functions, *, analyzable, roots=None, progress=None, lifted=None
             for addr in comp:
                 if addr not in firs:
                     continue
-                new = summarize(firs[addr], lookup, cells, prepared[addr])
+                new = summarize(firs[addr], lookup, cells)
                 current = live.get(addr)
                 if current is None or new.reads != current.reads or new.kills != current.kills:
                     live[addr] = new

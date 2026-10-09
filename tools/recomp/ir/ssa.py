@@ -142,7 +142,8 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
             # Indirect calls must also continue exactly at their own
             # fallthrough; noreturn/tail/alternate-entry shapes stay fallback.
             fall_index = indices.get(ins.addr + ins.length)
-            if fall_index is None or set(fir.succ[i]) != {fall_index}:
+            if not any(op.opc == "TRAP" for op in ins.ops) and (
+                    fall_index is None or set(fir.succ[i]) != {fall_index}):
                 raise SSAError("%08x: indirect call lacks its canonical fallthrough" % ins.addr)
         for op in ins.ops:
             if op.opc == "TAIL":
