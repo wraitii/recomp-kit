@@ -1,0 +1,9 @@
+format=recomp-code-map-v3
+status=complete
+program=LHLogR.dll
+executable_sha256=8cae8abc42b14732d00a979bd6cf3420b0fdc5b030ecfe40365ac5e6993a6afd
+language=x86:LE:32:default
+image_base=10000000
+functions=476
+instructions=25729
+instruction_bytes=75203

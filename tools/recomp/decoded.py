@@ -381,8 +381,8 @@ FCMOVCC = {"FCMOV" + k: COND[v] for k, v in (
 class Image(PE):
     """The program's bytes with a Capstone decoder over them."""
 
-    def __init__(self, path):
-        super().__init__(path)
+    def __init__(self, path, base=None):
+        super().__init__(path, base)
         import capstone
         self.md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
 
@@ -439,7 +439,7 @@ class Image(PE):
         if mnem.startswith("F") and mnem not in self.X87_INT:
             return {4: "float", 8: "double", 10: "extended double"}.get(nbytes)
         return {1: "byte", 2: "word", 4: "dword", 8: "qword",
-                10: "extended double"}.get(nbytes)
+                10: "extended double", 16: "xmmword"}.get(nbytes)
 
     def _op_text(self, ci, op, mnem):
         import capstone.x86_const as X
@@ -456,7 +456,8 @@ class Image(PE):
             # operands. Their mnemonic determines the layout, not a scalar width.
             structured = mnem in ("FNSTENV", "FSTENV", "FLDENV", "FNSAVE", "FSAVE", "FRSTOR")
             if word is None and not structured:
-                raise TranslateError("unknown operand width %d" % op.size)
+                raise TranslateError("%08x: unknown operand width %d for %s" %
+                                     (ci.address, op.size, mnem))
             parts = []
             if op.mem.base:
                 parts.append(ci.reg_name(op.mem.base).upper())

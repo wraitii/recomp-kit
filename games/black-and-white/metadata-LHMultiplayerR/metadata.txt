@@ -1,0 +1,9 @@
+format=recomp-code-map-v3
+status=complete
+program=LHMultiplayerR.dll
+executable_sha256=7b6e099afa2b9f29b4d2a93d2b5810e4b88397d1545783e7a98f43be409ea1d2
+language=x86:LE:32:default
+image_base=10100000
+functions=2645
+instructions=101062
+instruction_bytes=288269

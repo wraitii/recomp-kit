@@ -58,6 +58,7 @@ BUTTON_TARGET_RE = re.compile(
     r"action:(settings|system_keyboard|edit_layout)|none)$")
 HEAP_END = 0x0e000000        # default heap end; reserved low runtime regions start here
 GUEST_SIZE_DEFAULT = 0x10000000   # runtime/x86.h GUEST_SIZE: the arena, 256 MB unless a module needs more
+AUX_REQUIRED_KEYS = ("name", "sha256", "base", "size")
 
 # The production translation profile: every optimization the kit has. load()
 # fills these when a game omits them. fault_state = "exact" gives up the
@@ -293,6 +294,7 @@ def load(game_dir, build_root=None):
     if code_map is not None and (not isinstance(code_map, str) or not code_map):
         raise ValueError("%s: [translate] code_map must be a non-empty path" % source)
     cfg["code_map_path"] = (game_dir / code_map).resolve() if code_map else None
+    cfg["aux_modules"] = load_aux_modules(cfg, game_dir, source)
     # [translate] overrides: a header the generated sources include before they
     # define FN_<addr>, so a game can replace one translated function with a
     # native one (output.py's RECOMP_OVERRIDE_HEADER). Absent by default,
@@ -307,6 +309,31 @@ def load(game_dir, build_root=None):
         cfg["overrides_header"] = path
     validate_guest_layout(cfg, source)
     return cfg
+
+
+def load_aux_modules(cfg, game_dir, source):
+    modules = []
+    guest_size = cfg["game"].get("guest_size", GUEST_SIZE_DEFAULT)
+    for key, entry in sorted(cfg.get("modules", {}).get("aux", {}).items()):
+        missing = [name for name in AUX_REQUIRED_KEYS if name not in entry]
+        if missing:
+            raise ValueError("%s: [modules.aux.%s] missing %s" % (source, key, ", ".join(missing)))
+        base, size = entry["base"], entry["size"]
+        if base % 0x1000 or size <= 0 or base + size > guest_size:
+            raise ValueError("%s: [modules.aux.%s] invalid base or size" % (source, key))
+        if "path" in entry and "original_path" in entry:
+            raise ValueError("%s: [modules.aux.%s] path and original_path conflict" % (source, key))
+        path = (game_dir / entry["path"] if "path" in entry else
+                cfg["build_root"] / "original" / entry.get("original_path", entry["name"]))
+        modules.append({"key": key, "name": entry["name"], "sha256": entry["sha256"],
+                        "base": base, "size": size, "path": path.resolve(),
+                        "code_map_path": (game_dir / entry.get("code_map", "metadata-" + key)).resolve(),
+                        "entry_points": entry.get("entry_points", [])})
+    ordered = sorted(modules, key=lambda module: module["base"])
+    for left, right in zip(ordered, ordered[1:]):
+        if left["base"] + left["size"] > right["base"]:
+            raise ValueError("%s: auxiliary modules overlap" % source)
+    return modules
 
 
 def validate_guest_layout(cfg, source):

@@ -1,8 +1,9 @@
-format=recomp-code-map-v2
+format=recomp-code-map-v3
 status=complete
 program=runblack.exe
 executable_sha256=3f58bc02a6c421b4e66ef08716646bf0e1fa55ab292786edb521d7596ed48aba
+language=x86:LE:32:default
 image_base=00400000
-functions=31139
-instructions=1431272
-instruction_bytes=4620248
+functions=31138
+instructions=1432060
+instruction_bytes=4623215

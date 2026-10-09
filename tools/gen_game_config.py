@@ -82,8 +82,12 @@ def render_header(cfg):
     lines.append("#define RECOMP_STRICT_IMPORTS %d" % int(game["strict_imports"]))
     lines.append("#define RECOMP_INPUT_RELATIVE_MOUSE_CAPTURE %d" % int(cfg["input"]["relative_mouse_capture"]))
     lines.append("#define RECOMP_CD_AUDIO_TRACKS %s" % c_string_list(cfg.get("media", {}).get("cd_tracks", [])))
-    lines.append("#define RECOMP_AUX_MODULE_COUNT 0")
-    lines.append("#define RECOMP_AUX_MODULES {{0, 0, 0, 0u, 0u}}")
+    lines.append("#define RECOMP_AUX_MODULE_COUNT %d" % len(cfg["aux_modules"]))
+    lines.append("#define RECOMP_AUX_MODULES {%s}" % ", ".join(
+        "{%s, %s, %s, %s, %s}" % (c_string(m["name"]), c_string(m["path"].as_posix()),
+                                 c_string(m["sha256"]), c_hex(m["base"]), c_hex(m["size"]))
+        for m in cfg["aux_modules"]) if cfg["aux_modules"] else
+        "#define RECOMP_AUX_MODULES {{0, 0, 0, 0u, 0u}}")
     # One bit per settings-page row, in game_config.SETTINGS_ROWS order.
     mask = sum(1 << i for i, row in enumerate(game_config.SETTINGS_ROWS) if row in cfg["settings"]["rows"])
     lines.append("#define RECOMP_SETTINGS_ROWS 0x%03xu" % mask)
@@ -125,6 +129,7 @@ def render_cmake(cfg):
     lines.append("set(RECOMP_HEAP_BASE %s)" % c_hex(game["heap_base"]))
     lines.append("set(RECOMP_HEAP_END %s)" % c_hex(game["heap_end"]))
     lines.append("set(RECOMP_GUEST_SIZE %s)" % c_hex(game["guest_size"]))
+    lines.append("set(RECOMP_AUX_MODULES %s)" % ";".join(m["key"] for m in cfg["aux_modules"]))
     lines.append("set(RECOMP_STORE_HOOKS %d)" % int(game["store_hooks"]))
     # The generated sources include this header before they define FN_<addr>,
     # which is how a game replaces one translated function with a native one.

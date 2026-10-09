@@ -90,7 +90,7 @@ def linear_lengths(lifter, image, start, size):
     return ''.join('%x' % n for n in lengths)
 
 
-def pack(export_root, executable, out):
+def pack(export_root, executable, out, base=None):
     """Convert an export (names, sizes and every instruction length) into a v3 map.
 
     Lengths stay explicit wherever SLEIGH's linear decode differs from them."""
@@ -101,9 +101,11 @@ def pack(export_root, executable, out):
     metadata = dict(line.split('=', 1) for line in (export_root / 'metadata.txt').read_text().splitlines())
     if metadata.get('format') != EXPORT_FORMAT or metadata.get('status') != 'complete':
         raise ValueError('expected a complete %s export' % EXPORT_FORMAT)
-    image = PE(Path(executable))
+    image = PE(Path(executable), base)
     if hashlib.sha256(Path(executable).read_bytes()).hexdigest() != metadata['executable_sha256']:
         raise ValueError('executable does not match the export')
+    if metadata.get('image_base') != '%08x' % image.base:
+        raise ValueError('export image base does not match the mapped image')
     lifter = Lifter()
     rows = [SPANS_HEADER]
     explicit = 0
@@ -174,8 +176,9 @@ def main():
     parser.add_argument('--pack', type=Path, required=True, metavar='EXPORT_DIR')
     parser.add_argument('--exe', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--base', type=lambda value: int(value, 0))
     args = parser.parse_args()
-    pack(args.pack, args.exe, args.out)
+    pack(args.pack, args.exe, args.out, args.base)
 
 
 if __name__ == '__main__':

@@ -46,7 +46,7 @@ class Context(object):
 
     def __init__(self, settings):
         self.settings = settings
-        self.image = decoded.Image(settings.exe)
+        self.image = decoded.Image(settings.exe, settings.base)
         self.program = Program(settings)
         program = self.program
         self.entries = program.entries()
@@ -271,6 +271,7 @@ def parse_args(argv):
     ap = argparse.ArgumentParser(description="Translate a game from its Ghidra code map.")
     ap.add_argument("--out", required=True, help="where the generated sources go (build/recomp/gen)")
     ap.add_argument("--game", required=True, help="the directory holding game.toml")
+    ap.add_argument("--module", help="translate one [modules.aux] image")
     ap.add_argument("--report", default=None, help="write a JSON stats file")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--jobs", type=int, default=None, help="worker processes (default: all cores)")
@@ -285,7 +286,7 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     started = time.monotonic()
     log = (lambda *a: None) if args.quiet else (lambda *a: print(*a, file=sys.stderr, flush=True))
-    settings = Settings(game_config.load(args.game), args.allow_unmodelled, jobs_for(args.jobs))
+    settings = Settings(game_config.load(args.game), args.allow_unmodelled, jobs_for(args.jobs), args.module)
     ctx = Context(settings)
     settings, program = ctx.settings, ctx.program
     phase("load")
@@ -319,7 +320,7 @@ def main(argv=None):
 
         dangling = sorted((addr, t) for addr, row in scanned.items() for t in row[4])
         if dangling:
-            for addr, t in dangling[:20]:
+            for addr, t in dangling:
                 log("  fn_%08x dispatches to %08x, which is not an entry point" % (addr, t))
             raise TranslateError(
                 "%d literal dispatch targets are not entry points; add them in Ghidra "
@@ -356,9 +357,12 @@ def main(argv=None):
     os.makedirs(args.out, exist_ok=True)
     output.write_funcs_header(args.out, entry_names)
     output.emit_body_chunks(args.out, functions, bodies, entries_by_fn)
-    output.emit_entry_chunks(args.out, entry_names)
+    output.emit_entry_chunks(args.out, entry_names, settings.module)
     symbols = symbol_rows(ctx, entry_names, rows)
-    output.write_table(args.out, entry_names, symbols, call_returns)
+    if settings.module:
+        output.write_module_table(args.out, entry_names, symbols, call_returns, settings.module)
+    else:
+        output.write_table(args.out, entry_names, symbols, call_returns)
     output.write_symbols(
         args.out, str(settings.exe), ctx.image.base, symbols, settings.curated)
     phase("write")

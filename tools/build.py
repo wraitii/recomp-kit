@@ -253,7 +253,9 @@ def android_push_game(command, cfg, build_root):
     staged = Path(build_root) / "android/game"
     if staged.exists():
         shutil.rmtree(staged)
-    count = stage_game_files.stage(source, staged, executable, cfg["bundle"]["exclude"])
+    keep = [m["path"].relative_to(source).as_posix()
+            for m in cfg["aux_modules"] if m["path"].is_relative_to(source)]
+    count = stage_game_files.stage(source, staged, executable, cfg["bundle"]["exclude"], keep)
 
     destination = "/sdcard/Android/data/%s/files" % cfg["game"]["bundle_id"]
     print("Staged %d game files in %s; pushing to %s/game" % (count, staged, destination), flush=True)
@@ -349,6 +351,10 @@ def translation_fingerprint(game_dir, cfg, translate_args):
         from code_map import MAP_FILES
         for name in MAP_FILES:
             h.update(name.encode() + b"\0" + (cfg["code_map_path"] / name).read_bytes())
+        for module in cfg["aux_modules"]:
+            h.update(module["key"].encode() + b"\0" + hashlib.sha256(module["path"].read_bytes()).digest())
+            for name in MAP_FILES:
+                h.update(name.encode() + b"\0" + (module["code_map_path"] / name).read_bytes())
     for key in sorted(translate_args):
         value = translate_args[key]
         h.update(("arg:%s=%s\n" % (key, value if value is not None else "")).encode())
@@ -382,13 +388,22 @@ def publish_generated(build_root, translate):
         temporary.replace(recomp / "symbols.json")
 
 
-def run_translator(stage, game_dir, build_root, allow_unmodelled=None):
+def run_translator(stage, game_dir, build_root, allow_unmodelled=None, aux_modules=()):
     command = [sys.executable, str(ROOT / "tools/recomp/driver.py"), "--out", str(stage),
                "--game", str(game_dir),
                "--report", str(Path(build_root) / "recomp/translate-report.json")]
     if allow_unmodelled:
         command += ["--allow-unmodelled", allow_unmodelled]
     subprocess.run(command, cwd=ROOT, check=True)
+    for module in aux_modules:
+        destination = Path(stage) / ("aux-" + module["key"])
+        destination.mkdir()
+        command = [sys.executable, str(ROOT / "tools/recomp/driver.py"), "--out", str(destination),
+                   "--game", str(game_dir), "--module", module["key"],
+                   "--report", str(Path(build_root) / ("recomp/translate-%s-report.json" % module["key"]))]
+        if allow_unmodelled:
+            command += ["--allow-unmodelled", allow_unmodelled]
+        subprocess.run(command, cwd=ROOT, check=True)
 
 
 def web_site(game_dir, build_root, preset, cfg):
@@ -489,7 +504,7 @@ def main():
                 else:
                     publish_generated(args.build_root,
                                       lambda stage: run_translator(stage, args.game_dir, args.build_root,
-                                                                   args.allow_unmodelled))
+                                                                   args.allow_unmodelled, cfg["aux_modules"]))
                     stamp.parent.mkdir(parents=True, exist_ok=True)
                     temporary = stamp.with_name("translate.stamp.new")
                     temporary.write_text(fingerprint + "\n")

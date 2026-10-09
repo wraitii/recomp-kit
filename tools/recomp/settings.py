@@ -5,7 +5,7 @@ from program import TranslateError
 
 
 class Settings(object):
-    def __init__(self, cfg, allow_unmodelled=None, jobs=1):
+    def __init__(self, cfg, allow_unmodelled=None, jobs=1, module=None):
         translate = cfg["translate"]
         if not cfg.get("code_map_path"):
             raise TranslateError("game.toml [translate] code_map is required")
@@ -15,10 +15,26 @@ class Settings(object):
         self.game_dir = Path(cfg["dir"])
         self.exe = cfg["developer_exe_path"]
         self.code_map = Path(cfg["code_map_path"])
+        self.module = next((m for m in cfg["aux_modules"] if m["key"] == module), None)
+        if module and self.module is None:
+            raise TranslateError("game.toml has no [modules.aux.%s]" % module)
+        self.base = cfg["game"]["image_base"]
+        self.sha256 = cfg["game"]["sha256"]
+        if self.module:
+            self.exe = self.module["path"]
+            self.code_map = self.module["code_map_path"]
+            self.base = self.module["base"]
+            self.sha256 = self.module["sha256"]
+            self.curated = {}
         self.alternate_entries = frozenset(int(a) for a in translate["alternate_entries"])
-        self.configured_entries = self.alternate_entries | frozenset(int(a) for a in translate.get("entry_points", ()))
+        self.configured_entries = (frozenset(self.module["entry_points"]) if self.module else
+                                   self.alternate_entries | frozenset(int(a) for a in translate.get("entry_points", ())))
+        if self.module:
+            self.alternate_entries = frozenset()
         native = translate.get("native")
         self.native_header = native.get("header") if isinstance(native, dict) else None
+        if self.module:
+            self.native_header = None
         self.call_contracts = translate["call_contracts"]
         self.allow_unmodelled = allow_unmodelled
         self.jobs = jobs

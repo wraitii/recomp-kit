@@ -1,0 +1,9 @@
+format=recomp-code-map-v3
+status=complete
+program=wearasr.dll
+executable_sha256=21a58f920fb15797c32ff62274d7328203f47b87ee8dcbcbb87e56112e2737db
+language=x86:LE:32:default
+image_base=10400000
+functions=217
+instructions=10672
+instruction_bytes=30045

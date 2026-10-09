@@ -17,13 +17,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import game_config  # noqa: E402
 
 
-def excluded(relative, patterns):
+def excluded(relative, patterns, keep=()):
     """True when the path's top directory or its file name matches a pattern."""
     parts = relative.parts
+    if relative.as_posix().lower() in {name.lower() for name in keep}:
+        return False
     return any(fnmatch.fnmatch(parts[0], p) or fnmatch.fnmatch(relative.name, p) for p in patterns)
 
 
-def stage(source, dest, executable, exclude):
+def stage(source, dest, executable, exclude, keep=()):
     """Copy changed files only (size and mtime), remove nothing, write .stamp.
     Returns the number of files copied."""
     source, dest = Path(source), Path(dest)
@@ -31,7 +33,7 @@ def stage(source, dest, executable, exclude):
     copied = 0
     for path in sorted(source.rglob("*")):
         relative = path.relative_to(source)
-        if excluded(relative, exclude):
+        if excluded(relative, exclude, keep):
             continue
         target = dest / relative
         if path.is_dir():
@@ -58,7 +60,9 @@ def main():
     parser.add_argument("--dest", type=Path, required=True)
     args = parser.parse_args()
     cfg = game_config.load(args.game_dir)
-    n = stage(args.source, args.dest, cfg["game"]["executable"], cfg["bundle"]["exclude"])
+    keep = [m["path"].relative_to(cfg["developer_exe_path"].parent).as_posix()
+            for m in cfg["aux_modules"] if m["path"].is_relative_to(cfg["developer_exe_path"].parent)]
+    n = stage(args.source, args.dest, cfg["game"]["executable"], cfg["bundle"]["exclude"], keep)
     print("staged %s -> %s (%d files copied)" % (args.source, args.dest, n))
 
 

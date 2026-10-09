@@ -85,7 +85,7 @@ def emit_body_chunks(out, functions, bodies, entries_by_fn):
     return paths
 
 
-def emit_entry_chunks(out, entry_names):
+def emit_entry_chunks(out, entry_names, module=None):
     """Tiny address-named entry thunks own the changing dense dispatch indices.
 
     Native redirects are resolved only by table.c. Editing an override header
@@ -102,9 +102,10 @@ def emit_entry_chunks(out, entry_names):
             # helpers must not invalidate them along with the actual bodies.
             fh.write('/* generated stable entry thunks -- do not edit */\n'
                      '#include <stdint.h>\ntypedef struct X86 X86;\n')
-            fh.write("void recomp_enter(X86 *c, uint32_t index);\n")
+            enter = "recomp_enter_%s" % module["key"] if module else "recomp_enter"
+            fh.write("void %s(X86 *c, uint32_t index);\n" % enter)
             for index, addr in entries:
-                fh.write("void entry_%08x(X86 *c) { recomp_enter(c, %du); }\n" % (addr, index))
+                fh.write("void entry_%08x(X86 *c) { %s(c, %du); }\n" % (addr, enter, index))
         paths.append(str(path))
     return paths
 
@@ -375,6 +376,47 @@ void recomp_unknown_jump(X86 *c, uint32_t target)
     abort();
 }
 """)
+
+
+def write_module_table(out, entry_names, functions, call_returns, module):
+    key = module["key"]
+    prefix = "recomp_%s_" % key
+    with open(os.path.join(out, "table.c"), "w") as fh:
+        fh.write('#include "funcs.h"\n#include "thunks.h"\n\n')
+        fh.write("static const uint32_t %saddrs[] = {\n" % prefix)
+        for addr in entry_names:
+            fh.write("    0x%08xu,\n" % addr)
+        fh.write("};\nstatic const uint32_t %sreturns[] = {\n" % prefix)
+        for addr in call_returns or [0]:
+            fh.write("    0x%08xu,\n" % addr)
+        fh.write("};\nstatic const char *const %snames[] = {\n" % prefix)
+        for symbol in functions:
+            fh.write("    %s,\n" % json.dumps(symbol["name"]))
+        fh.write("};\nstatic void (*const %sbase[])(X86 *) = {\n" % prefix)
+        for addr in entry_names:
+            fh.write("    FN(%08x),\n" % addr)
+        fh.write("};\n")
+        fh.write("static void %srun(X86 *c, uint32_t i) { %sbase[i](c); }\n" % (prefix, prefix))
+        fh.write("static RecompHookFn %shooks[] = {\n" % prefix)
+        for _ in entry_names:
+            fh.write("    %srun,\n" % prefix)
+        fh.write("};\nstatic uint8_t %shooked[%d];\n" % (prefix, len(entry_names)))
+        fh.write("void recomp_enter_%s(X86 *c, uint32_t i)\n{\n" % key)
+        fh.write("    RecompSaved saved_; recomp_save(c, &saved_);\n")
+        fh.write("    recomp_execution_checkpoint();\n")
+        fh.write("    if (recomp_profile_enabled) recomp_profile_push(i);\n")
+        fh.write("    if (%shooked[i]) { x86_cc_settle(c); %shooks[i](c, i); }\n" % (prefix, prefix))
+        fh.write("    else %sbase[i](c);\n" % prefix)
+        fh.write("    if (recomp_profile_enabled) recomp_profile_pop();\n")
+        fh.write("    if (recomp_frame_watch) recomp_check_saved(c, %saddrs[i], &saved_);\n}\n" % prefix)
+        fh.write("static const RecompModule %smodule = {\n" % prefix)
+        fh.write("    %s, 0x%08xu, 0x%08xu,\n" %
+                 (json.dumps(module["name"]), module["base"], module["base"] + module["size"]))
+        fh.write("    %saddrs, %d, %sbase, %shooks, %shooked,\n" %
+                 (prefix, len(entry_names), prefix, prefix, prefix))
+        fh.write("    %sreturns, %d, %snames\n};\n" % (prefix, len(call_returns), prefix))
+        fh.write("__attribute__((constructor)) static void %sregister(void)\n" % prefix)
+        fh.write("{\n    recomp_module_register(&%smodule);\n}\n" % prefix)
 
 
 def write_symbols(out, executable, image_base, functions, curated):

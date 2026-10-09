@@ -20,22 +20,44 @@ class TranslateError(Exception):
 class PE(object):
     """Mapped image bytes, executable ranges and import slots."""
 
-    def __init__(self, path):
+    def __init__(self, path, base=None):
         import pefile
         pe = pefile.PE(str(path), fast_load=True)
-        self.base = pe.OPTIONAL_HEADER.ImageBase
+        preferred = pe.OPTIONAL_HEADER.ImageBase
+        self.base = preferred if base is None else base
         self.size = pe.OPTIONAL_HEADER.SizeOfImage
         data = bytes(pe.get_memory_mapped_image())
-        self.data = (data + bytes(max(0, self.size - len(data))))[:self.size]
+        self.data = bytearray((data + bytes(max(0, self.size - len(data))))[:self.size])
         self.end = self.base + self.size
         reloc = pe.OPTIONAL_HEADER.DATA_DIRECTORY[5]
         self.reloc_dir = (reloc.VirtualAddress, reloc.Size)
+        delta = self.base - preferred
+        if delta:
+            if not reloc.VirtualAddress or not reloc.Size:
+                raise TranslateError("%s: rebased image has no relocation directory" % path)
+            off, end = reloc.VirtualAddress, reloc.VirtualAddress + reloc.Size
+            while off + 8 <= end:
+                page = int.from_bytes(self.data[off:off + 4], "little")
+                block = int.from_bytes(self.data[off + 4:off + 8], "little")
+                if block < 8 or off + block > end:
+                    raise TranslateError("%s: malformed relocation block at %x" % (path, off))
+                for slot in range(off + 8, off + block, 2):
+                    entry = int.from_bytes(self.data[slot:slot + 2], "little")
+                    if entry >> 12 != 3:
+                        continue
+                    site = page + (entry & 0xfff)
+                    if site + 4 > self.size:
+                        raise TranslateError("%s: relocation outside image at %x" % (path, site))
+                    value = int.from_bytes(self.data[site:site + 4], "little")
+                    self.data[site:site + 4] = ((value + delta) & 0xffffffff).to_bytes(4, "little")
+                off += block
+        self.data = bytes(self.data)
         self.exec_ranges = [
             (self.base + s.VirtualAddress,
              self.base + s.VirtualAddress + max(s.Misc_VirtualSize, s.SizeOfRawData))
             for s in pe.sections if s.Characteristics & 0x20000000]
         pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
-        self.iat_names = {imp.address: imp.name.decode("ascii", "replace")
+        self.iat_names = {imp.address + delta: imp.name.decode("ascii", "replace")
                           for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", [])
                           for imp in entry.imports if imp.name}
         pe.close()
@@ -104,13 +126,13 @@ class Body(object):
 class Program(object):
     def __init__(self, settings):
         root = settings.code_map
-        self.pe = PE(settings.exe)
+        self.pe = PE(settings.exe, settings.base)
         self.metadata, spans = code_map.read_map(root)
         actual_hash = hashlib.sha256(settings.exe.read_bytes()).hexdigest()
-        expected_hash = settings.cfg["game"]["sha256"]
+        expected_hash = settings.sha256
         if actual_hash != expected_hash or self.metadata.get("executable_sha256") != actual_hash:
             raise TranslateError("code-map, game.toml and executable SHA-256 do not match")
-        if (self.pe.base != settings.cfg["game"]["image_base"] or
+        if (self.pe.base != settings.base or
                 self.metadata.get("image_base") != "%08x" % self.pe.base):
             raise TranslateError("code-map, game.toml and executable image bases do not match")
         self.tables, self.interior, noreturn, self.noreturn_calls = code_map.read_program(root)

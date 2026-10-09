@@ -1,0 +1,9 @@
+format=recomp-code-map-v3
+status=complete
+program=LanguageR.dll
+executable_sha256=72e5992d7453bc02c7a17d77e60f88cbc610874a2866bb3e644e4f83d45fffae
+language=x86:LE:32:default
+image_base=10700000
+functions=294
+instructions=17022
+instruction_bytes=46559
