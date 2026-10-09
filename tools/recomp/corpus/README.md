@@ -148,6 +148,5 @@ uses scalar x87 stack/environment state with exact outgoing residues and defers
 ordinary read GPR/flag snapshots, retaining diagnostics and complete
 store/call/exit state; `exact` retains pre-load observations, general arithmetic
 and every snapshot. `--corpus-msvc-x87-convention off` restores conservative
-call/return publication. The relaxed policies keep a strict path under
-`RECOMP_NULL_CHECKS=1`, and the report records the selection. See [the IR contracts](../../../docs/ir.md#scalar-x87-and-local-cpu-state).
+call/return publication. The report records the selection. See [the IR contracts](../../../docs/ir.md#scalar-x87-and-local-cpu-state).
 

@@ -107,7 +107,8 @@ extern uint8_t *g_mem;
  * perturbs timing, which is how it was noticed: the game this found a spin in
  * has an intermittent race whose odds moved when the check went in.
  *
- * -DRECOMP_NULL_CHECKS=1 builds it; RECOMP_NULL_FAULTS=1 then arms it. */
+ * -DRECOMP_NULL_CHECKS=1 builds it; RECOMP_NULL_FAULTS=1 then arms it. Translate
+ * such a build with fault_state = "exact" and msvc_x87_convention = false. */
 #if defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS
 #define RECOMP_NULL_GUARD(a, write)                                                                \
     do {                                                                                           \

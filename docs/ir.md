@@ -500,9 +500,9 @@ Policies and where they apply:
 
 Lazy NaN/IE checks (`lazy_nan=True`) are exact and always on in production; the
 `emit` parameter remains so the synthetic checks can compare against the eager
-`fx87`/`fx87_exact` emission. `RECOMP_NULL_CHECKS=1` builds always compile the
-strict forms: `emit` emits a strict/fast `#if` pair whenever any policy is
-relaxed. `emit()` defaults to the production policy except `lazy_nan`, which is
+`fx87`/`fx87_exact` emission. A `RECOMP_NULL_CHECKS=1` build exposes CPU state
+to fault dispatch, so translate it with `fault_state = "exact"` and
+`msvc_x87_convention = false`. `emit()` defaults to the production policy except `lazy_nan`, which is
 opt-in at that layer.
 
 DIVERGENCE(original): [ssa-x87-scalar] interior access faults and store watch

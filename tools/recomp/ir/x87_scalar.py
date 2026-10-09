@@ -15,8 +15,8 @@ memory forwarding, a native call ABI or a floating-point approximation.
 
 Guest loads and stores do not observe x87 state in the kit runtime: the
 watchpoint and DirectDraw dirty tracking read only the address and value, and
-null-check builds, whose fault dispatch exposes the CPU, compile the strict
-form. This is the decoded `x87_locals.py` contract, which also leaves x87 state
+null-check builds, whose fault dispatch exposes the CPU, translate with
+fault_state = "exact". This is the decoded `x87_locals.py` contract, which also leaves x87 state
 unpublished at arena accesses. A runtime that exposes x87 state at accesses
 must use the strict form.
 

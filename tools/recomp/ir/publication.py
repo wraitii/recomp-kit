@@ -16,7 +16,7 @@ def plan(s, successors, fields, *, access_fields=None):
 `fields` groups register lanes by runtime field. LOAD/STORE have read-only CPU
 observers on normal continuation in the current accessor contract: the store
 watchpoint reads only the address and value, and null-check builds, whose fault
-dispatch exposes the CPU, compile the strict form. access_fields (the locals
+dispatch exposes the CPU, translate with fault_state = "exact". access_fields (the locals
 policy) therefore names the only fields published at accesses. DIV32 may
 return through an error handler; it therefore invalidates all publication facts.
 At joins a field is known only if every predecessor published its exit value.

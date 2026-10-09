@@ -358,7 +358,7 @@ CW_CLONE_MAX_GUARDS = 1
 def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=True,
          call_symbols=None, x87_scalar_strict=False, local_state=True, msvc_convention=True,
          lazy_nan=False, lazy_flags=False, resumable_stacks=False, lifter=None,
-         indirect_call_symbol=None, _guard_null_checks=True, facts=None,
+         indirect_call_symbol=None, facts=None,
          call_contracts=None, x87_cw_clone=True):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
@@ -369,13 +369,12 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     dispatch and reloads all tracked state; when None, indirect calls stay a
     whole-function fallback. The defaults are the production policy (scalar x87,
     local CPU state). `x87_scalar_strict=True` keeps pre-load x87 observations and
-    `local_state=False` keeps every pre-access GPR/flag snapshot; null-check
-    builds compile both strict forms, and either can be requested explicitly.
+    `local_state=False` keeps every pre-access GPR/flag snapshot.
 
     `msvc_convention` (the `ir_ssa_msvc_convention` setting) assumes the MSVC
     x87 stack convention at calls and returns: flushes skip popped residue under
     the empty-above-TOP invariant (`x87_scalar.py`). False restores the
-    conservative publication; null-check builds compile it False.
+    conservative publication.
 
     `lazy_nan` (the `ir_ssa_x87_lazy_nan` setting) defers the per-arithmetic
     NaN check and indefinite canonicalisation to sinks and internal CFG edges,
@@ -413,7 +412,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         raise SSAError("invalid C symbol")
     # The register model and operand corrections are immutable across bodies.
     # Reuse the image's SLEIGH context instead of reparsing its specification
-    # for every function and both null-check policy variants.
+    # for every function.
     lifter = lifter if lifter is not None else Lifter()
     try:
         entries = list(dict(call_symbols or {}).items())
@@ -436,21 +435,6 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             or not indirect_call_symbol.isascii()):
         raise SSAError("invalid indirect call symbol %r" % (indirect_call_symbol,))
     x87_statements = x87.statements
-    if optimize and _guard_null_checks and (
-            local_state or not x87_scalar_strict or msvc_convention):
-        # Null-fault dispatch can expose CPU state to guest exception handlers.
-        # Compile the strict observation path whenever that facility is enabled.
-        options = dict(optimize=optimize, publish_changed=publish_changed, wide_registers=wide_registers,
-                       call_symbols=call_symbols, resumable_stacks=resumable_stacks,
-                       lifter=lifter, indirect_call_symbol=indirect_call_symbol,
-                       lazy_nan=lazy_nan, call_contracts=call_contracts,
-                       _guard_null_checks=False)
-        strict = emit(fir, symbol, x87_scalar_strict=True, local_state=False, msvc_convention=False,
-                      lazy_flags=False, **options)
-        fast = emit(fir, symbol, x87_scalar_strict=x87_scalar_strict, local_state=local_state,
-                    msvc_convention=msvc_convention, lazy_flags=lazy_flags, facts=facts,
-                    x87_cw_clone=x87_cw_clone, **options)
-        return "#if defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS\n%s\n#else\n%s\n#endif" % (strict, fast)
     from .x87_scalar import X87Scalar
     msvc_convention = msvc_convention and optimize
     # DIVERGENCE(original): [ssa-x87-convention] FINCSTP/FDECSTP leave a tagged
