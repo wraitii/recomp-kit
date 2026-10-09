@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Implement memory-backed mmioGetInfo, mmioSetInfo and read mmioAdvance with
+  guest cursors and three-argument stdcall cleanup. Disk direct buffering and
+  write advance retain named unsupported diagnostics.
+
 - Remove Populous-only fixture capture, decoder/oracle and mode probes, gameplay
   runner, host integration script, terrain-material generation/rendering,
   built-in menu/settings/animation hooks, entity and sprite decoders, and built-in

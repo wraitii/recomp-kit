@@ -7959,6 +7959,29 @@ static void test_mmio(X86 *c) {
     got = call_import(c, "WINMM.dll", "mmioRead", {h, sample, 4});
     check(got == 4 && (rd32(sample) & 0xff) == 0x11, "mmioRead(samples) -> %u", got);
 
+    check(call_import(c, "WINMM.dll", "mmioSeek", {h, 46, 0}) == 46,
+          "seek to sample bytes for direct access");
+    check(call_import(c, "WINMM.dll", "mmioGetInfo", {h, info, 0}) == 0 &&
+              rd32(info + 0x1c) == riff + 46 && rd32(info + 0x20) == riff + total &&
+              rd32(info + 0x44) == h,
+          "GetInfo exposes guest cursors at current position");
+    check(rd8(rd32(info + 0x1c)) == 0x11, "direct cursor reads first sample");
+    wr32(info + 0x1c, riff + 48);
+    check(call_import(c, "WINMM.dll", "mmioSetInfo", {h, info, 0}) == 0 &&
+              call_import(c, "WINMM.dll", "mmioRead", {h, sample, 1}) == 1 && rd8(sample) == 0x33,
+          "SetInfo commits direct cursor to subsequent reads");
+    wr32(info + 0x1c, riff + total + 1);
+    check(call_import(c, "WINMM.dll", "mmioSetInfo", {h, info, 0}) == 11 &&
+              call_import(c, "WINMM.dll", "mmioSeek", {h, 0, 1}) == 49,
+          "invalid cursor rejected without changing position");
+    wr32(info + 0x1c, riff + total);
+    check(call_import(c, "WINMM.dll", "mmioAdvance", {h, info, 0}) == 0 &&
+              rd32(info + 0x1c) == rd32(info + 0x20),
+          "memory Advance at EOF leaves exhausted cursors");
+    check(call_import(c, "WINMM.dll", "mmioGetInfo", {0, info, 0}) == 11 &&
+              call_import(c, "WINMM.dll", "mmioSetInfo", {h, 0, 0}) == 11,
+          "invalid handle and info rejected");
+
     uint32_t fact = scratch_block(0x14);
     wr32(fact + 0x00, 0x74636166); // ckid = 'fact'
     d = call_import(c, "WINMM.dll", "mmioDescend", {h, fact, parent, 0x10});

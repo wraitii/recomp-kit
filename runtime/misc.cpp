@@ -1814,6 +1814,85 @@ void m_mmioOpenA(X86 *c) {
     set_eax(c, h);
 }
 
+// Direct buffer access for FOURCC_MEM. All cursors remain guest addresses.
+// Disk buffering and custom I/O procedures are not implemented here and retain
+// the import's named unsupported diagnostic rather than reporting false success.
+void m_mmioGetInfo(X86 *c) {
+    uint32_t h = arg(c, 0), info = arg(c, 1);
+    auto it = mmios().find(h);
+    if (it == mmios().end() || !info || !gm_valid(info, MMIOINFO_SIZE) || arg(c, 2)) {
+        set_eax(c, 11); // MMSYSERR_INVALPARAM
+        return;
+    }
+    MmioFile &f = it->second;
+    if (!f.memory) {
+        imports_unsupported(c);
+        return;
+    }
+    memset(g_mem + info, 0, MMIOINFO_SIZE);
+    wr32(info, f.writable ? 2 : 0); // MMIO_READWRITE / MMIO_READ
+    wr32(info + MMIOINFO_OFF_fccIOProc, FOURCC_MEM);
+    wr32(info + MMIOINFO_OFF_cchBuffer, f.length);
+    wr32(info + MMIOINFO_OFF_pchBuffer, f.buffer);
+    wr32(info + MMIOINFO_OFF_pchNext, f.buffer + std::min(f.pos, f.length));
+    wr32(info + MMIOINFO_OFF_pchEndRead, f.buffer + f.length);
+    wr32(info + MMIOINFO_OFF_pchEndWrite, f.buffer + f.length);
+    wr32(info + 0x30, f.length); // lDiskOffset: end of memory backing
+    wr32(info + 0x44, h);        // hmmio
+    set_eax(c, 0);
+}
+
+void m_mmioSetInfo(X86 *c) {
+    auto it = mmios().find(arg(c, 0));
+    uint32_t info = arg(c, 1);
+    if (it == mmios().end() || !info || !gm_valid(info, MMIOINFO_SIZE) || arg(c, 2)) {
+        set_eax(c, 11);
+        return;
+    }
+    MmioFile &f = it->second;
+    if (!f.memory) {
+        imports_unsupported(c);
+        return;
+    }
+    uint32_t next = rd32(info + MMIOINFO_OFF_pchNext);
+    if (next < f.buffer || next - f.buffer > f.length) {
+        set_eax(c, 11);
+        return;
+    }
+    f.pos = next - f.buffer;
+    set_eax(c, 0);
+}
+
+void m_mmioAdvance(X86 *c) {
+    auto it = mmios().find(arg(c, 0));
+    uint32_t info = arg(c, 1), flags = arg(c, 2);
+    if (it == mmios().end() || (info && !gm_valid(info, MMIOINFO_SIZE)) || flags > 1) {
+        set_eax(c, 11);
+        return;
+    }
+    if (!it->second.memory || flags == 1) {
+        imports_unsupported(c);
+        return;
+    }
+    // A memory file is already wholly buffered: advancing at EOF yields no
+    // new bytes, allowing the caller to detect exhaustion without wrapping.
+    if (info) {
+        uint32_t next = rd32(info + MMIOINFO_OFF_pchNext);
+        if (next < it->second.buffer || next - it->second.buffer > it->second.length) {
+            set_eax(c, 11);
+            return;
+        }
+        it->second.pos = next - it->second.buffer;
+    }
+    it->second.pos = it->second.length;
+    if (info) {
+        // fuAdvance is MMIO_READ (zero), also valid as GetInfo's reserved flag.
+        m_mmioGetInfo(c);
+        return;
+    }
+    set_eax(c, 0);
+}
+
 void m_mmioWrite(X86 *c) {
     auto it = mmios().find(arg(c, 0));
     uint32_t buf = arg(c, 1), n = arg(c, 2);
@@ -2886,6 +2965,9 @@ const ImportShim g_misc_shims[] = {
     {"WINMM.dll", "timeBeginPeriod", 1, m_timeBeginPeriod},
     {"WINMM.dll", "timeEndPeriod", 1, m_timeEndPeriod},
     {"WINMM.dll", "mmioOpenA", 3, m_mmioOpenA},
+    {"WINMM.dll", "mmioGetInfo", 3, m_mmioGetInfo},
+    {"WINMM.dll", "mmioSetInfo", 3, m_mmioSetInfo},
+    {"WINMM.dll", "mmioAdvance", 3, m_mmioAdvance},
     {"WINMM.dll", "mmioRead", 3, m_mmioRead},
     {"WINMM.dll", "mmioSeek", 3, m_mmioSeek},
     {"WINMM.dll", "mmioDescend", 4, m_mmioDescend},
