@@ -1,0 +1,54 @@
+[game]
+id = "ghost-recon"
+name = "Tom Clancy's Ghost Recon"
+app_name = "GhostReconRecomp"
+bundle_id = "dev.recompkit.ghostrecon"
+executable = "GhostRecon.exe"
+sha256 = "78786b4e95fa535bb364154885bc161a92e96dddac18b66716581a8725a9735f"
+image_base = 0x00400000
+entry_point = 0x006f3d14
+guest_root = 'C:\Ghost Recon'
+store_hooks = false
+
+[translate]
+code_map = "metadata"
+entry_scan = false
+# MOV EAX,label; RET in Catch@ funclets hand these continuations to the C++ EH runtime.
+alternate_entries = [
+    0x0040201b,
+    0x004110d8,
+    0x0041a69d,
+    0x0041a77d,
+    0x0041a7db,
+    0x0041a8bd,
+    0x0041a90f,
+    0x0041a9ed,
+    0x0041aacd,
+    0x0041abad,
+    0x0041ac97,
+    0x0041acf3,
+    0x0041ad3f,
+    0x00572ebf,
+]
+native = { header = "native/ghost_recon_native.h", sources = [
+    "native/projection_cull/projection_cull.c",
+    "native/projection_cull/projection_build.c",
+    "native/ray_triangles/ray_triangles.c",
+    "native/scene_post/scene_post.c",
+    "native/port_tab/port_tab_logic.c",
+    "native/port_tab/port_tab_rewrite.c",
+    "native/port_tab/port_tab.c",
+] }
+
+[render]
+d3d8_wgpu = true
+
+[input]
+relative_mouse_capture = true
+
+[settings]
+rows = ["window", "performance_overlay", "controls"]
+
+[controls]
+default_layout = "hidden"
+pad = "off"

@@ -1,0 +1,9 @@
+format=recomp-code-map-v2
+status=complete
+program=GhostRecon.exe
+executable_sha256=78786b4e95fa535bb364154885bc161a92e96dddac18b66716581a8725a9735f
+language=x86:LE:32:default
+image_base=00400000
+functions=38966
+instructions=1278764
+instruction_bytes=4318041
