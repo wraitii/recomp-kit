@@ -138,6 +138,17 @@ class Lifter(object):
         vn = self.ctx.registers[name]
         return ("register", vn.offset, vn.size)
 
+    def lengths(self, addr, data):
+        """Instruction lengths SLEIGH decodes across `data`, which it must tile exactly."""
+        try:
+            marks = [op.inputs[0].size for op in self.ctx.translate(data, addr).ops
+                     if op.opcode == pypcode.OpCode.IMARK]
+        except Exception as e:
+            raise LiftError("%08x: SLEIGH decode failed: %s" % (addr, e))
+        if sum(marks) != len(data):
+            raise LiftError("%08x: SLEIGH decodes %d of %d bytes" % (addr, sum(marks), len(data)))
+        return marks
+
     def lift(self, addr, data, mnem=None):
         """Lift exactly `data` (one listed instruction) at guest `addr`.
 

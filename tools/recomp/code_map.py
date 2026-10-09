@@ -1,9 +1,10 @@
 """Decode public instruction-location metadata using the owner's private PE.
 
 A map holds function spans (start and byte count) and, only where a linear
-Capstone decode disagrees with the analysis boundaries, explicit instruction
-lengths. The resulting assembly listings are local build inputs, never
-publication artifacts.
+decode disagrees with the analysis boundaries, explicit instruction lengths,
+plus recovered jump tables, interior entries and non-returning functions.
+Addresses only: no names, bytes or instruction text. The resulting assembly
+listings are local build inputs, never publication artifacts.
 
     code_map.py --pack V1_DIR --exe GAME.EXE --out MAP_DIR
 """
@@ -15,9 +16,15 @@ import shutil
 import sys
 import tempfile
 
-MAP_FILES = ('metadata.txt', 'spans.tsv')
-FORMAT = 'recomp-code-map-v2'
+MAP_FILES = ('metadata.txt', 'spans.tsv', 'tables.tsv', 'entries.tsv', 'noreturn.tsv')
+FORMAT = 'recomp-code-map-v3'
+EXPORT_FORMAT = 'recomp-code-map-v3-export'
 SPANS_HEADER = 'function\tstart\tbytes\tlengths'
+TABLES_HEADER = 'function\tsite\ttargets'
+ENTRIES_HEADER = 'address\towner\tkind'
+NORETURN_HEADER = 'address\tkind'
+NORETURN_KINDS = ('function', 'call')
+ENTRY_KINDS = ('branch', 'data', 'table')
 
 
 def read_map(root):
@@ -51,6 +58,32 @@ def read_map(root):
     return metadata, functions
 
 
+def read_rows(root, name, header):
+    rows = (Path(root) / name).read_text().splitlines()
+    if not rows or rows[0] != header:
+        raise ValueError('invalid code-map header in ' + name)
+    return [row.split('\t') for row in rows[1:]]
+
+
+def read_program(root):
+    """Everything a map says about control flow, beyond the spans.
+
+    Returns tables {(function, site): [targets]}, entries {address: (owner, kind)}
+    the non-returning function entries and the CALL sites Ghidra ends flow at."""
+    tables = {}
+    for function, site, targets in read_rows(root, 'tables.tsv', TABLES_HEADER):
+        tables[int(function, 16), int(site, 16)] = [int(t, 16) for t in targets.split(',')]
+    entries = {}
+    for address, owner, kind in read_rows(root, 'entries.tsv', ENTRIES_HEADER):
+        if kind not in ENTRY_KINDS:
+            raise ValueError('invalid code-map entry kind: ' + kind)
+        entries[int(address, 16)] = (int(owner, 16), kind)
+    noreturn = {kind: set() for kind in NORETURN_KINDS}
+    for address, kind in read_rows(root, 'noreturn.tsv', NORETURN_HEADER):
+        noreturn[kind].add(int(address, 16))
+    return tables, entries, noreturn['function'], noreturn['call']
+
+
 def linear_lengths(image, start, size):
     """Capstone's instruction lengths across a span, or None where it cannot tile it exactly."""
     raw = image.data[start - image.base:start - image.base + size]
@@ -60,30 +93,45 @@ def linear_lengths(image, start, size):
     return ''.join('%x' % n for n in lengths)
 
 
-def pack(v1_root, executable, out):
-    """Convert a v1 export (names, sizes and every instruction length) into a v2 map."""
+def pack(export_root, executable, out):
+    """Convert an export (names, sizes and every instruction length) into a v3 map.
+
+    Lengths stay explicit wherever Capstone or SLEIGH decodes the span differently."""
     sys.path.insert(0, str(Path(__file__).parent))
     from translate import Image
-    v1_root, out = Path(v1_root), Path(out)
-    metadata = dict(line.split('=', 1) for line in (v1_root / 'metadata.txt').read_text().splitlines())
-    if metadata.get('format') != 'recomp-code-map-v1' or metadata.get('status') != 'complete':
-        raise ValueError('expected a complete recomp-code-map-v1 export')
+    from ir.lift import Lifter, LiftError
+    export_root, out = Path(export_root), Path(out)
+    metadata = dict(line.split('=', 1) for line in (export_root / 'metadata.txt').read_text().splitlines())
+    if metadata.get('format') != EXPORT_FORMAT or metadata.get('status') != 'complete':
+        raise ValueError('expected a complete %s export' % EXPORT_FORMAT)
     image = Image(Path(executable))
     if hashlib.sha256(Path(executable).read_bytes()).hexdigest() != metadata['executable_sha256']:
         raise ValueError('executable does not match the export')
+    lifter = Lifter()
     rows = [SPANS_HEADER]
     explicit = 0
-    for row in (v1_root / 'instruction_map.tsv').read_text().splitlines()[1:]:
+    for row in (export_root / 'instruction_map.tsv').read_text().splitlines()[1:]:
         function, start, lengths = row.split('\t')
         addr = int(start, 16)
         size = sum(int(c, 16) for c in lengths)
-        keep = '' if linear_lengths(image, addr, size) == lengths else lengths
+        try:
+            sleigh = ''.join('%x' % n for n in lifter.lengths(
+                addr, bytes(image.data[addr - image.base:addr - image.base + size])))
+        except LiftError:
+            sleigh = None
+        keep = '' if linear_lengths(image, addr, size) == lengths == sleigh else lengths
         explicit += bool(keep)
         rows.append('%s\t%s\t%d\t%s' % ('' if function == start else function, start, size, keep))
     out.mkdir(parents=True, exist_ok=True)
     metadata['format'] = FORMAT
     (out / 'metadata.txt').write_text(''.join('%s=%s\n' % item for item in metadata.items()))
     (out / 'spans.tsv').write_text('\n'.join(rows) + '\n')
+    for name, header in (('tables.tsv', TABLES_HEADER), ('entries.tsv', ENTRIES_HEADER),
+                         ('noreturn.tsv', NORETURN_HEADER)):
+        body = (export_root / name).read_text().splitlines()
+        if body[0] != header:
+            raise ValueError('invalid export header in ' + name)
+        (out / name).write_text('\n'.join(body) + '\n')
     print('Packed %d spans (%d with explicit lengths) into %s' % (len(rows) - 1, explicit, out))
 
 
@@ -244,7 +292,7 @@ def ensure_listings(cfg):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--pack', type=Path, required=True, metavar='V1_DIR')
+    parser.add_argument('--pack', type=Path, required=True, metavar='EXPORT_DIR')
     parser.add_argument('--exe', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()

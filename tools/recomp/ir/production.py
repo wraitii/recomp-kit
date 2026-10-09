@@ -180,7 +180,8 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
         contracts = analyze_contracts(tr, functions, analyzable=contract_analyzable,
                                       roots=roots, progress=contract_progress, lifted=lifted)
         if not quiet:
-            print("  ir contracts: %d summaries" % len(contracts), flush=True)
+            print("  ir contracts: %d summaries (%.1fs)" % (
+                len(contracts), time.monotonic() - started), flush=True)
     results, reasons, census = {}, Counter(), Counter()
     contract_calls = contract_skipped = 0
     ssa_settles = Counter()
@@ -195,9 +196,12 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
     reasons_by_index = {}
     outcomes = {}
 
+    emit_wait = [0.0]
+
     def flush():
         if not batch:
             return
+        flushed = time.monotonic()
         tasks = [(index, "fn_%08x" % fn.addr, fir, options)
                  for index, fn, fir, options in batch]
         if pool is not None:
@@ -208,6 +212,7 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
                 index, source, reason, facts = _emit_one(task, lifter)
                 outcomes[index] = (source, reason, facts)
         batch.clear()
+        emit_wait[0] += time.monotonic() - flushed
 
     try:
         for index, fn in enumerate(functions, 1):
@@ -314,6 +319,7 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
         "seconds": round(time.monotonic() - started, 3), "per_function": results,
     }
     if not quiet:
-        print("  ir SSA: %d emitted (%.2f%%), %d decoded fallback (%.2f%%)" % (
-            emitted, report["emitted_percent"], total - emitted, report["fallback_percent"]), flush=True)
+        print("  ir SSA: %d emitted (%.2f%%), %d decoded fallback (%.2f%%); contracts+lift %.1fs, emit wait %.1fs" % (
+            emitted, report["emitted_percent"], total - emitted, report["fallback_percent"],
+            report["seconds"] - emit_wait[0], emit_wait[0]), flush=True)
     return report
