@@ -19,8 +19,11 @@ translated locally into `build/recomp/gen/` and are never edited in place.
 | Original graphics API behavior | [DirectX adapters](../dx/README.md) | `Surface_Lock`, `Surface_Unlock`, `Surface_Blt`, `Surface_Flip`, `d3d_upload_texture` |
 | Imports, startup, memory | [Guest runtime](../runtime/README.md) | `loader_load`, `patch_iat`, `imports_dispatch`, `heap_realloc` |
 | Mod lifecycle and hooks | [loader.cpp](../mods/loader.cpp), [hooks.cpp](../mods/hooks.cpp) | `mods_load_all`, `build_api`, `mods_hook_dispatch`, `mods_call_next` |
-| Instruction translation | [translate.py](../tools/recomp/translate.py), [x86.h](../runtime/x86.h) | Instruction emitters and register/flag helpers |
-| Observable region analysis | [IR contracts](ir.md#observable-contract-foundation), [cfg.py](../tools/recomp/ir/cfg.py) | Shared CFG; immutable observations/effects; conservative demand and call-graph solvers |
+| Code map and program model | [code_map.py](../tools/recomp/code_map.py), [program.py](../tools/recomp/program.py) | `pack`, `read_map`, `Program` |
+| Translation driver, chunks, tables | [driver.py](../tools/recomp/driver.py), [output.py](../tools/recomp/output.py), [settings.py](../tools/recomp/settings.py) | `main`, `_emit`, `emit_body_chunks`, `write_table` |
+| Instruction semantics, SSA emission | [IR](ir.md), [ir/emit_c.py](../tools/recomp/ir/emit_c.py), [x86.h](../runtime/x86.h) | `emit`, `production.emit_ssa`; register/flag/x87 helpers |
+| Decoded fallback bodies | [decoded.py](../tools/recomp/decoded.py) | `Translator.translate`, `emit_mmx` |
+| Translator checks | [diff/run.py](../tools/recomp/diff/run.py), [corpus](../tools/recomp/corpus/README.md) | Unicorn comparison; eager/SSA/native corpus |
 | Native replacement validation | [replay.cpp](../mods/native/replay.cpp), [page_track.cpp](../mods/native/page_track.cpp) | `load`, `run`, `translated`, `begin`, `end` |
 
 ## Follow display settings

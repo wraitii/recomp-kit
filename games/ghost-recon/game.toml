@@ -12,7 +12,6 @@ store_hooks = false
 
 [translate]
 code_map = "metadata"
-entry_scan = false
 # MOV EAX,label; RET in Catch@ funclets hand these continuations to the C++ EH runtime.
 alternate_entries = [
     0x0040201b,

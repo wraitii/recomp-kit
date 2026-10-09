@@ -170,7 +170,7 @@ jobs:
         run: cmake --build --preset ${{ matrix.preset }} --target check_binaries
       - name: Link every host against the stub translation
         if: matrix.preset != 'ios-stub'
-        run: cmake --build --preset ${{ matrix.preset }} --target recomp_app pop_headless pop_smoke
+        run: cmake --build --preset ${{ matrix.preset }} --target recomp_app recomp_headless recomp_smoke
       - name: Compile the iOS app against the stub translation (no signing)
         if: matrix.preset == 'ios-stub'
         run: cmake --build --preset ${{ matrix.preset }} --target recomp_app -- CODE_SIGNING_ALLOWED=NO

@@ -78,21 +78,21 @@
       "name": "macos-stub",
       "inherits": "macos",
       "cacheVariables": {
-        "POP_TRANSLATE": "STUB"
+        "RECOMP_TRANSLATE": "STUB"
       }
     },
     {
       "name": "linux-stub",
       "inherits": "linux",
       "cacheVariables": {
-        "POP_TRANSLATE": "STUB"
+        "RECOMP_TRANSLATE": "STUB"
       }
     },
     {
       "name": "windows-stub",
       "inherits": "windows",
       "cacheVariables": {
-        "POP_TRANSLATE": "STUB"
+        "RECOMP_TRANSLATE": "STUB"
       }
     },
     {
@@ -107,7 +107,7 @@
       "name": "windows-cross-stub",
       "inherits": "windows-cross",
       "cacheVariables": {
-        "POP_TRANSLATE": "STUB"
+        "RECOMP_TRANSLATE": "STUB"
       }
     },
     {
@@ -125,7 +125,7 @@
       "name": "web-stub",
       "inherits": "web",
       "cacheVariables": {
-        "POP_TRANSLATE": "STUB"
+        "RECOMP_TRANSLATE": "STUB"
       }
     },
     {
@@ -138,7 +138,7 @@
         "ANDROID_PLATFORM": "android-29",
         "ANDROID_STL": "c++_static",
         "ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES": "ON",
-        "POP_TRANSLATE": "ON"
+        "RECOMP_TRANSLATE": "ON"
       }
     },
     {
@@ -146,7 +146,7 @@
       "inherits": "android",
       "binaryDir": "${sourceDir}/build/cmake/android-stub",
       "cacheVariables": {
-        "POP_TRANSLATE": "STUB"
+        "RECOMP_TRANSLATE": "STUB"
       }
     },
     {
@@ -163,7 +163,7 @@
         "CMAKE_OSX_DEPLOYMENT_TARGET": "17.0",
         "CMAKE_OSX_ARCHITECTURES": "arm64",
         "CMAKE_BUILD_TYPE": "Release",
-        "POP_TRANSLATE": "ON"
+        "RECOMP_TRANSLATE": "ON"
       }
     },
     {
@@ -171,7 +171,7 @@
       "inherits": "ios",
       "binaryDir": "${sourceDir}/build/cmake/ios-stub",
       "cacheVariables": {
-        "POP_TRANSLATE": "STUB"
+        "RECOMP_TRANSLATE": "STUB"
       }
     }
   ],

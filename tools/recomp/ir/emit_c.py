@@ -5,8 +5,7 @@ this emitter alone does not implement hooks, SEH or alternate entries. Original
 interior fault equivalence has not been validated. A direct CALL is emitted
 only when the caller supplies an explicit target-to-symbol binding; otherwise
 it is a whole-function fallback. Optimized bodies lower audited x87 effects
-through the scalar tracker (`x87_scalar.py`); the raw `optimize=False` path uses
-the comparison runtime's ordered helpers directly. Memory uses the
+through the scalar tracker (`x87_scalar.py`). Memory uses the
 existing guest accessors, in instruction order, with explicit state
 publication. No inferred convention permits discarding guest state.
 """
@@ -59,7 +58,7 @@ STRING_HELPERS = _string_helpers()
 # Arithmetic flags tracked by the calling-convention census.
 FLAG_FIELDS = frozenset("c->eflags_" + n for n in ("cf", "pf", "af", "zf", "sf", "of"))
 
-# Call-contract fields.  The mask order is the poison helper's (see x86.h).
+# Call-contract fields.
 CONTRACT_GPRS = ("EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI")
 CONTRACT_FLAGS = ("CF", "PF", "AF", "ZF", "SF", "OF")
 CONTRACT_FIELDS = frozenset(CONTRACT_GPRS) | frozenset(CONTRACT_FLAGS)
@@ -67,17 +66,6 @@ CONTRACT_FIELDS = frozenset(CONTRACT_GPRS) | frozenset(CONTRACT_FLAGS)
 #: contract says the callee overwrites them; never drop their publication.
 CONTRACT_NEVER_SKIP = frozenset(("ESP", "EBP"))
 
-
-def contract_poison_mask(fields):
-    """Bitmask for `RECOMP_CONTRACT_POISON_CALL`: GPRs low, flags high."""
-    mask = 0
-    for index, name in enumerate(CONTRACT_GPRS):
-        if name in fields:
-            mask |= 1 << index
-    for index, name in enumerate(CONTRACT_FLAGS):
-        if name in fields:
-            mask |= 1 << (8 + index)
-    return mask
 
 #: Lazy-flag producers recognised at a seam: (kind, primary p-code opcode).
 #: The primary op must write a non-flag destination.  SUB/CMP, ADD, logic/TEST
@@ -240,10 +228,10 @@ def seh_lines(kind, addr):
     eip = "c->eip = 0x%xu;" % addr
     if kind == "enter":
         return [eip, "{ jmp_buf *b_ = recomp_seh_frame_enter(c); "
-                     "if (setjmp(*b_)) { recomp_seh_land(c); return; } }"]
+                     "if (RECOMP_SETJMP(*b_)) { recomp_seh_land(c); return; } }"]
     if kind == "adopt":
         return [eip, "{ jmp_buf *b_ = recomp_seh_frame_adopt(c); "
-                     "if (b_) { if (setjmp(*b_)) { recomp_seh_land(c); return; } } }"]
+                     "if (b_) { if (RECOMP_SETJMP(*b_)) { recomp_seh_land(c); return; } } }"]
     if kind == "leave":
         return [eip, "recomp_seh_frame_leave(c);"]
     return ["recomp_seh_frame_orphan(c, seh_mark_);"]
@@ -321,7 +309,7 @@ def cc_action_lines(action):
     return ["x86_cc_settle(c);"]
 
 
-def ssa_settle_plan(cgi, flag_off_name, resumable_stacks):
+def ssa_settle_plan(cgi, flag_off_name):
     """Per-site lazy-flag decisions for one SSA body.
 
     Returns ``(entry, calls)``: the decision at the body entry and a mapping
@@ -373,7 +361,7 @@ def ssa_settle_plan(cgi, flag_off_name, resumable_stacks):
         if ins.mnem.upper() != "CALL":
             continue
         after = successors(i)
-        if resumable_stacks or not after:
+        if not after:
             calls[i] = flag_region.SETTLE
         else:
             calls[i] = classify(after[0])
@@ -414,10 +402,8 @@ CW_CLONE_DENSITY = 8
 CW_CLONE_MAX_GUARDS = 1
 
 
-def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=True,
-         call_symbols=None, x87_scalar_strict=False, local_state=True, msvc_convention=True,
-         lazy_nan=False, lazy_flags=False, resumable_stacks=False, lifter=None,
-         indirect_call_symbol=None, facts=None,
+def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state=True,
+         msvc_convention=True, lazy_flags=False, lifter=None, indirect_call_symbol=None,
          call_contracts=None, x87_cw_clone=True, tail_symbols=None):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
@@ -430,17 +416,10 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     local CPU state). `x87_scalar_strict=True` keeps pre-load x87 observations and
     `local_state=False` keeps every pre-access GPR/flag snapshot.
 
-    `msvc_convention` (the `ir_ssa_msvc_convention` setting) assumes the MSVC
+    `msvc_convention` (the `msvc_x87_convention` setting) assumes the MSVC
     x87 stack convention at calls and returns: flushes skip popped residue under
     the empty-above-TOP invariant (`x87_scalar.py`). False restores the
     conservative publication.
-
-    `lazy_nan` (the `ir_ssa_x87_lazy_nan` setting) defers the per-arithmetic
-    NaN check and indefinite canonicalisation to sinks and internal CFG edges,
-    folding IE before any status read or publication. It is a representation
-    change: with it off the emitted body is byte-identical to the eager
-    `fx87`/`fx87_exact` forms. It is ignored by strict x87, the exact flush
-    and `optimize=False`.
 
     `call_contracts` maps a direct-call target address to a contract
     (``reads``/``kills`` field sets, e.g. from ``call_contracts.py``). When
@@ -459,12 +438,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     PC = RC = 0 (the D3D8 single-precision, round-to-nearest control word)
     and fold CW to that constant, then the general clone it falls back to at
     the same activation. It is exact: the guard covers every other CW. Strict
-    x87 and raw emission never clone.
-
-    `facts`, when a dict, receives census facts about the performance body:
-    whether an arithmetic flag is read from the CPU at entry or after a call,
-    and whether the x87 flush kept
-    the exact form. They describe the code; they do not gate emission.
+    x87 never clones.
     """
     arguments = dict(locals())
     if not symbol.isidentifier() or not symbol.isascii():
@@ -493,28 +467,23 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             or not indirect_call_symbol.isidentifier()
             or not indirect_call_symbol.isascii()):
         raise SSAError("invalid indirect call symbol %r" % (indirect_call_symbol,))
-    x87_statements = x87.statements
     from .x87_scalar import X87Scalar
-    msvc_convention = msvc_convention and optimize
     # DIVERGENCE(original): [ssa-x87-convention] FINCSTP/FDECSTP leave a tagged
     # register above TOP, so those functions keep the exact x87 flush.
     x87_convention = msvc_convention and not any(
         ins.mnem.upper().removeprefix("WAIT ") in ("FINCSTP", "FDECSTP") for ins in fir.insns)
     # Lazy NaN needs per-op deferral, so it is off for the exact flush (which
-    # resets at edges), strict x87 and raw emission.
-    defer_ie = lazy_nan and not x87_scalar_strict and msvc_convention
+    # resets at edges) and strict x87.
+    defer_ie = not x87_scalar_strict and msvc_convention
     scalar = X87Scalar(observe_loads=x87_scalar_strict, convention=x87_convention,
-                       lazy_nan=defer_ie) if optimize else None
+                       lazy_nan=defer_ie)
 
     def flush_x87():
-        return scalar.flush() if scalar is not None else []
+        return scalar.flush()
 
     def lower_x87(data, address, result):
-        if scalar is not None:
-            return scalar.statements(data, address, result)
-        return x87_statements(data, address, result)
+        return scalar.statements(data, address, result)
 
-    # Keep a raw-SSA comparison path for measuring the passes independently.
     # Each SLEIGH register byte must map to a known runtime field.
     fields = []
     for index, name in enumerate(("EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI")):
@@ -560,38 +529,35 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     # emitter lowers, so an eager seam or a call boundary is classified the
     # way the generated body actually behaves.
     cc_entry, cc_calls = flag_region.SETTLE, {}
-    if lazy_flags and optimize:
-        cc_entry, cc_calls = ssa_settle_plan(cgi, flag_off_name, resumable_stacks)
+    if lazy_flags:
+        cc_entry, cc_calls = ssa_settle_plan(cgi, flag_off_name)
     s = build(cgi,
-              register_groups=groups if optimize and wide_registers else (),
+              register_groups=groups,
               call_targets=call_symbols, indirect_call_symbol=indirect_call_symbol,
               flag_off_name=flag_off_name)
     if any(key != MEMORY and key not in mapping for key in s.inputs):
         raise SSAError("unmapped runtime register")
-    publications = None
-    if optimize:
-        canonicalize(s)
-        if publish_changed:
-            # DIVERGENCE(original): [ssa-state-locals] guest load/store faults
-            # and store watch callbacks may observe earlier GPR/flag values
-            # under the agreed performance-mode policy. Keep diagnostic
-            # EIP/ESP/EBP eager; division, string helpers, calls and returns
-            # still publish every required field. The strict path keeps all
-            # pre-access snapshots.
-            access_fields = {key for key, (field, _) in mapping.items()
-                             if field in ("c->eip", "c->r[4]", "c->r[5]")} if local_state else None
-            # Compiler conventions do not cover every binary boundary: CRT
-            # assembly helpers can return flags or consume incoming flags.
-            # Keep flag publication at calls/returns until actual call
-            # summaries prove which fields a boundary does not observe.
-            publications = plan(s, fir.succ, groups, access_fields=access_fields)
+    canonicalize(s)
+    # DIVERGENCE(original): [ssa-state-locals] guest load/store faults
+    # and store watch callbacks may observe earlier GPR/flag values
+    # under the agreed performance-mode policy. Keep diagnostic
+    # EIP/ESP/EBP eager; division, string helpers, calls and returns
+    # still publish every required field. The strict path keeps all
+    # pre-access snapshots.
+    access_fields = {key for key, (field, _) in mapping.items()
+                     if field in ("c->eip", "c->r[4]", "c->r[5]")} if local_state else None
+    # Compiler conventions do not cover every binary boundary: CRT
+    # assembly helpers can return flags or consume incoming flags.
+    # Keep flag publication at calls/returns until actual call
+    # summaries prove which fields a boundary does not observe.
+    publications = plan(s, fir.succ, groups, access_fields=access_fields)
     # Cross-function contracts: a direct CALL may omit publication of a field
     # the callee neither reads nor preserves.  A field the callee preserves is
     # not droppable even when this body does not read it back: the field's CPU
     # value can still flow out to this body's own caller, and the publication
     # plan's must-facts may not republish it at RET.
-    contract_skip, contract_guard, contract_roots, contract_stats = {}, {}, [], [0, 0]
-    if optimize and publications is not None and call_contracts:
+    contract_skip, contract_guard, contract_roots = {}, {}, []
+    if call_contracts:
         for b in s.blocks.values():
             for v in b.ops:
                 if v.opc != "CALL":
@@ -608,8 +574,6 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 if not skipped:
                     continue
                 contract_skip[v.id] = skipped
-                contract_stats[0] += 1
-                contract_stats[1] += len(skipped)
                 # A mod hook installed on the callee at runtime observes the
                 # full CPU, so the dropped fields stay publishable behind
                 # recomp_hooks_ever; keep their values live for that path.
@@ -620,13 +584,10 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 contract_roots.extend(state[key] for key in guarded if key in state)
                 publications[v.id] = tuple(
                     key for key in publications[v.id] if lane_field.get(key) not in skipped)
-    if facts is not None:
-        facts["call_contract_calls"] = contract_stats[0]
-        facts["call_contract_fields_skipped"] = contract_stats[1]
     # Decide which seams defer their flags as a descriptor before dead-value
     # elimination, so the descriptor's operands can be kept live as roots.
     cc_plan, cc_roots = {}, []
-    if lazy_flags and optimize and publications is not None:
+    if lazy_flags:
         for b in s.blocks.values():
             for v in b.ops:
                 if v.opc not in EFFECTS and v.opc not in EXITS:
@@ -651,15 +612,9 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                     continue
                 cc_plan[v.id] = (record, mask)
                 cc_roots.extend(x for x in (record.a, record.b, record.res) if x is not None)
-    if optimize:
-        if publications is not None:
-            live = simplify(s, publications, canonical=False, extra_roots=cc_roots + contract_roots)
-        else:
-            live = simplify(s, canonical=False)
-    else:
-        live = {v.id for v in s.values}
+    live = simplify(s, publications, canonical=False, extra_roots=cc_roots + contract_roots)
     reload_live = live
-    if lazy_flags and optimize:
+    if lazy_flags:
         # ``CALL_RELOAD`` is itself a liveness root: the builder emits the
         # callee-state read even when no observation uses its value.  A
         # post-call settle decision cares only about reloads whose value is
@@ -675,7 +630,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         v.opc == "CALL_RELOAD" and v.data in flag_keys and v.id in reload_live
         and s.resolve(v) is v
         for v in s.values)
-    if lazy_flags and optimize and reads_after_call:
+    if lazy_flags and reads_after_call:
         # Only the call whose flag reload is needed materialises the callee's
         # descriptor: that reload reads the fields directly, right after the
         # site's settle.  A call whose flag reload is dead (shadowed by a
@@ -693,17 +648,6 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         # region as REMOVE or DROP while a caller descriptor is still pending,
         # and the later guest read would use a stale field.  Settle first.
         cc_entry = flag_region.SETTLE
-    if facts is not None:
-        facts["flags_read_at_entry"] = reads_entry_flags
-        facts["flags_read_after_call"] = reads_after_call
-        facts["x87_exact_flush"] = msvc_convention and not x87_convention
-        facts["lazy_flags"] = bool(cc_plan)
-        if lazy_flags:
-            facts["cc_settle_entry_%s" % cc_entry] = 1
-            for action in cc_calls.values():
-                key = "cc_settle_postcall_%s" % action
-                facts[key] = facts.get(key, 0) + 1
-
     def ref(v):
         v = s.resolve(v)
         if v.opc in ("CONST", "TARGET"):
@@ -782,7 +726,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
 
     def publish(state, event):
         lines = []
-        required = state if publications is None else publications[event.id]
+        required = publications[event.id]
         cc = cc_plan.get(event.id)
         record = None
         mask = 0
@@ -836,7 +780,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
 
     # Fast CW clone: worth its size only when enough operations read PC/RC.
     cw_sensitive = 0
-    if x87_cw_clone and scalar is not None and not scalar.observe_loads:
+    if x87_cw_clone and not scalar.observe_loads:
         for v in s.values:
             if v.opc not in ("X87_REG", "X87_MEM") or v.id not in live:
                 continue
@@ -852,8 +796,6 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
               if cw_sensitive >= CW_CLONE_MIN_OPS
               and cw_sensitive * CW_CLONE_DENSITY >= len(fir.insns)
               else (None,))
-    if facts is not None:
-        facts["x87_cw_clone"] = clones[0] is not None
     block_label = "F" if clones[0] == "fast" else "B"
 
     lines = ["static void %s(X86 *c, uint32_t entry_) {" % symbol if fir.entries
@@ -862,8 +804,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         if v.id in live and v.size and v.opc not in ("CONST", "TARGET") and s.resolve(v) is v:
             lines.append("uint64_t v%d;" % v.id)
     scalar_declarations = len(lines)
-    if scalar is not None:
-        lines.extend(scalar.declarations())
+    lines.extend(scalar.declarations())
     if lazy_flags:
         lines.extend(cc_action_lines(cc_entry))
     if seh_mark:
@@ -894,7 +835,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         for j in set(fir.succ[i]):
             predecessors[j].add(i)
     scalar_binary32 = set()
-    if scalar is not None and not scalar.observe_loads:
+    if not scalar.observe_loads:
         # A one-operation read/modify/store run does not amortize the precision
         # selector and its extra live representations. Keep its double recipe.
         # Longer linear arithmetic runs retain the proven binary32 path. This
@@ -926,7 +867,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     # Exact-flush functions (msvc_convention=False or FINCSTP/FDECSTP) keep the
     # per-edge flush. Carry only under the MSVC convention, where popped residue
     # may be relaxed; x87_scalar.snapshot() carries all popped parts otherwise.
-    carry_mode = scalar is not None and not scalar.observe_loads and scalar.convention
+    carry_mode = not scalar.observe_loads and scalar.convention
     entry_shape = None
     if carry_mode:
         from .x87_carry import analyze as analyze_carry, assert_covers
@@ -1041,15 +982,13 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 # straight to this label, so it follows the label.
                 if i not in linear_prev:
                     seed_block(entry_shape.get(i))
-            elif scalar is not None and (previous is None or set(fir.succ[previous]) != {i}
-                                         or predecessors[i] != {previous}):
+            elif previous is None or set(fir.succ[previous]) != {i} or predecessors[i] != {previous}:
                 scalar.reset()
             for v in b.ops:
                 if v.opc == "MEMORY":
                     continue
                 if v.opc in ("X87_REG", "X87_MEM"):
-                    if scalar is not None:
-                        scalar.binary32 = v.id in scalar_binary32
+                    scalar.binary32 = v.id in scalar_binary32
                     if v.opc == "X87_MEM":
                         lines.extend(publish(b.snapshots[v.id], v))
                     lines.append("{")
@@ -1058,19 +997,12 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                     lines.append("}")
                 elif v.opc == "CALL":
                     lines.extend(flush_x87())
-                    if scalar is not None:
-                        scalar.reset()
+                    scalar.reset()
                     # Publish every required field before the callee runs, then
                     # invoke only the explicitly bound symbol. The callee receives
                     # the guest return address already stored by the preceding
                     # CALL push, so its own RET owns ESP/EIP restoration.
                     lines.extend(publish(b.snapshots[v.id], v))
-                    if v.id in contract_skip:
-                        # Validation builds poison the killed fields this contract
-                        # dropped; production builds compile the macro to a no-op.
-                        lines.append("RECOMP_CONTRACT_POISON_CALL(c, 0x%xu);"
-                                     % contract_poison_mask(contract_skip[v.id]))
-                    # After poison, so a hooked run sees real values.
                     if contract_guard.get(v.id):
                         guarded = store_fields(b.snapshots[v.id], contract_guard[v.id])
                         lines.append("if (RECOMP_UNLIKELY(recomp_hooks_ever)) {")
@@ -1084,19 +1016,13 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                     if lazy_flags:
                         # A callee (SSA or otherwise) may leave a pending descriptor.
                         lines.extend(cc_action_lines(cc_calls.get(b.index)))
-                    if resumable_stacks:
-                        # Match the eager emitter's resumable-stack contract: a
-                        # callee that diverted EIP did not resume the continuation.
-                        lines.append("if (c->eip != 0x%x) return;" % (
-                            b.insn.addr + b.insn.length))
                 elif v.opc == "CALL_RELOAD":
                     # Complete, callee-agnostic reload of one mapped state field.
                     field, lane = mapping[v.data]
                     lines.append("v%d = (%s >> %d) & %s;" % (v.id, field, lane * 8, mask(v.size)))
                 elif v.opc == "CALLIND":
                     lines.extend(flush_x87())
-                    if scalar is not None:
-                        scalar.reset()
+                    scalar.reset()
                     # Publish the required pre-call state, including the target,
                     # then dispatch through the runtime. The return address was
                     # already stored by the preceding lifted CALL sequence, and the
@@ -1105,13 +1031,9 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                     lines.append("%s(c, (uint32_t)%s);" % (v.data, ref(v.args[1])))
                     if lazy_flags:
                         lines.extend(cc_action_lines(cc_calls.get(b.index)))
-                    if resumable_stacks:
-                        lines.append("if (c->eip != 0x%x) return;" % (
-                            b.insn.addr + b.insn.length))
                 elif v.opc == "STRINGOP":
                     lines.extend(flush_x87())
-                    if scalar is not None:
-                        scalar.reset()
+                    scalar.reset()
                     # Byte-audited string instruction. Publication before the helper
                     # and reloads afterward keep guest memory observers and fault
                     # snapshots in access-then-advance order; the helper owns
@@ -1122,12 +1044,11 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                     # Guest accesses do not observe x87 state (see x87_scalar.py);
                     # only strict mode publishes before them. The division seam
                     # always sees the complete CPU.
-                    if scalar is not None and (scalar.observe_loads or v.opc not in ("LOAD", "STORE")):
+                    if (scalar.observe_loads or v.opc not in ("LOAD", "STORE")):
                         lines.extend(flush_x87())
                     lines.extend(publish(b.snapshots[v.id], v))
                     if v.opc in ("DIV32", "IDIV32"):
-                        if scalar is not None:
-                            scalar.reset()
+                        scalar.reset()
                         helper = "div32" if v.opc == "DIV32" else "idiv32"
                         lines.append("%s(c, (uint32_t)%s, (uint32_t)%s);"
                                      % (helper, ref(v.args[2]), ref(v.args[3])))
@@ -1221,6 +1142,5 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         arguments["x87_cw_clone"] = False
         return emit(**arguments)
     lines.append("}")
-    if scalar is not None:
-        lines[scalar_declarations:scalar_declarations] = scalar.temps
+    lines[scalar_declarations:scalar_declarations] = scalar.temps
     return "\n".join(lines)

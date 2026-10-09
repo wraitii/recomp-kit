@@ -4,6 +4,15 @@
 #include "x86.h"
 #include <setjmp.h>
 
+/* Apple's setjmp saves the signal mask with a syscall; no checkpoint needs it. */
+#ifdef __APPLE__
+#define RECOMP_SETJMP _setjmp
+#define RECOMP_LONGJMP _longjmp
+#else
+#define RECOMP_SETJMP setjmp
+#define RECOMP_LONGJMP longjmp
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

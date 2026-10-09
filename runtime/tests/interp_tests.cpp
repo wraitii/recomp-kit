@@ -3,9 +3,8 @@
 // interp_tests.cpp - the heap-code interpreter (runtime/interp.cpp).
 //
 //   interp_tests               the checks below
-//   interp_tests --run HEX     runs HEX as a routine from the fixed state
-//                              that tools/recomp/tests/test_interp_unicorn.py
-//                              gives Unicorn, and prints the final state
+//   interp_tests --run HEX     runs HEX as a routine from a fixed state and
+//                              prints the final state
 #include "interp.h"
 
 #include <csignal>

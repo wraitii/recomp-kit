@@ -7,7 +7,7 @@ x86 emulator. The loader verifies its hash before mapping any of it.
 
 ```mermaid
 flowchart TD
-  Game[Your local game installation] --> Setup[Verified metadata import and listings]
+  Game[Your local game installation] --> Setup[Verified hash and link]
   Setup --> Translator[Static translator]
   Translator --> Generated[Local generated C archive]
   Generated --> Runtime[Guest memory, imports and scheduler]
@@ -43,23 +43,13 @@ guest stack operations. Replacement headers are compilation dependencies of
 `table.c` only, in addition to native sources that explicitly include them.
 
 Body chunks contain only local callee declarations, with no global function
-census or hook indices. They start in fixed 16 KiB guest-address buckets and
+list or hook indices. They start in fixed 16 KiB guest-address buckets and
 split by address until their emitted bodies fit a 2 MiB source budget.
 Oversized functions, including their alternate entries, stay intact in separate
 files scheduled first by the build. A change can repack its own bucket, but
 cannot move functions across the rest of the image. Dense-index changes can
 still rebuild lightweight entry shards and the table. Shared inline semantics
 in `x86.h` still require recompiling every body that includes that header.
-
-A game that ships part of its code as a DLL can name it in game.toml as an
-auxiliary module (`[modules.aux.<key>]`). The loader maps it beside the image
-at its preferred base, above the shim trampolines, so `[game] guest_size`
-grows the arena to hold it. The translator turns the module into its own
-generated library with prefixed tables that register with the runtime at
-start-up; `recomp_call` and `recomp_jump` consult that registry after the
-image's own table misses, so calls in either direction cross the boundary
-without a special case. `LoadLibrary` of the module's name returns its base
-and `GetProcAddress` reads its export directory, which is all the game sees.
 
 ## Threads and ownership
 
@@ -109,23 +99,16 @@ open the shared settings page through the mod API.
 
 ## Discovery, and code a build does not carry
 
-Static discovery is a guess about where code is, and it misses some: a
+The Ghidra code map is the authority on where code is, and it can miss some: a
 function only ever reached through a pointer nothing resolves, a jump-table
 slot no listing owns, a block Ghidra ended early. Each shows up at run time as
 a call or jump the address table cannot place.
 
-`RECOMP_DISCOVERY=<file>` writes those addresses in the form
-`tools/recomp/translate.py --discovered` reads back as entry points, so a run
-tells the next translation what it missed (`runtime/discovery.h`).
-`tools/discover.py` repeats that until a pass finds nothing new. Meanwhile
-`runtime/interp.cpp` runs what the translation lacks, so a gap costs speed
-rather than correctness.
-
-On the desktop, `tools/lazy_static.py` compiles just the discovered functions
-into a library that registers itself with the runtime's module table
-(`RECOMP_EXTRA_CODE`), which is the difference between a minute and a full
-rebuild. iOS runs no code that was not signed into the app, so there the
-addresses go into `game.toml` and the app is rebuilt.
+`RECOMP_DISCOVERY=<file>` writes those addresses with the instruction that named
+them (`runtime/discovery.h`). They are evidence for the Ghidra analysis: create the
+function or entry there, re-export the code map and regenerate; translation never
+guesses entry points. Meanwhile `runtime/interp.cpp` runs what the translation
+lacks, so a gap costs speed rather than correctness.
 
 ## Current boundaries
 

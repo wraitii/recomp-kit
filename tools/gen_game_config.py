@@ -81,15 +81,9 @@ def render_header(cfg):
     lines.append("#define RECOMP_GUEST_SIZE %s" % c_hex(game["guest_size"]))
     lines.append("#define RECOMP_STRICT_IMPORTS %d" % int(game["strict_imports"]))
     lines.append("#define RECOMP_INPUT_RELATIVE_MOUSE_CAPTURE %d" % int(cfg["input"]["relative_mouse_capture"]))
-    lines.append("#define RECOMP_RESUMABLE_STACKS %d" %
-                 int(cfg["translate"].get("resumable_stacks", False)))
     lines.append("#define RECOMP_CD_AUDIO_TRACKS %s" % c_string_list(cfg.get("media", {}).get("cd_tracks", [])))
-    # Auxiliary modules the loader maps beside the image: {name, developer path, sha256, base, size}.
-    lines.append("#define RECOMP_AUX_MODULE_COUNT %d" % len(cfg["aux_modules"]))
-    lines.append("#define RECOMP_AUX_MODULES {%s}" % ", ".join(
-        '{%s, %s, %s, %s, 0x%08xu}' % (c_string(m["name"]), c_string(m["path"].as_posix()), c_string(m["sha256"]),
-                                        c_hex(m["base"]), m["size"])
-        for m in cfg["aux_modules"]) if cfg["aux_modules"] else "#define RECOMP_AUX_MODULES {{0, 0, 0, 0u, 0u}}")
+    lines.append("#define RECOMP_AUX_MODULE_COUNT 0")
+    lines.append("#define RECOMP_AUX_MODULES {{0, 0, 0, 0u, 0u}}")
     # One bit per settings-page row, in game_config.SETTINGS_ROWS order.
     mask = sum(1 << i for i, row in enumerate(game_config.SETTINGS_ROWS) if row in cfg["settings"]["rows"])
     lines.append("#define RECOMP_SETTINGS_ROWS 0x%03xu" % mask)
@@ -136,7 +130,6 @@ def render_cmake(cfg):
     # which is how a game replaces one translated function with a native one.
     lines.append('set(RECOMP_OVERRIDE_HEADER "%s")'
                  % (cfg["overrides_header"].as_posix() if cfg.get("overrides_header") else ""))
-    lines.append("set(RECOMP_AUX_MODULES %s)" % ";".join(m["key"] for m in cfg["aux_modules"]))
     lines.append('set(RECOMP_DEVELOPER_GAME_DIR "%s")' % cfg["developer_exe_path"].parent.as_posix())
     lines.append('set(RECOMP_DEVELOPER_EXE "%s")' % cfg["developer_exe_path"].as_posix())
     # [translate] native: C replacements for hot functions, compiled with the

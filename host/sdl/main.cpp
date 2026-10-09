@@ -1802,7 +1802,7 @@ int main(int argc, char **argv) {
         g_run_max_seconds = strtod(v, nullptr);
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--version") == 0) {
-            printf(RECOMP_APP_NAME " %s (%s)\n", POP_RECOMP_VERSION, gpu::default_backend_name());
+            printf(RECOMP_APP_NAME " %s (%s)\n", RECOMP_VERSION, gpu::default_backend_name());
             return 0;
         }
         if (strcmp(argv[i], "--probe-layout") == 0) {

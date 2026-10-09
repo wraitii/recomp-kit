@@ -58,36 +58,16 @@ BUTTON_TARGET_RE = re.compile(
     r"action:(settings|system_keyboard|edit_layout)|none)$")
 HEAP_END = 0x0e000000        # default heap end; reserved low runtime regions start here
 GUEST_SIZE_DEFAULT = 0x10000000   # runtime/x86.h GUEST_SIZE: the arena, 256 MB unless a module needs more
-AUX_REQUIRED_KEYS = ("name", "path", "sha256", "base", "size")
 
 # The production translation profile: every optimization the kit has. load()
-# fills these when a game omits them, and translate.py reads the same values as
-# its fallback so a caller that bypasses load (tests, direct driver calls)
-# cannot silently select a different profile. ir_ssa = false translates
-# everything through decoded C; fault_state = "exact" gives up CPU/x87 locals
-# and the relaxed SSA scalar/state policies.
+# fills these when a game omits them. fault_state = "exact" gives up the
+# relaxed SSA scalar/state policies.
 TRANSLATE_DEFAULTS = {
-    "ir_ssa": True,
     "fault_state": "relaxed",
     "msvc_x87_convention": True,
     "call_contracts": True,
     "x87_cw_clone": True,
 }
-
-# Earlier [translate] keys, folded into ir_ssa / fault_state /
-# msvc_x87_convention; naming one is an error that says what replaced it.
-REMOVED_TRANSLATE_KEYS = {
-    "x87_locals": 'use fault_state = "relaxed" (or "exact")',
-    "cpu_locals": 'use fault_state = "relaxed" (or "exact")',
-    "ir_ssa_x87": 'use fault_state = "relaxed" (or "exact")',
-    "ir_ssa_state": 'use fault_state = "relaxed" (or "exact")',
-    "ir_ssa_msvc_convention": "use msvc_x87_convention",
-    "ir_ssa_x87_lazy_nan": "lazy x87 NaN checks are exact and always on",
-    "x87_dataflow": "removed experiment; production uses SSA or decoded C",
-    "x87_stack_forwarding": "removed experiment; production uses SSA or decoded C",
-    "decoded_dataflow": "removed experiment; production uses SSA or decoded C",
-}
-
 
 def add_game_args(parser):
     """--game <id> for a kit game under games/, or --game-dir for any directory holding game.toml."""
@@ -95,7 +75,7 @@ def add_game_args(parser):
     group.add_argument("--game", help="A game under the kit's games/ directory")
     group.add_argument("--game-dir", type=Path, help="The directory holding game.toml")
     parser.add_argument("--build-root", type=Path, default=None,
-                        help="Where outputs, the installation link and listings live")
+                        help="Where outputs, the installation link live")
 
 
 def resolve_game_args(args, default="stub"):
@@ -140,27 +120,6 @@ def validate_heap_base(value, heap_end=HEAP_END):
     if value % 0x1000 or not (0x00400000 < value < heap_end):
         raise ValueError("[game] heap_base %#x must be page aligned and between 0x00400000 and %#x" % (value, heap_end))
     return value
-
-
-def load_translate_intrinsics(translate, source):
-    """Validate optional guest addresses whose translated bodies use runtime intrinsics."""
-    raw = translate.get("intrinsics", {})
-    if not isinstance(raw, dict):
-        raise ValueError("%s: [translate.intrinsics] must be a table" % source)
-    intrinsics = dict(raw)
-    unknown = sorted(set(intrinsics) - {"setjmp", "longjmp"})
-    if unknown:
-        raise ValueError("%s: [translate.intrinsics] may name only setjmp, longjmp, not %s"
-                         % (source, ", ".join(unknown)))
-    for name, address in intrinsics.items():
-        if type(address) is not int or not (1 <= address <= 0xFFFFFFFF):
-            raise ValueError("%s: [translate.intrinsics] %s must be a guest address from 1 through 0xffffffff, not %r"
-                             % (source, name, address))
-    if len(set(intrinsics.values())) != len(intrinsics):
-        raise ValueError("%s: [translate.intrinsics] setjmp and longjmp addresses must be distinct"
-                         % source)
-    translate["intrinsics"] = intrinsics
-    return intrinsics
 
 
 def load_controls(controls, touch, source):
@@ -251,16 +210,6 @@ def load(game_dir, build_root=None):
     if not isinstance(strict_imports, bool):
         raise ValueError("%s: [game] strict_imports must be a boolean" % source)
     translate = cfg.setdefault("translate", {})
-    load_translate_intrinsics(translate, source)
-    resumable = translate.setdefault("resumable_stacks", False)
-    if not isinstance(resumable, bool):
-        raise ValueError("%s: [translate] resumable_stacks must be a boolean" % source)
-    for key, replacement in REMOVED_TRANSLATE_KEYS.items():
-        if key in translate:
-            raise ValueError("%s: [translate] %s was removed; %s" % (source, key, replacement))
-    ssa = translate.setdefault("ir_ssa", TRANSLATE_DEFAULTS["ir_ssa"])
-    if not isinstance(ssa, bool):
-        raise ValueError("%s: [translate] ir_ssa must be a boolean" % source)
     # "relaxed" keeps CPU and x87 state in host locals between observation
     # points, so an interior fault may see stale scratch state (DIVERGENCE
     # tags cpu-locals, ssa-x87-scalar, ssa-state-locals); "exact" publishes it
@@ -282,24 +231,13 @@ def load(game_dir, build_root=None):
     # emits the general body alone.
     if not isinstance(translate.setdefault("x87_cw_clone", TRANSLATE_DEFAULTS["x87_cw_clone"]), bool):
         raise ValueError("%s: [translate] x87_cw_clone must be a boolean" % source)
-    # Entry discovery from the data/immediate scans (`True`, the kit default) adds
-    # function starts and alternate entries that no listing names and no control
-    # flow reaches. `False` trusts the Ghidra listing plus structural evidence
-    # (calls, branches, jump tables, __initterm, SEH, curated entries).
-    if not isinstance(translate.setdefault("entry_scan", True), bool):
-        raise ValueError("%s: [translate] entry_scan must be a boolean" % source)
     alts = translate.setdefault("alternate_entries", [])
     if not isinstance(alts, list) or not all(type(v) is int for v in alts):
         raise ValueError("%s: [translate] alternate_entries must be a list of addresses" % source)
-    alignment = translate.setdefault("function_alignment", 16)
-    if type(alignment) is not int or alignment <= 0:
-        raise ValueError("%s: [translate] function_alignment must be a positive integer" % source)
     tracks = cfg.setdefault("media", {}).setdefault("cd_tracks", [])
     if not isinstance(tracks, list) or not all(isinstance(v, str) for v in tracks):
         raise ValueError("%s: [media] cd_tracks must be a list of strings" % source)
     cfg.setdefault("hooks", {})
-    translate.setdefault("animation_counter", 0)
-    translate.setdefault("volatile_reads", [])
     render = cfg.setdefault("render", {})
     if not isinstance(render.setdefault("d3d8_wgpu", False), bool):
         raise ValueError("%s: [render] d3d8_wgpu must be a boolean" % source)
@@ -351,16 +289,13 @@ def load(game_dir, build_root=None):
     cfg["build_root"] = build_root
     exe = game.get("developer_exe")
     cfg["developer_exe_path"] = ((game_dir / exe) if exe else build_root / "original" / game["executable"]).resolve()
-    listings = translate.get("listings")
-    cfg["listings_path"] = ((game_dir / listings) if listings else
-                            build_root / "recomp/listings" / game["executable"]).resolve()
     code_map = translate.get("code_map")
     if code_map is not None and (not isinstance(code_map, str) or not code_map):
         raise ValueError("%s: [translate] code_map must be a non-empty path" % source)
     cfg["code_map_path"] = (game_dir / code_map).resolve() if code_map else None
     # [translate] overrides: a header the generated sources include before they
     # define FN_<addr>, so a game can replace one translated function with a
-    # native one (translate.py's RECOMP_OVERRIDE_HEADER). Absent by default,
+    # native one (output.py's RECOMP_OVERRIDE_HEADER). Absent by default,
     # and required to exist when named: a path that silently does not resolve
     # would leave the build looking replaced while running the original.
     overrides = translate.get("overrides")
@@ -370,19 +305,11 @@ def load(game_dir, build_root=None):
         if not path.is_file():
             raise ValueError("%s: [translate] overrides names no file: %s" % (source, path))
         cfg["overrides_header"] = path
-    cfg["aux_modules"] = load_aux_modules(cfg, game_dir, source)
+    validate_guest_layout(cfg, source)
     return cfg
 
 
-def load_aux_modules(cfg, game_dir, source):
-    """[modules.aux.<key>]: a DLL the guest loads at run time (LoadLibrary) that
-    the kit translates as a second image and maps at its preferred base, so
-    its code runs as translated code and its exports answer GetProcAddress.
-    Keys: name (the file name the guest asks for), path (developer copy,
-    relative to game.toml), sha256, base and size (the PE's preferred base
-    and SizeOfImage), listings (Ghidra export directory, relative), and
-    function_alignment (default 4). [game] guest_size must reach past every
-    module; the default arena is 0x10000000."""
+def validate_guest_layout(cfg, source):
     game = cfg["game"]
     guest_size = int(game.setdefault("guest_size", GUEST_SIZE_DEFAULT))
     if guest_size % 0x1000 or guest_size < GUEST_SIZE_DEFAULT or guest_size > 0xfffff000:
@@ -397,31 +324,3 @@ def load_aux_modules(cfg, game_dir, source):
     if heap_base < GUEST_SIZE_DEFAULT and heap_end > HEAP_END:
         raise ValueError("%s: [game] heap overlaps reserved runtime memory [%#x, %#x)"
                          % (source, HEAP_END, GUEST_SIZE_DEFAULT))
-    modules = []
-    for key, entry in sorted(cfg.get("modules", {}).get("aux", {}).items()):
-        missing = [k for k in AUX_REQUIRED_KEYS if k not in entry]
-        if missing:
-            raise ValueError("%s: [modules.aux.%s] missing keys: %s" % (source, key, ", ".join(missing)))
-        base, size = int(entry["base"]), int(entry["size"])
-        if base % 0x1000 or size <= 0 or base + size > guest_size:
-            raise ValueError("%s: [modules.aux.%s] base %#x size %#x must fit below guest_size %#x"
-                             % (source, key, base, size, guest_size))
-        if base < heap_end and heap_base < base + size:
-            raise ValueError("%s: [modules.aux.%s] overlaps the guest heap" % (source, key))
-        alignment = entry.get("function_alignment", 4)
-        if type(alignment) is not int or alignment <= 0:
-            raise ValueError("%s: [modules.aux.%s] function_alignment must be a positive integer" % (source, key))
-        entries = entry.get("entry_points", [])
-        if not isinstance(entries, list) or any(type(a) is not int or not base <= a < base + size
-                                               for a in entries):
-            raise ValueError("%s: [modules.aux.%s] entry_points must be addresses inside the module"
-                             % (source, key))
-        modules.append({
-            "key": key, "name": entry["name"], "sha256": entry["sha256"], "base": base, "size": size,
-            "path": (game_dir / entry["path"]).resolve(),
-            "listings_path": ((game_dir / entry["listings"]) if "listings" in entry else
-                              cfg["build_root"] / "recomp/listings" / entry["name"]).resolve(),
-            "function_alignment": alignment,
-            "entry_points": entries,
-        })
-    return modules

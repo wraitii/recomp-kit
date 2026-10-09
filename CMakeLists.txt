@@ -29,43 +29,43 @@ foreach(lang C CXX OBJCXX)
   set(CMAKE_${lang}_FLAGS_DEBUG "-g -O0")
 endforeach()
 
-set(POP_ROOT ${CMAKE_SOURCE_DIR})
-set(POP_TRANSLATE AUTO CACHE STRING "AUTO, ON, OFF or STUB: how targets that need generated code get it")
-set_property(CACHE POP_TRANSLATE PROPERTY STRINGS AUTO ON OFF STUB)
+set(RECOMP_ROOT ${CMAKE_SOURCE_DIR})
+set(RECOMP_TRANSLATE AUTO CACHE STRING "AUTO, ON, OFF or STUB: how targets that need generated code get it")
+set_property(CACHE RECOMP_TRANSLATE PROPERTY STRINGS AUTO ON OFF STUB)
 # Where every output goes: the translation, the texture pack, the apps and the
 # logs. A game outside the kit keeps them beside itself (tools/build.py passes
 # <game-dir>/build); the kit's own builds use build/.
-set(POP_BUILD_ROOT ${POP_ROOT}/build CACHE PATH "Root of build outputs (build/recomp, build/ios, ...)")
+set(RECOMP_BUILD_ROOT ${RECOMP_ROOT}/build CACHE PATH "Root of build outputs (build/recomp, build/ios, ...)")
 # A stub build (no game code) keeps its outputs apart from a real build so it
 # can never overwrite the archive or the bundle a player runs.
-if(ANDROID AND POP_TRANSLATE STREQUAL "STUB")
-  set(POP_BUILD_DIR ${POP_BUILD_ROOT}/android-stub)
+if(ANDROID AND RECOMP_TRANSLATE STREQUAL "STUB")
+  set(RECOMP_BUILD_DIR ${RECOMP_BUILD_ROOT}/android-stub)
 elseif(ANDROID)
-  set(POP_BUILD_DIR ${POP_BUILD_ROOT}/android)
-elseif(IOS AND POP_TRANSLATE STREQUAL "STUB")
-  set(POP_BUILD_DIR ${POP_BUILD_ROOT}/ios-stub)
+  set(RECOMP_BUILD_DIR ${RECOMP_BUILD_ROOT}/android)
+elseif(IOS AND RECOMP_TRANSLATE STREQUAL "STUB")
+  set(RECOMP_BUILD_DIR ${RECOMP_BUILD_ROOT}/ios-stub)
 # Cross builds (the web, Windows from macOS or Linux) keep theirs apart from
 # the machine's own, which share the tree; the translation stays shared.
-elseif(EMSCRIPTEN AND POP_TRANSLATE STREQUAL "STUB")
-  set(POP_BUILD_DIR ${POP_BUILD_ROOT}/web-stub)
+elseif(EMSCRIPTEN AND RECOMP_TRANSLATE STREQUAL "STUB")
+  set(RECOMP_BUILD_DIR ${RECOMP_BUILD_ROOT}/web-stub)
 elseif(EMSCRIPTEN)
-  set(POP_BUILD_DIR ${POP_BUILD_ROOT}/web)
-elseif(WIN32 AND CMAKE_CROSSCOMPILING AND POP_TRANSLATE STREQUAL "STUB")
-  set(POP_BUILD_DIR ${POP_BUILD_ROOT}/windows-stub)
+  set(RECOMP_BUILD_DIR ${RECOMP_BUILD_ROOT}/web)
+elseif(WIN32 AND CMAKE_CROSSCOMPILING AND RECOMP_TRANSLATE STREQUAL "STUB")
+  set(RECOMP_BUILD_DIR ${RECOMP_BUILD_ROOT}/windows-stub)
 elseif(WIN32 AND CMAKE_CROSSCOMPILING)
-  set(POP_BUILD_DIR ${POP_BUILD_ROOT}/windows)
-elseif(POP_TRANSLATE STREQUAL "STUB")
-  set(POP_BUILD_DIR ${POP_BUILD_ROOT}/stub)
+  set(RECOMP_BUILD_DIR ${RECOMP_BUILD_ROOT}/windows)
+elseif(RECOMP_TRANSLATE STREQUAL "STUB")
+  set(RECOMP_BUILD_DIR ${RECOMP_BUILD_ROOT}/stub)
 elseif(IOS)
-  set(POP_BUILD_DIR ${POP_BUILD_ROOT}/ios)
+  set(RECOMP_BUILD_DIR ${RECOMP_BUILD_ROOT}/ios)
 else()
-  set(POP_BUILD_DIR ${POP_BUILD_ROOT})
+  set(RECOMP_BUILD_DIR ${RECOMP_BUILD_ROOT})
 endif()
-set(POP_OUT ${POP_BUILD_DIR}/recomp)
+set(RECOMP_OUT ${RECOMP_BUILD_DIR}/recomp)
 # Static archives are compiler/platform-specific. Shared game outputs can hold
 # both mobile and desktop builds; never let one preset overwrite another's libs.
-set(POP_ARCHIVE_DIR ${CMAKE_BINARY_DIR}/lib)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${POP_OUT})
+set(RECOMP_ARCHIVE_DIR ${CMAKE_BINARY_DIR}/lib)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${RECOMP_OUT})
 
 # tools/build.py passes its own interpreter; a bare configure finds one.
 if(NOT Python3_EXECUTABLE)
@@ -76,7 +76,7 @@ endif()
 # generated/game_config.h (C macros) and generated/game_config.cmake (build
 # names) at configure time; editing the toml reconfigures. The kit's own
 # default is the stub game; real games live in their own repositories.
-set(RECOMP_GAME_DIR ${POP_ROOT}/games/stub CACHE PATH "Directory holding the game.toml this build is for")
+set(RECOMP_GAME_DIR ${RECOMP_ROOT}/games/stub CACHE PATH "Directory holding the game.toml this build is for")
 if(NOT IS_ABSOLUTE ${RECOMP_GAME_DIR})
   message(FATAL_ERROR "RECOMP_GAME_DIR must be absolute: ${RECOMP_GAME_DIR}")
 endif()
@@ -84,13 +84,13 @@ if(NOT EXISTS ${RECOMP_GAME_DIR}/game.toml)
   message(FATAL_ERROR "No game config at ${RECOMP_GAME_DIR}/game.toml")
 endif()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-  ${RECOMP_GAME_DIR}/game.toml ${POP_ROOT}/tools/gen_game_config.py ${POP_ROOT}/tools/game_config.py)
+  ${RECOMP_GAME_DIR}/game.toml ${RECOMP_ROOT}/tools/gen_game_config.py ${RECOMP_ROOT}/tools/game_config.py)
 if(EXISTS ${RECOMP_GAME_DIR}/globals.toml)
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${RECOMP_GAME_DIR}/globals.toml)
 endif()
 execute_process(
-  COMMAND ${Python3_EXECUTABLE} ${POP_ROOT}/tools/gen_game_config.py
-          --game-dir ${RECOMP_GAME_DIR} --build-root ${POP_BUILD_ROOT}
+  COMMAND ${Python3_EXECUTABLE} ${RECOMP_ROOT}/tools/gen_game_config.py
+          --game-dir ${RECOMP_GAME_DIR} --build-root ${RECOMP_BUILD_ROOT}
           --header ${CMAKE_BINARY_DIR}/generated/game_config.h
           --cmake ${CMAKE_BINARY_DIR}/generated/game_config.cmake
   RESULT_VARIABLE RECOMP_GAME_CONFIG_RESULT)
@@ -107,13 +107,6 @@ add_compile_definitions(GUEST_HEAP_BASE=${RECOMP_HEAP_BASE})
 add_compile_definitions(GUEST_HEAP_END=${RECOMP_HEAP_END})
 add_compile_definitions(GUEST_SIZE=${RECOMP_GUEST_SIZE})
 add_compile_definitions(RECOMP_STORE_HOOKS=${RECOMP_STORE_HOOKS})
-# Validation build: generated call sites poison the fields their call contract
-# dropped (tools/build.py --contract-poison). Never on in a shipped build.
-option(RECOMP_CONTRACT_POISON "Poison CPU fields dropped by call contracts" OFF)
-if(RECOMP_CONTRACT_POISON)
-    add_compile_definitions(RECOMP_CONTRACT_POISON=1)
-endif()
-
 # Never fuse a*b+c into an FMA: the x87 helpers and native replacements must
 # round each operation as written, identically on every target. Clang contracts
 # within an expression by default and GCC across statements; cl does not
@@ -128,7 +121,7 @@ endif()
 
 if(IOS)
   set(RECOMP_IOS_TEAM "$ENV{RECOMP_IOS_TEAM}" CACHE STRING "Apple development team for automatic signing")
-  if(RECOMP_IOS_TEAM STREQUAL "" AND NOT POP_TRANSLATE STREQUAL "STUB")
+  if(RECOMP_IOS_TEAM STREQUAL "" AND NOT RECOMP_TRANSLATE STREQUAL "STUB")
     message(FATAL_ERROR "iOS builds need a signing team: set RECOMP_IOS_TEAM or pass tools/build.py --team; "
                         "`security find-identity -v -p codesigning` lists them")
   endif()
@@ -137,16 +130,16 @@ endif()
 # The version is the git description of the commit being built; a tree
 # without git history gets "unknown". The release workflow passes it in.
 find_package(Git QUIET)
-set(POP_RECOMP_VERSION "unknown" CACHE STRING "Version string baked into the hosts")
-if(POP_RECOMP_VERSION STREQUAL "unknown" AND GIT_FOUND)
+set(RECOMP_VERSION "unknown" CACHE STRING "Version string baked into the hosts")
+if(RECOMP_VERSION STREQUAL "unknown" AND GIT_FOUND)
   execute_process(COMMAND ${GIT_EXECUTABLE} describe --tags --always --dirty
-                  WORKING_DIRECTORY ${POP_ROOT} OUTPUT_VARIABLE POP_GIT_DESCRIBE
+                  WORKING_DIRECTORY ${RECOMP_ROOT} OUTPUT_VARIABLE RECOMP_GIT_DESCRIBE
                   OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-  if(POP_GIT_DESCRIBE)
-    set(POP_RECOMP_VERSION ${POP_GIT_DESCRIBE})
+  if(RECOMP_GIT_DESCRIBE)
+    set(RECOMP_VERSION ${RECOMP_GIT_DESCRIBE})
   endif()
 endif()
-configure_file(${POP_ROOT}/host/version.h.in ${CMAKE_BINARY_DIR}/generated/version.h @ONLY)
+configure_file(${RECOMP_ROOT}/host/version.h.in ${CMAKE_BINARY_DIR}/generated/version.h @ONLY)
 
 
 if(NOT IOS AND NOT ANDROID)

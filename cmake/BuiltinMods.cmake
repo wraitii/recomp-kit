@@ -1,11 +1,11 @@
-# pop_builtin_mods(<target> [RESOURCES <dir>]): compile the game's core mods
+# recomp_add_builtin_mods(<target> [RESOURCES <dir>]): compile the game's core mods
 # into <target> for platforms that cannot load a plugin at run time (iOS, the
 # web). Each <mods/core>/<mod>/*.c is built with its entry points renamed to
 # recomp_builtin_<stem>_{abi,init,exit}; a generated table lists them for the
 # loader (mods/builtin_mods.h), which finds a manifest's plugin by its stem.
 # RESOURCES, when given, is where the mods' manifests and assets are copied
 # after the build, so the loader finds the mods at all.
-function(pop_builtin_mods target)
+function(recomp_add_builtin_mods target)
   cmake_parse_arguments(ARG "" "RESOURCES" "" ${ARGN})
   set(core ${RECOMP_GAME_DIR}/mods/core)
   if(NOT EXISTS ${core})
@@ -20,12 +20,12 @@ function(pop_builtin_mods target)
     string(MAKE_C_IDENTIFIER ${stem} id)
     set(lib ${target}_mod_${id})
     add_library(${lib} OBJECT ${src})
-    target_include_directories(${lib} PRIVATE ${POP_ROOT}/mods)
+    target_include_directories(${lib} PRIVATE ${RECOMP_ROOT}/mods)
     target_compile_definitions(${lib} PRIVATE pop_mod_abi=recomp_builtin_${id}_abi
                                               pop_mod_init=recomp_builtin_${id}_init
                                               pop_mod_exit=recomp_builtin_${id}_exit)
     set_target_properties(${lib} PROPERTIES C_STANDARD 11)
-    pop_optimize(${lib} 1)
+    recomp_optimize(${lib} 1)
     target_sources(${target} PRIVATE $<TARGET_OBJECTS:${lib}>)
     string(APPEND decls "extern const PopModAbi recomp_builtin_${id}_abi;\n"
                         "PopModStatus recomp_builtin_${id}_init(const PopModApi *api);\n"
@@ -41,7 +41,7 @@ ${rows}    {0, 0, 0, 0},
 };
 ")
   target_sources(${target} PRIVATE ${table})
-  set_source_files_properties(${table} PROPERTIES INCLUDE_DIRECTORIES ${POP_ROOT}/mods)
+  set_source_files_properties(${table} PROPERTIES INCLUDE_DIRECTORIES ${RECOMP_ROOT}/mods)
   if(ARG_RESOURCES)
     add_custom_command(TARGET ${target} POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_directory ${core} ${ARG_RESOURCES}/mods/core

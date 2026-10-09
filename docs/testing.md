@@ -2,7 +2,6 @@
 
 | Command | Checks | Game needed |
 | --- | --- | --- |
-| `tools/test.py` | Python tooling and translator suites | No |
 | `tools/test.py --native` | Native CTest suites (runtime, DirectX, Metal, controls) | `game`-labelled suites only |
 | `tools/test.py --compile-only` | Native test binaries build | No |
 | `tools/test.py --mods` | Mod loader, hooks and replay against the translated archive | Yes |
@@ -15,8 +14,9 @@ CTest labels: `nogame`, `game`, `gpu`, `device`, `mods`. Run a subset with
 ## Translator checks
 
 `tools/recomp/diff/run.py` compares translated game functions with Unicorn; see
-`AGENTS.md`. `tools/recomp/tests/test_translate_insns.py` does the same for
-synthetic instruction forms the game rarely reaches.
+`AGENTS.md`. The function corpus (`tools/build.py --function-corpus`) compares the
+eager and SSA translations of real game functions; see its
+[README](../tools/recomp/corpus/README.md).
 
 ## Media probes
 

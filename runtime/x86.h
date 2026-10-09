@@ -1,6 +1,6 @@
 /* x86.h - guest CPU state and instruction helpers for the static recompiler.
  *
- * Emitted/owned by tools/recomp/translate.py (Task 1).  The generated C in
+ * Used by the code tools/recomp/driver.py generates.  The generated C in
  * build/recomp/gen/ includes this header, and so does the runtime in
  * runtime/.  Field names are fixed by the m1-recomp plan's
  * "Global constraints" section; do not rename them.
@@ -499,12 +499,10 @@ static inline void recomp_comis(X86 *c, double a, double b) {
 /* Indirect CALL: dispatch `target` to a translated function, an import shim,
  * or recomp_unknown_call.  Generated into build/recomp/gen/table.c. */
 void recomp_call(X86 *c, uint32_t target);
-/* Entry/callback driver for images that switch cooperative guest stacks. */
 void recomp_run(X86 *c, uint32_t target);
 /* Translated call boundaries also schedule guest-only polling loops. Does not
  * alter this thread's CPU; the scheduler keeps guest execution serialized. */
 void recomp_execution_checkpoint(void);
-extern const int recomp_resumable_stacks;
 
 /* RECOMP_WATCH_FRAME=1 reports a guest call that returns with EBP changed.
  * A routine that loses the frame pointer corrupts nothing and crashes nowhere:
@@ -618,9 +616,8 @@ int recomp_is_call_return(uint32_t target);
 
 /* ------------------------------------------------ auxiliary modules -- */
 
-/* A second guest image (a DLL the game loads by name) translated by
- * `translate.py --module <key>` into its own tables. Its table.c registers
- * the module from a constructor; the main image's recomp_call/recomp_jump
+/* Additional translated guest code (RECOMP_EXTRA_CODE libraries). Its table.c
+ * registers the module from a constructor; the main image's recomp_call/recomp_jump
  * fall back to the registry after their own table misses. The runtime
  * loader maps the module's sections at [base, end), and LoadLibrary /
  * GetProcAddress answer from the module's export directory. */
@@ -659,8 +656,6 @@ static inline void recomp_return(X86 *c) {
         recomp_callback_return(c);
         return;
     }
-    if (recomp_resumable_stacks)
-        return;
     if (recomp_is_call_return(c->eip) || recomp_module_is_call_return(c->eip))
         return;
     if ((c->eip >= GUEST_SHIM_BASE && c->eip < GUEST_SHIM_END) || recomp_index_of(c->eip) >= 0 ||
@@ -790,42 +785,6 @@ static inline void x86_cc_canonicalize(X86 *c) {
         c->cc_a = c->cc_b = c->cc_res = 0;
     }
 }
-
-/* --------------------------------------------------- call contract poison */
-
-/* Validation aid for cross-function call contracts.  At a direct call whose
- * contract lets the emitter omit publishing a CPU field, the generated body
- * names the dropped fields in this mask (GPRs in R_EAX..R_EDI order in the low
- * byte, CF/PF/AF/ZF/SF/OF above).  A build with -DRECOMP_CONTRACT_POISON=1
- * overwrites those fields with distinctive garbage before the call, so a wrong
- * reads/kills summary makes the callee observe corrupt input and fails the
- * full-state comparison loudly.  Production builds compile the call away. */
-#if defined(RECOMP_CONTRACT_POISON) && RECOMP_CONTRACT_POISON
-RECOMP_HOT_INLINE void recomp_contract_poison(X86 *c, uint32_t mask) {
-    for (int i = 0; i < 8; ++i)
-        if (mask & (1u << i))
-            c->r[i] = 0xC0DEC0DEu ^ (uint32_t)i;
-    /* The pending descriptor still carries the flags this call publishes;
-     * materialise it so poisoning the dropped ones cannot lose them. */
-    x86_cc_settle(c);
-    x86_cc_canonicalize(c);
-    if (mask & (1u << 8))
-        c->eflags_cf = 0x51u;
-    if (mask & (1u << 9))
-        c->eflags_pf = 0x52u;
-    if (mask & (1u << 10))
-        c->eflags_af = 0x54u;
-    if (mask & (1u << 11))
-        c->eflags_zf = 0x58u;
-    if (mask & (1u << 12))
-        c->eflags_sf = 0x59u;
-    if (mask & (1u << 13))
-        c->eflags_of = 0x5bu;
-}
-#define RECOMP_CONTRACT_POISON_CALL(c, mask) recomp_contract_poison((c), (mask))
-#else
-#define RECOMP_CONTRACT_POISON_CALL(c, mask) ((void)0)
-#endif
 
 /* Bits x86_get_eflags/x86_set_eflags build from the individual fields; every
  * other bit lives in eflags_misc so PUSHFD/POPFD is lossless. */
@@ -1975,7 +1934,7 @@ static inline double fscale(double a, double b) {
 }
 
 /* ----------------------------------------------------------------- MMX ---
- * The MMn registers, as translate.py's MMX_BINARY/MMX_SHIFT emit them. Each
+ * The MMn registers, as decoded.py's MMX_BINARY/MMX_SHIFT emit them. Each
  * helper takes and returns a packed 64-bit register; the lane width is the
  * caller's, so one helper serves every element size of an operation. */
 static inline uint64_t mmx_mask(unsigned bits) {
@@ -2115,6 +2074,12 @@ static inline uint64_t mmx_punpckl(uint64_t a, uint64_t b, unsigned bits) {
 }
 static inline uint64_t mmx_punpckh(uint64_t a, uint64_t b, unsigned bits) {
     return mmx_punpck(a, b, bits, 64 / bits / 2);
+}
+static inline uint64_t mmx_pshufw(uint64_t a, unsigned order) {
+    uint64_t r = 0;
+    for (unsigned i = 0; i < 4; i++)
+        r = mmx_put(r, 16, i, mmx_lane(a, 16, (order >> (2 * i)) & 3));
+    return r;
 }
 static inline uint64_t mmx_pand(uint64_t a, uint64_t b) {
     return a & b;

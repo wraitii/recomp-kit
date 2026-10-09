@@ -67,8 +67,8 @@ mixer can render offline for tests and captures. MIDI music is synthesized
 through the configured SoundFont implementation. Headless execution can
 capture audio without opening an output device.
 
-For scripted runs, `pop_smoke` accepts `--script <path>` (or
-`RECOMP_SCRIPT=<path>`). `pop_headless` and the desktop app accept a timed input
+For scripted runs, `recomp_smoke` accepts `--script <path>` (or
+`RECOMP_SCRIPT=<path>`). `recomp_headless` and the desktop app accept a timed input
 file through `RECOMP_INPUT_SCRIPT=<path>`. `RECOMP_FRAMES=<directory>` selects
 the frame output directory, and `RECOMP_FRAME_EVERY=<n>` controls how often a
 frame is saved. `RECOMP_MAX_FRAMES` and `RECOMP_MAX_SECONDS` set run limits;

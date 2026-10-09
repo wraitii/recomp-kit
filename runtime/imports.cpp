@@ -502,9 +502,14 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     const bool need_desc = trace_filter != nullptr || log_level() >= 2 ||
                            g_call_observer != nullptr || g_return_observer != nullptr ||
                            fn == nullptr || fn == imports_unsupported || argc == ARGC_UNKNOWN;
-    char desc[512] = {};
-    if (need_desc)
-        snprintf(desc, sizeof desc, "%s", tramps()[idx].desc.c_str());
+    char desc[512];
+    desc[0] = 0;
+    if (need_desc) {
+        const std::string &d = tramps()[idx].desc;
+        size_t n = std::min(d.size(), sizeof desc - 1);
+        memcpy(desc, d.data(), n);
+        desc[n] = 0;
+    }
     ++tramps()[idx].calls;
     ++g_import_calls;
 
@@ -662,7 +667,7 @@ void recomp_callback_return(X86 *c) {
         return;
     mods_hooks_unwind_to_esp(call->return_sp);
     recomp_profile_truncate(call->profile_depth);
-    longjmp(call->env, 1);
+    RECOMP_LONGJMP(call->env, 1);
 }
 
 uint32_t guest_call(X86 *c, uint32_t fn, const uint32_t *args, int nargs) {
@@ -681,7 +686,7 @@ uint32_t guest_call(X86 *c, uint32_t fn, const uint32_t *args, int nargs) {
     c->r[R_ESP] = esp;
     call->return_sp = esp;
     callbacks.stack.push_back(call);
-    if (!setjmp(call->env))
+    if (!RECOMP_SETJMP(call->env))
         recomp_run(c, fn);
     recomp_seh_callback_leave(c, recomp_callback_depth());
     uint32_t eax = c->r[R_EAX];

@@ -14,7 +14,6 @@ per-row guest memory ranges. Translation-only rows never fabricate native
 results.
 """
 from pathlib import Path
-from types import SimpleNamespace
 import hashlib
 import csv
 import json
@@ -26,12 +25,16 @@ import subprocess
 import time
 
 import game_config
-import translate as T
-from code_map import read_map, decode_span, expand
+import decoded as T
+from code_map import read_map, decode_span, linear_lengths
+from settings import Settings
+from ir.emit_c import emit
+from ir.lift import Lifter, LiftError
+from ir.ssa import SSAError
 
 HERE = Path(__file__).resolve().parent
 KIT = HERE.parents[2]
-MODES = ('eager', 'cpu', 'x87', 'combined', 'native')
+MODES = ('eager', 'ssa', 'native')
 NATIVE_REFERENCE = 'native-reference'
 TRANSLATION_ONLY = 'translation-only'
 COMPARISONS = (NATIVE_REFERENCE, TRANSLATION_ONLY)
@@ -420,7 +423,7 @@ def markdown(report):
              f"Contract: {report['contract']}.",
              *(["AddressSanitizer build: code sizes include instrumentation and are not comparable."]
                if report.get('asan') else []),
-             f"IR SSA in combined mode: {sum(r.get('ir_ssa', {}).get('emitted', False) for r in report['functions'])} functions emitted; fault state: {report.get('fault_state', 'relaxed')}; per-function fallbacks are in JSON.", '',
+             f"Fault state: {report['fault_state']}.", '',
              'Native is reviewed C plus its ABI adapter; kernel text is also shown separately.',
              'Translation-only rows have no native reference and omit adapter/kernel results entirely.',
              'Translated/native-adapter times include entry reset and indirect-call overhead.',
@@ -431,7 +434,7 @@ def markdown(report):
              (f"Timing: {report['trial_ms']:g} ms budget per eager trial, {report['trials']} rotating trials; "
               "each row's call count is calibrated once and shared by every variant and trial of that row."
               if report.get('trial_ms') else 'Timing: not run.'), '',
-             '| Function | Contract | Original bytes / x87 instructions | Eager bytes | Combined bytes | Native adapter / kernel bytes | Eager / combined / native kernel ns per call | Calls per trial |',
+             '| Function | Contract | Original bytes / x87 instructions | Eager bytes | SSA bytes | Native adapter / kernel bytes | Eager / SSA / native kernel ns per call | Calls per trial |',
              '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |']
     for row in report['functions']:
         def timing(mode):
@@ -445,8 +448,8 @@ def markdown(report):
         kernel_ns = f"{kernel['timing_ns']['median']:.2f}" if kernel and kernel.get('timing_ns') else '—'
         lines.append(f"| {row['address']} {row['name']} | {row.get('comparison', NATIVE_REFERENCE)} | "
                      f"{row['original_bytes']} / {row['x87_instructions']} | "
-                     f"{variants['eager']['span_bytes']} | {variants['combined']['span_bytes']} | "
-                     f"{native_bytes} / {kernel_bytes} | {timing('eager')} / {timing('combined')} / {kernel_ns} | "
+                     f"{variants['eager']['span_bytes']} | {variants['ssa']['span_bytes']} | "
+                     f"{native_bytes} / {kernel_bytes} | {timing('eager')} / {timing('ssa')} / {kernel_ns} | "
                      f"{row.get('calls_per_trial', '—')} |")
     boundary_rows = [row for row in report['functions']
                      if row.get('boundary_stubs') or row.get('indirect_calls')]
@@ -478,24 +481,28 @@ def markdown(report):
     return '\n'.join(lines)
 
 
-def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0, trials=9,
-               ir_ssa=False, fault_state=None, msvc_x87_convention=None, asan=False):
+def expand(image, functions, lifter):
+    expanded = {}
+    for owner, spans in functions.items():
+        filled = []
+        for start, size, lengths in spans:
+            lengths = lengths or linear_lengths(lifter, image, start, size)
+            if lengths is None:
+                raise ValueError('decoder cannot tile code-map span at %08x' % start)
+            filled.append((start, lengths))
+        expanded[owner] = ('FUN_%08x' % owner, sum(span[1] for span in spans), filled)
+    return expanded
+
+
+def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0, trials=9, asan=False):
     """Decode the selected instructions, build isolated variants, validate, report.
 
-    ``fault_state`` ("relaxed" by default with ``ir_ssa``) and
-    ``msvc_x87_convention`` (default True) mirror the ``[translate]`` keys; with
-    the convention the combined column compares with its dead fields cleared
-    (``corpus_convention_canonical``).
+    The SSA variant uses the game's [translate] fault_state and
+    msvc_x87_convention; with the convention it compares with its dead fields
+    cleared (``corpus_convention_canonical``).
     """
     if asan and trial_ms:
         raise ValueError("an AddressSanitizer corpus build is for correctness only; use a zero trial budget")
-    if (fault_state is not None or msvc_x87_convention is not None) and not ir_ssa:
-        raise ValueError("IR SSA fault-state and convention policies require IR SSA")
-    msvc_x87_convention = bool(ir_ssa) and msvc_x87_convention is not False
-    # Plain --ir-ssa is the production policy.
-    fault_state = fault_state or "relaxed"
-    if fault_state not in ("relaxed", "exact"):
-        raise ValueError("IR SSA fault state must be relaxed or exact")
     modes = MODES
     if checks < 1 or trial_ms < 0 or trials < 3:
         raise ValueError('checks must be positive, trial budget nonnegative, trials at least three')
@@ -521,11 +528,15 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
         raise ValueError('corpus requires a public instruction code map')
     metadata, functions = read_map(cfg['code_map_path'])
     validate_code_map_metadata(metadata, cfg)
-    T.configure(cfg)
-    image = T.Image(T.BINARY)
+    image = T.Image(cfg['developer_exe_path'])
     if image.base != cfg['game']['image_base']:
         raise ValueError('decoded executable image base mismatch')
-    functions = expand(image, functions)
+    functions = expand(image, functions, Lifter())
+    settings = Settings(cfg)
+    fault_state = cfg['translate']['fault_state']
+    msvc_x87_convention = settings.emit['msvc_convention']
+    translator = T.Translator(image, set(functions))
+    lifter = Lifter()
     out.mkdir(parents=True, exist_ok=True)
     # Do not leave an earlier successful report looking current after a failure.
     for filename in ('report.json', 'report.md', 'report.csv'):
@@ -583,61 +594,38 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
         if any(T.Translator.branch_target(i) not in instruction_addresses
                for i in insns if i.mnem in T.JCC or i.mnem == 'JMP'):
             raise ValueError(f'{addr:08x}: indirect/outward branches require an explicit fixture')
-        if any(i.addr in T.INSTRUCTION_PATCHES or i.addr in T.OPERAND_REDIRECTS for i in insns):
-            raise ValueError('corpus refuses configured instruction rewrites')
         directory = out / row['address']
         directory.mkdir(exist_ok=True)
         write_input(directory / 'original.asm', '\n'.join(i.raw for i in insns) + '\n')
         write_input(directory / 'original.bin', raw)
-        ir_result = {'emitted': False, 'reason': 'disabled'}
         for mode in modes[:-1]:
-            options = SimpleNamespace(eager_flags=mode == "eager", cpu_locals=mode in ('cpu', 'combined'),
-                                      x87_locals=mode in ('x87', 'combined'))
-            tr = T.Translator(image, set(functions), options)
+            tr = translator
             fn = T.Function(addr, name, size, insns)
             fn.measure(image)
-            tr.prepare(fn, strict=True)
+            tr.prepare(fn)
+            tr.analyze(fn, [])
             if fn.seh_sites or fn.pushed_continuations:
                 raise ValueError(f'{addr:08x}: SEH/continuation entries require an explicit fixture')
-            body = '\n'.join(tr.translate(fn))
-            body = re.sub(r'\b(fn|body|entry)_([0-9a-f]{8})\b', lambda m: mode + '_' + m[0], body)
-            if boundary:
-                body = bind_boundary_calls(body, mode, row['address'], direct, indirect_sites)
-            else:
-                body = bind_reviewed_calls(body, row.get('callees', []), mode)
             wrapped = False
-            if ir_ssa and mode == 'combined':
-                from ir.lift import Lifter, LiftError
-                from ir.cfg import function_ir
-                from ir.ssa import SSAError
-                from ir.emit_c import emit
-                # Only byte-verified, declared direct callees may be bound; an
-                # undeclared or indirect call stays a whole-function fallback.
-                call_symbols = ssa_call_symbols(mode, boundary, direct, row.get('callees', []))
+            if mode == 'eager':
+                body = '\n'.join(tr.translate(fn))
+                body = re.sub(r'\b(fn|body|entry)_([0-9a-f]{8})\b', lambda m: mode + '_' + m[0], body)
+                if boundary:
+                    body = bind_boundary_calls(body, mode, row['address'], direct, indirect_sites)
+                else:
+                    body = bind_reviewed_calls(body, row.get('callees', []), mode)
+            else:
                 indirect_symbol = (f'{mode}_indirect_{row["address"]}'
                                    if boundary and indirect_sites else None)
-
-                def ssa_emit():
-                    return emit(fir, f'{mode}_fn_{addr:08x}', call_symbols=call_symbols,
-                                indirect_call_symbol=indirect_symbol,
-                                x87_scalar_strict=(fault_state == 'exact'),
-                                local_state=(fault_state == 'relaxed'),
-                                msvc_convention=msvc_x87_convention,
-                                lazy_nan=True,
-                                # Production (ir/production.py) defers flags
-                                # as a descriptor under the relaxed policy.
-                                lazy_flags=(fault_state == 'relaxed'),
-                                resumable_stacks=getattr(T, 'RESUMABLE_STACKS', False))
+                options = {**settings.emit, 'indirect_call_symbol': indirect_symbol,
+                           'call_symbols': ssa_call_symbols(mode, boundary, direct, row.get('callees', []))}
                 try:
-                    lifter = Lifter()
-                    fir = function_ir(tr, lifter, fn)
-                    body = ssa_emit()
-                    if contract == 'mapped-comparison-corpus-v2':
-                        body = wrap_string_helpers_ssa(body, insns)
-                        wrapped = True
-                    ir_result = {'emitted': True, 'reason': None}
+                    body = emit(T.function_ir(tr, lifter, fn), f'{mode}_fn_{addr:08x}', lifter=lifter, **options)
                 except (SSAError, LiftError) as error:
-                    ir_result = {'emitted': False, 'reason': str(error)}
+                    raise ValueError(f'{addr:08x}: SSA cannot emit this row: {error}')
+                if contract == 'mapped-comparison-corpus-v2':
+                    body = wrap_string_helpers_ssa(body, insns)
+                    wrapped = True
             if not wrapped and contract == 'mapped-comparison-corpus-v2':
                 body = wrap_string_helpers(body)
             prototypes = ''.join(f'void {mode}_fn_{a}(X86 *);\n' for a in row.get('callees', []))
@@ -663,7 +651,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
             write_input(path, '\n'.join(include) + '\n' + prototypes + wrappers + body + '\n')
             sources.append(path)
         provenance.append({**row, 'comparison': comparison, 'analysis_name': name,
-                           'original_bytes': len(raw), 'ir_ssa': ir_result,
+                           'original_bytes': len(raw),
                            'original_instructions': len(insns),
                            'x87_instructions': sum(i.mnem.startswith('F') for i in insns),
                            'spans': spans})
@@ -686,7 +674,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
                     f'#define CORPUS_MODES {len(modes)}',
                     f'#define CORPUS_MODE_NATIVE {len(modes) - 1}']
     if msvc_x87_convention:
-        declarations.append(f'#define CORPUS_MODE_CONVENTION {modes.index("combined")}')
+        declarations.append(f'#define CORPUS_MODE_CONVENTION {modes.index("ssa")}')
     declarations.append('static const uint32_t corpus_call_returns[] = {CORPUS_RETURN' +
                         ''.join(f',0x{a:08x}u' for a in sorted(call_returns)) + '};')
     for row in provenance:
@@ -799,7 +787,6 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
     import shlex
     compiler = compiler_rows[0].get('arguments', []) or shlex.split(compiler_rows[0]['command'])
     report = {'contract': contract, 'host': platform.platform(),
-              'ir_ssa': ir_ssa,
               'fault_state': fault_state,
               'msvc_x87_convention': msvc_x87_convention,
               'compiler': subprocess.check_output([compiler[0], '--version'], text=True).splitlines()[0],
@@ -815,7 +802,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
               'row_modes': row_modes, 'row_has_native': row_has_native,
               'benchmark': spec.get('benchmark', {}),
               'native_executable_sha256': hashlib.sha256(executable.read_bytes()).hexdigest(),
-              'helper_text': {k: v for k, v in sizes.items() if not re.match(r'(?:eager|cpu|x87|combined|native|clean)_', k)},
+              'helper_text': {k: v for k, v in sizes.items() if not re.match(r'(?:eager|ssa|native|clean)_', k)},
               'functions': report_rows}
     (out / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
     (out / 'report.md').write_text(markdown(report))

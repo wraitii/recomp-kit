@@ -103,8 +103,8 @@ missing, duplicate, unknown-fixture, non-object and negative/non-integer
 records and records the object as row coverage. Coverage is game evidence and
 is reported alongside, not instead of, the byte comparisons.
 
-Four translated modes (eager, CPU locals, x87 locals, combined) share the same
-instruction-derived CFG and flag liveness. All optimized modes must match eager
+Two translated variants (eager, SSA) share the same
+instruction-derived CFG and flag liveness. The SSA variant must match eager
 C in full CPU and scratch memory at normal exit. The native reference compares
 only the game's declared observations, making its missing machine bookkeeping
 explicit. These are current-runtime comparisons, not an original-x86 oracle.
@@ -122,31 +122,13 @@ commands.
 
 ## Consolidated regression tools
 
-The former `experiments/x87_locals` directory and its build flag have been
-replaced by this suite. The LLVM comparison, sweep and x87 stack-to-SSA
-experiments were removed once none of them fed production; their history is in Git.
-
-- `--corpus-fragments`: [synthetic x87 fixtures](fragments/README.md), preserving
-  historical state/rounding regressions and explicitly weaker diagnostic modes.
-
 Use the game's build wrapper for every native compilation. Do not invoke
 compilers directly or retain private bytes/generated code in Git.
 
-`--corpus-ir-ssa` tries the experimental integer p-code SSA emitter in the
-combined variant, preserving the same full-state checks against eager C.
-Unsupported functions use the existing emitter; each row's `ir_ssa` records
-whether emission succeeded and the fallback reason. Audited x87 instructions
-use byte-backed effects lowered by the scalar x87 tracker; raw floating
-p-code, unsupported x87 forms, locked operations and unbound calls retain fallback.
-Declared reviewed direct callees are bound explicitly and use the same mode.
-The policy (default scalar x87 and local CPU state, the production policy) is
-recorded in JSON and Markdown.
-This mode does not enable production IR emission. See [IR limitations](../../../docs/ir.md).
+The variants are `eager` (the decoded emitter) and `ssa` (the production SSA emitter, with the
+game's `[translate]` settings); a row the SSA emitter cannot lower fails the run. Declared
+reviewed direct callees are bound explicitly and use the same variant. Audited x87
+instructions use byte-backed effects lowered by the scalar x87 tracker.
 
-The default `--corpus-fault-state relaxed` (the `[translate] fault_state` key)
-uses scalar x87 stack/environment state with exact outgoing residues and defers
-ordinary read GPR/flag snapshots, retaining diagnostics and complete
-store/call/exit state; `exact` retains pre-load observations, general arithmetic
-and every snapshot. `--corpus-msvc-x87-convention off` restores conservative
-call/return publication. The report records the selection. See [the IR contracts](../../../docs/ir.md#scalar-x87-and-local-cpu-state).
+The `[translate] fault_state` and `msvc_x87_convention` keys select the SSA policy; the report records it. See [the IR contracts](../../../docs/ir.md#scalar-x87).
 

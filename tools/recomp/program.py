@@ -6,14 +6,13 @@ instruction effects. Nothing here decodes with Capstone or scans for code.
 Unknown control flow fails with a named diagnostic: fix Ghidra and re-export.
 """
 from bisect import bisect_right
-from pathlib import Path
 
 import code_map
 from ir.cfg import FunctionIR
 from ir.lift import Lifter
 
 
-class ProgramError(Exception):
+class TranslateError(Exception):
     pass
 
 
@@ -28,6 +27,8 @@ class PE(object):
         data = bytes(pe.get_memory_mapped_image())
         self.data = (data + bytes(max(0, self.size - len(data))))[:self.size]
         self.end = self.base + self.size
+        reloc = pe.OPTIONAL_HEADER.DATA_DIRECTORY[5]
+        self.reloc_dir = (reloc.VirtualAddress, reloc.Size)
         self.exec_ranges = [
             (self.base + s.VirtualAddress,
              self.base + s.VirtualAddress + max(s.Misc_VirtualSize, s.SizeOfRawData))
@@ -41,10 +42,36 @@ class PE(object):
     def is_exec(self, va):
         return any(lo <= va < hi for lo, hi in self.exec_ranges)
 
+    def rd8(self, va):
+        return self.data[va - self.base] if self.base <= va < self.end else None
+
+    def rd32(self, va):
+        if not (self.base <= va and va + 4 <= self.end):
+            return None
+        return int.from_bytes(self.data[va - self.base:va - self.base + 4], "little")
+
+    def relocated_pointers(self):
+        """{address a HIGHLOW base relocation rewrites: where it is stored}."""
+        rva, size = self.reloc_dir
+        out = {}
+        off, end = rva, rva + size
+        while size and off + 8 <= end:
+            page = int.from_bytes(self.data[off:off + 4], "little")
+            block = int.from_bytes(self.data[off + 4:off + 8], "little")
+            if block < 8 or off + block > end:
+                break
+            for k in range(off + 8, off + block, 2):
+                entry = int.from_bytes(self.data[k:k + 2], "little")
+                site = page + (entry & 0xfff)
+                if entry >> 12 == 3 and site + 4 <= self.size:
+                    out.setdefault(int.from_bytes(self.data[site:site + 4], "little"), self.base + site)
+            off += block
+        return out
+
     def bytes_at(self, va, length):
         lo = va - self.base
         if lo < 0 or lo + length > self.size:
-            raise ProgramError("%08x: outside the image" % va)
+            raise TranslateError("%08x: outside the image" % va)
         return self.data[lo:lo + length]
 
 
@@ -74,16 +101,14 @@ class Body(object):
 
 
 class Program(object):
-    def __init__(self, cfg):
-        translate = cfg.get("translate", {})
-        root = Path(cfg["code_map_path"])
-        self.pe = PE(cfg["developer_exe_path"])
+    def __init__(self, settings):
+        root = settings.code_map
+        self.pe = PE(settings.exe)
         self.metadata, spans = code_map.read_map(root)
         self.tables, self.interior, noreturn, self.noreturn_calls = code_map.read_program(root)
         self.functions = {addr: Function(addr, rows, addr in noreturn)
                           for addr, rows in spans.items()}
-        self.configured_entries = (frozenset(int(a) for a in translate.get("alternate_entries", ()))
-                                   | frozenset(int(a) for a in translate.get("entry_points", ())))
+        self.configured_entries = settings.configured_entries
         self.noreturn = frozenset(noreturn)
         self.lifter = Lifter()
         self._instructions = {}
@@ -134,7 +159,7 @@ class Program(object):
                 continue
             owner = self.containing(addr)
             if owner is None:
-                raise ProgramError("%08x: entry outside every mapped function; fix Ghidra and re-export" % addr)
+                raise TranslateError("%08x: entry outside every mapped function; fix Ghidra and re-export" % addr)
             found.setdefault(owner, []).append(addr)
         return {owner: sorted(addrs) for owner, addrs in found.items()}
 

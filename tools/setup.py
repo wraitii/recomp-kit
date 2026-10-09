@@ -1,31 +1,20 @@
 #!/usr/bin/env python3
 """Prepare private translation inputs from a contributor's own game installation.
 
-    tools/setup.py --game <id> --install /path/to/the/installed/game [--ghidra-home ...]
+    tools/setup.py --game <id> --install /path/to/the/installed/game
 
 Creates <build root>/original, a symlink to the installation, after checking the
-executable against game.toml. Games without a code map also get Ghidra listings
-under <build root>/recomp/listings. No game files are downloaded or changed.
+executable against game.toml. No game files are downloaded or changed.
 """
 
 import argparse
 import hashlib
-import json
-import os
 from pathlib import Path
-import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import game_config  # noqa: E402
-
-GHIDRA_VERSION = "12.1.3"
-
-
-def run(args, **kwargs):
-    """Run one preparation step with argument boundaries preserved; fail on errors."""
-    subprocess.run([str(arg) for arg in args], cwd=ROOT, check=True, **kwargs)
 
 
 def validate_game(directory, executable, sha256, required_dirs=()):
@@ -55,90 +44,22 @@ def link_game(directory, destination):
     destination.symlink_to(directory, target_is_directory=True)
 
 
-def prepare_annotations(analysis_dir, url, revision):
-    """Fetch a fixed metadata revision into ignored storage without modifying a dirty checkout."""
-    directory = analysis_dir / "annotations"
-    created = not directory.exists()
-    if created:
-        run(["git", "clone", "--no-checkout", url, directory])
-    elif not (directory / ".git").exists():
-        raise ValueError(f"{directory} exists but is not a Git checkout")
-    changes = subprocess.check_output(
-        ["git", "-C", str(directory), "status", "--porcelain"], text=True
-    )
-    # A new --no-checkout clone reports deleted files until its first checkout.
-    current = subprocess.run(
-        ["git", "-C", str(directory), "rev-parse", "--verify", "HEAD"],
-        text=True, capture_output=True, check=False,
-    )
-    if changes and not created:
-        raise ValueError("Annotation checkout has local changes; preserve them before preparing inputs")
-    if current.returncode or current.stdout.strip() != revision:
-        run(["git", "-C", directory, "fetch", "origin", revision])
-    run(["git", "-C", directory, "checkout", "--detach", revision])
-    return directory / "backup/backup.xml"
-
-
-def export_listings(ghidra, java_home, annotations, cfg):
-    """Import the verified game and export listings in a disposable Ghidra project."""
-    ghidra = ghidra.expanduser().resolve()
-    properties = ghidra / "Ghidra/application.properties"
-    if not properties.is_file() or f"application.version={GHIDRA_VERSION}\n" not in properties.read_text():
-        raise ValueError(f"Use Ghidra {GHIDRA_VERSION}; set --ghidra-home to its extracted directory")
-    env = dict(os.environ)
-    if java_home:
-        env["JAVA_HOME"] = str(java_home.expanduser().resolve())
-        env["PATH"] = str(Path(env["JAVA_HOME"]) / "bin") + os.pathsep + env.get("PATH", "")
-    listings = cfg["listings_path"]           # <game-dir>/analysis/decompiled/<exe>
-    output = listings.parent                   # <game-dir>/analysis/decompiled
-    project = listings.parent.parent / "ghidra"
-    project.mkdir(parents=True, exist_ok=True)
-    output.mkdir(parents=True, exist_ok=True)
-    command = [
-        ghidra / "support/analyzeHeadless", project, cfg["game"]["app_name"],
-        "-import", cfg["developer_exe_path"], "-noanalysis", "-deleteProject",
-        "-scriptPath", ROOT / "tools",
-    ]
-    if annotations is not None:
-        command += ["-postScript", "ImportAnnotations.java", annotations]
-    command += ["-postScript", "ExportProgram.java", output]
-    run(command, env=env)
-    index = listings / "functions.tsv"
-    if not index.is_file() or len(index.read_text().splitlines()) < 2:
-        raise ValueError("Ghidra did not export a function index; inspect its error output")
-    (output / "inputs.json").write_text(json.dumps({
-        "executable_sha256": cfg["game"]["sha256"],
-        "annotations_revision": cfg.get("setup", {}).get("annotations_revision"),
-        "ghidra_version": GHIDRA_VERSION,
-    }, indent=2) + "\n")
-
-
 def main():
-    """Validate local prerequisites, preserve existing inputs, and prepare reproducible listings."""
+    """Validate local prerequisites, preserve existing inputs, and link the game."""
     parser = argparse.ArgumentParser(description=__doc__)
     game_config.add_game_args(parser)
     parser.add_argument("--install", type=Path, required=True, help="Your installed game directory")
-    parser.add_argument("--ghidra-home", type=Path, default=os.environ.get("GHIDRA_HOME"))
-    parser.add_argument("--java-home", type=Path, default=os.environ.get("JAVA_HOME"))
-    parser.add_argument("--link-only", action="store_true", help="Validate/link game data without exporting")
     args = game_config.resolve_game_args(parser.parse_args(), default=None)
     try:
         cfg = game_config.load(args.game_dir, args.build_root)
-        link_only = args.link_only or cfg["code_map_path"] is not None
+        if cfg["code_map_path"] is None:
+            raise ValueError("%s has no [translate] code_map; translation needs the game's Ghidra code map" % args.game_dir)
         setup = cfg.get("setup", {})
         directory = validate_game(args.install, cfg["game"]["executable"], cfg["game"]["sha256"],
                                   setup.get("required_dirs", ()))
-        if not link_only and not args.ghidra_home:
-            raise ValueError("Set --ghidra-home or GHIDRA_HOME; see the game's CONTRIBUTING.md")
         cfg["developer_exe_path"].parent.parent.mkdir(parents=True, exist_ok=True)
         link_game(directory, cfg["developer_exe_path"].parent)
-        if not link_only:
-            annotations = None
-            if setup.get("annotations_url"):
-                annotations = prepare_annotations(cfg["listings_path"].parent.parent, setup["annotations_url"],
-                                                  setup["annotations_revision"])
-            export_listings(args.ghidra_home, args.java_home, annotations, cfg)
-    except (ValueError, OSError, subprocess.CalledProcessError, KeyError) as error:
+    except (ValueError, OSError, KeyError) as error:
         parser.exit(1, f"Setup failed: {error}\n")
     game = "--game %s" % args.game if args.game else "--game-dir %s" % args.game_dir
     print("Game inputs ready. Next: tools/build.py %s --regenerate" % game)

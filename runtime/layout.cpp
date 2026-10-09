@@ -42,7 +42,7 @@ HostLayout compute() {
             c = '/';
     const std::string dir = parent(exe);
     // A checkout above the executable makes this a developer run whatever the
-    // executable's own shape (build/recomp/pop_smoke or build/PopRecomp.app).
+    // executable's own shape (build/recomp/recomp_smoke or build/PopRecomp.app).
     // The checkout is the game's directory (its game.toml; outputs under its
     // build/) or, for the kit's own stub builds, the kit itself.
     std::string up = dir;

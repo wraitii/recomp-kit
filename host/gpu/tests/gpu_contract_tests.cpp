@@ -2,7 +2,7 @@
 // round-trip, a clear and a draw land where expected, commands complete in
 // commit order, a compute kernel reads what a texture holds, and a native
 // surface makes a swapchain. Compiled once per backend with
-// POP_GPU_TEST_BACKEND naming it; the factory override selects it.
+// RECOMP_GPU_TEST_BACKEND naming it; the factory override selects it.
 #include "../../../platform/os.h"
 #include "../gpu_factory.h"
 
@@ -198,9 +198,9 @@ static void test_swapchain_from_surface() {
 }
 
 int main() {
-    os_setenv("RECOMP_GPU_BACKEND", POP_GPU_TEST_BACKEND);
-    if (strcmp(default_backend_name(), POP_GPU_TEST_BACKEND) != 0) {
-        fprintf(stderr, "backend %s is not available here (got %s)\n", POP_GPU_TEST_BACKEND,
+    os_setenv("RECOMP_GPU_BACKEND", RECOMP_GPU_TEST_BACKEND);
+    if (strcmp(default_backend_name(), RECOMP_GPU_TEST_BACKEND) != 0) {
+        fprintf(stderr, "backend %s is not available here (got %s)\n", RECOMP_GPU_TEST_BACKEND,
                 default_backend_name());
         return 1;
     }
@@ -211,6 +211,6 @@ int main() {
     test_swapchain_from_surface();
     printf("%d checks, %d failures\n", g_checks, g_failures);
     if (!g_failures)
-        printf("all gpu %s tests passed\n", POP_GPU_TEST_BACKEND);
+        printf("all gpu %s tests passed\n", RECOMP_GPU_TEST_BACKEND);
     return g_failures ? 1 : 0;
 }

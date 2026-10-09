@@ -3,7 +3,6 @@
 #include "corpus-config.h"
 #include <stdio.h>
 #include <stdlib.h>
-const int recomp_resumable_stacks = 0;
 static void unexpected(const char *name, uint32_t address) {
     fprintf(stderr, "corpus: unsupported %s at %08x\n", name, address);
     abort();

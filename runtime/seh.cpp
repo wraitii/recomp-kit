@@ -403,7 +403,7 @@ void recomp_seh_intercept(X86 *c, uint32_t target) {
     recomp_profile_truncate(landing->profile_depth);
     recomp_callback_truncate(landing->callback_depth);
     state.landing = landing;
-    longjmp(landing->env, 1);
+    RECOMP_LONGJMP(landing->env, 1);
 }
 
 void recomp_seh_land(X86 *c) {

@@ -934,76 +934,6 @@ static void test_discovery_recorder() {
     remove_tree(dir);
 }
 
-namespace stack_switch_test {
-constexpr uint32_t entry = 0x0e100100, resume = entry + 0x10, worker = entry + 0x20;
-uint32_t saved_stack, worker_stack, visits;
-void guest_ret(X86 *c) {
-    c->eip = rd32(c->r[R_ESP]);
-    c->r[R_ESP] += 4;
-    recomp_return(c);
-}
-void continuation(X86 *c) {
-    ++visits;
-    c->r[R_EAX] += 1;
-    guest_ret(c);
-}
-void start(X86 *c) {
-    c->r[R_ESP] -= 4;
-    wr32(c->r[R_ESP], resume);
-    saved_stack = c->r[R_ESP];
-    c->r[R_ESP] = worker_stack;
-    guest_ret(c); // A scheduler RET on the other stack names the worker.
-    if (c->eip != resume)
-        return;
-    continuation(c);
-}
-void other_stack(X86 *c) {
-    c->r[R_EAX] += 10;
-    c->r[R_ESP] = saved_stack;
-    guest_ret(c); // Resume a CALL continuation whose host frame has unwound.
-}
-} // namespace stack_switch_test
-
-// Exercise two guest stacks and a resumed CALL continuation through the real
-// entry driver. The translator suite separately checks the emitted CALL guards.
-static void test_resumable_stacks() {
-    if (!recomp_resumable_stacks)
-        return;
-    section("cooperative guest stacks");
-    using namespace stack_switch_test;
-    static const uint32_t addresses[] = {entry, resume, worker};
-    static void (*const functions[])(X86 *) = {start, continuation, other_stack};
-    static RecompHookFn hooks[3]{};
-    static uint8_t hooked[3]{};
-    static const RecompModule module = {"stack-switch-test",
-                                        entry,
-                                        worker + 1,
-                                        addresses,
-                                        3,
-                                        functions,
-                                        hooks,
-                                        hooked,
-                                        nullptr,
-                                        0,
-                                        nullptr};
-    recomp_module_register(&module);
-    const uint32_t stacks = heap_alloc(512);
-    X86 c{};
-    c.r[R_ESP] = stacks + 128;
-    wr32(c.r[R_ESP], GUEST_RETURN_SENTINEL);
-    worker_stack = stacks + 384;
-    wr32(worker_stack, worker);
-    wr32(worker_stack + 4, 0x12345678);
-    visits = 0;
-    recomp_run(&c, entry);
-    check(c.r[R_EAX] == 11 && visits == 1,
-          "worker ran before the original continuation, exactly once");
-    check(c.eip == GUEST_RETURN_SENTINEL && c.r[R_ESP] == stacks + 132,
-          "return restored the original stack and reached its caller");
-    check(rd32(worker_stack + 4) == 0x12345678, "suspended worker stack was preserved");
-    heap_free(stacks);
-}
-
 static void test_allocator() {
     section("allocator");
     check(heap_check().empty(), "the heap starts consistent with %u used blocks",
@@ -8117,7 +8047,6 @@ int main(int argc, char **argv) {
     test_pe_exports();
     test_dll_lifetime();
     test_auxiliary_modules();
-    test_resumable_stacks();
     if (argc == 2 && strcmp(argv[1], "--startup-contracts") == 0) {
         // A new port can validate mapping and registry contracts before its
         // remaining platform APIs or optional resources are supported.

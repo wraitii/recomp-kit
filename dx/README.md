@@ -312,11 +312,11 @@ all means the guest is not asking, and for the video player that means its own
 cursor gate never opened, which means `GetCurrentPosition` is not advancing.
 `Unlock` with `peak 0.000` means the guest is asking and writing silence.
 `Unlock` with a real peak and no submission after it means the write is not
-reaching the host. `build/recomp/pop_headless` boots into the same intro, so
+reaching the host. `build/recomp/recomp_headless` boots into the same intro, so
 all of this can be read off a headless run:
 
 ```
-RECOMP_AUDIO_TRACE=200 RECOMP_MAX_SECONDS=25 build/recomp/pop_headless
+RECOMP_AUDIO_TRACE=200 RECOMP_MAX_SECONDS=25 build/recomp/recomp_headless
 ```
 
 Other audio diagnostics, all off by default:

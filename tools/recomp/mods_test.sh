@@ -22,7 +22,7 @@ buildlock_acquire "$(dirname "$BUILD")" "tools/recomp/mods_test.sh" "$SELF" "$@"
 
 PROFILE=$BUILD/recomp/profile-mods-test
 # A record path of this script's own. Every host defaults to
-# $RECORD, so any other pop_smoke on this tree - a gate run,
+# $RECORD, so any other recomp_smoke on this tree - a gate run,
 # an agent's one-off, a make target - writes the same file and the .tmp beside
 # it, and this script would assert against whichever finished last. The build
 # lock above serialises the scripts that take it; a path of its own does not
@@ -39,7 +39,7 @@ RECOMP_MODS_DIR=mods/examples RECOMP_PROFILE_DIR="$PROFILE" \
 RECOMP_SCRIPT=$GAME/smoke/mods.script \
 RECOMP_HOST_DUMP_DIR=$BUILD/recomp/mods/frames \
 RECOMP_RUN_RECORD="$RECORD" \
-    $BUILD/recomp/pop_smoke > $BUILD/recomp/mods/run.log 2>&1 || {
+    $BUILD/recomp/recomp_smoke > $BUILD/recomp/mods/run.log 2>&1 || {
         echo "mods_test: the smoke run failed; see $BUILD/recomp/mods/run.log" >&2
         tail -40 $BUILD/recomp/mods/run.log >&2
         exit 1
@@ -152,7 +152,7 @@ RECOMP_MODS_DIR=mods/examples RECOMP_PROFILE_DIR="$PROFILE" \
 RECOMP_SCRIPT=$GAME/smoke/mods.script \
 RECOMP_HOST_DUMP_DIR=$BUILD/recomp/mods/frames2 \
 RECOMP_RUN_RECORD="$RECORD" \
-    $BUILD/recomp/pop_smoke > $BUILD/recomp/mods/run2.log 2>&1 || {
+    $BUILD/recomp/recomp_smoke > $BUILD/recomp/mods/run2.log 2>&1 || {
         echo "mods_test: the second smoke run failed; see $BUILD/recomp/mods/run2.log" >&2
         wait $prober 2>/dev/null || true
         exit 1
@@ -215,7 +215,7 @@ for spelling in 1 ""; do
     RECOMP_SCRIPT=$GAME/smoke/nomods.script \
     RECOMP_HOST_DUMP_DIR=$BUILD/recomp/mods/frames-off \
     RECOMP_RUN_RECORD="$RECORD" \
-        $BUILD/recomp/pop_smoke > $BUILD/recomp/mods/run-off.log 2>&1 || {
+        $BUILD/recomp/recomp_smoke > $BUILD/recomp/mods/run-off.log 2>&1 || {
             echo "mods_test: the mods-off run failed; see $BUILD/recomp/mods/run-off.log" >&2
             tail -20 $BUILD/recomp/mods/run-off.log >&2
             exit 1

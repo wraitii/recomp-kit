@@ -18,9 +18,7 @@
 ```
 
 Setup checks the executable hash and links the installation at
-`<build root>/original`. Games with a code map decode their listings during the
-build; others need `--ghidra-home` and `--java-home` (or `GHIDRA_HOME` and
-`JAVA_HOME`) for a Ghidra export.
+`<build root>/original`. Translation needs the game's Ghidra code map.
 
 ## Build
 
@@ -39,11 +37,14 @@ FFmpeg.
 ## Add a game
 
 Create `games/<id>/game.toml` modelled on `games/stub/`. To ship a code map,
-export a `recomp-code-map-v1` directory from Ghidra and pack it:
+export a `recomp-code-map-v3-export` directory from Ghidra (the game's own export
+script; spans, jump tables, interior entries and non-returning calls) and pack it:
 
 ```sh
 .venv/bin/python tools/recomp/code_map.py --pack EXPORT_DIR --exe GAME.EXE --out games/<id>/metadata
 ```
 
-The packed map keeps function spans and only the instruction lengths a linear
-decode would get wrong.
+The packed map keeps addresses only: function spans, the instruction lengths a
+linear decode would get wrong, jump tables, interior entries and non-returning
+calls. A gap in it is fixed in Ghidra, then re-exported, repacked and
+regenerated; translation never guesses entry points.

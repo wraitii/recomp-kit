@@ -87,20 +87,12 @@ int32_t module_index(const RecompModule *m, uint32_t target) {
 
 extern "C" {
 
-const int recomp_resumable_stacks = RECOMP_RESUMABLE_STACKS;
-
 // See x86.h: set by the mod hook installer, read by contract call sites.
 uint8_t recomp_hooks_ever = 0;
 
-// A switched guest stack owns its saved registers and return address. A
-// generated CALL propagates a mismatched EIP here instead of continuing in
-// the wrong native caller. All CALL continuations are dispatch entries in
-// this opt-in translation mode; ordinary games retain their existing path.
 void recomp_run(X86 *c, uint32_t target) {
     c->eip = target;
-    do {
-        recomp_call(c, c->eip);
-    } while (recomp_resumable_stacks && c->eip != GUEST_RETURN_SENTINEL);
+    recomp_call(c, target);
 }
 
 void recomp_module_register(const RecompModule *m) {

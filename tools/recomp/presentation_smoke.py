@@ -26,7 +26,7 @@ def main():
     parser.add_argument('--core', type=Path, default=None, help='default <game>/build/recomp/mods/core')
     parser.add_argument('--out', type=Path)
     args = parser.parse_args()
-    binary = args.game_dir/'build/recomp/pop_smoke'
+    binary = args.game_dir/'build/recomp/recomp_smoke'
     args.core = args.core or args.game_dir/'build/recomp/mods/core'
     if not binary.is_file() or not args.core.is_dir():
         parser.error('Build the smoke host and core mods first; see docs/testing.md')

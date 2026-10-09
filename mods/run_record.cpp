@@ -147,7 +147,7 @@ __attribute__((constructor)) void capture_initial() {
     // and the same .tmp beside it, and a reader between another run's write
     // and its own read gets whichever finished last. Gate B saw that: it
     // removes the file, runs, and copies the result, and another agent's
-    // pop_smoke landing in that window replaced the record it then copied.
+    // recomp_smoke landing in that window replaced the record it then copied.
     //
     // A lock would serialise the scripts that agree to take one; this does not
     // depend on agreement, because a run given its own path cannot be reached
@@ -296,16 +296,19 @@ uint64_t hash_file(const std::string &path, uint64_t h, bool *missing) {
             *missing = true;
         return h;
     }
-    // 4 KB, not 64. This runs from the loader, on whatever thread and at
-    // whatever stack depth the loader happens to be at, and it runs under
-    // hash_tree's recursion; a 64 KB frame there is a stack overflow waiting
-    // for a small thread stack, and a stack overflow in a mod's directory walk
-    // shows up as memory corruption somewhere else entirely. Nothing here is
-    // I/O-bound enough for the size to matter.
-    unsigned char buf[4096];
+    // Heap, not stack: this runs under hash_tree's recursion on loader threads
+    // with small stacks. Whole words first: the generated archive is hundreds
+    // of megabytes and is hashed before main.
+    std::vector<uint64_t> buf(1 << 16);
     size_t n;
-    while ((n = fread(buf, 1, sizeof buf, f)) > 0)
-        h = fnv(buf, n, h);
+    while ((n = fread(buf.data(), 1, buf.size() * sizeof buf[0], f)) > 0) {
+        size_t words = n / sizeof buf[0];
+        for (size_t i = 0; i < words; ++i) {
+            h ^= buf[i];
+            h *= 1099511628211ull;
+        }
+        h = fnv((const unsigned char *)buf.data() + words * sizeof buf[0], n % sizeof buf[0], h);
+    }
     if (ferror(f) && missing)
         *missing = true;
     if (fclose(f) != 0 && missing)
@@ -441,7 +444,7 @@ __attribute__((constructor)) void capture_build() {
 //
 //   - hash_file read through a 65536-byte stack buffer, inside hash_tree's
 //     recursion, on whatever thread and at whatever depth the caller was at.
-//     It is 4096 now.
+//     It reads through a heap buffer now.
 //   - hash_tree recursed without a limit, so a symlink cycle in a mod pack
 //     walked the stack off the end. It stops at 32 levels.
 //   - the payload map was read and written with no lock. ThreadSanitizer

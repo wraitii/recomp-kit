@@ -1,6 +1,6 @@
 // boot.h - the boot sequence every host of the recompiled game shares.
 //
-// Two programs run the same guest: build/recomp/pop_headless writes frames to
+// Two programs run the same guest: build/recomp/recomp_headless writes frames to
 // files, build/PopRecomp.app puts them on a screen. Everything between
 // mem_init() and the guest's main loop is identical in both, so it lives here
 // and neither one repeats it:

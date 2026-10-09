@@ -106,7 +106,7 @@ void write_locked() {
         LOGW("discovery: cannot write %s", file);
         return;
     }
-    fprintf(out, "# tools/recomp/translate.py --discovered reads this file.\n"
+    fprintf(out, "# Evidence for the Ghidra analysis; translation does not read this file.\n"
                  "# <address> <call|jump> <the instruction that named it> <times reached>\n");
     for (const auto &kv : finds())
         fprintf(out, "%08x %s %08x %u\n", kv.first, kv.second.kind.c_str(), kv.second.from,

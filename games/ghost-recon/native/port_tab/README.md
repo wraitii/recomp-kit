@@ -70,7 +70,7 @@ aliased to that copy.
 
 ## Execution evidence
 
-A headless startup (`build/recomp/pop_headless`, `RECOMP_MAX_FRAMES=180`, no frame
+A headless startup (`build/recomp/recomp_headless`, `RECOMP_MAX_FRAMES=180`, no frame
 output) with `RECOMP_TRACE_FILES=1` shows the original `GetFileAttributes` on
 `C:\Ghost Recon\data\Shell\IKE.RES` (size 280118) and then
 `CreateFileA("C:\Windows\Temp\recomp_port_tab.res")` resolving to the host

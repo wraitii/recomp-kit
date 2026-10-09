@@ -457,7 +457,7 @@ void fault_handler(const char *name) {
 // ---------------------------------------------------------------------------
 
 // RECOMP_EXTRA_CODE names libraries of translated code compiled after this
-// build: what a run discovered, turned into a module by tools/lazy_static.py.
+// build.
 // Each registers itself with the runtime's module table from a constructor as
 // it loads, so nothing here does more than open it. The image's own table is
 // consulted first, so a module can only answer for addresses the build did
@@ -764,11 +764,9 @@ void boot_print_undeliverable(FILE *out) {
             unknown.size(), unknown.size() == 1 ? "" : "s");
     for (const UnknownCall &u : unknown)
         fprintf(out, "    target %08x  called from the instruction before %08x\n", u.target, u.ret);
-    // With RECOMP_DISCOVERY set, these addresses are also on disk in the form
-    // tools/recomp/translate.py --discovered reads, so the next regeneration
-    // carries the code this run reached. See runtime/discovery.h.
+    // With RECOMP_DISCOVERY set, these addresses are also on disk. See runtime/discovery.h.
     if (recomp_env("DISCOVERY"))
-        fprintf(out, "  %u of them recorded in %s for --discovered\n", discovery_count(),
+        fprintf(out, "  %u of them recorded in %s\n", discovery_count(),
                 recomp_env("DISCOVERY"));
 }
 

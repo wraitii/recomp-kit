@@ -4,7 +4,7 @@ import sys
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import translate as T
+import output as T
 
 
 def write(out):
@@ -21,7 +21,7 @@ def write(out):
         addresses[3]: ["void fn_0d001030(X86 *c) { CALL_FN(0d001010); }"],
     }
     T.emit_body_chunks(out, functions, bodies, {})
-    T.emit_entry_chunks(out, addresses, "recomp_")
+    T.emit_entry_chunks(out, addresses)
     (out / "fixture_table.c").write_text('''#include "x86.h"
 void fn_0d001000(X86 *c);
 void fn_0d001010(X86 *c);
@@ -38,7 +38,7 @@ void (*const recomp_raw_ptrs[])(X86 *) = {
 };
 uint8_t recomp_hooked[4] = {0};
 RecompHookFn recomp_hook_ptrs[4] = {0};
-''' + T.emit_entry_dispatch("recomp_"))
+''' + T.emit_entry_dispatch())
 
 
 if __name__ == "__main__":

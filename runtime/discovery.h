@@ -1,17 +1,12 @@
 // discovery.h - the code a run found that the translation does not carry.
 //
-// Static discovery misses code: a function only ever reached through a
-// pointer the listing does not resolve, a jump-table slot whose target
-// nothing owns, a block Ghidra ended early. Each one shows up at run time as
-// a call or a jump the address table cannot deliver, and until now the way
-// back was to read the run's report and copy addresses into game.toml's
-// [translate] entry_points by hand.
+// The code map can miss code: a function only ever reached through a
+// pointer nothing resolves, a jump-table slot whose target nothing owns, a
+// block Ghidra ended early. Each one shows up at run time as a call or a jump
+// the address table cannot deliver.
 //
-// With RECOMP_DISCOVERY naming a file, every such address is written there
-// instead, and tools/recomp/translate.py --discovered reads it back as entry
-// points. Run, regenerate, run again: each pass carries the code the last one
-// reached, and the addresses stop appearing when there is nothing left to
-// find.
+// With RECOMP_DISCOVERY naming a file, every such address is written there as
+// evidence for fixing the Ghidra analysis and re-exporting the code map.
 #pragma once
 #include <stdint.h>
 #include <stdio.h>

@@ -20,9 +20,6 @@ spec = importlib.util.spec_from_file_location("build_py", ROOT / "tools/build.py
 build_py = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(build_py)
 
-PORTABLE_TESTS = ["tools/recomp/tests/test_translate_insns.py"]
-
-
 def run(args, env=None):
     """Propagate a test command's failure instead of treating missing coverage as success."""
     subprocess.run([str(arg) for arg in args], cwd=ROOT, env=env, check=True)
@@ -108,7 +105,7 @@ def main():
         elif args.native or args.compile_only:
             native(args.preset, env, args.jobs, args.native, args.game_dir, build_root)
         else:
-            run([sys.executable, "-m", "pytest", "-q"] + PORTABLE_TESTS, env)
+            parser.error("Choose a suite: --native, --compile-only, --mods or --d3d8-wgpu")
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, TimeoutError) as error:
         parser.exit(1, "Tests failed: %s\n" % error)
 

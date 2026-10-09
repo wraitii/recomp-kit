@@ -31,8 +31,8 @@ import web_launcher  # noqa: E402
 # What each --target builds. `plugins` is every mod plugin the game ships.
 TARGETS = {
     "app": ["recomp_app"],
-    "smoke": ["pop_smoke"],
-    "headless": ["pop_headless"],
+    "smoke": ["recomp_smoke"],
+    "headless": ["recomp_headless"],
     "gen": ["recomp_gen"],
     "dispatch-tests": ["dispatch_tests"],
     "plugins": ["plugins"],
@@ -85,7 +85,7 @@ def cmake_tool(name):
 def game_defines(game_dir, build_root):
     """The cache paths and the game's [render] d3d8_wgpu switch, passed on every configure."""
     wgpu = "ON" if game_config.load(game_dir, build_root)["render"]["d3d8_wgpu"] else "OFF"
-    return ["-DRECOMP_GAME_DIR=%s" % Path(game_dir).as_posix(), "-DPOP_BUILD_ROOT=%s" % Path(build_root).as_posix(),
+    return ["-DRECOMP_GAME_DIR=%s" % Path(game_dir).as_posix(), "-DRECOMP_BUILD_ROOT=%s" % Path(build_root).as_posix(),
             "-DRECOMP_D3D8_WGPU=" + wgpu]
 
 
@@ -253,8 +253,8 @@ def android_push_game(command, cfg, build_root):
     staged = Path(build_root) / "android/game"
     if staged.exists():
         shutil.rmtree(staged)
-    count = stage_game_files.stage(source, staged, executable, cfg["bundle"]["exclude"],
-                                   stage_game_files.kept(cfg))
+    count = stage_game_files.stage(source, staged, executable, cfg["bundle"]["exclude"])
+
     destination = "/sdcard/Android/data/%s/files" % cfg["game"]["bundle_id"]
     print("Staged %d game files in %s; pushing to %s/game" % (count, staged, destination), flush=True)
     subprocess.run(command + ["shell", "mkdir", "-p", destination], check=True)
@@ -349,13 +349,6 @@ def translation_fingerprint(game_dir, cfg, translate_args):
         from code_map import MAP_FILES
         for name in MAP_FILES:
             h.update(name.encode() + b"\0" + (cfg["code_map_path"] / name).read_bytes())
-    for module in cfg["aux_modules"]:
-        h.update(b"aux\0" + module["key"].encode())
-    discovered = translate_args.get("discovered")
-    if discovered:
-        # Runs append new entries to the same discovery file. Its path alone
-        # cannot distinguish translations before and after that execution.
-        h.update(b"discovered\0" + Path(discovered).read_bytes())
     for key in sorted(translate_args):
         value = translate_args[key]
         h.update(("arg:%s=%s\n" % (key, value if value is not None else "")).encode())
@@ -389,36 +382,13 @@ def publish_generated(build_root, translate):
         temporary.replace(recomp / "symbols.json")
 
 
-def run_translator(stage, game_dir, build_root, allow_table_gaps=None, aux_modules=(),
-                   allow_unmodelled=None, discovered=None, forget=None):
-    """Translate the image into `stage`, then each auxiliary module (game.toml
-    [modules.aux.<key>]) into `stage/aux-<key>`, which cmake/Translate.cmake
-    compiles into its own library. A module is translated under the same
-    --allow-table-gaps/--allow-unmodelled acceptances as the image: they are
-    the build's, and a module's listing has the same gaps a game's has."""
-    command = [sys.executable, str(ROOT / "tools/recomp/translate.py"), "--out", str(stage),
+def run_translator(stage, game_dir, build_root, allow_unmodelled=None):
+    command = [sys.executable, str(ROOT / "tools/recomp/driver.py"), "--out", str(stage),
                "--game", str(game_dir),
                "--report", str(Path(build_root) / "recomp/translate-report.json")]
-    if allow_table_gaps:
-        command += ["--allow-table-gaps", allow_table_gaps]
     if allow_unmodelled:
         command += ["--allow-unmodelled", allow_unmodelled]
-    if discovered:
-        command += ["--discovered", str(discovered)]
-    if forget:
-        command += ["--forget", forget]
     subprocess.run(command, cwd=ROOT, check=True)
-    for key in aux_modules:
-        out = Path(stage) / ("aux-" + key)
-        out.mkdir()
-        module = [sys.executable, str(ROOT / "tools/recomp/translate.py"), "--out", str(out),
-                  "--game", str(game_dir), "--module", key,
-                  "--report", str(Path(build_root) / ("recomp/translate-%s-report.json" % key))]
-        if allow_table_gaps:
-            module += ["--allow-table-gaps", allow_table_gaps]
-        if allow_unmodelled:
-            module += ["--allow-unmodelled", allow_unmodelled]
-        subprocess.run(module, cwd=ROOT, check=True)
 
 
 def web_site(game_dir, build_root, preset, cfg):
@@ -434,12 +404,6 @@ def parse_args(argv, system=None):
     parser.add_argument("--regenerate", action="store_true", help="Regenerate and compile translated C")
     parser.add_argument("--function-corpus", type=Path, metavar="MANIFEST",
                         help="Build/check/report a game-owned native-reference function corpus")
-    parser.add_argument("--corpus-ir-ssa", action="store_true",
-                        help="Try integer IR SSA in the corpus combined mode, recording fallbacks")
-    parser.add_argument("--corpus-fault-state", choices=("relaxed", "exact"), default=None,
-                        help="[translate] fault_state for --corpus-ir-ssa (default: relaxed)")
-    parser.add_argument("--corpus-msvc-x87-convention", choices=("on", "off"), default=None,
-                        help="[translate] msvc_x87_convention for --corpus-ir-ssa (default: on)")
     parser.add_argument("--corpus-checks", type=int, default=4096)
     parser.add_argument("--corpus-asan", action="store_true",
                         help="Build the corpus with AddressSanitizer; correctness only (needs --corpus-trial-ms 0)")
@@ -447,22 +411,9 @@ def parse_args(argv, system=None):
                         help="Time budget per eager trial in milliseconds; each row's call count is "
                              "calibrated once to fill it. Zero runs correctness/size only")
     parser.add_argument("--corpus-trials", type=int, default=9)
-    parser.add_argument("--corpus-fragments", action="store_true",
-                        help="Build and run the isolated x87 local-value experiment")
-    parser.add_argument("--contract-poison", action="store_true",
-                        help="Compile with RECOMP_CONTRACT_POISON=1: direct calls overwrite "
-                             "fields their call contract dropped, so a wrong summary fails")
-    parser.add_argument("--allow-table-gaps", metavar="REASON", default=None,
-                        help="Accept jump-table sites the translator cannot decode (passed to translate.py)")
-    parser.add_argument("--forget", metavar="ADDR[,ADDR...]", default=None,
-                        help="translate as if the listing had never named these functions "
-                             "(tools/recomp/translate.py --forget): an experiment, not a build")
-    parser.add_argument("--discovered", metavar="FILE", default=None, type=Path,
-                        help="a file a run wrote with RECOMP_DISCOVERY: the addresses it "
-                             "reached that the translation did not carry become entry points")
     parser.add_argument("--allow-unmodelled", metavar="REASON", default=None,
                         help="Translate instructions the translator cannot model into a trap at "
-                             "their own address (passed to translate.py)")
+                             "their own address (passed to the translator)")
     parser.add_argument("--target", choices=sorted(TARGETS), default="app")
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 2, 8))
     parser.add_argument("--preset", default=default_preset(system), help="CMake configure preset")
@@ -495,23 +446,13 @@ def parse_args(argv, system=None):
         parser.error("--target web needs the Emscripten SDK's environment (source emsdk_env.sh)")
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
-    if args.function_corpus and any((args.regenerate, args.stub, args.corpus_fragments,
-                                      args.allow_unmodelled,
-                                      args.allow_table_gaps, args.forget, args.discovered,
+    if args.function_corpus and any((args.regenerate, args.stub, args.allow_unmodelled,
                                       args.config != "Release", args.target != "app")):
         parser.error("--function-corpus is an isolated native Release build mode")
-    if args.corpus_ir_ssa and not args.function_corpus:
-        parser.error("--corpus-ir-ssa requires --function-corpus")
     if args.corpus_asan and not args.function_corpus:
         parser.error("--corpus-asan requires --function-corpus")
     if args.corpus_asan and args.corpus_trial_ms != 0:
         parser.error("--corpus-asan is a correctness build; pass --corpus-trial-ms 0")
-    if args.corpus_fault_state is not None and not args.corpus_ir_ssa:
-        parser.error("--corpus-fault-state requires --corpus-ir-ssa")
-    if args.corpus_msvc_x87_convention is not None and not args.corpus_ir_ssa:
-        parser.error("--corpus-msvc-x87-convention requires --corpus-ir-ssa")
-    if args.corpus_msvc_x87_convention is not None:
-        args.corpus_msvc_x87_convention = args.corpus_msvc_x87_convention == "on"
     return args, parser
 
 
@@ -523,24 +464,14 @@ def main():
         with buildlock.BuildLock(args.build_root.parent, "tools/build.py --function-corpus"):
             run_corpus(args.function_corpus, args.game_dir, args.build_root / "function-corpus",
                        cmake_tool("cmake"), args.jobs, args.corpus_checks,
-                       args.corpus_trial_ms, args.corpus_trials,
-                       args.corpus_ir_ssa, fault_state=args.corpus_fault_state,
-                       msvc_x87_convention=args.corpus_msvc_x87_convention, asan=args.corpus_asan)
-        return
-    if args.corpus_fragments:
-        from corpus.fragments.run import run_experiment
-        run_experiment(args.build_root / "function-corpus-fragments", cmake_tool("cmake"), args.jobs)
+                       args.corpus_trial_ms, args.corpus_trials, asan=args.corpus_asan)
         return
     cfg = game_config.load(args.game_dir, args.build_root)
-    # Regenerating needs the game and its listings.
     if args.regenerate and not cfg["developer_exe_path"].is_file():
         parser.error("Prepare your own game installation with tools/setup.py first")
     preset = preset_name(args.preset, args.config, stub=args.stub, target=args.target)
     build_dir = build_dir_for(args.build_root, preset)
     defines = game_defines(args.game_dir, args.build_root)
-    # Always explicit: the CMake cache would otherwise keep a poison build's
-    # setting for the next ordinary build.
-    defines = defines + ["-DRECOMP_CONTRACT_POISON=%s" % ("ON" if args.contract_poison else "OFF")]
     try:
         # The lock lives at <build root>/recomp/.lock: BuildLock joins build/recomp/.lock onto its argument.
         with buildlock.BuildLock(args.build_root.parent, "tools/build.py"):
@@ -548,10 +479,7 @@ def main():
                 if not cfg.get("code_map_path"):
                     parser.error("Translation needs the game's code map: set [translate] code_map in game.toml")
                 translate_args = {
-                    "allow_table_gaps": args.allow_table_gaps,
                     "allow_unmodelled": args.allow_unmodelled,
-                    "discovered": args.discovered,
-                    "forget": args.forget,
                 }
                 fingerprint = translation_fingerprint(args.game_dir, cfg, translate_args)
                 stamp = args.build_root / "recomp/translate.stamp"
@@ -561,10 +489,7 @@ def main():
                 else:
                     publish_generated(args.build_root,
                                       lambda stage: run_translator(stage, args.game_dir, args.build_root,
-                                                                   args.allow_table_gaps,
-                                                                   [m["key"] for m in cfg["aux_modules"]],
-                                                                   args.allow_unmodelled,
-                                                                   args.discovered, args.forget))
+                                                                   args.allow_unmodelled))
                     stamp.parent.mkdir(parents=True, exist_ok=True)
                     temporary = stamp.with_name("translate.stamp.new")
                     temporary.write_text(fingerprint + "\n")
@@ -603,7 +528,7 @@ def main():
                                                    build_root=args.build_root)
                 system = "Windows" if preset.startswith("windows-cross") else platform.system()
                 if args.target == "app" and not args.stub and system in {"Linux", "Windows"}:
-                    # The desktop Ninja presets write OUTPUT_NAME into POP_OUT.
+                    # The desktop Ninja presets write OUTPUT_NAME into RECOMP_OUT.
                     desktop_root = args.build_root / "windows" if preset.startswith("windows-cross") else args.build_root
                     suffix = ".exe" if system == "Windows" else ""
                     binary = desktop_root / "recomp" / (cfg["game"]["app_name"] + suffix)

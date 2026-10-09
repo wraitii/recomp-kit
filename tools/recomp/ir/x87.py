@@ -6,8 +6,8 @@ the existing helpers retain PC/RC, NaNs, exceptions, tags, exact integer metadat
 and popped-slot residue. These are effect nodes, not scalar floating SSA yet.
 No game addresses or inferred dead FPU fields appear in this adapter.
 
-`statements` is the audited ordered lowering: it is the raw `optimize=False`
-path and the fallback for shapes the scalar tracker (`x87_scalar.py`) delegates.
+`statements` is the audited ordered lowering the scalar tracker (`x87_scalar.py`)
+delegates to and validates against.
 """
 import capstone
 from capstone import x86_const as X

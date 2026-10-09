@@ -14,7 +14,6 @@
 #include "platform/os.h"
 
 uint8_t *g_mem;
-const int recomp_resumable_stacks = 0;
 /* No watchpoint is armed and no DirectDraw lock is open here: both stay
  * empty, and a store costs the runtime's two compares. */
 uint32_t g_watch_base, g_watch_len;

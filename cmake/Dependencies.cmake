@@ -48,8 +48,8 @@ if(NOT IOS AND NOT EMSCRIPTEN)
   FetchContent_MakeAvailable(glslang)
 endif()
 
-# pop_link_sdl(<target>): link SDL3 statically and give the target its headers.
-function(pop_link_sdl target)
+# recomp_link_sdl(<target>): link SDL3 statically and give the target its headers.
+function(recomp_link_sdl target)
   target_link_libraries(${target} PRIVATE SDL3::SDL3-static)
 endfunction()
 
@@ -235,10 +235,10 @@ if(RECOMP_VIDEO)
     BUILD_BYPRODUCTS ${RECOMP_FFMPEG_LIBRARIES} ${RECOMP_FFMPEG_IMPLIBRARIES})
   if(WIN32)
     # Windows finds a DLL beside the executable: every host and test binary
-    # is built into POP_OUT.
+    # is built into RECOMP_OUT.
     ExternalProject_Add_Step(ffmpeg copy_dlls
-      COMMAND ${CMAKE_COMMAND} -E make_directory ${POP_OUT}
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${RECOMP_FFMPEG_LIBRARIES} ${POP_OUT}
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${RECOMP_OUT}
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${RECOMP_FFMPEG_LIBRARIES} ${RECOMP_OUT}
       DEPENDEES install)
   endif()
   # Imported include paths must exist at generation time, before installation.
@@ -249,7 +249,7 @@ if(RECOMP_VIDEO)
 endif()
 
 # Object-library consumers must inherit both the headers and the dynamic link.
-function(pop_link_video target)
+function(recomp_link_video target)
   if(RECOMP_VIDEO)
     target_link_libraries(${target} PUBLIC ffmpeg::avformat ffmpeg::avcodec ffmpeg::avutil)
     target_compile_definitions(${target} PUBLIC RECOMP_HAVE_FFMPEG=1)

@@ -75,8 +75,8 @@ int main() {
     // 3. The kit checkout marker above the executable.
     mkdir_p(root + "/co/build/recomp");
     touch(root + "/co/AGENTS.md");
-    touch(root + "/co/build/recomp/pop_headless");
-    host_layout_set_exe_path_for_test((root + "/co/build/recomp/pop_headless").c_str());
+    touch(root + "/co/build/recomp/recomp_headless");
+    host_layout_set_exe_path_for_test((root + "/co/build/recomp/recomp_headless").c_str());
     CHECK(host_layout().developer);
     CHECK(host_layout().checkout_root == root + "/co");
     CHECK(host_resource("mods/core") == root + "/co/build/recomp/mods/core");
@@ -85,7 +85,7 @@ int main() {
     CHECK(host_layout().profile_dir == root + "/co/build/recomp/profile");
     // 4. RECOMP_PROFILE_DIR wins everywhere.
     os_setenv("RECOMP_PROFILE_DIR", "/elsewhere/profile");
-    host_layout_set_exe_path_for_test((root + "/co/build/recomp/pop_headless").c_str());
+    host_layout_set_exe_path_for_test((root + "/co/build/recomp/recomp_headless").c_str());
     CHECK(host_layout().profile_dir == "/elsewhere/profile");
     // Set after the layout was first asked for (an Android host, after a
     // constructor asked): the next answer follows it.
@@ -112,8 +112,8 @@ int main() {
     // 7. A game repository: game.toml above the executable, the kit elsewhere.
     mkdir_p(root + "/game/build/recomp");
     touch(root + "/game/game.toml");
-    touch(root + "/game/build/recomp/pop_headless");
-    host_layout_set_exe_path_for_test((root + "/game/build/recomp/pop_headless").c_str());
+    touch(root + "/game/build/recomp/recomp_headless");
+    host_layout_set_exe_path_for_test((root + "/game/build/recomp/recomp_headless").c_str());
     CHECK(host_layout().developer);
     CHECK(host_layout().checkout_root == root + "/game");
     CHECK(host_resource("symbols.json") == root + "/game/build/recomp/symbols.json");
@@ -143,7 +143,7 @@ int main() {
     // A developer run keeps its name mapping: the checkout still wins for the
     // names that only exist there, so an override aimed at one resource does
     // not send symbols.json or the game's layouts somewhere they never are.
-    host_layout_set_exe_path_for_test((root + "/game/build/recomp/pop_headless").c_str());
+    host_layout_set_exe_path_for_test((root + "/game/build/recomp/recomp_headless").c_str());
     CHECK(host_layout().developer);
     CHECK(host_layout().resources_dir == "/data/other-files");
     CHECK(host_resource("symbols.json") == root + "/game/build/recomp/symbols.json");
