@@ -365,6 +365,39 @@ void enum_thread(X86 *c) {
 std::vector<uint32_t> siblings(uint32_t parent) {
     return window_z_order(parent);
 }
+// BringWindowToTop raises a child among its siblings and activates its
+// top-level ancestor, using the same guest activation ordering as mouse input.
+// DIVERGENCE(original): native OS window raising remains host-controlled.
+void bring_window_to_top(X86 *c) {
+    uint32_t hwnd = arg(c, 0), top = hwnd;
+    Window *w = find_window(hwnd);
+    if (!w || hwnd == desktop_handle) {
+        set_last_error(1400); // ERROR_INVALID_WINDOW_HANDLE
+        set_eax(c, 0);
+        return;
+    }
+    for (size_t n = 0; w->parent && n < windows().size(); ++n) {
+        top = w->parent;
+        w = find_window(top);
+        if (!w) {
+            set_last_error(1400);
+            set_eax(c, 0);
+            return;
+        }
+    }
+    reorder_window(hwnd, 0);
+    if (top != active) {
+        uint32_t old = active;
+        active = top;
+        reorder_window(top, 0);
+        if (find_window(old))
+            host_dispatch_to_wndproc(c, old, 6, 0, top); // WA_INACTIVE
+        if (find_window(top))
+            host_dispatch_to_wndproc(c, top, 6, 1, old); // WA_ACTIVE
+    }
+    set_eax(c, 1);
+}
+
 void top_window(X86 *c) {
     auto list = siblings(arg(c, 0) == desktop_handle ? 0 : arg(c, 0));
     set_eax(c, list.empty() ? 0 : list.back());
@@ -1507,6 +1540,7 @@ const ImportShim shims[] = {
     U("EnumThreadWindows", 3, enum_thread),
     U("EnumWindows", 2, enum_windows),
     U("GetTopWindow", 1, top_window),
+    U("BringWindowToTop", 1, bring_window_to_top),
     U("GetWindow", 2, get_window),
     U("GetWindowThreadProcessId", 2, window_thread),
     U("IsWindow", 1, is_window),

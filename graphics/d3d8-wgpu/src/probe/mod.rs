@@ -214,7 +214,7 @@ fn draw_two_stage_quad(
             bytes.extend_from_slice(&component.to_le_bytes());
         }
     }
-    device.clear(0, 1 | 2, 0x00000000, 1.0, 0)?;
+    device.clear(&[], 1 | 2, 0x00000000, 1.0, 0)?;
     let vb = VertexBuffer::new(&bytes, 32)?;
     device.begin_scene()?;
     device.draw_primitive(4, 0x242, &vb, 0, 2)?;
@@ -314,7 +314,7 @@ fn run_with_gpu(
     // attachment format, which is what the depth test below proves.
     let mut device = Device::new(gpu, options.width, options.height, 21, 80)?;
     const CLEAR: [u8; 4] = [0x12, 0x34, 0x56, 0x7f];
-    device.clear(0, 1 | 2, 0x7f123456, 1.0, 0)?;
+    device.clear(&[], 1 | 2, 0x7f123456, 1.0, 0)?;
     let pixels = device.read_pixels()?;
     checked_pixels(&pixels, options.width, options.height)?;
     let mut abi_out = vec![0xaa; pixels.len() + 8];
@@ -411,7 +411,7 @@ fn run_with_gpu(
     // one-pixel coverage, so a point at NDC centre must land on the centre
     // pixel with the vertex diffuse colour. This is the GPU-side validation of
     // the topology the guest's star field (`FUN_00545ca0`) draws.
-    device.clear(0, 1 | 2, 0x00000000, 1.0, 0)?;
+    device.clear(&[], 1 | 2, 0x00000000, 1.0, 0)?;
     // The preceding triangle check left translated matrices in place; a point
     // at NDC centre must be drawn with the identity transform to land on the
     // centre pixel.
@@ -453,7 +453,7 @@ fn run_with_gpu(
     device.state.view = Mat4::IDENTITY;
     device.state.projection = Mat4::IDENTITY;
     device.state.set_render_state(7, 1)?; // D3DRS_ZENABLE = TRUE
-    device.clear(0, 1 | 2, 0x00000000, 1.0, 0)?;
+    device.clear(&[], 1 | 2, 0x00000000, 1.0, 0)?;
     let triangle = |z: f32, color: u32| -> Vec<u8> {
         let mut bytes = Vec::new();
         for position in [[-0.8f32, -0.8, z], [0.8, -0.8, z], [0.0, 0.8, z]] {
@@ -517,7 +517,7 @@ fn run_with_gpu(
     };
     let mut fog_samples = Vec::new();
     for z in [0.5f32, 2.0, 4.0] {
-        device.clear(0, 1 | 2, 0x0000_0000, 1.0, 0)?;
+        device.clear(&[], 1 | 2, 0x0000_0000, 1.0, 0)?;
         let vb = VertexBuffer::new(&fog_triangle(z), 16)?;
         device.begin_scene()?;
         device.draw_primitive(4, 0x42, &vb, 0, 1)?;
@@ -591,7 +591,7 @@ fn run_with_gpu(
         let mut visible = [false; 2];
         let mut seen = [[0u8; 4]; 2];
         for (i, bytes) in [&ccw_red, &cw_green].into_iter().enumerate() {
-            device.clear(0, 1 | 2, 0x00000000, 1.0, 0)?;
+            device.clear(&[], 1 | 2, 0x00000000, 1.0, 0)?;
             let vb = VertexBuffer::new(bytes, 16)?;
             device.begin_scene()?;
             device.draw_primitive(4, 0x42, &vb, 0, 1)?;
@@ -646,7 +646,7 @@ fn run_with_gpu(
     ] {
         device.state.set_render_state(25, func)?;
         device.state.set_render_state(24, reference)?;
-        device.clear(0, 1 | 2, 0x00000000, 1.0, 0)?;
+        device.clear(&[], 1 | 2, 0x00000000, 1.0, 0)?;
         let vb = VertexBuffer::new(&alpha_bytes, 16)?;
         device.begin_scene()?;
         device.draw_primitive(4, 0x42, &vb, 0, 1)?;
@@ -698,7 +698,7 @@ fn run_with_gpu(
             tf_bytes.extend_from_slice(&component.to_le_bytes());
         }
     }
-    device.clear(0, 1 | 2, 0x00000000, 1.0, 0)?;
+    device.clear(&[], 1 | 2, 0x00000000, 1.0, 0)?;
     let tf_vb = VertexBuffer::new(&tf_bytes, 24)?;
     const TF_TEX_ID: u32 = 88;
     // Source texels are D3D8 B,G,R,A; opaque white. MODULATE(TFACTOR, white) is
@@ -730,7 +730,7 @@ fn run_with_gpu(
     // (TFACTOR) does not read TEXTURE, so alpha stays the TFACTOR alpha. The
     // renderer must not sample the white fallback for the RGB.
     device.release_texture(TF_TEX_ID);
-    device.clear(0, 1 | 2, 0x00000000, 1.0, 0)?;
+    device.clear(&[], 1 | 2, 0x00000000, 1.0, 0)?;
     device.begin_scene()?;
     device.draw_primitive(4, 0x142, &tf_vb, 0, 1)?;
     device.end_scene()?;
@@ -764,7 +764,7 @@ fn run_with_gpu(
     let cache_red = [0u8, 0, 255, 255];
     let cache_green = [0u8, 255, 0, 255];
     let sample_cached = |device: &mut Device| -> Result<[u8; 4], ProbeError> {
-        device.clear(0, 1 | 2, 0x0000_0000, 1.0, 0)?;
+        device.clear(&[], 1 | 2, 0x0000_0000, 1.0, 0)?;
         device.begin_scene()?;
         device.draw_primitive(4, 0x142, &tf_vb, 0, 1)?;
         device.end_scene()?;
@@ -1052,7 +1052,7 @@ fn run_with_gpu(
         let mut prefixed = vec![0; 4096 * 36];
         prefixed.extend_from_slice(&bytes);
         let vertices = VertexBuffer::new(&prefixed, 36)?;
-        device.clear(0, 3, 0, 1.0, 0)?;
+        device.clear(&[], 3, 0, 1.0, 0)?;
         device.begin_scene()?;
         device.draw_primitive(4, 0x152, &vertices, 4096, 1)?;
         device.end_scene()?;
@@ -1083,7 +1083,7 @@ fn run_with_gpu(
     device.state.set_render_state(7, 1)?; // ZENABLE
     device.state.set_render_state(14, 1)?; // ZWRITEENABLE
     device.state.set_render_state(23, 4)?; // LESSEQUAL
-    device.clear(0, 3, 0xff00_00ff, 0.25, 0)?;
+    device.clear(&[], 3, 0xff00_00ff, 0.25, 0)?;
     let rt_width = 32;
     let rt_height = 16;
     let stale_cpu = vec![0u8; rt_width as usize * rt_height as usize * 4];
@@ -1111,7 +1111,7 @@ fn run_with_gpu(
     let green_quad = make_quad(0xff00_ff00, 0.5)?;
     device.set_render_target(901, 0, 7, 21, rt_width, rt_height, &stale_cpu, true, true)?;
     let rt_viewport = device.state.viewport;
-    device.clear(0, 3, 0xffff_ffff, 0.75, 0)?;
+    device.clear(&[], 3, 0xffff_ffff, 0.75, 0)?;
     device.state.set_texture_stage_state(0, 1, 1)?;
     device.state.set_texture_stage_state(0, 4, 1)?;
     device.begin_scene()?;

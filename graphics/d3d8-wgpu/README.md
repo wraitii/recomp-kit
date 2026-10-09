@@ -22,6 +22,12 @@ The native resource tests link the same Rust storage without creating a GPU.
 
 ## Status
 
+Fixed-function DotProduct3 evaluates signed RGB components, saturates the
+result, and replicates a color dot product to alpha. Alpha-only DotProduct3
+uses the RGB components of its selected arguments. A8 texture uploads consume
+one alpha byte per texel and sample as `(0, 0, 0, alpha)`; A8 render targets
+remain unsupported. GPU readback tests cover both paths.
+
 The bridge uses opaque Rust storage for texture levels and vertex/index buffers.
 Compact triangle lists queue GPU indices, including programmable shaders with
 stream-0 declaration layouts and padded strides. Fixed-function lit lists pack
@@ -32,7 +38,12 @@ strips/fans and diagnostic draws retain expansion; `RECOMP_D3D8_EXPAND_INDICES=1
 forces it for comparisons. Queued vertex/index bytes and constants are immutable
 snapshots. Shaders and supported render pipelines are cached per device.
 
-ABI version 8 (including programmable shaders) is generated from Rust with cbindgen 0.29.4. COM IIDs, slots and
+Clear accepts host copies of guest D3DRECT arrays, clips each rectangle to the
+current viewport, and preserves color/depth/stencil outside the selected regions.
+An empty array clears the viewport. The bridge validates guest spans and copies
+unaligned records before calling Rust; rectangle memory is consumed before return.
+
+ABI version 9 (including Clear rectangle arrays) is generated from Rust with cbindgen 0.29.4. COM IIDs, slots and
 arities are generated from the pinned Wine header with a reviewed handler map.
 Normal CMake builds regenerate the header and COM tables under
 `build/d3d8-generated/`; generated code is not tracked. Install the header generator with
@@ -166,3 +177,12 @@ rendering, same-scene restoration, shared-depth preservation, sampling after
 upload-cache eviction, CPU writes/readback generation ordering and depth detach.
 This is GPU/API-model validation; original D3D8 differential equivalence remains
 unmeasured.
+
+Nonindexed triangle strips (D3DPT_TRIANGLESTRIP=5) and fans (=6), including
+`DrawPrimitiveUP` from the guest bridge, expand into immutable triangle-list
+uploads with preserved winding. The pre-transformed FVF 0x144 uses a 28-byte
+XYZRHW/diffuse/UV layout and a vertex entry without a specular input.
+
+Nonindexed line lists use wgpu LineList with triangle culling disabled.
+Color-only XYZRHW/DIFFUSE (`0x44`) vertices use the existing screen-space
+shader with a 20-byte layout and no texture/specular reads.

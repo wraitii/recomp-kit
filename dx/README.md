@@ -15,6 +15,8 @@ descriptor tests compile with that backend disabled.
 operations cover adapter facts, conservative capabilities, a single explicit-size
 windowed color target, backbuffer descriptors/lifetime, and the host ABI's scene,
 clear, transform, viewport, render-state and owned-pixel presentation operations.
+DIVERGENCE(original): `SetGammaRamp` is a temporary no-op with a one-time
+diagnostic; host gamma is unchanged and gamma capability bits stay clear.
 Unsupported methods stop with their names; backend failures never become success.
 Vertex-buffer creation/draw, textures, depth/stencil, surface locks, device reset,
 fullscreen and additional swapchains are not implemented. These limits can prevent
@@ -364,3 +366,22 @@ recompiled code reaches it. The harness asserts after every call that the
 shim popped exactly its own arguments and returned to the pushed address,
 which is how a wrong `argc` in a vtable is caught. The suite is clean under
 `-fsanitize=address,undefined`.
+
+D3D8 `DrawPrimitiveUP` reads checked guest arena spans, uploads immutable vertex
+snapshots and clears stream zero after the call. Nonindexed triangle strips
+and fans expand into triangle lists with preserved winding. The renderer also
+accepts the 28-byte `XYZRHW | DIFFUSE | TEX1` FVF (0x144); its vertex entry
+supplies zero specular without reading a nonexistent field. Lines and unsupported
+vertex/state combinations remain named failures. The API data lifetime and
+stream-zero contract follows Microsoft's D3D8 documentation (ms889296).
+
+DirectSound enumeration reports the NULL-GUID primary-driver alias and a concrete
+Recomp Software Playback device with a stable bridge-owned GUID. Both create
+the same software mixer; unknown GUIDs are rejected. Enumeration honors a
+callback returning FALSE and keeps callback strings/GUIDs in guest memory.
+
+DirectInput7 creation uses the shared version-1/2/7 prefix with FindDevice
+and CreateDeviceEx at their documented slots. CreateDeviceEx validates the
+requested IID and returns a version-7 device view with the existing mouse/
+keyboard behavior. Name search and effect-file operations return named
+E_NOTIMPL diagnostics. Interface layouts follow Wine include/dinput.h.

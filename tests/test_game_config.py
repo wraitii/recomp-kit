@@ -20,6 +20,35 @@ gen_game_config = load_module("gen_game_config")
 
 
 class LoadTests(unittest.TestCase):
+    def test_heap_layout_defaults_and_large_arena(self):
+        stub = ROOT / "games/stub"
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            text = (stub / "game.toml").read_text()
+            (dest / "globals.toml").write_text((stub / "globals.toml").read_text())
+            (dest / "game.toml").write_text(text)
+            cfg = game_config.load(dest)
+            self.assertEqual(cfg["game"]["heap_end"], 0x0e000000)
+            self.assertEqual(cfg["game"]["guest_size"], 0x10000000)
+            large = text.replace("[game]", "[game]\nguest_size = 0x40000000\n"
+                                 "heap_base = 0x10000000\nheap_end = 0x40000000")
+            (dest / "game.toml").write_text(large)
+            cfg = game_config.load(dest)
+            self.assertIn("#define RECOMP_HEAP_END 0x40000000u", gen_game_config.render_header(cfg))
+            self.assertIn("set(RECOMP_HEAP_END 0x40000000u)", gen_game_config.render_cmake(cfg))
+            for invalid, message in (
+                (large.replace("heap_end = 0x40000000", "heap_end = 0x40001000"), "fit inside"),
+                (large.replace("heap_end = 0x40000000", "heap_end = 0x3fffffff"), "page aligned"),
+                (large.replace("heap_base = 0x10000000", "heap_base = 0x01000000"), "reserved"),
+                (large.replace("heap_base = 0x10000000", "heap_base = 0x40000000"), "heap_base"),
+                (large + '\n[modules.aux.test]\nname = "test.dll"\npath = "test.dll"\n'
+                 'sha256 = "' + '0' * 64 + '"\nbase = 0x20000000\nsize = 0x1000\n', "overlaps"),
+            ):
+                with self.subTest(message=message):
+                    (dest / "game.toml").write_text(invalid)
+                    with self.assertRaisesRegex(ValueError, message):
+                        game_config.load(dest)
+
     def test_translation_profile_defaults_and_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
             game = Path(tmp)

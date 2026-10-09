@@ -82,6 +82,7 @@ def main(argv=None):
                "-I", str(stage), "-I", str(ROOT / "runtime"), "-I", str(generated),
                "-DGUEST_IMAGE_BASE=" + cmake_value(macros, "RECOMP_IMAGE_BASE"),
                "-DGUEST_HEAP_BASE=" + cmake_value(macros, "RECOMP_HEAP_BASE"),
+               "-DGUEST_HEAP_END=" + cmake_value(macros, "RECOMP_HEAP_END"),
                "-DGUEST_SIZE=" + cmake_value(macros, "RECOMP_GUEST_SIZE"),
                "-DRECOMP_STORE_HOOKS=" + cmake_value(macros, "RECOMP_STORE_HOOKS"),
                # The host resolves the runtime's symbols when it loads this.

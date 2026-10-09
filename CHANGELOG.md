@@ -11,6 +11,71 @@
   as an optional generic tool. The reduced mod API is version 2; version 1
   plugins are rejected and must be rebuilt against the current header.
 
+- Allow color-only XYZRHW draws with bound textures, using the existing zero
+  fallback for missing texture coordinates while retaining stage operations.
+
+- Sample A8 textures with their one-byte alpha layout and zero RGB channels.
+
+- Implement fixed-function DotProduct3 with signed RGB dot products, saturation,
+  and color-to-alpha replication, matching the advertised D3D8 capability.
+
+- D3D8 Clear now accepts guest rectangle arrays, clips them to the viewport, and preserves color/depth/stencil outside each cleared region.
+
+- Implement BringWindowToTop guest ordering/activation with its one-argument
+  stdcall ABI; native OS raising remains host-controlled.
+
+- Supply DirectInput7 CreateDeviceEx with its five-argument ABI and matching
+  version-7 device views, preventing calls past the older interface vtable.
+
+- Support nonindexed D3D8 line lists with checked user-vertex ranges and
+  wgpu LineList pipelines, without triangle culling.
+
+- Enumerate a concrete DirectSound software playback device in addition to the
+  primary-driver alias, allowing games that skip NULL device GUIDs to initialize audio.
+- Implement CoCreateGuid with its one-argument stdcall ABI and host-generated
+  version-4 GUIDs; implement MoveFileW through the shared file rename seam.
+
+- Schedule guest-only polling loops at translated call boundaries, amortizing
+  checks over 1024 calls while preserving the execution baton and atomic spans.
+- Implement D3D8 DrawPrimitiveUP with checked guest vertex ranges, immutable
+  uploads and stream-zero clearing; expand nonindexed triangle strips/fans
+  with their original winding through the renderer's triangle-list path.
+
+- Retire unlinked x86 exception checkpoints when FS:[0] is restored before
+  local stack storage is released, preventing stale-frame accumulation and
+  growing cleanup scans during startup.
+
+- Accept D3D8 SetGammaRamp as a temporary no-op with a one-time diagnostic;
+  host gamma remains unchanged.
+
+- Implement ImmIsUIMessageA classification/forwarding with its four-argument
+  stdcall ABI, and GetFileTime access/write timestamps through the stat seam.
+
+- Quote the executable in GetCommandLineA/W so the CRT does not pass spaces
+  in its path to WinMain as unintended game arguments.
+
+- Recognize MSVC exception registrations that load FS:[0] before pushing the
+  previous chain head, retaining a live checkpoint for catch continuations.
+
+- Reject CreateFileA/W directory opens without backup semantics, preventing
+  POSIX directory handles from being mistaken for readable files.
+
+- Implement FormatMessageA system error text with guest-owned allocated buffers
+  and LocalFree compatibility; unsupported formatting modes remain fatal.
+
+- Allow `[game] heap_end` to size a guest heap above the fixed runtime regions.
+  Validate arena bounds and auxiliary-module overlap; existing defaults remain.
+
+- Implement GetCurrentDirectoryW with UTF-16 buffer lengths and size probes
+  instead of returning an unimplemented-import failure.
+
+- Register SetCurrentDirectoryW with its one-argument stdcall signature and
+  route UTF-16 paths through the shared current-directory handler, preventing
+  guest stack drift.
+
+- Translate SSE MOVLHPS as an exact register-lane copy, preserving the lower
+  destination half and arithmetic flags, including aliased operands.
+
 - Translated body chunks use a 2 MiB source budget (was 512 KiB), so the
   larger SSA bodies pack into fewer, less overhead-bound compile units.
 

@@ -45,6 +45,11 @@
      d6,                                                                                           \
      d7}
 
+// Stable identity of the bridge's software playback device, distinct from the
+// NULL-GUID primary-driver alias. This identifies our device, not host hardware.
+static const uint8_t GUID_RecompPlayback_[16] =
+    IID_BYTES(0xA802C861, 0xE478, 0x4A21, 0x91, 0xC8, 0x75, 0xD0, 0x04, 0x62, 0x58, 0x36);
+
 static const uint8_t IID_IDirectSound_[16] =
     IID_BYTES(0x279AFA83, 0x4981, 0x11CE, 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60);
 static const uint8_t IID_IDirectSound8_[16] =
@@ -2209,11 +2214,10 @@ static void create_dsound_device(X86 *c, ComIface iface) {
         com_ret(c, CLASS_E_NOAGGREGATION);
         return;
     }
-    // Only the primary playback device exists, and its GUID is NULL. A
-    // non-null GUID names a device that was never enumerated, so it is refused
-    // rather than silently mapped to the primary.
-    if (guid) {
-        LOGW("dsound: create asked for device GUID %08x, but only the primary device exists", guid);
+    // The primary-driver alias and the enumerated software device share the
+    // host mixer. Reject identities we did not enumerate.
+    if (guid && (!gm_valid(guid, 16) || memcmp(gm_ptr(guid), GUID_RecompPlayback_, 16) != 0)) {
+        LOGW("dsound: create asked for device GUID %08x, but it was not enumerated", guid);
         com_ret(c, DSERR_NODRIVER);
         return;
     }
@@ -2236,23 +2240,27 @@ void DirectSoundCreate8(X86 *c) {
     create_dsound_device(c, IF_DSOUND8);
 }
 
-// DirectSoundEnumerateA(callback, context). One device exists: the primary,
-// whose GUID is NULL. This is the device DirectSoundCreate8 returns for a NULL
-// GUID, and the callback owns the description strings only for the call.
+// Enumerate the primary-driver alias followed by the concrete software device.
+// Callers may skip the NULL-GUID alias when choosing a playback device. All
+// callback pointers refer to guest storage valid until enumeration returns.
 void DirectSoundEnumerateA(X86 *c) {
     uint32_t cb = arg(c, 0), ctx = arg(c, 1);
     if (!cb) {
         set_eax(c, DSERR_INVALIDPARAM);
         return;
     }
-    uint32_t strs = heap_alloc(128, false, 16);
+    uint32_t strs = heap_alloc(144, false, 16);
     if (!strs) {
         set_eax(c, E_OUTOFMEMORY);
         return;
     }
     gm_put_str(strs, "Primary Sound Driver", 64);
     gm_put_str(strs + 64, "dsound.dll", 64);
-    guest_call(c, cb, 0, strs, strs + 64, ctx);
+    if (guest_call(c, cb, 0, strs, strs + 64, ctx)) {
+        memcpy(gm_ptr(strs + 128), GUID_RecompPlayback_, 16);
+        gm_put_str(strs, "Recomp Software Playback", 64);
+        guest_call(c, cb, strs + 128, strs, strs + 64, ctx);
+    }
     heap_free(strs);
     set_eax(c, DS_OK);
 }

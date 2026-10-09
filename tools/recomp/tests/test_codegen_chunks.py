@@ -78,3 +78,5 @@ def test_auxiliary_entry_thunks_use_their_own_table(tmp_path):
     assert "recomp_fixture_hooked[i]" in dispatch
     assert "recomp_fixture_base_ptrs[i](c)" in dispatch
     assert "recomp_call(c, recomp_fixture_func_addrs[i])" in dispatch
+    assert dispatch.index("recomp_execution_checkpoint();") < dispatch.index("recomp_fixture_base_ptrs[i](c)")
+    assert dispatch.index("if (recomp_profile_enabled)") < dispatch.index("recomp_execution_checkpoint();")

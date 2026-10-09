@@ -34,7 +34,7 @@ static const uint32_t STACK_TOP = GUEST_STACK_TOP; // initial ESP region top, gr
 // (SizeOfStackReserve 0x100000): the same code runs deeper under the kit than
 // natively, and why is not yet established. Until it is, the guest gets
 // headroom rather than the program's own reserve. The region below the stack
-// down to GUEST_HEAP_END is otherwise unused.
+// down to the default heap end (0x0e000000) is otherwise unused.
 static const uint32_t STACK_SIZE = 0x00800000u;
 static const uint32_t STACK_LIMIT = STACK_TOP - STACK_SIZE;
 static const uint32_t TEB_BASE = GUEST_TEB_BASE; // FS segment base

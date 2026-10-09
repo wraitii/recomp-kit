@@ -32,7 +32,7 @@ Guest address `a` is `g_mem + a`.
 | range | contents |
 | --- | --- |
 | `0x00400000`–`loader_image_limit()` | image at its preferred base, no relocation (`0xd4c000` for this EXE, from SizeOfImage) |
-| `0x01000000`–`0x0e000000` | heap arena (HeapAlloc/GlobalAlloc/LocalAlloc/VirtualAlloc) |
+| `[game] heap_base`–`heap_end` (default `0x01000000`–`0x0e000000`) | heap arena (HeapAlloc/GlobalAlloc/LocalAlloc/VirtualAlloc) |
 | `0x0ef00000`–`0x0f000000` | stack, growing down |
 | `0x0fe00000` | TEB: FS:[0] SEH head, FS:[4]/[8] stack bounds, FS:[0x18] self, FS:[0x2c] TLS |
 | `0x0fe01000` | 64 TLS slots |
@@ -165,7 +165,12 @@ yields if the running thread has held the baton for a millisecond. Scheduling
 must not depend on which API the guest happens to poll: the frame limiter spins
 on `GetTickCount`, and when only blocking calls yielded it could starve the
 DirectInput workers indefinitely with their 200 ms waits already expired. The
-millisecond rate limit keeps the cost to one clock read.
+millisecond rate limit bounds the yield frequency. Translated direct, indirect,
+tail and auxiliary-module calls also checkpoint, with a per-thread 1024-call
+budget amortizing clock and registry work. This lets a guest-only polling loop
+wait for a worker without making an OS import. The checkpoint preserves the
+caller's CPU and honors `sched_atomic_enter` spans. A loop entirely within one
+translated body that makes no calls remains outside this call-boundary seam.
 
 **A thread that cannot proceed blocks.** It leaves the runnable set with a
 deadline, the scheduler runs everything else, and when nothing is runnable it
@@ -276,3 +281,27 @@ Out-of-arena words are marked unreadable; pointer arguments are not dereferenced
 The diagnostic is flushed to stderr and can be saved with `2>imports.log`.
 Legacy null handlers also dump this information with their first enabled warning;
 their existing zero-return behavior is unchanged.
+
+A larger heap can use `[game] guest_size`, `heap_base` and `heap_end`. Keep
+the heap wholly below `0x0e000000` or above `0x10000000`, clear of the fixed
+mod, stack, TEB and import regions and any auxiliary modules. Guest addresses
+remain 32-bit. Increasing `guest_size` alone does not enlarge the heap.
+
+`FormatMessageA` supports a limited English system-message catalog, caller buffers
+and `FORMAT_MESSAGE_ALLOCATE_BUFFER` with `LocalFree` ownership.
+DIVERGENCE(original): neutral/default language requests use English; other
+languages and missing catalog entries return the corresponding Win32 lookup
+errors. Source/module messages, insert formatting and width options remain named
+unsupported-import failures. `FormatMessageW` retains its existing approximation.
+
+`GetFileTime` supports optional access/write timestamps; creation-time requests
+remain named unsupported failures because the portable stat seam has no birth
+time. DIVERGENCE(original): timestamps retain only whole-second precision.
+`ImmIsUIMessageA` classifies IME UI messages even with a null window and forwards
+classified messages through `SendMessageA` when a window is supplied.
+
+CoCreateGuid uses a one-argument stdcall shim and returns a host-entropy
+version-4 GUID in guest memory, without advancing the guest RNG.
+MoveFileA/W share UTF-8 path resolution and reject an existing destination.
+DIVERGENCE(original): the rename seam currently cannot move files across
+volumes and checks destination existence before renaming rather than atomically.

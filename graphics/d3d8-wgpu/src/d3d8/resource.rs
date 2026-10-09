@@ -140,6 +140,59 @@ impl<'a> VertexBuffer<'a> {
     }
 }
 
+/// Pack a nonindexed strip/fan into independent triangles, retaining complete
+/// vertex records and alternating strip winding. Bounds and allocation are
+/// checked before any source copy; the caller retains/reuses the scratch bytes.
+pub fn expand_nonindexed_into(
+    output: &mut Vec<u8>,
+    vertices: &VertexBuffer,
+    topology: u32,
+    start_vertex: u32,
+    primitive_count: u32,
+) -> Result<(), RenderError> {
+    let invalid = |why| RenderError::invalid("DrawPrimitive", why);
+    if !matches!(topology, 5 | 6) {
+        return Err(RenderError::new(
+            "DrawPrimitive",
+            "expected TRIANGLESTRIP (5) or TRIANGLEFAN (6)",
+        ));
+    }
+    if primitive_count == 0 {
+        output.clear();
+        return Ok(());
+    }
+    let end = start_vertex
+        .checked_add(primitive_count)
+        .and_then(|n| n.checked_add(2))
+        .ok_or_else(|| invalid("vertex range overflow"))?;
+    let stride = vertices.stride;
+    if u64::from(end) * u64::from(stride) > vertices.bytes().len() as u64 {
+        return Err(invalid("vertex range exceeds buffer"));
+    }
+    let size = primitive_count
+        .checked_mul(3)
+        .and_then(|n| n.checked_mul(stride))
+        .ok_or_else(|| invalid("expanded vertex size overflow"))? as usize;
+    output.clear();
+    output.try_reserve(size).map_err(|_| {
+        RenderError::out_of_memory("DrawPrimitive", "triangle expansion allocation failed")
+    })?;
+    for triangle in 0..primitive_count {
+        let indices = if topology == 6 {
+            [0, triangle + 1, triangle + 2]
+        } else if triangle & 1 == 0 {
+            [triangle, triangle + 1, triangle + 2]
+        } else {
+            [triangle + 1, triangle, triangle + 2]
+        };
+        for index in indices {
+            let begin = (u64::from(start_vertex + index) * u64::from(stride)) as usize;
+            output.extend_from_slice(&vertices.bytes()[begin..begin + stride as usize]);
+        }
+    }
+    Ok(())
+}
+
 /// Arguments retain D3D8's distinction between the raw indices and the base
 /// vertex applied when accessing the stream. `min_index`/`num_vertices` are the
 /// API's hints: Wine only passes `num_vertices` to the sysmem vertex-buffer
@@ -797,5 +850,42 @@ mod tests {
         expand_indexed_into(&mut scratch, &vertices, &narrow_indices, narrow).unwrap();
         expand_indexed_into(&mut scratch, &vertices, &wide_indices, wide).unwrap();
         assert_eq!(scratch, [10, 11, 12, 13, 14, 15]);
+    }
+}
+
+#[cfg(test)]
+mod nonindexed_tests {
+    use super::{VertexBuffer, expand_nonindexed_into};
+
+    #[test]
+    fn strips_and_fans_preserve_records_start_and_winding() {
+        let bytes = [90, 91, 0, 10, 1, 11, 2, 12, 3, 13, 4, 14];
+        let vb = VertexBuffer::borrowed(&bytes, 2).unwrap();
+        let mut packed = Vec::new();
+        expand_nonindexed_into(&mut packed, &vb, 5, 1, 3).unwrap();
+        assert_eq!(
+            packed,
+            [
+                0, 10, 1, 11, 2, 12, 2, 12, 1, 11, 3, 13, 2, 12, 3, 13, 4, 14
+            ]
+        );
+        expand_nonindexed_into(&mut packed, &vb, 6, 1, 3).unwrap();
+        assert_eq!(
+            packed,
+            [
+                0, 10, 1, 11, 2, 12, 0, 10, 2, 12, 3, 13, 0, 10, 3, 13, 4, 14
+            ]
+        );
+        expand_nonindexed_into(&mut packed, &vb, 6, u32::MAX, 0).unwrap();
+        assert!(packed.is_empty());
+    }
+
+    #[test]
+    fn expansion_rejects_short_ranges_and_wrapping_counts() {
+        let vb = VertexBuffer::borrowed(&[0; 8], 2).unwrap();
+        for (start, count) in [(0, 3), (3, 1), (u32::MAX, 1), (0, u32::MAX)] {
+            assert!(expand_nonindexed_into(&mut Vec::new(), &vb, 6, start, count).is_err());
+        }
+        assert!(expand_nonindexed_into(&mut Vec::new(), &vb, 2, 0, 1).is_err());
     }
 }

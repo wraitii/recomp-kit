@@ -60,8 +60,8 @@ extern uint8_t *g_mem;
  *   0x00400000 + SizeOfImage  image (preferred base, no relocation).  The end
  *                             is a PE header value, not a constant; ask the
  *                             loader (loader_image_limit()) for it.
- *   GUEST_HEAP_BASE..0x0e000000  heap arena (default 0x01000000)
- *   0x0f000000                stack top, grows down (1 MB)
+ *   GUEST_HEAP_BASE..GUEST_HEAP_END  heap arena (configurable)
+ *   0x0f000000                stack top, grows down (8 MB)
  *   0x0fe00000                TEB (FS base)
  *   0x0ff00000 + 16*i         import shim trampoline for import i
  */
@@ -74,7 +74,16 @@ extern uint8_t *g_mem;
 #ifndef GUEST_HEAP_BASE
 #define GUEST_HEAP_BASE 0x01000000u
 #endif
+/* Larger game heaps can sit above the fixed low runtime regions. */
+#ifndef GUEST_HEAP_END
 #define GUEST_HEAP_END 0x0e000000u
+#endif
+#if GUEST_HEAP_BASE >= GUEST_HEAP_END || GUEST_HEAP_END > GUEST_SIZE
+#error "Guest heap must be a nonempty interval inside the arena"
+#endif
+#if GUEST_HEAP_BASE < 0x10000000u && GUEST_HEAP_END > 0x0e000000u
+#error "Guest heap overlaps the mod heap, stack, TEB or import regions"
+#endif
 #define GUEST_STACK_TOP 0x0f000000u
 #define GUEST_TEB_BASE 0x0fe00000u
 #define GUEST_SHIM_BASE 0x0ff00000u
@@ -491,6 +500,9 @@ static inline void recomp_comis(X86 *c, double a, double b) {
 void recomp_call(X86 *c, uint32_t target);
 /* Entry/callback driver for images that switch cooperative guest stacks. */
 void recomp_run(X86 *c, uint32_t target);
+/* Translated call boundaries also schedule guest-only polling loops. Does not
+ * alter this thread's CPU; the scheduler keeps guest execution serialized. */
+void recomp_execution_checkpoint(void);
 extern const int recomp_resumable_stacks;
 
 /* RECOMP_WATCH_FRAME=1 reports a guest call that returns with EBP changed.

@@ -290,6 +290,32 @@ static void div_error_faults() {
     wr32(c.fs_base, 0xffffffff);
 }
 
+// An epilogue can unlink its registration before releasing local stack words.
+// Repeated calls must not accumulate checkpoints whose setjmp owner returned.
+static void leave_before_stack_pop() {
+    X86 c;
+    loader_init_context(&c);
+    uint32_t outer = c.r[R_ESP] - 12, inner = outer - 32;
+    c.r[R_ESP] = outer;
+    registration(&c, outer, 0xffffffff, handler_search);
+    recomp_seh_frame_enter(&c);
+    for (unsigned i = 0; i < 1024; ++i) {
+        c.r[R_ESP] = inner - 8;
+        registration(&c, inner, outer, handler_search);
+        recomp_seh_frame_enter(&c);
+        recomp_seh_frame_leave(&c); // still linked, despite ESP below record
+        CHECK(recomp_seh_test_frame_count(&c) == 2);
+        wr32(c.fs_base, outer);
+        recomp_seh_frame_leave(&c); // FS restore precedes local stack release
+        CHECK(recomp_seh_test_frame_count(&c) == 1);
+    }
+    c.r[R_ESP] = outer - 8;
+    wr32(c.fs_base, 0xffffffff);
+    recomp_seh_frame_leave(&c);
+    CHECK(recomp_seh_test_frame_count(&c) == 0);
+    recomp_seh_reset(&c);
+}
+
 static void unwind_and_leave() {
     X86 c;
     loader_init_context(&c);
@@ -708,6 +734,7 @@ int main(int argc, char **argv) {
     chain_walk();
     null_call_faults();
     div_error_faults();
+    leave_before_stack_pop();
     unwind_and_leave();
     landing();
     adopted_landing();

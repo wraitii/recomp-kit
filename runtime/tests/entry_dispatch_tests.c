@@ -13,6 +13,10 @@ void entry_0d001030(X86 *c);
 
 const int recomp_profile_enabled = 0;
 uint32_t recomp_frame_watch;
+static unsigned checkpoints;
+void recomp_execution_checkpoint(void) {
+    checkpoints++;
+}
 static unsigned native_calls, hook_calls, frame_changes, failures;
 #define CHECK(x)                                                                                   \
     do {                                                                                           \
@@ -65,6 +69,7 @@ int main(void) {
     X86 c = {0};
     entry_0d001010(&c);
     CHECK(c.r[0] == 10 && c.r[1] == 1 && native_calls == 1);
+    CHECK(checkpoints == 2);
     entry_0d001020(&c);
     CHECK(c.r[0] == 20 && c.r[1] == 1 && native_calls == 2);
     recomp_raw_ptrs[0](&c);

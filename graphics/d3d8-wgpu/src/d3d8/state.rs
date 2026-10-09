@@ -716,7 +716,8 @@ impl DeviceState {
                 | D3DTEXTUREOP::BlendDiffuseAlpha
                 | D3DTEXTUREOP::BlendTextureAlpha
                 | D3DTEXTUREOP::BlendFactorAlpha
-                | D3DTEXTUREOP::BlendCurrentAlpha => Ok(()),
+                | D3DTEXTUREOP::BlendCurrentAlpha
+                | D3DTEXTUREOP::DotProduct3 => Ok(()),
                 other => Err(fail(format!(
                     "{name} = {other:?} is not in the implemented subset"
                 ))),
@@ -1201,7 +1202,7 @@ impl DeviceState {
 
     /// Validate the state consumed by the supported guest vertex layout.
     pub fn validate_draw(&self, fvf: u32) -> Result<(), RenderError> {
-        let pre_transformed = matches!(fvf, 0x01C4 | 0x02C4);
+        let pre_transformed = matches!(fvf, 0x0044 | 0x0144 | 0x01C4 | 0x02C4);
         // 0x112 (XYZ/NORMAL/TEX1) and 0x152 (XYZ/NORMAL/DIFFUSE/TEX1) both
         // carry a normal, so they feed the implemented lighting stage.
         self.validate_fixed_function(matches!(fvf, 0x0112 | 0x0152), pre_transformed)
@@ -1572,6 +1573,7 @@ mod tests {
         // Accepted: an XYZRHW draw through the full target, where the viewport
         // bound is the target bound, so wgpu's always-on clipping is exact.
         state.validate_draw(0x01C4).unwrap();
+        state.validate_draw(0x0144).unwrap();
 
         // Refused: an untransformed FVF, whose clip-space vertices rely on the
         // viewport as the clip bound.

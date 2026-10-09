@@ -261,7 +261,7 @@ void write_caps(uint32_t addr) {
     // Caps2 (+0x0c). Windowed rendering is the normal host path; the arena owns
     // all resources so managed textures are manageable; every texture lock is
     // serviced from CPU storage, so dynamic textures are honest. Not advertised:
-    // D3DCAPS2_FULLSCREENGAMMA / CANCALIBRATEGAMMA (no SetGammaRamp path) and
+    // D3DCAPS2_FULLSCREENGAMMA / CANCALIBRATEGAMMA (SetGammaRamp is a logged no-op) and
     // D3DCAPS2_NO2DDURING3DSCENE (inert: the host always composites 2D).
     wr32(addr + 0x0c,
          D3DCAPS2_CANRENDERWINDOWED | D3DCAPS2_CANMANAGERESOURCE | D3DCAPS2_DYNAMICTEXTURES);
@@ -943,6 +943,13 @@ void Dev_ValidateDevice(X86 *c) {
 void Dev_GetAvailableTextureMem(X86 *c) {
     com_ret(c, D8_AVAILABLE_TEXTURE_MEM);
 }
+// DIVERGENCE(original): accept gamma updates without changing host output.
+// SetGammaRamp returns void; com_ret only supplies the bridge's return ABI.
+void Dev_SetGammaRamp(X86 *c) {
+    log_once("d3d8.device.SetGammaRamp",
+             "d3d8: SetGammaRamp ignored; gamma correction is not implemented");
+    com_ret(c, 0);
+}
 void Dev_GetDirect3D(X86 *c) {
     ComObj *dev = d8_dev(c);
     ComObj *factory = dev ? com_get(dev->d3d8_factory) : nullptr;
@@ -1010,9 +1017,19 @@ void Dev_Clear(X86 *c) {
         memcpy(&z, &zbits, 4);
         LOGV("d3d8: Clear rects=%u flags=0x%x color=0x%08x z=%g stencil=%u", arg(c, 1), arg(c, 3),
              arg(c, 4), z, arg(c, 6));
+        uint32_t count = arg(c, 1), rects = arg(c, 2);
+        uint64_t bytes = uint64_t(count) * sizeof(D3d8Rect);
+        if (count && (!rects || bytes > UINT32_MAX || !gm_valid(rects, uint32_t(bytes)))) {
+            com_ret(c, D8_ERR_INVALIDCALL);
+            return;
+        }
+        // Snapshot unaligned guest memory into aligned host records.
+        std::vector<D3d8Rect> rectangles(count);
+        if (count)
+            memcpy(rectangles.data(), gm_ptr(rects), size_t(bytes));
         D3d8Error err{};
-        int32_t status = d3d8_device_clear(host_device(dev), arg(c, 1), arg(c, 3), arg(c, 4), z,
-                                           arg(c, 6), &err);
+        int32_t status = d3d8_device_clear(host_device(dev), count, rectangles.data(), arg(c, 3),
+                                           arg(c, 4), z, arg(c, 6), &err);
         com_ret(c, host_result(c, status, err));
         return;
     }
@@ -3014,6 +3031,67 @@ void Dev_DrawPrimitive(X86 *c) {
     int32_t status = d3d8_device_draw_primitive(host_device(dev), arg(c, 1), dev->d3d8_fvf, bytes,
                                                 (uint32_t)vb->pixels_bytes, dev->d3d8_stream_stride,
                                                 arg(c, 2), arg(c, 3), &err);
+    com_ret(c, host_result(c, status, err));
+#else
+    com_ret(c, D8_ERR_INVALIDCALL);
+#endif
+}
+
+// (this, PrimitiveType, PrimitiveCount, pVertexStreamZeroData, Stride).
+// Microsoft D3D8 DrawPrimitiveUP completes all access to user vertices before
+// returning and clears stream zero (ms889296). The Rust draw path owns immutable
+// uploads; only a checked, borrowed arena view crosses this native boundary.
+void Dev_DrawPrimitiveUP(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    if (!dev) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    const uint32_t topology = arg(c, 1), count = arg(c, 2);
+    const uint32_t vertices = arg(c, 3), stride = arg(c, 4);
+    dev->d3d8_stream_vb = 0;
+    dev->d3d8_stream_stride = 0;
+#ifdef RECOMP_D3D8_WGPU
+    if (!dev->d3d8_device || !stride) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    uint64_t vertex_count;
+    switch (topology) {
+    case 1:
+        vertex_count = count;
+        break; // POINTLIST
+    case 2:
+        vertex_count = uint64_t(count) * 2;
+        break; // LINELIST
+    case 4:
+        vertex_count = uint64_t(count) * 3;
+        break; // TRIANGLELIST
+    case 5:    // TRIANGLESTRIP
+    case 6:
+        vertex_count = uint64_t(count) + 2;
+        break; // TRIANGLEFAN
+    default:
+        fprintf(stderr, "d3d8: DrawPrimitiveUP unsupported topology %u\n", topology);
+        imports_unsupported(c);
+        return;
+    }
+    if (!count) {
+        com_ret(c, D8_OK);
+        return;
+    }
+    const uint64_t bytes = vertex_count * stride;
+    if (!vertices || bytes > UINT32_MAX || !gm_valid(vertices, (uint32_t)bytes)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    for (uint32_t stage = 0; stage < (d8_constants(dev)->pixel_shader ? 4u : 2u); ++stage)
+        if (!d8_sync_texture(c, dev, stage))
+            return;
+    D3d8Error err{};
+    int32_t status =
+        d3d8_device_draw_primitive(host_device(dev), topology, dev->d3d8_fvf, gm_ptr(vertices),
+                                   (uint32_t)bytes, stride, 0, count, &err);
     com_ret(c, host_result(c, status, err));
 #else
     com_ret(c, D8_ERR_INVALIDCALL);

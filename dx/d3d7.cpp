@@ -1915,8 +1915,8 @@ void Device7_Clear(X86 *c) {
 #ifdef RECOMP_D3D8_WGPU
     if (ensure_host(dev)) {
         D3d8Error err{};
-        int32_t status =
-            d3d8_device_clear((D3d8Device *)dev->d3d7_host, 0, flags, color, z, stencil, &err);
+        int32_t status = d3d8_device_clear((D3d8Device *)dev->d3d7_host, 0, nullptr, flags, color,
+                                           z, stencil, &err);
         if (host_ok(status, err, "Clear")) {
             dev->d3d7->target_dirty = true;
             host_d3d7_clear();

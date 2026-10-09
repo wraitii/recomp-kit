@@ -744,6 +744,31 @@ CASES += [
 ]
 
 
+# MOVLHPS copies raw low source bits into the high destination half.
+# Store both registers so the differential check also observes the untouched
+# low destination half and the source; include an aliased source/destination.
+for i, (dst, src) in enumerate(((1, 0), (2, 3), (4, 3), (1, 1))):
+    raw = bytes((0x0f, 0x10, (dst << 3) | 6,
+                 0x0f, 0x10, 0x40 | (src << 3) | 6, 0x10,
+                 0x39, 0xd8,
+                 0x0f, 0x16, 0xc0 | (dst << 3) | src,
+                 0x0f, 0x11, (dst << 3) | 7,
+                 0x0f, 0x11, 0x40 | (src << 3) | 7, 0x10, 0xc3))
+    CASES.append(Case(
+        "MOVLHPS XMM%d,XMM%d preserves source, low half and flags" % (dst, src),
+        0x0D010100 + i * 0x100,
+        [(0, "MOVUPS XMM%d,xmmword ptr [ESI]" % dst),
+         (3, "MOVUPS XMM%d,xmmword ptr [ESI + 0x10]" % src),
+         (7, "CMP EAX,EBX"),
+         (9, "MOVLHPS XMM%d,XMM%d" % (dst, src)),
+         (12, "MOVUPS xmmword ptr [EDI],XMM%d" % dst),
+         (15, "MOVUPS xmmword ptr [EDI + 0x10],XMM%d" % src),
+         (19, "RET")], raw.hex(),
+        lambda rng: {"regs": rand_regs(rng, ESI=SCRATCH + 0x200,
+                                      EDI=SCRATCH + 0x100),
+                     "mem": [(SCRATCH + 0x200, rng.randbytes(32))]}))
+
+
 # -------------------------------------------------------------- translate --
 
 class NoImage(object):

@@ -76,6 +76,62 @@ int main() {
     const uint8_t magenta[] = {255, 0, 255, 255};
     check(memcmp(pixels + (8 * 16 + 8) * 4, magenta, 4) == 0,
           "sample GPU-rendered magenta instead of stale CPU black");
+    const int32_t rectangles[][4] = {{-4, -4, 3, 3}, {12, 12, 20, 20}, {5, 5, 5, 8}};
+    memcpy(gm_ptr(scratch + 513), rectangles, sizeof(rectangles));
+    check(call_method(device, 36, {3, scratch + 513, 1, 0xff00ff00, 0x3f800000, 0}) == 0,
+          "clear unaligned guest rectangles");
+    memset(gm_ptr(scratch + 513), 0, sizeof(rectangles));
+    check(d3d8_device_read_pixels(gpu, pixels, sizeof(pixels), &size, &err) == 0,
+          "read rectangle clear");
+    const uint8_t green[] = {0, 255, 0, 255};
+    for (uint32_t y = 0; y < 16; ++y)
+        for (uint32_t x = 0; x < 16; ++x)
+            check(memcmp(pixels + (y * 16 + x) * 4,
+                         ((x < 3 && y < 3) || (x >= 12 && y >= 12)) ? green : magenta, 4) == 0,
+                  "rectangle clear preserves outside pixels");
+    check(call_method(device, 36, {1, 0, 1, 0, 0x3f800000, 0}) == 0x8876086c,
+          "clear rejects null rectangles");
+    check(call_method(device, 36, {1, GUEST_SIZE - 8, 1, 0, 0x3f800000, 0}) == 0x8876086c,
+          "clear rejects invalid rectangle span");
+    check(call_method(device, 36, {0xffffffffu, scratch, 1, 0, 0x3f800000, 0}) == 0x8876086c,
+          "clear rejects overflowing rectangle span");
+    // UP consumes guest user memory before return, supports pre-transformed
+    // 28-byte records, and clears a previously bound stream zero. Exercise
+    // both triangles of a fan and a strip through the real COM slot (72).
+    check(call_method(device, 76, {0x144}) == 0, "set XYZRHW diffuse TEX1 FVF");
+    check(call_method(device, 50, {136, 0}) == 0, "disable clipping for a full-target XYZRHW draw");
+    for (uint32_t topology : {6u, 5u}) {
+        check(call_method(device, 36, {0, 0, 1, 0xff000000, 0x3f800000, 0}) == 0,
+              "clear before UP");
+        const float fan[4][2] = {{0, 0}, {16, 0}, {16, 16}, {0, 16}};
+        const float strip[4][2] = {{0, 0}, {16, 0}, {0, 16}, {16, 16}};
+        for (uint32_t i = 0; i < 4; ++i) {
+            const auto &xy = topology == 6 ? fan[i] : strip[i];
+            float vertex[7] = {xy[0], xy[1], 0.5f, 1.0f, 0, 0.5f, 0.5f};
+            memcpy(gm_ptr(scratch + 256 + i * 28), vertex, sizeof(vertex));
+            wr32(scratch + 256 + i * 28 + 16, 0xffffffff);
+        }
+        dev->d3d8_stream_vb = vb->id;
+        dev->d3d8_stream_stride = 24;
+        check(call_method(device, 34) == 0, "BeginScene UP");
+        check(call_method(device, 72, {topology, 2, scratch + 256, 28}) == 0,
+              "DrawPrimitiveUP through COM");
+        check(!dev->d3d8_stream_vb && !dev->d3d8_stream_stride, "UP clears stream zero");
+        memset(gm_ptr(scratch + 256), 0, 112); // caller may immediately reuse the data
+        check(call_method(device, 35) == 0, "EndScene UP");
+        check(d3d8_device_read_pixels(gpu, pixels, sizeof(pixels), &size, &err) == 0,
+              "read UP draw");
+        check(memcmp(pixels + (4 * 16 + 4) * 4, magenta, 4) == 0 &&
+                  memcmp(pixels + (12 * 16 + 12) * 4, magenta, 4) == 0,
+              "UP snapshots vertices and covers both triangles");
+    }
+    check(call_method(device, 72, {6, 2, GUEST_SIZE - 32, 28}) == 0x8876086c,
+          "UP rejects a vertex span outside the arena");
+    check(call_method(device, 72, {6, 0xffffffffu, scratch, 28}) == 0x8876086c,
+          "UP rejects overflowing vertex spans");
+    check(call_method(device, 72, {6, 1, 0, 28}) == 0x8876086c, "UP rejects null vertices");
+    check(call_method(device, 72, {6, 1, scratch, 0}) == 0x8876086c, "UP rejects zero stride");
+    check(call_method(device, 72, {6, 0, 0, 28}) == 0, "zero-count UP is a no-op");
     check(call_method(surface, 9, {scratch, 0, 0x10}) == 0, "lock rendered surface readonly");
     check(rd32(rd32(scratch + 4)) == 0xffff00ff, "surface readback uses the same GPU identity");
     call_method(surface, 10);

@@ -152,6 +152,7 @@ void %(p)senter(X86 *c, uint32_t i)
 {
     RecompSaved saved_; recomp_save(c, &saved_);
     if (recomp_profile_enabled) { recomp_call(c, %(p)sfunc_addrs[i]); return; }
+    recomp_execution_checkpoint();
 #ifndef RECOMP_NO_HOOKS
     if (__builtin_expect(__atomic_load_n(&%(p)shooked[i], __ATOMIC_ACQUIRE) != 0u, 0)) {
         /* A hook callback observes the full register file, so a pending lazy
@@ -1017,7 +1018,7 @@ FLAG_NEUTRAL = frozenset((
     # are observers above.  MOVSD is also an SSE scalar move and is separated
     # from its string form by operand shape.
     "MOVSS", "MOVSD", "MOVAPS", "MOVUPS", "MOVAPD", "MOVUPD", "MOVD", "MOVQ",
-    "MOVDQA", "MOVDQU", "MOVDDUP", "MOVLPD", "MOVLPS", "MOVHPD", "MOVHPS",
+    "MOVDQA", "MOVDQU", "MOVDDUP", "MOVLPD", "MOVLPS", "MOVHPD", "MOVHPS", "MOVLHPS",
     "PUNPCKLDQ", "PUNPCKHDQ", "PUNPCKLQDQ", "UNPCKLPD", "UNPCKHPD",
     "PSHUFD", "SHUFPS", "SHUFPD", "ANDNPD", "ANDNPS", "PANDN", "PCMPEQD",
     "PXOR",
@@ -2066,10 +2067,28 @@ def seh_frame_sites(fn, image=None):
             # register operand can address a different TEB field.
             zero_base = dst.base if seh_zero_base(fn, i, dst.base) else 0
             if (not seh_chain_operand(dst, zero_base) or src.kind != "reg" or src.reg != 4
-                    or src.size != 32 or not seh_chain_operand(parse_operand(push.ops[0]), zero_base)
-                    or not fn.contiguous[i - 1]):
+                    or src.size != 32 or not fn.contiguous[i - 1]):
                 continue
-            for j in range(i - 2, max(-1, i - 4), -1):
+            pushed = parse_operand(push.ops[0])
+            handler_index = i - 2
+            if not seh_chain_operand(pushed, zero_base):
+                # MSVC also loads the old chain head before pushing it. Prove
+                # the adjacent load/push pair; an arbitrary pushed register
+                # is not evidence that this publishes a registration record.
+                load = fn.insns[i - 2]
+                if (pushed.kind != "reg" or pushed.size != 32 or
+                        load.mnem != "MOV" or len(load.ops) != 2 or
+                        not fn.contiguous[i - 2]):
+                    continue
+                loaded, head = [parse_operand(o) for o in load.ops]
+                if head.kind == "mem" and head.size is None:
+                    head.size = loaded.size  # MOV's register fixes the load width.
+                if (loaded.kind != "reg" or loaded.size != 32 or
+                        loaded.reg != pushed.reg or loaded.reg == R_ESP or
+                        not seh_chain_operand(head, zero_base)):
+                    continue
+                handler_index -= 1
+            for j in range(handler_index, max(-1, handler_index - 2), -1):
                 prev = fn.insns[j]
                 if not fn.contiguous[j]:
                     break
@@ -3949,7 +3968,7 @@ class Translator(object):
                         "ANDPS": "&", "POR": "|", "ORPD": "|", "ORPS": "|"}
         SSE_LANE_FORMS = ("PANDN", "ANDNPD", "ANDNPS", "PCMPEQD", "PUNPCKLDQ", "PUNPCKHDQ",
                           "PUNPCKLQDQ", "UNPCKLPD", "UNPCKHPD", "MOVDDUP", "MOVLPD", "MOVLPS",
-                          "MOVHPD", "MOVHPS", "SHUFPS", "SHUFPD", "MOVAPD", "MOVUPD")
+                          "MOVHPD", "MOVHPS", "MOVLHPS", "SHUFPS", "SHUFPD", "MOVAPD", "MOVUPD")
         if m in SSE_LANE_OPS or m in SSE_LANE_FORMS:
             dst, src = ops[0], ops[1]
 
@@ -3965,7 +3984,7 @@ class Translator(object):
 
             # d0_..d3_ and s0_..s3_ hold the operands as they were on entry.
             # A half-width form reads only the half it uses.
-            halves = 2 if m in ("MOVLPD", "MOVLPS", "MOVHPD", "MOVHPS") else 4
+            halves = 2 if m in ("MOVLPD", "MOVLPS", "MOVHPD", "MOVHPS", "MOVLHPS") else 4
             L.extend("uint32_t d%d_ = %s;" % (i, lane(dst, i)) for i in range(halves))
             L.extend("uint32_t s%d_ = %s;" % (i, lane(src, i)) for i in range(halves))
             d = lambda i: "d%d_" % i
@@ -3995,6 +4014,10 @@ class Translator(object):
             elif m == "MOVDDUP":                    # s0 s1 s0 s1
                 L.extend([put(dst, 0, sv(0)), put(dst, 1, sv(1)),
                           put(dst, 2, sv(0)), put(dst, 3, sv(1))])
+            elif m == "MOVLHPS":
+                # Raw low source lanes replace the high destination lanes.
+                # Snapshot the source before stores, including dst == src.
+                L.extend(put(dst, 2 + i, sv(i)) for i in range(2))
             elif m in ("MOVLPD", "MOVLPS", "MOVHPD", "MOVHPS"):
                 # One 64-bit half moves; the other half keeps what it had.
                 half = 0 if m in ("MOVLPD", "MOVLPS") else 2
@@ -6696,6 +6719,7 @@ static void recomp_call_inner(X86 *c, uint32_t target)
 {
     int32_t i = recomp_lookup(target);
     if (i >= 0) {
+        recomp_execution_checkpoint();
         if (recomp_profile_enabled) recomp_profile_push((uint32_t)i);
 #ifdef RECOMP_NO_HOOKS
         recomp_base_ptrs[i](c);
@@ -6723,6 +6747,7 @@ void recomp_jump(X86 *c, uint32_t target)
     if (recomp_seh_pending_target()) recomp_seh_intercept(c, target);
     int32_t i = recomp_lookup(target);
     if (i >= 0) {
+        recomp_execution_checkpoint();
         if (recomp_profile_enabled) recomp_profile_push((uint32_t)i);
 #ifdef RECOMP_NO_HOOKS
         recomp_base_ptrs[i](c);

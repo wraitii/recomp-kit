@@ -247,8 +247,7 @@ impl GpuContext {
         // Request it only when the adapter has it; a guest that then selects
         // border addressing fails with a named sampler error on adapters
         // without it instead of the whole device failing to open.
-        let required_features =
-            adapter.features() & wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER;
+        let required_features = adapter.features() & wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("d3d8-wgpu"),
@@ -328,6 +327,12 @@ impl GpuContext {
             ));
         }
         let color = format::ColorFormat::from_d3dformat(d3d_format)?;
+        if color == format::ColorFormat::A8 {
+            return Err(RenderError::new(
+                "create_target",
+                "A8 is supported for texture sampling only",
+            ));
+        }
         let wgpu_format = color.wgpu_format();
         let depth = format::DepthFormat::from_d3dformat(depth_format)?;
         let max = self.device.limits().max_texture_dimension_2d;

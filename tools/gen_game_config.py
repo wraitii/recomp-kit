@@ -17,7 +17,7 @@ STRINGS = (("id", "RECOMP_GAME_ID"), ("name", "RECOMP_GAME_NAME"), ("app_name", 
            ("bundle_id", "RECOMP_BUNDLE_ID"), ("executable", "RECOMP_EXECUTABLE"),
            ("sha256", "RECOMP_EXE_SHA256"), ("guest_root", "RECOMP_GUEST_ROOT"))
 ADDRESSES = (("image_base", "RECOMP_IMAGE_BASE"), ("entry_point", "RECOMP_ENTRY_POINT"),
-             ("heap_base", "RECOMP_HEAP_BASE"))
+             ("heap_base", "RECOMP_HEAP_BASE"), ("heap_end", "RECOMP_HEAP_END"))
 
 # Optional [hooks] the runtime, dx and hosts reference unconditionally. A game
 # that does not hook one still has to compile, so absence renders a value that
@@ -131,6 +131,7 @@ def render_cmake(cfg):
         lines.append('set(%s "%s")' % (macro, game[key]))
     lines.append("set(RECOMP_IMAGE_BASE %s)" % c_hex(game["image_base"]))
     lines.append("set(RECOMP_HEAP_BASE %s)" % c_hex(game["heap_base"]))
+    lines.append("set(RECOMP_HEAP_END %s)" % c_hex(game["heap_end"]))
     lines.append("set(RECOMP_GUEST_SIZE %s)" % c_hex(game["guest_size"]))
     lines.append("set(RECOMP_STORE_HOOKS %d)" % int(game["store_hooks"]))
     # The generated sources include this header before they define FN_<addr>,

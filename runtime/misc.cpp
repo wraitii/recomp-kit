@@ -18,6 +18,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <random>
 #include <string>
 #include <set>
 #include <vector>
@@ -1148,6 +1149,33 @@ void o_CoUninitialize(X86 *c) {
     set_eax(c, 0);
 }
 
+// Generate a version-4 GUID using host entropy, without consuming guest RNG.
+// GUID Data1/2/3 are little endian, so the version nibble resides in byte 7.
+void o_CoCreateGuid(X86 *c) {
+    uint32_t out = arg(c, 0);
+    if (!out || !gm_valid(out, 16)) {
+        set_eax(c, 0x80070057); // E_INVALIDARG
+        return;
+    }
+    uint8_t bytes[16];
+    try {
+        std::random_device entropy;
+        for (unsigned i = 0; i < 16; i += 4) {
+            uint32_t word = entropy();
+            for (unsigned j = 0; j < 4; ++j)
+                bytes[i + j] = (uint8_t)(word >> (j * 8));
+        }
+    } catch (...) {
+        LOGW("CoCreateGuid: host entropy unavailable");
+        set_eax(c, 0x80004005); // E_FAIL
+        return;
+    }
+    bytes[7] = (bytes[7] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    memcpy(gm_ptr(out), bytes, sizeof(bytes));
+    set_eax(c, 0); // S_OK
+}
+
 void o_CoTaskMemAlloc(X86 *c) {
     set_eax(c, heap_alloc(arg(c, 0)));
 }
@@ -1230,6 +1258,19 @@ void o_PropVariantCopy(X86 *c) {
 // -------------------------------------------------------------------------
 // IMM32: no input method is attached.
 // -------------------------------------------------------------------------
+// NULL hwnd asks for classification only, regardless of attached IME state.
+// The message classes follow ImmIsUIMessage's published API and Wine's IMM
+// compatibility implementation (dlls/imm32/imm.c).
+void i_ImmIsUIMessageA(X86 *c) {
+    uint32_t hwnd = arg(c, 0), msg = arg(c, 1);
+    bool ime = (msg >= 0x10d && msg <= 0x10f) || msg == 0x281 || msg == 0x282 || msg == 0x284 ||
+               msg == 0x285 || msg == 0x287;
+    if (ime && hwnd) {
+        uint32_t args[] = {hwnd, msg, arg(c, 2), arg(c, 3)};
+        guest_call(c, imports_resolve("USER32.dll", "SendMessageA"), args, 4);
+    }
+    set_eax(c, ime ? 1 : 0);
+}
 void i_ImmGetContext(X86 *c) {
     set_eax(c, 0);
 }
@@ -2741,6 +2782,7 @@ const ImportShim g_misc_shims[] = {
     {"SHFOLDER.dll", "SHGetFolderPathA", 5, s_SHGetFolderPathA},
     // ole32
     {"ole32.dll", "CoInitialize", 1, o_CoInitialize},
+    {"ole32.dll", "CoCreateGuid", 1, o_CoCreateGuid},
     {"ole32.dll", "OleInitialize", 1, o_CoInitialize},
     {"ole32.dll", "OleUninitialize", 0, o_CoUninitialize},
     {"ole32.dll", "CoInitializeEx", 2, o_CoInitialize},
@@ -2752,6 +2794,7 @@ const ImportShim g_misc_shims[] = {
     {"ole32.dll", "PropVariantClear", 1, o_PropVariantClear},
     {"ole32.dll", "PropVariantCopy", 2, o_PropVariantCopy},
     // IMM32
+    {"IMM32.dll", "ImmIsUIMessageA", 4, i_ImmIsUIMessageA},
     {"IMM32.dll", "ImmGetContext", 1, i_ImmGetContext},
     {"IMM32.dll", "ImmReleaseContext", 2, i_ImmReleaseContext},
     {"IMM32.dll", "ImmGetOpenStatus", 1, i_ImmGetOpenStatus},

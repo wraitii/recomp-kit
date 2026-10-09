@@ -207,6 +207,55 @@ impl FvfLayout {
                     },
                 ],
             }),
+            // XYZRHW | DIFFUSE: screen-space color-only vertices. No texture
+            // or specular inputs may be read beyond the 20-byte record.
+            0x44 => Ok(Self {
+                stride: 20,
+                texcoord_sets: 0,
+                pre_transformed: true,
+                attributes: vec![
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x4,
+                        offset: 0,
+                        shader_location: 0,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Uint32,
+                        offset: 16,
+                        shader_location: 1,
+                    },
+                ],
+            }),
+            // XYZRHW | DIFFUSE | TEX1: no specular word is present. A separate
+            // vertex entry supplies zero specular without reading beyond the
+            // 28-byte record or aliasing the diffuse/texture fields.
+            0x144 => Ok(Self {
+                stride: 28,
+                texcoord_sets: 1,
+                pre_transformed: true,
+                attributes: vec![
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x4,
+                        offset: 0,
+                        shader_location: 0,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Uint32,
+                        offset: 16,
+                        shader_location: 1,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 20,
+                        shader_location: 2,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 20,
+                        shader_location: 3,
+                    },
+                ],
+            }),
             // XYZRHW | DIFFUSE | SPECULAR | TEX1. The pre-transformed path
             // passes the 4-float screen-space position and the specular colour
             // to `vs_rhw_main`; the fragment shader adds specular when
@@ -279,7 +328,7 @@ impl FvfLayout {
             _ => Err(RenderError::new(
                 "FvfLayout::decode",
                 format!(
-                    "unsupported FVF 0x{raw:08X}; only D3DFVF_XYZ | D3DFVF_DIFFUSE (0x{FVF_XYZ_DIFFUSE:08X}), D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 (0x{FVF_XYZ_DIFFUSE_TEX1:08X}), D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX2 (0x{FVF_XYZ_DIFFUSE_TEX2:08X}), XYZ | NORMAL | TEX1 (0x00000112), XYZ | NORMAL | DIFFUSE | TEX1 (0x00000152) and XYZRHW | DIFFUSE | SPECULAR | TEX1/2 (0x000001C4/0x000002C4) are implemented"
+                    "unsupported FVF 0x{raw:08X}; only D3DFVF_XYZ | D3DFVF_DIFFUSE (0x{FVF_XYZ_DIFFUSE:08X}), D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 (0x{FVF_XYZ_DIFFUSE_TEX1:08X}), D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX2 (0x{FVF_XYZ_DIFFUSE_TEX2:08X}), XYZ | NORMAL | TEX1 (0x00000112), XYZ | NORMAL | DIFFUSE | TEX1 (0x00000152) and XYZRHW | DIFFUSE | TEX1 (0x00000144) or with SPECULAR | TEX1/2 (0x000001C4/0x000002C4) are implemented"
                 ),
             )),
         }
@@ -436,8 +485,7 @@ struct VertexInputRhw {
 // mapping here and let the rasterizer do the rest. The reciprocal-w field is
 // used as `w = 1/rhw` when nonzero; the observed D3D7 logo quad carries
 // `rhw = 0.0` and was an orthographic full-screen quad, so that keeps `w = 1`.
-@vertex
-fn vs_rhw_main(in: VertexInputRhw) -> VertexOutput {
+fn rhw_vertex(in: VertexInputRhw) -> VertexOutput {
     var out: VertexOutput;
     let vp = transform.viewport;
     let ndc_x = 2.0 * (in.position.x - vp.x) / vp.z - 1.0;
@@ -469,6 +517,21 @@ fn vs_rhw_main(in: VertexInputRhw) -> VertexOutput {
         f32(in.specular & 0xffu) / 255.0,
     );
     return out;
+}
+
+@vertex
+fn vs_rhw_main(in: VertexInputRhw) -> VertexOutput {
+    return rhw_vertex(in);
+}
+
+struct VertexInputRhwNoSpecular {
+    @location(0) position: vec4<f32>,
+    @location(1) color: u32,
+};
+
+@vertex
+fn vs_rhw_nospec_main(in: VertexInputRhwNoSpecular) -> VertexOutput {
+    return rhw_vertex(VertexInputRhw(in.position, in.color, 0u));
 }
 
 // D3DFOG_* table fog factor. `d` is the eye-space depth. The result is
@@ -993,8 +1056,7 @@ struct VertexInputRhw {
 
 // XYZRHW: see the unlit shader for the screen-space mapping. The texture
 // coordinates are passed through unchanged.
-@vertex
-fn vs_rhw_main(in: VertexInputRhw) -> VertexOutput {
+fn rhw_vertex(in: VertexInputRhw) -> VertexOutput {
     var out: VertexOutput;
     let vp = transform.viewport;
     let ndc_x = 2.0 * (in.position.x - vp.x) / vp.z - 1.0;
@@ -1031,6 +1093,35 @@ fn vs_rhw_main(in: VertexInputRhw) -> VertexOutput {
         f32(in.specular & 0xffu) / 255.0,
     );
     return out;
+}
+
+@vertex
+fn vs_rhw_main(in: VertexInputRhw) -> VertexOutput {
+    return rhw_vertex(in);
+}
+
+struct VertexInputRhwNoSpecular {
+    @location(0) position: vec4<f32>,
+    @location(1) color: u32,
+    @location(2) uv0: vec2<f32>,
+    @location(3) uv1: vec2<f32>,
+};
+
+@vertex
+fn vs_rhw_nospec_main(in: VertexInputRhwNoSpecular) -> VertexOutput {
+    return rhw_vertex(VertexInputRhw(in.position, in.color, in.uv0, in.uv1, 0u));
+}
+
+struct VertexInputRhwColor {
+    @location(0) position: vec4<f32>,
+    @location(1) color: u32,
+};
+
+// This layout has no guest coordinate or specular fields. Bound textures and
+// color-combine stages still run with the missing coordinates supplied as zero.
+@vertex
+fn vs_rhw_color_main(in: VertexInputRhwColor) -> VertexOutput {
+    return rhw_vertex(VertexInputRhw(in.position, in.color, vec2<f32>(0.0), vec2<f32>(0.0), 0u));
 }
 
 // D3DTA_*: low nibble 0 DIFFUSE, 1 CURRENT, 2 TEXTURE, 3 TFACTOR; bit 0x10 is
@@ -1074,6 +1165,12 @@ fn stage_arg_a(
     return v;
 }
 
+// WineD3D shader_glsl_ffp_fragment_op: signed components are 2*x-1.
+// Alpha components never participate in the three-component dot product.
+fn dotproduct3(a: vec4<f32>, b: vec4<f32>) -> f32 {
+    return clamp(4.0 * dot(a.rgb - vec3<f32>(0.5), b.rgb - vec3<f32>(0.5)), 0.0, 1.0);
+}
+
 // D3DTOP color result on RGB. The blend ops take their factor alpha from the
 // source D3D8 names.
 fn color_op(
@@ -1103,6 +1200,7 @@ fn color_op(
         case 13u: { r = mix(b.rgb, a.rgb, vec3<f32>(texel.a)); }
         case 14u: { r = mix(b.rgb, a.rgb, vec3<f32>(tfactor.a)); }
         case 16u: { r = mix(b.rgb, a.rgb, vec3<f32>(current.a)); }
+        case 24u: { r = vec3<f32>(dotproduct3(a, b)); } // DOTPRODUCT3
         default: { r = current.rgb; }
     }
     return r;
@@ -1210,7 +1308,16 @@ fn eval_stage(
     let rgb = color_op(s.color_op, c1, c2, current, diffuse, texel, tfactor);
     let a1 = stage_arg_a(s.alpha_arg1, diffuse, current, texel, tfactor);
     let a2 = stage_arg_a(s.alpha_arg2, diffuse, current, texel, tfactor);
-    let alpha = alpha_op(s.alpha_op, a1, a2, current, diffuse, texel, tfactor);
+    var alpha = alpha_op(s.alpha_op, a1, a2, current, diffuse, texel, tfactor);
+    if (s.color_op == 24u) {
+        // WineD3D wined3d_ffp_get_fs_settings: COLOROP DOTPRODUCT3 overrides
+        // ALPHAOP and its arguments, replicating the color result to alpha.
+        alpha = rgb.x;
+    } else if (s.alpha_op == 24u) {
+        alpha = dotproduct3(
+            stage_arg(s.alpha_arg1, diffuse, current, texel, tfactor),
+            stage_arg(s.alpha_arg2, diffuse, current, texel, tfactor));
+    }
     return clamp(vec4<f32>(rgb, alpha), vec4<f32>(0.0), vec4<f32>(1.0));
 }
 
@@ -1340,6 +1447,22 @@ mod tests {
     }
 
     #[test]
+    fn decode_xyzrhw_diffuse_tex1_has_no_specular_input() {
+        let layout = FvfLayout::decode(0x144).unwrap();
+        assert_eq!(layout.stride, 28);
+        assert!(layout.pre_transformed);
+        assert_eq!(layout.texcoord_sets, 1);
+        assert_eq!(
+            layout
+                .attributes
+                .iter()
+                .map(|a| (a.shader_location, a.offset))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (1, 16), (2, 20), (3, 20)]
+        );
+    }
+
+    #[test]
     fn decode_xyzrhw_diffuse_specular_tex1_stride_and_offsets() {
         let layout =
             FvfLayout::decode(FVF_XYZRHW_DIFFUSE_SPECULAR_TEX1).expect("0x1C4 must decode");
@@ -1404,7 +1527,6 @@ mod tests {
             0x0000,          // nothing
             0x0002,          // XYZ only
             0x0040,          // DIFFUSE only
-            0x0044,          // XYZRHW | DIFFUSE
             0x0052,          // XYZ | NORMAL | DIFFUSE
             0x0082,          // XYZ | SPECULAR
             0x0042 | 0x0020, // + PSIZE

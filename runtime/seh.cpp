@@ -334,10 +334,15 @@ jmp_buf *recomp_seh_frame_adopt(X86 *c) {
 
 void recomp_seh_frame_leave(X86 *c) {
     recomp_seh_validate_chain(c, "leave", "");
+    // FS:[0] has already been restored by the guest epilogue. It may do
+    // this before popping local storage, while ESP is still below the removed
+    // record. In the ascending x86 chain, records below the restored head
+    // are unlinked even when the stack has not yet passed them.
+    const uint32_t head = chain_head(c);
     bool removed = false;
     for (size_t i = state.frames.size(); i-- > 0;) {
         SehFrame *f = state.frames[i];
-        if (f->cpu == c && f->registration < c->r[R_ESP] &&
+        if (f->cpu == c && (f->registration < c->r[R_ESP] || f->registration < head) &&
             (f->callback_depth == recomp_callback_depth() || f->active_landing)) {
             LOGV("SEH leave: registration=%08x established=%08x EIP=%08x ESP=%08x", f->registration,
                  f->establishing_eip, c->eip, c->r[R_ESP]);

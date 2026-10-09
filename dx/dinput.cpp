@@ -50,6 +50,11 @@ static const uint8_t IID_IDirectInputDeviceA_[16] =
     IID_BYTES(0x5944E680, 0xC92E, 0x11CF, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00);
 static const uint8_t IID_IDirectInputDevice2A_[16] =
     IID_BYTES(0x5944E682, 0xC92E, 0x11CF, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00);
+static const uint8_t IID_IDirectInput7A_[16] =
+    IID_BYTES(0x9A4CB684, 0x236D, 0x11D3, 0x8E, 0x9D, 0x00, 0xC0, 0x4F, 0x68, 0x44, 0xAE);
+static const uint8_t IID_IDirectInputDevice7A_[16] =
+    IID_BYTES(0x57D7C6BC, 0x2356, 0x11D3, 0x8E, 0x9D, 0x00, 0xC0, 0x4F, 0x68, 0x44, 0xAE);
+
 static const uint8_t GUID_SysMouse_[16] =
     IID_BYTES(0x6F1D2B60, 0xD5A0, 0x11CF, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00);
 static const uint8_t GUID_SysKeyboard_[16] =
@@ -748,6 +753,11 @@ DX_STUB(Device_SendDeviceData, DIERR_UNSUPPORTED)
         "Initialize", 4, Device_Initialize                                                         \
     }
 
+void Device_EffectFileUnsupported(X86 *c) {
+    LOGW("dinput: device effect-file operations are not implemented");
+    com_ret(c, 0x80004001u); // E_NOTIMPL
+}
+
 const ComMethod g_didevice[] = {
     DIDEVICE_COMMON_SLOTS,
     // IDirectInputDevice2A continues in the same vtable. The game creates its
@@ -763,16 +773,16 @@ const ComMethod g_didevice[] = {
     {"Escape", 2, Device_Escape},
     {"Poll", 1, Device_Poll},
     {"SendDeviceData", 5, Device_SendDeviceData},
+    // IDirectInputDevice7 appends these to the version-2 prefix.
+    {"EnumEffectsInFile", 5, Device_EffectFileUnsupported},
+    {"WriteEffectToFile", 5, Device_EffectFileUnsupported},
 };
 
 // ===========================================================================
 // IDirectInputA
 // ===========================================================================
-static void create_device(X86 *c, ComIface iface) {
+static void create_device(X86 *c, ComIface iface, uint32_t guid, uint32_t out, uint32_t outer) {
     ComObj *di = this_dinput(c);
-    uint32_t guid = arg(c, 1);
-    uint32_t out = arg(c, 2);
-    uint32_t outer = arg(c, 3);
     if (!di || !out) {
         com_ret(c, DIERR_INVALIDPARAM);
         return;
@@ -821,7 +831,7 @@ static void create_device(X86 *c, ComIface iface) {
     com_ret(c, DI_OK);
 }
 void DI_CreateDevice(X86 *c) {
-    create_device(c, IF_DINPUTDEVICE);
+    create_device(c, IF_DINPUTDEVICE, arg(c, 1), arg(c, 2), arg(c, 3));
 }
 
 // EnumDevices(dwDevType, callback, ref, dwFlags). The mouse and keyboard
@@ -927,6 +937,29 @@ void DI_Initialize(X86 *c) {
     com_ret(c, DI_OK);
 }
 
+// DirectInput7::CreateDeviceEx(this, device GUID, interface IID, out, outer).
+// The IID changes the requested device view, not the five-slot call ABI.
+void DI_CreateDeviceEx(X86 *c) {
+    uint32_t iid = arg(c, 2), out = arg(c, 3);
+    if (!out || !gm_valid(out, 4) || !iid || !gm_valid(iid, 16)) {
+        com_ret(c, DIERR_INVALIDPARAM);
+        return;
+    }
+    wr32(out, 0);
+    ComIface iface = com_iface_for_iid(iid);
+    if (iface != IF_DINPUTDEVICE) {
+        LOGW("dinput: CreateDeviceEx requested an unsupported device interface");
+        com_ret(c, 0x80004002u); // E_NOINTERFACE
+        return;
+    }
+    create_device(c, iface, arg(c, 1), out, arg(c, 4));
+}
+
+void DI_FindDeviceUnsupported(X86 *c) {
+    LOGW("dinput: FindDevice by product name is not implemented");
+    com_ret(c, 0x80004001u); // E_NOTIMPL
+}
+
 const ComMethod g_dinput[] = {
     {"QueryInterface", 3, com_QueryInterface},
     {"AddRef", 1, com_AddRef},
@@ -936,6 +969,9 @@ const ComMethod g_dinput[] = {
     {"GetDeviceStatus", 2, DI_GetDeviceStatus},
     {"RunControlPanel", 3, DI_RunControlPanel},
     {"Initialize", 3, DI_Initialize},
+    // IDirectInput2 adds FindDevice; IDirectInput7 adds CreateDeviceEx.
+    {"FindDevice", 4, DI_FindDeviceUnsupported},
+    {"CreateDeviceEx", 5, DI_CreateDeviceEx},
 };
 
 // ===========================================================================
@@ -949,7 +985,7 @@ const ComMethod g_dinput[] = {
 static const uint32_t DI8_UNSUPPORTED = 0x80004001u; // E_NOTIMPL
 
 void DI8_CreateDevice(X86 *c) {
-    create_device(c, IF_DINPUTDEVICE8);
+    create_device(c, IF_DINPUTDEVICE8, arg(c, 1), arg(c, 2), arg(c, 3));
 }
 void DI8_EnumDevices(X86 *c) {
     enum_devices(c, true);
@@ -1049,9 +1085,8 @@ void direct_input_create(X86 *c, uint32_t version, uint32_t out, uint32_t outer,
         com_ret(c, CLASS_E_NOAGGREGATION);
         return;
     }
-    // DirectInput refuses a version newer than the runtime. This shim
-    // implements the DirectX 5 interface, so anything above 0x0500 would be a
-    // promise it cannot keep.
+    // Versions through DirectInput7 share the implemented prefix. Unsupported
+    // effect-file and name-search operations remain named E_NOTIMPL returns.
     if (version > 0x0700u) {
         LOGW("dinput: DirectInputCreateA for version %04x is newer than this "
              "shim implements",
@@ -1194,8 +1229,10 @@ void dinput_register() {
 
     com_register_iid(IF_DINPUT, IID_IDirectInputA_);
     com_register_iid(IF_DINPUT, IID_IDirectInput2A_);
+    com_register_iid(IF_DINPUT, IID_IDirectInput7A_);
     com_register_iid(IF_DINPUTDEVICE, IID_IDirectInputDeviceA_);
     com_register_iid(IF_DINPUTDEVICE, IID_IDirectInputDevice2A_);
+    com_register_iid(IF_DINPUTDEVICE, IID_IDirectInputDevice7A_);
 
     imports_register(g_dinput_exports, std::size(g_dinput_exports));
 }

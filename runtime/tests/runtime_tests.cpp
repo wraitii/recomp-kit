@@ -1051,7 +1051,21 @@ static void test_allocator() {
     HeapStats s = heap_stats();
     check(s.free_bytes > 0xc000000, "free bytes %llu after the churn",
           (unsigned long long)s.free_bytes);
-    check(heap_alloc(0x0f000000) == 0, "an allocation larger than the arena fails cleanly");
+    if (HEAP_LIMIT - HEAP_BASE > 0x20000000u) {
+        uint32_t large = heap_alloc(0x20000000u, false, 4096);
+        check(large && large >= HEAP_BASE && large <= HEAP_LIMIT - 0x20000000u,
+              "512 MiB allocation fits the configured guest heap: %08x", large);
+        if (large) {
+            wr32(large, 0x12345678);
+            wr32(large + 0x20000000u - 4, 0x87654321);
+            check(rd32(large) == 0x12345678 && rd32(large + 0x20000000u - 4) == 0x87654321,
+                  "large guest allocation supports both endpoint accesses");
+            check(heap_free(large) && heap_check().empty(),
+                  "large allocation frees with a consistent heap");
+        }
+    }
+    check(heap_alloc(HEAP_LIMIT - HEAP_BASE + 1) == 0,
+          "an allocation larger than the arena fails cleanly");
     check(heap_alloc(0xffffffffu) == 0, "a 0xffffffff request is refused, not rounded to zero");
     uint32_t keep = heap_alloc(64);
     memset(g_mem + keep, 0x5a, 64);
@@ -1345,6 +1359,24 @@ static void test_files(X86 *c) {
     check(size == (uint32_t)st.size, "GetFileSize reports %u, host file is %lld", size,
           (long long)st.size);
 
+    uint32_t timestamps = scratch_block(24);
+    uint64_t expected_write = ((uint64_t)st.mtime + 11644473600ull) * 10000000ull;
+    check(call_import(c, "KERNEL32.dll", "GetFileTime", {h, 0, 0, timestamps}) == 1 &&
+              rd32(timestamps) == (uint32_t)expected_write &&
+              rd32(timestamps + 4) == (uint32_t)(expected_write >> 32),
+          "GetFileTime reported call returns host last-write time as guest FILETIME");
+    check(call_import(c, "KERNEL32.dll", "GetFileTime", {h, 0, 0, 0}) == 1,
+          "GetFileTime permits all optional outputs to be null");
+    check(call_import(c, "KERNEL32.dll", "GetFileTime", {0xffffffffu, 0, 0, timestamps}) == 0 &&
+              get_last_error() == 6,
+          "GetFileTime rejects an invalid handle");
+    check(call_import(c, "IMM32.dll", "ImmIsUIMessageA", {0, 0x81, 0, 0}) == 0,
+          "ImmIsUIMessageA does not consume WM_NCCREATE and preserves its stdcall stack");
+    check(call_import(c, "IMM32.dll", "ImmIsUIMessageA", {0, 0x10f, 0, 0}) == 1,
+          "ImmIsUIMessageA classifies composition without an attached context");
+    check(call_import(c, "IMM32.dll", "ImmIsUIMessageA", {0, 0x286, 0, 0}) == 0,
+          "ImmIsUIMessageA does not consume WM_IME_CHAR");
+
     uint32_t buf = scratch_block(256), read_count = scratch_block(4);
     check(call_import(c, "KERNEL32.dll", "ReadFile", {h, buf, 64, read_count, 0}) == 1,
           "ReadFile of 64 bytes succeeded");
@@ -1374,6 +1406,22 @@ static void test_files(X86 *c) {
     uint32_t attributes = call_import(c, "KERNEL32.dll", "GetFileAttributesA", {dirname});
     check(attributes != 0xffffffffu && (attributes & 0x10),
           "GetFileAttributesA of the executable's directory reports a directory");
+
+    check(call_import(c, "KERNEL32.dll", "CreateFileA", {dirname, 0x80000000u, 3, 0, 3, 0x80, 0}) ==
+                  0xffffffffu &&
+              get_last_error() == 5,
+          "CreateFileA refuses a directory without backup semantics");
+    uint32_t wide_dir = scratch_block(1024);
+    gm_put_wstr(wide_dir, RECOMP_GUEST_ROOT, 512);
+    check(call_import(c, "KERNEL32.dll", "CreateFileW",
+                      {wide_dir, 0xc0000000u, 3, 0, 3, 0x80, 0}) == 0xffffffffu &&
+              get_last_error() == 5,
+          "CreateFileW deferred read/write refuses a directory");
+    uint32_t directory_handle = call_import(c, "KERNEL32.dll", "CreateFileA",
+                                            {dirname, 0x80000000u, 3, 0, 3, 0x02000000u, 0});
+    check(directory_handle != 0xffffffffu, "CreateFileA backup semantics opens a directory");
+    if (directory_handle != 0xffffffffu)
+        call_import(c, "KERNEL32.dll", "CloseHandle", {directory_handle});
 
     // The executable's stem may also name logs or configuration files. Walk
     // until exhaustion instead of assuming exactly two matches or their order.
@@ -1446,6 +1494,31 @@ static void test_files(X86 *c) {
     check(cwd_probe == (uint32_t)strlen(RECOMP_GUEST_ROOT) + 1,
           "GetCurrentDirectoryA(1, buf) reports the required size (%u)", cwd_probe);
 
+    uint32_t wide_cwd = scratch_block(1024);
+    gm_put_wstr(wide_cwd, RECOMP_GUEST_ROOT, 512);
+    uint32_t cwd_tramp = imports_resolve("KERNEL32.dll", "SetCurrentDirectoryW");
+    check(imports_argc(cwd_tramp) == 1, "SetCurrentDirectoryW has one stdcall argument");
+    check(call_import(c, "KERNEL32.dll", "SetCurrentDirectoryW", {wide_cwd}) == 1,
+          "SetCurrentDirectoryW accepts the UTF-16 guest root and balances ESP");
+    call_import(c, "KERNEL32.dll", "GetCurrentDirectoryA", {260, pathbuf});
+    check(gm_str(pathbuf) == RECOMP_GUEST_ROOT,
+          "SetCurrentDirectoryW shares the ANSI current-directory state");
+
+    uint32_t wide_need = call_import(c, "KERNEL32.dll", "GetCurrentDirectoryW", {0, 0});
+    check(wide_need == strlen(RECOMP_GUEST_ROOT) + 1,
+          "GetCurrentDirectoryW size probe includes the terminator");
+    wr16(wide_cwd, 0x1234);
+    check(call_import(c, "KERNEL32.dll", "GetCurrentDirectoryW", {wide_need - 1, wide_cwd}) ==
+                  wide_need &&
+              rd16(wide_cwd) == 0x1234,
+          "GetCurrentDirectoryW short buffer reports required units without writing");
+    check(call_import(c, "KERNEL32.dll", "GetCurrentDirectoryW", {wide_need, wide_cwd}) ==
+                  wide_need - 1 &&
+              gm_wstr(wide_cwd) == RECOMP_GUEST_ROOT,
+          "GetCurrentDirectoryW writes UTF-16 and returns length without terminator");
+    check(rd16(wide_cwd + 2 * (wide_need - 1)) == 0,
+          "GetCurrentDirectoryW terminates the exact-size buffer");
+
     // GetTempPathA: virtual directory with a trailing backslash; the return
     // is the length without the null, or the required size when too small.
     uint32_t tl = call_import(c, "KERNEL32.dll", "GetTempPathA", {260, pathbuf});
@@ -1507,10 +1580,14 @@ static void test_boot_shims(X86 *c) {
     os_setenv("RECOMP_GUEST_ARGS", "-debugout -nointro");
     win32_reset_command_line_for_test();
     std::string cmdline = gm_str(call_import(c, "KERNEL32.dll", "GetCommandLineA", {}));
-    check(cmdline == std::string(RECOMP_GUEST_ROOT "\\" RECOMP_EXECUTABLE) + " -debugout -nointro",
+    check(cmdline == std::string("\"" RECOMP_GUEST_ROOT "\\" RECOMP_EXECUTABLE "\"") +
+                         " -debugout -nointro",
           "GetCommandLineA appends RECOMP_GUEST_ARGS: \"%s\"", cmdline.c_str());
     os_unsetenv("RECOMP_GUEST_ARGS");
     win32_reset_command_line_for_test();
+    check(gm_str(call_import(c, "KERNEL32.dll", "GetCommandLineA", {})) ==
+              "\"" RECOMP_GUEST_ROOT "\\" RECOMP_EXECUTABLE "\"",
+          "GetCommandLineA quotes the executable with no guest arguments");
     uint32_t ms = scratch_block(32);
     wr32(ms, 32);
     call_import(c, "KERNEL32.dll", "GlobalMemoryStatus", {ms});
@@ -3018,6 +3095,35 @@ static void test_scheduling(X86 *c) {
         call_import(c, "KERNEL32.dll", "GetTickCount", {});
     check(g_service_loops > before,
           "polling GetTickCount alone let the service thread run (%u passes)", g_service_loops);
+
+    // Guest-only polling of translated helpers must also let workers run.
+    // Keep a nontrivial CPU (including pending flags) across the checkpoint:
+    // the worker must only change its own state and shared guest memory.
+    before = g_service_loops;
+    X86 original_cpu = *c;
+    c->r[R_EAX] = 0x87654321;
+    c->r[R_EDX] = 0xfedcba98;
+    c->cc_op = X86_CC_ADD;
+    c->cc_size = 4;
+    c->cc_mask = 0x3f;
+    c->cc_a = 0xffffffffu;
+    c->cc_b = 1;
+    c->cc_res = 0;
+    X86 saved_cpu = *c;
+    t0 = wall_seconds();
+    while (wall_seconds() - t0 < 0.05)
+        recomp_execution_checkpoint();
+    check(g_service_loops > before, "translated-call polling lets the service worker advance");
+    check(memcmp(c, &saved_cpu, sizeof(*c)) == 0,
+          "translated checkpoints preserve the polling thread's complete CPU");
+    *c = original_cpu;
+    before = g_service_loops;
+    sched_atomic_enter(c->r[R_ESP]);
+    t0 = wall_seconds();
+    while (wall_seconds() - t0 < 0.05)
+        recomp_execution_checkpoint();
+    check(g_service_loops == before, "translated checkpoints respect an atomic stretch");
+    sched_atomic_leave();
 
     // --- an atomic stretch keeps the baton through import checkpoints ------
     before = g_service_loops;
@@ -5705,6 +5811,34 @@ static void test_kernel32_wide() {
     if (h && h != 0xffffffffu)
         call_import(&c, "KERNEL32.dll", "CloseHandle", {h});
 
+    section("kernel32 ANSI system messages");
+    const char *denied = "Access is denied.\r\n";
+    set_last_error(5);
+    wr32(fd, 0);
+    check(call_import(&c, "KERNEL32.dll", "FormatMessageA", {0x1300, 0, 5, 0x400, fd, 0, 0}) ==
+                  strlen(denied) &&
+              rd32(fd) && gm_str(rd32(fd)) == denied && get_last_error() == 5,
+          "FormatMessageA reported call allocates guest text and preserves last error");
+    if (rd32(fd))
+        check(call_import(&c, "KERNEL32.dll", "LocalFree", {rd32(fd)}) == 0,
+              "FormatMessageA allocation is LocalFree compatible");
+    memset(g_mem + fd, 0x5a, 64);
+    check(call_import(&c, "KERNEL32.dll", "FormatMessageA", {0x1000, 0, 5, 0, fd, 18, 0}) == 0 &&
+              get_last_error() == 122 && rd8(fd) == 0x5a,
+          "FormatMessageA short buffer fails without truncating");
+    check(call_import(&c, "KERNEL32.dll", "FormatMessageA", {0x1000, 0, 5, 0x409, fd, 20, 0}) ==
+                  19 &&
+              gm_str(fd) == denied && rd8(fd + 20) == 0x5a,
+          "FormatMessageA exact buffer includes CRLF and terminating NUL");
+    wr32(fd, 0x12345678);
+    check(call_import(&c, "KERNEL32.dll", "FormatMessageA", {0x1300, 0, 0xffffffff, 0, fd, 0, 0}) ==
+                  0 &&
+              get_last_error() == 317 && rd32(fd) == 0x12345678,
+          "FormatMessageA unknown message leaves allocation output untouched");
+    check(call_import(&c, "KERNEL32.dll", "FormatMessageA", {0x1000, 0, 5, 0, 0, 64, 0}) == 0 &&
+              get_last_error() == 87,
+          "FormatMessageA rejects null output");
+
     section("kernel32 wide text and time");
     gm_put_wstr(s, "caf\xc3\xa9", 64);
     gm_put_wstr(s + 128, " \xf0\x9f\x98\x80", 64);
@@ -8001,10 +8135,10 @@ int main(int argc, char **argv) {
         child_setjmp_abort(c);
     // Unsupported APIs must stop execution, rather than report fabricated
     // Windows results. Exercise the dispatcher in children that may abort.
-    const char *unsupported[][2] = {
-        {"KERNEL32.dll", "GetFileTime"},  {"KERNEL32.dll", "FormatMessageA"},
-        {"DBGHELP.dll", "SymGetOptions"}, {"DBGHELP.dll", "SymSetOptions"},
-        {"DBGHELP.dll", "SymInitialize"}, {"DBGHELP.dll", "SymCleanup"}};
+    const char *unsupported[][2] = {{"DBGHELP.dll", "SymGetOptions"},
+                                    {"DBGHELP.dll", "SymSetOptions"},
+                                    {"DBGHELP.dll", "SymInitialize"},
+                                    {"DBGHELP.dll", "SymCleanup"}};
     for (const auto &api : unsupported) {
         char exe[4096];
         check(os_exe_path(exe, sizeof exe) == 0, "unsupported test knows its executable");

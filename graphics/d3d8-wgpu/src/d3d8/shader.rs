@@ -746,7 +746,7 @@ mod gpu_tests {
         let mut prefixed = vec![0; 4096 * 16];
         prefixed.extend_from_slice(bytemuck::cast_slice(&data));
         let vertices = VertexBuffer::borrowed(&prefixed, 16).unwrap();
-        device.clear(0, 1, 0xff000000, 1.0, 0).unwrap();
+        device.clear(&[], 1, 0xff000000, 1.0, 0).unwrap();
         device.begin_scene().unwrap();
         for (x, color) in [(0, [1.0f32, 0.0, 0.0, 1.0]), (32, [0.0, 1.0, 0.0, 1.0])] {
             let bits = color.map(f32::to_bits);
@@ -781,7 +781,7 @@ mod gpu_tests {
         let padded = VertexBuffer::borrowed(&padded, 32).unwrap();
         device.state.viewport.x = 0;
         device.state.viewport.width = 64;
-        device.clear(0, 1, 0xff000000, 1.0, 0).unwrap();
+        device.clear(&[], 1, 0xff000000, 1.0, 0).unwrap();
         device.begin_scene().unwrap();
         device.draw_primitive(4, 0x10000, &padded, 0, 1).unwrap();
         device.end_scene().unwrap();

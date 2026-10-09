@@ -25,7 +25,7 @@ use crate::d3d8::state::{Light, LitInput, Material, Viewport};
 /// 6: adds `IDirect3DDevice8::SetTexture` (level-0 upload + sampling).
 /// 7: `SetTexture` carries the whole mip chain (one generation per level).
 /// 8: shader-model 1.1 programs, bindings and draw constant snapshots.
-pub const ABI_VERSION: u32 = 8;
+pub const ABI_VERSION: u32 = 9;
 
 /// Opaque device handle. The bridge never inspects the pointee.
 pub struct D3d8Device {
@@ -115,6 +115,16 @@ pub struct D3d8Material {
     pub specular: D3d8ColorValue,
     pub emissive: D3d8ColorValue,
     pub power: f32,
+}
+
+/// Host copy of a signed, exclusive-maxima D3DRECT (16 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct D3d8Rect {
+    pub x1: i32,
+    pub y1: i32,
+    pub x2: i32,
+    pub y2: i32,
 }
 
 /// `D3DVIEWPORT8`, 24 bytes: `X, Y, Width, Height` then `MinZ, MaxZ`.
@@ -473,12 +483,13 @@ pub extern "C" fn d3d8_device_destroy(dev: *mut D3d8Device) {
     }
 }
 
-/// `IDirect3DDevice8::Clear` for the supported full-target clear. `flags` is
+/// `IDirect3DDevice8::Clear`. Rectangles are host copies, consumed before return. `flags` is
 /// the D3DCLEAR_* mask; `z`/`stencil` are the depth and stencil clear values.
 #[unsafe(no_mangle)]
 pub extern "C" fn d3d8_device_clear(
     dev: *mut D3d8Device,
     rect_count: u32,
+    rects: *const D3d8Rect,
     flags: u32,
     color: u32,
     z: f32,
@@ -489,7 +500,17 @@ pub extern "C" fn d3d8_device_clear(
         write_error(err, D3d8Status::InvalidArgument, "clear: null device");
         return D3d8Status::InvalidArgument as i32;
     };
-    report(err, device.clear(rect_count, flags, color, z, stencil))
+    if rect_count != 0 && rects.is_null() {
+        write_error(err, D3d8Status::InvalidArgument, "Clear: null rectangles");
+        return D3d8Status::InvalidArgument as i32;
+    }
+    let rectangles = if rect_count == 0 {
+        &[][..]
+    } else {
+        // The caller supplies a valid, aligned host array, never guest addresses.
+        unsafe { core::slice::from_raw_parts(rects, rect_count as usize) }
+    };
+    report(err, device.clear(rectangles, flags, color, z, stencil))
 }
 
 /// `IDirect3DDevice8::BeginScene`.
@@ -1521,6 +1542,7 @@ mod tests {
         let status = d3d8_device_clear(
             core::ptr::null_mut(),
             0,
+            core::ptr::null(),
             1,
             0,
             1.0,

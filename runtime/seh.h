@@ -15,7 +15,8 @@ jmp_buf *recomp_seh_frame_enter(X86 *c);
 uint64_t recomp_seh_frame_mark(X86 *c);
 void recomp_seh_frame_orphan(X86 *c, uint64_t mark);
 jmp_buf *recomp_seh_frame_adopt(X86 *c);
-/* Drop records below ESP at this callback level; retain active landings. */
+/* Drop records below ESP or the restored chain head at this callback level;
+ * retain active landings. */
 void recomp_seh_frame_leave(X86 *c);
 void recomp_seh_land(X86 *c);
 uint32_t recomp_seh_pending_target(void);

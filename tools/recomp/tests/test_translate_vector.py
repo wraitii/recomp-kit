@@ -23,3 +23,11 @@ def test_the_vector_rule_names_ymm_registers_and_ymmword_operands():
     assert T.is_vector_insn("VMOVUPS", ["YMM1", "ymmword ptr [EAX]"])
     assert T.is_vector_insn("VPXOR", ["YMM0", "YMM0", "YMM0"])
     assert not T.is_vector_insn("MOV", ["EAX", "dword ptr [EBX]"])
+
+
+def test_movlhps_is_emitted_instead_of_a_vector_trap():
+    from test_translate_insns import CASES
+    cases = [case for case in CASES if case.name.startswith("MOVLHPS ")]
+    assert len(cases) == 4
+    for case in cases:
+        assert "recomp_unmodelled" not in translate_case(case)

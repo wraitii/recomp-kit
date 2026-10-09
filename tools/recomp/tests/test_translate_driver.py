@@ -300,6 +300,8 @@ def test_computed_returns_use_sorted_call_continuations(tmp_path, monkeypatch, r
     assert jump.index("recomp_is_call_return(target)") < jump.index("recomp_unknown_jump(c, target)")
     call = text.split("void recomp_call(", 1)[1].split("void recomp_jump(", 1)[0]
     assert "recomp_is_call_return" not in call
+    assert "if (i >= 0) {\n        recomp_execution_checkpoint();" in call
+    assert "if (i >= 0) {\n        recomp_execution_checkpoint();" in jump
     assert '#include "thunks.h"' in text
     assert "int recomp_thunk_target_kind(uint32_t target)" in text
     assert "return (recomp_is_call_return(target) || recomp_module_is_call_return(target)) ? 2 : 0;" in text

@@ -54,7 +54,7 @@ KEY_NAMES = (
 BUTTON_TARGET_RE = re.compile(
     r"^(key:[A-Za-z0-9]+|mouse_(left|right|middle)|wheel_(up|down)|"
     r"action:(settings|system_keyboard|edit_layout)|none)$")
-HEAP_END = 0x0e000000        # runtime/x86.h GUEST_HEAP_END; the mods' heap starts there
+HEAP_END = 0x0e000000        # default heap end; reserved low runtime regions start here
 GUEST_SIZE_DEFAULT = 0x10000000   # runtime/x86.h GUEST_SIZE: the arena, 256 MB unless a module needs more
 AUX_REQUIRED_KEYS = ("name", "path", "sha256", "base", "size")
 
@@ -99,10 +99,10 @@ def windows_version(value):
     return major, minor, build, 2 if major >= 5 else 1
 
 
-def validate_heap_base(value):
+def validate_heap_base(value, heap_end=HEAP_END):
     """The heap arena start: page aligned, above the image base, below the arena end."""
-    if value % 0x1000 or not (0x00400000 < value < HEAP_END):
-        raise ValueError("[game] heap_base %#x must be page aligned and between 0x00400000 and %#x" % (value, HEAP_END))
+    if value % 0x1000 or not (0x00400000 < value < heap_end):
+        raise ValueError("[game] heap_base %#x must be page aligned and between 0x00400000 and %#x" % (value, heap_end))
     return value
 
 
@@ -199,7 +199,9 @@ def load(game_dir):
     missing = [key for key in REQUIRED_GAME_KEYS if key not in game]
     if missing:
         raise ValueError("%s: missing [game] keys: %s" % (source, ", ".join(missing)))
-    game["heap_base"] = validate_heap_base(int(game.get("heap_base", HEAP_BASE_DEFAULT)))
+    game["heap_end"] = int(game.get("heap_end", HEAP_END))
+    game["heap_base"] = validate_heap_base(int(game.get("heap_base", HEAP_BASE_DEFAULT)),
+                                           game["heap_end"])
     windows_version(game.setdefault("windows_version", "4.10"))
     # Fail loudly rather than returning 0 from an import whose stdcall arity is
     # unknown: the un-popped arguments otherwise drift the guest stack.
@@ -331,10 +333,18 @@ def load_aux_modules(cfg, game_dir, source):
     module; the default arena is 0x10000000."""
     game = cfg["game"]
     guest_size = int(game.setdefault("guest_size", GUEST_SIZE_DEFAULT))
-    if guest_size % 0x1000 or guest_size < GUEST_SIZE_DEFAULT:
-        raise ValueError("%s: [game] guest_size %#x must be page aligned and at least %#x"
+    if guest_size % 0x1000 or guest_size < GUEST_SIZE_DEFAULT or guest_size > 0xfffff000:
+        raise ValueError("%s: [game] guest_size %#x must be page aligned and between %#x and 0xfffff000"
                          % (source, guest_size, GUEST_SIZE_DEFAULT))
     game["guest_size"] = guest_size
+    heap_base, heap_end = game["heap_base"], game["heap_end"]
+    if heap_end % 0x1000 or heap_end > guest_size:
+        raise ValueError("%s: [game] heap_end must be page aligned and fit inside guest_size" % source)
+    # The mod heap, stack, callback sentinel, TEB and imports retain their
+    # fixed low addresses. A larger heap must lie wholly above this band.
+    if heap_base < GUEST_SIZE_DEFAULT and heap_end > HEAP_END:
+        raise ValueError("%s: [game] heap overlaps reserved runtime memory [%#x, %#x)"
+                         % (source, HEAP_END, GUEST_SIZE_DEFAULT))
     modules = []
     for key, entry in sorted(cfg.get("modules", {}).get("aux", {}).items()):
         missing = [k for k in AUX_REQUIRED_KEYS if k not in entry]
@@ -344,6 +354,8 @@ def load_aux_modules(cfg, game_dir, source):
         if base % 0x1000 or size <= 0 or base + size > guest_size:
             raise ValueError("%s: [modules.aux.%s] base %#x size %#x must fit below guest_size %#x"
                              % (source, key, base, size, guest_size))
+        if base < heap_end and heap_base < base + size:
+            raise ValueError("%s: [modules.aux.%s] overlaps the guest heap" % (source, key))
         alignment = entry.get("function_alignment", 4)
         if type(alignment) is not int or alignment <= 0:
             raise ValueError("%s: [modules.aux.%s] function_alignment must be a positive integer" % (source, key))

@@ -102,6 +102,7 @@ endif()
 include_directories(${CMAKE_BINARY_DIR}/generated)
 add_compile_definitions(GUEST_IMAGE_BASE=${RECOMP_IMAGE_BASE})
 add_compile_definitions(GUEST_HEAP_BASE=${RECOMP_HEAP_BASE})
+add_compile_definitions(GUEST_HEAP_END=${RECOMP_HEAP_END})
 add_compile_definitions(GUEST_SIZE=${RECOMP_GUEST_SIZE})
 add_compile_definitions(RECOMP_STORE_HOOKS=${RECOMP_STORE_HOOKS})
 # Validation build: generated call sites poison the fields their call contract

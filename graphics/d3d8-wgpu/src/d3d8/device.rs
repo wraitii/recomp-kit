@@ -7,7 +7,8 @@ use super::{
         lit_shader_source,
     },
     resource::{
-        IndexedDraw, VertexBuffer, expand_indexed_into, indexed_list_into, packed_indexed_list_into,
+        IndexedDraw, VertexBuffer, expand_indexed_into, expand_nonindexed_into, indexed_list_into,
+        packed_indexed_list_into,
     },
     shader::{self, Declaration, Program},
     state::{DeviceState, LightingUniform, LitInput, MAX_TEXTURE_STAGES},
@@ -116,21 +117,25 @@ fn skipped_fvf(fvf: u32) -> bool {
 /// D3DPRIMITIVETYPE value for a non-indexed draw, mapped to the number of
 /// vertices each primitive consumes.
 ///
-/// Only POINTLIST (1) and TRIANGLELIST (4) are implemented. The guest draws
-/// points for the star field (`FUN_00545ca0`) and triangle lists for everything
-/// else; strips, fans and lines are unused and fail by name rather than being
-/// expanded or silently dropped.
+/// Points, line lists and triangle lists map directly to wgpu primitives.
+/// Triangle strips/fans are expanded before entering this draw path.
 fn topology_vertex_count(topology: u32, primitive_count: u32) -> Result<u32, RenderError> {
     match topology {
         // D3DPT_POINTLIST: one vertex per point.
         1 => Ok(primitive_count),
+        // D3DPT_LINELIST: two vertices per independent line.
+        2 => primitive_count
+            .checked_mul(2)
+            .ok_or_else(|| RenderError::new("DrawPrimitive", "vertex range overflow")),
         // D3DPT_TRIANGLELIST: three vertices per triangle.
         4 => primitive_count
             .checked_mul(3)
             .ok_or_else(|| RenderError::new("DrawPrimitive", "vertex range overflow")),
         other => Err(RenderError::new(
             "DrawPrimitive",
-            format!("unsupported topology {other}; expected POINTLIST (1) or TRIANGLELIST (4)"),
+            format!(
+                "unsupported topology {other}; expected POINTLIST (1), LINELIST (2) or TRIANGLELIST (4)"
+            ),
         )),
     }
 }
@@ -139,6 +144,7 @@ fn topology_vertex_count(topology: u32, primitive_count: u32) -> Result<u32, Ren
 fn wgpu_topology(topology: u32) -> wgpu::PrimitiveTopology {
     match topology {
         1 => wgpu::PrimitiveTopology::PointList,
+        2 => wgpu::PrimitiveTopology::LineList,
         _ => wgpu::PrimitiveTopology::TriangleList,
     }
 }
@@ -1294,24 +1300,16 @@ impl Device {
         })
     }
 
-    /// `IDirect3DDevice8::Clear`. `flags` is `D3DCLEAR_*`; `argb` is the color,
-    /// `z` the depth value and `stencil` the stencil value. Only a full-target
-    /// clear (no rectangles) is supported, which is what the guest uses; the
-    /// flags select color and/or depth/stencil exactly, with no silent drop.
+    /// Clear explicit screen rectangles clipped to the viewport, or the whole
+    /// viewport for an empty slice. Independent clear passes preserve draw order.
     pub fn clear(
         &mut self,
-        rect_count: u32,
+        rects: &[crate::abi::D3d8Rect],
         flags: u32,
         argb: u32,
         z: f32,
         stencil: u32,
     ) -> Result<(), RenderError> {
-        if rect_count != 0 {
-            return Err(RenderError::new(
-                "Clear",
-                "clear rectangles are unsupported; only a full-target clear is implemented",
-            ));
-        }
         if flags & !(CLEAR_TARGET | CLEAR_ZBUFFER | CLEAR_STENCIL) != 0 || flags == 0 {
             return Err(RenderError::new(
                 "Clear",
@@ -1326,17 +1324,53 @@ impl Device {
         }
         self.flush_draws();
         let v = self.state.viewport;
-        self.gpu.clear_region(
-            &self.target,
-            flags,
-            argb,
-            z,
-            stencil,
-            v.x,
-            v.y,
-            v.width,
-            v.height,
-        )?;
+        // Validate attachments even when all rectangles clip to empty.
+        if flags & (CLEAR_ZBUFFER | CLEAR_STENCIL) != 0 && self.target.depth.is_none() {
+            return Err(RenderError::new(
+                "Clear",
+                "depth/stencil requested without attachment",
+            ));
+        }
+        if flags & CLEAR_STENCIL != 0 && !self.target.depth.as_ref().is_some_and(|d| d.has_stencil)
+        {
+            return Err(RenderError::new(
+                "Clear",
+                "stencil requested without stencil aspect",
+            ));
+        }
+        if rects.is_empty() {
+            self.gpu.clear_region(
+                &self.target,
+                flags,
+                argb,
+                z,
+                stencil,
+                v.x,
+                v.y,
+                v.width,
+                v.height,
+            )?;
+        } else {
+            for r in rects {
+                let x1 = i64::from(r.x1).max(i64::from(v.x));
+                let y1 = i64::from(r.y1).max(i64::from(v.y));
+                let x2 = i64::from(r.x2).min(i64::from(v.x) + i64::from(v.width));
+                let y2 = i64::from(r.y2).min(i64::from(v.y) + i64::from(v.height));
+                if x2 > x1 && y2 > y1 {
+                    self.gpu.clear_region(
+                        &self.target,
+                        flags,
+                        argb,
+                        z,
+                        stencil,
+                        x1 as u32,
+                        y1 as u32,
+                        (x2 - x1) as u32,
+                        (y2 - y1) as u32,
+                    )?;
+                }
+            }
+        }
         self.publish_target();
         Ok(())
     }
@@ -1848,6 +1882,25 @@ impl Device {
         start_vertex: u32,
         primitive_count: u32,
     ) -> Result<(), RenderError> {
+        if matches!(topology, 5 | 6) {
+            if primitive_count == 0 {
+                return Ok(());
+            }
+            let mut scratch = std::mem::take(&mut self.index_scratch);
+            let result = (|| {
+                expand_nonindexed_into(
+                    &mut scratch,
+                    vertices,
+                    topology,
+                    start_vertex,
+                    primitive_count,
+                )?;
+                let view = VertexBuffer::borrowed(&scratch, vertices.stride)?;
+                self.draw_stream(4, fvf, &view, 0, primitive_count, None)
+            })();
+            self.index_scratch = scratch;
+            return result;
+        }
         self.draw_stream(topology, fvf, vertices, start_vertex, primitive_count, None)
     }
 
@@ -2011,7 +2064,17 @@ impl Device {
                 }
             }
         }
-        if textured && vs.is_none() && !layout.attributes.iter().any(|a| a.shader_location == 2) {
+        // Color-only RHW vertices carry no texture coordinates even when a
+        // texture remains bound. The RHW color entry point supplies zero UVs,
+        // and for_pre_transformed marks both coordinate sets unavailable,
+        // following the missing-set behavior documented in for_fvf. Keep the
+        // stage operations and bound textures rather than rejecting the draw.
+        let color_only_rhw = fvf == 0x44;
+        if textured
+            && vs.is_none()
+            && !layout.attributes.iter().any(|a| a.shader_location == 2)
+            && !color_only_rhw
+        {
             let error = RenderError::new(
                 "DrawPrimitive",
                 "an active texture stage requires D3DFVF_TEX1 texture coordinates",
@@ -2066,8 +2129,8 @@ impl Device {
         // varies vertex layout and effective depth/blend pipeline state.
         let depth_state = self.depth_stencil_state();
         let blend = survey_or_skip!(self.blend_state());
-        let (cull_mode, front_face) = if topology == 1 {
-            // Culling does not apply to points; keep the pipeline independent
+        let (cull_mode, front_face) = if matches!(topology, 1 | 2) {
+            // Culling does not apply to points or lines; keep the pipeline independent
             // of the triangle cull state.
             (None, wgpu::FrontFace::Ccw)
         } else {
@@ -2395,7 +2458,13 @@ impl Device {
                 vertex: wgpu::VertexState {
                     module: shader,
                     entry_point: Some(if layout.pre_transformed {
-                        "vs_rhw_main"
+                        if textured && fvf == 0x44 {
+                            "vs_rhw_color_main"
+                        } else if layout.attributes.iter().any(|a| a.shader_location == 4) {
+                            "vs_rhw_main"
+                        } else {
+                            "vs_rhw_nospec_main"
+                        }
                     } else {
                         "vs_main"
                     }),
@@ -3065,6 +3134,115 @@ mod tests {
     use crate::d3d8::enums::D3DBLEND;
 
     #[test]
+    fn dotproduct3_signed_rgb_clamps_and_routes_alpha_on_gpu() {
+        use super::Device;
+        use crate::{backend::GpuContext, d3d8::resource::VertexBuffer};
+        let gpu = pollster::block_on(GpuContext::new_headless()).expect("GPU adapter");
+        let mut device = Device::new(gpu, 8, 8, 21, 0).unwrap();
+        device.state.set_render_state(7, 0).unwrap();
+        device.state.set_render_state(137, 0).unwrap();
+        device.state.set_render_state(22, 1).unwrap();
+        device.state.set_texture_stage_state(0, 2, 0).unwrap(); // COLORARG1 DIFFUSE
+        device.state.set_texture_stage_state(0, 3, 3).unwrap(); // COLORARG2 TFACTOR
+        device.state.set_texture_stage_state(0, 5, 0).unwrap(); // ALPHAARG1 DIFFUSE
+        device.state.set_texture_stage_state(0, 6, 3).unwrap(); // ALPHAARG2 TFACTOR
+        // Expected values derive from 4*sum((a.rgb-.5)*(b.rgb-.5)).
+        // Opposing components clamp to zero, aligned components saturate,
+        // and asymmetric RGB proves this is a dot rather than a scalar multiply.
+        for (diffuse, factor, expected) in [
+            (0x00ffffffu32, 0xff000000u32, 0u8),
+            (0x00000000, 0xff000000, 255),
+            (0x00ffffff, 0xffffffff, 255),
+            (0x00ff8080, 0xffbf8080, 127),
+            (0x00ff00ff, 0xffbfbfbf, 127),
+        ] {
+            device.state.set_render_state(60, factor).unwrap();
+            let mut bytes = Vec::new();
+            for pos in [[-1.0f32, -1.0, 0.5], [3.0, -1.0, 0.5], [-1.0, 3.0, 0.5]] {
+                for f in pos {
+                    bytes.extend(f.to_le_bytes());
+                }
+                bytes.extend(diffuse.to_le_bytes());
+                bytes.extend([0; 8]);
+            }
+            let vb = VertexBuffer::borrowed(&bytes, 24).unwrap();
+            for alpha_only in [false, true] {
+                device
+                    .state
+                    .set_texture_stage_state(0, 1, if alpha_only { 2 } else { 24 })
+                    .unwrap();
+                device
+                    .state
+                    .set_texture_stage_state(0, 4, if alpha_only { 24 } else { 2 })
+                    .unwrap();
+                device.clear(&[], 1, 0, 1.0, 0).unwrap();
+                device.begin_scene().unwrap();
+                device.draw_primitive(4, 0x142, &vb, 0, 1).unwrap();
+                device.end_scene().unwrap();
+                let pixels = device.read_pixels().unwrap();
+                let pixel = &pixels[(4 * 8 + 4) * 4..(4 * 8 + 4) * 4 + 4];
+                assert!(
+                    (i16::from(pixel[3]) - i16::from(expected)).abs() <= 1,
+                    "alpha: {diffuse:#x} {factor:#x}: {pixel:?}"
+                );
+                if !alpha_only {
+                    for c in &pixel[..3] {
+                        assert!((i16::from(*c) - i16::from(expected)).abs() <= 1);
+                    }
+                } else {
+                    assert_eq!(
+                        &pixel[..3],
+                        &[(diffuse >> 16) as u8, (diffuse >> 8) as u8, diffuse as u8]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a8_texture_upload_and_sampling_preserve_alpha_on_gpu() {
+        use super::{Device, TextureLevelUpload};
+        use crate::{backend::GpuContext, d3d8::resource::VertexBuffer};
+        let gpu = pollster::block_on(GpuContext::new_headless()).expect("GPU adapter");
+        let mut device = Device::new(gpu, 8, 8, 21, 0).unwrap();
+        device.state.set_render_state(7, 0).unwrap();
+        device.state.set_render_state(137, 0).unwrap();
+        device.state.set_render_state(22, 1).unwrap();
+        device.state.set_texture_stage_state(0, 1, 2).unwrap(); // SELECTARG1 TEXTURE
+        let mut bytes = Vec::new();
+        for pos in [[-1.0f32, -1.0, 0.5], [3.0, -1.0, 0.5], [-1.0, 3.0, 0.5]] {
+            for f in pos {
+                bytes.extend(f.to_le_bytes());
+            }
+            bytes.extend(u32::MAX.to_le_bytes());
+            bytes.extend([0; 8]);
+        }
+        let vb = VertexBuffer::borrowed(&bytes, 24).unwrap();
+        for (generation, a) in [0u8, 1, 64, 128, 254, 255].into_iter().enumerate() {
+            device
+                .set_texture(
+                    0,
+                    999,
+                    28,
+                    &[TextureLevelUpload {
+                        level: 0,
+                        generation: generation as u64,
+                        force_upload: false,
+                        width: 1,
+                        height: 1,
+                        data: &[a],
+                    }],
+                )
+                .unwrap();
+            device.begin_scene().unwrap();
+            device.draw_primitive(4, 0x142, &vb, 0, 1).unwrap();
+            device.end_scene().unwrap();
+            let pixels = device.read_pixels().unwrap();
+            assert_eq!(&pixels[(4 * 8 + 4) * 4..(4 * 8 + 4) * 4 + 4], &[0, 0, 0, a]);
+        }
+    }
+
+    #[test]
     fn unchanged_render_texture_bind_keeps_batch_and_rewrite_orders_old_draws() {
         use super::{Device, TextureLevelUpload};
         use crate::{backend::GpuContext, d3d8::resource::VertexBuffer};
@@ -3149,7 +3327,7 @@ mod tests {
             vertices.extend(0xff00ff00u32.to_le_bytes());
         }
         for format in [101, 102] {
-            device.clear(0, 1, 0, 1.0, 0).unwrap();
+            device.clear(&[], 1, 0, 1.0, 0).unwrap();
             let mut indices: Vec<u8> = [99u32, 2, 0, 1, 2, 0, 1]
                 .into_iter()
                 .flat_map(|i| {
@@ -3311,7 +3489,7 @@ mod tests {
                 let mut expanded = Vec::new();
                 expand_indexed_into(&mut expanded, &vertices, &indices, draw).unwrap();
                 device.shader_uniform.vc[0] = [0.5, 0.75, 1.0, 1.0];
-                device.clear(0, 1, 0xff000000, 1.0, 0).unwrap();
+                device.clear(&[], 1, 0xff000000, 1.0, 0).unwrap();
                 device.begin_scene().unwrap();
                 device.state.viewport.x = 0;
                 device.state.viewport.width = 32;
@@ -3525,7 +3703,7 @@ mod tests {
                             }
                         })
                         .collect();
-                    device.clear(0, 1, 0xff000000, 1.0, 0).unwrap();
+                    device.clear(&[], 1, 0xff000000, 1.0, 0).unwrap();
                     device.begin_scene().unwrap();
                     device.state.viewport.width = 32;
                     device.state.viewport.x = 0;
@@ -3674,21 +3852,25 @@ mod tests {
     }
 
     #[test]
-    fn point_and_triangle_topologies_consume_the_right_vertex_count() {
+    fn supported_topologies_consume_the_right_vertex_count() {
         use super::{topology_vertex_count, wgpu_topology};
         // POINTLIST: one vertex per point.
         assert_eq!(topology_vertex_count(1, 7).unwrap(), 7);
         assert_eq!(wgpu_topology(1), wgpu::PrimitiveTopology::PointList);
+        // LINELIST: two vertices per independent line.
+        assert_eq!(topology_vertex_count(2, 7).unwrap(), 14);
+        assert_eq!(wgpu_topology(2), wgpu::PrimitiveTopology::LineList);
+        assert!(topology_vertex_count(2, u32::MAX).is_err());
         // TRIANGLELIST: three vertices per triangle.
         assert_eq!(topology_vertex_count(4, 7).unwrap(), 21);
         assert_eq!(wgpu_topology(4), wgpu::PrimitiveTopology::TriangleList);
-        // Overflow and the unimplemented line/strip/fan topologies fail by name.
+        // Overflow and the unimplemented strip/fan topologies fail by name.
         assert!(topology_vertex_count(4, u32::MAX).is_err());
-        for topology in [0, 2, 3, 5, 6, 7] {
+        for topology in [0, 3, 5, 6, 7] {
             let err = topology_vertex_count(topology, 1).unwrap_err();
             assert!(
                 err.cause
-                    .contains("expected POINTLIST (1) or TRIANGLELIST (4)")
+                    .contains("expected POINTLIST (1), LINELIST (2) or TRIANGLELIST (4)")
             );
         }
     }

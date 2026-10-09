@@ -322,3 +322,26 @@ def test_a_handler_that_is_no_delphi_stub_yields_no_landings():
         img.seh_landings(handler)
     with pytest.raises(T.TranslateError):
         img.seh_landings(outside)
+
+
+@pytest.mark.parametrize("head, pushed, checkpoint", [
+    ("0x0", "EAX", True), ("0x4", "EAX", False), ("0x0", "EDX", False)])
+def test_msvc_load_then_push_chain_head(head, pushed, checkpoint):
+    # Byte-backed MSVC registration followed by its ordinary frame restore.
+    handler = BASE + 0x100
+    lines = [(0, "PUSH EBP"), (1, "MOV EBP,ESP"), (3, "PUSH -0x1"),
+             (5, "PUSH 0x%x" % handler), (10, "MOV EAX,FS:[%s]" % head),
+             (16, "PUSH " + pushed), (17, "MOV dword ptr FS:[0x0],ESP"),
+             (24, "MOV ECX,dword ptr [EBP + -0xc]"),
+             (27, "MOV dword ptr FS:[0x0],ECX"), (34, "MOV ESP,EBP"),
+             (36, "POP EBP"), (37, "RET")]
+    raw = bytes.fromhex("558bec6aff68") + struct.pack("<I", handler)
+    raw += bytes.fromhex("64a1") + struct.pack("<I", int(head, 16))
+    raw += bytes([0x50 if pushed == "EAX" else 0x52])
+    raw += bytes.fromhex("648925000000008b4df464890d000000008be55dc3")
+    case = Case("msvc_chain_registration", BASE, lines, raw.hex())
+    text = translate_case(case)
+    assert ("recomp_seh_frame_enter(c)" in text) == checkpoint
+    if checkpoint:
+        assert "if (setjmp(*b_)) { recomp_seh_land(c); return; }" in text
+        assert "recomp_seh_frame_leave(c)" in text

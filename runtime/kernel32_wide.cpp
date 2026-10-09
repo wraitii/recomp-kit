@@ -40,6 +40,9 @@ void k_SetFileAttributesW(X86 *c) {
 void k_DeleteFileW(X86 *c) {
     delete_file_named(c, gm_wstr(arg(c, 0)));
 }
+void k_MoveFileW(X86 *c) {
+    move_file_named(c, gm_wstr(arg(c, 0)), gm_wstr(arg(c, 1)));
+}
 void k_CopyFileW(X86 *c) {
     copy_file_named(c, gm_wstr(arg(c, 0)), gm_wstr(arg(c, 1)));
 }
@@ -64,6 +67,24 @@ void k_FindNextFileW(X86 *c) {
         return;
     }
     find_next(c, true);
+}
+void k_GetCurrentDirectoryW(X86 *c) {
+    const std::string path = current_directory();
+    uint32_t cap = arg(c, 0), out = arg(c, 1);
+    uint32_t need = wide_units(path) + 1;
+    if (!cap) {
+        set_eax(c, need);
+        return;
+    }
+    if (cap < need) {
+        set_last_error(122); // ERROR_INSUFFICIENT_BUFFER
+        set_eax(c, need);
+        return;
+    }
+    set_eax(c, gm_put_wstr(out, path, cap));
+}
+void k_SetCurrentDirectoryW(X86 *c) {
+    set_current_directory_named(c, gm_wstr(arg(c, 0)));
 }
 void k_GetFullPathNameW(X86 *c) {
     std::string full = full_path_named(gm_wstr(arg(c, 0)));
@@ -1008,10 +1029,13 @@ static const ImportShim g_kernel32_wide[] = {
     {"KERNEL32.dll", "FindFirstFileW", 2, k_FindFirstFileW},
     {"KERNEL32.dll", "FindNextFileW", 2, k_FindNextFileW},
     {"KERNEL32.dll", "GetFullPathNameW", 4, k_GetFullPathNameW},
+    {"KERNEL32.dll", "SetCurrentDirectoryW", 1, k_SetCurrentDirectoryW},
+    {"KERNEL32.dll", "GetCurrentDirectoryW", 2, k_GetCurrentDirectoryW},
     {"KERNEL32.dll", "GetFileAttributesW", 1, k_GetFileAttributesW},
     {"KERNEL32.dll", "GetFileAttributesExW", 3, k_GetFileAttributesExW},
     {"KERNEL32.dll", "SetFileAttributesW", 2, k_SetFileAttributesW},
     {"KERNEL32.dll", "DeleteFileW", 1, k_DeleteFileW},
+    {"KERNEL32.dll", "MoveFileW", 2, k_MoveFileW},
     {"KERNEL32.dll", "CopyFileW", 3, k_CopyFileW},
     {"KERNEL32.dll", "CreateDirectoryW", 2, k_CreateDirectoryW},
     {"KERNEL32.dll", "RemoveDirectoryW", 1, k_RemoveDirectoryW},

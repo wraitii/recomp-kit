@@ -3,7 +3,8 @@
 //! The bridge supports the two 32-bit ARGB formats the Ghost Recon presentation
 //! path is known to use, `D3DFMT_A8R8G8B8` (21) and `D3DFMT_X8R8G8B8` (22), plus
 //! the 16-bit formats the shell's textures use: `D3DFMT_R5G6B5` (23),
-//! `D3DFMT_A1R5G5B5` (25) and `D3DFMT_A4R4G4B4` (26). Any other format is a
+//! `D3DFMT_A1R5G5B5` (25), `D3DFMT_A4R4G4B4` (26), and alpha-only texture
+//! `D3DFMT_A8` (28). Any other color format is a
 //! named error rather than an unchecked substitution.
 //!
 //! Every format maps to a **linear UNORM** `wgpu::TextureFormat::Rgba8Unorm`.
@@ -36,6 +37,9 @@ pub const D3DFMT_R5G6B5: u32 = 23;
 pub const D3DFMT_A1R5G5B5: u32 = 25;
 /// `D3DFMT_A4R4G4B4` from `d3d8types.h`.
 pub const D3DFMT_A4R4G4B4: u32 = 26;
+/// Alpha-only texels. DXVK maps A8 sampling to (0,0,0,R8_UNORM).
+/// https://github.com/doitsujin/dxvk/blob/master/src/d3d9/d3d9_format.cpp
+pub const D3DFMT_A8: u32 = 28;
 /// Signed bump offsets: little-endian U,V bytes, sampled as R,G in [-1,1].
 /// Microsoft maps D3DFMT_V8U8 to R8G8_SNORM; missing B,A sample as 0,1.
 /// https://learn.microsoft.com/en-us/windows/uwp/gaming/feature-mapping
@@ -136,6 +140,8 @@ pub enum ColorFormat {
     A1R5G5B5,
     /// 16-bit, 4-bit alpha: A4 R4 G4 B4 (`D3DFMT_A4R4G4B4 = 26`).
     A4R4G4B4,
+    /// One alpha byte per texel; absent RGB channels sample as zero.
+    A8,
 }
 
 impl ColorFormat {
@@ -147,13 +153,14 @@ impl ColorFormat {
             D3DFMT_R5G6B5 => Ok(Self::R5G6B5),
             D3DFMT_A1R5G5B5 => Ok(Self::A1R5G5B5),
             D3DFMT_A4R4G4B4 => Ok(Self::A4R4G4B4),
+            D3DFMT_A8 => Ok(Self::A8),
             other => Err(RenderError::new(
                 "format::from_d3dformat",
                 format!(
                     "unsupported D3DFORMAT {other}; implemented are A8R8G8B8 \
                      ({D3DFMT_A8R8G8B8}), X8R8G8B8 ({D3DFMT_X8R8G8B8}), R5G6B5 \
                      ({D3DFMT_R5G6B5}), A1R5G5B5 ({D3DFMT_A1R5G5B5}) and A4R4G4B4 \
-                     ({D3DFMT_A4R4G4B4})"
+                     ({D3DFMT_A4R4G4B4}) and A8 ({D3DFMT_A8})"
                 ),
             )),
         }
@@ -167,6 +174,7 @@ impl ColorFormat {
             Self::R5G6B5 => D3DFMT_R5G6B5,
             Self::A1R5G5B5 => D3DFMT_A1R5G5B5,
             Self::A4R4G4B4 => D3DFMT_A4R4G4B4,
+            Self::A8 => D3DFMT_A8,
         }
     }
 
@@ -179,9 +187,10 @@ impl ColorFormat {
     }
 
     /// Bytes per texel in the source D3D8 layout: 4 for the 32-bit ARGB
-    /// formats, 2 for the packed 16-bit formats.
+    /// formats, 2 for the packed 16-bit formats, 1 for A8.
     pub const fn bytes_per_pixel(self) -> u32 {
         match self {
+            Self::A8 => 1,
             Self::A8R8G8B8 | Self::X8R8G8B8 => 4,
             Self::R5G6B5 | Self::A1R5G5B5 | Self::A4R4G4B4 => 2,
         }
@@ -210,6 +219,13 @@ impl ColorFormat {
     /// genuine upload still reuses this scratch).
     pub fn to_rgba8_into(self, data: &[u8], out: &mut Vec<u8>) {
         match self {
+            Self::A8 => {
+                out.clear();
+                out.reserve(data.len() * 4);
+                for &a in data {
+                    out.extend_from_slice(&[0, 0, 0, a]);
+                }
+            }
             Self::A8R8G8B8 => bgra_to_rgba_into(data, false, out),
             Self::X8R8G8B8 => bgra_to_rgba_into(data, true, out),
             Self::R5G6B5 | Self::A1R5G5B5 | Self::A4R4G4B4 => decode_16_into(data, self, out),
@@ -225,6 +241,9 @@ impl ColorFormat {
     pub fn from_rgba8_into(self, data: &[u8], out: &mut Vec<u8>) {
         out.clear();
         match self {
+            Self::A8 => {
+                out.extend(data.chunks_exact(4).map(|px| px[3]));
+            }
             Self::A8R8G8B8 | Self::X8R8G8B8 => {
                 let opaque = self.is_opaque();
                 out.reserve(data.len());
@@ -448,13 +467,11 @@ fn decode_dxt5(p: &[u8], out: &mut [[u8; 4]; 16]) {
     alpha[1] = a1;
     if a0 > a1 {
         for i in 1..=6u32 {
-            alpha[i as usize + 1] =
-                (((7 - i) as u32 * a0 as u32 + i * a1 as u32) / 7) as u8;
+            alpha[i as usize + 1] = (((7 - i) as u32 * a0 as u32 + i * a1 as u32) / 7) as u8;
         }
     } else {
         for i in 1..=4u32 {
-            alpha[i as usize + 1] =
-                (((5 - i) as u32 * a0 as u32 + i * a1 as u32) / 5) as u8;
+            alpha[i as usize + 1] = (((5 - i) as u32 * a0 as u32 + i * a1 as u32) / 5) as u8;
         }
         alpha[6] = 0x00;
         alpha[7] = 0xff;
@@ -486,7 +503,10 @@ pub fn decode_block_into(
         ));
     }
     if width == 0 || height == 0 {
-        return Err(RenderError::invalid("format::decode_block", "zero dimension"));
+        return Err(RenderError::invalid(
+            "format::decode_block",
+            "zero dimension",
+        ));
     }
     let (pitch, size) = block_level_layout(width, height, format);
     if data.len() < size as usize {
@@ -585,6 +605,20 @@ mod tests {
 
     fn le16(value: u16) -> [u8; 2] {
         value.to_le_bytes()
+    }
+
+    #[test]
+    fn a8_preserves_every_alpha_byte_and_supplies_zero_rgb() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        let fmt = ColorFormat::from_d3dformat(D3DFMT_A8).unwrap();
+        assert_eq!(fmt.bytes_per_pixel(), 1);
+        let rgba = fmt.to_rgba8(&bytes);
+        for (a, pixel) in rgba.chunks_exact(4).enumerate() {
+            assert_eq!(pixel, &[0, 0, 0, a as u8]);
+        }
+        let mut packed = Vec::new();
+        fmt.from_rgba8_into(&rgba, &mut packed);
+        assert_eq!(packed, bytes);
     }
 
     #[test]

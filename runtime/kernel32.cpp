@@ -804,6 +804,80 @@ void k_GlobalLock(X86 *c) {
 void k_GlobalUnlock(X86 *c) {
     set_eax(c, 0);
 }
+// System messages without inserts. The buffer contains guest addresses and is
+// owned by the same allocator as LocalAlloc/LocalFree.
+void k_FormatMessageA(X86 *c) {
+    uint32_t flags = arg(c, 0), out = arg(c, 4), cap = arg(c, 5);
+    // Resource tables, source templates, insert expansion and width formatting
+    // need their own implementation; keep those gaps explicitly fatal.
+    if (!(flags & 0x1000) || (flags & ~0x1300u)) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!out || !gm_valid(out, (flags & 0x100) ? 4 : 1)) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t language = arg(c, 3);
+    // DIVERGENCE(original): the portable system-message catalog is English.
+    // Neutral/default language requests resolve to this catalog.
+    if (language != 0 && language != 0x400 && language != 0x409) {
+        set_last_error(1815); // ERROR_RESOURCE_LANG_NOT_FOUND
+        set_eax(c, 0);
+        return;
+    }
+    const char *text = nullptr;
+    switch (arg(c, 2)) {
+    case 0:
+        text = "The operation completed successfully.\r\n";
+        break;
+    case 2:
+        text = "The system cannot find the file specified.\r\n";
+        break;
+    case 3:
+        text = "The system cannot find the path specified.\r\n";
+        break;
+    case 5:
+        text = "Access is denied.\r\n";
+        break;
+    case 6:
+        text = "The handle is invalid.\r\n";
+        break;
+    case 8:
+        text = "Not enough memory resources are available to process this command.\r\n";
+        break;
+    case 87:
+        text = "The parameter is incorrect.\r\n";
+        break;
+    case 122:
+        text = "The data area passed to a system call is too small.\r\n";
+        break;
+    default:
+        // DIVERGENCE(original): only the catalog above is currently available.
+        set_last_error(317); // ERROR_MR_MID_NOT_FOUND
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t count = (uint32_t)strlen(text), need = count + 1;
+    if (flags & 0x100) { // FORMAT_MESSAGE_ALLOCATE_BUFFER
+        uint32_t buffer = heap_alloc(std::max(cap, need), true);
+        if (!buffer) {
+            set_last_error(8);
+            set_eax(c, 0);
+            return;
+        }
+        wr32(out, buffer);
+        out = buffer;
+    } else if (cap < need || !gm_valid(out, need)) {
+        set_last_error(122);
+        set_eax(c, 0);
+        return;
+    }
+    memcpy(g_mem + out, text, need);
+    set_eax(c, count);
+}
+
 void k_LocalAlloc(X86 *c) {
     uint32_t flags = arg(c, 0), size = arg(c, 1);
     set_eax(c, heap_alloc(size, (flags & 0x40) != 0));
@@ -1033,6 +1107,39 @@ void k_SetFilePointer(X86 *c) {
     set_eax(c, (uint32_t)pos);
 }
 
+// Access/write times use the same host stat seam as directory enumeration.
+void k_GetFileTime(X86 *c) {
+    HObj *o = handle_get(arg(c, 0), H_FILE);
+    if (!o) {
+        set_last_error(ERROR_INVALID_HANDLE_);
+        set_eax(c, 0);
+        return;
+    }
+    if (arg(c, 1)) {
+        // OsStat has change time, not birth time. Never fabricate creation time.
+        imports_unsupported(c);
+        return;
+    }
+    uint32_t access = arg(c, 2), write = arg(c, 3);
+    if ((access && !gm_valid(access, 8)) || (write && !gm_valid(write, 8))) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    OsStat st{};
+    if (os_fd_stat(o->fd, &st) != 0) {
+        set_last_error(ERROR_INVALID_HANDLE_);
+        set_eax(c, 0);
+        return;
+    }
+    // DIVERGENCE(original): the portable stat seam retains whole seconds.
+    if (access)
+        put_filetime(access, st.atime);
+    if (write)
+        put_filetime(write, st.mtime);
+    set_eax(c, 1);
+}
+
 void k_GetFileSize(X86 *c) {
     HObj *o = handle_get(arg(c, 0), H_FILE);
     uint32_t phigh = arg(c, 1);
@@ -1152,16 +1259,7 @@ void k_DeleteFileA(X86 *c) {
 }
 
 void k_MoveFileA(X86 *c) {
-    std::string from = win32_host_path_op(gm_str(arg(c, 0)), WIN32_FILE_RENAME_SRC);
-    std::string to = win32_host_path_op(gm_str(arg(c, 1)), WIN32_FILE_RENAME_DST);
-    if (from.empty() || to.empty()) {
-        set_last_error(ERROR_FILE_NOT_FOUND_);
-        set_eax(c, 0);
-        return;
-    }
-    int rc = os_rename(from.c_str(), to.c_str());
-    win32_invalidate_dir_cache();
-    set_eax(c, rc == 0 ? 1 : 0);
+    move_file_named(c, gm_str(arg(c, 0)), gm_str(arg(c, 1)));
 }
 
 void k_CopyFileA(X86 *c) {
@@ -1220,20 +1318,7 @@ void k_GetCurrentDirectoryA(X86 *c) {
 }
 
 void k_SetCurrentDirectoryA(X86 *c) {
-    std::string want = gm_str(arg(c, 0));
-    std::string host = win32_host_path(want);
-    if (host.empty()) {
-        set_last_error(ERROR_PATH_NOT_FOUND_);
-        set_eax(c, 0);
-        return;
-    }
-    if (want.size() >= 2 && want[1] == ':')
-        g_cur_dir = want;
-    else if (!want.empty() && (want[0] == '\\' || want[0] == '/'))
-        g_cur_dir = "C:" + want;
-    else
-        g_cur_dir = g_cur_dir + "\\" + want;
-    set_eax(c, 1);
+    set_current_directory_named(c, gm_str(arg(c, 0)));
 }
 
 // Both encodings expose the same guest path, never a host filesystem path.
@@ -3066,6 +3151,19 @@ void sched_checkpoint() {
     guest_yield();
 }
 
+// A translated call publishes its callee's live inputs before dispatch. A
+// different guest thread owns a separate CPU and stack, so yielding here needs
+// no flag settling or register rewrite. Amortize clock/registry work over 1024
+// boundaries; sched_checkpoint still enforces the time slice and atomic spans.
+// Import-free loops that make no translated calls are not covered by this seam.
+extern "C" void recomp_execution_checkpoint(void) {
+    static __thread uint32_t remaining = 1024;
+    if (--remaining)
+        return;
+    remaining = 1024;
+    sched_checkpoint();
+}
+
 namespace {
 
 // A shim that changed an object's state calls this so a thread blocked on it
@@ -4455,6 +4553,26 @@ void sched_drive_release(void) {
 // Table
 // ---------------------------------------------------------------------------
 // Encoding-independent bodies shared by the ANSI and wide import tables.
+std::string current_directory() {
+    return g_cur_dir;
+}
+
+void set_current_directory_named(X86 *c, const std::string &want) {
+    std::string host = win32_host_path(want);
+    if (host.empty()) {
+        set_last_error(ERROR_PATH_NOT_FOUND_);
+        set_eax(c, 0);
+        return;
+    }
+    if (want.size() >= 2 && want[1] == ':')
+        g_cur_dir = want;
+    else if (!want.empty() && (want[0] == '\\' || want[0] == '/'))
+        g_cur_dir = "C:" + want;
+    else
+        g_cur_dir = g_cur_dir + "\\" + want;
+    set_eax(c, 1);
+}
+
 void create_file_named(X86 *c, const std::string &name) {
     if (recomp_env("TRACE_FILES"))
         LOGW("file: open \"%s\" -> \"%s\"", name.c_str(), win32_host_path(name).c_str());
@@ -4498,6 +4616,16 @@ void create_file_named(X86 *c, const std::string &name) {
     int fd = os_fd_open(host.c_str(), flags);
     if (fd < 0) {
         set_last_error(ERROR_FILE_NOT_FOUND_);
+        set_eax(c, INVALID_HANDLE_VALUE_);
+        return;
+    }
+    // POSIX open(O_RDONLY) accepts directories. Win32 requires an explicit
+    // backup-semantics OPEN_EXISTING request; otherwise the guest must see
+    // failure here, before it treats a directory handle as a packfile.
+    OsStat st{};
+    if (os_fd_stat(fd, &st) != 0 || (st.is_dir && (disp != 3 || !(arg(c, 5) & 0x02000000u)))) {
+        os_fd_close(fd);
+        set_last_error(ERROR_ACCESS_DENIED_);
         set_eax(c, INVALID_HANDLE_VALUE_);
         return;
     }
@@ -4574,6 +4702,27 @@ void delete_file_named(X86 *c, const std::string &name) {
         return;
     }
     int rc = os_unlink(host.c_str());
+    win32_invalidate_dir_cache();
+    set_eax(c, rc == 0 ? 1 : 0);
+}
+
+void move_file_named(X86 *c, const std::string &source, const std::string &dest) {
+    std::string from = win32_host_path_op(source, WIN32_FILE_RENAME_SRC);
+    std::string to = win32_host_path_op(dest, WIN32_FILE_RENAME_DST);
+    if (from.empty() || to.empty()) {
+        set_last_error(ERROR_FILE_NOT_FOUND_);
+        set_eax(c, 0);
+        return;
+    }
+    OsStat st;
+    if (os_lstat(to.c_str(), &st) == 0) {
+        set_last_error(ERROR_ALREADY_EXISTS_);
+        set_eax(c, 0);
+        return;
+    }
+    int rc = os_rename(from.c_str(), to.c_str());
+    if (rc != 0)
+        set_last_error(errno == ENOENT ? ERROR_FILE_NOT_FOUND_ : ERROR_ACCESS_DENIED_);
     win32_invalidate_dir_cache();
     set_eax(c, rc == 0 ? 1 : 0);
 }
@@ -4862,7 +5011,9 @@ void open_mutex_named(X86 *c, const std::string &name) {
 
 void get_command_line(X86 *c) {
     if (!g_cmdline_addr) {
-        std::string line = RECOMP_GUEST_ROOT "\\" RECOMP_EXECUTABLE;
+        // The CRT skips argv[0] before passing lpCmdLine to WinMain. Quote
+        // the executable so whitespace in its path never becomes game args.
+        std::string line = "\"" RECOMP_GUEST_ROOT "\\" RECOMP_EXECUTABLE "\"";
         if (const char *extra = recomp_env("GUEST_ARGS"); extra && *extra)
             line += std::string(" ") + extra;
         g_cmdline_addr = guest_strdup(line.c_str());
@@ -5069,7 +5220,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "SetEndOfFile", 1, k_SetEndOfFile},
     {"KERNEL32.dll", "GetFileType", 1, k_GetFileType},
     // ABI known; file timestamps are not implemented. Stop rather than fabricate a result.
-    {"KERNEL32.dll", "GetFileTime", 4, imports_unsupported},
+    {"KERNEL32.dll", "GetFileTime", 4, k_GetFileTime},
     {"KERNEL32.dll", "GetFileAttributesA", 1, k_GetFileAttributesA},
     {"KERNEL32.dll", "SetFileAttributesA", 2, k_SetFileAttributesA},
     {"KERNEL32.dll", "CreateDirectoryA", 2, k_CreateDirectoryA},
@@ -5129,7 +5280,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "GetComputerNameA", 2, imports_unsupported},
     {"KERNEL32.dll", "WinExec", 2, imports_unsupported},
     {"KERNEL32.dll", "lstrcpynA", 3, imports_unsupported},
-    {"KERNEL32.dll", "FormatMessageA", 7, imports_unsupported},
+    {"KERNEL32.dll", "FormatMessageA", 7, k_FormatMessageA},
     {"KERNEL32.dll", "IsProcessorFeaturePresent", 1, k_IsProcessorFeaturePresent},
     // time
     {"KERNEL32.dll", "GetTickCount", 0, k_GetTickCount},
@@ -5231,10 +5382,8 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "SystemTimeToFileTime", 2, k_SystemTimeToFileTime},
     {"KERNEL32.dll", "SystemTimeToTzSpecificLocalTime", 3, nullptr},
     {"KERNEL32.dll", "TzSpecificLocalTimeToSystemTime", 3, nullptr},
-    {"KERNEL32.dll", "MoveFileW", 2, nullptr},
     {"KERNEL32.dll", "OpenProcess", 3, nullptr},
     {"KERNEL32.dll", "ExpandEnvironmentStringsW", 3, nullptr},
-    {"KERNEL32.dll", "GetCurrentDirectoryW", 2, nullptr},
     {"KERNEL32.dll", "GetEnvironmentVariableW", 4, nullptr},
     {"KERNEL32.dll", "VerLanguageNameW", 3, nullptr},
     {"KERNEL32.dll", "SearchPathW", 6, nullptr},
