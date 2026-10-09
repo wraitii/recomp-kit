@@ -14,7 +14,7 @@ from .integer import memory_arithmetic, shift, divide
 from .integer_extra import EXTRA_MNEMONICS, correct as correct_extra
 from .ssa import SSAError, MEMORY, build
 from .cfg import FunctionIR
-from .simplify import canonicalize, simplify, live_values, EFFECTS, EXITS
+from .simplify import canonicalize, simplify, state_roots, whole, EFFECTS, EXITS
 from .publication import plan
 from . import flag_region
 from . import x87
@@ -550,7 +550,8 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     # assembly helpers can return flags or consume incoming flags.
     # Keep flag publication at calls/returns until actual call
     # summaries prove which fields a boundary does not observe.
-    publications = plan(s, fir.succ, groups, access_fields=access_fields)
+    publications = plan(s, fir.succ, groups, access_fields=access_fields,
+                        reloaded=set(mapping) - flag_keys)
     # Cross-function contracts: a direct CALL may omit publication of a field
     # the callee neither reads nor preserves.  A field the callee preserves is
     # not droppable even when this body does not read it back: the field's CPU
@@ -581,7 +582,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                                 if lane_field.get(key) in skipped)
                 contract_guard[v.id] = guarded
                 state = b.snapshots[v.id]
-                contract_roots.extend(state[key] for key in guarded if key in state)
+                contract_roots.extend(state_roots(s, state, guarded, groups))
                 publications[v.id] = tuple(
                     key for key in publications[v.id] if lane_field.get(key) not in skipped)
     # Decide which seams defer their flags as a descriptor before dead-value
@@ -612,22 +613,15 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     continue
                 cc_plan[v.id] = (record, mask)
                 cc_roots.extend(x for x in (record.a, record.b, record.res) if x is not None)
-    live = simplify(s, publications, canonical=False, extra_roots=cc_roots + contract_roots)
-    reload_live = live
-    if lazy_flags:
-        # ``CALL_RELOAD`` is itself a liveness root: the builder emits the
-        # callee-state read even when no observation uses its value.  A
-        # post-call settle decision cares only about reloads whose value is
-        # actually needed, so recompute liveness with those roots ignored.
-        # Entry INPUTs, effect snapshots and publication roots are unaffected.
-        reload_live = live_values(s, publications,
-                                  extra_roots=cc_roots + contract_roots,
-                                  removable=frozenset(("CALL_RELOAD",)))
+    # A callee-state read with no use is dropped; that also confines post-call
+    # settles to reloads whose value is needed.
+    live = simplify(s, publications, canonical=False, extra_roots=cc_roots + contract_roots,
+                    removable=frozenset(("CALL_RELOAD",)), groups=groups)
     reads_entry_flags = any(
         v.opc == "INPUT" and v.data in flag_keys and v.id in live and s.resolve(v) is v
         for v in s.values)
     reads_after_call = any(
-        v.opc == "CALL_RELOAD" and v.data in flag_keys and v.id in reload_live
+        v.opc == "CALL_RELOAD" and v.data in flag_keys and v.id in live
         and s.resolve(v) is v
         for v in s.values)
     if lazy_flags and reads_after_call:
@@ -639,7 +633,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
         # following call's publication root: a callee that reads or preserves
         # flags forces the caller to publish the fields before that call, so
         # the earlier reload must not read a stale field.
-        for index in live_flag_reload_calls(s, reload_live, flag_keys):
+        for index in live_flag_reload_calls(s, live, flag_keys):
             cc_calls[index] = flag_region.SETTLE
     if reads_entry_flags or fir.entries:
         # The SSA builder loads live entry flag INPUTs straight from the fields,
@@ -711,17 +705,22 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
             return "(%s << %d) | %s" % (a[0], v.args[1].size * 8, a[1])
         raise SSAError("unsupported integer operation %s" % opc)
 
+    def field_value(state, field, keys):
+        if all(key in state for key in keys):
+            source = whole(s, [state[key] for key in keys])
+            if source is not None:
+                return ref(source)
+        return " | ".join("(%s << %d)" % (ref(state[key]), n * 8) if key in state
+                          else "(%s & 0x%xu)" % (field, 255 << (n * 8))
+                          for n, key in enumerate(keys))
+
     def store_fields(state, required):
         """Direct field stores for the required keys (no descriptor)."""
         lines = []
         for (_, off, size), field in fields:
             keys = [("register", off + n) for n in range(size)]
-            if not any(key in required for key in keys):
-                continue
-            parts = ["(%s << %d)" % (ref(state[key]), n * 8)
-                     if key in state else "(%s & 0x%xu)" % (field, 255 << (n * 8))
-                     for n, key in enumerate(keys)]
-            lines.append("%s = (uint32_t)(%s);" % (field, " | ".join(parts)))
+            if any(key in required for key in keys):
+                lines.append("%s = (uint32_t)(%s);" % (field, field_value(state, field, keys)))
         return lines
 
     def publish(state, event):
@@ -741,10 +740,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                 continue
             if field in covered:
                 continue
-            parts = ["(%s << %d)" % (ref(state[key]), n * 8)
-                     if key in state else "(%s & 0x%xu)" % (field, 255 << (n * 8))
-                     for n, key in enumerate(keys)]
-            lines.append("%s = (uint32_t)(%s);" % (field, " | ".join(parts)))
+            lines.append("%s = (uint32_t)(%s);" % (field, field_value(state, field, keys)))
             if field in FLAG_FIELDS:
                 stored_flag = True
         if record is not None:

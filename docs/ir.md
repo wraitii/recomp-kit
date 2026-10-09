@@ -63,7 +63,8 @@ propagation, constant folding) and removes dead values; potentially faulting
 loads, stores, branches, returns, division and unknown operations are roots.
 `coalesce.py` carries whole registers through phis; `publication.py` keeps
 must-facts about published CPU fields (a field is known published only if every
-predecessor published it).
+predecessor published it; after a call or helper, a register or EIP/FS field
+equals its reload, flags stay unknown).
 
 `emit_c.py` lowers values to unsigned, width-masked C with staged parallel phi
 copies, sign-bias comparisons and saturating shift counts. Dword DIV/IDIV are
@@ -71,7 +72,8 @@ checked `div32`/`idiv32` effects that reach the runtime error seam with the
 original address. Memory ADD/SUB/INC/DEC capture one read and emit flags after
 the STORE; `MOVSD`/`REP MOVSD` call runtime helpers in access-then-advance
 order. Direct calls publish the CPU, call `entry_ADDR` (`CALL_FN`) and reload
-every tracked lane, flag and the memory token; indirect calls go through
+each register whole, each flag and the memory token, keeping only used reloads;
+a field whose four lanes are one value's bytes is stored whole; indirect calls go through
 `recomp_call`. Jump tables and tail transfers inside or outside the body,
 alternate entries (`body_X(c, entry)` plus `fn_E` wrappers), noreturn calls and
 SEH frame effects (enter/adopt/leave/orphan, ordered, with full state
