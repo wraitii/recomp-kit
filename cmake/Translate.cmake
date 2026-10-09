@@ -76,6 +76,9 @@ if(RECOMP_HAVE_GEN)
   target_include_directories(recomp_gen PRIVATE ${RECOMP_GEN_DIR} ${RECOMP_ROOT} ${RECOMP_ROOT}/runtime)
   target_include_directories(recomp_gen INTERFACE ${RECOMP_GEN_DIR})
   target_compile_options(recomp_gen PRIVATE ${RECOMP_WARN_GEN})
+  # Function-scope locals gain nothing from lifetime markers; clang's call emission costs calls x locals.
+  set_property(SOURCE ${RECOMP_GEN_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
+    "$<$<C_COMPILER_ID:Clang,AppleClang>:-Xclang;-disable-lifetime-markers>")
   recomp_translation_overrides(recomp_gen "${RECOMP_GEN_DIR}" "${RECOMP_EFFECTIVE_OVERRIDE}")
   recomp_optimize(recomp_gen 2)
   # The game's native replacements (game.toml [translate] native).
