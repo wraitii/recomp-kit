@@ -238,8 +238,6 @@ void poll_device(ComObj *d) {
     int32_t dx = g_host_in.acc_dx, dy = g_host_in.acc_dy, dz = g_host_in.acc_dz;
     g_host_in.acc_dx = g_host_in.acc_dy = g_host_in.acc_dz = 0;
 
-    host_input_pointer_correction(&dx, &dy);
-
     static const bool trace_wheel = recomp_env("TRACE_WHEEL") != nullptr;
     if (trace_wheel && dz)
         fprintf(stderr, "[wheel dinput] poll took dz=%d buffer_size=%u\n", dz, d->buffer_size);
@@ -1150,34 +1148,12 @@ extern "C" int dinput_host_mouse_acquired() {
     return g_acquired_mouse_count.load() != 0;
 }
 
-extern "C" void dinput_discard_mouse_motion(uint32_t device) {
-    ComObj *mouse = device ? com_this(device) : nullptr;
-    if (!mouse || mouse->kind != K_DIDEVICE || mouse->dev_type != DIDEVTYPE_MOUSE)
-        return;
-    // A keyboard poll may already have drained the host's motion into this
-    // shared accumulator; a mouse Poll may also have queued it on the device.
-    g_host_in.acc_dx = g_host_in.acc_dy = 0;
-    mouse->last_x = mouse->last_y = 0;
-    auto &events = mouse->events;
-    events.erase(std::remove_if(events.begin(), events.end(),
-                                [](uint32_t event) {
-                                    return event_ofs(event) == DIMOFS_X ||
-                                           event_ofs(event) == DIMOFS_Y;
-                                }),
-                 events.end());
-}
-
 // Called by the host after it has fed new mouse or keyboard state through
 // host_input_state. Signals every device that registered a notification event,
-// which is what wakes the game's service threads out of their WaitForSingleObject
-// so they can call GetDeviceData and see the input.
-//
-// It signals every registered device rather than only the one whose data
-// changed, because working that out means polling, and polling reads and
-// mutates guest-side device state that belongs to the baton holder. A guest
-// woken with nothing to report calls GetDeviceData, gets no events and waits
-// again, which costs one wakeup; a guest not woken when it should have been
-// waits for ever. The asymmetry decides it.
+// which wakes guest service threads so they can call GetDeviceData. It signals
+// every registered device rather than polling device state to determine which
+// changed: an unnecessary wakeup costs one empty read, while a missed wakeup can
+// leave a guest waiting forever.
 extern "C" void dinput_host_input_changed(void) {
     std::lock_guard<std::mutex> lock(g_notify_m);
     for (const Notify &n : g_notify)

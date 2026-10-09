@@ -9,7 +9,7 @@ translated locally into `build/recomp/gen/` and are never edited in place.
 | Change | Start here | Major entry points |
 | --- | --- | --- |
 | Host display settings | [display_settings.cpp](../mods/display_settings.cpp), [settings_page.cpp](../mods/settings_page.cpp) | `mods_display_init`, `mods_display_set`, `apply_transition` |
-| Mouse edges, coordinate mapping | [input_gate.cpp](../host/input_gate.cpp) | `take_layout`, `host_gate_pointer_event`, `pointer_correction` |
+| Mouse edges, coordinate mapping | [input_gate.cpp](../host/input_gate.cpp) | `take_layout`, `host_gate_pointer_event`, `host_gate_window_pointer` |
 | Window, focus, quit (SDL3) | [sdl/main.cpp](../host/sdl/main.cpp) | `handle_event`, `apply_focus`, `apply_window_mode`, `pump`, `applicationShouldTerminate` |
 | Frame lifetime and pacing | [present_thread.cpp](../host/present_thread.cpp) | `acquire`, `host_frame_seal`, `sweep` |
 | World rendering, materials | [d3d_render.cpp](../host/d3d_render.cpp) | `host_d3d_expand`, `uploadTexture`, `drawSnapshot`, `d3d_fragment` |
@@ -65,12 +65,8 @@ Keep them synchronized when changing behavior. Prefer a focused regression in
 that module's tests over copying a large gameplay scenario for a small helper.
 See [Testing](testing.md) for the available suites and their limits.
 
-Games whose mouse cursor does not use the default guest layout can implement
-`recomp_pointer_place` from `runtime/native_seam.h` in their native sources.
-The host calls it for absolute touch placement with compositor-mapped logical
-coordinates and canvas dimensions, while holding the guest scheduler baton.
-Return zero when no recognized cursor is live. A successful adapter owns the
-cursor write and any game-cached deltas; `dinput_discard_mouse_motion` can clear
-already sampled X/Y for its mouse interface. The host then clears unsampled
-X/Y. Neither operation releases buttons or consumes the wheel. Physical mouse
-motion and games without an adapter retain their existing paths.
+Absolute host positions use the same compositor mapping as ordinary Win32 mouse
+input. A game's integrated DirectInput cursor moves when the guest consumes those
+messages or counts; the host does not inspect or mutate private cursor objects.
+Relative capture is selected with `[input] relative_mouse_capture` (default `true`
+to preserve existing no-hook capture behavior; set `false` for absolute mode).

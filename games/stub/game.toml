@@ -34,10 +34,10 @@ frame_clock_wait_clamp = 0x00401300
 frame_clock_clamp_deadline = 0x00600000
 frame_clock_wait_deadline = 0x00600010
 cursor_surface_ptrs = [0x00600100, 0x00600104]
-mouse_vtable = 0x00600200
-mouse_device_ptr = 0x00600300
-mouse_device_right = 0x00600340
 camera = 0x00600400
+
+[input]
+relative_mouse_capture = false
 
 [controls]
 # The on-screen controls a fresh profile shows when no hardware keyboard is attached:

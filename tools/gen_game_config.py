@@ -33,9 +33,6 @@ HOOK_DEFAULTS = {
     "frame_clock_clamp_deadline": 0,
     "frame_clock_wait_deadline": 0,
     "cursor_surface_ptrs": [0],
-    "mouse_vtable": 0,
-    "mouse_device_ptr": 0,
-    "mouse_device_right": 0,
     "camera": 0,
 }
 
@@ -83,6 +80,7 @@ def render_header(cfg):
     lines.append("#define RECOMP_CONTROLS_NATIVE_BUTTONS %s" % c_string(",".join(native["buttons"])))
     lines.append("#define RECOMP_GUEST_SIZE %s" % c_hex(game["guest_size"]))
     lines.append("#define RECOMP_STRICT_IMPORTS %d" % int(game["strict_imports"]))
+    lines.append("#define RECOMP_INPUT_RELATIVE_MOUSE_CAPTURE %d" % int(cfg["input"]["relative_mouse_capture"]))
     lines.append("#define RECOMP_RESUMABLE_STACKS %d" %
                  int(cfg["translate"].get("resumable_stacks", False)))
     lines.append("#define RECOMP_CD_AUDIO_TRACKS %s" % c_string_list(cfg.get("media", {}).get("cd_tracks", [])))

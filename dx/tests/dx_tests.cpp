@@ -8433,33 +8433,6 @@ static void test_dinput() {
     call_method(ms, DID_GetDeviceData, {DIDEVICEOBJECTDATA_SIZE, data, inout, 0});
     CHECK_EQ(rd32(inout), 0);
 
-    // Absolute placement removes all already sampled X/Y, including a
-    // keyboard-first poll and buffered Poll, while preserving other input.
-    g_input.mouse_dx = 41;
-    g_input.mouse_dy = -23;
-    g_input.mouse_dz = 120;
-    g_input.mouse_buttons[1] = 0x80;
-    call_method(ms, 25 /* Poll */, {});
-    g_input.mouse_dx = 19;
-    g_input.mouse_dy = 37;
-    call_method(kb, DID_GetDeviceState, {256, state});
-    dinput_discard_mouse_motion(ms);
-    call_method(ms, DID_GetDeviceState, {DIMOUSESTATE_SIZE, mstate});
-    CHECK_EQ(rd32(mstate + DIMS_OFF_lX), 0);
-    CHECK_EQ(rd32(mstate + DIMS_OFF_lY), 0);
-    CHECK_EQ(rd32(mstate + DIMS_OFF_lZ), 120);
-    CHECK_EQ(rd8(mstate + DIMS_OFF_rgbButtons), 0x80);
-    CHECK_EQ(rd8(mstate + DIMS_OFF_rgbButtons + 1), 0x80);
-    CHECK_EQ(rd8(state + 0x1e), 0x80);
-    wr32(inout, 16);
-    call_method(ms, DID_GetDeviceData, {DIDEVICEOBJECTDATA_SIZE, data, inout, 0});
-    CHECK_EQ(rd32(inout), 2); // wheel and right-button edge, no X/Y events
-    CHECK_EQ(rd32(data + DIDOD_OFF_dwOfs), 8);
-    CHECK_EQ(rd32(data + DIDEVICEOBJECTDATA_SIZE + DIDOD_OFF_dwOfs), 13);
-    g_input.mouse_dx = 9;
-    call_method(ms, DID_GetDeviceState, {DIMOUSESTATE_SIZE, mstate});
-    CHECK_EQ(rd32(mstate + DIMS_OFF_lX), 9); // Later physical motion survives.
-
     // Eligibility follows acquisition, final release and arena resets.
     CHECK_EQ(call_method(ms, DID_Unacquire, {}), DI_OK);
     CHECK(!dinput_host_mouse_acquired());

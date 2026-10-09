@@ -261,6 +261,10 @@ def load(game_dir):
     if not isinstance(tracks, list) or not all(isinstance(v, str) for v in tracks):
         raise ValueError("%s: [media] cd_tracks must be a list of strings" % source)
     cfg.setdefault("hooks", {})
+    input_config = cfg.setdefault("input", {})
+    relative_capture = input_config.setdefault("relative_mouse_capture", True)
+    if not isinstance(relative_capture, bool):
+        raise ValueError("%s: [input] relative_mouse_capture must be a boolean" % source)
     cfg.setdefault("bundle", {}).setdefault("exclude", [])
     touch = cfg.setdefault("touch", {})
     touch.setdefault("keypad", "auto")

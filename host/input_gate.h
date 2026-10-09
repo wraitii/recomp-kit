@@ -153,29 +153,6 @@ void host_pointer_cursor(int32_t *x, int32_t *y);
 // Puts it in the middle of the frame, which is where capture starts.
 void host_pointer_center(void);
 
-// Read-only guest-memory seam, also used with a synthetic arena in host tests.
-// object is the guest this pointer, not the address of a pointer slot. In the
-// pinned executable 00526dd0 selects the static object 0x00d0595c with MOV ECX,
-// immediate; 0052d430 returns object+0x20. Call under the guest baton.
-// Readiness checks only the object's constructor identity and cursor/bounds.
-// The optional input context at +0x1c is informational, never dereferenced.
-struct HostGuestPointer {
-    enum Failure {
-        None,
-        ArenaUnavailable,
-        ObjectNull,
-        ObjectOutsideArena,
-        VtableMismatch,
-        BoundsInvalid,
-        CoordinatesOutsideBounds
-    } failure = None;
-    bool arena_available = false;
-    uint32_t arena_size = 0, object = 0, vtable = 0, context = 0;
-    int32_t x = 0, y = 0, left = 0, top = 0, right = 0, bottom = 0;
-};
-HostGuestPointer host_guest_pointer_resolve(const uint8_t *arena, uint32_t size, uint32_t object);
-const char *host_guest_pointer_failure_name(HostGuestPointer::Failure failure);
-
 // Task 9 compositor mapping. Except set_layout (presenter publication), these
 // functions run under the guest baton. nullptr hit-test uses the newest value
 // snapshot; a non-null input is a synchronous test/construction convenience.
@@ -199,14 +176,8 @@ void host_gate_fallback_layout(int drawable_w, int drawable_h);
 HitResult host_gate_pointer_event(int32_t x, int32_t y, double dx, double dy, int32_t *guest_dx,
                                   int32_t *guest_dy);
 
-// Wake the guest mouse reader for remaining correction, under the baton.
-void host_gate_pointer_tick();
-// Put the game's own cursor at drawable position (x, y) now, by writing the
-// pair the game integrates (the same pair the closed loop reads). Touch has
-// no pointer to converge from: a finger names a place, and the click that
-// follows must hit-test there. Returns false when the pair is not readable.
-// Call under the guest baton, from the input queue, in order with the motion
-// before it and the button after it.
+// Publish an absolute host pointer position through ordinary mapped Win32
+// input. This does not write game-private cursor objects or DirectInput state.
 bool host_gate_pointer_place(int32_t x, int32_t y);
 
 // Window motion production path: map, filter and deliver DirectInput once.

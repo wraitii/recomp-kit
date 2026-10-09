@@ -96,7 +96,6 @@ HOST_DEFAULT int32_t host_audio_is_playing(int32_t) {
 
 // No host means no input: every key up, the pointer at the origin. The guest
 // then simply sees nothing happening, which is what a headless run wants.
-HOST_DEFAULT void host_input_pointer_correction(int32_t *, int32_t *) {}
 
 HOST_DEFAULT void host_input_state(HostInputState *out) {
     if (out)

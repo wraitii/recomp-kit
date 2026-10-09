@@ -92,8 +92,9 @@ Each game repository documents which rendering profiles its build supports.
 The presentation limit is separate from simulation scheduling. Changing it must
 not change the scheduler's guest-time accounting.
 
-`host/input_gate.cpp` maps window coordinates through the published frame layout,
-corrects the original relative cursor, and handles edge scrolling and focus.
+`host/input_gate.cpp` maps window coordinates through the published frame layout
+and handles edge scrolling and focus. Relative DirectInput counts pass through
+unchanged; absolute Win32 positions use the compositor's current guest mapping.
 `host/controls/` holds the on-screen controls: a layout model and hit test, a
 router that owns each finger, a virtual pad that on-screen and physical
 controllers both write to, a binding stage that turns the pad into keys and

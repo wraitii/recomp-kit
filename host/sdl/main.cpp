@@ -370,14 +370,14 @@ void deliver_pending_input() {
 // The platform half of pointer capture. The policy and the arithmetic are in
 // input_gate.cpp, where they can be tested without a window; what is left here
 // is what only a window can do: hide and confine the associated system cursor.
-// Games with an explicit cursor-feedback hook retain window mapping. Other
-// DirectInput games use relative device motion while captured.
+// Capture hides/confines an absolute pointer or enables relative motion per
+// the selected game profile.
 // ---------------------------------------------------------------------------
 bool g_pointer_hidden = false;
 bool g_relative_mouse = false;
-// Cursor feedback is explicitly opted in by the game profile. Without it the
-// guest owns its integration and sensitivity; OS positions cannot replace counts.
-constexpr bool kRelativeMouseCapture = RECOMP_HOOK_MOUSE_DEVICE_PTR == 0;
+// Preserve each game's prior capture mode explicitly instead of inferring it
+// from a private guest cursor hook.
+constexpr bool kRelativeMouseCapture = RECOMP_INPUT_RELATIVE_MOUSE_CAPTURE != 0;
 std::atomic<bool> g_capture_release_held{false};
 std::atomic<bool> g_platform_capture_requested{false};
 void update_platform_pointer_capture();
@@ -510,13 +510,8 @@ void apply_motion(int32_t x, int32_t y, double drawable_dx, double drawable_dy) 
     const double now = (double(os_monotonic_ns()) / 1e9);
     if (trace && now - last_trace >= 0.1) {
         last_trace = now;
-        const auto guest =
-            host_guest_pointer_resolve(g_mem, GUEST_SIZE, RECOMP_HOOK_MOUSE_DEVICE_PTR);
-        fprintf(stderr,
-                "[pointer-game] drawable %d,%d hit %d at %d,%d delivered %d guest %d,%d bounds "
-                "%d,%d,%d,%d\n",
-                x, y, int(hit.kind), hit.gx, hit.gy, delivered, guest.x, guest.y, guest.left,
-                guest.top, guest.right, guest.bottom);
+        fprintf(stderr, "[pointer] drawable %d,%d hit %d at %d,%d delivered %d\n", x, y,
+                int(hit.kind), hit.gx, hit.gy, delivered);
     }
     if (host_pointer_captured() && g_buttons && g_window && window_has_resize_edges()) {
         double px, py;
@@ -894,10 +889,9 @@ void post_drawable_size();
 
 TouchMapper g_touch;
 
-// A touch names a place. The motion event moves the host's idea of the
-// pointer; the PLACE event that follows writes the game's own cursor there
-// (host_gate_pointer_place) so the click after it hit-tests where the finger
-// is, with no convergence to wait for. All three travel the SDL queue in order.
+// A touch names a place. The motion event maps it through normal window input;
+// PLACE publishes the same absolute position before the click so hit-testing
+// uses the finger's location. All events travel the SDL queue in order.
 constexpr Sint32 kTouchPlaceEvent = 0x70756c63; // 'pulc'
 void push_touch_action_now(const TouchAction &a);
 
@@ -1549,7 +1543,6 @@ void pump() {
     apply_mode_change();
     service(0.0);
     after_events();
-    host_gate_pointer_tick();
     host_input_script_tick(host_present_count());
 
     // A bounded run for automated verification: the same MAX_FRAMES /

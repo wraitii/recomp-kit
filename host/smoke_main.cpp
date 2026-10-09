@@ -879,10 +879,6 @@ void tick() {
         return;
     if (!boot_close_requested())
         boot_present_windows();
-    // Mirror main.mm's pump: a stationary physical pointer still wakes the
-    // guest's event-driven DirectInput reader until it reaches the target.
-    if (g_window_gestures)
-        host_gate_pointer_tick();
     if (!g_script_started) {
         g_script_started = true;
         g_script_start_ms = boot_guest_millis();

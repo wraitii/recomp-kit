@@ -308,7 +308,6 @@ struct HostInputState {
 };
 void host_input_state(HostInputState *out);
 // Optional window feedback, at mouse delivery under the guest baton.
-void host_input_pointer_correction(int32_t *dx, int32_t *dy);
 
 // ---------------------------------------------------------------------------
 // The virtual gamepad. Merges every source the host feeds it (touch overlay,
