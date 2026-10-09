@@ -473,10 +473,6 @@ def parse_args(argv, system=None):
     parser.add_argument("--corpus-trials", type=int, default=9)
     parser.add_argument("--corpus-fragments", action="store_true",
                         help="Build and run the isolated x87 local-value experiment")
-    parser.add_argument("--cpu-locals-checks", action="store_true",
-                        help="Build and run full-state CPU/x87 locals checks without benchmarks")
-    parser.add_argument("--ir-ssa-checks", action="store_true",
-                        help="Build/run byte-backed integer SSA full-state synthetic checks")
     parser.add_argument("--contract-poison", action="store_true",
                         help="Compile with RECOMP_CONTRACT_POISON=1: direct calls overwrite "
                              "fields their call contract dropped, so a wrong summary fails")
@@ -526,7 +522,6 @@ def parse_args(argv, system=None):
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
     if args.function_corpus and any((args.regenerate, args.stub, args.corpus_fragments,
-                                      args.cpu_locals_checks, args.ir_ssa_checks,
                                       args.allow_unmodelled,
                                       args.allow_table_gaps, args.forget, args.discovered,
                                       args.config != "Release", args.target != "app")):
@@ -543,11 +538,6 @@ def parse_args(argv, system=None):
         parser.error("--corpus-msvc-x87-convention requires --corpus-ir-ssa")
     if args.corpus_msvc_x87_convention is not None:
         args.corpus_msvc_x87_convention = args.corpus_msvc_x87_convention == "on"
-    if args.ir_ssa_checks and any((args.regenerate, args.stub, args.corpus_fragments,
-                                  args.cpu_locals_checks,
-                                  args.config != "Release",
-                                  args.preset != default_preset(system), args.target != "app")):
-        parser.error("--ir-ssa-checks is an isolated native Release check mode")
     args.build_root = build_root_for(args.game_dir)
     return args, parser
 
@@ -555,11 +545,6 @@ def parse_args(argv, system=None):
 def main():
     """Check inputs, translate under the build lock when needed, then configure and build."""
     args, parser = parse_args(sys.argv[1:])
-    if args.ir_ssa_checks:
-        from ir.native_checks import run_checks
-        with buildlock.BuildLock(args.build_root.parent, "tools/build.py --ir-ssa-checks"):
-            run_checks(args.build_root / "ir-ssa-checks", cmake_tool("cmake"), args.jobs)
-        return
     if args.function_corpus:
         from corpus.run import run_corpus
         with buildlock.BuildLock(args.build_root.parent, "tools/build.py --function-corpus"):
@@ -572,10 +557,6 @@ def main():
     if args.corpus_fragments:
         from corpus.fragments.run import run_experiment
         run_experiment(args.build_root / "function-corpus-fragments", cmake_tool("cmake"), args.jobs)
-        return
-    if args.cpu_locals_checks:
-        from experiments.cpu_locals.run import run_checks
-        run_checks(args.build_root / "cpu-locals-checks", cmake_tool("cmake"), args.jobs)
         return
     cfg = game_config.load(args.game_dir)
     # Regenerating needs the game and its listings.

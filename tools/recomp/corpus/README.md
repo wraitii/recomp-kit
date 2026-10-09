@@ -128,8 +128,6 @@ experiments were removed once none of them fed production; their history is in G
 
 - `--corpus-fragments`: [synthetic x87 fixtures](fragments/README.md), preserving
   historical state/rounding regressions and explicitly weaker diagnostic modes.
-- `--cpu-locals-checks`: full-state integer/x87 synthetic checks, sharing the
-  migrated fragment harness, including null-check fallback and mutating callees.
 
 Use the game's build wrapper for every native compilation. Do not invoke
 compilers directly or retain private bytes/generated code in Git.

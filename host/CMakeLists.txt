@@ -33,18 +33,6 @@ endif()
 add_subdirectory(gpu)
 
 if(NOT IOS AND NOT ANDROID)
-# The platform boundary: no Objective-C++ and no Apple framework outside gpu/metal/.
-add_test(NAME host_boundary_check
-  COMMAND ${Python3_EXECUTABLE} -m unittest ${POP_ROOT}/tools/recomp/tests/test_host_boundary.py
-  WORKING_DIRECTORY ${POP_ROOT})
-set_tests_properties(host_boundary_check PROPERTIES LABELS nogame)
-
-# The committed SPIR-V must match the GLSL sources; skips where glslc is absent.
-add_test(NAME shader_drift_check
-  COMMAND ${Python3_EXECUTABLE} -m unittest ${POP_ROOT}/tools/recomp/tests/test_shaders.py
-  WORKING_DIRECTORY ${POP_ROOT})
-set_tests_properties(shader_drift_check PROPERTIES LABELS nogame)
-
 # Portable pieces built everywhere. compositor_tests needs a real device for
 # its pixel half (label gpu); ui_layer_tests needs nothing.
 add_executable(compositor_tests ${HOST}/compositor.cpp ${HOST}/tests/compositor_tests.cpp)

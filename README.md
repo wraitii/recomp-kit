@@ -229,7 +229,7 @@ packages, including the DLLs and their notice, land in `build/windows/package/`.
 ```
 
 Nothing under `runtime/`, `dx/`, `host/` or `platform/` may name a game;
-`tests/test_game_literals.py` enforces that. Game-specific documents live
+`tools/check_game_literals.py` enforces that. Game-specific documents live
 with their game.
 
 The experimental [instruction IR](docs/ir.md) lifts original x86 bytes with

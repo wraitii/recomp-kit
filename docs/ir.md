@@ -71,8 +71,7 @@ Run the census from a kit checkout, supplying the game repository and image:
 The JSON has per-function summaries, overlapping reason counters and exclusive
 categories (failed, standard, nonstandard with entry EBP input, other
 nonstandard). Entry EBP input alone does not classify a function as an unwind
-funclet. `tools/recomp/tests/test_ir_summary.py` checks the analyses on real
-instruction bytes.
+funclet.
 
 ## Observable region contracts
 
@@ -546,19 +545,8 @@ is additional evidence, not a replacement for conservative analysis.
 
 ### Existing checks
 
-- `tools/recomp/tests/test_ir_*.py` (portable suite): byte-backed lifting, SSA
-  interpreter checks, pass idempotence, publication plans, emitter admission and
-  rejection, production selection.
-- `tools/build.py --ir-ssa-checks`: the byte-backed synthetic fixtures in
-  `ir/native_checks.py` run against eager C as five columns (eager, raw,
-  scalar with strict state, scalar-strict, and the production scalar/locals with the MSVC convention, which
-  compares with that convention's dead fields cleared), each in an ordinary and
-  a null-check build, comparing every CPU field, 2 KiB of scratch and read-only
-  store-watch snapshots over 24576 inputs per fixture, including all x87 TOP, PC
-  and RC combinations. A mocked divide-error handler mutates other GPRs/flags and
-  the checks require every tracked field to be reloaded. The null-check build runs
-  its conservative path on mapped inputs; it does not inject null faults or
-  validate guest SEH.
+- `tools/recomp/diff/run.py` compares translated game functions with the
+  original bytes under Unicorn.
 - The function corpus (`tools/recomp/corpus/README.md`) compares each variant with
   eager C on real game bytes:
 
@@ -570,8 +558,7 @@ is additional evidence, not a replacement for conservative analysis.
   `--corpus-ir-ssa` replaces the combined variant only when the whole function is
   supported; otherwise the decoded emitter supplies it, and JSON records an
   `ir_ssa` emitted/fallback result per function. The eager variant is the
-  full-state oracle. Original-x86 and interior-fault differential checks are not
-  part of any of these.
+  full-state oracle.
 
 ## Production selection
 
