@@ -10,7 +10,7 @@ never be mistaken for its newly assigned value. Helpers invalidate facts.
 from .simplify import EFFECTS, EXITS
 
 
-def plan(s, successors, fields, *, access_fields=None):
+def plan(s, successors, fields, *, access_fields=None, reloaded=()):
     """Return required register-lane keys for each effect and return snapshot.
 
 `fields` groups register lanes by runtime field. LOAD/STORE have read-only CPU
@@ -19,6 +19,7 @@ watchpoint reads only the address and value, and null-check builds, whose fault
 dispatch exposes the CPU, translate with fault_state = "exact". access_fields (the locals
 policy) therefore names the only fields published at accesses. DIV32 may
 return through an error handler; it therefore invalidates all publication facts.
+A field in `reloaded` is known after a helper: its reload reads the CPU.
 At joins a field is known only if every predecessor published its exit value.
 Starting with no facts gives a conservative least fixed point for loops.
 
@@ -68,6 +69,10 @@ Starting with no facts gives a conservative least fixed point for loops.
                     # helper's fault path may leave arbitrary CPU state behind,
                     # so no must-fact survives.
                     known.clear()
+                    reloads = b.reloads.get(v.id, {})
+                    for n, keys in enumerate(groups):
+                        if all(key in reloaded and key in reloads for key in keys):
+                            known[n] = values(reloads, keys)
             outgoing = {n for n, keys in enumerate(groups)
                         if known.get(n) == values(b.exit, keys)}
             if outgoing != known_exit[i]:

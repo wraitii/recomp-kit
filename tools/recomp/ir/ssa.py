@@ -23,7 +23,7 @@ class Value:
 class Block:
     def __init__(self, index, insn):
         self.index, self.insn = index, insn
-        self.phis, self.ops, self.snapshots = [], [], {}
+        self.phis, self.ops, self.snapshots, self.reloads = [], [], {}, {}
         # Lazy-flag producer active at each publication snapshot, and at exit.
         self.cc_snapshots = {}
         self.cc_exit = None
@@ -180,6 +180,8 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
     for i in sorted(reachable):
         for j in sorted(set(fir.succ[i])):
             predecessors[j].append(i)
+    reload_groups = [tuple(group) for group in register_groups
+                     if len(group) > 1 and all(key in s.inputs for key in group)]
     for i in sorted(reachable):
         b = Block(i, fir.insns[i])
         s.blocks[i] = b
@@ -237,6 +239,19 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
             for n in range(size):
                 storage[(space, off + n)] = value if size == 1 else emit("BYTE", 1, [value], n)
 
+        def reload(value):
+            """Read every tracked field back from the CPU after `value`, one value per group."""
+            reloads = {}
+            for group in reload_groups:
+                wide = emit("CALL_RELOAD", len(group), [value], data=group[0])
+                for n, key in enumerate(group):
+                    state[key] = emit("BYTE", 1, [wide], n)
+                    reloads[key] = state[key]
+            for key in keys:
+                if key != MEMORY and key not in reloads:
+                    state[key] = reloads[key] = emit("CALL_RELOAD", s.inputs[key].size, [value], data=key)
+            b.reloads[value.id] = reloads
+
         for op in b.insn.ops:
             if op.opc == "CALL":
                 # An opaque direct call: publish the pre-call CPU, invoke the
@@ -248,12 +263,7 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                 b.snapshots[value.id] = before
                 b.cc_snapshots[value.id] = cc_active
                 state[MEMORY] = emit("MEMORY", 0, [value])
-                for key in keys:
-                    if key != MEMORY:
-                        # Pure read of the callee's result state; the call value
-                        # keeps it ordered after the call and lets simplify drop
-                        # a reload that no later observation uses.
-                        state[key] = emit("CALL_RELOAD", s.inputs[key].size, [value], data=key)
+                reload(value)
                 # The callee's flags replace the caller's; a descriptor left by
                 # an SSA callee is materialised by the emitter before reload.
                 cc_active = None
@@ -271,9 +281,7 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                 b.snapshots[value.id] = before
                 b.cc_snapshots[value.id] = cc_active
                 state[MEMORY] = emit("MEMORY", 0, [value])
-                for key in keys:
-                    if key != MEMORY:
-                        state[key] = emit("CALL_RELOAD", s.inputs[key].size, [value], data=key)
+                reload(value)
                 cc_active = None
                 continue
             args = [read(v) for v in op.ins]
@@ -303,9 +311,7 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                 # fault path may leave arbitrary CPU state behind. Reload every
                 # tracked lane and flag from the helper's result state, exactly
                 # as the eager emitter publishes and reloads live locals.
-                for key in keys:
-                    if key != MEMORY:
-                        state[key] = emit("CALL_RELOAD", s.inputs[key].size, [value], data=key)
+                reload(value)
                 cc_active = None
         if cc_rec is not None and cc_ready:
             cc_active = cc_rec

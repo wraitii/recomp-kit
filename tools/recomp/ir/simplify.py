@@ -20,6 +20,10 @@ PURE = frozenset((
     "SUBPIECE", "PIECE", "MEMORY",
 ))
 
+#: Results of an operation whose two operands are the same value.
+SELF = {"INT_EQUAL": 1, "INT_LESSEQUAL": 1, "INT_SLESSEQUAL": 1, "INT_NOTEQUAL": 0,
+        "INT_LESS": 0, "INT_SLESS": 0, "INT_XOR": 0, "INT_SUB": 0, "INT_SBORROW": 0}
+
 
 def canonicalize(s):
     """Propagate copies/constants and cancel byte decomposition/reassembly.
@@ -62,6 +66,8 @@ output width and p-code's zero result for shifts beyond the input width.
                     source = s.resolve(a[0].args[0])
                     if source.size == v.size and all(s.resolve(x.args[0]) is source for x in a):
                         replacement = source
+            elif len(a) == 2 and a[0] is a[1] and v.opc in SELF:
+                replacement = constant(v.size, SELF[v.opc])
             elif v.size and a and all(x.opc == "CONST" for x in a):
                 x = [arg.data for arg in a]
                 result = None
@@ -97,7 +103,33 @@ output width and p-code's zero result for shifts beyond the input width.
     # The trailing all-values pass this replaced only repeated that work.
 
 
-def live_values(s, publications=None, extra_roots=(), removable=()):
+def whole(s, lanes):
+    """The value whose complete byte sequence `lanes` is, or None."""
+    lanes = [s.resolve(x) for x in lanes]
+    if lanes[0].opc != "BYTE":
+        return None
+    source = s.resolve(lanes[0].args[0])
+    if source.size != len(lanes) or any(
+            x.opc != "BYTE" or x.data != n or s.resolve(x.args[0]) is not source
+            for n, x in enumerate(lanes)):
+        return None
+    return source
+
+
+def state_roots(s, state, keys, groups=()):
+    """Values a publication of `keys` from `state` reads; a whole group reads its source."""
+    keys = [key for key in keys if key in state]
+    wanted, roots = set(keys), []
+    for group in groups:
+        if all(key in wanted for key in group):
+            source = whole(s, [state[key] for key in group])
+            if source is not None:
+                roots.append(source)
+                wanted.difference_update(group)
+    return roots + [state[key] for key in keys if key in wanted]
+
+
+def live_values(s, publications=None, extra_roots=(), removable=(), groups=()):
     """Find values needed by effects, control flow and observable CPU states.
 
     Outgoing state is observable on return. Each required effect snapshot is a
@@ -106,10 +138,8 @@ An optional publication plan identifies fields that already reside in the CPU
 and therefore need no SSA computation or assignment at that observation.
 Memory tokens retain the dependency chain without authorizing load forwarding.
 
-``removable`` names opcodes that are otherwise treated as roots but that a
-caller may ignore when asking what a value is needed for.  The SSA emitter uses
-it for ``CALL_RELOAD``: a callee-state read is emitted even when its value is
-unused, so a settle decision needs a use-only view.
+``removable`` names opcodes that are otherwise treated as roots but stay only
+when used, such as the emitter's ``CALL_RELOAD`` callee-state reads.
 """
     todo = list(extra_roots)
     for b in s.blocks.values():
@@ -118,13 +148,10 @@ unused, so a settle decision needs a use-only view.
             # absence of a result use is not proof of absent effects.
             if v.opc not in PURE and v.opc not in removable:
                 todo.append(v)
-                if v.opc in EFFECTS:
-                    state = b.snapshots[v.id]
-                    todo.extend(state[key] for key in (
-                        state if publications is None else publications[v.id]))
-                elif v.opc in EXITS:
-                    todo.extend(b.exit[key] for key in (
-                        b.exit if publications is None else publications[v.id]))
+                if v.opc in EFFECTS or v.opc in EXITS:
+                    state = b.snapshots[v.id] if v.opc in EFFECTS else b.exit
+                    todo.extend(state_roots(s, state, state if publications is None
+                                            else publications[v.id], groups))
     live = set()
     while todo:
         v = s.resolve(todo.pop())
@@ -134,7 +161,7 @@ unused, so a settle decision needs a use-only view.
     return live
 
 
-def simplify(s, publications=None, *, canonical=True, extra_roots=()):
+def simplify(s, publications=None, *, canonical=True, extra_roots=(), removable=(), groups=()):
     """Canonicalize to a fixed point, then eliminate unobserved pure values.
 
     ``canonical=False`` skips the canonicalization pass for a caller that has
@@ -144,7 +171,7 @@ def simplify(s, publications=None, *, canonical=True, extra_roots=()):
     """
     if canonical:
         canonicalize(s)
-    live = live_values(s, publications, extra_roots)
+    live = live_values(s, publications, extra_roots, removable, groups)
     for b in s.blocks.values():
         b.ops = [v for v in b.ops if v.id in live and s.resolve(v) is v]
         b.phis = [v for v in b.phis if v.id in live and s.resolve(v) is v]

@@ -17,6 +17,7 @@ import ctypes as C
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import platform
 import random
@@ -263,7 +264,7 @@ def ext80(b):
     if exp == 0 and mant == 0:
         return sign * 0.0
     try:
-        return sign * float(mant) * 2.0 ** (exp - 16383 - 63)
+        return sign * math.ldexp(float(mant), exp - 16383 - 63)
     except OverflowError:
         return sign * float("inf")
 
