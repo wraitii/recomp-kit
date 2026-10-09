@@ -15,7 +15,7 @@ from .integer import memory_arithmetic, shift, divide
 from .integer_extra import EXTRA_MNEMONICS, correct as correct_extra
 from .ssa import SSAError, MEMORY, build
 from .cfg import FunctionIR
-from .simplify import canonicalize, simplify, live_values, EFFECTS
+from .simplify import canonicalize, simplify, live_values, EFFECTS, EXITS
 from .publication import plan
 from . import flag_region
 from . import x87
@@ -101,7 +101,7 @@ def _flag_producer(mnem, ops, flag_offsets):
     if info is None:
         return None
     kind, opc = info
-    for op in ops:
+    for op in reversed(ops):
         if op.opc != opc or op.out is None:
             continue
         space, off, size = op.out
@@ -149,6 +149,13 @@ def normalize_direct_ram(ins, lifter):
       is rejected rather than approximated. Control-flow ram is untouched.
     """
     ops = list(ins.ops)
+    for index, op in enumerate(ops):
+        if op.opc == "BRANCHIND" and op.ins[0][0] == "ram":
+            _, offset, size = op.ins[0]
+            target = lifter.fresh_unique(size)
+            ops[index:index + 1] = [Op("LOAD", target, [("const", offset, 4)]),
+                                    Op("BRANCHIND", None, [target])]
+            break
     touched = [op for op in ops if op.opc not in _RAM_CONTROL
                and any(v is not None and v[0] == "ram" for v in (op.out,) + op.ins)]
     if not touched:
@@ -195,14 +202,59 @@ def normalize_direct_ram(ins, lifter):
     return rewritten
 
 
-def codegen_ir(fir, lifter):
+def add_exit_stubs(insns, succ, exits, tails):
+    """Give each out-of-body transfer target one TAIL block, shared by its sources."""
+    index = {ins.addr: k for k, ins in enumerate(insns)}
+    succ = [list(row) for row in succ]
+    for i, targets in sorted(exits.items()):
+        for target in targets:
+            if target not in tails:
+                raise SSAError("%08x: tail target %08x is not bound" % (insns[i].addr, target))
+            if target not in index:
+                index[target] = len(insns)
+                insns.append(Insn(target, 0, "TAIL", [Op("TAIL", None, [("ram", target, 4)])],
+                                  0, False, False, [], None))
+                succ.append([])
+            succ[i].append(index[target])
+    return succ
+
+
+def seh_ops(ops, kinds, addr):
+    """Append the SEH runtime effects; an orphan precedes the return it guards."""
+    ops = list(ops)
+    for kind in kinds:
+        op = Op("SEH", None, [], {"kind": kind, "eip": addr})
+        if kind != "orphan":
+            ops.append(op)
+            continue
+        at = next((n for n, o in enumerate(ops) if o.opc == "RETURN"), None)
+        if at is None:
+            raise SSAError("%08x: SEH orphan without a return" % addr)
+        ops.insert(at, op)
+    return ops
+
+
+def seh_lines(kind, addr):
+    eip = "c->eip = 0x%xu;" % addr
+    if kind == "enter":
+        return [eip, "{ jmp_buf *b_ = recomp_seh_frame_enter(c); "
+                     "if (setjmp(*b_)) { recomp_seh_land(c); return; } }"]
+    if kind == "adopt":
+        return [eip, "{ jmp_buf *b_ = recomp_seh_frame_adopt(c); "
+                     "if (b_) { if (setjmp(*b_)) { recomp_seh_land(c); return; } } }"]
+    if kind == "leave":
+        return [eip, "recomp_seh_frame_leave(c);"]
+    return ["recomp_seh_frame_orphan(c, seh_mark_);"]
+
+
+def codegen_ir(fir, lifter, tails=()):
     """Apply audited integer/x87 corrections without changing raw census input."""
     flag_offsets = set()
     for name in ("CF", "PF", "AF", "ZF", "SF", "OF"):
         _, off, size = lifter.register(name)
         flag_offsets.update(range(off, off + size))
     insns = []
-    for ins in fir.insns:
+    for i, ins in enumerate(fir.insns):
         mnem = ins.mnem.upper()
         if mnem.startswith("F") or ins.x87 or mnem.startswith("WAIT "):
             ops = x87.lower(ins, lifter)
@@ -241,11 +293,16 @@ def codegen_ir(fir, lifter):
             ops = divide(normalized, lifter)
         else:
             ops = normalized.ops
+        if i in fir.seh:
+            ops = seh_ops(ops, fir.seh[i], ins.addr)
+        if i in fir.noreturn:
+            ops = ops + [Op("TRAP", None, [], fir.noreturn[i])]
         result = Insn(ins.addr, ins.length, ins.mnem, ops, ins.x87_delta,
                       ins.x87, ins.internal_flow, ins.userops, ins.raw)
         result.cc = _flag_producer(mnem, ops, flag_offsets)
         insns.append(result)
-    return FunctionIR(fir.addr, insns, fir.succ, fir.tables)
+    succ = add_exit_stubs(insns, fir.succ, fir.exits, tails)
+    return FunctionIR(fir.addr, insns, succ, fir.tables, entries=fir.entries)
 
 
 #: Codegen ops whose seams materialise flags eagerly before or after running.
@@ -359,7 +416,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
          call_symbols=None, x87_scalar_strict=False, local_state=True, msvc_convention=True,
          lazy_nan=False, lazy_flags=False, resumable_stacks=False, lifter=None,
          indirect_call_symbol=None, facts=None,
-         call_contracts=None, x87_cw_clone=True):
+         call_contracts=None, x87_cw_clone=True, tail_symbols=None):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
     `call_symbols` maps an allowed direct-call target address to the C symbol
@@ -493,7 +550,10 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
             key = ("register", off + n)
             lane_field[key] = name
             field_lanes.setdefault(name, set()).add(key)
-    cgi = codegen_ir(fir, lifter)
+    tail_symbols = dict(tail_symbols or {})
+    seh_mark = any("orphan" in kinds for kinds in fir.seh.values())
+    cgi = codegen_ir(fir, lifter, tail_symbols)
+    fir = cgi
     # Per-site lazy-flag settle decisions over the same codegen ops the
     # emitter lowers, so an eager seam or a call boundary is classified the
     # way the generated body actually behaves.
@@ -567,12 +627,12 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     if lazy_flags and optimize and publications is not None:
         for b in s.blocks.values():
             for v in b.ops:
-                if v.opc not in EFFECTS and v.opc not in ("RETURN", "BRANCHIND"):
+                if v.opc not in EFFECTS and v.opc not in EXITS:
                     continue
-                record = b.cc_exit if v.opc == "RETURN" else b.cc_snapshots.get(v.id)
+                record = b.cc_exit if v.opc in ("RETURN", "TAIL") else b.cc_snapshots.get(v.id)
                 if record is None:
                     continue
-                state = b.exit if v.opc in ("RETURN", "BRANCHIND") else b.snapshots[v.id]
+                state = b.exit if v.opc in EXITS else b.snapshots[v.id]
                 required = publications[v.id]
                 defines = set(CC_DEFINES[record.kind])
                 mask = 0
@@ -624,7 +684,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         # the earlier reload must not read a stale field.
         for index in live_flag_reload_calls(s, reload_live, flag_keys):
             cc_calls[index] = flag_region.SETTLE
-    if reads_entry_flags:
+    if reads_entry_flags or fir.entries:
         # The SSA builder loads live entry flag INPUTs straight from the fields,
         # immediately after the entry settle.  Those loads are not codegen ops,
         # so the region walk cannot see them: it may have classified the entry
@@ -794,7 +854,8 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         facts["x87_cw_clone"] = clones[0] is not None
     block_label = "F" if clones[0] == "fast" else "B"
 
-    lines = ["void %s(X86 *c) {" % symbol]
+    lines = ["static void %s(X86 *c, uint32_t entry_) {" % symbol if fir.entries
+             else "void %s(X86 *c) {" % symbol]
     for v in s.values:
         if v.id in live and v.size and v.opc not in ("CONST", "TARGET") and s.resolve(v) is v:
             lines.append("uint64_t v%d;" % v.id)
@@ -803,6 +864,8 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
         lines.extend(scalar.declarations())
     if lazy_flags:
         lines.extend(cc_action_lines(cc_entry))
+    if seh_mark:
+        lines.append("uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
     for v in s.values:
         if v.opc != "INPUT" or not v.size or v.id not in live or s.resolve(v) is not v:
             continue
@@ -811,10 +874,20 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
     for v in getattr(s, "entry_ops", ()):
         if v.id in live and s.resolve(v) is v:
             lines.append("v%d = (%s) & %s;" % (v.id, expression(v), mask(v.size)))
-    lines.extend(edge(-1, s.entry))
+    if fir.entries:
+        lines.append("switch (entry_) {")
+        for e, block in zip(fir.entries, s.alternates):
+            lines.append("case 0x%xu:" % e)
+            lines.extend(edge(-1, block))
+        lines.append("default:")
+        lines.extend(edge(-1, s.entry))
+        lines.append("}")
+    else:
+        lines.extend(edge(-1, s.entry))
     indices = {b.insn.addr: i for i, b in s.blocks.items()}
     predecessors = {i: set() for i in s.blocks}
-    predecessors[s.entry].add(-1)
+    for e in [s.entry] + s.alternates:
+        predecessors[e].add(-1)
     for i in s.blocks:
         for j in set(fir.succ[i]):
             predecessors[j].add(i)
@@ -844,7 +917,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                             v.opc == "X87_MEM" and m in ("FST", "FSTP", "FNSTSW", "FNSTCW")):
                         finish_scalar_run()
                 elif v.opc in ("STORE", "DIV32", "IDIV32", "CALL", "CALLIND", "STRINGOP",
-                               "RETURN", "BRANCH", "CBRANCH", "BRANCHIND"):
+                               "RETURN", "TAIL", "TRAP", "BRANCH", "CBRANCH", "BRANCHIND"):
                     finish_scalar_run()
             prev = i
         finish_scalar_run()
@@ -894,7 +967,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                 # fallthrough.
                 continue
             if (i == prev + 1 and set(fir.succ[prev]) == {i}
-                    and not any(op.opc in ("BRANCH", "CBRANCH", "RETURN", "BRANCHIND")
+                    and not any(op.opc in ("BRANCH", "CBRANCH", "RETURN", "BRANCHIND", "TAIL", "TRAP")
                                 for op in s.blocks[prev].ops)):
                 linear_prev[i] = prev
 
@@ -1066,6 +1139,15 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                     lines.extend(flush_x87())
                     lines.extend(publish(b.exit, v))
                     lines.extend(["recomp_return(c);", "return;"])
+                elif v.opc == "SEH":
+                    lines.extend(publish(b.snapshots[v.id], v))
+                    lines.extend(seh_lines(v.data["kind"], v.data["eip"]))
+                elif v.opc == "TRAP":
+                    lines.append("recomp_unknown_call(c, 0x%xu); return;" % v.data)
+                elif v.opc == "TAIL":
+                    lines.extend(flush_x87())
+                    lines.extend(publish(b.exit, v))
+                    lines.append("%s(c); return;" % tail_symbols[v.args[0].data])
                 elif v.opc == "BRANCHIND":
                     # A decoded jump table: the target address selects a case, any
                     # other value is a runtime jump exactly like the decoded
@@ -1112,7 +1194,7 @@ def emit(fir, symbol, *, optimize=True, publish_changed=True, wide_registers=Tru
                         lines.extend(edge(i, indices[b.insn.addr + b.insn.length]))
                 else:
                     lines.append("v%d = (%s) & %s;" % (v.id, expression(v), mask(v.size)))
-            if not any(v.opc in ("BRANCH", "CBRANCH", "RETURN", "BRANCHIND") for v in b.ops):
+            if not any(v.opc in ("BRANCH", "CBRANCH", "RETURN", "BRANCHIND", "TAIL", "TRAP") for v in b.ops):
                 target = fir.succ[i][0]
                 if carry_mode:
                     if linear_prev.get(target) != i:

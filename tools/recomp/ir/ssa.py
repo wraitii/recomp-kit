@@ -101,7 +101,8 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
     if len(indices) != len(fir.insns) or fir.addr not in indices:
         raise SSAError("duplicate addresses or missing entry")
     entry = indices[fir.addr]
-    reachable, todo = set(), [entry]
+    alternates = [indices[a] for a in fir.entries]
+    reachable, todo = set(), [entry] + alternates
     while todo:
         i = todo.pop()
         if i in reachable:
@@ -121,12 +122,13 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                 raise SSAError("%08x: multiple direct calls in one instruction" % ins.addr)
             target = call_ops[0].ins
             if len(target) != 1 or target[0][0] != "ram" or target[0][1] not in call_targets:
-                raise SSAError("%08x: direct call target is not bound" % ins.addr)
+                raise SSAError("%08x: direct call target %s is not bound" % (ins.addr, "%08x" % target[0][1] if len(target) == 1 else "?"))
             # The call must continue exactly at its own fallthrough. A CFG that
             # resumes elsewhere is a noreturn/tail/alternate-entry shape this
             # effect model does not cover, so it stays a whole-function fallback.
             fall_index = indices.get(ins.addr + ins.length)
-            if fall_index is None or set(fir.succ[i]) != {fall_index}:
+            if not any(op.opc == "TRAP" for op in ins.ops) and (
+                    fall_index is None or set(fir.succ[i]) != {fall_index}):
                 raise SSAError("%08x: direct call lacks its canonical fallthrough" % ins.addr)
         indirect_ops = [op for op in ins.ops if op.opc == "CALLIND"]
         if indirect_ops:
@@ -143,6 +145,8 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
             if fall_index is None or set(fir.succ[i]) != {fall_index}:
                 raise SSAError("%08x: indirect call lacks its canonical fallthrough" % ins.addr)
         for op in ins.ops:
+            if op.opc == "TAIL":
+                continue
             if (op.opc == "BRANCHIND" and i in fir.tables and len(ins.ops) > 0
                     and len(op.ins) == 1 and op.ins[0][0] != "ram" and op.ins[0][2] == 4):
                 continue
@@ -166,10 +170,12 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
     keys = sorted(keys)
     s = SSA()
     s.entry = entry
+    s.alternates = alternates
     for key in keys:
         s.inputs[key] = s.value("INPUT", 0 if key == MEMORY else 1, data=key)
     predecessors = {i: [] for i in reachable}
-    predecessors[entry].append(-1)
+    for e in [entry] + alternates:
+        predecessors[e].append(-1)
     for i in sorted(reachable):
         for j in sorted(set(fir.succ[i])):
             predecessors[j].append(i)
@@ -318,6 +324,9 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                 wanted.add(indices[b.insn.addr + b.insn.length])
             if set(fir.succ[i]) != wanted:
                 raise SSAError("branch disagrees with supplied CFG")
+        elif any(op.opc in ("TAIL", "TRAP") for op in b.insn.ops):
+            if fir.succ[i]:
+                raise SSAError("tail exit has successors")
         elif branches and branches[0].opc == "RETURN":
             if fir.succ[i]:
                 raise SSAError("return has successors")

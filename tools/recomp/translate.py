@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import game_config  # noqa: E402
 from ir import flag_region  # noqa: E402
+from ir.lift import LiftError  # noqa: E402
 
 # Stable address buckets prevent an insertion from repacking the entire image.
 # Oversize functions stand alone; recursively split only an over-budget bucket.
@@ -2233,6 +2234,26 @@ class Translator(object):
                     continue
             work.extend((j, active) for j in self.successors(fn, i))
         return escapes
+
+    def seh_effects(self, fn):
+        """SEH runtime effects per instruction, as the decoded emitter attaches them."""
+        for i in fn.seh_sites:
+            if fn.insns[i].mnem != "MOV":
+                raise LiftError("%08x: SEH frame site is not a MOV" % fn.insns[i].addr)
+        effects = {}
+        for i, ins in enumerate(fn.insns):
+            if ins.mnem == "MOV" and fn.seh_sites and len(ins.ops) == 2:
+                dst, src = [parse_operand(o) for o in ins.ops]
+                if ((seh_chain_operand(dst) or i in fn.seh_sites)
+                        and src.kind == "reg" and src.size == 32):
+                    effects[i] = ("enter" if i in fn.seh_sites else "leave",)
+            elif ins.mnem == "POP" and i in fn.seh_restores:
+                effects[i] = ("leave",)
+            elif ins.mnem == "CALL" and self.branch_target(ins) in self.seh_helpers:
+                effects[i] = ("adopt",)
+            elif ins.mnem == "RET" and i in fn.seh_escapes:
+                effects[i] = ("orphan",)
+        return effects
 
     def discover_seh_helpers(self, functions):
         """Propagate escaping helper calls after all normal bodies are indexed."""

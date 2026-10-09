@@ -335,6 +335,8 @@ def cfg_is_closed(fir):
     for i, ins in enumerate(fir.insns):
         mnem = ins.mnem.upper()
         succ = fir.succ[i]
+        if i in fir.exits:
+            return False
         if mnem == "RET":
             if succ:
                 return False

@@ -42,7 +42,8 @@ def analyze(s, fir, scalar_factory, binary32):
     non-monotonicity into an explicit error instead of a hang.
     """
     predecessors = {i: set() for i in s.blocks}
-    predecessors[s.entry].add(-1)
+    for e in [s.entry] + s.alternates:
+        predecessors[e].add(-1)
     for i in s.blocks:
         for j in set(fir.succ[i]):
             predecessors[j].add(i)
@@ -69,6 +70,9 @@ def analyze(s, fir, scalar_factory, binary32):
 
     entry = {i: None for i in s.blocks}
     entry[s.entry] = INACTIVE
+    # Another entry arrives with nothing carried, so every edge into it publishes.
+    for i in s.alternates:
+        entry[i] = UNSAFE
     exit_shape = {}
     work = deque(seed_order)
     queued = set(seed_order)
@@ -83,6 +87,12 @@ def analyze(s, fir, scalar_factory, binary32):
         # A window overflow is absorbing: predecessor shapes only grow, so a
         # block that fell back to reset can never become carryable again.
         if entry[i] is UNSAFE:
+            if i in s.alternates and i not in exit_shape:
+                exit_shape[i] = _transfer(s.blocks[i], UNSAFE, scalar_factory, binary32)
+                for j in sorted(set(fir.succ[i])):
+                    if j not in queued:
+                        queued.add(j)
+                        work.append(j)
             continue
         shapes = []
         for p in sorted(predecessors[i]):

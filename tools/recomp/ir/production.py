@@ -21,7 +21,7 @@ from .ssa import SSAError
 
 # Bound Python graph/phi construction before it can consume excessive resources.
 # This is a code-generation budget, never a guest execution limit.
-MAX_INSTRUCTIONS = 2048
+MAX_INSTRUCTIONS = 16384
 
 #: Bodies lifted by the parent and handed to workers per batch. Bounds the
 #: parent's copy of lifted IR while keeping each pool submission large enough
@@ -88,22 +88,22 @@ def seh_hooks(tr, fn):
     return any(fn.insns[i].mnem == "POP" for i in fn.seh_restores)
 
 
+def external_entries(tr, fn, entries):
+    """Entries other code can reach, not only switch cases of this body.
+
+    With any, the SSA body takes every entry and the wrappers follow; with
+    none, `apply` keeps the decoded body for the switch-case wrappers."""
+    entries = sorted(e for e in entries if e in fn.index)
+    internal = tr.internal_entries.get(fn.addr, set())
+    return entries if any(e not in internal for e in entries) else []
+
+
 def exclusion(tr, fn, entries, policies):
     """Reject production contracts the corpus emitter does not implement."""
-    external = set(entries) - tr.internal_entries.get(fn.addr, set())
-    if external:
-        return "alternate entries"
-    # Entries left over are switch-case blocks reached only from this body. The
-    # SSA builder decides whether it can lower the table jump (it names
-    # BRANCHIND otherwise); `apply` keeps the decoded body for their wrappers.
     if fn.addr in policies.get("intrinsic_bodies", {}):
         return "runtime intrinsic"
-    if seh_hooks(tr, fn):
-        return "SEH frame ownership"
     if fn.pushed_continuations or fn.return_jumps:
         return "guest continuations"
-    if fn.dead_addrs or fn.addr in tr.noreturn_callees:
-        return "nonreturning control flow"
     if len(fn.insns) > MAX_INSTRUCTIONS:
         return "SSA instruction budget"
     rewritten = (set(policies.get("instruction_patches", ()))
@@ -121,8 +121,7 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
     started = time.monotonic()
     lifter = Lifter()
     known = {fn.addr for fn in functions}
-    forbidden = (set(tr.seh_helpers) | set(tr.noreturn_callees)
-                 | set(policies.get("intrinsic_bodies", {})))
+    forbidden = set(policies.get("intrinsic_bodies", {}))
     relaxed = settings.get("fault_state", "relaxed") == "relaxed"
     mode, state = ("scalar", "locals") if relaxed else ("scalar-strict", "strict")
     convention = settings.get("msvc_x87_convention", True)
@@ -195,6 +194,7 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
     batch = []
     reasons_by_index = {}
     outcomes = {}
+    outcomes_entries = {}
 
     emit_wait = [0.0]
 
@@ -202,7 +202,7 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
         if not batch:
             return
         flushed = time.monotonic()
-        tasks = [(index, "fn_%08x" % fn.addr, fir, options)
+        tasks = [(index, ("body_%08x" if fir.entries else "fn_%08x") % fn.addr, fir, options)
                  for index, fn, fir, options in batch]
         if pool is not None:
             for index, source, reason, facts in pool.map(_worker_emit, tasks, chunksize=8):
@@ -228,6 +228,7 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
                 try:
                     # The contract pass already lifted most bodies.
                     fir = lifted.pop(fn.addr, None) or function_ir(tr, lifter, fn)
+                    fir.entries = external_entries(tr, fn, entries_by_fn.get(fn.addr, ()))
                 except (SSAError, LiftError) as error:
                     reason = str(error)
                 except RecursionError:
@@ -235,11 +236,15 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
                 else:
                     options = dict(common)
                     options["call_symbols"] = calls
+                    options["tail_symbols"] = {
+                        t: "entry_%08x" % t for targets in fir.exits.values()
+                        for t in targets if t in tr.func_addrs}
                     if contracts:
                         # Only this body's bound targets: the whole table would
                         # be pickled into every worker task.
                         options["call_contracts"] = {
                             t: contracts[t] for t in calls if t in contracts}
+                    outcomes_entries[index] = fir.entries
                     batch.append((index, fn, fir, options))
                     if len(batch) >= _EMIT_BATCH * jobs:
                         flush()
@@ -264,7 +269,11 @@ def apply(tr, functions, bodies, entries_by_fn, settings, *, policies=None,
             # retargeting and dispatch checks already understand this seam.
             source = re.sub(r"\bentry_([0-9a-f]{8})\(c\);", r"CALL_FN(\1);", source)
             merged = source.splitlines()
-            if entries_by_fn.get(fn.addr):
+            if outcomes_entries.get(index):
+                merged += ["void fn_%08x(X86 *c) { body_%08x(c, 0u); }" % (fn.addr, fn.addr)]
+                merged += ["void fn_%08x(X86 *c) { body_%08x(c, 0x%xu); }" % (e, fn.addr, e)
+                           for e in outcomes_entries[index]]
+            elif entries_by_fn.get(fn.addr):
                 # Internal switch-case entries keep their decoded wrappers and
                 # `body_` for any runtime jump to a case; only the normal entry
                 # `fn_X` is replaced by the SSA body.

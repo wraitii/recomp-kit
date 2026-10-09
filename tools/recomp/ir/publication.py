@@ -7,7 +7,7 @@ all incoming paths prove its current value already resides in the CPU. Facts
 are relative to block entry/exit state, so a loop phi's previous iteration can
 never be mistaken for its newly assigned value. Helpers invalidate facts.
 """
-from .simplify import EFFECTS
+from .simplify import EFFECTS, EXITS
 
 
 def plan(s, successors, fields, *, access_fields=None):
@@ -27,7 +27,8 @@ Starting with no facts gives a conservative least fixed point for loops.
     groups = [keys for keys in groups if keys]
     access_fields = None if access_fields is None else frozenset(access_fields)
     predecessors = {i: [] for i in s.blocks}
-    predecessors[s.entry].append(-1)
+    for e in [s.entry] + s.alternates:
+        predecessors[e].append(-1)
     for i in s.blocks:
         for j in set(successors[i]):
             predecessors[j].append(i)
@@ -44,10 +45,10 @@ Starting with no facts gives a conservative least fixed point for loops.
             known = {n: values(b.state, keys) for n, keys in enumerate(groups)
                      if all(p == -1 or n in known_exit[p] for p in predecessors[i])}
             for v in b.ops:
-                if v.opc not in EFFECTS and v.opc not in ("RETURN", "BRANCHIND"):
+                if v.opc not in EFFECTS and v.opc not in EXITS:
                     continue
-                state = b.exit if v.opc in ("RETURN", "BRANCHIND") else b.snapshots[v.id]
-                access = v.opc in ("LOAD", "STORE", "X87_MEM")
+                state = b.exit if v.opc in EXITS else b.snapshots[v.id]
+                access = v.opc in ("LOAD", "STORE", "X87_MEM", "SEH")
                 required = []
                 for n, keys in enumerate(groups):
                     if access and access_fields is not None and not any(key in access_fields for key in keys):

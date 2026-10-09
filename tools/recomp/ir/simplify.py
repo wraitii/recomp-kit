@@ -6,9 +6,11 @@ The passes work on SSA rather than C spelling and can serve other consumers.
 """
 
 EFFECTS = frozenset(("LOAD", "STORE", "DIV32", "IDIV32", "X87_MEM", "CALL",
-                     "CALLIND", "STRINGOP"))
+                     "CALLIND", "STRINGOP", "SEH"))
 ORDERED = EFFECTS | {"X87_REG"}
-TERMINATORS = frozenset(("BRANCH", "CBRANCH", "RETURN", "BRANCHIND"))
+TERMINATORS = frozenset(("BRANCH", "CBRANCH", "RETURN", "BRANCHIND", "TAIL", "TRAP"))
+#: Terminators that publish the block's exit state.
+EXITS = ("RETURN", "BRANCHIND", "TAIL")
 PURE = frozenset((
     "PACK", "BYTE", "COPY", "INT_ZEXT", "INT_SEXT", "INT_ADD", "INT_SUB", "INT_MULT",
     "INT_AND", "INT_OR", "INT_XOR", "INT_EQUAL", "INT_NOTEQUAL", "INT_LESS",
@@ -120,7 +122,7 @@ unused, so a settle decision needs a use-only view.
                     state = b.snapshots[v.id]
                     todo.extend(state[key] for key in (
                         state if publications is None else publications[v.id]))
-                elif v.opc in ("RETURN", "BRANCHIND"):
+                elif v.opc in EXITS:
                     todo.extend(b.exit[key] for key in (
                         b.exit if publications is None else publications[v.id]))
     live = set()
