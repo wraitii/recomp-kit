@@ -344,7 +344,7 @@ def translation_fingerprint(game_dir, cfg, translate_args):
         path = game_dir / name
         if path.is_file():
             h.update(name.encode() + b"\0" + path.read_bytes())
-    h.update(b"exe\0" + cfg["game"]["sha256"].encode())
+    h.update(b"exe\0" + hashlib.sha256(cfg["developer_exe_path"].read_bytes()).digest())
     if cfg.get("code_map_path"):
         from code_map import MAP_FILES
         for name in MAP_FILES:

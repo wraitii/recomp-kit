@@ -6,6 +6,7 @@ instruction effects. Nothing here decodes with Capstone or scans for code.
 Unknown control flow fails with a named diagnostic: fix Ghidra and re-export.
 """
 from bisect import bisect_right
+import hashlib
 
 import code_map
 from ir.cfg import FunctionIR
@@ -105,6 +106,13 @@ class Program(object):
         root = settings.code_map
         self.pe = PE(settings.exe)
         self.metadata, spans = code_map.read_map(root)
+        actual_hash = hashlib.sha256(settings.exe.read_bytes()).hexdigest()
+        expected_hash = settings.cfg["game"]["sha256"]
+        if actual_hash != expected_hash or self.metadata.get("executable_sha256") != actual_hash:
+            raise TranslateError("code-map, game.toml and executable SHA-256 do not match")
+        if (self.pe.base != settings.cfg["game"]["image_base"] or
+                self.metadata.get("image_base") != "%08x" % self.pe.base):
+            raise TranslateError("code-map, game.toml and executable image bases do not match")
         self.tables, self.interior, noreturn, self.noreturn_calls = code_map.read_program(root)
         self.functions = {addr: Function(addr, rows, addr in noreturn)
                           for addr, rows in spans.items()}
