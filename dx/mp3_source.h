@@ -7,7 +7,8 @@
 #include "../third_party/minimp3/minimp3.h"
 
 struct Mp3Source {
-    bool open(const std::vector<uint8_t> &bytes);
+    bool open(const std::vector<uint8_t> &bytes, bool complete = true);
+    void append(const uint8_t *bytes, size_t size, bool complete);
     bool decode_next(std::vector<int16_t> &out);
     uint32_t rate() const {
         return rate_;
@@ -34,5 +35,5 @@ struct Mp3Source {
     uint32_t rate_ = 0, channels_ = 0;
     uint64_t position_ = 0;
     int64_t duration_ = -1;
-    bool drained_ = true;
+    bool drained_ = true, complete_ = true;
 };

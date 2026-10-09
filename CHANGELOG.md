@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Correct the IFilterGraph IID and render guest IAsyncReader MPEG audio sources
+  progressively through the streaming mixer and volume/completion interfaces.
+  Duration and forward seek require the complete source; incomplete requests
+  retain named unsupported diagnostics.
+
 - Implement memory-backed mmioGetInfo, mmioSetInfo and read mmioAdvance with
   guest cursors and three-argument stdcall cleanup. Disk direct buffering and
   write advance retain named unsupported diagnostics.

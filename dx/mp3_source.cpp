@@ -23,7 +23,8 @@
 #include <limits.h>
 
 // Probe the first frame for format without consuming it from the caller.
-bool Mp3Source::open(const std::vector<uint8_t> &bytes) {
+bool Mp3Source::open(const std::vector<uint8_t> &bytes, bool complete) {
+    complete_ = complete;
     bytes_ = bytes;
     rate_ = channels_ = 0;
     duration_ = -1;
@@ -37,15 +38,28 @@ bool Mp3Source::open(const std::vector<uint8_t> &bytes) {
     return true;
 }
 
+void Mp3Source::append(const uint8_t *bytes, size_t size, bool complete) {
+    bytes_.insert(bytes_.end(), bytes, bytes + size);
+    complete_ = complete;
+    drained_ = false;
+    duration_ = -1;
+}
+
 // Skip metadata and empty frames until one yields PCM, as DirectShow did.
 bool Mp3Source::decode_frame(std::vector<int16_t> &out) {
     out.clear();
     int16_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
     while (offset_ < bytes_.size()) {
+        mp3dec_t saved = dec_;
         mp3dec_frame_info_t info;
         int n = mp3dec_decode_frame(&dec_, bytes_.data() + offset_,
                                     (int)std::min(bytes_.size() - offset_, (size_t)INT_MAX), pcm,
                                     &info);
+        if (!complete_ && n == 0 &&
+            (info.frame_bytes <= 0 || (size_t)info.frame_bytes >= bytes_.size() - offset_)) {
+            dec_ = saved;
+            return false;
+        }
         if (info.frame_bytes <= 0)
             break;
         offset_ += (size_t)info.frame_bytes;
@@ -59,7 +73,7 @@ bool Mp3Source::decode_frame(std::vector<int16_t> &out) {
             return true;
         }
     }
-    drained_ = true;
+    drained_ = complete_;
     return false;
 }
 
@@ -94,6 +108,8 @@ void Mp3Source::seek_frames(uint64_t target) {
 
 // Count lazily with an independent parser so duration queries do not seek.
 int64_t Mp3Source::duration_frames() {
+    if (!complete_)
+        return -1;
     if (duration_ >= 0)
         return duration_;
     mp3dec_t dec;
