@@ -1260,36 +1260,45 @@ void d3d7_sync_texture(ComObj *dev, uint32_t stage) {
             conv_cache.erase(it);
         }
     }
-    ConvEntry &sc = conv_cache[tex->id];
-    sc.used = ++conv_tick;
-    std::vector<uint8_t> &converted = sc.bytes;
-    const bool fresh =
-        sc.generation == tex->d3d8_content_generation && tex->lock_count == 0 && !converted.empty();
-    if (!fresh) {
-        conv_bytes -= converted.size();
-        const bool ok = d3d7_convert_texture(tex, converted);
-        conv_bytes += converted.size();
-        if (!ok) {
-            LOGW("d3d7: SetTexture stage %u surface %ux%u bpp=%u masks=%08x/%08x/%08x has no "
-                 "decoded format (DXT and other compressed layouts are deferred); stopping",
-                 stage, tex->width, tex->height, tex->bpp, tex->rmask, tex->gmask, tex->bmask);
-            fflush(stderr);
-            abort();
+    std::vector<D3d8TextureLevel> levels;
+    // DirectDraw SetTexture binds the root of an implicit mip chain, not
+    // just its base pixels. Reconcile and version each level independently;
+    // updating a child must not require changing/rebinding the root.
+    for (ComObj *level = tex; level; level = com_get(level->mip_next)) {
+        const int32_t full[4] = {0, 0, (int32_t)level->width, (int32_t)level->height};
+        ddraw_refresh_retained_writes(level, full);
+        ConvEntry &sc = conv_cache[level->id];
+        sc.used = ++conv_tick;
+        std::vector<uint8_t> &converted = sc.bytes;
+        const bool fresh = sc.generation == level->d3d8_content_generation &&
+                           level->lock_count == 0 && !converted.empty();
+        if (!fresh) {
+            conv_bytes -= converted.size();
+            const bool ok = d3d7_convert_texture(level, converted);
+            conv_bytes += converted.size();
+            if (!ok) {
+                LOGW("d3d7: SetTexture stage %u surface %ux%u bpp=%u masks=%08x/%08x/%08x has no "
+                     "decoded format (DXT and other compressed layouts are deferred); stopping",
+                     stage, level->width, level->height, level->bpp, level->rmask, level->gmask,
+                     level->bmask);
+                fflush(stderr);
+                abort();
+            }
         }
+        sc.generation = level->lock_count == 0 ? level->d3d8_content_generation : UINT64_MAX;
+        const uint32_t dirty = level->lock_count > 0 ? 1u : 0u;
+        D3d8TextureLevel lvl{};
+        lvl.level = (uint32_t)levels.size();
+        lvl.width = level->width;
+        lvl.height = level->height;
+        lvl.dirty = dirty;
+        lvl.generation = level->d3d8_content_generation;
+        lvl.data = converted.data();
+        lvl.bytes = (uint32_t)converted.size();
+        levels.push_back(lvl);
     }
-    sc.generation = tex->lock_count == 0 ? tex->d3d8_content_generation : UINT64_MAX;
-    const uint32_t dirty = tex->lock_count > 0 ? 1u : 0u;
-    // D3D7 SetTexture binds one surface; hand the renderer a single base level.
-    D3d8TextureLevel lvl{};
-    lvl.level = 0;
-    lvl.width = tex->width;
-    lvl.height = tex->height;
-    lvl.dirty = dirty;
-    lvl.generation = tex->d3d8_content_generation;
-    lvl.data = converted.data();
-    lvl.bytes = (uint32_t)converted.size();
     host_ok(d3d8_device_set_texture((D3d8Device *)dev->d3d7_host, stage, tex->id, D3D8FMT_A8R8G8B8,
-                                    1, &lvl, &err),
+                                    (uint32_t)levels.size(), levels.data(), &err),
             err, "SetTexture");
 #else
     (void)dev;
@@ -1314,6 +1323,15 @@ void fill_device_desc7(uint32_t addr, const uint8_t guid[16], bool tnl) {
     wr32(addr + D3DDD7_OFF_dwDevCaps, caps);
     wr32(addr + D3DDD7_OFF_dpcLineCaps + D3DPC_OFF_dwSize, D3DPRIMCAPS_SIZE);
     wr32(addr + D3DDD7_OFF_dpcTriCaps + D3DPC_OFF_dwSize, D3DPRIMCAPS_SIZE);
+    // These filters are implemented by the renderer, including implicit
+    // DirectDraw mip chains. Do not advertise anisotropic/cubic filters.
+    for (uint32_t pc : {D3DDD7_OFF_dpcLineCaps, D3DDD7_OFF_dpcTriCaps}) {
+        wr32(addr + pc + D3DPC_OFF_dwTextureCaps, D3DPTEXTURECAPS_MIPMAP);
+        wr32(addr + pc + D3DPC_OFF_dwTextureFilterCaps,
+             D3DPTFILTERCAPS_MINFPOINT | D3DPTFILTERCAPS_MINFLINEAR | D3DPTFILTERCAPS_MIPFPOINT |
+                 D3DPTFILTERCAPS_MIPFLINEAR | D3DPTFILTERCAPS_MAGFPOINT |
+                 D3DPTFILTERCAPS_MAGFLINEAR);
+    }
     // Host truth: the display mode is 16bpp and the z-buffer the engine asks
     // for is 16-bit, so both bit-depth masks advertise 16 only.
     wr32(addr + D3DDD7_OFF_dwDeviceRenderBitDepth, DDBD_16);

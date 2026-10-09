@@ -6804,6 +6804,87 @@ static void test_dxt_decode() {
 // A DXT1 DirectDraw surface: CreateSurface accepts the FourCC, storage is the
 // block bytes, the Lock descriptor reports the linear size (not the block
 // pitch), and a Blt decodes into an A4R4G4B4 destination.
+// Implicit mip surfaces have separate lock storage and a next-level attachment.
+// Descriptor counts include the current level; invalid creation must not leak VRAM.
+static void test_ddraw_mipmap_chain() {
+    cpu_reset();
+    const uint8_t dd7[16] = {0xc0, 0x5e, 0xe6, 0x15, 0x9c, 0x3b, 0xd2, 0x11,
+                             0xb9, 0x2f, 0x00, 0x60, 0x97, 0x97, 0xea, 0x5b};
+    uint32_t iid = sc(0x40), out = sc(0x60), desc = sc(0x900), caps = sc(0xa00);
+    memcpy(gm_ptr(iid), dd7, 16);
+    CHECK_EQ(call_shim(tramp("DDRAW.dll", "DirectDrawCreateEx"), {0, out, iid, 0}), DD_OK);
+    uint32_t dd = rd32(out);
+    auto make = [&](uint32_t count, bool explicit_count, uint32_t extra_caps) {
+        gm_zero(desc, DDSD2_SIZE);
+        wr32(desc, DDSD2_SIZE);
+        wr32(desc + DDSD_OFF_dwFlags, DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT |
+                                          (explicit_count ? DDSD_MIPMAPCOUNT : 0));
+        wr32(desc + DDSD_OFF_dwWidth, 8);
+        wr32(desc + DDSD_OFF_dwHeight, 2);
+        wr32(desc + DDSD_OFF_dwMipMapCount, count);
+        wr32(desc + DDSD_OFF_ddsCaps, DDSCAPS_TEXTURE | DDSCAPS_MIPMAP | extra_caps);
+        uint32_t pf = desc + DDSD_OFF_ddpfPixelFormat;
+        wr32(pf, DDPF_SIZE);
+        wr32(pf + DDPF_OFF_dwFlags, DDPF_RGB);
+        wr32(pf + DDPF_OFF_dwRGBBitCount, 16);
+        return call_method(dd, DD_CreateSurface, {desc, out, 0});
+    };
+    CHECK_EQ(make(0, true, DDSCAPS_COMPLEX), DDERR_INVALIDPARAMS);
+    CHECK_EQ(make(5, true, DDSCAPS_COMPLEX), DDERR_INVALIDPARAMS);
+    CHECK_EQ(make(2, true, 0), DDERR_INVALIDCAPS);
+    CHECK_EQ(make(0, false, DDSCAPS_COMPLEX | DDSCAPS_SYSTEMMEMORY), DD_OK);
+    uint32_t root = rd32(out), current = root, root_pixels = 0;
+    gm_zero(caps, 16);
+    wr32(caps, DDSCAPS_TEXTURE | DDSCAPS_MIPMAP);
+    std::vector<uint32_t> ids;
+    for (uint32_t i = 0; i < 4; ++i) {
+        ids.push_back(com_this(current)->id);
+        wr32(desc, DDSD2_SIZE);
+        CHECK_EQ(call_method(current, S_GetSurfaceDesc, {desc}), DD_OK);
+        CHECK_EQ(rd32(desc + DDSD_OFF_dwWidth), 8u >> i);
+        CHECK_EQ(rd32(desc + DDSD_OFF_dwHeight), i ? 1u : 2u);
+        CHECK_EQ(rd32(desc + DDSD_OFF_dwMipMapCount), 4u - i);
+        CHECK_EQ(rd32(desc + DDSD_OFF_ddsCaps + 4), i ? DDSCAPS2_MIPMAPSUBLEVEL : 0u);
+        CHECK_EQ(call_method(current, S_Lock, {0, desc, DDLOCK_WAIT, 0}), DD_OK);
+        uint32_t pixels = rd32(desc + DDSD_OFF_lpSurface);
+        CHECK(pixels != 0);
+        if (i == 0)
+            root_pixels = pixels;
+        else
+            CHECK(pixels != root_pixels);
+        wr16(pixels, (uint16_t)(0x1000 + i));
+        CHECK_EQ(call_method(current, S_Unlock, {0}), DD_OK);
+        uint32_t hr = call_method(current, S_GetAttachedSurface, {caps, out});
+        CHECK_EQ(hr, i == 3 ? DDERR_NOTFOUND : DD_OK);
+        if (i < 3) {
+            uint32_t next = rd32(out);
+            CHECK_EQ(call_method(current, S_DeleteAttachedSurface, {0, next}),
+                     DDERR_CANNOTDETACHSURFACE);
+            if (current != root)
+                call_method(current, S_Release, {});
+            current = next;
+        }
+    }
+    call_method(current, S_Release, {});
+    CHECK_EQ(rd16(root_pixels), 0x1000u);
+    CHECK_EQ(call_method(root, S_Release, {}), 0u);
+    for (uint32_t id : ids)
+        CHECK(com_get(id) == nullptr);
+    // An explicit one-level request stays one level, even with COMPLEX.
+    CHECK_EQ(make(1, true, DDSCAPS_COMPLEX | DDSCAPS_SYSTEMMEMORY), DD_OK);
+    root = rd32(out);
+    CHECK_EQ(call_method(root, S_GetAttachedSurface, {caps, out}), DDERR_NOTFOUND);
+    call_method(root, S_Release, {});
+    // A failed chain allocation refunds its partially allocated levels.
+    ddraw_set_vram_total(36); // base=32, first child=8: insufficient
+    CHECK_EQ(make(0, false, DDSCAPS_COMPLEX | DDSCAPS_VIDEOMEMORY), DDERR_OUTOFVIDEOMEMORY);
+    CHECK_EQ(rd32(out), 0u);
+    CHECK_EQ(call_method(dd, DD_GetAvailableVidMem, {0, sc(0xb00), sc(0xb04)}), DD_OK);
+    CHECK_EQ(rd32(sc(0xb04)), 36u);
+    ddraw_set_vram_total(DDRAW_VRAM_UNSET);
+    call_method(dd, DD_Release, {});
+}
+
 static void test_dxt_surface_and_blit() {
     cpu_reset();
     const uint8_t dd7[16] = {0xC0, 0x5E, 0xE6, 0x15, 0x9C, 0x3B, 0xD2, 0x11,
@@ -15474,6 +15555,7 @@ int main() {
         {"GetDeviceData stride", test_device_data_stride16},
         {"GetClipStatus canary", test_clipstatus_canary},
         {"overflow rejection", test_overflow_rejection},
+        {"mipmap chain", test_ddraw_mipmap_chain},
         {"VRAM budget", test_vram_budget},
         {"identity and parent", test_identity_and_parent},
         {"duplicate PCM lifetime", test_dsound_duplicate_lifetime},

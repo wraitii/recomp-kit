@@ -137,8 +137,7 @@ def decode_span(image, start, lengths):
         addr = start
         for digit in lengths:
             size = int(digit, 16)
-            if (not image.is_exec(addr) or not image.is_exec(addr + size - 1)
-                    or not image.base <= addr < addr + size <= image.end):
+            if not image.base <= addr < addr + size <= image.end:
                 raise ValueError('code-map instruction outside executable image: %08x' % addr)
             raw = image.data[addr - image.base:addr - image.base + size]
             decoded = list(image.md.disasm(raw, addr))
