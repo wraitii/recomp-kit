@@ -94,7 +94,7 @@ def expand(image, functions):
         filled = []
         for start, size, lengths in spans:
             if not lengths:
-                if not (image.base <= start < start + size <= image.end and image.is_exec(start)):
+                if not image.base <= start < start + size <= image.end:
                     raise ValueError('code-map span outside executable image: %08x' % start)
                 lengths = linear_lengths(image, start, size)
                 if lengths is None:
@@ -114,8 +114,7 @@ def decode_span(image, start, lengths):
         addr = start
         for digit in lengths:
             size = int(digit, 16)
-            if (not image.is_exec(addr) or not image.is_exec(addr + size - 1)
-                    or not image.base <= addr < addr + size <= image.end):
+            if not image.base <= addr < addr + size <= image.end:
                 raise ValueError('code-map instruction outside executable image: %08x' % addr)
             raw = image.data[addr - image.base:addr - image.base + size]
             decoded = list(image.md.disasm(raw, addr))

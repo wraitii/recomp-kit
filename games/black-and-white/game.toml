@@ -1,0 +1,95 @@
+[game]
+id = "black-and-white"
+name = "Black & White"
+app_name = "BlackWhiteRecomp"
+bundle_id = "dev.recompkit.blackandwhite"
+executable = "runblack.exe"
+sha256 = "3f58bc02a6c421b4e66ef08716646bf0e1fa55ab292786edb521d7596ed48aba"
+image_base = 0x00400000
+entry_point = 0x007ca49f
+guest_root = 'C:\Black & White'
+guest_size = 0x10800000
+strict_imports = true
+
+[translate]
+code_map = "metadata"
+entry_points = [
+    0x00545b42,
+    0x0057f810,
+    0x00580e73,
+    0x00587793,
+    0x005879c3,
+    0x00587bf3,
+    0x00587e29,
+    0x005880a2,
+    0x005882b5,
+    0x005884e2,
+    0x005886f2,
+    0x00588c02,
+    0x0058ca4d,
+    0x0058cda6,
+    0x0058d04e,
+    0x0058fe89,
+    0x005eb78e,
+    0x006c7102,
+    0x00778cce,
+]
+native = { header = "native/bw_native.h", sources = [
+    "native/terrain/terrain_cells.c",
+    "native/terrain/terrain_render_cell.c",
+    "native/lod/lod_override.c",
+] }
+
+[render]
+d3d8_wgpu = true
+
+[settings]
+rows = ["window", "performance_overlay", "controls"]
+
+[controls]
+default_layout = "hidden"
+pad = "off"
+
+[modules.aux.LHLogR]
+name = "LHLogR.dll"
+sha256 = "8cae8abc42b14732d00a979bd6cf3420b0fdc5b030ecfe40365ac5e6993a6afd"
+base = 0x10000000
+size = 0x0002f000
+
+[modules.aux.LHMultiplayerR]
+name = "LHMultiplayerR.dll"
+sha256 = "7b6e099afa2b9f29b4d2a93d2b5810e4b88397d1545783e7a98f43be409ea1d2"
+base = 0x10100000
+size = 0x00072000
+
+[modules.aux.LHaudiodllR]
+name = "LHaudiodllR.dll"
+sha256 = "67d5623969a72e9f4761f59859e089f2980121b863cdd7467066a4001f8c0f67"
+base = 0x10200000
+size = 0x0005c000
+
+[modules.aux.IFC22]
+name = "IFC22.dll"
+sha256 = "98ffafcd7f22e57e10bc28cfb5a70c1e2426cd9fa7f908c78ccf692d83a7f7d4"
+base = 0x10300000
+size = 0x00031000
+
+[modules.aux.wearasr]
+name = "wearasr.dll"
+sha256 = "21a58f920fb15797c32ff62274d7328203f47b87ee8dcbcbb87e56112e2737db"
+base = 0x10400000
+size = 0x00011000
+
+[modules.aux.ScriptLibraryR]
+name = "ScriptLibraryR.dll"
+original_path = "Plug Ins/ScriptLibraryR.dll"
+sha256 = "047b1d7cd967fb653f214a67a23a688e9f57558c102b80e5706d44e9221b79a1"
+base = 0x10600000
+size = 0x00042000
+
+[modules.aux.LanguageR]
+name = "LanguageR.dll"
+original_path = "Plug Ins/LanguageR.dll"
+sha256 = "72e5992d7453bc02c7a17d77e60f88cbc610874a2866bb3e644e4f83d45fffae"
+base = 0x10700000
+size = 0x00014000

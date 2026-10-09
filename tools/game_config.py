@@ -58,7 +58,7 @@ BUTTON_TARGET_RE = re.compile(
     r"action:(settings|system_keyboard|edit_layout)|none)$")
 HEAP_END = 0x0e000000        # default heap end; reserved low runtime regions start here
 GUEST_SIZE_DEFAULT = 0x10000000   # runtime/x86.h GUEST_SIZE: the arena, 256 MB unless a module needs more
-AUX_REQUIRED_KEYS = ("name", "path", "sha256", "base", "size")
+AUX_REQUIRED_KEYS = ("name", "sha256", "base", "size")
 
 # The production translation profile: every optimization the kit has. load()
 # fills these when a game omits them, and translate.py reads the same values as
@@ -402,6 +402,9 @@ def load_aux_modules(cfg, game_dir, source):
         missing = [k for k in AUX_REQUIRED_KEYS if k not in entry]
         if missing:
             raise ValueError("%s: [modules.aux.%s] missing keys: %s" % (source, key, ", ".join(missing)))
+        if "path" in entry and "original_path" in entry:
+            raise ValueError("%s: [modules.aux.%s] path and original_path are mutually exclusive"
+                             % (source, key))
         base, size = int(entry["base"]), int(entry["size"])
         if base % 0x1000 or size <= 0 or base + size > guest_size:
             raise ValueError("%s: [modules.aux.%s] base %#x size %#x must fit below guest_size %#x"
@@ -418,7 +421,8 @@ def load_aux_modules(cfg, game_dir, source):
                              % (source, key))
         modules.append({
             "key": key, "name": entry["name"], "sha256": entry["sha256"], "base": base, "size": size,
-            "path": (game_dir / entry["path"]).resolve(),
+            "path": ((game_dir / entry["path"]) if "path" in entry else
+                     cfg["build_root"] / "original" / entry.get("original_path", entry["name"])).resolve(),
             "listings_path": ((game_dir / entry["listings"]) if "listings" in entry else
                               cfg["build_root"] / "recomp/listings" / entry["name"]).resolve(),
             "function_alignment": alignment,

@@ -1750,7 +1750,7 @@ class Image(object):
     def _size_word(self, nbytes, mnem):
         if mnem.startswith("F") and mnem not in self.X87_INT:
             return {4: "float", 8: "double", 10: "extended double"}.get(nbytes)
-        return {1: "byte", 2: "word", 4: "dword", 8: "qword",
+        return {1: "byte", 2: "word", 4: "dword", 8: "qword", 16: "xmmword",
                 10: "extended double"}.get(nbytes)
 
     def _op_text(self, ci, op, mnem):
