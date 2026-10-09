@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run explicit contributor suites, with game-backed checks isolated from player saves.
 
-The game is a directory holding game.toml (--game-dir, default the kit's stub
-game); its outputs live under the build root tools/build.py chooses for it."""
+The game is --game <id> or --game-dir (default the kit's stub game); outputs live
+under the build root tools/build.py chooses for it."""
 
 import argparse
 import importlib.util
@@ -79,13 +79,12 @@ def main():
     group.add_argument("--compile-only", action="store_true", help="Build the native test binaries only")
     parser.add_argument("--preset", default=build_py.default_preset())
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 2, 8))
-    parser.add_argument("--game-dir", type=Path, default=ROOT / "games/stub",
-                        help="Absolute directory holding the game.toml (default: the kit's stub game)")
-    args = parser.parse_args()
-    if not args.game_dir.is_absolute() or not (args.game_dir / "game.toml").is_file():
-        parser.error("--game-dir must be an absolute directory holding game.toml: %s" % args.game_dir)
-    cfg = build_py.game_config.load(args.game_dir)
-    build_root = build_py.build_root_for(args.game_dir)
+    build_py.game_config.add_game_args(parser)
+    args = build_py.game_config.resolve_game_args(parser.parse_args())
+    if not (args.game_dir / "game.toml").is_file():
+        parser.error("No game config at %s/game.toml" % args.game_dir)
+    cfg = build_py.game_config.load(args.game_dir, args.build_root)
+    build_root = args.build_root
     game_backed = args.mods
     if game_backed and platform.system() != "Darwin":
         parser.error("Game-backed suites require macOS")

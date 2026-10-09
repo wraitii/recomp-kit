@@ -161,10 +161,11 @@ def write_if_changed(path, text):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--game-dir", type=Path, required=True)
+    parser.add_argument("--build-root", type=Path, default=None)
     parser.add_argument("--header", type=Path, required=True)
     parser.add_argument("--cmake", type=Path, required=True)
     args = parser.parse_args()
-    cfg = game_config.load(args.game_dir)
+    cfg = game_config.load(args.game_dir, args.build_root)
     write_if_changed(args.header, render_header(cfg))
     write_if_changed(args.cmake, render_cmake(cfg))
 

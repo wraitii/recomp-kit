@@ -84,11 +84,13 @@ if(NOT EXISTS ${RECOMP_GAME_DIR}/game.toml)
   message(FATAL_ERROR "No game config at ${RECOMP_GAME_DIR}/game.toml")
 endif()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-  ${RECOMP_GAME_DIR}/game.toml ${RECOMP_GAME_DIR}/globals.toml
-  ${POP_ROOT}/tools/gen_game_config.py ${POP_ROOT}/tools/game_config.py)
+  ${RECOMP_GAME_DIR}/game.toml ${POP_ROOT}/tools/gen_game_config.py ${POP_ROOT}/tools/game_config.py)
+if(EXISTS ${RECOMP_GAME_DIR}/globals.toml)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${RECOMP_GAME_DIR}/globals.toml)
+endif()
 execute_process(
   COMMAND ${Python3_EXECUTABLE} ${POP_ROOT}/tools/gen_game_config.py
-          --game-dir ${RECOMP_GAME_DIR}
+          --game-dir ${RECOMP_GAME_DIR} --build-root ${POP_BUILD_ROOT}
           --header ${CMAKE_BINARY_DIR}/generated/game_config.h
           --cmake ${CMAKE_BINARY_DIR}/generated/game_config.cmake
   RESULT_VARIABLE RECOMP_GAME_CONFIG_RESULT)

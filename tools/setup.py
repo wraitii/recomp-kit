@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """Prepare private translation inputs from a contributor's own game installation.
 
-    tools/setup.py --game-dir <game repository> --install /path/to/the/installed/game [--ghidra-home ...]
+    tools/setup.py --game <id> --install /path/to/the/installed/game [--ghidra-home ...]
 
-Only a symlink to the installation and ignored analysis outputs are created,
-both inside the game directory (<game-dir>/original, <game-dir>/analysis).
-The executable is hash checked against game.toml before importing the
-annotation metadata game.toml names. No game files are downloaded, changed,
-or included in any repository.
+Creates <build root>/original, a symlink to the installation, after checking the
+executable against game.toml. Games without a code map also get Ghidra listings
+under <build root>/recomp/listings. No game files are downloaded or changed.
 """
 
 import argparse
@@ -118,21 +116,23 @@ def export_listings(ghidra, java_home, annotations, cfg):
 def main():
     """Validate local prerequisites, preserve existing inputs, and prepare reproducible listings."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--game-dir", type=Path, required=True, help="The directory holding game.toml")
+    game_config.add_game_args(parser)
     parser.add_argument("--install", type=Path, required=True, help="Your installed game directory")
     parser.add_argument("--ghidra-home", type=Path, default=os.environ.get("GHIDRA_HOME"))
     parser.add_argument("--java-home", type=Path, default=os.environ.get("JAVA_HOME"))
     parser.add_argument("--link-only", action="store_true", help="Validate/link game data without exporting")
-    args = parser.parse_args()
+    args = game_config.resolve_game_args(parser.parse_args(), default=None)
     try:
-        cfg = game_config.load(args.game_dir.resolve())
+        cfg = game_config.load(args.game_dir, args.build_root)
+        link_only = args.link_only or cfg["code_map_path"] is not None
         setup = cfg.get("setup", {})
         directory = validate_game(args.install, cfg["game"]["executable"], cfg["game"]["sha256"],
                                   setup.get("required_dirs", ()))
-        if not args.link_only and not args.ghidra_home:
+        if not link_only and not args.ghidra_home:
             raise ValueError("Set --ghidra-home or GHIDRA_HOME; see the game's CONTRIBUTING.md")
+        cfg["developer_exe_path"].parent.parent.mkdir(parents=True, exist_ok=True)
         link_game(directory, cfg["developer_exe_path"].parent)
-        if not args.link_only:
+        if not link_only:
             annotations = None
             if setup.get("annotations_url"):
                 annotations = prepare_annotations(cfg["listings_path"].parent.parent, setup["annotations_url"],
@@ -140,7 +140,8 @@ def main():
             export_listings(args.ghidra_home, args.java_home, annotations, cfg)
     except (ValueError, OSError, subprocess.CalledProcessError, KeyError) as error:
         parser.exit(1, f"Setup failed: {error}\n")
-    print("Game inputs ready. Next: tools/build.py --game-dir %s --regenerate" % args.game_dir)
+    game = "--game %s" % args.game if args.game else "--game-dir %s" % args.game_dir
+    print("Game inputs ready. Next: tools/build.py %s --regenerate" % game)
 
 
 if __name__ == "__main__":

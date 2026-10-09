@@ -1,8 +1,9 @@
-"""Load a game directory: games/<id>/game.toml plus its curated globals file.
+"""Load a game directory: games/<id>/game.toml, with an optional curated globals file.
 
 This module is the only place that knows the schema. Python 3.9 has no
 tomllib, so the pinned tomli is the fallback."""
 
+import os
 from pathlib import Path
 import re
 
@@ -11,8 +12,9 @@ try:
 except ModuleNotFoundError:  # Python < 3.11
     import tomli as tomllib
 
+KIT = Path(__file__).resolve().parents[1]
 REQUIRED_GAME_KEYS = ("id", "name", "app_name", "bundle_id", "executable", "sha256",
-                      "image_base", "entry_point", "guest_root", "developer_exe")
+                      "image_base", "entry_point", "guest_root")
 
 HEAP_BASE_DEFAULT = 0x01000000
 
@@ -85,6 +87,40 @@ REMOVED_TRANSLATE_KEYS = {
     "x87_stack_forwarding": "removed experiment; production uses SSA or decoded C",
     "decoded_dataflow": "removed experiment; production uses SSA or decoded C",
 }
+
+
+def add_game_args(parser):
+    """--game <id> for a kit game under games/, or --game-dir for any directory holding game.toml."""
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--game", help="A game under the kit's games/ directory")
+    group.add_argument("--game-dir", type=Path, help="The directory holding game.toml")
+    parser.add_argument("--build-root", type=Path, default=None,
+                        help="Where outputs, the installation link and listings live")
+
+
+def resolve_game_args(args, default="stub"):
+    """Fill args.game_dir and args.build_root, exporting the build root to child tools."""
+    if args.game_dir is None:
+        if not (args.game or default):
+            raise SystemExit("Pass --game <id> or --game-dir <directory>")
+        args.game_dir = KIT / "games" / (args.game or default)
+    args.game_dir = args.game_dir.resolve()
+    if args.build_root is not None:
+        os.environ["RECOMP_BUILD_ROOT"] = str(args.build_root.resolve())
+    args.build_root = build_root_for(args.game_dir)
+    return args
+
+
+def build_root_for(game_dir):
+    """RECOMP_BUILD_ROOT when set; else beside a game outside the kit, or build/<id> for a kit game."""
+    if os.environ.get("RECOMP_BUILD_ROOT"):
+        return Path(os.environ["RECOMP_BUILD_ROOT"])
+    game_dir = Path(game_dir).resolve()
+    try:
+        game_dir.relative_to(KIT)
+    except ValueError:
+        return game_dir / "build"
+    return KIT / "build" if game_dir == KIT / "games/stub" else KIT / "build" / game_dir.name
 
 
 def windows_version(value):
@@ -189,9 +225,10 @@ def load_controls(controls, touch, source):
     return controls
 
 
-def load(game_dir):
+def load(game_dir, build_root=None):
     """Return the parsed config with `globals` merged in and `dir`/`source` recorded."""
     game_dir = Path(game_dir)
+    build_root = Path(build_root) if build_root is not None else build_root_for(game_dir)
     source = game_dir / "game.toml"
     with source.open("rb") as fh:
         cfg = tomllib.load(fh)
@@ -261,6 +298,11 @@ def load(game_dir):
     if not isinstance(tracks, list) or not all(isinstance(v, str) for v in tracks):
         raise ValueError("%s: [media] cd_tracks must be a list of strings" % source)
     cfg.setdefault("hooks", {})
+    translate.setdefault("animation_counter", 0)
+    translate.setdefault("volatile_reads", [])
+    render = cfg.setdefault("render", {})
+    if not isinstance(render.setdefault("d3d8_wgpu", False), bool):
+        raise ValueError("%s: [render] d3d8_wgpu must be a boolean" % source)
     input_config = cfg.setdefault("input", {})
     relative_capture = input_config.setdefault("relative_mouse_capture", True)
     if not isinstance(relative_capture, bool):
@@ -297,15 +339,21 @@ def load(game_dir):
     setup_dirs = cfg.setdefault("setup", {}).setdefault("required_dirs", [])
     if not isinstance(setup_dirs, list):
         raise ValueError("%s: [setup] required_dirs must be a list" % source)
+    curated = {}
     globals_path = game_dir / translate.get("globals", "globals.toml")
-    with globals_path.open("rb") as fh:
-        cfg["globals"] = tomllib.load(fh).get("globals", {})
+    if globals_path.is_file():
+        with globals_path.open("rb") as fh:
+            curated = tomllib.load(fh)
+    cfg["globals"] = {**curated.get("globals", {}), **cfg.get("globals", {})}
+    cfg["curated"] = {key: value for key, value in curated.items() if key != "globals"}
     cfg["dir"] = game_dir
     cfg["source"] = str(source)
-    # Developer inputs live beside game.toml: a game repository holds its own
-    # ignored original/ and analysis/ directories.
-    cfg["developer_exe_path"] = (game_dir / game["developer_exe"]).resolve()
-    cfg["listings_path"] = (game_dir / translate.get("listings", "analysis")).resolve()
+    cfg["build_root"] = build_root
+    exe = game.get("developer_exe")
+    cfg["developer_exe_path"] = ((game_dir / exe) if exe else build_root / "original" / game["executable"]).resolve()
+    listings = translate.get("listings")
+    cfg["listings_path"] = ((game_dir / listings) if listings else
+                            build_root / "recomp/listings" / game["executable"]).resolve()
     code_map = translate.get("code_map")
     if code_map is not None and (not isinstance(code_map, str) or not code_map):
         raise ValueError("%s: [translate] code_map must be a non-empty path" % source)
@@ -371,7 +419,8 @@ def load_aux_modules(cfg, game_dir, source):
         modules.append({
             "key": key, "name": entry["name"], "sha256": entry["sha256"], "base": base, "size": size,
             "path": (game_dir / entry["path"]).resolve(),
-            "listings_path": (game_dir / entry.get("listings", "analysis/" + entry["name"])).resolve(),
+            "listings_path": ((game_dir / entry["listings"]) if "listings" in entry else
+                              cfg["build_root"] / "recomp/listings" / entry["name"]).resolve(),
             "function_alignment": alignment,
             "entry_points": entries,
         })

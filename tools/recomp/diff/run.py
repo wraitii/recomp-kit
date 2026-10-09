@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Run translated game functions and the original bytes under Unicorn on the same random inputs.
 
-    run.py --game-dir /abs/game --func 0x401000 [--func ...]
-    run.py --game-dir /abs/game --changed      # functions whose generated C changed since the last run
-    run.py --game-dir /abs/game --sample 2000  # random functions
-    run.py --game-dir /abs/game --all
+    run.py --game <id> --func 0x401000 [--func ...]
+    run.py --game <id> --changed      # functions whose generated C changed since the last run
+    run.py --game <id> --sample 2000  # random functions
+    run.py --game <id> --all
 
 Uses the archive from the last `tools/build.py` build. Inputs whose original
 execution faults, calls an import or runs too long are discarded; a function is
@@ -75,7 +75,7 @@ class State(C.Structure):
                 ("fpu_top", C.c_uint32), ("st0", C.c_double), ("escape_addr", C.c_uint32)]
 
 
-def build_harness(cfg, build_root, out):
+def build_harness(build_root, out):
     archive = build_py.archive_path(build_root)
     gen = build_root / "recomp/gen"
     if not archive.exists():
@@ -440,7 +440,7 @@ def report(result, done, total):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--game-dir", type=Path, required=True)
+    game_config.add_game_args(parser)
     pick = parser.add_mutually_exclusive_group(required=True)
     pick.add_argument("--func", type=lambda v: int(v, 16), action="append")
     pick.add_argument("--changed", action="store_true")
@@ -453,16 +453,15 @@ def main():
     parser.add_argument("--fpu-cw", type=lambda v: int(v, 16), action="append",
                         help="initial x87 control words, default %s" % " ".join("%04x" % w for w in FPU_CWS))
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
-    args = parser.parse_args()
+    args = game_config.resolve_game_args(parser.parse_args(), default=None)
     args.fpu_cw = args.fpu_cw or list(FPU_CWS)
 
-    game_dir = args.game_dir.resolve()
-    cfg = game_config.load(game_dir)
-    build_root = build_py.build_root_for(game_dir)
+    cfg = game_config.load(args.game_dir, args.build_root)
+    build_root = args.build_root
     out = build_root / "recomp/diff"
     gen = build_root / "recomp/gen"
     dylib = out / ("harness.dylib" if platform.system() == "Darwin" else "harness.so")
-    build_harness(cfg, build_root, dylib)
+    build_harness(build_root, dylib)
 
     symbols = json.loads((gen / "symbols.json").read_text())
     entries = sorted(int(f["addr"], 16) for f in symbols["functions"] if f["kind"] == "entry")

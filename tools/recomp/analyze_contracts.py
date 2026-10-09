@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import translate as T  # also installs the kit tools path
 import game_config
-from code_map import decode_span, read_map
+from code_map import decode_span, expand, read_map
 from ir.cfg import function_ir
 from ir.contracts.report import analyze
 from ir.lift import Lifter
@@ -42,6 +42,7 @@ def load_inputs(game_dir, manifest):
     image = T.Image(T.BINARY)
     if image.base != cfg['game']['image_base']:
         raise ValueError('image base mismatch')
+    mapped = expand(image, mapped)
     tr = T.Translator(image, set(mapped), SimpleNamespace(eager_flags=True))
     lifter, functions, provenance = Lifter(), [], {}
     for row, address in zip(rows, addresses):

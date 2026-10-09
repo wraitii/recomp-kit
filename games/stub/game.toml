@@ -1,8 +1,7 @@
 # games/stub/game.toml - a game that does not exist. Every RECOMP_* macro the
 # kit compiles against gets a value from here, so the link-only *-stub presets,
 # the iOS stub compile and the game-free unit tests configure without a real
-# game. No test asserts anything about these numbers. Real games live in their
-# own repositories and are built with tools/build.py --game-dir.
+# game.
 
 [game]
 id = "stub"
@@ -14,14 +13,12 @@ sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 image_base = 0x00400000
 entry_point = 0x00401000
 guest_root = 'C:\Stub'
-developer_exe = "original/STUB.EXE"
 # Report major.minor[.build]; default 4.10 uses build 2222, 6.1 uses 7601 (SP1).
 windows_version = "4.10"
 
 [translate]
 # Function-start scan alignment; 16 is the default, compilers may use less.
 function_alignment = 16
-listings = "analysis/STUB.EXE"
 globals = "globals.toml"
 animation_counter = 0x00500000
 volatile_reads = []

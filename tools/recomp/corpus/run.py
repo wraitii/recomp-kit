@@ -27,7 +27,7 @@ import time
 
 import game_config
 import translate as T
-from code_map import read_map, decode_span
+from code_map import read_map, decode_span, expand
 
 HERE = Path(__file__).resolve().parent
 KIT = HERE.parents[2]
@@ -525,6 +525,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
     image = T.Image(T.BINARY)
     if image.base != cfg['game']['image_base']:
         raise ValueError('decoded executable image base mismatch')
+    functions = expand(image, functions)
     out.mkdir(parents=True, exist_ok=True)
     # Do not leave an earlier successful report looking current after a failure.
     for filename in ('report.json', 'report.md', 'report.csv'):

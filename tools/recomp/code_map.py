@@ -1,59 +1,111 @@
 """Decode public instruction-location metadata using the owner's private PE.
 
-Maps contain addresses, instruction lengths and analysis names only. The resulting
-assembly listings are local build inputs, never publication artifacts.
+A map holds function spans (start and byte count) and, only where a linear
+Capstone decode disagrees with the analysis boundaries, explicit instruction
+lengths. The resulting assembly listings are local build inputs, never
+publication artifacts.
+
+    code_map.py --pack V1_DIR --exe GAME.EXE --out MAP_DIR
 """
+import argparse
 from pathlib import Path
 import hashlib
 import json
 import shutil
+import sys
 import tempfile
 
-MAP_FILES = ('metadata.txt', 'functions.tsv', 'instruction_map.tsv')
-FORMAT = 'recomp-code-map-v1'
+MAP_FILES = ('metadata.txt', 'spans.tsv')
+FORMAT = 'recomp-code-map-v2'
+SPANS_HEADER = 'function\tstart\tbytes\tlengths'
 
 
 def read_map(root):
-    """Validate a map before touching its generated listing directory."""
+    """Validate a map before touching its generated listing directory.
+
+    Returns metadata and {function: [(start, bytes, lengths or '')]}."""
     root = Path(root)
     metadata = dict(line.split('=', 1) for line in (root / 'metadata.txt').read_text().splitlines())
     if metadata.get('format') != FORMAT or metadata.get('status') != 'complete':
         raise ValueError('unsupported or incomplete code map')
-    rows = (root / 'functions.tsv').read_text().splitlines()
-    if not rows or rows[0] != 'address\tname\tbytes':
-        raise ValueError('invalid code-map function header')
+    rows = (root / 'spans.tsv').read_text().splitlines()
+    if not rows or rows[0] != SPANS_HEADER:
+        raise ValueError('invalid code-map span header')
     functions = {}
-    for row in rows[1:]:
-        address, name, size = row.split('\t')
-        addr, size = int(address, 16), int(size)
-        if addr in functions or not 0 <= addr <= 0xffffffff or size < 0:
-            raise ValueError('invalid or duplicate code-map function')
-        functions[addr] = (name, size, [])
-    rows = (root / 'instruction_map.tsv').read_text().splitlines()
-    if not rows or rows[0] != 'function\tstart\tlengths':
-        raise ValueError('invalid code-map instruction header')
-    count = 0
     ends = {}
     for row in rows[1:]:
-        function, start, lengths = row.split('\t')
-        owner, addr = int(function, 16), int(start, 16)
-        if owner not in functions or not lengths or any(c not in '123456789abcdef' for c in lengths):
-            raise ValueError('invalid code-map instruction span')
-        if not 0 <= addr <= 0xffffffff or addr < ends.get(owner, 0):
+        function, start, size, lengths = row.split('\t')
+        addr, size = int(start, 16), int(size)
+        owner = int(function, 16) if function else addr
+        if size <= 0 or not 0 <= addr or addr + size > 0x100000000:
+            raise ValueError('invalid code-map span at %08x' % addr)
+        if any(c not in '123456789abcdef' for c in lengths) or (
+                lengths and sum(int(c, 16) for c in lengths) != size):
+            raise ValueError('invalid code-map lengths at %08x' % addr)
+        if addr < ends.get(owner, 0):
             raise ValueError('overlapping or unordered code-map spans')
-        end = addr + sum(int(c, 16) for c in lengths)
-        if end > 0x100000000:
-            raise ValueError('code-map span exceeds guest address space')
-        ends[owner] = end
-        functions[owner][2].append((addr, lengths))
-        count += len(lengths)
-    if int(metadata['functions']) != len(functions) or int(metadata['instructions']) != count:
+        ends[owner] = addr + size
+        functions.setdefault(owner, []).append((addr, size, lengths))
+    if int(metadata['functions']) != len(functions):
         raise ValueError('code-map census mismatch')
     return metadata, functions
 
 
+def linear_lengths(image, start, size):
+    """Capstone's instruction lengths across a span, or None where it cannot tile it exactly."""
+    raw = image.data[start - image.base:start - image.base + size]
+    lengths = [insn.size for insn in image.md.disasm(raw, start)]
+    if sum(lengths) != size or any(n > 15 for n in lengths):
+        return None
+    return ''.join('%x' % n for n in lengths)
+
+
+def pack(v1_root, executable, out):
+    """Convert a v1 export (names, sizes and every instruction length) into a v2 map."""
+    sys.path.insert(0, str(Path(__file__).parent))
+    from translate import Image
+    v1_root, out = Path(v1_root), Path(out)
+    metadata = dict(line.split('=', 1) for line in (v1_root / 'metadata.txt').read_text().splitlines())
+    if metadata.get('format') != 'recomp-code-map-v1' or metadata.get('status') != 'complete':
+        raise ValueError('expected a complete recomp-code-map-v1 export')
+    image = Image(Path(executable))
+    if hashlib.sha256(Path(executable).read_bytes()).hexdigest() != metadata['executable_sha256']:
+        raise ValueError('executable does not match the export')
+    rows = [SPANS_HEADER]
+    explicit = 0
+    for row in (v1_root / 'instruction_map.tsv').read_text().splitlines()[1:]:
+        function, start, lengths = row.split('\t')
+        addr = int(start, 16)
+        size = sum(int(c, 16) for c in lengths)
+        keep = '' if linear_lengths(image, addr, size) == lengths else lengths
+        explicit += bool(keep)
+        rows.append('%s\t%s\t%d\t%s' % ('' if function == start else function, start, size, keep))
+    out.mkdir(parents=True, exist_ok=True)
+    metadata['format'] = FORMAT
+    (out / 'metadata.txt').write_text(''.join('%s=%s\n' % item for item in metadata.items()))
+    (out / 'spans.tsv').write_text('\n'.join(rows) + '\n')
+    print('Packed %d spans (%d with explicit lengths) into %s' % (len(rows) - 1, explicit, out))
+
+
+def expand(image, functions):
+    """{function: (name, bytes, [(start, lengths)])} with every span's lengths filled in."""
+    expanded = {}
+    for owner, spans in functions.items():
+        filled = []
+        for start, size, lengths in spans:
+            if not lengths:
+                if not (image.base <= start < start + size <= image.end and image.is_exec(start)):
+                    raise ValueError('code-map span outside executable image: %08x' % start)
+                lengths = linear_lengths(image, start, size)
+                if lengths is None:
+                    raise ValueError('decoder cannot tile code-map span at %08x' % start)
+            filled.append((start, lengths))
+        expanded[owner] = ('FUN_%08x' % owner, sum(span[1] for span in spans), filled)
+    return expanded
+
+
 def decode_span(image, start, lengths):
-    """Decode exactly the exported boundaries, including Ghidra's folded WAIT."""
+    """Decode exactly the mapped boundaries, including Ghidra's folded WAIT."""
     if image.md is None:
         raise ValueError('code-map decoding requires capstone')
     detail = image.md.detail
@@ -153,20 +205,21 @@ def ensure_listings(cfg):
     stage = Path(tempfile.mkdtemp(prefix='.code-map-', dir=destination.parent))
     try:
         (stage / 'functions').mkdir()
-        header = 'address\tname\tbytes\n' if skip else None
-        rows = (''.join('%08x\t%s\t%d\n' % (addr, value[0], value[1])
-                        for addr, value in functions.items()) if skip else None)
-        if skip:
-            (stage / 'functions.tsv').write_text(header + rows)
-        else:
-            shutil.copyfile(root / 'functions.tsv', stage / 'functions.tsv')
+        functions = expand(image, functions)
+        (stage / 'functions.tsv').write_text('address\tname\tbytes\n' + ''.join(
+            '%08x\t%s\t%d\n' % (addr, name, size) for addr, (name, size, _) in sorted(functions.items())))
         hashes = {'functions.tsv': hashlib.sha256((stage / 'functions.tsv').read_bytes()).hexdigest()}
+        count = 0
         for addr, (_, _, spans) in functions.items():
             lines = [insn.raw for start, lengths in spans for insn in decode_span(image, start, lengths)]
+            count += len(lines)
             name = 'functions/%08x.asm' % addr
             data = ('\n'.join(lines) + ('\n' if lines else '')).encode()
             (stage / name).write_bytes(data)
             hashes[name] = hashlib.sha256(data).hexdigest()
+        if not skip and count != int(metadata['instructions']):
+            raise ValueError('code-map census mismatch: decoded %d instructions, map says %s'
+                             % (count, metadata['instructions']))
         (stage / stamp.name).write_text(json.dumps({'key': key, 'files': hashes}) + '\n')
         # Complete staging first. Rename the previous cache aside so interrupted
         # publication cannot mix old and new per-function listings.
@@ -187,3 +240,16 @@ def ensure_listings(cfg):
     finally:
         if stage.exists():
             shutil.rmtree(stage)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--pack', type=Path, required=True, metavar='V1_DIR')
+    parser.add_argument('--exe', type=Path, required=True)
+    parser.add_argument('--out', type=Path, required=True)
+    args = parser.parse_args()
+    pack(args.pack, args.exe, args.out)
+
+
+if __name__ == '__main__':
+    main()

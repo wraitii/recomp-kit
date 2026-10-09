@@ -176,7 +176,8 @@ void %(p)senter(X86 *c, uint32_t i)
 # reads that only select a visual phase or blink, never interpolation,
 # simulation stamps, FPS measurement or input timing). Nothing is configured
 # until configure() runs: main() does it from --game, tests do it themselves.
-LISTINGS = FUNCS_TSV = BINARY = CURATED = None
+LISTINGS = FUNCS_TSV = BINARY = None
+CURATED = {}
 ANIMATION_COUNTER = 0
 VISUAL_ANIMATION_READS = frozenset()
 EXTRA_ENTRY_POINTS = frozenset()
@@ -245,7 +246,7 @@ def configure_module(cfg, key):
     LISTINGS = os.path.join(listings, "functions")
     FUNCS_TSV = os.path.join(listings, "functions.tsv")
     BINARY = str(mod["path"])
-    CURATED = None
+    CURATED = {}
     ANIMATION_COUNTER = 0
     VISUAL_ANIMATION_READS = frozenset()
     EXTRA_ENTRY_POINTS = frozenset(mod.get("entry_points", ()))
@@ -280,7 +281,7 @@ def configure(cfg):
     LISTINGS = os.path.join(listings, "functions")
     FUNCS_TSV = os.path.join(listings, "functions.tsv")
     BINARY = str(cfg["developer_exe_path"])
-    CURATED = os.path.join(str(cfg["dir"]), translate.get("globals", "globals.toml"))
+    CURATED = {**{"globals." + name: entry for name, entry in cfg["globals"].items()}, **cfg["curated"]}
     ANIMATION_COUNTER = translate["animation_counter"]
     VISUAL_ANIMATION_READS = frozenset(translate.get("volatile_reads", ()))
     global EXTRA_ENTRY_POINTS, FUNCTION_ALIGNMENT
@@ -386,28 +387,6 @@ def note_structural(provenance, owner, t, why):
 # the thousand and a coincidence is indistinguishable from a pointer, so the
 # scan feeds dispatch recovery only.
 HOOK_EVIDENCE = ("initterm", "reloc", "immediate", "curated")
-
-
-def read_curated(path):
-    """The curated globals file. Line-oriented on purpose: Python 3.9 has
-    no tomllib, and this file is written to be read by twenty lines."""
-    out, section = {}, None
-    if path is None:
-        return out
-    with open(path) as fh:
-        for raw in fh:
-            line = raw.split("#", 1)[0].strip()
-            if not line:
-                continue
-            if line.startswith("[") and line.endswith("]"):
-                section = line[1:-1]
-                out.setdefault(section, {})
-                continue
-            if "=" not in line or section is None:
-                raise TranslateError("globals.toml: cannot parse %r" % raw)
-            k, v = (t.strip() for t in line.split("=", 1))
-            out[section][k] = v[1:-1] if v.startswith('"') else int(v, 0)
-    return out
 
 
 def hook_kind(addr, listed, alt_owner, provenance, evidence, intrinsics):
@@ -4816,7 +4795,7 @@ def main():
         # image's table is consulted first, so this one answers only for what
         # it carries.
         AUX_MODULE["size"] = image.size
-    curated = read_curated(CURATED)
+    curated = CURATED
     # Addresses named by a dword the loader relocates: a vtable slot, a
     # function-pointer table, a stored callback.  Read once, before discovery,
     # so the evidence does not depend on which pass reaches an address first.

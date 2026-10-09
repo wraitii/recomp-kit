@@ -60,14 +60,7 @@ def preset_name(preset, config, stub=False, target=None):
     return preset if config == "Release" else preset + "-debug"
 
 
-def build_root_for(game_dir, root=ROOT):
-    """Outputs live beside the game when it is outside the kit, else in the kit's build/."""
-    game_dir = Path(game_dir)
-    try:
-        game_dir.relative_to(root)
-        return Path(root) / "build"
-    except ValueError:
-        return game_dir / "build"
+build_root_for = game_config.build_root_for
 
 
 def build_dir_for(build_root, preset):
@@ -90,12 +83,8 @@ def cmake_tool(name):
 
 
 def game_defines(game_dir, build_root):
-    """The cache paths and renderer switch every configure needs.
-
-    RECOMP_D3D8_WGPU=1 in the environment builds the kit's Rust D3D8/wgpu
-    renderer (native macOS only); it is passed explicitly each time so a stale
-    cache cannot keep it on."""
-    wgpu = "ON" if os.environ.get("RECOMP_D3D8_WGPU") == "1" else "OFF"
+    """The cache paths and the game's [render] d3d8_wgpu switch, passed on every configure."""
+    wgpu = "ON" if game_config.load(game_dir, build_root)["render"]["d3d8_wgpu"] else "OFF"
     return ["-DRECOMP_GAME_DIR=%s" % Path(game_dir).as_posix(), "-DPOP_BUILD_ROOT=%s" % Path(build_root).as_posix(),
             "-DRECOMP_D3D8_WGPU=" + wgpu]
 
@@ -491,8 +480,7 @@ def parse_args(argv, system=None):
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 2, 8))
     parser.add_argument("--preset", default=default_preset(system), help="CMake configure preset")
     parser.add_argument("--config", choices=("Release", "Debug"), default="Release")
-    parser.add_argument("--game-dir", type=Path, default=ROOT / "games/stub",
-                        help="Absolute directory holding the game.toml this build is for (default: the kit's stub game)")
+    game_config.add_game_args(parser)
     parser.add_argument("--stub", action="store_true",
                         help="Link the hosts against a stub translation (no game code; CI's build)")
     parser.add_argument("--device", default=None, help="devicectl identifier (iOS) or adb serial (Android)")
@@ -509,8 +497,7 @@ def parse_args(argv, system=None):
         parser.error("--target ios needs --team or RECOMP_IOS_TEAM")
     if args.stub and (args.config == "Debug" or args.regenerate):
         parser.error("--stub cannot be combined with --config Debug or --regenerate")
-    if not args.game_dir.is_absolute():
-        parser.error("--game-dir must be absolute: %s" % args.game_dir)
+    game_config.resolve_game_args(args)
     if not (args.game_dir / "game.toml").is_file():
         parser.error("No game config at %s/game.toml" % args.game_dir)
     if args.target == "plugins" and not (args.game_dir / "mods/CMakeLists.txt").is_file():
@@ -538,7 +525,6 @@ def parse_args(argv, system=None):
         parser.error("--corpus-msvc-x87-convention requires --corpus-ir-ssa")
     if args.corpus_msvc_x87_convention is not None:
         args.corpus_msvc_x87_convention = args.corpus_msvc_x87_convention == "on"
-    args.build_root = build_root_for(args.game_dir)
     return args, parser
 
 
@@ -558,7 +544,7 @@ def main():
         from corpus.fragments.run import run_experiment
         run_experiment(args.build_root / "function-corpus-fragments", cmake_tool("cmake"), args.jobs)
         return
-    cfg = game_config.load(args.game_dir)
+    cfg = game_config.load(args.game_dir, args.build_root)
     # Regenerating needs the game and its listings.
     if args.regenerate and not cfg["developer_exe_path"].is_file():
         parser.error("Prepare your own game installation with tools/setup.py first")

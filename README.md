@@ -2,10 +2,8 @@
 
 A static recompilation kit: 32-bit x86 Windows games become native
 applications for macOS, iOS, Android, Linux and Windows, with no JIT and no
-emulator at run time. The design is in
-`docs/superpowers/specs/2026-09-13-recomp-kit-design.md`. Game configurations,
-assets and game-backed evidence live in their own repositories, which pull this
-kit in as a submodule.
+emulator at run time. Supported games live in `games/<id>/`; you supply your own
+copy of each game.
 
 ## Layout
 
@@ -16,33 +14,27 @@ kit in as a submodule.
 | `host/` | SDL3 host, Metal/Vulkan/fake GPU backends, audio mixer, presentation |
 | `platform/` | `os.h`, the only place that talks to the operating system |
 | `mods/` | the mod foundation (Lua 5.4), loader and lifecycle services |
+| `games/<id>/` | one game's `game.toml`, code map and native replacements |
 | `games/stub/` | a game that does not exist: the values game-free builds and CI configure with |
 | `tools/` | translator, build and test scripts |
 | `third_party/` | vendored Lua, TinySoundFont, minimp3, stb_truetype, volk, Vulkan headers |
 
-## Games live in their own repositories
+## Games
 
-A game repository holds what is the game's and nothing of the kit's:
+A game directory holds only what is the game's:
 
 ```
-<game>/
-  kit/            this repository, as a git submodule
-  game.toml       identity, addresses, translator inputs (see games/stub/game.toml)
-  globals.toml    curated symbols
-  core/ tests/    game-specific headers the mods and tests use
-  mods/           the game's plugins, examples and smoke probe (optional)
-  assets/         artwork the texture pack is compiled from (optional)
-  smoke/          the game's smoke scripts (optional)
-  original/       ignored: your own installation, linked by tools/setup.py
-  analysis/       ignored: Ghidra listings, exported by tools/setup.py
-  build/          ignored: the translation, the texture pack, the apps, the logs
+games/<id>/
+  game.toml       identity, translator inputs, hooks and host settings (see games/stub/game.toml)
+  metadata/       the code map: function spans, no instruction bytes
+  native/         optional native replacements for translated functions
 ```
 
-Every kit tool takes `--game-dir <absolute path>`; the game repository's own
-`tools/build.py` is a four-line wrapper that passes it. Paths in `game.toml`
-(`developer_exe`, `translate.listings`) are relative to `game.toml`'s
-directory. Outputs go under `<game>/build` when the game lives outside the
-kit, else under the kit's `build/`.
+Every kit tool takes `--game <id>`, or `--game-dir <path>` for a game kept
+elsewhere. Outputs go to `build/<id>/` for a kit game and `<game-dir>/build`
+otherwise; `--build-root` or `RECOMP_BUILD_ROOT` overrides both. The build root
+also holds `original/`, the link to your installation that `tools/setup.py`
+creates, and the listings decoded from the code map.
 
 Translator runtime substitutions are opt-in per image. If a game's CRT
 `setjmp` or `longjmp` entry points are verified to match the runtime ABI, list
@@ -67,23 +59,16 @@ translator on all three platforms. The iOS packager runs on macOS,
 including `--target ios --stub` builds. Prerequisites are in
 [Contributing](CONTRIBUTING.md).
 
-From the game repository, with Python 3.9 or later and your own copy of the
-game. Ghidra is needed for listing-based games; games shipping an address/length
-code map can build without it. Follow the game repository's installation steps:
-
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install -r kit/requirements-dev.txt
-.venv/bin/python tools/setup.py --install /path/to/the/installed/game --ghidra-home /path/to/ghidra
-.venv/bin/python tools/build.py --regenerate
-open build/<AppName>.app
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python tools/setup.py --game <id> --install /path/to/the/installed/game
+.venv/bin/python tools/build.py --game <id> --regenerate
+open build/<id>/<AppName>.app
 ```
 
-From the kit itself the same commands take `--game-dir /abs/path/to/<game>`.
-Generated code is never tracked. A build without game files links the hosts
-against a stub translation of the stub game: `.venv/bin/python tools/build.py
---stub`; its outputs live under `build/stub/` so they never replace a real
-build.
+Games without a code map also need `--ghidra-home` for setup. `tools/build.py
+--stub` links the hosts against a stub translation without game files.
 
 ## Dependencies
 
