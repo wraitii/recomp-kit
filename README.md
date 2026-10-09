@@ -64,8 +64,8 @@ explicitly. Addresses must be distinct 32-bit guest addresses.
 `tools/build.py --target app` selects the `macos`, `linux` or `windows`
 CMake preset and builds `recomp_app`. `--regenerate` runs the Python
 translator on all three platforms. The iOS packager runs on macOS,
-including `--target ios --stub` builds. See [Contributing](CONTRIBUTING.md)
-for platform prerequisites; the commands below use a macOS shell.
+including `--target ios --stub` builds. Prerequisites are in
+[Contributing](CONTRIBUTING.md).
 
 From the game repository, with Python 3.9 or later and your own copy of the
 game. Ghidra is needed for listing-based games; games shipping an address/length
@@ -88,54 +88,11 @@ build.
 ## Dependencies
 
 SDL3 is fetched at its pinned release and linked statically; Lua,
-TinySoundFont, minimp3, stb_truetype, volk and Vulkan headers are vendored with their
-upstream notices. See [NOTICE](NOTICE) for licenses.
-
-On macOS, iOS, Android and Linux, `RECOMP_VIDEO` defaults to `ON`: the first build fetches the
-SHA-256-pinned FFmpeg 7.1.1 release and builds shared `avformat`, `avcodec`
-and `avutil` libraries with a limited decoder/demuxer set, including Bink,
-WMV, Indeo 5 AVI and Ogg/Vorbis. The exact enabled components are recorded in
-the FFmpeg notice. The macOS app carries the three dylibs in
-`Contents/Frameworks`, using `@rpath` install names and an executable rpath
-of `@executable_path/../Frameworks`; each dylib is signed ad hoc before the
-app. Apple system libraries/frameworks are allowed; no Homebrew libraries
-are required. Bink cinematics decode through these libraries; Smacker
-still refuses to open a video.
-
-iOS cross-builds for arm64 and iOS 17.0 with the iPhoneOS SDK. Xcode embeds
-the three dylibs in `Frameworks/` and signs them on copy with the app's
-development identity/team; the executable uses `@executable_path/Frameworks`.
-Android cross-builds with the selected NDK's arm64 API-29 compiler and
-packages unversioned `libavformat.so`, `libavcodec.so` and `libavutil.so`
-beside `libmain.so` under `lib/arm64-v8a/`. No Gradle packaging override is
-needed. The mobile cross builds and Android APK contents are verified;
-iOS embedded signatures and mobile device playback remain unverified.
-
-Linux uses CMake's native C compiler and `--enable-pic`. The desktop packager
-copies `libavformat.so.61`, `libavcodec.so.61` and `libavutil.so.59` beside
-the executable, whose rpath includes `$ORIGIN`. The package also carries
-`resources/ffmpeg-NOTICE.md`. FFmpeg builds from source using the existing
-compiler and make; no distribution FFmpeg package is needed.
-
-On a native Windows host, CMake looks for MSYS2's `make` on `PATH` (or takes
-`-DRECOMP_FFMPEG_MAKE=C:/msys64/usr/bin/make.exe`) and the `bash` beside it;
-video defaults to ON when both are there. With the presets' clang, which
-targets the MSVC ABI, FFmpeg is built by its own MSVC toolchain
-(`--toolchain=msvc`), so run CMake from a Visual Studio developer shell where
-`cl` and `link` are on `PATH`; a MinGW compiler gets a MinGW FFmpeg. The
-three versioned DLLs are copied beside the built executables and packaged
-beside the app with the notice under `resources/`. Windows CI builds FFmpeg
-this way and runs the video tests.
-
-FFmpeg is LGPL-2.1-or-later and dynamically linked. Its full license,
-source URL, checksum, configure command and library replacement instructions
-are in [the FFmpeg notice](third_party/ffmpeg/NOTICE.md), also shipped as
-`Contents/Resources/ffmpeg-NOTICE.md` on macOS, at the iOS bundle root,
-and as `assets/ffmpeg-NOTICE.md` in Android APKs. CMake `-DRECOMP_VIDEO=OFF`
-disables the dependency. Existing mobile or Linux CMake caches that
-explicitly have video OFF need `-DRECOMP_VIDEO=ON` once when configuring.
-See [Contributing](CONTRIBUTING.md) for the CMake cache workflow and the
-[notice](third_party/ffmpeg/NOTICE.md) for each platform's configure flags.
+TinySoundFont, minimp3, stb_truetype, volk and Vulkan headers are vendored with
+their upstream notices (see [NOTICE](NOTICE)). Video uses a pinned FFmpeg 7.1.1
+built from source with a limited decoder set and linked dynamically; its
+license and configure flags are in [the FFmpeg notice](third_party/ffmpeg/NOTICE.md).
+`-DRECOMP_VIDEO=OFF` disables it.
 
 For Android, set `ANDROID_NDK_HOME`, `ANDROID_HOME` and `JAVA_HOME` for
 your NDK, SDK and Android Studio JBR, then run `tools/build.py --target android`

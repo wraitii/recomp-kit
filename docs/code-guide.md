@@ -44,10 +44,6 @@ services, and return through `com_ret`. Win32 imports use their declared calling
 convention in `imports_dispatch`. New callbacks should use `guest_call` and the
 existing hook APIs instead of manufacturing host calls to guest addresses.
 
-Named symbols are useful navigation hints, but some are incomplete. Keep address
-provenance for a reviewed hook. Do not rename an unknown function to a guessed
-gameplay meaning or replace a routine without a behavior comparison.
-
 ## Respect ownership boundaries
 
 - Guest memory changes happen on the scheduler baton holder. The window host queues requests.
@@ -59,14 +55,3 @@ gameplay meaning or replace a routine without a behavior comparison.
   completion callbacks and playback clock have different timing guarantees.
 - Mod teardown revokes entry before unloading code. A callback still on a worker's
   stack must finish or unwind before that module's resources are reclaimed.
-
-Major function comments describe these contracts where they are implemented.
-Keep them synchronized when changing behavior. Prefer a focused regression in
-that module's tests over copying a large gameplay scenario for a small helper.
-See [Testing](testing.md) for the available suites and their limits.
-
-Absolute host positions use the same compositor mapping as ordinary Win32 mouse
-input. A game's integrated DirectInput cursor moves when the guest consumes those
-messages or counts; the host does not inspect or mutate private cursor objects.
-Relative capture is selected with `[input] relative_mouse_capture` (default `true`
-to preserve existing no-hook capture behavior; set `false` for absolute mode).

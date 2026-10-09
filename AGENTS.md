@@ -1,24 +1,34 @@
 # Working on recomp-kit
 
-Read README.md, CONTRIBUTING.md and docs/code-guide.md before a broad change.
-This repository contains the native runtime and translator. Game files and
-translations are private local inputs under ignored original/, analysis/ and build/.
+The kit is the translator, guest runtime, DirectX/Win32 shims and native hosts.
+Games live in their own repositories and pull the kit in as a submodule; their
+installations, analysis and builds stay in ignored `original/`, `analysis/` and
+`build/`. `docs/code-guide.md` maps behavior to source; `docs/architecture.md`
+explains guest memory, threads and frames.
 
-- Keep changes focused; preserve unrelated local work and player profiles.
-- Comment major functions and unusual guest layout, timing or ownership rules.
-- Never replace 32-bit guest addresses with host pointers. Respect the cooperative
-  scheduler baton and the immutable frame boundary described in docs/architecture.md.
-- Edit translation rules, not build/recomp/gen/. Regenerate after changing the translator.
-- Format first-party native source with `.venv/bin/python tools/format.py --write`.
-  Preserve vendored code and its notices.
-- Run relevant suites from docs/testing.md; native code builds only through
-  tools/build.py and tools/test.py, never by invoking compilers directly.
-  Platform calls go through platform/os.h; no `#ifdef` on the platform
-  outside os_posix.cpp and os_win32.cpp. Report exactly which checks ran;
-  compilation and offscreen counters do not establish playable performance.
-- Every game-specific literal belongs in `games/<id>/`; run `tools/check_game_literals.py`
-  before committing native code.
-- Do not commit game assets, generated code, binaries, credentials, personal saves
-  or run logs. Run `.venv/bin/python tools/check_repo.py` on staged source changes.
-- Keep setup/build instructions reproducible from a clean checkout. Update the
-  changelog for user-visible behavior and preserve the single Graphics resolution control.
+## Ground rules
+
+- Do not write tests unless asked.
+- Avoid comments; code should read clearly without them.
+- Before adding code or documentation, check whether it can be shorter or folded
+  into an existing section.
+- The repository has legacy; existing patterns are not authoritative.
+
+## Invariants
+
+- Guest addresses are 32-bit values accessed through the memory helpers, never
+  host pointers. Guest memory changes only on the scheduler baton holder; the
+  presenter only sees sealed frames.
+- Nothing in `runtime/`, `dx/`, `host/`, `platform/` or `mods/` names a game.
+  Game addresses go in `game.toml` (`[hooks]`, `[translate]`) and code reaches
+  them through generated `RECOMP_HOOK_*` macros.
+- Operating-system calls go through `platform/os.h`; platform `#ifdef`s live only
+  in `os_posix.cpp` and `os_win32.cpp`.
+- Never edit generated code under `build/recomp/gen/`. Fix the translator and
+  rebuild with `--regenerate`.
+- Unknown imports, COM methods and unsupported state fail with a named
+  diagnostic rather than a silent stub.
+- Build only through `tools/build.py`. Format native code with
+  `tools/format.py --write`; leave `third_party/` as vendored.
+- Never commit game files, generated code, binaries or logs.
+
