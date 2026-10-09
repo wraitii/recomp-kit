@@ -14,8 +14,9 @@ CTest labels: `nogame`, `game`, `gpu`, `device`, `mods`. Run a subset with
 
 ## Translator checks
 
-`tools/recomp/tests/test_translate_insns.py` runs synthetic instruction forms
-through the translator and compares the result with Unicorn.
+`tools/recomp/diff/run.py` compares translated game functions with Unicorn; see
+`AGENTS.md`. `tools/recomp/tests/test_translate_insns.py` does the same for
+synthetic instruction forms the game rarely reaches.
 
 ## Media probes
 

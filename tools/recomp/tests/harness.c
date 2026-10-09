@@ -31,20 +31,28 @@ static unsigned harness_checks_run;
 static int last_div_error_count;
 static uint64_t fake_tsc;
 
+__attribute__((weak)) void harness_escape(const char *reason, uint32_t addr) {
+    (void)reason;
+    (void)addr;
+}
+
 /* An instruction case runs with no guest handlers, so a dereference through
  * the never-mapped first 64 KB has nowhere to raise to. Say which access it
  * was and stop, rather than reading the arena as if the page were real. */
 void recomp_null_access(uint32_t addr, int write) {
+    harness_escape(write ? "null-write" : "null-read", addr);
     fprintf(stderr, "null %s of %08x\n", write ? "write" : "read", addr);
     abort();
 }
 
 void recomp_shim_call(X86 *c, uint32_t target) {
     (void)c;
+    harness_escape("import", target);
     last_shim = target;
 }
 void recomp_unknown_call(X86 *c, uint32_t target) {
     (void)c;
+    harness_escape("unknown-call", target);
     last_unknown = target;
 }
 /* No auxiliary modules in the synthetic image. */
@@ -67,6 +75,7 @@ void recomp_callback_return(X86 *c) {
 }
 void recomp_div_error(X86 *c, uint32_t addr) {
     (void)c;
+    harness_escape("divide", addr);
     last_div_error = addr;
     last_div_error_count++;
 }
@@ -114,6 +123,7 @@ void recomp_setjmp(X86 *c) {
 }
 void recomp_longjmp(X86 *c) {
     (void)c;
+    harness_escape("longjmp", 0);
     fprintf(stderr, "harness: guest longjmp\n");
     abort();
 }
@@ -140,6 +150,7 @@ void recomp_hlt(X86 *c) {
 }
 void recomp_int(X86 *c, uint32_t v) {
     (void)c;
+    harness_escape("int", v);
     (void)v;
 }
 /* Reaching one in a fixture is a test bug, so it aborts exactly as the
@@ -147,10 +158,12 @@ void recomp_int(X86 *c, uint32_t v) {
 uint32_t last_breakpoint = 0;
 void recomp_breakpoint(X86 *c, uint32_t addr) {
     (void)c;
+    harness_escape("breakpoint", addr);
     last_breakpoint = addr;
 }
 void recomp_unmodelled(X86 *c, uint32_t a) {
     (void)c;
+    harness_escape("unmodelled", a);
     fprintf(stderr, "unmodelled %08x\n", a);
     abort();
 }
