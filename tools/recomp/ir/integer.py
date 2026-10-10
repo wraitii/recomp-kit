@@ -78,6 +78,7 @@ def arithmetic(ins, lifter, result_node=None):
         a, b = [lifter.fresh_unique(result[2]) for _ in range(2)]
         at = ops.index(first_cf)
         ops[at:at] = [Op("COPY", a, [operands[0]]), Op("COPY", b, [operands[1]])]
+        results[0].data = {"cc_operands": (a, b, results[0].ins[1])}
         insert = len(ops)
     else:
         opcode = "INT_ADD" if mnem in ("ADD", "INC") else "INT_SUB"

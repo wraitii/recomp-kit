@@ -355,7 +355,7 @@ enum { R_EAX = 0, R_ECX, R_EDX, R_EBX, R_ESP, R_EBP, R_ESI, R_EDI };
 /* Lazy arithmetic flags: the operands of the last flag-producing integer
  * instruction, kept in X86 instead of materialising all six flag fields at a
  * seam.  x86_cc_settle writes the fields and clears the descriptor.  NONE
- * means the fields are current.  Only ADD/SUB/CMP/LOGIC/INC/DEC are encoded;
+ * means the fields are current. ADD/ADC/SUB/SBB/CMP/LOGIC/INC/DEC are encoded;
  * everything else writes the fields eagerly and stores NONE. */
 enum X86CcOp {
     X86_CC_NONE = 0,
@@ -364,6 +364,8 @@ enum X86CcOp {
     X86_CC_LOGIC,
     X86_CC_INC,
     X86_CC_DEC,
+    X86_CC_ADC,
+    X86_CC_SBB,
 };
 
 /* Which flag fields a pending descriptor defines and must write.  Flags not in
@@ -386,8 +388,8 @@ struct X86 {
     uint32_t eflags_misc;
     /* Pending arithmetic flags (see enum X86CcOp).  cc_size is 1/2/4 bytes;
      * cc_mask names the fields to write; cc_a/cc_b are the operands and
-     * cc_res the wrapped result. */
-    uint8_t cc_op, cc_size, cc_mask, cc_pad0;
+     * cc_res the wrapped result; cc_carry is the incoming ADC/SBB carry. */
+    uint8_t cc_op, cc_size, cc_mask, cc_carry;
     uint32_t cc_a, cc_b, cc_res;
     double st[8]; /* x87 stack, physical slots */
     /* FILD integers retain all 64 mantissa bits until arithmetic replaces
@@ -693,14 +695,17 @@ RECOMP_COLD void x86_cc_materialize(X86 *c) {
     const uint32_t mask = bits == 32u ? 0xffffffffu : ((1u << bits) - 1u);
     const uint32_t fields = c->cc_mask;
     const uint32_t a = c->cc_a & mask, b = c->cc_b & mask, r = c->cc_res & mask;
+    const uint32_t carry = c->cc_carry & 1u;
     c->cc_op = X86_CC_NONE;
     c->cc_mask = 0;
     c->cc_size = 0;
+    c->cc_carry = 0;
     c->cc_a = c->cc_b = c->cc_res = 0;
     switch (op) {
     case X86_CC_ADD:
+    case X86_CC_ADC:
         if (fields & X86_CCF_CF)
-            c->eflags_cf = (r < a);
+            c->eflags_cf = (r < a) || (op == X86_CC_ADC && carry && r == a);
         if (fields & X86_CCF_OF)
             c->eflags_of = (((a ^ r) & (b ^ r)) >> shift) & 1u;
         if (fields & X86_CCF_AF)
@@ -713,8 +718,9 @@ RECOMP_COLD void x86_cc_materialize(X86 *c) {
             c->eflags_pf = parity8(r);
         break;
     case X86_CC_SUB:
+    case X86_CC_SBB:
         if (fields & X86_CCF_CF)
-            c->eflags_cf = (a < b);
+            c->eflags_cf = (a < b) || (op == X86_CC_SBB && carry && a == b);
         if (fields & X86_CCF_OF)
             c->eflags_of = (((a ^ b) & (a ^ r)) >> shift) & 1u;
         if (fields & X86_CCF_AF)
@@ -809,6 +815,7 @@ RECOMP_HOT_INLINE void x86_cc_settle_or_drop(X86 *c, uint32_t need) {
 static inline void x86_cc_canonicalize(X86 *c) {
     if (c->cc_op == X86_CC_NONE) {
         c->cc_size = c->cc_mask = 0;
+        c->cc_carry = 0;
         c->cc_a = c->cc_b = c->cc_res = 0;
     }
 }

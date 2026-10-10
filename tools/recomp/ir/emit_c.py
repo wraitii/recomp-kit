@@ -69,10 +69,12 @@ CONTRACT_NEVER_SKIP = frozenset(("ESP", "EBP"))
 
 #: Lazy-flag producers recognised at a seam: (kind, primary p-code opcode).
 #: The primary op must write a non-flag destination.  SUB/CMP, ADD, logic/TEST
-#: and INC/DEC are the initial set; everything else stays eager.
+#: INC/DEC and carry-aware ADC/SBB are recognised; everything else stays eager.
 CC_PRIMARY = {
     "ADD": ("add", "INT_ADD"),
     "SUB": ("sub", "INT_SUB"),
+    "ADC": ("adc", "INT_ADD"),
+    "SBB": ("sbb", "INT_SUB"),
     "CMP": ("cmp", "INT_SUB"),
     "INC": ("inc", "INT_ADD"),
     "DEC": ("dec", "INT_SUB"),
@@ -102,7 +104,14 @@ def _flag_producer(mnem, ops, flag_offsets):
                 break
             continue
         if op.opc == opc and space in ("register", "unique"):
+            if kind in ("adc", "sbb"):
+                if not isinstance(op.data, dict) or "cc_operands" not in op.data:
+                    continue
             found = {"kind": kind, "opc": opc, "size": size, "result": op.out}
+            if kind in ("adc", "sbb"):
+                found["operands"] = op.data["cc_operands"]
+            if kind in ("adc", "sbb"):
+                break
     return found
 
 
@@ -111,13 +120,16 @@ def _flag_producer(mnem, ops, flag_offsets):
 CC_DEFINES = {
     "add": ("cf", "pf", "af", "zf", "sf", "of"),
     "sub": ("cf", "pf", "af", "zf", "sf", "of"),
+    "adc": ("cf", "pf", "af", "zf", "sf", "of"),
+    "sbb": ("cf", "pf", "af", "zf", "sf", "of"),
     "cmp": ("cf", "pf", "af", "zf", "sf", "of"),
     "logic": ("cf", "of", "zf", "sf", "pf"),
     "inc": ("pf", "af", "zf", "sf", "of"),
     "dec": ("pf", "af", "zf", "sf", "of"),
 }
 CC_OP_CONST = {"add": "X86_CC_ADD", "sub": "X86_CC_SUB", "cmp": "X86_CC_SUB",
-               "logic": "X86_CC_LOGIC", "inc": "X86_CC_INC", "dec": "X86_CC_DEC"}
+               "logic": "X86_CC_LOGIC", "inc": "X86_CC_INC", "dec": "X86_CC_DEC",
+               "adc": "X86_CC_ADC", "sbb": "X86_CC_SBB"}
 CC_BIT_VALUES = {"cf": 1, "pf": 2, "af": 4, "zf": 8, "sf": 0x10, "of": 0x20}
 #: Seams whose observer may read the guest's fields directly, so flags stay eager.
 CC_EAGER_EVENTS = frozenset(("DIV32", "IDIV32", "STRINGOP", "BRANCHIND"))
@@ -646,6 +658,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     # Decide which seams defer their flags as a descriptor before dead-value
     # elimination, so the descriptor's operands can be kept live as roots.
     cc_plan, cc_roots = {}, []
+    live_publications = dict(publications)
     if lazy_flags:
         for b in s.blocks.values():
             for v in b.ops:
@@ -656,7 +669,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     continue
                 state = b.exit if v.opc in EXITS else b.snapshots[v.id]
                 required = publications[v.id]
-                defines = set(CC_DEFINES[record.kind])
+                defines = set(record.flags) if record.kind == "join" else set(CC_DEFINES[record.kind])
                 mask = 0
                 for name, key in flag_first_key.items():
                     if name not in defines or key not in required:
@@ -670,10 +683,13 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                 if not mask or v.opc in CC_EAGER_EVENTS:
                     continue
                 cc_plan[v.id] = (record, mask)
-                cc_roots.extend(x for x in (record.a, record.b, record.res) if x is not None)
+                covered = {flag_first_key[name] for name, bit in CC_BIT_VALUES.items() if mask & bit}
+                live_publications[v.id] = tuple(key for key in required if key not in covered)
+                cc_roots.extend(x for x in (record.op, record.a, record.b, record.carry, record.res)
+                                if x is not None)
     # A callee-state read with no use is dropped; that also confines post-call
     # settles to reloads whose value is needed.
-    live = simplify(s, publications, canonical=False, extra_roots=cc_roots + contract_roots,
+    live = simplify(s, live_publications, canonical=False, extra_roots=cc_roots + contract_roots,
                     removable=frozenset(("CALL_RELOAD", "CALL_KEEP")), groups=groups)
     reads_entry_flags = any(
         v.opc == "INPUT" and v.data in flag_keys and v.id in live and s.resolve(v) is v
@@ -700,6 +716,8 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
         v = s.resolve(v)
         if v.opc in ("CONST", "TARGET"):
             return "0x%xull" % v.data
+        if v.opc == "CC_KIND":
+            return CC_OP_CONST[v.data]
         return "v%d" % v.id
 
     def mask(size):
@@ -786,7 +804,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
         covered = set()
         if cc is not None:
             record, mask = cc
-            covered = {"c->eflags_%s" % name for name in CC_DEFINES[record.kind]}
+            covered = {"c->eflags_%s" % name for name, bit in CC_BIT_VALUES.items() if mask & bit}
         stored_flag = False
         for (_, off, size), field in fields:
             keys = [("register", off + n) for n in range(size)]
@@ -798,7 +816,8 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
             if field in FLAG_FIELDS:
                 stored_flag = True
         if record is not None:
-            lines.append("c->cc_op = %s;" % CC_OP_CONST[record.kind])
+            lines.append("c->cc_op = %s;" % (ref(record.op) if record.op is not None
+                                             else CC_OP_CONST[record.kind]))
             lines.append("c->cc_size = %du;" % record.size)
             lines.append("c->cc_mask = 0x%xu;" % mask)
             lines.append("c->cc_a = (uint32_t)%s;" % (
@@ -806,6 +825,8 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
             lines.append("c->cc_b = (uint32_t)%s;" % (
                 ref(record.b) if record.b is not None else "0"))
             lines.append("c->cc_res = (uint32_t)%s;" % ref(record.res))
+            if record.carry is not None:
+                lines.append("c->cc_carry = (uint8_t)%s;" % ref(record.carry))
         elif lazy_flags and stored_flag:
             # A direct field write must not leave an older descriptor pending.
             lines.append("c->cc_op = X86_CC_NONE;")
@@ -851,7 +872,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     lines = ["static void %s(X86 *c, uint32_t entry_) {" % symbol if fir.entries
              else "void %s(X86 *c) {" % symbol]
     for v in s.values:
-        if v.id in live and v.size and v.opc not in ("CONST", "TARGET") and s.resolve(v) is v:
+        if v.id in live and v.size and v.opc not in ("CONST", "TARGET", "CC_KIND") and s.resolve(v) is v:
             lines.append("uint64_t v%d;" % v.id)
     scalar_declarations = len(lines)
     lines.extend(scalar.declarations())

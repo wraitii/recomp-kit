@@ -17,7 +17,7 @@ PURE = frozenset((
     "INT_LESSEQUAL", "INT_SLESS", "INT_SLESSEQUAL", "BOOL_AND", "BOOL_OR",
     "BOOL_XOR", "INT_LEFT", "INT_RIGHT", "INT_SRIGHT", "INT_CARRY", "INT_SCARRY",
     "INT_SBORROW", "BOOL_NEGATE", "INT_NEGATE", "INT_2COMP", "POPCOUNT",
-    "SUBPIECE", "PIECE", "MEMORY",
+    "SUBPIECE", "PIECE", "MEMORY", "CC_KIND",
 ))
 
 #: Results of an operation whose two operands are the same value.

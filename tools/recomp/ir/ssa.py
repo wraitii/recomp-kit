@@ -29,6 +29,7 @@ class Block:
         # Lazy-flag producer active at each publication snapshot, and at exit.
         self.cc_snapshots = {}
         self.cc_exit = None
+        self.cc_entry = None
         self.state, self.exit = {}, {}
 
 
@@ -38,11 +39,12 @@ class CcRecord:
     The producer is only usable at a seam while the SSA flag values still
     resolve to the values this record wrote; the emitter re-checks identity.
     """
-    __slots__ = ("kind", "size", "a", "b", "res", "flags")
+    __slots__ = ("kind", "size", "op", "a", "b", "carry", "res", "flags")
 
     def __init__(self, kind, size):
         self.kind, self.size = kind, size
         self.a = self.b = self.res = None
+        self.op = self.carry = None
         self.flags = {}
 
 
@@ -201,13 +203,8 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
         ins_cc = b.insn.cc
         cc_rec = CcRecord(ins_cc["kind"], ins_cc["size"]) if ins_cc is not None else None
         cc_ready = False  # the primary result has been seen
-        cc_active = None  # last complete producer, valid across this block
-        # Carry a producer along a single-predecessor edge (the common
-        # straight-line `cmp; ret`/`cmp; call` block pair).  Joins and loop
-        # backedges fall back to eager flags rather than threading a phi.
-        preds = predecessors[i]
-        if len(preds) == 1 and preds[0] != -1 and preds[0] in s.blocks:
-            cc_active = s.blocks[preds[0]].cc_exit
+        b.cc_entry = CcRecord("incoming", 0)
+        cc_active = b.cc_entry
 
         def emit(opc, size, args=(), data=None):
             v = s.value(opc, size, args, data)
@@ -303,9 +300,11 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
             primary = (ins_cc is not None and not cc_ready
                        and op.opc == ins_cc["opc"] and op.out == ins_cc["result"])
             if primary:
-                if len(args) > 0:
+                if "operands" in ins_cc:
+                    cc_rec.a, cc_rec.b, cc_rec.carry = [read(v) for v in ins_cc["operands"]]
+                elif len(args) > 0:
                     cc_rec.a = args[0]
-                if len(args) > 1:
+                if "operands" not in ins_cc and len(args) > 1:
                     cc_rec.b = args[1]
             if op.opc in ORDERED:
                 before = dict(state)
@@ -365,4 +364,8 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
         from .coalesce import registers
         registers(s, register_groups)
     s.simplify_phis()
+    if flag_off_name:
+        from .cc_carry import carry
+        carry(s, predecessors, flag_off_name)
+        s.simplify_phis()
     return s

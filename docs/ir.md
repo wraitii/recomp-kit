@@ -135,7 +135,9 @@ differs. It is off under `fault_state = "exact"`.
 ### Lazy flags
 
 `X86` carries a descriptor (`cc_op`, `cc_size`, `cc_mask`, `cc_a`, `cc_b`,
-`cc_res`) for the last ADD/SUB/CMP/logic/INC/DEC; `cc_op == X86_CC_NONE` means
+`cc_res`, `cc_carry`) for the last ADD/ADC/SUB/SBB/CMP/logic/INC/DEC;
+`cc_carry` uses the former padding byte without changing the CPU layout.
+`cc_op == X86_CC_NONE` means
 the six flag fields are current. `x86_cc_settle` writes them; `x86_get_eflags`,
 `x86_set_eflags`, `x86_sahf`, `recomp_comis`, the interpreter and `recomp_call`
 settle first. `ir/flag_region.py` walks from the entry or a post-call point to
@@ -149,6 +151,13 @@ paths leaving the body without
 a call or return, for calls that can continue elsewhere (SEH adoption, noreturn,
 setjmp), and where hooks may observe (entry thunks and `recomp_jump` settle
 before a hook). Decoded bodies use an explicit per-mnemonic flag-effect table.
+
+`ir/cc_carry.py` carries recipes through resolved CFG edges and merges equal-width
+recipes with payload phis, including differing producer kinds. Only flags covered
+by every predecessor's current recipe are deferred; other flags stay eager.
+Entry edges, missing recipes, incompatible widths and unresolved cycles retain
+eager publication. Deferred fields are excluded from publication liveness, while
+their operands, incoming carry and result remain live.
 
 ### Call contracts
 
