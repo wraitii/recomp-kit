@@ -362,7 +362,7 @@ def summarize(p, callee_lookup, cells=None):
 def cfg_is_closed(fir):
     """False for a body whose control can leave without a modeled edge.
 
-    Tail jumps, unresolved computed jumps and calls with no fallthrough are
+    Tail jumps, computed jumps without a decoded table and calls with no fallthrough are
     conservatively outside this model.
     """
     for i, ins in enumerate(fir.insns):
@@ -379,8 +379,6 @@ def cfg_is_closed(fir):
         elif mnem == "CALL":
             if not succ:
                 return False
-        elif mnem == "BRANCHIND" and i not in fir.tables:
-            return False
         elif not succ and not _is_return(ins):
             return False
     return True
