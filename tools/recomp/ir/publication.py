@@ -34,8 +34,15 @@ Starting with no facts gives a conservative least fixed point for loops.
         for j in set(successors[i]):
             predecessors[j].append(i)
 
+    resolved = {}
+
     def values(state, keys):
-        return tuple(s.resolve(state[key]) for key in keys)
+        cache_key = id(state), keys
+        current = resolved.get(cache_key)
+        if current is None:
+            current = tuple(s.resolve(state[key]) for key in keys)
+            resolved[cache_key] = current
+        return current
 
     known_exit = {i: set() for i in s.blocks}
     publications = {}
