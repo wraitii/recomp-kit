@@ -415,6 +415,8 @@ struct X86 {
      * leaves MMX without EMMS and then uses the FPU sees its old values, not
      * the MMX ones, which no game this runtime serves relies on. */
     uint64_t mm[8];
+    /* Translated calls until this guest thread's next scheduler checkpoint. */
+    uint32_t checkpoint_countdown;
 };
 typedef struct X86 X86;
 
@@ -501,8 +503,14 @@ static inline void recomp_comis(X86 *c, double a, double b) {
 void recomp_call(X86 *c, uint32_t target);
 void recomp_run(X86 *c, uint32_t target);
 /* Translated call boundaries also schedule guest-only polling loops. Does not
- * alter this thread's CPU; the scheduler keeps guest execution serialized. */
-void recomp_execution_checkpoint(void);
+ * alter this thread's guest state; the scheduler keeps guest execution
+ * serialized. The countdown lives in the guest thread's CPU rather than a
+ * thread-local, which costs a TLV lookup per call on Darwin. */
+void recomp_execution_checkpoint_due(X86 *c);
+static inline void recomp_execution_checkpoint(X86 *c) {
+    if (__builtin_expect(c->checkpoint_countdown-- == 0u, 0))
+        recomp_execution_checkpoint_due(c);
+}
 
 /* RECOMP_WATCH_FRAME=1 reports a guest call that returns with EBP changed.
  * A routine that loses the frame pointer corrupts nothing and crashes nowhere:
@@ -1625,13 +1633,11 @@ static inline void fxam(X86 *c) {
  * _longjmp reinstating a saved X86, for one), which would silently leave an
  * fesetround-based implementation rounding the wrong way.
  *
- * Nearest is ties-to-even, computed from floor and ceil rather than
- * `floor(v + 0.5)`: that addition itself rounds, and turns the exactly
- * representable 4503599627370497 into ...498.  For |v| >= 2^52 floor and ceil
- * are both v, so the tie branch returns v unchanged.
+ * Nearest is roundeven, which ignores the host mode (frintn on ARM64), rather
+ * than `floor(v + 0.5)`: that addition itself rounds, and turns the exactly
+ * representable 4503599627370497 into ...498.
  */
-static inline double fround_rc(uint16_t cw, double v) {
-    double lo, hi, dlo, dhi;
+RECOMP_HOT_INLINE double fround_rc(uint16_t cw, double v) {
     switch ((cw >> 10) & 3u) {
     case 1:
         return floor(v);
@@ -1640,15 +1646,7 @@ static inline double fround_rc(uint16_t cw, double v) {
     case 3:
         return trunc(v);
     default:
-        lo = floor(v);
-        hi = ceil(v);
-        dlo = v - lo;
-        dhi = hi - v;
-        if (dlo < dhi)
-            return lo;
-        if (dlo > dhi)
-            return hi;
-        return fmod(lo, 2.0) == 0.0 ? lo : hi; /* tie: to even */
+        return __builtin_roundeven(v);
     }
 }
 static inline double fround_cw(const X86 *c, double v) {
@@ -1797,48 +1795,34 @@ static inline float fto_float(const X86 *c, double v) {
 
 /* FIST/FISTP: round per the control word, and store the "integer indefinite"
  * when the value does not fit (NaN, infinity, out of range) exactly as x87
- * does with the invalid-operation exception masked, raising IE. */
-static inline int16_t fto_i16(X86 *c, double v) {
-    double r = fround_cw(c, v);
-    if (r >= -32768.0 && r <= 32767.0)
-        return (int16_t)r;
-    c->fpu_sw |= 0x0001u;
-    return INT16_MIN;
-}
-static inline int32_t fto_i32(X86 *c, double v) {
-    double r = fround_cw(c, v);
-    if (r >= -2147483648.0 && r <= 2147483647.0)
-        return (int32_t)r;
-    c->fpu_sw |= 0x0001u;
-    return INT32_MIN;
-}
-static inline int64_t fto_i64(X86 *c, double v) {
-    double r = fround_cw(c, v);
-    if (r >= -9223372036854775808.0 && r < 9223372036854775808.0)
-        return (int64_t)r;
-    c->fpu_sw |= 0x0001u;
-    return INT64_MIN;
-}
-
-/* Integer stores use FILD's exact signed value until an arithmetic write.
- * Narrowing falls back to the ordinary conversion for masked overflow. */
-static inline int16_t fist_i16(X86 *c) {
-    int64_t v = (int64_t)c->st_bits[c->fpu_top];
-    if (c->st_exact[c->fpu_top] && v >= INT16_MIN && v <= INT16_MAX)
-        return (int16_t)v;
-    return fto_i16(c, ST(c, 0));
-}
-static inline int32_t fist_i32(X86 *c) {
-    int64_t v = (int64_t)c->st_bits[c->fpu_top];
-    if (c->st_exact[c->fpu_top] && v >= INT32_MIN && v <= INT32_MAX)
-        return (int32_t)v;
-    return fto_i32(c, ST(c, 0));
-}
-static inline int64_t fist_i64(X86 *c) {
-    if (c->st_exact[c->fpu_top])
-        return (int64_t)c->st_bits[c->fpu_top];
-    return fto_i64(c, ST(c, 0));
-}
+ * does with the invalid-operation exception masked, raising IE. Integer
+ * stores use FILD's exact signed value until an arithmetic write. */
+#define X86_FIST(bits, lo, in_range)                                                               \
+    RECOMP_HOT_INLINE int##bits##_t fto_i##bits##_sw(uint16_t *sw, uint16_t cw, double v) {        \
+        double r = fround_rc(cw, v);                                                               \
+        if (r >= lo && in_range)                                                                   \
+            return (int##bits##_t)r;                                                               \
+        *sw |= 0x0001u;                                                                            \
+        return INT##bits##_MIN;                                                                    \
+    }                                                                                              \
+    RECOMP_HOT_INLINE int##bits##_t fist_i##bits##_sw(uint16_t *sw, uint16_t cw, double v,         \
+                                                      uint8_t exact, uint64_t raw) {               \
+        int64_t e = (int64_t)raw;                                                                  \
+        if (exact && e >= INT##bits##_MIN && e <= INT##bits##_MAX)                                 \
+            return (int##bits##_t)e;                                                               \
+        return fto_i##bits##_sw(sw, cw, v);                                                        \
+    }                                                                                              \
+    static inline int##bits##_t fto_i##bits(X86 *c, double v) {                                    \
+        return fto_i##bits##_sw(&c->fpu_sw, c->fpu_cw, v);                                         \
+    }                                                                                              \
+    static inline int##bits##_t fist_i##bits(X86 *c) {                                             \
+        return fist_i##bits##_sw(&c->fpu_sw, c->fpu_cw, ST(c, 0), c->st_exact[c->fpu_top],         \
+                                 c->st_bits[c->fpu_top]);                                          \
+    }
+X86_FIST(16, -32768.0, r <= 32767.0)
+X86_FIST(32, -2147483648.0, r <= 2147483647.0)
+X86_FIST(64, -9223372036854775808.0, r < 9223372036854775808.0)
+#undef X86_FIST
 
 /* FPREM / FPREM1.
  *

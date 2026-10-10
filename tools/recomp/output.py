@@ -124,7 +124,7 @@ void recomp_enter(X86 *c, uint32_t i)
 {
     RecompSaved saved_; recomp_save(c, &saved_);
     if (recomp_profile_enabled) { recomp_call(c, recomp_func_addrs[i]); return; }
-    recomp_execution_checkpoint();
+    recomp_execution_checkpoint(c);
 #ifndef RECOMP_NO_HOOKS
     if (__builtin_expect(__atomic_load_n(&recomp_hooked[i], __ATOMIC_ACQUIRE) != 0u, 0)) {
         /* A hook callback observes the full register file, so a pending lazy
@@ -309,7 +309,7 @@ static void recomp_call_inner(X86 *c, uint32_t target)
 {
     int32_t i = recomp_lookup(target);
     if (i >= 0) {
-        recomp_execution_checkpoint();
+        recomp_execution_checkpoint(c);
         if (recomp_profile_enabled) recomp_profile_push((uint32_t)i);
 #ifdef RECOMP_NO_HOOKS
         recomp_base_ptrs[i](c);
@@ -337,7 +337,7 @@ void recomp_jump(X86 *c, uint32_t target)
     if (recomp_seh_pending_target()) recomp_seh_intercept(c, target);
     int32_t i = recomp_lookup(target);
     if (i >= 0) {
-        recomp_execution_checkpoint();
+        recomp_execution_checkpoint(c);
         if (recomp_profile_enabled) recomp_profile_push((uint32_t)i);
 #ifdef RECOMP_NO_HOOKS
         recomp_base_ptrs[i](c);
@@ -404,7 +404,7 @@ def write_module_table(out, entry_names, functions, call_returns, module):
         fh.write("};\nstatic uint8_t %shooked[%d];\n" % (prefix, len(entry_names)))
         fh.write("void recomp_enter_%s(X86 *c, uint32_t i)\n{\n" % key)
         fh.write("    RecompSaved saved_; recomp_save(c, &saved_);\n")
-        fh.write("    recomp_execution_checkpoint();\n")
+        fh.write("    recomp_execution_checkpoint(c);\n")
         fh.write("    if (recomp_profile_enabled) recomp_profile_push(i);\n")
         fh.write("    if (%shooked[i]) { x86_cc_settle(c); %shooks[i](c, i); }\n" % (prefix, prefix))
         fh.write("    else %sbase[i](c);\n" % prefix)

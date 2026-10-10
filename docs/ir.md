@@ -69,8 +69,8 @@ equals its reload, flags stay unknown).
 `emit_c.py` lowers values to unsigned, width-masked C with staged parallel phi
 copies, sign-bias comparisons and saturating shift counts. Dword DIV/IDIV are
 checked `div32`/`idiv32` effects that reach the runtime error seam with the
-original address. Memory ADD/SUB/INC/DEC capture one read and emit flags after
-the STORE; `MOVSD`/`REP MOVSD` call runtime helpers in access-then-advance
+original address. Memory arithmetic, logic and shifts, including absolute
+(`ram`) operands, capture one read and emit flags after the STORE; `MOVSD`/`REP MOVSD` call runtime helpers in access-then-advance
 order. Direct calls publish the CPU, call `entry_ADDR` (`CALL_FN`) and reload
 each register whole, each flag and the memory token, keeping only used reloads;
 a field whose four lanes are one value's bytes is stored whole; indirect calls go through
@@ -81,10 +81,9 @@ published) are emitted; after `setjmp` returns nonzero only `c` is used.
 
 `production.py` runs one function through SSA with a 16384-instruction budget.
 Bodies SSA cannot emit stay on `decoded.py`, the plain eager emitter (Capstone
-decoding, full-state helpers) fed the mapped boundaries: about 140 bodies,
-named in `translate-report.json` (direct-ram read-modify-write, INT, RDTSC,
-SHLD/SHRD, some register shifts, FNSAVE/FNSTENV, guest continuations,
-over-budget bodies). `decoded.py` also emits the wrappers of internal-switch
+decoding, full-state helpers) fed the mapped boundaries: about 65 bodies,
+named in `translate-report.json` (INT, RDTSC, ROL/RCR, SHLD/SHRD, MMX,
+FNSAVE/FNSTENV, guest continuations, over-budget bodies). `decoded.py` also emits the wrappers of internal-switch
 entries. Unmodelled instructions become `recomp_unmodelled(c, addr)` traps only
 under `--allow-unmodelled`; otherwise translation fails.
 
@@ -112,7 +111,8 @@ never removed and their order is kept.
 
 `x87_scalar.py` replaces physical push/pop/copy updates with scalars indexed
 from the entry TOP, tracking all eight residues, tags and exact-integer shadows.
-CW and SW are scalar locals passed to always-inlined `_sw` helper forms. Seams
+CW and SW are scalar locals passed to always-inlined `_sw` helper forms,
+including FIST/FISTP, which read the scalar value and exact-integer shadow. Seams
 (division, calls, opaque recipes, returns) materialize the required state.
 `x87_carry.py` carries unpublished state across internal CFG edges: each block
 has a conservative fixed-point shape, predecessors write canonical function-scope

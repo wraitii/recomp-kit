@@ -10,7 +10,7 @@ existing guest accessors, in instruction order, with explicit state
 publication. No inferred convention permits discarding guest state.
 """
 from .lift import Lifter, Insn, Op
-from .integer import memory_arithmetic, shift, divide
+from .integer import read_modify_write, arithmetic, shift, divide
 from .integer_extra import EXTRA_MNEMONICS, correct as correct_extra
 from .ssa import SSAError, MEMORY, build
 from .cfg import FunctionIR
@@ -89,8 +89,11 @@ def _flag_producer(mnem, ops, flag_offsets):
     if info is None:
         return None
     kind, opc = info
+    stored = {op.ins[1] for op in ops if op.opc == "STORE"}
     found = None
     for op in ops:
+        if stored and op.out not in stored:
+            continue
         if op.out is None:
             continue
         space, off, size = op.out
@@ -133,10 +136,10 @@ def normalize_direct_ram(ins, lifter):
     * a source-only access is captured once into a fresh unique shared by every
       consumer, so arithmetic flags cannot re-read memory;
     * a pure store becomes an explicit STORE;
-    * a self-contained single-op read-modify-write (e.g. NOT [abs]) becomes
-      LOAD + compute + STORE;
-    * a direct-ram destination that also computes flags (ADD/XOR/... [abs],reg)
-      is rejected rather than approximated. Control-flow ram is untouched.
+    * a read-modify-write becomes SLEIGH's register-addressed memory form,
+      a LOAD before each read and a STORE after the write, which the
+      mnemonic's read-modify-write correction reduces to one read.
+    Control-flow ram is untouched.
     """
     ops = list(ins.ops)
     for index, op in enumerate(ops):
@@ -159,16 +162,23 @@ def normalize_direct_ram(ins, lifter):
     has_write = any(op.out is not None and op.out[0] == "ram" for op in touched)
     has_read = any(any(v is not None and v[0] == "ram" for v in op.ins) for op in touched)
     if has_write and has_read:
-        if len(touched) != 1:
+        if sum(op.out is not None and op.out[0] == "ram" for op in touched) != 1:
             raise SSAError("%08x: unsupported direct-ram read-modify-write" % ins.addr)
-        op = touched[0]
-        index = ops.index(op)
-        src, dst = lifter.fresh_unique(size), lifter.fresh_unique(size)
-        inputs = tuple(src if (v is not None and v[0] == "ram") else v for v in op.ins)
-        ops[index:index + 1] = [Op("LOAD", src, [address]),
-                                Op(op.opc, dst, inputs, op.data),
-                                Op("STORE", None, [address, dst])]
-        return ops
+        operand = lifter.fresh_unique(size)
+        rewritten = []
+        for op in ops:
+            if op.opc in _RAM_CONTROL:
+                rewritten.append(op)
+                continue
+            inputs = tuple(operand if (v is not None and v[0] == "ram") else v for v in op.ins)
+            if inputs != op.ins:
+                rewritten.append(Op("LOAD", operand, [address]))
+            if op.out is not None and op.out[0] == "ram":
+                rewritten.extend([Op(op.opc, operand, inputs, op.data),
+                                  Op("STORE", None, [address, operand])])
+            else:
+                rewritten.append(Op(op.opc, op.out, inputs, op.data))
+        return rewritten
     if has_write:
         for index, op in enumerate(ops):
             if op.out is not None and op.out[0] == "ram":
@@ -273,14 +283,21 @@ def codegen_ir(fir, lifter, tails=()):
         ops = normalize_direct_ram(ins, lifter)
         normalized = Insn(ins.addr, ins.length, ins.mnem, ops, ins.x87_delta,
                           ins.x87, ins.internal_flow, ins.userops, ins.raw)
-        if mnem in EXTRA_MNEMONICS:
+        if mnem == "SAR":
+            ops = read_modify_write(normalized, lifter,
+                                    lambda insn, operand: correct_extra(insn, lifter, operand))
+        elif mnem in EXTRA_MNEMONICS:
             ops = correct_extra(normalized, lifter)
         elif mnem in ("ADD", "SUB", "CMP", "INC", "DEC", "SBB", "ADC"):
-            ops = memory_arithmetic(normalized, lifter)
+            ops = read_modify_write(normalized, lifter,
+                                    lambda insn, operand: arithmetic(insn, lifter, operand))
         elif mnem in ("SHL", "SHR"):
-            ops = shift(normalized, lifter)
+            ops = read_modify_write(normalized, lifter,
+                                    lambda insn, operand: shift(insn, lifter, operand))
         elif mnem == "DIV":
             ops = divide(normalized, lifter)
+        elif mnem in ("AND", "OR", "XOR", "NOT"):
+            ops = read_modify_write(normalized, lifter, lambda insn, operand: list(insn.ops))
         else:
             ops = normalized.ops
         if i in fir.seh:
@@ -782,7 +799,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                 continue
             m = v.data["mnem"]
             if (m.rstrip("P") in x87.ARITH or m.rstrip("P") in x87.INTEGER_ARITH
-                    or m in ("FSQRT", "FRNDINT")
+                    or m in ("FSQRT", "FRNDINT", "FIST", "FISTP")
                     or (v.opc == "X87_MEM" and m in ("FST", "FSTP"))):
                 cw_sensitive += 1
     # The clone duplicates the integer code too; a mostly-integer body

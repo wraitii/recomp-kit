@@ -3042,7 +3042,7 @@ static void test_scheduling(X86 *c) {
     X86 saved_cpu = *c;
     t0 = wall_seconds();
     while (wall_seconds() - t0 < 0.05)
-        recomp_execution_checkpoint();
+        recomp_execution_checkpoint(c);
     check(g_service_loops > before, "translated-call polling lets the service worker advance");
     check(memcmp(c, &saved_cpu, sizeof(*c)) == 0,
           "translated checkpoints preserve the polling thread's complete CPU");
@@ -3051,7 +3051,7 @@ static void test_scheduling(X86 *c) {
     sched_atomic_enter(c->r[R_ESP]);
     t0 = wall_seconds();
     while (wall_seconds() - t0 < 0.05)
-        recomp_execution_checkpoint();
+        recomp_execution_checkpoint(c);
     check(g_service_loops == before, "translated checkpoints respect an atomic stretch");
     sched_atomic_leave();
 

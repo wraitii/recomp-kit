@@ -3156,11 +3156,8 @@ void sched_checkpoint() {
 // no flag settling or register rewrite. Amortize clock/registry work over 1024
 // boundaries; sched_checkpoint still enforces the time slice and atomic spans.
 // Import-free loops that make no translated calls are not covered by this seam.
-extern "C" void recomp_execution_checkpoint(void) {
-    static __thread uint32_t remaining = 1024;
-    if (--remaining)
-        return;
-    remaining = 1024;
+extern "C" void recomp_execution_checkpoint_due(X86 *c) {
+    c->checkpoint_countdown = 1023;
     sched_checkpoint();
 }
 
