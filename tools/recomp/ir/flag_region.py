@@ -44,7 +44,13 @@ def decision(reads, writes, must):
 
 
 def analyze(start, successors, access, is_end, leaves, count):
-    """Classify the region that starts at instruction index ``start``.
+    """Classify the region that starts at instruction index ``start``."""
+    found = summarize(start, successors, access, is_end, leaves, count)
+    return SETTLE if found is None else decision(*found)
+
+
+def summarize(start, successors, access, is_end, leaves, count):
+    """Summarize the region that starts at instruction index ``start``.
 
     ``successors(i)``  in-body successor indices to continue to.
     ``access(i)``      ``(reads, writes)`` frozensets, or ``None`` when the
@@ -54,11 +60,12 @@ def analyze(start, successors, access, is_end, leaves, count):
                        record the path, do not force a settle.
     ``leaves(i)``      control can leave the body after ``i``: an observer.
 
-    Returns one of ``REMOVE``/``DROP``/``SETTLE``.  A region with no reachable
-    boundary (an infinite loop) settles.
+    Returns ``(reads, writes, must)`` over the paths to a boundary, or None
+    when an observer or a region with no reachable boundary (an infinite loop)
+    forces a settle.
     """
     if not 0 <= start < count:
-        return SETTLE
+        return None
     # index -> (read-before-write, may-write, must-write), all frozensets.
     state = {start: (frozenset(), frozenset(), frozenset())}
     work = [start]
@@ -108,5 +115,5 @@ def analyze(start, successors, access, is_end, leaves, count):
                     state[j] = merged
                     work.append(j)
     if observer or not ends:
-        return SETTLE
-    return decision(reads, writes, must_end)
+        return None
+    return frozenset(reads), frozenset(writes), must_end

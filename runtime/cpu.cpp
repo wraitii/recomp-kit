@@ -143,7 +143,7 @@ int recomp_module_call(X86 *c, uint32_t target) {
     int32_t i = module_index(m, target);
     if (i < 0)
         return 0;
-    recomp_execution_checkpoint();
+    recomp_execution_checkpoint(c);
 #ifdef RECOMP_NO_HOOKS
     m->base_ptrs[i](c);
 #else

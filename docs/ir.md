@@ -69,8 +69,8 @@ equals its reload, flags stay unknown).
 `emit_c.py` lowers values to unsigned, width-masked C with staged parallel phi
 copies, sign-bias comparisons and saturating shift counts. Dword DIV/IDIV are
 checked `div32`/`idiv32` effects that reach the runtime error seam with the
-original address. Memory ADD/SUB/INC/DEC capture one read and emit flags after
-the STORE; `MOVSD`/`REP MOVSD` call runtime helpers in access-then-advance
+original address. Memory arithmetic, logic and shifts, including absolute
+(`ram`) operands, capture one read and emit flags after the STORE; `MOVSD`/`REP MOVSD` call runtime helpers in access-then-advance
 order. Direct calls publish the CPU, call `entry_ADDR` (`CALL_FN`) and reload
 each register whole, each flag and the memory token, keeping only used reloads;
 a field whose four lanes are one value's bytes is stored whole; indirect calls go through
@@ -81,10 +81,9 @@ published) are emitted; after `setjmp` returns nonzero only `c` is used.
 
 `production.py` runs one function through SSA with a 16384-instruction budget.
 Bodies SSA cannot emit stay on `decoded.py`, the plain eager emitter (Capstone
-decoding, full-state helpers) fed the mapped boundaries: about 140 bodies,
-named in `translate-report.json` (direct-ram read-modify-write, INT, RDTSC,
-SHLD/SHRD, some register shifts, FNSAVE/FNSTENV, guest continuations,
-over-budget bodies). `decoded.py` also emits the wrappers of internal-switch
+decoding, full-state helpers) fed the mapped boundaries: about 65 bodies,
+named in `translate-report.json` (INT, RDTSC, ROL/RCR, SHLD/SHRD, MMX,
+FNSAVE/FNSTENV, guest continuations, over-budget bodies). `decoded.py` also emits the wrappers of internal-switch
 entries. Unmodelled instructions become `recomp_unmodelled(c, addr)` traps only
 under `--allow-unmodelled`; otherwise translation fails.
 
@@ -112,7 +111,8 @@ never removed and their order is kept.
 
 `x87_scalar.py` replaces physical push/pop/copy updates with scalars indexed
 from the entry TOP, tracking all eight residues, tags and exact-integer shadows.
-CW and SW are scalar locals passed to always-inlined `_sw` helper forms. Seams
+CW and SW are scalar locals passed to always-inlined `_sw` helper forms,
+including FIST/FISTP, which read the scalar value and exact-integer shadow. Seams
 (division, calls, opaque recipes, returns) materialize the required state.
 `x87_carry.py` carries unpublished state across internal CFG edges: each block
 has a conservative fixed-point shape, predecessors write canonical function-scope
@@ -141,7 +141,11 @@ the six flag fields are current. `x86_cc_settle` writes them; `x86_get_eflags`,
 settle first. `ir/flag_region.py` walks from the entry or a post-call point to
 the next CALL/CALLIND/RET: with no flag read and no flag write the settle is
 removed; with no read and all six flags written on every path it becomes
-`x86_cc_drop`; otherwise it stays, as it does for paths leaving the body without
+`x86_cc_drop`. After a call, the flags read, reloaded from the fields or not
+written on every path form a mask: `x86_cc_settle_mask` (region without
+writes) and `x86_cc_settle_or_drop` materialise only a descriptor whose
+`cc_mask` meets it, and otherwise keep or drop it. A full settle stays for
+paths leaving the body without
 a call or return, for calls that can continue elsewhere (SEH adoption, noreturn,
 setjmp), and where hooks may observe (entry thunks and `recomp_jump` settle
 before a hook). Decoded bodies use an explicit per-mnemonic flag-effect table.
@@ -151,13 +155,25 @@ before a hook). Decoded bodies use an explicit per-mnemonic flag-effect table.
 `call_contracts.py` summarizes every body (decoded included) over the eight GPRs
 and six flags: `reads` is a backward may-liveness of entry values (through
 direct callees), `kills` a forward must-definite over all return paths (a GPR
-only if all four byte lanes are written). A save/restore stays in `reads`.
-Recursive components start empty and fall back to `reads=all, kills=none` if
+only if all four byte lanes are written), `writes` the fields any reachable
+instruction or callee may write. A save/restore stays in `reads`. SLEIGH omits
+AF for ADD/ADC/SUB/SBB/CMP/INC/DEC, which both emitters define, so the summary
+adds it; any instruction outside a flag-free mnemonic list may write every flag.
+Recursive components start empty and fall back to the conservative contract if
 unconverged. At a direct CALL the emitter drops field `F` only when
-`F not in reads and F in kills`; ESP and EBP are never dropped. Indirect calls,
-unbound targets, failed lifts, SEH and alternate-entry bodies and native
-replacements are `reads=all, kills=none`. Because any function can be hooked,
-dropped fields are still published behind `recomp_hooks_ever`.
+`F not in reads and F in kills`, and keeps it when `F` is in neither `reads`
+nor `writes`: no publication, and the SSA value continues past the call as
+`CALL_KEEP`, known in the CPU afterwards only if it was before. Flags are kept
+only all six together, so a pending descriptor passes through the callee
+untouched; bodies with SEH effects keep nothing. ESP and EBP are never dropped
+or kept. Indirect calls, unbound targets, failed lifts, SEH and alternate-entry
+bodies and native replacements read and write everything and kill nothing.
+Because any function can be hooked and a hook may rewrite the CPU, dropped and
+kept fields are still published behind `recomp_hooks_ever`, and `CALL_KEEP`
+rereads the field (after a settle, for flags) on that path. The flag is tested
+on both sides of every running call, so it rises only before guest entry: the
+loader arms it for any mod with a plugin or script, and a hook installed after
+entry without it is refused (`POP_E_STATE`).
 
 ### Policies
 
@@ -174,8 +190,9 @@ with `fault_state = "exact"` and `msvc_x87_convention = false`.
 DIVERGENCE(original) tags in the emitter name the accepted differences:
 `[ssa-x87-scalar]` interior faults and store-watch callbacks may see the
 preceding published x87 state; `[ssa-state-locals]` and `[ssa-call-contracts]`
-let a fault or SEH context raised before a dropped field is overwritten, or
-between an elided settle and its flag read, see stale fields;
+let a fault or SEH context raised before a dropped field is overwritten, inside
+a callee that keeps the field, or between an elided settle and its flag read,
+see stale fields;
 `[ssa-x87-binary32]` the binary32 exponent-range policy; `[ssa-x87-convention]`
 popped residue unpublished at calls and returns. Interior fault and SEH
 equivalence is unverified.

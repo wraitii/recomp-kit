@@ -60,7 +60,9 @@ void recomp_seh_frame_orphan(X86 *c, uint64_t mark) {
     (void)c;
     (void)mark;
 }
-void recomp_execution_checkpoint(void) {}
+void recomp_execution_checkpoint_due(X86 *c) {
+    (void)c;
+}
 uint32_t recomp_seh_pending_target(void) {
     return 0;
 }

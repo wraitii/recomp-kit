@@ -17,7 +17,8 @@ class FunctionIR(object):
         self.succ = succ
         #: Instruction index -> addresses outside this body it can transfer to:
         #: tail jumps, table targets in other functions, a fallthrough out of
-        #: the span. Not part of `succ`.
+        #: the span; empty for a computed jump with no decoded table. Not part
+        #: of `succ`.
         self.exits = exits or {}
         #: Direct calls that never return -> the address after them.
         self.noreturn = noreturn or {}

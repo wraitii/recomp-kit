@@ -12,7 +12,7 @@ def write(out):
     out.mkdir(parents=True, exist_ok=True)
     # These are synthetic guest addresses, not any game's entry points.
     addresses = [0x0D001000, 0x0D001010, 0x0D001020, 0x0D001030]
-    functions = [SimpleNamespace(addr=a, name="fixture", insns=[SimpleNamespace(addr=a)])
+    functions = [SimpleNamespace(addr=a, name="fixture", count=1, first=a, last=a)
                  for a in addresses]
     bodies = {
         addresses[0]: ["void fn_0d001000(X86 *c) { c->r[0] += 1; }"],

@@ -624,6 +624,17 @@ class X87Scalar:
                 # A register copy already carried the value to its destination;
                 # a plain FSTP ST(0) discards it and must fold.
                 self._drop(lines, subsumed=self.lazy_nan and bool(slots and slots[0]))
+        elif m in ("FIST", "FISTP") and not self.observe_loads:
+            if self.lazy_nan:
+                self._fold(0, lines)
+            value = read(0)
+            exact = self._read(0, "exact", lines)
+            raw = "0" if exact == "0" else self._read(0, "bits", lines)
+            lines.append("wr%d((uint32_t)%s, (uint%d_t)fist_i%d_sw(&x87_sw_, x87_cw_, %s, %s, %s));"
+                         % (bits, address, bits, bits, value, exact, raw))
+            self.status_dirty = True
+            if m == "FISTP":
+                self._drop(lines)
         elif m in x87.ARITH or m in x87.INTEGER_ARITH or (m.endswith("P") and m[:-1] in x87.ARITH):
             pop = m.endswith("P")
             base = m[:-1] if pop else m

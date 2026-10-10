@@ -10,7 +10,7 @@ existing guest accessors, in instruction order, with explicit state
 publication. No inferred convention permits discarding guest state.
 """
 from .lift import Lifter, Insn, Op
-from .integer import memory_arithmetic, shift, divide
+from .integer import read_modify_write, arithmetic, shift, divide
 from .integer_extra import EXTRA_MNEMONICS, correct as correct_extra
 from .ssa import SSAError, MEMORY, build
 from .cfg import FunctionIR
@@ -89,8 +89,11 @@ def _flag_producer(mnem, ops, flag_offsets):
     if info is None:
         return None
     kind, opc = info
+    stored = {op.ins[1] for op in ops if op.opc == "STORE"}
     found = None
     for op in ops:
+        if stored and op.out not in stored:
+            continue
         if op.out is None:
             continue
         space, off, size = op.out
@@ -133,10 +136,10 @@ def normalize_direct_ram(ins, lifter):
     * a source-only access is captured once into a fresh unique shared by every
       consumer, so arithmetic flags cannot re-read memory;
     * a pure store becomes an explicit STORE;
-    * a self-contained single-op read-modify-write (e.g. NOT [abs]) becomes
-      LOAD + compute + STORE;
-    * a direct-ram destination that also computes flags (ADD/XOR/... [abs],reg)
-      is rejected rather than approximated. Control-flow ram is untouched.
+    * a read-modify-write becomes SLEIGH's register-addressed memory form,
+      a LOAD before each read and a STORE after the write, which the
+      mnemonic's read-modify-write correction reduces to one read.
+    Control-flow ram is untouched.
     """
     ops = list(ins.ops)
     for index, op in enumerate(ops):
@@ -159,16 +162,23 @@ def normalize_direct_ram(ins, lifter):
     has_write = any(op.out is not None and op.out[0] == "ram" for op in touched)
     has_read = any(any(v is not None and v[0] == "ram" for v in op.ins) for op in touched)
     if has_write and has_read:
-        if len(touched) != 1:
+        if sum(op.out is not None and op.out[0] == "ram" for op in touched) != 1:
             raise SSAError("%08x: unsupported direct-ram read-modify-write" % ins.addr)
-        op = touched[0]
-        index = ops.index(op)
-        src, dst = lifter.fresh_unique(size), lifter.fresh_unique(size)
-        inputs = tuple(src if (v is not None and v[0] == "ram") else v for v in op.ins)
-        ops[index:index + 1] = [Op("LOAD", src, [address]),
-                                Op(op.opc, dst, inputs, op.data),
-                                Op("STORE", None, [address, dst])]
-        return ops
+        operand = lifter.fresh_unique(size)
+        rewritten = []
+        for op in ops:
+            if op.opc in _RAM_CONTROL:
+                rewritten.append(op)
+                continue
+            inputs = tuple(operand if (v is not None and v[0] == "ram") else v for v in op.ins)
+            if inputs != op.ins:
+                rewritten.append(Op("LOAD", operand, [address]))
+            if op.out is not None and op.out[0] == "ram":
+                rewritten.extend([Op(op.opc, operand, inputs, op.data),
+                                  Op("STORE", None, [address, operand])])
+            else:
+                rewritten.append(Op(op.opc, op.out, inputs, op.data))
+        return rewritten
     if has_write:
         for index, op in enumerate(ops):
             if op.out is not None and op.out[0] == "ram":
@@ -273,14 +283,21 @@ def codegen_ir(fir, lifter, tails=()):
         ops = normalize_direct_ram(ins, lifter)
         normalized = Insn(ins.addr, ins.length, ins.mnem, ops, ins.x87_delta,
                           ins.x87, ins.internal_flow, ins.userops, ins.raw)
-        if mnem in EXTRA_MNEMONICS:
+        if mnem == "SAR":
+            ops = read_modify_write(normalized, lifter,
+                                    lambda insn, operand: correct_extra(insn, lifter, operand))
+        elif mnem in EXTRA_MNEMONICS:
             ops = correct_extra(normalized, lifter)
         elif mnem in ("ADD", "SUB", "CMP", "INC", "DEC", "SBB", "ADC"):
-            ops = memory_arithmetic(normalized, lifter)
+            ops = read_modify_write(normalized, lifter,
+                                    lambda insn, operand: arithmetic(insn, lifter, operand))
         elif mnem in ("SHL", "SHR"):
-            ops = shift(normalized, lifter)
+            ops = read_modify_write(normalized, lifter,
+                                    lambda insn, operand: shift(insn, lifter, operand))
         elif mnem == "DIV":
             ops = divide(normalized, lifter)
+        elif mnem in ("AND", "OR", "XOR", "NOT"):
+            ops = read_modify_write(normalized, lifter, lambda insn, operand: list(insn.ops))
         else:
             ops = normalized.ops
         if i in fir.seh:
@@ -306,17 +323,40 @@ def cc_action_lines(action):
         return ["x86_cc_drop(c);"]
     if action == flag_region.REMOVE:
         return []
+    if isinstance(action, tuple):
+        helper, flags = action
+        bits = " | ".join("X86_CCF_%s" % f.upper() for f in sorted(flags))
+        return ["%s(c, %s);" % (helper, bits)]
     return ["x86_cc_settle(c);"]
+
+
+def call_cc_action(summary, live):
+    """The post-call action for a region summary and the flags read from the fields.
+
+    A descriptor whose `cc_mask` misses every needed flag leaves those fields
+    current: with no write in the region it stays pending, and once every
+    flag it defines is overwritten before the next boundary it is dropped.
+    """
+    if summary is None:
+        return flag_region.SETTLE
+    reads, writes, must = summary
+    need = reads | live if not writes else reads | live | (flag_region.ALL_FLAGS - must)
+    if not need:
+        return flag_region.REMOVE if not writes else flag_region.DROP
+    if need == flag_region.ALL_FLAGS:
+        return flag_region.SETTLE
+    return ("x86_cc_settle_mask" if not writes else "x86_cc_settle_or_drop", need)
 
 
 def ssa_settle_plan(cgi, flag_off_name):
     """Per-site lazy-flag decisions for one SSA body.
 
     Returns ``(entry, calls)``: the decision at the body entry and a mapping
-    from each call instruction index to the post-call decision.  The
-    classification is over the codegen ops, so it matches what the emitter
-    actually materialises: an eager seam is an observer, a call is a normal
-    region boundary, and unknown forms settle.
+    from each call instruction index to the post-call region summary
+    (`flag_region.summarize`), which `call_cc_action` turns into a decision.
+    The classification is over the codegen ops, so it matches what the
+    emitter actually materialises: an eager seam is an observer, a call is a
+    normal region boundary, and unknown forms settle.
     """
     n = len(cgi.insns)
 
@@ -349,27 +389,27 @@ def ssa_settle_plan(cgi, flag_off_name):
     def is_end(i):
         return cgi.insns[i].mnem.upper() in ("CALL", "RET")
 
-    def classify(start):
-        return flag_region.analyze(start, successors, access, is_end,
-                                   lambda i: False, n)
+    def summarize(start):
+        return flag_region.summarize(start, successors, access, is_end,
+                                     lambda i: False, n)
 
     indices = {ins.addr: k for k, ins in enumerate(cgi.insns)}
     start = indices.get(cgi.addr)
-    entry = classify(start) if start is not None else flag_region.SETTLE
+    entry = flag_region.SETTLE
+    if start is not None:
+        found = summarize(start)
+        entry = flag_region.SETTLE if found is None else flag_region.decision(*found)
     calls = {}
     for i, ins in enumerate(cgi.insns):
         if ins.mnem.upper() != "CALL":
             continue
         after = successors(i)
-        if not after:
-            calls[i] = flag_region.SETTLE
-        else:
-            calls[i] = classify(after[0])
+        calls[i] = summarize(after[0]) if after else None
     return entry, calls
 
 
-def live_flag_reload_calls(s, live, flag_keys):
-    """Block indices whose call leaves a live arithmetic-flag reload.
+def live_flag_reload_calls(s, live, flag_off_name):
+    """Block index -> flags whose post-call reload is live.
 
     The SSA builder replaces every tracked flag with a fresh ``CALL_RELOAD``
     of the callee's fields after a call.  ``simplify`` keeps only the live,
@@ -378,18 +418,17 @@ def live_flag_reload_calls(s, live, flag_keys):
     can be live because a guest instruction later reads it, because a RET
     publishes it, or because a following call's publication snapshot (a
     callee that reads or preserves flags) roots it.  Only the call that owns
-    such a reload needs to materialise the descriptor; its neighbours keep
-    their region decision.
+    such a reload needs its flags materialised; its neighbours keep their
+    region decision.
     """
-    calls = set()
+    calls = {}
     for index, block in s.blocks.items():
         if not any(v.opc in ("CALL", "CALLIND") for v in block.ops):
             continue
         for v in block.ops:
-            if (v.opc == "CALL_RELOAD" and v.data in flag_keys
+            if (v.opc == "CALL_RELOAD" and v.data[0] == "register" and v.data[1] in flag_off_name
                     and v.id in live and s.resolve(v) is v):
-                calls.add(index)
-                break
+                calls.setdefault(index, set()).add(flag_off_name[v.data[1]])
     return calls
 
 
@@ -422,13 +461,16 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     conservative publication.
 
     `call_contracts` maps a direct-call target address to a contract
-    (``reads``/``kills`` field sets, e.g. from ``call_contracts.py``). When
-    given, a direct CALL drops publication of a field the callee neither reads
-    nor preserves (``F not in reads and F in kills``). A preserved field is
-    never dropped: its CPU value can still flow out to this body's caller even
-    when this body does not read it back. The mapping is plain data so it
-    survives the emission process pool; a missing target keeps the conservative
-    full publication. ESP/EBP are never dropped.
+    (``reads``/``kills``/``writes`` field sets, e.g. from ``call_contracts.py``).
+    When given, a direct CALL drops publication of a field the callee neither
+    reads nor preserves (``F not in reads and F in kills``). A field the callee
+    neither reads nor writes is kept: it is not published, and the caller's
+    value continues past the call, so it is published later wherever the plan
+    still requires it. Flags are kept only all six together, so a pending
+    descriptor passes through untouched. Bodies with SEH effects keep nothing.
+    The mapping is plain data so it survives the emission process pool; a
+    missing target keeps the conservative full publication. ESP/EBP are never
+    dropped or kept.
 
     `x87_cw_clone` (the `x87_cw_clone` setting) emits a performance body with
     at least `CW_CLONE_MIN_OPS` precision/rounding-sensitive x87 operations,
@@ -521,6 +563,17 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
             key = ("register", off + n)
             lane_field[key] = name
             field_lanes.setdefault(name, set()).add(key)
+    kept_fields = {}
+    if call_contracts and not fir.seh:
+        for target, contract in call_contracts.items():
+            fields_ = {field for field in CONTRACT_FIELDS
+                       if field not in CONTRACT_NEVER_SKIP and field not in contract.reads
+                       and field not in contract.writes}
+            if not set(CONTRACT_FLAGS) <= fields_:
+                fields_ -= set(CONTRACT_FLAGS)
+            if fields_:
+                kept_fields[target] = frozenset(
+                    key for field in fields_ for key in field_lanes[field])
     tail_symbols = dict(tail_symbols or {})
     seh_mark = any("orphan" in kinds for kinds in fir.seh.values())
     cgi = codegen_ir(fir, lifter, tail_symbols)
@@ -534,7 +587,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     s = build(cgi,
               register_groups=groups,
               call_targets=call_symbols, indirect_call_symbol=indirect_call_symbol,
-              flag_off_name=flag_off_name)
+              flag_off_name=flag_off_name, kept_calls=kept_fields)
     if any(key != MEMORY and key not in mapping for key in s.inputs):
         raise SSAError("unmapped runtime register")
     canonicalize(s)
@@ -550,8 +603,10 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     # assembly helpers can return flags or consume incoming flags.
     # Keep flag publication at calls/returns until actual call
     # summaries prove which fields a boundary does not observe.
+    kept_calls = {v.id: kept_fields[v.data] for b in s.blocks.values() for v in b.ops
+                  if v.opc == "CALL" and v.data in kept_fields}
     publications = plan(s, fir.succ, groups, access_fields=access_fields,
-                        reloaded=set(mapping) - flag_keys)
+                        reloaded=set(mapping) - flag_keys, kept=kept_calls)
     # Cross-function contracts: a direct CALL may omit publication of a field
     # the callee neither reads nor preserves.  A field the callee preserves is
     # not droppable even when this body does not read it back: the field's CPU
@@ -572,14 +627,17 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     if field in CONTRACT_NEVER_SKIP or field in reads or field not in kills:
                         continue
                     skipped.add(field)
-                if not skipped:
+                kept = tuple(key for key in kept_calls.get(v.id, ()) if key in s.inputs)
+                if not skipped and not kept:
                     continue
-                contract_skip[v.id] = skipped
-                # A mod hook installed on the callee at runtime observes the
-                # full CPU, so the dropped fields stay publishable behind
-                # recomp_hooks_ever; keep their values live for that path.
+                if skipped:
+                    contract_skip[v.id] = skipped
+                # A mod hook installed on the callee at runtime observes and may
+                # rewrite the full CPU, so dropped and kept fields stay
+                # publishable behind recomp_hooks_ever, and a kept field is
+                # reread there after the call; keep their values live.
                 guarded = tuple(key for key in publications[v.id]
-                                if lane_field.get(key) in skipped)
+                                if lane_field.get(key) in skipped) + kept
                 contract_guard[v.id] = guarded
                 state = b.snapshots[v.id]
                 contract_roots.extend(state_roots(s, state, guarded, groups))
@@ -616,25 +674,21 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     # A callee-state read with no use is dropped; that also confines post-call
     # settles to reloads whose value is needed.
     live = simplify(s, publications, canonical=False, extra_roots=cc_roots + contract_roots,
-                    removable=frozenset(("CALL_RELOAD",)), groups=groups)
+                    removable=frozenset(("CALL_RELOAD", "CALL_KEEP")), groups=groups)
     reads_entry_flags = any(
         v.opc == "INPUT" and v.data in flag_keys and v.id in live and s.resolve(v) is v
         for v in s.values)
-    reads_after_call = any(
-        v.opc == "CALL_RELOAD" and v.data in flag_keys and v.id in live
-        and s.resolve(v) is v
-        for v in s.values)
-    if lazy_flags and reads_after_call:
-        # Only the call whose flag reload is needed materialises the callee's
-        # descriptor: that reload reads the fields directly, right after the
-        # site's settle.  A call whose flag reload is dead (shadowed by a
-        # later call or a region that overwrites all six) keeps its region
-        # decision.  This matters for a reload that is needed only as a
-        # following call's publication root: a callee that reads or preserves
-        # flags forces the caller to publish the fields before that call, so
-        # the earlier reload must not read a stale field.
-        for index in live_flag_reload_calls(s, live, flag_keys):
-            cc_calls[index] = flag_region.SETTLE
+    if lazy_flags:
+        # A post-call reload reads the flag fields directly, right after the
+        # site's action, so the action materialises a descriptor that defines
+        # one of them. A reload can be live only as a following call's
+        # publication root: a callee that reads or preserves flags forces the
+        # caller to publish the fields before that call, so the earlier reload
+        # must not read a stale field. A call whose flag reload is dead
+        # (shadowed by a later call or overwritten) keeps its region decision.
+        reloads = live_flag_reload_calls(s, live, flag_off_name)
+        cc_calls = {i: call_cc_action(summary, frozenset(reloads.get(i, ())))
+                    for i, summary in cc_calls.items()}
     if reads_entry_flags or fir.entries:
         # The SSA builder loads live entry flag INPUTs straight from the fields,
         # immediately after the entry settle.  Those loads are not codegen ops,
@@ -782,7 +836,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                 continue
             m = v.data["mnem"]
             if (m.rstrip("P") in x87.ARITH or m.rstrip("P") in x87.INTEGER_ARITH
-                    or m in ("FSQRT", "FRNDINT")
+                    or m in ("FSQRT", "FRNDINT", "FIST", "FISTP")
                     or (v.opc == "X87_MEM" and m in ("FST", "FSTP"))):
                 cw_sensitive += 1
     # The clone duplicates the integer code too; a mostly-integer body
@@ -1001,6 +1055,8 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     lines.extend(publish(b.snapshots[v.id], v))
                     if contract_guard.get(v.id):
                         guarded = store_fields(b.snapshots[v.id], contract_guard[v.id])
+                        if lazy_flags and any(key in flag_keys for key in kept_calls.get(v.id, ())):
+                            guarded.append("c->cc_op = X86_CC_NONE;")
                         lines.append("if (RECOMP_UNLIKELY(recomp_hooks_ever)) {")
                         lines.extend(guarded)
                         lines.append("}")
@@ -1016,6 +1072,15 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     # Complete, callee-agnostic reload of one mapped state field.
                     field, lane = mapping[v.data]
                     lines.append("v%d = (%s >> %d) & %s;" % (v.id, field, lane * 8, mask(v.size)))
+                elif v.opc == "CALL_KEEP":
+                    field, lane = mapping[v.data]
+                    lanes = v.args[1:]
+                    source = whole(s, lanes) if len(lanes) > 1 else None
+                    kept = ref(source) if source is not None else " | ".join(
+                        "(%s << %d)" % (ref(x), n * 8) for n, x in enumerate(lanes))
+                    settle = "x86_cc_settle(c), " if lazy_flags and field in FLAG_FIELDS else ""
+                    lines.append("v%d = RECOMP_UNLIKELY(recomp_hooks_ever) ? (%s(%s >> %d) & %s) : (%s);"
+                                 % (v.id, settle, field, lane * 8, mask(v.size), kept))
                 elif v.opc == "CALLIND":
                     lines.extend(flush_x87())
                     scalar.reset()

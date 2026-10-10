@@ -8,23 +8,23 @@ from .lift import Op
 from .ssa import SSAError
 
 
-def memory_arithmetic(ins, lifter):
+def read_modify_write(ins, lifter, correct):
     """Correct SLEIGH's repeated reads for one memory RMW instruction.
 
     The baseline reads the operand once and performs the guest store before
-    publishing arithmetic flags. Capture the value once, replace SLEIGH's
-    repeated operand reloads, and defer flag writes until after the store.
-    No inter-instruction forwarding or memory-alias inference is involved.
+    publishing flags. Capture the value once, replace SLEIGH's repeated operand
+    reloads, apply `correct(ins, operand)` and defer flag writes until after the
+    store. No inter-instruction forwarding or memory-alias inference is involved.
     """
     stores = [op for op in ins.ops if op.opc == "STORE"]
     if not stores:
-        return arithmetic(ins, lifter)
+        return correct(ins, None)
     loads = [op for op in ins.ops if op.opc == "LOAD"]
     if len(stores) != 1 or not loads or any(op.ins != loads[0].ins or op.out != loads[0].out for op in loads):
-        raise SSAError("%08x: unsupported arithmetic memory operand shape" % ins.addr)
+        raise SSAError("%08x: unsupported read-modify-write memory operand shape" % ins.addr)
     store = stores[0]
     if store.ins[0] != loads[0].ins[0] or store.ins[1][2] != loads[0].out[2]:
-        raise SSAError("%08x: arithmetic memory addresses disagree" % ins.addr)
+        raise SSAError("%08x: read-modify-write memory addresses disagree" % ins.addr)
     old = lifter.fresh_unique(loads[0].out[2])
     stored = lifter.fresh_unique(store.ins[1][2])
     ops, seen_load, seen_store = [], False, False
@@ -40,10 +40,9 @@ def memory_arithmetic(ins, lifter):
             seen_store = True
         else:
             ops.append(op)
-    # Select the arithmetic write to the operand temporary, not an address add.
     from .lift import Insn
     corrected = Insn(ins.addr, ins.length, ins.mnem, ops, 0, False, False, [], ins.raw)
-    ops = arithmetic(corrected, lifter, result_node=loads[0].out)
+    ops = correct(corrected, loads[0].out)
     flags = {lifter.register(name) for name in ("CF", "OF", "SF", "ZF", "PF", "AF")}
     names, deferred, result = {}, {}, []
     for op in ops:
@@ -107,7 +106,7 @@ def arithmetic(ins, lifter, result_node=None):
     return ops
 
 
-def shift(ins, lifter):
+def shift(ins, lifter, operand=None):
     """Retain runtime OF for nonzero SHL/SHR counts, including counts > 1.
 
     DIVERGENCE(original): OF for counts greater than one is architecturally
@@ -116,12 +115,14 @@ def shift(ins, lifter):
     """
     ops = list(ins.ops)
     opcode = "INT_LEFT" if ins.mnem.upper() == "SHL" else "INT_RIGHT"
-    shifts = [op for op in ops if op.opc == opcode and op.out[0] == "register"]
+    shifts = [op for op in ops if op.opc == opcode
+              and (op.out[0] == "register" if operand is None else op.out == operand)]
     if len(shifts) != 1 or shifts[0].out[2] not in (1, 2, 4):
-        raise SSAError("%08x: C emitter: unsupported register shift shape" % ins.addr)
+        raise SSAError("%08x: C emitter: unsupported shift shape" % ins.addr)
     op = shifts[0]
     original, old_of = lifter.fresh_unique(op.out[2]), lifter.fresh_unique(1)
-    ops[0:0] = [Op("COPY", original, [op.ins[0]]), Op("COPY", old_of, [lifter.register("OF")])]
+    ops.insert(ops.index(op), Op("COPY", original, [op.ins[0]]))
+    ops[0:0] = [Op("COPY", old_of, [lifter.register("OF")])]
     nonzero, zero, sign, changed, kept, updated = [lifter.fresh_unique(1) for _ in range(6)]
     cnt = op.ins[1]  # SLEIGH has already masked variable/immediate counts to 31.
     source = op.out if opcode == "INT_LEFT" else original

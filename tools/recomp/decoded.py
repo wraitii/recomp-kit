@@ -2274,7 +2274,8 @@ def external_exits(tr, fn):
 
     Mirrors `goto_target` and `emit_indirect_jump`: direct jumps, conditional
     jumps and decoded table cases outside the body, and a last instruction
-    that is not a terminator falling out of the span.
+    that is not a terminator falling out of the span. A computed jump without
+    a decoded table may leave for any address and maps to an empty tuple.
     """
     exits = {}
     for i, ins in enumerate(fn.insns):
@@ -2288,7 +2289,11 @@ def external_exits(tr, fn):
             if t is not None:
                 out.append(t)
             elif i not in getattr(fn, "return_jumps", ()):
-                out.extend(tr.jumptables.get((fn.addr, ins.addr)) or ())
+                table = tr.jumptables.get((fn.addr, ins.addr))
+                if not table:
+                    exits[i] = ()
+                    continue
+                out.extend(table)
         elif m.startswith("J"):
             out.append(tr.branch_target(ins))
         if m not in ("RET", "JMP") and not (i + 1 < len(fn.insns) and fn.contiguous[i]):

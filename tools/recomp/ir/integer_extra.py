@@ -30,7 +30,7 @@ EXTRA_MNEMONICS = frozenset((
 ))
 
 
-def correct(ins, lifter):
+def correct(ins, lifter, operand=None):
     """Return corrected operations for one admitted extra mnemonic."""
     mnem = ins.mnem.upper()
     if mnem == "IDIV":
@@ -38,7 +38,7 @@ def correct(ins, lifter):
     if mnem == "NEG":
         return negate(ins, lifter)
     if mnem == "SAR":
-        return shift_arithmetic(ins, lifter)
+        return shift_arithmetic(ins, lifter, operand)
     # CDQ, IMUL and SETcc: SLEIGH semantics are already expressible.
     return list(ins.ops)
 
@@ -94,19 +94,18 @@ def negate(ins, lifter):
     return ops
 
 
-def shift_arithmetic(ins, lifter):
+def shift_arithmetic(ins, lifter, operand=None):
     """Match the runtime ``sar*_f`` OF recipe and keep SLEIGH's other flags.
 
     ``sar*_f`` clears OF for every nonzero count and preserves every flag for a
     zero count. SLEIGH clears OF only for count one and preserves it otherwise,
-    which is the documented undefined-flag divergence above. Memory destinations
-    stay unsupported.
+    which is the documented undefined-flag divergence above. A memory
+    destination is the read-modify-write `operand`.
     """
     ops = list(ins.ops)
     shifts = [op for op in ops if op.opc == "INT_SRIGHT" and op.out is not None
-              and op.out[0] == "register"]
-    if (len(shifts) != 1 or shifts[0].out[2] not in (1, 2, 4)
-            or any(op.opc in ("LOAD", "STORE") for op in ops)):
+              and (op.out[0] == "register" if operand is None else op.out == operand)]
+    if len(shifts) != 1 or shifts[0].out[2] not in (1, 2, 4):
         raise SSAError("%08x: C emitter: unsupported SAR shape" % ins.addr)
     op = shifts[0]
     cnt = op.ins[1]

@@ -15,10 +15,19 @@ direct call: the eight GPRs and the six arithmetic flags.
     return, so a push/pop save-restore does not count as a kill even though the
     register is written: the push also reads it, which keeps it in ``reads``.
 
+``writes``
+    Fields some reachable instruction may write, including transitive callee
+    writes.  Flags count as written by any instruction outside
+    ``FLAG_FREE``, since emitted helpers may define flags SLEIGH leaves
+    undefined.
+
 At a direct CALL in an SSA body the caller may skip publishing field ``F`` iff
-``F not in callee.reads and F in callee.kills``.  A field the callee preserves
-is never dropped: its CPU value can still flow out to this body's caller even
-when this body does not read it back.
+``F not in callee.reads and F in callee.kills``.  A field outside both
+``reads`` and ``writes`` is transparent: the caller keeps its own value across
+the call instead of publishing and reloading it.
+
+SLEIGH omits AF for ADD/ADC/SUB/SBB/CMP/INC/DEC, which both emitters define,
+so those instructions add the AF write here.
 
 The analysis is conservative.  Indirect calls, CALLOTHER, unbound targets,
 failed lifts, SEH/alternate-entry/rewritten bodies, tail transfers and targets
@@ -34,11 +43,23 @@ GPRS = ("EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI")
 ARITH_FLAGS = ("CF", "PF", "AF", "ZF", "SF", "OF")
 FIELDS = GPRS + ARITH_FLAGS
 
-#: (reads, kills) field sets.  Plain data so it can cross a process boundary.
-Contract = namedtuple("Contract", ("reads", "kills"))
+#: Field sets.  Plain data so it can cross a process boundary.
+Contract = namedtuple("Contract", ("reads", "kills", "writes"), defaults=(frozenset(FIELDS),))
 
-#: reads everything, kills nothing.
-CONSERVATIVE = Contract(frozenset(FIELDS), frozenset())
+#: reads and writes everything, kills nothing.
+CONSERVATIVE = Contract(frozenset(FIELDS), frozenset(), frozenset(FIELDS))
+
+AF_WRITERS = frozenset(("ADD", "ADC", "SUB", "SBB", "CMP", "INC", "DEC"))
+FLAG_FREE = frozenset(("MOV", "MOVSX", "MOVZX", "XCHG", "NOT", "LEAVE", "LEA", "PUSH", "POP",
+                       "RET", "NOP", "CALL", "JMP", "CLD", "STD", "CDQ", "CWDE", "CBW", "WAIT"))
+FLAG_WRITING_X87 = frozenset(("FCOMI", "FCOMIP", "FUCOMI", "FUCOMIP"))
+
+
+def _flag_free(mnem):
+    mnem = mnem.upper().removeprefix("WAIT ")
+    if mnem in FLAG_FREE or mnem.startswith(("J", "SET", "CMOV")):
+        return True
+    return mnem.startswith("F") and mnem not in FLAG_WRITING_X87
 
 
 class Mapping(object):
@@ -188,13 +209,14 @@ class _Prepared(object):
     it is opaque (indirect call, CALLOTHER, unbound CALL).
     """
 
-    __slots__ = ("entry", "order", "succ", "preds", "use", "defs", "call", "returns")
+    __slots__ = ("entry", "order", "succ", "preds", "use", "defs", "call", "returns", "writes")
 
     def __init__(self, fir, cells, bits):
         indices = {ins.addr: i for i, ins in enumerate(fir.insns)}
         self.entry = indices.get(fir.addr)
         self.order, self.succ, self.preds = [], {}, {}
         self.use, self.defs, self.call, self.returns = {}, {}, {}, []
+        self.writes = 0
         if self.entry is None:
             return
         n = len(fir.insns)
@@ -232,9 +254,15 @@ class _Prepared(object):
                 target = _is_callable_target(ins)
                 if target is None:
                     unknown = True
+            if ins.mnem.upper() in AF_WRITERS:
+                defs |= bits.fields(("AF",))
+            self.writes |= defs
+            if not _flag_free(ins.mnem):
+                self.writes |= bits.fields(ARITH_FLAGS)
             if unknown:
                 use = bits.all
                 target = None
+                self.writes = bits.all
             self.use[i], self.defs[i], self.call[i] = use, defs, target
             if _is_return(ins):
                 self.returns.append(i)
@@ -269,15 +297,18 @@ def summarize(p, callee_lookup, cells=None):
     cells = cells or mapping()
     bits = _bits(cells)
     use, defs = dict(p.use), dict(p.defs)
+    writes = p.writes
     for i, target in p.call.items():
         if target is None:
             continue
         contract = callee_lookup(target)
         if contract is None:
             use[i] = bits.all
+            writes = bits.all
         else:
             use[i] |= bits.fields(contract.reads)
             defs[i] |= bits.fields(contract.kills)
+            writes |= bits.fields(contract.writes)
 
     # Backward may-liveness to the least fixed point, with a worklist.
     live_in = dict.fromkeys(p.order, 0)
@@ -325,13 +356,13 @@ def summarize(p, callee_lookup, cells=None):
     reads = frozenset(f for f in FIELDS if live_in[p.entry] & bits.field_bits[f])
     kills = frozenset(f for f in FIELDS
                       if killed & bits.field_bits[f] == bits.field_bits[f])
-    return Contract(reads, kills)
+    return Contract(reads, kills, frozenset(f for f in FIELDS if writes & bits.field_bits[f]))
 
 
 def cfg_is_closed(fir):
     """False for a body whose control can leave without a modeled edge.
 
-    Tail jumps, unresolved computed jumps and calls with no fallthrough are
+    Tail jumps, computed jumps without a decoded table and calls with no fallthrough are
     conservatively outside this model.
     """
     for i, ins in enumerate(fir.insns):
@@ -348,8 +379,6 @@ def cfg_is_closed(fir):
         elif mnem == "CALL":
             if not succ:
                 return False
-        elif mnem == "BRANCHIND" and i not in fir.tables:
-            return False
         elif not succ and not _is_return(ins):
             return False
     return True
@@ -388,7 +417,7 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None):
         # Sound bottom for both analyses: the may-liveness least fixed point and
         # the must-definite least fixed point (the strongest sound under-
         # approximation, which only makes the caller publish more).
-        live = {a: Contract(frozenset(), frozenset()) for a in comp if a in firs}
+        live = {a: Contract(frozenset(), frozenset(), frozenset()) for a in comp if a in firs}
 
         def lookup(target, live=live):
             if target in contracts:
@@ -418,7 +447,7 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None):
                     continue
                 new = summarize(firs[addr], lookup, cells)
                 current = live.get(addr)
-                if current is None or new.reads != current.reads or new.kills != current.kills:
+                if current is None or new != current:
                     live[addr] = new
                     changed = True
             if not changed:
