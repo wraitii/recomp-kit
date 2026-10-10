@@ -211,14 +211,23 @@ fully published ordinary checked entry. Exact fault-state mode and auxiliary
 modules retain ordinary entries. Guest accesses and the complete existing x87
 materialization policy remain in place; x87 field contracts are a later stage.
 
-`transfer_plan.py` separates call publication, hook guards, ordinary fallback
-requirements and continuation outputs from C emission. `publication.analyze`
+`transfer_plan.py` owns call and return publications, hook guards, ordinary
+fallbacks, flag recipes, continuation outputs and liveness roots. `publication.analyze`
 exposes pre-event facts as well as required stores; ordinary fallbacks retain
 only unproven integer fields, while flags remain explicit because a published
 recipe can leave their physical CPU fields stale. Fallbacks and unexpected RETs
 have separate flag publication plans, preserving proven lazy descriptors.
-Private variant requests are structured emission results; discarded emissions
-do not register variants. The cleanup sequence is in [contract-cleanup.md](contract-cleanup.md).
+Private variant requests drive both body declarations and variant generation;
+discarded emissions do not register variants or diagnostic decisions.
+`contract-report.json` records selected callers, private output masks, call-site
+publication decisions and SSA fallback reasons in the generated directory.
+
+Private entry preparation combines eligibility with the checkpoint countdown.
+A successful preparation decrements a nonzero countdown once; the private
+thunk then tail-calls its body. A rejection leaves the countdown untouched and
+the fully published ordinary entry owns the checkpoint, including due polling.
+Hooks, profiling, frame watches and replacements retain that ordinary path.
+The cleanup sequence is in [contract-cleanup.md](contract-cleanup.md).
 
 ### Policies
 

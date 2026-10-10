@@ -36,7 +36,7 @@ def exclusion(fn):
     return None
 
 
-def emit_ssa(tr, lifter, fn, entries, common, known, contracts, checked_returns=(), contract_calls=()):
+def emit_ssa(tr, lifter, fn, entries, common, known, contracts, checked_returns=(), contract_calls=(), report_calls=False):
     """The SSA body of `fn` as C lines, with its wrappers when other code can enter it.
 
     Raises SSAError or LiftError for a shape that stays decoded."""
@@ -58,10 +58,11 @@ def emit_ssa(tr, lifter, fn, entries, common, known, contracts, checked_returns=
     options["checked_return"] = checked
     options["checked_calls"] = set(calls) & set(checked_returns)
     options["contract_calls"] = set(calls) & set(contract_calls) if not fir.entries and not fir.seh else ()
-    variant_requests = set()
+    variant_requests, call_decisions = set(), []
     symbol = ("body_checked_%08x" if checked else "body_%08x" if fir.entries else "fn_%08x") % fn.addr
     try:
-        source = emit(fir, symbol, lifter=lifter, variant_requests=variant_requests, **options)
+        source = emit(fir, symbol, lifter=lifter, variant_requests=variant_requests,
+                      call_decisions=call_decisions if report_calls else None, **options)
     except RecursionError:
         raise SSAError("SSA graph recursion budget")
     source = re.sub(r"\bentry_([0-9a-f]{8})\(c\);", r"CALL_FN(\1);", source)
@@ -76,7 +77,7 @@ def emit_ssa(tr, lifter, fn, entries, common, known, contracts, checked_returns=
         lines.append("void fn_%08x(X86 *c) { body_%08x(c, 0u); }" % (fn.addr, fn.addr))
         lines += ["void fn_%08x(X86 *c) { body_%08x(c, 0x%xu); }" % (e, fn.addr, e)
                   for e in fir.entries]
-    return lines, fir.entries, variant_requests
+    return lines, fir.entries, variant_requests, call_decisions
 
 
 def emit_private(tr, lifter, fn, common, masks):

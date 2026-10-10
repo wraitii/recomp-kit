@@ -22,8 +22,8 @@ hooks and profiling retain the ordinary entry. Set `checked_returns = []` under
 `[translate]` and regenerate to disable the pilot. Savings across the conversion call's
 state transfer are piloted separately below; scratch memory remains translated.
 
-The integer-state pilot is disabled pending cleanup and a demonstrated workload
-gain. Its reviewed callers are `0x0042c1b0` and `0x0042ce00`, selected through
+The experimental integer-state pilot selects the reviewed callers
+`0x0042c1b0` and `0x0042ce00` through
 `state_contract_callers`. Their conversion edges require EAX, ESP and EBP on
 normal continuation, with AF retained at sites where it remains
 observable; EIP and all existing x87 state remain published. Private
@@ -39,4 +39,7 @@ differences. The ordinary entry still has the baseline's 96 original-byte
 rounding discrepancies. Random-input diff coverage reached valid returns in
 `0x005a10d0` and `0x0042c1b0`, including hook-enabled ordinary fallback, but not
 `0x0042ce00`. Cleanup removes fallback parity reductions in the private leaf
-assembly and reduces caller stack frames; eligibility/checkpoint costs remain.
+assembly and reduces caller stack frames. Eligibility and checkpoint preparation
+share one policy call; private entry thunks tail-call their bodies. Workload
+measurement uses host sampling with `RECOMP_PROFILE` unset or `0`, since the
+built-in guest profiler selects ordinary fallback. No workload gain is established.

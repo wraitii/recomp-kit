@@ -167,7 +167,7 @@ def _emit(task):
         tr.unmodelled.clear()
         fn, entries = ctx.load(addr)
         tr.analyze(fn, entries)
-        lines, wrappers, variant_requests = None, False, set()
+        lines, wrappers, variant_requests, call_decisions = None, False, set(), []
         reason = "decoded-only code map" if ctx.decoded_only else production.exclusion(fn)
         if reason is None:
             try:
@@ -175,10 +175,10 @@ def _emit(task):
                 callee_contracts = dict(contracts.get(addr) or {})
                 if selected:
                     callee_contracts.update(private_targets)
-                lines, external, variant_requests = production.emit_ssa(
+                lines, external, variant_requests, call_decisions = production.emit_ssa(
                     tr, ctx.lifter, fn, entries, ctx.settings.emit, ctx.known, callee_contracts,
                     ctx.settings.checked_returns,
-                    private_targets if selected else ())
+                    private_targets if selected else (), report_calls=selected)
             except (SSAError, LiftError) as error:
                 reason = str(error)
             else:
@@ -188,16 +188,16 @@ def _emit(task):
             head = "void fn_%08x(X86 *c) {" % addr
             kept = [line for line in decoded if not line.startswith(head)]
             if len(kept) != len(decoded) - 1:
-                reason, lines, variant_requests = "entry wrapper layout", None, set()
+                reason, lines, variant_requests, call_decisions = "entry wrapper layout", None, set(), []
             else:
                 lines = kept + lines
         if lines is None:
             if addr in ctx.settings.checked_returns:
                 raise TranslateError("%08x: checked-return body failed SSA emission: %s" % (addr, reason))
             lines = tr.translate(fn, entries)
-            variant_requests = set()
+            variant_requests, call_decisions = set(), []
         out.append((addr, lines, re.sub(r"^[0-9a-f]{8}: ", "", reason) if reason else None,
-                    list(tr.unmodelled), variant_requests))
+                    list(tr.unmodelled), variant_requests, call_decisions))
     return out
 
 
@@ -391,7 +391,10 @@ def main(argv=None):
                 results[row[0]] = row
         phase("emit")
         private_masks = {}
+        private_requests = {}
         for row in results.values():
+            if row[4]:
+                private_requests[row[0]] = set(row[4])
             for addr, mask in row[4]:
                 private_masks.setdefault(addr, set()).add(mask)
         for addr, lines in pool.map(_private, sorted(private_masks.items())):
@@ -405,7 +408,7 @@ def main(argv=None):
     functions = [rows[a] for a in addrs]
     os.makedirs(args.out, exist_ok=True)
     output.write_funcs_header(args.out, entry_names)
-    output.emit_body_chunks(args.out, functions, bodies, entries_by_fn)
+    output.emit_body_chunks(args.out, functions, bodies, entries_by_fn, private_requests)
     output.emit_entry_chunks(args.out, entry_names, settings.module, settings.checked_returns, private_masks)
     symbols = symbol_rows(ctx, entry_names, rows)
     if settings.module:
@@ -414,6 +417,29 @@ def main(argv=None):
         output.write_table(args.out, entry_names, symbols, call_returns, bool(private_masks))
     output.write_symbols(
         args.out, str(settings.exe), ctx.image.base, symbols, settings.curated)
+    selected_callers = (set(settings.state_contract_callers)
+                        if settings.call_contracts and settings.emit["local_state"]
+                        and settings.checked_returns and not settings.module else set())
+    decisions = [decision for addr in sorted(results) if addr in selected_callers
+                 for decision in results[addr][5]]
+    decisions.sort(key=lambda item: (item.get("site", ""), item.get("target", ""),
+                                     json.dumps(item, sort_keys=True, separators=(",", ":"))))
+    contract_report = {
+        "configured_callers": ["%08x" % a for a in sorted(settings.state_contract_callers)],
+        "selected_callers": ["%08x" % a for a in sorted(selected_callers)],
+        "checked_targets": ["%08x" % a for a in sorted(settings.checked_returns)],
+        "private_variants": [
+            {"target": "%08x" % addr, "mask": "%04x" % mask,
+             "fields": [field for i, field in enumerate(call_contracts.FIELDS) if mask & (1 << i)]}
+            for addr in sorted(private_masks) for mask in sorted(private_masks[addr])],
+        "ssa_fallbacks": [
+            {"function": "%08x" % addr, "reason": results[addr][2]}
+            for addr in sorted(results) if results[addr][2] is not None],
+        "call_decisions": decisions,
+    }
+    with open(os.path.join(args.out, "contract-report.json"), "w") as fh:
+        json.dump(contract_report, fh, sort_keys=True, indent=1)
+        fh.write("\n")
     phase("write")
 
     emitted = sum(1 for a in addrs if results[a][2] is None)

@@ -1,7 +1,7 @@
 # State contract cleanup
 
-Keep checked returns enabled and set `state_contract_callers = []` while the
-private integer-state path remains experimental. Preserve the two reviewed
+Keep checked returns enabled. The private integer-state path remains experimental;
+the same two reviewed callers are re-enabled for workload measurement. Preserve those
 callers as the validation scope; do not expand to x87 contracts or change guest
 memory accesses.
 
@@ -13,14 +13,21 @@ memory accesses.
 3. **Implemented:** plan lazy-flag publication separately for ordinary fallbacks and unexpected
    returns. Preserve descriptors where proven so fallback-only arithmetic does
    not become unconditional work. Keep eager flags where no recipe is proven.
-4. **Validated:** regenerate and validate against original bytes and ordinary entries. Temporarily
-   re-enable the same callers to exercise private variants and unexpected RETs;
-   inspect emitted host assembly, then leave the checked-return-only app built.
+4. **Validated:** regenerate and validate against original bytes and ordinary entries.
+   Exercise private variants and unexpected RETs, inspect emitted host assembly
+   and rebuild the windowed app. Keep the same two callers as the measurement scope.
 
 Use the function diff harness and existing rounding comparisons. Record discarded
 inputs and inherited discrepancies separately from new failures. Build through
 the game wrapper with `--target app`; workload capture belongs to the user.
 
-After this cleanup, fuse eligibility/checkpoint policy and evaluate the same two
-callers before expansion. A profile gain is still required; this refactor alone
-does not establish one.
+Follow-up cleanups consolidate complete transfer plans, use structured private
+declaration dependencies and emit `contract-report.json`. Eligibility and
+checkpoint preparation are fused; successful private entries decrement once
+and tail-call the leaf, while rejected entries leave polling to the ordinary
+path. Ordinary generated bodies remain unchanged with the pilot disabled.
+
+Evaluate the same two callers before expansion. Use host sampling with
+`RECOMP_PROFILE` unset or `0`: the built-in guest profiler selects ordinary
+fallbacks. A profile gain is still required; this refactor alone does not
+establish one.
