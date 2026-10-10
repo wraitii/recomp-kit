@@ -36,6 +36,7 @@ class Settings(object):
         if self.module:
             self.native_header = None
         self.call_contracts = translate["call_contracts"]
+        self.checked_returns = frozenset(translate["checked_returns"]) if not self.module else frozenset()
         self.allow_unmodelled = allow_unmodelled
         self.jobs = jobs
         relaxed = translate["fault_state"] == "relaxed"

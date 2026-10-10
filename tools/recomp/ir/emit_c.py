@@ -455,7 +455,8 @@ CW_CLONE_MAX_GUARDS = 1
 
 def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state=True,
          msvc_convention=True, lazy_flags=False, lifter=None, indirect_call_symbol=None,
-         call_contracts=None, x87_cw_clone=True, tail_symbols=None):
+         call_contracts=None, x87_cw_clone=True, tail_symbols=None,
+         checked_return=False, checked_calls=()):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
     `call_symbols` maps an allowed direct-call target address to the C symbol
@@ -484,6 +485,11 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     missing target keeps the conservative full publication. ESP/EBP are never
     dropped or kept.
 
+    `checked_calls` selects bound symbols that take the decoded guest
+    continuation as a second argument. `checked_return` emits a shared body
+    with explicit expected-continuation and enable arguments; its ordinary
+    wrapper disables the comparison, preserving general return handling.
+
     `x87_cw_clone` (the `x87_cw_clone` setting) emits a performance body with
     at least `CW_CLONE_MIN_OPS` precision/rounding-sensitive x87 operations,
     and one per `CW_CLONE_DENSITY` instructions, whose fast clone guards at
@@ -495,6 +501,9 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     x87 never clones.
     """
     arguments = dict(locals())
+    checked_calls = frozenset(checked_calls)
+    if checked_return and (fir.entries or fir.seh or fir.exits):
+        raise SSAError("checked return requires a single-entry closed body without SEH")
     if not symbol.isidentifier() or not symbol.isascii():
         raise SSAError("invalid C symbol")
     # The register model and operand corrections are immutable across bodies.
@@ -516,6 +525,8 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
         if not isinstance(name, str) or not name.isidentifier() or not name.isascii():
             raise SSAError("invalid call symbol %r for target %08x" % (name, target))
         call_symbols[target] = name
+    if not checked_calls <= call_symbols.keys():
+        raise SSAError("checked calls require bound direct-call symbols")
     if indirect_call_symbol is not None and (
             not isinstance(indirect_call_symbol, str)
             or not indirect_call_symbol.isidentifier()
@@ -869,7 +880,8 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
               else (None,))
     block_label = "F" if clones[0] == "fast" else "B"
 
-    lines = ["static void %s(X86 *c, uint32_t entry_) {" % symbol if fir.entries
+    lines = ["static void %s(X86 *c, uint32_t expected_return_, int checked_return_) {" % symbol if checked_return
+             else "static void %s(X86 *c, uint32_t entry_) {" % symbol if fir.entries
              else "void %s(X86 *c) {" % symbol]
     for v in s.values:
         if v.id in live and v.size and v.opc not in ("CONST", "TARGET", "CC_KIND") and s.resolve(v) is v:
@@ -1086,7 +1098,10 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     if name is None:
                         raise SSAError("%08x: no C symbol bound for call target %08x"
                                        % (b.insn.addr, v.data))
-                    lines.append("%s(c);" % name)
+                    if v.data in checked_calls:
+                        lines.append("%s(c, 0x%xu);" % (name, b.insn.addr + b.insn.length))
+                    else:
+                        lines.append("%s(c);" % name)
                     if lazy_flags:
                         # A callee (SSA or otherwise) may leave a pending descriptor.
                         lines.extend(cc_action_lines(cc_calls.get(b.index)))
@@ -1144,7 +1159,11 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                 elif v.opc == "RETURN":
                     lines.extend(flush_x87())
                     lines.extend(publish(b.exit, v))
-                    lines.extend(["recomp_return(c);", "return;"])
+                    if checked_return:
+                        lines.append("if (!checked_return_ || c->eip != expected_return_) recomp_return(c);")
+                    else:
+                        lines.append("recomp_return(c);")
+                    lines.append("return;")
                 elif v.opc == "SEH":
                     lines.extend(publish(b.snapshots[v.id], v))
                     lines.extend(seh_lines(v.data["kind"], v.data["eip"]))

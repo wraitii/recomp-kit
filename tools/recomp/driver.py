@@ -158,7 +158,8 @@ def _emit(task):
         if reason is None:
             try:
                 lines, external = production.emit_ssa(
-                    tr, ctx.lifter, fn, entries, ctx.settings.emit, ctx.known, contracts.get(addr))
+                    tr, ctx.lifter, fn, entries, ctx.settings.emit, ctx.known, contracts.get(addr),
+                    ctx.settings.checked_returns)
             except (SSAError, LiftError) as error:
                 reason = str(error)
             else:
@@ -172,6 +173,8 @@ def _emit(task):
             else:
                 lines = kept + lines
         if lines is None:
+            if addr in ctx.settings.checked_returns:
+                raise TranslateError("%08x: checked-return body failed SSA emission: %s" % (addr, reason))
             lines = tr.translate(fn, entries)
         out.append((addr, lines, re.sub(r"^[0-9a-f]{8}: ", "", reason) if reason else None,
                     list(tr.unmodelled)))
@@ -327,6 +330,10 @@ def main(argv=None):
                 "(function or referenced entry), re-export the code map and regenerate" % len(dangling))
 
         conservative = native_replaced(settings)
+        for addr in settings.checked_returns:
+            row = scanned.get(addr)
+            if not row or not row[8] or row[6] is not None or addr in helpers or addr in conservative:
+                raise TranslateError("%08x: checked return requires an unreplaced, closed single-entry body without SEH" % addr)
         contracts = {}
         if settings.call_contracts:
             prepared = {addr: row[8] or None for addr, row in scanned.items()}
@@ -357,7 +364,7 @@ def main(argv=None):
     os.makedirs(args.out, exist_ok=True)
     output.write_funcs_header(args.out, entry_names)
     output.emit_body_chunks(args.out, functions, bodies, entries_by_fn)
-    output.emit_entry_chunks(args.out, entry_names, settings.module)
+    output.emit_entry_chunks(args.out, entry_names, settings.module, settings.checked_returns)
     symbols = symbol_rows(ctx, entry_names, rows)
     if settings.module:
         output.write_module_table(args.out, entry_names, symbols, call_returns, settings.module)

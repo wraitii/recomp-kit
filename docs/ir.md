@@ -190,6 +190,16 @@ on both sides of every running call, so it rises only before guest entry: the
 loader arms it for any mod with a plugin or script, and a hook installed after
 entry without it is refused (`POP_E_STATE`).
 
+`checked_returns` admits reviewed, unreplaced single-entry SSA bodies with closed
+CFGs and no SEH. Their private direct-call entries take the continuation decoded
+from the original CALL bytes. RET still loads the guest return address, adjusts
+ESP and publishes the same CPU/x87 state; a matching continuation skips
+`recomp_return`, while a mismatch uses it unchanged. Ordinary entries remain for
+indirect calls and callbacks. Checked entry thunks retain scheduler checkpoints,
+frame checks, profiling and hooks; a changed base dispatch selects the ordinary
+replacement. Auxiliary modules currently retain ordinary entries. An empty list
+restores ordinary calls throughout the image.
+
 ### Policies
 
 | `[translate]` key | Default | Effect |
@@ -198,6 +208,7 @@ entry without it is refused (`POP_E_STATE`).
 | `msvc_x87_convention` | `true` | Every register above TOP is tagged empty, so popped residue is not published at calls and returns. Flags stay exact: CRT helpers return and consume flags. FINCSTP/FDECSTP bodies keep the exact flush. `false` publishes complete x87 state |
 | `x87_cw_clone` | `true` | `false` emits only the general body |
 | `call_contracts` | `true` | `false` restores full publication at calls |
+| `checked_returns` | `[]` | Addresses given private direct-call entries with checked guest continuations |
 
 A `RECOMP_NULL_CHECKS=1` build exposes CPU state to fault dispatch: translate it
 with `fault_state = "exact"` and `msvc_x87_convention = false`.

@@ -17,6 +17,7 @@ store_hooks = false
 # The public map holds Ghidra boundaries and control-flow addresses. Translation
 # decodes the original executable bytes; no instruction contents are published.
 code_map = "metadata"
+checked_returns = [0x005a10d0]
 
 [render]
 d3d8_wgpu = true
