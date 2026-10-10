@@ -378,6 +378,13 @@ FCMOVCC = {"FCMOV" + k: COND[v] for k, v in (
 
 # ------------------------------------------------------------------- image --
 
+MSVC_SEH_PROLOG = (b"\x68" + b"\0" * 4 + bytes.fromhex(
+    "64a100000000508b442410896c24108d6c24102be05356578b45f88965e8508b45fc"
+    "c745fcffffffff8945f88d45f064a300000000c3"))
+MSVC_SEH_PROLOG = tuple(None if 1 <= i <= 4 else b for i, b in enumerate(MSVC_SEH_PROLOG))
+MSVC_SEH_EPILOG = tuple(bytes.fromhex("8b4df064890d00000000595f5e5bc951c3"))
+
+
 class Image(PE):
     """The program's bytes with a Capstone decoder over them."""
 
@@ -410,6 +417,26 @@ class Image(PE):
                     stub = candidate
             self._seh_constructor_cache[va] = stub
         return self._seh_constructor_cache[va]
+
+    def code_matches(self, va, pattern):
+        """Do the executable bytes at va equal pattern, with None as one wildcard byte?"""
+        if not self.is_exec(va) or not self.is_exec(va + len(pattern) - 1):
+            return False
+        code = self.data[va - self.base:va - self.base + len(pattern)]
+        return len(code) == len(pattern) and all(p is None or p == b
+                                                 for p, b in zip(pattern, code))
+
+    def msvc_seh_prolog(self, va):
+        """Return the handler pushed by MSVC's __SEH_prolog, which links the
+        caller's EH3 record through EAX and returns with it published."""
+        if self.code_matches(va, MSVC_SEH_PROLOG):
+            handler = self.rd32(va + 1)
+            if self.is_exec(handler):
+                return handler
+        return None
+
+    def msvc_seh_epilog(self, va):
+        return self.code_matches(va, MSVC_SEH_EPILOG)
 
 
 
@@ -593,6 +620,11 @@ def seh_restore_sites(fn):
 def seh_frame_sites(fn, image=None):
     """Map establishing MOV/helper CALL indices to their handler addresses."""
     sites = {}
+    prolog = getattr(image, "msvc_seh_prolog", None)
+    handler = prolog(fn.addr) if prolog is not None else None
+    if handler is not None:
+        publish = fn.addr + len(MSVC_SEH_PROLOG) - 7
+        sites.update({i: handler for i, ins in enumerate(fn.insns) if ins.addr == publish})
     helper = getattr(image, "seh_constructor_helper", None)
     if helper is not None:
         stub = helper(fn.addr)
@@ -704,7 +736,7 @@ class Translator(object):
             if i in fn.seh_sites or (ins.mnem == "CALL" and
                                     self.branch_target(ins) in self.seh_helpers):
                 active = True
-            elif i in fn.seh_restores:
+            elif i in fn.seh_restores or self.calls_seh_epilog(ins):
                 active = False
             if i in returns or (ins.mnem == "RET" and self.push_ret_target(fn, i) is None):
                 if active:
@@ -714,14 +746,33 @@ class Translator(object):
             work.extend((j, active) for j in self.successors(fn, i))
         return escapes
 
+    def calls_seh_epilog(self, ins):
+        if ins.mnem != "CALL":
+            return False
+        target = self.branch_target(ins)
+        return target is not None and self.image.msvc_seh_epilog(target)
+
+    @staticmethod
+    def seh_except_entry(ins):
+        """MSVC EH3/EH4 __except blocks begin by restoring ESP from the frame."""
+        if ins.mnem != "MOV" or len(ins.ops) != 2 or ins.ops[0] != "ESP":
+            return False
+        src = parse_operand(ins.ops[1])
+        return (src.kind == "mem"
+                and src.base == R_EBP and src.index is None and src.seg is None
+                and src.disp & 0xffffffff == 0xffffffe8)
+
     def seh_effects(self, fn):
         """SEH runtime effects per instruction, as the decoded emitter attaches them."""
         for i in fn.seh_sites:
             if fn.insns[i].mnem != "MOV":
                 raise LiftError("%08x: SEH frame site is not a MOV" % fn.insns[i].addr)
         effects = {}
+        unlinks = bool(fn.seh_sites) or self.image.msvc_seh_epilog(fn.addr)
         for i, ins in enumerate(fn.insns):
-            if ins.mnem == "MOV" and fn.seh_sites and len(ins.ops) == 2:
+            if self.seh_except_entry(ins):
+                effects[i] = ("landing",)
+            elif ins.mnem == "MOV" and unlinks and len(ins.ops) == 2:
                 dst, src = [parse_operand(o) for o in ins.ops]
                 if ((seh_chain_operand(dst) or i in fn.seh_sites)
                         and src.kind == "reg" and src.size == 32):
@@ -1230,8 +1281,12 @@ class Translator(object):
                 # provides; a load of CS is an invalid opcode on the CPU too.
                 # These come from data Ghidra decoded as code.
                 return ["recomp_int(c, 6u);"] if dst.imm == SEGMENT_SELECTOR["CS"] else [";"]
+            if self.seh_except_entry(ins):
+                L.append("if (recomp_seh_pending_target()) recomp_seh_intercept(c, %s);"
+                         % hexlit(ins.addr))
             L.append(write_op(dst, size, read_op(src, size)))
-            if (fn.seh_sites and (seh_chain_operand(dst) or i in fn.seh_sites)
+            unlinks = fn.seh_sites or self.image.msvc_seh_epilog(fn.addr)
+            if (unlinks and (seh_chain_operand(dst) or i in fn.seh_sites)
                     and src.kind == "reg" and src.size == 32):
                 L.append("c->eip = %s;" % hexlit(ins.addr))
                 if i in fn.seh_sites:

@@ -236,6 +236,9 @@ def seh_ops(ops, kinds, addr):
     ops = list(ops)
     for kind in kinds:
         op = Op("SEH", None, [], {"kind": kind, "eip": addr})
+        if kind == "landing":
+            ops.insert(0, op)
+            continue
         if kind != "orphan":
             ops.append(op)
             continue
@@ -256,6 +259,8 @@ def seh_lines(kind, addr):
                      "if (b_) { if (RECOMP_SETJMP(*b_)) { recomp_seh_land(c); return; } } }"]
     if kind == "leave":
         return [eip, "recomp_seh_frame_leave(c);"]
+    if kind == "landing":
+        return ["if (recomp_seh_pending_target()) recomp_seh_intercept(c, 0x%xu);" % addr]
     return ["recomp_seh_frame_orphan(c, seh_mark_);"]
 
 

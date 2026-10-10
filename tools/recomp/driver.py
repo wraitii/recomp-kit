@@ -128,7 +128,8 @@ def _scan(addrs):
                 dangling.update(t for t in targets if not ctx.dispatchable(t))
         reason = "decoded-only code map" if ctx.decoded_only else production.exclusion(fn)
         escapes = bool(tr.seh_escaping_returns(fn))
-        site = bool(fn.seh_sites) or any(fn.insns[i].mnem == "POP" for i in fn.seh_restores)
+        site = (bool(fn.seh_sites) or any(fn.insns[i].mnem == "POP" for i in fn.seh_restores)
+                or tr.image.msvc_seh_epilog(addr) or any(map(tr.seh_except_entry, fn.insns)))
         prepared = None
         if not (escapes or site or entries or fn.pushed_continuations or fn.return_jumps
                 or fn.dead_addrs or addr in tr.noreturn_callees):
