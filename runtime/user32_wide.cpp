@@ -236,9 +236,16 @@ void find_ex_w(X86 *c) {
     find_named(c, true);
 }
 // RT_STRING blocks contain sixteen WORD-length-prefixed UTF-16 strings.
-void load_string(X86 *c) {
+void load_string(X86 *c, bool wide) {
     uint32_t id = arg(c, 1) & 0xffff, out = arg(c, 2), cap = arg(c, 3), bytes = 0;
-    uint32_t p = resource_data(resource_find(6, (id >> 4) + 1), &bytes), end = p + bytes;
+    if (!wide && (int32_t)cap <= 0) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t module = arg(c, 0);
+    uint32_t p = resource_data(resource_find(6, (id >> 4) + 1, nullptr, module), &bytes, nullptr,
+                               module),
+             end = p + bytes;
     for (uint32_t i = 0; p && i < 16; ++i) {
         if (end - p < 2)
             break;
@@ -257,16 +264,39 @@ void load_string(X86 *c) {
                 return;
             }
             n = std::min(n, cap - 1);
-            if (!gm_valid(out, (n + 1) * 2))
+            if (!gm_valid(out, (n + 1) * (wide ? 2 : 1)))
                 break;
-            memmove(g_mem + out, g_mem + p, n * 2);
-            wr16(out + n * 2, 0);
+            if (wide) {
+                memmove(g_mem + out, g_mem + p, n * 2);
+                wr16(out + n * 2, 0);
+            } else {
+                static const uint16_t high[] = {
+                    0x20ac, 0x81,   0x201a, 0x192,  0x201e, 0x2026, 0x2020, 0x2021,
+                    0x2c6,  0x2030, 0x160,  0x2039, 0x152,  0x8d,   0x17d,  0x8f,
+                    0x90,   0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
+                    0x2dc,  0x2122, 0x161,  0x203a, 0x153,  0x9d,   0x17e,  0x178};
+                for (uint32_t j = 0; j < n; ++j) {
+                    uint16_t value = rd16(p + j * 2);
+                    uint8_t ansi = value < 0x80 || (value >= 0xa0 && value <= 0xff) ? value : '?';
+                    for (uint32_t k = 0; k < 32; ++k)
+                        if (value == high[k])
+                            ansi = 0x80 + k;
+                    wr8(out + j, ansi);
+                }
+                wr8(out + n, 0);
+            }
             set_eax(c, n);
             return;
         }
         p += n * 2;
     }
     set_eax(c, 0);
+}
+void load_string_w(X86 *c) {
+    load_string(c, true);
+}
+void load_string_a(X86 *c) {
+    load_string(c, false);
 }
 void load_bitmap(X86 *c) {
     uint32_t bytes = 0, p = resource_data(resource_find(2, arg(c, 1)), &bytes);
@@ -432,6 +462,15 @@ void char_case(X86 *c, bool upper, bool buffer) {
 }
 void upper(X86 *c) {
     char_case(c, true, false);
+}
+void is_char_upper(X86 *c) {
+    uint16_t ch = (uint16_t)arg(c, 0);
+    set_eax(c, case_unit(ch, false) != ch);
+}
+void is_char_alpha(X86 *c) {
+    uint16_t ch = (uint16_t)arg(c, 0);
+    set_eax(c, (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                    (ch >= 0xc0 && ch <= 0xff && ch != 0xd7 && ch != 0xf7));
 }
 void lower(X86 *c) {
     char_case(c, false, false);
@@ -658,7 +697,8 @@ const ImportShim shims[] = {
     W("LoadBitmapW", 2, load_bitmap),
     W("LoadIconW", 2, load_icon),
     W("LoadImageA", 6, load_image_a),
-    W("LoadStringW", 4, load_string),
+    W("LoadStringW", 4, load_string_w),
+    W("LoadStringA", 4, load_string_a),
     W("DrawTextW", 5, draw_text),
     W("DrawTextExW", 6, draw_text_ex),
     W("CharUpperW", 1, upper),
@@ -666,6 +706,8 @@ const ImportShim shims[] = {
     W("CharUpperBuffW", 2, upper_buff),
     W("CharLowerBuffW", 2, lower_buff),
     W("CharUpperBuffA", 2, upper_buff_a),
+    W("IsCharUpperW", 1, is_char_upper),
+    W("IsCharAlphaW", 1, is_char_alpha),
     W("CharLowerBuffA", 2, lower_buff_a),
     W("CharNextW", 1, next_char),
     W("MapVirtualKeyW", 2, map_key),

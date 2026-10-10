@@ -1377,6 +1377,24 @@ void get_module_handle_named(X86 *c, const std::string &module_name) {
     load_library_named(c, module_name);
 }
 
+void k_DisableThreadLibraryCalls(X86 *c) {
+    const LoaderModule *found = loader_module_containing(arg(c, 0));
+    LoaderModule *module = found ? loader_module_named(found->name.c_str()) : nullptr;
+    if (!module || module->base != arg(c, 0) || module->base == IMAGE_BASE) {
+        set_last_error(ERROR_INVALID_HANDLE_);
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t optional = module->base + rd32(module->base + 0x3c) + 24;
+    if (rd32(optional + 92) > 9 && rd32(optional + 96 + 9 * 8)) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    module->thread_notifications_disabled = true;
+    set_eax(c, 1);
+}
+
 void k_GetModuleHandleA(X86 *c) {
     uint32_t p = arg(c, 0);
     if (!p) {
@@ -1781,6 +1799,67 @@ void k_GetTempPathA(X86 *c) {
     memcpy(g_mem + buf, dir, len + 1);
     set_eax(c, len);
 }
+void k_GetTempPathW(X86 *c) {
+    static const char dir[] = "C:\\Windows\\Temp\\";
+    uint32_t size = arg(c, 0), buf = arg(c, 1);
+    uint32_t len = sizeof dir - 1;
+    if (!buf || size <= len) {
+        set_eax(c, len + 1);
+        return;
+    }
+    gm_put_wstr(buf, dir, size);
+    set_eax(c, len);
+}
+
+void k_GetTempFileNameA(X86 *c) {
+    std::string path = gm_str(arg(c, 0)), prefix = gm_str(arg(c, 1));
+    uint32_t unique = arg(c, 2), output = arg(c, 3);
+    if (path.empty() || path.size() > 246 || !gm_valid(output, 260)) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    if (path.back() != '\\' && path.back() != '/')
+        path += '\\';
+    prefix = prefix.substr(0, 3);
+    static uint32_t next_unique = 1;
+    uint32_t number = unique ? unique & 0xffff : next_unique;
+    for (uint32_t attempt = 0; attempt < 65535; ++attempt) {
+        char suffix[16];
+        snprintf(suffix, sizeof suffix, "%04X.TMP", number);
+        std::string name = path + prefix + suffix;
+        if (unique) {
+            memcpy(g_mem + output, name.c_str(), name.size() + 1);
+            set_eax(c, unique);
+            return;
+        }
+        if (win32_host_path(name).empty()) {
+            std::string host = win32_host_path_op(name, WIN32_FILE_WRITE);
+            if (host.empty()) {
+                set_last_error(ERROR_PATH_NOT_FOUND_);
+                set_eax(c, 0);
+                return;
+            }
+            int fd = os_fd_open(host.c_str(), OS_O_RDWR | OS_O_CREAT | OS_O_EXCL);
+            if (fd >= 0) {
+                os_fd_close(fd);
+                win32_invalidate_dir_cache();
+                next_unique = number % 65535 + 1;
+                memcpy(g_mem + output, name.c_str(), name.size() + 1);
+                set_eax(c, number);
+                return;
+            }
+            if (errno != EEXIST) {
+                set_last_error(errno == ENOENT ? ERROR_PATH_NOT_FOUND_ : ERROR_ACCESS_DENIED_);
+                set_eax(c, 0);
+                return;
+            }
+        }
+        number = number % 65535 + 1;
+    }
+    set_last_error(80);
+    set_eax(c, 0);
+}
 
 void k_GetLogicalDriveStringsA(X86 *c) {
     logical_drive_strings(c, false);
@@ -2058,6 +2137,19 @@ void k_InterlockedExchange(X86 *c) {
     wr32(p, v);
     set_eax(c, old);
 }
+void k_InterlockedCompareExchange(X86 *c) {
+    uint32_t p = arg(c, 0), exchange = arg(c, 1), comparand = arg(c, 2);
+    uint32_t old = rd32(p);
+    if (old == comparand)
+        wr32(p, exchange);
+    set_eax(c, old);
+}
+void k_InterlockedExchangeAdd(X86 *c) {
+    uint32_t p = arg(c, 0);
+    uint32_t old = rd32(p);
+    wr32(p, old + arg(c, 1));
+    set_eax(c, old);
+}
 
 // CRITICAL_SECTION is 24 bytes. The fields the guest can read are kept where
 // Windows keeps them: LockCount at +4, RecursionCount at +8, OwningThread at
@@ -2071,6 +2163,15 @@ void k_InitializeCriticalSection(X86 *c) {
         wr32(p + 4, 0xffffffffu); // LockCount = -1 (unowned)
     }
     set_eax(c, 0);
+}
+void k_InitializeCriticalSectionAndSpinCount(X86 *c) {
+    if (!arg(c, 0) || !gm_valid(arg(c, 0), 24)) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    k_InitializeCriticalSection(c);
+    set_eax(c, 1);
 }
 void k_EnterCriticalSection(X86 *c) {
     imports_call_leaves_surfaces();
@@ -2218,6 +2319,15 @@ void k_SetEvent(X86 *c) {
 void k_WaitForSingleObject(X86 *c) {
     uint32_t h = arg(c, 0);
     set_eax(c, sched_wait_objects(&h, 1, false, arg(c, 1)));
+}
+
+void k_WaitForSingleObjectEx(X86 *c) {
+    if (arg(c, 2)) {
+        LOGW("WaitForSingleObjectEx: alertable waits are unsupported");
+        imports_unsupported(c);
+        return;
+    }
+    k_WaitForSingleObject(c);
 }
 
 void k_WaitForMultipleObjects(X86 *c) {
@@ -5284,6 +5394,11 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "GetDiskFreeSpaceA", 5, k_GetDiskFreeSpaceA},
     {"KERNEL32.dll", "GetSystemDirectoryA", 2, k_GetSystemDirectoryA},
     {"KERNEL32.dll", "GetTempPathA", 2, k_GetTempPathA},
+    {"KERNEL32.dll", "GetTempPathW", 2, k_GetTempPathW},
+    // The guest CONTEXT layout is a runtime detail no shim here has needed.
+    {"KERNEL32.dll", "GetThreadContext", 2, imports_unsupported},
+    {"KERNEL32.dll", "GetTempFileNameA", 4, k_GetTempFileNameA},
+    {"KERNEL32.dll", "DisableThreadLibraryCalls", 1, k_DisableThreadLibraryCalls},
     {"KERNEL32.dll", "GetLogicalDriveStringsA", 2, k_GetLogicalDriveStringsA},
     {"KERNEL32.dll", "GetDriveTypeA", 1, k_GetDriveTypeA},
     // modules and process state
@@ -5376,12 +5491,17 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "InterlockedIncrement", 1, k_InterlockedIncrement},
     {"KERNEL32.dll", "InterlockedDecrement", 1, k_InterlockedDecrement},
     {"KERNEL32.dll", "InterlockedExchange", 2, k_InterlockedExchange},
+    {"KERNEL32.dll", "InterlockedCompareExchange", 3, k_InterlockedCompareExchange},
+    {"KERNEL32.dll", "InterlockedExchangeAdd", 2, k_InterlockedExchangeAdd},
     {"KERNEL32.dll", "InitializeCriticalSection", 1, k_InitializeCriticalSection},
+    {"KERNEL32.dll", "InitializeCriticalSectionAndSpinCount", 2,
+     k_InitializeCriticalSectionAndSpinCount},
     {"KERNEL32.dll", "EnterCriticalSection", 1, k_EnterCriticalSection},
     {"KERNEL32.dll", "LeaveCriticalSection", 1, k_LeaveCriticalSection},
     {"KERNEL32.dll", "DeleteCriticalSection", 1, k_DeleteCriticalSection},
     // synchronisation objects
     {"KERNEL32.dll", "CreateSemaphoreA", 4, k_CreateSemaphoreA},
+    {"KERNEL32.dll", "CreateSemaphoreW", 4, k_CreateSemaphoreA},
     {"KERNEL32.dll", "ReleaseSemaphore", 3, k_ReleaseSemaphore},
     {"KERNEL32.dll", "CreateEventA", 4, k_CreateEventA},
     {"KERNEL32.dll", "ResetEvent", 1, k_ResetEvent},
@@ -5390,6 +5510,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "FindNextChangeNotification", 1, k_FindNextChangeNotification},
     {"KERNEL32.dll", "FindCloseChangeNotification", 1, k_FindCloseChangeNotification},
     {"KERNEL32.dll", "WaitForSingleObject", 2, k_WaitForSingleObject},
+    {"KERNEL32.dll", "WaitForSingleObjectEx", 3, k_WaitForSingleObjectEx},
     {"KERNEL32.dll", "WaitForMultipleObjects", 4, k_WaitForMultipleObjects},
     // threads and process exit
     {"KERNEL32.dll", "CreateThread", 6, k_CreateThread},

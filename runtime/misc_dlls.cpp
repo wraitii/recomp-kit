@@ -8,6 +8,11 @@
 #include <vector>
 
 namespace {
+uint32_t msvcr71_app_type;
+void crt_set_app_type(X86 *c) {
+    msvcr71_app_type = arg(c, 0);
+    set_eax(c, msvcr71_app_type);
+}
 void zero_out(uint32_t p) {
     if (p && gm_valid(p, 4))
         wr32(p, 0);
@@ -17,6 +22,97 @@ void yes(X86 *c) {
 }
 void zero(X86 *c) {
     set_eax(c, 0);
+}
+
+// SHLWAPI string and path helpers msxml3 imports. The URL entry points that
+// need WinINet's parser stay named failures.
+uint16_t wide_unit(uint32_t p, uint32_t i) {
+    return p && gm_valid(p + i * 2, 2) ? rd16(p + i * 2) : 0;
+}
+uint16_t lower_unit(uint16_t ch) {
+    return ch >= 'A' && ch <= 'Z' ? (uint16_t)(ch + 32) : ch;
+}
+void s_StrCmpW(X86 *c) {
+    uint32_t a = arg(c, 0), b = arg(c, 1);
+    for (uint32_t i = 0;; ++i) {
+        uint16_t ca = wide_unit(a, i), cb = wide_unit(b, i);
+        if (ca != cb) {
+            set_eax(c, ca < cb ? 0xffffffffu : 1u);
+            return;
+        }
+        if (!ca) {
+            set_eax(c, 0);
+            return;
+        }
+    }
+}
+void s_StrCmpNIW(X86 *c) {
+    uint32_t a = arg(c, 0), b = arg(c, 1), n = arg(c, 2);
+    for (uint32_t i = 0; i < n; ++i) {
+        uint16_t ca = lower_unit(wide_unit(a, i)), cb = lower_unit(wide_unit(b, i));
+        if (ca != cb) {
+            set_eax(c, ca < cb ? 0xffffffffu : 1u);
+            return;
+        }
+        if (!ca)
+            break;
+    }
+    set_eax(c, 0);
+}
+void s_StrToIntW(X86 *c) {
+    uint32_t p = arg(c, 0), i = 0;
+    uint16_t ch = wide_unit(p, i);
+    while (ch == ' ' || ch == '\t')
+        ch = wide_unit(p, ++i);
+    bool minus = ch == '-';
+    if (minus || ch == '+')
+        ch = wide_unit(p, ++i);
+    int32_t value = 0;
+    while (ch >= '0' && ch <= '9') {
+        value = value * 10 + (int32_t)(ch - '0');
+        ch = wide_unit(p, ++i);
+    }
+    set_eax(c, (uint32_t)(minus ? -value : value));
+}
+void s_PathFindExtensionW(X86 *c) {
+    uint32_t p = arg(c, 0), len = 0;
+    while (wide_unit(p, len))
+        ++len;
+    for (uint32_t i = len; i-- > 0;) {
+        uint16_t ch = wide_unit(p, i);
+        if (ch == '.') {
+            set_eax(c, p + i * 2);
+            return;
+        }
+        if (ch == '\\' || ch == '/' || ch == ':')
+            break;
+    }
+    set_eax(c, p + len * 2);
+}
+void s_PathFindFileNameW(X86 *c) {
+    uint32_t p = arg(c, 0), name = p;
+    for (uint32_t i = 0; wide_unit(p, i); ++i) {
+        uint16_t ch = wide_unit(p, i);
+        if (ch == '\\' || ch == '/')
+            name = p + (i + 1) * 2;
+    }
+    set_eax(c, name);
+}
+void s_PathIsURLW(X86 *c) {
+    uint32_t p = arg(c, 0), i = 0;
+    uint16_t ch = wide_unit(p, 0);
+    if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'))) {
+        set_eax(c, 0);
+        return;
+    }
+    for (i = 1;; ++i) {
+        ch = wide_unit(p, i);
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
+            ch == '+' || ch == '-' || ch == '.')
+            continue;
+        break;
+    }
+    set_eax(c, i >= 2 && ch == ':' ? 1 : 0);
 }
 // DSETUP.dll is the shipped DirectSetup shim; runblack.exe imports only
 // DirectXSetupGetVersion by ordinal and refuses to start below 0x00040007
@@ -293,12 +389,26 @@ const ImportShim shims[] = {
     {"WINSPOOL.DRV", "DocumentPropertiesW", 6, document_properties},
     {"NETAPI32.dll", "NetWkstaGetInfo", 3, workstation_info},
     {"NETAPI32.dll", "NetApiBufferFree", 1, zero},
+    {"MSVCR71.dll", "__set_app_type", ARGC_CDECL, crt_set_app_type},
     {"msvcrt.dll", "memcpy", ARGC_CDECL, crt_memcpy},
     {"msvcrt.dll", "memset", ARGC_CDECL, crt_memset},
     {"SHFOLDER.dll", "SHGetFolderPathW", 5, folder_path},
     {"SHELL32.dll", "Shell_NotifyIconW", 2, yes},
     {"SHELL32.dll", "SHAppBarMessage", 2, zero},
     {"SHELL32.dll", "ShellExecuteW", 6, zero},
+    {"SHLWAPI.dll", "StrCmpW", 2, s_StrCmpW},
+    {"SHLWAPI.dll", "StrCmpNIW", 3, s_StrCmpNIW},
+    {"SHLWAPI.dll", "StrToIntW", 1, s_StrToIntW},
+    {"SHLWAPI.dll", "PathFindExtensionW", 1, s_PathFindExtensionW},
+    {"SHLWAPI.dll", "PathFindFileNameW", 1, s_PathFindFileNameW},
+    {"SHLWAPI.dll", "PathIsURLW", 1, s_PathIsURLW},
+    {"SHLWAPI.dll", "UrlCanonicalizeW", 4, imports_unsupported},
+    {"SHLWAPI.dll", "UrlCreateFromPathW", 4, imports_unsupported},
+    {"SHLWAPI.dll", "PathCreateFromUrlW", 4, imports_unsupported},
+    {"SHLWAPI.dll", "PathSearchAndQualifyW", 3, imports_unsupported},
+    {"SHLWAPI.dll", "UrlUnescapeW", 4, imports_unsupported},
+    {"SHLWAPI.dll", "UrlGetLocationW", 1, imports_unsupported},
+    {"SHLWAPI.dll", "UrlIsW", 2, imports_unsupported},
     {"URLMON.dll", "URLDownloadToFileW", 5, nullptr},
     // Symbol APIs have known ABIs but remain unsupported.
     {"DBGHELP.dll", "SymGetOptions", 0, imports_unsupported},

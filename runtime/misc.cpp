@@ -2873,6 +2873,10 @@ const ImportShim g_misc_shims[] = {
     {"ADVAPI32.dll", "RegDeleteKeyW", 2, a_RegDeleteKeyW},
     {"ADVAPI32.dll", "RegDeleteValueW", 2, a_RegDeleteValueW},
     {"ADVAPI32.dll", "RegFlushKey", 1, a_RegFlushKey},
+    // Thread tokens have no runtime equivalent; fail with the import named.
+    {"ADVAPI32.dll", "OpenThreadToken", 4, imports_unsupported},
+    {"ADVAPI32.dll", "RevertToSelf", 0, imports_unsupported},
+    {"ADVAPI32.dll", "SetThreadToken", 2, imports_unsupported},
     {"ADVAPI32.dll", "RegConnectRegistryW", 3, a_RegDenied},
     {"ADVAPI32.dll", "RegLoadKeyW", 3, a_RegDenied},
     {"ADVAPI32.dll", "RegUnLoadKeyW", 2, a_RegDenied},

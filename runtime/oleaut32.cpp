@@ -337,21 +337,16 @@ void o_VariantCopyInd(X86 *c) {
 
 // The supported scalar conversions use a fixed locale, independent of the
 // host's locale. Integer conversion uses Automation's ties-to-even rounding.
-void o_VariantChangeType(X86 *c) {
-    uint32_t dst = arg(c, 0), src = arg(c, 1), to = arg(c, 3) & 0xffff;
-    if (!valid(dst, 16) || !valid(src, 16)) {
-        set_eax(c, INVALID);
-        return;
-    }
-    if (!(to == 3 || to == 5 || to == 8 || to == 11)) {
-        set_eax(c, MISMATCH);
-        return;
-    }
+// VariantChangeType and VariantChangeTypeEx differ only in where the flags and
+// target type sit in their argument lists.
+uint32_t variant_change_type(uint32_t dst, uint32_t src, uint16_t flags, uint16_t to) {
+    if (!valid(dst, 16) || !valid(src, 16))
+        return INVALID;
+    if (!(to == 3 || to == 5 || to == 8 || to == 11))
+        return MISMATCH;
     uint32_t tmp = heap_alloc(16, true);
-    if (!tmp) {
-        set_eax(c, OOM);
-        return;
-    }
+    if (!tmp)
+        return OOM;
     uint32_t hr = variant_copy(tmp, src, true);
     uint16_t from = rd16(tmp);
     if (!hr && !(from == 3 || from == 5 || from == 8 || from == 11))
@@ -392,7 +387,7 @@ void o_VariantChangeType(X86 *c) {
     if (!hr && to == 8 && from != 8) {
         std::ostringstream out;
         out.imbue(std::locale::classic());
-        if (from == 11 && (arg(c, 2) & 2))
+        if (from == 11 && (flags & 2))
             out << (number ? "True" : "False");
         else
             out << std::setprecision(15) << number;
@@ -435,7 +430,15 @@ void o_VariantChangeType(X86 *c) {
         bstr_free(b);
     variant_clear(tmp);
     heap_free(tmp);
-    set_eax(c, hr);
+    return hr;
+}
+void o_VariantChangeType(X86 *c) {
+    set_eax(c, variant_change_type(arg(c, 0), arg(c, 1), uint16_t(arg(c, 2)),
+                                   uint16_t(arg(c, 3))));
+}
+void o_VariantChangeTypeEx(X86 *c) {
+    set_eax(c, variant_change_type(arg(c, 0), arg(c, 1), uint16_t(arg(c, 3)),
+                                   uint16_t(arg(c, 4))));
 }
 void o_SafeArrayCreate(X86 *c) {
     uint32_t dims = arg(c, 1), bounds = arg(c, 2);
@@ -553,15 +556,112 @@ void o_GetErrorInfo(X86 *c) {
         wr32(arg(c, 1), 0);
     set_eax(c, 1);
 }
+void o_SysAllocString(X86 *c) {
+    uint32_t src = arg(c, 0);
+    if (!src) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t units = 0;
+    while (units < GUEST_SIZE / 2 && gm_valid(src + units * 2, 2) && rd16(src + units * 2))
+        ++units;
+    set_eax(c, bstr_alloc(src, units));
+}
+void o_SysStringLen(X86 *c) {
+    uint32_t b = arg(c, 0);
+    set_eax(c, b && bstr_valid(b) ? rd32(b - 4) / 2 : 0);
+}
+void o_SafeArrayDestroy(X86 *c) {
+    set_eax(c, array_destroy(arg(c, 0)));
+}
+void o_SafeArrayGetDim(X86 *c) {
+    uint32_t a = arg(c, 0);
+    set_eax(c, array_valid(a) ? array_dims(a) : 0);
+}
+void o_SafeArrayCreateVector(X86 *c) {
+    set_eax(c, array_create(uint16_t(arg(c, 0)), arg(c, 2), int32_t(arg(c, 1))));
+}
+void o_SafeArrayCopy(X86 *c) {
+    uint32_t a = arg(c, 0), out = arg(c, 1);
+    if (!valid(out, 4)) {
+        set_eax(c, INVALID);
+        return;
+    }
+    wr32(out, 0);
+    if (!array_valid(a)) {
+        set_eax(c, INVALID);
+        return;
+    }
+    uint32_t copy = array_copy(a);
+    if (!copy) {
+        set_eax(c, OOM);
+        return;
+    }
+    wr32(out, copy);
+    set_eax(c, 0);
+}
+void o_VarUI4FromStr(X86 *c) {
+    uint32_t out = arg(c, 3);
+    if (!valid(out, 4)) {
+        set_eax(c, INVALID);
+        return;
+    }
+    std::string text = gm_wstr(arg(c, 0), 64);
+    const char *s = text.c_str();
+    while (*s == ' ' || *s == '\t')
+        ++s;
+    uint64_t value = 0;
+    bool any = false;
+    for (; *s >= '0' && *s <= '9'; ++s) {
+        any = true;
+        value = value * 10 + uint32_t(*s - '0');
+        if (value > 0xffffffffull) {
+            set_eax(c, MISMATCH);
+            return;
+        }
+    }
+    while (*s == ' ' || *s == '\t')
+        ++s;
+    if (!any || *s) {
+        set_eax(c, MISMATCH);
+        return;
+    }
+    wr32(out, uint32_t(value));
+    set_eax(c, 0);
+}
 const ImportShim shims[] = {
 #define O(name, n) {"OLEAUT32.dll", #name, n, o_##name}
     O(VariantInit, 1),           O(VariantClear, 1),        O(VariantCopy, 2),
-    O(VariantCopyInd, 2),        O(VariantChangeType, 4),   O(SysAllocStringLen, 2),
-    O(SysReAllocStringLen, 3),   O(SysFreeString, 1),       O(SafeArrayCreate, 3),
-    O(SafeArrayGetLBound, 3),    O(SafeArrayGetUBound, 3),  O(SafeArrayGetElement, 3),
-    O(SafeArrayPutElement, 3),   O(SafeArrayPtrOfIndex, 3), O(SafeArrayAccessData, 2),
-    O(SafeArrayUnaccessData, 1), O(GetErrorInfo, 2)
+    O(VariantCopyInd, 2),        O(VariantChangeType, 4),   O(VariantChangeTypeEx, 5),
+    O(SysAllocString, 1),        O(SysAllocStringLen, 2),   O(SysReAllocStringLen, 3),
+    O(SysStringLen, 1),          O(SysFreeString, 1),       O(SafeArrayCreate, 3),
+    O(SafeArrayDestroy, 1),      O(SafeArrayGetDim, 1),     O(SafeArrayGetLBound, 3),
+    O(SafeArrayGetUBound, 3),    O(SafeArrayGetElement, 3), O(SafeArrayPutElement, 3),
+    O(SafeArrayPtrOfIndex, 3),   O(SafeArrayAccessData, 2), O(SafeArrayUnaccessData, 1),
+    O(SafeArrayCopy, 2),         O(SafeArrayCreateVector, 3), O(VarUI4FromStr, 4),
+    O(GetErrorInfo, 2),
 #undef O
+    // The msxml3 delay-import table names these by ordinal, so each implemented
+    // entry needs the ordinal alias its GetProcAddress call will use.
+    {"OLEAUT32.dll", "ord2", 1, o_SysAllocString},
+    {"OLEAUT32.dll", "ord4", 2, o_SysAllocStringLen},
+    {"OLEAUT32.dll", "ord6", 1, o_SysFreeString},
+    {"OLEAUT32.dll", "ord7", 1, o_SysStringLen},
+    {"OLEAUT32.dll", "ord8", 1, o_VariantInit},
+    {"OLEAUT32.dll", "ord9", 1, o_VariantClear},
+    {"OLEAUT32.dll", "ord10", 2, o_VariantCopy},
+    {"OLEAUT32.dll", "ord12", 4, o_VariantChangeType},
+    {"OLEAUT32.dll", "ord16", 1, o_SafeArrayDestroy},
+    {"OLEAUT32.dll", "ord17", 1, o_SafeArrayGetDim},
+    {"OLEAUT32.dll", "ord19", 3, o_SafeArrayGetUBound},
+    {"OLEAUT32.dll", "ord20", 3, o_SafeArrayGetLBound},
+    {"OLEAUT32.dll", "ord23", 2, o_SafeArrayAccessData},
+    {"OLEAUT32.dll", "ord24", 1, o_SafeArrayUnaccessData},
+    {"OLEAUT32.dll", "ord27", 2, o_SafeArrayCopy},
+    {"OLEAUT32.dll", "ord147", 5, o_VariantChangeTypeEx},
+    {"OLEAUT32.dll", "ord200", 2, o_GetErrorInfo},
+    {"OLEAUT32.dll", "ord277", 4, o_VarUI4FromStr},
+    {"OLEAUT32.dll", "ord411", 3, o_SafeArrayCreateVector},
 };
 } // namespace
 void oleaut32_register() {

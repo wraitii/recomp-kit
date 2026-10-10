@@ -24,9 +24,12 @@ struct Directory {
     bool relative(uint32_t offset, uint32_t bytes) const {
         return offset <= size && bytes <= size - offset;
     }
-    bool open() {
-        image = loader_image_base();
-        image_size = loader_image_size();
+    bool open(uint32_t module = 0) {
+        const LoaderModule *owner = module ? loader_module_containing(module) : nullptr;
+        if (module && (!owner || owner->base != module))
+            return fail(why, "invalid resource module");
+        image = owner ? owner->base : loader_image_base();
+        image_size = owner ? owner->size : loader_image_size();
         if (!image || !gm_valid(image, image_size) || image_size < 64 || rd16(image) != 0x5a4d)
             return fail(why, "no loaded PE image");
         uint32_t nt = rd32(image + 0x3c);
@@ -142,10 +145,11 @@ bool identifier(uint32_t p, ResourceName &out, std::string *why) {
 }
 } // namespace
 
-uint32_t resource_find(uint32_t type_id_or_name, uint32_t name_id_or_name, std::string *why) {
+uint32_t resource_find(uint32_t type_id_or_name, uint32_t name_id_or_name, std::string *why,
+                       uint32_t module) {
     Directory dir(why);
     ResourceName type, name;
-    if (!dir.open() || !identifier(type_id_or_name, type, why) ||
+    if (!dir.open(module) || !identifier(type_id_or_name, type, why) ||
         !identifier(name_id_or_name, name, why))
         return 0;
     uint32_t type_dir, name_dir, first, count;
@@ -164,11 +168,11 @@ uint32_t resource_find(uint32_t type_id_or_name, uint32_t name_id_or_name, std::
     uint32_t entry = dir.root + data_offset;
     return dir.data(entry, nullptr) ? entry : 0;
 }
-uint32_t resource_data(uint32_t entry, uint32_t *size, std::string *why) {
+uint32_t resource_data(uint32_t entry, uint32_t *size, std::string *why, uint32_t module) {
     if (size)
         *size = 0;
     Directory dir(why);
-    return dir.open() ? dir.data(entry, size) : 0;
+    return dir.open(module) ? dir.data(entry, size) : 0;
 }
 bool resource_names(uint32_t type_id_or_name, std::vector<ResourceName> *names, std::string *why) {
     if (!names)
