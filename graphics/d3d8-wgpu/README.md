@@ -157,7 +157,7 @@ numerical precision and repeated-frame game behavior remain open.
 ### Render-target textures
 
 Level-0 DEFAULT-pool A8R8G8B8/X8R8G8B8 color surfaces can be bound with the
-implicit depth surface or with depth detached. Setting a color surface resets
+implicit or standalone depth surfaces, or with depth detached. Setting a color surface resets
 the viewport; depth-only changes keep it. A padded color attachment permits a
 smaller color target to share the original larger depth surface; viewport-limited
 clears/draws preserve depth outside that region. GPU copies publish the logical
@@ -169,8 +169,10 @@ the CPU upload LRU. Sampling unchanged CPU generations reuses GPU-written pixels
 CPU generation changes upload new bytes. CPU staging reads synchronize from GPU
 only when its generation is current. The bridge keys storage by level-surface
 identity so releasing a parent texture cannot invalidate a still-bound surface.
-Other color formats, mip levels and nonimplicit depth surfaces are unsupported;
-read/write texture feedback fails by name.
+Standalone depth storage uses the guest surface identity, dimensions and format;
+it persists across bindings and is released with the surface. GPU allocation is
+deferred until its first binding. Mip levels remain unsupported; read/write
+texture feedback fails by name.
 
 The headless probe's `render texture/depth/restoration/readback` check covers
 rendering, same-scene restoration, shared-depth preservation, sampling after

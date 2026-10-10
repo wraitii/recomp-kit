@@ -1498,16 +1498,13 @@ void Dev_SetRenderTarget(X86 *c) {
         return;
     }
 #ifdef RECOMP_D3D8_WGPU
-    // DIVERGENCE(original): `ds` is validated for owner, size and format, but
-    // the renderer attaches the device's shared implicit autodepth rather than
-    // the standalone surface's own storage, so depth contents are shared
-    // between render targets.
     D3d8Error err{};
     int32_t status = d3d8_device_set_render_target(
         host_device(dev), texture ? rt->id : 0, texture ? rt->d3d8_level : 0,
         texture ? rt->d3d8_content_generation : 0, texture ? rt->rmask : dev->d3d8_format, width,
         height, texture ? storage_data(rt) : nullptr, texture ? rt->pixels_bytes : 0, ds != nullptr,
-        rt_arg != 0, &err);
+        ds && ds->id != dev->d3d8_depthbuffer ? ds->id : 0, ds ? ds->width : 0, ds ? ds->height : 0,
+        ds ? ds->rmask : 0, rt_arg != 0, &err);
     if (status) {
         com_ret(c, host_result(c, status, err));
         return;
@@ -1679,11 +1676,7 @@ void Dev_CreateTexture(X86 *c) {
 // (this, Width, Height, Format, MultiSampleType, ppSurface). A standalone
 // depth-stencil surface the guest can bind with SetRenderTarget. D3D8 accepts
 // D16, D24X8, D24S8 and D32. The object stores the descriptor and is retired
-// with the device; the depth bytes stay in the Rust target.
-//
-// DIVERGENCE(original): the renderer's depth attachment is the device's shared
-// implicit autodepth, not this surface's own storage (see Dev_SetRenderTarget),
-// so depth contents are shared across render targets rather than independent.
+// with its COM surface; GPU storage is allocated on first binding.
 void Dev_CreateDepthStencilSurface(X86 *c) {
     ComObj *dev = d8_dev(c);
     uint32_t w = arg(c, 1), h = arg(c, 2), format = arg(c, 3), ms = arg(c, 4), out = arg(c, 5);
@@ -2126,7 +2119,7 @@ void texture_destroy(ComObj *tex) {
 void surface_destroy(ComObj *surface) {
 #ifdef RECOMP_D3D8_WGPU
     if (ComObj *owner = com_get(surface->d3d8_owner))
-        if (owner->d3d8_device && surface->pixels_bytes)
+        if (owner->d3d8_device && (surface->pixels_bytes || surface->d3d8_depth))
             d3d8_device_release_texture(host_device(owner), surface->id);
 #endif
     if (surface->pixels)

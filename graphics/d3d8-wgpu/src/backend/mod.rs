@@ -363,34 +363,7 @@ impl GpuContext {
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-            let depth = match depth {
-                None => None,
-                Some(depth) => {
-                    let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("d3d8-offscreen-depth"),
-                        size: wgpu::Extent3d {
-                            width,
-                            height,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: depth.wgpu_format(),
-                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                        view_formats: &[],
-                    });
-                    let depth_view =
-                        depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
-                    Some(DepthAttachment {
-                        texture: depth_texture,
-                        view: depth_view,
-                        format: depth.wgpu_format(),
-                        has_stencil: depth.has_stencil(),
-                        d3d_format: depth.d3dformat(),
-                    })
-                }
-            };
+            let depth = depth.map(|depth| self.create_depth(width, height, depth));
 
             Ok(OffscreenTarget {
                 texture,
@@ -402,6 +375,51 @@ impl GpuContext {
                 depth,
             })
         })
+    }
+
+    pub fn create_depth_surface(
+        &self,
+        width: u32,
+        height: u32,
+        depth_format: u32,
+    ) -> Result<DepthAttachment, RenderError> {
+        let max = self.device.limits().max_texture_dimension_2d;
+        if width == 0 || height == 0 || width > max || height > max {
+            return Err(RenderError::new(
+                "CreateDepthStencilSurface",
+                "invalid dimensions",
+            ));
+        }
+        let depth = format::DepthFormat::from_d3dformat(depth_format)?
+            .ok_or_else(|| RenderError::new("CreateDepthStencilSurface", "missing depth format"))?;
+        self.scope_validation("CreateDepthStencilSurface", || {
+            Ok(self.create_depth(width, height, depth))
+        })
+    }
+
+    fn create_depth(&self, width: u32, height: u32, depth: format::DepthFormat) -> DepthAttachment {
+        let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("d3d8-offscreen-depth"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: depth.wgpu_format(),
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        DepthAttachment {
+            texture: depth_texture,
+            view: depth_view,
+            format: depth.wgpu_format(),
+            has_stencil: depth.has_stencil(),
+            d3d_format: depth.d3dformat(),
+        }
     }
 
     /// Clear target color and/or depth/stencil, exactly as far as `flags` asks.

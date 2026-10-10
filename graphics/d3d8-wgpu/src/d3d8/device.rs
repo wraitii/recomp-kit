@@ -1671,6 +1671,7 @@ impl Device {
         if texture_id == 0 {
             return;
         }
+        self.targets.depths.remove(&texture_id);
         self.texture_cache.remove_texture(texture_id);
         self.targets
             .textures

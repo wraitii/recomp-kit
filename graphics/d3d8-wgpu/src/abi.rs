@@ -637,8 +637,7 @@ pub extern "C" fn d3d8_device_set_texture(
 }
 
 /// Bind a level identity, or id zero for the implicit backbuffer. The bridge
-/// validates guest owners/usage and supplies host CPU bytes only. `depth` names
-/// the shared implicit depth attachment; no fresh depth storage is substituted.
+/// validates guest owners/usage and supplies host CPU bytes and depth identity.
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub extern "C" fn d3d8_device_set_render_target(
@@ -652,6 +651,10 @@ pub extern "C" fn d3d8_device_set_render_target(
     data: *const u8,
     bytes: u32,
     depth: u32,
+    depth_id: u32,
+    depth_width: u32,
+    depth_height: u32,
+    depth_format: u32,
     change_color: u32,
     err: *mut D3d8Error,
 ) -> i32 {
@@ -671,17 +674,24 @@ pub extern "C" fn d3d8_device_set_render_target(
     };
     report(
         err,
-        device.set_render_target(
-            id,
-            level,
-            generation,
-            format,
-            width,
-            height,
-            data,
-            depth != 0,
-            change_color != 0,
-        ),
+        (|| {
+            let attachment = if depth == 0 {
+                None
+            } else {
+                Some(device.depth_surface(depth_id, depth_width, depth_height, depth_format)?)
+            };
+            device.set_render_target_depth(
+                id,
+                level,
+                generation,
+                format,
+                width,
+                height,
+                data,
+                attachment,
+                change_color != 0,
+            )
+        })(),
     )
 }
 

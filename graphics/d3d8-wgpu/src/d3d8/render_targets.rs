@@ -14,6 +14,8 @@ pub(super) struct Targets {
     pub backbuffer: OffscreenTarget,
     pub textures: HashMap<TextureKey, RenderTexture>,
     pub current: Option<TextureKey>,
+    pub depths: HashMap<u32, crate::backend::DepthAttachment>,
+    pub backbuffer_padded: Option<OffscreenTarget>,
 }
 
 impl Targets {
@@ -22,6 +24,8 @@ impl Targets {
             backbuffer,
             textures: HashMap::new(),
             current: None,
+            depths: HashMap::new(),
+            backbuffer_padded: None,
         }
     }
 }
@@ -43,6 +47,72 @@ impl Device {
         depth: bool,
         change_color: bool,
     ) -> Result<(), RenderError> {
+        let attachment = if depth {
+            self.targets.backbuffer.depth.clone()
+        } else {
+            None
+        };
+        if depth && attachment.is_none() {
+            return Err(RenderError::new("SetRenderTarget", "autodepth absent"));
+        }
+        self.set_render_target_depth(
+            id,
+            level,
+            generation,
+            format,
+            width,
+            height,
+            data,
+            attachment,
+            change_color,
+        )
+    }
+
+    pub fn depth_surface(
+        &mut self,
+        id: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+    ) -> Result<crate::backend::DepthAttachment, RenderError> {
+        if id == 0 {
+            return self
+                .targets
+                .backbuffer
+                .depth
+                .clone()
+                .ok_or_else(|| RenderError::new("SetRenderTarget", "autodepth absent"));
+        }
+        if let Some(depth) = self.targets.depths.get(&id) {
+            if depth.texture.width() != width
+                || depth.texture.height() != height
+                || depth.d3d_format != format
+            {
+                return Err(RenderError::new(
+                    "SetRenderTarget",
+                    "depth surface descriptor changed",
+                ));
+            }
+            return Ok(depth.clone());
+        }
+        let depth = self.gpu.create_depth_surface(width, height, format)?;
+        self.targets.depths.insert(id, depth.clone());
+        Ok(depth)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_render_target_depth(
+        &mut self,
+        id: u32,
+        level: u32,
+        generation: u64,
+        format: u32,
+        width: u32,
+        height: u32,
+        data: &[u8],
+        depth: Option<crate::backend::DepthAttachment>,
+        change_color: bool,
+    ) -> Result<(), RenderError> {
         // Recorded draws target the previous binding.
         self.flush_draws();
         let key = if id == 0 {
@@ -58,12 +128,11 @@ impl Device {
         } else {
             (width, height)
         };
-        if depth {
-            let b = &self.targets.backbuffer;
-            if b.depth.is_none() || width > b.width || height > b.height {
+        if let Some(depth) = &depth {
+            if width > depth.texture.width() || height > depth.texture.height() {
                 return Err(RenderError::new(
                     "SetRenderTarget",
-                    "autodepth absent or smaller than color target",
+                    "depth smaller than color target",
                 ));
             }
         }
@@ -100,32 +169,28 @@ impl Device {
             None => self.targets.backbuffer.clone(),
             Some(key) => self.targets.textures[&key].surface.clone(),
         };
-        target.depth = if depth {
-            self.targets.backbuffer.depth.clone()
-        } else {
-            None
-        };
-        if depth
-            && (width != self.targets.backbuffer.width || height != self.targets.backbuffer.height)
-        {
-            let key = key.expect("backbuffer dimensions match autodepth");
-            if self.targets.textures[&key].padded.is_none() {
-                let padded = self.gpu.create_target(
-                    self.targets.backbuffer.width,
-                    self.targets.backbuffer.height,
-                    format,
-                    0,
-                )?;
-                self.targets.textures.get_mut(&key).unwrap().padded = Some(padded);
+        target.depth = depth;
+        if let Some(depth) = &target.depth {
+            let dw = depth.texture.width();
+            let dh = depth.texture.height();
+            if width != dw || height != dh {
+                let padded = match key {
+                    Some(key) => &mut self.targets.textures.get_mut(&key).unwrap().padded,
+                    None => &mut self.targets.backbuffer_padded,
+                };
+                if padded
+                    .as_ref()
+                    .is_none_or(|p| p.width != dw || p.height != dh)
+                {
+                    *padded = Some(self.gpu.create_target(dw, dh, format, 0)?);
+                }
+                let mut padded = padded.as_ref().unwrap().clone();
+                self.copy_color(&target, &padded, width, height);
+                padded.depth = target.depth;
+                padded.width = width;
+                padded.height = height;
+                target = padded;
             }
-            let mut padded = self.targets.textures[&key].padded.as_ref().unwrap().clone();
-            self.copy_color(&target, &padded, width, height);
-            padded.depth = target.depth;
-            // Logical extent drives viewport validation/readback; the backing
-            // texture retains its larger physical extent for wgpu attachments.
-            padded.width = width;
-            padded.height = height;
-            target = padded;
         }
         self.target = target;
         self.targets.current = key;
@@ -264,13 +329,14 @@ impl Device {
     /// sampling see the render result; the CPU generation is deliberately left
     /// unchanged, so a subsequent ordinary bind cannot re-upload stale bytes.
     pub(super) fn publish_target(&self) {
-        if let Some(key) = self.targets.current {
-            let surface = &self.targets.textures[&key].surface;
-            if self.target.texture.width() != surface.width
-                || self.target.texture.height() != surface.height
-            {
-                self.copy_color(&self.target, surface, surface.width, surface.height);
-            }
+        let surface = match self.targets.current {
+            Some(key) => &self.targets.textures[&key].surface,
+            None => &self.targets.backbuffer,
+        };
+        if self.target.texture.width() != surface.width
+            || self.target.texture.height() != surface.height
+        {
+            self.copy_color(&self.target, surface, surface.width, surface.height);
         }
     }
 
