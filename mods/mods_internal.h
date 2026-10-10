@@ -45,6 +45,8 @@ PopModStatus mods_hook_remove(uint32_t owner, uint32_t id);
 void mods_hooks_remove_all(uint32_t owner);
 void mods_hooks_set_load_order(uint32_t owner, uint32_t order);
 void mods_hooks_set_cpu_size(uint32_t owner, uint32_t cpu_size);
+// Before guest entry: a mod with code may install a hook later.
+void mods_hooks_arm(void);
 uint32_t mods_hooks_installed_count(void);
 void mods_hooks_reset(void);
 // Test seam only: substitutes the storage a callback's pop_cpu_v1 lives in, so

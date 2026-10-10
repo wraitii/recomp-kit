@@ -528,9 +528,8 @@ void publish(int32_t index) {
     bool any = !e.before.empty() || !e.after.empty() || !e.replace.empty();
     if (any) {
         // Pointer first, then the flag, both with release: a call site that
-        // sees the flag is guaranteed to see the pointer.
-        // Before the flag: a call site that dispatches to the hook has
-        // already published the fields its call contract would drop.
+        // sees the flag is guaranteed to see the pointer. recomp_hooks_ever
+        // rises here only before guest entry; install_hook requires it after.
         __atomic_store_n(&recomp_hooks_ever, (uint8_t)1, __ATOMIC_RELEASE);
         __atomic_store_n(&recomp_hook_ptrs[index], (RecompHookFn)mods_hook_dispatch,
                          __ATOMIC_RELEASE);
@@ -755,6 +754,16 @@ static PopModStatus install_hook(uint32_t owner, uint32_t addr, uint32_t return_
              addr, what);
 
     sched_registry_lock();
+    // Generated call sites test recomp_hooks_ever before a call to publish
+    // the fields a hook observes, and again after it to reread kept fields.
+    // Every running guest frame is between those tests, so the flag can
+    // only rise before guest entry.
+    if (!__atomic_load_n(&recomp_hooks_ever, __ATOMIC_ACQUIRE) &&
+        sched_guest_entry_begun_locked()) {
+        sched_registry_unlock();
+        LOGW("mods: %s refused: hooks were not armed before guest entry", buf);
+        return POP_E_STATE;
+    }
     if (g_next_id > 0xffffu) {
         sched_registry_unlock();
         return POP_E_LIMIT;
@@ -1005,6 +1014,10 @@ void mods_hooks_set_cpu_size(uint32_t owner, uint32_t cpu_size) {
     if (cpu_size_of_owner().size() <= owner)
         cpu_size_of_owner().resize(owner + 1, 0);
     cpu_size_of_owner()[owner] = cpu_size;
+}
+
+void mods_hooks_arm() {
+    __atomic_store_n(&recomp_hooks_ever, (uint8_t)1, __ATOMIC_RELEASE);
 }
 
 uint32_t mods_hooks_installed_count() {

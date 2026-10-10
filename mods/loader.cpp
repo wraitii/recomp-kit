@@ -763,6 +763,8 @@ bool mods_load_all() {
             mods_page_state_discard();
             mods_settings_txn_commit();
             c.loaded = true;
+            if (c.handle || !m.script_path.empty())
+                mods_hooks_arm();
             printf("mods: loaded %s %s\n", c.id.c_str(), c.version.c_str());
         } else {
             // Revoke BEFORE reclaiming: from here nothing the plugin still

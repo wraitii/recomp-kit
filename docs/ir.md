@@ -170,7 +170,10 @@ or kept. Indirect calls, unbound targets, failed lifts, SEH and alternate-entry
 bodies and native replacements read and write everything and kill nothing.
 Because any function can be hooked and a hook may rewrite the CPU, dropped and
 kept fields are still published behind `recomp_hooks_ever`, and `CALL_KEEP`
-rereads the field (after a settle, for flags) on that path.
+rereads the field (after a settle, for flags) on that path. The flag is tested
+on both sides of every running call, so it rises only before guest entry: the
+loader arms it for any mod with a plugin or script, and a hook installed after
+entry without it is refused (`POP_E_STATE`).
 
 ### Policies
 
