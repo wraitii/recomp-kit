@@ -414,7 +414,7 @@ def main(argv=None):
     if settings.module:
         output.write_module_table(args.out, entry_names, symbols, call_returns, settings.module)
     else:
-        output.write_table(args.out, entry_names, symbols, call_returns, bool(private_masks))
+        output.write_table(args.out, entry_names, symbols, call_returns, private_masks)
     output.write_symbols(
         args.out, str(settings.exe), ctx.image.base, symbols, settings.curated)
     selected_callers = (set(settings.state_contract_callers)

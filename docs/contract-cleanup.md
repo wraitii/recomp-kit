@@ -26,6 +26,9 @@ declaration dependencies and emit `contract-report.json`. Eligibility and
 checkpoint preparation are fused; successful private entries decrement once
 and tail-call the leaf, while rejected entries leave polling to the ordinary
 path. Ordinary generated bodies remain unchanged with the pilot disabled.
+Per-target preparation lives beside the immutable dispatch tables, so the compiler
+resolves raw-versus-replacement identity without table loads. The runtime policy
+checks and checkpoint decrement remain unchanged.
 
 Evaluate the same two callers before expansion. Use host sampling with
 `RECOMP_PROFILE` unset or `0`: the built-in guest profiler selects ordinary
