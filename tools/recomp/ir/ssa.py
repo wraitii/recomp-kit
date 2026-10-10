@@ -15,6 +15,8 @@ class SSAError(Exception):
 
 
 class Value:
+    __slots__ = ("id", "opc", "size", "args", "data")
+
     def __init__(self, ident, opc, size, args=(), data=None):
         self.id, self.opc, self.size = ident, opc, size
         self.args, self.data = tuple(args), data

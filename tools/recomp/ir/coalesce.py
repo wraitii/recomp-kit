@@ -5,11 +5,14 @@ and phis replace lane tuples at block boundaries; explicit BYTE operations bridg
 partial writes. Canonicalization removes complete extraction/reassembly pairs.
 This changes representation only, without inferring dead upper register bits.
 """
+from .simplify import TERMINATORS
 
 
 def registers(s, groups):
     """Coalesce complete groups before the builder simplifies their lane phis."""
     s.entry_ops = []
+    positions = {i: next((n for n, v in enumerate(b.ops) if v.opc in TERMINATORS), len(b.ops))
+                 for i, b in s.blocks.items()}
     for keys in groups:
         keys = tuple(keys)
         if len(keys) <= 1 or not all(key in s.inputs for key in keys):
@@ -28,6 +31,7 @@ def registers(s, groups):
             b.phis.append(phi)
             bytes_ = [s.value("BYTE", 1, [phi], n) for n in range(len(keys))]
             b.ops[:0] = bytes_
+            positions[i] += len(bytes_)
             for lane, byte in zip(lanes, bytes_):
                 s.aliases[lane.id] = byte
         for i, phi in phis.items():
@@ -38,10 +42,7 @@ def registers(s, groups):
                     continue
                 b = s.blocks[p]
                 packed = s.value("PACK", len(keys), [b.exit[key] for key in keys])
-                # Keep the terminator last. These pure copies do not move or
-                # change any access or its captured state.
-                at = next((n for n, v in enumerate(b.ops)
-                           if v.opc in ("BRANCH", "CBRANCH", "RETURN", "BRANCHIND", "TAIL", "TRAP")), len(b.ops))
-                b.ops.insert(at, packed)
+                b.ops.insert(positions[p], packed)
+                positions[p] += 1
                 args.append(packed)
             phi.args = tuple(args)

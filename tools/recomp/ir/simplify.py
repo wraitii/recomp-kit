@@ -24,6 +24,10 @@ PURE = frozenset((
 SELF = {"INT_EQUAL": 1, "INT_LESSEQUAL": 1, "INT_SLESSEQUAL": 1, "INT_NOTEQUAL": 0,
         "INT_LESS": 0, "INT_SLESS": 0, "INT_XOR": 0, "INT_SUB": 0, "INT_SBORROW": 0}
 
+REWRITABLE = frozenset(("PHI", "COPY", "INT_ZEXT", "BYTE", "PACK", "INT_ADD",
+                       "INT_SUB", "INT_MULT", "INT_AND", "INT_OR", "INT_XOR",
+                       "INT_LEFT", "INT_RIGHT", "SUBPIECE", "PIECE")) | SELF.keys()
+
 
 def canonicalize(s):
     """Propagate copies/constants and cancel byte decomposition/reassembly.
@@ -31,6 +35,7 @@ def canonicalize(s):
 Only equal-width values may alias one another. PACK of an entire BYTE sequence
 recovers its source; partial packs stay explicit. Constant evaluation uses the
 output width and p-code's zero result for shifts beyond the input width.
+Only values with operands that can still alias are revisited.
 """
     constants = {}
     for v in s.values:
@@ -43,12 +48,14 @@ output width and p-code's zero result for shifts beyond the input width.
             constants[key] = s.value("CONST", size, data=key[1])
         return constants[key]
 
+    pending = list(s.values)
     changed = True
     while changed:
         changed = False
         s.simplify_phis()
-        for v in list(s.values):
-            if s.resolve(v) is not v:
+        remaining = []
+        for v in pending:
+            if v.id in s.aliases:
                 continue
             v.args = tuple(s.resolve(a) for a in v.args)
             a, replacement = v.args, None
@@ -98,9 +105,12 @@ output width and p-code's zero result for shifts beyond the input width.
                 assert replacement.size == v.size
                 s.aliases[v.id] = replacement
                 changed = True
-    # Every non-aliased value's args were resolved by the last pass above;
-    # an aliased value's args are never read because consumers resolve first.
-    # The trailing all-values pass this replaced only repeated that work.
+            else:
+                for arg in a:
+                    if arg.opc in REWRITABLE:
+                        remaining.append(v)
+                        break
+        pending = remaining
 
 
 def whole(s, lanes):
