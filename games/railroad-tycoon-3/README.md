@@ -43,3 +43,29 @@ assembly and reduces caller stack frames. Eligibility and checkpoint preparation
 share one policy call; private entry thunks tail-call their bodies. Workload
 measurement uses host sampling with `RECOMP_PROFILE` unset or `0`, since the
 built-in guest profiler selects ordinary fallback. No workload gain is established.
+
+Static control-word analysis proves the conversion leaf preserves its incoming
+mode. Private preparation now requires `(CW & 0x0f00) == 0`, and each private
+body emits only the fast arithmetic; other modes reuse the ordinary checked
+entry. `x87_cw_clone = false` restores general private arithmetic. In the linked
+ARM64 diff harness, the two private bodies shrink from 4,680 to 1,120 bytes;
+preparation grows by 12 bytes. The existing rounding fixture, routed through
+preparation for private calls, matches the captured ordinary implementation in
+9,300 cases across both output masks, fallback modes and unexpected returns,
+including full x87 state and scratch memory. The ordinary original-byte fixture
+retains its 96 inherited discrepancies; the random-input diff comparison passes
+200 valid returns without discarded inputs.
+
+The code-map inventory has 58 functions containing 78 control-word writer sites.
+Their direct-call descendants include 81 of 1,565 x87-using functions. This
+narrows the exceptional-mode review; it does not establish a default at the
+remaining entries. The generated contract report includes writer sites, exposure
+closures, unknown boundaries and x87-only preservation coverage: 481 of 1,565
+functions currently prove precision/rounding preservation. Local stack provenance
+proves the original `__ftol` save/truncate/restore sequence; shared globals,
+indirect calls and startup-to-frame propagation remain conservative.
+
+The FEMMS regeneration changes 62 functions. Random-input original-byte checks
+reach no comparable returns in those functions; instruction checks cover tag
+clearing and control-word preservation. TOP follows AMD's documented reset,
+where Unicorn's Athlon model differs; see [the IR guide](../../docs/ir.md).

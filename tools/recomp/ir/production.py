@@ -80,13 +80,13 @@ def emit_ssa(tr, lifter, fn, entries, common, known, contracts, checked_returns=
     return lines, fir.entries, variant_requests, call_decisions
 
 
-def emit_private(tr, lifter, fn, common, masks):
+def emit_private(tr, lifter, fn, common, masks, known_mode=False):
     lines = []
     for mask in sorted(masks):
         symbol = "body_contract_%08x_%04x" % (fn.addr, mask)
         fields = frozenset(f for n, f in enumerate(FIELDS) if mask & (1 << n))
         source = emit(function_ir(tr, lifter, fn), symbol, lifter=lifter,
-                      checked_return=True, return_fields=fields, **common)
+                      checked_return=True, return_fields=fields, x87_known_mode=known_mode, **common)
         lines.extend(source.splitlines())
         lines.append("void fn_contract_%08x_%04x(X86 *c, uint32_t expected) { %s(c, expected); }"
                      % (fn.addr, mask, symbol))

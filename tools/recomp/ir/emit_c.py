@@ -462,7 +462,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
          msvc_convention=True, lazy_flags=False, lifter=None, indirect_call_symbol=None,
          call_contracts=None, x87_cw_clone=True, tail_symbols=None,
          checked_return=False, checked_calls=(), contract_calls=(), return_fields=None,
-         variant_requests=None, call_decisions=None):
+         variant_requests=None, call_decisions=None, x87_known_mode=False):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
     `call_symbols` maps an allowed direct-call target address to the C symbol
@@ -509,8 +509,17 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     and fold CW to that constant, then the general clone it falls back to at
     the same activation. It is exact: the guard covers every other CW. Strict
     x87 never clones.
+
+    `x87_known_mode` emits only the fast private body. Its entry preparation
+    must prove PC = RC = 0, and byte-backed analysis must prove the leaf has
+    no calls or control-word effects. Full guest x87 publication is retained.
     """
     arguments = dict(locals())
+    if x87_known_mode:
+        from . import x87_mode
+        if (return_fields is None or x87_scalar_strict or not x87_cw_clone
+                or not x87_mode.mode_preserving_leaf(x87_mode.prepare(fir))):
+            raise SSAError("known x87 mode requires a guarded private control-word-preserving leaf")
     requests_sink, variant_requests = variant_requests, set()
     decisions_sink, call_decisions = call_decisions, []
     checked_calls = frozenset(checked_calls)
@@ -561,6 +570,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     defer_ie = not x87_scalar_strict and msvc_convention
     scalar = X87Scalar(observe_loads=x87_scalar_strict, convention=x87_convention,
                        lazy_nan=defer_ie)
+    scalar.known_mode = x87_known_mode
 
     def flush_x87():
         return scalar.flush()
@@ -854,7 +864,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     # The clone duplicates the integer code too; a mostly-integer body
     # (ProjectionMeshBuilder::Build: 25 x87 of ~300 instructions) doubled in
     # size for a 3% corpus gain, so also require a minimum x87 density.
-    clones = (("fast", "general")
+    clones = (("fast",) if x87_known_mode else ("fast", "general")
               if cw_sensitive >= CW_CLONE_MIN_OPS
               and cw_sensitive * CW_CLONE_DENSITY >= len(fir.insns)
               else (None,))
@@ -1241,7 +1251,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
             activations.append(scalar.activations)
     if len(set(activations)) > 1:
         raise SSAError("x87 CW clones activate at different points: %r" % activations)
-    if activations and activations[0] > CW_CLONE_MAX_GUARDS:
+    if not x87_known_mode and activations and activations[0] > CW_CLONE_MAX_GUARDS:
         # Several tracker windows (calls, opaque recipes, reset edges): the
         # shared locals stay live across every guard into the general clone,
         # and the extra register pressure outweighed the folded selects

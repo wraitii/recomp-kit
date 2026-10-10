@@ -87,6 +87,13 @@ FNSAVE/FNSTENV, guest continuations, over-budget bodies). `decoded.py` also emit
 entries. Unmodelled instructions become `recomp_unmodelled(c, addr)` traps only
 under `--allow-unmodelled`; otherwise translation fails.
 
+The decoded emitter handles `FEMMS` (`0f 0e`) by emptying the x87 tags and
+clearing TOP, preserving the control word and other status fields. AMD's Athlon
+optimization guide (22007K, section 9) specifies this stack-pointer reset;
+Unicorn's Athlon model leaves TOP unchanged, so it is an incomplete oracle for
+that field. Undefined data-register contents retain deterministic runtime values
+and exact-value shadows. `EMMS` retains the Intel tag-only behavior.
+
 `output.py` writes address-bucketed body chunks (2 MiB budget), entry thunks,
 `funcs.h`, `table.c`, `symbols.json` and the report (counts, entry kinds, SSA
 versus decoded reasons, unmodelled, seconds). Workers lift and emit one function
@@ -228,6 +235,12 @@ thunk then tail-calls its body. A rejection leaves the countdown untouched and
 the fully published ordinary entry owns the checkpoint, including due polling.
 Hooks, profiling, frame watches and replacements retain that ordinary path.
 The cleanup sequence is in [contract-cleanup.md](contract-cleanup.md).
+
+`x87_mode.py` supplies separate control-word facts, return relations and a
+byte-backed writer/exposure inventory in that report. A proven preserving leaf
+can use a fast-only private body when preparation establishes PC = RC = 0;
+rejected modes use the shared ordinary checked entry. These are mode proofs,
+not contracts for x87 values, tags, TOP, status or exact-integer shadows.
 
 ### Policies
 

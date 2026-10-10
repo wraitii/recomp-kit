@@ -224,6 +224,7 @@ class X87Scalar:
         # CW clone role (see `emit_c`): None for a single body, "fast" for the
         # PC=00/RC=00 clone, "general" for the clone it falls back to.
         self.clone = None
+        self.known_mode = False
         self.activations = 0
         self.serial = 0
         self.temps = []
@@ -261,7 +262,7 @@ class X87Scalar:
         index = self.activations
         self.activations += 1
         lines = ["x87_top_ = c->fpu_top;", "x87_cw_ = c->fpu_cw;"]
-        if self.clone == "fast":
+        if self.clone == "fast" and not self.known_mode:
             lines.append("if (RECOMP_UNLIKELY((x87_cw_ & 0x%xu) != 0u)) goto %s;"
                          % (CW_FIELDS, cw_label(index)))
         elif self.clone == "general":

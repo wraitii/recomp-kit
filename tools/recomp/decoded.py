@@ -144,12 +144,10 @@ VECTOR_MNEM = frozenset((
 def is_vector_insn(mnem, ops):
     """True for an MMX/SSE/SSE2 instruction (see VECTOR_REG_RE).
 
-    EMMS is not one of them here: it names no register and only marks every
-    x87 register empty, which the x87 model can do. Codecs call a lone
-    `emms; ret` helper unconditionally, whatever CPUID said, so trapping it
-    stopped a game that never used MMX arithmetic at all.
+    EMMS and FEMMS are not vector traps here: they name no register and the
+    x87 model handles their media-state effects directly.
     """
-    if mnem == "EMMS":
+    if mnem in ("EMMS", "FEMMS"):
         return False
     return mnem in VECTOR_MNEM or any(VECTOR_REG_RE.search(o) for o in ops)
 
@@ -1881,6 +1879,8 @@ class Translator(object):
             # Every x87 register empty; TOP and the values are left alone.
             # Codecs call a bare `emms; ret` whatever CPUID said.
             return ["c->fpu_tag = 0xffffu;"]
+        if m == "FEMMS":
+            return ["c->fpu_top = 0u;", "c->fpu_tag = 0xffffu;"]
         if m == "STMXCSR":
             # No translated SSE arithmetic changes MXCSR, so expose its reset value.
             return ["wr32(%s, 0x1f80u);" % addr_expr(ops[0])]

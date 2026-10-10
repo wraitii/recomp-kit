@@ -24,7 +24,7 @@ import decoded
 import output
 from settings import Settings
 from decoded import external_exits
-from ir import call_contracts, production
+from ir import call_contracts, production, x87_mode
 from ir.lift import Lifter, LiftError
 from ir.ssa import SSAError
 from program import Program, TranslateError
@@ -130,17 +130,26 @@ def _scan(addrs):
         escapes = bool(tr.seh_escaping_returns(fn))
         site = (bool(fn.seh_sites) or any(fn.insns[i].mnem == "POP" for i in fn.seh_restores)
                 or tr.image.msvc_seh_epilog(addr) or any(map(tr.seh_except_entry, fn.insns)))
-        prepared = None
+        prepared, mode_prepared = None, None
         if not (escapes or site or entries or fn.pushed_continuations or fn.return_jumps
                 or fn.dead_addrs or addr in tr.noreturn_callees):
             try:
-                prepared = call_contracts.prepare(decoded.function_ir(tr, ctx.lifter, fn))
+                fir = decoded.function_ir(tr, ctx.lifter, fn)
+                prepared = call_contracts.prepare(fir)
+                mode_prepared = x87_mode.prepare(fir)
             except (LiftError, RecursionError):
                 prepared = None
             else:
                 prepared = prepared or False
+        x87_count, writers = 0, []
+        for ins in fn.insns:
+            mnem = ins.mnem.upper().removeprefix("WAIT ")
+            x87_count += mnem.startswith("F") and mnem != "FEMMS"
+            if x87_mode.writer_effect(mnem) is not None:
+                writers.append({"site": ins.addr, "mnemonic": mnem})
         rows.append((addr, Row(addr, fn.name, len(fn.insns), fn.insns[0].addr, fn.insns[-1].addr),
-                     calls, refs, sorted(dangling), returns, reason, escapes, prepared))
+                     calls, refs, sorted(dangling), returns, reason, escapes, prepared, mode_prepared, x87_count,
+                     writers))
     return rows
 
 
@@ -202,11 +211,11 @@ def _emit(task):
 
 
 def _private(task):
-    addr, masks = task
+    addr, masks, known_mode = task
     ctx = _CTX
     fn, entries = ctx.load(addr)
     ctx.tr.analyze(fn, entries)
-    return addr, production.emit_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit, masks)
+    return addr, production.emit_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit, masks, known_mode)
 
 
 def chunked(addrs, count):
@@ -313,6 +322,43 @@ def parse_args(argv):
     return ap.parse_args(argv)
 
 
+def mode_report(settings, prepared, summaries, opaque, known_modes, x87_counts, exposure):
+    functions = []
+    for addr in sorted(settings.state_contract_callers | settings.checked_returns):
+        body = prepared.get(addr)
+        row = {"function": "%08x" % addr,
+               "x87_instructions": x87_counts.get(addr, 0),
+               "return_relation": x87_mode.summary_dict(summaries.get(addr, x87_mode.UNKNOWN_SUMMARY))}
+        if body is None or addr in opaque:
+            row["reason"] = "opaque function"
+        else:
+            analysis = x87_mode.analyze(body, summaries, opaque)
+            targets = {site: target for _, site, target in body.calls}
+            row["calls"] = [{"site": "%08x" % site,
+                             "target": "%08x" % targets[site] if targets[site] is not None else None,
+                             "incoming": x87_mode.fact_dict(fact)}
+                            for site, fact in sorted(analysis.calls.items())]
+            row["return_fact"] = x87_mode.fact_dict(analysis.returns)
+            row["losses"] = analysis.losses
+        functions.append(row)
+    x87_functions = {addr for addr, count in x87_counts.items() if count}
+    covered = {addr for addr in x87_functions
+               if summaries.get(addr, x87_mode.UNKNOWN_SUMMARY).preserved_mask & 0x0f00 == 0x0f00}
+    return {"scope": "translated paths without hooks or dispatch overrides",
+            "exposure": exposure,
+            "coverage": {"x87_functions": len(x87_functions),
+                         "mode_preserving": len(covered),
+                         "without_mode_preservation_proof": len(x87_functions - covered),
+                         "opaque_or_unprepared": sum(prepared.get(addr) is None or addr in opaque
+                                                     for addr in x87_functions)},
+            "guarded_private_targets": ["%08x" % addr for addr in sorted(known_modes)],
+            "private_entry_guard": {"mask": "0f00", "value": "0000"},
+            "entry_fact": "symbolic incoming control word; no startup-mode assumption",
+            "functions": functions,
+            "return_relations": [{"function": "%08x" % addr, **x87_mode.summary_dict(summary)}
+                                 for addr, summary in sorted(summaries.items())]}
+
+
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     started = time.monotonic()
@@ -358,6 +404,12 @@ def main(argv=None):
                 "(function or referenced entry), re-export the code map and regenerate" % len(dangling))
 
         conservative = native_replaced(settings)
+        mode_prepared = {addr: row[9] for addr, row in scanned.items()}
+        mode_opaque = conservative | helpers | {addr for addr, row in scanned.items() if row[6] is not None}
+        mode_summaries = x87_mode.summarize(mode_prepared, mode_opaque)
+        x87_counts = {addr: row[10] for addr, row in scanned.items()}
+        mode_exposure = x87_mode.exposure_report(mode_prepared, calls, mode_opaque, x87_counts,
+                                                {addr: row[11] for addr, row in scanned.items()})
         for addr in settings.checked_returns:
             row = scanned.get(addr)
             if not row or not row[8] or row[6] is not None or addr in helpers or addr in conservative:
@@ -379,6 +431,9 @@ def main(argv=None):
                     fn, entries = ctx.load(addr)
                     ctx.tr.analyze(fn, entries)
                     private_targets[addr] = production.private_contract(ctx.tr, ctx.lifter, fn)
+        known_modes = {addr for addr in private_targets
+                       if settings.emit["x87_cw_clone"] and not settings.emit["x87_scalar_strict"]
+                       and addr not in mode_opaque and x87_mode.mode_preserving_leaf(mode_prepared.get(addr))}
 
         tasks = []
         for part in parts:
@@ -397,7 +452,8 @@ def main(argv=None):
                 private_requests[row[0]] = set(row[4])
             for addr, mask in row[4]:
                 private_masks.setdefault(addr, set()).add(mask)
-        for addr, lines in pool.map(_private, sorted(private_masks.items())):
+        for addr, lines in pool.map(_private, [(addr, masks, addr in known_modes)
+                                             for addr, masks in sorted(private_masks.items())]):
             results[addr][1].extend(lines)
         phase("private entries")
 
@@ -414,7 +470,7 @@ def main(argv=None):
     if settings.module:
         output.write_module_table(args.out, entry_names, symbols, call_returns, settings.module)
     else:
-        output.write_table(args.out, entry_names, symbols, call_returns, private_masks)
+        output.write_table(args.out, entry_names, symbols, call_returns, private_masks, known_modes)
     output.write_symbols(
         args.out, str(settings.exe), ctx.image.base, symbols, settings.curated)
     selected_callers = (set(settings.state_contract_callers)
@@ -436,6 +492,8 @@ def main(argv=None):
             {"function": "%08x" % addr, "reason": results[addr][2]}
             for addr in sorted(results) if results[addr][2] is not None],
         "call_decisions": decisions,
+        "x87_mode": mode_report(settings, mode_prepared, mode_summaries, mode_opaque,
+                                known_modes & private_masks.keys(), x87_counts, mode_exposure),
     }
     with open(os.path.join(args.out, "contract-report.json"), "w") as fh:
         json.dump(contract_report, fh, sort_keys=True, indent=1)

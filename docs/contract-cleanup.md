@@ -17,9 +17,28 @@ checkpoint countdown and replacement selection. It decrements once on success;
 the ordinary entry owns polling on rejection. Replacement identity is resolved
 beside the immutable dispatch tables without indexed table loads.
 
-The body still transfers x87 state through `X86`. Its internal arithmetic
-specialization checks the precision/rounding bits; the general branch handles
-other modes. Guest scratch accesses and faults remain intact.
+The body still transfers x87 state through `X86`. Ordinary entries retain the
+guarded arithmetic specialization and general branch. Private preparation checks
+the precision/rounding bits before decrementing the checkpoint countdown; its
+private leaf bodies contain only the known-mode arithmetic. Other modes use the
+shared ordinary checked entry. Guest scratch accesses and faults remain intact.
+
+`ir/x87_mode.py` tracks known control-word bits and symbolic entry bits through
+the CFG and conservative direct-call return relations. Byte-backed resets and
+environment saves have explicit effects; memory restores, unresolved calls and
+unclassified operations lose facts. Recursive call edges remain conservative.
+`ir/x87_provenance.py` follows register aliases and local stack bytes in closed
+linear leaves, proving temporary changes and restoration in `__ftol` without
+removing the original guest operations. Unknown stores invalidate saved slots.
+Private known-mode emission additionally requires a closed returning leaf with
+no calls or control-word effects. `x87_cw_clone = false` disables it.
+
+The report separates preservation coverage among x87-using functions from the
+inventory of concrete writers, their direct-call descendants, reverse callers
+and unknown boundaries. These exposure closures include calls before and after
+a setter and are review sets, not constant-mode proofs. Startup/device facts,
+shared-memory save/change/restore provenance and callback paths still need propagation before
+an unguarded default-mode specialization is justified.
 
 ## Objective
 
