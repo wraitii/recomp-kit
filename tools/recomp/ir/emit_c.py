@@ -1157,7 +1157,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     if return_fields is not None:
                         eip_keys = [key for key, (field, _) in mapping.items() if field == "c->eip"]
                         popped = field_value(b.exit, "c->eip", eip_keys)
-                        lines.append("if (%s != expected_return_) {" % popped)
+                        lines.append("if (RECOMP_UNLIKELY(%s != expected_return_)) {" % popped)
                         lines.extend(publish_fields(b.exit, transfers.returns[v.id].fallback.required,
                                                     transfers.returns[v.id].fallback.flags))
                         lines.extend(["recomp_return(c);", "return;", "}"])
@@ -1165,7 +1165,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     if return_fields is not None:
                         pass
                     elif checked_return:
-                        lines.append("if (!checked_return_ || c->eip != expected_return_) recomp_return(c);")
+                        lines.append("if (!checked_return_ || RECOMP_UNLIKELY(c->eip != expected_return_)) recomp_return(c);")
                     else:
                         lines.append("recomp_return(c);")
                     lines.append("return;")
