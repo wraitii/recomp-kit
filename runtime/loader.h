@@ -49,6 +49,7 @@ struct LoaderModule {
     std::string name, path;
     uint32_t base = 0, size = 0, entry = 0, export_rva = 0, export_size = 0;
     bool attached = false;
+    bool thread_notifications_disabled = false;
     uint32_t load_refs = 0;
     std::vector<uint8_t> initial_image;
     std::vector<SectionInfo> sections;
@@ -67,6 +68,14 @@ LoaderModule *loader_module_named(const char *name); // case-insensitive, nullpt
 const LoaderModule *loader_module_containing(uint32_t addr);
 // The guest address of a named export, 0 when the module has none by that name.
 uint32_t loader_module_export(const LoaderModule &m, const char *name);
+// DllMain(reason) for a mapped module. Returns 1 when the module's entry is not
+// translated, as Windows does for a DLL with no DllMain, and logs that fact.
+uint32_t loader_call_entry(X86 *c, const LoaderModule &m, uint32_t reason);
+// Attach a mapped auxiliary module on demand: restore its post-IAT bytes, run
+// DllMain(DLL_PROCESS_ATTACH) and take a load reference (one more when it is
+// already attached). Returns the module base, or 0 when it is unknown or its
+// attach failed; loader_error() names the failure.
+uint32_t loader_attach_module(X86 *c, const char *name);
 uint32_t loader_module_export_ordinal(const LoaderModule &m, uint32_t ordinal);
 // True inside the main image or any auxiliary module.
 bool loader_in_image(uint32_t addr);

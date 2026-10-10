@@ -1184,6 +1184,33 @@ void o_CoTaskMemFree(X86 *c) {
         heap_free(arg(c, 0));
     set_eax(c, 0);
 }
+// StringFromCLSID(rclsid, &lplpsz): the canonical braces-and-dashes form, in
+// guest memory allocated with CoTaskMemAlloc, which heap_alloc backs.
+void o_StringFromCLSID(X86 *c) {
+    uint32_t clsid = arg(c, 0), out = arg(c, 1);
+    if (!clsid || !gm_valid(clsid, 16) || !out || !gm_valid(out, 4)) {
+        set_eax(c, 0x80070057u); // E_INVALIDARG
+        return;
+    }
+    const uint8_t *g = gm_ptr(clsid);
+    uint32_t d1;
+    uint16_t d2, d3;
+    memcpy(&d1, g, 4);
+    memcpy(&d2, g + 4, 2);
+    memcpy(&d3, g + 6, 2);
+    char text[40];
+    snprintf(text, sizeof text, "{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}", d1, d2, d3,
+             g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+    uint32_t units = (uint32_t)strlen(text);
+    uint32_t buf = heap_alloc((units + 1) * 2, true);
+    if (!buf) {
+        set_eax(c, 0x8007000eu); // E_OUTOFMEMORY
+        return;
+    }
+    gm_put_wstr(buf, text, units + 1);
+    wr32(out, buf);
+    set_eax(c, 0);
+}
 void o_IsEqualGUID(X86 *c) {
     uint32_t a = arg(c, 0), b = arg(c, 1);
     set_eax(c, a && b && gm_valid(a, 16) && gm_valid(b, 16) && !memcmp(g_mem + a, g_mem + b, 16));
@@ -2867,6 +2894,7 @@ const ImportShim g_misc_shims[] = {
     {"ole32.dll", "CoInitializeEx", 2, o_CoInitialize},
     {"ole32.dll", "CoTaskMemAlloc", 1, o_CoTaskMemAlloc},
     {"ole32.dll", "CoTaskMemFree", 1, o_CoTaskMemFree},
+    {"ole32.dll", "StringFromCLSID", 2, o_StringFromCLSID},
     {"ole32.dll", "IsEqualGUID", 2, o_IsEqualGUID},
     {"ole32.dll", "CoFileTimeToDosDateTime", 3, o_CoFileTimeToDosDateTime},
     {"ole32.dll", "CoUninitialize", 0, o_CoUninitialize},

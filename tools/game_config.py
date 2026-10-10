@@ -6,6 +6,7 @@ tomllib, so the pinned tomli is the fallback."""
 import os
 from pathlib import Path
 import re
+import struct
 
 try:
     import tomllib
@@ -59,6 +60,20 @@ BUTTON_TARGET_RE = re.compile(
 HEAP_END = 0x0e000000        # default heap end; reserved low runtime regions start here
 GUEST_SIZE_DEFAULT = 0x10000000   # runtime/x86.h GUEST_SIZE: the arena, 256 MB unless a module needs more
 AUX_REQUIRED_KEYS = ("name", "sha256", "base", "size")
+
+GUID_RE = re.compile(
+    r"^\{?([0-9a-fA-F]{8})-([0-9a-fA-F]{4})-([0-9a-fA-F]{4})-"
+    r"([0-9a-fA-F]{4})-([0-9a-fA-F]{12})\}?$")
+
+
+def parse_guid(value, source, where):
+    """A GUID string as the 16 little-endian bytes the guest memory holds."""
+    match = GUID_RE.match(value) if isinstance(value, str) else None
+    if not match:
+        raise ValueError("%s: %s must be a GUID, not %r" % (source, where, value))
+    a, b, c, d, e = match.groups()
+    return (struct.pack("<IHH", int(a, 16), int(b, 16), int(c, 16))
+            + bytes.fromhex(d) + bytes.fromhex(e))
 
 # The production translation profile: every optimization the kit has. load()
 # fills these when a game omits them. fault_state = "exact" gives up the
@@ -317,6 +332,7 @@ def load(game_dir, build_root=None):
 def load_aux_modules(cfg, game_dir, source):
     modules = []
     guest_size = cfg["game"].get("guest_size", GUEST_SIZE_DEFAULT)
+    seen_classes = set()
     for key, entry in sorted(cfg.get("modules", {}).get("aux", {}).items()):
         missing = [name for name in AUX_REQUIRED_KEYS if name not in entry]
         if missing:
@@ -328,10 +344,24 @@ def load_aux_modules(cfg, game_dir, source):
             raise ValueError("%s: [modules.aux.%s] path and original_path conflict" % (source, key))
         path = (game_dir / entry["path"] if "path" in entry else
                 cfg["build_root"] / "original" / entry.get("original_path", entry["name"]))
+        com_classes = []
+        for item in entry.get("com_classes", []):
+            where = "[modules.aux.%s] com_classes" % key
+            if not isinstance(item, dict) or "clsid" not in item or "name" not in item:
+                raise ValueError("%s must list tables with clsid and name, not %r" % (where, item))
+            clsid = parse_guid(item["clsid"], source, where + ".clsid")
+            if clsid in seen_classes:
+                raise ValueError("%s repeats a CLSID already registered" % where)
+            seen_classes.add(clsid)
+            name = item["name"]
+            if not isinstance(name, str) or not name:
+                raise ValueError("%s.name must be a non-empty string" % where)
+            com_classes.append({"clsid": clsid, "name": name})
         modules.append({"key": key, "name": entry["name"], "sha256": entry["sha256"],
                         "base": base, "size": size, "path": path.resolve(),
                         "code_map_path": (game_dir / entry.get("code_map", "metadata-" + key)).resolve(),
-                        "entry_points": entry.get("entry_points", [])})
+                        "entry_points": entry.get("entry_points", []),
+                        "com_classes": com_classes})
     ordered = sorted(modules, key=lambda module: module["base"])
     for left, right in zip(ordered, ordered[1:]):
         if left["base"] + left["size"] > right["base"]:

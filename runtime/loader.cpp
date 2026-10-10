@@ -590,6 +590,38 @@ LoaderModule *loader_module_named(const char *name) {
             return &m;
     return nullptr;
 }
+uint32_t loader_call_entry(X86 *c, const LoaderModule &m, uint32_t reason) {
+    if (!m.entry || recomp_module_lookup(m.entry) < 0) {
+        LOGV("%s: DLL entry %08x is not translated, not run", m.name.c_str(), m.entry);
+        return 1;
+    }
+    uint32_t result = guest_call(c, m.entry, m.base, reason, 0);
+    LOGV("%s: DLL entry %08x reason %u returned %08x", m.name.c_str(), m.entry, reason, result);
+    return result;
+}
+
+uint32_t loader_attach_module(X86 *c, const char *name) {
+    LoaderModule *m = loader_module_named(name);
+    if (!m || m->base == loader_image_base())
+        return 0;
+    if (m->attached) {
+        ++m->load_refs;
+        return m->base;
+    }
+    memcpy(g_mem + m->base, m->initial_image.data(), m->initial_image.size());
+    m->thread_notifications_disabled = false;
+    m->attached = true;
+    m->load_refs = 1;
+    if (!loader_call_entry(c, *m, 1)) { // DLL_PROCESS_ATTACH
+        loader_call_entry(c, *m, 0);    // failed attach still receives detach
+        m->attached = false;
+        m->load_refs = 0;
+        g_error = m->name + " DllMain(DLL_PROCESS_ATTACH) returned FALSE";
+        return 0;
+    }
+    return m->base;
+}
+
 const LoaderModule *loader_module_containing(uint32_t addr) {
     if (g_main.base && addr >= g_main.base && addr - g_main.base < g_main.size)
         return &g_main;

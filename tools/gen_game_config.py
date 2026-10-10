@@ -88,6 +88,15 @@ def render_header(cfg):
                                  c_string(m["sha256"]), c_hex(m["base"]), c_hex(m["size"]))
         for m in cfg["aux_modules"]) if cfg["aux_modules"] else
         "#define RECOMP_AUX_MODULES {{0, 0, 0, 0u, 0u}}")
+    # In-proc COM servers a game's auxiliary modules expose. CoCreateInstance
+    # looks a CLSID up here after its native classes and calls the module's
+    # DllGetClassObject. The bytes are in guest memory order.
+    com_classes = [(m["name"], c) for m in cfg["aux_modules"] for c in m.get("com_classes", [])]
+    lines.append("#define RECOMP_COM_CLASS_COUNT %d" % len(com_classes))
+    lines.append("#define RECOMP_COM_CLASSES {%s}" % (", ".join(
+        "{{%s}, %s, %s}" % (", ".join("0x%02xu" % b for b in c["clsid"]), c_string(module_name),
+                             c_string(c["name"]))
+        for module_name, c in com_classes) if com_classes else "{{0}}"))
     # One bit per settings-page row, in game_config.SETTINGS_ROWS order.
     mask = sum(1 << i for i, row in enumerate(game_config.SETTINGS_ROWS) if row in cfg["settings"]["rows"])
     lines.append("#define RECOMP_SETTINGS_ROWS 0x%03xu" % mask)

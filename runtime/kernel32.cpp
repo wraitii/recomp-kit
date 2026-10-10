@@ -1400,17 +1400,8 @@ bool runtime_serves_module(const std::string &lower_name) {
 }
 
 // Mapped auxiliary code stays in the arena, but its Win32 lifetime follows
-// LoadLibrary/FreeLibrary. The main executable never enters this DLL path.
-uint32_t call_dll_entry(X86 *c, const LoaderModule &m, uint32_t reason) {
-    if (!m.entry || recomp_module_lookup(m.entry) < 0) {
-        LOGV("%s: DLL entry %08x is not translated, not run", m.name.c_str(), m.entry);
-        return 1;
-    }
-    uint32_t result = guest_call(c, m.entry, m.base, reason, 0);
-    LOGV("%s: DLL entry %08x reason %u returned %08x", m.name.c_str(), m.entry, reason, result);
-    return result;
-}
-
+// LoadLibrary/FreeLibrary. The main executable never enters this DLL path, and
+// loader_attach_module owns the rest of it for the COM class factories too.
 void load_library_named(X86 *c, const std::string &module_name) {
     std::string name = library_name(module_name);
     auto it = modules().find(name);
@@ -1425,22 +1416,10 @@ void load_library_named(X86 *c, const std::string &module_name) {
             set_eax(c, m->base);
             return;
         }
-        if (!m->attached) {
-            memcpy(g_mem + m->base, m->initial_image.data(), m->initial_image.size());
-            m->attached = true;
-            m->load_refs = 1;
-            if (!call_dll_entry(c, *m, 1)) { // DLL_PROCESS_ATTACH
-                call_dll_entry(c, *m, 0);    // failed attach still receives detach
-                m->attached = false;
-                m->load_refs = 0;
-                set_last_error(1114); // ERROR_DLL_INIT_FAILED
-                set_eax(c, 0);
-                return;
-            }
-        } else {
-            ++m->load_refs;
-        }
-        set_eax(c, m->base);
+        uint32_t base = loader_attach_module(c, name.c_str());
+        if (!base)
+            set_last_error(1114); // ERROR_DLL_INIT_FAILED
+        set_eax(c, base);
         return;
     }
     if (!runtime_serves_module(name)) {
@@ -1481,7 +1460,7 @@ void k_FreeLibrary(X86 *c) {
             return;
         }
         if (--m->load_refs == 0) {
-            call_dll_entry(c, *m, 0); // DLL_PROCESS_DETACH, before discarding globals
+            loader_call_entry(c, *m, 0); // DLL_PROCESS_DETACH, before discarding globals
             m->attached = false;
         }
     }

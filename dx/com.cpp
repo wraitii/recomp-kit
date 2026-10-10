@@ -1,5 +1,6 @@
 // com.cpp - guest COM objects, vtables and the three IUnknown slots.
 #include "com.h"
+#include "../runtime/loader.h"
 #include "../runtime/memory.h"
 
 #include <string.h>
@@ -165,7 +166,20 @@ std::vector<ComClass> &classes() {
     static auto *v = new std::vector<ComClass>();
     return *v;
 }
+
+// An in-proc server a game's auxiliary module exposes. The CLSID, module name
+// and class name come from game.toml through game_config.h, so nothing here
+// names a game.
+struct GuestComClass {
+    uint8_t clsid[16];
+    const char *module;
+    const char *name;
+};
+const GuestComClass g_guest_classes[] = RECOMP_COM_CLASSES;
+
 static const uint8_t kIidUnknown[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46};
+static const uint8_t kIidClassFactory[16] = {0x01, 0, 0, 0, 0, 0, 0, 0,
+                                             0xc0, 0, 0, 0, 0, 0, 0, 0x46};
 
 // CoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv)
 void CoCreateInstance(X86 *c) {
@@ -184,8 +198,59 @@ void CoCreateInstance(X86 *c) {
         if (memcmp(gm_ptr(clsid), k.clsid, 16) == 0)
             cls = &k;
     if (!cls) {
-        log_once("ole32.cocreate", "CoCreateInstance: class %08x-... is not registered here",
-                 rd32(clsid));
+        for (uint32_t i = 0; i < RECOMP_COM_CLASS_COUNT; ++i) {
+            const GuestComClass &k = g_guest_classes[i];
+            if (memcmp(gm_ptr(clsid), k.clsid, 16) != 0)
+                continue;
+            uint32_t base = loader_attach_module(c, k.module);
+            const LoaderModule *m = base ? loader_module_named(k.module) : nullptr;
+            uint32_t get_class_object = m ? loader_module_export(*m, "DllGetClassObject") : 0;
+            if (!get_class_object) {
+                LOGW("com: %s has no DllGetClassObject for %s: %s", k.module, k.name,
+                     loader_error());
+                com_ret(c, 0x80040154u); // REGDB_E_CLASSNOTREG
+                return;
+            }
+            uint32_t scratch = heap_alloc(16 + 4 + 4, true, 16);
+            if (!scratch) {
+                com_ret(c, E_OUTOFMEMORY);
+                return;
+            }
+            uint32_t iid_cf = scratch, cf_out = scratch + 16;
+            memcpy(gm_ptr(iid_cf), kIidClassFactory, 16);
+            wr32(cf_out, 0);
+            // DllGetClassObject(rclsid, IID_IClassFactory, &cf), then
+            // cf->CreateInstance(pUnkOuter, riid, ppv) with the caller's own
+            // riid/out, and cf->Release(). CreateInstance writes the real
+            // msxml3 interface pointer straight into the caller's slot.
+            uint32_t hr = guest_call(c, get_class_object, clsid, iid_cf, cf_out);
+            if (hr < 0x80000000u) {
+                uint32_t cf = rd32(cf_out);
+                if (!cf) {
+                    hr = 0x8000ffffu; // E_UNEXPECTED
+                } else {
+                    uint32_t vtbl = rd32(cf);
+                    hr = guest_call(c, rd32(vtbl + 4 * 3), cf, outer, riid, out);
+                    guest_call(c, rd32(vtbl + 4 * 2), cf);
+                }
+            }
+            heap_free(scratch);
+            LOGV("com: CoCreateInstance(%s from %s) -> %08x", k.name, k.module, hr);
+            com_ret(c, hr);
+            return;
+        }
+        const uint8_t *g = gm_ptr(clsid);
+        uint32_t d1;
+        uint16_t d2, d3;
+        memcpy(&d1, g, 4);
+        memcpy(&d2, g + 4, 2);
+        memcpy(&d3, g + 6, 2);
+        char key[40];
+        snprintf(key, sizeof key, "ole32.cocreate.%08x%04x%04x", d1, d2, d3);
+        log_once(key,
+                 "CoCreateInstance: class {%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X} is "
+                 "not registered here",
+                 d1, d2, d3, g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
         com_ret(c, 0x80040154u); // REGDB_E_CLASSNOTREG
         return;
     }
