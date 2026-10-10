@@ -10,7 +10,7 @@ never be mistaken for its newly assigned value. Helpers invalidate facts.
 from .simplify import EFFECTS, EXITS
 
 
-def plan(s, successors, fields, *, access_fields=None, reloaded=()):
+def plan(s, successors, fields, *, access_fields=None, reloaded=(), kept=None):
     """Return required register-lane keys for each effect and return snapshot.
 
 `fields` groups register lanes by runtime field. LOAD/STORE have read-only CPU
@@ -20,6 +20,8 @@ dispatch exposes the CPU, translate with fault_state = "exact". access_fields (t
 policy) therefore names the only fields published at accesses. DIV32 may
 return through an error handler; it therefore invalidates all publication facts.
 A field in `reloaded` is known after a helper: its reload reads the CPU.
+`kept` maps a CALL to the fields its callee neither reads nor writes: the call
+does not publish them, and they stay known across it only if already known.
 At joins a field is known only if every predecessor published its exit value.
 Starting with no facts gives a conservative least fixed point for loops.
 
@@ -57,6 +59,8 @@ Starting with no facts gives a conservative least fixed point for loops.
                     continue
                 state = b.exit if v.opc in EXITS else b.snapshots[v.id]
                 access = v.opc in ("LOAD", "STORE", "X87_MEM", "SEH")
+                held = kept.get(v.id, ()) if kept else ()
+                kept_groups, kept_known = set(), set()
                 required = []
                 for n, keys in enumerate(groups):
                     if access and access_fields is not None and not any(key in access_fields for key in keys):
@@ -64,6 +68,11 @@ Starting with no facts gives a conservative least fixed point for loops.
                         # The older CPU value stays known until a real observer.
                         continue
                     current = values(state, keys)
+                    if held and all(key in held for key in keys):
+                        kept_groups.add(n)
+                        if known.get(n) == current:
+                            kept_known.add(n)
+                        continue
                     if known.get(n) != current:
                         required.extend(keys)
                     if v.opc != "BRANCHIND":
@@ -78,7 +87,10 @@ Starting with no facts gives a conservative least fixed point for loops.
                     known.clear()
                     reloads = b.reloads.get(v.id, {})
                     for n, keys in enumerate(groups):
-                        if all(key in reloaded and key in reloads for key in keys):
+                        if n in kept_groups:
+                            if n in kept_known:
+                                known[n] = values(reloads, keys)
+                        elif all(key in reloaded and key in reloads for key in keys):
                             known[n] = values(reloads, keys)
             outgoing = {n for n, keys in enumerate(groups)
                         if known.get(n) == values(b.exit, keys)}

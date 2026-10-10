@@ -84,7 +84,7 @@ MEMORY = ("memory", 0)
 
 
 def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None,
-          flag_off_name=None):
+          flag_off_name=None, kept_calls=None):
     """Build SSA for reachable integer instructions using the supplied CFG.
 
     A direct CALL is admitted only when its literal target appears in
@@ -95,8 +95,13 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
     x87 and intra-instruction branches still need additional state/CFG models
     and are deliberately rejected. A ram varnode is a control target only;
     ordinary guest memory remains behind LOAD/STORE and the memory token.
+
+    `kept_calls` maps a direct-call target to the register keys its callee
+    neither reads nor writes. After such a call each kept field becomes a
+    ``CALL_KEEP`` of the call and the pre-call lanes instead of a reload.
     """
     call_targets = frozenset(call_targets)
+    kept_calls = kept_calls or {}
     if not fir.insns or len(fir.succ) != len(fir.insns):
         raise SSAError("empty function or invalid successor table")
     indices = {ins.addr: i for i, ins in enumerate(fir.insns)}
@@ -241,17 +246,25 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
             for n in range(size):
                 storage[(space, off + n)] = value if size == 1 else emit("BYTE", 1, [value], n)
 
-        def reload(value):
+        def reload(value, kept=frozenset()):
             """Read every tracked field back from the CPU after `value`, one value per group."""
             reloads = {}
             for group in reload_groups:
-                wide = emit("CALL_RELOAD", len(group), [value], data=group[0])
+                if all(key in kept for key in group):
+                    wide = emit("CALL_KEEP", len(group), [value] + [state[key] for key in group],
+                                data=group[0])
+                else:
+                    wide = emit("CALL_RELOAD", len(group), [value], data=group[0])
                 for n, key in enumerate(group):
                     state[key] = emit("BYTE", 1, [wide], n)
                     reloads[key] = state[key]
             for key in keys:
                 if key != MEMORY and key not in reloads:
-                    state[key] = reloads[key] = emit("CALL_RELOAD", s.inputs[key].size, [value], data=key)
+                    if key in kept:
+                        state[key] = emit("CALL_KEEP", s.inputs[key].size, [value, state[key]], data=key)
+                    else:
+                        state[key] = emit("CALL_RELOAD", s.inputs[key].size, [value], data=key)
+                    reloads[key] = state[key]
             b.reloads[value.id] = reloads
 
         for op in b.insn.ops:
@@ -265,7 +278,7 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                 b.snapshots[value.id] = before
                 b.cc_snapshots[value.id] = cc_active
                 state[MEMORY] = emit("MEMORY", 0, [value])
-                reload(value)
+                reload(value, kept_calls.get(op.ins[0][1], frozenset()))
                 # The callee's flags replace the caller's; a descriptor left by
                 # an SSA callee is materialised by the emitter before reload.
                 cc_active = None

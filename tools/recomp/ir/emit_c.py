@@ -439,13 +439,16 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     conservative publication.
 
     `call_contracts` maps a direct-call target address to a contract
-    (``reads``/``kills`` field sets, e.g. from ``call_contracts.py``). When
-    given, a direct CALL drops publication of a field the callee neither reads
-    nor preserves (``F not in reads and F in kills``). A preserved field is
-    never dropped: its CPU value can still flow out to this body's caller even
-    when this body does not read it back. The mapping is plain data so it
-    survives the emission process pool; a missing target keeps the conservative
-    full publication. ESP/EBP are never dropped.
+    (``reads``/``kills``/``writes`` field sets, e.g. from ``call_contracts.py``).
+    When given, a direct CALL drops publication of a field the callee neither
+    reads nor preserves (``F not in reads and F in kills``). A field the callee
+    neither reads nor writes is kept: it is not published, and the caller's
+    value continues past the call, so it is published later wherever the plan
+    still requires it. Flags are kept only all six together, so a pending
+    descriptor passes through untouched. Bodies with SEH effects keep nothing.
+    The mapping is plain data so it survives the emission process pool; a
+    missing target keeps the conservative full publication. ESP/EBP are never
+    dropped or kept.
 
     `x87_cw_clone` (the `x87_cw_clone` setting) emits a performance body with
     at least `CW_CLONE_MIN_OPS` precision/rounding-sensitive x87 operations,
@@ -538,6 +541,17 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
             key = ("register", off + n)
             lane_field[key] = name
             field_lanes.setdefault(name, set()).add(key)
+    kept_fields = {}
+    if call_contracts and not fir.seh:
+        for target, contract in call_contracts.items():
+            fields_ = {field for field in CONTRACT_FIELDS
+                       if field not in CONTRACT_NEVER_SKIP and field not in contract.reads
+                       and field not in contract.writes}
+            if not set(CONTRACT_FLAGS) <= fields_:
+                fields_ -= set(CONTRACT_FLAGS)
+            if fields_:
+                kept_fields[target] = frozenset(
+                    key for field in fields_ for key in field_lanes[field])
     tail_symbols = dict(tail_symbols or {})
     seh_mark = any("orphan" in kinds for kinds in fir.seh.values())
     cgi = codegen_ir(fir, lifter, tail_symbols)
@@ -551,7 +565,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     s = build(cgi,
               register_groups=groups,
               call_targets=call_symbols, indirect_call_symbol=indirect_call_symbol,
-              flag_off_name=flag_off_name)
+              flag_off_name=flag_off_name, kept_calls=kept_fields)
     if any(key != MEMORY and key not in mapping for key in s.inputs):
         raise SSAError("unmapped runtime register")
     canonicalize(s)
@@ -567,8 +581,10 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     # assembly helpers can return flags or consume incoming flags.
     # Keep flag publication at calls/returns until actual call
     # summaries prove which fields a boundary does not observe.
+    kept_calls = {v.id: kept_fields[v.data] for b in s.blocks.values() for v in b.ops
+                  if v.opc == "CALL" and v.data in kept_fields}
     publications = plan(s, fir.succ, groups, access_fields=access_fields,
-                        reloaded=set(mapping) - flag_keys)
+                        reloaded=set(mapping) - flag_keys, kept=kept_calls)
     # Cross-function contracts: a direct CALL may omit publication of a field
     # the callee neither reads nor preserves.  A field the callee preserves is
     # not droppable even when this body does not read it back: the field's CPU
@@ -589,14 +605,17 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     if field in CONTRACT_NEVER_SKIP or field in reads or field not in kills:
                         continue
                     skipped.add(field)
-                if not skipped:
+                kept = tuple(key for key in kept_calls.get(v.id, ()) if key in s.inputs)
+                if not skipped and not kept:
                     continue
-                contract_skip[v.id] = skipped
-                # A mod hook installed on the callee at runtime observes the
-                # full CPU, so the dropped fields stay publishable behind
-                # recomp_hooks_ever; keep their values live for that path.
+                if skipped:
+                    contract_skip[v.id] = skipped
+                # A mod hook installed on the callee at runtime observes and may
+                # rewrite the full CPU, so dropped and kept fields stay
+                # publishable behind recomp_hooks_ever, and a kept field is
+                # reread there after the call; keep their values live.
                 guarded = tuple(key for key in publications[v.id]
-                                if lane_field.get(key) in skipped)
+                                if lane_field.get(key) in skipped) + kept
                 contract_guard[v.id] = guarded
                 state = b.snapshots[v.id]
                 contract_roots.extend(state_roots(s, state, guarded, groups))
@@ -633,7 +652,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     # A callee-state read with no use is dropped; that also confines post-call
     # settles to reloads whose value is needed.
     live = simplify(s, publications, canonical=False, extra_roots=cc_roots + contract_roots,
-                    removable=frozenset(("CALL_RELOAD",)), groups=groups)
+                    removable=frozenset(("CALL_RELOAD", "CALL_KEEP")), groups=groups)
     reads_entry_flags = any(
         v.opc == "INPUT" and v.data in flag_keys and v.id in live and s.resolve(v) is v
         for v in s.values)
@@ -1018,6 +1037,8 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     lines.extend(publish(b.snapshots[v.id], v))
                     if contract_guard.get(v.id):
                         guarded = store_fields(b.snapshots[v.id], contract_guard[v.id])
+                        if lazy_flags and any(key in flag_keys for key in kept_calls.get(v.id, ())):
+                            guarded.append("c->cc_op = X86_CC_NONE;")
                         lines.append("if (RECOMP_UNLIKELY(recomp_hooks_ever)) {")
                         lines.extend(guarded)
                         lines.append("}")
@@ -1033,6 +1054,15 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     # Complete, callee-agnostic reload of one mapped state field.
                     field, lane = mapping[v.data]
                     lines.append("v%d = (%s >> %d) & %s;" % (v.id, field, lane * 8, mask(v.size)))
+                elif v.opc == "CALL_KEEP":
+                    field, lane = mapping[v.data]
+                    lanes = v.args[1:]
+                    source = whole(s, lanes) if len(lanes) > 1 else None
+                    kept = ref(source) if source is not None else " | ".join(
+                        "(%s << %d)" % (ref(x), n * 8) for n, x in enumerate(lanes))
+                    settle = "x86_cc_settle(c), " if lazy_flags and field in FLAG_FIELDS else ""
+                    lines.append("v%d = RECOMP_UNLIKELY(recomp_hooks_ever) ? (%s(%s >> %d) & %s) : (%s);"
+                                 % (v.id, settle, field, lane * 8, mask(v.size), kept))
                 elif v.opc == "CALLIND":
                     lines.extend(flush_x87())
                     scalar.reset()

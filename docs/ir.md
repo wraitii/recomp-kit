@@ -151,13 +151,22 @@ before a hook). Decoded bodies use an explicit per-mnemonic flag-effect table.
 `call_contracts.py` summarizes every body (decoded included) over the eight GPRs
 and six flags: `reads` is a backward may-liveness of entry values (through
 direct callees), `kills` a forward must-definite over all return paths (a GPR
-only if all four byte lanes are written). A save/restore stays in `reads`.
-Recursive components start empty and fall back to `reads=all, kills=none` if
+only if all four byte lanes are written), `writes` the fields any reachable
+instruction or callee may write. A save/restore stays in `reads`. SLEIGH omits
+AF for ADD/ADC/SUB/SBB/CMP/INC/DEC, which both emitters define, so the summary
+adds it; any instruction outside a flag-free mnemonic list may write every flag.
+Recursive components start empty and fall back to the conservative contract if
 unconverged. At a direct CALL the emitter drops field `F` only when
-`F not in reads and F in kills`; ESP and EBP are never dropped. Indirect calls,
-unbound targets, failed lifts, SEH and alternate-entry bodies and native
-replacements are `reads=all, kills=none`. Because any function can be hooked,
-dropped fields are still published behind `recomp_hooks_ever`.
+`F not in reads and F in kills`, and keeps it when `F` is in neither `reads`
+nor `writes`: no publication, and the SSA value continues past the call as
+`CALL_KEEP`, known in the CPU afterwards only if it was before. Flags are kept
+only all six together, so a pending descriptor passes through the callee
+untouched; bodies with SEH effects keep nothing. ESP and EBP are never dropped
+or kept. Indirect calls, unbound targets, failed lifts, SEH and alternate-entry
+bodies and native replacements read and write everything and kill nothing.
+Because any function can be hooked and a hook may rewrite the CPU, dropped and
+kept fields are still published behind `recomp_hooks_ever`, and `CALL_KEEP`
+rereads the field (after a settle, for flags) on that path.
 
 ### Policies
 
@@ -174,8 +183,9 @@ with `fault_state = "exact"` and `msvc_x87_convention = false`.
 DIVERGENCE(original) tags in the emitter name the accepted differences:
 `[ssa-x87-scalar]` interior faults and store-watch callbacks may see the
 preceding published x87 state; `[ssa-state-locals]` and `[ssa-call-contracts]`
-let a fault or SEH context raised before a dropped field is overwritten, or
-between an elided settle and its flag read, see stale fields;
+let a fault or SEH context raised before a dropped field is overwritten, inside
+a callee that keeps the field, or between an elided settle and its flag read,
+see stale fields;
 `[ssa-x87-binary32]` the binary32 exponent-range policy; `[ssa-x87-convention]`
 popped residue unpublished at calls and returns. Interior fault and SEH
 equivalence is unverified.
