@@ -517,6 +517,7 @@ struct ComObj {
     // --- K_D3D7DEVICE: the Rust d3d8-wgpu host device that owns the 32-bit
     // internal render target, and the state-block snapshots the engine's
     // blend-mode probe records. `d3d7_host` is null without the renderer.
+    bool d3d7_native_handoff_failed = false;
     void *d3d7_host = nullptr; // D3d8Device*; never a guest address
     uint32_t d3d7_width = 0, d3d7_height = 0;
     bool d3d7_recording = false;

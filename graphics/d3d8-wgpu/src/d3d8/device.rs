@@ -1217,6 +1217,7 @@ pub struct Device {
     batch: std::cell::RefCell<DrawBatch>,
     /// Present handoff ring (see [`FrameRing`]); created on first use.
     frame_ring: std::cell::RefCell<Option<FrameRing>>,
+    rgb565_handoff: std::cell::RefCell<Option<wgpu::ComputePipeline>>,
     /// The batch's target needs `publish_target` after it is flushed.
     publish_pending: std::cell::Cell<bool>,
     submits: std::cell::Cell<u64>,
@@ -1282,6 +1283,7 @@ impl Device {
             texture_groups: Default::default(),
             batch: Default::default(),
             frame_ring: Default::default(),
+            rgb565_handoff: Default::default(),
             publish_pending: Default::default(),
             submits: Default::default(),
             buffers_created_at_flush: Default::default(),
@@ -2890,7 +2892,17 @@ impl Device {
     /// the render to finish is the same one the readback made. Fails (so the
     /// caller falls back to readback) when no native handle is available.
     pub fn present_handoff(&self) -> Result<FrameHandoff, RenderError> {
+        self.present_surface_handoff(32)
+    }
+
+    pub fn present_surface_handoff(&self, bpp: u32) -> Result<FrameHandoff, RenderError> {
         use std::sync::atomic::Ordering;
+        if bpp != 16 && bpp != 32 {
+            return Err(RenderError::invalid(
+                "present_handoff",
+                "unsupported surface bit depth",
+            ));
+        }
         self.flush_draws();
         let b = &self.targets.backbuffer;
         let mut ring = self.frame_ring.borrow_mut();
@@ -2920,7 +2932,9 @@ impl Device {
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D2,
                         format: b.format,
-                        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                        usage: wgpu::TextureUsages::COPY_DST
+                            | wgpu::TextureUsages::TEXTURE_BINDING
+                            | wgpu::TextureUsages::STORAGE_BINDING,
                         view_formats: &[],
                     })
                 })
@@ -2939,25 +2953,29 @@ impl Device {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("d3d8-present-copy"),
             });
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &b.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &ring.textures[slot],
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: b.width,
-                height: b.height,
-                depth_or_array_layers: 1,
-            },
-        );
+        if bpp == 16 {
+            self.encode_rgb565_handoff(&mut encoder, &b.view, &ring.textures[slot]);
+        } else {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &b.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &ring.textures[slot],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: b.width,
+                    height: b.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         self.gpu.queue.submit([encoder.finish()]);
         // The host's queue has no ordering against ours: the render and copy
         // must have finished before it reads the slot.
@@ -2973,6 +2991,79 @@ impl Device {
             width: b.width,
             height: b.height,
         })
+    }
+
+    fn encode_rgb565_handoff(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        source: &wgpu::TextureView,
+        destination: &wgpu::Texture,
+    ) {
+        let mut pipeline = self.rgb565_handoff.borrow_mut();
+        let pipeline = pipeline.get_or_insert_with(|| {
+            let shader = self
+                .gpu
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("d3d8-rgb565-handoff"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        r#"
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var dst: texture_storage_2d<rgba8unorm, write>;
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(dst);
+    if (id.x >= size.x || id.y >= size.y) { return; }
+    let p = vec2<i32>(id.xy);
+    let bytes = vec3<u32>(textureLoad(src, p, 0).rgb * 255.0 + vec3<f32>(0.5));
+    let reduced = bytes >> vec3<u32>(3, 2, 3);
+    let expanded = reduced * vec3<u32>(255) / vec3<u32>(31, 63, 31);
+    textureStore(dst, p, vec4<f32>(vec3<f32>(expanded) / 255.0, 1.0));
+}
+"#
+                        .into(),
+                    ),
+                });
+            self.gpu
+                .device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("d3d8-rgb565-handoff"),
+                    layout: None,
+                    module: &shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        });
+        let view = destination.create_view(&wgpu::TextureViewDescriptor::default());
+        let group = self
+            .gpu
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("d3d8-rgb565-handoff"),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(source),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                ],
+            });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("d3d8-rgb565-handoff"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups(
+            destination.width().div_ceil(8),
+            destination.height().div_ceil(8),
+            1,
+        );
     }
 
     fn wait_slot(&self, busy: &std::sync::atomic::AtomicU32) -> Result<(), RenderError> {

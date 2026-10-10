@@ -184,6 +184,7 @@ void d3d_flush_surface(ComObj *surface, const char *why);
 // 16bpp bytes. Called beside every d3d_flush_surface above. A no-op for every
 // surface no D3D7 device renders into.
 void d3d7_flush_surface(ComObj *surface);
+bool d3d7_stage_surface(ComObj *surface);
 
 // ---------------------------------------------------------------------------
 // D3D7 -> D3D8 state translation (dx/d3d7.cpp). Pure functions so dx_tests can

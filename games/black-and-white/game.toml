@@ -10,6 +10,7 @@ entry_point = 0x007ca49f
 guest_root = 'C:\Black & White'
 guest_size = 0x10800000
 strict_imports = true
+store_hooks = false
 
 [translate]
 code_map = "metadata"

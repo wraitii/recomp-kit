@@ -48,6 +48,7 @@ void host_display_present_window_rgba(uint8_t *rgba, int w, int h);
 // when the host cannot take the texture (different device, CPU-only presenter);
 // the caller then falls back to `host_display_present_window_rgba`.
 int host_display_present_native_texture(void *native_texture, int w, int h, uint32_t *busy);
+int host_display_stage_native_texture(void *native_texture, int w, int h, uint32_t *busy);
 // Seconds to the presenter's next refresh boundary, `intervals` refreshes
 // on - when a Present with a sync interval returns. Zero on a headless
 // presenter. The caller waits in the scheduler, never in the host.

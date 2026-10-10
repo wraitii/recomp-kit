@@ -152,6 +152,10 @@ extern "C" __attribute__((weak)) int host_display_present_native_texture(void *,
                                                                          uint32_t *) {
     return 0;
 }
+extern "C" __attribute__((weak)) int host_display_stage_native_texture(void *, int, int,
+                                                                       uint32_t *) {
+    return 0;
+}
 extern "C" __attribute__((weak)) bool ddraw_gdi_primary_active() {
     return false;
 }

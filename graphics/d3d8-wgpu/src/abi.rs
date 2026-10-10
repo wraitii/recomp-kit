@@ -1253,6 +1253,19 @@ pub extern "C" fn d3d8_device_present_handoff(
     out_height: *mut u32,
     err: *mut D3d8Error,
 ) -> i32 {
+    d3d8_device_present_surface_handoff(dev, 32, out_texture, out_busy, out_width, out_height, err)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn d3d8_device_present_surface_handoff(
+    dev: *mut D3d8Device,
+    bpp: u32,
+    out_texture: *mut *mut core::ffi::c_void,
+    out_busy: *mut *mut u32,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    err: *mut D3d8Error,
+) -> i32 {
     let Some(device) = device_ref(dev) else {
         write_error(
             err,
@@ -1269,7 +1282,7 @@ pub extern "C" fn d3d8_device_present_handoff(
         );
         return D3d8Status::InvalidArgument as i32;
     }
-    match device.present_handoff() {
+    match device.present_surface_handoff(bpp) {
         Ok(frame) => {
             // SAFETY: caller-provided out-parameters, checked non-null above.
             unsafe {

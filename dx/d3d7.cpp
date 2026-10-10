@@ -27,6 +27,7 @@
 #include "host_api.h"
 #include "../platform/os.h"
 #include "../platform/profile_markers.h"
+#include "../runtime/display_seam.h"
 #include "../runtime/guest.h"
 #include "../runtime/memory.h"
 
@@ -1090,6 +1091,7 @@ void d3d7_writeback(ComObj *dev) {
         return; // leave dirty: a later flush may still service it
     }
     dev->d3d7->target_dirty = false;
+    ddraw_sync_gpu_pixels(s);
 #else
     (void)dev;
 #endif
@@ -2399,6 +2401,34 @@ const ComMethod g_vb7[] = {
 };
 
 } // namespace
+
+bool d3d7_stage_surface(ComObj *s) {
+#ifdef RECOMP_D3D8_WGPU
+    ComObj *dev = s ? com_get(s->d3d7_target_device) : nullptr;
+    if (!dev || dev->kind != K_D3D7DEVICE || !dev->d3d7_host || !dev->d3d7->target_dirty ||
+        dev->d3d7_native_handoff_failed || (s->bpp != 16 && s->bpp != 32) ||
+        s->width != dev->d3d7_width || s->height != dev->d3d7_height)
+        return false;
+    void *native = nullptr;
+    uint32_t *busy = nullptr;
+    uint32_t w = 0, h = 0;
+    D3d8Error err{};
+    if (d3d8_device_present_surface_handoff((D3d8Device *)dev->d3d7_host, s->bpp, &native, &busy,
+                                            &w, &h, &err) == 0) {
+        ddraw_external_present_begin();
+        if (host_display_stage_native_texture(native, (int)w, (int)h, busy))
+            return true;
+        __atomic_store_n(busy, 0u, __ATOMIC_RELEASE);
+    }
+    dev->d3d7_native_handoff_failed = true;
+    log_once("d3d7.present.handoff",
+             "d3d7: native present handoff unavailable (%s); using CPU presentation",
+             err.message[0] ? (const char *)err.message : "host presenter declined the texture");
+#else
+    (void)s;
+#endif
+    return false;
+}
 
 // Called by ddraw.cpp before it reads or presents a surface the D3D7 device
 // renders into. A no-op unless the surface has a live D3D7 target.

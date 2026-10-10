@@ -15,6 +15,7 @@
 // method, not merely a missing one.
 #include "com.h"
 #include "dx.h"
+#include "frame_dump.h"
 #include "dxt_decode.h"
 #include "host_api.h"
 #include "ddraw.h"
@@ -2676,6 +2677,11 @@ void record_cpu_write_rects(ComObj *s, const std::vector<HostDirtyRect> &boxes) 
 }
 } // namespace
 
+void ddraw_sync_gpu_pixels(ComObj *s) {
+    if (s && s->retained_pointer)
+        baseline_resync(s);
+}
+
 // A writable pointer stays writable after Unlock. Detect unannounced stores
 // under the guest baton, before a source read or primary present can read back
 // stale renderer pixels. Surfaces never locked writable pay no hashing cost.
@@ -3351,6 +3357,10 @@ void Surface_Flip(X86 *c) {
     // anything the device drew has to be in it first.
     d3d_flush_surface(s, "Flip front");
     d3d_flush_surface(back, "Flip back");
+    const bool native_present = s->is_primary && s->width == back->width &&
+                                s->height == back->height && s->bpp == back->bpp &&
+                                !dx_dump_enabled() && !mf_owns_the_screen() &&
+                                d3d7_stage_surface(back);
     d3d7_flush_surface(s);
     d3d7_flush_surface(back);
     // And anything a frame still holds has to be copied out of it, because
@@ -3362,6 +3372,9 @@ void Surface_Flip(X86 *c) {
     // the two pixel pointers reproduces that exactly: the guest's front and
     // back surface objects keep their identities and each now addresses the
     // other's memory, which is what the next Lock must see.
+    if (s->retained_pointer || back->retained_pointer)
+        std::swap(baselines()[s->id], baselines()[back->id]);
+    std::swap(s->retained_pointer, back->retained_pointer);
     std::swap(s->pixels, back->pixels);
     std::swap(s->pixels_bytes, back->pixels_bytes);
     std::swap(s->pitch, back->pitch);
@@ -3381,12 +3394,15 @@ void Surface_Flip(X86 *c) {
     ddraw_storage_changed(back);
     d3d_retarget_surface(s);
     d3d_retarget_surface(back);
-    ddraw_present(s);
+    if (!native_present)
+        ddraw_present(s);
     // A Flip of the PRIMARY chain is the end of a frame, by definition. An
     // offscreen flip chain is a private double buffer of the guest's and
     // flipping it says nothing about the screen, so sealing there would split
     // a frame in half.
-    if (s->is_primary)
+    if (native_present)
+        ddraw_external_present_end();
+    else if (s->is_primary)
         seal_frame("primary flip");
     com_ret(c, DD_OK);
 }

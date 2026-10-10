@@ -308,23 +308,24 @@ extern "C" void host_display_present_window_rgba(uint8_t *rgba, int w, int h) {
 // texture on this device, copied into the presenter's frame by a blit that
 // the one queue runs before the frame is composed. The alpha the CPU path
 // forces to 255 is not needed: legacy frames are composed with opaque blending.
-extern "C" int host_display_present_native_texture(void *native_texture, int w, int h,
-                                                   uint32_t *busy) {
+extern "C" int host_display_stage_native_texture(void *native_texture, int w, int h,
+                                                 uint32_t *busy) {
     gpu::Device *device = host_present_device();
-    if (!native_texture || !busy || w <= 0 || h <= 0 || !host_present_gpu_ready() || !device)
+    if (!native_texture || !busy || w <= 0 || h <= 0 || !host_present_gpu_ready() || !device ||
+        host_dump_every())
         return 0;
     gpu::Texture src = device->import_native_texture(native_texture);
     if (!src)
         return 0;
-    if (g_mode_w != w || g_mode_h != h || g_mode_bpp != 32)
-        host_set_display_mode(w, h, 32);
     host_present_first_write();
     gpu::CommandBuffer cb = device->begin();
     // The command buffer is committed whether or not anything was staged: an
     // open Metal encoder must be ended, and the slot is released on completion.
-    device->on_complete(
-        cb, [busy](gpu::CommandStatus, double) { __atomic_store_n(busy, 0u, __ATOMIC_RELEASE); });
     const bool staged = host_present_stage_texture(src, w, h, w, h, cb);
+    if (staged)
+        device->on_complete(cb, [busy](gpu::CommandStatus, double) {
+            __atomic_store_n(busy, 0u, __ATOMIC_RELEASE);
+        });
     device->commit(cb);
     if (!staged)
         return 0;
@@ -333,6 +334,15 @@ extern "C" int host_display_present_native_texture(void *native_texture, int w, 
         ++g_present_count;
     }
     host_page_overlay(nullptr, w, h, 32, w * 4, nullptr);
+    return 1;
+}
+
+extern "C" int host_display_present_native_texture(void *native_texture, int w, int h,
+                                                   uint32_t *busy) {
+    if (g_mode_w != w || g_mode_h != h || g_mode_bpp != 32)
+        host_set_display_mode(w, h, 32);
+    if (!host_display_stage_native_texture(native_texture, w, h, busy))
+        return 0;
     host_present_seal_window();
     return 1;
 }
