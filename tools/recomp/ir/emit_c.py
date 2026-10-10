@@ -323,17 +323,40 @@ def cc_action_lines(action):
         return ["x86_cc_drop(c);"]
     if action == flag_region.REMOVE:
         return []
+    if isinstance(action, tuple):
+        helper, flags = action
+        bits = " | ".join("X86_CCF_%s" % f.upper() for f in sorted(flags))
+        return ["%s(c, %s);" % (helper, bits)]
     return ["x86_cc_settle(c);"]
+
+
+def call_cc_action(summary, live):
+    """The post-call action for a region summary and the flags read from the fields.
+
+    A descriptor whose `cc_mask` misses every needed flag leaves those fields
+    current: with no write in the region it stays pending, and once every
+    flag it defines is overwritten before the next boundary it is dropped.
+    """
+    if summary is None:
+        return flag_region.SETTLE
+    reads, writes, must = summary
+    need = reads | live if not writes else reads | live | (flag_region.ALL_FLAGS - must)
+    if not need:
+        return flag_region.REMOVE if not writes else flag_region.DROP
+    if need == flag_region.ALL_FLAGS:
+        return flag_region.SETTLE
+    return ("x86_cc_settle_mask" if not writes else "x86_cc_settle_or_drop", need)
 
 
 def ssa_settle_plan(cgi, flag_off_name):
     """Per-site lazy-flag decisions for one SSA body.
 
     Returns ``(entry, calls)``: the decision at the body entry and a mapping
-    from each call instruction index to the post-call decision.  The
-    classification is over the codegen ops, so it matches what the emitter
-    actually materialises: an eager seam is an observer, a call is a normal
-    region boundary, and unknown forms settle.
+    from each call instruction index to the post-call region summary
+    (`flag_region.summarize`), which `call_cc_action` turns into a decision.
+    The classification is over the codegen ops, so it matches what the
+    emitter actually materialises: an eager seam is an observer, a call is a
+    normal region boundary, and unknown forms settle.
     """
     n = len(cgi.insns)
 
@@ -366,27 +389,27 @@ def ssa_settle_plan(cgi, flag_off_name):
     def is_end(i):
         return cgi.insns[i].mnem.upper() in ("CALL", "RET")
 
-    def classify(start):
-        return flag_region.analyze(start, successors, access, is_end,
-                                   lambda i: False, n)
+    def summarize(start):
+        return flag_region.summarize(start, successors, access, is_end,
+                                     lambda i: False, n)
 
     indices = {ins.addr: k for k, ins in enumerate(cgi.insns)}
     start = indices.get(cgi.addr)
-    entry = classify(start) if start is not None else flag_region.SETTLE
+    entry = flag_region.SETTLE
+    if start is not None:
+        found = summarize(start)
+        entry = flag_region.SETTLE if found is None else flag_region.decision(*found)
     calls = {}
     for i, ins in enumerate(cgi.insns):
         if ins.mnem.upper() != "CALL":
             continue
         after = successors(i)
-        if not after:
-            calls[i] = flag_region.SETTLE
-        else:
-            calls[i] = classify(after[0])
+        calls[i] = summarize(after[0]) if after else None
     return entry, calls
 
 
-def live_flag_reload_calls(s, live, flag_keys):
-    """Block indices whose call leaves a live arithmetic-flag reload.
+def live_flag_reload_calls(s, live, flag_off_name):
+    """Block index -> flags whose post-call reload is live.
 
     The SSA builder replaces every tracked flag with a fresh ``CALL_RELOAD``
     of the callee's fields after a call.  ``simplify`` keeps only the live,
@@ -395,18 +418,17 @@ def live_flag_reload_calls(s, live, flag_keys):
     can be live because a guest instruction later reads it, because a RET
     publishes it, or because a following call's publication snapshot (a
     callee that reads or preserves flags) roots it.  Only the call that owns
-    such a reload needs to materialise the descriptor; its neighbours keep
-    their region decision.
+    such a reload needs its flags materialised; its neighbours keep their
+    region decision.
     """
-    calls = set()
+    calls = {}
     for index, block in s.blocks.items():
         if not any(v.opc in ("CALL", "CALLIND") for v in block.ops):
             continue
         for v in block.ops:
-            if (v.opc == "CALL_RELOAD" and v.data in flag_keys
+            if (v.opc == "CALL_RELOAD" and v.data[0] == "register" and v.data[1] in flag_off_name
                     and v.id in live and s.resolve(v) is v):
-                calls.add(index)
-                break
+                calls.setdefault(index, set()).add(flag_off_name[v.data[1]])
     return calls
 
 
@@ -656,21 +678,17 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     reads_entry_flags = any(
         v.opc == "INPUT" and v.data in flag_keys and v.id in live and s.resolve(v) is v
         for v in s.values)
-    reads_after_call = any(
-        v.opc == "CALL_RELOAD" and v.data in flag_keys and v.id in live
-        and s.resolve(v) is v
-        for v in s.values)
-    if lazy_flags and reads_after_call:
-        # Only the call whose flag reload is needed materialises the callee's
-        # descriptor: that reload reads the fields directly, right after the
-        # site's settle.  A call whose flag reload is dead (shadowed by a
-        # later call or a region that overwrites all six) keeps its region
-        # decision.  This matters for a reload that is needed only as a
-        # following call's publication root: a callee that reads or preserves
-        # flags forces the caller to publish the fields before that call, so
-        # the earlier reload must not read a stale field.
-        for index in live_flag_reload_calls(s, live, flag_keys):
-            cc_calls[index] = flag_region.SETTLE
+    if lazy_flags:
+        # A post-call reload reads the flag fields directly, right after the
+        # site's action, so the action materialises a descriptor that defines
+        # one of them. A reload can be live only as a following call's
+        # publication root: a callee that reads or preserves flags forces the
+        # caller to publish the fields before that call, so the earlier reload
+        # must not read a stale field. A call whose flag reload is dead
+        # (shadowed by a later call or overwritten) keeps its region decision.
+        reloads = live_flag_reload_calls(s, live, flag_off_name)
+        cc_calls = {i: call_cc_action(summary, frozenset(reloads.get(i, ())))
+                    for i, summary in cc_calls.items()}
     if reads_entry_flags or fir.entries:
         # The SSA builder loads live entry flag INPUTs straight from the fields,
         # immediately after the entry settle.  Those loads are not codegen ops,

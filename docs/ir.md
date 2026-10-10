@@ -141,7 +141,11 @@ the six flag fields are current. `x86_cc_settle` writes them; `x86_get_eflags`,
 settle first. `ir/flag_region.py` walks from the entry or a post-call point to
 the next CALL/CALLIND/RET: with no flag read and no flag write the settle is
 removed; with no read and all six flags written on every path it becomes
-`x86_cc_drop`; otherwise it stays, as it does for paths leaving the body without
+`x86_cc_drop`. After a call, the flags read, reloaded from the fields or not
+written on every path form a mask: `x86_cc_settle_mask` (region without
+writes) and `x86_cc_settle_or_drop` materialise only a descriptor whose
+`cc_mask` meets it, and otherwise keep or drop it. A full settle stays for
+paths leaving the body without
 a call or return, for calls that can continue elsewhere (SEH adoption, noreturn,
 setjmp), and where hooks may observe (entry thunks and `recomp_jump` settle
 before a hook). Decoded bodies use an explicit per-mnemonic flag-effect table.

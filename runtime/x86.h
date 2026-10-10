@@ -784,6 +784,25 @@ static inline void x86_cc_drop(X86 *c) {
     c->cc_op = X86_CC_NONE;
 }
 
+/* Materialise a descriptor that defines a flag in `need`; otherwise leave it
+ * pending, since the `need` fields are already current. */
+RECOMP_HOT_INLINE void x86_cc_settle_mask(X86 *c, uint32_t need) {
+    if (RECOMP_UNLIKELY(c->cc_op != X86_CC_NONE) && (c->cc_mask & need))
+        x86_cc_materialize(c);
+}
+
+/* As x86_cc_settle_mask, for a site whose region overwrites every flag
+ * outside `need` before it is observed: a descriptor that defines none of
+ * `need` is dropped. */
+RECOMP_HOT_INLINE void x86_cc_settle_or_drop(X86 *c, uint32_t need) {
+    if (RECOMP_UNLIKELY(c->cc_op != X86_CC_NONE)) {
+        if (c->cc_mask & need)
+            x86_cc_materialize(c);
+        else
+            c->cc_op = X86_CC_NONE;
+    }
+}
+
 /* Clear the dead descriptor payload so a full-struct comparison does not see
  * bytes left over from an earlier descriptor.  Production never reads them
  * while cc_op is NONE, so this is a test/diagnostic helper. */
