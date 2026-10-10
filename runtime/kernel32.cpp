@@ -28,6 +28,7 @@
 #include <time.h>
 
 #include <map>
+#include <memory>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -86,6 +87,7 @@ enum HKind {
     H_NONE,
     H_FILE,
     H_FIND,
+    H_CHANGE,
     H_SEM,
     H_EVENT,
     H_MUTEX,
@@ -98,6 +100,7 @@ enum HKind {
 
 struct HObj {
     HKind kind = H_NONE;
+    std::shared_ptr<OsDirectoryWatch> watch;
     std::string object_name; // Named events, mutexes and mappings share a kernel object.
     uint32_t references = 1;
     int fd = -1;      // H_FILE, H_MAPPING
@@ -2090,6 +2093,60 @@ void k_DeleteCriticalSection(X86 *c) {
 // -------------------------------------------------------------------------
 // Synchronisation objects (single threaded, counted)
 // -------------------------------------------------------------------------
+void k_FindFirstChangeNotificationA(X86 *c) {
+    const std::string guest = gm_str(arg(c, 0));
+    const uint32_t filter = arg(c, 2);
+    if (filter != 0x10) {
+        LOGW("FindFirstChangeNotificationA: unsupported filter %08x for %s", filter, guest.c_str());
+        fflush(stderr);
+        abort();
+    }
+    const std::string path = win32_host_path(guest);
+    OsDirectoryWatch *watch = os_directory_watch_create(path.c_str(), arg(c, 1) != 0, filter);
+    if (!watch) {
+        if (errno == ENOSYS || errno == ENOTSUP) {
+            LOGW("FindFirstChangeNotificationA: native directory watching unavailable for %s",
+                 path.c_str());
+            fflush(stderr);
+            abort();
+        }
+        set_last_error(errno == ENOENT || errno == ENOTDIR ? ERROR_PATH_NOT_FOUND_
+                                                           : ERROR_ACCESS_DENIED_);
+        set_eax(c, INVALID_HANDLE_VALUE_);
+        return;
+    }
+    uint32_t handle = handle_new(H_CHANGE);
+    handles()[handle].watch = std::shared_ptr<OsDirectoryWatch>(watch, os_directory_watch_close);
+    set_eax(c, handle);
+}
+
+void k_FindNextChangeNotification(X86 *c) {
+    HObj *o = handle_get(arg(c, 0), H_CHANGE);
+    if (!o) {
+        set_last_error(ERROR_INVALID_HANDLE_);
+        set_eax(c, 0);
+        return;
+    }
+    if (os_directory_watch_next(o->watch.get()) != 0) {
+        LOGW("FindNextChangeNotification: native rearm failed for handle %08x", arg(c, 0));
+        fflush(stderr);
+        abort();
+    }
+    o->signalled = false;
+    set_eax(c, 1);
+}
+
+void k_FindCloseChangeNotification(X86 *c) {
+    const uint32_t handle = arg(c, 0);
+    if (!handle_get(handle, H_CHANGE)) {
+        set_last_error(ERROR_INVALID_HANDLE_);
+        set_eax(c, 0);
+        return;
+    }
+    handles().erase(handle);
+    set_eax(c, 1);
+}
+
 void k_CreateSemaphoreA(X86 *c) {
     uint32_t h = handle_new(H_SEM);
     handles()[h].count = (int32_t)arg(c, 1);
@@ -2678,6 +2735,19 @@ bool object_available(uint32_t h, uint32_t tid) {
         return false;
     timer_fire(o);
     switch (o->kind) {
+    case H_CHANGE:
+        if (!o->signalled) {
+            int changed = os_directory_watch_poll(o->watch.get());
+            if (changed < 0) {
+                LOGW(
+                    "FindFirstChangeNotificationA: native notification read failed for handle %08x",
+                    h);
+                fflush(stderr);
+                abort();
+            }
+            o->signalled = changed != 0;
+        }
+        return o->signalled;
     case H_SEM:
         return o->count > 0;
     case H_EVENT:
@@ -5316,6 +5386,9 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "CreateEventA", 4, k_CreateEventA},
     {"KERNEL32.dll", "ResetEvent", 1, k_ResetEvent},
     {"KERNEL32.dll", "CreateMutexA", 3, k_CreateMutexA},
+    {"KERNEL32.dll", "FindFirstChangeNotificationA", 3, k_FindFirstChangeNotificationA},
+    {"KERNEL32.dll", "FindNextChangeNotification", 1, k_FindNextChangeNotification},
+    {"KERNEL32.dll", "FindCloseChangeNotification", 1, k_FindCloseChangeNotification},
     {"KERNEL32.dll", "WaitForSingleObject", 2, k_WaitForSingleObject},
     {"KERNEL32.dll", "WaitForMultipleObjects", 4, k_WaitForMultipleObjects},
     // threads and process exit

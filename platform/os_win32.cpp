@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <io.h>
 #include <process.h>
@@ -150,6 +151,10 @@ int stat_attributes(const wchar_t *path, OsStat *out, bool follow) {
 struct OsThread {
     HANDLE handle;
     DWORD id;
+};
+
+struct OsDirectoryWatch {
+    HANDLE handle;
 };
 
 extern "C" {
@@ -355,6 +360,30 @@ int os_set_mtime(const char *path, int64_t mtime) {
     CloseHandle(h);
     return ok ? 0 : -1;
 }
+
+OsDirectoryWatch *os_directory_watch_create(const char *path, int subtree, uint32_t filter) {
+    HANDLE handle = FindFirstChangeNotificationW(widen(path).c_str(), subtree != 0, filter);
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = GetLastError() == ERROR_PATH_NOT_FOUND ? ENOENT : EACCES;
+        return nullptr;
+    }
+    return new OsDirectoryWatch{handle};
+}
+
+int os_directory_watch_poll(OsDirectoryWatch *watch) {
+    DWORD result = WaitForSingleObject(watch->handle, 0);
+    return result == WAIT_OBJECT_0 ? 1 : result == WAIT_TIMEOUT ? 0 : -1;
+}
+
+int os_directory_watch_next(OsDirectoryWatch *watch) {
+    return FindNextChangeNotification(watch->handle) ? 0 : -1;
+}
+
+void os_directory_watch_close(OsDirectoryWatch *watch) {
+    FindCloseChangeNotification(watch->handle);
+    delete watch;
+}
+
 int os_registry_read(const char *key, const char *value, char *buf, size_t cap) {
     if (!key || !value || !buf || !cap)
         return -1;

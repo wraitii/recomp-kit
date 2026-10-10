@@ -88,6 +88,11 @@ const char *os_null_device(void);
 int os_free_space(const char *path, uint64_t *bytes_out);
 // Sets a file's modification (and access) time, in seconds since the epoch.
 int os_set_mtime(const char *path, int64_t mtime);
+typedef struct OsDirectoryWatch OsDirectoryWatch;
+OsDirectoryWatch *os_directory_watch_create(const char *path, int subtree, uint32_t filter);
+int os_directory_watch_poll(OsDirectoryWatch *watch);
+int os_directory_watch_next(OsDirectoryWatch *watch);
+void os_directory_watch_close(OsDirectoryWatch *watch);
 // A string value from the Windows registry. `key` starts with "HKLM\" or
 // "HKCU\" and is read from the 64- and then the 32-bit view. -1 elsewhere.
 int os_registry_read(const char *key, const char *value, char *buf, size_t cap);

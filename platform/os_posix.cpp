@@ -27,6 +27,13 @@
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_OSX
+#include <CoreServices/CoreServices.h>
+#include <dispatch/dispatch.h>
+#include <atomic>
+#include <string>
+#endif
 #endif
 #ifndef MAP_ANON
 #define MAP_ANON MAP_ANONYMOUS
@@ -35,6 +42,41 @@
 struct OsThread {
     pthread_t handle;
 };
+
+#if defined(__APPLE__) && TARGET_OS_OSX
+struct OsDirectoryWatch {
+    FSEventStreamRef stream = nullptr;
+    dispatch_queue_t queue = nullptr;
+    std::string path;
+    bool subtree = false;
+    std::atomic<bool> pending{false};
+    std::atomic<bool> overflow{false};
+};
+
+static void directory_watch_events(ConstFSEventStreamRef, void *context, size_t count, void *paths,
+                                   const FSEventStreamEventFlags flags[],
+                                   const FSEventStreamEventId[]) {
+    auto *watch = static_cast<OsDirectoryWatch *>(context);
+    auto **names = static_cast<char **>(paths);
+    for (size_t i = 0; i < count; ++i) {
+        if (flags[i] &
+            (kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped |
+             kFSEventStreamEventFlagKernelDropped)) {
+            watch->overflow.store(true);
+            continue;
+        }
+        if (!(flags[i] & kFSEventStreamEventFlagItemModified))
+            continue;
+        std::string name = names[i];
+        if (name.compare(0, watch->path.size(), watch->path) != 0)
+            continue;
+        std::string relative = name.substr(watch->path.size());
+        if (relative.empty() || (!watch->subtree && relative.find('/') != std::string::npos))
+            continue;
+        watch->pending.store(true);
+    }
+}
+#endif
 
 extern "C" {
 
@@ -227,6 +269,102 @@ int os_set_mtime(const char *path, int64_t mtime) {
     times[0].tv_usec = times[1].tv_usec = 0;
     return utimes(path, times);
 }
+
+OsDirectoryWatch *os_directory_watch_create(const char *path, int subtree, uint32_t filter) {
+#if defined(__APPLE__) && TARGET_OS_OSX
+    if (filter != 0x10) {
+        errno = ENOTSUP;
+        return nullptr;
+    }
+    OsStat st{};
+    if (os_stat(path, &st) != 0)
+        return nullptr;
+    if (!st.is_dir) {
+        errno = ENOTDIR;
+        return nullptr;
+    }
+    char *canonical = realpath(path, nullptr);
+    if (!canonical)
+        return nullptr;
+    auto *watch = new OsDirectoryWatch;
+    watch->path = canonical;
+    free(canonical);
+    if (watch->path.back() != '/')
+        watch->path += '/';
+    watch->subtree = subtree != 0;
+    CFStringRef name =
+        CFStringCreateWithCString(nullptr, watch->path.c_str(), kCFStringEncodingUTF8);
+    CFArrayRef paths = name ? CFArrayCreate(nullptr, reinterpret_cast<const void **>(&name), 1,
+                                            &kCFTypeArrayCallBacks)
+                            : nullptr;
+    FSEventStreamContext context{0, watch, nullptr, nullptr, nullptr};
+    if (paths)
+        watch->stream = FSEventStreamCreate(
+            nullptr, directory_watch_events, &context, paths, kFSEventStreamEventIdSinceNow, 0.01,
+            kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer);
+    if (paths)
+        CFRelease(paths);
+    if (name)
+        CFRelease(name);
+    watch->queue = dispatch_queue_create("recomp.directory-watch", DISPATCH_QUEUE_SERIAL);
+    if (watch->stream && watch->queue) {
+        FSEventStreamSetDispatchQueue(watch->stream, watch->queue);
+        if (FSEventStreamStart(watch->stream))
+            return watch;
+    }
+    os_directory_watch_close(watch);
+    errno = EIO;
+    return nullptr;
+#else
+    (void)path;
+    (void)subtree;
+    (void)filter;
+    errno = ENOSYS;
+    return nullptr;
+#endif
+}
+
+int os_directory_watch_poll(OsDirectoryWatch *watch) {
+#if defined(__APPLE__) && TARGET_OS_OSX
+    if (watch->overflow.load()) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    return watch->pending.exchange(false) ? 1 : 0;
+#else
+    (void)watch;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+int os_directory_watch_next(OsDirectoryWatch *watch) {
+#if defined(__APPLE__) && TARGET_OS_OSX
+    return watch->overflow.load() ? -1 : 0;
+#else
+    (void)watch;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+void os_directory_watch_close(OsDirectoryWatch *watch) {
+#if defined(__APPLE__) && TARGET_OS_OSX
+    if (watch->stream) {
+        FSEventStreamStop(watch->stream);
+        FSEventStreamInvalidate(watch->stream);
+        FSEventStreamRelease(watch->stream);
+    }
+    if (watch->queue) {
+        dispatch_sync_f(watch->queue, nullptr, [](void *) {});
+        dispatch_release(watch->queue);
+    }
+    delete watch;
+#else
+    (void)watch;
+#endif
+}
+
 int os_registry_read(const char *, const char *, char *, size_t) {
     return -1;
 }
