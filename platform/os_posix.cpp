@@ -25,6 +25,8 @@
 #include <unistd.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #endif
 #ifndef MAP_ANON
 #define MAP_ANON MAP_ANONYMOUS
@@ -80,6 +82,16 @@ void *os_vm_reserve(size_t bytes) {
     return p == MAP_FAILED ? nullptr : p;
 }
 void *os_vm_reserve_at(void *address, size_t bytes) {
+#ifdef __APPLE__
+    mach_vm_address_t base = (mach_vm_address_t)(uintptr_t)address;
+    kern_return_t result = mach_vm_allocate(mach_task_self(), &base, bytes, VM_FLAGS_FIXED);
+    if (result != KERN_SUCCESS) {
+        fprintf(stderr, "[platform] fixed VM allocation at %p (%zu bytes): %s (%d)\n", address,
+                bytes, mach_error_string(result), result);
+        return nullptr;
+    }
+    return (void *)(uintptr_t)base;
+#else
     // A hint without MAP_FIXED never replaces a mapping; the kernel places the
     // region elsewhere when the range is taken, which is then a failure here.
     void *p = mmap(address, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -90,6 +102,7 @@ void *os_vm_reserve_at(void *address, size_t bytes) {
         return nullptr;
     }
     return p;
+#endif
 }
 void os_vm_release(void *p, size_t bytes) {
     munmap(p, bytes);
