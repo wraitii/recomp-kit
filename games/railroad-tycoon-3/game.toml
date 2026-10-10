@@ -14,33 +14,9 @@ guest_root = 'C:\Railroad Tycoon 3'
 store_hooks = false
 
 [translate]
-# The public code map holds Ghidra function/instruction boundaries only. Original
-# executable bytes are decoded into an ignored local cache before translation.
+# The public map holds Ghidra boundaries and control-flow addresses. Translation
+# decodes the original executable bytes; no instruction contents are published.
 code_map = "metadata"
-# Bring-up only: functions containing SSE/XMM operands the kit cannot lower yet.
-# The code-map cache drops them so the rest of the image translates; any path
-# that reaches one at run time faults until SSE lowering lands. The first is
-# movups xmm3, xmmword ptr [ecx] at 00581699. Remove entries as SSE is supported.
-#
-# The 0x00581770..0x00584210 group are the SSE/SSE2 (d3d7/d3d8) entries of the
-# math dispatcher tables at 0x00625c88 (MathFunctionDispatcher) and 0x00625d70
-# (MathFuncsTrampoline); they were added when the previously unlisted packed-table
-# targets were given function entries. The 3DNow (d3d9) entries decode as MMX.
-skip_functions = [
-  0x0055cd40, 0x00581690, 0x005816d0, 0x00581730,
-  0x00581770, 0x00581830, 0x005818f0, 0x005819f0,
-  0x00581db0, 0x005821d0, 0x00582320, 0x005823e0,
-  0x00582470, 0x00582520, 0x005825e0, 0x00582680,
-  0x00582770, 0x00582820, 0x005828e0, 0x005829b0,
-  0x00582aa0, 0x00582c30, 0x00582d10, 0x00582da0,
-  0x00582e40, 0x00582fd0, 0x005830a0, 0x00583160,
-  0x00583220, 0x00583320, 0x005833e0, 0x005836e0,
-  0x00583b00, 0x00583bc1, 0x00583c30, 0x00583cc0,
-  0x00583d90, 0x00583e80, 0x00584010, 0x00584210,
-  0x0058aa70, 0x0058ac60, 0x0058ad50, 0x005a42ea,
-  0x005a5510, 0x005a7190, 0x005a71a8, 0x005a71ae,
-  0x005aad39, 0x005acaf0, 0x005acb08, 0x005acb0e,
-]
 
 [render]
 d3d8_wgpu = true

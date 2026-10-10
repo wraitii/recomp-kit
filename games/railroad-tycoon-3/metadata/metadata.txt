@@ -1,9 +1,9 @@
-format=recomp-code-map-v2
+format=recomp-code-map-v3
 status=complete
 program=RT3.exe
 executable_sha256=accb099b0d8ebac8b50c539a5cc91a863bc9ae399ae70da382ff1c22301e38a2
 language=x86:LE:32:default
 image_base=00400000
-functions=6035
-instructions=506876
-instruction_bytes=1664154
+functions=6039
+instructions=510070
+instruction_bytes=1674380
