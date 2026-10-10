@@ -481,7 +481,13 @@ class Image(PE):
             words = words[1:]
         mnem = words[-1].upper()
         mnem = self.MNEM_ALIAS.get(mnem, mnem)
-        ops = [self._op_text(ci, o, mnem) for o in ci.operands]
+        try:
+            ops = [self._op_text(ci, o, mnem) for o in ci.operands]
+        except TranslateError as error:
+            if not getattr(self, "allow_unmodelled", False):
+                raise
+            return Insn(ci.address, "UNMODELLED", None, [],
+                        "%08x  %s %s: %s" % (ci.address, mnem, ci.op_str, error))
         if rep or mnem in Translator.STRING_MNEM:
             ops = []            # implicit ES:EDI / ESI operands carry nothing
         text = "%08x  %s%s%s" % (ci.address, mnem, "." + rep if rep else "",
@@ -1868,6 +1874,9 @@ class Translator(object):
             return ["goto L_%08x;" % t]
         if t in self.func_addrs:
             return ["CALL_FN(%08x); return;" % t]
+        if getattr(self, "provisional", False) and not GUEST_SHIM_BASE <= t < GUEST_SHIM_END:
+            self.unmodelled.append((ins.addr, "transfer to unmapped instruction %08x" % t))
+            return ["recomp_unmodelled(c, %s); return;" % hexlit(ins.addr)]
         return ["c->eip = %s; recomp_jump(c, %s); return;" % (hexlit(ins.addr), hexlit(t))]
 
     def emit_indirect_jump(self, fn, i, ins, op):

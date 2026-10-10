@@ -49,9 +49,17 @@ class Context(object):
         self.image = decoded.Image(settings.exe, settings.base)
         self.program = Program(settings)
         program = self.program
+        self.decoded_only = program.metadata.get("emitter") == "decoded"
+        if program.metadata.get("provenance") == "provisional-sweep" and not settings.allow_unmodelled:
+            raise TranslateError("provisional code maps require --allow-unmodelled with an explicit reason")
+        self.trap_instructions = {int(at, 16) for at in program.metadata.get("trap_instructions", "").split(",") if at}
+        if self.decoded_only:
+            settings.call_contracts = False
+            self.image.allow_unmodelled = settings.allow_unmodelled
         self.entries = program.entries()
         self.interior = program.interior_entries()
         self.tr = decoded.Translator(self.image, set(self.entries), settings.allow_unmodelled)
+        self.tr.provisional = program.metadata.get("provenance") == "provisional-sweep"
         self.tr.noreturn_callees = set(program.noreturn)
         self.tr.noreturn_sites = set(program.noreturn_calls)
         self.tr.jumptables = dict(program.tables)
@@ -67,6 +75,10 @@ class Context(object):
             if lengths is None:
                 raise TranslateError("%08x: decoder cannot tile the mapped span at %08x" % (addr, start))
             insns.extend(code_map.decode_span(image, start, lengths))
+        for ins in insns:
+            if ins.addr in self.trap_instructions:
+                ins.raw = "%08x  UNMODELLED direct transfer: %s" % (ins.addr, ins.raw.split("  ", 1)[1])
+                ins.mnem, ins.rep, ins.ops = "UNMODELLED", None, []
         size = sum(span[1] for span in self.program.functions[addr].spans)
         fn = decoded.Function(addr, "FUN_%08x" % addr, size, insns)
         fn.measure(image)
@@ -112,8 +124,9 @@ def _scan(addrs):
                 if target in ctx.entries and target not in ctx.known and ctx.program.containing(target) != addr:
                     refs.add(target)
         for targets in external_exits(tr, fn).values():
-            dangling.update(t for t in targets if not ctx.dispatchable(t))
-        reason = production.exclusion(fn)
+            if not ctx.tr.provisional:
+                dangling.update(t for t in targets if not ctx.dispatchable(t))
+        reason = "decoded-only code map" if ctx.decoded_only else production.exclusion(fn)
         escapes = bool(tr.seh_escaping_returns(fn))
         site = bool(fn.seh_sites) or any(fn.insns[i].mnem == "POP" for i in fn.seh_restores)
         prepared = None
@@ -154,7 +167,7 @@ def _emit(task):
         fn, entries = ctx.load(addr)
         tr.analyze(fn, entries)
         lines, wrappers = None, False
-        reason = production.exclusion(fn)
+        reason = "decoded-only code map" if ctx.decoded_only else production.exclusion(fn)
         if reason is None:
             try:
                 lines, external = production.emit_ssa(

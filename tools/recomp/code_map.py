@@ -162,9 +162,10 @@ def decode_span(image, start, lengths):
             # the emitted C stays byte-for-byte identical apart from comments.
             if insn.mnem == 'XCHG' and 0x90 <= raw[0] <= 0x97 and len(insn.ops) == 2:
                 insn.ops.reverse()
-            insn.raw = '%08x  %s%s%s' % (addr, insn.mnem,
-                '.' + insn.rep if insn.rep else '',
-                ' ' + ','.join(insn.ops) if insn.ops else '')
+            if insn.mnem != 'UNMODELLED':
+                insn.raw = '%08x  %s%s%s' % (addr, insn.mnem,
+                    '.' + insn.rep if insn.rep else '',
+                    ' ' + ','.join(insn.ops) if insn.ops else '')
             yield insn
             addr += size
     finally:
