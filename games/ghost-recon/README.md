@@ -19,6 +19,5 @@ antialiasing.
 | Source | Original addresses | Purpose / comparison switch |
 | --- | --- | --- |
 | `native/projection_cull` | `0081ae30`, `0081aa00` | Projection mesh culling and build; `RECOMP_PROJECTION_ORIGINAL=1` |
-| `native/ray_triangles` | `00556840` | Collision triangle tests; `RECOMP_RAYTRI_ORIGINAL=1` |
 | `native/scene_post` | `0047c160` | Scene boundary and optional FXAA before the HUD |
 | `native/port_tab` | `00650490`, `006a7fe0` and others | Options **Port** tab with a live FXAA toggle; see its README |

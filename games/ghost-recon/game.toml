@@ -32,7 +32,6 @@ alternate_entries = [
 native = { header = "native/ghost_recon_native.h", sources = [
     "native/projection_cull/projection_cull.c",
     "native/projection_cull/projection_build.c",
-    "native/ray_triangles/ray_triangles.c",
     "native/scene_post/scene_post.c",
     "native/port_tab/port_tab_logic.c",
     "native/port_tab/port_tab_rewrite.c",
