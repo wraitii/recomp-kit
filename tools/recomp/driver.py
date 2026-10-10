@@ -167,7 +167,7 @@ def _escapes(task):
 
 def _emit(task):
     """Emit one chunk of functions: SSA where admitted, the decoded body otherwise."""
-    addrs, helpers, internal, contracts, private_targets, contract_masks = task
+    addrs, helpers, internal, contracts, private_targets, contract_masks, checked_returns, selected_callers = task
     ctx, tr = _CTX, _CTX.tr
     tr.seh_helpers = set(helpers)
     tr.internal_entries = internal
@@ -180,13 +180,13 @@ def _emit(task):
         reason = "decoded-only code map" if ctx.decoded_only else production.exclusion(fn)
         if reason is None:
             try:
-                selected = addr in ctx.settings.state_contract_callers
+                selected = addr in selected_callers
                 callee_contracts = dict(contracts.get(addr) or {})
                 if selected:
                     callee_contracts.update(private_targets)
                 lines, external, variant_requests, call_decisions = production.emit_ssa(
                     tr, ctx.lifter, fn, entries, ctx.settings.emit, ctx.known, callee_contracts,
-                    ctx.settings.checked_returns,
+                    checked_returns,
                     private_targets if selected else (), report_calls=selected, contract_masks=contract_masks)
             except (SSAError, LiftError) as error:
                 reason = str(error)
@@ -201,13 +201,29 @@ def _emit(task):
             else:
                 lines = kept + lines
         if lines is None:
-            if addr in ctx.settings.checked_returns:
+            if addr in checked_returns:
                 raise TranslateError("%08x: checked-return body failed SSA emission: %s" % (addr, reason))
             lines = tr.translate(fn, entries)
             variant_requests, call_decisions = set(), []
         out.append((addr, lines, re.sub(r"^[0-9a-f]{8}: ", "", reason) if reason else None,
                     list(tr.unmodelled), variant_requests, call_decisions))
     return out
+
+
+def _private_candidate(task):
+    addr, helpers, known_mode = task
+    ctx = _CTX
+    ctx.tr.seh_helpers = set(helpers)
+    try:
+        fn, entries = ctx.load(addr)
+        ctx.tr.analyze(fn, entries)
+        contract = production.private_contract(ctx.tr, ctx.lifter, fn)
+        production.emit_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit, 0x3fff, known_mode)
+        production.emit_ssa(ctx.tr, ctx.lifter, fn, entries, ctx.settings.emit,
+                            ctx.known, {}, {addr})
+        return addr, contract, None
+    except (SSAError, LiftError, RecursionError) as error:
+        return addr, None, str(error)
 
 
 def _private(task):
@@ -322,9 +338,9 @@ def parse_args(argv):
     return ap.parse_args(argv)
 
 
-def mode_report(settings, prepared, summaries, opaque, known_modes, x87_counts, exposure):
+def mode_report(settings, prepared, summaries, opaque, known_modes, x87_counts, exposure, selected=()):
     functions = []
-    for addr in sorted(settings.state_contract_callers | settings.checked_returns):
+    for addr in sorted(set(selected) | settings.state_contract_callers | settings.checked_returns):
         body = prepared.get(addr)
         row = {"function": "%08x" % addr,
                "x87_instructions": x87_counts.get(addr, 0),
@@ -424,22 +440,40 @@ def main(argv=None):
                                           and a not in helpers and a not in conservative),
                 roots=roots)
         phase("contracts")
-        private_targets = {}
-        if settings.state_contract_callers and settings.call_contracts and settings.emit["local_state"]:
-            for addr in sorted(settings.checked_returns):
-                if not calls[addr]:
-                    fn, entries = ctx.load(addr)
-                    ctx.tr.analyze(fn, entries)
-                    private_targets[addr] = production.private_contract(ctx.tr, ctx.lifter, fn)
-        known_modes = {addr for addr in private_targets
+        private_targets, private_rejections = {}, {}
+        checked_returns = set(settings.checked_returns)
+        selected_callers = set(settings.state_contract_callers)
+        enabled = settings.call_contracts and settings.emit["local_state"] and not settings.module
+        candidates = {addr for addr in checked_returns if not calls[addr]} if enabled and selected_callers else set()
+        if enabled and settings.private_leaf_contracts:
+            candidates |= contract_variants.eligible_leaves(scanned, mode_opaque)
+        known_modes = {addr for addr in candidates
                        if settings.emit["x87_cw_clone"] and not settings.emit["x87_scalar_strict"]
-                       and addr not in mode_opaque and x87_mode.mode_preserving_leaf(mode_prepared.get(addr))}
+                       and x87_counts[addr] and addr not in mode_opaque
+                       and x87_mode.mode_preserving_leaf(mode_prepared.get(addr))}
+        for addr, contract, reason in pool.map(_private_candidate,
+                [(a, helpers, a in known_modes) for a in sorted(candidates)]):
+            if reason is None:
+                private_targets[addr] = contract
+            elif addr in settings.checked_returns:
+                raise TranslateError("%08x: configured private body failed: %s" % (addr, reason))
+            else:
+                private_rejections[addr] = reason
+        known_modes &= private_targets.keys()
+        checked_returns |= private_targets.keys()
+        if enabled and settings.private_leaf_contracts:
+            selected_callers |= {addr for addr, row in scanned.items()
+                                 if addr not in mode_opaque and row[8] and row[9]
+                                 and any(t in private_targets for t in calls[addr])}
+        if not enabled:
+            selected_callers.clear()
+        phase("private candidates")
 
         tasks = []
         for part in parts:
             tasks.append((part, helpers, {a: internal[a] for a in part if a in internal},
                           {a: {t: contracts[t] for t in calls[a] if t in contracts}
-                           for a in part if contracts}, private_targets, {}))
+                           for a in part if contracts}, private_targets, {}, checked_returns, selected_callers))
         results = {}
         for part in pool.map(_emit, tasks):
             for row in part:
@@ -448,7 +482,7 @@ def main(argv=None):
         shared_masks = contract_variants.shared_masks(row[4] for row in results.values())
         affected = {addr for addr, row in results.items()
                     if any(shared_masks[target] != mask for target, mask in row[4])}
-        shared_tasks = [(tuple(a for a in task[0] if a in affected), *task[1:-1], shared_masks)
+        shared_tasks = [(tuple(a for a in task[0] if a in affected), *task[1:5], shared_masks, *task[6:])
                         for task in tasks if any(a in affected for a in task[0])]
         for part in pool.map(_emit, shared_tasks):
             for row in part:
@@ -475,7 +509,7 @@ def main(argv=None):
     os.makedirs(args.out, exist_ok=True)
     output.write_funcs_header(args.out, entry_names)
     output.emit_body_chunks(args.out, functions, bodies, entries_by_fn, private_requests)
-    output.emit_entry_chunks(args.out, entry_names, settings.module, settings.checked_returns, private_masks)
+    output.emit_entry_chunks(args.out, entry_names, settings.module, checked_returns, private_masks)
     symbols = symbol_rows(ctx, entry_names, rows)
     if settings.module:
         output.write_module_table(args.out, entry_names, symbols, call_returns, settings.module)
@@ -483,9 +517,6 @@ def main(argv=None):
         output.write_table(args.out, entry_names, symbols, call_returns, private_masks, known_modes)
     output.write_symbols(
         args.out, str(settings.exe), ctx.image.base, symbols, settings.curated)
-    selected_callers = (set(settings.state_contract_callers)
-                        if settings.call_contracts and settings.emit["local_state"]
-                        and settings.checked_returns and not settings.module else set())
     decisions = [decision for addr in sorted(results) if addr in selected_callers
                  for decision in results[addr][5]]
     decisions.sort(key=lambda item: (item.get("site", ""), item.get("target", ""),
@@ -493,7 +524,10 @@ def main(argv=None):
     contract_report = {
         "configured_callers": ["%08x" % a for a in sorted(settings.state_contract_callers)],
         "selected_callers": ["%08x" % a for a in sorted(selected_callers)],
-        "checked_targets": ["%08x" % a for a in sorted(settings.checked_returns)],
+        "checked_targets": ["%08x" % a for a in sorted(checked_returns)],
+        "private_selection": {"automatic": settings.private_leaf_contracts,
+                              "heuristic": "at least two direct call sites; at most 64 instructions per site",
+                              "rejections": {"%08x" % a: r for a, r in sorted(private_rejections.items())}},
         "private_variants": [
             {"target": "%08x" % addr, "mask": "%04x" % mask,
              "fields": [field for i, field in enumerate(call_contracts.FIELDS) if mask & (1 << i)]}
@@ -503,7 +537,8 @@ def main(argv=None):
             for addr in sorted(results) if results[addr][2] is not None],
         "call_decisions": decisions,
         "x87_mode": mode_report(settings, mode_prepared, mode_summaries, mode_opaque,
-                                known_modes & private_masks.keys(), x87_counts, mode_exposure),
+                                known_modes & private_masks.keys(), x87_counts, mode_exposure,
+                                selected_callers | checked_returns),
     }
     with open(os.path.join(args.out, "contract-report.json"), "w") as fh:
         json.dump(contract_report, fh, sort_keys=True, indent=1)

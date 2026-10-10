@@ -205,9 +205,13 @@ ESP and publishes the same CPU/x87 state; a matching continuation skips
 indirect calls and callbacks. Checked entry thunks retain scheduler checkpoints,
 frame checks, profiling and hooks; a changed base dispatch selects the ordinary
 replacement. Auxiliary modules currently retain ordinary entries. An empty list
-restores ordinary calls throughout the image.
+restores ordinary calls when automatic leaf discovery is also disabled.
 
-`state_contract_callers` selects a pilot's caller addresses. Direct edges into
+`private_leaf_contracts` automatically admits closed, unreplaced returning
+leaves after private and checked emitter preflight. A reuse filter requires at
+least two direct call sites and at most 64 original instructions per site.
+Eligible closed callers use those targets; failed caller emission remains decoded.
+`state_contract_callers` additionally selects explicit caller addresses. Direct edges into
 checked leaf bodies get private entries specialized for the required GPR/flag
 outputs. A callee has one private body with the union of its callers' output
 masks; `contract_variants.py` plans that shared layout after initial emission.
@@ -254,6 +258,7 @@ not contracts for x87 values, tags, TOP, status or exact-integer shadows.
 | `x87_cw_clone` | `true` | `false` emits only the general body |
 | `call_contracts` | `true` | `false` restores full publication at calls |
 | `checked_returns` | `[]` | Addresses given private direct-call entries with checked guest continuations |
+| `private_leaf_contracts` | `false` | Automatically discover reusable private leaf contracts |
 | `state_contract_callers` | `[]` | Caller addresses using specialized integer-state entries into checked leaf bodies |
 
 A `RECOMP_NULL_CHECKS=1` build exposes CPU state to fault dispatch: translate it

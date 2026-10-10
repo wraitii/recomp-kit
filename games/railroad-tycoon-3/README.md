@@ -19,7 +19,7 @@ and `0x0042ce00`. Eligible SSA direct calls pass their decoded continuation and
 skip general return lookup on a match. Stack writes, x87 effects and all existing
 state publication remain translated. Decoded callers, indirect calls, callbacks,
 hooks and profiling retain the ordinary entry. Set `checked_returns = []` under
-`[translate]` and regenerate to disable the pilot. Savings across the conversion call's
+`[translate]`, also disable `private_leaf_contracts`, and regenerate to disable checked calls. Savings across the conversion call's
 state transfer are piloted separately below; scratch memory remains translated.
 
 The experimental integer-state pilot selects the reviewed callers
@@ -30,8 +30,12 @@ observable; EIP and all existing x87 state remain published. Private
 entries omit other integer return stores and use byte-derived leaf input
 contracts. Full changed state is recovered on an unexpected RET, and observation
 boundaries retain the ordinary path. Set `state_contract_callers = []` and
-regenerate to disable this stage independently. Expansion and x87 contracts
-await correctness coverage and a workload profile showing a gain.
+disable `private_leaf_contracts` and regenerate to return to ordinary calls.
+Automatic discovery extends these contracts to returning leaves with at least
+two direct call sites and at most 64 original instructions per site, subject to
+closed single-entry, replacement/SEH and emitter checks. One shared output layout
+is emitted per callee; the report records automatic selections and rejections.
+Non-leaf specialization and x87 value-transfer contracts remain future work.
 
 Validation compared both private output sets and their unexpected-return
 paths against the ordinary entry over 1,860 rounding cases each, with no new

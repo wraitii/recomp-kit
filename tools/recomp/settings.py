@@ -36,6 +36,7 @@ class Settings(object):
         if self.module:
             self.native_header = None
         self.call_contracts = translate["call_contracts"]
+        self.private_leaf_contracts = translate["private_leaf_contracts"] and not self.module
         self.checked_returns = frozenset(translate["checked_returns"]) if not self.module else frozenset()
         self.state_contract_callers = frozenset(translate["state_contract_callers"]) if not self.module else frozenset()
         self.allow_unmodelled = allow_unmodelled

@@ -82,6 +82,7 @@ TRANSLATE_DEFAULTS = {
     "fault_state": "relaxed",
     "msvc_x87_convention": True,
     "call_contracts": True,
+    "private_leaf_contracts": False,
     "x87_cw_clone": True,
 }
 
@@ -247,6 +248,8 @@ def load(game_dir, build_root=None):
     # emits the general body alone.
     if not isinstance(translate.setdefault("x87_cw_clone", TRANSLATE_DEFAULTS["x87_cw_clone"]), bool):
         raise ValueError("%s: [translate] x87_cw_clone must be a boolean" % source)
+    if not isinstance(translate.setdefault("private_leaf_contracts", TRANSLATE_DEFAULTS["private_leaf_contracts"]), bool):
+        raise ValueError("%s: [translate] private_leaf_contracts must be a boolean" % source)
     checked = translate.setdefault("checked_returns", [])
     if not isinstance(checked, list) or not all(type(v) is int and 0 <= v <= 0xffffffff for v in checked):
         raise ValueError("%s: [translate] checked_returns must be a list of 32-bit addresses" % source)

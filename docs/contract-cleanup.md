@@ -2,8 +2,12 @@
 
 ## Current implementation
 
-The RT3 pilot specializes direct calls from `0042c1b0` and `0042ce00` to
-`005a10d0`. Checked returns preserve the guest CALL stack write, actual RET
+RT3 enables automatic private leaf contracts. Candidates need at least two
+direct call sites and no more than 64 original instructions per site, then pass
+closed single-entry, replacement/SEH and actual emitter checks. Functions with
+calls remain excluded. The reviewed `0042c1b0`/`0042ce00` to `005a10d0` pilot
+remains explicitly selectable when automatic discovery is disabled.
+Checked returns preserve the guest CALL stack write, actual RET
 address load, stack adjustment and state publication. Expected returns bypass
 continuation lookup; unexpected returns publish the fuller state and use general
 return handling. Ordinary entries remain available for other callers.
@@ -117,8 +121,8 @@ that temporary fact.
 5. **Emit a known-mode private body.** Generate it from the same instruction IR,
    using the proven precision/rounding bits to remove the mode check and general
    arithmetic branch. Retain the ordinary entry, observation policies, actual
-   guest RET check, scratch accesses and faults. Limit initial emission to the
-   reviewed pilot edges and measure code growth before broader specialization.
+   guest RET check, scratch accesses and faults. Use the same conservative admission and shared layouts for automatic leaf
+   discovery; measure linked growth separately from generated source size.
 
 6. **Validate and measure.** Compare against original bytes and ordinary entries
    with the diff harness and existing rounding fixtures. Cover mode changes,
