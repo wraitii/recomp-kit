@@ -29,6 +29,7 @@ def _transfer(block, entry, scalar_factory, binary32):
             scalar.statements(value.data, "carry_address", "carry_result")
         elif value.opc in RESET_OPS:
             scalar.reset()
+    scalar.fold_pending([])
     return scalar.snapshot()
 
 
@@ -71,7 +72,10 @@ def analyze(s, fir, scalar_factory, binary32):
     entry = {i: None for i in s.blocks}
     entry[s.entry] = INACTIVE
     # Another entry arrives with nothing carried, so every edge into it publishes.
-    for i in s.alternates:
+    resets = set(s.alternates)
+    if predecessors[s.entry] - {-1}:
+        resets.add(s.entry)
+    for i in resets:
         entry[i] = UNSAFE
     exit_shape = {}
     work = deque(seed_order)
@@ -87,7 +91,7 @@ def analyze(s, fir, scalar_factory, binary32):
         # A window overflow is absorbing: predecessor shapes only grow, so a
         # block that fell back to reset can never become carryable again.
         if entry[i] is UNSAFE:
-            if i in s.alternates and i not in exit_shape:
+            if i in resets and i not in exit_shape:
                 exit_shape[i] = _transfer(s.blocks[i], UNSAFE, scalar_factory, binary32)
                 for j in sorted(set(fir.succ[i])):
                     if j not in queued:
@@ -135,10 +139,12 @@ def assert_covers(join, live, where):
     plan = dict(join.slots)
     for position, slot in live.slots:
         planned = plan.get(position)
+        if planned is None and not slot.dirty:
+            continue
         if planned is None:
             raise SSAError("%s: live x87 position %d absent from join shape"
                            % (where, position))
-        if not slot.parts <= planned.parts:
+        if not slot.dirty <= planned.dirty:
             raise SSAError("%s: live x87 parts beyond join shape at %d"
                            % (where, position))
         if planned.narrow and not slot.narrow:
@@ -146,7 +152,10 @@ def assert_covers(join, live, where):
                            % (where, position))
         agreements = _agreement(planned)
         live_const = _agreement(slot)
-        for part in slot.parts:
+        if planned.quiet and not slot.quiet:
+            raise SSAError("%s: quiet NaN join at %d from unproven operands"
+                           % (where, position))
+        for part in slot.parts & planned.parts:
             if part in agreements and live_const.get(part) != agreements[part]:
                 raise SSAError("%s: x87 %s at %d is not the joined constant"
                                % (where, part, position))

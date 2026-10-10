@@ -60,6 +60,7 @@ class Slot:
     tag: Optional[str] = None
     narrow: bool = False  # Proven binary32 when PC=00, not an incoming-state guess.
     dirty: set = field(default_factory=set)
+    quiet: bool = False
     pending: bool = False  # Arithmetic NaN whose IE check/canonicalisation is deferred.
 
 
@@ -89,9 +90,11 @@ CARRY_LITERALS = frozenset(("0", "1", "FTAG_EMPTY"))
 @dataclass(frozen=True)
 class SlotShape:
     """Unpublished parts of one physical slot, keyed by relative position."""
-    parts: frozenset = frozenset()          # dirty parts that must be carried
+    parts: frozenset = frozenset()
     narrow: bool = False
     const: tuple = ()                       # sorted (part, literal) agreements
+    dirty: frozenset = frozenset()
+    quiet: bool = False
 
 
 @dataclass(frozen=True)
@@ -128,7 +131,7 @@ def carry_var(position, part):
 def merge_shapes(shapes):
     """Merge predecessor edge shapes into a block entry shape.
 
-    Known parts and dirty flags union, `narrow` intersects, counters take the
+    Dirty parts union, cached clean parts and proofs intersect, counters take the
     conservative extremes (min base/low, max high) and activity/dirty flags
     OR. Returns ``None`` when a predecessor is still unknown and ``UNSAFE``
     when the merged window cannot be represented by eight physical slots."""
@@ -146,12 +149,18 @@ def merge_shapes(shapes):
     merged = []
     for p in sorted(slots):
         entries = slots[p]
-        parts = frozenset().union(*(e.parts for e in entries))
-        narrow = all(e.narrow for e in entries)
+        dirty = frozenset().union(*(e.dirty for e in entries))
+        common = (frozenset.intersection(*(e.parts for e in entries))
+                  if len(entries) == len(known) else frozenset())
+        parts = dirty | common
+        if not parts:
+            continue
+        narrow = len(entries) == len(known) and all(e.narrow for e in entries)
+        quiet = len(entries) == len(known) and all(e.quiet for e in entries)
         const = []
         for part in sorted(parts):
             literals = set()
-            ok = True
+            ok = len(entries) == len(known)
             for e in entries:
                 agreement = dict(e.const)
                 if part not in e.parts or part not in agreement:
@@ -160,7 +169,7 @@ def merge_shapes(shapes):
                 literals.add(agreement[part])
             if ok and len(literals) == 1:
                 const.append((part, literals.pop()))
-        merged.append((p, SlotShape(parts, narrow, tuple(const))))
+        merged.append((p, SlotShape(parts, narrow, tuple(const), dirty, quiet)))
     positions = [p for p, _ in merged]
     # An inactive predecessor activates at the edge with everything published
     # at its current TOP, i.e. relative base/low/high of zero.
@@ -292,13 +301,15 @@ class X87Scalar:
             setattr(slot, part, self._temp(expr, lines, ctype))
         return getattr(slot, part)
 
-    def _assign(self, logical, narrow=None, pending=None, **parts):
+    def _assign(self, logical, narrow=None, pending=None, quiet=None, **parts):
         _, slot = self._slot(logical)
         if narrow is not None:
             slot.narrow = narrow
         for part, expr in parts.items():
             setattr(slot, part, expr)
             slot.dirty.add(part)
+        if quiet is not None:
+            slot.quiet = quiet
         if pending is not None:
             slot.pending = pending
 
@@ -327,6 +338,7 @@ class X87Scalar:
                 "(%s != %s ? x87_indefinite() : %s)" % (value, value, value),
                 lines, "double")
             slot.dirty.add("value")
+            slot.quiet = True
         slot.pending = False
         return slot.value
 
@@ -360,7 +372,7 @@ class X87Scalar:
         value = self._temp(expr, lines)
         self._assign(logical, value=value, bits=bits, exact=exact,
                      tag=tag or "ftag_classify(%s)" % value, narrow=narrow,
-                     pending=pending)
+                     pending=pending, quiet=False)
 
     def _move_top(self, delta):
         self.top = (self.top + delta) & 7
@@ -454,25 +466,25 @@ class X87Scalar:
 
         Under the MSVC convention a popped register only needs its empty tag
         retagged; its value, bits and exact shadow are relaxed and dropped so a
-        join does not copy dead residue. Live slots carry every dirty part."""
+        join does not copy dead residue. Live slots also retain cached clean parts."""
         if not self.active:
             return INACTIVE
         slots = []
         for offset, slot in self.slots.items():
-            if not slot.dirty:
-                continue
             position = self.low + ((offset - self.low) & 7) - self.position
-            parts = frozenset(slot.dirty)
+            dirty = frozenset(slot.dirty)
+            parts = frozenset(part for part in PARTS if getattr(slot, part) is not None)
             if position < 0 and self.convention:
                 # Only the MSVC convention relaxes popped residue. With an exact
                 # flush (msvc_convention=False or FINCSTP/FDECSTP) the successor
                 # must be able to republish the popped value, bits and shadow.
-                parts &= frozenset(("tag",))
-                if not parts:
-                    continue
+                parts = dirty & frozenset(("tag",))
+            dirty &= parts
+            if not parts:
+                continue
             const = tuple((part, getattr(slot, part)) for part in sorted(parts)
                           if getattr(slot, part) in CARRY_LITERALS)
-            slots.append((position, SlotShape(parts, slot.narrow, const)))
+            slots.append((position, SlotShape(parts, slot.narrow, const, dirty, slot.quiet)))
         slots.sort()
         return CarryShape(True, tuple(slots), self.base - self.position,
                           self.low - self.position, self.high - self.position,
@@ -494,7 +506,7 @@ class X87Scalar:
         self.top_unknown = shape.top_unknown
         self.status_dirty = shape.status_dirty
         for position, slot_shape in shape.slots:
-            slot = Slot(narrow=slot_shape.narrow, dirty=set(slot_shape.parts))
+            slot = Slot(narrow=slot_shape.narrow, dirty=set(slot_shape.dirty), quiet=slot_shape.quiet)
             agreements = dict(slot_shape.const)
             for part in slot_shape.parts:
                 if part in agreements:
@@ -566,14 +578,15 @@ class X87Scalar:
                 # Capture all source components before TOP moves (FLD ST7).
                 parts = {part: self._read(slots[0], part, lines)
                          for part in ("value", "bits", "exact", "tag")}
+                quiet = self._slot(slots[0])[1].quiet
                 narrow = self._slot(slots[0])[1].narrow
                 pending = self._slot(slots[0])[1].pending if self.lazy_nan else False
                 self._move_top(-1)
                 if self.lazy_nan:
                     self._release(0, lines)
-                    self._assign(0, narrow=narrow, pending=pending, **parts)
+                    self._assign(0, narrow=narrow, pending=pending, quiet=quiet, **parts)
                 else:
-                    self._assign(0, narrow=narrow, **parts)
+                    self._assign(0, narrow=narrow, quiet=quiet, **parts)
             else:
                 value = mem()
                 self._move_top(-1)
@@ -589,15 +602,16 @@ class X87Scalar:
                 if slots[0]:
                     parts = {part: self._read(0, part, lines)
                              for part in ("value", "bits", "exact", "tag")}
+                    quiet = self._slot(0)[1].quiet
                     narrow = self._slot(0)[1].narrow
                     if self.lazy_nan:
                         # The copy carries any deferred NaN; fold the value the
                         # destination is about to lose (not an operand).
                         pending = self._slot(0)[1].pending
                         self._release(slots[0], lines)
-                        self._assign(slots[0], narrow=narrow, pending=pending, **parts)
+                        self._assign(slots[0], narrow=narrow, pending=pending, quiet=quiet, **parts)
                     else:
-                        self._assign(slots[0], narrow=narrow, **parts)
+                        self._assign(slots[0], narrow=narrow, quiet=quiet, **parts)
             else:
                 if self.lazy_nan:
                     # Store to memory is a sink: canonicalise the double before
@@ -612,8 +626,11 @@ class X87Scalar:
                     # quiets an sNaN payload that clang could otherwise retain
                     # by cancelling the widening/narrowing casts. The runtime
                     # PC test keeps the general double path for PC!=0.
+                    quiet = self._slot(0)[1].quiet
                     narrow = self._slot(0)[1].narrow
-                    if narrow and not self.observe_loads:
+                    if narrow and quiet and self.clone == "fast" and not self.observe_loads:
+                        value = "(float)(%s)" % value
+                    elif narrow and not self.observe_loads:
                         if not value.isidentifier():
                             value = self._temp("(%s)" % value, lines, "double")
                         value = ("((x87_cw_ & 0x300u) == 0u && %s == %s) ? "

@@ -945,7 +945,8 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
         from .x87_scalar import PART_TYPES, UNSAFE, carry_var, ordered_parts
 
         def carry_factory():
-            return X87Scalar(observe_loads=False, convention=x87_convention)
+            return X87Scalar(observe_loads=False, convention=x87_convention,
+                             lazy_nan=defer_ie)
 
         # The fixed point is needed because a loop header's shape depends on
         # its own backedge; see x87_carry.py.

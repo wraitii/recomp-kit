@@ -114,10 +114,14 @@ from the entry TOP, tracking all eight residues, tags and exact-integer shadows.
 CW and SW are scalar locals passed to always-inlined `_sw` helper forms,
 including FIST/FISTP, which read the scalar value and exact-integer shadow. Seams
 (division, calls, opaque recipes, returns) materialize the required state.
-`x87_carry.py` carries unpublished state across internal CFG edges: each block
+`x87_carry.py` carries unpublished state and cached clean values across internal
+CFG edges. Dirty parts union at joins; clean parts survive only when every
+predecessor caches them. Cached parts do not require state publication. Each block
 has a conservative fixed-point shape, predecessors write canonical function-scope
 slots, successors copy them, and emission raises `SSAError` (whole-function
-decoded fallback) on drift. Carry needs the MSVC convention.
+decoded fallback) on drift. External entries with internal backedges reset
+the tracker so a first call never reads carried locals before initialization.
+Carry needs the MSVC convention.
 
 Under PC=00, proven-binary32 operations use native float arithmetic plus the
 runtime's NaN/status normalization once a linear run has two arithmetic effects.
@@ -130,7 +134,9 @@ Lazy NaN keeps basic-arithmetic results in full precision and folds
 (`isnan`/indefinite) where the value stops flowing into NaN-propagating
 arithmetic: stores, comparisons, FCHS/FABS, FNSTSW, FSTCW/FLDCW, opaque
 fallbacks and any flush. IE is sticky, so only when the fold is computed
-differs. It is off under `fault_state = "exact"`.
+differs. The fast CW clone stores proven-binary32 values with canonical NaNs
+without repeating the general float conversion and NaN quieting. It is off
+under `fault_state = "exact"`.
 
 ### Lazy flags
 
