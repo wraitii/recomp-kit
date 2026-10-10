@@ -32,7 +32,7 @@ SUPPORTED = frozenset(ARITH) | frozenset(INTEGER_ARITH) | frozenset(CONSTANTS) |
     "FCOM", "FCOMP", "FCOMPP", "FUCOM", "FUCOMP", "FUCOMPP", "FICOM", "FICOMP",
     "FTST", "FXAM", "FXCH", "FPREM", "FPREM1", "FNCLEX", "FCLEX",
     "FNSTSW", "FSTSW", "FNSTCW", "FSTCW", "FLDCW", "FNINIT", "FINIT",
-    "FDECSTP", "FINCSTP", "FNOP", "FPTAN", "FSINCOS", "FSCALE", "FPATAN", "FYL2X", "FYL2XP1",
+    "FDECSTP", "FINCSTP", "FFREE", "FNOP", "FPTAN", "FSINCOS", "FSCALE", "FPATAN", "FYL2X", "FYL2XP1",
 }
 
 
@@ -237,6 +237,8 @@ def statements(data, address=None, result=None):
         # for FDECSTP, old ST(i+1) becomes ST(i) for FINCSTP.
         lines.extend(["c->fpu_top = (c->fpu_top %s 1u) & 7u;" % ("-" if m == "FDECSTP" else "+"),
                       "c->fpu_sw &= (uint16_t)~0x0200u;"])
+    elif m == "FFREE" and len(operands) == 1 and len(slots) == 1:
+        lines.append("ftag_put(c, (c->fpu_top + %du) & 7u, FTAG_EMPTY);" % slots[0])
     elif m == "FNOP" and not operands:
         lines.append(";")
     else:

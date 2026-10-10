@@ -2229,7 +2229,7 @@ class Translator(object):
         if m == "FLDCW":
             return ["x87_set_cw(c, rd16(%s));" % addr_expr(ops[0])]
         if m == "FFREE":
-            return [";"]
+            return ["ftag_put(c, (c->fpu_top + %du) & 7u, FTAG_EMPTY);" % ops[0].sti]
         if m in ("FSAVE", "FNSAVE"):
             return ["x87_fnsave(c, %s);" % addr_expr(ops[0])]
         if m == "FRSTOR":

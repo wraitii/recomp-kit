@@ -578,6 +578,8 @@ class X87Scalar:
                 value = mem()
                 self._move_top(-1)
                 self._set(0, value, lines, narrow=bits == 32)
+        elif m == "FFREE":
+            self._assign(slots[0], tag="FTAG_EMPTY")
         elif m == "FILD":
             value = mem(True)
             self._move_top(-1)
