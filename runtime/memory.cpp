@@ -569,6 +569,12 @@ void heap_reset() {
     g_total_allocs = g_total_frees = 0;
 }
 
+uint8_t *reserve_arena() {
+    return (uint8_t *)(RECOMP_ARENA_ADDRESS
+                           ? os_vm_reserve_at((void *)(uintptr_t)RECOMP_ARENA_ADDRESS, GUEST_SIZE)
+                           : os_vm_reserve(GUEST_SIZE));
+}
+
 } // namespace
 
 void mem_init() {
@@ -577,24 +583,26 @@ void mem_init() {
         os_vm_release(g_mem, GUEST_SIZE);
         g_mem = nullptr;
     }
-    if (!os_vm_reserve_at(RECOMP_ARENA, GUEST_SIZE)) {
-        fprintf(stderr,
-                "[recomp] fatal: cannot map %u bytes of guest memory at host address %#llx\n",
-                GUEST_SIZE, (unsigned long long)RECOMP_ARENA_ADDRESS);
+    g_mem = reserve_arena();
+    if (!g_mem) {
+        fprintf(
+            stderr,
+            "[recomp] fatal: cannot reserve %u bytes of guest memory (requested host base %#llx)\n",
+            GUEST_SIZE, (unsigned long long)RECOMP_ARENA_ADDRESS);
         abort();
     }
-    g_mem = RECOMP_ARENA;
     heap_reset();
 }
 
 void recomp_arena_swap(uint8_t *other, size_t size) {
     if (!g_mem) {
-        if (!os_vm_reserve_at(RECOMP_ARENA, GUEST_SIZE)) {
-            fprintf(stderr, "[recomp] fatal: cannot map guest memory at host address %#llx\n",
+        g_mem = reserve_arena();
+        if (!g_mem) {
+            fprintf(stderr,
+                    "[recomp] fatal: cannot reserve guest memory (requested host base %#llx)\n",
                     (unsigned long long)RECOMP_ARENA_ADDRESS);
             abort();
         }
-        g_mem = RECOMP_ARENA;
     }
     if (size > GUEST_SIZE) {
         fprintf(stderr, "[recomp] fatal: arena swap of %zu bytes exceeds the %u-byte arena\n", size,

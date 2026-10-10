@@ -129,6 +129,7 @@ def render_cmake(cfg):
     lines.append("set(RECOMP_HEAP_BASE %s)" % c_hex(game["heap_base"]))
     lines.append("set(RECOMP_HEAP_END %s)" % c_hex(game["heap_end"]))
     lines.append("set(RECOMP_GUEST_SIZE %s)" % c_hex(game["guest_size"]))
+    lines.append("set(RECOMP_HOST_ARENA_BASE 0x%xull)" % game["host_arena_base"])
     lines.append("set(RECOMP_AUX_MODULES %s)" % ";".join(m["key"] for m in cfg["aux_modules"]))
     lines.append("set(RECOMP_STORE_HOOKS %d)" % int(game["store_hooks"]))
     # The generated sources include this header before they define FN_<addr>,

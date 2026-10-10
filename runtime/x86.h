@@ -46,14 +46,14 @@ extern "C" {
 #define GUEST_SIZE 0x10000000u /* 256 MB arena; RECOMP_GUEST_SIZE grows it for auxiliary modules */
 #endif
 
-/* The arena lives at one fixed host address, so translated accessors index a
- * constant: no base pointer to load, and a guest store cannot alias it the
- * way it aliases a global pointer, which made clang reload the base after
- * every store. Whoever maps guest memory reserves exactly this range with
- * os_vm_reserve_at; g_mem is RECOMP_ARENA once that has happened and NULL
- * before, for host code that asks whether the arena exists yet. */
+#ifndef RECOMP_ARENA_ADDRESS
 #define RECOMP_ARENA_ADDRESS 0x300000000ull
+#endif
+#if RECOMP_ARENA_ADDRESS
 #define RECOMP_ARENA ((uint8_t *)(uintptr_t)RECOMP_ARENA_ADDRESS)
+#else
+#define RECOMP_ARENA g_mem
+#endif
 extern uint8_t *g_mem;
 
 /* Guest memory layout (see plan Global constraints, as corrected):

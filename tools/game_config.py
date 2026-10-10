@@ -346,6 +346,11 @@ def validate_guest_layout(cfg, source):
         raise ValueError("%s: [game] guest_size %#x must be page aligned and between %#x and 0xfffff000"
                          % (source, guest_size, GUEST_SIZE_DEFAULT))
     game["guest_size"] = guest_size
+    host_base = int(game.setdefault("host_arena_base", 0x300000000))
+    if host_base and (host_base % 0x10000 or host_base < 0x100000000
+                      or host_base + guest_size > 0x0000800000000000):
+        raise ValueError("%s: [game] host_arena_base must be zero for dynamic allocation or a 64 KiB aligned 64-bit user address" % source)
+    game["host_arena_base"] = host_base
     heap_base, heap_end = game["heap_base"], game["heap_end"]
     if heap_end % 0x1000 or heap_end > guest_size:
         raise ValueError("%s: [game] heap_end must be page aligned and fit inside guest_size" % source)
