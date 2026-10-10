@@ -26,6 +26,8 @@ struct Directory {
     }
     bool open(uint32_t module = 0) {
         const LoaderModule *owner = module ? loader_module_containing(module) : nullptr;
+        if (module && !owner)
+            owner = loader_datafile(module);
         if (module && (!owner || owner->base != module))
             return fail(why, "invalid resource module");
         image = owner ? owner->base : loader_image_base();
@@ -174,15 +176,16 @@ uint32_t resource_data(uint32_t entry, uint32_t *size, std::string *why, uint32_
     Directory dir(why);
     return dir.open(module) ? dir.data(entry, size) : 0;
 }
-bool resource_names(uint32_t type_id_or_name, std::vector<ResourceName> *names, std::string *why) {
+bool resource_names(uint32_t type_id_or_name, std::vector<ResourceName> *names, std::string *why,
+                    uint32_t module) {
     if (!names)
         return fail(why, "missing resource-name output");
     names->clear();
     Directory dir(why);
     ResourceName type;
     uint32_t type_dir, first, count;
-    if (!dir.open() || !identifier(type_id_or_name, type, why) || !dir.child(0, type, type_dir) ||
-        !dir.entries(type_dir, first, count))
+    if (!dir.open(module) || !identifier(type_id_or_name, type, why) ||
+        !dir.child(0, type, type_dir) || !dir.entries(type_dir, first, count))
         return false;
     for (uint32_t i = 0; i < count; ++i) {
         ResourceName name;

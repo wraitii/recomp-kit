@@ -1467,12 +1467,36 @@ void k_LoadLibraryW(X86 *c) {
 }
 
 void k_LoadLibraryExW(X86 *c) {
-    // File and flags are ignored: registered shim tables do not map a real DLL.
-    k_LoadLibraryW(c);
+    const uint32_t as_data = 0x2 | 0x20 | 0x40;
+    if (!(arg(c, 2) & as_data)) {
+        k_LoadLibraryW(c);
+        return;
+    }
+    std::string guest = gm_wstr(arg(c, 0));
+    if (LoaderModule *m = loader_module_named(library_name(guest).c_str()))
+        if (m->attached) {
+            set_eax(c, m->base);
+            return;
+        }
+    std::string host = win32_host_path(guest), why;
+    uint32_t base = host.empty() ? 0 : loader_map_datafile(host, &why);
+    if (!base) {
+        LOGW("LoadLibraryExW(%s, flags=%08x) as data: %s", guest.c_str(), arg(c, 2),
+             host.empty() ? "file not found" : why.c_str());
+        set_last_error(host.empty() ? 2 : 193);
+    }
+    set_eax(c, base ? base | 1 : 0);
 }
 
 void k_FreeLibrary(X86 *c) {
     uint32_t handle = arg(c, 0);
+    if (handle & 1) {
+        bool unmapped = loader_unmap_datafile(handle & ~1u);
+        if (!unmapped)
+            set_last_error(ERROR_INVALID_HANDLE_);
+        set_eax(c, unmapped);
+        return;
+    }
     if (const LoaderModule *mapped = loader_module_containing(handle)) {
         LoaderModule *m = loader_module_named(mapped->name.c_str());
         if (handle != m->base || handle == loader_image_base() || !m->load_refs) {

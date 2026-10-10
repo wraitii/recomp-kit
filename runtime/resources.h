@@ -11,6 +11,7 @@ struct ResourceName {
     std::string name; // UTF-8, decoded from the directory's length-prefixed UTF-16.
 };
 
+// `module` is a mapped image base: 0 for the EXE, an auxiliary module, or a data file.
 // Type and name accept integer IDs, UTF-16 "#123", or UTF-16 names. Select the
 // first language and return its IMAGE_RESOURCE_DATA_ENTRY address, or zero.
 uint32_t resource_find(uint32_t type_id_or_name, uint32_t name_id_or_name,
@@ -21,4 +22,4 @@ uint32_t resource_data(uint32_t entry, uint32_t *size, std::string *why = nullpt
 // Snapshot the names before guest callbacks run; no references into the directory
 // or temporary guest buffers escape this reader. False explains failure in why.
 bool resource_names(uint32_t type_id_or_name, std::vector<ResourceName> *names,
-                    std::string *why = nullptr);
+                    std::string *why = nullptr, uint32_t module = 0);

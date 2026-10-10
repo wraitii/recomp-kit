@@ -900,19 +900,27 @@ void k_WaitForMultipleObjectsEx(X86 *c) {
     wait_multiple_objects(c);
 }
 
-bool resource_module(uint32_t module) {
-    if (!module || module == loader_image_base())
+bool resource_module(uint32_t handle, uint32_t &module) {
+    module = 0;
+    if (!handle || handle == loader_image_base())
         return true;
+    uint32_t base = handle & ~1u;
+    const LoaderModule *m = handle & 1 ? loader_datafile(base) : loader_module_containing(base);
+    if (m && m->base == base) {
+        module = base;
+        return true;
+    }
     set_last_error(1812);
     return false;
 }
 void k_FindResourceW(X86 *c) {
-    if (!resource_module(arg(c, 0))) {
+    uint32_t module;
+    if (!resource_module(arg(c, 0), module)) {
         set_eax(c, 0);
         return;
     }
     std::string why;
-    uint32_t entry = resource_find(arg(c, 2), arg(c, 1), &why);
+    uint32_t entry = resource_find(arg(c, 2), arg(c, 1), &why, module);
     if (!entry) {
         set_last_error(1814);
         LOGV("FindResourceW: %s", why.c_str());
@@ -920,7 +928,9 @@ void k_FindResourceW(X86 *c) {
     set_eax(c, entry);
 }
 void k_LoadResource(X86 *c) {
-    uint32_t data = resource_module(arg(c, 0)) ? resource_data(arg(c, 1), nullptr) : 0;
+    uint32_t module;
+    uint32_t data =
+        resource_module(arg(c, 0), module) ? resource_data(arg(c, 1), nullptr, nullptr, module) : 0;
     if (!data)
         set_last_error(1812);
     set_eax(c, data);
@@ -929,8 +939,8 @@ void k_LockResource(X86 *c) {
     set_eax(c, arg(c, 0));
 }
 void k_SizeofResource(X86 *c) {
-    uint32_t size = 0;
-    if (!resource_module(arg(c, 0)) || !resource_data(arg(c, 1), &size))
+    uint32_t size = 0, module;
+    if (!resource_module(arg(c, 0), module) || !resource_data(arg(c, 1), &size, nullptr, module))
         set_last_error(1812);
     set_eax(c, size);
 }
@@ -940,7 +950,9 @@ void k_FreeResource(X86 *c) {
 void k_EnumResourceNamesW(X86 *c) {
     uint32_t module = arg(c, 0), type = arg(c, 1), callback = arg(c, 2), param = arg(c, 3);
     std::vector<ResourceName> names;
-    if (!callback || !resource_module(module) || !resource_names(type, &names)) {
+    uint32_t image;
+    if (!callback || !resource_module(module, image) ||
+        !resource_names(type, &names, nullptr, image)) {
         set_last_error(1814);
         set_eax(c, 0);
         return;

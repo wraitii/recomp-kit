@@ -373,6 +373,73 @@ bool relocate_aux_module(const char *name, uint32_t base, uint32_t preferred, ui
     return true;
 }
 
+struct PeLayout {
+    size_t opt_off = 0, sh_off = 0;
+    uint16_t opt_size = 0, nsections = 0;
+    uint32_t size_image = 0, size_hdrs = 0;
+};
+
+bool pe_layout(const std::vector<uint8_t> &file, const std::string &path, PeLayout &pe) {
+    if (file.size() < 0x40 || rd<uint16_t>(file, 0) != 0x5a4d) {
+        g_error = path + " is not an MZ image";
+        return false;
+    }
+    uint32_t pe_off = rd<uint32_t>(file, 0x3c);
+    if (pe_off + 24 > file.size() || rd<uint32_t>(file, pe_off) != 0x00004550) {
+        g_error = path + " is not a PE image";
+        return false;
+    }
+    size_t fh_off = pe_off + 4;
+    pe.nsections = rd<uint16_t>(file, fh_off + 2);
+    pe.opt_size = rd<uint16_t>(file, fh_off + 16);
+    pe.opt_off = fh_off + 20;
+    if (pe.opt_off + 96 > file.size() || rd<uint16_t>(file, pe.opt_off) != 0x10b ||
+        pe.opt_size < 96) {
+        g_error = path + " is not a PE32 image";
+        return false;
+    }
+    pe.sh_off = pe.opt_off + pe.opt_size;
+    if (pe.nsections == 0 || pe.sh_off + 40ull * pe.nsections > file.size()) {
+        g_error = path + " has a truncated section table";
+        return false;
+    }
+    pe.size_image = rd<uint32_t>(file, pe.opt_off + 56);
+    pe.size_hdrs = rd<uint32_t>(file, pe.opt_off + 60);
+    return true;
+}
+
+bool pe_copy(const std::vector<uint8_t> &file, const PeLayout &pe, const std::string &name,
+             uint32_t base, std::vector<SectionInfo> *sections) {
+    size_t hdr_copy = std::min<size_t>(std::min(pe.size_hdrs, pe.size_image), file.size());
+    memcpy(g_mem + base, file.data(), hdr_copy);
+    for (uint16_t i = 0; i < pe.nsections; ++i) {
+        size_t s = pe.sh_off + 40 * i;
+        char nm[9] = {0};
+        memcpy(nm, file.data() + s, 8);
+        uint32_t vsize = rd<uint32_t>(file, s + 8);
+        uint32_t va = base + rd<uint32_t>(file, s + 12);
+        uint32_t raw_size = rd<uint32_t>(file, s + 16);
+        uint32_t raw_ptr = rd<uint32_t>(file, s + 20);
+        uint32_t span = vsize ? vsize : raw_size;
+        sections->push_back({nm, va, vsize, raw_size, raw_ptr, rd<uint32_t>(file, s + 36)});
+        if (va < base || (uint64_t)va + span > (uint64_t)base + pe.size_image) {
+            g_error = name + ": section " + nm + " lies outside the image";
+            return false;
+        }
+        uint32_t copy = raw_size;
+        if (vsize && copy > vsize)
+            copy = vsize;
+        if (raw_ptr && copy) {
+            if ((uint64_t)raw_ptr + copy > file.size()) {
+                g_error = name + ": section " + nm + " raw data is truncated";
+                return false;
+            }
+            memcpy(g_mem + va, file.data() + raw_ptr, copy);
+        }
+    }
+    return true;
+}
+
 bool map_aux_module(const AuxSpec &spec) {
     LoaderModule m;
     m.name = spec.name;
@@ -402,33 +469,14 @@ bool map_aux_module(const AuxSpec &spec) {
         g_error = m.path + " has SHA-256 " + digest + ", expected " + spec.sha256;
         return false;
     }
-    if (file.size() < 0x40 || rd<uint16_t>(file, 0) != 0x5a4d) {
-        g_error = m.path + " is not an MZ image";
+    PeLayout pe;
+    if (!pe_layout(file, m.path, pe))
         return false;
-    }
-    uint32_t pe_off = rd<uint32_t>(file, 0x3c);
-    if (pe_off + 24 > file.size() || rd<uint32_t>(file, pe_off) != 0x00004550) {
-        g_error = m.path + " is not a PE image";
-        return false;
-    }
-    size_t fh_off = pe_off + 4;
-    uint16_t nsections = rd<uint16_t>(file, fh_off + 2);
-    uint16_t opt_size = rd<uint16_t>(file, fh_off + 16);
-    size_t opt_off = fh_off + 20;
-    uint16_t opt_magic = rd<uint16_t>(file, opt_off);
-    if (opt_magic != 0x10b || opt_size < 96) {
-        g_error = m.path + " is not a PE32 image";
-        return false;
-    }
-    size_t sh_off = opt_off + opt_size;
-    if (nsections == 0 || sh_off + 40ull * nsections > file.size()) {
-        g_error = m.path + " has a truncated section table";
-        return false;
-    }
+    size_t opt_off = pe.opt_off;
+    uint16_t opt_size = pe.opt_size, opt_magic = 0x10b;
     uint32_t entry_rva = rd<uint32_t>(file, opt_off + 16);
     uint32_t image_base = rd<uint32_t>(file, opt_off + 28);
-    uint32_t size_image = rd<uint32_t>(file, opt_off + 56);
-    uint32_t size_hdrs = rd<uint32_t>(file, opt_off + 60);
+    uint32_t size_image = pe.size_image;
     if (size_image > spec.size || spec.base < GUEST_SHIM_END ||
         (uint64_t)spec.base + spec.size > GUEST_SIZE) {
         char buf[200];
@@ -457,33 +505,8 @@ bool map_aux_module(const AuxSpec &spec) {
     if (rd<uint32_t>(file, opt_off + 92) > 9 && rd<uint32_t>(file, opt_off + 96 + 9 * 8))
         LOGW("%s has a TLS directory, which auxiliary modules do not get", spec.name);
 
-    size_t hdr_copy = size_hdrs < file.size() ? size_hdrs : file.size();
-    memcpy(g_mem + spec.base, file.data(), hdr_copy);
-    for (uint16_t i = 0; i < nsections; ++i) {
-        size_t s = sh_off + 40 * i;
-        char nm[9] = {0};
-        memcpy(nm, file.data() + s, 8);
-        uint32_t vsize = rd<uint32_t>(file, s + 8);
-        uint32_t va = spec.base + rd<uint32_t>(file, s + 12);
-        uint32_t raw_size = rd<uint32_t>(file, s + 16);
-        uint32_t raw_ptr = rd<uint32_t>(file, s + 20);
-        uint32_t span = vsize ? vsize : raw_size;
-        m.sections.push_back({nm, va, vsize, raw_size, raw_ptr, rd<uint32_t>(file, s + 36)});
-        if (va < spec.base || (uint64_t)va + span > (uint64_t)spec.base + size_image) {
-            g_error = std::string(spec.name) + ": section " + nm + " lies outside the image";
-            return false;
-        }
-        uint32_t copy = raw_size;
-        if (vsize && copy > vsize)
-            copy = vsize;
-        if (raw_ptr && copy) {
-            if ((uint64_t)raw_ptr + copy > file.size()) {
-                g_error = std::string(spec.name) + ": section " + nm + " raw data is truncated";
-                return false;
-            }
-            memcpy(g_mem + va, file.data() + raw_ptr, copy);
-        }
-    }
+    if (!pe_copy(file, pe, spec.name, spec.base, &m.sections))
+        return false;
     uint32_t reloc_rva = 0, reloc_size = 0;
     if (opt_size >= 96 + 6 * 8) {
         reloc_rva = rd<uint32_t>(file, opt_off + 96 + 5 * 8);
@@ -630,6 +653,51 @@ const LoaderModule *loader_module_containing(uint32_t addr) {
             return &m;
     return nullptr;
 }
+static std::vector<LoaderModule> g_datafiles;
+
+uint32_t loader_map_datafile(const std::string &path, std::string *why) {
+    std::vector<uint8_t> file;
+    PeLayout pe;
+    LoaderModule m;
+    m.path = path;
+    m.name = path.substr(path.find_last_of("\\/") + 1);
+    m.size = 0;
+    if (!read_file(path.c_str(), file)) {
+        g_error = "cannot read " + path;
+    } else if (pe_layout(file, path, pe)) {
+        m.base = heap_alloc(pe.size_image, true, 0x10000);
+        if (!m.base)
+            g_error = path + ": no guest memory for its image";
+        else if (!pe_copy(file, pe, m.name, m.base, &m.sections))
+            heap_free(m.base);
+        else {
+            m.size = pe.size_image;
+            g_datafiles.push_back(m);
+            return m.base;
+        }
+    }
+    if (why)
+        *why = g_error;
+    return 0;
+}
+
+const LoaderModule *loader_datafile(uint32_t base) {
+    for (const LoaderModule &m : g_datafiles)
+        if (m.base == base)
+            return &m;
+    return nullptr;
+}
+
+bool loader_unmap_datafile(uint32_t base) {
+    for (size_t i = 0; i < g_datafiles.size(); ++i)
+        if (g_datafiles[i].base == base) {
+            heap_free(base);
+            g_datafiles.erase(g_datafiles.begin() + i);
+            return true;
+        }
+    return false;
+}
+
 bool loader_in_image(uint32_t addr) {
     return (addr >= g_base && addr < g_base + g_size) || loader_module_containing(addr) != nullptr;
 }

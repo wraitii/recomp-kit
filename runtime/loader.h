@@ -66,6 +66,11 @@ const LoaderModule *loader_module(uint32_t i);
 // Count/index enumerate auxiliary modules; name/address lookups include the EXE.
 LoaderModule *loader_module_named(const char *name); // case-insensitive, nullptr when unknown
 const LoaderModule *loader_module_containing(uint32_t addr);
+// LoadLibraryEx(LOAD_LIBRARY_AS_DATAFILE): headers and sections only, no
+// relocation, imports or entry. The base is the image, not the guest handle.
+uint32_t loader_map_datafile(const std::string &path, std::string *why);
+const LoaderModule *loader_datafile(uint32_t base);
+bool loader_unmap_datafile(uint32_t base);
 // The guest address of a named export, 0 when the module has none by that name.
 uint32_t loader_module_export(const LoaderModule &m, const char *name);
 // DllMain(reason) for a mapped module. Returns 1 when the module's entry is not
