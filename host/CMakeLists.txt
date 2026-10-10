@@ -145,6 +145,7 @@ function(recomp_host target)
   recomp_optimize(${target} ${ARG_OPT})
   if(ARG_GEN)
     recomp_link_gen(${target})
+    recomp_link_aux(${target})
   endif()
 endfunction()
 

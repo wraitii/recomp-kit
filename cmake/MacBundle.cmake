@@ -34,6 +34,18 @@ function(recomp_mac_bundle target)
       list(APPEND video_args --ffmpeg-library "${library}")
     endforeach()
   endif()
+  set(aux_args)
+  if(RECOMP_AUX_SHARED)
+    # The auxiliary translations are dylibs beside the executable; the runtime
+    # and main table stay in the executable and are exported for them.
+    set_target_properties(${target} PROPERTIES
+      BUILD_WITH_INSTALL_RPATH ON
+      INSTALL_RPATH "@executable_path/../Frameworks")
+    target_link_options(${target} PRIVATE "-Wl,-export_dynamic")
+    foreach(aux_target ${RECOMP_GEN_AUX_TARGETS})
+      list(APPEND aux_args --aux-dylib "$<TARGET_FILE:${aux_target}>")
+    endforeach()
+  endif()
   set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS
     ${RECOMP_ROOT}/tools/recomp/finish_bundle.py)
   add_custom_command(TARGET ${target} POST_BUILD
@@ -41,7 +53,7 @@ function(recomp_mac_bundle target)
             --bundle ${RECOMP_BUILD_DIR}/${RECOMP_APP_NAME}.app
             --name ${RECOMP_APP_NAME} --cc ${CMAKE_C_COMPILER} --version ${RECOMP_VERSION}
             --build-root ${RECOMP_BUILD_ROOT} --game-dir ${RECOMP_GAME_DIR}
-            ${video_args}
+            ${video_args} ${aux_args}
     WORKING_DIRECTORY ${RECOMP_ROOT}
     COMMENT "Finishing ${RECOMP_APP_NAME}.app"
     VERBATIM)

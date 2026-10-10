@@ -34,7 +34,7 @@ const uint32_t recomp_func_count = 0;
 const char *recomp_profile_name(uint32_t i) { (void)i; return 0; }
 void (*const recomp_base_ptrs[1])(X86 *) = {0};
 void (*const recomp_raw_ptrs[1])(X86 *) = {0};
-uint8_t recomp_hooked[1];
+uint8_t recomp_hooked[1] = {0};
 RecompHookFn recomp_hook_ptrs[1] = {0};
 uint32_t recomp_override_count(void) { return 0; }
 uint64_t recomp_override_hash(void) { return 0; }

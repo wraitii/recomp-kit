@@ -39,6 +39,19 @@ def bundle_ffmpeg(contents, libraries):
         subprocess.run(["codesign", "--force", "--sign", "-", str(dest)], check=True)
 
 
+def bundle_aux_dylibs(contents, libraries):
+    """Embed each auxiliary translation, ID and sign it before the app."""
+    if not libraries:
+        return
+    frameworks = contents / "Frameworks"
+    frameworks.mkdir(parents=True, exist_ok=True)
+    for source in libraries:
+        dest = frameworks / source.name
+        shutil.copy2(source, dest)
+        subprocess.run(["install_name_tool", "-id", "@rpath/" + dest.name, str(dest)], check=True)
+        subprocess.run(["codesign", "--force", "--sign", "-", str(dest)], check=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, required=True)
@@ -51,6 +64,8 @@ def main():
     parser.add_argument("--pack", type=Path, default=None)
     parser.add_argument("--ffmpeg-library", type=Path, action="append", default=[],
                         help="FFmpeg shared library to copy into Contents/Frameworks (repeatable)")
+    parser.add_argument("--aux-dylib", type=Path, action="append", default=[],
+                        help="Auxiliary translation dylib to copy into Contents/Frameworks (repeatable)")
     args = parser.parse_args()
     if args.pack is None:
         args.pack = Path(os.environ.get("RECOMP_TEXTURE_PACK_DIR") or args.build_root / "texture-pack")
@@ -79,6 +94,7 @@ def main():
         subprocess.run([sys.executable, str(ROOT / "tools/recomp/package_texture_pack.py"),
                         str(args.pack), str(resources / "texture-pack")], check=True, cwd=ROOT)
     bundle_ffmpeg(contents, args.ffmpeg_library)
+    bundle_aux_dylibs(contents, args.aux_dylib)
     # Seal after every resource is in place: the linker signature alone does
     # not cover the resource envelope.
     subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(args.bundle)], check=True)

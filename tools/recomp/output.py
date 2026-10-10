@@ -225,7 +225,7 @@ def write_table(out, entry_names, functions, call_returns):
         for _a in entry_names:
             fh.write("    recomp_run_base,\n")
         fh.write("};\n")
-        fh.write("uint8_t recomp_hooked[%d];\n\n" % len(entry_names))
+        fh.write("uint8_t recomp_hooked[%d] = {0};\n\n" % len(entry_names))
         fh.write(emit_entry_dispatch())
         # O(1) call-return lookup: a bitset over the addresses' span, built
         # once at translation time. The binary search this replaces ran on

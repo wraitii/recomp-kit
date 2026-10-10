@@ -53,6 +53,8 @@ endfunction()
 # Submit isolated giants first so their compile can overlap the small chunks.
 function(recomp_translation_sources result dir)
   file(GLOB sources CONFIGURE_DEPENDS ${dir}/chunk_*.c ${dir}/table.c)
+  set_property(SOURCE ${sources} APPEND PROPERTY COMPILE_OPTIONS
+    "$<$<C_COMPILER_ID:Clang,AppleClang>:-Xclang;-disable-lifetime-markers>")
   set(giants ${sources})
   list(FILTER giants INCLUDE REGEX "/chunk_fn_[0-9a-f]+\\.c$")
   if(giants)
@@ -76,11 +78,16 @@ if(RECOMP_HAVE_GEN)
   target_include_directories(recomp_gen PRIVATE ${RECOMP_GEN_DIR} ${RECOMP_ROOT} ${RECOMP_ROOT}/runtime)
   target_include_directories(recomp_gen INTERFACE ${RECOMP_GEN_DIR})
   target_compile_options(recomp_gen PRIVATE ${RECOMP_WARN_GEN})
-  # Function-scope locals gain nothing from lifetime markers; clang's call emission costs calls x locals.
-  set_property(SOURCE ${RECOMP_GEN_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
-    "$<$<C_COMPILER_ID:Clang,AppleClang>:-Xclang;-disable-lifetime-markers>")
   recomp_translation_overrides(recomp_gen "${RECOMP_GEN_DIR}" "${RECOMP_EFFECTIVE_OVERRIDE}")
   recomp_optimize(recomp_gen 2)
+  # Desktop macOS keeps each auxiliary image in its own dylib: one static
+  # executable of every translation exceeds the arm64 branch range. Other
+  # platforms keep the static whole-archive layout.
+  if(APPLE AND NOT IOS AND NOT ANDROID)
+    set(RECOMP_AUX_SHARED ON)
+  else()
+    set(RECOMP_AUX_SHARED OFF)
+  endif()
   set(RECOMP_GEN_AUX_TARGETS "")
   foreach(key ${RECOMP_AUX_MODULES})
     set(dir "${RECOMP_GEN_DIR}/aux-${key}")
@@ -89,9 +96,18 @@ if(RECOMP_HAVE_GEN)
     endif()
     set(aux_target "recomp_gen_${key}")
     recomp_translation_sources(aux_sources "${dir}")
-    add_library(${aux_target} STATIC ${aux_sources})
-    set_target_properties(${aux_target} PROPERTIES
-      ARCHIVE_OUTPUT_DIRECTORY ${RECOMP_ARCHIVE_DIR} OUTPUT_NAME ${aux_target})
+    if(RECOMP_AUX_SHARED)
+      add_library(${aux_target} SHARED ${aux_sources})
+      set_target_properties(${aux_target} PROPERTIES
+        INSTALL_NAME_DIR "@rpath" OUTPUT_NAME ${aux_target})
+      # The runtime and the main table stay in the app; resolve their symbols
+      # from the main image at load time instead of linking a second copy.
+      target_link_options(${aux_target} PRIVATE "-Wl,-undefined,dynamic_lookup")
+    else()
+      add_library(${aux_target} STATIC ${aux_sources})
+      set_target_properties(${aux_target} PROPERTIES
+        ARCHIVE_OUTPUT_DIRECTORY ${RECOMP_ARCHIVE_DIR} OUTPUT_NAME ${aux_target})
+    endif()
     target_include_directories(${aux_target} PRIVATE ${dir} ${RECOMP_GEN_DIR} ${RECOMP_ROOT} ${RECOMP_ROOT}/runtime)
     target_compile_options(${aux_target} PRIVATE ${RECOMP_WARN_GEN})
     recomp_optimize(${aux_target} 2)
@@ -108,8 +124,15 @@ endif()
 # reached by address.
 function(recomp_link_gen target)
   target_link_libraries(${target} PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,recomp_gen>")
-  foreach(aux_target ${RECOMP_GEN_AUX_TARGETS})
-    target_link_libraries(${target} PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,${aux_target}>")
-  endforeach()
   target_include_directories(${target} PRIVATE ${RECOMP_GEN_DIR})
+endfunction()
+
+function(recomp_link_aux target)
+  foreach(aux_target ${RECOMP_GEN_AUX_TARGETS})
+    if(RECOMP_AUX_SHARED)
+      target_link_libraries(${target} PRIVATE ${aux_target})
+    else()
+      target_link_libraries(${target} PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,${aux_target}>")
+    endif()
+  endforeach()
 endfunction()
