@@ -7,11 +7,23 @@ all incoming paths prove its current value already resides in the CPU. Facts
 are relative to block entry/exit state, so a loop phi's previous iteration can
 never be mistaken for its newly assigned value. Helpers invalidate facts.
 """
+from dataclasses import dataclass
 from .simplify import EFFECTS, EXITS
 
 
+@dataclass
+class PublicationPlan:
+    required: dict
+    known_before: dict
+
+
 def plan(s, successors, fields, *, access_fields=None, reloaded=(), kept=None):
-    """Return required register-lane keys for each effect and return snapshot.
+    return analyze(s, successors, fields, access_fields=access_fields,
+                   reloaded=reloaded, kept=kept).required
+
+
+def analyze(s, successors, fields, *, access_fields=None, reloaded=(), kept=None):
+    """Return publication requirements and facts already known before each event.
 
 `fields` groups register lanes by runtime field. LOAD/STORE have read-only CPU
 observers on normal continuation in the current accessor contract: the store
@@ -48,6 +60,7 @@ Starting with no facts gives a conservative least fixed point for loops.
 
     known_exit = {i: set() for i in s.blocks}
     publications = {}
+    known_before = {}
     changed = True
     while changed:
         changed = False
@@ -62,12 +75,15 @@ Starting with no facts gives a conservative least fixed point for loops.
                 held = kept.get(v.id, ()) if kept else ()
                 kept_groups, kept_known = set(), set()
                 required = []
+                already_known = []
                 for n, keys in enumerate(groups):
+                    current = values(state, keys)
+                    if known.get(n) == current:
+                        already_known.extend(keys)
                     if access and access_fields is not None and not any(key in access_fields for key in keys):
                         # A skipped snapshot does not make a publication fact.
                         # The older CPU value stays known until a real observer.
                         continue
-                    current = values(state, keys)
                     if held and all(key in held for key in keys):
                         kept_groups.add(n)
                         if known.get(n) == current:
@@ -80,6 +96,7 @@ Starting with no facts gives a conservative least fixed point for loops.
                         # edges leave the CPU as it was.
                         known[n] = current
                 publications[v.id] = tuple(required)
+                known_before[v.id] = tuple(already_known)
                 if v.opc in ("DIV32", "IDIV32", "CALL", "CALLIND", "STRINGOP"):
                     # A division error handler, an opaque callee and the string
                     # helper's fault path may leave arbitrary CPU state behind,
@@ -97,4 +114,4 @@ Starting with no facts gives a conservative least fixed point for loops.
             if outgoing != known_exit[i]:
                 known_exit[i] = outgoing
                 changed = True
-    return publications
+    return PublicationPlan(publications, known_before)

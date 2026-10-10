@@ -167,7 +167,7 @@ def _emit(task):
         tr.unmodelled.clear()
         fn, entries = ctx.load(addr)
         tr.analyze(fn, entries)
-        lines, wrappers = None, False
+        lines, wrappers, variant_requests = None, False, set()
         reason = "decoded-only code map" if ctx.decoded_only else production.exclusion(fn)
         if reason is None:
             try:
@@ -175,7 +175,7 @@ def _emit(task):
                 callee_contracts = dict(contracts.get(addr) or {})
                 if selected:
                     callee_contracts.update(private_targets)
-                lines, external = production.emit_ssa(
+                lines, external, variant_requests = production.emit_ssa(
                     tr, ctx.lifter, fn, entries, ctx.settings.emit, ctx.known, callee_contracts,
                     ctx.settings.checked_returns,
                     private_targets if selected else ())
@@ -188,15 +188,16 @@ def _emit(task):
             head = "void fn_%08x(X86 *c) {" % addr
             kept = [line for line in decoded if not line.startswith(head)]
             if len(kept) != len(decoded) - 1:
-                reason, lines = "entry wrapper layout", None
+                reason, lines, variant_requests = "entry wrapper layout", None, set()
             else:
                 lines = kept + lines
         if lines is None:
             if addr in ctx.settings.checked_returns:
                 raise TranslateError("%08x: checked-return body failed SSA emission: %s" % (addr, reason))
             lines = tr.translate(fn, entries)
+            variant_requests = set()
         out.append((addr, lines, re.sub(r"^[0-9a-f]{8}: ", "", reason) if reason else None,
-                    list(tr.unmodelled)))
+                    list(tr.unmodelled), variant_requests))
     return out
 
 
@@ -391,8 +392,8 @@ def main(argv=None):
         phase("emit")
         private_masks = {}
         for row in results.values():
-            for addr, mask in re.findall(r"entry_contract_([0-9a-f]{8})_([0-9a-f]{4})\(c,", "\n".join(row[1])):
-                private_masks.setdefault(int(addr, 16), set()).add(int(mask, 16))
+            for addr, mask in row[4]:
+                private_masks.setdefault(addr, set()).add(mask)
         for addr, lines in pool.map(_private, sorted(private_masks.items())):
             results[addr][1].extend(lines)
         phase("private entries")

@@ -22,9 +22,10 @@ hooks and profiling retain the ordinary entry. Set `checked_returns = []` under
 `[translate]` and regenerate to disable the pilot. Savings across the conversion call's
 state transfer are piloted separately below; scratch memory remains translated.
 
-The integer-state pilot selects callers `0x0042c1b0` and `0x0042ce00` through
+The integer-state pilot is disabled pending cleanup and a demonstrated workload
+gain. Its reviewed callers are `0x0042c1b0` and `0x0042ce00`, selected through
 `state_contract_callers`. Their conversion edges require EAX, ESP and EBP on
-normal continuation, with EDX, ECX and AF retained at sites where they remain
+normal continuation, with AF retained at sites where it remains
 observable; EIP and all existing x87 state remain published. Private
 entries omit other integer return stores and use byte-derived leaf input
 contracts. Full changed state is recovered on an unexpected RET, and observation
@@ -32,8 +33,10 @@ boundaries retain the ordinary path. Set `state_contract_callers = []` and
 regenerate to disable this stage independently. Expansion and x87 contracts
 await correctness coverage and a workload profile showing a gain.
 
-Validation compared all three private output sets and their unexpected-return
+Validation compared both private output sets and their unexpected-return
 paths against the ordinary entry over 1,860 rounding cases each, with no new
 differences. The ordinary entry still has the baseline's 96 original-byte
 rounding discrepancies. Random-input diff coverage reached valid returns in
-`0x005a10d0` and `0x0042c1b0`, but not `0x0042ce00`.
+`0x005a10d0` and `0x0042c1b0`, including hook-enabled ordinary fallback, but not
+`0x0042ce00`. Cleanup removes fallback parity reductions in the private leaf
+assembly and reduces caller stack frames; eligibility/checkpoint costs remain.

@@ -211,6 +211,15 @@ fully published ordinary checked entry. Exact fault-state mode and auxiliary
 modules retain ordinary entries. Guest accesses and the complete existing x87
 materialization policy remain in place; x87 field contracts are a later stage.
 
+`transfer_plan.py` separates call publication, hook guards, ordinary fallback
+requirements and continuation outputs from C emission. `publication.analyze`
+exposes pre-event facts as well as required stores; ordinary fallbacks retain
+only unproven integer fields, while flags remain explicit because a published
+recipe can leave their physical CPU fields stale. Fallbacks and unexpected RETs
+have separate flag publication plans, preserving proven lazy descriptors.
+Private variant requests are structured emission results; discarded emissions
+do not register variants. The cleanup sequence is in [contract-cleanup.md](contract-cleanup.md).
+
 ### Policies
 
 | `[translate]` key | Default | Effect |

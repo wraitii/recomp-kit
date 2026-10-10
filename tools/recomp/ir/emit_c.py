@@ -15,10 +15,11 @@ from .integer_extra import EXTRA_MNEMONICS, correct as correct_extra
 from .ssa import SSAError, MEMORY, build
 from .cfg import FunctionIR
 from .simplify import canonicalize, simplify, state_roots, whole, EFFECTS, EXITS
-from .publication import plan
+from .publication import analyze as publication_analysis
+from . import transfer_plan
 from . import flag_region
 from . import x87
-from .call_contracts import continuation_outputs
+from .call_contracts import continuation_outputs, GPRS as CONTRACT_GPRS, ARITH_FLAGS as CONTRACT_FLAGS
 
 
 SUPPORTED_MNEMONICS = frozenset((
@@ -60,8 +61,6 @@ STRING_HELPERS = _string_helpers()
 FLAG_FIELDS = frozenset("c->eflags_" + n for n in ("cf", "pf", "af", "zf", "sf", "of"))
 
 # Call-contract fields.
-CONTRACT_GPRS = ("EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI")
-CONTRACT_FLAGS = ("CF", "PF", "AF", "ZF", "SF", "OF")
 CONTRACT_FIELDS = frozenset(CONTRACT_GPRS) | frozenset(CONTRACT_FLAGS)
 #: The guest frame pointer and stack pointer are call-helper state even when a
 #: contract says the callee overwrites them; never drop their publication.
@@ -462,7 +461,8 @@ CW_CLONE_MAX_GUARDS = 1
 def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state=True,
          msvc_convention=True, lazy_flags=False, lifter=None, indirect_call_symbol=None,
          call_contracts=None, x87_cw_clone=True, tail_symbols=None,
-         checked_return=False, checked_calls=(), contract_calls=(), return_fields=None):
+         checked_return=False, checked_calls=(), contract_calls=(), return_fields=None,
+         variant_requests=None):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
     `call_symbols` maps an allowed direct-call target address to the C symbol
@@ -511,6 +511,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     x87 never clones.
     """
     arguments = dict(locals())
+    requests_sink, variant_requests = variant_requests, set()
     checked_calls = frozenset(checked_calls)
     contract_calls = frozenset(contract_calls)
     if not contract_calls <= checked_calls:
@@ -645,8 +646,9 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     # summaries prove which fields a boundary does not observe.
     kept_calls = {v.id: kept_fields[v.data] for b in s.blocks.values() for v in b.ops
                   if v.opc == "CALL" and v.data in kept_fields}
-    publications = plan(s, fir.succ, groups, access_fields=access_fields,
-                        reloaded=set(mapping) - flag_keys, kept=kept_calls)
+    publication_facts = publication_analysis(s, fir.succ, groups, access_fields=access_fields,
+                                             reloaded=set(mapping) - flag_keys, kept=kept_calls)
+    publications = dict(publication_facts.required)
     return_fallback, return_roots = {}, []
     if return_fields is not None:
         required = set(return_fields) | set(CONTRACT_NEVER_SKIP)
@@ -660,45 +662,21 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     if any(s.resolve(b.exit[key]) is not s.resolve(s.inputs[key]) for key in keys):
                         fallback.extend(keys)
                 return_fallback[v.id] = fallback
-                return_roots.extend(state_roots(s, b.exit, fallback, groups))
                 publications[v.id] = tuple(key for key in publications[v.id]
                                            if key not in lane_field or lane_field[key] in required)
-    # Cross-function contracts: a direct CALL may omit publication of a field
-    # the callee neither reads nor preserves.  A field the callee preserves is
-    # not droppable even when this body does not read it back: the field's CPU
-    # value can still flow out to this body's own caller, and the publication
-    # plan's must-facts may not republish it at RET.
-    contract_skip, contract_guard, contract_roots = {}, {}, []
-    if call_contracts:
-        for b in s.blocks.values():
-            for v in b.ops:
-                if v.opc != "CALL":
-                    continue
-                contract = call_contracts.get(v.data)
-                if contract is None:
-                    continue
-                reads, kills = contract.reads, contract.kills
-                skipped = set()
-                for field in field_lanes:
-                    if field in CONTRACT_NEVER_SKIP or field in reads or field not in kills:
-                        continue
-                    skipped.add(field)
-                kept = tuple(key for key in kept_calls.get(v.id, ()) if key in s.inputs)
-                if not skipped and not kept:
-                    continue
-                if skipped:
-                    contract_skip[v.id] = skipped
-                # A mod hook installed on the callee at runtime observes and may
-                # rewrite the full CPU, so dropped and kept fields stay
-                # publishable behind recomp_hooks_ever, and a kept field is
-                # reread there after the call; keep their values live.
-                guarded = tuple(key for key in publications[v.id]
-                                if lane_field.get(key) in skipped) + kept
-                contract_guard[v.id] = guarded
-                state = b.snapshots[v.id]
-                contract_roots.extend(state_roots(s, state, guarded, groups))
-                publications[v.id] = tuple(
-                    key for key in publications[v.id] if lane_field.get(key) not in skipped)
+    call_plans = transfer_plan.calls(s, publications, publication_facts.known_before,
+                                     call_contracts or {}, kept_calls, lane_field,
+                                     CONTRACT_NEVER_SKIP, contract_calls, flag_keys)
+    contract_skip = {key: value.skipped for key, value in call_plans.items() if value.skipped}
+    contract_guard = {key: value.guard for key, value in call_plans.items() if value.guard}
+    contract_roots = []
+    for b in s.blocks.values():
+        for v in b.ops:
+            if v.opc == "CALL":
+                call = call_plans[v.id]
+                publications[v.id] = call.publication
+                if v.data not in contract_calls:
+                    contract_roots.extend(state_roots(s, b.snapshots[v.id], call.guard, groups))
     # Decide which seams defer their flags as a descriptor before dead-value
     # elimination, so the descriptor's operands can be kept live as roots.
     cc_plan, cc_roots = {}, []
@@ -713,32 +691,35 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     continue
                 state = b.exit if v.opc in EXITS else b.snapshots[v.id]
                 required = publications[v.id]
-                defines = set(record.flags) if record.kind == "join" else set(CC_DEFINES[record.kind])
-                mask = 0
-                for name, key in flag_first_key.items():
-                    if name not in defines or key not in required:
-                        continue
-                    rec = record.flags.get(name)
-                    cur = state.get(key)
-                    if rec is None or cur is None or s.resolve(cur) is not s.resolve(rec):
-                        mask = 0
-                        break
-                    mask |= CC_BIT_VALUES[name]
-                if not mask or v.opc in CC_EAGER_EVENTS:
+                if v.opc in CC_EAGER_EVENTS:
                     continue
-                cc_plan[v.id] = (record, mask)
-                covered = {flag_first_key[name] for name, bit in CC_BIT_VALUES.items() if mask & bit}
-                live_publications[v.id] = tuple(key for key in required if key not in covered)
-                cc_roots.extend(x for x in (record.op, record.a, record.b, record.carry, record.res)
-                                if x is not None)
+                flags = transfer_plan.flag_publication(s, state, required, record,
+                                                       flag_first_key, CC_DEFINES, CC_BIT_VALUES)
+                if flags is None:
+                    continue
+                cc_plan[v.id] = flags
+                live_publications[v.id] = tuple(key for key in required if key not in flags.covered)
+                cc_roots.extend(flags.roots)
     # A callee-state read with no use is dropped; that also confines post-call
     # settles to reloads whose value is needed.
+    fallback_flags = {}
     for b in s.blocks.values():
         for v in b.ops:
             if v.opc == "CALL" and v.data in contract_calls:
-                contract_roots.extend(state_roots(s, b.snapshots[v.id], b.snapshots[v.id], groups))
+                required, state, record = call_plans[v.id].fallback, b.snapshots[v.id], b.cc_snapshots.get(v.id)
+            elif v.opc == "RETURN" and return_fields is not None:
+                required, state, record = return_fallback[v.id], b.exit, b.cc_exit
+            else:
+                continue
+            flags = transfer_plan.flag_publication(s, state, required, record,
+                                                   flag_first_key, CC_DEFINES, CC_BIT_VALUES) if lazy_flags else None
+            fallback_flags[v.id] = flags
+            roots = transfer_plan.publication_roots(s, state, required, groups, flags)
+            (return_roots if v.opc == "RETURN" else contract_roots).extend(roots)
     contract_outputs = continuation_outputs(s, live_publications, groups, lane_field,
                                             cc_roots + contract_roots) if contract_calls else {}
+    for key, outputs in contract_outputs.items():
+        call_plans[key].outputs = outputs | CONTRACT_NEVER_SKIP
     live = simplify(s, live_publications, canonical=False, extra_roots=cc_roots + contract_roots + return_roots,
                     removable=frozenset(("CALL_RELOAD", "CALL_KEEP")), groups=groups)
     reads_entry_flags = any(
@@ -845,15 +826,13 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                 lines.append("%s = (uint32_t)(%s);" % (field, field_value(state, field, keys)))
         return lines
 
-    def publish(state, event):
+    def publish_fields(state, required, cc=None):
         lines = []
-        required = publications[event.id]
-        cc = cc_plan.get(event.id)
         record = None
         mask = 0
         covered = set()
         if cc is not None:
-            record, mask = cc
+            record, mask = cc.record, cc.mask
             covered = {"c->eflags_%s" % name for name, bit in CC_BIT_VALUES.items() if mask & bit}
         stored_flag = False
         for (_, off, size), field in fields:
@@ -880,8 +859,12 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
         elif lazy_flags and stored_flag:
             # A direct field write must not leave an older descriptor pending.
             lines.append("c->cc_op = X86_CC_NONE;")
+        return lines
+
+    def publish(state, event):
+        lines = publish_fields(state, publications[event.id], cc_plan.get(event.id))
         if lazy_flags and event.id in contract_skip \
-                and (contract_skip[event.id] & set(CONTRACT_FLAGS)) and record is None:
+                and (contract_skip[event.id] & set(CONTRACT_FLAGS)) and event.id not in cc_plan:
             # The dropped flags have no descriptor at this seam, so an older
             # pending descriptor must not materialise into them after the call.
             lines.append("c->cc_op = X86_CC_NONE;")
@@ -1126,14 +1109,14 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     # invoke only the explicitly bound symbol. The callee receives
                     # the guest return address already stored by the preceding
                     # CALL push, so its own RET owns ESP/EIP restoration.
-                    outputs = contract_outputs.get(v.id) if v.data in contract_calls else None
+                    outputs = call_plans[v.id].outputs if v.data in contract_calls else None
                     if outputs is not None:
                         output_mask = sum(1 << CONTRACT_GPRS.index(f) if f in CONTRACT_GPRS
                                           else 1 << (len(CONTRACT_GPRS) + CONTRACT_FLAGS.index(f))
-                                          for f in outputs | CONTRACT_NEVER_SKIP)
+                                          for f in outputs)
                         lines.append("if (entry_contract_available_%08x(c)) {" % v.data)
                     lines.extend(publish(b.snapshots[v.id], v))
-                    if contract_guard.get(v.id):
+                    if outputs is None and contract_guard.get(v.id):
                         guarded = store_fields(b.snapshots[v.id], contract_guard[v.id])
                         if lazy_flags and any(key in flag_keys for key in kept_calls.get(v.id, ())):
                             guarded.append("c->cc_op = X86_CC_NONE;")
@@ -1147,10 +1130,10 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     if outputs is not None:
                         lines.append("entry_contract_%08x_%04x(c, 0x%xu);" % (
                             v.data, output_mask, b.insn.addr + b.insn.length))
+                        variant_requests.add((v.data, output_mask))
                         lines.append("} else {")
-                        lines.extend(store_fields(b.snapshots[v.id], b.snapshots[v.id]))
-                        if lazy_flags:
-                            lines.append("c->cc_op = X86_CC_NONE;")
+                        lines.extend(publish_fields(b.snapshots[v.id], call_plans[v.id].fallback,
+                                                    fallback_flags.get(v.id)))
                         lines.append("%s(c, 0x%xu);" % (name, b.insn.addr + b.insn.length))
                         lines.append("}")
                     elif v.data in checked_calls:
@@ -1217,9 +1200,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                         eip_keys = [key for key, (field, _) in mapping.items() if field == "c->eip"]
                         popped = field_value(b.exit, "c->eip", eip_keys)
                         lines.append("if (%s != expected_return_) {" % popped)
-                        lines.extend(store_fields(b.exit, return_fallback[v.id]))
-                        if lazy_flags:
-                            lines.append("c->cc_op = X86_CC_NONE;")
+                        lines.extend(publish_fields(b.exit, return_fallback[v.id], fallback_flags.get(v.id)))
                         lines.extend(["recomp_return(c);", "return;", "}"])
                     lines.extend(publish(b.exit, v))
                     if return_fields is not None:
@@ -1310,4 +1291,6 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
         return emit(**arguments)
     lines.append("}")
     lines[scalar_declarations:scalar_declarations] = scalar.temps
+    if requests_sink is not None:
+        requests_sink.update(variant_requests)
     return "\n".join(lines)
