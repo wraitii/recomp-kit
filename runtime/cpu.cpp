@@ -45,13 +45,6 @@ std::map<uint32_t, SetjmpRecord *> &setjmps() {
 X86 *g_setjmp_ctx = nullptr;
 } // namespace
 
-// ---------------------------------------------------------------------------
-// Undeliverable call targets. A call the address table cannot deliver is
-// always a translator bug - a missing entry point, or a call target inside a
-// block nothing recovered - and the guest carries on with the wrong answer
-// rather than stopping. Recording each distinct one lets a run report them
-// instead of leaving them to be found in a log.
-// ---------------------------------------------------------------------------
 namespace {
 std::vector<UnknownCall> &unknown_calls() {
     static std::vector<UnknownCall> v;
@@ -187,12 +180,11 @@ void recomp_shim_call(X86 *c, uint32_t target) {
         return;
     LOGW("recomp_shim_call: %08x is not an allocated trampoline (ESP=%08x, return=%08x)", target,
          c->r[R_ESP], rd32(c->r[R_ESP]));
-    return_as_if_ret(c);
+    fflush(stdout);
+    fflush(stderr);
+    abort();
 }
 
-// An indirect call to an address that is neither a translated function nor a
-// shim. Almost always a translator bug or an uninitialised function pointer,
-// so it is logged with the target and the guest continues with EAX = 0.
 void recomp_unknown_call(X86 *c, uint32_t target) {
     if (recomp_run_thunk(c, target))
         return;
@@ -221,8 +213,7 @@ void recomp_unknown_call(X86 *c, uint32_t target) {
     // EAccessViolation, and a try/except around the call carries on: the
     // original drew speech with a surface that could be nil and relied on
     // exactly that. Returning 0 instead ran on with the garbage and aborted at
-    // the next jump through it. Only when no handler takes the fault does the
-    // call return as before.
+    // the next jump through it.
     if (target < 0x10000) {
         // EXCEPTION_ACCESS_VIOLATION's two parameters: an execute fault (8) at
         // the target. They sit below the stack pointer, which the dispatcher
@@ -250,7 +241,7 @@ void recomp_unknown_call(X86 *c, uint32_t target) {
     // empty, while a wild object means the pointer never was one.
     if (log_once(key,
                  "call to unknown target %08x (ESP=%08x, return=%08x, EAX=%08x EBX=%08x "
-                 "ECX=%08x EDX=%08x ESI=%08x EDI=%08x): returning 0",
+                 "ECX=%08x EDX=%08x ESI=%08x EDI=%08x): aborting",
                  target, c->r[R_ESP], ret, c->r[R_EAX], c->r[R_EBX], c->r[R_ECX], c->r[R_EDX],
                  c->r[R_ESI], c->r[R_EDI]) &&
         unknown_calls().size() < 256)
@@ -258,7 +249,9 @@ void recomp_unknown_call(X86 *c, uint32_t target) {
     // Every undeliverable call is an address the run proves is code, so it is
     // also what a regeneration wants back (see discovery.h).
     discovery_note("call", target, ret);
-    return_as_if_ret(c);
+    fflush(stdout);
+    fflush(stderr);
+    abort();
 }
 
 // DIV/IDIV with a zero divisor or an out-of-range quotient. On real hardware
