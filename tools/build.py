@@ -302,6 +302,15 @@ def android_install_and_launch(apk, bundle_id, device=None, console=False, *, ga
         subprocess.run(command + ["logcat"], check=True)
 
 
+def sync_file(src, dst):
+    if dst.is_file() and dst.read_bytes() == src.read_bytes():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    temporary = dst.with_name(dst.name + ".new")
+    shutil.copy2(src, temporary)
+    temporary.replace(dst)
+
+
 def sync_tree(src, dst):
     """Make `dst` match `src`, rewriting only files whose bytes changed.
 
@@ -316,13 +325,7 @@ def sync_tree(src, dst):
     for rel in sorted(set(dst_files) - set(src_files), reverse=True):
         dst_files[rel].unlink()
     for rel, sp in src_files.items():
-        dp = dst / rel
-        if dp.is_file() and dp.read_bytes() == sp.read_bytes():
-            continue
-        dp.parent.mkdir(parents=True, exist_ok=True)
-        temporary = dp.with_name(dp.name + ".new")
-        shutil.copy2(sp, temporary)
-        temporary.replace(dp)
+        sync_file(sp, dst / rel)
 
 
 def translation_fingerprint(game_dir, cfg, translate_args):
@@ -361,13 +364,16 @@ def translation_fingerprint(game_dir, cfg, translate_args):
     return h.hexdigest()
 
 
-def publish_generated(build_root, translate):
+def publish_generated(build_root, translate, partial=False, main=True):
     """Stage a translation, then publish it without disturbing unchanged files.
 
     `translate(stage_dir)` writes the sources and raises on failure; the
     published tree is untouched in that case. On success the stage is synced
     into gen/ file by file, under the build lock, so a reader never sees half
-    a generation and ninja only rebuilds what actually changed."""
+    a generation and ninja only rebuilds what actually changed. A partial
+    publish only touches the directories the stage carries, and, when `main`,
+    replaces the top-level generated files instead of deleting unmentioned
+    directories."""
     recomp = Path(build_root) / "recomp"
     recomp.mkdir(parents=True, exist_ok=True)
     gen = recomp / "gen"
@@ -378,7 +384,20 @@ def publish_generated(build_root, translate):
         translate(stage)
         # x86.h sits beside the generated sources so #include "x86.h" resolves.
         shutil.copy(ROOT / "runtime/x86.h", stage / "x86.h")
-        sync_tree(stage, gen)
+        if not partial:
+            sync_tree(stage, gen)
+        else:
+            for entry in sorted(stage.iterdir()):
+                if entry.is_dir():
+                    sync_tree(entry, gen / entry.name)
+            if main:
+                stage_files = {p.name for p in stage.iterdir() if p.is_file()}
+                for path in list(gen.iterdir()):
+                    if path.is_file() and path.name not in stage_files:
+                        path.unlink()
+                for path in stage.iterdir():
+                    if path.is_file():
+                        sync_file(path, gen / path.name)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
     symbols = gen / "symbols.json"
@@ -388,13 +407,14 @@ def publish_generated(build_root, translate):
         temporary.replace(recomp / "symbols.json")
 
 
-def run_translator(stage, game_dir, build_root, allow_unmodelled=None, aux_modules=()):
-    command = [sys.executable, str(ROOT / "tools/recomp/driver.py"), "--out", str(stage),
-               "--game", str(game_dir),
-               "--report", str(Path(build_root) / "recomp/translate-report.json")]
-    if allow_unmodelled:
-        command += ["--allow-unmodelled", allow_unmodelled]
-    subprocess.run(command, cwd=ROOT, check=True)
+def run_translator(stage, game_dir, build_root, allow_unmodelled=None, aux_modules=(), main=True):
+    if main:
+        command = [sys.executable, str(ROOT / "tools/recomp/driver.py"), "--out", str(stage),
+                   "--game", str(game_dir),
+                   "--report", str(Path(build_root) / "recomp/translate-report.json")]
+        if allow_unmodelled:
+            command += ["--allow-unmodelled", allow_unmodelled]
+        subprocess.run(command, cwd=ROOT, check=True)
     for module in aux_modules:
         destination = Path(stage) / ("aux-" + module["key"])
         destination.mkdir()
@@ -416,7 +436,9 @@ def web_site(game_dir, build_root, preset, cfg):
 
 def parse_args(argv, system=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--regenerate", action="store_true", help="Regenerate and compile translated C")
+    parser.add_argument("--regenerate", nargs="?", const="all", default=None, metavar="MODULES",
+                        help="Regenerate translated C: all images, or only the named auxiliary modules "
+                             "(comma-separated; 'main' names the game image)")
     parser.add_argument("--function-corpus", type=Path, metavar="MANIFEST",
                         help="Build/check/report a game-owned native-reference function corpus")
     parser.add_argument("--corpus-checks", type=int, default=4096)
@@ -471,6 +493,19 @@ def parse_args(argv, system=None):
     return args, parser
 
 
+def regenerate_selection(value, cfg, parser):
+    """None for a full regeneration, else the chosen image keys."""
+    keys = [part.strip() for part in value.split(",") if part.strip()]
+    if not keys or "all" in keys:
+        return None
+    known = {"main"} | {module["key"] for module in cfg["aux_modules"]}
+    unknown = [key for key in keys if key not in known]
+    if unknown:
+        parser.error("--regenerate names unknown modules: %s (known: %s)"
+                     % (", ".join(unknown), ", ".join(sorted(known))))
+    return set(keys)
+
+
 def main():
     """Check inputs, translate under the build lock when needed, then configure and build."""
     args, parser = parse_args(sys.argv[1:])
@@ -493,22 +528,34 @@ def main():
             if args.target in NEEDS_GEN and args.regenerate:
                 if not cfg.get("code_map_path"):
                     parser.error("Translation needs the game's code map: set [translate] code_map in game.toml")
+                selection = regenerate_selection(args.regenerate, cfg, parser)
                 translate_args = {
                     "allow_unmodelled": args.allow_unmodelled,
                 }
                 fingerprint = translation_fingerprint(args.game_dir, cfg, translate_args)
                 stamp = args.build_root / "recomp/translate.stamp"
                 translated = (args.build_root / "recomp/gen/table.c").is_file()
-                if translated and stamp.is_file() and stamp.read_text().strip() == fingerprint:
-                    print("translation inputs unchanged; keeping %s/recomp/gen" % args.build_root)
+                if selection is None:
+                    if translated and stamp.is_file() and stamp.read_text().strip() == fingerprint:
+                        print("translation inputs unchanged; keeping %s/recomp/gen" % args.build_root)
+                    else:
+                        publish_generated(args.build_root,
+                                          lambda stage: run_translator(stage, args.game_dir, args.build_root,
+                                                                       args.allow_unmodelled, cfg["aux_modules"]))
+                        stamp.parent.mkdir(parents=True, exist_ok=True)
+                        temporary = stamp.with_name("translate.stamp.new")
+                        temporary.write_text(fingerprint + "\n")
+                        temporary.replace(stamp)
                 else:
+                    if not translated:
+                        parser.error("a partial --regenerate needs an existing translation; run --regenerate first")
+                    main_image = "main" in selection
+                    aux = [module for module in cfg["aux_modules"] if module["key"] in selection]
                     publish_generated(args.build_root,
                                       lambda stage: run_translator(stage, args.game_dir, args.build_root,
-                                                                   args.allow_unmodelled, cfg["aux_modules"]))
-                    stamp.parent.mkdir(parents=True, exist_ok=True)
-                    temporary = stamp.with_name("translate.stamp.new")
-                    temporary.write_text(fingerprint + "\n")
-                    temporary.replace(stamp)
+                                                                   args.allow_unmodelled, aux, main=main_image),
+                                      partial=True, main=main_image)
+                    stamp.unlink(missing_ok=True)
             # Generated sources include the adjacent runtime header. Refresh
             # it under the same lock even when their translation is unchanged.
             header = args.build_root / "recomp/gen/x86.h"
