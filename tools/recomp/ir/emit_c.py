@@ -20,6 +20,7 @@ from . import transfer_plan
 from . import flag_region
 from . import x87
 from .call_contracts import GPRS as CONTRACT_GPRS, ARITH_FLAGS as CONTRACT_FLAGS
+from .contract_variants import output_mask as contract_output_mask
 
 
 SUPPORTED_MNEMONICS = frozenset((
@@ -462,7 +463,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
          msvc_convention=True, lazy_flags=False, lifter=None, indirect_call_symbol=None,
          call_contracts=None, x87_cw_clone=True, tail_symbols=None,
          checked_return=False, checked_calls=(), contract_calls=(), return_fields=None,
-         variant_requests=None, call_decisions=None, x87_known_mode=False):
+         variant_requests=None, call_decisions=None, x87_known_mode=False, contract_masks=None):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
     `call_symbols` maps an allowed direct-call target address to the C symbol
@@ -524,6 +525,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     decisions_sink, call_decisions = call_decisions, []
     checked_calls = frozenset(checked_calls)
     contract_calls = frozenset(contract_calls)
+    contract_masks = contract_masks or {}
     if not contract_calls <= checked_calls:
         raise SSAError("state contracts require checked calls")
     if return_fields is not None and (not checked_return or any(
@@ -683,6 +685,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     "callee_reads": sorted(contract.reads) if contract is not None else None,
                     "fast_publication": field_names(call.publication.required),
                     "outputs": sorted(call.outputs) if private else None,
+                    "entry_output_mask": "%04x" % contract_masks.get(v.data, contract_output_mask(call.outputs)) if private else None,
                     "ordinary_fallback": field_names(call.fallback.required) if private else None,
                     "fallback_flag_mask": call.fallback.flags.mask if call.fallback.flags else None,
                     "reason": reason,
@@ -1079,9 +1082,10 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     # CALL push, so its own RET owns ESP/EIP restoration.
                     outputs = transfers.calls[v.id].outputs if v.data in contract_calls else None
                     if outputs is not None:
-                        output_mask = sum(1 << CONTRACT_GPRS.index(f) if f in CONTRACT_GPRS
-                                          else 1 << (len(CONTRACT_GPRS) + CONTRACT_FLAGS.index(f))
-                                          for f in outputs)
+                        needed_mask = contract_output_mask(outputs)
+                        output_mask = contract_masks.get(v.data, needed_mask)
+                        if needed_mask & ~output_mask or output_mask & ~((1 << len(CONTRACT_GPRS + CONTRACT_FLAGS)) - 1):
+                            raise SSAError("shared contract outputs do not cover the call continuation")
                         lines.append("if (entry_contract_prepare_%08x(c)) {" % v.data)
                     lines.extend(publish(b.snapshots[v.id], v))
                     if outputs is None and transfers.calls[v.id].guard:

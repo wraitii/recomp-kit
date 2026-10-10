@@ -10,7 +10,7 @@ return handling. Ordinary entries remain available for other callers.
 
 Integer transfer plans combine callee effects with continuation liveness,
 including values escaping through the caller's return. Structured emission data
-owns private variants and declaration dependencies; `contract-report.json`
+owns private entries and declaration dependencies; `contract-report.json`
 reports the selected edges. Fallback flag publication retains proven lazy
 recipes. Private preparation checks hooks, profiling, frame watching,
 checkpoint countdown and replacement selection. It decrements once on success;
@@ -22,6 +22,11 @@ guarded arithmetic specialization and general branch. Private preparation checks
 the precision/rounding bits before decrementing the checkpoint countdown; its
 private leaf bodies contain only the known-mode arithmetic. Other modes use the
 shared ordinary checked entry. Guest scratch accesses and faults remain intact.
+Each callee has one private body publishing the union of its callers' required
+outputs. Callers retain their own continuation liveness and reloads. Initial
+emission discovers output requirements; `contract_variants.py` merges them and
+affected callers are re-emitted with the shared layout. The emitter rejects a
+layout that omits a required output.
 
 `ir/x87_mode.py` tracks known control-word bits and symbolic entry bits through
 the CFG and conservative direct-call return relations. Byte-backed resets and
@@ -129,3 +134,8 @@ This work precedes broader x87 transfer contracts and the register ABI. Those
 require separate proofs for values, shadows, tags, TOP, status and observable
 residue; removing scratch memory requires additional alias and observability
 proofs.
+
+A custom direct-call ABI can build on the shared input/output contracts: pass
+proven values as C arguments and results, keeping guest CALL/RET stack effects
+and an explicit publication path for rejected preparation and unexpected RETs.
+ABI layout and specialization selection belong outside the instruction proofs.

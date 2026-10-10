@@ -24,7 +24,7 @@ import decoded
 import output
 from settings import Settings
 from decoded import external_exits
-from ir import call_contracts, production, x87_mode
+from ir import call_contracts, contract_variants, production, x87_mode
 from ir.lift import Lifter, LiftError
 from ir.ssa import SSAError
 from program import Program, TranslateError
@@ -167,7 +167,7 @@ def _escapes(task):
 
 def _emit(task):
     """Emit one chunk of functions: SSA where admitted, the decoded body otherwise."""
-    addrs, helpers, internal, contracts, private_targets = task
+    addrs, helpers, internal, contracts, private_targets, contract_masks = task
     ctx, tr = _CTX, _CTX.tr
     tr.seh_helpers = set(helpers)
     tr.internal_entries = internal
@@ -187,7 +187,7 @@ def _emit(task):
                 lines, external, variant_requests, call_decisions = production.emit_ssa(
                     tr, ctx.lifter, fn, entries, ctx.settings.emit, ctx.known, callee_contracts,
                     ctx.settings.checked_returns,
-                    private_targets if selected else (), report_calls=selected)
+                    private_targets if selected else (), report_calls=selected, contract_masks=contract_masks)
             except (SSAError, LiftError) as error:
                 reason = str(error)
             else:
@@ -211,11 +211,11 @@ def _emit(task):
 
 
 def _private(task):
-    addr, masks, known_mode = task
+    addr, mask, known_mode = task
     ctx = _CTX
     fn, entries = ctx.load(addr)
     ctx.tr.analyze(fn, entries)
-    return addr, production.emit_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit, masks, known_mode)
+    return addr, production.emit_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit, mask, known_mode)
 
 
 def chunked(addrs, count):
@@ -439,21 +439,31 @@ def main(argv=None):
         for part in parts:
             tasks.append((part, helpers, {a: internal[a] for a in part if a in internal},
                           {a: {t: contracts[t] for t in calls[a] if t in contracts}
-                           for a in part if contracts}, private_targets))
+                           for a in part if contracts}, private_targets, {}))
         results = {}
         for part in pool.map(_emit, tasks):
             for row in part:
                 results[row[0]] = row
         phase("emit")
+        shared_masks = contract_variants.shared_masks(row[4] for row in results.values())
+        affected = {addr for addr, row in results.items()
+                    if any(shared_masks[target] != mask for target, mask in row[4])}
+        shared_tasks = [(tuple(a for a in task[0] if a in affected), *task[1:-1], shared_masks)
+                        for task in tasks if any(a in affected for a in task[0])]
+        for part in pool.map(_emit, shared_tasks):
+            for row in part:
+                results[row[0]] = row
         private_masks = {}
         private_requests = {}
         for row in results.values():
             if row[4]:
                 private_requests[row[0]] = set(row[4])
             for addr, mask in row[4]:
+                if mask != shared_masks[addr]:
+                    raise TranslateError("%08x: contract caller did not use its shared return layout" % addr)
                 private_masks.setdefault(addr, set()).add(mask)
-        for addr, lines in pool.map(_private, [(addr, masks, addr in known_modes)
-                                             for addr, masks in sorted(private_masks.items())]):
+        for addr, lines in pool.map(_private, [(addr, shared_masks[addr], addr in known_modes)
+                                             for addr in sorted(private_masks)]):
             results[addr][1].extend(lines)
         phase("private entries")
 

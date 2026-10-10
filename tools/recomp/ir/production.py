@@ -36,7 +36,8 @@ def exclusion(fn):
     return None
 
 
-def emit_ssa(tr, lifter, fn, entries, common, known, contracts, checked_returns=(), contract_calls=(), report_calls=False):
+def emit_ssa(tr, lifter, fn, entries, common, known, contracts, checked_returns=(), contract_calls=(), report_calls=False,
+             contract_masks=None):
     """The SSA body of `fn` as C lines, with its wrappers when other code can enter it.
 
     Raises SSAError or LiftError for a shape that stays decoded."""
@@ -58,6 +59,7 @@ def emit_ssa(tr, lifter, fn, entries, common, known, contracts, checked_returns=
     options["checked_return"] = checked
     options["checked_calls"] = set(calls) & set(checked_returns)
     options["contract_calls"] = set(calls) & set(contract_calls) if not fir.entries and not fir.seh else ()
+    options["contract_masks"] = contract_masks
     variant_requests, call_decisions = set(), []
     symbol = ("body_checked_%08x" if checked else "body_%08x" if fir.entries else "fn_%08x") % fn.addr
     try:
@@ -80,16 +82,14 @@ def emit_ssa(tr, lifter, fn, entries, common, known, contracts, checked_returns=
     return lines, fir.entries, variant_requests, call_decisions
 
 
-def emit_private(tr, lifter, fn, common, masks, known_mode=False):
-    lines = []
-    for mask in sorted(masks):
-        symbol = "body_contract_%08x_%04x" % (fn.addr, mask)
-        fields = frozenset(f for n, f in enumerate(FIELDS) if mask & (1 << n))
-        source = emit(function_ir(tr, lifter, fn), symbol, lifter=lifter,
-                      checked_return=True, return_fields=fields, x87_known_mode=known_mode, **common)
-        lines.extend(source.splitlines())
-        lines.append("void fn_contract_%08x_%04x(X86 *c, uint32_t expected) { %s(c, expected); }"
-                     % (fn.addr, mask, symbol))
+def emit_private(tr, lifter, fn, common, mask, known_mode=False):
+    symbol = "body_contract_%08x_%04x" % (fn.addr, mask)
+    fields = frozenset(f for n, f in enumerate(FIELDS) if mask & (1 << n))
+    source = emit(function_ir(tr, lifter, fn), symbol, lifter=lifter,
+                  checked_return=True, return_fields=fields, x87_known_mode=known_mode, **common)
+    lines = source.splitlines()
+    lines.append("void fn_contract_%08x_%04x(X86 *c, uint32_t expected) { %s(c, expected); }"
+                 % (fn.addr, mask, symbol))
     return lines
 
 

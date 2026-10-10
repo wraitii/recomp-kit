@@ -209,7 +209,10 @@ restores ordinary calls throughout the image.
 
 `state_contract_callers` selects a pilot's caller addresses. Direct edges into
 checked leaf bodies get private entries specialized for the required GPR/flag
-outputs. SSA dependencies include all state escaping through the caller's own
+outputs. A callee has one private body with the union of its callers' output
+masks; `contract_variants.py` plans that shared layout after initial emission.
+The report distinguishes each edge's required outputs from its entry mask.
+SSA dependencies include all state escaping through the caller's own
 RET and full snapshots on observation paths. Input contracts use the same
 byte-derived, corrected instruction IR as those leaf bodies. Unexpected guest
 returns publish every changed field before ordinary return handling. Hooks,

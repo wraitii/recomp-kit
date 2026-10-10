@@ -56,6 +56,14 @@ including full x87 state and scratch memory. The ordinary original-byte fixture
 retains its 96 inherited discrepancies; the random-input diff comparison passes
 200 valid returns without discarded inputs.
 
+The selected callers now share one private body with their union output mask
+`0431` (`EAX`, `ESP`, `EBP`, `AF`), while keeping per-edge liveness and reloads.
+Its linked ARM64 size is 564 bytes, removing the redundant 556-byte copy.
+The shared layout passes 9,300 comparisons against the captured ordinary body,
+including fallback modes, full x87 state, scratch memory and unexpected RETs.
+Original-byte checks pass for the helper and one caller; the other caller is
+unreached under random inputs. Ordinary entry and preparation policies are kept.
+
 The code-map inventory has 58 functions containing 78 control-word writer sites.
 Their direct-call descendants include 81 of 1,565 x87-using functions. This
 narrows the exceptional-mode review; it does not establish a default at the
