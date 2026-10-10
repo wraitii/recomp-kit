@@ -18,6 +18,7 @@ from .simplify import canonicalize, simplify, state_roots, whole, EFFECTS, EXITS
 from .publication import plan
 from . import flag_region
 from . import x87
+from .call_contracts import continuation_outputs
 
 
 SUPPORTED_MNEMONICS = frozenset((
@@ -461,7 +462,7 @@ CW_CLONE_MAX_GUARDS = 1
 def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state=True,
          msvc_convention=True, lazy_flags=False, lifter=None, indirect_call_symbol=None,
          call_contracts=None, x87_cw_clone=True, tail_symbols=None,
-         checked_return=False, checked_calls=()):
+         checked_return=False, checked_calls=(), contract_calls=(), return_fields=None):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
     `call_symbols` maps an allowed direct-call target address to the C symbol
@@ -495,6 +496,10 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     with explicit expected-continuation and enable arguments; its ordinary
     wrapper disables the comparison, preserving general return handling.
 
+    `contract_calls` selects checked leaf edges for continuation-output
+    specialization. `return_fields` emits a private leaf's normal-return
+    publication, with full changed state retained for unexpected returns.
+
     `x87_cw_clone` (the `x87_cw_clone` setting) emits a performance body with
     at least `CW_CLONE_MIN_OPS` precision/rounding-sensitive x87 operations,
     and one per `CW_CLONE_DENSITY` instructions, whose fast clone guards at
@@ -507,6 +512,13 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     """
     arguments = dict(locals())
     checked_calls = frozenset(checked_calls)
+    contract_calls = frozenset(contract_calls)
+    if not contract_calls <= checked_calls:
+        raise SSAError("state contracts require checked calls")
+    if return_fields is not None and (not checked_return or any(
+            op.opc in ("CALL", "CALLIND", "DIV32", "IDIV32", "STRINGOP", "SEH")
+            for ins in codegen_ir(fir, lifter or Lifter()).insns for op in ins.ops)):
+        raise SSAError("private state entry requires a checked leaf without opaque observers")
     if checked_return and (fir.entries or fir.seh or fir.exits):
         raise SSAError("checked return requires a single-entry closed body without SEH")
     if not symbol.isidentifier() or not symbol.isascii():
@@ -635,6 +647,22 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                   if v.opc == "CALL" and v.data in kept_fields}
     publications = plan(s, fir.succ, groups, access_fields=access_fields,
                         reloaded=set(mapping) - flag_keys, kept=kept_calls)
+    return_fallback, return_roots = {}, []
+    if return_fields is not None:
+        required = set(return_fields) | set(CONTRACT_NEVER_SKIP)
+        for b in s.blocks.values():
+            for v in b.ops:
+                if v.opc != "RETURN":
+                    continue
+                fallback = []
+                for group in groups:
+                    keys = [key for key in group if key in b.exit]
+                    if any(s.resolve(b.exit[key]) is not s.resolve(s.inputs[key]) for key in keys):
+                        fallback.extend(keys)
+                return_fallback[v.id] = fallback
+                return_roots.extend(state_roots(s, b.exit, fallback, groups))
+                publications[v.id] = tuple(key for key in publications[v.id]
+                                           if key not in lane_field or lane_field[key] in required)
     # Cross-function contracts: a direct CALL may omit publication of a field
     # the callee neither reads nor preserves.  A field the callee preserves is
     # not droppable even when this body does not read it back: the field's CPU
@@ -705,7 +733,13 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                                 if x is not None)
     # A callee-state read with no use is dropped; that also confines post-call
     # settles to reloads whose value is needed.
-    live = simplify(s, live_publications, canonical=False, extra_roots=cc_roots + contract_roots,
+    for b in s.blocks.values():
+        for v in b.ops:
+            if v.opc == "CALL" and v.data in contract_calls:
+                contract_roots.extend(state_roots(s, b.snapshots[v.id], b.snapshots[v.id], groups))
+    contract_outputs = continuation_outputs(s, live_publications, groups, lane_field,
+                                            cc_roots + contract_roots) if contract_calls else {}
+    live = simplify(s, live_publications, canonical=False, extra_roots=cc_roots + contract_roots + return_roots,
                     removable=frozenset(("CALL_RELOAD", "CALL_KEEP")), groups=groups)
     reads_entry_flags = any(
         v.opc == "INPUT" and v.data in flag_keys and v.id in live and s.resolve(v) is v
@@ -885,7 +919,8 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
               else (None,))
     block_label = "F" if clones[0] == "fast" else "B"
 
-    lines = ["static void %s(X86 *c, uint32_t expected_return_, int checked_return_) {" % symbol if checked_return
+    lines = ["static void %s(X86 *c, uint32_t expected_return_) {" % symbol if return_fields is not None
+             else "static void %s(X86 *c, uint32_t expected_return_, int checked_return_) {" % symbol if checked_return
              else "static void %s(X86 *c, uint32_t entry_) {" % symbol if fir.entries
              else "void %s(X86 *c) {" % symbol]
     for v in s.values:
@@ -1091,6 +1126,12 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     # invoke only the explicitly bound symbol. The callee receives
                     # the guest return address already stored by the preceding
                     # CALL push, so its own RET owns ESP/EIP restoration.
+                    outputs = contract_outputs.get(v.id) if v.data in contract_calls else None
+                    if outputs is not None:
+                        output_mask = sum(1 << CONTRACT_GPRS.index(f) if f in CONTRACT_GPRS
+                                          else 1 << (len(CONTRACT_GPRS) + CONTRACT_FLAGS.index(f))
+                                          for f in outputs | CONTRACT_NEVER_SKIP)
+                        lines.append("if (entry_contract_available_%08x(c)) {" % v.data)
                     lines.extend(publish(b.snapshots[v.id], v))
                     if contract_guard.get(v.id):
                         guarded = store_fields(b.snapshots[v.id], contract_guard[v.id])
@@ -1103,7 +1144,16 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     if name is None:
                         raise SSAError("%08x: no C symbol bound for call target %08x"
                                        % (b.insn.addr, v.data))
-                    if v.data in checked_calls:
+                    if outputs is not None:
+                        lines.append("entry_contract_%08x_%04x(c, 0x%xu);" % (
+                            v.data, output_mask, b.insn.addr + b.insn.length))
+                        lines.append("} else {")
+                        lines.extend(store_fields(b.snapshots[v.id], b.snapshots[v.id]))
+                        if lazy_flags:
+                            lines.append("c->cc_op = X86_CC_NONE;")
+                        lines.append("%s(c, 0x%xu);" % (name, b.insn.addr + b.insn.length))
+                        lines.append("}")
+                    elif v.data in checked_calls:
                         lines.append("%s(c, 0x%xu);" % (name, b.insn.addr + b.insn.length))
                     else:
                         lines.append("%s(c);" % name)
@@ -1163,8 +1213,18 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                             v.args[2].size * 8, ref(v.args[1]), v.args[2].size * 8, ref(v.args[2])))
                 elif v.opc == "RETURN":
                     lines.extend(flush_x87())
+                    if return_fields is not None:
+                        eip_keys = [key for key, (field, _) in mapping.items() if field == "c->eip"]
+                        popped = field_value(b.exit, "c->eip", eip_keys)
+                        lines.append("if (%s != expected_return_) {" % popped)
+                        lines.extend(store_fields(b.exit, return_fallback[v.id]))
+                        if lazy_flags:
+                            lines.append("c->cc_op = X86_CC_NONE;")
+                        lines.extend(["recomp_return(c);", "return;", "}"])
                     lines.extend(publish(b.exit, v))
-                    if checked_return:
+                    if return_fields is not None:
+                        pass
+                    elif checked_return:
                         lines.append("if (!checked_return_ || c->eip != expected_return_) recomp_return(c);")
                     else:
                         lines.append("recomp_return(c);")

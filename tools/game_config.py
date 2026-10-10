@@ -250,6 +250,9 @@ def load(game_dir, build_root=None):
     checked = translate.setdefault("checked_returns", [])
     if not isinstance(checked, list) or not all(type(v) is int and 0 <= v <= 0xffffffff for v in checked):
         raise ValueError("%s: [translate] checked_returns must be a list of 32-bit addresses" % source)
+    callers = translate.setdefault("state_contract_callers", [])
+    if not isinstance(callers, list) or not all(type(v) is int and 0 <= v <= 0xffffffff for v in callers):
+        raise ValueError("%s: [translate] state_contract_callers must be a list of 32-bit addresses" % source)
     alts = translate.setdefault("alternate_entries", [])
     if not isinstance(alts, list) or not all(type(v) is int for v in alts):
         raise ValueError("%s: [translate] alternate_entries must be a list of addresses" % source)

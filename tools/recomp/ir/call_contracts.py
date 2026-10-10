@@ -384,6 +384,28 @@ def cfg_is_closed(fir):
     return True
 
 
+def continuation_outputs(s, publications, groups, lane_field, extra_roots=()):
+    from .simplify import live_values, state_roots
+
+    escapes = [root for b in s.blocks.values() for v in b.ops if v.opc == "RETURN"
+               for root in state_roots(s, b.exit, b.exit, groups)]
+    live = live_values(s, publications, extra_roots=escapes + list(extra_roots),
+                       removable=("CALL_RELOAD", "CALL_KEEP"), groups=groups)
+    outputs = {}
+    for b in s.blocks.values():
+        for call in b.ops:
+            if call.opc != "CALL":
+                continue
+            fields = set()
+            for key, value in b.reloads.get(call.id, {}).items():
+                value = s.resolve(value)
+                source = s.resolve(value.args[0]) if value.opc == "BYTE" else value
+                if source.id in live and source.opc == "CALL_RELOAD" and key in lane_field:
+                    fields.add(lane_field[key])
+            outputs[call.id] = frozenset(fields)
+    return outputs
+
+
 def analyze(targets, prepared, *, analyzable, roots, progress=None):
     """Contracts for every analyzable body reachable from `roots`.
 

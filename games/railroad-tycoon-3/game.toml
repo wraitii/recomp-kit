@@ -18,6 +18,7 @@ store_hooks = false
 # decodes the original executable bytes; no instruction contents are published.
 code_map = "metadata"
 checked_returns = [0x005a10d0]
+state_contract_callers = [0x0042ce00, 0x0042c1b0]
 
 [render]
 d3d8_wgpu = true

@@ -200,6 +200,17 @@ frame checks, profiling and hooks; a changed base dispatch selects the ordinary
 replacement. Auxiliary modules currently retain ordinary entries. An empty list
 restores ordinary calls throughout the image.
 
+`state_contract_callers` selects a pilot's caller addresses. Direct edges into
+checked leaf bodies get private entries specialized for the required GPR/flag
+outputs. SSA dependencies include all state escaping through the caller's own
+RET and full snapshots on observation paths. Input contracts use the same
+byte-derived, corrected instruction IR as those leaf bodies. Unexpected guest
+returns publish every changed field before ordinary return handling. Hooks,
+profiling, frame watches, due scheduler checkpoints and replacements select a
+fully published ordinary checked entry. Exact fault-state mode and auxiliary
+modules retain ordinary entries. Guest accesses and the complete existing x87
+materialization policy remain in place; x87 field contracts are a later stage.
+
 ### Policies
 
 | `[translate]` key | Default | Effect |
@@ -209,6 +220,7 @@ restores ordinary calls throughout the image.
 | `x87_cw_clone` | `true` | `false` emits only the general body |
 | `call_contracts` | `true` | `false` restores full publication at calls |
 | `checked_returns` | `[]` | Addresses given private direct-call entries with checked guest continuations |
+| `state_contract_callers` | `[]` | Caller addresses using specialized integer-state entries into checked leaf bodies |
 
 A `RECOMP_NULL_CHECKS=1` build exposes CPU state to fault dispatch: translate it
 with `fault_state = "exact"` and `msvc_x87_convention = false`.

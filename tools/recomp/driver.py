@@ -158,7 +158,7 @@ def _escapes(task):
 
 def _emit(task):
     """Emit one chunk of functions: SSA where admitted, the decoded body otherwise."""
-    addrs, helpers, internal, contracts = task
+    addrs, helpers, internal, contracts, private_targets = task
     ctx, tr = _CTX, _CTX.tr
     tr.seh_helpers = set(helpers)
     tr.internal_entries = internal
@@ -171,9 +171,14 @@ def _emit(task):
         reason = "decoded-only code map" if ctx.decoded_only else production.exclusion(fn)
         if reason is None:
             try:
+                selected = addr in ctx.settings.state_contract_callers
+                callee_contracts = dict(contracts.get(addr) or {})
+                if selected:
+                    callee_contracts.update(private_targets)
                 lines, external = production.emit_ssa(
-                    tr, ctx.lifter, fn, entries, ctx.settings.emit, ctx.known, contracts.get(addr),
-                    ctx.settings.checked_returns)
+                    tr, ctx.lifter, fn, entries, ctx.settings.emit, ctx.known, callee_contracts,
+                    ctx.settings.checked_returns,
+                    private_targets if selected else ())
             except (SSAError, LiftError) as error:
                 reason = str(error)
             else:
@@ -193,6 +198,14 @@ def _emit(task):
         out.append((addr, lines, re.sub(r"^[0-9a-f]{8}: ", "", reason) if reason else None,
                     list(tr.unmodelled)))
     return out
+
+
+def _private(task):
+    addr, masks = task
+    ctx = _CTX
+    fn, entries = ctx.load(addr)
+    ctx.tr.analyze(fn, entries)
+    return addr, production.emit_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit, masks)
 
 
 def chunked(addrs, count):
@@ -358,17 +371,31 @@ def main(argv=None):
                                           and a not in helpers and a not in conservative),
                 roots=roots)
         phase("contracts")
+        private_targets = {}
+        if settings.state_contract_callers and settings.call_contracts and settings.emit["local_state"]:
+            for addr in sorted(settings.checked_returns):
+                if not calls[addr]:
+                    fn, entries = ctx.load(addr)
+                    ctx.tr.analyze(fn, entries)
+                    private_targets[addr] = production.private_contract(ctx.tr, ctx.lifter, fn)
 
         tasks = []
         for part in parts:
             tasks.append((part, helpers, {a: internal[a] for a in part if a in internal},
                           {a: {t: contracts[t] for t in calls[a] if t in contracts}
-                           for a in part if contracts}))
+                           for a in part if contracts}, private_targets))
         results = {}
         for part in pool.map(_emit, tasks):
             for row in part:
                 results[row[0]] = row
         phase("emit")
+        private_masks = {}
+        for row in results.values():
+            for addr, mask in re.findall(r"entry_contract_([0-9a-f]{8})_([0-9a-f]{4})\(c,", "\n".join(row[1])):
+                private_masks.setdefault(int(addr, 16), set()).add(int(mask, 16))
+        for addr, lines in pool.map(_private, sorted(private_masks.items())):
+            results[addr][1].extend(lines)
+        phase("private entries")
 
     bodies = {addr: results[addr][1] for addr in addrs}
     entries_by_fn = {addr: set(found) for addr, found in ctx.interior.items()}
@@ -378,12 +405,12 @@ def main(argv=None):
     os.makedirs(args.out, exist_ok=True)
     output.write_funcs_header(args.out, entry_names)
     output.emit_body_chunks(args.out, functions, bodies, entries_by_fn)
-    output.emit_entry_chunks(args.out, entry_names, settings.module, settings.checked_returns)
+    output.emit_entry_chunks(args.out, entry_names, settings.module, settings.checked_returns, private_masks)
     symbols = symbol_rows(ctx, entry_names, rows)
     if settings.module:
         output.write_module_table(args.out, entry_names, symbols, call_returns, settings.module)
     else:
-        output.write_table(args.out, entry_names, symbols, call_returns)
+        output.write_table(args.out, entry_names, symbols, call_returns, bool(private_masks))
     output.write_symbols(
         args.out, str(settings.exe), ctx.image.base, symbols, settings.curated)
     phase("write")

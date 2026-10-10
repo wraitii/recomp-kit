@@ -20,4 +20,20 @@ skip general return lookup on a match. Stack writes, x87 effects and all existin
 state publication remain translated. Decoded callers, indirect calls, callbacks,
 hooks and profiling retain the ordinary entry. Set `checked_returns = []` under
 `[translate]` and regenerate to disable the pilot. Savings across the conversion call's
-state transfer and scratch memory remain future work.
+state transfer are piloted separately below; scratch memory remains translated.
+
+The integer-state pilot selects callers `0x0042c1b0` and `0x0042ce00` through
+`state_contract_callers`. Their conversion edges require EAX, ESP and EBP on
+normal continuation, with EDX, ECX and AF retained at sites where they remain
+observable; EIP and all existing x87 state remain published. Private
+entries omit other integer return stores and use byte-derived leaf input
+contracts. Full changed state is recovered on an unexpected RET, and observation
+boundaries retain the ordinary path. Set `state_contract_callers = []` and
+regenerate to disable this stage independently. Expansion and x87 contracts
+await correctness coverage and a workload profile showing a gain.
+
+Validation compared all three private output sets and their unexpected-return
+paths against the ordinary entry over 1,860 rounding cases each, with no new
+differences. The ordinary entry still has the baseline's 96 original-byte
+rounding discrepancies. Random-input diff coverage reached valid returns in
+`0x005a10d0` and `0x0042c1b0`, but not `0x0042ce00`.
