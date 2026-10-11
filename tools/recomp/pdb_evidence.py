@@ -139,8 +139,8 @@ def project(contributions, omap):
     return merge(code), merge(data)
 
 
-def fpo_starts(text):
-    starts = set()
+def fpo_functions(text):
+    functions = {}
     mode = None
     for line in text.splitlines():
         if "Old FPO Data" in line:
@@ -152,13 +152,36 @@ def fpo_starts(text):
         match = FPO_ROW_RE.match(line)
         if not match:
             continue
-        start = mode == "old"
-        if mode == "new":
-            fields = [field.strip() for field in line.split("|")]
-            start = len(fields) > 9 and fields[9] == "true"
-        if start:
-            starts.add(int(match.group(1), 16))
-    return starts
+        fields = [field.strip() for field in line.split("|")]
+        if mode == "old" or len(fields) > 9 and fields[9] == "true":
+            start = int(match.group(1), 16)
+            functions[start] = max(functions.get(start, 0), int(fields[1]))
+    return functions
+
+
+def function_ranges(functions, omap):
+    starts = sorted(functions)
+    sources = [source for source, _ in omap]
+    ranges = []
+    for index, (source, destination) in enumerate(omap):
+        source_next = omap[index + 1][0] if index + 1 < len(omap) else None
+        if destination == 0 or source_next is None or source_next <= source:
+            continue
+        position = max(0, bisect.bisect_right(starts, source) - 1)
+        while position < len(starts) and starts[position] < source_next:
+            start = starts[position]
+            lo, hi = max(source, start), min(source_next, start + functions[start])
+            entry = omap_translate(omap, sources, start)
+            if lo < hi and entry is not None:
+                ranges.append([destination + lo - source, destination + hi - source, entry])
+            position += 1
+    merged = []
+    for lo, hi, entry in sorted(ranges):
+        if merged and merged[-1][1] == lo and merged[-1][2] == entry:
+            merged[-1][1] = hi
+        else:
+            merged.append([lo, hi, entry])
+    return merged
 
 
 def export_addresses(pe):
@@ -187,20 +210,23 @@ def main():
         pdbutil(args.pdbutil, args.pdb, "--section-contribs"), sections)
     _, data = project(contributions, omap)
 
+    functions = fpo_functions(pdbutil(args.pdbutil, args.pdb, "--fpo"))
     entries = set(export_addresses(pe))
-    for start in fpo_starts(pdbutil(args.pdbutil, args.pdb, "--fpo")):
+    for start in functions:
         final = omap_translate(omap, omap_sources, start)
         if final is not None:
             entries.add(final)
+    ranges = function_ranges(functions, omap)
     evidence = {
         "source": args.pdb.name,
         "data_ranges": [[start, end] for start, end in data],
         "entries": sorted(entries),
+        "functions": ranges,
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(evidence, indent=1) + "\n")
-    print("%d omap pairs, %d data ranges, %d entries -> %s"
-          % (len(omap), len(data), len(entries), args.out))
+    print("%d omap pairs, %d data ranges, %d entries, %d function ranges -> %s"
+          % (len(omap), len(data), len(entries), len(ranges), args.out))
 
 
 if __name__ == "__main__":

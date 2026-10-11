@@ -45,6 +45,8 @@ class Recovery:
         self.data_mask = None
         self.data_owner = None
         self.conflicts = set()
+        self.function_ranges = []
+        self.function_starts = []
         for index, directory in enumerate(self.pe.OPTIONAL_HEADER.DATA_DIRECTORY):
             if index != 4 and directory.VirtualAddress and directory.Size:
                 self.data_ranges.append((self.image.base + directory.VirtualAddress,
@@ -92,6 +94,15 @@ class Recovery:
             self.known_mask[start:end] = b"\x01" * (end - start)
         for rva in evidence.get("entries", ()):
             self.seed(self.image.base + rva, "PDB entry", True)
+        self.function_ranges = [(self.image.base + lo, self.image.base + hi, self.image.base + entry)
+                                for lo, hi, entry in evidence.get("functions", ())]
+        self.function_starts = [lo for lo, _, _ in self.function_ranges]
+
+    def function_of(self, at):
+        index = bisect.bisect_right(self.function_starts, at) - 1
+        if index >= 0 and at < self.function_ranges[index][1]:
+            return self.function_ranges[index][2]
+        return None
 
     def at_known_data(self, at):
         offset = at - self.image.base
@@ -356,18 +367,29 @@ class Recovery:
             raise TranslateError("%d entry/boundary conflicts; no code map published" % len(self.conflicts))
         if output.exists():
             raise TranslateError("Output exists: %s" % output)
-        groups = []
+        groups = defaultdict(list)
+        owned = {entry for _, _, entry in self.function_ranges}
+        window = previous = None
         for at, ins in sorted(self.instructions.items()):
-            if not groups or at in self.roots or at >= groups[-1][0][0] + body_bytes:
-                groups.append([])
-            groups[-1].append((at, ins.size))
+            owner = self.function_of(at)
+            if owner is None and previous and previous[0] == at and previous[1] in owned and at not in self.roots:
+                owner = previous[1]
+            if owner is None:
+                if (window is None or previous[1] != window or at in self.roots
+                        or at >= window + body_bytes):
+                    window = at
+                owner = window
+            groups[owner].append((at, ins.size))
+            previous = (at + ins.size, owner)
+        for owner, group in groups.items():
+            if owner not in self.instructions or self.function_of(owner) not in (None, owner):
+                raise TranslateError("function %08x has no instruction at its entry" % owner)
         output.parent.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".bootstrap-map-", dir=output.parent))
         try:
             spans = [code_map.SPANS_HEADER]
             entries = [code_map.ENTRIES_HEADER]
-            for group in groups:
-                owner = group[0][0]
+            for owner, group in sorted(groups.items()):
                 runs = []
                 for at, size in group:
                     if not runs or at != runs[-1][0] + sum(runs[-1][1]):
