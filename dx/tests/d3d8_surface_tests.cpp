@@ -1,6 +1,7 @@
 // Guest ABI contract for the implicit D3D8 backbuffer. Devices here are
 // constructed state fixtures, not host renderer creation or execution evidence.
 #include "../dx.h"
+#include "../d3d_bridge_helpers.h"
 #include "../d3d8_fpu.h"
 #include "../../runtime/memory.h"
 #include "guest_abi.h"
@@ -157,7 +158,24 @@ static ComObj *make_test_device(uint32_t w, uint32_t h, uint32_t format) {
     dev->d3d8_width = w;
     dev->d3d8_height = h;
     dev->d3d8_format = format;
+    dev->d3d8_device = std::make_shared<D3dHostDevice>();
+    recomp::d3d::set_device_dimensions(*dev->d3d8_device->value, w, h);
+    recomp::d3d::set_device_format(*dev->d3d8_device->value, format, 0);
     return dev;
+}
+
+static recomp::d3d::ResourceInfo test_resource_info(ComObj *object) {
+    if (!object->d3d8_resource)
+        return {};
+    return object->d3d8_resource->info();
+}
+
+static recomp::d3d::DeviceInfo test_device_info(ComObj *device) {
+    return recomp::d3d::device_info(*device->d3d8_device->value).info;
+}
+
+static uint32_t test_bound_texture(ComObj *device, uint32_t stage) {
+    return recomp::d3d::bound_texture(*device->d3d8_device->value, stage).value;
 }
 
 static void test_texture() {
@@ -174,7 +192,7 @@ static void test_texture() {
     check(t && t->kind == K_D3D8TEXTURE, "texture view has its own COM identity");
     if (!t)
         return;
-    check(t->d3d8_level_count == 1, "one level requested is one level created");
+    check(test_resource_info(t).level_count == 1, "one level requested is one level created");
 
     // Every slot carries the real D3D8 arity, including unsupported methods.
     const uint8_t arities[] = {3, 1, 1, 2, 5, 4, 2, 2, 1, 1, 1, 2, 1, 1, 3, 3, 5, 2, 2};
@@ -230,7 +248,7 @@ static void test_texture() {
           "CreateTexture with levels=0 succeeds");
     uint32_t tex2 = rd32(sc(0));
     ComObj *t2 = com_this(tex2, IF_D3D8TEXTURE8);
-    check(t2 && t2->d3d8_level_count == 4, "8x4 generates four levels");
+    check(t2 && test_resource_info(t2).level_count == 4, "8x4 generates four levels");
     check(call_method(tex2, 14, {1, sc(32)}) == 0 && rd32(sc(56)) == 4 && rd32(sc(60)) == 2,
           "level 1 is 4x2");
     check(call_method(tex2, 14, {3, sc(32)}) == 0 && rd32(sc(56)) == 1 && rd32(sc(60)) == 1,
@@ -377,13 +395,13 @@ static void test_render_target_texture() {
           "CreateTexture with D3DUSAGE_RENDERTARGET succeeds");
     uint32_t tex = rd32(sc(0));
     ComObj *t = tex ? com_this(tex, IF_D3D8TEXTURE8) : nullptr;
-    check(t && t->d3d8_usage == 1 && t->d3d8_pool == 0,
+    check(t && test_resource_info(t).usage == 1 && test_resource_info(t).pool == 0,
           "render-target texture records usage and DEFAULT pool");
     if (!t)
         return;
-    check(t->d3d8_level_count == 1, "render-target texture has one level");
+    check(test_resource_info(t).level_count == 1, "render-target texture has one level");
     ComObj *level = com_get(t->d3d8_levels[0]);
-    check(level && level->d3d8_usage == 1 && level->d3d8_texture == t->id,
+    check(level && test_resource_info(level).usage == 1 && level->d3d8_texture == t->id,
           "level keeps the render-target usage and texture owner");
     check(call_method(tex, 14, {0, sc(32)}) == 0 && rd32(sc(32)) == 22 && rd32(sc(40)) == 1 &&
               rd32(sc(56)) == 256 && rd32(sc(60)) == 256,
@@ -401,7 +419,7 @@ static void test_render_target_texture() {
 
     // Sampling stays on the same bind path as a normal texture.
     check(call_method(device, 61, {0, tex}) == 0, "SetTexture accepts a render-target texture");
-    check(dev->d3d8_bound_texture[0] == t->id, "render-target texture is bound on the device");
+    check(test_bound_texture(dev, 0) == t->id, "render-target texture is bound on the device");
     check(call_method(tex, 15, {0, sc(16)}) == 0 && rd32(sc(16)) != 0,
           "GetSurfaceLevel returns the render-target level surface");
     call_method(rd32(sc(16)), 2);
@@ -436,7 +454,7 @@ static void test_depth() {
     check(depth != 0, "GetDepthStencilSurface writes a real interface");
     ComObj *d = depth ? com_this(depth, IF_D3D8SURFACE8) : nullptr;
     uint32_t depth_id = d ? d->id : 0;
-    check(d && d->d3d8_depth, "depth surface is marked as depth");
+    check(d && test_resource_info(d).depth, "depth surface is marked as depth");
     check(call_method(device, 33, {sc(4)}) == 0 && rd32(sc(4)) == depth,
           "repeated GetDepthStencilSurface preserves identity");
     check(d && d->refs == 3,
@@ -484,7 +502,7 @@ static void test_create_depth_stencil_surface() {
     check(surface != 0, "CreateDepthStencilSurface writes a real interface");
     ComObj *depth = surface ? com_this(surface, IF_D3D8SURFACE8) : nullptr;
     uint32_t depth_id = depth ? depth->id : 0;
-    check(depth && depth->d3d8_depth && depth->rmask == 77 && depth->width == 32 &&
+    check(depth && test_resource_info(depth).depth && depth->rmask == 77 && depth->width == 32 &&
               depth->height == 16,
           "standalone depth surface records its descriptor");
     check(depth && depth->d3d8_owner == dev->id && depth->d3d8_owner_retained && dev->refs == 2,
@@ -686,16 +704,19 @@ static void test_buffers() {
     // SetStreamSource/SetIndices bind weakly; releasing the buffer clears the
     // device binding so a later draw cannot resolve a dead id.
     check(call_method(device, 83, {0, vb, 24}) == 0, "SetStreamSource accepts stream 0");
-    check(dev->d3d8_stream_vb == v->id && dev->d3d8_stream_stride == 24,
+    check(test_device_info(dev).stream_vb == v->id && test_device_info(dev).stream_stride == 24,
           "stream source is stored on the device");
     check(call_method(device, 83, {1, vb, 24}) == 0x8876086c, "a second stream is rejected");
     check(call_method(device, 85, {ib, 3}) == 0, "SetIndices stores the index buffer");
-    check(dev->d3d8_indices == i->id && dev->d3d8_base_vertex == 3, "base vertex is stored");
+    check(test_device_info(dev).index_buffer == i->id && test_device_info(dev).base_vertex == 3,
+          "base vertex is stored");
     check(call_method(vb, 2) == 0, "release the vertex buffer destroys it");
     check(heap_size(base) == 0xffffffff, "release frees unlocked lifetime-owned backing");
-    check(dev->d3d8_stream_vb == 0, "destroying the vertex buffer clears the stream binding");
+    check(test_device_info(dev).stream_vb == 0,
+          "destroying the vertex buffer clears the stream binding");
     check(call_method(ib, 2) == 0, "release the index buffer destroys it");
-    check(dev->d3d8_indices == 0, "destroying the index buffer clears the indices binding");
+    check(test_device_info(dev).index_buffer == 0,
+          "destroying the index buffer clears the indices binding");
     check(call_method(device, 2) == 0, "device released after the buffers");
 }
 
@@ -716,7 +737,7 @@ static void test_bind_texture() {
 
     // SetTexture binds stage 0; GetTexture returns the same view with a new ref.
     check(call_method(device, 61, {0, a}) == 0, "SetTexture binds stage 0");
-    check(dev->d3d8_bound_texture[0] == ta->id, "device stores the bound texture");
+    check(test_bound_texture(dev, 0) == ta->id, "device stores the bound texture");
     check(call_method(device, 60, {0, sc(8)}) == 0 && rd32(sc(8)) == a,
           "GetTexture returns the bound view");
     call_method(rd32(sc(8)), 2);
@@ -724,14 +745,14 @@ static void test_bind_texture() {
     // Replacing the binding drops the device's reference to A. With the
     // caller's reference released below, A is destroyed.
     check(call_method(device, 61, {0, b}) == 0, "SetTexture replaces the binding");
-    check(dev->d3d8_bound_texture[0] == tb->id, "device stores the replacement");
+    check(test_bound_texture(dev, 0) == tb->id, "device stores the replacement");
     check(call_method(a, 2) == 0, "replaced texture is released by the device");
     check(!com_get(ta->id), "replaced texture is destroyed");
 
     // A null binding releases and clears the slot, and GetTexture reports null.
     wr32(sc(8), 0xfeedface);
     check(call_method(device, 61, {0, 0}) == 0, "SetTexture(NULL) unbinds");
-    check(dev->d3d8_bound_texture[0] == 0 && call_method(device, 60, {0, sc(8)}) == 0 &&
+    check(test_bound_texture(dev, 0) == 0 && call_method(device, 60, {0, sc(8)}) == 0 &&
               rd32(sc(8)) == 0,
           "unbound stage is cleared and GetTexture returns null");
     check(call_method(b, 2) == 0, "unbound texture is released by the device");
@@ -845,16 +866,18 @@ static void test_shader_lifecycle() {
     cpu_reset();
     ComObj *dev = make_test_device(4, 4, 22);
     uint32_t device = com_view(dev, IF_D3D8DEVICE), out = sc(0x200), size = sc(0x300);
-    dev->d3d8_constants = std::make_shared<D3d8DeviceState>();
-    const uint32_t vs = 0xf0000001u, ps = 0xf0000002u;
-    D3d8Shader vertex;
-    vertex.declaration = {0x20000000, 0x40020000, 0xffffffff};
-    vertex.function = {0xfffe0101, 1, 0xc00f0000, 0x90e40000, 0xffff};
-    D3d8Shader pixel;
-    pixel.pixel = true;
-    pixel.function = {0xffff0101, 1, 0x800f0000, 0xa0e40000, 0xffff};
-    dev->d3d8_constants->shaders.emplace(vs, vertex);
-    dev->d3d8_constants->shaders.emplace(ps, pixel);
+    const std::vector<uint32_t> declaration = {0x20000000, 0x40020000, 0xffffffff};
+    const std::vector<uint32_t> vertex = {0xfffe0101, 1, 0xc00f0000, 0x90e40000, 0xffff};
+    const std::vector<uint32_t> pixel = {0xffff0101, 1, 0x800f0000, 0xa0e40000, 0xffff};
+    const uint32_t vs = recomp::d3d::create_shader(
+                            *dev->d3d8_device->value, false,
+                            rust::Slice<const uint32_t>(declaration.data(), declaration.size()),
+                            rust::Slice<const uint32_t>(vertex.data(), vertex.size()))
+                            .handle;
+    const uint32_t ps =
+        recomp::d3d::create_shader(*dev->d3d8_device->value, true, rust::Slice<const uint32_t>(),
+                                   rust::Slice<const uint32_t>(pixel.data(), pixel.size()))
+            .handle;
     check(call_method(device, 76, {vs}) == 0, "bind fixture vertex shader");
     check(call_method(device, 77, {out}) == 0 && rd32(out) == vs,
           "vertex shader handle round trip");
@@ -870,8 +893,8 @@ static void test_shader_lifecycle() {
           "short bytecode query reports MOREDATA");
     check(rd32(size) == 20 && rd32(out) == 0xdeadbeef, "short query updates size without copying");
     check(call_method(device, 82, {vs, out, size}) == 0, "vertex bytecode copy succeeds");
-    for (uint32_t i = 0; i < vertex.function.size(); ++i)
-        check(rd32(out + i * 4) == vertex.function[i], "vertex bytecode copy preserves tokens");
+    for (uint32_t i = 0; i < vertex.size(); ++i)
+        check(rd32(out + i * 4) == vertex[i], "vertex bytecode copy preserves tokens");
     check(call_method(device, 81, {vs, 0, size}) == 0 && rd32(size) == 12,
           "vertex declaration size query");
     check(call_method(device, 93, {ps, 0, size}) == 0 && rd32(size) == 20,
@@ -1069,7 +1092,8 @@ int main(int argc, char **argv) {
         // by name rather than silently redirecting the implicit target.
         ComObj *depth = com_new(K_D3D8SURFACE);
         depth->d3d8_owner = dev->id;
-        depth->d3d8_depth = true;
+        depth->d3d8_resource = std::make_shared<D3dHostResource>();
+        depth->d3d8_resource->set_flags(0, 0, true, false, 0, 0, 0, 0);
         call_method(com_view(dev, IF_D3D8DEVICE), 31, {com_view(depth, IF_D3D8SURFACE8), 0});
         return 1;
     }

@@ -1,24 +1,3 @@
-// d3d7.cpp - Direct3D 7: the IDirect3D7 factory, the IDirect3DDevice7 state
-// store and IDirect3DVertexBuffer7.
-//
-// This is the stage-2a front end. It gets the guest through OpenD3D (0x82cd80)
-// and keeps a faithful record of everything the engine sets, because the
-// engine caches every render and texture-stage state itself and reads it back
-// through GetRenderState/GetTextureStageState (fn_0082c8f0 at 0x82c8f0 walks
-// all 256 render states and all 8 stages x 256 stage states once at startup).
-//
-// Nothing here rasterizes. Anything that would need rendering -- draws, Clear
-// on the 3D target, VB draws, state blocks, ProcessVertices -- stops the run
-// with an abort that names the interface and method. The state methods are
-// real; the unimplemented ones fail loudly rather than returning zero.
-//
-// The seam for a later stage: a D3D7 device holds a D3d7DeviceState and every
-// Set* updates it. When the wgpu renderer is wired in, each Set* should call
-// the corresponding Rust d3d8 ABI entry (d3d8_device_set_render_state,
-// set_texture_stage_state, set_transform, set_viewport, set_material, set_light,
-// light_enable, set_texture) after recording, translating D3D7 ids to D3D8 ids
-// (D3D7 world/view/projection are 1/2/3, D3D8 uses 256/257/258). Draws and
-// Clear stay aborted until the renderer and the 16bpp present boundary exist.
 #include "com.h"
 #include "ddraw.h"
 #include "dx.h"
@@ -31,9 +10,7 @@
 #include "../runtime/guest.h"
 #include "../runtime/memory.h"
 
-#ifdef RECOMP_D3D8_WGPU
-#include "d3d8_abi.h"
-#endif
+#include "d3d_bridge_helpers.h"
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -42,11 +19,14 @@
 #include <string.h>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <map>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+uint32_t ddraw_surface_revision(uint32_t id);
 
 // Reconciles a readback into the guest surface. `dst` is the host pointer for
 // the surface's first row, `pitch` its byte pitch. The store is a shim copy
@@ -401,7 +381,7 @@ static std::string format_vertex(uint32_t fvf, const uint8_t *v) {
 }
 
 static std::string trace_tex_desc(ComObj *dev, uint32_t stage) {
-    ComObj *t = com_get(dev->d3d7->texture[stage]);
+    ComObj *t = com_get(recomp::d3d::d3d7_get_texture(*dev->d3d7->value, stage).value);
     if (!t)
         return "-";
     char buf[64];
@@ -412,21 +392,17 @@ static std::string trace_tex_desc(ComObj *dev, uint32_t stage) {
 static std::string trace_draw_text(ComObj *dev, const char *kind, uint32_t type, uint32_t fvf,
                                    uint32_t vcount, uint32_t icount, uint32_t stride,
                                    uint32_t start, uint32_t vb_id, uint32_t prims) {
-    const uint32_t *rs = dev->d3d7->render_state;
-    uint32_t vx, vy, vw, vh;
-    float vmin, vmax;
-    memcpy(&vx, dev->d3d7->viewport + 0, 4);
-    memcpy(&vy, dev->d3d7->viewport + 1, 4);
-    memcpy(&vw, dev->d3d7->viewport + 2, 4);
-    memcpy(&vh, dev->d3d7->viewport + 3, 4);
-    memcpy(&vmin, dev->d3d7->viewport + 4, 4);
-    memcpy(&vmax, dev->d3d7->viewport + 5, 4);
+    uint32_t rs[256];
+    for (uint32_t i = 0; i < 256; ++i)
+        rs[i] = recomp::d3d::d3d7_get_render_state(*dev->d3d7->value, i).value;
+    const auto viewport = recomp::d3d::d3d7_get_viewport(*dev->d3d7->value).viewport;
     std::string s;
     trace_appendf(s,
                   "%s type=%u fvf=%08x vcount=%u icount=%u prims=%u stride=%u vb=%s start=%u "
                   "vp=%u,%u,%ux%u z[%.3g,%.3g]",
                   kind, type, fvf, vcount, icount, prims, stride, vb_id ? "vb" : "inline", start,
-                  vx, vy, vw, vh, vmin, vmax);
+                  viewport.x, viewport.y, viewport.width, viewport.height, viewport.min_z,
+                  viewport.max_z);
     if (vb_id)
         trace_appendf(s, " vb#%u startoff=%u", vb_id, start * stride);
     trace_appendf(s,
@@ -443,8 +419,11 @@ static std::string trace_draw_text(ComObj *dev, const char *kind, uint32_t type,
 // The render state the small-draw trace keys on: a draw whose vertices are the
 // same but whose blend/alpha/z/texture-stage state changed is a new line.
 static std::string trace_small_state(ComObj *dev) {
-    const uint32_t *rs = dev->d3d7->render_state;
-    const uint32_t *t = dev->d3d7->tss[0];
+    uint32_t rs[256], t[256];
+    for (uint32_t i = 0; i < 256; ++i) {
+        rs[i] = recomp::d3d::d3d7_get_render_state(*dev->d3d7->value, i).value;
+        t[i] = recomp::d3d::d3d7_get_texture_stage_state(*dev->d3d7->value, 0, i).value;
+    }
     char buf[256];
     snprintf(buf, sizeof buf,
              "blend=%u,%u,%u atest=%u,%u,%u z=%u,%u,%u tss0=col(%u,%u,%u)alpha(%u,%u,%u)", rs[27],
@@ -462,7 +441,7 @@ static void trace_small_draw(ComObj *dev, const char *kind, uint32_t type, uint3
                              uint32_t start, uint32_t prims) {
     if (!g_trace.small || !stride || !vcount || vcount > 8)
         return;
-    const bool textured = dev->d3d7->texture[0] != 0;
+    const bool textured = recomp::d3d::d3d7_get_texture(*dev->d3d7->value, 0).value != 0;
     if (textured && !g_trace.small_textured)
         return;
     const uint64_t voff = (uint64_t)start * stride;
@@ -584,9 +563,6 @@ static void trace_draw(ComObj *dev, const char *kind, uint32_t type, uint32_t fv
     g_trace_draws[text].text = text;
     ++g_trace_draws[text].count;
     trace_small_draw(dev, kind, type, fvf, verts, vcount, icount, stride, start, prims);
-    // Capture the first vertices of the frame's biggest draw, but only in the
-    // leading frames, so the dump stays small. gm_valid is re-checked because
-    // the draw's own validation may not have run in a no-renderer build.
     if (g_trace_draw_frames < g_trace.vertex_frames && stride && vcount > g_trace_big_vcount &&
         (uint64_t)stride * vcount <= 0xffffffffu && gm_valid(verts, stride * vcount)) {
         uint32_t ndump = vcount < g_trace.max_vertex_dump ? vcount : g_trace.max_vertex_dump;
@@ -604,7 +580,10 @@ static void trace_transform(ComObj *dev, uint32_t state) {
         return;
     if (state != 1 && state != 2 && state != 3 && !(state >= 16 && state <= 23))
         return;
-    const float *m = dev->d3d7->transform[state];
+    const auto values = recomp::d3d::d3d7_get_transform(*dev->d3d7->value, state);
+    if (values.values.size() != 16)
+        return;
+    const float *m = values.values.data();
     if (g_trace_last_matrix_set[state] && memcmp(g_trace_last_matrix[state], m, 64) == 0)
         return;
     memcpy(g_trace_last_matrix[state], m, 64);
@@ -679,173 +658,6 @@ static void trace_reset() {
     memset(g_trace_last_matrix_set, 0, sizeof g_trace_last_matrix_set);
 }
 
-// ---------------------------------------------------------------- defaults
-// The documented D3D7 render-state defaults. The engine reads every one of
-// these back at 0x82c8f0, so a value that is not recorded here is a value the
-// engine's cache would hold as "unset" while the device held something else.
-// Values are the Direct3D 7 SDK defaults; the ones the engine explicitly sets
-// afterwards are listed only for completeness.
-uint32_t render_state_default(uint32_t s) {
-    switch (s) {
-    case 7: // ZENABLE: D3DZB_FALSE
-        return 0;
-    case 8: // FILLMODE: SOLID
-        return 3;
-    case 9: // SHADEMODE: GOURAUD
-        return 2;
-    case 14: // ZWRITEENABLE: TRUE
-        return 1;
-    case 16: // LASTPIXEL: TRUE
-        return 1;
-    case 19: // SRCBLEND: ONE
-        return 2;
-    case 20: // DESTBLEND: ZERO
-        return 1;
-    case 22: // CULLMODE: CCW
-        return 3;
-    case 23: // ZFUNC: LESSEQUAL
-        return 4;
-    case 25: // ALPHAFUNC: ALWAYS
-        return 8;
-    case 34: // FOGCOLOR: 0
-        return 0;
-    case 35: // FOGTABLEMODE: NONE
-        return 0;
-    case 36: // FOGSTART: 0
-        return 0;
-    case 37: // FOGEND: 1.0
-        return 0x3f800000u;
-    case 38: // FOGDENSITY: 1.0
-        return 0x3f800000u;
-    case 52: // STENCILENABLE: FALSE
-        return 0;
-    case 56: // STENCILFUNC: ALWAYS
-        return 8;
-    case 58: // STENCILMASK: 0xffffffff
-        return 0xffffffffu;
-    case 59: // STENCILWRITEMASK: 0xffffffff
-        return 0xffffffffu;
-    case 60: // TEXTUREFACTOR: 0xffffffff
-        return 0xffffffffu;
-    case 136: // CLIPPING: TRUE
-        return 1;
-    case 137: // LIGHTING: TRUE
-        return 1;
-    case 139: // AMBIENT: 0
-        return 0;
-    case 140: // FOGVERTEXMODE: NONE
-        return 0;
-    case 141: // COLORVERTEX: TRUE
-        return 1;
-    case 142: // LOCALVIEWER: TRUE
-        return 1;
-    case 143: // NORMALIZENORMALS: FALSE
-        return 0;
-    case 145: // DIFFUSEMATERIALSOURCE: COLOR1
-        return 0;
-    case 146: // SPECULARMATERIALSOURCE: COLOR2
-        return 1;
-    case 147: // AMBIENTMATERIALSOURCE: MATERIAL
-        return 2;
-    case 148: // EMISSIVEMATERIALSOURCE: MATERIAL
-        return 2;
-    case 151: // VERTEXBLEND: DISABLE
-        return 0;
-    case 152: // CLIPPLANEENABLE: 0
-        return 0;
-    case 153: // SOFTWAREVERTEXPROCESSING: FALSE
-        return 0;
-    case 154: // POINTSIZE: 1.0
-        return 0x3f800000u;
-    case 158: // POINTSCALE_A: 1.0
-        return 0x3f800000u;
-    case 159: // POINTSCALE_B: 0
-        return 0;
-    case 160: // POINTSCALE_C: 0
-        return 0;
-    case 161: // MULTISAMPLEANTIALIAS: TRUE
-        return 1;
-    case 162: // MULTISAMPLEMASK: 0xffffffff
-        return 0xffffffffu;
-    case 164: // PATCHSEGMENTS: 1.0
-        return 0x3f800000u;
-    case 168: // COLORWRITEENABLE: RGB
-        return 0x0000000fu;
-    case 170: // TWEENFACTOR: 0
-        return 0;
-    case 171: // BLENDOP: ADD
-        return 1;
-    default:
-        return 0;
-    }
-}
-
-// The documented D3DTSS defaults. Stage zero blends texture with the diffuse
-// current colour; every later stage is disabled. Texture coordinates are the
-// SDK default (2 floats), addressing wraps.
-uint32_t tss_default(uint32_t stage, uint32_t type) {
-    switch (type) {
-    case 1: // COLOROP
-        return stage == 0 ? 4u /* MODULATE */ : 1u /* DISABLE */;
-    case 2:       // COLORARG1
-        return 2; // TEXTURE
-    case 3:       // COLORARG2
-        return 1; // CURRENT
-    case 4:       // ALPHAOP
-        return stage == 0 ? 2u /* SELECTARG1 */ : 1u /* DISABLE */;
-    case 5:       // ALPHAARG1
-        return 2; // TEXTURE
-    case 6:       // ALPHAARG2
-        return 1; // CURRENT
-    case 11:      // TEXCOORDINDEX
-        return 0;
-    case 12:      // ADDRESS
-    case 13:      // ADDRESSU
-    case 14:      // ADDRESSV
-        return 1; // WRAP
-    case 16:      // MAGFILTER
-    case 17:      // MINFILTER
-        return 2; // LINEAR
-    case 18:      // MIPFILTER
-        return 0; // NONE
-    default:
-        return 0;
-    }
-}
-
-void init_device_state(D3d7DeviceState &s) {
-    for (uint32_t i = 0; i < 256; ++i) {
-        s.render_state[i] = render_state_default(i);
-        s.render_state_set[i] = false;
-    }
-    for (uint32_t stage = 0; stage < 8; ++stage)
-        for (uint32_t type = 0; type < 256; ++type) {
-            s.tss[stage][type] = tss_default(stage, type);
-            s.tss_set[stage][type] = false;
-        }
-    for (uint32_t t = 0; t < 256; ++t) {
-        memset(s.transform[t], 0, sizeof s.transform[t]);
-        s.transform[t][0] = s.transform[t][5] = s.transform[t][10] = s.transform[t][15] = 1.0f;
-        s.transform_set[t] = false;
-    }
-    memset(s.viewport, 0, sizeof s.viewport);
-    s.viewport[5] = 1.0f; // dvMaxZ
-    s.viewport_set = false;
-    // Default material: opaque white diffuse, no ambient/specular/emissive.
-    memset(s.material, 0, sizeof s.material);
-    s.material[0] = s.material[1] = s.material[2] = s.material[3] = 1.0f;
-    s.material_set = false;
-    memset(s.light, 0, sizeof s.light);
-    memset(s.light_enable, 0, sizeof s.light_enable);
-    memset(s.texture, 0, sizeof s.texture);
-    s.in_scene = false;
-    s.d3d_obj = 0;
-    s.render_target = 0;
-    s.target_dirty = true;
-    memset(s.device_guid, 0, sizeof s.device_guid);
-    s.tnl = false;
-}
-
 // ---------------------------------------------------------------- host renderer
 // The Rust d3d8-wgpu device owns a 32-bit internal render target; the guest's
 // 16bpp DirectDraw back buffer stays the truth of what the guest sees. The two
@@ -859,133 +671,157 @@ constexpr uint32_t D3D8FMT_A8R8G8B8 = 21;
 constexpr uint32_t D3D8FMT_D16 = 80;
 constexpr uint32_t D3D8_ERR_INVALIDCALL = 0x8876086Cu;
 
-#ifdef RECOMP_D3D8_WGPU
-bool host_ok(int32_t status, const D3d8Error &err, const char *what) {
-    if (status == 0)
+bool host_ok(const recomp::d3d::Status &status, const char *what) {
+    if (d3d_bridge_ok(status))
         return true;
-    LOGW("d3d7: host renderer %s failed: %s", what, (const char *)err.message);
+    LOGW("d3d7: host renderer %s failed: %.*s", what, static_cast<int>(status.message.size()),
+         status.message.data());
     return false;
 }
-#endif
+
+void host_require(const recomp::d3d::Status &status, const char *what) {
+    if (!host_ok(status, what)) {
+        fflush(stderr);
+        abort();
+    }
+}
+
+uint32_t state_block_hresult(const recomp::d3d::Status &status) {
+    switch (status.state_block_error) {
+    case recomp::d3d::StateBlockError::InBeginStateBlock:
+        return D3DERR_INBEGINSTATEBLOCK;
+    case recomp::d3d::StateBlockError::NotInBeginStateBlock:
+        return D3DERR_NOTINBEGINSTATEBLOCK;
+    case recomp::d3d::StateBlockError::InvalidStateBlock:
+        return D3DERR_INVALIDSTATEBLOCK;
+    case recomp::d3d::StateBlockError::OutOfMemory:
+        return DDERR_OUTOFMEMORY;
+    case recomp::d3d::StateBlockError::None:
+        return D3DERR_INVALID_DEVICE;
+    }
+    return D3DERR_INVALID_DEVICE;
+}
 
 // Forward one recorded render state to the host. The state is already in the
 // store; this is the seam, and every render-state forward goes through it so
 // the D3D7->D3D8 table exists once.
 void forward_render_state(ComObj *dev, uint32_t state, uint32_t value) {
-#ifdef RECOMP_D3D8_WGPU
     if (!dev->d3d7_host)
         return;
-    uint32_t ds = state;
-    D3d7StateMap m = d3d7_translate_render_state(state, value, &ds);
-    if (m == D3D7_STATE_INVALID) {
+    const auto translated = recomp::d3d::translate_render_state(state, value);
+    if (translated.kind == recomp::d3d::D3d7TranslationKind::Invalid) {
         LOGW("d3d7: render state %u (value %u) has no D3D8 equivalent; stopping", state, value);
         fflush(stderr);
         abort();
     }
-    if (m == D3D7_STATE_IGNORE)
+    if (translated.kind == recomp::d3d::D3d7TranslationKind::Ignore)
         return;
-    D3d8Error err{};
-    host_ok(d3d8_device_set_render_state((D3d8Device *)dev->d3d7_host, ds, value, &err), err,
-            "SetRenderState");
-#else
-    (void)dev;
-    (void)state;
-    (void)value;
-#endif
+    host_require(recomp::d3d::set_render_state(*dev->d3d7_host->value, translated.state, value),
+                 "SetRenderState");
 }
 
 void forward_texture_stage_state(ComObj *dev, uint32_t stage, uint32_t type, uint32_t value) {
-#ifdef RECOMP_D3D8_WGPU
     if (!dev->d3d7_host)
         return;
-    uint32_t out[2] = {0, 0};
-    int n = d3d7_translate_texture_stage_state(type, out);
-    if (n < 0) {
+    const auto translated = recomp::d3d::translate_texture_stage_state(type);
+    if (translated.count < 0) {
         LOGW("d3d7: texture-stage state %u has no D3D8 equivalent; stopping", type);
         fflush(stderr);
         abort();
     }
-    for (int i = 0; i < n; ++i) {
-        D3d8Error err{};
-        host_ok(d3d8_device_set_texture_stage_state((D3d8Device *)dev->d3d7_host, stage, out[i],
-                                                    value, &err),
-                err, "SetTextureStageState");
+    for (int i = 0; i < translated.count; ++i) {
+        const uint32_t state = i == 0 ? translated.first : translated.second;
+        host_require(
+            recomp::d3d::set_texture_stage_state(*dev->d3d7_host->value, stage, state, value),
+            "SetTextureStageState");
     }
-#else
-    (void)dev;
-    (void)stage;
-    (void)type;
-    (void)value;
-#endif
 }
 
 void forward_transform(ComObj *dev, uint32_t state) {
-#ifdef RECOMP_D3D8_WGPU
     if (!dev->d3d7_host)
         return;
-    uint32_t ds = state;
-    if (!d3d7_translate_transform(state, &ds))
+    const auto translated = recomp::d3d::translate_transform(state);
+    if (!translated.valid)
         return; // Get/SetTransform keeps states the D3D8 table has no slot for.
-    D3d8Matrix m;
-    memcpy(m.rows, dev->d3d7->transform[state], sizeof m.rows);
-    D3d8Error err{};
-    host_ok(d3d8_device_set_transform((D3d8Device *)dev->d3d7_host, ds, &m, &err), err,
-            "SetTransform");
-#else
-    (void)dev;
-    (void)state;
-#endif
+    const auto values = recomp::d3d::d3d7_get_transform(*dev->d3d7->value, state);
+    host_require(values.status, "GetTransform");
+    const rust::Slice<const float> matrix(values.values.data(), values.values.size());
+    host_require(recomp::d3d::set_transform(*dev->d3d7_host->value, translated.state, matrix),
+                 "SetTransform");
 }
 
 void forward_viewport(ComObj *dev) {
-#ifdef RECOMP_D3D8_WGPU
     if (!dev->d3d7_host)
         return;
-    // D3DVIEWPORT7 stores dwX/dwY/dwWidth/dwHeight as dwords and dvMinZ/dvMaxZ
-    // as floats. The store is a raw byte copy, so reinterpret the dwords.
-    uint32_t x, y, w, h;
-    float minz, maxz;
-    memcpy(&x, dev->d3d7->viewport + 0, 4);
-    memcpy(&y, dev->d3d7->viewport + 1, 4);
-    memcpy(&w, dev->d3d7->viewport + 2, 4);
-    memcpy(&h, dev->d3d7->viewport + 3, 4);
-    memcpy(&minz, dev->d3d7->viewport + 4, 4);
-    memcpy(&maxz, dev->d3d7->viewport + 5, 4);
-    D3d8Error err{};
-    host_ok(d3d8_device_set_viewport((D3d8Device *)dev->d3d7_host, x, y, w, h, minz, maxz, &err),
-            err, "SetViewport");
-#else
-    (void)dev;
-#endif
+    const auto result = recomp::d3d::d3d7_get_viewport(*dev->d3d7->value);
+    if (!host_ok(result.status, "GetViewport"))
+        return;
+    host_require(recomp::d3d::set_viewport(*dev->d3d7_host->value, result.viewport), "SetViewport");
 }
 
 void forward_material(ComObj *dev) {
-#ifdef RECOMP_D3D8_WGPU
     if (!dev->d3d7_host)
         return;
-    D3d8Material m;
-    static_assert(sizeof m == sizeof dev->d3d7->material, "D3DMATERIAL7/8 layout");
-    memcpy(&m, dev->d3d7->material, sizeof m);
-    D3d8Error err{};
-    host_ok(d3d8_device_set_material((D3d8Device *)dev->d3d7_host, &m, &err), err, "SetMaterial");
-#else
-    (void)dev;
-#endif
+    const auto values = recomp::d3d::d3d7_get_material(*dev->d3d7->value);
+    if (!host_ok(values.status, "GetMaterial") || values.values.size() != 17)
+        return;
+    recomp::d3d::Material material{};
+    auto f = [&](size_t index) { return std::bit_cast<float>(values.values[index]); };
+    material.diffuse_r = f(0);
+    material.diffuse_g = f(1);
+    material.diffuse_b = f(2);
+    material.diffuse_a = f(3);
+    material.ambient_r = f(4);
+    material.ambient_g = f(5);
+    material.ambient_b = f(6);
+    material.ambient_a = f(7);
+    material.specular_r = f(8);
+    material.specular_g = f(9);
+    material.specular_b = f(10);
+    material.specular_a = f(11);
+    material.emissive_r = f(12);
+    material.emissive_g = f(13);
+    material.emissive_b = f(14);
+    material.emissive_a = f(15);
+    material.power = f(16);
+    host_require(recomp::d3d::set_material(*dev->d3d7_host->value, material), "SetMaterial");
 }
 
 void forward_light(ComObj *dev, uint32_t index) {
-#ifdef RECOMP_D3D8_WGPU
     if (!dev->d3d7_host)
         return;
-    D3d8Light l;
-    static_assert(sizeof l == sizeof dev->d3d7->light, "D3DLIGHT7/8 layout");
-    memcpy(&l, dev->d3d7->light, sizeof l);
-    D3d8Error err{};
-    host_ok(d3d8_device_set_light((D3d8Device *)dev->d3d7_host, index, &l, &err), err, "SetLight");
-#else
-    (void)dev;
-    (void)index;
-#endif
+    const auto values = recomp::d3d::d3d7_get_light(*dev->d3d7->value, index);
+    if (!host_ok(values.status, "GetLight") || values.values.size() != 26)
+        return;
+    recomp::d3d::Light light{};
+    light.light_type = values.values[0];
+    auto f = [&](size_t index) { return std::bit_cast<float>(values.values[index]); };
+    light.diffuse_r = f(1);
+    light.diffuse_g = f(2);
+    light.diffuse_b = f(3);
+    light.diffuse_a = f(4);
+    light.specular_r = f(5);
+    light.specular_g = f(6);
+    light.specular_b = f(7);
+    light.specular_a = f(8);
+    light.ambient_r = f(9);
+    light.ambient_g = f(10);
+    light.ambient_b = f(11);
+    light.ambient_a = f(12);
+    light.position_x = f(13);
+    light.position_y = f(14);
+    light.position_z = f(15);
+    light.direction_x = f(16);
+    light.direction_y = f(17);
+    light.direction_z = f(18);
+    light.range = f(19);
+    light.falloff = f(20);
+    light.attenuation0 = f(21);
+    light.attenuation1 = f(22);
+    light.attenuation2 = f(23);
+    light.theta = f(24);
+    light.phi = f(25);
+    host_require(recomp::d3d::set_light(*dev->d3d7_host->value, index, light), "SetLight");
 }
 
 // Replays every state the engine set before the host device existed. The
@@ -993,22 +829,60 @@ void forward_light(ComObj *dev, uint32_t index) {
 // material, lights, viewport and render states before that.
 void replay_state(ComObj *dev) {
     for (uint32_t i = 0; i < 256; ++i)
-        if (dev->d3d7->render_state_set[i])
-            forward_render_state(dev, i, dev->d3d7->render_state[i]);
+        if (recomp::d3d::d3d7_render_state_was_set(*dev->d3d7->value, i))
+            forward_render_state(dev, i,
+                                 recomp::d3d::d3d7_get_render_state(*dev->d3d7->value, i).value);
     for (uint32_t stage = 0; stage < 8; ++stage)
         for (uint32_t type = 0; type < 256; ++type)
-            if (dev->d3d7->tss_set[stage][type])
-                forward_texture_stage_state(dev, stage, type, dev->d3d7->tss[stage][type]);
+            if (recomp::d3d::d3d7_texture_stage_state_was_set(*dev->d3d7->value, stage, type))
+                forward_texture_stage_state(
+                    dev, stage, type,
+                    recomp::d3d::d3d7_get_texture_stage_state(*dev->d3d7->value, stage, type)
+                        .value);
     for (uint32_t t = 0; t < 256; ++t)
-        if (dev->d3d7->transform_set[t])
+        if (recomp::d3d::d3d7_transform_was_set(*dev->d3d7->value, t))
             forward_transform(dev, t);
-    if (dev->d3d7->viewport_set)
+    if (recomp::d3d::d3d7_viewport_was_set(*dev->d3d7->value))
         forward_viewport(dev);
-    if (dev->d3d7->material_set)
+    if (recomp::d3d::d3d7_material_was_set(*dev->d3d7->value))
         forward_material(dev);
-    for (uint32_t i = 0; i < 8; ++i)
-        if (dev->d3d7->light_enable[i])
+    for (uint32_t i = 0; i < 8; ++i) {
+        if (recomp::d3d::d3d7_get_light_enable(*dev->d3d7->value, i).value)
             forward_light(dev, i);
+        if (dev->d3d7_host && !recomp::d3d::d3d7_recording(*dev->d3d7->value))
+            host_require(recomp::d3d::light_enable(
+                             *dev->d3d7_host->value, i,
+                             recomp::d3d::d3d7_get_light_enable(*dev->d3d7->value, i).value != 0),
+                         "LightEnable");
+    }
+}
+
+void replay_state_block(ComObj *dev, uint32_t handle) {
+    auto &state = *dev->d3d7->value;
+    for (uint32_t i = 0; i < 256; ++i) {
+        if (recomp::d3d::d3d7_state_block_render_state_was_set(state, handle, i))
+            forward_render_state(dev, i, recomp::d3d::d3d7_get_render_state(state, i).value);
+        if (recomp::d3d::d3d7_state_block_transform_was_set(state, handle, i))
+            forward_transform(dev, i);
+        for (uint32_t stage = 0; stage < 8; ++stage)
+            if (recomp::d3d::d3d7_state_block_texture_stage_state_was_set(state, handle, stage, i))
+                forward_texture_stage_state(
+                    dev, stage, i,
+                    recomp::d3d::d3d7_get_texture_stage_state(state, stage, i).value);
+    }
+    if (recomp::d3d::d3d7_state_block_viewport_was_set(state, handle))
+        forward_viewport(dev);
+    if (recomp::d3d::d3d7_state_block_material_was_set(state, handle))
+        forward_material(dev);
+    for (uint32_t i = 0; i < 8; ++i) {
+        if (recomp::d3d::d3d7_state_block_light_was_set(state, handle, i))
+            forward_light(dev, i);
+        if (dev->d3d7_host && recomp::d3d::d3d7_state_block_light_enable_was_set(state, handle, i))
+            host_require(
+                recomp::d3d::light_enable(*dev->d3d7_host->value, i,
+                                          recomp::d3d::d3d7_get_light_enable(state, i).value != 0),
+                "LightEnable");
+    }
 }
 
 // Creates the Rust device for a D3D7 device's DirectDraw back buffer. Host
@@ -1016,19 +890,18 @@ void replay_state(ComObj *dev) {
 // path can read back as tightly packed RGBA8; the depth attachment is D16
 // because the z-buffer the engine enumerated and attached is 16-bit.
 bool ensure_host(ComObj *dev) {
-#ifdef RECOMP_D3D8_WGPU
     if (dev->d3d7_host)
         return true;
-    ComObj *target = com_get(dev->d3d7->render_target);
+    ComObj *target = com_get(recomp::d3d::d3d7_get_render_target(*dev->d3d7->value));
     if (!target || target->kind != K_SURFACE || !target->width || !target->height) {
         LOGW("d3d7: cannot create the host renderer without a render target surface");
         return false;
     }
     uint32_t depth = target->zbuffer_obj ? D3D8FMT_D16 : 0;
-    D3d8Error err{};
-    void *host = d3d8_device_create(target->width, target->height, D3D8FMT_A8R8G8B8, depth, &err);
-    if (!host) {
-        LOGW("d3d7: host renderer device creation failed: %s", (const char *)err.message);
+    auto host = std::make_shared<D3dHostDevice>();
+    const auto status = recomp::d3d::initialize_gpu(*host->value, target->width, target->height,
+                                                    D3D8FMT_A8R8G8B8, depth);
+    if (!host_ok(status, "device creation")) {
         return false;
     }
     dev->d3d7_host = host;
@@ -1036,10 +909,6 @@ bool ensure_host(ComObj *dev) {
     dev->d3d7_height = target->height;
     replay_state(dev);
     return true;
-#else
-    (void)dev;
-    return false;
-#endif
 }
 
 // Copies the Rust 32-bit target into the guest surface. The writeback is a
@@ -1056,13 +925,12 @@ bool ensure_host(ComObj *dev) {
 // left as they are. This can only avoid clobbering CPU-written bytes; it never
 // hides GPU content, because every GPU-target write sets the flag.
 void d3d7_writeback(ComObj *dev) {
-#ifdef RECOMP_D3D8_WGPU
     if (!dev || !dev->d3d7_host)
         return;
-    ComObj *s = com_get(dev->d3d7->render_target);
+    ComObj *s = com_get(recomp::d3d::d3d7_get_render_target(*dev->d3d7->value));
     if (!s || s->kind != K_SURFACE || !s->pixels)
         return;
-    if (!dev->d3d7->target_dirty)
+    if (!recomp::d3d::d3d7_target_dirty(*dev->d3d7->value))
         return;
     const uint32_t w = dev->d3d7_width, h = dev->d3d7_height;
     if (!w || !h)
@@ -1071,18 +939,21 @@ void d3d7_writeback(ComObj *dev) {
     static std::vector<uint8_t> rgba;
     if (rgba.size() != (size_t)bytes)
         rgba.resize((size_t)bytes);
-    uint32_t got = 0;
-    D3d8Error err{};
+    uint64_t got = 0;
     const uint64_t marker_start = profile_marker_now();
-    const bool read_ok = host_ok(d3d8_device_read_pixels((D3d8Device *)dev->d3d7_host, rgba.data(),
-                                                         (uint32_t)bytes, &got, &err),
-                                 err, "ReadPixels");
+    const bool length_ok =
+        host_ok(recomp::d3d::read_pixels_len(*dev->d3d7_host->value, got), "ReadPixelsLength");
+    const bool read_ok =
+        length_ok && got == bytes &&
+        host_ok(recomp::d3d::read_pixels(*dev->d3d7_host->value,
+                                         rust::Slice<uint8_t>(rgba.data(), rgba.size())),
+                "ReadPixels");
     profile_marker_end("readback", marker_start);
     if (!read_ok)
         return;
     if (got != bytes) {
-        log_once("d3d7.writeback.size", "d3d7: readback returned %u bytes, expected %llu", got,
-                 (unsigned long long)bytes);
+        log_once("d3d7.writeback.size", "d3d7: readback returned %llu bytes, expected %llu",
+                 (unsigned long long)got, (unsigned long long)bytes);
         return;
     }
     if (!d3d7_store_rgba_surface(gm_ptr(s->pixels), s->pitch, s->bpp, w, h, rgba.data())) {
@@ -1090,11 +961,8 @@ void d3d7_writeback(ComObj *dev) {
                  s->bpp);
         return; // leave dirty: a later flush may still service it
     }
-    dev->d3d7->target_dirty = false;
+    recomp::d3d::d3d7_set_target_dirty(*dev->d3d7->value, false);
     ddraw_sync_gpu_pixels(s);
-#else
-    (void)dev;
-#endif
 }
 
 // ---------------------------------------------------------------- textures
@@ -1221,15 +1089,13 @@ bool d3d7_convert_texture(const ComObj *tex, std::vector<uint8_t> &out) {
 // bumped by ddraw.cpp's surface_pixels_changed; a lock still open at draw time
 // forces the upload instead of trusting it.
 void d3d7_sync_texture(ComObj *dev, uint32_t stage) {
-#ifdef RECOMP_D3D8_WGPU
-    if (!dev || !dev->d3d7_host || stage >= 8)
+    if (!dev || !dev->d3d7_host || stage >= 8 || recomp::d3d::d3d7_recording(*dev->d3d7->value))
         return;
-    ComObj *tex = com_get(dev->d3d7->texture[stage]);
-    D3d8Error err{};
+    ComObj *tex = com_get(recomp::d3d::d3d7_get_texture(*dev->d3d7->value, stage).value);
     if (!tex || tex->kind != K_SURFACE || !tex->pixels || !tex->width || !tex->height) {
-        host_ok(
-            d3d8_device_set_texture((D3d8Device *)dev->d3d7_host, stage, 0, 0, 0, nullptr, &err),
-            err, "SetTexture");
+        host_require(recomp::d3d::set_texture(*dev->d3d7_host->value, stage, 0, 0,
+                                              rust::Slice<const recomp::d3d::TextureLevel>()),
+                     "SetTexture");
         return;
     }
     // Reuse the conversion of this surface while its content generation is
@@ -1262,7 +1128,7 @@ void d3d7_sync_texture(ComObj *dev, uint32_t stage) {
             conv_cache.erase(it);
         }
     }
-    std::vector<D3d8TextureLevel> levels;
+    std::vector<recomp::d3d::TextureLevel> levels;
     // DirectDraw SetTexture binds the root of an implicit mip chain, not
     // just its base pixels. Reconcile and version each level independently;
     // updating a child must not require changing/rebinding the root.
@@ -1272,8 +1138,10 @@ void d3d7_sync_texture(ComObj *dev, uint32_t stage) {
         ConvEntry &sc = conv_cache[level->id];
         sc.used = ++conv_tick;
         std::vector<uint8_t> &converted = sc.bytes;
-        const bool fresh = sc.generation == level->d3d8_content_generation &&
-                           level->lock_count == 0 && !converted.empty();
+        const uint64_t generation = level->d3d8_resource ? level->d3d8_resource->generation()
+                                                         : ddraw_surface_revision(level->id);
+        const bool fresh =
+            sc.generation == generation && level->lock_count == 0 && !converted.empty();
         if (!fresh) {
             conv_bytes -= converted.size();
             const bool ok = d3d7_convert_texture(level, converted);
@@ -1287,25 +1155,21 @@ void d3d7_sync_texture(ComObj *dev, uint32_t stage) {
                 abort();
             }
         }
-        sc.generation = level->lock_count == 0 ? level->d3d8_content_generation : UINT64_MAX;
+        sc.generation = level->lock_count == 0 ? generation : UINT64_MAX;
         const uint32_t dirty = level->lock_count > 0 ? 1u : 0u;
-        D3d8TextureLevel lvl{};
+        recomp::d3d::TextureLevel lvl{};
         lvl.level = (uint32_t)levels.size();
         lvl.width = level->width;
         lvl.height = level->height;
-        lvl.dirty = dirty;
-        lvl.generation = level->d3d8_content_generation;
-        lvl.data = converted.data();
-        lvl.bytes = (uint32_t)converted.size();
+        lvl.force_upload = dirty != 0;
+        lvl.generation = generation;
+        lvl.data = rust::Slice<const uint8_t>(converted.data(), converted.size());
         levels.push_back(lvl);
     }
-    host_ok(d3d8_device_set_texture((D3d8Device *)dev->d3d7_host, stage, tex->id, D3D8FMT_A8R8G8B8,
-                                    (uint32_t)levels.size(), levels.data(), &err),
-            err, "SetTexture");
-#else
-    (void)dev;
-    (void)stage;
-#endif
+    host_require(recomp::d3d::set_texture(
+                     *dev->d3d7_host->value, stage, tex->id, D3D8FMT_A8R8G8B8,
+                     rust::Slice<const recomp::d3d::TextureLevel>(levels.data(), levels.size())),
+                 "SetTexture");
 }
 
 // ---------------------------------------------------------------- device caps
@@ -1483,10 +1347,9 @@ void D3D7_CreateDevice(X86 *c) {
         return;
     }
     ComObj *dev = com_new(K_D3D7DEVICE);
-    dev->d3d7 = std::make_shared<D3d7DeviceState>();
-    init_device_state(*dev->d3d7);
+    dev->d3d7 = std::make_shared<D3dHostDevice7State>();
     dev->d3d7->d3d_obj = d3d->id;
-    dev->d3d7->render_target = target->id;
+    recomp::d3d::d3d7_set_render_target(*dev->d3d7->value, target->id);
     // ddraw.cpp finds the Rust target through the surface: the guest bytes are
     // authoritative, and this is how a Flip/Lock/Blt knows to reconcile first.
     target->d3d7_target_device = dev->id;
@@ -1565,22 +1428,18 @@ void Device7_BeginScene(X86 *c) {
         com_ret(c, DDERR_INVALIDOBJECT);
         return;
     }
-    if (dev->d3d7->in_scene) {
+    if (recomp::d3d::d3d7_in_scene(*dev->d3d7->value)) {
         com_ret(c, D3DERR_SCENEINSCENE);
         return;
     }
-    dev->d3d7->in_scene = true;
+    recomp::d3d::d3d7_set_in_scene(*dev->d3d7->value, true);
     host_d3d7_begin_scene();
     trace_frame_begin();
-#ifdef RECOMP_D3D8_WGPU
     // The Rust draw path requires an open scene. The host exists from the
     // first Clear onward; a scene opened before that is only recorded (the
     // draws that need it come after the host exists).
-    if (dev->d3d7_host) {
-        D3d8Error err{};
-        host_ok(d3d8_device_begin_scene((D3d8Device *)dev->d3d7_host, &err), err, "BeginScene");
-    }
-#endif
+    if (dev->d3d7_host)
+        host_require(recomp::d3d::begin_scene(*dev->d3d7_host->value), "BeginScene");
     com_ret(c, D3D_OK_);
 }
 
@@ -1590,17 +1449,13 @@ void Device7_EndScene(X86 *c) {
         com_ret(c, DDERR_INVALIDOBJECT);
         return;
     }
-    if (!dev->d3d7->in_scene) {
+    if (!recomp::d3d::d3d7_in_scene(*dev->d3d7->value)) {
         com_ret(c, D3DERR_SCENENOTINSCENE);
         return;
     }
-    dev->d3d7->in_scene = false;
-#ifdef RECOMP_D3D8_WGPU
-    if (dev->d3d7_host) {
-        D3d8Error err{};
-        host_ok(d3d8_device_end_scene((D3d8Device *)dev->d3d7_host, &err), err, "EndScene");
-    }
-#endif
+    recomp::d3d::d3d7_set_in_scene(*dev->d3d7->value, false);
+    if (dev->d3d7_host)
+        host_require(recomp::d3d::end_scene(*dev->d3d7_host->value), "EndScene");
     trace_frame_end();
     com_ret(c, D3D_OK_);
 }
@@ -1630,9 +1485,15 @@ void Device7_SetTransform(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    memcpy(dev->d3d7->transform[state], gm_ptr(matrix), 64);
-    dev->d3d7->transform_set[state] = true;
-    forward_transform(dev, state);
+    const auto values =
+        rust::Slice<const float>(reinterpret_cast<const float *>(gm_ptr(matrix)), 16);
+    if (!host_ok(recomp::d3d::d3d7_set_transform(*dev->d3d7->value, state, values),
+                 "SetTransform")) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    if (!recomp::d3d::d3d7_recording(*dev->d3d7->value))
+        forward_transform(dev, state);
     trace_transform(dev, state);
     com_ret(c, D3D_OK_);
 }
@@ -1644,7 +1505,12 @@ void Device7_GetTransform(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    memcpy(gm_ptr(out), dev->d3d7->transform[state], 64);
+    const auto values = recomp::d3d::d3d7_get_transform(*dev->d3d7->value, state);
+    if (!host_ok(values.status, "GetTransform") || values.values.size() != 16) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    memcpy(gm_ptr(out), values.values.data(), 64);
     com_ret(c, D3D_OK_);
 }
 
@@ -1655,9 +1521,14 @@ void Device7_SetViewport(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    memcpy(dev->d3d7->viewport, gm_ptr(vp), sizeof dev->d3d7->viewport);
-    dev->d3d7->viewport_set = true;
-    forward_viewport(dev);
+    recomp::d3d::Viewport viewport{};
+    memcpy(&viewport, gm_ptr(vp), D3DVIEWPORT7_SIZE);
+    if (!host_ok(recomp::d3d::d3d7_set_viewport(*dev->d3d7->value, viewport), "SetViewport")) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    if (!recomp::d3d::d3d7_recording(*dev->d3d7->value))
+        forward_viewport(dev);
     com_ret(c, D3D_OK_);
 }
 
@@ -1668,7 +1539,12 @@ void Device7_GetViewport(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    memcpy(gm_ptr(out), dev->d3d7->viewport, sizeof dev->d3d7->viewport);
+    const auto result = recomp::d3d::d3d7_get_viewport(*dev->d3d7->value);
+    if (!host_ok(result.status, "GetViewport")) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    memcpy(gm_ptr(out), &result.viewport, D3DVIEWPORT7_SIZE);
     com_ret(c, D3D_OK_);
 }
 
@@ -1679,9 +1555,16 @@ void Device7_SetMaterial(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    memcpy(dev->d3d7->material, gm_ptr(m), sizeof dev->d3d7->material);
-    dev->d3d7->material_set = true;
-    forward_material(dev);
+    std::array<uint32_t, 17> values{};
+    memcpy(values.data(), gm_ptr(m), D3DMATERIAL7_SIZE);
+    if (!host_ok(recomp::d3d::d3d7_set_material(
+                     *dev->d3d7->value, rust::Slice<const uint32_t>(values.data(), values.size())),
+                 "SetMaterial")) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    if (!recomp::d3d::d3d7_recording(*dev->d3d7->value))
+        forward_material(dev);
     com_ret(c, D3D_OK_);
 }
 
@@ -1692,7 +1575,12 @@ void Device7_GetMaterial(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    memcpy(gm_ptr(out), dev->d3d7->material, sizeof dev->d3d7->material);
+    const auto values = recomp::d3d::d3d7_get_material(*dev->d3d7->value);
+    if (!host_ok(values.status, "GetMaterial") || values.values.size() != 17) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    memcpy(gm_ptr(out), values.values.data(), D3DMATERIAL7_SIZE);
     com_ret(c, D3D_OK_);
 }
 
@@ -1703,8 +1591,17 @@ void Device7_SetLight(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    memcpy(dev->d3d7->light, gm_ptr(data), sizeof dev->d3d7->light);
-    forward_light(dev, idx);
+    std::array<uint32_t, 26> values{};
+    memcpy(values.data(), gm_ptr(data), D3DLIGHT7_SIZE);
+    if (!host_ok(
+            recomp::d3d::d3d7_set_light(*dev->d3d7->value, idx,
+                                        rust::Slice<const uint32_t>(values.data(), values.size())),
+            "SetLight")) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    if (!recomp::d3d::d3d7_recording(*dev->d3d7->value))
+        forward_light(dev, idx);
     com_ret(c, D3D_OK_);
 }
 
@@ -1715,7 +1612,12 @@ void Device7_GetLight(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    memcpy(gm_ptr(out), dev->d3d7->light, sizeof dev->d3d7->light);
+    const auto values = recomp::d3d::d3d7_get_light(*dev->d3d7->value, idx);
+    if (!host_ok(values.status, "GetLight") || values.values.size() != 26) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    memcpy(gm_ptr(out), values.values.data(), D3DLIGHT7_SIZE);
     com_ret(c, D3D_OK_);
 }
 
@@ -1726,9 +1628,13 @@ void Device7_SetRenderState(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    dev->d3d7->render_state[state] = value;
-    dev->d3d7->render_state_set[state] = true;
-    forward_render_state(dev, state, value);
+    if (!host_ok(recomp::d3d::d3d7_set_render_state(*dev->d3d7->value, state, value),
+                 "SetRenderState")) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    if (!recomp::d3d::d3d7_recording(*dev->d3d7->value))
+        forward_render_state(dev, state, value);
     com_ret(c, D3D_OK_);
 }
 
@@ -1739,7 +1645,12 @@ void Device7_GetRenderState(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    wr32(out, dev->d3d7->render_state[state]);
+    const auto value = recomp::d3d::d3d7_get_render_state(*dev->d3d7->value, state);
+    if (!host_ok(value.status, "GetRenderState")) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    wr32(out, value.value);
     com_ret(c, D3D_OK_);
 }
 
@@ -1750,7 +1661,12 @@ void Device7_GetTextureStageState(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    wr32(out, dev->d3d7->tss[stage][type]);
+    const auto value = recomp::d3d::d3d7_get_texture_stage_state(*dev->d3d7->value, stage, type);
+    if (!host_ok(value.status, "GetTextureStageState")) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    wr32(out, value.value);
     com_ret(c, D3D_OK_);
 }
 
@@ -1764,9 +1680,13 @@ void Device7_SetTextureStageState(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    dev->d3d7->tss[stage][type] = value;
-    dev->d3d7->tss_set[stage][type] = true;
-    forward_texture_stage_state(dev, stage, type, value);
+    if (!host_ok(recomp::d3d::d3d7_set_texture_stage_state(*dev->d3d7->value, stage, type, value),
+                 "SetTextureStageState")) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    if (!recomp::d3d::d3d7_recording(*dev->d3d7->value))
+        forward_texture_stage_state(dev, stage, type, value);
     com_ret(c, D3D_OK_);
 }
 
@@ -1791,7 +1711,8 @@ void Device7_GetTexture(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    ComObj *tex = com_get(dev->d3d7->texture[stage]);
+    const auto value = recomp::d3d::d3d7_get_texture(*dev->d3d7->value, stage);
+    ComObj *tex = com_get(value.value);
     if (tex)
         com_addref(tex);
     wr32(out, tex ? com_view(tex, IF_DDSURFACE7) : 0);
@@ -1812,9 +1733,15 @@ void Device7_SetTexture(X86 *c) {
     }
     if (tex)
         com_addref(tex);
-    if (ComObj *old = com_get(dev->d3d7->texture[stage]))
+    auto result = recomp::d3d::d3d7_set_texture(*dev->d3d7->value, stage, tex ? tex->id : 0);
+    if (!host_ok(result.status, "SetTexture")) {
+        if (tex)
+            com_release(tex);
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    if (ComObj *old = com_get(result.old_id))
         com_release(old);
-    dev->d3d7->texture[stage] = tex ? tex->id : 0;
     // Forward the bind now if the host exists; draws re-sync anyway so a
     // surface written after this call is still current.
     d3d7_sync_texture(dev, stage);
@@ -1830,14 +1757,14 @@ void Device7_LightEnable(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    dev->d3d7->light_enable[idx] = enable ? 1 : 0;
-#ifdef RECOMP_D3D8_WGPU
-    if (dev->d3d7_host) {
-        D3d8Error err{};
-        host_ok(d3d8_device_light_enable((D3d8Device *)dev->d3d7_host, idx, enable ? 1u : 0u, &err),
-                err, "LightEnable");
+    if (!host_ok(recomp::d3d::d3d7_set_light_enable(*dev->d3d7->value, idx, enable ? 1u : 0u),
+                 "LightEnable")) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
     }
-#endif
+    if (dev->d3d7_host && !recomp::d3d::d3d7_recording(*dev->d3d7->value))
+        host_require(recomp::d3d::light_enable(*dev->d3d7_host->value, idx, enable != 0),
+                     "LightEnable");
     com_ret(c, D3D_OK_);
 }
 
@@ -1848,7 +1775,12 @@ void Device7_GetLightEnable(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    wr32(out, dev->d3d7->light_enable[idx]);
+    const auto value = recomp::d3d::d3d7_get_light_enable(*dev->d3d7->value, idx);
+    if (!host_ok(value.status, "GetLightEnable")) {
+        com_ret(c, DDERR_INVALIDPARAMS);
+        return;
+    }
+    wr32(out, value.value);
     com_ret(c, D3D_OK_);
 }
 
@@ -1859,51 +1791,11 @@ void Device7_GetRenderTarget(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    ComObj *s = com_get(dev->d3d7->render_target);
+    ComObj *s = com_get(recomp::d3d::d3d7_get_render_target(*dev->d3d7->value));
     if (s)
         com_addref(s);
     wr32(out, s ? com_view(s, IF_DDSURFACE7) : 0);
     com_ret(c, D3D_OK_);
-}
-
-// Clears the guest surface directly. Used when the Rust renderer is absent or
-// could not start; the guest bytes are the authoritative target, so the color
-// clear is exact and the depth/stencil clear is best-effort (16-bit z only).
-void clear_guest_target(ComObj *dev, uint32_t flags, uint32_t color, float z, uint32_t stencil) {
-    ComObj *s = com_get(dev->d3d7->render_target);
-    if ((flags & D3DCLEAR_TARGET) && s && s->pixels) {
-        const uint16_t c16 = d3d7_rgb888_to_rgb565(color);
-        const uint32_t c32 = 0xff000000u | (color & 0x00ffffffu);
-        for (uint32_t y = 0; y < s->height; ++y) {
-            uint32_t row = s->pixels + (uint32_t)((size_t)y * s->pitch);
-            for (uint32_t x = 0; x < s->width; ++x) {
-                if (s->bpp == 16)
-                    wr16(row + x * 2, c16);
-                else if (s->bpp == 32)
-                    wr32(row + x * 4, c32);
-            }
-        }
-    }
-    if (flags & D3DCLEAR_ZBUFFER) {
-        ComObj *zz = (s && s->zbuffer_obj) ? com_get(s->zbuffer_obj) : nullptr;
-        if (zz && zz->pixels && zz->bpp == 16) {
-            uint16_t zv =
-                (uint16_t)(z <= 0.0f ? 0 : (z >= 1.0f ? 0xffff : (uint32_t)(z * 65535.0f)));
-            for (uint32_t y = 0; y < zz->height; ++y) {
-                uint32_t row = zz->pixels + (uint32_t)((size_t)y * zz->pitch);
-                for (uint32_t x = 0; x < zz->width; ++x)
-                    wr16(row + x * 2, zv);
-            }
-        } else {
-            log_once(
-                "d3d7.clear.z",
-                "d3d7: Clear(ZBUFFER) with no attached 16-bit z-buffer surface; depth not cleared");
-        }
-    }
-    if (flags & D3DCLEAR_STENCIL_) {
-        (void)stencil;
-        log_once("d3d7.clear.stencil", "d3d7: Clear(STENCIL) is not modelled on the guest bytes");
-    }
 }
 
 // `IDirect3DDevice7::Clear` for the full-target clear the engine uses. Flags,
@@ -1932,13 +1824,12 @@ void Device7_Clear(X86 *c) {
         fflush(stderr);
         abort();
     }
-#ifdef RECOMP_D3D8_WGPU
     if (ensure_host(dev)) {
-        D3d8Error err{};
-        int32_t status = d3d8_device_clear((D3d8Device *)dev->d3d7_host, 0, nullptr, flags, color,
-                                           z, stencil, &err);
-        if (host_ok(status, err, "Clear")) {
-            dev->d3d7->target_dirty = true;
+        const auto status =
+            recomp::d3d::clear(*dev->d3d7_host->value, rust::Slice<const recomp::d3d::Rect>(),
+                               flags, color, z, stencil);
+        if (host_ok(status, "Clear")) {
+            recomp::d3d::d3d7_set_target_dirty(*dev->d3d7->value, true);
             host_d3d7_clear();
             com_ret(c, D3D_OK_);
         } else {
@@ -1946,27 +1837,20 @@ void Device7_Clear(X86 *c) {
         }
         return;
     }
-#endif
-    clear_guest_target(dev, flags, color, z, stencil);
-    host_d3d7_clear();
-    com_ret(c, D3D_OK_);
+    needs_render("IDirect3DDevice7", "Clear without a GPU backend");
 }
 
-// State blocks: the engine's blend-mode probe (fn_0082bf10) records states with
-// Begin/End, applies them and validates. This is a faithful front-end snapshot
-// (a copy of D3d7DeviceState). The Rust host already holds every state because
-// the recorded Set* calls forwarded live; Apply restores the front end only.
 void Device7_BeginStateBlock(X86 *c) {
     ComObj *dev = this_device7(c);
     if (!dev) {
         com_ret(c, DDERR_INVALIDOBJECT);
         return;
     }
-    if (dev->d3d7_recording) {
-        com_ret(c, D3DERR_INVALID_DEVICE);
+    const auto status = recomp::d3d::d3d7_begin_state_block(*dev->d3d7->value);
+    if (!host_ok(status, "BeginStateBlock")) {
+        com_ret(c, state_block_hresult(status));
         return;
     }
-    dev->d3d7_recording = true;
     com_ret(c, D3D_OK_);
 }
 
@@ -1977,14 +1861,12 @@ void Device7_EndStateBlock(X86 *c) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    if (!dev->d3d7_recording) {
-        com_ret(c, D3DERR_INVALID_DEVICE);
+    const auto result = recomp::d3d::d3d7_end_state_block(*dev->d3d7->value);
+    if (!host_ok(result.status, "EndStateBlock")) {
+        com_ret(c, state_block_hresult(result.status));
         return;
     }
-    uint32_t handle = dev->d3d7_next_stateblock++;
-    dev->d3d7_stateblocks[handle] = std::make_shared<D3d7DeviceState>(*dev->d3d7);
-    dev->d3d7_recording = false;
-    wr32(out, handle);
+    wr32(out, result.handle);
     com_ret(c, D3D_OK_);
 }
 
@@ -1995,12 +1877,25 @@ void Device7_ApplyStateBlock(X86 *c) {
         com_ret(c, DDERR_INVALIDOBJECT);
         return;
     }
-    auto it = dev->d3d7_stateblocks.find(handle);
-    if (it == dev->d3d7_stateblocks.end()) {
-        com_ret(c, D3DERR_INVALID_DEVICE);
+    const auto result = recomp::d3d::d3d7_apply_state_block(*dev->d3d7->value, handle);
+    if (!host_ok(result.status, "ApplyStateBlock")) {
+        com_ret(c, state_block_hresult(result.status));
         return;
     }
-    *dev->d3d7 = *it->second;
+    for (size_t stage = 0; stage < result.bindings.new_values.size(); ++stage) {
+        const uint32_t old_id = result.bindings.old_values[stage];
+        const uint32_t new_id = result.bindings.new_values[stage];
+        if (old_id == new_id)
+            continue;
+        if (ComObj *texture = com_get(new_id))
+            com_addref(texture);
+        if (ComObj *texture = com_get(old_id))
+            com_release(texture);
+    }
+    replay_state_block(dev, handle);
+    for (uint32_t stage = 0; stage < 8; ++stage)
+        if (recomp::d3d::d3d7_state_block_texture_was_set(*dev->d3d7->value, handle, stage))
+            d3d7_sync_texture(dev, stage);
     com_ret(c, D3D_OK_);
 }
 
@@ -2011,10 +1906,14 @@ void Device7_DeleteStateBlock(X86 *c) {
         com_ret(c, DDERR_INVALIDOBJECT);
         return;
     }
-    if (!dev->d3d7_stateblocks.erase(handle)) {
-        com_ret(c, D3DERR_INVALID_DEVICE);
+    const auto result = recomp::d3d::d3d7_delete_state_block(*dev->d3d7->value, handle);
+    if (!host_ok(result.status, "DeleteStateBlock")) {
+        com_ret(c, state_block_hresult(result.status));
         return;
     }
+    for (uint32_t id : result.values)
+        if (ComObj *texture = com_get(id))
+            com_release(texture);
     com_ret(c, D3D_OK_);
 }
 
@@ -2040,36 +1939,28 @@ bool d3d7_prim_count(uint32_t type, uint32_t count, uint32_t *out) {
 // A draw the host renderer refused is never a silent no-op: it is the named
 // diagnosis and the run stops. The renderer's own message carries the FVF,
 // state or range that was unsupported.
-#ifdef RECOMP_D3D8_WGPU
-[[noreturn]] void draw_host_stop(const char *method, const D3d8Error &err) {
-    LOGW("d3d7: IDirect3DDevice7::%s host renderer rejected the draw: %s; stopping", method,
-         (const char *)err.message);
+[[noreturn]] void draw_host_stop(const char *method, const recomp::d3d::Status &status) {
+    LOGW("d3d7: IDirect3DDevice7::%s host renderer rejected the draw: %.*s; stopping", method,
+         static_cast<int>(status.message.size()), status.message.data());
     fflush(stderr);
     abort();
 }
-#endif
 
-// Sync both implemented texture stages, then submit the draw to the host. The
-// no-renderer build and a missing host stop through needs_render after the
-// argument checks, so a malformed draw is diagnosed the same either way.
 void d3d7_submit_primitive(ComObj *dev, uint32_t type, uint32_t fvf, uint32_t verts,
                            uint32_t vertex_bytes, uint32_t stride, uint32_t start_vertex,
                            uint32_t prims, const char *method) {
-#ifdef RECOMP_D3D8_WGPU
     if (ensure_host(dev)) {
         d3d7_sync_texture(dev, 0);
         d3d7_sync_texture(dev, 1);
-        D3d8Error err{};
-        int32_t status =
-            d3d8_device_draw_primitive((D3d8Device *)dev->d3d7_host, type, fvf, gm_ptr(verts),
-                                       vertex_bytes, stride, start_vertex, prims, &err);
-        if (status != 0)
-            draw_host_stop(method, err);
-        dev->d3d7->target_dirty = true;
+        const auto status = recomp::d3d::draw_primitive(
+            *dev->d3d7_host->value, type, fvf,
+            rust::Slice<const uint8_t>(gm_ptr(verts), vertex_bytes), stride, start_vertex, prims);
+        if (!d3d_bridge_ok(status))
+            draw_host_stop(method, status);
+        recomp::d3d::d3d7_set_target_dirty(*dev->d3d7->value, true);
         host_d3d7_draw();
         return;
     }
-#endif
     (void)dev;
     (void)type;
     (void)fvf;
@@ -2086,22 +1977,20 @@ void d3d7_submit_indexed(ComObj *dev, uint32_t type, uint32_t fvf, uint32_t vert
                          uint32_t vertex_bytes, uint32_t stride, uint32_t indices,
                          uint32_t index_bytes, uint32_t base_vertex, uint32_t min_index,
                          uint32_t num_vertices, uint32_t prims, const char *method) {
-#ifdef RECOMP_D3D8_WGPU
     if (ensure_host(dev)) {
         d3d7_sync_texture(dev, 0);
         d3d7_sync_texture(dev, 1);
-        D3d8Error err{};
-        int32_t status = d3d8_device_draw_indexed_primitive(
-            (D3d8Device *)dev->d3d7_host, type, fvf, gm_ptr(verts), vertex_bytes, stride,
-            gm_ptr(indices), index_bytes, 101 /* D3DFMT_INDEX16 */, base_vertex, min_index,
-            num_vertices, 0, prims, &err);
-        if (status != 0)
-            draw_host_stop(method, err);
-        dev->d3d7->target_dirty = true;
+        const auto status = recomp::d3d::draw_indexed_primitive(
+            *dev->d3d7_host->value, type, fvf,
+            rust::Slice<const uint8_t>(gm_ptr(verts), vertex_bytes), stride,
+            rust::Slice<const uint8_t>(gm_ptr(indices), index_bytes), 101, base_vertex, min_index,
+            num_vertices, 0, prims);
+        if (!d3d_bridge_ok(status))
+            draw_host_stop(method, status);
+        recomp::d3d::d3d7_set_target_dirty(*dev->d3d7->value, true);
         host_d3d7_draw();
         return;
     }
-#endif
     (void)dev;
     (void)type;
     (void)fvf;
@@ -2403,18 +2292,17 @@ const ComMethod g_vb7[] = {
 } // namespace
 
 bool d3d7_stage_surface(ComObj *s) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = s ? com_get(s->d3d7_target_device) : nullptr;
-    if (!dev || dev->kind != K_D3D7DEVICE || !dev->d3d7_host || !dev->d3d7->target_dirty ||
-        dev->d3d7_native_handoff_failed || (s->bpp != 16 && s->bpp != 32) ||
-        s->width != dev->d3d7_width || s->height != dev->d3d7_height)
+    if (!dev || dev->kind != K_D3D7DEVICE || !dev->d3d7_host ||
+        !recomp::d3d::d3d7_target_dirty(*dev->d3d7->value) || dev->d3d7_native_handoff_failed ||
+        (s->bpp != 16 && s->bpp != 32) || s->width != dev->d3d7_width ||
+        s->height != dev->d3d7_height)
         return false;
-    void *native = nullptr;
-    uint32_t *busy = nullptr;
-    uint32_t w = 0, h = 0;
-    D3d8Error err{};
-    if (d3d8_device_present_surface_handoff((D3d8Device *)dev->d3d7_host, s->bpp, &native, &busy,
-                                            &w, &h, &err) == 0) {
+    const auto result = recomp::d3d::present_handoff(*dev->d3d7_host->value, s->bpp);
+    if (host_ok(result.status, "PresentHandoff")) {
+        void *native = result.handoff.texture;
+        uint32_t *busy = result.handoff.busy;
+        const uint32_t w = result.handoff.width, h = result.handoff.height;
         ddraw_external_present_begin();
         if (host_display_stage_native_texture(native, (int)w, (int)h, busy))
             return true;
@@ -2422,11 +2310,7 @@ bool d3d7_stage_surface(ComObj *s) {
     }
     dev->d3d7_native_handoff_failed = true;
     log_once("d3d7.present.handoff",
-             "d3d7: native present handoff unavailable (%s); using CPU presentation",
-             err.message[0] ? (const char *)err.message : "host presenter declined the texture");
-#else
-    (void)s;
-#endif
+             "d3d7: native present handoff unavailable; using CPU presentation");
     return false;
 }
 
@@ -2441,146 +2325,37 @@ void d3d7_flush_surface(ComObj *s) {
 }
 
 // ---------------------------------------------------------------- translation
-// Pure D3D7 -> D3D8 tables. Declared in dx.h so dx_tests can check them
-// without a GPU; the forwarding code above calls them too.
-
-static bool is_d3d8_render_state(uint32_t s) {
-    switch (s) {
-    case 7:
-    case 8:
-    case 9:
-    case 10:
-    case 14:
-    case 15:
-    case 16:
-    case 19:
-    case 20:
-    case 22:
-    case 23:
-    case 24:
-    case 25:
-    case 26:
-    case 27:
-    case 28:
-    case 29:
-    case 30:
-    case 34:
-    case 35:
-    case 36:
-    case 37:
-    case 38:
-    case 40:
-    case 47:
-    case 48:
-    case 52:
-    case 53:
-    case 54:
-    case 55:
-    case 56:
-    case 57:
-    case 58:
-    case 59:
-    case 60:
-    case 128:
-    case 129:
-    case 130:
-    case 131:
-    case 132:
-    case 133:
-    case 134:
-    case 135:
-    case 136:
-    case 137:
-    case 139:
-    case 140:
-    case 141:
-    case 142:
-    case 143:
-    case 145:
-    case 146:
-    case 147:
-    case 148:
-    case 151:
-    case 152:
-    case 153:
-    case 154:
-    case 155:
-    case 156:
-    case 157:
-    case 158:
-    case 159:
-    case 160:
-    case 161:
-    case 162:
-    case 163:
-    case 164:
-    case 165:
-    case 166:
-    case 167:
-    case 168:
-    case 170:
-    case 171:
-    case 172:
-    case 173:
-        return true;
-    default:
-        return false;
-    }
-}
-
 D3d7StateMap d3d7_translate_render_state(uint32_t d3d7_state, uint32_t value,
                                          uint32_t *d3d8_state) {
+    const auto result = recomp::d3d::translate_render_state(d3d7_state, value);
     if (d3d8_state)
-        *d3d8_state = d3d7_state;
-    // D3DRS_TEXTUREPERSPECTIVE (4) is a D3D7-only state. The d3d8-wgpu
-    // fixed-function path perspective-corrects unconditionally, so no value
-    // it takes here can be honoured; ignoring it is a documented divergence
-    // (the game sets 0 = affine).
-    if (d3d7_state == 4)
-        return D3D7_STATE_IGNORE;
-    // D3DRS_COLORKEYENABLE (41) is also D3D7-only. D3D8 keying is per-texture
-    // alpha; value 0 (disabled, the D3D8 default) is exact to ignore, any
-    // other value would silently lose transparency and must stop loudly.
-    if (d3d7_state == 41)
-        return value == 0 ? D3D7_STATE_IGNORE : D3D7_STATE_INVALID;
-    if (is_d3d8_render_state(d3d7_state))
+        *d3d8_state = result.state;
+    switch (result.kind) {
+    case recomp::d3d::D3d7TranslationKind::Forward:
         return D3D7_STATE_FORWARD;
+    case recomp::d3d::D3d7TranslationKind::Ignore:
+        return D3D7_STATE_IGNORE;
+    case recomp::d3d::D3d7TranslationKind::Invalid:
+        return D3D7_STATE_INVALID;
+    }
     return D3D7_STATE_INVALID;
 }
 
 bool d3d7_translate_transform(uint32_t d3d7_state, uint32_t *d3d8_state) {
-    // D3D7 D3DTS_WORLD is 1, D3D8 D3DTS_WORLD is 256. VIEW (2), PROJECTION (3)
-    // and the texture matrices (16..23) share their values in both enums.
-    uint32_t out;
-    if (d3d7_state == 1 || d3d7_state == 256)
-        out = 256;
-    else if (d3d7_state == 2 || d3d7_state == 3)
-        out = d3d7_state;
-    else if (d3d7_state >= 16 && d3d7_state <= 23)
-        out = d3d7_state;
-    else
-        return false;
-    if (d3d8_state)
-        *d3d8_state = out;
-    return true;
+    const auto result = recomp::d3d::translate_transform(d3d7_state);
+    if (result.valid && d3d8_state)
+        *d3d8_state = result.state;
+    return result.valid;
 }
 
 int d3d7_translate_texture_stage_state(uint32_t d3d7_type, uint32_t out[2]) {
-    // D3DTSS_TEXCOORDINDEX is 11 in both. D3D7's D3DTSS_ADDRESS (12) was split
-    // in D3D8 into ADDRESSU (13) and ADDRESSV (14); forwarding it to both is
-    // the exact equivalent for the engine, which sets only the pair.
-    if (d3d7_type == 12) {
-        out[0] = 13;
-        out[1] = 14;
-        return 2;
+    const auto result = recomp::d3d::translate_texture_stage_state(d3d7_type);
+    if (result.count > 0 && out) {
+        out[0] = result.first;
+        if (result.count > 1)
+            out[1] = result.second;
     }
-    // Every other D3D8 stage state has the same number in D3D7 (1..11,
-    // 13..28). D3D8 has no 12.
-    if ((d3d7_type >= 1 && d3d7_type <= 11) || (d3d7_type >= 13 && d3d7_type <= 28)) {
-        out[0] = d3d7_type;
-        return 1;
-    }
-    return -1;
+    return result.count;
 }
 
 uint16_t d3d7_rgb888_to_rgb565(uint32_t argb) {
@@ -2692,29 +2467,23 @@ bool d3d7_trace_small_flush(D3d7TraceSmallCollapser *c, std::string *collapsed) 
 // Releasing a device also releases the render target and every bound texture
 // it retained. Registered with com_set_destructor so com_destroy runs it.
 void d3d7_device_destroy(ComObj *dev) {
+    dev->d3d7_host.reset();
     if (!dev->d3d7)
         return;
-#ifdef RECOMP_D3D8_WGPU
-    if (dev->d3d7_host) {
-        d3d8_device_destroy((D3d8Device *)dev->d3d7_host);
-        dev->d3d7_host = nullptr;
-    }
-#endif
-    for (uint32_t &id : dev->d3d7->texture) {
-        if (id) {
-            if (ComObj *t = com_get(id))
-                com_release(t);
-            id = 0;
-        }
-    }
-    if (dev->d3d7->render_target) {
-        if (ComObj *s = com_get(dev->d3d7->render_target)) {
+    const auto retained = recomp::d3d::d3d7_release_refs(*dev->d3d7->value);
+    for (uint32_t id : retained.values)
+        if (ComObj *texture = com_get(id))
+            com_release(texture);
+    const uint32_t target_id = recomp::d3d::d3d7_get_render_target(*dev->d3d7->value);
+    if (target_id) {
+        if (ComObj *s = com_get(target_id)) {
             if (s->d3d7_target_device == dev->id)
                 s->d3d7_target_device = 0;
             com_release(s);
         }
-        dev->d3d7->render_target = 0;
+        recomp::d3d::d3d7_set_render_target(*dev->d3d7->value, 0);
     }
+    dev->d3d7.reset();
 }
 
 void d3d7_vb_destroy(ComObj *vb) {

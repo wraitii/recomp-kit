@@ -1306,7 +1306,7 @@ impl Device {
     /// viewport for an empty slice. Independent clear passes preserve draw order.
     pub fn clear(
         &mut self,
-        rects: &[crate::abi::D3d8Rect],
+        rects: &[crate::d3d8::state::Rect],
         flags: u32,
         argb: u32,
         z: f32,

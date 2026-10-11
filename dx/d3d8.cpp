@@ -5,6 +5,7 @@
 #include "dx.h"
 #include "d3d8_fpu.h"
 #include "frame_dump.h"
+#include "d3d_bridge_helpers.h"
 #include "../runtime/guest.h"
 #include "../runtime/memory.h"
 #include "../runtime/native_seam.h"
@@ -17,13 +18,10 @@
 
 #include <string.h>
 #include <algorithm>
+#include <array>
 #include <vector>
 #include <string>
 #include <new>
-
-#ifdef RECOMP_D3D8_RESOURCES
-#include "d3d8_abi.h"
-#endif
 
 namespace {
 
@@ -75,39 +73,7 @@ constexpr uint32_t D8_AVAILABLE_TEXTURE_MEM = 384u * 1024u * 1024u;
 // Format numbers follow the pinned Wine D3D8 headers
 // (graphics/d3d8-wgpu/reference/wine/d3d8types.h).
 uint32_t d8_format_bytes(uint32_t fmt) {
-#ifdef RECOMP_D3D8_RESOURCES
-    return d3d8_format_bytes(fmt);
-#else
-    switch (fmt) {
-    case D3DFMT_A8R8G8B8:
-    case D3DFMT_X8R8G8B8:
-        return 4;
-    case D3DFMT_R5G6B5:
-    case 24: // X1R5G5B5
-    case 25: // A1R5G5B5
-    case 26: // A4R4G4B4
-    case 29: // A8R3G3B2
-    case 30: // X4R4G4B4
-    case 60: // V8U8: signed U then V bytes
-    case 51: // A8L8
-        return 2;
-    case 27: // R3G3B2
-    case 28: // A8
-    case 50: // L8
-    case 52: // A4L4
-        return 1;
-    case 31: // A2B10G10R10
-    case 32: // A8B8G8R8
-    case 33: // X8B8G8R8
-    case 34: // G16R16
-    case 35: // A2R10G10B10
-        return 4;
-    case 36: // A16B16G16R16
-        return 8;
-    default:
-        return 0;
-    }
-#endif
+    return recomp::d3d::format_bytes(fmt);
 }
 
 // Bytes per 4x4 block for the S3TC/BC formats the Rust renderer decodes at
@@ -115,7 +81,7 @@ uint32_t d8_format_bytes(uint32_t fmt) {
 // The guest's compressed bytes are authoritative in CPU storage; a level's
 // pitch and size are block-based (see d3d8_texture_level_layout).
 uint32_t d8_block_bytes(uint32_t fmt) {
-    return fmt == D3DFMT_DXT1 ? 8u : (fmt == D3DFMT_DXT3 || fmt == D3DFMT_DXT5 ? 16u : 0u);
+    return recomp::d3d::block_bytes(fmt);
 }
 
 // Adapter facts. d3d8_adapter_info builds a wgpu context, so query it once.
@@ -123,9 +89,7 @@ uint32_t d8_block_bytes(uint32_t fmt) {
 struct AdapterCache {
     bool queried = false;
     bool valid = false;
-#ifdef RECOMP_D3D8_WGPU
-    D3d8AdapterInfo info{};
-#endif
+    recomp::d3d::AdapterInfo info{};
 };
 AdapterCache &adapter_cache() {
     static AdapterCache c;
@@ -137,24 +101,17 @@ bool ensure_adapter() {
     if (c.queried)
         return c.valid;
     c.queried = true;
-#ifdef RECOMP_D3D8_WGPU
-    D3d8Error err{};
-    if (d3d8_abi_version() != D3D8_ABI_VERSION) {
-        fprintf(stderr, "d3d8: incompatible host renderer ABI\n");
-        fflush(stderr);
-        return false;
-    }
-    if (d3d8_adapter_info(&c.info, &err) == 0) {
+    auto result = recomp::d3d::adapter_info();
+    if (result.status.code == recomp::d3d::StatusCode::Ok) {
+        c.info = std::move(result.info);
         c.valid = true;
-        LOGW("d3d8: adapter %s vendor=0x%04x device=0x%04x max_texture=%u",
-             reinterpret_cast<const char *>(c.info.name), c.info.vendor_id, c.info.device_id,
-             c.info.max_texture_dimension_2d);
+        std::string name(c.info.name.data(), c.info.name.size());
+        LOGW("d3d8: adapter %s vendor=0x%04x device=0x%04x max_texture=%u", name.c_str(),
+             c.info.vendor_id, c.info.device_id, c.info.max_texture_dimension_2d);
     } else {
-        LOGW("d3d8: adapter query failed: %s", reinterpret_cast<const char *>(err.message));
+        std::string message(result.status.message.data(), result.status.message.size());
+        LOGW("d3d8: adapter query failed: %s", message.c_str());
     }
-#else
-    LOGW("d3d8: built without the Rust wgpu renderer (RECOMP_D3D8_WGPU)");
-#endif
     return c.valid;
 }
 
@@ -168,14 +125,52 @@ ComObj *d8_tex(X86 *c) {
     return com_this_arg(c, IF_D3D8TEXTURE8);
 }
 
-#ifdef RECOMP_D3D8_WGPU
-static D3d8Device *host_device(ComObj *o) {
-    return static_cast<D3d8Device *>(o->d3d8_device);
-}
-#endif
+D3dHostDevice *d8_cpu_state(ComObj *dev);
+bool d8_pixel_shader_bound(ComObj *dev);
+uint32_t d8_selected_vertex_shader(ComObj *dev);
 
-// Objects have stable host addresses until com_reset. Reset must release GPU
-// handles itself: com_reset discards objects without running their destructors.
+recomp::d3d::DeviceInfo d8_device_info(ComObj *dev) {
+    return recomp::d3d::device_info(*d8_cpu_state(dev)->value).info;
+}
+
+uint32_t d8_bound_texture(ComObj *dev, uint32_t stage) {
+    auto result = recomp::d3d::bound_texture(*d8_cpu_state(dev)->value, stage);
+    return d3d_bridge_ok(result.status) ? result.value : 0;
+}
+
+D3dHostResource *d8_resource(ComObj *object) {
+    if (!object->d3d8_resource)
+        object->d3d8_resource = std::make_shared<D3dHostResource>();
+    return object->d3d8_resource.get();
+}
+
+recomp::d3d::ResourceInfo d8_resource_info(ComObj *object) {
+    return d8_resource(object)->info();
+}
+
+void d8_set_resource_flags(ComObj *object, uint32_t usage, uint32_t pool, bool depth,
+                           bool gpu_target, uint32_t buffer_fvf, uint32_t index_format,
+                           uint32_t buffer_usage, uint32_t buffer_pool) {
+    d8_resource(object)->set_flags(usage, pool, depth, gpu_target, buffer_fvf, index_format,
+                                   buffer_usage, buffer_pool);
+}
+
+void d8_set_gpu_target(ComObj *object, bool value) {
+    auto info = d8_resource_info(object);
+    d8_set_resource_flags(object, info.usage, info.pool, info.depth, value, info.buffer_fvf,
+                          info.index_format, info.buffer_usage, info.buffer_pool);
+}
+
+uint64_t d8_resource_level_generation(ComObj *object, uint32_t level = 0) {
+    auto result = d8_resource(object)->level(level);
+    return d3d_bridge_ok(result.status) ? result.level.generation : 0;
+}
+
+uint64_t d8_bump_resource_level_generation(ComObj *object, uint32_t level = 0) {
+    auto result = d8_resource(object)->bump_level_generation(level);
+    return d3d_bridge_ok(result.status) ? result.generation : 0;
+}
+
 std::unordered_set<ComObj *> live_devices;
 
 std::unordered_set<ComObj *> live_resources;
@@ -183,27 +178,16 @@ std::unordered_set<ComObj *> live_resources;
 uint8_t *storage_data(ComObj *o) {
     if (o->d3d8_guest_backing)
         return gm_ptr(o->d3d8_guest_backing);
-#ifdef RECOMP_D3D8_RESOURCES
-    return d3d8_storage_data(static_cast<D3d8Storage *>(o->d3d8_storage));
-#else
-    return o->blob.empty() ? nullptr : o->blob.data();
-#endif
+    return o->d3d8_storage ? o->d3d8_storage->bytes_mut().data() : nullptr;
 }
 bool storage_alloc(ComObj *o, uint32_t bytes) {
     if (!bytes)
         return false;
-#ifdef RECOMP_D3D8_RESOURCES
-    D3d8Error err{};
-    o->d3d8_storage = d3d8_storage_create(bytes, &err);
-    if (!o->d3d8_storage)
-        return false;
-#else
-    try {
-        o->blob.assign(bytes, 0);
-    } catch (const std::bad_alloc &) {
+    o->d3d8_storage = std::make_shared<D3dHostStorage>();
+    if (!d3d_bridge_ok(recomp::d3d::allocate_storage(*o->d3d8_storage->value, bytes))) {
+        o->d3d8_storage.reset();
         return false;
     }
-#endif
     o->pixels_bytes = bytes;
     live_resources.insert(o);
     return true;
@@ -215,29 +199,26 @@ void storage_destroy(ComObj *o) {
         o->pixels = 0;
         o->lock_count = 0;
     }
-#ifdef RECOMP_D3D8_RESOURCES
-    d3d8_storage_destroy(static_cast<D3d8Storage *>(o->d3d8_storage));
-    o->d3d8_storage = nullptr;
-#else
-    o->blob.clear();
-#endif
+    o->d3d8_storage.reset();
     o->pixels_bytes = 0;
     live_resources.erase(o);
 }
 
-#ifdef RECOMP_D3D8_WGPU
-uint32_t host_result(X86 *c, int32_t status, const D3d8Error &err) {
-    if (status == D3D8_STATUS_OK)
+uint32_t bridge_result(X86 *c, const recomp::d3d::Status &status) {
+    if (d3d_bridge_ok(status))
         return D8_OK;
-    fprintf(stderr, "d3d8: %s\n", reinterpret_cast<const char *>(err.message));
+    std::string message(status.message.data(), status.message.size());
+    fprintf(stderr, "d3d8: %s\n", message.c_str());
     fflush(stderr);
-    if (status == D3D8_STATUS_UNSUPPORTED || status == D3D8_STATUS_NOT_IMPLEMENTED)
+    if (status.code == recomp::d3d::StatusCode::Unsupported ||
+        status.code == recomp::d3d::StatusCode::NotImplemented)
         imports_unsupported(c);
-    return status == D3D8_STATUS_INVALID_ARGUMENT ? D8_ERR_INVALIDCALL
-           : status == D3D8_STATUS_OUT_OF_MEMORY  ? E_OUTOFMEMORY
-                                                  : D8_ERR_NOTAVAILABLE;
+    if (status.code == recomp::d3d::StatusCode::InvalidArgument)
+        return D8_ERR_INVALIDCALL;
+    if (status.code == recomp::d3d::StatusCode::OutOfMemory)
+        return E_OUTOFMEMORY;
+    return D8_ERR_NOTAVAILABLE;
 }
-#endif
 
 // ---------------------------------------------------------------------------
 // D3DCAPS8 describes this bounded renderer, not wgpu's potential capabilities.
@@ -563,8 +544,8 @@ void D8_GetAdapterIdentifier(X86 *c) {
     memset(gm_ptr(out), 0, 1068);
 #ifdef RECOMP_D3D8_WGPU
     strncpy((char *)gm_ptr(out), "wgpu", 511);
-    strncpy((char *)gm_ptr(out + 512), reinterpret_cast<const char *>(adapter_cache().info.name),
-            511);
+    const auto &name = adapter_cache().info.name;
+    memcpy(gm_ptr(out + 512), name.data(), std::min<size_t>(name.size(), 511));
     wr32(out + 1032, adapter_cache().info.vendor_id);
     wr32(out + 1036, adapter_cache().info.device_id);
 #endif
@@ -672,15 +653,12 @@ void D8_GetAdapterMonitor(X86 *c) {
     com_ret(c, arg(c, 1) == 0 && ensure_adapter() ? 1 : 0);
 }
 
-// Internal surface references preserve storage/identity without retaining the
-// device in return. An external AddRef (including GetRenderTarget) restores
-// device ownership; its final Release drops it, avoiding a binding cycle.
-void surface_refs_changed(ComObj *surface) {
-    const bool external = surface->refs > surface->internal_refs;
-    ComObj *dev = com_get(surface->d3d8_owner);
-    if (!dev || external == surface->d3d8_owner_retained)
+void resource_refs_changed(ComObj *resource) {
+    const bool external = resource->refs > resource->internal_refs;
+    ComObj *dev = com_get(resource->d3d8_owner);
+    if (!dev || external == resource->d3d8_owner_retained)
         return;
-    surface->d3d8_owner_retained = external;
+    resource->d3d8_owner_retained = external;
     if (external)
         com_addref(dev);
     else
@@ -698,12 +676,6 @@ void device_unbind_targets(ComObj *dev) {
         com_release_internal(o);
 }
 
-// A device-owned implicit surface. Real D3D8 keeps the implicit swap-chain
-// color and depth surfaces alive until the device is reset or released, so the
-// device holds one internal reference and the guest's Get* result is an
-// additional AddRef. That reference is what surface_refs_changed turns into
-// device retention; internal ownership does not retain the device, so there is
-// no device <-> surface cycle.
 ComObj *device_implicit_surface(ComObj *dev, uint32_t w, uint32_t h, uint32_t format, bool depth) {
     ComObj *surface = com_new(K_D3D8SURFACE);
     if (!surface)
@@ -712,8 +684,8 @@ ComObj *device_implicit_surface(ComObj *dev, uint32_t w, uint32_t h, uint32_t fo
     surface->width = w;
     surface->height = h;
     surface->rmask = format;
-    surface->d3d8_depth = depth;
-    surface->d3d8_usage = depth ? D3DUSAGE_DEPTHSTENCIL : D3DUSAGE_RENDERTARGET;
+    d8_resource(surface)->set_flags(depth ? D3DUSAGE_DEPTHSTENCIL : D3DUSAGE_RENDERTARGET,
+                                    D3DPOOL_DEFAULT, depth, !depth, 0, 0, 0, 0);
     com_internalize(surface); // the device's ownership reference
     return surface;
 }
@@ -816,11 +788,25 @@ void D8_CreateDevice(X86 *c) {
     dev->d3d8_height = h;
     dev->d3d8_format = format;
     dev->d3d8_depth_format = depth ? depth_format : 0;
-    D3d8Error err{};
-    dev->d3d8_device = d3d8_device_create(w, h, format, depth ? depth_format : 0, &err);
-    if (!dev->d3d8_device) {
+    D3dHostDevice *cpu = d8_cpu_state(dev);
+    auto dimensions = recomp::d3d::set_device_dimensions(*cpu->value, w, h);
+    if (!d3d_bridge_ok(dimensions)) {
         com_release(dev);
-        com_ret(c, host_result(c, err.status ? err.status : D3D8_STATUS_BACKEND, err));
+        com_ret(c, bridge_result(c, dimensions));
+        return;
+    }
+    auto format_status =
+        recomp::d3d::set_device_format(*cpu->value, format, depth ? depth_format : 0);
+    if (!d3d_bridge_ok(format_status)) {
+        com_release(dev);
+        com_ret(c, bridge_result(c, format_status));
+        return;
+    }
+    auto init_status =
+        recomp::d3d::initialize_gpu(*cpu->value, w, h, format, depth ? depth_format : 0);
+    if (!d3d_bridge_ok(init_status)) {
+        com_release(dev);
+        com_ret(c, bridge_result(c, init_status));
         return;
     }
     // The default depth binding is logical until a guest asks for a handle.
@@ -859,20 +845,14 @@ void device_discard_implicit_surfaces(ComObj *dev) {
     dev->d3d8_depth_detached = false;
 }
 
-// (this, pPresentationParameters). D3D8 Reset recreates the implicit swap
-// chain and resets device state. The guest 52-byte D3DPRESENT_PARAMETERS is
-// copied into the plain ABI struct; validation and the target/state rebuild
-// live in Rust. Here we only retire the two guest implicit-surface handles so
-// they are lazily recreated against the new target.
 void Dev_Reset(X86 *c) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     uint32_t pp = arg(c, 1);
     if (!dev || !dev->d3d8_device || !pp || !gm_valid(pp, 52)) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    D3d8PresentParams params{};
+    recomp::d3d::PresentParams params{};
     params.back_buffer_width = rd32(pp);
     params.back_buffer_height = rd32(pp + 4);
     params.back_buffer_format = rd32(pp + 8);
@@ -886,17 +866,12 @@ void Dev_Reset(X86 *c) {
     params.flags = rd32(pp + 40);
     params.fullscreen_refresh_rate = rd32(pp + 44);
     params.fullscreen_presentation_interval = rd32(pp + 48);
-    LOGV("d3d8: Reset params %ux%u fmt=0x%x count=%u ms=%u swap=%u hwnd=0x%x windowed=%u "
-         "autodepth=%u autofmt=0x%x flags=0x%x refresh=%u interval=%u",
-         params.back_buffer_width, params.back_buffer_height, params.back_buffer_format,
-         params.back_buffer_count, params.multisample_type, params.swap_effect,
-         params.device_window, params.windowed, params.enable_auto_depth_stencil,
-         params.auto_depth_stencil_format, params.flags, params.fullscreen_refresh_rate,
-         params.fullscreen_presentation_interval);
-    D3d8Error err{};
-    int32_t status = d3d8_device_reset(host_device(dev), &params, &err);
-    if (status) {
-        com_ret(c, host_result(c, status, err));
+    std::array<uint32_t, 8> bound_textures{};
+    for (uint32_t stage = 0; stage < bound_textures.size(); ++stage)
+        bound_textures[stage] = d8_bound_texture(dev, stage);
+    auto status = recomp::d3d::reset_device(*dev->d3d8_device->value, params);
+    if (!d3d_bridge_ok(status)) {
+        com_ret(c, bridge_result(c, status));
         return;
     }
     dev->d3d8_width = params.back_buffer_width;
@@ -905,16 +880,11 @@ void Dev_Reset(X86 *c) {
     dev->d3d8_depth_format =
         params.enable_auto_depth_stencil ? params.auto_depth_stencil_format : 0;
     device_discard_implicit_surfaces(dev);
-    dev->d3d8_fvf = 0;
-    if (dev->d3d8_constants) {
-        dev->d3d8_constants->pixel_shader = 0;
-        memset(dev->d3d8_constants->vconst, 0, sizeof(dev->d3d8_constants->vconst));
-        memset(dev->d3d8_constants->pconst, 0, sizeof(dev->d3d8_constants->pconst));
+    for (uint32_t texture_id : bound_textures) {
+        if (ComObj *texture = com_get(texture_id))
+            com_release_internal(texture);
     }
     com_ret(c, D8_OK);
-#else
-    com_ret(c, D8_ERR_NOTAVAILABLE);
-#endif
 }
 
 void Dev_TestCooperativeLevel(X86 *c) {
@@ -982,31 +952,24 @@ void Dev_GetDeviceCaps(X86 *c) {
     com_ret(c, D8_OK);
 }
 void Dev_BeginScene(X86 *c) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     if (dev && dev->d3d8_device) {
-        D3d8Error err{};
-        int32_t status = d3d8_device_begin_scene(host_device(dev), &err);
-        com_ret(c, host_result(c, status, err));
+        auto status = recomp::d3d::begin_scene(*dev->d3d8_device->value);
+        com_ret(c, bridge_result(c, status));
         return;
     }
-#endif
     com_ret(c, D8_ERR_INVALIDCALL);
 }
 void Dev_EndScene(X86 *c) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     if (dev && dev->d3d8_device) {
-        D3d8Error err{};
-        int32_t status = d3d8_device_end_scene(host_device(dev), &err);
-        com_ret(c, host_result(c, status, err));
+        auto status = recomp::d3d::end_scene(*dev->d3d8_device->value);
+        com_ret(c, bridge_result(c, status));
         return;
     }
-#endif
     com_ret(c, D8_ERR_INVALIDCALL);
 }
 void Dev_Clear(X86 *c) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     if (dev && dev->d3d8_device) {
         // (this, Count, pRects, Flags, Color, Z, Stencil). The Rust backend
@@ -1018,196 +981,185 @@ void Dev_Clear(X86 *c) {
         LOGV("d3d8: Clear rects=%u flags=0x%x color=0x%08x z=%g stencil=%u", arg(c, 1), arg(c, 3),
              arg(c, 4), z, arg(c, 6));
         uint32_t count = arg(c, 1), rects = arg(c, 2);
-        uint64_t bytes = uint64_t(count) * sizeof(D3d8Rect);
+        uint64_t bytes = uint64_t(count) * 16;
         if (count && (!rects || bytes > UINT32_MAX || !gm_valid(rects, uint32_t(bytes)))) {
             com_ret(c, D8_ERR_INVALIDCALL);
             return;
         }
         // Snapshot unaligned guest memory into aligned host records.
-        std::vector<D3d8Rect> rectangles(count);
-        if (count)
-            memcpy(rectangles.data(), gm_ptr(rects), size_t(bytes));
-        D3d8Error err{};
-        int32_t status = d3d8_device_clear(host_device(dev), count, rectangles.data(), arg(c, 3),
-                                           arg(c, 4), z, arg(c, 6), &err);
-        com_ret(c, host_result(c, status, err));
+        std::vector<recomp::d3d::Rect> rectangles(count);
+        for (uint32_t index = 0; index < count; ++index) {
+            uint32_t source = rects + index * 16;
+            rectangles[index] = {int32_t(rd32(source)), int32_t(rd32(source + 4)),
+                                 int32_t(rd32(source + 8)), int32_t(rd32(source + 12))};
+        }
+        auto status = recomp::d3d::clear(
+            *dev->d3d8_device->value,
+            rust::Slice<const recomp::d3d::Rect>(rectangles.data(), rectangles.size()), arg(c, 3),
+            arg(c, 4), z, arg(c, 6));
+        com_ret(c, bridge_result(c, status));
         return;
     }
-#endif
     com_ret(c, D8_ERR_INVALIDCALL);
 }
 void Dev_SetTransform(X86 *c) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     uint32_t matrix = arg(c, 2);
     if (dev && dev->d3d8_device && matrix && gm_valid(matrix, 64)) {
-        D3d8Matrix value;
-        memcpy(&value, gm_ptr(matrix), sizeof value); // Guest may be unaligned.
-        D3d8Error err{};
-        int32_t status = d3d8_device_set_transform(host_device(dev), arg(c, 1), &value, &err);
-        com_ret(c, host_result(c, status, err));
+        std::array<float, 16> value;
+        memcpy(value.data(), gm_ptr(matrix), 64);
+        auto status =
+            recomp::d3d::set_transform(*dev->d3d8_device->value, arg(c, 1),
+                                       rust::Slice<const float>(value.data(), value.size()));
+        com_ret(c, bridge_result(c, status));
         return;
     }
-#endif
     com_ret(c, D8_ERR_INVALIDCALL);
 }
 void Dev_SetViewport(X86 *c) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     uint32_t vp = arg(c, 1);
     if (dev && dev->d3d8_device && vp && gm_valid(vp, 24)) {
         float min_z, max_z;
         memcpy(&min_z, gm_ptr(vp + 16), 4);
         memcpy(&max_z, gm_ptr(vp + 20), 4);
-        D3d8Error err{};
-        int32_t status = d3d8_device_set_viewport(host_device(dev), rd32(vp), rd32(vp + 4),
-                                                  rd32(vp + 8), rd32(vp + 12), min_z, max_z, &err);
-        com_ret(c, host_result(c, status, err));
+        recomp::d3d::Viewport value{rd32(vp),      rd32(vp + 4), rd32(vp + 8),
+                                    rd32(vp + 12), min_z,        max_z};
+        auto status = recomp::d3d::set_viewport(*dev->d3d8_device->value, value);
+        com_ret(c, bridge_result(c, status));
         return;
     }
-#endif
     com_ret(c, D8_ERR_INVALIDCALL);
 }
-// (this, D3DVIEWPORT8 *pViewport). D3D8 returns the viewport currently set,
-// not a query of the host rasterizer, so an out-of-range SetViewport value is
-// still reported back verbatim.
 void Dev_GetViewport(X86 *c) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     uint32_t out = arg(c, 1);
     if (dev && dev->d3d8_device && out && gm_valid(out, 24)) {
-        D3d8Viewport vp{};
-        D3d8Error err{};
-        int32_t status = d3d8_device_get_viewport(host_device(dev), &vp, &err);
-        if (status == D3D8_STATUS_OK) {
-            wr32(out + 0, vp.x);
-            wr32(out + 4, vp.y);
-            wr32(out + 8, vp.width);
-            wr32(out + 12, vp.height);
-            memcpy(gm_ptr(out + 16), &vp.min_z, 4);
-            memcpy(gm_ptr(out + 20), &vp.max_z, 4);
+        auto result = recomp::d3d::get_viewport(*dev->d3d8_device->value);
+        if (d3d_bridge_ok(result.status)) {
+            wr32(out, result.viewport.x);
+            wr32(out + 4, result.viewport.y);
+            wr32(out + 8, result.viewport.width);
+            wr32(out + 12, result.viewport.height);
+            memcpy(gm_ptr(out + 16), &result.viewport.min_z, 4);
+            memcpy(gm_ptr(out + 20), &result.viewport.max_z, 4);
         }
-        com_ret(c, host_result(c, status, err));
+        com_ret(c, bridge_result(c, result.status));
         return;
     }
-#endif
     com_ret(c, D8_ERR_INVALIDCALL);
 }
 void Dev_SetMaterial(X86 *c) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     uint32_t p = arg(c, 1);
-    if (dev && dev->d3d8_device && p && gm_valid(p, sizeof(D3d8Material))) {
-        D3d8Material material;
-        memcpy(&material, gm_ptr(p), sizeof material);
-        D3d8Error err{};
-        int32_t status = d3d8_device_set_material(host_device(dev), &material, &err);
-        com_ret(c, host_result(c, status, err));
+    if (dev && dev->d3d8_device && p && gm_valid(p, 68)) {
+        float v[17];
+        memcpy(v, gm_ptr(p), sizeof v);
+        recomp::d3d::Material material{v[0], v[1],  v[2],  v[3],  v[4],  v[5],  v[6],  v[7], v[8],
+                                       v[9], v[10], v[11], v[12], v[13], v[14], v[15], v[16]};
+        auto status = recomp::d3d::set_material(*dev->d3d8_device->value, material);
+        com_ret(c, bridge_result(c, status));
         return;
     }
-#endif
     com_ret(c, D8_ERR_INVALIDCALL);
 }
 void Dev_GetMaterial(X86 *c) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     uint32_t p = arg(c, 1);
-    if (dev && dev->d3d8_device && p && gm_valid(p, sizeof(D3d8Material))) {
-        D3d8Material material{};
-        D3d8Error err{};
-        int32_t status = d3d8_device_get_material(host_device(dev), &material, &err);
-        if (status == D3D8_STATUS_OK)
-            memcpy(gm_ptr(p), &material, sizeof material);
-        com_ret(c, host_result(c, status, err));
+    if (dev && dev->d3d8_device && p && gm_valid(p, 68)) {
+        auto result = recomp::d3d::get_material(*dev->d3d8_device->value);
+        if (d3d_bridge_ok(result.status)) {
+            const auto &m = result.material;
+            float v[17] = {m.diffuse_r,  m.diffuse_g,  m.diffuse_b,  m.diffuse_a,  m.ambient_r,
+                           m.ambient_g,  m.ambient_b,  m.ambient_a,  m.specular_r, m.specular_g,
+                           m.specular_b, m.specular_a, m.emissive_r, m.emissive_g, m.emissive_b,
+                           m.emissive_a, m.power};
+            memcpy(gm_ptr(p), v, sizeof v);
+        }
+        com_ret(c, bridge_result(c, result.status));
         return;
     }
-#endif
     com_ret(c, D8_ERR_INVALIDCALL);
 }
 // (this, Index, pLight). D3D8 accepts eight active lights; an out-of-range
 // index is INVALIDCALL from the backend, not a fail-loud unsupported call.
 void Dev_SetLight(X86 *c) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     uint32_t p = arg(c, 2);
-    if (dev && dev->d3d8_device && p && gm_valid(p, sizeof(D3d8Light))) {
-        D3d8Light light;
-        memcpy(&light, gm_ptr(p), sizeof light);
-        D3d8Error err{};
-        int32_t status = d3d8_device_set_light(host_device(dev), arg(c, 1), &light, &err);
-        com_ret(c, host_result(c, status, err));
+    if (dev && dev->d3d8_device && p && gm_valid(p, 104)) {
+        uint32_t type = rd32(p);
+        float f[25];
+        memcpy(f, gm_ptr(p + 4), sizeof f);
+        recomp::d3d::Light light{type,  f[0],  f[1],  f[2],  f[3],  f[4],  f[5],  f[6],  f[7],
+                                 f[8],  f[9],  f[10], f[11], f[12], f[13], f[14], f[15], f[16],
+                                 f[17], f[18], f[19], f[20], f[21], f[22], f[23], f[24]};
+        auto status = recomp::d3d::set_light(*dev->d3d8_device->value, arg(c, 1), light);
+        com_ret(c, bridge_result(c, status));
         return;
     }
-#endif
     com_ret(c, D8_ERR_INVALIDCALL);
 }
 void Dev_GetLight(X86 *c) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     uint32_t p = arg(c, 2);
-    if (dev && dev->d3d8_device && p && gm_valid(p, sizeof(D3d8Light))) {
-        D3d8Light light{};
-        D3d8Error err{};
-        int32_t status = d3d8_device_get_light(host_device(dev), arg(c, 1), &light, &err);
-        if (status == D3D8_STATUS_OK)
-            memcpy(gm_ptr(p), &light, sizeof light);
-        com_ret(c, host_result(c, status, err));
+    if (dev && dev->d3d8_device && p && gm_valid(p, 104)) {
+        auto result = recomp::d3d::get_light(*dev->d3d8_device->value, arg(c, 1));
+        if (d3d_bridge_ok(result.status)) {
+            const auto &l = result.light;
+            uint32_t type = l.light_type;
+            float f[25] = {
+                l.diffuse_r,    l.diffuse_g,    l.diffuse_b,    l.diffuse_a,  l.specular_r,
+                l.specular_g,   l.specular_b,   l.specular_a,   l.ambient_r,  l.ambient_g,
+                l.ambient_b,    l.ambient_a,    l.position_x,   l.position_y, l.position_z,
+                l.direction_x,  l.direction_y,  l.direction_z,  l.range,      l.falloff,
+                l.attenuation0, l.attenuation1, l.attenuation2, l.theta,      l.phi};
+            wr32(p, type);
+            memcpy(gm_ptr(p + 4), f, sizeof f);
+        }
+        com_ret(c, bridge_result(c, result.status));
         return;
     }
-#endif
     com_ret(c, D8_ERR_INVALIDCALL);
 }
 void Dev_LightEnable(X86 *c) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     if (dev && dev->d3d8_device) {
-        D3d8Error err{};
-        int32_t status = d3d8_device_light_enable(host_device(dev), arg(c, 1), arg(c, 2), &err);
-        com_ret(c, host_result(c, status, err));
+        auto status =
+            recomp::d3d::light_enable(*dev->d3d8_device->value, arg(c, 1), arg(c, 2) != 0);
+        com_ret(c, bridge_result(c, status));
         return;
     }
-#endif
     com_ret(c, D8_ERR_INVALIDCALL);
 }
 void Dev_GetLightEnable(X86 *c) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     uint32_t out = arg(c, 2);
     if (dev && dev->d3d8_device && out && gm_valid(out, 4)) {
-        uint32_t enabled = 0;
-        D3d8Error err{};
-        int32_t status = d3d8_device_get_light_enable(host_device(dev), arg(c, 1), &enabled, &err);
-        if (status == D3D8_STATUS_OK)
-            wr32(out, enabled);
-        com_ret(c, host_result(c, status, err));
+        auto result = recomp::d3d::get_light_enable(*dev->d3d8_device->value, arg(c, 1));
+        if (d3d_bridge_ok(result.status))
+            wr32(out, result.value ? 1 : 0);
+        com_ret(c, bridge_result(c, result.status));
         return;
     }
-#endif
     com_ret(c, D8_ERR_INVALIDCALL);
 }
 void Dev_SetRenderState(X86 *c) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     if (dev && dev->d3d8_device) {
-        D3d8Error err{};
-        int32_t status = d3d8_device_set_render_state(host_device(dev), arg(c, 1), arg(c, 2), &err);
-        com_ret(c, host_result(c, status, err));
+        auto status = recomp::d3d::set_render_state(*dev->d3d8_device->value, arg(c, 1), arg(c, 2));
+        com_ret(c, bridge_result(c, status));
         return;
     }
-#endif
     com_ret(c, D8_ERR_INVALIDCALL);
 }
 void Dev_SetTextureStageState(X86 *c) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     if (dev && dev->d3d8_device) {
-        D3d8Error err{};
-        int32_t status = d3d8_device_set_texture_stage_state(host_device(dev), arg(c, 1), arg(c, 2),
-                                                             arg(c, 3), &err);
-        com_ret(c, host_result(c, status, err));
+        auto status = recomp::d3d::set_texture_stage_state(*dev->d3d8_device->value, arg(c, 1),
+                                                           arg(c, 2), arg(c, 3));
+        com_ret(c, bridge_result(c, status));
         return;
     }
-#endif
     com_ret(c, D8_ERR_INVALIDCALL);
 }
 // (this, Stage, pTexture). The device holds a reference to the bound texture
@@ -1225,12 +1177,19 @@ void Dev_SetTexture(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    ComObj *old = com_get(dev->d3d8_bound_texture[stage]);
-    if (tex)
-        com_addref(tex);
-    dev->d3d8_bound_texture[stage] = tex ? tex->id : 0;
-    if (old && old != tex)
-        com_release(old);
+    auto binding =
+        recomp::d3d::set_bound_texture(*d8_cpu_state(dev)->value, stage, tex ? tex->id : 0);
+    if (!d3d_bridge_ok(binding.status)) {
+        com_ret(c, bridge_result(c, binding.status));
+        return;
+    }
+    ComObj *old = com_get(binding.old_id);
+    if (old != tex) {
+        if (tex)
+            com_retain_internal(tex);
+        if (old)
+            com_release_internal(old);
+    }
     com_ret(c, D8_OK);
 }
 // (this, Stage, ppTexture). D3D8 returns the bound texture with a new
@@ -1243,7 +1202,7 @@ void Dev_GetTexture(X86 *c) {
         return;
     }
     wr32(out, 0);
-    ComObj *tex = com_get(dev->d3d8_bound_texture[stage]);
+    ComObj *tex = com_get(d8_bound_texture(dev, stage));
     if (tex) {
         com_addref(tex);
         uint32_t tex_view = com_view(tex, IF_D3D8TEXTURE8);
@@ -1260,7 +1219,6 @@ void Dev_GetTexture(X86 *c) {
 // does not pay a GPU copy and wait on every frame before falling back.
 static bool g_native_handoff_failed = false;
 void Dev_Present(X86 *c) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     if (dev && dev->d3d8_device) {
         if (arg(c, 1) || arg(c, 2) || arg(c, 3) || arg(c, 4)) {
@@ -1268,10 +1226,9 @@ void Dev_Present(X86 *c) {
             fflush(stderr);
             imports_unsupported(c);
         }
-        D3d8Error err{};
-        int32_t status = d3d8_device_present(host_device(dev), &err);
-        if (status) {
-            com_ret(c, host_result(c, status, err));
+        auto status = recomp::d3d::present(*dev->d3d8_device->value);
+        if (!d3d_bridge_ok(status)) {
+            com_ret(c, bridge_result(c, status));
             return;
         }
         uint64_t bytes = uint64_t(dev->d3d8_width) * dev->d3d8_height * 4;
@@ -1283,20 +1240,21 @@ void Dev_Present(X86 *c) {
         // no CPU pixels. Frame dumps need the pixels, and a host without a shared
         // Metal device declines, so both take the readback below.
         if (!dx_dump_enabled() && !g_native_handoff_failed) {
-            void *native = nullptr;
-            uint32_t *busy = nullptr;
-            uint32_t w = 0, h = 0;
-            if (d3d8_device_present_handoff(host_device(dev), &native, &busy, &w, &h, &err) == 0) {
-                if (host_display_present_native_texture(native, int(w), int(h), busy)) {
+            auto handoff = recomp::d3d::present_handoff(*dev->d3d8_device->value, 32);
+            if (d3d_bridge_ok(handoff.status)) {
+                if (host_display_present_native_texture(
+                        handoff.handoff.texture, int(handoff.handoff.width),
+                        int(handoff.handoff.height), handoff.handoff.busy)) {
                     com_ret(c, D8_OK);
                     return;
                 }
                 // Declined (different device or no GPU presenter): not retried.
-                __atomic_store_n(busy, 0u, __ATOMIC_RELEASE);
+                __atomic_store_n(handoff.handoff.busy, 0u, __ATOMIC_RELEASE);
             }
             g_native_handoff_failed = true;
+            std::string message(handoff.status.message.data(), handoff.status.message.size());
             fprintf(stderr, "d3d8: native present handoff unavailable (%s); using CPU readback\n",
-                    err.message);
+                    message.c_str());
             fflush(stderr);
         }
         // Rust copies mapped rows straight into reused caller storage. Dump raw
@@ -1304,15 +1262,10 @@ void Dev_Present(X86 *c) {
         static std::vector<uint8_t> rgba;
         if (rgba.size() != size_t(bytes))
             rgba.resize(size_t(bytes), 0);
-        uint32_t got = 0;
-        status =
-            d3d8_device_read_pixels(host_device(dev), rgba.data(), uint32_t(bytes), &got, &err);
-        if (status) {
-            com_ret(c, host_result(c, status, err));
-            return;
-        }
-        if (got != bytes) {
-            com_ret(c, D8_ERR_NOTAVAILABLE);
+        status = recomp::d3d::read_pixels(*dev->d3d8_device->value,
+                                          rust::Slice<uint8_t>(rgba.data(), rgba.size()));
+        if (!d3d_bridge_ok(status)) {
+            com_ret(c, bridge_result(c, status));
             return;
         }
         dx_dump_frame_rgba(rgba.data(), dev->d3d8_width, dev->d3d8_height);
@@ -1320,7 +1273,6 @@ void Dev_Present(X86 *c) {
         com_ret(c, D8_OK);
         return;
     }
-#endif
     com_ret(c, D8_ERR_INVALIDCALL);
 }
 void Dev_GetBackBuffer(X86 *c) {
@@ -1447,8 +1399,8 @@ void diagnose_render_target(X86 *c, ComObj *dev, uint32_t rt_arg, ComObj *rt, ui
                 label, pointer, o->id, o->d3d8_owner, o->d3d8_texture, o->d3d8_level,
                 implicit ? owner->d3d8_width : o->width, implicit ? owner->d3d8_height : o->height,
                 implicit ? owner->d3d8_format : o->rmask,
-                implicit ? D3DUSAGE_RENDERTARGET : o->d3d8_usage, o->d3d8_pool,
-                unsigned(o->d3d8_depth), unsigned(implicit));
+                implicit ? D3DUSAGE_RENDERTARGET : d8_resource_info(o).usage,
+                d8_resource_info(o).pool, unsigned(d8_resource_info(o).depth), unsigned(implicit));
     };
     surface("backbuffer", 0, dev ? com_get(dev->d3d8_backbuffer) : nullptr);
     surface("target", rt_arg, rt);
@@ -1475,11 +1427,13 @@ void Dev_SetRenderTarget(X86 *c) {
     uint32_t rt_arg = arg(c, 1), ds_arg = arg(c, 2);
     ComObj *rt = rt_arg ? com_this(rt_arg, IF_D3D8SURFACE8) : nullptr;
     ComObj *ds = ds_arg ? com_this(ds_arg, IF_D3D8SURFACE8) : nullptr;
-    bool rejected = !dev || (rt_arg && (!rt || rt->d3d8_depth || rt->d3d8_owner != dev->id)) ||
-                    (ds_arg && (!ds || !ds->d3d8_depth || ds->d3d8_owner != dev->id));
+    bool rejected = !dev ||
+                    (rt_arg && (!rt || d8_resource_info(rt).depth || rt->d3d8_owner != dev->id)) ||
+                    (ds_arg && (!ds || !d8_resource_info(ds).depth || ds->d3d8_owner != dev->id));
     if (dev && rt && rt->id != dev->d3d8_backbuffer &&
-        (!(rt->d3d8_usage & D3DUSAGE_RENDERTARGET) || rt->d3d8_pool != D3DPOOL_DEFAULT ||
-         rt->d3d8_level != 0 || !rt->pixels_bytes || rt->lock_count))
+        (!(d8_resource_info(rt).usage & D3DUSAGE_RENDERTARGET) ||
+         d8_resource_info(rt).pool != D3DPOOL_DEFAULT || rt->d3d8_level != 0 || !rt->pixels_bytes ||
+         rt->lock_count))
         rejected = true;
     if (rejected) {
         diagnose_render_target(c, dev, rt_arg, rt, ds_arg, ds);
@@ -1497,21 +1451,18 @@ void Dev_SetRenderTarget(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-#ifdef RECOMP_D3D8_WGPU
-    D3d8Error err{};
-    int32_t status = d3d8_device_set_render_target(
-        host_device(dev), texture ? rt->id : 0, texture ? rt->d3d8_level : 0,
-        texture ? rt->d3d8_content_generation : 0, texture ? rt->rmask : dev->d3d8_format, width,
-        height, texture ? storage_data(rt) : nullptr, texture ? rt->pixels_bytes : 0, ds != nullptr,
-        ds && ds->id != dev->d3d8_depthbuffer ? ds->id : 0, ds ? ds->width : 0, ds ? ds->height : 0,
-        ds ? ds->rmask : 0, rt_arg != 0, &err);
-    if (status) {
-        com_ret(c, host_result(c, status, err));
+    auto status = recomp::d3d::set_render_target(
+        *dev->d3d8_device->value, texture ? rt->id : 0, texture ? rt->d3d8_level : 0,
+        texture ? d8_resource_level_generation(rt) : 0, texture ? rt->rmask : dev->d3d8_format,
+        width, height,
+        texture ? rust::Slice<const uint8_t>(storage_data(rt), rt->pixels_bytes)
+                : rust::Slice<const uint8_t>(),
+        ds != nullptr, ds && ds->id != dev->d3d8_depthbuffer ? ds->id : 0, ds ? ds->width : 0,
+        ds ? ds->height : 0, ds ? ds->rmask : 0, rt_arg != 0);
+    if (!d3d_bridge_ok(status)) {
+        com_ret(c, bridge_result(c, status));
         return;
     }
-#else
-    // State-only fixtures exercise identity and ownership without claiming GPU execution.
-#endif
     // Retain new bindings before releasing old ones, including rebinding self.
     if (rt)
         com_retain_internal(rt);
@@ -1522,7 +1473,7 @@ void Dev_SetRenderTarget(X86 *c) {
     dev->d3d8_target_depth = ds ? ds->id : 0;
     dev->d3d8_depth_detached = !ds;
     if (texture)
-        rt->d3d8_gpu_target = true;
+        d8_set_gpu_target(rt, true);
     com_ret(c, D8_OK);
 }
 
@@ -1572,25 +1523,6 @@ void Dev_CreateTexture(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-#ifdef RECOMP_D3D8_RESOURCES
-    D3d8LevelLayout first{};
-    D3d8Error layout_err{};
-    if (d3d8_texture_level_layout(w, h, levels, 0, format, &first, &layout_err) != D3D8_STATUS_OK) {
-        diagnose_create_texture(reinterpret_cast<const char *>(layout_err.message), dev, w, h,
-                                levels, usage, format, pool);
-        com_ret(c, D8_ERR_INVALIDCALL);
-        return;
-    }
-    levels = first.levels;
-#else
-    if (!levels) {
-        levels = 1;
-        for (uint32_t d = (w > h ? w : h); d > 1; d >>= 1)
-            ++levels;
-    }
-    if (levels > 16)
-        levels = 16;
-#endif
     // CPU storage stages guest locks/uploads; SetRenderTarget promotes a
     // supported level to lifetime-owned GPU storage on first binding.
     ComObj *tex = com_new(K_D3D8TEXTURE);
@@ -1599,33 +1531,23 @@ void Dev_CreateTexture(X86 *c) {
         return;
     }
     tex->d3d8_owner = dev->id;
+    tex->d3d8_owner_retained = true;
     com_addref(dev);
     tex->rmask = format;
-    tex->d3d8_usage = usage;
-    tex->d3d8_pool = pool;
-    tex->d3d8_level_count = levels;
-    tex->d3d8_lod = 0;
+    d8_resource(tex)->set_flags(usage, pool, false, false, 0, 0, 0, 0);
+    auto configuration = d8_resource(tex)->configure_texture(w, h, levels, format);
+    if (!d3d_bridge_ok(configuration.status)) {
+        std::string message(configuration.status.message.data(),
+                            configuration.status.message.size());
+        diagnose_create_texture(message.c_str(), dev, w, h, levels, usage, format, pool);
+        com_release(tex);
+        com_ret(c, bridge_result(c, configuration.status));
+        return;
+    }
+    levels = configuration.level_count;
     for (uint32_t l = 0; l < levels; ++l) {
-        uint32_t lw = w >> l, lh = h >> l;
-        if (!lw)
-            lw = 1;
-        if (!lh)
-            lh = 1;
-        uint64_t bytes = uint64_t(lw) * bpp * lh;
-#ifdef RECOMP_D3D8_RESOURCES
-        D3d8LevelLayout layout{};
-        if (d3d8_texture_level_layout(w, h, levels, l, format, &layout, &layout_err) !=
-            D3D8_STATUS_OK) {
-            diagnose_create_texture(reinterpret_cast<const char *>(layout_err.message), dev, w, h,
-                                    levels, usage, format, pool);
-            com_release(tex);
-            com_ret(c, D8_ERR_INVALIDCALL);
-            return;
-        }
-        lw = layout.width;
-        lh = layout.height;
-        bytes = layout.size;
-#endif
+        const auto &layout = configuration.levels[l];
+        const uint32_t lw = layout.width, lh = layout.height, bytes = layout.byte_len;
         ComObj *level = com_new(K_D3D8SURFACE);
         if (!level || bytes > GUEST_SIZE || !storage_alloc(level, (uint32_t)bytes)) {
             if (level)
@@ -1644,19 +1566,21 @@ void Dev_CreateTexture(X86 *c) {
         level->d3d8_texture = tex->id;
         level->d3d8_level = l;
         level->rmask = format;
-        level->d3d8_usage = usage;
-        level->d3d8_pool = pool;
         level->width = lw;
         level->height = lh;
-#ifdef RECOMP_D3D8_RESOURCES
         // A block format reports a block-row pitch; its bytes-per-texel is
         // meaningless and d8_lock_offset uses the block path below.
         level->bpp = block ? 0 : bpp * 8;
         level->pitch = layout.pitch;
-#else
-        level->bpp = bpp * 8;
-        level->pitch = lw * bpp;
-#endif
+        d8_resource(level)->set_flags(usage, pool, false, false, 0, 0, 0, 0);
+        auto level_status =
+            d8_resource(level)->set_level(0, lw, lh, level->pitch, uint32_t(bytes), 0);
+        if (!d3d_bridge_ok(level_status)) {
+            com_release(level);
+            com_release(tex);
+            com_ret(c, bridge_result(c, level_status));
+            return;
+        }
         // The initial reference is the texture's ownership of the level.
         tex->d3d8_levels.push_back(level->id);
         com_internalize(level);
@@ -1703,8 +1627,8 @@ void Dev_CreateDepthStencilSurface(X86 *c) {
     surface->d3d8_owner = dev->id;
     com_addref(dev);
     surface->d3d8_owner_retained = true;
-    surface->d3d8_depth = true;
-    surface->d3d8_usage = D3DUSAGE_DEPTHSTENCIL;
+    d8_resource(surface)->set_flags(D3DUSAGE_DEPTHSTENCIL, D3DPOOL_DEFAULT, true, false, 0, 0, 0,
+                                    0);
     surface->rmask = format;
     surface->width = w;
     surface->height = h;
@@ -1724,23 +1648,20 @@ void Dev_CreateDepthStencilSurface(X86 *c) {
 // Synchronize before any CPU read (locks or UpdateTexture source), preserving
 // guest byte order through the ABI. Generation stays unchanged on readback.
 void sync_rendered_level(ComObj *level) {
-#ifdef RECOMP_D3D8_WGPU
-    if (!level || !level->d3d8_gpu_target || level->lock_count)
+    if (!level || !d8_resource_info(level).gpu_target || level->lock_count)
         return;
     ComObj *dev = com_get(level->d3d8_owner);
     if (!dev || !dev->d3d8_device)
         return;
-    D3d8Error err{};
-    int32_t status = d3d8_device_read_texture(host_device(dev), level->id, level->d3d8_level,
-                                              level->d3d8_content_generation, storage_data(level),
-                                              level->pixels_bytes, &err);
-    if (status) {
-        fprintf(stderr, "d3d8: render-target CPU readback failed: %s\n",
-                reinterpret_cast<const char *>(err.message));
+    auto status = recomp::d3d::read_texture(
+        *dev->d3d8_device->value, level->id, level->d3d8_level, d8_resource_level_generation(level),
+        rust::Slice<uint8_t>(storage_data(level), level->pixels_bytes));
+    if (!d3d_bridge_ok(status)) {
+        std::string message(status.message.data(), status.message.size());
+        fprintf(stderr, "d3d8: render-target CPU readback failed: %s\n", message.c_str());
         fflush(stderr);
         imports_unsupported(nullptr);
     }
-#endif
 }
 
 // (this, pSourceTexture, pDestinationTexture). D3D8 requires equal formats and
@@ -1757,10 +1678,11 @@ void Dev_UpdateTexture(X86 *c) {
         return;
     }
     if (src->rmask != dst->rmask || src->d3d8_levels.size() != dst->d3d8_levels.size() ||
-        src->d3d8_pool != D3DPOOL_SYSTEMMEM || dst->d3d8_pool != D3DPOOL_DEFAULT) {
+        d8_resource_info(src).pool != D3DPOOL_SYSTEMMEM ||
+        d8_resource_info(dst).pool != D3DPOOL_DEFAULT) {
         LOGW("d3d8: UpdateTexture needs equal formats and level counts, SYSTEMMEM source and "
              "DEFAULT destination (fmt 0x%x/0x%x, pools %u/%u)",
-             src->rmask, dst->rmask, src->d3d8_pool, dst->d3d8_pool);
+             src->rmask, dst->rmask, d8_resource_info(src).pool, d8_resource_info(dst).pool);
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
@@ -1777,20 +1699,20 @@ void Dev_UpdateTexture(X86 *c) {
     for (size_t l = 0; l < src->d3d8_levels.size(); ++l) {
         ComObj *s = com_get(src->d3d8_levels[l]);
         ComObj *d = com_get(dst->d3d8_levels[l]);
-#ifdef RECOMP_D3D8_RESOURCES
-        D3d8Error err{};
-        if (d3d8_storage_copy(static_cast<D3d8Storage *>(d->d3d8_storage),
-                              static_cast<D3d8Storage *>(s->d3d8_storage),
-                              &err) != D3D8_STATUS_OK) {
+        if (!d->d3d8_storage || !s->d3d8_storage) {
             com_ret(c, D8_ERR_INVALIDCALL);
             return;
         }
-#else
+        if (d->d3d8_storage == s->d3d8_storage)
+            continue;
         sync_rendered_level(s);
-        memcpy(storage_data(d), storage_data(s), s->pixels_bytes);
-#endif
+        if (!d3d_bridge_ok(
+                recomp::d3d::copy_storage(*d->d3d8_storage->value, *s->d3d8_storage->value))) {
+            com_ret(c, D8_ERR_INVALIDCALL);
+            return;
+        }
         // The destination texture's sampled content changed.
-        ++d->d3d8_content_generation;
+        d8_bump_resource_level_generation(d);
     }
     com_ret(c, D8_OK);
 }
@@ -1828,7 +1750,7 @@ static void d8_stage_unlock(ComObj *o) {
         // The level's bytes now differ from any resident GPU copy. A nested
         // lock (count > 1) writes through the same staged block and is still
         // open, so the draw path is told `dirty` instead of trusting this.
-        ++o->d3d8_content_generation;
+        d8_bump_resource_level_generation(o);
     }
 }
 
@@ -1875,14 +1797,14 @@ void Surface_GetDesc(X86 *c) {
     uint32_t format, usage, pool, size, width, height;
     if (surface->d3d8_texture) {
         format = surface->rmask;
-        usage = surface->d3d8_usage;
-        pool = surface->d3d8_pool;
+        usage = d8_resource_info(surface).usage;
+        pool = d8_resource_info(surface).pool;
         width = surface->width;
         height = surface->height;
         // pixels_bytes already carries the block-aware size for a compressed
         // level; pitch * height would over-report it.
         size = surface->pixels_bytes;
-    } else if (surface->d3d8_depth) {
+    } else if (d8_resource_info(surface).depth) {
         // Autodepth handle. Its bytes live in the Rust target; the descriptor
         // reports the D3D8 depth size (D16 is 2 bytes/texel, the rest 4).
         format = surface->rmask;
@@ -2007,14 +1929,16 @@ void Tex_GetDevice(X86 *c) {
 }
 void Tex_SetPriority(X86 *c) {
     ComObj *tex = d8_tex(c);
-    uint32_t old = tex ? tex->d3d8_priority : 0;
-    if (tex)
-        tex->d3d8_priority = arg(c, 1);
+    uint32_t old = 0;
+    if (tex) {
+        auto result = d8_resource(tex)->set_priority(arg(c, 1));
+        old = result.value;
+    }
     com_ret(c, old);
 }
 void Tex_GetPriority(X86 *c) {
     ComObj *tex = d8_tex(c);
-    com_ret(c, tex ? tex->d3d8_priority : 0);
+    com_ret(c, tex ? d8_resource_info(tex).priority : 0);
 }
 void Tex_PreLoad(X86 *c) {
     // No host copy exists until a draw binds the texture, so there is nothing
@@ -2026,18 +1950,20 @@ void Tex_GetType(X86 *c) {
 }
 void Tex_SetLOD(X86 *c) {
     ComObj *tex = d8_tex(c);
-    uint32_t old = tex ? tex->d3d8_lod : 0;
-    if (tex)
-        tex->d3d8_lod = arg(c, 1);
+    uint32_t old = 0;
+    if (tex) {
+        auto result = d8_resource(tex)->set_lod(arg(c, 1));
+        old = result.value;
+    }
     com_ret(c, old);
 }
 void Tex_GetLOD(X86 *c) {
     ComObj *tex = d8_tex(c);
-    com_ret(c, tex ? tex->d3d8_lod : 0);
+    com_ret(c, tex ? d8_resource_info(tex).lod : 0);
 }
 void Tex_GetLevelCount(X86 *c) {
     ComObj *tex = d8_tex(c);
-    com_ret(c, tex ? tex->d3d8_level_count : 0);
+    com_ret(c, tex ? d8_resource_info(tex).level_count : 0);
 }
 void Tex_GetLevelDesc(X86 *c) {
     ComObj *tex = d8_tex(c);
@@ -2049,8 +1975,8 @@ void Tex_GetLevelDesc(X86 *c) {
     }
     wr32(out + 0, level->rmask);
     wr32(out + 4, D3DRTYPE_SURFACE);
-    wr32(out + 8, level->d3d8_usage);
-    wr32(out + 12, level->d3d8_pool);
+    wr32(out + 8, d8_resource_info(level).usage);
+    wr32(out + 12, d8_resource_info(level).pool);
     wr32(out + 16, level->pixels_bytes);
     wr32(out + 20, 0); // D3DMULTISAMPLE_NONE
     wr32(out + 24, level->width);
@@ -2105,23 +2031,25 @@ void Tex_AddDirtyRect(X86 *c) {
 }
 
 void texture_destroy(ComObj *tex) {
+    const bool release_owner = tex->d3d8_owner_retained;
+    tex->d3d8_owner_retained = false;
     for (uint32_t sid : tex->d3d8_levels) {
         ComObj *level = com_get(sid);
         if (level)
             com_release_internal(level); // the texture's own level reference
     }
     tex->d3d8_levels.clear();
-    if (ComObj *dev = com_get(tex->d3d8_owner))
-        com_release(dev);
+    ComObj *dev = com_get(tex->d3d8_owner);
     tex->d3d8_owner = 0;
+    if (release_owner && dev)
+        com_release(dev);
+    tex->d3d8_resource.reset();
 }
 
 void surface_destroy(ComObj *surface) {
-#ifdef RECOMP_D3D8_WGPU
     if (ComObj *owner = com_get(surface->d3d8_owner))
-        if (owner->d3d8_device && (surface->pixels_bytes || surface->d3d8_depth))
-            d3d8_device_release_texture(host_device(owner), surface->id);
-#endif
+        if (owner->d3d8_device && (surface->pixels_bytes || d8_resource_info(surface).depth))
+            recomp::d3d::release_texture(*owner->d3d8_device->value, surface->id);
     if (surface->pixels)
         heap_free(surface->pixels);
     surface->pixels = 0;
@@ -2138,6 +2066,7 @@ void surface_destroy(ComObj *surface) {
     surface->d3d8_owner_retained = false;
     surface->d3d8_owner = 0;
     surface->d3d8_texture = 0;
+    surface->d3d8_resource.reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -2221,13 +2150,15 @@ void Buffer_Unlock(X86 *c) {
 }
 void Buffer_SetPriority(X86 *c) {
     ComObj *o = d8_buffer(c);
-    if (o)
-        o->d3d8_priority = arg(c, 1);
-    com_ret(c, o ? o->d3d8_priority : 0);
+    if (!o) {
+        com_ret(c, 0);
+        return;
+    }
+    com_ret(c, d8_resource(o)->set_priority(arg(c, 1)).value);
 }
 void Buffer_GetPriority(X86 *c) {
     ComObj *o = d8_buffer(c);
-    com_ret(c, o ? o->d3d8_priority : 0);
+    com_ret(c, o ? d8_resource_info(o).priority : 0);
 }
 void Buffer_PreLoad(X86 *c) {
     (void)c;
@@ -2258,19 +2189,19 @@ void Buffer_GetDesc(X86 *c) {
         }
         wr32(out + 0, D3DFMT_VERTEXDATA);
         wr32(out + 4, D3DRTYPE_VERTEXBUFFER);
-        wr32(out + 8, o->d3d8_buffer_usage);
-        wr32(out + 12, o->d3d8_buffer_pool);
+        wr32(out + 8, d8_resource_info(o).buffer_usage);
+        wr32(out + 12, d8_resource_info(o).buffer_pool);
         wr32(out + 16, size);
-        wr32(out + 20, o->d3d8_buffer_fvf);
+        wr32(out + 20, d8_resource_info(o).buffer_fvf);
     } else {
         if (!gm_valid(out, 20)) {
             com_ret(c, D8_ERR_INVALIDCALL);
             return;
         }
-        wr32(out + 0, o->d3d8_buffer_format);
+        wr32(out + 0, d8_resource_info(o).index_format);
         wr32(out + 4, D3DRTYPE_INDEXBUFFER);
-        wr32(out + 8, o->d3d8_buffer_usage);
-        wr32(out + 12, o->d3d8_buffer_pool);
+        wr32(out + 8, d8_resource_info(o).buffer_usage);
+        wr32(out + 12, d8_resource_info(o).buffer_pool);
         wr32(out + 16, size);
     }
     com_ret(c, D8_OK);
@@ -2281,15 +2212,17 @@ void buffer_destroy(ComObj *o) {
     // The owning device binds buffers weakly; drop any binding that points here
     // so a later draw does not resolve a dead object id.
     if (ComObj *dev = com_get(o->d3d8_owner)) {
-        if (dev->d3d8_stream_vb == o->id) {
-            dev->d3d8_stream_vb = 0;
-            dev->d3d8_stream_stride = 0;
+        if (dev->d3d8_device) {
+            auto info = d8_device_info(dev);
+            if (info.stream_vb == o->id)
+                recomp::d3d::set_stream(*dev->d3d8_device->value, 0, 0);
+            if (info.index_buffer == o->id)
+                recomp::d3d::set_indices(*dev->d3d8_device->value, 0, 0);
         }
-        if (dev->d3d8_indices == o->id)
-            dev->d3d8_indices = 0;
         com_release(dev);
     }
     o->d3d8_owner = 0;
+    o->d3d8_resource.reset();
 }
 
 // (this, Length, Usage, FVF, Pool, ppVertexBuffer)
@@ -2311,9 +2244,13 @@ void Dev_CreateVertexBuffer(X86 *c) {
     }
     vb->d3d8_owner = dev->id;
     com_addref(dev);
-    vb->d3d8_buffer_usage = arg(c, 2);
-    vb->d3d8_buffer_fvf = arg(c, 3);
-    vb->d3d8_buffer_pool = arg(c, 4);
+    d8_resource(vb)->set_flags(0, 0, false, false, arg(c, 3), 0, arg(c, 2), arg(c, 4));
+    auto level_status = d8_resource(vb)->set_level(0, bytes, 1, bytes, bytes, 0);
+    if (!d3d_bridge_ok(level_status)) {
+        com_release(vb);
+        com_ret(c, bridge_result(c, level_status));
+        return;
+    }
     uint32_t view = com_view(vb, IF_D3D8VERTEXBUFFER8);
     if (!view) {
         com_release(vb);
@@ -2346,9 +2283,13 @@ void Dev_CreateIndexBuffer(X86 *c) {
     }
     ib->d3d8_owner = dev->id;
     com_addref(dev);
-    ib->d3d8_buffer_usage = arg(c, 2);
-    ib->d3d8_buffer_format = format;
-    ib->d3d8_buffer_pool = arg(c, 4);
+    d8_resource(ib)->set_flags(0, 0, false, false, 0, format, arg(c, 2), arg(c, 4));
+    auto level_status = d8_resource(ib)->set_level(0, bytes, 1, bytes, bytes, 0);
+    if (!d3d_bridge_ok(level_status)) {
+        com_release(ib);
+        com_ret(c, bridge_result(c, level_status));
+        return;
+    }
     uint32_t view = com_view(ib, IF_D3D8INDEXBUFFER8);
     if (!view) {
         com_release(ib);
@@ -2378,11 +2319,17 @@ void Dev_SetStreamSource(X86 *c) {
         return;
     }
     if (!vb) {
-        dev->d3d8_stream_vb = 0;
-        dev->d3d8_stream_stride = 0;
+        auto binding = recomp::d3d::set_stream(*d8_cpu_state(dev)->value, 0, 0);
+        if (!d3d_bridge_ok(binding.status)) {
+            com_ret(c, bridge_result(c, binding.status));
+            return;
+        }
     } else if (vb->kind == K_D3D8VERTEXBUFFER) {
-        dev->d3d8_stream_vb = vb->id;
-        dev->d3d8_stream_stride = arg(c, 3);
+        auto binding = recomp::d3d::set_stream(*d8_cpu_state(dev)->value, vb->id, arg(c, 3));
+        if (!d3d_bridge_ok(binding.status)) {
+            com_ret(c, bridge_result(c, binding.status));
+            return;
+        }
     } else {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
@@ -2399,11 +2346,17 @@ void Dev_SetIndices(X86 *c) {
         return;
     }
     if (!ib) {
-        dev->d3d8_indices = 0;
-        dev->d3d8_base_vertex = 0;
+        auto binding = recomp::d3d::set_indices(*d8_cpu_state(dev)->value, 0, 0);
+        if (!d3d_bridge_ok(binding.status)) {
+            com_ret(c, bridge_result(c, binding.status));
+            return;
+        }
     } else if (ib->kind == K_D3D8INDEXBUFFER) {
-        dev->d3d8_indices = ib->id;
-        dev->d3d8_base_vertex = arg(c, 2);
+        auto binding = recomp::d3d::set_indices(*d8_cpu_state(dev)->value, ib->id, arg(c, 2));
+        if (!d3d_bridge_ok(binding.status)) {
+            com_ret(c, bridge_result(c, binding.status));
+            return;
+        }
     } else {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
@@ -2411,7 +2364,15 @@ void Dev_SetIndices(X86 *c) {
     com_ret(c, D8_OK);
 }
 
-D3d8DeviceState *d8_constants(ComObj *dev);
+D3dHostDevice *d8_cpu_state(ComObj *dev) {
+    if (!dev->d3d8_device)
+        dev->d3d8_device = std::make_shared<D3dHostDevice>();
+    return dev->d3d8_device.get();
+}
+
+uint32_t d8_selected_vertex_shader(ComObj *dev) {
+    return recomp::d3d::selected_shader(*d8_cpu_state(dev)->value, false);
+}
 
 // (this, Handle). Wine uses handles above VS_HIGHESTFIXEDFXF (0xf0000000),
 // independently of the 0xfffe0101 vertex bytecode version token.
@@ -2422,23 +2383,12 @@ void Dev_SetVertexShader(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    auto *state = d8_constants(dev);
-    auto it = state->shaders.find(handle);
-    if (handle > 0xf0000000u && (it == state->shaders.end() || it->second.pixel)) {
-        com_ret(c, D8_ERR_INVALIDCALL);
+    D3dHostDevice *state = d8_cpu_state(dev);
+    recomp::d3d::Status bind = recomp::d3d::bind_shader(*state->value, false, handle);
+    if (!d3d_bridge_ok(bind)) {
+        com_ret(c, bridge_result(c, bind));
         return;
     }
-#ifdef RECOMP_D3D8_WGPU
-    D3d8Error err{};
-    int32_t status =
-        d3d8_device_shader_action(host_device(dev), handle > 0xf0000000u ? handle : 0, 0, 0, &err);
-    if (status) {
-        com_ret(c, host_result(c, status, err));
-        return;
-    }
-
-#endif
-    dev->d3d8_fvf = handle;
     com_ret(c, D8_OK);
 }
 void Dev_GetVertexShader(X86 *c) {
@@ -2448,29 +2398,15 @@ void Dev_GetVertexShader(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    wr32(out, dev->d3d8_fvf);
+    wr32(out, d8_selected_vertex_shader(dev));
     com_ret(c, D8_OK);
 }
 
-// ---------------------------------------------------------------------------
-// Programmable shader constants. D3D8 keeps float4 register banks on the
-// device; Set/Get copy the 32-bit float bit patterns verbatim and never
-// convert or interpret them. The constants have no effect on the
-// fixed-function pipeline. Programmable draws snapshot these banks through
-// the host ABI. A
-// guest may set constants while no programmable shader is bound, and the
-// water path does, so failing the call would abort it. The banks live on the
-// device object, behind a shared_ptr, so Set and Get round-trip across calls.
-// ---------------------------------------------------------------------------
 constexpr uint32_t D8_VERTEX_CONSTANT_REGISTERS = 96;
 constexpr uint32_t D8_PIXEL_CONSTANT_REGISTERS = 8;
 
-// Lazily allocates the per-device constant banks. Only a K_D3D8DEVICE touches
-// them; every other object carries just the shared_ptr.
-D3d8DeviceState *d8_constants(ComObj *dev) {
-    if (!dev->d3d8_constants)
-        dev->d3d8_constants = std::make_shared<D3d8DeviceState>();
-    return dev->d3d8_constants.get();
+bool d8_pixel_shader_bound(ComObj *dev) {
+    return recomp::d3d::selected_shader(*d8_cpu_state(dev)->value, true) != 0;
 }
 
 // True when Set/Get may touch [reg, reg + count) and read/write the guest
@@ -2485,20 +2421,6 @@ bool d8_constant_range(uint32_t reg, uint32_t count, uint32_t limit, uint32_t da
     return data && gm_valid(data, count * 16u);
 }
 
-// Copies `count` float4 registers between the guest buffer at `data` and the
-// device's 32-bit bank. `to_guest` selects Get (true) or Set (false).
-void d8_copy_registers(uint32_t (*bank)[4], uint32_t reg, uint32_t data, uint32_t count,
-                       bool to_guest) {
-    for (uint32_t i = 0; i < count; ++i)
-        for (uint32_t k = 0; k < 4; ++k) {
-            uint32_t off = data + (i * 4 + k) * 4;
-            if (to_guest)
-                wr32(off, bank[reg + i][k]);
-            else
-                bank[reg + i][k] = rd32(off);
-        }
-}
-
 // (this, Register, pConstantData, ConstantCount). A range or pointer violation
 // is an ordinary D3D error, not an unsupported-import abort.
 void Dev_SetVertexShaderConstant(X86 *c) {
@@ -2508,19 +2430,18 @@ void Dev_SetVertexShaderConstant(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if (count)
-        d8_copy_registers(d8_constants(dev)->vconst, reg, data, count, false);
-#ifdef RECOMP_D3D8_WGPU
-    if (count && dev->d3d8_device) {
-        D3d8Error err{};
-        int32_t status = d3d8_device_shader_constants(
-            host_device(dev), 0, reg, &d8_constants(dev)->vconst[reg][0], count, &err);
-        if (status) {
-            com_ret(c, host_result(c, status, err));
+    std::array<uint32_t, D8_VERTEX_CONSTANT_REGISTERS * 4> values;
+    for (uint32_t i = 0; i < count * 4; ++i)
+        values[i] = rd32(data + i * 4);
+    if (count) {
+        recomp::d3d::Status status = recomp::d3d::set_shader_constants(
+            *d8_cpu_state(dev)->value, false, reg,
+            rust::Slice<const uint32_t>(values.data(), size_t(count) * 4));
+        if (!d3d_bridge_ok(status)) {
+            com_ret(c, bridge_result(c, status));
             return;
         }
     }
-#endif
     com_ret(c, D8_OK);
 }
 void Dev_GetVertexShaderConstant(X86 *c) {
@@ -2530,8 +2451,16 @@ void Dev_GetVertexShaderConstant(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if (count)
-        d8_copy_registers(d8_constants(dev)->vconst, reg, data, count, true);
+    if (count) {
+        auto result =
+            recomp::d3d::get_shader_constants(*d8_cpu_state(dev)->value, false, reg, count);
+        if (!d3d_bridge_ok(result.status)) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        }
+        for (uint32_t i = 0; i < count * 4; ++i)
+            wr32(data + i * 4, result.values[i]);
+    }
     com_ret(c, D8_OK);
 }
 void Dev_SetPixelShaderConstant(X86 *c) {
@@ -2541,19 +2470,18 @@ void Dev_SetPixelShaderConstant(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if (count)
-        d8_copy_registers(d8_constants(dev)->pconst, reg, data, count, false);
-#ifdef RECOMP_D3D8_WGPU
-    if (count && dev->d3d8_device) {
-        D3d8Error err{};
-        int32_t status = d3d8_device_shader_constants(
-            host_device(dev), 1, reg, &d8_constants(dev)->pconst[reg][0], count, &err);
-        if (status) {
-            com_ret(c, host_result(c, status, err));
+    std::array<uint32_t, D8_PIXEL_CONSTANT_REGISTERS * 4> values;
+    for (uint32_t i = 0; i < count * 4; ++i)
+        values[i] = rd32(data + i * 4);
+    if (count) {
+        recomp::d3d::Status status = recomp::d3d::set_shader_constants(
+            *d8_cpu_state(dev)->value, true, reg,
+            rust::Slice<const uint32_t>(values.data(), size_t(count) * 4));
+        if (!d3d_bridge_ok(status)) {
+            com_ret(c, bridge_result(c, status));
             return;
         }
     }
-#endif
     com_ret(c, D8_OK);
 }
 void Dev_GetPixelShaderConstant(X86 *c) {
@@ -2563,8 +2491,16 @@ void Dev_GetPixelShaderConstant(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if (count)
-        d8_copy_registers(d8_constants(dev)->pconst, reg, data, count, true);
+    if (count) {
+        auto result =
+            recomp::d3d::get_shader_constants(*d8_cpu_state(dev)->value, true, reg, count);
+        if (!d3d_bridge_ok(result.status)) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        }
+        for (uint32_t i = 0; i < count * 4; ++i)
+            wr32(data + i * 4, result.values[i]);
+    }
     com_ret(c, D8_OK);
 }
 
@@ -2636,42 +2572,29 @@ void d8_create_shader(X86 *c, bool pixel) {
         return;
     }
     wr32(output, 0);
-    D3d8Shader shader;
-    shader.pixel = pixel;
+    std::vector<uint32_t> declaration, function;
     if ((!pixel && (arg(c, 4) & ~0x10u)) ||
-        (!pixel && !d8_shader_words(arg(c, 1), true, shader.declaration)) ||
-        ((pixel || arg(c, 2)) && !d8_shader_words(arg(c, pixel ? 1 : 2), false, shader.function))) {
+        (!pixel && !d8_shader_words(arg(c, 1), true, declaration)) ||
+        ((pixel || arg(c, 2)) && !d8_shader_words(arg(c, pixel ? 1 : 2), false, function))) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-#ifdef RECOMP_D3D8_WGPU
-    auto *state = d8_constants(dev);
-    uint32_t handle = state->next_shader;
-    if (handle == UINT32_MAX) {
-        com_ret(c, D8_ERR_INVALIDCALL);
+    auto result = recomp::d3d::create_shader(
+        *d8_cpu_state(dev)->value, pixel,
+        rust::Slice<const uint32_t>(declaration.data(), declaration.size()),
+        rust::Slice<const uint32_t>(function.data(), function.size()));
+    if (!d3d_bridge_ok(result.status)) {
+        com_ret(c, bridge_result(c, result.status));
         return;
     }
-    D3d8Error err{};
-    int32_t status =
-        d3d8_device_create_shader(host_device(dev), handle, pixel, shader.declaration.data(),
-                                  uint32_t(shader.declaration.size()), shader.function.data(),
-                                  uint32_t(shader.function.size()), &err);
-    if (status) {
-        com_ret(c, host_result(c, status, err));
-        return;
-    }
-    ++state->next_shader;
+    uint32_t handle = result.handle;
     if (recomp_env("D3D8_TRACE_SHADERS"))
-        fprintf(
-            stderr, "d3d8: Create%sShader handle=0x%08x version=0x%08x words=%zu declaration=%zu\n",
-            pixel ? "Pixel" : "Vertex", handle, shader.function.empty() ? 0 : shader.function[0],
-            shader.function.size(), shader.declaration.size());
-    state->shaders.emplace(handle, std::move(shader));
+        fprintf(stderr,
+                "d3d8: Create%sShader handle=0x%08x version=0x%08x words=%zu declaration=%zu\n",
+                pixel ? "Pixel" : "Vertex", handle, function.empty() ? 0 : function[0],
+                function.size(), declaration.size());
     wr32(output, handle);
     com_ret(c, D8_OK);
-#else
-    com_ret(c, D8_ERR_NOTAVAILABLE);
-#endif
 }
 void Dev_CreateVertexShader(X86 *c) {
     d8_create_shader(c, false);
@@ -2687,21 +2610,12 @@ void Dev_SetPixelShader(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    auto *state = d8_constants(dev);
-    auto it = state->shaders.find(handle);
-    if (handle && (it == state->shaders.end() || !it->second.pixel)) {
-        com_ret(c, D8_ERR_INVALIDCALL);
+    D3dHostDevice *state = d8_cpu_state(dev);
+    recomp::d3d::Status bind = recomp::d3d::bind_shader(*state->value, true, handle);
+    if (!d3d_bridge_ok(bind)) {
+        com_ret(c, bridge_result(c, bind));
         return;
     }
-#ifdef RECOMP_D3D8_WGPU
-    D3d8Error err{};
-    int32_t status = d3d8_device_shader_action(host_device(dev), handle, 1, 0, &err);
-    if (status) {
-        com_ret(c, host_result(c, status, err));
-        return;
-    }
-#endif
-    state->pixel_shader = handle;
     com_ret(c, D8_OK);
 }
 void Dev_GetPixelShader(X86 *c) {
@@ -2711,7 +2625,7 @@ void Dev_GetPixelShader(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    wr32(out, d8_constants(dev)->pixel_shader);
+    wr32(out, recomp::d3d::selected_shader(*d8_cpu_state(dev)->value, true));
     com_ret(c, D8_OK);
 }
 // Deleting a bound program clears that stage; queued host draws retain it.
@@ -2722,25 +2636,12 @@ void d8_delete_shader(X86 *c, bool pixel) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    auto *state = d8_constants(dev);
-    auto it = state->shaders.find(handle);
-    if (it == state->shaders.end() || it->second.pixel != pixel) {
-        com_ret(c, D8_ERR_INVALIDCALL);
+    recomp::d3d::Status remove =
+        recomp::d3d::delete_shader(*d8_cpu_state(dev)->value, pixel, handle);
+    if (!d3d_bridge_ok(remove)) {
+        com_ret(c, bridge_result(c, remove));
         return;
     }
-#ifdef RECOMP_D3D8_WGPU
-    D3d8Error err{};
-    int32_t status = d3d8_device_shader_action(host_device(dev), handle, pixel, 1, &err);
-    if (status) {
-        com_ret(c, host_result(c, status, err));
-        return;
-    }
-#endif
-    if (pixel && state->pixel_shader == handle)
-        state->pixel_shader = 0;
-    if (!pixel && dev->d3d8_fvf == handle)
-        dev->d3d8_fvf = 0;
-    state->shaders.erase(it);
     com_ret(c, D8_OK);
 }
 void Dev_DeleteVertexShader(X86 *c) {
@@ -2759,13 +2660,13 @@ void d8_get_shader(X86 *c, bool pixel, bool declaration) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    auto *state = d8_constants(dev);
-    auto it = state->shaders.find(arg(c, 1));
-    if (it == state->shaders.end() || it->second.pixel != pixel) {
-        com_ret(c, D8_ERR_INVALIDCALL);
+    auto result =
+        recomp::d3d::shader_tokens(*d8_cpu_state(dev)->value, pixel, arg(c, 1), declaration);
+    if (!d3d_bridge_ok(result.status)) {
+        com_ret(c, bridge_result(c, result.status));
         return;
     }
-    const auto &words = declaration ? it->second.declaration : it->second.function;
+    const auto &words = result.values;
     uint32_t required = uint32_t(words.size() * 4), available = rd32(size);
     wr32(size, required);
     if (!data) {
@@ -2817,20 +2718,10 @@ void Dev_ProcessVertices(X86 *c) {
     ComObj *dev = d8_dev(c);
     ComObj *dest = com_this(arg(c, 4));
     uint32_t src_start = arg(c, 1), dest_index = arg(c, 2), count = arg(c, 3), flags = arg(c, 5);
-    ComObj *vb = dev ? com_get(dev->d3d8_stream_vb) : nullptr;
-    if (!dev || !dest || dest->kind != K_D3D8VERTEXBUFFER || !vb || !count) {
-        com_ret(c, D8_ERR_INVALIDCALL);
-        return;
-    }
-    // D3DPV_DONOTCOPYDATA (1) asks the processor to skip unchanged vertex
-    // data; the fixed-function path rewrites every component, so accepting it
-    // changes nothing. No other flag is defined in D3D8.
-    if (flags & ~1u) {
-        com_ret(c, D8_ERR_INVALIDCALL);
-        return;
-    }
-#ifdef RECOMP_D3D8_WGPU
-    if (!dev->d3d8_device) {
+    const auto device_state = dev ? d8_device_info(dev) : recomp::d3d::DeviceInfo{};
+    ComObj *vb = dev ? com_get(device_state.stream_vb) : nullptr;
+    if (!dev || !dev->d3d8_device || !dest || dest->kind != K_D3D8VERTEXBUFFER || !vb || !count ||
+        (flags & ~1u)) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
@@ -2840,26 +2731,35 @@ void Dev_ProcessVertices(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    D3d8Error err{};
-    int32_t status = d3d8_device_process_vertices(
-        host_device(dev), src, vb->pixels_bytes, dev->d3d8_fvf, dev->d3d8_stream_stride, dst,
-        dest->pixels_bytes, dest->d3d8_buffer_fvf, src_start, dest_index, count, &err);
-    if (status != D3D8_STATUS_OK) {
-        fprintf(stderr, "d3d8: ProcessVertices: %s\n", reinterpret_cast<const char *>(err.message));
+    std::vector<uint8_t> source_copy;
+    const uintptr_t source_begin = reinterpret_cast<uintptr_t>(src);
+    const uintptr_t source_end = source_begin + vb->pixels_bytes;
+    const uintptr_t destination_begin = reinterpret_cast<uintptr_t>(dst);
+    const uintptr_t destination_end = destination_begin + dest->pixels_bytes;
+    if (source_begin < destination_end && destination_begin < source_end) {
+        try {
+            source_copy.assign(src, src + vb->pixels_bytes);
+        } catch (const std::bad_alloc &) {
+            com_ret(c, E_OUTOFMEMORY);
+            return;
+        }
+        src = source_copy.data();
+    }
+    auto status = recomp::d3d::process_vertices(
+        *d8_cpu_state(dev)->value, rust::Slice<const uint8_t>(src, vb->pixels_bytes),
+        d8_selected_vertex_shader(dev), device_state.stream_stride,
+        rust::Slice<uint8_t>(dst, dest->pixels_bytes), d8_resource_info(dest).buffer_fvf, src_start,
+        dest_index, count);
+    if (!d3d_bridge_ok(status)) {
+        std::string message(status.message.data(), status.message.size());
+        fprintf(stderr, "d3d8: ProcessVertices: %s\n", message.c_str());
         fflush(stderr);
-        // The engine's fallback replaces a zero return, so a named capability
-        // failure is D3DERR_NOTAVAILABLE rather than an abort. A malformed call
-        // is still the caller's error.
-        com_ret(c,
-                status == D3D8_STATUS_INVALID_ARGUMENT ? D8_ERR_INVALIDCALL : D8_ERR_NOTAVAILABLE);
+        com_ret(c, status.code == recomp::d3d::StatusCode::InvalidArgument ? D8_ERR_INVALIDCALL
+                                                                           : D8_ERR_NOTAVAILABLE);
         return;
     }
+    d8_bump_resource_level_generation(dest);
     com_ret(c, D8_OK);
-#else
-    (void)src_start;
-    (void)dest_index;
-    com_ret(c, D8_ERR_NOTAVAILABLE);
-#endif
 }
 
 // (this, pSourceSurface, pSourceRectsArray, cRects, pDestinationSurface,
@@ -2875,8 +2775,8 @@ void Dev_CopyRects(X86 *c) {
     ComObj *src = com_this(arg(c, 1), IF_D3D8SURFACE8);
     ComObj *dst = com_this(arg(c, 4), IF_D3D8SURFACE8);
     uint32_t rects = arg(c, 2), count = arg(c, 3), points = arg(c, 5);
-    if (!dev || !src || !dst || !count || src->rmask != dst->rmask || src->d3d8_depth ||
-        dst->d3d8_depth) {
+    if (!dev || !src || !dst || !count || src->rmask != dst->rmask || d8_resource_info(src).depth ||
+        d8_resource_info(dst).depth) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
@@ -2942,92 +2842,68 @@ void Dev_CopyRects(X86 *c) {
         }
     }
     // The destination content changed; any resident GPU copy is now stale.
-    ++dst->d3d8_content_generation;
+    d8_bump_resource_level_generation(dst);
     com_ret(c, D8_OK);
 }
 
-#ifdef RECOMP_D3D8_WGPU
-// Hand the bound stage-0 texture's level-0 CPU bytes to the renderer. Called
-// immediately before each draw so a level locked after SetTexture samples its
-// newest content. A null binding sends an empty block; the renderer keeps a
-// white fallback bound there, but an unbound stage does not simply sample
-// white. Wine's is_invalid_op (dlls/wined3d/utils.c) rewrites a stage op that
-// reads TEXTURE with no texture to SELECTARG1(CURRENT), and
-// DeviceState::resolve_texture_stage applies the same rule, so the stage passes
-// CURRENT (the vertex diffuse at stage 0) through instead of the white texel.
-//
-// Returns false when the renderer rejected the bind; the diagnostic has already
-// been reported through host_result() and the caller must not draw. This
-// prevents a rejected bind from silently falling back to the white texture.
 bool d8_sync_texture(X86 *c, ComObj *dev, uint32_t stage) {
     if (!dev || !dev->d3d8_device || stage >= 8)
         return true;
-    ComObj *tex = com_get(dev->d3d8_bound_texture[stage]);
-    D3d8Error err{};
-    int32_t status;
+    ComObj *tex = com_get(d8_bound_texture(dev, stage));
+    std::vector<recomp::d3d::TextureLevel> levels;
+    uint32_t texture_id = 0, format = 0;
     if (tex && !tex->d3d8_levels.empty()) {
-        // Hand the renderer the whole mip chain (base level first). Each level
-        // carries its own content generation so re-locking level N re-uploads
-        // only N; `dirty` covers a lock still open at draw time.
-        const uint32_t count = (uint32_t)tex->d3d8_levels.size();
-        std::vector<D3d8TextureLevel> levels(count);
-        for (uint32_t l = 0; l < count; ++l) {
-            ComObj *level = com_get(tex->d3d8_levels[l]);
-            if (!level)
-                continue;
+        levels.resize(tex->d3d8_levels.size());
+        for (size_t index = 0; index < tex->d3d8_levels.size(); ++index) {
+            ComObj *level = com_get(tex->d3d8_levels[index]);
+            if (!level) {
+                com_ret(c, D8_ERR_INVALIDCALL);
+                return false;
+            }
             const uint8_t *data = d8_buffer_bytes(level);
-            D3d8TextureLevel &out = levels[l];
+            auto &out = levels[index];
             out.level = level->d3d8_level;
+            out.generation = d8_resource_level_generation(level);
+            out.force_upload = level->lock_count > 0;
             out.width = level->width;
             out.height = level->height;
-            out.dirty = level->lock_count > 0 ? 1u : 0u;
-            out.generation = level->d3d8_content_generation;
-            out.data = data;
-            out.bytes = data ? level->pixels_bytes : 0;
+            out.data = rust::Slice<const uint8_t>(data, data ? level->pixels_bytes : 0);
         }
-        // The renderer keys a mip chain by its level-0 surface identity.
-        // SetRenderTarget/readback/destruction already use that identity;
-        // using the parent texture id here creates a second stale CPU upload
-        // instead of sampling the GPU-rendered reflection surface.
-        status = d3d8_device_set_texture(host_device(dev), stage, tex->d3d8_levels[0], tex->rmask,
-                                         count, levels.data(), &err);
-    } else {
-        status = d3d8_device_set_texture(host_device(dev), stage, 0, 0, 0, nullptr, &err);
+        texture_id = tex->d3d8_levels[0];
+        format = tex->rmask;
     }
-    if (status != D3D8_STATUS_OK) {
-        com_ret(c, host_result(c, status, err));
+    auto status = recomp::d3d::set_texture(
+        *dev->d3d8_device->value, stage, texture_id, format,
+        rust::Slice<const recomp::d3d::TextureLevel>(levels.data(), levels.size()));
+    if (!d3d_bridge_ok(status)) {
+        com_ret(c, bridge_result(c, status));
         return false;
     }
     return true;
 }
-#endif
 
 // (this, PrimitiveType, StartVertex, PrimitiveCount)
 void Dev_DrawPrimitive(X86 *c) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     if (!dev || !dev->d3d8_device) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    ComObj *vb = com_get(dev->d3d8_stream_vb);
+    auto device_state = d8_device_info(dev);
+    ComObj *vb = com_get(device_state.stream_vb);
     const uint8_t *bytes = d8_buffer_bytes(vb);
-    if (!bytes || !vb->pixels_bytes || !dev->d3d8_stream_stride) {
+    if (!bytes || !vb->pixels_bytes || !device_state.stream_stride) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    // The bridge composites two stages, so both bindings must be current.
-    for (uint32_t stage = 0; stage < (d8_constants(dev)->pixel_shader ? 4u : 2u); ++stage)
+    for (uint32_t stage = 0; stage < (d8_pixel_shader_bound(dev) ? 4u : 2u); ++stage)
         if (!d8_sync_texture(c, dev, stage))
             return;
-    D3d8Error err{};
-    int32_t status = d3d8_device_draw_primitive(host_device(dev), arg(c, 1), dev->d3d8_fvf, bytes,
-                                                (uint32_t)vb->pixels_bytes, dev->d3d8_stream_stride,
-                                                arg(c, 2), arg(c, 3), &err);
-    com_ret(c, host_result(c, status, err));
-#else
-    com_ret(c, D8_ERR_INVALIDCALL);
-#endif
+    auto status = recomp::d3d::draw_primitive(*dev->d3d8_device->value, arg(c, 1),
+                                              d8_selected_vertex_shader(dev),
+                                              rust::Slice<const uint8_t>(bytes, vb->pixels_bytes),
+                                              device_state.stream_stride, arg(c, 2), arg(c, 3));
+    com_ret(c, bridge_result(c, status));
 }
 
 // (this, PrimitiveType, PrimitiveCount, pVertexStreamZeroData, Stride).
@@ -3036,16 +2912,14 @@ void Dev_DrawPrimitive(X86 *c) {
 // uploads; only a checked, borrowed arena view crosses this native boundary.
 void Dev_DrawPrimitiveUP(X86 *c) {
     ComObj *dev = d8_dev(c);
-    if (!dev) {
+    if (!dev || !dev->d3d8_device) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
+    recomp::d3d::set_stream(*dev->d3d8_device->value, 0, 0);
     const uint32_t topology = arg(c, 1), count = arg(c, 2);
     const uint32_t vertices = arg(c, 3), stride = arg(c, 4);
-    dev->d3d8_stream_vb = 0;
-    dev->d3d8_stream_stride = 0;
-#ifdef RECOMP_D3D8_WGPU
-    if (!dev->d3d8_device || !stride) {
+    if (!stride) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
@@ -3053,19 +2927,18 @@ void Dev_DrawPrimitiveUP(X86 *c) {
     switch (topology) {
     case 1:
         vertex_count = count;
-        break; // POINTLIST
+        break;
     case 2:
         vertex_count = uint64_t(count) * 2;
-        break; // LINELIST
+        break;
     case 4:
         vertex_count = uint64_t(count) * 3;
-        break; // TRIANGLELIST
-    case 5:    // TRIANGLESTRIP
+        break;
+    case 5:
     case 6:
         vertex_count = uint64_t(count) + 2;
-        break; // TRIANGLEFAN
+        break;
     default:
-        fprintf(stderr, "d3d8: DrawPrimitiveUP unsupported topology %u\n", topology);
         imports_unsupported(c);
         return;
     }
@@ -3074,81 +2947,53 @@ void Dev_DrawPrimitiveUP(X86 *c) {
         return;
     }
     const uint64_t bytes = vertex_count * stride;
-    if (!vertices || bytes > UINT32_MAX || !gm_valid(vertices, (uint32_t)bytes)) {
+    if (!vertices || bytes > UINT32_MAX || !gm_valid(vertices, uint32_t(bytes))) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    for (uint32_t stage = 0; stage < (d8_constants(dev)->pixel_shader ? 4u : 2u); ++stage)
+    for (uint32_t stage = 0; stage < (d8_pixel_shader_bound(dev) ? 4u : 2u); ++stage)
         if (!d8_sync_texture(c, dev, stage))
             return;
-    D3d8Error err{};
-    int32_t status =
-        d3d8_device_draw_primitive(host_device(dev), topology, dev->d3d8_fvf, gm_ptr(vertices),
-                                   (uint32_t)bytes, stride, 0, count, &err);
-    com_ret(c, host_result(c, status, err));
-#else
-    com_ret(c, D8_ERR_INVALIDCALL);
-#endif
+    auto status = recomp::d3d::draw_primitive(
+        *dev->d3d8_device->value, topology, d8_selected_vertex_shader(dev),
+        rust::Slice<const uint8_t>(gm_ptr(vertices), size_t(bytes)), stride, 0, count);
+    com_ret(c, bridge_result(c, status));
 }
 
 // (this, PrimitiveType, MinIndex, NumVertices, StartIndex, PrimitiveCount). The
 // Rust owns indexed range validation and triangle-list expansion. Guest COM
 // identities and memory staging remain here.
 void Dev_DrawIndexedPrimitive(X86 *c) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = d8_dev(c);
     if (!dev || !dev->d3d8_device) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    ComObj *vb = com_get(dev->d3d8_stream_vb);
-    ComObj *ib = com_get(dev->d3d8_indices);
+    auto device_state = d8_device_info(dev);
+    ComObj *vb = com_get(device_state.stream_vb);
+    ComObj *ib = com_get(device_state.index_buffer);
     uint32_t topology = arg(c, 1), min_index = arg(c, 2), num_vertices = arg(c, 3);
     uint32_t start_index = arg(c, 4), prim_count = arg(c, 5);
     const uint8_t *vbytes = d8_buffer_bytes(vb);
     const uint8_t *ibytes = d8_buffer_bytes(ib);
-    uint32_t stride = dev->d3d8_stream_stride;
-    // Wine's d3d8_device_DrawIndexedPrimitive returns D3D_OK immediately when
-    // no index buffer is bound and submits no draw (dlls/d3d8/device.c at Wine
-    // commit 455e3509b98a6919fd4ad1def4803e08c41c03b2). NumVertices and
-    // MinIndex are draw hints there: only NumVertices is passed to the sysmem
-    // vertex-buffer upload, and neither bounds which vertices the draw reads.
-    if (!ib || !ibytes) {
-        com_ret(c, D8_OK);
-        return;
-    }
-    // A zero primitive count is a D3D_OK no-op: Wine computes an index count of
-    // zero and emits a zero-length draw. The hint `num_vertices` may be zero.
-    if (!prim_count) {
+    uint32_t stride = device_state.stream_stride;
+    if (!ib || !ibytes || !prim_count) {
         com_ret(c, D8_OK);
         return;
     }
     if (!vbytes || !stride) {
-        // Name which precondition failed; a bare INVALIDCALL hides whether the
-        // guest drew with no stream bound or with a zero stride. Wine only
-        // requires the index buffer and defers a missing stream to wined3d;
-        // this renderer needs real vertex bytes, so it stays a named rejection.
-        // DIVERGENCE(original): the original driver's result for an unbound
-        // stream is not evidenced, so it is not guessed at here.
-        LOGW("d3d8: DrawIndexedPrimitive rejected: vb=%s stride=%u prim_count=%u topology=%u "
-             "fvf=%08x",
-             vbytes ? "bound" : "none", stride, prim_count, topology, dev->d3d8_fvf);
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    // The bridge composites two stages, so both bindings must be current.
-    for (uint32_t stage = 0; stage < (d8_constants(dev)->pixel_shader ? 4u : 2u); ++stage)
+    for (uint32_t stage = 0; stage < (d8_pixel_shader_bound(dev) ? 4u : 2u); ++stage)
         if (!d8_sync_texture(c, dev, stage))
             return;
-    D3d8Error err{};
-    int32_t status = d3d8_device_draw_indexed_primitive(
-        host_device(dev), topology, dev->d3d8_fvf, vbytes, vb->pixels_bytes, stride, ibytes,
-        ib->pixels_bytes, ib->d3d8_buffer_format, dev->d3d8_base_vertex, min_index, num_vertices,
-        start_index, prim_count, &err);
-    com_ret(c, host_result(c, status, err));
-#else
-    com_ret(c, D8_ERR_INVALIDCALL);
-#endif
+    auto status = recomp::d3d::draw_indexed_primitive(
+        *dev->d3d8_device->value, topology, d8_selected_vertex_shader(dev),
+        rust::Slice<const uint8_t>(vbytes, vb->pixels_bytes), stride,
+        rust::Slice<const uint8_t>(ibytes, ib->pixels_bytes), d8_resource_info(ib).index_format,
+        device_state.base_vertex, min_index, num_vertices, start_index, prim_count);
+    com_ret(c, bridge_result(c, status));
 }
 
 // ---------------------------------------------------------------------------
@@ -3180,16 +3025,19 @@ static const ImportShim g_d3d8_exports[] = {
 
 void device_destroy(ComObj *o) {
     device_discard_implicit_surfaces(o);
-#ifdef RECOMP_D3D8_WGPU
     if (o->d3d8_device) {
-        d3d8_device_destroy(static_cast<D3d8Device *>(o->d3d8_device));
-        o->d3d8_device = nullptr;
+        auto bindings = recomp::d3d::global_reset(*o->d3d8_device->value);
+        for (uint32_t stage = 0; stage < 8; ++stage) {
+            uint32_t texture_id = bindings.values[stage + 2];
+            if (ComObj *texture = com_get(texture_id))
+                com_release_internal(texture);
+        }
     }
-#endif
     live_devices.erase(o);
     if (ComObj *factory = com_get(o->d3d8_factory))
         com_release(factory);
     o->d3d8_factory = 0;
+    o->d3d8_device.reset();
 }
 
 } // namespace
@@ -3221,8 +3069,9 @@ void d3d8_register() {
     com_register_iid(IF_D3D8VERTEXBUFFER8, IID_IDirect3DVertexBuffer8_);
     com_register_iid(IF_D3D8INDEXBUFFER8, IID_IDirect3DIndexBuffer8_);
     com_set_destructor(K_D3D8SURFACE, surface_destroy);
-    com_set_ref_hook(K_D3D8SURFACE, surface_refs_changed);
+    com_set_ref_hook(K_D3D8SURFACE, resource_refs_changed);
     com_set_destructor(K_D3D8TEXTURE, texture_destroy);
+    com_set_ref_hook(K_D3D8TEXTURE, resource_refs_changed);
     com_set_destructor(K_D3D8VERTEXBUFFER, buffer_destroy);
     com_set_destructor(K_D3D8INDEXBUFFER, buffer_destroy);
     com_set_destructor(K_D3D8DEVICE, device_destroy);
@@ -3234,16 +3083,11 @@ void d3d8_register() {
 // post-process to the live device; without the wgpu renderer there is nothing
 // to apply and a request for one fails by name.
 extern "C" int d3d8_scene_boundary(X86 *c, uint32_t mode) {
-#ifdef RECOMP_D3D8_WGPU
     ComObj *dev = live_devices.empty() ? nullptr : *live_devices.begin();
     if (dev && dev->d3d8_device) {
-        D3d8Error err{};
-        // RECOMP_D3D8_DUMP_SCENE=N saves the backbuffer before and after every
-        // Nth boundary that runs a post-process, plus an amplified difference
-        // image, into RECOMP_DUMP_FRAME_DIR. Diagnostic only.
         static const uint32_t dump_every = [] {
-            const char *v = getenv("RECOMP_D3D8_DUMP_SCENE");
-            return v ? uint32_t(strtoul(v, nullptr, 10)) : 0u;
+            const char *value = getenv("RECOMP_D3D8_DUMP_SCENE");
+            return value ? uint32_t(strtoul(value, nullptr, 10)) : 0u;
         }();
         static uint32_t boundary_serial = 0;
         const bool dump =
@@ -3252,30 +3096,34 @@ extern "C" int d3d8_scene_boundary(X86 *c, uint32_t mode) {
         std::vector<uint8_t> before;
         if (dump) {
             before.resize(pixels * 4);
-            uint32_t got = 0;
-            if (d3d8_device_read_pixels(host_device(dev), before.data(), uint32_t(before.size()),
-                                        &got, &err) ||
-                got != before.size())
+            auto read = recomp::d3d::read_pixels(
+                *dev->d3d8_device->value, rust::Slice<uint8_t>(before.data(), before.size()));
+            if (!d3d_bridge_ok(read))
                 before.clear();
         }
-        int32_t status = d3d8_device_scene_boundary(host_device(dev), mode, &err);
-        if (status == D3D8_STATUS_OK && !before.empty()) {
+        auto status = recomp::d3d::scene_boundary(*dev->d3d8_device->value, mode);
+        if (!d3d_bridge_ok(status)) {
+            bridge_result(c, status);
+            return -1;
+        }
+        if (!before.empty()) {
             std::vector<uint8_t> after(pixels * 4), diff(pixels * 4, 255);
-            uint32_t got = 0;
-            if (!d3d8_device_read_pixels(host_device(dev), after.data(), uint32_t(after.size()),
-                                         &got, &err) &&
-                got == after.size()) {
+            auto read = recomp::d3d::read_pixels(*dev->d3d8_device->value,
+                                                 rust::Slice<uint8_t>(after.data(), after.size()));
+            if (d3d_bridge_ok(read)) {
                 size_t changed = 0;
-                for (size_t i = 0; i < pixels; ++i) {
-                    int d = 0;
-                    for (int k = 0; k < 3; ++k)
-                        d = std::max(d, std::abs(int(before[i * 4 + k]) - int(after[i * 4 + k])));
-                    changed += d != 0;
-                    uint8_t v = uint8_t(std::min(255, d * 8));
-                    diff[i * 4] = diff[i * 4 + 1] = diff[i * 4 + 2] = v;
+                for (size_t index = 0; index < pixels; ++index) {
+                    int difference = 0;
+                    for (int component = 0; component < 3; ++component)
+                        difference =
+                            std::max(difference, std::abs(int(before[index * 4 + component]) -
+                                                          int(after[index * 4 + component])));
+                    changed += difference != 0;
+                    uint8_t value = uint8_t(std::min(255, difference * 8));
+                    diff[index * 4] = diff[index * 4 + 1] = diff[index * 4 + 2] = value;
                 }
-                char name[48];
                 static uint32_t dumped = 0;
+                char name[48];
                 snprintf(name, sizeof name, "scene_%04u_before", dumped);
                 dx_dump_named_rgba(name, before.data(), dev->d3d8_width, dev->d3d8_height);
                 snprintf(name, sizeof name, "scene_%04u_after", dumped);
@@ -3286,29 +3134,26 @@ extern "C" int d3d8_scene_boundary(X86 *c, uint32_t mode) {
                         changed, pixels);
             }
         }
-        return host_result(c, status, err) == D8_OK ? 0 : -1;
+        return 0;
     }
     if (mode == 0)
         return 0;
     fprintf(stderr, "d3d8: scene post-process %u requested with no live device\n", mode);
-#else
-    if (mode == 0)
-        return 0;
-    fprintf(stderr, "d3d8: scene post-process %u requires the wgpu renderer\n", mode);
-#endif
     fflush(stderr);
     imports_unsupported(c);
     return -1;
 }
 
 void d3d8_reset() {
-#ifdef RECOMP_D3D8_WGPU
     for (ComObj *dev : live_devices) {
-        if (dev->d3d8_device)
-            d3d8_device_destroy(static_cast<D3d8Device *>(dev->d3d8_device));
-        dev->d3d8_device = nullptr;
+        if (!dev->d3d8_device)
+            continue;
+        recomp::d3d::global_reset(*dev->d3d8_device->value);
+        dev->d3d8_target = 0;
+        dev->d3d8_target_depth = 0;
+        dev->d3d8_backbuffer = 0;
+        dev->d3d8_depthbuffer = 0;
     }
-#endif
     live_devices.clear();
     // Guest allocations were discarded by mem_init; release only host storage.
     while (!live_resources.empty()) {

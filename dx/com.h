@@ -269,67 +269,10 @@ struct SurfacePrivateData {
     std::vector<uint8_t> bytes;
 };
 
-// Per-device state for an IDirect3DDevice7 (K_D3D7DEVICE). The engine caches
-// every render/texture-stage state itself and reads it back through Get*, so
-// the front end keeps a faithful store: GetRenderState/GetTextureStageState
-// return exactly what Set* last recorded, and the documented D3D7 defaults
-// for the states never set. Held behind a shared_ptr so ComObj stays copyable
-// and so the arrays cost nothing on the thousands of surface/texture objects.
-struct D3d7DeviceState {
-    // Bounds the type loop the engine walks at 0x82c8f0: render states
-    // 0..255, texture stages 0..7 with types 0..255.
-    uint32_t render_state[256];
-    uint32_t tss[8][256];
-    // Transform states the engine uses: WORLD/VIEW/PROJECTION. Stored for
-    // every state so GetTransform is a faithful read, not a fixed three.
-    float transform[256][16];
-    bool transform_set[256];
-    // `*_set` records whether the guest ever set the state, so the Rust host
-    // device can be created lazily (the first Clear) and still receive every
-    // state the engine set before it. Defaults are preloaded into the arrays.
-    bool render_state_set[256];
-    bool tss_set[8][256];
-    float viewport[6];
-    bool viewport_set;
-    float material[68 / 4]; // D3DMATERIAL7, 17 dwords
-    bool material_set;
-    float light[104 / 4]; // D3DLIGHT7, 26 dwords
-    uint32_t light_enable[8];
-    // Bound stage textures, as K_SURFACE object ids (0 = none, D3D7 slot 0).
-    uint32_t texture[8];
-    bool in_scene;
-    uint32_t d3d_obj;       // owning K_DDRAW (IDirect3D7) object id
-    uint32_t render_target; // surface id, or 0
-    // True while the host renderer's 32-bit target holds 3D content that has
-    // not been reconciled into the guest 16bpp bytes. Cleared by a successful
-    // d3d7_writeback; set by every Clear or draw that changes the target. A
-    // surface the device has not drawn into since the last writeback needs no
-    // readback (the guest bytes are already the reconciled content), which is
-    // the lazy half of the writeback policy in docs/d3d7-inventory.md.
-    bool target_dirty;
-    // The device class that was requested: one of the two device GUIDs.
-    uint8_t device_guid[16];
-    bool tnl; // device_guid names IID_IDirect3DTnLHalDevice
-};
-
-// Per-device programmable shader constant registers for an
-// IDirect3DDevice8. D3D8 guarantees at least 96 float4 vertex-shader constants
-// for vs.1.1 hardware, and the water path addresses eight pixel-shader
-// constants. Storage holds the exact 32-bit float bit patterns the guest
-// wrote; nothing here interprets them. Held behind a shared_ptr so the arrays
-// are not paid for by every surface/texture/buffer object, the same reason
-// D3d7DeviceState is shared.
-struct D3d8Shader {
-    bool pixel = false;
-    std::vector<uint32_t> declaration, function;
-};
-struct D3d8DeviceState {
-    std::unordered_map<uint32_t, D3d8Shader> shaders;
-    uint32_t next_shader = 0xf0000001u;
-    uint32_t pixel_shader = 0;
-    uint32_t vconst[96][4] = {};
-    uint32_t pconst[8][4] = {};
-};
+struct D3dHostDevice;
+struct D3dHostStorage;
+struct D3dHostResource;
+struct D3dHostDevice7State;
 
 // ---------------------------------------------------------------------------
 // The host-side object. One fat struct rather than a class hierarchy: these
@@ -516,16 +459,10 @@ struct ComObj {
     // --- K_D3D7DEVICE / K_D3D7VB. The D3D7 device's state is behind a
     // pointer so the big render-state arrays are not paid for by every COM
     // object; a vertex buffer's storage is the guest `pixels` block.
-    std::shared_ptr<D3d7DeviceState> d3d7;
-    // --- K_D3D7DEVICE: the Rust d3d8-wgpu host device that owns the 32-bit
-    // internal render target, and the state-block snapshots the engine's
-    // blend-mode probe records. `d3d7_host` is null without the renderer.
+    std::shared_ptr<D3dHostDevice7State> d3d7;
     bool d3d7_native_handoff_failed = false;
-    void *d3d7_host = nullptr; // D3d8Device*; never a guest address
+    std::shared_ptr<D3dHostDevice> d3d7_host;
     uint32_t d3d7_width = 0, d3d7_height = 0;
-    bool d3d7_recording = false;
-    uint32_t d3d7_next_stateblock = 1;
-    std::map<uint32_t, std::shared_ptr<D3d7DeviceState>> d3d7_stateblocks;
     // --- K_SURFACE: the D3D7 device that renders into this surface, if any.
     // The guest bytes stay authoritative; this is only how ddraw.cpp finds the
     // Rust target to reconcile before it reads or presents those bytes.
@@ -534,15 +471,10 @@ struct ComObj {
     uint32_t vb_num_vertices = 0;
     uint32_t vb_caps = 0;
 
-    // --- K_D3D8DEVICE: shader constant registers. D3D8 keeps these on the
-    // device even when no programmable shader is bound, so Set/Get round-trip
-    // them without affecting fixed-function drawing (see d3d8.cpp).
-    std::shared_ptr<D3d8DeviceState> d3d8_constants;
-    // --- K_D3D8/wgpu. The Rust host device is a
-    // host-side pointer kept here, never in a guest field.
+    std::shared_ptr<D3dHostDevice> d3d8_device;
+    std::shared_ptr<D3dHostResource> d3d8_resource;
     uint32_t d3d8_guest_backing = 0; // lifetime-owned vertex/index bytes in guest arena
-    void *d3d8_storage = nullptr;    // opaque Rust CPU storage; never a guest address
-    void *d3d8_device = nullptr;     // D3d8Device* from the Rust ABI
+    std::shared_ptr<D3dHostStorage> d3d8_storage;
     uint32_t d3d8_width = 0, d3d8_height = 0, d3d8_format = 0;
     uint32_t d3d8_factory = 0; // K_D3D8DEVICE: its IDirect3D8 object id
     uint32_t d3d8_owner = 0;   // K_D3D8SURFACE/K_D3D8TEXTURE: retained device object id
@@ -556,41 +488,14 @@ struct ComObj {
     uint32_t d3d8_target = 0;       // internal binding reference; 0 = implicit color
     uint32_t d3d8_target_depth = 0; // internal binding reference
     bool d3d8_depth_detached = false;
-    bool d3d8_owner_retained = false; // surface's external refs retain device
-    bool d3d8_gpu_target = false;     // CPU bytes require GPU readback before read
-    uint32_t d3d8_depth_format = 0;   // raw D3DFORMAT requested at create; 0 = none
+    bool d3d8_owner_retained = false;
+    uint32_t d3d8_depth_format = 0; // raw D3DFORMAT requested at create; 0 = none
     // --- K_D3D8TEXTURE
-    uint32_t d3d8_level_count = 0;
-    uint32_t d3d8_usage = 0;           // D3DUSAGE the texture was created with
-    uint32_t d3d8_pool = 0;            // D3DPOOL the texture was created with
-    uint32_t d3d8_lod = 0;             // most detailed mip the texture may use
-    uint32_t d3d8_priority = 0;        // eviction priority; no eviction happens here
     std::vector<uint32_t> d3d8_levels; // K_D3D8SURFACE id per mip level
     // --- K_D3D8SURFACE texture levels (the implicit backbuffer leaves these 0)
     uint32_t d3d8_texture = 0; // owning K_D3D8TEXTURE id
     uint32_t d3d8_level = 0;   // which mip level of that texture
-    // Bumped on every write path that changes the bytes a draw would sample
-    // (UnlockRect write-back, UpdateTexture into this level). The Rust upload
-    // cache uses it to skip converting/uploading unchanged content. A lock
-    // still open at draw time is passed to the device as `dirty` instead, so
-    // bytes written through the staged pointer are never assumed unchanged.
-    uint64_t d3d8_content_generation = 0;
-    bool d3d8_depth = false; // this surface is the implicit depth/stencil buffer
-    // --- K_D3D8VERTEXBUFFER/K_D3D8INDEXBUFFER
-    // Contents live in `blob` (host memory); a Lock stages them into guest heap
-    // through `pixels`/`pixels_bytes`/`lock_count`, exactly as the D3D9 path
-    // does. `d3d8_buffer_fvf` is only meaningful for a vertex buffer.
-    uint32_t d3d8_buffer_fvf = 0;
-    uint32_t d3d8_buffer_format = 0; // index format; 0 for a vertex buffer
-    uint32_t d3d8_buffer_usage = 0;
-    uint32_t d3d8_buffer_pool = 0;
     // --- stream/indices state on K_D3D8DEVICE
-    uint32_t d3d8_stream_vb = 0; // bound K_D3D8VERTEXBUFFER object id
-    uint32_t d3d8_stream_stride = 0;
-    uint32_t d3d8_indices = 0;            // bound K_D3D8INDEXBUFFER object id
-    uint32_t d3d8_base_vertex = 0;        // SetIndices base vertex index
-    uint32_t d3d8_fvf = 0;                // FVF or device-owned shader handle
-    uint32_t d3d8_bound_texture[8] = {0}; // bound K_D3D8TEXTURE id per texture stage
 };
 
 // One vtable slot.

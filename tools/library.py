@@ -211,7 +211,7 @@ def catalog(storage, repair=False):
             known = (storage / directory.name / "location.json").is_file() or (root / "imported.json").is_file() or (root / "library.json").is_file()
             destination = root if known else Path.home() / ("Applications" if platform.system() == "Darwin" else "Games") / directory.name
             item.update(game_entry(cfg), id=directory.name, installation=str(destination),
-                        needsRust=cfg.get("render", {}).get("d3d8_wgpu", False))
+                        needsRust=True)
             item["state"] = "notInstalled"
             if (root / "imported.json").is_file():
                 item["managedSource"] = str(root / "original")
@@ -416,7 +416,7 @@ def install(request, storage):
     root = Path(request.get("destination") or previous_root).expanduser().resolve()
     cfg = game_config.load(directory, root)
     emit("stage", stage="checking", message="Checking build prerequisites")
-    checks = prerequisites(cfg.get("render", {}).get("d3d8_wgpu", False),
+    checks = prerequisites(True,
                            Path(request["source"]).suffix.lower() == ".exe")
     if not checks["ready"]:
         raise ValueError("Missing prerequisites: " + ", ".join(c["label"] for c in checks["checks"] if not c["ok"]))

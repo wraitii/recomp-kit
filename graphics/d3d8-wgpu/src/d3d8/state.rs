@@ -84,6 +84,15 @@ pub const MAX_LIGHTS: usize = 8;
 /// A `D3DMATERIAL8` channel: four floats in `r, g, b, a` order.
 pub type ColorValue = [f32; 4];
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Rect {
+    pub x1: i32,
+    pub y1: i32,
+    pub x2: i32,
+    pub y2: i32,
+}
+
 /// A `D3DMATERIAL8` with the same field order and widths. The bridge copies
 /// the guest's 68-byte record verbatim; the renderer never reinterprets it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -367,6 +376,18 @@ impl DeviceState {
             material: Material::d3d_default(),
             lights: [Light::default(); MAX_LIGHTS],
             light_enabled: [false; MAX_LIGHTS],
+        }
+    }
+
+    pub fn set_target_size(&mut self, width: u32, height: u32) {
+        self.target_width = width;
+        self.target_height = height;
+        if self.viewport.x == 0
+            && self.viewport.y == 0
+            && self.viewport.width == 0
+            && self.viewport.height == 0
+        {
+            self.viewport = Viewport::full(width, height);
         }
     }
 

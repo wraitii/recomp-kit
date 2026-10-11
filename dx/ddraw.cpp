@@ -14,6 +14,7 @@
 // is a stub: an interface that stops early would make the guest call the wrong
 // method, not merely a missing one.
 #include "com.h"
+#include "d3d_bridge_helpers.h"
 #include "dx.h"
 #include "frame_dump.h"
 #include "dxt_decode.h"
@@ -1061,7 +1062,8 @@ void surface_pixels_changed(ComObj *s) {
     // key their upload cache on it) must see the new content. The generation
     // is monotonic and shared with the D3D8 level surfaces; a DirectDraw write
     // to one of those is equally a content change.
-    ++s->d3d8_content_generation;
+    if (s->d3d8_resource)
+        s->d3d8_resource->bump_generation();
     // The content is now different from whatever any record referred to.
     ddraw_after_write(s);
     if (s->is_primary) {

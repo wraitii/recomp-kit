@@ -3,7 +3,7 @@
 #include "../dx.h"
 #include "../../runtime/memory.h"
 #include "guest_abi.h"
-#include "d3d8_abi.h"
+#include "../d3d_bridge_helpers.h"
 
 static void check(bool value, const char *message) {
     ++g_checks;
@@ -23,13 +23,14 @@ int main() {
     ComObj *dev = com_new(K_D3D8DEVICE);
     dev->d3d8_width = dev->d3d8_height = 16;
     dev->d3d8_format = 21;
-    D3d8Error err{};
-    auto *gpu = d3d8_device_create(16, 16, 21, 0, &err);
-    if (!gpu) {
-        fprintf(stderr, "GPU creation failed: %s\n", err.message);
+    dev->d3d8_device = std::make_shared<D3dHostDevice>();
+    auto &gpu = *dev->d3d8_device->value;
+    if (!d3d_bridge_ok(recomp::d3d::set_device_dimensions(gpu, 16, 16)) ||
+        !d3d_bridge_ok(recomp::d3d::set_device_format(gpu, 21, 0)) ||
+        !d3d_bridge_ok(recomp::d3d::initialize_gpu(gpu, 16, 16, 21, 0))) {
+        fprintf(stderr, "GPU creation failed\n");
         return 1;
     }
-    dev->d3d8_device = gpu;
     uint32_t device = com_view(dev, IF_D3D8DEVICE);
     check(call_method(device, 16, {0, 0, scratch}) == 0, "GetBackBuffer");
     uint32_t backbuffer = rd32(scratch);
@@ -64,15 +65,14 @@ int main() {
         memcpy(gm_ptr(vb->pixels + i * 24), vertex, sizeof(vertex));
         wr32(vb->pixels + i * 24 + 12, 0xffffffff);
     }
-    dev->d3d8_stream_vb = vb->id;
-    dev->d3d8_stream_stride = 24;
+    recomp::d3d::set_stream(gpu, vb->id, 24);
     check(call_method(device, 34) == 0, "BeginScene");
     check(call_method(device, 70, {4, 0, 1}) == 0, "sample rendered texture through COM");
     check(call_method(device, 35) == 0, "EndScene");
     uint8_t pixels[16 * 16 * 4];
-    uint32_t size = 0;
-    check(d3d8_device_read_pixels(gpu, pixels, sizeof(pixels), &size, &err) == 0,
-          "read GPU backbuffer");
+    check(
+        d3d_bridge_ok(recomp::d3d::read_pixels(gpu, rust::Slice<uint8_t>(pixels, sizeof(pixels)))),
+        "read GPU backbuffer");
     const uint8_t magenta[] = {255, 0, 255, 255};
     check(memcmp(pixels + (8 * 16 + 8) * 4, magenta, 4) == 0,
           "sample GPU-rendered magenta instead of stale CPU black");
@@ -81,8 +81,9 @@ int main() {
     check(call_method(device, 36, {3, scratch + 513, 1, 0xff00ff00, 0x3f800000, 0}) == 0,
           "clear unaligned guest rectangles");
     memset(gm_ptr(scratch + 513), 0, sizeof(rectangles));
-    check(d3d8_device_read_pixels(gpu, pixels, sizeof(pixels), &size, &err) == 0,
-          "read rectangle clear");
+    check(
+        d3d_bridge_ok(recomp::d3d::read_pixels(gpu, rust::Slice<uint8_t>(pixels, sizeof(pixels)))),
+        "read rectangle clear");
     const uint8_t green[] = {0, 255, 0, 255};
     for (uint32_t y = 0; y < 16; ++y)
         for (uint32_t x = 0; x < 16; ++x)
@@ -111,15 +112,16 @@ int main() {
             memcpy(gm_ptr(scratch + 256 + i * 28), vertex, sizeof(vertex));
             wr32(scratch + 256 + i * 28 + 16, 0xffffffff);
         }
-        dev->d3d8_stream_vb = vb->id;
-        dev->d3d8_stream_stride = 24;
+        recomp::d3d::set_stream(gpu, vb->id, 24);
         check(call_method(device, 34) == 0, "BeginScene UP");
         check(call_method(device, 72, {topology, 2, scratch + 256, 28}) == 0,
               "DrawPrimitiveUP through COM");
-        check(!dev->d3d8_stream_vb && !dev->d3d8_stream_stride, "UP clears stream zero");
+        auto stream = recomp::d3d::device_info(gpu).info;
+        check(!stream.stream_vb && !stream.stream_stride, "UP clears stream zero");
         memset(gm_ptr(scratch + 256), 0, 112); // caller may immediately reuse the data
         check(call_method(device, 35) == 0, "EndScene UP");
-        check(d3d8_device_read_pixels(gpu, pixels, sizeof(pixels), &size, &err) == 0,
+        check(d3d_bridge_ok(
+                  recomp::d3d::read_pixels(gpu, rust::Slice<uint8_t>(pixels, sizeof(pixels)))),
               "read UP draw");
         check(memcmp(pixels + (4 * 16 + 4) * 4, magenta, 4) == 0 &&
                   memcmp(pixels + (12 * 16 + 12) * 4, magenta, 4) == 0,
@@ -137,7 +139,7 @@ int main() {
     call_method(surface, 10);
     call_method(device, 61, {0, 0});
     call_method(device, 90, {ps});
-    dev->d3d8_stream_vb = 0;
+    recomp::d3d::set_stream(gpu, 0, 0);
     com_release(vb);
     call_method(surface, 2);
     call_method(texture, 2);

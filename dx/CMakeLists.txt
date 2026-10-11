@@ -42,93 +42,111 @@ add_custom_target(d3d8_com_tables DEPENDS "${RECOMP_D3D8_COM_TABLES}" "${RECOMP_
 
 add_library(recomp_dx OBJECT ${RECOMP_DX_SOURCES})
 add_dependencies(recomp_dx d3d8_com_tables)
-target_include_directories(recomp_dx PRIVATE "${RECOMP_D3D8_GENERATED_DIR}")
+target_include_directories(recomp_dx PUBLIC "${RECOMP_D3D8_GENERATED_DIR}")
 target_link_libraries(recomp_dx PUBLIC recomp_runtime recomp_frame_dump)
 recomp_link_video(recomp_dx)
 target_compile_options(recomp_dx PRIVATE ${RECOMP_WARN_HOST})
 recomp_optimize(recomp_dx 2)
 
-# Optional Rust D3D8/wgpu host renderer, shipped in the kit as
-# graphics/d3d8-wgpu. It is built on native macOS when RECOMP_D3D8_WGPU is ON
-# (tools/build.py passes it from the environment) or when a game ships its own
-# graphics/d3d8-wgpu, which then takes precedence. Every other build compiles
-# no Rust and uses d3d8.cpp's no-renderer path only. The frameworks are what the
-# probe binaries link through cargo's build scripts.
-option(RECOMP_D3D8_WGPU "Build the kit's Rust D3D8/wgpu renderer" OFF)
+option(RECOMP_D3D8_WGPU "Build the Rust D3D8/wgpu renderer" OFF)
 set(RECOMP_D3D8_WGPU_DIR "")
 if(EXISTS "${RECOMP_GAME_DIR}/graphics/d3d8-wgpu/Cargo.toml")
   set(RECOMP_D3D8_WGPU_DIR "${RECOMP_GAME_DIR}/graphics/d3d8-wgpu")
-elseif(RECOMP_D3D8_WGPU)
+else()
   set(RECOMP_D3D8_WGPU_DIR "${CMAKE_CURRENT_LIST_DIR}/../graphics/d3d8-wgpu")
   get_filename_component(RECOMP_D3D8_WGPU_DIR "${RECOMP_D3D8_WGPU_DIR}" ABSOLUTE)
 endif()
-if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND RECOMP_D3D8_WGPU_DIR AND EXISTS "${RECOMP_D3D8_WGPU_DIR}/Cargo.toml")
+if(RECOMP_D3D8_WGPU_DIR AND EXISTS "${RECOMP_D3D8_WGPU_DIR}/Cargo.toml")
   find_program(CARGO_EXECUTABLE cargo)
   if(NOT CARGO_EXECUTABLE)
-    message(FATAL_ERROR "the D3D8/wgpu renderer is enabled but cargo was not found")
+    message(FATAL_ERROR "D3D7/D3D8 host support requires Cargo")
   endif()
-  # This host bridge has only been wired for native macOS builds. Cargo's
-  # default target must not silently supply a host archive to a cross build.
   if(CMAKE_CROSSCOMPILING OR (CMAKE_OSX_ARCHITECTURES AND
       NOT CMAKE_OSX_ARCHITECTURES STREQUAL CMAKE_HOST_SYSTEM_PROCESSOR))
-    message(FATAL_ERROR "D3D8/wgpu integration currently requires a native single-architecture macOS build")
+    message(FATAL_ERROR "D3D7/D3D8 Rust integration requires a native single-architecture build")
   endif()
   file(GLOB_RECURSE RECOMP_D3D8_WGPU_SOURCES CONFIGURE_DEPENDS
     "${RECOMP_D3D8_WGPU_DIR}/src/*.rs")
   set(RECOMP_D3D8_WGPU_TARGET_DIR "${RECOMP_BUILD_ROOT}/d3d8-wgpu/rust")
-  set(RECOMP_D3D8_WGPU_LIB "${RECOMP_D3D8_WGPU_TARGET_DIR}/release/libd3d8_wgpu.a")
-  set(RECOMP_D3D8_ABI_HEADER "${RECOMP_D3D8_GENERATED_DIR}/d3d8_abi.h")
+  set(RECOMP_D3D8_WGPU_LIB "${RECOMP_D3D8_WGPU_TARGET_DIR}/release/${CMAKE_STATIC_LIBRARY_PREFIX}d3d8_wgpu${CMAKE_STATIC_LIBRARY_SUFFIX}")
+  set(RECOMP_D3D8_NATIVE_LIBS "${RECOMP_D3D8_GENERATED_DIR}/native-libs.rsp")
+  set(RECOMP_D3D8_BRIDGE_HEADER "${RECOMP_D3D8_GENERATED_DIR}/d3d_bridge.h")
+  set(RECOMP_D3D8_CXX_HEADER "${RECOMP_D3D8_GENERATED_DIR}/rust/cxx.h")
+  set(RECOMP_D3D8_DEPLOYMENT_ARGS)
+  if(APPLE)
+    set(RECOMP_D3D8_DEPLOYMENT_TARGET "${CMAKE_OSX_DEPLOYMENT_TARGET}")
+    if(NOT RECOMP_D3D8_DEPLOYMENT_TARGET)
+      if(CMAKE_OTOOL)
+        set(RECOMP_D3D8_OTOOL "${CMAKE_OTOOL}")
+      else()
+        find_program(RECOMP_D3D8_OTOOL NAMES otool)
+      endif()
+      set(RECOMP_D3D8_COMPILER_ABI "${CMAKE_PLATFORM_INFO_DIR}/CMakeDetermineCompilerABI_CXX.bin")
+      if(RECOMP_D3D8_OTOOL AND EXISTS "${RECOMP_D3D8_COMPILER_ABI}")
+        execute_process(
+          COMMAND "${RECOMP_D3D8_OTOOL}" -l "${RECOMP_D3D8_COMPILER_ABI}"
+          RESULT_VARIABLE RECOMP_D3D8_OTOOL_STATUS
+          OUTPUT_VARIABLE RECOMP_D3D8_LOAD_COMMANDS
+          ERROR_QUIET)
+        if(RECOMP_D3D8_OTOOL_STATUS EQUAL 0 AND
+            RECOMP_D3D8_LOAD_COMMANDS MATCHES "minos[ \t]+([0-9]+(\\.[0-9]+)*)")
+          set(RECOMP_D3D8_DEPLOYMENT_TARGET "${CMAKE_MATCH_1}")
+        elseif(RECOMP_D3D8_OTOOL_STATUS EQUAL 0 AND
+            RECOMP_D3D8_LOAD_COMMANDS MATCHES "cmd LC_VERSION_MIN_MACOSX[\r\n]+[^\r\n]+[\r\n]+[ \t]*version[ \t]+([0-9]+(\\.[0-9]+)*)")
+          set(RECOMP_D3D8_DEPLOYMENT_TARGET "${CMAKE_MATCH_1}")
+        endif()
+      endif()
+      if(NOT RECOMP_D3D8_DEPLOYMENT_TARGET)
+        message(FATAL_ERROR "Could not determine the native macOS deployment target from CMAKE_OSX_DEPLOYMENT_TARGET or the CMake C++ ABI probe")
+      endif()
+    endif()
+    list(APPEND RECOMP_D3D8_DEPLOYMENT_ARGS --deployment-target "${RECOMP_D3D8_DEPLOYMENT_TARGET}")
+  endif()
   add_custom_command(
-    OUTPUT "${RECOMP_D3D8_WGPU_LIB}" "${RECOMP_D3D8_ABI_HEADER}"
+    OUTPUT "${RECOMP_D3D8_WGPU_LIB}"
+           "${RECOMP_D3D8_BRIDGE_HEADER}" "${RECOMP_D3D8_CXX_HEADER}" "${RECOMP_D3D8_NATIVE_LIBS}"
     COMMAND ${Python3_EXECUTABLE} "${RECOMP_ROOT}/tools/build_d3d8_wgpu.py"
             --cargo "${CARGO_EXECUTABLE}" --crate "${RECOMP_D3D8_WGPU_DIR}"
-            --target-dir "${RECOMP_D3D8_WGPU_TARGET_DIR}" --header "${RECOMP_D3D8_ABI_HEADER}"
+            --target-dir "${RECOMP_D3D8_WGPU_TARGET_DIR}"
+            --bridge-header "${RECOMP_D3D8_BRIDGE_HEADER}" --cxx-header "${RECOMP_D3D8_CXX_HEADER}"
+            --native-libs "${RECOMP_D3D8_NATIVE_LIBS}" --cxx "${CMAKE_CXX_COMPILER}"
+            ${RECOMP_D3D8_DEPLOYMENT_ARGS}
     DEPENDS "${RECOMP_D3D8_WGPU_DIR}/Cargo.toml"
             "${RECOMP_D3D8_WGPU_DIR}/Cargo.lock"
             "${RECOMP_D3D8_WGPU_DIR}/build.rs"
-            "${RECOMP_D3D8_WGPU_DIR}/cbindgen.toml"
             "${RECOMP_ROOT}/tools/build_d3d8_wgpu.py"
             ${RECOMP_D3D8_WGPU_SOURCES}
     COMMENT "Building d3d8-wgpu Rust static library"
     VERBATIM)
-  add_custom_target(d3d8_abi_header DEPENDS "${RECOMP_D3D8_ABI_HEADER}")
-  add_dependencies(recomp_dx d3d8_abi_header)
+  add_custom_target(d3d_bridge_headers DEPENDS
+    "${RECOMP_D3D8_BRIDGE_HEADER}" "${RECOMP_D3D8_CXX_HEADER}")
+  add_dependencies(recomp_dx d3d_bridge_headers)
   add_custom_target(d3d8_wgpu_rust DEPENDS "${RECOMP_D3D8_WGPU_LIB}")
   add_library(d3d8_wgpu STATIC IMPORTED GLOBAL)
-  set_target_properties(d3d8_wgpu PROPERTIES IMPORTED_LOCATION "${RECOMP_D3D8_WGPU_LIB}")
+  set_target_properties(d3d8_wgpu PROPERTIES IMPORTED_LOCATION "${RECOMP_D3D8_WGPU_LIB}"
+    INTERFACE_LINK_LIBRARIES "-Wl,@${RECOMP_D3D8_NATIVE_LIBS}")
   add_dependencies(d3d8_wgpu d3d8_wgpu_rust)
-  target_include_directories(recomp_dx PRIVATE "${RECOMP_D3D8_GENERATED_DIR}")
-  target_compile_definitions(recomp_dx PRIVATE RECOMP_D3D8_WGPU=1 RECOMP_D3D8_RESOURCES=1)
+  if(RECOMP_D3D8_WGPU)
+    target_compile_definitions(recomp_dx PRIVATE RECOMP_D3D8_WGPU=1)
+  endif()
   target_link_libraries(recomp_dx PUBLIC d3d8_wgpu)
-  foreach(fw ApplicationServices CoreGraphics CoreVideo Carbon AppKit Foundation QuartzCore Metal CoreFoundation ColorSync CoreServices IOKit)
-    find_library(RECOMP_FW_${fw} ${fw})
-    if(RECOMP_FW_${fw})
-      target_link_libraries(recomp_dx PUBLIC ${RECOMP_FW_${fw}})
-    endif()
-  endforeach()
+else()
+  message(FATAL_ERROR "D3D7/D3D8 Rust host crate was not found")
 endif()
 
 # The same shims with every host callback a strong no-op: a binary linking
 # these can neither draw nor play sound. Profile and mod tests use it.
 add_library(recomp_dx_null OBJECT ${RECOMP_DX_SOURCES})
 add_dependencies(recomp_dx_null d3d8_com_tables)
-target_include_directories(recomp_dx_null PRIVATE "${RECOMP_D3D8_GENERATED_DIR}")
+target_include_directories(recomp_dx_null PUBLIC "${RECOMP_D3D8_GENERATED_DIR}")
 target_link_libraries(recomp_dx_null PUBLIC recomp_runtime recomp_frame_dump)
 recomp_link_video(recomp_dx_null)
 target_compile_definitions(recomp_dx_null PUBLIC RECOMP_NULL_HOST)
 target_compile_options(recomp_dx_null PRIVATE ${RECOMP_WARN_HOST})
 recomp_optimize(recomp_dx_null 1)
-# Exercise the same Rust CPU storage through guest COM without creating a GPU.
 if(TARGET d3d8_wgpu)
-  add_dependencies(recomp_dx_null d3d8_abi_header)
-  target_include_directories(recomp_dx_null PRIVATE "${RECOMP_D3D8_GENERATED_DIR}")
-  target_compile_definitions(recomp_dx_null PUBLIC RECOMP_D3D8_RESOURCES=1)
+  add_dependencies(recomp_dx_null d3d_bridge_headers)
   target_link_libraries(recomp_dx_null PUBLIC d3d8_wgpu)
-  foreach(fw ApplicationServices CoreGraphics CoreVideo Carbon AppKit Foundation QuartzCore Metal CoreFoundation ColorSync CoreServices IOKit)
-    if(RECOMP_FW_${fw})
-      target_link_libraries(recomp_dx_null PUBLIC ${RECOMP_FW_${fw}})
-    endif()
-  endforeach()
 endif()
 
 
@@ -146,7 +164,7 @@ set_tests_properties(d3d8_surface_tests PROPERTIES LABELS nogame)
 if(TARGET d3d8_wgpu)
   add_executable(d3d8_render_tests tests/d3d8_render_tests.cpp
     ${RECOMP_ROOT}/runtime/tests/stub_recomp_call.cpp)
-  add_dependencies(d3d8_render_tests d3d8_abi_header)
+  add_dependencies(d3d8_render_tests d3d_bridge_headers)
   target_include_directories(d3d8_render_tests PRIVATE "${RECOMP_D3D8_GENERATED_DIR}")
   target_link_libraries(d3d8_render_tests PRIVATE recomp_platform recomp_dx recomp_runtime)
   target_compile_options(d3d8_render_tests PRIVATE ${RECOMP_WARN_HOST})
@@ -156,7 +174,7 @@ if(TARGET d3d8_wgpu)
   set_tests_properties(d3d8_render_tests PROPERTIES LABELS gpu)
   add_executable(d3d7_mipmap_tests tests/d3d7_mipmap_tests.cpp
     ${RECOMP_ROOT}/runtime/tests/stub_recomp_call.cpp)
-  add_dependencies(d3d7_mipmap_tests d3d8_abi_header)
+  add_dependencies(d3d7_mipmap_tests d3d_bridge_headers)
   target_include_directories(d3d7_mipmap_tests PRIVATE "${RECOMP_D3D8_GENERATED_DIR}")
   target_link_libraries(d3d7_mipmap_tests PRIVATE recomp_platform recomp_dx recomp_runtime)
   target_compile_options(d3d7_mipmap_tests PRIVATE ${RECOMP_WARN_HOST})
@@ -164,15 +182,6 @@ if(TARGET d3d8_wgpu)
   recomp_test_binary(d3d7_mipmap_tests)
   add_test(NAME d3d7_mipmap_tests COMMAND d3d7_mipmap_tests)
   set_tests_properties(d3d7_mipmap_tests PROPERTIES LABELS gpu)
-  add_library(d3d8_abi_layout_test OBJECT tests/d3d8_abi_layout_test.c)
-  add_dependencies(d3d8_abi_layout_test d3d8_abi_header)
-  target_include_directories(d3d8_abi_layout_test PRIVATE "${RECOMP_D3D8_GENERATED_DIR}")
-  target_sources(d3d8_surface_tests PRIVATE $<TARGET_OBJECTS:d3d8_abi_layout_test>)
-  add_test(NAME d3d8_abi_cpp_check
-    COMMAND ${CMAKE_CXX_COMPILER} -std=c++17 -Wall -Wextra -Werror
-            -I${RECOMP_D3D8_GENERATED_DIR} -fsyntax-only -x c++
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d8_abi_layout_test.c)
-  set_tests_properties(d3d8_abi_cpp_check PROPERTIES LABELS nogame)
 endif()
 
 

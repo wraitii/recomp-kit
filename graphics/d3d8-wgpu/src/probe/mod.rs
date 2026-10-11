@@ -244,7 +244,7 @@ fn run_with_gpu(
             "adapter initialization",
             "X8 clear/readback",
             "reused staging/direct readback",
-            "direct readback ABI bounds",
+            "direct readback output bounds",
             "clear/readback",
             "transformed triangle/readback",
             "point list/readback",
@@ -317,38 +317,19 @@ fn run_with_gpu(
     device.clear(&[], 1 | 2, 0x7f123456, 1.0, 0)?;
     let pixels = device.read_pixels()?;
     checked_pixels(&pixels, options.width, options.height)?;
-    let mut abi_out = vec![0xaa; pixels.len() + 8];
-    let mut out_len = 0;
-    let mut error = crate::abi::D3d8Error::empty();
-    let raw_device = (&mut device as *mut Device).cast::<crate::abi::D3d8Device>();
-    let short_status = crate::abi::d3d8_device_read_pixels(
-        raw_device,
-        abi_out.as_mut_ptr(),
-        1,
-        &mut out_len,
-        &mut error,
-    );
+    let mut readback = vec![0xaa; pixels.len()];
     let short_ok =
-        short_status != 0 && out_len as usize == pixels.len() && abi_out.iter().all(|&p| p == 0xaa);
-    let status = crate::abi::d3d8_device_read_pixels(
-        raw_device,
-        abi_out.as_mut_ptr(),
-        abi_out.len() as u32,
-        &mut out_len,
-        &mut error,
-    );
-    let abi_ok = short_ok
-        && status == 0
-        && abi_out[..pixels.len()] == pixels
-        && abi_out[pixels.len()..].iter().all(|&p| p == 0xaa);
+        device.read_pixels_into(&mut readback[..1]).is_err() && readback.iter().all(|&p| p == 0xaa);
+    let readback_ok =
+        short_ok && device.read_pixels_into(&mut readback).is_ok() && readback == pixels;
     report.checks.push(CheckResult {
-        name: "direct readback ABI bounds",
-        outcome: if abi_ok {
+        name: "direct readback output bounds",
+        outcome: if readback_ok {
             Outcome::Passed
         } else {
             Outcome::Failed
         },
-        detail: "short output unchanged; required size; exact pixels and trailing guard".into(),
+        detail: "short output unchanged; exact pixels".into(),
     });
 
     let mismatches = pixels.chunks_exact(4).filter(|p| *p != CLEAR).count();

@@ -99,6 +99,9 @@ static const uint32_t D3DERR_BADMAJORVERSION = MAKE_DDHRESULT(700);
 static const uint32_t D3DERR_BADMINORVERSION = MAKE_DDHRESULT(701);
 static const uint32_t D3DERR_INVALID_DEVICE = MAKE_DDHRESULT(705);
 static const uint32_t D3DERR_INITFAILED = MAKE_DDHRESULT(706);
+static const uint32_t D3DERR_INVALIDSTATEBLOCK = 0x88760834u;
+static const uint32_t D3DERR_INBEGINSTATEBLOCK = 0x88760835u;
+static const uint32_t D3DERR_NOTINBEGINSTATEBLOCK = 0x88760836u;
 // The SDK spells these D3DERR_SCENE_IN_SCENE, _NOT_IN_SCENE, _BEGIN_FAILED
 // and _END_FAILED. Codes 723-726 are the D3DERR_TEXTURE_* failures, so the
 // earlier values here returned a texture error where the caller was told to

@@ -7,8 +7,6 @@
 //!   and device emulation. No Ghost Recon addresses, no guest CPU
 //!   types, no recomp-kit types.
 //! - [`backend`] — wgpu instance/adapter/device/surface and readback plumbing.
-//! - [`abi`] — a small C ABI exposing opaque host handles. Guest COM dispatch,
-//!   32-bit pointer/layout conversion and lock-copy bridging are out of scope.
 //! - [`probe`] — the shared probe harness and its assertions.
 //!
 //! The isolated Metal probes have run;
@@ -16,8 +14,10 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-pub mod abi;
 pub mod backend;
+pub mod bridge;
+pub(crate) mod bridge_render;
+pub(crate) mod bridge_translate;
 pub mod d3d8;
 pub mod probe;
 

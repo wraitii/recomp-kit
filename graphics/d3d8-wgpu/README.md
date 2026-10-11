@@ -43,11 +43,9 @@ current viewport, and preserves color/depth/stencil outside the selected regions
 An empty array clears the viewport. The bridge validates guest spans and copies
 unaligned records before calling Rust; rectangle memory is consumed before return.
 
-ABI version 9 (including Clear rectangle arrays) is generated from Rust with cbindgen 0.29.4. COM IIDs, slots and
-arities are generated from the pinned Wine header with a reviewed handler map.
-Cargo builds generate the header using the pinned cbindgen build dependency;
-CMake stages it alongside the COM tables under `build/d3d8-generated/`.
-Generated code is not tracked, and no separate cbindgen installation is needed.
+The renderer boundary is a CXX bridge. Rust owns typed device, resource and
+storage state; C++ retains guest COM dispatch, memory validation and HRESULT
+conversion. CXX-generated headers are build output and are not tracked.
 
 The Metal headless probe passed clear/readback, transformed triangles and depth
 occlusion on Apple M1 Max. Startup replay produced one 640x480 PNG, then failed
@@ -67,7 +65,7 @@ src/d3d8/            reusable D3D8 layer (no windowing, no game types)
   fixed_function.rs  FVF -> vertex layout and fixed-function WGSL
   device.rs          Clear / Draw* / Present / resource creation
 src/backend/         wgpu instance / adapter / device / surface / readback
-src/abi.rs           C ABI (version/status/diagnostics, adapter query, device ops)
+src/bridge.rs        CXX shared types, device/resource ownership and D3D7 state
 src/probe/           shared probe harness and assertions
 src/bin/             probe-headless (offscreen readback), probe-windowed (present)
 ```

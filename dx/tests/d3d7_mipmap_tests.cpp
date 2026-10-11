@@ -2,7 +2,7 @@
 #include "../dx.h"
 #include "../../runtime/memory.h"
 #include "guest_abi.h"
-#include "d3d8_abi.h"
+#include "../d3d_bridge_helpers.h"
 #include <cmath>
 
 static void check(bool value, const char *message) {
@@ -111,11 +111,13 @@ int main() {
         check(call_method(dev, 25, {4, 0x1c4, vertices, 3, 0}) == DD_OK, "DrawPrimitive");
         check(call_method(dev, 6) == DD_OK, "EndScene");
         uint8_t pixels[16 * 16 * 4];
-        uint32_t size = 0;
-        D3d8Error err{};
-        check(d3d8_device_read_pixels((D3d8Device *)com_this(dev)->d3d7_host, pixels,
-                                      sizeof(pixels), &size, &err) == 0,
-              "GPU readback");
+        uint64_t size = 0;
+        auto &host = *com_this(dev)->d3d7_host->value;
+        const auto size_status = recomp::d3d::read_pixels_len(host, size);
+        check(d3d_bridge_ok(size_status) && size == sizeof(pixels), "GPU readback size");
+        const auto read_status =
+            recomp::d3d::read_pixels(host, rust::Slice<uint8_t>(pixels, sizeof(pixels)));
+        check(d3d_bridge_ok(read_status), "GPU readback");
         uint8_t *p = pixels + (8 * 16 + 8) * 4;
         if (std::abs(int(p[0]) - r) > 2 || std::abs(int(p[1]) - g) > 2 ||
             std::abs(int(p[2]) - b) > 2)
