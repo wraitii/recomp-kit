@@ -191,6 +191,54 @@ void get_metrics(X86 *c) {
     }
     set_eax(c, 1);
 }
+// OUTLINETEXTMETRICA: the size word then the TEXTMETRICA the base call also
+// reports. The outline specifics stay zero.
+void outline_text_metrics(X86 *c) {
+    auto *dc = dc_of(arg(c, 0));
+    uint32_t size = arg(c, 1), out = arg(c, 2);
+    if (!dc || !out || size < 64 || !gm_valid(out, size)) {
+        set_eax(c, 0);
+        return;
+    }
+    memset(g_mem + out, 0, size);
+    wr32(out, size);
+    auto font = objects().find(dc->font);
+    uint32_t weight = font == objects().end() ? 400 : font_word(font->second, 16);
+    if (!weight)
+        weight = 400;
+    metrics(out + 4, font_scale(arg(c, 0)), weight);
+    set_eax(c, 1);
+}
+void char_width32(X86 *c) {
+    uint32_t dc = arg(c, 0), first = arg(c, 1), last = arg(c, 2), out = arg(c, 3);
+    if (!dc_of(dc) || last < first || !out || last - first > GUEST_SIZE / 4 - 1 ||
+        !gm_valid(out, (last - first + 1) * 4)) {
+        set_eax(c, 0);
+        return;
+    }
+    const Pen pen = pen_of(dc);
+    for (uint32_t ch = first; ch <= last; ++ch)
+        wr32(out + (ch - first) * 4, uint32_t(pen.advance(ch)));
+    set_eax(c, 1);
+}
+// ABC: a zero left and right bearing around the advance, which is how the
+// bitmap and Open Sans paths draw them.
+void char_abc_widths(X86 *c) {
+    uint32_t dc = arg(c, 0), first = arg(c, 1), last = arg(c, 2), out = arg(c, 3);
+    if (!dc_of(dc) || last < first || !out || last - first > GUEST_SIZE / 12 - 1 ||
+        !gm_valid(out, (last - first + 1) * 12)) {
+        set_eax(c, 0);
+        return;
+    }
+    const Pen pen = pen_of(dc);
+    for (uint32_t ch = first; ch <= last; ++ch) {
+        uint32_t at = out + (ch - first) * 12;
+        wr32(at, 0);
+        wr32(at + 4, uint32_t(pen.advance(ch)));
+        wr32(at + 8, 0);
+    }
+    set_eax(c, 1);
+}
 void extent(X86 *c) {
     uint32_t dc = arg(c, 0), text = arg(c, 1), n = arg(c, 2), out = arg(c, 3);
     if (!dc_of(dc) || !out || !gm_valid(out, 8) || n > GUEST_SIZE / 2 ||
@@ -447,6 +495,9 @@ void register_text() {
                                        G("GetTextExtentPoint32W", 4, extent),
                                        G("GetTextExtentPointW", 4, extent),
                                        G("GetTextMetricsW", 2, get_metrics),
+                                       G("GetOutlineTextMetricsA", 3, outline_text_metrics),
+                                       G("GetCharABCWidthsA", 4, char_abc_widths),
+                                       G("GetCharWidth32A", 4, char_width32),
                                        G("AddFontMemResourceEx", 4, memory_font),
                                        G("EnumFontsW", 4, enumerate),
                                        G("EnumFontFamiliesExW", 5, enumerate),

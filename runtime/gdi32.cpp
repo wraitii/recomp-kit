@@ -784,6 +784,20 @@ void g_SetBkMode(X86 *c) {
     dc.bk_mode = arg(c, 1);
     set_eax(c, prev);
 }
+// (hdc, nCharExtra): returns the previous intercharacter spacing. The value is
+// kept on the DC; the runtime's TextOutA does not draw, so nothing consumes it
+// yet.
+void g_SetTextCharacterExtra(X86 *c) {
+    auto *found = dc_of(arg(c, 0));
+    if (!found) {
+        set_eax(c, 0);
+        return;
+    }
+    DeviceContext &dc = *found;
+    uint32_t prev = (uint32_t)dc.char_extra;
+    dc.char_extra = (int32_t)arg(c, 1);
+    set_eax(c, prev);
+}
 
 const ImportShim g_gdi32_shims[] = {
     {"GDI32.dll", "CreateFontA", 14, nullptr},
@@ -812,6 +826,7 @@ const ImportShim g_gdi32_shims[] = {
     {"GDI32.dll", "SetTextColor", 2, g_SetTextColor},
     {"GDI32.dll", "SetBkColor", 2, g_SetBkColor},
     {"GDI32.dll", "SetBkMode", 2, g_SetBkMode},
+    {"GDI32.dll", "SetTextCharacterExtra", 2, g_SetTextCharacterExtra},
 };
 const size_t g_gdi32_shim_count = sizeof(g_gdi32_shims) / sizeof(g_gdi32_shims[0]);
 
