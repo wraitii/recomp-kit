@@ -634,9 +634,12 @@ LoaderModule *loader_module_named(const char *name) {
     return nullptr;
 }
 uint32_t loader_call_entry(X86 *c, const LoaderModule &m, uint32_t reason) {
-    if (!m.entry || recomp_module_lookup(m.entry) < 0) {
-        LOGV("%s: DLL entry %08x is not translated, not run", m.name.c_str(), m.entry);
+    if (!m.entry)
         return 1;
+    if (recomp_module_lookup(m.entry) < 0) {
+        fprintf(stderr, "[recomp] fatal: %s has an untranslated DLL entry at %08x (reason %u)\n",
+                m.name.c_str(), m.entry, reason);
+        abort();
     }
     uint32_t result = guest_call(c, m.entry, m.base, reason, 0);
     LOGV("%s: DLL entry %08x reason %u returned %08x", m.name.c_str(), m.entry, reason, result);

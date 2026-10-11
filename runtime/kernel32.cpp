@@ -1485,6 +1485,7 @@ void k_LoadLibraryExW(X86 *c) {
     std::string guest = gm_wstr(arg(c, 0));
     if (LoaderModule *m = loader_module_named(library_name(guest).c_str()))
         if (m->attached) {
+            ++m->load_refs;
             set_eax(c, m->base);
             return;
         }
@@ -1666,14 +1667,14 @@ void k_GetSystemInfo(X86 *c) {
         return;
     }
     memset(g_mem + p, 0, 36);
-    wr32(p + 0, 0);           // wProcessorArchitecture = INTEL, wReserved
-    wr32(p + 4, 4096);        // dwPageSize
-    wr32(p + 8, IMAGE_BASE);  // lpMinimumApplicationAddress
-    wr32(p + 12, HEAP_LIMIT); // lpMaximumApplicationAddress
-    wr32(p + 16, 1);          // dwActiveProcessorMask
-    wr32(p + 20, 1);          // dwNumberOfProcessors
-    wr32(p + 24, 586);        // dwProcessorType = PROCESSOR_INTEL_PENTIUM
-    wr32(p + 28, 65536);      // dwAllocationGranularity
+    wr32(p + 0, 0);             // wProcessorArchitecture = INTEL, wReserved
+    wr32(p + 4, 4096);          // dwPageSize
+    wr32(p + 8, IMAGE_BASE);    // lpMinimumApplicationAddress
+    wr32(p + 12, HEAP_LIMIT);   // lpMaximumApplicationAddress
+    wr32(p + 16, 1);            // dwActiveProcessorMask
+    wr32(p + 20, 1);            // dwNumberOfProcessors
+    wr32(p + 24, 586);          // dwProcessorType = PROCESSOR_INTEL_PENTIUM
+    wr32(p + 28, 65536);        // dwAllocationGranularity
     wr32(p + 32, (5 << 8) | 6); // wProcessorLevel / wProcessorRevision
     set_eax(c, 0);
 }
