@@ -35,6 +35,10 @@ class Settings(object):
         self.native_header = native.get("header") if isinstance(native, dict) else None
         if self.module:
             self.native_header = None
+        metadata = translate.get("x87_mode_metadata")
+        self.x87_mode_metadata = self.game_dir / metadata if metadata and not self.module else None
+        self.x87_imports_preserve_pc_rc = translate["x87_imports_preserve_pc_rc"]
+        self.x87_entry_contracts = translate.get("x87_entry_contracts", []) if not self.module else []
         self.call_contracts = translate["call_contracts"]
         self.private_leaf_contracts = translate["private_leaf_contracts"] and not self.module
         self.checked_returns = frozenset(translate["checked_returns"]) if not self.module else frozenset()

@@ -243,13 +243,25 @@ def load(game_dir, build_root=None):
     # ssa-call-contracts). False publishes every field at every call.
     if not isinstance(translate.setdefault("call_contracts", TRANSLATE_DEFAULTS["call_contracts"]), bool):
         raise ValueError("%s: [translate] call_contracts must be a boolean" % source)
-    # FP-heavy SSA bodies get a fast clone specialised for PC = RC = 0 that
-    # falls back to the general body when the guest CW differs. Exact; false
-    # emits the general body alone.
     if not isinstance(translate.setdefault("x87_cw_clone", TRANSLATE_DEFAULTS["x87_cw_clone"]), bool):
         raise ValueError("%s: [translate] x87_cw_clone must be a boolean" % source)
     if not isinstance(translate.setdefault("private_leaf_contracts", TRANSLATE_DEFAULTS["private_leaf_contracts"]), bool):
         raise ValueError("%s: [translate] private_leaf_contracts must be a boolean" % source)
+    if type(translate.setdefault("x87_imports_preserve_pc_rc", False)) is not bool:
+        raise ValueError("%s: x87_imports_preserve_pc_rc must be a boolean" % source)
+    contracts = translate.setdefault("x87_entry_contracts", [])
+    if not isinstance(contracts, list):
+        raise ValueError("%s: x87_entry_contracts must be a list" % source)
+    seen = set()
+    for row in contracts:
+        addr, mask, value = (row.get(k) for k in ("function", "mask", "value"))
+        if (type(addr) is not int or not 0 <= addr <= 0xffffffff or addr in seen
+                or type(mask) is not int or not 0 < mask <= 0xffff
+                or type(value) is not int or value & ~mask
+                or not row.get("evidence") or row.get("scope") != "all_invocations"
+                or type(row.get("verify", False)) is not bool):
+            raise ValueError("%s: invalid x87 entry contract %r" % (source, row))
+        seen.add(addr)
     checked = translate.setdefault("checked_returns", [])
     if not isinstance(checked, list) or not all(type(v) is int and 0 <= v <= 0xffffffff for v in checked):
         raise ValueError("%s: [translate] checked_returns must be a list of 32-bit addresses" % source)

@@ -17,8 +17,8 @@ CW_RESET = 0x037f
 Fact = namedtuple("Fact", ("known_mask", "known_value", "entry_mask"))
 ReturnSummary = namedtuple("ReturnSummary", ("preserved_mask", "known_mask", "known_value"))
 Prepared = namedtuple("Prepared", ("addr", "entry", "sites", "order", "succ", "preds",
-                                   "effects", "calls", "returns", "x87_count", "word_relations"))
-Analysis = namedtuple("Analysis", ("calls", "returns", "losses"))
+                                   "effects", "calls", "returns", "x87_count", "word_relations", "entries"))
+Analysis = namedtuple("Analysis", ("calls", "returns", "losses", "sites", "gaps"), defaults=((),))
 
 UNKNOWN = Fact(0, 0, 0)
 ENTRY = Fact(0, 0, CW_MASK)
@@ -26,6 +26,13 @@ UNKNOWN_SUMMARY = ReturnSummary(0, 0, 0)
 
 _CW_NEUTRAL = x87.SUPPORTED | frozenset((
     "FCOMI", "FCOMIP", "FUCOMI", "FUCOMIP", "FEMMS", "WAIT",
+))
+_CW_NEUTRAL_USER_OPS = frozenset((
+    "CPUID", "RDTSC", "PACKSSDW", "PACKSSWB", "PSRAW", "PSWAPD",
+    "RCPPS", "RCPSS", "RSQRTSS", "PF2ID", "PFACC", "PFADD", "PFCMPEQ",
+    "PFCMPGE", "PFCMPGT", "PFMAX", "PFMIN", "PFMUL", "PFNACC", "PFPNACC",
+    "PFRCP", "PFRCPIT1", "PFRCPIT2", "PFRSQIT1", "PFRSQRT", "PFSUB",
+    "PFSUBR", "PI2FD",
 ))
 _DECODER = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
 
@@ -70,7 +77,7 @@ def summary_dict(summary):
             "known_value": "%04x" % summary.known_value}
 
 
-def _mnemonic(ins):
+def instruction_mnemonic(ins):
     """Decode and validate the byte-backed instruction name used by effects."""
     if not ins.raw:
         return None
@@ -85,7 +92,7 @@ def _mnemonic(ins):
     return meaningful[0]
 
 
-def _effect(mnem):
+def instruction_effect(mnem):
     if mnem in ("FINIT", "FNINIT", "FSAVE", "FNSAVE"):
         return ("set", CW_MASK, CW_RESET, "reset control word")
     if mnem == "FNSTENV" or mnem == "FSTENV":
@@ -111,10 +118,10 @@ def writer_effect(mnem):
     never promoted to definite writer sites by this helper.
     """
     mnem = str(mnem).upper()
-    return _effect(mnem) if mnem in _CW_WRITERS else None
+    return instruction_effect(mnem) if mnem in _CW_WRITERS else None
 
 
-def _call_target(ins):
+def direct_call_target(ins):
     for op in ins.ops:
         if op.opc == "CALL" and op.ins:
             space, target, _size = op.ins[0]
@@ -123,14 +130,28 @@ def _call_target(ins):
 
 
 def prepare(fir):
-    """Prepare closed lifted IR; reject bodies without byte-backed boundaries."""
-    if (not fir.insns or not cfg_is_closed(fir) or fir.entries or fir.seh
-            or any(not ins.raw for ins in fir.insns)):
+    """Prepare closed byte-backed IR; secondary entries contribute unknown facts."""
+    tails = {}
+    for i, targets in fir.exits.items():
+        ins = fir.insns[i]
+        literal = [op.ins[0][1] for op in ins.ops
+                   if op.opc == "BRANCH" and op.ins[0][0] == "ram"]
+        if (instruction_mnemonic(ins) != "JMP" or fir.succ[i] or len(targets) != 1
+                or literal != list(targets)):
+            return None
+        tails[i] = literal[0]
+    if not fir.insns or fir.seh or any(not ins.raw for ins in fir.insns):
         return None
+    if not tails and not cfg_is_closed(fir):
+        return None
+    for i, ins in enumerate(fir.insns):
+        if not fir.succ[i] and i not in tails and instruction_mnemonic(ins) != "RET":
+            return None
     entry = next((i for i, ins in enumerate(fir.insns) if ins.addr == fir.addr), None)
     if entry is None:
         return None
-    seen, todo = set(), [entry]
+    roots = (entry,) + tuple(i for i, ins in enumerate(fir.insns) if ins.addr in fir.entries)
+    seen, todo = set(), list(roots)
     while todo:
         i = todo.pop()
         if i in seen or not 0 <= i < len(fir.insns):
@@ -145,27 +166,29 @@ def prepare(fir):
     sites = tuple(ins.addr for ins in fir.insns)
     for i in order:
         ins = fir.insns[i]
-        mnem = _mnemonic(ins)
+        mnem = instruction_mnemonic(ins)
         if mnem is None:
             return None
-        effect = _effect(mnem)
-        if (effect[0] == "keep" and mnem not in ("FEMMS",)
+        effect = instruction_effect(mnem)
+        if (effect[0] == "keep" and mnem not in _CW_NEUTRAL | _CW_NEUTRAL_USER_OPS
                 and any(op.opc == "CALLOTHER" for op in ins.ops)):
             effect = ("unknown", 0, 0, "unmodeled user operation")
         effects.append((i, effect))
-        if any(op.opc in ("CALL", "CALLIND") for op in ins.ops):
-            calls.append((i, ins.addr, _call_target(ins)))
-        if mnem == "RET" or any(op.opc == "RETURN" for op in ins.ops):
+        if i in tails:
+            calls.append((i, ins.addr, tails[i]))
+        elif any(op.opc in ("CALL", "CALLIND") for op in ins.ops):
+            calls.append((i, ins.addr, direct_call_target(ins)))
+        if i in tails or mnem == "RET" or any(op.opc == "RETURN" for op in ins.ops):
             returns.append(i)
         for target in succ[i]:
             preds[target].append(i)
     from .x87_provenance import relations
-    word_relations = relations(fir) if any(_mnemonic(fir.insns[i]) == "FLDCW" for i in order) else {}
+    word_relations = relations(fir) if any(instruction_mnemonic(fir.insns[i]) == "FLDCW" for i in order) else {}
     return Prepared(fir.addr, entry, sites, order, succ,
                     tuple(tuple(row) for row in preds), tuple(effects),
                     tuple(calls), tuple(returns),
-                    sum(1 for i in order if _mnemonic(fir.insns[i]).startswith("F")
-                        and _mnemonic(fir.insns[i]) != "FEMMS"), word_relations or {})
+                    sum(1 for i in order if instruction_mnemonic(fir.insns[i]).startswith("F")
+                        and instruction_mnemonic(fir.insns[i]) != "FEMMS"), word_relations or {}, roots)
 
 
 def _apply_summary(fact, summary):
@@ -191,40 +214,57 @@ def _call_summary(target, summaries, opaque_targets, recursive):
     return summaries.get(target)
 
 
-def _record_loss(losses, seen, site, reason, target, lost):
+def _record_loss(losses, seen, site, reason, target, lost, predecessor=None):
     if not lost:
         return
     row = {"site": "%08x" % site, "reason": reason,
            "target": None if target is None else "%08x" % target,
-           "lost_mask": "%04x" % lost}
-    key = (row["site"], row["reason"], row["target"], row["lost_mask"])
+           "lost_mask": "%04x" % lost,
+           "kind": "unresolved_preservation" if ("unresolved" in reason or "opaque" in reason or "unmodeled" in reason or "recursive" in reason) else "join" if "join" in reason else "possible_mode_change"}
+    if predecessor is not None:
+        row["predecessor"] = "%08x" % predecessor
+    key = (row["site"], row["reason"], row["target"], row["lost_mask"], predecessor)
     if key not in seen:
         seen.add(key)
         losses.append(row)
 
 
-def _run(prepared, summaries, opaque_targets, recursive=frozenset()):
+def _run(prepared, summaries, opaque_targets, recursive=frozenset(),
+         initial=ENTRY, boundaries=None):
+    boundaries = boundaries or {}
+    call_boundaries = boundaries.get("calls", {})
+    edge_boundaries = boundaries.get("edges", {})
+
+    def call_summary(i, target):
+        return call_boundaries.get(prepared.sites[i],
+               _call_summary(target, summaries, opaque_targets, recursive))
+
+    def edge_fact(p, i):
+        fact = outgoing[p]
+        effect = edge_boundaries.get((prepared.sites[p], prepared.sites[i]))
+        return _apply_summary(fact, effect) if effect else fact
     effects = dict(prepared.effects)
     calls = {i: target for i, _site, target in prepared.calls}
     call_sites = {i: site for i, site, _target in prepared.calls}
     incoming, outgoing = {}, {}
-    call_facts, losses, loss_keys = {}, [], set()
-    work = [prepared.entry]
-    queued = {prepared.entry}
-    initial = ENTRY
+    call_facts, losses, loss_keys, gaps = {}, [], set(), []
+    work = list(prepared.entries)
+    queued = set(work)
     while work:
         i = work.pop()
         queued.discard(i)
-        predecessors = [outgoing[p] for p in prepared.preds[i] if p in outgoing]
+        predecessors = [edge_fact(p, i) for p in prepared.preds[i] if p in outgoing]
         if i == prepared.entry:
             predecessors.append(initial)
+        elif i in prepared.entries:
+            predecessors.append(UNKNOWN)
         state = join(predecessors)
         if incoming.get(i) == state and i in outgoing:
             continue
         incoming[i] = state
         if i in calls:
             target = calls[i]
-            state = _apply_summary(state, _call_summary(target, summaries, opaque_targets, recursive))
+            state = _apply_summary(state, call_summary(i, target))
         kind, mask, value, reason = effects[i]
         if i in prepared.word_relations:
             relation = prepared.word_relations[i]
@@ -242,18 +282,33 @@ def _run(prepared, summaries, opaque_targets, recursive=frozenset()):
                 work.append(target)
 
     for i in prepared.order:
+        if i not in incoming:
+            continue
         state = incoming[i]
+        for p in prepared.preds[i]:
+            if p in outgoing:
+                before = edge_fact(p, i)
+                _record_loss(losses, loss_keys, prepared.sites[i],
+                             "control-flow join loses predecessor facts", None, _lost_mask(before, state), prepared.sites[p])
         if i in calls:
             target = calls[i]
             site = call_sites[i]
             call_facts[site] = state
-            summary = _call_summary(target, summaries, opaque_targets, recursive)
+            summary = call_summary(i, target)
+            unresolved = 0x0f00 & ~(summary.preserved_mask | summary.known_mask) if summary else 0x0f00
+            if unresolved:
+                gaps.append({"site": "%08x" % site,
+                             "target": None if target is None else "%08x" % target,
+                             "kind": "unresolved_preservation",
+                             "unresolved_mask": "%04x" % unresolved,
+                             "reason": "indirect or opaque call" if summary is None else "callee return relation lacks a preservation proof"})
             after = _apply_summary(state, summary)
             lost = _lost_mask(state, after)
             if summary is None:
                 reason = "indirect or opaque call" if target is None or target in opaque_targets else "recursive or unmodeled callee"
             elif lost:
-                reason = "callee return relation changes or loses control-word bits"
+                changed = state.known_mask & summary.known_mask & (state.known_value ^ summary.known_value)
+                reason = "callee proves changed control-word bits" if changed else "unresolved callee preservation proof"
             else:
                 reason = None
             if reason:
@@ -278,18 +333,23 @@ def _run(prepared, summaries, opaque_targets, recursive=frozenset()):
             loss_reason = reason or "instruction changes control-word facts"
         else:
             loss_reason = None
+        if kind == "unknown" and i not in prepared.word_relations:
+            gaps.append({"site": "%08x" % prepared.sites[i], "target": None,
+                         "kind": "possible_mode_change" if "restor" in reason or "loaded" in reason else "unresolved_instruction",
+                         "unresolved_mask": "0f00", "reason": reason})
         if loss_reason:
             _record_loss(losses, loss_keys, prepared.sites[i], loss_reason, None, lost)
     returns = join(outgoing[i] for i in prepared.returns if i in outgoing)
-    return Analysis(call_facts, returns, tuple(losses))
+    return Analysis(call_facts, returns, tuple(losses),
+                    {prepared.sites[i]: fact for i, fact in incoming.items()}, tuple(gaps))
 
 
 def _summary(fact):
     return ReturnSummary(fact.entry_mask, fact.known_mask, fact.known_value)
 
 
-def summarize(prepared_by_addr, opaque_targets=()):
-    """Summarize translated direct-call return relations; recursive edges are opaque."""
+def summarize(prepared_by_addr, opaque_targets=(), boundaries=None):
+    """Prove return relations, including induction over finite recursive returns."""
     opaque_targets = frozenset(opaque_targets)
     summaries = {addr: UNKNOWN_SUMMARY for addr, body in prepared_by_addr.items()
                  if body is None or addr in opaque_targets}
@@ -299,20 +359,29 @@ def summarize(prepared_by_addr, opaque_targets=()):
                for addr, p in analyzable.items()}
     components = call_graph(sorted(analyzable), lambda addr: targets.get(addr, ()))
     for component in components:
-        members = frozenset(component)
         recursive = len(component) > 1 or any(addr in targets.get(addr, ()) for addr in component)
-        for addr in component:
-            result = _run(analyzable[addr], summaries, opaque_targets,
-                          members if recursive else frozenset())
-            summaries[addr] = _summary(result.returns)
+        if recursive:
+            for addr in component:
+                summaries[addr] = ReturnSummary(CW_MASK, 0, 0)
+        changed = True
+        while changed:
+            changed = False
+            for addr in component:
+                result = _run(analyzable[addr], summaries, opaque_targets, boundaries=boundaries)
+                summary = _summary(result.returns)
+                if summaries.get(addr) != summary:
+                    summaries[addr] = summary
+                    changed = True
+            if not recursive:
+                break
     return summaries
 
 
-def analyze(prepared, summaries, opaque_targets=()):
+def analyze(prepared, summaries, opaque_targets=(), initial=ENTRY, boundaries=None):
     """Propagate mode facts through one function and report calls/returns/losses."""
     if prepared is None:
-        return Analysis({}, UNKNOWN, ())
-    return _run(prepared, summaries, frozenset(opaque_targets))
+        return Analysis({}, UNKNOWN, (), {})
+    return _run(prepared, summaries, frozenset(opaque_targets), initial=initial, boundaries=boundaries)
 
 
 def mode_preserving_leaf(prepared):
@@ -499,3 +568,104 @@ def exposure_report(prepared_by_addr, direct_calls_by_addr, opaque_targets=(),
             "remaining_candidates": len(candidates),
         },
     }
+
+
+def propagate(prepared, summaries, roots, opaque_targets=(), boundaries=None):
+    """Contextual direct-call facts; roots are explicit assumptions, not entry proofs."""
+    entries = dict(roots)
+    results, work = {}, list(roots)
+    edges = {}
+    while work:
+        addr = work.pop()
+        body = prepared.get(addr)
+        if body is None or addr in opaque_targets:
+            results[addr] = Analysis({}, UNKNOWN, (), {})
+            continue
+        result = analyze(body, summaries, opaque_targets, entries[addr], boundaries)
+        results[addr] = result
+        for _, site, target in body.calls:
+            if target is None or site not in result.calls:
+                continue
+            edges.setdefault(target, {})[(addr, site)] = result.calls[site]
+            incoming = list(edges[target].values())
+            fact = roots[target] if target in roots else join(incoming)
+            if entries.get(target) != fact:
+                entries[target] = fact
+                if target not in work:
+                    work.append(target)
+    return entries, results
+
+
+def ordinary_entries(prepared, summaries, contracts, direct_calls, unknown_entries,
+                     opaque_targets=(), boundaries=None):
+    """Join every static caller and unknown entry before folding a shared body.
+
+    Contracts constrain every invocation at their named primary entry. All
+    other entries start unknown; facts grow only from constants or contracts.
+    Opaque callers contribute unknown even when their outgoing edge is unlifted.
+    """
+    from collections import deque
+
+    opaque = frozenset(opaque_targets)
+    roots = {row["function"]: Fact(row["mask"], row["value"], 0) for row in contracts}
+    for addr in roots:
+        if addr not in prepared or prepared[addr] is None or addr in opaque:
+            raise ValueError("%08x: CW contract requires a prepared unreplaced body" % addr)
+    callers, edges = {}, {}
+    for addr, targets in direct_calls.items():
+        for target in targets:
+            callers.setdefault(target, set()).add(addr)
+            edges.setdefault(target, {})[(addr, None)] = UNKNOWN
+    for addr, body in prepared.items():
+        if body is None or addr in opaque:
+            continue
+        for _, site, target in body.calls:
+            if target is not None:
+                edges.setdefault(target, {}).pop((addr, None), None)
+                edges[target][(addr, site)] = UNKNOWN
+    entries = {addr: roots.get(addr, UNKNOWN) for addr in prepared}
+    results = {}
+    work = deque(prepared)
+    queued = set(work)
+    while work:
+        addr = work.popleft()
+        queued.discard(addr)
+        body = prepared[addr]
+        if body is None or addr in opaque:
+            continue
+        result = analyze(body, summaries, opaque, entries[addr], boundaries)
+        results[addr] = result
+        for _, site, target in body.calls:
+            if target is None or target not in prepared:
+                continue
+            edges[target][(addr, site)] = result.calls.get(site, UNKNOWN)
+            incoming = list(edges[target].values())
+            if target in unknown_entries or not incoming:
+                incoming.append(UNKNOWN)
+            fact = roots.get(target, join(incoming))
+            if fact != entries[target]:
+                entries[target] = fact
+                if target not in queued:
+                    work.append(target)
+                    queued.add(target)
+    gaps = []
+    for addr in prepared:
+        if addr in roots:
+            continue
+        for reason in unknown_entries.get(addr, ()):
+            gaps.append({"function": "%08x" % addr, "kind": "unknown_entry", "reason": reason})
+        if not callers.get(addr):
+            gaps.append({"function": "%08x" % addr, "kind": "unknown_entry",
+                         "reason": "no proven direct caller; includes external or unreachable entry"})
+        for (caller, site), fact in edges.get(addr, {}).items():
+            lost = fact.known_mask & ~entries[addr].known_mask
+            if lost:
+                gaps.append({"function": "%08x" % addr, "kind": "caller_join",
+                             "caller": "%08x" % caller,
+                             "site": None if site is None else "%08x" % site,
+                             "lost_mask": "%04x" % lost,
+                             "reason": "other caller or unknown entry disagrees",
+                             "other_inputs": [{"caller": "%08x" % a,
+                                "site": None if s is None else "%08x" % s,
+                                **fact_dict(f)} for (a, s), f in sorted(edges[addr].items(), key=lambda item: (item[0][0], item[0][1] or 0))]})
+    return entries, results, gaps

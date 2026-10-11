@@ -123,7 +123,9 @@ def _scan(addrs):
                         dangling.add(target)
                 if target in ctx.entries and target not in ctx.known and ctx.program.containing(target) != addr:
                     refs.add(target)
+        external_targets = set()
         for targets in external_exits(tr, fn).values():
+            external_targets.update(targets)
             if not ctx.tr.provisional:
                 dangling.update(t for t in targets if not ctx.dispatchable(t))
         reason = "decoded-only code map" if ctx.decoded_only else production.exclusion(fn)
@@ -131,11 +133,12 @@ def _scan(addrs):
         site = (bool(fn.seh_sites) or any(fn.insns[i].mnem == "POP" for i in fn.seh_restores)
                 or tr.image.msvc_seh_epilog(addr) or any(map(tr.seh_except_entry, fn.insns)))
         prepared, mode_prepared = None, None
-        if not (escapes or site or entries or fn.pushed_continuations or fn.return_jumps
+        if not (escapes or site or fn.pushed_continuations or fn.return_jumps
                 or fn.dead_addrs or addr in tr.noreturn_callees):
             try:
                 fir = decoded.function_ir(tr, ctx.lifter, fn)
-                prepared = call_contracts.prepare(fir)
+                prepared = call_contracts.prepare(fir) if not entries else None
+                fir.entries = tuple(entries)
                 mode_prepared = x87_mode.prepare(fir)
             except (LiftError, RecursionError):
                 prepared = None
@@ -149,7 +152,7 @@ def _scan(addrs):
                 writers.append({"site": ins.addr, "mnemonic": mnem})
         rows.append((addr, Row(addr, fn.name, len(fn.insns), fn.insns[0].addr, fn.insns[-1].addr),
                      calls, refs, sorted(dangling), returns, reason, escapes, prepared, mode_prepared, x87_count,
-                     writers))
+                     writers, sorted(external_targets)))
     return rows
 
 
@@ -163,6 +166,17 @@ def _escapes(task):
         if tr.seh_escaping_returns(fn):
             found.append(addr)
     return found
+
+
+def scan_program(settings, jobs):
+    ctx = Context(settings)
+    with ProcessPoolExecutor(max_workers=jobs, initializer=_init, initargs=(settings,)) as pool:
+        scanned = {row[0]: row for batch in pool.map(_scan,
+                   chunked(sorted(ctx.program.functions), jobs * 24)) for row in batch}
+        helpers = seh_helpers(pool, chunked(sorted(scanned), jobs * 24),
+                              {addr: row[7] for addr, row in scanned.items()},
+                              {addr: row[2] for addr, row in scanned.items()})
+    return scanned, helpers
 
 
 def _emit(task):
