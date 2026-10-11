@@ -1,5 +1,5 @@
 """Lifted CFG regions, real call contexts and saved-CW provenance."""
-import decoded
+from frontend import function_ir
 from ir import x87_mode as mode, x87_provenance as bits
 from ir.call_contracts import cfg_is_closed
 from ir.cfg import FunctionIR
@@ -25,7 +25,7 @@ def tail_region(ctx, addr, lifted, opaque, limit=20000):
         if owner not in lifted:
             fn, entries = ctx.load(owner)
             ctx.tr.analyze(fn, entries)
-            fir = decoded.function_ir(ctx.tr, ctx.lifter, fn)
+            fir = function_ir(ctx.tr, ctx.lifter, fn)
             fir.entries = tuple(entries)
             if fn.pushed_continuations or fn.return_jumps or fn.dead_addrs:
                 raise ValueError('rewritten flow in %08x' % owner)
@@ -342,7 +342,7 @@ def context_graph(ctx, root, depth, limit, opaque, contracts=()):
         if owner not in bodies:
             fn, entries = ctx.load(owner)
             ctx.tr.analyze(fn, entries)
-            fir = decoded.function_ir(ctx.tr, ctx.lifter, fn)
+            fir = function_ir(ctx.tr, ctx.lifter, fn)
             if (fn.pushed_continuations or fn.return_jumps or fn.dead_addrs
                     or fir.seh or fir.noreturn) and owner not in terminate_functions:
                 raise ValueError('unsupported flow in %08x' % owner)

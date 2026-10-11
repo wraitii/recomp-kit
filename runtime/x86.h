@@ -47,7 +47,7 @@ extern "C" {
 #endif
 
 #ifndef RECOMP_ARENA_ADDRESS
-#define RECOMP_ARENA_ADDRESS 0x300000000ull
+#define RECOMP_ARENA_ADDRESS 0
 #endif
 #if RECOMP_ARENA_ADDRESS
 #define RECOMP_ARENA ((uint8_t *)(uintptr_t)RECOMP_ARENA_ADDRESS)
@@ -126,23 +126,23 @@ void recomp_null_access(uint32_t addr, int write);
 /* Little-endian host (ARM64) matches the guest, so memcpy is a plain load. */
 RECOMP_HOT_INLINE uint8_t rd8(uint32_t a) {
     RECOMP_NULL_GUARD(a, 0);
-    return RECOMP_ARENA[a];
+    return g_mem[a];
 }
 RECOMP_HOT_INLINE uint16_t rd16(uint32_t a) {
     RECOMP_NULL_GUARD(a, 0);
     uint16_t v;
-    memcpy(&v, RECOMP_ARENA + a, 2);
+    memcpy(&v, g_mem + a, 2);
     return v;
 }
 RECOMP_HOT_INLINE uint32_t rd32(uint32_t a) {
     RECOMP_NULL_GUARD(a, 0);
     uint32_t v;
-    memcpy(&v, RECOMP_ARENA + a, 4);
+    memcpy(&v, g_mem + a, 4);
     return v;
 }
 RECOMP_HOT_INLINE uint64_t rd64(uint32_t a) {
     uint64_t v;
-    memcpy(&v, RECOMP_ARENA + a, 8);
+    memcpy(&v, g_mem + a, 8);
     return v;
 }
 /* A guest-memory watchpoint.  RECOMP_WATCH=<hex address>[:<length>] reports
@@ -234,36 +234,36 @@ static inline void recomp_watch_f32(uint32_t a, float v) {
 
 RECOMP_HOT_INLINE void wr8(uint32_t a, uint8_t v) {
     RECOMP_NULL_GUARD(a, 1);
-    RECOMP_ARENA[a] = v;
+    g_mem[a] = v;
     recomp_watch(a, 1, v);
 }
 RECOMP_HOT_INLINE void wr16(uint32_t a, uint16_t v) {
     RECOMP_NULL_GUARD(a, 1);
-    memcpy(RECOMP_ARENA + a, &v, 2);
+    memcpy(g_mem + a, &v, 2);
     recomp_watch(a, 2, v);
 }
 RECOMP_HOT_INLINE void wr32(uint32_t a, uint32_t v) {
     RECOMP_NULL_GUARD(a, 1);
-    memcpy(RECOMP_ARENA + a, &v, 4);
+    memcpy(g_mem + a, &v, 4);
     recomp_watch(a, 4, v);
 }
 RECOMP_HOT_INLINE void wr64(uint32_t a, uint64_t v) {
-    memcpy(RECOMP_ARENA + a, &v, 8);
+    memcpy(g_mem + a, &v, 8);
     recomp_watch(a, 8, v);
 }
 RECOMP_HOT_INLINE float rdf32(uint32_t a) {
     float v;
-    memcpy(&v, RECOMP_ARENA + a, 4);
+    memcpy(&v, g_mem + a, 4);
     return v;
 }
 RECOMP_HOT_INLINE double rdf64(uint32_t a) {
     double v;
-    memcpy(&v, RECOMP_ARENA + a, 8);
+    memcpy(&v, g_mem + a, 8);
     return v;
 }
 RECOMP_HOT_INLINE void wrf32(uint32_t a, float v) {
     RECOMP_NULL_GUARD(a, 1);
-    RECOMP_BITCOPY(RECOMP_ARENA + a, &v, 4);
+    RECOMP_BITCOPY(g_mem + a, &v, 4);
     recomp_watch_f32(a, v);
 }
 RECOMP_HOT_INLINE void wrf64(uint32_t a, double v) {
@@ -321,7 +321,7 @@ static inline void wrbcd80(uint32_t a, double v) {
     double r = nearbyint(v);
     if (!(fabs(r) < 1e18)) {
         static const uint8_t indefinite[10] = {0, 0, 0, 0, 0, 0, 0, 0xc0, 0xff, 0xff};
-        memcpy(RECOMP_ARENA + a, indefinite, 10);
+        memcpy(g_mem + a, indefinite, 10);
         {
             uint64_t low;
             memcpy(&low, indefinite, 8);
@@ -339,7 +339,7 @@ static inline void wrbcd80(uint32_t a, double v) {
     }
     if (r < 0 || (r == 0 && signbit(v)))
         out[9] = 0x80;
-    memcpy(RECOMP_ARENA + a, out, 10);
+    memcpy(g_mem + a, out, 10);
     {
         uint64_t low;
         memcpy(&low, out, 8);

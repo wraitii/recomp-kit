@@ -52,17 +52,19 @@ class LiftError(Exception):
 
 class Op(object):
     """One p-code operation. `out` is a varnode or None; `ins` a tuple."""
-    __slots__ = ("opc", "out", "ins", "data")
+    __slots__ = ("opc", "out", "ins", "data", "register_names")
 
-    def __init__(self, opc, out, ins, data=None):
+    def __init__(self, opc, out, ins, data=None, register_names=None):
         self.opc = opc
         self.out = out
         self.ins = tuple(ins)
         self.data = data
+        self.register_names = register_names
 
     def __repr__(self):
-        lhs = "%s = " % (fmt_var(self.out),) if self.out else ""
-        return "%s%s %s" % (lhs, self.opc, ", ".join(fmt_var(v) for v in self.ins))
+        lhs = "%s = " % (fmt_var(self.out, self.register_names),) if self.out else ""
+        return "%s%s %s" % (lhs, self.opc,
+                             ", ".join(fmt_var(v, self.register_names) for v in self.ins))
 
 
 class Insn(object):
@@ -75,9 +77,10 @@ class Insn(object):
     TOP movement in slots (+1 per push).
     """
     __slots__ = ("addr", "length", "mnem", "ops", "x87_delta", "x87", "internal_flow",
-                 "userops", "raw", "cc")
+                 "userops", "raw", "cc", "decode")
 
-    def __init__(self, addr, length, mnem, ops, x87_delta, x87, internal_flow, userops, raw=None):
+    def __init__(self, addr, length, mnem, ops, x87_delta, x87, internal_flow, userops,
+                 raw=None, decode=None):
         self.addr = addr
         self.length = length
         self.mnem = mnem
@@ -87,20 +90,21 @@ class Insn(object):
         self.internal_flow = internal_flow
         self.userops = userops
         self.raw = raw
+        self.decode = decode
         # Optional lazy-flag producer metadata: kind, size and the primary
-        # p-code result varnode, set by the C emitter's codegen corrections.
+        # p-code result varnode, set by frontend normalization.
         self.cc = None
 
     def __repr__(self):
         return "%08x %s" % (self.addr, self.mnem)
 
 
-def fmt_var(v):
+def fmt_var(v, register_names=None):
     if v is None:
         return "_"
     space, off, size = v
     if space == "register":
-        return REGISTER_NAMES.get((off, size), "reg[%x:%d]" % (off, size))
+        return (register_names or {}).get((off, size), "reg[%x:%d]" % (off, size))
     if space == "const":
         return "0x%x" % off
     if space in ("stin", "stout"):
@@ -108,7 +112,7 @@ def fmt_var(v):
     return "%s[%x:%d]" % (space, off, size)
 
 
-REGISTER_NAMES = {}
+REGISTER_NAMES_BY_LANGUAGE = {}
 
 
 def st_index(v):
@@ -125,11 +129,15 @@ class Lifter(object):
     """Lift instruction bytes to `Insn` objects through one SLEIGH context."""
 
     def __init__(self, language="x86:LE:32:default"):
+        self.language = language
         self.ctx = pypcode.Context(language)
         regs = self.ctx.registers
-        if not REGISTER_NAMES:
+        if language not in REGISTER_NAMES_BY_LANGUAGE:
+            register_names = {}
             for name, vn in regs.items():
-                REGISTER_NAMES.setdefault((vn.offset, vn.size), name)
+                register_names.setdefault((vn.offset, vn.size), name)
+            REGISTER_NAMES_BY_LANGUAGE[language] = register_names
+        self.register_names = REGISTER_NAMES_BY_LANGUAGE[language]
         self.diagnostic = {(regs[n].offset, regs[n].size) for n in DIAGNOSTIC_REGISTERS
                            if n in regs}
         self._unique = 0
@@ -149,13 +157,16 @@ class Lifter(object):
             raise LiftError("%08x: SLEIGH decodes %d of %d bytes" % (addr, sum(marks), len(data)))
         return marks
 
-    def lift(self, addr, data, mnem=None):
+    def lift(self, addr, data, mnem=None, decode=None):
         """Lift exactly `data` (one listed instruction) at guest `addr`.
 
         A listing boundary can hold more than one SLEIGH instruction: Ghidra
         folds WAIT into a following FNSTSW/FNSTCW. Those are lifted in order
         and concatenated.
         """
+        if decode is not None and (decode.address != addr or decode.source_bytes != bytes(data)
+                                   or decode.length != len(data)):
+            raise LiftError("%08x: decode evidence disagrees with instruction bytes" % addr)
         ops, mnems, delta, x87, flow, userops = [], [], 0, False, False, []
         pos = 0
         while pos < len(data):
@@ -194,7 +205,7 @@ class Lifter(object):
             ops.extend(sub)
             pos += size
         return Insn(addr, len(data), mnem or " ".join(mnems), ops, delta, x87, flow, userops,
-                    bytes(data))
+                    bytes(data), decode)
 
     def convert(self, op, userops):
         opc = op.opcode.name
@@ -209,10 +220,11 @@ class Lifter(object):
             userops.append(op.inputs[0].getUserDefinedOpName())
         elif len(ins) == 2 and ins[0] == ins[1] and ins[0][0] != "const":
             if opc in SAME_OPERAND_ZERO:
-                return Op("COPY", out, [("const", 0, out[2])])
+                return Op("COPY", out, [("const", 0, out[2])],
+                          register_names=self.register_names)
             if opc in SAME_OPERAND_ONE:
-                return Op("COPY", out, [("const", 1, out[2])])
-        return Op(opc, out, ins)
+                return Op("COPY", out, [("const", 1, out[2])], register_names=self.register_names)
+        return Op(opc, out, ins, register_names=self.register_names)
 
     def fresh_unique(self, size):
         self._unique += 1
@@ -229,7 +241,7 @@ class Lifter(object):
             if dst is not None and dst[0] == "unique":
                 names[dst] = self.fresh_unique(dst[2])
                 dst = names[dst]
-            out.append(Op(op.opc, dst, ins))
+            out.append(Op(op.opc, dst, ins, register_names=op.register_names))
         return out
 
 
@@ -245,6 +257,7 @@ def normalize_x87(ops, fresh):
     st = [("pre", i) for i in range(8)]
     alias = {}  # unique -> ("pre", j) when the unique is a plain copy of a slot
     out = []
+    register_names = next((op.register_names for op in ops if op.register_names is not None), None)
 
     def value(v):
         k = st_index(v)
@@ -261,7 +274,7 @@ def normalize_x87(ops, fresh):
             alias[op.out] = ("pre", ins[0][1])
             continue
         if k is None:
-            out.append(Op(op.opc, op.out, ins))
+            out.append(Op(op.opc, op.out, ins, register_names=op.register_names))
             continue
         if op.opc == "COPY":
             src = ins[0]
@@ -275,13 +288,14 @@ def normalize_x87(ops, fresh):
                 st[k] = ("tmp", src)
                 continue
         t = fresh(ST_SIZE)
-        out.append(Op(op.opc, t, ins))
+        out.append(Op(op.opc, t, ins, register_names=register_names))
         st[k] = ("tmp", t)
     # Any surviving read of an aliased unique must see the slot it copied.
     for n, op in enumerate(out):
         if any(v in alias for v in op.ins):
             out[n] = Op(op.opc, op.out, tuple(
-                ("stin", alias[v][1], ST_SIZE) if v in alias else v for v in op.ins))
+                ("stin", alias[v][1], ST_SIZE) if v in alias else v for v in op.ins),
+                register_names=op.register_names)
     best, delta = -1, 0
     for d in (0, -1, 1, -2):
         score = sum(1 for i in range(8) if st[i] == ("pre", i - d))
@@ -294,5 +308,6 @@ def normalize_x87(ops, fresh):
         if s == ("pre", i - delta):
             continue
         src = ("stin", s[1], ST_SIZE) if s[0] == "pre" else s[1]
-        out.append(Op("COPY", ("stout", i, ST_SIZE), (src,)))
+        out.append(Op("COPY", ("stout", i, ST_SIZE), (src,),
+                      register_names=register_names))
     return out, delta

@@ -1,4 +1,7 @@
-"""The function CFG the SSA emitter consumes, and the direct call graph."""
+"""The function CFG shared by analyses and backends, and the direct call graph."""
+from .guest import X86_32
+
+
 class FunctionIR(object):
     """A function's lifted instructions and CFG.
 
@@ -8,8 +11,9 @@ class FunctionIR(object):
     """
 
     def __init__(self, addr, insns, succ, tables=None, exits=None, entries=(),
-                 noreturn=None, seh=None):
+                 noreturn=None, seh=None, language=X86_32.language):
         self.addr = addr
+        self.language = language
         #: Other instruction addresses generated code can enter at, with the
         #: CPU state at the normal entry.
         self.entries = tuple(entries)

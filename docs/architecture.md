@@ -20,12 +20,11 @@ flowchart TD
 ## Guest memory and calls
 
 `runtime/memory.cpp` owns the guest address arena and allocator. Guest pointers
-remain 32-bit offsets even in a 64-bit process. The arena sits at one fixed host
-address (`RECOMP_ARENA` in `runtime/x86.h`), so translated accessors index a
-constant instead of reloading a base pointer after every guest store; anything
-that maps guest memory, including test harnesses, reserves exactly that range
-through `os_vm_reserve_at`, and code that runs guest functions against other
-memory swaps it in with `recomp_arena_swap`. `loader.cpp` maps PE sections,
+remain 32-bit offsets even in a 64-bit process. The platform chooses the arena's
+host address through `os_vm_reserve`; translated accessors resolve guest addresses
+through `g_mem`. Harnesses allocate their own arena through the same platform API.
+Code that runs guest functions against other memory exchanges bytes with
+`recomp_arena_swap`. `loader.cpp` maps PE sections,
 zero-fills data tails and replaces import-table entries with runtime trampolines.
 `imports.cpp` decodes calls and dispatches the original calling conventions.
 

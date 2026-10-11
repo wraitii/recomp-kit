@@ -613,8 +613,8 @@ void recomp_arena_swap(uint8_t *other, size_t size) {
     for (size_t at = 0; at < size; at += sizeof chunk) {
         const size_t n = std::min(sizeof chunk, size - at);
         memcpy(chunk, other + at, n);
-        memcpy(other + at, RECOMP_ARENA + at, n);
-        memcpy(RECOMP_ARENA + at, chunk, n);
+        memcpy(other + at, g_mem + at, n);
+        memcpy(g_mem + at, chunk, n);
     }
 }
 

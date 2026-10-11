@@ -8,7 +8,7 @@
 void mem_init();
 void mem_shutdown();
 // Exchanges guest bytes [0, size) with `other`, mapping the arena first if no
-// one has. Translated code addresses one fixed arena, so a caller that runs
+// one has. A caller that runs
 // guest code against other memory (a replay) swaps it in, runs, and swaps
 // again to restore both. Not for concurrent guest execution.
 void recomp_arena_swap(uint8_t *other, size_t size);

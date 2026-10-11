@@ -5,7 +5,7 @@ function with SLEIGH, builds an integer SSA with scalar x87 tracking and emits C
 Game measurements and the optimization history live in the game repository.
 
 ```
-code map v3 + PE -> program.py -> ir/lift.py (+ x87.py) -> ir/cfg.py -> ir/ssa.py
+code map v3 + PE -> program.py + frontend.py -> ir/lift.py -> ir/normalize.py -> ir/ssa.py
   -> emit_c.prepare + x87_plan -> contract_variants.SpecializationPlan
   -> emit_c.emit_prepared -> output.py (chunks, funcs.h, table.c, symbols.json, report)
 ```
@@ -16,6 +16,19 @@ code map v3 + PE -> program.py -> ir/lift.py (+ x87.py) -> ir/cfg.py -> ir/ssa.p
 passed to the program model, the workers and the corpus runner.
 
 ## Program model
+
+`decode.py` owns byte-backed instruction records and decoding. `x86_frontend.py`
+owns operand identities, declared function fields, CFG successors, return-jump
+proofs and SEH analysis; the eager emitter inherits that analysis. `frontend.py`
+assembles raw `FunctionIR`, and `ir/normalize.py` produces normalized IR while
+retaining original bytes and decode evidence. These frontend modules do not
+import either emitter. `ir/guest.py` describes register widths, aliases, roles and
+guest linkage; C access expressions belong to the backend. x86 CALL pushes the
+instruction continuation, and RET pops it and applies guest stack adjustment,
+independently of private host transport.
+`Program.body` attaches the same validated records to exploratory lifted IR;
+the driver shares its image and decode cache with the program model. SLEIGH
+still validates instruction lengths and effects independently.
 
 The code map (`recomp-code-map-v3`, `code_map.py`) is the only authority on code:
 function spans, jump tables, interior entries (`branch`, `data`, `table`) and
@@ -40,6 +53,8 @@ arithmetic flags stay explicit. Boundaries come from the code map. Folded WAIT
 prefixes lift in order, same-operand identities such as `XOR EBX,EBX` fold, and
 consumed carry dependencies such as `SBB EAX,EAX` do not. SLEIGH omits AF; the
 emitter supplies it for ADD/SUB/INC/DEC/SBB/ADC/NEG/CMP.
+Register-name diagnostics and contract cell maps are cached by SLEIGH language;
+the contract field projection itself remains the x86 runtime's GPR and flag set.
 
 Raw SLEIGH is not faithful to the runtime's x87 (FIST/FISTP, FRNDINT, FPREM,
 FCOM/FNCLEX status, FXAM, tags). `x87.py` corrects these by lowering operands,
@@ -51,6 +66,10 @@ transcendentals and environment operations stay named fallbacks.
 
 `cfg.py` holds `FunctionIR` (instructions, successors, table sites, external
 exits, noreturn calls, SEH effects, entries) and the call-graph SCC order.
+`normalize.py` turns that lifted model into corrected operations for SSA,
+including audited x87/string lowering, explicit absolute-memory effects, SEH
+and noreturn operations, and bound external-exit stubs. `emit_c.py` keeps the
+C emission and preparation stages.
 
 ## SSA and C emission
 

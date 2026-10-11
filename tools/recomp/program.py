@@ -2,7 +2,8 @@
 
 The code map names function spans, jump tables, interior entries and
 non-returning functions; the PE supplies bytes and imports; SLEIGH supplies
-instruction effects. Nothing here decodes with Capstone or scans for code.
+instruction effects. Shared decoding attaches evidence at those boundaries;
+it does not scan for code.
 Unknown control flow fails with a named diagnostic: fix Ghidra and re-export.
 """
 from bisect import bisect_right
@@ -142,9 +143,11 @@ class Body(object):
 
 
 class Program(object):
-    def __init__(self, settings):
+    def __init__(self, settings, image=None):
+        from decode import Image
+
         root = settings.code_map
-        self.pe = PE(settings.exe, settings.base)
+        self.pe = image if image is not None else Image(settings.exe, settings.base)
         self.metadata, spans = code_map.read_map(root)
         actual_hash = hashlib.sha256(settings.exe.read_bytes()).hexdigest()
         expected_hash = settings.sha256
@@ -243,7 +246,13 @@ class Program(object):
 
     def body(self, addr):
         """Lift one function from the image bytes."""
-        insns = [self.lifter.lift(at, self.pe.bytes_at(at, n)) for at, n in self.instructions(addr)]
+        insns = []
+        for at, n in self.instructions(addr):
+            raw = self.pe.bytes_at(at, n)
+            decoded = self.pe.decode_span_instruction(at, raw)
+            if decoded is None:
+                raise TranslateError("%08x: decoder cannot tile mapped instruction" % at)
+            insns.append(self.lifter.lift(at, raw, decode=decoded.decode))
         index = {ins.addr: k for k, ins in enumerate(insns)}
         noreturn = self.noreturn
         succ, exits, tables, dynamic = [], [], [], []
@@ -283,4 +292,4 @@ class Program(object):
                     leave.append(ins.addr + ins.length)
             succ.append(sorted(set(out)))
             exits.extend((k, t) for t in leave)
-        return Body(FunctionIR(addr, insns, succ, tables), exits, dynamic)
+        return Body(FunctionIR(addr, insns, succ, tables, language=self.lifter.language), exits, dynamic)

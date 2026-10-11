@@ -468,7 +468,7 @@ extern "C" void watchdog(int) {
 #endif
 
 int main(int argc, char **argv) {
-    g_mem = (uint8_t *)os_vm_reserve_at(RECOMP_ARENA, GUEST_SIZE);
+    g_mem = (uint8_t *)os_vm_reserve(GUEST_SIZE);
     if (!g_mem)
         return 1;
     if (argc == 3 && !strcmp(argv[1], "--run"))

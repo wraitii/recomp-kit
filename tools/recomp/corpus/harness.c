@@ -226,7 +226,7 @@ static unsigned calibrate(unsigned row, double budget_ms) {
 int main(int argc, char **argv) {
     if (argc != 6)
         return 2;
-    g_mem = os_vm_reserve_at(RECOMP_ARENA, CORPUS_MEMORY_SIZE);
+    g_mem = os_vm_reserve(CORPUS_MEMORY_SIZE);
     if (!g_mem)
         return 2;
     FILE *image = fopen(argv[1], "rb");

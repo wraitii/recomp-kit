@@ -25,7 +25,7 @@ import game_config
 import decoded
 import output
 from settings import Settings
-from decoded import external_exits
+from frontend import external_exits, function_ir
 from ir import call_contracts, contract_variants, production, x87_mode, x87_facts, prepared_store
 from ir.invocation import Declaration
 from ir.lift import Lifter, LiftError
@@ -48,7 +48,7 @@ class Context(object):
     def __init__(self, settings):
         self.settings = settings
         self.image = decoded.Image(settings.exe, settings.base)
-        self.program = Program(settings)
+        self.program = Program(settings, self.image)
         program = self.program
         self.decoded_only = program.metadata.get("emitter") == "decoded"
         if program.metadata.get("provenance") == "provisional-sweep" and not settings.allow_unmodelled:
@@ -137,7 +137,7 @@ def _scan(addrs):
         if not (escapes or site or fn.pushed_continuations or fn.return_jumps
                 or fn.dead_addrs or addr in tr.noreturn_callees):
             try:
-                fir = decoded.function_ir(tr, ctx.lifter, fn)
+                fir = function_ir(tr, ctx.lifter, fn)
                 prepared = call_contracts.prepare(fir) if not entries else None
                 fir.entries = tuple(entries)
                 mode_prepared = x87_mode.prepare(fir)

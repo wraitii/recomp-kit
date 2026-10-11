@@ -38,9 +38,10 @@ from collections import namedtuple
 
 from .lift import Lifter
 from .cfg import call_graph
+from .guest import X86_32
 
-GPRS = ("EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI")
-ARITH_FLAGS = ("CF", "PF", "AF", "ZF", "SF", "OF")
+GPRS = X86_32.names("gpr")
+ARITH_FLAGS = X86_32.names("arithmetic_flag")
 FIELDS = GPRS + ARITH_FLAGS
 
 #: Field sets.  Plain data so it can cross a process boundary.
@@ -70,24 +71,41 @@ class Mapping(object):
     contract and are ignored.
     """
 
-    __slots__ = ("gpr_lane", "flag_cell", "all_cells", "_field_cells")
+    __slots__ = ("language", "gpr_lane", "flag_cell", "all_cells", "_field_cells")
 
     def __init__(self, lifter):
+        X86_32.validate(lifter)
+        self.language = lifter.language
         self.gpr_lane = {}
         for name in GPRS:
-            _, off, size = lifter.register(name)
+            try:
+                _, off, size = lifter.register(name)
+            except KeyError as error:
+                raise ValueError("call-contract language %s lacks required register %s"
+                                 % (self.language, name)) from error
+            if size != 4:
+                raise ValueError("call-contract language %s maps %s to %d bytes; expected 4"
+                                 % (self.language, name, size))
             for lane in range(size):
                 self.gpr_lane[off + lane] = (name, lane)
         self.flag_cell = {}
         for name in ARITH_FLAGS:
-            _, off, size = lifter.register(name)
+            try:
+                _, off, size = lifter.register(name)
+            except KeyError as error:
+                raise ValueError("call-contract language %s lacks required flag %s"
+                                 % (self.language, name)) from error
+            if size != 1:
+                raise ValueError("call-contract language %s maps %s to %d bytes; expected 1"
+                                 % (self.language, name, size))
             for n in range(size):
                 self.flag_cell[off + n] = name
         self.all_cells = frozenset(
             [("g", n, l) for (n, l) in self.gpr_lane.values()] + [("f", n) for n in self.flag_cell.values()])
         self._field_cells = {}
         for name in GPRS:
-            self._field_cells[name] = frozenset(("g", name, lane) for lane in range(4))
+            self._field_cells[name] = frozenset(cell for cell in self.all_cells
+                                                if cell[0] == "g" and cell[1] == name)
         for name in ARITH_FLAGS:
             self._field_cells[name] = frozenset((("f", name),))
 
@@ -123,15 +141,16 @@ def _scc_cap(size, cell_count):
     return max(size + 4, 4 * (cell_count + 1) * size)
 
 
-_MAPPING = None
+_MAPPINGS = {}
 
 
-def mapping():
-    """The process-wide x86 cell mapping (offsets are language constants)."""
-    global _MAPPING
-    if _MAPPING is None:
-        _MAPPING = Mapping(Lifter())
-    return _MAPPING
+def mapping(language=None):
+    """Cell mapping keyed by the SLEIGH language used to lift the body."""
+    language = language or "x86:LE:32:default"
+    cells = _MAPPINGS.get(language)
+    if cells is None:
+        cells = _MAPPINGS[language] = Mapping(Lifter(language))
+    return cells
 
 
 def contract_from_cells(reads_cells, killed_cells, cells=None):
@@ -143,7 +162,7 @@ def contract_from_cells(reads_cells, killed_cells, cells=None):
         field for field in ARITH_FLAGS if cells.field_cells((field,)) & set(reads_cells))
     kills = frozenset()
     for name in GPRS:
-        if all(("g", name, lane) in killed_cells for lane in range(4)):
+        if cells._field_cells[name] <= set(killed_cells):
             kills |= {name}
     for name in ARITH_FLAGS:
         if ("f", name) in killed_cells:
@@ -195,9 +214,9 @@ _BITS = {}
 
 
 def _bits(cells):
-    b = _BITS.get(id(cells))
+    b = _BITS.get(cells)
     if b is None:
-        b = _BITS[id(cells)] = _Bits(cells)
+        b = _BITS[cells] = _Bits(cells)
     return b
 
 
@@ -209,9 +228,10 @@ class _Prepared(object):
     it is opaque (indirect call, CALLOTHER, unbound CALL).
     """
 
-    __slots__ = ("entry", "order", "succ", "preds", "use", "defs", "call", "returns", "writes")
+    __slots__ = ("language", "entry", "order", "succ", "preds", "use", "defs", "call", "returns", "writes")
 
     def __init__(self, fir, cells, bits):
+        self.language = cells.language
         indices = {ins.addr: i for i, ins in enumerate(fir.insns)}
         self.entry = indices.get(fir.addr)
         self.order, self.succ, self.preds = [], {}, {}
@@ -279,13 +299,13 @@ def _is_return(ins):
     return ins.mnem.upper() == "RET" or any(op.opc == "RETURN" for op in ins.ops)
 
 
-def prepare(fir):
+def prepare(fir, language=None):
     """The callee-independent facts of one lifted body, None unless its CFG is closed.
 
     Plain data, so workers can hand it to the process that solves the call graph."""
     if not fir.insns or not cfg_is_closed(fir):
         return None
-    cells = mapping()
+    cells = mapping(language or fir.language)
     p = _Prepared(fir, cells, _bits(cells))
     return None if p.entry is None else p
 
@@ -294,7 +314,7 @@ def summarize(p, callee_lookup, cells=None):
     """Compute one function's contract from its prepared facts.
 
     ``callee_lookup(target)`` returns a Contract or None for no summary."""
-    cells = cells or mapping()
+    cells = cells or mapping(p.language)
     bits = _bits(cells)
     use, defs = dict(p.use), dict(p.defs)
     writes = p.writes
@@ -427,7 +447,7 @@ def continuation_outputs(s, publications, groups, lane_field, extra_roots=(), ca
     return outputs
 
 
-def analyze(targets, prepared, *, analyzable, roots, progress=None):
+def analyze(targets, prepared, *, analyzable, roots, progress=None, language=None):
     """Contracts for every analyzable body reachable from `roots`.
 
     `targets[addr]` lists a function's direct CALL targets, `prepared[addr]` is
@@ -451,7 +471,14 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None):
                 stack.append(target)
     firs = {addr: prepared[addr] for addr in needed if prepared.get(addr) is not None}
     needed &= set(firs)
-    cells = mapping()
+    languages = {p.language for p in firs.values()}
+    if language is None:
+        if len(languages) > 1:
+            raise ValueError("call-contract analysis spans multiple SLEIGH languages")
+        language = next(iter(languages), None)
+    if any(p.language != (language or X86_32.language) for p in firs.values()):
+        raise ValueError("call-contract analysis language disagrees with prepared bodies")
+    cells = mapping(language)
     contracts = {}
     components = call_graph(sorted(needed),
                             lambda a: [t for t in targets.get(a, ()) if t in firs])

@@ -1,5 +1,4 @@
-# Standalone C harnesses map the guest arena at its fixed address (RECOMP_ARENA
-# in runtime/x86.h) through the platform layer. Include after project() and
+# Standalone C harnesses map guest memory through the platform layer. Include after project() and
 # link ${KIT_OS_SOURCES} into each executable that includes x86.h.
 enable_language(CXX)
 get_filename_component(KIT_ROOT "${KIT_RUNTIME}/.." ABSOLUTE)

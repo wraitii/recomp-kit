@@ -81,6 +81,11 @@ def instruction_mnemonic(ins):
     """Decode and validate the byte-backed instruction name used by effects."""
     if not ins.raw:
         return None
+    record = getattr(ins, "decode", None)
+    if (record is not None and record.address == ins.addr
+            and record.source_bytes == ins.raw and record.length == ins.length):
+        name = record.raw_mnemonic.upper()
+        return "WAIT" if name == "WAIT" else name
     decoded = list(_DECODER.disasm(ins.raw, ins.addr))
     if sum(item.size for item in decoded) != ins.length:
         return None

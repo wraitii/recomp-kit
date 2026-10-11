@@ -11,56 +11,22 @@ publication. No inferred convention permits discarding guest state.
 """
 from dataclasses import dataclass, field
 
-from .lift import Lifter, Insn, Op
-from .integer import read_modify_write, arithmetic, shift, divide
-from .integer_extra import EXTRA_MNEMONICS, correct as correct_extra
+from .lift import Lifter
 from .ssa import SSAError, MEMORY, build
 from .cfg import FunctionIR
+from .guest import X86_32
 from .simplify import canonicalize, simplify, state_roots, whole, EFFECTS, EXITS
 from .publication import analyze as publication_analysis
 from . import transfer_plan, x87_plan
 from . import flag_region
-from . import x87
 from .call_contracts import GPRS as CONTRACT_GPRS, ARITH_FLAGS as CONTRACT_FLAGS
 from .contract_variants import output_mask as contract_output_mask
 from .invocation import (EntryBinding, binding_invocation,
                          private_invocation, tail_invocation)
 
 
-SUPPORTED_MNEMONICS = frozenset((
-    "MOV", "MOVSX", "MOVZX", "XCHG", "NOT", "LEAVE", "LEA", "PUSH", "POP", "RET", "NOP", "ADD", "SUB", "CMP", "INC", "DEC",
-    "ADC", "SBB", "SHL", "SHR", "DIV",
-    "CLD", "STD", "SAHF", "MUL",
-    "TEST", "AND", "OR", "XOR", "JMP", "JZ", "JNZ", "JE", "JNE",
-    "JA", "JAE", "JB", "JBE", "JC", "JNC", "JG", "JGE", "JL", "JLE", "JS", "JNS",
-    "JO", "JNO", "JP", "JNP", "JPE", "JPO", "CALL",
-)) | EXTRA_MNEMONICS
+from .normalize import codegen_ir, CC_DEFINES
 
-
-def _string_helpers():
-    """Map the audited string-instruction encodings to their runtime helpers."""
-    table = {}
-    for opcode, name in ((0xa4, "movs"), (0xa5, "movs"), (0xaa, "stos"), (0xab, "stos"),
-                         (0xa6, "cmps"), (0xa7, "cmps"), (0xae, "scas"), (0xaf, "scas")):
-        for size_prefix, wide in ((b"", "d"), (b"\x66", "w")):
-            if opcode & 1 == 0:
-                if size_prefix:
-                    continue
-                suffix = "b"
-            else:
-                suffix = wide
-            single = bytes([opcode])
-            table[size_prefix + single] = name + suffix
-            if name in ("movs", "stos"):
-                table[size_prefix + b"\xf3" + single] = "rep_" + name + suffix
-            else:
-                table[b"\xf3" + size_prefix + single] = "repe_" + name + suffix
-                table[b"\xf2" + size_prefix + single] = "repne_" + name + suffix
-    return table
-
-
-#: Raw encodings (bare, REP, REPE, REPNE; byte, word, dword) -> runtime helper.
-STRING_HELPERS = _string_helpers()
 
 # Arithmetic flags tracked by the calling-convention census.
 FLAG_FIELDS = frozenset("c->eflags_" + n for n in ("cf", "pf", "af", "zf", "sf", "of"))
@@ -69,189 +35,15 @@ FLAG_FIELDS = frozenset("c->eflags_" + n for n in ("cf", "pf", "af", "zf", "sf",
 CONTRACT_FIELDS = frozenset(CONTRACT_GPRS) | frozenset(CONTRACT_FLAGS)
 #: The guest frame pointer and stack pointer are call-helper state even when a
 #: contract says the callee overwrites them; never drop their publication.
-CONTRACT_NEVER_SKIP = frozenset(("ESP", "EBP"))
+CONTRACT_NEVER_SKIP = frozenset(X86_32.names("stack") + X86_32.names("frame"))
 
 
-#: Lazy-flag producers recognised at a seam: (kind, primary p-code opcode).
-#: The primary op must write a non-flag destination.  SUB/CMP, ADD, logic/TEST
-#: INC/DEC and carry-aware ADC/SBB are recognised; everything else stays eager.
-CC_PRIMARY = {
-    "ADD": ("add", "INT_ADD"),
-    "SUB": ("sub", "INT_SUB"),
-    "ADC": ("adc", "INT_ADD"),
-    "SBB": ("sbb", "INT_SUB"),
-    "CMP": ("cmp", "INT_SUB"),
-    "INC": ("inc", "INT_ADD"),
-    "DEC": ("dec", "INT_SUB"),
-    "AND": ("logic", "INT_AND"),
-    "OR": ("logic", "INT_OR"),
-    "XOR": ("logic", "INT_XOR"),
-    "TEST": ("logic", "INT_AND"),
-}
-
-
-def _flag_producer(mnem, ops, flag_offsets):
-    """Return the primary op metadata for a recognised lazy-flag producer."""
-    info = CC_PRIMARY.get(mnem)
-    if info is None:
-        return None
-    kind, opc = info
-    stored = {op.ins[1] for op in ops if op.opc == "STORE"}
-    found = None
-    for op in ops:
-        if stored and op.out not in stored:
-            continue
-        if op.out is None:
-            continue
-        space, off, size = op.out
-        if space == "register" and any((off + n) in flag_offsets for n in range(size)):
-            if op.opc == "INT_EQUAL" and op.ins[1] == ("const", 0, op.ins[0][2]):
-                break
-            continue
-        if op.opc == opc and space in ("register", "unique"):
-            if kind in ("adc", "sbb"):
-                if not isinstance(op.data, dict) or "cc_operands" not in op.data:
-                    continue
-            found = {"kind": kind, "opc": opc, "size": size, "result": op.out}
-            if kind in ("adc", "sbb"):
-                found["operands"] = op.data["cc_operands"]
-            if kind in ("adc", "sbb"):
-                break
-    return found
-
-
-#: Which arithmetic flags a recognised producer defines.  Flags absent are
-#: preserved; the emitter stores them directly at the seam.
-CC_DEFINES = {
-    "add": ("cf", "pf", "af", "zf", "sf", "of"),
-    "sub": ("cf", "pf", "af", "zf", "sf", "of"),
-    "adc": ("cf", "pf", "af", "zf", "sf", "of"),
-    "sbb": ("cf", "pf", "af", "zf", "sf", "of"),
-    "cmp": ("cf", "pf", "af", "zf", "sf", "of"),
-    "logic": ("cf", "of", "zf", "sf", "pf"),
-    "inc": ("pf", "af", "zf", "sf", "of"),
-    "dec": ("pf", "af", "zf", "sf", "of"),
-}
 CC_OP_CONST = {"add": "X86_CC_ADD", "sub": "X86_CC_SUB", "cmp": "X86_CC_SUB",
                "logic": "X86_CC_LOGIC", "inc": "X86_CC_INC", "dec": "X86_CC_DEC",
                "adc": "X86_CC_ADC", "sbb": "X86_CC_SBB"}
 CC_BIT_VALUES = {"cf": 1, "pf": 2, "af": 4, "zf": 8, "sf": 0x10, "of": 0x20}
 #: Seams whose observer may read the guest's fields directly, so flags stay eager.
 CC_EAGER_EVENTS = frozenset(("DIV32", "IDIV32", "STRINGOP", "BRANCHIND"))
-
-_RAM_CONTROL = frozenset(("BRANCH", "CBRANCH", "CALL", "CALLIND", "BRANCHIND", "CALLOTHER"))
-
-
-def normalize_direct_ram(ins, lifter):
-    """Codegen-only lowering of SLEIGH's direct absolute memory operands.
-
-    SLEIGH folds a direct access into a data-position ``ram`` varnode
-    (`MOV EAX,[0x...]` is `EAX = COPY ram[...]`). Raw lifting keeps those for
-    the census; code generation must make them explicit memory effects so flag
-    order and single-read behavior match the eager emitter:
-
-    * a source-only access is captured once into a fresh unique shared by every
-      consumer, so arithmetic flags cannot re-read memory;
-    * a pure store becomes an explicit STORE;
-    * a read-modify-write becomes SLEIGH's register-addressed memory form,
-      a LOAD before each read and a STORE after the write, which the
-      mnemonic's read-modify-write correction reduces to one read.
-    Control-flow ram is untouched.
-    """
-    ops = list(ins.ops)
-    for index, op in enumerate(ops):
-        if op.opc == "BRANCHIND" and op.ins[0][0] == "ram":
-            _, offset, size = op.ins[0]
-            target = lifter.fresh_unique(size)
-            ops[index:index + 1] = [Op("LOAD", target, [("const", offset, 4)]),
-                                    Op("BRANCHIND", None, [target])]
-            break
-    touched = [op for op in ops if op.opc not in _RAM_CONTROL
-               and any(v is not None and v[0] == "ram" for v in (op.out,) + op.ins)]
-    if not touched:
-        return ops
-    operands = {(v[1], v[2]) for op in touched for v in (op.out,) + op.ins
-                if v is not None and v[0] == "ram"}
-    if len(operands) != 1:
-        raise SSAError("%08x: multiple direct-ram operands" % ins.addr)
-    offset, size = operands.pop()
-    address = ("const", offset, 4)
-    has_write = any(op.out is not None and op.out[0] == "ram" for op in touched)
-    has_read = any(any(v is not None and v[0] == "ram" for v in op.ins) for op in touched)
-    if has_write and has_read:
-        if sum(op.out is not None and op.out[0] == "ram" for op in touched) != 1:
-            raise SSAError("%08x: unsupported direct-ram read-modify-write" % ins.addr)
-        operand = lifter.fresh_unique(size)
-        rewritten = []
-        for op in ops:
-            if op.opc in _RAM_CONTROL:
-                rewritten.append(op)
-                continue
-            inputs = tuple(operand if (v is not None and v[0] == "ram") else v for v in op.ins)
-            if inputs != op.ins:
-                rewritten.append(Op("LOAD", operand, [address]))
-            if op.out is not None and op.out[0] == "ram":
-                rewritten.extend([Op(op.opc, operand, inputs, op.data),
-                                  Op("STORE", None, [address, operand])])
-            else:
-                rewritten.append(Op(op.opc, op.out, inputs, op.data))
-        return rewritten
-    if has_write:
-        for index, op in enumerate(ops):
-            if op.out is not None and op.out[0] == "ram":
-                dst = lifter.fresh_unique(size)
-                ops[index] = Op(op.opc, dst, op.ins, op.data)
-                ops.insert(index + 1, Op("STORE", None, [address, dst]))
-                break
-        return ops
-    # Source-only: exactly one captured read, inserted where the first direct
-    # read appeared and shared by every consumer.
-    src = lifter.fresh_unique(size)
-    first = ops.index(touched[0])
-    rewritten = []
-    for op in ops:
-        if op.opc in _RAM_CONTROL:
-            rewritten.append(op)
-            continue
-        inputs = tuple(src if (v is not None and v[0] == "ram") else v for v in op.ins)
-        rewritten.append(Op(op.opc, op.out, inputs, op.data))
-    rewritten.insert(first, Op("LOAD", src, [address]))
-    return rewritten
-
-
-def add_exit_stubs(insns, succ, exits, tails):
-    """Give each out-of-body transfer target one TAIL block, shared by its sources."""
-    index = {ins.addr: k for k, ins in enumerate(insns)}
-    succ = [list(row) for row in succ]
-    for i, targets in sorted(exits.items()):
-        for target in targets:
-            if target not in tails:
-                raise SSAError("%08x: tail target %08x is not bound" % (insns[i].addr, target))
-            if target not in index:
-                index[target] = len(insns)
-                insns.append(Insn(target, 0, "TAIL", [Op("TAIL", None, [("ram", target, 4)])],
-                                  0, False, False, [], None))
-                succ.append([])
-            succ[i].append(index[target])
-    return succ
-
-
-def seh_ops(ops, kinds, addr):
-    """Append the SEH runtime effects; an orphan precedes the return it guards."""
-    ops = list(ops)
-    for kind in kinds:
-        op = Op("SEH", None, [], {"kind": kind, "eip": addr})
-        if kind == "landing":
-            ops.insert(0, op)
-            continue
-        if kind != "orphan":
-            ops.append(op)
-            continue
-        at = next((n for n, o in enumerate(ops) if o.opc == "RETURN"), None)
-        if at is None:
-            raise SSAError("%08x: SEH orphan without a return" % addr)
-        ops.insert(at, op)
-    return ops
 
 
 def seh_lines(kind, addr):
@@ -267,6 +59,7 @@ def seh_lines(kind, addr):
     if kind == "landing":
         return ["if (recomp_seh_pending_target()) recomp_seh_intercept(c, 0x%xu);" % addr]
     return ["recomp_seh_frame_orphan(c, seh_mark_);"]
+
 
 
 def normalize_bindings(mapping, label, allow_checked=True):
@@ -292,70 +85,6 @@ def normalize_bindings(mapping, label, allow_checked=True):
         result[target] = binding
     return result
 
-
-def codegen_ir(fir, lifter, tails=()):
-    """Apply audited integer/x87 corrections without changing raw census input."""
-    flag_offsets = set()
-    for name in ("CF", "PF", "AF", "ZF", "SF", "OF"):
-        _, off, size = lifter.register(name)
-        flag_offsets.update(range(off, off + size))
-    insns = []
-    for i, ins in enumerate(fir.insns):
-        mnem = ins.mnem.upper()
-        if mnem.startswith("F") or ins.x87 or mnem.startswith("WAIT "):
-            ops = x87.lower(ins, lifter)
-            insns.append(Insn(ins.addr, ins.length, ins.mnem, ops, 0,
-                              False, False, [], ins.raw))
-            continue
-        # String instructions are byte-audited to the runtime helpers rather
-        # than the raw SLEIGH loops: SLEIGH advances ESI/EDI and decrements ECX
-        # before the access, while the helpers access first and then advance.
-        # Only the exact byte sequences in STRING_HELPERS are admitted; SSE
-        # MOVSD, address-size and other prefixes stay unsupported fallbacks.
-        helper = STRING_HELPERS.get(ins.raw)
-        if helper is not None:
-            ops = [Op("STRINGOP", None, [], {"helper": helper})]
-            insns.append(Insn(ins.addr, ins.length, ins.mnem, ops, 0,
-                              False, False, [], ins.raw))
-            continue
-        if mnem == "WAIT":
-            # A bare WAIT only synchronises pending x87 exceptions; the port's
-            # eager emitter treats it as a no-op, and no exception is delivered.
-            insns.append(Insn(ins.addr, ins.length, ins.mnem, [], 0,
-                              False, False, [], ins.raw))
-            continue
-        if mnem not in SUPPORTED_MNEMONICS:
-            raise SSAError("%08x: C emitter: unsupported instruction %s" % (ins.addr, mnem))
-        ops = normalize_direct_ram(ins, lifter)
-        normalized = Insn(ins.addr, ins.length, ins.mnem, ops, ins.x87_delta,
-                          ins.x87, ins.internal_flow, ins.userops, ins.raw)
-        if mnem == "SAR":
-            ops = read_modify_write(normalized, lifter,
-                                    lambda insn, operand: correct_extra(insn, lifter, operand))
-        elif mnem in EXTRA_MNEMONICS:
-            ops = correct_extra(normalized, lifter)
-        elif mnem in ("ADD", "SUB", "CMP", "INC", "DEC", "SBB", "ADC"):
-            ops = read_modify_write(normalized, lifter,
-                                    lambda insn, operand: arithmetic(insn, lifter, operand))
-        elif mnem in ("SHL", "SHR"):
-            ops = read_modify_write(normalized, lifter,
-                                    lambda insn, operand: shift(insn, lifter, operand))
-        elif mnem == "DIV":
-            ops = divide(normalized, lifter)
-        elif mnem in ("AND", "OR", "XOR", "NOT"):
-            ops = read_modify_write(normalized, lifter, lambda insn, operand: list(insn.ops))
-        else:
-            ops = normalized.ops
-        if i in fir.seh:
-            ops = seh_ops(ops, fir.seh[i], ins.addr)
-        if i in fir.noreturn:
-            ops = ops + [Op("TRAP", None, [], fir.noreturn[i])]
-        result = Insn(ins.addr, ins.length, ins.mnem, ops, ins.x87_delta,
-                      ins.x87, ins.internal_flow, ins.userops, ins.raw)
-        result.cc = _flag_producer(mnem, ops, flag_offsets)
-        insns.append(result)
-    succ = add_exit_stubs(insns, fir.succ, fir.exits, tails)
-    return FunctionIR(fir.addr, insns, succ, fir.tables, entries=fir.entries)
 
 
 #: Codegen ops whose seams materialise flags eagerly before or after running.
@@ -671,6 +400,13 @@ def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_st
     must prove PC = RC = 0, and byte-backed analysis must prove the leaf has
     no calls or control-word effects. Full guest x87 publication is retained.
     """
+    lifter = lifter if lifter is not None else Lifter(fir.language)
+    if fir.language != lifter.language:
+        raise SSAError("function language %s disagrees with lifter %s" % (fir.language, lifter.language))
+    try:
+        X86_32.validate(lifter)
+    except ValueError as error:
+        raise SSAError(str(error)) from error
     options = {name: value for name, value in locals().items()
                if name in ("symbol", "checked_return", "return_fields", "lazy_flags",
                            "call_symbols", "tail_symbols", "checked_calls", "contract_calls",
@@ -693,11 +429,11 @@ def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_st
         raise SSAError("state contracts require checked calls")
     if return_fields is not None and not x87_known_mode and any(
             op.opc in ("X87_REG", "X87_MEM", "X87_OPAQUE")
-            for ins in codegen_ir(fir, lifter or Lifter()).insns for op in ins.ops):
+            for ins in codegen_ir(fir, lifter).insns for op in ins.ops):
         raise SSAError("private x87 entry requires guarded D3D8 arithmetic")
     if return_fields is not None and (not checked_return or any(
             op.opc in ("CALL", "CALLIND", "DIV32", "IDIV32", "STRINGOP", "SEH")
-            for ins in codegen_ir(fir, lifter or Lifter()).insns for op in ins.ops)):
+            for ins in codegen_ir(fir, lifter).insns for op in ins.ops)):
         raise SSAError("private state entry requires a checked leaf without opaque observers")
     if checked_return and (fir.entries or fir.seh or fir.exits):
         raise SSAError("checked return requires a single-entry closed body without SEH")
@@ -706,7 +442,6 @@ def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_st
     # The register model and operand corrections are immutable across bodies.
     # Reuse the image's SLEIGH context instead of reparsing its specification
     # for every function.
-    lifter = lifter if lifter is not None else Lifter()
     call_symbols = normalize_bindings(call_symbols, "direct-call")
     if not checked_calls <= call_symbols.keys():
         raise SSAError("checked calls require bound direct-call symbols")
@@ -727,7 +462,7 @@ def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_st
     defer_ie = not x87_scalar_strict and msvc_convention
     # Each SLEIGH register byte must map to a known runtime field.
     fields = []
-    for index, name in enumerate(("EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI")):
+    for index, name in enumerate(X86_32.names("gpr")):
         fields.append((lifter.register(name), "c->r[%d]" % index))
     fields.append((lifter.register("EIP"), "c->eip"))
     # FS-relative accesses (the SEH chain head, TLS reads) lift to FS_OFFSET plus
@@ -796,8 +531,10 @@ def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_st
     # EIP/ESP/EBP eager; division, string helpers, calls and returns
     # still publish every required field. The strict path keeps all
     # pre-access snapshots.
-    access_fields = {key for key, (field, _) in mapping.items()
-                     if field in ("c->eip", "c->r[4]", "c->r[5]")} if local_state else None
+    mandatory_registers = {lifter.register(name) for name in X86_32.names("mandatory")}
+    mandatory_fields = {field for register, field in fields if register in mandatory_registers}
+    access_fields = ({key for key, (field, _) in mapping.items() if field in mandatory_fields}
+                     if local_state else None)
     # Compiler conventions do not cover every binary boundary: CRT
     # assembly helpers can return flags or consume incoming flags.
     # Keep flag publication at calls/returns until actual call

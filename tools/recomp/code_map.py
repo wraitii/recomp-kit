@@ -133,43 +133,21 @@ def decode_span(image, start, lengths):
     """Decode exactly the mapped boundaries, including Ghidra's folded WAIT."""
     if image.md is None:
         raise ValueError('code-map decoding requires capstone')
-    detail = image.md.detail
-    image.md.detail = True
-    try:
-        addr = start
-        for digit in lengths:
-            size = int(digit, 16)
-            if not image.base <= addr < addr + size <= image.end:
-                raise ValueError('code-map instruction outside executable image: %08x' % addr)
-            raw = image.data[addr - image.base:addr - image.base + size]
-            decoded = list(image.md.disasm(raw, addr))
-            if len(decoded) == 1 and decoded[0].size == size:
-                insn = image.to_insn(decoded[0])
-            elif (len(decoded) == 2 and decoded[0].mnemonic in ('wait', 'fwait')
-                  and decoded[1].mnemonic.startswith('fn')
-                  and sum(ci.size for ci in decoded) == size):
-                insn = image.to_insn(decoded[1])
-                insn.addr = addr
-                insn.mnem = 'F' + insn.mnem[2:]
-                insn.raw = '%08x  %s%s' % (addr, insn.mnem,
-                                         ' ' + ','.join(insn.ops) if insn.ops else '')
-            else:
-                raise ValueError('decoder disagrees with code-map boundary at %08x (length %d)' % (addr, size))
-            if insn.mnem == 'XLATB':
-                insn.mnem = 'XLAT'
-            # The short XCHG opcode has an implicit accumulator. Ghidra prints
-            # that operand first; Capstone prints it second. Canonicalize it so
-            # the emitted C stays byte-for-byte identical apart from comments.
-            if insn.mnem == 'XCHG' and 0x90 <= raw[0] <= 0x97 and len(insn.ops) == 2:
-                insn.ops.reverse()
-            if insn.mnem != 'UNMODELLED':
-                insn.raw = '%08x  %s%s%s' % (addr, insn.mnem,
-                    '.' + insn.rep if insn.rep else '',
-                    ' ' + ','.join(insn.ops) if insn.ops else '')
-            yield insn
-            addr += size
-    finally:
-        image.md.detail = detail
+    addr = start
+    for digit in lengths:
+        size = int(digit, 16)
+        if not image.base <= addr < addr + size <= image.end:
+            raise ValueError('code-map instruction outside executable image: %08x' % addr)
+        raw = image.data[addr - image.base:addr - image.base + size]
+        insn = image.decode_span_instruction(addr, raw)
+        if insn is None:
+            raise ValueError('decoder disagrees with code-map boundary at %08x (length %d)' % (addr, size))
+        if insn.mnem != 'UNMODELLED':
+            insn.raw = '%08x  %s%s%s' % (addr, insn.mnem,
+                '.' + insn.rep if insn.rep else '',
+                ' ' + ','.join(insn.ops) if insn.ops else '')
+        yield insn
+        addr += size
 
 
 def main():

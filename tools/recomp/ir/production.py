@@ -7,8 +7,9 @@ ownership and unsupported shapes keep the decoded body whole.
 """
 from dataclasses import dataclass
 
-from decoded import function_ir
-from .emit_c import prepare as prepare_body, emit_prepared, codegen_ir
+from frontend import function_ir
+from .emit_c import prepare as prepare_body, emit_prepared
+from .normalize import codegen_ir
 from .invocation import EntryBinding
 from .lift import LiftError
 from .ssa import SSAError
