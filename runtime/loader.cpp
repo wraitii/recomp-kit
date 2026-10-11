@@ -295,6 +295,7 @@ bool patch_iat(const std::vector<uint8_t> &file, size_t opt_off, uint16_t opt_ma
 struct AuxSpec {
     const char *name, *path, *sha256;
     uint32_t base, size;
+    const char *aliases;
 };
 const AuxSpec g_aux_specs[] = RECOMP_AUX_MODULES;
 std::vector<LoaderModule> g_aux;
@@ -329,6 +330,15 @@ std::string normalize_module_name(const char *raw) {
     if (n.find('.') == std::string::npos)
         n += ".dll";
     return n;
+}
+
+bool answers_to(const LoaderModule &m, const std::string &normalized) {
+    if (normalize_module_name(m.name.c_str()) == normalized)
+        return true;
+    for (const std::string &alias : m.aliases)
+        if (normalize_module_name(alias.c_str()) == normalized)
+            return true;
+    return false;
 }
 
 // Add `base - preferred` to every HIGHLOW relocation site in the mapped module.
@@ -443,6 +453,12 @@ bool pe_copy(const std::vector<uint8_t> &file, const PeLayout &pe, const std::st
 bool map_aux_module(const AuxSpec &spec) {
     LoaderModule m;
     m.name = spec.name;
+    for (const char *at = spec.aliases; *at;) {
+        const char *end = strchr(at, ';');
+        end = end ? end : at + strlen(at);
+        m.aliases.emplace_back(at, end);
+        at = *end ? end + 1 : end;
+    }
     m.path = dirname_of(g_exe_path) + "/" + spec.name;
     std::vector<uint8_t> file;
     if (!read_file(m.path.c_str(), file)) {
@@ -549,7 +565,7 @@ bool bind_aux_imports() {
                 break;
             std::string dll = normalize_module_name(gm_str(m.base + name_rva, 260).c_str());
             for (size_t j = 0; j < n; ++j)
-                if (i != j && normalize_module_name(g_aux[j].name.c_str()) == dll)
+                if (i != j && answers_to(g_aux[j], dll))
                     deps[i].push_back((int)j);
         }
     }
@@ -611,6 +627,10 @@ LoaderModule *loader_module_named(const char *name) {
     for (LoaderModule &m : g_aux)
         if (os_strcasecmp(m.name.c_str(), name) == 0)
             return &m;
+    for (LoaderModule &m : g_aux)
+        for (const std::string &alias : m.aliases)
+            if (os_strcasecmp(alias.c_str(), name) == 0)
+                return &m;
     return nullptr;
 }
 uint32_t loader_call_entry(X86 *c, const LoaderModule &m, uint32_t reason) {
@@ -1033,7 +1053,7 @@ bool loader_load(const char *exe_path) {
                     break;
                 std::string dll = normalize_module_name(gm_str(g_base + name_rva, 260).c_str());
                 for (size_t i = 0; i < g_aux.size(); ++i)
-                    if (normalize_module_name(g_aux[i].name.c_str()) == dll)
+                    if (answers_to(g_aux[i], dll))
                         g_aux_startup[i] = true;
             }
         }

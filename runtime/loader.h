@@ -47,6 +47,7 @@ const std::vector<SectionInfo> &loader_sections();
 // image is retained so a later load starts with fresh globals and CRT state.
 struct LoaderModule {
     std::string name, path;
+    std::vector<std::string> aliases;
     uint32_t base = 0, size = 0, entry = 0, export_rva = 0, export_size = 0;
     bool attached = false;
     bool thread_notifications_disabled = false;

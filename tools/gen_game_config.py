@@ -84,10 +84,11 @@ def render_header(cfg):
     lines.append("#define RECOMP_CD_AUDIO_TRACKS %s" % c_string_list(cfg.get("media", {}).get("cd_tracks", [])))
     lines.append("#define RECOMP_AUX_MODULE_COUNT %d" % len(cfg["aux_modules"]))
     lines.append("#define RECOMP_AUX_MODULES {%s}" % ", ".join(
-        "{%s, %s, %s, %s, %s}" % (c_string(m["name"]), c_string(m["path"].as_posix()),
-                                 c_string(m["sha256"]), c_hex(m["base"]), c_hex(m["size"]))
+        "{%s, %s, %s, %s, %s, %s}" % (c_string(m["name"]), c_string(m["path"].as_posix()),
+                                     c_string(m["sha256"]), c_hex(m["base"]), c_hex(m["size"]),
+                                     c_string(";".join(m["aliases"])))
         for m in cfg["aux_modules"]) if cfg["aux_modules"] else
-        "#define RECOMP_AUX_MODULES {{0, 0, 0, 0u, 0u}}")
+        "#define RECOMP_AUX_MODULES {{0, 0, 0, 0u, 0u, 0}}")
     # In-proc COM servers a game's auxiliary modules expose. CoCreateInstance
     # looks a CLSID up here after its native classes and calls the module's
     # DllGetClassObject. The bytes are in guest memory order.

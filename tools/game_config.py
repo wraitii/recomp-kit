@@ -357,11 +357,20 @@ def load_aux_modules(cfg, game_dir, source):
             if not isinstance(name, str) or not name:
                 raise ValueError("%s.name must be a non-empty string" % where)
             com_classes.append({"clsid": clsid, "name": name})
-        modules.append({"key": key, "name": entry["name"], "sha256": entry["sha256"],
+        aliases = entry.get("aliases", [])
+        if not isinstance(aliases, list) or not all(isinstance(a, str) and a for a in aliases):
+            raise ValueError("%s: [modules.aux.%s] aliases must be a list of non-empty strings" % (source, key))
+        modules.append({"key": key, "name": entry["name"], "aliases": aliases, "sha256": entry["sha256"],
                         "base": base, "size": size, "path": path.resolve(),
                         "code_map_path": (game_dir / entry.get("code_map", "metadata-" + key)).resolve(),
                         "entry_points": entry.get("entry_points", []),
                         "com_classes": com_classes})
+    claimed = set()
+    for module in modules:
+        for name in [module["name"]] + module["aliases"]:
+            if name.lower() in claimed:
+                raise ValueError("%s: [modules.aux.%s] name or alias %s is already taken" % (source, module["key"], name))
+            claimed.add(name.lower())
     ordered = sorted(modules, key=lambda module: module["base"])
     for left, right in zip(ordered, ordered[1:]):
         if left["base"] + left["size"] > right["base"]:
