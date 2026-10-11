@@ -27,6 +27,7 @@
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include <TargetConditionals.h>
 #if TARGET_OS_OSX
 #include <CoreServices/CoreServices.h>
@@ -557,6 +558,63 @@ void os_sleep_us(uint64_t us) {
 
 int os_strcasecmp(const char *a, const char *b) {
     return strcasecmp(a, b);
+}
+
+int os_compare_utf16(uint32_t lcid, uint32_t flags, const uint16_t *a, int a_len, const uint16_t *b,
+                     int b_len) {
+#ifdef __APPLE__
+    if ((lcid != 0x0400 && lcid != 0x0409 && lcid != 0x0800) || a_len < 0 || b_len < 0 ||
+        (a_len && !a) || (b_len && !b)) {
+        errno = EINVAL;
+        return 0;
+    }
+    static const uint16_t empty = 0;
+    if (!a)
+        a = &empty;
+    if (!b)
+        b = &empty;
+    constexpr uint32_t supported = 0x1 | 0x2 | 0x20000;
+    if (flags & ~supported) {
+        errno = ENOSYS;
+        return 0;
+    }
+    CFStringCompareFlags options = 0;
+    if (flags & 0x1)
+        options |= kCFCompareCaseInsensitive;
+    if (flags & 0x2)
+        options |= kCFCompareDiacriticInsensitive;
+    if (flags & 0x20000)
+        options |= kCFCompareWidthInsensitive;
+    CFStringRef left = CFStringCreateWithCharacters(kCFAllocatorDefault, (const UniChar *)a, a_len);
+    CFStringRef right =
+        CFStringCreateWithCharacters(kCFAllocatorDefault, (const UniChar *)b, b_len);
+    CFLocaleRef locale = CFLocaleCreate(kCFAllocatorDefault, CFSTR("en_US"));
+    if (!left || !right || !locale) {
+        if (left)
+            CFRelease(left);
+        if (right)
+            CFRelease(right);
+        if (locale)
+            CFRelease(locale);
+        errno = ENOMEM;
+        return 0;
+    }
+    CFComparisonResult result =
+        CFStringCompareWithOptionsAndLocale(left, right, CFRangeMake(0, a_len), options, locale);
+    CFRelease(left);
+    CFRelease(right);
+    CFRelease(locale);
+    return result < 0 ? 1 : result == 0 ? 2 : 3;
+#else
+    (void)lcid;
+    (void)flags;
+    (void)a;
+    (void)a_len;
+    (void)b;
+    (void)b_len;
+    errno = ENOSYS;
+    return 0;
+#endif
 }
 
 int os_hostname(char *buf, size_t cap) {

@@ -632,6 +632,25 @@ int os_strcasecmp(const char *a, const char *b) {
     return _stricmp(a, b);
 }
 
+int os_compare_utf16(uint32_t lcid, uint32_t flags, const uint16_t *a, int a_len, const uint16_t *b,
+                     int b_len) {
+    if (a_len < 0 || b_len < 0 || (a_len && !a) || (b_len && !b)) {
+        errno = EINVAL;
+        return 0;
+    }
+    static const uint16_t empty = 0;
+    if (!a)
+        a = &empty;
+    if (!b)
+        b = &empty;
+    int result = CompareStringW(lcid, flags, (LPCWCH)a, a_len, (LPCWCH)b, b_len);
+    if (!result) {
+        errno = EINVAL;
+        return 0;
+    }
+    return result;
+}
+
 int os_hostname(char *buf, size_t cap) {
     if (!buf || cap == 0)
         return -1;

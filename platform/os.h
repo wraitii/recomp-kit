@@ -161,6 +161,8 @@ void os_sleep_us(uint64_t us);
 // Strings.
 // ---------------------------------------------------------------------------
 int os_strcasecmp(const char *a, const char *b);
+int os_compare_utf16(uint32_t lcid, uint32_t flags, const uint16_t *a, int a_len, const uint16_t *b,
+                     int b_len);
 
 // ---------------------------------------------------------------------------
 // Network identity. Used by the winsock name-resolution shims; the commands

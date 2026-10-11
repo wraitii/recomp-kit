@@ -768,21 +768,40 @@ void o_SysStringLen(X86 *c) {
     uint32_t b = arg(c, 0);
     set_eax(c, b && bstr_valid(b) ? rd32(b - 4) / 2 : 0);
 }
-// VarBstrCmp(bstrLeft, bstrRight, lcid, dwFlags). A NULL operand compares as
-// VARCMP_NULL; otherwise the ordering follows CompareString's mapping.
+[[noreturn]] void unsupported_bstr_cmp(uint32_t lcid, uint32_t flags) {
+    LOGW("OLEAUT32 VarBstrCmp: unsupported locale comparison (LCID %08x, flags %08x)", lcid, flags);
+    abort();
+}
 void o_VarBstrCmp(X86 *c) {
-    uint32_t left = arg(c, 0), right = arg(c, 1), flags = arg(c, 3);
-    if (!left || !right || !bstr_valid(left) || !bstr_valid(right)) {
-        set_eax(c, 3); // VARCMP_NULL
+    uint32_t left = arg(c, 0), right = arg(c, 1), lcid = arg(c, 2), flags = arg(c, 3);
+    if ((left && !bstr_valid(left)) || (right && !bstr_valid(right))) {
+        LOGW("OLEAUT32 VarBstrCmp: invalid BSTR operand");
+        abort();
+    }
+    uint32_t alen = left ? rd32(left - 4) / 2 : 0;
+    uint32_t blen = right ? rd32(right - 4) / 2 : 0;
+    uint32_t abytes = alen * 2, bbytes = blen * 2;
+    if (lcid == 0) {
+        uint32_t n = abytes < bbytes ? abytes : bbytes;
+        int order = n ? memcmp(gm_ptr(left), gm_ptr(right), n) : 0;
+        if (!order)
+            order = abytes < bbytes ? -1 : abytes > bbytes ? 1 : 0;
+        set_eax(c, order < 0 ? 0 : order > 0 ? 2 : 1);
         return;
     }
-    std::string a, b;
-    for (uint32_t i = 0, n = rd32(left - 4) / 2; i < n; ++i)
-        a.push_back((char)rd16(left + 2 * i));
-    for (uint32_t i = 0, n = rd32(right - 4) / 2; i < n; ++i)
-        b.push_back((char)rd16(right + 2 * i));
-    int r = (flags & 1) ? os_strcasecmp(a.c_str(), b.c_str()) : strcmp(a.c_str(), b.c_str());
-    set_eax(c, r < 0 ? 0 : r == 0 ? 1 : 2); // VARCMP_LT / EQ / GT
+    if (lcid != 0x0400 && lcid != 0x0409 && lcid != 0x0800)
+        unsupported_bstr_cmp(lcid, flags);
+    if (flags & ~(0x1u | 0x2u | 0x4u | 0x10000u | 0x20000u | 0x40000u))
+        unsupported_bstr_cmp(lcid, flags);
+    if (alen > uint32_t(std::numeric_limits<int>::max()) ||
+        blen > uint32_t(std::numeric_limits<int>::max()))
+        unsupported_bstr_cmp(lcid, flags);
+    int result =
+        os_compare_utf16(lcid, flags, left ? (const uint16_t *)gm_ptr(left) : nullptr, int(alen),
+                         right ? (const uint16_t *)gm_ptr(right) : nullptr, int(blen));
+    if (!result)
+        unsupported_bstr_cmp(lcid, flags);
+    set_eax(c, result - 1);
 }
 void o_SafeArrayDestroy(X86 *c) {
     set_eax(c, array_destroy(arg(c, 0)));
@@ -874,8 +893,6 @@ void o_VarParseNumFromStr(X86 *c) {
     uint32_t in = rd32(np + 4), cap = rd32(np);
     if (in & ~NP_STD)
         unsupported_numparse("unknown input flag", in);
-    if (in & NP_HEX_OCT)
-        unsupported_numparse("NUMPRS_HEX_OCT", in);
     std::u16string s;
     for (uint32_t i = 0; i < (1u << 20) && valid(str + i * 2, 2) && rd16(str + i * 2); ++i)
         s.push_back(char16_t(rd16(str + i * 2)));
@@ -906,6 +923,9 @@ void o_VarParseNumFromStr(X86 *c) {
         if (!more && take(NP_PARENS, '(', NP_LEAD_PLUS | NP_LEAD_MINUS | NP_PARENS))
             more = true, out |= NP_NEG;
     }
+    if ((in & NP_HEX_OCT) && p + 1 < s.size() && s[p] == '&' &&
+        ((s[p + 1] | 0x20) == 'h' || (s[p + 1] | 0x20) == 'o'))
+        unsupported_numparse("hexadecimal/octal prefix", in);
     std::vector<uint8_t> digits;
     int32_t pwr = 0;
     bool seen = false, decimal = false, started = false;
