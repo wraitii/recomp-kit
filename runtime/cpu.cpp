@@ -222,10 +222,24 @@ void recomp_unknown_call(X86 *c, uint32_t target) {
         if (exception_info_block(c, &info)) {
             wr32(info, 8);
             wr32(info + 4, target);
+            std::string chain;
+            for (uint32_t frame : win32_return_chain(c->r[R_EBP], 8)) {
+                char word[16];
+                snprintf(word, sizeof word, " %08x", frame);
+                chain += word;
+            }
+            uint32_t self = c->r[R_ESI], obj = c->r[R_EAX];
+            uint32_t self_vt = gm_valid(self, 4) ? rd32(self) : 0;
+            uint32_t obj_vt = gm_valid(obj, 4) ? rd32(obj) : 0;
             log_once("null-call",
-                     "call to %08x (return=%08x EAX=%08x ECX=%08x ESI=%08x EDI=%08x FS:[0]=%08x): "
-                     "raising an access violation, as Windows would, for the guest's handlers",
-                     target, ret, c->r[R_EAX], c->r[R_ECX], c->r[R_ESI], c->r[R_EDI],
+                     "call to %08x (return=%08x EAX=%08x ECX=%08x EDX=%08x ESI=%08x EDI=%08x "
+                     "EBP=%08x chain:%s self_vt=%08x obj_vt=%08x self_flags=%08x "
+                     "self_20=%08x FS:[0]=%08x): raising an access violation, as Windows "
+                     "would, for the guest's handlers",
+                     target, ret, c->r[R_EAX], c->r[R_ECX], c->r[R_EDX], c->r[R_ESI],
+                     c->r[R_EDI], c->r[R_EBP], chain.c_str(), self_vt, obj_vt,
+                     gm_valid(self + 8, 4) ? rd32(self + 8) : 0u,
+                     gm_valid(self + 0x20, 4) ? rd32(self + 0x20) : 0u,
                      c->fs_base && gm_valid(c->fs_base, 4) ? rd32(c->fs_base) : 0u);
             recomp_seh_raise(c, 0xc0000005u, 0, 2, info);
         }
