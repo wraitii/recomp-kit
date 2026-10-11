@@ -23,6 +23,8 @@ from . import flag_region
 from . import x87
 from .call_contracts import GPRS as CONTRACT_GPRS, ARITH_FLAGS as CONTRACT_FLAGS
 from .contract_variants import output_mask as contract_output_mask
+from .invocation import (EntryBinding, binding_invocation,
+                         private_invocation, tail_invocation)
 
 
 SUPPORTED_MNEMONICS = frozenset((
@@ -267,6 +269,30 @@ def seh_lines(kind, addr):
     return ["recomp_seh_frame_orphan(c, seh_mark_);"]
 
 
+def normalize_bindings(mapping, label, allow_checked=True):
+    """Validate a target-to-binding map, preserving literal custom symbols."""
+    try:
+        items = dict(mapping or {}).items()
+    except (TypeError, ValueError):
+        raise SSAError("invalid %s target map" % label)
+    result = {}
+    for target, binding in items:
+        if type(target) is not int or not 0 <= target <= 0xffffffff:
+            raise SSAError("invalid %s target %r" % (label, target))
+        if target in result:
+            raise SSAError("duplicate %s target %08x" % (label, target))
+        if isinstance(binding, EntryBinding):
+            if binding.target != target:
+                raise SSAError("binding target %08x does not match %s target %08x"
+                               % (binding.target, label, target))
+            if binding.checked and not allow_checked:
+                raise SSAError("%s target %08x cannot bind a checked entry" % (label, target))
+        elif not (isinstance(binding, str) and binding.isidentifier() and binding.isascii()):
+            raise SSAError("invalid %s symbol %r for target %08x" % (label, binding, target))
+        result[target] = binding
+    return result
+
+
 def codegen_ir(fir, lifter, tails=()):
     """Apply audited integer/x87 corrections without changing raw census input."""
     flag_offsets = set()
@@ -469,6 +495,7 @@ class PreparedFunction:
     arithmetic: x87_plan.X87Plan
     report_calls: bool
     layouts: dict = field(default_factory=dict)
+    invocations: dict = field(default_factory=dict)
 
     def _contract_calls(self):
         for b in self.ssa.blocks.values():
@@ -485,8 +512,30 @@ class PreparedFunction:
 
     @property
     def bound_requests(self):
-        return {(v.data, self.layouts.get(v.data, contract_output_mask(call.required_outputs)))
-                for _b, v, call in self._contract_calls()}
+        return {(inv.target, inv.output_mask) for inv in self.invocations.values()
+                if inv.form == "private"}
+
+    def _call_invocation(self, b, v, call):
+        options = self.options
+        target = v.data
+        expected = b.insn.addr + b.insn.length
+        binding = options["call_symbols"].get(target)
+        if binding is None:
+            raise SSAError("%08x: no C symbol bound for call target %08x"
+                           % (b.insn.addr, target))
+        if target in options["contract_calls"] and call.required_outputs is not None:
+            mask = self.layouts.get(target, contract_output_mask(call.required_outputs))
+            mode_proven = options["x87_mode_sites"].get(b.insn.addr) == (0x0f00, 0)
+            return private_invocation(target, binding, expected, mode_proven, mask)
+        form = "checked" if target in options["checked_calls"] else "ordinary"
+        return binding_invocation(target, binding, form, expected)
+
+    def _tail_invocation(self, v):
+        target = v.args[0].data
+        binding = self.options["tail_symbols"].get(target)
+        if binding is None:
+            raise SSAError("no C symbol bound for tail target %08x" % target)
+        return tail_invocation(target, binding)
 
     def finalize(self, masks):
         masks = masks or {}
@@ -496,6 +545,20 @@ class PreparedFunction:
             if needed & ~layout or layout & ~((1 << len(CONTRACT_GPRS + CONTRACT_FLAGS)) - 1):
                 raise SSAError("shared contract outputs do not cover the call continuation")
         self.layouts = dict(masks)
+        invocations = {}
+        for b in self.ssa.blocks.values():
+            for v in b.ops:
+                if v.opc == "CALL":
+                    invocations[v.id] = self._call_invocation(b, v, self.transfers.calls[v.id])
+                elif v.opc == "TAIL":
+                    invocations[v.id] = self._tail_invocation(v)
+        self.invocations = invocations
+
+    def declarations(self):
+        result = set()
+        for invocation in self.invocations.values():
+            result |= invocation.declarations()
+        return frozenset(result)
 
     def decision_rows(self):
         if not self.report_calls:
@@ -504,8 +567,6 @@ class PreparedFunction:
         contracts = options["call_contracts"]
         lane_field = options["lane_field"]
         mapping = self.mapping
-        checked_calls = options["checked_calls"]
-        contract_calls = options["contract_calls"]
         fir = self.ir
 
         def field_names(keys):
@@ -518,7 +579,8 @@ class PreparedFunction:
                 if v.opc != "CALL":
                     continue
                 call = self.transfers.calls[v.id]
-                private = v.data in contract_calls
+                invocation = self.invocations[v.id]
+                private = invocation.form == "private"
                 reason = None if private else (
                     "caller has alternate entries or SEH" if fir.entries or fir.seh
                     else "target is not an admitted checked leaf")
@@ -526,11 +588,11 @@ class PreparedFunction:
                 rows.append({
                     "caller": "%08x" % fir.addr, "site": "%08x" % b.insn.addr,
                     "target": "%08x" % v.data,
-                    "specialization": "private" if private else "checked" if v.data in checked_calls else "ordinary",
+                    "specialization": invocation.form,
                     "callee_reads": sorted(contract.reads) if contract is not None else None,
                     "fast_publication": field_names(call.publication.required),
                     "outputs": sorted(call.required_outputs) if private else None,
-                    "entry_output_mask": "%04x" % self.layouts.get(v.data, contract_output_mask(call.required_outputs)) if private else None,
+                    "entry_output_mask": "%04x" % invocation.output_mask if private else None,
                     "ordinary_fallback": field_names(call.fallback.required) if private else None,
                     "fallback_flag_mask": call.fallback.flags.mask if call.fallback.flags else None,
                     "reason": reason,
@@ -561,9 +623,10 @@ def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_st
          variant_requests=None, call_decisions=None, x87_known_mode=False, contract_masks=None, x87_mode_sites=None, x87_entry_verify=None):
     """Prepare a complete body plan or raise SSAError for whole-function fallback.
 
-    `call_symbols` maps an allowed direct-call target address to the C symbol
-    that implements it. With no mapping, a direct CALL is rejected rather than
-    dispatched or approximated. `indirect_call_symbol` is the explicit opt-in
+    `call_symbols` maps an allowed direct-call target address to a literal C
+    symbol or a production `EntryBinding` rendered through the `CALL_FN`
+    macros. With no mapping, a direct CALL is rejected rather than dispatched
+    or approximated. `indirect_call_symbol` is the explicit opt-in
     for indirect CALL effects: when set, CALLIND lowers to that runtime
     dispatch and reloads all tracked state; when None, indirect calls stay a
     whole-function fallback. The defaults are the production policy (scalar x87,
@@ -644,23 +707,12 @@ def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_st
     # Reuse the image's SLEIGH context instead of reparsing its specification
     # for every function.
     lifter = lifter if lifter is not None else Lifter()
-    try:
-        entries = list(dict(call_symbols or {}).items())
-    except (TypeError, ValueError):
-        raise SSAError("invalid direct-call target map")
-    call_symbols = {}
-    for target, name in entries:
-        # An exact 32-bit guest address, never a bool, float or numeric string
-        # that int() would silently round or reinterpret.
-        if type(target) is not int or not 0 <= target <= 0xffffffff:
-            raise SSAError("invalid direct-call target %r" % (target,))
-        if target in call_symbols:
-            raise SSAError("duplicate direct-call target %08x" % target)
-        if not isinstance(name, str) or not name.isidentifier() or not name.isascii():
-            raise SSAError("invalid call symbol %r for target %08x" % (name, target))
-        call_symbols[target] = name
+    call_symbols = normalize_bindings(call_symbols, "direct-call")
     if not checked_calls <= call_symbols.keys():
         raise SSAError("checked calls require bound direct-call symbols")
+    for target, binding in call_symbols.items():
+        if isinstance(binding, EntryBinding) and binding.checked != (target in checked_calls):
+            raise SSAError("direct-call binding %08x disagrees with its checked class" % target)
     if indirect_call_symbol is not None and (
             not isinstance(indirect_call_symbol, str)
             or not indirect_call_symbol.isidentifier()
@@ -721,7 +773,7 @@ def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_st
             if fields_:
                 kept_fields[target] = frozenset(
                     key for field in fields_ for key in field_lanes[field])
-    tail_symbols = dict(tail_symbols or {})
+    tail_symbols = normalize_bindings(tail_symbols, "tail", allow_checked=False)
     seh_mark = any("orphan" in kinds for kinds in fir.seh.values())
     cgi = codegen_ir(fir, lifter, tail_symbols)
     fir = cgi
@@ -801,8 +853,6 @@ def emit_prepared(prepared):
     options = prepared.options
     symbol, checked_return = options["symbol"], options["checked_return"]
     return_fields, lazy_flags = options["return_fields"], options["lazy_flags"]
-    call_symbols, tail_symbols = options["call_symbols"], options["tail_symbols"]
-    checked_calls, contract_calls = options["checked_calls"], options["contract_calls"]
     x87_mode_sites, x87_entry_verify = options["x87_mode_sites"], options["x87_entry_verify"]
     fir, s, live = prepared.ir, prepared.ssa, prepared.live
     fields, mapping, flag_keys = prepared.fields, prepared.mapping, prepared.flag_keys
@@ -1040,36 +1090,29 @@ def emit_prepared(prepared):
                     # invoke only the explicitly bound symbol. The callee receives
                     # the guest return address already stored by the preceding
                     # CALL push, so its own RET owns ESP/EIP restoration.
+                    invocation = prepared.invocations[v.id]
                     call = transfers.calls[v.id]
-                    outputs = call.required_outputs if v.data in contract_calls else None
-                    if outputs is not None:
-                        output_mask = prepared.layouts.get(v.data, contract_output_mask(outputs))
-                        mode_proven = x87_mode_sites.get(b.insn.addr) == (0x0f00, 0)
-                        lines.append("if (entry_contract_prepare_%08x(c, %du)) {" % (v.data, mode_proven))
+                    private = invocation.form == "private"
+                    if private:
+                        lines.append("if (%s(c, %du)) {" % (
+                            invocation.preparation.symbol, 1 if invocation.preparation.mode_proven else 0))
                     lines.extend(publish(b.snapshots[v.id], v))
-                    if outputs is None and transfers.calls[v.id].guard:
-                        guarded = store_fields(b.snapshots[v.id], transfers.calls[v.id].guard)
+                    if not private and call.guard:
+                        guarded = store_fields(b.snapshots[v.id], call.guard)
                         if lazy_flags and any(key in flag_keys for key in kept_calls.get(v.id, ())):
                             guarded.append("c->cc_op = X86_CC_NONE;")
                         lines.append("if (RECOMP_UNLIKELY(recomp_hooks_ever)) {")
                         lines.extend(guarded)
                         lines.append("}")
-                    name = call_symbols.get(v.data)
-                    if name is None:
-                        raise SSAError("%08x: no C symbol bound for call target %08x"
-                                       % (b.insn.addr, v.data))
-                    if outputs is not None:
-                        lines.append("entry_contract_%08x_%04x(c, 0x%xu);" % (
-                            v.data, output_mask, b.insn.addr + b.insn.length))
+                    if private:
+                        lines.append("%s;" % invocation.render())
                         lines.append("} else {")
-                        lines.extend(publish_fields(b.snapshots[v.id], transfers.calls[v.id].fallback.required,
-                                                    transfers.calls[v.id].fallback.flags))
-                        lines.append("%s(c, 0x%xu);" % (name, b.insn.addr + b.insn.length))
+                        lines.extend(publish_fields(b.snapshots[v.id], call.fallback.required,
+                                                    call.fallback.flags))
+                        lines.append("%s;" % invocation.fallback.render())
                         lines.append("}")
-                    elif v.data in checked_calls:
-                        lines.append("%s(c, 0x%xu);" % (name, b.insn.addr + b.insn.length))
                     else:
-                        lines.append("%s(c);" % name)
+                        lines.append("%s;" % invocation.render())
                     if lazy_flags:
                         # A callee (SSA or otherwise) may leave a pending descriptor.
                         lines.extend(cc_action_lines(cc_calls.get(b.index)))
@@ -1149,7 +1192,7 @@ def emit_prepared(prepared):
                 elif v.opc == "TAIL":
                     lines.extend(flush_x87())
                     lines.extend(publish(b.exit, v))
-                    lines.append("%s(c); return;" % tail_symbols[v.args[0].data])
+                    lines.append("%s; return;" % prepared.invocations[v.id].render())
                 elif v.opc == "BRANCHIND":
                     # A decoded jump table: the target address selects a case, any
                     # other value is a runtime jump exactly like the decoded

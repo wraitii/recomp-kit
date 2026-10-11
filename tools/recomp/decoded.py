@@ -706,6 +706,7 @@ class Translator(object):
         self.func_addrs = func_addrs
         self.allow_unmodelled = allow_unmodelled
         self.unmodelled = []
+        self.call_targets = set()
         self.jumptables = {}
         self.internal_entries = {}
         self.noreturn_callees = set()
@@ -1122,6 +1123,7 @@ class Translator(object):
 
         With entries, the body becomes `static void body_ADDR(X86 *, uint32_t)`
         preceded by a dispatch switch and every entry is a one-line wrapper."""
+        self.call_targets = set()
         entries = sorted(set(entries))
         dead = {i for i, ins in enumerate(fn.insns) if ins.addr in fn.dead_addrs}
         live = [i for i in range(len(fn.insns)) if i not in dead]
@@ -1610,6 +1612,7 @@ class Translator(object):
                 t = int(ins.ops[0], 16)
                 L.append("c->r[4] -= 4; wr32(c->r[4], %s);" % hexlit(nxt))
                 if t in self.func_addrs:
+                    self.call_targets.add(t)
                     L.append("CALL_FN(%08x);" % t)
                 else:
                     self.reject_offimage_call(t)
@@ -1928,6 +1931,7 @@ class Translator(object):
         if t in fn.index:
             return ["goto L_%08x;" % t]
         if t in self.func_addrs:
+            self.call_targets.add(t)
             return ["CALL_FN(%08x); return;" % t]
         if getattr(self, "provisional", False) and not GUEST_SHIM_BASE <= t < GUEST_SHIM_END:
             self.unmodelled.append((ins.addr, "transfer to unmapped instruction %08x" % t))
@@ -1969,6 +1973,7 @@ class Translator(object):
             if t in fn.index:
                 L.append("case %s: goto L_%08x;" % (hexlit(t), t))
             else:
+                self.call_targets.add(t)
                 L.append("case %s: CALL_FN(%08x); return;" % (hexlit(t), t))
         L.append("default: c->eip = %s; recomp_jump(c, t_); return;" % hexlit(ins.addr))
         L.append("}")

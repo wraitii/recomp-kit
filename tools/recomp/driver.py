@@ -27,6 +27,7 @@ import output
 from settings import Settings
 from decoded import external_exits
 from ir import call_contracts, contract_variants, production, x87_mode, x87_facts, prepared_store
+from ir.invocation import Declaration
 from ir.lift import Lifter, LiftError
 from ir.ssa import SSAError
 from program import FunctionDescription as Row, Program, ScanRow, TranslateError
@@ -231,11 +232,12 @@ def _emit(task):
         tr.unmodelled.clear()
         fn, entries = ctx.load(addr)
         tr.analyze(fn, entries)
-        reason, lines, requests, decisions = plan.reason, None, set(), []
+        reason, lines, requests, decisions, deps = plan.reason, None, set(), [], set()
         if plan.path is not None:
             body = prepared_store.read(plan.path)
             body.finalize(contract_masks)
             lines, external, requests, decisions = production.emit_ssa_prepared(body)
+            deps = set(body.declarations())
             if entries and not external:
                 wrappers = tr.translate(fn, entries)
                 head = "void fn_%08x(X86 *c) {" % addr
@@ -243,10 +245,12 @@ def _emit(task):
                 if len(kept) != len(wrappers) - 1:
                     raise TranslateError("%08x: prepared entry wrapper layout changed" % addr)
                 lines = kept + lines
+                deps |= {Declaration("entry", t) for t in tr.call_targets}
         if lines is None:
             lines = tr.translate(fn, entries)
+            deps = {Declaration("entry", t) for t in tr.call_targets}
         out.append((addr, lines, re.sub(r"^[0-9a-f]{8}: ", "", reason) if reason else None,
-                    list(tr.unmodelled), requests, decisions))
+                    list(tr.unmodelled), requests, decisions, frozenset(deps)))
     return out
 
 
@@ -544,9 +548,10 @@ def main(argv=None):
     entry_names = sorted(ctx.entries)
     call_returns = sorted({r for row in scanned.values() for r in row.returns})
     functions = [rows[a] for a in addrs]
+    dependencies = {addr: results[addr][6] for addr in addrs}
     os.makedirs(args.out, exist_ok=True)
     output.write_funcs_header(args.out, entry_names)
-    output.emit_body_chunks(args.out, functions, bodies, entries_by_fn, private_requests)
+    output.emit_body_chunks(args.out, functions, bodies, entries_by_fn, dependencies)
     output.emit_entry_chunks(args.out, entry_names, settings.module, checked_returns, private_masks)
     symbols = symbol_rows(ctx, entry_names, rows)
     if settings.module:

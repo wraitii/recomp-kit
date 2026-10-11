@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import output as T
+from ir.invocation import Declaration
 
 
 def write(out):
@@ -20,7 +21,13 @@ def write(out):
         addresses[2]: ["void fn_0d001020(X86 *c) { CALL_FN(0d001000); return; }"],
         addresses[3]: ["void fn_0d001030(X86 *c) { CALL_FN(0d001010); }"],
     }
-    T.emit_body_chunks(out, functions, bodies, {})
+    dependencies = {
+        addresses[0]: set(),
+        addresses[1]: {Declaration("entry", addresses[0])},
+        addresses[2]: {Declaration("entry", addresses[0])},
+        addresses[3]: {Declaration("entry", addresses[1])},
+    }
+    T.emit_body_chunks(out, functions, bodies, {}, dependencies)
     T.emit_entry_chunks(out, addresses)
     (out / "fixture_table.c").write_text('''#include "x86.h"
 void fn_0d001000(X86 *c);

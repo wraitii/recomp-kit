@@ -15,11 +15,17 @@ return handling. Ordinary entries remain available for other callers.
 Integer transfer plans combine callee effects with continuation liveness,
 including values escaping through the caller's return and state read by later
 calls even when it already resides in `X86`. Untracked GPRs and flags remain
-observable on return; private layouts retain their callee outputs. Structured emission data
-owns private entries and declaration dependencies; `contract-report.json`
-reports the selected edges. Fallback flag publication retains proven lazy
-recipes. Private preparation checks hooks, profiling, frame watching,
-checkpoint countdown and replacement selection. It decrements once on success;
+observable on return; private layouts retain their callee outputs. Before
+emission each direct call and tail is planned as a finalized, immutable
+invocation record: form (ordinary, checked, private or tail), production macro
+or literal custom binding, expected continuation, preparation guard and bound
+shared layout, with a private invocation carrying its checked fallback as a
+record. Emission renders from those records and chunked declarations derive
+from them, so emitted C is never rewritten and prototypes are never
+rediscovered from generated text; decoded bodies record their own bound
+targets. `contract-report.json` reports the selected edges. Fallback flag
+publication retains proven lazy recipes. Private preparation checks hooks,
+profiling, frame watching, checkpoint countdown and replacement selection. It decrements once on success;
 the ordinary entry owns polling on rejection. Replacement identity is resolved
 beside the immutable dispatch tables without indexed table loads.
 

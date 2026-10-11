@@ -6,10 +6,10 @@ are admitted only through the explicit `recomp_call` opt-in; complex host-frame
 ownership and unsupported shapes keep the decoded body whole.
 """
 from dataclasses import dataclass
-import re
 
 from decoded import function_ir
 from .emit_c import prepare as prepare_body, emit_prepared, codegen_ir
+from .invocation import EntryBinding
 from .lift import LiftError
 from .ssa import SSAError
 from .call_contracts import FIELDS, prepare, summarize
@@ -47,12 +47,12 @@ def prepare_ssa(tr, lifter, fn, entries, common, known, contracts, checked_retur
         if ins.mnem == "CALL":
             target = tr.branch_target(ins)
             if target in known:
-                calls[target] = ("entry_checked_%08x" if target in checked_returns else "entry_%08x") % target
+                calls[target] = EntryBinding(target, target in checked_returns)
     fir = function_ir(tr, lifter, fn)
     fir.entries = external_entries(tr, fn, entries)
     options = dict(common)
     options["call_symbols"] = calls
-    options["tail_symbols"] = {t: "entry_%08x" % t for targets in fir.exits.values()
+    options["tail_symbols"] = {t: EntryBinding(t, False) for targets in fir.exits.values()
                                for t in targets if t in tr.func_addrs}
     if contracts:
         options["call_contracts"] = {t: contracts[t] for t in calls if t in contracts}
@@ -75,9 +75,6 @@ def emit_ssa_prepared(prepared):
     source = emit_prepared(prepared)
     addr, entries = prepared.ir.addr, prepared.ir.entries
     checked, symbol = prepared.options["checked_return"], prepared.options["symbol"]
-    source = re.sub(r"\bentry_([0-9a-f]{8})\(c\);", r"CALL_FN(\1);", source)
-    source = re.sub(r"\bentry_checked_([0-9a-f]{8})\(c, (0x[0-9a-f]+u)\);",
-                    r"CALL_FN_CHECKED(\1, \2);", source)
     lines = source.splitlines()
     if checked:
         lines.append("void fn_%08x(X86 *c) { %s(c, 0u, 0); }" % (addr, symbol))
