@@ -31,9 +31,14 @@ int32_t miles_volume_mb(int32_t v) {
                   : std::clamp((int32_t)std::lround(2000.0 * std::log10(v / 127.0)), -10000, 0);
 }
 
-int32_t miles_pan_mb(int32_t p) {
-    p = std::clamp(p, 0, 127);
-    return std::clamp((p - 64) * 10000 / 63, -10000, 10000);
+int32_t miles_volume_mb(float v) {
+    v = std::clamp(v, 0.0f, 1.0f);
+    return v == 0.0f ? -10000 : std::clamp((int32_t)std::lround(2000.0 * std::log10(v)), -10000, 0);
+}
+
+int32_t miles_pan_mb(float p) {
+    p = std::clamp(p, 0.0f, 1.0f);
+    return std::clamp((int32_t)std::lround((p - 0.5f) * 20000.0f), -10000, 10000);
 }
 
 struct Driver {
@@ -50,7 +55,7 @@ struct Sample {
     bool alive = false;
     int32_t channel = -1;
     RiffWave wave{};
-    int32_t volume = 127, pan = 64;
+    float volume01 = 1.0f, pan01 = 0.5f;
     uint32_t loops = 1, remaining = 0;
     bool playing = false;
     uint32_t eos_cb = 0; // AIL_register_EOS_callback for a 2D sample
@@ -58,10 +63,8 @@ struct Sample {
 
     // A Miles 3D sample plays through the same host-channel machinery as a 2D
     // one. Where it is and how far away decide the pan and the distance gain;
-    // vol01 is AIL_set_3D_sample_volume's 0..1 value and rate overrides the
-    // file's own sample rate when non-zero.
+    // rate overrides the file's own sample rate when non-zero.
     bool is_3d = false;
-    float vol01 = 1.0f;
     float pos3d[3] = {0.0f, 0.0f, 0.0f};
     float min_d = 1.0f, max_d = 1.0e9f;
     uint32_t rate = 0;
@@ -128,10 +131,10 @@ void sample_reset(Sample &s) {
 
 // Inverse-distance attenuation against the listener, matching the
 // DirectSound3D model in dsound.cpp's calc_3d: a source inside MinDistance is
-// untouched, beyond it falls off and is clamped at MaxDistance. RT3 hands
-// Miles listener-relative positions, so the listener is the origin.
+// untouched, beyond it falls off and is clamped at MaxDistance.
 float sample3d_distance_gain(const Sample &s) {
-    audio3d::V3 dir = {s.pos3d[0], s.pos3d[1], s.pos3d[2]};
+    audio3d::V3 dir = {s.pos3d[0] - g_listener_pos3d[0], s.pos3d[1] - g_listener_pos3d[1],
+                       s.pos3d[2] - g_listener_pos3d[2]};
     float dist = audio3d::v3_len(dir);
     if (dist > s.max_d)
         dist = s.max_d;
@@ -144,7 +147,8 @@ float sample3d_distance_gain(const Sample &s) {
 // The hundredths-of-a-dB pan for a listener-relative source, using the same
 // axis convention and speaker mix as DirectSound3D (front +z, top +y).
 int32_t sample3d_pan_mb(const Sample &s) {
-    audio3d::V3 dir = {s.pos3d[0], s.pos3d[1], s.pos3d[2]};
+    audio3d::V3 dir = {s.pos3d[0] - g_listener_pos3d[0], s.pos3d[1] - g_listener_pos3d[1],
+                       s.pos3d[2] - g_listener_pos3d[2]};
     float dist = audio3d::v3_len(dir);
     if (dist == 0.0f)
         return 0;
@@ -173,14 +177,12 @@ int sample_volume(const Sample &s) {
     auto it = g_drivers.find(s.driver);
     int master = miles_volume_mb(it == g_drivers.end() ? 127 : it->second.master);
     if (s.is_3d) {
-        // The 3D volume is a 0..1 gain, unlike the 2D API's 0..127. Distance
-        // attenuation is folded in here so one call site reaches every gain.
-        float gain = s.vol01 * sample3d_distance_gain(s);
+        float gain = s.volume01 * sample3d_distance_gain(s);
         if (gain <= 0.0f)
             return -10000;
-        return std::clamp(master + (int)std::lround(2000.0 * std::log10(gain)), -10000, 0);
+        return std::clamp(master + miles_volume_mb(gain), -10000, 0);
     }
-    return miles_volume_mb(s.volume) + master;
+    return miles_volume_mb(s.volume01) + master;
 }
 
 // Push a sample's current volume and pan to its host channel. A playing 3D
@@ -189,7 +191,13 @@ void sample_apply_mix(Sample &s) {
     if (s.channel < 0)
         return;
     host_audio_set_volume(s.channel, std::max(-10000, sample_volume(s)));
-    host_audio_set_pan(s.channel, s.is_3d ? sample3d_pan_mb(s) : miles_pan_mb(s.pan));
+    host_audio_set_pan(s.channel, s.is_3d ? sample3d_pan_mb(s) : miles_pan_mb(s.pan01));
+}
+
+void sample_update_3d_mix() {
+    for (auto &s : g_samples)
+        if (s.alive && s.is_3d)
+            sample_apply_mix(s);
 }
 
 void sample_play(Sample &s) {
@@ -202,7 +210,7 @@ void sample_play(Sample &s) {
     p.bits = s.wave.bits;
     p.loop = s.loops == 0 ? 1 : 0;
     p.volume = std::max(-10000, sample_volume(s));
-    p.pan = s.is_3d ? sample3d_pan_mb(s) : miles_pan_mb(s.pan);
+    p.pan = s.is_3d ? sample3d_pan_mb(s) : miles_pan_mb(s.pan01);
     host_audio_play(&p);
     s.playing = true;
 }
@@ -550,18 +558,17 @@ void ail_sample_status(X86 *c) {
 
 void ail_set_sample_volume(X86 *c) {
     if (Sample *s = sample_for(arg(c, 0))) {
-        s->volume = std::clamp((int32_t)arg(c, 1), 0, 127);
-        if (s->channel >= 0)
-            host_audio_set_volume(s->channel, std::max(-10000, sample_volume(*s)));
+        s->volume01 = std::clamp((int32_t)arg(c, 1), 0, 127) / 127.0f;
+        sample_apply_mix(*s);
     }
     set_eax(c, 0);
 }
 
 void ail_set_sample_pan(X86 *c) {
     if (Sample *s = sample_for(arg(c, 0))) {
-        s->pan = std::clamp((int32_t)arg(c, 1), 0, 127);
-        if (s->channel >= 0)
-            host_audio_set_pan(s->channel, miles_pan_mb(s->pan));
+        int32_t p = std::clamp((int32_t)arg(c, 1), 0, 127);
+        s->pan01 = p <= 64 ? p / 128.0f : 0.5f + (p - 64) / 126.0f;
+        sample_apply_mix(*s);
     }
     set_eax(c, 0);
 }
@@ -583,11 +590,17 @@ float bits_to_float(uint32_t bits) {
     return v;
 }
 
+uint32_t float_to_bits(float v) {
+    uint32_t bits;
+    memcpy(&bits, &v, 4);
+    return bits;
+}
+
 // AIL_set_sample_volume_levels(HSAMPLE, F32 left, F32 right) and
 // AIL_set_sample_volume_pan(HSAMPLE, F32 volume, F32 pan) are the two forms
 // the engine's 2D path uses. The shim's channel has one volume and one pan,
 // so the two levels collapse to their loudest and their balance, and the
-// combined form maps its 0..1 pan onto the 0..127 range SetPan uses.
+// combined form retains its normalized volume and pan values.
 void ail_set_sample_volume_levels(X86 *c) {
     Sample *s = sample_for(arg(c, 0));
     set_eax(c, 0);
@@ -597,8 +610,8 @@ void ail_set_sample_volume_levels(X86 *c) {
     float r = std::clamp(bits_to_float(arg(c, 2)), 0.0f, 1.0f);
     float loud = l > r ? l : r;
     float sum = l + r;
-    s->volume = std::clamp((int)std::lround(loud * 127.0f), 0, 127);
-    s->pan = sum > 0.0f ? std::clamp((int)std::lround((r / sum) * 127.0f), 0, 127) : 64;
+    s->volume01 = loud;
+    s->pan01 = sum > 0.0f ? r / sum : 0.5f;
     sample_apply_mix(*s);
 }
 
@@ -609,8 +622,8 @@ void ail_set_sample_volume_pan(X86 *c) {
         return;
     float v = std::clamp(bits_to_float(arg(c, 1)), 0.0f, 1.0f);
     float p = std::clamp(bits_to_float(arg(c, 2)), 0.0f, 1.0f);
-    s->volume = std::clamp((int)std::lround(v * 127.0f), 0, 127);
-    s->pan = std::clamp((int)std::lround(p * 127.0f), 0, 127);
+    s->volume01 = v;
+    s->pan01 = p;
     sample_apply_mix(*s);
 }
 
@@ -969,7 +982,7 @@ void ail_set_3D_sample_loop_count(X86 *c) {
 
 void ail_set_3D_sample_volume(X86 *c) {
     if (Sample *s = sample_for(arg(c, 0))) {
-        s->vol01 = std::clamp(bits_to_float(arg(c, 1)), 0.0f, 1.0f);
+        s->volume01 = std::clamp(bits_to_float(arg(c, 1)), 0.0f, 1.0f);
         sample_apply_mix(*s);
     }
     set_eax(c, 0);
@@ -1015,6 +1028,7 @@ void ail_set_3D_position(X86 *c) {
         g_listener_pos3d[0] = x;
         g_listener_pos3d[1] = y;
         g_listener_pos3d[2] = z;
+        sample_update_3d_mix();
     } else if (Sample *s = sample_for(handle)) {
         s->pos3d[0] = x;
         s->pos3d[1] = y;
@@ -1033,9 +1047,7 @@ void ail_set_3D_orientation(X86 *c) {
         }
         // Every source's pan is measured against the listener, so a listener
         // move re-places anything already playing.
-        for (auto &s : g_samples)
-            if (s.alive && s.is_3d)
-                sample_apply_mix(s);
+        sample_update_3d_mix();
     }
     set_eax(c, 0);
 }
@@ -1148,16 +1160,6 @@ void ail_release_timer_handle(X86 *c) {
     set_eax(c, 0);
 }
 
-// ---------------------------------------------------------------------------
-// Miles 9 exports the title imports under names earlier Miles revisions did
-// not have. The mixer holds no reverb, Doppler or per-sample orientation, so
-// those calls leave the mix unchanged; positions and distances map onto the
-// shared 3D model, and the getters report what the shim holds.
-// ---------------------------------------------------------------------------
-void ail_mem_hook(X86 *c) {
-    set_eax(c, 0);
-}
-
 void ail_close_digital_driver(X86 *c) {
     uint32_t id = arg(c, 0);
     for (auto &s : g_samples)
@@ -1171,64 +1173,17 @@ void ail_close_digital_driver(X86 *c) {
     set_eax(c, 0);
 }
 
-void ail_get_dsound_info(X86 *c) {
-    if (arg(c, 1) && gm_valid(arg(c, 1), 4))
-        wr32(arg(c, 1), 0);
-    if (arg(c, 2) && gm_valid(arg(c, 2), 4))
-        wr32(arg(c, 2), 0);
-    set_eax(c, 0);
-}
-
 void ail_sample_playback_rate(X86 *c) {
     Sample *s = sample_for(arg(c, 0));
     set_eax(c, s ? (s->rate ? s->rate : s->wave.rate) : 0);
 }
 
-void ail_sample_position(X86 *c) {
-    set_eax(c, 0);
-}
-
-// AIL_sample_ms_position(HSAMPLE, S32 *total, S32 *current). The shim knows
-// the image's length but keeps no play cursor, so the current position is
-// reported as the start.
-void ail_sample_ms_position(X86 *c) {
-    Sample *s = sample_for(arg(c, 0));
-    uint32_t total = 0;
-    if (s && s->wave.pcm_bytes) {
-        uint32_t rate = s->rate ? s->rate : s->wave.rate;
-        uint32_t frame =
-            std::max<uint32_t>(1u, uint32_t(s->wave.channels) * uint32_t(s->wave.bits / 8));
-        total = uint32_t((uint64_t)s->wave.pcm_bytes / frame * 1000 / std::max(1u, rate));
-    }
-    if (arg(c, 1) && gm_valid(arg(c, 1), 4))
-        wr32(arg(c, 1), total);
-    if (arg(c, 2) && gm_valid(arg(c, 2), 4))
-        wr32(arg(c, 2), 0);
-    set_eax(c, 0);
-}
-
 void ail_sample_volume_pan(X86 *c) {
     Sample *s = sample_for(arg(c, 0));
     if (arg(c, 1) && gm_valid(arg(c, 1), 4))
-        wr32(arg(c, 1), s ? (uint32_t)s->volume : 0);
+        wr32(arg(c, 1), float_to_bits(s ? s->volume01 : 0.0f));
     if (arg(c, 2) && gm_valid(arg(c, 2), 4))
-        wr32(arg(c, 2), s ? (uint32_t)s->pan : 0);
-    set_eax(c, 0);
-}
-
-void ail_sample_reverb_levels(X86 *c) {
-    if (arg(c, 1) && gm_valid(arg(c, 1), 4))
-        wr32(arg(c, 1), 0);
-    if (arg(c, 2) && gm_valid(arg(c, 2), 4))
-        wr32(arg(c, 2), 0);
-    set_eax(c, 0);
-}
-
-void ail_set_sample_position(X86 *c) {
-    set_eax(c, 0);
-}
-
-void ail_set_sample_reverb_levels(X86 *c) {
+        wr32(arg(c, 2), float_to_bits(s ? s->pan01 : 0.0f));
     set_eax(c, 0);
 }
 
@@ -1243,43 +1198,36 @@ void ail_stream_loop_count(X86 *c) {
     set_eax(c, s ? s->loops : 0);
 }
 
-void ail_stream_ms_position(X86 *c) {
-    if (arg(c, 1) && gm_valid(arg(c, 1), 4))
-        wr32(arg(c, 1), 0);
-    if (arg(c, 2) && gm_valid(arg(c, 2), 4))
-        wr32(arg(c, 2), 0);
-    set_eax(c, 0);
-}
-
-void ail_set_stream_ms_position(X86 *c) {
-    set_eax(c, 0);
-}
-
-void ail_stream_sample_handle(X86 *c) {
-    set_eax(c, 0);
-}
-
 void ail_set_listener_3D_position(X86 *c) {
-    ail_set_3D_position(c);
+    float x = bits_to_float(arg(c, 1)), y = bits_to_float(arg(c, 2)), z = bits_to_float(arg(c, 3));
+    if (g_drivers.count(arg(c, 0))) {
+        g_listener_pos3d[0] = x;
+        g_listener_pos3d[1] = y;
+        g_listener_pos3d[2] = z;
+        sample_update_3d_mix();
+    }
+    set_eax(c, 0);
 }
 
 void ail_set_listener_3D_orientation(X86 *c) {
-    ail_set_3D_orientation(c);
+    if (g_drivers.count(arg(c, 0))) {
+        for (int i = 0; i < 3; ++i) {
+            g_listener_front3d[i] = bits_to_float(arg(c, 1 + i));
+            g_listener_top3d[i] = bits_to_float(arg(c, 4 + i));
+        }
+        sample_update_3d_mix();
+    }
+    set_eax(c, 0);
 }
 
 void ail_set_sample_3D_position(X86 *c) {
-    ail_set_3D_position(c);
-}
-
-void ail_set_sample_3D_orientation(X86 *c) {
-    set_eax(c, 0);
-}
-
-void ail_set_sample_3D_velocity_vector(X86 *c) {
-    set_eax(c, 0);
-}
-
-void ail_set_sample_3D_cone(X86 *c) {
+    if (Sample *s = sample_for(arg(c, 0))) {
+        s->is_3d = true;
+        s->pos3d[0] = bits_to_float(arg(c, 1));
+        s->pos3d[1] = bits_to_float(arg(c, 2));
+        s->pos3d[2] = bits_to_float(arg(c, 3));
+        sample_apply_mix(*s);
+    }
     set_eax(c, 0);
 }
 
@@ -1293,26 +1241,9 @@ void ail_set_sample_3D_distances(X86 *c) {
     set_eax(c, 0);
 }
 
-void ail_set_3D_doppler_factor(X86 *c) {
-    set_eax(c, 0);
-}
-
-// AIL_set_3D_rolloff_factor(listener, F32) is the distance-factor control in
-// the title's Miles revision; the shared 3D model stores one rolloff.
 void ail_set_3D_rolloff_factor(X86 *c) {
     g_rolloff3d = bits_to_float(arg(c, 1));
-    set_eax(c, 0);
-}
-
-void ail_set_room_type(X86 *c) {
-    set_eax(c, 0);
-}
-
-void ail_set_digital_master_reverb(X86 *c) {
-    set_eax(c, 0);
-}
-
-void ail_set_digital_master_reverb_levels(X86 *c) {
+    sample_update_3d_mix();
     set_eax(c, 0);
 }
 
@@ -1411,34 +1342,34 @@ const ImportShim g_mss32_shims[] = {
     AIL(set_3D_orientation, 28, ail_set_3D_orientation),
     AIL(register_3D_EOS_callback, 8, ail_register_3D_eos_callback),
     AIL(3D_update_position, 8, ret0),
-    AIL(mem_use_malloc, 4, ail_mem_hook),
-    AIL(mem_use_free, 4, ail_mem_hook),
+    AIL(mem_use_malloc, 4, imports_unsupported),
+    AIL(mem_use_free, 4, imports_unsupported),
     AIL(close_digital_driver, 4, ail_close_digital_driver),
-    AIL(get_DirectSound_info, 12, ail_get_dsound_info),
-    AIL(sample_ms_position, 12, ail_sample_ms_position),
+    AIL(get_DirectSound_info, 12, imports_unsupported),
+    AIL(sample_ms_position, 12, imports_unsupported),
     AIL(sample_playback_rate, 4, ail_sample_playback_rate),
-    AIL(sample_position, 4, ail_sample_position),
-    AIL(sample_reverb_levels, 12, ail_sample_reverb_levels),
+    AIL(sample_position, 4, imports_unsupported),
+    AIL(sample_reverb_levels, 12, imports_unsupported),
     AIL(sample_volume_pan, 12, ail_sample_volume_pan),
     AIL(service_stream, 8, ail_service_stream),
-    AIL(set_3D_doppler_factor, 8, ail_set_3D_doppler_factor),
+    AIL(set_3D_doppler_factor, 8, imports_unsupported),
     AIL(set_3D_rolloff_factor, 8, ail_set_3D_rolloff_factor),
-    AIL(set_digital_master_reverb, 16, ail_set_digital_master_reverb),
-    AIL(set_digital_master_reverb_levels, 12, ail_set_digital_master_reverb_levels),
+    AIL(set_digital_master_reverb, 16, imports_unsupported),
+    AIL(set_digital_master_reverb_levels, 12, imports_unsupported),
     AIL(set_listener_3D_orientation, 28, ail_set_listener_3D_orientation),
     AIL(set_listener_3D_position, 16, ail_set_listener_3D_position),
-    AIL(set_room_type, 8, ail_set_room_type),
-    AIL(set_sample_3D_cone, 16, ail_set_sample_3D_cone),
+    AIL(set_room_type, 8, imports_unsupported),
+    AIL(set_sample_3D_cone, 16, imports_unsupported),
     AIL(set_sample_3D_distances, 16, ail_set_sample_3D_distances),
-    AIL(set_sample_3D_orientation, 28, ail_set_sample_3D_orientation),
+    AIL(set_sample_3D_orientation, 28, imports_unsupported),
     AIL(set_sample_3D_position, 16, ail_set_sample_3D_position),
-    AIL(set_sample_3D_velocity_vector, 16, ail_set_sample_3D_velocity_vector),
-    AIL(set_sample_position, 8, ail_set_sample_position),
-    AIL(set_sample_reverb_levels, 12, ail_set_sample_reverb_levels),
-    AIL(set_stream_ms_position, 8, ail_set_stream_ms_position),
+    AIL(set_sample_3D_velocity_vector, 16, imports_unsupported),
+    AIL(set_sample_position, 8, imports_unsupported),
+    AIL(set_sample_reverb_levels, 12, imports_unsupported),
+    AIL(set_stream_ms_position, 8, imports_unsupported),
     AIL(stream_loop_count, 4, ail_stream_loop_count),
-    AIL(stream_ms_position, 12, ail_stream_ms_position),
-    AIL(stream_sample_handle, 4, ail_stream_sample_handle),
+    AIL(stream_ms_position, 12, imports_unsupported),
+    AIL(stream_sample_handle, 4, imports_unsupported),
 };
 
 } // namespace
