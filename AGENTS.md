@@ -39,9 +39,31 @@ last build and the original bytes under Unicorn on the same random registers,
 arguments, scratch memory and uninitialized globals, then compares registers,
 flags, x87 state and writable memory. Inputs where the original faults, calls an
 import or runs too long are discarded. Select functions with `--func ADDR`,
-`--sample N`, `--all`, or `--changed` (generated C differs from the previous run).
+`--sample N`, `--all`, `--changed`, or `--suite MANIFEST`.
 
-For a translator change: run once before (it records generated bodies), change
-and `--regenerate`, then run `--changed`. `--fpu-cw` fixes the initial x87
-control word; divergences only under `007f` usually come from binary32 x87
-arithmetic. The report is in `<build root>/recomp/diff/report.json`.
+`--mode specialized` (default) runs the production contract call sites,
+`--mode ordinary` forces the ordinary fallback through `recomp_hooks_ever`, and
+`--mode paired` runs both on each input, comparing each with the original and
+the two with each other. The same linked library serves both modes, so
+`checkpoint_countdown` is seeded nonzero for private routes to run. There is no
+per-site instrumentation: paired equality is necessary, not proof that a call
+site took the private route.
+
+Each run writes a fresh report directory and its own harness; `--out` refuses
+reuse. `--changed --baseline FILE` reads a chosen body snapshot, while
+`--save-baseline FILE` creates a new one exclusively. `--fail-on any` (default)
+fails on oracle or pair discrepancies; `--fail-on pair` requires paired mode.
+Run provenance and replay limits are recorded in `run.json`; see
+[testing](docs/testing.md) for artifact and input details.
+
+For a translator change: `--all --save-baseline before.json`, change and
+`--regenerate`, then `--changed --baseline before.json` (add `--mode paired`).
+Inputs reset writable sections, BSS/scratch/TEB fills and the full stack window
+before the original and every variant, without redrawing random values.
+
+The harness is compiled only through `tools/build.py --diff-harness`, which links
+the existing generated archive whole without rebuilding or regenerating it.
+`--fpu-cw` fixes the initial x87 control word; divergences only under `007f`
+usually come from binary32 x87 arithmetic. Only the active ST0 and TOP are
+compared, using the tag word to tell active from empty and ignoring inactive
+scratch slots; ST1-ST7 and the full status word are out of scope.

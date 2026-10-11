@@ -93,6 +93,24 @@ constructor result escaping through its caller. Run after rebuilding:
 python tools/recomp/diff/run.py --game railroad-tycoon-3 --suite games/railroad-tycoon-3/validation/private-call-state.json
 ```
 
+Each run writes a fresh report directory holding its own linked harness;
+`--mode paired` runs the production specialization-enabled and forced ordinary
+routes on the same inputs and compares both with the original bytes. `--changed`
+needs an explicit `--baseline FILE`, recorded with `--save-baseline FILE`;
+neither is implicit. Before a translator change: `--all --save-baseline
+before.json`; after the change and `--regenerate`: `--changed --baseline
+before.json`. Run the pair check on callers with specialized edges, such
+as `0x0042c1b0` and `0x0042ce00`. The harness cannot observe whether one call
+site took a private route, and compares only the active ST0/TOP, so pair equality
+is necessary but not per-call-site coverage.
+
+The tag-aware checker also reports empty/active ST0 disagreements at
+`005a13d0`, `005a3040` and `005a3e90` in both modes. These wrappers consume an
+x87 argument, while the current random fixture starts with an empty x87 stack.
+They remain oracle failures under the default policy; pair-only diagnosis can
+separate them from specialization differences. Valid x87 argument fixtures and
+full-stack/status comparisons remain validation gaps.
+
 Selected production facts use import PC/RC preservation and the explicit,
 verified cargo-entry premise in `game.toml`. `x87-boundaries.json` records the
 byte-backed native/import boundaries; `x87-facts.json` covers 479 instruction

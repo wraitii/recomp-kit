@@ -2,20 +2,28 @@
 """Run translated game functions and the original bytes under Unicorn on the same random inputs.
 
     run.py --game <id> --func 0x401000 [--func ...]
-    run.py --game <id> --changed      # functions whose generated C changed since the last run
-    run.py --game <id> --sample 2000  # random functions
+    run.py --game <id> --changed --baseline before-bodies.json
+    run.py --game <id> --sample 2000
     run.py --game <id> --all
+    run.py --game <id> --suite path.json --mode paired
 
-Uses the archive from the last `tools/build.py` build. Inputs whose original
-execution faults, calls an import or runs too long are discarded; a function is
-reported when the translation returns different registers, flags, x87 state or
-memory, or escapes where the original returned.
+Uses the archive from the last `tools/build.py` build, compiling the linked
+harness through `tools/build.py --diff-harness`. Inputs whose original execution
+faults, calls an import or runs too long are discarded; a function is reported
+when a translation returns different registers, flags, x87 state or memory.
+
+--mode selects what is linked into the run:
+  specialized  production contract call sites (recomp_hooks_ever = 0), default
+  ordinary     forced ordinary fallback (recomp_hooks_ever = 1)
+  paired       both, per input, compared with each other and the original
+
+Every run writes a fresh report directory. `--changed` reads only the explicit
+`--baseline`; `--save-baseline` writes a new one and is never implicit.
 """
 
 import argparse
 import ctypes as C
 import hashlib
-import importlib.util
 import json
 import math
 import os
@@ -23,10 +31,12 @@ import platform
 import random
 import re
 import select
+import shutil
 import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter
 from pathlib import Path
@@ -41,12 +51,9 @@ from unicorn.x86_const import (
     UC_X86_REG_FS, UC_X86_REG_SS, UC_X86_REG_DS, UC_X86_REG_ES, UC_X86_REG_GDTR)
 
 KIT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(KIT / "tools"))
+sys.path[:0] = [str(KIT / "tools"), str(KIT / "tools/recomp")]
+import buildlock  # noqa: E402
 import game_config  # noqa: E402
-
-spec = importlib.util.spec_from_file_location("build_py", KIT / "tools/build.py")
-build_py = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(build_py)
 
 SCRATCH, SCRATCH_SIZE = 0x0E000000, 0x00100000
 STACK, STACK_SIZE = 0x0EF00000, 0x00100000
@@ -61,6 +68,7 @@ FPU_CW_SLOT = CAVE + 0x300
 IMPORT_TRAP = 0x0DF00000
 TEB = 0x0DEB0000
 GDT = 0x0DEB1000
+ZERO_STACK = bytes(STACK_SIZE)
 
 REGS = [UC_X86_REG_EAX, UC_X86_REG_ECX, UC_X86_REG_EDX, UC_X86_REG_EBX,
         UC_X86_REG_ESP, UC_X86_REG_EBP, UC_X86_REG_ESI, UC_X86_REG_EDI]
@@ -68,6 +76,8 @@ REG_NAMES = ["EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI"]
 FLAGS = {"CF": 0x001, "PF": 0x004, "ZF": 0x040, "SF": 0x080, "DF": 0x400, "OF": 0x800}
 FLAG_MASK = sum(FLAGS.values())
 FPU_CWS = (0x037F, 0x027F, 0x007F)
+HOOKS_EVER = {"ordinary": 1, "specialized": 0}
+MODES = ("ordinary", "specialized", "paired")
 
 
 class State(C.Structure):
@@ -76,28 +86,27 @@ class State(C.Structure):
                 ("fpu_top", C.c_uint32), ("st0", C.c_double), ("escape_addr", C.c_uint32)]
 
 
-def build_harness(build_root, out):
-    archive = build_py.archive_path(build_root)
-    gen = build_root / "recomp/gen"
-    if not archive.exists():
-        sys.exit("%s is missing: build the game first" % archive)
-    sources = [KIT / "tools/recomp/tests/harness.c", Path(__file__).with_name("host.c"),
-               KIT / "platform/os_posix.cpp"]
-    inputs = sources + [archive, KIT / "runtime/x86.h", gen / "table.c"]
-    if out.exists() and out.stat().st_mtime > max(p.stat().st_mtime for p in inputs):
+def harness_name():
+    return "harness.dylib" if platform.system() == "Darwin" else "harness.so"
+
+
+def harness_path(build_root):
+    return Path(build_root) / "recomp/diff" / harness_name()
+
+
+def build_harness(build_root, out, game_dir, no_build=False):
+    """Build the linked harness into this run's directory, or copy the prebuild."""
+    if no_build:
+        shared = harness_path(build_root)
+        if not shared.exists():
+            sys.exit("--no-build given but the prebuilt harness is missing: %s" % shared)
+        with buildlock.BuildLock(Path(build_root).parent, "diff/run.py --no-build"):
+            shutil.copy2(shared, out)
         return
-    out.parent.mkdir(parents=True, exist_ok=True)
-    darwin = platform.system() == "Darwin"
-    cc = ["xcrun", "clang"] if darwin else ["clang"]
-    os_obj = out.with_name("os_posix.o")
-    subprocess.check_call(cc + ["-x", "c++", "-std=c++17", "-O1", "-fno-exceptions", "-fPIC",
-                                "-I", str(KIT), "-c", str(sources[2]), "-o", str(os_obj)])
-    whole = (["-dynamiclib", "-Wl,-force_load," + str(archive)] if darwin else
-             ["-shared", "-Wl,--whole-archive", str(archive), "-Wl,--no-whole-archive", "-lm"])
-    subprocess.check_call(cc + ["-O1", "-ffp-contract=off", "-std=c11", "-w", "-fPIC",
-                                "-I", str(gen), "-I", str(KIT), "-I", str(KIT / "runtime"),
-                                str(sources[0]), str(sources[1]), str(os_obj)] + whole +
-                          ["-o", str(out)])
+    subprocess.check_call(
+        [sys.executable, str(KIT / "tools/build.py"), "--game-dir", str(game_dir),
+         "--build-root", str(build_root), "--diff-harness", "--harness-out", str(out)],
+        cwd=str(KIT))
 
 
 def function_bodies(gen):
@@ -110,6 +119,41 @@ def function_bodies(gen):
             end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
             bodies[int(m.group(1), 16)] = hashlib.sha1(text[m.start():end].encode()).hexdigest()
     return bodies
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def sha256_or_none(path):
+    path = Path(path)
+    return sha256_file(path) if path.is_file() else None
+
+
+def tree_sha256(root):
+    root = Path(root)
+    if not root.is_dir():
+        return None
+    h = hashlib.sha256()
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        h.update(path.relative_to(root).as_posix().encode() + b"\0")
+        h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def functions_sha256(addrs):
+    return hashlib.sha256(",".join("%08x" % a for a in sorted(addrs)).encode()).hexdigest()
+
+
+def write_exclusive(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
 
 
 class Image:
@@ -149,8 +193,12 @@ class Native:
         self.lib.harness_mem.restype = C.c_void_p
         self.lib.diff_run.restype = C.c_char_p
         self.lib.diff_run.argtypes = [C.c_uint32, C.POINTER(State), C.c_uint32]
+        self.lib.diff_set_hooks_ever.argtypes = [C.c_uint8]
         self.base = self.lib.harness_mem()
         self.write(image.base, image.bytes)
+
+    def set_hooks_ever(self, value):
+        self.lib.diff_set_hooks_ever(value)
 
     def write(self, addr, data):
         C.memmove(self.base + addr, data, len(data))
@@ -297,82 +345,223 @@ def regions(image):
     return list(image.writable) + [(SCRATCH, SCRATCH_SIZE), (ESP_INIT, ARG_BYTES), (TEB, 0x1000)]
 
 
-def run_function(addr, native, emu, image, args):
+def make_state(regs, eflags, cw):
+    st = State()
+    st.r[:] = regs
+    st.eflags = eflags
+    st.fpu_cw = cw
+    return st
+
+
+def load_memory(sink, data, fills, stack):
+    for start, blob in data:
+        sink(start, blob)
+    for start, blob in fills:
+        sink(start, blob)
+    sink(STACK, ZERO_STACK)
+    sink(ESP_INIT, stack)
+
+
+def oracle_snapshot(u, fnsave, region_list):
+    """x87 ST0 is only compared when the oracle tag word marks it valid."""
+    want_tag = struct.unpack_from("<H", fnsave, 8)[0]
+    want_top = (struct.unpack_from("<H", fnsave, 4)[0] >> 11) & 7
+    st0 = None
+    if (want_tag >> (2 * want_top)) & 3 != 3:
+        st0 = ext80(fnsave[28:38])
+    return {"regs": [u.reg_read(r) for r in REGS],
+            "eflags": u.reg_read(UC_X86_REG_EFLAGS),
+            "fpu_top": want_top, "st0": st0,
+            "mem": [bytes(u.mem_read(s, n)) for s, n in region_list]}
+
+
+def native_snapshot(native, st, region_list):
+    active = (st.fpu_tag >> (2 * st.fpu_top)) & 3 != 3
+    return {"regs": [st.r[i] for i in range(8)],
+            "eflags": st.eflags,
+            "fpu_top": st.fpu_top, "st0": st.st0 if active else None,
+            "mem": [native.read(s, n) for s, n in region_list]}
+
+
+def compare_states(want, got, region_list):
+    """Differences of one state against another, in a deterministic order."""
+    problems = []
+    for name, a, b in zip(REG_NAMES, want["regs"], got["regs"]):
+        if a != b:
+            problems.append("%s %08x != %08x" % (name, a, b))
+    flags = [n for n, bit in FLAGS.items() if (want["eflags"] ^ got["eflags"]) & bit]
+    if want["fpu_top"] != got["fpu_top"]:
+        problems.append("x87 TOP %d != %d" % (want["fpu_top"], got["fpu_top"]))
+    else:
+        a, b = want["st0"], got["st0"]
+        if (a is None) != (b is None):
+            problems.append("x87 ST0 %s != %s" % ("empty" if a is None else "active",
+                                                  "empty" if b is None else "active"))
+        elif a is not None and not close(a, b, 1e-9):
+            problems.append("ST0 %r != %r" % (a, b))
+    fp = []
+    for (start, n), w, g in zip(region_list, want["mem"], got["mem"]):
+        hard, soft = memory_diff(w, g, start)
+        problems += hard
+        fp += soft
+    if flags and not problems:
+        problems.append("flags " + " ".join(flags))
+    if fp and not problems:
+        problems.append("float only: " + "; ".join(fp[:4]))
+    return problems
+
+
+def compare_pair(specialized, ordinary, region_list):
+    """Specialized against ordinary, including escape shapes, as a pair result."""
+    if specialized[0] == "escape" and ordinary[0] == "escape":
+        if specialized[1] == ordinary[1] and specialized[2] == ordinary[2]:
+            return []
+        if specialized[1] == ordinary[1]:
+            return ["pair escape %s @%08x != @%08x" % (specialized[1], specialized[2], ordinary[2])]
+        return ["pair escape %s != %s" % (specialized[1], ordinary[1])]
+    if specialized[0] == "escape":
+        return ["pair specialized escaped (%s @%08x) but ordinary returned"
+                % (specialized[1], specialized[2])]
+    if ordinary[0] == "escape":
+        return ["pair ordinary escaped (%s @%08x) but specialized returned"
+                % (ordinary[1], ordinary[2])]
+    return ["pair " + p for p in compare_states(specialized[1], ordinary[1], region_list)]
+
+
+def findings_add(store, problems):
+    for problem in problems:
+        store[problem] = store.get(problem, 0) + 1
+
+
+def findings_list(store):
+    return sorted(({"problem": p, "count": c} for p, c in store.items()),
+                  key=lambda f: (-f["count"], f["problem"]))
+
+
+def oracle_problems(oracle, variant, region_list):
+    if variant[0] == "escape":
+        return ["translation escaped (%s %08x) where the original returned" % (variant[1], variant[2])]
+    return compare_states(oracle, variant[1], region_list)
+
+
+def emulate_original(u, emu, addr, data, region_list, args, regs, eflags, cw, stack, fills):
+    """Run the original bytes and return (skip_reason, oracle_snapshot|None)."""
+    load_memory(u.mem_write, data, fills, stack)
+    for r, v in zip(REGS, regs):
+        u.reg_write(r, v)
+    u.mem_write(FPU_CW_SLOT, struct.pack("<H", cw))
+    u.emu_start(FPU_RESET, FPU_RESET + 8)
+    u.reg_write(UC_X86_REG_EFLAGS, eflags)
+    emu.fault = None
+    try:
+        u.emu_start(addr, MAGIC_RET, count=args.max_insns)
+    except UcError:
+        return emu.fault_kind(), None
+    if u.reg_read(UC_X86_REG_EIP) != MAGIC_RET:
+        return "original did not return", None
+    return None, oracle_snapshot(u, fnsave(u), region_list)
+
+
+def run_variant(native, mode, addr, data, fills, stack, region_list, regs, eflags, cw):
+    load_memory(native.write, data, fills, stack)
+    native.set_hooks_ever(HOOKS_EVER[mode])
+    st = make_state(regs, eflags, cw)
+    escape = native.lib.diff_run(addr, C.byref(st), TEB)
+    if escape:
+        return ("escape", escape.decode(), st.escape_addr)
+    return ("state", native_snapshot(native, st, region_list))
+
+
+def run_single(addr, native, emu, image, args):
+    """One mode, the original bytes and the translation on shared inputs."""
+    mode = args.mode
     inputs = Inputs(args.seed ^ addr, image, args.fpu_cw)
     u = emu.u
     data = [(s, image.bytes[s - image.base:s - image.base + n]) for s, n in image.writable]
+    region_list = regions(image)
     skipped = Counter()
     compared = 0
     for it in range(args.iterations):
         regs, eflags, cw, stack, fills = inputs.make()
-        for start, blob in data:
-            u.mem_write(start, blob)
-            native.write(start, blob)
-        for target in (u.mem_write, native.write):
-            for start, blob in fills:
-                target(start, blob)
-            target(ESP_INIT, stack)
-        for r, v in zip(REGS, regs):
-            u.reg_write(r, v)
-        u.mem_write(FPU_CW_SLOT, struct.pack("<H", cw))
-        u.emu_start(FPU_RESET, FPU_RESET + 8)
-        u.reg_write(UC_X86_REG_EFLAGS, eflags)
-        emu.fault = None
-        try:
-            u.emu_start(addr, MAGIC_RET, count=args.max_insns)
-        except UcError:
-            skipped[emu.fault_kind()] += 1
+        reason, oracle = emulate_original(u, emu, addr, data, region_list, args,
+                                          regs, eflags, cw, stack, fills)
+        if reason is not None:
+            skipped[reason] += 1
             continue
-        if u.reg_read(UC_X86_REG_EIP) != MAGIC_RET:
-            skipped["original did not return"] += 1
-            continue
-        want_regs = [u.reg_read(r) for r in REGS]
-        want_flags = u.reg_read(UC_X86_REG_EFLAGS)
-        want_mem = [bytes(u.mem_read(s, n)) for s, n in regions(image)]
-        u.mem_write(FNSAVE_SLOT, bytes(108))
-        u.emu_start(FNSAVE_CODE, FNSAVE_CODE + 6)
-        fnsave = bytes(u.mem_read(FNSAVE_SLOT, 108))
-
-        st = State()
-        st.r[:] = regs
-        st.eflags = eflags
-        st.fpu_cw = cw
-        escape = native.lib.diff_run(addr, C.byref(st), TEB)
         compared += 1
-        problems = []
-        if escape:
-            problems.append("translation escaped (%s %08x) where the original returned"
-                            % (escape.decode(), st.escape_addr))
-        else:
-            for name, a, b in zip(REG_NAMES, want_regs, st.r):
-                if a != b:
-                    problems.append("%s %08x != %08x" % (name, a, b))
-            flags = [n for n, bit in FLAGS.items() if (want_flags ^ st.eflags) & bit]
-            want_tag = struct.unpack_from("<H", fnsave, 8)[0]
-            want_top = (struct.unpack_from("<H", fnsave, 4)[0] >> 11) & 7
-            if want_top != st.fpu_top:
-                problems.append("x87 TOP %d != %d" % (want_top, st.fpu_top))
-            elif (want_tag >> (2 * want_top)) & 3 != 3:
-                want_st0 = ext80(fnsave[28:38])
-                if not close(want_st0, st.st0, 1e-9):
-                    problems.append("ST0 %r != %r" % (want_st0, st.st0))
-            fp = []
-            for (start, n), want in zip(regions(image), want_mem):
-                hard, soft = memory_diff(want, native.read(start, n), start)
-                problems += hard
-                fp += soft
-            if flags and not problems:
-                problems.append("flags " + " ".join(flags))
-            if fp and not problems:
-                problems.append("float only: " + "; ".join(fp[:4]))
+        variant = run_variant(native, mode, addr, data, fills, stack, region_list,
+                              regs, eflags, cw)
+        problems = oracle_problems(oracle, variant, region_list)
         if problems:
+            store = {}
+            findings_add(store, problems)
+            findings = findings_list(store)
             return {"addr": addr, "status": "diverged", "iteration": it, "compared": compared,
-                    "input": {"regs": dict(zip(REG_NAMES, ("%08x" % v for v in regs))),
-                              "eflags": "%08x" % eflags, "fpu_cw": "%04x" % cw,
-                              "args": [("%08x" % v) for v in struct.unpack("<8I", stack[4:36])]},
-                    "problems": problems[:24]}
+                    "mode": mode, "oracle": {mode: findings}, "pair": [],
+                    "input": input_record(regs, eflags, cw, stack),
+                    "problems": [f["problem"] for f in findings][:24]}
     return {"addr": addr, "status": "ok" if compared else "unreached", "compared": compared,
-            "skipped": dict(skipped)}
+            "mode": mode, "oracle": {mode: []}, "pair": [], "skipped": dict(skipped)}
+
+
+def run_paired(addr, native, emu, image, args):
+    """Both modes on every returning input; oracle and pair results aggregate."""
+    inputs = Inputs(args.seed ^ addr, image, args.fpu_cw)
+    u = emu.u
+    data = [(s, image.bytes[s - image.base:s - image.base + n]) for s, n in image.writable]
+    region_list = regions(image)
+    skipped = Counter()
+    compared = 0
+    oracle_store = {"specialized": {}, "ordinary": {}}
+    pair_store = {}
+    first = {}
+    for it in range(args.iterations):
+        regs, eflags, cw, stack, fills = inputs.make()
+        reason, oracle = emulate_original(u, emu, addr, data, region_list, args,
+                                          regs, eflags, cw, stack, fills)
+        if reason is not None:
+            skipped[reason] += 1
+            continue
+        compared += 1
+        variants = {mode: run_variant(native, mode, addr, data, fills, stack, region_list,
+                                      regs, eflags, cw)
+                    for mode in ("specialized", "ordinary")}
+        for mode in ("specialized", "ordinary"):
+            problems = oracle_problems(oracle, variants[mode], region_list)
+            if problems and mode not in first:
+                first[mode] = {"iteration": it, "input": input_record(regs, eflags, cw, stack),
+                               "problems": problems[:24]}
+            findings_add(oracle_store[mode], problems)
+        pair = compare_pair(variants["specialized"], variants["ordinary"], region_list)
+        if pair and "pair" not in first:
+            first["pair"] = {"iteration": it, "input": input_record(regs, eflags, cw, stack),
+                             "problems": pair[:24]}
+        findings_add(pair_store, pair)
+    findings = findings_list(pair_store)
+    diverged = bool(findings) or any(oracle_store[m] for m in oracle_store)
+    return {"addr": addr, "status": "diverged" if diverged else ("ok" if compared else "unreached"),
+            "compared": compared, "mode": "paired",
+            "oracle": {m: findings_list(oracle_store[m]) for m in ("specialized", "ordinary")},
+            "pair": findings, "first": first, "skipped": dict(skipped)}
+
+
+def fnsave(u):
+    """Run FNSAVE in the Unicorn cave and return the 108-byte image."""
+    u.mem_write(FNSAVE_SLOT, bytes(108))
+    u.emu_start(FNSAVE_CODE, FNSAVE_CODE + 6)
+    return bytes(u.mem_read(FNSAVE_SLOT, 108))
+
+
+def input_record(regs, eflags, cw, stack):
+    return {"regs": dict(zip(REG_NAMES, ("%08x" % v for v in regs))),
+            "eflags": "%08x" % eflags, "fpu_cw": "%04x" % cw,
+            "args": [("%08x" % v) for v in struct.unpack("<8I", stack[4:36])]}
+
+
+def run_function(addr, native, emu, image, args):
+    if args.mode == "paired":
+        return run_paired(addr, native, emu, image, args)
+    return run_single(addr, native, emu, image, args)
 
 
 def run_all(addrs, args, dylib, image):
@@ -435,8 +624,33 @@ def report(result, done, total):
     print("\r%08x %s" % (result["addr"], result["status"]))
     if "input" in result:
         print("    input %s" % json.dumps(result["input"]))
+    for mode in sorted(result.get("oracle", ())):
+        for f in result["oracle"][mode][:4]:
+            print("    %s oracle x%d: %s" % (mode, f["count"], f["problem"]))
+    for f in result.get("pair", [])[:4]:
+        print("    pair x%d: %s" % (f["count"], f["problem"]))
+    for category in sorted(result.get("first", {})):
+        entry = result["first"][category]
+        print("    first %s iteration %d: %s"
+              % (category, entry["iteration"], json.dumps(entry["input"])))
     for p in result.get("problems", []):
         print("    " + p)
+
+
+def failure(result, fail_on):
+    if result["status"] in ("error", "crashed", "hung"):
+        return True
+    if fail_on == "none":
+        return False
+    if fail_on == "pair":
+        return bool(result.get("pair"))
+    return bool(result.get("pair")) or any(result.get("oracle", {}).values())
+
+
+def default_run_dir(build_root, mode):
+    base = Path(build_root) / "recomp/diff"
+    base.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix="%s-" % mode, dir=base))
 
 
 def main():
@@ -448,6 +662,18 @@ def main():
     pick.add_argument("--sample", type=int)
     pick.add_argument("--all", action="store_true")
     pick.add_argument("--suite", type=Path, help="run a hash-pinned original-byte regression suite")
+    parser.add_argument("--mode", choices=MODES, default="specialized",
+                        help="specialized is production; ordinary forces fallback; paired runs both")
+    parser.add_argument("--baseline", type=Path, default=None,
+                        help="generated-body hashes read by --changed (there is no implicit baseline)")
+    parser.add_argument("--save-baseline", type=Path, default=None,
+                        help="write the current generated-body hashes here; never implicit")
+    parser.add_argument("--out", type=Path, default=None,
+                        help="report directory; refused if it already exists (default: a fresh directory)")
+    parser.add_argument("--fail-on", choices=("any", "pair", "none"), default="any",
+                        help="any fails on any oracle or pair discrepancy; pair only on pair")
+    parser.add_argument("--no-build", action="store_true",
+                        help="copy the prebuilt harness instead of invoking tools/build.py")
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--max-insns", type=int, default=200000)
     parser.add_argument("--timeout", type=int, default=60)
@@ -467,40 +693,125 @@ def main():
             parser.error("regression suite schema or executable identity mismatch")
         args.seed, args.iterations = suite["seed"], suite["iterations"]
         args.fpu_cw = [int(cw, 16) for cw in suite["fpu_cws"]]
-    build_root = args.build_root
-    out = build_root / "recomp/diff"
-    gen = build_root / "recomp/gen"
-    dylib = out / ("harness.dylib" if platform.system() == "Darwin" else "harness.so")
-    build_harness(build_root, dylib)
 
+    for name, value in (("--iterations", args.iterations), ("--jobs", args.jobs),
+                        ("--max-insns", args.max_insns), ("--timeout", args.timeout)):
+        if value < 1:
+            parser.error("%s must be at least 1" % name)
+    if args.sample is not None and args.sample < 1:
+        parser.error("--sample must be at least 1")
+    if args.fail_on == "pair" and args.mode != "paired":
+        parser.error("--fail-on pair needs --mode paired")
+
+    exe = cfg["developer_exe_path"]
+    if not exe.is_file():
+        parser.error("developer executable not found: %s (pass --build-root)" % exe)
+    digest = sha256_file(exe)
+    if digest != cfg["game"]["sha256"]:
+        parser.error("executable identity mismatch: %s has %s, game.toml pins %s"
+                     % (exe, digest, cfg["game"]["sha256"]))
+
+    if (args.baseline is not None and args.save_baseline is not None
+            and args.baseline.resolve() == args.save_baseline.resolve()):
+        parser.error("--baseline and --save-baseline must be different paths")
+    if args.save_baseline is not None and args.save_baseline.exists():
+        parser.error("--save-baseline already exists; refusing to overwrite %s" % args.save_baseline)
+    if args.out is not None:
+        out = args.out.resolve()
+        if out.exists():
+            parser.error("--out already exists; refusing to reuse %s" % out)
+        out.mkdir(parents=True)
+    else:
+        out = default_run_dir(args.build_root, args.mode)
+
+    build_root = args.build_root
+    gen = build_root / "recomp/gen"
     symbols = json.loads((gen / "symbols.json").read_text())
     entries = sorted(int(f["addr"], 16) for f in symbols["functions"] if f["kind"] == "entry")
     bodies = function_bodies(gen)
-    snapshot = out / "bodies.json"
     if suite:
+        selection = "suite"
         addrs = [int(addr, 16) for addr in suite["functions"]]
         if set(addrs) - set(entries):
             parser.error("regression suite contains unmapped entries")
     elif args.func:
+        selection = "func"
         addrs = args.func
+        if set(addrs) - set(entries):
+            parser.error("--func contains unmapped entries")
     elif args.changed:
-        if not snapshot.exists():
-            sys.exit("No previous run to compare with: run once before changing the translator")
-        before = {int(k, 16): v for k, v in json.loads(snapshot.read_text()).items()}
+        selection = "changed"
+        if args.baseline is None:
+            parser.error("--changed needs --baseline PATH; there is no implicit baseline")
+        if not args.baseline.is_file():
+            sys.exit("baseline does not exist: %s" % args.baseline)
+        before = {int(k, 16): v for k, v in json.loads(args.baseline.read_text()).items()}
         addrs = [a for a in entries if bodies.get(a) != before.get(a)]
         print("%d functions changed" % len(addrs))
     elif args.sample:
+        selection = "sample"
         addrs = sorted(random.Random(args.seed).sample(entries, min(args.sample, len(entries))))
     else:
+        selection = "all"
         addrs = entries
 
-    results = run_all(addrs, args, dylib, Image(cfg["developer_exe_path"]))
-    snapshot.write_text(json.dumps({"%08x" % a: h for a, h in bodies.items()}))
-    (out / "report.json").write_text(json.dumps(results, indent=1))
+    if args.save_baseline is not None:
+        write_exclusive(args.save_baseline,
+                        json.dumps({"%08x" % a: h for a, h in bodies.items()}, sort_keys=True) + "\n")
+        print("saved baseline: %s" % args.save_baseline)
+
+    harness = out / harness_name()
+    build_harness(build_root, harness, args.game_dir, args.no_build)
+    harness_digest = sha256_file(harness)
+
+    results = run_all(addrs, args, harness, Image(exe))
+    results.sort(key=lambda r: r["addr"])
+    translate = cfg.get("translate", {})
+    facts, boundaries = translate.get("x87_facts"), translate.get("x87_mode_metadata")
+    stamp = build_root / "recomp/translate.stamp"
+    run_meta = {
+        "format": "recomp-diff-run-v1",
+        "mode": args.mode,
+        "game": cfg["game"]["id"],
+        "selection": selection,
+        "function_count": len(addrs),
+        "functions_sha256": functions_sha256(addrs),
+        "executable": str(exe),
+        "executable_sha256": digest,
+        "expected_executable_sha256": cfg["game"]["sha256"],
+        "harness": str(harness),
+        "harness_sha256": harness_digest,
+        "translate_stamp": stamp.read_text().strip() if stamp.is_file() else None,
+        "game_toml_sha256": sha256_or_none(args.game_dir / "game.toml"),
+        "code_map_sha256": tree_sha256(cfg["code_map_path"]) if cfg.get("code_map_path") else None,
+        "x87_facts_sha256": sha256_or_none(args.game_dir / facts) if facts else None,
+        "x87_boundaries_sha256": sha256_or_none(args.game_dir / boundaries) if boundaries else None,
+        "seed": args.seed,
+        "iterations": args.iterations,
+        "fpu_cws": ["%04x" % cw for cw in args.fpu_cw],
+        "max_insns": args.max_insns,
+        "timeout": args.timeout,
+        "jobs": args.jobs,
+        "fail_on": args.fail_on,
+        "baseline": str(args.baseline) if args.baseline else None,
+        "save_baseline": str(args.save_baseline) if args.save_baseline else None,
+        "input_reset": {
+            "stack_base": "%08x" % STACK,
+            "stack_bytes": STACK_SIZE,
+            "zero_stack": True,
+            "reloaded": ["image writable sections", "bss", "scratch", "teb", "stack"],
+        },
+    }
+    if len(addrs) <= 64:
+        run_meta["functions"] = ["%08x" % a for a in sorted(addrs)]
+    write_exclusive(out / "report.json", json.dumps(results, indent=1, sort_keys=True) + "\n")
+    write_exclusive(out / "run.json", json.dumps(run_meta, indent=1, sort_keys=True) + "\n")
     counts = Counter(r["status"] for r in results)
+    failed = sum(failure(r, args.fail_on) for r in results)
     print(", ".join("%d %s" % (n, s) for s, n in sorted(counts.items())))
+    print("%d functions failed under --fail-on %s" % (failed, args.fail_on))
     print("report: %s" % (out / "report.json"))
-    sys.exit(1 if counts.keys() - {"ok", "unreached"} else 0)
+    sys.exit(1 if failed else 0)
 
 
 if __name__ == "__main__":

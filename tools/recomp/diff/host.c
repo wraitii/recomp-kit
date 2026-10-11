@@ -28,6 +28,10 @@ void recomp_x87_contract_violation(X86 *c, uint32_t addr, uint16_t mask, uint16_
 uint8_t recomp_hooks_ever;
 uint32_t recomp_frame_watch;
 
+void diff_set_hooks_ever(uint8_t value) {
+    recomp_hooks_ever = value;
+}
+
 int interp_call(X86 *c, uint32_t target) {
     (void)c;
     harness_escape("interp", target);
@@ -132,6 +136,7 @@ static X86 diff_cpu;
 const char *diff_run(uint32_t addr, DiffState *s, uint32_t fs_base) {
     X86 *c = &diff_cpu;
     memset(c, 0, sizeof *c);
+    c->checkpoint_countdown = 1023u;
     memcpy(c->r, s->r, sizeof c->r);
     x86_set_eflags(c, s->eflags);
     x87_finit(c);

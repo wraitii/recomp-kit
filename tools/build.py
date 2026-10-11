@@ -408,6 +408,42 @@ def publish_generated(build_root, translate, partial=False, main=True):
         temporary.replace(recomp / "symbols.json")
 
 
+def harness_name(system=None):
+    return "harness.dylib" if (system or platform.system()) == "Darwin" else "harness.so"
+
+
+def build_diff_harness(build_root, out):
+    """Compile the Unicorn diff harness beside the translated archive.
+
+    It links the archive whole so its address-indexed entry tables survive, and
+    the OS shim so its guest arena is mapped. The archive itself is only read;
+    tools/build.py --regenerate owns it. Reuses the library when every input is
+    older, so a repeated run does not relink."""
+    archive = archive_path(build_root)
+    gen = Path(build_root) / "recomp/gen"
+    if not archive.exists():
+        sys.exit("%s is missing: build the game first" % archive)
+    sources = [ROOT / "tools/recomp/tests/harness.c", ROOT / "tools/recomp/diff/host.c",
+               ROOT / "platform/os_posix.cpp"]
+    inputs = sources + [archive, ROOT / "runtime/x86.h", gen / "table.c"]
+    if out.exists() and out.stat().st_mtime > max(p.stat().st_mtime for p in inputs):
+        print("diff harness up to date: %s" % out)
+        return
+    out.parent.mkdir(parents=True, exist_ok=True)
+    darwin = platform.system() == "Darwin"
+    cc = ["xcrun", "clang"] if darwin else ["clang"]
+    os_obj = out.with_name("os_posix.o")
+    subprocess.check_call(cc + ["-x", "c++", "-std=c++17", "-O1", "-fno-exceptions", "-fPIC",
+                                "-I", str(ROOT), "-c", str(sources[2]), "-o", str(os_obj)])
+    whole = (["-dynamiclib", "-Wl,-force_load," + str(archive)] if darwin else
+             ["-shared", "-Wl,--whole-archive", str(archive), "-Wl,--no-whole-archive", "-lm"])
+    subprocess.check_call(cc + ["-O1", "-ffp-contract=off", "-std=c11", "-w", "-fPIC",
+                                "-I", str(gen), "-I", str(ROOT), "-I", str(ROOT / "runtime"),
+                                str(sources[0]), str(sources[1]), str(os_obj)] + whole +
+                          ["-o", str(out)])
+    print("built diff harness: %s" % out)
+
+
 def run_translator(stage, game_dir, build_root, allow_unmodelled=None, aux_modules=(), main=True):
     if main:
         command = [sys.executable, str(ROOT / "tools/recomp/driver.py"), "--out", str(stage),
@@ -459,6 +495,10 @@ def parse_args(argv, system=None):
     game_config.add_game_args(parser)
     parser.add_argument("--stub", action="store_true",
                         help="Link the hosts against a stub translation (no game code; CI's build)")
+    parser.add_argument("--diff-harness", action="store_true",
+                        help="Compile the Unicorn diff harness for the translated archive and exit")
+    parser.add_argument("--harness-out", type=Path, default=None,
+                        help="Where --diff-harness writes the shared library")
     parser.add_argument("--device", default=None, help="devicectl identifier (iOS) or adb serial (Android)")
     parser.add_argument("--team", default=os.environ.get("RECOMP_IOS_TEAM", ""),
                         help="Apple team id for automatic signing (ios target; default $RECOMP_IOS_TEAM)")
@@ -487,6 +527,12 @@ def parse_args(argv, system=None):
     if args.function_corpus and any((args.regenerate, args.stub, args.allow_unmodelled,
                                       args.config != "Release", args.target != "app")):
         parser.error("--function-corpus is an isolated native Release build mode")
+    if args.harness_out and not args.diff_harness:
+        parser.error("--harness-out requires --diff-harness")
+    if args.diff_harness and any((args.stub, args.regenerate, args.function_corpus,
+                                 args.target != "app", args.config != "Release", args.allow_unmodelled)):
+        parser.error("--diff-harness is isolated; it cannot be combined with --stub, "
+                     "--regenerate, --function-corpus, another target, Debug or --allow-unmodelled")
     if args.corpus_asan and not args.function_corpus:
         parser.error("--corpus-asan requires --function-corpus")
     if args.corpus_asan and args.corpus_trial_ms != 0:
@@ -513,6 +559,11 @@ def main():
     if args.target == "library":
         from build_library import build as build_library
         build_library(args.build_root, args.config)
+        return
+    if args.diff_harness:
+        out = args.harness_out or (args.build_root / "recomp/diff" / harness_name())
+        with buildlock.BuildLock(args.build_root.parent, "tools/build.py --diff-harness"):
+            build_diff_harness(args.build_root, out)
         return
     if args.function_corpus:
         from corpus.run import run_corpus

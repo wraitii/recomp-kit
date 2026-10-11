@@ -28,10 +28,22 @@ storage, one-level requests and partial allocation rollback without a GPU.
 diagnostics. When running `runtime_tests --startup-contracts` directly, set
 `RECOMP_PYTHON` to the absolute Python interpreter containing `pefile`.
 
-`tools/recomp/diff/run.py` compares translated game functions with Unicorn; see
-`AGENTS.md`. The function corpus (`tools/build.py --function-corpus`) compares the
+`tools/recomp/diff/run.py` compares translated game functions with Unicorn, and
+with `--mode paired` compares the production specialization-enabled and forced
+ordinary variants on each shared input; see `AGENTS.md`. The function corpus
+(`tools/build.py --function-corpus`) compares the
 eager and SSA translations of real game functions; see its
 [README](../tools/recomp/corpus/README.md).
+
+Diff reports include separate ordinary/original, specialized/original and
+ordinary/specialized findings, with the first failing input and iteration.
+Every run keeps its linked harness beside `report.json` and `run.json` in a new
+directory; `--no-build` copies the prebuilt library under the build lock.
+`run.json` records executable, harness, config, code-map and fact hashes, the
+translation fingerprint, selected functions and execution limits. Baseline
+snapshots are read and written only through explicit paths; existing report or
+baseline destinations cannot be overwritten. Writable image sections,
+BSS/scratch/TEB fills and the full zeroed stack are reset before every execution.
 
 ## Media probes
 
