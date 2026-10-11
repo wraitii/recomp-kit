@@ -46,7 +46,7 @@ source.
 | Directory | What it holds |
 |---|---|
 | `runtime/` | x86 semantics (`x86.h`), guest memory, PE loader, scheduler, kernel32/user32 shims |
-| `dx/` | DirectDraw, Direct3D, DirectSound, DirectInput, QMixer shims |
+| `dx/` | DirectX and media shims: DirectDraw through Direct3D 11, DirectSound/WinMM, DirectInput/XInput, Miles, QMixer, FMOD, Bink, DirectShow, Media Foundation |
 | `host/` | SDL3 host, Metal/Vulkan/fake GPU backends, audio mixer, presentation |
 | `platform/` | `os.h`, the only place that talks to the operating system |
 | `mods/` | the mod foundation (Lua 5.4), loader and lifecycle services |

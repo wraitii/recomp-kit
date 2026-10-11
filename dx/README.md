@@ -1,27 +1,76 @@
-# `dx` — DirectDraw, Direct3D, DirectSound, DirectInput, QMixer, weanetr
+# `dx` — the graphics, audio, video and input shims
 
-The graphics, audio and input side of the static recompilation. Every file
-here implements a published API contract and nothing about the game: a shim
-answers the way the real DLL would, and where it cannot, it says so once in
-the log rather than inventing an answer.
+The Windows API surface a recompiled game expects from the DirectX and media
+DLLs: DirectDraw through Direct3D 11, DirectSound and WinMM, DirectInput and
+XInput, and the audio, video and networking libraries games of that era bundled
+(Miles, QMixer, FMOD, Bink, DirectShow, Media Foundation, MLDPlay). Each file
+implements a published API contract and nothing about a game: a shim answers
+the way the real DLL would, and where it cannot, it says so once in the log
+rather than inventing an answer.
 
-Most rendering and audio leave through callbacks in `host_api.h`. The optional
-D3D8 bridge additionally owns an offscreen Rust/wgpu device; its CPU-only
-descriptor tests compile with that backend disabled.
+Every module is compiled and `dx_register_shims()` registers all of them; a
+build does not select by game or era. A game reaches only the ones its imports
+name, so the rest cost registration, not behaviour. The work behind them is
+split three ways: the DX3-7 recorder, audio and input leave through callbacks
+in `host_api.h`; D3D8 hands its draws to the Rust `graphics/d3d8-wgpu` crate;
+D3D9 and D3D11 render through `host_d9.h` and `host/gpu2d` on the host GPU.
+
+## By era and subsystem
+
+| Era / subsystem | Files | What it covers |
+| --- | --- | --- |
+| Common | `com.h/.cpp`, `dx.h/.cpp`, `host_api.h/.cpp`, `display_stubs.cpp`, `coherence.h`, `passes.h`, `frame_dump.h/.cpp` | guest COM objects and vtables; `dx_register_shims()` and `dx_reset()`; the host callback seam with weak no-op defaults; display coherence and frame/draw mapping hooks; frame capture |
+| DirectDraw and Direct3D 2-7 (DX3-7) | `ddraw.cpp/.h`, `d3d.cpp`, `d3d7.cpp`, `dxtypes.h`, `dxt_decode.h` | IDirectDraw/2/4 with surfaces/2/3/4, palettes and clippers; IDirect3D/2 and IDirect3D7 devices, viewports, materials, lights and textures; DX6 constants and DXT decode |
+| Direct3D 8 (DX8) | `d3d8.cpp`, `d3d8_fpu.h`, `d3d8_bindings.json`, `d3d8_constants.json` | IDirect3D8 factory, device, surface, texture, vertex-buffer and index-buffer vtables behind the Rust renderer; the guest x87 control-word change `CreateDevice` implies |
+| Direct3D 9 (DX9) | `d3d9.cpp`, `d3d9_raster.cpp/.h`, `d3d9_shader.cpp/.h`, `d3d9_shadergen.cpp`, `d3d9_pipeline.h`, `d3d9_glsl.h`, `d3d9_msl.h`, `d3d9_wgsl.h`, `host_d9.h`, `host_d9_default.cpp`, `d3dx9.cpp` | IDirect3D9 device and resources; SM 1.1-2.0 bytecode decode plus an interpreter/CPU rasterizer and MSL/GLSL/WGSL generation for the host GPU backends; D3DX9 matrix/vector maths and effects |
+| Direct3D 10/11 and DXGI | `d3d11.cpp/.h`, `dxgi.cpp`, `d3dx10.cpp`, `d3dcompiler.cpp` | ID3D11Device/context/resources for one fixed 2D quad pipeline; IDXGISwapChain over guest-owned back buffers; D3DX10 row-vector maths; a tagged-source `ID3DBlob` shim |
+| DirectSound and WinMM audio | `dsound.cpp`, `waveout.cpp`, `audio3d.h` | IDirectSound, buffers, 3D buffer/listener and notification positions; WinMM `waveOut` queues; the 3D model shared with Miles |
+| DirectInput and XInput | `dinput.cpp`, `dinput_joystick.cpp/.h`, `xinput.cpp` | IDirectInputA mouse and keyboard; the virtual pad as a DirectInput joystick; the virtual pad as XInput user 0 across `xinput1_3`, `1_4` and `9_1_0` |
+| Bundled audio libraries | `mss32.cpp`, `redbook.cpp`, `qmixer.cpp`, `fmod.cpp`, `soundlib.cpp`, `galaxy_stub.cpp`, `mp3_source.cpp/.h`, `riff.cpp/.h` | Miles drivers, PCM/MP3 streams and CD audio; the 28 QMixer exports; FMOD 3 samples and streams; the Soundlib MIDI helper; a null Galaxy API; shared MP3 and RIFF readers |
+| Video and cinematics | `avi.cpp`, `dshow.cpp`, `bink.cpp`, `video_frame.cpp/.h`, `mf.cpp`, `mf_media.cpp/.h` | read-only AVIFile streams; the DirectShow reading side; Bink containers and video; shared decoded-frame helpers; Media Foundation graph playback over the FFmpeg reader |
+| Networking | `weanetr.cpp` | the 17 MLDPlay methods, reporting no networking (`GetCurrentMs` excepted) |
+| Tests | `tests/` | `dx_tests` for the shim paths, `pad_tests` for the DirectInput joystick and XInput, plus the D3D8 descriptor/rendering and D3D7 mipmap suites |
+
+## Renderers
+
+| Layer | Rasterization | Notes |
+| --- | --- | --- |
+| DX3-7 (`ddraw`, `d3d`, `d3d7`) | the kit's own, `host/d3d_render.cpp` over `host/gpu/` | fixed-function immediate mode; vertex lighting is recorded but not applied |
+| D3D8 (`d3d8.cpp`) | the Rust `graphics/d3d8-wgpu` crate (wgpu) | optional; without it the no-renderer path advertises no adapter |
+| D3D9 (`d3d9.cpp`) | the kit's own GPU (`host/gpu/d3d9_host.cpp` plus Metal, Vulkan and WebGPU backends) and a CPU fallback (`d3d9_raster.cpp`) | shader-only, SM 1.1-2.0 without flow control; fixed-function T&L and programs outside that range are refused by name; `d3d9_shadergen.cpp` emits the backend's shading language |
+| D3D11 (`d3d11.cpp`) | the kit's own, `host/gpu2d.cpp` | one fixed 2D layered-quad pipeline; `d3dcompiler.cpp` is a tagged-source blob, not a compiler |
+| Video | FFmpeg (`mf_media.cpp`, `avi.cpp`, parts of `bink.cpp`, `waveout.cpp` ADPCM), minimp3 (`dshow.cpp`, `mp3_source.cpp`), Bink video in `bink.cpp` | containers, demux and frame helpers are kit code |
+
+## Audio
+
+Every playback shim — DirectSound, QMixer, Miles, WinMM `waveOut`, FMOD,
+redbook and the audio track of Bink, DirectShow and Media Foundation — shares
+one host mixer (`host/audio/mixer.cpp`) and one channel allocator
+(`dx_alloc_audio_channel` in `dx.cpp`), so the host sees a single flat voice
+space. MIDI (`soundlib.cpp`) is the exception: it uses a separate `host_midi_*`
+seam over `host/audio/midi_synth.cpp`. Wave-in capture has no implementation:
+the WinMM `waveIn*` imports are stack-balancing stubs in `runtime/misc.cpp`.
 
 ## Bounded D3D8 bridge
 
-`d3d8.cpp` registers complete factory, device and surface vtables. Implemented
-operations cover adapter facts, conservative capabilities, a single explicit-size
-windowed color target, backbuffer descriptors/lifetime, and the host ABI's scene,
-clear, transform, viewport, render-state and owned-pixel presentation operations.
-DIVERGENCE(original): `SetGammaRamp` is a temporary no-op with a one-time
-diagnostic; host gamma is unchanged and gamma capability bits stay clear.
-Unsupported methods stop with their names; backend failures never become success.
-Vertex-buffer creation/draw, textures, depth/stencil, surface locks, device reset,
-fullscreen and additional swapchains are not implemented. These limits can prevent
-a guest from selecting this adapter; capability bits must not be inflated to
-bypass selection.
+`d3d8.cpp` registers complete factory, device, surface, texture, vertex-buffer
+and index-buffer vtables. Implemented operations cover adapter facts and
+conservative capabilities; a single explicit-size windowed color target with
+backbuffer and implicit-surface lifetime; render-target and depth-stencil
+surfaces; 2D textures with mip levels in the uncompressed and DXT formats the
+CPU storage holds; vertex and index buffers with lock/unlock; the scene, clear,
+transform, viewport, material, light, render-state, texture-stage and texture
+operations; vertex and pixel shader creation, constants and declarations; and
+the host ABI's owned-pixel presentation. The rest fail by name through the
+import dispatcher rather than returning a plausible value: among them state
+blocks, palettes, volume and cube textures, extra swap chains, cursor and
+clip-plane calls, the transform/render-state/stream/indices getters,
+`DrawIndexedPrimitiveUP`, patch drawing and the private-data slots. Backend
+failures never become success.
+Capability bits are not inflated to pass selection. DIVERGENCE(original):
+`SetGammaRamp` is a no-op with a one-time diagnostic; host gamma is unchanged
+and gamma capability bits stay clear. `CreateDevice` also models the guest x87
+control-word change unless `D3DCREATE_FPU_PRESERVE` is set (`d3d8_fpu.h`).
 
 Native desktop builds require Rust and statically link `graphics/d3d8-wgpu`
 through CXX. A game's own crate at that path takes precedence. Rust owns D3D7/D3D8
@@ -30,29 +79,6 @@ same CPU implementation. Enable GPU rendering with `[render] d3d8_wgpu = true`
 in the game configuration when building through `tools/build.py`. Cross builds require explicit Rust target
 integration. COM IIDs and tables are generated from a pinned
 Wine header plus `d3d8_bindings.json`; see [Testing](../docs/testing.md).
-
-## Files
-
-| file | contents |
-| --- | --- |
-| `dxtypes.h` | DirectX 6 constants and structure field offsets |
-| `com.h/.cpp` | guest COM objects, vtables, the three IUnknown slots |
-| `host_api.h/.cpp` | the callbacks into the host app, with weak no-op defaults |
-| `dx.h/.cpp` | `dx_register_shims()`, `dx_reset()`, the audio channel allocator |
-| `ddraw.cpp` | IDirectDraw/2/4, IDirectDrawSurface/2/3/4, palette, clipper |
-| `d3d.cpp` | IDirect3D/2, device, viewport, material, light, texture |
-| `dsound.cpp` | IDirectSound, buffer, 3D buffer, 3D listener, notify |
-| `mss32.cpp` | Miles digital drivers, PCM/MP3 samples and streams |
-| `redbook.cpp` | Miles CD audio backed by configured media files |
-| `waveout.cpp` | WinMM PCM/IMA ADPCM queues and device-clock WAVEHDR completion |
-| `avi.cpp` | Read-only AVIFile streams and Indeo 5 Video for Windows decoding |
-| `dshow.cpp` | DirectShow multimedia streaming, the reading side: IAMMultiMediaStream over an MP3 file, IAudioMediaStream, AMAudioData, IAudioStreamSample (minimp3) |
-| `dinput.cpp` | IDirectInputA, mouse and keyboard devices |
-| `dinput_joystick.cpp` | the virtual pad as a DirectInput joystick, when a game asks for native pad input |
-| `qmixer.cpp` | the 28 QMixer `QSWaveMix*` exports |
-| `weanetr.cpp` | the 17 MLDPlay methods, reporting no networking |
-| `tests/dx_tests.cpp` | the headless tests |
-| `tests/pad_tests.cpp` | the virtual pad through DirectInput, with its own host pad callbacks |
 
 ## Wiring it up
 
