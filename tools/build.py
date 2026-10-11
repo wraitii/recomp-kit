@@ -30,6 +30,7 @@ import web_launcher  # noqa: E402
 
 # What each --target builds. `plugins` is every mod plugin the game ships.
 TARGETS = {
+    "library": [],
     "app": ["recomp_app"],
     "smoke": ["recomp_smoke"],
     "headless": ["recomp_headless"],
@@ -509,6 +510,10 @@ def regenerate_selection(value, cfg, parser):
 def main():
     """Check inputs, translate under the build lock when needed, then configure and build."""
     args, parser = parse_args(sys.argv[1:])
+    if args.target == "library":
+        from build_library import build as build_library
+        build_library(args.build_root, args.config)
+        return
     if args.function_corpus:
         from corpus.run import run_corpus
         with buildlock.BuildLock(args.build_root.parent, "tools/build.py --function-corpus"):

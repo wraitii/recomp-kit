@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Recomp Library</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header><span class="brand">RECOMP KIT <span>Library</span></span><div class="buttons"><button id="settings">Settings</button><button id="refresh">Refresh</button></div></header>
+  <main>
+    <section class="intro"><h1>Choose a game to recompile</h1><p class="lead">Recomp-kit rebuilds older games as native apps for this computer. Select a game to install it from your own copy or play an installed game.</p></section>
+    <p id="message" role="status" hidden></p>
+    <section id="games" aria-label="Game library"></section>
+    <footer id="storage"></footer>
+  </main>
+  <dialog id="installer" aria-labelledby="install-title">
+    <div class="modal-heading"><h2 id="install-title"></h2><button id="close" aria-label="Close game setup">Close</button></div>
+    <ol id="steps" class="steps"><li>Requirements</li><li>Your copy</li><li>Build</li><li>Install</li></ol>
+    <p id="install-message" role="status" hidden></p>
+    <section id="requirements">
+      <h3>Requirements</h3><p class="muted">These tools are needed to build the game app.</p>
+      <p id="check-status" role="status"></p><div id="checks"></div>
+      <div class="buttons actions"><button id="change-copy" hidden>Choose a different copy</button><button id="recheck">Check again</button><button id="continue" class="primary" disabled>Continue</button></div>
+    </section>
+    <section id="source" hidden>
+      <h3>Choose your game copy</h3><p id="copy-help"></p>
+      <div class="source-options"><button id="folder"><strong>Installed game folder</strong><span>Choose the folder containing your game files.</span></button><button id="archive"><strong>ZIP or GOG offline installer</strong><span>Choose a .zip archive or GOG setup .exe.</span></button></div>
+      <p class="muted">GOG installers are extracted without running them. Keep any accompanying .bin files beside the .exe.</p>
+      <p id="selected-source" class="selected" hidden></p>
+      <label>Install folder<div class="field"><input id="destination" readonly><button id="pick-destination">Choose…</button></div></label><p class="muted">The app and game files will be saved here. Your originals stay untouched. Temporary build files are removed after installation.</p>
+      <div class="buttons actions"><button id="back">Back</button><button id="install" class="primary" disabled>Build and install</button></div>
+    </section>
+    <section id="job" aria-live="polite" hidden>
+      <h3 id="stage"></h3><p id="stage-help" class="muted"></p><progress id="progress" max="1"></progress><p id="current" class="muted"></p>
+      <details><summary>Installation details</summary><pre id="log"></pre></details>
+      <div class="buttons actions"><button id="cancel">Cancel installation</button><button id="retry" hidden>Try again</button><button id="play-existing" class="primary" hidden>Play installed game</button></div>
+    </section>
+    <section id="ready" hidden><h3>Installed</h3><p id="installed-location"></p><p id="update-note" class="muted" hidden>An updated build is available. You can keep playing the installed version.</p><div class="buttons actions"><button id="rebuild">Rebuild app</button><button id="play" class="primary">Play game</button></div></section>
+    <details id="setup"><summary>Advanced library settings</summary><p class="muted">Locations of the kit and Python used to build games.</p>
+      <label>Recomp-kit folder<div class="field"><input id="kit" spellcheck="false"><button id="pick-kit">Browse…</button></div></label>
+      <label>Python program<div class="field"><input id="python" spellcheck="false"><button id="pick-python">Browse…</button></div></label>
+      <button id="save">Save settings</button>
+    </details>
+  </dialog>
+  <template id="card"><button class="game"><span class="game-top"><span class="monogram" aria-hidden="true"></span><span class="state"></span></span><span class="game-title"></span><span class="detail"></span><span class="card-action"></span></button></template>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

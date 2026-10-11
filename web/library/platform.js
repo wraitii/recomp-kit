@@ -1,0 +1,20 @@
+export function platform() {
+  const desktop = window.__TAURI__;
+  if (!desktop) {
+    const unavailable = async () => { throw new Error("Local compilation requires the desktop library app. Browser play remains available through the kit’s web launcher."); };
+    return { settings: unavailable, save: unavailable, pick: unavailable, query: unavailable,
+      start: unavailable, cancel: unavailable, open: (url) => window.open(url, "_blank", "noopener"),
+      listen: async () => () => {} };
+  }
+  const invoke = desktop.core.invoke;
+  return {
+    settings: () => invoke("settings"),
+    save: (value) => invoke("save_settings", { value }),
+    pick: (kind) => invoke("pick", { kind }),
+    query: (request) => invoke("query", { request }),
+    start: (request) => invoke("start_job", { request }),
+    cancel: () => invoke("cancel_job"),
+    open: (url) => invoke("open_url", { url }),
+    listen: (callback) => desktop.event.listen("library-job", ({ payload }) => callback(payload)),
+  };
+}

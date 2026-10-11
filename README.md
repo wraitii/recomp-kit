@@ -21,6 +21,15 @@ copy of each game.
 
 ## Games
 
+The desktop library lives in `desktop/library/`, with a platform adapter and
+UI in `web/library/`. Build it with `tools/build.py --target library`; on macOS
+this produces `build/library/Recomp Library.app`. It discovers recipes under
+`games/` and imports and builds the player's copy in application storage through
+`tools/library.py` (JSON events). This first version uses a local kit checkout
+and configured Python environment; ZIP import is built in, and GOG offline
+installer extraction requires `innoextract`. The existing browser launcher in
+`web/launcher/` remains available for web builds.
+
 A game directory holds only what is the game's:
 
 ```
