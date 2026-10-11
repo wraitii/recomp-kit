@@ -20,6 +20,10 @@
 Setup checks the executable hash and links the installation at
 `<build root>/original`. Translation needs the game's Ghidra code map.
 
+Every kit tool takes `--game <id>`, or `--game-dir <path>` for a game kept
+elsewhere. Outputs go to `build/<id>/` for a kit game and `<game-dir>/build`
+otherwise; `--build-root` or `RECOMP_BUILD_ROOT` overrides both.
+
 ## Build
 
 ```sh
@@ -36,7 +40,17 @@ FFmpeg.
 
 ## Add a game
 
-Create `games/<id>/game.toml` modelled on `games/stub/`. To ship a code map,
+```
+games/<id>/
+  game.toml       identity, translator inputs, hooks and host settings
+  metadata/       the code map: function spans, no instruction bytes
+  native/         optional native replacements for translated functions
+```
+
+Create `game.toml` modelled on `games/stub/`, a game that does not exist and
+that game-free builds configure with. Nothing under `runtime/`, `dx/`, `host/`,
+`platform/` or `mods/` may name a game (`tools/check_game_literals.py`);
+game-specific documents live with their game. To ship a code map,
 export a `recomp-code-map-v3-export` directory from Ghidra (the game's own export
 script; spans, jump tables, interior entries and non-returning calls) and pack it:
 
@@ -48,3 +62,10 @@ The packed map keeps addresses only: function spans, the instruction lengths a
 linear decode would get wrong, jump tables, interior entries and non-returning
 calls. A gap in it is fixed in Ghidra, then re-exported, repacked and
 regenerated; translation never guesses entry points.
+
+## Check translation
+
+`tools/recomp/diff/run.py --game <id>` runs translated functions and the
+original bytes side by side and compares the results; the function corpus
+(`tools/build.py --function-corpus`) checks them against each other. See
+`AGENTS.md` for the translator-change workflow.
