@@ -234,7 +234,7 @@ def _emit(task):
         reason, lines, requests, decisions = plan.reason, None, set(), []
         if plan.path is not None:
             body = prepared_store.read(plan.path)
-            body.bind_layouts(contract_masks)
+            body.finalize(contract_masks)
             lines, external, requests, decisions = production.emit_ssa_prepared(body)
             if entries and not external:
                 wrappers = tr.translate(fn, entries)

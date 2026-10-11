@@ -9,7 +9,7 @@ through the scalar tracker (`x87_scalar.py`). Memory uses the
 existing guest accessors, in instruction order, with explicit state
 publication. No inferred convention permits discarding guest state.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .lift import Lifter, Insn, Op
 from .integer import read_modify_write, arithmetic, shift, divide
@@ -467,32 +467,75 @@ class PreparedFunction:
     cc_calls: dict
     seh_mark: bool
     arithmetic: x87_plan.X87Plan
-    decisions: list
+    report_calls: bool
+    layouts: dict = field(default_factory=dict)
+
+    def _contract_calls(self):
+        for b in self.ssa.blocks.values():
+            for v in b.ops:
+                if v.opc == "CALL" and v.data in self.options["contract_calls"]:
+                    call = self.transfers.calls[v.id]
+                    if call.required_outputs is not None:
+                        yield b, v, call
 
     @property
     def requests(self):
-        return {(v.data, self.transfers.calls[v.id].output_mask)
-                for b in self.ssa.blocks.values() for v in b.ops
-                if v.opc == "CALL" and v.data in self.options["contract_calls"]}
+        return {(v.data, contract_output_mask(call.required_outputs))
+                for _b, v, call in self._contract_calls()}
 
-    def bind_layouts(self, masks):
+    @property
+    def bound_requests(self):
+        return {(v.data, self.layouts.get(v.data, contract_output_mask(call.required_outputs)))
+                for _b, v, call in self._contract_calls()}
+
+    def finalize(self, masks):
+        masks = masks or {}
+        for _b, v, call in self._contract_calls():
+            needed = contract_output_mask(call.required_outputs)
+            layout = masks.get(v.data, needed)
+            if needed & ~layout or layout & ~((1 << len(CONTRACT_GPRS + CONTRACT_FLAGS)) - 1):
+                raise SSAError("shared contract outputs do not cover the call continuation")
+        self.layouts = dict(masks)
+
+    def decision_rows(self):
+        if not self.report_calls:
+            return []
+        options = self.options
+        contracts = options["call_contracts"]
+        lane_field = options["lane_field"]
+        mapping = self.mapping
+        checked_calls = options["checked_calls"]
+        contract_calls = options["contract_calls"]
+        fir = self.ir
+
+        def field_names(keys):
+            return sorted({lane_field.get(key, "EIP" if mapping[key][0] == "c->eip" else mapping[key][0])
+                           for key in keys if key in mapping})
+
+        rows = []
         for b in self.ssa.blocks.values():
             for v in b.ops:
-                if v.opc != "CALL" or v.data not in self.options["contract_calls"]:
+                if v.opc != "CALL":
                     continue
                 call = self.transfers.calls[v.id]
-                if call.outputs is None:
-                    continue
-                needed = contract_output_mask(call.outputs)
-                layout = masks.get(v.data, needed)
-                if needed & ~layout or layout & ~((1 << len(CONTRACT_GPRS + CONTRACT_FLAGS)) - 1):
-                    raise SSAError("shared contract outputs do not cover the call continuation")
-                call.output_mask = layout
-                call.mode_proven = self.options["x87_mode_sites"].get(b.insn.addr) == (0x0f00, 0)
-        for row in self.decisions:
-            if row["specialization"] == "private":
-                target = int(row["target"], 16)
-                row["entry_output_mask"] = "%04x" % masks.get(target, int(row["entry_output_mask"], 16))
+                private = v.data in contract_calls
+                reason = None if private else (
+                    "caller has alternate entries or SEH" if fir.entries or fir.seh
+                    else "target is not an admitted checked leaf")
+                contract = contracts.get(v.data)
+                rows.append({
+                    "caller": "%08x" % fir.addr, "site": "%08x" % b.insn.addr,
+                    "target": "%08x" % v.data,
+                    "specialization": "private" if private else "checked" if v.data in checked_calls else "ordinary",
+                    "callee_reads": sorted(contract.reads) if contract is not None else None,
+                    "fast_publication": field_names(call.publication.required),
+                    "outputs": sorted(call.required_outputs) if private else None,
+                    "entry_output_mask": "%04x" % self.layouts.get(v.data, contract_output_mask(call.required_outputs)) if private else None,
+                    "ordinary_fallback": field_names(call.fallback.required) if private else None,
+                    "fallback_flag_mask": call.fallback.flags.mask if call.fallback.flags else None,
+                    "reason": reason,
+                })
+        return rows
 
 
 def validate_operations(s):
@@ -580,7 +623,6 @@ def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_st
                 or not x87_mode.mode_preserving_leaf(x87_mode.prepare(fir))):
             raise SSAError("known x87 mode requires a guarded private control-word-preserving leaf")
     report_calls = call_decisions is not None
-    call_decisions = []
     checked_calls = frozenset(checked_calls)
     contract_calls = frozenset(contract_calls)
     contract_masks = contract_masks or {}
@@ -716,31 +758,6 @@ def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_st
                                     call_contracts or {}, kept_calls, lane_field, CONTRACT_NEVER_SKIP,
                                     contract_calls, return_fields, flag_keys, flag_first_key,
                                     CC_DEFINES, CC_BIT_VALUES, lazy_flags, CC_EAGER_EVENTS)
-    if report_calls:
-        def field_names(keys):
-            return sorted({lane_field.get(key, "EIP" if mapping[key][0] == "c->eip" else mapping[key][0]) for key in keys if key in mapping})
-
-        for b in s.blocks.values():
-            for v in b.ops:
-                if v.opc != "CALL":
-                    continue
-                call = transfers.calls[v.id]
-                private = v.data in contract_calls
-                reason = None if private else ("caller has alternate entries or SEH" if fir.entries or fir.seh
-                                                else "target is not an admitted checked leaf")
-                contract = (call_contracts or {}).get(v.data)
-                call_decisions.append({
-                    "caller": "%08x" % fir.addr, "site": "%08x" % b.insn.addr,
-                    "target": "%08x" % v.data,
-                    "specialization": "private" if private else "checked" if v.data in checked_calls else "ordinary",
-                    "callee_reads": sorted(contract.reads) if contract is not None else None,
-                    "fast_publication": field_names(call.publication.required),
-                    "outputs": sorted(call.outputs) if private else None,
-                    "entry_output_mask": "%04x" % contract_masks.get(v.data, contract_output_mask(call.outputs)) if private else None,
-                    "ordinary_fallback": field_names(call.fallback.required) if private else None,
-                    "fallback_flag_mask": call.fallback.flags.mask if call.fallback.flags else None,
-                    "reason": reason,
-                })
     live = simplify(s, transfers.live_publications, canonical=False, extra_roots=transfers.roots,
                     removable=frozenset(("CALL_RELOAD", "CALL_KEEP")), groups=groups)
     reads_entry_flags = any(
@@ -770,11 +787,12 @@ def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_st
                                        mode_sites=x87_mode_sites)
     options.update(call_symbols=call_symbols, tail_symbols=tail_symbols,
                    x87_mode_sites=x87_mode_sites, checked_calls=checked_calls,
-                   contract_calls=contract_calls)
+                   contract_calls=contract_calls, call_contracts=call_contracts or {},
+                   lane_field=lane_field)
     prepared = PreparedFunction(options, fir, s, live, fields, mapping, flag_keys,
                                 kept_calls, transfers, cc_entry, cc_calls, seh_mark,
-                                arithmetic_plan, call_decisions)
-    prepared.bind_layouts(contract_masks)
+                                arithmetic_plan, report_calls)
+    prepared.finalize(contract_masks)
     validate_operations(s)
     return prepared
 
@@ -1022,10 +1040,11 @@ def emit_prepared(prepared):
                     # invoke only the explicitly bound symbol. The callee receives
                     # the guest return address already stored by the preceding
                     # CALL push, so its own RET owns ESP/EIP restoration.
-                    outputs = transfers.calls[v.id].outputs if v.data in contract_calls else None
+                    call = transfers.calls[v.id]
+                    outputs = call.required_outputs if v.data in contract_calls else None
                     if outputs is not None:
-                        call = transfers.calls[v.id]
-                        output_mask, mode_proven = call.output_mask, call.mode_proven
+                        output_mask = prepared.layouts.get(v.data, contract_output_mask(outputs))
+                        mode_proven = x87_mode_sites.get(b.insn.addr) == (0x0f00, 0)
                         lines.append("if (entry_contract_prepare_%08x(c, %du)) {" % (v.data, mode_proven))
                     lines.extend(publish(b.snapshots[v.id], v))
                     if outputs is None and transfers.calls[v.id].guard:
@@ -1204,7 +1223,7 @@ def emit(fir, symbol, **options):
     prepared = prepare(fir, symbol, **options)
     source = emit_prepared(prepared)
     if requests is not None:
-        requests.update(prepared.requests)
+        requests.update(prepared.bound_requests)
     if decisions is not None:
-        decisions.extend(prepared.decisions)
+        decisions.extend(prepared.decision_rows())
     return source

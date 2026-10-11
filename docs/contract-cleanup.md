@@ -47,8 +47,12 @@ through temporary files with SSA value references encoded by ID; emission uses
 those graphs without repeating preparation. Private entry eligibility and
 full-output checked-body aliases are settled in preparation. `x87_plan.py`
 selects clones, binary32 runs, carry shapes and activation budgets ahead of
-emission; emission verifies that its tracker matches the plan. A layout that
-omits a required output fails during binding.
+emission; emission verifies that its tracker matches the plan. Call sites carry
+an immutable transport-independent `CallState`: semantic callee inputs,
+continuation outputs, proven kept fields, resident fields and an explicit opaque
+marker for state outside the integer projection. `PreparedFunction.finalize`
+binds shared layouts without mutating call plans and report rows derive from the
+finalized plan. A layout that omits a required output fails during finalize.
 
 `tools/recomp/x87_audit.py` selects propagation, writer or real-call context
 analysis with `--game` or `--game-dir`. Its shared library consumes lifted

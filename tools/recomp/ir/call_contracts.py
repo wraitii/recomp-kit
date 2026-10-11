@@ -386,9 +386,14 @@ def cfg_is_closed(fir):
 
 def continuation_outputs(s, publications, groups, lane_field, extra_roots=(), call_reads=None):
     from .simplify import live_values, state_roots
+    from .call_state import ContinuationState
 
     escapes = [root for b in s.blocks.values() for v in b.ops if v.opc == "RETURN"
                for root in state_roots(s, b.exit, b.exit, groups)]
+    caller_return_fields = frozenset(
+        lane_field[key] for b in s.blocks.values() for v in b.ops if v.opc == "RETURN"
+        for key in b.exit if key in lane_field)
+    caller_call_read_fields = set()
     for b in s.blocks.values():
         for v in b.ops:
             if v.opc not in ("CALL", "CALLIND"):
@@ -397,7 +402,9 @@ def continuation_outputs(s, publications, groups, lane_field, extra_roots=(), ca
             state = b.snapshots[v.id]
             keys = [key for key in state if key in lane_field
                     and (reads is None or lane_field[key] in reads)]
+            caller_call_read_fields.update(lane_field[key] for key in keys)
             escapes.extend(state_roots(s, state, keys, groups))
+    caller_call_read_fields = frozenset(caller_call_read_fields)
     untracked = set(lane_field.values()) - {lane_field[key] for key in s.inputs if key in lane_field}
     live = live_values(s, publications, extra_roots=escapes + list(extra_roots),
                        removable=("CALL_RELOAD", "CALL_KEEP"), groups=groups)
@@ -407,12 +414,16 @@ def continuation_outputs(s, publications, groups, lane_field, extra_roots=(), ca
             if call.opc != "CALL":
                 continue
             fields = set(untracked)
+            returned = set()
             for key, value in b.reloads.get(call.id, {}).items():
                 value = s.resolve(value)
                 source = s.resolve(value.args[0]) if value.opc == "BYTE" else value
                 if source.id in live and source.opc == "CALL_RELOAD" and key in lane_field:
                     fields.add(lane_field[key])
-            outputs[call.id] = frozenset(fields)
+                    returned.add(lane_field[key])
+            outputs[call.id] = ContinuationState(
+                frozenset(fields), frozenset(returned), frozenset(untracked),
+                caller_return_fields, caller_call_read_fields)
     return outputs
 
 

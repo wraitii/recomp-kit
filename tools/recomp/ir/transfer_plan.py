@@ -1,7 +1,8 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .simplify import state_roots, EFFECTS, EXITS
-from .call_contracts import continuation_outputs
+from .call_contracts import continuation_outputs, FIELDS
+from .call_state import CallState, OPAQUE_STATE
 from .ssa import MEMORY
 
 
@@ -50,9 +51,13 @@ class CallPlan:
     guard: tuple
     skipped: frozenset
     fallback: Publication
-    outputs: frozenset | None = None
-    output_mask: int | None = None
-    mode_proven: bool = False
+    state: CallState | None = None
+
+    @property
+    def required_outputs(self):
+        if self.state is None or self.state.required_outputs is None:
+            return None
+        return self.state.required_outputs.fields
 
 
 def flag_publication(s, state, required, record, first_keys, defines, bits):
@@ -152,9 +157,25 @@ def build(s, groups, facts, contracts, kept, lane_field, never_skip,
                                                       first_keys, defines, bits)
                 roots.extend(fallback.roots(s, state, groups))
     result = TransferPlan(publications, call_plans, returns, roots)
+    continuations = {}
     if private:
-        outputs = continuation_outputs(s, result.live_publications, groups, lane_field, roots,
-                                       {target: contract.reads for target, contract in contracts.items()})
-        for key, fields in outputs.items():
-            call_plans[key].outputs = fields | never_skip
+        continuations = continuation_outputs(
+            s, result.live_publications, groups, lane_field, roots,
+            {target: contract.reads for target, contract in contracts.items()})
+    for b in s.blocks.values():
+        for v in b.ops:
+            if v.opc != "CALL":
+                continue
+            call = call_plans[v.id]
+            continuation = continuations.get(v.id)
+            if continuation is not None and never_skip:
+                continuation = replace(continuation, fields=continuation.fields | never_skip)
+            contract = contracts.get(v.data)
+            call.state = CallState(
+                inputs=frozenset(contract.reads if contract is not None else FIELDS) | never_skip,
+                required_outputs=continuation if v.data in private else None,
+                preserved=frozenset(lane_field[key] for key in kept.get(v.id, ()) if key in lane_field),
+                resident=frozenset(lane_field[key] for key in facts.known_before.get(v.id, ())
+                                   if key in lane_field),
+                opaque=OPAQUE_STATE)
     return result

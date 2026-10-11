@@ -87,7 +87,7 @@ def emit_ssa_prepared(prepared):
         lines.append("void fn_%08x(X86 *c) { body_%08x(c, 0u); }" % (addr, addr))
         lines += ["void fn_%08x(X86 *c) { body_%08x(c, 0x%xu); }" % (e, addr, e)
                   for e in entries]
-    return lines, entries, prepared.requests, prepared.decisions
+    return lines, entries, prepared.bound_requests, prepared.decision_rows()
 
 
 @dataclass
