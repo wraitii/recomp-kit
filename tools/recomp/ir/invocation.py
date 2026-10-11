@@ -10,6 +10,8 @@ from option sets or generated text.
 """
 from dataclasses import dataclass
 
+from .x87_cw import CW_FAST, Proven
+
 
 @dataclass(frozen=True)
 class EntryBinding:
@@ -24,7 +26,16 @@ class Preparation:
     """Private-entry eligibility guard, checked before the specialized call."""
 
     symbol: str
-    mode_proven: bool
+    proof: Proven | None
+
+    def __post_init__(self):
+        if self.proof is not None and (not isinstance(self.proof, Proven)
+                                       or self.proof.condition != CW_FAST):
+            raise ValueError("private mode proof must establish CW_FAST")
+
+    @property
+    def mode_proven(self):
+        return self.proof is not None
 
 
 @dataclass(frozen=True)
@@ -86,8 +97,8 @@ def binding_invocation(target, binding, form, expected):
     return Invocation(target, form, symbol, expected, None, None, None)
 
 
-def private_invocation(target, binding, expected, mode_proven, mask):
-    preparation = Preparation("entry_contract_prepare_%08x" % target, mode_proven)
+def private_invocation(target, binding, expected, proof, mask):
+    preparation = Preparation("entry_contract_prepare_%08x" % target, proof)
     fallback = binding_invocation(target, binding, "checked", expected)
     return Invocation(target, "private", None, expected, preparation, mask, fallback)
 

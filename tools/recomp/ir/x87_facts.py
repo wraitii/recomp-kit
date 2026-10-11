@@ -10,13 +10,13 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple
 
 from program import TranslateError
+from .x87_cw import CW_PC_RC, ModeCondition
 
 FORMAT = "x87-compiler-facts-v1"
 PRODUCER = "recomp-kit-x87-analysis-v1"
-MODE_MASK = 0x0f00
+MODE_MASK = CW_PC_RC
 FUNCTION_SCOPE = "all_invocations_joined"
 RETURN_SCOPE = "all_mapped_entries"
 CONTRACT_SCOPE = "all_invocations"
@@ -63,6 +63,10 @@ class EntryContract:
     scope: str
     verify: bool | None
     evidence: str
+
+    @property
+    def condition(self):
+        return ModeCondition(self.mask, self.value)
 
     @classmethod
     def from_row(cls, row):
@@ -129,18 +133,11 @@ class Provenance:
                 "entry_contracts": [contract.to_payload() for contract in self.entry_contracts]}
 
 
-class InstructionMode(NamedTuple):
-    """Two-bit-field mode retained for the existing tuple consumers."""
-
-    known_mask: int
-    known_value: int
-
-
 @dataclass(frozen=True)
 class InstructionFact:
     function: int
     site: int
-    mode: InstructionMode
+    mode: ModeCondition
     scope: str
     provenance: Provenance
 
@@ -152,6 +149,10 @@ class EntryCondition:
     value: int
     scope: str
     provenance: Provenance
+
+    @property
+    def condition(self):
+        return ModeCondition(self.mask, self.value)
 
 
 @dataclass(frozen=True)
@@ -218,7 +219,7 @@ class X87Facts:
                     raise ValueError("invalid, duplicated or out-of-scope instruction fact")
                 seen_sites.add(site)
                 instructions.append(InstructionFact(
-                    function, site, InstructionMode(smask, svalue), FUNCTION_SCOPE, provenance))
+                    function, site, ModeCondition(smask, svalue), FUNCTION_SCOPE, provenance))
             seen_functions.add(function)
             functions.append(FunctionFacts(
                 function, FUNCTION_SCOPE,
@@ -247,7 +248,7 @@ class X87Facts:
         return cls(True, provenance, tuple(functions), tuple(returns))
 
     def mode_sites(self):
-        return {facts.function: {item.site: item.mode for item in facts.instructions}
+        return {facts.function: {item.site: item for item in facts.instructions}
                 for facts in self.functions}
 
     def report(self):
@@ -268,8 +269,8 @@ class X87Facts:
                                "entry_mask": "%04x" % facts.entry.mask,
                                "entry_value": "%04x" % facts.entry.value,
                                "sites": [["%08x" % item.site,
-                                          "%04x" % item.mode.known_mask,
-                                          "%04x" % item.mode.known_value]
+                                          "%04x" % item.mode.mask,
+                                          "%04x" % item.mode.value]
                                          for item in facts.instructions]}
                               for facts in self.functions],
                 "returns": [{"function": "%08x" % relation.function, "scope": relation.scope,

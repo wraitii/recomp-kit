@@ -10,13 +10,11 @@ the planned shape, so the analysis and the emitter cannot drift silently.
 """
 from collections import deque
 
+from .operations import X87_RESET_OPS
 from .ssa import SSAError
 from .x87_scalar import INACTIVE, UNSAFE, merge_shapes
 
-
-#: Effect nodes that discard scalar x87 state inside a block, mirroring the
-#: reset points in `emit_c.emit`: calls, string moves and division seams.
-RESET_OPS = frozenset(("CALL", "CALLIND", "STRINGOP", "DIV32", "IDIV32"))
+RESET_OPS = X87_RESET_OPS
 
 
 def _transfer(block, entry, scalar_factory, binary32):

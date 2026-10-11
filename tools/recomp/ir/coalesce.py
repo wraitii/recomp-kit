@@ -5,7 +5,7 @@ and phis replace lane tuples at block boundaries; explicit BYTE operations bridg
 partial writes. Canonicalization removes complete extraction/reassembly pairs.
 This changes representation only, without inferring dead upper register bits.
 """
-from .simplify import TERMINATORS
+from .operations import TERMINATORS
 
 
 def registers(s, groups):

@@ -4,11 +4,12 @@ from pathlib import Path
 
 import capstone
 
-from .x87_mode import CW_MASK, ReturnSummary
+from .x87_cw import (CW_D3D8_PRESERVED, CW_D3D8_SETUP_MASK, CW_D3D8_SETUP_VALUE,
+                     CW_MASK, CW_PC_RC, ReturnSummary)
 
 PRESERVE = ReturnSummary(CW_MASK, 0, 0)
-D3D8_CREATE = ReturnSummary(CW_MASK & ~0x0f3f, 0, 0)
-D3D8_SETUP = ReturnSummary(CW_MASK & ~0x0f3f, 0x0f3f, 0x003f)
+D3D8_CREATE = ReturnSummary(CW_D3D8_PRESERVED, 0, 0)
+D3D8_SETUP = ReturnSummary(CW_D3D8_PRESERVED, CW_D3D8_SETUP_MASK, CW_D3D8_SETUP_VALUE)
 EFFECTS = {"preserve": PRESERVE, "d3d8_create_no_preserve": D3D8_CREATE}
 
 
@@ -106,7 +107,7 @@ def load(path, prepared, image, imports_preserve_pc_rc=False):
                 calls[site] = EFFECTS[imports[name]["effect"]]
                 source = "audited_native"
             elif name and imports_preserve_pc_rc:
-                calls[site] = ReturnSummary(0x0f00, 0, 0)
+                calls[site] = ReturnSummary(CW_PC_RC, 0, 0)
                 source = "configuration_assumption"
             else:
                 continue
@@ -134,7 +135,7 @@ def load(path, prepared, image, imports_preserve_pc_rc=False):
                     or image.iat_names.get(source.operands[1].mem.disp & 0xffffffff) != row["import"]):
                 raise ValueError("%08x: audited cached import disagrees with original bytes" % site)
             if imports_preserve_pc_rc:
-                calls[site] = ReturnSummary(0x0f00, 0, 0)
+                calls[site] = ReturnSummary(CW_PC_RC, 0, 0)
             continue
         if (ins.mnemonic != "call" or len(operands) != 1
                 or operands[0].type != capstone.x86.X86_OP_MEM

@@ -26,7 +26,7 @@ import decoded
 import output
 from settings import Settings
 from frontend import external_exits, function_ir
-from ir import call_contracts, contract_variants, production, x87_mode, x87_facts, prepared_store
+from ir import call_contracts, contract_variants, production, x87_mode, x87_facts, x87_report, prepared_store
 from ir.invocation import Declaration
 from ir.lift import Lifter, LiftError
 from ir.ssa import SSAError
@@ -393,43 +393,6 @@ def parse_args(argv):
     return ap.parse_args(argv)
 
 
-def mode_report(settings, prepared, summaries, opaque, known_modes, x87_counts, exposure, selected=()):
-    functions = []
-    for addr in sorted(set(selected) | settings.state_contract_callers | settings.checked_returns):
-        body = prepared.get(addr)
-        row = {"function": "%08x" % addr,
-               "x87_instructions": x87_counts.get(addr, 0),
-               "return_relation": x87_mode.summary_dict(summaries.get(addr, x87_mode.UNKNOWN_SUMMARY))}
-        if body is None or addr in opaque:
-            row["reason"] = "opaque function"
-        else:
-            analysis = x87_mode.analyze(body, summaries, opaque)
-            targets = {site: target for _, site, target in body.calls}
-            row["calls"] = [{"site": "%08x" % site,
-                             "target": "%08x" % targets[site] if targets[site] is not None else None,
-                             "incoming": x87_mode.fact_dict(fact)}
-                            for site, fact in sorted(analysis.calls.items())]
-            row["return_fact"] = x87_mode.fact_dict(analysis.returns)
-            row["losses"] = analysis.losses
-        functions.append(row)
-    x87_functions = {addr for addr, count in x87_counts.items() if count}
-    covered = {addr for addr in x87_functions
-               if summaries.get(addr, x87_mode.UNKNOWN_SUMMARY).preserved_mask & 0x0f00 == 0x0f00}
-    return {"scope": "translated paths without hooks or dispatch overrides",
-            "exposure": exposure,
-            "coverage": {"x87_functions": len(x87_functions),
-                         "mode_preserving": len(covered),
-                         "without_mode_preservation_proof": len(x87_functions - covered),
-                         "opaque_or_unprepared": sum(prepared.get(addr) is None or addr in opaque
-                                                     for addr in x87_functions)},
-            "guarded_private_targets": ["%08x" % addr for addr in sorted(known_modes)],
-            "private_entry_guard": {"mask": "0f00", "value": "0000"},
-            "entry_fact": "symbolic incoming control word; no startup-mode assumption",
-            "functions": functions,
-            "return_relations": [{"function": "%08x" % addr, **x87_mode.summary_dict(summary)}
-                                 for addr, summary in sorted(summaries.items())]}
-
-
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     started = time.monotonic()
@@ -470,7 +433,7 @@ def main(argv=None):
         mode_opaque = conservative | helpers | {addr for addr, row in scanned.items() if row.exclusion is not None}
         x87_facts_loaded = x87_facts.load(settings.x87_facts, ctx, mode_prepared, mode_opaque)
         mode_sites = x87_facts_loaded.mode_sites()
-        entry_verification = {row["function"]: (row["mask"], row["value"])
+        entry_verification = {row["function"]: x87_facts.EntryContract.from_row(row)
                               for row in settings.x87_entry_contracts if row.get("verify")}
         mode_summaries = x87_mode.summarize(mode_prepared, mode_opaque)
         x87_counts = {addr: row.x87_count for addr, row in scanned.items()}
@@ -581,7 +544,7 @@ def main(argv=None):
             for addr in sorted(results) if results[addr][2] is not None],
         "call_decisions": decisions,
         "x87_compiler_facts": x87_facts_loaded.report(),
-        "x87_mode": mode_report(settings, mode_prepared, mode_summaries, mode_opaque,
+        "x87_mode": x87_report.mode_report(settings, mode_prepared, mode_summaries, mode_opaque,
                                 known_modes & private_masks.keys(), x87_counts, mode_exposure,
                                 selected_callers | checked_returns),
     }

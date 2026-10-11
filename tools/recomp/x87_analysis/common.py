@@ -10,8 +10,9 @@ import game_config
 from settings import Settings
 from program import ScanRow
 from ir import x87, x87_mode
+from ir.x87_cw import CW_PC_RC
 
-MASK = 0x0f00
+MASK = CW_PC_RC
 
 
 def settings_for(args):

@@ -5,20 +5,12 @@ move effects: even unused LOAD results retain their access and pre-access state.
 The passes work on SSA rather than C spelling and can serve other consumers.
 """
 
-EFFECTS = frozenset(("LOAD", "STORE", "DIV32", "IDIV32", "X87_MEM", "CALL",
-                     "CALLIND", "STRINGOP", "SEH"))
-ORDERED = EFFECTS | {"X87_REG"}
-TERMINATORS = frozenset(("BRANCH", "CBRANCH", "RETURN", "BRANCHIND", "TAIL", "TRAP"))
-#: Terminators that publish the block's exit state.
-EXITS = ("RETURN", "BRANCHIND", "TAIL")
-PURE = frozenset((
-    "PACK", "BYTE", "COPY", "INT_ZEXT", "INT_SEXT", "INT_ADD", "INT_SUB", "INT_MULT",
-    "INT_AND", "INT_OR", "INT_XOR", "INT_EQUAL", "INT_NOTEQUAL", "INT_LESS",
-    "INT_LESSEQUAL", "INT_SLESS", "INT_SLESSEQUAL", "BOOL_AND", "BOOL_OR",
-    "BOOL_XOR", "INT_LEFT", "INT_RIGHT", "INT_SRIGHT", "INT_CARRY", "INT_SCARRY",
-    "INT_SBORROW", "BOOL_NEGATE", "INT_NEGATE", "INT_2COMP", "POPCOUNT",
-    "SUBPIECE", "PIECE", "MEMORY", "CC_KIND",
-))
+# Effect/observation/termination classifications come from operations.py.
+from .operations import EFFECTS, EXITS, OBSERVES, ORDERED, PURE, TERMINATORS
+
+#: Policy: pure values that still count as liveness roots unless removable.
+ROOTED_PURE = frozenset(("CONST", "TARGET", "INPUT", "PHI", "CALL_RELOAD", "CALL_KEEP"))
+DEFAULT_NON_ROOTS = PURE - ROOTED_PURE
 
 #: Results of an operation whose two operands are the same value.
 SELF = {"INT_EQUAL": 1, "INT_LESSEQUAL": 1, "INT_SLESSEQUAL": 1, "INT_NOTEQUAL": 0,
@@ -156,9 +148,9 @@ when used, such as the emitter's ``CALL_RELOAD`` callee-state reads.
         for v in b.ops:
             # Unknown operations must survive to the consumer's diagnostic;
             # absence of a result use is not proof of absent effects.
-            if v.opc not in PURE and v.opc not in removable:
+            if v.opc not in DEFAULT_NON_ROOTS and v.opc not in removable:
                 todo.append(v)
-                if v.opc in EFFECTS or v.opc in EXITS:
+                if v.opc in OBSERVES:
                     state = b.snapshots[v.id] if v.opc in EFFECTS else b.exit
                     todo.extend(state_roots(s, state, state if publications is None
                                             else publications[v.id], groups))

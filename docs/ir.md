@@ -123,6 +123,19 @@ versus decoded reasons, unmodelled, seconds). Workers lift and emit one function
 at a time from the image bytes; dispatch checks, call returns and entry sets
 come from the program model, never from generated C.
 
+`operations.py` is the single intrinsic description of IR operations: ordering,
+memory direction, possible faults, observation, clobbering and termination.
+`simplify`, `publication`, `transfer_plan`, `ssa`, `x87_carry`, `x87_plan` and
+the emitter derive from it. Consumer policy stays explicit and separate:
+relaxable observation (`publication.RELAXABLE_ACCESS`), lazy-flag eager
+events, x87 reset/flush and liveness roots are derived from the table plus
+named boundaries, not duplicated literals. A missing description raises a named
+diagnostic and the body takes the decoded fallback. The C printer separately
+validates which described operations it can render; that capability check is
+not an effect classification. `decoded.py` keeps its own
+mnemonic-level acceptance and per-mnemonic flag lowering; that raw path is
+intentionally separate and does not consume the p-code operation table.
+
 ## State publication
 
 SSA bodies keep state in host locals between observation points. Two kinds of
@@ -274,11 +287,27 @@ the fully published ordinary entry owns the checkpoint, including due polling.
 Hooks, profiling, frame watches and replacements retain that ordinary path.
 The cleanup sequence is in [contract-cleanup.md](contract-cleanup.md).
 
-`x87_mode.py` supplies separate control-word facts, return relations and a
-byte-backed writer/exposure inventory in that report. A proven preserving leaf
-can use a fast-only private body when preparation establishes PC = RC = 0;
-rejected modes use the shared ordinary checked entry. These are mode proofs,
-not contracts for x87 values, tags, TOP, status or exact-integer shadows.
+`x87_cw.py` owns the control-word lattice, named masks and per-activation
+arithmetic choices; `x87_propagation.py` owns `Prepared` bodies, return
+relations and entry joins; `x87_report.py` owns the byte-backed writer/exposure
+inventory and the driver's mode report (`x87_mode.py` re-exports them).
+`ModeCondition(mask, value)` is the canonical concrete condition. Known bits,
+symbolic entry bits, return preservation, configured premises, entry
+verification and runtime guards stay distinct: a condition constrains only the
+control word and proves nothing about x87 values, tags, shadows, TOP, status or
+exact-integer shadows. Arithmetic is `Dynamic`, `Guarded(condition, boundary)`
+or `Proven(condition, proof)`. `Guarded(entry)` keeps a fast-only private body
+behind private entry preparation; `Guarded(activation)` keeps the in-body
+fast/general clone pair; both retain the external ordinary fallback. `Proven`
+keeps instruction proof scope and provenance and is never rendered as a runtime
+guard. Private-entry guards are not static proofs. The plan's choice determines
+clone routing; the scalar's site choice combines that route with the retained
+instruction fact and is the single input to CW recipe folding. Private-call
+preparation retains its proof record, and configured entry verification retains
+the contract's scope and evidence. Instruction facts cross the
+compiler-facing emission boundary as typed `InstructionFact` records matched to
+their function and site; a bare `ModeCondition` is not a proof and is rejected
+there (legacy tuples remain accepted only by analysis/verification APIs).
 
 ### Policies
 

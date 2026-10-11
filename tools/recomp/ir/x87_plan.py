@@ -2,12 +2,33 @@ from dataclasses import dataclass
 
 from . import x87
 from .ssa import SSAError
+from .x87_cw import (CW_FAST, Dynamic, Guarded, InstructionProof, Proven,
+                     condition_of)
+from .operations import TERMINATORS, X87_FLUSH_OPS, X87_FLUSH_STRICT_OPS, X87_RESET_OPS
 from .x87_scalar import X87Scalar, PART_TYPES, UNSAFE, carry_var, ordered_parts
 from .x87_carry import assert_covers
+
+#: Policy: binary32 scalar runs end at these effects.
+_SCALAR_RUN_BOUNDARIES = X87_FLUSH_OPS | frozenset(
+    ("STORE", "TRAP", "BRANCH", "CBRANCH", "BRANCHIND"))
 
 CW_CLONE_MIN_OPS = 4
 CW_CLONE_DENSITY = 8
 CW_CLONE_MAX_GUARDS = 1
+
+
+def _instruction_proof(entries):
+    facts = [fact for _site, fact in entries if fact is not None]
+    if not facts:
+        return None
+    scopes = {getattr(fact, "scope", None) for fact in facts}
+    provenance = getattr(facts[0], "provenance", None)
+    if len(scopes) != 1 or None in scopes or provenance is None:
+        return None
+    try:
+        return InstructionProof(tuple(facts), scopes.pop(), provenance)
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -15,8 +36,7 @@ class X87Plan:
     strict: bool
     convention: bool
     defer_ie: bool
-    known_mode: bool
-    clones: tuple
+    choice: object
     binary32: set
     indices: dict
     predecessors: dict
@@ -26,10 +46,20 @@ class X87Plan:
     linear_prev: dict
     activations: tuple = ()
 
+    @property
+    def known_mode(self):
+        return isinstance(self.choice, Guarded) and self.choice.boundary == "entry"
+
+    @property
+    def clones(self):
+        if isinstance(self.choice, Guarded):
+            return ("fast",) if self.choice.boundary == "entry" else ("fast", "general")
+        return (None,)
+
     def scalar(self):
         scalar = X87Scalar(observe_loads=self.strict, convention=self.convention,
                            lazy_nan=self.defer_ie)
-        scalar.known_mode = self.known_mode
+        scalar.choice = self.choice
         scalar.mode_hook_guard = True
         return scalar
 
@@ -108,10 +138,10 @@ class X87Plan:
                     if v.opc in ("X87_REG", "X87_MEM"):
                         scalar.binary32 = v.id in self.binary32
                         scalar.statements(v.data, "planning_address", "planning_result")
-                    elif v.opc in ("CALL", "CALLIND", "STRINGOP", "DIV32", "IDIV32"):
+                    elif v.opc in X87_RESET_OPS:
                         scalar.flush()
                         scalar.reset()
-                    elif v.opc in ("LOAD", "STORE"):
+                    elif v.opc in X87_FLUSH_STRICT_OPS:
                         if scalar.observe_loads:
                             scalar.flush()
                     elif v.opc in ("RETURN", "TAIL"):
@@ -129,8 +159,7 @@ class X87Plan:
                                 scalar.flush()
                         else:
                             scalar.flush()
-                if not any(v.opc in ("BRANCH", "CBRANCH", "RETURN", "BRANCHIND", "TAIL", "TRAP")
-                           for v in b.ops):
+                if not any(v.opc in TERMINATORS for v in b.ops):
                     target = fir.succ[i][0]
                     if self.carry_mode:
                         if self.linear_prev.get(target) != i:
@@ -160,13 +189,26 @@ def prepare(s, fir, live, *, strict, convention, defer_ie, known_mode, cw_clone,
     # The clone duplicates the integer code too; a mostly-integer body
     # (ProjectionMeshBuilder::Build: 25 x87 of ~300 instructions) doubled in
     # size for a 3% corpus gain, so also require a minimum x87 density.
-    proven_mode = all(mode_sites.get(b.insn.addr) == (0x0f00, 0)
-                      for b in s.blocks.values() for v in b.ops
-                      if v.opc in ("X87_REG", "X87_MEM") and v.id in live)
-    clones = (("fast",) if known_mode else ("fast", "general")
-              if not proven_mode and cw_sensitive >= CW_CLONE_MIN_OPS
-              and cw_sensitive * CW_CLONE_DENSITY >= len(fir.insns)
-              else (None,))
+    proven_facts = [(b.insn.addr, mode_sites.get(b.insn.addr))
+                    for b in s.blocks.values() for v in b.ops
+                    if v.opc in ("X87_REG", "X87_MEM") and v.id in live]
+    proven_mode = bool(proven_facts) and all(condition_of(fact) == CW_FAST
+                                             for _site, fact in proven_facts)
+    proof = _instruction_proof(proven_facts) if proven_mode else None
+    site_proven = None
+    if proof is not None:
+        try:
+            site_proven = Proven(CW_FAST, proof)
+        except (TypeError, ValueError):
+            site_proven = None
+    if known_mode:
+        choice = Guarded(CW_FAST, boundary="entry")
+    elif proven_mode:
+        choice = site_proven if site_proven is not None else Dynamic()
+    elif cw_sensitive >= CW_CLONE_MIN_OPS and cw_sensitive * CW_CLONE_DENSITY >= len(fir.insns):
+        choice = Guarded(CW_FAST, boundary="activation")
+    else:
+        choice = Dynamic()
     indices = {b.insn.addr: i for i, b in s.blocks.items()}
     predecessors = {i: set() for i in s.blocks}
     for e in [s.entry] + s.alternates:
@@ -199,8 +241,7 @@ def prepare(s, fir, live, *, strict, convention, defer_ie, known_mode, cw_clone,
                     if m in ("FXAM", "FIST", "FISTP", "FLDCW", "FNINIT", "FINIT") or (
                             v.opc == "X87_MEM" and m in ("FST", "FSTP", "FNSTSW", "FNSTCW")):
                         finish_scalar_run()
-                elif v.opc in ("STORE", "DIV32", "IDIV32", "CALL", "CALLIND", "STRINGOP",
-                               "RETURN", "TAIL", "TRAP", "BRANCH", "CBRANCH", "BRANCHIND"):
+                elif v.opc in _SCALAR_RUN_BOUNDARIES:
                     finish_scalar_run()
             prev = i
         finish_scalar_run()
@@ -246,14 +287,13 @@ def prepare(s, fir, live, *, strict, convention, defer_ie, known_mode, cw_clone,
                 # fallthrough.
                 continue
             if (i == prev + 1 and set(fir.succ[prev]) == {i}
-                    and not any(op.opc in ("BRANCH", "CBRANCH", "RETURN", "BRANCHIND", "TAIL", "TRAP")
-                                for op in s.blocks[prev].ops)):
+                    and not any(op.opc in TERMINATORS for op in s.blocks[prev].ops)):
                 linear_prev[i] = prev
 
-    plan = X87Plan(strict, convention, defer_ie, known_mode, clones, scalar_binary32,
+    plan = X87Plan(strict, convention, defer_ie, choice, scalar_binary32,
                    indices, predecessors, carry_mode, entry_shape, declared, linear_prev)
     plan.activations = plan.replay(s, fir, mode_sites)
-    if not known_mode and len(clones) > 1 and plan.activations[0] > CW_CLONE_MAX_GUARDS:
-        plan.clones = (None,)
+    if not known_mode and len(plan.clones) > 1 and plan.activations[0] > CW_CLONE_MAX_GUARDS:
+        plan.choice = Dynamic()
         plan.activations = plan.replay(s, fir, mode_sites)
     return plan

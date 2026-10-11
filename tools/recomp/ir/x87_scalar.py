@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from . import x87
+from .x87_cw import CW_FAST, CW_PC_RC, Dynamic, Guarded, Proven, condition_of, proven_fact
 
 
 @dataclass
@@ -195,7 +196,7 @@ SCALAR_ENV = (("fx87_exact(c, ", "fx87_exact_sw(&x87_sw_, "),
 
 #: Control-word mask of the precision (PC) and rounding (RC) fields: the only
 #: CW bits a scalar helper reads.
-CW_FIELDS = 0xf00
+CW_FIELDS = CW_PC_RC
 #: CW uses other than its load and clone guard; the fast clone folds them.
 CW_USE = re.compile(r"\bx87_cw_\b(?! = c->fpu_cw;| & 0x%xu\))" % CW_FIELDS)
 
@@ -218,7 +219,7 @@ class X87Scalar:
     def __init__(self, observe_loads=False, convention=False, lazy_nan=False):
         self.clone = None
         self.activations = 0
-        self.known_mode = False
+        self.choice = Dynamic()
         self.proven_cw = None
         self.mode_hook_guard = False
         self.serial = 0
@@ -228,6 +229,10 @@ class X87Scalar:
         self.lazy_nan = lazy_nan
         self.binary32 = True
         self.reset()
+
+    @property
+    def known_mode(self):
+        return isinstance(self.choice, Guarded) and self.choice.boundary == "entry"
 
     def declarations(self):
         return ["uint16_t x87_cw_;", "uint16_t x87_sw_;", "uint32_t x87_top_;"]
@@ -531,18 +536,30 @@ class X87Scalar:
         self.low -= delta
         self.high -= delta
 
+    def site_choice(self):
+        if self.clone == "fast":
+            assert isinstance(self.choice, Guarded), "fast clone requires a guarded body choice"
+            assert self.choice.condition == CW_FAST, "fast clone supports only CW_FAST"
+            return Guarded(self.choice.condition, self.choice.boundary)
+        if self.proven_cw is not None:
+            record = proven_fact(self.proven_cw, condition_of(self.proven_cw))
+            if record is not None:
+                return record
+        return Dynamic()
+
     def statements(self, data, address=None, result=None):
         """Fold PC/RC facts into audited recipes, retaining other guest state."""
         lines = self._statements(data, address, result)
-        if self.proven_cw is not None and self.clone != "fast":
-            known, value = self.proven_cw
-            mode = "0x%xu" % value if known == CW_FIELDS else \
-                "((x87_cw_ & 0x%xu) | 0x%xu)" % (CW_FIELDS & ~known, value)
+        choice = self.site_choice()
+        if isinstance(choice, Guarded):
+            lines = [CW_USE.sub("0u", line) for line in lines]
+        elif isinstance(choice, Proven):
+            condition = choice.condition
+            mode = "0x%xu" % condition.value if condition.mask == CW_FIELDS else \
+                "((x87_cw_ & 0x%xu) | 0x%xu)" % (CW_FIELDS & ~condition.mask, condition.value)
             if self.mode_hook_guard:
                 mode = "(recomp_hooks_ever ? x87_cw_ : %s)" % mode
             lines = [CW_USE.sub(mode, line) for line in lines]
-        elif self.clone == "fast":
-            lines = [CW_USE.sub("0u", line) for line in lines]
         return lines
 
     def _statements(self, data, address=None, result=None):

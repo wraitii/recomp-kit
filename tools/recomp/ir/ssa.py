@@ -7,7 +7,7 @@ No memory forwarding, dead-store removal or call-convention assumptions occur.
 Unsupported effects fail the entire build; consumers must retain a fallback.
 """
 from .lift import BRANCHES
-from .simplify import ORDERED
+from .operations import ORDERED, RETURNING_OPAQUE, validate as validate_operations
 
 
 class SSAError(Exception):
@@ -320,7 +320,7 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                 cc_ready = True
             if op.out is not None:
                 write(op.out, value)
-            if op.opc in ("DIV32", "IDIV32", "STRINGOP"):
+            if op.opc in RETURNING_OPAQUE:
                 # A returning divide-error handler and the string helper's
                 # fault path may leave arbitrary CPU state behind. Reload every
                 # tracked lane and flag from the helper's result state, exactly
@@ -368,4 +368,5 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
         from .cc_carry import carry
         carry(s, predecessors, flag_off_name)
         s.simplify_phis()
+    validate_operations(s)
     return s

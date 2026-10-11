@@ -5,7 +5,7 @@ control-word bits, register aliases and local stack bytes; all other values
 remain unknown. It proves no environment/FX state restore or memory alias.
 """
 from .lift import Lifter, BRANCHES
-from .x87_mode import Fact, CW_MASK, writer_effect, instruction_mnemonic, instruction_effect
+from .x87_cw import Fact, CW_MASK, writer_effect, instruction_mnemonic, instruction_effect
 
 ENTRY_CW = "entry-cw"
 STACK_ADDR = "stack-address"

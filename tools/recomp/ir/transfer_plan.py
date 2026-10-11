@@ -1,6 +1,7 @@
 from dataclasses import dataclass, replace
 
-from .simplify import state_roots, EFFECTS, EXITS
+from .operations import EXITS, OBSERVES
+from .simplify import state_roots
 from .call_contracts import continuation_outputs, FIELDS
 from .call_state import CallState, OPAQUE_STATE
 from .ssa import MEMORY
@@ -136,7 +137,7 @@ def build(s, groups, facts, contracts, kept, lane_field, never_skip,
                 publications[v.id] = call.publication
                 if v.data not in private:
                     roots.extend(state_roots(s, b.snapshots[v.id], call.guard, groups))
-            if v.opc not in EFFECTS and v.opc not in EXITS:
+            if v.opc not in OBSERVES:
                 continue
             state = b.exit if v.opc in EXITS else b.snapshots[v.id]
             record = b.cc_exit if v.opc in ("RETURN", "TAIL") else b.cc_snapshots.get(v.id)

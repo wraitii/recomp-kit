@@ -8,7 +8,10 @@ are relative to block entry/exit state, so a loop phi's previous iteration can
 never be mistaken for its newly assigned value. Helpers invalidate facts.
 """
 from dataclasses import dataclass
-from .simplify import EFFECTS, EXITS
+from .operations import EXITS, OBSERVES, OPAQUE
+
+#: Policy: observers whose contract permits the exact/relaxed field policy.
+RELAXABLE_ACCESS = OBSERVES - OPAQUE - EXITS
 
 
 @dataclass
@@ -68,10 +71,10 @@ Starting with no facts gives a conservative least fixed point for loops.
             known = {n: values(b.state, keys) for n, keys in enumerate(groups)
                      if all(p == -1 or n in known_exit[p] for p in predecessors[i])}
             for v in b.ops:
-                if v.opc not in EFFECTS and v.opc not in EXITS:
+                if v.opc not in OBSERVES:
                     continue
                 state = b.exit if v.opc in EXITS else b.snapshots[v.id]
-                access = v.opc in ("LOAD", "STORE", "X87_MEM", "SEH")
+                access = v.opc in RELAXABLE_ACCESS
                 held = kept.get(v.id, ()) if kept else ()
                 kept_groups, kept_known = set(), set()
                 required = []
@@ -97,7 +100,7 @@ Starting with no facts gives a conservative least fixed point for loops.
                         known[n] = current
                 publications[v.id] = tuple(required)
                 known_before[v.id] = tuple(already_known)
-                if v.opc in ("DIV32", "IDIV32", "CALL", "CALLIND", "STRINGOP"):
+                if v.opc in OPAQUE:
                     # A division error handler, an opaque callee and the string
                     # helper's fault path may leave arbitrary CPU state behind,
                     # so no must-fact survives.

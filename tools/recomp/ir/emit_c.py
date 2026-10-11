@@ -17,8 +17,8 @@ from .cfg import FunctionIR
 from .guest import X86_32
 from .simplify import canonicalize, simplify, state_roots, whole, EFFECTS, EXITS
 from .publication import analyze as publication_analysis
+from . import flag_region, operations
 from . import transfer_plan, x87_plan
-from . import flag_region
 from .call_contracts import GPRS as CONTRACT_GPRS, ARITH_FLAGS as CONTRACT_FLAGS
 from .contract_variants import output_mask as contract_output_mask
 from .invocation import (EntryBinding, binding_invocation,
@@ -26,6 +26,7 @@ from .invocation import (EntryBinding, binding_invocation,
 
 
 from .normalize import codegen_ir, CC_DEFINES
+from .x87_cw import CW_FAST, CW_PC_RC, ModeCondition, condition_of, proven_fact
 
 
 # Arithmetic flags tracked by the calling-convention census.
@@ -43,7 +44,7 @@ CC_OP_CONST = {"add": "X86_CC_ADD", "sub": "X86_CC_SUB", "cmp": "X86_CC_SUB",
                "adc": "X86_CC_ADC", "sbb": "X86_CC_SBB"}
 CC_BIT_VALUES = {"cf": 1, "pf": 2, "af": 4, "zf": 8, "sf": 0x10, "of": 0x20}
 #: Seams whose observer may read the guest's fields directly, so flags stay eager.
-CC_EAGER_EVENTS = frozenset(("DIV32", "IDIV32", "STRINGOP", "BRANCHIND"))
+CC_EAGER_EVENTS = operations.FLAG_EAGER_CODEGEN
 
 
 def seh_lines(kind, addr):
@@ -89,7 +90,7 @@ def normalize_bindings(mapping, label, allow_checked=True):
 
 #: Codegen ops whose seams materialise flags eagerly before or after running.
 #: They end the region as observers, so the settle is kept.
-_SSA_EAGER_OPS = frozenset(("DIV32", "IDIV32", "STRINGOP", "BRANCHIND", "CALLOTHER"))
+_SSA_EAGER_OPS = operations.FLAG_EAGER_OBSERVERS
 
 
 def cc_action_lines(action):
@@ -254,8 +255,8 @@ class PreparedFunction:
                            % (b.insn.addr, target))
         if target in options["contract_calls"] and call.required_outputs is not None:
             mask = self.layouts.get(target, contract_output_mask(call.required_outputs))
-            mode_proven = options["x87_mode_sites"].get(b.insn.addr) == (0x0f00, 0)
-            return private_invocation(target, binding, expected, mode_proven, mask)
+            proof = proven_fact(options["x87_mode_sites"].get(b.insn.addr), CW_FAST)
+            return private_invocation(target, binding, expected, proof, mask)
         form = "checked" if target in options["checked_calls"] else "ordinary"
         return binding_invocation(target, binding, form, expected)
 
@@ -342,7 +343,21 @@ def validate_operations(s):
     for b in s.blocks.values():
         for v in b.ops:
             if v.opc not in supported:
+                operations.describe(v.opc)
                 raise SSAError("unsupported integer operation %s" % v.opc)
+
+
+def _validate_mode_sites(mode_sites, boundaries, function):
+    from .x87_facts import InstructionFact
+    for site, fact in mode_sites.items():
+        if not isinstance(fact, InstructionFact):
+            raise SSAError("%08x: control-word mode requires a typed InstructionFact record" % site)
+        if fact.site != site or fact.function != function or site not in boundaries:
+            raise SSAError("%08x: control-word mode fact does not belong to this body" % site)
+        condition = fact.mode
+        if (not isinstance(condition, ModeCondition) or condition.mask & ~CW_PC_RC
+                or condition.value & ~condition.mask):
+            raise SSAError("%08x: invalid control-word mode metadata" % site)
 
 
 def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state=True,
@@ -388,7 +403,9 @@ def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_st
     specialization. `return_fields` emits a private leaf's normal-return
     publication, with full changed state retained for unexpected returns.
 
-    `x87_mode_sites` supplies instruction facts from the separate CW analysis.
+    `x87_mode_sites` supplies typed `x87_facts.InstructionFact` records from
+    the separate CW analysis; a bare condition is not a proof, and each fact
+    must match this body's function and instruction address.
     General emission folds proven bits; hooks use the general recipe.
 
     The shared body pass selects arithmetic and state-transfer capabilities
@@ -412,10 +429,7 @@ def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_st
                            "call_symbols", "tail_symbols", "checked_calls", "contract_calls",
                            "x87_mode_sites", "x87_entry_verify")}
     x87_mode_sites = (x87_mode_sites or {}) if not x87_scalar_strict else {}
-    mode_boundaries = {ins.addr for ins in fir.insns}
-    if any(site not in mode_boundaries or known & ~0x0f00 or value & ~known
-           for site, (known, value) in x87_mode_sites.items()):
-        raise SSAError("invalid instruction control-word mode metadata")
+    _validate_mode_sites(x87_mode_sites, {ins.addr for ins in fir.insns}, fir.addr)
     if x87_known_mode:
         from . import x87_mode
         if (return_fields is None or x87_scalar_strict or not x87_cw_clone
@@ -432,7 +446,7 @@ def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_st
             for ins in codegen_ir(fir, lifter).insns for op in ins.ops):
         raise SSAError("private x87 entry requires guarded D3D8 arithmetic")
     if return_fields is not None and (not checked_return or any(
-            op.opc in ("CALL", "CALLIND", "DIV32", "IDIV32", "STRINGOP", "SEH")
+            op.opc in (operations.X87_RESET_OPS | frozenset(("SEH",)))
             for ins in codegen_ir(fir, lifter).insns for op in ins.ops)):
         raise SSAError("private state entry requires a checked leaf without opaque observers")
     if checked_return and (fir.entries or fir.seh or fir.exits):
@@ -769,8 +783,8 @@ def emit_prepared(prepared):
         if v.id in live and s.resolve(v) is v:
             lines.append("v%d = (%s) & %s;" % (v.id, expression(v), mask(v.size)))
     if x87_entry_verify:
-        known, value = x87_entry_verify
-        lines.append('if (RECOMP_UNLIKELY(!recomp_hooks_ever && (c->fpu_cw & 0x%xu) != 0x%xu)) recomp_x87_contract_violation(c, 0x%08xu, 0x%xu, 0x%xu);' % (known, value, fir.addr, known, value))
+        condition = condition_of(getattr(x87_entry_verify, "condition", x87_entry_verify))
+        lines.append('if (RECOMP_UNLIKELY(!recomp_hooks_ever && (c->fpu_cw & 0x%xu) != 0x%xu)) recomp_x87_contract_violation(c, 0x%08xu, 0x%xu, 0x%xu);' % (condition.mask, condition.value, fir.addr, condition.mask, condition.value))
     if fir.entries:
         lines.append("switch (entry_) {")
         for e, block in zip(fir.entries, s.alternates):
@@ -890,7 +904,7 @@ def emit_prepared(prepared):
                     # Guest accesses do not observe x87 state (see x87_scalar.py);
                     # only strict mode publishes before them. The division seam
                     # always sees the complete CPU.
-                    if (scalar.observe_loads or v.opc not in ("LOAD", "STORE")):
+                    if (scalar.observe_loads or v.opc not in operations.X87_FLUSH_STRICT_OPS):
                         lines.extend(flush_x87())
                     lines.extend(publish(b.snapshots[v.id], v))
                     if v.opc in ("DIV32", "IDIV32"):
@@ -976,7 +990,7 @@ def emit_prepared(prepared):
                         lines.extend(edge(i, indices[b.insn.addr + b.insn.length]))
                 else:
                     lines.append("v%d = (%s) & %s;" % (v.id, expression(v), mask(v.size)))
-            if not any(v.opc in ("BRANCH", "CBRANCH", "RETURN", "BRANCHIND", "TAIL", "TRAP") for v in b.ops):
+            if not any(v.opc in operations.TERMINATORS for v in b.ops):
                 target = fir.succ[i][0]
                 if carry_mode:
                     if linear_prev.get(target) != i:
