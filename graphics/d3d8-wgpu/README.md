@@ -45,9 +45,9 @@ unaligned records before calling Rust; rectangle memory is consumed before retur
 
 ABI version 9 (including Clear rectangle arrays) is generated from Rust with cbindgen 0.29.4. COM IIDs, slots and
 arities are generated from the pinned Wine header with a reviewed handler map.
-Normal CMake builds regenerate the header and COM tables under
-`build/d3d8-generated/`; generated code is not tracked. Install the header generator with
-`cargo install cbindgen --version 0.29.4 --locked --root build/tools`.
+Cargo builds generate the header using the pinned cbindgen build dependency;
+CMake stages it alongside the COM tables under `build/d3d8-generated/`.
+Generated code is not tracked, and no separate cbindgen installation is needed.
 
 The Metal headless probe passed clear/readback, transformed triangles and depth
 occlusion on Apple M1 Max. Startup replay produced one 640x480 PNG, then failed

@@ -73,34 +73,23 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND RECOMP_D3D8_WGPU_DIR AND EXISTS "${RE
       NOT CMAKE_OSX_ARCHITECTURES STREQUAL CMAKE_HOST_SYSTEM_PROCESSOR))
     message(FATAL_ERROR "D3D8/wgpu integration currently requires a native single-architecture macOS build")
   endif()
-  find_program(CBINDGEN_EXECUTABLE cbindgen HINTS "${RECOMP_GAME_DIR}/build/tools/bin")
-  if(NOT CBINDGEN_EXECUTABLE)
-    message(FATAL_ERROR "D3D8 ABI generation requires cbindgen 0.29.4")
-  endif()
-  execute_process(COMMAND "${CBINDGEN_EXECUTABLE}" --version OUTPUT_VARIABLE RECOMP_CBINDGEN_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE)
-  if(NOT RECOMP_CBINDGEN_VERSION STREQUAL "cbindgen 0.29.4")
-    message(FATAL_ERROR "D3D8 ABI generation requires cbindgen 0.29.4; found ${RECOMP_CBINDGEN_VERSION}")
-  endif()
   file(GLOB_RECURSE RECOMP_D3D8_WGPU_SOURCES CONFIGURE_DEPENDS
     "${RECOMP_D3D8_WGPU_DIR}/src/*.rs")
   set(RECOMP_D3D8_WGPU_TARGET_DIR "${RECOMP_BUILD_ROOT}/d3d8-wgpu/rust")
   set(RECOMP_D3D8_WGPU_LIB "${RECOMP_D3D8_WGPU_TARGET_DIR}/release/libd3d8_wgpu.a")
+  set(RECOMP_D3D8_ABI_HEADER "${RECOMP_D3D8_GENERATED_DIR}/d3d8_abi.h")
   add_custom_command(
-    OUTPUT "${RECOMP_D3D8_WGPU_LIB}"
-    COMMAND ${CMAKE_COMMAND} -E env "CARGO_TARGET_DIR=${RECOMP_D3D8_WGPU_TARGET_DIR}"
-            "${CARGO_EXECUTABLE}" build --release --lib --locked --manifest-path "${RECOMP_D3D8_WGPU_DIR}/Cargo.toml"
+    OUTPUT "${RECOMP_D3D8_WGPU_LIB}" "${RECOMP_D3D8_ABI_HEADER}"
+    COMMAND ${Python3_EXECUTABLE} "${RECOMP_ROOT}/tools/build_d3d8_wgpu.py"
+            --cargo "${CARGO_EXECUTABLE}" --crate "${RECOMP_D3D8_WGPU_DIR}"
+            --target-dir "${RECOMP_D3D8_WGPU_TARGET_DIR}" --header "${RECOMP_D3D8_ABI_HEADER}"
     DEPENDS "${RECOMP_D3D8_WGPU_DIR}/Cargo.toml"
             "${RECOMP_D3D8_WGPU_DIR}/Cargo.lock"
+            "${RECOMP_D3D8_WGPU_DIR}/build.rs"
+            "${RECOMP_D3D8_WGPU_DIR}/cbindgen.toml"
+            "${RECOMP_ROOT}/tools/build_d3d8_wgpu.py"
             ${RECOMP_D3D8_WGPU_SOURCES}
     COMMENT "Building d3d8-wgpu Rust static library"
-    VERBATIM)
-  set(RECOMP_D3D8_ABI_HEADER "${RECOMP_D3D8_GENERATED_DIR}/d3d8_abi.h")
-  add_custom_command(OUTPUT "${RECOMP_D3D8_ABI_HEADER}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${RECOMP_D3D8_GENERATED_DIR}"
-    COMMAND "${CBINDGEN_EXECUTABLE}" --quiet --config "${RECOMP_D3D8_WGPU_DIR}/cbindgen.toml"
-            --output "${RECOMP_D3D8_ABI_HEADER}" "${RECOMP_D3D8_WGPU_DIR}"
-    DEPENDS "${RECOMP_D3D8_WGPU_DIR}/cbindgen.toml" "${RECOMP_D3D8_WGPU_DIR}/Cargo.toml"
-            "${RECOMP_D3D8_WGPU_DIR}/Cargo.lock" ${RECOMP_D3D8_WGPU_SOURCES}
     VERBATIM)
   add_custom_target(d3d8_abi_header DEPENDS "${RECOMP_D3D8_ABI_HEADER}")
   add_dependencies(recomp_dx d3d8_abi_header)
