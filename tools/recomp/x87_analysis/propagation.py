@@ -36,18 +36,8 @@ def main(argv=None):
     ctx = driver.Context(settings)
     fact_identity = x87_facts.identity(settings)
     scanned, helpers = scan(ctx, args.jobs, args.scan_cache)
-    outside = set().union(*(row.references for row in scanned.values()))
-    relocated, kinds = ctx.image.relocated_pointers(), ctx.program.entries()
-    internal = {}
-    for (owner, _site), targets in ctx.program.tables.items():
-        for target in targets:
-            if (kinds.get(target) == "table" and ctx.program.containing(target) == owner
-                    and target != owner and target not in ctx.program.configured_entries
-                    and target not in relocated and target not in outside):
-                internal.setdefault(owner, set()).add(target)
-    prepared = {addr: row.cw_facts._replace(entries=tuple(
-        i for i in row.cw_facts.entries if row.cw_facts.sites[i] not in internal.get(addr, ())))
-        if row.cw_facts else None for addr, row in scanned.items()}
+    entry_model = ctx.program.classify_entries(scanned)
+    prepared = entry_model.cw_inputs(scanned)
     opaque = driver.native_replaced(settings) | helpers
     boundaries = x87_boundaries.load(settings.x87_mode_metadata, prepared, ctx.image,
                                      settings.x87_imports_preserve_pc_rc)
@@ -103,13 +93,13 @@ def main(argv=None):
         if owner is not None:
             unknown_entries.setdefault(owner, []).append(reason)
 
-    for target, site in relocated.items():
+    for target, site in entry_model.relocated.items():
         unknown_entry(target, "address taken by relocation at %08x" % site)
     for target in settings.configured_entries | {settings.cfg["game"]["entry_point"]}:
         unknown_entry(target, "configured or process entry at %08x" % target)
     for (owner, _site), targets in ctx.program.tables.items():
         for target in targets:
-            if target not in internal.get(owner, ()):
+            if target not in entry_model.internal.get(owner, ()):
                 unknown_entry(target, "external jump-table entry at %08x" % target)
     for addr, row in scanned.items():
         modeled = {target for _, _, target in prepared[addr].calls} if prepared[addr] else set()

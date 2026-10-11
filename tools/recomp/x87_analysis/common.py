@@ -1,5 +1,4 @@
 """Shared analysis inputs, contracts and reports."""
-from collections import namedtuple
 from concurrent.futures import ProcessPoolExecutor
 import hashlib
 import json
@@ -9,10 +8,10 @@ import pickle
 import driver
 import game_config
 from settings import Settings
+from program import ScanRow
 from ir import x87, x87_mode
 
 MASK = 0x0f00
-ScanRow = namedtuple("ScanRow", "addr description calls references dangling returns exclusion seh_escapes register_facts cw_facts x87_count writers external_targets")
 
 
 def settings_for(args):
@@ -53,7 +52,6 @@ def scan(ctx, jobs, cache=None):
         except ValueError:
             pass
     scanned, helpers = driver.scan_program(ctx.settings, jobs)
-    scanned = {addr: ScanRow(*row) for addr, row in scanned.items()}
     if cache:
         cache.parent.mkdir(parents=True, exist_ok=True)
         cache.write_bytes(pickle.dumps((scan_fingerprint(ctx), scanned, helpers)))

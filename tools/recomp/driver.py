@@ -6,7 +6,7 @@ SSA cannot emit, and the wrappers of bodies whose entries are all switch cases,
 come from the decoded emitter, fed the map's own instruction boundaries.
 """
 import argparse
-from collections import Counter, namedtuple
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 import json
 import os
@@ -27,9 +27,7 @@ from decoded import external_exits
 from ir import call_contracts, contract_variants, production, x87_mode, x87_facts
 from ir.lift import Lifter, LiftError
 from ir.ssa import SSAError
-from program import Program, TranslateError
-
-Row = namedtuple("Row", "addr name count first last")
+from program import FunctionDescription as Row, Program, ScanRow, TranslateError
 
 _CTX = None
 _CLOCK = [time.monotonic()]
@@ -150,7 +148,7 @@ def _scan(addrs):
             x87_count += mnem.startswith("F") and mnem != "FEMMS"
             if x87_mode.writer_effect(mnem) is not None:
                 writers.append({"site": ins.addr, "mnemonic": mnem})
-        rows.append((addr, Row(addr, fn.name, len(fn.insns), fn.insns[0].addr, fn.insns[-1].addr),
+        rows.append(ScanRow(addr, Row(addr, fn.name, len(fn.insns), fn.insns[0].addr, fn.insns[-1].addr),
                      calls, refs, sorted(dangling), returns, reason, escapes, prepared, mode_prepared, x87_count,
                      writers, sorted(external_targets)))
     return rows
@@ -171,11 +169,11 @@ def _escapes(task):
 def scan_program(settings, jobs):
     ctx = Context(settings)
     with ProcessPoolExecutor(max_workers=jobs, initializer=_init, initargs=(settings,)) as pool:
-        scanned = {row[0]: row for batch in pool.map(_scan,
+        scanned = {row.addr: row for batch in pool.map(_scan,
                    chunked(sorted(ctx.program.functions), jobs * 24)) for row in batch}
         helpers = seh_helpers(pool, chunked(sorted(scanned), jobs * 24),
-                              {addr: row[7] for addr, row in scanned.items()},
-                              {addr: row[2] for addr, row in scanned.items()})
+                              {addr: row.seh_escapes for addr, row in scanned.items()},
+                              {addr: row.calls for addr, row in scanned.items()})
     return scanned, helpers
 
 
@@ -404,29 +402,19 @@ def main(argv=None):
         scanned = {}
         for part in pool.map(_scan, parts):
             for row in part:
-                scanned[row[0]] = row
+                scanned[row.addr] = row
         phase("scan")
 
-        rows = {addr: row[1] for addr, row in scanned.items()}
-        calls = {addr: row[2] for addr, row in scanned.items()}
-        escapes = {addr: row[7] for addr, row in scanned.items()}
+        rows = {addr: row.description for addr, row in scanned.items()}
+        calls = {addr: row.calls for addr, row in scanned.items()}
+        escapes = {addr: row.seh_escapes for addr, row in scanned.items()}
         helpers = seh_helpers(pool, parts, escapes, calls)
         phase("seh helpers")
 
-        outside = set()
-        for row in scanned.values():
-            outside |= row[3]
-        relocated = ctx.image.relocated_pointers()
-        kinds = program.entries()
-        internal = {}
-        for (owner, _site), targets in program.tables.items():
-            for t in targets:
-                if (kinds.get(t) == "table" and program.containing(t) == owner and t != owner
-                        and t not in program.configured_entries and t not in relocated
-                        and t not in outside):
-                    internal.setdefault(owner, set()).add(t)
+        entry_model = program.classify_entries(scanned)
+        internal = entry_model.internal
 
-        dangling = sorted((addr, t) for addr, row in scanned.items() for t in row[4])
+        dangling = sorted((addr, t) for addr, row in scanned.items() for t in row.dangling)
         if dangling:
             for addr, t in dangling:
                 log("  fn_%08x dispatches to %08x, which is not an entry point" % (addr, t))
@@ -435,28 +423,26 @@ def main(argv=None):
                 "(function or referenced entry), re-export the code map and regenerate" % len(dangling))
 
         conservative = native_replaced(settings)
-        mode_prepared = {addr: row[9]._replace(entries=tuple(
-            i for i in row[9].entries if row[9].sites[i] not in internal.get(addr, ())))
-            if row[9] else None for addr, row in scanned.items()}
-        mode_opaque = conservative | helpers | {addr for addr, row in scanned.items() if row[6] is not None}
+        mode_prepared = entry_model.cw_inputs(scanned)
+        mode_opaque = conservative | helpers | {addr for addr, row in scanned.items() if row.exclusion is not None}
         mode_sites, facts_report = x87_facts.load(settings.x87_facts, ctx, mode_prepared, mode_opaque)
         entry_verification = {row["function"]: (row["mask"], row["value"])
                               for row in settings.x87_entry_contracts if row.get("verify")}
         mode_summaries = x87_mode.summarize(mode_prepared, mode_opaque)
-        x87_counts = {addr: row[10] for addr, row in scanned.items()}
+        x87_counts = {addr: row.x87_count for addr, row in scanned.items()}
         mode_exposure = x87_mode.exposure_report(mode_prepared, calls, mode_opaque, x87_counts,
-                                                {addr: row[11] for addr, row in scanned.items()})
+                                                {addr: row.writers for addr, row in scanned.items()})
         for addr in settings.checked_returns:
             row = scanned.get(addr)
-            if not row or not row[8] or row[6] is not None or addr in helpers or addr in conservative:
+            if not row or not row.register_facts or row.exclusion is not None or addr in helpers or addr in conservative:
                 raise TranslateError("%08x: checked return requires an unreplaced, closed single-entry body without SEH" % addr)
         contracts = {}
         if settings.call_contracts:
-            prepared = {addr: row[8] or None for addr, row in scanned.items()}
-            roots = [addr for addr, row in scanned.items() if row[6] is None]
+            prepared = {addr: row.register_facts or None for addr, row in scanned.items()}
+            roots = [addr for addr, row in scanned.items() if row.exclusion is None]
             contracts = call_contracts.analyze(
                 calls, prepared,
-                analyzable=lambda a: bool(scanned.get(a) and scanned[a][8] is not None
+                analyzable=lambda a: bool(scanned.get(a) and scanned[a].register_facts is not None
                                           and a not in helpers and a not in conservative),
                 roots=roots)
         phase("contracts")
@@ -483,7 +469,7 @@ def main(argv=None):
         checked_returns |= private_targets.keys()
         if enabled and settings.private_leaf_contracts:
             selected_callers |= {addr for addr, row in scanned.items()
-                                 if addr not in mode_opaque and row[8] and row[9]
+                                 if addr not in mode_opaque and row.register_facts and row.cw_facts
                                  and any(t in private_targets for t in calls[addr])}
         if not enabled:
             selected_callers.clear()
@@ -524,7 +510,7 @@ def main(argv=None):
     bodies = {addr: results[addr][1] for addr in addrs}
     entries_by_fn = {addr: set(found) for addr, found in ctx.interior.items()}
     entry_names = sorted(ctx.entries)
-    call_returns = sorted({r for row in scanned.values() for r in row[5]})
+    call_returns = sorted({r for row in scanned.values() for r in row.returns})
     functions = [rows[a] for a in addrs]
     os.makedirs(args.out, exist_ok=True)
     output.write_funcs_header(args.out, entry_names)

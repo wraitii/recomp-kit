@@ -46,8 +46,10 @@ layout that omits a required output.
 
 `tools/recomp/x87_audit.py` selects propagation, writer or real-call context
 analysis with `--game` or `--game-dir`. Its shared library consumes lifted
-instruction CFGs independently of production SSA acceptance. Named scan records,
-byte-checked assumptions, CFG graphs and bit provenance are reusable interfaces.
+instruction CFGs independently of production SSA acceptance. Production and
+offline analysis share named scan records, internal entry classification and CW
+entry scope through `program.py`. Byte-checked assumptions,
+CFG graphs and bit provenance are reusable analysis interfaces.
 Hypothetical roots, broad discovery reports and candidate context summaries stay
 offline. Context preservation and constant mode are separate results.
 

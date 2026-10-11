@@ -17,11 +17,11 @@ def shared_masks(requests):
 def eligible_leaves(scanned, opaque):
     uses = {}
     for addr, row in scanned.items():
-        if addr in opaque or not row[8] or not row[9]:
+        if addr in opaque or not row.register_facts or not row.cw_facts:
             continue
-        for target in row[2]:
+        for target in row.calls:
             uses[target] = uses.get(target, 0) + 1
     return {addr for addr, row in scanned.items()
-            if addr not in opaque and row[8] and row[9] and row[9].returns
-            and not row[9].calls and uses.get(addr, 0) >= 2
-            and row[1].count <= 64 * uses[addr]}
+            if addr not in opaque and row.register_facts and row.cw_facts and row.cw_facts.returns
+            and not row.cw_facts.calls and uses.get(addr, 0) >= 2
+            and row.description.count <= 64 * uses[addr]}

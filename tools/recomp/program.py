@@ -6,11 +6,29 @@ instruction effects. Nothing here decodes with Capstone or scans for code.
 Unknown control flow fails with a named diagnostic: fix Ghidra and re-export.
 """
 from bisect import bisect_right
+from collections import namedtuple
+from dataclasses import dataclass
 import hashlib
 
 import code_map
 from ir.cfg import FunctionIR
 from ir.lift import Lifter
+
+
+FunctionDescription = namedtuple("FunctionDescription", "addr name count first last")
+ScanRow = namedtuple("ScanRow", "addr description calls references dangling returns exclusion seh_escapes register_facts cw_facts x87_count writers external_targets")
+
+
+@dataclass
+class EntryModel:
+    internal: dict
+    relocated: dict
+
+    def cw_inputs(self, scanned):
+        return {addr: row.cw_facts._replace(entries=tuple(
+            i for i in row.cw_facts.entries
+            if row.cw_facts.sites[i] not in self.internal.get(addr, ())))
+            if row.cw_facts else None for addr, row in scanned.items()}
 
 
 class TranslateError(Exception):
@@ -210,6 +228,18 @@ class Program(object):
             found.setdefault(addr, "config")
         self._entries = found
         return found
+
+    def classify_entries(self, scanned):
+        outside = set().union(*(row.references for row in scanned.values()))
+        relocated, kinds = self.pe.relocated_pointers(), self.entries()
+        internal = {}
+        for (owner, _site), targets in self.tables.items():
+            for target in targets:
+                if (kinds.get(target) == "table" and self.containing(target) == owner
+                        and target != owner and target not in self.configured_entries
+                        and target not in relocated and target not in outside):
+                    internal.setdefault(owner, set()).add(target)
+        return EntryModel(internal, relocated)
 
     def body(self, addr):
         """Lift one function from the image bytes."""
