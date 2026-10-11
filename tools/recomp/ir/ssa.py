@@ -51,6 +51,7 @@ class CcRecord:
 class SSA:
     def __init__(self):
         self.values, self.blocks, self.inputs, self.aliases = [], {}, {}, {}
+        self.entry_ops = []
 
     def value(self, opc, size, args=(), data=None):
         v = Value(len(self.values), opc, size, args, data)

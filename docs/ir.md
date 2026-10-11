@@ -7,7 +7,7 @@ Game measurements and the optimization history live in the game repository.
 ```
 code map v3 + PE -> program.py + frontend.py -> ir/lift.py -> ir/normalize.py -> ir/ssa.py
   -> emit_c.prepare + x87_plan -> contract_variants.SpecializationPlan
-  -> emit_c.emit_prepared -> output.py (chunks, funcs.h, table.c, symbols.json, report)
+  -> final call binding -> emit_c.emit_prepared -> output.py (chunks, funcs.h, table.c, symbols.json, report)
 ```
 
 `tools/recomp/driver.py` is the command (`--game DIR --out DIR`, `--report`,
@@ -29,6 +29,9 @@ independently of private host transport.
 `Program.body` attaches the same validated records to exploratory lifted IR;
 the driver shares its image and decode cache with the program model. SLEIGH
 still validates instruction lengths and effects independently.
+Decode records contain structural operands without listing text. Exploratory
+lifting uses `decode_span_record`; the production listing path formats those
+records separately and retains its operand-width restrictions.
 
 The code map (`recomp-code-map-v3`, `code_map.py`) is the only authority on code:
 function spans, jump tables, interior entries (`branch`, `data`, `table`) and
@@ -86,9 +89,12 @@ must-facts about published CPU fields (a field is known published only if every
 predecessor published it; after a call or helper, a register or EIP/FS field
 equals its reload, flags stay unknown).
 
-`emit_c.prepare` settles publication, fallback, flag and arithmetic plans without
-emitting a body. `x87_plan.py` selects clones and validates tracker/carry shapes
-and activation budgets. `emit_c.emit_prepared` lowers the prepared values to
+`emit_c.prepare` computes publication, fallback, flag and arithmetic requirements
+without emitting a body. Final binding attaches call values and `lowering.py`
+boundary operations before selecting CPU-field transport. `x87_plan.py` selects
+clones and validates tracker/carry shapes and activation budgets.
+`emit_c.emit_prepared` prints the finalized boundary operations through
+`c_boundaries.py` and lowers integer values to
 unsigned, width-masked C with staged parallel phi
 copies, sign-bias comparisons and saturating shift counts. Dword DIV/IDIV are
 checked `div32`/`idiv32` effects that reach the runtime error seam with the
@@ -161,10 +167,28 @@ including FIST/FISTP, which read the scalar value and exact-integer shadow. Seam
 CFG edges. Dirty parts union at joins; clean parts survive only when every
 predecessor caches them. Cached parts do not require state publication. Each block
 has a conservative fixed-point shape, predecessors write canonical function-scope
-slots, successors copy them, and emission raises `SSAError` (whole-function
-decoded fallback) on drift. External entries with internal backedges reset
+slots, successors copy them, and planning raises `SSAError` (whole-function
+decoded fallback) on shape drift. External entries with internal backedges reset
 the tracker so a first call never reads carried locals before initialization.
 Carry needs the MSVC convention.
+
+`x87_transition.py` owns validated instruction recipes, width-typed expressions,
+CW/SW operands, helpers and ordered activation/reset/publication operations.
+Scalar and eager execution share operand directions, pop counts, arithmetic and
+unary recipes. The decoded eager policy retains its broader legacy instruction
+acceptance; SSA admission stays byte-validated in `x87.py`. `x87_scalar.py`
+interprets recipes into tracker changes and transition records, never C text.
+`x87_carry.py` interprets those same transitions with real typed operands and
+symbolic carry values. `x87_plan.py` stores each clone's block/event/edge
+operations once; emission prints them through `c_x87.py` without replaying a
+mutable tracker. Shape coverage, activation counts, operand roles and event
+coverage remain checked before or during printing.
+
+Control-word uses are dynamic, guarded constants, proven constants or partially
+known operands with an explicit hook-dependent selection. Folding happens while
+constructing operands; the C printer renders them without regex substitution,
+helper-name replacement or leftover-text checks. Proof scope/provenance remains
+attached to folded operands and proves only CW bits, never slot or status state.
 
 Under PC=00, proven-binary32 operations use native float arithmetic plus the
 runtime's NaN/status normalization once a linear run has two arithmetic effects.
@@ -255,11 +279,59 @@ Eligible closed callers use those targets; failed caller preparation remains dec
 `state_contract_callers` additionally selects explicit caller addresses. Direct edges into
 checked leaf bodies get private entries specialized for the required GPR/flag
 outputs. A callee has one private body with the union of its callers' output
-masks; `contract_variants.SpecializationPlan` settles shared layouts before
-emission. Prepared SSA graphs pass between workers in temporary files through
+masks. Frozen `PrivateLayout(inputs, outputs, resident_opaque)` records order
+fields by guest contract identity; inputs cover callee reads and linkage fields,
+while x87, EIP, FS, DF and runtime state remain resident. Transport still uses CPU
+fields. `contract_variants.SpecializationPlan` unions outputs across all callers.
+Preparation retains `ProvisionalBindings`; a distinct final-binding phase attaches
+`FinalBindings` with the shared layouts and ordered per-site `CallValues`.
+`CallState` remains field requirements; `call_values.py` binds layout inputs to
+caller SSA values, outputs to call results and preserved fields to before/after
+continuation values. Missing SSA lanes explicitly remain resident. Full integer
+fallback inputs/results and resident opaque state are separate from the private
+layout; unused shared outputs still have result bindings. Validation checks
+layout order and coverage before transport selection.
+
+`lowering.py` finalizes publication operands and flag recipes, invocation,
+eligibility/hook guards, reload/preservation, post-call settlement, checked
+returns and parallel edge copies. CPU-field transport consumes this plan without
+changing requirements. Guest CALL pushes and RET pops remain SSA memory effects;
+entry thunks retain eligibility, checkpoints and hooks independently of transport.
+`c_boundaries.py` prints these decisions; `c_symbols.py` owns invocation rendering
+and declaration discovery. No semantic module renders invocations or owns C
+prototypes. The x87 tracker uses the structured transition plan described above.
+
+Emission requires those final decisions
+and checks them against both the caller requests and private callee records.
+Final binding hands fresh graphs directly to emission in the same worker, avoiding
+another SSA serialization round trip.
+Prepared SSA graphs pass between workers in temporary files through
 `prepared_store.py`, encoding value references by ID. Each body is emitted once;
 full-output integer private entries alias the checked body.
 The report distinguishes each edge's required outputs from its entry mask.
+
+`body.py` defines frozen emission policies, preparation requests and
+`BodyVariant(entry, returns, arithmetic)` records. Supported forms are ordinary,
+multiple entry, checked and private; only private bodies admit a whole-body
+`Guarded(CW_FAST, entry)` arithmetic choice. Ordinary activation choices and typed
+instruction proofs remain in the x87 plan. `c_symbols.py` owns backend spellings
+and shared entry signatures. The corpus's `emit_c.emit` wrapper adapts keyword
+options to typed requests; unused production emission wrappers were removed.
+`phases.py` names scan, analysis, selection, preparation and emission payloads;
+`selection.py` centralizes eligibility without changing the selection budgets.
+
+`artifacts.py` snapshots lifted and normalized functions as immutable byte
+payloads in the translation's temporary store. Keys include guest language,
+source bytes, boundaries, CFG, exits, noreturn/SEH effects, entries and normalized
+tail targets as applicable. Normalization is independent of emission policy;
+SSA, publications and arithmetic plans remain variant-local. Every cache read
+materializes a fresh graph, including reads in different workers. Temporary
+snapshots are retained for repeated normalized preparation only; one-use
+normalized graphs pass directly to SSA. Snapshots never survive a translation
+run, so changed frontend code cannot reuse
+an older producer. `frontend_work` reports build/reuse and instruction counts in
+the contract report and optional driver report; emission never rebuilds SSA.
+
 SSA dependencies include all state escaping through the caller's own
 RET and full snapshots on observation paths. Input contracts use the same
 byte-derived, corrected instruction IR as those leaf bodies. Unexpected guest
@@ -344,3 +416,11 @@ equivalence is unverified.
   the eager and SSA variants (and an optional native kernel) on real game bytes;
   the SSA variant must lower every row.
 - Report counts are frontend coverage, not execution coverage or equivalence.
+- For x87 transition changes, compare eager and scalar output separately, then
+  compare stateful sequences, carry joins, activation/reset/publication and
+  dynamic/guarded/proven/partial CW operands with hook fallback. Roundtrip
+  prepared stores and verify that external SSA values and shared CW proofs
+  retain identity. Compare regenerated C and specialization decisions as well
+  as refreshed offline propagation and proof contents. Recipe/text equivalence
+  does not establish native floating-point or fault equivalence; a paired
+  `--changed` run with identical bodies executes no new inputs.

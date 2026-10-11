@@ -5,7 +5,9 @@ from .ssa import SSAError
 from .x87_cw import (CW_FAST, Dynamic, Guarded, InstructionProof, Proven,
                      condition_of)
 from .operations import TERMINATORS, X87_FLUSH_OPS, X87_FLUSH_STRICT_OPS, X87_RESET_OPS
-from .x87_scalar import X87Scalar, PART_TYPES, UNSAFE, carry_var, ordered_parts
+from .x87_scalar import X87Scalar, PART_TYPES, UNSAFE, ordered_parts
+from .body import FrozenMap
+from .x87_transition import carry, external, Type, Assign, Declare, Reset, environment, Activation, validate
 from .x87_carry import assert_covers
 
 #: Policy: binary32 scalar runs end at these effects.
@@ -31,6 +33,16 @@ def _instruction_proof(entries):
         return None
 
 
+@dataclass(frozen=True)
+class CloneProgram:
+    clone: str | None
+    blocks: FrozenMap
+    events: FrozenMap
+    defaults: FrozenMap
+    ends: FrozenMap
+    activations: int
+
+
 @dataclass
 class X87Plan:
     strict: bool
@@ -44,7 +56,12 @@ class X87Plan:
     entry_shape: dict | None
     declared: set
     linear_prev: dict
-    activations: tuple = ()
+    programs: tuple = ()
+    temporaries: tuple = ()
+
+    @property
+    def activations(self):
+        return tuple(program.activations for program in self.programs)
 
     @property
     def known_mode(self):
@@ -64,8 +81,10 @@ class X87Plan:
         return scalar
 
     def declarations(self):
-        return ["%s %s;" % (PART_TYPES[part], carry_var(position, part))
-                for position, part in sorted(self.declared)]
+        return tuple(Declare(carry(position, part)) for position, part in sorted(self.declared))
+
+    def environment_declarations(self):
+        return tuple(Declare(environment(part)) for part in ('cw', 'sw', 'top'))
 
     def seed_block(self, scalar, shape, lines):
         if shape is None or shape is UNSAFE or not shape.active:
@@ -77,7 +96,7 @@ class X87Plan:
             for part in ordered_parts(slot.parts):
                 if part not in agreements:
                     exprs[(position, part)] = scalar._temp(
-                        carry_var(position, part), lines, PART_TYPES[part])
+                        carry(position, part), lines, PART_TYPES[part])
         scalar.seed(shape, exprs)
 
     def transition(self, scalar, source, targets, lines):
@@ -111,66 +130,86 @@ class X87Plan:
                 for position, slot in shape.slots:
                     agreements = dict(slot.const)
                     for part in ordered_parts(slot.parts):
-                        name = carry_var(position, part)
+                        name = carry(position, part)
                         if part not in agreements and name not in assignments:
                             assignments[name] = scalar._read(position, part, lines)
             for name, expr in assignments.items():
-                lines.append("%s = %s;" % (name, expr))
+                lines.append(Assign(name, expr))
         if fallback:
             lines.extend(scalar.flush())
 
-    def replay(self, s, fir, mode_sites):
+    def lower(self, s, fir, mode_sites):
         scalar = self.scalar()
-        counts = []
+        programs = []
         for clone in self.clones:
             scalar.reset()
             scalar.clone, scalar.activations = clone, 0
             previous = None
+            blocks, events, defaults, ends = {}, {}, {}, {}
             for i, b in s.blocks.items():
                 scalar.proven_cw = mode_sites.get(b.insn.addr)
+                operations = []
                 if self.carry_mode:
                     if i not in self.linear_prev:
-                        self.seed_block(scalar, self.entry_shape.get(i), [])
+                        self.seed_block(scalar, self.entry_shape.get(i), operations)
                 elif (previous is None or set(fir.succ[previous]) != {i}
                       or self.predecessors[i] != {previous}):
                     scalar.reset()
+                    operations.append(Reset())
+                blocks[i] = tuple(operations)
                 for v in b.ops:
-                    if v.opc in ("X87_REG", "X87_MEM"):
+                    operations = []
+                    if v.opc in ('X87_REG', 'X87_MEM'):
                         scalar.binary32 = v.id in self.binary32
-                        scalar.statements(v.data, "planning_address", "planning_result")
+                        operations.extend(scalar.apply(v.data,
+                            external(v.args[1]) if v.opc == 'X87_MEM' else None,
+                            external(v, Type.U16) if v.size else None))
                     elif v.opc in X87_RESET_OPS:
-                        scalar.flush()
+                        operations.extend(scalar.flush())
+                        operations.append(Reset())
                         scalar.reset()
                     elif v.opc in X87_FLUSH_STRICT_OPS:
                         if scalar.observe_loads:
-                            scalar.flush()
-                    elif v.opc in ("RETURN", "TAIL"):
-                        scalar.flush()
-                    elif v.opc in ("BRANCH", "CBRANCH", "BRANCHIND"):
+                            operations.extend(scalar.flush())
+                    elif v.opc in ('RETURN', 'TAIL'):
+                        operations.extend(scalar.flush())
+                    elif v.opc in ('BRANCH', 'CBRANCH', 'BRANCHIND'):
                         if self.carry_mode:
-                            if v.opc == "BRANCHIND":
+                            if v.opc == 'BRANCHIND':
                                 targets = sorted(set(fir.succ[i]))
                             else:
                                 targets = [self.indices[v.args[0].data]]
-                                if v.opc == "CBRANCH":
+                                if v.opc == 'CBRANCH':
                                     targets.append(self.indices[b.insn.addr + b.insn.length])
-                            self.transition(scalar, i, targets, [])
-                            if v.opc == "BRANCHIND":
-                                scalar.flush()
+                            self.transition(scalar, i, targets, operations)
+                            if v.opc == 'BRANCHIND':
+                                defaults[v.id] = tuple(scalar.flush())
                         else:
-                            scalar.flush()
+                            operations.extend(scalar.flush())
+                    events[v.id] = tuple(operations)
+                operations = []
                 if not any(v.opc in TERMINATORS for v in b.ops):
                     target = fir.succ[i][0]
                     if self.carry_mode:
                         if self.linear_prev.get(target) != i:
-                            self.transition(scalar, i, [target], [])
+                            self.transition(scalar, i, [target], operations)
                     elif self.predecessors[target] != {i} or target != i + 1:
-                        scalar.flush()
+                        operations.extend(scalar.flush())
+                ends[i] = tuple(operations)
                 previous = i
-            counts.append(scalar.activations)
+            programs.append(CloneProgram(clone, FrozenMap.of(blocks), FrozenMap.of(events),
+                                         FrozenMap.of(defaults), FrozenMap.of(ends), scalar.activations))
+        counts = tuple(program.activations for program in programs)
         if len(set(counts)) > 1:
-            raise SSAError("x87 specializations activate at different points: %r" % counts)
-        return tuple(counts)
+            raise SSAError('x87 specializations activate at different points: %r' % (counts,))
+        for program in programs:
+            operations = tuple(op for table in (program.blocks, program.events, program.defaults, program.ends)
+                               for sequence in table.values() for op in sequence)
+            validate(operations)
+            if sum(isinstance(op, Activation) for op in operations) != program.activations:
+                raise SSAError('x87 transition activation count differs from tracker')
+        self.programs, self.temporaries = tuple(programs), tuple(scalar.temps)
+
 
 
 def prepare(s, fir, live, *, strict, convention, defer_ie, known_mode, cw_clone, mode_sites):
@@ -292,8 +331,8 @@ def prepare(s, fir, live, *, strict, convention, defer_ie, known_mode, cw_clone,
 
     plan = X87Plan(strict, convention, defer_ie, choice, scalar_binary32,
                    indices, predecessors, carry_mode, entry_shape, declared, linear_prev)
-    plan.activations = plan.replay(s, fir, mode_sites)
+    plan.lower(s, fir, mode_sites)
     if not known_mode and len(plan.clones) > 1 and plan.activations[0] > CW_CLONE_MAX_GUARDS:
         plan.choice = Dynamic()
-        plan.activations = plan.replay(s, fir, mode_sites)
+        plan.lower(s, fir, mode_sites)
     return plan

@@ -249,10 +249,10 @@ class Program(object):
         insns = []
         for at, n in self.instructions(addr):
             raw = self.pe.bytes_at(at, n)
-            decoded = self.pe.decode_span_instruction(at, raw)
+            decoded = self.pe.decode_span_record(at, raw)
             if decoded is None:
                 raise TranslateError("%08x: decoder cannot tile mapped instruction" % at)
-            insns.append(self.lifter.lift(at, raw, decode=decoded.decode))
+            insns.append(self.lifter.lift(at, raw, decode=decoded))
         index = {ins.addr: k for k, ins in enumerate(insns)}
         noreturn = self.noreturn
         succ, exits, tables, dynamic = [], [], [], []

@@ -8,7 +8,7 @@ come from the decoded emitter, fed the map's own instruction boundaries.
 import argparse
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -25,9 +25,15 @@ import game_config
 import decoded
 import output
 from settings import Settings
-from frontend import external_exits, function_ir
+from frontend import external_exits
 from ir import call_contracts, contract_variants, production, x87_mode, x87_facts, x87_report, prepared_store
-from ir.invocation import Declaration
+from ir.c_symbols import Declaration
+from ir.artifacts import ArtifactStore
+from ir.body import FrozenMap
+from ir.selection import Eligibility
+from phases import (ScanTask, EscapeTask, ProgramAnalysis, Selection, PreparationTask,
+                    FunctionPlan, EmissionTask, EmissionResult, CandidateTask, CandidateResult,
+                    PrivatePreparationTask, PrivateEmissionResult, FinalFunctionPlan, FinalEmissionTask)
 from ir.lift import Lifter, LiftError
 from ir.ssa import SSAError
 from program import FunctionDescription as Row, Program, ScanRow, TranslateError
@@ -45,7 +51,7 @@ def phase(name):
 class Context(object):
     """What one process needs to read, lift and emit functions."""
 
-    def __init__(self, settings):
+    def __init__(self, settings, artifacts=None):
         self.settings = settings
         self.image = decoded.Image(settings.exe, settings.base)
         self.program = Program(settings, self.image)
@@ -66,6 +72,7 @@ class Context(object):
         self.tr.jumptables = dict(program.tables)
         self.lifter = Lifter()
         self.known = frozenset(program.functions)
+        self.artifacts = ArtifactStore(artifacts)
 
     def load(self, addr):
         """The decoded function, indexed, with the entries the map gives it."""
@@ -97,17 +104,17 @@ class Context(object):
         return target in self.entries or decoded.GUEST_SHIM_BASE <= target < decoded.GUEST_SHIM_END
 
 
-def _init(settings):
+def _init(settings, artifacts=None):
     global _CTX
-    _CTX = Context(settings)
+    _CTX = Context(settings, artifacts)
 
 
-def _scan(addrs):
+def _scan(task):
     """Per-function facts the whole-program steps need, with the SSA contract inputs."""
     ctx, tr = _CTX, _CTX.tr
     tr.seh_helpers = set()
     rows = []
-    for addr in addrs:
+    for addr in task.addresses:
         fn, entries = ctx.load(addr)
         tr.analyze(fn, entries)
         calls, refs, dangling, returns = [], set(), set(), []
@@ -137,7 +144,7 @@ def _scan(addrs):
         if not (escapes or site or fn.pushed_continuations or fn.return_jumps
                 or fn.dead_addrs or addr in tr.noreturn_callees):
             try:
-                fir = function_ir(tr, ctx.lifter, fn)
+                fir = ctx.artifacts.lifted(tr, ctx.lifter, fn)
                 prepared = call_contracts.prepare(fir) if not entries else None
                 fir.entries = tuple(entries)
                 mode_prepared = x87_mode.prepare(fir)
@@ -154,11 +161,12 @@ def _scan(addrs):
         rows.append(ScanRow(addr, Row(addr, fn.name, len(fn.insns), fn.insns[0].addr, fn.insns[-1].addr),
                      calls, refs, sorted(dangling), returns, reason, escapes, prepared, mode_prepared, x87_count,
                      writers, sorted(external_targets)))
+    ctx.artifacts.flush_counts()
     return rows
 
 
 def _escapes(task):
-    addrs, helpers = task
+    addrs, helpers = task.addresses, task.helpers
     ctx, tr = _CTX, _CTX.tr
     tr.seh_helpers = set(helpers)
     found = []
@@ -173,23 +181,20 @@ def scan_program(settings, jobs):
     ctx = Context(settings)
     with ProcessPoolExecutor(max_workers=jobs, initializer=_init, initargs=(settings,)) as pool:
         scanned = {row.addr: row for batch in pool.map(_scan,
-                   chunked(sorted(ctx.program.functions), jobs * 24)) for row in batch}
+                   [ScanTask(tuple(part)) for part in chunked(sorted(ctx.program.functions), jobs * 24)]) for row in batch}
         helpers = seh_helpers(pool, chunked(sorted(scanned), jobs * 24),
                               {addr: row.seh_escapes for addr, row in scanned.items()},
                               {addr: row.calls for addr, row in scanned.items()})
     return scanned, helpers
 
 
-@dataclass
-class FunctionPlan:
-    addr: int
-    path: Path | None
-    reason: str | None
-    requests: set
-
-
 def _prepare(task):
-    addrs, helpers, internal, contracts, private_targets, checked_returns, selected_callers, mode_sites, entry_verification, store = task
+    analysis, selection = task.analysis, task.selection
+    helpers, internal, contracts = analysis.helpers, analysis.internal, analysis.contracts
+    private_targets, checked_returns = selection.private_targets, selection.checked_returns
+    selected_callers, mode_sites = selection.callers, analysis.mode_sites
+    entry_verification, store = analysis.entry_verification, task.store
+    addrs = task.addresses
     ctx, tr = _CTX, _CTX.tr
     tr.seh_helpers = set(helpers)
     tr.internal_entries = internal
@@ -202,13 +207,15 @@ def _prepare(task):
         if reason is None:
             try:
                 selected = addr in selected_callers
-                callee_contracts = dict(contracts.get(addr) or {})
+                targets = {tr.branch_target(ins) for ins in fn.insns if ins.mnem == "CALL"}
+                callee_contracts = {t: contracts[t] for t in targets if t in contracts}
                 if selected:
                     callee_contracts.update(private_targets)
                 body = production.prepare_ssa(
-                    tr, ctx.lifter, fn, entries, ctx.settings.emit, ctx.known, callee_contracts,
-                    checked_returns, private_targets if selected else (), report_calls=selected,
-                    x87_mode_sites=mode_sites.get(addr), x87_entry_verify=entry_verification.get(addr))
+                    tr, ctx.lifter, fn, entries,
+                    production.ProductionRequest(ctx.settings.emit, ctx.known, callee_contracts,
+                        checked_returns, frozenset(private_targets) if selected else frozenset(), selected,
+                        mode_sites.get(addr), entry_verification.get(addr)), ctx.artifacts)
             except (SSAError, LiftError) as error:
                 reason = str(error)
             else:
@@ -217,12 +224,27 @@ def _prepare(task):
                 requests = body.requests
         if reason is not None and addr in checked_returns:
             raise TranslateError("%08x: checked-return body failed preparation: %s" % (addr, reason))
-        plans.append(FunctionPlan(addr, path, reason, requests))
+        plans.append(FunctionPlan(addr, path, reason, frozenset(requests)))
+    ctx.artifacts.flush_counts()
     return plans
 
 
+def _finalize(task):
+    plans = []
+    for plan in task.plans:
+        body = prepared_store.read(plan.path) if plan.path is not None else None
+        if body is not None:
+            body.finalize(task.layouts)
+        plans.append(FinalFunctionPlan(plan.addr, body, plan.reason))
+    return FinalEmissionTask(tuple(plans), task.analysis, task.layouts)
+
+
+def _finalize_and_emit(task):
+    return _emit(_finalize(task))
+
+
 def _emit(task):
-    plans, helpers, internal, contract_masks = task
+    plans, helpers, internal, layouts = task.plans, task.analysis.helpers, task.analysis.internal, task.layouts
     ctx, tr = _CTX, _CTX.tr
     tr.seh_helpers = set(helpers)
     tr.internal_entries = internal
@@ -233,9 +255,10 @@ def _emit(task):
         fn, entries = ctx.load(addr)
         tr.analyze(fn, entries)
         reason, lines, requests, decisions, deps = plan.reason, None, set(), [], set()
-        if plan.path is not None:
-            body = prepared_store.read(plan.path)
-            body.finalize(contract_masks)
+        if plan.body is not None:
+            body = plan.body
+            if body.final is None or body.final.layouts != layouts:
+                raise TranslateError("%08x: emission requires finalized shared layouts" % addr)
             lines, external, requests, decisions = production.emit_ssa_prepared(body)
             deps = set(body.declarations())
             if entries and not external:
@@ -249,44 +272,50 @@ def _emit(task):
         if lines is None:
             lines = tr.translate(fn, entries)
             deps = {Declaration("entry", t) for t in tr.call_targets}
-        out.append((addr, lines, re.sub(r"^[0-9a-f]{8}: ", "", reason) if reason else None,
-                    list(tr.unmodelled), requests, decisions, frozenset(deps)))
+        out.append(EmissionResult(addr, lines, re.sub(r"^[0-9a-f]{8}: ", "", reason) if reason else None,
+                    tuple(tr.unmodelled), frozenset(requests), tuple(decisions), frozenset(deps)))
     return out
 
 
 def _private_candidate(task):
-    addr, helpers, known_mode = task
+    addr, helpers, known_mode = task.addr, task.helpers, task.known_mode
     ctx = _CTX
     ctx.tr.seh_helpers = set(helpers)
     try:
         fn, entries = ctx.load(addr)
         ctx.tr.analyze(fn, entries)
-        contract = production.private_contract(ctx.tr, ctx.lifter, fn)
-        production.prepare_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit, 0x3fff, known_mode)
-        production.prepare_ssa(ctx.tr, ctx.lifter, fn, entries, ctx.settings.emit,
-                            ctx.known, {}, {addr})
-        return addr, contract, None
+        ctx.artifacts.reuse_normalized(addr)
+        contract = production.private_contract(ctx.tr, ctx.lifter, fn, ctx.artifacts)
+        production.prepare_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit,
+                                   contract_variants.PrivateLayout.from_mask(0x3fff, contract.reads), known_mode, ctx.artifacts)
+        production.prepare_ssa(ctx.tr, ctx.lifter, fn, entries,
+                               production.ProductionRequest(ctx.settings.emit, ctx.known, checked_returns=frozenset({addr})),
+                               ctx.artifacts)
+        ctx.artifacts.flush_counts()
+        return CandidateResult(addr, contract, None)
     except (SSAError, LiftError, RecursionError) as error:
-        return addr, None, str(error)
+        ctx.artifacts.flush_counts()
+        return CandidateResult(addr, None, str(error))
 
 
 def _prepare_private(task):
-    addr, mask, known_mode, store = task
+    addr, layout, known_mode, store = task.addr, task.layout, task.known_mode, task.store
     ctx = _CTX
     fn, entries = ctx.load(addr)
     ctx.tr.analyze(fn, entries)
-    plan = production.prepare_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit, mask, known_mode)
+    plan = production.prepare_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit, layout, known_mode, ctx.artifacts)
     if plan.body is not None:
         path = Path(store) / ("private-%08x.pickle" % addr)
         prepared_store.write(path, plan.body)
-        plan.body = path
+        plan = replace(plan, body=path)
+    ctx.artifacts.flush_counts()
     return plan
 
 
 def _private(plan):
     if plan.body is not None:
-        plan.body = prepared_store.read(plan.body)
-    return plan.addr, production.emit_private_prepared(plan)
+        plan = replace(plan, body=prepared_store.read(plan.body))
+    return PrivateEmissionResult(plan.addr, tuple(production.emit_private_prepared(plan)))
 
 
 def chunked(addrs, count):
@@ -331,7 +360,7 @@ def seh_helpers(pool, parts, escapes, calls):
         if not pending:
             return helpers
         found = set()
-        for part in pool.map(_escapes, [(p, helpers) for p in chunked(pending, len(parts))]):
+        for part in pool.map(_escapes, [EscapeTask(tuple(p), frozenset(helpers)) for p in chunked(pending, len(parts))]):
             found.update(part)
         if not found:
             return helpers
@@ -403,10 +432,18 @@ def main(argv=None):
     phase("load")
     addrs = sorted(program.functions)
     parts = chunked(addrs, settings.jobs * 24)
-    with TemporaryDirectory(prefix="recomp-prepared-") as store, ProcessPoolExecutor(
-            max_workers=settings.jobs, initializer=_init, initargs=(settings,)) as pool:
+    with TemporaryDirectory(prefix="recomp-prepared-") as temporary:
+        store = Path(temporary)
+        artifacts = store / "artifacts"
+        artifacts.mkdir()
+        return translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
+
+
+def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs):
+    program = ctx.program
+    with ProcessPoolExecutor(max_workers=settings.jobs, initializer=_init, initargs=(settings, artifacts)) as pool:
         scanned = {}
-        for part in pool.map(_scan, parts):
+        for part in pool.map(_scan, [ScanTask(tuple(part)) for part in parts]):
             for row in part:
                 scanned[row.addr] = row
         phase("scan")
@@ -439,9 +476,9 @@ def main(argv=None):
         x87_counts = {addr: row.x87_count for addr, row in scanned.items()}
         mode_exposure = x87_mode.exposure_report(mode_prepared, calls, mode_opaque, x87_counts,
                                                 {addr: row.writers for addr, row in scanned.items()})
+        eligibility = Eligibility(settings, scanned, mode_opaque)
         for addr in settings.checked_returns:
-            row = scanned.get(addr)
-            if not row or not row.register_facts or row.exclusion is not None or addr in helpers or addr in conservative:
+            if not eligibility.checked(addr):
                 raise TranslateError("%08x: checked return requires an unreplaced, closed single-entry body without SEH" % addr)
         contracts = {}
         if settings.call_contracts:
@@ -455,17 +492,11 @@ def main(argv=None):
         phase("contracts")
         private_targets, private_rejections = {}, {}
         checked_returns = set(settings.checked_returns)
-        selected_callers = set(settings.state_contract_callers)
-        enabled = settings.call_contracts and settings.emit["local_state"] and not settings.module
-        candidates = {addr for addr in checked_returns if not calls[addr]} if enabled and selected_callers else set()
-        if enabled and settings.private_leaf_contracts:
-            candidates |= contract_variants.eligible_leaves(scanned, mode_opaque)
-        known_modes = {addr for addr in candidates
-                       if settings.emit["x87_cw_clone"] and not settings.emit["x87_scalar_strict"]
-                       and x87_counts[addr] and addr not in mode_opaque
-                       and x87_mode.mode_preserving_leaf(mode_prepared.get(addr))}
-        for addr, contract, reason in pool.map(_private_candidate,
-                [(a, helpers, a in known_modes) for a in sorted(candidates)]):
+        candidates = eligibility.candidates()
+        known_modes = eligibility.known_modes(candidates, mode_prepared)
+        for candidate in pool.map(_private_candidate,
+                [CandidateTask(a, frozenset(helpers), a in known_modes) for a in sorted(candidates)]):
+            addr, contract, reason = candidate.addr, candidate.contract, candidate.reason
             if reason is None:
                 private_targets[addr] = contract
             elif addr in settings.checked_returns:
@@ -474,45 +505,44 @@ def main(argv=None):
                 private_rejections[addr] = reason
         known_modes &= private_targets.keys()
         checked_returns |= private_targets.keys()
-        if enabled and settings.private_leaf_contracts:
-            selected_callers |= {addr for addr, row in scanned.items()
-                                 if addr not in mode_opaque and row.register_facts and row.cw_facts
-                                 and any(t in private_targets for t in calls[addr])}
-        if not enabled:
-            selected_callers.clear()
+        selected_callers = eligibility.callers(private_targets)
         phase("private candidates")
 
-        tasks = [(part, helpers, {a: internal[a] for a in part if a in internal},
-                  {a: {t: contracts[t] for t in calls[a] if t in contracts}
-                   for a in part if contracts}, private_targets, checked_returns,
-                  selected_callers, mode_sites, entry_verification, store) for part in parts]
+        analysis = ProgramAnalysis(frozenset(helpers), FrozenMap.of(internal), FrozenMap.of(contracts),
+                                   FrozenMap.of(mode_sites), FrozenMap.of(entry_verification))
+        selection = Selection(FrozenMap.of(private_targets), frozenset(checked_returns),
+                              frozenset(selected_callers), frozenset(known_modes), FrozenMap.of(private_rejections))
+        tasks = [PreparationTask(tuple(part), analysis.for_addresses(part, calls), selection, store) for part in parts]
         plans = {plan.addr: plan for batch in pool.map(_prepare, tasks) for plan in batch}
         specialization = contract_variants.SpecializationPlan.build(
-            {addr: plan.requests for addr, plan in plans.items()})
-        shared_masks = specialization.layouts
+            {addr: plan.requests for addr, plan in plans.items()}, private_targets)
+        shared_layouts = specialization.layouts
         private_plans = list(pool.map(_prepare_private,
-                             [(addr, mask, addr in known_modes, store)
-                              for addr, mask in sorted(shared_masks.items())]))
+                             [PrivatePreparationTask(addr, layout, addr in known_modes, store)
+                              for addr, layout in sorted(shared_layouts.items())]))
         phase("prepare and plan")
-        emit_tasks = [([plans[a] for a in part], helpers,
-                       {a: internal[a] for a in part if a in internal}, shared_masks) for part in parts]
-        results = {row[0]: row for batch in pool.map(_emit, emit_tasks) for row in batch}
-        phase("emit")
+        emit_tasks = [EmissionTask(tuple(plans[a] for a in part), analysis.for_addresses(part), shared_layouts) for part in parts]
+        results = {row.addr: row for batch in pool.map(_finalize_and_emit, emit_tasks) for row in batch}
+        phase("final bind / emit")
         private_masks = specialization.private_masks
         private_requests = specialization.caller_requests
         for addr, row in results.items():
-            if row[4] != private_requests.get(addr, set()):
+            if row.requests != private_requests.get(addr, set()):
                 raise TranslateError("%08x: emission differs from its specialization plan" % addr)
-        for addr, lines in pool.map(_private, private_plans):
-            results[addr][1].extend(lines)
+        for row in pool.map(_private, private_plans):
+            results[row.addr].lines.extend(row.lines)
         phase("private entries")
 
-    bodies = {addr: results[addr][1] for addr in addrs}
+    workload = Counter()
+    for path in artifacts.glob("counts-*.json"):
+        workload.update(json.loads(path.read_text()))
+    log("  frontend work: " + json.dumps(dict(workload), sort_keys=True))
+    bodies = {addr: results[addr].lines for addr in addrs}
     entries_by_fn = {addr: set(found) for addr, found in ctx.interior.items()}
     entry_names = sorted(ctx.entries)
     call_returns = sorted({r for row in scanned.values() for r in row.returns})
     functions = [rows[a] for a in addrs]
-    dependencies = {addr: results[addr][6] for addr in addrs}
+    dependencies = {addr: results[addr].dependencies for addr in addrs}
     os.makedirs(args.out, exist_ok=True)
     output.write_funcs_header(args.out, entry_names)
     output.emit_body_chunks(args.out, functions, bodies, entries_by_fn, dependencies)
@@ -525,10 +555,11 @@ def main(argv=None):
     output.write_symbols(
         args.out, str(settings.exe), ctx.image.base, symbols, settings.curated)
     decisions = [decision for addr in sorted(results) if addr in selected_callers
-                 for decision in results[addr][5]]
+                 for decision in results[addr].decisions]
     decisions.sort(key=lambda item: (item.get("site", ""), item.get("target", ""),
                                      json.dumps(item, sort_keys=True, separators=(",", ":"))))
     contract_report = {
+        "frontend_work": dict(workload),
         "configured_callers": ["%08x" % a for a in sorted(settings.state_contract_callers)],
         "selected_callers": ["%08x" % a for a in sorted(selected_callers)],
         "checked_targets": ["%08x" % a for a in sorted(checked_returns)],
@@ -540,8 +571,8 @@ def main(argv=None):
              "fields": [field for i, field in enumerate(call_contracts.FIELDS) if mask & (1 << i)]}
             for addr in sorted(private_masks) for mask in sorted(private_masks[addr])],
         "ssa_fallbacks": [
-            {"function": "%08x" % addr, "reason": results[addr][2]}
-            for addr in sorted(results) if results[addr][2] is not None],
+            {"function": "%08x" % addr, "reason": results[addr].reason}
+            for addr in sorted(results) if results[addr].reason is not None],
         "call_decisions": decisions,
         "x87_compiler_facts": x87_facts_loaded.report(),
         "x87_mode": x87_report.mode_report(settings, mode_prepared, mode_summaries, mode_opaque,
@@ -553,9 +584,9 @@ def main(argv=None):
         fh.write("\n")
     phase("write")
 
-    emitted = sum(1 for a in addrs if results[a][2] is None)
-    reasons = Counter(results[a][2] for a in addrs if results[a][2] is not None)
-    unmodelled = [item for a in addrs for item in results[a][3]]
+    emitted = sum(1 for a in addrs if results[a].reason is None)
+    reasons = Counter(results[a].reason for a in addrs if results[a].reason is not None)
+    unmodelled = [item for a in addrs for item in results[a].unmodelled]
     kinds_count = Counter(f["kind"] for f in symbols)
     log("  %d functions, %d entries (%s), %d emitted by SSA (%.2f%%), %d decoded"
         % (len(addrs), len(entry_names), ", ".join("%d %s" % (n, k) for k, n in sorted(kinds_count.items())),
@@ -567,6 +598,7 @@ def main(argv=None):
     if args.report:
         with open(args.report, "w") as fh:
             json.dump({
+                "frontend_work": dict(workload),
                 "functions": len(addrs),
                 "entry_points": len(entry_names),
                 "entry_kinds": dict(kinds_count),

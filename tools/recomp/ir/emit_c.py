@@ -9,24 +9,32 @@ through the scalar tracker (`x87_scalar.py`). Memory uses the
 existing guest accessors, in instruction order, with explicit state
 publication. No inferred convention permits discarding guest state.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .lift import Lifter
 from .ssa import SSAError, MEMORY, build
 from .cfg import FunctionIR
 from .guest import X86_32
-from .simplify import canonicalize, simplify, state_roots, whole, EFFECTS, EXITS
+from .simplify import canonicalize, simplify, state_roots, EFFECTS, EXITS
 from .publication import analyze as publication_analysis
 from . import flag_region, operations
 from . import transfer_plan, x87_plan
 from .call_contracts import GPRS as CONTRACT_GPRS, ARITH_FLAGS as CONTRACT_FLAGS
-from .contract_variants import output_mask as contract_output_mask
+from .contract_variants import (output_mask as contract_output_mask, PrivateLayout,
+                                ProvisionalBindings, FinalBindings)
+from .body import (BodyRequest, BodyVariant, EntryForm, ReturnForm, EmissionPolicy,
+                   FrozenMap, PreparedOptions)
+from . import c_symbols, x87_mode
+from .x87_facts import InstructionFact
 from .invocation import (EntryBinding, binding_invocation,
                          private_invocation, tail_invocation)
+from . import call_values, lowering
+from .c_boundaries import Printer as BoundaryPrinter, CC_OP_CONST
+from .c_x87 import Printer as X87Printer
 
 
 from .normalize import codegen_ir, CC_DEFINES
-from .x87_cw import CW_FAST, CW_PC_RC, ModeCondition, condition_of, proven_fact
+from .x87_cw import CW_FAST, CW_PC_RC, ModeCondition, condition_of, proven_fact, Dynamic, Guarded
 
 
 # Arithmetic flags tracked by the calling-convention census.
@@ -39,9 +47,6 @@ CONTRACT_FIELDS = frozenset(CONTRACT_GPRS) | frozenset(CONTRACT_FLAGS)
 CONTRACT_NEVER_SKIP = frozenset(X86_32.names("stack") + X86_32.names("frame"))
 
 
-CC_OP_CONST = {"add": "X86_CC_ADD", "sub": "X86_CC_SUB", "cmp": "X86_CC_SUB",
-               "logic": "X86_CC_LOGIC", "inc": "X86_CC_INC", "dec": "X86_CC_DEC",
-               "adc": "X86_CC_ADC", "sbb": "X86_CC_SBB"}
 CC_BIT_VALUES = {"cf": 1, "pf": 2, "af": 4, "zf": 8, "sf": 0x10, "of": 0x20}
 #: Seams whose observer may read the guest's fields directly, so flags stay eager.
 CC_EAGER_EVENTS = operations.FLAG_EAGER_CODEGEN
@@ -91,19 +96,6 @@ def normalize_bindings(mapping, label, allow_checked=True):
 #: Codegen ops whose seams materialise flags eagerly before or after running.
 #: They end the region as observers, so the settle is kept.
 _SSA_EAGER_OPS = operations.FLAG_EAGER_OBSERVERS
-
-
-def cc_action_lines(action):
-    """The C statement for one lazy-flag region decision."""
-    if action == flag_region.DROP:
-        return ["x86_cc_drop(c);"]
-    if action == flag_region.REMOVE:
-        return []
-    if isinstance(action, tuple):
-        helper, flags = action
-        bits = " | ".join("X86_CCF_%s" % f.upper() for f in sorted(flags))
-        return ["%s(c, %s);" % (helper, bits)]
-    return ["x86_cc_settle(c);"]
 
 
 def call_cc_action(summary, live):
@@ -210,7 +202,7 @@ def live_flag_reload_calls(s, live, flag_off_name):
 
 @dataclass
 class PreparedFunction:
-    options: dict
+    options: PreparedOptions
     ir: FunctionIR
     ssa: object
     live: set
@@ -224,13 +216,19 @@ class PreparedFunction:
     seh_mark: bool
     arithmetic: x87_plan.X87Plan
     report_calls: bool
-    layouts: dict = field(default_factory=dict)
-    invocations: dict = field(default_factory=dict)
+    state_groups: tuple
+    provisional: ProvisionalBindings | None = None
+    final: FinalBindings | None = None
+    transport: lowering.CPUFieldTransport | None = None
+
+    @property
+    def invocations(self):
+        return (self.final or self.provisional).invocations
 
     def _contract_calls(self):
         for b in self.ssa.blocks.values():
             for v in b.ops:
-                if v.opc == "CALL" and v.data in self.options["contract_calls"]:
+                if v.opc == "CALL" and v.data in self.options.request.contract_calls:
                     call = self.transfers.calls[v.id]
                     if call.required_outputs is not None:
                         yield b, v, call
@@ -245,57 +243,69 @@ class PreparedFunction:
         return {(inv.target, inv.output_mask) for inv in self.invocations.values()
                 if inv.form == "private"}
 
-    def _call_invocation(self, b, v, call):
+    def _call_invocation(self, b, v, call, layouts):
         options = self.options
         target = v.data
         expected = b.insn.addr + b.insn.length
-        binding = options["call_symbols"].get(target)
+        binding = options.call_symbols.get(target)
         if binding is None:
             raise SSAError("%08x: no C symbol bound for call target %08x"
                            % (b.insn.addr, target))
-        if target in options["contract_calls"] and call.required_outputs is not None:
-            mask = self.layouts.get(target, contract_output_mask(call.required_outputs))
-            proof = proven_fact(options["x87_mode_sites"].get(b.insn.addr), CW_FAST)
+        if target in options.request.contract_calls and call.required_outputs is not None:
+            mask = layouts[target].output_mask if target in layouts else contract_output_mask(call.required_outputs)
+            proof = proven_fact(options.mode_sites.get(b.insn.addr), CW_FAST)
             return private_invocation(target, binding, expected, proof, mask)
-        form = "checked" if target in options["checked_calls"] else "ordinary"
+        form = "checked" if target in options.request.checked_calls else "ordinary"
         return binding_invocation(target, binding, form, expected)
 
     def _tail_invocation(self, v):
         target = v.args[0].data
-        binding = self.options["tail_symbols"].get(target)
+        binding = self.options.tail_symbols.get(target)
         if binding is None:
             raise SSAError("no C symbol bound for tail target %08x" % target)
         return tail_invocation(target, binding)
 
-    def finalize(self, masks):
-        masks = masks or {}
-        for _b, v, call in self._contract_calls():
-            needed = contract_output_mask(call.required_outputs)
-            layout = masks.get(v.data, needed)
-            if needed & ~layout or layout & ~((1 << len(CONTRACT_GPRS + CONTRACT_FLAGS)) - 1):
-                raise SSAError("shared contract outputs do not cover the call continuation")
-        self.layouts = dict(masks)
+    def _bind(self, layouts):
         invocations = {}
         for b in self.ssa.blocks.values():
             for v in b.ops:
                 if v.opc == "CALL":
-                    invocations[v.id] = self._call_invocation(b, v, self.transfers.calls[v.id])
+                    invocations[v.id] = self._call_invocation(b, v, self.transfers.calls[v.id], layouts)
                 elif v.opc == "TAIL":
                     invocations[v.id] = self._tail_invocation(v)
-        self.invocations = invocations
+        return FrozenMap.of(invocations)
+
+    def bind_provisional(self):
+        self.provisional = ProvisionalBindings(self._bind({}))
+
+    def finalize(self, layouts):
+        for _b, v, call in self._contract_calls():
+            if v.data not in layouts or not call.required_outputs <= set(layouts[v.data].outputs):
+                raise SSAError("shared contract outputs do not cover the call continuation")
+            contract = self.options.request.call_contracts.get(v.data)
+            if contract is not None and not contract.reads <= set(layouts[v.data].inputs):
+                raise SSAError("shared contract inputs do not cover the callee reads")
+        invocations = self._bind(layouts)
+        values = call_values.bind(self, invocations, layouts)
+        final = FinalBindings(invocations, FrozenMap.of(layouts), values)
+        if self.final is not None and self.final != final:
+            raise SSAError("body already finalized with a different layout")
+        boundaries = lowering.plan(self, invocations)
+        transport = lowering.select_cpu_fields(boundaries, values)
+        self.final, self.transport = final, transport
 
     def declarations(self):
         result = set()
         for invocation in self.invocations.values():
-            result |= invocation.declarations()
+            result |= c_symbols.invocation_declarations(invocation)
         return frozenset(result)
 
     def decision_rows(self):
         if not self.report_calls:
             return []
         options = self.options
-        contracts = options["call_contracts"]
-        lane_field = options["lane_field"]
+        contracts = options.request.call_contracts
+        lane_field = options.lane_field
         mapping = self.mapping
         fir = self.ir
 
@@ -348,7 +358,6 @@ def validate_operations(s):
 
 
 def _validate_mode_sites(mode_sites, boundaries, function):
-    from .x87_facts import InstructionFact
     for site, fact in mode_sites.items():
         if not isinstance(fact, InstructionFact):
             raise SSAError("%08x: control-word mode requires a typed InstructionFact record" % site)
@@ -360,63 +369,21 @@ def _validate_mode_sites(mode_sites, boundaries, function):
             raise SSAError("%08x: invalid control-word mode metadata" % site)
 
 
-def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state=True,
-         msvc_convention=True, lazy_flags=False, lifter=None, indirect_call_symbol=None,
-         call_contracts=None, x87_cw_clone=True, tail_symbols=None,
-         checked_return=False, checked_calls=(), contract_calls=(), return_fields=None,
-         variant_requests=None, call_decisions=None, x87_known_mode=False, contract_masks=None, x87_mode_sites=None, x87_entry_verify=None):
-    """Prepare a complete body plan or raise SSAError for whole-function fallback.
-
-    `call_symbols` maps an allowed direct-call target address to a literal C
-    symbol or a production `EntryBinding` rendered through the `CALL_FN`
-    macros. With no mapping, a direct CALL is rejected rather than dispatched
-    or approximated. `indirect_call_symbol` is the explicit opt-in
-    for indirect CALL effects: when set, CALLIND lowers to that runtime
-    dispatch and reloads all tracked state; when None, indirect calls stay a
-    whole-function fallback. The defaults are the production policy (scalar x87,
-    local CPU state). `x87_scalar_strict=True` keeps pre-load x87 observations and
-    `local_state=False` keeps every pre-access GPR/flag snapshot.
-
-    `msvc_convention` (the `msvc_x87_convention` setting) assumes the MSVC
-    x87 stack convention at calls and returns: flushes skip popped residue under
-    the empty-above-TOP invariant (`x87_scalar.py`). False restores the
-    conservative publication.
-
-    `call_contracts` maps a direct-call target address to a contract
-    (``reads``/``kills``/``writes`` field sets, e.g. from ``call_contracts.py``).
-    When given, a direct CALL drops publication of a field the callee neither
-    reads nor preserves (``F not in reads and F in kills``). A field the callee
-    neither reads nor writes is kept: it is not published, and the caller's
-    value continues past the call, so it is published later wherever the plan
-    still requires it. Flags are kept only all six together, so a pending
-    descriptor passes through untouched. Bodies with SEH effects keep nothing.
-    The mapping is plain data so it survives the emission process pool; a
-    missing target keeps the conservative full publication. ESP/EBP are never
-    dropped or kept.
-
-    `checked_calls` selects bound symbols that take the decoded guest
-    continuation as a second argument. `checked_return` emits a shared body
-    with explicit expected-continuation and enable arguments; its ordinary
-    wrapper disables the comparison, preserving general return handling.
-
-    `contract_calls` selects checked leaf edges for continuation-output
-    specialization. `return_fields` emits a private leaf's normal-return
-    publication, with full changed state retained for unexpected returns.
-
-    `x87_mode_sites` supplies typed `x87_facts.InstructionFact` records from
-    the separate CW analysis; a bare condition is not a proof, and each fact
-    must match this body's function and instruction address.
-    General emission folds proven bits; hooks use the general recipe.
-
-    The shared body pass selects arithmetic and state-transfer capabilities
-    before lowering. `x87_cw_clone` retains guarded D3D8 arithmetic for ordinary
-    entries within the operation, density and activation budgets. Private x87
-    entries use that lowering with an entry CW guard and reduced publication.
-
-    `x87_known_mode` emits only the fast private body. Its entry preparation
-    must prove PC = RC = 0, and byte-backed analysis must prove the leaf has
-    no calls or control-word effects. Full guest x87 publication is retained.
-    """
+def prepare(fir, request, *, lifter=None, normalized=None):
+    """Prepare variant-local SSA; immutable frontend artifacts may be supplied."""
+    symbol, variant, policy = request.symbol, request.variant, request.policy
+    if (variant.entry == EntryForm.MULTIPLE) != bool(fir.entries) and not variant.checked:
+        raise SSAError("body variant disagrees with alternate entries")
+    call_symbols, tail_symbols = request.call_symbols, request.tail_symbols
+    call_contracts = request.call_contracts
+    checked_return = variant.checked
+    return_fields = None if request.layout is None else frozenset(request.layout.outputs)
+    checked_calls, contract_calls = request.checked_calls, request.contract_calls
+    x87_mode_sites, x87_entry_verify = request.mode_sites, request.entry_verify
+    x87_known_mode = variant.known_mode
+    x87_scalar_strict, local_state = policy.x87_scalar_strict, policy.local_state
+    msvc_convention, lazy_flags = policy.msvc_convention, policy.lazy_flags
+    indirect_call_symbol, x87_cw_clone = policy.indirect_call_symbol, policy.x87_cw_clone
     lifter = lifter if lifter is not None else Lifter(fir.language)
     if fir.language != lifter.language:
         raise SSAError("function language %s disagrees with lifter %s" % (fir.language, lifter.language))
@@ -424,30 +391,25 @@ def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_st
         X86_32.validate(lifter)
     except ValueError as error:
         raise SSAError(str(error)) from error
-    options = {name: value for name, value in locals().items()
-               if name in ("symbol", "checked_return", "return_fields", "lazy_flags",
-                           "call_symbols", "tail_symbols", "checked_calls", "contract_calls",
-                           "x87_mode_sites", "x87_entry_verify")}
     x87_mode_sites = (x87_mode_sites or {}) if not x87_scalar_strict else {}
     _validate_mode_sites(x87_mode_sites, {ins.addr for ins in fir.insns}, fir.addr)
     if x87_known_mode:
-        from . import x87_mode
         if (return_fields is None or x87_scalar_strict or not x87_cw_clone
                 or not x87_mode.mode_preserving_leaf(x87_mode.prepare(fir))):
             raise SSAError("known x87 mode requires a guarded private control-word-preserving leaf")
-    report_calls = call_decisions is not None
+    report_calls = request.report_calls
     checked_calls = frozenset(checked_calls)
     contract_calls = frozenset(contract_calls)
-    contract_masks = contract_masks or {}
     if not contract_calls <= checked_calls:
         raise SSAError("state contracts require checked calls")
+    cgi = normalized if normalized is not None else codegen_ir(fir, lifter, tail_symbols)
     if return_fields is not None and not x87_known_mode and any(
             op.opc in ("X87_REG", "X87_MEM", "X87_OPAQUE")
-            for ins in codegen_ir(fir, lifter).insns for op in ins.ops):
+            for ins in cgi.insns for op in ins.ops):
         raise SSAError("private x87 entry requires guarded D3D8 arithmetic")
     if return_fields is not None and (not checked_return or any(
             op.opc in (operations.X87_RESET_OPS | frozenset(("SEH",)))
-            for ins in codegen_ir(fir, lifter).insns for op in ins.ops)):
+            for ins in cgi.insns for op in ins.ops)):
         raise SSAError("private state entry requires a checked leaf without opaque observers")
     if checked_return and (fir.entries or fir.seh or fir.exits):
         raise SSAError("checked return requires a single-entry closed body without SEH")
@@ -524,7 +486,6 @@ def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_st
                     key for field in fields_ for key in field_lanes[field])
     tail_symbols = normalize_bindings(tail_symbols, "tail", allow_checked=False)
     seh_mark = any("orphan" in kinds for kinds in fir.seh.values())
-    cgi = codegen_ir(fir, lifter, tail_symbols)
     fir = cgi
     # Per-site lazy-flag settle decisions over the same codegen ops the
     # emitter lowers, so an eager seam or a call boundary is classified the
@@ -588,36 +549,28 @@ def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_st
                                        convention=x87_convention, defer_ie=defer_ie,
                                        known_mode=x87_known_mode, cw_clone=x87_cw_clone,
                                        mode_sites=x87_mode_sites)
-    options.update(call_symbols=call_symbols, tail_symbols=tail_symbols,
-                   x87_mode_sites=x87_mode_sites, checked_calls=checked_calls,
-                   contract_calls=contract_calls, call_contracts=call_contracts or {},
-                   lane_field=lane_field)
+    options = PreparedOptions(request, FrozenMap.of(call_symbols), FrozenMap.of(tail_symbols),
+                              FrozenMap.of(x87_mode_sites), FrozenMap.of(lane_field))
     prepared = PreparedFunction(options, fir, s, live, fields, mapping, flag_keys,
                                 kept_calls, transfers, cc_entry, cc_calls, seh_mark,
-                                arithmetic_plan, report_calls)
-    prepared.finalize(contract_masks)
+                                arithmetic_plan, report_calls,
+                                tuple((name, tuple(keys)) for name, keys in zip(
+                                    (*X86_32.names("gpr"), "EIP", "FS_OFFSET", "CF", "PF", "AF", "ZF", "SF", "OF", "DF"), groups)))
+    prepared.bind_provisional()
     validate_operations(s)
     return prepared
 
 
 def emit_prepared(prepared):
+    if prepared.final is None or prepared.transport is None:
+        raise SSAError("C emission requires finalized CPU-field operations")
     options = prepared.options
-    symbol, checked_return = options["symbol"], options["checked_return"]
-    return_fields, lazy_flags = options["return_fields"], options["lazy_flags"]
-    x87_mode_sites, x87_entry_verify = options["x87_mode_sites"], options["x87_entry_verify"]
+    symbol = options.symbol
+    x87_mode_sites, x87_entry_verify = options.mode_sites, options.request.entry_verify
     fir, s, live = prepared.ir, prepared.ssa, prepared.live
-    fields, mapping, flag_keys = prepared.fields, prepared.mapping, prepared.flag_keys
-    kept_calls, transfers = prepared.kept_calls, prepared.transfers
-    cc_entry, cc_calls, seh_mark = prepared.cc_entry, prepared.cc_calls, prepared.seh_mark
+    mapping = prepared.mapping
+    seh_mark = prepared.seh_mark
     arithmetic_plan = prepared.arithmetic
-    scalar = arithmetic_plan.scalar()
-
-    def flush_x87():
-        return scalar.flush()
-
-    def lower_x87(data, address, result):
-        return scalar.statements(data, address, result)
-
     def ref(v):
         v = s.resolve(v)
         if v.opc in ("CONST", "TARGET"):
@@ -683,95 +636,26 @@ def emit_prepared(prepared):
             return "(%s << %d) | %s" % (a[0], v.args[1].size * 8, a[1])
         raise SSAError("unsupported integer operation %s" % opc)
 
-    def field_value(state, field, keys):
-        if all(key in state for key in keys):
-            source = whole(s, [state[key] for key in keys])
-            if source is not None:
-                return ref(source)
-        return " | ".join("(%s << %d)" % (ref(state[key]), n * 8) if key in state
-                          else "(%s & 0x%xu)" % (field, 255 << (n * 8))
-                          for n, key in enumerate(keys))
+    boundary = BoundaryPrinter(prepared.transport,
+                               {name: mapping[keys[0]][0] for name, keys in prepared.state_groups},
+                               ref, mask)
 
-    def store_fields(state, required):
-        """Direct field stores for the required keys (no descriptor)."""
-        lines = []
-        for (_, off, size), field in fields:
-            keys = [("register", off + n) for n in range(size)]
-            if any(key in required for key in keys):
-                lines.append("%s = (uint32_t)(%s);" % (field, field_value(state, field, keys)))
-        return lines
-
-    def publish_fields(state, required, cc=None):
-        lines = []
-        record = None
-        mask = 0
-        covered = set()
-        if cc is not None:
-            record, mask = cc.record, cc.mask
-            covered = {"c->eflags_%s" % name for name, bit in CC_BIT_VALUES.items() if mask & bit}
-        stored_flag = False
-        for (_, off, size), field in fields:
-            keys = [("register", off + n) for n in range(size)]
-            if not any(key in required for key in keys):
-                continue
-            if field in covered:
-                continue
-            lines.append("%s = (uint32_t)(%s);" % (field, field_value(state, field, keys)))
-            if field in FLAG_FIELDS:
-                stored_flag = True
-        if record is not None:
-            lines.append("c->cc_op = %s;" % (ref(record.op) if record.op is not None
-                                             else CC_OP_CONST[record.kind]))
-            lines.append("c->cc_size = %du;" % record.size)
-            lines.append("c->cc_mask = 0x%xu;" % mask)
-            lines.append("c->cc_a = (uint32_t)%s;" % (
-                ref(record.a) if record.a is not None else "0"))
-            lines.append("c->cc_b = (uint32_t)%s;" % (
-                ref(record.b) if record.b is not None else "0"))
-            lines.append("c->cc_res = (uint32_t)%s;" % ref(record.res))
-            if record.carry is not None:
-                lines.append("c->cc_carry = (uint8_t)%s;" % ref(record.carry))
-        elif lazy_flags and stored_flag:
-            # A direct field write must not leave an older descriptor pending.
-            lines.append("c->cc_op = X86_CC_NONE;")
-        return lines
-
-    def publish(state, event):
-        publication = transfers.publications[event.id]
-        lines = publish_fields(state, publication.required, publication.flags)
-        call = transfers.calls.get(event.id)
-        if lazy_flags and call is not None and (call.skipped & set(CONTRACT_FLAGS)) and publication.flags is None:
-            # The dropped flags have no descriptor at this seam, so an older
-            # pending descriptor must not materialise into them after the call.
-            lines.append("c->cc_op = X86_CC_NONE;")
-        return lines
+    def publish(event):
+        return boundary.publication(event)
 
     def edge(source, target):
-        # Phi assignments are parallel copies: stage every source before any
-        # destination changes, including swaps on loop backedges.
-        phis = [v for v in s.blocks[target].phis if v.size and s.resolve(v) is v]
-        lines = ["{"]
-        for v in phis:
-            arg = v.args[v.data[1].index(source)]
-            lines.append("uint64_t p%d = %s;" % (v.id, ref(arg)))
-        lines.extend("v%d = p%d;" % (v.id, v.id) for v in phis)
-        lines.extend(["goto %s%d;" % (block_label, target), "}"])
-        return lines
+        return boundary.edge(source, target, block_label)
 
-    clones = arithmetic_plan.clones
-    block_label = "F" if clones[0] == "fast" else "B"
+    x87_printer = X87Printer(ref)
+    block_label = "F" if arithmetic_plan.programs[0].clone == "fast" else "B"
 
-    lines = ["static void %s(X86 *c, uint32_t expected_return_) {" % symbol if return_fields is not None
-             else "static void %s(X86 *c, uint32_t expected_return_, int checked_return_) {" % symbol if checked_return
-             else "static void %s(X86 *c, uint32_t entry_) {" % symbol if fir.entries
-             else "void %s(X86 *c) {" % symbol]
+    lines = [c_symbols.signature(options.request.variant, symbol)]
     for v in s.values:
         if v.id in live and v.size and v.opc not in ("CONST", "TARGET", "CC_KIND") and s.resolve(v) is v:
             lines.append("uint64_t v%d;" % v.id)
     scalar_declarations = len(lines)
-    lines.extend(scalar.declarations())
-    if lazy_flags:
-        lines.extend(cc_action_lines(cc_entry))
+    lines.extend(x87_printer.declaration(op) for op in arithmetic_plan.environment_declarations())
+    lines.extend(boundary.operations(boundary.plan.entry))
     if seh_mark:
         lines.append("uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
     for v in s.values:
@@ -779,7 +663,7 @@ def emit_prepared(prepared):
             continue
         field, lane = mapping[v.data]
         lines.append("v%d = (%s >> %d) & %s;" % (v.id, field, lane * 8, mask(v.size)))
-    for v in getattr(s, "entry_ops", ()):
+    for v in s.entry_ops:
         if v.id in live and s.resolve(v) is v:
             lines.append("v%d = (%s) & %s;" % (v.id, expression(v), mask(v.size)))
     if x87_entry_verify:
@@ -795,120 +679,50 @@ def emit_prepared(prepared):
         lines.append("}")
     else:
         lines.extend(edge(-1, s.entry))
-    indices, predecessors = arithmetic_plan.indices, arithmetic_plan.predecessors
-    scalar_binary32 = arithmetic_plan.binary32
-    carry_mode = arithmetic_plan.carry_mode
-    entry_shape, linear_prev = arithmetic_plan.entry_shape, arithmetic_plan.linear_prev
-    lines[scalar_declarations:scalar_declarations] = arithmetic_plan.declarations()
+    indices = arithmetic_plan.indices
+    lines[scalar_declarations:scalar_declarations] = [x87_printer.declaration(op) for op in arithmetic_plan.declarations()]
 
-    def seed_block(shape):
-        arithmetic_plan.seed_block(scalar, shape, lines)
-
-    def transition(source, targets):
-        arithmetic_plan.transition(scalar, source, targets, lines)
-
-    activations = []
-    for clone in clones:
-        scalar.reset()
-        scalar.clone, scalar.activations = clone, 0
-        block_label = "F" if clone == "fast" else "B"
-        previous = None
+    for program in arithmetic_plan.programs:
+        block_label = 'F' if program.clone == 'fast' else 'B'
+        emitted = set()
         for i, b in s.blocks.items():
-            scalar.proven_cw = x87_mode_sites.get(b.insn.addr)
-            lines.append("%s%d:;" % (block_label, i))
-            if carry_mode:
-                # Seeding must run on every entry, including a branch that jumps
-                # straight to this label, so it follows the label.
-                if i not in linear_prev:
-                    seed_block(entry_shape.get(i))
-            elif previous is None or set(fir.succ[previous]) != {i} or predecessors[i] != {previous}:
-                scalar.reset()
+            lines.append('%s%d:;' % (block_label, i))
+            lines.extend(x87_printer.operations(program.blocks[i]))
             for v in b.ops:
+                emitted.add(v.id)
+                if v.opc not in ("X87_REG", "X87_MEM"):
+                    lines.extend(x87_printer.operations(program.events[v.id]))
                 if v.opc == "MEMORY":
                     continue
                 if v.opc in ("X87_REG", "X87_MEM"):
-                    scalar.binary32 = v.id in scalar_binary32
                     if v.opc == "X87_MEM":
-                        lines.extend(publish(b.snapshots[v.id], v))
+                        lines.extend(publish(v))
                     lines.append("{")
-                    lines.extend(lower_x87(v.data, ref(v.args[1]) if v.opc == "X87_MEM" else None,
-                                           "v%d" % v.id if v.size else None))
+                    lines.extend(x87_printer.operations(program.events[v.id]))
                     lines.append("}")
                 elif v.opc == "CALL":
-                    lines.extend(flush_x87())
-                    scalar.reset()
-                    # Publish every required field before the callee runs, then
-                    # invoke only the explicitly bound symbol. The callee receives
-                    # the guest return address already stored by the preceding
-                    # CALL push, so its own RET owns ESP/EIP restoration.
-                    invocation = prepared.invocations[v.id]
-                    call = transfers.calls[v.id]
-                    private = invocation.form == "private"
-                    if private:
-                        lines.append("if (%s(c, %du)) {" % (
-                            invocation.preparation.symbol, 1 if invocation.preparation.mode_proven else 0))
-                    lines.extend(publish(b.snapshots[v.id], v))
-                    if not private and call.guard:
-                        guarded = store_fields(b.snapshots[v.id], call.guard)
-                        if lazy_flags and any(key in flag_keys for key in kept_calls.get(v.id, ())):
-                            guarded.append("c->cc_op = X86_CC_NONE;")
-                        lines.append("if (RECOMP_UNLIKELY(recomp_hooks_ever)) {")
-                        lines.extend(guarded)
-                        lines.append("}")
-                    if private:
-                        lines.append("%s;" % invocation.render())
-                        lines.append("} else {")
-                        lines.extend(publish_fields(b.snapshots[v.id], call.fallback.required,
-                                                    call.fallback.flags))
-                        lines.append("%s;" % invocation.fallback.render())
-                        lines.append("}")
-                    else:
-                        lines.append("%s;" % invocation.render())
-                    if lazy_flags:
-                        # A callee (SSA or otherwise) may leave a pending descriptor.
-                        lines.extend(cc_action_lines(cc_calls.get(b.index)))
-                elif v.opc == "CALL_RELOAD":
-                    # Complete, callee-agnostic reload of one mapped state field.
-                    field, lane = mapping[v.data]
-                    lines.append("v%d = (%s >> %d) & %s;" % (v.id, field, lane * 8, mask(v.size)))
-                elif v.opc == "CALL_KEEP":
-                    field, lane = mapping[v.data]
-                    lanes = v.args[1:]
-                    source = whole(s, lanes) if len(lanes) > 1 else None
-                    kept = ref(source) if source is not None else " | ".join(
-                        "(%s << %d)" % (ref(x), n * 8) for n, x in enumerate(lanes))
-                    settle = "x86_cc_settle(c), " if lazy_flags and field in FLAG_FIELDS else ""
-                    lines.append("v%d = RECOMP_UNLIKELY(recomp_hooks_ever) ? (%s(%s >> %d) & %s) : (%s);"
-                                 % (v.id, settle, field, lane * 8, mask(v.size), kept))
+                    lines.extend(boundary.event(v))
+                elif v.opc in ("CALL_RELOAD", "CALL_KEEP"):
+                    lines.extend(boundary.event(v))
                 elif v.opc == "CALLIND":
-                    lines.extend(flush_x87())
-                    scalar.reset()
                     # Publish the required pre-call state, including the target,
                     # then dispatch through the runtime. The return address was
                     # already stored by the preceding lifted CALL sequence, and the
                     # SSA builder reloads every tracked lane/flag afterward.
-                    lines.extend(publish(b.snapshots[v.id], v))
-                    lines.append("%s(c, (uint32_t)%s);" % (v.data, ref(v.args[1])))
-                    if lazy_flags:
-                        lines.extend(cc_action_lines(cc_calls.get(b.index)))
+                    lines.extend(boundary.event(v))
                 elif v.opc == "STRINGOP":
-                    lines.extend(flush_x87())
-                    scalar.reset()
                     # Byte-audited string instruction. Publication before the helper
                     # and reloads afterward keep guest memory observers and fault
                     # snapshots in access-then-advance order; the helper owns
                     # EDI/ESI/ECX/DF exactly as the eager emitter's string calls do.
-                    lines.extend(publish(b.snapshots[v.id], v))
+                    lines.extend(publish(v))
                     lines.append("%s(c);" % v.data["helper"])
                 elif v.opc in ("LOAD", "STORE", "DIV32", "IDIV32"):
                     # Guest accesses do not observe x87 state (see x87_scalar.py);
                     # only strict mode publishes before them. The division seam
                     # always sees the complete CPU.
-                    if (scalar.observe_loads or v.opc not in operations.X87_FLUSH_STRICT_OPS):
-                        lines.extend(flush_x87())
-                    lines.extend(publish(b.snapshots[v.id], v))
+                    lines.extend(publish(v))
                     if v.opc in ("DIV32", "IDIV32"):
-                        scalar.reset()
                         helper = "div32" if v.opc == "DIV32" else "idiv32"
                         lines.append("%s(c, (uint32_t)%s, (uint32_t)%s);"
                                      % (helper, ref(v.args[2]), ref(v.args[3])))
@@ -919,31 +733,14 @@ def emit_prepared(prepared):
                         lines.append("wr%d((uint32_t)%s, (uint%d_t)%s);" % (
                             v.args[2].size * 8, ref(v.args[1]), v.args[2].size * 8, ref(v.args[2])))
                 elif v.opc == "RETURN":
-                    lines.extend(flush_x87())
-                    if return_fields is not None:
-                        eip_keys = [key for key, (field, _) in mapping.items() if field == "c->eip"]
-                        popped = field_value(b.exit, "c->eip", eip_keys)
-                        lines.append("if (RECOMP_UNLIKELY(%s != expected_return_)) {" % popped)
-                        lines.extend(publish_fields(b.exit, transfers.returns[v.id].fallback.required,
-                                                    transfers.returns[v.id].fallback.flags))
-                        lines.extend(["recomp_return(c);", "return;", "}"])
-                    lines.extend(publish(b.exit, v))
-                    if return_fields is not None:
-                        pass
-                    elif checked_return:
-                        lines.append("if (!checked_return_ || RECOMP_UNLIKELY(c->eip != expected_return_)) recomp_return(c);")
-                    else:
-                        lines.append("recomp_return(c);")
-                    lines.append("return;")
+                    lines.extend(boundary.event(v))
                 elif v.opc == "SEH":
-                    lines.extend(publish(b.snapshots[v.id], v))
+                    lines.extend(publish(v))
                     lines.extend(seh_lines(v.data["kind"], v.data["eip"]))
                 elif v.opc == "TRAP":
                     lines.append("recomp_unknown_call(c, 0x%xu); return;" % v.data)
                 elif v.opc == "TAIL":
-                    lines.extend(flush_x87())
-                    lines.extend(publish(b.exit, v))
-                    lines.append("%s; return;" % prepared.invocations[v.id].render())
+                    lines.extend(boundary.event(v))
                 elif v.opc == "BRANCHIND":
                     # A decoded jump table: the target address selects a case, any
                     # other value is a runtime jump exactly like the decoded
@@ -952,69 +749,60 @@ def emit_prepared(prepared):
                     grouped = {}
                     for j in sorted(set(fir.succ[i])):
                         grouped.setdefault(j, fir.insns[j].addr)
-                    targets = list(grouped)
-                    if carry_mode:
-                        transition(i, targets)
-                    else:
-                        lines.extend(flush_x87())
                     lines.append("switch ((uint32_t)%s) {" % ref(v.args[0]))
                     for j, addr in grouped.items():
                         lines.append("case 0x%xu:" % addr)
                         lines.extend(edge(i, j))
                     lines.append("default:")
-                    lines.extend(flush_x87() if carry_mode else [])
-                    lines.extend(publish(b.exit, v))
+                    lines.extend(x87_printer.operations(program.defaults.get(v.id, ())))
+                    lines.extend(publish(v))
                     lines.append("c->eip = 0x%xu; recomp_jump(c, (uint32_t)%s); return;" % (
                         b.insn.addr, ref(v.args[0])))
                     lines.append("}")
                 elif v.opc == "BRANCH":
-                    if carry_mode:
-                        target = indices[v.args[0].data]
-                        transition(i, [target])
-                        lines.extend(edge(i, target))
-                    else:
-                        lines.extend(flush_x87())
-                        lines.extend(edge(i, indices[v.args[0].data]))
+                    lines.extend(edge(i, indices[v.args[0].data]))
                 elif v.opc == "CBRANCH":
-                    if carry_mode:
-                        taken = indices[v.args[0].data]
-                        fallthrough = indices[b.insn.addr + b.insn.length]
-                        transition(i, [taken, fallthrough])
-                        lines.append("if (%s)" % ref(v.args[1]))
-                        lines.extend(edge(i, taken))
-                        lines.extend(edge(i, fallthrough))
-                    else:
-                        lines.extend(flush_x87())
-                        lines.append("if (%s)" % ref(v.args[1]))
-                        lines.extend(edge(i, indices[v.args[0].data]))
-                        lines.extend(edge(i, indices[b.insn.addr + b.insn.length]))
+                    lines.append("if (%s)" % ref(v.args[1]))
+                    lines.extend(edge(i, indices[v.args[0].data]))
+                    lines.extend(edge(i, indices[b.insn.addr + b.insn.length]))
                 else:
                     lines.append("v%d = (%s) & %s;" % (v.id, expression(v), mask(v.size)))
             if not any(v.opc in operations.TERMINATORS for v in b.ops):
-                target = fir.succ[i][0]
-                if carry_mode:
-                    if linear_prev.get(target) != i:
-                        transition(i, [target])
-                    lines.extend(edge(i, target))
-                else:
-                    # A non-linear edge must publish before its goto. Never emit a
-                    # predecessor-specific flush at a shared destination label.
-                    if predecessors[target] != {i} or target != i + 1:
-                        lines.extend(flush_x87())
-                    lines.extend(edge(i, target))
-            previous = i
-        activations.append(scalar.activations)
-    if tuple(activations) != arithmetic_plan.activations:
-        raise SSAError("x87 emission differs from its activation plan")
+                lines.extend(x87_printer.operations(program.ends[i]))
+                lines.extend(edge(i, fir.succ[i][0]))
+        if emitted != set(program.events):
+            raise SSAError('x87 emission differs from its planned event coverage')
     lines.append("}")
-    lines[scalar_declarations:scalar_declarations] = scalar.temps
+    lines[scalar_declarations:scalar_declarations] = [x87_printer.declaration(op) for op in arithmetic_plan.temporaries]
     return "\n".join(lines)
 
 
 def emit(fir, symbol, **options):
-    requests = options.get("variant_requests")
-    decisions = options.get("call_decisions")
-    prepared = prepare(fir, symbol, **options)
+    requests, decisions = options.pop("variant_requests", None), options.pop("call_decisions", None)
+    lifter = options.pop("lifter", None)
+    masks = options.pop("contract_masks", None)
+    fields = options.pop("return_fields", None)
+    checked = options.pop("checked_return", False)
+    known_mode = options.pop("x87_known_mode", False)
+    if fields is not None and not checked:
+        raise SSAError("private state entry requires a checked leaf without opaque observers")
+    entry = (EntryForm.PRIVATE if fields is not None else EntryForm.CHECKED if checked
+             else EntryForm.MULTIPLE if fir.entries else EntryForm.ORDINARY)
+    returns = ReturnForm.PRIVATE if fields is not None else ReturnForm.CHECKED if checked else ReturnForm.ORDINARY
+    variant = BodyVariant(entry, returns, Guarded(CW_FAST, "entry") if known_mode else Dynamic())
+    policy = EmissionPolicy(**{name: options.pop(name) for name in EmissionPolicy.__dataclass_fields__ if name in options})
+    options["mode_sites"] = options.pop("x87_mode_sites", None)
+    options["entry_verify"] = options.pop("x87_entry_verify", None)
+    request = BodyRequest(symbol, variant, policy, layout=PrivateLayout.from_mask(contract_output_mask(fields))
+                          if fields is not None else None, report_calls=decisions is not None, **options)
+    prepared = prepare(fir, request, lifter=lifter)
+    wanted = {}
+    for target, mask in prepared.requests:
+        wanted[target] = wanted.get(target, 0) | mask
+    layouts = {target: PrivateLayout.from_mask(mask) for target, mask in wanted.items()}
+    if masks:
+        layouts.update({target: PrivateLayout.from_mask(mask) for target, mask in masks.items()})
+    prepared.finalize(layouts)
     source = emit_prepared(prepared)
     if requests is not None:
         requests.update(prepared.bound_requests)

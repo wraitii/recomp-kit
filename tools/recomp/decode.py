@@ -8,7 +8,7 @@ from x86_frontend import STRING_MNEM, MSVC_SEH_PROLOG, MSVC_SEH_EPILOG
 
 DecodeOperand = namedtuple(
     "DecodeOperand",
-    "kind width reg immediate base index scale displacement segment text",
+    "kind width reg immediate base index scale displacement segment",
 )
 DecodeRecord = namedtuple(
     "DecodeRecord",
@@ -31,11 +31,11 @@ class Insn(object):
         return "%08x %s %s" % (self.addr, self.mnem, ",".join(self.ops))
 
 
-def operand_record(kind, width, text, reg=None, immediate=None, base=None,
+def operand_record(kind, width, reg=None, immediate=None, base=None,
                    index=None, scale=1, displacement=0, segment=None):
     """Build a value-only operand description with no Capstone object state."""
     return DecodeOperand(kind, width, reg, immediate, base, index, scale,
-                         displacement, segment, text)
+                         displacement, segment)
 
 
 class Image(PE):
@@ -132,36 +132,33 @@ class Image(PE):
         return {1: "byte", 2: "word", 4: "dword", 8: "qword",
                 10: "extended double", 16: "xmmword"}.get(nbytes)
 
-    def _op_text(self, ci, op, mnem):
-        import capstone.x86_const as X
-        if op.type == X.X86_OP_REG:
-            name = ci.reg_name(op.reg).upper()
-            if name.startswith("ST(") and name.endswith(")"):
-                return "ST" + name[3:-1]        # capstone st(1) -> ST1
-            return name
-        if op.type == X.X86_OP_IMM:
-            return "-0x%x" % -op.imm if op.imm < 0 else "0x%x" % op.imm
-        if op.type == X.X86_OP_MEM:
-            word = self._size_word(op.size, mnem)
+    def _op_text(self, record, op):
+        mnem = record.opcode
+        if op.reg is not None:
+            return op.reg
+        if op.kind == "imm":
+            return "-0x%x" % -op.immediate if op.immediate < 0 else "0x%x" % op.immediate
+        if op.kind == "mem":
+            word = self._size_word(op.width // 8, mnem)
             # Environment/state instructions have structured 14/28/94/108-byte
             # operands. Their mnemonic determines the layout, not a scalar width.
             structured = mnem in ("FNSTENV", "FSTENV", "FLDENV", "FNSAVE", "FSAVE", "FRSTOR")
             if word is None and not structured:
                 raise TranslateError("%08x: unknown operand width %d for %s" %
-                                     (ci.address, op.size, mnem))
+                                     (record.address, op.width // 8, mnem))
             parts = []
-            if op.mem.base:
-                parts.append(ci.reg_name(op.mem.base).upper())
-            if op.mem.index:
-                parts.append("%s*0x%x" % (ci.reg_name(op.mem.index).upper(), op.mem.scale))
-            if op.mem.disp or not parts:
-                parts.append("-0x%x" % -op.mem.disp if op.mem.disp < 0
-                             else "0x%x" % op.mem.disp)
+            if op.base:
+                parts.append(op.base)
+            if op.index:
+                parts.append("%s*0x%x" % (op.index, op.scale))
+            if op.displacement or not parts:
+                parts.append("-0x%x" % -op.displacement if op.displacement < 0
+                             else "0x%x" % op.displacement)
             inner = " + ".join(parts)
-            seg = ci.reg_name(op.mem.segment).upper() if op.mem.segment else ""
+            seg = op.segment or ""
             return "%s%s[%s]" % ("" if structured else word + " ptr ",
                                   seg + ":" if seg else "", inner)
-        raise TranslateError("unknown capstone operand type %d" % op.type)
+        raise TranslateError("unknown decoded operand kind %s" % op.kind)
 
     def decode_record(self, ci, source_bytes=None, address=None, mnem_override=None):
         """Return immutable decode evidence, cached by address and exact bytes."""
@@ -189,7 +186,6 @@ class Image(PE):
         operands = []
         import capstone.x86_const as X
         for op in ci.operands:
-            text = self._op_text(ci, op, mnem)
             if op.type == X.X86_OP_REG:
                 name = ci.reg_name(op.reg).upper()
                 if name.startswith("ST(") and name.endswith(")"):
@@ -199,13 +195,13 @@ class Image(PE):
                         "mm" if name.startswith("MM") else
                         "st" if name.startswith("ST") else
                         "sreg" if name in ("CS", "DS", "ES", "FS", "GS", "SS") else "reg")
-                item = self._operand_record(kind, op.size * 8, text, reg=name)
+                item = self._operand_record(kind, op.size * 8, reg=name)
             elif op.type == X.X86_OP_IMM:
-                item = self._operand_record("imm", op.size * 8, text, immediate=op.imm)
+                item = self._operand_record("imm", op.size * 8, immediate=op.imm)
             elif op.type == X.X86_OP_MEM:
                 mem = op.mem
                 item = self._operand_record(
-                    "mem", op.size * 8, text,
+                    "mem", op.size * 8,
                     base=ci.reg_name(mem.base).upper() if mem.base else None,
                     index=ci.reg_name(mem.index).upper() if mem.index else None,
                     scale=mem.scale, displacement=mem.disp,
@@ -231,41 +227,41 @@ class Image(PE):
             return Insn(addr, "UNMODELLED", None, [],
                         "%08x  %s %s: %s" % (addr, ci.mnemonic.upper(), ci.op_str, error))
         mnem, rep = record.opcode, record.rep
-        ops = [op.text for op in record.operands]
+        ops = [self._op_text(record, op) for op in record.operands]
         if rep or mnem in STRING_MNEM:
             ops = []            # implicit ES:EDI / ESI operands carry nothing
         text = "%08x  %s%s%s" % (record.address, mnem, "." + rep if rep else "",
                                  (" " + ",".join(ops)) if ops else "")
         return Insn(record.address, mnem, rep, ops, text, record)
 
-    def decode_span_instruction(self, addr, raw):
+    def decode_span_record(self, addr, raw):
         """Decode one mapped instruction, including Ghidra's folded WAIT form."""
         key = (addr, bytes(raw))
         record = self._decode_records.get(key)
-        if record is not None:
-            insn = self.to_insn(record)
-        else:
+        if record is None:
             decoded = list(self.md.disasm(raw, addr))
             if len(decoded) == 1 and decoded[0].size == len(raw):
-                insn = self.to_insn(decoded[0], source_bytes=raw)
+                record = self.decode_record(decoded[0], source_bytes=raw)
             elif (len(decoded) == 2 and decoded[0].mnemonic in ("wait", "fwait")
                   and decoded[1].mnemonic.startswith("fn")
                   and sum(ci.size for ci in decoded) == len(raw)):
                 ci = decoded[1]
                 suffix = ci.mnemonic[2:].upper()
                 mnem = self.MNEM_ALIAS.get("F" + suffix, "F" + suffix)
-                insn = self.to_insn(ci, source_bytes=raw, address=addr, mnem_override=mnem)
+                record = self.decode_record(ci, source_bytes=raw, address=addr, mnem_override=mnem)
             else:
                 return None
         # The old mapped-code path canonicalized XLATB for the emitter; the
         # general Capstone view keeps its original spelling.
-        if insn.mnem == "XLATB":
-            insn.mnem = "XLAT"
-            insn.decode = insn.decode._replace(opcode="XLAT")
-        if insn.mnem == "XCHG" and raw and 0x90 <= raw[0] <= 0x97 and len(insn.ops) == 2:
-            insn.ops.reverse()
-            insn.decode = insn.decode._replace(operands=tuple(reversed(insn.decode.operands)))
-        return insn
+        if record.opcode == "XLATB":
+            record = record._replace(opcode="XLAT")
+        if record.opcode == "XCHG" and raw and 0x90 <= raw[0] <= 0x97 and len(record.operands) == 2:
+            record = record._replace(operands=tuple(reversed(record.operands)))
+        return record
+
+    def decode_span_instruction(self, addr, raw):
+        record = self.decode_span_record(addr, raw)
+        return self.to_insn(record) if record is not None else None
 
 
     def insn_end(self, va, mnem):

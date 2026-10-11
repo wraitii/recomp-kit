@@ -14,6 +14,7 @@ per-row guest memory ranges. Translation-only rows never fabricate native
 results.
 """
 from pathlib import Path
+from dataclasses import asdict
 import hashlib
 import csv
 import json
@@ -534,7 +535,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
     functions = expand(image, functions, Lifter())
     settings = Settings(cfg)
     fault_state = cfg['translate']['fault_state']
-    msvc_x87_convention = settings.emit['msvc_convention']
+    msvc_x87_convention = settings.emit.msvc_convention
     translator = T.Translator(image, set(functions))
     lifter = Lifter()
     out.mkdir(parents=True, exist_ok=True)
@@ -617,7 +618,7 @@ def run_corpus(manifest, game_dir, out, cmake, jobs, checks=4096, trial_ms=10.0,
             else:
                 indirect_symbol = (f'{mode}_indirect_{row["address"]}'
                                    if boundary and indirect_sites else None)
-                options = {**settings.emit, 'indirect_call_symbol': indirect_symbol,
+                options = {**asdict(settings.emit), 'indirect_call_symbol': indirect_symbol,
                            'call_symbols': ssa_call_symbols(mode, boundary, direct, row.get('callees', []))}
                 try:
                     body = emit(T.function_ir(tr, lifter, fn), f'{mode}_fn_{addr:08x}', lifter=lifter, **options)

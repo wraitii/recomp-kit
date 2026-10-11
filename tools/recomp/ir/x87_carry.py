@@ -13,6 +13,7 @@ from collections import deque
 from .operations import X87_RESET_OPS
 from .ssa import SSAError
 from .x87_scalar import INACTIVE, UNSAFE, merge_shapes
+from .x87_transition import external, Type
 
 RESET_OPS = X87_RESET_OPS
 
@@ -24,7 +25,8 @@ def _transfer(block, entry, scalar_factory, binary32):
     for value in block.ops:
         if value.opc in ("X87_REG", "X87_MEM"):
             scalar.binary32 = value.id in binary32
-            scalar.statements(value.data, "carry_address", "carry_result")
+            scalar.apply(value.data, external(value.args[1]) if value.opc == "X87_MEM" else None,
+                         external(value, Type.U16) if value.size else None)
         elif value.opc in RESET_OPS:
             scalar.reset()
     scalar.fold_pending([])

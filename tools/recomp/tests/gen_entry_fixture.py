@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import output as T
-from ir.invocation import Declaration
+from ir.c_symbols import Declaration
 
 
 def write(out):

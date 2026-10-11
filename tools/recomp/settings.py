@@ -2,6 +2,7 @@
 from pathlib import Path
 
 from program import TranslateError
+from ir.body import EmissionPolicy
 
 
 class Settings(object):
@@ -48,11 +49,7 @@ class Settings(object):
         self.allow_unmodelled = allow_unmodelled
         self.jobs = jobs
         relaxed = translate["fault_state"] == "relaxed"
-        self.emit = {
-            "x87_scalar_strict": not relaxed,
-            "local_state": relaxed,
-            "lazy_flags": relaxed,
-            "msvc_convention": translate["msvc_x87_convention"],
-            "x87_cw_clone": translate["x87_cw_clone"],
-            "indirect_call_symbol": "recomp_call",
-        }
+        self.emit = EmissionPolicy(
+            x87_scalar_strict=not relaxed, local_state=relaxed, lazy_flags=relaxed,
+            msvc_convention=translate["msvc_x87_convention"],
+            x87_cw_clone=translate["x87_cw_clone"], indirect_call_symbol="recomp_call")

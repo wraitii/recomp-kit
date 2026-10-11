@@ -45,20 +45,19 @@ tag word, TOP and live registers stay exact; only popped residue differs.
 Functions containing FINCSTP/FDECSTP, which break the invariant inside a
 region, keep the exact flush.
 """
-import re
 from dataclasses import dataclass, field
-from typing import Optional
 
-from . import x87
-from .x87_cw import CW_FAST, CW_PC_RC, Dynamic, Guarded, Proven, condition_of, proven_fact
+from . import x87_transition as t
+from .x87_transition import Expr, Type, Assign, Evaluate, Store, PublishTags, Activation, Declare
+from .x87_cw import CW_FAST, Dynamic, Guarded, condition_of, proven_fact
 
 
 @dataclass
 class Slot:
-    value: Optional[str] = None
-    bits: Optional[str] = None
-    exact: Optional[str] = None
-    tag: Optional[str] = None
+    value: Expr | None = None
+    bits: Expr | None = None
+    exact: Expr | None = None
+    tag: Expr | None = None
     narrow: bool = False  # Proven binary32 when PC=00, not an incoming-state guess.
     dirty: set = field(default_factory=set)
     quiet: bool = False
@@ -67,8 +66,7 @@ class Slot:
 
 #: Slot components carried across an internal CFG edge.
 PARTS = ("value", "bits", "exact", "tag")
-PART_TYPES = {"value": "double", "bits": "uint64_t",
-              "exact": "uint8_t", "tag": "unsigned"}
+PART_TYPES = t.PART_TYPES
 
 #: Canonical iteration order for the parts of a carried slot. The emitter used
 #: to walk ``SlotShape.parts`` (a frozenset), whose order follows the process
@@ -83,9 +81,8 @@ def ordered_parts(parts):
     """Return ``parts`` in a hash-seed-independent code-generation order."""
     known = [part for part in PART_ORDER if part in parts]
     return known + sorted(part for part in parts if part not in PART_ORDER)
-#: Literal expressions whose agreement survives a join (the convention flush
-#: tests `slot.exact != "0"`, so `0`/`FTAG_EMPTY`/`1` must stay constants).
-CARRY_LITERALS = frozenset(("0", "1", "FTAG_EMPTY"))
+#: Typed literal agreements retained across carry joins.
+CARRY_LITERALS = frozenset((t.ZERO, t.ONE, t.EMPTY, t.literal(0, Type.U64)))
 
 
 @dataclass(frozen=True)
@@ -121,12 +118,6 @@ class CarryShape:
 INACTIVE = CarryShape(False)
 #: A merged join that exceeds the eight-slot window; callers must reset.
 UNSAFE = object()
-
-
-def carry_var(position, part):
-    """Stable function-scope C name for one carried slot component."""
-    tag = "m%d" % -position if position < 0 else "%d" % position
-    return "x87c%s_%s" % (tag, part)
 
 
 def merge_shapes(shapes):
@@ -188,33 +179,8 @@ def merge_shapes(shapes):
                       any(s.status_dirty for s in known))
 
 
-#: Runtime recipes on the full CPU and their forms on the scalar CW/SW locals.
-SCALAR_ENV = (("fx87_exact(c, ", "fx87_exact_sw(&x87_sw_, "),
-              ("fx87(c, ", "fx87_sw(&x87_sw_, x87_cw_, "),
-              ("fround_cw(c, ", "fround_rc(x87_cw_, "))
-
-
-#: Control-word mask of the precision (PC) and rounding (RC) fields: the only
-#: CW bits a scalar helper reads.
-CW_FIELDS = CW_PC_RC
-#: CW uses other than its load and clone guard; the fast clone folds them.
-CW_USE = re.compile(r"\bx87_cw_\b(?! = c->fpu_cw;| & 0x%xu\))" % CW_FIELDS)
-
-
-def scalar_env(expr):
-    """Rewrite a `c`-based x87 recipe onto the scalar CW/SW locals.
-
-    Any `c` argument left after the rewrite would read guest CW/SW that the
-    tracker has not published, so it fails closed instead."""
-    for old, new in SCALAR_ENV:
-        expr = expr.replace(old, new)
-    if "(c," in expr or "(c)" in expr:
-        raise ValueError("x87 recipe still reads the CPU: %s" % expr)
-    return expr
-
-
 class X87Scalar:
-    """Track all eight physical residues within a single-entry linear region."""
+    """Interpret typed recipes while tracking physical slot state and publication."""
 
     def __init__(self, observe_loads=False, convention=False, lazy_nan=False):
         self.clone = None
@@ -232,144 +198,107 @@ class X87Scalar:
 
     @property
     def known_mode(self):
-        return isinstance(self.choice, Guarded) and self.choice.boundary == "entry"
-
-    def declarations(self):
-        return ["uint16_t x87_cw_;", "uint16_t x87_sw_;", "uint32_t x87_top_;"]
+        return isinstance(self.choice, Guarded) and self.choice.boundary == 'entry'
 
     def reset(self):
         self.active = False
         self.top = 0
-        self.top_dirty = False
-        self.top_unknown = False  # see CarryShape.top_unknown
-        # Unbounded stack positions relative to the region's captured TOP
-        # (negative = pushed). `base` is the last published TOP, `low` the
-        # deepest push since then and `high` the highest position accessed.
+        self.top_dirty = self.top_unknown = False
         self.position = self.base = self.low = self.high = 0
         self.status_dirty = False
         self.slots = {}
 
     def _activation(self):
-        """Guard the current mode where the published tracker starts a window.
-
-        Calls and CW writers reset the tracker. Corresponding windows in both
-        bodies share SSA locals and carried state at the fallback label.
-        """
-        index = self.activations
+        operation = Activation(self.activations, self.clone, self.choice, self.known_mode)
         self.activations += 1
-        lines = ["x87_top_ = c->fpu_top;", "x87_cw_ = c->fpu_cw;"]
-        if self.clone == "fast" and not self.known_mode:
-            lines.append("if (RECOMP_UNLIKELY(recomp_hooks_ever || (x87_cw_ & 0x%xu) != 0u)) goto X87CW%d;"
-                         % (CW_FIELDS, index))
-        elif self.clone == "general":
-            lines.insert(0, "X87CW%d:;" % index)
-        lines.append("x87_sw_ = c->fpu_sw;")
-        return lines
+        return [operation]
 
-    def _activate(self, lines):
+    def _activate(self, operations):
         if not self.active:
-            lines.extend(self._activation())
+            operations.extend(self._activation())
             self.active = True
 
-    def _temp(self, expr, lines, ctype="double"):
-        name = "x87s%d" % self.serial
+    def _temp(self, value, operations, type=Type.F64):
+        result = t.local(self.serial, type)
         self.serial += 1
-        self.temps.append("%s %s;" % (ctype, name))
-        lines.append("%s = %s;" % (name, expr))
-        return name
+        self.temps.append(Declare(result))
+        operations.append(Assign(result, value))
+        return result
 
     def _phys(self, offset):
-        return "(x87_top_ + %du) & 7u" % offset
+        return Expr('physical', Type.U32, (t.environment('top'),), offset)
 
     def _slot(self, logical=0):
         self.high = max(self.high, self.position + logical)
         offset = (self.top + logical) & 7
         return offset, self.slots.setdefault(offset, Slot())
 
-    def _read(self, logical, part, lines):
+    def _read(self, logical, part, operations):
         offset, slot = self._slot(logical)
         if getattr(slot, part) is None:
-            phys = self._phys(offset)
-            expr = ("ftag_of(c, %s)" % phys if part == "tag" else
-                    "c->%s[%s]" % ({"value": "st", "bits": "st_bits",
-                                    "exact": "st_exact"}[part], phys))
-            ctype = {"value": "double", "bits": "uint64_t",
-                     "exact": "uint8_t", "tag": "unsigned"}[part]
-            setattr(slot, part, self._temp(expr, lines, ctype))
+            setattr(slot, part, self._temp(t.slot(part, self._phys(offset)), operations, PART_TYPES[part]))
         return getattr(slot, part)
 
     def _assign(self, logical, narrow=None, pending=None, quiet=None, **parts):
         _, slot = self._slot(logical)
         if narrow is not None:
             slot.narrow = narrow
-        for part, expr in parts.items():
-            setattr(slot, part, expr)
+        for part, value in parts.items():
+            setattr(slot, part, value)
             slot.dirty.add(part)
         if quiet is not None:
             slot.quiet = quiet
         if pending is not None:
             slot.pending = pending
 
-    def _fold_slot(self, slot, lines, emit_ie=True, canonical=True):
-        """Fold one deferred arithmetic NaN: raise IE and canonicalise its bits.
-
-        A deferred value is always bound to a simple local by `_set`/`_read`;
-        the guard below keeps a future caller from duplicating a compound
-        expression in the `v != v ? indef : v` ternary.
-        """
+    def _fold_slot(self, slot, operations, emit_ie=True, canonical=True):
         if not slot.pending:
             return slot.value
         value = slot.value
         if value is None:
             slot.pending = False
             return None
-        if not value.isidentifier():
-            value = self._temp("(%s)" % value, lines, "double")
+        if not value.atomic:
+            value = self._temp(t.group(value), operations)
         if emit_ie:
-            # IE is bit 0, so a branchless boolean OR raises it exactly when
-            # the value is NaN, mirroring `fx87`'s NaN branch.
-            lines.append("x87_sw_ |= (uint16_t)(%s != %s);" % (value, value))
+            operations.append(Assign(t.environment('sw'), Expr('nan_test', Type.U16, (value,)), '|='))
             self.status_dirty = True
         if canonical:
-            slot.value = self._temp(
-                "(%s != %s ? x87_indefinite() : %s)" % (value, value, value),
-                lines, "double")
-            slot.dirty.add("value")
+            slot.value = self._temp(Expr('nan_fold', Type.F64, (value,)), operations)
+            slot.dirty.add('value')
             slot.quiet = True
         slot.pending = False
         return slot.value
 
-    def _fold(self, logical, lines, emit_ie=True, canonical=True):
-        _, slot = self._slot(logical)
-        return self._fold_slot(slot, lines, emit_ie, canonical)
+    def _fold(self, logical, operations, emit_ie=True, canonical=True):
+        return self._fold_slot(self._slot(logical)[1], operations, emit_ie, canonical)
 
-    def _fold_all(self, lines, emit_ie=True, canonical=True):
+    def _fold_all(self, operations, emit_ie=True, canonical=True):
         for _, slot in sorted(self.slots.items()):
             if slot.pending:
-                self._fold_slot(slot, lines, emit_ie, canonical)
+                self._fold_slot(slot, operations, emit_ie, canonical)
 
-    def fold_pending(self, lines):
-        """Fold every deferred NaN before an internal CFG edge or publication."""
+    def fold_pending(self, operations):
         if self.active:
-            self._fold_all(lines)
+            self._fold_all(operations)
 
-    def _release(self, logical, lines, subsumed=False):
-        """Discard the slot at `logical`; fold IE unless the new value subsumes it."""
-        _, slot = self._slot(logical)
+    def _release(self, logical, operations, subsumed=False):
+        slot = self._slot(logical)[1]
         if not slot.pending:
             return
         if subsumed:
             slot.pending = False
         else:
-            self._fold_slot(slot, lines)
+            self._fold_slot(slot, operations)
 
-    def _set(self, logical, expr, lines, bits="0", exact="0", tag=None, narrow=False,
+    def _set(self, logical, value, operations, bits=None, exact=None, tag=None, narrow=False,
              pending=False, subsumed=False):
-        self._release(logical, lines, subsumed=subsumed)
-        value = self._temp(expr, lines)
-        self._assign(logical, value=value, bits=bits, exact=exact,
-                     tag=tag or "ftag_classify(%s)" % value, narrow=narrow,
-                     pending=pending, quiet=False)
+        self._release(logical, operations, subsumed=subsumed)
+        value = self._temp(value, operations)
+        self._assign(logical, value=value, bits=bits if bits is not None else t.literal(0, Type.U64),
+                     exact=exact if exact is not None else t.ZERO,
+                     tag=tag if tag is not None else t.helper('ftag_classify', Type.TAG, value),
+                     narrow=narrow, pending=pending, quiet=False)
 
     def _move_top(self, delta):
         self.top = (self.top + delta) & 7
@@ -377,93 +306,49 @@ class X87Scalar:
         self.position += delta
         self.low = min(self.low, self.position)
 
-    def _drop(self, lines=None, subsumed=False):
-        # Preserve both value and integer shadow in the popped physical slot.
-        if lines is not None:
-            self._release(0, lines, subsumed=subsumed)
-        self._assign(0, exact="0", tag="FTAG_EMPTY")
+    def _drop(self, operations=None, subsumed=False):
+        if operations is not None:
+            self._release(0, operations, subsumed=subsumed)
+        self._assign(0, exact=t.ZERO, tag=t.EMPTY)
         self._move_top(1)
 
-    def _convention_flush(self):
-        """Publish under the MSVC stack invariant, or None when ambiguous.
-
-        Every tracked physical slot maps to one position in [low, low + 8)
-        unless the region touched a position eight or more above its deepest
-        push (only possible on a stack overflow); then the exact flush runs.
-        """
-        if self.high >= self.low + 8 or self.position >= self.low + 8:
-            return None
-        lines, tags = [], []
+    def _publish(self, convention):
+        operations, tags = [], []
         for offset, slot in sorted(self.slots.items()):
-            phys = self._phys(offset)
+            physical = self._phys(offset)
             position = self.low + ((offset - self.low) & 7)
-            if position < self.position:
-                # Popped residue. Only a register that was on the stack when
-                # the region began needs its (dirty) empty tag.
-                if position >= self.base and "tag" in slot.dirty:
-                    tags.append((phys, slot.tag))
+            if convention and position < self.position:
+                if position >= self.base and 'tag' in slot.dirty:
+                    tags.append((physical, slot.tag))
             else:
-                if "value" in slot.dirty:
-                    lines.append("c->st[%s] = %s;" % (phys, slot.value))
-                if "exact" in slot.dirty:
-                    lines.append("c->st_exact[%s] = %s;" % (phys, slot.exact))
-                if "bits" in slot.dirty and slot.exact != "0":
-                    lines.append("c->st_bits[%s] = %s;" % (phys, slot.bits))
-                if "tag" in slot.dirty:
-                    tags.append((phys, slot.tag))
+                parts = ('value', 'exact', 'bits') if convention else ('value', 'bits', 'exact')
+                for part in parts:
+                    if part in slot.dirty and not (convention and part == 'bits' and t.zero(slot.exact)):
+                        operations.append(Assign(t.slot(part, physical), getattr(slot, part)))
+                if 'tag' in slot.dirty:
+                    tags.append((physical, slot.tag))
             slot.dirty.clear()
         if tags:
-            masks = " | ".join("(3u << (2u * (%s)))" % phys for phys, _ in tags)
-            values = " | ".join("((%s) << (2u * (%s)))" % (tag, phys) for phys, tag in tags)
-            lines.append("c->fpu_tag = (uint16_t)((c->fpu_tag & ~(%s)) | %s);" % (masks, values))
-        if self.position != self.base or self.top_unknown:
-            lines.append("c->fpu_top = (%s);" % self._phys(self.top))
+            operations.append(PublishTags(tuple(tags)))
+        if (self.position != self.base if convention else self.top_dirty) or self.top_unknown:
+            operations.append(Assign(t.environment('top', True), t.group(self._phys(self.top))))
         self.top_dirty = self.top_unknown = False
         self.base = self.low = self.high = self.position
         if self.status_dirty:
-            lines.append("c->fpu_sw = x87_sw_;")
+            operations.append(Assign(t.environment('sw', True), t.environment('sw')))
             self.status_dirty = False
-        return lines
+        return operations
 
     def flush(self):
-        """Publish only changed components; retain scalar knowledge afterward."""
         if not self.active:
             return []
-        folded = []
-        self._fold_all(folded)
-        if self.convention:
-            lines = self._convention_flush()
-            if lines is not None:
-                return folded + lines
-        lines, tags = [], []
-        for offset, slot in sorted(self.slots.items()):
-            phys = self._phys(offset)
-            for part, array in (("value", "st"), ("bits", "st_bits"),
-                                ("exact", "st_exact")):
-                if part in slot.dirty:
-                    lines.append("c->%s[%s] = %s;" % (array, phys, getattr(slot, part)))
-            if "tag" in slot.dirty:
-                tags.append((phys, slot.tag))
-            slot.dirty.clear()
-        if tags:
-            masks = " | ".join("(3u << (2u * (%s)))" % phys for phys, _ in tags)
-            values = " | ".join("((%s) << (2u * (%s)))" % (tag, phys) for phys, tag in tags)
-            lines.append("c->fpu_tag = (uint16_t)((c->fpu_tag & ~(%s)) | %s);" % (masks, values))
-        if self.top_dirty or self.top_unknown:
-            lines.append("c->fpu_top = (%s);" % self._phys(self.top))
-            self.top_dirty = self.top_unknown = False
-        self.base = self.low = self.high = self.position
-        if self.status_dirty:
-            lines.append("c->fpu_sw = x87_sw_;")
-            self.status_dirty = False
-        return folded + lines
+        operations = []
+        self._fold_all(operations)
+        convention = self.convention and self.high < self.low + 8 and self.position < self.low + 8
+        operations.extend(self._publish(convention))
+        return operations
 
     def snapshot(self):
-        """Current unpublished state as a carry shape relative to the live TOP.
-
-        Under the MSVC convention a popped register only needs its empty tag
-        retagged; its value, bits and exact shadow are relaxed and dropped so a
-        join does not copy dead residue. Live slots also retain cached clean parts."""
         if not self.active:
             return INACTIVE
         slots = []
@@ -472,10 +357,7 @@ class X87Scalar:
             dirty = frozenset(slot.dirty)
             parts = frozenset(part for part in PARTS if getattr(slot, part) is not None)
             if position < 0 and self.convention:
-                # Only the MSVC convention relaxes popped residue. With an exact
-                # flush (msvc_convention=False or FINCSTP/FDECSTP) the successor
-                # must be able to republish the popped value, bits and shadow.
-                parts = dirty & frozenset(("tag",))
+                parts = dirty & frozenset(('tag',))
             dirty &= parts
             if not parts:
                 continue
@@ -487,48 +369,32 @@ class X87Scalar:
                           self.low - self.position, self.high - self.position,
                           self.top_unknown, self.status_dirty)
 
-    def seed(self, shape, exprs=None):
-        """Replace this tracker with a carried shape from a block entry.
-
-        `exprs` maps (position, part) to the fresh C local holding the carried
-        value; const parts come from the shape. With no `exprs` (fixed-point
-        replay) placeholder expressions stand in for the locals."""
+    def seed(self, shape, values=None):
         self.reset()
         if not shape.active:
             return
         self.active = True
-        self.top = 0
-        self.position = 0
+        self.top = self.position = 0
         self.base, self.low, self.high = shape.base, shape.low, shape.high
-        self.top_unknown = shape.top_unknown
-        self.status_dirty = shape.status_dirty
+        self.top_unknown, self.status_dirty = shape.top_unknown, shape.status_dirty
         for position, slot_shape in shape.slots:
             slot = Slot(narrow=slot_shape.narrow, dirty=set(slot_shape.dirty), quiet=slot_shape.quiet)
             agreements = dict(slot_shape.const)
             for part in slot_shape.parts:
-                if part in agreements:
-                    expr = agreements[part]
-                elif exprs is not None:
-                    expr = exprs[(position, part)]
-                else:
-                    expr = "_"
-                setattr(slot, part, expr)
+                value = agreements.get(part)
+                if value is None:
+                    value = values[position, part] if values is not None else t.carry(position, part)
+                setattr(slot, part, value)
             self.slots[position & 7] = slot
 
-    def normalize(self, lines):
-        """Activate or re-anchor the tracker to the current physical TOP.
-
-        Afterward `top == position == 0` and slot keys are relative positions,
-        so an edge can publish `x87_top_` and index `slots` consistently even
-        when predecessors reached the block from different activations."""
+    def normalize(self, operations):
         if not self.active:
-            lines.extend(self._activation())
+            operations.extend(self._activation())
             self.active = True
             return
         if self.top != 0:
-            lines.append("x87_top_ = (x87_top_ + %du) & 7u;" % self.top)
-            self.slots = {((offset - self.top) & 7): slot
-                          for offset, slot in self.slots.items()}
+            operations.append(Assign(t.environment('top'), self._phys(self.top)))
+            self.slots = {((offset - self.top) & 7): slot for offset, slot in self.slots.items()}
         delta = self.position
         self.top = 0
         self.position -= delta
@@ -537,9 +403,9 @@ class X87Scalar:
         self.high -= delta
 
     def site_choice(self):
-        if self.clone == "fast":
-            assert isinstance(self.choice, Guarded), "fast clone requires a guarded body choice"
-            assert self.choice.condition == CW_FAST, "fast clone supports only CW_FAST"
+        if self.clone == 'fast':
+            assert isinstance(self.choice, Guarded), 'fast clone requires a guarded body choice'
+            assert self.choice.condition == CW_FAST, 'fast clone supports only CW_FAST'
             return Guarded(self.choice.condition, self.choice.boundary)
         if self.proven_cw is not None:
             record = proven_fact(self.proven_cw, condition_of(self.proven_cw))
@@ -547,241 +413,156 @@ class X87Scalar:
                 return record
         return Dynamic()
 
-    def statements(self, data, address=None, result=None):
-        """Fold PC/RC facts into audited recipes, retaining other guest state."""
-        lines = self._statements(data, address, result)
-        choice = self.site_choice()
-        if isinstance(choice, Guarded):
-            lines = [CW_USE.sub("0u", line) for line in lines]
-        elif isinstance(choice, Proven):
-            condition = choice.condition
-            mode = "0x%xu" % condition.value if condition.mask == CW_FIELDS else \
-                "((x87_cw_ & 0x%xu) | 0x%xu)" % (CW_FIELDS & ~condition.mask, condition.value)
-            if self.mode_hook_guard:
-                mode = "(recomp_hooks_ever ? x87_cw_ : %s)" % mode
-            lines = [CW_USE.sub(mode, line) for line in lines]
-        return lines
-
-    def _statements(self, data, address=None, result=None):
-        m, operands = data["mnem"], data["operands"]
-        memory = [size for kind, size in operands if kind == "mem"]
-        slots = [index for kind, index in operands if kind == "st"]
-        bits = memory[0] * 8 if memory else 0
-        lines = []
-        self._activate(lines)
-        # Strict mode keeps every pre-access snapshot; performance mode defers
-        # across loads and stores, which do not observe x87 state.
+    def apply(self, recipe, address=None, result=None):
+        r = t.recipe(recipe) if isinstance(recipe, dict) else recipe
+        m, bits, slots = r.mnem, r.bits, r.slots
+        memory = bool(bits)
+        operations = []
+        self._activate(operations)
         if address is not None and self.observe_loads:
-            lines.extend(self.flush())
-
+            operations.extend(self.flush())
+        sw, cw = t.environment('sw'), t.control(self.site_choice(), self.mode_hook_guard)
         def read(index):
-            return self._read(index, "value", lines)
-
+            return self._read(index, 'value', operations)
         def mem(integer=False):
-            expr = ("(int%d_t)rd%d((uint32_t)%s)" % (bits, bits, address) if integer else
-                    "rdf%d((uint32_t)%s)" % (bits, address))
-            return self._temp(expr, lines, "int64_t" if integer else "double")
-
-        if m in x87.CONSTANTS and not operands:
+            return self._temp(t.load(bits, address, integer), operations, Type.I64 if integer else Type.F64)
+        if r.action == 'constant':
             self._move_top(-1)
-            self._set(0, x87.CONSTANTS[m], lines, narrow=m in ("FLD1", "FLDZ"))
-        elif m == "FLD":
+            self._set(0, t.CONSTANTS[m], operations, narrow=m in ('FLD1', 'FLDZ'))
+        elif r.action == 'push':
             if slots:
-                # Capture all source components before TOP moves (FLD ST7).
-                parts = {part: self._read(slots[0], part, lines)
-                         for part in ("value", "bits", "exact", "tag")}
-                quiet = self._slot(slots[0])[1].quiet
-                narrow = self._slot(slots[0])[1].narrow
-                pending = self._slot(slots[0])[1].pending if self.lazy_nan else False
+                parts = {part: self._read(slots[0], part, operations) for part in ('value', 'bits', 'exact', 'tag')}
+                slot = self._slot(slots[0])[1]
+                quiet, narrow, pending = slot.quiet, slot.narrow, slot.pending if self.lazy_nan else False
                 self._move_top(-1)
                 if self.lazy_nan:
-                    self._release(0, lines)
-                    self._assign(0, narrow=narrow, pending=pending, quiet=quiet, **parts)
-                else:
-                    self._assign(0, narrow=narrow, quiet=quiet, **parts)
+                    self._release(0, operations)
+                self._assign(0, narrow=narrow, pending=pending if self.lazy_nan else None, quiet=quiet, **parts)
             else:
                 value = mem()
                 self._move_top(-1)
-                self._set(0, value, lines, narrow=bits == 32)
-        elif m == "FFREE":
-            self._assign(slots[0], tag="FTAG_EMPTY")
-        elif m == "FILD":
+                self._set(0, value, operations, narrow=bits == 32)
+        elif r.action == 'free':
+            self._assign(r.src, tag=t.EMPTY)
+        elif r.action == 'push_integer':
             value = mem(True)
             self._move_top(-1)
-            self._set(0, "(double)%s" % value, lines, bits="(uint64_t)%s" % value, exact="1")
-        elif m in ("FST", "FSTP"):
+            self._set(0, t.cast(Type.F64, value), operations, bits=t.cast(Type.U64, value), exact=t.ONE)
+        elif r.action == 'store':
             if slots:
                 if slots[0]:
-                    parts = {part: self._read(0, part, lines)
-                             for part in ("value", "bits", "exact", "tag")}
-                    quiet = self._slot(0)[1].quiet
-                    narrow = self._slot(0)[1].narrow
+                    parts = {part: self._read(0, part, operations) for part in ('value', 'bits', 'exact', 'tag')}
+                    slot = self._slot(0)[1]
+                    quiet, narrow, pending = slot.quiet, slot.narrow, slot.pending
                     if self.lazy_nan:
-                        # The copy carries any deferred NaN; fold the value the
-                        # destination is about to lose (not an operand).
-                        pending = self._slot(0)[1].pending
-                        self._release(slots[0], lines)
-                        self._assign(slots[0], narrow=narrow, pending=pending, quiet=quiet, **parts)
-                    else:
-                        self._assign(slots[0], narrow=narrow, quiet=quiet, **parts)
+                        self._release(slots[0], operations)
+                    self._assign(slots[0], narrow=narrow, pending=pending if self.lazy_nan else None, quiet=quiet, **parts)
             else:
                 if self.lazy_nan:
-                    # Store to memory is a sink: canonicalise the double before
-                    # any narrowing conversion, matching eager's fx87 result.
-                    self._fold(0, lines)
+                    self._fold(0, operations)
                 value = read(0)
                 if bits == 32:
-                    # A narrow slot is exactly a binary32 when PC=00 (every
-                    # FLD m32, FLD1/FLDZ and PC=00 arithmetic result has been
-                    # widened from a float), so (float)v is exact and the RC
-                    # stepper in fto_float is dead. Keep the NaN arm: fto_float
-                    # quiets an sNaN payload that clang could otherwise retain
-                    # by cancelling the widening/narrowing casts. The runtime
-                    # PC test keeps the general double path for PC!=0.
-                    quiet = self._slot(0)[1].quiet
-                    narrow = self._slot(0)[1].narrow
-                    if narrow and quiet and self.known_mode and not self.observe_loads:
-                        value = "(float)(%s)" % value
-                    elif narrow and not self.observe_loads:
-                        if not value.isidentifier():
-                            value = self._temp("(%s)" % value, lines, "double")
-                        value = ("((x87_cw_ & 0x300u) == 0u && %s == %s) ? "
-                                 "(float)(%s) : fto_float_cw(x87_cw_, %s)" %
-                                 (value, value, value, value))
+                    slot = self._slot(0)[1]
+                    if slot.narrow and slot.quiet and self.known_mode and not self.observe_loads:
+                        value = t.cast(Type.F32, t.group(value))
+                    elif slot.narrow and not self.observe_loads:
+                        if not value.atomic:
+                            value = self._temp(t.group(value), operations)
+                        value = Expr('float_store', Type.F32, (cw, value))
                     else:
-                        value = "fto_float_cw(x87_cw_, %s)" % value
-                lines.append("wrf%d((uint32_t)%s, %s);" % (bits, address, value))
-            if m == "FSTP":
-                # A register copy already carried the value to its destination;
-                # a plain FSTP ST(0) discards it and must fold.
-                self._drop(lines, subsumed=self.lazy_nan and bool(slots and slots[0]))
-        elif m in ("FIST", "FISTP") and not self.observe_loads:
+                        value = t.helper('fto_float', Type.F32, cw, value)
+                operations.append(Store(bits, address, value, True))
+            if r.pops:
+                self._drop(operations, subsumed=self.lazy_nan and bool(slots and slots[0]))
+        elif r.action == 'store_integer' and not self.observe_loads:
             if self.lazy_nan:
-                self._fold(0, lines)
-            value = read(0)
-            exact = self._read(0, "exact", lines)
-            raw = "0" if exact == "0" else self._read(0, "bits", lines)
-            lines.append("wr%d((uint32_t)%s, (uint%d_t)fist_i%d_sw(&x87_sw_, x87_cw_, %s, %s, %s));"
-                         % (bits, address, bits, bits, value, exact, raw))
+                self._fold(0, operations)
+            value, exact = read(0), self._read(0, 'exact', operations)
+            raw = t.literal(0, Type.U64) if t.zero(exact) else self._read(0, 'bits', operations)
+            conversion = t.helper('fist', Type.I64, sw, cw, value, exact, raw)
+            value = Expr('integer_convert', Type.I64, conversion.args, bits)
+            operations.append(Store(bits, address, t.cast({16: Type.U16, 32: Type.U32, 64: Type.U64}[bits], value)))
             self.status_dirty = True
-            if m == "FISTP":
-                self._drop(lines)
-        elif m in x87.ARITH or m in x87.INTEGER_ARITH or (m.endswith("P") and m[:-1] in x87.ARITH):
-            pop = m.endswith("P")
-            base = m[:-1] if pop else m
-            integer = base in x87.INTEGER_ARITH
-            operator = (x87.INTEGER_ARITH if integer else x87.ARITH)[base]
+            if r.pops:
+                self._drop(operations)
+        elif r.action == 'arithmetic':
             if memory:
-                rhs = mem(integer)
-                dst, lhs = 0, read(0)
-                narrow = self._slot(0)[1].narrow and not integer and bits == 32
-            elif slots:
-                dst = slots[0] if len(slots) == 2 or pop else 0
-                src = slots[1] if len(slots) == 2 else (0 if pop else slots[0])
-                lhs, rhs = read(dst), read(src)
-                narrow = self._slot(dst)[1].narrow and self._slot(src)[1].narrow
+                rhs, dst = mem(r.integer), 0
+                lhs = read(0)
+                narrow = self._slot(0)[1].narrow and not r.integer and bits == 32
             else:
-                dst, lhs, rhs = 1, read(1), read(0)
-                narrow = self._slot(1)[1].narrow and self._slot(0)[1].narrow
-            if base.endswith("R"):
+                dst = r.dst
+                lhs, rhs = read(dst), read(r.src)
+                narrow = self._slot(dst)[1].narrow and self._slot(r.src)[1].narrow
+            if r.reverse:
                 lhs, rhs = rhs, lhs
+            raw = t.arithmetic(r.operator, lhs, rhs, sw)
+            use_float = narrow and r.operator in ('+', '-', '*') and not self.observe_loads and self.binary32
             if self.lazy_nan:
-                # NaN-propagating: keep the full-precision result, apply PC
-                # rounding per op, and defer the IE check/canonicalisation.
-                # The destination slot was an operand, so the pending result
-                # subsumes its old IE, and so does a popped operand.
-                raw = ("fdivz_sw(&x87_sw_, %s, %s)" % (lhs, rhs) if operator == "/" else
-                       "%s %s %s" % (lhs, operator, rhs))
-                if narrow and operator in ("+", "-", "*") and not self.observe_loads and self.binary32:
-                    value = ("((x87_cw_ & 0x300u) == 0u ? "
-                             "(double)((float)(%s) %s (float)(%s)) : %s)" %
-                             (lhs, operator, rhs, raw))
-                else:
-                    value = ("((x87_cw_ & 0x300u) == 0u ? "
-                             "(double)(float)(%s) : (%s))" % (raw, raw))
-                self._set(dst, value, lines, narrow=True, pending=True, subsumed=True)
+                value = (Expr('float_arithmetic', Type.F64, (cw, lhs, rhs, raw), r.operator) if use_float else
+                         Expr('pc_round', Type.F64, (cw, raw)))
+                self._set(dst, value, operations, narrow=True, pending=True, subsumed=True)
             else:
-                value = ("fdivz_sw(&x87_sw_, %s, %s)" % (lhs, rhs) if operator == "/" else
-                         "%s %s %s" % (lhs, operator, rhs))
-                value = "fx87_sw(&x87_sw_, x87_cw_, %s)" % value
-                if narrow and operator in ("+", "-", "*") and not self.observe_loads and self.binary32:
-                    value = ("((x87_cw_ & 0x300u) == 0u ? "
-                             "fx87_exact_sw(&x87_sw_, (double)((float)(%s) %s (float)(%s))) : %s)" %
-                             (lhs, operator, rhs, value))
-                self._set(dst, value, lines, narrow=True)
+                value = t.helper('fx87', Type.F64, sw, cw, raw)
+                if use_float:
+                    value = Expr('float_arithmetic', Type.F64, (cw, lhs, rhs, value, sw), r.operator)
+                self._set(dst, value, operations, narrow=True)
             self.status_dirty = True
-            if pop:
-                self._drop(lines, subsumed=True)
-        elif m in ("FCOM", "FCOMP", "FUCOM", "FUCOMP", "FICOM", "FICOMP", "FCOMPP", "FUCOMPP", "FTST"):
+            if r.pops:
+                self._drop(operations, subsumed=True)
+        elif r.action == 'compare':
             if self.lazy_nan:
-                # Compare is a sink: FUCOM would not raise IE for a quiet
-                # arithmetic NaN, so fold both operands first.
-                self._fold(0, lines)
+                self._fold(0, operations)
                 a = read(0)
                 if memory:
-                    other = mem(m.startswith("FI"))
-                elif m == "FTST":
-                    other = "0.0"
+                    other = mem(r.integer)
+                elif m == 'FTST':
+                    other = t.literal(0.0, Type.F64)
                 else:
-                    logical = slots[-1] if slots else 1
-                    self._fold(logical, lines)
-                    other = read(logical)
-                lines.append("%s(&x87_sw_, %s, %s);" %
-                             ("fucom_sw" if m.startswith("FU") else "fcom_sw", a, other))
+                    self._fold(r.src, operations)
+                    other = read(r.src)
             else:
-                other = (mem(m.startswith("FI")) if memory else
-                         "0.0" if m == "FTST" else read(slots[-1] if slots else 1))
-                lines.append("%s(&x87_sw_, %s, %s);" %
-                             ("fucom_sw" if m.startswith("FU") else "fcom_sw", read(0), other))
+                other = mem(r.integer) if memory else t.literal(0.0, Type.F64) if m == 'FTST' else read(r.src)
+                a = read(0)
+            operations.append(Evaluate(t.helper('fucom' if m.startswith('FU') else 'fcom', Type.VOID, sw, a, other)))
             self.status_dirty = True
-            for _ in range(2 if m.endswith("PP") else int(m.endswith("P"))):
-                self._drop(lines)
-        elif m in x87.UNARY:
-            narrow = self._slot(0)[1].narrow if m in ("FABS", "FCHS") else m == "FSQRT"
-            if self.lazy_nan and m in ("FABS", "FCHS"):
-                # Sign/payload-sensitive: eager acts on the canonical indefinite.
-                self._fold(0, lines)
-            self._set(0, scalar_env(x87.UNARY[m] % read(0)), lines,
-                      narrow=narrow, subsumed=self.lazy_nan and m in ("FSQRT", "FRNDINT", "FSIN", "FCOS", "F2XM1"))
+            for _ in range(r.pops):
+                self._drop(operations)
+        elif r.action == 'unary':
+            narrow = self._slot(0)[1].narrow if m in ('FABS', 'FCHS') else m == 'FSQRT'
+            if self.lazy_nan and m in ('FABS', 'FCHS'):
+                self._fold(0, operations)
+            self._set(0, t.unary(m, read(0), sw, cw), operations, narrow=narrow,
+                      subsumed=self.lazy_nan and m in ('FSQRT', 'FRNDINT', 'FSIN', 'FCOS', 'F2XM1'))
             self.status_dirty = True
-        elif m in ("FPREM", "FPREM1"):
-            self._set(0, "fprem_sw(&x87_sw_, %s, %s, %d)" %
-                      (read(0), read(1), int(m == "FPREM1")), lines)
+        elif r.action == 'remainder':
+            self._set(0, t.helper('fprem', Type.F64, sw, read(0), read(1), t.literal(int(m == 'FPREM1'))), operations)
             self.status_dirty = True
-        elif m == "FXCH":
-            other = slots[-1] if slots else 1
-            a = {part: self._read(0, part, lines) for part in ("value", "bits", "exact", "tag")}
-            b = {part: self._read(other, part, lines) for part in a}
-            a_narrow, b_narrow = self._slot(0)[1].narrow, self._slot(other)[1].narrow
+        elif r.action == 'exchange':
+            other = r.src
+            a = {part: self._read(0, part, operations) for part in ('value', 'bits', 'exact', 'tag')}
+            b = {part: self._read(other, part, operations) for part in a}
+            a_slot, b_slot = self._slot(0)[1], self._slot(other)[1]
+            a_narrow, b_narrow = a_slot.narrow, b_slot.narrow
+            a_pending, b_pending = a_slot.pending, b_slot.pending
+            self._assign(0, narrow=b_narrow, pending=b_pending if self.lazy_nan else None, **b)
+            self._assign(other, narrow=a_narrow, pending=a_pending if self.lazy_nan else None, **a)
+        elif r.action == 'status':
             if self.lazy_nan:
-                # A pure swap moves the deferred NaN with its value.
-                a_pending, b_pending = self._slot(0)[1].pending, self._slot(other)[1].pending
-                self._assign(0, narrow=b_narrow, pending=b_pending, **b)
-                self._assign(other, narrow=a_narrow, pending=a_pending, **a)
-            else:
-                self._assign(0, narrow=b_narrow, **b)
-                self._assign(other, narrow=a_narrow, **a)
-        elif m == "FNSTSW" and operands == (("ax", 0),):
+                self._fold_all(operations)
+            operations.append(Assign(result, Expr('status_word', Type.U16, (sw, self._phys(self.top)))))
+        elif r.action == 'clear':
             if self.lazy_nan:
-                self._fold_all(lines)
-            lines.append("%s = (uint16_t)((x87_sw_ & (uint16_t)~0x3800u) | ((%s) << 11));" %
-                         (result, self._phys(self.top)))
-        elif m in ("FNCLEX", "FCLEX"):
-            if self.lazy_nan:
-                # Eager canonicalised before clearing; suppress the IE it cleared.
-                self._fold_all(lines, emit_ie=False)
-            lines.append("x87_sw_ &= (uint16_t)~0x80ffu;")
+                self._fold_all(operations, emit_ie=False)
+            operations.append(Assign(sw, Expr('clear_mask', Type.U16, data=0x80ff), '&='))
             self.status_dirty = True
-        elif m in ("FDECSTP", "FINCSTP"):
-            self._move_top(-1 if m == "FDECSTP" else 1)
-            lines.append("x87_sw_ &= (uint16_t)~0x0200u;")
+        elif r.action == 'rotate':
+            self._move_top(-1 if m == 'FDECSTP' else 1)
+            operations.append(Assign(sw, Expr('clear_mask', Type.U16, data=0x200), '&='))
             self.status_dirty = True
-        elif m == "FNOP":
-            pass
-        else:
-            # State-reading helpers (FXAM/FIST/FINIT/CW changes) remain audited
-            # runtime effects. Afterward no scalar or environment fact survives.
-            lines.extend(self.flush())
-            lines.extend(x87.statements(data, address, result))
+        elif r.action != 'nop':
+            operations.extend(self.flush())
+            operations.extend(t.eager(r, address, result))
+            operations.append(t.Reset())
             self.reset()
-        return lines
+        return tuple(operations)

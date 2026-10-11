@@ -1,6 +1,7 @@
-"""One shared return layout per specialized callee."""
+"""One shared ordered state layout per specialized callee."""
 from dataclasses import dataclass
 
+from .body import FrozenMap
 from .call_contracts import FIELDS
 
 
@@ -8,29 +9,63 @@ def output_mask(fields):
     return sum(1 << i for i, field in enumerate(FIELDS) if field in fields)
 
 
-def shared_masks(requests):
-    masks = {}
-    for variants in requests:
-        for target, mask in variants:
-            masks[target] = masks.get(target, 0) | mask
-    return masks
+@dataclass(frozen=True)
+class PrivateLayout:
+    inputs: tuple
+    outputs: tuple
+    resident_opaque: tuple = ("EIP", "FS_OFFSET", "DF", "x87", "runtime")
 
-
-@dataclass
-class SpecializationPlan:
-    layouts: dict
-    caller_requests: dict
+    def __post_init__(self):
+        for names in (self.inputs, self.outputs):
+            if not isinstance(names, tuple) or names != tuple(f for f in FIELDS if f in names):
+                raise ValueError("private fields must be unique and in guest contract order")
+        if not isinstance(self.resident_opaque, tuple) or len(set(self.resident_opaque)) != len(self.resident_opaque):
+            raise ValueError("resident opaque state must be an ordered unique tuple")
 
     @classmethod
-    def build(cls, requests):
-        layouts = shared_masks(requests.values())
-        callers = {addr: {(target, layouts[target]) for target, _mask in wanted}
+    def from_mask(cls, mask, inputs=FIELDS):
+        if mask < 0 or mask & ~((1 << len(FIELDS)) - 1):
+            raise ValueError("invalid private output mask")
+        return cls(tuple(f for f in FIELDS if f in inputs),
+                   tuple(f for i, f in enumerate(FIELDS) if mask & (1 << i)))
+
+    @property
+    def output_mask(self):
+        return output_mask(self.outputs)
+
+
+@dataclass(frozen=True)
+class ProvisionalBindings:
+    invocations: FrozenMap
+
+
+@dataclass(frozen=True)
+class FinalBindings:
+    invocations: FrozenMap
+    layouts: FrozenMap
+    values: FrozenMap
+
+
+@dataclass(frozen=True)
+class SpecializationPlan:
+    layouts: FrozenMap
+    caller_requests: FrozenMap
+
+    @classmethod
+    def build(cls, requests, contracts):
+        masks = {}
+        for wanted in requests.values():
+            for target, mask in wanted:
+                masks[target] = masks.get(target, 0) | mask
+        layouts = {addr: PrivateLayout.from_mask(mask, contracts[addr].reads | frozenset(("ESP", "EBP")))
+                   for addr, mask in masks.items()}
+        callers = {addr: frozenset((target, layouts[target].output_mask) for target, _ in wanted)
                    for addr, wanted in requests.items() if wanted}
-        return cls(layouts, callers)
+        return cls(FrozenMap.of(layouts), FrozenMap.of(callers))
 
     @property
     def private_masks(self):
-        return {addr: {mask} for addr, mask in self.layouts.items()}
+        return {addr: {layout.output_mask} for addr, layout in self.layouts.items()}
 
 
 def eligible_leaves(scanned, opaque):
