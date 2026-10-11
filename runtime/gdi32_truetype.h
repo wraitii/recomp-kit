@@ -13,6 +13,22 @@ struct TrueTypeFace;
 struct TrueTypeMetrics {
     int32_t ascent = 0, descent = 0, height = 0, internal = 0, average = 0, maximum = 0;
 };
+struct TrueTypeOutlineMetrics {
+    uint8_t panose[10] = {};
+    uint32_t em_square = 0;
+    uint32_t selection = 0, type = 0, minimum_ppem = 0;
+    int32_t ascent = 0, descent = 0, line_gap = 0;
+    int32_t x_min = 0, y_min = 0, x_max = 0, y_max = 0;
+    int32_t mac_ascent = 0, mac_descent = 0, mac_line_gap = 0;
+    int32_t slope_rise = 0, slope_run = 0;
+    int32_t subscript_x_size = 0, subscript_y_size = 0;
+    int32_t subscript_x_offset = 0, subscript_y_offset = 0;
+    int32_t superscript_x_size = 0, superscript_y_size = 0;
+    int32_t superscript_x_offset = 0, superscript_y_offset = 0;
+    int32_t strikeout_size = 0, strikeout_position = 0;
+    int32_t underline_size = 0, underline_position = 0;
+    int32_t italic_angle = 0;
+};
 struct TrueTypeGlyph {
     int32_t w = 0, h = 0, x = 0, y = 0; // offset from the pen on the baseline
     std::vector<uint8_t> coverage;
@@ -30,6 +46,10 @@ const TrueTypeFace *truetype_windows_substitute(const std::string &family, int32
 // cell height, zero a 16-pixel cell.
 double truetype_scale(const TrueTypeFace *face, int32_t lf_height);
 TrueTypeMetrics truetype_metrics(const TrueTypeFace *face, double scale);
+TrueTypeOutlineMetrics truetype_outline_metrics(const TrueTypeFace *face, double scale);
+const std::string &truetype_family(const TrueTypeFace *face);
+const std::string &truetype_style(const TrueTypeFace *face);
+const std::string &truetype_full_name(const TrueTypeFace *face);
 int32_t truetype_advance(const TrueTypeFace *face, double scale, uint32_t codepoint);
 // One glyph's coverage, cached; valid until the next call.
 const TrueTypeGlyph &truetype_glyph(const TrueTypeFace *face, double scale, uint32_t codepoint);

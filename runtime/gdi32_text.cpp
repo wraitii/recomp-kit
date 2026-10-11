@@ -191,23 +191,104 @@ void get_metrics(X86 *c) {
     }
     set_eax(c, 1);
 }
-// OUTLINETEXTMETRICA: the size word then the TEXTMETRICA the base call also
-// reports. The outline specifics stay zero.
+void metrics_a(uint8_t *out, uint32_t weight, const Pen &pen) {
+    auto put32 = [&](size_t at, uint32_t value) { memcpy(out + at, &value, 4); };
+    put32(0, uint32_t(pen.metrics.height));
+    put32(4, uint32_t(pen.metrics.ascent));
+    put32(8, uint32_t(pen.metrics.descent));
+    put32(12, uint32_t(pen.metrics.internal));
+    put32(20, uint32_t(pen.metrics.average));
+    put32(24, uint32_t(pen.metrics.maximum));
+    put32(28, weight);
+    put32(36, 96);
+    put32(40, 96);
+    out[44] = 32;
+    out[45] = 127;
+    out[46] = '?';
+    out[47] = ' ';
+    out[51] = 0x30;
+}
 void outline_text_metrics(X86 *c) {
     auto *dc = dc_of(arg(c, 0));
     uint32_t size = arg(c, 1), out = arg(c, 2);
-    if (!dc || !out || size < 64 || !gm_valid(out, size)) {
+    if (!dc) {
         set_eax(c, 0);
         return;
     }
-    memset(g_mem + out, 0, size);
-    wr32(out, size);
+    const Pen pen = pen_of(arg(c, 0));
+    if (!pen.face) {
+        set_eax(c, 0);
+        return;
+    }
+    constexpr size_t fixed_size = 212;
+    const std::string &family = truetype_family(pen.face);
+    const std::string &style = truetype_style(pen.face);
+    const std::string &full_name = truetype_full_name(pen.face);
+    const size_t required = fixed_size + (family.size() + 1) * 2 +
+                            (style.empty() ? 0 : style.size() + 1) +
+                            (full_name.empty() ? 0 : full_name.size() + 1);
+    if (!out) {
+        set_eax(c, uint32_t(required));
+        return;
+    }
+    if (!gm_valid(out, size)) {
+        set_eax(c, 0);
+        return;
+    }
+    std::vector<uint8_t> data(required, 0);
+    auto put32 = [&](size_t at, uint32_t value) { memcpy(data.data() + at, &value, 4); };
+    const size_t copied = std::min<size_t>(size, data.size());
+    put32(0, uint32_t(copied));
     auto font = objects().find(dc->font);
     uint32_t weight = font == objects().end() ? 400 : font_word(font->second, 16);
     if (!weight)
         weight = 400;
-    metrics(out + 4, font_scale(arg(c, 0)), weight);
-    set_eax(c, 1);
+    metrics_a(data.data() + 4, weight, pen);
+    const TrueTypeOutlineMetrics om = truetype_outline_metrics(pen.face, pen.scale);
+    memcpy(data.data() + 61, om.panose, sizeof(om.panose));
+    put32(72, om.selection);
+    put32(76, om.type);
+    put32(80, uint32_t(om.slope_rise));
+    put32(84, uint32_t(om.slope_run));
+    put32(88, uint32_t(om.italic_angle));
+    put32(92, om.em_square);
+    put32(96, uint32_t(om.ascent));
+    put32(100, uint32_t(om.descent));
+    put32(104, uint32_t(om.line_gap));
+    put32(116, uint32_t(om.x_min));
+    put32(120, uint32_t(om.y_max));
+    put32(124, uint32_t(om.x_max));
+    put32(128, uint32_t(om.y_min));
+    put32(132, uint32_t(om.mac_ascent));
+    put32(136, uint32_t(om.mac_descent));
+    put32(140, uint32_t(om.mac_line_gap));
+    put32(144, om.minimum_ppem);
+    put32(148, uint32_t(om.subscript_x_size));
+    put32(152, uint32_t(om.subscript_y_size));
+    put32(156, uint32_t(om.subscript_x_offset));
+    put32(160, uint32_t(om.subscript_y_offset));
+    put32(164, uint32_t(om.superscript_x_size));
+    put32(168, uint32_t(om.superscript_y_size));
+    put32(172, uint32_t(om.superscript_x_offset));
+    put32(176, uint32_t(om.superscript_y_offset));
+    put32(180, uint32_t(om.strikeout_size));
+    put32(184, uint32_t(om.strikeout_position));
+    put32(188, uint32_t(om.underline_size));
+    put32(192, uint32_t(om.underline_position));
+    size_t names_at = fixed_size;
+    auto append_name = [&](size_t field, const std::string &name) {
+        if (name.empty())
+            return;
+        put32(field, uint32_t(names_at));
+        memcpy(data.data() + names_at, name.c_str(), name.size() + 1);
+        names_at += name.size() + 1;
+    };
+    append_name(196, family);
+    append_name(200, family);
+    append_name(204, style);
+    append_name(208, full_name);
+    memcpy(g_mem + out, data.data(), copied);
+    set_eax(c, uint32_t(copied));
 }
 void char_width32(X86 *c) {
     uint32_t dc = arg(c, 0), first = arg(c, 1), last = arg(c, 2), out = arg(c, 3);
