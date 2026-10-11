@@ -898,8 +898,9 @@ void k_LocalFree(X86 *c) {
     set_eax(c, heap_free(arg(c, 0)) ? 0 : arg(c, 0));
 }
 
-// Virtual regions are whole 4 KB pages, base and size, so two allocations can
-// never share a page. Commit state is tracked per region: freshly committed
+// Virtual regions are whole 4 KB pages on 64 KB aligned bases, as on Win32, so
+// two allocations never share a page and callers can mask an address inside a
+// reservation down to an aligned base. Commit state is tracked per region: freshly committed
 // pages read as zero, a commit over already committed pages leaves them alone,
 // and a decommit discards the contents.
 // The region containing `addr`, or nullptr.
@@ -942,7 +943,7 @@ void k_VirtualAlloc(X86 *c) {
         LOGV("VirtualAlloc: ignoring requested base %08x, no region there", addr);
     }
 
-    uint32_t base = heap_alloc(pages, true, 4096);
+    uint32_t base = heap_alloc(pages, true, 0x10000);
     if (!base) {
         set_last_error(ERROR_NOT_ENOUGH_MEMORY_);
         set_eax(c, 0);
@@ -1672,8 +1673,7 @@ void k_GetSystemInfo(X86 *c) {
     wr32(p + 16, 1);          // dwActiveProcessorMask
     wr32(p + 20, 1);          // dwNumberOfProcessors
     wr32(p + 24, 586);        // dwProcessorType = PROCESSOR_INTEL_PENTIUM
-    wr32(p + 28, 4096);       // dwAllocationGranularity is 65536 on Win32
-    wr32(p + 28, 65536);
+    wr32(p + 28, 65536);      // dwAllocationGranularity
     wr32(p + 32, (5 << 8) | 6); // wProcessorLevel / wProcessorRevision
     set_eax(c, 0);
 }
@@ -2034,6 +2034,19 @@ void k_SystemTimeToFileTime(X86 *c) {
     wr32(out, (uint32_t)ft);
     wr32(out + 4, (uint32_t)(ft >> 32));
     set_eax(c, 1);
+}
+
+// (lpFileTime1, lpFileTime2). A FILETIME is an unsigned 64-bit tick count,
+// so the high word decides first and the low word only breaks a tie.
+void k_CompareFileTime(X86 *c) {
+    const uint32_t a = arg(c, 0), b = arg(c, 1);
+    if (!a || !b || !gm_valid(a, 8) || !gm_valid(b, 8)) {
+        set_eax(c, 0);
+        return;
+    }
+    const uint64_t ta = (uint64_t)rd32(a) | ((uint64_t)rd32(a + 4) << 32);
+    const uint64_t tb = (uint64_t)rd32(b) | ((uint64_t)rd32(b + 4) << 32);
+    set_eax(c, ta < tb ? 0xffffffffu : ta > tb ? 1u : 0u);
 }
 
 void k_GetTimeZoneInformation(X86 *c) {
@@ -3532,6 +3545,11 @@ void thread_run_exit_cleanup(GuestThread *t) {
     recomp_profile_truncate(0);
     if (g_thread_exit_observer)
         g_thread_exit_observer();
+    g_sched_m.lock();
+    bool have_baton = g_baton == t->index;
+    g_sched_m.unlock();
+    if (have_baton)
+        oleaut32_thread_exit(guest_current_context());
     // Last, so that mod code running in the unwind or the observer still sees
     // a guest thread holding the baton, which is what it is.
     t_is_guest = false;
@@ -3926,6 +3944,38 @@ void k_SuspendThread(X86 *c) {
         return;
     }
     set_eax(c, 0);
+}
+
+// A suspended thread has its registers parked in its GuestThread, and the
+// main thread's live in the loader's process-wide context. The pseudo-handle
+// GetCurrentThread returns is the running thread, whose registers are here.
+void k_GetThreadContext(X86 *c) {
+    uint32_t h = arg(c, 0);
+    uint32_t p = arg(c, 1);
+    if (!p || !gm_valid(p, 0x2cc)) {
+        set_last_error(87 /* ERROR_INVALID_PARAMETER */);
+        set_eax(c, 0);
+        return;
+    }
+    X86 *src = nullptr;
+    if (h == 0xfffffffeu) {
+        src = c;
+    } else {
+        GuestThread *me = cur_thread();
+        for (GuestThread *t : threads()) {
+            if (t->handle != h || !t->handle)
+                continue;
+            src = t == me ? c : (t->is_main ? loader_context() : &t->ctx);
+            break;
+        }
+    }
+    if (!src) {
+        set_last_error(ERROR_INVALID_HANDLE_);
+        set_eax(c, 0);
+        return;
+    }
+    recomp_context_fill(src, p, src->eip);
+    set_eax(c, 1);
 }
 
 void k_GetCurrentThread(X86 *c) {
@@ -5440,8 +5490,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "GetSystemDirectoryA", 2, k_GetSystemDirectoryA},
     {"KERNEL32.dll", "GetTempPathA", 2, k_GetTempPathA},
     {"KERNEL32.dll", "GetTempPathW", 2, k_GetTempPathW},
-    // The guest CONTEXT layout is a runtime detail no shim here has needed.
-    {"KERNEL32.dll", "GetThreadContext", 2, imports_unsupported},
+    {"KERNEL32.dll", "GetThreadContext", 2, k_GetThreadContext},
     {"KERNEL32.dll", "GetTempFileNameA", 4, k_GetTempFileNameA},
     {"KERNEL32.dll", "DisableThreadLibraryCalls", 1, k_DisableThreadLibraryCalls},
     {"KERNEL32.dll", "GetLogicalDriveStringsA", 2, k_GetLogicalDriveStringsA},
@@ -5595,6 +5644,7 @@ const ImportShim g_kernel32_shims[] = {
     // survives, and the log says which of these it wanted.
     {"KERNEL32.dll", "SetFileTime", 4, nullptr},
     {"KERNEL32.dll", "SystemTimeToFileTime", 2, k_SystemTimeToFileTime},
+    {"KERNEL32.dll", "CompareFileTime", 2, k_CompareFileTime},
     {"KERNEL32.dll", "SystemTimeToTzSpecificLocalTime", 3, nullptr},
     {"KERNEL32.dll", "TzSpecificLocalTimeToSystemTime", 3, nullptr},
     {"KERNEL32.dll", "OpenProcess", 3, nullptr},
