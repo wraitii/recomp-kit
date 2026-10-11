@@ -62,7 +62,7 @@ bool split(const std::string &rel, std::vector<std::string> *out) {
             cur += c;
             continue;
         }
-        if (cur == ".." || cur == ".")
+        if (cur == "." || (cur == ".." && !out->empty() && out->back() != ".."))
             return false;
         if (!cur.empty())
             out->push_back(cur);
@@ -185,6 +185,19 @@ bool resolve_in(const std::string &root, const std::string &rel, bool create, bo
         return false;
     for (size_t i = 0; i < comps.size(); ++i) {
         std::string name = comps[i];
+        if (name == "..") {
+            // A guest path that leaves the guest root reaches siblings of the
+            // game directory; only reads from the game tier may climb.
+            if (mutation || create || root != win32_game_dir())
+                return false;
+            size_t slash = host.find_last_of("/\\");
+            if (slash == std::string::npos)
+                return false;
+            host.erase(slash);
+            if (host.empty() || os_stat(host.c_str(), &st) != 0 || !st.is_dir)
+                return false;
+            continue;
+        }
         // Always use the directory's spelling, even on case-insensitive hosts.
         std::string found_name;
         int lk = lookup_name(host, lower(name), &found_name);

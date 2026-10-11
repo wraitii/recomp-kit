@@ -369,13 +369,22 @@ static std::vector<std::string> normalise_components(const std::string &guest_pa
             r = r.substr(2);
         return split_path(r);
     }();
-    bool under_root = norm.size() >= root.size() && !root.empty();
-    for (size_t i = 0; under_root && i < root.size(); ++i)
-        under_root = lower(norm[i]) == lower(root[i]);
-    if (under_root)
+    size_t common = 0;
+    while (common < root.size() && common < norm.size() &&
+           lower(norm[common]) == lower(root[common]))
+        ++common;
+    if (!root.empty() && common == root.size()) {
         norm.erase(norm.begin(), norm.begin() + (long)root.size());
-    else if (!norm.empty() && lower(norm[0]) == lower(win32_guest_root_name()))
+    } else if (common > 0) {
+        // The game reaches sibling installs - Warlords and the base Assets -
+        // through ".." from the guest root's parent, so a path that leaves
+        // the root maps by climbing out of the host game directory once per
+        // root component it did not consume.
+        norm.erase(norm.begin(), norm.begin() + (long)common);
+        norm.insert(norm.begin(), root.size() - common, std::string(".."));
+    } else if (!norm.empty() && lower(norm[0]) == lower(win32_guest_root_name())) {
         norm.erase(norm.begin());
+    }
     return norm;
 }
 
@@ -4795,6 +4804,8 @@ void create_file_named(X86 *c, const std::string &name) {
     }
     int fd = os_fd_open(host.c_str(), flags);
     if (fd < 0) {
+        if (recomp_env("TRACE_FILES"))
+            LOGW("file: open FAILED \"%s\" host=\"%s\"", name.c_str(), host.c_str());
         set_last_error(ERROR_FILE_NOT_FOUND_);
         set_eax(c, INVALID_HANDLE_VALUE_);
         return;
@@ -4967,6 +4978,9 @@ void find_first_named(X86 *c, const std::string &pattern, bool wide) {
     // two real map files and the terrain colour never loads.
     std::string host_dir = dirpart.empty() ? win32_host_path_op(".", WIN32_FILE_LIST)
                                            : win32_host_path_op(dirpart, WIN32_FILE_LIST);
+    if (recomp_env("TRACE_FILES"))
+        LOGW("file: find \"%s\" dir=\"%s\" host=\"%s\"", pattern.c_str(), dirpart.c_str(),
+             host_dir.c_str());
     auto add_dot = [&](const char *name) {
         o.matches.push_back(name);
         o.match_paths.push_back(host_dir);
@@ -5335,6 +5349,13 @@ void k_SetThreadAffinityMask(X86 *c) {
     set_eax(c, 1); // the previous mask
 }
 
+// (HandlerRoutine, Add). Console control events (Ctrl+C, logoff, shutdown) do
+// not reach a guest whose host is a window; no handler is ever invoked, but
+// registration succeeds so a title that installs one proceeds.
+void k_SetConsoleCtrlHandler(X86 *c) {
+    set_eax(c, 1);
+}
+
 // (hTimer, pDueTime, lPeriod, pfnCompletionRoutine, lpArgToCompletionRoutine,
 // fResume). A negative due time is relative, in 100 ns; a positive one is an
 // absolute UTC FILETIME. Completion routines need an alertable wait, which
@@ -5504,7 +5525,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "GetOverlappedResult", 4, nullptr},
     {"KERNEL32.dll", "HeapValidate", 3, nullptr},
     {"KERNEL32.dll", "QueueUserAPC", 3, nullptr},
-    {"KERNEL32.dll", "SetConsoleCtrlHandler", 2, nullptr},
+    {"KERNEL32.dll", "SetConsoleCtrlHandler", 2, k_SetConsoleCtrlHandler},
     {"KERNEL32.dll", "TerminateThread", 2, nullptr},
     {"KERNEL32.dll", "GetTimeZoneInformation", 1, k_GetTimeZoneInformation},
     // TLS / interlocked / critical sections
