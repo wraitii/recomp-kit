@@ -468,7 +468,8 @@ def main(argv=None):
         conservative = native_replaced(settings)
         mode_prepared = entry_model.cw_inputs(scanned)
         mode_opaque = conservative | helpers | {addr for addr, row in scanned.items() if row.exclusion is not None}
-        mode_sites, facts_report = x87_facts.load(settings.x87_facts, ctx, mode_prepared, mode_opaque)
+        x87_facts_loaded = x87_facts.load(settings.x87_facts, ctx, mode_prepared, mode_opaque)
+        mode_sites = x87_facts_loaded.mode_sites()
         entry_verification = {row["function"]: (row["mask"], row["value"])
                               for row in settings.x87_entry_contracts if row.get("verify")}
         mode_summaries = x87_mode.summarize(mode_prepared, mode_opaque)
@@ -579,7 +580,7 @@ def main(argv=None):
             {"function": "%08x" % addr, "reason": results[addr][2]}
             for addr in sorted(results) if results[addr][2] is not None],
         "call_decisions": decisions,
-        "x87_compiler_facts": facts_report,
+        "x87_compiler_facts": x87_facts_loaded.report(),
         "x87_mode": mode_report(settings, mode_prepared, mode_summaries, mode_opaque,
                                 known_modes & private_masks.keys(), x87_counts, mode_exposure,
                                 selected_callers | checked_returns),

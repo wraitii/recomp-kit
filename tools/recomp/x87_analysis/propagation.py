@@ -122,9 +122,9 @@ def main(argv=None):
         if x87_facts.identity(settings) != fact_identity:
             raise ValueError("analysis inputs changed during proof discovery")
         production_opaque = opaque | {a for a, r in scanned.items() if r.exclusion is not None}
-        facts = x87_facts.document(ctx, prepared, summaries, baseline, baseline_entries, production_opaque)
+        facts = x87_facts.build(ctx, prepared, summaries, baseline, baseline_entries, production_opaque)
         args.facts_out.parent.mkdir(parents=True, exist_ok=True)
-        args.facts_out.write_text(json.dumps(facts, separators=(",", ":")) + "\n")
+        args.facts_out.write_text(facts.to_json() + "\n")
         x87_facts.load(args.facts_out, ctx, prepared, opaque)
     report = {"scope": "analysis only; hypothetical contracts never change game configuration",
               "return_metadata": return_metadata,
