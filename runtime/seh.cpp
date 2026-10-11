@@ -136,18 +136,8 @@ struct ChainWalk {
 // `eip` is the instruction the context resumes at: the faulting instruction
 // for a CPU fault, or the caller's return address for RaiseException.
 void fill_context(X86 *c, uint32_t context, uint32_t eip) {
-    wr32(context, 0x10003);     // CONTEXT_i386 | CONTROL | INTEGER
-    wr32(context + 0x90, 0x3b); // FS (TEB)
-    wr32(context + 0x94, 0x23); // ES
-    wr32(context + 0x98, 0x23); // DS
-    const int regs[] = {R_EDI, R_ESI, R_EBX, R_EDX, R_ECX, R_EAX, R_EBP};
-    for (uint32_t i = 0; i < 7; ++i)
-        wr32(context + 0x9c + i * 4, c->r[regs[i]]);
-    wr32(context + 0xb8, eip);
-    wr32(context + 0xbc, 0x1b); // CS
-    wr32(context + 0xc0, x86_get_eflags(c));
-    wr32(context + 0xc4, c->r[R_ESP]);
-    wr32(context + 0xc8, 0x23); // SS
+    wr32(context, 0x10003); // CONTEXT_i386 | CONTROL | INTEGER
+    recomp_context_fill(c, context, eip);
 }
 
 SehDispatch *new_dispatch(X86 *c, uint32_t supplied_record = 0, uint32_t fault_eip = 0) {
@@ -233,6 +223,23 @@ uint32_t call_handler(X86 *c, uint32_t reg, SehDispatch *d) {
 } // namespace
 
 extern "C" {
+
+// Windows x86 CONTEXT register offsets. Writes the control, integer and
+// segment sets; the caller owns ContextFlags and the floating-point/debug
+// areas, matching CONTEXT_FULL's coverage.
+void recomp_context_fill(X86 *src, uint32_t context, uint32_t eip) {
+    wr32(context + 0x90, 0x3b); // FS (TEB)
+    wr32(context + 0x94, 0x23); // ES
+    wr32(context + 0x98, 0x23); // DS
+    const int regs[] = {R_EDI, R_ESI, R_EBX, R_EDX, R_ECX, R_EAX, R_EBP};
+    for (uint32_t i = 0; i < 7; ++i)
+        wr32(context + 0x9c + i * 4, src->r[regs[i]]);
+    wr32(context + 0xb8, eip);
+    wr32(context + 0xbc, 0x1b); // CS
+    wr32(context + 0xc0, x86_get_eflags(src));
+    wr32(context + 0xc4, src->r[R_ESP]);
+    wr32(context + 0xc8, 0x23); // SS
+}
 
 // Inspection only: do not repair or dereference an invalid link. Retain the
 // last valid boundary so one message bounds the first corrupting guest code.

@@ -33,6 +33,10 @@ void recomp_seh_intercept(X86 *c, uint32_t target);
 /* Verbose-only, bounded validation. Logs the first failure and last good point. */
 void recomp_seh_validate_chain(X86 *c, const char *phase, const char *detail);
 
+/* Fills a Windows x86 CONTEXT with src's control, integer and segment
+ * registers at `eip`; ContextFlags and the float/debug areas are untouched. */
+void recomp_context_fill(X86 *src, uint32_t context, uint32_t eip);
+
 /* Context reuse/teardown on its owning host thread; NULL drops all its state. */
 void recomp_seh_reset(X86 *c);
 /* A callback return abandons frames/landings created at this call depth. */
