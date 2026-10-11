@@ -74,6 +74,8 @@ ImportCallObserver imports_set_call_observer_get(void);
 // WINMM tables owned by this runtime. Idempotent; called by loader_load().
 void imports_init();
 void oleaut32_register();
+void oleaut32_reset();
+void oleaut32_thread_exit(X86 *c);
 void misc_dlls_register();
 void comctl32_register();
 void media_foundation_register();

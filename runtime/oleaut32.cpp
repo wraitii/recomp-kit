@@ -2,13 +2,19 @@
 // the guest scheduler baton; copies own their strings and array elements.
 #include "imports.h"
 #include "memory.h"
+#include "win32.h"
+#include "../dx/com.h"
+#include "../platform/os.h"
 #include <cmath>
 #include <cstring>
 #include <iomanip>
 #include <limits>
 #include <locale>
+#include <map>
 #include <sstream>
 #include <array>
+#include <string>
+#include <vector>
 
 namespace {
 constexpr uint32_t INVALID = 0x80070057u, OOM = 0x8007000eu;
@@ -41,6 +47,137 @@ void bstr_free(uint32_t b) {
 }
 uint32_t bstr_copy(uint32_t b) {
     return b ? bstr_alloc(b, rd32(b - 4) / 2) : 0;
+}
+uint32_t bstr_from_z(uint32_t src) {
+    if (!src)
+        return 0;
+    uint32_t units = 0;
+    while (units < GUEST_SIZE / 2 && valid(src + units * 2, 2)) {
+        if (!rd16(src + units * 2))
+            return bstr_alloc(src, units);
+        ++units;
+    }
+    return 0;
+}
+
+struct ErrorInfo {
+    std::array<uint8_t, 16> guid{};
+    uint32_t strings[3] = {};
+    uint32_t context = 0;
+};
+std::map<uint32_t, ErrorInfo> error_objects;
+std::map<uint32_t, uint32_t> thread_errors;
+
+ErrorInfo *error_this(X86 *c, ComIface iface) {
+    ComObj *o = com_this_arg(c, iface);
+    if (!o || o->kind != K_ERRORINFO)
+        return nullptr;
+    auto it = error_objects.find(o->id);
+    return it == error_objects.end() ? nullptr : &it->second;
+}
+void error_destroy(ComObj *o) {
+    auto it = error_objects.find(o->id);
+    if (it == error_objects.end())
+        return;
+    for (uint32_t b : it->second.strings)
+        bstr_free(b);
+    error_objects.erase(it);
+}
+void error_reference(X86 *c, uint32_t p, bool retain) {
+    if (ComObj *o = com_iface_of(p) != IF_NONE ? com_this(p) : nullptr) {
+        if (retain)
+            com_addref(o);
+        else
+            com_release(o);
+    } else {
+        guest_call(c, rd32(rd32(p) + (retain ? 4 : 8)), p);
+    }
+}
+template <bool Set> void error_guid(X86 *c) {
+    ErrorInfo *e = error_this(c, Set ? IF_CREATEERRORINFO : IF_ERRORINFO);
+    uint32_t p = arg(c, 1);
+    if (!e || !valid(p, 16)) {
+        set_eax(c, E_POINTER);
+        return;
+    }
+    if (Set)
+        memcpy(e->guid.data(), gm_ptr(p), 16);
+    else
+        memcpy(gm_ptr(p), e->guid.data(), 16);
+    set_eax(c, S_OK);
+}
+template <bool Set, unsigned Field> void error_string(X86 *c) {
+    ErrorInfo *e = error_this(c, Set ? IF_CREATEERRORINFO : IF_ERRORINFO);
+    uint32_t p = arg(c, 1);
+    if (!e || (!Set && !valid(p, 4))) {
+        set_eax(c, E_POINTER);
+        return;
+    }
+    uint32_t b = Set ? bstr_from_z(p) : bstr_copy(e->strings[Field]);
+    if (Set) {
+        if (p && !b) {
+            set_eax(c, E_OUTOFMEMORY);
+            return;
+        }
+        bstr_free(e->strings[Field]);
+        e->strings[Field] = b;
+    } else {
+        wr32(p, b);
+        if (e->strings[Field] && !b) {
+            set_eax(c, E_OUTOFMEMORY);
+            return;
+        }
+    }
+    set_eax(c, S_OK);
+}
+template <bool Set> void error_context(X86 *c) {
+    ErrorInfo *e = error_this(c, Set ? IF_CREATEERRORINFO : IF_ERRORINFO);
+    uint32_t p = arg(c, 1);
+    if (!e || (!Set && !valid(p, 4))) {
+        set_eax(c, E_POINTER);
+        return;
+    }
+    if (Set)
+        e->context = p;
+    else
+        wr32(p, e->context);
+    set_eax(c, S_OK);
+}
+void o_CreateErrorInfo(X86 *c) {
+    uint32_t out = arg(c, 0);
+    if (!valid(out, 4)) {
+        set_eax(c, E_POINTER);
+        return;
+    }
+    ComObj *o = com_new(K_ERRORINFO);
+    error_objects.emplace(o->id, ErrorInfo{});
+    uint32_t p = com_view(o, IF_CREATEERRORINFO);
+    wr32(out, p);
+    if (!p)
+        com_release(o);
+    set_eax(c, p ? S_OK : E_OUTOFMEMORY);
+}
+void o_SetErrorInfo(X86 *c) {
+    if (arg(c, 0)) {
+        set_eax(c, E_INVALIDARG);
+        return;
+    }
+    uint32_t p = arg(c, 1), id = guest_current_thread_id();
+    if (p && (!valid(p, 4) || !valid(rd32(p), 12))) {
+        set_eax(c, E_POINTER);
+        return;
+    }
+    if (p)
+        error_reference(c, p, true);
+    auto it = thread_errors.find(id);
+    uint32_t old = it == thread_errors.end() ? 0 : it->second;
+    if (p)
+        thread_errors[id] = p;
+    else
+        thread_errors.erase(id);
+    if (old)
+        error_reference(c, old, false);
+    set_eax(c, S_OK);
 }
 uint32_t element_size(uint16_t vt) {
     switch (vt) {
@@ -335,6 +472,68 @@ void o_VariantCopyInd(X86 *c) {
     set_eax(c, variant_copy(arg(c, 0), arg(c, 1), true));
 }
 
+bool number_variant(uint16_t vt) {
+    switch (vt) {
+    case 2:
+    case 3:
+    case 4:
+    case 5:
+    case 11:
+    case 16:
+    case 17:
+    case 18:
+    case 19:
+    case 20:
+    case 21:
+    case 22:
+    case 23:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void variant_number(uint16_t vt, uint32_t p, double &out) {
+    switch (vt) {
+    case 4: {
+        uint32_t bits = rd32(p);
+        float f;
+        memcpy(&f, &bits, sizeof f);
+        out = f;
+        break;
+    }
+    case 5:
+        memcpy(&out, g_mem + p, 8);
+        break;
+    case 11:
+    case 2:
+        out = int16_t(rd16(p));
+        break;
+    case 16:
+        out = int8_t(rd8(p));
+        break;
+    case 17:
+        out = uint8_t(rd8(p));
+        break;
+    case 18:
+        out = rd16(p);
+        break;
+    case 19:
+    case 23:
+        out = rd32(p);
+        break;
+    case 20:
+        out = double(int64_t(rd64(p)));
+        break;
+    case 21:
+        out = double(rd64(p));
+        break;
+    default:
+        out = int32_t(rd32(p));
+        break;
+    }
+}
+
 // The supported scalar conversions use a fixed locale, independent of the
 // host's locale. Integer conversion uses Automation's ties-to-even rounding.
 // VariantChangeType and VariantChangeTypeEx differ only in where the flags and
@@ -349,18 +548,12 @@ uint32_t variant_change_type(uint32_t dst, uint32_t src, uint16_t flags, uint16_
         return OOM;
     uint32_t hr = variant_copy(tmp, src, true);
     uint16_t from = rd16(tmp);
-    if (!hr && !(from == 3 || from == 5 || from == 8 || from == 11))
+    if (!hr && !(from == 8 || number_variant(from)))
         hr = MISMATCH;
     double number = 0;
     std::string text;
     if (!hr) {
-        if (from == 3)
-            number = int32_t(rd32(tmp + 8));
-        else if (from == 5)
-            memcpy(&number, g_mem + tmp + 8, 8);
-        else if (from == 11)
-            number = int16_t(rd16(tmp + 8));
-        else {
+        if (from == 8) {
             uint32_t b = rd32(tmp + 8);
             text = gm_wstr(b, b ? rd32(b - 4) / 2 : 0);
             if (to != 8) {
@@ -380,7 +573,8 @@ uint32_t variant_change_type(uint32_t dst, uint32_t src, uint16_t flags, uint16_
                     }
                 }
             }
-        }
+        } else
+            variant_number(from, tmp + 8, number);
         if (!std::isfinite(number))
             hr = MISMATCH;
     }
@@ -433,12 +627,10 @@ uint32_t variant_change_type(uint32_t dst, uint32_t src, uint16_t flags, uint16_
     return hr;
 }
 void o_VariantChangeType(X86 *c) {
-    set_eax(c, variant_change_type(arg(c, 0), arg(c, 1), uint16_t(arg(c, 2)),
-                                   uint16_t(arg(c, 3))));
+    set_eax(c, variant_change_type(arg(c, 0), arg(c, 1), uint16_t(arg(c, 2)), uint16_t(arg(c, 3))));
 }
 void o_VariantChangeTypeEx(X86 *c) {
-    set_eax(c, variant_change_type(arg(c, 0), arg(c, 1), uint16_t(arg(c, 3)),
-                                   uint16_t(arg(c, 4))));
+    set_eax(c, variant_change_type(arg(c, 0), arg(c, 1), uint16_t(arg(c, 3)), uint16_t(arg(c, 4))));
 }
 void o_SafeArrayCreate(X86 *c) {
     uint32_t dims = arg(c, 1), bounds = arg(c, 2);
@@ -552,24 +744,45 @@ void o_SafeArrayPtrOfIndex(X86 *c) {
     array_element(c, false, true);
 }
 void o_GetErrorInfo(X86 *c) {
-    if (valid(arg(c, 1), 4))
-        wr32(arg(c, 1), 0);
-    set_eax(c, 1);
-}
-void o_SysAllocString(X86 *c) {
-    uint32_t src = arg(c, 0);
-    if (!src) {
-        set_eax(c, 0);
+    uint32_t out = arg(c, 1);
+    if (!valid(out, 4)) {
+        set_eax(c, E_POINTER);
         return;
     }
-    uint32_t units = 0;
-    while (units < GUEST_SIZE / 2 && gm_valid(src + units * 2, 2) && rd16(src + units * 2))
-        ++units;
-    set_eax(c, bstr_alloc(src, units));
+    wr32(out, 0);
+    if (arg(c, 0)) {
+        set_eax(c, E_INVALIDARG);
+        return;
+    }
+    auto it = thread_errors.find(guest_current_thread_id());
+    uint32_t p = it == thread_errors.end() ? 0 : it->second;
+    if (it != thread_errors.end())
+        thread_errors.erase(it);
+    wr32(out, p);
+    set_eax(c, p ? S_OK : S_FALSE);
+}
+void o_SysAllocString(X86 *c) {
+    set_eax(c, bstr_from_z(arg(c, 0)));
 }
 void o_SysStringLen(X86 *c) {
     uint32_t b = arg(c, 0);
     set_eax(c, b && bstr_valid(b) ? rd32(b - 4) / 2 : 0);
+}
+// VarBstrCmp(bstrLeft, bstrRight, lcid, dwFlags). A NULL operand compares as
+// VARCMP_NULL; otherwise the ordering follows CompareString's mapping.
+void o_VarBstrCmp(X86 *c) {
+    uint32_t left = arg(c, 0), right = arg(c, 1), flags = arg(c, 3);
+    if (!left || !right || !bstr_valid(left) || !bstr_valid(right)) {
+        set_eax(c, 3); // VARCMP_NULL
+        return;
+    }
+    std::string a, b;
+    for (uint32_t i = 0, n = rd32(left - 4) / 2; i < n; ++i)
+        a.push_back((char)rd16(left + 2 * i));
+    for (uint32_t i = 0, n = rd32(right - 4) / 2; i < n; ++i)
+        b.push_back((char)rd16(right + 2 * i));
+    int r = (flags & 1) ? os_strcasecmp(a.c_str(), b.c_str()) : strcmp(a.c_str(), b.c_str());
+    set_eax(c, r < 0 ? 0 : r == 0 ? 1 : 2); // VARCMP_LT / EQ / GT
 }
 void o_SafeArrayDestroy(X86 *c) {
     set_eax(c, array_destroy(arg(c, 0)));
@@ -629,17 +842,330 @@ void o_VarUI4FromStr(X86 *c) {
     wr32(out, uint32_t(value));
     set_eax(c, 0);
 }
+constexpr uint32_t OVERFLOW_HR = 0x8002000au;
+enum : uint32_t {
+    NP_LEAD_WHITE = 0x1,
+    NP_TRAIL_WHITE = 0x2,
+    NP_LEAD_PLUS = 0x4,
+    NP_TRAIL_PLUS = 0x8,
+    NP_LEAD_MINUS = 0x10,
+    NP_TRAIL_MINUS = 0x20,
+    NP_HEX_OCT = 0x40,
+    NP_PARENS = 0x80,
+    NP_DECIMAL = 0x100,
+    NP_THOUSANDS = 0x200,
+    NP_CURRENCY = 0x400,
+    NP_EXPONENT = 0x800,
+    NP_USE_ALL = 0x1000,
+    NP_STD = 0x1fff,
+    NP_NEG = 0x10000,
+    NP_INEXACT = 0x20000
+};
+[[noreturn]] void unsupported_numparse(const char *what, uint32_t flags) {
+    LOGW("OLEAUT32 number parsing: %s (flags %08x) is not supported", what, flags);
+    abort();
+}
+void o_VarParseNumFromStr(X86 *c) {
+    uint32_t str = arg(c, 0), np = arg(c, 3), dig = arg(c, 4);
+    if (!valid(str, 2) || !valid(np, 24) || !valid(dig, rd32(np) > 0 ? uint32_t(rd32(np)) : 1)) {
+        set_eax(c, INVALID);
+        return;
+    }
+    uint32_t in = rd32(np + 4), cap = rd32(np);
+    if (in & ~NP_STD)
+        unsupported_numparse("unknown input flag", in);
+    if (in & NP_HEX_OCT)
+        unsupported_numparse("NUMPRS_HEX_OCT", in);
+    std::u16string s;
+    for (uint32_t i = 0; i < (1u << 20) && valid(str + i * 2, 2) && rd16(str + i * 2); ++i)
+        s.push_back(char16_t(rd16(str + i * 2)));
+    size_t p = 0;
+    uint32_t out = 0;
+    auto white = [&](uint32_t flag) {
+        if (!(in & flag))
+            return;
+        while (p < s.size() && (s[p] == ' ' || (s[p] >= 9 && s[p] <= 13))) {
+            out |= flag;
+            ++p;
+        }
+    };
+    auto take = [&](uint32_t flag, char16_t ch, uint32_t blockers) {
+        if ((in & flag) && p < s.size() && s[p] == ch && !(out & blockers)) {
+            out |= flag;
+            ++p;
+            return true;
+        }
+        return false;
+    };
+    white(NP_LEAD_WHITE);
+    for (bool more = true; more;) {
+        more = take(NP_LEAD_PLUS, '+', NP_LEAD_PLUS | NP_LEAD_MINUS | NP_PARENS) ||
+               take(NP_CURRENCY, '$', NP_CURRENCY);
+        if (!more && take(NP_LEAD_MINUS, '-', NP_LEAD_PLUS | NP_LEAD_MINUS | NP_PARENS))
+            more = true, out |= NP_NEG;
+        if (!more && take(NP_PARENS, '(', NP_LEAD_PLUS | NP_LEAD_MINUS | NP_PARENS))
+            more = true, out |= NP_NEG;
+    }
+    std::vector<uint8_t> digits;
+    int32_t pwr = 0;
+    bool seen = false, decimal = false, started = false;
+    for (; p < s.size(); ++p) {
+        char16_t ch = s[p];
+        if (ch >= '0' && ch <= '9') {
+            seen = true;
+            uint8_t d = uint8_t(ch - '0');
+            if (!started && d == 0) {
+                if (decimal)
+                    --pwr;
+                continue;
+            }
+            started = true;
+            if (digits.size() < cap) {
+                digits.push_back(d);
+                if (decimal)
+                    --pwr;
+            } else {
+                out |= NP_INEXACT;
+                if (!decimal)
+                    ++pwr;
+            }
+        } else if (ch == '.' && (in & NP_DECIMAL) && !decimal) {
+            decimal = true;
+            out |= NP_DECIMAL;
+        } else if (ch == ',' && (in & NP_THOUSANDS) && seen && !decimal) {
+            out |= NP_THOUSANDS;
+        } else
+            break;
+    }
+    if (!seen) {
+        set_eax(c, MISMATCH);
+        return;
+    }
+    while (!digits.empty() && digits.back() == 0) {
+        digits.pop_back();
+        ++pwr;
+    }
+    if (digits.empty())
+        pwr = 0;
+    if ((in & NP_EXPONENT) && p + 1 < s.size() && (s[p] | 0x20) == 'e') {
+        size_t q = p + 1;
+        bool eneg = false;
+        if (s[q] == '+' || s[q] == '-')
+            eneg = s[q++] == '-';
+        if (q < s.size() && s[q] >= '0' && s[q] <= '9') {
+            int32_t e = 0;
+            for (; q < s.size() && s[q] >= '0' && s[q] <= '9'; ++q)
+                e = e < 100000 ? e * 10 + (s[q] - '0') : e;
+            pwr += eneg ? -e : e;
+            out |= NP_EXPONENT;
+            p = q;
+        }
+    }
+    white(NP_TRAIL_WHITE);
+    if (!(out & (NP_LEAD_PLUS | NP_LEAD_MINUS | NP_PARENS))) {
+        if (!take(NP_TRAIL_PLUS, '+', 0) && take(NP_TRAIL_MINUS, '-', 0))
+            out |= NP_NEG;
+    } else if ((out & NP_PARENS) && p < s.size() && s[p] == ')') {
+        ++p;
+    } else if (out & NP_PARENS) {
+        set_eax(c, MISMATCH);
+        return;
+    }
+    white(NP_TRAIL_WHITE);
+    if ((in & NP_USE_ALL) && p != s.size()) {
+        set_eax(c, MISMATCH);
+        return;
+    }
+    for (size_t i = 0; i < digits.size(); ++i)
+        wr8(dig + uint32_t(i), digits[i]);
+    wr32(np, uint32_t(digits.size()));
+    wr32(np + 8, out);
+    wr32(np + 12, uint32_t(p));
+    wr32(np + 16, 0);
+    wr32(np + 20, uint32_t(pwr));
+    set_eax(c, 0);
+}
+void o_VarNumFromParseNum(X86 *c) {
+    uint32_t np = arg(c, 0), dig = arg(c, 1), bits = arg(c, 2), var = arg(c, 3);
+    if (!valid(np, 24) || !valid(var, 16) || !bits || !valid(dig, rd32(np) ? rd32(np) : 1)) {
+        set_eax(c, INVALID);
+        return;
+    }
+    uint32_t n = rd32(np), flags = rd32(np + 8);
+    int32_t pwr = int32_t(rd32(np + 20));
+    if (rd32(np + 16) || (flags & NP_HEX_OCT))
+        unsupported_numparse("base-shifted digits", flags);
+    bool neg = flags & NP_NEG;
+    if (n > 29) {
+        set_eax(c, OVERFLOW_HR);
+        return;
+    }
+    std::string text;
+    for (uint32_t i = 0; i < n; ++i)
+        text.push_back(char('0' + rd8(dig + i)));
+    bool integral = pwr >= 0 && int64_t(n) + pwr <= 20;
+    unsigned __int128 mag = 0;
+    if (integral) {
+        for (char ch : text)
+            mag = mag * 10 + unsigned(ch - '0');
+        for (int32_t i = 0; i < pwr; ++i)
+            mag *= 10;
+        integral = mag <= std::numeric_limits<uint64_t>::max();
+    }
+    auto put = [&](uint16_t vt, uint64_t raw, int bytes) {
+        wr16(var, vt);
+        if (bytes == 8)
+            wr64(var + 8, raw);
+        else
+            wr32(var + 8, uint32_t(raw));
+        set_eax(c, 0);
+    };
+    if (integral) {
+        struct Kind {
+            uint16_t vt;
+            int bytes;
+            int64_t lo;
+            uint64_t hi;
+        };
+        static const Kind kinds[] = {{16, 4, -128, 127},
+                                     {17, 4, 0, 255},
+                                     {2, 4, -32768, 32767},
+                                     {18, 4, 0, 65535},
+                                     {3, 4, INT32_MIN, INT32_MAX},
+                                     {19, 4, 0, UINT32_MAX},
+                                     {20, 8, INT64_MIN, uint64_t(INT64_MAX)},
+                                     {21, 8, 0, UINT64_MAX}};
+        for (const Kind &k : kinds) {
+            if (!(bits & (1u << k.vt)))
+                continue;
+            if (neg && mag != 0) {
+                if (k.lo == 0 || mag > (unsigned __int128)(-(k.lo + 1)) + 1)
+                    continue;
+                put(k.vt, uint64_t(-int64_t(uint64_t(mag - 1)) - 1), k.bytes);
+                return;
+            }
+            if (mag <= k.hi) {
+                put(k.vt, uint64_t(mag), k.bytes);
+                return;
+            }
+        }
+    }
+    double d = 0;
+    if (n) {
+        d = strtod((text + "e" + std::to_string(pwr)).c_str(), nullptr);
+        if (neg)
+            d = -d;
+    }
+    const double r4max = std::numeric_limits<float>::max();
+    if ((bits & (1u << 4)) && (std::fabs(d) <= r4max || !(bits & (1u << 5)))) {
+        if (std::fabs(d) > r4max) {
+            set_eax(c, OVERFLOW_HR);
+            return;
+        }
+        float f = float(d);
+        uint32_t raw;
+        memcpy(&raw, &f, 4);
+        put(4, raw, 4);
+        return;
+    }
+    if (bits & (1u << 5)) {
+        if (!std::isfinite(d)) {
+            set_eax(c, OVERFLOW_HR);
+            return;
+        }
+        uint64_t raw;
+        memcpy(&raw, &d, 8);
+        put(5, raw, 8);
+        return;
+    }
+    if (bits & (1u << 14)) {
+        unsigned __int128 m = 0;
+        int32_t scale = pwr < 0 ? -pwr : 0;
+        const unsigned __int128 limit = (unsigned __int128)1 << 96;
+        bool ok = scale <= 28;
+        for (char ch : text) {
+            m = m * 10 + unsigned(ch - '0');
+            ok = ok && m < limit;
+        }
+        for (int32_t i = 0; ok && i < pwr; ++i) {
+            m *= 10;
+            ok = m < limit;
+        }
+        if (!ok) {
+            set_eax(c, OVERFLOW_HR);
+            return;
+        }
+        wr16(var, 14);
+        wr8(var + 2, uint8_t(scale));
+        wr8(var + 3, neg ? 0x80 : 0);
+        wr32(var + 4, uint32_t(m >> 64));
+        wr32(var + 8, uint32_t(m));
+        wr32(var + 12, uint32_t(m >> 32));
+        set_eax(c, 0);
+        return;
+    }
+    if (bits & (1u << 6)) {
+        unsigned __int128 m = 0;
+        for (char ch : text)
+            m = m * 10 + unsigned(ch - '0');
+        int32_t shift = pwr + 4;
+        bool ok = true;
+        for (; shift > 0 && ok; --shift) {
+            m *= 10;
+            ok = m <= (unsigned __int128)1 << 64;
+        }
+        if (shift < 0) {
+            unsigned __int128 div = 1;
+            for (int32_t i = 0; i < -shift && i < 38; ++i)
+                div *= 10;
+            unsigned __int128 q = -shift > 38 ? 0 : m / div, rem = -shift > 38 ? m : m % div;
+            unsigned __int128 twice = rem * 2;
+            if (-shift <= 38 && (twice > div || (twice == div && (q & 1))))
+                ++q;
+            m = -shift > 38 ? 0 : q;
+        }
+        unsigned __int128 lim = (unsigned __int128)INT64_MAX + (neg ? 1 : 0);
+        if (!ok || m > lim) {
+            set_eax(c, OVERFLOW_HR);
+            return;
+        }
+        put(6, neg ? uint64_t(0) - uint64_t(m) : uint64_t(m), 8);
+        return;
+    }
+    set_eax(c, OVERFLOW_HR);
+}
 const ImportShim shims[] = {
 #define O(name, n) {"OLEAUT32.dll", #name, n, o_##name}
-    O(VariantInit, 1),           O(VariantClear, 1),        O(VariantCopy, 2),
-    O(VariantCopyInd, 2),        O(VariantChangeType, 4),   O(VariantChangeTypeEx, 5),
-    O(SysAllocString, 1),        O(SysAllocStringLen, 2),   O(SysReAllocStringLen, 3),
-    O(SysStringLen, 1),          O(SysFreeString, 1),       O(SafeArrayCreate, 3),
-    O(SafeArrayDestroy, 1),      O(SafeArrayGetDim, 1),     O(SafeArrayGetLBound, 3),
-    O(SafeArrayGetUBound, 3),    O(SafeArrayGetElement, 3), O(SafeArrayPutElement, 3),
-    O(SafeArrayPtrOfIndex, 3),   O(SafeArrayAccessData, 2), O(SafeArrayUnaccessData, 1),
-    O(SafeArrayCopy, 2),         O(SafeArrayCreateVector, 3), O(VarUI4FromStr, 4),
+    O(VariantInit, 1),
+    O(VariantClear, 1),
+    O(VariantCopy, 2),
+    O(VariantCopyInd, 2),
+    O(VariantChangeType, 4),
+    O(VariantChangeTypeEx, 5),
+    O(SysAllocString, 1),
+    O(SysAllocStringLen, 2),
+    O(SysReAllocStringLen, 3),
+    O(SysStringLen, 1),
+    O(SysFreeString, 1),
+    O(VarBstrCmp, 4),
+    O(SafeArrayCreate, 3),
+    O(SafeArrayDestroy, 1),
+    O(SafeArrayGetDim, 1),
+    O(SafeArrayGetLBound, 3),
+    O(SafeArrayGetUBound, 3),
+    O(SafeArrayGetElement, 3),
+    O(SafeArrayPutElement, 3),
+    O(SafeArrayPtrOfIndex, 3),
+    O(SafeArrayAccessData, 2),
+    O(SafeArrayUnaccessData, 1),
+    O(SafeArrayCopy, 2),
+    O(SafeArrayCreateVector, 3),
+    O(VarUI4FromStr, 4),
+    O(VarParseNumFromStr, 5),
+    O(VarNumFromParseNum, 4),
     O(GetErrorInfo, 2),
+    O(SetErrorInfo, 2),
+    O(CreateErrorInfo, 1),
 #undef O
     // The msxml3 delay-import table names these by ordinal, so each implemented
     // entry needs the ordinal alias its GetProcAddress call will use.
@@ -660,10 +1186,55 @@ const ImportShim shims[] = {
     {"OLEAUT32.dll", "ord27", 2, o_SafeArrayCopy},
     {"OLEAUT32.dll", "ord147", 5, o_VariantChangeTypeEx},
     {"OLEAUT32.dll", "ord200", 2, o_GetErrorInfo},
+    {"OLEAUT32.dll", "ord201", 2, o_SetErrorInfo},
+    {"OLEAUT32.dll", "ord202", 1, o_CreateErrorInfo},
+    {"OLEAUT32.dll", "ord46", 5, o_VarParseNumFromStr},
+    {"OLEAUT32.dll", "ord47", 4, o_VarNumFromParseNum},
     {"OLEAUT32.dll", "ord277", 4, o_VarUI4FromStr},
+    {"OLEAUT32.dll", "ord314", 4, o_VarBstrCmp},
     {"OLEAUT32.dll", "ord411", 3, o_SafeArrayCreateVector},
 };
 } // namespace
 void oleaut32_register() {
     imports_register(shims, sizeof shims / sizeof shims[0]);
+    static const ComMethod create_methods[] = {{"QueryInterface", 3, com_QueryInterface},
+                                               {"AddRef", 1, com_AddRef},
+                                               {"Release", 1, com_Release},
+                                               {"SetGUID", 2, error_guid<true>},
+                                               {"SetSource", 2, error_string<true, 0>},
+                                               {"SetDescription", 2, error_string<true, 1>},
+                                               {"SetHelpFile", 2, error_string<true, 2>},
+                                               {"SetHelpContext", 2, error_context<true>}};
+    static const ComMethod info_methods[] = {{"QueryInterface", 3, com_QueryInterface},
+                                             {"AddRef", 1, com_AddRef},
+                                             {"Release", 1, com_Release},
+                                             {"GetGUID", 2, error_guid<false>},
+                                             {"GetSource", 2, error_string<false, 0>},
+                                             {"GetDescription", 2, error_string<false, 1>},
+                                             {"GetHelpFile", 2, error_string<false, 2>},
+                                             {"GetHelpContext", 2, error_context<false>}};
+    static const uint8_t create_iid[16] = {0x40, 0x33, 0xf0, 0x22, 0x7d, 0x54, 0x1b, 0x10,
+                                           0x8e, 0x65, 0x08, 0x00, 0x2b, 0x2b, 0xd1, 0x19};
+    static const uint8_t info_iid[16] = {0x20, 0xb1, 0xf2, 0x1c, 0x7d, 0x54, 0x1b, 0x10,
+                                         0x8e, 0x65, 0x08, 0x00, 0x2b, 0x2b, 0xd1, 0x19};
+    com_define(IF_CREATEERRORINFO, "OLEAUT32.dll", "ICreateErrorInfo", create_methods,
+               std::size(create_methods));
+    com_define(IF_ERRORINFO, "OLEAUT32.dll", "IErrorInfo", info_methods, std::size(info_methods));
+    com_bind(IF_CREATEERRORINFO, K_ERRORINFO);
+    com_bind(IF_ERRORINFO, K_ERRORINFO);
+    com_register_iid(IF_CREATEERRORINFO, create_iid);
+    com_register_iid(IF_ERRORINFO, info_iid);
+    com_set_destructor(K_ERRORINFO, error_destroy);
+}
+void oleaut32_reset() {
+    error_objects.clear();
+    thread_errors.clear();
+}
+void oleaut32_thread_exit(X86 *c) {
+    auto it = thread_errors.find(guest_current_thread_id());
+    if (it == thread_errors.end())
+        return;
+    uint32_t p = it->second;
+    thread_errors.erase(it);
+    error_reference(c, p, false);
 }

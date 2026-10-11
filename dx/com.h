@@ -162,6 +162,8 @@ enum ComIface : uint16_t {
     IF_D3D8TEXTURE8,
     IF_D3D8VERTEXBUFFER8,
     IF_D3D8INDEXBUFFER8,
+    IF_CREATEERRORINFO,
+    IF_ERRORINFO,
     IF_COUNT
 };
 
@@ -243,6 +245,7 @@ enum ComKind : uint16_t {
     K_D3D8TEXTURE,      // a 2D texture and its mip levels
     K_D3D8VERTEXBUFFER, // a vertex buffer's host storage
     K_D3D8INDEXBUFFER,  // an index buffer's host storage
+    K_ERRORINFO,
 };
 
 // A DirectInput joystick axis's DIPROP_RANGE, DIPROP_DEADZONE and

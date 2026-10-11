@@ -73,6 +73,7 @@ uint32_t build_vtable(const VtDef &d) {
 // Lifetime
 // ---------------------------------------------------------------------------
 void com_reset() {
+    oleaut32_reset();
     objects().clear();
     // Objects held guest heap blocks that mem_init() already discarded; the
     // vtables did too, so rebuild them at their new addresses.

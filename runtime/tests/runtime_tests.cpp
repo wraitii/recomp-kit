@@ -6102,6 +6102,11 @@ static void test_delphi_automation() {
     check(call_import(&c, "OLEAUT32.dll", "VariantChangeType", {copy, v, 0, 9}) == 0x80020005u,
           "VariantChangeType unsupported type mismatch");
     call_import(&c, "OLEAUT32.dll", "VariantClear", {v});
+    wr16(v, 19);
+    wr32(v + 8, 42);
+    check(call_import(&c, "OLEAUT32.dll", "VariantChangeType", {v, v, 0, 3}) == 0 && rd16(v) == 3 &&
+              rd32(v + 8) == 42,
+          "VariantChangeType UI4 to I4");
     wr16(v, 0x4003);
     wr32(v + 8, s + 24);
     wr32(s + 24, 1234);
