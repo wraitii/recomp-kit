@@ -13,7 +13,9 @@ continuation lookup; unexpected returns publish the fuller state and use general
 return handling. Ordinary entries remain available for other callers.
 
 Integer transfer plans combine callee effects with continuation liveness,
-including values escaping through the caller's return. Structured emission data
+including values escaping through the caller's return and state read by later
+calls even when it already resides in `X86`. Untracked GPRs and flags remain
+observable on return; private layouts retain their callee outputs. Structured emission data
 owns private entries and declaration dependencies; `contract-report.json`
 reports the selected edges. Fallback flag publication retains proven lazy
 recipes. Private preparation checks hooks, profiling, frame watching,
@@ -21,33 +23,47 @@ checkpoint countdown and replacement selection. It decrements once on success;
 the ordinary entry owns polling on rejection. Replacement identity is resolved
 beside the immutable dispatch tables without indexed table loads.
 
-The body still transfers x87 state through `X86`. Ordinary entries retain the
-guarded arithmetic specialization and general branch. Private preparation checks
-the precision/rounding bits before decrementing the checkpoint countdown; its
-private leaf bodies contain only the known-mode arithmetic. Other modes use the
-shared ordinary checked entry. Guest scratch accesses and faults remain intact.
+The shared emission pass selects arithmetic conditions and state-transfer
+requirements before lowering. Ordinary x87 entries retain guarded D3D8
+arithmetic within the existing operation, density and activation budgets,
+including calls whose private preparation was rejected. Non-x87 private entries
+need no CW guard. Private x87 entries require a CW-preserving leaf and combine
+D3D8 arithmetic with reduced state publication; no transfer-only private x87
+body is emitted. Strict x87 and disabled specialization retain general entries.
+Hooks use general arithmetic. Instruction-local proven PC/RC bits can still
+fold general recipes, leaving unknown bits dynamic.
+
+The current interface transfers values through `X86`. Future specialization
+will pass actual arguments and results directly for integer and x87 functions;
+arithmetic conditions remain separate from that interface. Private preparation
+checks precision/rounding before decrementing the checkpoint countdown. Guest
+scratch accesses and faults remain intact.
 Each callee has one private body publishing the union of its callers' required
 outputs. Callers retain their own continuation liveness and reloads. Initial
 emission discovers output requirements; `contract_variants.py` merges them and
 affected callers are re-emitted with the shared layout. The emitter rejects a
 layout that omits a required output.
 
-`ir/x87_mode.py` tracks known control-word bits and symbolic entry bits through
-the CFG and conservative direct-call return relations. Byte-backed resets and
-environment saves have explicit effects; memory restores, unresolved calls and
-unclassified operations lose facts. Recursive call edges remain conservative.
-`ir/x87_provenance.py` follows register aliases and local stack bytes in closed
-linear leaves, proving temporary changes and restoration in `__ftol` without
-removing the original guest operations. Unknown stores invalidate saved slots.
-Private known-mode emission additionally requires a closed returning leaf with
-no calls or control-word effects. `x87_cw_clone = false` disables it.
+`tools/recomp/x87_audit.py` selects propagation, writer or real-call context
+analysis with `--game` or `--game-dir`. Its shared library consumes lifted
+instruction CFGs independently of production SSA acceptance. Named scan records,
+byte-checked assumptions, CFG graphs and bit provenance are reusable interfaces.
+Hypothetical roots, broad discovery reports and candidate context summaries stay
+offline. Context preservation and constant mode are separate results.
 
-The report separates preservation coverage among x87-using functions from the
-inventory of concrete writers, their direct-call descendants, reverse callers
-and unknown boundaries. These exposure closures include calls before and after
-a setter and are review sets, not constant-mode proofs. Startup/device facts,
-shared-memory save/change/restore provenance and callback paths still need propagation before
-an unguarded default-mode specialization is justified.
+`propagation --facts-out` emits `x87-compiler-facts-v1` for the selected production
+policy. The compiler validates the executable, producer sources, code map,
+configuration, native sources, assumption dependencies, entry scope, original
+instruction sites and replacement boundaries before consuming it. Exploratory
+contracts and old candidate summaries cannot produce compiler facts. Unknown
+conditions retain guarded specialization. Hooks retain general arithmetic.
+Facts can remove arithmetic duplication and private call-site CW checks without
+establishing unrelated private-entry conditions. Original CW writes/restores and
+other x87 state remain translated. Return summaries remain distinct from known
+entry and instruction modes.
+
+Use `--build-root` to select the installation/build tree. Detailed reports and
+trusted local scan pickles remain ignored; only selected compiler facts ship.
 
 ## Objective
 
@@ -76,8 +92,13 @@ Later, device creation at `00549991` uses flags `0x20` or `0x40`, both omitting
 D3D8 boundary models its effect as `(CW & ~0x0f3f) | 0x003f`, establishing the
 precision/rounding bits needed by the specialization while preserving other bits.
 
-The pilot calls are downstream of this setup, but the mode reaching them still
-requires a proof through subsequent calls and control flow. Other invocations
+The full device body joins success and retry/error paths at `00549aed`, losing
+the success-edge constant there. A separate success-continuation view exposes
+subsequent losses without excluding failures from ordinary analysis.
+`showErrorDialog` at `0051e980` exits on its first invocation but returns when
+its global error-handling flag is already set, so it is not unconditionally
+no-return. The pilot calls are downstream of setup, but their mode still
+requires proofs through subsequent calls and control flow. Other invocations
 of the general entry may have different modes.
 
 Temporary changes need return relations rather than only a may-write flag.

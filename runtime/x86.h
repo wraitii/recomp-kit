@@ -584,6 +584,7 @@ void recomp_int(X86 *c, uint32_t vec);
  * image, because a listing routinely decodes the data past a function's last
  * instruction as code. Reaching one is fatal and says where. */
 void recomp_unmodelled(X86 *c, uint32_t addr);
+void recomp_x87_contract_violation(X86 *c, uint32_t addr, uint16_t mask, uint16_t value);
 void recomp_breakpoint(X86 *c, uint32_t addr);
 
 /* ------------------------------------------------------ hook dispatch -- */

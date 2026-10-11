@@ -24,7 +24,7 @@ import decoded
 import output
 from settings import Settings
 from decoded import external_exits
-from ir import call_contracts, contract_variants, production, x87_mode
+from ir import call_contracts, contract_variants, production, x87_mode, x87_facts
 from ir.lift import Lifter, LiftError
 from ir.ssa import SSAError
 from program import Program, TranslateError
@@ -181,7 +181,7 @@ def scan_program(settings, jobs):
 
 def _emit(task):
     """Emit one chunk of functions: SSA where admitted, the decoded body otherwise."""
-    addrs, helpers, internal, contracts, private_targets, contract_masks, checked_returns, selected_callers = task
+    addrs, helpers, internal, contracts, private_targets, contract_masks, checked_returns, selected_callers, mode_sites, entry_verification = task
     ctx, tr = _CTX, _CTX.tr
     tr.seh_helpers = set(helpers)
     tr.internal_entries = internal
@@ -201,7 +201,8 @@ def _emit(task):
                 lines, external, variant_requests, call_decisions = production.emit_ssa(
                     tr, ctx.lifter, fn, entries, ctx.settings.emit, ctx.known, callee_contracts,
                     checked_returns,
-                    private_targets if selected else (), report_calls=selected, contract_masks=contract_masks)
+                    private_targets if selected else (), report_calls=selected, contract_masks=contract_masks,
+                    x87_mode_sites=mode_sites.get(addr), x87_entry_verify=entry_verification.get(addr))
             except (SSAError, LiftError) as error:
                 reason = str(error)
             else:
@@ -434,8 +435,13 @@ def main(argv=None):
                 "(function or referenced entry), re-export the code map and regenerate" % len(dangling))
 
         conservative = native_replaced(settings)
-        mode_prepared = {addr: row[9] for addr, row in scanned.items()}
+        mode_prepared = {addr: row[9]._replace(entries=tuple(
+            i for i in row[9].entries if row[9].sites[i] not in internal.get(addr, ())))
+            if row[9] else None for addr, row in scanned.items()}
         mode_opaque = conservative | helpers | {addr for addr, row in scanned.items() if row[6] is not None}
+        mode_sites, facts_report = x87_facts.load(settings.x87_facts, ctx, mode_prepared, mode_opaque)
+        entry_verification = {row["function"]: (row["mask"], row["value"])
+                              for row in settings.x87_entry_contracts if row.get("verify")}
         mode_summaries = x87_mode.summarize(mode_prepared, mode_opaque)
         x87_counts = {addr: row[10] for addr, row in scanned.items()}
         mode_exposure = x87_mode.exposure_report(mode_prepared, calls, mode_opaque, x87_counts,
@@ -487,7 +493,7 @@ def main(argv=None):
         for part in parts:
             tasks.append((part, helpers, {a: internal[a] for a in part if a in internal},
                           {a: {t: contracts[t] for t in calls[a] if t in contracts}
-                           for a in part if contracts}, private_targets, {}, checked_returns, selected_callers))
+                           for a in part if contracts}, private_targets, {}, checked_returns, selected_callers, mode_sites, entry_verification))
         results = {}
         for part in pool.map(_emit, tasks):
             for row in part:
@@ -550,6 +556,7 @@ def main(argv=None):
             {"function": "%08x" % addr, "reason": results[addr][2]}
             for addr in sorted(results) if results[addr][2] is not None],
         "call_decisions": decisions,
+        "x87_compiler_facts": facts_report,
         "x87_mode": mode_report(settings, mode_prepared, mode_summaries, mode_opaque,
                                 known_modes & private_masks.keys(), x87_counts, mode_exposure,
                                 selected_callers | checked_returns),

@@ -81,3 +81,13 @@ The FEMMS regeneration changes 62 functions. Random-input original-byte checks
 reach no comparable returns in those functions; instruction checks cover tag
 clearing and control-word preservation. TOP follows AMD's documented reset,
 where Unicorn's Athlon model differs; see [the IR guide](../../docs/ir.md).
+
+Private continuation layouts retain modified registers absent from the caller's
+SSA and values observed by later calls, even when no additional publication is
+needed. The original-byte regression suite exercises eight cases, including
+`005a76d8`'s EAX exponent result before CRT math calls and `0052ecd0`'s EDX
+constructor result escaping through its caller. Run after rebuilding:
+
+```sh
+python tools/recomp/diff/run.py --game railroad-tycoon-3 --suite games/railroad-tycoon-3/validation/private-call-state.json
+```

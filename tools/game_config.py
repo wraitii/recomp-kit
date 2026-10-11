@@ -249,6 +249,8 @@ def load(game_dir, build_root=None):
         raise ValueError("%s: [translate] private_leaf_contracts must be a boolean" % source)
     if type(translate.setdefault("x87_imports_preserve_pc_rc", False)) is not bool:
         raise ValueError("%s: x87_imports_preserve_pc_rc must be a boolean" % source)
+    if translate.get("x87_facts") is not None and (not isinstance(translate["x87_facts"], str) or not translate["x87_facts"]):
+        raise ValueError("%s: x87_facts must name a compiler fact file" % source)
     contracts = translate.setdefault("x87_entry_contracts", [])
     if not isinstance(contracts, list):
         raise ValueError("%s: x87_entry_contracts must be a list" % source)

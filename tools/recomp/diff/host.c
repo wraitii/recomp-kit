@@ -18,6 +18,13 @@ void harness_escape(const char *reason, uint32_t addr) {
     longjmp(escape_jb, 1);
 }
 
+void recomp_x87_contract_violation(X86 *c, uint32_t addr, uint16_t mask, uint16_t value) {
+    (void)c;
+    (void)mask;
+    (void)value;
+    harness_escape("x87 entry contract violation", addr);
+}
+
 uint8_t recomp_hooks_ever;
 uint32_t recomp_frame_watch;
 

@@ -151,7 +151,8 @@ def build(s, groups, facts, contracts, kept, lane_field, never_skip,
                 roots.extend(fallback.roots(s, state, groups))
     result = TransferPlan(publications, call_plans, returns, roots)
     if private:
-        outputs = continuation_outputs(s, result.live_publications, groups, lane_field, roots)
+        outputs = continuation_outputs(s, result.live_publications, groups, lane_field, roots,
+                                       {target: contract.reads for target, contract in contracts.items()})
         for key, fields in outputs.items():
             call_plans[key].outputs = fields | never_skip
     return result

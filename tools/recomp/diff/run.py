@@ -447,6 +447,7 @@ def main():
     pick.add_argument("--changed", action="store_true")
     pick.add_argument("--sample", type=int)
     pick.add_argument("--all", action="store_true")
+    pick.add_argument("--suite", type=Path, help="run a hash-pinned original-byte regression suite")
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--max-insns", type=int, default=200000)
     parser.add_argument("--timeout", type=int, default=60)
@@ -458,6 +459,14 @@ def main():
     args.fpu_cw = args.fpu_cw or list(FPU_CWS)
 
     cfg = game_config.load(args.game_dir, args.build_root)
+    suite = None
+    if args.suite:
+        suite = json.loads(args.suite.read_text())
+        if (suite.get("format") != "recomp-diff-suite-v1"
+                or suite.get("executable_sha256") != cfg["game"]["sha256"]):
+            parser.error("regression suite schema or executable identity mismatch")
+        args.seed, args.iterations = suite["seed"], suite["iterations"]
+        args.fpu_cw = [int(cw, 16) for cw in suite["fpu_cws"]]
     build_root = args.build_root
     out = build_root / "recomp/diff"
     gen = build_root / "recomp/gen"
@@ -468,7 +477,11 @@ def main():
     entries = sorted(int(f["addr"], 16) for f in symbols["functions"] if f["kind"] == "entry")
     bodies = function_bodies(gen)
     snapshot = out / "bodies.json"
-    if args.func:
+    if suite:
+        addrs = [int(addr, 16) for addr in suite["functions"]]
+        if set(addrs) - set(entries):
+            parser.error("regression suite contains unmapped entries")
+    elif args.func:
         addrs = args.func
     elif args.changed:
         if not snapshot.exists():

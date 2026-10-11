@@ -334,6 +334,12 @@ void recomp_null_access(uint32_t addr, int write) {
     abort();
 }
 
+void recomp_x87_contract_violation(X86 *c, uint32_t addr, uint16_t mask, uint16_t value) {
+    LOGW("x87 entry contract violated at %08x: CW=%04x, expected CW & %04x == %04x", addr,
+         c->fpu_cw, mask, value);
+    abort();
+}
+
 // An SSE/SSE2 instruction the translator left as a trap (MMX is translated).
 // The CPUID below advertises neither extension, so only a guest that skips the
 // CPUID check gets here; continuing would compute garbage, so this is fatal.

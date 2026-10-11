@@ -875,8 +875,11 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     # The clone duplicates the integer code too; a mostly-integer body
     # (ProjectionMeshBuilder::Build: 25 x87 of ~300 instructions) doubled in
     # size for a 3% corpus gain, so also require a minimum x87 density.
+    proven_mode = all(x87_mode_sites.get(b.insn.addr) == (0x0f00, 0)
+                      for b in s.blocks.values() for v in b.ops
+                      if v.opc in ("X87_REG", "X87_MEM") and v.id in live)
     clones = (("fast",) if x87_known_mode else ("fast", "general")
-              if cw_sensitive >= CW_CLONE_MIN_OPS
+              if not proven_mode and cw_sensitive >= CW_CLONE_MIN_OPS
               and cw_sensitive * CW_CLONE_DENSITY >= len(fir.insns)
               else (None,))
     block_label = "F" if clones[0] == "fast" else "B"
@@ -1095,7 +1098,8 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                         output_mask = contract_masks.get(v.data, needed_mask)
                         if needed_mask & ~output_mask or output_mask & ~((1 << len(CONTRACT_GPRS + CONTRACT_FLAGS)) - 1):
                             raise SSAError("shared contract outputs do not cover the call continuation")
-                        lines.append("if (entry_contract_prepare_%08x(c)) {" % v.data)
+                        mode_proven = x87_mode_sites.get(b.insn.addr) == (0x0f00, 0)
+                        lines.append("if (entry_contract_prepare_%08x(c, %du)) {" % (v.data, mode_proven))
                     lines.extend(publish(b.snapshots[v.id], v))
                     if outputs is None and transfers.calls[v.id].guard:
                         guarded = store_fields(b.snapshots[v.id], transfers.calls[v.id].guard)

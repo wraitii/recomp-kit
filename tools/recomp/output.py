@@ -85,7 +85,7 @@ def emit_body_chunks(out, functions, bodies, entries_by_fn, private_requests=Non
             for addr in checked:
                 fh.write("void entry_checked_%s(X86 *c, uint32_t expected);\n" % addr)
             for addr in sorted({addr for addr, _ in private}):
-                fh.write("int entry_contract_prepare_%s(X86 *c);\n" % addr)
+                fh.write("int entry_contract_prepare_%s(X86 *c, int mode_proven);\n" % addr)
             for addr, mask in private:
                 fh.write("void entry_contract_%s_%s(X86 *c, uint32_t expected);\n" % (addr, mask))
             fh.write("\n")
@@ -181,9 +181,9 @@ void recomp_enter(X86 *c, uint32_t i)
 
 
 def emit_contract_prepare(addr, known_mode=False):
-    mode_guard = "        (c->fpu_cw & 0x0f00u) != 0u ||\n" if known_mode else ""
+    mode_guard = "        (!mode_proven && (c->fpu_cw & 0x0f00u) != 0u) ||\n" if known_mode else ""
     return """
-int entry_contract_prepare_%08x(X86 *c)
+int entry_contract_prepare_%08x(X86 *c, int mode_proven)
 {
     if (recomp_hooks_ever || recomp_profile_enabled || recomp_frame_watch ||
 %s        c->checkpoint_countdown == 0u || FN(%08x) != fn_%08x)

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import driver
 import game_config
-from ir import x87, x87_boundaries, x87_mode
+from ir import x87, x87_boundaries, x87_mode, x87_facts
 from .common import MASK, settings_for, scan_fingerprint, scan, read_scan, apply_contracts, preserving, coverage
 from .core import CW_NEUTRAL_TRANSCENDENTALS, internal_pcode_flow, tail_region, cfg_relations, context_graph
 
@@ -17,6 +17,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--jobs", type=int, default=8)
+    parser.add_argument("--facts-out", type=Path, help="emit validated compiler facts for the selected production policy")
     parser.add_argument("--root", action="append", metavar="NAME=HEX_ADDRESS",
                         help="analyze these hypothetical entry contracts instead of the default roots")
     parser.add_argument("--bundle", action="store_true", help="also analyze all selected entry contracts together")
@@ -33,6 +34,7 @@ def main(argv=None):
     settings = settings_for(args)
     args.out = args.out or args.build_root / "recomp/x87-audit/propagation.json"
     ctx = driver.Context(settings)
+    fact_identity = x87_facts.identity(settings)
     scanned, helpers = scan(ctx, args.jobs, args.scan_cache)
     outside = set().union(*(row.references for row in scanned.values()))
     relocated, kinds = ctx.image.relocated_pointers(), ctx.program.entries()
@@ -123,7 +125,17 @@ def main(argv=None):
         return x87_mode.ordinary_entries(prepared, summaries, contracts, direct_calls,
                                         unknown_entries, opaque, boundaries)
 
-    _, baseline, baseline_gaps = ordinary(settings.x87_entry_contracts)
+    baseline_entries, baseline, baseline_gaps = ordinary(settings.x87_entry_contracts)
+    if args.facts_out:
+        if args.analysis_contracts or args.return_metadata:
+            parser.error("compiler facts cannot depend on exploratory contracts or candidate metadata")
+        if x87_facts.identity(settings) != fact_identity:
+            raise ValueError("analysis inputs changed during proof discovery")
+        production_opaque = opaque | {a for a, r in scanned.items() if r.exclusion is not None}
+        facts = x87_facts.document(ctx, prepared, summaries, baseline, baseline_entries, production_opaque)
+        args.facts_out.parent.mkdir(parents=True, exist_ok=True)
+        args.facts_out.write_text(json.dumps(facts, separators=(",", ":")) + "\n")
+        x87_facts.load(args.facts_out, ctx, prepared, opaque)
     report = {"scope": "analysis only; hypothetical contracts never change game configuration",
               "return_metadata": return_metadata,
               "analysis_contracts": contract_rows, "contract_sensitivity": sensitivity,

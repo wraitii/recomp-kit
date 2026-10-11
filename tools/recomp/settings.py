@@ -37,6 +37,8 @@ class Settings(object):
             self.native_header = None
         metadata = translate.get("x87_mode_metadata")
         self.x87_mode_metadata = self.game_dir / metadata if metadata and not self.module else None
+        facts = translate.get("x87_facts")
+        self.x87_facts = self.game_dir / facts if facts and not self.module else None
         self.x87_imports_preserve_pc_rc = translate["x87_imports_preserve_pc_rc"]
         self.x87_entry_contracts = translate.get("x87_entry_contracts", []) if not self.module else []
         self.call_contracts = translate["call_contracts"]
