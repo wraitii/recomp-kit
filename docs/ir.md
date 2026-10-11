@@ -133,9 +133,14 @@ Carry needs the MSVC convention.
 Under PC=00, proven-binary32 operations use native float arithmetic plus the
 runtime's NaN/status normalization once a linear run has two arithmetic effects.
 A body with at least four PC/RC-sensitive operations in one tracker window is
-emitted twice (`x87_cw_clone`): each activation tests `(cw & 0xf00) == 0` and
-otherwise jumps to the same activation in the general clone; past the guard the
-fast clone folds CW to 0. It is exact. Multi-window bodies are not cloned.
+emitted through the same body pass as private specialization (`x87_cw_clone`),
+with D3D8 and general arithmetic: each activation checks hooks and tests
+`(cw & 0xf00) == 0`, otherwise jumping to the same activation in the general clone; past the guard the
+D3D8 body folds PC/RC to 0. Private state transfers are an additional capability
+of that pass. Multi-window ordinary bodies are not duplicated. Independently, proved
+instruction-local CW bits can fold ordinary scalar recipes without cloning;
+partial facts leave the other PC/RC bits dynamic. Calls retain a hook guard,
+and configured contextual entry assumptions are not emission facts.
 
 Lazy NaN keeps basic-arithmetic results in full precision and folds
 (`isnan`/indefinite) where the value stops flowing into NaN-propagating

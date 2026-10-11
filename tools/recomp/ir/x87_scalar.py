@@ -200,11 +200,6 @@ CW_FIELDS = 0xf00
 CW_USE = re.compile(r"\bx87_cw_\b(?! = c->fpu_cw;| & 0x%xu\))" % CW_FIELDS)
 
 
-def cw_label(index):
-    """Label of the general clone's `index`-th tracker activation."""
-    return "X87CW%d" % index
-
-
 def scalar_env(expr):
     """Rewrite a `c`-based x87 recipe onto the scalar CW/SW locals.
 
@@ -221,11 +216,11 @@ class X87Scalar:
     """Track all eight physical residues within a single-entry linear region."""
 
     def __init__(self, observe_loads=False, convention=False, lazy_nan=False):
-        # CW clone role (see `emit_c`): None for a single body, "fast" for the
-        # PC=00/RC=00 clone, "general" for the clone it falls back to.
         self.clone = None
-        self.known_mode = False
         self.activations = 0
+        self.known_mode = False
+        self.proven_cw = None
+        self.mode_hook_guard = False
         self.serial = 0
         self.temps = []
         self.observe_loads = observe_loads
@@ -250,23 +245,19 @@ class X87Scalar:
         self.slots = {}
 
     def _activation(self):
-        """Load TOP/CW/SW; in a CW clone, also its guard or fallback label.
+        """Guard the current mode where the published tracker starts a window.
 
-        Activation is the only point where a tracker window reads the guest
-        CW: FLDCW and every other CW writer is an opaque recipe or a call,
-        both of which reset the tracker, so CW is invariant while it is
-        active. Both clones replay the same tracker transitions, so the k-th
-        activation of the fast clone and of the general clone are the same
-        program point, with the tracker inactive and all x87 state published.
-        The fast clone jumps there when PC/RC are not both zero."""
+        Calls and CW writers reset the tracker. Corresponding windows in both
+        bodies share SSA locals and carried state at the fallback label.
+        """
         index = self.activations
         self.activations += 1
         lines = ["x87_top_ = c->fpu_top;", "x87_cw_ = c->fpu_cw;"]
         if self.clone == "fast" and not self.known_mode:
-            lines.append("if (RECOMP_UNLIKELY((x87_cw_ & 0x%xu) != 0u)) goto %s;"
-                         % (CW_FIELDS, cw_label(index)))
+            lines.append("if (RECOMP_UNLIKELY(recomp_hooks_ever || (x87_cw_ & 0x%xu) != 0u)) goto X87CW%d;"
+                         % (CW_FIELDS, index))
         elif self.clone == "general":
-            lines.insert(0, "%s:;" % cw_label(index))
+            lines.insert(0, "X87CW%d:;" % index)
         lines.append("x87_sw_ = c->fpu_sw;")
         return lines
 
@@ -541,13 +532,16 @@ class X87Scalar:
         self.high -= delta
 
     def statements(self, data, address=None, result=None):
-        """Lower common audited effects; materialize before other runtime recipes.
-
-        In the fast CW clone every CW use past the activation guard is the
-        constant 0: helpers read only the PC/RC fields, which the guard
-        proved zero, so the precision and rounding selects fold away."""
+        """Fold PC/RC facts into audited recipes, retaining other guest state."""
         lines = self._statements(data, address, result)
-        if self.clone == "fast":
+        if self.proven_cw is not None and self.clone != "fast":
+            known, value = self.proven_cw
+            mode = "0x%xu" % value if known == CW_FIELDS else \
+                "((x87_cw_ & 0x%xu) | 0x%xu)" % (CW_FIELDS & ~known, value)
+            if self.mode_hook_guard:
+                mode = "(recomp_hooks_ever ? x87_cw_ : %s)" % mode
+            lines = [CW_USE.sub(mode, line) for line in lines]
+        elif self.clone == "fast":
             lines = [CW_USE.sub("0u", line) for line in lines]
         return lines
 
@@ -629,7 +623,7 @@ class X87Scalar:
                     # PC test keeps the general double path for PC!=0.
                     quiet = self._slot(0)[1].quiet
                     narrow = self._slot(0)[1].narrow
-                    if narrow and quiet and self.clone == "fast" and not self.observe_loads:
+                    if narrow and quiet and self.known_mode and not self.observe_loads:
                         value = "(float)(%s)" % value
                     elif narrow and not self.observe_loads:
                         if not value.isidentifier():

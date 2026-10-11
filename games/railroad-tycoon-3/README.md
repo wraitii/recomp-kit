@@ -51,7 +51,7 @@ built-in guest profiler selects ordinary fallback. No workload gain is establish
 Static control-word analysis proves the conversion leaf preserves its incoming
 mode. Private preparation now requires `(CW & 0x0f00) == 0`, and each private
 body emits only the fast arithmetic; other modes reuse the ordinary checked
-entry. `x87_cw_clone = false` restores general private arithmetic. In the linked
+entry. `x87_cw_clone = false` keeps x87 calls on general ordinary entries. In the linked
 ARM64 diff harness, the two private bodies shrink from 4,680 to 1,120 bytes;
 preparation grows by 12 bytes. The existing rounding fixture, routed through
 preparation for private calls, matches the captured ordinary implementation in

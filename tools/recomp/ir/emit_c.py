@@ -463,7 +463,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
          msvc_convention=True, lazy_flags=False, lifter=None, indirect_call_symbol=None,
          call_contracts=None, x87_cw_clone=True, tail_symbols=None,
          checked_return=False, checked_calls=(), contract_calls=(), return_fields=None,
-         variant_requests=None, call_decisions=None, x87_known_mode=False, contract_masks=None):
+         variant_requests=None, call_decisions=None, x87_known_mode=False, contract_masks=None, x87_mode_sites=None, x87_entry_verify=None):
     """Return a complete C function or raise SSAError for whole-function fallback.
 
     `call_symbols` maps an allowed direct-call target address to the C symbol
@@ -501,21 +501,24 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     specialization. `return_fields` emits a private leaf's normal-return
     publication, with full changed state retained for unexpected returns.
 
-    `x87_cw_clone` (the `x87_cw_clone` setting) emits a performance body with
-    at least `CW_CLONE_MIN_OPS` precision/rounding-sensitive x87 operations,
-    and one per `CW_CLONE_DENSITY` instructions, whose fast clone guards at
-    most `CW_CLONE_MAX_GUARDS` tracker activations,
-    twice in one C function: a fast clone whose tracker activations guard
-    PC = RC = 0 (the D3D8 single-precision, round-to-nearest control word)
-    and fold CW to that constant, then the general clone it falls back to at
-    the same activation. It is exact: the guard covers every other CW. Strict
-    x87 never clones.
+    `x87_mode_sites` supplies instruction facts from the separate CW analysis.
+    General emission folds proven bits; hooks use the general recipe.
+
+    The shared body pass selects arithmetic and state-transfer capabilities
+    before lowering. `x87_cw_clone` retains guarded D3D8 arithmetic for ordinary
+    entries within the operation, density and activation budgets. Private x87
+    entries use that lowering with an entry CW guard and reduced publication.
 
     `x87_known_mode` emits only the fast private body. Its entry preparation
     must prove PC = RC = 0, and byte-backed analysis must prove the leaf has
     no calls or control-word effects. Full guest x87 publication is retained.
     """
     arguments = dict(locals())
+    x87_mode_sites = (x87_mode_sites or {}) if not x87_scalar_strict else {}
+    mode_boundaries = {ins.addr for ins in fir.insns}
+    if any(site not in mode_boundaries or known & ~0x0f00 or value & ~known
+           for site, (known, value) in x87_mode_sites.items()):
+        raise SSAError("invalid instruction control-word mode metadata")
     if x87_known_mode:
         from . import x87_mode
         if (return_fields is None or x87_scalar_strict or not x87_cw_clone
@@ -528,6 +531,10 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     contract_masks = contract_masks or {}
     if not contract_calls <= checked_calls:
         raise SSAError("state contracts require checked calls")
+    if return_fields is not None and not x87_known_mode and any(
+            op.opc in ("X87_REG", "X87_MEM", "X87_OPAQUE")
+            for ins in codegen_ir(fir, lifter or Lifter()).insns for op in ins.ops):
+        raise SSAError("private x87 entry requires guarded D3D8 arithmetic")
     if return_fields is not None and (not checked_return or any(
             op.opc in ("CALL", "CALLIND", "DIV32", "IDIV32", "STRINGOP", "SEH")
             for ins in codegen_ir(fir, lifter or Lifter()).insns for op in ins.ops)):
@@ -573,6 +580,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     scalar = X87Scalar(observe_loads=x87_scalar_strict, convention=x87_convention,
                        lazy_nan=defer_ie)
     scalar.known_mode = x87_known_mode
+    scalar.mode_hook_guard = True
 
     def flush_x87():
         return scalar.flush()
@@ -894,6 +902,9 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     for v in getattr(s, "entry_ops", ()):
         if v.id in live and s.resolve(v) is v:
             lines.append("v%d = (%s) & %s;" % (v.id, expression(v), mask(v.size)))
+    if x87_entry_verify:
+        known, value = x87_entry_verify
+        lines.append('if (RECOMP_UNLIKELY(!recomp_hooks_ever && (c->fpu_cw & 0x%xu) != 0x%xu)) recomp_x87_contract_violation(c, 0x%08xu, 0x%xu, 0x%xu);' % (known, value, fir.addr, known, value))
     if fir.entries:
         lines.append("switch (entry_) {")
         for e, block in zip(fir.entries, s.alternates):
@@ -1046,14 +1057,12 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
 
     activations = []
     for clone in clones:
-        if clone is not None:
-            # Each clone replays the tracker from a clean state, so their
-            # activation sequences line up; see X87Scalar._activation.
-            block_label = "F" if clone == "fast" else "B"
-            scalar.reset()
-            scalar.clone, scalar.activations = clone, 0
+        scalar.reset()
+        scalar.clone, scalar.activations = clone, 0
+        block_label = "F" if clone == "fast" else "B"
         previous = None
         for i, b in s.blocks.items():
+            scalar.proven_cw = x87_mode_sites.get(b.insn.addr)
             lines.append("%s%d:;" % (block_label, i))
             if carry_mode:
                 # Seeding must run on every entry, including a branch that jumps
@@ -1254,12 +1263,8 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
         if clone is not None:
             activations.append(scalar.activations)
     if len(set(activations)) > 1:
-        raise SSAError("x87 CW clones activate at different points: %r" % activations)
+        raise SSAError("x87 specializations activate at different points: %r" % activations)
     if not x87_known_mode and activations and activations[0] > CW_CLONE_MAX_GUARDS:
-        # Several tracker windows (calls, opaque recipes, reset edges): the
-        # shared locals stay live across every guard into the general clone,
-        # and the extra register pressure outweighed the folded selects
-        # (RayTestTriangles 323 -> 331 ns with 13 guards). Emit one body.
         arguments["x87_cw_clone"] = False
         return emit(**arguments)
     lines.append("}")
