@@ -2265,6 +2265,57 @@ void DirectSoundEnumerateA(X86 *c) {
     set_eax(c, DS_OK);
 }
 
+// DirectSoundCaptureEnumerateA(callback, context). The bridge provides no
+// capture device, so the callback is never invoked and the call reports
+// success with an empty list, the same result as a machine with no input.
+void DirectSoundCaptureEnumerateA(X86 *c) {
+    if (!arg(c, 0)) {
+        set_eax(c, DSERR_INVALIDPARAM);
+        return;
+    }
+    set_eax(c, DS_OK);
+}
+
+// DirectSoundCaptureCreate(lpGuid, ppCapture, pUnkOuter). Capture is not
+// modelled; the caller learns there is no driver so it can disable capture
+// rather than receive a NULL object with a success code.
+void DirectSoundCaptureCreate(X86 *c) {
+    uint32_t out = arg(c, 1);
+    if (out && gm_valid(out, 4))
+        wr32(out, 0);
+    set_eax(c, DSERR_NODRIVER);
+}
+
+// GetDeviceID(lpGuidSrc, lpGuidDest). The bridge has one playback identity and
+// no capture device, so both playback default-device IDs map onto the
+// enumerated playback GUID; every other GUID is returned unchanged.
+void DirectSoundGetDeviceID(X86 *c) {
+    uint32_t src = arg(c, 0), dst = arg(c, 1);
+    if (!dst || !gm_valid(dst, 16)) {
+        set_eax(c, DSERR_INVALIDPARAM);
+        return;
+    }
+    if (!src) {
+        memcpy(gm_ptr(dst), GUID_RecompPlayback_, 16);
+        set_eax(c, DS_OK);
+        return;
+    }
+    if (!gm_valid(src, 16)) {
+        set_eax(c, DSERR_INVALIDPARAM);
+        return;
+    }
+    // DSDEVID_Default{Playback,VoicePlayback} share the suffix
+    // {9C6D-47ED-AAF1-4DDA8F2B5C03} and differ only in DEF00000/DEF00002.
+    static const uint8_t suffix[12] = {0x6d, 0x9c, 0xed, 0x47, 0xaa, 0xf1,
+                                       0x4d, 0xda, 0x8f, 0x2b, 0x5c, 0x03};
+    uint32_t id = rd32(src);
+    if ((id == 0xdef00000u || id == 0xdef00002u) && memcmp(gm_ptr(src) + 4, suffix, 12) == 0)
+        memcpy(gm_ptr(dst), GUID_RecompPlayback_, 16);
+    else
+        memcpy(gm_ptr(dst), gm_ptr(src), 16);
+    set_eax(c, DS_OK);
+}
+
 // CLSID_DirectSound, for a game built against the DirectX 7 era SDK that
 // creates its DirectSound through CoCreateInstance rather than
 // DirectSoundCreate. Both make the same host object.
@@ -2282,6 +2333,12 @@ const ImportShim g_dsound_exports[] = {
     {"DSOUND.dll", "DirectSoundEnumerateA", 2, DirectSoundEnumerateA},
     {"DSOUND.dll", "ord11", 3, DirectSoundCreate8},
     {"DSOUND.dll", "DirectSoundCreate8", 3, DirectSoundCreate8},
+    {"DSOUND.dll", "ord6", 3, DirectSoundCaptureCreate},
+    {"DSOUND.dll", "DirectSoundCaptureCreate", 3, DirectSoundCaptureCreate},
+    {"DSOUND.dll", "ord7", 2, DirectSoundCaptureEnumerateA},
+    {"DSOUND.dll", "DirectSoundCaptureEnumerateA", 2, DirectSoundCaptureEnumerateA},
+    {"DSOUND.dll", "ord9", 2, DirectSoundGetDeviceID},
+    {"DSOUND.dll", "GetDeviceID", 2, DirectSoundGetDeviceID},
 };
 
 // A DirectSound object also answers to IDirectSound3DListener, and a buffer to

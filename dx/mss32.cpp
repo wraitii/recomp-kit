@@ -1148,6 +1148,174 @@ void ail_release_timer_handle(X86 *c) {
     set_eax(c, 0);
 }
 
+// ---------------------------------------------------------------------------
+// Miles 9 exports the title imports under names earlier Miles revisions did
+// not have. The mixer holds no reverb, Doppler or per-sample orientation, so
+// those calls leave the mix unchanged; positions and distances map onto the
+// shared 3D model, and the getters report what the shim holds.
+// ---------------------------------------------------------------------------
+void ail_mem_hook(X86 *c) {
+    set_eax(c, 0);
+}
+
+void ail_close_digital_driver(X86 *c) {
+    uint32_t id = arg(c, 0);
+    for (auto &s : g_samples)
+        if (s.alive && s.driver == id) {
+            sample_reset(s);
+            s.alive = false;
+        }
+    g_drivers.erase(id);
+    if (g_last_digital_driver == id)
+        g_last_digital_driver = 0;
+    set_eax(c, 0);
+}
+
+void ail_get_dsound_info(X86 *c) {
+    if (arg(c, 1) && gm_valid(arg(c, 1), 4))
+        wr32(arg(c, 1), 0);
+    if (arg(c, 2) && gm_valid(arg(c, 2), 4))
+        wr32(arg(c, 2), 0);
+    set_eax(c, 0);
+}
+
+void ail_sample_playback_rate(X86 *c) {
+    Sample *s = sample_for(arg(c, 0));
+    set_eax(c, s ? (s->rate ? s->rate : s->wave.rate) : 0);
+}
+
+void ail_sample_position(X86 *c) {
+    set_eax(c, 0);
+}
+
+// AIL_sample_ms_position(HSAMPLE, S32 *total, S32 *current). The shim knows
+// the image's length but keeps no play cursor, so the current position is
+// reported as the start.
+void ail_sample_ms_position(X86 *c) {
+    Sample *s = sample_for(arg(c, 0));
+    uint32_t total = 0;
+    if (s && s->wave.pcm_bytes) {
+        uint32_t rate = s->rate ? s->rate : s->wave.rate;
+        uint32_t frame =
+            std::max<uint32_t>(1u, uint32_t(s->wave.channels) * uint32_t(s->wave.bits / 8));
+        total = uint32_t((uint64_t)s->wave.pcm_bytes / frame * 1000 / std::max(1u, rate));
+    }
+    if (arg(c, 1) && gm_valid(arg(c, 1), 4))
+        wr32(arg(c, 1), total);
+    if (arg(c, 2) && gm_valid(arg(c, 2), 4))
+        wr32(arg(c, 2), 0);
+    set_eax(c, 0);
+}
+
+void ail_sample_volume_pan(X86 *c) {
+    Sample *s = sample_for(arg(c, 0));
+    if (arg(c, 1) && gm_valid(arg(c, 1), 4))
+        wr32(arg(c, 1), s ? (uint32_t)s->volume : 0);
+    if (arg(c, 2) && gm_valid(arg(c, 2), 4))
+        wr32(arg(c, 2), s ? (uint32_t)s->pan : 0);
+    set_eax(c, 0);
+}
+
+void ail_sample_reverb_levels(X86 *c) {
+    if (arg(c, 1) && gm_valid(arg(c, 1), 4))
+        wr32(arg(c, 1), 0);
+    if (arg(c, 2) && gm_valid(arg(c, 2), 4))
+        wr32(arg(c, 2), 0);
+    set_eax(c, 0);
+}
+
+void ail_set_sample_position(X86 *c) {
+    set_eax(c, 0);
+}
+
+void ail_set_sample_reverb_levels(X86 *c) {
+    set_eax(c, 0);
+}
+
+void ail_service_stream(X86 *c) {
+    if (Stream *s = stream_for(arg(c, 0)))
+        stream_update(*s);
+    set_eax(c, 0);
+}
+
+void ail_stream_loop_count(X86 *c) {
+    Stream *s = stream_for(arg(c, 0));
+    set_eax(c, s ? s->loops : 0);
+}
+
+void ail_stream_ms_position(X86 *c) {
+    if (arg(c, 1) && gm_valid(arg(c, 1), 4))
+        wr32(arg(c, 1), 0);
+    if (arg(c, 2) && gm_valid(arg(c, 2), 4))
+        wr32(arg(c, 2), 0);
+    set_eax(c, 0);
+}
+
+void ail_set_stream_ms_position(X86 *c) {
+    set_eax(c, 0);
+}
+
+void ail_stream_sample_handle(X86 *c) {
+    set_eax(c, 0);
+}
+
+void ail_set_listener_3D_position(X86 *c) {
+    ail_set_3D_position(c);
+}
+
+void ail_set_listener_3D_orientation(X86 *c) {
+    ail_set_3D_orientation(c);
+}
+
+void ail_set_sample_3D_position(X86 *c) {
+    ail_set_3D_position(c);
+}
+
+void ail_set_sample_3D_orientation(X86 *c) {
+    set_eax(c, 0);
+}
+
+void ail_set_sample_3D_velocity_vector(X86 *c) {
+    set_eax(c, 0);
+}
+
+void ail_set_sample_3D_cone(X86 *c) {
+    set_eax(c, 0);
+}
+
+// AIL_set_sample_3D_distances(H3DSAMPLE, F32 max, F32 min, S32 apply).
+void ail_set_sample_3D_distances(X86 *c) {
+    if (Sample *s = sample_for(arg(c, 0))) {
+        s->max_d = bits_to_float(arg(c, 1));
+        s->min_d = bits_to_float(arg(c, 2));
+        sample_apply_mix(*s);
+    }
+    set_eax(c, 0);
+}
+
+void ail_set_3D_doppler_factor(X86 *c) {
+    set_eax(c, 0);
+}
+
+// AIL_set_3D_rolloff_factor(listener, F32) is the distance-factor control in
+// the title's Miles revision; the shared 3D model stores one rolloff.
+void ail_set_3D_rolloff_factor(X86 *c) {
+    g_rolloff3d = bits_to_float(arg(c, 1));
+    set_eax(c, 0);
+}
+
+void ail_set_room_type(X86 *c) {
+    set_eax(c, 0);
+}
+
+void ail_set_digital_master_reverb(X86 *c) {
+    set_eax(c, 0);
+}
+
+void ail_set_digital_master_reverb_levels(X86 *c) {
+    set_eax(c, 0);
+}
+
 void ret0(X86 *c) {
     set_eax(c, 0);
 }
@@ -1243,6 +1411,34 @@ const ImportShim g_mss32_shims[] = {
     AIL(set_3D_orientation, 28, ail_set_3D_orientation),
     AIL(register_3D_EOS_callback, 8, ail_register_3D_eos_callback),
     AIL(3D_update_position, 8, ret0),
+    AIL(mem_use_malloc, 4, ail_mem_hook),
+    AIL(mem_use_free, 4, ail_mem_hook),
+    AIL(close_digital_driver, 4, ail_close_digital_driver),
+    AIL(get_DirectSound_info, 12, ail_get_dsound_info),
+    AIL(sample_ms_position, 12, ail_sample_ms_position),
+    AIL(sample_playback_rate, 4, ail_sample_playback_rate),
+    AIL(sample_position, 4, ail_sample_position),
+    AIL(sample_reverb_levels, 12, ail_sample_reverb_levels),
+    AIL(sample_volume_pan, 12, ail_sample_volume_pan),
+    AIL(service_stream, 8, ail_service_stream),
+    AIL(set_3D_doppler_factor, 8, ail_set_3D_doppler_factor),
+    AIL(set_3D_rolloff_factor, 8, ail_set_3D_rolloff_factor),
+    AIL(set_digital_master_reverb, 16, ail_set_digital_master_reverb),
+    AIL(set_digital_master_reverb_levels, 12, ail_set_digital_master_reverb_levels),
+    AIL(set_listener_3D_orientation, 28, ail_set_listener_3D_orientation),
+    AIL(set_listener_3D_position, 16, ail_set_listener_3D_position),
+    AIL(set_room_type, 8, ail_set_room_type),
+    AIL(set_sample_3D_cone, 16, ail_set_sample_3D_cone),
+    AIL(set_sample_3D_distances, 16, ail_set_sample_3D_distances),
+    AIL(set_sample_3D_orientation, 28, ail_set_sample_3D_orientation),
+    AIL(set_sample_3D_position, 16, ail_set_sample_3D_position),
+    AIL(set_sample_3D_velocity_vector, 16, ail_set_sample_3D_velocity_vector),
+    AIL(set_sample_position, 8, ail_set_sample_position),
+    AIL(set_sample_reverb_levels, 12, ail_set_sample_reverb_levels),
+    AIL(set_stream_ms_position, 8, ail_set_stream_ms_position),
+    AIL(stream_loop_count, 4, ail_stream_loop_count),
+    AIL(stream_ms_position, 12, ail_stream_ms_position),
+    AIL(stream_sample_handle, 4, ail_stream_sample_handle),
 };
 
 } // namespace
