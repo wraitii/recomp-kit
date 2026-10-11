@@ -801,6 +801,15 @@ void ctrl_id(X86 *c) {
     Window *w = find_window(arg(c, 0));
     set_eax(c, w ? w->id : 0);
 }
+void dlg_item(X86 *c) {
+    uint32_t dlg = arg(c, 0), id = arg(c, 1), found = 0;
+    for (const auto &kv : windows())
+        if (kv.second.parent == dlg && kv.second.id == id) {
+            found = kv.first;
+            break;
+        }
+    set_eax(c, found);
+}
 // COLORREF byte order (00BBGGRR), classic system palette, indices 0..29.
 const uint32_t colors[30] = {0xc8c8c8, 0,        0xd1b499, 0xdbcdbf, 0xf0f0f0, 0xffffff,
                              0x646464, 0,        0,        0,        0xb4b4b4, 0xf4f7fc,
@@ -1656,9 +1665,8 @@ const ImportShim shims[] = {
     U("EndDialog", 2, imports_unsupported),
     U("IsDlgButtonChecked", 2, imports_unsupported),
     U("CheckDlgButton", 3, imports_unsupported),
-    U("GetDlgItem", 2, imports_unsupported),
+    U("GetDlgItem", 2, dlg_item),
     U("GetDlgItemTextA", 4, imports_unsupported),
-    U("LoadBitmapA", 2, imports_unsupported),
     U("SendDlgItemMessageA", 5, imports_unsupported),
 #undef U
 };

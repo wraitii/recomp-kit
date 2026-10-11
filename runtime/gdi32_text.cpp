@@ -36,6 +36,25 @@ void create_font(X86 *c) {
     memcpy(font.logfont.data(), g_mem + p, 92);
     set_eax(c, make_object(font));
 }
+// LOGFONTA is the 60-byte prefix of LOGFONTW with a CHAR face name; the stored
+// font always uses the wide layout, so widen the name into the 92-byte record.
+void create_font_a(X86 *c) {
+    uint32_t p = arg(c, 0);
+    if (!p || !gm_valid(p, 60)) {
+        set_eax(c, 0);
+        return;
+    }
+    Object font;
+    font.kind = Object::Font;
+    memcpy(font.logfont.data(), g_mem + p, 28);
+    for (size_t i = 0; i < 32; ++i) {
+        uint8_t ch = g_mem[p + 28 + i];
+        font.logfont[28 + 2 * i] = ch;
+        if (!ch)
+            break;
+    }
+    set_eax(c, make_object(font));
+}
 // TEXTMETRICW is 60 bytes on x86: eleven DWORDs, four UTF-16
 // characters, five BYTE fields and three bytes of trailing padding.
 void metrics(uint32_t out, int32_t scale, uint32_t weight) {
@@ -423,6 +442,7 @@ void register_text() {
         "GDI32.dll", n, a, f                                                                       \
     }
     static const ImportShim shims[] = {G("CreateFontIndirectW", 1, create_font),
+                                       G("CreateFontIndirectA", 1, create_font_a),
                                        G("ExtTextOutW", 8, text_out),
                                        G("GetTextExtentPoint32W", 4, extent),
                                        G("GetTextExtentPointW", 4, extent),

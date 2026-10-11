@@ -80,6 +80,9 @@ using namespace user32;
 void register_w(X86 *c) {
     register_class_named(c, true, 0);
 }
+void register_ex_w(X86 *c) {
+    register_class_named(c, true, 4);
+}
 void create_w(X86 *c) {
     create_window_named(c, true);
 }
@@ -676,6 +679,7 @@ void dialog_message(X86 *c) {
 const ImportShim shims[] = {
 #define W(name, n, fn) {"USER32.dll", name, n, fn}
     W("RegisterClassW", 1, register_w),
+    W("RegisterClassExW", 1, register_ex_w),
     W("UnregisterClassW", 2, unregister_w),
     W("GetClassInfoW", 3, class_info),
     W("CreateWindowExW", 12, create_w),
@@ -689,12 +693,14 @@ const ImportShim shims[] = {
     W("SendMessageTimeoutW", 7, send_timeout),
     W("GetClassLongW", 2, get_class_long),
     W("SetClassLongW", 3, set_class_long),
+    W("SetClassLongA", 3, set_class_long),
     W("GetWindowTextW", 3, get_text),
     W("SetWindowTextW", 2, set_text),
     W("GetClassNameW", 3, class_name),
     W("FindWindowW", 2, find_w),
     W("FindWindowExW", 4, find_ex_w),
     W("LoadBitmapW", 2, load_bitmap),
+    W("LoadBitmapA", 2, load_bitmap),
     W("LoadIconW", 2, load_icon),
     W("LoadImageA", 6, load_image_a),
     W("LoadStringW", 4, load_string_w),

@@ -24,6 +24,16 @@ void zero(X86 *c) {
     set_eax(c, 0);
 }
 
+// HAP Debugger: a developer-only remote debug console that owns its own
+// sockets and Python interpreter. Its imports are __cdecl (mangled names with
+// no @N), so the dispatcher must leave the arguments for the caller to pop.
+// Initialize reports "no debugger" so the title's HAP session path returns
+// early, and the output calls are accepted and dropped, as on a run with no
+// debugger attached.
+void hapdbg_noop(X86 *c) {
+    set_eax(c, 0);
+}
+
 // SHLWAPI string and path helpers msxml3 imports. The URL entry points that
 // need WinINet's parser stay named failures.
 uint16_t wide_unit(uint32_t p, uint32_t i) {
@@ -415,6 +425,17 @@ const ImportShim shims[] = {
     {"DBGHELP.dll", "SymSetOptions", 1, imports_unsupported},
     {"DBGHELP.dll", "SymInitialize", 3, imports_unsupported},
     {"DBGHELP.dll", "SymCleanup", 1, imports_unsupported},
+    {"hapdbg.dll", "?Initialize@hapdbg@@YA_NH@Z", ARGC_CDECL, hapdbg_noop},
+    {"hapdbg.dll", "?WaitForConnection@hapdbg@@YA_NXZ", ARGC_CDECL, hapdbg_noop},
+    {"hapdbg.dll", "?Uninitialize@hapdbg@@YAXXZ", ARGC_CDECL, hapdbg_noop},
+    {"hapdbg.dll",
+     "?OutputToDebugConsole@hapdbg@@YAXAAV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@"
+     "std@@@Z",
+     ARGC_CDECL, hapdbg_noop},
+    {"hapdbg.dll",
+     "?OutputToErrConsole@hapdbg@@YAXAAV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@"
+     "std@@@Z",
+     ARGC_CDECL, hapdbg_noop},
 };
 } // namespace
 void misc_dlls_register() {

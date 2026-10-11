@@ -849,6 +849,26 @@ void a_RegCreateKeyExW(X86 *c) {
 void a_RegQueryValueExA(X86 *c) {
     reg_query(c, gm_str(arg(c, 1), 256), false);
 }
+// RegQueryValueA is the pre-RegQueryValueEx form of the same read: it returns
+// the unnamed value of hKey, or of lpSubKey when one is given, as ANSI text.
+void a_RegQueryValueA(X86 *c) {
+    std::string path = key_path(arg(c, 0), gm_str(arg(c, 1), 512));
+    if (path.empty()) {
+        set_eax(c, 6);
+        return;
+    }
+    auto it = regstore().find(path);
+    if (it == regstore().end()) {
+        set_eax(c, 2);
+        return;
+    }
+    auto vi = it->second.find("");
+    if (vi == it->second.end()) {
+        set_eax(c, 2);
+        return;
+    }
+    set_eax(c, reg_read_value(vi->second, false, 0, arg(c, 2), arg(c, 3)));
+}
 void a_RegQueryValueExW(X86 *c) {
     reg_query(c, gm_wstr(arg(c, 1)), true);
 }
@@ -2848,7 +2868,6 @@ const ImportShim g_misc_shims[] = {
     // Published Win32 stdcall signatures; unsupported calls retain named faults.
     {"comdlg32.dll", "GetOpenFileNameA", 1, imports_unsupported},
     {"GDI32.dll", "GetTextFaceA", 3, imports_unsupported},
-    {"GDI32.dll", "CreateFontIndirectA", 1, imports_unsupported},
     // ADVAPI32
     {"ADVAPI32.dll", "GetUserNameA", 2, a_GetUserNameA},
     {"ADVAPI32.dll", "GetUserNameW", 2, a_GetUserNameW},
@@ -2858,6 +2877,7 @@ const ImportShim g_misc_shims[] = {
     {"ADVAPI32.dll", "RegCreateKeyA", 3, a_RegCreateKeyA},
     {"ADVAPI32.dll", "RegCloseKey", 1, a_RegCloseKey},
     {"ADVAPI32.dll", "RegQueryValueExA", 6, a_RegQueryValueExA},
+    {"ADVAPI32.dll", "RegQueryValueA", 4, a_RegQueryValueA},
     {"ADVAPI32.dll", "RegSetValueExA", 6, a_RegSetValueExA},
     {"ADVAPI32.dll", "RegOpenKeyExW", 5, a_RegOpenKeyExW},
     {"ADVAPI32.dll", "RegCreateKeyExW", 9, a_RegCreateKeyExW},

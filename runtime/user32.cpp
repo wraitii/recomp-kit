@@ -550,8 +550,37 @@ void u_GetClientRect(X86 *c) {
     set_eax(c, 1);
 }
 
+void u_GetWindowInfo(X86 *c) {
+    Window *w = find_window(arg(c, 0));
+    uint32_t p = arg(c, 1);
+    if (!w || !p || !gm_valid(p, 0x3c) || rd32(p) < 0x3c) {
+        set_eax(c, 0);
+        return;
+    }
+    int32_t x, y;
+    client_origin(w->hwnd, &x, &y);
+    uint32_t values[] = {(uint32_t)x,
+                         (uint32_t)y,
+                         (uint32_t)(x + w->w),
+                         (uint32_t)(y + w->h),
+                         (uint32_t)x,
+                         (uint32_t)y,
+                         (uint32_t)(x + w->w),
+                         (uint32_t)(y + w->h),
+                         w->style,
+                         w->exstyle,
+                         0,
+                         0,
+                         0,
+                         0x04000000u};
+    for (uint32_t i = 0; i < sizeof(values) / sizeof(values[0]); ++i)
+        wr32(p + 4 + 4 * i, values[i]);
+    set_eax(c, 1);
+}
+
 void u_SystemParametersInfoA(X86 *c) {
     const uint32_t SPI_GETWORKAREA = 48;
+    const uint32_t SPI_SETMOUSEKEYS = 55, SPI_SETSTICKYKEYS = 59;
     uint32_t action = arg(c, 0), param = arg(c, 2);
     if (action == SPI_GETWORKAREA && param) {
         Window *w = find_window(host_main_window());
@@ -559,6 +588,12 @@ void u_SystemParametersInfoA(X86 *c) {
         wr32(param + 4, 0);
         wr32(param + 8, (uint32_t)(w ? w->w : 640));
         wr32(param + 12, (uint32_t)(w ? w->h : 480));
+        set_eax(c, 1);
+        return;
+    }
+    // Accessibility key settings have no host state; accepting the write keeps
+    // the guest from treating the refusal as a failure.
+    if (action == SPI_SETMOUSEKEYS || action == SPI_SETSTICKYKEYS) {
         set_eax(c, 1);
         return;
     }
@@ -1956,6 +1991,7 @@ const ImportShim g_user32_shims[] = {
     {"USER32.dll", "SetWindowPos", 7, u_SetWindowPos},
     {"USER32.dll", "GetWindowRect", 2, u_GetWindowRect},
     {"USER32.dll", "GetClientRect", 2, u_GetClientRect},
+    {"USER32.dll", "GetWindowInfo", 2, u_GetWindowInfo},
     {"USER32.dll", "SystemParametersInfoA", 4, u_SystemParametersInfoA},
     {"USER32.dll", "AdjustWindowRectEx", 4, u_AdjustWindowRectEx},
     {"USER32.dll", "ClientToScreen", 2, u_ClientToScreen},
