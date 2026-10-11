@@ -369,7 +369,6 @@ D9_STUB(UpdateTexture, 3)
 D9_STUB(GetRenderTargetData, 3)
 D9_STUB(GetFrontBufferData, 3)
 D9_STUB(ColorFill, 4)
-D9_STUB(GetRenderTarget, 3)
 D9_STUB(GetTransform, 3)
 D9_STUB(MultiplyTransform, 3)
 D9_STUB(SetMaterial, 2)
@@ -1328,6 +1327,35 @@ void Dev_GetDepthStencilSurface(X86 *c) {
     com_ret(c, D3D_OK9);
 }
 
+// (this, iSwapChain, ppRenderTarget). The surface bound as target 0, or the
+// implicit back buffer when none was set; the returned handle is a new
+// external reference, like GetBackBuffer's.
+void Dev_GetRenderTarget(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 2);
+    if (!dev || !out) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    com_out_ptr(out, 0);
+    ComObj *s = dev->render_target ? com_get(dev->render_target) : nullptr;
+    if (!s)
+        s = device_backbuffer(dev);
+    if (!s) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    com_addref(s);
+    uint32_t view_ = com_view(s, IF_D3DSURFACE9);
+    if (!view_) {
+        com_release(s);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    com_out_ptr(out, view_);
+    com_ret(c, D3D_OK9);
+}
+
 void Dev_SetRenderTarget(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *s = com_this(arg(c, 2));
@@ -1875,7 +1903,6 @@ RES_STUB(Res, FreePrivateData)
 RES_STUB(Res, SetPriority)
 RES_STUB(Res, GetPriority)
 RES_STUB(Res, PreLoad)
-RES_STUB(Res, GetType)
 RES_STUB(Tex, SetLOD)
 RES_STUB(Tex, GetLOD)
 RES_STUB(Tex, SetAutoGenFilterType)
@@ -1886,6 +1913,22 @@ RES_STUB(Tex, AddDirtyRectCube)
 RES_STUB(Surf, GetDC)
 RES_STUB(Surf, ReleaseDC)
 RES_STUB(Decl, GetDeclaration)
+
+// D3DRESOURCETYPE: 1 surface, 3 texture, 5 cube texture, 6 vertex buffer,
+// 7 index buffer. A K_D3D9TEXTURE is a cube when it carries the cube marker.
+void Res_GetType(X86 *c) {
+    ComObj *o = com_this_arg(c);
+    uint32_t type = 0;
+    if (o && o->kind == K_D3D9SURFACE)
+        type = 1;
+    else if (o && o->kind == K_D3D9TEXTURE)
+        type = o->caps ? 5 : 3;
+    else if (o && o->kind == K_D3D9VB)
+        type = 6;
+    else if (o && o->kind == K_D3D9IB)
+        type = 7;
+    com_ret(c, type);
+}
 
 // (this, riid, ppContainer): the texture a level or face belongs to, or the
 // device when the surface stands alone.
