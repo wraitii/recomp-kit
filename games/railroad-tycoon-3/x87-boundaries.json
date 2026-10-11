@@ -1,0 +1,62 @@
+{
+ "boundaries": [
+  {
+   "function": "005492d0",
+   "site": "00549991",
+   "vtable_offset": 60,
+   "effect": "d3d8_create_no_preserve",
+   "success": "00549aed",
+   "evidence": "IDirect3D8::CreateDevice; original flags EDI=0x20 or 0x40 at 00549949/00549950, pushed at 00549976; no FPU_PRESERVE. dx/d3d8.cpp::D8_CreateDevice preserves CW on early validation returns, applies dx/d3d8_fpu.h before backend creation; successful HRESULT proves setup ran. TEST EAX/EAX and JGE at 00549994/00549996 select the success edge."
+  },
+  {
+   "function": "00545e00",
+   "site": "00545e09",
+   "vtable_offset": 12,
+   "effect": "preserve",
+   "evidence": "RenderingContext::getDeviceStatus loads d3d8Device at +0x25df and invokes IDirect3DDevice8::TestCooperativeLevel. dx/d3d8.cpp::Dev_TestCooperativeLevel calls only com_ret; dx/com.h::com_ret writes EAX. No guest callback or guest FPU write."
+  },
+  {
+   "function": "0054e5d0",
+   "site": "0054e5e7",
+   "load_site": "0054e5d4",
+   "register": "esi",
+   "source": "audited_call_target",
+   "evidence": "Original DispatchMessage wrapper caches the named PE IAT slot in a saved nonvolatile register. Ghidra decompilation and complete 0054e5d0..0054e627 disassembly identify this call, with no intervening writes to that register except imported calls following the x86 API ABI. Target identity is an audited contract; PC/RC preservation requires x87_imports_preserve_pc_rc.",
+   "import": "PeekMessageA"
+  },
+  {
+   "function": "0054e5d0",
+   "site": "0054e605",
+   "load_site": "0054e5f5",
+   "register": "edi",
+   "source": "audited_call_target",
+   "evidence": "Original DispatchMessage wrapper caches the named PE IAT slot in a saved nonvolatile register. Ghidra decompilation and complete 0054e5d0..0054e627 disassembly identify this call, with no intervening writes to that register except imported calls following the x86 API ABI. Target identity is an audited contract; PC/RC preservation requires x87_imports_preserve_pc_rc.",
+   "import": "TranslateMessage"
+  },
+  {
+   "function": "0054e5d0",
+   "site": "0054e60c",
+   "load_site": "0054e5ee",
+   "register": "ebx",
+   "source": "audited_call_target",
+   "evidence": "Original DispatchMessage wrapper caches the named PE IAT slot in a saved nonvolatile register. Ghidra decompilation and complete 0054e5d0..0054e627 disassembly identify this call, with no intervening writes to that register except imported calls following the x86 API ABI. Target identity is an audited contract; PC/RC preservation requires x87_imports_preserve_pc_rc.",
+   "import": "DispatchMessageA"
+  },
+  {
+   "function": "0054e5d0",
+   "site": "0054e61b",
+   "load_site": "0054e5d4",
+   "register": "esi",
+   "source": "audited_call_target",
+   "evidence": "Original DispatchMessage wrapper caches the named PE IAT slot in a saved nonvolatile register. Ghidra decompilation and complete 0054e5d0..0054e627 disassembly identify this call, with no intervening writes to that register except imported calls following the x86 API ABI. Target identity is an audited contract; PC/RC preservation requires x87_imports_preserve_pc_rc.",
+   "import": "PeekMessageA"
+  }
+ ],
+ "imports": [
+  {
+   "name": "GetTickCount",
+   "effect": "preserve",
+   "evidence": "runtime/kernel32.cpp::k_GetTickCount: native_frame_clock, host_note_cadence, host_millis, guest deadline write, set_eax. No guest callback or guest CW write. Original get_elapsed_ticks at 0051d890 calls the PE IAT slot, subtracts TickAtStart and returns; import names are checked against original PE bytes."
+  }
+ ]
+}

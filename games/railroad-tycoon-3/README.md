@@ -72,8 +72,9 @@ The code-map inventory has 58 functions containing 78 control-word writer sites.
 Their direct-call descendants include 81 of 1,565 x87-using functions. This
 narrows the exceptional-mode review; it does not establish a default at the
 remaining entries. The generated contract report includes writer sites, exposure
-closures, unknown boundaries and x87-only preservation coverage: 481 of 1,565
-functions currently prove precision/rounding preservation. Local stack provenance
+closures, unknown boundaries and x87-only preservation coverage: 517 of 1,565
+functions prove intrinsic precision/rounding preservation. Offline analysis with
+selected boundary contracts raises that to 525; incoming constants remain separate. Local stack provenance
 proves the original `__ftol` save/truncate/restore sequence; shared globals,
 indirect calls and startup-to-frame propagation remain conservative.
 
@@ -91,3 +92,13 @@ constructor result escaping through its caller. Run after rebuilding:
 ```sh
 python tools/recomp/diff/run.py --game railroad-tycoon-3 --suite games/railroad-tycoon-3/validation/private-call-state.json
 ```
+
+Selected production facts use import PC/RC preservation and the explicit,
+verified cargo-entry premise in `game.toml`. `x87-boundaries.json` records the
+byte-backed native/import boundaries; `x87-facts.json` covers 479 instruction
+sites in 10 functions. It removes five ordinary arithmetic copies and six
+private call-site CW checks while retaining other preparation and fallback
+conditions. Exploratory roots and allocator/math assumptions remain offline.
+Re-export facts with `tools/recomp/x87_audit.py propagation --facts-out` after
+changing analysis dependencies; see [the contract guide](../../docs/contract-cleanup.md).
+Future specialized calls will pass actual arguments/results instead of `X86*`.
