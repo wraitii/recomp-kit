@@ -6,6 +6,7 @@ bundle_id = "dev.recompkit.ghostrecon"
 executable = "GhostRecon.exe"
 sha256 = "78786b4e95fa535bb364154885bc161a92e96dddac18b66716581a8725a9735f"
 image_base = 0x00400000
+host_arena_base = 0
 entry_point = 0x006f3d14
 guest_root = 'C:\Ghost Recon'
 store_hooks = false
