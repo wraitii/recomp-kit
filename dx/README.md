@@ -108,34 +108,22 @@ including the slots that are stubs, because an interface that stopped early
 would send the guest to the wrong method rather than to a missing one. The
 tests assert the slot count and that no two slots share a trampoline.
 
-## What the game actually uses
+## Interface inventory
 
-Cross-referencing the EXE's `.text` against the DirectX IID table (all 42 IIDs
-are present in `.rdata` because `dxguid.lib` is linked, so presence proves
-nothing; only a code reference does) gives the real inventory:
-
-| requested from code | where |
-| --- | --- |
-| `IID_IDirectDraw2`, `IID_IDirectDraw4` | `0x4b03a7`, `0x520e54` |
-| `IID_IDirectDrawSurface2`, `IID_IDirectDrawSurface4` | 8 and 6 sites |
-| `IID_IDirect3D2`, `IID_IDirect3DHALDevice` | `0x42f020`, `0x42f03d` |
-| `IID_IDirect3DMaterial2` | 3 sites |
-| `GUID_SysMouse`, `GUID_SysKeyboard` | `0x52cdc7`, `0x52c907` |
-| `IID_IDirectSound3DBuffer`, `IID_IDirectSound3DListener`, `IID_IDirectSoundNotify` | 4 sites |
-
-So this build renders through Direct3D with a HAL device; there is no
-software-rasterizer path to fall back on. `IID_IDirectDraw`,
-`IID_IDirectDrawSurface`, `IID_IDirectDrawPalette` and `IID_IDirectDrawClipper`
-are never requested by IID, but the version 1 interfaces are still implemented
-in full because `DirectDrawCreate` returns one and `CreateSurface` hands one
-back.
+A game's real DirectX surface is the set of IIDs its code references, not the
+set present in `.rdata`: `dxguid.lib` links all 42 of them, so presence proves
+nothing. Cross-referencing the executable's `.text` against the IID table is
+what produces the inventory. The version-1 interfaces
+(`IID_IDirectDraw`, `IID_IDirectDrawSurface`, `IID_IDirectDrawPalette` and
+`IID_IDirectDrawClipper`) are often never requested by IID, but they are still
+implemented in full because `DirectDrawCreate` returns one and `CreateSurface`
+hands one back.
 
 Vtable slot offsets were checked against real call sites in the Ghidra
 decompilation rather than taken on trust: `IDirect3D2::FindDevice` at `+0x1c`
-and `CreateDevice` at `+0x20` in `init_d3d`, `IDirectDraw2::CreatePalette` at
-`+0x14` and `IDirect3DDevice2::EnumTextureFormats` at `+0x24` in
-`init_d3d_hw_card`, `SetRenderState` at `+0x5c` in `set_render_states`,
-`IDirect3DViewport2::SetViewport2` at `+0x44`, and
+and `CreateDevice` at `+0x20`, `IDirectDraw2::CreatePalette` at `+0x14` and
+`IDirect3DDevice2::EnumTextureFormats` at `+0x24`, `SetRenderState` at
+`+0x5c`, `IDirect3DViewport2::SetViewport2` at `+0x44`, and
 `IDirectDraw::SetCooperativeLevel` at `+0x50`.
 
 ## Behaviour worth knowing before you debug something
@@ -173,29 +161,24 @@ and `CreateDevice` at `+0x20` in `init_d3d`, `IDirectDraw2::CreatePalette` at
 - **DirectInput deltas are consumed on read.** `host_input_state` clears them,
   so `poll_device` is the only reader; a second read in the same call would
   lose that frame's motion.
-- **Nothing in the game drives the mixer, so the shims are driven from the
-  message loop.** `QSWaveMixPump` is called zero times in a whole run: real
-  QMixer runs its own mixing thread and that export is for an application that
-  wants to pump it by hand. Everything that refilled a streamed wave used to
-  hang off it, so nothing ever refilled one, and a streamed wave played the
-  chunks it was given at the start and then stopped - which is a menu that
-  plays a second of music and goes quiet. `dx_register_shims` now registers
+- **Nothing drives the mixer from a guest thread, so the shims are driven from
+  the message loop.** `QSWaveMixPump` is for an application that wants to pump
+  QMixer by hand and may never be called; a streamed wave hung only off it
+  would play its opening chunks and stop. `dx_register_shims` registers
   `qmixer_frame_pump` with `host_set_frame_pump`, and the guest's own message
-  loop runs it between frames. The loop is `PeekMessageA` and only that; the
-  game never calls `GetMessageA`, so anything hung off that one never runs
-  either. DirectSound's notification service rides along on the same tick.
+  loop runs it between frames. DirectSound's notification service rides along
+  on the same tick.
 - **QMixer's `PauseChannel` stops rather than pauses**, because there is no
   host pause; `RestartChannel` replays from the start. It logs once.
 - **A looping buffer the guest writes into is a stream, not a loop.** This is
-  how the game plays music and speech, and the Wine trace of the original
-  settles every detail of it. `0057e1e0` creates a 32768-byte buffer at
-  22050 Hz stereo 16-bit with `GETCURRENTPOSITION2 | CTRLVOLUME | CTRLPAN |
-  CTRLFREQUENCY`, reads its length back out of `GetCaps`, and calls
+  how a game plays music and speech. A typical writer creates a 32768-byte
+  buffer at 22050 Hz stereo 16-bit with `GETCURRENTPOSITION2 | CTRLVOLUME |
+  CTRLPAN | CTRLFREQUENCY`, reads its length back out of `GetCaps`, and calls
   `Play(0, 0, DSBPLAY_LOOPING)` while it is still empty. A thread then polls
   `GetCurrentPosition` every ten milliseconds and, every forty, locks three or
   four kilobytes at its own running offset - 0, 3584, 7056, 10640, wrapping at
   32768 - staying about a lap ahead of the play cursor. There are no
-  notification positions anywhere on that path.
+  notification positions on that path.
 
   So the first lap really is silence, in the original as much as here. What
   must not happen is re-submitting the ring on each `Unlock`, which restarts
@@ -213,43 +196,40 @@ and `CreateDevice` at `+0x20` in `init_d3d`, `IDirectDraw2::CreatePalette` at
   instead would avoid the seam and cost up to a whole extra lap of the ring
   first - 370 ms at 32 KB and 22050 Hz stereo - on a buffer holding silence at
   that instant. It happens once per sound; everything after it is appended and
-  gapless. It reports the
-  offset it resumed from, and `host_audio_played_bytes` counts on from there at
-  the sample rate and never goes backwards, across a re-schedule, across a
-  refill and across an underrun. Reducing that modulo the ring is the whole of
-  the play cursor.
+  gapless. It reports the offset it resumed from, and
+  `host_audio_played_bytes` counts on from there at the sample rate and never
+  goes backwards, across a re-schedule, across a refill and across an
+  underrun. Reducing that modulo the ring is the whole of the play cursor.
 
   It has to be a count of what has been played and not of what is in flight.
-  The guest keeps about a lap of audio in flight on purpose, so a cursor
-  derived from the outstanding bytes sits a fixed distance ahead of the guest's
-  own write offset - and that distance is exactly what the refill gate measures
-  (`0057df10` returns the bytes from the write offset forward to the cursor,
-  `0057dc80` compares that to the next chunk's length). Freeze it and the guest
-  stops writing, which stops the stream, which freezes it further: the movie
-  waits on a number that will not move, with nothing to show that anything is
-  wrong.
+  A guest keeps about a lap of audio in flight on purpose, so a cursor derived
+  from the outstanding bytes sits a fixed distance ahead of its own write
+  offset - and that distance is exactly what the refill gate measures (the
+  bytes from the write offset forward to the cursor, compared against the next
+  chunk's length). Freeze it and the guest stops writing, which stops the
+  stream, which freezes it further: the movie waits on a number that will not
+  move, with nothing to show that anything is wrong.
 
   A host that answers -1 to `host_audio_stream` cannot continue a sound, and
   the ring stays a loop that is re-submitted at every refill. It says so once.
-- **DirectSound notification positions are signalled.** The game has a second
-  streaming path that uses them - `0056ec50` builds a worker thread and two
-  events, `0056efe0` registers them at offset 0 and the half-way point of a
-  `0x7800` buffer and calls `Play`, `0056eb70` parks the worker in
-  `WaitForMultipleObjects` on them - and it does not appear in the traced run,
-  but recording positions without signalling them would hang that worker for
-  good. `dsound_pump()` compares the host play cursor against the registered
-  offsets and signals what it has passed; `QSWaveMixPump` calls it because the
-  game calls that every frame, and every DirectSound entry point calls it too.
+- **DirectSound notification positions are signalled.** A second streaming path
+  builds a worker thread and two events, registers them at offset 0 and the
+  half-way point of a `0x7800` buffer and calls `Play`, then parks the worker
+  in `WaitForMultipleObjects` on them. Recording positions without signalling
+  them would hang that worker for good. `dsound_pump()` compares the host play
+  cursor against the registered offsets and signals what it has passed;
+  `QSWaveMixPump` calls it because the guest calls that every frame, and every
+  DirectSound entry point calls it too.
 - **A streamed wave is refilled through `host_audio_queue` where the host has
   it, and re-submitted where it does not.** Re-submitting restarts the voice,
   so the join is audible; it logs once when it falls back. The chunk the guest
   callback returns zero on is still played, because zero means "this was the
-  last one", not "this one is bad" (`0056f090`).
+  last one", not "this one is bad".
 - **weanetr reports failure so networking is unavailable.** The polarity is
-  not a guess: at `0x413f90` the game frees its MLDPlay object when
-  `StartupNetwork` returns zero, so zero is failure across MLDPlay.
-  `GetCurrentMs` is the exception and returns the real clock, because the game
-  calls it from dozens of places that have nothing to do with networking.
+  not a guess: a caller frees its MLDPlay object when `StartupNetwork` returns
+  zero, so zero is failure across MLDPlay. `GetCurrentMs` is the exception and
+  returns the real clock, because callers use it from dozens of places that
+  have nothing to do with networking.
 
 ## Known gaps
 
@@ -336,9 +316,7 @@ attenuated and panned from the listener and buffer positions, min/max distance
 and rolloff, following Wine's `DSOUND_Calc3DBuffer` (see the comment above
 `calc_3d` in `dsound.cpp` for the formulas and what is from a reference versus
 memory). Cones, velocity/Doppler and modes other than normal are logged once
-and not applied. Ghost Recon uses only position, min/max distance, volume and
-the listener position and orientation; the Windows result for the same inputs
-has not been compared.
+and not applied. The Windows result for the same inputs has not been compared.
 
 ## Tests
 

@@ -5,8 +5,6 @@ Status: built on branch `touch-controls` (all six steps of section 11).
 This document describes what the branch does, not what was first proposed:
 where the build settled somewhere else, the built behaviour is what is
 written here, with a sentence of reasoning.
-Parent spec: `2026-09-13-recomp-kit-design.md`; supersedes
-`2026-09-13-keypad-design.md` in full
 
 ## 1. Goal
 

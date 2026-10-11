@@ -2,7 +2,6 @@
 
 Date: 2026-09-13
 Status: approved in conversation 2026-09-13; spec pending review
-Parent spec: `2026-09-13-recomp-kit-design.md`
 
 ## 1. Goal
 

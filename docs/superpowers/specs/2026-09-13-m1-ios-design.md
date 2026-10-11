@@ -2,7 +2,6 @@
 
 Date: 2026-09-13
 Status: approved in conversation 2026-09-13
-Parent spec: `2026-09-13-recomp-kit-design.md`, milestone M1
 
 ## 1. Goal
 
@@ -144,8 +143,8 @@ pixel size.
 | Three-finger tap | F10 down, F10 up (Options) |
 | Four-finger tap | toggles the on-screen keyboard (`SDL_StartTextInput` / `SDL_StopTextInput`) |
 
-A key bar (`host/touch_overlay.cpp`, layout in `touch_overlay_layout.h`;
-to be replaced by the split keypad of `2026-09-13-keypad-design.md`) is
+A key bar (since replaced by the data-driven controls of
+`2026-09-17-touch-controls-design.md`) is
 drawn by the presenter along the bottom edge when no hardware keyboard is
 attached: Esc, F10, the four arrows, Space, Enter, and HIDE, which collapses
 the strip to a KEYS tab in the bottom-right corner. A finger on a key holds

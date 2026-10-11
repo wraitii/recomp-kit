@@ -369,9 +369,9 @@ void host_access_counts(HostAccessCounts *out);
 // header fixes their shape so those tasks can be written against something
 // that does not move.
 //
-// The ownership rules are stated once, in
-// docs/superpowers/plans/display-lifetimes.md, and every lifetime comment
-// here is a restatement of a rule in that file rather than a second source.
+// The ownership rules are stated once, in this header's display section, and
+// every lifetime comment here is a restatement of a rule stated there rather
+// than a second source.
 // ===========================================================================
 
 // ---- identities -----------------------------------------------------------

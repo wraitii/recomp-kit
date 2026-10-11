@@ -1,8 +1,7 @@
 # Launcher design: finding and importing the player's game on every target
 
 Date: 2026-09-17
-Status: implemented 2026-09-17 (L0 to L4); see the plan for what was checked where
-Parent spec: `2026-09-13-recomp-kit-design.md`
+Status: implemented 2026-09-17 (L0 to L4); section 7 lists each milestone.
 
 ## 1. Goal
 

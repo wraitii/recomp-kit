@@ -1,13 +1,11 @@
 # Delphi structured exception handling
 
-Date: 2026-09-14. Task 12, measured against kit `9345855`.
+Date: 2026-09-14. Measured against kit `9345855`.
 
-**Status: implemented and validated on macOS; regeneration, four native suites, portable translator suites and kit checks pass. Legacy corpus-specific translator checks remain unavailable.**
-The revised design below resolves the three original landing contradictions
-and corrects normal retirement to use `registration < ESP`. Regeneration
-also identified null default-type entries and a speculative-owner boundary;
-the regressions and resolver now cover both. This document does not claim a
-game run or validation on the other three presets.
+**Status: implemented and validated on macOS.** Normal retirement uses
+`registration < ESP`. Null default-type entries and the speculative-owner
+boundary are covered by the resolver and the regressions. This document does
+not claim a game run or validation on the other three presets.
 
 ## Goal
 
@@ -15,8 +13,8 @@ Dispatch software exceptions through the guest's x86 registration chain,
 run Delphi exception/finally code, and resume the correct live translated
 function without leaving abandoned host calls on its stack. Guest addresses
 remain 32-bit arena offsets. Runtime code must contain no game addresses or
-game identity. The intended platforms are the task's `macos`, `ios`, `linux`
-and `windows` presets; Android is outside this task.
+game identity. The intended platforms are the `macos`, `ios`, `linux` and
+`windows` presets; Android is out of scope.
 
 ## The Delphi idiom
 
@@ -44,10 +42,10 @@ through a popped return register must not consume another guest word.
 
 ### Measurement table
 
-These are documentation evidence, not runtime constants. Measurements were
-repeated on 2026-09-14. The executable hash was verified before reading its
-bytes. Names of the three System routines are inferred from their behavior;
-Ghidra names them `FUN_<address>`, not recovered Delphi symbols.
+These are documentation evidence, not runtime constants. The executable hash
+was verified before reading its bytes. Names of the three System routines are
+inferred from their behavior; Ghidra names them `FUN_<address>`, not recovered
+Delphi symbols.
 
 | Measurement | Result | Evidence |
 | --- | --- | --- |
@@ -64,8 +62,8 @@ Ghidra names them `FUN_<address>`, not recovered Delphi symbols.
 | `System.@HandleFinally` | `0x0080a2dc`, 2,004 incoming measured stubs | Calls the block after the stub during unwind, then returns disposition 1 |
 
 The three System entry points themselves have `.asm` listings and rows in
-`functions.tsv`. Contrary to the task's measurement instructions, the stub
-JMPs cannot be found by grepping those listings: their bytes are omitted.
+`functions.tsv`. The stub JMPs cannot be found by grepping those listings:
+their bytes are omitted.
 The pushed addresses plus PE decoding establish the target counts.
 
 ## Windows' contract
@@ -190,7 +188,7 @@ intervening pushes and never consume a second guest return word.
 `RaiseException` walks the guest registration chain through `guest_call`.
 Disposition 1 searches the next registration. Disposition 0 logs
 `ExceptionContinueExecution requested; not supported` with the record and
-aborts: context restoration is outside this task's implemented subset.
+aborts: context restoration is outside this implementation's supported subset.
 Exhaustion preserves the existing C++ throw, return-chain, register-object
 and stack-return diagnostics before aborting. Only the testing runtime can
 replace unhandled abort with a recording hook.
@@ -260,8 +258,7 @@ the second elements are landing entries and the count/pairs are table
 storage. Otherwise S+5 is the landing.
 The table bytes never become forced executable entries.
 
-The null-type allowance is a measured adjustment to the task's initial
-classifier: stubs `0x0091e551`, `0x0091e611` and `0x0091e6dd` each have two
+The null-type allowance is a measured adjustment to the initial classifier: stubs `0x0091e551`, `0x0091e611` and `0x0091e6dd` each have two
 pairs, the second with a zero type and an executable default handler. The
 System consumer tests the type at `0x0080a1a6` and branches directly to
 acceptance when zero. Requiring every type to lie inside a section decoded
@@ -357,62 +354,19 @@ exception-allocation reclamation, profiling depth and a subsequent callback.
 
 ## Testing
 
-The original hash/stub/table/accepting-stack measurements remain reproducible
-with the private local `build/task12-seh-measure.py`. The corrected normal
-retirement boundary is recorded by the private
-`build/task12-seh-revised-measure.py` probe. Neither script is a game run;
-no image bytes or generated code are committed.
+The synthetic translator regressions use `translate_case` from
+`test_translate_insns.py` for checkpoint emission and the driver's synthetic
+image fixture for omitted-byte discovery. Both FS spellings, an unrelated TEB
+write, plain and typed/default omitted blocks, speculative-owner recovery,
+alternate entries and interception before lookup are covered without game
+inputs.
 
-The synthetic translator regressions use
-`translate_case` from `test_translate_insns.py` for checkpoint emission,
-and the driver's synthetic image fixture for omitted-byte discovery. The
-original helper deliberately uses `NoImage` and cannot recover machine-code
-entries by itself. Both FS spellings, an unrelated TEB write, plain and
-typed/default omitted blocks, speculative-owner recovery, alternate entries
-and interception before lookup are covered without game inputs.
-
-The native `seh_tests` CTest target is labelled `nogame` and builds through
-the game repository's test wrapper. It checks chain order and record fields,
-unwind flags/return value, normal retirement's strict inequality, exit
-unwind, a real host nonlocal landing, skipped callee continuation, guest RET
-state, profile/mod-hook truncation, allocation cleanup, context reuse, thread
-teardown and fatal malformed-chain/unsupported-continuation/missing-checkpoint
-paths. The final run reports **113 checks, 0 failures**.
-
-Validation on 2026-09-14, from the game repository root with its Python:
-
-- Translator tests were written and run before implementation: the initial
-  SEH suite failed four tests, then passed. The null-default table,
-  speculative-owner, provenance and thread-teardown regressions also failed
-  before their corresponding fixes.
-- `.venv/bin/python -m pytest -q kit/tools/recomp/tests
-  --ignore=kit/tools/recomp/tests/test_translate.py
-  --ignore=kit/tools/recomp/tests/test_eaxa.py
-  --ignore=kit/tools/recomp/tests/test_translate_hooks.py`:
-  **87 passed, 1 skipped**. The first two exclusions are standalone
-  game-backed differential scripts, not portable pytest suites. The hook
-  suite was attempted separately and produced **13 failures** because its
-  paths, executable hash and expected symbols require the legacy game's
-  generated corpus, which is absent in this checkout. Its assertions were
-  not weakened or represented as passing.
-- `.venv/bin/python build/task-k1-native.py <suite>` for each of
-  `runtime_tests`, `host_tests`, `dx_tests` and `seh_tests`: **1/1 CTest passed**
-  for each suite. The existing local selector now includes `seh_tests`.
-- `.venv/bin/python -m pytest -q kit/tests`: **37 passed, 2 skipped**.
-- `.venv/bin/python -m pytest -q tests`: **4 passed**.
-- `.venv/bin/python tools/build.py --regenerate --target headless --jobs 8`:
-  successful translation and headless link. The report has **38,196 entries**
-  (**5,602** above the previous 32,594), **5,391 alternate entries**, and
-  **8,181** entries with `seh` provenance. Provenance includes recovered
-  continuations and promoted owners, so it is not a count of frame sites.
-  There are no translation failures, jump-table gaps, undecoded table sites
-  or stale alternate entries. `fn_008812e8` is defined in the generated C.
-  Translation took **89.36 seconds**; the 166 generated-C compilation steps
-  spanned **19.77 seconds** in Ninja's log. Build/link spanned **20.18 seconds**;
-  the complete regeneration/build command took **110.33 seconds** wall time.
-
-Build and test logs are private local artifacts under `build/`, not committed
-inputs. Formatting, game-literal and staged repository checks also pass.
+The native `seh_tests` CTest target is labelled `nogame`. It checks chain
+order and record fields, unwind flags and return value, normal retirement's
+strict inequality, exit unwind, a real host nonlocal landing, skipped callee
+continuation, guest RET state, profile/mod-hook truncation, allocation
+cleanup, context reuse, thread teardown and the fatal
+malformed-chain/unsupported-continuation/missing-checkpoint paths.
 
 ## Out of scope
 
@@ -421,6 +375,4 @@ abort diagnostics. A later implementation could reuse safe guest exception
 dispatch and host checkpoint infrastructure, but compiler-specific frame
 decoding is separate work. Hardware-fault delivery, debugger integration,
 vectored handlers and a complete Windows exception subsystem are also outside
-this task. No game progress log, changelog, assets or parent-repository
-submodule update is committed by this task; the orchestrator records
-game-port progress.
+this implementation.

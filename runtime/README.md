@@ -1,9 +1,9 @@
 # `runtime` — guest runtime, image loader and Win32 shims
 
 This directory is the host side of the static recompilation: it owns the guest
-address space, loads `D3DPopTB.exe` into it, and implements the Win32 imports
-the game calls. It knows nothing about game logic; every shim implements a
-Win32 contract and nothing else.
+address space, loads the game's executable into it, and implements the Win32
+imports the game calls. It knows nothing about game logic; every shim
+implements a Win32 contract and nothing else.
 
 The CPU state (`struct X86`), the memory accessors (`rd32`/`wr32` and friends)
 and `recomp_call` come from `runtime/x86.h`, which the translator
@@ -31,7 +31,7 @@ Guest address `a` is `g_mem + a`.
 
 | range | contents |
 | --- | --- |
-| `0x00400000`–`loader_image_limit()` | image at its preferred base, no relocation (`0xd4c000` for this EXE, from SizeOfImage) |
+| `0x00400000`–`loader_image_limit()` | image at its preferred base, no relocation (the limit comes from the image's `SizeOfImage`) |
 | `[game] heap_base`–`heap_end` (default `0x01000000`–`0x0e000000`) | heap arena (HeapAlloc/GlobalAlloc/LocalAlloc/VirtualAlloc) |
 | `0x0ef00000`–`0x0f000000` | stack, growing down |
 | `0x0fe00000` | TEB: FS:[0] SEH head, FS:[4]/[8] stack bounds, FS:[0x18] self, FS:[0x2c] TLS |
@@ -94,9 +94,9 @@ trampoline; `imports_register_data(dll, name, size)` adds more.
 
 ## `_setjmp` / `_longjmp`
 
-The translator substitutes these by address (`_longjmp` is `0x0055db78`).
-`intrinsics.h` documents the contract: prefer the two-call form, which puts the
-host `setjmp` in the generated function's own frame:
+The translator substitutes these by address.
+Prefer the two-call form, which puts the host `setjmp` in the generated
+function's own frame:
 
 ```c
 { jmp_buf *b = recomp_setjmp_prepare(c); recomp_setjmp_return(c, setjmp(*b)); }
@@ -148,10 +148,10 @@ here, so continuing would run the guest past a point Windows never reaches.
 ## Threads
 
 `CreateThread` starts a **cooperative** thread and returns, the way Windows
-does. The game needs that: both DirectInput service threads (`0052c880`
-keyboard, `0052cd40` mouse) tell their creator they are ready by setting a
-field it polls and then loop on `WaitForSingleObject` for the rest of the
-process, so a body run to completion inside `CreateThread` never comes back.
+does. The game needs that: both DirectInput service threads tell their creator
+they are ready by setting a field it polls and then loop on
+`WaitForSingleObject` for the rest of the process, so a body run to completion
+inside `CreateThread` never comes back.
 
 Each guest thread owns a register file, a 256 KB guest stack, a TEB and a TLS
 array, and runs on its own host thread so guest code can nest host C frames
@@ -244,31 +244,16 @@ and check that every shim leaves ESP balanced.
 `midiOutGetDevCapsA` reports one device called "SoundFont Synth".
 `host_midi_open/short/sysex/reset/close` in `win32.h` are the host contract;
 the weak defaults in `misc.cpp` accept every message and play nothing.
-The host uses TinySoundFont with the bank selected during startup, before
-the guest begins executing. A host without a synth remains silent.
+The host builds the TinySoundFont synth and loads the bank during startup,
+before any guest thread exists, so `host_midi_open` publishes what already
+exists and parses nothing. A host without a synth remains silent.
 
 Every one of these runs on a guest thread and holds the scheduler baton for the
 whole call, so a host that blocks inside one stops every guest thread and not
 just the caller. `host_midi_short` is the hot one, called per note, and must
-not take a lock an audio thread can hold. Loading a large bank synchronously would freeze the game at the moment the music starts with nothing
-to say why, so the open is timed.
-
-The host now builds the synth and loads the bank before the guest starts, so
-`host_midi_open` publishes what already exists and parses nothing. The timing
-above therefore measures a call whose expected reading is zero, and the
-threshold is two milliseconds to match: against an expectation of zero, fifty
-would let a twenty-millisecond parse back in unremarked, and that stutters
-every time the music starts. If it fires, the work belongs in
-`host_midi_startup` rather than on a host thread - which is what the message
-says, because the advice has to move with the meaning.
-
-That is a better answer than moving the load to a host thread would have been,
-and the reason is worth keeping. Loading before any guest thread exists gives
-up nothing: what the baton provides is exclusion between guest threads, so a
-host thread would have surrendered it - no note can arrive in the middle of an
-open that builds nothing, whereas one certainly could arrive in the middle of
-an open waiting on another thread. And nothing waits while holding the baton,
-because nothing waits at all.
+not take a lock an audio thread can hold. Because the bank is already loaded,
+`host_midi_open` is timed against a two-millisecond budget: work that would
+make it block belongs in `host_midi_startup`.
 
 ### Unsupported import diagnostics
 
