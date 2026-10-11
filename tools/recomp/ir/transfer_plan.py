@@ -51,6 +51,8 @@ class CallPlan:
     skipped: frozenset
     fallback: Publication
     outputs: frozenset | None = None
+    output_mask: int | None = None
+    mode_proven: bool = False
 
 
 def flag_publication(s, state, required, record, first_keys, defines, bits):

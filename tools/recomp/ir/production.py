@@ -5,10 +5,11 @@ including replacement, hook, profiling and frame-watch policy. Indirect calls
 are admitted only through the explicit `recomp_call` opt-in; complex host-frame
 ownership and unsupported shapes keep the decoded body whole.
 """
+from dataclasses import dataclass
 import re
 
 from decoded import function_ir
-from .emit_c import emit, codegen_ir
+from .emit_c import prepare as prepare_body, emit_prepared, codegen_ir
 from .lift import LiftError
 from .ssa import SSAError
 from .call_contracts import FIELDS, prepare, summarize
@@ -36,9 +37,9 @@ def exclusion(fn):
     return None
 
 
-def emit_ssa(tr, lifter, fn, entries, common, known, contracts, checked_returns=(), contract_calls=(), report_calls=False,
+def prepare_ssa(tr, lifter, fn, entries, common, known, contracts, checked_returns=(), contract_calls=(), report_calls=False,
              contract_masks=None, x87_mode_sites=None, x87_entry_verify=None):
-    """The SSA body of `fn` as C lines, with its wrappers when other code can enter it.
+    """Prepare the SSA body of `fn`, including checked/private call obligations.
 
     Raises SSAError or LiftError for a shape that stays decoded."""
     calls = {}
@@ -62,40 +63,64 @@ def emit_ssa(tr, lifter, fn, entries, common, known, contracts, checked_returns=
     options["contract_masks"] = contract_masks
     options["x87_mode_sites"] = x87_mode_sites
     options["x87_entry_verify"] = x87_entry_verify
-    variant_requests, call_decisions = set(), []
     symbol = ("body_checked_%08x" if checked else "body_%08x" if fir.entries else "fn_%08x") % fn.addr
     try:
-        source = emit(fir, symbol, lifter=lifter, variant_requests=variant_requests,
-                      call_decisions=call_decisions if report_calls else None, **options)
+        return prepare_body(fir, symbol, lifter=lifter,
+                            call_decisions=[] if report_calls else None, **options)
     except RecursionError:
         raise SSAError("SSA graph recursion budget")
+
+
+def emit_ssa_prepared(prepared):
+    source = emit_prepared(prepared)
+    addr, entries = prepared.ir.addr, prepared.ir.entries
+    checked, symbol = prepared.options["checked_return"], prepared.options["symbol"]
     source = re.sub(r"\bentry_([0-9a-f]{8})\(c\);", r"CALL_FN(\1);", source)
     source = re.sub(r"\bentry_checked_([0-9a-f]{8})\(c, (0x[0-9a-f]+u)\);",
                     r"CALL_FN_CHECKED(\1, \2);", source)
     lines = source.splitlines()
     if checked:
-        lines.append("void fn_%08x(X86 *c) { %s(c, 0u, 0); }" % (fn.addr, symbol))
+        lines.append("void fn_%08x(X86 *c) { %s(c, 0u, 0); }" % (addr, symbol))
         lines.append("void fn_checked_%08x(X86 *c, uint32_t expected) { %s(c, expected, 1); }"
-                     % (fn.addr, symbol))
-    if fir.entries:
-        lines.append("void fn_%08x(X86 *c) { body_%08x(c, 0u); }" % (fn.addr, fn.addr))
-        lines += ["void fn_%08x(X86 *c) { body_%08x(c, 0x%xu); }" % (e, fn.addr, e)
-                  for e in fir.entries]
-    return lines, fir.entries, variant_requests, call_decisions
+                     % (addr, symbol))
+    if entries:
+        lines.append("void fn_%08x(X86 *c) { body_%08x(c, 0u); }" % (addr, addr))
+        lines += ["void fn_%08x(X86 *c) { body_%08x(c, 0x%xu); }" % (e, addr, e)
+                  for e in entries]
+    return lines, entries, prepared.requests, prepared.decisions
 
 
-def emit_private(tr, lifter, fn, common, mask, known_mode=False):
-    symbol = "body_contract_%08x_%04x" % (fn.addr, mask)
+@dataclass
+class PrivatePlan:
+    addr: int
+    mask: int
+    body: object | None
+
+
+def prepare_private(tr, lifter, fn, common, mask, known_mode=False):
     fields = frozenset(f for n, f in enumerate(FIELDS) if mask & (1 << n))
-    source = emit(function_ir(tr, lifter, fn), symbol, lifter=lifter,
-                  checked_return=True, return_fields=fields, x87_known_mode=known_mode, **common)
-    if not known_mode and fields == frozenset(FIELDS):
+    body = prepare_body(function_ir(tr, lifter, fn), "body_contract_%08x_%04x" % (fn.addr, mask),
+                        lifter=lifter, checked_return=True, return_fields=fields,
+                        x87_known_mode=known_mode, **common)
+    return PrivatePlan(fn.addr, mask, None if not known_mode and fields == frozenset(FIELDS) else body)
+
+
+def emit_private_prepared(plan):
+    if plan.body is None:
         return ["void fn_contract_%08x_%04x(X86 *c, uint32_t expected) { fn_checked_%08x(c, expected); }"
-                % (fn.addr, mask, fn.addr)]
-    lines = source.splitlines()
+                % (plan.addr, plan.mask, plan.addr)]
+    lines = emit_prepared(plan.body).splitlines()
     lines.append("void fn_contract_%08x_%04x(X86 *c, uint32_t expected) { %s(c, expected); }"
-                 % (fn.addr, mask, symbol))
+                 % (plan.addr, plan.mask, plan.body.options["symbol"]))
     return lines
+
+
+def emit_ssa(*args, **options):
+    return emit_ssa_prepared(prepare_ssa(*args, **options))
+
+
+def emit_private(*args, **options):
+    return emit_private_prepared(prepare_private(*args, **options))
 
 
 def private_contract(tr, lifter, fn):

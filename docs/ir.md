@@ -6,7 +6,8 @@ Game measurements and the optimization history live in the game repository.
 
 ```
 code map v3 + PE -> program.py -> ir/lift.py (+ x87.py) -> ir/cfg.py -> ir/ssa.py
-  -> ir/emit_c.py -> output.py (chunks, funcs.h, table.c, symbols.json, report)
+  -> emit_c.prepare + x87_plan -> contract_variants.SpecializationPlan
+  -> emit_c.emit_prepared -> output.py (chunks, funcs.h, table.c, symbols.json, report)
 ```
 
 `tools/recomp/driver.py` is the command (`--game DIR --out DIR`, `--report`,
@@ -66,7 +67,10 @@ must-facts about published CPU fields (a field is known published only if every
 predecessor published it; after a call or helper, a register or EIP/FS field
 equals its reload, flags stay unknown).
 
-`emit_c.py` lowers values to unsigned, width-masked C with staged parallel phi
+`emit_c.prepare` settles publication, fallback, flag and arithmetic plans without
+emitting a body. `x87_plan.py` selects clones and validates tracker/carry shapes
+and activation budgets. `emit_c.emit_prepared` lowers the prepared values to
+unsigned, width-masked C with staged parallel phi
 copies, sign-bias comparisons and saturating shift counts. Dword DIV/IDIV are
 checked `div32`/`idiv32` effects that reach the runtime error seam with the
 original address. Memory arithmetic, logic and shifts, including absolute
@@ -213,13 +217,16 @@ replacement. Auxiliary modules currently retain ordinary entries. An empty list
 restores ordinary calls when automatic leaf discovery is also disabled.
 
 `private_leaf_contracts` automatically admits closed, unreplaced returning
-leaves after private and checked emitter preflight. A reuse filter requires at
+leaves after private and checked preparation. A reuse filter requires at
 least two direct call sites and at most 64 original instructions per site.
-Eligible closed callers use those targets; failed caller emission remains decoded.
+Eligible closed callers use those targets; failed caller preparation remains decoded.
 `state_contract_callers` additionally selects explicit caller addresses. Direct edges into
 checked leaf bodies get private entries specialized for the required GPR/flag
 outputs. A callee has one private body with the union of its callers' output
-masks; `contract_variants.py` plans that shared layout after initial emission.
+masks; `contract_variants.SpecializationPlan` settles shared layouts before
+emission. Prepared SSA graphs pass between workers in temporary files through
+`prepared_store.py`, encoding value references by ID. Each body is emitted once;
+full-output integer private entries alias the checked body.
 The report distinguishes each edge's required outputs from its entry mask.
 SSA dependencies include all state escaping through the caller's own
 RET and full snapshots on observation paths. Input contracts use the same

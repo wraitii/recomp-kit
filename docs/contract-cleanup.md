@@ -4,7 +4,7 @@
 
 RT3 enables automatic private leaf contracts. Candidates need at least two
 direct call sites and no more than 64 original instructions per site, then pass
-closed single-entry, replacement/SEH and actual emitter checks. Functions with
+closed single-entry, replacement/SEH and body preparation checks. Functions with
 calls remain excluded. The reviewed `0042c1b0`/`0042ce00` to `005a10d0` pilot
 remains explicitly selectable when automatic discovery is disabled.
 Checked returns preserve the guest CALL stack write, actual RET
@@ -23,7 +23,7 @@ checkpoint countdown and replacement selection. It decrements once on success;
 the ordinary entry owns polling on rejection. Replacement identity is resolved
 beside the immutable dispatch tables without indexed table loads.
 
-The shared emission pass selects arithmetic conditions and state-transfer
+The shared preparation pass selects arithmetic conditions and state-transfer
 requirements before lowering. Ordinary x87 entries retain guarded D3D8
 arithmetic within the existing operation, density and activation budgets,
 including calls whose private preparation was rejected. Non-x87 private entries
@@ -39,10 +39,16 @@ arithmetic conditions remain separate from that interface. Private preparation
 checks precision/rounding before decrementing the checkpoint countdown. Guest
 scratch accesses and faults remain intact.
 Each callee has one private body publishing the union of its callers' required
-outputs. Callers retain their own continuation liveness and reloads. Initial
-emission discovers output requirements; `contract_variants.py` merges them and
-affected callers are re-emitted with the shared layout. The emitter rejects a
-layout that omits a required output.
+outputs. Callers retain their own continuation liveness and reloads.
+`emit_c.prepare` computes SSA, publication and fallback requirements before C
+emission. `contract_variants.SpecializationPlan` merges caller requirements into
+shared layouts before any body is emitted. Prepared graphs pass between workers
+through temporary files with SSA value references encoded by ID; emission uses
+those graphs without repeating preparation. Private entry eligibility and
+full-output checked-body aliases are settled in preparation. `x87_plan.py`
+selects clones, binary32 runs, carry shapes and activation budgets ahead of
+emission; emission verifies that its tracker matches the plan. A layout that
+omits a required output fails during binding.
 
 `tools/recomp/x87_audit.py` selects propagation, writer or real-call context
 analysis with `--game` or `--game-dir`. Its shared library consumes lifted

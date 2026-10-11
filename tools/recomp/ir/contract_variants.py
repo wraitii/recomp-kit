@@ -1,4 +1,6 @@
 """One shared return layout per specialized callee."""
+from dataclasses import dataclass
+
 from .call_contracts import FIELDS
 
 
@@ -12,6 +14,23 @@ def shared_masks(requests):
         for target, mask in variants:
             masks[target] = masks.get(target, 0) | mask
     return masks
+
+
+@dataclass
+class SpecializationPlan:
+    layouts: dict
+    caller_requests: dict
+
+    @classmethod
+    def build(cls, requests):
+        layouts = shared_masks(requests.values())
+        callers = {addr: {(target, layouts[target]) for target, _mask in wanted}
+                   for addr, wanted in requests.items() if wanted}
+        return cls(layouts, callers)
+
+    @property
+    def private_masks(self):
+        return {addr: {mask} for addr, mask in self.layouts.items()}
 
 
 def eligible_leaves(scanned, opaque):

@@ -8,12 +8,14 @@ come from the decoded emitter, fed the map's own instruction boundaries.
 import argparse
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import re
 import sys
 import time
+from tempfile import TemporaryDirectory
 
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent)]
@@ -24,7 +26,7 @@ import decoded
 import output
 from settings import Settings
 from decoded import external_exits
-from ir import call_contracts, contract_variants, production, x87_mode, x87_facts
+from ir import call_contracts, contract_variants, production, x87_mode, x87_facts, prepared_store
 from ir.lift import Lifter, LiftError
 from ir.ssa import SSAError
 from program import FunctionDescription as Row, Program, ScanRow, TranslateError
@@ -177,49 +179,74 @@ def scan_program(settings, jobs):
     return scanned, helpers
 
 
-def _emit(task):
-    """Emit one chunk of functions: SSA where admitted, the decoded body otherwise."""
-    addrs, helpers, internal, contracts, private_targets, contract_masks, checked_returns, selected_callers, mode_sites, entry_verification = task
+@dataclass
+class FunctionPlan:
+    addr: int
+    path: Path | None
+    reason: str | None
+    requests: set
+
+
+def _prepare(task):
+    addrs, helpers, internal, contracts, private_targets, checked_returns, selected_callers, mode_sites, entry_verification, store = task
     ctx, tr = _CTX, _CTX.tr
     tr.seh_helpers = set(helpers)
     tr.internal_entries = internal
-    out = []
+    plans = []
     for addr in addrs:
-        tr.unmodelled.clear()
         fn, entries = ctx.load(addr)
         tr.analyze(fn, entries)
-        lines, wrappers, variant_requests, call_decisions = None, False, set(), []
         reason = "decoded-only code map" if ctx.decoded_only else production.exclusion(fn)
+        path, requests = None, set()
         if reason is None:
             try:
                 selected = addr in selected_callers
                 callee_contracts = dict(contracts.get(addr) or {})
                 if selected:
                     callee_contracts.update(private_targets)
-                lines, external, variant_requests, call_decisions = production.emit_ssa(
+                body = production.prepare_ssa(
                     tr, ctx.lifter, fn, entries, ctx.settings.emit, ctx.known, callee_contracts,
-                    checked_returns,
-                    private_targets if selected else (), report_calls=selected, contract_masks=contract_masks,
+                    checked_returns, private_targets if selected else (), report_calls=selected,
                     x87_mode_sites=mode_sites.get(addr), x87_entry_verify=entry_verification.get(addr))
             except (SSAError, LiftError) as error:
                 reason = str(error)
             else:
-                wrappers = bool(entries) and not external
-        if wrappers:
-            decoded = tr.translate(fn, entries)
-            head = "void fn_%08x(X86 *c) {" % addr
-            kept = [line for line in decoded if not line.startswith(head)]
-            if len(kept) != len(decoded) - 1:
-                reason, lines, variant_requests, call_decisions = "entry wrapper layout", None, set(), []
-            else:
+                path = Path(store) / ("%08x.pickle" % addr)
+                prepared_store.write(path, body)
+                requests = body.requests
+        if reason is not None and addr in checked_returns:
+            raise TranslateError("%08x: checked-return body failed preparation: %s" % (addr, reason))
+        plans.append(FunctionPlan(addr, path, reason, requests))
+    return plans
+
+
+def _emit(task):
+    plans, helpers, internal, contract_masks = task
+    ctx, tr = _CTX, _CTX.tr
+    tr.seh_helpers = set(helpers)
+    tr.internal_entries = internal
+    out = []
+    for plan in plans:
+        addr = plan.addr
+        tr.unmodelled.clear()
+        fn, entries = ctx.load(addr)
+        tr.analyze(fn, entries)
+        reason, lines, requests, decisions = plan.reason, None, set(), []
+        if plan.path is not None:
+            body = prepared_store.read(plan.path)
+            body.bind_layouts(contract_masks)
+            lines, external, requests, decisions = production.emit_ssa_prepared(body)
+            if entries and not external:
+                wrappers = tr.translate(fn, entries)
+                head = "void fn_%08x(X86 *c) {" % addr
+                kept = [line for line in wrappers if not line.startswith(head)]
+                if len(kept) != len(wrappers) - 1:
+                    raise TranslateError("%08x: prepared entry wrapper layout changed" % addr)
                 lines = kept + lines
         if lines is None:
-            if addr in checked_returns:
-                raise TranslateError("%08x: checked-return body failed SSA emission: %s" % (addr, reason))
             lines = tr.translate(fn, entries)
-            variant_requests, call_decisions = set(), []
         out.append((addr, lines, re.sub(r"^[0-9a-f]{8}: ", "", reason) if reason else None,
-                    list(tr.unmodelled), variant_requests, call_decisions))
+                    list(tr.unmodelled), requests, decisions))
     return out
 
 
@@ -231,20 +258,31 @@ def _private_candidate(task):
         fn, entries = ctx.load(addr)
         ctx.tr.analyze(fn, entries)
         contract = production.private_contract(ctx.tr, ctx.lifter, fn)
-        production.emit_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit, 0x3fff, known_mode)
-        production.emit_ssa(ctx.tr, ctx.lifter, fn, entries, ctx.settings.emit,
+        production.prepare_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit, 0x3fff, known_mode)
+        production.prepare_ssa(ctx.tr, ctx.lifter, fn, entries, ctx.settings.emit,
                             ctx.known, {}, {addr})
         return addr, contract, None
     except (SSAError, LiftError, RecursionError) as error:
         return addr, None, str(error)
 
 
-def _private(task):
-    addr, mask, known_mode = task
+def _prepare_private(task):
+    addr, mask, known_mode, store = task
     ctx = _CTX
     fn, entries = ctx.load(addr)
     ctx.tr.analyze(fn, entries)
-    return addr, production.emit_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit, mask, known_mode)
+    plan = production.prepare_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit, mask, known_mode)
+    if plan.body is not None:
+        path = Path(store) / ("private-%08x.pickle" % addr)
+        prepared_store.write(path, plan.body)
+        plan.body = path
+    return plan
+
+
+def _private(plan):
+    if plan.body is not None:
+        plan.body = prepared_store.read(plan.body)
+    return plan.addr, production.emit_private_prepared(plan)
 
 
 def chunked(addrs, count):
@@ -398,7 +436,8 @@ def main(argv=None):
     phase("load")
     addrs = sorted(program.functions)
     parts = chunked(addrs, settings.jobs * 24)
-    with ProcessPoolExecutor(max_workers=settings.jobs, initializer=_init, initargs=(settings,)) as pool:
+    with TemporaryDirectory(prefix="recomp-prepared-") as store, ProcessPoolExecutor(
+            max_workers=settings.jobs, initializer=_init, initargs=(settings,)) as pool:
         scanned = {}
         for part in pool.map(_scan, parts):
             for row in part:
@@ -475,35 +514,28 @@ def main(argv=None):
             selected_callers.clear()
         phase("private candidates")
 
-        tasks = []
-        for part in parts:
-            tasks.append((part, helpers, {a: internal[a] for a in part if a in internal},
-                          {a: {t: contracts[t] for t in calls[a] if t in contracts}
-                           for a in part if contracts}, private_targets, {}, checked_returns, selected_callers, mode_sites, entry_verification))
-        results = {}
-        for part in pool.map(_emit, tasks):
-            for row in part:
-                results[row[0]] = row
+        tasks = [(part, helpers, {a: internal[a] for a in part if a in internal},
+                  {a: {t: contracts[t] for t in calls[a] if t in contracts}
+                   for a in part if contracts}, private_targets, checked_returns,
+                  selected_callers, mode_sites, entry_verification, store) for part in parts]
+        plans = {plan.addr: plan for batch in pool.map(_prepare, tasks) for plan in batch}
+        specialization = contract_variants.SpecializationPlan.build(
+            {addr: plan.requests for addr, plan in plans.items()})
+        shared_masks = specialization.layouts
+        private_plans = list(pool.map(_prepare_private,
+                             [(addr, mask, addr in known_modes, store)
+                              for addr, mask in sorted(shared_masks.items())]))
+        phase("prepare and plan")
+        emit_tasks = [([plans[a] for a in part], helpers,
+                       {a: internal[a] for a in part if a in internal}, shared_masks) for part in parts]
+        results = {row[0]: row for batch in pool.map(_emit, emit_tasks) for row in batch}
         phase("emit")
-        shared_masks = contract_variants.shared_masks(row[4] for row in results.values())
-        affected = {addr for addr, row in results.items()
-                    if any(shared_masks[target] != mask for target, mask in row[4])}
-        shared_tasks = [(tuple(a for a in task[0] if a in affected), *task[1:5], shared_masks, *task[6:])
-                        for task in tasks if any(a in affected for a in task[0])]
-        for part in pool.map(_emit, shared_tasks):
-            for row in part:
-                results[row[0]] = row
-        private_masks = {}
-        private_requests = {}
-        for row in results.values():
-            if row[4]:
-                private_requests[row[0]] = set(row[4])
-            for addr, mask in row[4]:
-                if mask != shared_masks[addr]:
-                    raise TranslateError("%08x: contract caller did not use its shared return layout" % addr)
-                private_masks.setdefault(addr, set()).add(mask)
-        for addr, lines in pool.map(_private, [(addr, shared_masks[addr], addr in known_modes)
-                                             for addr in sorted(private_masks)]):
+        private_masks = specialization.private_masks
+        private_requests = specialization.caller_requests
+        for addr, row in results.items():
+            if row[4] != private_requests.get(addr, set()):
+                raise TranslateError("%08x: emission differs from its specialization plan" % addr)
+        for addr, lines in pool.map(_private, private_plans):
             results[addr][1].extend(lines)
         phase("private entries")
 

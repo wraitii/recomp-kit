@@ -21,7 +21,7 @@ translated locally into `build/recomp/gen/` and are never edited in place.
 | Mod lifecycle and hooks | [loader.cpp](../mods/loader.cpp), [hooks.cpp](../mods/hooks.cpp) | `mods_load_all`, `build_api`, `mods_hook_dispatch`, `mods_call_next` |
 | Code map and program model | [code_map.py](../tools/recomp/code_map.py), [program.py](../tools/recomp/program.py) | `pack`, `read_map`, `Program` |
 | Translation driver, chunks, tables | [driver.py](../tools/recomp/driver.py), [output.py](../tools/recomp/output.py), [settings.py](../tools/recomp/settings.py) | `main`, `_emit`, `emit_body_chunks`, `write_table` |
-| Instruction semantics, SSA emission | [IR](ir.md), [ir/emit_c.py](../tools/recomp/ir/emit_c.py), [x86.h](../runtime/x86.h) | `emit`, `production.emit_ssa`; register/flag/x87 helpers |
+| Instruction semantics, SSA emission | [IR](ir.md), [ir/emit_c.py](../tools/recomp/ir/emit_c.py), [x86.h](../runtime/x86.h) | `prepare`, `emit_prepared`, `production.prepare_ssa`; register/flag/x87 helpers |
 | Decoded fallback bodies | [decoded.py](../tools/recomp/decoded.py) | `Translator.translate`, `emit_mmx` |
 | Translator checks | [diff/run.py](../tools/recomp/diff/run.py), [corpus](../tools/recomp/corpus/README.md) | Unicorn comparison; eager/SSA/native corpus |
 | Native replacement validation | [replay.cpp](../mods/native/replay.cpp), [page_track.cpp](../mods/native/page_track.cpp) | `load`, `run`, `translated`, `begin`, `end` |

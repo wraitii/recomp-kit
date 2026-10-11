@@ -9,6 +9,8 @@ through the scalar tracker (`x87_scalar.py`). Memory uses the
 existing guest accessors, in instruction order, with explicit state
 publication. No inferred convention permits discarding guest state.
 """
+from dataclasses import dataclass
+
 from .lift import Lifter, Insn, Op
 from .integer import read_modify_write, arithmetic, shift, divide
 from .integer_extra import EXTRA_MNEMONICS, correct as correct_extra
@@ -16,7 +18,7 @@ from .ssa import SSAError, MEMORY, build
 from .cfg import FunctionIR
 from .simplify import canonicalize, simplify, state_roots, whole, EFFECTS, EXITS
 from .publication import analyze as publication_analysis
-from . import transfer_plan
+from . import transfer_plan, x87_plan
 from . import flag_region
 from . import x87
 from .call_contracts import GPRS as CONTRACT_GPRS, ARITH_FLAGS as CONTRACT_FLAGS
@@ -450,21 +452,71 @@ def live_flag_reload_calls(s, live, flag_off_name):
     return calls
 
 
-#: Minimum PC/RC-sensitive x87 operations for a fast CW clone (x87_cw_clone).
-CW_CLONE_MIN_OPS = 4
-#: ...and at least one per this many instructions of the body.
-CW_CLONE_DENSITY = 8
-#: ...and at most this many guarded tracker activations: a leaf FP body that
-#: is one tracker window.
-CW_CLONE_MAX_GUARDS = 1
+@dataclass
+class PreparedFunction:
+    options: dict
+    ir: FunctionIR
+    ssa: object
+    live: set
+    fields: list
+    mapping: dict
+    flag_keys: set
+    kept_calls: dict
+    transfers: transfer_plan.TransferPlan
+    cc_entry: object
+    cc_calls: dict
+    seh_mark: bool
+    arithmetic: x87_plan.X87Plan
+    decisions: list
+
+    @property
+    def requests(self):
+        return {(v.data, self.transfers.calls[v.id].output_mask)
+                for b in self.ssa.blocks.values() for v in b.ops
+                if v.opc == "CALL" and v.data in self.options["contract_calls"]}
+
+    def bind_layouts(self, masks):
+        for b in self.ssa.blocks.values():
+            for v in b.ops:
+                if v.opc != "CALL" or v.data not in self.options["contract_calls"]:
+                    continue
+                call = self.transfers.calls[v.id]
+                if call.outputs is None:
+                    continue
+                needed = contract_output_mask(call.outputs)
+                layout = masks.get(v.data, needed)
+                if needed & ~layout or layout & ~((1 << len(CONTRACT_GPRS + CONTRACT_FLAGS)) - 1):
+                    raise SSAError("shared contract outputs do not cover the call continuation")
+                call.output_mask = layout
+                call.mode_proven = self.options["x87_mode_sites"].get(b.insn.addr) == (0x0f00, 0)
+        for row in self.decisions:
+            if row["specialization"] == "private":
+                target = int(row["target"], 16)
+                row["entry_output_mask"] = "%04x" % masks.get(target, int(row["entry_output_mask"], 16))
 
 
-def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state=True,
+def validate_operations(s):
+    supported = frozenset((
+        "MEMORY", "X87_REG", "X87_MEM", "CALL", "CALL_RELOAD", "CALL_KEEP", "CALLIND",
+        "STRINGOP", "LOAD", "STORE", "DIV32", "IDIV32", "RETURN", "SEH", "TRAP", "TAIL",
+        "BRANCHIND", "BRANCH", "CBRANCH", "PACK", "BYTE", "COPY", "INT_ZEXT", "INT_SEXT",
+        "INT_ADD", "INT_SUB", "INT_MULT", "INT_AND", "INT_OR", "INT_XOR", "INT_EQUAL",
+        "INT_NOTEQUAL", "INT_LESS", "INT_LESSEQUAL", "BOOL_AND", "BOOL_OR", "BOOL_XOR",
+        "INT_SLESS", "INT_SLESSEQUAL", "INT_LEFT", "INT_RIGHT", "INT_SRIGHT", "INT_CARRY",
+        "INT_SCARRY", "INT_SBORROW", "BOOL_NEGATE", "INT_NEGATE", "INT_2COMP", "POPCOUNT",
+        "SUBPIECE", "PIECE"))
+    for b in s.blocks.values():
+        for v in b.ops:
+            if v.opc not in supported:
+                raise SSAError("unsupported integer operation %s" % v.opc)
+
+
+def prepare(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state=True,
          msvc_convention=True, lazy_flags=False, lifter=None, indirect_call_symbol=None,
          call_contracts=None, x87_cw_clone=True, tail_symbols=None,
          checked_return=False, checked_calls=(), contract_calls=(), return_fields=None,
          variant_requests=None, call_decisions=None, x87_known_mode=False, contract_masks=None, x87_mode_sites=None, x87_entry_verify=None):
-    """Return a complete C function or raise SSAError for whole-function fallback.
+    """Prepare a complete body plan or raise SSAError for whole-function fallback.
 
     `call_symbols` maps an allowed direct-call target address to the C symbol
     that implements it. With no mapping, a direct CALL is rejected rather than
@@ -513,7 +565,10 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     must prove PC = RC = 0, and byte-backed analysis must prove the leaf has
     no calls or control-word effects. Full guest x87 publication is retained.
     """
-    arguments = dict(locals())
+    options = {name: value for name, value in locals().items()
+               if name in ("symbol", "checked_return", "return_fields", "lazy_flags",
+                           "call_symbols", "tail_symbols", "checked_calls", "contract_calls",
+                           "x87_mode_sites", "x87_entry_verify")}
     x87_mode_sites = (x87_mode_sites or {}) if not x87_scalar_strict else {}
     mode_boundaries = {ins.addr for ins in fir.insns}
     if any(site not in mode_boundaries or known & ~0x0f00 or value & ~known
@@ -524,8 +579,8 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
         if (return_fields is None or x87_scalar_strict or not x87_cw_clone
                 or not x87_mode.mode_preserving_leaf(x87_mode.prepare(fir))):
             raise SSAError("known x87 mode requires a guarded private control-word-preserving leaf")
-    requests_sink, variant_requests = variant_requests, set()
-    decisions_sink, call_decisions = call_decisions, []
+    report_calls = call_decisions is not None
+    call_decisions = []
     checked_calls = frozenset(checked_calls)
     contract_calls = frozenset(contract_calls)
     contract_masks = contract_masks or {}
@@ -569,7 +624,6 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
             or not indirect_call_symbol.isidentifier()
             or not indirect_call_symbol.isascii()):
         raise SSAError("invalid indirect call symbol %r" % (indirect_call_symbol,))
-    from .x87_scalar import X87Scalar
     # DIVERGENCE(original): [ssa-x87-convention] FINCSTP/FDECSTP leave a tagged
     # register above TOP, so those functions keep the exact x87 flush.
     x87_convention = msvc_convention and not any(
@@ -577,17 +631,6 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
     # Lazy NaN needs per-op deferral, so it is off for the exact flush (which
     # resets at edges) and strict x87.
     defer_ie = not x87_scalar_strict and msvc_convention
-    scalar = X87Scalar(observe_loads=x87_scalar_strict, convention=x87_convention,
-                       lazy_nan=defer_ie)
-    scalar.known_mode = x87_known_mode
-    scalar.mode_hook_guard = True
-
-    def flush_x87():
-        return scalar.flush()
-
-    def lower_x87(data, address, result):
-        return scalar.statements(data, address, result)
-
     # Each SLEIGH register byte must map to a known runtime field.
     fields = []
     for index, name in enumerate(("EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI")):
@@ -673,7 +716,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                                     call_contracts or {}, kept_calls, lane_field, CONTRACT_NEVER_SKIP,
                                     contract_calls, return_fields, flag_keys, flag_first_key,
                                     CC_DEFINES, CC_BIT_VALUES, lazy_flags, CC_EAGER_EVENTS)
-    if decisions_sink is not None:
+    if report_calls:
         def field_names(keys):
             return sorted({lane_field.get(key, "EIP" if mapping[key][0] == "c->eip" else mapping[key][0]) for key in keys if key in mapping})
 
@@ -721,6 +764,41 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
         # region as REMOVE or DROP while a caller descriptor is still pending,
         # and the later guest read would use a stale field.  Settle first.
         cc_entry = flag_region.SETTLE
+    arithmetic_plan = x87_plan.prepare(s, fir, live, strict=x87_scalar_strict,
+                                       convention=x87_convention, defer_ie=defer_ie,
+                                       known_mode=x87_known_mode, cw_clone=x87_cw_clone,
+                                       mode_sites=x87_mode_sites)
+    options.update(call_symbols=call_symbols, tail_symbols=tail_symbols,
+                   x87_mode_sites=x87_mode_sites, checked_calls=checked_calls,
+                   contract_calls=contract_calls)
+    prepared = PreparedFunction(options, fir, s, live, fields, mapping, flag_keys,
+                                kept_calls, transfers, cc_entry, cc_calls, seh_mark,
+                                arithmetic_plan, call_decisions)
+    prepared.bind_layouts(contract_masks)
+    validate_operations(s)
+    return prepared
+
+
+def emit_prepared(prepared):
+    options = prepared.options
+    symbol, checked_return = options["symbol"], options["checked_return"]
+    return_fields, lazy_flags = options["return_fields"], options["lazy_flags"]
+    call_symbols, tail_symbols = options["call_symbols"], options["tail_symbols"]
+    checked_calls, contract_calls = options["checked_calls"], options["contract_calls"]
+    x87_mode_sites, x87_entry_verify = options["x87_mode_sites"], options["x87_entry_verify"]
+    fir, s, live = prepared.ir, prepared.ssa, prepared.live
+    fields, mapping, flag_keys = prepared.fields, prepared.mapping, prepared.flag_keys
+    kept_calls, transfers = prepared.kept_calls, prepared.transfers
+    cc_entry, cc_calls, seh_mark = prepared.cc_entry, prepared.cc_calls, prepared.seh_mark
+    arithmetic_plan = prepared.arithmetic
+    scalar = arithmetic_plan.scalar()
+
+    def flush_x87():
+        return scalar.flush()
+
+    def lower_x87(data, address, result):
+        return scalar.statements(data, address, result)
+
     def ref(v):
         v = s.resolve(v)
         if v.opc in ("CONST", "TARGET"):
@@ -861,27 +939,7 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
         lines.extend(["goto %s%d;" % (block_label, target), "}"])
         return lines
 
-    # Fast CW clone: worth its size only when enough operations read PC/RC.
-    cw_sensitive = 0
-    if x87_cw_clone and not scalar.observe_loads:
-        for v in s.values:
-            if v.opc not in ("X87_REG", "X87_MEM") or v.id not in live:
-                continue
-            m = v.data["mnem"]
-            if (m.rstrip("P") in x87.ARITH or m.rstrip("P") in x87.INTEGER_ARITH
-                    or m in ("FSQRT", "FRNDINT", "FIST", "FISTP")
-                    or (v.opc == "X87_MEM" and m in ("FST", "FSTP"))):
-                cw_sensitive += 1
-    # The clone duplicates the integer code too; a mostly-integer body
-    # (ProjectionMeshBuilder::Build: 25 x87 of ~300 instructions) doubled in
-    # size for a 3% corpus gain, so also require a minimum x87 density.
-    proven_mode = all(x87_mode_sites.get(b.insn.addr) == (0x0f00, 0)
-                      for b in s.blocks.values() for v in b.ops
-                      if v.opc in ("X87_REG", "X87_MEM") and v.id in live)
-    clones = (("fast",) if x87_known_mode else ("fast", "general")
-              if not proven_mode and cw_sensitive >= CW_CLONE_MIN_OPS
-              and cw_sensitive * CW_CLONE_DENSITY >= len(fir.insns)
-              else (None,))
+    clones = arithmetic_plan.clones
     block_label = "F" if clones[0] == "fast" else "B"
 
     lines = ["static void %s(X86 *c, uint32_t expected_return_) {" % symbol if return_fields is not None
@@ -918,145 +976,17 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
         lines.append("}")
     else:
         lines.extend(edge(-1, s.entry))
-    indices = {b.insn.addr: i for i, b in s.blocks.items()}
-    predecessors = {i: set() for i in s.blocks}
-    for e in [s.entry] + s.alternates:
-        predecessors[e].add(-1)
-    for i in s.blocks:
-        for j in set(fir.succ[i]):
-            predecessors[j].add(i)
-    scalar_binary32 = set()
-    if not scalar.observe_loads:
-        # A one-operation read/modify/store run does not amortize the precision
-        # selector and its extra live representations. Keep its double recipe.
-        # Longer linear arithmetic runs retain the proven binary32 path. This
-        # is a codegen-cost heuristic, never a relaxation of operand provenance.
-        arithmetic = []
+    indices, predecessors = arithmetic_plan.indices, arithmetic_plan.predecessors
+    scalar_binary32 = arithmetic_plan.binary32
+    carry_mode = arithmetic_plan.carry_mode
+    entry_shape, linear_prev = arithmetic_plan.entry_shape, arithmetic_plan.linear_prev
+    lines[scalar_declarations:scalar_declarations] = arithmetic_plan.declarations()
 
-        def finish_scalar_run():
-            if len(arithmetic) >= 2:
-                scalar_binary32.update(arithmetic)
-            arithmetic.clear()
+    def seed_block(shape):
+        arithmetic_plan.seed_block(scalar, shape, lines)
 
-        prev = None
-        for i, b in s.blocks.items():
-            if prev is not None and (set(fir.succ[prev]) != {i} or predecessors[i] != {prev}):
-                finish_scalar_run()
-            for v in b.ops:
-                if v.opc in ("X87_REG", "X87_MEM"):
-                    m = v.data["mnem"]
-                    if m.rstrip("P") in ("FADD", "FSUB", "FSUBR", "FMUL"):
-                        arithmetic.append(v.id)
-                    if m in ("FXAM", "FIST", "FISTP", "FLDCW", "FNINIT", "FINIT") or (
-                            v.opc == "X87_MEM" and m in ("FST", "FSTP", "FNSTSW", "FNSTCW")):
-                        finish_scalar_run()
-                elif v.opc in ("STORE", "DIV32", "IDIV32", "CALL", "CALLIND", "STRINGOP",
-                               "RETURN", "TAIL", "TRAP", "BRANCH", "CBRANCH", "BRANCHIND"):
-                    finish_scalar_run()
-            prev = i
-        finish_scalar_run()
-    # Exact-flush functions (msvc_convention=False or FINCSTP/FDECSTP) keep the
-    # per-edge flush. Carry only under the MSVC convention, where popped residue
-    # may be relaxed; x87_scalar.snapshot() carries all popped parts otherwise.
-    carry_mode = not scalar.observe_loads and scalar.convention
-    entry_shape = None
-    if carry_mode:
-        from .x87_carry import analyze as analyze_carry, assert_covers
-        from .x87_scalar import PART_TYPES, UNSAFE, carry_var, ordered_parts
-
-        def carry_factory():
-            return X87Scalar(observe_loads=False, convention=x87_convention,
-                             lazy_nan=defer_ie)
-
-        # The fixed point is needed because a loop header's shape depends on
-        # its own backedge; see x87_carry.py.
-        entry_shape, _exit_shape = analyze_carry(s, fir, carry_factory, scalar_binary32)
-        declared = set()
-        for i, b in s.blocks.items():
-            shape = entry_shape.get(i)
-            if shape is None or shape is UNSAFE or not shape.active:
-                continue
-            for position, slot in shape.slots:
-                for part in ordered_parts(slot.parts):
-                    if part not in dict(slot.const):
-                        declared.add((position, part))
-        lines[scalar_declarations:scalar_declarations] = [
-            "%s %s;" % (PART_TYPES[part], carry_var(position, part))
-            for position, part in sorted(declared)]
-
-        # Only non-linear edges cut the tracker. A plain fallthrough from the
-        # previous instruction keeps the live scalar locals and needs neither
-        # canonical assignment nor entry reload.
-        linear_prev = {}
-        for i in s.blocks:
-            preds = predecessors[i]
-            if len(preds) != 1:
-                continue
-            prev = next(iter(preds))
-            if prev == -1:
-                continue
-            shape = entry_shape.get(i)
-            if shape is None or shape is UNSAFE:
-                # The successor must reset, so this edge is a real cut and
-                # must publish before it even though it looks like a
-                # fallthrough.
-                continue
-            if (i == prev + 1 and set(fir.succ[prev]) == {i}
-                    and not any(op.opc in ("BRANCH", "CBRANCH", "RETURN", "BRANCHIND", "TAIL", "TRAP")
-                                for op in s.blocks[prev].ops)):
-                linear_prev[i] = prev
-
-        def seed_block(shape):
-            if shape is None or shape is UNSAFE or not shape.active:
-                scalar.reset()
-                return
-            exprs = {}
-            for position, slot in shape.slots:
-                agreements = dict(slot.const)
-                for part in ordered_parts(slot.parts):
-                    if part not in agreements:
-                        exprs[(position, part)] = scalar._temp(
-                            carry_var(position, part), lines, PART_TYPES[part])
-            scalar.seed(shape, exprs)
-
-        def transition(source, targets):
-            active = []
-            fallback = False
-            # Deferred NaNs never cross a non-linear internal edge: fold IE and
-            # canonicalise the carried value so the planned shape is unchanged.
-            scalar.fold_pending(lines)
-            live = scalar.snapshot()
-            for target in targets:
-                shape = entry_shape.get(target)
-                if shape is None or shape is UNSAFE:
-                    fallback = True
-                elif shape.active:
-                    active.append((target, shape))
-                else:
-                    assert_covers(shape, live, "B%d->B%d" % (source, target))
-            if active:
-                scalar.normalize(lines)
-                # Check every target against the edge state before any
-                # materialization read: reading a slot another predecessor
-                # dirtied raises the tracker's `high` mark, which is bookkeeping
-                # for this edge, not state the other target inherits.
-                live = scalar.snapshot()
-                for target, shape in active:
-                    assert_covers(shape, live, "B%d->B%d" % (source, target))
-                # Both CBRANCH targets read the same tracker, so one canonical
-                # assignment per (position, part) serves every carried target.
-                assignments = {}
-                for target, shape in active:
-                    for position, slot in shape.slots:
-                        agreements = dict(slot.const)
-                        for part in ordered_parts(slot.parts):
-                            name = carry_var(position, part)
-                            if part not in agreements and name not in assignments:
-                                assignments[name] = scalar._read(position, part, lines)
-                for name, expr in assignments.items():
-                    lines.append("%s = %s;" % (name, expr))
-            if fallback:
-                lines.extend(flush_x87())
+    def transition(source, targets):
+        arithmetic_plan.transition(scalar, source, targets, lines)
 
     activations = []
     for clone in clones:
@@ -1094,11 +1024,8 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     # CALL push, so its own RET owns ESP/EIP restoration.
                     outputs = transfers.calls[v.id].outputs if v.data in contract_calls else None
                     if outputs is not None:
-                        needed_mask = contract_output_mask(outputs)
-                        output_mask = contract_masks.get(v.data, needed_mask)
-                        if needed_mask & ~output_mask or output_mask & ~((1 << len(CONTRACT_GPRS + CONTRACT_FLAGS)) - 1):
-                            raise SSAError("shared contract outputs do not cover the call continuation")
-                        mode_proven = x87_mode_sites.get(b.insn.addr) == (0x0f00, 0)
+                        call = transfers.calls[v.id]
+                        output_mask, mode_proven = call.output_mask, call.mode_proven
                         lines.append("if (entry_contract_prepare_%08x(c, %du)) {" % (v.data, mode_proven))
                     lines.extend(publish(b.snapshots[v.id], v))
                     if outputs is None and transfers.calls[v.id].guard:
@@ -1115,7 +1042,6 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                     if outputs is not None:
                         lines.append("entry_contract_%08x_%04x(c, 0x%xu);" % (
                             v.data, output_mask, b.insn.addr + b.insn.length))
-                        variant_requests.add((v.data, output_mask))
                         lines.append("} else {")
                         lines.extend(publish_fields(b.snapshots[v.id], transfers.calls[v.id].fallback.required,
                                                     transfers.calls[v.id].fallback.flags))
@@ -1264,17 +1190,21 @@ def emit(fir, symbol, *, call_symbols=None, x87_scalar_strict=False, local_state
                         lines.extend(flush_x87())
                     lines.extend(edge(i, target))
             previous = i
-        if clone is not None:
-            activations.append(scalar.activations)
-    if len(set(activations)) > 1:
-        raise SSAError("x87 specializations activate at different points: %r" % activations)
-    if not x87_known_mode and activations and activations[0] > CW_CLONE_MAX_GUARDS:
-        arguments["x87_cw_clone"] = False
-        return emit(**arguments)
+        activations.append(scalar.activations)
+    if tuple(activations) != arithmetic_plan.activations:
+        raise SSAError("x87 emission differs from its activation plan")
     lines.append("}")
     lines[scalar_declarations:scalar_declarations] = scalar.temps
-    if requests_sink is not None:
-        requests_sink.update(variant_requests)
-    if decisions_sink is not None:
-        decisions_sink.extend(call_decisions)
     return "\n".join(lines)
+
+
+def emit(fir, symbol, **options):
+    requests = options.get("variant_requests")
+    decisions = options.get("call_decisions")
+    prepared = prepare(fir, symbol, **options)
+    source = emit_prepared(prepared)
+    if requests is not None:
+        requests.update(prepared.requests)
+    if decisions is not None:
+        decisions.extend(prepared.decisions)
+    return source
