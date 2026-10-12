@@ -6,10 +6,12 @@ from ir.body import EmissionPolicy
 
 
 class Settings(object):
-    def __init__(self, cfg, allow_unmodelled=None, jobs=1, module=None):
+    def __init__(self, cfg, allow_unmodelled=None, jobs=1, module=None, backend=None, llvm_functions=(), private_values=None):
         translate = cfg["translate"]
         if not cfg.get("code_map_path"):
             raise TranslateError("game.toml [translate] code_map is required")
+        self.backend = backend or translate["backend"]
+        self.llvm_functions = frozenset(llvm_functions)
         self.cfg = cfg
         self.curated = {**{"globals." + name: entry for name, entry in cfg["globals"].items()},
                         **cfg["curated"]}
@@ -52,4 +54,5 @@ class Settings(object):
         self.emit = EmissionPolicy(
             x87_scalar_strict=not relaxed, local_state=relaxed, lazy_flags=relaxed,
             msvc_convention=translate["msvc_x87_convention"],
-            x87_cw_clone=translate["x87_cw_clone"], indirect_call_symbol="recomp_call")
+            x87_cw_clone=translate["x87_cw_clone"], indirect_call_symbol="recomp_call",
+            private_value_transport=translate["private_value_transport"] if private_values is None else private_values)

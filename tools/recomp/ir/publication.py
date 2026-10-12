@@ -25,7 +25,8 @@ def plan(s, successors, fields, *, access_fields=None, reloaded=(), kept=None):
                    reloaded=reloaded, kept=kept).required
 
 
-def analyze(s, successors, fields, *, access_fields=None, reloaded=(), kept=None):
+def analyze(s, successors, fields, *, access_fields=None, reloaded=(), kept=None,
+            nonresident_inputs=(), value_calls=(), transported=()):
     """Return publication requirements and facts already known before each event.
 
 `fields` groups register lanes by runtime field. LOAD/STORE have read-only CPU
@@ -44,6 +45,7 @@ Starting with no facts gives a conservative least fixed point for loops.
     groups = [tuple(key for key in keys if key in s.inputs) for keys in fields]
     groups = [keys for keys in groups if keys]
     access_fields = None if access_fields is None else frozenset(access_fields)
+    nonresident_inputs, value_calls, transported = map(frozenset, (nonresident_inputs, value_calls, transported))
     predecessors = {i: [] for i in s.blocks}
     for e in [s.entry] + s.alternates:
         predecessors[e].append(-1)
@@ -69,7 +71,8 @@ Starting with no facts gives a conservative least fixed point for loops.
         changed = False
         for i, b in s.blocks.items():
             known = {n: values(b.state, keys) for n, keys in enumerate(groups)
-                     if all(p == -1 or n in known_exit[p] for p in predecessors[i])}
+                     if all((not any(key in nonresident_inputs for key in keys)) if p == -1
+                            else n in known_exit[p] for p in predecessors[i])}
             for v in b.ops:
                 if v.opc not in OBSERVES:
                     continue
@@ -107,6 +110,8 @@ Starting with no facts gives a conservative least fixed point for loops.
                     known.clear()
                     reloads = b.reloads.get(v.id, {})
                     for n, keys in enumerate(groups):
+                        if v.id in value_calls and any(key in transported for key in keys):
+                            continue
                         if n in kept_groups:
                             if n in kept_known:
                                 known[n] = values(reloads, keys)

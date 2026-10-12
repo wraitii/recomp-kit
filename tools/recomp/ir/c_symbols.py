@@ -1,6 +1,7 @@
 """C spellings for semantic entries, layouts and body signatures."""
 from dataclasses import dataclass
 from .body import EntryForm, BodyVariant, ReturnForm
+from .guest import X86_32
 
 
 @dataclass(frozen=True)
@@ -8,6 +9,40 @@ class Declaration:
     kind: str
     target: int
     mask: int = 0
+    layout: object | None = None
+
+
+def field_type(field):
+    return "uint%d_t" % next(register.width for register in X86_32.registers if register.name == field)
+
+
+def argument(field):
+    return "in_%s_" % field.lower()
+
+
+def result_type(layout, target):
+    return symbol("PrivateResult", target, layout.output_mask)
+
+
+def result_declaration(layout, target):
+    name = result_type(layout, target)
+    fields = " ".join("%s %s;" % (field_type(field), field.lower()) for field in layout.outputs)
+    return "#ifndef %s_DEFINED\n#define %s_DEFINED\ntypedef struct { %s } %s;\n#endif" % (
+        name, name, fields or "uint8_t unused;", name)
+
+
+def value_parameters(layout, target, expected="expected"):
+    return ", ".join(("X86 *c", "uint32_t %s" % expected,
+                      *("%s %s" % (field_type(field), argument(field)) for field in layout.inputs),
+                      "%s *out_" % result_type(layout, target)))
+
+
+def value_signature(name, layout, target):
+    return "void %s(%s)" % (name, value_parameters(layout, target))
+
+
+def value_arguments(layout, expected="expected"):
+    return ", ".join(("c", expected, *(argument(field) for field in layout.inputs), "out_"))
 
 
 def invocation_declarations(invocation):
@@ -43,7 +78,11 @@ def body_symbol(variant, target, layout=None):
     return symbol(kind, target, layout.output_mask if layout is not None else None)
 
 
-def signature(variant, name):
+def signature(variant, name, layout=None, target=None):
+    if layout is not None:
+        if target is None:
+            raise ValueError("value body signature requires its target identity")
+        return "static void %s(%s) {" % (name, value_parameters(layout, target, "expected_return_"))
     parameters = {EntryForm.ORDINARY: "X86 *c",
                   EntryForm.MULTIPLE: "X86 *c, uint32_t entry_",
                   EntryForm.CHECKED: "X86 *c, uint32_t expected_return_, int checked_return_",
@@ -64,6 +103,10 @@ def entry_arguments(variant, expected):
 def declaration(record):
     if record.kind == "private_prepare":
         return "int %s(X86 *c, int mode_proven);" % symbol("entry_contract_prepare", record.target)
+    if record.kind == "private_values":
+        if record.layout is None or record.layout.output_mask != record.mask:
+            raise ValueError("value declaration requires its finalized layout")
+        return value_signature(symbol("entry_values", record.target, record.mask), record.layout, record.target) + ";"
     if record.kind == "private_contract":
         variant = BodyVariant(EntryForm.PRIVATE, ReturnForm.PRIVATE)
         name = symbol("entry_contract", record.target, record.mask)
@@ -75,3 +118,27 @@ def declaration(record):
     else:
         raise ValueError("unknown C declaration kind %s" % record.kind)
     return entry_signature(variant, name) + ";"
+
+
+def prepared_declarations(prepared):
+    from .lowering import ValueTransport
+    result = set()
+    for invocation in prepared.invocations.values():
+        result |= invocation_declarations(invocation)
+    if isinstance(prepared.transport, ValueTransport):
+        result = {record for record in result if record.kind != "private_contract"}
+        result.update(Declaration("private_values", invocation.target,
+                                 invocation.output_mask, prepared.final.values[event].layout)
+                      for event, invocation in prepared.invocations.items() if invocation.form == "private")
+    return frozenset(result)
+
+
+def cpu_field(name):
+    gprs = X86_32.names("gpr")
+    if name in gprs:
+        return "c->r[%d]" % gprs.index(name)
+    if name in ("EIP", "FS_OFFSET"):
+        return "c->" + {"EIP": "eip", "FS_OFFSET": "fs_base"}[name]
+    if name in (*X86_32.names("arithmetic_flag"), *X86_32.names("direction_flag")):
+        return "c->eflags_" + name.lower()
+    raise ValueError("unknown runtime CPU field " + name)

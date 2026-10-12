@@ -573,6 +573,10 @@ def main():
                        args.corpus_trial_ms, args.corpus_trials, asan=args.corpus_asan)
         return
     cfg = game_config.load(args.game_dir, args.build_root)
+    if args.regen_function:
+        args.regenerate = True
+        if cfg["aux_modules"]:
+            parser.error("selected regeneration currently requires an image without auxiliary modules")
     if args.regenerate and not cfg["developer_exe_path"].is_file():
         parser.error("Prepare your own game installation with tools/setup.py first")
     preset = preset_name(args.preset, args.config, stub=args.stub, target=args.target)
@@ -587,6 +591,9 @@ def main():
                 selection = regenerate_selection(args.regenerate, cfg, parser)
                 translate_args = {
                     "allow_unmodelled": args.allow_unmodelled,
+                    "backend": args.backend,
+                    "llvm_functions": args.llvm_function,
+                    "private_values": args.private_values,
                 }
                 fingerprint = translation_fingerprint(args.game_dir, cfg, translate_args)
                 stamp = args.build_root / "recomp/translate.stamp"

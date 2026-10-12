@@ -1,9 +1,9 @@
 """Finalize semantic boundary operations before selecting transport."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from . import flag_region
 from .body import FrozenMap
-from .call_contracts import ARITH_FLAGS
+from .call_contracts import ARITH_FLAGS, GPRS
 from .call_values import field_value
 from .operations import EXITS
 from .ssa import SSAError, Value
@@ -80,6 +80,36 @@ class Preserve:
 @dataclass(frozen=True)
 class Return:
     dispatch: str
+    results: tuple = ()
+    resident: bool = False
+
+
+@dataclass(frozen=True)
+class ValueInvoke:
+    call: int
+    invocation: Invocation
+    values: object
+
+
+@dataclass(frozen=True)
+class ResidentResults:
+    call: int
+    fields: tuple
+
+
+@dataclass(frozen=True)
+class ResultReload:
+    result: Value
+    call: int
+    field: str
+    lane: int
+
+
+@dataclass(frozen=True)
+class PublishResult:
+    call: int
+    field: str
+    lanes: tuple
 
 
 @dataclass(frozen=True)
@@ -102,11 +132,62 @@ class CPUFieldTransport:
     calls: FrozenMap
 
 
+@dataclass(frozen=True)
+class ValueTransport:
+    boundaries: BoundaryPlan
+    calls: FrozenMap
+    entry_fields: tuple
+
+
 def select_cpu_fields(boundaries, calls):
     for values in calls.values():
         if not values.fallback_inputs or not values.fallback_outputs:
             raise SSAError("CPU-field transport requires full fallback bindings")
     return CPUFieldTransport(boundaries, calls)
+
+
+def select_values(prepared, boundaries, calls):
+    s, groups = prepared.ssa, dict(prepared.state_groups)
+    layout = prepared.options.request.layout
+    events = dict(boundaries.events)
+    private = {event: values for event, values in calls.items()
+               if isinstance(events[event][0], Guard) and events[event][0].kind == "eligible"}
+
+    def keep_resident(publication, arguments):
+        return replace(publication, values=tuple(v for v in publication.values
+                       if v.field not in arguments or v.field not in GPRS or v.field in ("ESP", "EBP")))
+
+    for event, values in private.items():
+        guard, *after = events[event]
+        publication, invoke = guard.taken
+        fallback = guard.otherwise
+        settle = (SettleFlags(flag_region.SETTLE),) if set(values.layout.outputs) & set(ARITH_FLAGS) else ()
+        merged = tuple(PublishResult(event, output.field, output.continuation.resident_lanes)
+                       for output in values.outputs if output.continuation.resident_lanes)
+        events[event] = (replace(guard,
+                         taken=(keep_resident(publication, values.layout.inputs),
+                                ValueInvoke(event, invoke.invocation, values)),
+                         otherwise=(*fallback, *settle, ResidentResults(event, values.layout.outputs))),
+                         *after, *merged)
+    for block in s.blocks.values():
+        for event in block.ops:
+            if event.opc == "CALL_RELOAD" and event.args[0].id in private:
+                reload, = events[event.id]
+                values = private[event.args[0].id]
+                if reload.field in values.layout.outputs:
+                    events[event.id] = (ResultReload(event, event.args[0].id, reload.field, reload.lane),)
+            if event.opc == "RETURN" and layout is not None:
+                output = tuple(field_value(s, field, groups[field], block.exit) for field in layout.outputs)
+                popped = field_value(s, "EIP", groups["EIP"], block.exit)
+                fallback = Publish(tuple(field_value(s, field, keys, block.exit)
+                                         for field, keys in groups.items()),
+                                   clear_flags=int(prepared.options.request.policy.lazy_flags))
+                events[event.id] = (Guard("return_mismatch", popped,
+                                    (fallback, Return("always", output, True))),
+                                    keep_resident(boundaries.publications[event.id], layout.outputs),
+                                    Return("none", output))
+    return ValueTransport(replace(boundaries, events=FrozenMap.of(events)), FrozenMap.of(private),
+                          layout.inputs if layout is not None else ())
 
 
 def plan(prepared, invocations):

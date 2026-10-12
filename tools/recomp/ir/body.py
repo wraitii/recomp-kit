@@ -95,6 +95,7 @@ class EmissionPolicy:
     lazy_flags: bool = False
     indirect_call_symbol: str | None = None
     x87_cw_clone: bool = True
+    private_value_transport: bool = False
 
 
 @dataclass(frozen=True)

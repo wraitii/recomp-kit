@@ -281,8 +281,8 @@ checked leaf bodies get private entries specialized for the required GPR/flag
 outputs. A callee has one private body with the union of its callers' output
 masks. Frozen `PrivateLayout(inputs, outputs, resident_opaque)` records order
 fields by guest contract identity; inputs cover callee reads and linkage fields,
-while x87, EIP, FS, DF and runtime state remain resident. Transport still uses CPU
-fields. `contract_variants.SpecializationPlan` unions outputs across all callers.
+while x87, EIP, FS, DF and runtime state remain resident.
+`contract_variants.SpecializationPlan` unions outputs across all callers.
 Preparation retains `ProvisionalBindings`; a distinct final-binding phase attaches
 `FinalBindings` with the shared layouts and ordered per-site `CallValues`.
 `CallState` remains field requirements; `call_values.py` binds layout inputs to
@@ -294,8 +294,26 @@ layout order and coverage before transport selection.
 
 `lowering.py` finalizes publication operands and flag recipes, invocation,
 eligibility/hook guards, reload/preservation, post-call settlement, checked
-returns and parallel edge copies. CPU-field transport consumes this plan without
-changing requirements. Guest CALL pushes and RET pops remain SSA memory effects;
+returns and parallel edge copies. CPU-field and argument/result transport consume
+this plan without changing requirements. With `private_value_transport`, C private
+entries accept ordered scalar arguments and a host-local typed result pointer;
+GPRs are 32-bit and arithmetic flag fields are 8-bit. Layout inputs also cover
+requested outputs not definitely overwritten by the callee. Successful calls
+bind results directly to continuation SSA; checked fallback fills the same result
+record from CPU fields. Missing continuation lanes are copied into resident CPU
+storage. Transparent fields retain their existing post-call hook reload guard.
+Unexpected guest returns publish full state before runtime dispatch and capture
+results afterward. The result pointer never enters guest memory or CPU fields.
+
+Value transport omits transported GPR publication at private calls/normal returns,
+except ESP/EBP, and replaces corresponding CPU reloads. Flags and helper/observer
+publications retain resident storage. Publication analysis invalidates GPR
+residency facts after value calls and treats private integer arguments as
+potentially different from CPU entry fields. Direct result operands remain
+liveness roots even when lazy flag publication uses a compact descriptor.
+`private_value_transport = false` retains the CPU-field ABI. This setting changes
+transport, independently of which private targets and arithmetic modes are eligible.
+Guest CALL pushes and RET pops remain SSA memory effects;
 entry thunks retain eligibility, checkpoints and hooks independently of transport.
 `c_boundaries.py` prints these decisions; `c_symbols.py` owns invocation rendering
 and declaration discovery. No semantic module renders invocations or owns C
@@ -391,6 +409,8 @@ there (legacy tuples remain accepted only by analysis/verification APIs).
 | `call_contracts` | `true` | `false` restores full publication at calls |
 | `checked_returns` | `[]` | Addresses given private direct-call entries with checked guest continuations |
 | `private_leaf_contracts` | `false` | Automatically discover reusable private leaf contracts |
+| `backend` | `"c"` | `"llvm"` enables the experimental LLVM emitter; `--llvm-function` can restrict its scope |
+| `private_value_transport` | `false` | Pass ordered private inputs/results through a host ABI; `false` retains CPU-field transport |
 | `state_contract_callers` | `[]` | Caller addresses using specialized integer-state entries into checked leaf bodies |
 
 A `RECOMP_NULL_CHECKS=1` build exposes CPU state to fault dispatch: translate it
@@ -424,3 +444,62 @@ equivalence is unverified.
   as refreshed offline propagation and proof contents. Recipe/text equivalence
   does not establish native floating-point or fault equivalence; a paired
   `--changed` run with identical bodies executes no new inputs.
+
+LLVM emission uses `ir/prepare.py` for the same finalized SSA, transport,
+publication and x87 plans as C. `ir/emit_llvm.py` emits integer arithmetic,
+branches, switches, edge PHIs and boundary guards directly as LLVM IR. It does
+not parse generated C. Runtime effects and x87 recipes use generated callable
+C bridges, printed from the typed plans by the existing printers. C owns each
+opaque activation frame, CPU access and helper ABI; LLVM sees pointers and
+fixed-width integers. Frame pointers remain host-local. Narrow private ABI and
+result layout conversions occur in C compiled for the selected target.
+
+Integer operations have their guest widths and no overflow, alias, alignment
+or fast-math promises. P-code shifts saturate; their LLVM count is selected to
+be valid before the shift, including arithmetic shifts and SUBPIECE. Guest
+count masking remains a frontend operation. PHI inputs are read before any
+parallel destination writes. Activation guards transfer to the corresponding
+general x87 activation without replaying preceding guest instructions. SEH
+bodies retain C with a named fallback because setjmp must remain in its owning
+frame.
+
+Select `[translate] backend = "c" | "llvm"` or build with `--backend`.
+`--private-values` and `--no-private-values` override transport independently.
+Repeat `--llvm-function HEX_ADDR` to restrict LLVM emission for an experiment;
+other bodies retain C with explicit provenance in `backends.json`. The build
+fingerprint includes these selections. Clang compiles `.ll` using the same
+CMake target configuration as the C bridges. Integer results and operands now
+remain native LLVM SSA values, including
+merges introduced by guards and clone side exits. Bridges take explicit scalar
+operands and return scalar results. A C-owned context retains x87 locals, private
+call result records and boundary metadata; it has no integer temporary array.
+Entry initialization uses a bounded result buffer whose loaded values enter SSA.
+No performance or size benefit is assumed without measurement.
+
+The first RT3 comparison uses 14 selected LLVM guest functions with C for the
+remaining image. All four C/LLVM × CPU-field/value variants agree on the recorded
+returning inputs and focused native cases. Selected LLVM increases linked text
+in both transports; generic bridge calls and frame traffic outweigh the current
+integer width/PHI benefits. C already benefits from Clang's LLVM optimizer, so a
+second emitter does not inherently improve code. The original experiment used a
+generic integer bridge frame. Direct integer SSA and explicit bridge operands
+remove that representation; compare its assembly against CPU-field C before
+changing region boundaries or internal ABIs. Full-image LLVM validation and
+runtime performance remain outstanding; the default stays C.
+
+`tools/build.py --regen-function HEX_ADDR` (repeatable) re-emits selected
+functions using the whole-image preparation saved by a full regeneration.
+`--backend llvm` can switch those functions to LLVM without regenerating other
+bodies. Unchanged generated files retain timestamps, so Ninja recompiles affected
+C/LLVM chunks and relinks the requested target. Address buckets can include
+neighboring functions; this is chunk compilation, not an isolated object per
+function.
+
+The ignored `recomp/emission-cache` validates preparation sources, executable,
+map, policy, facts, native evidence and the generated tree. Contracts, selection,
+shared layouts and entry tables remain those of the full generation. Changes to
+those inputs require a full regeneration; backend emitter changes can reuse
+preparation. Selected generation records its scope and emitter revision in
+`partial-generations.json` and clears the whole-image translation stamp. A later
+full `--regenerate` therefore cannot mistake a partially updated tree for a
+fully current translation. Auxiliary modules currently require full generation.

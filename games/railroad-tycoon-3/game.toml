@@ -26,6 +26,8 @@ x87_entry_contracts = [
   { function = 0x0041cbc0, mask = 0x0f00, value = 0, scope = "all_invocations", verify = true, evidence = "Normal gameplay cargo delivery: processCargoDelivery is called by Train::processDeliveryChain at 004adf30 after device setup. CreateDevice at 00549991 uses flags 0x20/0x40 without FPU_PRESERVE and establishes PC=RC=0. Contract covers every cargo-delivery invocation, including callback/recovery paths; startup ordering and preservation above this entry are assumed, not mechanically proven. Original entry, caller, revenue callees and device flags inspected in Ghidra." },
 ]
 private_leaf_contracts = true
+backend = "c"
+private_value_transport = false
 checked_returns = [0x005a10d0]
 state_contract_callers = [0x0042ce00, 0x0042c1b0]
 

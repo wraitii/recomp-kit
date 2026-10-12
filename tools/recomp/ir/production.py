@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from .artifacts import ArtifactStore
 from .body import BodyRequest, BodyVariant, EntryForm, ReturnForm, EmissionPolicy, FrozenMap
 from . import c_symbols
-from .emit_c import prepare as prepare_body, emit_prepared
+from .prepare import prepare as prepare_body
+from .emit_c import emit_prepared
 from .invocation import EntryBinding
 from .ssa import SSAError
 from .call_contracts import FIELDS, prepare, summarize
@@ -73,8 +74,8 @@ def prepare_ssa(tr, lifter, fn, entries, request, artifacts=None):
         raise SSAError("SSA graph recursion budget")
 
 
-def emit_ssa_prepared(prepared):
-    source = emit_prepared(prepared)
+def emit_ssa_prepared(prepared, emitter=emit_prepared):
+    source = emitter(prepared)
     addr, entries = prepared.ir.addr, prepared.ir.entries
     checked, symbol = prepared.options.checked_return, prepared.options.symbol
     lines = source.splitlines()
@@ -107,17 +108,23 @@ def prepare_private(tr, lifter, fn, policy, layout, known_mode=False, artifacts=
     body = prepare_body(fir, request, lifter=lifter, normalized=artifacts.normalized(fir, lifter))
     body.finalize({})
     return PrivatePlan(fn.addr, layout, variant,
-                       None if not known_mode and layout.outputs == tuple(FIELDS) else body)
+                       None if not policy.private_value_transport and not known_mode and layout.outputs == tuple(FIELDS) else body)
 
 
-def emit_private_prepared(plan):
+def emit_private_prepared(plan, emitter=emit_prepared):
     name = c_symbols.symbol("fn_contract", plan.addr, plan.layout.output_mask)
     signature = c_symbols.entry_signature(plan.variant, name)
     if plan.body is None:
         return ["%s { %s(c, expected); }" % (signature, c_symbols.symbol("fn_checked", plan.addr))]
     if plan.body.options.request.layout != plan.layout or plan.body.options.request.variant != plan.variant:
         raise SSAError("private body disagrees with its entry layout or variant")
-    lines = emit_prepared(plan.body).splitlines()
+    lines = emitter(plan.body).splitlines()
+    if plan.body.options.request.policy.private_value_transport:
+        name = c_symbols.symbol("fn_values", plan.addr, plan.layout.output_mask)
+        signature = c_symbols.value_signature(name, plan.layout, plan.addr)
+        lines.append("%s { %s(%s); }" % (signature, plan.body.options.symbol,
+                                         c_symbols.value_arguments(plan.layout)))
+        return lines
     lines.append("%s { %s(c, expected); }" % (signature, plan.body.options.symbol))
     return lines
 
