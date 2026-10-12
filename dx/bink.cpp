@@ -29,7 +29,9 @@ extern "C" {
 
 namespace {
 
-constexpr uint32_t BINK_RECORD_BYTES = 0x100;
+// binkw32!BinkOpen allocates 0x38c bytes and copies that many from its local
+// BINK struct (0x3001286a/0x30012890); RT3 reads fields up to +0x2a0.
+constexpr uint32_t BINK_RECORD_BYTES = 0x38c;
 constexpr uint32_t BINK_SUMMARY_BYTES = 0x7c;
 // _BinkGetRealtime@12 writes this many bytes: FrameNum, FrameRate, FrameRateDiv,
 // Frames, FramesTime and the ten stage/buffer/rate fields the shipped Bink 1.0
@@ -37,6 +39,11 @@ constexpr uint32_t BINK_SUMMARY_BYTES = 0x7c;
 constexpr uint32_t BINK_REALTIME_BYTES = 0x38;
 constexpr uint32_t BINK_FILE_HANDLE = 0x00800000;
 constexpr uint32_t BINK_FROM_MEMORY = 0x04000000;
+// _BinkOpen@8 consumes the size from _BinkSetIOSize@4 only under this flag.
+constexpr uint32_t BINK_IO_SIZE = 0x01000000;
+constexpr uint32_t BINK_DEFAULT_IO_SIZE = 64 * 1024;
+constexpr uint32_t BINK_MIN_IO_SIZE = 4096;
+uint32_t g_io_size = 0;
 uint32_t g_error_string = 0;
 char g_error[512] = {};
 
@@ -53,10 +60,18 @@ bool video_error(const char *text) {
     return false;
 }
 
+uint32_t take_io_size(uint32_t flags) {
+    if (!(flags & BINK_IO_SIZE))
+        return 0;
+    uint32_t io_size = g_io_size;
+    g_io_size = 0;
+    return io_size;
+}
+
 bool check_open_flags(uint32_t flags) {
     if (flags & BINK_FROM_MEMORY)
         return video_error("memory-resident video is not supported");
-    uint32_t ignored = flags & ~(BINK_FILE_HANDLE | BINK_FROM_MEMORY);
+    uint32_t ignored = flags & ~(BINK_FILE_HANDLE | BINK_FROM_MEMORY | BINK_IO_SIZE);
     if (ignored)
         LOGV("bink: ignoring open flags %08x", ignored);
     return true;
@@ -86,13 +101,15 @@ struct BinkPlayer {
     int video_index = -1, audio_index = -1;
     int32_t channel = -1;
     AVRational fps{};
-    uint32_t t0 = 0, paused_at = 0, count = 0, current = 1;
+    uint32_t t0 = 0, paused_at = 0, count = 0, current = 1, displayed = 0;
     bool paused = false;
     bool eof = false, flushed = false, failed = false;
     bool have_frame = false, audio_started = false, audio_unavailable = false;
     // BinkSetSoundOnOff: the guest movie player enables/disables the stream's
     // audio. Kept here because audio is host-rendered, not mixed by the guest.
     bool sound_on = true;
+    // BinkSetVolume on track 0, in millibels for host_audio_set_volume.
+    int32_t volume_mb = 0;
     // BinkGetRealtime accounting. Bink keeps per-frame accumulators that this
     // shim does not reproduce; these are host-clock measurements (ms) of the
     // work the shim actually does, plus the compressed bytes it has read.
@@ -187,7 +204,7 @@ int64_t seek_file_window(void *opaque, int64_t offset, int whence) {
 // Byte zero is the handle's current offset, and AVSEEK_SIZE reports the rest
 // of the host file. Bink's own header bounds its frames, so trailing archive
 // data is harmless. The player owns every allocation even if open fails.
-bool open_file_window(BinkPlayer &p, const std::string &path, int64_t offset) {
+bool open_file_window(BinkPlayer &p, const std::string &path, int64_t offset, uint32_t io_size) {
     p.file_fd = os_fd_open(path.c_str(), OS_O_RDONLY);
     if (p.file_fd < 0)
         return decoder_error("open video file", AVERROR(errno));
@@ -203,7 +220,9 @@ bool open_file_window(BinkPlayer &p, const std::string &path, int64_t offset) {
     p.input = avformat_alloc_context();
     if (!p.input)
         return video_error("cannot allocate video input");
-    constexpr int buffer_bytes = 64 * 1024;
+    uint32_t buffer_bytes = io_size ? io_size : BINK_DEFAULT_IO_SIZE;
+    if (buffer_bytes < BINK_MIN_IO_SIZE)
+        buffer_bytes = BINK_MIN_IO_SIZE;
     auto *buffer = static_cast<uint8_t *>(av_malloc(buffer_bytes));
     if (!buffer)
         return video_error("cannot allocate video I/O buffer");
@@ -221,11 +240,15 @@ bool open_file_window(BinkPlayer &p, const std::string &path, int64_t offset) {
 
 // The imported record has two observed layouts. Both pairs describe the
 // same 1-based counter; host pointers never enter these guest fields.
+// The guest's end test is [+0x10] == [+0x8]: +0x8 is Frames, +0x10 the last
+// displayed frame, +0xc the frame to decode next, +0x14 FrameRate and +0x18
+// FrameRateDiv (binkw32 0x30011f97/0x3001203f keeps +0x10 one behind +0xc).
 void write_frame_count(uint32_t rec, const BinkPlayer &p) {
     wr32(rec + 0x08, p.count);
     wr32(rec + 0x0c, p.current);
-    wr32(rec + 0x10, p.count);
-    wr32(rec + 0x14, p.current);
+    wr32(rec + 0x10, p.displayed);
+    wr32(rec + 0x14, (uint32_t)p.fps.num);
+    wr32(rec + 0x18, (uint32_t)p.fps.den);
 }
 
 bool open_decoder(AVFormatContext *input, int index, AVCodecContext **context) {
@@ -314,6 +337,7 @@ void BinkOpen(X86 *c) {
     uint32_t name = arg(c, 0), flags = arg(c, 1);
     if (!check_open_flags(flags))
         return;
+    uint32_t io_size = take_io_size(flags);
     auto p = std::make_unique<BinkPlayer>();
     std::string guest;
     if (flags & BINK_FILE_HANDLE) {
@@ -323,7 +347,7 @@ void BinkOpen(X86 *c) {
             video_error("invalid video file handle");
             return;
         }
-        if (!open_file_window(*p, path, offset))
+        if (!open_file_window(*p, path, offset, io_size))
             return;
         guest = win32_guest_path(path);
         LOGV("bink: file handle %08x at offset %lld", name, (long long)offset);
@@ -338,11 +362,8 @@ void BinkOpen(X86 *c) {
             video_error("cannot resolve video filename");
             return;
         }
-        int rc = avformat_open_input(&p->input, path.c_str(), nullptr, nullptr);
-        if (rc < 0) {
-            decoder_error("open input", rc);
+        if (!open_file_window(*p, path, 0, io_size))
             return;
-        }
     }
     int rc = avformat_find_stream_info(p->input, nullptr);
     if (rc < 0) {
@@ -403,6 +424,9 @@ void BinkOpen(X86 *c) {
     memset(g_mem + rec, 0, BINK_RECORD_BYTES);
     wr32(rec, (uint32_t)p->video->width);
     wr32(rec + 4, (uint32_t)p->video->height);
+    // binkw32 sets this when the open found audio tracks (0x300130d1); the
+    // guest uses it to pick its frame-skip path.
+    wr32(rec + 0x2a0, p->audio ? 1u : 0u);
     p->count = (uint32_t)count;
     p->t0 = host_millis();
     write_frame_count(rec, *p);
@@ -441,6 +465,8 @@ void service_audio(uint32_t rec, BinkPlayer &p) {
                 play.bits = 16;
                 host_audio_play(&play);
                 p.audio_started = host_audio_stream(p.channel) >= 0;
+                if (p.audio_started)
+                    host_audio_set_volume(p.channel, p.volume_mb);
             }
             if (!p.audio_started) {
                 if (p.channel >= 0) {
@@ -467,7 +493,7 @@ void service_audio(uint32_t rec, BinkPlayer &p) {
         }
     }
     if (p.failed) {
-        p.current = p.count;
+        p.displayed = p.count;
         write_frame_count(rec, p);
     }
 }
@@ -483,7 +509,7 @@ void BinkDoFrame(X86 *c) {
     // Some guests only react to keys/clicks inside the video loop. Finish
     // its record so the outer message loop can handle the pending close.
     if (host_close_requested()) {
-        p->current = p->count;
+        p->displayed = p->count;
         write_frame_count(rec, *p);
         return;
     }
@@ -532,17 +558,20 @@ void BinkDoFrame(X86 *c) {
     }
     // Let a guest leave its playback loop after a fatal decoder error.
     p->video_ms += host_millis() - decode_start;
-    p->current = p->count;
+    p->displayed = p->count;
     write_frame_count(rec, *p);
 }
 
 void BinkNextFrame(X86 *c) {
     uint32_t rec = arg(c, 0);
     if (BinkPlayer *p = player_for(rec)) {
-        if (host_close_requested())
+        if (host_close_requested()) {
             p->current = p->count;
-        else if (p->current < UINT32_MAX)
+            p->displayed = p->count;
+        } else if (p->current < UINT32_MAX) {
+            p->displayed = p->current;
             ++p->current;
+        }
         write_frame_count(rec, *p);
         service_audio(rec, *p);
     }
@@ -656,10 +685,10 @@ void BinkGoto(X86 *c) {
     BinkPlayer *p = player_for(rec);
     if (!p)
         return;
-    if (flags != 0) {
-        p->failed = !video_error("BinkGoto time-based seek is not implemented");
+    // binkw32's flags are a bitmask: flags & 3 == 3 repositions audio only and
+    // leaves the video frame alone. RT3 uses 0 and 1, both video seeks.
+    if ((flags & 3) == 3)
         return;
-    }
     if (frame < 1)
         frame = 1;
     if (frame > p->count)
@@ -681,8 +710,9 @@ void BinkGoto(X86 *c) {
     int rc = av_seek_frame(p->input, p->video_index, ts, AVSEEK_FLAG_BACKWARD);
     if (rc < 0) {
         p->failed = !decoder_error("seek video frame", rc);
-        p->current = p->count;
+        p->displayed = p->count;
     } else {
+        p->displayed = p->current;
         p->current = frame;
     }
     write_frame_count(rec, *p);
@@ -771,6 +801,29 @@ void BinkClose(X86 *c) {
     set_eax(c, 0);
 }
 
+// _BinkSetVolume@12(HBINK, U32 trackid, U32 volume): binkw32 forwards the
+// value to the track's sound-system callback (binkw32.dll 0x30015900). The
+// guest passes track 0 and a linear 0..65535 level from the movie volume
+// setting; host-rendered Bink audio applies it directly.
+int32_t bink_volume_mb(uint32_t volume) {
+    if (volume == 0)
+        return -10000;
+    int32_t mb = (int32_t)(2000.0 * log10((double)volume / 65535.0));
+    return mb > 0 ? 0 : (mb < -10000 ? -10000 : mb);
+}
+
+void BinkSetVolume(X86 *c) {
+    uint32_t rec = arg(c, 0), track = arg(c, 1), volume = arg(c, 2);
+    if (BinkPlayer *p = player_for(rec)) {
+        if (track == 0) {
+            p->volume_mb = bink_volume_mb(volume);
+            if (p->channel >= 0)
+                host_audio_set_volume(p->channel, p->volume_mb);
+        }
+    }
+    set_eax(c, 0);
+}
+
 // _BinkSetSoundOnOff@8(HBINK, int). The guest calls it around the pre-intro to
 // mute/unmute the movie's audio stream. The real SDK silences the Bink audio
 // track; here the decoder's audio is host-rendered (a deferred fidelity gap),
@@ -801,6 +854,7 @@ void BinkOpen(X86 *c) {
     uint32_t name = arg(c, 0), flags = arg(c, 1);
     if (!check_open_flags(flags))
         return;
+    take_io_size(flags);
     if ((flags & BINK_FILE_HANDLE) && !win32_file_handle_position(name, nullptr, nullptr)) {
         video_error("invalid video file handle");
         return;
@@ -878,6 +932,9 @@ void BinkService(X86 *c) {
 void BinkCopyToBuffer(X86 *c) {
     ret0(c);
 }
+void BinkSetVolume(X86 *c) {
+    ret0(c);
+}
 // No decoder to silence; the record is already finished.
 void BinkSetSoundOnOff(X86 *c) {
     log_once("bink.soundonoff",
@@ -901,12 +958,27 @@ void BinkDDSurfaceType(X86 *c) {
     set_eax(c, type);
 }
 
+// _BinkGetKeyFrame@12(HBINK, U32 frame, S32 flags): a pure query over
+// binkw32's precomputed keyframe table (0x30014720). The only RT3 caller
+// discards the result and immediately BinkGotos, and the host decoder has no
+// equivalent table, so report 0 rather than inventing one.
+void BinkGetKeyFrame(X86 *c) {
+    ret0(c);
+}
+
 void BinkGetError(X86 *c) {
     if (!g_error_string)
         g_error_string = heap_alloc(sizeof g_error, true, 16);
     if (g_error_string)
         memcpy(g_mem + g_error_string, g_error, sizeof g_error);
     set_eax(c, g_error_string);
+}
+
+// _BinkSetIOSize@4(U32): binkw32 stores the value (0x30012070 writes it to
+// 0x30065238); the next _BinkOpen@8 with flag 0x1000000 consumes it once.
+void BinkSetIOSize(X86 *c) {
+    g_io_size = arg(c, 0);
+    LOGV("bink: I/O size %u", g_io_size);
 }
 
 #define BINK(name, bytes, fn) {"binkw32.dll", "_Bink" #name "@" #bytes, (bytes) / 4, fn}
@@ -923,6 +995,9 @@ const ImportShim g_video_shims[] = {
     BINK(OpenMiles, 4, ret0),
     BINK(SetSoundSystem, 8, ret1),
     BINK(SetSoundOnOff, 8, BinkSetSoundOnOff),
+    BINK(SetIOSize, 4, BinkSetIOSize),
+    BINK(SetVolume, 12, BinkSetVolume),
+    BINK(GetKeyFrame, 12, BinkGetKeyFrame),
     BINK(DDSurfaceType, 4, BinkDDSurfaceType),
     BINK(DoFrame, 4, BinkDoFrame),
     BINK(NextFrame, 4, BinkNextFrame),
@@ -961,6 +1036,7 @@ void bink_reset() {
     g_players.clear();
 #endif
     // mem_init already discarded the old guest heap.
+    g_io_size = 0;
     g_error_string = 0;
     g_error[0] = 0;
 }
