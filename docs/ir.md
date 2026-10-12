@@ -304,6 +304,16 @@ independently of transport. `c_boundaries.py` prints these decisions;
 module renders invocations or owns C prototypes. The x87 tracker uses the
 structured transition plan described above.
 
+C emission stores integer SSA values of up to four bytes in `uint32_t` and
+explicitly widens qword results and `SUBPIECE` shifts. Guest accesses cache the
+arena base, refreshed after calls, string/division helpers and SEH seams; builds
+with store hooks or null checks retain the original accessors. Guest writes and
+state publications remain ordered. Ordinary continuations use a small inline
+return check with general dispatch shared in a cold helper per chunk. Contract
+fallbacks and exceptional float stores are marked unlikely. Ordered x87
+comparisons update status bits without branches; unordered handling stays
+inline to avoid call-related spills and retains signalling-NaN behavior.
+
 Emission requires those final decisions
 and checks them against both the caller requests and private callee records.
 Final binding hands fresh graphs directly to emission in the same worker, avoiding

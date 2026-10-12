@@ -69,6 +69,10 @@ class Printer:
             return cc_action_lines(operation.action)
         if isinstance(operation, Guard):
             condition = self.condition(operation)
+            if operation.kind == "eligible" and operation.otherwise:
+                return ["if (RECOMP_UNLIKELY(!(%s))) {" % condition,
+                        *self.operations(operation.otherwise), "} else {",
+                        *self.operations(operation.taken), "}"]
             lines = ["if (%s) {" % condition, *self.operations(operation.taken)]
             if operation.otherwise:
                 lines.extend(["} else {", *self.operations(operation.otherwise)])
@@ -84,8 +88,8 @@ class Printer:
                     % (operation.result.id, settle, self.fields[operation.field], operation.lane * 8,
                        self.mask(operation.result.size), kept)]
         if isinstance(operation, Return):
-            dispatch = {"none": [], "always": ["recomp_return(c);"],
-                        "checked": ["if (!checked_return_ || RECOMP_UNLIKELY(c->eip != expected_return_)) recomp_return(c);"]}
+            dispatch = {"none": [], "always": ["recomp_return_fast_(c);"],
+                        "checked": ["if (!checked_return_ || RECOMP_UNLIKELY(c->eip != expected_return_)) recomp_return_fast_(c);"]}
             return [*dispatch[operation.dispatch], "return;"]
         raise ValueError("unknown C boundary operation %s" % type(operation).__name__)
 
@@ -98,7 +102,7 @@ class Printer:
     def edge(self, source, target, label):
         edge = self.plan.edges[source, target]
         lines = ["{"]
-        lines.extend("uint64_t p%d = %s;" % (dst.id, self.ref(src)) for dst, src in edge.copies)
+        lines.extend("uint%d_t p%d = %s;" % (32 if dst.size <= 4 else 64, dst.id, self.ref(src)) for dst, src in edge.copies)
         lines.extend("v%d = p%d;" % (dst.id, dst.id) for dst, _ in edge.copies)
         return [*lines, "goto %s%d;" % (label, edge.target), "}"]
 

@@ -7,6 +7,86 @@ from .contract_variants import PrivateLayout, output_mask as contract_output_mas
 from .x87_cw import CW_FAST, Dynamic, Guarded, condition_of
 from .c_boundaries import Printer as BoundaryPrinter, CC_OP_CONST
 from .c_x87 import Printer as X87Printer
+from .x87_transition import Store
+
+
+RETURN_HELPERS = """
+RECOMP_COLD void recomp_return_slow_(X86 *c) { recomp_return(c); }
+static inline void recomp_return_fast_(X86 *c) {
+    if (RECOMP_UNLIKELY(c->eip == GUEST_RETURN_SENTINEL) ||
+        RECOMP_UNLIKELY(!recomp_is_call_return(c->eip)))
+        recomp_return_slow_(c);
+}
+"""
+
+FLOAT_HELPERS = """
+RECOMP_HOT_INLINE void recomp_fcom_(uint16_t *status, double a, double b, int quiet) {
+    if (RECOMP_UNLIKELY(isnan(a) || isnan(b))) {
+        fcom_status(status, a, b, quiet);
+    } else {
+        *status = (uint16_t)((*status & (uint16_t)~0x4700u) |
+                            ((uint16_t)(a < b) << 8) | ((uint16_t)(a == b) << 14));
+    }
+}
+"""
+
+
+def memory_helpers():
+    lines = []
+    for floating, widths in ((False, (8, 16, 32, 64)), (True, (32, 64))):
+        for bits in widths:
+            ctype = ('float' if bits == 32 else 'double') if floating else 'uint%d_t' % bits
+            suffix = '%s%d' % ('f' if floating else '', bits)
+            for write in (False, True):
+                name = ('wr' if write else 'rd') + suffix
+                arguments = 'uint8_t *arena, uint32_t a' + (', %s v' % ctype if write else '')
+                lines.extend(['RECOMP_HOT_INLINE %s recomp_%s_(%s) {' % ('void' if write else ctype, name, arguments),
+                              '#if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)',
+                              '    %s%s(a%s);' % ('' if write else 'return ', name, ', v' if write else ''),
+                              '#else'])
+                if not write:
+                    lines.append('    %s v;' % ctype)
+                lines.append('    RECOMP_BITCOPY(%s, %s, %d);' % (
+                    'arena + a' if write else '&v', '&v' if write else 'arena + a', bits // 8))
+                if not write:
+                    lines.append('    return v;')
+                lines.extend(['#endif', '}'])
+    return '\n'.join(lines) + '\n'
+
+
+class ScalarPrinter(X87Printer):
+    def expr(self, value):
+        if value.kind == 'helper' and value.data in ('fcom', 'fucom'):
+            status, a, b = [self.expr(arg) for arg in value.args]
+            return 'recomp_fcom_(&%s, %s, %s, %du)' % (status, a, b, value.data == 'fucom')
+        if value.kind == 'nan_fold':
+            source = self.expr(value.args[0])
+            return '(RECOMP_UNLIKELY(%s != %s) ? x87_indefinite() : %s)' % (source, source, source)
+        if value.kind == 'float_store':
+            cw, source = [self.expr(arg) for arg in value.args]
+            return '(RECOMP_UNLIKELY((%s & 0x300u) != 0u || %s != %s) ? fto_float_cw(%s, %s) : (float)(%s))' % (
+                cw, source, source, cw, source, source)
+        if value.kind == 'load' and value.data[0] <= 64:
+            bits, integer = value.data
+            address = self.expr(value.args[0])
+            call = 'recomp_rd%s%d_(arena_, (uint32_t)%s)' % ('' if integer else 'f', bits, address)
+            return '(int%d_t)%s' % (bits, call) if integer else call
+        if value.kind == 'load_word':
+            return 'recomp_rd16_(arena_, (uint32_t)%s)' % self.expr(value.args[0])
+        return super().expr(value)
+
+    def operations(self, operations):
+        lines, pending = [], []
+        for operation in operations:
+            if isinstance(operation, Store) and operation.bits <= 64 and not operation.bcd:
+                lines.extend(super().operations(pending))
+                pending = []
+                lines.append('recomp_wr%s%d_(arena_, (uint32_t)%s, %s);' % (
+                    'f' if operation.floating else '', operation.bits,
+                    self.expr(operation.address), self.expr(operation.value)))
+            else:
+                pending.append(operation)
+        return lines + super().operations(pending)
 
 
 def seh_lines(kind, addr):
@@ -50,6 +130,8 @@ def emit_prepared(prepared):
     def expression(v):
         a = [ref(arg) for arg in v.args]
         opc = v.opc
+        if v.size > 4 or opc == "SUBPIECE":
+            a = ["(uint64_t)(%s)" % arg for arg in a]
         if opc == "PACK":
             return " | ".join("(%s << %d)" % (arg, n * 8) for n, arg in enumerate(a))
         if opc == "BYTE":
@@ -111,13 +193,14 @@ def emit_prepared(prepared):
     def edge(source, target):
         return boundary.edge(source, target, block_label)
 
-    x87_printer = X87Printer(ref)
+    x87_printer = ScalarPrinter(ref)
     block_label = "F" if arithmetic_plan.programs[0].clone == "fast" else "B"
 
     lines = [c_symbols.signature(options.request.variant, symbol)]
+    lines.append("uint8_t *arena_ = g_mem;")
     for v in s.values:
         if v.id in live and v.size and v.opc not in ("CONST", "TARGET", "CC_KIND") and s.resolve(v) is v:
-            lines.append("uint64_t v%d;" % v.id)
+            lines.append("uint%d_t v%d;" % (32 if v.size <= 4 else 64, v.id))
     scalar_declarations = len(lines)
     lines.extend(x87_printer.declaration(op) for op in arithmetic_plan.environment_declarations())
     lines.extend(boundary.operations(boundary.plan.entry))
@@ -167,6 +250,7 @@ def emit_prepared(prepared):
                     lines.append("}")
                 elif v.opc == "CALL":
                     lines.extend(boundary.event(v))
+                    lines.append("arena_ = g_mem;")
                 elif v.opc in ("CALL_RELOAD", "CALL_KEEP"):
                     lines.extend(boundary.event(v))
                 elif v.opc == "CALLIND":
@@ -175,6 +259,7 @@ def emit_prepared(prepared):
                     # already stored by the preceding lifted CALL sequence, and the
                     # SSA builder reloads every tracked lane/flag afterward.
                     lines.extend(boundary.event(v))
+                    lines.append("arena_ = g_mem;")
                 elif v.opc == "STRINGOP":
                     # Byte-audited string instruction. Publication before the helper
                     # and reloads afterward keep guest memory observers and fault
@@ -182,6 +267,7 @@ def emit_prepared(prepared):
                     # EDI/ESI/ECX/DF exactly as the eager emitter's string calls do.
                     lines.extend(publish(v))
                     lines.append("%s(c);" % v.data["helper"])
+                    lines.append("arena_ = g_mem;")
                 elif v.opc in ("LOAD", "STORE", "DIV32", "IDIV32"):
                     # Guest accesses do not observe x87 state (see x87_scalar.py);
                     # only strict mode publishes before them. The division seam
@@ -192,16 +278,18 @@ def emit_prepared(prepared):
                         lines.append("%s(c, (uint32_t)%s, (uint32_t)%s);"
                                      % (helper, ref(v.args[2]), ref(v.args[3])))
                         lines.append("v%d = c->r[R_EAX] | ((uint64_t)c->r[R_EDX] << 32);" % v.id)
+                        lines.append("arena_ = g_mem;")
                     elif v.opc == "LOAD":
-                        lines.append("v%d = rd%d((uint32_t)%s);" % (v.id, v.size * 8, ref(v.args[1])))
+                        lines.append("v%d = recomp_rd%d_(arena_, (uint32_t)%s);" % (v.id, v.size * 8, ref(v.args[1])))
                     else:
-                        lines.append("wr%d((uint32_t)%s, (uint%d_t)%s);" % (
+                        lines.append("recomp_wr%d_(arena_, (uint32_t)%s, (uint%d_t)%s);" % (
                             v.args[2].size * 8, ref(v.args[1]), v.args[2].size * 8, ref(v.args[2])))
                 elif v.opc == "RETURN":
                     lines.extend(boundary.event(v))
                 elif v.opc == "SEH":
                     lines.extend(publish(v))
                     lines.extend(seh_lines(v.data["kind"], v.data["eip"]))
+                    lines.append("arena_ = g_mem;")
                 elif v.opc == "TRAP":
                     lines.append("recomp_unknown_call(c, 0x%xu); return;" % v.data)
                 elif v.opc == "TAIL":
@@ -273,4 +361,5 @@ def emit(fir, symbol, **options):
         requests.update(prepared.bound_requests)
     if decisions is not None:
         decisions.extend(prepared.decision_rows())
-    return source
+    return ("#ifndef RECOMP_SSA_SUPPORT\n#define RECOMP_SSA_SUPPORT\n" + memory_helpers()
+            + RETURN_HELPERS + FLOAT_HELPERS + "#endif\n" + source)
