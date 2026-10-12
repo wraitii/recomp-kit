@@ -21,10 +21,13 @@ pub use crate::d3d9::resource::D3d9Resource;
 use crate::d3d9::resource::StagedStorage;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
+pub mod copy;
+pub mod draw;
 pub mod format;
 pub mod gpu;
+pub mod query;
 pub mod resource;
 pub mod shader;
 pub mod state;
@@ -105,11 +108,89 @@ const D3DPTEXTURECAPS_VOLUMEMAP: u32 = 0x0000_2000;
 const D3DPTEXTURECAPS_MIPMAP: u32 = 0x0000_4000;
 const D3DPTEXTURECAPS_MIPVOLUMEMAP: u32 = 0x0000_8000;
 const D3DPTEXTURECAPS_MIPCUBEMAP: u32 = 0x0001_0000;
+const D3DPTFILTERCAPS_POINTLINEAR: u32 = 0x0003_0303;
+const D3DPTADDRESSCAPS_WRAPMIRRORCLAMP: u32 = 0x0000_0007;
+const D3DVS_VERSION_2_0: u32 = 0xfffe_0200;
+const D3DPS_VERSION_2_0: u32 = 0xffff_0200;
+const D3D_MAX_PRIMITIVE_COUNT: u32 = 0x000f_ffff;
+const D3D_MAX_VERTEX_INDEX: u32 = 0x000f_ffff;
 
 struct ImplicitTargets {
     target: OffscreenTarget,
     format: u32,
     depth_format: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TargetRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+pub(crate) struct SurfaceView {
+    pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub cube: bool,
+    pub volume: bool,
+    pub subresource: (u32, u32, u32),
+}
+
+#[derive(Clone)]
+pub(crate) enum GpuRegistryEntry {
+    Buffer {
+        buffer: wgpu::Buffer,
+        size: u32,
+        format: u32,
+        fvf: u32,
+        fresh: Arc<AtomicBool>,
+    },
+    Texture {
+        texture: wgpu::Texture,
+        kind: resource::TextureKind,
+        format: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+        levels: u32,
+        pool: u32,
+        usage: u32,
+        lod: Arc<AtomicU32>,
+        fresh: Arc<AtomicBool>,
+    },
+    TextureAlias {
+        gpu: Option<wgpu::Texture>,
+        parent_fresh: Arc<AtomicBool>,
+        kind: resource::TextureKind,
+        format: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+        levels: u32,
+        face: u32,
+        level: u32,
+        volume: bool,
+        pool: u32,
+        usage: u32,
+        lod: Arc<AtomicU32>,
+        fresh: Arc<AtomicBool>,
+    },
+    Surface {
+        texture: wgpu::Texture,
+        format: u32,
+        width: u32,
+        height: u32,
+        depth: bool,
+        pool: u32,
+        usage: u32,
+        discard: bool,
+        fresh: Arc<AtomicBool>,
+    },
 }
 
 struct RestorePlan {
@@ -120,6 +201,7 @@ struct RestorePlan {
     present: D3d9PresentParams,
     expected: BTreeMap<u32, u32>,
     staged: BTreeMap<u32, StagedStorage>,
+    registry: BTreeMap<u32, GpuRegistryEntry>,
     committed: usize,
     ready: bool,
 }
@@ -156,6 +238,15 @@ pub struct D3d9Device {
     restore: Option<RestorePlan>,
     state: state::D3d9State,
     objects: shader::D3d9Objects,
+    registry: BTreeMap<u32, GpuRegistryEntry>,
+    locks: BTreeMap<u32, Vec<Arc<AtomicU32>>>,
+    draw: draw::D3d9DrawState,
+    queries: query::D3d9Queries,
+    render_target_id: u32,
+    depth_target_id: u32,
+    in_scene: bool,
+    implicit_backbuffer_id: u32,
+    implicit_depthbuffer_id: u32,
 }
 
 impl D3d9Device {
@@ -355,7 +446,7 @@ pub fn d3d9_buffer_lock_prepare(
     let discard = request.flags & resource::D3DLOCK_DISCARD != 0;
     let first = matches!(
         resource.state.as_ref(),
-        Some(resource::ResourceState::Buffer(b)) if b.lock_count == 0
+        Some(resource::ResourceState::Buffer(b)) if b.lock_count.load(Ordering::Acquire) == 0
     );
     if !discard && first {
         if let Ok(gpu) = resource.gpu_handle() {
@@ -391,7 +482,7 @@ pub fn d3d9_buffer_lock_commit(
             "D3D9 buffer is not initialized",
         );
     };
-    let count = match b.lock_count.checked_add(1) {
+    let count = match b.lock_count.load(Ordering::Acquire).checked_add(1) {
         Some(count) => count,
         None => return lock_fail(StatusCode::OutOfMemory, "D3D9 buffer lock count overflow"),
     };
@@ -402,7 +493,7 @@ pub fn d3d9_buffer_lock_commit(
             "D3D9 buffer lock record allocation failed",
         );
     }
-    b.lock_count = count;
+    b.lock_count.store(count, Ordering::Release);
     if writable {
         if request.flags & resource::D3DLOCK_NO_DIRTY_UPDATE == 0 {
             b.writable_dirty = true;
@@ -443,7 +534,7 @@ pub fn d3d9_buffer_unlock(resource: &mut D3d9Resource, bytes: &[u8]) -> D3d9Buff
             closed: false,
         };
     };
-    if b.lock_count == 0 {
+    if b.lock_count.load(Ordering::Acquire) == 0 {
         return D3d9BufferUnlockResult {
             status: status(StatusCode::InvalidArgument, "D3D9 buffer is not locked"),
             closed: false,
@@ -458,8 +549,8 @@ pub fn d3d9_buffer_unlock(resource: &mut D3d9Resource, bytes: &[u8]) -> D3d9Buff
             closed: false,
         };
     }
-    b.lock_count -= 1;
-    let closed = b.lock_count == 0;
+    b.lock_count.fetch_sub(1, Ordering::AcqRel);
+    let closed = b.lock_count.load(Ordering::Acquire) == 0;
     if closed && !b.writable.is_empty() {
         for &(lo, hi) in &b.writable {
             let lo = lo as usize;
@@ -919,7 +1010,7 @@ pub fn d3d9_set_lod(resource: &mut D3d9Resource, lod: u32) -> ValueResult {
 pub fn d3d9_lod(resource: &D3d9Resource) -> ValueResult {
     ValueResult {
         status: status(StatusCode::Ok, ""),
-        value: resource.lod,
+        value: resource.lod.load(Ordering::Acquire),
     }
 }
 
@@ -1154,6 +1245,15 @@ impl Default for D3d9Device {
             restore: None,
             state: state::D3d9State::default(),
             objects: shader::D3d9Objects::default(),
+            registry: BTreeMap::new(),
+            locks: BTreeMap::new(),
+            draw: draw::D3d9DrawState::default(),
+            queries: query::D3d9Queries::new(),
+            render_target_id: 0,
+            depth_target_id: 0,
+            in_scene: false,
+            implicit_backbuffer_id: 0,
+            implicit_depthbuffer_id: 0,
             present: D3d9PresentParams {
                 width: 0,
                 height: 0,
@@ -1356,7 +1456,9 @@ fn create_d3d9_depth(
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu_format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1513,6 +1615,7 @@ pub fn d3d9_create_device(
     device.present = present;
     device.state.set_target_size(present.width, present.height);
     if present.enable_auto_depth_stencil != 0 {
+        device.depth_target_id = u32::MAX;
         let _ = device.state.set_render_state(7, 1);
     }
     device.creator_thread = request.thread_id;
@@ -1553,11 +1656,194 @@ pub fn d3d9_register_resource(device: &mut D3d9Device, id: u32, resource: &D3d9R
             "resource id is already registered",
         );
     }
+    device.locks.insert(id, resource.lock_handles());
+    if let Some(entry) = gpu_entry_from_resource(resource) {
+        device.registry.insert(id, entry);
+    }
+    status(StatusCode::Ok, "")
+}
+
+fn fresh_or_new(fresh: Option<Arc<AtomicBool>>) -> Arc<AtomicBool> {
+    fresh.unwrap_or_else(|| Arc::new(AtomicBool::new(false)))
+}
+
+fn gpu_entry_from_staged(
+    resource: &D3d9Resource,
+    staged: &StagedStorage,
+) -> Option<GpuRegistryEntry> {
+    if let Some(buffer) = staged.buffer.as_ref() {
+        let Some(resource::ResourceState::Buffer(b)) = resource.state.as_ref() else {
+            return None;
+        };
+        return Some(GpuRegistryEntry::Buffer {
+            buffer: buffer.clone(),
+            size: b.size,
+            format: b.format,
+            fvf: b.fvf,
+            fresh: resource.freshness(),
+        });
+    }
+    let texture = staged.texture.as_ref()?;
+    match resource.state.as_ref() {
+        Some(resource::ResourceState::Texture(t)) => Some(GpuRegistryEntry::Texture {
+            texture: texture.clone(),
+            kind: t.kind,
+            format: t.format,
+            width: t.width,
+            height: t.height,
+            depth: t.depth,
+            levels: t.levels,
+            pool: t.pool,
+            usage: t.usage,
+            lod: resource.lod.clone(),
+            fresh: fresh_or_new(resource.level_freshness(0, 0)),
+        }),
+        Some(resource::ResourceState::Surface(s)) => Some(GpuRegistryEntry::Surface {
+            texture: texture.clone(),
+            format: s.format,
+            width: s.width,
+            height: s.height,
+            depth: s.depth,
+            pool: s.pool,
+            usage: s.usage,
+            discard: s.discard,
+            fresh: fresh_or_new(resource.level_freshness(0, 0)),
+        }),
+        _ => None,
+    }
+}
+
+fn gpu_entry_from_resource(resource: &D3d9Resource) -> Option<GpuRegistryEntry> {
+    if let Some((buffer, size, format, fvf, _)) = resource.buffer_gpu() {
+        return Some(GpuRegistryEntry::Buffer {
+            buffer,
+            size,
+            format,
+            fvf,
+            fresh: resource.freshness(),
+        });
+    }
+    if let Some((texture, kind, format, width, height, levels)) = resource.texture_gpu() {
+        let (depth, pool, usage) = match resource.state.as_ref() {
+            Some(resource::ResourceState::Texture(t)) => (t.depth, t.pool, t.usage),
+            _ => (1, 0, 0),
+        };
+        return Some(GpuRegistryEntry::Texture {
+            texture,
+            kind,
+            format,
+            width,
+            height,
+            depth,
+            levels,
+            pool,
+            usage,
+            lod: resource.lod.clone(),
+            fresh: fresh_or_new(resource.level_freshness(0, 0)),
+        });
+    }
+    resource
+        .surface_gpu()
+        .map(
+            |(texture, format, width, height, depth)| GpuRegistryEntry::Surface {
+                texture,
+                format,
+                width,
+                height,
+                depth,
+                pool: resource.pool().unwrap_or(resource::D3DPOOL_DEFAULT),
+                usage: match resource.state.as_ref() {
+                    Some(resource::ResourceState::Surface(s)) => s.usage,
+                    _ => 0,
+                },
+                discard: match resource.state.as_ref() {
+                    Some(resource::ResourceState::Surface(s)) => s.discard,
+                    _ => false,
+                },
+                fresh: fresh_or_new(resource.level_freshness(0, 0)),
+            },
+        )
+}
+
+pub fn d3d9_register_resource_view(
+    device: &mut D3d9Device,
+    id: u32,
+    resource: &D3d9Resource,
+    face: u32,
+    level: u32,
+    volume: bool,
+) -> Status {
+    let Some(resource::ResourceState::Texture(t)) = resource.state.as_ref() else {
+        return status(StatusCode::InvalidArgument, "resource is not a texture");
+    };
+    if level >= t.levels {
+        return status(
+            StatusCode::InvalidArgument,
+            "texture view level is out of range",
+        );
+    }
+    if !volume && matches!(t.kind, resource::TextureKind::Cube) && face >= 6 {
+        return status(StatusCode::InvalidArgument, "cube face is out of range");
+    }
+    let kind = t.kind;
+    let format = t.format;
+    let pool = t.pool;
+    let usage = t.usage;
+    let width = (t.width >> level).max(1);
+    let height = (t.height >> level).max(1);
+    let depth = if volume { (t.depth >> level).max(1) } else { 1 };
+    let gpu = resource
+        .texture_gpu()
+        .map(|(texture, _, _, _, _, _)| texture);
+    let lock = match resource.level_lock_handle(face, level) {
+        Ok(lock) => lock,
+        Err(error) => return bridge_error(error),
+    };
+    device.locks.insert(id, vec![lock]);
+    device.registry.insert(
+        id,
+        GpuRegistryEntry::TextureAlias {
+            gpu,
+            parent_fresh: resource.freshness(),
+            kind,
+            format,
+            width,
+            height,
+            depth,
+            levels: 1,
+            face,
+            level,
+            volume,
+            pool,
+            usage,
+            lod: resource.lod.clone(),
+            fresh: fresh_or_new(resource.level_freshness(face, level)),
+        },
+    );
+    status(StatusCode::Ok, "")
+}
+
+pub fn d3d9_register_implicit_targets(
+    device: &mut D3d9Device,
+    backbuffer: u32,
+    depth: u32,
+) -> Status {
+    device.implicit_backbuffer_id = backbuffer;
+    device.implicit_depthbuffer_id = depth;
     status(StatusCode::Ok, "")
 }
 
 pub fn d3d9_unregister_resource(device: &mut D3d9Device, id: u32) -> Status {
     device.resources.remove(&id);
+    device.registry.remove(&id);
+    device.locks.remove(&id);
+    device.draw.drop_resource(id);
+    if device.render_target_id == id {
+        device.render_target_id = 0;
+    }
+    if device.depth_target_id == id {
+        device.depth_target_id = 0;
+    }
     status(StatusCode::Ok, "")
 }
 
@@ -1727,6 +2013,7 @@ pub fn d3d9_reset(device: &mut D3d9Device, request: &D3d9ResetRequest) -> D3d9Re
             present,
             expected,
             staged: BTreeMap::new(),
+            registry: device.registry.clone(),
             committed: 0,
             ready: false,
         });
@@ -1760,6 +2047,7 @@ pub fn d3d9_reset(device: &mut D3d9Device, request: &D3d9ResetRequest) -> D3d9Re
             present,
             expected,
             staged: BTreeMap::new(),
+            registry: device.registry.clone(),
             committed: 0,
             ready: false,
         });
@@ -1798,6 +2086,27 @@ pub fn d3d9_prepare_resource_reset(
     }
     match resource::stage_restore(&plan.d3d9_gpu, resource) {
         Ok(staged) => {
+            let parent_fresh = resource.freshness();
+            match gpu_entry_from_staged(resource, &staged) {
+                Some(entry) => {
+                    plan.registry.insert(id, entry);
+                }
+                None => {
+                    plan.registry.remove(&id);
+                }
+            }
+            for entry in plan.registry.values_mut() {
+                if let GpuRegistryEntry::TextureAlias {
+                    gpu,
+                    parent_fresh: alias_parent,
+                    ..
+                } = entry
+                {
+                    if Arc::ptr_eq(alias_parent, &parent_fresh) {
+                        *gpu = staged.texture.clone();
+                    }
+                }
+            }
             plan.staged.insert(id, staged);
             status(StatusCode::Ok, "")
         }
@@ -1883,12 +2192,23 @@ pub fn d3d9_finish_reset(device: &mut D3d9Device) -> D3d9ResetResult {
     );
     let lost = plan.loss.is_physical();
     device.targets = Some(plan.targets);
+    device.registry = plan.registry;
     device.present = plan.present;
     device
         .state
         .set_target_size(plan.present.width, plan.present.height);
     device.state.clear_pipeline();
+    device.draw.clear();
+    device.render_target_id = 0;
+    device.depth_target_id = 0;
+    device.implicit_backbuffer_id = 0;
+    device.implicit_depthbuffer_id = 0;
+    device.in_scene = false;
+    if let Some(gpu) = device.d3d9_gpu.clone() {
+        device.queries.reset(&gpu);
+    }
     if plan.present.enable_auto_depth_stencil != 0 {
+        device.depth_target_id = u32::MAX;
         let _ = device.state.set_render_state(7, 1);
     }
     if let Some(gpu) = plan.gpu {
@@ -2195,19 +2515,28 @@ fn caps_image(probe: &D3d9Probe) -> Vec<u8> {
             | D3DPTEXTURECAPS_MIPVOLUMEMAP
             | D3DPTEXTURECAPS_MIPCUBEMAP,
     );
+    put_u32(&mut caps, 64, D3DPTFILTERCAPS_POINTLINEAR);
+    put_u32(&mut caps, 68, D3DPTFILTERCAPS_POINTLINEAR);
+    put_u32(&mut caps, 72, D3DPTFILTERCAPS_POINTLINEAR);
+    put_u32(&mut caps, 76, D3DPTADDRESSCAPS_WRAPMIRRORCLAMP);
+    put_u32(&mut caps, 80, D3DPTADDRESSCAPS_WRAPMIRRORCLAMP);
     put_u32(&mut caps, 88, probe.max_texture_dimension_2d);
     put_u32(&mut caps, 92, probe.max_texture_dimension_2d);
     put_u32(&mut caps, 96, probe.max_texture_dimension_3d);
     put_u32(&mut caps, 100, probe.max_texture_dimension_2d);
     put_u32(&mut caps, 104, probe.max_texture_dimension_2d);
-    put_u32(&mut caps, 108, state::MAX_ANISOTROPY);
+    put_u32(&mut caps, 108, 1);
     put_u32(&mut caps, 148, 8);
     put_u32(&mut caps, 152, 8);
     put_u32(&mut caps, 160, 8);
     put_u32(&mut caps, 164, 6);
+    put_u32(&mut caps, 180, D3D_MAX_PRIMITIVE_COUNT);
+    put_u32(&mut caps, 184, D3D_MAX_VERTEX_INDEX);
     put_u32(&mut caps, 188, 16);
-    put_u32(&mut caps, 192, 0xffff);
+    put_u32(&mut caps, 192, state::MAX_STREAM_STRIDE);
+    put_u32(&mut caps, 196, D3DVS_VERSION_2_0);
     put_u32(&mut caps, 200, 256);
+    put_u32(&mut caps, 204, D3DPS_VERSION_2_0);
     put_u32(&mut caps, 232, 1);
     put_u32(&mut caps, 236, 0x1ffff);
     put_u32(&mut caps, 240, 1);
@@ -3356,5 +3685,1469 @@ pub fn d3d9_current_bindings(device: &D3d9Device) -> D3d9BindingsResult {
         live: bridge_bindings(device.state.bindings()),
         recording: bridge_bindings(recording),
         recording_active,
+    }
+}
+
+fn bridge_gpu(device: &D3d9Device) -> Result<D3d9Gpu, RenderError> {
+    device.resource_gpu().cloned()
+}
+
+fn device_gpu(device: &D3d9Device) -> Result<D3d9Gpu, Status> {
+    let gpu = match device.resource_gpu() {
+        Ok(gpu) => gpu.clone(),
+        Err(error) => return Err(bridge_error(error)),
+    };
+    if gpu.is_physical() {
+        return Err(status(
+            StatusCode::DeviceLost,
+            gpu.loss().physical_message(),
+        ));
+    }
+    if gpu.loss().is_reset_required() {
+        return Err(status(
+            StatusCode::DeviceLost,
+            "the device must be reset before this call",
+        ));
+    }
+    Ok(gpu)
+}
+
+fn invalid(op: &'static str, why: impl Into<String>) -> RenderError {
+    RenderError::invalid(op, why)
+}
+
+fn unsupported(op: &'static str, why: impl Into<String>) -> RenderError {
+    RenderError::new(op, why)
+}
+
+fn alloc_bytes(size: u32) -> Result<Vec<u8>, RenderError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(size as usize)
+        .map_err(|_| RenderError::out_of_memory("D3D9", "allocation failed"))?;
+    out.resize(size as usize, 0);
+    Ok(out)
+}
+
+fn resource_storage_format(resource: &D3d9Resource) -> Option<u32> {
+    match resource.state.as_ref() {
+        Some(resource::ResourceState::Texture(t)) => Some(t.format),
+        Some(resource::ResourceState::Surface(s)) => Some(s.format),
+        _ => None,
+    }
+}
+
+fn map_rects(rects: &[crate::bridge::D3d9Rect]) -> Result<Vec<TargetRect>, Status> {
+    if rects.len() > 1 {
+        return Err(status(
+            StatusCode::InvalidArgument,
+            "a D3D9 call accepts at most one rectangle",
+        ));
+    }
+    Ok(rects
+        .iter()
+        .map(|r| TargetRect {
+            left: r.left,
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom,
+        })
+        .collect())
+}
+
+fn clear_region(
+    rect: Option<TargetRect>,
+    viewport: &state::Viewport,
+    width: u32,
+    height: u32,
+) -> Option<TargetRect> {
+    let vp_left = viewport.x.min(i32::MAX as u32) as i32;
+    let vp_top = viewport.y.min(i32::MAX as u32) as i32;
+    let vp_right = viewport
+        .x
+        .saturating_add(viewport.width)
+        .min(i32::MAX as u32) as i32;
+    let vp_bottom = viewport
+        .y
+        .saturating_add(viewport.height)
+        .min(i32::MAX as u32) as i32;
+    let (left, top, right, bottom) = match rect {
+        Some(rect) => (rect.left, rect.top, rect.right, rect.bottom),
+        None => (vp_left, vp_top, vp_right, vp_bottom),
+    };
+    let left = left.max(0).max(vp_left);
+    let top = top.max(0).max(vp_top);
+    let right = right.min(width.min(i32::MAX as u32) as i32).min(vp_right);
+    let bottom = bottom
+        .min(height.min(i32::MAX as u32) as i32)
+        .min(vp_bottom);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some(TargetRect {
+        left,
+        top,
+        right,
+        bottom,
+    })
+}
+
+fn index_element_size(index_format: u32) -> Result<u32, RenderError> {
+    match index_format {
+        101 => Ok(2),
+        102 => Ok(4),
+        _ => Err(invalid(
+            "Draw",
+            format!("unknown D3DFORMAT index type {index_format}"),
+        )),
+    }
+}
+
+fn texture_view(
+    texture: &wgpu::Texture,
+    face: u32,
+    level: u32,
+    volume: bool,
+    cube: bool,
+) -> wgpu::TextureView {
+    let dimension = if volume {
+        wgpu::TextureViewDimension::D3
+    } else {
+        wgpu::TextureViewDimension::D2
+    };
+    let array_layer = if cube && !volume { face } else { 0 };
+    texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(dimension),
+        base_mip_level: level,
+        mip_level_count: Some(1),
+        base_array_layer: array_layer,
+        array_layer_count: Some(1),
+        ..Default::default()
+    })
+}
+
+fn sampling_view(
+    texture: &wgpu::Texture,
+    kind: resource::TextureKind,
+    depth: bool,
+) -> wgpu::TextureView {
+    let aspect = if depth {
+        wgpu::TextureAspect::DepthOnly
+    } else {
+        wgpu::TextureAspect::All
+    };
+    match kind {
+        resource::TextureKind::Cube => texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::Cube),
+            aspect,
+            base_array_layer: 0,
+            array_layer_count: Some(6),
+            ..Default::default()
+        }),
+        resource::TextureKind::Volume => texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            aspect,
+            ..Default::default()
+        }),
+        resource::TextureKind::Texture2D => texture.create_view(&wgpu::TextureViewDescriptor {
+            aspect,
+            ..Default::default()
+        }),
+    }
+}
+
+fn require_unlocked(
+    device: &D3d9Device,
+    id: u32,
+    operation: &'static str,
+) -> Result<(), RenderError> {
+    if device
+        .locks
+        .get(&id)
+        .is_some_and(|locks| locks.iter().any(|l| l.load(Ordering::Acquire) != 0))
+    {
+        Err(invalid(operation, "resource has an outstanding lock"))
+    } else {
+        Ok(())
+    }
+}
+
+fn resolve_target_view(
+    device: &D3d9Device,
+    id: u32,
+    face: u32,
+    level: u32,
+    volume: bool,
+) -> Result<SurfaceView, RenderError> {
+    require_unlocked(device, id, "D3D9 surface")?;
+    if id == 0 || id == device.implicit_backbuffer_id {
+        let targets = device
+            .targets
+            .as_ref()
+            .ok_or_else(|| invalid("D3D9", "device has no implicit back buffer"))?;
+        return Ok(SurfaceView {
+            texture: targets.target.texture.clone(),
+            view: targets.target.view.clone(),
+            format: targets.format,
+            width: targets.target.width,
+            height: targets.target.height,
+            depth: 1,
+            cube: false,
+            volume: false,
+            subresource: (0, 0, 0),
+        });
+    }
+    if id == u32::MAX || id == device.implicit_depthbuffer_id {
+        let targets = device
+            .targets
+            .as_ref()
+            .ok_or_else(|| invalid("D3D9", "device has no implicit depth buffer"))?;
+        let depth = targets
+            .target
+            .depth
+            .as_ref()
+            .ok_or_else(|| invalid("D3D9", "device has no implicit depth buffer"))?;
+        return Ok(SurfaceView {
+            texture: depth.texture.clone(),
+            view: depth.view.clone(),
+            format: targets.depth_format,
+            width: targets.target.width,
+            height: targets.target.height,
+            depth: 1,
+            cube: false,
+            volume: false,
+            subresource: (0, 0, 0),
+        });
+    }
+    match device.registry.get(&id) {
+        Some(GpuRegistryEntry::Texture {
+            texture,
+            kind,
+            format,
+            width,
+            height,
+            levels,
+            ..
+        }) => {
+            let _ = levels;
+            Ok(SurfaceView {
+                texture: texture.clone(),
+                view: texture_view(
+                    texture,
+                    face,
+                    level,
+                    *kind == resource::TextureKind::Volume,
+                    *kind == resource::TextureKind::Cube,
+                ),
+                format: *format,
+                width: (*width >> level).max(1),
+                height: (*height >> level).max(1),
+                depth: 1,
+                cube: *kind == resource::TextureKind::Cube,
+                volume: *kind == resource::TextureKind::Volume,
+                subresource: (face, level, 0),
+            })
+        }
+        Some(GpuRegistryEntry::TextureAlias {
+            gpu,
+            kind,
+            format,
+            width,
+            height,
+            depth,
+            face: alias_face,
+            level: alias_level,
+            volume: alias_volume,
+            ..
+        }) => {
+            let texture = gpu
+                .as_ref()
+                .ok_or_else(|| unsupported("D3D9", "texture view has no GPU storage"))?;
+            let view = texture_view(
+                texture,
+                *alias_face,
+                *alias_level,
+                *alias_volume,
+                *kind == resource::TextureKind::Cube,
+            );
+            let _ = (face, level, volume);
+            Ok(SurfaceView {
+                texture: texture.clone(),
+                view,
+                format: *format,
+                width: *width,
+                height: *height,
+                depth: *depth,
+                cube: *kind == resource::TextureKind::Cube,
+                volume: *alias_volume,
+                subresource: (*alias_face, *alias_level, 0),
+            })
+        }
+        Some(GpuRegistryEntry::Surface {
+            texture,
+            format,
+            width,
+            height,
+            ..
+        }) => Ok(SurfaceView {
+            texture: texture.clone(),
+            view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            format: *format,
+            width: *width,
+            height: *height,
+            depth: 1,
+            cube: false,
+            volume: false,
+            subresource: (0, 0, 0),
+        }),
+        Some(GpuRegistryEntry::Buffer { .. }) => {
+            Err(invalid("D3D9", "a buffer cannot be a render target"))
+        }
+        None => Err(unsupported("D3D9", "target id is not registered")),
+    }
+}
+
+fn bound_textures(
+    device: &D3d9Device,
+    state: &state::D3d9State,
+    target: &SurfaceView,
+    depth: Option<&SurfaceView>,
+) -> Result<Vec<draw::BoundTexture>, RenderError> {
+    let mut out = Vec::new();
+    for stage in 0..state::MAX_SAMPLERS as u32 {
+        let id = state.texture(stage)?;
+        if id == 0 {
+            continue;
+        }
+        require_unlocked(device, id, "Draw texture")?;
+        let (texture, kind, format, width, height, lod) = match device.registry.get(&id) {
+            Some(GpuRegistryEntry::Texture {
+                texture,
+                kind,
+                format,
+                width,
+                height,
+                lod,
+                ..
+            }) => (
+                texture.clone(),
+                *kind,
+                *format,
+                *width,
+                *height,
+                lod.load(Ordering::Acquire),
+            ),
+            Some(GpuRegistryEntry::TextureAlias {
+                gpu: Some(texture),
+                kind,
+                format,
+                width,
+                height,
+                lod,
+                ..
+            }) => (
+                texture.clone(),
+                *kind,
+                *format,
+                *width,
+                *height,
+                lod.load(Ordering::Acquire),
+            ),
+            Some(GpuRegistryEntry::Surface {
+                texture,
+                format,
+                width,
+                height,
+                ..
+            }) => (
+                texture.clone(),
+                resource::TextureKind::Texture2D,
+                *format,
+                *width,
+                *height,
+                0,
+            ),
+            _ => {
+                return Err(unsupported(
+                    "Draw",
+                    format!("sampler stage {stage} has no GPU texture"),
+                ));
+            }
+        };
+        if texture == target.texture || depth.is_some_and(|depth| texture == depth.texture) {
+            return Err(unsupported(
+                "Draw",
+                "the current render target is bound as a sampler",
+            ));
+        }
+        let is_depth = format::is_depth(format);
+        out.push(draw::BoundTexture {
+            stage,
+            view: sampling_view(&texture, kind, is_depth),
+            width,
+            height,
+            depth: is_depth,
+            cube: kind == resource::TextureKind::Cube,
+            volume: kind == resource::TextureKind::Volume,
+            format,
+            lod,
+            levels: texture.mip_level_count(),
+        });
+    }
+    Ok(out)
+}
+
+fn collect_streams(
+    gpu: &D3d9Gpu,
+    device: &D3d9Device,
+    state: &state::D3d9State,
+) -> Result<Vec<draw::StreamData>, RenderError> {
+    let mut out = Vec::new();
+    for stream in 0..state::MAX_STREAMS as u32 {
+        let source = state.stream_source(stream)?;
+        if source.buffer == 0 {
+            continue;
+        }
+        require_unlocked(device, source.buffer, "Draw vertex buffer")?;
+        let Some(GpuRegistryEntry::Buffer { buffer, size, .. }) =
+            device.registry.get(&source.buffer)
+        else {
+            return Err(unsupported(
+                "Draw",
+                format!("vertex stream {stream} has no GPU buffer"),
+            ));
+        };
+        let mut bytes = alloc_bytes(*size)?;
+        gpu.read_buffer(buffer, *size, &mut bytes)?;
+        out.push(draw::StreamData {
+            stream,
+            stride: source.stride,
+            offset: source.offset,
+            bytes,
+        });
+    }
+    Ok(out)
+}
+
+fn index_buffer(
+    gpu: &D3d9Gpu,
+    device: &D3d9Device,
+    id: u32,
+) -> Result<(Vec<u8>, u32), RenderError> {
+    require_unlocked(device, id, "Draw index buffer")?;
+    match device.registry.get(&id) {
+        Some(GpuRegistryEntry::Buffer {
+            buffer,
+            size,
+            format,
+            ..
+        }) => {
+            let mut bytes = alloc_bytes(*size)?;
+            gpu.read_buffer(buffer, *size, &mut bytes)?;
+            Ok((bytes, *format))
+        }
+        _ => Err(unsupported("Draw", "index buffer has no GPU storage")),
+    }
+}
+
+fn mark_target_fresh(device: &D3d9Device, id: u32) {
+    if id == 0 || id == u32::MAX {
+        return;
+    }
+    let fresh = match device.registry.get(&id) {
+        Some(GpuRegistryEntry::Buffer { fresh, .. })
+        | Some(GpuRegistryEntry::Texture { fresh, .. })
+        | Some(GpuRegistryEntry::TextureAlias { fresh, .. })
+        | Some(GpuRegistryEntry::Surface { fresh, .. }) => Some(Arc::clone(fresh)),
+        None => None,
+    };
+    if let Some(fresh) = fresh {
+        fresh.store(true, Ordering::Release);
+    }
+}
+
+fn mark_clear_fresh(device: &D3d9Device, flags: u32) {
+    if flags & 1 != 0 {
+        mark_target_fresh(device, device.render_target_id);
+    }
+    if flags & 6 != 0 {
+        mark_target_fresh(device, device.depth_target_id);
+    }
+}
+
+fn mark_draw_fresh(device: &D3d9Device) {
+    if device.state.render_state(168).unwrap_or(0) != 0 {
+        mark_target_fresh(device, device.render_target_id);
+    }
+    let depth_write = device.state.render_state(7).unwrap_or(0) != 0
+        && device.state.render_state(14).unwrap_or(0) != 0;
+    let stencil_write = device.state.render_state(52).unwrap_or(0) != 0
+        && device.state.render_state(59).unwrap_or(0xffff_ffff) != 0
+        && [53, 54, 55]
+            .iter()
+            .any(|&state| device.state.render_state(state).unwrap_or(1) != 1);
+    if depth_write || stencil_write {
+        mark_target_fresh(device, device.depth_target_id);
+    }
+}
+
+fn dispatch_draw(device: &mut D3d9Device, command: draw::DrawCommand) -> Result<(), RenderError> {
+    let gpu = bridge_gpu(device)?;
+    let target = resolve_target_view(device, device.render_target_id, 0, 0, false)?;
+    let depth = if device.depth_target_id == 0 {
+        None
+    } else {
+        Some(resolve_target_view(
+            device,
+            device.depth_target_id,
+            0,
+            0,
+            false,
+        )?)
+    };
+    if depth
+        .as_ref()
+        .is_some_and(|d| d.width < target.width || d.height < target.height)
+    {
+        return Err(invalid(
+            "Draw",
+            "depth surface is smaller than the render target",
+        ));
+    }
+    let textures = bound_textures(device, &device.state, &target, depth.as_ref())?;
+    let snapshot = draw::DrawSnapshot {
+        command,
+        target,
+        depth,
+        textures,
+    };
+    gpu.validate("Draw", || {
+        draw::execute(
+            &gpu,
+            &mut device.draw,
+            &device.state,
+            &device.objects,
+            snapshot,
+        )
+    })?;
+    mark_draw_fresh(device);
+    Ok(())
+}
+
+fn target_metadata(device: &D3d9Device, id: u32) -> Option<(u32, u32, u32)> {
+    match device.registry.get(&id)? {
+        GpuRegistryEntry::Texture {
+            format,
+            pool,
+            usage,
+            ..
+        }
+        | GpuRegistryEntry::TextureAlias {
+            format,
+            pool,
+            usage,
+            ..
+        }
+        | GpuRegistryEntry::Surface {
+            format,
+            pool,
+            usage,
+            ..
+        } => Some((*format, *pool, *usage)),
+        GpuRegistryEntry::Buffer { .. } => None,
+    }
+}
+
+fn validate_color_target(device: &D3d9Device, id: u32) -> Result<(), RenderError> {
+    if id == u32::MAX {
+        return Err(invalid(
+            "SetRenderTarget",
+            "the implicit depth surface is not a color target",
+        ));
+    }
+    let (format, pool, usage) = target_metadata(device, id)
+        .ok_or_else(|| invalid("SetRenderTarget", "target id is not a color surface"))?;
+    if pool != resource::D3DPOOL_DEFAULT {
+        return Err(invalid(
+            "SetRenderTarget",
+            "render targets must be in D3DPOOL_DEFAULT",
+        ));
+    }
+    if usage & resource::D3DUSAGE_RENDERTARGET == 0 {
+        return Err(invalid(
+            "SetRenderTarget",
+            "surface lacks D3DUSAGE_RENDERTARGET",
+        ));
+    }
+    if format::is_depth(format) {
+        return Err(invalid(
+            "SetRenderTarget",
+            "a depth/stencil surface is not a color target",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_depth_target(device: &D3d9Device, id: u32) -> Result<(), RenderError> {
+    let (format, pool, usage) = target_metadata(device, id)
+        .ok_or_else(|| invalid("SetDepthStencilSurface", "target id is not a depth surface"))?;
+    if pool != resource::D3DPOOL_DEFAULT {
+        return Err(invalid(
+            "SetDepthStencilSurface",
+            "depth targets must be in D3DPOOL_DEFAULT",
+        ));
+    }
+    if usage & resource::D3DUSAGE_DEPTHSTENCIL == 0 {
+        return Err(invalid(
+            "SetDepthStencilSurface",
+            "surface lacks D3DUSAGE_DEPTHSTENCIL",
+        ));
+    }
+    if !format::is_depth(format) {
+        return Err(invalid(
+            "SetDepthStencilSurface",
+            "a color surface is not a depth target",
+        ));
+    }
+    Ok(())
+}
+
+pub fn d3d9_begin_scene(device: &mut D3d9Device) -> Status {
+    if device.gpu.is_none() {
+        return status(
+            StatusCode::InvalidArgument,
+            "D3D9 device is not initialized",
+        );
+    }
+    if device.in_scene {
+        return status(StatusCode::InvalidArgument, "BeginScene is already active");
+    }
+    device.in_scene = true;
+    status(StatusCode::Ok, "")
+}
+
+pub fn d3d9_end_scene(device: &mut D3d9Device) -> Status {
+    if !device.in_scene {
+        return status(StatusCode::InvalidArgument, "EndScene without BeginScene");
+    }
+    device.in_scene = false;
+    status(StatusCode::Ok, "")
+}
+
+pub fn d3d9_set_render_target(
+    device: &mut D3d9Device,
+    index: u32,
+    id: u32,
+    face: u32,
+    level: u32,
+    volume: bool,
+) -> Status {
+    if index != 0 {
+        return status(
+            StatusCode::Unsupported,
+            "multiple render targets are not implemented",
+        );
+    }
+    if id != 0 && id != device.implicit_backbuffer_id {
+        if let Err(error) = validate_color_target(device, id) {
+            return bridge_error(error);
+        }
+    }
+    match resolve_target_view(device, id, face, level, volume) {
+        Ok(view) => {
+            device.render_target_id = if id == device.implicit_backbuffer_id {
+                0
+            } else {
+                id
+            };
+            device.state.set_target_size(view.width, view.height);
+            device.state.reset_viewport();
+            status(StatusCode::Ok, "")
+        }
+        Err(error) => bridge_error(error),
+    }
+}
+
+pub fn d3d9_set_depth_stencil(
+    device: &mut D3d9Device,
+    id: u32,
+    face: u32,
+    level: u32,
+    volume: bool,
+) -> Status {
+    if id == 0 {
+        device.depth_target_id = 0;
+        return status(StatusCode::Ok, "");
+    }
+    if id != u32::MAX && id != device.implicit_depthbuffer_id {
+        if let Err(error) = validate_depth_target(device, id) {
+            return bridge_error(error);
+        }
+    }
+    match resolve_target_view(device, id, face, level, volume) {
+        Ok(_) => {
+            device.depth_target_id = if id == device.implicit_depthbuffer_id {
+                u32::MAX
+            } else {
+                id
+            };
+            status(StatusCode::Ok, "")
+        }
+        Err(error) => bridge_error(error),
+    }
+}
+
+pub fn d3d9_get_render_target(device: &D3d9Device) -> ValueResult {
+    ValueResult {
+        status: status(StatusCode::Ok, ""),
+        value: device.render_target_id,
+    }
+}
+
+pub fn d3d9_get_depth_stencil(device: &D3d9Device) -> ValueResult {
+    let value = if device.depth_target_id == 0 {
+        0
+    } else if device.depth_target_id == device.implicit_depthbuffer_id {
+        u32::MAX
+    } else {
+        device.depth_target_id
+    };
+    ValueResult {
+        status: status(StatusCode::Ok, ""),
+        value,
+    }
+}
+
+pub fn d3d9_clear(
+    device: &mut D3d9Device,
+    flags: u32,
+    color: u32,
+    z: f32,
+    stencil: u32,
+    rects: &[crate::bridge::D3d9Rect],
+) -> Status {
+    let gpu = match device_gpu(device) {
+        Ok(gpu) => gpu,
+        Err(status) => return status,
+    };
+    let target = match resolve_target_view(device, device.render_target_id, 0, 0, false) {
+        Ok(view) => view,
+        Err(error) => return bridge_error(error),
+    };
+    let depth = match if device.depth_target_id == 0 {
+        None
+    } else {
+        Some(resolve_target_view(
+            device,
+            device.depth_target_id,
+            0,
+            0,
+            false,
+        ))
+    } {
+        None => None,
+        Some(Ok(view)) => Some(view),
+        Some(Err(error)) => return bridge_error(error),
+    };
+    let viewport = device.state.viewport();
+    let mut regions = Vec::new();
+    if rects.is_empty() {
+        if let Some(region) = clear_region(None, &viewport, target.width, target.height) {
+            regions.push(region);
+        }
+    } else {
+        for rect in rects {
+            let rect = TargetRect {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            };
+            if let Some(region) = clear_region(Some(rect), &viewport, target.width, target.height) {
+                regions.push(region);
+            }
+        }
+    }
+    match gpu.validate("Clear", || {
+        draw::clear(
+            &gpu,
+            &mut device.draw,
+            &target,
+            depth.as_ref(),
+            flags,
+            color,
+            z,
+            stencil,
+            &regions,
+        )
+    }) {
+        Ok(()) => {
+            mark_clear_fresh(device, flags);
+            status(StatusCode::Ok, "")
+        }
+        Err(error) => bridge_error(error),
+    }
+}
+
+pub fn d3d9_draw_primitive(
+    device: &mut D3d9Device,
+    primitive: u32,
+    start_vertex: u32,
+    primitive_count: u32,
+) -> Status {
+    if !device.in_scene {
+        return status(
+            StatusCode::InvalidArgument,
+            "DrawPrimitive requires BeginScene",
+        );
+    }
+    let gpu = match device_gpu(device) {
+        Ok(gpu) => gpu,
+        Err(status) => return status,
+    };
+    let streams = match collect_streams(&gpu, device, &device.state) {
+        Ok(streams) => streams,
+        Err(error) => return bridge_error(error),
+    };
+    let command = draw::DrawCommand {
+        primitive,
+        primitive_count,
+        start_vertex,
+        base_vertex: 0,
+        indexed: false,
+        index_format: 0,
+        index_bytes: Vec::new(),
+        min_vertex: 0,
+        num_vertices: 0,
+        streams,
+    };
+    match dispatch_draw(device, command) {
+        Ok(()) => status(StatusCode::Ok, ""),
+        Err(error) => bridge_error(error),
+    }
+}
+
+pub fn d3d9_draw_indexed_primitive(
+    device: &mut D3d9Device,
+    primitive: u32,
+    base_vertex: i32,
+    min_index: u32,
+    num_vertices: u32,
+    start_index: u32,
+    primitive_count: u32,
+) -> Status {
+    if !device.in_scene {
+        return status(
+            StatusCode::InvalidArgument,
+            "DrawIndexedPrimitive requires BeginScene",
+        );
+    }
+    let gpu = match device_gpu(device) {
+        Ok(gpu) => gpu,
+        Err(status) => return status,
+    };
+    let index_id = device.state.bindings().indices;
+    if index_id == 0 {
+        return status(StatusCode::InvalidArgument, "no index buffer is bound");
+    }
+    if min_index.checked_add(num_vertices).is_none() {
+        return status(StatusCode::InvalidArgument, "vertex hint range overflows");
+    }
+    let (index_bytes, index_format) = match index_buffer(&gpu, device, index_id) {
+        Ok(value) => value,
+        Err(error) => return bridge_error(error),
+    };
+    let streams = match collect_streams(&gpu, device, &device.state) {
+        Ok(streams) => streams,
+        Err(error) => return bridge_error(error),
+    };
+    let command = draw::DrawCommand {
+        primitive,
+        primitive_count,
+        start_vertex: start_index,
+        base_vertex,
+        indexed: true,
+        index_format,
+        index_bytes,
+        min_vertex: min_index,
+        num_vertices,
+        streams,
+    };
+    match dispatch_draw(device, command) {
+        Ok(()) => status(StatusCode::Ok, ""),
+        Err(error) => bridge_error(error),
+    }
+}
+
+pub fn d3d9_draw_primitive_up(
+    device: &mut D3d9Device,
+    primitive: u32,
+    primitive_count: u32,
+    vertices: &[u8],
+    stride: u32,
+) -> Status {
+    if !device.in_scene {
+        return status(
+            StatusCode::InvalidArgument,
+            "DrawPrimitiveUP requires BeginScene",
+        );
+    }
+    if let Err(status) = device_gpu(device) {
+        device.state.clear_up_stream();
+        return status;
+    }
+    let required = match draw::primitive_vertex_count(primitive, primitive_count) {
+        Ok(count) => count,
+        Err(error) => return bridge_error(error),
+    };
+    if (required as u64)
+        .checked_mul(stride as u64)
+        .is_none_or(|bytes| bytes > vertices.len() as u64)
+    {
+        return status(
+            StatusCode::InvalidArgument,
+            "DrawPrimitiveUP vertex data is shorter than the primitive span",
+        );
+    }
+    let streams = vec![draw::StreamData {
+        stream: 0,
+        stride,
+        offset: 0,
+        bytes: vertices.to_vec(),
+    }];
+    let command = draw::DrawCommand {
+        primitive,
+        primitive_count,
+        start_vertex: 0,
+        base_vertex: 0,
+        indexed: false,
+        index_format: 0,
+        index_bytes: Vec::new(),
+        min_vertex: 0,
+        num_vertices: 0,
+        streams,
+    };
+    let status = match dispatch_draw(device, command) {
+        Ok(()) => status(StatusCode::Ok, ""),
+        Err(error) => bridge_error(error),
+    };
+    device.state.clear_up_stream();
+    status
+}
+
+pub fn d3d9_draw_indexed_primitive_up(
+    device: &mut D3d9Device,
+    primitive: u32,
+    min_vertex: u32,
+    num_vertices: u32,
+    primitive_count: u32,
+    indices: &[u8],
+    index_format: u32,
+    vertices: &[u8],
+    stride: u32,
+) -> Status {
+    if !device.in_scene {
+        return status(
+            StatusCode::InvalidArgument,
+            "DrawIndexedPrimitiveUP requires BeginScene",
+        );
+    }
+    if let Err(status) = device_gpu(device) {
+        device.state.clear_up_indexed();
+        return status;
+    }
+    let index_size = match index_element_size(index_format) {
+        Ok(size) => size,
+        Err(error) => return bridge_error(error),
+    };
+    let required_indices = match draw::primitive_vertex_count(primitive, primitive_count) {
+        Ok(count) => count,
+        Err(error) => return bridge_error(error),
+    };
+    if (required_indices as u64)
+        .checked_mul(index_size as u64)
+        .is_none_or(|bytes| bytes > indices.len() as u64)
+    {
+        return status(
+            StatusCode::InvalidArgument,
+            "DrawIndexedPrimitiveUP index data is shorter than the primitive span",
+        );
+    }
+    let hint_vertices = match min_vertex.checked_add(num_vertices) {
+        Some(count) => count,
+        None => return status(StatusCode::InvalidArgument, "vertex hint range overflows"),
+    };
+    if (hint_vertices as u64)
+        .checked_mul(stride as u64)
+        .is_none_or(|bytes| bytes > vertices.len() as u64)
+    {
+        return status(
+            StatusCode::InvalidArgument,
+            "DrawIndexedPrimitiveUP vertex data is shorter than MinVertexIndex + NumVertices",
+        );
+    }
+    let streams = vec![draw::StreamData {
+        stream: 0,
+        stride,
+        offset: 0,
+        bytes: vertices.to_vec(),
+    }];
+    let command = draw::DrawCommand {
+        primitive,
+        primitive_count,
+        start_vertex: 0,
+        base_vertex: 0,
+        indexed: true,
+        index_format,
+        index_bytes: indices.to_vec(),
+        min_vertex,
+        num_vertices,
+        streams,
+    };
+    let status = match dispatch_draw(device, command) {
+        Ok(()) => status(StatusCode::Ok, ""),
+        Err(error) => bridge_error(error),
+    };
+    device.state.clear_up_indexed();
+    status
+}
+
+fn depth_surface_meta(device: &D3d9Device, id: u32) -> Option<(u32, bool)> {
+    if id == u32::MAX || id == device.implicit_depthbuffer_id {
+        return Some((resource::D3DPOOL_DEFAULT, false));
+    }
+    match device.registry.get(&id) {
+        Some(GpuRegistryEntry::Surface { pool, discard, .. }) => Some((*pool, *discard)),
+        _ => None,
+    }
+}
+
+fn validate_depth_stretch(
+    device: &D3d9Device,
+    src: u32,
+    src_view: &SurfaceView,
+    src_rect: Option<TargetRect>,
+    dst: u32,
+    dst_view: &SurfaceView,
+    dst_rect: Option<TargetRect>,
+    filter: u32,
+) -> Result<(), RenderError> {
+    if !format::is_depth(src_view.format) && !format::is_depth(dst_view.format) {
+        return Ok(());
+    }
+    if device.in_scene {
+        return Err(invalid(
+            "StretchRect",
+            "depth StretchRect is not allowed inside BeginScene/EndScene",
+        ));
+    }
+    if src_view.format != dst_view.format {
+        return Err(invalid(
+            "StretchRect",
+            "depth StretchRect requires matching formats",
+        ));
+    }
+    let full = |rect: Option<TargetRect>, view: &SurfaceView| {
+        rect.is_none_or(|r| {
+            r.left == 0
+                && r.top == 0
+                && r.right == view.width as i32
+                && r.bottom == view.height as i32
+        })
+    };
+    if !full(src_rect, src_view) || !full(dst_rect, dst_view) {
+        return Err(unsupported(
+            "StretchRect",
+            "depth StretchRect only supports full-surface copies",
+        ));
+    }
+    if filter != 0 {
+        return Err(unsupported(
+            "StretchRect",
+            "depth StretchRect requires D3DTEXF_NONE",
+        ));
+    }
+    for (id, which) in [(src, "source"), (dst, "destination")] {
+        let Some((pool, discard)) = depth_surface_meta(device, id) else {
+            return Err(unsupported(
+                "StretchRect",
+                format!("depth StretchRect {which} must be a standalone surface"),
+            ));
+        };
+        if pool != resource::D3DPOOL_DEFAULT {
+            return Err(invalid(
+                "StretchRect",
+                format!("depth StretchRect {which} must be D3DPOOL_DEFAULT"),
+            ));
+        }
+        if discard {
+            return Err(invalid(
+                "StretchRect",
+                format!("depth StretchRect {which} must not be discardable"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn d3d9_stretch_rect(
+    device: &mut D3d9Device,
+    src: u32,
+    src_rect: &[crate::bridge::D3d9Rect],
+    dst: u32,
+    dst_rect: &[crate::bridge::D3d9Rect],
+    filter: u32,
+) -> Status {
+    let gpu = match device_gpu(device) {
+        Ok(gpu) => gpu,
+        Err(status) => return status,
+    };
+    let source = match resolve_target_view(device, src, 0, 0, false) {
+        Ok(view) => view,
+        Err(error) => return bridge_error(error),
+    };
+    let destination = match resolve_target_view(device, dst, 0, 0, false) {
+        Ok(view) => view,
+        Err(error) => return bridge_error(error),
+    };
+    let src_rect = match map_rects(src_rect) {
+        Ok(rects) => rects.into_iter().next(),
+        Err(status) => return status,
+    };
+    let dst_rect = match map_rects(dst_rect) {
+        Ok(rects) => rects.into_iter().next(),
+        Err(status) => return status,
+    };
+    if let Err(error) = validate_depth_stretch(
+        device,
+        src,
+        &source,
+        src_rect,
+        dst,
+        &destination,
+        dst_rect,
+        filter,
+    ) {
+        return bridge_error(error);
+    }
+    match copy::stretch_rect(&gpu, &source, src_rect, &destination, dst_rect, filter) {
+        Ok(()) => {
+            mark_target_fresh(device, dst);
+            status(StatusCode::Ok, "")
+        }
+        Err(error) => bridge_error(error),
+    }
+}
+
+pub fn d3d9_update_surface(
+    device: &mut D3d9Device,
+    source: &mut D3d9Resource,
+    src_face: u32,
+    src_level: u32,
+    src_rect: &[crate::bridge::D3d9Rect],
+    destination: &mut D3d9Resource,
+    dst_face: u32,
+    dst_level: u32,
+    dst_x: i32,
+    dst_y: i32,
+) -> Status {
+    let gpu = match bridge_gpu(device) {
+        Ok(gpu) => gpu,
+        Err(error) => return bridge_error(error),
+    };
+    let src_rect = match map_rects(src_rect) {
+        Ok(rects) => rects.into_iter().next(),
+        Err(status) => return status,
+    };
+    match resource::update_surface(
+        &gpu,
+        source,
+        src_face,
+        src_level,
+        src_rect,
+        destination,
+        dst_face,
+        dst_level,
+        (dst_x, dst_y),
+    ) {
+        Ok(()) => status(StatusCode::Ok, ""),
+        Err(error) => bridge_error(error),
+    }
+}
+
+pub fn d3d9_update_texture(
+    device: &mut D3d9Device,
+    source: &mut D3d9Resource,
+    destination: &mut D3d9Resource,
+) -> Status {
+    let gpu = match bridge_gpu(device) {
+        Ok(gpu) => gpu,
+        Err(error) => return bridge_error(error),
+    };
+    match resource::update_texture(&gpu, source, destination) {
+        Ok(()) => status(StatusCode::Ok, ""),
+        Err(error) => bridge_error(error),
+    }
+}
+
+fn validate_readback_source(
+    device: &D3d9Device,
+    src: u32,
+    source: &SurfaceView,
+) -> Result<(), RenderError> {
+    if src == u32::MAX || src == device.implicit_depthbuffer_id {
+        return Err(invalid(
+            "GetRenderTargetData",
+            "the depth/stencil target cannot be read back",
+        ));
+    }
+    if format::is_depth(source.format) {
+        return Err(invalid(
+            "GetRenderTargetData",
+            "depth/stencil surfaces cannot be read back",
+        ));
+    }
+    if src == 0 || src == device.implicit_backbuffer_id {
+        return Ok(());
+    }
+    let (_, pool, usage) = target_metadata(device, src).ok_or_else(|| {
+        invalid(
+            "GetRenderTargetData",
+            "source is not a registered render target",
+        )
+    })?;
+    if pool != resource::D3DPOOL_DEFAULT {
+        return Err(invalid(
+            "GetRenderTargetData",
+            "source render target must be in D3DPOOL_DEFAULT",
+        ));
+    }
+    if usage & resource::D3DUSAGE_RENDERTARGET == 0 {
+        return Err(invalid(
+            "GetRenderTargetData",
+            "source lacks D3DUSAGE_RENDERTARGET",
+        ));
+    }
+    Ok(())
+}
+
+pub fn d3d9_get_render_target_data(
+    device: &mut D3d9Device,
+    src: u32,
+    destination: &mut D3d9Resource,
+    dst_face: u32,
+    dst_level: u32,
+) -> Status {
+    let gpu = match device_gpu(device) {
+        Ok(gpu) => gpu,
+        Err(status) => return status,
+    };
+    let source = match resolve_target_view(device, src, 0, 0, false) {
+        Ok(view) => view,
+        Err(error) => return bridge_error(error),
+    };
+    if let Err(error) = validate_readback_source(device, src, &source) {
+        return bridge_error(error);
+    }
+    let (width, height, depth, _) =
+        match resource::level_descriptor(destination, dst_face, dst_level) {
+            Ok(values) => values,
+            Err(error) => return bridge_error(error),
+        };
+    if depth != 1 {
+        return status(
+            StatusCode::InvalidArgument,
+            "GetRenderTargetData destination must be a single-slice surface",
+        );
+    }
+    let fmt = match resource_storage_format(destination) {
+        Some(fmt) => fmt,
+        None => {
+            return status(
+                StatusCode::InvalidArgument,
+                "GetRenderTargetData destination is not a texture or surface",
+            );
+        }
+    };
+    if source.format != fmt || source.width != width || source.height != height {
+        return status(
+            StatusCode::InvalidArgument,
+            "GetRenderTargetData source and destination must match in format and size",
+        );
+    }
+    let size = match format::level_size(fmt, width, height) {
+        Some(size) => size,
+        None => {
+            return bridge_error(invalid(
+                "GetRenderTargetData",
+                "unsupported destination format",
+            ));
+        }
+    };
+    let mut bytes = match alloc_bytes(size) {
+        Ok(bytes) => bytes,
+        Err(error) => return bridge_error(error),
+    };
+    if let Err(error) = copy::copy_to_cpu(&gpu, &source, None, &mut bytes) {
+        return bridge_error(error);
+    }
+    match resource::store_readback(destination, dst_face, dst_level, &bytes, fmt, width, height) {
+        Ok(()) => status(StatusCode::Ok, ""),
+        Err(error) => bridge_error(error),
+    }
+}
+
+pub fn d3d9_color_fill(
+    device: &mut D3d9Device,
+    dst: u32,
+    rect: &[crate::bridge::D3d9Rect],
+    color: u32,
+) -> Status {
+    let gpu = match device_gpu(device) {
+        Ok(gpu) => gpu,
+        Err(status) => return status,
+    };
+    let destination = match resolve_target_view(device, dst, 0, 0, false) {
+        Ok(view) => view,
+        Err(error) => return bridge_error(error),
+    };
+    let rect = match map_rects(rect) {
+        Ok(rects) => rects.into_iter().next(),
+        Err(status) => return status,
+    };
+    match copy::color_fill(&gpu, &destination, rect, color) {
+        Ok(()) => {
+            mark_target_fresh(device, dst);
+            status(StatusCode::Ok, "")
+        }
+        Err(error) => bridge_error(error),
+    }
+}
+
+pub fn d3d9_create_query(device: &mut D3d9Device, kind: u32) -> ValueResult {
+    match device.queries.create(kind) {
+        Ok(handle) => ValueResult {
+            status: status(StatusCode::Ok, ""),
+            value: handle,
+        },
+        Err(error) => ValueResult {
+            status: if kind == 9 {
+                status(StatusCode::Unsupported, error.to_string())
+            } else {
+                bridge_error(error)
+            },
+            value: 0,
+        },
+    }
+}
+
+pub fn d3d9_destroy_query(device: &mut D3d9Device, handle: u32) -> Status {
+    match device.queries.destroy(handle) {
+        Ok(()) => status(StatusCode::Ok, ""),
+        Err(error) => bridge_error(error),
+    }
+}
+
+pub fn d3d9_query_type(device: &D3d9Device, handle: u32) -> ValueResult {
+    match device.queries.query_type(handle) {
+        Ok(kind) => ValueResult {
+            status: status(StatusCode::Ok, ""),
+            value: kind,
+        },
+        Err(error) => ValueResult {
+            status: bridge_error(error),
+            value: 0,
+        },
+    }
+}
+
+pub fn d3d9_query_data_size(kind: u32) -> ValueResult {
+    match crate::d3d9::query::D3d9Queries::data_size(kind) {
+        Ok(size) => ValueResult {
+            status: status(StatusCode::Ok, ""),
+            value: size,
+        },
+        Err(error) => ValueResult {
+            status: bridge_error(error),
+            value: 0,
+        },
+    }
+}
+
+pub fn d3d9_query_issue(device: &mut D3d9Device, handle: u32, flags: u32) -> Status {
+    if flags != 1 && flags != 2 {
+        return status(
+            StatusCode::InvalidArgument,
+            "D3DISSUE requires exactly one of BEGIN or END",
+        );
+    }
+    let gpu = match device_gpu(device) {
+        Ok(gpu) => gpu,
+        Err(status) => return status,
+    };
+    let begin = flags == 2;
+    match device.queries.issue(&gpu, handle, begin) {
+        Ok(()) => status(StatusCode::Ok, ""),
+        Err(error) => bridge_error(error),
+    }
+}
+
+pub fn d3d9_query_get_data(
+    device: &mut D3d9Device,
+    handle: u32,
+    data: &mut [u8],
+    size: u32,
+    flags: u32,
+) -> ValueResult {
+    if size != 0 && size != 4 {
+        return ValueResult {
+            status: status(
+                StatusCode::InvalidArgument,
+                "query data size must be 0 or 4",
+            ),
+            value: 0,
+        };
+    }
+    if flags & !1 != 0 {
+        return ValueResult {
+            status: status(
+                StatusCode::InvalidArgument,
+                "unknown D3DGETDATA flag for query readback",
+            ),
+            value: 0,
+        };
+    }
+    if size == 4 && data.len() < 4 {
+        return ValueResult {
+            status: status(
+                StatusCode::InvalidArgument,
+                "query output buffer is too small",
+            ),
+            value: 0,
+        };
+    }
+    let gpu = match device_gpu(device) {
+        Ok(gpu) => gpu,
+        Err(status) => {
+            return ValueResult { status, value: 0 };
+        }
+    };
+    match device.queries.get_data(&gpu, handle, flags & 1 != 0) {
+        Ok(crate::d3d9::query::QueryPoll::Ready(value)) => {
+            if size == 4 {
+                data[..4].copy_from_slice(&value.to_le_bytes());
+            }
+            ValueResult {
+                status: status(StatusCode::Ok, ""),
+                value: 1,
+            }
+        }
+        Ok(crate::d3d9::query::QueryPoll::Pending) => ValueResult {
+            status: status(StatusCode::Ok, ""),
+            value: 0,
+        },
+        Err(error) => ValueResult {
+            status: bridge_error(error),
+            value: 0,
+        },
     }
 }

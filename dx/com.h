@@ -506,6 +506,7 @@ struct ComObj {
     bool d3d9_implicit = false;
     bool d3d9_target_depth = false;
     uint32_t d3d9_state_handle = 0;
+    uint32_t d3d9_query = 0;
 
     std::shared_ptr<D3dHostDevice> d3d8_device;
     std::shared_ptr<D3dHostResource> d3d8_resource;

@@ -1714,6 +1714,29 @@ impl D3d9State {
     pub fn has_live_state_blocks(&self) -> bool {
         !self.blocks.is_empty() || self.recording.is_some()
     }
+
+    pub fn clear_up_stream(&mut self) {
+        self.streams[0] = StreamSource::default();
+    }
+
+    pub fn clear_up_indexed(&mut self) {
+        self.streams[0] = StreamSource::default();
+        self.indices = 0;
+    }
+
+    pub fn reset_viewport(&mut self) {
+        self.viewport = None;
+    }
+
+    pub fn enabled_lights(&self) -> Vec<[u32; 26]> {
+        let mut out = Vec::new();
+        for (&index, light) in &self.lights {
+            if self.light_enabled.get(&index).copied().unwrap_or(false) {
+                out.push(*light);
+            }
+        }
+        out
+    }
 }
 
 fn transform_index(state: u32) -> Option<u32> {

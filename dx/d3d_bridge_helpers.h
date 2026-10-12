@@ -25,6 +25,95 @@ struct D3d9HostDevice {
     void unregister_resource(uint32_t id) {
         recomp::d3d::d3d9_unregister_resource(*value, id);
     }
+    recomp::d3d::Status register_resource_view(uint32_t id, const D3d9HostResource &resource,
+                                               uint32_t face, uint32_t level, bool volume);
+    recomp::d3d::Status register_implicit_targets(uint32_t backbuffer, uint32_t depth) {
+        return recomp::d3d::d3d9_register_implicit_targets(*value, backbuffer, depth);
+    }
+    recomp::d3d::Status begin_scene() {
+        return recomp::d3d::d3d9_begin_scene(*value);
+    }
+    recomp::d3d::Status end_scene() {
+        return recomp::d3d::d3d9_end_scene(*value);
+    }
+    recomp::d3d::Status set_render_target(uint32_t index, uint32_t id, uint32_t face,
+                                          uint32_t level, bool volume) {
+        return recomp::d3d::d3d9_set_render_target(*value, index, id, face, level, volume);
+    }
+    recomp::d3d::Status set_depth_stencil(uint32_t id, uint32_t face, uint32_t level, bool volume) {
+        return recomp::d3d::d3d9_set_depth_stencil(*value, id, face, level, volume);
+    }
+    recomp::d3d::ValueResult render_target() const {
+        return recomp::d3d::d3d9_get_render_target(*value);
+    }
+    recomp::d3d::ValueResult depth_stencil() const {
+        return recomp::d3d::d3d9_get_depth_stencil(*value);
+    }
+    recomp::d3d::Status clear(uint32_t flags, uint32_t color, float z, uint32_t stencil,
+                              rust::Slice<const recomp::d3d::D3d9Rect> rects) {
+        return recomp::d3d::d3d9_clear(*value, flags, color, z, stencil, rects);
+    }
+    recomp::d3d::Status draw_primitive(uint32_t primitive, uint32_t start_vertex,
+                                       uint32_t primitive_count) {
+        return recomp::d3d::d3d9_draw_primitive(*value, primitive, start_vertex, primitive_count);
+    }
+    recomp::d3d::Status draw_indexed_primitive(uint32_t primitive, int32_t base_vertex,
+                                               uint32_t min_index, uint32_t num_vertices,
+                                               uint32_t start_index, uint32_t primitive_count) {
+        return recomp::d3d::d3d9_draw_indexed_primitive(*value, primitive, base_vertex, min_index,
+                                                        num_vertices, start_index, primitive_count);
+    }
+    recomp::d3d::Status draw_primitive_up(uint32_t primitive, uint32_t primitive_count,
+                                          rust::Slice<const uint8_t> vertices, uint32_t stride) {
+        return recomp::d3d::d3d9_draw_primitive_up(*value, primitive, primitive_count, vertices,
+                                                   stride);
+    }
+    recomp::d3d::Status draw_indexed_primitive_up(uint32_t primitive, uint32_t min_vertex,
+                                                  uint32_t num_vertices, uint32_t primitive_count,
+                                                  rust::Slice<const uint8_t> indices,
+                                                  uint32_t index_format,
+                                                  rust::Slice<const uint8_t> vertices,
+                                                  uint32_t stride) {
+        return recomp::d3d::d3d9_draw_indexed_primitive_up(*value, primitive, min_vertex,
+                                                           num_vertices, primitive_count, indices,
+                                                           index_format, vertices, stride);
+    }
+    recomp::d3d::Status
+    stretch_rect(uint32_t src, rust::Slice<const recomp::d3d::D3d9Rect> src_rect, uint32_t dst,
+                 rust::Slice<const recomp::d3d::D3d9Rect> dst_rect, uint32_t filter) {
+        return recomp::d3d::d3d9_stretch_rect(*value, src, src_rect, dst, dst_rect, filter);
+    }
+    recomp::d3d::Status update_surface(D3d9HostResource &source, uint32_t src_face,
+                                       uint32_t src_level,
+                                       rust::Slice<const recomp::d3d::D3d9Rect> src_rect,
+                                       D3d9HostResource &destination, uint32_t dst_face,
+                                       uint32_t dst_level, int32_t dst_x, int32_t dst_y);
+    recomp::d3d::Status update_texture(D3d9HostResource &source, D3d9HostResource &destination);
+    recomp::d3d::Status get_render_target_data(uint32_t src, D3d9HostResource &destination,
+                                               uint32_t dst_face, uint32_t dst_level);
+    recomp::d3d::Status color_fill(uint32_t dst, rust::Slice<const recomp::d3d::D3d9Rect> rect,
+                                   uint32_t color) {
+        return recomp::d3d::d3d9_color_fill(*value, dst, rect, color);
+    }
+    recomp::d3d::ValueResult create_query(uint32_t kind) {
+        return recomp::d3d::d3d9_create_query(*value, kind);
+    }
+    recomp::d3d::Status destroy_query(uint32_t handle) {
+        return recomp::d3d::d3d9_destroy_query(*value, handle);
+    }
+    recomp::d3d::ValueResult query_type(uint32_t handle) const {
+        return recomp::d3d::d3d9_query_type(*value, handle);
+    }
+    recomp::d3d::ValueResult query_data_size(uint32_t kind) const {
+        return recomp::d3d::d3d9_query_data_size(kind);
+    }
+    recomp::d3d::Status query_issue(uint32_t handle, uint32_t flags) {
+        return recomp::d3d::d3d9_query_issue(*value, handle, flags);
+    }
+    recomp::d3d::ValueResult query_get_data(uint32_t handle, rust::Slice<uint8_t> data,
+                                            uint32_t size, uint32_t flags) {
+        return recomp::d3d::d3d9_query_get_data(*value, handle, data, size, flags);
+    }
     recomp::d3d::D3d9ResetResult reset(const recomp::d3d::D3d9ResetRequest &request) {
         return recomp::d3d::d3d9_reset(*value, request);
     }
@@ -408,6 +497,36 @@ D3d9HostDevice::prepare_resource_reset(uint32_t id, const D3d9HostResource &reso
 
 inline void D3d9HostDevice::commit_resource_reset(uint32_t id, D3d9HostResource &resource) {
     recomp::d3d::d3d9_commit_resource_reset(*value, id, *resource.value);
+}
+
+inline recomp::d3d::Status D3d9HostDevice::register_resource_view(uint32_t id,
+                                                                  const D3d9HostResource &resource,
+                                                                  uint32_t face, uint32_t level,
+                                                                  bool volume) {
+    return recomp::d3d::d3d9_register_resource_view(*value, id, *resource.value, face, level,
+                                                    volume);
+}
+
+inline recomp::d3d::Status
+D3d9HostDevice::update_surface(D3d9HostResource &source, uint32_t src_face, uint32_t src_level,
+                               rust::Slice<const recomp::d3d::D3d9Rect> src_rect,
+                               D3d9HostResource &destination, uint32_t dst_face, uint32_t dst_level,
+                               int32_t dst_x, int32_t dst_y) {
+    return recomp::d3d::d3d9_update_surface(*value, *source.value, src_face, src_level, src_rect,
+                                            *destination.value, dst_face, dst_level, dst_x, dst_y);
+}
+
+inline recomp::d3d::Status D3d9HostDevice::update_texture(D3d9HostResource &source,
+                                                          D3d9HostResource &destination) {
+    return recomp::d3d::d3d9_update_texture(*value, *source.value, *destination.value);
+}
+
+inline recomp::d3d::Status D3d9HostDevice::get_render_target_data(uint32_t src,
+                                                                  D3d9HostResource &destination,
+                                                                  uint32_t dst_face,
+                                                                  uint32_t dst_level) {
+    return recomp::d3d::d3d9_get_render_target_data(*value, src, *destination.value, dst_face,
+                                                    dst_level);
 }
 
 struct D3dHostStorage {

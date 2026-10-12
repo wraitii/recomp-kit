@@ -462,6 +462,14 @@ pub mod ffi {
         bottom: i32,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct D3d9Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
     #[derive(Clone, Copy)]
     struct D3d9LockBox {
         left: u32,
@@ -780,6 +788,129 @@ pub mod ffi {
         fn d3d9_readback_buffer(resource: &mut D3d9Resource) -> Status;
         fn d3d9_upload_level(resource: &mut D3d9Resource, face: u32, level: u32) -> Status;
         fn d3d9_readback_level(resource: &mut D3d9Resource, face: u32, level: u32) -> Status;
+        fn d3d9_register_resource_view(
+            device: &mut D3d9Device,
+            id: u32,
+            resource: &D3d9Resource,
+            face: u32,
+            level: u32,
+            volume: bool,
+        ) -> Status;
+        fn d3d9_register_implicit_targets(
+            device: &mut D3d9Device,
+            backbuffer: u32,
+            depth: u32,
+        ) -> Status;
+        fn d3d9_begin_scene(device: &mut D3d9Device) -> Status;
+        fn d3d9_end_scene(device: &mut D3d9Device) -> Status;
+        fn d3d9_set_render_target(
+            device: &mut D3d9Device,
+            index: u32,
+            id: u32,
+            face: u32,
+            level: u32,
+            volume: bool,
+        ) -> Status;
+        fn d3d9_set_depth_stencil(
+            device: &mut D3d9Device,
+            id: u32,
+            face: u32,
+            level: u32,
+            volume: bool,
+        ) -> Status;
+        fn d3d9_get_render_target(device: &D3d9Device) -> ValueResult;
+        fn d3d9_get_depth_stencil(device: &D3d9Device) -> ValueResult;
+        fn d3d9_clear(
+            device: &mut D3d9Device,
+            flags: u32,
+            color: u32,
+            z: f32,
+            stencil: u32,
+            rects: &[D3d9Rect],
+        ) -> Status;
+        fn d3d9_draw_primitive(
+            device: &mut D3d9Device,
+            primitive: u32,
+            start_vertex: u32,
+            primitive_count: u32,
+        ) -> Status;
+        fn d3d9_draw_indexed_primitive(
+            device: &mut D3d9Device,
+            primitive: u32,
+            base_vertex: i32,
+            min_index: u32,
+            num_vertices: u32,
+            start_index: u32,
+            primitive_count: u32,
+        ) -> Status;
+        fn d3d9_draw_primitive_up(
+            device: &mut D3d9Device,
+            primitive: u32,
+            primitive_count: u32,
+            vertices: &[u8],
+            stride: u32,
+        ) -> Status;
+        fn d3d9_draw_indexed_primitive_up(
+            device: &mut D3d9Device,
+            primitive: u32,
+            min_vertex: u32,
+            num_vertices: u32,
+            primitive_count: u32,
+            indices: &[u8],
+            index_format: u32,
+            vertices: &[u8],
+            stride: u32,
+        ) -> Status;
+        fn d3d9_stretch_rect(
+            device: &mut D3d9Device,
+            src: u32,
+            src_rect: &[D3d9Rect],
+            dst: u32,
+            dst_rect: &[D3d9Rect],
+            filter: u32,
+        ) -> Status;
+        fn d3d9_update_surface(
+            device: &mut D3d9Device,
+            source: &mut D3d9Resource,
+            src_face: u32,
+            src_level: u32,
+            src_rect: &[D3d9Rect],
+            destination: &mut D3d9Resource,
+            dst_face: u32,
+            dst_level: u32,
+            dst_x: i32,
+            dst_y: i32,
+        ) -> Status;
+        fn d3d9_update_texture(
+            device: &mut D3d9Device,
+            source: &mut D3d9Resource,
+            destination: &mut D3d9Resource,
+        ) -> Status;
+        fn d3d9_get_render_target_data(
+            device: &mut D3d9Device,
+            src: u32,
+            destination: &mut D3d9Resource,
+            dst_face: u32,
+            dst_level: u32,
+        ) -> Status;
+        fn d3d9_color_fill(
+            device: &mut D3d9Device,
+            dst: u32,
+            rect: &[D3d9Rect],
+            color: u32,
+        ) -> Status;
+        fn d3d9_create_query(device: &mut D3d9Device, kind: u32) -> ValueResult;
+        fn d3d9_destroy_query(device: &mut D3d9Device, handle: u32) -> Status;
+        fn d3d9_query_type(device: &D3d9Device, handle: u32) -> ValueResult;
+        fn d3d9_query_data_size(kind: u32) -> ValueResult;
+        fn d3d9_query_issue(device: &mut D3d9Device, handle: u32, flags: u32) -> Status;
+        fn d3d9_query_get_data(
+            device: &mut D3d9Device,
+            handle: u32,
+            data: &mut [u8],
+            size: u32,
+            flags: u32,
+        ) -> ValueResult;
         fn d3d9_register_resource(
             device: &mut D3d9Device,
             id: u32,
@@ -1252,6 +1383,15 @@ use crate::d3d9::{
     d3d9_unregister_resource, d3d9_upload_buffer, d3d9_upload_level, new_d3d9_device,
     new_d3d9_resource,
 };
+use crate::d3d9::{
+    d3d9_begin_scene, d3d9_clear, d3d9_color_fill, d3d9_create_query, d3d9_destroy_query,
+    d3d9_draw_indexed_primitive, d3d9_draw_indexed_primitive_up, d3d9_draw_primitive,
+    d3d9_draw_primitive_up, d3d9_end_scene, d3d9_get_depth_stencil, d3d9_get_render_target,
+    d3d9_get_render_target_data, d3d9_query_data_size, d3d9_query_get_data, d3d9_query_issue,
+    d3d9_query_type, d3d9_register_implicit_targets, d3d9_register_resource_view,
+    d3d9_set_depth_stencil, d3d9_set_render_target, d3d9_stretch_rect, d3d9_update_surface,
+    d3d9_update_texture,
+};
 use crate::{
     RenderError, RenderErrorKind, backend::GpuContext, d3d8::device::Device as RenderDevice,
 };
@@ -1268,7 +1408,7 @@ pub use ffi::{
     D3d9CreateResult, D3d9CreationParameters, D3d9CreationParametersResult, D3d9DeclarationResult,
     D3d9DeviceRequest, D3d9DisplayModeRequest, D3d9DisplayModeResult, D3d9FrameResult,
     D3d9LevelDescriptor, D3d9LevelDescriptorResult, D3d9LevelLockRequest, D3d9LevelLockResult,
-    D3d9LightResult, D3d9LockBox, D3d9LockRect, D3d9PresentParams, D3d9PrivateDataResult,
+    D3d9LightResult, D3d9LockBox, D3d9LockRect, D3d9PresentParams, D3d9PrivateDataResult, D3d9Rect,
     D3d9ResetRequest, D3d9ResetResult, D3d9ScissorResult, D3d9StreamResult, D3d9SurfaceDescriptor,
     D3d9SurfaceDescriptorResult, D3d9SurfaceRequest, D3d9TextureCreateResult,
     D3d9TextureDescriptor, D3d9TextureDescriptorResult, D3d9TextureKind, D3d9TextureRequest,

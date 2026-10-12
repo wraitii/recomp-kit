@@ -1,6 +1,9 @@
+use super::TargetRect;
 use super::format;
 use super::gpu::D3d9Gpu;
 use crate::RenderError;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 pub const D3DPOOL_DEFAULT: u32 = 0;
 pub const D3DPOOL_MANAGED: u32 = 1;
@@ -139,12 +142,12 @@ struct LevelState {
     width: u32,
     height: u32,
     depth: u32,
-    lock_count: u32,
+    lock_count: Arc<AtomicU32>,
     writable: Vec<Region>,
     dirty: bool,
     dirty_lo: u32,
     dirty_hi: u32,
-    gpu_newer: bool,
+    gpu_newer: Arc<AtomicBool>,
     generation: u64,
     gpu_generation: u64,
     writable_dirty: bool,
@@ -157,12 +160,12 @@ impl LevelState {
             width,
             height,
             depth,
-            lock_count: 0,
+            lock_count: Arc::new(AtomicU32::new(0)),
             writable: Vec::new(),
             dirty: false,
             dirty_lo: 0,
             dirty_hi: 0,
-            gpu_newer: false,
+            gpu_newer: Arc::new(AtomicBool::new(false)),
             generation: 0,
             gpu_generation: 0,
             writable_dirty: false,
@@ -195,7 +198,7 @@ pub struct BufferState {
     pub fvf: u32,
     pub format: u32,
     pub bytes: Vec<u8>,
-    pub lock_count: u32,
+    pub lock_count: Arc<AtomicU32>,
     pub writable: Vec<(u32, u32)>,
     pub writable_dirty: bool,
     pub dirty_lo: u32,
@@ -253,8 +256,9 @@ pub struct D3d9Resource {
     pub(crate) gpu: Option<D3d9Gpu>,
     pub state: Option<ResourceState>,
     pub priority: u32,
-    pub lod: u32,
+    pub lod: Arc<AtomicU32>,
     pub private: Vec<PrivateData>,
+    pub gpu_newer: Arc<AtomicBool>,
 }
 
 impl Default for D3d9Resource {
@@ -263,13 +267,30 @@ impl Default for D3d9Resource {
             gpu: None,
             state: None,
             priority: 0,
-            lod: 0,
+            lod: Arc::new(AtomicU32::new(0)),
             private: Vec::new(),
+            gpu_newer: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
 impl D3d9Resource {
+    pub fn lock_handles(&self) -> Vec<Arc<AtomicU32>> {
+        match self.state.as_ref() {
+            Some(ResourceState::Buffer(b)) => vec![Arc::clone(&b.lock_count)],
+            Some(ResourceState::Surface(s)) => vec![Arc::clone(&s.level.lock_count)],
+            Some(ResourceState::Texture(t)) => t
+                .subresources
+                .iter()
+                .map(|l| Arc::clone(&l.lock_count))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+    pub fn level_lock_handle(&self, face: u32, level: u32) -> Result<Arc<AtomicU32>, RenderError> {
+        self.level(face, level).map(|l| Arc::clone(&l.lock_count))
+    }
+
     pub fn initialized(&self) -> bool {
         self.state.is_some()
     }
@@ -320,6 +341,62 @@ impl D3d9Resource {
         match self.state.as_ref()? {
             ResourceState::Texture(t) => t.gpu.as_ref(),
             ResourceState::Surface(s) => s.gpu.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn freshness(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.gpu_newer)
+    }
+
+    pub fn level_freshness(&self, face: u32, level: u32) -> Option<Arc<AtomicBool>> {
+        match self.state.as_ref()? {
+            ResourceState::Surface(s) => Some(Arc::clone(&s.level.gpu_newer)),
+            ResourceState::Texture(t) => texture_index(t.kind, face, level, t.levels)
+                .and_then(|index| t.subresources.get(index))
+                .map(|l| Arc::clone(&l.gpu_newer)),
+            _ => None,
+        }
+    }
+
+    pub fn gpu_newer(&self) -> bool {
+        self.gpu_newer.load(Ordering::Acquire)
+    }
+
+    pub fn clear_gpu_newer(&self) {
+        self.gpu_newer.store(false, Ordering::Release);
+    }
+
+    pub fn mark_gpu_newer(&self) {
+        self.gpu_newer.store(true, Ordering::Release);
+    }
+
+    pub fn buffer_gpu(&self) -> Option<(wgpu::Buffer, u32, u32, u32, u64)> {
+        match self.state.as_ref()? {
+            ResourceState::Buffer(b) => b
+                .gpu
+                .as_ref()
+                .map(|gpu| (gpu.clone(), b.size, b.format, b.fvf, b.usage as u64)),
+            _ => None,
+        }
+    }
+
+    pub fn texture_gpu(&self) -> Option<(wgpu::Texture, TextureKind, u32, u32, u32, u32)> {
+        match self.state.as_ref()? {
+            ResourceState::Texture(t) => t
+                .gpu
+                .as_ref()
+                .map(|gpu| (gpu.clone(), t.kind, t.format, t.width, t.height, t.levels)),
+            _ => None,
+        }
+    }
+
+    pub fn surface_gpu(&self) -> Option<(wgpu::Texture, u32, u32, u32, bool)> {
+        match self.state.as_ref()? {
+            ResourceState::Surface(s) => s
+                .gpu
+                .as_ref()
+                .map(|gpu| (gpu.clone(), s.format, s.width, s.height, s.depth)),
             _ => None,
         }
     }
@@ -400,8 +477,9 @@ impl D3d9Resource {
         if !self.is_managed() || !matches!(self.state, Some(ResourceState::Texture(_))) {
             return 0;
         }
-        let old = self.lod;
-        self.lod = lod.min(self.max_lod_level());
+        let old = self
+            .lod
+            .swap(lod.min(self.max_lod_level()), Ordering::AcqRel);
         old
     }
 
@@ -755,7 +833,7 @@ pub fn create_buffer(
         fvf: request.fvf,
         format: request.format,
         bytes,
-        lock_count: 0,
+        lock_count: Arc::new(AtomicU32::new(0)),
         writable: Vec::new(),
         writable_dirty: false,
         dirty_lo: 0,
@@ -1185,7 +1263,7 @@ pub fn upload_buffer(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(), R
     let Some(ResourceState::Buffer(b)) = resource.state.as_mut() else {
         return Err(invalid("PreLoad", "resource is not a buffer"));
     };
-    if b.lock_count != 0 {
+    if b.lock_count.load(Ordering::Acquire) != 0 {
         return Err(invalid("PreLoad", "buffer is locked"));
     }
     let Some(buffer) = b.gpu.as_ref() else {
@@ -1203,6 +1281,7 @@ pub fn upload_buffer(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(), R
     b.dirty_lo = 0;
     b.dirty_hi = 0;
     b.gpu_generation = b.generation;
+    resource.clear_gpu_newer();
     Ok(())
 }
 
@@ -1217,6 +1296,7 @@ pub fn readback_buffer(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(),
     gpu.read_buffer(buffer, b.bytes.len() as u32, &mut out)?;
     b.bytes = out;
     b.gpu_generation = b.generation;
+    resource.clear_gpu_newer();
     Ok(())
 }
 
@@ -1238,6 +1318,7 @@ pub fn mark_buffer_gpu_written(resource: &mut D3d9Resource) -> Result<(), Render
     match resource.state.as_mut() {
         Some(ResourceState::Buffer(b)) => {
             b.gpu_generation = b.generation.wrapping_add(1);
+            resource.gpu_newer.store(true, Ordering::Release);
             Ok(())
         }
         _ => Err(invalid("D3D9", "resource is not a buffer")),
@@ -1268,7 +1349,7 @@ pub fn upload_level(
         let ResourceState::Surface(s) = resource.state.as_mut().expect("surface state") else {
             unreachable!()
         };
-        if s.level.lock_count != 0 {
+        if s.level.lock_count.load(Ordering::Acquire) != 0 {
             return Err(invalid("PreLoad", "surface is locked"));
         }
         let Some(texture) = s.gpu.as_ref() else {
@@ -1288,6 +1369,7 @@ pub fn upload_level(
             }
             s.level.dirty = false;
             s.level.gpu_generation = s.level.generation;
+            s.level.gpu_newer.store(false, Ordering::Release);
         }
         return Ok(());
     }
@@ -1296,7 +1378,7 @@ pub fn upload_level(
     };
     let index = texture_index(t.kind, face, level, t.levels)
         .ok_or_else(|| invalid("PreLoad", "texture subresource out of range"))?;
-    if t.subresources[index].lock_count != 0 {
+    if t.subresources[index].lock_count.load(Ordering::Acquire) != 0 {
         return Err(invalid("PreLoad", "texture is locked"));
     }
     let Some(texture) = t.gpu.as_ref() else {
@@ -1327,6 +1409,7 @@ pub fn upload_level(
         let l = &mut t.subresources[index];
         l.dirty = false;
         l.gpu_generation = l.generation;
+        l.gpu_newer.store(false, Ordering::Release);
     }
     Ok(())
 }
@@ -1349,7 +1432,7 @@ pub fn generate_mips(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(), R
         if !t.subresources[index].dirty {
             continue;
         }
-        if t.subresources[index].lock_count != 0 {
+        if t.subresources[index].lock_count.load(Ordering::Acquire) != 0 {
             return Err(invalid("GenerateMipSubLevels", "texture is locked"));
         }
         let (width, height, depth) = {
@@ -1399,7 +1482,7 @@ pub fn generate_mips(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(), R
         linear,
     )?;
     for l in t.subresources.iter_mut() {
-        if l.lock_count == 0 {
+        if l.lock_count.load(Ordering::Acquire) == 0 {
             l.dirty = false;
             l.gpu_generation = l.generation;
         }
@@ -1503,7 +1586,7 @@ fn stage_texture(gpu: &D3d9Gpu, t: &TextureState) -> Result<StagedStorage, Rende
         return Ok(StagedStorage::default());
     }
     for level in &t.subresources {
-        if level.gpu_newer {
+        if level.gpu_newer.load(Ordering::Acquire) {
             return Err(unsupported(
                 "Reset",
                 "texture has GPU-only contents that cannot be recovered",
@@ -1548,7 +1631,7 @@ fn stage_surface(gpu: &D3d9Gpu, s: &SurfaceState) -> Result<StagedStorage, Rende
     if !has_gpu_storage(s.pool) {
         return Ok(StagedStorage::default());
     }
-    if s.level.gpu_newer {
+    if s.level.gpu_newer.load(Ordering::Acquire) {
         return Err(unsupported(
             "Reset",
             "surface has GPU-only contents that cannot be recovered",
@@ -1627,7 +1710,7 @@ pub fn readback_level_explicit(
             texture, s.format, 0, s.width, s.height, 1, 0, false, &mut raw,
         )?;
         s.level.bytes = format::readback_bytes(s.format, s.width, s.height, 1, &raw)?;
-        s.level.gpu_newer = false;
+        s.level.gpu_newer.store(false, Ordering::Release);
         return Ok(());
     }
     let Some(ResourceState::Texture(t)) = resource.state.as_mut() else {
@@ -1651,7 +1734,9 @@ pub fn readback_level_explicit(
         texture, format, level, width, height, depth, layer, is_3d, &mut raw,
     )?;
     t.subresources[index].bytes = format::readback_bytes(format, width, height, depth, &raw)?;
-    t.subresources[index].gpu_newer = false;
+    t.subresources[index]
+        .gpu_newer
+        .store(false, Ordering::Release);
     Ok(())
 }
 
@@ -1662,10 +1747,10 @@ pub fn readback_level(
     level: u32,
 ) -> Result<(), RenderError> {
     let gpu_newer = match resource.state.as_ref() {
-        Some(ResourceState::Surface(s)) => s.level.gpu_newer,
+        Some(ResourceState::Surface(s)) => s.level.gpu_newer.load(Ordering::Acquire),
         Some(ResourceState::Texture(t)) => texture_index(t.kind, face, level, t.levels)
             .and_then(|index| t.subresources.get(index))
-            .map(|l| l.gpu_newer)
+            .map(|l| l.gpu_newer.load(Ordering::Acquire))
             .unwrap_or(false),
         _ => false,
     };
@@ -1685,13 +1770,15 @@ pub fn mark_gpu_written(
             if face != 0 || level != 0 {
                 return Err(invalid("D3D9", "surface has one subresource"));
             }
-            s.level.gpu_newer = true;
+            s.level.gpu_newer.store(true, Ordering::Release);
             Ok(())
         }
         Some(ResourceState::Texture(t)) => {
             let index = texture_index(t.kind, face, level, t.levels)
                 .ok_or_else(|| invalid("D3D9", "texture subresource out of range"))?;
-            t.subresources[index].gpu_newer = true;
+            t.subresources[index]
+                .gpu_newer
+                .store(true, Ordering::Release);
             Ok(())
         }
         _ => Err(invalid("D3D9", "resource is not a texture")),
@@ -1976,7 +2063,7 @@ fn resolve_level_lock(
     }
     validate_lock_flags(resource, request.flags)?;
     let level = resource.level(request.face, request.level)?;
-    if level.lock_count != 0 {
+    if level.lock_count.load(Ordering::Acquire) != 0 {
         return Err(invalid("LockRect", "the subresource is already locked"));
     }
     let format = resource_format(resource);
@@ -2002,10 +2089,10 @@ pub fn validate_level_lock(
 
 pub fn lock_would_block(resource: &D3d9Resource, face: u32, level: u32) -> bool {
     match resource.state.as_ref() {
-        Some(ResourceState::Surface(s)) => s.level.gpu_newer,
+        Some(ResourceState::Surface(s)) => s.level.gpu_newer.load(Ordering::Acquire),
         Some(ResourceState::Texture(t)) => texture_index(t.kind, face, level, t.levels)
             .and_then(|index| t.subresources.get(index))
-            .map(|l| l.gpu_newer)
+            .map(|l| l.gpu_newer.load(Ordering::Acquire))
             .unwrap_or(false),
         _ => false,
     }
@@ -2038,7 +2125,7 @@ pub fn level_lock_commit(
     if writable && level.writable.try_reserve(1).is_err() {
         return Err(oom("LockRect", "lock record allocation failed"));
     }
-    level.lock_count = 1;
+    level.lock_count.store(1, Ordering::Release);
     if writable {
         if request.flags & D3DLOCK_NO_DIRTY_UPDATE == 0 {
             level.writable_dirty = true;
@@ -2122,7 +2209,7 @@ pub fn level_unlock(
     let format = resource_format(resource);
     let managed = resource.is_managed();
     let l = resource.level_mut(face, level)?;
-    if l.lock_count == 0 {
+    if l.lock_count.load(Ordering::Acquire) == 0 {
         return Err(invalid("UnlockRect", "resource is not locked"));
     }
     if bytes.len() != l.bytes.len() {
@@ -2134,7 +2221,7 @@ pub fn level_unlock(
     let regions = core::mem::take(&mut l.writable);
     let dirty = l.writable_dirty;
     l.writable_dirty = false;
-    l.lock_count = 0;
+    l.lock_count.store(0, Ordering::Release);
     if !regions.is_empty() {
         for region in regions {
             apply_region(l, bytes, format, region);
@@ -2265,4 +2352,484 @@ pub fn autogen_capable(resource: &D3d9Resource) -> bool {
         Some(ResourceState::Texture(t)) => t.autogen && t.gpu_levels > 1,
         _ => false,
     }
+}
+
+fn fit_transfer_rect(
+    rect: Option<TargetRect>,
+    width: u32,
+    height: u32,
+    op: &'static str,
+) -> Result<(u32, u32, u32, u32), RenderError> {
+    let (left, top, right, bottom) = match rect {
+        Some(rect) => (
+            rect.left as i64,
+            rect.top as i64,
+            rect.right as i64,
+            rect.bottom as i64,
+        ),
+        None => (0, 0, width as i64, height as i64),
+    };
+    if left < 0
+        || top < 0
+        || right <= left
+        || bottom <= top
+        || right > width as i64
+        || bottom > height as i64
+    {
+        return Err(invalid(op, "rectangle is outside the surface"));
+    }
+    Ok((left as u32, top as u32, right as u32, bottom as u32))
+}
+
+fn validate_block_transfer(
+    format: u32,
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+    width: u32,
+    height: u32,
+    op: &'static str,
+) -> Result<(), RenderError> {
+    if !format::is_block(format) {
+        return Ok(());
+    }
+    if left % 4 != 0 || top % 4 != 0 {
+        return Err(invalid(
+            op,
+            "compressed transfer must start on a block boundary",
+        ));
+    }
+    if right % 4 != 0 && right != width {
+        return Err(invalid(
+            op,
+            "compressed transfer right edge must be block aligned",
+        ));
+    }
+    if bottom % 4 != 0 && bottom != height {
+        return Err(invalid(
+            op,
+            "compressed transfer bottom edge must be block aligned",
+        ));
+    }
+    Ok(())
+}
+
+fn copy_checked(
+    destination: &mut LevelState,
+    source: &[u8],
+    dst_at: usize,
+    src_at: usize,
+    len: usize,
+    op: &'static str,
+) -> Result<(), RenderError> {
+    let dst_end = dst_at
+        .checked_add(len)
+        .ok_or_else(|| invalid(op, "copy range overflow"))?;
+    let src_end = src_at
+        .checked_add(len)
+        .ok_or_else(|| invalid(op, "copy range overflow"))?;
+    if dst_end > destination.bytes.len() || src_end > source.len() {
+        return Err(invalid(op, "copy range is outside the subresource"));
+    }
+    destination.bytes[dst_at..dst_end].copy_from_slice(&source[src_at..src_end]);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_packed_region(
+    destination: &mut LevelState,
+    source: &[u8],
+    source_width: u32,
+    format: u32,
+    src_left: u32,
+    src_top: u32,
+    src_right: u32,
+    src_bottom: u32,
+    dst_left: u32,
+    dst_top: u32,
+    op: &'static str,
+) -> Result<(), RenderError> {
+    let src_pitch = format::row_pitch(format, source_width)
+        .ok_or_else(|| invalid(op, "invalid source pitch"))? as usize;
+    let dst_pitch = format::row_pitch(format, destination.width)
+        .ok_or_else(|| invalid(op, "invalid destination pitch"))? as usize;
+    if format::is_block(format) {
+        let block = format::block_bytes(format) as usize;
+        let rows = (format::block_rows(src_bottom) - src_top / 4) as usize;
+        let cols = (src_right.div_ceil(4) - src_left / 4) as usize;
+        for row in 0..rows {
+            let src_at = (src_top as usize / 4 + row) * src_pitch + (src_left as usize / 4) * block;
+            let dst_at = (dst_top as usize / 4 + row) * dst_pitch + (dst_left as usize / 4) * block;
+            copy_checked(destination, source, dst_at, src_at, cols * block, op)?;
+        }
+    } else {
+        let bpp = format::bpp(format) as usize;
+        let rows = (src_bottom - src_top) as usize;
+        let row_bytes = (src_right - src_left) as usize * bpp;
+        for row in 0..rows {
+            let src_at = (src_top as usize + row) * src_pitch + src_left as usize * bpp;
+            let dst_at = (dst_top as usize + row) * dst_pitch + dst_left as usize * bpp;
+            copy_checked(destination, source, dst_at, src_at, row_bytes, op)?;
+        }
+    }
+    Ok(())
+}
+
+fn level_lock_count(resource: &D3d9Resource, face: u32, level: u32) -> Result<u32, RenderError> {
+    Ok(resource
+        .level(face, level)?
+        .lock_count
+        .load(Ordering::Acquire))
+}
+
+fn level_multisample(resource: &D3d9Resource) -> u32 {
+    match resource.state.as_ref() {
+        Some(ResourceState::Surface(s)) => s.multisample_type,
+        _ => 0,
+    }
+}
+
+fn texture_transfer_meta(
+    resource: &D3d9Resource,
+    op: &'static str,
+) -> Result<(TextureKind, u32, u32, u32, bool), RenderError> {
+    match resource.state.as_ref() {
+        Some(ResourceState::Texture(t)) => Ok((t.kind, t.format, t.levels, t.pool, t.autogen)),
+        _ => Err(invalid(op, "resource is not a texture")),
+    }
+}
+
+pub fn update_surface(
+    gpu: &D3d9Gpu,
+    source: &D3d9Resource,
+    src_face: u32,
+    src_level: u32,
+    src_rect: Option<TargetRect>,
+    destination: &mut D3d9Resource,
+    dst_face: u32,
+    dst_level: u32,
+    dst_point: (i32, i32),
+) -> Result<(), RenderError> {
+    const OP: &str = "UpdateSurface";
+    let src_format = resource_format(source);
+    let dst_format = resource_format(destination);
+    if source.pool() != Some(D3DPOOL_SYSTEMMEM) {
+        return Err(invalid(OP, "source must be a system-memory surface"));
+    }
+    if destination.pool() != Some(D3DPOOL_DEFAULT) {
+        return Err(invalid(OP, "destination must be a default-pool surface"));
+    }
+    if src_format != dst_format {
+        return Err(invalid(OP, "source and destination formats must match"));
+    }
+    if format::is_depth(src_format) {
+        return Err(invalid(OP, "depth/stencil surfaces are not valid operands"));
+    }
+    if level_multisample(source) != 0 || level_multisample(destination) != 0 {
+        return Err(invalid(OP, "multisampled surfaces are not supported"));
+    }
+    if level_lock_count(source, src_face, src_level)? != 0 {
+        return Err(invalid(OP, "source is locked"));
+    }
+    if level_lock_count(destination, dst_face, dst_level)? != 0 {
+        return Err(invalid(OP, "destination is locked"));
+    }
+    let (src_width, src_height, src_depth) = {
+        let level = source.level(src_face, src_level)?;
+        (level.width, level.height, level.depth)
+    };
+    let (dst_width, dst_height, dst_depth) = {
+        let level = destination.level(dst_face, dst_level)?;
+        (level.width, level.height, level.depth)
+    };
+    if src_depth != 1 || dst_depth != 1 {
+        return Err(invalid(OP, "UpdateSurface requires single-slice surfaces"));
+    }
+    let (src_left, src_top, src_right, src_bottom) =
+        fit_transfer_rect(src_rect, src_width, src_height, OP)?;
+    validate_block_transfer(
+        src_format, src_left, src_top, src_right, src_bottom, src_width, src_height, OP,
+    )?;
+    let (dst_x, dst_y) = dst_point;
+    if dst_x < 0 || dst_y < 0 {
+        return Err(invalid(OP, "negative destination point"));
+    }
+    let (dst_x, dst_y) = (dst_x as u32, dst_y as u32);
+    let rect_width = src_right - src_left;
+    let rect_height = src_bottom - src_top;
+    if dst_x
+        .checked_add(rect_width)
+        .is_none_or(|right| right > dst_width)
+        || dst_y
+            .checked_add(rect_height)
+            .is_none_or(|bottom| bottom > dst_height)
+    {
+        return Err(invalid(OP, "destination rectangle is outside the surface"));
+    }
+    validate_block_transfer(
+        src_format,
+        dst_x,
+        dst_y,
+        dst_x + rect_width,
+        dst_y + rect_height,
+        dst_width,
+        dst_height,
+        OP,
+    )?;
+    let full = src_left == 0
+        && src_top == 0
+        && src_right == src_width
+        && src_bottom == src_height
+        && dst_x == 0
+        && dst_y == 0
+        && src_width == dst_width
+        && src_height == dst_height;
+    let gpu_ready = !gpu.is_blocked();
+    if gpu_ready && !full && destination.gpu_texture().is_some() {
+        readback_level(gpu, destination, dst_face, dst_level)?;
+    }
+    {
+        let source_bytes = source.level(src_face, src_level)?.bytes.as_slice();
+        let destination_level = destination.level_mut(dst_face, dst_level)?;
+        copy_packed_region(
+            destination_level,
+            source_bytes,
+            src_width,
+            src_format,
+            src_left,
+            src_top,
+            src_right,
+            src_bottom,
+            dst_x,
+            dst_y,
+            OP,
+        )?;
+        destination_level.generation = destination_level.generation.wrapping_add(1);
+        destination_level.dirty = true;
+        destination_level.dirty_lo = 0;
+        destination_level.dirty_hi = destination_level.bytes.len() as u32;
+        destination_level.gpu_newer.store(false, Ordering::Release);
+    }
+    if gpu_ready {
+        upload_level(gpu, destination, dst_face, dst_level)?;
+    }
+    Ok(())
+}
+
+pub fn update_texture(
+    gpu: &D3d9Gpu,
+    source: &D3d9Resource,
+    destination: &mut D3d9Resource,
+) -> Result<(), RenderError> {
+    const OP: &str = "UpdateTexture";
+    let (src_kind, src_format, src_levels, src_pool, src_autogen) =
+        texture_transfer_meta(source, OP)?;
+    let (dst_kind, dst_format, dst_levels, dst_pool, dst_autogen) =
+        texture_transfer_meta(destination, OP)?;
+    if src_pool != D3DPOOL_SYSTEMMEM {
+        return Err(invalid(OP, "source must be a system-memory texture"));
+    }
+    if dst_pool != D3DPOOL_DEFAULT {
+        return Err(invalid(OP, "destination must be a default-pool texture"));
+    }
+    if src_kind != dst_kind {
+        return Err(invalid(
+            OP,
+            "source and destination texture kinds must match",
+        ));
+    }
+    if src_format != dst_format {
+        return Err(invalid(OP, "source and destination formats must match"));
+    }
+    if format::is_depth(src_format) {
+        return Err(invalid(OP, "depth/stencil textures are not valid operands"));
+    }
+    if dst_levels > src_levels {
+        return Err(invalid(
+            OP,
+            "destination has more mip levels than the source",
+        ));
+    }
+    if src_autogen && !dst_autogen {
+        return Err(invalid(
+            OP,
+            "an autogen source texture requires an autogen destination",
+        ));
+    }
+    let level_offset = if dst_autogen {
+        let dst = destination.level(0, 0)?;
+        (0..src_levels)
+            .find(|&level| {
+                source.level(0, level).is_ok_and(|src| {
+                    src.width == dst.width && src.height == dst.height && src.depth == dst.depth
+                })
+            })
+            .ok_or_else(|| invalid(OP, "source has no matching autogen destination level"))?
+    } else {
+        src_levels - dst_levels
+    };
+    let faces = face_count(src_kind);
+    let copied_levels = if dst_autogen { 1 } else { dst_levels };
+    for face in 0..faces {
+        for level in 0..copied_levels {
+            let src_level = level + level_offset;
+            let src_index = texture_index(src_kind, face, src_level, src_levels)
+                .ok_or_else(|| invalid(OP, "source subresource is missing"))?;
+            let dst_index = texture_index(dst_kind, face, level, dst_levels)
+                .ok_or_else(|| invalid(OP, "destination subresource is missing"))?;
+            let (src_w, src_h, src_d, src_lock, src_len) = {
+                let texture = match source.state.as_ref() {
+                    Some(ResourceState::Texture(t)) => t,
+                    _ => return Err(invalid(OP, "source is not a texture")),
+                };
+                let level = &texture.subresources[src_index];
+                (
+                    level.width,
+                    level.height,
+                    level.depth,
+                    level.lock_count.load(Ordering::Acquire),
+                    level.bytes.len(),
+                )
+            };
+            let (dst_w, dst_h, dst_d, dst_lock, dst_len) = {
+                let texture = match destination.state.as_ref() {
+                    Some(ResourceState::Texture(t)) => t,
+                    _ => return Err(invalid(OP, "destination is not a texture")),
+                };
+                let level = &texture.subresources[dst_index];
+                (
+                    level.width,
+                    level.height,
+                    level.depth,
+                    level.lock_count.load(Ordering::Acquire),
+                    level.bytes.len(),
+                )
+            };
+            if src_w != dst_w || src_h != dst_h || src_d != dst_d {
+                return Err(invalid(
+                    OP,
+                    "source and destination subresource dimensions must match",
+                ));
+            }
+            if src_lock != 0 || dst_lock != 0 {
+                return Err(invalid(
+                    OP,
+                    "textures must not be locked during UpdateTexture",
+                ));
+            }
+            if src_len != dst_len {
+                return Err(invalid(
+                    OP,
+                    "source and destination subresource sizes must match",
+                ));
+            }
+        }
+    }
+    for face in 0..faces {
+        for level in 0..copied_levels {
+            let src_level = level + level_offset;
+            let src_index = texture_index(src_kind, face, src_level, src_levels)
+                .ok_or_else(|| invalid(OP, "source subresource is missing"))?;
+            let dst_index = texture_index(dst_kind, face, level, dst_levels)
+                .ok_or_else(|| invalid(OP, "destination subresource is missing"))?;
+            let source_bytes = match source.state.as_ref() {
+                Some(ResourceState::Texture(t)) => t.subresources[src_index].bytes.as_slice(),
+                _ => return Err(invalid(OP, "source is not a texture")),
+            };
+            let destination_level = match destination.state.as_mut() {
+                Some(ResourceState::Texture(t)) => &mut t.subresources[dst_index],
+                _ => return Err(invalid(OP, "destination is not a texture")),
+            };
+            destination_level.bytes.copy_from_slice(source_bytes);
+            destination_level.generation = destination_level.generation.wrapping_add(1);
+            destination_level.dirty = true;
+            destination_level.dirty_lo = 0;
+            destination_level.dirty_hi = destination_level.bytes.len() as u32;
+            destination_level.gpu_newer.store(false, Ordering::Release);
+        }
+    }
+    if !gpu.is_blocked() {
+        preload(gpu, destination)?;
+    }
+    Ok(())
+}
+
+pub fn store_readback(
+    destination: &mut D3d9Resource,
+    face: u32,
+    level: u32,
+    bytes: &[u8],
+    format: u32,
+    width: u32,
+    height: u32,
+) -> Result<(), RenderError> {
+    const OP: &str = "GetRenderTargetData";
+    if resource_format(destination) != format {
+        return Err(invalid(
+            OP,
+            "destination format does not match the readback",
+        ));
+    }
+    if destination.pool() != Some(D3DPOOL_SYSTEMMEM) {
+        return Err(invalid(OP, "destination must be a system-memory surface"));
+    }
+    if format::is_depth(format) {
+        return Err(invalid(
+            OP,
+            "depth/stencil formats cannot be stored by readback",
+        ));
+    }
+    let multisample = match destination.state.as_ref() {
+        Some(ResourceState::Surface(s)) => s.multisample_type,
+        Some(ResourceState::Texture(_)) => 0,
+        _ => return Err(invalid(OP, "resource is not a texture or surface")),
+    };
+    if multisample != 0 {
+        return Err(invalid(OP, "multisampled destinations are not supported"));
+    }
+    let (dst_width, dst_height, dst_depth, lock_count) = {
+        let level = destination.level(face, level)?;
+        (
+            level.width,
+            level.height,
+            level.depth,
+            level.lock_count.load(Ordering::Acquire),
+        )
+    };
+    if dst_depth != 1 {
+        return Err(invalid(
+            OP,
+            "readback destinations must be single-slice surfaces",
+        ));
+    }
+    if lock_count != 0 {
+        return Err(invalid(OP, "destination is locked"));
+    }
+    if dst_width != width || dst_height != height {
+        return Err(invalid(
+            OP,
+            "destination dimensions do not match the readback",
+        ));
+    }
+    let expected = format::level_size(format, width, height)
+        .ok_or_else(|| invalid(OP, "unsupported destination format"))? as usize;
+    if bytes.len() < expected {
+        return Err(invalid(
+            OP,
+            "readback bytes are shorter than the destination level",
+        ));
+    }
+    let level = destination.level_mut(face, level)?;
+    if level.bytes.len() != expected {
+        return Err(invalid(OP, "destination CPU storage size is inconsistent"));
+    }
+    level.bytes.copy_from_slice(&bytes[..expected]);
+    level.generation = level.generation.wrapping_add(1);
+    level.gpu_generation = level.generation;
+    level.gpu_newer.store(false, Ordering::Release);
+    level.dirty = false;
+    level.dirty_lo = 0;
+    level.dirty_hi = 0;
+    Ok(())
 }

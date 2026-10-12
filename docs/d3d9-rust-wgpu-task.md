@@ -51,8 +51,8 @@ Follow the D3D7/D3D8 CXX migration (kit commit `f90bba7`):
 
 Object ownership rules live in `docs/architecture.md` under "Threads and
 ownership". Rust owns device, resource and pipeline state through CXX; C++ retains COM
-identities and guest staging. Shader translation is Rust-owned (M5); drawing
-and D3DX objects remain M6–M9.
+identities and guest staging. Shader translation is Rust-owned (M5); M6 now owns draw/copy/query execution
+within the subset below. D3DX objects remain M7–M9.
 
 ## Current status
 
@@ -75,14 +75,16 @@ and D3DX objects remain M6–M9.
   wgpu context and rebuilds managed residency; physical loss stages a compatible
   fresh context with an isolated loss token and replaces the old one. Pipeline
   state, shader/declaration bytes and state blocks now live in Rust (M4).
-  M5 translation and creation-time naga validation are complete for the shipped
-  shader corpus; M6–M9 remain pending. Drawing remains unimplemented. Civ4's
-  `[render] d3d9_wgpu = true` stays on during active migration.
+  **M5 shader translation is complete**: translation and creation-time naga validation are complete for the shipped
+  shader corpus. M6 now has callable draw, target, clear, copy/readback and
+  event-query paths; occlusion remains deferred and M6 stays open. M7–M9 are
+  pending; rendering fidelity and runtime execution remain unverified.
+  Civ4's `[render] d3d9_wgpu = true` stays on during active migration.
 - **ABI foundation: done.** Pinned Wine headers and IIDs
   (`third_party/wine-d3d9/`), generated D3D9 constants, version-specific D3DX
   tables, and the 25 `d3dx9_33` imports Civ4 uses (3 reuse existing matrix
   handlers, 22 fail by name). `D9_STUB`/`RES_STUB`/`FX_STUB` are gone; missing
-  shader/declaration draws and query failures fail by name. Coverage lives in
+  methods and query types fail by name. Coverage lives in
   `dx/d3d9_bindings.json`, `dx/d3dx9_bindings.json`,
   `dx/d3dx9_33_bindings.json` and `dx/d3dx9_imports.json`. The authoritative
   D3D9 flag-on status map is `dx/d3d9_bindings.json`: `flag_on` marks each
@@ -94,21 +96,26 @@ and D3DX objects remain M6–M9.
   formatting, generated COM/status staleness and whitespace checks passed.
   No tests, app, headless or GPU runs were performed.
 
-Handoff: M5 is complete for all 92 shaders in the 14 compiled effects; M6 is
-next. Shader creation reaches Rust through the existing CXX API and stores owned
-bytecode, decoded instructions/declarations and naga-validated default-variant
-WGSL before publishing a handle. C++ retains COM identity/refcounts. Relevant
-files: `graphics/d3d8-wgpu/src/d3d9/{shader.rs,wgsl.rs}`,
-`src/bin/shader_corpus.rs`, `Cargo.toml` and `tools/build_d3d8_wgpu.py`.
-Pi implementation and independent review, supervisor corrections, Rust formatting,
-repository-boundary and whitespace checks passed. One final flag-on
-`tools/.venv/bin/python tools/build.py --target app` and signing passed on the
-first attempt; the CPU-only `shader-corpus` run reported 92 ok, 0 failed
-(`analysis/m5-shader-validation.log`). No tests or app/GPU/headless runs.
-D3D8, CXX and COM bindings are unchanged; `dx/d3d9_bindings.json` remains the
-single guest-method status map. M6 draw integration and sampler variants, M8
-reflection APIs and M11 execution/precision fidelity remain unverified/deferred.
-The Civ4 flag stays on.
+Handoff: M6 implements scene/target selection, all four ordinary/UP/indexed
+Draw APIs, viewport-clipped color/depth/stencil Clear, same-format StretchRect,
+UpdateSurface/UpdateTexture, GetRenderTargetData, ColorFill and EVENT queries.
+Fixed-function and translated stages share one interface and may be mixed;
+Rust owns validation, copied draw inputs/constants, GPU handles and submission.
+C++ retains COM identities and stages guest arguments/results. Per-subresource
+freshness, lock counters and texture LOD are shared with the resource holders;
+Reset stages the GPU registry and aliases before readiness, then commits without
+allocating. Relevant files: `graphics/d3d8-wgpu/src/d3d9.rs`,
+`d3d9/{draw,copy,query,resource,state,wgsl,format}.rs`, `src/bridge.rs`,
+`dx/{d3d9.cpp,d3d_bridge_helpers.h,com.h,d3d9_bindings.json}`.
+Occlusion remains a named failure by the user's decision; M7–M9 and the named
+M11 execution gaps below remain. `dx/d3d9_bindings.json` is still the sole guest
+method status map. The current change review corrected cross-device source validation
+in GetRenderTargetData and consolidated primitive vertex counts so UP line strips
+use exactly PrimitiveCount + 1 vertices. Changed-file Rust/native formatting,
+generated COM consistency, repository-boundary and whitespace checks passed.
+The final flag-on macOS windowed rebuild and app signing passed. No tests, shader-corpus
+rerun, app, headless or GPU execution. Private build log: consumer
+`analysis/d3d9-review-build.log` (ignored). The Civ4 flag stays on.
 
 M4 primary evidence: Microsoft `Reset`, `GetFunction`, `D3DSTATEBLOCKTYPE`, the
 three "Saving ... States With a StateBlock" pages and the `Capture` per-entry
@@ -477,6 +484,65 @@ proceed in parallel once M1 exists.
   translated shader stages from immutable state snapshots; clears, copies,
   readback, `Present` and event/occlusion queries work with correct `S_FALSE`
   and data-size behavior. No skipped draws or fabricated query results.
+  **Implemented subset:** Rust device scene/current-target state, owned draw
+  inputs and wgpu submissions, semantic vertex linking and conversion of all
+  D1 declaration types, triangle-fan expansion, fixed-function transforms and
+  lighting, eight-stage RGB/alpha combiners, mixed fixed/programmed stages,
+  float constants and cube/volume/depth/projected sampler variants. The four
+  Draw methods, Begin/EndScene, Set/GetRenderTarget/DepthStencilSurface and
+  Clear are guest-callable through CXX. UP clears stream 0; indexed UP also
+  clears indices. Target bindings retain COM objects and stay outside state
+  blocks. Clear honors rectangles/viewport for color, depth and stencil.
+  StretchRect supports same-format color copies/scaling with NONE/POINT/LINEAR
+  and whole, matching non-discard depth surfaces outside a scene. SYSTEMMEM →
+  DEFAULT UpdateSurface/UpdateTexture handle packed pitches, block alignment,
+  cube/volume subresources, bottom-matched mip chains and autogen destinations;
+  GetRenderTargetData stores real GPU readback in matching SYSTEMMEM storage.
+  ColorFill preserves pixels outside its rectangle. EVENT query Issue(END)
+  uses an actual queue completion marker; GetData polls without blocking,
+  returns S_FALSE without writing while pending, accepts status-only size 0
+  or a four-byte BOOL, and FLUSH submits/polls. Initial queries are signaled;
+  completed events return TRUE. No fabricated occlusion counts.
+
+  **User-approved deferral (2026-10-12): occlusion queries remain named
+  unsupported and M6 stays open.** `wgpu-types-27.0.1/src/lib.rs` defines
+  QueryType::Occlusion as a boolean; Metal uses
+  `MTLVisibilityResultMode::Boolean` in `wgpu-hal-27.0.4/src/metal/command.rs`
+  (line 423). The user chose this deferral instead of a pinned backend extension.
+  A CreateQuery probe reports NOTAVAILABLE; execution fails by name.
+
+  **Named remaining gaps:** GetFrontBufferData, other query types, copy format
+  conversion, MSAA/MRT and the earlier D1/M2–M5 deferrals. M11 owns raster
+  breadth: premultiply/bump texture combiners (17/22/23), vertex blending and
+  coordinate generation, flat/wireframe shading, clip planes/clipping disabled,
+  point sizing/sprites/scaling, W-buffer and constant depth bias, border and
+  MIRRORONCE addressing, anisotropic/special filters, sampler LOD bias, linear
+  filtering of non-filterable float formats, sRGB texture sampling and table fog
+  with translated vertex shaders. These executing cases fail by name; they are
+  not silently approximated. Point/linear filters, mip selection/SetLOD, culling,
+  alpha test, blend/separate alpha, depth/stencil, scissor and color masks have
+  execution paths; numeric equivalence, converted-format render precision and
+  half-pixel behavior await M11/approved runs. Raster/filter/FF capability bits
+  remain conservative pending that reconciliation. Pipeline batching/caching
+  is a performance deferral; current draws submit synchronously. No rendering,
+  new sampler-variant/FF WGSL validation run or reset execution is claimed by
+  the compile-only checks.
+
+  M6 primary evidence: pinned Wine 11.0 headers/IIDs at
+  `db11d0fe6a169c457e23d007e20404643d067aa8`; Microsoft
+  [DrawIndexedPrimitiveUP](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3ddevice9-drawindexedprimitiveup),
+  [Clear](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3ddevice9-clear),
+  [StretchRect](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3ddevice9-stretchrect),
+  [UpdateTexture](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3ddevice9-updatetexture)
+  (bottom-matched levels, autogen top matching, conservative whole-level copies),
+  [queries](https://learn.microsoft.com/en-us/windows/win32/direct3d9/queries),
+  [texture blending](https://learn.microsoft.com/en-us/windows/win32/direct3d9/texture-blending),
+  [texture operations](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dtextureop),
+  [lighting](https://learn.microsoft.com/en-us/windows/win32/direct3d9/mathematics-of-lighting)
+  and [pixel centers](https://learn.microsoft.com/en-us/windows/win32/direct3d9/directly-mapping-texels-to-pixels);
+  wgpu 27.0.1 Queue::on_submitted_work_done, PollType::Poll and pinned
+  wgpu-types 27.0.1/wgpu-hal 27.0.4 source. Consumer evidence remains the
+  existing inventories/addresses below; no Ghidra or translation-input edits.
 - [ ] **M7. D3DX textures.** Needs M3, D6. Done when: Civ4's texture
   imports (file and memory loaders, image info, `D3DXLoadSurfaceFromSurface`,
   save to file) handle DDS/DXT, TGA, PNG, JPG and BMP into D1 formats, with

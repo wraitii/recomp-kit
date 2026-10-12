@@ -131,6 +131,14 @@ impl Program {
             self.minor
         )
     }
+
+    pub fn const_limit(&self) -> u32 {
+        if self.relative {
+            if self.pixel { 32 } else { 256 }
+        } else {
+            self.max_const.max(1)
+        }
+    }
 }
 
 fn operand_count(op: u32, major: u32, minor: u32, pixel: bool) -> Option<u32> {
@@ -563,6 +571,7 @@ impl Program {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Variant {
     pub cube: u16,
+    pub volume: u16,
     pub projected: u16,
     pub depth: u16,
     pub alpha: u16,
@@ -628,6 +637,7 @@ impl<'a> Gen<'a> {
         match self.p.samplers.get(&stage).copied() {
             Some(kind) => kind,
             None if self.variant.cube & (1u16 << stage) != 0 => S_CUBE,
+            None if self.variant.volume & (1u16 << stage) != 0 => S_VOLUME,
             None => 0,
         }
     }

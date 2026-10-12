@@ -580,6 +580,15 @@ pub fn d3d_to_wgpu(fmt: u32) -> Option<wgpu::TextureFormat> {
     info(fmt).map(|f| f.wgpu)
 }
 
+pub fn has_stencil(fmt: u32) -> bool {
+    matches!(
+        d3d_to_wgpu(fmt),
+        Some(wgpu::TextureFormat::Depth24PlusStencil8)
+            | Some(wgpu::TextureFormat::Depth32FloatStencil8)
+            | Some(wgpu::TextureFormat::Stencil8)
+    )
+}
+
 pub fn row_pitch(fmt: u32, width: u32) -> Option<u32> {
     let f = info(fmt)?;
     match f.storage {

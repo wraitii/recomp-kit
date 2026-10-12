@@ -109,6 +109,40 @@ static ComObj *this_device9(X86 *c) {
     return (o && o->kind == K_D3D9DEVICE) ? o : nullptr;
 }
 
+static bool read_guest_rect(uint32_t addr, recomp::d3d::D3d9Rect *out) {
+    if (!addr || !gm_valid(addr, 16))
+        return false;
+    out->left = (int32_t)rd32(addr);
+    out->top = (int32_t)rd32(addr + 4);
+    out->right = (int32_t)rd32(addr + 8);
+    out->bottom = (int32_t)rd32(addr + 12);
+    return true;
+}
+
+static uint32_t d3d9_target_id(ComObj *s) {
+    if (!s)
+        return 0;
+    if (s->d3d9_implicit)
+        return s->d3d9_target_depth ? 0xffffffffu : 0u;
+    return s->id;
+}
+
+static void return_surface_handle(X86 *c, ComObj *s, uint32_t out) {
+    if (!s) {
+        com_ret(c, D3DERR_NOTFOUND);
+        return;
+    }
+    com_addref(s);
+    uint32_t view_ = com_view(s, IF_D3DSURFACE9);
+    if (!view_) {
+        com_release(s);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    com_out_ptr(out, view_);
+    com_ret(c, D3D_OK9);
+}
+
 static void d3d9_ref_add(uint32_t id) {
     if (ComObj *o = com_get(id))
         com_retain_internal(o);
@@ -154,7 +188,13 @@ static void d3d9_refresh_bindings(ComObj *dev) {
     recomp::d3d::D3d9BindingsResult result = dev->d3d9_device->current_bindings();
     if (result.status.code != recomp::d3d::StatusCode::Ok)
         return;
-    d3d9_reconcile(dev->d3d9_device->live_refs, d3d9_binding_set(dev, result.live));
+    std::set<uint32_t> live = d3d9_binding_set(dev, result.live);
+    for (const auto &target :
+         {dev->d3d9_device->render_target(), dev->d3d9_device->depth_stencil()})
+        if (target.status.code == recomp::d3d::StatusCode::Ok && target.value &&
+            target.value != 0xffffffffu)
+            live.insert(target.value);
+    d3d9_reconcile(dev->d3d9_device->live_refs, live);
     std::set<uint32_t> recording;
     if (result.recording_active)
         recording = d3d9_binding_set(dev, result.recording);
@@ -1013,12 +1053,28 @@ void Dev_GetDeviceCaps(X86 *c) {
 }
 void Dev_BeginScene(X86 *c) {
     ComObj *dev = this_device9(c);
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        com_ret(c, bridge_result(c, dev->d3d9_device->begin_scene()));
+        return;
+    }
     if (dev)
         dev->in_scene = true;
     com_ret(c, dev ? D3D_OK9 : D3DERR_INVALIDCALL);
 }
 void Dev_EndScene(X86 *c) {
     ComObj *dev = this_device9(c);
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        com_ret(c, bridge_result(c, dev->d3d9_device->end_scene()));
+        return;
+    }
     if (dev)
         dev->in_scene = false;
     com_ret(c, dev ? D3D_OK9 : D3DERR_INVALIDCALL);
@@ -1035,6 +1091,36 @@ void Dev_Clear(X86 *c) {
     uint32_t count = arg(c, 1), rects = arg(c, 2), flags = arg(c, 3), color = arg(c, 4);
     if (!dev) {
         com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (kD3d9WgpuEnabled) {
+        if (!dev->d3d9_device) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        if ((!count && rects) ||
+            (count && (count > 0x0fffffffu || !rects || !gm_fits(rects, count * 16u)))) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        std::vector<recomp::d3d::D3d9Rect> list;
+        list.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            recomp::d3d::D3d9Rect r;
+            uint32_t a = rects + i * 16u;
+            r.left = (int32_t)rd32(a);
+            r.top = (int32_t)rd32(a + 4);
+            r.right = (int32_t)rd32(a + 8);
+            r.bottom = (int32_t)rd32(a + 12);
+            list.push_back(r);
+        }
+        float z;
+        uint32_t zbits = arg(c, 5);
+        memcpy(&z, &zbits, 4);
+        rust::Slice<const recomp::d3d::D3d9Rect> rect_slice(list.empty() ? nullptr : list.data(),
+                                                            list.size());
+        com_ret(c,
+                bridge_result(c, dev->d3d9_device->clear(flags, color, z, arg(c, 6), rect_slice)));
         return;
     }
     if (gpu_on()) {
@@ -1217,7 +1303,7 @@ static void d3d9_release_staging(D3d9HostResource *h) {
 
 static void d3d9_resource_destroy(ComObj *o) {
     if (kD3d9WgpuEnabled) {
-        if (!o->d3d9_parent && o->d3d9_resource && o->dev_d3d) {
+        if (o->d3d9_resource && o->dev_d3d) {
             if (ComObj *dev = com_get(o->dev_d3d)) {
                 if (dev->d3d9_device)
                     dev->d3d9_device->unregister_resource(o->id);
@@ -1675,6 +1761,19 @@ static ComObj *com_level_view(ComObj *tex, uint32_t face, uint32_t level, bool v
     com_retain_internal(tex);
     s->d3d9_parent_retained = true;
     tex->d3d9_levels[slot] = s->id;
+    if (kD3d9WgpuEnabled && s->dev_d3d) {
+        if (ComObj *dev = com_get(s->dev_d3d)) {
+            if (dev->d3d9_device) {
+                recomp::d3d::Status status = dev->d3d9_device->register_resource_view(
+                    s->id, *s->d3d9_resource, face, level, volume);
+                if (!d3d_bridge_ok(status)) {
+                    tex->d3d9_levels[slot] = 0;
+                    com_release(s);
+                    return nullptr;
+                }
+            }
+        }
+    }
     return s;
 }
 
@@ -2158,6 +2257,9 @@ static ComObj *device_backbuffer(ComObj *dev) {
             s->dev_d3d = dev->id;
             com_internalize(s);
             dev->d3d9_backbuffer = s->id;
+            if (dev->d3d9_device)
+                dev->d3d9_device->register_implicit_targets(dev->d3d9_backbuffer,
+                                                            dev->d3d9_depthbuffer);
         }
         return s;
     }
@@ -2182,6 +2284,27 @@ void Dev_StretchRect(X86 *c) {
     ComObj *src = com_this(arg(c, 1)), *dst = com_this(arg(c, 3));
     if (!src || !dst || src->kind != K_D3D9SURFACE || dst->kind != K_D3D9SURFACE) {
         com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (kD3d9WgpuEnabled) {
+        ComObj *dev = this_device9(c);
+        if (!dev || !dev->d3d9_device || src->dev_d3d != dev->id || dst->dev_d3d != dev->id) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::D3d9Rect sr{}, dr{};
+        bool have_src = arg(c, 2) != 0;
+        bool have_dst = arg(c, 4) != 0;
+        if ((have_src && !read_guest_rect(arg(c, 2), &sr)) ||
+            (have_dst && !read_guest_rect(arg(c, 4), &dr))) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        rust::Slice<const recomp::d3d::D3d9Rect> srs(have_src ? &sr : nullptr, have_src ? 1 : 0);
+        rust::Slice<const recomp::d3d::D3d9Rect> drs(have_dst ? &dr : nullptr, have_dst ? 1 : 0);
+        com_ret(c, bridge_result(c, dev->d3d9_device->stretch_rect(d3d9_target_id(src), srs,
+                                                                   d3d9_target_id(dst), drs,
+                                                                   arg(c, 5))));
         return;
     }
     if (gpu_on()) {
@@ -2247,6 +2370,104 @@ void Dev_StretchRect(X86 *c) {
     d9_raster_invalidate(dst->id);
     com_ret(c, D3D_OK9);
 }
+
+void Dev_UpdateSurface(X86 *c) {
+    ComObj *dev = this_device9(c);
+    ComObj *src = com_this(arg(c, 1)), *dst = com_this(arg(c, 3));
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device || !src || !dst || src->kind != K_D3D9SURFACE ||
+            dst->kind != K_D3D9SURFACE || src->dev_d3d != dev->id || dst->dev_d3d != dev->id ||
+            !src->d3d9_resource || !dst->d3d9_resource ||
+            src->d3d9_resource.get() == dst->d3d9_resource.get()) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::D3d9Rect sr{};
+        bool have_src = arg(c, 2) != 0;
+        if (have_src && !read_guest_rect(arg(c, 2), &sr)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        int32_t dx = 0, dy = 0;
+        if (arg(c, 4)) {
+            if (!gm_valid(arg(c, 4), 8)) {
+                com_ret(c, D3DERR_INVALIDCALL);
+                return;
+            }
+            dx = (int32_t)rd32(arg(c, 4));
+            dy = (int32_t)rd32(arg(c, 4) + 4);
+        }
+        rust::Slice<const recomp::d3d::D3d9Rect> sr_slice(have_src ? &sr : nullptr,
+                                                          have_src ? 1 : 0);
+        com_ret(
+            c, bridge_result(c, dev->d3d9_device->update_surface(
+                                    *src->d3d9_resource, src->d3d9_face, src->d3d9_level, sr_slice,
+                                    *dst->d3d9_resource, dst->d3d9_face, dst->d3d9_level, dx, dy)));
+        return;
+    }
+    imports_unsupported(c);
+    com_ret(c, D3DERR_INVALIDCALL);
+}
+
+void Dev_UpdateTexture(X86 *c) {
+    ComObj *dev = this_device9(c);
+    ComObj *src = com_this(arg(c, 1)), *dst = com_this(arg(c, 2));
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device || !src || !dst || !src->d3d9_resource ||
+            !dst->d3d9_resource || src->dev_d3d != dev->id || dst->dev_d3d != dev->id ||
+            src->d3d9_resource.get() == dst->d3d9_resource.get()) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        com_ret(c, bridge_result(c, dev->d3d9_device->update_texture(*src->d3d9_resource,
+                                                                     *dst->d3d9_resource)));
+        return;
+    }
+    imports_unsupported(c);
+    com_ret(c, D3DERR_INVALIDCALL);
+}
+
+void Dev_GetRenderTargetData(X86 *c) {
+    ComObj *dev = this_device9(c);
+    ComObj *src = com_this(arg(c, 1)), *dst = com_this(arg(c, 2));
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device || !src || !dst || src->kind != K_D3D9SURFACE ||
+            dst->kind != K_D3D9SURFACE || !dst->d3d9_resource || src->dev_d3d != dev->id ||
+            dst->dev_d3d != dev->id) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        com_ret(c, bridge_result(c, dev->d3d9_device->get_render_target_data(
+                                        d3d9_target_id(src), *dst->d3d9_resource, dst->d3d9_face,
+                                        dst->d3d9_level)));
+        return;
+    }
+    imports_unsupported(c);
+    com_ret(c, D3DERR_INVALIDCALL);
+}
+
+void Dev_ColorFill(X86 *c) {
+    ComObj *dev = this_device9(c);
+    ComObj *s = com_this(arg(c, 1));
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device || !s || s->kind != K_D3D9SURFACE || s->dev_d3d != dev->id) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::D3d9Rect r{};
+        bool have = arg(c, 2) != 0;
+        if (have && !read_guest_rect(arg(c, 2), &r)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        rust::Slice<const recomp::d3d::D3d9Rect> slice(have ? &r : nullptr, have ? 1 : 0);
+        com_ret(
+            c, bridge_result(c, dev->d3d9_device->color_fill(d3d9_target_id(s), slice, arg(c, 3))));
+        return;
+    }
+    imports_unsupported(c);
+    com_ret(c, D3DERR_INVALIDCALL);
+}
 static ComObj *device_depthbuffer(ComObj *dev) {
     if (kD3d9WgpuEnabled) {
         if (!dev || !dev->d3d9_device)
@@ -2266,6 +2487,9 @@ static ComObj *device_depthbuffer(ComObj *dev) {
             s->dev_d3d = dev->id;
             com_internalize(s);
             dev->d3d9_depthbuffer = s->id;
+            if (dev->d3d9_device)
+                dev->d3d9_device->register_implicit_targets(dev->d3d9_backbuffer,
+                                                            dev->d3d9_depthbuffer);
         }
         return s;
     }
@@ -2294,6 +2518,8 @@ static void device_discard_implicit_surfaces(ComObj *dev) {
             com_release_internal(s);
     }
     dev->render_target = 0;
+    if (kD3d9WgpuEnabled && dev->d3d9_device)
+        dev->d3d9_device->register_implicit_targets(0, 0);
 }
 
 // Drops the device's own back and depth buffers; the game's references to them
@@ -2340,25 +2566,26 @@ void Dev_GetDepthStencilSurface(X86 *c) {
             com_ret(c, D3DERR_INVALIDCALL);
             return;
         }
-        if (dev->d3d9_device->depthbuffer_descriptor().status.code != recomp::d3d::StatusCode::Ok) {
+        com_out_ptr(out, 0);
+        recomp::d3d::ValueResult result = dev->d3d9_device->depth_stencil();
+        if (result.status.code != recomp::d3d::StatusCode::Ok) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        }
+        if (result.value == 0) {
             com_ret(c, D3DERR_NOTFOUND);
             return;
         }
+        ComObj *s = result.value == 0xffffffffu ? device_depthbuffer(dev) : com_get(result.value);
+        return_surface_handle(c, s, out);
+        return;
     }
     ComObj *s = dev ? device_depthbuffer(dev) : nullptr;
     if (!s || !out) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    com_addref(s);
-    uint32_t view_ = com_view(s, IF_D3DSURFACE9);
-    if (!view_) {
-        com_release(s);
-        com_ret(c, E_OUTOFMEMORY);
-        return;
-    }
-    com_out_ptr(out, view_);
-    com_ret(c, D3D_OK9);
+    return_surface_handle(c, s, out);
 }
 
 // (this, iSwapChain, ppRenderTarget). The surface bound as target 0, or the
@@ -2367,7 +2594,22 @@ void Dev_GetDepthStencilSurface(X86 *c) {
 void Dev_GetRenderTarget(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 2);
-    if (!dev || !out || (kD3d9WgpuEnabled && (arg(c, 1) != 0 || !gm_valid(out, 4)))) {
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device || arg(c, 1) != 0 || !out || !gm_valid(out, 4)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        com_out_ptr(out, 0);
+        recomp::d3d::ValueResult result = dev->d3d9_device->render_target();
+        if (result.status.code != recomp::d3d::StatusCode::Ok) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        }
+        ComObj *s = result.value == 0 ? device_backbuffer(dev) : com_get(result.value);
+        return_surface_handle(c, s, out);
+        return;
+    }
+    if (!dev || !out) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
@@ -2375,25 +2617,35 @@ void Dev_GetRenderTarget(X86 *c) {
     ComObj *s = dev->render_target ? com_get(dev->render_target) : nullptr;
     if (!s)
         s = device_backbuffer(dev);
-    if (!s) {
-        com_ret(c, E_OUTOFMEMORY);
-        return;
-    }
-    com_addref(s);
-    uint32_t view_ = com_view(s, IF_D3DSURFACE9);
-    if (!view_) {
-        com_release(s);
-        com_ret(c, E_OUTOFMEMORY);
-        return;
-    }
-    com_out_ptr(out, view_);
-    com_ret(c, D3D_OK9);
+    return_surface_handle(c, s, out);
 }
 
 void Dev_SetRenderTarget(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *s = com_this(arg(c, 2));
     uint32_t index = arg(c, 1);
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device || (arg(c, 2) && (!s || s->kind != K_D3D9SURFACE)) ||
+            (s && s->dev_d3d != dev->id) || (index == 0 && !s)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        uint32_t face = 0, level = 0;
+        bool volume = false;
+        uint32_t id = 0;
+        if (s) {
+            id = d3d9_target_id(s);
+            face = s->d3d9_face;
+            level = s->d3d9_level;
+            volume = s->d3d9_volume;
+        }
+        recomp::d3d::Status status =
+            dev->d3d9_device->set_render_target(index, id, face, level, volume);
+        if (d3d_bridge_ok(status))
+            d3d9_refresh_bindings(dev);
+        com_ret(c, bridge_result(c, status));
+        return;
+    }
     if (!dev || index > 3) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -2418,6 +2670,31 @@ void Dev_SetRenderTarget(X86 *c) {
 void Dev_SetDepthStencilSurface(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *s = com_this(arg(c, 1));
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device || (arg(c, 1) && (!s || s->kind != K_D3D9SURFACE)) ||
+            (s && s->dev_d3d != dev->id)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        uint32_t face = 0, level = 0;
+        bool volume = false;
+        uint32_t id = 0;
+        if (s) {
+            if (s->d3d9_implicit && s->d3d9_target_depth) {
+                id = 0xffffffffu;
+            } else {
+                id = s->id;
+                face = s->d3d9_face;
+                level = s->d3d9_level;
+                volume = s->d3d9_volume;
+            }
+        }
+        recomp::d3d::Status status = dev->d3d9_device->set_depth_stencil(id, face, level, volume);
+        if (d3d_bridge_ok(status))
+            d3d9_refresh_bindings(dev);
+        com_ret(c, bridge_result(c, status));
+        return;
+    }
     if (dev)
         dev->zbuffer_obj = (s && s->kind == K_D3D9SURFACE) ? s->id : 0;
     com_ret(c, D3D_OK9);
@@ -2528,11 +2805,56 @@ void Dev_CreateQuery(X86 *c) {
         return;
     }
     bool known = type == 4 || type == 5 || type == 6 || (type >= 8 && type <= 19);
-    bool creatable = type == D3DQUERYTYPE_OCCLUSION && gpu_on();
     if (!known) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
+    if (kD3d9WgpuEnabled) {
+        if (!dev->d3d9_device) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::ValueResult result = dev->d3d9_device->create_query(type);
+        if (!out) {
+            if (result.status.code == recomp::d3d::StatusCode::Ok && result.value) {
+                dev->d3d9_device->destroy_query(result.value);
+                com_ret(c, D3D_OK9);
+            } else {
+                com_ret(c, D3DERR_NOTAVAILABLE);
+            }
+            return;
+        }
+        if (!gm_valid(out, 4)) {
+            if (result.status.code == recomp::d3d::StatusCode::Ok && result.value)
+                dev->d3d9_device->destroy_query(result.value);
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        if (result.status.code != recomp::d3d::StatusCode::Ok) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        }
+        ComObj *q = com_new(K_D3D9QUERY);
+        if (!q) {
+            dev->d3d9_device->destroy_query(result.value);
+            com_ret(c, E_OUTOFMEMORY);
+            return;
+        }
+        q->dev_d3d = dev->id;
+        q->d3d9_query = result.value;
+        com_retain_internal(dev);
+        q->d3d9_owner_retained = true;
+        uint32_t view_ = com_view(q, IF_D3DQUERY9);
+        if (!view_) {
+            com_release(q);
+            com_ret(c, E_OUTOFMEMORY);
+            return;
+        }
+        com_out_ptr(out, view_);
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    bool creatable = type == D3DQUERYTYPE_OCCLUSION && gpu_on();
     if (!out) {
         com_ret(c, creatable ? D3D_OK9 : D3DERR_NOTAVAILABLE);
         return;
@@ -2868,6 +3190,18 @@ void Dev_DrawPrimitive(X86 *c) {
         com_ret(c, D3D_OK9);
         return;
     }
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::Status status =
+            dev->d3d9_device->draw_primitive(arg(c, 1), arg(c, 2), prim_count);
+        if (status.code == recomp::d3d::StatusCode::Ok)
+            d3d9_refresh_bindings(dev);
+        com_ret(c, bridge_result(c, status));
+        return;
+    }
     if (dev && gpu_on()) {
         bool have_stream = false;
         for (int i = 0; i < 8; ++i)
@@ -2910,6 +3244,18 @@ void Dev_DrawIndexedPrimitive(X86 *c) {
     uint32_t prim_count = arg(c, 6);
     if (prim_count == 0) {
         com_ret(c, D3D_OK9);
+        return;
+    }
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::Status status = dev->d3d9_device->draw_indexed_primitive(
+            arg(c, 1), (int32_t)arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5), prim_count);
+        if (status.code == recomp::d3d::StatusCode::Ok)
+            d3d9_refresh_bindings(dev);
+        com_ret(c, bridge_result(c, status));
         return;
     }
     if (dev && gpu_on()) {
@@ -3026,9 +3372,20 @@ void Dev_DrawPrimitiveUP(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (g_draws <= 8)
+    if (!kD3d9WgpuEnabled && g_draws <= 8)
         describe_draw_inputs(c, arg(c, 3), arg(c, 4),
                              static_cast<uint32_t>(primitive_vertices(arg(c, 1), prim_count)));
+    if (kD3d9WgpuEnabled) {
+        if (!dev->d3d9_device) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::Status status = dev->d3d9_device->draw_primitive_up(
+            arg(c, 1), prim_count, rust::Slice<const uint8_t>(gm_ptr(arg(c, 3)), bytes), arg(c, 4));
+        d3d9_refresh_bindings(dev);
+        com_ret(c, bridge_result(c, status));
+        return;
+    }
     if (gpu_on()) {
         HostD9Draw d{};
         d.primitive = arg(c, 1);
@@ -3069,6 +3426,19 @@ void Dev_DrawIndexedPrimitiveUP(X86 *c) {
         !vbytes || !arg(c, 5) || !arg(c, 7) || !gm_valid(arg(c, 5), ibytes) ||
         !gm_valid(arg(c, 7), vbytes)) {
         com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (kD3d9WgpuEnabled) {
+        if (!dev->d3d9_device) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::Status status = dev->d3d9_device->draw_indexed_primitive_up(
+            arg(c, 1), arg(c, 2), arg(c, 3), prim_count,
+            rust::Slice<const uint8_t>(gm_ptr(arg(c, 5)), ibytes), arg(c, 6),
+            rust::Slice<const uint8_t>(gm_ptr(arg(c, 7)), vbytes), arg(c, 8));
+        d3d9_refresh_bindings(dev);
+        com_ret(c, bridge_result(c, status));
         return;
     }
     if (gpu_on()) {
@@ -4132,16 +4502,62 @@ static std::unordered_map<uint32_t, uint32_t> &query_state() { // id -> 1 begun,
     return *m;
 }
 static void query_destroy(ComObj *o) {
+    if (kD3d9WgpuEnabled && o->d3d9_query) {
+        if (ComObj *dev = com_get(o->dev_d3d)) {
+            if (dev->d3d9_device)
+                dev->d3d9_device->destroy_query(o->d3d9_query);
+        }
+        o->d3d9_query = 0;
+    }
+    if (o->d3d9_owner_retained) {
+        o->d3d9_owner_retained = false;
+        if (ComObj *dev = com_get(o->dev_d3d))
+            com_release_internal(dev);
+    }
+    o->dev_d3d = 0;
     if (query_state().erase(o->id))
         host_d9_query_drop(o->id);
 }
 void Query_GetType9(X86 *c) {
     ComObj *q = com_this_arg(c);
+    if (kD3d9WgpuEnabled) {
+        ComObj *dev = q ? com_get(q->dev_d3d) : nullptr;
+        if (!q || !q->d3d9_query || !dev || !dev->d3d9_device) {
+            imports_unsupported(c);
+            return;
+        }
+        recomp::d3d::ValueResult result = dev->d3d9_device->query_type(q->d3d9_query);
+        if (!d3d_bridge_ok(result.status)) {
+            bridge_result(c, result.status);
+            return;
+        }
+        set_eax(c, result.value);
+        return;
+    }
     set_eax(c, q ? q->dev_type : 0);
 }
 void Query_GetDataSize(X86 *c) {
     ComObj *q = com_this_arg(c);
     uint32_t type = q ? q->dev_type : 0;
+    if (kD3d9WgpuEnabled) {
+        ComObj *dev = q ? com_get(q->dev_d3d) : nullptr;
+        if (!q || !q->d3d9_query || !dev || !dev->d3d9_device) {
+            imports_unsupported(c);
+            return;
+        }
+        recomp::d3d::ValueResult kind = dev->d3d9_device->query_type(q->d3d9_query);
+        if (!d3d_bridge_ok(kind.status)) {
+            bridge_result(c, kind.status);
+            return;
+        }
+        recomp::d3d::ValueResult result = recomp::d3d::d3d9_query_data_size(kind.value);
+        if (!d3d_bridge_ok(result.status)) {
+            bridge_result(c, result.status);
+            return;
+        }
+        set_eax(c, result.value);
+        return;
+    }
     set_eax(c, (type == D3DQUERYTYPE_OCCLUSION || type == D3DQUERYTYPE_EVENT) ? 4 : 0);
 }
 // (this, dwIssueFlags): D3DISSUE_END 1, D3DISSUE_BEGIN 2.
@@ -4150,6 +4566,19 @@ void Query_Issue(X86 *c) {
     uint32_t flags = arg(c, 1);
     if (!q || (flags != D3DISSUE_BEGIN && flags != D3DISSUE_END)) {
         com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (kD3d9WgpuEnabled) {
+        if (!q->d3d9_query) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        ComObj *dev = com_get(q->dev_d3d);
+        if (!dev || !dev->d3d9_device) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        com_ret(c, bridge_result(c, dev->d3d9_device->query_issue(q->d3d9_query, flags)));
         return;
     }
     if (q->dev_type == D3DQUERYTYPE_OCCLUSION && gpu_on()) {
@@ -4173,6 +4602,42 @@ void Query_GetData(X86 *c) {
     if (!q || (size != 0 && (size != 4 || !data || !gm_valid(data, size))) ||
         (flags & ~D3DGETDATA_FLUSH)) {
         com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (kD3d9WgpuEnabled) {
+        if (!q->d3d9_query) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        if (size) {
+            if (!data || !gm_valid(data, size)) {
+                com_ret(c, D3DERR_INVALIDCALL);
+                return;
+            }
+        } else if (size != 0) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        ComObj *dev = com_get(q->dev_d3d);
+        if (!dev || !dev->d3d9_device) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        uint8_t staged[4]{};
+        rust::Slice<uint8_t> out(size ? staged : nullptr, size);
+        recomp::d3d::ValueResult result =
+            dev->d3d9_device->query_get_data(q->d3d9_query, out, size, flags);
+        if (result.status.code != recomp::d3d::StatusCode::Ok) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        }
+        if (!result.value) {
+            com_ret(c, S_FALSE9);
+            return;
+        }
+        if (size)
+            memcpy(gm_ptr(data), staged, size);
+        com_ret(c, D3D_OK9);
         return;
     }
     if (flags & D3DGETDATA_FLUSH) {
