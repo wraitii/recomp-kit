@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 from .artifacts import ArtifactStore
 from .body import BodyRequest, BodyVariant, EntryForm, ReturnForm, EmissionPolicy, FrozenMap
-from . import c_symbols
+from . import c_boundaries, c_symbols
 from .prepare import prepare as prepare_body
 from .emit_c import emit_prepared
 from .invocation import EntryBinding
@@ -74,16 +74,28 @@ def prepare_ssa(tr, lifter, fn, entries, request, artifacts=None):
         raise SSAError("SSA graph recursion budget")
 
 
+def _entry_action(prepared):
+    if not prepared.options.request.policy.lazy_flags:
+        return []
+    return c_boundaries.cc_action_lines(prepared.cc_entry)
+
+
+def _wrapped(action, call):
+    prefix = " ".join(action)
+    return "%s %s" % (prefix, call) if prefix else call
+
+
 def emit_ssa_prepared(prepared):
-    source = emit_prepared(prepared)
+    source = emit_prepared(prepared, external_entry=prepared.options.checked_return)
     addr, entries = prepared.ir.addr, prepared.ir.entries
     checked, symbol = prepared.options.checked_return, prepared.options.symbol
+    action = _entry_action(prepared) if checked else []
     lines = source.splitlines()
     ordinary = c_symbols.entry_signature(BodyVariant(), c_symbols.symbol("fn", addr))
     if checked:
-        lines.append("%s { %s(c, 0u, 0); }" % (ordinary, symbol))
+        lines.append("%s { %s; }" % (ordinary, _wrapped(action, "%s(c, 0u, 0)" % symbol)))
         entry = c_symbols.entry_signature(prepared.options.request.variant, c_symbols.symbol("fn_checked", addr))
-        lines.append("%s { %s(c, expected, 1); }" % (entry, symbol))
+        lines.append("%s { %s; }" % (entry, _wrapped(action, "%s(c, expected, 1)" % symbol)))
     if entries:
         lines.append("%s { %s(c, 0u); }" % (ordinary, symbol))
         lines += ["%s { %s(c, 0x%xu); }" % (
@@ -122,8 +134,9 @@ def emit_private_prepared(plan):
         return ["%s { %s(c, expected); }" % (signature, c_symbols.symbol("fn_checked", plan.addr))]
     if plan.body.options.request.layout != plan.layout or plan.body.options.request.variant != plan.variant:
         raise SSAError("private body disagrees with its entry layout or variant")
-    lines = emit_prepared(plan.body).splitlines()
-    lines.append("%s { %s(c, expected); }" % (signature, plan.body.options.symbol))
+    lines = emit_prepared(plan.body, external_entry=True).splitlines()
+    wrapped = _wrapped(_entry_action(plan.body), "%s(c, expected)" % plan.body.options.symbol)
+    lines.append("%s { %s; }" % (signature, wrapped))
     return lines
 
 

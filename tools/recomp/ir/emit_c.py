@@ -106,7 +106,7 @@ def seh_lines(kind, addr):
 
 
 
-def emit_prepared(prepared):
+def emit_prepared(prepared, external_entry=False):
     if prepared.final is None or prepared.transport is None:
         raise SSAError("C emission requires finalized boundary operations")
     options = prepared.options
@@ -210,7 +210,8 @@ def emit_prepared(prepared):
             lines.append("uint%d_t v%d;" % (32 if v.size <= 4 else 64, v.id))
     scalar_declarations = len(lines)
     lines.extend(x87_printer.declaration(op) for op in arithmetic_plan.environment_declarations())
-    lines.extend(boundary.operations(boundary.plan.entry))
+    if not external_entry:
+        lines.extend(boundary.operations(boundary.plan.entry))
     if seh_mark:
         lines.append("uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
     for v in s.values:
