@@ -11,7 +11,7 @@ from . import flag_region, operations
 from . import transfer_plan, x87_plan
 from .call_contracts import GPRS as CONTRACT_GPRS, ARITH_FLAGS as CONTRACT_FLAGS
 from .contract_variants import (output_mask as contract_output_mask, PrivateLayout,
-                                ProvisionalBindings, FinalBindings)
+                                ProvisionalBindings, FinalBindings, select_layout)
 from .body import (BodyRequest, BodyVariant, EntryForm, ReturnForm, EmissionPolicy,
                    FrozenMap, PreparedOptions)
 from . import x87_mode
@@ -222,7 +222,9 @@ class PreparedFunction:
             raise SSAError("%08x: no C symbol bound for call target %08x"
                            % (b.insn.addr, target))
         if target in options.request.contract_calls and call.required_outputs is not None:
-            mask = layouts[target].output_mask if target in layouts else contract_output_mask(call.required_outputs)
+            mask = contract_output_mask(call.required_outputs)
+            if target in layouts:
+                mask = select_layout(layouts, target, mask).output_mask
             proof = proven_fact(options.mode_sites.get(b.insn.addr), CW_FAST)
             return private_invocation(target, binding, expected, proof, mask)
         form = "checked" if target in options.request.checked_calls else "ordinary"
@@ -250,10 +252,11 @@ class PreparedFunction:
 
     def finalize(self, layouts):
         for _b, v, call in self._contract_calls():
-            if v.data not in layouts or not call.required_outputs <= set(layouts[v.data].outputs):
+            if v.data not in layouts:
                 raise SSAError("shared contract outputs do not cover the call continuation")
+            layout = select_layout(layouts, v.data, contract_output_mask(call.required_outputs))
             contract = self.options.request.call_contracts.get(v.data)
-            if contract is not None and not contract.reads <= set(layouts[v.data].inputs):
+            if contract is not None and not contract.reads <= set(layout.inputs):
                 raise SSAError("shared contract inputs do not cover the callee reads")
         invocations = self._bind(layouts)
         values = call_values.bind(self, invocations, layouts)

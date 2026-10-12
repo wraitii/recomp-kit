@@ -278,16 +278,21 @@ least two direct call sites and at most 64 original instructions per site.
 Eligible closed callers use those targets; failed caller preparation remains decoded.
 `state_contract_callers` additionally selects explicit caller addresses. Direct edges into
 checked leaf bodies get private entries specialized for the required GPR/flag
-outputs. A callee has one private body with the union of its callers' output
-masks. Frozen `PrivateLayout(inputs, outputs, resident_opaque)` records order
+outputs. A callee shares the union of its callers' output masks, plus at most
+one variant omitting returned arithmetic flags when at least 16 callers can use
+it. Each site selects the smallest covering layout. Frozen
+`PrivateLayout(inputs, outputs, resident_opaque)` records order
 fields by guest contract identity; inputs cover callee reads and linkage fields,
 while x87, EIP, FS, DF and runtime state remain resident.
-`contract_variants.SpecializationPlan` unions outputs across all callers.
+`contract_variants.SpecializationPlan` builds these bounded shared layouts.
 Preparation retains `ProvisionalBindings`; a distinct final-binding phase attaches
 `FinalBindings` with the shared layouts and ordered per-site `CallValues`.
 `CallState` remains field requirements; `call_values.py` binds layout inputs to
 caller SSA values, outputs to call results and preserved fields to before/after
-continuation values. Missing SSA lanes explicitly remain resident. Full integer
+continuation values. Missing SSA lanes explicitly remain resident; a field the
+callee never writes needs no returned output merely because the caller does
+not track it. Stack linkage fields remain required. A layout covering every
+callee write reuses the checked body instead of duplicating it. Full integer
 fallback inputs/results and resident opaque state are separate from the private
 layout; unused shared outputs still have result bindings. Validation checks
 layout order and coverage before transport selection.

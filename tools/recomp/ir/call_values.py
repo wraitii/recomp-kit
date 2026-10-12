@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 from .body import FrozenMap
 from .call_contracts import FIELDS
-from .contract_variants import PrivateLayout
+from .contract_variants import PrivateLayout, select_layout
 from .call_state import CallState
 from .simplify import whole
 from .ssa import SSAError, Value
@@ -72,7 +72,7 @@ def bind(prepared, invocations, layouts):
                 continue
             state = prepared.transfers.calls[event.id].state
             invocation = invocations[event.id]
-            layout = (layouts[event.data] if invocation.form == "private"
+            layout = (select_layout(layouts, event.data, invocation.output_mask) if invocation.form == "private"
                       else PrivateLayout(tuple(f for f in FIELDS if f in state.inputs), FIELDS))
             before, after = block.snapshots[event.id], block.reloads[event.id]
             def value(field, snapshot):

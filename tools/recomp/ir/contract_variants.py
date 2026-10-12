@@ -1,8 +1,8 @@
-"""One shared ordered state layout per specialized callee."""
+"""Bounded shared state layouts for specialized callees."""
 from dataclasses import dataclass
 
 from .body import FrozenMap
-from .call_contracts import FIELDS
+from .call_contracts import FIELDS, ARITH_FLAGS
 
 
 def output_mask(fields):
@@ -53,19 +53,41 @@ class SpecializationPlan:
 
     @classmethod
     def build(cls, requests, contracts):
-        masks = {}
+        masks, flagless, users = {}, {}, {}
+        flags = output_mask(ARITH_FLAGS)
         for wanted in requests.values():
+            flagless_targets = set()
             for target, mask in wanted:
                 masks[target] = masks.get(target, 0) | mask
-        layouts = {addr: PrivateLayout.from_mask(mask, contracts[addr].reads | frozenset(("ESP", "EBP")))
+                if not mask & flags:
+                    flagless[target] = flagless.get(target, 0) | mask
+                    flagless_targets.add(target)
+            for target in flagless_targets:
+                users[target] = users.get(target, 0) + 1
+        layouts = {addr: (PrivateLayout.from_mask(mask, contracts[addr].reads | frozenset(("ESP", "EBP"))),)
                    for addr, mask in masks.items()}
-        callers = {addr: frozenset((target, layouts[target].output_mask) for target, _ in wanted)
+        for addr, mask in flagless.items():
+            if users[addr] >= 16 and masks[addr] & flags:
+                layouts[addr] += (PrivateLayout.from_mask(mask, layouts[addr][0].inputs),)
+        callers = {addr: frozenset((target, select_layout(layouts, target, mask).output_mask)
+                                  for target, mask in wanted)
                    for addr, wanted in requests.items() if wanted}
         return cls(FrozenMap.of(layouts), FrozenMap.of(callers))
 
     @property
     def private_masks(self):
-        return {addr: {layout.output_mask} for addr, layout in self.layouts.items()}
+        return {addr: {layout.output_mask for layout in variants}
+                for addr, variants in self.layouts.items()}
+
+
+def select_layout(layouts, target, mask):
+    variants = layouts[target]
+    if isinstance(variants, PrivateLayout):
+        variants = (variants,)
+    compatible = [layout for layout in variants if not mask & ~layout.output_mask]
+    if not compatible:
+        raise ValueError("private outputs do not cover the call continuation")
+    return min(compatible, key=lambda layout: (layout.output_mask.bit_count(), layout.output_mask))
 
 
 def eligible_leaves(scanned, opaque):

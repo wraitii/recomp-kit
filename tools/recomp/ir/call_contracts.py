@@ -442,7 +442,8 @@ def cfg_is_closed(fir):
     return True
 
 
-def continuation_outputs(s, publications, groups, lane_field, extra_roots=(), call_reads=None):
+def continuation_outputs(s, publications, groups, lane_field, extra_roots=(), call_reads=None,
+                         contracts=None):
     from .simplify import live_values, state_roots
     from .call_state import ContinuationState
 
@@ -471,7 +472,10 @@ def continuation_outputs(s, publications, groups, lane_field, extra_roots=(), ca
         for call in b.ops:
             if call.opc != "CALL":
                 continue
-            fields = set(untracked)
+            contract = contracts.get(call.data) if contracts is not None else None
+            absent = {field for field in untracked
+                      if contract is None or field in contract.writes or field in ("ESP", "EBP")}
+            fields = set(absent)
             returned = set()
             for key, value in b.reloads.get(call.id, {}).items():
                 value = s.resolve(value)
@@ -480,7 +484,7 @@ def continuation_outputs(s, publications, groups, lane_field, extra_roots=(), ca
                     fields.add(lane_field[key])
                     returned.add(lane_field[key])
             outputs[call.id] = ContinuationState(
-                frozenset(fields), frozenset(returned), frozenset(untracked),
+                frozenset(fields), frozenset(returned), frozenset(absent),
                 caller_return_fields, caller_call_read_fields)
     return outputs
 

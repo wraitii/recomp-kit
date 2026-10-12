@@ -108,8 +108,11 @@ def prepare_private(tr, lifter, fn, policy, layout, known_mode=False, artifacts=
     body = prepare_body(fir, request, lifter=lifter, normalized=artifacts.normalized(fir, lifter))
     if finalize:
         body.finalize({})
+    complete = layout.outputs == tuple(FIELDS)
+    if not known_mode and not complete:
+        complete = private_contract(tr, lifter, fn, artifacts).writes <= set(layout.outputs)
     return PrivatePlan(fn.addr, layout, variant,
-                       None if not known_mode and layout.outputs == tuple(FIELDS) else body)
+                       None if not known_mode and complete else body)
 
 
 def emit_private_prepared(plan):

@@ -308,7 +308,7 @@ def _prepare_private(task):
     ctx.tr.analyze(fn, entries)
     plan = production.prepare_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit, layout, known_mode, ctx.artifacts)
     if plan.body is not None:
-        path = Path(store) / ("private-%08x.pickle" % addr)
+        path = Path(store) / ("private-%08x-%04x.pickle" % (addr, layout.output_mask))
         prepared_store.write(path, plan.body)
         plan = replace(plan, body=path)
     ctx.artifacts.flush_counts()
@@ -528,7 +528,7 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
         shared_layouts = specialization.layouts
         private_plans = list(pool.map(_prepare_private,
                              [PrivatePreparationTask(addr, layout, addr in known_modes, store)
-                              for addr, layout in sorted(shared_layouts.items())]))
+                              for addr, layouts in sorted(shared_layouts.items()) for layout in layouts]))
         phase("prepare and plan")
         emit_tasks = [EmissionTask(tuple(plans[a] for a in part), analysis.for_addresses(part), shared_layouts) for part in parts]
         results = {row.addr: row for batch in pool.map(_finalize_and_emit, emit_tasks) for row in batch}

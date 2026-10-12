@@ -162,7 +162,7 @@ def build(s, groups, facts, contracts, kept, lane_field, never_skip,
     if private:
         continuations = continuation_outputs(
             s, result.live_publications, groups, lane_field, roots,
-            {target: contract.reads for target, contract in contracts.items()})
+            {target: contract.reads for target, contract in contracts.items()}, contracts)
     for b in s.blocks.values():
         for v in b.ops:
             if v.opc != "CALL":
