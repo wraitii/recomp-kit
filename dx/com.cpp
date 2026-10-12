@@ -100,6 +100,10 @@ ComObj *com_get(uint32_t id) {
     return o.alive ? &o : nullptr;
 }
 
+std::deque<ComObj> &com_objects() {
+    return objects();
+}
+
 ComIface com_iface_of(uint32_t addr) {
     if (!addr || !gm_valid(addr, COM_VIEW_SIZE))
         return IF_NONE;

@@ -26,6 +26,7 @@
 #include "../runtime/imports.h"
 #include "dxtypes.h"
 
+#include <deque>
 #include <map>
 #include <memory>
 #include <string>
@@ -514,6 +515,9 @@ void com_reset();
 
 ComObj *com_new(ComKind kind);
 ComObj *com_get(uint32_t id);
+// Every object in creation order, including dead ones; the object with id n is
+// at index n - 1. Prefer this over com_get when walking the whole table.
+std::deque<ComObj> &com_objects();
 // The object a guest interface pointer refers to, or null when `addr` is not
 // one of ours. `want` may be IF_NONE to accept any interface.
 ComObj *com_this(uint32_t addr, ComIface want = IF_NONE);

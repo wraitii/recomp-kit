@@ -509,11 +509,9 @@ void update_channel_mix(ComObj *b) {
 // as Wine's DSOUND_ChangeListener walks the device buffer list. Stopped
 // buffers need nothing: Play computes from the stored state.
 void update_all_3d() {
-    const uint32_t n = com_object_count();
-    for (uint32_t id = 1; id <= n; ++id) {
-        ComObj *o = com_get(id);
-        if (o && o->alive && o->kind == K_DSBUFFER && o->is_3d)
-            update_channel_mix(o);
+    for (ComObj &o : com_objects()) {
+        if (o.alive && o.kind == K_DSBUFFER && o.is_3d)
+            update_channel_mix(&o);
     }
 }
 
