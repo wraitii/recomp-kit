@@ -2509,6 +2509,7 @@ fn caps_image(probe: &D3d9Probe) -> Vec<u8> {
     let mut caps = vec![0u8; 304];
     put_u32(&mut caps, 0, D3DDEVTYPE_HAL);
     put_u32(&mut caps, 12, D3DCAPS2_CANAUTOGENMIPMAP);
+    put_u32(&mut caps, 28, 0x0001_0000 | 0x0008_0000);
     put_u32(
         &mut caps,
         60,
