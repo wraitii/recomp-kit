@@ -18,7 +18,91 @@ SELF = {"INT_EQUAL": 1, "INT_LESSEQUAL": 1, "INT_SLESSEQUAL": 1, "INT_NOTEQUAL":
 
 REWRITABLE = frozenset(("PHI", "COPY", "INT_ZEXT", "BYTE", "PACK", "INT_ADD",
                        "INT_SUB", "INT_MULT", "INT_AND", "INT_OR", "INT_XOR",
-                       "INT_LEFT", "INT_RIGHT", "SUBPIECE", "PIECE")) | SELF.keys()
+                       "INT_EQUAL", "INT_NOTEQUAL", "INT_SLESS", "INT_SLESSEQUAL",
+                       "BOOL_AND", "BOOL_OR", "BOOL_XOR", "INT_LEFT", "INT_RIGHT",
+                       "SUBPIECE", "PIECE")) | SELF.keys()
+
+
+def _signed_sub_parts(s, value):
+    """Return ``(a, b, result)`` for a same-width signed-subtract predicate."""
+    value = s.resolve(value)
+    if value.size != 1 or value.opc not in ("INT_XOR", "INT_NOTEQUAL", "INT_EQUAL", "BOOL_XOR"):
+        return None
+    left, right = (s.resolve(arg) for arg in value.args)
+    if left.size != 1 or right.size != 1:
+        return None
+    for sign, overflow in ((left, right), (right, left)):
+        sign, overflow = s.resolve(sign), s.resolve(overflow)
+        if (sign.opc != "INT_SLESS" or len(sign.args) != 2
+                or overflow.opc != "INT_SBORROW" or len(overflow.args) != 2):
+            continue
+        result, zero = (s.resolve(arg) for arg in sign.args)
+        a, b = (s.resolve(arg) for arg in overflow.args)
+        if (result.opc != "INT_SUB" or result.size == 0
+                or result.size != a.size or a.size != b.size
+                or zero.opc != "CONST" or zero.size != result.size or zero.data != 0):
+            continue
+        sub_a, sub_b = (s.resolve(arg) for arg in result.args)
+        if _same_packed_value(s, sub_a, a) and _same_packed_value(s, sub_b, b):
+            return a, b, result
+    return None
+
+
+def _same_packed_value(s, left, right):
+    """Accept independently assembled PACKs of the same byte values."""
+    left, right = s.resolve(left), s.resolve(right)
+    if left is right:
+        return True
+    return (left.opc == right.opc == "PACK" and left.size == right.size
+            and len(left.args) == len(right.args)
+            and all(s.resolve(a) is s.resolve(b) for a, b in zip(left.args, right.args)))
+
+
+def _rewrite_signed_sub_predicate(s, value):
+    """Replace overflow/sign combinations only when both describe one SUB."""
+    parts = _signed_sub_parts(s, value)
+    if parts is None:
+        return False
+    a, b, _ = parts
+    value = s.resolve(value)
+    if value.opc in ("INT_XOR", "INT_NOTEQUAL", "BOOL_XOR"):
+        value.opc, value.args = "INT_SLESS", (a, b)
+        return True
+    if value.opc == "INT_EQUAL":
+        value.opc, value.args = "INT_SLESSEQUAL", (b, a)
+        return True
+    return False
+
+
+def _rewrite_signed_sub_le(s, value):
+    """Fold ``(SF xor OF) || ZF`` for the same subtraction to signed <=."""
+    value = s.resolve(value)
+    if value.opc not in ("INT_OR", "BOOL_OR") or value.size != 1 or len(value.args) != 2:
+        return False
+    for relation, equal in ((value.args[0], value.args[1]), (value.args[1], value.args[0])):
+        relation = s.resolve(relation)
+        if relation.opc != "INT_SLESS" or relation.size != 1 or len(relation.args) != 2:
+            continue
+        a, b = (s.resolve(arg) for arg in relation.args)
+        if a.size == 0 or a.size != b.size:
+            continue
+        equal = s.resolve(equal)
+        if equal.opc != "INT_EQUAL" or equal.size != 1 or len(equal.args) != 2:
+            continue
+        left, right = (s.resolve(arg) for arg in equal.args)
+        if left.opc == "CONST" and left.data == 0:
+            zero, result = left, right
+        elif right.opc == "CONST" and right.data == 0:
+            zero, result = right, left
+        else:
+            continue
+        if (zero.size != result.size or result.opc != "INT_SUB" or result.size != a.size
+                or not _same_packed_value(s, result.args[0], a)
+                or not _same_packed_value(s, result.args[1], b)):
+            continue
+        value.opc, value.args = "INT_SLESSEQUAL", (a, b)
+        return True
+    return False
 
 
 def canonicalize(s):
@@ -51,6 +135,10 @@ Only values with operands that can still alias are revisited.
                 continue
             v.args = tuple(s.resolve(a) for a in v.args)
             a, replacement = v.args, None
+            if _rewrite_signed_sub_predicate(s, v) or _rewrite_signed_sub_le(s, v):
+                changed = True
+                remaining.append(v)
+                continue
             if v.opc in ("COPY", "INT_ZEXT") and a[0].size == v.size:
                 replacement = a[0]
             elif v.opc == "BYTE":
