@@ -21,6 +21,8 @@ FUNCTION_SCOPE = "all_invocations_joined"
 RETURN_SCOPE = "all_mapped_entries"
 CONTRACT_SCOPE = "all_invocations"
 _IDENTITY_KEYS = ("executable_sha256", "producer", "producer_sha256", "analysis_inputs_sha256")
+#: Recorded identity that rejects a stored fact file; producer_sha256 is provenance only.
+_GATE_KEYS = ("executable_sha256", "producer", "analysis_inputs_sha256")
 _CONTRACT_KEYS = frozenset(("function", "mask", "value", "scope", "verify", "evidence"))
 
 
@@ -343,7 +345,8 @@ def load(path, ctx, prepared, opaque):
         data = json.loads(path.read_text())
         if not isinstance(data, dict):
             raise ValueError("compiler facts must be an object")
-        if data.get("format") != FORMAT or any(data.get(k) != v for k, v in identity(ctx.settings).items()):
+        ident = identity(ctx.settings)
+        if data.get("format") != FORMAT or any(data.get(k) != ident[k] for k in _GATE_KEYS):
             raise ValueError("schema, producer or analysis-input identity mismatch")
         expected = {"imports_preserve_pc_rc": ctx.settings.x87_imports_preserve_pc_rc,
                     "entry_contracts": ctx.settings.x87_entry_contracts}

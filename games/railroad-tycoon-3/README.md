@@ -118,5 +118,5 @@ sites in 10 functions. It removes five ordinary arithmetic copies and six
 private call-site CW checks while retaining other preparation and fallback
 conditions. Exploratory roots and allocator/math assumptions remain offline.
 Re-export facts with `tools/recomp/x87_audit.py propagation --facts-out` after
-changing an analysis dependency. Specialized calls transfer state through `X86`
+changing an analysis input or bumping the analysis producer version. Specialized calls transfer state through `X86`
 (CPU fields); the value/result ABI and LLVM backend trials were rejected.
