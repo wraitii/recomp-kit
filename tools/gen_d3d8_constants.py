@@ -63,9 +63,7 @@ def collect(headers):
                     continue
                 name, value = match[1], match[2]
                 if value is None:
-                    if previous is None:
-                        raise ValueError('enum member without value: ' + name)
-                    value = f'({previous}) + 1'
+                    value = '0' if previous is None else f'({previous}) + 1'
                 add(name, value.strip())
                 previous = name
     return table

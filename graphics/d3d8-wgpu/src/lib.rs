@@ -19,6 +19,7 @@ pub mod bridge;
 pub(crate) mod bridge_render;
 pub(crate) mod bridge_translate;
 pub mod d3d8;
+pub mod d3d9;
 pub mod probe;
 
 /// Named failure at the renderer boundary; unsupported behavior is never success.

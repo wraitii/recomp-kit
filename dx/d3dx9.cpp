@@ -1300,31 +1300,6 @@ static void apply_pass(FxEffect &fx) {
 // ---------------------------------------------------------------------------
 // The methods
 // ---------------------------------------------------------------------------
-#define FX_STUB(name)                                                                              \
-    void Fx_##name(X86 *c) {                                                                       \
-        log_once("d3dx9.fx." #name, "d3dx9: ID3DXEffect::" #name " is not implemented");           \
-        com_ret(c, D3D_OKX);                                                                       \
-    }
-
-FX_STUB(GetFunctionDesc)
-FX_STUB(GetParameterElement)
-FX_STUB(GetFunction)
-FX_STUB(GetFunctionByName)
-FX_STUB(GetMatrixPointerArray)
-FX_STUB(GetMatrixTransposeArray)
-FX_STUB(SetMatrixTransposePointerArray)
-FX_STUB(GetMatrixTransposePointerArray)
-FX_STUB(SetString)
-FX_STUB(GetPixelShader)
-FX_STUB(GetVertexShader)
-FX_STUB(SetArrayRange)
-FX_STUB(SetStateManager)
-FX_STUB(GetStateManager)
-FX_STUB(BeginParameterBlock)
-FX_STUB(EndParameterBlock)
-FX_STUB(ApplyParameterBlock)
-FX_STUB(DeleteParameterBlock)
-FX_STUB(CloneEffect)
 
 // (this, pDesc): Creator, Parameters, Techniques, Functions.
 void Fx_GetDesc(X86 *c) {
@@ -1961,94 +1936,6 @@ template <void (*F)(X86 *)> void shared_setter(X86 *c) {
         share_parameter(id, (uint32_t)index);
 }
 
-static const ComMethod g_effect_pool[] = {
-    {"QueryInterface", 3, com_QueryInterface},
-    {"AddRef", 1, com_AddRef},
-    {"Release", 1, com_Release},
-};
-
-static const ComMethod g_effect[] = {
-    {"QueryInterface", 3, com_QueryInterface},
-    {"AddRef", 1, com_AddRef},
-    {"Release", 1, com_Release},
-    {"GetDesc", 2, Fx_GetDesc},
-    {"GetParameterDesc", 3, Fx_GetParameterDesc},
-    {"GetTechniqueDesc", 3, Fx_GetTechniqueDesc},
-    {"GetPassDesc", 3, Fx_GetPassDesc},
-    {"GetFunctionDesc", 3, Fx_GetFunctionDesc},
-    {"GetParameter", 3, Fx_GetParameter},
-    {"GetParameterByName", 3, Fx_GetParameterByName},
-    {"GetParameterBySemantic", 3, Fx_GetParameterBySemantic},
-    {"GetParameterElement", 3, Fx_GetParameterElement},
-    {"GetTechnique", 2, Fx_GetTechnique},
-    {"GetTechniqueByName", 2, Fx_GetTechniqueByName},
-    {"GetPass", 3, Fx_GetPass},
-    {"GetPassByName", 3, Fx_GetPassByName},
-    {"GetFunction", 2, Fx_GetFunction},
-    {"GetFunctionByName", 2, Fx_GetFunctionByName},
-    {"GetAnnotation", 3, Fx_GetAnnotation},
-    {"GetAnnotationByName", 3, Fx_GetAnnotationByName},
-    {"SetValue", 4, shared_setter<Fx_SetValue>},
-    {"GetValue", 4, Fx_GetValue},
-    {"SetBool", 3, shared_setter<Fx_SetBool>},
-    {"GetBool", 3, Fx_GetBool},
-    {"SetBoolArray", 4, shared_setter<Fx_SetBoolArray>},
-    {"GetBoolArray", 4, Fx_GetBoolArray},
-    {"SetInt", 3, shared_setter<Fx_SetInt>},
-    {"GetInt", 3, Fx_GetInt},
-    {"SetIntArray", 4, shared_setter<Fx_SetIntArray>},
-    {"GetIntArray", 4, Fx_GetIntArray},
-    {"SetFloat", 3, shared_setter<Fx_SetFloat>},
-    {"GetFloat", 3, Fx_GetFloat},
-    {"SetFloatArray", 4, shared_setter<Fx_SetFloatArray>},
-    {"GetFloatArray", 4, Fx_GetFloatArray},
-    {"SetVector", 3, shared_setter<Fx_SetVector>},
-    {"GetVector", 3, Fx_GetVector},
-    {"SetVectorArray", 4, shared_setter<Fx_SetVectorArray>},
-    {"GetVectorArray", 4, Fx_GetVectorArray},
-    {"SetMatrix", 3, shared_setter<Fx_SetMatrix>},
-    {"GetMatrix", 3, Fx_GetMatrix},
-    {"SetMatrixArray", 4, shared_setter<Fx_SetMatrixArray>},
-    {"GetMatrixArray", 4, Fx_GetMatrixArray},
-    {"SetMatrixPointerArray", 4, shared_setter<Fx_SetMatrixPointerArray>},
-    {"GetMatrixPointerArray", 4, Fx_GetMatrixPointerArray},
-    {"SetMatrixTranspose", 3, shared_setter<Fx_SetMatrixTranspose>},
-    {"GetMatrixTranspose", 3, Fx_GetMatrixTranspose},
-    {"SetMatrixTransposeArray", 4, shared_setter<Fx_SetMatrixTransposeArray>},
-    {"GetMatrixTransposeArray", 4, Fx_GetMatrixTransposeArray},
-    {"SetMatrixTransposePointerArray", 4, shared_setter<Fx_SetMatrixTransposePointerArray>},
-    {"GetMatrixTransposePointerArray", 4, Fx_GetMatrixTransposePointerArray},
-    {"SetString", 3, shared_setter<Fx_SetString>},
-    {"GetString", 3, Fx_GetString},
-    {"SetTexture", 3, shared_setter<Fx_SetTexture>},
-    {"GetTexture", 3, Fx_GetTexture},
-    {"GetPixelShader", 3, Fx_GetPixelShader},
-    {"GetVertexShader", 3, Fx_GetVertexShader},
-    {"SetArrayRange", 4, Fx_SetArrayRange},
-    {"GetPool", 2, Fx_GetPool},
-    {"SetTechnique", 2, Fx_SetTechnique},
-    {"GetCurrentTechnique", 1, Fx_GetCurrentTechnique},
-    {"ValidateTechnique", 2, Fx_ValidateTechnique},
-    {"FindNextValidTechnique", 3, Fx_FindNextValidTechnique},
-    {"IsParameterUsed", 3, Fx_IsParameterUsed},
-    {"Begin", 3, Fx_Begin},
-    {"BeginPass", 2, Fx_BeginPass},
-    {"CommitChanges", 1, Fx_CommitChanges},
-    {"EndPass", 1, Fx_EndPass},
-    {"End", 1, Fx_End},
-    {"GetDevice", 2, Fx_GetDevice},
-    {"OnLostDevice", 1, Fx_OnLostDevice},
-    {"OnResetDevice", 1, Fx_OnResetDevice},
-    {"SetStateManager", 2, Fx_SetStateManager},
-    {"GetStateManager", 2, Fx_GetStateManager},
-    {"BeginParameterBlock", 1, Fx_BeginParameterBlock},
-    {"EndParameterBlock", 1, Fx_EndParameterBlock},
-    {"ApplyParameterBlock", 2, Fx_ApplyParameterBlock},
-    {"DeleteParameterBlock", 2, Fx_DeleteParameterBlock},
-    {"CloneEffect", 3, Fx_CloneEffect},
-    {"SetRawValue", 5, shared_setter<Fx_SetRawValue>},
-};
-
 void X_D3DXCreateEffectPool(X86 *c) {
     uint32_t out = arg(c, 0);
     ComObj *o = com_new(K_D3DXEFFECTPOOL);
@@ -2140,6 +2027,42 @@ static const ImportShim g_d3dx9_exports[] = {
     {"d3dx9_26.dll", "D3DXVec3Normalize", 2, X_D3DXVec3Normalize},
 };
 
+#include "d3dx9_interfaces.inc"
+#include "d3dx9_33_interfaces.inc"
+#include "d3dx9_imports.inc"
+
+#ifdef RECOMP_D3D9_WGPU
+static bool d3dx9_wgpu_blocked(void (*fn)(X86 *)) {
+    return fn == X_D3DXCreateEffectPool || fn == X_D3DXCreateEffectFromResourceA;
+}
+
+static void d3dx9_register_exports(const ImportShim *shims, size_t count) {
+    std::vector<ImportShim> guarded(shims, shims + count);
+    for (ImportShim &shim : guarded)
+        if (d3dx9_wgpu_blocked(shim.fn))
+            shim.fn = imports_unsupported;
+    imports_register(guarded.data(), guarded.size());
+}
+
+static void d3dx9_define(ComIface iface, const char *dll, const char *name,
+                         const ComMethod *methods, size_t count) {
+    std::vector<ComMethod> guarded(methods, methods + count);
+    for (ComMethod &method : guarded)
+        if (method.fn != com_QueryInterface && method.fn != com_AddRef && method.fn != com_Release)
+            method.fn = imports_unsupported;
+    com_define(iface, dll, name, guarded.data(), guarded.size());
+}
+#else
+static void d3dx9_register_exports(const ImportShim *shims, size_t count) {
+    imports_register(shims, count);
+}
+
+static void d3dx9_define(ComIface iface, const char *dll, const char *name,
+                         const ComMethod *methods, size_t count) {
+    com_define(iface, dll, name, methods, count);
+}
+#endif
+
 void d3dx9_reset() {
     effects().clear();
 }
@@ -2149,11 +2072,25 @@ void d3dx9_register() {
     if (done)
         return;
     done = true;
-    com_define(IF_D3DXEFFECTPOOL, "d3dx9_26.dll", "ID3DXEffectPool", g_effect_pool,
-               std::size(g_effect_pool));
-    com_define(IF_D3DXEFFECT, "d3dx9_26.dll", "ID3DXEffect", g_effect, std::size(g_effect));
+    d3dx9_define(IF_D3DXEFFECTPOOL, "d3dx9_26.dll", "ID3DXEffectPool", g_effect_pool,
+                 std::size(g_effect_pool));
+    d3dx9_define(IF_D3DXEFFECT, "d3dx9_26.dll", "ID3DXEffect", g_effect, std::size(g_effect));
+    com_register_iid(IF_D3DXEFFECTPOOL, IID_ID3DXEffectPool_);
+    com_register_iid(IF_D3DXEFFECT, IID_ID3DXEffect_);
     com_bind(IF_D3DXEFFECTPOOL, K_D3DXEFFECTPOOL);
     com_bind(IF_D3DXEFFECT, K_D3DXEFFECT);
+    d3dx9_define(IF_D3DXEFFECT33, "d3dx9_33.dll", "ID3DXEffect", g_effect_33,
+                 std::size(g_effect_33));
+    d3dx9_define(IF_D3DXBUFFER, "d3dx9_33.dll", "ID3DXBuffer", g_buffer_33, std::size(g_buffer_33));
+    d3dx9_define(IF_D3DXCONSTANTTABLE, "d3dx9_33.dll", "ID3DXConstantTable", g_constant_table_33,
+                 std::size(g_constant_table_33));
+    d3dx9_define(IF_D3DXEFFECTCOMPILER, "d3dx9_33.dll", "ID3DXEffectCompiler", g_effect_compiler_33,
+                 std::size(g_effect_compiler_33));
+    com_register_iid(IF_D3DXEFFECT33, IID_ID3DXEffect_33);
+    com_register_iid(IF_D3DXBUFFER, IID_ID3DXBuffer_33);
+    com_register_iid(IF_D3DXCONSTANTTABLE, IID_ID3DXConstantTable_33);
+    com_register_iid(IF_D3DXEFFECTCOMPILER, IID_ID3DXEffectCompiler_33);
     com_set_destructor(K_D3DXEFFECT, fx_destroy);
-    imports_register(g_d3dx9_exports, std::size(g_d3dx9_exports));
+    d3dx9_register_exports(g_d3dx9_exports, std::size(g_d3dx9_exports));
+    d3dx9_register_exports(g_d3dx9_33_exports, std::size(g_d3dx9_33_exports));
 }

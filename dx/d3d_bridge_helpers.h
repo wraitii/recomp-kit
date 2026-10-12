@@ -3,6 +3,7 @@
 #include "d3d_bridge.h"
 
 #include <cstdint>
+#include <map>
 #include <memory>
 
 struct D3dHostDevice {
@@ -10,6 +11,217 @@ struct D3dHostDevice {
 
     D3dHostDevice() : value(recomp::d3d::new_device()) {}
 };
+
+struct D3d9HostResource;
+
+struct D3d9HostDevice {
+    rust::Box<recomp::d3d::D3d9Device> value;
+
+    D3d9HostDevice() : value(recomp::d3d::new_d3d9_device()) {}
+
+    recomp::d3d::Status register_resource(uint32_t id, const D3d9HostResource &resource);
+    void unregister_resource(uint32_t id) {
+        recomp::d3d::d3d9_unregister_resource(*value, id);
+    }
+    recomp::d3d::D3d9ResetResult reset(const recomp::d3d::D3d9ResetRequest &request) {
+        return recomp::d3d::d3d9_reset(*value, request);
+    }
+    recomp::d3d::ValueResult test_cooperative_level(uint32_t thread_id) {
+        return recomp::d3d::d3d9_test_cooperative_level(*value, thread_id);
+    }
+    recomp::d3d::ValuesResult registered_resource_ids() const {
+        return recomp::d3d::d3d9_registered_resource_ids(*value);
+    }
+    recomp::d3d::Status prepare_resource_reset(uint32_t id, const D3d9HostResource &resource);
+    recomp::d3d::Status reset_ready() {
+        return recomp::d3d::d3d9_reset_ready(*value);
+    }
+    void commit_resource_reset(uint32_t id, D3d9HostResource &resource);
+    recomp::d3d::D3d9ResetResult finish_reset() {
+        return recomp::d3d::d3d9_finish_reset(*value);
+    }
+    recomp::d3d::Status abort_reset() {
+        return recomp::d3d::d3d9_abort_reset(*value);
+    }
+    recomp::d3d::D3d9FrameResult present() {
+        return recomp::d3d::d3d9_present(*value);
+    }
+    recomp::d3d::D3d9SurfaceDescriptorResult backbuffer_descriptor() const {
+        return recomp::d3d::d3d9_backbuffer_descriptor(*value);
+    }
+    recomp::d3d::D3d9SurfaceDescriptorResult depthbuffer_descriptor() const {
+        return recomp::d3d::d3d9_depthbuffer_descriptor(*value);
+    }
+    recomp::d3d::ValueResult number_of_swap_chains() const {
+        return recomp::d3d::d3d9_number_of_swap_chains(*value);
+    }
+    recomp::d3d::D3d9DisplayModeResult
+    display_mode(const recomp::d3d::D3d9DisplayModeRequest &request) const {
+        return recomp::d3d::d3d9_display_mode(*value, request);
+    }
+    recomp::d3d::D3d9CapsResult caps() const {
+        return recomp::d3d::d3d9_device_caps(*value);
+    }
+};
+
+struct D3d9Staging {
+    uint32_t addr = 0;
+    uint32_t size = 0;
+};
+
+struct D3d9HostResource {
+    rust::Box<recomp::d3d::D3d9Resource> value;
+    std::map<uint64_t, D3d9Staging> staging;
+
+    D3d9HostResource() : value(recomp::d3d::new_d3d9_resource()) {}
+
+    recomp::d3d::Status create_buffer(const D3d9HostDevice &device,
+                                      const recomp::d3d::D3d9BufferRequest &request) {
+        return recomp::d3d::d3d9_create_buffer(*device.value, *value, request);
+    }
+
+    recomp::d3d::D3d9TextureCreateResult
+    create_texture(const D3d9HostDevice &device, const recomp::d3d::D3d9TextureRequest &request) {
+        return recomp::d3d::d3d9_create_texture(*device.value, *value, request);
+    }
+
+    recomp::d3d::Status create_surface(const D3d9HostDevice &device,
+                                       const recomp::d3d::D3d9SurfaceRequest &request) {
+        return recomp::d3d::d3d9_create_surface(*device.value, *value, request);
+    }
+
+    recomp::d3d::D3d9BufferDescriptorResult descriptor() const {
+        return recomp::d3d::d3d9_buffer_descriptor(*value);
+    }
+
+    recomp::d3d::D3d9BufferLockResult
+    lock_prepare(const recomp::d3d::D3d9BufferLockRequest &request) {
+        return recomp::d3d::d3d9_buffer_lock_prepare(*value, request);
+    }
+
+    recomp::d3d::D3d9BufferLockResult
+    lock_commit(const recomp::d3d::D3d9BufferLockRequest &request) {
+        return recomp::d3d::d3d9_buffer_lock_commit(*value, request);
+    }
+
+    rust::Slice<const uint8_t> bytes() const {
+        return recomp::d3d::d3d9_buffer_bytes(*value);
+    }
+
+    recomp::d3d::D3d9BufferUnlockResult unlock(rust::Slice<const uint8_t> bytes) {
+        return recomp::d3d::d3d9_buffer_unlock(*value, bytes);
+    }
+
+    recomp::d3d::ValueResult resource_type() const {
+        return recomp::d3d::d3d9_resource_type(*value);
+    }
+
+    recomp::d3d::D3d9TextureDescriptorResult texture_descriptor() const {
+        return recomp::d3d::d3d9_texture_descriptor(*value);
+    }
+
+    recomp::d3d::D3d9SurfaceDescriptorResult surface_descriptor() const {
+        return recomp::d3d::d3d9_surface_descriptor(*value);
+    }
+
+    recomp::d3d::D3d9LevelDescriptorResult texture_level_descriptor(uint32_t face,
+                                                                    uint32_t level) const {
+        return recomp::d3d::d3d9_texture_level_descriptor(*value, face, level);
+    }
+
+    recomp::d3d::D3d9LevelDescriptorResult texture_volume_descriptor(uint32_t level) const {
+        return recomp::d3d::d3d9_texture_volume_descriptor(*value, level);
+    }
+
+    recomp::d3d::D3d9LevelLockResult
+    level_lock_prepare(const recomp::d3d::D3d9LevelLockRequest &request) {
+        return recomp::d3d::d3d9_level_lock_prepare(*value, request);
+    }
+
+    recomp::d3d::D3d9LevelLockResult
+    level_lock_commit(const recomp::d3d::D3d9LevelLockRequest &request) {
+        return recomp::d3d::d3d9_level_lock_commit(*value, request);
+    }
+
+    rust::Slice<const uint8_t> level_bytes(uint32_t face, uint32_t level) const {
+        return recomp::d3d::d3d9_level_bytes(*value, face, level);
+    }
+
+    recomp::d3d::D3d9BufferUnlockResult level_unlock(uint32_t face, uint32_t level,
+                                                     rust::Slice<const uint8_t> bytes) {
+        return recomp::d3d::d3d9_level_unlock(*value, face, level, bytes);
+    }
+
+    recomp::d3d::ValueResult set_priority(uint32_t priority) {
+        return recomp::d3d::d3d9_set_priority(*value, priority);
+    }
+    recomp::d3d::ValueResult priority() const {
+        return recomp::d3d::d3d9_priority(*value);
+    }
+    recomp::d3d::ValueResult set_lod(uint32_t lod) {
+        return recomp::d3d::d3d9_set_lod(*value, lod);
+    }
+    recomp::d3d::ValueResult lod() const {
+        return recomp::d3d::d3d9_lod(*value);
+    }
+    recomp::d3d::Status set_private_data(uint32_t view, rust::Slice<const uint8_t> guid,
+                                         rust::Slice<const uint8_t> data, uint32_t flags) {
+        return recomp::d3d::d3d9_set_private_data(*value, view, guid, data, flags);
+    }
+    recomp::d3d::D3d9PrivateDataResult get_private_data(uint32_t view,
+                                                        rust::Slice<const uint8_t> guid) const {
+        return recomp::d3d::d3d9_get_private_data(*value, view, guid);
+    }
+    recomp::d3d::Status free_private_data(uint32_t view, rust::Slice<const uint8_t> guid) {
+        return recomp::d3d::d3d9_free_private_data(*value, view, guid);
+    }
+    recomp::d3d::Status add_dirty_rect(uint32_t face, uint32_t level, bool full_region,
+                                       const recomp::d3d::D3d9LockRect &rect) {
+        return recomp::d3d::d3d9_add_dirty_rect(*value, face, level, full_region, rect);
+    }
+    recomp::d3d::Status add_dirty_box(uint32_t level, bool full_region,
+                                      const recomp::d3d::D3d9LockBox &bounds) {
+        return recomp::d3d::d3d9_add_dirty_box(*value, level, full_region, bounds);
+    }
+    recomp::d3d::Status preload() {
+        return recomp::d3d::d3d9_preload(*value);
+    }
+    recomp::d3d::Status set_autogen_filter(uint32_t filter) {
+        return recomp::d3d::d3d9_set_autogen_filter(*value, filter);
+    }
+    recomp::d3d::ValueResult autogen_filter() const {
+        return recomp::d3d::d3d9_get_autogen_filter(*value);
+    }
+    recomp::d3d::Status generate_mips() {
+        return recomp::d3d::d3d9_generate_mips(*value);
+    }
+    recomp::d3d::Status upload_buffer() {
+        return recomp::d3d::d3d9_upload_buffer(*value);
+    }
+    recomp::d3d::Status readback_buffer() {
+        return recomp::d3d::d3d9_readback_buffer(*value);
+    }
+    recomp::d3d::Status upload_level(uint32_t face, uint32_t level) {
+        return recomp::d3d::d3d9_upload_level(*value, face, level);
+    }
+    recomp::d3d::Status readback_level(uint32_t face, uint32_t level) {
+        return recomp::d3d::d3d9_readback_level(*value, face, level);
+    }
+};
+
+inline recomp::d3d::Status D3d9HostDevice::register_resource(uint32_t id,
+                                                             const D3d9HostResource &resource) {
+    return recomp::d3d::d3d9_register_resource(*value, id, *resource.value);
+}
+
+inline recomp::d3d::Status
+D3d9HostDevice::prepare_resource_reset(uint32_t id, const D3d9HostResource &resource) {
+    return recomp::d3d::d3d9_prepare_resource_reset(*value, id, *resource.value);
+}
+
+inline void D3d9HostDevice::commit_resource_reset(uint32_t id, D3d9HostResource &resource) {
+    recomp::d3d::d3d9_commit_resource_reset(*value, id, *resource.value);
+}
 
 struct D3dHostStorage {
     rust::Box<recomp::d3d::Storage> value;

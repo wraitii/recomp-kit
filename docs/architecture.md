@@ -71,6 +71,56 @@ texture revisions remain alive until commands that reference them complete.
 Audio queues use their own clock and synchronization. Window events publish
 requests for the guest thread rather than directly executing guest functions.
 
+Guest COM views live in guest memory as a 16-byte header (vtable address,
+magic, host object id and interface id); C++ owns COM identity, interface views
+and reference counts. The Rust renderer owns API state, resources and layouts
+reached through the CXX bridge (`dx/d3d_bridge_helpers.h`). C++ copies scalars
+and borrowed slices in for one synchronous call and writes guest results out;
+Rust never holds a guest address. D3D7 and D3D8 keep device, resource metadata,
+shader records and binding state in Rust.
+
+D3D9 ownership is split by object. The factory's COM identity and references
+stay in C++. Each device owns its `GpuContext`, creation and presentation
+parameters in Rust; C++ keeps its COM identity, factory reference and focus
+window. Rust owns vertex/index buffers, standalone surfaces and 2D/cube/volume
+texture descriptors, CPU layouts/bytes, GPU resources, locks, dirty regions,
+priority/LOD and byte private data. SYSTEMMEM/SCRATCH storage is CPU-only;
+DEFAULT/MANAGED storage has owned wgpu handles and upload/readback paths.
+C++ retains resource/device identities and per-subresource guest staging.
+Texture level surfaces and volumes share the parent's Rust holder, retain the
+parent COM object and cache weak child ids, avoiding a parent/child reference
+cycle. Their private data uses separate Rust view namespaces. Synchronous
+borrowed slices are copied before return; queued work retains its bytes and
+GPU handles. Global COM reset drops holders after guest heap reset and does not
+free stale guest allocations. The device owns one implicit swap chain: Rust
+creates the windowed back buffer and optional auto-depth target, validates
+presentation parameters for create and reset, and presents by reading the
+target back as owned CPU RGBA for the host seam. `Present`, `Reset`,
+`TestCooperativeLevel` and the presentation caps/`Check*` answers are Rust.
+A single shared loss/reset-required token is carried by the device and every
+resource's GPU clone, so blocked contexts stop GPU submissions without being
+classified as physical loss. `Reset` is a staged transaction: implicit targets
+and each live resource's GPU storage are rebuilt from committed CPU bytes off
+the live holders, holder pools are checked against the device registration,
+readiness is confirmed, and only then are handles installed and the device
+moved; the token's reset-required flag clears only after the last holder is
+committed. A healthy `Reset` keeps the existing `GpuContext`; physical loss
+stages a compatible replacement with an isolated callback token. C++ holds
+implicit-surface COM identities as weak device caches, retained device lifetime
+via the ref hook, and guest marshalling. Factory adapter enumeration and
+`GetDisplayMode` report
+the virtual desktop as the current adapter mode and reject adapters or swap
+chains other than 0; an implicit surface's `GetType` is answered in C++ as
+`D3DRTYPE_SURFACE`, because that classification needs no Rust resource state.
+The implicit depth target uses the D3D9 depth-format mapping, not the D3D8 one.
+Declarations, shader/state objects, drawing and queries are later milestones; additional swap-chain objects and Windows resource
+interop remain deferred.
+
+D3DX buffers will own bytes, constant tables will own reflection data, and
+effects, effect compilers and pools will own parameters, preshaders and shared
+values in Rust. C++ retains the COM identity and marshals guest calls for every
+D3D9 and D3DX object. Unported shader/state/query and D3DX methods fail by name.
+
 ## A frame through the host
 
 1. The original game submits DirectDraw/Direct3D operations to `dx/`.

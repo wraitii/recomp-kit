@@ -142,8 +142,13 @@ enum ComIface : uint16_t {
     // model on a DirectDraw object, while IDirect3D9 stands alone.
     IF_D3D9,
     IF_D3DDEVICE9,
+    IF_D3DRESOURCE9,
     IF_D3DXEFFECTPOOL,
     IF_D3DXEFFECT,
+    IF_D3DXEFFECT33,
+    IF_D3DXBUFFER,
+    IF_D3DXCONSTANTTABLE,
+    IF_D3DXEFFECTCOMPILER,
     // The device's resources: what a game creates to draw with.
     IF_D3DTEXTURE9,
     IF_D3DCUBETEXTURE9,
@@ -152,6 +157,12 @@ enum ComIface : uint16_t {
     IF_D3DINDEXBUFFER9,
     IF_D3DVERTEXDECL9,
     IF_D3DQUERY9,
+    IF_D3DBASETEXTURE9,
+    IF_D3DVOLUME9,
+    IF_D3DVOLUMETEXTURE9,
+    IF_D3DVERTEXSHADER9,
+    IF_D3DPIXELSHADER9,
+    IF_D3DSTATEBLOCK9,
     // DirectInput 8: the same objects as DirectInput, reached through the
     // version 8 vtables.
     IF_DINPUT8,
@@ -230,11 +241,14 @@ enum ComKind : uint16_t {
     K_MF_CLOCK,
     K_MF_VIDEO_DISPLAY, // IMFVideoDisplayControl on the session's renderer
     K_MF_AUDIO_VOLUME,
-    K_D3D9,             // the IDirect3D9 factory object
-    K_D3D9DEVICE,       // one device created from it
-    K_D3DXEFFECTPOOL,   // the D3DX effect pool a game shares between effects
-    K_D3DXEFFECT,       // one effect loaded from the executable's resources
-    K_D3D9TEXTURE,      // a 2D or cube texture and its levels
+    K_D3D9,           // the IDirect3D9 factory object
+    K_D3D9DEVICE,     // one device created from it
+    K_D3DXEFFECTPOOL, // the D3DX effect pool a game shares between effects
+    K_D3DXEFFECT,     // one effect loaded from the executable's resources
+    K_D3D9TEXTURE,    // a 2D texture and its levels
+    K_D3D9CUBETEXTURE,
+    K_D3D9VOLUMETEXTURE,
+    K_D3D9VOLUME,
     K_D3D9SURFACE,      // one surface: a texture level, a back buffer, a depth buffer
     K_D3D9VB,           // a vertex buffer
     K_D3D9IB,           // an index buffer
@@ -274,6 +288,8 @@ struct D3dHostDevice;
 struct D3dHostStorage;
 struct D3dHostResource;
 struct D3dHostDevice7State;
+struct D3d9HostDevice;
+struct D3d9HostResource;
 
 // ---------------------------------------------------------------------------
 // The host-side object. One fat struct rather than a class hierarchy: these
@@ -471,6 +487,21 @@ struct ComObj {
     uint32_t vb_fvf = 0;
     uint32_t vb_num_vertices = 0;
     uint32_t vb_caps = 0;
+
+    std::shared_ptr<D3d9HostDevice> d3d9_device;
+    uint32_t d3d9_focus_window = 0;
+    std::shared_ptr<D3d9HostResource> d3d9_resource;
+    bool d3d9_owner_retained = false;
+    uint32_t d3d9_parent = 0; // owning texture/volume texture for a level view
+    uint32_t d3d9_face = 0;
+    uint32_t d3d9_level = 0;
+    bool d3d9_volume = false;
+    bool d3d9_parent_retained = false;
+    std::vector<uint32_t> d3d9_levels; // parent texture's cached level views
+    uint32_t d3d9_backbuffer = 0;
+    uint32_t d3d9_depthbuffer = 0;
+    bool d3d9_implicit = false;
+    bool d3d9_target_depth = false;
 
     std::shared_ptr<D3dHostDevice> d3d8_device;
     std::shared_ptr<D3dHostResource> d3d8_resource;

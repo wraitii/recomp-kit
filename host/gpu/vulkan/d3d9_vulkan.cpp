@@ -989,10 +989,8 @@ class VkRenderer final : public D9Backend {
         if (it == queries_.end() || !it->second.ended)
             return -1;
         Query &q = it->second;
-        if (q.overflow) {
-            *count = 1;
-            return 1;
-        }
+        if (q.overflow)
+            return -1;
         poll();
         if (!q.slots.empty())
             return 0; // its frame has not finished on the GPU

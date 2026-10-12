@@ -40,15 +40,89 @@ add_custom_command(OUTPUT "${RECOMP_D3D8_CONSTANTS}"
   VERBATIM)
 add_custom_target(d3d8_com_tables DEPENDS "${RECOMP_D3D8_COM_TABLES}" "${RECOMP_D3D8_CONSTANTS}")
 
+set(RECOMP_D3D9_GENERATED_DIR "${RECOMP_BUILD_ROOT}/d3d9-generated")
+set(RECOMP_D3D9_INTERFACES "${RECOMP_D3D9_GENERATED_DIR}/d3d9_interfaces.inc")
+add_custom_command(OUTPUT "${RECOMP_D3D9_INTERFACES}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${RECOMP_D3D9_GENERATED_DIR}"
+  COMMAND ${Python3_EXECUTABLE} "${RECOMP_ROOT}/tools/gen_com_interfaces.py"
+          --reference "${RECOMP_ROOT}/third_party/wine-d3d9/d3d9.h"
+          --bindings "${CMAKE_CURRENT_SOURCE_DIR}/d3d9_bindings.json"
+          --sdk-version 33
+          --output "${RECOMP_D3D9_INTERFACES}"
+  DEPENDS "${RECOMP_ROOT}/tools/gen_com_interfaces.py"
+          "${RECOMP_ROOT}/third_party/wine-d3d9/d3d9.h" "${CMAKE_CURRENT_SOURCE_DIR}/d3d9_bindings.json"
+  VERBATIM)
+set(RECOMP_D3D9_CONSTANTS "${RECOMP_D3D9_GENERATED_DIR}/d3d9_constants.inc")
+add_custom_command(OUTPUT "${RECOMP_D3D9_CONSTANTS}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${RECOMP_D3D9_GENERATED_DIR}"
+  COMMAND ${Python3_EXECUTABLE} "${RECOMP_ROOT}/tools/gen_d3d8_constants.py"
+          --reference "${RECOMP_ROOT}/third_party/wine-d3d9/d3d9types.h"
+          --names "${CMAKE_CURRENT_SOURCE_DIR}/d3d9_constants.json"
+          --output "${RECOMP_D3D9_CONSTANTS}"
+  DEPENDS "${RECOMP_ROOT}/tools/gen_d3d8_constants.py"
+          "${RECOMP_ROOT}/third_party/wine-d3d9/d3d9types.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/d3d9_constants.json"
+  VERBATIM)
+set(RECOMP_D3DX9_INTERFACES "${RECOMP_D3D9_GENERATED_DIR}/d3dx9_interfaces.inc")
+add_custom_command(OUTPUT "${RECOMP_D3DX9_INTERFACES}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${RECOMP_D3D9_GENERATED_DIR}"
+  COMMAND ${Python3_EXECUTABLE} "${RECOMP_ROOT}/tools/gen_com_interfaces.py"
+          --reference "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9effect.h"
+          --bindings "${CMAKE_CURRENT_SOURCE_DIR}/d3dx9_bindings.json"
+          --sdk-version 26
+          --output "${RECOMP_D3DX9_INTERFACES}"
+  DEPENDS "${RECOMP_ROOT}/tools/gen_com_interfaces.py"
+          "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9effect.h" "${CMAKE_CURRENT_SOURCE_DIR}/d3dx9_bindings.json"
+  VERBATIM)
+set(RECOMP_D3DX9_33_INTERFACES "${RECOMP_D3D9_GENERATED_DIR}/d3dx9_33_interfaces.inc")
+add_custom_command(OUTPUT "${RECOMP_D3DX9_33_INTERFACES}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${RECOMP_D3D9_GENERATED_DIR}"
+  COMMAND ${Python3_EXECUTABLE} "${RECOMP_ROOT}/tools/gen_com_interfaces.py"
+          --reference "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9core.h"
+                      "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9shader.h"
+                      "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9effect.h"
+          --bindings "${CMAKE_CURRENT_SOURCE_DIR}/d3dx9_33_bindings.json"
+          --sdk-version 33
+          --suffix _33
+          --output "${RECOMP_D3DX9_33_INTERFACES}"
+  DEPENDS "${RECOMP_ROOT}/tools/gen_com_interfaces.py"
+          "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9core.h"
+          "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9shader.h"
+          "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9effect.h" "${CMAKE_CURRENT_SOURCE_DIR}/d3dx9_33_bindings.json"
+  VERBATIM)
+set(RECOMP_D3DX9_IMPORTS "${RECOMP_D3D9_GENERATED_DIR}/d3dx9_imports.inc")
+add_custom_command(OUTPUT "${RECOMP_D3DX9_IMPORTS}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${RECOMP_D3D9_GENERATED_DIR}"
+  COMMAND ${Python3_EXECUTABLE} "${RECOMP_ROOT}/tools/gen_d3dx9_imports.py"
+          --reference "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9core.h"
+                      "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9effect.h"
+                      "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9math.h"
+                      "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9shader.h"
+                      "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9tex.h"
+          --imports "${CMAKE_CURRENT_SOURCE_DIR}/d3dx9_imports.json"
+          --sdk-version 33
+          --output "${RECOMP_D3DX9_IMPORTS}"
+  DEPENDS "${RECOMP_ROOT}/tools/gen_d3dx9_imports.py" "${RECOMP_ROOT}/tools/gen_com_interfaces.py"
+          "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9core.h"
+          "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9effect.h"
+          "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9math.h"
+          "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9shader.h"
+          "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9tex.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/d3dx9_imports.json"
+  VERBATIM)
+add_custom_target(d3d9_generated DEPENDS "${RECOMP_D3D9_INTERFACES}" "${RECOMP_D3D9_CONSTANTS}"
+                  "${RECOMP_D3DX9_INTERFACES}" "${RECOMP_D3DX9_33_INTERFACES}" "${RECOMP_D3DX9_IMPORTS}")
+
 add_library(recomp_dx OBJECT ${RECOMP_DX_SOURCES})
-add_dependencies(recomp_dx d3d8_com_tables)
-target_include_directories(recomp_dx PUBLIC "${RECOMP_D3D8_GENERATED_DIR}")
+add_dependencies(recomp_dx d3d8_com_tables d3d9_generated)
+target_include_directories(recomp_dx PUBLIC "${RECOMP_D3D8_GENERATED_DIR}" "${RECOMP_D3D9_GENERATED_DIR}")
 target_link_libraries(recomp_dx PUBLIC recomp_runtime recomp_frame_dump)
 recomp_link_video(recomp_dx)
 target_compile_options(recomp_dx PRIVATE ${RECOMP_WARN_HOST})
 recomp_optimize(recomp_dx 2)
 
 option(RECOMP_D3D8_WGPU "Build the Rust D3D8/wgpu renderer" OFF)
+option(RECOMP_D3D9_WGPU "Select the Rust D3D9/wgpu scaffold" OFF)
 set(RECOMP_D3D8_WGPU_DIR "")
 if(EXISTS "${RECOMP_GAME_DIR}/graphics/d3d8-wgpu/Cargo.toml")
   set(RECOMP_D3D8_WGPU_DIR "${RECOMP_GAME_DIR}/graphics/d3d8-wgpu")
@@ -129,6 +203,9 @@ if(RECOMP_D3D8_WGPU_DIR AND EXISTS "${RECOMP_D3D8_WGPU_DIR}/Cargo.toml")
   if(RECOMP_D3D8_WGPU)
     target_compile_definitions(recomp_dx PRIVATE RECOMP_D3D8_WGPU=1)
   endif()
+  if(RECOMP_D3D9_WGPU)
+    target_compile_definitions(recomp_dx PRIVATE RECOMP_D3D9_WGPU=1)
+  endif()
   target_link_libraries(recomp_dx PUBLIC d3d8_wgpu)
 else()
   message(FATAL_ERROR "D3D7/D3D8 Rust host crate was not found")
@@ -137,8 +214,8 @@ endif()
 # The same shims with every host callback a strong no-op: a binary linking
 # these can neither draw nor play sound. Profile and mod tests use it.
 add_library(recomp_dx_null OBJECT ${RECOMP_DX_SOURCES})
-add_dependencies(recomp_dx_null d3d8_com_tables)
-target_include_directories(recomp_dx_null PUBLIC "${RECOMP_D3D8_GENERATED_DIR}")
+add_dependencies(recomp_dx_null d3d8_com_tables d3d9_generated)
+target_include_directories(recomp_dx_null PUBLIC "${RECOMP_D3D8_GENERATED_DIR}" "${RECOMP_D3D9_GENERATED_DIR}")
 target_link_libraries(recomp_dx_null PUBLIC recomp_runtime recomp_frame_dump)
 recomp_link_video(recomp_dx_null)
 target_compile_definitions(recomp_dx_null PUBLIC RECOMP_NULL_HOST)

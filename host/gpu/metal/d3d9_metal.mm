@@ -922,10 +922,8 @@ class Renderer final : public D9Backend {
         if (it == queries_.end() || !it->second.ended)
             return -1;
         Query &q = it->second;
-        if (q.overflow) {
-            *count = 1;
-            return 1;
-        }
+        if (q.overflow)
+            return -1;
         if (!fold(q))
             return 0; // its frame has not finished on the GPU
         *count = (uint32_t)std::min<uint64_t>(q.counted, 0xffffffffu);

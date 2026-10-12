@@ -8,6 +8,11 @@ pub mod ffi {
         Backend = 3,
         NotImplemented = 4,
         OutOfMemory = 5,
+        WasStillDrawing = 6,
+        DeviceLost = 7,
+        DeviceNotReset = 8,
+        NoAutogen = 9,
+        NotAvailable = 10,
     }
 
     struct Status {
@@ -178,13 +183,470 @@ pub mod ffi {
         handoff: FrameHandoff,
     }
 
+    #[derive(Clone, Copy)]
+    struct D3d9PresentParams {
+        width: u32,
+        height: u32,
+        format: u32,
+        count: u32,
+        multisample_type: u32,
+        multisample_quality: u32,
+        swap_effect: u32,
+        windowed: u32,
+        enable_auto_depth_stencil: u32,
+        auto_depth_stencil_format: u32,
+        flags: u32,
+        fullscreen_refresh_rate: u32,
+        presentation_interval: u32,
+    }
+
+    struct D3d9DeviceRequest {
+        adapter: u32,
+        device_type: u32,
+        behavior_flags: u32,
+        present: D3d9PresentParams,
+        desktop_format: u32,
+        thread_id: u32,
+    }
+
+    struct D3d9CreateResult {
+        status: Status,
+        present: D3d9PresentParams,
+    }
+
+    #[derive(Clone, Copy)]
+    struct D3d9CreationParameters {
+        adapter: u32,
+        device_type: u32,
+        behavior_flags: u32,
+    }
+
+    struct D3d9CreationParametersResult {
+        status: Status,
+        parameters: D3d9CreationParameters,
+    }
+
+    struct D3d9ResetRequest {
+        present: D3d9PresentParams,
+        desktop_format: u32,
+        implicit_external_refs: bool,
+        window_valid: bool,
+        thread_id: u32,
+    }
+
+    struct D3d9ResetResult {
+        status: Status,
+        present: D3d9PresentParams,
+    }
+
+    struct D3d9AdapterIdentifierResult {
+        status: Status,
+        description: String,
+        vendor_id: u32,
+        device_id: u32,
+        sub_sys_id: u32,
+        revision: u32,
+        whql_level: u32,
+        driver_version_low: u32,
+        driver_version_high: u32,
+    }
+
+    struct D3d9CapsResult {
+        status: Status,
+        caps: Vec<u8>,
+    }
+
+    struct D3d9FrameResult {
+        status: Status,
+        width: u32,
+        height: u32,
+        bytes: Vec<u8>,
+    }
+
+    struct D3d9DisplayModeResult {
+        status: Status,
+        width: u32,
+        height: u32,
+        refresh_rate: u32,
+        format: u32,
+    }
+
+    struct D3d9DisplayModeRequest {
+        swap_chain: u32,
+        width: u32,
+        height: u32,
+        refresh_rate: u32,
+        format: u32,
+    }
+
+    struct D3d9CheckDeviceTypeRequest {
+        adapter: u32,
+        device_type: u32,
+        adapter_format: u32,
+        backbuffer_format: u32,
+        windowed: u32,
+    }
+
+    struct D3d9CheckDeviceFormatRequest {
+        adapter: u32,
+        device_type: u32,
+        adapter_format: u32,
+        usage: u32,
+        resource_type: u32,
+        check_format: u32,
+        windowed: u32,
+    }
+
+    struct D3d9CheckMultiSampleRequest {
+        adapter: u32,
+        device_type: u32,
+        surface_format: u32,
+        windowed: u32,
+        multisample_type: u32,
+    }
+
+    struct D3d9CheckDepthStencilRequest {
+        adapter: u32,
+        device_type: u32,
+        adapter_format: u32,
+        render_target_format: u32,
+        depth_stencil_format: u32,
+    }
+
+    struct D3d9CheckFormatConversionRequest {
+        adapter: u32,
+        device_type: u32,
+        source_format: u32,
+        destination_format: u32,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum D3d9BufferKind {
+        Vertex,
+        Index,
+    }
+
+    struct D3d9BufferRequest {
+        kind: D3d9BufferKind,
+        size: u32,
+        usage: u32,
+        pool: u32,
+        fvf: u32,
+        format: u32,
+        shared_handle: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    struct D3d9BufferDescriptor {
+        format: u32,
+        resource_type: u32,
+        usage: u32,
+        pool: u32,
+        size: u32,
+        fvf: u32,
+    }
+
+    struct D3d9BufferDescriptorResult {
+        status: Status,
+        descriptor: D3d9BufferDescriptor,
+    }
+
+    struct D3d9BufferLockRequest {
+        offset: u32,
+        size: u32,
+        flags: u32,
+    }
+
+    struct D3d9BufferLockResult {
+        status: Status,
+        offset: u32,
+        size: u32,
+        total: u32,
+    }
+
+    struct D3d9BufferUnlockResult {
+        status: Status,
+        closed: bool,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum D3d9TextureKind {
+        Texture2D,
+        Cube,
+        Volume,
+    }
+
+    struct D3d9TextureRequest {
+        kind: D3d9TextureKind,
+        width: u32,
+        height: u32,
+        depth: u32,
+        levels: u32,
+        usage: u32,
+        format: u32,
+        pool: u32,
+        shared_handle: bool,
+    }
+
+    struct D3d9SurfaceRequest {
+        width: u32,
+        height: u32,
+        format: u32,
+        pool: u32,
+        usage: u32,
+        multisample_type: u32,
+        multisample_quality: u32,
+        shared_handle: bool,
+        lockable: bool,
+        discard: bool,
+    }
+
+    struct D3d9TextureCreateResult {
+        status: Status,
+        no_autogen: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    struct D3d9TextureDescriptor {
+        format: u32,
+        resource_type: u32,
+        usage: u32,
+        pool: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+        levels: u32,
+    }
+
+    #[derive(Clone, Copy)]
+    struct D3d9SurfaceDescriptor {
+        format: u32,
+        resource_type: u32,
+        usage: u32,
+        pool: u32,
+        multisample_type: u32,
+        multisample_quality: u32,
+        width: u32,
+        height: u32,
+    }
+
+    #[derive(Clone, Copy)]
+    struct D3d9LevelDescriptor {
+        format: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+        levels: u32,
+    }
+
+    struct D3d9TextureDescriptorResult {
+        status: Status,
+        descriptor: D3d9TextureDescriptor,
+    }
+
+    struct D3d9SurfaceDescriptorResult {
+        status: Status,
+        descriptor: D3d9SurfaceDescriptor,
+    }
+
+    struct D3d9LevelDescriptorResult {
+        status: Status,
+        descriptor: D3d9LevelDescriptor,
+    }
+
+    #[derive(Clone, Copy)]
+    struct D3d9LockRect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[derive(Clone, Copy)]
+    struct D3d9LockBox {
+        left: u32,
+        top: u32,
+        right: u32,
+        bottom: u32,
+        front: u32,
+        back: u32,
+    }
+
+    struct D3d9LevelLockRequest {
+        face: u32,
+        level: u32,
+        volume: bool,
+        full_region: bool,
+        rect: D3d9LockRect,
+        volume_box: D3d9LockBox,
+        flags: u32,
+    }
+
+    struct D3d9LevelLockResult {
+        status: Status,
+        pitch: u32,
+        slice_pitch: u32,
+        offset: u32,
+        size: u32,
+        total: u32,
+    }
+
+    struct D3d9PrivateDataResult {
+        status: Status,
+        found: bool,
+        data: Vec<u8>,
+    }
+
     extern "Rust" {
         type Device;
         type Storage;
         type Device7State;
         type Resource;
+        type D3d9Device;
+        type D3d9Resource;
 
         fn new_device() -> Box<Device>;
+        fn new_d3d9_device() -> Box<D3d9Device>;
+        fn d3d9_create_device(
+            device: &mut D3d9Device,
+            request: &D3d9DeviceRequest,
+        ) -> D3d9CreateResult;
+        fn d3d9_creation_parameters(device: &D3d9Device) -> D3d9CreationParametersResult;
+        fn new_d3d9_resource() -> Box<D3d9Resource>;
+        fn d3d9_create_buffer(
+            device: &D3d9Device,
+            resource: &mut D3d9Resource,
+            request: &D3d9BufferRequest,
+        ) -> Status;
+        fn d3d9_buffer_descriptor(resource: &D3d9Resource) -> D3d9BufferDescriptorResult;
+        fn d3d9_buffer_lock_prepare(
+            resource: &mut D3d9Resource,
+            request: &D3d9BufferLockRequest,
+        ) -> D3d9BufferLockResult;
+        fn d3d9_buffer_lock_commit(
+            resource: &mut D3d9Resource,
+            request: &D3d9BufferLockRequest,
+        ) -> D3d9BufferLockResult;
+        fn d3d9_buffer_bytes(resource: &D3d9Resource) -> &[u8];
+        fn d3d9_buffer_unlock(resource: &mut D3d9Resource, bytes: &[u8]) -> D3d9BufferUnlockResult;
+        fn d3d9_create_texture(
+            device: &D3d9Device,
+            resource: &mut D3d9Resource,
+            request: &D3d9TextureRequest,
+        ) -> D3d9TextureCreateResult;
+        fn d3d9_create_surface(
+            device: &D3d9Device,
+            resource: &mut D3d9Resource,
+            request: &D3d9SurfaceRequest,
+        ) -> Status;
+        fn d3d9_resource_type(resource: &D3d9Resource) -> ValueResult;
+        fn d3d9_texture_descriptor(resource: &D3d9Resource) -> D3d9TextureDescriptorResult;
+        fn d3d9_surface_descriptor(resource: &D3d9Resource) -> D3d9SurfaceDescriptorResult;
+        fn d3d9_texture_level_descriptor(
+            resource: &D3d9Resource,
+            face: u32,
+            level: u32,
+        ) -> D3d9LevelDescriptorResult;
+        fn d3d9_texture_volume_descriptor(
+            resource: &D3d9Resource,
+            level: u32,
+        ) -> D3d9LevelDescriptorResult;
+        fn d3d9_level_lock_prepare(
+            resource: &mut D3d9Resource,
+            request: &D3d9LevelLockRequest,
+        ) -> D3d9LevelLockResult;
+        fn d3d9_level_lock_commit(
+            resource: &mut D3d9Resource,
+            request: &D3d9LevelLockRequest,
+        ) -> D3d9LevelLockResult;
+        fn d3d9_level_bytes(resource: &D3d9Resource, face: u32, level: u32) -> &[u8];
+        fn d3d9_level_unlock(
+            resource: &mut D3d9Resource,
+            face: u32,
+            level: u32,
+            bytes: &[u8],
+        ) -> D3d9BufferUnlockResult;
+        fn d3d9_set_priority(resource: &mut D3d9Resource, priority: u32) -> ValueResult;
+        fn d3d9_priority(resource: &D3d9Resource) -> ValueResult;
+        fn d3d9_set_lod(resource: &mut D3d9Resource, lod: u32) -> ValueResult;
+        fn d3d9_lod(resource: &D3d9Resource) -> ValueResult;
+        fn d3d9_set_private_data(
+            resource: &mut D3d9Resource,
+            view: u32,
+            guid: &[u8],
+            data: &[u8],
+            flags: u32,
+        ) -> Status;
+        fn d3d9_get_private_data(
+            resource: &D3d9Resource,
+            view: u32,
+            guid: &[u8],
+        ) -> D3d9PrivateDataResult;
+        fn d3d9_free_private_data(resource: &mut D3d9Resource, view: u32, guid: &[u8]) -> Status;
+        fn d3d9_add_dirty_rect(
+            resource: &mut D3d9Resource,
+            face: u32,
+            level: u32,
+            full_region: bool,
+            rect: &D3d9LockRect,
+        ) -> Status;
+        fn d3d9_add_dirty_box(
+            resource: &mut D3d9Resource,
+            level: u32,
+            full_region: bool,
+            bounds: &D3d9LockBox,
+        ) -> Status;
+        fn d3d9_preload(resource: &mut D3d9Resource) -> Status;
+        fn d3d9_set_autogen_filter(resource: &mut D3d9Resource, filter: u32) -> Status;
+        fn d3d9_get_autogen_filter(resource: &D3d9Resource) -> ValueResult;
+        fn d3d9_generate_mips(resource: &mut D3d9Resource) -> Status;
+        fn d3d9_autogen_capable(resource: &D3d9Resource) -> ValueResult;
+        fn d3d9_format_autogen_capable(format: u32) -> ValueResult;
+        fn d3d9_upload_buffer(resource: &mut D3d9Resource) -> Status;
+        fn d3d9_readback_buffer(resource: &mut D3d9Resource) -> Status;
+        fn d3d9_upload_level(resource: &mut D3d9Resource, face: u32, level: u32) -> Status;
+        fn d3d9_readback_level(resource: &mut D3d9Resource, face: u32, level: u32) -> Status;
+        fn d3d9_register_resource(
+            device: &mut D3d9Device,
+            id: u32,
+            resource: &D3d9Resource,
+        ) -> Status;
+        fn d3d9_unregister_resource(device: &mut D3d9Device, id: u32) -> Status;
+        fn d3d9_registered_resource_ids(device: &D3d9Device) -> ValuesResult;
+        fn d3d9_reset(device: &mut D3d9Device, request: &D3d9ResetRequest) -> D3d9ResetResult;
+        fn d3d9_test_cooperative_level(device: &mut D3d9Device, thread_id: u32) -> ValueResult;
+        fn d3d9_prepare_resource_reset(
+            device: &mut D3d9Device,
+            id: u32,
+            resource: &D3d9Resource,
+        ) -> Status;
+        fn d3d9_reset_ready(device: &mut D3d9Device) -> Status;
+        fn d3d9_commit_resource_reset(
+            device: &mut D3d9Device,
+            id: u32,
+            resource: &mut D3d9Resource,
+        );
+        fn d3d9_finish_reset(device: &mut D3d9Device) -> D3d9ResetResult;
+        fn d3d9_abort_reset(device: &mut D3d9Device) -> Status;
+        fn d3d9_present(device: &mut D3d9Device) -> D3d9FrameResult;
+        fn d3d9_backbuffer_descriptor(device: &D3d9Device) -> D3d9SurfaceDescriptorResult;
+        fn d3d9_depthbuffer_descriptor(device: &D3d9Device) -> D3d9SurfaceDescriptorResult;
+        fn d3d9_number_of_swap_chains(device: &D3d9Device) -> ValueResult;
+        fn d3d9_display_mode(
+            device: &D3d9Device,
+            request: &D3d9DisplayModeRequest,
+        ) -> D3d9DisplayModeResult;
+        fn d3d9_device_caps(device: &D3d9Device) -> D3d9CapsResult;
+        fn d3d9_adapter_caps(adapter: u32) -> D3d9CapsResult;
+        fn d3d9_adapter_identifier(adapter: u32) -> D3d9AdapterIdentifierResult;
+        fn d3d9_check_device_type(request: &D3d9CheckDeviceTypeRequest) -> Status;
+        fn d3d9_check_device_format(request: &D3d9CheckDeviceFormatRequest) -> Status;
+        fn d3d9_check_device_multisample_type(request: &D3d9CheckMultiSampleRequest)
+        -> ValueResult;
+        fn d3d9_check_depth_stencil_match(request: &D3d9CheckDepthStencilRequest) -> Status;
+        fn d3d9_check_device_format_conversion(
+            request: &D3d9CheckFormatConversionRequest,
+        ) -> Status;
         fn adapter_info() -> AdapterInfoResult;
         fn set_device_dimensions(device: &mut Device, width: u32, height: u32) -> Status;
         fn set_device_format(device: &mut Device, format: u32, depth_format: u32) -> Status;
@@ -577,24 +1039,54 @@ use crate::bridge_render::{
     set_texture_stage_state, set_transform, set_viewport,
 };
 use crate::d3d8::{
-    resource::{format_bytes as cpu_format_bytes, level_layout, D3d8LevelLayout},
+    resource::{D3d8LevelLayout, format_bytes as cpu_format_bytes, level_layout},
     shader::{Declaration, Program},
     state::DeviceState,
 };
+use crate::d3d9::{
+    D3d9Device, D3d9Resource, d3d9_abort_reset, d3d9_adapter_caps, d3d9_adapter_identifier,
+    d3d9_add_dirty_box, d3d9_add_dirty_rect, d3d9_autogen_capable, d3d9_backbuffer_descriptor,
+    d3d9_buffer_bytes, d3d9_buffer_descriptor, d3d9_buffer_lock_commit, d3d9_buffer_lock_prepare,
+    d3d9_buffer_unlock, d3d9_check_depth_stencil_match, d3d9_check_device_format,
+    d3d9_check_device_format_conversion, d3d9_check_device_multisample_type,
+    d3d9_check_device_type, d3d9_commit_resource_reset, d3d9_create_buffer, d3d9_create_device,
+    d3d9_create_surface, d3d9_create_texture, d3d9_creation_parameters,
+    d3d9_depthbuffer_descriptor, d3d9_device_caps, d3d9_display_mode, d3d9_finish_reset,
+    d3d9_format_autogen_capable, d3d9_free_private_data, d3d9_generate_mips,
+    d3d9_get_autogen_filter, d3d9_get_private_data, d3d9_level_bytes, d3d9_level_lock_commit,
+    d3d9_level_lock_prepare, d3d9_level_unlock, d3d9_lod, d3d9_number_of_swap_chains, d3d9_preload,
+    d3d9_prepare_resource_reset, d3d9_present, d3d9_priority, d3d9_readback_buffer,
+    d3d9_readback_level, d3d9_register_resource, d3d9_registered_resource_ids, d3d9_reset,
+    d3d9_reset_ready, d3d9_resource_type, d3d9_set_autogen_filter, d3d9_set_lod, d3d9_set_priority,
+    d3d9_set_private_data, d3d9_surface_descriptor, d3d9_test_cooperative_level,
+    d3d9_texture_descriptor, d3d9_texture_level_descriptor, d3d9_texture_volume_descriptor,
+    d3d9_unregister_resource, d3d9_upload_buffer, d3d9_upload_level, new_d3d9_device,
+    new_d3d9_resource,
+};
 use crate::{
-    backend::GpuContext, d3d8::device::Device as RenderDevice, RenderError, RenderErrorKind,
+    RenderError, RenderErrorKind, backend::GpuContext, d3d8::device::Device as RenderDevice,
 };
 use std::collections::BTreeMap;
 
 pub use ffi::{
     AdapterInfo, AdapterInfoResult, ApplyStateBlockResult, BindingResult, ConstantRead,
     D3d7RenderStateTranslation, D3d7TextureStageTranslation, D3d7TransformTranslation,
-    D3d7TranslationKind, DeviceInfo, DeviceInfoResult, FloatValuesResult, FrameHandoff,
-    FrameHandoffResult, HandleResult, LevelLayout, LevelLayoutResult, Light, LightResult, Material,
-    MaterialResult, PresentParams, Rect, ResourceConfigurationResult, ResourceGenerationResult,
-    ResourceInfo, ResourceLevel, ResourceLevelResult, ShaderHandleResult, StateBlockError, Status,
-    StatusCode, TextureBindings, TextureLevel, TextureSetResult, ValueResult, ValuesResult,
-    Viewport, ViewportResult,
+    D3d7TranslationKind, D3d9AdapterIdentifierResult, D3d9BufferDescriptor,
+    D3d9BufferDescriptorResult, D3d9BufferKind, D3d9BufferLockRequest, D3d9BufferLockResult,
+    D3d9BufferRequest, D3d9BufferUnlockResult, D3d9CapsResult, D3d9CheckDepthStencilRequest,
+    D3d9CheckDeviceFormatRequest, D3d9CheckDeviceTypeRequest, D3d9CheckFormatConversionRequest,
+    D3d9CheckMultiSampleRequest, D3d9CreateResult, D3d9CreationParameters,
+    D3d9CreationParametersResult, D3d9DeviceRequest, D3d9DisplayModeRequest, D3d9DisplayModeResult,
+    D3d9FrameResult, D3d9LevelDescriptor, D3d9LevelDescriptorResult, D3d9LevelLockRequest,
+    D3d9LevelLockResult, D3d9LockBox, D3d9LockRect, D3d9PresentParams, D3d9PrivateDataResult,
+    D3d9ResetRequest, D3d9ResetResult, D3d9SurfaceDescriptor, D3d9SurfaceDescriptorResult,
+    D3d9SurfaceRequest, D3d9TextureCreateResult, D3d9TextureDescriptor,
+    D3d9TextureDescriptorResult, D3d9TextureKind, D3d9TextureRequest, DeviceInfo, DeviceInfoResult,
+    FloatValuesResult, FrameHandoff, FrameHandoffResult, HandleResult, LevelLayout,
+    LevelLayoutResult, Light, LightResult, Material, MaterialResult, PresentParams, Rect,
+    ResourceConfigurationResult, ResourceGenerationResult, ResourceInfo, ResourceLevel,
+    ResourceLevelResult, ShaderHandleResult, StateBlockError, Status, StatusCode, TextureBindings,
+    TextureLevel, TextureSetResult, ValueResult, ValuesResult, Viewport, ViewportResult,
 };
 
 pub struct Device {
@@ -1333,7 +1825,7 @@ pub fn configure_texture_resource(
                 status: status_from_error(error),
                 level_count: 0,
                 levels: Vec::new(),
-            }
+            };
         }
     };
     let mut configured = Vec::new();
@@ -1355,7 +1847,7 @@ pub fn configure_texture_resource(
                     status: status_from_error(error),
                     level_count: 0,
                     levels: Vec::new(),
-                }
+                };
             }
         };
         let value = ResourceLevel {
@@ -1439,7 +1931,7 @@ pub fn create_shader(
                 return ShaderHandleResult {
                     status: status_from_error(error),
                     handle: 0,
-                }
+                };
             }
         }
     };
@@ -1463,7 +1955,7 @@ pub fn create_shader(
                 return ShaderHandleResult {
                     status: status_from_error(error),
                     handle: 0,
-                }
+                };
             }
         }
     };

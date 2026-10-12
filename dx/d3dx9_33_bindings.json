@@ -1,0 +1,26 @@
+[
+  {
+    "interface": "ID3DXBuffer",
+    "table": "g_buffer",
+    "iid": "IID_ID3DXBuffer_",
+    "handlers": {}
+  },
+  {
+    "interface": "ID3DXConstantTable",
+    "table": "g_constant_table",
+    "iid": "IID_ID3DXConstantTable_",
+    "handlers": {}
+  },
+  {
+    "interface": "ID3DXEffectCompiler",
+    "table": "g_effect_compiler",
+    "iid": "IID_ID3DXEffectCompiler_",
+    "handlers": {}
+  },
+  {
+    "interface": "ID3DXEffect",
+    "table": "g_effect",
+    "iid": "IID_ID3DXEffect_",
+    "handlers": {}
+  }
+]

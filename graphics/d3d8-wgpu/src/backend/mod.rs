@@ -207,7 +207,31 @@ impl GpuContext {
             .request_adapter(&wgpu::RequestAdapterOptions::default())
             .await
             .map_err(|e| RenderError::new("new_headless::request_adapter", e.to_string()))?;
-        Self::from_adapter(adapter, None, None).await
+        Self::from_adapter(
+            adapter,
+            None,
+            None,
+            wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER,
+        )
+        .await
+    }
+
+    /// Create a headless context for the D3D9 path.
+    ///
+    /// D3D9 needs block-compressed storage and optional 16-bit normalized
+    /// formats. Features are intersected with the adapter so a device that
+    /// lacks them still opens; the format is then refused by name.
+    pub async fn new_headless_d3d9() -> Result<Self, RenderError> {
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .map_err(|e| RenderError::new("new_headless_d3d9::request_adapter", e.to_string()))?;
+        let requested = wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
+            | wgpu::Features::TEXTURE_COMPRESSION_BC
+            | wgpu::Features::TEXTURE_COMPRESSION_BC_SLICED_3D
+            | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
+        Self::from_adapter(adapter, None, None, requested).await
     }
 
     /// True when this context owns a window surface, i.e. [`GpuContext::present`]
@@ -234,20 +258,26 @@ impl GpuContext {
             })
             .await
             .map_err(|e| RenderError::new("new_windowed::request_adapter", e.to_string()))?;
-        Self::from_adapter(adapter, Some(surface), Some(window)).await
+        Self::from_adapter(
+            adapter,
+            Some(surface),
+            Some(window),
+            wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER,
+        )
+        .await
     }
 
     async fn from_adapter(
         adapter: wgpu::Adapter,
         surface: Option<wgpu::Surface<'static>>,
         window: Option<Arc<winit::window::Window>>,
+        requested_features: wgpu::Features,
     ) -> Result<Self, RenderError> {
         let adapter_info = adapter.get_info();
-        // D3DTADDRESS_BORDER maps to ClampToBorder, an optional wgpu feature.
-        // Request it only when the adapter has it; a guest that then selects
-        // border addressing fails with a named sampler error on adapters
-        // without it instead of the whole device failing to open.
-        let required_features = adapter.features() & wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER;
+        // Optional features are intersected with the adapter. A guest that
+        // selects a feature the adapter lacks fails with a named error later
+        // instead of stopping the whole device from opening.
+        let required_features = adapter.features() & requested_features;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("d3d8-wgpu"),

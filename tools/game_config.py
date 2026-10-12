@@ -280,6 +280,8 @@ def load(game_dir, build_root=None):
     render = cfg.setdefault("render", {})
     if not isinstance(render.setdefault("d3d8_wgpu", False), bool):
         raise ValueError("%s: [render] d3d8_wgpu must be a boolean" % source)
+    if not isinstance(render.setdefault("d3d9_wgpu", False), bool):
+        raise ValueError("%s: [render] d3d9_wgpu must be a boolean" % source)
     input_config = cfg.setdefault("input", {})
     relative_capture = input_config.setdefault("relative_mouse_capture", True)
     if not isinstance(relative_capture, bool):

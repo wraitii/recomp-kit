@@ -1,42 +1,134 @@
 #!/usr/bin/env python3
-"""Generate guest COM slot tables and IIDs from a pinned Wine API header.
+"""Generate guest COM slot tables and IIDs from pinned Wine API headers.
 
 The JSON supplies handler choices only. Names, order and stdcall arity (including
-this) come from the header. Unsupported methods keep named import diagnostics.
-This deliberately accepts the explicit, flattened STDMETHOD form in Wine headers;
-unknown declarations or stale handler names fail rather than producing a partial
-vtable. --check verifies committed output without modifying it.
+this) come from the headers. Unsupported methods keep named import diagnostics.
+Interfaces declared with an inline GUID (`DECLARE_INTERFACE_IID_`) and helper
+interfaces declared with a separate `DEFINE_GUID` are both accepted. Branches
+guarded by `#if D3DX_SDK_VERSION ...` are resolved against `--sdk-version` so an
+interface's GUID and method list match the selected D3DX release. Unknown
+declarations or stale handler names fail rather than producing a partial vtable.
+--check verifies committed output without modifying it.
 """
 import argparse
 import hashlib
 import json
 from pathlib import Path
 import re
+import struct
 import uuid
 
+CONDITION = re.compile(r'^\s*D3DX_SDK_VERSION\s*(<=|>=|==|!=|<|>)\s*(\d+)\s*$')
+METHOD = re.compile(
+    r'STDMETHOD(?:_\([^,]+,\s*(\w+)\s*\)|\(\s*(\w+)\s*\))\s*\((.*?)\)\s*(?:PURE\s*)?;', re.S)
 
-def render(reference, bindings):
-    text = reference.decode('utf-8')
+
+def declaration_pattern(name):
+    return re.compile(r'DECLARE_INTERFACE(?:_IID_|_)?\(' + re.escape(name) +
+                      r',\s*\w+(?:,\s*"[^"]+")?\)\s*\{(.*?)\n\};', re.S)
+
+
+def guid_pattern(name):
+    return re.compile(r'DEFINE_GUID\(\s*IID_' + re.escape(name) + r'\s*,(.*?)\)\s*;', re.S)
+
+
+def evaluate(condition, sdk_version):
+    match = CONDITION.fullmatch(condition)
+    if match is None:
+        raise ValueError('unsupported preprocessor condition: ' + condition)
+    operator, bound = match.groups()
+    bound = int(bound)
+    return {'<=': sdk_version <= bound, '>=': sdk_version >= bound, '==': sdk_version == bound,
+            '!=': sdk_version != bound, '<': sdk_version < bound, '>': sdk_version > bound}[operator]
+
+
+def preprocess(text, sdk_version):
+    """Resolve only D3DX_SDK_VERSION branches, leaving every other directive in place."""
+    output, stack = [], []
+
+    def active():
+        return all(frame['active'] for frame in stack)
+
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith('#'):
+            directive = stripped[1:].strip()
+            keyword = directive.split(None, 1)[0] if directive else ''
+            if keyword in ('if', 'ifdef', 'ifndef'):
+                condition = directive[2:].strip()
+                handled = keyword == 'if' and 'D3DX_SDK_VERSION' in condition
+                state = evaluate(condition, sdk_version) if handled else active()
+                stack.append({'handled': handled, 'active': state, 'taken': state})
+                if not handled:
+                    output.append(line)
+                continue
+            if keyword == 'elif' and stack and stack[-1]['handled']:
+                frame = stack[-1]
+                frame['active'] = not frame['taken'] and evaluate(directive[4:].strip(), sdk_version)
+                frame['taken'] = frame['taken'] or frame['active']
+                continue
+            if keyword == 'else' and stack and stack[-1]['handled']:
+                frame = stack[-1]
+                frame['active'] = not frame['taken']
+                frame['taken'] = True
+                continue
+            if keyword == 'endif':
+                if stack and stack.pop()['handled']:
+                    continue
+            output.append(line)
+            continue
+        if active():
+            output.append(line)
+    return ''.join(output)
+
+
+def guid_from_fields(fields):
+    parts = [part.strip() for part in fields.split(',')]
+    if len(parts) != 11:
+        raise ValueError('malformed GUID: ' + fields)
+    first, second, third = (int(part, 16) for part in parts[:3])
+    tail = bytes(int(part, 16) for part in parts[3:])
+    return struct.pack('<IHH', first, second, third) + tail
+
+
+def interface_iid(text, name):
+    inline = re.search(r'DECLARE_INTERFACE_IID_\(' + re.escape(name) + r',\s*\w+,\s*"([^"]+)"\)', text)
+    if inline is not None:
+        return uuid.UUID(inline.group(1)).bytes_le
+    definitions = guid_pattern(name).findall(text)
+    if not definitions:
+        raise ValueError('missing IID for ' + name)
+    if len(definitions) != 1:
+        raise ValueError(f'ambiguous IID for {name}: {len(definitions)} definitions')
+    return guid_from_fields(definitions[0])
+
+
+def render(references, bindings, sdk_version, suffix=''):
+    raw = '\n'.join(reference.decode('utf-8') for reference in references)
+    text = preprocess(raw, sdk_version)
+    digest = hashlib.sha256(b''.join(references)).hexdigest()
     lines = ['// Generated by tools/gen_com_interfaces.py; do not edit.',
-             '// Reference SHA256: ' + hashlib.sha256(reference).hexdigest(), '']
+             '// Reference SHA256: ' + digest, '']
+    status = []
+    gated = any('flag_on' in item for item in bindings)
     seen = set()
     for binding in bindings:
         name, table, symbol = (binding[key] for key in ('interface', 'table', 'iid'))
+        table, symbol = table + suffix, (symbol.rstrip('_') + suffix if suffix else symbol)
         if name in seen:
             raise ValueError('duplicate interface: ' + name)
         seen.add(name)
+        flag_on = binding.get('flag_on', {})
+        if not isinstance(flag_on, dict):
+            raise ValueError('flag_on must be an object in ' + name)
         for identifier in (name, table, symbol, *binding['handlers'].values()):
-            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', identifier):
+            if not re.fullmatch(r'[A-Za-z_]\w*(?:<[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*>)?', identifier):
                 raise ValueError('invalid C++ identifier: ' + identifier)
-        declaration = re.search(r'DECLARE_INTERFACE_IID_\(' + re.escape(name) +
-                                r',\s*\w+,\s*"([^"]+)"\)\s*\{(.*?)\n\};', text, re.S)
+        declaration = declaration_pattern(name).search(text)
         if declaration is None:
             raise ValueError('missing interface: ' + name)
-        iid = uuid.UUID(declaration[1]).bytes_le
         methods = []
-        pattern = r'STDMETHOD(?:_\([^,]+,\s*(\w+)\s*\)|\(\s*(\w+)\s*\))\s*\((.*?)\)\s*PURE\s*;'
-        body = declaration[2]
-        for method in re.finditer(pattern, body, re.S):
+        for method in METHOD.finditer(declaration[1]):
             method_name = method[1] or method[2]
             args = method[3].strip()
             if args == 'THIS':
@@ -46,36 +138,85 @@ def render(reference, bindings):
             else:
                 raise ValueError('unsupported parameter declaration: ' + args)
             methods.append((method_name, argc))
-        if len(methods) != body.count('STDMETHOD') or not methods:
+        if len(methods) != declaration[1].count('STDMETHOD') or not methods:
             raise ValueError('unparsed methods in ' + name)
-        stale = set(binding['handlers']) - {method[0] for method in methods}
+        raw_declaration = declaration_pattern(name).search(raw)
+        raw_methods = ({method[1] or method[2] for method in METHOD.finditer(raw_declaration[1])}
+                       if raw_declaration is not None else {method[0] for method in methods})
+        stale = set(binding['handlers']) - raw_methods
         if stale:
             raise ValueError('unknown handler methods in ' + name + ': ' + ', '.join(sorted(stale)))
+        stale_flag = set(flag_on) - raw_methods
+        if stale_flag:
+            raise ValueError('unknown flag_on methods in ' + name + ': ' + ', '.join(sorted(stale_flag)))
+        for method, kind in flag_on.items():
+            if method not in binding['handlers']:
+                raise ValueError('flag_on method without handler in ' + name + ': ' + method)
+            if kind not in ('rust', 'native'):
+                raise ValueError('flag_on kind for ' + name + '::' + method + ' must be rust or native')
         lines.append('static const uint8_t ' + symbol + '[16] = {')
-        lines.append('    ' + ', '.join(f'0x{byte:02x}' for byte in iid) + ',')
+        lines.append('    ' + ', '.join(f'0x{byte:02x}' for byte in interface_iid(text, name)) + ',')
         lines.extend(['};', 'static const ComMethod ' + table + '[] = {'])
         for method, argc in methods:
-            handler = binding['handlers'].get(method, 'imports_unsupported')
-            lines.append(f'    {{"{method}", {argc}, {handler}}},')
+            if method in binding['handlers'] and gated and method not in flag_on:
+                lines.extend(['#ifdef RECOMP_D3D9_WGPU',
+                              f'    {{"{method}", {argc}, imports_unsupported}},',
+                              '#else',
+                              f'    {{"{method}", {argc}, {binding["handlers"][method]}}},',
+                              '#endif'])
+            else:
+                handler = binding['handlers'].get(method, 'imports_unsupported')
+                lines.append(f'    {{"{method}", {argc}, {handler}}},')
         lines.extend(['};', ''])
-    return '\n'.join(lines)
+        for method, _ in methods:
+            if binding['handlers'].get(method, 'imports_unsupported') == 'imports_unsupported':
+                flag_on_status, flag_off_status = 'unsupported (named)', 'unsupported (named)'
+            else:
+                kind = flag_on.get(method) if gated else 'native'
+                flag_on_status = kind if kind in ('rust', 'native') else 'unsupported (named)'
+                flag_off_status = 'handler'
+            status.append(f'| {name} | {method} | {flag_on_status} | {flag_off_status} |')
+    return '\n'.join(lines), status
+
+
+def status_document(bindings_path, rows):
+    return ('# Guest COM implementation status\n\n'
+            'Generated by `tools/gen_com_interfaces.py --status-output`; do not edit.\n'
+            'Source: `' + bindings_path.as_posix() + '` and the pinned Wine headers.\n\n'
+            '`rust` routes the method through CXX to Rust when the flag is on; `native` is\n'
+            'C++ that stays correct with the flag on; `unsupported (named)` stops the run\n'
+            'with `dll!Interface::Method` when the flag is on. `handler` in the flag-off\n'
+            'column means the method keeps its legacy C++ implementation.\n\n'
+            '| Interface | Method | Flag-on | Flag-off |\n'
+            '| --- | --- | --- | --- |\n' + '\n'.join(rows) + '\n')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--reference', type=Path, required=True)
+    parser.add_argument('--reference', type=Path, nargs='+', required=True)
     parser.add_argument('--bindings', type=Path, required=True)
+    parser.add_argument('--sdk-version', type=int, default=33)
+    parser.add_argument('--suffix', default='')
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--status-output', type=Path)
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
     try:
-        generated = render(args.reference.read_bytes(), json.loads(args.bindings.read_text()))
+        generated, rows = render([path.read_bytes() for path in args.reference],
+                                 json.loads(args.bindings.read_text()), args.sdk_version,
+                                 args.suffix)
+        outputs = [(args.output, generated)]
+        if args.status_output is not None:
+            outputs.append((args.status_output, status_document(args.bindings, rows)))
+        stale = [str(path) for path, content in outputs
+                 if not path.exists() or path.read_text() != content]
         if args.check:
-            if args.output.read_text() != generated:
-                parser.error(str(args.output) + ' is stale; regenerate COM tables')
-        else:
-            if not args.output.exists() or args.output.read_text() != generated:
-                args.output.write_text(generated)
+            if stale:
+                parser.error(', '.join(stale) + ' stale; regenerate')
+            return
+        for path, content in outputs:
+            if not path.exists() or path.read_text() != content:
+                path.write_text(content)
     except (ValueError, OSError, KeyError) as failure:
         parser.error(str(failure))
 

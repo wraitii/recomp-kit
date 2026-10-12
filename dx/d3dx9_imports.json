@@ -1,0 +1,106 @@
+{
+  "dll": "d3dx9_33.dll",
+  "table": "g_d3dx9_33_exports",
+  "imports": [
+    {
+      "name": "D3DXGetShaderInputSemantics",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXCompileShader",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXGetShaderVersion",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXCreateCubeTextureFromFileExA",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXCompileShaderFromFileA",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXGetShaderConstantTable",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXGetImageInfoFromFileInMemory",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXCreateTextureFromFileInMemory",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXCreateCubeTextureFromFileInMemory",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXCreateVolumeTextureFromFileExA",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXCreateTextureFromFileExA",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXCreateEffectFromFileA",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXCreateEffectCompilerFromFileA",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXAssembleShader",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXAssembleShaderFromFileA",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXGetPixelShaderProfile",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXDebugMute",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXMatrixMultiply",
+      "handler": "X_D3DXMatrixMultiply"
+    },
+    {
+      "name": "D3DXMatrixInverse",
+      "handler": "X_D3DXMatrixInverse"
+    },
+    {
+      "name": "D3DXMatrixTranspose",
+      "handler": "X_D3DXMatrixTranspose"
+    },
+    {
+      "name": "D3DXSaveSurfaceToFileA",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXLoadSurfaceFromSurface",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXSaveTextureToFileA",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXCreateVolumeTextureFromFileInMemory",
+      "handler": "imports_unsupported"
+    },
+    {
+      "name": "D3DXGetVertexShaderProfile",
+      "handler": "imports_unsupported"
+    }
+  ]
+}

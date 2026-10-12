@@ -1,20 +1,3 @@
-// d3d9.cpp - Direct3D 9, for a game that renders through shaders.
-//
-// The kit's other Direct3D module (d3d.cpp) models version 2: a fixed-function
-// recorder reached by QueryInterface on a DirectDraw object. Version 9 shares
-// none of that. It is its own DLL with its own factory function, its own
-// object model, and a device whose drawing is programmable, so it lives here.
-//
-// What works today: the factory object, everything a game asks it before it
-// commits to a device (adapter count, identifier, display mode, device type
-// and format checks, caps) and CreateDevice itself. The device's vtable is
-// complete and correctly ordered - a guest calls these by slot index, so the
-// order is the interface - but only the handful of methods below do anything;
-// every other slot reports itself once and returns D3D_OK. That turns what
-// was a crash into a list of exactly which device methods this game uses,
-// which is what the drawing work needs next.
-//
-// Nothing here rasterizes. No pixels are produced by this file yet.
 #include "com.h"
 #include "dx.h"
 #include "../runtime/guest.h"
@@ -24,6 +7,16 @@
 #include "d3d9_raster.h"
 #include "d3d9_shader.h"
 #include "host_d9.h"
+#include "frame_dump.h"
+#include "d3d9_constants.inc"
+#include "d3d_bridge_helpers.h"
+#include "../runtime/win32.h"
+#include "../runtime/display_seam.h"
+#ifdef RECOMP_D3D9_WGPU
+constexpr bool kD3d9WgpuEnabled = true;
+#else
+constexpr bool kD3d9WgpuEnabled = false;
+#endif
 #include <unordered_map>
 #include <map>
 
@@ -32,34 +25,45 @@
 #include <algorithm>
 #include <initializer_list>
 
-#define IID_BYTES(a, b, c, d0, d1, d2, d3, d4, d5, d6, d7)                                         \
-    {(uint8_t)((a) & 0xff),                                                                        \
-     (uint8_t)(((a) >> 8) & 0xff),                                                                 \
-     (uint8_t)(((a) >> 16) & 0xff),                                                                \
-     (uint8_t)(((a) >> 24) & 0xff),                                                                \
-     (uint8_t)((b) & 0xff),                                                                        \
-     (uint8_t)(((b) >> 8) & 0xff),                                                                 \
-     (uint8_t)((c) & 0xff),                                                                        \
-     (uint8_t)(((c) >> 8) & 0xff),                                                                 \
-     d0,                                                                                           \
-     d1,                                                                                           \
-     d2,                                                                                           \
-     d3,                                                                                           \
-     d4,                                                                                           \
-     d5,                                                                                           \
-     d6,                                                                                           \
-     d7}
-
-// {81BDCBCA-64D4-426d-AE8D-AD0147F4275C} and {D0223B96-BF7A-43fd-92BD-A43B0D82B9EB}
-static const uint8_t IID_IDirect3D9_[16] =
-    IID_BYTES(0x81bdcbca, 0x64d4, 0x426d, 0xae, 0x8d, 0xad, 0x01, 0x47, 0xf4, 0x27, 0x5c);
-static const uint8_t IID_IDirect3DDevice9_[16] =
-    IID_BYTES(0xd0223b96, 0xbf7a, 0x43fd, 0x92, 0xbd, 0xa4, 0x3b, 0x0d, 0x82, 0xb9, 0xeb);
-
 #define MAKE_D3DHRESULT(code) (0x88760000u | (uint32_t)(code))
 static const uint32_t D3D_OK9 = 0u;
 static const uint32_t D3DERR_NOTAVAILABLE = MAKE_D3DHRESULT(2154);
 static const uint32_t D3DERR_INVALIDCALL = MAKE_D3DHRESULT(2156);
+static const uint32_t D3DERR_NOTFOUND = MAKE_D3DHRESULT(2150);
+static const uint32_t D3DERR_MOREDATA = MAKE_D3DHRESULT(2151);
+static const uint32_t D3DERR_DEVICELOST = MAKE_D3DHRESULT(2152);
+static const uint32_t D3DERR_DEVICENOTRESET = MAKE_D3DHRESULT(2153);
+static const uint32_t D3DOK_NOAUTOGEN = 0x08760000u | 2159u;
+
+static uint32_t bridge_result(X86 *c, const recomp::d3d::Status &status) {
+    if (status.code == recomp::d3d::StatusCode::Ok)
+        return D3D_OK9;
+    std::string message(status.message.data(), status.message.size());
+    LOGW("d3d9: %s", message.c_str());
+    if (status.code == recomp::d3d::StatusCode::Unsupported ||
+        status.code == recomp::d3d::StatusCode::NotImplemented)
+        imports_unsupported(c);
+    if (status.code == recomp::d3d::StatusCode::InvalidArgument)
+        return D3DERR_INVALIDCALL;
+    if (status.code == recomp::d3d::StatusCode::OutOfMemory)
+        return E_OUTOFMEMORY;
+    if (status.code == recomp::d3d::StatusCode::WasStillDrawing)
+        return MAKE_D3DHRESULT(540);
+    if (status.code == recomp::d3d::StatusCode::DeviceLost)
+        return D3DERR_DEVICELOST;
+    if (status.code == recomp::d3d::StatusCode::DeviceNotReset)
+        return D3DERR_DEVICENOTRESET;
+    if (status.code == recomp::d3d::StatusCode::NoAutogen)
+        return D3DOK_NOAUTOGEN;
+    if (status.code == recomp::d3d::StatusCode::NotAvailable)
+        return D3DERR_NOTAVAILABLE;
+    return D3DERR_NOTAVAILABLE;
+}
+
+static void d3d9_setup_guest_fpu(X86 *c, uint32_t behavior_flags) {
+    if (!(behavior_flags & 0x2u))
+        x87_set_cw(c, (uint16_t)((c->fpu_cw & ~0x0f3fu) | 0x003fu));
+}
 
 // Defined with the resources further down.
 struct ComObj;
@@ -70,6 +74,16 @@ static HostD9Target gpu_target(ComObj *dev);
 static void target_viewport(ComObj *dev, const HostD9Target &t, int32_t vp[4]);
 static void gpu_target_drawn(ComObj *dev, bool color, bool depth);
 static void gpu_sync(ComObj *o);
+static void device_discard_implicit_surfaces(ComObj *dev);
+static bool implicit_surface_externally_referenced(uint32_t field);
+static void create_texture_wgpu(X86 *c, recomp::d3d::D3d9TextureKind kind);
+static void create_surface_wgpu(X86 *c, uint32_t out_index, uint32_t usage);
+static ComObj *com_level_view(ComObj *tex, uint32_t face, uint32_t level, bool volume);
+static void level_lock_wgpu(X86 *c, ComObj *o, uint32_t face, uint32_t level, bool volume,
+                            uint32_t rect_addr, uint32_t box_addr, uint32_t flags, uint32_t out,
+                            bool box_output);
+static void level_unlock_wgpu(X86 *c, ComObj *o, uint32_t face, uint32_t level);
+static ComObj *level_owner(ComObj *o, uint32_t *face, uint32_t *level, bool *volume);
 
 // One scratch block for structures a method fills in for the guest.
 static uint32_t g_scratch = 0, g_scratch_size = 0;
@@ -110,8 +124,30 @@ void D9_GetAdapterCount(X86 *c) {
 // driver version, four ids, the identifier GUID and the WHQL level.
 void D9_GetAdapterIdentifier(X86 *c) {
     uint32_t out = arg(c, 3);
-    if (!out) {
+    if (!out || (kD3d9WgpuEnabled && (!this_d3d9(c) || arg(c, 1) != 0 || !gm_valid(out, 1100)))) {
         com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (kD3d9WgpuEnabled) {
+        recomp::d3d::D3d9AdapterIdentifierResult result =
+            recomp::d3d::d3d9_adapter_identifier(arg(c, 1));
+        if (result.status.code != recomp::d3d::StatusCode::Ok) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        }
+        memset(gm_ptr(out), 0, 1100);
+        std::string description(result.description.data(), result.description.size());
+        gm_put_str(out, "wgpu", 512);
+        gm_put_str(out + 512, description.c_str(), 512);
+        gm_put_str(out + 1024, "\\\\.\\DISPLAY1", 32);
+        wr32(out + 1056, result.driver_version_low);
+        wr32(out + 1060, result.driver_version_high);
+        wr32(out + 1064, result.vendor_id);
+        wr32(out + 1068, result.device_id);
+        wr32(out + 1072, result.sub_sys_id);
+        wr32(out + 1076, result.revision);
+        wr32(out + 1096, result.whql_level);
+        com_ret(c, D3D_OK9);
         return;
     }
     memset(gm_ptr(out), 0, 1100);
@@ -132,7 +168,24 @@ void D9_GetAdapterIdentifier(X86 *c) {
     com_ret(c, D3D_OK9);
 }
 
+static uint32_t desktop_format9() {
+    uint32_t w = 0, h = 0, bpp = 0;
+    win32_display_mode(&w, &h, &bpp);
+    return bpp == 32 ? 22u : bpp == 16 ? 23u : 0u;
+}
+
+// Mode enumeration reports the one virtual-desktop mode, and the count matches
+// exactly that format so a caller never enumerates a mode it was not counted.
 void D9_GetAdapterModeCount(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        if (!this_d3d9(c) || arg(c, 1) != 0) {
+            set_eax(c, 0);
+            return;
+        }
+        uint32_t desktop = desktop_format9();
+        set_eax(c, desktop != 0 && arg(c, 2) == desktop ? 1u : 0u);
+        return;
+    }
     set_eax(c, 1);
 }
 
@@ -140,24 +193,90 @@ void D9_GetAdapterModeCount(X86 *c) {
 static void put_display_mode(uint32_t p) {
     if (!p)
         return;
-    wr32(p + 0, 1280);
-    wr32(p + 4, 960);
-    wr32(p + 8, 60);
-    wr32(p + 12, 22);
+    if (!kD3d9WgpuEnabled) {
+        wr32(p + 0, 1280);
+        wr32(p + 4, 960);
+        wr32(p + 8, 60);
+        wr32(p + 12, 22);
+        return;
+    }
+    uint32_t w = 0, h = 0, bpp = 0;
+    win32_display_mode(&w, &h, &bpp);
+    wr32(p + 0, w);
+    wr32(p + 4, h);
+    wr32(p + 8, 0);
+    wr32(p + 12, desktop_format9());
 }
 void D9_EnumAdapterModes(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        ComObj *d3d = this_d3d9(c);
+        uint32_t out = arg(c, 4);
+        uint32_t desktop = desktop_format9();
+        if (!d3d || arg(c, 1) != 0 || !out || !gm_valid(out, 16) || arg(c, 3) != 0 ||
+            desktop == 0 || arg(c, 2) != desktop) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        put_display_mode(out);
+        com_ret(c, D3D_OK9);
+        return;
+    }
     put_display_mode(arg(c, 4));
     com_ret(c, D3D_OK9);
 }
 void D9_GetAdapterDisplayMode(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        ComObj *d3d = this_d3d9(c);
+        uint32_t out = arg(c, 2);
+        if (!d3d || arg(c, 1) != 0 || !out || !gm_valid(out, 16)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        if (desktop_format9() == 0) {
+            com_ret(c, D3DERR_NOTAVAILABLE);
+            return;
+        }
+        put_display_mode(out);
+        com_ret(c, D3D_OK9);
+        return;
+    }
     put_display_mode(arg(c, 2));
     com_ret(c, D3D_OK9);
 }
 void D9_CheckDeviceType(X86 *c) {
-    com_ret(c, D3D_OK9);
+    if (!kD3d9WgpuEnabled) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    if (!this_d3d9(c)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3d9CheckDeviceTypeRequest request{};
+    request.adapter = arg(c, 1);
+    request.device_type = arg(c, 2);
+    request.adapter_format = arg(c, 3);
+    request.backbuffer_format = arg(c, 4);
+    request.windowed = arg(c, 5);
+    com_ret(c, bridge_result(c, recomp::d3d::d3d9_check_device_type(request)));
 }
 void D9_CheckDeviceFormat(X86 *c) {
-    com_ret(c, D3D_OK9);
+    if (!kD3d9WgpuEnabled) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    if (!this_d3d9(c)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3d9CheckDeviceFormatRequest request{};
+    request.adapter = arg(c, 1);
+    request.device_type = arg(c, 2);
+    request.adapter_format = arg(c, 3);
+    request.usage = arg(c, 4);
+    request.resource_type = arg(c, 5);
+    request.check_format = arg(c, 6);
+    com_ret(c, bridge_result(c, recomp::d3d::d3d9_check_device_format(request)));
 }
 // D3DMULTISAMPLE_TYPE and quality as a sample count: 2x and 4x, which every
 // Apple GPU renders. NONMASKABLE (1) offers them as quality levels 0 and 1.
@@ -171,6 +290,24 @@ static uint32_t multisample_count(uint32_t type, uint32_t quality) {
 // (this, Adapter, DeviceType, SurfaceFormat, Windowed, MultiSampleType,
 // pQualityLevels)
 void D9_CheckDeviceMultiSampleType(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        uint32_t quality = arg(c, 6);
+        if (!this_d3d9(c) || (quality && !gm_valid(quality, 4))) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::D3d9CheckMultiSampleRequest request{};
+        request.adapter = arg(c, 1);
+        request.device_type = arg(c, 2);
+        request.surface_format = arg(c, 3);
+        request.windowed = arg(c, 4);
+        request.multisample_type = arg(c, 5);
+        recomp::d3d::ValueResult result = recomp::d3d::d3d9_check_device_multisample_type(request);
+        if (result.status.code == recomp::d3d::StatusCode::Ok && quality)
+            wr32(quality, result.value);
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
     uint32_t type = arg(c, 5), quality = arg(c, 6);
     uint32_t levels = type == 0 ? 1 : type == 1 ? 2 : (type == 2 || type == 4) ? 1 : 0;
     if (!levels) {
@@ -182,10 +319,37 @@ void D9_CheckDeviceMultiSampleType(X86 *c) {
     com_ret(c, D3D_OK9);
 }
 void D9_CheckDepthStencilMatch(X86 *c) {
-    com_ret(c, D3D_OK9);
+    if (!kD3d9WgpuEnabled) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    if (!this_d3d9(c)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3d9CheckDepthStencilRequest request{};
+    request.adapter = arg(c, 1);
+    request.device_type = arg(c, 2);
+    request.adapter_format = arg(c, 3);
+    request.render_target_format = arg(c, 4);
+    request.depth_stencil_format = arg(c, 5);
+    com_ret(c, bridge_result(c, recomp::d3d::d3d9_check_depth_stencil_match(request)));
 }
 void D9_CheckDeviceFormatConversion(X86 *c) {
-    com_ret(c, D3D_OK9);
+    if (!kD3d9WgpuEnabled) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    if (!this_d3d9(c)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3d9CheckFormatConversionRequest request{};
+    request.adapter = arg(c, 1);
+    request.device_type = arg(c, 2);
+    request.source_format = arg(c, 3);
+    request.destination_format = arg(c, 4);
+    com_ret(c, bridge_result(c, recomp::d3d::d3d9_check_device_format_conversion(request)));
 }
 
 // D3DCAPS9 (304 bytes), as a GeForce 7800 GTX reports it for what the
@@ -197,7 +361,7 @@ static void put_caps9(uint32_t p) {
         return;
     memset(gm_ptr(p), 0, 304);
     auto f = [&](uint32_t off, float v) { wrf32(p + off, v); };
-    wr32(p + 0, 1);            // DeviceType: D3DDEVTYPE_HAL
+    wr32(p + 0, D3DDEVTYPE_HAL);
     wr32(p + 8, 0x00020000u);  // Caps: READ_SCANLINE
     wr32(p + 12, 0x00020000u); // Caps2: FULLSCREENGAMMA
     wr32(
@@ -279,18 +443,133 @@ static void put_caps9(uint32_t p) {
     wr32(p + 300, 32768);       // MaxPixelShader30InstructionSlots
 }
 void D9_GetDeviceCaps(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        uint32_t out = arg(c, 3);
+        if (!this_d3d9(c) || arg(c, 1) != 0 || arg(c, 2) != D3DDEVTYPE_HAL || !out ||
+            !gm_valid(out, 304)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::D3d9CapsResult result = recomp::d3d::d3d9_adapter_caps(arg(c, 1));
+        if (result.status.code != recomp::d3d::StatusCode::Ok || result.caps.size() != 304) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        }
+        memcpy(gm_ptr(out), result.caps.data(), 304);
+        com_ret(c, D3D_OK9);
+        return;
+    }
     put_caps9(arg(c, 3));
     com_ret(c, D3D_OK9);
 }
 void D9_GetAdapterMonitor(X86 *c) {
+    if (kD3d9WgpuEnabled && (!this_d3d9(c) || arg(c, 1) != 0)) {
+        set_eax(c, 0);
+        return;
+    }
     set_eax(c, 1); // a non-null HMONITOR
 }
 
 void D9_CreateDevice(X86 *c) {
     ComObj *d3d = this_d3d9(c);
     uint32_t present = arg(c, 5), out = arg(c, 6);
-    if (!d3d || !out) {
+    if (!out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (kD3d9WgpuEnabled)
+        com_out_ptr(out, 0);
+    if (!d3d) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (kD3d9WgpuEnabled) {
+        if (!present || !gm_valid(present, 56)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::D3d9DeviceRequest request{};
+        request.adapter = arg(c, 1);
+        request.device_type = arg(c, 2);
+        request.behavior_flags = arg(c, 4);
+        request.present.width = rd32(present + 0);
+        request.present.height = rd32(present + 4);
+        request.present.format = rd32(present + 8);
+        request.present.count = rd32(present + 12);
+        request.present.multisample_type = rd32(present + 16);
+        request.present.multisample_quality = rd32(present + 20);
+        request.present.swap_effect = rd32(present + 24);
+        request.present.windowed = rd32(present + 32);
+        request.present.enable_auto_depth_stencil = rd32(present + 36);
+        request.present.auto_depth_stencil_format = rd32(present + 40);
+        request.present.flags = rd32(present + 44);
+        request.present.fullscreen_refresh_rate = rd32(present + 48);
+        request.present.presentation_interval = rd32(present + 52);
+        uint32_t focus_window = arg(c, 3);
+        uint32_t device_window = rd32(present + 28);
+        if (!device_window)
+            device_window = focus_window;
+        if (focus_window && !host_window_rect(focus_window, nullptr, nullptr, nullptr, nullptr)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        if (request.present.windowed) {
+            int32_t w = 0, h = 0;
+            if (!device_window || !host_window_rect(device_window, nullptr, nullptr, &w, &h) ||
+                w <= 0 || h <= 0) {
+                com_ret(c, D3DERR_INVALIDCALL);
+                return;
+            }
+            if (!request.present.width)
+                request.present.width = (uint32_t)w;
+            if (!request.present.height)
+                request.present.height = (uint32_t)h;
+        }
+        request.desktop_format = desktop_format9();
+        request.thread_id = guest_current_thread_id();
+        ComObj *dev = com_new(K_D3D9DEVICE);
+        if (!dev) {
+            com_ret(c, E_OUTOFMEMORY);
+            return;
+        }
+        dev->dev_d3d = d3d->id;
+        com_addref(d3d);
+        dev->d3d9_focus_window = focus_window;
+        dev->d3d9_device = std::make_shared<D3d9HostDevice>();
+        uint16_t previous_cw = c->fpu_cw;
+        d3d9_setup_guest_fpu(c, request.behavior_flags);
+        LOGW("d3d9: CreateDevice wgpu behavior=0x%x guest FPU CW %04x -> %04x",
+             request.behavior_flags, previous_cw, c->fpu_cw);
+        recomp::d3d::D3d9CreateResult result =
+            recomp::d3d::d3d9_create_device(*dev->d3d9_device->value, request);
+        if (result.status.code != recomp::d3d::StatusCode::Ok) {
+            com_release(dev);
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        }
+        uint32_t view = com_view(dev, IF_D3DDEVICE9);
+        if (!view) {
+            com_release(dev);
+            com_ret(c, E_OUTOFMEMORY);
+            return;
+        }
+        wr32(present + 0, result.present.width);
+        wr32(present + 4, result.present.height);
+        wr32(present + 8, result.present.format);
+        wr32(present + 12, result.present.count);
+        wr32(present + 16, result.present.multisample_type);
+        wr32(present + 20, result.present.multisample_quality);
+        wr32(present + 24, result.present.swap_effect);
+        wr32(present + 36, result.present.enable_auto_depth_stencil);
+        wr32(present + 40, result.present.auto_depth_stencil_format);
+        wr32(present + 44, result.present.flags);
+        wr32(present + 48, result.present.fullscreen_refresh_rate);
+        wr32(present + 52, result.present.presentation_interval);
+        dev->width = result.present.width;
+        dev->height = result.present.height;
+        dev->bpp = 32;
+        com_out_ptr(out, view);
+        com_ret(c, D3D_OK9);
         return;
     }
     com_out_ptr(out, 0);
@@ -336,96 +615,6 @@ void D9_CreateDevice(X86 *c) {
 static ComObj *device_backbuffer(ComObj *dev);
 static ComObj *device_depthbuffer(ComObj *dev);
 
-// ---------------------------------------------------------------------------
-// IDirect3DDevice9
-//
-// Every slot is named and in its interface order, because a guest calls them
-// by index. A stub reports itself once and returns D3D_OK: a game that is
-// told "no" by a method it expects to work usually stops, and stopping tells
-// us less than carrying on does.
-// ---------------------------------------------------------------------------
-#define D9_STUB(name, argc)                                                                        \
-    void Dev_##name(X86 *c) {                                                                      \
-        log_once("d3d9.dev." #name, "d3d9: IDirect3DDevice9::" #name " is not implemented");       \
-        (void)argc;                                                                                \
-        com_ret(c, D3D_OK9);                                                                       \
-    }
-
-D9_STUB(EvictManagedResources, 1)
-D9_STUB(GetDisplayMode, 3)
-D9_STUB(GetCreationParameters, 2)
-D9_STUB(SetCursorProperties, 4)
-D9_STUB(SetCursorPosition, 4)
-D9_STUB(ShowCursor, 2)
-D9_STUB(CreateAdditionalSwapChain, 3)
-D9_STUB(GetSwapChain, 3)
-D9_STUB(GetRasterStatus, 3)
-D9_STUB(SetDialogBoxMode, 2)
-D9_STUB(SetGammaRamp, 4)
-D9_STUB(GetGammaRamp, 3)
-D9_STUB(CreateVolumeTexture, 9)
-D9_STUB(UpdateSurface, 5)
-D9_STUB(UpdateTexture, 3)
-D9_STUB(GetRenderTargetData, 3)
-D9_STUB(GetFrontBufferData, 3)
-D9_STUB(ColorFill, 4)
-D9_STUB(GetTransform, 3)
-D9_STUB(MultiplyTransform, 3)
-D9_STUB(SetMaterial, 2)
-D9_STUB(GetMaterial, 2)
-D9_STUB(SetLight, 3)
-D9_STUB(GetLight, 3)
-D9_STUB(LightEnable, 3)
-D9_STUB(GetLightEnable, 3)
-D9_STUB(SetClipPlane, 3)
-D9_STUB(GetClipPlane, 3)
-D9_STUB(GetRenderState, 3)
-D9_STUB(CreateStateBlock, 3)
-D9_STUB(BeginStateBlock, 1)
-D9_STUB(EndStateBlock, 2)
-D9_STUB(SetClipStatus, 2)
-D9_STUB(GetClipStatus, 2)
-D9_STUB(GetTexture, 3)
-D9_STUB(GetTextureStageState, 4)
-D9_STUB(GetSamplerState, 4)
-D9_STUB(ValidateDevice, 2)
-D9_STUB(SetPaletteEntries, 3)
-D9_STUB(GetPaletteEntries, 3)
-D9_STUB(SetCurrentTexturePalette, 2)
-D9_STUB(GetCurrentTexturePalette, 2)
-D9_STUB(GetScissorRect, 2)
-D9_STUB(SetSoftwareVertexProcessing, 2)
-D9_STUB(GetSoftwareVertexProcessing, 1)
-D9_STUB(SetNPatchMode, 2)
-D9_STUB(GetNPatchMode, 1)
-D9_STUB(ProcessVertices, 6)
-D9_STUB(GetVertexDeclaration, 2)
-D9_STUB(SetFVF, 2)
-D9_STUB(GetFVF, 2)
-D9_STUB(CreateVertexShader, 3)
-D9_STUB(SetVertexShader, 2)
-D9_STUB(GetVertexShader, 2)
-D9_STUB(GetVertexShaderConstantF, 4)
-D9_STUB(SetVertexShaderConstantI, 4)
-D9_STUB(GetVertexShaderConstantI, 4)
-D9_STUB(SetVertexShaderConstantB, 4)
-D9_STUB(GetVertexShaderConstantB, 4)
-D9_STUB(GetStreamSource, 5)
-D9_STUB(SetStreamSourceFreq, 3)
-D9_STUB(GetStreamSourceFreq, 3)
-D9_STUB(GetIndices, 2)
-D9_STUB(CreatePixelShader, 3)
-D9_STUB(SetPixelShader, 2)
-D9_STUB(GetPixelShader, 2)
-D9_STUB(GetPixelShaderConstantF, 4)
-D9_STUB(SetPixelShaderConstantI, 4)
-D9_STUB(GetPixelShaderConstantI, 4)
-D9_STUB(SetPixelShaderConstantB, 4)
-D9_STUB(GetPixelShaderConstantB, 4)
-D9_STUB(DrawRectPatch, 4)
-D9_STUB(DrawTriPatch, 4)
-D9_STUB(DeletePatch, 2)
-
 // (this, pRect)
 void Dev_SetScissorRect(X86 *c) {
     ComObj *dev = this_device9(c);
@@ -440,14 +629,111 @@ static ComObj *device_backbuffer(ComObj *dev);
 static ComObj *device_depthbuffer(ComObj *dev);
 static void device_forget_buffers(ComObj *dev);
 
-// (this, pPresentationParameters): new back buffer and depth buffer at the
-// new size; every resource the game made itself survives, as with
-// D3DPOOL_MANAGED.
+static void d3d9_reset_transaction(ComObj *dev, const recomp::d3d::D3d9ResetRequest &request,
+                                   recomp::d3d::D3d9ResetResult &result) {
+    result = dev->d3d9_device->reset(request);
+    if (result.status.code != recomp::d3d::StatusCode::Ok)
+        return;
+    recomp::d3d::ValuesResult ids = dev->d3d9_device->registered_resource_ids();
+    if (ids.status.code != recomp::d3d::StatusCode::Ok) {
+        dev->d3d9_device->abort_reset();
+        result.status = ids.status;
+        return;
+    }
+    for (uint32_t id : ids.values) {
+        ComObj *o = com_get(id);
+        if (!o || !o->d3d9_resource || o->d3d9_parent || o->d3d9_implicit ||
+            o->dev_d3d != dev->id) {
+            dev->d3d9_device->abort_reset();
+            LOGW("d3d9: reset holder %u is not a root resource of this device", id);
+            result.status.code = recomp::d3d::StatusCode::InvalidArgument;
+            return;
+        }
+    }
+    for (uint32_t id : ids.values) {
+        ComObj *o = com_get(id);
+        recomp::d3d::Status prepared =
+            dev->d3d9_device->prepare_resource_reset(o->id, *o->d3d9_resource);
+        if (prepared.code != recomp::d3d::StatusCode::Ok) {
+            dev->d3d9_device->abort_reset();
+            result.status = prepared;
+            return;
+        }
+    }
+    recomp::d3d::Status ready = dev->d3d9_device->reset_ready();
+    if (ready.code != recomp::d3d::StatusCode::Ok) {
+        dev->d3d9_device->abort_reset();
+        result.status = ready;
+        return;
+    }
+    for (uint32_t id : ids.values)
+        dev->d3d9_device->commit_resource_reset(id, *com_get(id)->d3d9_resource);
+    result = dev->d3d9_device->finish_reset();
+}
+
 void Dev_Reset(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t present = arg(c, 1);
     if (!dev || !present) {
         com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (kD3d9WgpuEnabled) {
+        if (!dev->d3d9_device || !gm_valid(present, 56)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::D3d9ResetRequest request{};
+        request.present.width = rd32(present + 0);
+        request.present.height = rd32(present + 4);
+        request.present.format = rd32(present + 8);
+        request.present.count = rd32(present + 12);
+        request.present.multisample_type = rd32(present + 16);
+        request.present.multisample_quality = rd32(present + 20);
+        request.present.swap_effect = rd32(present + 24);
+        request.present.windowed = rd32(present + 32);
+        request.present.enable_auto_depth_stencil = rd32(present + 36);
+        request.present.auto_depth_stencil_format = rd32(present + 40);
+        request.present.flags = rd32(present + 44);
+        request.present.fullscreen_refresh_rate = rd32(present + 48);
+        request.present.presentation_interval = rd32(present + 52);
+        uint32_t focus_window = dev->d3d9_focus_window;
+        uint32_t device_window = rd32(present + 28);
+        if (!device_window)
+            device_window = focus_window;
+        bool windowed = request.present.windowed != 0;
+        request.window_valid = !windowed;
+        if (windowed && device_window &&
+            host_window_rect(device_window, nullptr, nullptr, nullptr, nullptr)) {
+            int32_t w = 0, h = 0;
+            if (host_window_rect(device_window, nullptr, nullptr, &w, &h) && w > 0 && h > 0) {
+                if (!request.present.width)
+                    request.present.width = (uint32_t)w;
+                if (!request.present.height)
+                    request.present.height = (uint32_t)h;
+                request.window_valid = true;
+            }
+        }
+        request.implicit_external_refs =
+            implicit_surface_externally_referenced(dev->d3d9_backbuffer) ||
+            implicit_surface_externally_referenced(dev->d3d9_depthbuffer);
+        request.desktop_format = desktop_format9();
+        request.thread_id = guest_current_thread_id();
+        recomp::d3d::D3d9ResetResult result{};
+        d3d9_reset_transaction(dev, request, result);
+        wr32(present + 0, result.present.width);
+        wr32(present + 4, result.present.height);
+        wr32(present + 8, result.present.format);
+        wr32(present + 12, result.present.count);
+        if (result.status.code != recomp::d3d::StatusCode::Ok) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        }
+        if (windowed && request.window_valid)
+            dev->hwnd = device_window;
+        device_discard_implicit_surfaces(dev);
+        LOGW("d3d9: Reset to %ux%u", request.present.width, request.present.height);
+        com_ret(c, D3D_OK9);
         return;
     }
     dev->width = rd32(present + 0);
@@ -475,29 +761,141 @@ void Dev_Reset(X86 *c) {
 }
 
 void Dev_TestCooperativeLevel(X86 *c) {
-    com_ret(c, this_device9(c) ? D3D_OK9 : D3DERR_INVALIDCALL);
+    ComObj *dev = this_device9(c);
+    if (!dev || (kD3d9WgpuEnabled && !dev->d3d9_device)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (kD3d9WgpuEnabled) {
+        recomp::d3d::ValueResult result =
+            dev->d3d9_device->test_cooperative_level(guest_current_thread_id());
+        if (result.status.code != recomp::d3d::StatusCode::Ok) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        }
+        if (result.value == 1) {
+            com_ret(c, D3DERR_DEVICELOST);
+            return;
+        }
+        if (result.value == 2) {
+            com_ret(c, D3DERR_DEVICENOTRESET);
+            return;
+        }
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    com_ret(c, D3D_OK9);
 }
 void Dev_GetAvailableTextureMem(X86 *c) {
     set_eax(c, 256u * 1024u * 1024u);
 }
 void Dev_GetNumberOfSwapChains(X86 *c) {
+    ComObj *dev = this_device9(c);
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        set_eax(c, dev->d3d9_device->number_of_swap_chains().value);
+        return;
+    }
     set_eax(c, 1);
+}
+// (this, iSwapChain, pMode)
+void Dev_GetDisplayMode(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 2);
+    if (!dev || !out || !gm_valid(out, 16)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (kD3d9WgpuEnabled) {
+        if (arg(c, 1) != 0 || !dev->d3d9_device) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        uint32_t w = 0, h = 0, bpp = 0;
+        win32_display_mode(&w, &h, &bpp);
+        recomp::d3d::D3d9DisplayModeRequest request{};
+        request.swap_chain = arg(c, 1);
+        request.width = w;
+        request.height = h;
+        request.refresh_rate = 0;
+        request.format = desktop_format9();
+        recomp::d3d::D3d9DisplayModeResult result = dev->d3d9_device->display_mode(request);
+        if (result.status.code != recomp::d3d::StatusCode::Ok) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        }
+        wr32(out + 0, result.width);
+        wr32(out + 4, result.height);
+        wr32(out + 8, result.refresh_rate);
+        wr32(out + 12, result.format);
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    put_display_mode(out);
+    com_ret(c, D3D_OK9);
 }
 void Dev_GetDirect3D(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *d3d = dev ? com_get(dev->dev_d3d) : nullptr;
     uint32_t out = arg(c, 1);
-    if (!d3d || !out) {
+    if (!d3d || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
     uint32_t view = com_view(d3d, IF_D3D9);
+    if (!view) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
     com_addref(d3d);
     com_out_ptr(out, view);
     com_ret(c, D3D_OK9);
 }
+void Dev_GetCreationParameters(X86 *c) {
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 1);
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 16)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3d9CreationParametersResult result =
+        recomp::d3d::d3d9_creation_parameters(*dev->d3d9_device->value);
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    wr32(out + 0, result.parameters.adapter);
+    wr32(out + 4, result.parameters.device_type);
+    wr32(out + 8, dev->d3d9_focus_window);
+    wr32(out + 12, result.parameters.behavior_flags);
+    com_ret(c, D3D_OK9);
+}
 void Dev_GetDeviceCaps(X86 *c) {
-    put_caps9(arg(c, 1));
+    uint32_t out = arg(c, 1);
+    if (kD3d9WgpuEnabled) {
+        ComObj *dev = this_device9(c);
+        if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 304)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::D3d9CapsResult result = dev->d3d9_device->caps();
+        if (result.status.code != recomp::d3d::StatusCode::Ok) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        }
+        if (result.caps.size() >= 304)
+            memcpy(gm_ptr(out), result.caps.data(), 304);
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    put_caps9(out);
     com_ret(c, D3D_OK9);
 }
 void Dev_BeginScene(X86 *c) {
@@ -579,6 +977,29 @@ void Dev_Clear(X86 *c) {
 // on screen.
 void Dev_Present(X86 *c) {
     ComObj *dev = this_device9(c);
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        if (arg(c, 1) || arg(c, 2) || arg(c, 3) || arg(c, 4)) {
+            imports_unsupported(c);
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::D3d9FrameResult result = dev->d3d9_device->present();
+        if (result.status.code != recomp::d3d::StatusCode::Ok) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        }
+        if (!result.bytes.empty()) {
+            dx_dump_frame_rgba(result.bytes.data(), result.width, result.height);
+            host_display_present_window_rgba(result.bytes.data(), (int)result.width,
+                                             (int)result.height);
+        }
+        com_ret(c, D3D_OK9);
+        return;
+    }
     ComObj *bb = dev ? device_backbuffer(dev) : nullptr;
     if (bb && gpu_on()) {
         gpu_sync(bb);
@@ -672,7 +1093,40 @@ static void stage_unlock(ComObj *o) {
     }
 }
 
+static void d3d9_release_staging(D3d9HostResource *h) {
+    if (!h)
+        return;
+    for (auto &entry : h->staging)
+        if (entry.second.addr)
+            heap_free(entry.second.addr);
+    h->staging.clear();
+}
+
 static void d3d9_resource_destroy(ComObj *o) {
+    if (kD3d9WgpuEnabled) {
+        if (!o->d3d9_parent && o->d3d9_resource && o->dev_d3d) {
+            if (ComObj *dev = com_get(o->dev_d3d)) {
+                if (dev->d3d9_device)
+                    dev->d3d9_device->unregister_resource(o->id);
+            }
+        }
+        if (!o->d3d9_parent && o->d3d9_resource)
+            d3d9_release_staging(o->d3d9_resource.get());
+        o->d3d9_resource.reset();
+        if (o->d3d9_parent_retained) {
+            o->d3d9_parent_retained = false;
+            if (ComObj *parent = com_get(o->d3d9_parent))
+                com_release_internal(parent);
+        }
+        o->d3d9_parent = 0;
+        if (o->d3d9_owner_retained) {
+            o->d3d9_owner_retained = false;
+            if (ComObj *dev = com_get(o->dev_d3d))
+                com_release_internal(dev);
+        }
+        o->dev_d3d = 0;
+        return;
+    }
     if (o->pixels)
         heap_free(o->pixels);
     o->pixels = 0;
@@ -723,12 +1177,12 @@ static uint32_t format_bytes(uint32_t fmt) {
 // The DXT formats, stored as blocks of 4x4 pixels.
 static uint32_t dxt_block_bytes(uint32_t fmt) {
     switch (fmt) {
-    case 0x31545844u:
-        return 8; // DXT1
-    case 0x32545844u:
-    case 0x33545844u:
-    case 0x34545844u:
-    case 0x35545844u:
+    case D3DFMT_DXT1:
+        return 8;
+    case D3DFMT_DXT2:
+    case D3DFMT_DXT3:
+    case D3DFMT_DXT4:
+    case D3DFMT_DXT5:
         return 16;
     default:
         return 0;
@@ -1001,10 +1455,377 @@ static void gpu_forget(ComObj *o) {
     resource_usage().erase(o->id);
 }
 
+static void d3d9_register_wgpu_resource(ComObj *dev, ComObj *o) {
+    if (!dev || !dev->d3d9_device || !o || !o->d3d9_resource)
+        return;
+    recomp::d3d::Status status = dev->d3d9_device->register_resource(o->id, *o->d3d9_resource);
+    if (status.code != recomp::d3d::StatusCode::Ok) {
+        std::string message(status.message.data(), status.message.size());
+        LOGW("d3d9: register resource %u failed: %s", o->id, message.c_str());
+    }
+}
+
+static void create_buffer_wgpu(X86 *c, recomp::d3d::D3d9BufferKind kind) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 5);
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    com_out_ptr(out, 0);
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    bool vertex = kind == recomp::d3d::D3d9BufferKind::Vertex;
+    recomp::d3d::D3d9BufferRequest request{};
+    request.kind = kind;
+    request.size = arg(c, 1);
+    request.usage = arg(c, 2);
+    request.pool = arg(c, 4);
+    request.fvf = vertex ? arg(c, 3) : 0;
+    request.format = vertex ? 100 : arg(c, 3);
+    request.shared_handle = arg(c, 6) != 0;
+    auto resource = std::make_shared<D3d9HostResource>();
+    recomp::d3d::Status status = resource->create_buffer(*dev->d3d9_device, request);
+    if (status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, status));
+        return;
+    }
+    ComKind resource_kind = vertex ? K_D3D9VB : K_D3D9IB;
+    ComIface resource_iface = vertex ? IF_D3DVERTEXBUFFER9 : IF_D3DINDEXBUFFER9;
+    ComObj *buffer = com_new(resource_kind);
+    if (!buffer) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    buffer->d3d9_resource = std::move(resource);
+    buffer->dev_d3d = dev->id;
+    com_retain_internal(dev);
+    buffer->d3d9_owner_retained = true;
+    d3d9_register_wgpu_resource(dev, buffer);
+    uint32_t view = com_view(buffer, resource_iface);
+    if (!view) {
+        com_release(buffer);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    com_out_ptr(out, view);
+    com_ret(c, D3D_OK9);
+}
+
+static ComObj *level_owner(ComObj *o, uint32_t *face, uint32_t *level, bool *volume) {
+    *face = 0;
+    *level = 0;
+    *volume = false;
+    if (!o)
+        return nullptr;
+    if (o->d3d9_parent) {
+        *face = o->d3d9_face;
+        *level = o->d3d9_level;
+        *volume = o->d3d9_volume;
+        return com_get(o->d3d9_parent);
+    }
+    return o;
+}
+
+static ComObj *com_level_view(ComObj *tex, uint32_t face, uint32_t level, bool volume) {
+    if (!tex || !tex->d3d9_resource)
+        return nullptr;
+    uint32_t slot;
+    if (volume)
+        slot = level;
+    else if (tex->kind == K_D3D9CUBETEXTURE)
+        slot = face + 6u * level;
+    else
+        slot = level;
+    if (tex->d3d9_levels.size() <= slot)
+        tex->d3d9_levels.resize(slot + 1, 0);
+    ComObj *s = com_get(tex->d3d9_levels[slot]);
+    if (s) {
+        com_addref(s);
+        return s;
+    }
+    s = com_new(volume ? K_D3D9VOLUME : K_D3D9SURFACE);
+    if (!s)
+        return nullptr;
+    s->d3d9_resource = tex->d3d9_resource;
+    s->d3d9_parent = tex->id;
+    s->d3d9_face = face;
+    s->d3d9_level = level;
+    s->d3d9_volume = volume;
+    s->dev_d3d = tex->dev_d3d;
+    com_retain_internal(tex);
+    s->d3d9_parent_retained = true;
+    tex->d3d9_levels[slot] = s->id;
+    return s;
+}
+
+static void create_texture_wgpu(X86 *c, recomp::d3d::D3d9TextureKind kind) {
+    ComObj *dev = this_device9(c);
+    recomp::d3d::D3d9TextureRequest request{};
+    request.kind = kind;
+    uint32_t out = 0;
+    ComIface iface = IF_D3DTEXTURE9;
+    ComKind com_kind = K_D3D9TEXTURE;
+    switch (kind) {
+    case recomp::d3d::D3d9TextureKind::Texture2D:
+        request.width = arg(c, 1);
+        request.height = arg(c, 2);
+        request.levels = arg(c, 3);
+        request.usage = arg(c, 4);
+        request.format = arg(c, 5);
+        request.pool = arg(c, 6);
+        out = arg(c, 7);
+        request.shared_handle = arg(c, 8) != 0;
+        break;
+    case recomp::d3d::D3d9TextureKind::Cube:
+        request.width = request.height = arg(c, 1);
+        request.levels = arg(c, 2);
+        request.usage = arg(c, 3);
+        request.format = arg(c, 4);
+        request.pool = arg(c, 5);
+        out = arg(c, 6);
+        request.shared_handle = arg(c, 7) != 0;
+        iface = IF_D3DCUBETEXTURE9;
+        com_kind = K_D3D9CUBETEXTURE;
+        break;
+    case recomp::d3d::D3d9TextureKind::Volume:
+        request.width = arg(c, 1);
+        request.height = arg(c, 2);
+        request.depth = arg(c, 3);
+        request.levels = arg(c, 4);
+        request.usage = arg(c, 5);
+        request.format = arg(c, 6);
+        request.pool = arg(c, 7);
+        out = arg(c, 8);
+        request.shared_handle = arg(c, 9) != 0;
+        iface = IF_D3DVOLUMETEXTURE9;
+        com_kind = K_D3D9VOLUMETEXTURE;
+        break;
+    }
+    request.depth = request.depth ? request.depth : 1;
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    com_out_ptr(out, 0);
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    auto resource = std::make_shared<D3d9HostResource>();
+    recomp::d3d::D3d9TextureCreateResult result =
+        resource->create_texture(*dev->d3d9_device, request);
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    ComObj *tex = com_new(com_kind);
+    if (!tex) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    tex->d3d9_resource = std::move(resource);
+    tex->dev_d3d = dev->id;
+    com_retain_internal(dev);
+    tex->d3d9_owner_retained = true;
+    d3d9_register_wgpu_resource(dev, tex);
+    uint32_t view = com_view(tex, iface);
+    if (!view) {
+        com_release(tex);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    com_out_ptr(out, view);
+    com_ret(c, D3D_OK9);
+}
+
+static void create_surface_wgpu(X86 *c, uint32_t out_index, uint32_t usage) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, out_index);
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    com_out_ptr(out, 0);
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3d9SurfaceRequest request{};
+    request.width = arg(c, 1);
+    request.height = arg(c, 2);
+    request.format = arg(c, 3);
+    if (out_index == 5) {
+        request.pool = arg(c, 4);
+        request.usage = 0;
+        request.shared_handle = arg(c, 6) != 0;
+    } else {
+        request.pool = 0;
+        request.usage = usage;
+        request.multisample_type = arg(c, 4);
+        request.multisample_quality = arg(c, 5);
+        request.lockable = usage == USAGE_RENDERTARGET && arg(c, 6) != 0;
+        request.discard = usage == USAGE_DEPTHSTENCIL && arg(c, 6) != 0;
+        request.shared_handle = arg(c, 8) != 0;
+    }
+    auto resource = std::make_shared<D3d9HostResource>();
+    recomp::d3d::Status status = resource->create_surface(*dev->d3d9_device, request);
+    if (status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, status));
+        return;
+    }
+    ComObj *s = com_new(K_D3D9SURFACE);
+    if (!s) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    s->d3d9_resource = std::move(resource);
+    s->dev_d3d = dev->id;
+    com_retain_internal(dev);
+    s->d3d9_owner_retained = true;
+    d3d9_register_wgpu_resource(dev, s);
+    uint32_t view = com_view(s, IF_D3DSURFACE9);
+    if (!view) {
+        com_release(s);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    com_out_ptr(out, view);
+    com_ret(c, D3D_OK9);
+}
+
+static void level_lock_wgpu(X86 *c, ComObj *o, uint32_t face, uint32_t level, bool volume,
+                            uint32_t rect_addr, uint32_t box_addr, uint32_t flags, uint32_t out,
+                            bool box_output) {
+    uint32_t owner_face = 0, owner_level = 0;
+    bool owner_volume = false;
+    ComObj *owner = level_owner(o, &owner_face, &owner_level, &owner_volume);
+    if (owner && owner != o) {
+        face = owner_face;
+        level = owner_level;
+        volume = owner_volume;
+    }
+    if (!owner || !owner->d3d9_resource) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!out || !gm_valid(out, box_output ? 12 : 8) || (rect_addr && !gm_valid(rect_addr, 16)) ||
+        (box_addr && !gm_valid(box_addr, 24))) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3d9LevelLockRequest request{};
+    request.face = face;
+    request.level = level;
+    request.volume = volume;
+    request.full_region = volume ? box_addr == 0 : rect_addr == 0;
+    request.flags = flags;
+    if (box_addr) {
+        request.volume_box.left = rd32(box_addr + 0);
+        request.volume_box.top = rd32(box_addr + 4);
+        request.volume_box.right = rd32(box_addr + 8);
+        request.volume_box.bottom = rd32(box_addr + 12);
+        request.volume_box.front = rd32(box_addr + 16);
+        request.volume_box.back = rd32(box_addr + 20);
+    }
+    if (rect_addr) {
+        request.rect.left = (int32_t)rd32(rect_addr + 0);
+        request.rect.top = (int32_t)rd32(rect_addr + 4);
+        request.rect.right = (int32_t)rd32(rect_addr + 8);
+        request.rect.bottom = (int32_t)rd32(rect_addr + 12);
+    }
+    D3d9HostResource *h = owner->d3d9_resource.get();
+    uint64_t key = ((uint64_t)face << 32) | level;
+    D3d9Staging &staging = h->staging[key];
+    bool fresh = staging.addr == 0;
+    recomp::d3d::D3d9LevelLockResult prepared = h->level_lock_prepare(request);
+    if (prepared.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, prepared.status));
+        return;
+    }
+    if (fresh) {
+        if (prepared.total == 0) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        uint32_t stage = heap_alloc(prepared.total, false, 16);
+        if (!stage) {
+            com_ret(c, E_OUTOFMEMORY);
+            return;
+        }
+        rust::Slice<const uint8_t> bytes = h->level_bytes(face, level);
+        if (bytes.size() != prepared.total) {
+            heap_free(stage);
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        memcpy(gm_ptr(stage), bytes.data(), prepared.total);
+        staging.addr = stage;
+        staging.size = prepared.total;
+    }
+    recomp::d3d::D3d9LevelLockResult committed = h->level_lock_commit(request);
+    if (committed.status.code != recomp::d3d::StatusCode::Ok) {
+        if (fresh) {
+            heap_free(staging.addr);
+            staging.addr = 0;
+            staging.size = 0;
+        }
+        com_ret(c, bridge_result(c, committed.status));
+        return;
+    }
+    if (box_output) {
+        wr32(out + 0, prepared.pitch);
+        wr32(out + 4, prepared.slice_pitch);
+        wr32(out + 8, staging.addr + prepared.offset);
+    } else {
+        wr32(out + 0, prepared.pitch);
+        wr32(out + 4, staging.addr + prepared.offset);
+    }
+    com_ret(c, D3D_OK9);
+}
+
+static void level_unlock_wgpu(X86 *c, ComObj *o, uint32_t face, uint32_t level) {
+    uint32_t owner_face = 0, owner_level = 0;
+    bool owner_volume = false;
+    ComObj *owner = level_owner(o, &owner_face, &owner_level, &owner_volume);
+    if (owner && owner != o) {
+        face = owner_face;
+        level = owner_level;
+    }
+    if (!owner || !owner->d3d9_resource) {
+        imports_unsupported(c);
+        return;
+    }
+    D3d9HostResource *h = owner->d3d9_resource.get();
+    uint64_t key = ((uint64_t)face << 32) | level;
+    auto it = h->staging.find(key);
+    if (it == h->staging.end() || !it->second.addr) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    rust::Slice<const uint8_t> bytes(gm_ptr(it->second.addr), it->second.size);
+    recomp::d3d::D3d9BufferUnlockResult result = h->level_unlock(face, level, bytes);
+    if (result.closed) {
+        heap_free(it->second.addr);
+        h->staging.erase(it);
+    }
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    com_ret(c, D3D_OK9);
+}
+
 // (this, Length, Usage, FVF, Pool, ppVertexBuffer, pSharedHandle)
 void Dev_CreateVertexBuffer(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t bytes = arg(c, 1), out = arg(c, 5);
+    if (kD3d9WgpuEnabled) {
+        create_buffer_wgpu(c, recomp::d3d::D3d9BufferKind::Vertex);
+        return;
+    }
     if (!dev || !out) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -1032,6 +1853,10 @@ void Dev_CreateVertexBuffer(X86 *c) {
 void Dev_CreateIndexBuffer(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t bytes = arg(c, 1), out = arg(c, 5);
+    if (kD3d9WgpuEnabled) {
+        create_buffer_wgpu(c, recomp::d3d::D3d9BufferKind::Index);
+        return;
+    }
     if (!dev || !out) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -1045,7 +1870,7 @@ void Dev_CreateIndexBuffer(X86 *c) {
     }
     ib->dev_d3d = dev->id;
     ib->buf_bytes = bytes;
-    ib->rmask = arg(c, 3) == 102 ? 4 : 2; // D3DFMT_INDEX32 or D3DFMT_INDEX16
+    ib->rmask = arg(c, 3) == D3DFMT_INDEX32 ? 4 : 2;
     uint32_t view_ = com_view(ib, IF_D3DINDEXBUFFER9);
     if (!view_) {
         com_release(ib);
@@ -1058,6 +1883,10 @@ void Dev_CreateIndexBuffer(X86 *c) {
 
 // (this, Width, Height, Levels, Usage, Format, Pool, ppTexture, pSharedHandle)
 void Dev_CreateTexture(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        create_texture_wgpu(c, recomp::d3d::D3d9TextureKind::Texture2D);
+        return;
+    }
     ComObj *dev = this_device9(c);
     uint32_t w = arg(c, 1), h = arg(c, 2), fmt = arg(c, 5), out = arg(c, 7);
     if (!dev || !out) {
@@ -1104,6 +1933,10 @@ void Dev_CreateTexture(X86 *c) {
 
 // (this, EdgeLength, Levels, Usage, Format, Pool, ppCubeTexture, pSharedHandle)
 void Dev_CreateCubeTexture(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        create_texture_wgpu(c, recomp::d3d::D3d9TextureKind::Cube);
+        return;
+    }
     ComObj *dev = this_device9(c);
     uint32_t edge = arg(c, 1), fmt = arg(c, 4), out = arg(c, 6);
     if (!dev || !out) {
@@ -1133,7 +1966,19 @@ void Dev_CreateCubeTexture(X86 *c) {
     com_ret(c, D3D_OK9);
 }
 
+void Dev_CreateVolumeTexture(X86 *c) {
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    create_texture_wgpu(c, recomp::d3d::D3d9TextureKind::Volume);
+}
+
 static void create_surface_method(X86 *c, uint32_t out_index, uint32_t fmt_index, uint32_t usage) {
+    if (kD3d9WgpuEnabled) {
+        create_surface_wgpu(c, out_index, usage);
+        return;
+    }
     ComObj *dev = this_device9(c);
     uint32_t w = arg(c, 1), h = arg(c, 2), fmt = arg(c, fmt_index), out = arg(c, out_index);
     if (!dev || !out) {
@@ -1178,6 +2023,27 @@ void Dev_CreateOffscreenPlainSurface(X86 *c) {
 // which SetRenderTarget overwrites, so after the game switched targets the
 // "back buffer" was whatever it had last drawn into.
 static ComObj *device_backbuffer(ComObj *dev) {
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device)
+            return nullptr;
+        ComObj *s = com_get(dev->d3d9_backbuffer);
+        if (!s) {
+            recomp::d3d::D3d9SurfaceDescriptorResult desc =
+                dev->d3d9_device->backbuffer_descriptor();
+            if (desc.status.code != recomp::d3d::StatusCode::Ok)
+                return nullptr;
+            s = com_new(K_D3D9SURFACE);
+            if (!s)
+                return nullptr;
+            s->d3d9_implicit = true;
+            s->d3d9_resource = std::make_shared<D3d9HostResource>();
+            s->d3d9_target_depth = false;
+            s->dev_d3d = dev->id;
+            com_internalize(s);
+            dev->d3d9_backbuffer = s->id;
+        }
+        return s;
+    }
     ComObj *s = com_get(dev->palette_obj);
     if (!s) {
         s = make_surface(dev, dev->width ? dev->width : 640, dev->height ? dev->height : 480, 22);
@@ -1265,6 +2131,27 @@ void Dev_StretchRect(X86 *c) {
     com_ret(c, D3D_OK9);
 }
 static ComObj *device_depthbuffer(ComObj *dev) {
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device)
+            return nullptr;
+        ComObj *s = com_get(dev->d3d9_depthbuffer);
+        if (!s) {
+            recomp::d3d::D3d9SurfaceDescriptorResult desc =
+                dev->d3d9_device->depthbuffer_descriptor();
+            if (desc.status.code != recomp::d3d::StatusCode::Ok)
+                return nullptr;
+            s = com_new(K_D3D9SURFACE);
+            if (!s)
+                return nullptr;
+            s->d3d9_implicit = true;
+            s->d3d9_resource = std::make_shared<D3d9HostResource>();
+            s->d3d9_target_depth = true;
+            s->dev_d3d = dev->id;
+            com_internalize(s);
+            dev->d3d9_depthbuffer = s->id;
+        }
+        return s;
+    }
     ComObj *s = com_get(dev->zbuffer_obj);
     if (!s) {
         s = make_surface(dev, dev->width ? dev->width : 640, dev->height ? dev->height : 480, 75);
@@ -1275,6 +2162,21 @@ static ComObj *device_depthbuffer(ComObj *dev) {
             resource_usage()[s->id] = USAGE_DEPTHSTENCIL;
     }
     return s;
+}
+
+static bool implicit_surface_externally_referenced(uint32_t field) {
+    ComObj *s = com_get(field);
+    return s && s->refs > s->internal_refs;
+}
+
+static void device_discard_implicit_surfaces(ComObj *dev) {
+    for (uint32_t *field : {&dev->d3d9_backbuffer, &dev->d3d9_depthbuffer}) {
+        ComObj *s = com_get(*field);
+        *field = 0;
+        if (s)
+            com_release_internal(s);
+    }
+    dev->render_target = 0;
 }
 
 // Drops the device's own back and depth buffers; the game's references to them
@@ -1292,6 +2194,11 @@ static void device_forget_buffers(ComObj *dev) {
 void Dev_GetBackBuffer(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 4);
+    if (kD3d9WgpuEnabled &&
+        (!dev || arg(c, 1) || arg(c, 2) || arg(c, 3) || !out || !gm_valid(out, 4))) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
     ComObj *s = dev ? device_backbuffer(dev) : nullptr;
     if (!s || !out) {
         com_ret(c, D3DERR_INVALIDCALL);
@@ -1311,6 +2218,16 @@ void Dev_GetBackBuffer(X86 *c) {
 void Dev_GetDepthStencilSurface(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 1);
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        if (dev->d3d9_device->depthbuffer_descriptor().status.code != recomp::d3d::StatusCode::Ok) {
+            com_ret(c, D3DERR_NOTFOUND);
+            return;
+        }
+    }
     ComObj *s = dev ? device_depthbuffer(dev) : nullptr;
     if (!s || !out) {
         com_ret(c, D3DERR_INVALIDCALL);
@@ -1333,7 +2250,7 @@ void Dev_GetDepthStencilSurface(X86 *c) {
 void Dev_GetRenderTarget(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 2);
-    if (!dev || !out) {
+    if (!dev || !out || (kD3d9WgpuEnabled && (arg(c, 1) != 0 || !gm_valid(out, 4)))) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
@@ -1434,7 +2351,6 @@ void Dev_SetVertexDeclaration(X86 *c) {
     com_ret(c, D3D_OK9);
 }
 
-// (this, Type, ppQuery). A query with no GPU behind it answers immediately.
 void Dev_CreateQuery(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t type = arg(c, 1), out = arg(c, 2);
@@ -1442,9 +2358,19 @@ void Dev_CreateQuery(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (!out) {
-        com_ret(c, D3D_OK9); // a null out pointer only asks whether the type exists
+    bool known = type == 4 || type == 5 || type == 6 || (type >= 8 && type <= 19);
+    bool creatable = type == D3DQUERYTYPE_OCCLUSION && gpu_on();
+    if (!known) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
+    }
+    if (!out) {
+        com_ret(c, creatable ? D3D_OK9 : D3DERR_NOTAVAILABLE);
+        return;
+    }
+    if (!creatable) {
+        LOGW("d3d9: CreateQuery unsupported for query type %u", type);
+        imports_unsupported(c);
     }
     ComObj *q = com_new(K_D3D9QUERY);
     if (!q) {
@@ -1468,14 +2394,24 @@ void Dev_SetStreamSource(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *vb = com_this(arg(c, 2));
     uint32_t stream = arg(c, 1);
-    if (dev && stream < 8) {
-        D9Pipeline::Stream &st = d9_pipeline(dev->id).stream[stream];
-        st.vb = (vb && vb->kind == K_D3D9VB) ? vb->id : 0;
-        st.offset = arg(c, 3);
-        st.stride = arg(c, 4);
+    if (!dev) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
     }
-    if (dev && stream == 0 && vb && vb->kind == K_D3D9VB) {
-        dev->back_obj = vb->id;
+    if (stream >= 16 || (arg(c, 2) && (!vb || vb->kind != K_D3D9VB))) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (stream >= 8) {
+        LOGW("d3d9: SetStreamSource unsupported for stream %u", stream);
+        imports_unsupported(c);
+    }
+    D9Pipeline::Stream &st = d9_pipeline(dev->id).stream[stream];
+    st.vb = (vb && vb->kind == K_D3D9VB) ? vb->id : 0;
+    st.offset = arg(c, 3);
+    st.stride = arg(c, 4);
+    if (stream == 0) {
+        dev->back_obj = st.vb;
         dev->lock_off = arg(c, 3);
         dev->rate = arg(c, 4); // the stride, reusing a spare field
     }
@@ -1497,19 +2433,23 @@ void Dev_SetTexture(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *tex = com_this(arg(c, 2));
     uint32_t stage = arg(c, 1);
-    if (dev) {
-        dev->texture_handle = tex ? tex->id : 0;
-        if (stage < 16)
-            d9_pipeline(dev->id).sampler_tex[stage] = tex ? tex->id : 0;
+    if (!dev) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
     }
+    if (stage >= 16) {
+        if (stage >= D3DDMAPSAMPLER && stage <= D3DVERTEXTEXTURESAMPLER3) {
+            LOGW("d3d9: SetTexture unsupported for sampler %u", stage);
+            imports_unsupported(c);
+        }
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    dev->texture_handle = tex ? tex->id : 0;
+    d9_pipeline(dev->id).sampler_tex[stage] = tex ? tex->id : 0;
     com_ret(c, D3D_OK9);
 }
 
-// The draws. Nothing is rasterized yet, so each one reports what it was asked
-// to draw: the geometry a renderer would need is all in these arguments, and
-// a run that names them is the specification for the work that comes next.
-// The first few are reported in full and then every 256th, because a game at
-// speed issues thousands.
 static uint32_t g_draws = 0;
 
 static const char *prim_name(uint32_t type) {
@@ -1538,22 +2478,29 @@ static bool draw_worth_reporting() {
     return g_draws <= 8 || ((g_draws % 256) == 0 && log_level() >= 2);
 }
 
-static uint32_t primitive_vertices(uint32_t prim, uint32_t count) {
+static uint64_t primitive_vertices(uint32_t prim, uint32_t count) {
+    uint64_t n = count;
     switch (prim) {
     case 1:
-        return count; // points
+        return n;
     case 2:
-        return count * 2; // lines
+        return n * 2;
     case 3:
-        return count + 1; // line strip
+        return n + 1;
     case 4:
-        return count * 3; // triangles
+        return n * 3;
     case 5:
     case 6:
-        return count + 2;
+        return n + 2;
     default:
         return 0;
     }
+}
+
+static uint32_t inline_bytes(uint64_t count, uint32_t stride) {
+    if (!stride || count > UINT32_MAX / stride)
+        return 0;
+    return static_cast<uint32_t>(count) * stride;
 }
 
 // The render target and depth buffer a draw or clear goes to, mirrored.
@@ -1609,13 +2556,12 @@ static void target_viewport(ComObj *dev, const HostD9Target &t, int32_t vp[4]) {
 }
 
 // One draw, handed to the GPU renderer with everything the device has bound.
-static void gpu_draw(ComObj *dev, HostD9Draw &d) {
+static void gpu_draw(X86 *c, ComObj *dev, HostD9Draw &d) {
     D9Pipeline &pl = d9_pipeline(dev->id);
     if (pl.vs.empty() || pl.ps.empty()) {
-        log_once("d3d9.gpu.ffp",
-                 "d3d9: a draw with no shaders bound is skipped; the fixed-function "
-                 "pipeline is not rendered on the GPU yet");
-        return;
+        LOGW("d3d9: GPU draw unsupported: no vertex/pixel shader bound (primitive %u)",
+             d.primitive);
+        imports_unsupported(c);
     }
     d.target = gpu_target(dev);
     target_viewport(dev, d.target, d.viewport);
@@ -1641,8 +2587,8 @@ static void gpu_draw(ComObj *dev, HostD9Draw &d) {
     d.pconst_count = std::min<uint32_t>(ps.max_const, 32);
     ComObj *decl = com_get(pl.declaration);
     if (!decl || decl->kind != K_D3D9DECL) {
-        log_once("d3d9.gpu.nodecl", "d3d9: a draw with no vertex declaration is skipped");
-        return;
+        LOGW("d3d9: GPU draw unsupported: no vertex declaration bound (primitive %u)", d.primitive);
+        imports_unsupported(c);
     }
     d.decl = decl->blob.data();
     d.decl_size = (uint32_t)decl->blob.size();
@@ -1698,26 +2644,41 @@ void Dev_DrawPrimitive(X86 *c) {
         LOGW("d3d9: draw %u: %s, %u primitives from vertex %u, from the bound stream", g_draws,
              prim_name(arg(c, 1)), arg(c, 3), arg(c, 2));
     ComObj *dev = this_device9(c);
+    uint32_t prim_count = arg(c, 3);
+    if (prim_count == 0) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
     if (dev && gpu_on()) {
+        bool have_stream = false;
+        for (int i = 0; i < 8; ++i)
+            if (d9_pipeline(dev->id).stream[i].vb)
+                have_stream = true;
+        if (!have_stream) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
         HostD9Draw d{};
         d.primitive = arg(c, 1);
-        d.primitive_count = arg(c, 3);
+        d.primitive_count = prim_count;
         d.start = arg(c, 2);
-        gpu_draw(dev, d);
+        gpu_draw(c, dev, d);
         com_ret(c, D3D_OK9);
         return;
     }
     ComObj *vb = dev ? com_get(dev->back_obj) : nullptr;
-    if (vb && resource_bytes(vb) && dev->lock_off < vb->blob.size()) {
-        D9DrawCall call;
-        call.prim = arg(c, 1);
-        call.prim_count = arg(c, 3);
-        call.vertex_data = resource_bytes(vb) + dev->lock_off;
-        call.vertex_bytes = vb->blob.size() - dev->lock_off;
-        call.stride = dev->rate;
-        call.first = arg(c, 2);
-        raster(c, call);
+    if (!vb || !resource_bytes(vb) || dev->lock_off >= vb->blob.size()) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
     }
+    D9DrawCall call;
+    call.prim = arg(c, 1);
+    call.prim_count = prim_count;
+    call.vertex_data = resource_bytes(vb) + dev->lock_off;
+    call.vertex_bytes = vb->blob.size() - dev->lock_off;
+    call.stride = dev->rate;
+    call.first = arg(c, 2);
+    raster(c, call);
     com_ret(c, D3D_OK9);
 }
 
@@ -1727,38 +2688,48 @@ void Dev_DrawIndexedPrimitive(X86 *c) {
         LOGW("d3d9: draw %u: %s, %u primitives, %u vertices from index %u, indexed", g_draws,
              prim_name(arg(c, 1)), arg(c, 6), arg(c, 4), arg(c, 5));
     ComObj *dev = this_device9(c);
+    uint32_t prim_count = arg(c, 6);
+    if (prim_count == 0) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
     if (dev && gpu_on()) {
         ComObj *ibo = com_get(d9_pipeline(dev->id).index_buffer);
-        if (ibo) {
-            gpu_sync_buffer(ibo);
-            HostD9Draw d{};
-            d.primitive = arg(c, 1);
-            d.primitive_count = arg(c, 6);
-            d.start = arg(c, 5);
-            d.base_vertex = (int32_t)arg(c, 2);
-            d.index_buffer = ibo->id;
-            d.index_size = ibo->rmask ? ibo->rmask : 2;
-            gpu_draw(dev, d);
+        if (!ibo) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
         }
+        gpu_sync_buffer(ibo);
+        HostD9Draw d{};
+        d.primitive = arg(c, 1);
+        d.primitive_count = prim_count;
+        d.start = arg(c, 5);
+        d.base_vertex = (int32_t)arg(c, 2);
+        d.index_buffer = ibo->id;
+        d.index_size = ibo->rmask ? ibo->rmask : 2;
+        gpu_draw(c, dev, d);
         com_ret(c, D3D_OK9);
         return;
     }
     ComObj *vb = dev ? com_get(dev->back_obj) : nullptr;
     ComObj *ib = dev ? com_get(dev->front_obj) : nullptr;
-    if (vb && resource_bytes(vb) && ib && resource_bytes(ib) && dev->lock_off < vb->blob.size()) {
-        D9DrawCall call;
-        call.prim = arg(c, 1);
-        call.prim_count = arg(c, 6);
-        call.vertex_data = resource_bytes(vb) + dev->lock_off;
-        call.vertex_bytes = vb->blob.size() - dev->lock_off;
-        call.stride = dev->rate;
-        call.index_data = resource_bytes(ib);
-        call.index_bytes = ib->blob.size();
-        call.index_size = ib->rmask ? ib->rmask : 2;
-        call.base_vertex = (int32_t)arg(c, 2);
-        call.first = arg(c, 5);
-        raster(c, call);
+    if (!vb || !resource_bytes(vb) || !ib || !resource_bytes(ib) ||
+        dev->lock_off >= vb->blob.size()) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
     }
+    D9DrawCall call;
+    call.prim = arg(c, 1);
+    call.prim_count = prim_count;
+    call.vertex_data = resource_bytes(vb) + dev->lock_off;
+    call.vertex_bytes = vb->blob.size() - dev->lock_off;
+    call.stride = dev->rate;
+    call.index_data = resource_bytes(ib);
+    call.index_bytes = ib->blob.size();
+    call.index_size = ib->rmask ? ib->rmask : 2;
+    call.base_vertex = (int32_t)arg(c, 2);
+    call.first = arg(c, 5);
+    raster(c, call);
     com_ret(c, D3D_OK9);
 }
 
@@ -1801,7 +2772,7 @@ static void describe_draw_inputs(X86 *c, uint32_t vertices, uint32_t stride, uin
     }
     for (uint32_t v = 0; v < nverts && v < 4; ++v) {
         uint32_t base = vertices + v * stride;
-        char line[256];
+        char line[256]{};
         size_t used = 0;
         for (uint32_t o = 0; o + 4 <= stride && o < 40; o += 4)
             used += (size_t)snprintf(
@@ -1824,27 +2795,35 @@ void Dev_DrawPrimitiveUP(X86 *c) {
     if (draw_worth_reporting()) {
         LOGW("d3d9: draw %u: %s, %u primitives, %u-byte vertices inline at %08x", g_draws,
              prim_name(arg(c, 1)), arg(c, 2), arg(c, 4), arg(c, 3));
-        // A fan of n primitives has n + 2 vertices.
-        if (g_draws <= 8)
-            describe_draw_inputs(c, arg(c, 3), arg(c, 4), arg(c, 2) + 2);
     }
-    if (ComObj *dev = this_device9(c); dev && gpu_on()) {
+    ComObj *dev = this_device9(c);
+    uint32_t prim_count = arg(c, 2);
+    if (prim_count == 0) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    uint32_t bytes = inline_bytes(primitive_vertices(arg(c, 1), prim_count), arg(c, 4));
+    if (!dev || !bytes || !arg(c, 3) || !gm_valid(arg(c, 3), bytes)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (g_draws <= 8)
+        describe_draw_inputs(c, arg(c, 3), arg(c, 4),
+                             static_cast<uint32_t>(primitive_vertices(arg(c, 1), prim_count)));
+    if (gpu_on()) {
         HostD9Draw d{};
         d.primitive = arg(c, 1);
-        d.primitive_count = arg(c, 2);
-        uint32_t bytes = primitive_vertices(d.primitive, d.primitive_count) * arg(c, 4);
-        if (bytes && gm_fits(arg(c, 3), bytes)) {
-            d.stream[0].stride = arg(c, 4);
-            d.inline_vertices = gm_ptr(arg(c, 3));
-            d.inline_bytes = bytes;
-            gpu_draw(dev, d);
-        }
+        d.primitive_count = prim_count;
+        d.stream[0].stride = arg(c, 4);
+        d.inline_vertices = gm_ptr(arg(c, 3));
+        d.inline_bytes = bytes;
+        gpu_draw(c, dev, d);
         com_ret(c, D3D_OK9);
         return;
     }
     D9DrawCall call;
     call.prim = arg(c, 1);
-    call.prim_count = arg(c, 2);
+    call.prim_count = prim_count;
     call.vertices = arg(c, 3);
     call.stride = arg(c, 4);
     raster(c, call);
@@ -1858,32 +2837,42 @@ void Dev_DrawIndexedPrimitiveUP(X86 *c) {
         LOGW("d3d9: draw %u: %s, %u primitives, %u vertices of %u bytes inline at %08x, "
              "indices at %08x",
              g_draws, prim_name(arg(c, 1)), arg(c, 4), arg(c, 3), arg(c, 8), arg(c, 7), arg(c, 5));
-    if (ComObj *dev = this_device9(c); dev && gpu_on()) {
+    ComObj *dev = this_device9(c);
+    uint32_t prim_count = arg(c, 4);
+    if (prim_count == 0) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    uint32_t isize = arg(c, 6) == D3DFMT_INDEX32 ? 4 : 2;
+    uint32_t ibytes = inline_bytes(primitive_vertices(arg(c, 1), prim_count), isize);
+    uint32_t vbytes = inline_bytes(static_cast<uint64_t>(arg(c, 2)) + arg(c, 3), arg(c, 8));
+    if (!dev || (arg(c, 6) != D3DFMT_INDEX16 && arg(c, 6) != D3DFMT_INDEX32) || !ibytes ||
+        !vbytes || !arg(c, 5) || !arg(c, 7) || !gm_valid(arg(c, 5), ibytes) ||
+        !gm_valid(arg(c, 7), vbytes)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (gpu_on()) {
         HostD9Draw d{};
         d.primitive = arg(c, 1);
-        d.primitive_count = arg(c, 4);
-        uint32_t isize = arg(c, 6) == 102 ? 4 : 2;
-        uint32_t ibytes = primitive_vertices(d.primitive, d.primitive_count) * isize;
-        uint32_t vbytes = (arg(c, 2) + arg(c, 3)) * arg(c, 8);
-        if (ibytes && vbytes && gm_fits(arg(c, 5), ibytes) && gm_fits(arg(c, 7), vbytes)) {
-            d.stream[0].stride = arg(c, 8);
-            d.inline_vertices = gm_ptr(arg(c, 7));
-            d.inline_bytes = vbytes;
-            d.inline_indices = gm_ptr(arg(c, 5));
-            d.inline_index_bytes = ibytes;
-            d.index_size = isize;
-            gpu_draw(dev, d);
-        }
+        d.primitive_count = prim_count;
+        d.stream[0].stride = arg(c, 8);
+        d.inline_vertices = gm_ptr(arg(c, 7));
+        d.inline_bytes = vbytes;
+        d.inline_indices = gm_ptr(arg(c, 5));
+        d.inline_index_bytes = ibytes;
+        d.index_size = isize;
+        gpu_draw(c, dev, d);
         com_ret(c, D3D_OK9);
         return;
     }
     D9DrawCall call;
     call.prim = arg(c, 1);
-    call.prim_count = arg(c, 4);
+    call.prim_count = prim_count;
     call.vertices = arg(c, 7);
     call.stride = arg(c, 8);
     call.indices = arg(c, 5);
-    call.index_size = arg(c, 6) == 102 ? 4 : 2;
+    call.index_size = arg(c, 6) == D3DFMT_INDEX32 ? 4 : 2;
     raster(c, call);
     com_ret(c, D3D_OK9);
 }
@@ -1891,33 +2880,30 @@ void Dev_DrawIndexedPrimitiveUP(X86 *c) {
 // ---------------------------------------------------------------------------
 // The resource interfaces themselves
 // ---------------------------------------------------------------------------
-#define RES_STUB(iface, name)                                                                      \
-    void iface##_##name(X86 *c) {                                                                  \
-        log_once("d3d9." #iface "." #name, "d3d9: " #iface "::" #name " is not implemented");      \
-        com_ret(c, D3D_OK9);                                                                       \
+
+static void resource_type_wgpu(X86 *c, ComObj *o) {
+    if (!o || !o->d3d9_resource) {
+        imports_unsupported(c);
+        return;
     }
+    recomp::d3d::ValueResult result = o->d3d9_resource->resource_type();
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    com_ret(c, result.value);
+}
 
-RES_STUB(Res, SetPrivateData)
-RES_STUB(Res, GetPrivateData)
-RES_STUB(Res, FreePrivateData)
-RES_STUB(Res, SetPriority)
-RES_STUB(Res, GetPriority)
-RES_STUB(Res, PreLoad)
-RES_STUB(Tex, SetLOD)
-RES_STUB(Tex, GetLOD)
-RES_STUB(Tex, SetAutoGenFilterType)
-RES_STUB(Tex, GetAutoGenFilterType)
-RES_STUB(Tex, GenerateMipSubLevels)
-RES_STUB(Tex, AddDirtyRect)
-RES_STUB(Tex, AddDirtyRectCube)
-RES_STUB(Surf, GetDC)
-RES_STUB(Surf, ReleaseDC)
-RES_STUB(Decl, GetDeclaration)
-
-// D3DRESOURCETYPE: 1 surface, 3 texture, 5 cube texture, 6 vertex buffer,
-// 7 index buffer. A K_D3D9TEXTURE is a cube when it carries the cube marker.
 void Res_GetType(X86 *c) {
     ComObj *o = com_this_arg(c);
+    if (kD3d9WgpuEnabled) {
+        if (o && o->d3d9_implicit) {
+            com_ret(c, 1);
+            return;
+        }
+        resource_type_wgpu(c, o);
+        return;
+    }
     uint32_t type = 0;
     if (o && o->kind == K_D3D9SURFACE)
         type = 1;
@@ -1930,9 +2916,65 @@ void Res_GetType(X86 *c) {
     com_ret(c, type);
 }
 
+void Buf_GetType(X86 *c) {
+    Res_GetType(c);
+}
+
+static const uint8_t kIidUnknown9[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46};
+
+static void resource_container(X86 *c) {
+    ComObj *s = com_this_arg(c);
+    uint32_t riid = arg(c, 1), out = arg(c, 2);
+    if (!s || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    com_out_ptr(out, 0);
+    ComObj *target = s->d3d9_parent ? com_get(s->d3d9_parent) : com_get(s->dev_d3d);
+    if (!target) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (!riid || !gm_valid(riid, 16)) {
+        com_ret(c, E_POINTER);
+        return;
+    }
+    ComIface want = com_iface_for_iid(riid);
+    if (want == IF_NONE) {
+        if (memcmp(gm_ptr(riid), kIidUnknown9, 16) != 0) {
+            com_ret(c, E_NOINTERFACE);
+            return;
+        }
+        if (!target->identity) {
+            com_ret(c, E_NOINTERFACE);
+            return;
+        }
+        com_addref(target);
+        com_out_ptr(out, target->identity);
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    if (!com_iface_binds(want, target->kind)) {
+        com_ret(c, E_NOINTERFACE);
+        return;
+    }
+    uint32_t view = com_view(target, want);
+    if (!view) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    com_addref(target);
+    com_out_ptr(out, view);
+    com_ret(c, D3D_OK9);
+}
+
 // (this, riid, ppContainer): the texture a level or face belongs to, or the
 // device when the surface stands alone.
 void Surf_GetContainer(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        resource_container(c);
+        return;
+    }
     ComObj *s = com_this_arg(c);
     uint32_t out = arg(c, 2);
     if (!s || !out) {
@@ -1958,14 +3000,183 @@ void Surf_GetContainer(X86 *c) {
 
 void Res_GetDevice(X86 *c) {
     ComObj *o = com_this_arg(c);
-    ComObj *dev = o ? com_get(o->dev_d3d) : nullptr;
     uint32_t out = arg(c, 1);
-    if (!dev || !out) {
+    if (!o || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
+    if (kD3d9WgpuEnabled && !o->d3d9_resource && !o->d3d9_implicit) {
+        imports_unsupported(c);
+        return;
+    }
+    ComObj *dev = com_get(o->dev_d3d);
+    if (!dev || (kD3d9WgpuEnabled && !dev->d3d9_device)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t view = com_view(dev, IF_D3DDEVICE9);
+    if (!view) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
     com_addref(dev);
-    com_out_ptr(out, com_view(dev, IF_D3DDEVICE9));
+    com_out_ptr(out, view);
+    com_ret(c, D3D_OK9);
+}
+
+void Buf_GetDevice(X86 *c) {
+    Res_GetDevice(c);
+}
+
+static uint32_t private_view_key(ComObj *o) {
+    if (!o || !o->d3d9_parent)
+        return 0;
+    uint32_t key = 0x80000000u | ((o->d3d9_face & 0x1fu) << 8) | (o->d3d9_level & 0xffu);
+    if (o->d3d9_volume)
+        key |= 0x40000000u;
+    return key;
+}
+
+static void resource_set_private_data(X86 *c) {
+    ComObj *o = com_this_arg(c);
+    uint32_t guid = arg(c, 1), data = arg(c, 2), size = arg(c, 3), flags = arg(c, 4);
+    if (!o || !o->d3d9_resource || !guid || !gm_valid(guid, 16) ||
+        (size && (!data || !gm_valid(data, size))) || (flags & ~1u)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (flags) {
+        LOGW("d3d9: IUnknown private data is not implemented");
+        imports_unsupported(c);
+        return;
+    }
+    rust::Slice<const uint8_t> g(gm_ptr(guid), 16);
+    rust::Slice<const uint8_t> d(data ? gm_ptr(data) : nullptr, size);
+    recomp::d3d::Status status =
+        o->d3d9_resource->set_private_data(private_view_key(o), g, d, flags);
+    com_ret(c, status.code == recomp::d3d::StatusCode::Ok ? D3D_OK9 : bridge_result(c, status));
+}
+
+static void resource_get_private_data(X86 *c) {
+    ComObj *o = com_this_arg(c);
+    uint32_t guid = arg(c, 1), data = arg(c, 2), size_addr = arg(c, 3);
+    if (!o || !o->d3d9_resource || !guid || !gm_valid(guid, 16) || !size_addr ||
+        !gm_valid(size_addr, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t have = rd32(size_addr);
+    if (data && have && !gm_valid(data, have)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    rust::Slice<const uint8_t> g(gm_ptr(guid), 16);
+    recomp::d3d::D3d9PrivateDataResult result =
+        o->d3d9_resource->get_private_data(private_view_key(o), g);
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    if (!result.found) {
+        com_ret(c, D3DERR_NOTFOUND);
+        return;
+    }
+    uint32_t need = (uint32_t)result.data.size();
+    if (!data) {
+        wr32(size_addr, need);
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    if (have < need) {
+        wr32(size_addr, need);
+        com_ret(c, D3DERR_MOREDATA);
+        return;
+    }
+    if (need) {
+        if (!gm_valid(data, need)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        memcpy(gm_ptr(data), result.data.data(), need);
+    }
+    wr32(size_addr, need);
+    com_ret(c, D3D_OK9);
+}
+
+static void resource_free_private_data(X86 *c) {
+    ComObj *o = com_this_arg(c);
+    uint32_t guid = arg(c, 1);
+    if (!o || !o->d3d9_resource || !guid || !gm_valid(guid, 16)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    rust::Slice<const uint8_t> g(gm_ptr(guid), 16);
+    recomp::d3d::Status status = o->d3d9_resource->free_private_data(private_view_key(o), g);
+    if (status.code == recomp::d3d::StatusCode::Ok)
+        com_ret(c, D3D_OK9);
+    else if (status.code == recomp::d3d::StatusCode::InvalidArgument)
+        com_ret(c, D3DERR_NOTFOUND);
+    else
+        com_ret(c, bridge_result(c, status));
+}
+
+static void resource_set_priority(X86 *c) {
+    ComObj *o = com_this_arg(c);
+    if (!o || !o->d3d9_resource) {
+        imports_unsupported(c);
+        return;
+    }
+    recomp::d3d::ValueResult result = o->d3d9_resource->set_priority(arg(c, 1));
+    com_ret(c, result.status.code == recomp::d3d::StatusCode::Ok ? result.value
+                                                                 : bridge_result(c, result.status));
+}
+
+static void resource_get_priority(X86 *c) {
+    ComObj *o = com_this_arg(c);
+    if (!o || !o->d3d9_resource) {
+        imports_unsupported(c);
+        return;
+    }
+    recomp::d3d::ValueResult result = o->d3d9_resource->priority();
+    com_ret(c, result.status.code == recomp::d3d::StatusCode::Ok ? result.value
+                                                                 : bridge_result(c, result.status));
+}
+
+static void resource_set_lod(X86 *c) {
+    ComObj *o = com_this_arg(c);
+    if (!o || !o->d3d9_resource) {
+        imports_unsupported(c);
+        return;
+    }
+    recomp::d3d::ValueResult result = o->d3d9_resource->set_lod(arg(c, 1));
+    com_ret(c, result.status.code == recomp::d3d::StatusCode::Ok ? result.value
+                                                                 : bridge_result(c, result.status));
+}
+
+static void resource_get_lod(X86 *c) {
+    ComObj *o = com_this_arg(c);
+    if (!o || !o->d3d9_resource) {
+        imports_unsupported(c);
+        return;
+    }
+    recomp::d3d::ValueResult result = o->d3d9_resource->lod();
+    com_ret(c, result.status.code == recomp::d3d::StatusCode::Ok ? result.value
+                                                                 : bridge_result(c, result.status));
+}
+
+static void resource_preload(X86 *c) {
+    ComObj *o = com_this_arg(c);
+    if (!o || !o->d3d9_resource) {
+        imports_unsupported(c);
+        return;
+    }
+    recomp::d3d::Status status = o->d3d9_resource->preload();
+    if (status.code != recomp::d3d::StatusCode::Ok) {
+        std::string message(status.message.data(), status.message.size());
+        LOGW("d3d9: PreLoad: %s", message.c_str());
+        com_ret(c, bridge_result(c, status));
+        return;
+    }
     com_ret(c, D3D_OK9);
 }
 
@@ -1982,13 +3193,106 @@ static void buffer_lock(X86 *c) {
     com_out_ptr(out, staged ? staged + offset : 0);
     com_ret(c, staged ? D3D_OK9 : E_OUTOFMEMORY);
 }
+
+static void buffer_lock_wgpu(X86 *c) {
+    ComObj *o = com_this_arg(c);
+    uint32_t offset = arg(c, 1), size = arg(c, 2), out = arg(c, 3), flags = arg(c, 4);
+    if (!o || (o->kind != K_D3D9VB && o->kind != K_D3D9IB) || !o->d3d9_resource) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3d9BufferLockRequest request{};
+    request.offset = offset;
+    request.size = size;
+    request.flags = flags;
+    recomp::d3d::D3d9BufferLockResult prepared = o->d3d9_resource->lock_prepare(request);
+    if (prepared.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, prepared.status));
+        return;
+    }
+    D3d9Staging &staging = o->d3d9_resource->staging[0];
+    bool fresh = staging.addr == 0;
+    if (fresh) {
+        if (prepared.total == 0) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        uint32_t stage = heap_alloc(prepared.total, false, 16);
+        if (!stage) {
+            com_ret(c, E_OUTOFMEMORY);
+            return;
+        }
+        rust::Slice<const uint8_t> bytes = o->d3d9_resource->bytes();
+        if (bytes.size() != prepared.total) {
+            heap_free(stage);
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        memcpy(gm_ptr(stage), bytes.data(), prepared.total);
+        staging.addr = stage;
+        staging.size = prepared.total;
+    }
+    recomp::d3d::D3d9BufferLockResult committed = o->d3d9_resource->lock_commit(request);
+    if (committed.status.code != recomp::d3d::StatusCode::Ok) {
+        if (fresh) {
+            heap_free(staging.addr);
+            staging.addr = 0;
+            staging.size = 0;
+        }
+        com_ret(c, bridge_result(c, committed.status));
+        return;
+    }
+    wr32(out, staging.addr + committed.offset);
+    com_ret(c, D3D_OK9);
+}
+
+static void buffer_unlock_wgpu(X86 *c) {
+    ComObj *o = com_this_arg(c);
+    if (!o || (o->kind != K_D3D9VB && o->kind != K_D3D9IB) || !o->d3d9_resource) {
+        imports_unsupported(c);
+        return;
+    }
+    auto it = o->d3d9_resource->staging.find(0);
+    if (it == o->d3d9_resource->staging.end() || !it->second.addr) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    rust::Slice<const uint8_t> bytes(gm_ptr(it->second.addr), it->second.size);
+    recomp::d3d::D3d9BufferUnlockResult result = o->d3d9_resource->unlock(bytes);
+    if (result.closed) {
+        heap_free(it->second.addr);
+        o->d3d9_resource->staging.erase(it);
+    }
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    com_ret(c, D3D_OK9);
+}
+
 void VB_Lock(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        buffer_lock_wgpu(c);
+        return;
+    }
     buffer_lock(c);
 }
 void IB_Lock(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        buffer_lock_wgpu(c);
+        return;
+    }
     buffer_lock(c);
 }
 void Buf_Unlock(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        buffer_unlock_wgpu(c);
+        return;
+    }
     stage_unlock(com_this_arg(c));
     com_ret(c, D3D_OK9);
 }
@@ -1996,6 +3300,32 @@ void Buf_Unlock(X86 *c) {
 void Buf_GetDesc(X86 *c) {
     ComObj *o = com_this_arg(c);
     uint32_t d = arg(c, 1);
+    if (kD3d9WgpuEnabled) {
+        if (!o || (o->kind != K_D3D9VB && o->kind != K_D3D9IB) || !o->d3d9_resource) {
+            imports_unsupported(c);
+            return;
+        }
+        uint32_t desc_size = o->kind == K_D3D9VB ? 24 : 20;
+        if (!d || !gm_valid(d, desc_size)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::D3d9BufferDescriptorResult result = o->d3d9_resource->descriptor();
+        if (result.status.code != recomp::d3d::StatusCode::Ok) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        }
+        memset(gm_ptr(d), 0, desc_size);
+        wr32(d + 0, result.descriptor.format);
+        wr32(d + 4, result.descriptor.resource_type);
+        wr32(d + 8, result.descriptor.usage);
+        wr32(d + 12, result.descriptor.pool);
+        wr32(d + 16, result.descriptor.size);
+        if (o->kind == K_D3D9VB)
+            wr32(d + 20, result.descriptor.fvf);
+        com_ret(c, D3D_OK9);
+        return;
+    }
     if (!o || !d) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -2007,6 +3337,16 @@ void Buf_GetDesc(X86 *c) {
 
 // D3DLOCKED_RECT is { INT Pitch; void *pBits; }.
 void Surf_LockRect(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        ComObj *o = com_this_arg(c);
+        if (o && o->d3d9_implicit) {
+            imports_unsupported(c);
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        level_lock_wgpu(c, o, 0, 0, false, arg(c, 2), 0, arg(c, 3), arg(c, 1), false);
+        return;
+    }
     ComObj *s = com_this_arg(c);
     uint32_t out = arg(c, 1);
     if (!s || !out) {
@@ -2019,6 +3359,15 @@ void Surf_LockRect(X86 *c) {
     com_ret(c, staged ? D3D_OK9 : E_OUTOFMEMORY);
 }
 void Surf_UnlockRect(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        ComObj *o = com_this_arg(c);
+        if (o && o->d3d9_implicit) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        level_unlock_wgpu(c, o, 0, 0);
+        return;
+    }
     stage_unlock(com_this_arg(c));
     com_ret(c, D3D_OK9);
 }
@@ -2027,6 +3376,79 @@ void Surf_UnlockRect(X86 *c) {
 void Surf_GetDesc(X86 *c) {
     ComObj *s = com_this_arg(c);
     uint32_t d = arg(c, 1);
+    if (kD3d9WgpuEnabled) {
+        if (s && s->d3d9_implicit) {
+            ComObj *dev = com_get(s->dev_d3d);
+            if (!dev || !dev->d3d9_device || !d || !gm_valid(d, 32)) {
+                com_ret(c, D3DERR_INVALIDCALL);
+                return;
+            }
+            recomp::d3d::D3d9SurfaceDescriptorResult result =
+                s->d3d9_target_depth ? dev->d3d9_device->depthbuffer_descriptor()
+                                     : dev->d3d9_device->backbuffer_descriptor();
+            if (result.status.code != recomp::d3d::StatusCode::Ok) {
+                com_ret(c, bridge_result(c, result.status));
+                return;
+            }
+            memset(gm_ptr(d), 0, 32);
+            wr32(d + 0, result.descriptor.format);
+            wr32(d + 4, result.descriptor.resource_type);
+            wr32(d + 8, result.descriptor.usage);
+            wr32(d + 12, result.descriptor.pool);
+            wr32(d + 24, result.descriptor.width);
+            wr32(d + 28, result.descriptor.height);
+            com_ret(c, D3D_OK9);
+            return;
+        }
+        if (!s || !s->d3d9_resource || !d || !gm_valid(d, 32)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        if (s->d3d9_parent) {
+            ComObj *parent = com_get(s->d3d9_parent);
+            if (!parent || !parent->d3d9_resource) {
+                com_ret(c, D3DERR_INVALIDCALL);
+                return;
+            }
+            recomp::d3d::D3d9TextureDescriptorResult td =
+                parent->d3d9_resource->texture_descriptor();
+            recomp::d3d::D3d9LevelDescriptorResult ld =
+                parent->d3d9_resource->texture_level_descriptor(s->d3d9_face, s->d3d9_level);
+            if (td.status.code != recomp::d3d::StatusCode::Ok) {
+                com_ret(c, bridge_result(c, td.status));
+                return;
+            }
+            if (ld.status.code != recomp::d3d::StatusCode::Ok) {
+                com_ret(c, bridge_result(c, ld.status));
+                return;
+            }
+            memset(gm_ptr(d), 0, 32);
+            wr32(d + 0, ld.descriptor.format);
+            wr32(d + 4, td.descriptor.resource_type);
+            wr32(d + 8, td.descriptor.usage);
+            wr32(d + 12, td.descriptor.pool);
+            wr32(d + 24, ld.descriptor.width);
+            wr32(d + 28, ld.descriptor.height);
+            com_ret(c, D3D_OK9);
+            return;
+        }
+        recomp::d3d::D3d9SurfaceDescriptorResult result = s->d3d9_resource->surface_descriptor();
+        if (result.status.code != recomp::d3d::StatusCode::Ok) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        }
+        memset(gm_ptr(d), 0, 32);
+        wr32(d + 0, result.descriptor.format);
+        wr32(d + 4, result.descriptor.resource_type);
+        wr32(d + 8, result.descriptor.usage);
+        wr32(d + 12, result.descriptor.pool);
+        wr32(d + 16, result.descriptor.multisample_type);
+        wr32(d + 20, result.descriptor.multisample_quality);
+        wr32(d + 24, result.descriptor.width);
+        wr32(d + 28, result.descriptor.height);
+        com_ret(c, D3D_OK9);
+        return;
+    }
     if (!s || !d) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -2066,6 +3488,28 @@ static ComObj *cube_face(ComObj *tex, uint32_t face, uint32_t level) {
 // texture, so handing one out references the texture too: the game takes
 // face zero, releases the cube, and goes on using it for the other five.
 void Tex_GetCubeMapSurface(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        ComObj *tex = com_this_arg(c);
+        uint32_t out = arg(c, 3);
+        if (!out || !gm_valid(out, 4)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        ComObj *s = com_level_view(tex, arg(c, 1), arg(c, 2), false);
+        if (!s) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        uint32_t view = com_view(s, IF_D3DSURFACE9);
+        if (!view) {
+            com_release(s);
+            com_ret(c, E_OUTOFMEMORY);
+            return;
+        }
+        com_out_ptr(out, view);
+        com_ret(c, D3D_OK9);
+        return;
+    }
     ComObj *tex = com_this_arg(c);
     uint32_t out = arg(c, 3);
     ComObj *s = cube_face(tex, arg(c, 1), arg(c, 2));
@@ -2088,6 +3532,11 @@ void Tex_GetCubeMapSurface(X86 *c) {
 // game its textures had no levels at all.
 // (this, FaceType, Level, pLockedRect, pRect, Flags)
 void Tex_LockRectCube(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        level_lock_wgpu(c, com_this_arg(c), arg(c, 1), arg(c, 2), false, arg(c, 4), 0, arg(c, 5),
+                        arg(c, 3), false);
+        return;
+    }
     ComObj *s = cube_face(com_this_arg(c), arg(c, 1), arg(c, 2));
     uint32_t out = arg(c, 3);
     if (!s || !out) {
@@ -2101,12 +3550,29 @@ void Tex_LockRectCube(X86 *c) {
 }
 // (this, FaceType, Level)
 void Tex_UnlockRectCube(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        level_unlock_wgpu(c, com_this_arg(c), arg(c, 1), arg(c, 2));
+        return;
+    }
     stage_unlock(cube_face(com_this_arg(c), arg(c, 1), arg(c, 2)));
     com_ret(c, D3D_OK9);
 }
 
 void Tex_GetLevelCount(X86 *c) {
     ComObj *tex = com_this_arg(c);
+    if (kD3d9WgpuEnabled) {
+        if (!tex || !tex->d3d9_resource) {
+            imports_unsupported(c);
+            return;
+        }
+        recomp::d3d::D3d9TextureDescriptorResult result = tex->d3d9_resource->texture_descriptor();
+        if (result.status.code != recomp::d3d::StatusCode::Ok) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        }
+        com_ret(c, result.descriptor.levels);
+        return;
+    }
     set_eax(c, (tex && !tex->caps && !tex->surfaces.empty()) ? (uint32_t)tex->surfaces.size() : 1);
 }
 
@@ -2114,8 +3580,34 @@ void Tex_GetLevelCount(X86 *c) {
 // with, for the level the texture was created at.
 void Tex_GetLevelDesc(X86 *c) {
     ComObj *tex = com_this_arg(c);
-    ComObj *s = texture_level(tex, arg(c, 1));
     uint32_t d = arg(c, 2);
+    if (kD3d9WgpuEnabled) {
+        if (!tex || !tex->d3d9_resource || !d || !gm_valid(d, 32)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::D3d9TextureDescriptorResult td = tex->d3d9_resource->texture_descriptor();
+        recomp::d3d::D3d9LevelDescriptorResult ld =
+            tex->d3d9_resource->texture_level_descriptor(0, arg(c, 1));
+        if (td.status.code != recomp::d3d::StatusCode::Ok) {
+            com_ret(c, bridge_result(c, td.status));
+            return;
+        }
+        if (ld.status.code != recomp::d3d::StatusCode::Ok) {
+            com_ret(c, bridge_result(c, ld.status));
+            return;
+        }
+        memset(gm_ptr(d), 0, 32);
+        wr32(d + 0, ld.descriptor.format);
+        wr32(d + 4, td.descriptor.resource_type);
+        wr32(d + 8, td.descriptor.usage);
+        wr32(d + 12, td.descriptor.pool);
+        wr32(d + 24, ld.descriptor.width);
+        wr32(d + 28, ld.descriptor.height);
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    ComObj *s = texture_level(tex, arg(c, 1));
     if (!tex || !d) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -2130,6 +3622,26 @@ void Tex_GetLevelDesc(X86 *c) {
 void Tex_GetSurfaceLevel(X86 *c) {
     ComObj *tex = com_this_arg(c);
     uint32_t out = arg(c, 2);
+    if (kD3d9WgpuEnabled) {
+        if (!out || !gm_valid(out, 4)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        ComObj *s = com_level_view(tex, 0, arg(c, 1), false);
+        if (!s) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        uint32_t view = com_view(s, IF_D3DSURFACE9);
+        if (!view) {
+            com_release(s);
+            com_ret(c, E_OUTOFMEMORY);
+            return;
+        }
+        com_out_ptr(out, view);
+        com_ret(c, D3D_OK9);
+        return;
+    }
     ComObj *s = texture_level(tex, arg(c, 1));
     if (!s || !out) {
         com_ret(c, D3DERR_INVALIDCALL);
@@ -2150,6 +3662,11 @@ void Tex_GetSurfaceLevel(X86 *c) {
     com_ret(c, D3D_OK9);
 }
 void Tex_LockRect(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        level_lock_wgpu(c, com_this_arg(c), 0, arg(c, 1), false, arg(c, 3), 0, arg(c, 4), arg(c, 2),
+                        false);
+        return;
+    }
     ComObj *s = texture_level(com_this_arg(c), arg(c, 1));
     uint32_t out = arg(c, 2);
     if (!s || !out) {
@@ -2162,15 +3679,234 @@ void Tex_LockRect(X86 *c) {
     com_ret(c, staged ? D3D_OK9 : E_OUTOFMEMORY);
 }
 void Tex_UnlockRect(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        level_unlock_wgpu(c, com_this_arg(c), 0, arg(c, 1));
+        return;
+    }
     stage_unlock(texture_level(com_this_arg(c), arg(c, 1)));
     com_ret(c, D3D_OK9);
 }
 
-// D3DQUERYTYPE: 8 is EVENT, 9 OCCLUSION. An occlusion query with a GPU
-// renderer counts real samples; without one, or for any other type, the
-// query is finished at once, and an occlusion count is reported as one
-// sample so that nothing the game gates on visibility disappears.
-static const uint32_t D3DQUERYTYPE_EVENT = 8, D3DQUERYTYPE_OCCLUSION = 9;
+static void autogen_set_filter(X86 *c) {
+    ComObj *tex = com_this_arg(c);
+    if (!tex || !tex->d3d9_resource) {
+        imports_unsupported(c);
+        return;
+    }
+    recomp::d3d::Status status = tex->d3d9_resource->set_autogen_filter(arg(c, 1));
+    com_ret(c, status.code == recomp::d3d::StatusCode::Ok ? D3D_OK9 : bridge_result(c, status));
+}
+
+static void autogen_get_filter(X86 *c) {
+    ComObj *tex = com_this_arg(c);
+    if (!tex || !tex->d3d9_resource) {
+        imports_unsupported(c);
+        return;
+    }
+    recomp::d3d::ValueResult result = tex->d3d9_resource->autogen_filter();
+    com_ret(c, result.status.code == recomp::d3d::StatusCode::Ok ? result.value
+                                                                 : bridge_result(c, result.status));
+}
+
+static void autogen_generate(X86 *c) {
+    ComObj *tex = com_this_arg(c);
+    if (!tex || !tex->d3d9_resource) {
+        imports_unsupported(c);
+        return;
+    }
+    recomp::d3d::Status status = tex->d3d9_resource->generate_mips();
+    if (status.code != recomp::d3d::StatusCode::Ok) {
+        std::string message(status.message.data(), status.message.size());
+        LOGW("d3d9: GenerateMipSubLevels: %s", message.c_str());
+    }
+}
+
+static bool read_dirty_rect(uint32_t rect, recomp::d3d::D3d9LockRect *out) {
+    if (!rect)
+        return true;
+    if (!gm_valid(rect, 16))
+        return false;
+    out->left = (int32_t)rd32(rect + 0);
+    out->top = (int32_t)rd32(rect + 4);
+    out->right = (int32_t)rd32(rect + 8);
+    out->bottom = (int32_t)rd32(rect + 12);
+    return true;
+}
+
+static bool read_dirty_box(uint32_t box, recomp::d3d::D3d9LockBox *out) {
+    if (!box)
+        return true;
+    if (!gm_valid(box, 24))
+        return false;
+    out->left = rd32(box + 0);
+    out->top = rd32(box + 4);
+    out->right = rd32(box + 8);
+    out->bottom = rd32(box + 12);
+    out->front = rd32(box + 16);
+    out->back = rd32(box + 20);
+    return true;
+}
+
+void Tex_AddDirtyRect(X86 *c) {
+    ComObj *tex = com_this_arg(c);
+    recomp::d3d::D3d9LockRect rect{};
+    if (!tex || !tex->d3d9_resource || !read_dirty_rect(arg(c, 1), &rect)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::Status status = tex->d3d9_resource->add_dirty_rect(0, 0, arg(c, 1) == 0, rect);
+    com_ret(c, status.code == recomp::d3d::StatusCode::Ok ? D3D_OK9 : bridge_result(c, status));
+}
+
+void Tex_AddDirtyRectCube(X86 *c) {
+    ComObj *tex = com_this_arg(c);
+    recomp::d3d::D3d9LockRect rect{};
+    if (!tex || !tex->d3d9_resource || !read_dirty_rect(arg(c, 2), &rect)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::Status status =
+        tex->d3d9_resource->add_dirty_rect(arg(c, 1), 0, arg(c, 2) == 0, rect);
+    com_ret(c, status.code == recomp::d3d::StatusCode::Ok ? D3D_OK9 : bridge_result(c, status));
+}
+
+void VolTex_GetLevelCount(X86 *c) {
+    ComObj *tex = com_this_arg(c);
+    if (!tex || !tex->d3d9_resource) {
+        imports_unsupported(c);
+        return;
+    }
+    recomp::d3d::D3d9TextureDescriptorResult result = tex->d3d9_resource->texture_descriptor();
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    com_ret(c, result.descriptor.levels);
+}
+
+void VolTex_GetLevelDesc(X86 *c) {
+    ComObj *tex = com_this_arg(c);
+    uint32_t d = arg(c, 2);
+    if (!tex || !tex->d3d9_resource || !d || !gm_valid(d, 28)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3d9TextureDescriptorResult td = tex->d3d9_resource->texture_descriptor();
+    recomp::d3d::D3d9LevelDescriptorResult ld =
+        tex->d3d9_resource->texture_volume_descriptor(arg(c, 1));
+    if (td.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, td.status));
+        return;
+    }
+    if (ld.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, ld.status));
+        return;
+    }
+    memset(gm_ptr(d), 0, 28);
+    wr32(d + 0, ld.descriptor.format);
+    wr32(d + 4, td.descriptor.resource_type);
+    wr32(d + 8, td.descriptor.usage);
+    wr32(d + 12, td.descriptor.pool);
+    wr32(d + 16, ld.descriptor.width);
+    wr32(d + 20, ld.descriptor.height);
+    wr32(d + 24, ld.descriptor.depth);
+    com_ret(c, D3D_OK9);
+}
+
+void VolTex_GetVolumeLevel(X86 *c) {
+    ComObj *tex = com_this_arg(c);
+    uint32_t out = arg(c, 2);
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    ComObj *v = com_level_view(tex, 0, arg(c, 1), true);
+    if (!v) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t view = com_view(v, IF_D3DVOLUME9);
+    if (!view) {
+        com_release(v);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    com_out_ptr(out, view);
+    com_ret(c, D3D_OK9);
+}
+
+void VolTex_LockBox(X86 *c) {
+    level_lock_wgpu(c, com_this_arg(c), 0, arg(c, 1), true, 0, arg(c, 3), arg(c, 4), arg(c, 2),
+                    true);
+}
+
+void VolTex_UnlockBox(X86 *c) {
+    level_unlock_wgpu(c, com_this_arg(c), 0, arg(c, 1));
+}
+
+void VolTex_AddDirtyBox(X86 *c) {
+    ComObj *tex = com_this_arg(c);
+    recomp::d3d::D3d9LockBox box{};
+    if (!tex || !tex->d3d9_resource || !read_dirty_box(arg(c, 1), &box)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::Status status = tex->d3d9_resource->add_dirty_box(0, arg(c, 1) == 0, box);
+    com_ret(c, status.code == recomp::d3d::StatusCode::Ok ? D3D_OK9 : bridge_result(c, status));
+}
+
+void Vol_GetContainer(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        resource_container(c);
+        return;
+    }
+    com_ret(c, D3DERR_INVALIDCALL);
+}
+
+void Vol_GetDesc(X86 *c) {
+    ComObj *v = com_this_arg(c);
+    uint32_t d = arg(c, 1);
+    if (!v || !v->d3d9_resource || !d || !gm_valid(d, 28)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t face = 0, level = 0;
+    bool volume = false;
+    ComObj *owner = level_owner(v, &face, &level, &volume);
+    if (!owner || !owner->d3d9_resource) {
+        imports_unsupported(c);
+        return;
+    }
+    recomp::d3d::D3d9TextureDescriptorResult td = owner->d3d9_resource->texture_descriptor();
+    recomp::d3d::D3d9LevelDescriptorResult ld =
+        owner->d3d9_resource->texture_volume_descriptor(level);
+    if (td.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, td.status));
+        return;
+    }
+    if (ld.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, ld.status));
+        return;
+    }
+    memset(gm_ptr(d), 0, 28);
+    wr32(d + 0, ld.descriptor.format);
+    wr32(d + 4, td.descriptor.resource_type);
+    wr32(d + 8, td.descriptor.usage);
+    wr32(d + 12, td.descriptor.pool);
+    wr32(d + 16, ld.descriptor.width);
+    wr32(d + 20, ld.descriptor.height);
+    wr32(d + 24, ld.descriptor.depth);
+    com_ret(c, D3D_OK9);
+}
+
+void Vol_LockBox(X86 *c) {
+    level_lock_wgpu(c, com_this_arg(c), 0, 0, true, 0, arg(c, 2), arg(c, 3), arg(c, 1), true);
+}
+
+void Vol_UnlockBox(X86 *c) {
+    level_unlock_wgpu(c, com_this_arg(c), 0, 0);
+}
+
 static const uint32_t S_FALSE9 = 1;
 static std::unordered_map<uint32_t, uint32_t> &query_state() { // id -> 1 begun, 2 ended
     static auto *m = new std::unordered_map<uint32_t, uint32_t>();
@@ -2193,126 +3929,61 @@ void Query_GetDataSize(X86 *c) {
 void Query_Issue(X86 *c) {
     ComObj *q = com_this_arg(c);
     uint32_t flags = arg(c, 1);
-    if (q && q->dev_type == D3DQUERYTYPE_OCCLUSION && gpu_on()) {
-        if (flags & 2) {
+    if (!q || (flags != D3DISSUE_BEGIN && flags != D3DISSUE_END)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (q->dev_type == D3DQUERYTYPE_OCCLUSION && gpu_on()) {
+        if (flags == D3DISSUE_BEGIN) {
             host_d9_query_begin(q->id);
             query_state()[q->id] = 1;
-        } else if (flags & 1) {
+        } else {
             host_d9_query_end(q->id);
             query_state()[q->id] = 2;
         }
+        com_ret(c, D3D_OK9);
+        return;
     }
-    com_ret(c, q ? D3D_OK9 : D3DERR_INVALIDCALL);
+    LOGW("d3d9: IDirect3DQuery9::Issue unsupported for query type %u", q->dev_type);
+    imports_unsupported(c);
 }
 // (this, pData, dwSize, dwGetDataFlags)
 void Query_GetData(X86 *c) {
     ComObj *q = com_this_arg(c);
-    uint32_t data = arg(c, 1), size = arg(c, 2);
-    if (!q) {
+    uint32_t data = arg(c, 1), size = arg(c, 2), flags = arg(c, 3);
+    if (!q || (size != 0 && (size != 4 || !data || !gm_valid(data, size))) ||
+        (flags & ~D3DGETDATA_FLUSH)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    uint32_t value = 1;
-    if (q->dev_type == D3DQUERYTYPE_OCCLUSION && gpu_on()) {
-        auto it = query_state().find(q->id);
-        if (it != query_state().end()) {
-            uint32_t count = 0;
-            int r = it->second == 2 ? host_d9_query_result(q->id, &count) : 0;
-            if (r == 0) {
-                com_ret(c, S_FALSE9); // not yet
-                return;
-            }
-            value = r > 0 ? count : 1;
-        }
+    if (flags & D3DGETDATA_FLUSH) {
+        LOGW("d3d9: IDirect3DQuery9::GetData D3DGETDATA_FLUSH unsupported");
+        imports_unsupported(c);
     }
-    if (data && size >= 4)
-        wr32(data, value);
+    if (q->dev_type != D3DQUERYTYPE_OCCLUSION || !gpu_on()) {
+        LOGW("d3d9: IDirect3DQuery9::GetData unsupported for query type %u", q->dev_type);
+        imports_unsupported(c);
+    }
+    auto it = query_state().find(q->id);
+    if (it == query_state().end() || it->second != 2) {
+        com_ret(c, S_FALSE9);
+        return;
+    }
+    uint32_t count = 0;
+    int r = host_d9_query_result(q->id, &count);
+    if (r == 0) {
+        com_ret(c, S_FALSE9);
+        return;
+    }
+    if (r < 0) {
+        LOGW("d3d9: IDirect3DQuery9::GetData host error");
+        imports_unsupported(c);
+    }
+    if (size)
+        wr32(data, count);
     com_ret(c, D3D_OK9);
 }
 
-#define RESOURCE_HEAD                                                                              \
-    {"QueryInterface", 3, com_QueryInterface}, {"AddRef", 1, com_AddRef},                          \
-        {"Release", 1, com_Release}, {"GetDevice", 2, Res_GetDevice},                              \
-        {"SetPrivateData", 5, Res_SetPrivateData}, {"GetPrivateData", 4, Res_GetPrivateData},      \
-        {"FreePrivateData", 2, Res_FreePrivateData}, {"SetPriority", 2, Res_SetPriority},          \
-        {"GetPriority", 1, Res_GetPriority}, {"PreLoad", 1, Res_PreLoad}, {                        \
-        "GetType", 1, Res_GetType                                                                  \
-    }
-
-static const ComMethod g_vb9[] = {
-    RESOURCE_HEAD,
-    {"Lock", 5, VB_Lock},
-    {"Unlock", 1, Buf_Unlock},
-    {"GetDesc", 2, Buf_GetDesc},
-};
-
-static const ComMethod g_ib9[] = {
-    RESOURCE_HEAD,
-    {"Lock", 5, IB_Lock},
-    {"Unlock", 1, Buf_Unlock},
-    {"GetDesc", 2, Buf_GetDesc},
-};
-
-static const ComMethod g_surface9[] = {
-    RESOURCE_HEAD,
-    {"GetContainer", 3, Surf_GetContainer},
-    {"GetDesc", 2, Surf_GetDesc},
-    {"LockRect", 4, Surf_LockRect},
-    {"UnlockRect", 1, Surf_UnlockRect},
-    {"GetDC", 2, Surf_GetDC},
-    {"ReleaseDC", 2, Surf_ReleaseDC},
-};
-
-static const ComMethod g_texture9[] = {
-    RESOURCE_HEAD,
-    {"SetLOD", 2, Tex_SetLOD},
-    {"GetLOD", 1, Tex_GetLOD},
-    {"GetLevelCount", 1, Tex_GetLevelCount},
-    {"SetAutoGenFilterType", 2, Tex_SetAutoGenFilterType},
-    {"GetAutoGenFilterType", 1, Tex_GetAutoGenFilterType},
-    {"GenerateMipSubLevels", 1, Tex_GenerateMipSubLevels},
-    {"GetLevelDesc", 3, Tex_GetLevelDesc},
-    {"GetSurfaceLevel", 3, Tex_GetSurfaceLevel},
-    {"LockRect", 5, Tex_LockRect},
-    {"UnlockRect", 2, Tex_UnlockRect},
-    {"AddDirtyRect", 2, Tex_AddDirtyRect},
-};
-
-static const ComMethod g_cubetexture9[] = {
-    RESOURCE_HEAD,
-    {"SetLOD", 2, Tex_SetLOD},
-    {"GetLOD", 1, Tex_GetLOD},
-    {"GetLevelCount", 1, Tex_GetLevelCount},
-    {"SetAutoGenFilterType", 2, Tex_SetAutoGenFilterType},
-    {"GetAutoGenFilterType", 1, Tex_GetAutoGenFilterType},
-    {"GenerateMipSubLevels", 1, Tex_GenerateMipSubLevels},
-    {"GetLevelDesc", 3, Tex_GetLevelDesc},
-    {"GetCubeMapSurface", 4, Tex_GetCubeMapSurface},
-    {"LockRect", 6, Tex_LockRectCube},
-    {"UnlockRect", 3, Tex_UnlockRectCube},
-    {"AddDirtyRect", 3, Tex_AddDirtyRectCube},
-};
-
-static const ComMethod g_decl9[] = {
-    {"QueryInterface", 3, com_QueryInterface},
-    {"AddRef", 1, com_AddRef},
-    {"Release", 1, com_Release},
-    {"GetDevice", 2, Res_GetDevice},
-    {"GetDeclaration", 3, Decl_GetDeclaration},
-};
-
-static const ComMethod g_query9[] = {
-    {"QueryInterface", 3, com_QueryInterface},
-    {"AddRef", 1, com_AddRef},
-    {"Release", 1, com_Release},
-    {"GetDevice", 2, Res_GetDevice},
-    {"GetType", 1, Query_GetType9},
-    {"GetDataSize", 1, Query_GetDataSize},
-    {"Issue", 2, Query_Issue},
-    {"GetData", 4, Query_GetData},
-};
-
-// ---------------------------------------------------------------------------
 // The pipeline record, and the device setters that write it
 // ---------------------------------------------------------------------------
 D9Pipeline &d9_pipeline(uint32_t device_id) {
@@ -2393,13 +4064,19 @@ void Dev_SetTextureStageState(X86 *c) {
 void Dev_SetRenderState(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t state = arg(c, 1);
-    if (dev && state < 256) {
-        D9Pipeline &p = d9_pipeline(dev->id);
-        if (p.rs[state] != arg(c, 2) || !p.rs_set[state]) {
-            p.rs[state] = arg(c, 2);
-            p.rs_set[state] = true;
-            p.states_changed();
-        }
+    if (!dev) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (state < D3DRS_ZENABLE || state > D3DRS_BLENDOPALPHA) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    D9Pipeline &p = d9_pipeline(dev->id);
+    if (p.rs[state] != arg(c, 2) || !p.rs_set[state]) {
+        p.rs[state] = arg(c, 2);
+        p.rs_set[state] = true;
+        p.states_changed();
     }
     com_ret(c, D3D_OK9);
 }
@@ -2408,182 +4085,65 @@ void Dev_SetRenderState(X86 *c) {
 void Dev_SetSamplerState(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t sampler = arg(c, 1), type = arg(c, 2);
-    if (dev && sampler < 16 && type < 14) {
-        D9Pipeline &p = d9_pipeline(dev->id);
-        if (p.sampler_state[sampler][type] != arg(c, 3)) {
-            p.sampler_state[sampler][type] = arg(c, 3);
-            p.states_changed();
+    if (!dev) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (sampler >= 16) {
+        if (sampler >= D3DDMAPSAMPLER && sampler <= D3DVERTEXTEXTURESAMPLER3) {
+            LOGW("d3d9: SetSamplerState unsupported for sampler %u", sampler);
+            imports_unsupported(c);
         }
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (type < D3DSAMP_ADDRESSU || type > D3DSAMP_DMAPOFFSET) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    D9Pipeline &p = d9_pipeline(dev->id);
+    if (p.sampler_state[sampler][type] != arg(c, 3)) {
+        p.sampler_state[sampler][type] = arg(c, 3);
+        p.states_changed();
     }
     com_ret(c, D3D_OK9);
 }
 
-// Copies Count four-float vectors from guest memory into a register table,
-// clipped to the table.
-static void write_registers(float (*table)[4], uint32_t limit, uint32_t start, uint32_t data,
+static bool write_registers(float (*table)[4], uint32_t limit, uint32_t start, uint32_t data,
                             uint32_t count) {
-    for (uint32_t i = 0; i < count && start + i < limit && data; ++i)
+    if (count == 0)
+        return true;
+    if (start > limit || count > limit - start)
+        return false;
+    if (!data || !gm_valid(data, count * 16))
+        return false;
+    for (uint32_t i = 0; i < count; ++i)
         for (uint32_t k = 0; k < 4; ++k) {
-            uint32_t bits = rd32(data + (i * 4 + k) * 4);
+            uint32_t bits = rd32(data + i * 16 + k * 4);
             memcpy(&table[start + i][k], &bits, 4);
         }
+    return true;
 }
 
 // (this, StartRegister, pConstantData, Vector4fCount)
 void Dev_SetVertexShaderConstantF(X86 *c) {
     ComObj *dev = this_device9(c);
-    if (dev)
-        write_registers(d9_pipeline(dev->id).vconst, 256, arg(c, 1), arg(c, 2), arg(c, 3));
+    if (!dev ||
+        !write_registers(d9_pipeline(dev->id).vconst, 256, arg(c, 1), arg(c, 2), arg(c, 3))) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
     com_ret(c, D3D_OK9);
 }
 void Dev_SetPixelShaderConstantF(X86 *c) {
     ComObj *dev = this_device9(c);
-    if (dev)
-        write_registers(d9_pipeline(dev->id).pconst, 32, arg(c, 1), arg(c, 2), arg(c, 3));
+    if (!dev ||
+        !write_registers(d9_pipeline(dev->id).pconst, 32, arg(c, 1), arg(c, 2), arg(c, 3))) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
     com_ret(c, D3D_OK9);
 }
-
-static const ComMethod g_d3d9[] = {
-    {"QueryInterface", 3, com_QueryInterface},
-    {"AddRef", 1, com_AddRef},
-    {"Release", 1, com_Release},
-    {"RegisterSoftwareDevice", 2, D9_RegisterSoftwareDevice},
-    {"GetAdapterCount", 1, D9_GetAdapterCount},
-    {"GetAdapterIdentifier", 4, D9_GetAdapterIdentifier},
-    {"GetAdapterModeCount", 3, D9_GetAdapterModeCount},
-    {"EnumAdapterModes", 5, D9_EnumAdapterModes},
-    {"GetAdapterDisplayMode", 3, D9_GetAdapterDisplayMode},
-    {"CheckDeviceType", 6, D9_CheckDeviceType},
-    {"CheckDeviceFormat", 7, D9_CheckDeviceFormat},
-    {"CheckDeviceMultiSampleType", 7, D9_CheckDeviceMultiSampleType},
-    {"CheckDepthStencilMatch", 6, D9_CheckDepthStencilMatch},
-    {"CheckDeviceFormatConversion", 5, D9_CheckDeviceFormatConversion},
-    {"GetDeviceCaps", 4, D9_GetDeviceCaps},
-    {"GetAdapterMonitor", 2, D9_GetAdapterMonitor},
-    {"CreateDevice", 7, D9_CreateDevice},
-};
-
-static const ComMethod g_device9[] = {
-    {"QueryInterface", 3, com_QueryInterface},
-    {"AddRef", 1, com_AddRef},
-    {"Release", 1, com_Release},
-    {"TestCooperativeLevel", 1, Dev_TestCooperativeLevel},
-    {"GetAvailableTextureMem", 1, Dev_GetAvailableTextureMem},
-    {"EvictManagedResources", 1, Dev_EvictManagedResources},
-    {"GetDirect3D", 2, Dev_GetDirect3D},
-    {"GetDeviceCaps", 2, Dev_GetDeviceCaps},
-    {"GetDisplayMode", 3, Dev_GetDisplayMode},
-    {"GetCreationParameters", 2, Dev_GetCreationParameters},
-    {"SetCursorProperties", 4, Dev_SetCursorProperties},
-    {"SetCursorPosition", 4, Dev_SetCursorPosition},
-    {"ShowCursor", 2, Dev_ShowCursor},
-    {"CreateAdditionalSwapChain", 3, Dev_CreateAdditionalSwapChain},
-    {"GetSwapChain", 3, Dev_GetSwapChain},
-    {"GetNumberOfSwapChains", 1, Dev_GetNumberOfSwapChains},
-    {"Reset", 2, Dev_Reset},
-    {"Present", 5, Dev_Present},
-    {"GetBackBuffer", 5, Dev_GetBackBuffer},
-    {"GetRasterStatus", 3, Dev_GetRasterStatus},
-    {"SetDialogBoxMode", 2, Dev_SetDialogBoxMode},
-    {"SetGammaRamp", 4, Dev_SetGammaRamp},
-    {"GetGammaRamp", 3, Dev_GetGammaRamp},
-    {"CreateTexture", 9, Dev_CreateTexture},
-    {"CreateVolumeTexture", 10, Dev_CreateVolumeTexture},
-    {"CreateCubeTexture", 8, Dev_CreateCubeTexture},
-    {"CreateVertexBuffer", 7, Dev_CreateVertexBuffer},
-    {"CreateIndexBuffer", 7, Dev_CreateIndexBuffer},
-    {"CreateRenderTarget", 9, Dev_CreateRenderTarget},
-    {"CreateDepthStencilSurface", 9, Dev_CreateDepthStencilSurface},
-    {"UpdateSurface", 5, Dev_UpdateSurface},
-    {"UpdateTexture", 3, Dev_UpdateTexture},
-    {"GetRenderTargetData", 3, Dev_GetRenderTargetData},
-    {"GetFrontBufferData", 3, Dev_GetFrontBufferData},
-    {"StretchRect", 6, Dev_StretchRect},
-    {"ColorFill", 4, Dev_ColorFill},
-    {"CreateOffscreenPlainSurface", 7, Dev_CreateOffscreenPlainSurface},
-    {"SetRenderTarget", 3, Dev_SetRenderTarget},
-    {"GetRenderTarget", 3, Dev_GetRenderTarget},
-    {"SetDepthStencilSurface", 2, Dev_SetDepthStencilSurface},
-    {"GetDepthStencilSurface", 2, Dev_GetDepthStencilSurface},
-    {"BeginScene", 1, Dev_BeginScene},
-    {"EndScene", 1, Dev_EndScene},
-    {"Clear", 7, Dev_Clear},
-    {"SetTransform", 3, Dev_SetTransform},
-    {"GetTransform", 3, Dev_GetTransform},
-    {"MultiplyTransform", 3, Dev_MultiplyTransform},
-    {"SetViewport", 2, Dev_SetViewport},
-    {"GetViewport", 2, Dev_GetViewport},
-    {"SetMaterial", 2, Dev_SetMaterial},
-    {"GetMaterial", 2, Dev_GetMaterial},
-    {"SetLight", 3, Dev_SetLight},
-    {"GetLight", 3, Dev_GetLight},
-    {"LightEnable", 3, Dev_LightEnable},
-    {"GetLightEnable", 3, Dev_GetLightEnable},
-    {"SetClipPlane", 3, Dev_SetClipPlane},
-    {"GetClipPlane", 3, Dev_GetClipPlane},
-    {"SetRenderState", 3, Dev_SetRenderState},
-    {"GetRenderState", 3, Dev_GetRenderState},
-    {"CreateStateBlock", 3, Dev_CreateStateBlock},
-    {"BeginStateBlock", 1, Dev_BeginStateBlock},
-    {"EndStateBlock", 2, Dev_EndStateBlock},
-    {"SetClipStatus", 2, Dev_SetClipStatus},
-    {"GetClipStatus", 2, Dev_GetClipStatus},
-    {"GetTexture", 3, Dev_GetTexture},
-    {"SetTexture", 3, Dev_SetTexture},
-    {"GetTextureStageState", 4, Dev_GetTextureStageState},
-    {"SetTextureStageState", 4, Dev_SetTextureStageState},
-    {"GetSamplerState", 4, Dev_GetSamplerState},
-    {"SetSamplerState", 4, Dev_SetSamplerState},
-    {"ValidateDevice", 2, Dev_ValidateDevice},
-    {"SetPaletteEntries", 3, Dev_SetPaletteEntries},
-    {"GetPaletteEntries", 3, Dev_GetPaletteEntries},
-    {"SetCurrentTexturePalette", 2, Dev_SetCurrentTexturePalette},
-    {"GetCurrentTexturePalette", 2, Dev_GetCurrentTexturePalette},
-    {"SetScissorRect", 2, Dev_SetScissorRect},
-    {"GetScissorRect", 2, Dev_GetScissorRect},
-    {"SetSoftwareVertexProcessing", 2, Dev_SetSoftwareVertexProcessing},
-    {"GetSoftwareVertexProcessing", 1, Dev_GetSoftwareVertexProcessing},
-    {"SetNPatchMode", 2, Dev_SetNPatchMode},
-    {"GetNPatchMode", 1, Dev_GetNPatchMode},
-    {"DrawPrimitive", 4, Dev_DrawPrimitive},
-    {"DrawIndexedPrimitive", 7, Dev_DrawIndexedPrimitive},
-    {"DrawPrimitiveUP", 5, Dev_DrawPrimitiveUP},
-    {"DrawIndexedPrimitiveUP", 9, Dev_DrawIndexedPrimitiveUP},
-    {"ProcessVertices", 7, Dev_ProcessVertices},
-    {"CreateVertexDeclaration", 3, Dev_CreateVertexDeclaration},
-    {"SetVertexDeclaration", 2, Dev_SetVertexDeclaration},
-    {"GetVertexDeclaration", 2, Dev_GetVertexDeclaration},
-    {"SetFVF", 2, Dev_SetFVF},
-    {"GetFVF", 2, Dev_GetFVF},
-    {"CreateVertexShader", 3, Dev_CreateVertexShader},
-    {"SetVertexShader", 2, Dev_SetVertexShader},
-    {"GetVertexShader", 2, Dev_GetVertexShader},
-    {"SetVertexShaderConstantF", 4, Dev_SetVertexShaderConstantF},
-    {"GetVertexShaderConstantF", 4, Dev_GetVertexShaderConstantF},
-    {"SetVertexShaderConstantI", 4, Dev_SetVertexShaderConstantI},
-    {"GetVertexShaderConstantI", 4, Dev_GetVertexShaderConstantI},
-    {"SetVertexShaderConstantB", 4, Dev_SetVertexShaderConstantB},
-    {"GetVertexShaderConstantB", 4, Dev_GetVertexShaderConstantB},
-    {"SetStreamSource", 5, Dev_SetStreamSource},
-    {"GetStreamSource", 5, Dev_GetStreamSource},
-    {"SetStreamSourceFreq", 3, Dev_SetStreamSourceFreq},
-    {"GetStreamSourceFreq", 3, Dev_GetStreamSourceFreq},
-    {"SetIndices", 2, Dev_SetIndices},
-    {"GetIndices", 2, Dev_GetIndices},
-    {"CreatePixelShader", 3, Dev_CreatePixelShader},
-    {"SetPixelShader", 2, Dev_SetPixelShader},
-    {"GetPixelShader", 2, Dev_GetPixelShader},
-    {"SetPixelShaderConstantF", 4, Dev_SetPixelShaderConstantF},
-    {"GetPixelShaderConstantF", 4, Dev_GetPixelShaderConstantF},
-    {"SetPixelShaderConstantI", 4, Dev_SetPixelShaderConstantI},
-    {"GetPixelShaderConstantI", 4, Dev_GetPixelShaderConstantI},
-    {"SetPixelShaderConstantB", 4, Dev_SetPixelShaderConstantB},
-    {"GetPixelShaderConstantB", 4, Dev_GetPixelShaderConstantB},
-    {"DrawRectPatch", 4, Dev_DrawRectPatch},
-    {"DrawTriPatch", 4, Dev_DrawTriPatch},
-    {"DeletePatch", 2, Dev_DeletePatch},
-    {"CreateQuery", 3, Dev_CreateQuery},
-};
 
 // The DLL's one export. Not a COM method: the guest calls it directly.
 void d3d9_Direct3DCreate9(X86 *c) {
@@ -2608,6 +4168,33 @@ void d3d9_reset() {
     g_scratch_size = 0;
 }
 
+#include "d3d9_interfaces.inc"
+
+static void d3d9_device_destroy(ComObj *o) {
+    device_discard_implicit_surfaces(o);
+    if (o->d3d9_device) {
+        o->d3d9_device.reset();
+        if (ComObj *factory = com_get(o->dev_d3d))
+            com_release(factory);
+    }
+    o->dev_d3d = 0;
+    o->d3d9_focus_window = 0;
+}
+
+static void d3d9_implicit_refs_changed(ComObj *o) {
+    if (!o || !o->d3d9_implicit)
+        return;
+    const bool external = o->refs > o->internal_refs;
+    ComObj *dev = com_get(o->dev_d3d);
+    if (!dev || external == o->d3d9_owner_retained)
+        return;
+    o->d3d9_owner_retained = external;
+    if (external)
+        com_retain_internal(dev);
+    else
+        com_release_internal(dev);
+}
+
 void d3d9_register() {
     static bool done = false;
     if (done)
@@ -2616,10 +4203,15 @@ void d3d9_register() {
 
     com_define(IF_D3D9, "d3d9.dll", "IDirect3D9", g_d3d9, std::size(g_d3d9));
     com_define(IF_D3DDEVICE9, "d3d9.dll", "IDirect3DDevice9", g_device9, std::size(g_device9));
+    com_define(IF_D3DRESOURCE9, "d3d9.dll", "IDirect3DResource9", g_resource9,
+               std::size(g_resource9));
     com_bind(IF_D3D9, K_D3D9);
     com_bind(IF_D3DDEVICE9, K_D3D9DEVICE);
+    com_bind(IF_D3DRESOURCE9, K_D3D9VB);
+    com_bind(IF_D3DRESOURCE9, K_D3D9IB);
     com_register_iid(IF_D3D9, IID_IDirect3D9_);
     com_register_iid(IF_D3DDEVICE9, IID_IDirect3DDevice9_);
+    com_register_iid(IF_D3DRESOURCE9, IID_IDirect3DResource9_);
     com_define(IF_D3DTEXTURE9, "d3d9.dll", "IDirect3DTexture9", g_texture9, std::size(g_texture9));
     com_define(IF_D3DCUBETEXTURE9, "d3d9.dll", "IDirect3DCubeTexture9", g_cubetexture9,
                std::size(g_cubetexture9));
@@ -2629,15 +4221,53 @@ void d3d9_register() {
     com_define(IF_D3DVERTEXDECL9, "d3d9.dll", "IDirect3DVertexDeclaration9", g_decl9,
                std::size(g_decl9));
     com_define(IF_D3DQUERY9, "d3d9.dll", "IDirect3DQuery9", g_query9, std::size(g_query9));
+    com_define(IF_D3DBASETEXTURE9, "d3d9.dll", "IDirect3DBaseTexture9", g_basetexture9,
+               std::size(g_basetexture9));
+    com_define(IF_D3DVOLUME9, "d3d9.dll", "IDirect3DVolume9", g_volume9, std::size(g_volume9));
+    com_define(IF_D3DVOLUMETEXTURE9, "d3d9.dll", "IDirect3DVolumeTexture9", g_volumetexture9,
+               std::size(g_volumetexture9));
+    com_define(IF_D3DVERTEXSHADER9, "d3d9.dll", "IDirect3DVertexShader9", g_vertexshader9,
+               std::size(g_vertexshader9));
+    com_define(IF_D3DPIXELSHADER9, "d3d9.dll", "IDirect3DPixelShader9", g_pixelshader9,
+               std::size(g_pixelshader9));
+    com_define(IF_D3DSTATEBLOCK9, "d3d9.dll", "IDirect3DStateBlock9", g_stateblock9,
+               std::size(g_stateblock9));
+    com_register_iid(IF_D3DTEXTURE9, IID_IDirect3DTexture9_);
+    com_register_iid(IF_D3DCUBETEXTURE9, IID_IDirect3DCubeTexture9_);
+    com_register_iid(IF_D3DSURFACE9, IID_IDirect3DSurface9_);
+    com_register_iid(IF_D3DVERTEXBUFFER9, IID_IDirect3DVertexBuffer9_);
+    com_register_iid(IF_D3DINDEXBUFFER9, IID_IDirect3DIndexBuffer9_);
+    com_register_iid(IF_D3DVERTEXDECL9, IID_IDirect3DVertexDeclaration9_);
+    com_register_iid(IF_D3DQUERY9, IID_IDirect3DQuery9_);
+    com_register_iid(IF_D3DBASETEXTURE9, IID_IDirect3DBaseTexture9_);
+    com_register_iid(IF_D3DVOLUME9, IID_IDirect3DVolume9_);
+    com_register_iid(IF_D3DVOLUMETEXTURE9, IID_IDirect3DVolumeTexture9_);
+    com_register_iid(IF_D3DVERTEXSHADER9, IID_IDirect3DVertexShader9_);
+    com_register_iid(IF_D3DPIXELSHADER9, IID_IDirect3DPixelShader9_);
+    com_register_iid(IF_D3DSTATEBLOCK9, IID_IDirect3DStateBlock9_);
     com_bind(IF_D3DTEXTURE9, K_D3D9TEXTURE);
-    com_bind(IF_D3DCUBETEXTURE9, K_D3D9TEXTURE);
+    com_bind(IF_D3DCUBETEXTURE9, K_D3D9CUBETEXTURE);
+    if (!kD3d9WgpuEnabled)
+        com_bind(IF_D3DCUBETEXTURE9, K_D3D9TEXTURE);
+    com_bind(IF_D3DVOLUMETEXTURE9, K_D3D9VOLUMETEXTURE);
+    com_bind(IF_D3DVOLUME9, K_D3D9VOLUME);
+    com_bind(IF_D3DBASETEXTURE9, K_D3D9TEXTURE);
+    com_bind(IF_D3DBASETEXTURE9, K_D3D9CUBETEXTURE);
+    com_bind(IF_D3DBASETEXTURE9, K_D3D9VOLUMETEXTURE);
     com_bind(IF_D3DSURFACE9, K_D3D9SURFACE);
+    com_bind(IF_D3DRESOURCE9, K_D3D9TEXTURE);
+    com_bind(IF_D3DRESOURCE9, K_D3D9CUBETEXTURE);
+    com_bind(IF_D3DRESOURCE9, K_D3D9VOLUMETEXTURE);
+    com_bind(IF_D3DRESOURCE9, K_D3D9SURFACE);
     com_bind(IF_D3DVERTEXBUFFER9, K_D3D9VB);
     com_bind(IF_D3DINDEXBUFFER9, K_D3D9IB);
     com_bind(IF_D3DVERTEXDECL9, K_D3D9DECL);
     com_bind(IF_D3DQUERY9, K_D3D9QUERY);
-    for (ComKind k : {K_D3D9TEXTURE, K_D3D9SURFACE, K_D3D9VB, K_D3D9IB})
+    for (ComKind k : {K_D3D9TEXTURE, K_D3D9CUBETEXTURE, K_D3D9VOLUMETEXTURE, K_D3D9VOLUME,
+                      K_D3D9SURFACE, K_D3D9VB, K_D3D9IB})
         com_set_destructor(k, d3d9_resource_destroy);
+    com_set_ref_hook(K_D3D9SURFACE, d3d9_implicit_refs_changed);
     com_set_destructor(K_D3D9QUERY, query_destroy);
+    com_set_destructor(K_D3D9DEVICE, d3d9_device_destroy);
     imports_register(g_d3d9_exports, std::size(g_d3d9_exports));
 }
