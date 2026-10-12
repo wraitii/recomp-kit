@@ -1,3 +1,4 @@
+use super::wgsl as shader_wgsl;
 use crate::RenderError;
 use std::collections::BTreeMap;
 
@@ -206,6 +207,8 @@ pub struct VertexElement {
 pub struct ShaderRecord {
     pub pixel: bool,
     pub code: Vec<u32>,
+    pub program: shader_wgsl::Program,
+    pub wgsl: String,
 }
 
 pub struct D3d9Objects {
@@ -237,6 +240,9 @@ impl D3d9Objects {
                 "shader handle range exhausted",
             ));
         }
+        let program = shader_wgsl::Program::decode(&code[..count], pixel)?;
+        let wgsl = shader_wgsl::translate(&program, &shader_wgsl::Variant::default())?;
+        shader_wgsl::validate(&wgsl)?;
         let handle = self.next_shader;
         self.next_shader += 1;
         self.shaders.insert(
@@ -244,6 +250,8 @@ impl D3d9Objects {
             ShaderRecord {
                 pixel,
                 code: code[..count].to_vec(),
+                program,
+                wgsl,
             },
         );
         Ok(handle)

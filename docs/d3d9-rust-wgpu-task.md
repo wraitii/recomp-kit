@@ -51,11 +51,12 @@ Follow the D3D7/D3D8 CXX migration (kit commit `f90bba7`):
 
 Object ownership rules live in `docs/architecture.md` under "Threads and
 ownership". Rust owns device, resource and pipeline state through CXX; C++ retains COM
-identities and guest staging. Shader execution and D3DX objects remain M5–M9.
+identities and guest staging. Shader translation is Rust-owned (M5); drawing
+and D3DX objects remain M6–M9.
 
 ## Current status
 
-- **Rust D3D9: M1–M4 done within the contracts below.** Device and resource
+- **Rust D3D9: M1–M5 done within the contracts below.** Device and resource
   state, descriptors, layouts, bytes, locks, dirty regions, priority/LOD and
   byte private data live in Rust. C++ retains COM identities/refcounts,
   factory/device/texture parents and per-subresource guest staging. Buffers,
@@ -74,7 +75,8 @@ identities and guest staging. Shader execution and D3DX objects remain M5–M9.
   wgpu context and rebuilds managed residency; physical loss stages a compatible
   fresh context with an isolated loss token and replaces the old one. Pipeline
   state, shader/declaration bytes and state blocks now live in Rust (M4).
-  M5–M9 remain pending; state storage does not imply drawing support. Civ4's
+  M5 translation and creation-time naga validation are complete for the shipped
+  shader corpus; M6–M9 remain pending. Drawing remains unimplemented. Civ4's
   `[render] d3d9_wgpu = true` stays on during active migration.
 - **ABI foundation: done.** Pinned Wine headers and IIDs
   (`third_party/wine-d3d9/`), generated D3D9 constants, version-specific D3DX
@@ -92,17 +94,21 @@ identities and guest staging. Shader execution and D3DX objects remain M5–M9.
   formatting, generated COM/status staleness and whitespace checks passed.
   No tests, app, headless or GPU runs were performed.
 
-Handoff: M4 is complete within its state-storage contract below; M5 is next.
-Rust owns state, declaration/shader bytes and state-block recording/snapshots;
-C++ retains COM identities from Rust binding ids without device/child cycles.
-Relevant files: `graphics/d3d8-wgpu/src/{bridge.rs,d3d9.rs,d3d9/{shader.rs,state.rs}}`
-and `dx/{d3d9.cpp,com.h,d3d_bridge_helpers.h,d3d9_bindings.json}`. Pi implementation
-and independent review, supervisor corrections, native/Rust formatting, generated
-dispatch staleness, repository boundaries and whitespace checks passed. The final
-flag-on `tools/.venv/bin/python tools/build.py --target app` and signing passed
-after correcting CXX declarations/imports, a Rust map-key type and the C++
-shader identity map. No tests, app, headless or GPU runs; runtime behavior remains
-unverified. Explicit deferrals are in M4 below. The Civ4 flag stays on.
+Handoff: M5 is complete for all 92 shaders in the 14 compiled effects; M6 is
+next. Shader creation reaches Rust through the existing CXX API and stores owned
+bytecode, decoded instructions/declarations and naga-validated default-variant
+WGSL before publishing a handle. C++ retains COM identity/refcounts. Relevant
+files: `graphics/d3d8-wgpu/src/d3d9/{shader.rs,wgsl.rs}`,
+`src/bin/shader_corpus.rs`, `Cargo.toml` and `tools/build_d3d8_wgpu.py`.
+Pi implementation and independent review, supervisor corrections, Rust formatting,
+repository-boundary and whitespace checks passed. One final flag-on
+`tools/.venv/bin/python tools/build.py --target app` and signing passed on the
+first attempt; the CPU-only `shader-corpus` run reported 92 ok, 0 failed
+(`analysis/m5-shader-validation.log`). No tests or app/GPU/headless runs.
+D3D8, CXX and COM bindings are unchanged; `dx/d3d9_bindings.json` remains the
+single guest-method status map. M6 draw integration and sampler variants, M8
+reflection APIs and M11 execution/precision fidelity remain unverified/deferred.
+The Civ4 flag stays on.
 
 M4 primary evidence: Microsoft `Reset`, `GetFunction`, `D3DSTATEBLOCKTYPE`, the
 three "Saving ... States With a StateBlock" pages and the `Capture` per-entry
@@ -121,6 +127,45 @@ example; [SetLight](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-
 `d3d9.h`/`d3d9types.h`/`d3d9caps.h`; Wine `dlls/d3d9/stateblock.c`,
 `dlls/wined3d/stateblock.c` and `dlls/wined3d/shader_sm1.c` (pin
 `db11d0fe6a169c457e23d007e20404643d067aa8`).
+
+M5 primary evidence: D2 and the Microsoft instruction pages
+[exp](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/exp---vs),
+[expp](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/expp---vs),
+[log](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/log---vs),
+[logp](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/logp---vs),
+[mova](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/mova---vs),
+[cnd](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/cnd---ps),
+[texkill](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/texkill---ps),
+[texld ps_1_4](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/texld---ps-1-4)/[ps_2_0](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/texld---ps-2-0),
+[texcrd](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/texcrd---ps),
+[texcoord](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/texcoord---ps),
+[dcl](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dcl---ps),
+[def vs](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/def---vs)/[ps](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/def---ps),
+[defi](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/defi---vs),
+[defb](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/defb---vs), the
+[assembly reference](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx9-graphics-reference-asm)
+and [vs_2_0 instruction list](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx9-graphics-reference-asm-vs-instructions-vs-2-0),
+plus the
+[D3DSHADER_PARAM_REGISTER_TYPE](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3d9types/ne-d3d9types-_d3dshader_param_register_type)
+enum. `texkill` SM2 compares `.xyzw`, SM1 `.xyz`, per pinned Wine
+`shader_glsl_texkill` in `dlls/wined3d/glsl_shader.c` at
+`db11d0fe6a169c457e23d007e20404643d067aa8`; `mova` rounds half away from zero
+(kit tie convention; Microsoft specifies nearest rounding, and tie fidelity
+remains unverified). Vertex float constants use a static
+256-entry bank (index 0–255) for vs1.1 and vs2.0; pinned Wine
+[`dlls/d3d9/tests/device.c` L7551–L7569](https://github.com/wine-mirror/wine/blob/db11d0fe6a169c457e23d007e20404643d067aa8/dlls/d3d9/tests/device.c#L7551-L7569)
+creates `vs_1_255` when the adapter exposes enough constants, so shader version
+alone does not cap the bank at 96. Read-only static review; no test executed.
+Corpus: 92 objects under ignored
+`analysis/m5-shaders/`, hashed in `analysis/m5-shader-manifest.json` (40 vs1.1,
+2 vs2.0, 34 ps1.1, 7 ps1.4, 9 ps2.0). Implementation:
+`graphics/d3d8-wgpu/src/d3d9/wgsl.rs` (decode, per-version register validation,
+translate, naga validate), `d3d9/shader.rs` (`ShaderRecord` owns decoded
+`Program` plus validated WGSL), `src/bin/shader_corpus.rs` (raw-file CLI),
+`tools/build_d3d8_wgpu.py` builds the CLI. VS constants bind group 0
+bindings 0–1, PS constants 2–3, textures 4+stage, samplers 20+stage. Corpus
+validation passed for all 92 default-variant modules using naga 27.0.3;
+non-default sampler variants remain unverified.
 
 ## Evidence rules
 
@@ -397,7 +442,7 @@ proceed in parallel once M1 exists.
   queries and reject short outputs. Caps report 16 streams/pixel sampler slots,
   eight fixed-function stages/textures, 256 vertex float constants, eight active
   lights and six clip planes; execution capability bits remain deferred.
-  Named deferrals: SM3/translation (M5), target selection/draws/queries (M6),
+  Named deferrals: SM3, target selection/draws/queries (M6),
   instancing and stream dividers above 1, vertex/displacement samplers, non-default
   declaration methods/tessellation, palettes, software VP, clip status and
   ValidateDevice. Pixel filter kernels/anisotropy remain M11; state storage
@@ -406,10 +451,27 @@ proceed in parallel once M1 exists.
   pinned Wine device behavior. LightEnable beyond the eight-active contract
   returns INVALIDCALL. Supervisor review and the windowed build/signing passed;
   execution and runtime fidelity remain unverified.
-- [ ] **M5. Shader translation.** Needs M4, D2. Done when: every shader in
+- [x] **M5. Shader translation.** Needs M4, D2. Done when: every shader in
   Civ4's compiled effects (`vs_1_1`, `vs_2_0`, `ps_1_1`, `ps_1_4`, `ps_2_0`)
-  translates to WGSL that naga validates, and other versions fail by name at
-  creation.
+  translates to WGSL that naga validates, and versions outside D1 fail by name
+  at creation. All 92 original shader objects passed CPU-only naga parsing and
+  validation: 40 vs1.1, 2 vs2.0, 34 ps1.1, 7 ps1.4 and 9 ps2.0. Callable
+  `CreateVertexShader`/`CreatePixelShader` decode, translate and validate before
+  publishing a Rust shader handle; Set/Get/GetFunction retain M4 behavior.
+  Rust owns raw bytes, decoded programs and validated WGSL; no guest addresses
+  or borrowed slices survive. Arithmetic, definitions, declarations, masks,
+  shifts, saturation, relative vertex constants, texture instructions and
+  simultaneous coissue reads cover the shipped corpus. Unsupported versions,
+  instructions, register forms and outputs fail by name. This establishes
+  corpus translation, not full instruction coverage or rendering equivalence.
+  Named deferrals: SM3, flow control/predication, untranslated instructions
+  (including `crs`/`sgn`), device-fed integer/bool constants, relative pixel
+  constants, unsupported source modifiers, declaration-free vertex inputs,
+  depth/MRT/point-size outputs. M6 owns draw/pipeline integration, semantic
+  linking, constant uploads and actual sampler variants; M8 owns CTAB/reflection
+  APIs. Non-default cube/volume/depth/projected variants and numeric fidelity
+  await later validation. Pi and supervisor review plus the final flag-on
+  windowed build/signing passed; no app/GPU execution was performed.
 - [ ] **M6. Drawing.** Needs M2–M5. Done when: all draw calls, including
   user-pointer and indexed variants, render through fixed-function or
   translated shader stages from immutable state snapshots; clears, copies,

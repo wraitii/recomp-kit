@@ -52,6 +52,12 @@ def main():
     status = process.wait()
     if status:
         parser.exit(status, "D3D8 renderer Cargo build failed\n")
+    corpus = subprocess.run(
+        [args.cargo, "build", "--release", "--locked", "--manifest-path",
+         str(args.crate / "Cargo.toml"), "--bin", "shader-corpus"],
+        env=build_env)
+    if corpus.returncode:
+        parser.exit(corpus.returncode, "D3D8 shader corpus CLI build failed\n")
     if package not in outputs:
         parser.exit(1, "Cargo did not report the D3D8 bridge output directory\n")
     if native_libs is None:

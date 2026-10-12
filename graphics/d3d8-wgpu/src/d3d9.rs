@@ -28,6 +28,7 @@ pub mod gpu;
 pub mod resource;
 pub mod shader;
 pub mod state;
+pub mod wgsl;
 
 static LIVE_DEVICES: AtomicUsize = AtomicUsize::new(0);
 
