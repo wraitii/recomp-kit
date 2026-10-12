@@ -9,25 +9,38 @@ import shutil
 from program import TranslateError
 from ir import x87_facts
 
-FORMAT = 'recomp-emission-cache-v1'
-EMITTERS = frozenset(('ir/emit_c.py', 'ir/emit_llvm.py', 'ir/llvm_cfg.py', 'output.py'))
+FORMAT = 'recomp-emission-cache-v2'
+NON_PRODUCING = x87_facts.NON_PRODUCING
+RE_RUN_MODULES = x87_facts.RE_RUN_MODULES
+
+
+def source_revisions(root=None):
+    """Preparation sources and the finalization sources re-run by selected regeneration."""
+    root = Path(__file__).resolve().parent if root is None else Path(root)
+    preparation, finalization = [], []
+    for path in sorted(root.rglob('*.py')):
+        relative = path.relative_to(root)
+        if NON_PRODUCING.intersection(relative.parts):
+            continue
+        entry = (str(relative), hashlib.sha256(path.read_bytes()).hexdigest())
+        (finalization if str(relative) in RE_RUN_MODULES else preparation).append(entry)
+    return {'preparation': x87_facts.digest(preparation),
+            'finalization': x87_facts.digest(finalization)}
 
 
 def identity(settings):
-    root = Path(__file__).resolve().parent
-    sources = [(str(path.relative_to(root)), hashlib.sha256(path.read_bytes()).hexdigest())
-               for path in sorted(root.rglob('*.py')) if str(path.relative_to(root)) not in EMITTERS
-               and 'tests' not in path.relative_to(root).parts]
+    revisions = source_revisions()
     return x87_facts.digest({
-        'sources': sources, 'policy': asdict(settings.emit),
-        'translate': {key: value for key, value in settings.cfg['translate'].items() if key != 'backend'},
+        'sources': revisions['preparation'],
+        'policy': asdict(settings.emit),
+        'translate': dict(settings.cfg['translate']),
         'game': settings.cfg['game'], 'curated': settings.curated, 'module': settings.module,
         'allow_unmodelled': settings.allow_unmodelled,
         'executable': hashlib.sha256(settings.exe.read_bytes()).hexdigest(),
         'code_map': x87_facts.tree_digest(settings.code_map, ('*',)),
         'facts': hashlib.sha256(settings.x87_facts.read_bytes()).hexdigest() if settings.x87_facts else None,
         'boundaries': hashlib.sha256(settings.x87_mode_metadata.read_bytes()).hexdigest() if settings.x87_mode_metadata else None,
-        'native': {name: x87_facts.tree_digest(root.parents[1] / name, ('*.c', '*.cpp', '*.h'))
+        'native': {name: x87_facts.tree_digest(Path(__file__).resolve().parents[2] / name, ('*.c', '*.cpp', '*.h'))
                    for name in ('runtime', 'dx', 'mods')},
         'game_native': x87_facts.tree_digest(settings.game_dir, ('*.c', '*.cpp', '*.h')),
     })
@@ -63,6 +76,7 @@ def save(root, settings, out, plans, private_plans, analysis, functions, entries
         if plan.body is not None:
             shutil.copy2(plan.body, root / plan.body.name)
     state = {'format': FORMAT, 'identity': identity(settings), 'tree': tree(out),
+             'revisions': source_revisions(),
              'plans': {addr: replace(plan, path=Path(plan.path.name) if plan.path is not None else None)
                        for addr, plan in plans.items()},
              'private_plans': [replace(plan, body=Path(plan.body.name) if plan.body is not None else None)
@@ -81,8 +95,9 @@ def write_index(root, state):
 
 
 def update(root, state, out, selected):
-    revision = x87_facts.tree_digest(Path(__file__).resolve().parent, ('*.py',))
-    state['history'].append({'functions': ['%08x' % addr for addr in sorted(selected)], 'emitter_revision': revision})
-    Path(out, 'partial-generations.json').write_text(json.dumps({'format': FORMAT, 'history': state['history']}, indent=1) + '\n')
+    state['history'].append({'functions': ['%08x' % addr for addr in sorted(selected)],
+                             'revisions': source_revisions()})
+    Path(out, 'partial-generations.json').write_text(
+        json.dumps({'format': FORMAT, 'history': state['history']}, indent=1) + '\n')
     state['tree'] = tree(out)
     write_index(root, state)

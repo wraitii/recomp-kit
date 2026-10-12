@@ -112,13 +112,7 @@ def build_harness(build_root, out, game_dir, no_build=False):
 
 
 def function_bodies(gen):
-    manifest = gen / "backends.json"
-    if manifest.is_file():
-        metadata = json.loads(manifest.read_text())
-        if metadata.get("format") != "recomp-backends-v1":
-            raise ValueError("unknown backend manifest format")
-        return {int(addr, 16): row["sha1"] for addr, row in metadata["functions"].items()}
-    header = re.compile(r"^/\* \S+\s+\d+ insns\s+([0-9a-f]{8})\.\.[0-9a-f]{8} \*/$", re.M)
+    header = re.compile(r"^/\* FUN_([0-9a-f]{8})\s+\d+ insns\s+[0-9a-f]{8}\.\.[0-9a-f]{8}[^*]*\*/$", re.M)
     bodies = {}
     for chunk in sorted(gen.glob("chunk_*.c")):
         text = chunk.read_text()
@@ -506,51 +500,6 @@ class RecordedInputs:
         return values
 
 
-def run_backends(addr, natives, emu, image, args):
-    inputs = RecordedInputs(addr, image, args)
-    data = [(s, image.bytes[s - image.base:s - image.base + n]) for s, n in image.writable]
-    region_list = regions(image)
-    skipped, compared = Counter(), 0
-    modes = ("specialized", "ordinary") if args.mode == "paired" else (args.mode,)
-    oracle_store = {name + "/" + mode: {} for name in natives for mode in modes}
-    within, across, first = {}, {}, {}
-    primary = next(iter(natives))
-    for iteration in range(args.iterations):
-        regs, eflags, cw, stack, fills = inputs.make()
-        reason, oracle = emulate_original(emu.u, emu, addr, data, region_list, args,
-                                          regs, eflags, cw, stack, fills)
-        if reason is not None:
-            skipped[reason] += 1
-            continue
-        compared += 1
-        variants = {}
-        for name, native in natives.items():
-            for mode in modes:
-                label = name + "/" + mode
-                variants[name, mode] = run_variant(native, mode, addr, data, fills, stack, region_list,
-                                                   regs, eflags, cw)
-                problems = oracle_problems(oracle, variants[name, mode], region_list)
-                findings_add(oracle_store[label], problems)
-                if problems and label not in first:
-                    first[label] = {"iteration": iteration, "input": input_record(regs, eflags, cw, stack), "problems": problems[:24]}
-            if len(modes) == 2:
-                problems = compare_pair(variants[name, "specialized"], variants[name, "ordinary"], region_list)
-                findings_add(within, [name + ": " + problem for problem in problems])
-            if name != primary:
-                for mode in modes:
-                    problems = compare_pair(variants[primary, mode], variants[name, mode], region_list)
-                    label = primary + "/" + name + "/" + mode
-                    findings_add(across, [label + ": " + problem for problem in problems])
-                    if problems and label not in first:
-                        first[label] = {"iteration": iteration, "input": input_record(regs, eflags, cw, stack), "problems": problems[:24]}
-    diverged = bool(within or across or any(oracle_store.values()))
-    return {"addr": addr, "status": "diverged" if diverged else "ok" if compared else "unreached",
-            "compared": compared, "mode": args.mode,
-            "oracle": {label: findings_list(store) for label, store in oracle_store.items()},
-            "pair": findings_list(within), "native_pair": findings_list(across),
-            "first": first, "skipped": dict(skipped)}
-
-
 def run_single(addr, native, emu, image, args):
     """One mode, the original bytes and the translation on shared inputs."""
     mode = args.mode
@@ -638,8 +587,6 @@ def input_record(regs, eflags, cw, stack):
 
 
 def run_function(addr, native, emu, image, args):
-    if isinstance(native, dict):
-        return run_backends(addr, native, emu, image, args)
     if args.mode == "paired":
         return run_paired(addr, native, emu, image, args)
     return run_single(addr, native, emu, image, args)
@@ -647,9 +594,6 @@ def run_function(addr, native, emu, image, args):
 
 def run_all(addrs, args, dylib, image):
     native = Native(dylib, image)
-    if args.compare_backend:
-        native = {args.backend_name: native,
-                  **{name: Native(path, image) for name, path in args.compare_backend}}
     emu = Emu(image)
     pending = list(addrs)
     running = {}
@@ -713,8 +657,6 @@ def report(result, done, total):
             print("    %s oracle x%d: %s" % (mode, f["count"], f["problem"]))
     for f in result.get("pair", [])[:4]:
         print("    pair x%d: %s" % (f["count"], f["problem"]))
-    for f in result.get("native_pair", [])[:4]:
-        print("    native pair x%d: %s" % (f["count"], f["problem"]))
     for category in sorted(result.get("first", {})):
         entry = result["first"][category]
         print("    first %s iteration %d: %s"
@@ -729,8 +671,8 @@ def failure(result, fail_on):
     if fail_on == "none":
         return False
     if fail_on == "pair":
-        return bool(result.get("pair") or result.get("native_pair"))
-    return bool(result.get("pair") or result.get("native_pair")) or any(result.get("oracle", {}).values())
+        return bool(result.get("pair"))
+    return bool(result.get("pair")) or any(result.get("oracle", {}).values())
 
 
 def default_run_dir(build_root, mode):
@@ -760,8 +702,6 @@ def main():
                         help="any fails on any oracle or pair discrepancy; pair only on pair")
     parser.add_argument("--no-build", action="store_true",
                         help="copy the prebuilt harness instead of invoking tools/build.py")
-    parser.add_argument("--backend-name", default="current")
-    parser.add_argument("--compare-backend", action="append", default=[], metavar="NAME=HARNESS")
     recording = parser.add_mutually_exclusive_group()
     recording.add_argument("--record-inputs", type=Path)
     recording.add_argument("--replay-inputs", type=Path)
@@ -851,15 +791,6 @@ def main():
                         json.dumps({"%08x" % a: h for a, h in bodies.items()}, sort_keys=True) + "\n")
         print("saved baseline: %s" % args.save_baseline)
 
-    comparisons = []
-    labels = {args.backend_name}
-    for specification in args.compare_backend:
-        name, separator, path = specification.partition("=")
-        if not separator or not name or name in labels or not Path(path).is_file():
-            parser.error("--compare-backend needs a unique NAME and an existing harness")
-        labels.add(name)
-        comparisons.append((name, str(Path(path).resolve())))
-    args.compare_backend = comparisons
     input_manifest = {"format": "recomp-diff-inputs-v1", "executable_sha256": digest,
                       "functions": ["%08x" % addr for addr in addrs], "iterations": args.iterations,
                       "seed": args.seed, "fpu_cws": args.fpu_cw}
@@ -892,9 +823,6 @@ def main():
         "expected_executable_sha256": cfg["game"]["sha256"],
         "harness": str(harness),
         "harness_sha256": harness_digest,
-        "backend_name": args.backend_name,
-        "backend_manifest": json.loads((gen / "backends.json").read_text()) if (gen / "backends.json").is_file() else None,
-        "compare_backends": {name: {"path": path, "sha256": sha256_file(path)} for name, path in args.compare_backend},
         "record_inputs": str(args.record_inputs) if args.record_inputs else None,
         "replay_inputs": str(args.replay_inputs) if args.replay_inputs else None,
         "translate_stamp": stamp.read_text().strip() if stamp.is_file() else None,

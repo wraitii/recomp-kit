@@ -83,8 +83,6 @@ TRANSLATE_DEFAULTS = {
     "msvc_x87_convention": True,
     "call_contracts": True,
     "private_leaf_contracts": False,
-    "private_value_transport": False,
-    "backend": "c",
     "x87_cw_clone": True,
 }
 
@@ -229,8 +227,6 @@ def load(game_dir, build_root=None):
     if not isinstance(strict_imports, bool):
         raise ValueError("%s: [game] strict_imports must be a boolean" % source)
     translate = cfg.setdefault("translate", {})
-    if translate.setdefault("backend", "c") not in ("c", "llvm"):
-        raise ValueError("%s: translate.backend must be c or llvm" % source)
     # "relaxed" keeps CPU and x87 state in host locals between observation
     # points, so an interior fault may see stale scratch state (DIVERGENCE
     # tags cpu-locals, ssa-x87-scalar, ssa-state-locals); "exact" publishes it
@@ -251,8 +247,6 @@ def load(game_dir, build_root=None):
         raise ValueError("%s: [translate] x87_cw_clone must be a boolean" % source)
     if not isinstance(translate.setdefault("private_leaf_contracts", TRANSLATE_DEFAULTS["private_leaf_contracts"]), bool):
         raise ValueError("%s: [translate] private_leaf_contracts must be a boolean" % source)
-    if not isinstance(translate.setdefault("private_value_transport", TRANSLATE_DEFAULTS["private_value_transport"]), bool):
-        raise ValueError("%s: [translate] private_value_transport must be a boolean" % source)
     if type(translate.setdefault("x87_imports_preserve_pc_rc", False)) is not bool:
         raise ValueError("%s: x87_imports_preserve_pc_rc must be a boolean" % source)
     if translate.get("x87_facts") is not None and (not isinstance(translate["x87_facts"], str) or not translate["x87_facts"]):

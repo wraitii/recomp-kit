@@ -444,11 +444,14 @@ def build_diff_harness(build_root, out):
     print("built diff harness: %s" % out)
 
 
-def run_translator(stage, game_dir, build_root, allow_unmodelled=None, aux_modules=(), main=True):
+def run_translator(stage, game_dir, build_root, allow_unmodelled=None, aux_modules=(), regen_functions=(), main=True):
     if main:
         command = [sys.executable, str(ROOT / "tools/recomp/driver.py"), "--out", str(stage),
                    "--game", str(game_dir),
                    "--report", str(Path(build_root) / "recomp/translate-report.json")]
+        command += ["--emission-cache", str(Path(build_root) / "recomp/emission-cache")]
+        for function in regen_functions:
+            command += ["--regen-function", function]
         if allow_unmodelled:
             command += ["--allow-unmodelled", allow_unmodelled]
         subprocess.run(command, cwd=ROOT, check=True)
@@ -476,6 +479,8 @@ def parse_args(argv, system=None):
     parser.add_argument("--regenerate", nargs="?", const="all", default=None, metavar="MODULES",
                         help="Regenerate translated C: all images, or only the named auxiliary modules "
                              "(comma-separated; 'main' names the game image)")
+    parser.add_argument("--regen-function", action="append", default=[], metavar="HEX_ADDR",
+                        help="Re-emit selected functions from validated whole-image preparation")
     parser.add_argument("--function-corpus", type=Path, metavar="MANIFEST",
                         help="Build/check/report a game-owned native-reference function corpus")
     parser.add_argument("--corpus-checks", type=int, default=4096)
@@ -591,14 +596,20 @@ def main():
                 selection = regenerate_selection(args.regenerate, cfg, parser)
                 translate_args = {
                     "allow_unmodelled": args.allow_unmodelled,
-                    "backend": args.backend,
-                    "llvm_functions": args.llvm_function,
-                    "private_values": args.private_values,
                 }
                 fingerprint = translation_fingerprint(args.game_dir, cfg, translate_args)
                 stamp = args.build_root / "recomp/translate.stamp"
                 translated = (args.build_root / "recomp/gen/table.c").is_file()
-                if selection is None:
+                if args.regen_function:
+                    if not translated or selection is not None:
+                        parser.error("--regen-function needs an existing translation and --regenerate all")
+                    def regenerate_selected(stage):
+                        shutil.copytree(args.build_root / "recomp/gen", stage, dirs_exist_ok=True)
+                        run_translator(stage, args.game_dir, args.build_root,
+                                       args.allow_unmodelled, (), args.regen_function)
+                    publish_generated(args.build_root, regenerate_selected)
+                    stamp.unlink(missing_ok=True)
+                elif selection is None:
                     if translated and stamp.is_file() and stamp.read_text().strip() == fingerprint:
                         print("translation inputs unchanged; keeping %s/recomp/gen" % args.build_root)
                     else:

@@ -74,8 +74,6 @@ class EmissionResult:
     requests: frozenset
     decisions: tuple
     dependencies: frozenset
-    llvm: tuple = ()
-    backend_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -104,7 +102,6 @@ class PrivatePreparationTask:
 class PrivateEmissionResult:
     addr: int
     lines: tuple
-    llvm: tuple = ()
 
 
 @dataclass(frozen=True)

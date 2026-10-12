@@ -1,8 +1,6 @@
 """C printing for finalized CPU-field boundary operations."""
 from . import c_symbols, flag_region
-from .lowering import (Publish, Invoke, IndirectInvoke, SettleFlags, Guard, Reload, Preserve, Return,
-                       ValueTransport, ValueInvoke, ResidentResults, ResultReload, PublishResult)
-from .call_contracts import ARITH_FLAGS
+from .lowering import (Publish, Invoke, IndirectInvoke, SettleFlags, Guard, Reload, Preserve, Return)
 
 
 CC_OP_CONST = {"add": "X86_CC_ADD", "sub": "X86_CC_SUB", "cmp": "X86_CC_SUB",
@@ -23,18 +21,14 @@ def cc_action_lines(action):
 
 
 class Printer:
-    def __init__(self, transport, fields, ref, mask, result=None, call=None):
-        self.result = result or (lambda v: "v%d" % v.id)
-        self.call = call or (lambda event: "call%d_" % event)
+    def __init__(self, transport, fields, ref, mask):
         self.plan = transport.boundaries
         self.fields, self.ref, self.mask = fields, ref, mask
-        self.arguments = ({field: c_symbols.argument(field) for field in transport.entry_fields}
-                          if isinstance(transport, ValueTransport) else {})
 
     def value(self, value):
         if value.whole is not None:
             return self.ref(value.whole)
-        field = self.arguments.get(value.field, self.fields[value.field])
+        field = self.fields[value.field]
         return " | ".join("(%s << %d)" % (self.ref(v), n * 8) if v is not None
                           else "(%s & 0x%xu)" % (field, 255 << (n * 8))
                           for n, v in enumerate(value.lanes))
@@ -69,27 +63,6 @@ class Printer:
             return lines
         if isinstance(operation, Invoke):
             return ["%s;" % c_symbols.render_invocation(operation.invocation)]
-        if isinstance(operation, ValueInvoke):
-            invocation, values = operation.invocation, operation.values
-            arguments = ["c", "0x%xu" % invocation.expected]
-            arguments.extend("(%s)(%s)" % (c_symbols.field_type(value.field), self.value(value))
-                             for value in values.inputs)
-            arguments.append("&" + self.call(operation.call))
-            return ["%s(%s);" % (c_symbols.symbol("entry_values", invocation.target, invocation.output_mask),
-                                    ", ".join(arguments))]
-        if isinstance(operation, ResidentResults):
-            return ["%s.%s = (%s)%s;" % (self.call(operation.call), field.lower(), c_symbols.field_type(field),
-                                             self.fields[field]) for field in operation.fields]
-        if isinstance(operation, ResultReload):
-            return ["%s = (%s.%s >> %d) & %s;" % (self.result(operation.result), self.call(operation.call),
-                       operation.field.lower(), operation.lane * 8, self.mask(operation.result.size))]
-        if isinstance(operation, PublishResult):
-            mask = sum(255 << (lane * 8) for lane in operation.lanes)
-            field = self.fields[operation.field]
-            if mask == 0xffffffff or operation.field in ARITH_FLAGS:
-                return ["%s = %s.%s;" % (field, self.call(operation.call), operation.field.lower())]
-            return ["%s = (%s & ~0x%xu) | (%s.%s & 0x%xu);" % (
-                field, field, mask, self.call(operation.call), operation.field.lower(), mask)]
         if isinstance(operation, IndirectInvoke):
             return ["%s(c, (uint32_t)%s);" % (operation.helper, self.ref(operation.target))]
         if isinstance(operation, SettleFlags):
@@ -101,25 +74,19 @@ class Printer:
                 lines.extend(["} else {", *self.operations(operation.otherwise)])
             return [*lines, "}"]
         if isinstance(operation, Reload):
-            return ["%s = (%s >> %d) & %s;" % (self.result(operation.result), self.fields[operation.field],
+            return ["v%d = (%s >> %d) & %s;" % (operation.result.id, self.fields[operation.field],
                                               operation.lane * 8, self.mask(operation.result.size))]
         if isinstance(operation, Preserve):
             kept = (self.ref(operation.whole) if operation.whole is not None else
                     " | ".join("(%s << %d)" % (self.ref(v), n * 8) for n, v in enumerate(operation.values)))
             settle = "x86_cc_settle(c), " if operation.settle_flags else ""
-            return ["%s = RECOMP_UNLIKELY(recomp_hooks_ever) ? (%s(%s >> %d) & %s) : (%s);"
-                    % (self.result(operation.result), settle, self.fields[operation.field], operation.lane * 8,
+            return ["v%d = RECOMP_UNLIKELY(recomp_hooks_ever) ? (%s(%s >> %d) & %s) : (%s);"
+                    % (operation.result.id, settle, self.fields[operation.field], operation.lane * 8,
                        self.mask(operation.result.size), kept)]
         if isinstance(operation, Return):
             dispatch = {"none": [], "always": ["recomp_return(c);"],
                         "checked": ["if (!checked_return_ || RECOMP_UNLIKELY(c->eip != expected_return_)) recomp_return(c);"]}
-            lines = list(dispatch[operation.dispatch])
-            if operation.resident and any(value.field in ARITH_FLAGS for value in operation.results):
-                lines.append("x86_cc_settle(c);")
-            lines.extend("out_->%s = (%s)(%s);" % (value.field.lower(), c_symbols.field_type(value.field),
-                          self.fields[value.field] if operation.resident else self.value(value))
-                         for value in operation.results)
-            return [*lines, "return;"]
+            return [*dispatch[operation.dispatch], "return;"]
         raise ValueError("unknown C boundary operation %s" % type(operation).__name__)
 
     def publication(self, event):

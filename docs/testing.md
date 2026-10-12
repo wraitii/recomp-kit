@@ -50,20 +50,14 @@ BSS/scratch/TEB fills and the full zeroed stack are reset before every execution
 `RECOMP_TEST_AUDIO=/path/to/track.ogg` and `RECOMP_TEST_AVI=/path/to/movie.avi`
 exercise the Vorbis and AVI/Indeo decoders in the native suites.
 
-The diff harness reads `backends.json` when present, including LLVM body
-hashes and C bridges in change selection. `--record-inputs DIR` saves every
-input, including discarded inputs and complete scratch/BSS/TEB fills, in a
-fresh directory. `--replay-inputs DIR` checks executable, selected functions
-and input settings before replay. Original memory and all native memories are
-reset independently for each mode.
+`--record-inputs DIR` saves every input, including discarded inputs and complete
+scratch/BSS/TEB fills, in a fresh directory. `--replay-inputs DIR` checks
+executable, selected functions and input settings before replay. Original
+memory is reset independently for each mode.
 
-Use `--backend-name NAME --compare-backend NAME=HARNESS` (repeatable) to compare
-saved CPU-field C, value C and LLVM harnesses on one input set. `--mode paired`
-compares ordinary/private modes within every backend. `pair` contains those
-within-backend discrepancies; `native_pair` contains discrepancies against the
-primary backend by mode; `oracle` remains separate for every backend/mode.
-`--fail-on pair` includes native pairs while retaining the non-clean oracle
-baseline. Library hashes and backend provenance are recorded in `run.json`.
-A saved library's coverage must be supplied with its build evidence; its name
-alone does not prove a private route was executed. Existing x87 slot/status,
-fault-discard and gameplay coverage limits still apply.
+`--mode paired` compares the production specialization-enabled and forced
+ordinary variants within a run; `pair` contains those discrepancies and `oracle`
+remains separate. `--fail-on pair` requires paired mode and ignores the non-clean
+oracle baseline. A saved library's coverage must be supplied with its build
+evidence; its name alone does not prove a private route was executed. Existing
+x87 slot/status, fault-discard and gameplay coverage limits still apply.

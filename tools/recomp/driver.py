@@ -28,7 +28,7 @@ import emission_cache
 from settings import Settings
 from frontend import external_exits
 from ir import call_contracts, contract_variants, production, x87_mode, x87_facts, x87_report, prepared_store
-from ir import c_symbols, emit_llvm
+from ir import c_symbols
 from ir.c_symbols import Declaration
 from ir.artifacts import ArtifactStore
 from ir.body import FrozenMap
@@ -257,24 +257,11 @@ def _emit(task):
         fn, entries = ctx.load(addr)
         tr.analyze(fn, entries)
         reason, lines, requests, decisions, deps = plan.reason, None, set(), [], set()
-        llvm, backend_reason = [], None
         if plan.body is not None:
             body = plan.body
             if body.final is None or body.final.layouts != layouts:
                 raise TranslateError("%08x: emission requires finalized shared layouts" % addr)
-            emitter = production.emit_prepared
-            if ctx.settings.backend == "llvm":
-                if ctx.settings.llvm_functions and addr not in ctx.settings.llvm_functions:
-                    backend_reason = "C fallback: outside requested LLVM functions"
-                else:
-                    try:
-                        artifact = emit_llvm.emit_prepared(body)
-                    except SSAError as error:
-                        backend_reason = str(error)
-                    else:
-                        llvm.append(artifact)
-                        emitter = lambda _: artifact.bridges
-            lines, external, requests, decisions = production.emit_ssa_prepared(body, emitter)
+            lines, external, requests, decisions = production.emit_ssa_prepared(body)
             deps = set(c_symbols.prepared_declarations(body))
             if entries and not external:
                 wrappers = tr.translate(fn, entries)
@@ -288,7 +275,7 @@ def _emit(task):
             lines = tr.translate(fn, entries)
             deps = {Declaration("entry", t) for t in tr.call_targets}
         out.append(EmissionResult(addr, lines, re.sub(r"^[0-9a-f]{8}: ", "", reason) if reason else None,
-                    tuple(tr.unmodelled), frozenset(requests), tuple(decisions), frozenset(deps), tuple(llvm), backend_reason))
+                    tuple(tr.unmodelled), frozenset(requests), tuple(decisions), frozenset(deps)))
     return out
 
 
@@ -302,7 +289,8 @@ def _private_candidate(task):
         ctx.artifacts.reuse_normalized(addr)
         contract = production.private_contract(ctx.tr, ctx.lifter, fn, ctx.artifacts)
         production.prepare_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit,
-                                   contract_variants.PrivateLayout.from_mask(0x3fff, contract.reads), known_mode, ctx.artifacts)
+                                   contract_variants.PrivateLayout.from_mask(0x3fff, contract.reads), known_mode, ctx.artifacts,
+                                   finalize=True)
         production.prepare_ssa(ctx.tr, ctx.lifter, fn, entries,
                                production.ProductionRequest(ctx.settings.emit, ctx.known, checked_returns=frozenset({addr})),
                                ctx.artifacts)
@@ -330,15 +318,9 @@ def _prepare_private(task):
 def _private(plan):
     if plan.body is not None:
         plan = replace(plan, body=prepared_store.read(plan.body))
-    artifacts = []
-    def emitter(body):
-        artifact = emit_llvm.emit_prepared(body)
-        artifacts.append(artifact)
-        return artifact.bridges
-    use_llvm = (_CTX.settings.backend == "llvm" and
-                (not _CTX.settings.llvm_functions or plan.addr in _CTX.settings.llvm_functions))
-    lines = production.emit_private_prepared(plan, emitter if use_llvm else production.emit_prepared)
-    return PrivateEmissionResult(plan.addr, tuple(lines), tuple(artifacts))
+        plan.body.finalize({})
+    lines = production.emit_private_prepared(plan)
+    return PrivateEmissionResult(plan.addr, tuple(lines))
 
 
 def chunked(addrs, count):
@@ -436,9 +418,6 @@ def parse_args(argv):
     ap.add_argument("--game", required=True, help="the directory holding game.toml")
     ap.add_argument("--emission-cache", type=Path)
     ap.add_argument("--regen-function", type=lambda v: int(v, 16), action="append", default=[])
-    ap.add_argument("--backend", choices=("c", "llvm"))
-    ap.add_argument("--llvm-function", type=lambda v: int(v, 16), action="append", default=[])
-    ap.add_argument("--private-values", action=argparse.BooleanOptionalAction, default=None)
     ap.add_argument("--module", help="translate one [modules.aux] image")
     ap.add_argument("--report", default=None, help="write a JSON stats file")
     ap.add_argument("--quiet", action="store_true")
@@ -454,7 +433,7 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     started = time.monotonic()
     log = (lambda *a: None) if args.quiet else (lambda *a: print(*a, file=sys.stderr, flush=True))
-    settings = Settings(game_config.load(args.game), args.allow_unmodelled, jobs_for(args.jobs), args.module, args.backend, args.llvm_function, args.private_values)
+    settings = Settings(game_config.load(args.game), args.allow_unmodelled, jobs_for(args.jobs), args.module)
     ctx = Context(settings)
     settings, program = ctx.settings, ctx.program
     phase("load")
@@ -545,8 +524,7 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
         tasks = [PreparationTask(tuple(part), analysis.for_addresses(part, calls), selection, store) for part in parts]
         plans = {plan.addr: plan for batch in pool.map(_prepare, tasks) for plan in batch}
         specialization = contract_variants.SpecializationPlan.build(
-            {addr: plan.requests for addr, plan in plans.items()}, private_targets,
-            settings.emit.private_value_transport)
+            {addr: plan.requests for addr, plan in plans.items()}, private_targets)
         shared_layouts = specialization.layouts
         private_plans = list(pool.map(_prepare_private,
                              [PrivatePreparationTask(addr, layout, addr in known_modes, store)
@@ -562,7 +540,6 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
                 raise TranslateError("%08x: emission differs from its specialization plan" % addr)
         for row in pool.map(_private, private_plans):
             results[row.addr].lines.extend(row.lines)
-            results[row.addr] = replace(results[row.addr], llvm=results[row.addr].llvm + row.llvm)
         phase("private entries")
 
     workload = Counter()
@@ -577,11 +554,8 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
     dependencies = {addr: results[addr].dependencies for addr in addrs}
     os.makedirs(args.out, exist_ok=True)
     output.write_funcs_header(args.out, entry_names)
-    output.emit_body_chunks(args.out, functions, bodies, entries_by_fn, dependencies,
-                            shared_layouts if settings.emit.private_value_transport else None)
-    output.write_backend_artifacts(args.out, results, settings.backend)
-    output.emit_entry_chunks(args.out, entry_names, settings.module, checked_returns, private_masks,
-                             shared_layouts if settings.emit.private_value_transport else None)
+    output.emit_body_chunks(args.out, functions, bodies, entries_by_fn, dependencies)
+    output.emit_entry_chunks(args.out, entry_names, settings.module, checked_returns, private_masks)
     symbols = symbol_rows(ctx, entry_names, rows)
     if settings.module:
         output.write_module_table(args.out, entry_names, symbols, call_returns, settings.module)
@@ -594,7 +568,6 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
     decisions.sort(key=lambda item: (item.get("site", ""), item.get("target", ""),
                                      json.dumps(item, sort_keys=True, separators=(",", ":"))))
     contract_report = {
-        "private_transport": "values" if settings.emit.private_value_transport else "cpu_fields",
         "frontend_work": dict(workload),
         "configured_callers": ["%08x" % a for a in sorted(settings.state_contract_callers)],
         "selected_callers": ["%08x" % a for a in sorted(selected_callers)],
@@ -675,14 +648,11 @@ def translate_selected(args, settings, ctx, log, started):
                    for plan in state['private_plans'] if plan.addr in selected]
         for row in pool.map(_private, private):
             results[row.addr].lines.extend(row.lines)
-            results[row.addr] = replace(results[row.addr], llvm=results[row.addr].llvm + row.llvm)
     phase("selected emission")
     functions = state['functions']
     bodies = {addr: result.lines for addr, result in results.items()}
     dependencies = {addr: result.dependencies for addr, result in results.items()}
-    paths = output.emit_body_chunks(args.out, functions, bodies, state['entries_by_fn'], dependencies,
-                            layouts if settings.emit.private_value_transport else None)
-    output.write_backend_artifacts(args.out, results, settings.backend)
+    paths = output.emit_body_chunks(args.out, functions, bodies, state['entries_by_fn'], dependencies)
     written = {Path(path).name for path in paths}
     for path in Path(args.out).glob('chunk_*.c'):
         if not path.name.startswith('chunk_entries_') and path.name not in written:

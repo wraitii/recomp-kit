@@ -34,15 +34,39 @@ def tree_digest(root, patterns):
     return digest([(str(p.relative_to(root)), hashlib.sha256(p.read_bytes()).hexdigest()) for p in sorted(files)])
 
 
+NON_PRODUCING = frozenset(("tests", "diff", "corpus"))
+RE_RUN_MODULES = frozenset((
+    "ir/lowering.py", "ir/c_boundaries.py", "ir/call_values.py",
+    "ir/emit_c.py", "output.py",
+))
+
+
+def producer_digest(kit):
+    """The analysis producer and its semantic dependencies, not the whole tree."""
+    recomp = kit / "tools/recomp"
+    files = set(recomp.rglob("*.py"))
+    game_config = kit / "tools/game_config.py"
+    if game_config.is_file():
+        files.add(game_config)
+    entries = []
+    for path in sorted(files):
+        relative = path.relative_to(recomp) if recomp in path.parents else Path(path.name)
+        if NON_PRODUCING.intersection(relative.parts) or "__pycache__" in relative.parts:
+            continue
+        if str(relative) in RE_RUN_MODULES:
+            continue
+        entries.append((str(path.relative_to(kit)), hashlib.sha256(path.read_bytes()).hexdigest()))
+    return digest(entries)
+
+
 def identity(settings):
     kit = Path(__file__).resolve().parents[3]
-    tools = kit / "tools"
     policy = {key: value for key, value in settings.cfg["translate"].items()
               if key not in ("x87_facts", "code_map")}
     boundary = settings.x87_mode_metadata
     return {"executable_sha256": settings.sha256.lower(),
             "producer": PRODUCER,
-            "producer_sha256": tree_digest(tools, ("*.py",)),
+            "producer_sha256": producer_digest(kit),
             "analysis_inputs_sha256": digest({
                 "code_map": tree_digest(settings.code_map, ("*",)),
                 "policy": policy,

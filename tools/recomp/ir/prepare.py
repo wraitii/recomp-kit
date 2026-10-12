@@ -5,7 +5,7 @@ from .lift import Lifter
 from .ssa import SSAError, MEMORY, build
 from .cfg import FunctionIR
 from .guest import X86_32
-from .simplify import canonicalize, simplify, state_roots, EFFECTS, EXITS
+from .simplify import canonicalize, simplify, EFFECTS, EXITS
 from .publication import analyze as publication_analysis
 from . import flag_region, operations
 from . import transfer_plan, x87_plan
@@ -189,7 +189,7 @@ class PreparedFunction:
     state_groups: tuple
     provisional: ProvisionalBindings | None = None
     final: FinalBindings | None = None
-    transport: lowering.CPUFieldTransport | lowering.ValueTransport | None = None
+    transport: lowering.CPUFieldTransport | None = None
 
     @property
     def invocations(self):
@@ -261,9 +261,7 @@ class PreparedFunction:
         if self.final is not None and self.final != final:
             raise SSAError("body already finalized with a different layout")
         boundaries = lowering.plan(self, invocations)
-        transport = (lowering.select_values(self, boundaries, values)
-                     if self.options.request.policy.private_value_transport
-                     else lowering.select_cpu_fields(boundaries, values))
+        transport = lowering.select_cpu_fields(boundaries, values)
         self.final, self.transport = final, transport
 
     def decision_rows(self):
@@ -291,23 +289,13 @@ class PreparedFunction:
                     "caller has alternate entries or SEH" if fir.entries or fir.seh
                     else "target is not an admitted checked leaf")
                 contract = contracts.get(v.data)
-                values = self.transport.calls.get(v.id) if isinstance(self.transport, lowering.ValueTransport) else None
                 fast_publication = field_names(call.publication.required)
-                removed = []
-                if values is not None:
-                    removed = [field for field in fast_publication if field in values.layout.inputs
-                               and field in CONTRACT_GPRS and field not in CONTRACT_NEVER_SKIP]
-                    fast_publication = sorted(set(fast_publication) - set(removed))
                 rows.append({
                     "caller": "%08x" % fir.addr, "site": "%08x" % b.insn.addr,
                     "target": "%08x" % v.data,
                     "specialization": invocation.form,
                     "callee_reads": sorted(contract.reads) if contract is not None else None,
                     "fast_publication": fast_publication,
-                    "transport": "values" if values is not None else "cpu_fields",
-                    "argument_fields": list(values.layout.inputs) if values is not None else [],
-                    "result_fields": list(values.layout.outputs) if values is not None else [],
-                    "cpu_input_stores_removed": removed,
                     "outputs": sorted(call.required_outputs) if private else None,
                     "entry_output_mask": "%04x" % invocation.output_mask if private else None,
                     "ordinary_fallback": field_names(call.fallback.required) if private else None,
@@ -493,25 +481,12 @@ def prepare(fir, request, *, lifter=None, normalized=None):
     # summaries prove which fields a boundary does not observe.
     kept_calls = {v.id: kept_fields[v.data] for b in s.blocks.values() for v in b.ops
                   if v.opc == "CALL" and v.data in kept_fields}
-    transported = {key for key, field in lane_field.items() if field in CONTRACT_GPRS}
-    value_calls = {v.id for b in s.blocks.values() for v in b.ops
-                   if v.opc == "CALL" and v.data in contract_calls} if policy.private_value_transport else set()
-    nonresident_inputs = (set(transported) if return_fields is not None and policy.private_value_transport else set())
     publication_facts = publication_analysis(s, fir.succ, groups, access_fields=access_fields,
-                                             reloaded=set(mapping) - flag_keys, kept=kept_calls,
-                                             nonresident_inputs=nonresident_inputs, value_calls=value_calls,
-                                             transported=transported)
+                                             reloaded=set(mapping) - flag_keys, kept=kept_calls)
     transfers = transfer_plan.build(s, groups, publication_facts,
                                     call_contracts or {}, kept_calls, lane_field, CONTRACT_NEVER_SKIP,
                                     contract_calls, return_fields, flag_keys, flag_first_key,
                                     CC_DEFINES, CC_BIT_VALUES, lazy_flags, CC_EAGER_EVENTS)
-    if policy.private_value_transport:
-        for b in s.blocks.values():
-            for v in b.ops:
-                if v.id in value_calls or (v.opc == "RETURN" and return_fields is not None):
-                    state = b.exit if v.opc == "RETURN" else b.snapshots[v.id]
-                    keys = [key for key in state if key in lane_field]
-                    transfers.roots.extend(state_roots(s, state, keys, groups))
     live = simplify(s, transfers.live_publications, canonical=False, extra_roots=transfers.roots,
                     removable=frozenset(("CALL_RELOAD", "CALL_KEEP")), groups=groups)
     reads_entry_flags = any(

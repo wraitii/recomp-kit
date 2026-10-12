@@ -74,8 +74,8 @@ def prepare_ssa(tr, lifter, fn, entries, request, artifacts=None):
         raise SSAError("SSA graph recursion budget")
 
 
-def emit_ssa_prepared(prepared, emitter=emit_prepared):
-    source = emitter(prepared)
+def emit_ssa_prepared(prepared):
+    source = emit_prepared(prepared)
     addr, entries = prepared.ir.addr, prepared.ir.entries
     checked, symbol = prepared.options.checked_return, prepared.options.symbol
     lines = source.splitlines()
@@ -99,32 +99,27 @@ class PrivatePlan:
     body: object | None
 
 
-def prepare_private(tr, lifter, fn, policy, layout, known_mode=False, artifacts=None):
+def prepare_private(tr, lifter, fn, policy, layout, known_mode=False, artifacts=None, finalize=False):
     artifacts = artifacts if artifacts is not None else ArtifactStore()
     variant = BodyVariant(EntryForm.PRIVATE, ReturnForm.PRIVATE,
                           Guarded(CW_FAST, "entry") if known_mode else Dynamic())
     fir = artifacts.lifted(tr, lifter, fn)
     request = BodyRequest(c_symbols.body_symbol(variant, fn.addr, layout), variant, policy, layout=layout)
     body = prepare_body(fir, request, lifter=lifter, normalized=artifacts.normalized(fir, lifter))
-    body.finalize({})
+    if finalize:
+        body.finalize({})
     return PrivatePlan(fn.addr, layout, variant,
-                       None if not policy.private_value_transport and not known_mode and layout.outputs == tuple(FIELDS) else body)
+                       None if not known_mode and layout.outputs == tuple(FIELDS) else body)
 
 
-def emit_private_prepared(plan, emitter=emit_prepared):
+def emit_private_prepared(plan):
     name = c_symbols.symbol("fn_contract", plan.addr, plan.layout.output_mask)
     signature = c_symbols.entry_signature(plan.variant, name)
     if plan.body is None:
         return ["%s { %s(c, expected); }" % (signature, c_symbols.symbol("fn_checked", plan.addr))]
     if plan.body.options.request.layout != plan.layout or plan.body.options.request.variant != plan.variant:
         raise SSAError("private body disagrees with its entry layout or variant")
-    lines = emitter(plan.body).splitlines()
-    if plan.body.options.request.policy.private_value_transport:
-        name = c_symbols.symbol("fn_values", plan.addr, plan.layout.output_mask)
-        signature = c_symbols.value_signature(name, plan.layout, plan.addr)
-        lines.append("%s { %s(%s); }" % (signature, plan.body.options.symbol,
-                                         c_symbols.value_arguments(plan.layout)))
-        return lines
+    lines = emit_prepared(plan.body).splitlines()
     lines.append("%s { %s(c, expected); }" % (signature, plan.body.options.symbol))
     return lines
 

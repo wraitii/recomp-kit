@@ -52,18 +52,13 @@ class SpecializationPlan:
     caller_requests: FrozenMap
 
     @classmethod
-    def build(cls, requests, contracts, value_transport=False):
+    def build(cls, requests, contracts):
         masks = {}
         for wanted in requests.values():
             for target, mask in wanted:
                 masks[target] = masks.get(target, 0) | mask
-        layouts = {}
-        for addr, mask in masks.items():
-            inputs = contracts[addr].reads | frozenset(("ESP", "EBP"))
-            if value_transport:
-                inputs |= frozenset(f for i, f in enumerate(FIELDS)
-                                    if mask & (1 << i) and f not in contracts[addr].kills)
-            layouts[addr] = PrivateLayout.from_mask(mask, inputs)
+        layouts = {addr: PrivateLayout.from_mask(mask, contracts[addr].reads | frozenset(("ESP", "EBP")))
+                   for addr, mask in masks.items()}
         callers = {addr: frozenset((target, layouts[target].output_mask) for target, _ in wanted)
                    for addr, wanted in requests.items() if wanted}
         return cls(FrozenMap.of(layouts), FrozenMap.of(callers))

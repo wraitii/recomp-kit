@@ -18,9 +18,8 @@ def carry_name(position, part):
 
 
 class Printer:
-    def __init__(self, external, decoded=False, conditions=None, local=None):
+    def __init__(self, external, decoded=False, conditions=None):
         self.external, self.decoded, self.conditions = external, decoded, conditions or {}
-        self.local = local or (lambda name: name)
 
     def expr(self, value):
         kind, data = value.kind, value.data
@@ -30,13 +29,13 @@ class Printer:
         if kind == 'constant':
             return CONSTANTS[data]
         if kind == 'local':
-            return self.local('x87s%d' % data)
+            return 'x87s%d' % data
         if kind == 'named':
             return 'v_' if self.decoded or data == 'captured' else 'operand'
         if kind == 'carry':
-            return self.local(carry_name(*data))
+            return carry_name(*data)
         if kind == 'environment':
-            return self.local('x87_%s_' % data)
+            return 'x87_%s_' % data
         if kind == 'resident':
             return 'c->fpu_%s' % data
         if kind == 'cw_constant':

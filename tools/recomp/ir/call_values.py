@@ -16,10 +16,6 @@ class FieldValue:
     lanes: tuple
     whole: Value | None
 
-    @property
-    def resident_lanes(self):
-        return tuple(i for i, value in enumerate(self.lanes) if value is None)
-
 
 def field_value(s, field, keys, state):
     lanes = tuple(s.resolve(state[key]) if key in state else None for key in keys)

@@ -1,12 +1,13 @@
 """C emission of finalized SSA, boundary operations and x87 recipes."""
 from .prepare import PreparedFunction, prepare
 from .ssa import SSAError
-from . import operations, c_symbols, lowering
+from . import operations, c_symbols
 from .body import BodyRequest, BodyVariant, EntryForm, ReturnForm, EmissionPolicy
 from .contract_variants import PrivateLayout, output_mask as contract_output_mask
 from .x87_cw import CW_FAST, Dynamic, Guarded, condition_of
 from .c_boundaries import Printer as BoundaryPrinter, CC_OP_CONST
 from .c_x87 import Printer as X87Printer
+
 
 def seh_lines(kind, addr):
     eip = "c->eip = 0x%xu;" % addr
@@ -113,17 +114,11 @@ def emit_prepared(prepared):
     x87_printer = X87Printer(ref)
     block_label = "F" if arithmetic_plan.programs[0].clone == "fast" else "B"
 
-    value_layout = options.request.layout if isinstance(prepared.transport, lowering.ValueTransport) else None
-    lines = [c_symbols.signature(options.request.variant, symbol, value_layout, fir.addr)]
+    lines = [c_symbols.signature(options.request.variant, symbol)]
     for v in s.values:
         if v.id in live and v.size and v.opc not in ("CONST", "TARGET", "CC_KIND") and s.resolve(v) is v:
             lines.append("uint64_t v%d;" % v.id)
     scalar_declarations = len(lines)
-    if isinstance(prepared.transport, lowering.ValueTransport):
-        lines.extend("%s call%d_;" % (c_symbols.result_type(values.layout, prepared.invocations[event].target), event)
-                     for event, values in prepared.transport.calls.items())
-    if value_layout is not None:
-        lines.extend("(void)%s;" % c_symbols.argument(field) for field in value_layout.inputs)
     lines.extend(x87_printer.declaration(op) for op in arithmetic_plan.environment_declarations())
     lines.extend(boundary.operations(boundary.plan.entry))
     if seh_mark:
@@ -132,9 +127,6 @@ def emit_prepared(prepared):
         if v.opc != "INPUT" or not v.size or v.id not in live or s.resolve(v) is not v:
             continue
         field, lane = mapping[v.data]
-        field_name = options.lane_field.get(v.data)
-        if value_layout is not None and field_name in value_layout.inputs:
-            field = c_symbols.argument(field_name)
         lines.append("v%d = (%s >> %d) & %s;" % (v.id, field, lane * 8, mask(v.size)))
     for v in s.entry_ops:
         if v.id in live and s.resolve(v) is v:
