@@ -118,7 +118,9 @@ def emit_prepared(prepared):
     arithmetic_plan = prepared.arithmetic
     def ref(v):
         v = s.resolve(v)
-        if v.opc in ("CONST", "TARGET"):
+        if v.opc == "CONST":
+            return "0x%xu" % v.data if v.size <= 4 else "0x%xull" % v.data
+        if v.opc == "TARGET":
             return "0x%xull" % v.data
         if v.opc == "CC_KIND":
             return CC_OP_CONST[v.data]
@@ -128,10 +130,14 @@ def emit_prepared(prepared):
         return "0x%xull" % ((1 << (size * 8)) - 1)
 
     def expression(v):
+        wide = v.size > 4 or v.opc == "SUBPIECE"
         a = [ref(arg) for arg in v.args]
         opc = v.opc
-        if v.size > 4 or opc == "SUBPIECE":
+        if wide:
             a = ["(uint64_t)(%s)" % arg for arg in a]
+        zero = "0ull" if wide else "0u"
+        one = "1ull" if wide else "1u"
+        suffix = "ull" if wide else "u"
         if opc == "PACK":
             return " | ".join("(%s << %d)" % (arg, n * 8) for n, arg in enumerate(a))
         if opc == "BYTE":
@@ -139,7 +145,7 @@ def emit_prepared(prepared):
         if opc in ("COPY", "INT_ZEXT"):
             return a[0]
         if opc == "INT_SEXT":
-            sign = "0x%xull" % (1 << (v.args[0].size * 8 - 1))
+            sign = "0x%x%s" % (1 << (v.args[0].size * 8 - 1), suffix)
             return "(%s ^ %s) - %s" % (a[0], sign, sign)
         binary = {"INT_ADD": "+", "INT_SUB": "-", "INT_MULT": "*", "INT_AND": "&", "INT_OR": "|",
                   "INT_XOR": "^", "INT_EQUAL": "==", "INT_NOTEQUAL": "!=",
@@ -151,32 +157,33 @@ def emit_prepared(prepared):
         if opc in ("INT_SLESS", "INT_SLESSEQUAL"):
             # Sign-bit bias compares two's-complement values without a signed
             # overflow or an implementation-defined unsigned-to-signed cast.
-            sign = "0x%xull" % (1 << (bits - 1))
+            sign = "0x%x%s" % (1 << (bits - 1), suffix)
             return "(%s ^ %s) %s (%s ^ %s)" % (a[0], sign,
                     "<" if opc == "INT_SLESS" else "<=", a[1], sign)
         if opc in ("INT_LEFT", "INT_RIGHT"):
-            return "%s >= %d ? 0ull : (%s %s %s)" % (a[1], bits, a[0],
+            return "%s >= %d ? %s : (%s %s %s)" % (a[1], bits, zero, a[0],
                     "<<" if opc == "INT_LEFT" else ">>", a[1])
         if opc == "INT_SRIGHT":
             # P-code counts saturate, unlike the x86 helper's modulo-32 count.
             # Biasing the sign bit expresses sign extension with unsigned C.
-            sign = "0x%xull" % (1 << (bits - 1))
-            return "%s >= %d ? (0ull - (%s >> %d)) : (((%s ^ %s) >> %s) - (%s >> %s))" % (
-                a[1], bits, a[0], bits - 1, a[0], sign, a[1], sign, a[1])
+            sign = "0x%x%s" % (1 << (bits - 1), suffix)
+            return "%s >= %d ? (%s - (%s >> %d)) : (((%s ^ %s) >> %s) - (%s >> %s))" % (
+                a[1], bits, zero, a[0], bits - 1, a[0], sign, a[1], sign, a[1])
         if opc == "INT_CARRY":
-            return "%s > (%s - %s)" % (a[0], mask(v.args[0].size), a[1])
+            operand = "0x%x%s" % ((1 << (v.args[0].size * 8)) - 1, suffix)
+            return "%s > (%s - %s)" % (a[0], operand, a[1])
         if opc in ("INT_SCARRY", "INT_SBORROW"):
             result = "(%s %s %s)" % (a[0], "+" if opc == "INT_SCARRY" else "-", a[1])
-            return "((%s(%s ^ %s) & (%s ^ %s)) >> %d) & 1ull" % (
-                "~" if opc == "INT_SCARRY" else "", a[0], a[1], a[0], result, bits - 1)
+            return "((%s(%s ^ %s) & (%s ^ %s)) >> %d) & %s" % (
+                "~" if opc == "INT_SCARRY" else "", a[0], a[1], a[0], result, bits - 1, one)
         if opc == "BOOL_NEGATE":
             return "!%s" % a[0]
         if opc == "INT_NEGATE":
             return "~%s" % a[0]
         if opc == "INT_2COMP":
-            return "0ull - %s" % a[0]
+            return "%s - %s" % (zero, a[0])
         if opc == "POPCOUNT":
-            return "__builtin_popcountll(%s)" % a[0]
+            return "%s(%s)" % ("__builtin_popcountll" if v.args[0].size > 4 else "__builtin_popcount", a[0])
         if opc == "SUBPIECE":
             return "%s >= 8 ? 0ull : (%s >> (%s * 8))" % (a[1], a[0], a[1])
         if opc == "PIECE":
