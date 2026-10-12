@@ -128,7 +128,11 @@ def plan(prepared, invocations):
             operands = tuple(s.resolve(v) if v is not None else None
                              for v in (record.op, record.a, record.b, record.carry, record.res))
             recipe = PublishedFlags(FlagRecipe(record.kind, record.size, *operands), flags.mask)
-        return Publish(values, recipe, clear)
+        result = Publish(values, recipe, clear)
+        if flags is not None and flags.record.guarded:
+            return Guard("hooks", None,
+                         (publish(state, Publication(publication.required)),), (result,))
+        return result
 
     publications, events = {}, {}
     for block in s.blocks.values():

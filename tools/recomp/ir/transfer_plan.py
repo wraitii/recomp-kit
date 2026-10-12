@@ -25,7 +25,8 @@ class Publication:
 
     @property
     def live_keys(self):
-        return tuple(key for key in self.required if self.flags is None or key not in self.flags.covered)
+        return tuple(key for key in self.required
+                     if self.flags is None or self.flags.record.guarded or key not in self.flags.covered)
 
 
 @dataclass
@@ -105,7 +106,7 @@ def calls(s, publications, known_before, contracts, kept, lane_field, never_skip
 
 
 def publication_roots(s, state, required, groups, flags=None):
-    keys = tuple(key for key in required if flags is None or key not in flags.covered)
+    keys = tuple(key for key in required if flags is None or flags.record.guarded or key not in flags.covered)
     return state_roots(s, state, keys, groups) + (list(flags.roots) if flags else [])
 
 

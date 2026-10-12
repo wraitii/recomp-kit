@@ -35,6 +35,7 @@ def carry(s, predecessors, flag_off_name):
         if not flags:
             return None
         result = CcRecord("join", records[0].size)
+        result.guarded = any(r.guarded for r in records)
 
         def phi(part, size, values):
             value = s.value("PHI", size, values, (("cc", i, part), preds))
@@ -66,8 +67,17 @@ def carry(s, predecessors, flag_off_name):
         block.cc_snapshots = {ident: incoming if r is block.cc_entry else r
                               for ident, r in block.cc_snapshots.items()}
         if block.cc_exit is block.cc_entry:
-            block.cc_exit = incoming
-            exits[i] = incoming
+            outgoing = incoming
+            if incoming is not None and block.cc_keep is not None:
+                before, after = block.cc_keep
+                outgoing = CcRecord(incoming.kind, incoming.size)
+                for part in ("op", "a", "b", "carry", "res"):
+                    setattr(outgoing, part, getattr(incoming, part))
+                outgoing.flags = {name: after[flag_keys[name]] for name, value in incoming.flags.items()
+                                  if s.resolve(value) is s.resolve(before[flag_keys[name]])}
+                outgoing.guarded = True
+            block.cc_exit = outgoing
+            exits[i] = outgoing
             todo.extend(sorted(successors[i]))
     for i in pending:
         block = s.blocks[i]

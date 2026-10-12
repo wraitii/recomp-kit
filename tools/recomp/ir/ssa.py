@@ -30,6 +30,7 @@ class Block:
         self.cc_snapshots = {}
         self.cc_exit = None
         self.cc_entry = None
+        self.cc_keep = None
         self.state, self.exit = {}, {}
 
 
@@ -39,13 +40,14 @@ class CcRecord:
     The producer is only usable at a seam while the SSA flag values still
     resolve to the values this record wrote; the emitter re-checks identity.
     """
-    __slots__ = ("kind", "size", "op", "a", "b", "carry", "res", "flags")
+    __slots__ = ("kind", "size", "op", "a", "b", "carry", "res", "flags", "guarded")
 
     def __init__(self, kind, size):
         self.kind, self.size = kind, size
         self.a = self.b = self.res = None
         self.op = self.carry = None
         self.flags = {}
+        self.guarded = False
 
 
 class SSA:
@@ -99,8 +101,8 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
     and are deliberately rejected. A ram varnode is a control target only;
     ordinary guest memory remains behind LOAD/STORE and the memory token.
 
-    `kept_calls` maps a direct-call target to the register keys its callee
-    neither reads nor writes. After such a call each kept field becomes a
+    `kept_calls` maps a direct-call target to register keys its callee preserves.
+    After such a call each kept field becomes a
     ``CALL_KEEP`` of the call and the pre-call lanes instead of a reload.
     """
     call_targets = frozenset(call_targets)
@@ -277,9 +279,11 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                 b.cc_snapshots[value.id] = cc_active
                 state[MEMORY] = emit("MEMORY", 0, [value])
                 reload(value, kept_calls.get(op.ins[0][1], frozenset()))
-                # The callee's flags replace the caller's; a descriptor left by
-                # an SSA callee is materialised by the emitter before reload.
-                cc_active = None
+                if flag_off_name and all(("register", off) in kept_calls.get(op.ins[0][1], ())
+                                         for off in flag_off_name):
+                    b.cc_keep = (before, dict(state))
+                else:
+                    cc_active = None
                 continue
             if op.opc == "CALLIND":
                 # An opaque indirect call: publish the pre-call CPU (including

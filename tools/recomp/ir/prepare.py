@@ -495,7 +495,9 @@ def prepare(fir, request, *, lifter=None, normalized=None):
     transparent_calls = {v.id: transparent_fields[v.data] for b in s.blocks.values() for v in b.ops
                          if v.opc == "CALL" and v.data in transparent_fields}
     publication_facts = publication_analysis(s, fir.succ, groups, access_fields=access_fields,
-                                             reloaded=set(mapping) - flag_keys, kept=transparent_calls)
+                                             reloaded=set(mapping) - flag_keys, kept=transparent_calls,
+                                             lazy_fields=flag_keys if lazy_flags else (),
+                                             preserved=kept_calls, eager_events=CC_EAGER_EVENTS)
     transfers = transfer_plan.build(s, groups, publication_facts,
                                     call_contracts or {}, kept_calls, lane_field, CONTRACT_NEVER_SKIP,
                                     contract_calls, return_fields, flag_keys, flag_first_key,
@@ -516,6 +518,9 @@ def prepare(fir, request, *, lifter=None, normalized=None):
         reloads = live_flag_reload_calls(s, live, flag_off_name)
         cc_calls = {i: call_cc_action(summary, frozenset(reloads.get(i, ())))
                     for i, summary in cc_calls.items()}
+        cc_calls.update({b.index: flag_region.REMOVE for b in s.blocks.values()
+                         for v in b.ops
+                         if v.opc == "CALL" and flag_keys <= set(kept_calls.get(v.id, ()))})
     if reads_entry_flags or fir.entries:
         # The SSA builder loads live entry flag INPUTs straight from the fields,
         # immediately after the entry settle.  Those loads are not codegen ops,
