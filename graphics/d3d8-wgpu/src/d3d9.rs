@@ -1,17 +1,20 @@
 use crate::RenderError;
 use crate::backend::{DepthAttachment, GpuContext, OffscreenTarget};
 use crate::bridge::{
-    D3d9AdapterIdentifierResult, D3d9BufferDescriptor, D3d9BufferDescriptorResult, D3d9BufferKind,
+    D3d9AdapterIdentifierResult, D3d9Bindings as BridgeBindings, D3d9BindingsResult,
+    D3d9BlockBindingsResult, D3d9BufferDescriptor, D3d9BufferDescriptorResult, D3d9BufferKind,
     D3d9BufferLockRequest, D3d9BufferLockResult, D3d9BufferRequest, D3d9BufferUnlockResult,
     D3d9CapsResult, D3d9CheckDepthStencilRequest, D3d9CheckDeviceFormatRequest,
     D3d9CheckDeviceTypeRequest, D3d9CheckFormatConversionRequest, D3d9CheckMultiSampleRequest,
-    D3d9CreateResult, D3d9CreationParameters, D3d9CreationParametersResult, D3d9DeviceRequest,
-    D3d9DisplayModeRequest, D3d9DisplayModeResult, D3d9FrameResult, D3d9LevelDescriptor,
-    D3d9LevelDescriptorResult, D3d9LevelLockRequest, D3d9LevelLockResult, D3d9PresentParams,
-    D3d9PrivateDataResult, D3d9ResetRequest, D3d9ResetResult, D3d9SurfaceDescriptor,
-    D3d9SurfaceDescriptorResult, D3d9SurfaceRequest, D3d9TextureCreateResult,
-    D3d9TextureDescriptor, D3d9TextureDescriptorResult, D3d9TextureKind, D3d9TextureRequest,
-    Status, StatusCode, ValueResult, ValuesResult, status,
+    D3d9CreateResult, D3d9CreationParameters, D3d9CreationParametersResult, D3d9DeclarationResult,
+    D3d9DeviceRequest, D3d9DisplayModeRequest, D3d9DisplayModeResult, D3d9FrameResult,
+    D3d9LevelDescriptor, D3d9LevelDescriptorResult, D3d9LevelLockRequest, D3d9LevelLockResult,
+    D3d9LightResult, D3d9PresentParams, D3d9PrivateDataResult, D3d9ResetRequest, D3d9ResetResult,
+    D3d9ScissorResult, D3d9StreamResult, D3d9SurfaceDescriptor, D3d9SurfaceDescriptorResult,
+    D3d9SurfaceRequest, D3d9TextureCreateResult, D3d9TextureDescriptor,
+    D3d9TextureDescriptorResult, D3d9TextureKind, D3d9TextureRequest, D3d9VertexElement,
+    FloatValuesResult, Status, StatusCode, ValueResult, ValuesResult, Viewport, ViewportResult,
+    status,
 };
 use crate::d3d9::gpu::{D3d9Gpu, D3d9Loss};
 pub use crate::d3d9::resource::D3d9Resource;
@@ -23,6 +26,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub mod format;
 pub mod gpu;
 pub mod resource;
+pub mod shader;
+pub mod state;
 
 static LIVE_DEVICES: AtomicUsize = AtomicUsize::new(0);
 
@@ -118,6 +123,11 @@ struct RestorePlan {
     ready: bool,
 }
 
+struct ResourceRegistration {
+    resource_type: u32,
+    pool: u32,
+}
+
 struct D3d9Probe {
     description: String,
     vendor_id: u32,
@@ -137,12 +147,14 @@ pub struct D3d9Device {
     present: D3d9PresentParams,
     loss: Option<Arc<D3d9Loss>>,
     targets: Option<ImplicitTargets>,
-    resources: BTreeMap<u32, u32>,
+    resources: BTreeMap<u32, ResourceRegistration>,
     creator_thread: u32,
     features: wgpu::Features,
     limits: wgpu::Limits,
     replacement: Option<(GpuContext, Arc<D3d9Loss>)>,
     restore: Option<RestorePlan>,
+    state: state::D3d9State,
+    objects: shader::D3d9Objects,
 }
 
 impl D3d9Device {
@@ -1139,6 +1151,8 @@ impl Default for D3d9Device {
             limits: wgpu::Limits::default(),
             replacement: None,
             restore: None,
+            state: state::D3d9State::default(),
+            objects: shader::D3d9Objects::default(),
             present: D3d9PresentParams {
                 width: 0,
                 height: 0,
@@ -1496,6 +1510,10 @@ pub fn d3d9_create_device(
     device.device_type = request.device_type;
     device.behavior_flags = request.behavior_flags;
     device.present = present;
+    device.state.set_target_size(present.width, present.height);
+    if present.enable_auto_depth_stencil != 0 {
+        let _ = device.state.set_render_state(7, 1);
+    }
     device.creator_thread = request.thread_id;
     device.loss = Some(loss);
     device.targets = Some(targets);
@@ -1512,7 +1530,23 @@ pub fn d3d9_register_resource(device: &mut D3d9Device, id: u32, resource: &D3d9R
             "resource metadata is not initialized",
         );
     };
-    if device.resources.insert(id, pool).is_some() {
+    let Some(resource_type) = resource.resource_type() else {
+        return status(
+            StatusCode::Unsupported,
+            "resource metadata is not initialized",
+        );
+    };
+    if device
+        .resources
+        .insert(
+            id,
+            ResourceRegistration {
+                resource_type,
+                pool,
+            },
+        )
+        .is_some()
+    {
         return status(
             StatusCode::InvalidArgument,
             "resource id is already registered",
@@ -1567,10 +1601,16 @@ fn reset_validation(
             "Reset requires outstanding implicit surface references to be released first",
         ));
     }
+    if device.state.has_live_state_blocks() {
+        return Err(status(
+            StatusCode::InvalidArgument,
+            "Reset requires every live state block to be released first",
+        ));
+    }
     if device
         .resources
         .values()
-        .any(|pool| *pool == resource::D3DPOOL_DEFAULT)
+        .any(|registration| registration.pool == resource::D3DPOOL_DEFAULT)
     {
         return Err(status(
             StatusCode::InvalidArgument,
@@ -1651,7 +1691,11 @@ pub fn d3d9_reset(device: &mut D3d9Device, request: &D3d9ResetRequest) -> D3d9Re
             return reset_fail(request.present, error);
         }
     };
-    let expected = device.resources.clone();
+    let expected: BTreeMap<u32, u32> = device
+        .resources
+        .iter()
+        .map(|(id, registration)| (*id, registration.pool))
+        .collect();
     if physical {
         if let Err(message) = replacement_ready(device) {
             if let Some(loss) = device.loss.as_ref() {
@@ -1839,6 +1883,13 @@ pub fn d3d9_finish_reset(device: &mut D3d9Device) -> D3d9ResetResult {
     let lost = plan.loss.is_physical();
     device.targets = Some(plan.targets);
     device.present = plan.present;
+    device
+        .state
+        .set_target_size(plan.present.width, plan.present.height);
+    device.state.clear_pipeline();
+    if plan.present.enable_auto_depth_stencil != 0 {
+        let _ = device.state.set_render_state(7, 1);
+    }
     if let Some(gpu) = plan.gpu {
         device.features = gpu.device.features();
         device.limits = gpu.device.limits();
@@ -2148,8 +2199,17 @@ fn caps_image(probe: &D3d9Probe) -> Vec<u8> {
     put_u32(&mut caps, 96, probe.max_texture_dimension_3d);
     put_u32(&mut caps, 100, probe.max_texture_dimension_2d);
     put_u32(&mut caps, 104, probe.max_texture_dimension_2d);
-    put_u32(&mut caps, 108, 1);
+    put_u32(&mut caps, 108, state::MAX_ANISOTROPY);
+    put_u32(&mut caps, 148, 8);
+    put_u32(&mut caps, 152, 8);
+    put_u32(&mut caps, 160, 8);
+    put_u32(&mut caps, 164, 6);
+    put_u32(&mut caps, 188, 16);
+    put_u32(&mut caps, 192, 0xffff);
+    put_u32(&mut caps, 200, 256);
     put_u32(&mut caps, 232, 1);
+    put_u32(&mut caps, 236, 0x1ffff);
+    put_u32(&mut caps, 240, 1);
     caps
 }
 
@@ -2666,5 +2726,634 @@ pub fn d3d9_creation_parameters(device: &D3d9Device) -> D3d9CreationParametersRe
             device_type: device.device_type,
             behavior_flags: device.behavior_flags,
         },
+    }
+}
+
+fn ok_value(value: u32) -> ValueResult {
+    ValueResult {
+        status: status(StatusCode::Ok, ""),
+        value,
+    }
+}
+
+fn err_value(error: RenderError) -> ValueResult {
+    ValueResult {
+        status: bridge_error(error),
+        value: 0,
+    }
+}
+
+fn ok_values(values: Vec<u32>) -> ValuesResult {
+    ValuesResult {
+        status: status(StatusCode::Ok, ""),
+        values,
+    }
+}
+
+fn err_values(error: RenderError) -> ValuesResult {
+    ValuesResult {
+        status: bridge_error(error),
+        values: Vec::new(),
+    }
+}
+
+fn ok_floats(values: Vec<f32>) -> FloatValuesResult {
+    FloatValuesResult {
+        status: status(StatusCode::Ok, ""),
+        values,
+    }
+}
+
+fn err_floats(error: RenderError) -> FloatValuesResult {
+    FloatValuesResult {
+        status: bridge_error(error),
+        values: Vec::new(),
+    }
+}
+
+fn validate_binding(device: &D3d9Device, id: u32, allowed: &[u32]) -> Result<(), RenderError> {
+    if id == 0 {
+        return Ok(());
+    }
+    let Some(registration) = device.resources.get(&id) else {
+        return Err(RenderError::invalid(
+            "D3D9",
+            "resource id is not registered with this device",
+        ));
+    };
+    if !allowed.contains(&registration.resource_type) {
+        return Err(RenderError::invalid(
+            "D3D9",
+            "resource kind cannot be bound to this slot",
+        ));
+    }
+    if registration.pool == resource::D3DPOOL_SYSTEMMEM
+        || registration.pool == resource::D3DPOOL_SCRATCH
+    {
+        return Err(RenderError::invalid(
+            "D3D9",
+            "SYSTEMMEM and SCRATCH resources cannot be bound",
+        ));
+    }
+    Ok(())
+}
+
+fn bridge_bindings(bindings: state::D3d9Bindings) -> BridgeBindings {
+    BridgeBindings {
+        textures: bindings.textures.to_vec(),
+        streams: bindings.streams.to_vec(),
+        indices: bindings.indices,
+        vertex_shader: bindings.vertex_shader,
+        pixel_shader: bindings.pixel_shader,
+        declaration: bindings.declaration,
+    }
+}
+
+fn empty_bridge_bindings() -> BridgeBindings {
+    BridgeBindings {
+        textures: vec![0; state::MAX_SAMPLERS],
+        streams: vec![0; state::MAX_STREAMS],
+        indices: 0,
+        vertex_shader: 0,
+        pixel_shader: 0,
+        declaration: 0,
+    }
+}
+
+pub fn d3d9_set_render_state(device: &mut D3d9Device, state: u32, value: u32) -> Status {
+    bridge_ok(device.state.set_render_state(state, value))
+}
+
+pub fn d3d9_get_render_state(device: &D3d9Device, state: u32) -> ValueResult {
+    match device.state.render_state(state) {
+        Ok(value) => ok_value(value),
+        Err(error) => err_value(error),
+    }
+}
+
+pub fn d3d9_set_texture_stage_state(
+    device: &mut D3d9Device,
+    stage: u32,
+    state: u32,
+    value: u32,
+) -> Status {
+    bridge_ok(device.state.set_texture_stage_state(stage, state, value))
+}
+
+pub fn d3d9_get_texture_stage_state(device: &D3d9Device, stage: u32, state: u32) -> ValueResult {
+    match device.state.texture_stage_state(stage, state) {
+        Ok(value) => ok_value(value),
+        Err(error) => err_value(error),
+    }
+}
+
+pub fn d3d9_set_sampler_state(
+    device: &mut D3d9Device,
+    sampler: u32,
+    state: u32,
+    value: u32,
+) -> Status {
+    bridge_ok(device.state.set_sampler_state(sampler, state, value))
+}
+
+pub fn d3d9_get_sampler_state(device: &D3d9Device, sampler: u32, state: u32) -> ValueResult {
+    match device.state.sampler_state(sampler, state) {
+        Ok(value) => ok_value(value),
+        Err(error) => err_value(error),
+    }
+}
+
+pub fn d3d9_set_transform(device: &mut D3d9Device, state: u32, values: &[f32]) -> Status {
+    let Ok(matrix) = <[f32; 16]>::try_from(values) else {
+        return bridge_error(RenderError::invalid(
+            "SetTransform",
+            "a transform requires exactly 16 floats",
+        ));
+    };
+    bridge_ok(device.state.set_transform(state, matrix))
+}
+
+pub fn d3d9_get_transform(device: &D3d9Device, state: u32) -> FloatValuesResult {
+    match device.state.transform(state) {
+        Ok(matrix) => ok_floats(matrix.to_vec()),
+        Err(error) => err_floats(error),
+    }
+}
+
+pub fn d3d9_multiply_transform(device: &mut D3d9Device, state: u32, values: &[f32]) -> Status {
+    let Ok(matrix) = <[f32; 16]>::try_from(values) else {
+        return bridge_error(RenderError::invalid(
+            "MultiplyTransform",
+            "a transform requires exactly 16 floats",
+        ));
+    };
+    bridge_ok(device.state.multiply_transform(state, matrix))
+}
+
+pub fn d3d9_set_viewport(device: &mut D3d9Device, viewport: &Viewport) -> Status {
+    bridge_ok(device.state.set_viewport(state::Viewport {
+        x: viewport.x,
+        y: viewport.y,
+        width: viewport.width,
+        height: viewport.height,
+        min_z: viewport.min_z,
+        max_z: viewport.max_z,
+    }))
+}
+
+pub fn d3d9_get_viewport(device: &D3d9Device) -> ViewportResult {
+    let viewport = device.state.viewport();
+    ViewportResult {
+        status: status(StatusCode::Ok, ""),
+        viewport: Viewport {
+            x: viewport.x,
+            y: viewport.y,
+            width: viewport.width,
+            height: viewport.height,
+            min_z: viewport.min_z,
+            max_z: viewport.max_z,
+        },
+    }
+}
+
+pub fn d3d9_set_scissor(
+    device: &mut D3d9Device,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+) -> Status {
+    bridge_ok(device.state.set_scissor(state::Scissor {
+        left,
+        top,
+        right,
+        bottom,
+    }))
+}
+
+pub fn d3d9_get_scissor(device: &D3d9Device) -> D3d9ScissorResult {
+    let scissor = device.state.scissor();
+    D3d9ScissorResult {
+        status: status(StatusCode::Ok, ""),
+        left: scissor.left,
+        top: scissor.top,
+        right: scissor.right,
+        bottom: scissor.bottom,
+    }
+}
+
+pub fn d3d9_set_material(device: &mut D3d9Device, values: &[f32]) -> Status {
+    if values.len() != 17 {
+        return bridge_error(RenderError::invalid(
+            "SetMaterial",
+            "a material requires exactly 17 floats",
+        ));
+    }
+    let mut material = [0u32; 17];
+    for (slot, value) in material.iter_mut().zip(values) {
+        *slot = value.to_bits();
+    }
+    bridge_ok(device.state.set_material(material))
+}
+
+pub fn d3d9_get_material(device: &D3d9Device) -> FloatValuesResult {
+    ok_floats(
+        device
+            .state
+            .material()
+            .iter()
+            .map(|b| f32::from_bits(*b))
+            .collect(),
+    )
+}
+
+pub fn d3d9_set_light(
+    device: &mut D3d9Device,
+    index: u32,
+    light_type: u32,
+    values: &[f32],
+) -> Status {
+    if values.len() != 25 {
+        return bridge_error(RenderError::invalid(
+            "SetLight",
+            "a light requires exactly 25 floats",
+        ));
+    }
+    let mut light = [0u32; 26];
+    light[0] = light_type;
+    for (slot, value) in light[1..].iter_mut().zip(values) {
+        *slot = value.to_bits();
+    }
+    bridge_ok(device.state.set_light(index, light))
+}
+
+pub fn d3d9_get_light(device: &D3d9Device, index: u32) -> D3d9LightResult {
+    match device.state.light(index) {
+        Ok(light) => D3d9LightResult {
+            status: status(StatusCode::Ok, ""),
+            light_type: light[0],
+            values: light[1..].iter().map(|b| f32::from_bits(*b)).collect(),
+        },
+        Err(error) => D3d9LightResult {
+            status: bridge_error(error),
+            light_type: 0,
+            values: Vec::new(),
+        },
+    }
+}
+
+pub fn d3d9_set_light_enable(device: &mut D3d9Device, index: u32, enable: bool) -> Status {
+    bridge_ok(device.state.set_light_enable(index, enable))
+}
+
+pub fn d3d9_get_light_enable(device: &D3d9Device, index: u32) -> ValueResult {
+    match device.state.light_enabled(index) {
+        Ok(enabled) => ok_value(u32::from(enabled)),
+        Err(error) => err_value(error),
+    }
+}
+
+pub fn d3d9_set_clip_plane(device: &mut D3d9Device, index: u32, values: &[f32]) -> Status {
+    let Ok(plane) = <[f32; 4]>::try_from(values) else {
+        return bridge_error(RenderError::invalid(
+            "SetClipPlane",
+            "a clip plane requires exactly 4 floats",
+        ));
+    };
+    bridge_ok(device.state.set_clip_plane(index, plane))
+}
+
+pub fn d3d9_get_clip_plane(device: &D3d9Device, index: u32) -> FloatValuesResult {
+    if index as usize >= state::MAX_CLIP_PLANES {
+        return err_floats(RenderError::invalid(
+            "GetClipPlane",
+            format!("clip plane {index} is out of range"),
+        ));
+    }
+    ok_floats(device.state.clip_plane(index).to_vec())
+}
+
+pub fn d3d9_set_texture(device: &mut D3d9Device, stage: u32, id: u32) -> Status {
+    if let Err(error) = validate_binding(
+        device,
+        id,
+        &[
+            resource::D3DRTYPE_TEXTURE,
+            resource::D3DRTYPE_CUBETEXTURE,
+            resource::D3DRTYPE_VOLUMETEXTURE,
+        ],
+    ) {
+        return bridge_error(error);
+    }
+    bridge_ok(device.state.set_texture(stage, id))
+}
+
+pub fn d3d9_get_texture(device: &D3d9Device, stage: u32) -> ValueResult {
+    match device.state.texture(stage) {
+        Ok(value) => ok_value(value),
+        Err(error) => err_value(error),
+    }
+}
+
+pub fn d3d9_set_stream_source(
+    device: &mut D3d9Device,
+    stream: u32,
+    buffer: u32,
+    offset: u32,
+    stride: u32,
+) -> Status {
+    if let Err(error) = validate_binding(device, buffer, &[resource::D3DRTYPE_VERTEXBUFFER]) {
+        return bridge_error(error);
+    }
+    bridge_ok(device.state.set_stream_source(
+        stream,
+        state::StreamSource {
+            buffer,
+            offset,
+            stride,
+        },
+    ))
+}
+
+pub fn d3d9_get_stream_source(device: &D3d9Device, stream: u32) -> D3d9StreamResult {
+    match device.state.stream_source(stream) {
+        Ok(source) => D3d9StreamResult {
+            status: status(StatusCode::Ok, ""),
+            buffer: source.buffer,
+            offset: source.offset,
+            stride: source.stride,
+        },
+        Err(error) => D3d9StreamResult {
+            status: bridge_error(error),
+            buffer: 0,
+            offset: 0,
+            stride: 0,
+        },
+    }
+}
+
+pub fn d3d9_set_stream_freq(device: &mut D3d9Device, stream: u32, divider: u32) -> Status {
+    bridge_ok(device.state.set_stream_freq(stream, divider))
+}
+
+pub fn d3d9_get_stream_freq(device: &D3d9Device, stream: u32) -> ValueResult {
+    match device.state.stream_freq(stream) {
+        Ok(value) => ok_value(value),
+        Err(error) => err_value(error),
+    }
+}
+
+pub fn d3d9_set_indices(device: &mut D3d9Device, id: u32) -> Status {
+    if let Err(error) = validate_binding(device, id, &[resource::D3DRTYPE_INDEXBUFFER]) {
+        return bridge_error(error);
+    }
+    device.state.set_indices(id);
+    status(StatusCode::Ok, "")
+}
+
+pub fn d3d9_get_indices(device: &D3d9Device) -> ValueResult {
+    ok_value(device.state.bindings().indices)
+}
+
+pub fn d3d9_create_fvf_declaration(device: &mut D3d9Device, fvf: u32) -> ValueResult {
+    let elements = match shader::fvf_declaration(fvf) {
+        Ok(elements) => elements,
+        Err(error) => return err_value(error),
+    };
+    match device.objects.add_fvf_declaration(fvf, &elements) {
+        Ok(handle) => ok_value(handle),
+        Err(error) => err_value(error),
+    }
+}
+
+pub fn d3d9_set_fvf_binding(device: &mut D3d9Device, handle: u32, fvf: u32) -> Status {
+    device.state.set_declaration(handle, fvf);
+    status(StatusCode::Ok, "")
+}
+
+pub fn d3d9_get_fvf(device: &D3d9Device) -> ValueResult {
+    ok_value(device.state.fvf())
+}
+
+pub fn d3d9_create_vertex_declaration(
+    device: &mut D3d9Device,
+    elements: &[D3d9VertexElement],
+) -> ValueResult {
+    let mapped: Vec<shader::VertexElement> = elements
+        .iter()
+        .map(|element| shader::VertexElement {
+            stream: element.stream,
+            offset: element.offset,
+            element_type: element.element_type,
+            method: element.method,
+            usage: element.usage,
+            usage_index: element.usage_index,
+        })
+        .collect();
+    match device.objects.add_declaration(&mapped) {
+        Ok(handle) => ok_value(handle),
+        Err(error) => err_value(error),
+    }
+}
+
+pub fn d3d9_destroy_declaration(device: &mut D3d9Device, handle: u32) -> Status {
+    bridge_ok(device.objects.destroy_declaration(handle))
+}
+
+pub fn d3d9_declaration_elements(device: &D3d9Device, handle: u32) -> D3d9DeclarationResult {
+    match device.objects.declaration(handle) {
+        Ok(elements) => D3d9DeclarationResult {
+            status: status(StatusCode::Ok, ""),
+            elements: elements
+                .iter()
+                .map(|element| D3d9VertexElement {
+                    stream: element.stream,
+                    offset: element.offset,
+                    element_type: element.element_type,
+                    method: element.method,
+                    usage: element.usage,
+                    usage_index: element.usage_index,
+                })
+                .collect(),
+        },
+        Err(error) => D3d9DeclarationResult {
+            status: bridge_error(error),
+            elements: Vec::new(),
+        },
+    }
+}
+
+pub fn d3d9_set_vertex_declaration(device: &mut D3d9Device, handle: u32) -> Status {
+    if handle != 0 && device.objects.declaration(handle).is_err() {
+        return bridge_error(RenderError::invalid(
+            "SetVertexDeclaration",
+            "invalid vertex declaration handle",
+        ));
+    }
+    device.state.set_declaration(handle, 0);
+    status(StatusCode::Ok, "")
+}
+
+pub fn d3d9_get_vertex_declaration(device: &D3d9Device) -> ValueResult {
+    ok_value(device.state.declaration())
+}
+
+pub fn d3d9_create_shader(device: &mut D3d9Device, pixel: bool, code: &[u32]) -> ValueResult {
+    match device.objects.add_shader(pixel, code) {
+        Ok(handle) => ok_value(handle),
+        Err(error) => err_value(error),
+    }
+}
+
+pub fn d3d9_destroy_shader(device: &mut D3d9Device, pixel: bool, handle: u32) -> Status {
+    let status_value = bridge_ok(device.objects.destroy_shader(pixel, handle));
+    if status_value.code == StatusCode::Ok && device.state.shader(pixel) == handle {
+        device.state.set_shader(pixel, 0);
+    }
+    status_value
+}
+
+pub fn d3d9_set_shader(device: &mut D3d9Device, pixel: bool, handle: u32) -> Status {
+    if handle != 0 && device.objects.shader(pixel, handle).is_err() {
+        return bridge_error(RenderError::invalid(
+            "SetShader",
+            "invalid shader handle for the shader stage",
+        ));
+    }
+    device.state.set_shader(pixel, handle);
+    status(StatusCode::Ok, "")
+}
+
+pub fn d3d9_get_shader(device: &D3d9Device, pixel: bool) -> ValueResult {
+    ok_value(device.state.shader(pixel))
+}
+
+pub fn d3d9_shader_function(device: &D3d9Device, pixel: bool, handle: u32) -> ValuesResult {
+    match device.objects.shader(pixel, handle) {
+        Ok(record) => ok_values(record.code.clone()),
+        Err(error) => err_values(error),
+    }
+}
+
+pub fn d3d9_shader_size(device: &D3d9Device, pixel: bool, handle: u32) -> ValueResult {
+    match device.objects.shader(pixel, handle) {
+        Ok(record) => ok_value(record.code.len() as u32 * 4),
+        Err(error) => err_value(error),
+    }
+}
+
+pub fn d3d9_set_shader_constants_f(
+    device: &mut D3d9Device,
+    pixel: bool,
+    start: u32,
+    values: &[f32],
+) -> Status {
+    bridge_ok(device.state.set_constants_f(pixel, start, values))
+}
+
+pub fn d3d9_get_shader_constants_f(
+    device: &D3d9Device,
+    pixel: bool,
+    start: u32,
+    count: u32,
+) -> FloatValuesResult {
+    match device.state.constants_f(pixel, start, count) {
+        Ok(values) => ok_floats(values),
+        Err(error) => err_floats(error),
+    }
+}
+
+pub fn d3d9_set_shader_constants_i(
+    device: &mut D3d9Device,
+    pixel: bool,
+    start: u32,
+    values: &[i32],
+) -> Status {
+    bridge_ok(device.state.set_constants_i(pixel, start, values))
+}
+
+pub fn d3d9_get_shader_constants_i(
+    device: &D3d9Device,
+    pixel: bool,
+    start: u32,
+    count: u32,
+) -> ValuesResult {
+    match device.state.constants_i(pixel, start, count) {
+        Ok(values) => ok_values(values.into_iter().map(|value| value as u32).collect()),
+        Err(error) => err_values(error),
+    }
+}
+
+pub fn d3d9_set_shader_constants_b(
+    device: &mut D3d9Device,
+    pixel: bool,
+    start: u32,
+    values: &[u32],
+) -> Status {
+    bridge_ok(device.state.set_constants_b(pixel, start, values))
+}
+
+pub fn d3d9_get_shader_constants_b(
+    device: &D3d9Device,
+    pixel: bool,
+    start: u32,
+    count: u32,
+) -> ValuesResult {
+    match device.state.constants_b(pixel, start, count) {
+        Ok(values) => ok_values(values),
+        Err(error) => err_values(error),
+    }
+}
+
+pub fn d3d9_create_state_block(device: &mut D3d9Device, block_type: u32) -> ValueResult {
+    match device.state.create_block(block_type) {
+        Ok(handle) => ok_value(handle),
+        Err(error) => err_value(error),
+    }
+}
+
+pub fn d3d9_begin_state_block(device: &mut D3d9Device) -> Status {
+    bridge_ok(device.state.begin_block())
+}
+
+pub fn d3d9_end_state_block(device: &mut D3d9Device) -> ValueResult {
+    match device.state.end_block() {
+        Ok(handle) => ok_value(handle),
+        Err(error) => err_value(error),
+    }
+}
+
+pub fn d3d9_capture_state_block(device: &mut D3d9Device, handle: u32) -> Status {
+    bridge_ok(device.state.capture_block(handle))
+}
+
+pub fn d3d9_apply_state_block(device: &mut D3d9Device, handle: u32) -> Status {
+    bridge_ok(device.state.apply_block(handle))
+}
+
+pub fn d3d9_destroy_state_block(device: &mut D3d9Device, handle: u32) -> Status {
+    bridge_ok(device.state.destroy_block(handle))
+}
+
+pub fn d3d9_state_block_bindings(device: &D3d9Device, handle: u32) -> D3d9BlockBindingsResult {
+    match device.state.block_bindings(handle) {
+        Ok(bindings) => D3d9BlockBindingsResult {
+            status: status(StatusCode::Ok, ""),
+            bindings: bridge_bindings(bindings),
+        },
+        Err(error) => D3d9BlockBindingsResult {
+            status: bridge_error(error),
+            bindings: empty_bridge_bindings(),
+        },
+    }
+}
+
+pub fn d3d9_current_bindings(device: &D3d9Device) -> D3d9BindingsResult {
+    let (recording, recording_active) = device.state.recording_bindings();
+    D3d9BindingsResult {
+        status: status(StatusCode::Ok, ""),
+        live: bridge_bindings(device.state.bindings()),
+        recording: bridge_bindings(recording),
+        recording_active,
     }
 }

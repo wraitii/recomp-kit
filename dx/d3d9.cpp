@@ -19,6 +19,7 @@ constexpr bool kD3d9WgpuEnabled = false;
 #endif
 #include <unordered_map>
 #include <map>
+#include <set>
 
 #include <string.h>
 #include <iterator>
@@ -106,6 +107,107 @@ static ComObj *this_d3d9(X86 *c) {
 static ComObj *this_device9(X86 *c) {
     ComObj *o = com_this_arg(c);
     return (o && o->kind == K_D3D9DEVICE) ? o : nullptr;
+}
+
+static void d3d9_ref_add(uint32_t id) {
+    if (ComObj *o = com_get(id))
+        com_retain_internal(o);
+}
+static void d3d9_ref_del(uint32_t id) {
+    if (ComObj *o = com_get(id))
+        com_release_internal(o);
+}
+static std::set<uint32_t> d3d9_binding_set(ComObj *dev, const recomp::d3d::D3d9Bindings &bindings) {
+    std::set<uint32_t> out;
+    for (uint32_t id : bindings.textures)
+        if (id)
+            out.insert(id);
+    for (uint32_t id : bindings.streams)
+        if (id)
+            out.insert(id);
+    if (bindings.indices)
+        out.insert(bindings.indices);
+    auto resolve = [&](const std::unordered_map<uint32_t, uint32_t> &map, uint32_t handle) {
+        if (!handle)
+            return;
+        auto it = map.find(handle);
+        if (it != map.end() && it->second)
+            out.insert(it->second);
+    };
+    resolve(dev->d3d9_device->shader_views, bindings.vertex_shader);
+    resolve(dev->d3d9_device->shader_views, bindings.pixel_shader);
+    resolve(dev->d3d9_device->decl_views, bindings.declaration);
+    return out;
+}
+static void d3d9_reconcile(std::set<uint32_t> &current, const std::set<uint32_t> &desired) {
+    for (uint32_t id : current)
+        if (!desired.count(id))
+            d3d9_ref_del(id);
+    for (uint32_t id : desired)
+        if (!current.count(id))
+            d3d9_ref_add(id);
+    current = desired;
+}
+static void d3d9_refresh_bindings(ComObj *dev) {
+    if (!dev || !dev->d3d9_device)
+        return;
+    recomp::d3d::D3d9BindingsResult result = dev->d3d9_device->current_bindings();
+    if (result.status.code != recomp::d3d::StatusCode::Ok)
+        return;
+    d3d9_reconcile(dev->d3d9_device->live_refs, d3d9_binding_set(dev, result.live));
+    std::set<uint32_t> recording;
+    if (result.recording_active)
+        recording = d3d9_binding_set(dev, result.recording);
+    d3d9_reconcile(dev->d3d9_device->recording_refs, recording);
+}
+static void d3d9_refresh_block_bindings(ComObj *dev, uint32_t handle) {
+    if (!dev || !dev->d3d9_device)
+        return;
+    recomp::d3d::D3d9BlockBindingsResult result = dev->d3d9_device->state_block_bindings(handle);
+    std::set<uint32_t> &refs = dev->d3d9_device->block_refs[handle];
+    if (result.status.code == recomp::d3d::StatusCode::Ok)
+        d3d9_reconcile(refs, d3d9_binding_set(dev, result.bindings));
+}
+static void d3d9_drop_block_refs(ComObj *dev, uint32_t handle) {
+    if (!dev || !dev->d3d9_device)
+        return;
+    auto it = dev->d3d9_device->block_refs.find(handle);
+    if (it == dev->d3d9_device->block_refs.end())
+        return;
+    for (uint32_t id : it->second)
+        d3d9_ref_del(id);
+    dev->d3d9_device->block_refs.erase(it);
+}
+static void d3d9_drop_all_refs(ComObj *dev) {
+    if (!dev || !dev->d3d9_device)
+        return;
+    for (uint32_t id : dev->d3d9_device->live_refs)
+        d3d9_ref_del(id);
+    for (uint32_t id : dev->d3d9_device->recording_refs)
+        d3d9_ref_del(id);
+    dev->d3d9_device->live_refs.clear();
+    dev->d3d9_device->recording_refs.clear();
+    for (auto &entry : dev->d3d9_device->block_refs)
+        for (uint32_t id : entry.second)
+            d3d9_ref_del(id);
+    dev->d3d9_device->block_refs.clear();
+}
+static ComObj *d3d9_make_object(ComObj *dev, ComKind kind, ComIface iface, uint32_t handle,
+                                uint32_t out) {
+    ComObj *o = com_new(kind);
+    if (!o)
+        return nullptr;
+    o->dev_d3d = dev->id;
+    o->d3d9_state_handle = handle;
+    com_retain_internal(dev);
+    o->d3d9_owner_retained = true;
+    uint32_t view = com_view(o, iface);
+    if (!view) {
+        com_release(o);
+        return nullptr;
+    }
+    com_out_ptr(out, view);
+    return o;
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +721,16 @@ static ComObj *device_depthbuffer(ComObj *dev);
 void Dev_SetScissorRect(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t r = arg(c, 1);
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device || !r || !gm_valid(r, 16)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        com_ret(c, bridge_result(c, dev->d3d9_device->set_scissor(
+                                        (int32_t)rd32(r), (int32_t)rd32(r + 4),
+                                        (int32_t)rd32(r + 8), (int32_t)rd32(r + 12))));
+        return;
+    }
     if (dev && r)
         for (int i = 0; i < 4; ++i)
             d9_pipeline(dev->id).scissor[i] = (int32_t)rd32(r + 4u * (uint32_t)i);
@@ -669,6 +781,7 @@ static void d3d9_reset_transaction(ComObj *dev, const recomp::d3d::D3d9ResetRequ
     for (uint32_t id : ids.values)
         dev->d3d9_device->commit_resource_reset(id, *com_get(id)->d3d9_resource);
     result = dev->d3d9_device->finish_reset();
+    d3d9_refresh_bindings(dev);
 }
 
 void Dev_Reset(X86 *c) {
@@ -1555,6 +1668,10 @@ static ComObj *com_level_view(ComObj *tex, uint32_t face, uint32_t level, bool v
     s->d3d9_level = level;
     s->d3d9_volume = volume;
     s->dev_d3d = tex->dev_d3d;
+    if (ComObj *dev = com_get(tex->dev_d3d)) {
+        com_retain_internal(dev);
+        s->d3d9_owner_retained = true;
+    }
     com_retain_internal(tex);
     s->d3d9_parent_retained = true;
     tex->d3d9_levels[slot] = s->id;
@@ -2315,6 +2432,45 @@ void Dev_CreateVertexDeclaration(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
+    if (kD3d9WgpuEnabled) {
+        if (!dev->d3d9_device || !gm_valid(out, 4)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        std::vector<recomp::d3d::D3d9VertexElement> elements;
+        for (uint32_t i = 0; i < 65 && elems; ++i) {
+            uint32_t e = elems + i * 8u;
+            if (!gm_valid(e, 8)) {
+                com_ret(c, D3DERR_INVALIDCALL);
+                return;
+            }
+            recomp::d3d::D3d9VertexElement element{};
+            element.stream = rd16(e);
+            element.offset = rd16(e + 2);
+            element.element_type = gm_ptr(e)[4];
+            element.method = gm_ptr(e)[5];
+            element.usage = gm_ptr(e)[6];
+            element.usage_index = gm_ptr(e)[7];
+            elements.push_back(element);
+            if (element.stream == 0xff)
+                break;
+        }
+        recomp::d3d::ValueResult result = dev->d3d9_device->create_vertex_declaration(
+            rust::Slice<const recomp::d3d::D3d9VertexElement>(elements.data(), elements.size()));
+        if (!d3d_bridge_ok(result.status)) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        }
+        ComObj *d = d3d9_make_object(dev, K_D3D9DECL, IF_D3DVERTEXDECL9, result.value, out);
+        if (!d) {
+            dev->d3d9_device->destroy_declaration(result.value);
+            com_ret(c, E_OUTOFMEMORY);
+            return;
+        }
+        dev->d3d9_device->decl_views[result.value] = d->id;
+        com_ret(c, D3D_OK9);
+        return;
+    }
     ComObj *d = com_new(K_D3D9DECL);
     if (!d) {
         com_ret(c, E_OUTOFMEMORY);
@@ -2323,7 +2479,7 @@ void Dev_CreateVertexDeclaration(X86 *c) {
     d->dev_d3d = dev->id;
     // D3DVERTEXELEMENT9 is 8 bytes and the array ends with D3DDECL_END, whose
     // Stream is 0xff. Copy until that, so the declaration survives the call.
-    for (uint32_t i = 0; i < 64 && elems; ++i) {
+    for (uint32_t i = 0; i < 65 && elems; ++i) {
         uint32_t e = elems + i * 8u;
         uint16_t stream = rd16(e);
         for (int b = 0; b < 8; ++b)
@@ -2344,6 +2500,19 @@ void Dev_CreateVertexDeclaration(X86 *c) {
 void Dev_SetVertexDeclaration(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *d = com_this(arg(c, 1));
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device || (arg(c, 1) && (!d || d->kind != K_D3D9DECL)) ||
+            (d && d->dev_d3d != dev->id)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::Status status =
+            dev->d3d9_device->set_vertex_declaration(d ? d->d3d9_state_handle : 0);
+        if (d3d_bridge_ok(status))
+            d3d9_refresh_bindings(dev);
+        com_ret(c, bridge_result(c, status));
+        return;
+    }
     if (dev) {
         dev->current_viewport = (d && d->kind == K_D3D9DECL) ? d->id : 0;
         d9_pipeline(dev->id).declaration = dev->current_viewport;
@@ -2394,6 +2563,19 @@ void Dev_SetStreamSource(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *vb = com_this(arg(c, 2));
     uint32_t stream = arg(c, 1);
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device || stream >= 16 ||
+            (arg(c, 2) && (!vb || vb->kind != K_D3D9VB)) || (vb && vb->dev_d3d != dev->id)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::Status status =
+            dev->d3d9_device->set_stream_source(stream, vb ? vb->id : 0, arg(c, 3), arg(c, 4));
+        if (d3d_bridge_ok(status))
+            d3d9_refresh_bindings(dev);
+        com_ret(c, bridge_result(c, status));
+        return;
+    }
     if (!dev) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -2421,6 +2603,18 @@ void Dev_SetStreamSource(X86 *c) {
 void Dev_SetIndices(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *ib = com_this(arg(c, 1));
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device || (arg(c, 1) && (!ib || ib->kind != K_D3D9IB)) ||
+            (ib && ib->dev_d3d != dev->id)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::Status status = dev->d3d9_device->set_indices(ib ? ib->id : 0);
+        if (d3d_bridge_ok(status))
+            d3d9_refresh_bindings(dev);
+        com_ret(c, bridge_result(c, status));
+        return;
+    }
     if (dev) {
         dev->front_obj = (ib && ib->kind == K_D3D9IB) ? ib->id : 0;
         d9_pipeline(dev->id).index_buffer = dev->front_obj;
@@ -2433,6 +2627,31 @@ void Dev_SetTexture(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *tex = com_this(arg(c, 2));
     uint32_t stage = arg(c, 1);
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        if (stage >= 16) {
+            if (stage >= D3DDMAPSAMPLER && stage <= D3DVERTEXTEXTURESAMPLER3)
+                imports_unsupported(c);
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        if (arg(c, 2)) {
+            if (!tex || tex->dev_d3d != dev->id ||
+                (tex->kind != K_D3D9TEXTURE && tex->kind != K_D3D9CUBETEXTURE &&
+                 tex->kind != K_D3D9VOLUMETEXTURE)) {
+                com_ret(c, D3DERR_INVALIDCALL);
+                return;
+            }
+        }
+        recomp::d3d::Status status = dev->d3d9_device->set_texture(stage, tex ? tex->id : 0);
+        if (d3d_bridge_ok(status))
+            d3d9_refresh_bindings(dev);
+        com_ret(c, bridge_result(c, status));
+        return;
+    }
     if (!dev) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -3005,7 +3224,7 @@ void Res_GetDevice(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (kD3d9WgpuEnabled && !o->d3d9_resource && !o->d3d9_implicit) {
+    if (kD3d9WgpuEnabled && !o->d3d9_resource && !o->d3d9_implicit && !o->dev_d3d) {
         imports_unsupported(c);
         return;
     }
@@ -4004,6 +4223,21 @@ D9Pipeline &d9_pipeline(uint32_t device_id) {
 void Dev_SetViewport(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t v = arg(c, 1);
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device || !v || !gm_valid(v, 24)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::Viewport viewport{};
+        viewport.x = rd32(v);
+        viewport.y = rd32(v + 4);
+        viewport.width = rd32(v + 8);
+        viewport.height = rd32(v + 12);
+        memcpy(&viewport.min_z, gm_ptr(v + 16), 4);
+        memcpy(&viewport.max_z, gm_ptr(v + 20), 4);
+        com_ret(c, bridge_result(c, dev->d3d9_device->set_viewport(viewport)));
+        return;
+    }
     if (dev && v) {
         D9Pipeline &p = d9_pipeline(dev->id);
         for (int i = 0; i < 4; ++i)
@@ -4018,6 +4252,23 @@ void Dev_SetViewport(X86 *c) {
 void Dev_GetViewport(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t v = arg(c, 1);
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device || !v || !gm_valid(v, 24)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        recomp::d3d::ViewportResult result = dev->d3d9_device->viewport();
+        if (d3d_bridge_ok(result.status)) {
+            wr32(v, result.viewport.x);
+            wr32(v + 4, result.viewport.y);
+            wr32(v + 8, result.viewport.width);
+            wr32(v + 12, result.viewport.height);
+            memcpy(gm_ptr(v + 16), &result.viewport.min_z, 4);
+            memcpy(gm_ptr(v + 20), &result.viewport.max_z, 4);
+        }
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
     if (dev && v) {
         D9Pipeline &p = d9_pipeline(dev->id);
         ComObj *rt = com_get(dev->render_target);
@@ -4040,6 +4291,17 @@ void Dev_GetViewport(X86 *c) {
 void Dev_SetTransform(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t state = arg(c, 1), m = arg(c, 2);
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device || !m || !gm_valid(m, 64)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        float matrix[16];
+        memcpy(matrix, gm_ptr(m), 64);
+        com_ret(c, bridge_result(c, dev->d3d9_device->set_transform(
+                                        state, rust::Slice<const float>(matrix, 16))));
+        return;
+    }
     if (dev && m) {
         uint32_t slot =
             state < 256 ? state : (state >= 256 && state < 260 ? state - 256 + 24 : 0xffffffffu);
@@ -4052,10 +4314,38 @@ void Dev_SetTransform(X86 *c) {
     com_ret(c, D3D_OK9);
 }
 
+// (this, State, pMatrix): multiply the current transform by the supplied
+// matrix, current = current * supplied, in D3D9's row-major layout.
+void Dev_MultiplyTransform(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t state = arg(c, 1), m = arg(c, 2);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !m || !gm_valid(m, 64)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    float matrix[16];
+    memcpy(matrix, gm_ptr(m), 64);
+    com_ret(c, bridge_result(c, dev->d3d9_device->multiply_transform(
+                                    state, rust::Slice<const float>(matrix, 16))));
+}
+
 // (this, Stage, Type, Value)
 void Dev_SetTextureStageState(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t stage = arg(c, 1), type = arg(c, 2);
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        com_ret(
+            c, bridge_result(c, dev->d3d9_device->set_texture_stage_state(stage, type, arg(c, 3))));
+        return;
+    }
     if (dev && stage < 8 && type < 33)
         d9_pipeline(dev->id).tss[stage][type] = arg(c, 3);
     com_ret(c, D3D_OK9);
@@ -4064,6 +4354,14 @@ void Dev_SetTextureStageState(X86 *c) {
 void Dev_SetRenderState(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t state = arg(c, 1);
+    if (kD3d9WgpuEnabled) {
+        if (!dev || !dev->d3d9_device) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        com_ret(c, bridge_result(c, dev->d3d9_device->set_render_state(state, arg(c, 2))));
+        return;
+    }
     if (!dev) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -4087,6 +4385,16 @@ void Dev_SetSamplerState(X86 *c) {
     uint32_t sampler = arg(c, 1), type = arg(c, 2);
     if (!dev) {
         com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (kD3d9WgpuEnabled) {
+        if (!dev->d3d9_device || sampler >= 16) {
+            if (sampler >= D3DDMAPSAMPLER && sampler <= D3DVERTEXTEXTURESAMPLER3)
+                imports_unsupported(c);
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        com_ret(c, bridge_result(c, dev->d3d9_device->set_sampler_state(sampler, type, arg(c, 3))));
         return;
     }
     if (sampler >= 16) {
@@ -4128,6 +4436,27 @@ static bool write_registers(float (*table)[4], uint32_t limit, uint32_t start, u
 // (this, StartRegister, pConstantData, Vector4fCount)
 void Dev_SetVertexShaderConstantF(X86 *c) {
     ComObj *dev = this_device9(c);
+    if (kD3d9WgpuEnabled) {
+        uint32_t start = arg(c, 1), data = arg(c, 2), count = arg(c, 3);
+        if (!dev || !dev->d3d9_device || count > 256 || start > 256 - count) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        if (!count) {
+            com_ret(c, D3D_OK9);
+            return;
+        }
+        if (!data || !gm_valid(data, count * 16)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        std::vector<float> values(count * 4);
+        memcpy(values.data(), gm_ptr(data), count * 16);
+        com_ret(c, bridge_result(c, dev->d3d9_device->set_shader_constants_f(
+                                        false, start,
+                                        rust::Slice<const float>(values.data(), values.size()))));
+        return;
+    }
     if (!dev ||
         !write_registers(d9_pipeline(dev->id).vconst, 256, arg(c, 1), arg(c, 2), arg(c, 3))) {
         com_ret(c, D3DERR_INVALIDCALL);
@@ -4137,6 +4466,27 @@ void Dev_SetVertexShaderConstantF(X86 *c) {
 }
 void Dev_SetPixelShaderConstantF(X86 *c) {
     ComObj *dev = this_device9(c);
+    if (kD3d9WgpuEnabled) {
+        uint32_t start = arg(c, 1), data = arg(c, 2), count = arg(c, 3);
+        if (!dev || !dev->d3d9_device || count > 32 || start > 32 - count) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        if (!count) {
+            com_ret(c, D3D_OK9);
+            return;
+        }
+        if (!data || !gm_valid(data, count * 16)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        std::vector<float> values(count * 4);
+        memcpy(values.data(), gm_ptr(data), count * 16);
+        com_ret(c, bridge_result(c, dev->d3d9_device->set_shader_constants_f(
+                                        true, start,
+                                        rust::Slice<const float>(values.data(), values.size()))));
+        return;
+    }
     if (!dev ||
         !write_registers(d9_pipeline(dev->id).pconst, 32, arg(c, 1), arg(c, 2), arg(c, 3))) {
         com_ret(c, D3DERR_INVALIDCALL);
@@ -4168,11 +4518,920 @@ void d3d9_reset() {
     g_scratch_size = 0;
 }
 
+static bool d3d9_write_view(uint32_t out, uint32_t id, ComIface iface) {
+    ComObj *o = com_get(id);
+    if (!o)
+        return false;
+    com_addref(o);
+    uint32_t view = com_view(o, iface);
+    if (!view) {
+        com_release(o);
+        return false;
+    }
+    com_out_ptr(out, view);
+    return true;
+}
+
+static void d3d9_stage_shader(uint32_t addr, std::vector<uint32_t> &out) {
+    if (!addr)
+        return;
+    for (uint32_t i = 0; i < 4096; ++i) {
+        if (addr > UINT32_MAX - i * 4u)
+            break;
+        uint32_t a = addr + i * 4u;
+        if (!gm_valid(a, 4))
+            break;
+        out.push_back(rd32(a));
+    }
+}
+
+static uint32_t d3d9_shader_id(ComObj *dev, uint32_t handle, bool pixel) {
+    if (!dev || !dev->d3d9_device || !handle)
+        return 0;
+    auto &map = dev->d3d9_device->shader_views;
+    auto it = map.find(handle);
+    return it == map.end() ? 0 : it->second;
+}
+
+void Dev_GetRenderState(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 2);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::ValueResult result = dev->d3d9_device->render_state(arg(c, 1));
+    if (d3d_bridge_ok(result.status))
+        wr32(out, result.value);
+    com_ret(c, bridge_result(c, result.status));
+}
+void Dev_GetTextureStageState(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 3);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::ValueResult result = dev->d3d9_device->texture_stage_state(arg(c, 1), arg(c, 2));
+    if (d3d_bridge_ok(result.status))
+        wr32(out, result.value);
+    com_ret(c, bridge_result(c, result.status));
+}
+void Dev_GetSamplerState(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 3);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::ValueResult result = dev->d3d9_device->sampler_state(arg(c, 1), arg(c, 2));
+    if (d3d_bridge_ok(result.status))
+        wr32(out, result.value);
+    com_ret(c, bridge_result(c, result.status));
+}
+void Dev_GetTransform(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 2);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 64)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::FloatValuesResult result = dev->d3d9_device->transform(arg(c, 1));
+    if (d3d_bridge_ok(result.status) && result.values.size() == 16)
+        for (size_t i = 0; i < 16; ++i)
+            memcpy(gm_ptr(out + (uint32_t)i * 4), &result.values[i], 4);
+    com_ret(c, bridge_result(c, result.status));
+}
+void Dev_GetScissorRect(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 1);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 16)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3d9ScissorResult result = dev->d3d9_device->scissor();
+    if (d3d_bridge_ok(result.status)) {
+        wr32(out, (uint32_t)result.left);
+        wr32(out + 4, (uint32_t)result.top);
+        wr32(out + 8, (uint32_t)result.right);
+        wr32(out + 12, (uint32_t)result.bottom);
+    }
+    com_ret(c, bridge_result(c, result.status));
+}
+void Dev_SetMaterial(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t p = arg(c, 1);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !p || !gm_valid(p, 68)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    float values[17];
+    memcpy(values, gm_ptr(p), 68);
+    com_ret(c,
+            bridge_result(c, dev->d3d9_device->set_material(rust::Slice<const float>(values, 17))));
+}
+void Dev_GetMaterial(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t p = arg(c, 1);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !p || !gm_valid(p, 68)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::FloatValuesResult result = dev->d3d9_device->material();
+    if (d3d_bridge_ok(result.status) && result.values.size() == 17)
+        memcpy(gm_ptr(p), result.values.data(), 68);
+    com_ret(c, bridge_result(c, result.status));
+}
+void Dev_SetLight(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t p = arg(c, 2);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !p || !gm_valid(p, 104)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t type = rd32(p);
+    float values[25];
+    memcpy(values, gm_ptr(p + 4), 100);
+    com_ret(c, bridge_result(c, dev->d3d9_device->set_light(arg(c, 1), type,
+                                                            rust::Slice<const float>(values, 25))));
+}
+void Dev_GetLight(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t p = arg(c, 2);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !p || !gm_valid(p, 104)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3d9LightResult result = dev->d3d9_device->light(arg(c, 1));
+    if (d3d_bridge_ok(result.status) && result.values.size() == 25) {
+        wr32(p, result.light_type);
+        memcpy(gm_ptr(p + 4), result.values.data(), 100);
+    }
+    com_ret(c, bridge_result(c, result.status));
+}
+void Dev_LightEnable(X86 *c) {
+    ComObj *dev = this_device9(c);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    com_ret(c, bridge_result(c, dev->d3d9_device->set_light_enable(arg(c, 1), arg(c, 2) != 0)));
+}
+void Dev_GetLightEnable(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 2);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::ValueResult result = dev->d3d9_device->light_enable(arg(c, 1));
+    if (d3d_bridge_ok(result.status))
+        wr32(out, result.value);
+    com_ret(c, bridge_result(c, result.status));
+}
+void Dev_SetClipPlane(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t p = arg(c, 2);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !p || !gm_valid(p, 16)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    float values[4];
+    memcpy(values, gm_ptr(p), 16);
+    com_ret(c, bridge_result(c, dev->d3d9_device->set_clip_plane(
+                                    arg(c, 1), rust::Slice<const float>(values, 4))));
+}
+void Dev_GetClipPlane(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t p = arg(c, 2);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !p || !gm_valid(p, 16)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::FloatValuesResult result = dev->d3d9_device->clip_plane(arg(c, 1));
+    if (d3d_bridge_ok(result.status) && result.values.size() == 4)
+        memcpy(gm_ptr(p), result.values.data(), 16);
+    com_ret(c, bridge_result(c, result.status));
+}
+void Dev_GetTexture(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 2);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::ValueResult result = dev->d3d9_device->texture(arg(c, 1));
+    if (!d3d_bridge_ok(result.status)) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    if (!result.value || !d3d9_write_view(out, result.value, IF_D3DBASETEXTURE9))
+        wr32(out, 0);
+    com_ret(c, D3D_OK9);
+}
+void Dev_GetStreamSource(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 2), offset = arg(c, 3), stride = arg(c, 4);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4) || !offset || !gm_valid(offset, 4) ||
+        !stride || !gm_valid(stride, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3d9StreamResult result = dev->d3d9_device->stream_source(arg(c, 1));
+    if (!d3d_bridge_ok(result.status)) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    if (!result.buffer || !d3d9_write_view(out, result.buffer, IF_D3DVERTEXBUFFER9))
+        wr32(out, 0);
+    wr32(offset, result.offset);
+    wr32(stride, result.stride);
+    com_ret(c, D3D_OK9);
+}
+void Dev_SetStreamSourceFreq(X86 *c) {
+    ComObj *dev = this_device9(c);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    com_ret(c, bridge_result(c, dev->d3d9_device->set_stream_freq(arg(c, 1), arg(c, 2))));
+}
+void Dev_GetStreamSourceFreq(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 2);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::ValueResult result = dev->d3d9_device->stream_freq(arg(c, 1));
+    if (d3d_bridge_ok(result.status))
+        wr32(out, result.value);
+    com_ret(c, bridge_result(c, result.status));
+}
+void Dev_GetIndices(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 1);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::ValueResult result = dev->d3d9_device->indices();
+    if (!d3d_bridge_ok(result.status)) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    if (!result.value || !d3d9_write_view(out, result.value, IF_D3DINDEXBUFFER9))
+        wr32(out, 0);
+    com_ret(c, D3D_OK9);
+}
+void Dev_GetFVF(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 1);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::ValueResult result = dev->d3d9_device->fvf();
+    if (d3d_bridge_ok(result.status))
+        wr32(out, result.value);
+    com_ret(c, bridge_result(c, result.status));
+}
+void Dev_SetFVF(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t fvf = arg(c, 1);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (!fvf) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    recomp::d3d::ValueResult result = dev->d3d9_device->create_fvf_declaration(fvf);
+    if (!d3d_bridge_ok(result.status)) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    if (dev->d3d9_device->decl_views.find(result.value) == dev->d3d9_device->decl_views.end()) {
+        ComObj *d = com_new(K_D3D9DECL);
+        if (!d) {
+            dev->d3d9_device->destroy_declaration(result.value);
+            com_ret(c, E_OUTOFMEMORY);
+            return;
+        }
+        d->dev_d3d = dev->id;
+        d->d3d9_state_handle = result.value;
+        com_internalize(d);
+        uint32_t view = com_view(d, IF_D3DVERTEXDECL9);
+        if (!view) {
+            com_release_internal(d);
+            com_ret(c, E_OUTOFMEMORY);
+            return;
+        }
+        dev->d3d9_device->decl_views[result.value] = d->id;
+        dev->d3d9_device->fvf_decls.insert(d->id);
+    }
+    recomp::d3d::Status status = dev->d3d9_device->set_fvf_binding(result.value, fvf);
+    if (d3d_bridge_ok(status))
+        d3d9_refresh_bindings(dev);
+    com_ret(c, bridge_result(c, status));
+}
+void Dev_GetVertexDeclaration(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 1);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::ValueResult result = dev->d3d9_device->vertex_declaration();
+    if (!d3d_bridge_ok(result.status)) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    uint32_t id = 0;
+    if (result.value) {
+        auto it = dev->d3d9_device->decl_views.find(result.value);
+        if (it != dev->d3d9_device->decl_views.end())
+            id = it->second;
+    }
+    if (!id || !d3d9_write_view(out, id, IF_D3DVERTEXDECL9))
+        wr32(out, 0);
+    com_ret(c, D3D_OK9);
+}
+void Dev_CreateVertexShader(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 2);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, 0);
+    std::vector<uint32_t> code;
+    d3d9_stage_shader(arg(c, 1), code);
+    recomp::d3d::ValueResult result = dev->d3d9_device->create_shader(
+        false, rust::Slice<const uint32_t>(code.data(), code.size()));
+    if (!d3d_bridge_ok(result.status)) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    ComObj *o = d3d9_make_object(dev, K_D3D9VS, IF_D3DVERTEXSHADER9, result.value, out);
+    if (!o) {
+        dev->d3d9_device->destroy_shader(false, result.value);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    dev->d3d9_device->shader_views[result.value] = o->id;
+    com_ret(c, D3D_OK9);
+}
+void Dev_SetVertexShader(X86 *c) {
+    ComObj *dev = this_device9(c);
+    ComObj *s = com_this(arg(c, 1));
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || (arg(c, 1) && (!s || s->kind != K_D3D9VS)) ||
+        (s && s->dev_d3d != dev->id)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::Status status = dev->d3d9_device->set_shader(false, s ? s->d3d9_state_handle : 0);
+    if (d3d_bridge_ok(status))
+        d3d9_refresh_bindings(dev);
+    com_ret(c, bridge_result(c, status));
+}
+void Dev_GetVertexShader(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 1);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::ValueResult result = dev->d3d9_device->shader(false);
+    uint32_t id = d3d9_shader_id(dev, d3d_bridge_ok(result.status) ? result.value : 0, false);
+    if (!id || !d3d9_write_view(out, id, IF_D3DVERTEXSHADER9))
+        wr32(out, 0);
+    com_ret(c, D3D_OK9);
+}
+void Dev_CreatePixelShader(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 2);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, 0);
+    std::vector<uint32_t> code;
+    d3d9_stage_shader(arg(c, 1), code);
+    recomp::d3d::ValueResult result = dev->d3d9_device->create_shader(
+        true, rust::Slice<const uint32_t>(code.data(), code.size()));
+    if (!d3d_bridge_ok(result.status)) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    ComObj *o = d3d9_make_object(dev, K_D3D9PS, IF_D3DPIXELSHADER9, result.value, out);
+    if (!o) {
+        dev->d3d9_device->destroy_shader(true, result.value);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    dev->d3d9_device->shader_views[result.value] = o->id;
+    com_ret(c, D3D_OK9);
+}
+void Dev_SetPixelShader(X86 *c) {
+    ComObj *dev = this_device9(c);
+    ComObj *s = com_this(arg(c, 1));
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || (arg(c, 1) && (!s || s->kind != K_D3D9PS)) ||
+        (s && s->dev_d3d != dev->id)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::Status status = dev->d3d9_device->set_shader(true, s ? s->d3d9_state_handle : 0);
+    if (d3d_bridge_ok(status))
+        d3d9_refresh_bindings(dev);
+    com_ret(c, bridge_result(c, status));
+}
+void Dev_GetPixelShader(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 1);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::ValueResult result = dev->d3d9_device->shader(true);
+    uint32_t id = d3d9_shader_id(dev, d3d_bridge_ok(result.status) ? result.value : 0, true);
+    if (!id || !d3d9_write_view(out, id, IF_D3DPIXELSHADER9))
+        wr32(out, 0);
+    com_ret(c, D3D_OK9);
+}
+static void d3d9_get_function(X86 *c, bool pixel) {
+    ComObj *o = com_this_arg(c);
+    uint32_t data = arg(c, 1), size = arg(c, 2);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!o || o->kind != (pixel ? K_D3D9PS : K_D3D9VS) || !size || !gm_valid(size, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    ComObj *dev = com_get(o->dev_d3d);
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::ValuesResult result =
+        dev->d3d9_device->shader_function(pixel, o->d3d9_state_handle);
+    if (!d3d_bridge_ok(result.status)) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    uint32_t required = (uint32_t)result.values.size() * 4;
+    uint32_t available = rd32(size);
+    wr32(size, required);
+    if (!data) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    if (available < required || !gm_valid(data, required)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    for (size_t i = 0; i < result.values.size(); ++i)
+        wr32(data + (uint32_t)i * 4, result.values[i]);
+    com_ret(c, D3D_OK9);
+}
+void VS_GetFunction(X86 *c) {
+    d3d9_get_function(c, false);
+}
+void PS_GetFunction(X86 *c) {
+    d3d9_get_function(c, true);
+}
+void Decl_GetDeclaration(X86 *c) {
+    ComObj *o = com_this_arg(c);
+    uint32_t data = arg(c, 1), count = arg(c, 2);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!o || o->kind != K_D3D9DECL || !count || !gm_valid(count, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    ComObj *dev = com_get(o->dev_d3d);
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3d9DeclarationResult result =
+        dev->d3d9_device->declaration_elements(o->d3d9_state_handle);
+    if (!d3d_bridge_ok(result.status)) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    uint32_t required = (uint32_t)result.elements.size();
+    uint32_t available = rd32(count);
+    wr32(count, required);
+    if (!data) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    if (available < required || !gm_valid(data, required * 8)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    for (uint32_t i = 0; i < required; ++i) {
+        const recomp::d3d::D3d9VertexElement &e = result.elements[i];
+        uint32_t at = data + i * 8;
+        wr16(at, e.stream);
+        wr16(at + 2, e.offset);
+        gm_ptr(at)[4] = e.element_type;
+        gm_ptr(at)[5] = e.method;
+        gm_ptr(at)[6] = e.usage;
+        gm_ptr(at)[7] = e.usage_index;
+    }
+    com_ret(c, D3D_OK9);
+}
+static void d3d9_constant_i(X86 *c, bool pixel, bool set) {
+    ComObj *dev = this_device9(c);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t start = arg(c, 1), data = arg(c, 2), count = arg(c, 3);
+    if (count > 16 || start > 16 - count) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (!count) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    if (!data || !gm_valid(data, count * 16)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (set) {
+        std::vector<int32_t> values(count * 4);
+        memcpy(values.data(), gm_ptr(data), count * 16);
+        com_ret(c, bridge_result(c, dev->d3d9_device->set_shader_constants_i(
+                                        pixel, start,
+                                        rust::Slice<const int32_t>(values.data(), values.size()))));
+        return;
+    }
+    recomp::d3d::ValuesResult result = dev->d3d9_device->shader_constants_i(pixel, start, count);
+    if (d3d_bridge_ok(result.status) && result.values.size() == (size_t)count * 4)
+        for (uint32_t i = 0; i < count * 4; ++i)
+            wr32(data + i * 4, result.values[i]);
+    com_ret(c, bridge_result(c, result.status));
+}
+static void d3d9_constant_b(X86 *c, bool pixel, bool set) {
+    ComObj *dev = this_device9(c);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t start = arg(c, 1), data = arg(c, 2), count = arg(c, 3);
+    if (count > 16 || start > 16 - count) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (!count) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    if (!data || !gm_valid(data, count * 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (set) {
+        std::vector<uint32_t> values(count);
+        for (uint32_t i = 0; i < count; ++i)
+            values[i] = rd32(data + i * 4);
+        com_ret(c,
+                bridge_result(c, dev->d3d9_device->set_shader_constants_b(
+                                     pixel, start,
+                                     rust::Slice<const uint32_t>(values.data(), values.size()))));
+        return;
+    }
+    recomp::d3d::ValuesResult result = dev->d3d9_device->shader_constants_b(pixel, start, count);
+    if (d3d_bridge_ok(result.status) && result.values.size() == count)
+        for (uint32_t i = 0; i < count; ++i)
+            wr32(data + i * 4, result.values[i]);
+    com_ret(c, bridge_result(c, result.status));
+}
+void Dev_GetVertexShaderConstantF(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t data = arg(c, 2), count = arg(c, 3);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || count > 256 || arg(c, 1) > 256 - count) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (!count) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    if (!data || !gm_valid(data, count * 16)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::FloatValuesResult result =
+        dev->d3d9_device->shader_constants_f(false, arg(c, 1), count);
+    if (d3d_bridge_ok(result.status) && result.values.size() == (size_t)count * 4)
+        memcpy(gm_ptr(data), result.values.data(), count * 16);
+    com_ret(c, bridge_result(c, result.status));
+}
+void Dev_GetPixelShaderConstantF(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t data = arg(c, 2), count = arg(c, 3);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || count > 32 || arg(c, 1) > 32 - count) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (!count) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    if (!data || !gm_valid(data, count * 16)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::FloatValuesResult result =
+        dev->d3d9_device->shader_constants_f(true, arg(c, 1), count);
+    if (d3d_bridge_ok(result.status) && result.values.size() == (size_t)count * 4)
+        memcpy(gm_ptr(data), result.values.data(), count * 16);
+    com_ret(c, bridge_result(c, result.status));
+}
+void Dev_SetVertexShaderConstantI(X86 *c) {
+    d3d9_constant_i(c, false, true);
+}
+void Dev_GetVertexShaderConstantI(X86 *c) {
+    d3d9_constant_i(c, false, false);
+}
+void Dev_SetPixelShaderConstantI(X86 *c) {
+    d3d9_constant_i(c, true, true);
+}
+void Dev_GetPixelShaderConstantI(X86 *c) {
+    d3d9_constant_i(c, true, false);
+}
+void Dev_SetVertexShaderConstantB(X86 *c) {
+    d3d9_constant_b(c, false, true);
+}
+void Dev_GetVertexShaderConstantB(X86 *c) {
+    d3d9_constant_b(c, false, false);
+}
+void Dev_SetPixelShaderConstantB(X86 *c) {
+    d3d9_constant_b(c, true, true);
+}
+void Dev_GetPixelShaderConstantB(X86 *c) {
+    d3d9_constant_b(c, true, false);
+}
+void Dev_CreateStateBlock(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 2);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, 0);
+    recomp::d3d::ValueResult result = dev->d3d9_device->create_state_block(arg(c, 1));
+    if (!d3d_bridge_ok(result.status)) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    ComObj *b = d3d9_make_object(dev, K_D3D9STATEBLOCK, IF_D3DSTATEBLOCK9, result.value, out);
+    if (!b) {
+        dev->d3d9_device->destroy_state_block(result.value);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    dev->d3d9_device->block_views[result.value] = b->id;
+    d3d9_refresh_block_bindings(dev, result.value);
+    com_ret(c, D3D_OK9);
+}
+void Dev_BeginStateBlock(X86 *c) {
+    ComObj *dev = this_device9(c);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    com_ret(c, bridge_result(c, dev->d3d9_device->begin_state_block()));
+}
+void Dev_EndStateBlock(X86 *c) {
+    ComObj *dev = this_device9(c);
+    uint32_t out = arg(c, 1);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, 0);
+    recomp::d3d::ValueResult result = dev->d3d9_device->end_state_block();
+    if (!d3d_bridge_ok(result.status)) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    ComObj *b = d3d9_make_object(dev, K_D3D9STATEBLOCK, IF_D3DSTATEBLOCK9, result.value, out);
+    if (!b) {
+        d3d9_refresh_bindings(dev);
+        dev->d3d9_device->destroy_state_block(result.value);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    dev->d3d9_device->block_views[result.value] = b->id;
+    d3d9_refresh_block_bindings(dev, result.value);
+    d3d9_refresh_bindings(dev);
+    com_ret(c, D3D_OK9);
+}
+void SB_Capture(X86 *c) {
+    ComObj *b = com_this_arg(c);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!b || b->kind != K_D3D9STATEBLOCK) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    ComObj *dev = com_get(b->dev_d3d);
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::Status status = dev->d3d9_device->capture_state_block(b->d3d9_state_handle);
+    if (d3d_bridge_ok(status))
+        d3d9_refresh_block_bindings(dev, b->d3d9_state_handle);
+    com_ret(c, bridge_result(c, status));
+}
+void SB_Apply(X86 *c) {
+    ComObj *b = com_this_arg(c);
+    if (!kD3d9WgpuEnabled) {
+        imports_unsupported(c);
+        return;
+    }
+    if (!b || b->kind != K_D3D9STATEBLOCK) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    ComObj *dev = com_get(b->dev_d3d);
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::Status status = dev->d3d9_device->apply_state_block(b->d3d9_state_handle);
+    if (d3d_bridge_ok(status))
+        d3d9_refresh_bindings(dev);
+    com_ret(c, bridge_result(c, status));
+}
+
 #include "d3d9_interfaces.inc"
+
+static void d3d9_drop_fvf_cache(ComObj *dev) {
+    if (!dev || !dev->d3d9_device)
+        return;
+    for (uint32_t id : dev->d3d9_device->fvf_decls) {
+        if (ComObj *o = com_get(id))
+            com_release_internal(o);
+    }
+    dev->d3d9_device->fvf_decls.clear();
+}
 
 static void d3d9_device_destroy(ComObj *o) {
     device_discard_implicit_surfaces(o);
     if (o->d3d9_device) {
+        d3d9_drop_all_refs(o);
+        d3d9_drop_fvf_cache(o);
         o->d3d9_device.reset();
         if (ComObj *factory = com_get(o->dev_d3d))
             com_release(factory);
@@ -4181,18 +5440,62 @@ static void d3d9_device_destroy(ComObj *o) {
     o->d3d9_focus_window = 0;
 }
 
-static void d3d9_implicit_refs_changed(ComObj *o) {
-    if (!o || !o->d3d9_implicit)
+static void d3d9_child_refs_changed(ComObj *o) {
+    if (!kD3d9WgpuEnabled || !o || !o->dev_d3d)
+        return;
+    ComObj *dev = com_get(o->dev_d3d);
+    if (!dev || !dev->d3d9_device)
         return;
     const bool external = o->refs > o->internal_refs;
-    ComObj *dev = com_get(o->dev_d3d);
-    if (!dev || external == o->d3d9_owner_retained)
+    if (external == o->d3d9_owner_retained)
         return;
     o->d3d9_owner_retained = external;
     if (external)
         com_retain_internal(dev);
     else
         com_release_internal(dev);
+}
+
+static void d3d9_pipeline_object_destroy(ComObj *o) {
+    if (!o)
+        return;
+    if (kD3d9WgpuEnabled) {
+        ComObj *dev = com_get(o->dev_d3d);
+        if (dev && dev->d3d9_device) {
+            D3d9HostDevice *host = dev->d3d9_device.get();
+            switch (o->kind) {
+            case K_D3D9VS:
+                host->shader_views.erase(o->d3d9_state_handle);
+                host->destroy_shader(false, o->d3d9_state_handle);
+                break;
+            case K_D3D9PS:
+                host->shader_views.erase(o->d3d9_state_handle);
+                host->destroy_shader(true, o->d3d9_state_handle);
+                break;
+            case K_D3D9DECL:
+                host->decl_views.erase(o->d3d9_state_handle);
+                host->fvf_decls.erase(o->id);
+                host->destroy_declaration(o->d3d9_state_handle);
+                break;
+            case K_D3D9STATEBLOCK:
+                d3d9_drop_block_refs(dev, o->d3d9_state_handle);
+                host->block_views.erase(o->d3d9_state_handle);
+                host->destroy_state_block(o->d3d9_state_handle);
+                break;
+            default:
+                break;
+            }
+        }
+        if (o->d3d9_owner_retained) {
+            o->d3d9_owner_retained = false;
+            if (dev)
+                com_release_internal(dev);
+        }
+        o->dev_d3d = 0;
+        o->d3d9_state_handle = 0;
+        return;
+    }
+    o->d3d9_state_handle = 0;
 }
 
 void d3d9_register() {
@@ -4263,10 +5566,17 @@ void d3d9_register() {
     com_bind(IF_D3DINDEXBUFFER9, K_D3D9IB);
     com_bind(IF_D3DVERTEXDECL9, K_D3D9DECL);
     com_bind(IF_D3DQUERY9, K_D3D9QUERY);
+    com_bind(IF_D3DVERTEXSHADER9, K_D3D9VS);
+    com_bind(IF_D3DPIXELSHADER9, K_D3D9PS);
+    com_bind(IF_D3DSTATEBLOCK9, K_D3D9STATEBLOCK);
     for (ComKind k : {K_D3D9TEXTURE, K_D3D9CUBETEXTURE, K_D3D9VOLUMETEXTURE, K_D3D9VOLUME,
                       K_D3D9SURFACE, K_D3D9VB, K_D3D9IB})
         com_set_destructor(k, d3d9_resource_destroy);
-    com_set_ref_hook(K_D3D9SURFACE, d3d9_implicit_refs_changed);
+    for (ComKind k : {K_D3D9DECL, K_D3D9VS, K_D3D9PS, K_D3D9STATEBLOCK})
+        com_set_destructor(k, d3d9_pipeline_object_destroy);
+    for (ComKind k : {K_D3D9SURFACE, K_D3D9TEXTURE, K_D3D9CUBETEXTURE, K_D3D9VOLUMETEXTURE,
+                      K_D3D9VB, K_D3D9IB, K_D3D9DECL, K_D3D9VS, K_D3D9PS, K_D3D9STATEBLOCK})
+        com_set_ref_hook(k, d3d9_child_refs_changed);
     com_set_destructor(K_D3D9QUERY, query_destroy);
     com_set_destructor(K_D3D9DEVICE, d3d9_device_destroy);
     imports_register(g_d3d9_exports, std::size(g_d3d9_exports));

@@ -50,13 +50,12 @@ Follow the D3D7/D3D8 CXX migration (kit commit `f90bba7`):
   required.
 
 Object ownership rules live in `docs/architecture.md` under "Threads and
-ownership". At M1, Rust owns `IDirect3DDevice9` state and typed, byte-backed
-system-memory vertex/index buffers through CXX; remaining resource, shader
-and effect objects are planned for M3-M9.
+ownership". Rust owns device, resource and pipeline state through CXX; C++ retains COM
+identities and guest staging. Shader execution and D3DX objects remain M5–M9.
 
 ## Current status
 
-- **Rust D3D9: M1–M3 done within the contracts below.** Device and resource
+- **Rust D3D9: M1–M4 done within the contracts below.** Device and resource
   state, descriptors, layouts, bytes, locks, dirty regions, priority/LOD and
   byte private data live in Rust. C++ retains COM identities/refcounts,
   factory/device/texture parents and per-subresource guest staging. Buffers,
@@ -73,8 +72,9 @@ and effect objects are planned for M3-M9.
   holder's GPU storage from committed CPU bytes, confirms readiness, and only
   then installs handles and moves the device. Ordinary Reset keeps the healthy
   wgpu context and rebuilds managed residency; physical loss stages a compatible
-  fresh context with an isolated loss token and replaces the old one. M4–M9
-  remain pending and resource completion does not imply drawing support. Civ4's
+  fresh context with an isolated loss token and replaces the old one. Pipeline
+  state, shader/declaration bytes and state blocks now live in Rust (M4).
+  M5–M9 remain pending; state storage does not imply drawing support. Civ4's
   `[render] d3d9_wgpu = true` stays on during active migration.
 - **ABI foundation: done.** Pinned Wine headers and IIDs
   (`third_party/wine-d3d9/`), generated D3D9 constants, version-specific D3DX
@@ -92,21 +92,35 @@ and effect objects are planned for M3-M9.
   formatting, generated COM/status staleness and whitespace checks passed.
   No tests, app, headless or GPU runs were performed.
 
-Handoff: M2 is complete within the windowed presentation contract below.
-Create/Reset validation, implicit back/depth surfaces, owned RGBA Present,
-cooperative status, adapter queries, caps and Check* are callable. Both Reset
-paths stage targets and managed residency before committing; physical loss
-replaces the context, while healthy Reset retains it. CPU bytes, locks, staging,
-COM identities, private data and LOD survive. Named deferrals are listed below;
-M4 is next. Relevant files: `graphics/d3d8-wgpu/src/{d3d9.rs,bridge.rs,
-d3d9/gpu.rs,d3d9/resource.rs}` and
-`dx/{d3d9.cpp,d3d_bridge_helpers.h,d3d9_bindings.json}`. Checks completed: pi
-implementation and supervisor review; pinned API/callback/format inspection;
-native/Rust formatting; generated dispatch/status staleness and whitespace;
-final flag-on `tools/.venv/bin/python tools/build.py --target app` with signing,
-passed on its first attempt. D3D7/D3D8 and shared backend sources are unchanged;
-the status bindings are unchanged. No tests, app, headless or GPU runs; runtime
-recovery and consumer rendering remain unverified. The Civ4 flag stays on.
+Handoff: M4 is complete within its state-storage contract below; M5 is next.
+Rust owns state, declaration/shader bytes and state-block recording/snapshots;
+C++ retains COM identities from Rust binding ids without device/child cycles.
+Relevant files: `graphics/d3d8-wgpu/src/{bridge.rs,d3d9.rs,d3d9/{shader.rs,state.rs}}`
+and `dx/{d3d9.cpp,com.h,d3d_bridge_helpers.h,d3d9_bindings.json}`. Pi implementation
+and independent review, supervisor corrections, native/Rust formatting, generated
+dispatch staleness, repository boundaries and whitespace checks passed. The final
+flag-on `tools/.venv/bin/python tools/build.py --target app` and signing passed
+after correcting CXX declarations/imports, a Rust map-key type and the C++
+shader identity map. No tests, app, headless or GPU runs; runtime behavior remains
+unverified. Explicit deferrals are in M4 below. The Civ4 flag stays on.
+
+M4 primary evidence: Microsoft `Reset`, `GetFunction`, `D3DSTATEBLOCKTYPE`, the
+three "Saving ... States With a StateBlock" pages and the `Capture` per-entry
+example; [SetLight](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3ddevice9-setlight),
+[GetLight](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3ddevice9-getlight),
+[LightEnable](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3ddevice9-lightenable),
+[GetLightEnable](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3ddevice9-getlightenable),
+[MultiplyTransform](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3ddevice9-multiplytransform),
+[SetViewport](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3ddevice9-setviewport),
+[D3DVIEWPORT9](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dviewport9),
+[D3DTEXTURESTAGESTATETYPE](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dtexturestagestatetype),
+[D3DSAMPLERSTATETYPE](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dsamplerstatetype),
+[D3DTEXTUREOP](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dtextureop),
+[texture blending](https://learn.microsoft.com/en-us/windows/win32/direct3d9/texture-blending),
+`D3DTRANSFORMSTATETYPE` and `D3DMATERIAL9`/`D3DLIGHT9`; pinned Wine 11.0
+`d3d9.h`/`d3d9types.h`/`d3d9caps.h`; Wine `dlls/d3d9/stateblock.c`,
+`dlls/wined3d/stateblock.c` and `dlls/wined3d/shader_sm1.c` (pin
+`db11d0fe6a169c457e23d007e20404643d067aa8`).
 
 ## Evidence rules
 
@@ -367,10 +381,31 @@ proceed in parallel once M1 exists.
   bytes, validation and residency; C++ owns COM identities, retained parents and
   guest staging. The listed interop, MSAA and later-milestone deferrals fail by
   name. The D1 format list is fixed above.
-- [ ] **M4. Pipeline state.** Needs M1. Done when: vertex declarations and FVF,
+- [x] **M4. Pipeline state.** Needs M1. Done when: vertex declarations and FVF,
   shader objects with bytecode retrieval, float/int/bool constants, render,
   texture-stage and sampler state, state blocks and all getters are stored and
-  validated in Rust.
+  validated in Rust. Done within the state-storage contract: callable declaration
+  creation/FVF synthesis and cached identities, shader Create/Set/Get/GetFunction
+  for VS1.1/2.0 and PS1.1–1.4/2.0, F/I/B constants, render/texture-stage/sampler
+  setters/getters, transforms/MultiplyTransform, viewport/scissor, material/lights,
+  clip planes, texture/stream/index bindings and ordinary stream frequency 1.
+  ALL/PIXELSTATE/VERTEXSTATE and custom blocks retain per-entry snapshots;
+  recording does not mutate live state. Rust validates enums, layouts, binding
+  kind/pool and ranges; C++ checks guest memory and COM/device identity. Successful
+  Reset clears bindings/default state at commit, preserves shader/declaration
+  objects, and rejects live state blocks. GetFunction/GetDeclaration support size
+  queries and reject short outputs. Caps report 16 streams/pixel sampler slots,
+  eight fixed-function stages/textures, 256 vertex float constants, eight active
+  lights and six clip planes; execution capability bits remain deferred.
+  Named deferrals: SM3/translation (M5), target selection/draws/queries (M6),
+  instancing and stream dividers above 1, vertex/displacement samplers, non-default
+  declaration methods/tessellation, palettes, software VP, clip status and
+  ValidateDevice. Pixel filter kernels/anisotropy remain M11; state storage
+  accepts the pinned D3D filter enum and anisotropy 1–16. Viewport extents are
+  target-bounded; finite depth values outside 0..1 remain stored, following
+  pinned Wine device behavior. LightEnable beyond the eight-active contract
+  returns INVALIDCALL. Supervisor review and the windowed build/signing passed;
+  execution and runtime fidelity remain unverified.
 - [ ] **M5. Shader translation.** Needs M4, D2. Done when: every shader in
   Civ4's compiled effects (`vs_1_1`, `vs_2_0`, `ps_1_1`, `ps_1_4`, `ps_2_0`)
   translates to WGSL that naga validates, and other versions fail by name at

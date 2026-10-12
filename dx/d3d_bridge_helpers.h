@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <set>
+#include <unordered_map>
 
 struct D3dHostDevice {
     rust::Box<recomp::d3d::Device> value;
@@ -62,6 +64,191 @@ struct D3d9HostDevice {
     recomp::d3d::D3d9CapsResult caps() const {
         return recomp::d3d::d3d9_device_caps(*value);
     }
+    recomp::d3d::Status set_render_state(uint32_t state, uint32_t v) {
+        return recomp::d3d::d3d9_set_render_state(*value, state, v);
+    }
+    recomp::d3d::ValueResult render_state(uint32_t state) const {
+        return recomp::d3d::d3d9_get_render_state(*value, state);
+    }
+    recomp::d3d::Status set_texture_stage_state(uint32_t stage, uint32_t state, uint32_t v) {
+        return recomp::d3d::d3d9_set_texture_stage_state(*value, stage, state, v);
+    }
+    recomp::d3d::ValueResult texture_stage_state(uint32_t stage, uint32_t state) const {
+        return recomp::d3d::d3d9_get_texture_stage_state(*value, stage, state);
+    }
+    recomp::d3d::Status set_sampler_state(uint32_t sampler, uint32_t state, uint32_t v) {
+        return recomp::d3d::d3d9_set_sampler_state(*value, sampler, state, v);
+    }
+    recomp::d3d::ValueResult sampler_state(uint32_t sampler, uint32_t state) const {
+        return recomp::d3d::d3d9_get_sampler_state(*value, sampler, state);
+    }
+    recomp::d3d::Status set_transform(uint32_t state, rust::Slice<const float> values) {
+        return recomp::d3d::d3d9_set_transform(*value, state, values);
+    }
+    recomp::d3d::FloatValuesResult transform(uint32_t state) const {
+        return recomp::d3d::d3d9_get_transform(*value, state);
+    }
+    recomp::d3d::Status multiply_transform(uint32_t state, rust::Slice<const float> values) {
+        return recomp::d3d::d3d9_multiply_transform(*value, state, values);
+    }
+    recomp::d3d::Status set_viewport(const recomp::d3d::Viewport &viewport) {
+        return recomp::d3d::d3d9_set_viewport(*value, viewport);
+    }
+    recomp::d3d::ViewportResult viewport() const {
+        return recomp::d3d::d3d9_get_viewport(*value);
+    }
+    recomp::d3d::Status set_scissor(int32_t l, int32_t t, int32_t r, int32_t b) {
+        return recomp::d3d::d3d9_set_scissor(*value, l, t, r, b);
+    }
+    recomp::d3d::D3d9ScissorResult scissor() const {
+        return recomp::d3d::d3d9_get_scissor(*value);
+    }
+    recomp::d3d::Status set_material(rust::Slice<const float> values) {
+        return recomp::d3d::d3d9_set_material(*value, values);
+    }
+    recomp::d3d::FloatValuesResult material() const {
+        return recomp::d3d::d3d9_get_material(*value);
+    }
+    recomp::d3d::Status set_light(uint32_t index, uint32_t type, rust::Slice<const float> values) {
+        return recomp::d3d::d3d9_set_light(*value, index, type, values);
+    }
+    recomp::d3d::D3d9LightResult light(uint32_t index) const {
+        return recomp::d3d::d3d9_get_light(*value, index);
+    }
+    recomp::d3d::Status set_light_enable(uint32_t index, bool enable) {
+        return recomp::d3d::d3d9_set_light_enable(*value, index, enable);
+    }
+    recomp::d3d::ValueResult light_enable(uint32_t index) const {
+        return recomp::d3d::d3d9_get_light_enable(*value, index);
+    }
+    recomp::d3d::Status set_clip_plane(uint32_t index, rust::Slice<const float> values) {
+        return recomp::d3d::d3d9_set_clip_plane(*value, index, values);
+    }
+    recomp::d3d::FloatValuesResult clip_plane(uint32_t index) const {
+        return recomp::d3d::d3d9_get_clip_plane(*value, index);
+    }
+    recomp::d3d::Status set_texture(uint32_t stage, uint32_t id) {
+        return recomp::d3d::d3d9_set_texture(*value, stage, id);
+    }
+    recomp::d3d::ValueResult texture(uint32_t stage) const {
+        return recomp::d3d::d3d9_get_texture(*value, stage);
+    }
+    recomp::d3d::Status set_stream_source(uint32_t stream, uint32_t buffer, uint32_t offset,
+                                          uint32_t stride) {
+        return recomp::d3d::d3d9_set_stream_source(*value, stream, buffer, offset, stride);
+    }
+    recomp::d3d::D3d9StreamResult stream_source(uint32_t stream) const {
+        return recomp::d3d::d3d9_get_stream_source(*value, stream);
+    }
+    recomp::d3d::Status set_stream_freq(uint32_t stream, uint32_t divider) {
+        return recomp::d3d::d3d9_set_stream_freq(*value, stream, divider);
+    }
+    recomp::d3d::ValueResult stream_freq(uint32_t stream) const {
+        return recomp::d3d::d3d9_get_stream_freq(*value, stream);
+    }
+    recomp::d3d::Status set_indices(uint32_t id) {
+        return recomp::d3d::d3d9_set_indices(*value, id);
+    }
+    recomp::d3d::ValueResult indices() const {
+        return recomp::d3d::d3d9_get_indices(*value);
+    }
+    recomp::d3d::ValueResult create_fvf_declaration(uint32_t fvf) {
+        return recomp::d3d::d3d9_create_fvf_declaration(*value, fvf);
+    }
+    recomp::d3d::Status set_fvf_binding(uint32_t handle, uint32_t fvf) {
+        return recomp::d3d::d3d9_set_fvf_binding(*value, handle, fvf);
+    }
+    recomp::d3d::ValueResult fvf() const {
+        return recomp::d3d::d3d9_get_fvf(*value);
+    }
+    recomp::d3d::ValueResult
+    create_vertex_declaration(rust::Slice<const recomp::d3d::D3d9VertexElement> elements) {
+        return recomp::d3d::d3d9_create_vertex_declaration(*value, elements);
+    }
+    recomp::d3d::Status destroy_declaration(uint32_t handle) {
+        return recomp::d3d::d3d9_destroy_declaration(*value, handle);
+    }
+    recomp::d3d::D3d9DeclarationResult declaration_elements(uint32_t handle) const {
+        return recomp::d3d::d3d9_declaration_elements(*value, handle);
+    }
+    recomp::d3d::Status set_vertex_declaration(uint32_t handle) {
+        return recomp::d3d::d3d9_set_vertex_declaration(*value, handle);
+    }
+    recomp::d3d::ValueResult vertex_declaration() const {
+        return recomp::d3d::d3d9_get_vertex_declaration(*value);
+    }
+    recomp::d3d::ValueResult create_shader(bool pixel, rust::Slice<const uint32_t> code) {
+        return recomp::d3d::d3d9_create_shader(*value, pixel, code);
+    }
+    recomp::d3d::Status destroy_shader(bool pixel, uint32_t handle) {
+        return recomp::d3d::d3d9_destroy_shader(*value, pixel, handle);
+    }
+    recomp::d3d::Status set_shader(bool pixel, uint32_t handle) {
+        return recomp::d3d::d3d9_set_shader(*value, pixel, handle);
+    }
+    recomp::d3d::ValueResult shader(bool pixel) const {
+        return recomp::d3d::d3d9_get_shader(*value, pixel);
+    }
+    recomp::d3d::ValuesResult shader_function(bool pixel, uint32_t handle) const {
+        return recomp::d3d::d3d9_shader_function(*value, pixel, handle);
+    }
+    recomp::d3d::ValueResult shader_size(bool pixel, uint32_t handle) const {
+        return recomp::d3d::d3d9_shader_size(*value, pixel, handle);
+    }
+    recomp::d3d::Status set_shader_constants_f(bool pixel, uint32_t start,
+                                               rust::Slice<const float> values) {
+        return recomp::d3d::d3d9_set_shader_constants_f(*value, pixel, start, values);
+    }
+    recomp::d3d::FloatValuesResult shader_constants_f(bool pixel, uint32_t start,
+                                                      uint32_t count) const {
+        return recomp::d3d::d3d9_get_shader_constants_f(*value, pixel, start, count);
+    }
+    recomp::d3d::Status set_shader_constants_i(bool pixel, uint32_t start,
+                                               rust::Slice<const int32_t> values) {
+        return recomp::d3d::d3d9_set_shader_constants_i(*value, pixel, start, values);
+    }
+    recomp::d3d::ValuesResult shader_constants_i(bool pixel, uint32_t start, uint32_t count) const {
+        return recomp::d3d::d3d9_get_shader_constants_i(*value, pixel, start, count);
+    }
+    recomp::d3d::Status set_shader_constants_b(bool pixel, uint32_t start,
+                                               rust::Slice<const uint32_t> values) {
+        return recomp::d3d::d3d9_set_shader_constants_b(*value, pixel, start, values);
+    }
+    recomp::d3d::ValuesResult shader_constants_b(bool pixel, uint32_t start, uint32_t count) const {
+        return recomp::d3d::d3d9_get_shader_constants_b(*value, pixel, start, count);
+    }
+    recomp::d3d::ValueResult create_state_block(uint32_t type) {
+        return recomp::d3d::d3d9_create_state_block(*value, type);
+    }
+    recomp::d3d::Status begin_state_block() {
+        return recomp::d3d::d3d9_begin_state_block(*value);
+    }
+    recomp::d3d::ValueResult end_state_block() {
+        return recomp::d3d::d3d9_end_state_block(*value);
+    }
+    recomp::d3d::Status capture_state_block(uint32_t handle) {
+        return recomp::d3d::d3d9_capture_state_block(*value, handle);
+    }
+    recomp::d3d::Status apply_state_block(uint32_t handle) {
+        return recomp::d3d::d3d9_apply_state_block(*value, handle);
+    }
+    recomp::d3d::Status destroy_state_block(uint32_t handle) {
+        return recomp::d3d::d3d9_destroy_state_block(*value, handle);
+    }
+    recomp::d3d::D3d9BlockBindingsResult state_block_bindings(uint32_t handle) const {
+        return recomp::d3d::d3d9_state_block_bindings(*value, handle);
+    }
+    recomp::d3d::D3d9BindingsResult current_bindings() const {
+        return recomp::d3d::d3d9_current_bindings(*value);
+    }
+
+    std::unordered_map<uint32_t, uint32_t> shader_views;
+    std::unordered_map<uint32_t, uint32_t> decl_views;
+    std::set<uint32_t> fvf_decls;
+    std::unordered_map<uint32_t, uint32_t> block_views;
+    std::set<uint32_t> live_refs;
+    std::set<uint32_t> recording_refs;
+    std::map<uint32_t, std::set<uint32_t>> block_refs;
 };
 
 struct D3d9Staging {

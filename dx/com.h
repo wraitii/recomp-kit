@@ -254,6 +254,9 @@ enum ComKind : uint16_t {
     K_D3D9IB,           // an index buffer
     K_D3D9DECL,         // a vertex declaration
     K_D3D9QUERY,        // an occlusion or event query
+    K_D3D9VS,           // a vertex shader object
+    K_D3D9PS,           // a pixel shader object
+    K_D3D9STATEBLOCK,   // a captured or recorded device state block
     K_D3D8,             // the IDirect3D8 factory object
     K_D3D8DEVICE,       // one host wgpu device
     K_D3D8SURFACE,      // a render target / back buffer view, or one texture level
@@ -502,6 +505,7 @@ struct ComObj {
     uint32_t d3d9_depthbuffer = 0;
     bool d3d9_implicit = false;
     bool d3d9_target_depth = false;
+    uint32_t d3d9_state_handle = 0;
 
     std::shared_ptr<D3dHostDevice> d3d8_device;
     std::shared_ptr<D3dHostResource> d3d8_resource;

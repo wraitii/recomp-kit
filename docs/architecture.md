@@ -113,7 +113,13 @@ the virtual desktop as the current adapter mode and reject adapters or swap
 chains other than 0; an implicit surface's `GetType` is answered in C++ as
 `D3DRTYPE_SURFACE`, because that classification needs no Rust resource state.
 The implicit depth target uses the D3D9 depth-format mapping, not the D3D8 one.
-Declarations, shader/state objects, drawing and queries are later milestones; additional swap-chain objects and Windows resource
+Rust also owns declarations/FVF, shader bytecode, constants, pipeline state and
+state-block snapshots/recording. C++ maps opaque handles to COM identities and
+retains bound/recorded children internally; externally referenced children and
+level views retain the device through ref hooks. FVF declarations have an
+internal-only identity cache. Reset preserves shader/declaration objects, rejects
+live state blocks and clears pipeline bindings/defaults only at final commit.
+Shader execution, drawing, queries, additional swap chains and Windows resource
 interop remain deferred.
 
 D3DX buffers will own bytes, constant tables will own reflection data, and

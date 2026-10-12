@@ -76,6 +76,7 @@
       "EndScene": "Dev_EndScene",
       "Clear": "Dev_Clear",
       "SetTransform": "Dev_SetTransform",
+      "MultiplyTransform": "Dev_MultiplyTransform",
       "SetViewport": "Dev_SetViewport",
       "GetViewport": "Dev_GetViewport",
       "SetRenderState": "Dev_SetRenderState",
@@ -93,7 +94,47 @@
       "SetStreamSource": "Dev_SetStreamSource",
       "SetIndices": "Dev_SetIndices",
       "SetPixelShaderConstantF": "Dev_SetPixelShaderConstantF",
-      "CreateQuery": "Dev_CreateQuery"
+      "CreateQuery": "Dev_CreateQuery",
+      "GetTransform": "Dev_GetTransform",
+      "SetMaterial": "Dev_SetMaterial",
+      "GetMaterial": "Dev_GetMaterial",
+      "SetLight": "Dev_SetLight",
+      "GetLight": "Dev_GetLight",
+      "LightEnable": "Dev_LightEnable",
+      "GetLightEnable": "Dev_GetLightEnable",
+      "SetClipPlane": "Dev_SetClipPlane",
+      "GetClipPlane": "Dev_GetClipPlane",
+      "GetRenderState": "Dev_GetRenderState",
+      "CreateStateBlock": "Dev_CreateStateBlock",
+      "BeginStateBlock": "Dev_BeginStateBlock",
+      "EndStateBlock": "Dev_EndStateBlock",
+      "GetTextureStageState": "Dev_GetTextureStageState",
+      "GetSamplerState": "Dev_GetSamplerState",
+      "GetScissorRect": "Dev_GetScissorRect",
+      "GetTexture": "Dev_GetTexture",
+      "GetStreamSource": "Dev_GetStreamSource",
+      "SetStreamSourceFreq": "Dev_SetStreamSourceFreq",
+      "GetStreamSourceFreq": "Dev_GetStreamSourceFreq",
+      "GetIndices": "Dev_GetIndices",
+      "SetFVF": "Dev_SetFVF",
+      "GetFVF": "Dev_GetFVF",
+      "GetVertexDeclaration": "Dev_GetVertexDeclaration",
+      "CreateVertexShader": "Dev_CreateVertexShader",
+      "SetVertexShader": "Dev_SetVertexShader",
+      "GetVertexShader": "Dev_GetVertexShader",
+      "GetVertexShaderConstantF": "Dev_GetVertexShaderConstantF",
+      "SetVertexShaderConstantI": "Dev_SetVertexShaderConstantI",
+      "GetVertexShaderConstantI": "Dev_GetVertexShaderConstantI",
+      "SetVertexShaderConstantB": "Dev_SetVertexShaderConstantB",
+      "GetVertexShaderConstantB": "Dev_GetVertexShaderConstantB",
+      "CreatePixelShader": "Dev_CreatePixelShader",
+      "SetPixelShader": "Dev_SetPixelShader",
+      "GetPixelShader": "Dev_GetPixelShader",
+      "GetPixelShaderConstantF": "Dev_GetPixelShaderConstantF",
+      "SetPixelShaderConstantI": "Dev_SetPixelShaderConstantI",
+      "GetPixelShaderConstantI": "Dev_GetPixelShaderConstantI",
+      "SetPixelShaderConstantB": "Dev_SetPixelShaderConstantB",
+      "GetPixelShaderConstantB": "Dev_GetPixelShaderConstantB"
     },
     "flag_on": {
       "QueryInterface": "native",
@@ -117,7 +158,62 @@
       "CreateVolumeTexture": "rust",
       "CreateRenderTarget": "rust",
       "CreateDepthStencilSurface": "rust",
-      "CreateOffscreenPlainSurface": "rust"
+      "CreateOffscreenPlainSurface": "rust",
+      "SetTransform": "rust",
+      "MultiplyTransform": "rust",
+      "GetTransform": "rust",
+      "SetViewport": "rust",
+      "GetViewport": "rust",
+      "SetMaterial": "rust",
+      "GetMaterial": "rust",
+      "SetLight": "rust",
+      "GetLight": "rust",
+      "LightEnable": "rust",
+      "GetLightEnable": "rust",
+      "SetClipPlane": "rust",
+      "GetClipPlane": "rust",
+      "SetRenderState": "rust",
+      "GetRenderState": "rust",
+      "CreateStateBlock": "rust",
+      "BeginStateBlock": "rust",
+      "EndStateBlock": "rust",
+      "SetTextureStageState": "rust",
+      "GetTextureStageState": "rust",
+      "SetSamplerState": "rust",
+      "GetSamplerState": "rust",
+      "SetScissorRect": "rust",
+      "GetScissorRect": "rust",
+      "SetTexture": "rust",
+      "GetTexture": "rust",
+      "SetStreamSource": "rust",
+      "GetStreamSource": "rust",
+      "SetStreamSourceFreq": "rust",
+      "GetStreamSourceFreq": "rust",
+      "SetIndices": "rust",
+      "GetIndices": "rust",
+      "SetFVF": "rust",
+      "GetFVF": "rust",
+      "CreateVertexDeclaration": "rust",
+      "SetVertexDeclaration": "rust",
+      "GetVertexDeclaration": "rust",
+      "CreateVertexShader": "rust",
+      "SetVertexShader": "rust",
+      "GetVertexShader": "rust",
+      "SetVertexShaderConstantF": "rust",
+      "GetVertexShaderConstantF": "rust",
+      "SetVertexShaderConstantI": "rust",
+      "GetVertexShaderConstantI": "rust",
+      "SetVertexShaderConstantB": "rust",
+      "GetVertexShaderConstantB": "rust",
+      "CreatePixelShader": "rust",
+      "SetPixelShader": "rust",
+      "GetPixelShader": "rust",
+      "SetPixelShaderConstantF": "rust",
+      "GetPixelShaderConstantF": "rust",
+      "SetPixelShaderConstantI": "rust",
+      "GetPixelShaderConstantI": "rust",
+      "SetPixelShaderConstantB": "rust",
+      "GetPixelShaderConstantB": "rust"
     }
   },
   {
@@ -499,12 +595,14 @@
       "QueryInterface": "com_QueryInterface",
       "AddRef": "com_AddRef",
       "Release": "com_Release",
-      "GetDevice": "Res_GetDevice"
+      "GetDevice": "Res_GetDevice",
+      "GetDeclaration": "Decl_GetDeclaration"
     },
     "flag_on": {
       "QueryInterface": "native",
       "AddRef": "native",
-      "Release": "native"
+      "Release": "native",
+      "GetDeclaration": "rust"
     }
   },
   {
@@ -531,18 +629,59 @@
     "interface": "IDirect3DVertexShader9",
     "table": "g_vertexshader9",
     "iid": "IID_IDirect3DVertexShader9_",
-    "handlers": {}
+    "handlers": {
+      "QueryInterface": "com_QueryInterface",
+      "AddRef": "com_AddRef",
+      "Release": "com_Release",
+      "GetDevice": "Res_GetDevice",
+      "GetFunction": "VS_GetFunction"
+    },
+    "flag_on": {
+      "QueryInterface": "native",
+      "AddRef": "native",
+      "Release": "native",
+      "GetDevice": "native",
+      "GetFunction": "rust"
+    }
   },
   {
     "interface": "IDirect3DPixelShader9",
     "table": "g_pixelshader9",
     "iid": "IID_IDirect3DPixelShader9_",
-    "handlers": {}
+    "handlers": {
+      "QueryInterface": "com_QueryInterface",
+      "AddRef": "com_AddRef",
+      "Release": "com_Release",
+      "GetDevice": "Res_GetDevice",
+      "GetFunction": "PS_GetFunction"
+    },
+    "flag_on": {
+      "QueryInterface": "native",
+      "AddRef": "native",
+      "Release": "native",
+      "GetDevice": "native",
+      "GetFunction": "rust"
+    }
   },
   {
     "interface": "IDirect3DStateBlock9",
     "table": "g_stateblock9",
     "iid": "IID_IDirect3DStateBlock9_",
-    "handlers": {}
+    "handlers": {
+      "QueryInterface": "com_QueryInterface",
+      "AddRef": "com_AddRef",
+      "Release": "com_Release",
+      "GetDevice": "Res_GetDevice",
+      "Capture": "SB_Capture",
+      "Apply": "SB_Apply"
+    },
+    "flag_on": {
+      "QueryInterface": "native",
+      "AddRef": "native",
+      "Release": "native",
+      "GetDevice": "native",
+      "Capture": "rust",
+      "Apply": "rust"
+    }
   }
 ]
