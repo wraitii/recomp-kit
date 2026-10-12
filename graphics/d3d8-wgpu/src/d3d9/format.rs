@@ -1,4 +1,5 @@
 use crate::RenderError;
+use half::f16;
 
 pub const D3DFMT_UNKNOWN: u32 = 0;
 pub const D3DFMT_R8G8B8: u32 = 20;
@@ -713,13 +714,9 @@ fn expand_n(value: u32, bits: u32) -> u8 {
     }
 }
 
-fn expand10(value: u32) -> u8 {
-    ((value << 2) | (value >> 8)) as u8
-}
-
 fn decode_texel_to_rgba8(fmt: u32, texel: &[u8], out: &mut Vec<u8>) {
     match fmt {
-        D3DFMT_R8G8B8 => out.extend_from_slice(&[texel[0], texel[1], texel[2], 0xFF]),
+        D3DFMT_R8G8B8 => out.extend_from_slice(&[texel[2], texel[1], texel[0], 0xFF]),
         D3DFMT_R5G6B5 => {
             let v = u16::from_le_bytes([texel[0], texel[1]]) as u32;
             out.extend_from_slice(&[
@@ -790,7 +787,7 @@ fn decode_texel_to_rgba8(fmt: u32, texel: &[u8], out: &mut Vec<u8>) {
 
 fn encode_texel_from_rgba8(fmt: u32, px: &[u8], out: &mut Vec<u8>) {
     match fmt {
-        D3DFMT_R8G8B8 => out.extend_from_slice(&px[0..3]),
+        D3DFMT_R8G8B8 => out.extend_from_slice(&[px[2], px[1], px[0]]),
         D3DFMT_R5G6B5 => {
             let v = ((px[0] as u16 >> 3) << 11) | ((px[1] as u16 >> 2) << 5) | (px[2] as u16 >> 3);
             out.extend_from_slice(&v.to_le_bytes());
@@ -849,6 +846,476 @@ fn swap_rgb10(word: u32) -> u32 {
     let g = (word >> 10) & 0x3FF;
     let b = word & 0x3FF;
     a | (b << 20) | (g << 10) | r
+}
+
+fn checked_pixel_count(width: u32, height: u32, depth: u32) -> Result<usize, RenderError> {
+    if width == 0 || height == 0 || depth == 0 {
+        return Err(RenderError::invalid(
+            "TexelConversion",
+            "zero texture dimension",
+        ));
+    }
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(depth as usize))
+        .ok_or_else(|| RenderError::invalid("TexelConversion", "pixel count overflow"))
+}
+
+fn fallible_pixels(len: usize) -> Result<Vec<[f32; 4]>, RenderError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).map_err(|_| {
+        RenderError::out_of_memory("TexelConversion", "RGBA float conversion allocation failed")
+    })?;
+    Ok(out)
+}
+
+fn color_format(fmt: u32) -> Result<FormatInfo, RenderError> {
+    match info(fmt) {
+        None => Err(RenderError::new(
+            "TexelConversion",
+            format!("format {fmt} is not a supported texture format"),
+        )),
+        Some(f) if matches!(f.storage, StorageClass::Block) => Err(RenderError::new(
+            "TexelConversion",
+            format!(
+                "format {fmt} is block-compressed; DXT decoding is owned by the D3DX image path"
+            ),
+        )),
+        Some(f) if matches!(f.storage, StorageClass::Depth) => Err(RenderError::new(
+            "TexelConversion",
+            format!("format {fmt} is a depth format and has no color conversion"),
+        )),
+        Some(f) => Ok(f),
+    }
+}
+
+fn unorm_scale(value: u32, bits: u32) -> f32 {
+    value as f32 / ((1u32 << bits) - 1) as f32
+}
+
+fn byte_to_unorm(value: u8) -> f32 {
+    unorm_scale(value as u32, 8)
+}
+
+fn half_at(texel: &[u8], offset: usize) -> f32 {
+    f16::from_bits(u16::from_le_bytes([texel[offset], texel[offset + 1]])).to_f32()
+}
+
+fn f32_at(texel: &[u8], offset: usize) -> f32 {
+    f32::from_le_bytes([
+        texel[offset],
+        texel[offset + 1],
+        texel[offset + 2],
+        texel[offset + 3],
+    ])
+}
+
+fn snorm8(byte: u8) -> f32 {
+    (byte as i8 as f32 / 127.0).clamp(-1.0, 1.0)
+}
+
+fn snorm16(word: u16) -> f32 {
+    (word as i16 as f32 / 32767.0).clamp(-1.0, 1.0)
+}
+
+fn decode_color_texel(fmt: u32, texel: &[u8]) -> Option<[f32; 4]> {
+    let le16 = |offset: usize| u16::from_le_bytes([texel[offset], texel[offset + 1]]) as u32;
+    let le32 = |offset: usize| {
+        u32::from_le_bytes([
+            texel[offset],
+            texel[offset + 1],
+            texel[offset + 2],
+            texel[offset + 3],
+        ])
+    };
+    let field = |value: u32, shift: u32, bits: u32| {
+        unorm_scale((value >> shift) & ((1u32 << bits) - 1), bits)
+    };
+    Some(match fmt {
+        D3DFMT_R8G8B8 => [
+            byte_to_unorm(texel[2]),
+            byte_to_unorm(texel[1]),
+            byte_to_unorm(texel[0]),
+            1.0,
+        ],
+        D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8 => [
+            byte_to_unorm(texel[2]),
+            byte_to_unorm(texel[1]),
+            byte_to_unorm(texel[0]),
+            if fmt == D3DFMT_X8R8G8B8 {
+                1.0
+            } else {
+                byte_to_unorm(texel[3])
+            },
+        ],
+        D3DFMT_A8B8G8R8 | D3DFMT_X8B8G8R8 => [
+            byte_to_unorm(texel[0]),
+            byte_to_unorm(texel[1]),
+            byte_to_unorm(texel[2]),
+            if fmt == D3DFMT_X8B8G8R8 {
+                1.0
+            } else {
+                byte_to_unorm(texel[3])
+            },
+        ],
+        D3DFMT_R5G6B5 => {
+            let value = le16(0);
+            [
+                field(value, 11, 5),
+                field(value, 5, 6),
+                field(value, 0, 5),
+                1.0,
+            ]
+        }
+        D3DFMT_X1R5G5B5 | D3DFMT_A1R5G5B5 => {
+            let value = le16(0);
+            [
+                field(value, 10, 5),
+                field(value, 5, 5),
+                field(value, 0, 5),
+                if fmt == D3DFMT_A1R5G5B5 {
+                    field(value, 15, 1)
+                } else {
+                    1.0
+                },
+            ]
+        }
+        D3DFMT_A4R4G4B4 | D3DFMT_X4R4G4B4 => {
+            let value = le16(0);
+            [
+                field(value, 8, 4),
+                field(value, 4, 4),
+                field(value, 0, 4),
+                if fmt == D3DFMT_A4R4G4B4 {
+                    field(value, 12, 4)
+                } else {
+                    1.0
+                },
+            ]
+        }
+        D3DFMT_R3G3B2 => {
+            let value = texel[0] as u32;
+            [
+                field(value, 5, 3),
+                field(value, 2, 3),
+                field(value, 0, 2),
+                1.0,
+            ]
+        }
+        D3DFMT_A8 => [0.0, 0.0, 0.0, byte_to_unorm(texel[0])],
+        D3DFMT_A8R3G3B2 => {
+            let value = le16(0);
+            [
+                field(value, 5, 3),
+                field(value, 2, 3),
+                field(value, 0, 2),
+                field(value, 8, 8),
+            ]
+        }
+        D3DFMT_L8 => {
+            let luminance = byte_to_unorm(texel[0]);
+            [luminance, luminance, luminance, 1.0]
+        }
+        D3DFMT_A8L8 => {
+            let luminance = byte_to_unorm(texel[0]);
+            [luminance, luminance, luminance, byte_to_unorm(texel[1])]
+        }
+        D3DFMT_A4L4 => {
+            let luminance = field(texel[0] as u32, 0, 4);
+            [
+                luminance,
+                luminance,
+                luminance,
+                field(texel[0] as u32, 4, 4),
+            ]
+        }
+        D3DFMT_A2B10G10R10 | D3DFMT_A2R10G10B10 => {
+            let value = le32(0);
+            let (red, blue) = if fmt == D3DFMT_A2B10G10R10 {
+                (field(value, 0, 10), field(value, 20, 10))
+            } else {
+                (field(value, 20, 10), field(value, 0, 10))
+            };
+            [red, field(value, 10, 10), blue, field(value, 30, 2)]
+        }
+        D3DFMT_G16R16 => [unorm_scale(le16(0), 16), unorm_scale(le16(2), 16), 1.0, 1.0],
+        D3DFMT_A16B16G16R16 => [
+            unorm_scale(le16(0), 16),
+            unorm_scale(le16(2), 16),
+            unorm_scale(le16(4), 16),
+            unorm_scale(le16(6), 16),
+        ],
+        D3DFMT_V8U8 => [snorm8(texel[0]), snorm8(texel[1]), 1.0, 1.0],
+        D3DFMT_Q8W8V8U8 => [
+            snorm8(texel[0]),
+            snorm8(texel[1]),
+            snorm8(texel[2]),
+            snorm8(texel[3]),
+        ],
+        D3DFMT_V16U16 => [snorm16(le16(0) as u16), snorm16(le16(2) as u16), 1.0, 1.0],
+        D3DFMT_Q16W16V16U16 => [
+            snorm16(le16(0) as u16),
+            snorm16(le16(2) as u16),
+            snorm16(le16(4) as u16),
+            snorm16(le16(6) as u16),
+        ],
+        D3DFMT_R16F => [half_at(texel, 0), 1.0, 1.0, 1.0],
+        D3DFMT_G16R16F => [half_at(texel, 0), half_at(texel, 2), 1.0, 1.0],
+        D3DFMT_A16B16G16R16F => [
+            half_at(texel, 0),
+            half_at(texel, 2),
+            half_at(texel, 4),
+            half_at(texel, 6),
+        ],
+        D3DFMT_R32F => [f32_at(texel, 0), 1.0, 1.0, 1.0],
+        D3DFMT_G32R32F => [f32_at(texel, 0), f32_at(texel, 4), 1.0, 1.0],
+        D3DFMT_A32B32G32R32F => [
+            f32_at(texel, 0),
+            f32_at(texel, 4),
+            f32_at(texel, 8),
+            f32_at(texel, 12),
+        ],
+        _ => return None,
+    })
+}
+
+fn quantize_unorm(value: f32, max: u32) -> u32 {
+    if value.is_nan() || value <= 0.0 {
+        return 0;
+    }
+    if value >= 1.0 {
+        return max;
+    }
+    (value * max as f32 + 0.5) as u32
+}
+
+fn quantize_snorm(value: f32, max: i32) -> i32 {
+    let scaled = (value.clamp(-1.0, 1.0) * max as f32).round();
+    scaled.clamp((-max - 1) as f32, max as f32) as i32
+}
+
+fn unorm_field(value: f32, bits: u32) -> u32 {
+    quantize_unorm(value, (1u32 << bits) - 1)
+}
+
+fn quantize_byte(value: f32) -> u8 {
+    quantize_unorm(value, 255) as u8
+}
+
+fn snorm_byte(value: f32) -> u8 {
+    quantize_snorm(value, 127) as i8 as u8
+}
+
+fn snorm_word(value: f32) -> u16 {
+    quantize_snorm(value, 32767) as i16 as u16
+}
+
+fn encode_color_texel(fmt: u32, [red, green, blue, alpha]: [f32; 4], out: &mut Vec<u8>) -> bool {
+    match fmt {
+        D3DFMT_R8G8B8 => out.extend_from_slice(&[
+            quantize_byte(blue),
+            quantize_byte(green),
+            quantize_byte(red),
+        ]),
+        D3DFMT_A8R8G8B8 => out.extend_from_slice(&[
+            quantize_byte(blue),
+            quantize_byte(green),
+            quantize_byte(red),
+            quantize_byte(alpha),
+        ]),
+        D3DFMT_X8R8G8B8 => out.extend_from_slice(&[
+            quantize_byte(blue),
+            quantize_byte(green),
+            quantize_byte(red),
+            0xFF,
+        ]),
+        D3DFMT_A8B8G8R8 => out.extend_from_slice(&[
+            quantize_byte(red),
+            quantize_byte(green),
+            quantize_byte(blue),
+            quantize_byte(alpha),
+        ]),
+        D3DFMT_X8B8G8R8 => out.extend_from_slice(&[
+            quantize_byte(red),
+            quantize_byte(green),
+            quantize_byte(blue),
+            0xFF,
+        ]),
+        D3DFMT_R5G6B5 => {
+            let value =
+                (unorm_field(red, 5) << 11) | (unorm_field(green, 6) << 5) | unorm_field(blue, 5);
+            out.extend_from_slice(&(value as u16).to_le_bytes());
+        }
+        D3DFMT_X1R5G5B5 | D3DFMT_A1R5G5B5 => {
+            let top = if fmt == D3DFMT_A1R5G5B5 {
+                unorm_field(alpha, 1)
+            } else {
+                1
+            };
+            let value = (top << 15)
+                | (unorm_field(red, 5) << 10)
+                | (unorm_field(green, 5) << 5)
+                | unorm_field(blue, 5);
+            out.extend_from_slice(&(value as u16).to_le_bytes());
+        }
+        D3DFMT_A4R4G4B4 | D3DFMT_X4R4G4B4 => {
+            let top = if fmt == D3DFMT_A4R4G4B4 {
+                unorm_field(alpha, 4)
+            } else {
+                0xF
+            };
+            let value = (top << 12)
+                | (unorm_field(red, 4) << 8)
+                | (unorm_field(green, 4) << 4)
+                | unorm_field(blue, 4);
+            out.extend_from_slice(&(value as u16).to_le_bytes());
+        }
+        D3DFMT_R3G3B2 => out.push(
+            ((unorm_field(red, 3) << 5) | (unorm_field(green, 3) << 2) | unorm_field(blue, 2))
+                as u8,
+        ),
+        D3DFMT_A8 => out.push(quantize_byte(alpha)),
+        D3DFMT_A8R3G3B2 => {
+            let value = ((quantize_byte(alpha) as u16) << 8)
+                | ((unorm_field(red, 3) << 5) | (unorm_field(green, 3) << 2) | unorm_field(blue, 2))
+                    as u16;
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        D3DFMT_L8 => out.push(quantize_byte(red)),
+        D3DFMT_A8L8 => out.extend_from_slice(&[quantize_byte(red), quantize_byte(alpha)]),
+        D3DFMT_A4L4 => out.push(((unorm_field(alpha, 4) << 4) | unorm_field(red, 4)) as u8),
+        D3DFMT_A2B10G10R10 => {
+            let value = unorm_field(red, 10)
+                | (unorm_field(green, 10) << 10)
+                | (unorm_field(blue, 10) << 20)
+                | (unorm_field(alpha, 2) << 30);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        D3DFMT_A2R10G10B10 => {
+            let value = unorm_field(blue, 10)
+                | (unorm_field(green, 10) << 10)
+                | (unorm_field(red, 10) << 20)
+                | (unorm_field(alpha, 2) << 30);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        D3DFMT_G16R16 => {
+            out.extend_from_slice(&(unorm_field(red, 16) as u16).to_le_bytes());
+            out.extend_from_slice(&(unorm_field(green, 16) as u16).to_le_bytes());
+        }
+        D3DFMT_A16B16G16R16 => {
+            out.extend_from_slice(&(unorm_field(red, 16) as u16).to_le_bytes());
+            out.extend_from_slice(&(unorm_field(green, 16) as u16).to_le_bytes());
+            out.extend_from_slice(&(unorm_field(blue, 16) as u16).to_le_bytes());
+            out.extend_from_slice(&(unorm_field(alpha, 16) as u16).to_le_bytes());
+        }
+        D3DFMT_V8U8 => out.extend_from_slice(&[snorm_byte(red), snorm_byte(green)]),
+        D3DFMT_Q8W8V8U8 => out.extend_from_slice(&[
+            snorm_byte(red),
+            snorm_byte(green),
+            snorm_byte(blue),
+            snorm_byte(alpha),
+        ]),
+        D3DFMT_V16U16 => {
+            out.extend_from_slice(&snorm_word(red).to_le_bytes());
+            out.extend_from_slice(&snorm_word(green).to_le_bytes());
+        }
+        D3DFMT_Q16W16V16U16 => {
+            out.extend_from_slice(&snorm_word(red).to_le_bytes());
+            out.extend_from_slice(&snorm_word(green).to_le_bytes());
+            out.extend_from_slice(&snorm_word(blue).to_le_bytes());
+            out.extend_from_slice(&snorm_word(alpha).to_le_bytes());
+        }
+        D3DFMT_R16F => out.extend_from_slice(&f16::from_f32(red).to_bits().to_le_bytes()),
+        D3DFMT_G16R16F => {
+            out.extend_from_slice(&f16::from_f32(red).to_bits().to_le_bytes());
+            out.extend_from_slice(&f16::from_f32(green).to_bits().to_le_bytes());
+        }
+        D3DFMT_A16B16G16R16F => {
+            for channel in [red, green, blue, alpha] {
+                out.extend_from_slice(&f16::from_f32(channel).to_bits().to_le_bytes());
+            }
+        }
+        D3DFMT_R32F => out.extend_from_slice(&red.to_le_bytes()),
+        D3DFMT_G32R32F => {
+            out.extend_from_slice(&red.to_le_bytes());
+            out.extend_from_slice(&green.to_le_bytes());
+        }
+        D3DFMT_A32B32G32R32F => {
+            for channel in [red, green, blue, alpha] {
+                out.extend_from_slice(&channel.to_le_bytes());
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+pub fn to_rgba_f32(
+    fmt: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    src: &[u8],
+) -> Result<Vec<[f32; 4]>, RenderError> {
+    let f = color_format(fmt)?;
+    let pixels = checked_pixel_count(width, height, depth)?;
+    let texel = f.bpp as usize;
+    let expected = pixels
+        .checked_mul(texel)
+        .ok_or_else(|| RenderError::invalid("TexelConversion", "source level size overflow"))?;
+    if src.len() < expected {
+        return Err(RenderError::invalid(
+            "TexelConversion",
+            format!(
+                "source level holds {} bytes but {pixels} texels of format {fmt} need {expected}",
+                src.len()
+            ),
+        ));
+    }
+    let mut out = fallible_pixels(pixels)?;
+    for texel_bytes in src[..expected].chunks_exact(texel) {
+        let Some(pixel) = decode_color_texel(fmt, texel_bytes) else {
+            return Err(RenderError::new(
+                "TexelConversion",
+                format!("format {fmt} has no float color decoder"),
+            ));
+        };
+        out.push(pixel);
+    }
+    Ok(out)
+}
+
+pub fn from_rgba_f32(
+    fmt: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    src: &[[f32; 4]],
+) -> Result<Vec<u8>, RenderError> {
+    let f = color_format(fmt)?;
+    let pixels = checked_pixel_count(width, height, depth)?;
+    if src.len() < pixels {
+        return Err(RenderError::invalid(
+            "TexelConversion",
+            format!(
+                "RGBA float source holds {} pixels but the level needs {pixels}",
+                src.len()
+            ),
+        ));
+    }
+    let capacity = pixels
+        .checked_mul(f.bpp as usize)
+        .ok_or_else(|| RenderError::invalid("TexelConversion", "packed level size overflow"))?;
+    let mut out = fallible_vec(capacity)?;
+    for pixel in &src[..pixels] {
+        if !encode_color_texel(fmt, *pixel, &mut out) {
+            return Err(RenderError::new(
+                "TexelConversion",
+                format!("format {fmt} has no packed color encoder"),
+            ));
+        }
+    }
+    Ok(out)
 }
 
 pub fn upload_bytes(

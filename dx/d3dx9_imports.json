@@ -16,7 +16,8 @@
     },
     {
       "name": "D3DXCreateCubeTextureFromFileExA",
-      "handler": "imports_unsupported"
+      "handler": "X_D3DXCreateCubeTextureFromFileExA",
+      "flag_on": "rust"
     },
     {
       "name": "D3DXCompileShaderFromFileA",
@@ -28,23 +29,28 @@
     },
     {
       "name": "D3DXGetImageInfoFromFileInMemory",
-      "handler": "imports_unsupported"
+      "handler": "X_D3DXGetImageInfoFromFileInMemory",
+      "flag_on": "rust"
     },
     {
       "name": "D3DXCreateTextureFromFileInMemory",
-      "handler": "imports_unsupported"
+      "handler": "X_D3DXCreateTextureFromFileInMemory",
+      "flag_on": "rust"
     },
     {
       "name": "D3DXCreateCubeTextureFromFileInMemory",
-      "handler": "imports_unsupported"
+      "handler": "X_D3DXCreateCubeTextureFromFileInMemory",
+      "flag_on": "rust"
     },
     {
       "name": "D3DXCreateVolumeTextureFromFileExA",
-      "handler": "imports_unsupported"
+      "handler": "X_D3DXCreateVolumeTextureFromFileExA",
+      "flag_on": "rust"
     },
     {
       "name": "D3DXCreateTextureFromFileExA",
-      "handler": "imports_unsupported"
+      "handler": "X_D3DXCreateTextureFromFileExA",
+      "flag_on": "rust"
     },
     {
       "name": "D3DXCreateEffectFromFileA",
@@ -84,19 +90,23 @@
     },
     {
       "name": "D3DXSaveSurfaceToFileA",
-      "handler": "imports_unsupported"
+      "handler": "X_D3DXSaveSurfaceToFileA",
+      "flag_on": "rust"
     },
     {
       "name": "D3DXLoadSurfaceFromSurface",
-      "handler": "imports_unsupported"
+      "handler": "X_D3DXLoadSurfaceFromSurface",
+      "flag_on": "rust"
     },
     {
       "name": "D3DXSaveTextureToFileA",
-      "handler": "imports_unsupported"
+      "handler": "X_D3DXSaveTextureToFileA",
+      "flag_on": "rust"
     },
     {
       "name": "D3DXCreateVolumeTextureFromFileInMemory",
-      "handler": "imports_unsupported"
+      "handler": "X_D3DXCreateVolumeTextureFromFileInMemory",
+      "flag_on": "rust"
     },
     {
       "name": "D3DXGetVertexShaderProfile",

@@ -137,6 +137,21 @@ struct D3d9HostDevice {
     recomp::d3d::D3d9FrameResult present() {
         return recomp::d3d::d3d9_present(*value);
     }
+
+    recomp::d3d::D3dxSurfaceReadResult d3dx_surface_read(D3d9HostResource &resource, uint32_t face,
+                                                         uint32_t level,
+                                                         const recomp::d3d::D3d9Rect &rect,
+                                                         bool rect_present, uint32_t color_key);
+    recomp::d3d::Status d3dx_surface_store(D3d9HostResource &resource, uint32_t face,
+                                           uint32_t level, const recomp::d3d::D3d9Rect &rect,
+                                           bool rect_present,
+                                           const recomp::d3d::D3dxSurfaceData &snapshot,
+                                           uint32_t filter);
+    recomp::d3d::D3dxBytesResult d3dx_save_surface(D3d9HostResource &resource, uint32_t face,
+                                                   uint32_t level,
+                                                   const recomp::d3d::D3d9Rect &rect,
+                                                   bool rect_present, uint32_t format);
+    recomp::d3d::D3dxBytesResult d3dx_save_texture(D3d9HostResource &resource, uint32_t format);
     recomp::d3d::D3d9SurfaceDescriptorResult backbuffer_descriptor() const {
         return recomp::d3d::d3d9_backbuffer_descriptor(*value);
     }
@@ -361,6 +376,12 @@ struct D3d9HostResource {
         return recomp::d3d::d3d9_create_texture(*device.value, *value, request);
     }
 
+    recomp::d3d::D3dxCreateResult create_d3dx_texture(const D3d9HostDevice &device,
+                                                      const recomp::d3d::D3dxCreateRequest &request,
+                                                      rust::Slice<const uint8_t> bytes) {
+        return recomp::d3d::d3d9_d3dx_create_texture(*device.value, *value, request, bytes);
+    }
+
     recomp::d3d::Status create_surface(const D3d9HostDevice &device,
                                        const recomp::d3d::D3d9SurfaceRequest &request) {
         return recomp::d3d::d3d9_create_surface(*device.value, *value, request);
@@ -527,6 +548,39 @@ inline recomp::d3d::Status D3d9HostDevice::get_render_target_data(uint32_t src,
                                                                   uint32_t dst_level) {
     return recomp::d3d::d3d9_get_render_target_data(*value, src, *destination.value, dst_face,
                                                     dst_level);
+}
+
+inline recomp::d3d::D3dxSurfaceReadResult
+D3d9HostDevice::d3dx_surface_read(D3d9HostResource &resource, uint32_t face, uint32_t level,
+                                  const recomp::d3d::D3d9Rect &rect, bool rect_present,
+                                  uint32_t color_key) {
+    return recomp::d3d::d3d9_d3dx_surface_read(*value, *resource.value, face, level, rect,
+                                               rect_present, color_key);
+}
+
+inline recomp::d3d::Status
+D3d9HostDevice::d3dx_surface_store(D3d9HostResource &resource, uint32_t face, uint32_t level,
+                                   const recomp::d3d::D3d9Rect &rect, bool rect_present,
+                                   const recomp::d3d::D3dxSurfaceData &snapshot, uint32_t filter) {
+    return recomp::d3d::d3d9_d3dx_surface_store(*value, *resource.value, face, level, rect,
+                                                rect_present, snapshot, filter);
+}
+
+inline recomp::d3d::D3dxBytesResult
+D3d9HostDevice::d3dx_save_surface(D3d9HostResource &resource, uint32_t face, uint32_t level,
+                                  const recomp::d3d::D3d9Rect &rect, bool rect_present,
+                                  uint32_t format) {
+    return recomp::d3d::d3d9_d3dx_save_surface(*value, *resource.value, face, level, rect,
+                                               rect_present, format);
+}
+
+inline recomp::d3d::D3dxBytesResult D3d9HostDevice::d3dx_save_texture(D3d9HostResource &resource,
+                                                                      uint32_t format) {
+    return recomp::d3d::d3d9_d3dx_save_texture(*value, *resource.value, format);
+}
+
+inline recomp::d3d::D3dxImageInfoResult d3dx_image_info(rust::Slice<const uint8_t> bytes) {
+    return recomp::d3d::d3d9_d3dx_image_info(bytes);
 }
 
 struct D3dHostStorage {

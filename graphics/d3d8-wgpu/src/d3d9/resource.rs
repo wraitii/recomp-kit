@@ -345,6 +345,62 @@ impl D3d9Resource {
         }
     }
 
+    pub fn texture_shape(&self) -> Option<(TextureKind, u32, u32, u32, u32, u32)> {
+        match self.state.as_ref()? {
+            ResourceState::Texture(t) => {
+                Some((t.kind, t.format, t.width, t.height, t.depth, t.levels))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn surface_shape(&self) -> Option<(u32, u32, u32, bool, u32)> {
+        match self.state.as_ref()? {
+            ResourceState::Surface(s) => {
+                Some((s.format, s.width, s.height, s.depth, s.multisample_type))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn subresource_layout(
+        &self,
+        face: u32,
+        level: u32,
+    ) -> Result<(u32, u32, u32, u32), RenderError> {
+        let l = self.level(face, level)?;
+        let format = match self.state.as_ref() {
+            Some(ResourceState::Texture(t)) => t.format,
+            Some(ResourceState::Surface(s)) => s.format,
+            _ => 0,
+        };
+        Ok((format, l.width, l.height, l.depth))
+    }
+
+    pub fn write_subresource(
+        &mut self,
+        face: u32,
+        level: u32,
+        bytes: &[u8],
+    ) -> Result<(), RenderError> {
+        let l = self.level_mut(face, level)?;
+        if l.lock_count.load(Ordering::Acquire) != 0 {
+            return Err(invalid("D3DX", "resource is locked"));
+        }
+        if bytes.len() != l.bytes.len() {
+            return Err(invalid(
+                "D3DX",
+                "decoded subresource size does not match the level",
+            ));
+        }
+        l.bytes.copy_from_slice(bytes);
+        l.generation = l.generation.wrapping_add(1);
+        let size = l.bytes.len() as u32;
+        l.mark_dirty(0, size);
+        l.gpu_newer.store(false, Ordering::Release);
+        Ok(())
+    }
+
     pub fn freshness(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.gpu_newer)
     }

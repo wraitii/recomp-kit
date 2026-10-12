@@ -34,6 +34,7 @@ pub struct RenderError {
 pub enum RenderErrorKind {
     Unsupported,
     InvalidArgument,
+    InvalidData,
     OutOfMemory,
 }
 
@@ -55,6 +56,13 @@ impl RenderError {
     pub fn out_of_memory(operation: &'static str, cause: impl Into<String>) -> Self {
         Self {
             kind: RenderErrorKind::OutOfMemory,
+            operation,
+            cause: cause.into(),
+        }
+    }
+    pub fn invalid_data(operation: &'static str, cause: impl Into<String>) -> Self {
+        Self {
+            kind: RenderErrorKind::InvalidData,
             operation,
             cause: cause.into(),
         }

@@ -479,7 +479,7 @@ proceed in parallel once M1 exists.
   APIs. Non-default cube/volume/depth/projected variants and numeric fidelity
   await later validation. Pi and supervisor review plus the final flag-on
   windowed build/signing passed; no app/GPU execution was performed.
-- [ ] **M6. Drawing.** Needs M2–M5. Done when: all draw calls, including
+- [-] **M6. Drawing.** Needs M2–M5. Done when: all draw calls, including
   user-pointer and indexed variants, render through fixed-function or
   translated shader stages from immutable state snapshots; clears, copies,
   readback, `Present` and event/occlusion queries work with correct `S_FALSE`
@@ -547,6 +547,55 @@ proceed in parallel once M1 exists.
   imports (file and memory loaders, image info, `D3DXLoadSurfaceFromSurface`,
   save to file) handle DDS/DXT, TGA, PNG, JPG and BMP into D1 formats, with
   mips, cube faces, volume slices, color keys and filtering.
+  **Implemented, compile unverified (focused correctness pass 2026-10-13).** All
+  10 Civ4 imports route through Rust-owned decode/validation/conversion/mip/filter/encode;
+  C++ stages guest/file data and publishes COM identities. Rust reads DDS headers
+  directly for numeric FOURCC (64/128-bit), `DDPF_BUMPDUDV` signed/bump masks and
+  header pitch padding, validates cube/volume layout, and writes manual DDS
+  headers for every D1 format on save. `decode_dds` selects deterministically
+  between a tight lower-mip layout and legacy per-row DWORD padding from the
+  parsed header pitch and exact data length; block data uses the tight block
+  layout and any other padding fails by name. `D3DXCreateTexture` reports the
+  original image through `pSrcInfo` and generates missing mips with the validated
+  mip-filter dither. `D3DXLoadSurfaceFromSurface` validates the filter up front,
+  preserves destination bytes outside the rectangle (per-row patches for
+  uncompressed, per-block patches for block-aligned DXT edges), applies ordered
+  dither to quantization, and fails by name for an unaligned DXT destination.
+  `D3DXSaveSurfaceToFile` DDS extracts uncompressed rows or aligned DXT blocks
+  exactly, including small/odd surface-edge extents, and recompresses only an
+  unaligned DXT crop. Malformed/truncated DDS/raster and codec decode failures
+  return `InvalidData`; unknown pixel/file formats and unsupported filters stay
+  named unsupported. Named deferrals: paletted formats and palette output,
+  MSAA/depth LoadSurface peers, non-DDS volume save (the legacy `SaveVolume`
+  delegate is not implemented; cube non-DDS saves the positiveX face at mip 0),
+  creation of L6V5U5/X8L8V8U8/A2W10V10U10/CxV8U8 (reported by `GetImageInfo`,
+  create fails by name), and other non-tight/non-DWORD row padding. Numeric fidelity (DXT
+  compressor, SNORM tie rounding, luminance-as-red, PIECEWISE sRGB vs native
+  D3DX, odd BOX leftovers) awaits approved runs. No build or execution yet.
+  M7 primary evidence: Microsoft
+  [D3DFORMAT](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dformat)
+  (little-endian channel order; missing channels read as 1, except `A8RGB000`),
+  [D3DXCreateTextureFromFileEx](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreatetexturefromfileex),
+  [D3DXCreateTextureFromFileInMemoryEx](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreatetexturefromfileinmemoryex),
+  [D3DXGetImageInfoFromFileInMemory](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxgetimageinfofromfileinmemory),
+  [D3DXLoadSurfaceFromSurface](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxloadsurfacefromsurface),
+  [D3DXSaveSurfaceToFile](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxsavesurfacetofile)
+  and
+  [D3DXSaveTextureToFile](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxsavetexturetofile)
+  (TGA/PPM excluded; pinned Wine 11.0
+  [`dlls/d3dx9_36/texture.c`](https://github.com/wine-mirror/wine/blob/db11d0fe6a169c457e23d007e20404643d067aa8/dlls/d3dx9_36/texture.c)
+  `D3DXSaveTextureToFileInMemory` selects the positiveX face at mip 0 for cubes
+  and ordinary 2D, and delegates volumes to `SaveVolume`),
+  [D3DX_DEFAULT](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dx-default),
+  [D3DX_FILTER](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dx-filter)
+  (TRIANGLE|DITHER default, BOX mip default),
+  [D3DX_SKIP_DDS_MIP_LEVELS](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dx-skip-dds-mip-levels)
+  and the pinned Wine 11.0 `d3dx9tex.h`/`d3dx9.h` (skip shift 26, bits 26-30);
+  D6; consumer `analysis/d3d9-resource-evidence.json`; Ghidra read-only
+  `0x9a94b0`, `0x9c5be0`, `0x9c5c70`, `0x9c5ce0`, `0x6ad6b0`, `0x6ad9d0`.
+  Files: `graphics/d3d8-wgpu/src/d3d9/d3dx.rs`, `d3dx/filter.rs`,
+  `d3d9/{format,resource}.rs`, `src/bridge.rs`, `dx/{d3dx9tex.h,d3d9.cpp,
+  d3d_bridge_helpers.h,d3dx9_imports.json}`, `tools/gen_d3dx9_imports.py`.
 - [ ] **M8. D3DX shader helpers and math.** Needs M5. Done when: constant
   tables, input semantics, shader version and vertex/pixel profile queries
   (matching M2's caps) work, and matrix helpers handle aliasing and singular

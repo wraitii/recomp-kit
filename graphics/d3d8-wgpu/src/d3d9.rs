@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 pub mod copy;
+pub mod d3dx;
 pub mod draw;
 pub mod format;
 pub mod gpu;
@@ -32,6 +33,8 @@ pub mod resource;
 pub mod shader;
 pub mod state;
 pub mod wgsl;
+
+pub use d3dx::*;
 
 static LIVE_DEVICES: AtomicUsize = AtomicUsize::new(0);
 
@@ -260,6 +263,7 @@ impl D3d9Device {
 fn bridge_error(error: RenderError) -> Status {
     let code = match error.kind {
         crate::RenderErrorKind::InvalidArgument => StatusCode::InvalidArgument,
+        crate::RenderErrorKind::InvalidData => StatusCode::InvalidData,
         crate::RenderErrorKind::OutOfMemory => StatusCode::OutOfMemory,
         crate::RenderErrorKind::Unsupported => StatusCode::Unsupported,
     };

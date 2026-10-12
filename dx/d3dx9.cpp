@@ -17,6 +17,7 @@
 // rendering actually asks for.
 #include "com.h"
 #include "dx.h"
+#include "d3dx9tex.h"
 #include "../runtime/guest.h"
 #include "../runtime/memory.h"
 

@@ -11,6 +11,7 @@
 #include "d3d9_constants.inc"
 #include "d3d_bridge_helpers.h"
 #include "../runtime/win32.h"
+#include "../platform/os.h"
 #include "../runtime/display_seam.h"
 #ifdef RECOMP_D3D9_WGPU
 constexpr bool kD3d9WgpuEnabled = true;
@@ -46,6 +47,8 @@ static uint32_t bridge_result(X86 *c, const recomp::d3d::Status &status) {
         imports_unsupported(c);
     if (status.code == recomp::d3d::StatusCode::InvalidArgument)
         return D3DERR_INVALIDCALL;
+    if (status.code == recomp::d3d::StatusCode::InvalidData)
+        return MAKE_D3DHRESULT(2905);
     if (status.code == recomp::d3d::StatusCode::OutOfMemory)
         return E_OUTOFMEMORY;
     if (status.code == recomp::d3d::StatusCode::WasStillDrawing)
@@ -1909,6 +1912,407 @@ static void create_surface_wgpu(X86 *c, uint32_t out_index, uint32_t usage) {
         return;
     }
     com_out_ptr(out, view);
+    com_ret(c, D3D_OK9);
+}
+
+static bool d3dx_srcinfo_ok(uint32_t addr) {
+    return addr == 0 || gm_valid(addr, 28);
+}
+
+static bool d3dx_palette_ok(uint32_t addr) {
+    return addr == 0 || gm_valid(addr, 1024);
+}
+
+static bool d3dx_read_file(const std::string &path, std::vector<uint8_t> &bytes) {
+    if (path.empty())
+        return false;
+    int fd = os_fd_open(path.c_str(), OS_O_RDONLY);
+    if (fd < 0)
+        return false;
+    OsStat st{};
+    if (os_fd_stat(fd, &st) != 0 || !st.is_regular || !st.size || st.size > INT32_MAX) {
+        os_fd_close(fd);
+        return false;
+    }
+    bytes.resize((size_t)st.size);
+    size_t got = 0;
+    while (got < bytes.size()) {
+        int64_t n = os_fd_read(fd, bytes.data() + got, bytes.size() - got);
+        if (n <= 0)
+            break;
+        got += (size_t)n;
+    }
+    os_fd_close(fd);
+    return got == bytes.size();
+}
+
+static bool d3dx_write_file(const std::string &path, const uint8_t *data, size_t size) {
+    if (path.empty())
+        return false;
+    int fd = os_fd_open(path.c_str(), OS_O_WRONLY | OS_O_CREAT | OS_O_TRUNC);
+    if (fd < 0)
+        return false;
+    size_t put = 0;
+    while (put < size) {
+        int64_t n = os_fd_write(fd, data + put, size - put);
+        if (n <= 0)
+            break;
+        put += (size_t)n;
+    }
+    os_fd_close(fd);
+    return put == size;
+}
+
+static void d3dx_write_info(uint32_t addr, const recomp::d3d::D3dxImageInfo &info) {
+    if (!addr || !gm_valid(addr, 28))
+        return;
+    wr32(addr + 0, info.width);
+    wr32(addr + 4, info.height);
+    wr32(addr + 8, info.depth);
+    wr32(addr + 12, info.mip_levels);
+    wr32(addr + 16, info.format);
+    wr32(addr + 20, info.resource_type);
+    wr32(addr + 24, info.image_file_format);
+}
+
+static ComKind d3dx_com_kind(recomp::d3d::D3d9TextureKind kind) {
+    switch (kind) {
+    case recomp::d3d::D3d9TextureKind::Cube:
+        return K_D3D9CUBETEXTURE;
+    case recomp::d3d::D3d9TextureKind::Volume:
+        return K_D3D9VOLUMETEXTURE;
+    default:
+        return K_D3D9TEXTURE;
+    }
+}
+
+static ComIface d3dx_iface(recomp::d3d::D3d9TextureKind kind) {
+    switch (kind) {
+    case recomp::d3d::D3d9TextureKind::Cube:
+        return IF_D3DCUBETEXTURE9;
+    case recomp::d3d::D3d9TextureKind::Volume:
+        return IF_D3DVOLUMETEXTURE9;
+    default:
+        return IF_D3DTEXTURE9;
+    }
+}
+
+static void d3dx_finish_create(X86 *c, ComObj *dev,
+                               const std::shared_ptr<D3d9HostResource> &resource,
+                               const recomp::d3d::D3dxCreateResult &result,
+                               recomp::d3d::D3d9TextureKind kind, uint32_t out_addr,
+                               uint32_t srcinfo_addr) {
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    d3dx_write_info(srcinfo_addr, result.info);
+    ComObj *tex = com_new(d3dx_com_kind(kind));
+    if (!tex) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    tex->d3d9_resource = resource;
+    tex->dev_d3d = dev->id;
+    com_retain_internal(dev);
+    tex->d3d9_owner_retained = true;
+    d3d9_register_wgpu_resource(dev, tex);
+    uint32_t view = com_view(tex, d3dx_iface(kind));
+    if (!view) {
+        com_release(tex);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    com_out_ptr(out_addr, view);
+    com_ret(c, D3D_OK9);
+}
+
+static void d3dx_create_from_file_ex(X86 *c, recomp::d3d::D3d9TextureKind kind) {
+    ComObj *dev = this_device9(c);
+    uint32_t file_addr = arg(c, 1);
+    recomp::d3d::D3dxCreateRequest request{};
+    request.kind = kind;
+    uint32_t out_addr = 0, srcinfo_addr = 0, palette_addr = 0;
+    switch (kind) {
+    case recomp::d3d::D3d9TextureKind::Texture2D:
+        request.width = arg(c, 2);
+        request.height = arg(c, 3);
+        request.levels = arg(c, 4);
+        request.usage = arg(c, 5);
+        request.format = arg(c, 6);
+        request.pool = arg(c, 7);
+        request.filter = arg(c, 8);
+        request.mip_filter = arg(c, 9);
+        request.color_key = arg(c, 10);
+        srcinfo_addr = arg(c, 11);
+        palette_addr = arg(c, 12);
+        out_addr = arg(c, 13);
+        request.depth = 1;
+        break;
+    case recomp::d3d::D3d9TextureKind::Cube:
+        request.width = request.height = arg(c, 2);
+        request.levels = arg(c, 3);
+        request.usage = arg(c, 4);
+        request.format = arg(c, 5);
+        request.pool = arg(c, 6);
+        request.filter = arg(c, 7);
+        request.mip_filter = arg(c, 8);
+        request.color_key = arg(c, 9);
+        srcinfo_addr = arg(c, 10);
+        palette_addr = arg(c, 11);
+        out_addr = arg(c, 12);
+        request.depth = 1;
+        break;
+    case recomp::d3d::D3d9TextureKind::Volume:
+        request.width = arg(c, 2);
+        request.height = arg(c, 3);
+        request.depth = arg(c, 4);
+        request.levels = arg(c, 5);
+        request.usage = arg(c, 6);
+        request.format = arg(c, 7);
+        request.pool = arg(c, 8);
+        request.filter = arg(c, 9);
+        request.mip_filter = arg(c, 10);
+        request.color_key = arg(c, 11);
+        srcinfo_addr = arg(c, 12);
+        palette_addr = arg(c, 13);
+        out_addr = arg(c, 14);
+        break;
+    default:
+        break;
+    }
+    if (!dev || !dev->d3d9_device || !out_addr || !gm_valid(out_addr, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (!d3dx_srcinfo_ok(srcinfo_addr) || !d3dx_palette_ok(palette_addr)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (palette_addr) {
+        imports_unsupported(c);
+        return;
+    }
+    com_out_ptr(out_addr, 0);
+    if (!file_addr || !gm_valid(file_addr, 1)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    std::string path = win32_host_path_op(gm_str(file_addr, 1024), WIN32_FILE_READ);
+    std::vector<uint8_t> bytes;
+    if (!d3dx_read_file(path, bytes)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    auto resource = std::make_shared<D3d9HostResource>();
+    recomp::d3d::D3dxCreateResult result = resource->create_d3dx_texture(
+        *dev->d3d9_device, request, rust::Slice<const uint8_t>(bytes.data(), bytes.size()));
+    d3dx_finish_create(c, dev, resource, result, kind, out_addr, srcinfo_addr);
+}
+
+static void d3dx_create_from_memory(X86 *c, recomp::d3d::D3d9TextureKind kind) {
+    ComObj *dev = this_device9(c);
+    uint32_t data_addr = arg(c, 1), size = arg(c, 2), out_addr = arg(c, 3);
+    if (!dev || !dev->d3d9_device || !out_addr || !gm_valid(out_addr, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    com_out_ptr(out_addr, 0);
+    if (!data_addr || !size || !gm_valid(data_addr, size)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3dxCreateRequest request{};
+    request.kind = kind;
+    request.width = 0xFFFFFFFFu;
+    request.height = 0xFFFFFFFFu;
+    request.depth = 0xFFFFFFFFu;
+    request.levels = 0xFFFFFFFFu;
+    request.usage = 0;
+    request.format = 0;
+    request.pool = 1;
+    request.filter = 0xFFFFFFFFu;
+    request.mip_filter = 0xFFFFFFFFu;
+    request.color_key = 0;
+    auto resource = std::make_shared<D3d9HostResource>();
+    recomp::d3d::D3dxCreateResult result = resource->create_d3dx_texture(
+        *dev->d3d9_device, request,
+        rust::Slice<const uint8_t>((const uint8_t *)gm_ptr(data_addr), size));
+    d3dx_finish_create(c, dev, resource, result, kind, out_addr, 0);
+}
+
+void X_D3DXGetImageInfoFromFileInMemory(X86 *c) {
+    uint32_t data_addr = arg(c, 0), size = arg(c, 1), info_addr = arg(c, 2);
+    if (!data_addr || !size || !gm_valid(data_addr, size) || !d3dx_srcinfo_ok(info_addr)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3dxImageInfoResult result =
+        d3dx_image_info(rust::Slice<const uint8_t>((const uint8_t *)gm_ptr(data_addr), size));
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    d3dx_write_info(info_addr, result.info);
+    com_ret(c, D3D_OK9);
+}
+
+void X_D3DXCreateTextureFromFileExA(X86 *c) {
+    d3dx_create_from_file_ex(c, recomp::d3d::D3d9TextureKind::Texture2D);
+}
+void X_D3DXCreateCubeTextureFromFileExA(X86 *c) {
+    d3dx_create_from_file_ex(c, recomp::d3d::D3d9TextureKind::Cube);
+}
+void X_D3DXCreateVolumeTextureFromFileExA(X86 *c) {
+    d3dx_create_from_file_ex(c, recomp::d3d::D3d9TextureKind::Volume);
+}
+void X_D3DXCreateTextureFromFileInMemory(X86 *c) {
+    d3dx_create_from_memory(c, recomp::d3d::D3d9TextureKind::Texture2D);
+}
+void X_D3DXCreateCubeTextureFromFileInMemory(X86 *c) {
+    d3dx_create_from_memory(c, recomp::d3d::D3d9TextureKind::Cube);
+}
+void X_D3DXCreateVolumeTextureFromFileInMemory(X86 *c) {
+    d3dx_create_from_memory(c, recomp::d3d::D3d9TextureKind::Volume);
+}
+
+static bool d3dx_rect(uint32_t addr, recomp::d3d::D3d9Rect &rect, bool &present) {
+    present = false;
+    rect.left = rect.top = rect.right = rect.bottom = 0;
+    if (!addr)
+        return true;
+    if (!gm_valid(addr, 16))
+        return false;
+    present = true;
+    rect.left = (int32_t)rd32(addr + 0);
+    rect.top = (int32_t)rd32(addr + 4);
+    rect.right = (int32_t)rd32(addr + 8);
+    rect.bottom = (int32_t)rd32(addr + 12);
+    return true;
+}
+
+static ComObj *d3dx_device_of(ComObj *node) {
+    if (!node)
+        return nullptr;
+    ComObj *dev = com_get(node->dev_d3d);
+    if (!dev || !dev->d3d9_device)
+        return nullptr;
+    return dev;
+}
+
+void X_D3DXLoadSurfaceFromSurface(X86 *c) {
+    ComObj *dst = com_this(arg(c, 0));
+    ComObj *src = com_this(arg(c, 3));
+    if (!dst || !src || dst->kind != K_D3D9SURFACE || src->kind != K_D3D9SURFACE) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (!d3dx_palette_ok(arg(c, 1)) || !d3dx_palette_ok(arg(c, 4))) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3d9Rect drect{}, srect{};
+    bool dpresent = false, spresent = false;
+    if (!d3dx_rect(arg(c, 2), drect, dpresent) || !d3dx_rect(arg(c, 5), srect, spresent)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t df = 0, dl = 0, sf = 0, sl = 0;
+    bool dv = false, sv = false;
+    ComObj *downer = level_owner(dst, &df, &dl, &dv);
+    ComObj *sowner = level_owner(src, &sf, &sl, &sv);
+    ComObj *dev = d3dx_device_of(downer);
+    if (!downer || !sowner || !downer->d3d9_resource || !sowner->d3d9_resource || !dev) {
+        imports_unsupported(c);
+        return;
+    }
+    if (downer->dev_d3d != sowner->dev_d3d || dv || sv) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t filter = arg(c, 6), color_key = arg(c, 7);
+    recomp::d3d::D3dxSurfaceReadResult read = dev->d3d9_device->d3dx_surface_read(
+        *sowner->d3d9_resource, sf, sl, srect, spresent, color_key);
+    if (read.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, read.status));
+        return;
+    }
+    recomp::d3d::Status status = dev->d3d9_device->d3dx_surface_store(
+        *downer->d3d9_resource, df, dl, drect, dpresent, *read.snapshot, filter);
+    com_ret(c, bridge_result(c, status));
+}
+
+void X_D3DXSaveSurfaceToFileA(X86 *c) {
+    uint32_t file_addr = arg(c, 0), format = arg(c, 1);
+    ComObj *src = com_this(arg(c, 2));
+    if (!src || src->kind != K_D3D9SURFACE) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (!d3dx_palette_ok(arg(c, 3))) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3d9Rect rect{};
+    bool present = false;
+    if (!d3dx_rect(arg(c, 4), rect, present)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t face = 0, level = 0;
+    bool volume = false;
+    ComObj *owner = level_owner(src, &face, &level, &volume);
+    ComObj *dev = d3dx_device_of(owner);
+    if (!owner || !owner->d3d9_resource || !dev || !file_addr || !gm_valid(file_addr, 1) ||
+        volume) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3dxBytesResult result = dev->d3d9_device->d3dx_save_surface(
+        *owner->d3d9_resource, face, level, rect, present, format);
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    std::string path = win32_host_path_op(gm_str(file_addr, 1024), WIN32_FILE_WRITE);
+    if (!d3dx_write_file(path, result.bytes.data(), result.bytes.size())) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    com_ret(c, D3D_OK9);
+}
+
+void X_D3DXSaveTextureToFileA(X86 *c) {
+    uint32_t file_addr = arg(c, 0), format = arg(c, 1);
+    ComObj *src = com_this(arg(c, 2));
+    if (!src || (src->kind != K_D3D9TEXTURE && src->kind != K_D3D9CUBETEXTURE &&
+                 src->kind != K_D3D9VOLUMETEXTURE)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (!d3dx_palette_ok(arg(c, 3))) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t face = 0, level = 0;
+    bool volume = false;
+    ComObj *owner = level_owner(src, &face, &level, &volume);
+    ComObj *dev = d3dx_device_of(owner);
+    if (!owner || !owner->d3d9_resource || !dev || !file_addr || !gm_valid(file_addr, 1)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3dxBytesResult result =
+        dev->d3d9_device->d3dx_save_texture(*owner->d3d9_resource, format);
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    std::string path = win32_host_path_op(gm_str(file_addr, 1024), WIN32_FILE_WRITE);
+    if (!d3dx_write_file(path, result.bytes.data(), result.bytes.size())) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
     com_ret(c, D3D_OK9);
 }
 
