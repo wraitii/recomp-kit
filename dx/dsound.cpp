@@ -1975,6 +1975,27 @@ const ComMethod g_dsnotify[] = {
 // ===========================================================================
 // IDirectSound
 // ===========================================================================
+ComObj *new_primary_buffer(uint32_t rate, uint32_t bits, uint32_t channels, uint32_t flags) {
+    ComObj *b = com_new(K_DSBUFFER);
+    b->buf_flags = flags;
+    b->is_3d = (flags & DSBCAPS_CTRL3D) != 0;
+    b->is_primary_buffer = true;
+    b->rate = rate;
+    b->bits = bits;
+    b->nchannels = channels;
+    b->block_align = (uint16_t)(channels * (bits / 8));
+    return b;
+}
+
+ComObj *new_dsound_object(ComIface iface) {
+    ComObj *ds = com_new(K_DSOUND);
+    if (!com_view(ds, iface)) {
+        com_release(ds);
+        return nullptr;
+    }
+    return ds;
+}
+
 void DS_CreateSoundBuffer(X86 *c) {
     ComObj *ds = this_dsound(c);
     uint32_t desc = arg(c, 1), out = arg(c, 2), outer = arg(c, 3);
@@ -2015,16 +2036,14 @@ void DS_CreateSoundBuffer(X86 *c) {
         }
     }
 
-    ComObj *b = com_new(K_DSBUFFER);
-    b->buf_flags = flags;
-    b->is_3d = (flags & DSBCAPS_CTRL3D) != 0;
-    b->is_primary_buffer = primary;
-    if (primary) {
-        b->rate = 22050;
-        b->nchannels = 2;
-        b->bits = 16;
-        b->block_align = 4;
-    } else {
+    ComObj *b = primary ? new_primary_buffer(22050, 16, 2, flags) : com_new(K_DSBUFFER);
+    if (!b) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    if (!primary) {
+        b->buf_flags = flags;
+        b->is_3d = (flags & DSBCAPS_CTRL3D) != 0;
         read_wave_format(b, wfx);
         b->buf_bytes = bytes;
         b->buf_pixels = heap_alloc(bytes, true, 16);
@@ -2219,13 +2238,12 @@ static void create_dsound_device(X86 *c, ComIface iface) {
         com_ret(c, DSERR_NODRIVER);
         return;
     }
-    ComObj *ds = com_new(K_DSOUND);
-    uint32_t view = com_view(ds, iface);
-    if (!view) {
-        com_release(ds);
+    ComObj *ds = new_dsound_object(iface);
+    if (!ds) {
         com_ret(c, E_OUTOFMEMORY);
         return;
     }
+    uint32_t view = com_view(ds, iface);
     wr32(out, view);
     LOGV("dsound: create -> %08x", view);
     com_ret(c, DS_OK);
@@ -2382,6 +2400,14 @@ void dsbuffer_destroy(ComObj *b) {
 }
 
 } // namespace
+
+ComObj *dsound_new_device() {
+    return new_dsound_object(IF_DSOUND);
+}
+
+ComObj *dsound_new_primary_buffer(uint32_t rate, uint32_t bits, uint32_t channels, uint32_t flags) {
+    return new_primary_buffer(rate, bits, channels, flags);
+}
 
 void dsound_reset() {
     // The sample blocks lived in the arena mem_init discarded, so the

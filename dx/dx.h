@@ -157,6 +157,8 @@ void dx_dump(FILE *out);
 // including each other.
 // ---------------------------------------------------------------------------
 struct ComObj;
+ComObj *dsound_new_device();
+ComObj *dsound_new_primary_buffer(uint32_t rate, uint32_t bits, uint32_t channels, uint32_t flags);
 // The IDirect3D(2) object belonging to a DirectDraw object, created on demand.
 ComObj *d3d_for_ddraw(ComObj *dd);
 // Presents the primary surface through host_present. Called on Flip, on

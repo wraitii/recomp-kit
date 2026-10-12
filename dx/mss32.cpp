@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 #include <iterator>
 #include <map>
@@ -44,10 +45,37 @@ int32_t miles_pan_mb(float p) {
 struct Driver {
     uint32_t rate = 22050, bits = 16, channels = 2;
     int master = 127;
+    ComObj *ds_object = nullptr;
+    ComObj *primary_buffer = nullptr;
+    uint32_t reverb[3]{};
+    uint32_t reverb_dry = 0x3f800000, reverb_wet = 0;
+    uint32_t room_type = 0;
 };
 std::map<uint32_t, Driver> g_drivers;
 uint32_t g_next_driver = 0x10000;
 int32_t g_preferences[64]{};
+uint32_t g_malloc_cb = 0, g_free_cb = 0;
+
+void driver_apply_mix(uint32_t driver);
+
+float bits_to_float(uint32_t bits) {
+    float v;
+    memcpy(&v, &bits, 4);
+    return v;
+}
+
+int driver_volume(uint32_t driver, float volume) {
+    auto it = g_drivers.find(driver);
+    if (it == g_drivers.end())
+        return miles_volume_mb(volume);
+    if (bits_to_float(it->second.reverb_wet) != 0.0f) {
+        LOGW("mss32: wet reverb DSP is unsupported for driver %08x", driver);
+        abort();
+    }
+    return std::clamp(miles_volume_mb(it->second.master) +
+                          miles_volume_mb(volume * bits_to_float(it->second.reverb_dry)),
+                      -10000, 0);
+}
 
 struct Sample {
     uint32_t handle = 0, driver = 0;
@@ -174,15 +202,7 @@ int32_t sample3d_pan_mb(const Sample &s) {
 }
 
 int sample_volume(const Sample &s) {
-    auto it = g_drivers.find(s.driver);
-    int master = miles_volume_mb(it == g_drivers.end() ? 127 : it->second.master);
-    if (s.is_3d) {
-        float gain = s.volume01 * sample3d_distance_gain(s);
-        if (gain <= 0.0f)
-            return -10000;
-        return std::clamp(master + miles_volume_mb(gain), -10000, 0);
-    }
-    return miles_volume_mb(s.volume01) + master;
+    return driver_volume(s.driver, s.volume01 * (s.is_3d ? sample3d_distance_gain(s) : 1.0f));
 }
 
 // Push a sample's current volume and pan to its host channel. A playing 3D
@@ -232,6 +252,60 @@ bool sample_update(Sample &s) {
     return true;
 }
 
+void ail_default_malloc(X86 *c) {
+    uint32_t block = heap_alloc(arg(c, 0) + 32);
+    if (!block) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t aligned = (block + 32) & ~31u;
+    wr32(aligned - 4, block);
+    set_eax(c, aligned);
+}
+
+void ail_default_free(X86 *c) {
+    uint32_t ptr = arg(c, 0), block = rd32(ptr - 4);
+    wr32(ptr - 4, 0);
+    heap_free(block);
+}
+
+uint32_t ail_malloc_callback() {
+    return g_malloc_cb
+               ? g_malloc_cb
+               : imports_alloc_trampoline("mss32.dll", "MilesDefaultMalloc", ail_default_malloc, 1);
+}
+
+uint32_t ail_free_callback() {
+    return g_free_cb
+               ? g_free_cb
+               : imports_alloc_trampoline("mss32.dll", "MilesDefaultFree", ail_default_free, 1);
+}
+
+void ail_mem_use_malloc(X86 *c) {
+    uint32_t previous = ail_malloc_callback();
+    g_malloc_cb = arg(c, 0);
+    set_eax(c, previous);
+}
+
+void ail_mem_use_free(X86 *c) {
+    uint32_t previous = ail_free_callback();
+    g_free_cb = arg(c, 0);
+    set_eax(c, previous);
+}
+
+uint32_t ail_alloc(X86 *c, uint32_t bytes) {
+    return guest_call(c, ail_malloc_callback(), bytes);
+}
+
+void ail_free(X86 *c, uint32_t ptr) {
+    if (ptr)
+        guest_call(c, ail_free_callback(), ptr);
+}
+
+void ail_mem_alloc_lock(X86 *c) {
+    set_eax(c, ail_alloc(c, arg(c, 0)));
+}
+
 // Use CreateFileA's read resolver, including overlays, drive mapping and
 // case folding. Both NULL (ordinary Miles allocation) and FILE_READ_WITH_SIZE
 // request a guest allocation here; the returned image begins with file bytes.
@@ -251,11 +325,12 @@ void ail_file_read(X86 *c) {
     uint32_t bytes = (uint32_t)st.size, dest = arg(c, 1);
     bool allocate = dest == 0 || dest == 0xffffffffu;
     if (allocate)
-        dest = heap_alloc(bytes);
+        dest = ail_alloc(c, bytes);
     if (!dest || !gm_valid(dest, bytes)) {
         if (allocate && dest)
-            heap_free(dest);
+            ail_free(c, dest);
         os_fd_close(fd);
+        set_eax(c, 0);
         return;
     }
     uint32_t got = 0;
@@ -268,14 +343,15 @@ void ail_file_read(X86 *c) {
     os_fd_close(fd);
     if (got != bytes) {
         if (allocate)
-            heap_free(dest);
+            ail_free(c, dest);
+        set_eax(c, 0);
         return;
     }
     set_eax(c, dest);
 }
 
 void ail_mem_free_lock(X86 *c) {
-    heap_free(arg(c, 0));
+    ail_free(c, arg(c, 0));
     set_eax(c, 0);
 }
 
@@ -420,6 +496,15 @@ void ail_wav_info(X86 *c) {
     }
 }
 
+void driver_release(Driver &d) {
+    if (d.primary_buffer)
+        com_release_internal(d.primary_buffer);
+    if (d.ds_object)
+        com_release_internal(d.ds_object);
+    d.primary_buffer = nullptr;
+    d.ds_object = nullptr;
+}
+
 // A successful waveOutOpen must populate HDIGDRIVER, not just return zero.
 void ail_wave_open(X86 *c) {
     uint32_t out = arg(c, 0), fmt = arg(c, 3);
@@ -431,7 +516,12 @@ void ail_wave_open(X86 *c) {
         (rd16(fmt + 2) != 1 && rd16(fmt + 2) != 2) || (rd16(fmt + 14) != 8 && rd16(fmt + 14) != 16))
         return;
     uint32_t id = g_next_driver++;
-    g_drivers[id] = {rd32(fmt + 4), rd16(fmt + 14), rd16(fmt + 2), 127};
+    Driver &d = g_drivers[id];
+    d.rate = rd32(fmt + 4);
+    d.bits = rd16(fmt + 14);
+    d.channels = rd16(fmt + 2);
+    d.master = 127;
+    g_last_digital_driver = id;
     wr32(out, id);
     if (arg(c, 1) && gm_valid(arg(c, 1), 4))
         wr32(arg(c, 1), id);
@@ -444,27 +534,149 @@ void ail_wave_open(X86 *c) {
 // selects Miles' default; the shim records the requested shape so
 // digital_configuration and sample volume answer consistently.
 void ail_open_digital_driver(X86 *c) {
-    uint32_t rate = arg(c, 0), bits = arg(c, 1), channels = arg(c, 2);
+    uint32_t rate = arg(c, 0), bits = arg(c, 1), channels = arg(c, 2), flags = arg(c, 3);
+    if (channels > 2) {
+        LOGW("mss32: AIL_open_digital_driver channels=%u needs the unsupported multi-channel path",
+             channels);
+        set_eax(c, 0);
+        return;
+    }
+    if (flags) {
+        LOGW("mss32: AIL_open_digital_driver flags=%08x are not supported", flags);
+        set_eax(c, 0);
+        return;
+    }
     if (!rate)
         rate = 22050;
-    if (bits != 8 && bits != 16)
+    if (bits != 8)
         bits = 16;
-    if (channels != 1 && channels != 2)
+    if (channels != 1)
         channels = 2;
+    ComObj *ds = dsound_new_device();
+    if (!ds) {
+        LOGW("mss32: AIL_open_digital_driver could not create a DirectSound device");
+        set_eax(c, 0);
+        return;
+    }
+    com_internalize(ds);
+    ComObj *primary = dsound_new_primary_buffer(rate, bits, channels, DSBCAPS_PRIMARYBUFFER);
+    if (!primary) {
+        com_release_internal(ds);
+        LOGW("mss32: AIL_open_digital_driver could not create a primary buffer");
+        set_eax(c, 0);
+        return;
+    }
+    com_internalize(primary);
+    if (!com_view(primary, IF_DSBUFFER)) {
+        LOGW("mss32: AIL_open_digital_driver could not create a primary buffer view");
+        com_release_internal(primary);
+        com_release_internal(ds);
+        set_eax(c, 0);
+        return;
+    }
     uint32_t id = g_next_driver++;
-    g_drivers[id] = {rate, bits, channels, 127};
+    Driver &d = g_drivers[id];
+    d.rate = rate;
+    d.bits = bits;
+    d.channels = channels;
+    d.master = 127;
+    d.ds_object = ds;
+    d.primary_buffer = primary;
     g_last_digital_driver = id;
     LOGV("mss32: opened digital driver %08x (%u Hz, %u-bit, %u ch)", id, rate, bits, channels);
     set_eax(c, id);
 }
 
+void ail_set_digital_master_reverb(X86 *c) {
+    uint32_t handle = arg(c, 0);
+    if (handle) {
+        auto it = g_drivers.find(handle);
+        if (it == g_drivers.end()) {
+            imports_unsupported(c);
+            return;
+        }
+        for (int i = 0; i < 3; ++i)
+            it->second.reverb[i] = arg(c, i + 1);
+    }
+    set_eax(c, 0);
+}
+
+void ail_digital_master_reverb(X86 *c) {
+    uint32_t handle = arg(c, 0);
+    if (handle) {
+        auto it = g_drivers.find(handle);
+        if (it == g_drivers.end()) {
+            imports_unsupported(c);
+            return;
+        }
+        for (int i = 0; i < 3; ++i) {
+            uint32_t out = arg(c, i + 1);
+            if (out)
+                wr32(out, it->second.reverb[i]);
+        }
+    }
+    set_eax(c, 0);
+}
+
+void ail_get_dsound_info(X86 *c) {
+    uint32_t handle = arg(c, 0), out_ds = arg(c, 1), out_primary = arg(c, 2);
+    Driver *default_driver = nullptr, *driver = nullptr;
+    auto def = g_drivers.find(g_last_digital_driver);
+    if (def != g_drivers.end())
+        default_driver = &def->second;
+    if (handle) {
+        auto it = g_drivers.find(handle);
+        if (it == g_drivers.end()) {
+            LOGW("mss32: AIL_get_DirectSound_info asked for unknown driver %08x", handle);
+            set_eax(c, 0);
+            return;
+        }
+        driver = &it->second;
+    } else {
+        driver = default_driver;
+    }
+    if (!driver) {
+        set_eax(c, 1);
+        return;
+    }
+    Driver *primary_driver = handle ? default_driver : driver;
+    if (out_primary && !primary_driver) {
+        LOGW("mss32: AIL_get_DirectSound_info has no default driver for the primary buffer");
+        set_eax(c, 0);
+        return;
+    }
+    if (out_ds && !gm_valid(out_ds, 4)) {
+        LOGW("mss32: AIL_get_DirectSound_info DirectSound output %08x is not guest memory", out_ds);
+        set_eax(c, 0);
+        return;
+    }
+    if (out_primary && !gm_valid(out_primary, 4)) {
+        LOGW("mss32: AIL_get_DirectSound_info primary output %08x is not guest memory",
+             out_primary);
+        set_eax(c, 0);
+        return;
+    }
+    if (out_ds)
+        wr32(out_ds, driver->ds_object ? com_view(driver->ds_object, IF_DSOUND) : 0);
+    if (out_primary)
+        wr32(out_primary, com_view(primary_driver->primary_buffer, IF_DSBUFFER));
+    set_eax(c, 1);
+}
+
 void ail_wave_close(X86 *c) {
+    uint32_t id = arg(c, 0);
     for (auto &s : g_samples)
-        if (s.alive && s.driver == arg(c, 0)) {
+        if (s.alive && s.driver == id) {
             sample_reset(s);
             s.alive = false;
         }
-    g_drivers.erase(arg(c, 0));
+    auto it = g_drivers.find(id);
+    if (it != g_drivers.end()) {
+        driver_release(it->second);
+        g_drivers.erase(it);
+    }
+    if (g_last_digital_driver == id)
+        g_last_digital_driver = 0;
     set_eax(c, 0);
 }
 void ail_configuration(X86 *c) {
@@ -483,9 +695,7 @@ void ail_master_volume(X86 *c) {
     auto it = g_drivers.find(arg(c, 0));
     if (it != g_drivers.end())
         it->second.master = std::clamp((int32_t)arg(c, 1), 0, 127);
-    for (auto &s : g_samples)
-        if (s.alive && s.channel >= 0 && s.driver == arg(c, 0))
-            host_audio_set_volume(s.channel, std::max(-10000, sample_volume(s)));
+    driver_apply_mix(arg(c, 0));
     set_eax(c, 0);
 }
 void ail_preference(X86 *c) {
@@ -584,12 +794,6 @@ void ail_sample_loop_count(X86 *c) {
     set_eax(c, s ? s->loops : 0);
 }
 
-float bits_to_float(uint32_t bits) {
-    float v;
-    memcpy(&v, &bits, 4);
-    return v;
-}
-
 uint32_t float_to_bits(float v) {
     uint32_t bits;
     memcpy(&bits, &v, 4);
@@ -649,6 +853,7 @@ void ail_register_eos_callback(X86 *c) {
 // submission. A refused chunk remains pending until a later frame accepts it.
 struct Stream {
     bool alive = false, playing = false;
+    uint32_t driver = 0;
     // A paused stream is one the host voice has been stopped for. The host has
     // no pause of its own, so resuming restarts the stream; a title that pauses
     // to close does not care, and one that pauses for focus will hear the track
@@ -662,6 +867,106 @@ struct Stream {
     size_t pending_pos = 0;
 };
 std::vector<Stream> g_streams(64);
+
+void driver_apply_mix(uint32_t driver) {
+    for (auto &s : g_samples)
+        if (s.alive && s.driver == driver)
+            sample_apply_mix(s);
+    for (auto &s : g_streams)
+        if (s.alive && s.driver == driver && s.channel >= 0)
+            host_audio_set_volume(s.channel, driver_volume(s.driver, s.volume / 127.0f));
+}
+
+void ail_set_digital_master_reverb_levels(X86 *c) {
+    uint32_t handle = arg(c, 0);
+    if (handle) {
+        auto it = g_drivers.find(handle);
+        float dry = bits_to_float(arg(c, 1)), wet = bits_to_float(arg(c, 2));
+        if (it == g_drivers.end() || !(dry >= 0.0f && dry <= 1.0f) ||
+            !(wet >= 0.0f && wet <= 1.0f)) {
+            LOGW(
+                "mss32: AIL_set_digital_master_reverb_levels unsupported driver=%08x dry=%g wet=%g",
+                handle, dry, wet);
+            imports_unsupported(c);
+            return;
+        }
+        it->second.reverb_dry = arg(c, 1);
+        it->second.reverb_wet = arg(c, 2);
+        driver_apply_mix(handle);
+    }
+    set_eax(c, 1);
+}
+
+void ail_digital_master_reverb_levels(X86 *c) {
+    uint32_t handle = arg(c, 0);
+    if (handle) {
+        auto it = g_drivers.find(handle);
+        if (it == g_drivers.end()) {
+            imports_unsupported(c);
+            return;
+        }
+        if (arg(c, 1))
+            wr32(arg(c, 1), it->second.reverb_dry);
+        if (arg(c, 2))
+            wr32(arg(c, 2), it->second.reverb_wet);
+    }
+    set_eax(c, 1);
+}
+
+void ail_set_room_type(X86 *c) {
+    static const uint32_t presets[][4] = {
+        {0x00000000, 0x3fbf1aa0, 0x3f000000, 0x3c343958},
+        {0x3e800000, 0x3dcccccd, 0x3dcccccd, 0x3b03126f},
+        {0x3ed58106, 0x3ecccccd, 0x3f2a7efa, 0x3b449ba6},
+        {0x3f400000, 0x3fbfdf3b, 0x3e29fbe7, 0x3c343958},
+        {0x3e54fdf4, 0x3ef4bc6a, 0x3dcccccd, 0x3b83126f},
+        {0x3e99999a, 0x4013c6a8, 0x3f2e147b, 0x3c8b4396},
+        {0x3ece5604, 0x4088ed91, 0x3f000000, 0x3cf5c28f},
+        {0x3f000000, 0x407d8106, 0x3f000000, 0x3ced9168},
+        {0x3f000000, 0x4038b439, 0x3fa6e979, 0x3cb43958},
+        {0x3eb8d4fe, 0x40e91687, 0x3ea9fbe7, 0x3cf5c28f},
+        {0x3f000000, 0x41200000, 0x3e99999a, 0x3cf5c28f},
+        {0x3e1cac08, 0x3e849ba6, 0x3f0ccccd, 0x3cf5c28f},
+        {0x3eb8d4fe, 0x3fbf1aa0, 0x3f000000, 0x3c343958},
+        {0x3ee353f8, 0x402c9ba6, 0x3f2353f8, 0x3ca3d70a},
+        {0x3e800000, 0x3fe04189, 0x3f46a7f0, 0x3c343958},
+        {0x3de353f8, 0x404947ae, 0x3ef1a9fc, 0x3db43958},
+        {0x3de353f8, 0x40311687, 0x3e656042, 0x3c343958},
+        {0x3e4ccccd, 0x3f4ccccd, 0x3e4ccccd, 0x3e99999a},
+        {0x3f0ccccd, 0x40400000, 0x3f0ccccd, 0x3d3020c5},
+        {0x3df5c28f, 0x3f4ccccd, 0x3e3851ec, 0x3dcccccd},
+        {0x3e54fdf4, 0x3fd374bc, 0x3fc00000, 0x3c449ba6},
+        {0x3f26e979, 0x4038b439, 0x3e800000, 0x3cac0831},
+        {0x3f800000, 0x3fbfdf3b, 0x3dcccccd, 0x3c343958},
+        {0x3f600000, 0x410645a2, 0x3fb1a9fc, 0x3c343958},
+        {0x3e0e5604, 0x41200000, 0x3fc00000, 0x3c343958},
+        {0x3ef8d4fe, 0x40f20419, 0x40200000, 0x3c343958},
+    };
+    auto it = g_drivers.find(arg(c, 0));
+    uint32_t room = arg(c, 1);
+    if (it == g_drivers.end() || room >= std::size(presets)) {
+        imports_unsupported(c);
+        return;
+    }
+    Driver &d = it->second;
+    d.room_type = room;
+    d.reverb_dry = 0x3f800000;
+    d.reverb_wet = presets[room][0];
+    d.reverb[0] = presets[room][1];
+    d.reverb[1] = presets[room][3];
+    d.reverb[2] = presets[room][2];
+    driver_apply_mix(arg(c, 0));
+    set_eax(c, 1);
+}
+
+void ail_room_type(X86 *c) {
+    auto it = g_drivers.find(arg(c, 0));
+    if (it == g_drivers.end()) {
+        imports_unsupported(c);
+        return;
+    }
+    set_eax(c, it->second.room_type);
+}
 
 Stream *stream_for(uint32_t handle) {
     if (!handle || handle > g_streams.size())
@@ -717,6 +1022,7 @@ void ail_open_stream(X86 *c) {
             return;
         }
         s.alive = true;
+        s.driver = arg(c, 0);
         LOGV("mss32: open_stream(%s): %s, %u Hz, %u channel(s)", guest.c_str(), path.c_str(),
              s.source.rate(), s.source.channels());
         set_eax(c, i + 1);
@@ -774,7 +1080,7 @@ void stream_start(Stream &s) {
         p.sample_rate = (int32_t)s.source.rate();
         p.channels = (int32_t)s.source.channels();
         p.bits = 16;
-        p.volume = miles_volume_mb(s.volume);
+        p.volume = driver_volume(s.driver, s.volume / 127.0f);
         host_audio_play(&p);
         s.submitted = p.bytes;
         s.pending.clear();
@@ -814,7 +1120,7 @@ void ail_stream_status(X86 *c) {
 void ail_set_stream_volume(X86 *c) {
     if (Stream *s = stream_for(arg(c, 0))) {
         s->volume = std::clamp((int32_t)arg(c, 1), 0, 127);
-        host_audio_set_volume(s->channel, miles_volume_mb(s->volume));
+        host_audio_set_volume(s->channel, driver_volume(s->driver, s->volume / 127.0f));
     }
     set_eax(c, 0);
 }
@@ -856,7 +1162,7 @@ void ail_set_stream_volume_levels(X86 *c) {
         float l = std::clamp(bits_to_float(arg(c, 1)), 0.0f, 1.0f);
         float r = std::clamp(bits_to_float(arg(c, 2)), 0.0f, 1.0f);
         s->volume = std::clamp((int)std::lround(std::max(l, r) * 127.0f), 0, 127);
-        host_audio_set_volume(s->channel, miles_volume_mb(s->volume));
+        host_audio_set_volume(s->channel, driver_volume(s->driver, s->volume / 127.0f));
     }
     set_eax(c, 0);
 }
@@ -891,7 +1197,8 @@ void ail_enumerate_3D_providers(X86 *c) {
     // enumerations, so the names live in guest memory, not host string
     // literals, and stay put for the run.
     if (!g_provider_names3d) {
-        uint32_t block = heap_alloc(128, false, 16);
+        uint32_t block = ail_alloc(c, 128);
+        set_eax(c, 0);
         if (!block)
             return;
         g_provider_names3d = block;
@@ -1167,7 +1474,11 @@ void ail_close_digital_driver(X86 *c) {
             sample_reset(s);
             s.alive = false;
         }
-    g_drivers.erase(id);
+    auto it = g_drivers.find(id);
+    if (it != g_drivers.end()) {
+        driver_release(it->second);
+        g_drivers.erase(it);
+    }
     if (g_last_digital_driver == id)
         g_last_digital_driver = 0;
     set_eax(c, 0);
@@ -1279,6 +1590,7 @@ const ImportShim g_mss32_shims[] = {
     AIL(set_digital_master_volume, 8, ail_master_volume),
     AIL(set_named_sample_file, 20, ail_set_named_sample_file),
     AIL(mem_free_lock, 4, ail_mem_free_lock),
+    AIL(mem_alloc_lock, 4, ail_mem_alloc_lock),
     AIL(file_read, 8, ail_file_read),
     AIL(WAV_info, 8, ail_wav_info),
     AIL(allocate_sample_handle, 4, ail_allocate_sample_handle),
@@ -1342,10 +1654,10 @@ const ImportShim g_mss32_shims[] = {
     AIL(set_3D_orientation, 28, ail_set_3D_orientation),
     AIL(register_3D_EOS_callback, 8, ail_register_3D_eos_callback),
     AIL(3D_update_position, 8, ret0),
-    AIL(mem_use_malloc, 4, imports_unsupported),
-    AIL(mem_use_free, 4, imports_unsupported),
+    AIL(mem_use_malloc, 4, ail_mem_use_malloc),
+    AIL(mem_use_free, 4, ail_mem_use_free),
     AIL(close_digital_driver, 4, ail_close_digital_driver),
-    AIL(get_DirectSound_info, 12, imports_unsupported),
+    AIL(get_DirectSound_info, 12, ail_get_dsound_info),
     AIL(sample_ms_position, 12, imports_unsupported),
     AIL(sample_playback_rate, 4, ail_sample_playback_rate),
     AIL(sample_position, 4, imports_unsupported),
@@ -1354,11 +1666,14 @@ const ImportShim g_mss32_shims[] = {
     AIL(service_stream, 8, ail_service_stream),
     AIL(set_3D_doppler_factor, 8, imports_unsupported),
     AIL(set_3D_rolloff_factor, 8, ail_set_3D_rolloff_factor),
-    AIL(set_digital_master_reverb, 16, imports_unsupported),
-    AIL(set_digital_master_reverb_levels, 12, imports_unsupported),
+    AIL(set_digital_master_reverb, 16, ail_set_digital_master_reverb),
+    AIL(digital_master_reverb, 16, ail_digital_master_reverb),
+    AIL(set_digital_master_reverb_levels, 12, ail_set_digital_master_reverb_levels),
+    AIL(digital_master_reverb_levels, 12, ail_digital_master_reverb_levels),
     AIL(set_listener_3D_orientation, 28, ail_set_listener_3D_orientation),
     AIL(set_listener_3D_position, 16, ail_set_listener_3D_position),
-    AIL(set_room_type, 8, imports_unsupported),
+    AIL(set_room_type, 8, ail_set_room_type),
+    AIL(room_type, 4, ail_room_type),
     AIL(set_sample_3D_cone, 16, imports_unsupported),
     AIL(set_sample_3D_distances, 16, ail_set_sample_3D_distances),
     AIL(set_sample_3D_orientation, 28, imports_unsupported),
@@ -1424,6 +1739,7 @@ void mss32_reset() {
     g_streams.assign(g_streams.size(), Stream{});
     g_ail_timers.assign(g_ail_timers.size(), AilTimer{});
     g_drivers.clear();
+    g_malloc_cb = g_free_cb = 0;
     g_last_digital_driver = 0;
     g_provider_names3d = 0;
     g_listener_pos3d[0] = g_listener_pos3d[1] = g_listener_pos3d[2] = 0.0f;
