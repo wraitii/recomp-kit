@@ -8,6 +8,7 @@ import pickle
 from tempfile import NamedTemporaryFile
 
 from frontend import function_ir, external_exits, table_jumps
+from .lift import LiftError
 from .normalize import codegen_ir
 
 
@@ -61,6 +62,9 @@ class ArtifactStore:
             (self.root / ("counts-%d.json" % os.getpid())).write_text(json.dumps(self.counts))
 
     def lifted(self, tr, lifter, fn):
+        for ins in fn.insns:
+            if ins.decode is None:
+                raise LiftError("%08x: instruction decode evidence missing" % ins.addr)
         key = ("frontend-v1", lifter.language, fn.addr,
                tuple((ins.addr, ins.mnem, ins.decode.source_bytes) for ins in fn.insns),
                tuple(tuple(tr.successors(fn, i)) for i in range(len(fn.insns))),
