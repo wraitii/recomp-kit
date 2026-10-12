@@ -21,10 +21,9 @@ def cc_action_lines(action):
 
 
 class Printer:
-    def __init__(self, transport, fields, ref, mask, *, defer_returns=False):
+    def __init__(self, transport, fields, ref, mask):
         self.plan = transport.boundaries
         self.fields, self.ref, self.mask = fields, ref, mask
-        self.defer_returns = defer_returns
 
     def value(self, value):
         if value.whole is not None:
@@ -33,10 +32,6 @@ class Printer:
         return " | ".join("(%s << %d)" % (self.ref(v), n * 8) if v is not None
                           else "(%s & 0x%xu)" % (field, 255 << (n * 8))
                           for n, v in enumerate(value.lanes))
-
-    def publication_field(self, field, diagnostic):
-        target = self.fields[field]
-        return "(*(volatile uint32_t *)&%s)" % target if diagnostic and field in ("ESP", "EBP", "EIP") else target
 
     def operations(self, operations):
         lines = []
@@ -50,9 +45,9 @@ class Printer:
             previous = operation
         return lines
 
-    def operation(self, operation, *, diagnostic=False):
+    def operation(self, operation):
         if isinstance(operation, Publish):
-            lines = ["%s = (uint32_t)(%s);" % (self.publication_field(v.field, diagnostic), self.value(v))
+            lines = ["%s = (uint32_t)(%s);" % (self.fields[v.field], self.value(v))
                      for v in operation.values]
             if operation.flags is not None:
                 record, mask = operation.flags.record, operation.flags.mask
@@ -93,17 +88,13 @@ class Printer:
                     % (operation.result.id, settle, self.fields[operation.field], operation.lane * 8,
                        self.mask(operation.result.size), kept)]
         if isinstance(operation, Return):
-            if self.defer_returns:
-                result = {"none": "0", "always": "1",
-                          "checked": "!checked_return_ || RECOMP_UNLIKELY(c->eip != expected_return_)"}
-                return ["return %s;" % result[operation.dispatch]]
             dispatch = {"none": [], "always": ["recomp_return_fast_(c);"],
                         "checked": ["if (!checked_return_ || RECOMP_UNLIKELY(c->eip != expected_return_)) recomp_return_fast_(c);"]}
             return [*dispatch[operation.dispatch], "return;"]
         raise ValueError("unknown C boundary operation %s" % type(operation).__name__)
 
     def publication(self, event):
-        return self.operation(self.plan.publications[event.id], diagnostic=self.defer_returns)
+        return self.operation(self.plan.publications[event.id])
 
     def event(self, event):
         return self.operations(self.plan.events[event.id])
