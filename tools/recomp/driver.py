@@ -554,7 +554,7 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
     dependencies = {addr: results[addr].dependencies for addr in addrs}
     os.makedirs(args.out, exist_ok=True)
     output.write_funcs_header(args.out, entry_names)
-    output.emit_body_chunks(args.out, functions, bodies, entries_by_fn, dependencies)
+    output.emit_body_chunks(args.out, functions, bodies, entries_by_fn, dependencies, known_modes)
     output.emit_entry_chunks(args.out, entry_names, settings.module, checked_returns, private_masks)
     symbols = symbol_rows(ctx, entry_names, rows)
     if settings.module:
@@ -593,7 +593,7 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
         fh.write("\n")
     if args.emission_cache:
         emission_cache.save(args.emission_cache, settings, args.out, plans, private_plans,
-                            analysis, functions, entries_by_fn, results, contract_report)
+                            analysis, functions, entries_by_fn, results, contract_report, known_modes)
     phase("write")
 
     emitted = sum(1 for a in addrs if results[a].reason is None)
@@ -652,7 +652,8 @@ def translate_selected(args, settings, ctx, log, started):
     functions = state['functions']
     bodies = {addr: result.lines for addr, result in results.items()}
     dependencies = {addr: result.dependencies for addr, result in results.items()}
-    paths = output.emit_body_chunks(args.out, functions, bodies, state['entries_by_fn'], dependencies)
+    paths = output.emit_body_chunks(args.out, functions, bodies, state['entries_by_fn'], dependencies,
+                                    state['known_modes'])
     written = {Path(path).name for path in paths}
     for path in Path(args.out).glob('chunk_*.c'):
         if not path.name.startswith('chunk_entries_') and path.name not in written:

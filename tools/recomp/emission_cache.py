@@ -66,7 +66,8 @@ def load(root, settings, out):
     return state
 
 
-def save(root, settings, out, plans, private_plans, analysis, functions, entries_by_fn, results, report):
+def save(root, settings, out, plans, private_plans, analysis, functions, entries_by_fn, results, report,
+         known_modes):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     for plan in plans.values():
@@ -82,7 +83,7 @@ def save(root, settings, out, plans, private_plans, analysis, functions, entries
              'private_plans': [replace(plan, body=Path(plan.body.name) if plan.body is not None else None)
                                for plan in private_plans],
              'analysis': analysis, 'functions': functions, 'entries_by_fn': entries_by_fn,
-             'results': results, 'report': report, 'history': []}
+             'results': results, 'report': report, 'known_modes': frozenset(known_modes), 'history': []}
     write_index(root, state)
 
 

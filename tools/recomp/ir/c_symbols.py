@@ -64,7 +64,9 @@ def entry_arguments(variant, expected):
 
 def declaration(record):
     if record.kind == "private_prepare":
-        return "int %s(X86 *c, int mode_proven);" % symbol("entry_contract_prepare", record.target)
+        addr = record.target
+        return ("void fn_%08x(X86 *c);\n"
+                "extern void (*const entry_contract_base_%08x)(X86 *);") % (addr, addr)
     if record.kind == "private_contract":
         variant = BodyVariant(EntryForm.PRIVATE, ReturnForm.PRIVATE)
         name = symbol("entry_contract", record.target, record.mask)
