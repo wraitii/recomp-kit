@@ -220,14 +220,16 @@ class Image(PE):
         try:
             record = ci if isinstance(ci, self._DecodeRecord) else self.decode_record(
                 ci, source_bytes=source_bytes, address=address, mnem_override=mnem_override)
+            ops = [self._op_text(record, op) for op in record.operands]
         except TranslateError as error:
             if not getattr(self, "allow_unmodelled", False):
                 raise
             addr = ci.address if address is None else address
+            mnemonic = ci.raw_mnemonic if isinstance(ci, self._DecodeRecord) else ci.mnemonic
+            operands = "" if isinstance(ci, self._DecodeRecord) else ci.op_str
             return Insn(addr, "UNMODELLED", None, [],
-                        "%08x  %s %s: %s" % (addr, ci.mnemonic.upper(), ci.op_str, error))
+                        "%08x  %s %s: %s" % (addr, mnemonic.upper(), operands, error))
         mnem, rep = record.opcode, record.rep
-        ops = [self._op_text(record, op) for op in record.operands]
         if rep or mnem in STRING_MNEM:
             ops = []            # implicit ES:EDI / ESI operands carry nothing
         text = "%08x  %s%s%s" % (record.address, mnem, "." + rep if rep else "",

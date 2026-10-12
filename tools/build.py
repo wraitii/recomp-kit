@@ -435,7 +435,8 @@ def build_diff_harness(build_root, out):
     os_obj = out.with_name("os_posix.o")
     subprocess.check_call(cc + ["-x", "c++", "-std=c++17", "-O1", "-fno-exceptions", "-fPIC",
                                 "-I", str(ROOT), "-c", str(sources[2]), "-o", str(os_obj)])
-    whole = (["-dynamiclib", "-Wl,-force_load," + str(archive)] if darwin else
+    whole = (["-dynamiclib", "-Wl,-force_load," + str(archive), "-lc++",
+               "-framework", "CoreFoundation", "-framework", "CoreServices"] if darwin else
              ["-shared", "-Wl,--whole-archive", str(archive), "-Wl,--no-whole-archive", "-lm"])
     subprocess.check_call(cc + ["-O1", "-ffp-contract=off", "-std=c11", "-w", "-fPIC",
                                 "-I", str(gen), "-I", str(ROOT), "-I", str(ROOT / "runtime"),
@@ -579,7 +580,7 @@ def main():
         return
     cfg = game_config.load(args.game_dir, args.build_root)
     if args.regen_function:
-        args.regenerate = True
+        args.regenerate = "all"
         if cfg["aux_modules"]:
             parser.error("selected regeneration currently requires an image without auxiliary modules")
     if args.regenerate and not cfg["developer_exe_path"].is_file():

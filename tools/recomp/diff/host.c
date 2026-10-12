@@ -53,6 +53,10 @@ jmp_buf *recomp_seh_frame_enter(X86 *c) {
     (void)c;
     return &seh_landing;
 }
+jmp_buf *recomp_seh_frame_adopt(X86 *c) {
+    harness_escape("seh", c->r[R_ESP]);
+    return NULL;
+}
 void recomp_seh_frame_leave(X86 *c) {
     (void)c;
 }
