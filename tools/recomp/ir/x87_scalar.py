@@ -93,6 +93,7 @@ class SlotShape:
     const: tuple = ()                       # sorted (part, literal) agreements
     dirty: frozenset = frozenset()
     quiet: bool = False
+    pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -149,6 +150,7 @@ def merge_shapes(shapes):
             continue
         narrow = len(entries) == len(known) and all(e.narrow for e in entries)
         quiet = len(entries) == len(known) and all(e.quiet for e in entries)
+        pending = len(entries) == len(known) and all(e.pending for e in entries)
         const = []
         for part in sorted(parts):
             literals = set()
@@ -161,7 +163,7 @@ def merge_shapes(shapes):
                 literals.add(agreement[part])
             if ok and len(literals) == 1:
                 const.append((part, literals.pop()))
-        merged.append((p, SlotShape(parts, narrow, tuple(const), dirty, quiet)))
+        merged.append((p, SlotShape(parts, narrow, tuple(const), dirty, quiet, pending)))
     positions = [p for p, _ in merged]
     # An inactive predecessor activates at the edge with everything published
     # at its current TOP, i.e. relative base/low/high of zero.
@@ -363,7 +365,8 @@ class X87Scalar:
                 continue
             const = tuple((part, getattr(slot, part)) for part in sorted(parts)
                           if getattr(slot, part) in CARRY_LITERALS)
-            slots.append((position, SlotShape(parts, slot.narrow, const, dirty, slot.quiet)))
+            slots.append((position, SlotShape(parts, slot.narrow, const, dirty, slot.quiet,
+                                              slot.pending)))
         slots.sort()
         return CarryShape(True, tuple(slots), self.base - self.position,
                           self.low - self.position, self.high - self.position,
@@ -378,7 +381,8 @@ class X87Scalar:
         self.base, self.low, self.high = shape.base, shape.low, shape.high
         self.top_unknown, self.status_dirty = shape.top_unknown, shape.status_dirty
         for position, slot_shape in shape.slots:
-            slot = Slot(narrow=slot_shape.narrow, dirty=set(slot_shape.dirty), quiet=slot_shape.quiet)
+            slot = Slot(narrow=slot_shape.narrow, dirty=set(slot_shape.dirty),
+                        quiet=slot_shape.quiet, pending=slot_shape.pending)
             agreements = dict(slot_shape.const)
             for part in slot_shape.parts:
                 value = agreements.get(part)
@@ -544,9 +548,12 @@ class X87Scalar:
             b = {part: self._read(other, part, operations) for part in a}
             a_slot, b_slot = self._slot(0)[1], self._slot(other)[1]
             a_narrow, b_narrow = a_slot.narrow, b_slot.narrow
+            a_quiet, b_quiet = a_slot.quiet, b_slot.quiet
             a_pending, b_pending = a_slot.pending, b_slot.pending
-            self._assign(0, narrow=b_narrow, pending=b_pending if self.lazy_nan else None, **b)
-            self._assign(other, narrow=a_narrow, pending=a_pending if self.lazy_nan else None, **a)
+            self._assign(0, narrow=b_narrow, quiet=b_quiet,
+                         pending=b_pending if self.lazy_nan else None, **b)
+            self._assign(other, narrow=a_narrow, quiet=a_quiet,
+                         pending=a_pending if self.lazy_nan else None, **a)
         elif r.action == 'status':
             if self.lazy_nan:
                 self._fold_all(operations)

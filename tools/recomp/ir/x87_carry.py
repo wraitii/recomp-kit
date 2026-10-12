@@ -10,7 +10,7 @@ the planned shape, so the analysis and the emitter cannot drift silently.
 """
 from collections import deque
 
-from .operations import X87_RESET_OPS
+from .operations import TERMINATORS, X87_RESET_OPS
 from .ssa import SSAError
 from .x87_scalar import INACTIVE, UNSAFE, merge_shapes
 from .x87_transition import external, Type
@@ -18,8 +18,7 @@ from .x87_transition import external, Type
 RESET_OPS = X87_RESET_OPS
 
 
-def _transfer(block, entry, scalar_factory, binary32):
-    """Replay one block's x87 effects and return its exit shape."""
+def _transfer(block, entry, scalar_factory, binary32, fold_pending):
     scalar = scalar_factory()
     scalar.seed(entry if entry is not UNSAFE else INACTIVE)
     for value in block.ops:
@@ -29,7 +28,8 @@ def _transfer(block, entry, scalar_factory, binary32):
                          external(value, Type.U16) if value.size else None)
         elif value.opc in RESET_OPS:
             scalar.reset()
-    scalar.fold_pending([])
+    if fold_pending:
+        scalar.fold_pending([])
     return scalar.snapshot()
 
 
@@ -88,36 +88,41 @@ def analyze(s, fir, scalar_factory, binary32):
             raise SSAError("x87 carry analysis did not converge")
         i = work.popleft()
         queued.discard(i)
-        # A window overflow is absorbing: predecessor shapes only grow, so a
-        # block that fell back to reset can never become carryable again.
         if entry[i] is UNSAFE:
-            if i in resets and i not in exit_shape:
-                exit_shape[i] = _transfer(s.blocks[i], UNSAFE, scalar_factory, binary32)
-                for j in sorted(set(fir.succ[i])):
-                    if j not in queued:
-                        queued.add(j)
-                        work.append(j)
-            continue
-        shapes = []
-        for p in sorted(predecessors[i]):
-            if p == -1:
-                shapes.append(INACTIVE)
-            elif p in exit_shape:
-                shapes.append(exit_shape[p])
-        if not shapes:
-            # No predecessor has produced an exit shape yet; a later
-            # predecessor update re-enqueues this block.
-            continue
-        merged = merge_shapes(shapes)
-        if merged is None:
-            continue
+            merged = UNSAFE
+        else:
+            shapes = []
+            for p in sorted(predecessors[i]):
+                if p == -1:
+                    shapes.append(INACTIVE)
+                elif p in exit_shape:
+                    shapes.append(exit_shape[p])
+            if not shapes:
+                # No predecessor has produced an exit shape yet; a later
+                # predecessor update re-enqueues this block.
+                continue
+            if len(shapes) > 1 and any(
+                    slot.pending for shape in shapes if shape.active
+                    for _, slot in shape.slots):
+                raise SSAError("deferred x87 NaN reached a carried join B%d" % i)
+            merged = merge_shapes(shapes)
+            if merged is None:
+                continue
         if merged == entry[i] and i in exit_shape:
             continue
         entry[i] = merged
-        result = _transfer(s.blocks[i], merged, scalar_factory, binary32)
+        targets = sorted(set(fir.succ[i]))
+        if not targets:
+            continue
+        # Pending NaNs survive only an uncut linear fallthrough.
+        linear = (len(targets) == 1 and targets[0] == i + 1
+                  and predecessors[targets[0]] == {i}
+                  and not any(op.opc in TERMINATORS for op in s.blocks[i].ops))
+        result = _transfer(s.blocks[i], merged, scalar_factory, binary32,
+                           fold_pending=not linear)
         if exit_shape.get(i) != result:
             exit_shape[i] = result
-            for j in sorted(set(fir.succ[i])):
+            for j in targets:
                 if j not in queued:
                     queued.add(j)
                     work.append(j)
