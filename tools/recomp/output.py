@@ -66,7 +66,7 @@ def partition_chunks(functions, bodies, budget=CHUNK_SOURCE_BUDGET):
     return sorted(result)
 
 
-def emit_body_chunks(out, functions, bodies, entries_by_fn, dependencies):
+def emit_body_chunks(out, functions, bodies, entries_by_fn, dependencies, known_modes=()):
     """Emit local call declarations: no global census, indices or overrides."""
     Path(out, "body.h").write_text(BODY_HEADER)
     paths = []
@@ -96,6 +96,7 @@ def emit_body_chunks(out, functions, bodies, entries_by_fn, dependencies):
                 fh.write(declaration(Declaration("checked", addr)) + "\n")
             for addr in prepare:
                 fh.write(declaration(Declaration("private_prepare", addr)) + "\n")
+                fh.write(emit_contract_prepare(addr, addr in known_modes))
             for addr, mask in private:
                 fh.write(declaration(Declaration("private_contract", addr, mask)) + "\n")
             fh.write("\n")
@@ -199,15 +200,19 @@ def emit_entry_dispatch():
 def emit_contract_prepare(addr, known_mode=False):
     mode_guard = "        (!mode_proven && (c->fpu_cw & 0x0f00u) != 0u) ||\n" if known_mode else ""
     return """
-int entry_contract_prepare_%08x(X86 *c, int mode_proven)
+static inline int entry_contract_prepare_%08x(X86 *c, int mode_proven)
 {
-    if (recomp_hooks_ever || recomp_profile_enabled || recomp_frame_watch ||
-%s        c->checkpoint_countdown == 0u || FN(%08x) != fn_%08x)
+    if (RECOMP_UNLIKELY(recomp_hooks_ever || recomp_profile_enabled || recomp_frame_watch ||
+%s        c->checkpoint_countdown == 0u || entry_contract_base_%08x != fn_%08x))
         return 0;
     --c->checkpoint_countdown;
     return 1;
 }
 """ % (addr, mode_guard, addr, addr)
+
+
+def emit_contract_base(addr):
+    return "void (*const entry_contract_base_%08x)(X86 *) = FN(%08x);\n" % (addr, addr)
 
 
 def write_funcs_header(out, entry_names):
@@ -275,7 +280,7 @@ def write_table(out, entry_names, functions, call_returns, private_masks=None, k
         fh.write(emit_entry_dispatch())
         known_modes = set(known_modes or ())
         for addr in sorted(private_masks or ()):
-            fh.write(emit_contract_prepare(addr, addr in known_modes))
+            fh.write(emit_contract_base(addr))
         # O(1) call-return lookup: a bitset over the addresses' span, built
         # once at translation time. The binary search this replaces ran on
         # every guest RET (7.4% self in a windowed profile); the bitset is

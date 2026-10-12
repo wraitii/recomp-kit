@@ -9446,9 +9446,9 @@ static void test_bink_open_from_handle() {
         uint32_t width = rd32(rec), height = rd32(rec + 4);
         CHECK(width >= 16 && width <= 4096);
         CHECK(height >= 16 && height <= 4096);
-        CHECK(rd32(rec + 0x10) > 0);
-        CHECK_EQ(rd32(rec + 0x14), 1u);
-        printf("bink container test: %ux%u, %u frames\n", width, height, rd32(rec + 0x10));
+        CHECK(rd32(rec + 8) > 0);
+        CHECK(rd32(rec + 0x14) > 0 && rd32(rec + 0x18) > 0);
+        printf("bink container test: %ux%u, %u frames\n", width, height, rd32(rec + 8));
         if (width >= 16 && width <= 4096 && height >= 16 && height <= 4096) {
             uint32_t pitch = width * 2, bytes = pitch * height;
             uint32_t dest = heap_alloc(bytes, true, 16);
@@ -9462,7 +9462,7 @@ static void test_bink_open_from_handle() {
                     call_shim(tramp("binkw32.dll", "_BinkDoFrame@4"), {rec});
                     ++decoded_frames;
                     call_shim(tramp("binkw32.dll", "_BinkNextFrame@4"), {rec});
-                    CHECK_EQ(rd32(rec + 0x14), decoded_frames + 1);
+                    CHECK_EQ(rd32(rec + 0x0c), decoded_frames + 1);
                     memset(g_mem + dest, 0xa5, bytes);
                     call_shim(tramp("binkw32.dll", "_BinkCopyToBuffer@28"),
                               {rec, dest, pitch, height, 0, 0, 10});
@@ -9510,7 +9510,7 @@ static void test_bink_audio_without_service() {
                     CHECK(g_queued_accepted > accepted);
             }
         }
-        CHECK_EQ(rd32(rec + 0x14), 4u);
+        CHECK_EQ(rd32(rec + 0x0c), 4u);
         g_queue_enabled = false;
     });
 }
@@ -9584,7 +9584,7 @@ static void test_bink_rects_and_pause() {
         CHECK_EQ(rd32(rec + 0x3c), rd32(rec));
         CHECK_EQ(rd32(rec + 0x40), rd32(rec + 4));
         call_shim(tramp("binkw32.dll", "_BinkNextFrame@4"), {rec});
-        CHECK_EQ(rd32(rec + 0x14), 2u);
+        CHECK_EQ(rd32(rec + 0x0c), 2u);
         CHECK_EQ(call_shim(wait, {rec}), 1u);
         CHECK_EQ(call_shim(pause, {rec, 1}), 0u);
         uint32_t paused_at = host_millis();
@@ -9679,7 +9679,7 @@ static void test_bink_realtime() {
         uint32_t blit = rd32(out + 0x28);
         uint32_t buffer_size = rd32(out + 0x2c);
         uint32_t buffer_used = rd32(out + 0x30);
-        CHECK_EQ(frame_num, rd32(rec + 0x14));
+        CHECK_EQ(frame_num, rd32(rec + 0x0c));
         CHECK(frame_rate > 0 && frame_rate_div > 0);
         CHECK_EQ(window, 1u);
         CHECK(total >= 1);
@@ -9694,7 +9694,7 @@ static void test_bink_realtime() {
         call_shim(tramp("binkw32.dll", "_BinkNextFrame@4"), {rec});
         CHECK_EQ(call_shim(realtime, {rec, out, 1}), 0u);
         CHECK_EQ(rd32(out + 0x00), frame_num + 1);
-        CHECK_EQ(rd32(out + 0x00), rd32(rec + 0x14));
+        CHECK_EQ(rd32(out + 0x00), rd32(rec + 0x0c));
         heap_free(out);
     });
 #else
@@ -9729,13 +9729,13 @@ static void test_bink_play() {
         g_queue_enabled = false;
         return;
     }
-    CHECK_EQ(heap_size(rec), 0x100u);
+    CHECK_EQ(heap_size(rec), 0x38cu);
     CHECK_EQ(rd32(rec), 560u);
     CHECK_EQ(rd32(rec + 4), 333u);
-    CHECK(rd32(rec + 0x10) > 0);
-    CHECK_EQ(rd32(rec + 0x14), 1u);
-    CHECK_EQ(rd32(rec + 8), rd32(rec + 0x10));
+    CHECK(rd32(rec + 8) > 0);
     CHECK_EQ(rd32(rec + 12), 1u);
+    CHECK_EQ(rd32(rec + 0x10), 0u);
+    CHECK(rd32(rec + 0x14) > 0 && rd32(rec + 0x18) > 0);
     CHECK(g_plays.empty()); // open does not decode or play
     uint32_t err = call_shim(tramp("binkw32.dll", "_BinkGetError@0"), {});
     CHECK(err && gm_str(err).empty());
@@ -9745,7 +9745,7 @@ static void test_bink_play() {
     for (uint32_t frame = 1; frame <= 2 && dest; ++frame) {
         call_shim(tramp("binkw32.dll", "_BinkDoFrame@4"), {rec});
         call_shim(tramp("binkw32.dll", "_BinkNextFrame@4"), {rec});
-        CHECK_EQ(rd32(rec + 0x14), frame + 1);
+        CHECK_EQ(rd32(rec + 0x10), frame);
         CHECK_EQ(rd32(rec + 12), frame + 1);
         memset(g_mem + dest, 0xa5, pitch * height);
         CHECK_EQ(call_shim(tramp("binkw32.dll", "_BinkCopyToBuffer@28"),
@@ -9776,10 +9776,9 @@ static void test_bink_play() {
     g_test_close_requested = true;
     CHECK_EQ(call_shim(tramp("binkw32.dll", "_BinkWait@4"), {rec}), 0u);
     call_shim(tramp("binkw32.dll", "_BinkDoFrame@4"), {rec});
-    CHECK_EQ(rd32(rec + 0x14), rd32(rec + 0x10));
-    CHECK_EQ(rd32(rec + 0x0c), rd32(rec + 0x08));
+    CHECK_EQ(rd32(rec + 0x10), rd32(rec + 0x08));
     call_shim(tramp("binkw32.dll", "_BinkNextFrame@4"), {rec});
-    CHECK_EQ(rd32(rec + 0x14), rd32(rec + 0x10));
+    CHECK_EQ(rd32(rec + 0x10), rd32(rec + 0x08));
     CHECK_EQ(rd32(rec + 0x0c), rd32(rec + 0x08));
     g_test_close_requested = false;
     call_shim(tramp("binkw32.dll", "_BinkClose@4"), {rec});
