@@ -319,6 +319,16 @@ fallbacks and exceptional float stores are marked unlikely. Ordered x87
 comparisons update status bits without branches; unordered handling stays
 inline to avoid call-related spills and retains signalling-NaN behavior.
 
+`RECOMP_RESTRICT_LEAF_CPU=1 tools/build.py --regenerate --target app` experiments
+with a restricted CPU pointer in relaxed integer leaf bodies. Calls, x87, SEH,
+alternate entries and external branches remain unrestricted. A private C helper
+returns a dispatch decision so runtime return handling runs outside its restricted
+scope; pre-access ESP/EBP/EIP publications use volatile stores to retain eager diagnostic
+snapshots. Store-hook and null-check builds suppress the qualifier. Set the
+variable to `control` for the same helper and snapshots without `restrict`, or
+`0` (the default) for ordinary emission. The build fingerprint records the mode;
+guest pointers and arena aliases are unchanged.
+
 Emission requires those final decisions
 and checks them against both the caller requests and private callee records.
 Final binding hands fresh graphs directly to emission in the same worker, avoiding

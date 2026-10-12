@@ -1,4 +1,6 @@
 """C emission of finalized SSA, boundary operations and x87 recipes."""
+import os
+
 from .prepare import PreparedFunction, prepare
 from .ssa import SSAError
 from . import operations, c_symbols
@@ -32,7 +34,9 @@ RECOMP_HOT_INLINE void recomp_fcom_(uint16_t *status, double a, double b, int qu
 
 
 def memory_helpers():
-    lines = []
+    lines = ["#if RECOMP_STORE_HOOKS || (defined(RECOMP_NULL_CHECKS) && RECOMP_NULL_CHECKS)",
+             "#define RECOMP_LEAF_CPU_RESTRICT", "#else",
+             "#define RECOMP_LEAF_CPU_RESTRICT restrict", "#endif"]
     for floating, widths in ((False, (8, 16, 32, 64)), (True, (32, 64))):
         for bits in widths:
             ctype = ('float' if bits == 32 else 'double') if floating else 'uint%d_t' % bits
@@ -52,6 +56,20 @@ def memory_helpers():
                     lines.append('    return v;')
                 lines.extend(['#endif', '}'])
     return '\n'.join(lines) + '\n'
+
+
+def leaf_cpu_mode(prepared):
+    mode = os.environ.get("RECOMP_RESTRICT_LEAF_CPU", "0")
+    if mode not in ("0", "1", "control"):
+        raise SSAError("RECOMP_RESTRICT_LEAF_CPU must be 0, 1 or control")
+    if mode == "0" or not prepared.options.request.policy.local_state:
+        return "0"
+    if prepared.ir.entries or prepared.ir.seh or prepared.ir.exits or prepared.options.request.entry_verify:
+        return "0"
+    allowed = operations.PURE | {"LOAD", "STORE", "RETURN", "BRANCH", "CBRANCH"}
+    if any(v.opc not in allowed for b in prepared.ssa.blocks.values() for v in b.ops):
+        return "0"
+    return mode
 
 
 class ScalarPrinter(X87Printer):
@@ -113,6 +131,8 @@ def emit_prepared(prepared):
     symbol = options.symbol
     x87_mode_sites, x87_entry_verify = options.mode_sites, options.request.entry_verify
     fir, s, live = prepared.ir, prepared.ssa, prepared.live
+    cpu_mode = leaf_cpu_mode(prepared)
+    defer_returns = cpu_mode != "0"
     mapping = {key: (c_symbols.cpu_field(field), lane) for key, (field, lane) in prepared.mapping.items()}
     seh_mark = prepared.seh_mark
     arithmetic_plan = prepared.arithmetic
@@ -185,7 +205,7 @@ def emit_prepared(prepared):
 
     boundary = BoundaryPrinter(prepared.transport,
                                {name: mapping[keys[0]][0] for name, keys in prepared.state_groups},
-                               ref, mask)
+                               ref, mask, defer_returns=defer_returns)
 
     def publish(event):
         return boundary.publication(event)
@@ -196,7 +216,10 @@ def emit_prepared(prepared):
     x87_printer = ScalarPrinter(ref)
     block_label = "F" if arithmetic_plan.programs[0].clone == "fast" else "B"
 
-    lines = [c_symbols.signature(options.request.variant, symbol)]
+    variant = options.request.variant
+    body_symbol = "cpu_leaf_" + symbol if defer_returns else symbol
+    lines = [c_symbols.signature(variant, body_symbol, restrict_cpu=cpu_mode == "1",
+                                 return_type="int" if defer_returns else "void")]
     lines.append("uint8_t *arena_ = g_mem;")
     for v in s.values:
         if v.id in live and v.size and v.opc not in ("CONST", "TARGET", "CC_KIND") and s.resolve(v) is v:
@@ -327,6 +350,12 @@ def emit_prepared(prepared):
             raise SSAError('x87 emission differs from its planned event coverage')
     lines.append("}")
     lines[scalar_declarations:scalar_declarations] = [x87_printer.declaration(op) for op in arithmetic_plan.temporaries]
+    if defer_returns:
+        arguments = {EntryForm.ORDINARY: "c",
+                     EntryForm.CHECKED: "c, expected_return_, checked_return_",
+                     EntryForm.PRIVATE: "c, expected_return_"}[variant.entry]
+        lines.extend([c_symbols.signature(variant, symbol),
+                      "if (%s(%s)) recomp_return_fast_(c);" % (body_symbol, arguments), "}"])
     return "\n".join(lines)
 
 

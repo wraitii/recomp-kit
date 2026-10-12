@@ -598,6 +598,11 @@ def main():
                 translate_args = {
                     "allow_unmodelled": args.allow_unmodelled,
                 }
+                cpu_mode = os.environ.get("RECOMP_RESTRICT_LEAF_CPU", "0")
+                if cpu_mode not in ("0", "1", "control"):
+                    parser.error("RECOMP_RESTRICT_LEAF_CPU must be 0, 1 or control")
+                if cpu_mode != "0":
+                    translate_args["restrict_leaf_cpu"] = cpu_mode
                 fingerprint = translation_fingerprint(args.game_dir, cfg, translate_args)
                 stamp = args.build_root / "recomp/translate.stamp"
                 translated = (args.build_root / "recomp/gen/table.c").is_file()

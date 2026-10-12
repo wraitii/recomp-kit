@@ -44,13 +44,14 @@ def body_symbol(variant, target, layout=None):
     return symbol(kind, target, layout.output_mask if layout is not None else None)
 
 
-def signature(variant, name):
-    parameters = {EntryForm.ORDINARY: "X86 *c",
-                  EntryForm.MULTIPLE: "X86 *c, uint32_t entry_",
-                  EntryForm.CHECKED: "X86 *c, uint32_t expected_return_, int checked_return_",
-                  EntryForm.PRIVATE: "X86 *c, uint32_t expected_return_"}[variant.entry]
-    storage = "" if variant.entry == EntryForm.ORDINARY else "static "
-    return "%svoid %s(%s) {" % (storage, name, parameters)
+def signature(variant, name, *, restrict_cpu=False, return_type="void"):
+    cpu = "X86 *%sc" % ("RECOMP_LEAF_CPU_RESTRICT " if restrict_cpu else "")
+    parameters = {EntryForm.ORDINARY: cpu,
+                  EntryForm.MULTIPLE: cpu + ", uint32_t entry_",
+                  EntryForm.CHECKED: cpu + ", uint32_t expected_return_, int checked_return_",
+                  EntryForm.PRIVATE: cpu + ", uint32_t expected_return_"}[variant.entry]
+    storage = "" if variant.entry == EntryForm.ORDINARY and return_type == "void" else "static "
+    return "%s%s %s(%s) {" % (storage, return_type, name, parameters)
 
 
 def entry_signature(variant, name):
