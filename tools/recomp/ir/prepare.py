@@ -439,16 +439,21 @@ def prepare(fir, request, *, lifter=None, normalized=None):
             lane_field[key] = name
             field_lanes.setdefault(name, set()).add(key)
     kept_fields = {}
+    transparent_fields = {}
     if call_contracts and not fir.seh:
         for target, contract in call_contracts.items():
             fields_ = {field for field in CONTRACT_FIELDS
-                       if field not in CONTRACT_NEVER_SKIP and field not in contract.reads
-                       and field not in contract.writes}
+                       if field not in CONTRACT_NEVER_SKIP
+                       and (field in contract.preserves or
+                            (field not in contract.reads and field not in contract.writes))}
             if not set(CONTRACT_FLAGS) <= fields_:
                 fields_ -= set(CONTRACT_FLAGS)
             if fields_:
                 kept_fields[target] = frozenset(
                     key for field in fields_ for key in field_lanes[field])
+                transparent_fields[target] = frozenset(
+                    key for field in fields_ if field not in contract.reads
+                    and field not in contract.writes for key in field_lanes[field])
     tail_symbols = normalize_bindings(tail_symbols, "tail", allow_checked=False)
     seh_mark = any("orphan" in kinds for kinds in fir.seh.values())
     fir = cgi
@@ -465,6 +470,9 @@ def prepare(fir, request, *, lifter=None, normalized=None):
     if any(key != MEMORY and key not in mapping for key in s.inputs):
         raise SSAError("unmapped runtime register")
     canonicalize(s)
+    if not fir.entries and not seh_mark:
+        from .preservation import forward
+        forward(s)
     # DIVERGENCE(original): [ssa-state-locals] guest load/store faults
     # and store watch callbacks may observe earlier GPR/flag values
     # under the agreed performance-mode policy. Keep diagnostic
@@ -481,8 +489,10 @@ def prepare(fir, request, *, lifter=None, normalized=None):
     # summaries prove which fields a boundary does not observe.
     kept_calls = {v.id: kept_fields[v.data] for b in s.blocks.values() for v in b.ops
                   if v.opc == "CALL" and v.data in kept_fields}
+    transparent_calls = {v.id: transparent_fields[v.data] for b in s.blocks.values() for v in b.ops
+                         if v.opc == "CALL" and v.data in transparent_fields}
     publication_facts = publication_analysis(s, fir.succ, groups, access_fields=access_fields,
-                                             reloaded=set(mapping) - flag_keys, kept=kept_calls)
+                                             reloaded=set(mapping) - flag_keys, kept=transparent_calls)
     transfers = transfer_plan.build(s, groups, publication_facts,
                                     call_contracts or {}, kept_calls, lane_field, CONTRACT_NEVER_SKIP,
                                     contract_calls, return_fields, flag_keys, flag_first_key,

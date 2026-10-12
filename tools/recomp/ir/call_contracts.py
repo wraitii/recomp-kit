@@ -1,6 +1,6 @@
 """Per-function field contracts for direct call publication.
 
-A contract is two sets over the runtime CPU fields the emitter publishes at a
+A contract records sets over the runtime CPU fields the emitter publishes at a
 direct call: the eight GPRs and the six arithmetic flags.
 
 ``reads``
@@ -12,14 +12,18 @@ direct call: the eight GPRs and the six arithmetic flags.
     Fields overwritten on *every* path to a return (a forward must-definite
     analysis).  A GPR is killed only when all four byte lanes are written; a
     flag is killed when its field is written.  ``kills`` is about the value at
-    return, so a push/pop save-restore does not count as a kill even though the
-    register is written: the push also reads it, which keeps it in ``reads``.
+    return. Proven register saves restored on every return are excluded.
 
 ``writes``
     Fields some reachable instruction may write, including transitive callee
     writes.  Flags count as written by any instruction outside
     ``FLAG_FREE``, since emitted helpers may define flags SLEIGH leaves
     undefined.
+
+``preserves``
+    GPRs proven to return their entry value through stack-save forwarding.
+    Intermediate writes and the PUSH read remain in ``writes`` and ``reads``;
+    the caller can retain the value in SSA while publishing required inputs.
 
 At a direct CALL in an SSA body the caller may skip publishing field ``F`` iff
 ``F not in callee.reads and F in callee.kills``.  A field outside both
@@ -31,8 +35,9 @@ so those instructions add the AF write here.
 
 The analysis is conservative.  Indirect calls, CALLOTHER, unbound targets,
 failed lifts, SEH/alternate-entry/rewritten bodies, tail transfers and targets
-whose dispatch can be swapped all contribute ``reads=all, kills=none``.  Raw
-lifted instructions are the evidence; no emission is inspected.
+whose dispatch can be swapped all contribute ``reads=all, kills=none``.
+Preservation uses byte-backed normalization and SSA for call-free bodies;
+no emission is inspected.
 """
 from collections import namedtuple
 
@@ -45,7 +50,8 @@ ARITH_FLAGS = X86_32.names("arithmetic_flag")
 FIELDS = GPRS + ARITH_FLAGS
 
 #: Field sets.  Plain data so it can cross a process boundary.
-Contract = namedtuple("Contract", ("reads", "kills", "writes"), defaults=(frozenset(FIELDS),))
+Contract = namedtuple("Contract", ("reads", "kills", "writes", "preserves"),
+                      defaults=(frozenset(FIELDS), frozenset()))
 
 #: reads and writes everything, kills nothing.
 CONSERVATIVE = Contract(frozenset(FIELDS), frozenset(), frozenset(FIELDS))
@@ -228,7 +234,7 @@ class _Prepared(object):
     it is opaque (indirect call, CALLOTHER, unbound CALL).
     """
 
-    __slots__ = ("language", "entry", "order", "succ", "preds", "use", "defs", "call", "returns", "writes")
+    __slots__ = ("language", "entry", "order", "succ", "preds", "use", "defs", "call", "returns", "writes", "preserves")
 
     def __init__(self, fir, cells, bits):
         self.language = cells.language
@@ -237,6 +243,7 @@ class _Prepared(object):
         self.order, self.succ, self.preds = [], {}, {}
         self.use, self.defs, self.call, self.returns = {}, {}, {}, []
         self.writes = 0
+        self.preserves = frozenset()
         if self.entry is None:
             return
         n = len(fir.insns)
@@ -307,7 +314,37 @@ def prepare(fir, language=None):
         return None
     cells = mapping(language or fir.language)
     p = _Prepared(fir, cells, _bits(cells))
+    if (any(ins.raw and len(ins.raw) == 1 and 0x50 <= ins.raw[0] <= 0x57
+            for ins in fir.insns) and not fir.entries and not fir.seh and not any(
+            op.opc in ("CALL", "CALLIND", "CALLOTHER") for ins in fir.insns for op in ins.ops)):
+        p.preserves = _preserved_registers(fir)
     return None if p.entry is None else p
+
+
+def _preserved_registers(fir):
+    from .normalize import codegen_ir
+    from .ssa import build, SSAError
+    from .simplify import canonicalize
+    from .preservation import forward
+
+    lifter = Lifter(fir.language)
+    registers = {name: lifter.register(name) for name in GPRS}
+    groups = {name: tuple((space, offset + n) for n in range(size))
+              for name, (space, offset, size) in registers.items()}
+    try:
+        s = build(codegen_ir(fir, lifter), register_groups=groups.values())
+        canonicalize(s)
+        if not forward(s):
+            return frozenset()
+    except (SSAError, RecursionError):
+        return frozenset()
+    returns = [b for b in s.blocks.values() if any(v.opc == "RETURN" for v in b.ops)]
+    if not returns:
+        return frozenset()
+    return frozenset(name for name, keys in groups.items()
+                     if all(key in s.inputs for key in keys) and all(
+                         s.resolve(b.exit[key]) is s.resolve(s.inputs[key])
+                         for b in returns for key in keys))
 
 
 def summarize(p, callee_lookup, cells=None):
@@ -376,7 +413,8 @@ def summarize(p, callee_lookup, cells=None):
     reads = frozenset(f for f in FIELDS if live_in[p.entry] & bits.field_bits[f])
     kills = frozenset(f for f in FIELDS
                       if killed & bits.field_bits[f] == bits.field_bits[f])
-    return Contract(reads, kills, frozenset(f for f in FIELDS if writes & bits.field_bits[f]))
+    return Contract(reads, kills - p.preserves,
+                    frozenset(f for f in FIELDS if writes & bits.field_bits[f]), p.preserves)
 
 
 def cfg_is_closed(fir):

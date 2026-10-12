@@ -1,0 +1,8 @@
+{
+ "format": "recomp-diff-suite-v1",
+ "executable_sha256": "accb099b0d8ebac8b50c539a5cc91a863bc9ae399ae70da382ff1c22301e38a2",
+ "seed": 1,
+ "iterations": 200,
+ "fpu_cws": ["037f"],
+ "functions": ["00448af0", "0056b070"]
+}
