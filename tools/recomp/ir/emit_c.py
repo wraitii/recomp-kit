@@ -129,6 +129,11 @@ def emit_prepared(prepared, external_entry=False):
     def mask(size):
         return "0x%xull" % ((1 << (size * 8)) - 1)
 
+    def assignment(v, value):
+        if v.size not in (4, 8):
+            value = "(%s) & %s" % (value, mask(v.size))
+        return "v%d = %s;" % (v.id, value)
+
     def expression(v):
         wide = v.size > 4 or v.opc == "SUBPIECE"
         a = [ref(arg) for arg in v.args]
@@ -218,10 +223,10 @@ def emit_prepared(prepared, external_entry=False):
         if v.opc != "INPUT" or not v.size or v.id not in live or s.resolve(v) is not v:
             continue
         field, lane = mapping[v.data]
-        lines.append("v%d = (%s >> %d) & %s;" % (v.id, field, lane * 8, mask(v.size)))
+        lines.append(assignment(v, "%s >> %d" % (field, lane * 8)))
     for v in s.entry_ops:
         if v.id in live and s.resolve(v) is v:
-            lines.append("v%d = (%s) & %s;" % (v.id, expression(v), mask(v.size)))
+            lines.append(assignment(v, expression(v)))
     if x87_entry_verify:
         condition = condition_of(getattr(x87_entry_verify, "condition", x87_entry_verify))
         lines.append('if (RECOMP_UNLIKELY(!recomp_hooks_ever && (c->fpu_cw & 0x%xu) != 0x%xu)) recomp_x87_contract_violation(c, 0x%08xu, 0x%xu, 0x%xu);' % (condition.mask, condition.value, fir.addr, condition.mask, condition.value))
@@ -327,7 +332,7 @@ def emit_prepared(prepared, external_entry=False):
                     lines.extend(edge(i, indices[v.args[0].data]))
                     lines.extend(edge(i, indices[b.insn.addr + b.insn.length]))
                 else:
-                    lines.append("v%d = (%s) & %s;" % (v.id, expression(v), mask(v.size)))
+                    lines.append(assignment(v, expression(v)))
             if not any(v.opc in operations.TERMINATORS for v in b.ops):
                 lines.extend(x87_printer.operations(program.ends[i]))
                 lines.extend(edge(i, fir.succ[i][0]))
