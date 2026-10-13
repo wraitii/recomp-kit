@@ -448,7 +448,7 @@ def prepare(fir, request, *, lifter=None, normalized=None):
             fields_ = {field for field in CONTRACT_FIELDS
                        if field not in CONTRACT_NEVER_SKIP
                        and (field in contract.preserves or
-                            (field not in contract.reads and field not in contract.writes))}
+                            field not in contract.writes)}
             if not set(CONTRACT_FLAGS) <= fields_:
                 fields_ -= set(CONTRACT_FLAGS)
             if fields_:

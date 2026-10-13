@@ -341,9 +341,15 @@ def _preserved_registers(fir):
     returns = [b for b in s.blocks.values() if any(v.opc == "RETURN" for v in b.ops)]
     if not returns:
         return frozenset()
+
+    def same_byte(left, right):
+        left, right = s.resolve(left), s.resolve(right)
+        return left is right or (left.opc == right.opc == "BYTE" and left.data == right.data
+                                 and s.resolve(left.args[0]) is s.resolve(right.args[0]))
+
     return frozenset(name for name, keys in groups.items()
                      if all(key in s.inputs for key in keys) and all(
-                         s.resolve(b.exit[key]) is s.resolve(s.inputs[key])
+                         same_byte(b.exit[key], s.inputs[key])
                          for b in returns for key in keys))
 
 
