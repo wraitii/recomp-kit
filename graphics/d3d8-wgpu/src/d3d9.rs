@@ -38,6 +38,21 @@ pub mod state;
 pub mod wgsl;
 
 pub use d3dx::*;
+
+fn trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("RECOMP_D3D9_TRACE").is_ok_and(|v| v == "1"))
+}
+
+fn trace_draw_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("RECOMP_D3D9_TRACE_DRAWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(24)
+    })
+}
 pub use d3dx_math::*;
 pub use d3dx_shader::*;
 
@@ -521,6 +536,21 @@ pub fn d3d9_buffer_lock_commit(
         }
         b.writable.push((offset, offset.saturating_add(size)));
     }
+    if trace_enabled() {
+        static COUNT: AtomicU32 = AtomicU32::new(0);
+        if COUNT.fetch_add(1, Ordering::Relaxed) < 128 {
+            eprintln!(
+                "[d3d9-trace] buffer_lock resource={:p} pool={} format={} usage={} offset={} size={} flags={:#x}",
+                b as *const resource::BufferState,
+                b.pool,
+                b.format,
+                b.usage,
+                offset,
+                size,
+                request.flags
+            );
+        }
+    }
     D3d9BufferLockResult {
         status: status(StatusCode::Ok, ""),
         offset,
@@ -541,7 +571,7 @@ pub fn d3d9_buffer_unlock(resource: &mut D3d9Resource, bytes: &[u8]) -> D3d9Buff
         resource.state.as_ref(),
         Some(resource::ResourceState::Buffer(b)) if b.pool == resource::D3DPOOL_DEFAULT
     );
-    let gpu = if default_pool {
+    let gpu = if default_pool || resource.is_managed() {
         resource.gpu_handle().ok().filter(|gpu| !gpu.is_blocked())
     } else {
         None
@@ -973,7 +1003,7 @@ pub fn d3d9_level_unlock(
             };
         }
     };
-    if closed && resource::is_default_pool(resource) {
+    if closed && (resource::is_default_pool(resource) || resource.is_managed()) {
         if let Some(gpu) = resource.gpu_handle().ok().filter(|gpu| !gpu.is_blocked()) {
             if let Err(error) = resource::upload_level(&gpu, resource, face, level) {
                 return D3d9BufferUnlockResult {
@@ -2120,7 +2150,7 @@ pub fn d3d9_reset(device: &mut D3d9Device, request: &D3d9ResetRequest) -> D3d9Re
     }
     D3d9ResetResult {
         status: status(StatusCode::Ok, ""),
-        present: reset_output_present(present),
+        present,
     }
 }
 
@@ -2300,7 +2330,7 @@ pub fn d3d9_finish_reset(device: &mut D3d9Device) -> D3d9ResetResult {
     };
     D3d9ResetResult {
         status,
-        present: reset_output_present(plan.present),
+        present: plan.present,
     }
 }
 

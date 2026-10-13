@@ -729,9 +729,9 @@ const OUTPUT: &str = r#"
 fn d9_output(input:vec4<f32>,vin:V2F)->vec4<f32> {
     var col=input;
     let a=clamp(col.a,0.0,1.0); let r=psp.alpha_ref;
-    var pass=true;
-    switch psp.alpha_func {case 1:{pass=false;} case 2:{pass=a<r;} case 3:{pass=a==r;} case 4:{pass=a<=r;} case 5:{pass=a>r;} case 6:{pass=a!=r;} case 7:{pass=a>=r;} default:{} }
-    if (!pass) {discard;}
+    var alpha_pass=true;
+    switch psp.alpha_func {case 1:{alpha_pass=false;} case 2:{alpha_pass=a<r;} case 3:{alpha_pass=a==r;} case 4:{alpha_pass=a<=r;} case 5:{alpha_pass=a>r;} case 6:{alpha_pass=a!=r;} case 7:{alpha_pass=a>=r;} default:{} }
+    if (!alpha_pass) {discard;}
     var f=vin.fog;
     let z=abs(vin.fogz);
     switch psp.fog_mode {case 1:{f=exp(-psp.fog_density*z);} case 2:{let d=psp.fog_density*z;f=exp(-d*d);} case 3:{f=(psp.fog_end-z)/(psp.fog_end-psp.fog_start);} default:{} }
@@ -1036,8 +1036,7 @@ fn depth_state(
         ));
     }
     Ok(Some(wgpu::DepthStencilState {
-        format: super::format::d3d_to_wgpu(depth.format)
-            .ok_or_else(|| unsupported("Draw", "depth format"))?,
+        format: depth.texture.format(),
         depth_write_enabled: rs(state, 7) != 0 && rs(state, 14) != 0,
         depth_compare: if rs(state, 7) != 0 {
             compare(rs(state, 23))
@@ -1319,6 +1318,17 @@ fn translated_source(
     wgsl::validate(&source)?;
     Ok(source)
 }
+fn shading_source(mut source: String, state: &D3d9State) -> String {
+    if rs(state, 9) == 1 {
+        for (location, name) in [(0, "d0"), (1, "d1")] {
+            source = source.replace(
+                &format!("@location({location}) {name}:"),
+                &format!("@location({location}) @interpolate(flat, first) {name}:"),
+            );
+        }
+    }
+    source
+}
 fn uniform_entry(
     binding: u32,
     size: u64,
@@ -1347,9 +1357,14 @@ pub(crate) fn execute(
         return Ok(());
     }
     let (order, _, topology) = expanded_indices(&snapshot.command)?;
+    if !matches!(rs(state, 9), 1 | 2) {
+        return Err(unsupported(
+            "Draw",
+            format!("D3DRS_SHADEMODE value {} is not implemented", rs(state, 9)),
+        ));
+    }
     for (id, default) in [
         (8, 3),
-        (9, 2),
         (48, 0),
         (136, 1),
         (163, 0),
@@ -1398,16 +1413,86 @@ pub(crate) fn execute(
     } else {
         ff_vertices(&snapshot.command, declaration, &order, state)?
     };
-    let vertex_source = if let Some(v) = vs {
-        translated_source(&v.program, state, &snapshot.textures)?
-    } else {
-        ff_vertex_source()
-    };
-    let pixel_source = if let Some(p) = ps {
-        translated_source(&p.program, state, &snapshot.textures)?
-    } else {
-        ff_fragment_source(state, &snapshot.textures)?
-    };
+    if super::trace_enabled() {
+        static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count < super::trace_draw_limit() && (count < 24 || count % 61 == 0) {
+            eprintln!("[d3d9-trace] indices={:?}", &order[..order.len().min(12)]);
+            for stream in &snapshot.command.streams {
+                eprintln!(
+                    "[d3d9-trace] stream={} offset={} stride={} sample={:?}",
+                    stream.stream,
+                    stream.offset,
+                    stream.stride,
+                    stream
+                        .bytes
+                        .get(
+                            stream.offset as usize
+                                ..stream.bytes.len().min(stream.offset as usize + 96)
+                        )
+                        .unwrap_or(&[])
+                );
+            }
+            eprintln!(
+                "[d3d9-trace] draw={} target={}x{} format={} viewport={:?} vs={} ps={} declaration={:?}",
+                count,
+                snapshot.target.width,
+                snapshot.target.height,
+                snapshot.target.format,
+                [
+                    state.viewport().x as f32,
+                    state.viewport().y as f32,
+                    state.viewport().width as f32,
+                    state.viewport().height as f32,
+                    state.viewport().min_z,
+                    state.viewport().max_z
+                ],
+                state.shader(false),
+                state.shader(true),
+                declaration
+            );
+            for id in [7, 14, 15, 19, 20, 22, 23, 24, 25, 27, 137, 162, 168, 174] {
+                eprintln!("[d3d9-trace] rs[{id}]={}", rs(state, id));
+            }
+            for texture in &snapshot.textures {
+                eprintln!(
+                    "[d3d9-trace] stage={} id={} size={}x{} format={} lod={} color_op={} color_args={}/{} alpha_op={} alpha_args={}/{}",
+                    texture.stage,
+                    state.texture(texture.stage)?,
+                    texture.width,
+                    texture.height,
+                    texture.format,
+                    texture.lod,
+                    tss(state, texture.stage, 1),
+                    tss(state, texture.stage, 2),
+                    tss(state, texture.stage, 3),
+                    tss(state, texture.stage, 4),
+                    tss(state, texture.stage, 5),
+                    tss(state, texture.stage, 6)
+                );
+            }
+            let stride = linked.as_ref().map_or(48, |inputs| inputs.len() * 4);
+            for vertex in vertices.chunks(stride.max(1)).take(6) {
+                eprintln!("[d3d9-trace] vertex={vertex:?}");
+            }
+        }
+    }
+    let vertex_source = shading_source(
+        if let Some(v) = vs {
+            translated_source(&v.program, state, &snapshot.textures)?
+        } else {
+            ff_vertex_source()
+        },
+        state,
+    );
+    let pixel_source = shading_source(
+        if let Some(p) = ps {
+            translated_source(&p.program, state, &snapshot.textures)?
+        } else {
+            ff_fragment_source(state, &snapshot.textures)?
+        },
+        state,
+    );
     if vs.is_some() && rs(state, 28) != 0 && rs(state, 35) != 0 {
         return Err(unsupported(
             "Draw",
@@ -1615,8 +1700,7 @@ pub(crate) fn execute(
         _ => Some(wgpu::Face::Back),
     };
     let targets = [Some(wgpu::ColorTargetState {
-        format: super::format::d3d_to_wgpu(snapshot.target.format)
-            .ok_or_else(|| unsupported("Draw", "render target format"))?,
+        format: snapshot.target.texture.format(),
         blend: blend_state(state, opaque_format(snapshot.target.format))?,
         write_mask: wgpu::ColorWrites::from_bits_truncate(rs(state, 168)),
     })];
@@ -1734,6 +1818,38 @@ pub(crate) fn execute(
         pass.draw(0..order.len() as u32, 0..1);
     }
     gpu.queue.submit(std::iter::once(encoder.finish()));
+    if super::trace_enabled() {
+        static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count < super::trace_draw_limit()
+            && (count < 24 || count % 61 == 0)
+            && matches!(snapshot.target.format, 21 | 22)
+        {
+            let mut pixels =
+                vec![0; snapshot.target.width as usize * snapshot.target.height as usize * 4];
+            match gpu.read_texture(
+                &snapshot.target.texture,
+                snapshot.target.format,
+                snapshot.target.subresource.1,
+                snapshot.target.width,
+                snapshot.target.height,
+                1,
+                snapshot.target.subresource.0,
+                false,
+                &mut pixels,
+            ) {
+                Ok(()) => eprintln!(
+                    "[d3d9-trace] draw={} target_colored_pixels={}",
+                    count,
+                    pixels
+                        .chunks_exact(4)
+                        .filter(|p| p[..3].iter().any(|&b| b != 0))
+                        .count()
+                ),
+                Err(error) => eprintln!("[d3d9-trace] draw={count} readback={error}"),
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1829,8 +1945,7 @@ pub(crate) fn clear(
     let ds = depth
         .map(|d| {
             Ok::<_, RenderError>(wgpu::DepthStencilState {
-                format: super::format::d3d_to_wgpu(d.format)
-                    .ok_or_else(|| unsupported("Clear", "depth format"))?,
+                format: d.texture.format(),
                 depth_write_enabled: flags & 2 != 0,
                 depth_compare: wgpu::CompareFunction::Always,
                 stencil: wgpu::StencilState {
@@ -1844,8 +1959,7 @@ pub(crate) fn clear(
         })
         .transpose()?;
     let targets = [Some(wgpu::ColorTargetState {
-        format: super::format::d3d_to_wgpu(target.format)
-            .ok_or_else(|| unsupported("Clear", "color format"))?,
+        format: target.texture.format(),
         blend: None,
         write_mask: if flags & 1 != 0 {
             wgpu::ColorWrites::ALL

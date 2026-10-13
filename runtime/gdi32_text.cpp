@@ -339,13 +339,12 @@ void extent(X86 *c) {
     wr32(out + 4, uint32_t(pen.height()));
     set_eax(c, 1);
 }
-void text_out(X86 *c) {
-    uint32_t hdc = arg(c, 0), flags = arg(c, 3), rp = arg(c, 4), text = arg(c, 5), n = arg(c, 6),
-             dx = arg(c, 7);
+void text_out(X86 *c, uint32_t hdc, int32_t x_origin, int32_t y_origin, uint32_t flags, uint32_t rp,
+              uint32_t text, uint32_t n, uint32_t dx, bool wide) {
     auto *dc = dc_of(hdc);
     int w, h;
     if (!dc || !dc_size(hdc, &w, &h) || n > GUEST_SIZE / 4 ||
-        (n && (!text || !gm_valid(text, n * 2))) || (dx && !gm_valid(dx, n * 4)) ||
+        (n && (!text || !gm_valid(text, n * (wide ? 2 : 1)))) || (dx && !gm_valid(dx, n * 4)) ||
         ((flags & 6) && (!rp || !gm_valid(rp, 16)))) {
         set_eax(c, 0);
         return;
@@ -372,15 +371,31 @@ void text_out(X86 *c) {
     if (flags & 2)
         fill(hdc, rect, bg);
     const Pen pen = pen_of(hdc);
-    int64_t x = int32_t(arg(c, 1)), y = int32_t(arg(c, 2));
+    int64_t x = x_origin, y = y_origin;
     for (uint32_t i = 0; i < n; ++i) {
-        uint32_t unit = rd16(text + 2 * i);
+        uint32_t unit = wide ? rd16(text + 2 * i) : rd8(text + i);
         pen.draw(hdc, x, y, unit, false);
         x += dx ? int32_t(rd32(dx + 4 * i)) : pen.advance(unit);
     }
     dc->clip = std::move(old_clip);
     dc->clipped = old_clipped;
     set_eax(c, 1);
+}
+void text_out_a(X86 *c) {
+    text_out(c, arg(c, 0), int32_t(arg(c, 1)), int32_t(arg(c, 2)), 0, 0, arg(c, 3), arg(c, 4), 0,
+             false);
+}
+void text_out_w(X86 *c) {
+    text_out(c, arg(c, 0), int32_t(arg(c, 1)), int32_t(arg(c, 2)), 0, 0, arg(c, 3), arg(c, 4), 0,
+             true);
+}
+void ext_text_out_a(X86 *c) {
+    text_out(c, arg(c, 0), int32_t(arg(c, 1)), int32_t(arg(c, 2)), arg(c, 3), arg(c, 4), arg(c, 5),
+             arg(c, 6), arg(c, 7), false);
+}
+void ext_text_out_w(X86 *c) {
+    text_out(c, arg(c, 0), int32_t(arg(c, 1)), int32_t(arg(c, 2)), arg(c, 3), arg(c, 4), arg(c, 5),
+             arg(c, 6), arg(c, 7), true);
 }
 // The fonts are kept, so a DC whose font names one of them draws with it. Data
 // the rasterizer cannot read still gets a handle, as it always has here.
@@ -572,7 +587,10 @@ void register_text() {
     }
     static const ImportShim shims[] = {G("CreateFontIndirectW", 1, create_font),
                                        G("CreateFontIndirectA", 1, create_font_a),
-                                       G("ExtTextOutW", 8, text_out),
+                                       G("TextOutA", 5, text_out_a),
+                                       G("TextOutW", 5, text_out_w),
+                                       G("ExtTextOutA", 8, ext_text_out_a),
+                                       G("ExtTextOutW", 8, ext_text_out_w),
                                        G("GetTextExtentPoint32W", 4, extent),
                                        G("GetTextExtentPointW", 4, extent),
                                        G("GetTextMetricsW", 2, get_metrics),

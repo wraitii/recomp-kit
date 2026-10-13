@@ -10,6 +10,7 @@ use crate::d3d9::format::{
 };
 use crate::d3d9::resource::{self, D3d9Resource, TextureKind};
 use ddsfile::Dds;
+use image::ImageEncoder;
 use std::io::Cursor;
 use std::sync::atomic::Ordering;
 
@@ -1547,15 +1548,11 @@ pub fn d3d9_d3dx_surface_store(
     }
 }
 
-fn validate_save_format(format: u32) -> Result<(), RenderError> {
+fn validate_save_format(op: &'static str, format: u32) -> Result<(), RenderError> {
     match format {
-        D3DXIFF_BMP | D3DXIFF_JPG | D3DXIFF_PNG | D3DXIFF_DDS => Ok(()),
-        D3DXIFF_TGA | D3DXIFF_PPM => Err(RenderError::new(
-            "D3DXSaveSurfaceToFile",
-            "TGA and PPM are not supported for saving",
-        )),
+        D3DXIFF_BMP | D3DXIFF_JPG | D3DXIFF_PNG | D3DXIFF_DDS | D3DXIFF_TGA | D3DXIFF_PPM => Ok(()),
         other => Err(RenderError::new(
-            "D3DXSaveSurfaceToFile",
+            op,
             format!("unsupported D3DXIMAGE_FILEFORMAT {other}"),
         )),
     }
@@ -1568,12 +1565,27 @@ fn encode_image(format: u32, w: u32, h: u32, pixels: &[[f32; 4]]) -> Result<Vec<
             rgba.push((c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
         }
     }
+    if format == D3DXIFF_PPM {
+        let mut rgb = Vec::with_capacity((w as usize) * (h as usize) * 3);
+        for px in rgba.chunks_exact(4) {
+            rgb.extend_from_slice(&px[..3]);
+        }
+        let mut cursor = Cursor::new(Vec::new());
+        image::codecs::pnm::PnmEncoder::new(&mut cursor)
+            .with_subtype(image::codecs::pnm::PnmSubtype::Pixmap(
+                image::codecs::pnm::SampleEncoding::Binary,
+            ))
+            .write_image(&rgb, w, h, image::ExtendedColorType::Rgb8)
+            .map_err(|e| RenderError::new("D3DX", format!("image encode failed: {e}")))?;
+        return Ok(cursor.into_inner());
+    }
     let image = image::RgbaImage::from_raw(w, h, rgba)
         .ok_or_else(|| RenderError::invalid("D3DX", "image dimensions overflow"))?;
     let dynamic = image::DynamicImage::ImageRgba8(image);
     let image_format = match format {
         D3DXIFF_BMP => image::ImageFormat::Bmp,
         D3DXIFF_JPG => image::ImageFormat::Jpeg,
+        D3DXIFF_TGA => image::ImageFormat::Tga,
         D3DXIFF_PNG => image::ImageFormat::Png,
         _ => return Err(RenderError::new("D3DX", "unsupported image output format")),
     };
@@ -1789,7 +1801,7 @@ pub fn d3d9_d3dx_save_surface(
     rect_present: bool,
     format: u32,
 ) -> D3dxBytesResult {
-    if let Err(error) = validate_save_format(format) {
+    if let Err(error) = validate_save_format("D3DXSaveSurfaceToFile", format) {
         return fail_bytes(error);
     }
     if let Err(error) = validate_color_level(resource, face, level, "D3DXSaveSurfaceToFile") {
@@ -1874,7 +1886,7 @@ pub fn d3d9_d3dx_save_texture(
     resource: &mut D3d9Resource,
     format: u32,
 ) -> D3dxBytesResult {
-    if let Err(error) = validate_save_format(format) {
+    if let Err(error) = validate_save_format("D3DXSaveTextureToFile", format) {
         return fail_bytes(error);
     }
     let gpu = match device.resource_gpu() {

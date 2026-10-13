@@ -776,6 +776,135 @@ proceed in parallel once M1 exists.
 - [ ] **M10. First frame.** Needs the subset of M2–M9 Civ4's startup uses.
   Done when: a reviewed build with the flag on reaches Civ4's main menu in an
   approved run, with known gaps listed here.
+
+  Handoff (2026-10-13, reviewed and built): two startup blockers were fixed.
+  **Effect passes:** `d3dx_effect_enum(K_PASS)` extracted the technique index
+  with `pass_parts`, which only accepts a pass handle, so `ID3DXEffect::GetPass`
+  always returned NULL and every `GetPassDesc` failed with
+  `ID3DXEffect::GetPassDesc`; the follow-on `D3DXGetShaderInputSemantics` read
+  the unwritten descriptor and logged `shader version token is not valid`. It now
+  uses `handle_index(parent, H_TECH)`. **Code map:** the Gamebryo class registry
+  `FUN_0091c820` (`FUN_008fc130(name, factory)`) passes each factory as an
+  immediate, and the audit snapshot predated that initializer's disassembly. A
+  fresh `AuditCodePointers` + `AuditMissingCodePointers` pass found 233 class-A
+  targets, recovered all of them with `RecoverReviewedDispatchEntries` (including
+  `008f97e0`, the shared `NiNode`/`NiCollisionSwitch` factory), and `game/metadata`
+  moved 61,686 -> 61,932 functions. Files: kit
+  `graphics/d3d8-wgpu/src/d3d9/d3dx_effect.rs`; consumer `game/metadata/{spans,
+  entries,tables}.tsv`, `game/metadata/metadata.txt`, `tools/ghidra_scripts/`.
+  Checks: Ghidra identity and original bytes verified by the audit/recovery
+  scripts; `--regenerate main --target app` built and signed
+  `build/Civ4BTSRecomp.app` (Rust lib recompiled with the effect fix). Full
+  `--regenerate` was rejected only because all auxiliary maps carry
+  `provenance=provisional-sweep` and need `--allow-unmodelled`; the main map does
+  not. No app run, so the effect/per-frame path and the registry call remain
+  runtime-unverified. Logs: consumer
+  `analysis/d3d9-m10-regenerate-build.log` (ignored),
+  `analysis/code-pointer-recovery-20261013/` (ignored).
+
+  Handoff (2026-10-13, target formats, built): the run then aborted in
+  `Clear` with wgpu validation `RenderPass ... [Rgba8Unorm] ... RenderPipeline
+  'd3d9-clear' ... [Bgra8Unorm]`. The shared backend's `create_target` always
+  allocates a linear `Rgba8Unorm` texture, but the D3D9 draw, clear and copy
+  pipelines derived their attachment format with `d3d_to_wgpu(SurfaceView.format)`
+  (`X8R8G8B8` -> `Bgra8Unorm`). They now use the bound texture's actual
+  `wgpu::Texture::format()`: `SurfaceView` carries the texture, so
+  `d3d9/draw.rs` uses `snapshot.target.texture.format()`,
+  `depth.texture.format()` and `target.texture.format()`, and `copy.rs`'s
+  `wgpu_format` takes the `SurfaceView` and returns its texture format after
+  keeping the D3D-format validation. Files: kit
+  `graphics/d3d8-wgpu/src/d3d9/{draw,copy}.rs`. Checks: `--target app` rebuilt and
+  signed `build/Civ4BTSRecomp.app` with no Rust errors; no app run, so the clear
+  and subsequent present/draw paths remain runtime-unverified. Log: consumer
+  `analysis/d3d9-m10-targetfmt-build.log` (ignored). The same mismatch would have
+  hit `StretchRect`/`ColorFill` into the implicit target.
+
+  Handoff (2026-10-13, EvictManagedResources, built): the next abort was the
+  named import `d3d9.dll!IDirect3DDevice9::EvictManagedResources`. It is now
+  callable: `Dev_EvictManagedResources` in `dx/d3d9.cpp` returns `D3D_OK` for a
+  valid device, and `dx/d3d9_bindings.json` records it as handler
+  `Dev_EvictManagedResources` / flag-on `native`. The generated
+  `g_device9` slot 5 routes to it. Fidelity gap (intentional): it does not free
+  managed GPU residency, because the D3D9 Rust registry stores GPU clones owned
+  by each `D3d9Resource` and has no lazy recreation path; wgpu owns the
+  allocations and guest-observable managed resources stay valid. Files: kit
+  `dx/d3d9.cpp`, `dx/d3d9_bindings.json`, plus regenerated
+  `build/d3d9-generated/d3d9_interfaces.inc`. Checks: `--target app` rebuilt and
+  signed the app; no app run. Log: consumer
+  `analysis/d3d9-m10-evict-build.log` (ignored). Separately, the run logged a
+  non-fatal presenter diagnostic (`drawable acknowledgement exceeded queue grace;
+  using command completion fallback`) before this abort. Its `flight` field is
+  `2^63 + n`, not a corrupted id: `host_present_seal_window` numbers window
+  presents from a separate sequence starting at `uint64_t(1) << 63`
+  (`host/present_thread.cpp`), deliberately disjoint from DirectDraw's frame
+  leases. The fault itself is the presenter's existing acknowledgement-grace
+  timeout on this handoff path; still uninvestigated.
+
+  Handoff (2026-10-13, reserved WGSL keyword, built): the next abort was
+  `CreateShader: translated WGSL does not parse: name 'pass' is a reserved
+  keyword`, from the shared naga `validate`. Both generated WGSL sources named a
+  local `pass` in their alpha-test switch. Renamed to `alpha_pass` in the D3D9
+  fixed-function output helper (`graphics/d3d8-wgpu/src/d3d9/draw.rs`, `OUTPUT`,
+  reached by both `ff_fragment_source` and `translated_source`) and in the host
+  presenter blit shader (`host/gpu/webgpu/shaders_wgsl.h`, `kPresent`). The
+  `CreateShader` label on that error is the generic `wgsl::validate` context, so
+  a draw-time fixed-function parse failure reports as `CreateShader`; the label
+  is unchanged. Files: kit `graphics/d3d8-wgpu/src/d3d9/draw.rs`,
+  `host/gpu/webgpu/shaders_wgsl.h`. Checks: both changed files clang-format
+  clean; `--target app` rebuilt and signed `build/Civ4BTSRecomp.app` with no new
+  errors. The kit-wide format check still reports pre-existing violations in
+  `games/black-and-white/` and `games/ghost-recon/` (HEAD itself is not
+  clang-format 23.1.1 clean), unrelated to this change. No app run,
+  so the fixed-function draw and presenter paths remain runtime-unverified.
+  Log: consumer `analysis/d3d9-m10-pass-build.log` (ignored).
+
+  Handoff (2026-10-13, TGA/PPM save, built): the next abort was
+  `D3DXSaveSurfaceToFile: TGA and PPM are not supported for saving`, raised from
+  `validate_save_format` although the guest call is `D3DXSaveTextureToFileA` (the
+  label was hard-coded). The abort EIP `0x6adb9b` is the `TEST EAX,EAX` right
+  after the import at `0x6adb96`; its caller builds `%sFrozenScreen.tga`
+  (`0xc98a94`) and `%sHiResScreenShot%04i.tga` (`0xc98aa8`) and passes
+  `D3DXIFF_TGA` (`2`) as the format. TGA and PPM now save: `image`'s TGA encoder
+  handles TGA, and PPM is written as binary P6 through `PnmEncoder` with
+  `Pixmap(SampleEncoding::Binary)` (the `pnm` feature was added; `image` already
+  provided `tga`). `validate_save_format` takes the caller op so the label is
+  now `D3DXSaveTextureToFile`/`D3DXSaveSurfaceToFile` accurately, and its
+  unsupported-format arm fails by name. Files: kit
+  `graphics/d3d8-wgpu/src/d3d9/d3dx.rs`, `graphics/d3d8-wgpu/Cargo.toml`. Checks:
+  `--target app` rebuilt and signed `build/Civ4BTSRecomp.app` with no Rust
+  errors. No app run, so the encoded bytes and the resumed startup path remain
+  runtime-unverified. Log: consumer `analysis/d3d9-m10-tga-build.log` (ignored).
+
+  Handoff (2026-10-13, BinkShouldSkip, built): the next abort was the unregistered
+  import `binkw32.dll!_BinkShouldSkip@4` called from `FUN_00559f00` at
+  `0x559f08` with the HBINK at `[ESI+0x398]`. It is the last of Civ4's twelve
+  Bink imports not already shimmed (Ghidra `BINKW32.DLL` externals; no GetRects,
+  GetSummary, GetRealtime, Goto, Pause, SetSoundOnOff, GetKeyFrame or SetIOSize
+  import is present). `BinkShouldSkip` returns 0: it reports a late frame so a
+  guest can drop it, but this shim decodes synchronously and `BinkWait` blocks
+  to the frame boundary, so playback is never behind. Files: kit `dx/bink.cpp`
+  (new handler plus `BINK(ShouldSkip, 4, ...)` in `g_video_shims`). Checks:
+  `--target app` rebuilt and signed `build/Civ4BTSRecomp.app` with no errors. No
+  app run, so the movie loop remains runtime-unverified. Log: consumer
+  `analysis/d3d9-m10-binkskip-build.log` (ignored).
+
+  Handoff (2026-10-13, GDI region paint, built): the next gap was two
+  unregistered Win32 imports in the MFC paint path at `FUN_0086c8de`: GDI32
+  `CreateRectRgnIndirect` (`0x86ca03`; its undecorated name left the runtime
+  unable to drop the stdcall argument and the stack would drift) and USER32
+  `GetUpdateRgn` (`0x86ca11`). The caller does `GetUpdateRect` ->
+  `CreateRectRgnIndirect(rect)` -> `GetUpdateRgn(hwnd, rgn, FALSE)` and only uses
+  the region contents when the result is `COMPLEXREGION` (3); otherwise it
+  deletes the region and calls `BeginPaint`. Both are now implemented:
+  `CreateRectRgnIndirect` builds a `gdi::Object::Region` from the guest `RECT`
+  (same object as `CreateRectRgn`), and `GetUpdateRgn` fills the region with the
+  client rect while the window's flag is pending and returns `SIMPLEREGION` (2)
+  or `NULLREGION` (1), so the guest never takes the `GetRegionData`/`ValidateRgn`
+  path. `bErase` does not validate, matching Windows. Files: kit
+  `runtime/gdi32_draw.cpp`, `runtime/user32.cpp`. Checks: `--target app` rebuilt
+  and signed `build/Civ4BTSRecomp.app` with no errors; both files clang-format
+  clean. No app run. Log: consumer
+  `analysis/d3d9-m10-gdi-rgn-build.log` (ignored).
 - [ ] **M11. Raster breadth.** Needs M6. Done when: viewport and half-pixel
   offset, culling, alpha test, fog, blending including separate alpha, depth,
   stencil, scissor, color masks, depth bias, texture addressing, filtering, LOD

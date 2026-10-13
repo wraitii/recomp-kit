@@ -1144,6 +1144,9 @@ void Dev_GetDeviceCaps(X86 *c) {
     put_caps9(out);
     com_ret(c, D3D_OK9);
 }
+void Dev_EvictManagedResources(X86 *c) {
+    com_ret(c, this_device9(c) ? D3D_OK9 : D3DERR_INVALIDCALL);
+}
 void Dev_BeginScene(X86 *c) {
     ComObj *dev = this_device9(c);
     if (kD3d9WgpuEnabled) {

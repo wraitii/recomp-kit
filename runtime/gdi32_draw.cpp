@@ -445,6 +445,16 @@ void create_region(X86 *c) {
     o.rect = rectangle(c, 0);
     set_eax(c, make_object(o));
 }
+// CreateRectRgnIndirect(const RECT*): the same object as CreateRectRgn, with
+// the bounds read from guest memory.
+void create_region_indirect(X86 *c) {
+    uint32_t p = arg(c, 0);
+    Object o;
+    o.kind = Object::Region;
+    if (p && gm_valid(p, 16))
+        o.rect = read_rect(p);
+    set_eax(c, make_object(o));
+}
 void set_region(X86 *c) {
     auto it = objects().find(arg(c, 0));
     if (it == objects().end() || it->second.kind != Object::Region) {
@@ -630,6 +640,7 @@ void register_draw() {
                                        G("PolyBezierTo", 3, polyto),
                                        G("ExtFloodFill", 5, flood),
                                        G("CreateRectRgn", 4, create_region),
+                                       G("CreateRectRgnIndirect", 1, create_region_indirect),
                                        G("SetRectRgn", 5, set_region),
                                        G("GetRgnBox", 2, region_box),
                                        G("FrameRgn", 5, frame_region),

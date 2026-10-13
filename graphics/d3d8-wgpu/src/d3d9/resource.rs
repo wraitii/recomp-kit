@@ -1333,6 +1333,21 @@ pub fn upload_buffer(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(), R
     if hi as usize > b.bytes.len() {
         return Err(invalid("PreLoad", "buffer dirty range is outside storage"));
     }
+    if super::trace_enabled() {
+        static COUNT: AtomicU32 = AtomicU32::new(0);
+        if COUNT.fetch_add(1, Ordering::Relaxed) < 128 {
+            eprintln!(
+                "[d3d9-trace] buffer_upload resource={:p} pool={} format={} size={} range={}-{} sample={:?}",
+                b as *const BufferState,
+                b.pool,
+                b.format,
+                b.size,
+                lo,
+                hi,
+                &b.bytes[lo as usize..(hi as usize).min(lo as usize + 64)]
+            );
+        }
+    }
     gpu.write_buffer_padded(buffer, &b.bytes, lo, hi)?;
     b.dirty_lo = 0;
     b.dirty_hi = 0;
@@ -1447,6 +1462,23 @@ pub fn upload_level(
         (t.format, l.width, l.height, l.depth, l.dirty)
     };
     if dirty {
+        if super::trace_enabled() && level == 0 {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            if COUNT.fetch_add(1, Ordering::Relaxed) < 128 {
+                let bytes = &t.subresources[index].bytes;
+                eprintln!(
+                    "[d3d9-trace] upload resource={:p} pool={} format={} size={}x{}x{} nonzero={} sample={:?}",
+                    t as *const TextureState,
+                    t.pool,
+                    format,
+                    width,
+                    height,
+                    depth,
+                    bytes.iter().filter(|&&b| b != 0).count(),
+                    &bytes[..bytes.len().min(32)]
+                );
+            }
+        }
         if format::is_depth(format) && format == format::D3DFMT_D32F_LOCKABLE {
             let bytes = {
                 let l = &t.subresources[index];

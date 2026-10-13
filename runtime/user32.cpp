@@ -1398,6 +1398,18 @@ void u_GetUpdateRect(X86 *c) {
         w->update_pending = false; // bErase: the caller will paint it now
     set_eax(c, pending);
 }
+// GetUpdateRgn(hwnd, hrgn, bErase): fill the region with the update area and
+// report its complexity. The update region is a flag here, so a pending window
+// is the whole client and an idle one is empty. bErase does not validate; the
+// guest still validates through BeginPaint or ValidateRgn.
+void u_GetUpdateRgn(X86 *c) {
+    Window *w = find_window(arg(c, 0));
+    bool pending = w && w->update_pending;
+    auto it = gdi::objects().find(arg(c, 1));
+    if (it != gdi::objects().end() && it->second.kind == gdi::Object::Region)
+        it->second.rect = pending ? gdi::Rect{0, 0, w->w, w->h} : gdi::Rect{};
+    set_eax(c, pending ? 2 : 1); // SIMPLEREGION / NULLREGION
+}
 void u_LoadCursorFromFileW(X86 *c) {
     set_eax(c, arg(c, 0) && gm_valid(arg(c, 0), 2) ? g_next_icon++ : 0);
 }
@@ -2020,6 +2032,7 @@ const ImportShim g_user32_shims[] = {
     {"USER32.dll", "LoadCursorA", 2, u_LoadCursorA},
     {"USER32.dll", "ValidateRect", 2, u_ValidateRect},
     {"USER32.dll", "GetUpdateRect", 3, u_GetUpdateRect},
+    {"USER32.dll", "GetUpdateRgn", 3, u_GetUpdateRgn},
     {"USER32.dll", "GetScrollBarInfo", 3, nullptr},
     {"USER32.dll", "LoadCursorFromFileA", 1, u_LoadCursorFromFileW},
     {"USER32.dll", "LoadCursorFromFileW", 1, u_LoadCursorFromFileW},

@@ -2117,7 +2117,7 @@ pub fn d3dx_effect_enum(effect: &D3dxEffect, parent: u32, index: u32, kind: u32)
             }
         }
         K_PASS => {
-            let Some((tech, _)) = pass_parts(parent) else {
+            let Some(tech) = handle_index(parent, H_TECH) else {
                 return 0;
             };
             let Some(technique) = effect.techniques.get(tech as usize) else {

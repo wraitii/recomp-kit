@@ -944,6 +944,13 @@ void BinkSetSoundOnOff(X86 *c) {
 }
 #endif
 
+// _BinkShouldSkip@4(HBINK): nonzero when the caller should drop the current
+// frame because playback is behind. This shim decodes each frame synchronously
+// and BinkWait blocks to the frame boundary, so no frame is ever late.
+void BinkShouldSkip(X86 *c) {
+    ret0(c);
+}
+
 void BinkDDSurfaceType(X86 *c) {
     ComObj *s = com_this_arg(c);
     uint32_t type = 0;
@@ -1003,6 +1010,7 @@ const ImportShim g_video_shims[] = {
     BINK(NextFrame, 4, BinkNextFrame),
     BINK(Wait, 4, BinkWait),
     BINK(CopyToBuffer, 28, BinkCopyToBuffer),
+    BINK(ShouldSkip, 4, BinkShouldSkip),
     BINK(Service, 4, BinkService),
     BINK(GetError, 0, BinkGetError),
     BINK(Close, 4, BinkClose),

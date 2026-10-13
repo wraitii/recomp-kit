@@ -719,11 +719,6 @@ void g_GetDeviceCaps(X86 *c) {
     set_eax(c, value);
 }
 
-// Text: accepted and measured with fixed metrics, not drawn.
-void g_TextOutA(X86 *c) {
-    log_once("gdi.textout", "gdi: TextOutA is accepted and not drawn in this runtime");
-    set_eax(c, 1);
-}
 void g_GetTextMetricsA(X86 *c) {
     uint32_t tm = arg(c, 1);
     if (!tm || !gm_valid(tm, 56)) {
@@ -789,9 +784,6 @@ void g_SetBkMode(X86 *c) {
     dc.bk_mode = arg(c, 1);
     set_eax(c, prev);
 }
-// (hdc, nCharExtra): returns the previous intercharacter spacing. The value is
-// kept on the DC; the runtime's TextOutA does not draw, so nothing consumes it
-// yet.
 void g_SetTextCharacterExtra(X86 *c) {
     auto *found = dc_of(arg(c, 0));
     if (!found) {
@@ -806,7 +798,6 @@ void g_SetTextCharacterExtra(X86 *c) {
 
 const ImportShim g_gdi32_shims[] = {
     {"GDI32.dll", "CreateFontA", 14, nullptr},
-    {"GDI32.dll", "ExtTextOutA", 8, nullptr},
     {"GDI32.dll", "CreateCompatibleBitmap", 3, g_CreateCompatibleBitmap},
     // Named for its argument count; the result is ERROR, which is honest.
     {"GDI32.dll", "CombineRgn", 4, nullptr},
@@ -825,7 +816,6 @@ const ImportShim g_gdi32_shims[] = {
     {"GDI32.dll", "SetSystemPaletteUse", 2, g_SetSystemPaletteUse},
     {"GDI32.dll", "GetDIBits", 7, g_GetDIBits},
     {"GDI32.dll", "GetDeviceCaps", 2, g_GetDeviceCaps},
-    {"GDI32.dll", "TextOutA", 5, g_TextOutA},
     {"GDI32.dll", "GetTextMetricsA", 2, g_GetTextMetricsA},
     {"GDI32.dll", "GetTextExtentPointA", 4, g_GetTextExtentPointA},
     {"GDI32.dll", "SetTextColor", 2, g_SetTextColor},

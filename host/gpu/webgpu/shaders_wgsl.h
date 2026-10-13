@@ -142,18 +142,18 @@ struct PSOut { @location(0) color: vec4f, @location(1) coverage: f32 };
     }
     if (u.specular != 0u) { c = vec4f(sat3(c.rgb + i.spec.rgb), c.a); }
     if (u.alphatest != 0u) {
-        var pass = true;
+        var alpha_pass = true;
         switch (u.alphafunc) {
-            case 1u: { pass = false; }
-            case 2u: { pass = c.a < u.alpharef; }
-            case 3u: { pass = c.a == u.alpharef; }
-            case 4u: { pass = c.a <= u.alpharef; }
-            case 5u: { pass = c.a > u.alpharef; }
-            case 6u: { pass = c.a != u.alpharef; }
-            case 7u: { pass = c.a >= u.alpharef; }
-            default: { pass = true; }
+            case 1u: { alpha_pass = false; }
+            case 2u: { alpha_pass = c.a < u.alpharef; }
+            case 3u: { alpha_pass = c.a == u.alpharef; }
+            case 4u: { alpha_pass = c.a <= u.alpharef; }
+            case 5u: { alpha_pass = c.a > u.alpharef; }
+            case 6u: { alpha_pass = c.a != u.alpharef; }
+            case 7u: { alpha_pass = c.a >= u.alpharef; }
+            default: { alpha_pass = true; }
         }
-        if (!pass) { discard; }
+        if (!alpha_pass) { discard; }
     }
     if (u.fogmode != 0u) {
         var f = 1.0;

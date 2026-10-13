@@ -149,10 +149,12 @@ fn same_subresource(a: &SurfaceView, b: &SurfaceView) -> bool {
     a.texture == b.texture && a.subresource == b.subresource
 }
 
-fn wgpu_format(format_value: u32, op: &'static str) -> Result<wgpu::TextureFormat, RenderError> {
-    format::d3d_to_wgpu(format_value).ok_or_else(|| {
-        RenderError::new(op, format!("D3D format {format_value} has no wgpu mapping"))
-    })
+fn wgpu_format(view: &SurfaceView, op: &'static str) -> Result<wgpu::TextureFormat, RenderError> {
+    format::d3d_to_wgpu(view.format)
+        .map(|_| view.texture.format())
+        .ok_or_else(|| {
+            RenderError::new(op, format!("D3D format {} has no wgpu mapping", view.format))
+        })
 }
 
 fn opaque_destination(format_value: u32) -> bool {
@@ -232,8 +234,8 @@ fn raw_copy(
     dst_rect: Rect,
     op: &'static str,
 ) -> Result<(), RenderError> {
-    let src_format = wgpu_format(src.format, op)?;
-    let dst_format = wgpu_format(dst.format, op)?;
+    let src_format = wgpu_format(src, op)?;
+    let dst_format = wgpu_format(dst, op)?;
     if src_format != dst_format {
         return Err(RenderError::new(
             op,
@@ -297,8 +299,8 @@ fn blit(
     filter: u32,
     op: &'static str,
 ) -> Result<(), RenderError> {
-    let src_format = wgpu_format(src.format, op)?;
-    let dst_format = wgpu_format(dst.format, op)?;
+    let src_format = wgpu_format(src, op)?;
+    let dst_format = wgpu_format(dst, op)?;
     let src_features = src_format.guaranteed_format_features(gpu.features());
     if !src_features
         .flags
@@ -734,7 +736,7 @@ pub(crate) fn color_fill(
     if rect.is_empty() {
         return Ok(());
     }
-    let dst_format = wgpu_format(dst.format, OP)?;
+    let dst_format = wgpu_format(dst, OP)?;
     let features = dst_format.guaranteed_format_features(gpu.features());
     if !features
         .allowed_usages
