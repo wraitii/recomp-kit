@@ -26,7 +26,9 @@ def function_ir(tr, lifter, fn):
             noreturn[i] = insns[i].addr + insns[i].length
             succ[i] = []
     return FunctionIR(fn.addr, insns, succ, table_jumps(tr, fn), external_exits(tr, fn),
-                      noreturn=noreturn, seh=tr.seh_effects(fn), language=lifter.language)
+                      noreturn=noreturn, seh=tr.seh_effects(fn), language=lifter.language,
+                      import_tails={i: slot for i, ins in enumerate(fn.insns)
+                                    if (slot := tr.import_tail_slot(ins)) is not None})
 
 
 def external_exits(tr, fn):

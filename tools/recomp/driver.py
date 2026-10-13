@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+from copy import copy
 import sys
 import time
 from tempfile import TemporaryDirectory
@@ -263,6 +264,12 @@ def _emit(task):
                 raise TranslateError("%08x: emission requires finalized shared layouts" % addr)
             lines, external, requests, decisions = production.emit_ssa_prepared(body)
             deps = set(c_symbols.prepared_declarations(body))
+            if body.ir.import_tails:
+                fallback = copy(fn)
+                fallback.dead_addrs = set()
+                symbol = c_symbols.symbol('body_import_fallback', addr)
+                lines = tr.translate(fallback, fallback.addrs, body_symbol=symbol) + lines
+                deps |= {Declaration("entry", t) for t in tr.call_targets}
             if entries and not external:
                 wrappers = tr.translate(fn, entries)
                 head = "void fn_%08x(X86 *c) {" % addr

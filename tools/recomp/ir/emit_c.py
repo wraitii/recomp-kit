@@ -312,6 +312,18 @@ def emit_prepared(prepared, external_entry=False):
                 elif v.opc == "TAIL":
                     lines.extend(boundary.event(v))
                 elif v.opc == "BRANCHIND":
+                    if i in fir.import_tails:
+                        lines.extend(x87_printer.operations(program.defaults.get(v.id, ())))
+                        lines.extend(publish(v))
+                        lines.append('c->eip = 0x%xu;' % b.insn.addr)
+                        target = ref(v.args[0])
+                        first = min(ins.addr for ins in fir.insns if ins.length)
+                        end = max(ins.addr + ins.length for ins in fir.insns if ins.length)
+                        lines.append('if ((uint32_t)%s >= 0x%xu && (uint32_t)%s < 0x%xu)' % (target, first, target, end))
+                        lines.append('%s(c, (uint32_t)%s);' % (c_symbols.symbol('body_import_fallback', fir.addr), target))
+                        lines.append('else recomp_jump(c, (uint32_t)%s);' % target)
+                        lines.append('return;')
+                        continue
                     # A decoded jump table: the target address selects a case, any
                     # other value is a runtime jump exactly like the decoded
                     # emitter's default arm (publish everything, set EIP to the

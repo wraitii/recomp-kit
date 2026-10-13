@@ -357,7 +357,10 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
             if fir.succ[i]:
                 raise SSAError("return has successors")
         elif branches and branches[0].opc == "BRANCHIND":
-            if i not in fir.tables or not fir.succ[i]:
+            if i in fir.import_tails:
+                if fir.succ[i]:
+                    raise SSAError("import tail has successors")
+            elif i not in fir.tables or not fir.succ[i]:
                 raise SSAError("computed jump without a decoded table")
         elif len(set(fir.succ[i])) != 1:
             raise SSAError("instruction requires one fallthrough successor")

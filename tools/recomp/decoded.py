@@ -216,7 +216,7 @@ NORETURN_IMPORTS = frozenset(("RaiseException", "ExitProcess", "TerminateProcess
 class Translator(ControlFlow):
     # -- emission ----------------------------------------------------------
 
-    def translate(self, fn, entries=()):
+    def translate(self, fn, entries=(), body_symbol=None):
         """Emit fn_ADDR, plus one thin wrapper per alternate entry point.
 
         With entries, the body becomes `static void body_ADDR(X86 *, uint32_t)`
@@ -250,14 +250,18 @@ class Translator(ControlFlow):
             labels.add(fn.addr)
         out = []
         if entries:
-            out.append("static void body_%08x(X86 *c, uint32_t entry_) {" % fn.addr)
+            out.append("RECOMP_COLD void %s(X86 *c, uint32_t entry_) {" % body_symbol
+                       if body_symbol else "static void body_%08x(X86 *c, uint32_t entry_) {" % fn.addr)
             out.append("    x86_cc_settle(c);")
             if fn.seh_escapes:
                 out.append("    uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
             out.append("    switch (entry_) {")
             for e in entries:
                 out.append("    case %s: goto L_%08x;" % (hexlit(e), e))
-            out.append("    default: goto L_%08x;" % fn.addr if head else "    default: break;")
+            if body_symbol:
+                out.append("    default: recomp_jump(c, entry_); return;")
+            else:
+                out.append("    default: goto L_%08x;" % fn.addr if head else "    default: break;")
             out.append("    }")
         else:
             out.append("void fn_%08x(X86 *c) {" % fn.addr)
@@ -286,7 +290,7 @@ class Translator(ControlFlow):
         referenced = set(re.findall(r'\bgoto (L_[0-9a-f]+);', '\n'.join(out)))
         out = [line for line in out if not (line.startswith('L_')
                and line.endswith(': ;') and line[:-3] not in referenced)]
-        if entries:
+        if entries and body_symbol is None:
             out.append("void fn_%08x(X86 *c) { body_%08x(c, 0u); }" % (fn.addr, fn.addr))
             for e in entries:
                 out.append("void fn_%08x(X86 *c) { body_%08x(c, %s); }" % (e, fn.addr, hexlit(e)))
