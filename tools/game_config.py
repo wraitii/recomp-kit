@@ -83,6 +83,7 @@ TRANSLATE_DEFAULTS = {
     "msvc_x87_convention": True,
     "call_contracts": True,
     "private_leaf_contracts": False,
+    "ecx_private_targets": [],
     "x87_cw_clone": True,
 }
 
@@ -247,6 +248,11 @@ def load(game_dir, build_root=None):
         raise ValueError("%s: [translate] x87_cw_clone must be a boolean" % source)
     if not isinstance(translate.setdefault("private_leaf_contracts", TRANSLATE_DEFAULTS["private_leaf_contracts"]), bool):
         raise ValueError("%s: [translate] private_leaf_contracts must be a boolean" % source)
+    ecx_targets = translate.setdefault("ecx_private_targets", TRANSLATE_DEFAULTS["ecx_private_targets"])
+    if (not isinstance(ecx_targets, list) or
+            not all(type(v) is int and 0 <= v <= 0xffffffff for v in ecx_targets) or
+            len(set(ecx_targets)) != len(ecx_targets)):
+        raise ValueError("%s: [translate] ecx_private_targets must be a unique list of 32-bit addresses" % source)
     if type(translate.setdefault("x87_imports_preserve_pc_rc", False)) is not bool:
         raise ValueError("%s: x87_imports_preserve_pc_rc must be a boolean" % source)
     if translate.get("x87_facts") is not None and (not isinstance(translate["x87_facts"], str) or not translate["x87_facts"]):

@@ -218,7 +218,8 @@ def _prepare(task):
                     tr, ctx.lifter, fn, entries,
                     production.ProductionRequest(ctx.settings.emit, ctx.known, callee_contracts,
                         checked_returns, frozenset(private_targets) if selected else frozenset(), selected,
-                        mode_sites.get(addr), entry_verification.get(addr)), ctx.artifacts)
+                        mode_sites.get(addr), entry_verification.get(addr),
+                        ctx.settings.ecx_private_targets), ctx.artifacts)
             except (SSAError, LiftError) as error:
                 reason = str(error)
             else:
@@ -493,9 +494,14 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
         mode_exposure = x87_mode.exposure_report(mode_prepared, calls, mode_opaque, x87_counts,
                                                 {addr: row.writers for addr, row in scanned.items()})
         eligibility = Eligibility(settings, scanned, mode_opaque)
+        if settings.ecx_private_targets and not eligibility.enabled:
+            raise TranslateError("ECX private targets require call contracts, relaxed local state and a game translation")
         for addr in settings.checked_returns:
             if not eligibility.checked(addr):
                 raise TranslateError("%08x: checked return requires an unreplaced, closed single-entry body without SEH" % addr)
+        for addr in settings.ecx_private_targets:
+            if not eligibility.checked(addr):
+                raise TranslateError("%08x: ECX private target requires an unreplaced, closed single-entry body without SEH" % addr)
         contracts = {}
         if settings.call_contracts:
             prepared = {addr: row.register_facts or None for addr, row in scanned.items()}
@@ -515,7 +521,7 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
             addr, contract, reason = candidate.addr, candidate.contract, candidate.reason
             if reason is None:
                 private_targets[addr] = contract
-            elif addr in settings.checked_returns:
+            elif addr in settings.checked_returns or addr in settings.ecx_private_targets:
                 raise TranslateError("%08x: configured private body failed: %s" % (addr, reason))
             else:
                 private_rejections[addr] = reason
@@ -531,7 +537,8 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
         tasks = [PreparationTask(tuple(part), analysis.for_addresses(part, calls), selection, store) for part in parts]
         plans = {plan.addr: plan for batch in pool.map(_prepare, tasks) for plan in batch}
         specialization = contract_variants.SpecializationPlan.build(
-            {addr: plan.requests for addr, plan in plans.items()}, private_targets)
+            {addr: plan.requests for addr, plan in plans.items()}, private_targets,
+            settings.ecx_private_targets)
         shared_layouts = specialization.layouts
         private_plans = list(pool.map(_prepare_private,
                              [PrivatePreparationTask(addr, layout, addr in known_modes, store)
@@ -562,7 +569,8 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
     os.makedirs(args.out, exist_ok=True)
     output.write_funcs_header(args.out, entry_names)
     output.emit_body_chunks(args.out, functions, bodies, entries_by_fn, dependencies, known_modes)
-    output.emit_entry_chunks(args.out, entry_names, settings.module, checked_returns, private_masks)
+    output.emit_entry_chunks(args.out, entry_names, settings.module, checked_returns, private_masks,
+                             settings.ecx_private_targets)
     symbols = symbol_rows(ctx, entry_names, rows)
     if settings.module:
         output.write_module_table(args.out, entry_names, symbols, call_returns, settings.module)

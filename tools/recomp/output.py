@@ -78,7 +78,7 @@ def emit_body_chunks(out, functions, bodies, entries_by_fn, dependencies, known_
             declarations |= dependencies[fn.addr]
         calls = sorted({d.target for d in declarations if d.kind == "entry"})
         checked = sorted({d.target for d in declarations if d.kind == "checked"})
-        private = sorted({(d.target, d.mask) for d in declarations
+        private = sorted({(d.target, d.mask, d.ecx_argument) for d in declarations
                           if d.kind == "private_contract"})
         prepare = sorted({d.target for d in declarations if d.kind == "private_prepare"})
         with path.open("w") as fh:
@@ -97,8 +97,8 @@ def emit_body_chunks(out, functions, bodies, entries_by_fn, dependencies, known_
             for addr in prepare:
                 fh.write(declaration(Declaration("private_prepare", addr)) + "\n")
                 fh.write(emit_contract_prepare(addr, addr in known_modes))
-            for addr, mask in private:
-                fh.write(declaration(Declaration("private_contract", addr, mask)) + "\n")
+            for addr, mask, ecx_argument in private:
+                fh.write(declaration(Declaration("private_contract", addr, mask, ecx_argument)) + "\n")
             fh.write("\n")
             for fn in group:
                 alt = sorted(entries_by_fn.get(fn.addr, ()))
@@ -110,7 +110,8 @@ def emit_body_chunks(out, functions, bodies, entries_by_fn, dependencies, known_
     return paths
 
 
-def emit_entry_chunks(out, entry_names, module=None, checked_returns=(), private_masks=None):
+def emit_entry_chunks(out, entry_names, module=None, checked_returns=(), private_masks=None,
+                      ecx_private_targets=()):
     """Tiny address-named entry thunks own the changing dense dispatch indices.
 
     Native redirects are resolved only by table.c. Editing an override header
@@ -138,8 +139,11 @@ def emit_entry_chunks(out, entry_names, module=None, checked_returns=(), private
                         variant = BodyVariant(EntryForm.PRIVATE, ReturnForm.PRIVATE)
                         body = symbol("fn_contract", addr, mask)
                         entry = symbol("entry_contract", addr, mask)
-                        fh.write(entry_signature(variant, body) + ";\n")
-                        fh.write("%s { %s(c, expected); }\n" % (entry_signature(variant, entry), body))
+                        ecx_argument = addr in ecx_private_targets
+                        fh.write(entry_signature(variant, body, ecx_argument) + ";\n")
+                        arguments = "c, ecx_, expected" if ecx_argument else "c, expected"
+                        fh.write("%s { %s(%s); }\n" %
+                                 (entry_signature(variant, entry, ecx_argument), body, arguments))
             checked = [(i, a) for i, a in entries if a in checked_returns]
             if checked:
                 fh.write("void recomp_enter_checked(X86 *c, uint32_t index, uint32_t expected, "

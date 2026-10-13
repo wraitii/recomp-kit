@@ -44,6 +44,7 @@ class Settings(object):
         self.x87_entry_contracts = translate.get("x87_entry_contracts", []) if not self.module else []
         self.call_contracts = translate["call_contracts"]
         self.private_leaf_contracts = translate["private_leaf_contracts"] and not self.module
+        self.ecx_private_targets = frozenset(translate["ecx_private_targets"]) if not self.module else frozenset()
         self.checked_returns = frozenset(translate["checked_returns"]) if not self.module else frozenset()
         self.state_contract_callers = frozenset(translate["state_contract_callers"]) if not self.module else frozenset()
         self.allow_unmodelled = allow_unmodelled

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 from .artifacts import ArtifactStore
 from .body import BodyRequest, BodyVariant, EntryForm, ReturnForm, EmissionPolicy, FrozenMap
-from . import c_boundaries, c_symbols
+from . import c_boundaries, c_symbols, flag_region
 from .prepare import prepare as prepare_body
 from .emit_c import emit_prepared
 from .invocation import EntryBinding
@@ -39,11 +39,12 @@ class ProductionRequest:
     report_calls: bool = False
     mode_sites: FrozenMap = FrozenMap()
     entry_verify: object | None = None
+    ecx_private_targets: frozenset = frozenset()
 
     def __post_init__(self):
         for name in ("contracts", "mode_sites"):
             object.__setattr__(self, name, FrozenMap.of(getattr(self, name)))
-        for name in ("known", "checked_returns", "contract_calls"):
+        for name in ("known", "checked_returns", "contract_calls", "ecx_private_targets"):
             object.__setattr__(self, name, frozenset(getattr(self, name)))
 
 
@@ -66,6 +67,7 @@ def prepare_ssa(tr, lifter, fn, entries, request, artifacts=None):
                        call_contracts={t: request.contracts[t] for t in calls if t in request.contracts},
                        checked_calls=set(calls) & request.checked_returns,
                        contract_calls=set(calls) & request.contract_calls if not fir.entries and not fir.seh else (),
+                       ecx_private_targets=request.ecx_private_targets,
                        mode_sites=request.mode_sites, entry_verify=request.entry_verify,
                        report_calls=request.report_calls)
     try:
@@ -120,8 +122,8 @@ def prepare_private(tr, lifter, fn, policy, layout, known_mode=False, artifacts=
     body = prepare_body(fir, request, lifter=lifter, normalized=artifacts.normalized(fir, lifter))
     if finalize:
         body.finalize({})
-    complete = layout.outputs == tuple(FIELDS)
-    if not known_mode and not complete:
+    complete = layout.outputs == tuple(FIELDS) and not layout.ecx_argument
+    if not known_mode and not complete and not layout.ecx_argument:
         complete = private_contract(tr, lifter, fn, artifacts).writes <= set(layout.outputs)
     return PrivatePlan(fn.addr, layout, variant,
                        None if not known_mode and complete else body)
@@ -129,13 +131,27 @@ def prepare_private(tr, lifter, fn, policy, layout, known_mode=False, artifacts=
 
 def emit_private_prepared(plan):
     name = c_symbols.symbol("fn_contract", plan.addr, plan.layout.output_mask)
-    signature = c_symbols.entry_signature(plan.variant, name)
+    signature = c_symbols.entry_signature(plan.variant, name, plan.layout.ecx_argument)
     if plan.body is None:
         return ["%s { %s(c, expected); }" % (signature, c_symbols.symbol("fn_checked", plan.addr))]
     if plan.body.options.request.layout != plan.layout or plan.body.options.request.variant != plan.variant:
         raise SSAError("private body disagrees with its entry layout or variant")
     lines = emit_prepared(plan.body, external_entry=True).splitlines()
-    wrapped = _wrapped(_entry_action(plan.body), "%s(c, expected)" % plan.body.options.symbol)
+    body_arguments = "c, ecx_, expected" if plan.layout.ecx_argument else "c, expected"
+    if (plan.layout.ecx_argument and plan.body.options.request.policy.lazy_flags
+            and plan.body.cc_entry == flag_region.SETTLE):
+        body_prototype = lines[0].removesuffix(" {")
+        lines[:0] = ["#if defined(__GNUC__) || defined(__clang__)",
+                     "%s __attribute__((noinline));" % body_prototype,
+                     "#endif"]
+        slow_name = name + "_settle"
+        slow_signature = c_symbols.entry_signature(plan.variant, slow_name, True)
+        lines.append("RECOMP_COLD %s { x86_cc_settle(c); %s(%s); }" % (
+            slow_signature, plan.body.options.symbol, body_arguments))
+        lines.append("%s { if (RECOMP_UNLIKELY(c->cc_op != X86_CC_NONE)) %s(%s); else %s(%s); }" % (
+            signature, slow_name, body_arguments, plan.body.options.symbol, body_arguments))
+        return lines
+    wrapped = _wrapped(_entry_action(plan.body), "%s(%s)" % (plan.body.options.symbol, body_arguments))
     lines.append("%s { %s; }" % (signature, wrapped))
     return lines
 

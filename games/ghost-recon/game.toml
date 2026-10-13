@@ -14,6 +14,7 @@ store_hooks = false
 [translate]
 code_map = "metadata"
 private_leaf_contracts = true
+ecx_private_targets = [0x00755990, 0x007b80e0, 0x0052f200, 0x00569150, 0x00538240]
 # MOV EAX,label; RET in Catch@ funclets hand these continuations to the C++ EH runtime.
 alternate_entries = [
     0x0040201b,
