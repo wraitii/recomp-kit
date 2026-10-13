@@ -3,8 +3,9 @@
 A *settle site* is the function entry or the instruction after a call.  The
 region walks in-body control flow from the site until it reaches a boundary:
 
-* a direct/indirect CALL or a RET, where the next site (the callee's entry or
-  the caller's own site) takes over;
+* a direct/indirect CALL, a RET, or a resolved TAIL to another translated
+  body, where the next site (the callee's or tail target's entry, or the
+  caller's own site) takes over;
 * an instruction whose arithmetic-flag effect is unknown, or a transfer that
   leaves the body, which is an observer and forces a settle.
 
@@ -56,8 +57,8 @@ def summarize(start, successors, access, is_end, leaves, count):
     ``access(i)``      ``(reads, writes)`` frozensets, or ``None`` when the
                        instruction's arithmetic-flag effect is unknown (an
                        observer that forces a settle).
-    ``is_end(i)``      a normal region boundary (CALL/CALLIND/RET): stop here,
-                       record the path, do not force a settle.
+    ``is_end(i)``      a normal region boundary (CALL/CALLIND/RET/TAIL): stop
+                       here, record the path, do not force a settle.
     ``leaves(i)``      control can leave the body after ``i``: an observer.
 
     Returns ``(reads, writes, must)`` over the paths to a boundary, or None

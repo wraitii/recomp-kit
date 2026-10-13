@@ -93,14 +93,16 @@ def ssa_settle_plan(cgi, flag_off_name):
     from each call instruction index to the post-call region summary
     (`flag_region.summarize`), which `call_cc_action` turns into a decision.
     The classification is over the codegen ops, so it matches what the
-    emitter actually materialises: an eager seam is an observer, a call is a
-    normal region boundary, and unknown forms settle.
+    emitter actually materialises: an eager seam is an observer, a call or a
+    resolved tail is a normal region boundary, and unknown forms settle.  A
+    resolved tail enters another translated body whose entry dispatch settles
+    before any hook; an unresolved or import tail stays a BRANCHIND observer.
     """
     n = len(cgi.insns)
 
     def access(i):
         ins = cgi.insns[i]
-        if ins.mnem.upper() in ("CALL", "RET"):
+        if ins.mnem.upper() in ("CALL", "RET", "TAIL"):
             return (frozenset(), frozenset())
         if any(op.opc in _SSA_EAGER_OPS for op in ins.ops):
             return None
@@ -125,7 +127,7 @@ def ssa_settle_plan(cgi, flag_off_name):
         return list(cgi.succ[i])
 
     def is_end(i):
-        return cgi.insns[i].mnem.upper() in ("CALL", "RET")
+        return cgi.insns[i].mnem.upper() in ("CALL", "RET", "TAIL")
 
     def summarize(start):
         return flag_region.summarize(start, successors, access, is_end,

@@ -10,11 +10,12 @@ from ir.cfg import FunctionIR
 from ir.emit_c import emit_prepared
 from ir.invocation import EntryBinding
 from ir.lift import Lifter
+from ir.normalize import codegen_ir
 from ir.prepare import live_flag_reload_calls, prepare
 
 
 class LazyFlagTests(unittest.TestCase):
-    def body(self, encoded, **options):
+    def body(self, encoded, exits=None, tails=None, **options):
         lifter = Lifter()
         raw = bytes.fromhex(encoded)
         instructions, position = [], 0
@@ -22,9 +23,12 @@ class LazyFlagTests(unittest.TestCase):
             instructions.append(lifter.lift(0x1000 + position, raw[position:position + size]))
             position += size
         successors = [[i + 1] if i + 1 < len(instructions) else [] for i in range(len(instructions))]
+        tails = tails or {}
         request = BodyRequest('fixture', policy=EmissionPolicy(lazy_flags=True, indirect_call_symbol='indirect'),
-                              **options)
-        return prepare(FunctionIR(0x1000, instructions, successors, {}), request, lifter=lifter)
+                              tail_symbols=tails, **options)
+        fir = FunctionIR(0x1000, instructions, successors, {}, exits=exits)
+        normalized = codegen_ir(fir, lifter, tails) if tails else None
+        return prepare(fir, request, lifter=lifter, normalized=normalized)
 
     def test_imul_does_not_read_incoming_carry(self):
         body = self.body('e8 fb 0f 00 00 69 c9 fd 43 03 00 83 c1 01 c3',
@@ -37,6 +41,22 @@ class LazyFlagTests(unittest.TestCase):
 
     def test_inc_entry_preserves_only_carry(self):
         body = self.body('40 c3')
+        self.assertEqual(body.cc_entry, ('x86_cc_settle_or_drop', frozenset(('cf',))))
+
+    def test_resolved_tail_forwards_pending_descriptor(self):
+        # jmp 0x2000: a resolved tail is a normal boundary, so the descriptor
+        # passes through to the target's entry instead of settling here.
+        body = self.body('e9 fb 0f 00 00', exits={0: [0x2000]}, tails={0x2000: 'target'})
+        self.assertEqual(body.cc_entry, 'remove')
+
+    def test_tail_after_full_overwrite_drops(self):
+        # xor eax, eax; jmp 0x2000: every flag is overwritten before the tail.
+        body = self.body('31 c0 e9 f9 0f 00 00', exits={1: [0x2000]}, tails={0x2000: 'target'})
+        self.assertEqual(body.cc_entry, 'drop')
+
+    def test_tail_still_keeps_incoming_read(self):
+        # adc eax, eax; jmp 0x2000: the incoming carry is a real read.
+        body = self.body('11 c0 e9 f9 0f 00 00', exits={1: [0x2000]}, tails={0x2000: 'target'})
         self.assertEqual(body.cc_entry, ('x86_cc_settle_or_drop', frozenset(('cf',))))
 
     def test_inc_zero_reader_only_keeps_result_predicate(self):

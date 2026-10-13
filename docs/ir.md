@@ -233,11 +233,14 @@ unaffected and must remain preserved.
 the six flag fields are current. `x86_cc_settle` writes them; `x86_get_eflags`,
 `x86_set_eflags`, `x86_sahf`, `recomp_comis`, the interpreter and `recomp_call`
 settle first. `ir/flag_region.py` walks from the entry or a post-call point to
-the next CALL/CALLIND/RET: with no flag read and no flag write the settle is
-removed; with no read and all six flags written on every path it becomes
-`x86_cc_drop`. After a call, the flags read, reloaded from the fields or not
-written on every path form a mask: `x86_cc_settle_mask` (region without
-writes) and `x86_cc_settle_or_drop` materialise only a descriptor whose
+the next CALL/CALLIND/RET or resolved TAIL: with no flag read and no flag write
+the settle is removed; with no read and all six flags written on every path it
+becomes `x86_cc_drop`. A resolved TAIL goes to another translated body, whose
+entry site (and entry dispatch, which settles before a hook) takes over, so a
+pending descriptor is forwarded rather than settled. After a call, the flags
+read, reloaded from the fields or not written on every path form a mask:
+`x86_cc_settle_mask` (region without writes) and `x86_cc_settle_or_drop`
+materialise only a descriptor whose
 `cc_mask` meets it, and otherwise keep or drop it. The overwrite-region helper
 computes only needed fields before dropping the descriptor; entry masks also
 include live flag inputs. Reads within an instruction are counted only before
@@ -245,10 +248,10 @@ that instruction writes the field. Full-output calls can forward returned flags
 through RET without field reloads; specialized calls retain explicit output
 requirements. Resident flag inputs used only by an ordinary call's hook guard
 settle inside that guard instead of forcing entry loads. A full settle stays for
-paths leaving the body without
-a call or return, for calls that can continue elsewhere (SEH adoption, noreturn,
-setjmp), and where hooks may observe (entry thunks and `recomp_jump` settle
-before a hook). Decoded bodies settle at entry and after calls.
+paths leaving the body without a call, return or resolved tail, for calls that
+can continue elsewhere (SEH adoption, noreturn, setjmp), and where hooks may
+observe (entry thunks and `recomp_jump` settle before a hook). Decoded bodies
+settle at entry and after calls.
 
 `ir/cc_carry.py` carries recipes through resolved CFG edges and merges equal-width
 recipes with payload phis, including differing producer kinds. Only flags covered
