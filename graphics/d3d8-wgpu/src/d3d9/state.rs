@@ -1737,6 +1737,120 @@ impl D3d9State {
         }
         out
     }
+
+    pub(crate) fn effect_capture(&self, keys: &EffectKeys) -> Result<EffectSnapshot, RenderError> {
+        let mut block = D3d9StateBlock::new(D3DSBT_ALL);
+        for &state in &keys.render {
+            if render_state_spec(state).is_none() {
+                return Err(invalid(
+                    "Begin",
+                    format!("render state {state} is not supported for effect capture"),
+                ));
+            }
+            block.set_render(state, 0);
+        }
+        for &(stage, state) in &keys.tss {
+            if stage as usize >= MAX_TEXTURE_STAGES || texture_stage_state_spec(state).is_none() {
+                return Err(invalid(
+                    "Begin",
+                    format!(
+                        "texture stage state {stage}/{state} is out of range for effect capture"
+                    ),
+                ));
+            }
+            block.set_tss(stage, state, 0);
+        }
+        for &(sampler, state) in &keys.sampler {
+            if sampler as usize >= MAX_SAMPLERS || sampler_state_spec(state).is_none() {
+                return Err(invalid(
+                    "Begin",
+                    format!("sampler state {sampler}/{state} is out of range for effect capture"),
+                ));
+            }
+            block.set_sampler(sampler, state, 0);
+        }
+        for &stage in &keys.textures {
+            if stage as usize >= MAX_SAMPLERS {
+                return Err(invalid(
+                    "Begin",
+                    format!("texture stage {stage} is out of range for effect capture"),
+                ));
+            }
+            block.set_texture(stage, 0);
+        }
+        for &index in &keys.transform {
+            if transform_index(index).is_none() {
+                return Err(invalid(
+                    "Begin",
+                    format!("transform {index} is out of range for effect capture"),
+                ));
+            }
+            if !block.transform.iter().any(|entry| entry.0 == index) {
+                block.transform.push((index, [0.0; 16]));
+            }
+        }
+        if keys.vertex_shader {
+            block.vertex_shader = Some(0);
+        }
+        if keys.pixel_shader {
+            block.pixel_shader = Some(0);
+        }
+        for &(start, count) in &keys.vs_const_f {
+            if start as usize + count as usize > VS_CONST_F {
+                return Err(invalid(
+                    "Begin",
+                    "vertex shader constant range is out of bounds for effect capture",
+                ));
+            }
+            for index in start..start + count {
+                if !block.vs_const_f.iter().any(|entry| entry.0 == index) {
+                    block.vs_const_f.push((index, [0.0; 4]));
+                }
+            }
+        }
+        for &(start, count) in &keys.ps_const_f {
+            if start as usize + count as usize > PS_CONST_F {
+                return Err(invalid(
+                    "Begin",
+                    "pixel shader constant range is out of bounds for effect capture",
+                ));
+            }
+            for index in start..start + count {
+                if !block.ps_const_f.iter().any(|entry| entry.0 == index) {
+                    block.ps_const_f.push((index, [0.0; 4]));
+                }
+            }
+        }
+        block.capture_from(self);
+        Ok(EffectSnapshot { block })
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct EffectKeys {
+    pub render: Vec<u32>,
+    pub tss: Vec<(u32, u32)>,
+    pub sampler: Vec<(u32, u32)>,
+    pub transform: Vec<u32>,
+    pub textures: Vec<u32>,
+    pub vertex_shader: bool,
+    pub pixel_shader: bool,
+    pub vs_const_f: Vec<(u32, u32)>,
+    pub ps_const_f: Vec<(u32, u32)>,
+}
+
+pub(crate) struct EffectSnapshot {
+    block: D3d9StateBlock,
+}
+
+impl EffectSnapshot {
+    pub(crate) fn restore(&self, state: &mut D3d9State) {
+        self.block.apply_to(state);
+    }
+
+    pub(crate) fn bindings(&self) -> D3d9Bindings {
+        self.block.bindings()
+    }
 }
 
 fn transform_index(state: u32) -> Option<u32> {

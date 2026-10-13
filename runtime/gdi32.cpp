@@ -47,6 +47,9 @@ extern "C" __attribute__((weak)) bool ddraw_display_mode(uint32_t *, uint32_t *,
 extern "C" __attribute__((weak)) bool dxgi_display_mode(uint32_t *, uint32_t *, uint32_t *) {
     return false;
 }
+extern "C" __attribute__((weak)) bool d3d9_display_mode(uint32_t *, uint32_t *, uint32_t *) {
+    return false;
+}
 // A media session playing video owns the screen. Its frames go straight to the
 // host, and the game keeps drawing its own window behind them - far more often
 // than a movie has frames - so compositing both would show the game's picture
@@ -68,6 +71,8 @@ void win32_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp) {
     // A fullscreen swap chain is the latest word on what mode the display is
     // in; releasing it leaves the DirectDraw mode in charge again.
     if (dxgi_display_mode(w, h, bpp))
+        return;
+    if (d3d9_display_mode(w, h, bpp))
         return;
     if (ddraw_display_mode(w, h, bpp))
         return;

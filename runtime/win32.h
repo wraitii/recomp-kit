@@ -57,6 +57,7 @@ uint32_t get_last_error();
 // DirectDraw supplies the current accepted mode when linked. The runtime-only
 // weak default returns false and leaves the caller's fallback values intact.
 extern "C" bool ddraw_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp);
+extern "C" bool d3d9_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp);
 // Selected DirectDraw mode, otherwise the host virtual desktop.
 void win32_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp);
 // Notify an exclusive DirectDraw window after the accepted mode is published,

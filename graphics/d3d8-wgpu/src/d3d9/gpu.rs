@@ -130,6 +130,27 @@ impl D3d9Gpu {
         self.device.limits()
     }
 
+    pub fn available_texture_mem_bytes(&self) -> Result<u64, RenderError> {
+        #[cfg(target_os = "macos")]
+        {
+            let hal =
+                unsafe { self.device.as_hal::<wgpu::hal::api::Metal>() }.ok_or_else(|| {
+                    RenderError::new("GetAvailableTextureMem", "the device is not a Metal device")
+                })?;
+            let raw = hal.raw_device().lock();
+            Ok(raw
+                .recommended_max_working_set_size()
+                .saturating_sub(raw.current_allocated_size() as u64))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(RenderError::new(
+                "GetAvailableTextureMem",
+                "texture memory estimate is implemented only on the Metal backend",
+            ))
+        }
+    }
+
     pub fn validate<T>(
         &self,
         operation: &'static str,

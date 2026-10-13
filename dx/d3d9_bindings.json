@@ -148,6 +148,7 @@
       "TestCooperativeLevel": "rust",
       "GetCreationParameters": "rust",
       "GetDeviceCaps": "rust",
+      "GetAvailableTextureMem": "rust",
       "GetDisplayMode": "rust",
       "GetNumberOfSwapChains": "rust",
       "Reset": "rust",

@@ -7,14 +7,14 @@ use crate::bridge::{
     D3d9CapsResult, D3d9CheckDepthStencilRequest, D3d9CheckDeviceFormatRequest,
     D3d9CheckDeviceTypeRequest, D3d9CheckFormatConversionRequest, D3d9CheckMultiSampleRequest,
     D3d9CreateResult, D3d9CreationParameters, D3d9CreationParametersResult, D3d9DeclarationResult,
-    D3d9DeviceRequest, D3d9DisplayModeRequest, D3d9DisplayModeResult, D3d9FrameResult,
-    D3d9LevelDescriptor, D3d9LevelDescriptorResult, D3d9LevelLockRequest, D3d9LevelLockResult,
-    D3d9LightResult, D3d9PresentParams, D3d9PrivateDataResult, D3d9ResetRequest, D3d9ResetResult,
-    D3d9ScissorResult, D3d9StreamResult, D3d9SurfaceDescriptor, D3d9SurfaceDescriptorResult,
-    D3d9SurfaceRequest, D3d9TextureCreateResult, D3d9TextureDescriptor,
-    D3d9TextureDescriptorResult, D3d9TextureKind, D3d9TextureRequest, D3d9VertexElement,
-    FloatValuesResult, Status, StatusCode, ValueResult, ValuesResult, Viewport, ViewportResult,
-    status,
+    D3d9DeviceRequest, D3d9DisplayMode, D3d9DisplayModeRequest, D3d9DisplayModeResult,
+    D3d9FrameResult, D3d9LevelDescriptor, D3d9LevelDescriptorResult, D3d9LevelLockRequest,
+    D3d9LevelLockResult, D3d9LightResult, D3d9PresentParams, D3d9PrivateDataResult,
+    D3d9ResetRequest, D3d9ResetResult, D3d9ScissorResult, D3d9StreamResult, D3d9SurfaceDescriptor,
+    D3d9SurfaceDescriptorResult, D3d9SurfaceRequest, D3d9TextureCreateResult,
+    D3d9TextureDescriptor, D3d9TextureDescriptorResult, D3d9TextureKind, D3d9TextureRequest,
+    D3d9VertexElement, FloatValuesResult, Status, StatusCode, ValueResult, ValuesResult, Viewport,
+    ViewportResult, status,
 };
 use crate::d3d9::gpu::{D3d9Gpu, D3d9Loss};
 pub use crate::d3d9::resource::D3d9Resource;
@@ -25,6 +25,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 pub mod copy;
 pub mod d3dx;
+pub mod d3dx_effect;
+pub mod d3dx_math;
+pub mod d3dx_shader;
 pub mod draw;
 pub mod format;
 pub mod gpu;
@@ -35,6 +38,8 @@ pub mod state;
 pub mod wgsl;
 
 pub use d3dx::*;
+pub use d3dx_math::*;
+pub use d3dx_shader::*;
 
 static LIVE_DEVICES: AtomicUsize = AtomicUsize::new(0);
 
@@ -103,6 +108,10 @@ const D3DSWAPEFFECT_FLIP: u32 = 2;
 const D3DSWAPEFFECT_COPY: u32 = 3;
 
 const D3DPRESENTFLAG_KNOWN: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004 | 0x0000_0010;
+
+const D3DPRESENT_INTERVAL_DEFAULT: u32 = 0x0000_0000;
+const D3DPRESENT_INTERVAL_ONE: u32 = 0x0000_0001;
+const D3DPRESENT_INTERVAL_IMMEDIATE: u32 = 0x8000_0000;
 
 const D3DCAPS2_CANAUTOGENMIPMAP: u32 = 0x4000_0000;
 const D3DPTEXTURECAPS_ALPHA: u32 = 0x0000_0004;
@@ -202,6 +211,7 @@ struct RestorePlan {
     loss: Arc<D3d9Loss>,
     targets: ImplicitTargets,
     present: D3d9PresentParams,
+    display_mode: D3d9DisplayMode,
     expected: BTreeMap<u32, u32>,
     staged: BTreeMap<u32, StagedStorage>,
     registry: BTreeMap<u32, GpuRegistryEntry>,
@@ -231,6 +241,7 @@ pub struct D3d9Device {
     device_type: u32,
     behavior_flags: u32,
     present: D3d9PresentParams,
+    display_mode: D3d9DisplayMode,
     loss: Option<Arc<D3d9Loss>>,
     targets: Option<ImplicitTargets>,
     resources: BTreeMap<u32, ResourceRegistration>,
@@ -257,6 +268,12 @@ impl D3d9Device {
         self.d3d9_gpu
             .as_ref()
             .ok_or_else(|| RenderError::invalid("D3D9", "device is not initialized"))
+    }
+
+    pub(crate) fn resource_pool(&self, id: u32) -> Option<u32> {
+        self.resources
+            .get(&id)
+            .map(|registration| registration.pool)
     }
 }
 
@@ -1273,6 +1290,12 @@ impl Default for D3d9Device {
                 fullscreen_refresh_rate: 0,
                 presentation_interval: 0,
             },
+            display_mode: D3d9DisplayMode {
+                width: 0,
+                height: 0,
+                refresh_rate: 0,
+                format: 0,
+            },
         }
     }
 }
@@ -1294,7 +1317,7 @@ fn fail(
 
 fn validate_present_params(
     request: &D3d9PresentParams,
-    desktop_format: u32,
+    display_mode: &D3d9DisplayMode,
 ) -> Result<D3d9PresentParams, RenderError> {
     let mut present = *request;
     if present.count == 0 {
@@ -1306,20 +1329,21 @@ fn validate_present_params(
             "back buffer count greater than one is not implemented",
         ));
     }
+    let fullscreen = present.windowed == 0;
     if present.format == 0 {
-        if present.windowed == 0 {
+        if fullscreen {
             return Err(RenderError::invalid(
                 "D3DPRESENT_PARAMETERS",
                 "fullscreen device requires a back buffer format",
             ));
         }
-        if desktop_format == 0 {
+        if display_mode.format == 0 {
             return Err(RenderError::new(
                 "D3DPRESENT_PARAMETERS",
                 "windowed D3DFMT_UNKNOWN needs a desktop format the host cannot provide",
             ));
         }
-        present.format = desktop_format;
+        present.format = display_mode.format;
     }
     if present.format != D3DFMT_A8R8G8B8 && present.format != D3DFMT_X8R8G8B8 {
         return Err(RenderError::new(
@@ -1330,13 +1354,45 @@ fn validate_present_params(
             ),
         ));
     }
-    if present.windowed == 0 {
-        return Err(RenderError::new(
-            "D3DPRESENT_PARAMETERS",
-            "fullscreen D3D9 devices are not implemented",
-        ));
-    }
-    if present.width == 0 || present.height == 0 {
+    if fullscreen {
+        if display_mode.width == 0 || display_mode.height == 0 || display_mode.format == 0 {
+            return Err(RenderError::new(
+                "D3DPRESENT_PARAMETERS",
+                "fullscreen device has no enumerated display mode",
+            ));
+        }
+        let format_matches = display_mode.format == D3DFMT_X8R8G8B8
+            && (present.format == D3DFMT_X8R8G8B8 || present.format == D3DFMT_A8R8G8B8);
+        if !format_matches {
+            return Err(RenderError::invalid(
+                "D3DPRESENT_PARAMETERS",
+                format!(
+                    "fullscreen back buffer D3DFORMAT {} does not match enumerated display D3DFORMAT {}",
+                    present.format, display_mode.format
+                ),
+            ));
+        }
+        if present.width != display_mode.width || present.height != display_mode.height {
+            return Err(RenderError::invalid(
+                "D3DPRESENT_PARAMETERS",
+                format!(
+                    "fullscreen back buffer {}x{} is not the enumerated display mode {}x{}",
+                    present.width, present.height, display_mode.width, display_mode.height
+                ),
+            ));
+        }
+        if present.fullscreen_refresh_rate != 0
+            && present.fullscreen_refresh_rate != display_mode.refresh_rate
+        {
+            return Err(RenderError::invalid(
+                "D3DPRESENT_PARAMETERS",
+                format!(
+                    "fullscreen refresh rate {} is not the enumerated display refresh {}",
+                    present.fullscreen_refresh_rate, display_mode.refresh_rate
+                ),
+            ));
+        }
+    } else if present.width == 0 || present.height == 0 {
         return Err(RenderError::invalid(
             "D3DPRESENT_PARAMETERS",
             "back buffer dimensions must be nonzero",
@@ -1378,16 +1434,19 @@ fn validate_present_params(
             "multisample quality must be zero without multisampling",
         ));
     }
-    if present.presentation_interval != 0 {
+    if present.presentation_interval != D3DPRESENT_INTERVAL_DEFAULT
+        && present.presentation_interval != D3DPRESENT_INTERVAL_ONE
+        && present.presentation_interval != D3DPRESENT_INTERVAL_IMMEDIATE
+    {
         return Err(RenderError::new(
             "D3DPRESENT_PARAMETERS",
             format!(
-                "presentation interval {:#x} is not implemented; only D3DPRESENT_INTERVAL_DEFAULT",
+                "presentation interval {:#x} is not implemented; DEFAULT, ONE and IMMEDIATE are",
                 present.presentation_interval
             ),
         ));
     }
-    if present.fullscreen_refresh_rate != 0 {
+    if !fullscreen && present.fullscreen_refresh_rate != 0 {
         return Err(RenderError::invalid(
             "D3DPRESENT_PARAMETERS",
             "windowed device requires a zero fullscreen refresh rate",
@@ -1582,7 +1641,7 @@ pub fn d3d9_create_device(
             format!("D3DCREATE flag(s) {extra:#x} are not implemented"),
         );
     }
-    let present = match validate_present_params(&request.present, request.desktop_format) {
+    let present = match validate_present_params(&request.present, &request.display_mode) {
         Ok(present) => present,
         Err(error) => return fail_status(&request.present, bridge_error(error)),
     };
@@ -1617,6 +1676,7 @@ pub fn d3d9_create_device(
     device.device_type = request.device_type;
     device.behavior_flags = request.behavior_flags;
     device.present = present;
+    device.display_mode = request.display_mode;
     device.state.set_target_size(present.width, present.height);
     if present.enable_auto_depth_stencil != 0 {
         device.depth_target_id = u32::MAX;
@@ -1885,7 +1945,7 @@ fn reset_validation(
         ));
     }
     let present =
-        validate_present_params(&request.present, request.desktop_format).map_err(bridge_error)?;
+        validate_present_params(&request.present, &request.display_mode).map_err(bridge_error)?;
     if request.implicit_external_refs {
         return Err(status(
             StatusCode::InvalidArgument,
@@ -2015,6 +2075,7 @@ pub fn d3d9_reset(device: &mut D3d9Device, request: &D3d9ResetRequest) -> D3d9Re
             loss,
             targets,
             present,
+            display_mode: request.display_mode,
             expected,
             staged: BTreeMap::new(),
             registry: device.registry.clone(),
@@ -2049,6 +2110,7 @@ pub fn d3d9_reset(device: &mut D3d9Device, request: &D3d9ResetRequest) -> D3d9Re
             loss,
             targets,
             present,
+            display_mode: request.display_mode,
             expected,
             staged: BTreeMap::new(),
             registry: device.registry.clone(),
@@ -2198,6 +2260,7 @@ pub fn d3d9_finish_reset(device: &mut D3d9Device) -> D3d9ResetResult {
     device.targets = Some(plan.targets);
     device.registry = plan.registry;
     device.present = plan.present;
+    device.display_mode = plan.display_mode;
     device
         .state
         .set_target_size(plan.present.width, plan.present.height);
@@ -2417,6 +2480,39 @@ pub fn d3d9_depthbuffer_descriptor(device: &D3d9Device) -> D3d9SurfaceDescriptor
     implicit_surface_descriptor(device, true)
 }
 
+pub fn d3d9_available_texture_mem(device: &D3d9Device) -> ValueResult {
+    const MB: u64 = 1024 * 1024;
+    let gpu = match device.resource_gpu() {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            return ValueResult {
+                status: bridge_error(error),
+                value: 0,
+            };
+        }
+    };
+    if gpu.is_physical() {
+        return ValueResult {
+            status: status(StatusCode::DeviceLost, gpu.loss().physical_message()),
+            value: 0,
+        };
+    }
+    match gpu.available_texture_mem_bytes() {
+        Ok(bytes) => {
+            let mb = bytes.saturating_add(MB / 2) / MB;
+            let mb = mb.min(u32::MAX as u64 / MB);
+            ValueResult {
+                status: status(StatusCode::Ok, ""),
+                value: (mb * MB) as u32,
+            }
+        }
+        Err(error) => ValueResult {
+            status: bridge_error(error),
+            value: 0,
+        },
+    }
+}
+
 pub fn d3d9_number_of_swap_chains(device: &D3d9Device) -> ValueResult {
     if device.gpu.is_none() {
         return ValueResult {
@@ -2462,7 +2558,17 @@ pub fn d3d9_display_mode(
             ..empty
         };
     }
-    if request.format == 0 {
+    let mode = if device.present.windowed != 0 {
+        D3d9DisplayMode {
+            width: request.width,
+            height: request.height,
+            refresh_rate: request.refresh_rate,
+            format: request.format,
+        }
+    } else {
+        device.display_mode
+    };
+    if mode.format == 0 {
         return D3d9DisplayModeResult {
             status: status(
                 StatusCode::NotAvailable,
@@ -2473,11 +2579,15 @@ pub fn d3d9_display_mode(
     }
     D3d9DisplayModeResult {
         status: status(StatusCode::Ok, ""),
-        width: request.width,
-        height: request.height,
-        refresh_rate: request.refresh_rate,
-        format: request.format,
+        width: mode.width,
+        height: mode.height,
+        refresh_rate: mode.refresh_rate,
+        format: mode.format,
     }
+}
+
+pub fn d3d9_effective_present(device: &D3d9Device) -> D3d9PresentParams {
+    device.present
 }
 
 fn adapter_probe() -> Result<&'static D3d9Probe, RenderError> {
@@ -2509,6 +2619,11 @@ fn caps_image(probe: &D3d9Probe) -> Vec<u8> {
     let mut caps = vec![0u8; 304];
     put_u32(&mut caps, 0, D3DDEVTYPE_HAL);
     put_u32(&mut caps, 12, D3DCAPS2_CANAUTOGENMIPMAP);
+    put_u32(
+        &mut caps,
+        20,
+        D3DPRESENT_INTERVAL_IMMEDIATE | D3DPRESENT_INTERVAL_ONE,
+    );
     put_u32(&mut caps, 28, 0x0001_0000 | 0x0008_0000);
     put_u32(
         &mut caps,
@@ -2690,17 +2805,26 @@ pub fn d3d9_check_device_type(request: &D3d9CheckDeviceTypeRequest) -> Status {
     if let Err(status) = check_adapter(request.adapter, request.device_type) {
         return status;
     }
-    if request.windowed == 0 {
-        return status(
-            StatusCode::NotAvailable,
-            "fullscreen devices are not available",
-        );
-    }
     if !adapter_format_supported(request.adapter_format) {
         return status(
             StatusCode::NotAvailable,
             format!("adapter format {} is not available", request.adapter_format),
         );
+    }
+    if request.windowed == 0 {
+        let format_ok = request.adapter_format == D3DFMT_X8R8G8B8
+            && (request.backbuffer_format == D3DFMT_X8R8G8B8
+                || request.backbuffer_format == D3DFMT_A8R8G8B8);
+        if !format_ok {
+            return status(
+                StatusCode::NotAvailable,
+                format!(
+                    "fullscreen back buffer D3DFORMAT {} is not compatible with display D3DFORMAT {}",
+                    request.backbuffer_format, request.adapter_format
+                ),
+            );
+        }
+        return status(StatusCode::Ok, "");
     }
     if request.backbuffer_format == 0 {
         return status(StatusCode::Ok, "");
@@ -2892,15 +3016,6 @@ pub fn d3d9_check_device_format(request: &D3d9CheckDeviceFormatRequest) -> Statu
 pub fn d3d9_check_device_multisample_type(request: &D3d9CheckMultiSampleRequest) -> ValueResult {
     if let Err(status) = check_adapter(request.adapter, request.device_type) {
         return ValueResult { status, value: 0 };
-    }
-    if request.windowed == 0 {
-        return ValueResult {
-            status: status(
-                StatusCode::NotAvailable,
-                "fullscreen devices are not available",
-            ),
-            value: 0,
-        };
     }
     if !format::is_supported(request.surface_format) {
         return ValueResult {

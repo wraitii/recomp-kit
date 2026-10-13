@@ -18,6 +18,8 @@
 #include "com.h"
 #include "dx.h"
 #include "d3dx9tex.h"
+#include "d3dx9shader_shim.h"
+#include "d3dx9effect_shim.h"
 #include "../runtime/guest.h"
 #include "../runtime/memory.h"
 
@@ -1848,6 +1850,10 @@ void Fx_GetDevice(X86 *c) {
 }
 
 static void fx_destroy(ComObj *o) {
+    if (o->d3dx_effect) {
+        d3dx_effect_destroy(o);
+        return;
+    }
     auto it = effects().find(o->id);
     if (it == effects().end())
         return;
@@ -2065,6 +2071,7 @@ static void d3dx9_define(ComIface iface, const char *dll, const char *name,
 #endif
 
 void d3dx9_reset() {
+    d3dx_shader_helpers_reset();
     effects().clear();
 }
 
@@ -2080,18 +2087,26 @@ void d3dx9_register() {
     com_register_iid(IF_D3DXEFFECT, IID_ID3DXEffect_);
     com_bind(IF_D3DXEFFECTPOOL, K_D3DXEFFECTPOOL);
     com_bind(IF_D3DXEFFECT, K_D3DXEFFECT);
-    d3dx9_define(IF_D3DXEFFECT33, "d3dx9_33.dll", "ID3DXEffect", g_effect_33,
-                 std::size(g_effect_33));
-    d3dx9_define(IF_D3DXBUFFER, "d3dx9_33.dll", "ID3DXBuffer", g_buffer_33, std::size(g_buffer_33));
-    d3dx9_define(IF_D3DXCONSTANTTABLE, "d3dx9_33.dll", "ID3DXConstantTable", g_constant_table_33,
-                 std::size(g_constant_table_33));
-    d3dx9_define(IF_D3DXEFFECTCOMPILER, "d3dx9_33.dll", "ID3DXEffectCompiler", g_effect_compiler_33,
-                 std::size(g_effect_compiler_33));
+    com_define(IF_D3DXEFFECT33, "d3dx9_33.dll", "ID3DXEffect", g_effect_33, std::size(g_effect_33));
+    com_define(IF_D3DXEFFECTPOOL33, "d3dx9_33.dll", "ID3DXEffectPool", g_effect_pool_33,
+               std::size(g_effect_pool_33));
+    com_define(IF_D3DXBUFFER, "d3dx9_33.dll", "ID3DXBuffer", g_buffer_33, std::size(g_buffer_33));
+    com_define(IF_D3DXCONSTANTTABLE, "d3dx9_33.dll", "ID3DXConstantTable", g_constant_table_33,
+               std::size(g_constant_table_33));
+    com_define(IF_D3DXEFFECTCOMPILER, "d3dx9_33.dll", "ID3DXEffectCompiler", g_effect_compiler_33,
+               std::size(g_effect_compiler_33));
     com_register_iid(IF_D3DXEFFECT33, IID_ID3DXEffect_33);
+    com_register_iid(IF_D3DXEFFECTPOOL33, IID_ID3DXEffectPool_33);
     com_register_iid(IF_D3DXBUFFER, IID_ID3DXBuffer_33);
     com_register_iid(IF_D3DXCONSTANTTABLE, IID_ID3DXConstantTable_33);
     com_register_iid(IF_D3DXEFFECTCOMPILER, IID_ID3DXEffectCompiler_33);
+    com_bind(IF_D3DXBUFFER, K_D3DXCONSTANTTABLE);
+    com_bind(IF_D3DXCONSTANTTABLE, K_D3DXCONSTANTTABLE);
+    com_bind(IF_D3DXEFFECT33, K_D3DXEFFECT);
+    com_bind(IF_D3DXEFFECTPOOL33, K_D3DXEFFECTPOOL);
     com_set_destructor(K_D3DXEFFECT, fx_destroy);
+    com_set_destructor(K_D3DXEFFECTPOOL, d3dx_effect_pool_destroy);
+    com_set_destructor(K_D3DXCONSTANTTABLE, d3dx_ctab_destroy);
     d3dx9_register_exports(g_d3dx9_exports, std::size(g_d3dx9_exports));
     d3dx9_register_exports(g_d3dx9_33_exports, std::size(g_d3dx9_33_exports));
 }

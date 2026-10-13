@@ -201,12 +201,20 @@ pub mod ffi {
         presentation_interval: u32,
     }
 
+    #[derive(Clone, Copy)]
+    struct D3d9DisplayMode {
+        width: u32,
+        height: u32,
+        refresh_rate: u32,
+        format: u32,
+    }
+
     struct D3d9DeviceRequest {
         adapter: u32,
         device_type: u32,
         behavior_flags: u32,
         present: D3d9PresentParams,
-        desktop_format: u32,
+        display_mode: D3d9DisplayMode,
         thread_id: u32,
     }
 
@@ -229,7 +237,7 @@ pub mod ffi {
 
     struct D3d9ResetRequest {
         present: D3d9PresentParams,
-        desktop_format: u32,
+        display_mode: D3d9DisplayMode,
         implicit_external_refs: bool,
         window_valid: bool,
         thread_id: u32,
@@ -453,6 +461,168 @@ pub mod ffi {
     }
 
     #[derive(Clone, Copy)]
+    struct D3dxConstantTableDesc {
+        creator_offset: u32,
+        version: u32,
+        constants: u32,
+    }
+
+    struct D3dxConstantTableResult {
+        status: Status,
+        buffer: Vec<u8>,
+        desc: D3dxConstantTableDesc,
+        node_count: u32,
+        invalid_bytecode: bool,
+    }
+
+    #[derive(Clone)]
+    struct D3dxConstantDesc {
+        name_offset: u32,
+        register_set: u32,
+        register_index: u32,
+        register_count: u32,
+        class_: u32,
+        type_: u32,
+        rows: u32,
+        columns: u32,
+        elements: u32,
+        struct_members: u32,
+        bytes: u32,
+        default_offset: u32,
+    }
+
+    struct D3dxConstantDescResult {
+        status: Status,
+        desc: D3dxConstantDesc,
+    }
+
+    #[derive(Clone, Copy)]
+    struct D3dxEffectDesc {
+        parameters: u32,
+        techniques: u32,
+        functions: u32,
+    }
+
+    struct D3dxEffectDescResult {
+        status: Status,
+        desc: D3dxEffectDesc,
+    }
+
+    struct D3dxEffectCreateResult {
+        status: Status,
+        parameters: u32,
+        techniques: u32,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct D3dxEffectParamDesc {
+        class_: u32,
+        type_: u32,
+        rows: u32,
+        columns: u32,
+        elements: u32,
+        annotations: u32,
+        struct_members: u32,
+        flags: u32,
+        bytes: u32,
+    }
+
+    struct D3dxEffectParamDescResult {
+        status: Status,
+        desc: D3dxEffectParamDesc,
+        name: Vec<u8>,
+        semantic: Vec<u8>,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct D3dxEffectTechniqueDesc {
+        passes: u32,
+        annotations: u32,
+    }
+
+    struct D3dxEffectTechniqueDescResult {
+        status: Status,
+        desc: D3dxEffectTechniqueDesc,
+        name: Vec<u8>,
+    }
+
+    #[derive(Default)]
+    struct D3dxEffectPassDesc {
+        annotations: u32,
+        vertex_shader: Vec<u8>,
+        pixel_shader: Vec<u8>,
+    }
+
+    struct D3dxEffectPassDescResult {
+        status: Status,
+        desc: D3dxEffectPassDesc,
+        name: Vec<u8>,
+    }
+
+    struct D3dxEffectShadersResult {
+        status: Status,
+        vertex: Vec<u32>,
+        pixel: Vec<u32>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum D3dxEffectCommandKind {
+        SetRenderState = 0,
+        SetTextureStageState = 1,
+        SetSamplerState = 2,
+        SetTransform = 3,
+        SetTexture = 4,
+        SetVertexShader = 5,
+        SetPixelShader = 6,
+        SetVertexShaderConstantF = 7,
+        SetPixelShaderConstantF = 8,
+    }
+
+    struct D3dxEffectCommand {
+        kind: D3dxEffectCommandKind,
+        index: u32,
+        state: u32,
+        value: u32,
+        matrix: [f32; 16],
+        values: Vec<f32>,
+    }
+
+    struct D3dxEffectRunResult {
+        status: Status,
+        commands: Vec<D3dxEffectCommand>,
+        reserved: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    struct D3dxSemantic {
+        usage: u32,
+        usage_index: u32,
+    }
+
+    struct D3dxSemanticsResult {
+        status: Status,
+        semantics: Vec<D3dxSemantic>,
+    }
+
+    struct D3dxProfilesResult {
+        status: Status,
+        vertex: String,
+        pixel: String,
+    }
+
+    struct D3dxMatrixResult {
+        status: Status,
+        values: Vec<f32>,
+    }
+
+    struct D3dxMatrixInverseResult {
+        status: Status,
+        valid: bool,
+        determinant: f32,
+        values: Vec<f32>,
+    }
+
+    #[derive(Clone, Copy)]
     struct D3d9TextureDescriptor {
         format: u32,
         resource_type: u32,
@@ -618,6 +788,7 @@ pub mod ffi {
 
         fn new_device() -> Box<Device>;
         fn new_d3d9_device() -> Box<D3d9Device>;
+        fn d3d9_available_texture_mem(device: &D3d9Device) -> ValueResult;
         fn d3d9_create_device(
             device: &mut D3d9Device,
             request: &D3d9DeviceRequest,
@@ -808,6 +979,120 @@ pub mod ffi {
             resource: &mut D3d9Resource,
             format: u32,
         ) -> D3dxBytesResult;
+        type D3dxConstantTable;
+        fn new_d3dx_constant_table() -> Box<D3dxConstantTable>;
+        fn d3dx_constant_table_info(table: &D3dxConstantTable) -> D3dxConstantTableDesc;
+        fn d3dx_constant_table_create(
+            table: &mut D3dxConstantTable,
+            code: &[u32],
+        ) -> D3dxConstantTableResult;
+        fn d3dx_constant_table_desc(table: &D3dxConstantTable, node: u32)
+        -> D3dxConstantDescResult;
+        fn d3dx_constant_table_find(table: &D3dxConstantTable, parent: u32, name: &[u8]) -> i32;
+        fn d3dx_constant_table_constant(table: &D3dxConstantTable, parent: u32, index: u32) -> i32;
+        fn d3dx_constant_table_element(table: &D3dxConstantTable, node: u32, index: u32) -> i32;
+        fn d3dx_constant_table_sampler(table: &D3dxConstantTable, node: u32) -> u32;
+        fn d3dx_constant_table_apply(
+            device: &mut D3d9Device,
+            table: &D3dxConstantTable,
+            node: u32,
+            setter: u32,
+            data: &[u8],
+        ) -> Status;
+        fn d3dx_constant_table_defaults(
+            device: &mut D3d9Device,
+            table: &D3dxConstantTable,
+        ) -> Status;
+        fn d3dx_constant_table_input_size(
+            table: &D3dxConstantTable,
+            node: u32,
+            setter: u32,
+            requested_bytes: u64,
+        ) -> u64;
+        fn d3dx_shader_version(code: &[u32]) -> u32;
+        fn d3dx_shader_input_semantics(code: &[u32]) -> D3dxSemanticsResult;
+        fn d3dx_shader_profiles(device: &D3d9Device) -> D3dxProfilesResult;
+        fn d3dx_matrix_multiply(a: &[f32], b: &[f32]) -> D3dxMatrixResult;
+        fn d3dx_matrix_transpose(a: &[f32]) -> D3dxMatrixResult;
+        fn d3dx_matrix_inverse(a: &[f32]) -> D3dxMatrixInverseResult;
+        type D3dxEffect;
+        type D3dxEffectPool;
+        fn new_d3dx_effect() -> Box<D3dxEffect>;
+        fn new_d3dx_effect_pool() -> Box<D3dxEffectPool>;
+        fn d3dx_effect_pool_id(pool: &D3dxEffectPool) -> u32;
+        fn d3dx_effect_create(
+            effect: &mut D3dxEffect,
+            device: &mut D3d9Device,
+            bytes: &[u8],
+            flags: u32,
+        ) -> D3dxEffectCreateResult;
+        fn d3dx_effect_join_pool(
+            effect: &mut D3dxEffect,
+            pool: &D3dxEffectPool,
+            device_id: u32,
+        ) -> Status;
+        fn d3dx_effect_desc(effect: &D3dxEffect) -> D3dxEffectDescResult;
+        fn d3dx_effect_param_desc(effect: &D3dxEffect, handle: u32) -> D3dxEffectParamDescResult;
+        fn d3dx_effect_param_name(effect: &D3dxEffect, handle: u32) -> D3dxBytesResult;
+        fn d3dx_effect_param_semantic(effect: &D3dxEffect, handle: u32) -> D3dxBytesResult;
+        fn d3dx_effect_technique_desc(
+            effect: &D3dxEffect,
+            handle: u32,
+        ) -> D3dxEffectTechniqueDescResult;
+        fn d3dx_effect_pass_desc(effect: &D3dxEffect, handle: u32) -> D3dxEffectPassDescResult;
+        fn d3dx_effect_pass_shader(
+            effect: &D3dxEffect,
+            handle: u32,
+            pixel: bool,
+        ) -> D3dxBytesResult;
+        fn d3dx_effect_find(effect: &D3dxEffect, parent: u32, name: &[u8], kind: u32) -> u32;
+        fn d3dx_effect_enum(effect: &D3dxEffect, parent: u32, index: u32, kind: u32) -> u32;
+        fn d3dx_effect_set(
+            effect: &mut D3dxEffect,
+            handle: u32,
+            setter: u32,
+            data: &[u8],
+        ) -> Status;
+        fn d3dx_effect_get(effect: &D3dxEffect, handle: u32, kind: u32) -> D3dxBytesResult;
+        fn d3dx_effect_set_texture(effect: &mut D3dxEffect, handle: u32, id: u32) -> Status;
+        fn d3dx_effect_texture(effect: &D3dxEffect, handle: u32) -> ValueResult;
+        fn d3dx_effect_set_technique(effect: &mut D3dxEffect, handle: u32) -> Status;
+        fn d3dx_effect_current_technique(effect: &D3dxEffect) -> u32;
+        fn d3dx_effect_validate_technique(effect: &D3dxEffect, handle: u32) -> Status;
+        fn d3dx_effect_find_next_valid(effect: &D3dxEffect, handle: u32) -> u32;
+        fn d3dx_effect_is_parameter_used(effect: &D3dxEffect, param: u32, tech: u32) -> bool;
+        fn d3dx_effect_flags(effect: &D3dxEffect, handle: u32) -> u32;
+        fn d3dx_effect_pool_id_of(effect: &D3dxEffect) -> u32;
+        fn d3dx_effect_prepare_shaders(
+            effect: &mut D3dxEffect,
+            device: &mut D3d9Device,
+        ) -> D3dxEffectShadersResult;
+        fn d3dx_effect_begin(
+            effect: &mut D3dxEffect,
+            device: &mut D3d9Device,
+            flags: u32,
+        ) -> ValueResult;
+        fn d3dx_effect_begin_pass(
+            effect: &mut D3dxEffect,
+            device: &mut D3d9Device,
+            index: u32,
+        ) -> D3dxEffectRunResult;
+        fn d3dx_effect_commit(
+            effect: &mut D3dxEffect,
+            device: &mut D3d9Device,
+        ) -> D3dxEffectRunResult;
+        fn d3dx_effect_batch_finish(effect: &mut D3dxEffect, ok: bool) -> Status;
+        fn d3dx_effect_batch_active(effect: &D3dxEffect) -> bool;
+        fn d3dx_effect_set_state_manager(effect: &mut D3dxEffect, active: bool) -> Status;
+        fn d3dx_effect_end_pass(effect: &mut D3dxEffect) -> Status;
+        fn d3dx_effect_end(effect: &mut D3dxEffect, device: &mut D3d9Device) -> Status;
+        fn d3dx_effect_on_lost(effect: &mut D3dxEffect, device: &mut D3d9Device) -> Status;
+        fn d3dx_effect_on_reset(effect: &mut D3dxEffect, device: &mut D3d9Device) -> Status;
+        fn d3dx_effect_release(effect: &mut D3dxEffect);
+        fn d3dx_effect_texture_refs(effect: &D3dxEffect) -> Vec<u32>;
+        fn d3dx_effect_pool_texture_refs(pool: &D3dxEffectPool) -> Vec<u32>;
+        fn d3dx_effect_saved_bindings(effect: &D3dxEffect) -> D3d9BindingsResult;
+        fn d3dx_effect_shutdown(effect: &mut D3dxEffect, device: &mut D3d9Device);
         fn d3d9_resource_type(resource: &D3d9Resource) -> ValueResult;
         fn d3d9_texture_descriptor(resource: &D3d9Resource) -> D3d9TextureDescriptorResult;
         fn d3d9_surface_descriptor(resource: &D3d9Resource) -> D3d9SurfaceDescriptorResult;
@@ -1028,6 +1313,7 @@ pub mod ffi {
             device: &D3d9Device,
             request: &D3d9DisplayModeRequest,
         ) -> D3d9DisplayModeResult;
+        fn d3d9_effective_present(device: &D3d9Device) -> D3d9PresentParams;
         fn d3d9_device_caps(device: &D3d9Device) -> D3d9CapsResult;
         fn d3d9_adapter_caps(adapter: u32) -> D3d9CapsResult;
         fn d3d9_adapter_identifier(adapter: u32) -> D3d9AdapterIdentifierResult;
@@ -1435,20 +1721,36 @@ use crate::d3d8::{
     shader::{Declaration, Program},
     state::DeviceState,
 };
+use crate::d3d9::d3dx_effect::{
+    D3dxEffect, D3dxEffectPool, d3dx_effect_batch_active, d3dx_effect_batch_finish,
+    d3dx_effect_begin, d3dx_effect_begin_pass, d3dx_effect_commit, d3dx_effect_create,
+    d3dx_effect_current_technique, d3dx_effect_desc, d3dx_effect_end, d3dx_effect_end_pass,
+    d3dx_effect_enum, d3dx_effect_find, d3dx_effect_find_next_valid, d3dx_effect_flags,
+    d3dx_effect_get, d3dx_effect_is_parameter_used, d3dx_effect_join_pool, d3dx_effect_on_lost,
+    d3dx_effect_on_reset, d3dx_effect_param_desc, d3dx_effect_param_name,
+    d3dx_effect_param_semantic, d3dx_effect_pass_desc, d3dx_effect_pass_shader,
+    d3dx_effect_pool_id, d3dx_effect_pool_id_of, d3dx_effect_pool_texture_refs,
+    d3dx_effect_prepare_shaders, d3dx_effect_release, d3dx_effect_saved_bindings, d3dx_effect_set,
+    d3dx_effect_set_state_manager, d3dx_effect_set_technique, d3dx_effect_set_texture,
+    d3dx_effect_shutdown, d3dx_effect_technique_desc, d3dx_effect_texture,
+    d3dx_effect_texture_refs, d3dx_effect_validate_technique, new_d3dx_effect,
+    new_d3dx_effect_pool,
+};
 use crate::d3d9::{
     D3d9Device, D3d9Resource, D3dxSurfaceData, d3d9_abort_reset, d3d9_adapter_caps,
     d3d9_adapter_identifier, d3d9_add_dirty_box, d3d9_add_dirty_rect, d3d9_apply_state_block,
-    d3d9_autogen_capable, d3d9_backbuffer_descriptor, d3d9_begin_state_block, d3d9_buffer_bytes,
-    d3d9_buffer_descriptor, d3d9_buffer_lock_commit, d3d9_buffer_lock_prepare, d3d9_buffer_unlock,
-    d3d9_capture_state_block, d3d9_check_depth_stencil_match, d3d9_check_device_format,
-    d3d9_check_device_format_conversion, d3d9_check_device_multisample_type,
-    d3d9_check_device_type, d3d9_commit_resource_reset, d3d9_create_buffer, d3d9_create_device,
-    d3d9_create_fvf_declaration, d3d9_create_shader, d3d9_create_state_block, d3d9_create_surface,
-    d3d9_create_texture, d3d9_create_vertex_declaration, d3d9_creation_parameters,
-    d3d9_current_bindings, d3d9_d3dx_create_texture, d3d9_d3dx_image_info, d3d9_d3dx_save_surface,
-    d3d9_d3dx_save_texture, d3d9_d3dx_surface_read, d3d9_d3dx_surface_store,
-    d3d9_declaration_elements, d3d9_depthbuffer_descriptor, d3d9_destroy_declaration,
-    d3d9_destroy_shader, d3d9_destroy_state_block, d3d9_device_caps, d3d9_display_mode,
+    d3d9_autogen_capable, d3d9_available_texture_mem, d3d9_backbuffer_descriptor,
+    d3d9_begin_state_block, d3d9_buffer_bytes, d3d9_buffer_descriptor, d3d9_buffer_lock_commit,
+    d3d9_buffer_lock_prepare, d3d9_buffer_unlock, d3d9_capture_state_block,
+    d3d9_check_depth_stencil_match, d3d9_check_device_format, d3d9_check_device_format_conversion,
+    d3d9_check_device_multisample_type, d3d9_check_device_type, d3d9_commit_resource_reset,
+    d3d9_create_buffer, d3d9_create_device, d3d9_create_fvf_declaration, d3d9_create_shader,
+    d3d9_create_state_block, d3d9_create_surface, d3d9_create_texture,
+    d3d9_create_vertex_declaration, d3d9_creation_parameters, d3d9_current_bindings,
+    d3d9_d3dx_create_texture, d3d9_d3dx_image_info, d3d9_d3dx_save_surface, d3d9_d3dx_save_texture,
+    d3d9_d3dx_surface_read, d3d9_d3dx_surface_store, d3d9_declaration_elements,
+    d3d9_depthbuffer_descriptor, d3d9_destroy_declaration, d3d9_destroy_shader,
+    d3d9_destroy_state_block, d3d9_device_caps, d3d9_display_mode, d3d9_effective_present,
     d3d9_end_state_block, d3d9_finish_reset, d3d9_format_autogen_capable, d3d9_free_private_data,
     d3d9_generate_mips, d3d9_get_autogen_filter, d3d9_get_clip_plane, d3d9_get_fvf,
     d3d9_get_indices, d3d9_get_light, d3d9_get_light_enable, d3d9_get_material,
@@ -1473,6 +1775,14 @@ use crate::d3d9::{
     new_d3d9_resource,
 };
 use crate::d3d9::{
+    D3dxConstantTable, d3dx_constant_table_apply, d3dx_constant_table_constant,
+    d3dx_constant_table_create, d3dx_constant_table_defaults, d3dx_constant_table_desc,
+    d3dx_constant_table_element, d3dx_constant_table_find, d3dx_constant_table_info,
+    d3dx_constant_table_input_size, d3dx_constant_table_sampler, d3dx_matrix_inverse,
+    d3dx_matrix_multiply, d3dx_matrix_transpose, d3dx_shader_input_semantics, d3dx_shader_profiles,
+    d3dx_shader_version, new_d3dx_constant_table,
+};
+use crate::d3d9::{
     d3d9_begin_scene, d3d9_clear, d3d9_color_fill, d3d9_create_query, d3d9_destroy_query,
     d3d9_draw_indexed_primitive, d3d9_draw_indexed_primitive_up, d3d9_draw_primitive,
     d3d9_draw_primitive_up, d3d9_end_scene, d3d9_get_depth_stencil, d3d9_get_render_target,
@@ -1495,14 +1805,20 @@ pub use ffi::{
     D3d9CapsResult, D3d9CheckDepthStencilRequest, D3d9CheckDeviceFormatRequest,
     D3d9CheckDeviceTypeRequest, D3d9CheckFormatConversionRequest, D3d9CheckMultiSampleRequest,
     D3d9CreateResult, D3d9CreationParameters, D3d9CreationParametersResult, D3d9DeclarationResult,
-    D3d9DeviceRequest, D3d9DisplayModeRequest, D3d9DisplayModeResult, D3d9FrameResult,
-    D3d9LevelDescriptor, D3d9LevelDescriptorResult, D3d9LevelLockRequest, D3d9LevelLockResult,
-    D3d9LightResult, D3d9LockBox, D3d9LockRect, D3d9PresentParams, D3d9PrivateDataResult, D3d9Rect,
-    D3d9ResetRequest, D3d9ResetResult, D3d9ScissorResult, D3d9StreamResult, D3d9SurfaceDescriptor,
-    D3d9SurfaceDescriptorResult, D3d9SurfaceRequest, D3d9TextureCreateResult,
-    D3d9TextureDescriptor, D3d9TextureDescriptorResult, D3d9TextureKind, D3d9TextureRequest,
-    D3d9VertexElement, D3dxBytesResult, D3dxCreateRequest, D3dxCreateResult, D3dxImageInfo,
-    D3dxImageInfoResult, D3dxSurfaceReadResult, DeviceInfo, DeviceInfoResult, FloatValuesResult,
+    D3d9DeviceRequest, D3d9DisplayMode, D3d9DisplayModeRequest, D3d9DisplayModeResult,
+    D3d9FrameResult, D3d9LevelDescriptor, D3d9LevelDescriptorResult, D3d9LevelLockRequest,
+    D3d9LevelLockResult, D3d9LightResult, D3d9LockBox, D3d9LockRect, D3d9PresentParams,
+    D3d9PrivateDataResult, D3d9Rect, D3d9ResetRequest, D3d9ResetResult, D3d9ScissorResult,
+    D3d9StreamResult, D3d9SurfaceDescriptor, D3d9SurfaceDescriptorResult, D3d9SurfaceRequest,
+    D3d9TextureCreateResult, D3d9TextureDescriptor, D3d9TextureDescriptorResult, D3d9TextureKind,
+    D3d9TextureRequest, D3d9VertexElement, D3dxBytesResult, D3dxConstantDesc,
+    D3dxConstantDescResult, D3dxConstantTableDesc, D3dxConstantTableResult, D3dxCreateRequest,
+    D3dxCreateResult, D3dxEffectCommand, D3dxEffectCommandKind, D3dxEffectCreateResult,
+    D3dxEffectDesc, D3dxEffectDescResult, D3dxEffectParamDesc, D3dxEffectParamDescResult,
+    D3dxEffectPassDesc, D3dxEffectPassDescResult, D3dxEffectRunResult, D3dxEffectShadersResult,
+    D3dxEffectTechniqueDesc, D3dxEffectTechniqueDescResult, D3dxImageInfo, D3dxImageInfoResult,
+    D3dxMatrixInverseResult, D3dxMatrixResult, D3dxProfilesResult, D3dxSemantic,
+    D3dxSemanticsResult, D3dxSurfaceReadResult, DeviceInfo, DeviceInfoResult, FloatValuesResult,
     FrameHandoff, FrameHandoffResult, HandleResult, LevelLayout, LevelLayoutResult, Light,
     LightResult, Material, MaterialResult, PresentParams, Rect, ResourceConfigurationResult,
     ResourceGenerationResult, ResourceInfo, ResourceLevel, ResourceLevelResult, ShaderHandleResult,

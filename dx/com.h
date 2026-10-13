@@ -146,6 +146,7 @@ enum ComIface : uint16_t {
     IF_D3DXEFFECTPOOL,
     IF_D3DXEFFECT,
     IF_D3DXEFFECT33,
+    IF_D3DXEFFECTPOOL33,
     IF_D3DXBUFFER,
     IF_D3DXCONSTANTTABLE,
     IF_D3DXEFFECTCOMPILER,
@@ -245,7 +246,8 @@ enum ComKind : uint16_t {
     K_D3D9DEVICE,     // one device created from it
     K_D3DXEFFECTPOOL, // the D3DX effect pool a game shares between effects
     K_D3DXEFFECT,     // one effect loaded from the executable's resources
-    K_D3D9TEXTURE,    // a 2D texture and its levels
+    K_D3DXCONSTANTTABLE,
+    K_D3D9TEXTURE, // a 2D texture and its levels
     K_D3D9CUBETEXTURE,
     K_D3D9VOLUMETEXTURE,
     K_D3D9VOLUME,
@@ -293,6 +295,9 @@ struct D3dHostResource;
 struct D3dHostDevice7State;
 struct D3d9HostDevice;
 struct D3d9HostResource;
+struct D3dxConstantTableHost;
+struct D3dxEffectHost;
+struct D3dxEffectPoolHost;
 
 // ---------------------------------------------------------------------------
 // The host-side object. One fat struct rather than a class hierarchy: these
@@ -507,6 +512,13 @@ struct ComObj {
     bool d3d9_target_depth = false;
     uint32_t d3d9_state_handle = 0;
     uint32_t d3d9_query = 0;
+    std::shared_ptr<D3dxConstantTableHost> d3dx_ctab;
+    uint32_t d3dx_ctab_buffer = 0;
+    uint32_t d3dx_ctab_size = 0;
+    uint32_t d3dx_ctab_handles = 0;
+    uint32_t d3dx_ctab_nodes = 0;
+    std::shared_ptr<D3dxEffectHost> d3dx_effect;
+    std::shared_ptr<D3dxEffectPoolHost> d3dx_effect_pool;
 
     std::shared_ptr<D3dHostDevice> d3d8_device;
     std::shared_ptr<D3dHostResource> d3d8_resource;

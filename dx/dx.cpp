@@ -517,12 +517,12 @@ const char *hresult_name(uint32_t hr) {
 }
 
 void dx_report_failure(const char *desc, uint32_t eax) {
-    // Only this layer's COM methods, and only a failing HRESULT. AddRef and
-    // Release return refcounts, never a value with the sign bit set, so they
-    // cannot be mistaken for failures.
     if (!(eax & 0x80000000u))
         return;
-    if (!desc || !strstr(desc, "::"))
+    if (!desc)
+        return;
+    const char *method = strstr(desc, "::");
+    if (!method || strcmp(method, "::GetAvailableTextureMem") == 0)
         return;
     if (!strstr(desc, "IDirect") && !strstr(desc, "IDirect3D"))
         return;

@@ -10,6 +10,8 @@
 #include "frame_dump.h"
 #include "d3d9_constants.inc"
 #include "d3d_bridge_helpers.h"
+#include "d3dx9shader_shim.h"
+#include "d3dx9effect_shim.h"
 #include "../runtime/win32.h"
 #include "../platform/os.h"
 #include "../runtime/display_seam.h"
@@ -26,6 +28,7 @@ constexpr bool kD3d9WgpuEnabled = false;
 #include <iterator>
 #include <algorithm>
 #include <initializer_list>
+#include <cstdlib>
 
 #define MAKE_D3DHRESULT(code) (0x88760000u | (uint32_t)(code))
 static const uint32_t D3D_OK9 = 0u;
@@ -110,6 +113,49 @@ static ComObj *this_d3d9(X86 *c) {
 static ComObj *this_device9(X86 *c) {
     ComObj *o = com_this_arg(c);
     return (o && o->kind == K_D3D9DEVICE) ? o : nullptr;
+}
+
+static uint32_t g_d3d9_display_owner = 0;
+
+extern "C" bool d3d9_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp) {
+    ComObj *dev = g_d3d9_display_owner ? com_get(g_d3d9_display_owner) : nullptr;
+    if (!dev || !dev->d3d9_device)
+        return false;
+    recomp::d3d::D3d9PresentParams present = dev->d3d9_device->effective_present();
+    if (present.windowed != 0 || present.width == 0 || present.height == 0)
+        return false;
+    if (w)
+        *w = present.width;
+    if (h)
+        *h = present.height;
+    if (bpp)
+        *bpp = 32;
+    return true;
+}
+
+static void d3d9_clear_virtual_display(ComObj *dev) {
+    if (!dev || g_d3d9_display_owner != dev->id)
+        return;
+    g_d3d9_display_owner = 0;
+    uint32_t w = 0, h = 0, bpp = 0;
+    win32_display_mode(&w, &h, &bpp);
+    host_set_display_mode((int)w, (int)h, (int)bpp);
+}
+
+static void d3d9_sync_virtual_display(X86 *c, ComObj *dev, uint32_t hwnd) {
+    if (!dev || !dev->d3d9_device)
+        return;
+    recomp::d3d::D3d9PresentParams present = dev->d3d9_device->effective_present();
+    if (present.windowed != 0) {
+        d3d9_clear_virtual_display(dev);
+        if (hwnd)
+            win32_uncover_display(c, hwnd);
+        return;
+    }
+    g_d3d9_display_owner = dev->id;
+    host_set_display_mode((int)present.width, (int)present.height, 32);
+    if (hwnd)
+        win32_cover_display(c, hwnd, present.width, present.height);
 }
 
 static bool read_guest_rect(uint32_t addr, recomp::d3d::D3d9Rect *out) {
@@ -313,10 +359,21 @@ void D9_GetAdapterIdentifier(X86 *c) {
     com_ret(c, D3D_OK9);
 }
 
-static uint32_t desktop_format9() {
+static uint32_t d3d9_display_format(uint32_t bpp) {
+    return bpp == 32 ? 22u : bpp == 16 ? 23u : 0u;
+}
+static recomp::d3d::D3d9DisplayMode d3d9_current_display_mode() {
     uint32_t w = 0, h = 0, bpp = 0;
     win32_display_mode(&w, &h, &bpp);
-    return bpp == 32 ? 22u : bpp == 16 ? 23u : 0u;
+    recomp::d3d::D3d9DisplayMode mode{};
+    mode.width = w;
+    mode.height = h;
+    mode.refresh_rate = 0;
+    mode.format = d3d9_display_format(bpp);
+    return mode;
+}
+static uint32_t desktop_format9() {
+    return d3d9_current_display_mode().format;
 }
 
 // Mode enumeration reports the one virtual-desktop mode, and the count matches
@@ -345,12 +402,11 @@ static void put_display_mode(uint32_t p) {
         wr32(p + 12, 22);
         return;
     }
-    uint32_t w = 0, h = 0, bpp = 0;
-    win32_display_mode(&w, &h, &bpp);
-    wr32(p + 0, w);
-    wr32(p + 4, h);
-    wr32(p + 8, 0);
-    wr32(p + 12, desktop_format9());
+    recomp::d3d::D3d9DisplayMode mode = d3d9_current_display_mode();
+    wr32(p + 0, mode.width);
+    wr32(p + 4, mode.height);
+    wr32(p + 8, mode.refresh_rate);
+    wr32(p + 12, mode.format);
 }
 void D9_EnumAdapterModes(X86 *c) {
     if (kD3d9WgpuEnabled) {
@@ -669,8 +725,12 @@ void D9_CreateDevice(X86 *c) {
                 request.present.width = (uint32_t)w;
             if (!request.present.height)
                 request.present.height = (uint32_t)h;
+        } else if (!focus_window || !win32_top_level(focus_window) || !device_window ||
+                   !win32_top_level(device_window)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
         }
-        request.desktop_format = desktop_format9();
+        request.display_mode = d3d9_current_display_mode();
         request.thread_id = guest_current_thread_id();
         ComObj *dev = com_new(K_D3D9DEVICE);
         if (!dev) {
@@ -680,11 +740,19 @@ void D9_CreateDevice(X86 *c) {
         dev->dev_d3d = d3d->id;
         com_addref(d3d);
         dev->d3d9_focus_window = focus_window;
+        dev->hwnd = device_window;
         dev->d3d9_device = std::make_shared<D3d9HostDevice>();
         uint16_t previous_cw = c->fpu_cw;
         d3d9_setup_guest_fpu(c, request.behavior_flags);
-        LOGW("d3d9: CreateDevice wgpu behavior=0x%x guest FPU CW %04x -> %04x",
-             request.behavior_flags, previous_cw, c->fpu_cw);
+        LOGW("d3d9: CreateDevice windowed=%u %ux%u fmt=%u count=%u msaa=%u/%u swap=%u flags=0x%x "
+             "refresh=%u interval=0x%x behavior=0x%x desktop=%ux%u fmt=%u FPU CW %04x -> %04x",
+             request.present.windowed, request.present.width, request.present.height,
+             request.present.format, request.present.count, request.present.multisample_type,
+             request.present.multisample_quality, request.present.swap_effect,
+             request.present.flags, request.present.fullscreen_refresh_rate,
+             request.present.presentation_interval, request.behavior_flags,
+             request.display_mode.width, request.display_mode.height, request.display_mode.format,
+             previous_cw, c->fpu_cw);
         recomp::d3d::D3d9CreateResult result =
             recomp::d3d::d3d9_create_device(*dev->d3d9_device->value, request);
         if (result.status.code != recomp::d3d::StatusCode::Ok) {
@@ -713,6 +781,7 @@ void D9_CreateDevice(X86 *c) {
         dev->width = result.present.width;
         dev->height = result.present.height;
         dev->bpp = 32;
+        d3d9_sync_virtual_display(c, dev, dev->hwnd);
         com_out_ptr(out, view);
         com_ret(c, D3D_OK9);
         return;
@@ -858,22 +927,25 @@ void Dev_Reset(X86 *c) {
         if (!device_window)
             device_window = focus_window;
         bool windowed = request.present.windowed != 0;
-        request.window_valid = !windowed;
-        if (windowed && device_window &&
-            host_window_rect(device_window, nullptr, nullptr, nullptr, nullptr)) {
+        request.window_valid = false;
+        if (windowed) {
             int32_t w = 0, h = 0;
-            if (host_window_rect(device_window, nullptr, nullptr, &w, &h) && w > 0 && h > 0) {
+            if (device_window && host_window_rect(device_window, nullptr, nullptr, &w, &h) &&
+                w > 0 && h > 0) {
                 if (!request.present.width)
                     request.present.width = (uint32_t)w;
                 if (!request.present.height)
                     request.present.height = (uint32_t)h;
                 request.window_valid = true;
             }
+        } else {
+            request.window_valid = focus_window && win32_top_level(focus_window) && device_window &&
+                                   win32_top_level(device_window);
         }
         request.implicit_external_refs =
             implicit_surface_externally_referenced(dev->d3d9_backbuffer) ||
             implicit_surface_externally_referenced(dev->d3d9_depthbuffer);
-        request.desktop_format = desktop_format9();
+        request.display_mode = d3d9_current_display_mode();
         request.thread_id = guest_current_thread_id();
         recomp::d3d::D3d9ResetResult result{};
         d3d9_reset_transaction(dev, request, result);
@@ -885,10 +957,13 @@ void Dev_Reset(X86 *c) {
             com_ret(c, bridge_result(c, result.status));
             return;
         }
-        if (windowed && request.window_valid)
-            dev->hwnd = device_window;
+        if (dev->hwnd != device_window)
+            win32_uncover_display(c, dev->hwnd);
+        dev->hwnd = device_window;
         device_discard_implicit_surfaces(dev);
-        LOGW("d3d9: Reset to %ux%u", request.present.width, request.present.height);
+        d3d9_sync_virtual_display(c, dev, dev->hwnd);
+        LOGW("d3d9: Reset to %ux%u windowed=%u", request.present.width, request.present.height,
+             request.present.windowed);
         com_ret(c, D3D_OK9);
         return;
     }
@@ -943,6 +1018,22 @@ void Dev_TestCooperativeLevel(X86 *c) {
     com_ret(c, D3D_OK9);
 }
 void Dev_GetAvailableTextureMem(X86 *c) {
+    if (kD3d9WgpuEnabled) {
+        ComObj *dev = this_device9(c);
+        if (!dev || !dev->d3d9_device) {
+            imports_unsupported(c);
+            return;
+        }
+        recomp::d3d::ValueResult result = dev->d3d9_device->available_texture_mem();
+        if (result.status.code != recomp::d3d::StatusCode::Ok) {
+            std::string message(result.status.message.data(), result.status.message.size());
+            LOGW("d3d9: GetAvailableTextureMem: %s", message.c_str());
+            imports_unsupported(c);
+            return;
+        }
+        set_eax(c, result.value);
+        return;
+    }
     set_eax(c, 256u * 1024u * 1024u);
 }
 void Dev_GetNumberOfSwapChains(X86 *c) {
@@ -970,14 +1061,13 @@ void Dev_GetDisplayMode(X86 *c) {
             com_ret(c, D3DERR_INVALIDCALL);
             return;
         }
-        uint32_t w = 0, h = 0, bpp = 0;
-        win32_display_mode(&w, &h, &bpp);
+        recomp::d3d::D3d9DisplayMode mode = d3d9_current_display_mode();
         recomp::d3d::D3d9DisplayModeRequest request{};
         request.swap_chain = arg(c, 1);
-        request.width = w;
-        request.height = h;
-        request.refresh_rate = 0;
-        request.format = desktop_format9();
+        request.width = mode.width;
+        request.height = mode.height;
+        request.refresh_rate = mode.refresh_rate;
+        request.format = mode.format;
         recomp::d3d::D3d9DisplayModeResult result = dev->d3d9_device->display_mode(request);
         if (result.status.code != recomp::d3d::StatusCode::Ok) {
             com_ret(c, bridge_result(c, result.status));
@@ -1198,6 +1288,12 @@ void Dev_Present(X86 *c) {
             dx_dump_frame_rgba(result.bytes.data(), result.width, result.height);
             host_display_present_window_rgba(result.bytes.data(), (int)result.width,
                                              (int)result.height);
+        }
+        recomp::d3d::D3d9PresentParams effective = dev->d3d9_device->effective_present();
+        if (effective.presentation_interval != 0x80000000u) {
+            const double delay = host_present_refresh_delay(1);
+            if (delay > 0)
+                guest_sleep_ms((uint32_t)(delay * 1000.0));
         }
         com_ret(c, D3D_OK9);
         return;
@@ -2314,6 +2410,2005 @@ void X_D3DXSaveTextureToFileA(X86 *c) {
         return;
     }
     com_ret(c, D3D_OK9);
+}
+
+static float d3dx_rf(uint32_t addr) {
+    uint32_t bits = rd32(addr);
+    float value;
+    memcpy(&value, &bits, 4);
+    return value;
+}
+static void d3dx_wf(uint32_t addr, float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, 4);
+    wr32(addr, bits);
+}
+
+static void d3d9_stage_shader(uint32_t addr, std::vector<uint32_t> &out);
+
+static bool d3dx_stage_shader(uint32_t addr, std::vector<uint32_t> &out) {
+    d3d9_stage_shader(addr, out);
+    return !out.empty();
+}
+
+static ComObj *d3dx_ctab_this(X86 *c) {
+    ComObj *o = com_this_arg(c);
+    if (!o || o->kind != K_D3DXCONSTANTTABLE || !o->d3dx_ctab)
+        return nullptr;
+    return o;
+}
+
+static int d3dx_ctab_node_of(ComObj *o, uint32_t handle) {
+    if (!o->d3dx_ctab_handles || handle < o->d3dx_ctab_handles)
+        return -1;
+    uint32_t offset = handle - o->d3dx_ctab_handles;
+    if (offset % 4 || offset / 4 >= o->d3dx_ctab_nodes)
+        return -1;
+    return (int)(offset / 4);
+}
+
+static int d3dx_ctab_resolve(ComObj *o, uint32_t handle) {
+    if (!handle)
+        return -1;
+    int node = d3dx_ctab_node_of(o, handle);
+    if (node >= 0)
+        return node;
+    if (!gm_valid(handle, 1))
+        return -1;
+    std::string name = gm_str(handle, 16384);
+    if (name.empty() || !gm_valid(handle, name.size() + 1) || rd8(handle + name.size()) != 0)
+        return -1;
+    return recomp::d3d::d3dx_constant_table_find(
+        *o->d3dx_ctab->value, 0xffffffffu,
+        rust::Slice<const uint8_t>((const uint8_t *)name.data(), name.size()));
+}
+
+static uint32_t d3dx_ctab_handle(ComObj *o, int node) {
+    if (node < 0 || (uint32_t)node >= o->d3dx_ctab_nodes || !o->d3dx_ctab_handles)
+        return 0;
+    return o->d3dx_ctab_handles + (uint32_t)node * 4;
+}
+
+static bool d3dx_ctab_desc(ComObj *o, int node, recomp::d3d::D3dxConstantDesc &desc) {
+    if (node < 0)
+        return false;
+    recomp::d3d::D3dxConstantDescResult result =
+        recomp::d3d::d3dx_constant_table_desc(*o->d3dx_ctab->value, (uint32_t)node);
+    if (result.status.code != recomp::d3d::StatusCode::Ok)
+        return false;
+    desc = result.desc;
+    return true;
+}
+
+static void d3dx_ctab_apply_to(X86 *c, uint32_t device_addr, uint32_t handle, uint32_t setter,
+                               const uint8_t *data, size_t size) {
+    ComObj *o = d3dx_ctab_this(c);
+    int node = o ? d3dx_ctab_resolve(o, handle) : -1;
+    if (node < 0) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    ComObj *dev = com_this(device_addr);
+    if (!dev || dev->kind != K_D3D9DEVICE || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::Status status = recomp::d3d::d3dx_constant_table_apply(
+        *dev->d3d9_device->value, *o->d3dx_ctab->value, (uint32_t)node, setter,
+        rust::Slice<const uint8_t>(data, size));
+    com_ret(c, status.code == recomp::d3d::StatusCode::Ok ? D3D_OK9 : bridge_result(c, status));
+}
+
+static bool d3dx_ctab_input_size(X86 *c, uint32_t handle, uint32_t setter, uint64_t requested,
+                                 size_t &size) {
+    ComObj *o = d3dx_ctab_this(c);
+    int node = o ? d3dx_ctab_resolve(o, handle) : -1;
+    if (node < 0) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return false;
+    }
+    size = (size_t)recomp::d3d::d3dx_constant_table_input_size(*o->d3dx_ctab->value, (uint32_t)node,
+                                                               setter, requested);
+    return true;
+}
+
+static void d3dx_ctab_apply_guest(X86 *c, uint32_t device_addr, uint32_t handle, uint32_t setter,
+                                  uint32_t data_addr, uint32_t count, uint32_t element) {
+    size_t size = 0;
+    if (!d3dx_ctab_input_size(c, handle, setter, (uint64_t)count * element, size))
+        return;
+    if (!data_addr || !gm_fits(data_addr, size)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    const uint8_t *data = (const uint8_t *)gm_ptr(data_addr);
+    d3dx_ctab_apply_to(c, device_addr, handle, setter, data, (size_t)size);
+}
+
+static void d3dx_ctab_pointer_array(X86 *c, uint32_t setter, uint32_t element) {
+    uint32_t device_addr = arg(c, 1), handle = arg(c, 2), values_addr = arg(c, 3),
+             count = arg(c, 4);
+    size_t size = 0;
+    if (!d3dx_ctab_input_size(c, handle, setter, (uint64_t)count * element, size))
+        return;
+    count = (uint32_t)(size / element);
+    std::vector<uint8_t> gathered;
+    if (!values_addr || !gm_fits_n(values_addr, count, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (count) {
+        gathered.reserve((size_t)count * element);
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t pointer = rd32(values_addr + i * 4);
+            if (!pointer || !gm_valid(pointer, element)) {
+                com_ret(c, D3DERR_INVALIDCALL);
+                return;
+            }
+            const uint8_t *bytes = (const uint8_t *)gm_ptr(pointer);
+            gathered.insert(gathered.end(), bytes, bytes + element);
+        }
+    }
+    d3dx_ctab_apply_to(c, device_addr, handle, setter, gathered.data(), gathered.size());
+}
+
+void D3DXBuffer_GetBufferPointer(X86 *c) {
+    ComObj *o = d3dx_ctab_this(c);
+    set_eax(c, o ? o->d3dx_ctab_buffer : 0);
+}
+
+void D3DXBuffer_GetBufferSize(X86 *c) {
+    ComObj *o = d3dx_ctab_this(c);
+    set_eax(c, o ? o->d3dx_ctab_size : 0);
+}
+
+void D3DXConstantTable_GetDesc(X86 *c) {
+    ComObj *o = d3dx_ctab_this(c);
+    uint32_t desc = arg(c, 1);
+    if (!o || !desc || !gm_valid(desc, 12)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3dxConstantTableDesc info =
+        recomp::d3d::d3dx_constant_table_info(*o->d3dx_ctab->value);
+    wr32(desc + 0, o->d3dx_ctab_buffer + info.creator_offset);
+    wr32(desc + 4, info.version);
+    wr32(desc + 8, info.constants);
+    com_ret(c, D3D_OK9);
+}
+
+void D3DXConstantTable_GetConstantDesc(X86 *c) {
+    ComObj *o = d3dx_ctab_this(c);
+    uint32_t handle = arg(c, 1), desc_addr = arg(c, 2), count_addr = arg(c, 3);
+    int node = o ? d3dx_ctab_resolve(o, handle) : -1;
+    recomp::d3d::D3dxConstantDesc desc;
+    if (node < 0 || !d3dx_ctab_desc(o, node, desc)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if ((count_addr && !gm_valid(count_addr, 4)) || (desc_addr && !gm_valid(desc_addr, 48))) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (desc_addr) {
+        wr32(desc_addr + 0, o->d3dx_ctab_buffer + desc.name_offset);
+        wr32(desc_addr + 4, desc.register_set);
+        wr32(desc_addr + 8, desc.register_index);
+        wr32(desc_addr + 12, desc.register_count);
+        wr32(desc_addr + 16, desc.class_);
+        wr32(desc_addr + 20, desc.type_);
+        wr32(desc_addr + 24, desc.rows);
+        wr32(desc_addr + 28, desc.columns);
+        wr32(desc_addr + 32, desc.elements);
+        wr32(desc_addr + 36, desc.struct_members);
+        wr32(desc_addr + 40, desc.bytes);
+        wr32(desc_addr + 44,
+             desc.default_offset == 0xffffffffu ? 0 : o->d3dx_ctab_buffer + desc.default_offset);
+    }
+    if (count_addr)
+        wr32(count_addr, 1);
+    com_ret(c, D3D_OK9);
+}
+
+void D3DXConstantTable_GetSamplerIndex(X86 *c) {
+    ComObj *o = d3dx_ctab_this(c);
+    int node = o ? d3dx_ctab_resolve(o, arg(c, 1)) : -1;
+    set_eax(c, node < 0 ? 0xffffffffu
+                        : recomp::d3d::d3dx_constant_table_sampler(*o->d3dx_ctab->value,
+                                                                   (uint32_t)node));
+}
+
+void D3DXConstantTable_GetConstant(X86 *c) {
+    ComObj *o = d3dx_ctab_this(c);
+    uint32_t handle = arg(c, 1);
+    int parent = o && handle ? d3dx_ctab_resolve(o, handle) : -1;
+    if (!o || (handle && parent < 0)) {
+        set_eax(c, 0);
+        return;
+    }
+    int node = recomp::d3d::d3dx_constant_table_constant(
+        *o->d3dx_ctab->value, handle ? (uint32_t)parent : 0xffffffffu, arg(c, 2));
+    set_eax(c, d3dx_ctab_handle(o, node));
+}
+
+void D3DXConstantTable_GetConstantByName(X86 *c) {
+    ComObj *o = d3dx_ctab_this(c);
+    uint32_t handle = arg(c, 1), name_addr = arg(c, 2);
+    if (!o || !name_addr || !gm_valid(name_addr, 1)) {
+        set_eax(c, 0);
+        return;
+    }
+    int parent = handle ? d3dx_ctab_resolve(o, handle) : -1;
+    if (handle && parent < 0) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t parent_arg = handle ? (uint32_t)parent : 0xffffffffu;
+    std::string name = gm_str(name_addr, 16384);
+    if (!gm_valid(name_addr, name.size() + 1) || rd8(name_addr + name.size()) != 0) {
+        set_eax(c, 0);
+        return;
+    }
+    int node = recomp::d3d::d3dx_constant_table_find(
+        *o->d3dx_ctab->value, parent_arg,
+        rust::Slice<const uint8_t>((const uint8_t *)name.data(), name.size()));
+    set_eax(c, d3dx_ctab_handle(o, node));
+}
+
+void D3DXConstantTable_GetConstantElement(X86 *c) {
+    ComObj *o = d3dx_ctab_this(c);
+    int node = o ? d3dx_ctab_resolve(o, arg(c, 1)) : -1;
+    int element = node < 0 ? -1
+                           : recomp::d3d::d3dx_constant_table_element(*o->d3dx_ctab->value,
+                                                                      (uint32_t)node, arg(c, 2));
+    set_eax(c, o ? d3dx_ctab_handle(o, element) : 0);
+}
+
+void D3DXConstantTable_SetDefaults(X86 *c) {
+    ComObj *o = d3dx_ctab_this(c);
+    ComObj *dev = com_this(arg(c, 1));
+    if (!o || !dev || dev->kind != K_D3D9DEVICE || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::Status status =
+        recomp::d3d::d3dx_constant_table_defaults(*dev->d3d9_device->value, *o->d3dx_ctab->value);
+    com_ret(c, status.code == recomp::d3d::StatusCode::Ok ? D3D_OK9 : bridge_result(c, status));
+}
+
+void D3DXConstantTable_SetValue(X86 *c) {
+    d3dx_ctab_apply_guest(c, arg(c, 1), arg(c, 2), kD3dxSetValue, arg(c, 3), arg(c, 4), 1);
+}
+
+void D3DXConstantTable_SetBool(X86 *c) {
+    uint32_t value = arg(c, 3);
+    d3dx_ctab_apply_to(c, arg(c, 1), arg(c, 2), kD3dxSetBool, (const uint8_t *)&value, 4);
+}
+
+void D3DXConstantTable_SetBoolArray(X86 *c) {
+    d3dx_ctab_apply_guest(c, arg(c, 1), arg(c, 2), kD3dxSetBoolArray, arg(c, 3), arg(c, 4), 4);
+}
+
+void D3DXConstantTable_SetInt(X86 *c) {
+    uint32_t value = arg(c, 3);
+    d3dx_ctab_apply_to(c, arg(c, 1), arg(c, 2), kD3dxSetInt, (const uint8_t *)&value, 4);
+}
+
+void D3DXConstantTable_SetIntArray(X86 *c) {
+    d3dx_ctab_apply_guest(c, arg(c, 1), arg(c, 2), kD3dxSetIntArray, arg(c, 3), arg(c, 4), 4);
+}
+
+void D3DXConstantTable_SetFloat(X86 *c) {
+    uint32_t value = arg(c, 3);
+    d3dx_ctab_apply_to(c, arg(c, 1), arg(c, 2), kD3dxSetFloat, (const uint8_t *)&value, 4);
+}
+
+void D3DXConstantTable_SetFloatArray(X86 *c) {
+    d3dx_ctab_apply_guest(c, arg(c, 1), arg(c, 2), kD3dxSetFloatArray, arg(c, 3), arg(c, 4), 4);
+}
+
+void D3DXConstantTable_SetVector(X86 *c) {
+    d3dx_ctab_apply_guest(c, arg(c, 1), arg(c, 2), kD3dxSetVector, arg(c, 3), 1, 16);
+}
+
+void D3DXConstantTable_SetVectorArray(X86 *c) {
+    d3dx_ctab_apply_guest(c, arg(c, 1), arg(c, 2), kD3dxSetVectorArray, arg(c, 3), arg(c, 4), 16);
+}
+
+void D3DXConstantTable_SetMatrix(X86 *c) {
+    d3dx_ctab_apply_guest(c, arg(c, 1), arg(c, 2), kD3dxSetMatrix, arg(c, 3), 1, 64);
+}
+
+void D3DXConstantTable_SetMatrixArray(X86 *c) {
+    d3dx_ctab_apply_guest(c, arg(c, 1), arg(c, 2), kD3dxSetMatrixArray, arg(c, 3), arg(c, 4), 64);
+}
+
+void D3DXConstantTable_SetMatrixPointerArray(X86 *c) {
+    d3dx_ctab_pointer_array(c, kD3dxSetMatrixPointerArray, 64);
+}
+
+void D3DXConstantTable_SetMatrixTranspose(X86 *c) {
+    d3dx_ctab_apply_guest(c, arg(c, 1), arg(c, 2), kD3dxSetMatrixTranspose, arg(c, 3), 1, 64);
+}
+
+void D3DXConstantTable_SetMatrixTransposeArray(X86 *c) {
+    d3dx_ctab_apply_guest(c, arg(c, 1), arg(c, 2), kD3dxSetMatrixTransposeArray, arg(c, 3),
+                          arg(c, 4), 64);
+}
+
+void D3DXConstantTable_SetMatrixTransposePointerArray(X86 *c) {
+    d3dx_ctab_pointer_array(c, kD3dxSetMatrixTransposePointerArray, 64);
+}
+
+void d3dx_ctab_destroy(ComObj *o) {
+    if (o->d3dx_ctab_buffer) {
+        heap_free(o->d3dx_ctab_buffer);
+        o->d3dx_ctab_buffer = 0;
+    }
+    if (o->d3dx_ctab_handles) {
+        heap_free(o->d3dx_ctab_handles);
+        o->d3dx_ctab_handles = 0;
+    }
+    o->d3dx_ctab.reset();
+}
+
+void X_D3DXGetShaderVersion(X86 *c) {
+    uint32_t addr = arg(c, 0);
+    uint32_t version = addr && gm_valid(addr, 4) ? rd32(addr) : 0;
+    set_eax(c, recomp::d3d::d3dx_shader_version(rust::Slice<const uint32_t>(&version, 1)));
+}
+
+void X_D3DXGetShaderInputSemantics(X86 *c) {
+    uint32_t code_addr = arg(c, 0), semantics_addr = arg(c, 1), count_addr = arg(c, 2);
+    if (!code_addr || !gm_valid(code_addr, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    std::vector<uint32_t> code;
+    if (!d3dx_stage_shader(code_addr, code)) {
+        com_ret(c, MAKE_D3DHRESULT(2905));
+        return;
+    }
+    recomp::d3d::D3dxSemanticsResult result = recomp::d3d::d3dx_shader_input_semantics(
+        rust::Slice<const uint32_t>(code.data(), code.size()));
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    uint32_t count = (uint32_t)result.semantics.size();
+    if ((count_addr && !gm_valid(count_addr, 4)) ||
+        (semantics_addr && !gm_fits_n(semantics_addr, count, 8))) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (count_addr)
+        wr32(count_addr, count);
+    if (semantics_addr && count) {
+        for (uint32_t i = 0; i < count; ++i) {
+            wr32(semantics_addr + i * 8, result.semantics[i].usage);
+            wr32(semantics_addr + i * 8 + 4, result.semantics[i].usage_index);
+        }
+    }
+    com_ret(c, D3D_OK9);
+}
+
+void X_D3DXGetShaderConstantTable(X86 *c) {
+    uint32_t code_addr = arg(c, 0), out_addr = arg(c, 1);
+    if (!out_addr || !gm_valid(out_addr, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    wr32(out_addr, 0);
+    if (!code_addr || !gm_valid(code_addr, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    std::vector<uint32_t> code;
+    if (!d3dx_stage_shader(code_addr, code)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    auto host = std::make_shared<D3dxConstantTableHost>();
+    recomp::d3d::D3dxConstantTableResult result = recomp::d3d::d3dx_constant_table_create(
+        *host->value, rust::Slice<const uint32_t>(code.data(), code.size()));
+    if (result.invalid_bytecode) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    uint32_t buffer = 0;
+    if (!result.buffer.empty()) {
+        buffer = heap_alloc((uint32_t)result.buffer.size(), true, 16);
+        if (!buffer) {
+            com_ret(c, E_OUTOFMEMORY);
+            return;
+        }
+        memcpy(gm_ptr(buffer), result.buffer.data(), result.buffer.size());
+    }
+    uint32_t handles = 0;
+    if (result.node_count) {
+        handles = heap_alloc(result.node_count * 4, true, 16);
+        if (!handles) {
+            heap_free(buffer);
+            com_ret(c, E_OUTOFMEMORY);
+            return;
+        }
+    }
+    ComObj *o = com_new(K_D3DXCONSTANTTABLE);
+    if (!o) {
+        heap_free(buffer);
+        heap_free(handles);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    o->d3dx_ctab = host;
+    o->d3dx_ctab_buffer = buffer;
+    o->d3dx_ctab_size = (uint32_t)result.buffer.size();
+    o->d3dx_ctab_handles = handles;
+    o->d3dx_ctab_nodes = result.node_count;
+    uint32_t view = com_view(o, IF_D3DXCONSTANTTABLE);
+    if (!view) {
+        com_release(o);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    com_out_ptr(out_addr, view);
+    com_ret(c, D3D_OK9);
+}
+
+static std::map<std::string, uint32_t> &d3dx_profile_strings() {
+    static std::map<std::string, uint32_t> cache;
+    return cache;
+}
+
+void d3dx_shader_helpers_reset() {
+    d3dx_profile_strings().clear();
+}
+
+static ComObj *efx_this(X86 *c) {
+    ComObj *o = com_this_arg(c);
+    if (!o || o->kind != K_D3DXEFFECT || !o->d3dx_effect)
+        return nullptr;
+    return o;
+}
+
+static D3dxEffectHost *efx_host(ComObj *o) {
+    return o && o->d3dx_effect ? o->d3dx_effect.get() : nullptr;
+}
+
+static ComObj *efx_device(X86 *c) {
+    ComObj *fx = efx_this(c);
+    if (!fx)
+        return nullptr;
+    ComObj *dev = com_get(fx->d3dx_effect->device_id);
+    if (!dev || dev->kind != K_D3D9DEVICE || !dev->d3d9_device)
+        return nullptr;
+    return dev;
+}
+
+static void efx_status(X86 *c, recomp::d3d::Status result) {
+    com_ret(c, result.code == recomp::d3d::StatusCode::Ok ? D3D_OK9 : bridge_result(c, result));
+}
+
+static uint32_t efx_guest_string(D3dxEffectHost *host, const std::vector<uint8_t> &bytes) {
+    std::string key((const char *)bytes.data(), bytes.size());
+    auto it = host->strings.find(key);
+    if (it != host->strings.end())
+        return it->second;
+    uint32_t addr = heap_alloc((uint32_t)bytes.size() + 1, true, 16);
+    if (!addr)
+        return 0;
+    if (!bytes.empty())
+        memcpy(gm_ptr(addr), bytes.data(), bytes.size());
+    ((uint8_t *)gm_ptr(addr))[bytes.size()] = 0;
+    host->strings.emplace(std::move(key), addr);
+    return addr;
+}
+
+static bool efx_texture_kind(ComKind kind) {
+    return kind == K_D3D9TEXTURE || kind == K_D3D9CUBETEXTURE || kind == K_D3D9VOLUMETEXTURE;
+}
+
+static const uint32_t EFX_KNOWN_CREATION_FLAGS = 0x1fbffu;
+
+static uint32_t efx_wrap_handle(ComObj *fx, uint32_t token) {
+    if (!token)
+        return 0;
+    D3dxEffectHost *host = efx_host(fx);
+    auto it = host->handle_tokens.find(token);
+    if (it != host->handle_tokens.end())
+        return it->second;
+    uint32_t addr = heap_alloc(4, false, 16);
+    if (!addr)
+        return 0;
+    wr32(addr, token);
+    host->handle_tokens.emplace(token, addr);
+    host->handle_reverse.emplace(addr, token);
+    return addr;
+}
+
+static uint32_t efx_resolve_handle(ComObj *fx, uint32_t guest_handle, uint32_t kind) {
+    if (!guest_handle)
+        return 0;
+    D3dxEffectHost *host = efx_host(fx);
+    auto it = host->handle_reverse.find(guest_handle);
+    if (it != host->handle_reverse.end())
+        return it->second;
+    std::string text = gm_str(guest_handle, 16384);
+    if (text.empty())
+        return 0;
+    rust::Slice<const uint8_t> name((const uint8_t *)text.data(), text.size());
+    if (kind <= 2) {
+        uint32_t token = recomp::d3d::d3dx_effect_find(*host->value, 0, name, kind);
+        if (token)
+            return token;
+    }
+    for (uint32_t candidate : {0u, 1u, 2u}) {
+        uint32_t token = recomp::d3d::d3dx_effect_find(*host->value, 0, name, candidate);
+        if (token)
+            return token;
+    }
+    return 0;
+}
+
+static void efx_free_handles(D3dxEffectHost *host) {
+    for (auto &entry : host->handle_tokens)
+        heap_free(entry.second);
+    host->handle_tokens.clear();
+    host->handle_reverse.clear();
+}
+
+static void efx_reconcile_refs(std::set<uint32_t> &current, const std::set<uint32_t> &desired) {
+    for (uint32_t id : current)
+        if (!desired.count(id))
+            if (ComObj *o = com_get(id))
+                com_release(o);
+    for (uint32_t id : desired)
+        if (!current.count(id))
+            if (ComObj *o = com_get(id))
+                com_addref(o);
+    current = desired;
+}
+
+static void efx_refresh_textures(ComObj *fx) {
+    D3dxEffectHost *host = efx_host(fx);
+    if (!host)
+        return;
+    std::set<uint32_t> desired;
+    for (uint32_t id : recomp::d3d::d3dx_effect_texture_refs(*host->value)) {
+        if (!id)
+            continue;
+        ComObj *o = com_get(id);
+        if (o && efx_texture_kind(o->kind) && o->dev_d3d == host->device_id)
+            desired.insert(id);
+    }
+    efx_reconcile_refs(host->texture_refs, desired);
+}
+
+static void efx_refresh_pool_textures(ComObj *pool) {
+    if (!pool || !pool->d3dx_effect_pool)
+        return;
+    std::set<uint32_t> desired;
+    for (uint32_t id : recomp::d3d::d3dx_effect_pool_texture_refs(*pool->d3dx_effect_pool->value)) {
+        if (!id)
+            continue;
+        ComObj *o = com_get(id);
+        if (o && efx_texture_kind(o->kind))
+            desired.insert(id);
+    }
+    efx_reconcile_refs(pool->d3dx_effect_pool->texture_refs, desired);
+}
+
+static void efx_refresh_saved(ComObj *dev, ComObj *fx) {
+    D3dxEffectHost *host = efx_host(fx);
+    if (!host || !dev || !dev->d3d9_device)
+        return;
+    recomp::d3d::D3d9BindingsResult result = recomp::d3d::d3dx_effect_saved_bindings(*host->value);
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        efx_reconcile_refs(host->saved_refs, {});
+        return;
+    }
+    efx_reconcile_refs(host->saved_refs, d3d9_binding_set(dev, result.live));
+}
+
+static void efx_drop_saved(ComObj *fx) {
+    D3dxEffectHost *host = efx_host(fx);
+    if (host)
+        efx_reconcile_refs(host->saved_refs, {});
+}
+
+static recomp::d3d::Status efx_publish_shaders(ComObj *dev, ComObj *fx) {
+    D3dxEffectHost *host = efx_host(fx);
+    recomp::d3d::D3dxEffectShadersResult result =
+        recomp::d3d::d3dx_effect_prepare_shaders(*host->value, *dev->d3d9_device->value);
+    if (result.status.code != recomp::d3d::StatusCode::Ok)
+        return result.status;
+    std::set<uint32_t> added;
+    auto publish = [&](uint32_t handle, bool pixel) -> bool {
+        if (!handle || dev->d3d9_device->shader_views.count(handle))
+            return true;
+        ComObj *o = com_new(pixel ? K_D3D9PS : K_D3D9VS);
+        if (!o)
+            return false;
+        o->dev_d3d = dev->id;
+        o->d3d9_state_handle = handle;
+        com_internalize(o);
+        dev->d3d9_device->shader_views[handle] = o->id;
+        host->published_shaders.insert(o->id);
+        added.insert(o->id);
+        return true;
+    };
+    bool published = true;
+    for (uint32_t handle : result.vertex)
+        if (!publish(handle, false)) {
+            published = false;
+            break;
+        }
+    if (published)
+        for (uint32_t handle : result.pixel)
+            if (!publish(handle, true)) {
+                published = false;
+                break;
+            }
+    if (!published) {
+        for (uint32_t handle : result.vertex)
+            if (!dev->d3d9_device->shader_views.count(handle))
+                dev->d3d9_device->destroy_shader(false, handle);
+        for (uint32_t handle : result.pixel)
+            if (!dev->d3d9_device->shader_views.count(handle))
+                dev->d3d9_device->destroy_shader(true, handle);
+        for (uint32_t id : added)
+            if (ComObj *o = com_get(id)) {
+                if (o->d3d9_state_handle)
+                    dev->d3d9_device->shader_views.erase(o->d3d9_state_handle);
+                host->published_shaders.erase(id);
+                com_release_internal(o);
+            }
+        return recomp::d3d::Status{recomp::d3d::StatusCode::OutOfMemory,
+                                   rust::String("ID3DXEffect: shader view allocation failed")};
+    }
+    return recomp::d3d::Status{recomp::d3d::StatusCode::Ok, rust::String()};
+}
+
+static const uint32_t EFX_MANAGER_ADDREF = 1 * 4;
+static const uint32_t EFX_MANAGER_RELEASE = 2 * 4;
+static const uint32_t EFX_MANAGER_SET_TRANSFORM = 3 * 4;
+static const uint32_t EFX_MANAGER_SET_RENDER_STATE = 7 * 4;
+static const uint32_t EFX_MANAGER_SET_TEXTURE = 8 * 4;
+static const uint32_t EFX_MANAGER_SET_TEXTURE_STAGE_STATE = 9 * 4;
+static const uint32_t EFX_MANAGER_SET_SAMPLER_STATE = 10 * 4;
+static const uint32_t EFX_MANAGER_SET_VERTEX_SHADER = 13 * 4;
+static const uint32_t EFX_MANAGER_SET_VERTEX_SHADER_CONSTANT_F = 14 * 4;
+static const uint32_t EFX_MANAGER_SET_PIXEL_SHADER = 17 * 4;
+static const uint32_t EFX_MANAGER_SET_PIXEL_SHADER_CONSTANT_F = 18 * 4;
+
+static bool efx_manager_valid(uint32_t manager) {
+    if (!manager || !gm_valid(manager, 4))
+        return false;
+    uint32_t vtbl = rd32(manager);
+    return vtbl && gm_valid(vtbl, 21 * 4);
+}
+
+static uint32_t efx_manager_method(uint32_t manager, uint32_t offset, const char *name) {
+    uint32_t vtbl = efx_manager_valid(manager) ? rd32(manager) : 0;
+    if (!vtbl || !gm_valid(vtbl + offset, 4)) {
+        LOGW("d3d9: ID3DXEffectStateManager::%s vtable slot is not readable", name);
+        return 0;
+    }
+    uint32_t fn = rd32(vtbl + offset);
+    if (!fn || !gm_valid(fn, 1)) {
+        LOGW("d3d9: ID3DXEffectStateManager::%s target is not a readable guest address", name);
+        return 0;
+    }
+    return fn;
+}
+
+void d3dx_effect_destroy(ComObj *o) {
+    if (!o->d3dx_effect)
+        return;
+    D3dxEffectHost *host = o->d3dx_effect.get();
+    for (auto &entry : host->strings)
+        heap_free(entry.second);
+    host->strings.clear();
+    for (auto &entry : host->pass_shaders) {
+        if (entry.second.first)
+            heap_free(entry.second.first);
+        if (entry.second.second)
+            heap_free(entry.second.second);
+    }
+    host->pass_shaders.clear();
+    efx_free_handles(host);
+    efx_reconcile_refs(host->texture_refs, {});
+    efx_reconcile_refs(host->saved_refs, {});
+    if (host->state_manager) {
+        X86 *c = guest_current_context();
+        if (!c) {
+            LOGW("d3d9: ID3DXEffectStateManager::Release requires a guest context");
+            std::abort();
+        } else {
+            uint32_t release =
+                efx_manager_method(host->state_manager, EFX_MANAGER_RELEASE, "Release");
+            if (!release) {
+                LOGW("d3d9: ID3DXEffectStateManager::Release unavailable during effect destroy");
+                std::abort();
+            } else
+                guest_call(c, release, host->state_manager);
+        }
+        host->state_manager = 0;
+    }
+    ComObj *pool = com_get(host->pool_obj);
+    ComObj *dev = com_get(host->device_id);
+    if (dev && dev->d3d9_device) {
+        recomp::d3d::d3dx_effect_release(*host->value);
+        recomp::d3d::d3dx_effect_shutdown(*host->value, *dev->d3d9_device->value);
+    }
+    for (uint32_t id : host->published_shaders)
+        if (ComObj *shader = com_get(id))
+            com_release_internal(shader);
+    host->published_shaders.clear();
+    if (pool && pool->d3dx_effect_pool)
+        efx_refresh_pool_textures(pool);
+    if (pool)
+        com_release(pool);
+    if (dev)
+        com_release(dev);
+    o->d3dx_effect.reset();
+}
+
+void d3dx_effect_pool_destroy(ComObj *o) {
+    if (!o || !o->d3dx_effect_pool)
+        return;
+    efx_reconcile_refs(o->d3dx_effect_pool->texture_refs, {});
+    o->d3dx_effect_pool.reset();
+}
+
+void X_D3DX33CreateEffectPool(X86 *c) {
+    uint32_t out = arg(c, 0);
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, 0);
+    auto host = std::make_shared<D3dxEffectPoolHost>();
+    ComObj *o = com_new(K_D3DXEFFECTPOOL);
+    if (!o) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    o->d3dx_effect_pool = host;
+    uint32_t view = com_view(o, IF_D3DXEFFECTPOOL33);
+    if (!view) {
+        com_release(o);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    com_out_ptr(out, view);
+    com_ret(c, D3D_OK9);
+}
+
+void X_D3DXCreateEffectFromFileA(X86 *c) {
+    uint32_t device_addr = arg(c, 0), file = arg(c, 1), flags = arg(c, 4);
+    uint32_t pool_addr = arg(c, 5), out = arg(c, 6), errors = arg(c, 7);
+    if (errors && gm_valid(errors, 4))
+        wr32(errors, 0);
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, 0);
+    ComObj *dev = com_this(device_addr);
+    if (!dev || dev->kind != K_D3D9DEVICE || !dev->d3d9_device || !file) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    ComObj *pool = pool_addr ? com_this(pool_addr) : nullptr;
+    if (pool_addr && (!pool || pool->kind != K_D3DXEFFECTPOOL || !pool->d3dx_effect_pool)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (flags & ~EFX_KNOWN_CREATION_FLAGS) {
+        com_ret(c, bridge_result(
+                       c, recomp::d3d::Status{recomp::d3d::StatusCode::Unsupported,
+                                              rust::String("D3DXCreateEffectFromFileA: "
+                                                           "unknown effect creation flags")}));
+        return;
+    }
+    std::string path = win32_host_path_op(gm_str(file, 1024), WIN32_FILE_READ);
+    std::vector<uint8_t> bytes;
+    if (!d3dx_read_file(path, bytes)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    auto host = std::make_shared<D3dxEffectHost>();
+    host->device_id = dev->id;
+    recomp::d3d::D3dxEffectCreateResult result = recomp::d3d::d3dx_effect_create(
+        *host->value, *dev->d3d9_device->value,
+        rust::Slice<const uint8_t>(bytes.data(), bytes.size()), flags);
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    com_addref(dev);
+    if (pool) {
+        recomp::d3d::Status join = recomp::d3d::d3dx_effect_join_pool(
+            *host->value, *pool->d3dx_effect_pool->value, dev->id);
+        if (join.code != recomp::d3d::StatusCode::Ok) {
+            recomp::d3d::d3dx_effect_release(*host->value);
+            com_release(dev);
+            com_ret(c, bridge_result(c, join));
+            return;
+        }
+        com_addref(pool);
+        host->pool_obj = pool->id;
+    }
+    ComObj *o = com_new(K_D3DXEFFECT);
+    if (!o) {
+        recomp::d3d::d3dx_effect_release(*host->value);
+        if (pool)
+            com_release(pool);
+        com_release(dev);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    o->d3dx_effect = host;
+    uint32_t view = com_view(o, IF_D3DXEFFECT33);
+    if (!view) {
+        com_release(o);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    efx_refresh_textures(o);
+    if (pool)
+        efx_refresh_pool_textures(pool);
+    recomp::d3d::Status publish = efx_publish_shaders(dev, o);
+    if (publish.code != recomp::d3d::StatusCode::Ok) {
+        com_release(o);
+        com_ret(c, bridge_result(c, publish));
+        return;
+    }
+    com_out_ptr(out, view);
+    com_ret(c, D3D_OK9);
+}
+
+void Efx_GetDesc(X86 *c) {
+    ComObj *fx = efx_this(c);
+    uint32_t desc = arg(c, 1);
+    if (!fx || !desc || !gm_valid(desc, 16)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3dxEffectDescResult result = recomp::d3d::d3dx_effect_desc(*efx_host(fx)->value);
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        efx_status(c, result.status);
+        return;
+    }
+    wr32(desc + 0, 0);
+    wr32(desc + 4, result.desc.parameters);
+    wr32(desc + 8, result.desc.techniques);
+    wr32(desc + 12, result.desc.functions);
+    com_ret(c, D3D_OK9);
+}
+
+void Efx_GetParameterDesc(X86 *c) {
+    ComObj *fx = efx_this(c);
+    uint32_t desc = arg(c, 2);
+    if (!fx || !desc || !gm_valid(desc, 44)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3dxEffectParamDescResult result = recomp::d3d::d3dx_effect_param_desc(
+        *efx_host(fx)->value, efx_resolve_handle(fx, arg(c, 1), 0));
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        efx_status(c, result.status);
+        return;
+    }
+    std::vector<uint8_t> name(result.name.begin(), result.name.end());
+    std::vector<uint8_t> semantic(result.semantic.begin(), result.semantic.end());
+    uint32_t name_addr = name.empty() ? 0 : efx_guest_string(efx_host(fx), name);
+    if (!name.empty() && !name_addr) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    uint32_t semantic_addr = semantic.empty() ? 0 : efx_guest_string(efx_host(fx), semantic);
+    if (!semantic.empty() && !semantic_addr) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    wr32(desc + 0, name_addr);
+    wr32(desc + 4, semantic_addr);
+    wr32(desc + 8, result.desc.class_);
+    wr32(desc + 12, result.desc.type_);
+    wr32(desc + 16, result.desc.rows);
+    wr32(desc + 20, result.desc.columns);
+    wr32(desc + 24, result.desc.elements);
+    wr32(desc + 28, result.desc.annotations);
+    wr32(desc + 32, result.desc.struct_members);
+    wr32(desc + 36, result.desc.flags);
+    wr32(desc + 40, result.desc.bytes);
+    com_ret(c, D3D_OK9);
+}
+
+void Efx_GetTechniqueDesc(X86 *c) {
+    ComObj *fx = efx_this(c);
+    uint32_t desc = arg(c, 2);
+    if (!fx || !desc || !gm_valid(desc, 12)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3dxEffectTechniqueDescResult result = recomp::d3d::d3dx_effect_technique_desc(
+        *efx_host(fx)->value, efx_resolve_handle(fx, arg(c, 1), 1));
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        efx_status(c, result.status);
+        return;
+    }
+    std::vector<uint8_t> name(result.name.begin(), result.name.end());
+    uint32_t name_addr = name.empty() ? 0 : efx_guest_string(efx_host(fx), name);
+    if (!name.empty() && !name_addr) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    wr32(desc + 0, name_addr);
+    wr32(desc + 4, result.desc.passes);
+    wr32(desc + 8, result.desc.annotations);
+    com_ret(c, D3D_OK9);
+}
+
+void Efx_GetPassDesc(X86 *c) {
+    ComObj *fx = efx_this(c);
+    uint32_t desc = arg(c, 2);
+    if (!fx || !desc || !gm_valid(desc, 16)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    D3dxEffectHost *host = efx_host(fx);
+    uint32_t pass = efx_resolve_handle(fx, arg(c, 1), 2);
+    recomp::d3d::D3dxEffectPassDescResult result =
+        recomp::d3d::d3dx_effect_pass_desc(*host->value, pass);
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        efx_status(c, result.status);
+        return;
+    }
+    std::vector<uint8_t> name(result.name.begin(), result.name.end());
+    uint32_t name_addr = name.empty() ? 0 : efx_guest_string(host, name);
+    if (!name.empty() && !name_addr) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    wr32(desc + 0, name_addr);
+    wr32(desc + 4, result.desc.annotations);
+    auto it = host->pass_shaders.find(pass);
+    if (it == host->pass_shaders.end()) {
+        auto copy_shader = [](const rust::Vec<uint8_t> &bytes) -> uint32_t {
+            if (bytes.empty())
+                return 0;
+            uint32_t addr = heap_alloc((uint32_t)bytes.size(), false, 16);
+            if (addr)
+                memcpy(gm_ptr(addr), bytes.data(), bytes.size());
+            return addr;
+        };
+        uint32_t vertex = copy_shader(result.desc.vertex_shader);
+        uint32_t pixel = copy_shader(result.desc.pixel_shader);
+        if ((!result.desc.vertex_shader.empty() && !vertex) ||
+            (!result.desc.pixel_shader.empty() && !pixel)) {
+            if (vertex)
+                heap_free(vertex);
+            if (pixel)
+                heap_free(pixel);
+            com_ret(c, E_OUTOFMEMORY);
+            return;
+        }
+        it = host->pass_shaders.emplace(pass, std::make_pair(vertex, pixel)).first;
+    }
+    wr32(desc + 8, it->second.first);
+    wr32(desc + 12, it->second.second);
+    com_ret(c, D3D_OK9);
+}
+
+void Efx_GetParameter(X86 *c) {
+    ComObj *fx = efx_this(c);
+    if (!fx) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t parent = efx_resolve_handle(fx, arg(c, 1), 0);
+    set_eax(c, efx_wrap_handle(
+                   fx, recomp::d3d::d3dx_effect_enum(*efx_host(fx)->value, parent, arg(c, 2), 0)));
+}
+
+void Efx_GetParameterElement(X86 *c) {
+    ComObj *fx = efx_this(c);
+    if (!fx) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t parent = efx_resolve_handle(fx, arg(c, 1), 0);
+    set_eax(c, efx_wrap_handle(
+                   fx, recomp::d3d::d3dx_effect_enum(*efx_host(fx)->value, parent, arg(c, 2), 4)));
+}
+
+void Efx_GetParameterByName(X86 *c) {
+    ComObj *fx = efx_this(c);
+    uint32_t name = arg(c, 2);
+    if (!fx || !name) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t parent = efx_resolve_handle(fx, arg(c, 1), 0);
+    std::string text = gm_str(name, 16384);
+    set_eax(c,
+            efx_wrap_handle(
+                fx, recomp::d3d::d3dx_effect_find(
+                        *efx_host(fx)->value, parent,
+                        rust::Slice<const uint8_t>((const uint8_t *)text.data(), text.size()), 0)));
+}
+
+void Efx_GetParameterBySemantic(X86 *c) {
+    ComObj *fx = efx_this(c);
+    uint32_t semantic = arg(c, 2);
+    set_eax(c, 0);
+    if (!fx || !semantic)
+        return;
+    std::string want = gm_str(semantic, 16384);
+    D3dxEffectHost *host = efx_host(fx);
+    uint32_t parent = efx_resolve_handle(fx, arg(c, 1), 0);
+    for (uint32_t index = 0;; ++index) {
+        uint32_t handle = recomp::d3d::d3dx_effect_enum(*host->value, parent, index, 0);
+        if (!handle)
+            break;
+        recomp::d3d::D3dxBytesResult name =
+            recomp::d3d::d3dx_effect_param_semantic(*host->value, handle);
+        std::string text(name.bytes.begin(), name.bytes.end());
+        if (text == want) {
+            set_eax(c, efx_wrap_handle(fx, handle));
+            return;
+        }
+    }
+}
+
+void Efx_GetTechnique(X86 *c) {
+    ComObj *fx = efx_this(c);
+    set_eax(c, fx ? efx_wrap_handle(
+                        fx, recomp::d3d::d3dx_effect_enum(*efx_host(fx)->value, 0, arg(c, 1), 1))
+                  : 0);
+}
+
+void Efx_GetTechniqueByName(X86 *c) {
+    ComObj *fx = efx_this(c);
+    uint32_t name = arg(c, 1);
+    if (!fx || !name) {
+        set_eax(c, 0);
+        return;
+    }
+    std::string text = gm_str(name, 16384);
+    set_eax(c,
+            efx_wrap_handle(
+                fx, recomp::d3d::d3dx_effect_find(
+                        *efx_host(fx)->value, 0,
+                        rust::Slice<const uint8_t>((const uint8_t *)text.data(), text.size()), 1)));
+}
+
+void Efx_GetPass(X86 *c) {
+    ComObj *fx = efx_this(c);
+    if (!fx) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t technique = efx_resolve_handle(fx, arg(c, 1), 1);
+    set_eax(c, efx_wrap_handle(fx, recomp::d3d::d3dx_effect_enum(*efx_host(fx)->value, technique,
+                                                                 arg(c, 2), 2)));
+}
+
+void Efx_GetPassByName(X86 *c) {
+    ComObj *fx = efx_this(c);
+    uint32_t name = arg(c, 2);
+    if (!fx || !name) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t technique = efx_resolve_handle(fx, arg(c, 1), 1);
+    std::string text = gm_str(name, 16384);
+    set_eax(c,
+            efx_wrap_handle(
+                fx, recomp::d3d::d3dx_effect_find(
+                        *efx_host(fx)->value, technique,
+                        rust::Slice<const uint8_t>((const uint8_t *)text.data(), text.size()), 2)));
+}
+
+void Efx_GetAnnotation(X86 *c) {
+    ComObj *fx = efx_this(c);
+    if (!fx) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t object = efx_resolve_handle(fx, arg(c, 1), 3);
+    set_eax(c, efx_wrap_handle(
+                   fx, recomp::d3d::d3dx_effect_enum(*efx_host(fx)->value, object, arg(c, 2), 3)));
+}
+
+void Efx_GetAnnotationByName(X86 *c) {
+    ComObj *fx = efx_this(c);
+    uint32_t name = arg(c, 2);
+    if (!fx || !name) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t object = efx_resolve_handle(fx, arg(c, 1), 3);
+    std::string text = gm_str(name, 16384);
+    set_eax(c,
+            efx_wrap_handle(
+                fx, recomp::d3d::d3dx_effect_find(
+                        *efx_host(fx)->value, object,
+                        rust::Slice<const uint8_t>((const uint8_t *)text.data(), text.size()), 3)));
+}
+
+static void efx_apply(X86 *c, uint32_t setter, const uint8_t *data, size_t size) {
+    ComObj *fx = efx_this(c);
+    if (!fx) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t handle = efx_resolve_handle(fx, arg(c, 1), 0);
+    efx_status(c, recomp::d3d::d3dx_effect_set(*efx_host(fx)->value, handle, setter,
+                                               rust::Slice<const uint8_t>(data, size)));
+}
+
+static void efx_set_array_n(X86 *c, uint32_t setter, uint32_t element, uint32_t count) {
+    uint32_t addr = arg(c, 2);
+    if (!addr || !count || !gm_fits_n(addr, count, element)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    efx_apply(c, setter, (const uint8_t *)gm_ptr(addr), (size_t)count * element);
+}
+
+static void efx_set_array(X86 *c, uint32_t setter, uint32_t element) {
+    efx_set_array_n(c, setter, element, arg(c, 3));
+}
+
+void Efx_SetValue(X86 *c) {
+    uint32_t addr = arg(c, 2), size = arg(c, 3);
+    if (size && (!addr || !gm_valid(addr, size))) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    efx_apply(c, 0, size ? (const uint8_t *)gm_ptr(addr) : nullptr, size);
+}
+
+void Efx_SetBool(X86 *c) {
+    uint32_t value = arg(c, 2) ? 1 : 0;
+    efx_apply(c, 1, (const uint8_t *)&value, 4);
+}
+void Efx_SetBoolArray(X86 *c) {
+    efx_set_array(c, 2, 4);
+}
+void Efx_SetInt(X86 *c) {
+    uint32_t value = arg(c, 2);
+    efx_apply(c, 3, (const uint8_t *)&value, 4);
+}
+void Efx_SetIntArray(X86 *c) {
+    efx_set_array(c, 4, 4);
+}
+void Efx_SetFloat(X86 *c) {
+    uint32_t value = arg(c, 2);
+    efx_apply(c, 5, (const uint8_t *)&value, 4);
+}
+void Efx_SetFloatArray(X86 *c) {
+    efx_set_array(c, 6, 4);
+}
+void Efx_SetVector(X86 *c) {
+    efx_set_array_n(c, 7, 16, 1);
+}
+void Efx_SetVectorArray(X86 *c) {
+    efx_set_array(c, 8, 16);
+}
+void Efx_SetMatrix(X86 *c) {
+    efx_set_array_n(c, 9, 64, 1);
+}
+void Efx_SetMatrixArray(X86 *c) {
+    efx_set_array(c, 10, 64);
+}
+void Efx_SetMatrixTranspose(X86 *c) {
+    efx_set_array_n(c, 12, 64, 1);
+}
+void Efx_SetMatrixTransposeArray(X86 *c) {
+    efx_set_array(c, 13, 64);
+}
+
+static void efx_set_pointer_array(X86 *c, uint32_t setter) {
+    uint32_t addr = arg(c, 2), count = arg(c, 3);
+    if (!addr || !count || !gm_fits_n(addr, count, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    std::vector<uint8_t> gathered;
+    gathered.reserve((size_t)count * 64);
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t pointer = rd32(addr + i * 4);
+        if (!pointer || !gm_valid(pointer, 64)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        const uint8_t *bytes = (const uint8_t *)gm_ptr(pointer);
+        gathered.insert(gathered.end(), bytes, bytes + 64);
+    }
+    efx_apply(c, setter, gathered.data(), gathered.size());
+}
+
+void Efx_SetMatrixPointerArray(X86 *c) {
+    efx_set_pointer_array(c, 11);
+}
+void Efx_SetMatrixTransposePointerArray(X86 *c) {
+    efx_set_pointer_array(c, 14);
+}
+
+static void efx_get(X86 *c, uint32_t kind, uint64_t limit) {
+    ComObj *fx = efx_this(c);
+    if (!fx) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t addr = arg(c, 2);
+    uint32_t handle = efx_resolve_handle(fx, arg(c, 1), 0);
+    recomp::d3d::D3dxBytesResult result =
+        recomp::d3d::d3dx_effect_get(*efx_host(fx)->value, handle, kind);
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        efx_status(c, result.status);
+        return;
+    }
+    size_t bytes = std::min<size_t>(result.bytes.size(), (size_t)limit);
+    if (bytes && (!addr || !gm_valid(addr, (uint32_t)bytes))) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (bytes)
+        memcpy(gm_ptr(addr), result.bytes.data(), bytes);
+    com_ret(c, D3D_OK9);
+}
+
+static uint64_t efx_array_bytes(uint32_t count, uint32_t element) {
+    return (uint64_t)count * element;
+}
+
+void Efx_GetValue(X86 *c) {
+    efx_get(c, 3, arg(c, 3));
+}
+void Efx_GetBool(X86 *c) {
+    efx_get(c, 2, 4);
+}
+void Efx_GetInt(X86 *c) {
+    efx_get(c, 1, 4);
+}
+void Efx_GetFloat(X86 *c) {
+    efx_get(c, 0, 4);
+}
+void Efx_GetBoolArray(X86 *c) {
+    efx_get(c, 6, efx_array_bytes(arg(c, 3), 4));
+}
+void Efx_GetIntArray(X86 *c) {
+    efx_get(c, 5, efx_array_bytes(arg(c, 3), 4));
+}
+void Efx_GetFloatArray(X86 *c) {
+    efx_get(c, 4, efx_array_bytes(arg(c, 3), 4));
+}
+void Efx_GetVector(X86 *c) {
+    efx_get(c, 7, 16);
+}
+void Efx_GetVectorArray(X86 *c) {
+    efx_get(c, 8, efx_array_bytes(arg(c, 3), 16));
+}
+void Efx_GetMatrix(X86 *c) {
+    efx_get(c, 9, 64);
+}
+void Efx_GetMatrixArray(X86 *c) {
+    efx_get(c, 10, efx_array_bytes(arg(c, 3), 64));
+}
+void Efx_GetMatrixTranspose(X86 *c) {
+    efx_get(c, 11, 64);
+}
+void Efx_GetMatrixTransposeArray(X86 *c) {
+    efx_get(c, 12, efx_array_bytes(arg(c, 3), 64));
+}
+
+void Efx_GetString(X86 *c) {
+    ComObj *fx = efx_this(c);
+    uint32_t out = arg(c, 2);
+    if (!fx || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3dxBytesResult result = recomp::d3d::d3dx_effect_get(
+        *efx_host(fx)->value, efx_resolve_handle(fx, arg(c, 1), 0), 13);
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        efx_status(c, result.status);
+        return;
+    }
+    std::vector<uint8_t> bytes(result.bytes.begin(), result.bytes.end());
+    uint32_t addr = bytes.empty() ? 0 : efx_guest_string(efx_host(fx), bytes);
+    if (!bytes.empty() && !addr) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    wr32(out, addr);
+    com_ret(c, D3D_OK9);
+}
+
+void Efx_SetTexture(X86 *c) {
+    ComObj *fx = efx_this(c);
+    if (!fx) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t handle = efx_resolve_handle(fx, arg(c, 1), 0);
+    uint32_t texture = arg(c, 2);
+    ComObj *tex = texture ? com_this(texture) : nullptr;
+    if (texture && !tex) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (tex && (!efx_texture_kind(tex->kind) || tex->dev_d3d != fx->d3dx_effect->device_id)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::Status result =
+        recomp::d3d::d3dx_effect_set_texture(*efx_host(fx)->value, handle, tex ? tex->id : 0);
+    if (result.code != recomp::d3d::StatusCode::Ok) {
+        efx_status(c, result);
+        return;
+    }
+    efx_refresh_textures(fx);
+    if (ComObj *pool = com_get(efx_host(fx)->pool_obj))
+        efx_refresh_pool_textures(pool);
+    com_ret(c, D3D_OK9);
+}
+
+void Efx_GetTexture(X86 *c) {
+    ComObj *fx = efx_this(c);
+    uint32_t out = arg(c, 2);
+    if (!fx || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t handle = efx_resolve_handle(fx, arg(c, 1), 0);
+    recomp::d3d::ValueResult result =
+        recomp::d3d::d3dx_effect_texture(*efx_host(fx)->value, handle);
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        efx_status(c, result.status);
+        return;
+    }
+    ComObj *tex = com_get(result.value);
+    if (!tex || !efx_texture_kind(tex->kind) || tex->dev_d3d != fx->d3dx_effect->device_id) {
+        com_out_ptr(out, 0);
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    uint32_t view = com_view(tex, IF_D3DBASETEXTURE9);
+    if (!view) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    com_addref(tex);
+    com_out_ptr(out, view);
+    com_ret(c, D3D_OK9);
+}
+
+void Efx_GetPool(X86 *c) {
+    ComObj *fx = efx_this(c);
+    uint32_t out = arg(c, 1);
+    if (!fx || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    ComObj *pool = com_get(efx_host(fx)->pool_obj);
+    if (!pool) {
+        com_out_ptr(out, 0);
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    uint32_t view = com_view(pool, IF_D3DXEFFECTPOOL33);
+    if (!view) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    com_addref(pool);
+    com_out_ptr(out, view);
+    com_ret(c, D3D_OK9);
+}
+
+void Efx_SetTechnique(X86 *c) {
+    ComObj *fx = efx_this(c);
+    if (!fx) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    efx_status(c, recomp::d3d::d3dx_effect_set_technique(*efx_host(fx)->value,
+                                                         efx_resolve_handle(fx, arg(c, 1), 1)));
+}
+
+void Efx_GetCurrentTechnique(X86 *c) {
+    ComObj *fx = efx_this(c);
+    set_eax(c, fx ? efx_wrap_handle(
+                        fx, recomp::d3d::d3dx_effect_current_technique(*efx_host(fx)->value))
+                  : 0);
+}
+
+void Efx_ValidateTechnique(X86 *c) {
+    ComObj *fx = efx_this(c);
+    if (!fx) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    efx_status(c, recomp::d3d::d3dx_effect_validate_technique(
+                      *efx_host(fx)->value, efx_resolve_handle(fx, arg(c, 1), 1)));
+}
+
+void Efx_FindNextValidTechnique(X86 *c) {
+    ComObj *fx = efx_this(c);
+    uint32_t out = arg(c, 2);
+    if (!fx || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t next = recomp::d3d::d3dx_effect_find_next_valid(*efx_host(fx)->value,
+                                                             efx_resolve_handle(fx, arg(c, 1), 1));
+    uint32_t wrapped = efx_wrap_handle(fx, next);
+    if (next && !wrapped) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    wr32(out, wrapped);
+    com_ret(c, next ? D3D_OK9 : 1u);
+}
+
+void Efx_IsParameterUsed(X86 *c) {
+    ComObj *fx = efx_this(c);
+    set_eax(c, fx ? recomp::d3d::d3dx_effect_is_parameter_used(*efx_host(fx)->value,
+                                                               efx_resolve_handle(fx, arg(c, 1), 0),
+                                                               efx_resolve_handle(fx, arg(c, 2), 1))
+                  : 0);
+}
+
+static bool efx_hr_failed(uint32_t hr) {
+    return (int32_t)hr < 0;
+}
+
+static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
+                                      const rust::Vec<recomp::d3d::D3dxEffectCommand> &commands) {
+    D3dxEffectHost *host = efx_host(fx);
+    if (!host || !dev || !dev->d3d9_device)
+        return D3DERR_INVALIDCALL;
+    if (commands.size() == 0)
+        return D3D_OK9;
+    uint32_t manager = host->state_manager;
+    if (!efx_manager_valid(manager)) {
+        LOGW("d3d9: ID3DXEffect needs a valid ID3DXEffectStateManager for %u commands",
+             (unsigned)commands.size());
+        return D3DERR_INVALIDCALL;
+    }
+    uint32_t addref = efx_manager_method(manager, EFX_MANAGER_ADDREF, "AddRef");
+    uint32_t release = efx_manager_method(manager, EFX_MANAGER_RELEASE, "Release");
+    if (!addref || !release)
+        return D3DERR_INVALIDCALL;
+    std::vector<uint32_t> resolved(commands.size(), 0);
+    std::set<uint32_t> pinned;
+    bool stale = false;
+    bool oom = false;
+    for (size_t i = 0; i < commands.size() && !stale && !oom; ++i) {
+        const recomp::d3d::D3dxEffectCommand &cmd = commands[i];
+        if (cmd.kind == recomp::d3d::D3dxEffectCommandKind::SetTexture) {
+            if (!cmd.value)
+                continue;
+            ComObj *o = com_get(cmd.value);
+            if (!o || !efx_texture_kind(o->kind) || o->dev_d3d != host->device_id) {
+                LOGW("d3d9: ID3DXEffectStateManager::SetTexture stale texture %u", cmd.value);
+                stale = true;
+                break;
+            }
+            resolved[i] = com_view(o, IF_D3DBASETEXTURE9);
+            if (!resolved[i]) {
+                oom = true;
+                break;
+            }
+            if (pinned.insert(cmd.value).second)
+                com_addref(o);
+        } else if (cmd.kind == recomp::d3d::D3dxEffectCommandKind::SetVertexShader ||
+                   cmd.kind == recomp::d3d::D3dxEffectCommandKind::SetPixelShader) {
+            if (!cmd.value)
+                continue;
+            bool vertex = cmd.kind == recomp::d3d::D3dxEffectCommandKind::SetVertexShader;
+            auto it = dev->d3d9_device->shader_views.find(cmd.value);
+            ComObj *o = it == dev->d3d9_device->shader_views.end() ? nullptr : com_get(it->second);
+            if (!o || o->kind != (vertex ? K_D3D9VS : K_D3D9PS) || o->dev_d3d != dev->id) {
+                LOGW("d3d9: ID3DXEffectStateManager::%s stale shader handle %u",
+                     vertex ? "SetVertexShader" : "SetPixelShader", cmd.value);
+                stale = true;
+                break;
+            }
+            resolved[i] = com_view(o, vertex ? IF_D3DVERTEXSHADER9 : IF_D3DPIXELSHADER9);
+            if (!resolved[i]) {
+                oom = true;
+                break;
+            }
+            if (pinned.insert(it->second).second)
+                com_addref(o);
+        }
+    }
+
+    auto unpin = [&]() {
+        for (uint32_t id : pinned)
+            if (ComObj *o = com_get(id))
+                com_release(o);
+    };
+
+    if (stale || oom) {
+        unpin();
+        return oom ? E_OUTOFMEMORY : D3DERR_INVALIDCALL;
+    }
+
+    guest_call(c, addref, manager);
+
+    uint32_t failure = D3D_OK9;
+    for (size_t i = 0; i < commands.size() && !oom; ++i) {
+        const recomp::d3d::D3dxEffectCommand &cmd = commands[i];
+        uint32_t result = D3D_OK9;
+        switch (cmd.kind) {
+        case recomp::d3d::D3dxEffectCommandKind::SetRenderState: {
+            uint32_t fn =
+                efx_manager_method(manager, EFX_MANAGER_SET_RENDER_STATE, "SetRenderState");
+            if (!fn) {
+                stale = true;
+                break;
+            }
+            result = guest_call(c, fn, manager, cmd.state, cmd.value);
+            break;
+        }
+        case recomp::d3d::D3dxEffectCommandKind::SetTextureStageState: {
+            uint32_t fn = efx_manager_method(manager, EFX_MANAGER_SET_TEXTURE_STAGE_STATE,
+                                             "SetTextureStageState");
+            if (!fn) {
+                stale = true;
+                break;
+            }
+            result = guest_call(c, fn, manager, cmd.index, cmd.state, cmd.value);
+            break;
+        }
+        case recomp::d3d::D3dxEffectCommandKind::SetSamplerState: {
+            uint32_t fn =
+                efx_manager_method(manager, EFX_MANAGER_SET_SAMPLER_STATE, "SetSamplerState");
+            if (!fn) {
+                stale = true;
+                break;
+            }
+            result = guest_call(c, fn, manager, cmd.index, cmd.state, cmd.value);
+            break;
+        }
+        case recomp::d3d::D3dxEffectCommandKind::SetTransform: {
+            uint32_t fn = efx_manager_method(manager, EFX_MANAGER_SET_TRANSFORM, "SetTransform");
+            if (!fn) {
+                stale = true;
+                break;
+            }
+            uint32_t buf = heap_alloc(64, false, 16);
+            if (!buf) {
+                oom = true;
+                break;
+            }
+            memcpy(gm_ptr(buf), cmd.matrix.data(), 64);
+            result = guest_call(c, fn, manager, cmd.state, buf);
+            heap_free(buf);
+            break;
+        }
+        case recomp::d3d::D3dxEffectCommandKind::SetTexture: {
+            uint32_t fn = efx_manager_method(manager, EFX_MANAGER_SET_TEXTURE, "SetTexture");
+            if (!fn) {
+                stale = true;
+                break;
+            }
+            result = guest_call(c, fn, manager, cmd.index, resolved[i]);
+            break;
+        }
+        case recomp::d3d::D3dxEffectCommandKind::SetVertexShader: {
+            uint32_t fn =
+                efx_manager_method(manager, EFX_MANAGER_SET_VERTEX_SHADER, "SetVertexShader");
+            if (!fn) {
+                stale = true;
+                break;
+            }
+            result = guest_call(c, fn, manager, resolved[i]);
+            break;
+        }
+        case recomp::d3d::D3dxEffectCommandKind::SetPixelShader: {
+            uint32_t fn =
+                efx_manager_method(manager, EFX_MANAGER_SET_PIXEL_SHADER, "SetPixelShader");
+            if (!fn) {
+                stale = true;
+                break;
+            }
+            result = guest_call(c, fn, manager, resolved[i]);
+            break;
+        }
+        case recomp::d3d::D3dxEffectCommandKind::SetVertexShaderConstantF:
+        case recomp::d3d::D3dxEffectCommandKind::SetPixelShaderConstantF: {
+            bool vertex = cmd.kind == recomp::d3d::D3dxEffectCommandKind::SetVertexShaderConstantF;
+            uint32_t fn =
+                efx_manager_method(manager,
+                                   vertex ? EFX_MANAGER_SET_VERTEX_SHADER_CONSTANT_F
+                                          : EFX_MANAGER_SET_PIXEL_SHADER_CONSTANT_F,
+                                   vertex ? "SetVertexShaderConstantF" : "SetPixelShaderConstantF");
+            if (!fn) {
+                stale = true;
+                break;
+            }
+            if (cmd.values.size() % 4 != 0 || cmd.values.size() > UINT32_MAX / 4) {
+                LOGW("d3d9: ID3DXEffectStateManager::%s has an invalid constant span",
+                     vertex ? "SetVertexShaderConstantF" : "SetPixelShaderConstantF");
+                stale = true;
+                break;
+            }
+            uint32_t count = (uint32_t)cmd.values.size() / 4;
+            uint32_t bytes = (uint32_t)cmd.values.size() * 4;
+            uint32_t buf = bytes ? heap_alloc(bytes, false, 16) : 0;
+            if (bytes && !buf) {
+                oom = true;
+                break;
+            }
+            if (bytes)
+                memcpy(gm_ptr(buf), cmd.values.data(), bytes);
+            result = guest_call(c, fn, manager, cmd.index, buf, count);
+            if (buf)
+                heap_free(buf);
+            break;
+        }
+        default:
+            LOGW("d3d9: ID3DXEffectStateManager command %d is unsupported", (int)cmd.kind);
+            stale = true;
+            break;
+        }
+        if (stale || oom)
+            break;
+        if (efx_hr_failed(result))
+            failure = result;
+    }
+
+    unpin();
+    guest_call(c, release, manager);
+    if (oom)
+        return E_OUTOFMEMORY;
+    if (stale)
+        return D3DERR_INVALIDCALL;
+    return failure;
+}
+
+static uint32_t efx_run(X86 *c, ComObj *fx, ComObj *dev,
+                        const recomp::d3d::D3dxEffectRunResult &result) {
+    D3dxEffectHost *host = efx_host(fx);
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        if (result.reserved)
+            recomp::d3d::d3dx_effect_batch_finish(*host->value, false);
+        efx_refresh_textures(fx);
+        if (ComObj *pool = com_get(host->pool_obj))
+            efx_refresh_pool_textures(pool);
+        d3d9_refresh_bindings(dev);
+        return bridge_result(c, result.status);
+    }
+    uint32_t hr = efx_dispatch_commands(c, fx, dev, result.commands);
+    if (result.reserved)
+        recomp::d3d::d3dx_effect_batch_finish(*host->value, !efx_hr_failed(hr));
+    efx_refresh_textures(fx);
+    if (ComObj *pool = com_get(host->pool_obj))
+        efx_refresh_pool_textures(pool);
+    d3d9_refresh_bindings(dev);
+    return hr;
+}
+
+void Efx_Begin(X86 *c) {
+    ComObj *fx = efx_this(c);
+    ComObj *dev = efx_device(c);
+    uint32_t passes = arg(c, 1);
+    if (!fx || !dev) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (passes && !gm_valid(passes, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::ValueResult result =
+        recomp::d3d::d3dx_effect_begin(*efx_host(fx)->value, *dev->d3d9_device->value, arg(c, 2));
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        efx_status(c, result.status);
+        return;
+    }
+    if (passes)
+        wr32(passes, result.value);
+    efx_refresh_saved(dev, fx);
+    d3d9_refresh_bindings(dev);
+    com_ret(c, D3D_OK9);
+}
+
+void Efx_BeginPass(X86 *c) {
+    ComObj *fx = efx_this(c);
+    ComObj *dev = efx_device(c);
+    if (!fx || !dev) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    com_addref(fx);
+    com_addref(dev);
+    recomp::d3d::D3dxEffectRunResult result = recomp::d3d::d3dx_effect_begin_pass(
+        *efx_host(fx)->value, *dev->d3d9_device->value, arg(c, 1));
+    uint32_t hr = efx_run(c, fx, dev, result);
+    com_release(dev);
+    com_release(fx);
+    com_ret(c, hr);
+}
+
+void Efx_CommitChanges(X86 *c) {
+    ComObj *fx = efx_this(c);
+    ComObj *dev = efx_device(c);
+    if (!fx || !dev) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    com_addref(fx);
+    com_addref(dev);
+    recomp::d3d::D3dxEffectRunResult result =
+        recomp::d3d::d3dx_effect_commit(*efx_host(fx)->value, *dev->d3d9_device->value);
+    uint32_t hr = efx_run(c, fx, dev, result);
+    com_release(dev);
+    com_release(fx);
+    com_ret(c, hr);
+}
+
+void Efx_EndPass(X86 *c) {
+    ComObj *fx = efx_this(c);
+    if (!fx) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    efx_status(c, recomp::d3d::d3dx_effect_end_pass(*efx_host(fx)->value));
+}
+
+void Efx_End(X86 *c) {
+    ComObj *fx = efx_this(c);
+    ComObj *dev = efx_device(c);
+    if (!fx || !dev) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::Status result =
+        recomp::d3d::d3dx_effect_end(*efx_host(fx)->value, *dev->d3d9_device->value);
+    d3d9_refresh_bindings(dev);
+    if (result.code == recomp::d3d::StatusCode::Ok)
+        efx_drop_saved(fx);
+    efx_status(c, result);
+}
+
+void Efx_GetDevice(X86 *c) {
+    ComObj *fx = efx_this(c);
+    uint32_t out = arg(c, 1);
+    ComObj *dev = fx ? com_get(fx->d3dx_effect->device_id) : nullptr;
+    if (!fx || !dev || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t view = com_view(dev, IF_D3DDEVICE9);
+    if (!view) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    com_addref(dev);
+    com_out_ptr(out, view);
+    com_ret(c, D3D_OK9);
+}
+
+void Efx_OnLostDevice(X86 *c) {
+    ComObj *fx = efx_this(c);
+    ComObj *dev = efx_device(c);
+    if (!fx || !dev) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::Status result =
+        recomp::d3d::d3dx_effect_on_lost(*efx_host(fx)->value, *dev->d3d9_device->value);
+    efx_drop_saved(fx);
+    efx_refresh_textures(fx);
+    if (ComObj *pool = com_get(efx_host(fx)->pool_obj))
+        efx_refresh_pool_textures(pool);
+    d3d9_refresh_bindings(dev);
+    efx_status(c, result);
+}
+
+void Efx_OnResetDevice(X86 *c) {
+    ComObj *fx = efx_this(c);
+    ComObj *dev = efx_device(c);
+    if (!fx || !dev) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::Status result =
+        recomp::d3d::d3dx_effect_on_reset(*efx_host(fx)->value, *dev->d3d9_device->value);
+    efx_refresh_textures(fx);
+    if (ComObj *pool = com_get(efx_host(fx)->pool_obj))
+        efx_refresh_pool_textures(pool);
+    efx_status(c, result);
+}
+
+void Efx_SetStateManager(X86 *c) {
+    ComObj *fx = efx_this(c);
+    uint32_t manager = arg(c, 1);
+    if (!fx) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    D3dxEffectHost *host = efx_host(fx);
+    if (recomp::d3d::d3dx_effect_batch_active(*host->value)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (manager && !efx_manager_valid(manager)) {
+        LOGW("d3d9: ID3DXEffectStateManager manager %#x is not a valid interface", manager);
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t addref = manager ? efx_manager_method(manager, EFX_MANAGER_ADDREF, "AddRef") : 0;
+    uint32_t manager_release =
+        manager ? efx_manager_method(manager, EFX_MANAGER_RELEASE, "Release") : 0;
+    uint32_t old = host->state_manager;
+    uint32_t release = old ? efx_manager_method(old, EFX_MANAGER_RELEASE, "Release") : 0;
+    if ((manager && (!addref || !manager_release)) || (old && !release)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::Status set =
+        recomp::d3d::d3dx_effect_set_state_manager(*host->value, manager != 0);
+    if (set.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, set));
+        return;
+    }
+    com_addref(fx);
+    if (manager)
+        guest_call(c, addref, manager);
+    host->state_manager = manager;
+    if (old)
+        guest_call(c, release, old);
+    recomp::d3d::d3dx_effect_batch_finish(*host->value, true);
+    if (manager)
+        efx_drop_saved(fx);
+    com_release(fx);
+    com_ret(c, D3D_OK9);
+}
+
+void Efx_GetStateManager(X86 *c) {
+    ComObj *fx = efx_this(c);
+    uint32_t out = arg(c, 1);
+    if (!fx || !out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    D3dxEffectHost *host = efx_host(fx);
+    uint32_t manager = host->state_manager;
+    if (manager) {
+        uint32_t addref = efx_manager_method(manager, EFX_MANAGER_ADDREF, "AddRef");
+        if (!addref) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        com_addref(fx);
+        guest_call(c, addref, manager);
+        wr32(out, manager);
+        com_release(fx);
+    } else {
+        wr32(out, 0);
+    }
+    com_ret(c, D3D_OK9);
+}
+
+static uint32_t d3dx_profile_string(const std::string &profile) {
+    if (profile.empty())
+        return 0;
+    auto &cache = d3dx_profile_strings();
+    auto it = cache.find(profile);
+    if (it != cache.end())
+        return it->second;
+    uint32_t addr = heap_alloc((uint32_t)profile.size() + 1, true, 16);
+    if (!addr)
+        return 0;
+    gm_put_str(addr, profile.c_str(), (uint32_t)profile.size() + 1);
+    cache[profile] = addr;
+    return addr;
+}
+
+static void d3dx_shader_profile(X86 *c, bool vertex) {
+    ComObj *dev = com_this(arg(c, 0));
+    if (!dev || dev->kind != K_D3D9DEVICE || !dev->d3d9_device) {
+        set_eax(c, 0);
+        return;
+    }
+    recomp::d3d::D3dxProfilesResult result =
+        recomp::d3d::d3dx_shader_profiles(*dev->d3d9_device->value);
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        set_eax(c, 0);
+        return;
+    }
+    std::string profile = vertex ? std::string(result.vertex) : std::string(result.pixel);
+    set_eax(c, d3dx_profile_string(profile));
+}
+
+void X_D3DXGetVertexShaderProfile(X86 *c) {
+    d3dx_shader_profile(c, true);
+}
+
+void X_D3DXGetPixelShaderProfile(X86 *c) {
+    d3dx_shader_profile(c, false);
+}
+
+static bool d3dx_matrix_read(uint32_t addr, float out[16]) {
+    if (!addr || !gm_valid(addr, 64))
+        return false;
+    for (int i = 0; i < 16; ++i)
+        out[i] = d3dx_rf(addr + (uint32_t)i * 4);
+    return true;
+}
+
+static void d3dx_matrix_write(uint32_t addr, const rust::Vec<float> &values) {
+    for (size_t i = 0; i < values.size() && i < 16; ++i)
+        d3dx_wf(addr + (uint32_t)i * 4, values[i]);
+}
+
+void X_D3DX33MatrixMultiply(X86 *c) {
+    uint32_t out = arg(c, 0), a = arg(c, 1), b = arg(c, 2);
+    float ma[16], mb[16];
+    if (!d3dx_matrix_read(a, ma) || !d3dx_matrix_read(b, mb) || (!out || !gm_valid(out, 64))) {
+        set_eax(c, 0);
+        return;
+    }
+    recomp::d3d::D3dxMatrixResult result = recomp::d3d::d3dx_matrix_multiply(
+        rust::Slice<const float>(ma, 16), rust::Slice<const float>(mb, 16));
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        set_eax(c, 0);
+        return;
+    }
+    d3dx_matrix_write(out, result.values);
+    set_eax(c, out);
+}
+
+void X_D3DX33MatrixTranspose(X86 *c) {
+    uint32_t out = arg(c, 0), in = arg(c, 1);
+    float m[16];
+    if (!d3dx_matrix_read(in, m) || (!out || !gm_valid(out, 64))) {
+        set_eax(c, 0);
+        return;
+    }
+    recomp::d3d::D3dxMatrixResult result =
+        recomp::d3d::d3dx_matrix_transpose(rust::Slice<const float>(m, 16));
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        set_eax(c, 0);
+        return;
+    }
+    d3dx_matrix_write(out, result.values);
+    set_eax(c, out);
+}
+
+void X_D3DX33MatrixInverse(X86 *c) {
+    uint32_t out = arg(c, 0), pdet = arg(c, 1), in = arg(c, 2);
+    float m[16];
+    if (!d3dx_matrix_read(in, m) || (!out || !gm_valid(out, 64)) || (pdet && !gm_valid(pdet, 4))) {
+        set_eax(c, 0);
+        return;
+    }
+    recomp::d3d::D3dxMatrixInverseResult result =
+        recomp::d3d::d3dx_matrix_inverse(rust::Slice<const float>(m, 16));
+    if (result.status.code != recomp::d3d::StatusCode::Ok || !result.valid) {
+        set_eax(c, 0);
+        return;
+    }
+    if (pdet)
+        d3dx_wf(pdet, result.determinant);
+    d3dx_matrix_write(out, result.values);
+    set_eax(c, out);
 }
 
 static void level_lock_wgpu(X86 *c, ComObj *o, uint32_t face, uint32_t level, bool volume,
@@ -5477,7 +7572,7 @@ void Dev_GetTransform(X86 *c) {
         imports_unsupported(c);
         return;
     }
-    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 64)) {
+    if (!dev || !dev->d3d9_device || !out || (!out || !gm_valid(out, 64))) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
@@ -6298,7 +8393,10 @@ static void d3d9_drop_fvf_cache(ComObj *dev) {
 
 static void d3d9_device_destroy(ComObj *o) {
     device_discard_implicit_surfaces(o);
+    d3d9_clear_virtual_display(o);
     if (o->d3d9_device) {
+        if (X86 *c = guest_current_context())
+            win32_uncover_display(c, o->hwnd);
         d3d9_drop_all_refs(o);
         d3d9_drop_fvf_cache(o);
         o->d3d9_device.reset();

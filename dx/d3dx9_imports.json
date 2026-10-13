@@ -4,7 +4,8 @@
   "imports": [
     {
       "name": "D3DXGetShaderInputSemantics",
-      "handler": "imports_unsupported"
+      "handler": "X_D3DXGetShaderInputSemantics",
+      "flag_on": "rust"
     },
     {
       "name": "D3DXCompileShader",
@@ -12,7 +13,8 @@
     },
     {
       "name": "D3DXGetShaderVersion",
-      "handler": "imports_unsupported"
+      "handler": "X_D3DXGetShaderVersion",
+      "flag_on": "rust"
     },
     {
       "name": "D3DXCreateCubeTextureFromFileExA",
@@ -25,7 +27,8 @@
     },
     {
       "name": "D3DXGetShaderConstantTable",
-      "handler": "imports_unsupported"
+      "handler": "X_D3DXGetShaderConstantTable",
+      "flag_on": "rust"
     },
     {
       "name": "D3DXGetImageInfoFromFileInMemory",
@@ -54,7 +57,13 @@
     },
     {
       "name": "D3DXCreateEffectFromFileA",
-      "handler": "imports_unsupported"
+      "handler": "X_D3DXCreateEffectFromFileA",
+      "flag_on": "rust"
+    },
+    {
+      "name": "D3DXCreateEffectPool",
+      "handler": "X_D3DX33CreateEffectPool",
+      "flag_on": "rust"
     },
     {
       "name": "D3DXCreateEffectCompilerFromFileA",
@@ -70,7 +79,8 @@
     },
     {
       "name": "D3DXGetPixelShaderProfile",
-      "handler": "imports_unsupported"
+      "handler": "X_D3DXGetPixelShaderProfile",
+      "flag_on": "rust"
     },
     {
       "name": "D3DXDebugMute",
@@ -78,15 +88,18 @@
     },
     {
       "name": "D3DXMatrixMultiply",
-      "handler": "X_D3DXMatrixMultiply"
+      "handler": "X_D3DX33MatrixMultiply",
+      "flag_on": "rust"
     },
     {
       "name": "D3DXMatrixInverse",
-      "handler": "X_D3DXMatrixInverse"
+      "handler": "X_D3DX33MatrixInverse",
+      "flag_on": "rust"
     },
     {
       "name": "D3DXMatrixTranspose",
-      "handler": "X_D3DXMatrixTranspose"
+      "handler": "X_D3DX33MatrixTranspose",
+      "flag_on": "rust"
     },
     {
       "name": "D3DXSaveSurfaceToFileA",
@@ -110,7 +123,8 @@
     },
     {
       "name": "D3DXGetVertexShaderProfile",
-      "handler": "imports_unsupported"
+      "handler": "X_D3DXGetVertexShaderProfile",
+      "flag_on": "rust"
     }
   ]
 }

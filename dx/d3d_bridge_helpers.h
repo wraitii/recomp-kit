@@ -7,6 +7,7 @@
 #include <memory>
 #include <set>
 #include <unordered_map>
+#include <utility>
 
 struct D3dHostDevice {
     rust::Box<recomp::d3d::Device> value;
@@ -161,9 +162,15 @@ struct D3d9HostDevice {
     recomp::d3d::ValueResult number_of_swap_chains() const {
         return recomp::d3d::d3d9_number_of_swap_chains(*value);
     }
+    recomp::d3d::ValueResult available_texture_mem() const {
+        return recomp::d3d::d3d9_available_texture_mem(*value);
+    }
     recomp::d3d::D3d9DisplayModeResult
     display_mode(const recomp::d3d::D3d9DisplayModeRequest &request) const {
         return recomp::d3d::d3d9_display_mode(*value, request);
+    }
+    recomp::d3d::D3d9PresentParams effective_present() const {
+        return recomp::d3d::d3d9_effective_present(*value);
     }
     recomp::d3d::D3d9CapsResult caps() const {
         return recomp::d3d::d3d9_device_caps(*value);
@@ -353,6 +360,35 @@ struct D3d9HostDevice {
     std::set<uint32_t> live_refs;
     std::set<uint32_t> recording_refs;
     std::map<uint32_t, std::set<uint32_t>> block_refs;
+};
+
+struct D3dxConstantTableHost {
+    rust::Box<recomp::d3d::D3dxConstantTable> value;
+
+    D3dxConstantTableHost() : value(recomp::d3d::new_d3dx_constant_table()) {}
+};
+
+struct D3dxEffectPoolHost {
+    rust::Box<recomp::d3d::D3dxEffectPool> value;
+    std::set<uint32_t> texture_refs;
+
+    D3dxEffectPoolHost() : value(recomp::d3d::new_d3dx_effect_pool()) {}
+};
+
+struct D3dxEffectHost {
+    rust::Box<recomp::d3d::D3dxEffect> value;
+    uint32_t device_id = 0;
+    uint32_t pool_obj = 0;
+    uint32_t state_manager = 0;
+    std::set<uint32_t> texture_refs;
+    std::set<uint32_t> saved_refs;
+    std::set<uint32_t> published_shaders;
+    std::map<uint32_t, uint32_t> handle_tokens;
+    std::map<uint32_t, uint32_t> handle_reverse;
+    std::map<std::string, uint32_t> strings;
+    std::map<uint32_t, std::pair<uint32_t, uint32_t>> pass_shaders;
+
+    D3dxEffectHost() : value(recomp::d3d::new_d3dx_effect()) {}
 };
 
 struct D3d9Staging {

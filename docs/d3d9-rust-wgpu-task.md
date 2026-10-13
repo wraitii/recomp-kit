@@ -77,13 +77,14 @@ within the subset below. D3DX objects remain M7–M9.
   state, shader/declaration bytes and state blocks now live in Rust (M4).
   **M5 shader translation is complete**: translation and creation-time naga validation are complete for the shipped
   shader corpus. M6 now has callable draw, target, clear, copy/readback and
-  event-query paths; occlusion remains deferred and M6 stays open. M7–M9 are
-  pending; rendering fidelity and runtime execution remain unverified.
+  event-query paths; occlusion remains deferred and M6 stays open. M7 and M8 are implemented within their contracts and build; M9 is implemented
+  and builds, with runtime acceptance pending. Fullscreen creation
+  now succeeds in the approved startup run; rendering fidelity remains unverified.
   Civ4's `[render] d3d9_wgpu = true` stays on during active migration.
 - **ABI foundation: done.** Pinned Wine headers and IIDs
   (`third_party/wine-d3d9/`), generated D3D9 constants, version-specific D3DX
-  tables, and the 25 `d3dx9_33` imports Civ4 uses (3 reuse existing matrix
-  handlers, 22 fail by name). `D9_STUB`/`RES_STUB`/`FX_STUB` are gone; missing
+  tables, and the 25 `d3dx9_33` imports Civ4 uses (19 reach Rust; 6 fail
+  by name). `D9_STUB`/`RES_STUB`/`FX_STUB` are gone; missing
   methods and query types fail by name. Coverage lives in
   `dx/d3d9_bindings.json`, `dx/d3dx9_bindings.json`,
   `dx/d3dx9_33_bindings.json` and `dx/d3dx9_imports.json`. The authoritative
@@ -95,27 +96,29 @@ within the subset below. D3DX objects remain M7–M9.
   errors; those were fixed and the resumed final build passed. Native/Rust
   formatting, generated COM/status staleness and whitespace checks passed.
   No tests, app, headless or GPU runs were performed.
+- **M2 fullscreen expansion: reviewed, built and startup-verified.** Guest
+  fullscreen uses the virtual display; Rust validates and owns its parameters,
+  C++ retains the mode owner/ HWND identities and restores covered bounds on
+  windowed Reset, window changes and Release. DEFAULT/ONE wait for the host
+  refresh through the guest scheduler; IMMEDIATE does not. Physical window mode
+  remains player-owned. Reset/Release execution is unverified.
 
-Handoff: M6 implements scene/target selection, all four ordinary/UP/indexed
-Draw APIs, viewport-clipped color/depth/stencil Clear, same-format StretchRect,
-UpdateSurface/UpdateTexture, GetRenderTargetData, ColorFill and EVENT queries.
-Fixed-function and translated stages share one interface and may be mixed;
-Rust owns validation, copied draw inputs/constants, GPU handles and submission.
-C++ retains COM identities and stages guest arguments/results. Per-subresource
-freshness, lock counters and texture LOD are shared with the resource holders;
-Reset stages the GPU registry and aliases before readiness, then commits without
-allocating. Relevant files: `graphics/d3d8-wgpu/src/d3d9.rs`,
-`d3d9/{draw,copy,query,resource,state,wgsl,format}.rs`, `src/bridge.rs`,
-`dx/{d3d9.cpp,d3d_bridge_helpers.h,com.h,d3d9_bindings.json}`.
-Occlusion remains a named failure by the user's decision; M7–M9 and the named
-M11 execution gaps below remain. `dx/d3d9_bindings.json` is still the sole guest
-method status map. The current change review corrected cross-device source validation
-in GetRenderTargetData and consolidated primitive vertex counts so UP line strips
-use exactly PrimitiveCount + 1 vertices. Changed-file Rust/native formatting,
-generated COM consistency, repository-boundary and whitespace checks passed.
-The final flag-on macOS windowed rebuild and app signing passed. No tests, shader-corpus
-rerun, app, headless or GPU execution. Private build log: consumer
-`analysis/d3d9-review-build.log` (ignored). The Civ4 flag stays on.
+Handoff (2026-10-13, M8): shader version, input semantics, profiles, CTAB
+creation and all constant-table COM slots are callable. Rust owns metadata,
+lookup/packing, constant writes and matrix math; C++ owns COM identity, stable
+handle tokens, staged CTAB bytes and process-lifetime profile strings (reset
+with guest memory). Table setters use M4 state recording and prevalidate writes.
+Native/Rust formatting, generated COM/import consistency, repository boundaries
+and whitespace checks passed. Final flag-on windowed build/signing passed after
+correcting a stale Rust import; no tests, corpus rerun, app or GPU execution for
+M8. Log: consumer `analysis/d3d9-m8-build.log` (ignored).
+Files: `graphics/d3d8-wgpu/src/d3d9/{d3dx_shader,d3dx_math}.rs`, `src/bridge.rs`,
+`dx/{d3d9.cpp,d3dx9.cpp,d3dx9shader_shim.h,com.h,d3d_bridge_helpers.h}` and the
+existing D3DX bindings/import JSONs. M8's named deferrals are below. The last
+approved startup run passed fullscreen CreateDevice and GetAvailableTextureMem
+and stopped at `D3DXCreateEffectFromFileA` (`0x009c4b22`); M9 is next, M10 remains
+open. No Present/draw, main-menu or reset/release execution is claimed. The Civ4
+flag stays on; no commits.
 
 M4 primary evidence: Microsoft `Reset`, `GetFunction`, `D3DSTATEBLOCKTYPE`, the
 three "Saving ... States With a StateBlock" pages and the `Capture` per-entry
@@ -275,10 +278,22 @@ and row-alignment restrictions). D3D8 constructors retain their existing feature
 requests; the D3D9 constructor requests its own supported features.
 
 **M2 device and presentation contract.** One implicit swap chain (index 0) per
-windowed HAL device. Rust validates `D3DPRESENT_PARAMETERS` for create and
-reset: single back buffer, `D3DSWAPEFFECT_DISCARD`, default interval, no
-multisample, no presentation flags; `D3DFMT_UNKNOWN` resolves from the desktop
-format; zero dimensions resolve from the device/focus window before the call.
+HAL device. Rust validates `D3DPRESENT_PARAMETERS` for create and
+reset: single back buffer, `D3DSWAPEFFECT_DISCARD`, no
+multisample, no presentation flags; intervals `DEFAULT`, `ONE` and `IMMEDIATE`
+are accepted and Present waits one refresh for the synchronized pair;
+`D3DFMT_UNKNOWN` resolves from the desktop
+format and is invalid fullscreen; zero dimensions resolve from the device/focus
+window before the call in windowed mode. A fullscreen request is a guest virtual display mode,
+not the player's physical host window: the enumerated adapter mode (X8 display
+format, X8 or A8 back buffer) validates the dimensions, format and zero refresh,
+C++ publishes the mode through `d3d9_display_mode`/`host_set_display_mode` and
+`win32_cover_display`, and D3D9 never calls `host_display_request_window`. Reset
+to windowed clears the registration and restores the host mode; device
+destruction does the same. `EnumAdapterModes`/`GetAdapterDisplayMode`,
+`GetDisplayMode` and the create/reset descriptor share
+`d3d9_current_display_mode`; windowed `GetDisplayMode` reports the live desktop
+descriptor, fullscreen reports the accepted mode.
 Rust owns the effective parameters and a shared loss/reset-required token
 carried by the device context and every resource's GPU clone, so a failed Reset
 stops further GPU submissions without being classified as physical loss or
@@ -308,14 +323,22 @@ mixed old/new resources. Caps and
 `D3DERR_NOTAVAILABLE` for unsupported queried capability without aborting.
 C++ owns COM identity/refcounts and the implicit-surface weak cache, with the
 D3D8 ref-hook device-retention pattern and no cycle. Explicit deferrals:
-fullscreen, additional swap chains and swap-chain COM, multiple back buffers,
-COPY/FLIP swap effects, MSAA, non-default intervals/presentation flags,
-Present rectangles/window overrides/dirty regions and implicit-surface locks.
+exclusive/physical display-mode switching and ownership, additional swap chains
+and swap-chain COM, multiple back buffers, COPY/FLIP swap effects, MSAA,
+counted intervals above ONE, presentation flags, Present
+rectangles/window overrides/dirty regions and implicit-surface locks.
 These executing paths fail by name. Native GPU present handoff is an
 optimization deferral; the owned CPU snapshot reaches the existing presenter.
 `D3DUSAGE_QUERY_*` capability bits and `CheckDeviceFormatConversion` report
 `D3DERR_NOTAVAILABLE` while copy/conversion is unimplemented; no identity copy
 is claimed.
+
+`GetAvailableTextureMem` returns the live wgpu D3D9 device's Metal estimate
+(`recommendedMaxWorkingSetSize - currentAllocatedSize`), rounded to the nearest
+MB and saturated to the largest MB-aligned UINT; it is an allocatable budget
+minus current allocations, not free VRAM. Uninitialized devices, physical loss
+and non-Metal backends fail by name; reset-required on a healthy device still
+answers.
 
 M2 primary evidence: Microsoft
 [Reset](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3ddevice9-reset),
@@ -324,12 +347,17 @@ M2 primary evidence: Microsoft
 [lost devices](https://learn.microsoft.com/en-us/windows/win32/direct3d9/lost-devices),
 [D3DPRESENT_PARAMETERS](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dpresent-parameters),
 [D3DCAPS9](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dcaps9),
-[CheckDeviceType](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3d9-checkdevicetype),
+[CheckDeviceType](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3d9-checkdevicetype)
+(the implemented fullscreen subset uses X8R8G8B8 display with X8R8G8B8
+or A8R8G8B8 back buffer),
+[D3DPRESENT](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dpresent)
+(DEFAULT/ONE synchronize, IMMEDIATE does not),
 [CheckDeviceFormat](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3d9-checkdeviceformat),
 [CheckDeviceMultiSampleType](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3d9-checkdevicemultisampletype),
 [CheckDepthStencilMatch](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3d9-checkdepthstencilmatch),
 [CheckDeviceFormatConversion](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3d9-checkdeviceformatconversion),
 [GetDeviceCaps](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3d9-getdevicecaps),
+[GetAvailableTextureMem](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3ddevice9-getavailabletexturemem),
 [GetAdapterCount](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3d9-getadaptercount),
 [GetAdapterModeCount](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3d9-getadaptermodecount),
 [EnumAdapterModes](https://learn.microsoft.com/en-us/windows/win32/api/d3d9/nf-d3d9-idirect3d9-enumadaptermodes),
@@ -344,8 +372,17 @@ pinned Wine 11.0 `d3d9types.h`/`d3d9caps.h`/`d3d9.h` declarations; and wgpu 27.0
 `Device::set_device_lost_callback` / `DeviceLostReason` behavior, `poll`
 (`PollType::Poll`, `PollError` limited to `Timeout`/`WrongSubmissionIndex`) and
 wgpu-core 27.0.3 `device/resource.rs` `lose()` (immediate callback) plus
-`device/queue.rs` poll discovery. Thread identity uses the recomp runtime's
-guest scalar `guest_current_thread_id()`.
+`device/queue.rs` poll discovery. `GetAvailableTextureMem` uses Apple's
+[recommendedMaxWorkingSetSize](https://developer.apple.com/documentation/metal/mtldevice/recommendedmaxworkingsetsize)
+(allocatable without performance impact) minus
+[currentAllocatedSize](https://developer.apple.com/documentation/metal/mtldevice/currentallocatedsize)
+(all device resources), via pinned `wgpu-hal 27.0.4`
+`src/metal/device.rs:365` `raw_device()`, `metal 0.32.0` `src/device.rs:1616`
+`recommended_max_working_set_size()` and `:2107` `current_allocated_size()`, and
+`wgpu 27.0.1` `Device::as_hal` (`src/api/device.rs:538`). Consumer disassembly:
+CreateDevice call `0x009a4b85`, return `0x009a4b88`;
+GetAvailableTextureMem call `0x00456c58 [ECX+0x10]`, return `0x00456c5b` stores
+EAX at `[ESI+0x120]`. Thread identity uses the recomp runtime's guest scalar `guest_current_thread_id()`.
 
 **D2. Running legacy bytecode: extend the kit's Rust translator.** The D3D8
 crate already translates SM1.1 to WGSL (`graphics/d3d8-wgpu/src/d3d8/shader.rs`).
@@ -417,7 +454,8 @@ proceed in parallel once M1 exists.
   the M2 contract's shared validator, Rust-owned implicit back/depth targets,
   `Reset`/`Present`/`TestCooperativeLevel`,
   `GetBackBuffer`/`GetRenderTarget`/`GetDepthStencilSurface`/`GetDisplayMode`/
-  `GetNumberOfSwapChains`, adapter-fact caps and `Check*`, factory enumeration
+  `GetNumberOfSwapChains`/`GetAvailableTextureMem` (Metal estimate),
+  adapter-fact caps and `Check*`, factory enumeration
   with adapter validation and the D3D9 ref-hook implicit-surface lifetime.
   Both Reset paths stage implicit targets and managed residency before
   committing; healthy Reset retains its context, physical loss replaces it.
@@ -547,7 +585,7 @@ proceed in parallel once M1 exists.
   imports (file and memory loaders, image info, `D3DXLoadSurfaceFromSurface`,
   save to file) handle DDS/DXT, TGA, PNG, JPG and BMP into D1 formats, with
   mips, cube faces, volume slices, color keys and filtering.
-  **Implemented, compile unverified (focused correctness pass 2026-10-13).** All
+  **Implemented; final windowed build/signing passed 2026-10-13.** All
   10 Civ4 imports route through Rust-owned decode/validation/conversion/mip/filter/encode;
   C++ stages guest/file data and publishes COM identities. Rust reads DDS headers
   directly for numeric FOURCC (64/128-bit), `DDPF_BUMPDUDV` signed/bump masks and
@@ -571,7 +609,7 @@ proceed in parallel once M1 exists.
   creation of L6V5U5/X8L8V8U8/A2W10V10U10/CxV8U8 (reported by `GetImageInfo`,
   create fails by name), and other non-tight/non-DWORD row padding. Numeric fidelity (DXT
   compressor, SNORM tie rounding, luminance-as-red, PIECEWISE sRGB vs native
-  D3DX, odd BOX leftovers) awaits approved runs. No build or execution yet.
+  D3DX, odd BOX leftovers) awaits approved runs. No texture execution verified.
   M7 primary evidence: Microsoft
   [D3DFORMAT](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dformat)
   (little-endian channel order; missing channels read as 1, except `A8RGB000`),
@@ -596,14 +634,145 @@ proceed in parallel once M1 exists.
   Files: `graphics/d3d8-wgpu/src/d3d9/d3dx.rs`, `d3dx/filter.rs`,
   `d3d9/{format,resource}.rs`, `src/bridge.rs`, `dx/{d3dx9tex.h,d3d9.cpp,
   d3d_bridge_helpers.h,d3dx9_imports.json}`, `tools/gen_d3dx9_imports.py`.
-- [ ] **M8. D3DX shader helpers and math.** Needs M5. Done when: constant
-  tables, input semantics, shader version and vertex/pixel profile queries
-  (matching M2's caps) work, and matrix helpers handle aliasing and singular
-  inputs. Compile and assemble keep failing by name per D3/D4.
-- [ ] **M9. D3DX effects.** Needs M4, M8, D5. Done when: all 14 Civ4 compiled
-  effects load, expose parameters, annotations and techniques, evaluate their
-  preshaders, share pools, and apply passes through the Rust device state with
-  `Begin`/`End` save/restore and lost/reset handling.
+- [x] **M8. D3DX shader helpers and math.** Needs M5. Done within this
+  contract: the five imported shader helpers and three matrix helpers reach
+  Rust through CXX; `ID3DXConstantTable` and its inherited `ID3DXBuffer` view
+  share one COM identity/refcount and Rust table. Rust owns CTAB payloads,
+  descriptors, roots/children, ANSI names, defaults, lookup and numeric packing;
+  C++ owns only guest staging and stable handle tokens, released with the table.
+  `GetBufferPointer` exposes the CTAB payload without FOURCC. Raw shader-version
+  queries return the first DWORD (or zero for NULL); input-semantic queries
+  support D1 DCL and SM1 pixel register enumeration; profiles come from M2 caps.
+  Scalar/vector/matrix/array, transpose and matrix-pointer setters update actual
+  float/int/bool banks through M4's state-block recording path, with whole-call
+  range validation before writes. SetDefaults uploads register-packed defaults,
+  including struct defaults; missing defaults leave constants unchanged. Arrays,
+  elements and nested member names are reflected; handles accept tokens or ANSI
+  name paths. The parser bounds metadata to 32 nested levels and 4096 nodes and
+  validates spans before publishing descriptors. Matrix inputs are captured
+  before guest output writes; singular inverse returns NULL without writing
+  either output or determinant. `_26` math/effect handlers are preserved.
+
+  **Named deferrals:** struct setter conversion, matrix-pointer setters on
+  scalar/vector destinations, partial scatter inputs requiring words outside
+  the supplied input, and valid non-numeric types in numeric register sets.
+  Sampler/object numeric setters return INVALIDCALL. SM3 creation/reflection,
+  standalone buffer creation, ConstantTableEx, output-semantic exports,
+  compile/assemble and DebugMute remain outside this imported subset. Numeric
+  equivalence and runtime table/setter execution remain unverified.
+
+  M8 primary evidence: Microsoft
+  [ID3DXConstantTable](https://learn.microsoft.com/en-us/windows/win32/direct3d9/id3dxconstanttable),
+  [D3DXGetShaderConstantTable](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxgetshaderconstanttable),
+  [D3DXGetShaderInputSemantics](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxgetshaderinputsemantics),
+  [SetValue](https://learn.microsoft.com/en-us/windows/win32/direct3d9/id3dxconstanttable--setvalue),
+  [D3DXGetVertexShaderProfile](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxgetvertexshaderprofile),
+  [D3DXMatrixInverse](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixinverse);
+  pinned Wine 11.0 headers and `dlls/d3dx9_36/{shader,math}.c` at
+  `db11d0fe6a169c457e23d007e20404643d067aa8` (reference semantics, no linked Wine
+  runtime). Consumer inventory: 458 CTAB constants, 313 FLOAT4 and 145 SAMPLER;
+  174 column matrices, 122 vectors, 17 scalars, 145 objects, no recorded structs.
+  Static caller evidence: `0x9c9531/0x9c9541` version,
+  `0x9cb8f5/0x9cb979` semantics, `0x9bbff8/0x9bc068` CTAB,
+  `0x9bcb97/0x9bcce4` pixel profiles, `0x9bc87e/0x9bca0e` vertex profiles;
+  matrix sites include `0x461ab3`, `0x47ab6a`, `0x9c5df1`, `0xa11b89`.
+  Supervisor `/program/info` verified x86, little-endian, Windows, base
+  `00400000` against `game/game.toml`; no Ghidra or translation-input edits.
+- [-] **M9. D3DX effects.** Needs M4, M8, D5. Done when: all 14 compiled
+  effects load through `D3DXCreateEffectFromFileA`; effect/pool objects expose
+  parameters, annotations, array elements and techniques; numeric/texture
+  setters feed preshaders and passes; `Begin`/`End` restore affected states;
+  lost/reset calls release DEFAULT texture references and saved bindings.
+  Rust owns parsing, values, pool membership, shader preparation, pass state,
+  flags and snapshots. C++ owns COM identity/refcounts, device/pool parents,
+  guest handle/name/bytecode staging and retained texture/shader bindings.
+
+  Handoff (2026-10-13, reviewed and built): compiled
+  FXO loading, reflection, numeric/texture setters/getters, compatible numeric
+  and texture pools, technique selection/structural validation, pass/commit
+  execution and lost/reset are wired. The binding/import JSONs remain the
+  authoritative callable map. Guest handles accept stable effect-local tokens
+  or staged names. Shader COM views survive effect release while bound or saved;
+  creation failures roll back unpublished shaders and pool membership.
+  Snapshots include nested/CTAB sampler states and the union of shader-array
+  elements. `DONOTSAVESHADERSTATE` excludes shader objects/constants while
+  retaining sampler restoration; `DONOTSAVESAMPLERSTATE` follows the published
+  ordinary-save behavior. `NOT_CLONEABLE` suppresses pass bytecode pointers.
+  FXO texture object indices initialize to NULL, never COM ids. Partial shared
+  writes begin from the pool's latest values; pool texture arrays retain every
+  element independently of the writer effect.
+
+  Static asset evidence: 14 effects, 60 techniques, 74 passes, 1,242 pass states,
+  251 parameters, 222 annotations and 92 shaders in the existing inventory;
+  52 effect-state preshader resources in 10 effects, six Terrain shader-array
+  selectors, and two executable River vertex-shader `PRES` blocks (NEG/DOT).
+  River `PRES` payloads start at file `0x3488`/`0x3b30`, each 528 bytes;
+  they upload computed constants c12/c14 after ordinary CTAB constants.
+  State MOV, selector MOV, and shader NEG/DOT use bounded register banks and
+  floating-point writes. All 103 render and 18 texture-stage operation mappings
+  were compared with the pinned table and headers. This is static reconciliation;
+  Rust loading of all assets, numeric/rendering fidelity and reset execution
+  remain unverified, so M9 acceptance stays open.
+
+  Named deferrals: source/compiler APIs; structs; shared sampler/string/shader
+  parameters; sampler arrays; preshader relative addressing and integer/BOOL
+  banks; shader integer/BOOL constant uploads; LARGEADDRESSAWARE creation;
+  function reflection, shader-object getters, string/array-range setters,
+  parameter blocks, cloning, raw-value and matrix-pointer getters.
+  Technique validation is structural; device-cap validation remains a gap.
+  Existing M6/M11 raster deferrals still fail by name during drawing.
+  Files: `d3d9/{d3dx_effect.rs,d3dx_effect/preshader.rs,d3dx_shader.rs,state.rs}`,
+  `src/{bridge.rs,d3d9.rs}`, `dx/{d3d9.cpp,d3dx9.cpp,d3dx9effect_shim.h,com.h,
+  d3d_bridge_helpers.h,d3dx9_33_bindings.json,d3dx9_imports.json}`.
+  Checks: supervisor static review and inventory/header reconciliation;
+  native/Rust formatting, generated COM/import consistency, repository-boundary
+  and whitespace checks passed. Final flag-on windowed build/signing passed
+  after fixing CXX defaults, a handler declaration and a legacy export-name
+  collision. Log: consumer `analysis/d3d9-m9-build.log` (ignored).
+  No tests, app, headless or GPU runs; no translation/Ghidra edits or commits.
+
+  Primary evidence: pinned Wine 11.0 `d3dx9effect.h`, `effect.c` and
+  `preshader.c` at `db11d0fe6a169c457e23d007e20404643d067aa8`
+  (`d3dx_parse_array_selector`, `ST_ARRAY_SELECTOR`, `set_constants`,
+  `param_on_lost_device`); Microsoft
+  [Using an Effect](https://learn.microsoft.com/en-us/windows/win32/direct3d9/using-an-effect),
+  [Begin](https://learn.microsoft.com/en-us/windows/win32/direct3d9/id3dxeffect--begin),
+  [OnLostDevice](https://learn.microsoft.com/en-us/windows/win32/direct3d9/id3dxeffect--onlostdevice)
+  and [D3DXFX](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxfx);
+  consumer `analysis/fxo-inventory.json`, installed `Shaders/FXO`, creation
+  caller `0x9c4ae0` and import call `0x009c4b22`.
+
+  State-manager handoff (2026-10-13, reviewed and built): `ID3DXEffect::SetStateManager` and
+  `GetStateManager` are callable. Rust owns `manager_mode` and a reserved command
+  batch: `Begin` with a manager bypasses snapshot capture per Microsoft,
+  `BeginPass`/`CommitChanges` return owned `D3dxEffectCommand` lists
+  (`SetRenderState`, `SetTextureStageState`, `SetSamplerState`, `SetTransform`,
+  `SetTexture`, `SetVertexShader`, `SetPixelShader`, `SetVertexShaderConstantF`,
+  `SetPixelShaderConstantF`) and never mutate the Rust device in that mode.
+  C++ owns the guest manager identity/refcounts, resolves shader handles through
+  `shader_views` and textures by kind/device, pins the effect, manager and every
+  referenced identity across the whole handler, stages constant/matrix bytes in
+  guest heap, passes register counts for constant uploads, propagates failing
+  callback HRESULTs (last failure per pinned Wine) and releases the manager
+  through `guest_current_context` at destroy. Manager changes and callback
+  batches guard lifecycle re-entry. NULL restores default dispatch; `End`
+  retains restored bindings before dropping saved references. Binary evidence: caller
+  `0x009c7f7c` (slot `0x11c` = SetStateManager), return `0x009c7f82`, manager
+  vtable `0x00ad9cb8`, `SetRenderState 0x009cc000`, `SetTexture 0x009cc040`,
+  `SetTextureStageState 0x009cc090`, `SetSamplerState 0x009cc0e0`,
+  `SetTransform 0x009cbeb0`, `SetVertexShader 0x009cc190`,
+  `SetVertexShaderConstantF 0x009cc310`, `SetPixelShader 0x009cc240`,
+  `SetPixelShaderConstantF 0x009cc3d0`, `AddRef 0x009cbe60`, `Release 0x009cbe80`.
+  Primary: Microsoft
+  [ID3DXEffectStateManager](https://learn.microsoft.com/en-us/windows/win32/direct3d9/id3dxeffectstatemanager);
+  pinned Wine header slot order and `effect.c` `d3dx_effect_SetStateManager`.
+  Checks: all 21 manager vtable targets confirmed as existing metadata spans;
+  bindings generator output validated (`SetStateManager`/`GetStateManager` →
+  `Efx_*`, argc 2; getter is native identity/refcount handling); Rust/native
+  formatting, boundary and whitespace checks passed. Final flag-on windowed
+  build/signing passed on the first build attempt after supervisor corrections.
+  Log: consumer `analysis/d3d9-m9-state-manager-build.log` (ignored). Callback
+  execution remains unverified; no tests, app, headless, GPU or `--regenerate`.
 - [ ] **M10. First frame.** Needs the subset of M2–M9 Civ4's startup uses.
   Done when: a reviewed build with the flag on reaches Civ4's main menu in an
   approved run, with known gaps listed here.
@@ -632,7 +801,8 @@ asked.
 
 ## Civ4 consumer evidence
 
-Static only; nothing has been run. In the consumer's ignored `analysis/`:
+The inventories below are static; approved startup execution is recorded in
+the handoff above. In the consumer's ignored `analysis/`:
 `d3d9-inventory.json` (identity, imports, call sites), `fxo-inventory.json`
 (parsed effects), `d3d9-resource-evidence.json` (DDS headers, masks and resource
 calls) and Ghidra dumps. The resource scan found 4,031 loose DDS files across
@@ -648,7 +818,7 @@ classifier `0x9ae2f0` proves recognition, not use.
 - 25 `d3dx9_33` imports with 49 static call sites; `Direct3DCreate9` only, no
   Ex.
 - All 14 compiled effects in `Shaders/FXO` parse: `vs_1_1`, `vs_2_0`,
-  `ps_1_1`, `ps_1_4`, `ps_2_0`, preshaders in 11 of them, NULL and mixed
+  `ps_1_1`, `ps_1_4`, `ps_2_0`, effect-state preshaders in 10 of them, NULL and mixed
   stages.
 - Effect loading: `0x456880` loads the shader library from `Shaders\FXO` and
   registers `Shaders/FX` only as a hot-load watch directory (`0x699a80`,
