@@ -163,11 +163,12 @@ def plan(prepared, invocations):
                                   (*primary, Invoke(invocation, input_value)),
                                   (fallback, Invoke(invocation.fallback))),)
                 else:
-                    if call.guard:
+                    if call.guard or call.settle_guard:
                         guarded = publish(block.snapshots[event.id],
                                           Publication(call.guard), direct=True,
                                           clear=lazy and any(key in prepared.flag_keys for key in prepared.kept_calls.get(event.id, ())))
-                        primary += (Guard("hooks", None, (guarded,)),)
+                        settle = (SettleFlags(flag_region.SETTLE),) if call.settle_guard else ()
+                        primary += (Guard("hooks", None, (*settle, guarded)),)
                     body = (*primary, Invoke(invocation))
                 events[event.id] = body + ((SettleFlags(prepared.cc_calls.get(block.index)),) if lazy else ())
             elif event.opc in ("CALL_RELOAD", "CALL_KEEP"):

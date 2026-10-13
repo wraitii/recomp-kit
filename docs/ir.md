@@ -212,6 +212,20 @@ under `fault_state = "exact"`.
 
 ### Lazy flags
 
+DIVERGENCE(original): AND/OR/XOR/TEST choose AF=0 rather than preserving its
+incoming value; x86 leaves AF undefined. Both emitters, the interpreter, lazy
+recipes and call-contract kills agree, so logic replaces all six arithmetic
+flags without observing an incoming descriptor.
+
+Other undefined-flag choices remain separate: shifts preserve AF (zero masked
+counts preserve all flags), nonzero shifts/rotates use the runtime's existing
+OF recipes, MUL/IMUL preserve SF/ZF/AF/PF in generated paths, and successful
+DIV/IDIV preserve arithmetic flags. BSF/BSR preserve undefined flags other than
+ZF; BT/BTS/BTR/BTC preserve undefined OF/SF/AF/PF and unaffected ZF. These are
+implementation choices, not x86 preservation guarantees for undefined flags.
+INC/DEC's CF and rotates' SF/ZF/AF/PF are guaranteed
+unaffected and must remain preserved.
+
 `X86` carries a descriptor (`cc_op`, `cc_size`, `cc_mask`, `cc_a`, `cc_b`,
 `cc_res`, `cc_carry`) for the last ADD/ADC/SUB/SBB/CMP/logic/INC/DEC;
 `cc_carry` uses the former padding byte without changing the CPU layout.
@@ -224,11 +238,17 @@ removed; with no read and all six flags written on every path it becomes
 `x86_cc_drop`. After a call, the flags read, reloaded from the fields or not
 written on every path form a mask: `x86_cc_settle_mask` (region without
 writes) and `x86_cc_settle_or_drop` materialise only a descriptor whose
-`cc_mask` meets it, and otherwise keep or drop it. A full settle stays for
+`cc_mask` meets it, and otherwise keep or drop it. The overwrite-region helper
+computes only needed fields before dropping the descriptor; entry masks also
+include live flag inputs. Reads within an instruction are counted only before
+that instruction writes the field. Full-output calls can forward returned flags
+through RET without field reloads; specialized calls retain explicit output
+requirements. Resident flag inputs used only by an ordinary call's hook guard
+settle inside that guard instead of forcing entry loads. A full settle stays for
 paths leaving the body without
 a call or return, for calls that can continue elsewhere (SEH adoption, noreturn,
 setjmp), and where hooks may observe (entry thunks and `recomp_jump` settle
-before a hook). Decoded bodies use an explicit per-mnemonic flag-effect table.
+before a hook). Decoded bodies settle at entry and after calls.
 
 `ir/cc_carry.py` carries recipes through resolved CFG edges and merges equal-width
 recipes with payload phis, including differing producer kinds. Only flags covered

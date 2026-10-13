@@ -18,6 +18,7 @@ RELAXABLE_ACCESS = OBSERVES - OPAQUE - EXITS
 class PublicationPlan:
     required: dict
     known_before: dict
+    resident_before: dict
 
 
 def plan(s, successors, fields, *, access_fields=None, reloaded=(), kept=None,
@@ -28,7 +29,7 @@ def plan(s, successors, fields, *, access_fields=None, reloaded=(), kept=None,
 
 
 def analyze(s, successors, fields, *, access_fields=None, reloaded=(), kept=None,
-            lazy_fields=(), preserved=None, eager_events=()):
+            lazy_fields=(), preserved=None, eager_events=(), returned_lazy=()):
     """Return publication requirements and facts already known before each event.
 
 `fields` groups register lanes by runtime field. LOAD/STORE have read-only CPU
@@ -42,6 +43,8 @@ A field in `reloaded` is known after a helper: its reload reads the CPU.
 does not publish them, and they stay known across it only if already known.
 `lazy_fields` may reside in a descriptor at non-eager observers. Preserved
 flags retain that residency across calls, but eager observers require fields.
+`returned_lazy` identifies full-output calls whose returned descriptors can
+stay resident without reloading fields; specialized calls can omit outputs.
 At joins each fact requires every predecessor to carry its exit value.
 Starting with no facts gives a conservative least fixed point for loops.
 
@@ -72,6 +75,8 @@ Starting with no facts gives a conservative least fixed point for loops.
     resident_exit = {i: set() for i in s.blocks}
     publications = {}
     known_before = {}
+    resident_before = {}
+    returned_lazy = frozenset(returned_lazy)
     changed = True
     while changed:
         changed = False
@@ -91,10 +96,13 @@ Starting with no facts gives a conservative least fixed point for loops.
                 kept_groups, kept_known, kept_resident = set(), set(), set()
                 required = []
                 already_known = []
+                already_resident = []
                 for n, keys in enumerate(groups):
                     current = values(state, keys)
                     if known.get(n) == current:
                         already_known.extend(keys)
+                    if resident.get(n) == current:
+                        already_resident.extend(keys)
                     if access and access_fields is not None and not any(key in access_fields for key in keys):
                         # A skipped snapshot does not make a publication fact.
                         # The older CPU value stays known until a real observer.
@@ -123,6 +131,7 @@ Starting with no facts gives a conservative least fixed point for loops.
                                     if key in lazy_fields and key not in required)
                 publications[v.id] = tuple(required)
                 known_before[v.id] = tuple(already_known)
+                resident_before[v.id] = tuple(already_resident)
                 if v.opc in OPAQUE:
                     # A division error handler, an opaque callee and the string
                     # helper's fault path may leave arbitrary CPU state behind,
@@ -144,6 +153,8 @@ Starting with no facts gives a conservative least fixed point for loops.
                         elif all(key in reloaded and key in reloads for key in keys):
                             known[n] = values(reloads, keys)
                             resident[n] = known[n]
+                        elif v.id in returned_lazy and all(key in lazy_fields and key in reloads for key in keys):
+                            resident[n] = values(reloads, keys)
             outgoing = {n for n, keys in enumerate(groups)
                         if known.get(n) == values(b.exit, keys)}
             resident_outgoing = {n for n, keys in enumerate(groups)
@@ -154,4 +165,4 @@ Starting with no facts gives a conservative least fixed point for loops.
             if outgoing != known_exit[i]:
                 known_exit[i] = outgoing
                 changed = True
-    return PublicationPlan(publications, known_before)
+    return PublicationPlan(publications, known_before, resident_before)
