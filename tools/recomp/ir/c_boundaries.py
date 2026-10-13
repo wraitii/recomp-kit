@@ -99,12 +99,14 @@ class Printer:
     def event(self, event):
         return self.operations(self.plan.events[event.id])
 
-    def edge(self, source, target, label):
+    def edge(self, source, target, label, fallthrough=None):
         edge = self.plan.edges[source, target]
         lines = ["{"]
         lines.extend("uint%d_t p%d = %s;" % (32 if dst.size <= 4 else 64, dst.id, self.ref(src)) for dst, src in edge.copies)
         lines.extend("v%d = p%d;" % (dst.id, dst.id) for dst, _ in edge.copies)
-        return [*lines, "goto %s%d;" % (label, edge.target), "}"]
+        if edge.target != fallthrough:
+            lines.append("goto %s%d;" % (label, edge.target))
+        return [*lines, "}"] if edge.copies or edge.target != fallthrough else []
 
     def condition(self, operation):
         if operation.kind == "eligible":

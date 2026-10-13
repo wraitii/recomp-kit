@@ -18,6 +18,7 @@ def function_ir(tr, lifter, fn):
         lo = ins.addr - image.base
         insns.append(lifter.lift(ins.addr, bytes(image.data[lo:lo + end - ins.addr]),
                                  mnem=ins.mnem, decode=ins.decode))
+        insns[-1].text = ' '.join(filter(None, (ins.rep, ins.mnem, ', '.join(ins.ops))))
     succ = [tr.successors(fn, i) for i in range(len(fn.insns))]
     noreturn = {}
     for i, ins in enumerate(fn.insns):

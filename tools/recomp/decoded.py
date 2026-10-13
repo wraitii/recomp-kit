@@ -266,19 +266,26 @@ class Translator(ControlFlow):
                 out.append("    uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
             if head:
                 out.append("    goto L_%08x;" % fn.addr)
-        for i in live:
+        for position, i in enumerate(live):
             ins = fn.insns[i]
             if ins.addr in labels:
                 out.append("L_%08x: ;" % ins.addr)
-            out.extend("    " + line for line in self.emit(fn, i))
+            out.append('    // %08x: %s' % (ins.addr, ' '.join(filter(None, (ins.rep, ins.mnem, ', '.join(ins.ops))))))
+            emitted = self.emit(fn, i)
             if (not fn.contiguous[i] and ins.mnem not in TERMINATORS
                     and ins.mnem != "INT3" and not self.never_returns(ins)):
                 t = fn.fallthrough[i]
-                out.extend("    " + line for line in self.goto_target(fn, t, ins))
+                emitted.extend(self.goto_target(fn, t, ins))
+            if position + 1 < len(live) and emitted and emitted[-1] == 'goto L_%08x;' % fn.insns[live[position + 1]].addr:
+                emitted.pop()
+            out.extend("    " + line for line in emitted)
         if (last.mnem not in TERMINATORS and last.mnem != "INT3"
                 and not self.never_returns(last)):
             out.append("    " + " ".join(self.goto_target(fn, fn.fallthrough[live[-1]] or fn.end, last)))
         out.append("}")
+        referenced = set(re.findall(r'\bgoto (L_[0-9a-f]+);', '\n'.join(out)))
+        out = [line for line in out if not (line.startswith('L_')
+               and line.endswith(': ;') and line[:-3] not in referenced)]
         if entries:
             out.append("void fn_%08x(X86 *c) { body_%08x(c, 0u); }" % (fn.addr, fn.addr))
             for e in entries:

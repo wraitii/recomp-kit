@@ -284,5 +284,7 @@ def codegen_ir(fir, lifter, tails=()):
                       ins.x87, ins.internal_flow, ins.userops, ins.raw, ins.decode)
         result.cc = _flag_producer(mnem, ops, flag_offsets)
         insns.append(result)
+    for original, normalized in zip(fir.insns, insns):
+        normalized.text = original.text
     succ = add_exit_stubs(insns, fir.succ, fir.exits, tails)
     return FunctionIR(fir.addr, insns, succ, fir.tables, entries=fir.entries, language=fir.language)

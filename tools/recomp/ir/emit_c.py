@@ -202,8 +202,8 @@ def emit_prepared(prepared, external_entry=False):
     def publish(event):
         return boundary.publication(event)
 
-    def edge(source, target):
-        return boundary.edge(source, target, block_label)
+    def edge(source, target, fallthrough=None):
+        return boundary.edge(source, target, block_label, fallthrough)
 
     x87_printer = ScalarPrinter(ref)
     block_label = "F" if arithmetic_plan.programs[0].clone == "fast" else "B"
@@ -235,19 +235,23 @@ def emit_prepared(prepared, external_entry=False):
         for e, block in zip(fir.entries, s.alternates):
             lines.append("case 0x%xu:" % e)
             lines.extend(edge(-1, block))
-        lines.append("default:")
-        lines.extend(edge(-1, s.entry))
+        lines.append("default:;")
+        lines.extend(edge(-1, s.entry, next(iter(s.blocks))))
         lines.append("}")
     else:
-        lines.extend(edge(-1, s.entry))
+        lines.extend(edge(-1, s.entry, next(iter(s.blocks))))
     indices = arithmetic_plan.indices
     lines[scalar_declarations:scalar_declarations] = [x87_printer.declaration(op) for op in arithmetic_plan.declarations()]
 
     for program in arithmetic_plan.programs:
         block_label = 'F' if program.clone == 'fast' else 'B'
         emitted = set()
-        for i, b in s.blocks.items():
+        block_order = list(s.blocks)
+        for position, i in enumerate(block_order):
+            b = s.blocks[i]
+            following = block_order[position + 1] if position + 1 < len(block_order) else None
             lines.append('%s%d:;' % (block_label, i))
+            lines.append('// %08x: %s' % (b.insn.addr, b.insn.text))
             lines.extend(x87_printer.operations(program.blocks[i]))
             for v in b.ops:
                 emitted.add(v.id)
@@ -326,19 +330,27 @@ def emit_prepared(prepared, external_entry=False):
                         b.insn.addr, ref(v.args[0])))
                     lines.append("}")
                 elif v.opc == "BRANCH":
-                    lines.extend(edge(i, indices[v.args[0].data]))
+                    lines.extend(edge(i, indices[v.args[0].data], following))
                 elif v.opc == "CBRANCH":
+                    target = indices[v.args[0].data]
                     lines.append("if (%s)" % ref(v.args[1]))
-                    lines.extend(edge(i, indices[v.args[0].data]))
-                    lines.extend(edge(i, indices[b.insn.addr + b.insn.length]))
+                    lines.extend(edge(i, target, following) or ['{}'])
+                    if target == following:
+                        lines.append('else')
+                        lines.extend(edge(i, indices[b.insn.addr + b.insn.length], following) or ['{}'])
+                        continue
+                    lines.extend(edge(i, indices[b.insn.addr + b.insn.length], following))
                 else:
                     lines.append(assignment(v, expression(v)))
             if not any(v.opc in operations.TERMINATORS for v in b.ops):
                 lines.extend(x87_printer.operations(program.ends[i]))
-                lines.extend(edge(i, fir.succ[i][0]))
+                lines.extend(edge(i, fir.succ[i][0], following))
         if emitted != set(program.events):
             raise SSAError('x87 emission differs from its planned event coverage')
     lines.append("}")
+    referenced = {line[5:-1] for line in lines if line.startswith('goto ')}
+    lines = [line for line in lines if not (line.startswith(('B', 'F'))
+             and line.endswith(':;') and line[:-2] not in referenced)]
     lines[scalar_declarations:scalar_declarations] = [x87_printer.declaration(op) for op in arithmetic_plan.temporaries]
     return "\n".join(lines)
 
