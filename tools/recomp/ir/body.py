@@ -107,7 +107,7 @@ class BodyRequest:
     call_contracts: FrozenMap = field(default_factory=FrozenMap)
     checked_calls: frozenset = frozenset()
     contract_calls: frozenset = frozenset()
-    ecx_private_targets: frozenset = frozenset()
+    private_input_arguments: FrozenMap = field(default_factory=FrozenMap)
     layout: "PrivateLayout | None" = None
     mode_sites: FrozenMap = field(default_factory=FrozenMap)
     entry_verify: object | None = None
@@ -116,8 +116,9 @@ class BodyRequest:
     def __post_init__(self):
         for name in ("call_symbols", "tail_symbols", "call_contracts", "mode_sites"):
             object.__setattr__(self, name, FrozenMap.of(getattr(self, name)))
-        for name in ("checked_calls", "contract_calls", "ecx_private_targets"):
+        for name in ("checked_calls", "contract_calls"):
             object.__setattr__(self, name, frozenset(getattr(self, name)))
+        object.__setattr__(self, "private_input_arguments", FrozenMap.of(self.private_input_arguments))
         if (self.variant.returns == ReturnForm.PRIVATE) != (self.layout is not None):
             raise ValueError("private body requires a shared layout")
 

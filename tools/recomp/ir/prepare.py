@@ -227,7 +227,7 @@ class PreparedFunction:
                 mask = select_layout(layouts, target, mask).output_mask
             proof = proven_fact(options.mode_sites.get(b.insn.addr), CW_FAST)
             return private_invocation(target, binding, expected, proof, mask,
-                                     target in options.request.ecx_private_targets)
+                                     options.request.private_input_arguments.get(target))
         form = "checked" if target in options.request.checked_calls else "ordinary"
         return binding_invocation(target, binding, form, expected)
 
@@ -258,7 +258,8 @@ class PreparedFunction:
             layout = select_layout(layouts, v.data, contract_output_mask(call.required_outputs))
             contract = self.options.request.call_contracts.get(v.data)
             if contract is not None:
-                required_inputs = contract.reads - (frozenset(("ECX",)) if layout.ecx_argument else frozenset())
+                required_inputs = contract.reads - (frozenset((layout.input_argument,))
+                                                     if layout.input_argument else frozenset())
                 if not required_inputs <= set(layout.inputs):
                     raise SSAError("shared contract inputs do not cover the callee reads")
         invocations = self._bind(layouts)
@@ -460,8 +461,8 @@ def prepare(fir, request, *, lifter=None, normalized=None):
                 transparent_fields[target] = frozenset(
                     key for field in fields_
                     if (field not in contract.reads and field not in contract.writes)
-                    or (field == "ECX" and target in request.ecx_private_targets
-                        and target in contract_calls and field in contract.preserves)
+                    or (field == request.private_input_arguments.get(target)
+                        and target in contract_calls)
                     for key in field_lanes[field])
     tail_symbols = normalize_bindings(tail_symbols, "tail", allow_checked=False)
     seh_mark = any("orphan" in kinds for kinds in fir.seh.values())
@@ -508,8 +509,8 @@ def prepare(fir, request, *, lifter=None, normalized=None):
                                     call_contracts or {}, kept_calls, lane_field, CONTRACT_NEVER_SKIP,
                                     contract_calls, return_fields, flag_keys, flag_first_key,
                                     CC_DEFINES, CC_BIT_VALUES, lazy_flags, CC_EAGER_EVENTS,
-                                    bool(request.layout and request.layout.ecx_argument),
-                                    request.ecx_private_targets)
+                                    request.layout.input_argument if request.layout else None,
+                                    request.private_input_arguments)
     live = simplify(s, transfers.live_publications, canonical=False, extra_roots=transfers.roots,
                     removable=frozenset(("CALL_RELOAD", "CALL_KEEP")), groups=groups)
     reads_entry_flags = any(

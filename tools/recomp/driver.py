@@ -28,7 +28,7 @@ import output
 import emission_cache
 from settings import Settings
 from frontend import external_exits
-from ir import call_contracts, contract_variants, production, x87_mode, x87_facts, x87_report, prepared_store
+from ir import call_contracts, call_values, contract_variants, production, x87_mode, x87_facts, x87_report, prepared_store
 from ir import c_symbols
 from ir.c_symbols import Declaration
 from ir.artifacts import ArtifactStore
@@ -206,7 +206,7 @@ def _prepare(task):
         fn, entries = ctx.load(addr)
         tr.analyze(fn, entries)
         reason = "decoded-only code map" if ctx.decoded_only else production.exclusion(fn)
-        path, requests = None, set()
+        path, requests, input_sites = None, set(), ()
         if reason is None:
             try:
                 selected = addr in selected_callers
@@ -219,16 +219,39 @@ def _prepare(task):
                     production.ProductionRequest(ctx.settings.emit, ctx.known, callee_contracts,
                         checked_returns, frozenset(private_targets) if selected else frozenset(), selected,
                         mode_sites.get(addr), entry_verification.get(addr),
-                        ctx.settings.ecx_private_targets), ctx.artifacts)
+                        selection.input_arguments), ctx.artifacts)
             except (SSAError, LiftError) as error:
                 reason = str(error)
             else:
                 path = Path(store) / ("%08x.pickle" % addr)
                 prepared_store.write(path, body)
                 requests = body.requests
+                groups = dict(body.state_groups)
+                sites = []
+                if ctx.settings.private_input_arguments:
+                    for block in body.ssa.blocks.values():
+                        for event in block.ops:
+                            if event.opc != "CALL" or event.data not in body.options.request.contract_calls:
+                                continue
+                            call = body.transfers.calls[event.id]
+                            publication = body.transfers.publications[event.id]
+                            inputs = tuple(field for field in call.state.inputs if field in call_contracts.GPRS)
+                            stored = tuple(field for field in inputs
+                                           if set(groups[field]) & set(publication.required))
+                            preserved_live = []
+                            for field in call_contracts.GPRS:
+                                if field not in call.state.preserved:
+                                    continue
+                                value = call_values.field_value(body.ssa, field, groups[field], block.reloads[event.id])
+                                live = ((value.whole is not None and value.whole.id in body.live)
+                                        or any(lane is not None and lane.id in body.live for lane in value.lanes))
+                                if live:
+                                    preserved_live.append(field)
+                            sites.append((event.data, inputs, stored, tuple(preserved_live)))
+                input_sites = tuple(sites)
         if reason is not None and addr in checked_returns:
             raise TranslateError("%08x: checked-return body failed preparation: %s" % (addr, reason))
-        plans.append(FunctionPlan(addr, path, reason, frozenset(requests)))
+        plans.append(FunctionPlan(addr, path, reason, frozenset(requests), input_sites))
     ctx.artifacts.flush_counts()
     return plans
 
@@ -295,6 +318,9 @@ def _private_candidate(task):
         fn, entries = ctx.load(addr)
         ctx.tr.analyze(fn, entries)
         ctx.artifacts.reuse_normalized(addr)
+        register_uses = (call_contracts.substantive_register_uses(
+            call_contracts.prepare(ctx.artifacts.lifted(ctx.tr, ctx.lifter, fn)), fn.insns)
+            if task.input_argument_heuristic else {})
         contract = production.private_contract(ctx.tr, ctx.lifter, fn, ctx.artifacts)
         production.prepare_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit,
                                    contract_variants.PrivateLayout.from_mask(0x3fff, contract.reads), known_mode, ctx.artifacts,
@@ -303,7 +329,7 @@ def _private_candidate(task):
                                production.ProductionRequest(ctx.settings.emit, ctx.known, checked_returns=frozenset({addr})),
                                ctx.artifacts)
         ctx.artifacts.flush_counts()
-        return CandidateResult(addr, contract, None)
+        return CandidateResult(addr, contract, None, FrozenMap.of(register_uses))
     except (SSAError, LiftError, RecursionError) as error:
         ctx.artifacts.flush_counts()
         return CandidateResult(addr, None, str(error))
@@ -494,14 +520,14 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
         mode_exposure = x87_mode.exposure_report(mode_prepared, calls, mode_opaque, x87_counts,
                                                 {addr: row.writers for addr, row in scanned.items()})
         eligibility = Eligibility(settings, scanned, mode_opaque)
-        if settings.ecx_private_targets and not eligibility.enabled:
-            raise TranslateError("ECX private targets require call contracts, relaxed local state and a game translation")
+        if (settings.private_input_arguments or settings.private_input_registers) and not eligibility.enabled:
+            raise TranslateError("private register arguments require call contracts, relaxed local state and a game translation")
         for addr in settings.checked_returns:
             if not eligibility.checked(addr):
                 raise TranslateError("%08x: checked return requires an unreplaced, closed single-entry body without SEH" % addr)
-        for addr in settings.ecx_private_targets:
+        for addr in settings.private_input_registers:
             if not eligibility.checked(addr):
-                raise TranslateError("%08x: ECX private target requires an unreplaced, closed single-entry body without SEH" % addr)
+                raise TranslateError("%08x: private input register requires an unreplaced, closed single-entry body without SEH" % addr)
         contracts = {}
         if settings.call_contracts:
             prepared = {addr: row.register_facts or None for addr, row in scanned.items()}
@@ -513,15 +539,18 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
                 roots=roots)
         phase("contracts")
         private_targets, private_rejections = {}, {}
+        register_uses = {}
         checked_returns = set(settings.checked_returns)
         candidates = eligibility.candidates()
         known_modes = eligibility.known_modes(candidates, mode_prepared)
         for candidate in pool.map(_private_candidate,
-                [CandidateTask(a, frozenset(helpers), a in known_modes) for a in sorted(candidates)]):
+                [CandidateTask(a, frozenset(helpers), a in known_modes, settings.private_input_arguments)
+                 for a in sorted(candidates)]):
             addr, contract, reason = candidate.addr, candidate.contract, candidate.reason
             if reason is None:
                 private_targets[addr] = contract
-            elif addr in settings.checked_returns or addr in settings.ecx_private_targets:
+                register_uses[addr] = candidate.register_uses
+            elif addr in settings.checked_returns or addr in settings.private_input_registers:
                 raise TranslateError("%08x: configured private body failed: %s" % (addr, reason))
             else:
                 private_rejections[addr] = reason
@@ -532,13 +561,39 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
 
         analysis = ProgramAnalysis(frozenset(helpers), FrozenMap.of(internal), FrozenMap.of(contracts),
                                    FrozenMap.of(mode_sites), FrozenMap.of(entry_verification))
+        input_arguments = dict(settings.private_input_registers)
         selection = Selection(FrozenMap.of(private_targets), frozenset(checked_returns),
-                              frozenset(selected_callers), frozenset(known_modes), FrozenMap.of(private_rejections))
+                              frozenset(selected_callers), frozenset(known_modes), FrozenMap.of(private_rejections),
+                              FrozenMap.of(input_arguments))
         tasks = [PreparationTask(tuple(part), analysis.for_addresses(part, calls), selection, store) for part in parts]
         plans = {plan.addr: plan for batch in pool.map(_prepare, tasks) for plan in batch}
+        phase("prepare callers")
+        argument_report = {}
+        if settings.private_input_arguments:
+            automatic_arguments, argument_report = contract_variants.select_input_arguments(
+                private_targets, register_uses,
+                {addr: plan.input_sites for addr, plan in plans.items()},
+                {addr: scanned[addr].description.count for addr in private_targets})
+            input_arguments = {**automatic_arguments, **settings.private_input_registers}
+            for addr, register in settings.private_input_registers.items():
+                row = argument_report.setdefault("%08x" % addr, {})
+                row["selected"] = register
+                row["configured"] = True
+            selection = replace(selection, input_arguments=FrozenMap.of(input_arguments))
+            phase("input selection %d" % len(input_arguments))
+            affected = {plan.addr for plan in plans.values()
+                        if any(input_arguments.get(site[0]) != settings.private_input_registers.get(site[0])
+                               and input_arguments.get(site[0]) is not None for site in plan.input_sites)}
+            refresh_tasks = [PreparationTask(tuple(part), analysis.for_addresses(part, calls), selection, store)
+                             for part in chunked(affected, settings.jobs * 24)]
+            for batch in pool.map(_prepare, refresh_tasks):
+                plans.update({plan.addr: plan for plan in batch})
+        else:
+            argument_report = {"%08x" % addr: {"selected": register, "configured": True}
+                               for addr, register in settings.private_input_registers.items()}
         specialization = contract_variants.SpecializationPlan.build(
             {addr: plan.requests for addr, plan in plans.items()}, private_targets,
-            settings.ecx_private_targets)
+            selection.input_arguments)
         shared_layouts = specialization.layouts
         private_plans = list(pool.map(_prepare_private,
                              [PrivatePreparationTask(addr, layout, addr in known_modes, store)
@@ -570,7 +625,7 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
     output.write_funcs_header(args.out, entry_names)
     output.emit_body_chunks(args.out, functions, bodies, entries_by_fn, dependencies, known_modes)
     output.emit_entry_chunks(args.out, entry_names, settings.module, checked_returns, private_masks,
-                             settings.ecx_private_targets)
+                             selection.input_arguments)
     symbols = symbol_rows(ctx, entry_names, rows)
     if settings.module:
         output.write_module_table(args.out, entry_names, symbols, call_returns, settings.module)
@@ -590,6 +645,9 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
         "private_selection": {"automatic": settings.private_leaf_contracts,
                               "heuristic": "at least two direct call sites; at most 64 instructions per site",
                               "rejections": {"%08x" % a: r for a, r in sorted(private_rejections.items())}},
+        "private_input_arguments": {"enabled": settings.private_input_arguments,
+                                    "overrides": {"%08x" % a: r for a, r in sorted(settings.private_input_registers.items())},
+                                    "selection": argument_report},
         "private_variants": [
             {"target": "%08x" % addr, "mask": "%04x" % mask,
              "fields": [field for i, field in enumerate(call_contracts.FIELDS) if mask & (1 << i)]}

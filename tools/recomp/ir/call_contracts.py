@@ -234,14 +234,14 @@ class _Prepared(object):
     it is opaque (indirect call, CALLOTHER, unbound CALL).
     """
 
-    __slots__ = ("language", "entry", "order", "succ", "preds", "use", "defs", "call", "returns", "writes", "preserves")
+    __slots__ = ("language", "entry", "order", "succ", "preds", "use", "defs", "call", "opaque", "returns", "writes", "preserves")
 
     def __init__(self, fir, cells, bits):
         self.language = cells.language
         indices = {ins.addr: i for i, ins in enumerate(fir.insns)}
         self.entry = indices.get(fir.addr)
         self.order, self.succ, self.preds = [], {}, {}
-        self.use, self.defs, self.call, self.returns = {}, {}, {}, []
+        self.use, self.defs, self.call, self.opaque, self.returns = {}, {}, {}, set(), []
         self.writes = 0
         self.preserves = frozenset()
         if self.entry is None:
@@ -291,6 +291,8 @@ class _Prepared(object):
                 target = None
                 self.writes = bits.all
             self.use[i], self.defs[i], self.call[i] = use, defs, target
+            if unknown:
+                self.opaque.add(i)
             if _is_return(ins):
                 self.returns.append(i)
 
@@ -319,6 +321,34 @@ def prepare(fir, language=None):
             op.opc in ("CALL", "CALLIND", "CALLOTHER") for ins in fir.insns for op in ins.ops)):
         p.preserves = _preserved_registers(fir)
     return None if p.entry is None else p
+
+
+def substantive_register_uses(prepared, instructions):
+    if prepared is None:
+        return {}
+    bits = _bits(mapping(prepared.language))
+    out = {}
+    available = {prepared.entry: bits.all}
+    pending = [prepared.entry]
+    while pending:
+        index = pending.pop()
+        if index in prepared.opaque or prepared.call.get(index) is not None:
+            continue
+        incoming = available[index]
+        if index < len(instructions):
+            ins = instructions[index]
+            for field in GPRS:
+                if ins.mnem.upper() == "PUSH" and field in prepared.preserves:
+                    continue
+                if prepared.use[index] & incoming & bits.field_bits[field]:
+                    out.setdefault(field, []).append(index)
+        outgoing = incoming & ~prepared.defs[index]
+        for successor in prepared.succ.get(index, ()):
+            joined = available.get(successor, 0) | outgoing
+            if joined != available.get(successor, 0):
+                available[successor] = joined
+                pending.append(successor)
+    return {field: tuple(sorted(set(indices))) for field, indices in out.items() if indices}
 
 
 def _preserved_registers(fir):

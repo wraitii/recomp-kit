@@ -3,6 +3,9 @@ from dataclasses import dataclass
 
 from .body import FrozenMap
 from .call_contracts import FIELDS, ARITH_FLAGS
+from .call_contracts import GPRS
+
+INPUT_ARGUMENT_REGISTERS = tuple(field for field in GPRS if field not in ("ESP", "EBP"))
 
 
 def output_mask(fields):
@@ -14,7 +17,7 @@ class PrivateLayout:
     inputs: tuple
     outputs: tuple
     resident_opaque: tuple = ("EIP", "FS_OFFSET", "DF", "x87", "runtime")
-    ecx_argument: bool = False
+    input_argument: str | None = None
 
     def __post_init__(self):
         for names in (self.inputs, self.outputs):
@@ -22,16 +25,17 @@ class PrivateLayout:
                 raise ValueError("private fields must be unique and in guest contract order")
         if not isinstance(self.resident_opaque, tuple) or len(set(self.resident_opaque)) != len(self.resident_opaque):
             raise ValueError("resident opaque state must be an ordered unique tuple")
-        if type(self.ecx_argument) is not bool or (self.ecx_argument and "ECX" in self.inputs):
-            raise ValueError("private ECX input must use the explicit argument")
+        if self.input_argument is not None and (self.input_argument not in INPUT_ARGUMENT_REGISTERS
+                                                or self.input_argument in self.inputs):
+            raise ValueError("private register input must use the explicit argument")
 
     @classmethod
-    def from_mask(cls, mask, inputs=FIELDS, ecx_argument=False):
+    def from_mask(cls, mask, inputs=FIELDS, input_argument=None):
         if mask < 0 or mask & ~((1 << len(FIELDS)) - 1):
             raise ValueError("invalid private output mask")
-        return cls(tuple(f for f in FIELDS if f in inputs and not (ecx_argument and f == "ECX")),
+        return cls(tuple(f for f in FIELDS if f in inputs and f != input_argument),
                    tuple(f for i, f in enumerate(FIELDS) if mask & (1 << i)),
-                   ecx_argument=ecx_argument)
+                   input_argument=input_argument)
 
     @property
     def output_mask(self):
@@ -56,8 +60,8 @@ class SpecializationPlan:
     caller_requests: FrozenMap
 
     @classmethod
-    def build(cls, requests, contracts, ecx_targets=()):
-        ecx_targets = frozenset(ecx_targets)
+    def build(cls, requests, contracts, input_arguments=()):
+        input_arguments = dict(input_arguments)
         masks, flagless, users = {}, {}, {}
         flags = output_mask(ARITH_FLAGS)
         for wanted in requests.values():
@@ -70,12 +74,12 @@ class SpecializationPlan:
             for target in flagless_targets:
                 users[target] = users.get(target, 0) + 1
         layouts = {addr: (PrivateLayout.from_mask(mask, contracts[addr].reads | frozenset(("ESP", "EBP")),
-                                                addr in ecx_targets),)
+                                                input_arguments.get(addr)),)
                    for addr, mask in masks.items()}
         for addr, mask in flagless.items():
             if users[addr] >= 16 and masks[addr] & flags:
                 layouts[addr] += (PrivateLayout.from_mask(mask, layouts[addr][0].inputs,
-                                                          addr in ecx_targets),)
+                                                          input_arguments.get(addr)),)
         callers = {addr: frozenset((target, select_layout(layouts, target, mask).output_mask)
                                   for target, mask in wanted)
                    for addr, wanted in requests.items() if wanted}
@@ -86,6 +90,43 @@ class SpecializationPlan:
         return {addr: {layout.output_mask for layout in variants}
                 for addr, variants in self.layouts.items()}
 
+
+def select_input_arguments(contracts, register_uses, input_sites, instruction_counts):
+    sites = [site for rows in input_sites.values() for site in rows]
+    chosen, report = {}, {}
+    for target, contract in sorted(contracts.items()):
+        uses = register_uses.get(target, {})
+        rows = [site for site in sites if site[0] == target]
+        evidence = {}
+        if instruction_counts.get(target, 0) > 64:
+            report["%08x" % target] = {"excluded": "body exceeds 64 instructions",
+                                       "instructions": instruction_counts[target]}
+            continue
+        ranked = []
+        for order, field in enumerate(INPUT_ARGUMENT_REGISTERS):
+            if field not in contract.reads or field not in uses:
+                continue
+            input_sites_count = sum(field in site[1] for site in rows)
+            stores = sum(field in site[2] for site in rows)
+            preserved = sum(field in site[3] for site in rows)
+            instructions = tuple(uses[field])
+            score = (stores, preserved, input_sites_count, len(instructions),
+                     -min(instructions), -order)
+            evidence[field] = {"input_sites": input_sites_count, "saved_stores": stores,
+                               "preserved_continuations": preserved,
+                               "substantive_reads": len(instructions),
+                               "first_read_index": min(instructions)}
+            if input_sites_count:
+                ranked.append((score, field))
+        if ranked:
+            score, field = max(ranked)
+            chosen[target] = field
+            evidence["selected"] = field
+            evidence["score"] = list(score)
+        else:
+            evidence["excluded"] = "no substantive register input at private call sites"
+        report["%08x" % target] = evidence
+    return chosen, report
 
 def select_layout(layouts, target, mask):
     variants = layouts[target]

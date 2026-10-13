@@ -40,6 +40,7 @@ class Selection:
     callers: frozenset
     known_modes: frozenset
     rejections: FrozenMap
+    input_arguments: FrozenMap = FrozenMap()
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,7 @@ class FunctionPlan:
     path: Path | None
     reason: str | None
     requests: frozenset
+    input_sites: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -81,6 +83,7 @@ class CandidateTask:
     addr: int
     helpers: frozenset
     known_mode: bool
+    input_argument_heuristic: bool = False
 
 
 @dataclass(frozen=True)
@@ -88,6 +91,7 @@ class CandidateResult:
     addr: int
     contract: object | None
     reason: str | None
+    register_uses: FrozenMap = FrozenMap()
 
 
 @dataclass(frozen=True)

@@ -112,9 +112,9 @@ def publication_roots(s, state, required, groups, flags=None):
 
 def build(s, groups, facts, contracts, kept, lane_field, never_skip,
           private, return_fields, flag_keys, first_keys, defines, bits, lazy_flags, eager_events,
-          explicit_ecx_input=False, ecx_call_targets=()):
-    ecx_keys = tuple(key for key, field in lane_field.items() if field == "ECX") if explicit_ecx_input else ()
-    call_ecx_keys = tuple(key for key, field in lane_field.items() if field == "ECX") if ecx_call_targets else ()
+          explicit_input_argument=None, call_input_arguments=()):
+    input_keys = tuple(key for key, field in lane_field.items() if field == explicit_input_argument)
+    call_input_arguments = dict(call_input_arguments)
     publications = {key: Publication(tuple(value)) for key, value in facts.required.items()}
     returns = {}
     if return_fields is not None:
@@ -127,13 +127,13 @@ def build(s, groups, facts, contracts, kept, lane_field, never_skip,
                                  if any(s.resolve(b.exit[key]) is not s.resolve(s.inputs[key])
                                         for key in group if key in b.exit)
                                  for key in group if key in b.exit)
-                if explicit_ecx_input:
-                    fallback = tuple(dict.fromkeys((*fallback, *ecx_keys)))
+                if explicit_input_argument:
+                    fallback = tuple(dict.fromkeys((*fallback, *input_keys)))
                 publication = publications[v.id]
                 publication.required = tuple(key for key in publication.required
                                              if key not in lane_field or lane_field[key] in required)
-                if explicit_ecx_input and "ECX" in required:
-                    publication.required = tuple(dict.fromkeys((*publication.required, *ecx_keys)))
+                if explicit_input_argument and explicit_input_argument in required:
+                    publication.required = tuple(dict.fromkeys((*publication.required, *input_keys)))
                 returns[v.id] = ReturnPlan(publication, Publication(fallback))
     call_plans = calls(s, {key: value.required for key, value in publications.items()},
                        facts.known_before, contracts, kept, lane_field, never_skip, private, flag_keys)
@@ -143,8 +143,10 @@ def build(s, groups, facts, contracts, kept, lane_field, never_skip,
             if v.opc == "CALL":
                 call = call_plans[v.id]
                 publications[v.id] = call.publication
-                if v.data in private and v.data in ecx_call_targets:
-                    roots.extend(state_roots(s, b.snapshots[v.id], call_ecx_keys, groups))
+                input_argument = call_input_arguments.get(v.data)
+                if v.data in private and input_argument:
+                    keys = tuple(key for key, field in lane_field.items() if field == input_argument)
+                    roots.extend(state_roots(s, b.snapshots[v.id], keys, groups))
                 if v.data not in private:
                     roots.extend(state_roots(s, b.snapshots[v.id], call.guard, groups))
             if v.opc not in OBSERVES:

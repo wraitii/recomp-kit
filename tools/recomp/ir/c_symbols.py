@@ -9,24 +9,24 @@ class Declaration:
     kind: str
     target: int
     mask: int = 0
-    ecx_argument: bool = False
+    input_argument: str | None = None
 
 
 def invocation_declarations(invocation):
     if invocation.form == "private":
         return frozenset({Declaration("private_prepare", invocation.target),
                           Declaration("private_contract", invocation.target, invocation.output_mask,
-                                      invocation.ecx_argument)}) | invocation_declarations(invocation.fallback)
+                                      invocation.input_argument)}) | invocation_declarations(invocation.fallback)
     if invocation.symbol is not None:
         return frozenset()
     return frozenset({Declaration("checked" if invocation.form == "checked" else "entry", invocation.target)})
 
 
-def render_invocation(invocation, ecx_argument=None):
+def render_invocation(invocation, input_value=None):
     if invocation.symbol is not None:
         return "%s(%s)" % (invocation.symbol, entry_arguments(invocation.variant, invocation.expected))
     if invocation.form == "private":
-        arguments = "c, %s, 0x%xu" % (ecx_argument, invocation.expected) if invocation.ecx_argument else "c, 0x%xu" % invocation.expected
+        arguments = "c, %s, 0x%xu" % (input_value, invocation.expected) if invocation.input_argument else "c, 0x%xu" % invocation.expected
         return "%s(%s)" % (symbol("entry_contract", invocation.target, invocation.output_mask),
                            arguments)
     if invocation.form == "checked":
@@ -52,13 +52,15 @@ def signature(variant, name, layout=None):
                   EntryForm.MULTIPLE: "X86 *c, uint32_t entry_",
                   EntryForm.CHECKED: "X86 *c, uint32_t expected_return_, int checked_return_",
                   EntryForm.PRIVATE: "X86 *c, %suint32_t expected_return_" %
-                                     ("uint32_t ecx_, " if layout is not None and layout.ecx_argument else "")}[variant.entry]
+                                     ("uint32_t %s_, " % layout.input_argument.lower()
+                                      if layout is not None and layout.input_argument else "")}[variant.entry]
     storage = "" if variant.entry == EntryForm.ORDINARY else "static "
     return "%svoid %s(%s) {" % (storage, name, parameters)
 
 
-def entry_signature(variant, name, ecx_argument=False):
-    parameters = ("X86 *c, %suint32_t expected" % ("uint32_t ecx_, " if ecx_argument else "")
+def entry_signature(variant, name, input_argument=False):
+    parameters = ("X86 *c, %suint32_t expected" % ("uint32_t %s_, " % input_argument.lower()
+                                                     if input_argument else "")
                   if variant.checked else "X86 *c")
     return "void %s(%s)" % (name, parameters)
 
@@ -75,7 +77,7 @@ def declaration(record):
     if record.kind == "private_contract":
         variant = BodyVariant(EntryForm.PRIVATE, ReturnForm.PRIVATE)
         name = symbol("entry_contract", record.target, record.mask)
-        return entry_signature(variant, name, record.ecx_argument) + ";"
+        return entry_signature(variant, name, record.input_argument) + ";"
     elif record.kind == "checked":
         variant = BodyVariant(EntryForm.CHECKED, ReturnForm.CHECKED)
         name = symbol("entry_checked", record.target)

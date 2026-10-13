@@ -62,8 +62,8 @@ class Printer:
             lines.extend(["c->cc_op = X86_CC_NONE;"] * operation.clear_flags)
             return lines
         if isinstance(operation, Invoke):
-            ecx = self.value(operation.ecx_argument) if operation.ecx_argument is not None else None
-            return ["%s;" % c_symbols.render_invocation(operation.invocation, ecx)]
+            input_value = self.value(operation.input_value) if operation.input_value is not None else None
+            return ["%s;" % c_symbols.render_invocation(operation.invocation, input_value)]
         if isinstance(operation, IndirectInvoke):
             return ["%s(c, (uint32_t)%s);" % (operation.helper, self.ref(operation.target))]
         if isinstance(operation, SettleFlags):

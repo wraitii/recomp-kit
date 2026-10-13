@@ -223,9 +223,9 @@ def emit_prepared(prepared, external_entry=False):
         if v.opc != "INPUT" or not v.size or v.id not in live or s.resolve(v) is not v:
             continue
         field, lane = mapping[v.data]
-        if (field == c_symbols.cpu_field("ECX") and options.request.layout is not None
-                and options.request.layout.ecx_argument):
-            field = "ecx_"
+        if (options.request.layout is not None and options.request.layout.input_argument
+                and field == c_symbols.cpu_field(options.request.layout.input_argument)):
+            field = options.request.layout.input_argument.lower() + "_"
         lines.append(assignment(v, "%s >> %d" % (field, lane * 8)))
     for v in s.entry_ops:
         if v.id in live and s.resolve(v) is v:

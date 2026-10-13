@@ -39,7 +39,7 @@ class Publish:
 @dataclass(frozen=True)
 class Invoke:
     invocation: Invocation
-    ecx_argument: object | None = None
+    input_value: object | None = None
 
 
 @dataclass(frozen=True)
@@ -143,9 +143,10 @@ def plan(prepared, invocations):
                 call = prepared.transfers.calls.get(event.id)
                 publication = prepared.transfers.publications[event.id]
                 invocation = invocations.get(event.id)
-                if invocation is not None and invocation.form == "private" and invocation.ecx_argument:
-                    ecx_keys = set(dict(groups)["ECX"])
-                    publication = Publication(tuple(key for key in publication.required if key not in ecx_keys),
+                if invocation is not None and invocation.form == "private" and invocation.input_argument:
+                    input_keys = {key for key in dict(groups)[invocation.input_argument]
+                                  if key in block.snapshots[event.id] and block.snapshots[event.id][key] is not None}
+                    publication = Publication(tuple(key for key in publication.required if key not in input_keys),
                                               publication.flags)
                 clear = lazy and call is not None and bool(call.skipped & flag_fields) and publication.flags is None
                 publications[event.id] = publish(snapshot, publication, clear=clear)
@@ -155,10 +156,11 @@ def plan(prepared, invocations):
                 primary = (publication,)
                 if invocation.form == "private":
                     fallback = publish(block.snapshots[event.id], call.fallback)
-                    ecx = (field_value(s, "ECX", dict(groups)["ECX"], block.snapshots[event.id])
-                           if invocation.ecx_argument else None)
+                    input_value = (field_value(s, invocation.input_argument, dict(groups)[invocation.input_argument],
+                                               block.snapshots[event.id])
+                                   if invocation.input_argument else None)
                     body = (Guard("eligible", invocation.preparation,
-                                  (*primary, Invoke(invocation, ecx)),
+                                  (*primary, Invoke(invocation, input_value)),
                                   (fallback, Invoke(invocation.fallback))),)
                 else:
                     if call.guard:
