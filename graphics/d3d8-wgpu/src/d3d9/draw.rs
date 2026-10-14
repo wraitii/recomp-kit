@@ -5,6 +5,8 @@ use super::{SurfaceView, TargetRect, wgsl};
 use crate::RenderError;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::Arc;
 
 pub const D3DPT_POINTLIST: u32 = 1;
 pub const D3DPT_LINELIST: u32 = 2;
@@ -299,14 +301,85 @@ fn indexed_vertex_index(bytes: &[u8], index_format: u32, index: usize) -> u32 {
     }
 }
 
+#[derive(Default)]
+struct FastU32Hasher(u64);
+
+impl FastU32Hasher {
+    fn mix(&mut self, value: u64) {
+        self.0 = value
+            .wrapping_add(0x9e37_79b9_7f4a_7c15)
+            .wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        self.0 ^= self.0 >> 30;
+        self.0 = self.0.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        self.0 ^= self.0 >> 27;
+        self.0 = self.0.wrapping_mul(0x94d0_49bb_1331_11eb);
+        self.0 ^= self.0 >> 31;
+    }
+}
+
+impl Hasher for FastU32Hasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut value = [0; 8];
+            value[..chunk.len()].copy_from_slice(chunk);
+            self.mix(u64::from_ne_bytes(value));
+        }
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.mix(u64::from(value));
+    }
+}
+
+type FastIndexMap = HashMap<u32, u32, BuildHasherDefault<FastU32Hasher>>;
+
 fn expanded_indices(
     command: &DrawCommand,
-) -> Result<(Vec<u32>, u32, wgpu::PrimitiveTopology), RenderError> {
+    dense_remap: &mut Vec<u32>,
+) -> Result<(Vec<u32>, Option<Vec<u32>>, u32, wgpu::PrimitiveTopology), RenderError> {
     let count = primitive_vertex_count(command.primitive, command.primitive_count)?;
+    let packed_indices = command.indexed && command.primitive == D3DPT_TRIANGLELIST;
+    let unique_capacity = if packed_indices {
+        count.min(command.num_vertices) as usize
+    } else {
+        count as usize
+    };
     let mut order = Vec::new();
     order
-        .try_reserve_exact(count as usize)
+        .try_reserve_exact(unique_capacity)
         .map_err(|_| RenderError::out_of_memory("Draw", "index expansion allocation failed"))?;
+    let dense_range = command.num_vertices as usize;
+    let use_dense_remap = packed_indices
+        && dense_range <= 1_048_576
+        && dense_range <= (count as usize).saturating_mul(8).max(4096);
+    if use_dense_remap {
+        dense_remap
+            .try_reserve(dense_range.saturating_sub(dense_remap.len()))
+            .map_err(|_| {
+                RenderError::out_of_memory("Draw", "dense index remap allocation failed")
+            })?;
+        dense_remap.resize(dense_range, u32::MAX);
+        dense_remap.fill(u32::MAX);
+    }
+    let mut slots = FastIndexMap::default();
+    let mut draw_indices = if packed_indices {
+        if !use_dense_remap {
+            slots.try_reserve(unique_capacity).map_err(|_| {
+                RenderError::out_of_memory("Draw", "vertex index map allocation failed")
+            })?;
+        }
+        let mut indices = Vec::new();
+        indices
+            .try_reserve_exact(count as usize)
+            .map_err(|_| RenderError::out_of_memory("Draw", "draw index allocation failed"))?;
+        Some(indices)
+    } else {
+        None
+    };
     if command.indexed {
         if !matches!(command.index_format, 101 | 102) {
             return Err(invalid("Draw", "invalid index format"));
@@ -333,7 +406,31 @@ fn expanded_indices(
                     "index plus base vertex is outside the vertex window",
                 ));
             }
-            order.push(absolute as u32);
+            let absolute = absolute as u32;
+            if let Some(indices) = &mut draw_indices {
+                let slot = if use_dense_remap {
+                    let slot = &mut dense_remap[(raw as u32 - command.min_vertex) as usize];
+                    if *slot == u32::MAX {
+                        *slot = u32::try_from(order.len())
+                            .map_err(|_| invalid("Draw", "packed vertex count exceeds 32 bits"))?;
+                        order.push(absolute);
+                    }
+                    *slot
+                } else {
+                    if let Some(&slot) = slots.get(&absolute) {
+                        slot
+                    } else {
+                        let slot = u32::try_from(order.len())
+                            .map_err(|_| invalid("Draw", "packed vertex count exceeds 32 bits"))?;
+                        order.push(absolute);
+                        slots.insert(absolute, slot);
+                        slot
+                    }
+                };
+                indices.push(slot);
+            } else {
+                order.push(absolute);
+            }
         }
     } else {
         let start = command.start_vertex;
@@ -368,7 +465,31 @@ fn expanded_indices(
         }
         _ => return Err(invalid("Draw", "unknown D3DPRIMITIVETYPE")),
     };
-    Ok((order, count, topology))
+    Ok((order, draw_indices, count, topology))
+}
+
+fn append_f32_le(out: &mut Vec<u8>, values: &[f32]) {
+    if cfg!(target_endian = "little") {
+        out.extend_from_slice(bytemuck::cast_slice(values));
+    } else {
+        let start = out.len();
+        out.resize(start + values.len() * 4, 0);
+        for (destination, value) in out[start..].chunks_exact_mut(4).zip(values) {
+            destination.copy_from_slice(&value.to_le_bytes());
+        }
+    }
+}
+
+fn append_u32_le(out: &mut Vec<u8>, values: &[u32]) {
+    if cfg!(target_endian = "little") {
+        out.extend_from_slice(bytemuck::cast_slice(values));
+    } else {
+        let start = out.len();
+        out.resize(start + values.len() * 4, 0);
+        for (destination, value) in out[start..].chunks_exact_mut(4).zip(values) {
+            destination.copy_from_slice(&value.to_le_bytes());
+        }
+    }
 }
 
 fn stream_for<'a>(command: &'a DrawCommand, stream: u32) -> Result<&'a StreamData, RenderError> {
@@ -379,65 +500,174 @@ fn stream_for<'a>(command: &'a DrawCommand, stream: u32) -> Result<&'a StreamDat
         .ok_or_else(|| unsupported("Draw", format!("vertex stream {stream} is not bound")))
 }
 
-fn fetch_element(
-    command: &DrawCommand,
-    stream: u16,
-    offset: u16,
+struct VertexFetch<'a> {
+    bytes: &'a [u8],
+    stride: usize,
+    size: usize,
     element_type: u8,
-    index: u32,
-) -> Result<[f32; 4], RenderError> {
-    let data = stream_for(command, stream as u32)?;
-    let base = (index as usize)
-        .checked_mul(data.stride as usize)
-        .and_then(|v| v.checked_add(data.offset as usize))
-        .and_then(|v| v.checked_add(offset as usize))
-        .ok_or_else(|| invalid("Draw", "vertex offset overflow"))?;
-    let size = element_size(element_type)
-        .ok_or_else(|| unsupported("Draw", "unsupported vertex element type"))?
-        as usize;
-    let end = base
-        .checked_add(size)
-        .ok_or_else(|| invalid("Draw", "vertex offset overflow"))?;
-    if end > data.bytes.len() {
-        return Err(invalid("Draw", "vertex fetch is outside the stream"));
-    }
-    expand_element(element_type, &data.bytes[base..end])
 }
 
-fn canonical_shader_vertices(
+impl<'a> VertexFetch<'a> {
+    fn prepare(
+        command: &'a DrawCommand,
+        stream: u16,
+        offset: u16,
+        element_type: u8,
+        max_index: u32,
+    ) -> Result<Self, RenderError> {
+        let data = stream_for(command, stream as u32)?;
+        let size = element_size(element_type)
+            .ok_or_else(|| unsupported("Draw", "unsupported vertex element type"))?
+            as usize;
+        let start = (data.offset as usize)
+            .checked_add(offset as usize)
+            .ok_or_else(|| invalid("Draw", "vertex offset overflow"))?;
+        let end = (max_index as usize)
+            .checked_mul(data.stride as usize)
+            .and_then(|v| v.checked_add(start))
+            .and_then(|v| v.checked_add(size))
+            .ok_or_else(|| invalid("Draw", "vertex offset overflow"))?;
+        if end > data.bytes.len() {
+            return Err(invalid("Draw", "vertex fetch is outside the stream"));
+        }
+        Ok(Self {
+            bytes: &data.bytes[start..],
+            stride: data.stride as usize,
+            size,
+            element_type,
+        })
+    }
+
+    fn bytes(&self, index: u32) -> &[u8] {
+        let base = index as usize * self.stride;
+        &self.bytes[base..base + self.size]
+    }
+
+    fn fetch(&self, index: u32) -> Result<[f32; 4], RenderError> {
+        expand_element(self.element_type, self.bytes(index))
+    }
+}
+
+fn native_vertex_format(element_type: u8) -> Option<wgpu::VertexFormat> {
+    use wgpu::VertexFormat as F;
+    Some(match element_type {
+        D3DDECLTYPE_FLOAT1 => F::Float32,
+        D3DDECLTYPE_FLOAT2 => F::Float32x2,
+        D3DDECLTYPE_FLOAT3 => F::Float32x3,
+        D3DDECLTYPE_FLOAT4 => F::Float32x4,
+        D3DDECLTYPE_D3DCOLOR => F::Unorm8x4Bgra,
+        D3DDECLTYPE_UBYTE4N => F::Unorm8x4,
+        D3DDECLTYPE_SHORT2N => F::Snorm16x2,
+        D3DDECLTYPE_SHORT4N => F::Snorm16x4,
+        D3DDECLTYPE_USHORT2N => F::Unorm16x2,
+        D3DDECLTYPE_USHORT4N => F::Unorm16x4,
+        D3DDECLTYPE_FLOAT16_2 => F::Float16x2,
+        D3DDECLTYPE_FLOAT16_4 => F::Float16x4,
+        _ => return None,
+    })
+}
+
+struct PackedVertices {
+    bytes: Vec<u8>,
+    attributes: Vec<wgpu::VertexAttribute>,
+    stride: u64,
+}
+
+fn pack_shader_vertices(
     command: &DrawCommand,
     linked: &[LinkedInput],
     order: &[u32],
-) -> Result<Vec<f32>, RenderError> {
-    let slots = linked.len();
-    let total = order
-        .len()
-        .checked_mul(slots)
-        .and_then(|v| v.checked_mul(4))
-        .ok_or_else(|| invalid("Draw", "vertex buffer size overflow"))?;
-    let mut out = Vec::new();
-    out.try_reserve_exact(total)
-        .map_err(|_| RenderError::out_of_memory("Draw", "vertex repack allocation failed"))?;
-    for &index in order {
-        for input in linked {
-            let value = fetch_element(
+) -> Result<PackedVertices, RenderError> {
+    struct Copy<'a> {
+        fetch: VertexFetch<'a>,
+        native: bool,
+        stream: u16,
+        offset: usize,
+    }
+    let mut copies: Vec<Copy<'_>> = Vec::with_capacity(linked.len());
+    let mut attributes = Vec::with_capacity(linked.len());
+    let mut stride = 0u64;
+    let max_index = order.iter().copied().max();
+    for input in linked {
+        let native = native_vertex_format(input.element_type);
+        let format = native.unwrap_or(wgpu::VertexFormat::Float32x4);
+        attributes.push(wgpu::VertexAttribute {
+            format,
+            offset: stride,
+            shader_location: input.location,
+        });
+        stride += format.size();
+        if let Some(max_index) = max_index {
+            let fetch = VertexFetch::prepare(
                 command,
                 input.stream,
                 input.offset,
                 input.element_type,
-                index,
+                max_index,
             )?;
-            out.extend_from_slice(&value);
+            if let Some(last) = copies.last_mut() {
+                if native.is_some()
+                    && last.native
+                    && last.stream == input.stream
+                    && last.offset + last.fetch.size == input.offset as usize
+                {
+                    last.fetch.size += fetch.size;
+                    continue;
+                }
+            }
+            copies.push(Copy {
+                fetch,
+                native: native.is_some(),
+                stream: input.stream,
+                offset: input.offset as usize,
+            });
         }
     }
-    Ok(out)
+    let total = order
+        .len()
+        .checked_mul(stride as usize)
+        .ok_or_else(|| invalid("Draw", "vertex buffer size overflow"))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(total)
+        .map_err(|_| RenderError::out_of_memory("Draw", "vertex repack allocation failed"))?;
+    if let [copy] = copies.as_slice() {
+        if copy.native
+            && copy.fetch.stride == copy.fetch.size
+            && order
+                .windows(2)
+                .all(|pair| u64::from(pair[0]) + 1 == u64::from(pair[1]))
+        {
+            if let Some(&first) = order.first() {
+                let start = first as usize * copy.fetch.stride;
+                bytes.extend_from_slice(&copy.fetch.bytes[start..start + total]);
+            }
+            return Ok(PackedVertices {
+                bytes,
+                attributes,
+                stride,
+            });
+        }
+    }
+    for &index in order {
+        for copy in &copies {
+            if copy.native {
+                bytes.extend_from_slice(copy.fetch.bytes(index));
+            } else {
+                append_f32_le(&mut bytes, &copy.fetch.fetch(index)?);
+            }
+        }
+    }
+    Ok(PackedVertices {
+        bytes,
+        attributes,
+        stride,
+    })
 }
 
 fn flat_to_u8(values: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(values.len() * 4);
-    for value in values {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
+    let mut out = Vec::with_capacity(values.len().saturating_mul(4));
+    append_f32_le(&mut out, values);
     out
 }
 
@@ -495,12 +725,18 @@ fn inverse3(m: &[f32; 16]) -> Result<[[f32; 3]; 3], RenderError> {
     ]
     .map(|r| r.map(|x| x / det)))
 }
+struct FfLight {
+    kind: u32,
+    values: [f32; 26],
+    direction: [f32; 4],
+    position: [f32; 4],
+}
 fn ff_colors(
     state: &D3d9State,
     p: [f32; 4],
     n: [f32; 3],
     vertex: [Option<[f32; 4]>; 2],
-    view: &[f32; 16],
+    lights: &[FfLight],
 ) -> Result<[[f32; 4]; 2], RenderError> {
     if rs(state, 137) == 0 {
         return Ok([vertex[0].unwrap_or([1.0; 4]), vertex[1].unwrap_or([0.0; 4])]);
@@ -536,22 +772,29 @@ fn ff_colors(
     } else {
         [0.0, 0.0, 1.0]
     };
-    for raw in state.enabled_lights() {
-        let light = raw.map(f32::from_bits);
-        let direction = transform_point(view, [light[16], light[17], light[18], 0.0]);
-        let (l, mut attenuation) = if raw[0] == 3 {
+    for light in lights {
+        let (l, mut attenuation) = if light.kind == 3 {
             (
-                normalize3([-direction[0], -direction[1], -direction[2]]),
+                normalize3([
+                    -light.direction[0],
+                    -light.direction[1],
+                    -light.direction[2],
+                ]),
                 1.0,
             )
         } else {
-            let lp = transform_point(view, [light[13], light[14], light[15], 1.0]);
-            let delta = [lp[0] - p[0], lp[1] - p[1], lp[2] - p[2]];
+            let delta = [
+                light.position[0] - p[0],
+                light.position[1] - p[1],
+                light.position[2] - p[2],
+            ];
             let distance = dot3(delta, delta).sqrt();
-            if distance > light[19] {
+            if distance > light.values[19] {
                 continue;
             }
-            let denominator = light[21] + light[22] * distance + light[23] * distance * distance;
+            let denominator = light.values[21]
+                + light.values[22] * distance
+                + light.values[23] * distance * distance;
             if denominator <= 0.0 {
                 return Err(unsupported(
                     "Draw",
@@ -560,16 +803,19 @@ fn ff_colors(
             }
             (normalize3(delta), 1.0 / denominator)
         };
-        if raw[0] == 2 {
-            let rho = -dot3(l, normalize3([direction[0], direction[1], direction[2]]));
-            let inner = (light[24] * 0.5).cos();
-            let outer = (light[25] * 0.5).cos();
+        if light.kind == 2 {
+            let rho = -dot3(
+                l,
+                normalize3([light.direction[0], light.direction[1], light.direction[2]]),
+            );
+            let inner = (light.values[24] * 0.5).cos();
+            let outer = (light.values[25] * 0.5).cos();
             attenuation *= if rho >= inner {
                 1.0
             } else if rho <= outer {
                 0.0
             } else {
-                ((rho - outer) / (inner - outer)).powf(light[20])
+                ((rho - outer) / (inner - outer)).powf(light.values[20])
             };
         }
         let ndotl = dot3(n, l).max(0.0);
@@ -581,9 +827,9 @@ fn ff_colors(
             0.0
         };
         for i in 0..3 {
-            result[0][i] +=
-                attenuation * (ambient[i] * light[9 + i] + diffuse[i] * light[1 + i] * ndotl);
-            result[1][i] += attenuation * specular[i] * light[5 + i] * highlight;
+            result[0][i] += attenuation
+                * (ambient[i] * light.values[9 + i] + diffuse[i] * light.values[1 + i] * ndotl);
+            result[1][i] += attenuation * specular[i] * light.values[5 + i] * highlight;
         }
     }
     result[0][3] = diffuse[3];
@@ -595,7 +841,7 @@ fn ff_vertices(
     decl: &[VertexElement],
     order: &[u32],
     state: &D3d9State,
-) -> Result<Vec<f32>, RenderError> {
+) -> Result<Vec<u8>, RenderError> {
     for id in [151, 152, 167] {
         if rs(state, id) != 0 {
             return Err(unsupported(
@@ -624,19 +870,79 @@ fn ff_vertices(
     } else {
         None
     };
+    let mut lights = Vec::new();
+    if !transformed && rs(state, 137) != 0 {
+        let raw_lights = state.enabled_lights();
+        lights
+            .try_reserve_exact(raw_lights.len())
+            .map_err(|_| RenderError::out_of_memory("Draw", "fixed-function lights"))?;
+        for raw in raw_lights {
+            let values = raw.map(f32::from_bits);
+            let direction = transform_point(&view, [values[16], values[17], values[18], 0.0]);
+            let position = if raw[0] == 3 {
+                [0.0; 4]
+            } else {
+                transform_point(&view, [values[13], values[14], values[15], 1.0])
+            };
+            lights.push(FfLight {
+                kind: raw[0],
+                values,
+                direction,
+                position,
+            });
+        }
+    }
+    let mut stage_coords = Vec::new();
+    stage_coords
+        .try_reserve_exact(8)
+        .map_err(|_| RenderError::out_of_memory("Draw", "fixed-function texture stages"))?;
+    for stage in 0..8 {
+        let coord = tss(state, stage, 11);
+        let transform = if tss(state, stage, 24) & 255 != 0 {
+            Some(state.transform(16 + stage)?)
+        } else {
+            None
+        };
+        stage_coords.push((coord, transform));
+    }
     let vp = state.viewport();
     let mut out = Vec::new();
     out.try_reserve_exact(
         order
             .len()
-            .checked_mul(48)
+            .checked_mul(192)
             .ok_or_else(|| invalid("Draw", "vertex allocation overflow"))?,
     )
     .map_err(|_| RenderError::out_of_memory("Draw", "fixed-function vertices"))?;
+    let Some(&max_index) = order.iter().max() else {
+        return Ok(out);
+    };
+    let prepare = |e: &VertexElement| {
+        VertexFetch::prepare(command, e.stream, e.offset, e.element_type, max_index)
+    };
+    let position = prepare(position)?;
+    let colors = [
+        find(10, 0).map(&prepare).transpose()?,
+        find(10, 1).map(&prepare).transpose()?,
+    ];
+    let normal = if needs_normal {
+        find(3, 0).map(&prepare).transpose()?
+    } else {
+        None
+    };
+    let texcoords = stage_coords
+        .iter()
+        .map(|&(coord, _)| {
+            if coord & 0xffff0000 == 0 {
+                find(5, (coord & 0xffff) as u8).map(&prepare).transpose()
+            } else {
+                Ok(None)
+            }
+        })
+        .collect::<Result<Vec<_>, RenderError>>()?;
     for &index in order {
-        let fetch =
-            |e: &VertexElement| fetch_element(command, e.stream, e.offset, e.element_type, index);
-        let p = fetch(position)?;
+        let fetch = |e: &VertexFetch<'_>| e.fetch(index);
+        let p = fetch(&position)?;
         let viewp = transform_point(&worldview, p);
         let clip = if transformed {
             if p[3] == 0.0 || !p[3].is_finite() {
@@ -658,11 +964,11 @@ fn ff_vertices(
             transform_point(&wvp, p)
         };
         let vertex = [
-            find(10, 0).map(&fetch).transpose()?,
-            find(10, 1).map(&fetch).transpose()?,
+            colors[0].as_ref().map(&fetch).transpose()?,
+            colors[1].as_ref().map(&fetch).transpose()?,
         ];
         let normal = if needs_normal {
-            let n = find(3, 0).map(&fetch).transpose()?.unwrap_or([0.0; 4]);
+            let n = normal.as_ref().map(&fetch).transpose()?.unwrap_or([0.0; 4]);
             let normal = if let Some(inv) = normal_matrix {
                 std::array::from_fn(|i| (0..3).map(|j| n[j] * inv[i][j]).sum())
             } else {
@@ -679,13 +985,12 @@ fn ff_vertices(
         let colors = if transformed {
             [vertex[0].unwrap_or([1.0; 4]), vertex[1].unwrap_or([0.0; 4])]
         } else {
-            ff_colors(state, viewp, normal, vertex, &view)?
+            ff_colors(state, viewp, normal, vertex, &lights)?
         };
-        out.extend_from_slice(&clip);
-        out.extend_from_slice(&colors[0]);
-        out.extend_from_slice(&colors[1]);
-        for stage in 0..8 {
-            let coord = tss(state, stage, 11);
+        append_f32_le(&mut out, &clip);
+        append_f32_le(&mut out, &colors[0]);
+        append_f32_le(&mut out, &colors[1]);
+        for (&(coord, transform), texcoord) in stage_coords.iter().zip(&texcoords) {
             if transformed && coord & 0xffff0000 != 0 {
                 return Err(unsupported(
                     "Draw",
@@ -693,7 +998,8 @@ fn ff_vertices(
                 ));
             }
             let mut uv = match coord & 0xffff0000 {
-                0 => find(5, (coord & 0xffff) as u8)
+                0 => texcoord
+                    .as_ref()
                     .map(&fetch)
                     .transpose()?
                     .unwrap_or([0.0, 0.0, 0.0, 1.0]),
@@ -716,18 +1022,17 @@ fn ff_vertices(
                     ));
                 }
             };
-            let flags = tss(state, stage, 24);
-            if flags & 255 != 0 {
-                uv = transform_point(&state.transform(16 + stage)?, uv);
+            if let Some(transform) = transform {
+                uv = transform_point(&transform, uv);
             }
-            out.extend_from_slice(&uv);
+            append_f32_le(&mut out, &uv);
         }
         let fog = if transformed {
             vertex[1].map(|v| v[3]).unwrap_or(1.0)
         } else {
             fog_factor(state, viewp[2].abs(), rs(state, 140))
         };
-        out.extend_from_slice(&[fog, viewp[2], 0.0, 0.0]);
+        append_f32_le(&mut out, &[fog, viewp[2], 0.0, 0.0]);
     }
     Ok(out)
 }
@@ -926,6 +1231,7 @@ fn ff_fragment_source(state: &D3d9State, textures: &[BoundTexture]) -> Result<St
             let mut coord = format!("vin.t{stage}");
             if flags & 256 != 0 {
                 let component = match flags & 255 {
+                    0 if state.shader(false) != 0 => "w",
                     2 => "y",
                     3 => "z",
                     4 => "w",
@@ -1175,7 +1481,7 @@ fn blend_state(state: &D3d9State, opaque: bool) -> Result<Option<wgpu::BlendStat
 fn sampler(
     state: &D3d9State,
     t: &BoundTexture,
-) -> Result<wgpu::SamplerDescriptor<'static>, RenderError> {
+) -> Result<(SamplerKey, wgpu::SamplerDescriptor<'static>), RenderError> {
     let address = |id| -> Result<wgpu::AddressMode, RenderError> {
         Ok(match ss(state, t.stage, id) {
             1 => wgpu::AddressMode::Repeat,
@@ -1210,31 +1516,49 @@ fn sampler(
             "sRGB texture sampling views are not implemented",
         ));
     }
-    Ok(wgpu::SamplerDescriptor {
-        label: Some("d3d9-sampler"),
-        address_mode_u: address(1)?,
-        address_mode_v: address(2)?,
-        address_mode_w: address(3)?,
-        mag_filter: filter(5)?,
-        min_filter: filter(6)?,
-        mipmap_filter: filter(7)?,
-        lod_min_clamp: ss(state, t.stage, 9)
-            .max(t.lod)
-            .min(t.levels.saturating_sub(1)) as f32,
-        lod_max_clamp: if ss(state, t.stage, 7) == 0 {
-            ss(state, t.stage, 9)
-                .max(t.lod)
-                .min(t.levels.saturating_sub(1)) as f32
-        } else {
-            t.levels.saturating_sub(1) as f32
+    let lod_min = ss(state, t.stage, 9)
+        .max(t.lod)
+        .min(t.levels.saturating_sub(1)) as f32;
+    let lod_max = if ss(state, t.stage, 7) == 0 {
+        lod_min
+    } else {
+        t.levels.saturating_sub(1) as f32
+    };
+    let key = SamplerKey {
+        address: [
+            ss(state, t.stage, 1),
+            ss(state, t.stage, 2),
+            ss(state, t.stage, 3),
+        ],
+        filters: [
+            ss(state, t.stage, 5),
+            ss(state, t.stage, 6),
+            ss(state, t.stage, 7),
+        ],
+        lod_min: lod_min.to_bits(),
+        lod_max: lod_max.to_bits(),
+        depth: t.depth,
+    };
+    Ok((
+        key,
+        wgpu::SamplerDescriptor {
+            label: Some("d3d9-sampler"),
+            address_mode_u: address(1)?,
+            address_mode_v: address(2)?,
+            address_mode_w: address(3)?,
+            mag_filter: filter(5)?,
+            min_filter: filter(6)?,
+            mipmap_filter: filter(7)?,
+            lod_min_clamp: lod_min,
+            lod_max_clamp: lod_max,
+            compare: if t.depth {
+                Some(wgpu::CompareFunction::LessEqual)
+            } else {
+                None
+            },
+            ..Default::default()
         },
-        compare: if t.depth {
-            Some(wgpu::CompareFunction::LessEqual)
-        } else {
-            None
-        },
-        ..Default::default()
-    })
+    ))
 }
 fn make_buffer(
     gpu: &D3d9Gpu,
@@ -1255,28 +1579,168 @@ struct PipelineKey {
     modules: [wgpu::ShaderModule; 2],
     layout: wgpu::BindGroupLayout,
     attributes: Vec<wgpu::VertexAttribute>,
+    vertex_stride: u64,
     target: wgpu::ColorTargetState,
     primitive: wgpu::PrimitiveState,
     depth: Option<wgpu::DepthStencilState>,
     multisample: wgpu::MultisampleState,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ShaderVariantKey {
+    pixel: bool,
+    shader: u32,
+    state: Vec<u32>,
+}
+
+#[derive(Clone)]
+struct CachedShaderSource {
+    source: String,
+    texture_stages: Vec<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SamplerKey {
+    address: [u32; 3],
+    filters: [u32; 3],
+    lod_min: u32,
+    lod_max: u32,
+    depth: bool,
+}
+
+struct PendingTexture {
+    stage: u32,
+    view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct BindGroupKey {
+    layout: wgpu::BindGroupLayout,
+    uniform_sizes: [u64; 4],
+    textures: Vec<(u32, wgpu::TextureView, wgpu::Sampler)>,
+}
+
+struct PendingDraw {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    uniform_offsets: [u32; 4],
+    uniform_sizes: [u64; 4],
+    textures: Vec<PendingTexture>,
+    vertex_offset: u64,
+    vertex_size: u64,
+    has_attributes: bool,
+    index_range: Option<(u64, u64, wgpu::IndexFormat)>,
+    vertex_count: u32,
+    viewport: super::state::Viewport,
+    stencil_reference: u32,
+    blend_constant: [f32; 4],
+    scissor: Option<[u32; 4]>,
+}
+
+#[derive(Default)]
+struct DrawBatch {
+    draws: Vec<PendingDraw>,
+    data: Vec<u8>,
+    color_view: Option<wgpu::TextureView>,
+    depth: Option<(wgpu::TextureView, bool)>,
+    width: u32,
+    height: u32,
+    last_uniform: Option<([u32; 4], [u64; 4])>,
+}
+
 #[derive(Default)]
 pub(crate) struct D3d9DrawState {
     shaders: HashMap<String, wgpu::ShaderModule>,
+    shader_variants: HashMap<ShaderVariantKey, Arc<CachedShaderSource>>,
+    variant_shaders: HashMap<ShaderVariantKey, wgpu::ShaderModule>,
+    samplers: HashMap<SamplerKey, wgpu::Sampler>,
     layouts: HashMap<Vec<wgpu::BindGroupLayoutEntry>, wgpu::BindGroupLayout>,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
+    batch: DrawBatch,
+    index_remap: Vec<u32>,
+    upload: Option<wgpu::Buffer>,
+    bind_groups: HashMap<BindGroupKey, wgpu::BindGroup>,
 }
 impl D3d9DrawState {
     pub fn clear(&mut self) {
         self.pipelines.clear();
         self.layouts.clear();
         self.shaders.clear();
+        self.shader_variants.clear();
+        self.variant_shaders.clear();
+        self.samplers.clear();
+        self.bind_groups.clear();
+    }
+
+    pub(crate) fn discard_batch(&mut self) {
+        self.batch = DrawBatch::default();
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.clear();
+        self.discard_batch();
+        self.upload = None;
+        self.bind_groups.clear();
     }
     pub fn drop_resource(&mut self, _id: u32) {}
 
-    fn shader(&mut self, gpu: &D3d9Gpu, source: String) -> Result<wgpu::ShaderModule, RenderError> {
-        if let Some(shader) = self.shaders.get(&source) {
+    fn source(
+        &mut self,
+        key: ShaderVariantKey,
+        generate: impl FnOnce() -> Result<String, RenderError>,
+    ) -> Result<Arc<CachedShaderSource>, RenderError> {
+        if let Some(source) = self.shader_variants.get(&key) {
+            return Ok(Arc::clone(source));
+        }
+        let source = generate()?;
+        let texture_stages = (0..16)
+            .filter(|stage| source.contains(&format!("var tx{stage}:")))
+            .collect();
+        let cached = Arc::new(CachedShaderSource {
+            source,
+            texture_stages,
+        });
+        if self.shader_variants.len() >= 512 {
+            self.clear();
+        }
+        self.shader_variants.insert(key, Arc::clone(&cached));
+        Ok(cached)
+    }
+
+    fn sampler(
+        &mut self,
+        gpu: &D3d9Gpu,
+        key: SamplerKey,
+        descriptor: wgpu::SamplerDescriptor<'static>,
+    ) -> wgpu::Sampler {
+        if let Some(sampler) = self.samplers.get(&key) {
+            return sampler.clone();
+        }
+        let sampler = gpu.device.create_sampler(&descriptor);
+        if self.samplers.len() >= 128 {
+            self.samplers.clear();
+        }
+        self.samplers.insert(key, sampler.clone());
+        sampler
+    }
+
+    fn variant_shader(
+        &mut self,
+        gpu: &D3d9Gpu,
+        key: ShaderVariantKey,
+        source: &str,
+    ) -> Result<wgpu::ShaderModule, RenderError> {
+        if let Some(shader) = self.variant_shaders.get(&key) {
+            return Ok(shader.clone());
+        }
+        let shader = self.shader(gpu, source)?;
+        self.variant_shaders.insert(key, shader.clone());
+        Ok(shader)
+    }
+
+    fn shader(&mut self, gpu: &D3d9Gpu, source: &str) -> Result<wgpu::ShaderModule, RenderError> {
+        if let Some(shader) = self.shaders.get(source) {
             return Ok(shader.clone());
         }
         wgsl::validate(&source)?;
@@ -1289,7 +1753,7 @@ impl D3d9DrawState {
         if self.shaders.len() >= 512 {
             self.clear();
         }
-        self.shaders.insert(source, shader.clone());
+        self.shaders.insert(source.to_owned(), shader.clone());
         Ok(shader)
     }
 
@@ -1327,7 +1791,7 @@ impl D3d9DrawState {
                 push_constant_ranges: &[],
             });
         let vertex_layout = wgpu::VertexBufferLayout {
-            array_stride: (key.attributes.len() * 16) as u64,
+            array_stride: key.vertex_stride,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &key.attributes,
         };
@@ -1433,7 +1897,11 @@ fn translated_source(
             }
             variant.depth |= 1 << t.stage;
         }
-        if program.pixel && program.major == 1 && t.stage < 8 && tss(state, t.stage, 24) & 256 != 0
+        if program.pixel
+            && program.major == 1
+            && program.minor <= 3
+            && t.stage < 8
+            && tss(state, t.stage, 24) & 256 != 0
         {
             variant.projected |= 1 << t.stage;
         }
@@ -1454,6 +1922,97 @@ fn translated_source(
     }
     Ok(source)
 }
+fn translated_key(
+    shader: u32,
+    program: &wgsl::Program,
+    state: &D3d9State,
+    textures: &[BoundTexture],
+) -> Result<ShaderVariantKey, RenderError> {
+    let mut variant = wgsl::Variant::default();
+    for stage in 0..16 {
+        if state.texture(stage)? == 0 {
+            variant.unbound |= 1 << stage;
+        }
+    }
+    let mut opaque = 0u32;
+    for t in textures {
+        if t.cube {
+            variant.cube |= 1 << t.stage;
+        }
+        if t.volume {
+            variant.volume |= 1 << t.stage;
+        }
+        if t.depth {
+            if t.cube || t.volume {
+                return Err(unsupported("Draw", "cube/volume depth sampling"));
+            }
+            variant.depth |= 1 << t.stage;
+        }
+        if opaque_format(t.format) {
+            opaque |= 1 << t.stage;
+        }
+        if program.pixel
+            && program.major == 1
+            && program.minor <= 3
+            && t.stage < 8
+            && tss(state, t.stage, 24) & 256 != 0
+        {
+            variant.projected |= 1 << t.stage;
+        }
+        if let Some(kind) = program.samplers.get(&t.stage) {
+            if (*kind == 3) != t.cube || (*kind == 4) != t.volume {
+                return Err(invalid(
+                    "Draw",
+                    format!("sampler {} texture dimension mismatch", t.stage),
+                ));
+            }
+        }
+    }
+    Ok(ShaderVariantKey {
+        pixel: program.pixel,
+        shader,
+        state: vec![
+            u32::from(variant.unbound),
+            u32::from(variant.cube),
+            u32::from(variant.volume),
+            u32::from(variant.depth),
+            u32::from(variant.projected),
+            opaque,
+            rs(state, 9),
+        ],
+    })
+}
+
+fn fixed_function_key(
+    pixel: bool,
+    state: &D3d9State,
+    textures: &[BoundTexture],
+) -> ShaderVariantKey {
+    let mut values = vec![rs(state, 9), rs(state, 29), rs(state, 60)];
+    if pixel {
+        values.push(u32::from(state.shader(false) != 0));
+        for stage in 0..8 {
+            for id in [1, 2, 3, 4, 5, 6, 24, 26, 27, 28, 32] {
+                values.push(tss(state, stage, id));
+            }
+        }
+        for texture in textures {
+            values.extend_from_slice(&[
+                texture.stage,
+                texture.format,
+                texture.depth as u32,
+                texture.cube as u32,
+                texture.volume as u32,
+            ]);
+        }
+    }
+    ShaderVariantKey {
+        pixel,
+        shader: 0,
+        state: values,
+    }
+}
+
 fn shading_source(mut source: String, state: &D3d9State) -> String {
     if rs(state, 9) == 1 {
         for (location, name) in [(0, "d0"), (1, "d1")] {
@@ -1466,6 +2025,23 @@ fn shading_source(mut source: String, state: &D3d9State) -> String {
     source
 }
 fn uniform_entry(
+    binding: u32,
+    size: u64,
+    visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: true,
+            min_binding_size: wgpu::BufferSize::new(size),
+        },
+        count: None,
+    }
+}
+
+fn static_uniform_entry(
     binding: u32,
     size: u64,
     visibility: wgpu::ShaderStages,
@@ -1492,7 +2068,8 @@ pub(crate) fn execute(
     if snapshot.command.primitive_count == 0 {
         return Ok(());
     }
-    let (order, _, topology) = expanded_indices(&snapshot.command)?;
+    let (order, draw_indices, _, topology) =
+        expanded_indices(&snapshot.command, &mut draw.index_remap)?;
     if !matches!(rs(state, 9), 1 | 2) {
         return Err(unsupported(
             "Draw",
@@ -1545,9 +2122,19 @@ pub(crate) fn execute(
         .map(|v| link_inputs(declaration, &v.program))
         .transpose()?;
     let vertices = if let Some(linked) = &linked {
-        canonical_shader_vertices(&snapshot.command, linked, &order)?
+        pack_shader_vertices(&snapshot.command, linked, &order)?
     } else {
-        ff_vertices(&snapshot.command, declaration, &order, state)?
+        PackedVertices {
+            bytes: ff_vertices(&snapshot.command, declaration, &order, state)?,
+            attributes: (0..12)
+                .map(|i| wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: u64::from(i) * 16,
+                    shader_location: i,
+                })
+                .collect(),
+            stride: 192,
+        }
     };
     if super::trace_enabled() {
         static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1607,28 +2194,66 @@ pub(crate) fn execute(
                     tss(state, texture.stage, 6)
                 );
             }
-            let stride = linked.as_ref().map_or(48, |inputs| inputs.len() * 4);
-            for vertex in vertices.chunks(stride.max(1)).take(6) {
-                eprintln!("[d3d9-trace] vertex={vertex:?}");
+            eprintln!(
+                "[d3d9-trace] vertex_stride={} packed_bytes={}",
+                vertices.stride,
+                vertices.bytes.len()
+            );
+            for vertex in vertices
+                .bytes
+                .chunks((vertices.stride as usize).max(1))
+                .take(6)
+            {
+                let values = if let Some(linked) = &linked {
+                    linked
+                        .iter()
+                        .zip(&vertices.attributes)
+                        .map(|(input, attribute)| {
+                            let element_type = if native_vertex_format(input.element_type).is_some()
+                            {
+                                input.element_type
+                            } else {
+                                D3DDECLTYPE_FLOAT4
+                            };
+                            expand_element(element_type, &vertex[attribute.offset as usize..])
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                } else {
+                    vertex
+                        .chunks_exact(16)
+                        .map(|bytes| expand_element(D3DDECLTYPE_FLOAT4, bytes))
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                eprintln!("[d3d9-trace] vertex={values:?}");
             }
         }
     }
-    let vertex_source = shading_source(
-        if let Some(v) = vs {
+    let vertex_key = if let Some(v) = vs {
+        translated_key(state.shader(false), &v.program, state, &snapshot.textures)?
+    } else {
+        fixed_function_key(false, state, &snapshot.textures)
+    };
+    let vertex_source = draw.source(vertex_key.clone(), || {
+        let source = if let Some(v) = vs {
             translated_source(&v.program, state, &snapshot.textures)?
         } else {
             ff_vertex_source()
-        },
-        state,
-    );
-    let pixel_source = shading_source(
-        if let Some(p) = ps {
+        };
+        Ok(shading_source(source, state))
+    })?;
+    let pixel_key = if let Some(p) = ps {
+        translated_key(state.shader(true), &p.program, state, &snapshot.textures)?
+    } else {
+        fixed_function_key(true, state, &snapshot.textures)
+    };
+    let pixel_source = draw.source(pixel_key.clone(), || {
+        let source = if let Some(p) = ps {
             translated_source(&p.program, state, &snapshot.textures)?
         } else {
             ff_fragment_source(state, &snapshot.textures)?
-        },
-        state,
-    );
+        };
+        Ok(shading_source(source, state))
+    })?;
     if vs.is_some() && rs(state, 28) != 0 && rs(state, 35) != 0 {
         return Err(unsupported(
             "Draw",
@@ -1649,10 +2274,8 @@ pub(crate) fn execute(
             "point size/sprite/scaling state is not implemented",
         ));
     }
-    for stage in 0..16 {
-        if pixel_source.contains(&format!("var tx{stage}:"))
-            && !snapshot.textures.iter().any(|t| t.stage == stage)
-        {
+    for &stage in &pixel_source.texture_stages {
+        if !snapshot.textures.iter().any(|t| t.stage == stage) {
             return Err(unsupported(
                 "Draw",
                 format!("shader samples unbound texture stage {stage}"),
@@ -1662,12 +2285,13 @@ pub(crate) fn execute(
     let textures: Vec<&BoundTexture> = snapshot
         .textures
         .iter()
-        .filter(|t| pixel_source.contains(&format!("var tx{}:", t.stage)))
+        .filter(|t| pixel_source.texture_stages.contains(&t.stage))
         .collect();
-    let samplers: Vec<wgpu::Sampler> = textures
-        .iter()
-        .map(|t| sampler(state, t).map(|d| gpu.device.create_sampler(&d)))
-        .collect::<Result<_, _>>()?;
+    let mut samplers = Vec::with_capacity(textures.len());
+    for texture in &textures {
+        let (key, descriptor) = sampler(state, texture)?;
+        samplers.push(draw.sampler(gpu, key, descriptor));
+    }
     let vs_count = vs.map(|v| v.program.const_limit()).unwrap_or(1);
     let ps_count = ps.map(|p| p.program.const_limit()).unwrap_or(1);
     let mut layout_entries = vec![
@@ -1736,74 +2360,11 @@ pub(crate) fn execute(
         psp.extend_from_slice(&rs(state, id).to_le_bytes());
     }
     psp.extend_from_slice(&(if rs(state, 194) != 0 { 1.0f32 } else { 0.0f32 }).to_le_bytes());
-    let buffers = [
-        make_buffer(
-            gpu,
-            "d3d9-vs-constants",
-            &flat_to_u8(&state.constants_f(false, 0, vs_count)?),
-            wgpu::BufferUsages::UNIFORM,
-        ),
-        make_buffer(
-            gpu,
-            "d3d9-vsp",
-            &flat_to_u8(&vsp),
-            wgpu::BufferUsages::UNIFORM,
-        ),
-        make_buffer(
-            gpu,
-            "d3d9-ps-constants",
-            &flat_to_u8(&state.constants_f(true, 0, ps_count)?),
-            wgpu::BufferUsages::UNIFORM,
-        ),
-        make_buffer(gpu, "d3d9-psp", &psp, wgpu::BufferUsages::UNIFORM),
-    ];
-    let mut entries: Vec<_> = buffers
-        .iter()
-        .enumerate()
-        .map(|(i, b)| wgpu::BindGroupEntry {
-            binding: i as u32,
-            resource: b.as_entire_binding(),
-        })
-        .collect();
-    for (t, s) in textures.iter().zip(&samplers) {
-        entries.push(wgpu::BindGroupEntry {
-            binding: 4 + t.stage,
-            resource: wgpu::BindingResource::TextureView(&t.view),
-        });
-        entries.push(wgpu::BindGroupEntry {
-            binding: 20 + t.stage,
-            resource: wgpu::BindingResource::Sampler(s),
-        });
-    }
-    let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("d3d9-draw"),
-        layout: &layout,
-        entries: &entries,
-    });
     let modules = [
-        draw.shader(gpu, vertex_source)?,
-        draw.shader(gpu, pixel_source)?,
+        draw.variant_shader(gpu, vertex_key, &vertex_source.source)?,
+        draw.variant_shader(gpu, pixel_key, &pixel_source.source)?,
     ];
-    let attributes: Vec<_> = if let Some(linked) = &linked {
-        linked
-            .iter()
-            .enumerate()
-            .map(|(i, l)| wgpu::VertexAttribute {
-                format: wgpu::VertexFormat::Float32x4,
-                offset: (i * 16) as u64,
-                shader_location: l.location,
-            })
-            .collect()
-    } else {
-        (0..12)
-            .map(|i| wgpu::VertexAttribute {
-                format: wgpu::VertexFormat::Float32x4,
-                offset: u64::from(i) * 16,
-                shader_location: i,
-            })
-            .collect()
-    };
-    let has_attributes = !attributes.is_empty();
+    let has_attributes = !vertices.attributes.is_empty();
     let cull = match rs(state, 22) {
         1 => None,
         2 => Some(wgpu::Face::Front),
@@ -1818,8 +2379,9 @@ pub(crate) fn execute(
         gpu,
         PipelineKey {
             modules,
-            layout,
-            attributes,
+            layout: layout.clone(),
+            attributes: vertices.attributes,
+            vertex_stride: vertices.stride,
             target,
             primitive: wgpu::PrimitiveState {
                 topology,
@@ -1834,85 +2396,167 @@ pub(crate) fn execute(
             },
         },
     );
-    let vertex = make_buffer(
-        gpu,
-        "d3d9-vertices",
-        &flat_to_u8(&vertices),
-        wgpu::BufferUsages::VERTEX,
-    );
-    let mut encoder = gpu
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("d3d9-draw"),
-        });
-    let colors = [Some(wgpu::RenderPassColorAttachment {
-        view: &snapshot.target.view,
-        resolve_target: None,
-        depth_slice: None,
-        ops: wgpu::Operations {
-            load: wgpu::LoadOp::Load,
-            store: wgpu::StoreOp::Store,
-        },
-    })];
-    let depth = snapshot
-        .depth
+    if draw
+        .batch
+        .color_view
         .as_ref()
-        .map(|d| wgpu::RenderPassDepthStencilAttachment {
-            view: &d.view,
-            depth_ops: Some(wgpu::Operations {
-                load: wgpu::LoadOp::Load,
-                store: wgpu::StoreOp::Store,
-            }),
-            stencil_ops: if super::format::has_stencil(d.format) {
-                Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                })
-            } else {
-                None
-            },
-        });
+        .is_some_and(|view| *view != snapshot.target.view)
+        || draw.batch.depth.as_ref().map(|(view, _)| view)
+            != snapshot.depth.as_ref().map(|depth| &depth.view)
     {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("d3d9-draw"),
-            color_attachments: &colors,
-            depth_stencil_attachment: depth,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bind, &[]);
-        if has_attributes {
-            pass.set_vertex_buffer(0, vertex.slice(..));
-        }
-        pass.set_viewport(
-            vp.x as f32,
-            vp.y as f32,
-            vp.width as f32,
-            vp.height as f32,
-            vp.min_z,
-            vp.max_z,
-        );
-        pass.set_stencil_reference(rs(state, 57));
-        let blend = color(rs(state, 193));
-        pass.set_blend_constant(wgpu::Color {
-            r: blend[0] as f64,
-            g: blend[1] as f64,
-            b: blend[2] as f64,
-            a: blend[3] as f64,
-        });
-        if rs(state, 174) != 0 {
-            let s = state.scissor();
-            let l = s.left.clamp(0, snapshot.target.width as i32) as u32;
-            let t = s.top.clamp(0, snapshot.target.height as i32) as u32;
-            let r = s.right.clamp(0, snapshot.target.width as i32) as u32;
-            let b = s.bottom.clamp(0, snapshot.target.height as i32) as u32;
-            pass.set_scissor_rect(l, t, r.saturating_sub(l), b.saturating_sub(t));
-        }
-        pass.draw(0..order.len() as u32, 0..1);
+        flush(gpu, draw)?;
     }
-    gpu.queue.submit(std::iter::once(encoder.finish()));
+    if draw.batch.draws.is_empty() {
+        draw.batch.color_view = Some(snapshot.target.view.clone());
+        draw.batch.depth = snapshot
+            .depth
+            .as_ref()
+            .map(|depth| (depth.view.clone(), super::format::has_stencil(depth.format)));
+        draw.batch.width = snapshot.target.width;
+        draw.batch.height = snapshot.target.height;
+    }
+    let uniform_values = [
+        flat_to_u8(&state.constants_f(false, 0, vs_count)?),
+        flat_to_u8(&vsp),
+        flat_to_u8(&state.constants_f(true, 0, ps_count)?),
+        psp,
+    ];
+    let alignment = gpu.limits().min_uniform_buffer_offset_alignment.max(1) as usize;
+    let uniform_sizes = uniform_values.each_ref().map(|bytes| bytes.len() as u64);
+    let mut shared_uniforms = draw.batch.last_uniform.filter(|(offsets, sizes)| {
+        *sizes == uniform_sizes
+            && uniform_values.iter().enumerate().all(|(index, bytes)| {
+                let start = offsets[index] as usize;
+                draw.batch.data.get(start..start + bytes.len()) == Some(bytes.as_slice())
+            })
+    });
+    let compact_indices = order.len() <= u16::MAX as usize + 1;
+    let index_stride = if compact_indices { 2 } else { 4 };
+    let index_size = draw_indices
+        .as_ref()
+        .map_or(Some(0usize), |indices| {
+            indices.len().checked_mul(index_stride)
+        })
+        .ok_or_else(|| invalid("Draw", "index upload size overflow"))?;
+    let vertex_size = vertices.bytes.len();
+    let aligned = |value: usize, alignment: usize| {
+        value
+            .checked_add(alignment - 1)
+            .map(|value| value / alignment * alignment)
+    };
+    let estimate_size = |mut size: usize, reuse_uniforms: bool| -> Option<usize> {
+        if !reuse_uniforms {
+            for bytes in &uniform_values {
+                size = aligned(size, alignment)?.checked_add(bytes.len())?;
+            }
+        }
+        size = aligned(size, 4)?.checked_add(vertex_size)?;
+        if index_size != 0 {
+            size = aligned(aligned(size, 4)?.checked_add(index_size)?, 4)?;
+        }
+        Some(size)
+    };
+    let upload_limit = gpu.limits().max_buffer_size.min(u32::MAX as u64) as usize;
+    let estimated = estimate_size(draw.batch.data.len(), shared_uniforms.is_some())
+        .ok_or_else(|| invalid("Draw", "draw upload size overflow"))?;
+    if estimated > upload_limit && !draw.batch.draws.is_empty() {
+        flush(gpu, draw)?;
+        shared_uniforms = None;
+    }
+    let estimated = estimate_size(draw.batch.data.len(), shared_uniforms.is_some())
+        .ok_or_else(|| invalid("Draw", "draw upload size overflow"))?;
+    if estimated > upload_limit {
+        return Err(RenderError::out_of_memory(
+            "Draw",
+            "draw upload exceeds the device buffer limit",
+        ));
+    }
+    let uniform_offsets = if let Some((offsets, _)) = shared_uniforms {
+        offsets
+    } else {
+        let mut offsets = [0u32; 4];
+        for (index, bytes) in uniform_values.iter().enumerate() {
+            let offset = draw.batch.data.len().next_multiple_of(alignment);
+            draw.batch.data.resize(offset, 0);
+            offsets[index] = u32::try_from(offset)
+                .map_err(|_| invalid("Draw", "uniform upload offset exceeds 32 bits"))?;
+            draw.batch.data.extend_from_slice(bytes);
+        }
+        draw.batch.last_uniform = Some((offsets, uniform_sizes));
+        offsets
+    };
+    let vertex_offset = aligned(draw.batch.data.len(), 4)
+        .ok_or_else(|| invalid("Draw", "vertex upload offset overflow"))?;
+    draw.batch.data.resize(vertex_offset, 0);
+    draw.batch.data.extend_from_slice(&vertices.bytes);
+    let index_range = draw_indices.as_ref().map(|indices| {
+        let offset = draw.batch.data.len().next_multiple_of(4);
+        draw.batch.data.resize(offset, 0);
+        let start = draw.batch.data.len();
+        let format = if compact_indices {
+            draw.batch.data.resize(start + index_size, 0);
+            for (destination, &index) in draw.batch.data[start..].chunks_exact_mut(2).zip(indices) {
+                destination.copy_from_slice(&(index as u16).to_le_bytes());
+            }
+            wgpu::IndexFormat::Uint16
+        } else {
+            append_u32_le(&mut draw.batch.data, indices);
+            wgpu::IndexFormat::Uint32
+        };
+        let size = draw.batch.data.len() - start;
+        let end = draw.batch.data.len().next_multiple_of(4);
+        draw.batch.data.resize(end, 0);
+        (start as u64, size as u64, format)
+    });
+    let texture_bindings = textures
+        .iter()
+        .zip(&samplers)
+        .map(|(texture, sampler)| PendingTexture {
+            stage: texture.stage,
+            view: texture.view.clone(),
+            sampler: sampler.clone(),
+        })
+        .collect();
+    let scissor = if rs(state, 174) != 0 {
+        let s = state.scissor();
+        let left = s.left.clamp(0, snapshot.target.width as i32) as u32;
+        let top = s.top.clamp(0, snapshot.target.height as i32) as u32;
+        let right = s.right.clamp(0, snapshot.target.width as i32) as u32;
+        let bottom = s.bottom.clamp(0, snapshot.target.height as i32) as u32;
+        Some([
+            left,
+            top,
+            right.saturating_sub(left),
+            bottom.saturating_sub(top),
+        ])
+    } else {
+        None
+    };
+    let vertex_count = draw_indices
+        .as_ref()
+        .map_or(order.len(), |indices| indices.len()) as u32;
+    let blend = color(rs(state, 193));
+    draw.batch.draws.push(PendingDraw {
+        pipeline,
+        layout,
+        uniform_offsets,
+        uniform_sizes,
+        textures: texture_bindings,
+        vertex_offset: vertex_offset as u64,
+        vertex_size: vertex_size as u64,
+        has_attributes,
+        index_range,
+        vertex_count,
+        viewport: vp,
+        stencil_reference: rs(state, 57),
+        blend_constant: blend,
+        scissor,
+    });
+    if draw.batch.data.len() >= 32 << 20 {
+        flush(gpu, draw)?;
+    }
     if super::trace_enabled() {
+        flush(gpu, draw)?;
         static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if count < super::trace_draw_limit()
@@ -1944,6 +2588,192 @@ pub(crate) fn execute(
             }
         }
     }
+    Ok(())
+}
+
+pub(crate) fn flush(gpu: &D3d9Gpu, draw: &mut D3d9DrawState) -> Result<(), RenderError> {
+    if draw.batch.draws.is_empty() {
+        return Ok(());
+    }
+    match gpu.validate("DrawFlush", || flush_inner(gpu, draw)) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            draw.discard_batch();
+            Err(error)
+        }
+    }
+}
+
+fn flush_inner(gpu: &D3d9Gpu, draw: &mut D3d9DrawState) -> Result<(), RenderError> {
+    if draw.batch.draws.is_empty() {
+        return Ok(());
+    }
+    let needed = draw.batch.data.len().max(4) as u64;
+    if needed > gpu.limits().max_buffer_size || needed > u32::MAX as u64 {
+        return Err(RenderError::out_of_memory(
+            "DrawFlush",
+            "draw upload exceeds the device buffer limit",
+        ));
+    }
+    if draw
+        .upload
+        .as_ref()
+        .is_none_or(|buffer| buffer.size() < needed)
+    {
+        draw.bind_groups.clear();
+        let size = needed
+            .next_power_of_two()
+            .max(4096)
+            .min(gpu.limits().max_buffer_size)
+            .max(needed);
+        draw.upload = Some(gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("d3d9-draw-upload"),
+            size,
+            usage: wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::INDEX
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+    }
+    let upload = draw
+        .upload
+        .as_ref()
+        .expect("draw upload buffer was created");
+    gpu.queue.write_buffer(upload, 0, &draw.batch.data);
+    let mut bind_groups = Vec::with_capacity(draw.batch.draws.len());
+    for pending in &draw.batch.draws {
+        let key = BindGroupKey {
+            layout: pending.layout.clone(),
+            uniform_sizes: pending.uniform_sizes,
+            textures: pending
+                .textures
+                .iter()
+                .map(|texture| (texture.stage, texture.view.clone(), texture.sampler.clone()))
+                .collect(),
+        };
+        let bind_group = if let Some(bind_group) = draw.bind_groups.get(&key) {
+            bind_group.clone()
+        } else {
+            let mut entries = Vec::with_capacity(4 + pending.textures.len() * 2);
+            for binding in 0..4 {
+                entries.push(wgpu::BindGroupEntry {
+                    binding,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: upload,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(pending.uniform_sizes[binding as usize]),
+                    }),
+                });
+            }
+            for texture in &pending.textures {
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 4 + texture.stage,
+                    resource: wgpu::BindingResource::TextureView(&texture.view),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 20 + texture.stage,
+                    resource: wgpu::BindingResource::Sampler(&texture.sampler),
+                });
+            }
+            let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("d3d9-draw-bindings"),
+                layout: &pending.layout,
+                entries: &entries,
+            });
+            if draw.bind_groups.len() >= 512 {
+                draw.bind_groups.clear();
+            }
+            draw.bind_groups.insert(key, bind_group.clone());
+            bind_group
+        };
+        bind_groups.push(bind_group);
+    }
+    let color_view = draw
+        .batch
+        .color_view
+        .as_ref()
+        .expect("draw batch has a color target");
+    let colors = [Some(wgpu::RenderPassColorAttachment {
+        view: color_view,
+        resolve_target: None,
+        depth_slice: None,
+        ops: wgpu::Operations {
+            load: wgpu::LoadOp::Load,
+            store: wgpu::StoreOp::Store,
+        },
+    })];
+    let depth = draw.batch.depth.as_ref().map(|(view, has_stencil)| {
+        wgpu::RenderPassDepthStencilAttachment {
+            view,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            }),
+            stencil_ops: has_stencil.then_some(wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            }),
+        }
+    });
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("d3d9-draw-batch"),
+        });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("d3d9-draw-batch"),
+            color_attachments: &colors,
+            depth_stencil_attachment: depth,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        for (pending, bind_group) in draw.batch.draws.iter().zip(&bind_groups) {
+            pass.set_pipeline(&pending.pipeline);
+            pass.set_bind_group(0, bind_group, &pending.uniform_offsets);
+            if pending.has_attributes {
+                pass.set_vertex_buffer(
+                    0,
+                    upload
+                        .slice(pending.vertex_offset..pending.vertex_offset + pending.vertex_size),
+                );
+            }
+            pass.set_viewport(
+                pending.viewport.x as f32,
+                pending.viewport.y as f32,
+                pending.viewport.width as f32,
+                pending.viewport.height as f32,
+                pending.viewport.min_z,
+                pending.viewport.max_z,
+            );
+            pass.set_stencil_reference(pending.stencil_reference);
+            let blend = pending.blend_constant;
+            pass.set_blend_constant(wgpu::Color {
+                r: blend[0] as f64,
+                g: blend[1] as f64,
+                b: blend[2] as f64,
+                a: blend[3] as f64,
+            });
+            let [left, top, width, height] =
+                pending
+                    .scissor
+                    .unwrap_or([0, 0, draw.batch.width, draw.batch.height]);
+            pass.set_scissor_rect(left, top, width, height);
+            if let Some((offset, size, format)) = pending.index_range {
+                pass.set_index_buffer(upload.slice(offset..offset + size), format);
+                pass.draw_indexed(0..pending.vertex_count, 0, 0..1);
+            } else {
+                pass.draw(0..pending.vertex_count, 0..1);
+            }
+        }
+    }
+    gpu.queue.submit(std::iter::once(encoder.finish()));
+    draw.batch.draws.clear();
+    draw.batch.data.clear();
+    draw.batch.color_view = None;
+    draw.batch.depth = None;
+    draw.batch.last_uniform = None;
     Ok(())
 }
 
@@ -1982,6 +2812,7 @@ pub(crate) fn clear(
     if rects.is_empty() {
         return Ok(());
     }
+    flush(gpu, draw)?;
     let depth = depth.filter(|_| flags & 6 != 0);
     let mut source = String::from(
         "struct Params {color:vec4<f32>,depth:vec4<f32>}\n@group(0) @binding(0) var<uniform> params:Params;\n@vertex fn vs_main(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32>{let p=array<vec2<f32>,3>(vec2<f32>(-1.0,-1.0),vec2<f32>(3.0,-1.0),vec2<f32>(-1.0,3.0));return vec4<f32>(p[i],0.0,1.0);}\n",
@@ -1991,10 +2822,10 @@ pub(crate) fn clear(
     } else {
         source += "@fragment fn ps_main()->@location(0) vec4<f32>{return params.color;}\n";
     }
-    let shader = draw.shader(gpu, source)?;
+    let shader = draw.shader(gpu, &source)?;
     let layout = draw.layout(
         gpu,
-        vec![uniform_entry(0, 32, wgpu::ShaderStages::FRAGMENT)],
+        vec![static_uniform_entry(0, 32, wgpu::ShaderStages::FRAGMENT)],
     );
     let mut params = color(color_value).to_vec();
     if opaque_format(target.format) {
@@ -2043,6 +2874,7 @@ pub(crate) fn clear(
             modules: [shader.clone(), shader],
             layout,
             attributes: Vec::new(),
+            vertex_stride: 0,
             target: wgpu::ColorTargetState {
                 format: target.texture.format(),
                 blend: None,

@@ -115,6 +115,17 @@ static ComObj *this_device9(X86 *c) {
     return (o && o->kind == K_D3D9DEVICE) ? o : nullptr;
 }
 
+static bool d3d9_flush_resource_owner(X86 *c, ComObj *resource) {
+    ComObj *device = resource ? com_get(resource->dev_d3d) : nullptr;
+    if (!device || !device->d3d9_device)
+        return true;
+    recomp::d3d::Status status = device->d3d9_device->flush();
+    if (status.code == recomp::d3d::StatusCode::Ok)
+        return true;
+    com_ret(c, bridge_result(c, status));
+    return false;
+}
+
 static uint32_t g_d3d9_display_owner = 0;
 
 extern "C" bool d3d9_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp) {
@@ -200,26 +211,28 @@ static void d3d9_ref_del(uint32_t id) {
     if (ComObj *o = com_get(id))
         com_release_internal(o);
 }
-static std::set<uint32_t> d3d9_binding_set(ComObj *dev, const recomp::d3d::D3d9Bindings &bindings) {
-    std::set<uint32_t> out;
-    for (uint32_t id : bindings.textures)
-        if (id)
-            out.insert(id);
-    for (uint32_t id : bindings.streams)
-        if (id)
-            out.insert(id);
-    if (bindings.indices)
-        out.insert(bindings.indices);
+static std::array<uint32_t, 38> d3d9_binding_ids(ComObj *dev,
+                                                 const recomp::d3d::D3d9Bindings &bindings) {
+    std::array<uint32_t, 38> out{};
+    std::copy(bindings.textures.begin(), bindings.textures.end(), out.begin());
+    std::copy(bindings.streams.begin(), bindings.streams.end(), out.begin() + 16);
+    out[32] = bindings.indices;
     auto resolve = [&](const std::unordered_map<uint32_t, uint32_t> &map, uint32_t handle) {
         if (!handle)
-            return;
+            return 0u;
         auto it = map.find(handle);
-        if (it != map.end() && it->second)
-            out.insert(it->second);
+        return it == map.end() ? 0u : it->second;
     };
-    resolve(dev->d3d9_device->shader_views, bindings.vertex_shader);
-    resolve(dev->d3d9_device->shader_views, bindings.pixel_shader);
-    resolve(dev->d3d9_device->decl_views, bindings.declaration);
+    out[33] = resolve(dev->d3d9_device->shader_views, bindings.vertex_shader);
+    out[34] = resolve(dev->d3d9_device->shader_views, bindings.pixel_shader);
+    out[35] = resolve(dev->d3d9_device->decl_views, bindings.declaration);
+    return out;
+}
+static std::set<uint32_t> d3d9_binding_set(ComObj *dev, const recomp::d3d::D3d9Bindings &bindings) {
+    std::set<uint32_t> out;
+    for (uint32_t id : d3d9_binding_ids(dev, bindings))
+        if (id)
+            out.insert(id);
     return out;
 }
 static void d3d9_reconcile(std::set<uint32_t> &current, const std::set<uint32_t> &desired) {
@@ -237,17 +250,29 @@ static void d3d9_refresh_bindings(ComObj *dev) {
     recomp::d3d::D3d9BindingsResult result = dev->d3d9_device->current_bindings();
     if (result.status.code != recomp::d3d::StatusCode::Ok)
         return;
-    std::set<uint32_t> live = d3d9_binding_set(dev, result.live);
-    for (const auto &target :
-         {dev->d3d9_device->render_target(), dev->d3d9_device->depth_stencil()})
+    auto *host = dev->d3d9_device.get();
+    auto live = d3d9_binding_ids(dev, result.live);
+    size_t slot = 36;
+    for (const auto &target : {host->render_target(), host->depth_stencil()}) {
         if (target.status.code == recomp::d3d::StatusCode::Ok && target.value &&
             target.value != 0xffffffffu)
-            live.insert(target.value);
-    d3d9_reconcile(dev->d3d9_device->live_refs, live);
-    std::set<uint32_t> recording;
-    if (result.recording_active)
-        recording = d3d9_binding_set(dev, result.recording);
-    d3d9_reconcile(dev->d3d9_device->recording_refs, recording);
+            live[slot] = target.value;
+        ++slot;
+    }
+    auto recording = result.recording_active ? d3d9_binding_ids(dev, result.recording)
+                                             : std::array<uint32_t, 38>{};
+    auto refresh = [](auto &snapshot, auto &refs, const auto &ids) {
+        if (snapshot == ids)
+            return;
+        std::set<uint32_t> desired;
+        for (uint32_t id : ids)
+            if (id)
+                desired.insert(id);
+        d3d9_reconcile(refs, desired);
+        snapshot = ids;
+    };
+    refresh(host->live_bindings, host->live_refs, live);
+    refresh(host->recording_bindings, host->recording_refs, recording);
 }
 static void d3d9_refresh_block_bindings(ComObj *dev, uint32_t handle) {
     if (!dev || !dev->d3d9_device)
@@ -275,6 +300,8 @@ static void d3d9_drop_all_refs(ComObj *dev) {
     for (uint32_t id : dev->d3d9_device->recording_refs)
         d3d9_ref_del(id);
     dev->d3d9_device->live_refs.clear();
+    dev->d3d9_device->live_bindings.fill(0);
+    dev->d3d9_device->recording_bindings.fill(0);
     dev->d3d9_device->recording_refs.clear();
     for (auto &entry : dev->d3d9_device->block_refs)
         for (uint32_t id : entry.second)
@@ -1282,15 +1309,38 @@ void Dev_Present(X86 *c) {
             com_ret(c, D3DERR_INVALIDCALL);
             return;
         }
-        recomp::d3d::D3d9FrameResult result = dev->d3d9_device->present();
-        if (result.status.code != recomp::d3d::StatusCode::Ok) {
-            com_ret(c, bridge_result(c, result.status));
-            return;
+        bool presented = false;
+        if (!dx_dump_enabled() && dev->d3d9_device->native_present_available) {
+            auto result = dev->d3d9_device->present_handoff();
+            if (result.status.code == recomp::d3d::StatusCode::Ok) {
+                presented = host_display_present_native_texture(
+                    result.handoff.texture, (int)result.handoff.width, (int)result.handoff.height,
+                    result.handoff.busy);
+                if (!presented) {
+                    __atomic_store_n(result.handoff.busy, 0u, __ATOMIC_RELEASE);
+                    dev->d3d9_device->native_present_available = false;
+                    LOGW("d3d9: presenter declined native texture handoff; using RGBA readback");
+                }
+            } else if (result.status.code != recomp::d3d::StatusCode::Unsupported) {
+                com_ret(c, bridge_result(c, result.status));
+                return;
+            } else {
+                dev->d3d9_device->native_present_available = false;
+                std::string message(result.status.message.data(), result.status.message.size());
+                LOGW("d3d9: %s; using RGBA readback", message.c_str());
+            }
         }
-        if (!result.bytes.empty()) {
-            dx_dump_frame_rgba(result.bytes.data(), result.width, result.height);
-            host_display_present_window_rgba(result.bytes.data(), (int)result.width,
-                                             (int)result.height);
+        if (!presented) {
+            recomp::d3d::D3d9FrameResult result = dev->d3d9_device->present();
+            if (result.status.code != recomp::d3d::StatusCode::Ok) {
+                com_ret(c, bridge_result(c, result.status));
+                return;
+            }
+            if (!result.bytes.empty()) {
+                dx_dump_frame_rgba(result.bytes.data(), result.width, result.height);
+                host_display_present_window_rgba(result.bytes.data(), (int)result.width,
+                                                 (int)result.height);
+            }
         }
         recomp::d3d::D3d9PresentParams effective = dev->d3d9_device->effective_present();
         if (effective.presentation_interval != 0x80000000u) {
@@ -4455,6 +4505,8 @@ static void level_lock_wgpu(X86 *c, ComObj *o, uint32_t face, uint32_t level, bo
         request.rect.bottom = (int32_t)rd32(rect_addr + 12);
     }
     D3d9HostResource *h = owner->d3d9_resource.get();
+    if (!d3d9_flush_resource_owner(c, owner))
+        return;
     uint64_t key = ((uint64_t)face << 32) | level;
     D3d9Staging &staging = h->staging[key];
     bool fresh = staging.addr == 0;
@@ -4524,6 +4576,8 @@ static void level_unlock_wgpu(X86 *c, ComObj *o, uint32_t face, uint32_t level) 
         return;
     }
     rust::Slice<const uint8_t> bytes(gm_ptr(it->second.addr), it->second.size);
+    if (!d3d9_flush_resource_owner(c, owner))
+        return;
     recomp::d3d::D3d9BufferUnlockResult result = h->level_unlock(face, level, bytes);
     if (result.closed) {
         heap_free(it->second.addr);
@@ -6266,6 +6320,8 @@ static void resource_preload(X86 *c) {
         imports_unsupported(c);
         return;
     }
+    if (!d3d9_flush_resource_owner(c, o))
+        return;
     recomp::d3d::Status status = o->d3d9_resource->preload();
     if (status.code != recomp::d3d::StatusCode::Ok) {
         std::string message(status.message.data(), status.message.size());
@@ -6810,6 +6866,8 @@ static void autogen_generate(X86 *c) {
         imports_unsupported(c);
         return;
     }
+    if (!d3d9_flush_resource_owner(c, tex))
+        return;
     recomp::d3d::Status status = tex->d3d9_resource->generate_mips();
     if (status.code != recomp::d3d::StatusCode::Ok) {
         std::string message(status.message.data(), status.message.size());

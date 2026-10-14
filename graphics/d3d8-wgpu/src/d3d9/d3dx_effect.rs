@@ -14,6 +14,7 @@ use crate::d3d9::resource::D3DPOOL_DEFAULT;
 use crate::d3d9::state::{EffectKeys, EffectSnapshot};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -235,6 +236,8 @@ struct EfxTechnique {
 struct EfxObject {
     data: Vec<u8>,
     param: Vec<u8>,
+    ctab: OnceLock<Result<Vec<CtabConst>, RenderError>>,
+    preshader_ctab: OnceLock<Result<Vec<CtabConst>, RenderError>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -658,6 +661,8 @@ fn parse_effect(blob: &[u8]) -> Result<D3dxEffect, RenderError> {
             EfxObject {
                 data: body[at..end].to_vec(),
                 param: Vec::new(),
+                ctab: OnceLock::new(),
+                preshader_ctab: OnceLock::new(),
             },
         );
         at = end + ((4 - (size & 3)) & 3);
@@ -762,9 +767,14 @@ fn parse_effect(blob: &[u8]) -> Result<D3dxEffect, RenderError> {
             }
             _ => return Err(unsupported("Parse", "resource usage is unsupported")),
         }
+        if state.op == FXS_SETSAMPLER {
+            continue;
+        }
         let entry = effect.objects.entry(id).or_insert(EfxObject {
             data: Vec::new(),
             param: Vec::new(),
+            ctab: OnceLock::new(),
+            preshader_ctab: OnceLock::new(),
         });
         match usage {
             0 => entry.data = state.shader.clone().unwrap_or_default(),
@@ -785,6 +795,7 @@ fn parse_effect(blob: &[u8]) -> Result<D3dxEffect, RenderError> {
     Ok(effect)
 }
 
+#[derive(Clone)]
 struct CtabConst {
     name: Vec<u8>,
     set: u32,
@@ -811,6 +822,15 @@ fn parse_ctab(code: &[u8]) -> Result<Vec<CtabConst>, RenderError> {
             elements: constant.elements.max(1),
         })
         .collect())
+}
+
+fn object_ctab(object: &EfxObject) -> Result<&[CtabConst], RenderError> {
+    object
+        .ctab
+        .get_or_init(|| parse_ctab(&object.data))
+        .as_ref()
+        .map(Vec::as_slice)
+        .map_err(Clone::clone)
 }
 
 fn handle_index(handle: u32, tag: u32) -> Option<u32> {
@@ -2284,28 +2304,7 @@ fn validate_state_references(
             }
             Ok(())
         }
-        FXS_SETSAMPLER => {
-            let id = match &state.value {
-                EfxValue::Object(ids) => ids
-                    .first()
-                    .copied()
-                    .ok_or_else(|| invalid_data("set sampler state has no object id"))?,
-                _ => {
-                    return Err(invalid_data("set sampler state has a non-object value"));
-                }
-            };
-            let object = effect
-                .objects
-                .get(&id)
-                .ok_or_else(|| invalid_data("set sampler object is missing"))?;
-            let index = effect
-                .find_param_index(&object.param)
-                .ok_or_else(|| invalid_data("set sampler parameter is missing"))?;
-            if !matches!(effect.params[index].value, EfxValue::Sampler(_)) {
-                return Err(invalid_data("set sampler parameter is not a sampler"));
-            }
-            Ok(())
-        }
+        FXS_SETSAMPLER => sampler_state_parameter(effect, state).map(|_| ()),
         _ => Ok(()),
     }
 }
@@ -2366,18 +2365,9 @@ fn state_uses_name(effect: &D3dxEffect, state: &EfxState, name: &[u8]) -> bool {
         return true;
     }
     if state.op == FXS_SETSAMPLER {
-        if let EfxValue::Object(ids) = &state.value {
-            if let Some(id) = ids.first() {
-                if let Some(object) = effect.objects.get(id) {
-                    if object.param == name {
-                        return true;
-                    }
-                    if let Some(index) = effect.find_param_index(&object.param) {
-                        if sampler_uses_name(effect, index, name) {
-                            return true;
-                        }
-                    }
-                }
+        if let Ok(index) = sampler_state_parameter(effect, state) {
+            if effect.params[index].type_.name == name || sampler_uses_name(effect, index, name) {
+                return true;
             }
         }
     }
@@ -2608,10 +2598,9 @@ fn constant_registers(
     Ok(out)
 }
 
-fn ctab_inputs(effect: &D3dxEffect, code: &[u8]) -> Result<Vec<[f32; 4]>, RenderError> {
-    let ctab = parse_ctab(code)?;
+fn ctab_inputs_from(effect: &D3dxEffect, ctab: &[CtabConst]) -> Result<Vec<[f32; 4]>, RenderError> {
     let mut inputs = vec![[0.0f32; 4]; 256];
-    for constant in &ctab {
+    for constant in ctab {
         if constant.set != D3DXRS_FLOAT4 {
             return Err(unsupported(
                 "Preshader",
@@ -2637,10 +2626,40 @@ fn ctab_inputs(effect: &D3dxEffect, code: &[u8]) -> Result<Vec<[f32; 4]>, Render
     Ok(inputs)
 }
 
+fn ctab_inputs(effect: &D3dxEffect, code: &[u8]) -> Result<Vec<[f32; 4]>, RenderError> {
+    let ctab = parse_ctab(code)?;
+    ctab_inputs_from(effect, &ctab)
+}
+
 fn evaluate_numeric(effect: &D3dxEffect, code: &[u8]) -> Result<Vec<f32>, RenderError> {
     let parsed = preshader::parse(code)?;
     let inputs = ctab_inputs(effect, code)?;
     preshader::evaluate(&parsed, &inputs)
+}
+
+fn sampler_state_parameter(effect: &D3dxEffect, state: &EfxState) -> Result<usize, RenderError> {
+    let name = if let Some(name) = &state.referenced {
+        name
+    } else {
+        let id = match &state.value {
+            EfxValue::Object(ids) => ids
+                .first()
+                .ok_or_else(|| invalid_data("set sampler state has no object id"))?,
+            _ => return Err(invalid_data("set sampler state has a non-object value")),
+        };
+        &effect
+            .objects
+            .get(id)
+            .ok_or_else(|| invalid_data("set sampler object is missing"))?
+            .param
+    };
+    let index = effect
+        .find_param_index(name)
+        .ok_or_else(|| invalid_data("set sampler parameter is missing"))?;
+    if !matches!(effect.params[index].value, EfxValue::Sampler(_)) {
+        return Err(invalid_data("set sampler parameter is not a sampler"));
+    }
+    Ok(index)
 }
 
 fn sampler_param_states<'a>(effect: &'a D3dxEffect, index: usize) -> Option<&'a Vec<EfxState>> {
@@ -2952,10 +2971,11 @@ fn apply_shader_constants(
     effect: &D3dxEffect,
     sink: &mut StateSink,
     pixel: bool,
-    code: &[u8],
+    object: &EfxObject,
 ) -> Result<(), RenderError> {
-    let ctab = parse_ctab(code)?;
-    for constant in &ctab {
+    let code = &object.data;
+    let ctab = object_ctab(object)?;
+    for constant in ctab {
         let index = effect
             .find_param_index(&constant.name)
             .ok_or_else(|| invalid_data("shader constant parameter is missing"))?;
@@ -2993,7 +3013,13 @@ fn apply_shader_constants(
     }
     if let Some(code) = preshader::shader_preshader(code)? {
         let program = preshader::parse(code)?;
-        let inputs = ctab_inputs(effect, code)?;
+        let preshader_ctab = object
+            .preshader_ctab
+            .get_or_init(|| parse_ctab(code))
+            .as_ref()
+            .map(Vec::as_slice)
+            .map_err(Clone::clone)?;
+        let inputs = ctab_inputs_from(effect, preshader_ctab)?;
         let values = preshader::evaluate(&program, &inputs)?;
         for register in program.output_registers() {
             let start = register as usize * 4;
@@ -3058,9 +3084,8 @@ fn apply_shader_state(
     if handle != 0 {
         if let Some(id) = id {
             if let Some(object) = effect.objects.get(&id) {
-                let data = object.data.clone();
-                if !data.is_empty() {
-                    apply_shader_constants(effect, sink, pixel, &data)?;
+                if !object.data.is_empty() {
+                    apply_shader_constants(effect, sink, pixel, object)?;
                 }
             }
         }
@@ -3108,28 +3133,9 @@ fn apply_state(
             sink.texture(state.index, id)?;
         }
         FXS_SETSAMPLER => {
-            let id = match &state.value {
-                EfxValue::Object(ids) => ids
-                    .first()
-                    .copied()
-                    .ok_or_else(|| invalid_data("set sampler state has no object id"))?,
-                _ => return Err(invalid_data("set sampler state has a non-object value")),
-            };
-            let object = effect
-                .objects
-                .get(&id)
-                .ok_or_else(|| invalid_data("set sampler object is missing"))?;
-            if object.param.is_empty() {
-                return Err(invalid_data(
-                    "set sampler object has no referenced parameter",
-                ));
-            }
-            let index = effect
-                .find_param_index(&object.param)
-                .ok_or_else(|| invalid_data("set sampler parameter is missing"))?;
-            let EfxValue::Sampler(states) = &effect.params[index].value else {
-                return Err(invalid_data("set sampler parameter is not a sampler"));
-            };
+            let index = sampler_state_parameter(effect, state)?;
+            let states = sampler_param_states(effect, index)
+                .ok_or_else(|| invalid_data("set sampler parameter is not a sampler"))?;
             for sampler_state in states {
                 apply_sampler_state(effect, sink, sampler_state, state.index)?;
             }
@@ -3282,22 +3288,7 @@ fn touched_keys(effect: &D3dxEffect, skip_shader: bool) -> Result<EffectKeys, Re
                 }
                 FXS_SAMPLER_TEXTURE => keys.textures.push(state.index),
                 FXS_SETSAMPLER => {
-                    let id = match &state.value {
-                        EfxValue::Object(ids) => ids
-                            .first()
-                            .copied()
-                            .ok_or_else(|| invalid_data("set sampler state has no object id"))?,
-                        _ => {
-                            return Err(invalid_data("set sampler state has a non-object value"));
-                        }
-                    };
-                    let object = effect
-                        .objects
-                        .get(&id)
-                        .ok_or_else(|| invalid_data("set sampler object is missing"))?;
-                    let index = effect
-                        .find_param_index(&object.param)
-                        .ok_or_else(|| invalid_data("set sampler parameter is missing"))?;
+                    let index = sampler_state_parameter(effect, state)?;
                     let states = sampler_param_states(effect, index)
                         .ok_or_else(|| invalid_data("set sampler parameter is not a sampler"))?;
                     sampler_state_keys(&mut keys, state.index, states)?;

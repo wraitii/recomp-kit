@@ -2,6 +2,7 @@
 
 #include "d3d_bridge.h"
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -19,6 +20,7 @@ struct D3d9HostResource;
 
 struct D3d9HostDevice {
     rust::Box<recomp::d3d::D3d9Device> value;
+    bool native_present_available = true;
 
     D3d9HostDevice() : value(recomp::d3d::new_d3d9_device()) {}
 
@@ -36,6 +38,9 @@ struct D3d9HostDevice {
     }
     recomp::d3d::Status end_scene() {
         return recomp::d3d::d3d9_end_scene(*value);
+    }
+    recomp::d3d::Status flush() {
+        return recomp::d3d::d3d9_flush(*value);
     }
     recomp::d3d::Status set_render_target(uint32_t index, uint32_t id, uint32_t face,
                                           uint32_t level, bool volume) {
@@ -137,6 +142,9 @@ struct D3d9HostDevice {
     }
     recomp::d3d::D3d9FrameResult present() {
         return recomp::d3d::d3d9_present(*value);
+    }
+    recomp::d3d::FrameHandoffResult present_handoff() {
+        return recomp::d3d::d3d9_present_handoff(*value);
     }
 
     recomp::d3d::D3dxSurfaceReadResult d3dx_surface_read(D3d9HostResource &resource, uint32_t face,
@@ -357,6 +365,8 @@ struct D3d9HostDevice {
     std::unordered_map<uint32_t, uint32_t> decl_views;
     std::set<uint32_t> fvf_decls;
     std::unordered_map<uint32_t, uint32_t> block_views;
+    std::array<uint32_t, 38> live_bindings{};
+    std::array<uint32_t, 38> recording_bindings{};
     std::set<uint32_t> live_refs;
     std::set<uint32_t> recording_refs;
     std::map<uint32_t, std::set<uint32_t>> block_refs;

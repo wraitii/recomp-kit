@@ -195,16 +195,14 @@ bool log_once(const char *key, const char *fmt, ...) {
 }
 
 std::string gm_str(uint32_t a, size_t max_len) {
-    if (a == 0)
+    if (a == 0 || a >= GUEST_SIZE)
         return std::string();
-    std::string out;
-    for (size_t i = 0; i < max_len && a + i < GUEST_SIZE; ++i) {
-        char ch = (char)g_mem[a + i];
-        if (!ch)
-            break;
-        out.push_back(ch);
-    }
-    return out;
+    const size_t available = std::min(max_len, (size_t)(GUEST_SIZE - a));
+    if (!available)
+        return std::string();
+    const char *begin = (const char *)(g_mem + a);
+    const char *end = (const char *)memchr(begin, 0, available);
+    return std::string(begin, end ? (size_t)(end - begin) : available);
 }
 
 uint32_t gm_put_str(uint32_t a, const char *s, uint32_t cap) {
@@ -321,18 +319,140 @@ struct Blk {
     bool used;
     bool listed;      // in the free index
     Blk *prev, *next; // address order
+    Blk *free_left, *free_right;
+    uint64_t free_priority;
+    uint32_t free_max_size;
 };
 
-// Every block is a node in an address-ordered list, with an open-addressing
-// hash for lookup and a set of just the free ones so first fit walks free
-// blocks instead of the whole heap.
 Blk *g_block_head = nullptr, *g_block_tail = nullptr;
 std::vector<Blk *> g_block_slots;
 size_t g_block_live = 0, g_block_tombs = 0;
 Blk *g_node_pool = nullptr;
 const Blk *kHashTomb = (const Blk *)1;
-std::set<uint32_t> *g_free = nullptr;
+Blk *g_free_root = nullptr;
 uint64_t g_total_allocs = 0, g_total_frees = 0;
+
+uint32_t free_max_size(const Blk *n) {
+    return n ? n->free_max_size : 0;
+}
+void free_update(Blk *n) {
+    n->free_max_size =
+        std::max(n->size, std::max(free_max_size(n->free_left), free_max_size(n->free_right)));
+}
+uint64_t free_priority(uint32_t addr) {
+    uint64_t x = addr + 0x9e3779b97f4a7c15ull;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+}
+bool free_higher(const Blk *a, const Blk *b) {
+    return a->free_priority > b->free_priority ||
+           (a->free_priority == b->free_priority && a->addr < b->addr);
+}
+Blk *free_rotate_right(Blk *root) {
+    Blk *top = root->free_left;
+    root->free_left = top->free_right;
+    top->free_right = root;
+    free_update(root);
+    free_update(top);
+    return top;
+}
+Blk *free_rotate_left(Blk *root) {
+    Blk *top = root->free_right;
+    root->free_right = top->free_left;
+    top->free_left = root;
+    free_update(root);
+    free_update(top);
+    return top;
+}
+Blk *free_insert(Blk *root, Blk *n) {
+    if (!root)
+        return n;
+    if (n->addr < root->addr) {
+        root->free_left = free_insert(root->free_left, n);
+        if (free_higher(root->free_left, root))
+            root = free_rotate_right(root);
+    } else {
+        root->free_right = free_insert(root->free_right, n);
+        if (free_higher(root->free_right, root))
+            root = free_rotate_left(root);
+    }
+    free_update(root);
+    return root;
+}
+Blk *free_merge(Blk *left, Blk *right) {
+    if (!left)
+        return right;
+    if (!right)
+        return left;
+    if (free_higher(left, right)) {
+        left->free_right = free_merge(left->free_right, right);
+        free_update(left);
+        return left;
+    }
+    right->free_left = free_merge(left, right->free_left);
+    free_update(right);
+    return right;
+}
+Blk *free_erase(Blk *root, uint32_t addr) {
+    if (!root)
+        return nullptr;
+    if (addr < root->addr) {
+        root->free_left = free_erase(root->free_left, addr);
+    } else if (addr > root->addr) {
+        root->free_right = free_erase(root->free_right, addr);
+    } else {
+        return free_merge(root->free_left, root->free_right);
+    }
+    free_update(root);
+    return root;
+}
+void free_index_add(Blk *n) {
+    n->free_left = n->free_right = nullptr;
+    n->free_priority = free_priority(n->addr);
+    n->free_max_size = n->size;
+    g_free_root = free_insert(g_free_root, n);
+}
+void free_index_remove(Blk *n) {
+    g_free_root = free_erase(g_free_root, n->addr);
+    n->free_left = n->free_right = nullptr;
+    n->free_max_size = 0;
+}
+inline uint32_t align_up(uint32_t v, uint32_t a);
+Blk *find_block(uint32_t addr);
+Blk *first_fit(Blk *root, uint32_t need, uint32_t align) {
+    if (!root || root->free_max_size < need)
+        return nullptr;
+    if (root->free_left && root->free_left->free_max_size >= need) {
+        if (Blk *found = first_fit(root->free_left, need, align))
+            return found;
+    }
+    uint32_t user = align_up(root->addr, align);
+    if (user >= root->addr) {
+        uint32_t pad = user - root->addr;
+        if (pad <= root->size && need <= root->size - pad)
+            return root;
+    }
+    return first_fit(root->free_right, need, align);
+}
+bool free_index_valid(const Blk *n, uint64_t lower, uint64_t upper, size_t &count,
+                      uint32_t &max_size) {
+    if (!n) {
+        max_size = 0;
+        return true;
+    }
+    if (n->addr <= lower || n->addr >= upper || n->used || !n->listed || find_block(n->addr) != n ||
+        (n->free_left && free_higher(n->free_left, n)) ||
+        (n->free_right && free_higher(n->free_right, n)))
+        return false;
+    uint32_t left_max, right_max;
+    if (!free_index_valid(n->free_left, lower, n->addr, count, left_max) ||
+        !free_index_valid(n->free_right, n->addr, upper, count, right_max))
+        return false;
+    ++count;
+    max_size = std::max(n->size, std::max(left_max, right_max));
+    return n->free_max_size == max_size;
+}
 
 uint32_t block_bucket(uint32_t addr, size_t cap) {
     return (uint32_t)((addr >> 4) * 2654435761u) & (uint32_t)(cap - 1);
@@ -392,6 +512,9 @@ Blk *block_new(uint32_t addr, uint32_t size, uint32_t req, bool used) {
     n->used = used;
     n->listed = !used;
     n->prev = n->next = nullptr;
+    n->free_left = n->free_right = nullptr;
+    n->free_priority = 0;
+    n->free_max_size = 0;
     return n;
 }
 Blk *block_add(Blk *at, uint32_t addr, uint32_t size, uint32_t req, bool used) {
@@ -411,12 +534,12 @@ Blk *block_add(Blk *at, uint32_t addr, uint32_t size, uint32_t req, bool used) {
         g_block_tail = n;
     block_hash_put(n);
     if (n->listed)
-        g_free->insert(addr);
+        free_index_add(n);
     return n;
 }
 void block_remove(Blk *n) {
     if (n->listed)
-        g_free->erase(n->addr);
+        free_index_remove(n);
     if (n->prev)
         n->prev->next = n->next;
     else
@@ -632,8 +755,6 @@ void canary_tick() {
 }
 
 void heap_reset() {
-    if (!g_free)
-        g_free = new std::set<uint32_t>();
     if (!g_live)
         g_live = new std::map<uint32_t, LiveAlloc>();
     g_heap_trace = recomp_env("HEAP_TRACE") != nullptr;
@@ -652,7 +773,7 @@ void heap_reset() {
     g_held_bytes = 0;
     g_free_site.clear();
     g_live->clear();
-    g_free->clear();
+    g_free_root = nullptr;
     g_block_slots.clear();
     g_block_live = g_block_tombs = 0;
     while (g_block_head) {
@@ -734,10 +855,7 @@ void mem_shutdown() {
     }
     g_block_slots.clear();
     g_block_live = g_block_tombs = 0;
-    if (g_free) {
-        delete g_free;
-        g_free = nullptr;
-    }
+    g_free_root = nullptr;
     if (g_live) {
         delete g_live;
         g_live = nullptr;
@@ -745,7 +863,7 @@ void mem_shutdown() {
 }
 
 uint32_t heap_alloc(uint32_t size, bool zero, uint32_t align) {
-    if (!g_free || !g_block_head)
+    if (!g_block_head)
         return 0;
     if (!size_is_sane(size)) {
         LOGW("heap_alloc: refusing a %u byte request, the arena is %u bytes", size,
@@ -779,18 +897,10 @@ uint32_t heap_alloc(uint32_t size, bool zero, uint32_t align) {
         align = 16;
     uint32_t need = align_up((size ? size : 1) + canary_pad(), 16);
 
-    for (auto fit = g_free->begin(); fit != g_free->end(); ++fit) {
-        Blk *b = find_block(*fit);
-        if (!b || b->used || !b->listed)
-            continue; // index out of step
+    if (Blk *b = first_fit(g_free_root, need, align)) {
         uint32_t start = b->addr, len = b->size;
         uint32_t user = align_up(start, align);
-        if (user < start)
-            continue; // overflow
         uint32_t pad = user - start;
-        if (pad > len || need > len - pad)
-            continue; // does not fit
-
         uint32_t tail = len - pad - need;
         Blk *at = b->prev;
         block_remove(b);
@@ -837,8 +947,7 @@ uint32_t heap_size(uint32_t addr) {
 // Returns a freed block to the free list and merges it with free neighbours.
 static void release_free_block(Blk *b) {
     b->used = false;
-    b->listed = true;
-    g_free->insert(b->addr);
+    b->listed = false;
     // Merge only with blocks on the free list: a quarantined block is free but held.
     Blk *next = b->next;
     if (next && !next->used && next->listed && next->addr == b->addr + b->size) {
@@ -847,8 +956,15 @@ static void release_free_block(Blk *b) {
     }
     Blk *prev = b->prev;
     if (prev && !prev->used && prev->listed && prev->addr + prev->size == b->addr) {
+        free_index_remove(prev);
+        prev->listed = false;
         prev->size += b->size;
         block_remove(b);
+        prev->listed = true;
+        free_index_add(prev);
+    } else {
+        b->listed = true;
+        free_index_add(b);
     }
 }
 
@@ -925,7 +1041,7 @@ bool heap_free(uint32_t addr) {
 uint32_t heap_realloc(uint32_t addr, uint32_t new_size, bool zero) {
     if (!addr)
         return heap_alloc(new_size, zero);
-    if (!g_free)
+    if (!g_block_head)
         return 0;
     if (!size_is_sane(new_size)) {
         LOGW("heap_realloc: refusing a %u byte request, the arena is %u bytes", new_size,
@@ -997,7 +1113,7 @@ HeapStats heap_stats() {
     HeapStats s{};
     s.total_allocs = g_total_allocs;
     s.total_frees = g_total_frees;
-    if (!g_free)
+    if (!g_block_head)
         return s;
     for (Blk *b = g_block_head; b; b = b->next) {
         if (b->used) {
@@ -1017,7 +1133,7 @@ HeapStats heap_stats() {
 // Check that the heap block map covers the arena without gaps, overlap or adjacent free blocks.
 // Return the first invariant failure, or an empty string when the allocation structure is consistent.
 std::string heap_check() {
-    if (!g_free)
+    if (!g_block_head)
         return "heap not initialised";
     uint32_t cursor = HEAP_BASE;
     bool prev_free = false;
@@ -1042,20 +1158,17 @@ std::string heap_check() {
         snprintf(buf, sizeof buf, "heap ends at %08x, expected %08x", cursor, HEAP_LIMIT);
         return buf;
     }
-    for (uint32_t a : *g_free) {
-        Blk *b = find_block(a);
-        if (!b || b->used || !b->listed) {
-            snprintf(buf, sizeof buf, "free index holds %08x, which is not a free block", a);
-            return buf;
-        }
-    }
     size_t free_count = 0;
     for (Blk *b = g_block_head; b; b = b->next)
-        if (!b->used)
+        if (!b->used && b->listed)
             ++free_count;
-    if (free_count != g_free->size()) {
-        snprintf(buf, sizeof buf, "free index has %zu entries, the heap has %zu free blocks",
-                 g_free->size(), free_count);
+    size_t indexed_count = 0;
+    uint32_t indexed_max;
+    if (!free_index_valid(g_free_root, 0, 1ull << 32, indexed_count, indexed_max))
+        return "free index tree invariant failed";
+    if (free_count != indexed_count) {
+        snprintf(buf, sizeof buf, "free index has %zu entries, the heap has %zu listed free blocks",
+                 indexed_count, free_count);
         return buf;
     }
     return std::string();

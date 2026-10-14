@@ -150,7 +150,7 @@ fn validate_kind(
             }
         }
         RKind::TextureTransformFlags => {
-            if matches!(value, 0..=4 | 0x102 | 0x103 | 0x104) {
+            if matches!(value, 0..=4 | 0x100 | 0x102 | 0x103 | 0x104) {
                 Ok(value)
             } else {
                 Err(invalid(

@@ -322,10 +322,17 @@ extern "C" int host_display_stage_native_texture(void *native_texture, int w, in
     // The command buffer is committed whether or not anything was staged: an
     // open Metal encoder must be ended, and the slot is released on completion.
     const bool staged = host_present_stage_texture(src, w, h, w, h, cb);
-    if (staged)
-        device->on_complete(cb, [busy](gpu::CommandStatus, double) {
+    if (staged) {
+        host_present_track_command(cb);
+        device->on_complete(cb, [device, src, busy](gpu::CommandStatus status, double) {
+            device->destroy(src);
+            if (status != gpu::CommandStatus::Completed)
+                fprintf(stderr, "presenter: native texture copy failed\n");
             __atomic_store_n(busy, 0u, __ATOMIC_RELEASE);
         });
+    } else {
+        device->destroy(src);
+    }
     device->commit(cb);
     if (!staged)
         return 0;

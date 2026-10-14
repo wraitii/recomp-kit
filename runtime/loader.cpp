@@ -758,10 +758,24 @@ uint32_t loader_module_export(const LoaderModule &m, const char *name) {
     if (nfuncs > m.size / 4 || nnames > m.size / 4 || !in(funcs, 4 * nfuncs) ||
         !in(names, 4 * nnames) || !in(ords, 2 * nnames))
         return 0;
+    const size_t requested_length = strlen(name);
     for (uint32_t i = 0; i < nnames; ++i) {
         uint32_t name_rva = rd32(m.base + names + 4 * i);
-        if (!in(name_rva, 1) || gm_str(m.base + name_rva, m.size - name_rva) != name)
+        if (!in(name_rva, 1))
             continue;
+        const uint32_t name_addr = m.base + name_rva;
+        size_t available = 0;
+        if (name_addr != 0 && name_addr < GUEST_SIZE)
+            available = std::min((size_t)(m.size - name_rva), (size_t)(GUEST_SIZE - name_addr));
+        if (available) {
+            const char *export_name = (const char *)(g_mem + name_addr);
+            if (requested_length > available ||
+                (requested_length && memcmp(export_name, name, requested_length) != 0) ||
+                (requested_length < available && export_name[requested_length] != 0))
+                continue;
+        } else if (requested_length != 0) {
+            continue;
+        }
         uint32_t ordinal = rd16(m.base + ords + 2 * i);
         if (ordinal >= nfuncs)
             return 0;
