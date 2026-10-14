@@ -13,6 +13,7 @@ store_hooks = false
 
 [translate]
 code_map = "metadata"
+indirect_targets = "indirect-targets.tsv"
 private_leaf_contracts = true
 private_input_arguments = false
 private_input_registers = { "00755990" = "ECX", "007b80e0" = "ECX", "0052f200" = "ECX", "00569150" = "ECX", "00538240" = "ECX" }
