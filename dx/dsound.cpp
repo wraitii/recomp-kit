@@ -127,8 +127,8 @@ ComObj *this_buffer(X86 *c) {
 // Play for the rest of the run. That is what the first live run heard.
 //
 // Nothing here runs on a host thread. The positions are serviced whenever a
-// guest thread enters this module or QSWaveMixPump, both of which happen far
-// more often than the 174 ms a half-buffer lasts, and the signal itself goes
+// guest thread enters this module or QSWaveMixPump, or yields at a scheduler
+// checkpoint, which covers loading when no frames run. The signal itself goes
 // through guest_event_signal_from_host, which queues it for the scheduler.
 // ---------------------------------------------------------------------------
 const uint32_t DSBPN_OFFSETSTOP = 0xffffffffu;

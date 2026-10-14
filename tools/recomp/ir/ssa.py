@@ -89,7 +89,7 @@ MEMORY = ("memory", 0)
 
 
 def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None,
-          flag_off_name=None, kept_calls=None):
+          flag_off_name=None, kept_calls=None, string_writes=None):
     """Build SSA for reachable integer instructions using the supplied CFG.
 
     A direct CALL is admitted only when its literal target appears in
@@ -104,9 +104,13 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
     `kept_calls` maps a direct-call target to register keys its callee preserves.
     After such a call each kept field becomes a
     ``CALL_KEEP`` of the call and the pre-call lanes instead of a reload.
+    `string_writes` maps a string helper to the register keys it writes; only
+    those are reloaded after it, and a helper writing no flag keeps the
+    pending descriptor.
     """
     call_targets = frozenset(call_targets)
     kept_calls = kept_calls or {}
+    string_writes = string_writes or {}
     if not fir.insns or len(fir.succ) != len(fir.insns):
         raise SSAError("empty function or invalid successor table")
     indices = {ins.addr: i for i, ins in enumerate(fir.insns)}
@@ -246,10 +250,12 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
             for n in range(size):
                 storage[(space, off + n)] = value if size == 1 else emit("BYTE", 1, [value], n)
 
-        def reload(value, kept=frozenset()):
+        def reload(value, kept=frozenset(), only=None):
             """Read every tracked field back from the CPU after `value`, one value per group."""
             reloads = {}
             for group in reload_groups:
+                if only is not None and not any(key in only for key in group):
+                    continue
                 if all(key in kept for key in group):
                     wide = emit("CALL_KEEP", len(group), [value] + [state[key] for key in group],
                                 data=group[0])
@@ -259,7 +265,7 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                     state[key] = emit("BYTE", 1, [wide], n)
                     reloads[key] = state[key]
             for key in keys:
-                if key != MEMORY and key not in reloads:
+                if key != MEMORY and key not in reloads and (only is None or key in only):
                     if key in kept:
                         state[key] = emit("CALL_KEEP", s.inputs[key].size, [value, state[key]], data=key)
                     else:
@@ -325,7 +331,13 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                 cc_ready = True
             if op.out is not None:
                 write(op.out, value)
-            if op.opc in RETURNING_OPAQUE:
+            written = string_writes.get(op.data["helper"]) if op.opc == "STRINGOP" else None
+            if written is not None:
+                reload(value, only=written)
+                if flag_off_name and any(key[0] == "register" and key[1] in flag_off_name
+                                         for key in written):
+                    cc_active = None
+            elif op.opc in RETURNING_OPAQUE:
                 # A returning divide-error handler and the string helper's
                 # fault path may leave arbitrary CPU state behind. Reload every
                 # tracked lane and flag from the helper's result state, exactly

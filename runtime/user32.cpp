@@ -10,6 +10,7 @@
 #include "win32.h"
 #include "../platform/os.h"
 #include "memory.h"
+#include "loader.h"
 
 #include <array>
 #include <deque>
@@ -1360,10 +1361,20 @@ void u_GetSystemMetrics(X86 *c) {
     }
     set_eax(c, v);
 }
-// One handle per stock cursor id; the host draws the pointer, so the handle
-// only has to be distinct and non-zero.
+// A stock cursor id gets one distinct handle the host maps to a system cursor;
+// a module's own cursor is decoded from its resources.
 void u_LoadCursorA(X86 *c) {
-    set_eax(c, 0x0002a000u + (arg(c, 1) & 0xfffu));
+    uint32_t module = arg(c, 0), id = arg(c, 1);
+    if (!module) {
+        set_eax(c, 0x0002a000u + (id & 0xfffu));
+        return;
+    }
+    uint32_t handle = win32_load_cursor_resource(module == loader_image_base() ? 0 : module, id);
+    if (!handle) {
+        LOGW("LoadCursorA: no decodable cursor resource %x in module %08x", id, module);
+        set_last_error(1814);
+    }
+    set_eax(c, handle);
 }
 // The creation API determines the encoding delivered to the window procedure.
 void u_IsWindowUnicode(X86 *c) {

@@ -634,7 +634,9 @@ uint64_t recomp_override_hash(void);
 int32_t recomp_index_of(uint32_t addr);
 int recomp_is_call_return(uint32_t target);
 
-typedef struct RecompCallFact { uint32_t ret, first, count; } RecompCallFact;
+typedef struct RecompCallFact {
+    uint32_t ret, first, count;
+} RecompCallFact;
 extern const RecompCallFact recomp_call_facts[];
 extern const uint32_t recomp_call_fact_count;
 extern const uint32_t recomp_call_fact_targets[];
@@ -1222,6 +1224,22 @@ static inline void x86_popad(X86 *c) {
 /* ---------------------------------------------------------- string ops
  * DF selects the step direction.  The REP forms use ECX as the counter.
  */
+/* A forward REP MOVS as one memmove: both spans inside the arena above the
+ * null page, no store hook armed, and no destination starting inside the
+ * source, where the element loop would replicate a pattern instead. */
+static inline int rep_movs_bulk(X86 *c, uint32_t size) {
+    const uint64_t bytes = (uint64_t)c->r[R_ECX] * size;
+    const uint32_t d = c->r[R_EDI], s = c->r[R_ESI];
+    if (c->eflags_df || (RECOMP_STORE_HOOKS && g_store_hook != 0) || d < GUEST_NULL_LIMIT ||
+        s < GUEST_NULL_LIMIT || d + bytes > GUEST_SIZE || s + bytes > GUEST_SIZE ||
+        (d > s && d < s + bytes))
+        return 0;
+    memmove(g_mem + d, g_mem + s, (size_t)bytes);
+    c->r[R_EDI] = d + (uint32_t)bytes;
+    c->r[R_ESI] = s + (uint32_t)bytes;
+    c->r[R_ECX] = 0;
+    return 1;
+}
 #define STRING_OPS(SUF, BITS, UT, RD, WR)                                                          \
     static inline void stos##SUF(X86 *c) {                                                         \
         WR(c->r[R_EDI], (UT)c->r[R_EAX]);                                                          \
@@ -1239,6 +1257,8 @@ static inline void x86_popad(X86 *c) {
         c->r[R_ESI] += c->eflags_df ? (uint32_t)-(BITS / 8) : (uint32_t)(BITS / 8);                \
     }                                                                                              \
     static inline void rep_movs##SUF(X86 *c) {                                                     \
+        if (rep_movs_bulk(c, BITS / 8))                                                            \
+            return;                                                                                \
         while (c->r[R_ECX]) {                                                                      \
             movs##SUF(c);                                                                          \
             c->r[R_ECX]--;                                                                         \
