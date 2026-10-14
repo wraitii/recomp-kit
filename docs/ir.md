@@ -230,7 +230,12 @@ unaffected and must remain preserved.
 `cc_res`, `cc_carry`) for the last ADD/ADC/SUB/SBB/CMP/logic/INC/DEC;
 `cc_carry` uses the former padding byte without changing the CPU layout.
 `cc_op == X86_CC_NONE` means
-the six flag fields are current. `x86_cc_settle` writes them; `x86_get_eflags`,
+the six flag fields are current. The emitter stores only the operands
+`x86_cc_materialize` can read for the descriptor's kind and stored mask: LOGIC
+keeps neither `cc_a` nor `cc_b` (its CF/OF/AF are constants), INC/DEC keep only
+`cc_a`, and `cc_carry` is written only for ADC/SBB under a CF mask. `cc_res`
+always accompanies a result-derived flag, and a joined descriptor keeps every
+operand. `x86_cc_settle` writes them; `x86_get_eflags`,
 `x86_set_eflags`, `x86_sahf`, `recomp_comis`, the interpreter and `recomp_call`
 settle first. `ir/flag_region.py` walks from the entry or a post-call point to
 the next CALL/CALLIND/RET or resolved TAIL: with no flag read and no flag write
