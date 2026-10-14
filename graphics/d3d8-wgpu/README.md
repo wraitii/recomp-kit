@@ -148,7 +148,8 @@ caveat. Draws reject unsupported reached state by name.
 
 CPU textures keep native texel layouts and stage locks through guest memory.
 CreateImageSurface uses the same storage for standalone SYSTEMMEM surfaces,
-including descriptors, locks, CopyRects and device retention.
+including descriptors, locks, CopyRects and device retention. CopyRects accepts
+the zero-count/null-array form for copying a whole surface, including compressed mips.
 GPU sampling and indexed triangle lists use immutable draw snapshots, with
 expansion available for other supported topologies and diagnostic comparisons.
 Resource pool/usage,

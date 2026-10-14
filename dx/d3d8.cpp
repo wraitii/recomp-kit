@@ -2934,12 +2934,14 @@ void Dev_CopyRects(X86 *c) {
     ComObj *src = com_this(arg(c, 1), IF_D3D8SURFACE8);
     ComObj *dst = com_this(arg(c, 4), IF_D3D8SURFACE8);
     uint32_t rects = arg(c, 2), count = arg(c, 3), points = arg(c, 5);
-    if (!dev || !src || !dst || !count || src->rmask != dst->rmask || d8_resource_info(src).depth ||
-        d8_resource_info(dst).depth) {
+    const bool whole_surface = !rects && !count && !points;
+    if (!dev || !src || !dst || (!count && !whole_surface) || src->rmask != dst->rmask ||
+        d8_resource_info(src).depth || d8_resource_info(dst).depth) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if (!gm_valid(rects, count * 16) || (points && !gm_valid(points, count * 8))) {
+    if (!whole_surface && (count > UINT32_MAX / 16 || !gm_valid(rects, count * 16) ||
+                           (points && !gm_valid(points, count * 8)))) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
@@ -2959,11 +2961,13 @@ void Dev_CopyRects(X86 *c) {
     }
     const uint32_t block = d8_block_bytes(src->rmask);
     const uint32_t texel = block ? block : src->bpp / 8;
+    if (whole_surface)
+        count = 1;
     for (uint32_t i = 0; i < count; ++i) {
-        int32_t left = (int32_t)rd32(rects + i * 16);
-        int32_t top = (int32_t)rd32(rects + i * 16 + 4);
-        int32_t right = (int32_t)rd32(rects + i * 16 + 8);
-        int32_t bottom = (int32_t)rd32(rects + i * 16 + 12);
+        int32_t left = whole_surface ? 0 : (int32_t)rd32(rects + i * 16);
+        int32_t top = whole_surface ? 0 : (int32_t)rd32(rects + i * 16 + 4);
+        int32_t right = whole_surface ? (int32_t)src->width : (int32_t)rd32(rects + i * 16 + 8);
+        int32_t bottom = whole_surface ? (int32_t)src->height : (int32_t)rd32(rects + i * 16 + 12);
         int32_t dx = left, dy = top;
         if (points) {
             dx = (int32_t)rd32(points + i * 8);
@@ -2979,13 +2983,13 @@ void Dev_CopyRects(X86 *c) {
         if (block) {
             // Block formats address 4x4 blocks; D3D8 requires a block-aligned
             // rect. The block row pitch is the level pitch.
-            if ((left & 3) || (top & 3) || (dx & 3) || (dy & 3) || ((right - left) & 3) ||
-                ((bottom - top) & 3)) {
+            if (!whole_surface && ((left & 3) || (top & 3) || (dx & 3) || (dy & 3) ||
+                                   ((right - left) & 3) || ((bottom - top) & 3))) {
                 com_ret(c, D8_ERR_INVALIDCALL);
                 return;
             }
-            const uint32_t row = uint32_t(right - left) / 4 * block;
-            const uint32_t rows = uint32_t(bottom - top) / 4;
+            const uint32_t row = (uint32_t(right - left) + 3) / 4 * block;
+            const uint32_t rows = (uint32_t(bottom - top) + 3) / 4;
             const uint8_t *s =
                 sbase + (uint32_t)(top / 4) * src->pitch + (uint32_t)(left / 4) * block;
             uint8_t *d = dbase + (uint32_t)(dy / 4) * dst->pitch + (uint32_t)(dx / 4) * block;
