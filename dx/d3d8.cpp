@@ -3108,6 +3108,7 @@ void Dev_DrawPrimitiveUP(X86 *c) {
         return;
     }
     recomp::d3d::set_stream(*dev->d3d8_device->value, 0, 0);
+    dev->d3d8_streams[0] = {};
     const uint32_t topology = arg(c, 1), count = arg(c, 2);
     const uint32_t vertices = arg(c, 3), stride = arg(c, 4);
     if (!stride) {
@@ -3148,6 +3149,63 @@ void Dev_DrawPrimitiveUP(X86 *c) {
     auto status = recomp::d3d::draw_primitive(
         *dev->d3d8_device->value, topology, d8_selected_vertex_shader(dev),
         rust::Slice<const uint8_t>(gm_ptr(vertices), size_t(bytes)), stride, 0, count);
+    com_ret(c, bridge_result(c, status));
+}
+
+void Dev_DrawIndexedPrimitiveUP(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    if (!dev || !dev->d3d8_device) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::set_stream(*dev->d3d8_device->value, 0, 0);
+    dev->d3d8_streams[0] = {};
+    recomp::d3d::set_indices(*dev->d3d8_device->value, 0, 0);
+    const uint32_t topology = arg(c, 1), min_index = arg(c, 2), num_vertices = arg(c, 3);
+    const uint32_t count = arg(c, 4), indices = arg(c, 5), format = arg(c, 6);
+    const uint32_t vertices = arg(c, 7), stride = arg(c, 8);
+    if (!stride || (format != D3DFMT_INDEX16 && format != D3DFMT_INDEX32) ||
+        recomp::d3d::shader_stream_count(*dev->d3d8_device->value) > 1) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    if (!count) {
+        com_ret(c, D8_OK);
+        return;
+    }
+    uint64_t index_count;
+    switch (topology) {
+    case 4:
+        index_count = uint64_t(count) * 3;
+        break;
+    case 6:
+        index_count = uint64_t(count) + 2;
+        break;
+    default:
+        fprintf(stderr, "d3d8: DrawIndexedPrimitiveUP unsupported topology %u\n", topology);
+        imports_unsupported(c);
+        return;
+    }
+    const uint64_t vertex_end = uint64_t(min_index) + num_vertices;
+    if (!num_vertices || vertex_end > UINT32_MAX) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    const uint64_t vbytes = vertex_end * stride;
+    const uint64_t ibytes = index_count * (format == D3DFMT_INDEX16 ? 2u : 4u);
+    if (!vertices || !indices || vbytes > UINT32_MAX || ibytes > UINT32_MAX ||
+        !gm_valid(vertices, uint32_t(vbytes)) || !gm_valid(indices, uint32_t(ibytes))) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    for (uint32_t stage = 0; stage < (d8_pixel_shader_bound(dev) ? 4u : 2u); ++stage)
+        if (!d8_sync_texture(c, dev, stage))
+            return;
+    auto status = recomp::d3d::draw_indexed_primitive(
+        *dev->d3d8_device->value, topology, d8_selected_vertex_shader(dev),
+        rust::Slice<const uint8_t>(gm_ptr(vertices), size_t(vbytes)), stride,
+        rust::Slice<const uint8_t>(gm_ptr(indices), size_t(ibytes)), format, 0, min_index,
+        num_vertices, 0, count);
     com_ret(c, bridge_result(c, status));
 }
 

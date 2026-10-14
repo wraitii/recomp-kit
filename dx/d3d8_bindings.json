@@ -65,6 +65,7 @@
       "SetTexture": "Dev_SetTexture",
       "DrawPrimitive": "Dev_DrawPrimitive",
       "DrawPrimitiveUP": "Dev_DrawPrimitiveUP",
+      "DrawIndexedPrimitiveUP": "Dev_DrawIndexedPrimitiveUP",
       "DrawIndexedPrimitive": "Dev_DrawIndexedPrimitive",
       "ProcessVertices": "Dev_ProcessVertices",
       "SetVertexShader": "Dev_SetVertexShader",
