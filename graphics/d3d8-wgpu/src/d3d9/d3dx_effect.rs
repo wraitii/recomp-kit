@@ -2392,14 +2392,14 @@ fn state_uses_name(effect: &D3dxEffect, state: &EfxState, name: &[u8]) -> bool {
         }
         for id in ids {
             if let Some(object) = effect.objects.get(&id) {
-                if ctab_uses_name(&object.data, name) {
+                if ctab_uses_name(effect, &object.data, name) {
                     return true;
                 }
             }
         }
     }
     if let Some(code) = &state.preshader {
-        if ctab_uses_name(code, name) {
+        if ctab_uses_name(effect, code, name) {
             return true;
         }
     }
@@ -2411,22 +2411,28 @@ fn sampler_uses_name(effect: &D3dxEffect, index: usize, name: &[u8]) -> bool {
         return false;
     };
     for state in states {
-        if state.referenced.as_deref() == Some(name) {
+        if state_uses_name(effect, state, name) {
             return true;
         }
     }
     false
 }
 
-fn ctab_uses_name(code: &[u8], name: &[u8]) -> bool {
+fn ctab_uses_name(effect: &D3dxEffect, code: &[u8], name: &[u8]) -> bool {
     let Ok(constants) = parse_ctab(code) else {
         return true;
     };
-    if constants.iter().any(|constant| constant.name == name) {
+    if constants.iter().any(|constant| {
+        constant.name == name
+            || (constant.set == D3DXRS_SAMPLER
+                && effect
+                    .find_param_index(&constant.name)
+                    .is_some_and(|index| sampler_uses_name(effect, index, name)))
+    }) {
         return true;
     }
     match preshader::shader_preshader(code) {
-        Ok(Some(code)) => ctab_uses_name(code, name),
+        Ok(Some(code)) => ctab_uses_name(effect, code, name),
         Ok(None) => false,
         Err(_) => true,
     }
