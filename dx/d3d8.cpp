@@ -1607,6 +1607,54 @@ void Dev_CreateTexture(X86 *c) {
     com_ret(c, D8_OK);
 }
 
+void Dev_CreateImageSurface(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t w = arg(c, 1), h = arg(c, 2), format = arg(c, 3), out = arg(c, 4);
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, 0);
+    if (!dev) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    ComObj *surface = com_new(K_D3D8SURFACE);
+    if (!surface) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    auto configuration = d8_resource(surface)->configure_texture(w, h, 1, format);
+    if (!d3d_bridge_ok(configuration.status)) {
+        com_release(surface);
+        com_ret(c, bridge_result(c, configuration.status));
+        return;
+    }
+    const auto &layout = configuration.levels[0];
+    if (layout.byte_len > GUEST_SIZE || !storage_alloc(surface, layout.byte_len)) {
+        com_release(surface);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    surface->d3d8_owner = dev->id;
+    surface->d3d8_owner_retained = true;
+    com_addref(dev);
+    surface->rmask = format;
+    surface->width = w;
+    surface->height = h;
+    surface->bpp = d8_format_bytes(format) * 8;
+    surface->pitch = layout.pitch;
+    d8_resource(surface)->set_flags(0, D3DPOOL_SYSTEMMEM, false, false, 0, 0, 0, 0);
+    uint32_t view = com_view(surface, IF_D3D8SURFACE8);
+    if (!view) {
+        com_release(surface);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    wr32(out, view);
+    com_ret(c, D8_OK);
+}
+
 // (this, Width, Height, Format, MultiSampleType, ppSurface). A standalone
 // depth-stencil surface the guest can bind with SetRenderTarget. D3D8 accepts
 // D16, D24X8, D24S8 and D32. The object stores the descriptor and is retired
@@ -1795,8 +1843,7 @@ bool d8_lock_offset(const ComObj *level, uint32_t rect, uint32_t *offset) {
     return true;
 }
 
-// A texture level is one K_D3D8SURFACE; the implicit backbuffer has no blob
-// and leaves d3d8_texture zero. The level's own bytes back its lock.
+// CPU surfaces own storage; implicit backbuffer and depth surfaces do not.
 void Surface_GetDesc(X86 *c) {
     ComObj *surface = com_this_arg(c, IF_D3D8SURFACE8);
     uint32_t out = arg(c, 1);
@@ -1805,7 +1852,7 @@ void Surface_GetDesc(X86 *c) {
         return;
     }
     uint32_t format, usage, pool, size, width, height;
-    if (surface->d3d8_texture) {
+    if (surface->d3d8_storage) {
         format = surface->rmask;
         usage = d8_resource_info(surface).usage;
         pool = d8_resource_info(surface).pool;
@@ -1877,7 +1924,7 @@ void Surface_LockRect(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if (!surface->d3d8_texture) {
+    if (!surface->d3d8_storage) {
         ComObj *dev = com_get(surface->d3d8_owner);
         if (dev && dev->d3d8_backbuffer == surface->id) {
             const uint32_t flags = arg(c, 3);
@@ -2648,7 +2695,7 @@ bool d8_shader_words(uint32_t addr, bool declaration, std::vector<uint32_t> &out
             else if (op == 81)
                 extra = 5;
             else if (op == 1 || (op >= 6 && op <= 7) || (op >= 14 && op <= 16) || op == 19 ||
-                     op == 78 || op == 79)
+                     op == 73 || op == 77 || op == 78 || op == 79)
                 extra = 2;
             else if (op == 4 || op == 18 || op == 80)
                 extra = 4;

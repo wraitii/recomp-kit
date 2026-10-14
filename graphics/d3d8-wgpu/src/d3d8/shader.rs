@@ -237,6 +237,7 @@ pub struct Program {
     pub declaration_only: bool,
     pub body: String,
     pub samplers: [bool; 4],
+    pub cube_reflection: bool,
 }
 fn register(t: u32, pixel: bool, dest: bool) -> Result<String, RenderError> {
     if t & 0x80000000 == 0 {
@@ -296,6 +297,15 @@ fn source(t: u32, pixel: bool) -> Result<String, RenderError> {
     })
 }
 impl Program {
+    pub fn validate_draw(&self) -> Result<(), RenderError> {
+        if self.cube_reflection {
+            return Err(fail(
+                "TEXM3X3VSPEC requires unsupported cube/volume sampling and four-component texture coordinates",
+            ));
+        }
+        Ok(())
+    }
+
     /// Decode one bounded SM1.0/1.1 program; unknown instructions fail by name.
     pub fn parse(words: &[u32], pixel: bool) -> Result<Self, RenderError> {
         let version = if pixel { 0xffff0100 } else { 0xfffe0100 };
@@ -305,12 +315,17 @@ impl Program {
         let mut i = 1;
         let mut body = String::new();
         let mut samplers = [false; 4];
+        let mut cube_reflection = false;
+        let mut matrix_rows: Vec<(u32, u32)> = Vec::new();
         let mut seq = 0;
         while i < words.len() {
             let ins = words[i];
             i += 1;
             let op = ins & 0xffff;
             if op == 0xffff {
+                if !matrix_rows.is_empty() {
+                    return Err(fail("incomplete TEXM3X3PAD sequence"));
+                }
                 if i != words.len() {
                     return Err(fail("trailing shader tokens"));
                 }
@@ -319,6 +334,7 @@ impl Program {
                     declaration_only: false,
                     body,
                     samplers,
+                    cube_reflection,
                 });
             }
             if op == 0xfffe {
@@ -331,11 +347,16 @@ impl Program {
             if ins & !0xffff != 0 {
                 return Err(fail(format!("instruction flags/coissue {ins:#010x}")));
             }
+            if !matrix_rows.is_empty() && op != 73 && op != 77 {
+                return Err(fail(
+                    "TEXM3X3PAD must be followed by TEXM3X3PAD/TEXM3X3VSPEC",
+                ));
+            }
             if op == 0 {
                 continue;
             }
             let n = match op {
-                1 | 6 | 7 | 14 | 15 | 16 | 19 | 78 | 79 => 1,
+                1 | 6 | 7 | 14 | 15 | 16 | 19 | 73 | 77 | 78 | 79 => 1,
                 2 | 3 | 5 | 8 | 9 | 10 | 11 | 12 | 13 | 17 | 20..=24 | 67..=70 => 2,
                 4 | 18 | 80 => 3,
                 64..=66 => 0,
@@ -351,6 +372,40 @@ impl Program {
             let args = &words[i + 1..i + 1 + n];
             i += 1 + n;
             let name = register(dst, pixel, true)?;
+            if op == 73 || op == 77 {
+                let stage = dst & 0x7ff;
+                let src = args[0];
+                source(src, pixel)?;
+                if !pixel
+                    || dst != (0xb00f0000 | stage)
+                    || stage >= 4
+                    || (src >> 28) & 7 != 3
+                    || src & 0x7ff >= stage
+                    || src & 0x00ff0000 != 0x00e40000
+                    || !matches!((src >> 24) & 15, 0 | 4)
+                {
+                    return Err(fail("invalid TEXM3X3PAD/TEXM3X3VSPEC operands"));
+                }
+                if let Some(&(first, input)) = matrix_rows.first() {
+                    if stage != first + matrix_rows.len() as u32 || src != input {
+                        return Err(fail("nonconsecutive TEXM3X3PAD/TEXM3X3VSPEC sequence"));
+                    }
+                }
+                if op == 73 {
+                    if matrix_rows.len() >= 2 || stage >= 2 + matrix_rows.len() as u32 {
+                        return Err(fail("too many/out-of-range TEXM3X3PAD rows"));
+                    }
+                    matrix_rows.push((stage, src));
+                } else {
+                    if matrix_rows.len() != 2 {
+                        return Err(fail("TEXM3X3VSPEC requires two TEXM3X3PAD rows"));
+                    }
+                    matrix_rows.clear();
+                    cube_reflection = true;
+                    samplers[stage as usize] = true;
+                }
+                continue;
+            }
             if op == 81 {
                 if (dst >> 28) & 7 != 2 {
                     return Err(fail("DEF destination must be a constant"));
@@ -538,6 +593,9 @@ fn replace_block(s: &mut String, start: &str, replacement: &str) {
 /// and alpha testing remain post-fragment operations; specular addition is
 /// bypassed for a pixel shader. D3D7 can reuse the token-free fixed stages.
 pub fn compose(vs: Option<(&Declaration, &Program)>, ps: Option<&Program>, lit: bool) -> String {
+    if let Some(p) = ps {
+        p.validate_draw().expect("validated pixel shader draw");
+    }
     let mut s = if lit {
         lit_shader_source(true)
     } else {

@@ -1971,6 +1971,9 @@ impl Device {
         };
         let vs = bound_vs.filter(|(_, p)| !p.declaration_only);
         let ps = self.shaders.get(&self.pixel_shader).map(|s| &s.1);
+        if let Some(ps) = ps {
+            ps.validate_draw()?;
+        }
         let programmable = vs.is_some() || ps.is_some();
         if vs.is_some() {
             survey_or_skip!(self.state.validate_shader_draw());

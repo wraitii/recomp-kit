@@ -147,6 +147,8 @@ onto wgpu depth formats; the backend-defined D24 precision remains a fidelity
 caveat. Draws reject unsupported reached state by name.
 
 CPU textures keep native texel layouts and stage locks through guest memory.
+CreateImageSurface uses the same storage for standalone SYSTEMMEM surfaces,
+including descriptors, locks, CopyRects and device retention.
 GPU sampling and indexed triangle lists use immutable draw snapshots, with
 expansion available for other supported topologies and diagnostic comparisons.
 Resource pool/usage,

@@ -2713,6 +2713,7 @@ pub fn create_shader(
             declaration_only: true,
             body: String::new(),
             samplers: [false; 4],
+            cube_reflection: false,
         }
     } else {
         match Program::parse(function, pixel) {
