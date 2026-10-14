@@ -339,7 +339,7 @@ structured transition plan described above.
 
 C emission stores integer SSA values of up to four bytes in `uint32_t` and
 explicitly widens qword results and `SUBPIECE` shifts. Guest accesses cache the
-arena base, refreshed after calls, string/division helpers and SEH seams; builds
+arena base once per function, since only boot replaces the arena; builds
 with store hooks or null checks retain the original accessors. Guest writes and
 state publications remain ordered. Ordinary continuations use a small inline
 return check with general dispatch shared in a cold helper per chunk. Contract

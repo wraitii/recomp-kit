@@ -19,6 +19,18 @@ static inline void recomp_return_fast_(X86 *c) {
 }
 """
 
+TABLE_RETURN_HELPERS = """
+extern const uint32_t recomp_call_return_min, recomp_call_return_span;
+extern const uint32_t recomp_call_return_bits[];
+RECOMP_COLD void recomp_return_slow_(X86 *c) { recomp_return(c); }
+static inline void recomp_return_fast_(X86 *c) {
+    uint32_t off = c->eip - recomp_call_return_min;
+    if (RECOMP_UNLIKELY(off >= recomp_call_return_span) ||
+        RECOMP_UNLIKELY(!((recomp_call_return_bits[off >> 5] >> (off & 31)) & 1u)))
+        recomp_return_slow_(c);
+}
+"""
+
 FLOAT_HELPERS = """
 RECOMP_HOT_INLINE void recomp_fcom_(uint16_t *status, double a, double b, int quiet) {
     if (RECOMP_UNLIKELY(isnan(a) || isnan(b))) {
@@ -278,7 +290,6 @@ def emit_prepared(prepared, external_entry=False):
                     lines.append("}")
                 elif v.opc == "CALL":
                     lines.extend(boundary.event(v))
-                    lines.append("arena_ = g_mem;")
                 elif v.opc in ("CALL_RELOAD", "CALL_KEEP"):
                     lines.extend(boundary.event(v))
                 elif v.opc == "CALLIND":
@@ -287,7 +298,6 @@ def emit_prepared(prepared, external_entry=False):
                     # already stored by the preceding lifted CALL sequence, and the
                     # SSA builder reloads every tracked lane/flag afterward.
                     lines.extend(boundary.event(v))
-                    lines.append("arena_ = g_mem;")
                 elif v.opc == "STRINGOP":
                     # Byte-audited string instruction. Publication before the helper
                     # and reloads afterward keep guest memory observers and fault
@@ -295,7 +305,6 @@ def emit_prepared(prepared, external_entry=False):
                     # EDI/ESI/ECX/DF exactly as the eager emitter's string calls do.
                     lines.extend(publish(v))
                     lines.append("%s(c);" % v.data["helper"])
-                    lines.append("arena_ = g_mem;")
                 elif v.opc in ("LOAD", "STORE", "DIV32", "IDIV32"):
                     # Guest accesses do not observe x87 state (see x87_scalar.py);
                     # only strict mode publishes before them. The division seam
@@ -306,7 +315,6 @@ def emit_prepared(prepared, external_entry=False):
                         lines.append("%s(c, (uint32_t)%s, (uint32_t)%s);"
                                      % (helper, ref(v.args[2]), ref(v.args[3])))
                         lines.append("v%d = c->r[R_EAX] | ((uint64_t)c->r[R_EDX] << 32);" % v.id)
-                        lines.append("arena_ = g_mem;")
                     elif v.opc == "LOAD":
                         lines.append("v%d = recomp_rd%d_(arena_, (uint32_t)%s);" % (v.id, v.size * 8, ref(v.args[1])))
                     else:
@@ -317,7 +325,6 @@ def emit_prepared(prepared, external_entry=False):
                 elif v.opc == "SEH":
                     lines.extend(publish(v))
                     lines.extend(seh_lines(v.data["kind"], v.data["eip"]))
-                    lines.append("arena_ = g_mem;")
                 elif v.opc == "TRAP":
                     lines.append("recomp_unknown_call(c, 0x%xu); return;" % v.data)
                 elif v.opc == "TAIL":
