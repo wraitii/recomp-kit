@@ -2,8 +2,8 @@ use super::TargetRect;
 use super::format;
 use super::gpu::D3d9Gpu;
 use crate::RenderError;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub const D3DPOOL_DEFAULT: u32 = 0;
 pub const D3DPOOL_MANAGED: u32 = 1;
@@ -198,6 +198,7 @@ pub struct BufferState {
     pub fvf: u32,
     pub format: u32,
     pub bytes: Vec<u8>,
+    pub uploaded: Arc<Mutex<Vec<u8>>>,
     pub lock_count: Arc<AtomicU32>,
     pub writable: Vec<(u32, u32)>,
     pub writable_dirty: bool,
@@ -888,6 +889,7 @@ pub fn create_buffer(
         pool: request.pool,
         fvf: request.fvf,
         format: request.format,
+        uploaded: Arc::new(Mutex::new(alloc_bytes(request.size)?)),
         bytes,
         lock_count: Arc::new(AtomicU32::new(0)),
         writable: Vec::new(),
@@ -1349,6 +1351,10 @@ pub fn upload_buffer(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(), R
         }
     }
     gpu.write_buffer_padded(buffer, &b.bytes, lo, hi)?;
+    let align = wgpu::COPY_BUFFER_ALIGNMENT as u32;
+    let copy_lo = (lo - lo % align) as usize;
+    let copy_hi = (hi.next_multiple_of(align) as usize).min(b.bytes.len());
+    b.uploaded.lock().unwrap()[copy_lo..copy_hi].copy_from_slice(&b.bytes[copy_lo..copy_hi]);
     b.dirty_lo = 0;
     b.dirty_hi = 0;
     b.gpu_generation = b.generation;
@@ -1365,6 +1371,7 @@ pub fn readback_buffer(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(),
     };
     let mut out = alloc_bytes(b.bytes.len() as u32)?;
     gpu.read_buffer(buffer, b.bytes.len() as u32, &mut out)?;
+    b.uploaded.lock().unwrap().copy_from_slice(&out);
     b.bytes = out;
     b.gpu_generation = b.generation;
     resource.clear_gpu_newer();
@@ -1623,6 +1630,7 @@ pub fn preload(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(), RenderE
 #[derive(Default)]
 pub struct StagedStorage {
     pub buffer: Option<wgpu::Buffer>,
+    pub uploaded: Option<Arc<Mutex<Vec<u8>>>>,
     pub texture: Option<wgpu::Texture>,
 }
 
@@ -1637,7 +1645,12 @@ pub fn stage_restore(gpu: &D3d9Gpu, resource: &D3d9Resource) -> Result<StagedSto
 
 pub fn install_staged(resource: &mut D3d9Resource, staged: StagedStorage, gpu: &D3d9Gpu) {
     match resource.state.as_mut() {
-        Some(ResourceState::Buffer(b)) => b.gpu = staged.buffer,
+        Some(ResourceState::Buffer(b)) => {
+            b.gpu = staged.buffer;
+            if let Some(uploaded) = staged.uploaded {
+                b.uploaded = uploaded;
+            }
+        }
         Some(ResourceState::Texture(t)) => t.gpu = staged.texture,
         Some(ResourceState::Surface(s)) => s.gpu = staged.texture,
         None => {}
@@ -1663,7 +1676,10 @@ fn stage_buffer(gpu: &D3d9Gpu, b: &BufferState) -> Result<StagedStorage, RenderE
         | wgpu::BufferUsages::COPY_SRC;
     let buffer = gpu.create_buffer(aligned, usage)?;
     gpu.write_buffer_padded(&buffer, &b.bytes, 0, b.size)?;
+    let mut uploaded = alloc_bytes(b.size)?;
+    uploaded.copy_from_slice(&b.bytes);
     Ok(StagedStorage {
+        uploaded: Some(Arc::new(Mutex::new(uploaded))),
         buffer: Some(buffer),
         texture: None,
     })
@@ -1711,6 +1727,7 @@ fn stage_texture(gpu: &D3d9Gpu, t: &TextureState) -> Result<StagedStorage, Rende
     }
     Ok(StagedStorage {
         buffer: None,
+        uploaded: None,
         texture: Some(texture),
     })
 }
@@ -1747,6 +1764,7 @@ fn stage_surface(gpu: &D3d9Gpu, s: &SurfaceState) -> Result<StagedStorage, Rende
     }
     Ok(StagedStorage {
         buffer: None,
+        uploaded: None,
         texture: Some(texture),
     })
 }

@@ -20,8 +20,8 @@ use crate::d3d9::gpu::{D3d9Gpu, D3d9Loss};
 pub use crate::d3d9::resource::D3d9Resource;
 use crate::d3d9::resource::StagedStorage;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub mod copy;
 pub mod d3dx;
@@ -172,6 +172,7 @@ pub(crate) struct SurfaceView {
 pub(crate) enum GpuRegistryEntry {
     Buffer {
         buffer: wgpu::Buffer,
+        uploaded: Arc<Mutex<Vec<u8>>>,
         size: u32,
         format: u32,
         fvf: u32,
@@ -1771,6 +1772,7 @@ fn gpu_entry_from_staged(
         };
         return Some(GpuRegistryEntry::Buffer {
             buffer: buffer.clone(),
+            uploaded: Arc::clone(staged.uploaded.as_ref()?),
             size: b.size,
             format: b.format,
             fvf: b.fvf,
@@ -1808,12 +1810,15 @@ fn gpu_entry_from_staged(
 }
 
 fn gpu_entry_from_resource(resource: &D3d9Resource) -> Option<GpuRegistryEntry> {
-    if let Some((buffer, size, format, fvf, _)) = resource.buffer_gpu() {
+    if let Some(resource::ResourceState::Buffer(b)) = resource.state.as_ref()
+        && let Some(buffer) = b.gpu.as_ref()
+    {
         return Some(GpuRegistryEntry::Buffer {
-            buffer,
-            size,
-            format,
-            fvf,
+            buffer: buffer.clone(),
+            uploaded: Arc::clone(&b.uploaded),
+            size: b.size,
+            format: b.format,
+            fvf: b.fvf,
             fresh: resource.freshness(),
         });
     }
@@ -4246,6 +4251,29 @@ fn bound_textures(
     Ok(out)
 }
 
+fn read_draw_buffer(
+    gpu: &D3d9Gpu,
+    entry: &GpuRegistryEntry,
+    out: &mut [u8],
+) -> Result<(), RenderError> {
+    let GpuRegistryEntry::Buffer {
+        buffer,
+        uploaded,
+        size,
+        fresh,
+        ..
+    } = entry
+    else {
+        return Err(unsupported("Draw", "resource is not a buffer"));
+    };
+    if fresh.load(Ordering::Acquire) {
+        gpu.read_buffer(buffer, *size, out)
+    } else {
+        out.copy_from_slice(&uploaded.lock().unwrap());
+        Ok(())
+    }
+}
+
 fn collect_streams(
     gpu: &D3d9Gpu,
     device: &D3d9Device,
@@ -4258,7 +4286,7 @@ fn collect_streams(
             continue;
         }
         require_unlocked(device, source.buffer, "Draw vertex buffer")?;
-        let Some(GpuRegistryEntry::Buffer { buffer, size, .. }) =
+        let Some(entry @ GpuRegistryEntry::Buffer { size, .. }) =
             device.registry.get(&source.buffer)
         else {
             return Err(unsupported(
@@ -4267,7 +4295,7 @@ fn collect_streams(
             ));
         };
         let mut bytes = alloc_bytes(*size)?;
-        gpu.read_buffer(buffer, *size, &mut bytes)?;
+        read_draw_buffer(gpu, entry, &mut bytes)?;
         out.push(draw::StreamData {
             stream,
             stride: source.stride,
@@ -4285,14 +4313,9 @@ fn index_buffer(
 ) -> Result<(Vec<u8>, u32), RenderError> {
     require_unlocked(device, id, "Draw index buffer")?;
     match device.registry.get(&id) {
-        Some(GpuRegistryEntry::Buffer {
-            buffer,
-            size,
-            format,
-            ..
-        }) => {
+        Some(entry @ GpuRegistryEntry::Buffer { size, format, .. }) => {
             let mut bytes = alloc_bytes(*size)?;
-            gpu.read_buffer(buffer, *size, &mut bytes)?;
+            read_draw_buffer(gpu, entry, &mut bytes)?;
             Ok((bytes, *format))
         }
         _ => Err(unsupported("Draw", "index buffer has no GPU storage")),

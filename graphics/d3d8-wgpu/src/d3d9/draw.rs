@@ -4,6 +4,7 @@ use super::state::D3d9State;
 use super::{SurfaceView, TargetRect, wgsl};
 use crate::RenderError;
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 pub const D3DPT_POINTLIST: u32 = 1;
 pub const D3DPT_LINELIST: u32 = 2;
@@ -1228,11 +1229,121 @@ fn make_buffer(
             usage,
         })
 }
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PipelineKey {
+    modules: [wgpu::ShaderModule; 2],
+    layout: wgpu::BindGroupLayout,
+    attributes: Vec<wgpu::VertexAttribute>,
+    target: wgpu::ColorTargetState,
+    primitive: wgpu::PrimitiveState,
+    depth: Option<wgpu::DepthStencilState>,
+    multisample: wgpu::MultisampleState,
+}
+
 #[derive(Default)]
-pub(crate) struct D3d9DrawState {}
+pub(crate) struct D3d9DrawState {
+    shaders: HashMap<String, wgpu::ShaderModule>,
+    layouts: HashMap<Vec<wgpu::BindGroupLayoutEntry>, wgpu::BindGroupLayout>,
+    pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
+}
 impl D3d9DrawState {
-    pub fn clear(&mut self) {}
+    pub fn clear(&mut self) {
+        self.pipelines.clear();
+        self.layouts.clear();
+        self.shaders.clear();
+    }
     pub fn drop_resource(&mut self, _id: u32) {}
+
+    fn shader(&mut self, gpu: &D3d9Gpu, source: String) -> Result<wgpu::ShaderModule, RenderError> {
+        if let Some(shader) = self.shaders.get(&source) {
+            return Ok(shader.clone());
+        }
+        wgsl::validate(&source)?;
+        let shader = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("d3d9-cached"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(&source)),
+            });
+        if self.shaders.len() >= 512 {
+            self.clear();
+        }
+        self.shaders.insert(source, shader.clone());
+        Ok(shader)
+    }
+
+    fn layout(
+        &mut self,
+        gpu: &D3d9Gpu,
+        entries: Vec<wgpu::BindGroupLayoutEntry>,
+    ) -> wgpu::BindGroupLayout {
+        if let Some(layout) = self.layouts.get(&entries) {
+            return layout.clone();
+        }
+        let layout = gpu
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("d3d9-cached"),
+                entries: &entries,
+            });
+        if self.layouts.len() >= 128 {
+            self.pipelines.clear();
+            self.layouts.clear();
+        }
+        self.layouts.insert(entries, layout.clone());
+        layout
+    }
+
+    fn pipeline(&mut self, gpu: &D3d9Gpu, key: PipelineKey) -> wgpu::RenderPipeline {
+        if let Some(pipeline) = self.pipelines.get(&key) {
+            return pipeline.clone();
+        }
+        let layout = gpu
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("d3d9-cached"),
+                bind_group_layouts: &[&key.layout],
+                push_constant_ranges: &[],
+            });
+        let vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: (key.attributes.len() * 16) as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &key.attributes,
+        };
+        let buffers = if key.attributes.is_empty() {
+            Vec::new()
+        } else {
+            vec![vertex_layout]
+        };
+        let pipeline = gpu
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("d3d9-cached"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &key.modules[0],
+                    entry_point: Some("vs_main"),
+                    buffers: &buffers,
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &key.modules[1],
+                    entry_point: Some("ps_main"),
+                    targets: &[Some(key.target.clone())],
+                    compilation_options: Default::default(),
+                }),
+                primitive: key.primitive,
+                depth_stencil: key.depth.clone(),
+                multisample: key.multisample,
+                multiview: None,
+                cache: None,
+            });
+        if self.pipelines.len() >= 512 {
+            self.pipelines.clear();
+        }
+        self.pipelines.insert(key, pipeline.clone());
+        pipeline
+    }
 }
 fn texture_dimension(t: &BoundTexture) -> wgpu::TextureViewDimension {
     if t.cube {
@@ -1315,7 +1426,6 @@ fn translated_source(
         source = source.replace("return col;", "return d9_output(col,vin);");
         source += OUTPUT;
     }
-    wgsl::validate(&source)?;
     Ok(source)
 }
 fn shading_source(mut source: String, state: &D3d9State) -> String {
@@ -1348,7 +1458,7 @@ fn uniform_entry(
 
 pub(crate) fn execute(
     gpu: &D3d9Gpu,
-    _draw: &mut D3d9DrawState,
+    draw: &mut D3d9DrawState,
     state: &D3d9State,
     objects: &super::shader::D3d9Objects,
     snapshot: DrawSnapshot,
@@ -1523,8 +1633,6 @@ pub(crate) fn execute(
             ));
         }
     }
-    wgsl::validate(&vertex_source)?;
-    wgsl::validate(&pixel_source)?;
     let textures: Vec<&BoundTexture> = snapshot
         .textures
         .iter()
@@ -1580,12 +1688,7 @@ pub(crate) fn execute(
             count: None,
         });
     }
-    let layout = gpu
-        .device
-        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("d3d9-draw"),
-            entries: &layout_entries,
-        });
+    let layout = draw.layout(gpu, layout_entries);
     let vp = state.viewport();
     if vp.width == 0 || vp.height == 0 || vp.min_z < 0.0 || vp.max_z > 1.0 || vp.min_z > vp.max_z {
         return Err(unsupported(
@@ -1652,16 +1755,8 @@ pub(crate) fn execute(
         entries: &entries,
     });
     let modules = [
-        gpu.device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("d3d9-vs"),
-                source: wgpu::ShaderSource::Wgsl(Cow::Owned(vertex_source)),
-            }),
-        gpu.device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("d3d9-ps"),
-                source: wgpu::ShaderSource::Wgsl(Cow::Owned(pixel_source)),
-            }),
+        draw.shader(gpu, vertex_source)?,
+        draw.shader(gpu, pixel_source)?,
     ];
     let attributes: Vec<_> = if let Some(linked) = &linked {
         linked
@@ -1682,64 +1777,37 @@ pub(crate) fn execute(
             })
             .collect()
     };
-    let vertex_layout = wgpu::VertexBufferLayout {
-        array_stride: (attributes.len() * 16) as u64,
-        step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &attributes,
-    };
-    let pipeline_layout = gpu
-        .device
-        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("d3d9-draw"),
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
-        });
+    let has_attributes = !attributes.is_empty();
     let cull = match rs(state, 22) {
         1 => None,
         2 => Some(wgpu::Face::Front),
         _ => Some(wgpu::Face::Back),
     };
-    let targets = [Some(wgpu::ColorTargetState {
+    let target = wgpu::ColorTargetState {
         format: snapshot.target.texture.format(),
         blend: blend_state(state, opaque_format(snapshot.target.format))?,
         write_mask: wgpu::ColorWrites::from_bits_truncate(rs(state, 168)),
-    })];
-    let vertex_layouts = if attributes.is_empty() {
-        Vec::new()
-    } else {
-        vec![vertex_layout]
     };
-    let pipeline = gpu
-        .device
-        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("d3d9-draw"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &modules[0],
-                entry_point: Some("vs_main"),
-                buffers: &vertex_layouts,
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &modules[1],
-                entry_point: Some("ps_main"),
-                targets: &targets,
-                compilation_options: Default::default(),
-            }),
+    let pipeline = draw.pipeline(
+        gpu,
+        PipelineKey {
+            modules,
+            layout,
+            attributes,
+            target,
             primitive: wgpu::PrimitiveState {
                 topology,
                 front_face: wgpu::FrontFace::Cw,
                 cull_mode: cull,
                 ..Default::default()
             },
-            depth_stencil: depth_state(state, snapshot.depth.as_ref())?,
+            depth: depth_state(state, snapshot.depth.as_ref())?,
             multisample: wgpu::MultisampleState {
                 mask: u64::from(rs(state, 162)),
                 ..Default::default()
             },
-            multiview: None,
-            cache: None,
-        });
+        },
+    );
     let vertex = make_buffer(
         gpu,
         "d3d9-vertices",
@@ -1788,7 +1856,7 @@ pub(crate) fn execute(
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind, &[]);
-        if !attributes.is_empty() {
+        if has_attributes {
             pass.set_vertex_buffer(0, vertex.slice(..));
         }
         pass.set_viewport(
@@ -1855,7 +1923,7 @@ pub(crate) fn execute(
 
 pub(crate) fn clear(
     gpu: &D3d9Gpu,
-    _draw: &mut D3d9DrawState,
+    draw: &mut D3d9DrawState,
     target: &SurfaceView,
     depth: Option<&SurfaceView>,
     flags: u32,
@@ -1897,19 +1965,11 @@ pub(crate) fn clear(
     } else {
         source += "@fragment fn ps_main()->@location(0) vec4<f32>{return params.color;}\n";
     }
-    wgsl::validate(&source)?;
-    let shader = gpu
-        .device
-        .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("d3d9-clear"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Owned(source)),
-        });
-    let layout = gpu
-        .device
-        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("d3d9-clear"),
-            entries: &[uniform_entry(0, 32, wgpu::ShaderStages::FRAGMENT)],
-        });
+    let shader = draw.shader(gpu, source)?;
+    let layout = draw.layout(
+        gpu,
+        vec![uniform_entry(0, 32, wgpu::ShaderStages::FRAGMENT)],
+    );
     let mut params = color(color_value).to_vec();
     if opaque_format(target.format) {
         params[3] = 1.0;
@@ -1929,13 +1989,6 @@ pub(crate) fn clear(
             resource: buffer.as_entire_binding(),
         }],
     });
-    let pl = gpu
-        .device
-        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("d3d9-clear"),
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
-        });
     let face = wgpu::StencilFaceState {
         compare: wgpu::CompareFunction::Always,
         fail_op: wgpu::StencilOperation::Keep,
@@ -1958,38 +2011,26 @@ pub(crate) fn clear(
             })
         })
         .transpose()?;
-    let targets = [Some(wgpu::ColorTargetState {
-        format: target.texture.format(),
-        blend: None,
-        write_mask: if flags & 1 != 0 {
-            wgpu::ColorWrites::ALL
-        } else {
-            wgpu::ColorWrites::empty()
-        },
-    })];
-    let pipeline = gpu
-        .device
-        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("d3d9-clear"),
-            layout: Some(&pl),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
+    let pipeline = draw.pipeline(
+        gpu,
+        PipelineKey {
+            modules: [shader.clone(), shader],
+            layout,
+            attributes: Vec::new(),
+            target: wgpu::ColorTargetState {
+                format: target.texture.format(),
+                blend: None,
+                write_mask: if flags & 1 != 0 {
+                    wgpu::ColorWrites::ALL
+                } else {
+                    wgpu::ColorWrites::empty()
+                },
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("ps_main"),
-                targets: &targets,
-                compilation_options: Default::default(),
-            }),
             primitive: Default::default(),
-            depth_stencil: ds,
+            depth: ds,
             multisample: Default::default(),
-            multiview: None,
-            cache: None,
-        });
+        },
+    );
     let mut encoder = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
