@@ -65,11 +65,11 @@ class ArtifactStore:
         for ins in fn.insns:
             if ins.decode is None:
                 raise LiftError("%08x: instruction decode evidence missing" % ins.addr)
-        key = ("frontend-v2", lifter.language, fn.addr,
+        key = ("frontend-v3", lifter.language, fn.addr,
                tuple((ins.addr, ins.mnem, ins.decode.source_bytes) for ins in fn.insns),
                tuple(tuple(tr.successors(fn, i)) for i in range(len(fn.insns))),
                tuple((i, tr.never_returns(ins)) for i, ins in enumerate(fn.insns)),
-               tr.seh_effects(fn), tuple((site, targets) for (owner, site), targets in sorted(tr.jumptables.items())
+               tr.seh_effects(fn), tuple(sorted(dict(fn.seh_sites).items())), tuple((site, targets) for (owner, site), targets in sorted(tr.jumptables.items())
                                         if owner == fn.addr), fn.return_jumps, fn.dead_addrs,
                fn.pushed_continuations, tuple(fn.fallthrough), tuple(fn.contiguous), fn.end,
                external_exits(tr, fn), table_jumps(tr, fn))

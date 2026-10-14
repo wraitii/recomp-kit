@@ -28,7 +28,11 @@ def indirect_jump(ins):
 
 
 def prepare(fir, image=None):
-    """Prepare closed byte-backed IR; secondary entries contribute unknown facts."""
+    """Prepare closed byte-backed IR; secondary entries contribute unknown facts.
+
+    SEH bodies qualify only when every frame they establish is unwind-only:
+    an exception then never resumes here, so normal returns stay sound.
+    """
     tails = {i: None for i, ins in enumerate(fir.insns) if not fir.succ[i] and indirect_jump(ins)}
     for i, targets in fir.exits.items():
         ins = fir.insns[i]
@@ -42,7 +46,11 @@ def prepare(fir, image=None):
         if len(targets) != 1 or literal != list(targets):
             return None
         tails[i] = literal[0]
-    if not fir.insns or fir.seh or any(not ins.raw for ins in fir.insns):
+    if not fir.insns or any(not ins.raw for ins in fir.insns):
+        return None
+    if fir.seh and (image is None or any(set(kinds) - {"enter", "leave"} for kinds in fir.seh.values())
+                    or not all(image.msvc_unwind_only(fir.seh_handlers.get(i))
+                               for i, kinds in fir.seh.items() if "enter" in kinds)):
         return None
     if not tails and not cfg_is_closed(fir):
         return None

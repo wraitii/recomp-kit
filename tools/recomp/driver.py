@@ -145,17 +145,17 @@ def _scan(task):
         site = (bool(fn.seh_sites) or any(fn.insns[i].mnem == "POP" for i in fn.seh_restores)
                 or tr.image.msvc_seh_epilog(addr) or any(map(tr.seh_except_entry, fn.insns)))
         prepared, mode_prepared = None, None
-        if not (escapes or site or fn.pushed_continuations or fn.return_jumps
+        if not (escapes or fn.pushed_continuations or fn.return_jumps
                 or fn.dead_addrs or addr in tr.noreturn_callees):
             try:
                 fir = ctx.artifacts.lifted(tr, ctx.lifter, fn)
-                prepared = call_contracts.prepare(fir, image=ctx.image) if not entries else None
+                prepared = call_contracts.prepare(fir, image=ctx.image) if not (entries or site) else None
                 fir.entries = tuple(entries)
                 mode_prepared = x87_mode.prepare(fir, ctx.image)
             except (LiftError, RecursionError):
                 prepared = None
             else:
-                prepared = prepared or False
+                prepared = None if site else prepared or False
         x87_count, writers = 0, []
         for ins in fn.insns:
             mnem = ins.mnem.upper().removeprefix("WAIT ")
