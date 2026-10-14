@@ -20,6 +20,11 @@ They are a mechanical translation, so register operations are expected. Add
 meaningful names in reviewed symbol metadata; do not hand-edit generated chunks or
 publish them.
 
+Absolute `FF 25` jumps through named PE import slots leave the primary SSA CFG.
+They read the slot at runtime and dispatch without pushing a return address. A
+cold decoded body preserves jumps back into the containing function if the slot
+is rebound; other computed jumps retain their existing target sets.
+
 A normal translation needs the exact executable prepared by setup and the game's code map.
 `tools/build.py` publishes the generated directory and `symbols.json` by rename
 under the lock, then CMake rebuilds `librecomp_gen.a` from it; a reader under the

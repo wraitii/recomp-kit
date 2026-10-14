@@ -216,7 +216,7 @@ NORETURN_IMPORTS = frozenset(("RaiseException", "ExitProcess", "TerminateProcess
 class Translator(ControlFlow):
     # -- emission ----------------------------------------------------------
 
-    def translate(self, fn, entries=()):
+    def translate(self, fn, entries=(), body_symbol=None):
         """Emit fn_ADDR, plus one thin wrapper per alternate entry point.
 
         With entries, the body becomes `static void body_ADDR(X86 *, uint32_t)`
@@ -250,14 +250,18 @@ class Translator(ControlFlow):
             labels.add(fn.addr)
         out = []
         if entries:
-            out.append("static void body_%08x(X86 *c, uint32_t entry_) {" % fn.addr)
+            out.append("RECOMP_COLD void %s(X86 *c, uint32_t entry_) {" % body_symbol
+                       if body_symbol else "static void body_%08x(X86 *c, uint32_t entry_) {" % fn.addr)
             out.append("    x86_cc_settle(c);")
             if fn.seh_escapes:
                 out.append("    uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
             out.append("    switch (entry_) {")
             for e in entries:
                 out.append("    case %s: goto L_%08x;" % (hexlit(e), e))
-            out.append("    default: goto L_%08x;" % fn.addr if head else "    default: break;")
+            if body_symbol:
+                out.append("    default: recomp_jump(c, entry_); return;")
+            else:
+                out.append("    default: goto L_%08x;" % fn.addr if head else "    default: break;")
             out.append("    }")
         else:
             out.append("void fn_%08x(X86 *c) {" % fn.addr)
@@ -266,20 +270,27 @@ class Translator(ControlFlow):
                 out.append("    uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
             if head:
                 out.append("    goto L_%08x;" % fn.addr)
-        for i in live:
+        for position, i in enumerate(live):
             ins = fn.insns[i]
             if ins.addr in labels:
                 out.append("L_%08x: ;" % ins.addr)
-            out.extend("    " + line for line in self.emit(fn, i))
+            out.append('    // %08x: %s' % (ins.addr, ' '.join(filter(None, (ins.rep, ins.mnem, ', '.join(ins.ops))))))
+            emitted = self.emit(fn, i)
             if (not fn.contiguous[i] and ins.mnem not in TERMINATORS
                     and ins.mnem != "INT3" and not self.never_returns(ins)):
                 t = fn.fallthrough[i]
-                out.extend("    " + line for line in self.goto_target(fn, t, ins))
+                emitted.extend(self.goto_target(fn, t, ins))
+            if position + 1 < len(live) and emitted and emitted[-1] == 'goto L_%08x;' % fn.insns[live[position + 1]].addr:
+                emitted.pop()
+            out.extend("    " + line for line in emitted)
         if (last.mnem not in TERMINATORS and last.mnem != "INT3"
                 and not self.never_returns(last)):
             out.append("    " + " ".join(self.goto_target(fn, fn.fallthrough[live[-1]] or fn.end, last)))
         out.append("}")
-        if entries:
+        referenced = set(re.findall(r'\bgoto (L_[0-9a-f]+);', '\n'.join(out)))
+        out = [line for line in out if not (line.startswith('L_')
+               and line.endswith(': ;') and line[:-3] not in referenced)]
+        if entries and body_symbol is None:
             out.append("void fn_%08x(X86 *c) { body_%08x(c, 0u); }" % (fn.addr, fn.addr))
             for e in entries:
                 out.append("void fn_%08x(X86 *c) { body_%08x(c, %s); }" % (e, fn.addr, hexlit(e)))
@@ -305,7 +316,7 @@ class Translator(ControlFlow):
         return lines
 
     def flags_logic(self, size, r="r_"):
-        return ["c->eflags_cf = 0;", "c->eflags_of = 0;",
+        return ["c->eflags_cf = 0;", "c->eflags_of = 0;", "c->eflags_af = 0;",
                 "c->eflags_zf = (%s == 0);" % r,
                 "c->eflags_sf = (%s >> %d) & 1u;" % (r, size - 1),
                 "c->eflags_pf = parity8(%s);" % r]

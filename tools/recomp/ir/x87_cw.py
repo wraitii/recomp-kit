@@ -146,6 +146,16 @@ def join(facts):
     return Fact(known, value & known, entry & ~known & CW_MASK)
 
 
+def join_summaries(summaries):
+    summaries = list(summaries)
+    preserved = known = CW_MASK
+    for summary in summaries:
+        preserved &= summary.preserved_mask
+        known &= summary.known_mask & ~(summaries[0].known_value ^ summary.known_value)
+    known &= CW_MASK
+    return ReturnSummary(preserved & ~known, known, summaries[0].known_value & known)
+
+
 def overwrite(fact, mask, value):
     """Set selected bits to a constant while retaining other facts."""
     mask &= CW_MASK

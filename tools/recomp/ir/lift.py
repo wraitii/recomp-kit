@@ -77,13 +77,14 @@ class Insn(object):
     TOP movement in slots (+1 per push).
     """
     __slots__ = ("addr", "length", "mnem", "ops", "x87_delta", "x87", "internal_flow",
-                 "userops", "raw", "cc", "decode")
+                 "userops", "raw", "cc", "decode", "text")
 
     def __init__(self, addr, length, mnem, ops, x87_delta, x87, internal_flow, userops,
                  raw=None, decode=None):
         self.addr = addr
         self.length = length
         self.mnem = mnem
+        self.text = mnem
         self.ops = ops
         self.x87_delta = x87_delta
         self.x87 = x87

@@ -40,10 +40,21 @@ class Settings(object):
         self.x87_mode_metadata = self.game_dir / metadata if metadata and not self.module else None
         facts = translate.get("x87_facts")
         self.x87_facts = self.game_dir / facts if facts and not self.module else None
+        indirect = translate.get("indirect_targets")
+        self.indirect_targets = self.game_dir / indirect if indirect and not self.module else None
+        self.call_effects = {"sites": {}, "imports": {}}
+        for row in translate.get("call_effects", []):
+            fields = {field: row[field] for field in ("regs", "x87") if field in row}
+            if "site" in row:
+                self.call_effects["sites"][row["site"]] = fields
+            else:
+                self.call_effects["imports"][row["import"]] = fields
         self.x87_imports_preserve_pc_rc = translate["x87_imports_preserve_pc_rc"]
         self.x87_entry_contracts = translate.get("x87_entry_contracts", []) if not self.module else []
         self.call_contracts = translate["call_contracts"]
         self.private_leaf_contracts = translate["private_leaf_contracts"] and not self.module
+        self.private_input_arguments = translate["private_input_arguments"] and not self.module
+        self.private_input_registers = dict(translate.get("private_input_registers", {})) if not self.module else {}
         self.checked_returns = frozenset(translate["checked_returns"]) if not self.module else frozenset()
         self.state_contract_callers = frozenset(translate["state_contract_callers"]) if not self.module else frozenset()
         self.allow_unmodelled = allow_unmodelled

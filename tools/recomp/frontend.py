@@ -18,6 +18,7 @@ def function_ir(tr, lifter, fn):
         lo = ins.addr - image.base
         insns.append(lifter.lift(ins.addr, bytes(image.data[lo:lo + end - ins.addr]),
                                  mnem=ins.mnem, decode=ins.decode))
+        insns[-1].text = ' '.join(filter(None, (ins.rep, ins.mnem, ', '.join(ins.ops))))
     succ = [tr.successors(fn, i) for i in range(len(fn.insns))]
     noreturn = {}
     for i, ins in enumerate(fn.insns):
@@ -25,7 +26,10 @@ def function_ir(tr, lifter, fn):
             noreturn[i] = insns[i].addr + insns[i].length
             succ[i] = []
     return FunctionIR(fn.addr, insns, succ, table_jumps(tr, fn), external_exits(tr, fn),
-                      noreturn=noreturn, seh=tr.seh_effects(fn), language=lifter.language)
+                      noreturn=noreturn, seh=tr.seh_effects(fn), seh_handlers=dict(fn.seh_sites),
+                      language=lifter.language,
+                      import_tails={i: slot for i, ins in enumerate(fn.insns)
+                                    if (slot := tr.import_tail_slot(ins)) is not None})
 
 
 def external_exits(tr, fn):

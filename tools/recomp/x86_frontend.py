@@ -642,6 +642,8 @@ class ControlFlow(object):
                 out.append(fn.index[t])
             return out
         if m == "JMP":
+            if self.import_tail_slot(ins) is not None:
+                return []
             if ins.ops and ins.ops[0].startswith("0x"):
                 t = int(ins.ops[0], 16)
                 return [fn.index[t]] if t in fn.index else []
@@ -717,6 +719,14 @@ class ControlFlow(object):
     def branch_target(ins):
         if ins.ops and ins.ops[0].startswith("0x"):
             return int(ins.ops[0], 16)
+        return None
+
+    def import_tail_slot(self, ins):
+        raw = ins.decode.source_bytes if ins.decode is not None else b''
+        if ins.mnem == 'JMP' and len(raw) == 6 and raw[:2] == b'\xff\x25':
+            slot = int.from_bytes(raw[2:], 'little')
+            if slot in self.image.iat_names:
+                return slot
         return None
 
 

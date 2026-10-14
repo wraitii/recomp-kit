@@ -39,6 +39,7 @@ class Publish:
 @dataclass(frozen=True)
 class Invoke:
     invocation: Invocation
+    input_value: object | None = None
 
 
 @dataclass(frozen=True)
@@ -128,7 +129,11 @@ def plan(prepared, invocations):
             operands = tuple(s.resolve(v) if v is not None else None
                              for v in (record.op, record.a, record.b, record.carry, record.res))
             recipe = PublishedFlags(FlagRecipe(record.kind, record.size, *operands), flags.mask)
-        return Publish(values, recipe, clear)
+        result = Publish(values, recipe, clear)
+        if flags is not None and flags.record.guarded:
+            return Guard("hooks", None,
+                         (publish(state, Publication(publication.required)),), (result,))
+        return result
 
     publications, events = {}, {}
     for block in s.blocks.values():
@@ -137,22 +142,33 @@ def plan(prepared, invocations):
                 snapshot = block.exit if event.opc in EXITS else block.snapshots[event.id]
                 call = prepared.transfers.calls.get(event.id)
                 publication = prepared.transfers.publications[event.id]
+                invocation = invocations.get(event.id)
+                if invocation is not None and invocation.form == "private" and invocation.input_argument:
+                    input_keys = {key for key in dict(groups)[invocation.input_argument]
+                                  if key in block.snapshots[event.id] and block.snapshots[event.id][key] is not None}
+                    publication = Publication(tuple(key for key in publication.required if key not in input_keys),
+                                              publication.flags)
                 clear = lazy and call is not None and bool(call.skipped & flag_fields) and publication.flags is None
                 publications[event.id] = publish(snapshot, publication, clear=clear)
             if event.opc == "CALL":
                 invocation, call = invocations[event.id], prepared.transfers.calls[event.id]
-                primary = (publications[event.id],)
+                publication = publications[event.id]
+                primary = (publication,)
                 if invocation.form == "private":
                     fallback = publish(block.snapshots[event.id], call.fallback)
+                    input_value = (field_value(s, invocation.input_argument, dict(groups)[invocation.input_argument],
+                                               block.snapshots[event.id])
+                                   if invocation.input_argument else None)
                     body = (Guard("eligible", invocation.preparation,
-                                  (*primary, Invoke(invocation)),
+                                  (*primary, Invoke(invocation, input_value)),
                                   (fallback, Invoke(invocation.fallback))),)
                 else:
-                    if call.guard:
+                    if call.guard or call.settle_guard:
                         guarded = publish(block.snapshots[event.id],
                                           Publication(call.guard), direct=True,
                                           clear=lazy and any(key in prepared.flag_keys for key in prepared.kept_calls.get(event.id, ())))
-                        primary += (Guard("hooks", None, (guarded,)),)
+                        settle = (SettleFlags(flag_region.SETTLE),) if call.settle_guard else ()
+                        primary += (Guard("hooks", None, (*settle, guarded)),)
                     body = (*primary, Invoke(invocation))
                 events[event.id] = body + ((SettleFlags(prepared.cc_calls.get(block.index)),) if lazy else ())
             elif event.opc in ("CALL_RELOAD", "CALL_KEEP"):

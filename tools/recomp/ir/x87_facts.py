@@ -66,19 +66,22 @@ def identity(settings):
     policy = {key: value for key, value in settings.cfg["translate"].items()
               if key not in ("x87_facts", "code_map")}
     boundary = settings.x87_mode_metadata
+    inputs = {
+        "code_map": tree_digest(settings.code_map, ("*",)),
+        "policy": policy,
+        "entry_point": settings.cfg["game"]["entry_point"],
+        "image_base": settings.base,
+        "configured_entries": sorted(settings.configured_entries),
+        "boundaries": hashlib.sha256(boundary.read_bytes()).hexdigest() if boundary else None,
+        "native": {name: tree_digest(kit / name, ("*.c", "*.cpp", "*.h"))
+                   for name in ("runtime", "dx", "mods")},
+        "game_native": tree_digest(settings.game_dir, ("*.c", "*.cpp", "*.h"))}
+    if settings.indirect_targets:
+        inputs["indirect_targets"] = hashlib.sha256(settings.indirect_targets.read_bytes()).hexdigest()
     return {"executable_sha256": settings.sha256.lower(),
             "producer": PRODUCER,
             "producer_sha256": producer_digest(kit),
-            "analysis_inputs_sha256": digest({
-                "code_map": tree_digest(settings.code_map, ("*",)),
-                "policy": policy,
-                "entry_point": settings.cfg["game"]["entry_point"],
-                "image_base": settings.base,
-                "configured_entries": sorted(settings.configured_entries),
-                "boundaries": hashlib.sha256(boundary.read_bytes()).hexdigest() if boundary else None,
-                "native": {name: tree_digest(kit / name, ("*.c", "*.cpp", "*.h"))
-                           for name in ("runtime", "dx", "mods")},
-                "game_native": tree_digest(settings.game_dir, ("*.c", "*.cpp", "*.h"))})}
+            "analysis_inputs_sha256": digest(inputs)}
 
 
 @dataclass(frozen=True)

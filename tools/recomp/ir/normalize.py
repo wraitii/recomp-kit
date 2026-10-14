@@ -71,7 +71,7 @@ CC_DEFINES = {
     "adc": ("cf", "pf", "af", "zf", "sf", "of"),
     "sbb": ("cf", "pf", "af", "zf", "sf", "of"),
     "cmp": ("cf", "pf", "af", "zf", "sf", "of"),
-    "logic": ("cf", "of", "zf", "sf", "pf"),
+    "logic": ("cf", "of", "af", "zf", "sf", "pf"),
     "inc": ("pf", "af", "zf", "sf", "of"),
     "dec": ("pf", "af", "zf", "sf", "of"),
 }
@@ -276,6 +276,8 @@ def codegen_ir(fir, lifter, tails=()):
             ops = read_modify_write(normalized, lifter, lambda insn, operand: list(insn.ops))
         else:
             ops = normalized.ops
+        if mnem in ("AND", "OR", "XOR", "TEST"):
+            ops = ops + [Op("COPY", lifter.register("AF"), [("const", 0, 1)])]
         if i in fir.seh:
             ops = seh_ops(ops, fir.seh[i], ins.addr)
         if i in fir.noreturn:
@@ -284,5 +286,8 @@ def codegen_ir(fir, lifter, tails=()):
                       ins.x87, ins.internal_flow, ins.userops, ins.raw, ins.decode)
         result.cc = _flag_producer(mnem, ops, flag_offsets)
         insns.append(result)
+    for original, normalized in zip(fir.insns, insns):
+        normalized.text = original.text
     succ = add_exit_stubs(insns, fir.succ, fir.exits, tails)
-    return FunctionIR(fir.addr, insns, succ, fir.tables, entries=fir.entries, language=fir.language)
+    return FunctionIR(fir.addr, insns, succ, fir.tables, entries=fir.entries, language=fir.language,
+                      import_tails=fir.import_tails)

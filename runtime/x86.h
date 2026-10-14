@@ -625,6 +625,15 @@ uint64_t recomp_override_hash(void);
 int32_t recomp_index_of(uint32_t addr);
 int recomp_is_call_return(uint32_t target);
 
+typedef struct RecompCallFact { uint32_t ret, first, count; } RecompCallFact;
+extern const RecompCallFact recomp_call_facts[];
+extern const uint32_t recomp_call_fact_count;
+extern const uint32_t recomp_call_fact_targets[];
+#ifdef RECOMP_CHECK_CALL_FACTS
+void recomp_call_fact_violation(uint32_t ret, uint32_t target);
+void recomp_import_cw_violation(const char *name, uint16_t before, uint16_t after);
+#endif
+
 /* ------------------------------------------------ auxiliary modules -- */
 
 /* Additional translated guest code (RECOMP_EXTRA_CODE libraries). Its table.c
@@ -687,8 +696,10 @@ RECOMP_HOT_INLINE uint32_t parity8(uint32_t v) {
 
 /* Materialise pending arithmetic flags into the fields and clear the
  * descriptor; callers go through x86_cc_settle.  Recipes match the
- * interpreter's and the decoded emitter's: logic leaves AF, INC/DEC leave CF,
- * and MUL/IMUL are not encoded here. */
+ * interpreter's and the decoded emitter's: logic clears AF, INC/DEC leave CF,
+ * and MUL/IMUL are not encoded here.
+ * DIVERGENCE(original): AND/OR/XOR/TEST choose zero for architecturally
+ * undefined AF, consistently with the interpreter and both emitters. */
 RECOMP_COLD void x86_cc_materialize(X86 *c) {
     const uint32_t op = c->cc_op;
     const uint32_t bits = (uint32_t)c->cc_size * 8u;
@@ -739,13 +750,15 @@ RECOMP_COLD void x86_cc_materialize(X86 *c) {
             c->eflags_cf = 0;
         if (fields & X86_CCF_OF)
             c->eflags_of = 0;
+        if (fields & X86_CCF_AF)
+            c->eflags_af = 0;
         if (fields & X86_CCF_ZF)
             c->eflags_zf = (r == 0);
         if (fields & X86_CCF_SF)
             c->eflags_sf = (r >> shift) & 1u;
         if (fields & X86_CCF_PF)
             c->eflags_pf = parity8(r);
-        break; /* AF is preserved by the decoded emitter. */
+        break;
     case X86_CC_INC:
         if (fields & X86_CCF_OF)
             c->eflags_of = (r == sign);
@@ -801,12 +814,14 @@ RECOMP_HOT_INLINE void x86_cc_settle_mask(X86 *c, uint32_t need) {
 
 /* As x86_cc_settle_mask, for a site whose region overwrites every flag
  * outside `need` before it is observed: a descriptor that defines none of
- * `need` is dropped. */
+ * `need` is dropped. Only needed fields are computed before dropping the
+ * descriptor; every other pending field is overwritten by the region. */
 RECOMP_HOT_INLINE void x86_cc_settle_or_drop(X86 *c, uint32_t need) {
     if (RECOMP_UNLIKELY(c->cc_op != X86_CC_NONE)) {
-        if (c->cc_mask & need)
+        if (c->cc_mask & need) {
+            c->cc_mask &= (uint8_t)need;
             x86_cc_materialize(c);
-        else
+        } else
             c->cc_op = X86_CC_NONE;
     }
 }

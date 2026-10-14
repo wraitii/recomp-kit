@@ -102,6 +102,14 @@ class Image(PE):
     def msvc_seh_epilog(self, va):
         return self.code_matches(va, MSVC_SEH_EPILOG)
 
+    def msvc_unwind_only(self, handler):
+        """Is handler a C++ EH thunk whose FuncInfo has no try blocks, so it never resumes its frame?"""
+        if handler is None or not self.code_matches(handler, (0xb8,) + (None,) * 4 + (0xe9,) + (None,) * 4):
+            return False
+        info = self.rd32(handler + 1)
+        return (self.rd32(info) in (0x19930520, 0x19930521, 0x19930522)
+                and self.rd32(info + 12) == 0)
+
 
 
 

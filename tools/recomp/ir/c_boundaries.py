@@ -7,6 +7,32 @@ CC_OP_CONST = {"add": "X86_CC_ADD", "sub": "X86_CC_SUB", "cmp": "X86_CC_SUB",
                "logic": "X86_CC_LOGIC", "inc": "X86_CC_INC", "dec": "X86_CC_DEC",
                "adc": "X86_CC_ADC", "sbb": "X86_CC_SBB"}
 
+_CC_FLAG_BITS = {"cf": 1, "pf": 2, "af": 4, "zf": 8, "sf": 0x10, "of": 0x20}
+#: Kinds whose carry/borrow and add/sub flag recipes read both operands.
+_CC_AB_KINDS = frozenset(("add", "adc", "sub", "sbb", "cmp"))
+#: Kinds whose AF/OF recipes read the first operand (INC/DEC read only `a`).
+_CC_A_KINDS = _CC_AB_KINDS | frozenset(("inc", "dec"))
+
+
+def cc_operand_names(kind, mask):
+    """Operands `x86_cc_materialize` can read for `kind` and `mask`.
+
+    The wrapped result `cc_res` is always stored: every non-logic recipe
+    derives from it, and LOGIC's CF/OF/AF are constants.  A joined descriptor
+    carries a PHI kind, so every operand stays.
+    """
+    if kind not in CC_OP_CONST:
+        return frozenset(("a", "b", "carry"))
+    additive = mask & (_CC_FLAG_BITS["cf"] | _CC_FLAG_BITS["af"] | _CC_FLAG_BITS["of"])
+    names = set()
+    if additive and kind in _CC_A_KINDS:
+        names.add("a")
+    if additive and kind in _CC_AB_KINDS:
+        names.add("b")
+    if kind in ("adc", "sbb") and mask & _CC_FLAG_BITS["cf"]:
+        names.add("carry")
+    return frozenset(names)
+
 
 def cc_action_lines(action):
     if action == flag_region.DROP:
@@ -51,18 +77,22 @@ class Printer:
                      for v in operation.values]
             if operation.flags is not None:
                 record, mask = operation.flags.record, operation.flags.mask
+                used = cc_operand_names(record.kind, mask)
                 lines.extend(["c->cc_op = %s;" % (self.ref(record.op) if record.op is not None else CC_OP_CONST[record.kind]),
                               "c->cc_size = %du;" % record.size,
-                              "c->cc_mask = 0x%xu;" % mask,
-                              "c->cc_a = (uint32_t)%s;" % (self.ref(record.a) if record.a is not None else "0"),
-                              "c->cc_b = (uint32_t)%s;" % (self.ref(record.b) if record.b is not None else "0"),
-                              "c->cc_res = (uint32_t)%s;" % self.ref(record.res)])
-                if record.carry is not None:
+                              "c->cc_mask = 0x%xu;" % mask])
+                if "a" in used:
+                    lines.append("c->cc_a = (uint32_t)%s;" % (self.ref(record.a) if record.a is not None else "0"))
+                if "b" in used:
+                    lines.append("c->cc_b = (uint32_t)%s;" % (self.ref(record.b) if record.b is not None else "0"))
+                lines.append("c->cc_res = (uint32_t)%s;" % self.ref(record.res))
+                if "carry" in used and record.carry is not None:
                     lines.append("c->cc_carry = (uint8_t)%s;" % self.ref(record.carry))
             lines.extend(["c->cc_op = X86_CC_NONE;"] * operation.clear_flags)
             return lines
         if isinstance(operation, Invoke):
-            return ["%s;" % c_symbols.render_invocation(operation.invocation)]
+            input_value = self.value(operation.input_value) if operation.input_value is not None else None
+            return ["%s;" % c_symbols.render_invocation(operation.invocation, input_value)]
         if isinstance(operation, IndirectInvoke):
             return ["%s(c, (uint32_t)%s);" % (operation.helper, self.ref(operation.target))]
         if isinstance(operation, SettleFlags):
@@ -99,12 +129,14 @@ class Printer:
     def event(self, event):
         return self.operations(self.plan.events[event.id])
 
-    def edge(self, source, target, label):
+    def edge(self, source, target, label, fallthrough=None):
         edge = self.plan.edges[source, target]
         lines = ["{"]
         lines.extend("uint%d_t p%d = %s;" % (32 if dst.size <= 4 else 64, dst.id, self.ref(src)) for dst, src in edge.copies)
         lines.extend("v%d = p%d;" % (dst.id, dst.id) for dst, _ in edge.copies)
-        return [*lines, "goto %s%d;" % (label, edge.target), "}"]
+        if edge.target != fallthrough:
+            lines.append("goto %s%d;" % (label, edge.target))
+        return [*lines, "}"] if edge.copies or edge.target != fallthrough else []
 
     def condition(self, operation):
         if operation.kind == "eligible":

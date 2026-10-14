@@ -48,6 +48,7 @@ class Invocation:
     preparation: Preparation | None
     output_mask: int | None
     fallback: "Invocation | None"
+    input_argument: str | None = None
 
     @property
     def variant(self):
@@ -62,10 +63,10 @@ def binding_invocation(target, binding, form, expected):
     return Invocation(target, form, symbol, expected, None, None, None)
 
 
-def private_invocation(target, binding, expected, proof, mask):
+def private_invocation(target, binding, expected, proof, mask, input_argument=None):
     preparation = Preparation(target, proof)
     fallback = binding_invocation(target, binding, "checked", expected)
-    return Invocation(target, "private", None, expected, preparation, mask, fallback)
+    return Invocation(target, "private", None, expected, preparation, mask, fallback, input_argument)
 
 
 def tail_invocation(target, binding):

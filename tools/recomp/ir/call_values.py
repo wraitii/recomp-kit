@@ -52,7 +52,9 @@ class CallValues:
             raise SSAError("call input bindings do not match the shared layout")
         if tuple(value.field for value in self.outputs) != self.layout.outputs:
             raise SSAError("call result bindings do not match the shared layout")
-        if not self.requirements.inputs <= set(self.layout.inputs):
+        required_inputs = self.requirements.inputs - (frozenset((self.layout.input_argument,))
+                                                      if self.layout.input_argument else frozenset())
+        if not required_inputs <= set(self.layout.inputs):
             raise SSAError("call bindings omit required inputs")
         continuation = self.requirements.required_outputs
         if continuation is not None and not continuation.fields <= set(self.layout.outputs):

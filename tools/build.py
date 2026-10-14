@@ -502,6 +502,8 @@ def parse_args(argv, system=None):
     game_config.add_game_args(parser)
     parser.add_argument("--stub", action="store_true",
                         help="Link the hosts against a stub translation (no game code; CI's build)")
+    parser.add_argument("--check-call-facts", action="store_true",
+                        help="Build with RECOMP_CHECK_CALL_FACTS: abort on indirect calls outside the translator's target facts and on imports that change the x87 control word")
     parser.add_argument("--diff-harness", action="store_true",
                         help="Compile the Unicorn diff harness for the translated archive and exit")
     parser.add_argument("--harness-out", type=Path, default=None,
@@ -588,7 +590,8 @@ def main():
         parser.error("Prepare your own game installation with tools/setup.py first")
     preset = preset_name(args.preset, args.config, stub=args.stub, target=args.target)
     build_dir = build_dir_for(args.build_root, preset)
-    defines = game_defines(args.game_dir, args.build_root)
+    defines = game_defines(args.game_dir, args.build_root) + [
+        "-DRECOMP_CHECK_CALL_FACTS=" + ("ON" if args.check_call_facts else "OFF")]
     try:
         # The lock lives at <build root>/recomp/.lock: BuildLock joins build/recomp/.lock onto its argument.
         with buildlock.BuildLock(args.build_root.parent, "tools/build.py"):

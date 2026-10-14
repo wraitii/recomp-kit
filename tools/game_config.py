@@ -83,8 +83,11 @@ TRANSLATE_DEFAULTS = {
     "msvc_x87_convention": True,
     "call_contracts": True,
     "private_leaf_contracts": False,
+    "private_input_arguments": False,
+    "private_input_registers": {},
     "x87_cw_clone": True,
 }
+PRIVATE_INPUT_REGISTERS = frozenset(("EAX", "ECX", "EDX", "EBX", "ESI", "EDI"))
 
 def add_game_args(parser):
     """--game <id> for a kit game under games/, or --game-dir for any directory holding game.toml."""
@@ -255,10 +258,66 @@ def load(game_dir, build_root=None):
         raise ValueError("%s: [translate] x87_cw_clone must be a boolean" % source)
     if not isinstance(translate.setdefault("private_leaf_contracts", TRANSLATE_DEFAULTS["private_leaf_contracts"]), bool):
         raise ValueError("%s: [translate] private_leaf_contracts must be a boolean" % source)
+    if type(translate.setdefault("private_input_arguments", TRANSLATE_DEFAULTS["private_input_arguments"])) is not bool:
+        raise ValueError("%s: [translate] private_input_arguments must be a boolean" % source)
+    input_registers = translate.setdefault("private_input_registers", {})
+    if not isinstance(input_registers, dict):
+        raise ValueError("%s: [translate] private_input_registers must be an address-to-register table" % source)
+    parsed_input_registers = {}
+    for address, register in input_registers.items():
+        if not isinstance(address, str) or not re.fullmatch(r"[0-9a-fA-F]{8}", address):
+            raise ValueError("%s: [translate] private_input_registers keys must be 8-digit hexadecimal addresses" % source)
+        addr = int(address, 16)
+        if addr in parsed_input_registers:
+            raise ValueError("%s: [translate] private_input_registers repeats address %08x" % (source, addr))
+        if not isinstance(register, str) or register not in PRIVATE_INPUT_REGISTERS:
+            raise ValueError("%s: [translate] private_input_registers values must be one of %s"
+                             % (source, ", ".join(sorted(PRIVATE_INPUT_REGISTERS))))
+        parsed_input_registers[addr] = register
+    translate["private_input_registers"] = parsed_input_registers
     if type(translate.setdefault("x87_imports_preserve_pc_rc", False)) is not bool:
         raise ValueError("%s: x87_imports_preserve_pc_rc must be a boolean" % source)
     if translate.get("x87_facts") is not None and (not isinstance(translate["x87_facts"], str) or not translate["x87_facts"]):
         raise ValueError("%s: x87_facts must name a compiler fact file" % source)
+    if translate.get("indirect_targets") is not None and (not isinstance(translate["indirect_targets"], str) or not translate["indirect_targets"]):
+        raise ValueError("%s: indirect_targets must name an indirect target file" % source)
+    effects = translate.setdefault("call_effects", [])
+    if not isinstance(effects, list):
+        raise ValueError("%s: call_effects must be an array of tables" % source)
+    seen_effects = set()
+    for index, row in enumerate(effects):
+        where = "%s: call_effects entry %d" % (source, index)
+        if not isinstance(row, dict) or not set(row) <= {"import", "site", "regs", "x87"}:
+            raise ValueError("%s has unknown keys" % where)
+        if ("import" in row) == ("site" in row):
+            raise ValueError("%s must set exactly one of import or site" % where)
+        if "import" in row:
+            dll, sep, name = row["import"].partition("!") if isinstance(row["import"], str) else ("", "", "")
+            if not sep or not dll or not name or "!" in name:
+                raise ValueError("%s: import must be 'dll!name'" % where)
+            row["import"] = dll.lower() + "!" + name
+            target = ("import", row["import"])
+        else:
+            if type(row["site"]) is not int or not 0 <= row["site"] <= 0xffffffff:
+                raise ValueError("%s: site must be a 32-bit address" % where)
+            target = ("site", row["site"])
+        if "regs" not in row and "x87" not in row:
+            raise ValueError("%s must set regs or x87" % where)
+        if "regs" in row and row["regs"] not in ("abi", "unknown"):
+            raise ValueError("%s: regs must be 'abi' or 'unknown'" % where)
+        if "x87" in row:
+            x87 = row["x87"]
+            if isinstance(x87, dict):
+                valid = (set(x87) == {"preserved", "known", "value"}
+                         and all(type(x87[k]) is int and 0 <= x87[k] <= 0xffff for k in x87)
+                         and not x87["value"] & ~x87["known"])
+            else:
+                valid = x87 in ("preserve", "unknown")
+            if not valid:
+                raise ValueError("%s: x87 must be 'preserve', 'unknown' or {preserved, known, value}" % where)
+        if target in seen_effects:
+            raise ValueError("%s repeats %s" % (where, target[1]))
+        seen_effects.add(target)
     contracts = translate.setdefault("x87_entry_contracts", [])
     if not isinstance(contracts, list):
         raise ValueError("%s: x87_entry_contracts must be a list" % source)

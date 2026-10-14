@@ -350,6 +350,21 @@ void recomp_unknown_call(X86 *c, uint32_t target) {
     abort();
 }
 
+#ifdef RECOMP_CHECK_CALL_FACTS
+void recomp_call_fact_violation(uint32_t ret, uint32_t target) {
+    fprintf(stderr, "indirect call returning to %08x reached undeclared target %08x\n", ret, target);
+    fflush(stdout);
+    abort();
+}
+
+void recomp_import_cw_violation(const char *name, uint16_t before, uint16_t after) {
+    fprintf(stderr, "import %s changed x87 control word %04x -> %04x without guest callbacks\n",
+            name, before, after);
+    fflush(stdout);
+    abort();
+}
+#endif
+
 // DIV/IDIV with a zero divisor or an out-of-range quotient. On real hardware
 // this raises #DE; deliver it to the guest's own handlers as Windows would,
 // with the record and CONTEXT naming the faulting instruction. The registers

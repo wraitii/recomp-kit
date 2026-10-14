@@ -24,6 +24,7 @@ class Eligibility:
             return set()
         configured = {a for a in self.settings.checked_returns if not self.scanned[a].calls}
         result = configured if self.settings.state_contract_callers else set()
+        result |= set(self.settings.private_input_registers)
         if self.settings.private_leaf_contracts:
             result |= contract_variants.eligible_leaves(self.scanned, self.opaque)
         return result
@@ -38,6 +39,10 @@ class Eligibility:
         if not self.enabled:
             return set()
         result = set(self.settings.state_contract_callers)
+        if self.settings.private_input_registers:
+            result |= {addr for addr, row in self.scanned.items()
+                       if addr not in self.opaque and row.register_facts and row.cw_facts
+                       and any(target in self.settings.private_input_registers for target in row.calls)}
         if self.settings.private_leaf_contracts:
             result |= {addr for addr, row in self.scanned.items()
                        if addr not in self.opaque and row.register_facts and row.cw_facts

@@ -30,7 +30,7 @@ def source_revisions(root=None):
 
 def identity(settings):
     revisions = source_revisions()
-    return x87_facts.digest({
+    inputs = {
         'sources': revisions['preparation'],
         'policy': asdict(settings.emit),
         'translate': dict(settings.cfg['translate']),
@@ -43,7 +43,10 @@ def identity(settings):
         'native': {name: x87_facts.tree_digest(Path(__file__).resolve().parents[2] / name, ('*.c', '*.cpp', '*.h'))
                    for name in ('runtime', 'dx', 'mods')},
         'game_native': x87_facts.tree_digest(settings.game_dir, ('*.c', '*.cpp', '*.h')),
-    })
+    }
+    if settings.indirect_targets:
+        inputs['indirect_targets'] = hashlib.sha256(settings.indirect_targets.read_bytes()).hexdigest()
+    return x87_facts.digest(inputs)
 
 
 def tree(out):

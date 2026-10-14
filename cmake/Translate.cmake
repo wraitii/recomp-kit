@@ -52,7 +52,7 @@ endfunction()
 
 # Submit isolated giants first so their compile can overlap the small chunks.
 function(recomp_translation_sources result dir)
-  file(GLOB sources CONFIGURE_DEPENDS ${dir}/chunk_*.c ${dir}/table.c)
+  file(GLOB sources CONFIGURE_DEPENDS ${dir}/chunk_*.c ${dir}/table.c ${dir}/call_facts.c)
   set_property(SOURCE ${sources} APPEND PROPERTY COMPILE_OPTIONS
     "$<$<C_COMPILER_ID:Clang,AppleClang>:-Xclang;-disable-lifetime-markers>")
   set(giants ${sources})

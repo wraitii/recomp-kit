@@ -1,7 +1,7 @@
 """Forward proven register saves without removing guest stores or stack motion.
 
 Every incoming memory path must reach the same PUSH value. Unknown aliases,
-calls, opaque effects and cyclic proofs stop forwarding. Aligned stack locals
+calls and opaque effects stop forwarding. Aligned stack locals
 use modular address intervals to prove disjointness. A surviving store to the
 same four bytes establishes that the removed restore load cannot fault.
 """
@@ -69,20 +69,22 @@ def forward(s):
             if load.opc != "LOAD" or load.size != 4:
                 continue
             target = load.args[1]
-            memo, active = {}, set()
-
-            def saved(token):
+            pending, visited, saved_value = [load.args[0]], set(), None
+            while pending:
+                token = pending.pop()
                 token = s.resolve(token)
-                if token.id in memo:
-                    return memo[token.id]
-                if token.id in active or len(memo) + len(active) >= 512:
-                    return None
-                active.add(token.id)
-                result = None
+                if token.id in visited:
+                    continue
+                if len(visited) >= 512:
+                    saved_value = None
+                    break
+                visited.add(token.id)
                 if token.opc == "PHI" and token.data[0] == MEMORY:
-                    values = [saved(arg) for arg in token.args]
-                    if values and values[0] is not None and all(v is values[0] for v in values):
-                        result = values[0]
+                    if not token.args:
+                        saved_value = None
+                        break
+                    pending.extend(token.args)
+                    continue
                 elif token.opc == "MEMORY":
                     effect = token.args[0]
                     if effect.opc == "STORE":
@@ -90,24 +92,29 @@ def forward(s):
                         origin = owners[effect.id].insn.raw or b""
                         if (address(source) == address(target) and value.size == 4
                                 and origin == bytes([0x50 + register])):
-                            result = s.resolve(value)
+                            source_value = s.resolve(value)
+                            if saved_value is not None and source_value is not saved_value:
+                                saved_value = None
+                                break
+                            saved_value = source_value
+                            continue
                         elif disjoint(target, 4, source, value.size):
-                            result = saved(effect.args[0])
+                            pending.append(effect.args[0])
+                            continue
                     elif effect.opc in ("LOAD", "X87_REG"):
-                        result = saved(effect.args[0])
+                        pending.append(effect.args[0])
+                        continue
                     elif effect.opc == "X87_MEM":
                         mnem = effect.data["mnem"]
                         writes = mnem.startswith(("FST", "FNST", "FIST"))
                         size = effect.data["operands"][0][1]
                         if not writes or disjoint(target, 4, effect.args[1], size):
-                            result = saved(effect.args[0])
-                active.remove(token.id)
-                memo[token.id] = result
-                return result
-
-            value = saved(load.args[0])
-            if value is not None:
-                s.aliases[load.id] = value
+                            pending.append(effect.args[0])
+                            continue
+                saved_value = None
+                break
+            if saved_value is not None:
+                s.aliases[load.id] = saved_value
                 changed = True
     if changed:
         for block in s.blocks.values():

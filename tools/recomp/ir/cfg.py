@@ -11,7 +11,8 @@ class FunctionIR(object):
     """
 
     def __init__(self, addr, insns, succ, tables=None, exits=None, entries=(),
-                 noreturn=None, seh=None, language=X86_32.language):
+                 noreturn=None, seh=None, language=X86_32.language, import_tails=None,
+                 seh_handlers=None):
         self.addr = addr
         self.language = language
         #: Other instruction addresses generated code can enter at, with the
@@ -28,6 +29,9 @@ class FunctionIR(object):
         self.noreturn = noreturn or {}
         #: Instruction index -> ordered SEH runtime effects (`Translator.seh_effects`).
         self.seh = seh or {}
+        #: SEH `enter` index -> the handler its registration record names.
+        self.seh_handlers = seh_handlers or {}
+        self.import_tails = import_tails or {}
         #: Indices of computed jumps whose complete target set is `succ[i]`:
         #: decoded jump tables with every case inside this body. Any other
         #: BRANCHIND stays an opaque effect.

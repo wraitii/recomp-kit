@@ -93,30 +93,32 @@ def ssa_settle_plan(cgi, flag_off_name):
     from each call instruction index to the post-call region summary
     (`flag_region.summarize`), which `call_cc_action` turns into a decision.
     The classification is over the codegen ops, so it matches what the
-    emitter actually materialises: an eager seam is an observer, a call is a
-    normal region boundary, and unknown forms settle.
+    emitter actually materialises: an eager seam is an observer, a call or a
+    resolved tail is a normal region boundary, and unknown forms settle.  A
+    resolved tail enters another translated body whose entry dispatch settles
+    before any hook; an unresolved or import tail stays a BRANCHIND observer.
     """
     n = len(cgi.insns)
 
     def access(i):
         ins = cgi.insns[i]
-        if ins.mnem.upper() in ("CALL", "RET"):
+        if ins.mnem.upper() in ("CALL", "RET", "TAIL"):
             return (frozenset(), frozenset())
         if any(op.opc in _SSA_EAGER_OPS for op in ins.ops):
             return None
         reads, writes = set(), set()
         for op in ins.ops:
+            for v in op.ins:
+                if v is not None and v[0] == "register":
+                    for k in range(v[2]):
+                        name = flag_off_name.get(v[1] + k)
+                        if name and name not in writes:
+                            reads.add(name)
             if op.out is not None and op.out[0] == "register":
                 for k in range(op.out[2]):
                     name = flag_off_name.get(op.out[1] + k)
                     if name:
                         writes.add(name)
-            for v in op.ins:
-                if v is not None and v[0] == "register":
-                    for k in range(v[2]):
-                        name = flag_off_name.get(v[1] + k)
-                        if name:
-                            reads.add(name)
         return (frozenset(reads), frozenset(writes))
 
     def successors(i):
@@ -125,7 +127,7 @@ def ssa_settle_plan(cgi, flag_off_name):
         return list(cgi.succ[i])
 
     def is_end(i):
-        return cgi.insns[i].mnem.upper() in ("CALL", "RET")
+        return cgi.insns[i].mnem.upper() in ("CALL", "RET", "TAIL")
 
     def summarize(start):
         return flag_region.summarize(start, successors, access, is_end,
@@ -136,7 +138,7 @@ def ssa_settle_plan(cgi, flag_off_name):
     entry = flag_region.SETTLE
     if start is not None:
         found = summarize(start)
-        entry = flag_region.SETTLE if found is None else flag_region.decision(*found)
+        entry = call_cc_action(found, frozenset())
     calls = {}
     for i, ins in enumerate(cgi.insns):
         if ins.mnem.upper() != "CALL":
@@ -226,7 +228,8 @@ class PreparedFunction:
             if target in layouts:
                 mask = select_layout(layouts, target, mask).output_mask
             proof = proven_fact(options.mode_sites.get(b.insn.addr), CW_FAST)
-            return private_invocation(target, binding, expected, proof, mask)
+            return private_invocation(target, binding, expected, proof, mask,
+                                     options.request.private_input_arguments.get(target))
         form = "checked" if target in options.request.checked_calls else "ordinary"
         return binding_invocation(target, binding, form, expected)
 
@@ -256,8 +259,11 @@ class PreparedFunction:
                 raise SSAError("shared contract outputs do not cover the call continuation")
             layout = select_layout(layouts, v.data, contract_output_mask(call.required_outputs))
             contract = self.options.request.call_contracts.get(v.data)
-            if contract is not None and not contract.reads <= set(layout.inputs):
-                raise SSAError("shared contract inputs do not cover the callee reads")
+            if contract is not None:
+                required_inputs = contract.reads - (frozenset((layout.input_argument,))
+                                                     if layout.input_argument else frozenset())
+                if not required_inputs <= set(layout.inputs):
+                    raise SSAError("shared contract inputs do not cover the callee reads")
         invocations = self._bind(layouts)
         values = call_values.bind(self, invocations, layouts)
         final = FinalBindings(invocations, FrozenMap.of(layouts), values)
@@ -448,15 +454,18 @@ def prepare(fir, request, *, lifter=None, normalized=None):
             fields_ = {field for field in CONTRACT_FIELDS
                        if field not in CONTRACT_NEVER_SKIP
                        and (field in contract.preserves or
-                            (field not in contract.reads and field not in contract.writes))}
+                            field not in contract.writes)}
             if not set(CONTRACT_FLAGS) <= fields_:
                 fields_ -= set(CONTRACT_FLAGS)
             if fields_:
                 kept_fields[target] = frozenset(
                     key for field in fields_ for key in field_lanes[field])
                 transparent_fields[target] = frozenset(
-                    key for field in fields_ if field not in contract.reads
-                    and field not in contract.writes for key in field_lanes[field])
+                    key for field in fields_
+                    if (field not in contract.reads and field not in contract.writes)
+                    or (field == request.private_input_arguments.get(target)
+                        and target in contract_calls)
+                    for key in field_lanes[field])
     tail_symbols = normalize_bindings(tail_symbols, "tail", allow_checked=False)
     seh_mark = any("orphan" in kinds for kinds in fir.seh.values())
     fir = cgi
@@ -495,16 +504,23 @@ def prepare(fir, request, *, lifter=None, normalized=None):
     transparent_calls = {v.id: transparent_fields[v.data] for b in s.blocks.values() for v in b.ops
                          if v.opc == "CALL" and v.data in transparent_fields}
     publication_facts = publication_analysis(s, fir.succ, groups, access_fields=access_fields,
-                                             reloaded=set(mapping) - flag_keys, kept=transparent_calls)
+                                             reloaded=set(mapping) - flag_keys, kept=transparent_calls,
+                                             lazy_fields=flag_keys if lazy_flags else (),
+                                             preserved=kept_calls, eager_events=CC_EAGER_EVENTS,
+                                             returned_lazy={v.id for b in s.blocks.values() for v in b.ops
+                                                            if v.opc == "CALLIND" or
+                                                            (v.opc == "CALL" and v.data not in contract_calls)})
     transfers = transfer_plan.build(s, groups, publication_facts,
                                     call_contracts or {}, kept_calls, lane_field, CONTRACT_NEVER_SKIP,
                                     contract_calls, return_fields, flag_keys, flag_first_key,
-                                    CC_DEFINES, CC_BIT_VALUES, lazy_flags, CC_EAGER_EVENTS)
+                                    CC_DEFINES, CC_BIT_VALUES, lazy_flags, CC_EAGER_EVENTS,
+                                    request.layout.input_argument if request.layout else None,
+                                    request.private_input_arguments)
     live = simplify(s, transfers.live_publications, canonical=False, extra_roots=transfers.roots,
                     removable=frozenset(("CALL_RELOAD", "CALL_KEEP")), groups=groups)
-    reads_entry_flags = any(
-        v.opc == "INPUT" and v.data in flag_keys and v.id in live and s.resolve(v) is v
-        for v in s.values)
+    reads_entry_flags = frozenset(
+        flag_off_name[v.data[1]] for v in s.values
+        if v.opc == "INPUT" and v.data in flag_keys and v.id in live and s.resolve(v) is v)
     if lazy_flags:
         # A post-call reload reads the flag fields directly, right after the
         # site's action, so the action materialises a descriptor that defines
@@ -516,13 +532,18 @@ def prepare(fir, request, *, lifter=None, normalized=None):
         reloads = live_flag_reload_calls(s, live, flag_off_name)
         cc_calls = {i: call_cc_action(summary, frozenset(reloads.get(i, ())))
                     for i, summary in cc_calls.items()}
-    if reads_entry_flags or fir.entries:
-        # The SSA builder loads live entry flag INPUTs straight from the fields,
-        # immediately after the entry settle.  Those loads are not codegen ops,
-        # so the region walk cannot see them: it may have classified the entry
-        # region as REMOVE or DROP while a caller descriptor is still pending,
-        # and the later guest read would use a stale field.  Settle first.
+        cc_calls.update({b.index: flag_region.REMOVE for b in s.blocks.values()
+                         for v in b.ops
+                         if v.opc == "CALL" and flag_keys <= set(kept_calls.get(v.id, ()))})
+    if fir.entries:
         cc_entry = flag_region.SETTLE
+    elif reads_entry_flags:
+        if cc_entry == flag_region.REMOVE:
+            cc_entry = ("x86_cc_settle_mask", reads_entry_flags)
+        elif cc_entry == flag_region.DROP:
+            cc_entry = ("x86_cc_settle_or_drop", reads_entry_flags)
+        elif isinstance(cc_entry, tuple):
+            cc_entry = (cc_entry[0], cc_entry[1] | reads_entry_flags)
     arithmetic_plan = x87_plan.prepare(s, fir, live, strict=x87_scalar_strict,
                                        convention=x87_convention, defer_ie=defer_ie,
                                        known_mode=x87_known_mode, cw_clone=x87_cw_clone,

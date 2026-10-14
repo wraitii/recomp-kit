@@ -89,6 +89,13 @@ class ScalarPrinter(X87Printer):
         return lines + super().operations(pending)
 
 
+def declaration_lines(declarations):
+    groups = {}
+    for ctype, name in declarations:
+        groups.setdefault(ctype, []).append(name)
+    return ["%s %s;" % (ctype, ", ".join(names)) for ctype, names in groups.items()]
+
+
 def seh_lines(kind, addr):
     eip = "c->eip = 0x%xu;" % addr
     if kind == "enter":
@@ -106,7 +113,7 @@ def seh_lines(kind, addr):
 
 
 
-def emit_prepared(prepared):
+def emit_prepared(prepared, external_entry=False):
     if prepared.final is None or prepared.transport is None:
         raise SSAError("C emission requires finalized boundary operations")
     options = prepared.options
@@ -118,7 +125,9 @@ def emit_prepared(prepared):
     arithmetic_plan = prepared.arithmetic
     def ref(v):
         v = s.resolve(v)
-        if v.opc in ("CONST", "TARGET"):
+        if v.opc == "CONST":
+            return "0x%xu" % v.data if v.size <= 4 else "0x%xull" % v.data
+        if v.opc == "TARGET":
             return "0x%xull" % v.data
         if v.opc == "CC_KIND":
             return CC_OP_CONST[v.data]
@@ -127,11 +136,20 @@ def emit_prepared(prepared):
     def mask(size):
         return "0x%xull" % ((1 << (size * 8)) - 1)
 
+    def assignment(v, value):
+        if v.size not in (4, 8):
+            value = "(%s) & %s" % (value, mask(v.size))
+        return "v%d = %s;" % (v.id, value)
+
     def expression(v):
+        wide = v.size > 4 or v.opc == "SUBPIECE"
         a = [ref(arg) for arg in v.args]
         opc = v.opc
-        if v.size > 4 or opc == "SUBPIECE":
+        if wide:
             a = ["(uint64_t)(%s)" % arg for arg in a]
+        zero = "0ull" if wide else "0u"
+        one = "1ull" if wide else "1u"
+        suffix = "ull" if wide else "u"
         if opc == "PACK":
             return " | ".join("(%s << %d)" % (arg, n * 8) for n, arg in enumerate(a))
         if opc == "BYTE":
@@ -139,7 +157,7 @@ def emit_prepared(prepared):
         if opc in ("COPY", "INT_ZEXT"):
             return a[0]
         if opc == "INT_SEXT":
-            sign = "0x%xull" % (1 << (v.args[0].size * 8 - 1))
+            sign = "0x%x%s" % (1 << (v.args[0].size * 8 - 1), suffix)
             return "(%s ^ %s) - %s" % (a[0], sign, sign)
         binary = {"INT_ADD": "+", "INT_SUB": "-", "INT_MULT": "*", "INT_AND": "&", "INT_OR": "|",
                   "INT_XOR": "^", "INT_EQUAL": "==", "INT_NOTEQUAL": "!=",
@@ -151,32 +169,33 @@ def emit_prepared(prepared):
         if opc in ("INT_SLESS", "INT_SLESSEQUAL"):
             # Sign-bit bias compares two's-complement values without a signed
             # overflow or an implementation-defined unsigned-to-signed cast.
-            sign = "0x%xull" % (1 << (bits - 1))
+            sign = "0x%x%s" % (1 << (bits - 1), suffix)
             return "(%s ^ %s) %s (%s ^ %s)" % (a[0], sign,
                     "<" if opc == "INT_SLESS" else "<=", a[1], sign)
         if opc in ("INT_LEFT", "INT_RIGHT"):
-            return "%s >= %d ? 0ull : (%s %s %s)" % (a[1], bits, a[0],
+            return "%s >= %d ? %s : (%s %s %s)" % (a[1], bits, zero, a[0],
                     "<<" if opc == "INT_LEFT" else ">>", a[1])
         if opc == "INT_SRIGHT":
             # P-code counts saturate, unlike the x86 helper's modulo-32 count.
             # Biasing the sign bit expresses sign extension with unsigned C.
-            sign = "0x%xull" % (1 << (bits - 1))
-            return "%s >= %d ? (0ull - (%s >> %d)) : (((%s ^ %s) >> %s) - (%s >> %s))" % (
-                a[1], bits, a[0], bits - 1, a[0], sign, a[1], sign, a[1])
+            sign = "0x%x%s" % (1 << (bits - 1), suffix)
+            return "%s >= %d ? (%s - (%s >> %d)) : (((%s ^ %s) >> %s) - (%s >> %s))" % (
+                a[1], bits, zero, a[0], bits - 1, a[0], sign, a[1], sign, a[1])
         if opc == "INT_CARRY":
-            return "%s > (%s - %s)" % (a[0], mask(v.args[0].size), a[1])
+            operand = "0x%x%s" % ((1 << (v.args[0].size * 8)) - 1, suffix)
+            return "%s > (%s - %s)" % (a[0], operand, a[1])
         if opc in ("INT_SCARRY", "INT_SBORROW"):
             result = "(%s %s %s)" % (a[0], "+" if opc == "INT_SCARRY" else "-", a[1])
-            return "((%s(%s ^ %s) & (%s ^ %s)) >> %d) & 1ull" % (
-                "~" if opc == "INT_SCARRY" else "", a[0], a[1], a[0], result, bits - 1)
+            return "((%s(%s ^ %s) & (%s ^ %s)) >> %d) & %s" % (
+                "~" if opc == "INT_SCARRY" else "", a[0], a[1], a[0], result, bits - 1, one)
         if opc == "BOOL_NEGATE":
             return "!%s" % a[0]
         if opc == "INT_NEGATE":
             return "~%s" % a[0]
         if opc == "INT_2COMP":
-            return "0ull - %s" % a[0]
+            return "%s - %s" % (zero, a[0])
         if opc == "POPCOUNT":
-            return "__builtin_popcountll(%s)" % a[0]
+            return "%s(%s)" % ("__builtin_popcountll" if v.args[0].size > 4 else "__builtin_popcount", a[0])
         if opc == "SUBPIECE":
             return "%s >= 8 ? 0ull : (%s >> (%s * 8))" % (a[1], a[0], a[1])
         if opc == "PIECE":
@@ -190,30 +209,35 @@ def emit_prepared(prepared):
     def publish(event):
         return boundary.publication(event)
 
-    def edge(source, target):
-        return boundary.edge(source, target, block_label)
+    def edge(source, target, fallthrough=None):
+        return boundary.edge(source, target, block_label, fallthrough)
 
     x87_printer = ScalarPrinter(ref)
     block_label = "F" if arithmetic_plan.programs[0].clone == "fast" else "B"
 
-    lines = [c_symbols.signature(options.request.variant, symbol)]
+    lines = [c_symbols.signature(options.request.variant, symbol, options.request.layout)]
     lines.append("uint8_t *arena_ = g_mem;")
-    for v in s.values:
-        if v.id in live and v.size and v.opc not in ("CONST", "TARGET", "CC_KIND") and s.resolve(v) is v:
-            lines.append("uint%d_t v%d;" % (32 if v.size <= 4 else 64, v.id))
+    lines.extend(declaration_lines(
+        ("uint%d_t" % (32 if v.size <= 4 else 64), "v%d" % v.id)
+        for v in s.values
+        if v.id in live and v.size and v.opc not in ("CONST", "TARGET", "CC_KIND") and s.resolve(v) is v))
     scalar_declarations = len(lines)
     lines.extend(x87_printer.declaration(op) for op in arithmetic_plan.environment_declarations())
-    lines.extend(boundary.operations(boundary.plan.entry))
+    if not external_entry:
+        lines.extend(boundary.operations(boundary.plan.entry))
     if seh_mark:
         lines.append("uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
     for v in s.values:
         if v.opc != "INPUT" or not v.size or v.id not in live or s.resolve(v) is not v:
             continue
         field, lane = mapping[v.data]
-        lines.append("v%d = (%s >> %d) & %s;" % (v.id, field, lane * 8, mask(v.size)))
+        if (options.request.layout is not None and options.request.layout.input_argument
+                and field == c_symbols.cpu_field(options.request.layout.input_argument)):
+            field = options.request.layout.input_argument.lower() + "_"
+        lines.append(assignment(v, "%s >> %d" % (field, lane * 8)))
     for v in s.entry_ops:
         if v.id in live and s.resolve(v) is v:
-            lines.append("v%d = (%s) & %s;" % (v.id, expression(v), mask(v.size)))
+            lines.append(assignment(v, expression(v)))
     if x87_entry_verify:
         condition = condition_of(getattr(x87_entry_verify, "condition", x87_entry_verify))
         lines.append('if (RECOMP_UNLIKELY(!recomp_hooks_ever && (c->fpu_cw & 0x%xu) != 0x%xu)) recomp_x87_contract_violation(c, 0x%08xu, 0x%xu, 0x%xu);' % (condition.mask, condition.value, fir.addr, condition.mask, condition.value))
@@ -222,19 +246,23 @@ def emit_prepared(prepared):
         for e, block in zip(fir.entries, s.alternates):
             lines.append("case 0x%xu:" % e)
             lines.extend(edge(-1, block))
-        lines.append("default:")
-        lines.extend(edge(-1, s.entry))
+        lines.append("default:;")
+        lines.extend(edge(-1, s.entry, next(iter(s.blocks))))
         lines.append("}")
     else:
-        lines.extend(edge(-1, s.entry))
+        lines.extend(edge(-1, s.entry, next(iter(s.blocks))))
     indices = arithmetic_plan.indices
     lines[scalar_declarations:scalar_declarations] = [x87_printer.declaration(op) for op in arithmetic_plan.declarations()]
 
     for program in arithmetic_plan.programs:
         block_label = 'F' if program.clone == 'fast' else 'B'
         emitted = set()
-        for i, b in s.blocks.items():
+        block_order = list(s.blocks)
+        for position, i in enumerate(block_order):
+            b = s.blocks[i]
+            following = block_order[position + 1] if position + 1 < len(block_order) else None
             lines.append('%s%d:;' % (block_label, i))
+            lines.append('// %08x: %s' % (b.insn.addr, b.insn.text))
             lines.extend(x87_printer.operations(program.blocks[i]))
             for v in b.ops:
                 emitted.add(v.id)
@@ -295,6 +323,18 @@ def emit_prepared(prepared):
                 elif v.opc == "TAIL":
                     lines.extend(boundary.event(v))
                 elif v.opc == "BRANCHIND":
+                    if i in fir.import_tails:
+                        lines.extend(x87_printer.operations(program.defaults.get(v.id, ())))
+                        lines.extend(publish(v))
+                        lines.append('c->eip = 0x%xu;' % b.insn.addr)
+                        target = ref(v.args[0])
+                        first = min(ins.addr for ins in fir.insns if ins.length)
+                        end = max(ins.addr + ins.length for ins in fir.insns if ins.length)
+                        lines.append('if ((uint32_t)%s >= 0x%xu && (uint32_t)%s < 0x%xu)' % (target, first, target, end))
+                        lines.append('%s(c, (uint32_t)%s);' % (c_symbols.symbol('body_import_fallback', fir.addr), target))
+                        lines.append('else recomp_jump(c, (uint32_t)%s);' % target)
+                        lines.append('return;')
+                        continue
                     # A decoded jump table: the target address selects a case, any
                     # other value is a runtime jump exactly like the decoded
                     # emitter's default arm (publish everything, set EIP to the
@@ -313,19 +353,27 @@ def emit_prepared(prepared):
                         b.insn.addr, ref(v.args[0])))
                     lines.append("}")
                 elif v.opc == "BRANCH":
-                    lines.extend(edge(i, indices[v.args[0].data]))
+                    lines.extend(edge(i, indices[v.args[0].data], following))
                 elif v.opc == "CBRANCH":
+                    target = indices[v.args[0].data]
                     lines.append("if (%s)" % ref(v.args[1]))
-                    lines.extend(edge(i, indices[v.args[0].data]))
-                    lines.extend(edge(i, indices[b.insn.addr + b.insn.length]))
+                    lines.extend(edge(i, target, following) or ['{}'])
+                    if target == following:
+                        lines.append('else')
+                        lines.extend(edge(i, indices[b.insn.addr + b.insn.length], following) or ['{}'])
+                        continue
+                    lines.extend(edge(i, indices[b.insn.addr + b.insn.length], following))
                 else:
-                    lines.append("v%d = (%s) & %s;" % (v.id, expression(v), mask(v.size)))
+                    lines.append(assignment(v, expression(v)))
             if not any(v.opc in operations.TERMINATORS for v in b.ops):
                 lines.extend(x87_printer.operations(program.ends[i]))
-                lines.extend(edge(i, fir.succ[i][0]))
+                lines.extend(edge(i, fir.succ[i][0], following))
         if emitted != set(program.events):
             raise SSAError('x87 emission differs from its planned event coverage')
     lines.append("}")
+    referenced = {line[5:-1] for line in lines if line.startswith('goto ')}
+    lines = [line for line in lines if not (line.startswith(('B', 'F'))
+             and line.endswith(':;') and line[:-2] not in referenced)]
     lines[scalar_declarations:scalar_declarations] = [x87_printer.declaration(op) for op in arithmetic_plan.temporaries]
     return "\n".join(lines)
 
