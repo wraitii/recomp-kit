@@ -655,6 +655,7 @@ int32_t recomp_module_lookup(uint32_t target);
 int recomp_module_is_call_return(uint32_t target);
 /* Dispatches target through the owning module's tables; 0 when no module owns it. */
 int recomp_module_call(X86 *c, uint32_t target);
+void recomp_module_jump(X86 *c, uint32_t target);
 
 /* RET has already popped EIP and applied any immediate stack adjustment.
  * A CALL continuation belongs to the pending host caller, even when it is

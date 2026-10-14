@@ -429,7 +429,10 @@ void recomp_jump(X86 *c, uint32_t target)
         if (recomp_profile_enabled) recomp_profile_pop();
         return;
     }
-    if (recomp_module_call(c, target)) return;
+    if (recomp_module_lookup(target) >= 0) {
+        recomp_module_jump(c, target);
+        return;
+    }
     if (target >= GUEST_SHIM_BASE && target < GUEST_SHIM_END) {
         recomp_shim_call(c, target);
         return;
@@ -478,6 +481,10 @@ def write_module_table(out, entry_names, functions, call_returns, module):
             fh.write("    %srun,\n" % prefix)
         fh.write("};\nstatic uint8_t %shooked[%d];\n" % (prefix, len(entry_names)))
         fh.write("void recomp_enter_%s(X86 *c, uint32_t i)\n{\n" % key)
+        fh.write("    if (!recomp_profile_enabled && !recomp_frame_watch) {\n")
+        fh.write("        recomp_execution_checkpoint(c);\n")
+        fh.write("        if (%shooked[i]) { x86_cc_settle(c); %shooks[i](c, i); }\n" % (prefix, prefix))
+        fh.write("        else %sbase[i](c);\n        return;\n    }\n" % prefix)
         fh.write("    RecompSaved saved_; recomp_save(c, &saved_);\n")
         fh.write("    recomp_execution_checkpoint(c);\n")
         fh.write("    if (recomp_profile_enabled) recomp_profile_push(i);\n")

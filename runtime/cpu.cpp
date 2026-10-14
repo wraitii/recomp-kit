@@ -212,6 +212,24 @@ int recomp_module_call(X86 *c, uint32_t target) {
     return 1;
 }
 
+void recomp_module_jump(X86 *c, uint32_t target) {
+    ModuleEntry e = module_entry(target);
+    if (!e.module || e.index < 0) {
+        recomp_unknown_jump(c, target);
+        return;
+    }
+    recomp_execution_checkpoint(c);
+#ifdef RECOMP_NO_HOOKS
+    e.module->base_ptrs[e.index](c);
+#else
+    if (__atomic_load_n(&e.module->hooked[e.index], __ATOMIC_ACQUIRE)) {
+        x86_cc_settle(c);
+        e.module->hook_ptrs[e.index](c, (uint32_t)e.index);
+    } else
+        e.module->base_ptrs[e.index](c);
+#endif
+}
+
 // Consumes the return address the caller pushed and continues after the call,
 // which is what the callee's RET would have done. Without this a call that the
 // runtime cannot deliver leaves a dword on the guest stack and every later
