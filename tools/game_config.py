@@ -226,6 +226,14 @@ def load(game_dir, build_root=None):
     strict_imports = game.setdefault("strict_imports", False)
     if not isinstance(strict_imports, bool):
         raise ValueError("%s: [game] strict_imports must be a boolean" % source)
+    environment = cfg.setdefault("environment", {})
+    passthrough = environment.setdefault("passthrough", [])
+    if not isinstance(passthrough, list) or any(
+            not isinstance(name, str) or not name or any(ch in name for ch in "=\0\r\n")
+            for name in passthrough):
+        raise ValueError("%s: [environment] passthrough must be a list of environment variable names" % source)
+    if len({name.upper() for name in passthrough}) != len(passthrough):
+        raise ValueError("%s: [environment] passthrough contains duplicate names" % source)
     translate = cfg.setdefault("translate", {})
     # "relaxed" keeps CPU and x87 state in host locals between observation
     # points, so an interior fault may see stale scratch state (DIVERGENCE

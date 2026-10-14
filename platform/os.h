@@ -178,6 +178,7 @@ int os_resolve_ipv4(const char *name, unsigned char addr[4]);
 // ---------------------------------------------------------------------------
 // Environment. Values are copied; 0 or -1.
 // ---------------------------------------------------------------------------
+const char *os_getenv(const char *name);
 int os_setenv(const char *name, const char *value);
 int os_unsetenv(const char *name);
 // The kit's switches: `recomp_env("PIN_CLOCK")` reads RECOMP_PIN_CLOCK.  The

@@ -638,6 +638,10 @@ int os_resolve_ipv4(const char *name, unsigned char addr[4]) {
     return 0;
 }
 
+const char *os_getenv(const char *name) {
+    return getenv(name);
+}
+
 int os_setenv(const char *name, const char *value) {
     return setenv(name, value, 1);
 }

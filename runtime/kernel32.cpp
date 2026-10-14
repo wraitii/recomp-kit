@@ -1611,18 +1611,39 @@ namespace {
 
 // The environment block is a run of NUL-terminated strings ended by an extra
 // NUL. GetEnvironmentStringsW must hand back UTF-16, not the ANSI bytes.
-static const char *const k_environment[] = {"PATH=" RECOMP_GUEST_ROOT, "windir=C:\\WINDOWS",
-                                            nullptr};
+static const std::vector<std::string> &guest_environment() {
+    static const std::vector<std::string> entries = [] {
+        std::vector<std::string> result = {"PATH=" RECOMP_GUEST_ROOT, "windir=C:\\WINDOWS"};
+        static const char *const names[] = RECOMP_ENVIRONMENT_PASSTHROUGH;
+        for (const char *const *name = names; *name; ++name) {
+            const char *value = os_getenv(*name);
+            if (!value)
+                continue;
+            std::string prefix = std::string(*name) + "=";
+            result.erase(std::remove_if(result.begin(), result.end(),
+                                        [&](const std::string &entry) {
+                                            return os_strcasecmp(
+                                                       entry.substr(0, entry.find('=')).c_str(),
+                                                       *name) == 0;
+                                        }),
+                         result.end());
+            result.push_back(prefix + value);
+        }
+        return result;
+    }();
+    return entries;
+}
 
 void k_GetEnvironmentStrings(X86 *c) {
     if (!g_envblock_addr || !heap_owns(g_envblock_addr)) {
         uint32_t bytes = 1;
-        for (int i = 0; k_environment[i]; ++i)
-            bytes += (uint32_t)strlen(k_environment[i]) + 1;
+        for (const auto &entry : guest_environment())
+            bytes += (uint32_t)entry.size() + 1;
         uint32_t a = heap_alloc(bytes, true);
         uint32_t at = a;
-        for (int i = 0; a && k_environment[i]; ++i)
-            at += gm_put_str(at, k_environment[i], 0x1000) + 1;
+        for (const auto &entry : guest_environment())
+            if (a)
+                at += gm_put_str(at, entry.c_str(), bytes) + 1;
         g_envblock_addr = a;
     }
     set_eax(c, g_envblock_addr);
@@ -1631,19 +1652,13 @@ void k_GetEnvironmentStrings(X86 *c) {
 void k_GetEnvironmentStringsW(X86 *c) {
     if (!g_envblockw_addr || !heap_owns(g_envblockw_addr)) {
         uint32_t chars = 1;
-        for (int i = 0; k_environment[i]; ++i)
-            chars += (uint32_t)strlen(k_environment[i]) + 1;
+        for (const auto &entry : guest_environment())
+            chars += (uint32_t)entry.size() * 2 + 1;
         uint32_t a = heap_alloc(chars * 2, true);
         uint32_t at = a;
-        for (int i = 0; a && k_environment[i]; ++i) {
-            const char *s = k_environment[i];
-            for (uint32_t j = 0; s[j]; ++j) {
-                wr16(at, (uint16_t)(uint8_t)s[j]);
-                at += 2;
-            }
-            wr16(at, 0);
-            at += 2;
-        }
+        for (const auto &entry : guest_environment())
+            if (a)
+                at += (gm_put_wstr(at, entry, chars) + 1) * 2;
         g_envblockw_addr = a;
     }
     set_eax(c, g_envblockw_addr);
@@ -4482,12 +4497,42 @@ const char *locale_info(uint32_t lctype) {
     }
 }
 
-// The Visual C++ 6 CRT's start-up asks about the environment and the locale
-// before main: nothing is set, and the answer is the one en-US machine every
-// game of the era saw.
-void k_GetEnvironmentVariableA(X86 *c) {
-    set_last_error(203); // ERROR_ENVVAR_NOT_FOUND
+void get_environment_variable(X86 *c, bool wide) {
+    std::string name = wide ? gm_wstr(arg(c, 0)) : gm_str(arg(c, 0));
+    for (const auto &entry : guest_environment()) {
+        size_t eq = entry.find('=');
+        if (eq != name.size() || os_strcasecmp(entry.substr(0, eq).c_str(), name.c_str()) != 0)
+            continue;
+        std::string value = entry.substr(eq + 1);
+        uint32_t length = 0;
+        for (unsigned char ch : value)
+            length += wide ? ((ch & 0xc0) != 0x80 ? (ch >= 0xf0 ? 2 : 1) : 0) : 1;
+        uint32_t out = arg(c, 1), cap = arg(c, 2);
+        if (cap <= length) {
+            set_eax(c, length + 1);
+            return;
+        }
+        if (!out || !gm_valid(out, (length + 1) * (wide ? 2 : 1))) {
+            set_last_error(87);
+            set_eax(c, 0);
+            return;
+        }
+        if (wide)
+            gm_put_wstr(out, value, cap);
+        else
+            gm_put_str(out, value.c_str(), cap);
+        set_last_error(0);
+        set_eax(c, length);
+        return;
+    }
+    set_last_error(203);
     set_eax(c, 0);
+}
+void k_GetEnvironmentVariableA(X86 *c) {
+    get_environment_variable(c, false);
+}
+void k_GetEnvironmentVariableW(X86 *c) {
+    get_environment_variable(c, true);
 }
 void k_GetUserDefaultLCID(X86 *c) {
     set_eax(c, 0x0409);
@@ -5650,7 +5695,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "TzSpecificLocalTimeToSystemTime", 3, nullptr},
     {"KERNEL32.dll", "OpenProcess", 3, nullptr},
     {"KERNEL32.dll", "ExpandEnvironmentStringsW", 3, nullptr},
-    {"KERNEL32.dll", "GetEnvironmentVariableW", 4, nullptr},
+    {"KERNEL32.dll", "GetEnvironmentVariableW", 3, k_GetEnvironmentVariableW},
     {"KERNEL32.dll", "VerLanguageNameW", 3, nullptr},
     {"KERNEL32.dll", "SearchPathW", 6, nullptr},
     {"KERNEL32.dll", "GetStringTypeA", 5, k_GetStringTypeA},
