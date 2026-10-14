@@ -89,6 +89,13 @@ class ScalarPrinter(X87Printer):
         return lines + super().operations(pending)
 
 
+def declaration_lines(declarations):
+    groups = {}
+    for ctype, name in declarations:
+        groups.setdefault(ctype, []).append(name)
+    return ["%s %s;" % (ctype, ", ".join(names)) for ctype, names in groups.items()]
+
+
 def seh_lines(kind, addr):
     eip = "c->eip = 0x%xu;" % addr
     if kind == "enter":
@@ -210,9 +217,10 @@ def emit_prepared(prepared, external_entry=False):
 
     lines = [c_symbols.signature(options.request.variant, symbol, options.request.layout)]
     lines.append("uint8_t *arena_ = g_mem;")
-    for v in s.values:
-        if v.id in live and v.size and v.opc not in ("CONST", "TARGET", "CC_KIND") and s.resolve(v) is v:
-            lines.append("uint%d_t v%d;" % (32 if v.size <= 4 else 64, v.id))
+    lines.extend(declaration_lines(
+        ("uint%d_t" % (32 if v.size <= 4 else 64), "v%d" % v.id)
+        for v in s.values
+        if v.id in live and v.size and v.opc not in ("CONST", "TARGET", "CC_KIND") and s.resolve(v) is v))
     scalar_declarations = len(lines)
     lines.extend(x87_printer.declaration(op) for op in arithmetic_plan.environment_declarations())
     if not external_entry:
