@@ -8,6 +8,12 @@ implements a published API contract and nothing about a game: a shim answers
 the way the real DLL would, and where it cannot, it says so once in the log
 rather than inventing an answer.
 
+`BinkCopyToBuffer` supports unscaled copies and horizontal pixel doubling
+(`flags & 0x70000000 == 0x30000000`), preserving the supplied destination pitch.
+The original `binkw32.dll` dispatch at `0x1000d778` selects pixel pairs; its
+XRGB writer at `0x1000bd9f` stores each pixel twice. Other scaling modes remain
+unsupported and report an error. Destination validation includes the expanded row.
+
 Every module is compiled and `dx_register_shims()` registers all of them; a
 build does not select by game or era. A game reaches only the ones its imports
 name, so the rest cost registration, not behaviour. The work behind them is
