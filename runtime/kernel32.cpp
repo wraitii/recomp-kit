@@ -1767,7 +1767,7 @@ void k_SetLastError(X86 *c) {
 }
 
 // The guest CPU is fixed by recomp_cpuid(): GenuineIntel family 6, model 3
-// (Pentium II), with FPU, TSC and CMOV and no MMX. Answer from that same model
+// (Pentium II), with FPU, TSC, CMOV and MMX. Answer from that same model
 // so CPUID and this API can never disagree. Feature codes follow winnt.h; an
 // unknown code is FALSE, as on Windows.
 void k_IsProcessorFeaturePresent(X86 *c) {
@@ -1788,10 +1788,11 @@ void k_IsProcessorFeaturePresent(X86 *c) {
     switch ((uint32_t)arg(c, 0)) {
     // CMPXCHG8B is deliberately absent from this runtime's CPUID EDX mask.
     // Do not infer it from the nominal CPU family/model.
+    case PF_MMX_INSTRUCTIONS_AVAILABLE:  // CPUID EDX bit 23 is advertised
     case PF_RDTSC_INSTRUCTION_AVAILABLE: // CPUID EDX bit 4 is advertised
         present = true;
         break;
-    default: // the FDIV erratum, FPU emulation, MMX/SSE/3DNow and the rest
+    default: // the FDIV erratum, FPU emulation, SSE/3DNow and the rest
         present = false;
         break;
     }

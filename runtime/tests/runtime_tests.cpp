@@ -4026,10 +4026,10 @@ static void test_startup_apis(X86 *c) {
               call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {8}) ==
                   ((cpuid.r[R_EDX] >> 4) & 1),
           "feature API agrees with actual CPUID bits");
-    check(call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {3}) == 0 &&
+    check(call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {3}) == 1 &&
               call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {6}) == 0 &&
               call_import(c, "KERNEL32.dll", "IsProcessorFeaturePresent", {0x7fffffff}) == 0,
-          "MMX, SSE and unknown feature codes are absent");
+          "MMX is present; SSE and unknown feature codes are absent");
     check(call_import(c, "USER32.dll", "LoadImageA", {0, 0, 1, 16, 16, 0}) == 0x00029001,
           "LoadImageA(IMAGE_ICON) without an instance gives the shared icon handle");
     check(call_import(c, "USER32.dll", "LoadImageA", {0, 0, 2, 0, 0, 0}) == 0x0002a000,

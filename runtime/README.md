@@ -290,3 +290,7 @@ version-4 GUID in guest memory, without advancing the guest RNG.
 MoveFileA/W share UTF-8 path resolution and reject an existing destination.
 DIVERGENCE(original): the rename seam currently cannot move files across
 volumes and checks destination existence before renaming rather than atomically.
+
+CPUID reports FPU, TSC, CMOV and MMX for the emulated Pentium II;
+`IsProcessorFeaturePresent(PF_MMX_INSTRUCTIONS_AVAILABLE)` agrees. The translator
+models original MMX instructions; SSE, SSE2 and 3DNow remain unadvertised.

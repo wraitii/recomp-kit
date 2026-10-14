@@ -352,7 +352,8 @@ void recomp_unknown_call(X86 *c, uint32_t target) {
 
 #ifdef RECOMP_CHECK_CALL_FACTS
 void recomp_call_fact_violation(uint32_t ret, uint32_t target) {
-    fprintf(stderr, "indirect call returning to %08x reached undeclared target %08x\n", ret, target);
+    fprintf(stderr, "indirect call returning to %08x reached undeclared target %08x\n", ret,
+            target);
     fflush(stdout);
     abort();
 }
@@ -467,9 +468,7 @@ void recomp_rdtsc(X86 *c) {
     c->r[R_EDX] = (uint32_t)(tsc >> 32);
 }
 
-// Deterministic CPUID per the plan: GenuineIntel, family 6, model 3, and only
-// FPU, TSC and CMOV. No MMX, so the guest cannot pick a path the translator
-// does not cover.
+// GenuineIntel family 6, model 3, with FPU, TSC, CMOV and translated MMX.
 void recomp_cpuid(X86 *c) {
     switch (c->r[R_EAX]) {
     case 0:
@@ -482,7 +481,7 @@ void recomp_cpuid(X86 *c) {
         c->r[R_EAX] = 0x00000633; // family 6, model 3, stepping 3
         c->r[R_EBX] = 0;
         c->r[R_ECX] = 0;
-        c->r[R_EDX] = 0x00008011; // FPU | TSC | CMOV, nothing else
+        c->r[R_EDX] = 0x00808011; // FPU | TSC | CMOV | MMX
         break;
     default:
         c->r[R_EAX] = c->r[R_EBX] = c->r[R_ECX] = c->r[R_EDX] = 0;
