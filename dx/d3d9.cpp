@@ -244,6 +244,27 @@ static void d3d9_reconcile(std::set<uint32_t> &current, const std::set<uint32_t>
             d3d9_ref_add(id);
     current = desired;
 }
+static size_t d3d9_unique_ids(const std::array<uint32_t, 38> &ids, std::array<uint32_t, 38> &out) {
+    auto end = std::remove_copy(ids.begin(), ids.end(), out.begin(), 0u);
+    std::sort(out.begin(), end);
+    return (size_t)(std::unique(out.begin(), end) - out.begin());
+}
+static void d3d9_reconcile_bindings(std::array<uint32_t, 38> &snapshot,
+                                    const std::array<uint32_t, 38> &ids) {
+    if (snapshot == ids)
+        return;
+    std::array<uint32_t, 38> old_ids{};
+    std::array<uint32_t, 38> new_ids{};
+    const size_t old_count = d3d9_unique_ids(snapshot, old_ids);
+    const size_t new_count = d3d9_unique_ids(ids, new_ids);
+    for (size_t i = 0; i < old_count; ++i)
+        if (!std::binary_search(new_ids.begin(), new_ids.begin() + new_count, old_ids[i]))
+            d3d9_ref_del(old_ids[i]);
+    for (size_t i = 0; i < new_count; ++i)
+        if (!std::binary_search(old_ids.begin(), old_ids.begin() + old_count, new_ids[i]))
+            d3d9_ref_add(new_ids[i]);
+    snapshot = ids;
+}
 static void d3d9_refresh_bindings(ComObj *dev) {
     if (!dev || !dev->d3d9_device)
         return;
@@ -261,18 +282,8 @@ static void d3d9_refresh_bindings(ComObj *dev) {
     }
     auto recording = result.recording_active ? d3d9_binding_ids(dev, result.recording)
                                              : std::array<uint32_t, 38>{};
-    auto refresh = [](auto &snapshot, auto &refs, const auto &ids) {
-        if (snapshot == ids)
-            return;
-        std::set<uint32_t> desired;
-        for (uint32_t id : ids)
-            if (id)
-                desired.insert(id);
-        d3d9_reconcile(refs, desired);
-        snapshot = ids;
-    };
-    refresh(host->live_bindings, host->live_refs, live);
-    refresh(host->recording_bindings, host->recording_refs, recording);
+    d3d9_reconcile_bindings(host->live_bindings, live);
+    d3d9_reconcile_bindings(host->recording_bindings, recording);
 }
 static void d3d9_refresh_block_bindings(ComObj *dev, uint32_t handle) {
     if (!dev || !dev->d3d9_device)
@@ -295,18 +306,21 @@ static void d3d9_drop_block_refs(ComObj *dev, uint32_t handle) {
 static void d3d9_drop_all_refs(ComObj *dev) {
     if (!dev || !dev->d3d9_device)
         return;
-    for (uint32_t id : dev->d3d9_device->live_refs)
-        d3d9_ref_del(id);
-    for (uint32_t id : dev->d3d9_device->recording_refs)
-        d3d9_ref_del(id);
-    dev->d3d9_device->live_refs.clear();
-    dev->d3d9_device->live_bindings.fill(0);
-    dev->d3d9_device->recording_bindings.fill(0);
-    dev->d3d9_device->recording_refs.clear();
-    for (auto &entry : dev->d3d9_device->block_refs)
+    D3d9HostDevice *host = dev->d3d9_device.get();
+    std::array<uint32_t, 38> live_ids{};
+    std::array<uint32_t, 38> recording_ids{};
+    const size_t live_count = d3d9_unique_ids(host->live_bindings, live_ids);
+    const size_t recording_count = d3d9_unique_ids(host->recording_bindings, recording_ids);
+    for (size_t i = 0; i < live_count; ++i)
+        d3d9_ref_del(live_ids[i]);
+    for (size_t i = 0; i < recording_count; ++i)
+        d3d9_ref_del(recording_ids[i]);
+    host->live_bindings.fill(0);
+    host->recording_bindings.fill(0);
+    for (auto &entry : host->block_refs)
         for (uint32_t id : entry.second)
             d3d9_ref_del(id);
-    dev->d3d9_device->block_refs.clear();
+    host->block_refs.clear();
 }
 static ComObj *d3d9_make_object(ComObj *dev, ComKind kind, ComIface iface, uint32_t handle,
                                 uint32_t out) {
@@ -3222,6 +3236,10 @@ void d3dx_effect_destroy(ComObj *o) {
             heap_free(entry.second.second);
     }
     host->pass_shaders.clear();
+    if (host->dispatch_scratch)
+        heap_free(host->dispatch_scratch);
+    host->dispatch_scratch = 0;
+    host->dispatch_scratch_size = 0;
     efx_free_handles(host);
     efx_reconcile_refs(host->texture_refs, {});
     efx_reconcile_refs(host->saved_refs, {});
@@ -3981,24 +3999,26 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
     D3dxEffectHost *host = efx_host(fx);
     if (!host || !dev || !dev->d3d9_device)
         return D3DERR_INVALIDCALL;
-    if (commands.size() == 0)
+    const size_t command_count = commands.size();
+    if (command_count == 0)
         return D3D_OK9;
     uint32_t manager = host->state_manager;
     if (!efx_manager_valid(manager)) {
         LOGW("d3d9: ID3DXEffect needs a valid ID3DXEffectStateManager for %u commands",
-             (unsigned)commands.size());
+             (unsigned)command_count);
         return D3DERR_INVALIDCALL;
     }
     uint32_t addref = efx_manager_method(manager, EFX_MANAGER_ADDREF, "AddRef");
     uint32_t release = efx_manager_method(manager, EFX_MANAGER_RELEASE, "Release");
     if (!addref || !release)
         return D3DERR_INVALIDCALL;
-    std::vector<uint32_t> resolved(commands.size(), 0);
+    const recomp::d3d::D3dxEffectCommand *cmd_list = commands.data();
+    std::vector<uint32_t> resolved(command_count, 0);
     std::set<uint32_t> pinned;
     bool stale = false;
     bool oom = false;
-    for (size_t i = 0; i < commands.size() && !stale && !oom; ++i) {
-        const recomp::d3d::D3dxEffectCommand &cmd = commands[i];
+    for (size_t i = 0; i < command_count && !stale && !oom; ++i) {
+        const recomp::d3d::D3dxEffectCommand &cmd = cmd_list[i];
         if (cmd.kind == recomp::d3d::D3dxEffectCommandKind::SetTexture) {
             if (!cmd.value)
                 continue;
@@ -4051,23 +4071,21 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
 
     guest_call(c, addref, manager);
 
-    uint32_t scratch = 0;
-    uint32_t scratch_size = 0;
     auto temporary = [&](uint32_t bytes) -> uint32_t {
         if (!bytes)
             return 0;
-        if (bytes > scratch_size) {
-            if (scratch)
-                heap_free(scratch);
-            scratch = heap_alloc(bytes, false, 16);
-            scratch_size = scratch ? bytes : 0;
+        if (bytes > host->dispatch_scratch_size) {
+            if (host->dispatch_scratch)
+                heap_free(host->dispatch_scratch);
+            host->dispatch_scratch = heap_alloc(bytes, false, 16);
+            host->dispatch_scratch_size = host->dispatch_scratch ? bytes : 0;
         }
-        return scratch;
+        return host->dispatch_scratch;
     };
 
     uint32_t failure = D3D_OK9;
-    for (size_t i = 0; i < commands.size() && !oom; ++i) {
-        const recomp::d3d::D3dxEffectCommand &cmd = commands[i];
+    for (size_t i = 0; i < command_count && !oom; ++i) {
+        const recomp::d3d::D3dxEffectCommand &cmd = cmd_list[i];
         uint32_t result = D3D_OK9;
         switch (cmd.kind) {
         case recomp::d3d::D3dxEffectCommandKind::SetRenderState: {
@@ -4156,14 +4174,15 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
                 stale = true;
                 break;
             }
-            if (cmd.values.size() % 4 != 0 || cmd.values.size() > UINT32_MAX / 4) {
+            const size_t value_count = cmd.values.size();
+            if (value_count % 4 != 0 || value_count > UINT32_MAX / 4) {
                 LOGW("d3d9: ID3DXEffectStateManager::%s has an invalid constant span",
                      vertex ? "SetVertexShaderConstantF" : "SetPixelShaderConstantF");
                 stale = true;
                 break;
             }
-            uint32_t count = (uint32_t)cmd.values.size() / 4;
-            uint32_t bytes = (uint32_t)cmd.values.size() * 4;
+            uint32_t count = (uint32_t)value_count / 4;
+            uint32_t bytes = (uint32_t)value_count * 4;
             uint32_t buf = temporary(bytes);
             if (bytes && !buf) {
                 oom = true;
@@ -4185,8 +4204,6 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
             failure = result;
     }
 
-    if (scratch)
-        heap_free(scratch);
     unpin();
     guest_call(c, release, manager);
     if (oom)

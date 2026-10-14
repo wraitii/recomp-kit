@@ -665,15 +665,22 @@ struct Callbacks {
         }
     }
 };
-thread_local Callbacks callbacks;
+Callbacks &callback_state() {
+    static thread_local Callbacks *cached = nullptr;
+    if (!cached) {
+        static thread_local Callbacks owned;
+        cached = &owned;
+    }
+    return *cached;
+}
 } // namespace
 
 uint32_t recomp_callback_depth(void) {
-    return (uint32_t)callbacks.stack.size();
+    return (uint32_t)callback_state().stack.size();
 }
 
 void recomp_callback_truncate(uint32_t depth) {
-    Callbacks &local = callbacks;
+    Callbacks &local = callback_state();
     while (local.stack.size() > depth) {
         local.recycle(local.stack.back());
         local.stack.pop_back();
@@ -681,7 +688,7 @@ void recomp_callback_truncate(uint32_t depth) {
 }
 
 void recomp_callback_reset(X86 *c) {
-    Callbacks &local = callbacks;
+    Callbacks &local = callback_state();
     for (size_t i = local.stack.size(); i-- > 0;)
         if (!c || local.stack[i]->cpu == c) {
             local.recycle(local.stack[i]);
@@ -690,7 +697,7 @@ void recomp_callback_reset(X86 *c) {
 }
 
 void recomp_callback_return(X86 *c) {
-    Callbacks &local = callbacks;
+    Callbacks &local = callback_state();
     if (local.stack.empty())
         return;
     Callback *call = local.stack.back();
@@ -709,7 +716,7 @@ uint32_t guest_call(X86 *c, uint32_t fn, const uint32_t *args, int nargs) {
 #ifdef RECOMP_CHECK_CALL_FACTS
     ++g_guest_entries;
 #endif
-    Callbacks &local = callbacks;
+    Callbacks &local = callback_state();
     Callback *call = local.acquire();
     call->cpu = c;
     call->saved_esp = c->r[R_ESP];
@@ -727,7 +734,7 @@ uint32_t guest_call(X86 *c, uint32_t fn, const uint32_t *args, int nargs) {
     local.stack.push_back(call);
     if (!RECOMP_SETJMP(call->env))
         recomp_run(c, fn);
-    recomp_seh_callback_leave(c, recomp_callback_depth());
+    recomp_seh_callback_leave(c, static_cast<uint32_t>(local.stack.size()));
     uint32_t eax = c->r[R_EAX];
     c->r[R_ESP] = call->saved_esp;
     c->eip = call->saved_eip;

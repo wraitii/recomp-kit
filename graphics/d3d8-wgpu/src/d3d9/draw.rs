@@ -865,60 +865,124 @@ fn inverse3(m: &[f32; 16]) -> Result<[[f32; 3]; 3], RenderError> {
 struct FfLight {
     kind: u32,
     values: [f32; 26],
-    direction: [f32; 4],
     position: [f32; 4],
+    direction: [f32; 3],
+    spot_inner: f32,
+    spot_outer: f32,
+}
+struct FfFog {
+    mode: u32,
+    density: f32,
+    start: f32,
+    end: f32,
+}
+impl FfFog {
+    fn prepare(state: &D3d9State) -> Self {
+        Self {
+            mode: rs(state, 140),
+            density: f32::from_bits(rs(state, 38)),
+            start: f32::from_bits(rs(state, 36)),
+            end: f32::from_bits(rs(state, 37)),
+        }
+    }
+
+    fn factor(&self, z: f32) -> f32 {
+        match self.mode {
+            1 => (-self.density * z).exp(),
+            2 => {
+                let d = self.density * z;
+                (-d * d).exp()
+            }
+            3 => ((self.end - z) / (self.end - self.start)).clamp(0.0, 1.0),
+            _ => 1.0,
+        }
+    }
+}
+struct FfDraw {
+    lighting: bool,
+    local_viewer: bool,
+    specular: bool,
+    normalize_normals: bool,
+    material: [f32; 17],
+    diffuse_source: Option<u8>,
+    ambient_source: Option<u8>,
+    specular_source: Option<u8>,
+    emissive_source: Option<u8>,
+    global_ambient: [f32; 4],
+    fog: FfFog,
+}
+impl FfDraw {
+    fn prepare(state: &D3d9State) -> Self {
+        let vertex_color = rs(state, 141) != 0;
+        let selector = |id: u32| -> Option<u8> {
+            if vertex_color {
+                match rs(state, id) {
+                    1 => Some(0),
+                    2 => Some(1),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
+        Self {
+            lighting: rs(state, 137) != 0,
+            local_viewer: rs(state, 142) != 0,
+            specular: rs(state, 29) != 0,
+            normalize_normals: rs(state, 143) != 0,
+            material: state.material().map(f32::from_bits),
+            diffuse_source: selector(145),
+            ambient_source: selector(147),
+            specular_source: selector(146),
+            emissive_source: selector(148),
+            global_ambient: color(rs(state, 139)),
+            fog: FfFog::prepare(state),
+        }
+    }
+
+    fn source(
+        &self,
+        offset: usize,
+        selected: Option<u8>,
+        vertex: &[Option<[f32; 4]>; 2],
+    ) -> [f32; 4] {
+        selected
+            .and_then(|index| vertex[index as usize])
+            .unwrap_or_else(|| {
+                self.material[offset..offset + 4]
+                    .try_into()
+                    .expect("material color")
+            })
+    }
 }
 fn ff_colors(
-    state: &D3d9State,
+    prep: &FfDraw,
     p: [f32; 4],
     n: [f32; 3],
     vertex: [Option<[f32; 4]>; 2],
     lights: &[FfLight],
 ) -> Result<[[f32; 4]; 2], RenderError> {
-    if rs(state, 137) == 0 {
+    if !prep.lighting {
         return Ok([vertex[0].unwrap_or([1.0; 4]), vertex[1].unwrap_or([0.0; 4])]);
     }
-    let material = state.material().map(f32::from_bits);
-    let source = |offset: usize, id: u32| -> [f32; 4] {
-        let selected = if rs(state, 141) != 0 {
-            match rs(state, id) {
-                1 => vertex[0],
-                2 => vertex[1],
-                _ => None,
-            }
-        } else {
-            None
-        };
-        selected.unwrap_or_else(|| {
-            material[offset..offset + 4]
-                .try_into()
-                .expect("material color")
-        })
-    };
-    let diffuse = source(0, 145);
-    let ambient = source(4, 147);
-    let specular = source(8, 146);
-    let emissive = source(12, 148);
-    let global = color(rs(state, 139));
+    let material = &prep.material;
+    let diffuse = prep.source(0, prep.diffuse_source, &vertex);
+    let ambient = prep.source(4, prep.ambient_source, &vertex);
+    let specular = prep.source(8, prep.specular_source, &vertex);
+    let emissive = prep.source(12, prep.emissive_source, &vertex);
+    let global = prep.global_ambient;
     let mut result: [[f32; 4]; 2] = [
         std::array::from_fn(|i| emissive[i] + ambient[i] * global[i]),
         [0.0; 4],
     ];
-    let viewer = if rs(state, 142) != 0 {
+    let viewer = if prep.local_viewer {
         normalize3([-p[0], -p[1], -p[2]])
     } else {
         [0.0, 0.0, 1.0]
     };
     for light in lights {
         let (l, mut attenuation) = if light.kind == 3 {
-            (
-                normalize3([
-                    -light.direction[0],
-                    -light.direction[1],
-                    -light.direction[2],
-                ]),
-                1.0,
-            )
+            (light.direction, 1.0)
         } else {
             let delta = [
                 light.position[0] - p[0],
@@ -941,12 +1005,9 @@ fn ff_colors(
             (normalize3(delta), 1.0 / denominator)
         };
         if light.kind == 2 {
-            let rho = -dot3(
-                l,
-                normalize3([light.direction[0], light.direction[1], light.direction[2]]),
-            );
-            let inner = (light.values[24] * 0.5).cos();
-            let outer = (light.values[25] * 0.5).cos();
+            let rho = -dot3(l, light.direction);
+            let inner = light.spot_inner;
+            let outer = light.spot_outer;
             attenuation *= if rho >= inner {
                 1.0
             } else if rho <= outer {
@@ -956,7 +1017,7 @@ fn ff_colors(
             };
         }
         let ndotl = dot3(n, l).max(0.0);
-        let highlight = if rs(state, 29) != 0 && ndotl > 0.0 {
+        let highlight = if prep.specular && ndotl > 0.0 {
             dot3(n, normalize3(std::array::from_fn(|i| l[i] + viewer[i])))
                 .max(0.0)
                 .powf(material[16])
@@ -1015,17 +1076,29 @@ fn ff_vertices(
             .map_err(|_| RenderError::out_of_memory("Draw", "fixed-function lights"))?;
         for raw in raw_lights {
             let values = raw.map(f32::from_bits);
-            let direction = transform_point(&view, [values[16], values[17], values[18], 0.0]);
+            let view_direction = transform_point(&view, [values[16], values[17], values[18], 0.0]);
             let position = if raw[0] == 3 {
                 [0.0; 4]
             } else {
                 transform_point(&view, [values[13], values[14], values[15], 1.0])
             };
+            let direction = match raw[0] {
+                2 => normalize3([view_direction[0], view_direction[1], view_direction[2]]),
+                3 => normalize3([-view_direction[0], -view_direction[1], -view_direction[2]]),
+                _ => [0.0; 3],
+            };
+            let (spot_inner, spot_outer) = if raw[0] == 2 {
+                ((values[24] * 0.5).cos(), (values[25] * 0.5).cos())
+            } else {
+                (0.0, 0.0)
+            };
             lights.push(FfLight {
                 kind: raw[0],
                 values,
-                direction,
                 position,
+                direction,
+                spot_inner,
+                spot_outer,
             });
         }
     }
@@ -1067,16 +1140,22 @@ fn ff_vertices(
     } else {
         None
     };
-    let texcoords = stage_coords
-        .iter()
-        .map(|&(coord, _)| {
-            if coord & 0xffff0000 == 0 {
-                find(5, (coord & 0xffff) as u8).map(&prepare).transpose()
-            } else {
-                Ok(None)
+    let mut unique_texcoords: [Option<VertexFetch<'_>>; 8] = std::array::from_fn(|_| None);
+    let mut texcoord_sources: [Option<u8>; 8] = [None; 8];
+    for (stage, &(coord, _)) in stage_coords.iter().enumerate() {
+        if coord & 0xffff0000 != 0 {
+            continue;
+        }
+        let usage = (coord & 0xffff) as u8;
+        if unique_texcoords[usage as usize].is_none() {
+            match find(5, usage) {
+                Some(element) => unique_texcoords[usage as usize] = Some(prepare(element)?),
+                None => continue,
             }
-        })
-        .collect::<Result<Vec<_>, RenderError>>()?;
+        }
+        texcoord_sources[stage] = Some(usage);
+    }
+    let prep = FfDraw::prepare(state);
     for &index in order {
         let fetch = |e: &VertexFetch<'_>| e.fetch(index);
         let p = fetch(&position)?;
@@ -1115,7 +1194,7 @@ fn ff_vertices(
             } else {
                 [n[0], n[1], n[2]]
             };
-            if !transformed && rs(state, 143) != 0 {
+            if !transformed && prep.normalize_normals {
                 normalize3(normal)
             } else {
                 normal
@@ -1126,21 +1205,31 @@ fn ff_vertices(
         let colors = if transformed {
             [vertex[0].unwrap_or([1.0; 4]), vertex[1].unwrap_or([0.0; 4])]
         } else {
-            ff_colors(state, viewp, normal, vertex, &lights)?
+            ff_colors(&prep, viewp, normal, vertex, &lights)?
         };
         let mut packed = [0.0f32; 48];
         packed[..4].copy_from_slice(&clip);
         packed[4..8].copy_from_slice(&colors[0]);
         packed[8..12].copy_from_slice(&colors[1]);
-        for (stage, (&(coord, transform), texcoord)) in
-            stage_coords.iter().zip(&texcoords).enumerate()
-        {
+        let mut texcoord_cache: [Option<[f32; 4]>; 8] = [None; 8];
+        for (stage, &(coord, transform)) in stage_coords.iter().enumerate() {
             let mut uv = match coord & 0xffff0000 {
-                0 => texcoord
-                    .as_ref()
-                    .map(&fetch)
-                    .transpose()?
-                    .unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                0 => match texcoord_sources[stage] {
+                    Some(usage) => {
+                        let slot = usage as usize;
+                        if let Some(value) = texcoord_cache[slot] {
+                            value
+                        } else {
+                            let value = unique_texcoords[slot]
+                                .as_ref()
+                                .expect("prepared texture coordinate")
+                                .fetch(index)?;
+                            texcoord_cache[slot] = Some(value);
+                            value
+                        }
+                    }
+                    None => [0.0, 0.0, 0.0, 1.0],
+                },
                 0x10000 => [normal[0], normal[1], normal[2], 1.0],
                 0x20000 => viewp,
                 0x30000 => {
@@ -1169,7 +1258,7 @@ fn ff_vertices(
         let fog = if transformed {
             vertex[1].map(|v| v[3]).unwrap_or(1.0)
         } else {
-            fog_factor(state, viewp[2].abs(), rs(state, 140))
+            prep.fog.factor(viewp[2].abs())
         };
         packed[44] = fog;
         packed[45] = viewp[2];
@@ -1177,21 +1266,6 @@ fn ff_vertices(
     }
     Ok(out)
 }
-fn fog_factor(state: &D3d9State, z: f32, mode: u32) -> f32 {
-    let density = f32::from_bits(rs(state, 38));
-    let start = f32::from_bits(rs(state, 36));
-    let end = f32::from_bits(rs(state, 37));
-    match mode {
-        1 => (-density * z).exp(),
-        2 => {
-            let d = density * z;
-            (-d * d).exp()
-        }
-        3 => ((end - z) / (end - start)).clamp(0.0, 1.0),
-        _ => 1.0,
-    }
-}
-
 const V2F: &str = "struct V2F { @builtin(position) pos: vec4<f32>, @location(0) d0: vec4<f32>, @location(1) d1: vec4<f32>, @location(2) t0: vec4<f32>, @location(3) t1: vec4<f32>, @location(4) t2: vec4<f32>, @location(5) t3: vec4<f32>, @location(6) t4: vec4<f32>, @location(7) t5: vec4<f32>, @location(8) t6: vec4<f32>, @location(9) t7: vec4<f32>, @location(10) fog: f32, @location(11) fogz: f32 }\n";
 const OUTPUT: &str = r#"
 fn d9_output(input:vec4<f32>,vin:V2F)->vec4<f32> {
@@ -2952,6 +3026,10 @@ fn flush_inner(gpu: &D3d9Gpu, draw: &mut D3d9DrawState) -> Result<(), RenderErro
             timestamp_writes: None,
             occlusion_query_set: None,
         });
+        let mut cached_viewport = None;
+        let mut cached_stencil = None;
+        let mut cached_blend = None;
+        let mut cached_scissor = None;
         for (pending, bind_group) in draw.batch.draws.iter().zip(&bind_groups) {
             pass.set_pipeline(&pending.pipeline);
             pass.set_bind_group(0, bind_group, &pending.uniform_offsets);
@@ -2969,27 +3047,48 @@ fn flush_inner(gpu: &D3d9Gpu, draw: &mut D3d9DrawState) -> Result<(), RenderErro
                         .slice(pending.vertex_offset..pending.vertex_offset + pending.vertex_size),
                 );
             }
-            pass.set_viewport(
-                pending.viewport.x as f32,
-                pending.viewport.y as f32,
-                pending.viewport.width as f32,
-                pending.viewport.height as f32,
-                pending.viewport.min_z,
-                pending.viewport.max_z,
+            let viewport_key = (
+                pending.viewport.x,
+                pending.viewport.y,
+                pending.viewport.width,
+                pending.viewport.height,
+                pending.viewport.min_z.to_bits(),
+                pending.viewport.max_z.to_bits(),
             );
-            pass.set_stencil_reference(pending.stencil_reference);
+            if cached_viewport != Some(viewport_key) {
+                pass.set_viewport(
+                    pending.viewport.x as f32,
+                    pending.viewport.y as f32,
+                    pending.viewport.width as f32,
+                    pending.viewport.height as f32,
+                    pending.viewport.min_z,
+                    pending.viewport.max_z,
+                );
+                cached_viewport = Some(viewport_key);
+            }
+            if cached_stencil != Some(pending.stencil_reference) {
+                pass.set_stencil_reference(pending.stencil_reference);
+                cached_stencil = Some(pending.stencil_reference);
+            }
             let blend = pending.blend_constant;
-            pass.set_blend_constant(wgpu::Color {
-                r: blend[0] as f64,
-                g: blend[1] as f64,
-                b: blend[2] as f64,
-                a: blend[3] as f64,
-            });
+            let blend_bits = blend.map(f32::to_bits);
+            if cached_blend != Some(blend_bits) {
+                pass.set_blend_constant(wgpu::Color {
+                    r: blend[0] as f64,
+                    g: blend[1] as f64,
+                    b: blend[2] as f64,
+                    a: blend[3] as f64,
+                });
+                cached_blend = Some(blend_bits);
+            }
             let [left, top, width, height] =
                 pending
                     .scissor
                     .unwrap_or([0, 0, draw.batch.width, draw.batch.height]);
-            pass.set_scissor_rect(left, top, width, height);
+            if cached_scissor != Some([left, top, width, height]) {
+                pass.set_scissor_rect(left, top, width, height);
+                cached_scissor = Some([left, top, width, height]);
+            }
             if let Some(geometry) = &pending.native_geometry {
                 pass.set_index_buffer(
                     geometry
@@ -3053,6 +3152,78 @@ pub(crate) fn clear(
     }
     flush(gpu, draw)?;
     let depth = depth.filter(|_| flags & 6 != 0);
+    let full_color = flags & 1 == 0 || !target.texture.format().is_srgb();
+    let full_rect = rects.len() == 1
+        && rects[0].left == 0
+        && rects[0].top == 0
+        && rects[0].right == target.width as i32
+        && rects[0].bottom == target.height as i32
+        && target.width != 0
+        && target.height != 0;
+    let full_depth = flags & 6 == 0
+        || depth
+            .as_ref()
+            .is_some_and(|d| d.width == target.width && d.height == target.height);
+    if full_color && full_rect && full_depth {
+        let mut clear = color(color_value);
+        if opaque_format(target.format) {
+            clear[3] = 1.0;
+        }
+        let color_attachment = (flags & 1 != 0).then(|| wgpu::RenderPassColorAttachment {
+            view: &target.view,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color {
+                    r: clear[0] as f64,
+                    g: clear[1] as f64,
+                    b: clear[2] as f64,
+                    a: clear[3] as f64,
+                }),
+                store: wgpu::StoreOp::Store,
+            },
+        });
+        let colors = [color_attachment];
+        let colors: &[Option<wgpu::RenderPassColorAttachment>] =
+            if flags & 1 != 0 { &colors } else { &[] };
+        let depth_attachment = depth
+            .as_ref()
+            .map(|d| wgpu::RenderPassDepthStencilAttachment {
+                view: &d.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: if flags & 2 != 0 {
+                        wgpu::LoadOp::Clear(z)
+                    } else {
+                        wgpu::LoadOp::Load
+                    },
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: super::format::has_stencil(d.format).then_some(wgpu::Operations {
+                    load: if flags & 4 != 0 {
+                        wgpu::LoadOp::Clear(stencil)
+                    } else {
+                        wgpu::LoadOp::Load
+                    },
+                    store: wgpu::StoreOp::Store,
+                }),
+            });
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("d3d9-clear"),
+            });
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("d3d9-clear"),
+                color_attachments: colors,
+                depth_stencil_attachment: depth_attachment,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+        gpu.queue.submit(std::iter::once(encoder.finish()));
+        return Ok(());
+    }
     let mut source = String::from(
         "struct Params {color:vec4<f32>,depth:vec4<f32>}\n@group(0) @binding(0) var<uniform> params:Params;\n@vertex fn vs_main(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32>{let p=array<vec2<f32>,3>(vec2<f32>(-1.0,-1.0),vec2<f32>(3.0,-1.0),vec2<f32>(-1.0,3.0));return vec4<f32>(p[i],0.0,1.0);}\n",
     );

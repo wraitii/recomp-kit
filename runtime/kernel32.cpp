@@ -508,8 +508,13 @@ extern "C" void recomp_guest_free(uint32_t addr) {
         heap_free(addr);
 }
 
-// The case-insensitive walk through the game directory, unchanged.
 static std::string resolve_in_game_dir(const std::vector<std::string> &norm, bool for_create) {
+    if (norm.size() > 1) {
+        std::string direct = g_game_dir + "/" + serialise_relative(norm);
+        OsStat st;
+        if (os_stat(direct.c_str(), &st) == 0)
+            return direct;
+    }
     std::string host = g_game_dir;
     for (size_t i = 0; i < norm.size(); ++i) {
         std::string next = host + "/" + norm[i];

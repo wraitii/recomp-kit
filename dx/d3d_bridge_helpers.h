@@ -367,8 +367,6 @@ struct D3d9HostDevice {
     std::unordered_map<uint32_t, uint32_t> block_views;
     std::array<uint32_t, 38> live_bindings{};
     std::array<uint32_t, 38> recording_bindings{};
-    std::set<uint32_t> live_refs;
-    std::set<uint32_t> recording_refs;
     std::map<uint32_t, std::set<uint32_t>> block_refs;
 };
 
@@ -397,6 +395,8 @@ struct D3dxEffectHost {
     std::map<uint32_t, uint32_t> handle_reverse;
     std::map<std::string, uint32_t> strings;
     std::map<uint32_t, std::pair<uint32_t, uint32_t>> pass_shaders;
+    uint32_t dispatch_scratch = 0;
+    uint32_t dispatch_scratch_size = 0;
 
     D3dxEffectHost() : value(recomp::d3d::new_d3dx_effect()) {}
 };
