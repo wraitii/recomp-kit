@@ -9,6 +9,7 @@
 #include "host_api.h"
 #include "riff.h"
 #include "mp3_source.h"
+#include "wav_source.h"
 #include "../runtime/imports.h"
 #include "../runtime/memory.h"
 #include "../runtime/win32.h"
@@ -50,6 +51,7 @@ struct Driver {
     uint32_t reverb[3]{};
     uint32_t reverb_dry = 0x3f800000, reverb_wet = 0;
     uint32_t room_type = 0;
+    float doppler = 1.0f;
 };
 std::map<uint32_t, Driver> g_drivers;
 uint32_t g_next_driver = 0x10000;
@@ -94,16 +96,25 @@ struct Sample {
     bool playing = false;
     uint32_t eos_cb = 0; // AIL_register_EOS_callback for a 2D sample
     bool eos_fired = false;
+    int32_t stream = -1;
 
     // A Miles 3D sample plays through the same host-channel machinery as a 2D
     // one. Where it is and how far away decide the pan and the distance gain;
     // rate overrides the file's own sample rate when non-zero.
     bool is_3d = false;
     float pos3d[3] = {0.0f, 0.0f, 0.0f};
+    float front3d[3] = {0.0f, 0.0f, 1.0f};
+    float up3d[3] = {0.0f, 1.0f, 0.0f};
+    float vel3d[3] = {0.0f, 0.0f, 0.0f};
+    float cone_inner = 0.0f, cone_outer = 0.0f, cone_outer_volume = 1.0f;
+    bool cone_enabled = false;
     float min_d = 1.0f, max_d = 1.0e9f;
     uint32_t rate = 0;
 };
 std::vector<Sample> g_samples(64);
+
+uint32_t stream_status(uint32_t handle);
+void stream_close_driver(uint32_t driver);
 
 // The single digital driver every sample belongs to. A sample handle does not
 // name a driver, so master volume comes from the most recently opened one.
@@ -155,7 +166,8 @@ void sample_stop(Sample &s) {
 
 void sample_reset(Sample &s) {
     sample_stop(s);
-    dx_free_audio_channel(s.channel);
+    if (s.stream < 0)
+        dx_free_audio_channel(s.channel);
     uint32_t handle = s.handle, driver = s.driver;
     s = Sample{};
     s.handle = handle;
@@ -176,6 +188,46 @@ float sample3d_distance_gain(const Sample &s) {
         dist = s.min_d;
     float adjusted = s.min_d + (dist - s.min_d) * g_rolloff3d;
     return (s.min_d > 0.0f && adjusted > 0.0f) ? s.min_d / adjusted : 1.0f;
+}
+
+float sample3d_cone_gain(const Sample &s) {
+    if (!s.cone_enabled)
+        return 1.0f;
+    audio3d::V3 dir = {s.pos3d[0] - g_listener_pos3d[0], s.pos3d[1] - g_listener_pos3d[1],
+                       s.pos3d[2] - g_listener_pos3d[2]};
+    float dist = audio3d::v3_len(dir);
+    if (dist < 1.0e-4f) {
+        dir = {1.0f, 0.0f, 0.0f};
+    } else {
+        float inverse = 1.0f / dist;
+        dir.x *= inverse;
+        dir.y *= inverse;
+        dir.z *= inverse;
+    }
+    float dot = -(s.front3d[0] * dir.x + s.front3d[1] * dir.y + s.front3d[2] * dir.z);
+    float angle;
+    if (dot > 0.9999f)
+        angle = 0.0f;
+    else if (dot < -0.9999f)
+        angle = audio3d::PI_F_;
+    else
+        angle = (float)acos((double)dot);
+    if (angle > s.cone_outer)
+        return s.cone_outer_volume;
+    if (angle > s.cone_inner && s.cone_outer - s.cone_inner > 1.0e-4f)
+        return s.cone_outer_volume + (s.cone_outer - angle) / (s.cone_outer - s.cone_inner) *
+                                         (1.0f - s.cone_outer_volume);
+    return 1.0f;
+}
+
+void sample3d_normalize_or_keep(float *v) {
+    float len = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (len > 1.0e-4f) {
+        float inverse = 1.0f / len;
+        v[0] *= inverse;
+        v[1] *= inverse;
+        v[2] *= inverse;
+    }
 }
 
 // The hundredths-of-a-dB pan for a listener-relative source, using the same
@@ -208,7 +260,8 @@ int32_t sample3d_pan_mb(const Sample &s) {
 }
 
 int sample_volume(const Sample &s) {
-    return driver_volume(s.driver, s.volume01 * (s.is_3d ? sample3d_distance_gain(s) : 1.0f));
+    float gain3d = s.is_3d ? sample3d_distance_gain(s) * sample3d_cone_gain(s) : 1.0f;
+    return driver_volume(s.driver, s.volume01 * gain3d);
 }
 
 // Push a sample's current volume and pan to its host channel. A playing 3D
@@ -318,9 +371,6 @@ void ail_mem_alloc_lock(X86 *c) {
     set_eax(c, ail_alloc(c, arg(c, 0)));
 }
 
-// Use CreateFileA's read resolver, including overlays, drive mapping and
-// case folding. Both NULL (ordinary Miles allocation) and FILE_READ_WITH_SIZE
-// request a guest allocation here; the returned image begins with file bytes.
 void ail_file_read(X86 *c) {
     set_eax(c, 0);
     std::string path = win32_host_path_op(gm_str(arg(c, 0)), WIN32_FILE_READ);
@@ -383,7 +433,12 @@ void ail_allocate_sample_handle(X86 *c) {
 }
 
 void ail_release_sample_handle(X86 *c) {
-    if (Sample *s = sample_for(arg(c, 0))) {
+    Sample *s = sample_for(arg(c, 0));
+    if (s && s->stream >= 0) {
+        imports_unsupported(c);
+        return;
+    }
+    if (s) {
         sample_reset(*s);
         s->alive = false;
     }
@@ -391,7 +446,12 @@ void ail_release_sample_handle(X86 *c) {
 }
 
 void ail_init_sample(X86 *c) {
-    if (Sample *s = sample_for(arg(c, 0)))
+    Sample *s = sample_for(arg(c, 0));
+    if (s && s->stream >= 0) {
+        imports_unsupported(c);
+        return;
+    }
+    if (s)
         sample_reset(*s);
     set_eax(c, 0);
 }
@@ -422,24 +482,57 @@ uint32_t sample_image_bytes(uint32_t image, uint32_t explicit_bytes) {
 bool sample_load_image(Sample &s, uint32_t image, uint32_t bytes) {
     s.wave = RiffWave{};
     s.decoded.clear();
-    if (!image || !bytes || !gm_valid(image, bytes))
+    if (!image || !bytes || !gm_valid(image, bytes)) {
+        LOGW("mss32: sample image %08x length %u is not guest memory", image, bytes);
         return false;
+    }
     if (riff_parse_wave(image, bytes, &s.wave))
         return s.wave.pcm_bytes != 0;
+    std::vector<uint8_t> host(g_mem + image, g_mem + image + bytes);
+    WavImage wav{};
+    if (riff_parse_wave_host(host.data(), host.size(), &wav)) {
+        WavSource source;
+        if (!source.open(host, 64 * 1024 * 1024)) {
+            LOGW("mss32: sample image %08x: WAVE format %04x bits=%u could not be decoded", image,
+                 wav.format, wav.bits);
+            return false;
+        }
+        std::vector<int16_t> frame;
+        while (source.decode_next(frame))
+            s.decoded.insert(s.decoded.end(), frame.begin(), frame.end());
+        if (source.failed()) {
+            s.decoded.clear();
+            LOGW("mss32: sample image %08x: WAVE decode failed", image);
+            return false;
+        }
+        if (s.decoded.empty()) {
+            LOGW("mss32: sample image %08x: WAVE decoded to no PCM", image);
+            return false;
+        }
+        s.wave.pcm_bytes = uint32_t(s.decoded.size() * 2);
+        s.wave.rate = source.rate();
+        s.wave.channels = (uint16_t)source.channels();
+        s.wave.bits = 16;
+        return true;
+    }
     Mp3Source source;
-    if (!source.open(std::vector<uint8_t>(g_mem + image, g_mem + image + bytes)))
+    if (!source.open(host)) {
+        LOGW("mss32: sample image %08x length %u is not a decodable WAVE or MPEG image", image,
+             bytes);
         return false;
+    }
     std::vector<int16_t> frame;
     while (source.decode_next(frame)) {
         if (s.decoded.size() + frame.size() > 64 * 1024 * 1024) {
             s.decoded.clear();
+            LOGW("mss32: sample image %08x: decoded MPEG exceeds 128 MiB", image);
             return false;
         }
         s.decoded.insert(s.decoded.end(), frame.begin(), frame.end());
     }
     s.wave.pcm_bytes = uint32_t(s.decoded.size() * 2);
     s.wave.rate = source.rate();
-    s.wave.channels = source.channels();
+    s.wave.channels = (uint16_t)source.channels();
     s.wave.bits = 16;
     return s.wave.pcm_bytes != 0;
 }
@@ -465,6 +558,10 @@ void ail_set_named_sample_file(X86 *c) {
     sample_stop(*s);
     if (sample_load_image(*s, arg(c, 2), arg(c, 3)))
         set_eax(c, 1);
+    else {
+        std::string name = arg(c, 1) ? gm_str(arg(c, 1)) : std::string();
+        LOGW("mss32: AIL_set_named_sample_file(%s) failed", name.c_str());
+    }
 }
 
 // AIL_WAV_info(void *file_image, AILSOUNDINFO *info). The structure is nine
@@ -687,6 +784,7 @@ void ail_get_dsound_info(X86 *c) {
 
 void ail_wave_close(X86 *c) {
     uint32_t id = arg(c, 0);
+    stream_close_driver(id);
     for (auto &s : g_samples)
         if (s.alive && s.driver == id) {
             sample_reset(s);
@@ -784,6 +882,10 @@ void ail_resume_sample(X86 *c) {
 
 void ail_sample_status(X86 *c) {
     Sample *s = sample_for(arg(c, 0));
+    if (s && s->stream >= 0) {
+        set_eax(c, stream_status((uint32_t)s->stream + 1));
+        return;
+    }
     if (s)
         sample_update(*s);
     set_eax(c, !s ? SMP_FREE : s->playing ? SMP_PLAYING : SMP_DONE);
@@ -883,7 +985,7 @@ void ail_sample_reverb_levels(X86 *c) {
 void ail_set_sample_playback_rate(X86 *c) {
     if (Sample *s = sample_for(arg(c, 0))) {
         s->rate = arg(c, 1);
-        if (s->channel >= 0 && s->rate)
+        if (s->channel >= 0)
             host_audio_set_frequency(s->channel, s->rate);
     }
     set_eax(c, 0);
@@ -897,21 +999,56 @@ void ail_register_eos_callback(X86 *c) {
     set_eax(c, 0);
 }
 
+struct StreamSource {
+    Mp3Source mp3;
+    WavSource wav;
+    bool wave = false;
+
+    bool open(const std::vector<uint8_t> &bytes) {
+        wave = bytes.size() >= 4 && bytes[0] == 'R' && bytes[1] == 'I' && bytes[2] == 'F' &&
+               bytes[3] == 'F';
+        return wave ? wav.open(bytes) : mp3.open(bytes);
+    }
+    bool decode_next(std::vector<int16_t> &out) {
+        return wave ? wav.decode_next(out) : mp3.decode_next(out);
+    }
+    uint32_t rate() const {
+        return wave ? wav.rate() : mp3.rate();
+    }
+    uint32_t channels() const {
+        return wave ? wav.channels() : mp3.channels();
+    }
+    void seek_frames(uint64_t target) {
+        if (wave)
+            wav.seek_frames(target);
+        else
+            mp3.seek_frames(target);
+    }
+    bool drained() const {
+        return wave ? wav.drained() : mp3.drained();
+    }
+    bool failed() const {
+        return wave && wav.failed();
+    }
+};
+
 // Stream handles own the encoded image, decoder and shared host channel.
 // All state is serviced on the guest frame seam; the host copies each PCM
 // submission. A refused chunk remains pending until a later frame accepts it.
 struct Stream {
     bool alive = false, playing = false;
     uint32_t driver = 0;
+    std::string name;
     // A paused stream is one the host voice has been stopped for. The host has
     // no pause of its own, so resuming restarts the stream; a title that pauses
     // to close does not care, and one that pauses for focus will hear the track
     // restart.
     bool paused = false;
-    int32_t channel = -1, volume = 127;
+    uint32_t sample = 0;
+    int32_t channel = -1;
     uint32_t loops = 1, remaining = 1;
     uint64_t submitted = 0;
-    Mp3Source source;
+    StreamSource source;
     std::vector<int16_t> pending;
     size_t pending_pos = 0;
 };
@@ -927,10 +1064,6 @@ void driver_apply_mix(uint32_t driver) {
     for (auto &s : g_samples)
         if (s.alive && s.driver == driver)
             sample_apply_mix(s);
-    for (auto &s : g_streams)
-        if (s.alive && s.driver == driver && s.channel >= 0)
-            host_audio_set_volume(
-                s.channel, driver_volume(s.driver, s.volume / 127.0f * driver_dry(s.driver)));
 }
 
 void ail_set_digital_master_reverb_levels(X86 *c) {
@@ -1031,13 +1164,32 @@ Stream *stream_for(uint32_t handle) {
     return s.alive ? &s : nullptr;
 }
 
+void stream_release(Stream &s) {
+    if (Sample *h = sample_for(s.sample)) {
+        *h = Sample{};
+    }
+    if (s.channel >= 0) {
+        host_audio_stop(s.channel);
+        dx_free_audio_channel(s.channel);
+    }
+    s = Stream{};
+}
+
+void stream_close_driver(uint32_t driver) {
+    for (auto &s : g_streams)
+        if (s.alive && s.driver == driver)
+            stream_release(s);
+}
+
 // Read through the runtime resolver, sharing CreateFileA's overlays, drive
 // mapping and case folding. Open does not play until AIL_start_stream.
 void ail_open_stream(X86 *c) {
     set_eax(c, 0);
     uint32_t name = arg(c, 1);
-    if (!name || !gm_valid(name, 1))
+    if (!name || !gm_valid(name, 1)) {
+        LOGW("mss32: open_stream: guest filename %08x is not readable", name);
         return;
+    }
     std::string guest = gm_str(name);
     std::string path = win32_host_path_op(guest, WIN32_FILE_READ);
     int fd = path.empty() ? -1 : os_fd_open(path.c_str(), OS_O_RDONLY);
@@ -1047,6 +1199,7 @@ void ail_open_stream(X86 *c) {
     }
     OsStat st{};
     if (os_fd_stat(fd, &st) != 0 || !st.is_regular || !st.size || st.size > UINT32_MAX) {
+        LOGW("mss32: open_stream(%s): cannot stat %s", guest.c_str(), path.c_str());
         os_fd_close(fd);
         return;
     }
@@ -1069,21 +1222,53 @@ void ail_open_stream(X86 *c) {
             continue;
         s = Stream{};
         if (!s.source.open(bytes)) {
-            LOGW("mss32: open_stream(%s): not an MPEG audio file: %s", guest.c_str(), path.c_str());
+            WavImage wav{};
+            if (riff_parse_wave_host(bytes.data(), bytes.size(), &wav))
+                LOGW("mss32: open_stream(%s): WAVE format %04x bits=%u could not be decoded: %s",
+                     guest.c_str(), wav.format, wav.bits, path.c_str());
+            else
+                LOGW("mss32: open_stream(%s): not a decodable WAVE or MPEG image: %s",
+                     guest.c_str(), path.c_str());
             return;
         }
         s.channel = dx_alloc_audio_channel();
         if (s.channel < 0) {
+            LOGW("mss32: open_stream(%s): no free audio channel", guest.c_str());
             s = Stream{};
             return;
         }
         s.alive = true;
         s.driver = arg(c, 0);
+        s.name = guest;
+        host_audio_set_frequency(s.channel, 0);
+        for (uint32_t j = 0; j < g_samples.size() && !s.sample; ++j) {
+            Sample &h = g_samples[j];
+            if (h.alive)
+                continue;
+            h = Sample{};
+            h.handle = j + 1;
+            h.driver = s.driver;
+            h.channel = s.channel;
+            h.wave.rate = s.source.rate();
+            h.wave.channels = (uint16_t)s.source.channels();
+            h.wave.bits = 16;
+            h.stream = (int32_t)i;
+            h.alive = true;
+            s.sample = h.handle;
+        }
+        if (!s.sample) {
+            LOGW("mss32: open_stream(%s): no free sample handle", guest.c_str());
+            host_audio_stop(s.channel);
+            dx_free_audio_channel(s.channel);
+            s = Stream{};
+            return;
+        }
         LOGV("mss32: open_stream(%s): %s, %u Hz, %u channel(s)", guest.c_str(), path.c_str(),
              s.source.rate(), s.source.channels());
         set_eax(c, i + 1);
         return;
     }
+    LOGW("mss32: open_stream(%s): no free stream handle", guest.c_str());
 }
 
 // Keep one second of appended PCM ahead. Decoder EOF is not playback EOF:
@@ -1095,6 +1280,8 @@ void stream_update(Stream &s) {
     while (host_audio_queued_bytes(s.channel) < ahead) {
         if (s.pending.empty()) {
             if (!s.source.decode_next(s.pending)) {
+                if (s.source.failed())
+                    break;
                 if (s.loops != 0 && s.remaining <= 1)
                     break;
                 if (s.remaining > 1)
@@ -1136,55 +1323,66 @@ void stream_start(Stream &s) {
         p.sample_rate = (int32_t)s.source.rate();
         p.channels = (int32_t)s.source.channels();
         p.bits = 16;
-        p.volume = driver_volume(s.driver, s.volume / 127.0f * driver_dry(s.driver));
+        Sample *h = sample_for(s.sample);
+        if (!h) {
+            LOGW("mss32: stream start(%s): stream has no sample handle", s.name.c_str());
+            return;
+        }
+        host_audio_set_frequency(s.channel, h->rate);
+        p.volume = sample_volume(*h);
+        p.pan = h->is_3d ? sample3d_pan_mb(*h) : miles_pan_mb(h->pan01);
         host_audio_play(&p);
         s.submitted = p.bytes;
         s.pending.clear();
         s.playing = host_audio_stream(s.channel) >= 0;
+        sample_apply_mix(*h);
         if (!s.playing)
             host_audio_stop(s.channel);
+    } else {
+        LOGW("mss32: stream start(%s): produced no PCM", s.name.c_str());
     }
 }
 
 void ail_start_stream(X86 *c) {
     if (Stream *s = stream_for(arg(c, 0)))
         stream_start(*s);
+    else
+        LOGW("mss32: AIL_start_stream(%08x) has no stream", arg(c, 0));
     set_eax(c, 0);
 }
 
 void ail_close_stream(X86 *c) {
-    if (Stream *s = stream_for(arg(c, 0))) {
-        host_audio_stop(s->channel);
-        dx_free_audio_channel(s->channel);
-        *s = Stream{};
-    }
+    if (Stream *s = stream_for(arg(c, 0)))
+        stream_release(*s);
     set_eax(c, 0);
 }
 
-void ail_stream_status(X86 *c) {
-    Stream *s = stream_for(arg(c, 0));
-    if (s) {
-        if (s->paused) {
-            set_eax(c, 0x8u); // SMP_STOPPED
-            return;
-        }
+uint32_t stream_status(uint32_t handle) {
+    Stream *s = stream_for(handle);
+    if (s && s->paused)
+        return 0x8u;
+    if (s)
         stream_update(*s);
-    }
-    set_eax(c, s && s->playing ? SMP_PLAYING : SMP_DONE);
+    return s && s->playing ? SMP_PLAYING : SMP_DONE;
+}
+
+void ail_stream_status(X86 *c) {
+    set_eax(c, stream_status(arg(c, 0)));
 }
 
 void ail_set_stream_volume(X86 *c) {
-    if (Stream *s = stream_for(arg(c, 0))) {
-        s->volume = std::clamp((int32_t)arg(c, 1), 0, 127);
-        host_audio_set_volume(s->channel,
-                              driver_volume(s->driver, s->volume / 127.0f * driver_dry(s->driver)));
-    }
+    if (Stream *s = stream_for(arg(c, 0)))
+        if (Sample *h = sample_for(s->sample)) {
+            h->volume01 = std::clamp((int32_t)arg(c, 1), 0, 127) / 127.0f;
+            sample_apply_mix(*h);
+        }
     set_eax(c, 0);
 }
 
 void ail_stream_volume(X86 *c) {
     Stream *s = stream_for(arg(c, 0));
-    set_eax(c, s ? (uint32_t)s->volume : 0);
+    Sample *h = s ? sample_for(s->sample) : nullptr;
+    set_eax(c, h ? (uint32_t)std::lround(h->volume01 * 127.0f) : 0);
 }
 
 void ail_set_stream_loop_count(X86 *c) {
@@ -1215,13 +1413,15 @@ void ail_pause_stream(X86 *c) {
 // AIL_set_stream_volume_levels(HSTREAM, F32 left, F32 right): the two levels
 // collapse to the host channel's single volume, as the sample form does.
 void ail_set_stream_volume_levels(X86 *c) {
-    if (Stream *s = stream_for(arg(c, 0))) {
-        float l = std::clamp(bits_to_float(arg(c, 1)), 0.0f, 1.0f);
-        float r = std::clamp(bits_to_float(arg(c, 2)), 0.0f, 1.0f);
-        s->volume = std::clamp((int)std::lround(std::max(l, r) * 127.0f), 0, 127);
-        host_audio_set_volume(s->channel,
-                              driver_volume(s->driver, s->volume / 127.0f * driver_dry(s->driver)));
-    }
+    if (Stream *s = stream_for(arg(c, 0)))
+        if (Sample *h = sample_for(s->sample)) {
+            float l = std::clamp(bits_to_float(arg(c, 1)), 0.0f, 1.0f);
+            float r = std::clamp(bits_to_float(arg(c, 2)), 0.0f, 1.0f);
+            float sum = l + r;
+            h->volume01 = std::max(l, r);
+            h->pan01 = sum > 0.0f ? r / sum : 0.5f;
+            sample_apply_mix(*h);
+        }
     set_eax(c, 0);
 }
 
@@ -1319,11 +1519,7 @@ void ail_allocate_3D_sample_handle(X86 *c) {
 }
 
 void ail_release_3D_sample_handle(X86 *c) {
-    if (Sample *s = sample_for(arg(c, 0))) {
-        sample_reset(*s);
-        s->alive = false;
-    }
-    set_eax(c, 0);
+    ail_release_sample_handle(c);
 }
 
 // AIL_set_3D_sample_file(H3DSAMPLE, void *file_image). The engine hands it the
@@ -1527,6 +1723,7 @@ void ail_release_timer_handle(X86 *c) {
 
 void ail_close_digital_driver(X86 *c) {
     uint32_t id = arg(c, 0);
+    stream_close_driver(id);
     for (auto &s : g_samples)
         if (s.alive && s.driver == id) {
             sample_reset(s);
@@ -1566,6 +1763,11 @@ void ail_service_stream(X86 *c) {
 void ail_stream_loop_count(X86 *c) {
     Stream *s = stream_for(arg(c, 0));
     set_eax(c, s ? s->loops : 0);
+}
+
+void ail_stream_sample_handle(X86 *c) {
+    Stream *s = stream_for(arg(c, 0));
+    set_eax(c, s ? s->sample : 0);
 }
 
 void ail_set_listener_3D_position(X86 *c) {
@@ -1608,6 +1810,62 @@ void ail_set_sample_3D_distances(X86 *c) {
         s->min_d = bits_to_float(arg(c, 2));
         sample_apply_mix(*s);
     }
+    set_eax(c, 0);
+}
+
+void ail_set_sample_3D_orientation(X86 *c) {
+    if (Sample *s = sample_for(arg(c, 0))) {
+        s->is_3d = true;
+        for (int i = 0; i < 3; ++i) {
+            s->front3d[i] = bits_to_float(arg(c, 1 + i));
+            s->up3d[i] = bits_to_float(arg(c, 4 + i));
+        }
+        sample3d_normalize_or_keep(s->front3d);
+        sample3d_normalize_or_keep(s->up3d);
+        sample_apply_mix(*s);
+    }
+    set_eax(c, 0);
+}
+
+void ail_set_sample_3D_cone(X86 *c) {
+    if (Sample *s = sample_for(arg(c, 0))) {
+        s->is_3d = true;
+        float inner = bits_to_float(arg(c, 1));
+        s->cone_inner = inner * (audio3d::PI_F_ / 360.0f);
+        s->cone_outer = bits_to_float(arg(c, 2)) * (audio3d::PI_F_ / 360.0f);
+        s->cone_outer_volume = bits_to_float(arg(c, 3));
+        s->cone_enabled = inner < 360.0f && s->cone_outer_volume < 1.0f;
+        sample_apply_mix(*s);
+    }
+    set_eax(c, 0);
+}
+
+void ail_set_sample_3D_velocity_vector(X86 *c) {
+    if (Sample *s = sample_for(arg(c, 0))) {
+        float velocity[3] = {bits_to_float(arg(c, 1)), bits_to_float(arg(c, 2)),
+                             bits_to_float(arg(c, 3))};
+        if (velocity[0] != 0.0f || velocity[1] != 0.0f || velocity[2] != 0.0f) {
+            LOGW("mss32: unsupported nonzero sample velocity (%g, %g, %g) for %08x", velocity[0],
+                 velocity[1], velocity[2], s->handle);
+            imports_unsupported(c);
+            return;
+        }
+        s->is_3d = true;
+        std::copy(std::begin(velocity), std::end(velocity), s->vel3d);
+        sample_apply_mix(*s);
+    }
+    set_eax(c, 0);
+}
+
+void ail_set_3D_doppler_factor(X86 *c) {
+    auto it = g_drivers.find(arg(c, 0));
+    float factor = bits_to_float(arg(c, 1));
+    if (it == g_drivers.end() || !std::isfinite(factor)) {
+        LOGW("mss32: unsupported Doppler driver=%08x factor=%g", arg(c, 0), factor);
+        imports_unsupported(c);
+        return;
+    }
+    it->second.doppler = factor;
     set_eax(c, 0);
 }
 
@@ -1723,7 +1981,7 @@ const ImportShim g_mss32_shims[] = {
     AIL(sample_reverb_levels, 12, ail_sample_reverb_levels),
     AIL(sample_volume_pan, 12, ail_sample_volume_pan),
     AIL(service_stream, 8, ail_service_stream),
-    AIL(set_3D_doppler_factor, 8, imports_unsupported),
+    AIL(set_3D_doppler_factor, 8, ail_set_3D_doppler_factor),
     AIL(set_3D_rolloff_factor, 8, ail_set_3D_rolloff_factor),
     AIL(set_digital_master_reverb, 16, ail_set_digital_master_reverb),
     AIL(digital_master_reverb, 16, ail_digital_master_reverb),
@@ -1733,17 +1991,17 @@ const ImportShim g_mss32_shims[] = {
     AIL(set_listener_3D_position, 16, ail_set_listener_3D_position),
     AIL(set_room_type, 8, ail_set_room_type),
     AIL(room_type, 4, ail_room_type),
-    AIL(set_sample_3D_cone, 16, imports_unsupported),
+    AIL(set_sample_3D_cone, 16, ail_set_sample_3D_cone),
     AIL(set_sample_3D_distances, 16, ail_set_sample_3D_distances),
-    AIL(set_sample_3D_orientation, 28, imports_unsupported),
+    AIL(set_sample_3D_orientation, 28, ail_set_sample_3D_orientation),
     AIL(set_sample_3D_position, 16, ail_set_sample_3D_position),
-    AIL(set_sample_3D_velocity_vector, 16, imports_unsupported),
+    AIL(set_sample_3D_velocity_vector, 16, ail_set_sample_3D_velocity_vector),
     AIL(set_sample_position, 8, imports_unsupported),
     AIL(set_sample_reverb_levels, 12, ail_set_sample_reverb_levels),
     AIL(set_stream_ms_position, 8, imports_unsupported),
     AIL(stream_loop_count, 4, ail_stream_loop_count),
     AIL(stream_ms_position, 12, imports_unsupported),
-    AIL(stream_sample_handle, 4, imports_unsupported),
+    AIL(stream_sample_handle, 4, ail_stream_sample_handle),
 };
 
 } // namespace
@@ -1752,7 +2010,7 @@ void mss32_frame_pump(X86 *c) {
     if (!c)
         return;
     for (auto &s : g_samples) {
-        if (!s.alive)
+        if (!s.alive || s.stream >= 0)
             continue;
         if (sample_update(s) && s.eos_cb && !s.eos_fired) {
             // Mark before the call: the callback may stop or release the
@@ -1788,14 +2046,12 @@ void mss32_frame_pump(X86 *c) {
 // dx_reset discards them. The provider name block and the sample WAVE images
 // are guest heap allocations; the digital drivers and channels are host state.
 void mss32_reset() {
+    for (auto &s : g_streams)
+        stream_release(s);
     for (auto &s : g_samples)
         if (s.alive && s.channel >= 0)
             host_audio_stop(s.channel);
-    for (auto &s : g_streams)
-        if (s.alive && s.channel >= 0)
-            host_audio_stop(s.channel);
     g_samples.assign(g_samples.size(), Sample{});
-    g_streams.assign(g_streams.size(), Stream{});
     g_ail_timers.assign(g_ail_timers.size(), AilTimer{});
     for (auto &[id, driver] : g_drivers)
         host_audio_delete_reverb(id);

@@ -403,22 +403,70 @@ static uint32_t desktop_format9() {
     return d3d9_current_display_mode().format;
 }
 
-// Mode enumeration reports the one virtual-desktop mode, and the count matches
-// exactly that format so a caller never enumerates a mode it was not counted.
+static void add_display_mode(std::vector<recomp::d3d::D3d9DisplayMode> &modes, uint32_t w,
+                             uint32_t h) {
+    if (!w || !h)
+        return;
+    for (const auto &m : modes)
+        if (m.width == w && m.height == h)
+            return;
+    recomp::d3d::D3d9DisplayMode mode{};
+    mode.width = w;
+    mode.height = h;
+    mode.refresh_rate = 0;
+    mode.format = d3d9_display_format(32);
+    modes.push_back(mode);
+}
+
+static std::vector<recomp::d3d::D3d9DisplayMode> d3d9_display_modes() {
+    std::vector<recomp::d3d::D3d9DisplayMode> modes;
+    static const uint32_t kStandard[][2] = {
+        {640, 480},   {800, 600},   {1024, 768},  {1152, 864},  {1280, 720},  {1280, 800},
+        {1280, 960},  {1280, 1024}, {1366, 768},  {1400, 1050}, {1440, 900},  {1600, 900},
+        {1600, 1200}, {1680, 1050}, {1920, 1080}, {1920, 1200}, {1920, 1440}, {2048, 1536},
+        {2560, 1440}, {2560, 1600}, {2560, 1920},
+    };
+    for (const auto &m : kStandard)
+        add_display_mode(modes, m[0], m[1]);
+    int32_t host_w = 0, host_h = 0;
+    if (host_display_screen(&host_w, &host_h) && host_w > 0 && host_h > 0)
+        add_display_mode(modes, (uint32_t)host_w, (uint32_t)host_h);
+    return modes;
+}
+
+static recomp::d3d::D3d9DisplayMode
+d3d9_device_display_mode(const recomp::d3d::D3d9PresentParams &present) {
+    if (present.windowed != 0 || !present.width || !present.height)
+        return d3d9_current_display_mode();
+    recomp::d3d::D3d9DisplayMode mode{};
+    mode.width = present.width;
+    mode.height = present.height;
+    mode.refresh_rate = present.fullscreen_refresh_rate;
+    mode.format = d3d9_display_format(32);
+    return mode;
+}
+
+static void put_mode(uint32_t p, const recomp::d3d::D3d9DisplayMode &mode) {
+    if (!p)
+        return;
+    wr32(p + 0, mode.width);
+    wr32(p + 4, mode.height);
+    wr32(p + 8, mode.refresh_rate);
+    wr32(p + 12, mode.format);
+}
+
 void D9_GetAdapterModeCount(X86 *c) {
     if (kD3d9WgpuEnabled) {
-        if (!this_d3d9(c) || arg(c, 1) != 0) {
+        if (!this_d3d9(c) || arg(c, 1) != 0 || arg(c, 2) != d3d9_display_format(32)) {
             set_eax(c, 0);
             return;
         }
-        uint32_t desktop = desktop_format9();
-        set_eax(c, desktop != 0 && arg(c, 2) == desktop ? 1u : 0u);
+        set_eax(c, (uint32_t)d3d9_display_modes().size());
         return;
     }
     set_eax(c, 1);
 }
 
-// D3DDISPLAYMODE: width, height, refresh rate, format. X8R8G8B8 is 22.
 static void put_display_mode(uint32_t p) {
     if (!p)
         return;
@@ -429,23 +477,24 @@ static void put_display_mode(uint32_t p) {
         wr32(p + 12, 22);
         return;
     }
-    recomp::d3d::D3d9DisplayMode mode = d3d9_current_display_mode();
-    wr32(p + 0, mode.width);
-    wr32(p + 4, mode.height);
-    wr32(p + 8, mode.refresh_rate);
-    wr32(p + 12, mode.format);
+    put_mode(p, d3d9_current_display_mode());
 }
 void D9_EnumAdapterModes(X86 *c) {
     if (kD3d9WgpuEnabled) {
         ComObj *d3d = this_d3d9(c);
         uint32_t out = arg(c, 4);
-        uint32_t desktop = desktop_format9();
-        if (!d3d || arg(c, 1) != 0 || !out || !gm_valid(out, 16) || arg(c, 3) != 0 ||
-            desktop == 0 || arg(c, 2) != desktop) {
+        uint32_t format = d3d9_display_format(32);
+        if (!d3d || arg(c, 1) != 0 || !out || !gm_valid(out, 16) || arg(c, 2) != format) {
             com_ret(c, D3DERR_INVALIDCALL);
             return;
         }
-        put_display_mode(out);
+        std::vector<recomp::d3d::D3d9DisplayMode> modes = d3d9_display_modes();
+        uint32_t mode = arg(c, 3);
+        if (mode >= modes.size()) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        put_mode(out, modes[mode]);
         com_ret(c, D3D_OK9);
         return;
     }
@@ -757,7 +806,7 @@ void D9_CreateDevice(X86 *c) {
             com_ret(c, D3DERR_INVALIDCALL);
             return;
         }
-        request.display_mode = d3d9_current_display_mode();
+        request.display_mode = d3d9_device_display_mode(request.present);
         request.thread_id = guest_current_thread_id();
         ComObj *dev = com_new(K_D3D9DEVICE);
         if (!dev) {
@@ -972,7 +1021,7 @@ void Dev_Reset(X86 *c) {
         request.implicit_external_refs =
             implicit_surface_externally_referenced(dev->d3d9_backbuffer) ||
             implicit_surface_externally_referenced(dev->d3d9_depthbuffer);
-        request.display_mode = d3d9_current_display_mode();
+        request.display_mode = d3d9_device_display_mode(request.present);
         request.thread_id = guest_current_thread_id();
         recomp::d3d::D3d9ResetResult result{};
         d3d9_reset_transaction(dev, request, result);

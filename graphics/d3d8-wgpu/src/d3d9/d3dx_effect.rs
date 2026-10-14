@@ -2902,35 +2902,63 @@ fn numeric_value(effect: &D3dxEffect, state: &EfxState) -> Result<u32, RenderErr
 }
 
 fn transform_value(effect: &D3dxEffect, state: &EfxState) -> Result<[f32; 16], RenderError> {
-    let output = if let Some(code) = &state.preshader {
-        evaluate_numeric(effect, code)?
-    } else if let Some(name) = &state.referenced {
-        let index = effect
-            .find_param_index(name)
-            .ok_or_else(|| invalid_data("referenced transform parameter is missing"))?;
-        let bytes = effect
-            .pool_value(index)
-            .ok_or_else(|| invalid_data("referenced transform parameter has no value"))?;
-        bytes
-            .chunks_exact(4)
-            .map(|word| f32::from_bits(u32::from_le_bytes([word[0], word[1], word[2], word[3]])))
-            .collect()
+    let (words, type_) = if let Some(code) = &state.preshader {
+        (
+            evaluate_numeric(effect, code)?
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
+            &state.type_,
+        )
     } else {
-        match &state.value {
-            EfxValue::Numeric(bytes) => bytes
+        let (bytes, type_) = if let Some(name) = &state.referenced {
+            let index = effect
+                .find_param_index(name)
+                .ok_or_else(|| invalid_data("referenced transform parameter is missing"))?;
+            (
+                effect
+                    .pool_value(index)
+                    .ok_or_else(|| invalid_data("referenced transform parameter has no value"))?,
+                &effect.params[index].type_,
+            )
+        } else {
+            let EfxValue::Numeric(bytes) = &state.value else {
+                return Err(invalid_data("transform state has no numeric matrix"));
+            };
+            (Cow::Borrowed(bytes.as_slice()), &state.type_)
+        };
+        (
+            bytes
                 .chunks_exact(4)
-                .map(|word| {
-                    f32::from_bits(u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
-                })
+                .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
                 .collect(),
-            _ => Vec::new(),
-        }
+            type_,
+        )
     };
-    if output.len() < 16 {
-        return Err(invalid_data("transform state did not provide a 4x4 matrix"));
+    let rows = type_.rows as usize;
+    let cols = type_.cols as usize;
+    if !matches!(type_.class, FXC_MATRIX_ROWS | FXC_MATRIX_COLUMNS)
+        || type_.count() != 1
+        || rows == 0
+        || cols == 0
+        || rows > 4
+        || cols > 4
+        || words.len() < rows * cols
+    {
+        return Err(invalid_data(
+            "transform state did not provide a numeric matrix",
+        ));
     }
+    let input = if state.preshader.is_some() {
+        FXT_FLOAT
+    } else {
+        type_.type_
+    };
+    let bytes = get_matrix(&words, rows, cols, 1, input, false);
     let mut matrix = [0.0f32; 16];
-    matrix.copy_from_slice(&output[..16]);
+    for (value, word) in matrix.iter_mut().zip(bytes.chunks_exact(4)) {
+        *value = f32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+    }
     Ok(matrix)
 }
 
