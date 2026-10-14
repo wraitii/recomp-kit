@@ -422,8 +422,6 @@ static void recomp_check_call_fact(uint32_t ret, uint32_t target)
 static void recomp_call_inner(X86 *c, uint32_t target);
 void recomp_call(X86 *c, uint32_t target)
 {
-    // Unknown, indirect and shim targets read the guest's own flag fields.
-    x86_cc_settle(c);
 #ifdef RECOMP_CHECK_CALL_FACTS
     recomp_check_call_fact(rd32(c->r[4]), target);
 #endif
@@ -438,17 +436,23 @@ static void recomp_call_inner(X86 *c, uint32_t target)
     if (i >= 0) {
         recomp_execution_checkpoint(c);
         if (recomp_profile_enabled) recomp_profile_push((uint32_t)i);
+        /* A translated body settles or drops a pending descriptor at its own
+         * entry; an override or a hook reads the flag fields as published. */
+        if (recomp_base_ptrs[i] != recomp_raw_ptrs[i]) x86_cc_settle(c);
 #ifdef RECOMP_NO_HOOKS
         recomp_base_ptrs[i](c);
 #else
-        if (__atomic_load_n(&recomp_hooked[i], __ATOMIC_ACQUIRE))
+        if (__atomic_load_n(&recomp_hooked[i], __ATOMIC_ACQUIRE)) {
+            x86_cc_settle(c);
             recomp_hook_ptrs[i](c, (uint32_t)i);
-        else
+        } else
             recomp_base_ptrs[i](c);
 #endif
         if (recomp_profile_enabled) recomp_profile_pop();
         return;
     }
+    /* Modules, shims and unknown targets read the guest's own flag fields. */
+    x86_cc_settle(c);
     if (recomp_module_call(c, target)) return;
     if (target >= GUEST_SHIM_BASE && target < GUEST_SHIM_END) {
         recomp_shim_call(c, target);

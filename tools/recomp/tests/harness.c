@@ -68,6 +68,9 @@ int recomp_module_call(X86 *c, uint32_t target) {
     (void)target;
     return 0;
 }
+void recomp_module_jump(X86 *c, uint32_t target) {
+    recomp_unknown_jump(c, target);
+}
 /* Instruction fixtures have no runtime guest_call callback checkpoints. */
 void recomp_callback_return(X86 *c) {
     (void)c;
