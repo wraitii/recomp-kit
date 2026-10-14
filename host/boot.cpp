@@ -452,6 +452,16 @@ void fault_handler(const char *name) {
     os_exit_immediately(same_text(name, "an abort from the runtime") ? 6 : 5);
 }
 
+// A streaming worker waits on DirectSound notification events, which only a
+// guest thread can signal. Frames stop during loading, so the scheduler's
+// yields keep the stream fed too.
+bool g_mods_checkpoint = false;
+void boot_checkpoint() {
+    if (g_mods_checkpoint)
+        mods_registry_pump();
+    dsound_pump();
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -532,6 +542,7 @@ bool boot_load(const BootOptions &opts) {
     // are real, and before the entry point, so a hook is installed before the
     // code it hooks can run.
     const bool mods_enabled = g_opt.load_mods && !recomp_env("NO_MODS");
+    sched_set_checkpoint(boot_checkpoint);
     bool page_enabled = false;
     if (mods_enabled) {
         // The host-only APIs belong to the thread that boots.
@@ -539,7 +550,7 @@ bool boot_load(const BootOptions &opts) {
         // What applies a queued registry mutation from inside the scheduler.
         // Without it a mutation made off a guest thread is queued and never
         // applied, and the hook silently never fires.
-        sched_set_checkpoint(mods_registry_pump);
+        g_mods_checkpoint = true;
         if (!mods_load_all())
             LOGW("boot: the mod loader reported a failure");
         // The host display rows exist even when the built-in mod root is
