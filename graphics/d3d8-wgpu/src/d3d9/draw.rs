@@ -617,7 +617,9 @@ fn ff_vertices(
     let projection = state.transform(3)?;
     let worldview = multiply_matrices(&world, &view);
     let wvp = multiply_matrices(&worldview, &projection);
-    let normal_matrix = if !transformed && rs(state, 137) != 0 {
+    let needs_normal = rs(state, 137) != 0
+        || (0..8).any(|stage| matches!(tss(state, stage, 11) & 0xffff0000, 0x10000 | 0x30000));
+    let normal_matrix = if !transformed && needs_normal {
         Some(inverse3(&worldview)?)
     } else {
         None
@@ -659,42 +661,61 @@ fn ff_vertices(
             find(10, 0).map(&fetch).transpose()?,
             find(10, 1).map(&fetch).transpose()?,
         ];
-        let colors = if transformed {
-            [vertex[0].unwrap_or([1.0; 4]), vertex[1].unwrap_or([0.0; 4])]
-        } else {
+        let normal = if needs_normal {
             let n = find(3, 0).map(&fetch).transpose()?.unwrap_or([0.0; 4]);
             let normal = if let Some(inv) = normal_matrix {
                 std::array::from_fn(|i| (0..3).map(|j| n[j] * inv[i][j]).sum())
             } else {
                 [n[0], n[1], n[2]]
             };
-            ff_colors(
-                state,
-                viewp,
-                if rs(state, 143) != 0 {
-                    normalize3(normal)
-                } else {
-                    normal
-                },
-                vertex,
-                &view,
-            )?
+            if rs(state, 143) != 0 {
+                normalize3(normal)
+            } else {
+                normal
+            }
+        } else {
+            [0.0; 3]
+        };
+        let colors = if transformed {
+            [vertex[0].unwrap_or([1.0; 4]), vertex[1].unwrap_or([0.0; 4])]
+        } else {
+            ff_colors(state, viewp, normal, vertex, &view)?
         };
         out.extend_from_slice(&clip);
         out.extend_from_slice(&colors[0]);
         out.extend_from_slice(&colors[1]);
         for stage in 0..8 {
             let coord = tss(state, stage, 11);
-            if coord & 0xffff0000 != 0 {
+            if transformed && coord & 0xffff0000 != 0 {
                 return Err(unsupported(
                     "Draw",
-                    format!("texture-coordinate generation {coord:#x} is not implemented"),
+                    "texture-coordinate generation with POSITIONT is not implemented",
                 ));
             }
-            let mut uv = find(5, (coord & 0xffff) as u8)
-                .map(&fetch)
-                .transpose()?
-                .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+            let mut uv = match coord & 0xffff0000 {
+                0 => find(5, (coord & 0xffff) as u8)
+                    .map(&fetch)
+                    .transpose()?
+                    .unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                0x10000 => [normal[0], normal[1], normal[2], 1.0],
+                0x20000 => viewp,
+                0x30000 => {
+                    let incident = normalize3([viewp[0], viewp[1], viewp[2]]);
+                    let twice_dot = 2.0 * dot3(incident, normal);
+                    [
+                        incident[0] - twice_dot * normal[0],
+                        incident[1] - twice_dot * normal[1],
+                        incident[2] - twice_dot * normal[2],
+                        1.0,
+                    ]
+                }
+                _ => {
+                    return Err(unsupported(
+                        "Draw",
+                        format!("texture-coordinate generation {coord:#x} is not implemented"),
+                    ));
+                }
+            };
             let flags = tss(state, stage, 24);
             if flags & 255 != 0 {
                 uv = transform_point(&state.transform(16 + stage)?, uv);
@@ -1394,6 +1415,11 @@ fn translated_source(
     textures: &[BoundTexture],
 ) -> Result<String, RenderError> {
     let mut variant = wgsl::Variant::default();
+    for stage in 0..16 {
+        if state.texture(stage)? == 0 {
+            variant.unbound |= 1 << stage;
+        }
+    }
     for t in textures {
         if t.cube {
             variant.cube |= 1 << t.stage;

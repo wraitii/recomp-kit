@@ -862,6 +862,13 @@ void com_QueryInterface(X86 *c) {
     com_ret(c, S_OK);
 }
 
+static uint32_t com_public_refs(const ComObj *o) {
+    if (!o->alive)
+        return 0;
+    return (uint32_t)(o->refs -
+                      ((o->kind == K_D3D9VB || o->kind == K_D3D9IB) ? o->internal_refs : 0));
+}
+
 void com_AddRef(X86 *c) {
     ComObj *o = com_this_arg(c);
     if (!o) {
@@ -869,7 +876,7 @@ void com_AddRef(X86 *c) {
         return;
     }
     com_addref(o);
-    com_ret(c, (uint32_t)o->refs);
+    com_ret(c, com_public_refs(o));
 }
 
 void com_Release(X86 *c) {
@@ -878,7 +885,8 @@ void com_Release(X86 *c) {
         com_ret(c, 0);
         return;
     }
-    com_ret(c, (uint32_t)com_release(o));
+    com_release(o);
+    com_ret(c, com_public_refs(o));
 }
 
 // ---------------------------------------------------------------------------

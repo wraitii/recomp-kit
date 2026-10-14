@@ -570,6 +570,7 @@ impl Program {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Variant {
+    pub unbound: u16,
     pub cube: u16,
     pub volume: u16,
     pub projected: u16,
@@ -812,6 +813,9 @@ impl<'a> Gen<'a> {
                 "pixel shader 2.0 samples undeclared sampler s{stage}"
             ));
             return "vec4<f32>(0.0)".into();
+        }
+        if self.variant.unbound & (1u16 << stage) != 0 {
+            return "vec4<f32>(0.0, 0.0, 0.0, 1.0)".into();
         }
         self.stages.insert(stage);
         let kind = self.stage_kind(stage);

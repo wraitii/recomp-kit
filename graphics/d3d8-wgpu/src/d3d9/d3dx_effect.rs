@@ -3030,6 +3030,13 @@ fn apply_shader_state(
     } else {
         match &state.value {
             EfxValue::Object(ids) => ids.first().copied(),
+            EfxValue::Numeric(_)
+                if state.type_.type_ == FXT_INT
+                    && state.type_.bytes == 4
+                    && numeric_value(effect, state)? == 0 =>
+            {
+                Some(0)
+            }
             _ => return Err(invalid_data("shader state has a non-object value")),
         }
     };

@@ -5430,6 +5430,11 @@ void Dev_SetIndices(X86 *c) {
     if (kD3d9WgpuEnabled) {
         if (!dev || !dev->d3d9_device || (arg(c, 1) && (!ib || ib->kind != K_D3D9IB)) ||
             (ib && ib->dev_d3d != dev->id)) {
+            log_once(("d3d9.SetIndices:" + std::to_string(arg(c, 1))).c_str(),
+                     "d3d9: SetIndices rejected device=%08x id=%08x buffer=%08x id=%08x kind=%u "
+                     "owner=%08x",
+                     arg(c, 0), dev ? dev->id : 0, arg(c, 1), ib ? ib->id : 0,
+                     ib ? static_cast<unsigned>(ib->kind) : 0, ib ? ib->dev_d3d : 0);
             com_ret(c, D3DERR_INVALIDCALL);
             return;
         }
