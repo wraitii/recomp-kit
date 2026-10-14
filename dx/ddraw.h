@@ -117,15 +117,8 @@ void ddraw_reset_access_counts(void);
 // environment does not change under a running game - so only a test that
 // varies the variable needs it dropped.
 void ddraw_reset_modes(void);
-// Replaces the offered display modes while the game is running: the same
-// syntax RECOMP_DDRAW_MODES takes, "640x480x8,1280x960x16". A null or empty
-// spec restores the built-in six. Returns 0 on a malformed spec, leaving the
-// table exactly as it was.
-//
-// This, and not the environment variable, is how a script forces one single
-// mode. The variable restricts the list from process start, and this game
-// selects 640x480x8 without first asking what is available: a list without it
-// has that call refused and the guest, which does not check, takes a SIGBUS.
+// Replaces the offered modes with a comma-separated list of WxHxB (8, 16 or 32 bits).
+// A null or empty spec restores the built-in list; malformed input leaves it unchanged.
 int ddraw_set_modes(const char *spec);
 // Test seam: override the video-memory budget every DirectDraw object reports
 // and enforces (bytes; 0 is unbounded). The default comes from
