@@ -1,8 +1,8 @@
 #include "display_settings.h"
 // hooks.cpp - the mutable dispatch layer.
 //
-// Translated code is immutable. Every generated call site reads
-// recomp_hooked[i] with an acquire load and, when it is set, calls
+// Translated code is immutable. Every entry stub reads recomp_slow[i]; when it
+// is set, the slow path rereads recomp_hooked[i] with an acquire load and calls
 // recomp_hook_ptrs[i](c, i), which is this module.
 //
 // STORAGE. An invocation is a POD in a fixed-size thread-local array. Nothing
@@ -534,10 +534,12 @@ void publish(int32_t index) {
         __atomic_store_n(&recomp_hook_ptrs[index], (RecompHookFn)mods_hook_dispatch,
                          __ATOMIC_RELEASE);
         __atomic_store_n(&recomp_hooked[index], (uint8_t)1, __ATOMIC_RELEASE);
+        recomp_slow_update((uint32_t)index);
     } else {
         // Removal clears the flag first; the pointer is left in place, which is
         // harmless because nothing reads it while the flag is clear.
         __atomic_store_n(&recomp_hooked[index], (uint8_t)0, __ATOMIC_RELEASE);
+        recomp_slow_update((uint32_t)index);
     }
 }
 
@@ -705,8 +707,10 @@ namespace {
 void apply_reset_tables() {
     for (size_t i = 0; i < entries().size(); ++i) {
         entries()[i] = Entry();
-        if (i < (size_t)recomp_func_count)
+        if (i < (size_t)recomp_func_count) {
             __atomic_store_n(&recomp_hooked[i], (uint8_t)0, __ATOMIC_RELEASE);
+            recomp_slow_update((uint32_t)i);
+        }
     }
     pending().clear();
     order_of_owner().clear();

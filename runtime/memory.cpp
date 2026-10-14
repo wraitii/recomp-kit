@@ -39,6 +39,8 @@ namespace {
 struct WatchArm {
     WatchArm() {
         recomp_frame_watch = recomp_env("WATCH_FRAME") ? 1u : 0u;
+        if (recomp_frame_watch)
+            memset(recomp_slow, 1, recomp_func_count);
         const char *s = recomp_env("WATCH");
         if (!s || !*s)
             return;

@@ -48,6 +48,7 @@ __attribute__((weak)) const uint32_t recomp_func_count = 0;
 __attribute__((weak)) void (*const recomp_base_ptrs[])(X86 *c) = {nullptr};
 __attribute__((weak)) RecompHookFn recomp_hook_ptrs[] = {nullptr};
 __attribute__((weak)) uint8_t recomp_hooked[] = {0};
+__attribute__((weak)) uint8_t recomp_slow[] = {0};
 }
 
 namespace {
@@ -436,6 +437,8 @@ void arm(const RecompModule *module, uint32_t addr, const char *label, const Dum
     st.next = __atomic_load_n(slot_ptr, __ATOMIC_ACQUIRE);
     __atomic_store_n(slot_ptr, kSlotFns[g_trace_count], __ATOMIC_RELEASE);
     __atomic_store_n(slot_flag, (uint8_t)1, __ATOMIC_RELEASE);
+    if (!module)
+        recomp_slow_update((uint32_t)index);
     ++g_trace_count;
 }
 

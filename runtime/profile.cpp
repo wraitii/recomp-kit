@@ -9,10 +9,14 @@
 #include <mutex>
 #include <thread>
 #include "../platform/os.h"
+#include "x86.h"
 
 extern "C" const int recomp_profile_enabled = [] {
     const char *value = recomp_env("PROFILE");
-    return value && std::strcmp(value, "1") == 0;
+    const bool on = value && std::strcmp(value, "1") == 0;
+    if (on)
+        std::memset(recomp_slow, 1, recomp_func_count);
+    return on;
 }();
 // Generated table supplies names; runtime-only tests need no generated table.
 extern "C" __attribute__((weak)) const char *recomp_profile_name(uint32_t) {

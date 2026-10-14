@@ -30,7 +30,7 @@ else()
   message(STATUS "No translation found: hosts and game-backed tests are not defined")
 endif()
 
-# New translations isolate overrides in table.c. Keep old generated trees usable
+# New translations isolate overrides in table.c and the entry thunks. Keep old generated trees usable
 # until their next regeneration; those still need the legacy target-wide define.
 function(recomp_translation_overrides target dir header)
   if(NOT header)
@@ -41,9 +41,10 @@ function(recomp_translation_overrides target dir header)
   endif()
   get_filename_component(override_dir "${header}" DIRECTORY)
   if(EXISTS "${dir}/body.h")
-    set_property(SOURCE "${dir}/table.c" APPEND PROPERTY
+    file(GLOB selecting CONFIGURE_DEPENDS ${dir}/table.c ${dir}/chunk_entries_*.c)
+    set_property(SOURCE ${selecting} APPEND PROPERTY
       COMPILE_DEFINITIONS RECOMP_OVERRIDE_HEADER="${header}")
-    set_property(SOURCE "${dir}/table.c" APPEND PROPERTY INCLUDE_DIRECTORIES "${override_dir}")
+    set_property(SOURCE ${selecting} APPEND PROPERTY INCLUDE_DIRECTORIES "${override_dir}")
   else()
     target_compile_definitions(${target} PRIVATE RECOMP_OVERRIDE_HEADER="${header}")
     target_include_directories(${target} PRIVATE "${override_dir}")

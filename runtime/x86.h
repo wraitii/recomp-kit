@@ -593,7 +593,7 @@ void recomp_breakpoint(X86 *c, uint32_t addr);
  *   recomp_func_addrs   sorted address index, immutable
  *   recomp_base_ptrs    the original for each entry, fixed at build time
  *   recomp_hook_ptrs    mutable dispatch, initially "run the base"
- * plus recomp_hooked, the per-function flag every call site reads with an
+ * plus recomp_hooked, the per-function flag the slow path reads with an
  * ACQUIRE load. The installer publishes the pointer with a release store and
  * then the flag with a release store, so a set flag always implies a visible
  * pointer. The index is passed to the dispatcher because one C function serves
@@ -612,6 +612,15 @@ extern void (*const recomp_base_ptrs[])(X86 *c);
 extern void (*const recomp_raw_ptrs[])(X86 *c);
 extern RecompHookFn recomp_hook_ptrs[];
 extern uint8_t recomp_hooked[];
+/* What each entry stub reads, unordered, before jumping straight to its body:
+ * recomp_hooked or a process-wide observer (profiling, frame watch). The slow
+ * path rereads recomp_hooked with acquire, so writers update this after it. */
+extern uint8_t recomp_slow[];
+static inline void recomp_slow_update(uint32_t i) {
+    uint8_t slow = __atomic_load_n(&recomp_hooked[i], __ATOMIC_RELAXED) |
+                   (uint8_t)(recomp_profile_enabled || recomp_frame_watch);
+    __atomic_store_n(&recomp_slow[i], slow, __ATOMIC_RELEASE);
+}
 /* Set once any mod hook is installed and never cleared.  A call whose
  * contract dropped CPU fields publishes them anyway while this is set,
  * because a hook callback observes the full register file. */

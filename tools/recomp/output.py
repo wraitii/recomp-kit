@@ -9,7 +9,7 @@ from decoded import TranslateError
 from ir.c_symbols import declaration, symbol, entry_signature
 from ir.c_symbols import Declaration
 from ir.body import BodyVariant, EntryForm, ReturnForm
-from ir.emit_c import memory_helpers, RETURN_HELPERS, FLOAT_HELPERS
+from ir.emit_c import memory_helpers, TABLE_RETURN_HELPERS, FLOAT_HELPERS
 
 # Stable address buckets prevent an insertion from repacking the entire image.
 # Oversize functions stand alone; recursively split only an over-budget bucket.
@@ -30,6 +30,19 @@ BODY_HEADER = """/* generated -- translated bodies do not depend on replacement 
 #define CALL_FN(a) RECOMP_ENTRY_CAT(entry_, a)(c)
 #define CALL_FN_CHECKED(a, expected) RECOMP_ENTRY_CAT(entry_checked_, a)(c, expected)
 #endif
+"""
+
+ENTRY_STUB_PRELUDE = """#include "x86.h"
+#ifdef RECOMP_OVERRIDE_HEADER
+#include RECOMP_OVERRIDE_HEADER
+#endif
+void recomp_enter(X86 *c, uint32_t index);
+#define RECOMP_SLOW_(i) RECOMP_UNLIKELY(__atomic_load_n(&recomp_slow[i], __ATOMIC_RELAXED))
+#define RECOMP_ENTER(i, base) \\
+    do { recomp_execution_checkpoint(c); if (RECOMP_SLOW_(i)) recomp_enter(c, i); else base; } while (0)
+#define RECOMP_ENTER_CHECKED(i, body, base) \\
+    do { recomp_execution_checkpoint(c); \\
+         if (RECOMP_SLOW_(i)) recomp_enter_checked(c, i, expected, body); else base; } while (0)
 """
 
 
@@ -87,7 +100,7 @@ def emit_body_chunks(out, functions, bodies, entries_by_fn, dependencies, known_
             if any('arena_' in body for body in text.values()):
                 fh.write(memory_helpers())
             if any('recomp_return_fast_' in body for body in text.values()):
-                fh.write(RETURN_HELPERS)
+                fh.write(TABLE_RETURN_HELPERS)
             if any('recomp_fcom_(' in body for body in text.values()):
                 fh.write(FLOAT_HELPERS)
             for addr in calls:
@@ -114,8 +127,10 @@ def emit_entry_chunks(out, entry_names, module=None, checked_returns=(), private
                       private_input_arguments=None):
     """Tiny address-named entry thunks own the changing dense dispatch indices.
 
-    Native redirects are resolved only by table.c. Editing an override header
-    therefore never recompiles either these thunks or the translated bodies.
+    A main-image thunk takes the execution checkpoint and jumps straight to its
+    base, the FN_<addr> override or the translation, unless recomp_slow sends it
+    through recomp_enter. Editing an override header recompiles these thunks
+    and table.c, never the translated bodies.
     """
     groups = defaultdict(list)
     for index, addr in enumerate(entry_names):
@@ -126,12 +141,20 @@ def emit_entry_chunks(out, entry_names, module=None, checked_returns=(), private
         with path.open("w") as fh:
             # Thunks never inspect CPU state; edits to inline instruction
             # helpers must not invalidate them along with the actual bodies.
-            fh.write('/* generated stable entry thunks -- do not edit */\n'
-                     '#include <stdint.h>\ntypedef struct X86 X86;\n')
-            enter = "recomp_enter_%s" % module["key"] if module else "recomp_enter"
-            fh.write("void %s(X86 *c, uint32_t index);\n" % enter)
-            for index, addr in entries:
-                fh.write("void entry_%08x(X86 *c) { %s(c, %du); }\n" % (addr, enter, index))
+            fh.write('/* generated stable entry thunks -- do not edit */\n')
+            if module:
+                fh.write('#include <stdint.h>\ntypedef struct X86 X86;\n')
+                enter = "recomp_enter_%s" % module["key"]
+                fh.write("void %s(X86 *c, uint32_t index);\n" % enter)
+                for index, addr in entries:
+                    fh.write("void entry_%08x(X86 *c) { %s(c, %du); }\n" % (addr, enter, index))
+            else:
+                fh.write(ENTRY_STUB_PRELUDE)
+                for index, addr in entries:
+                    fh.write("#ifndef FN_%08x\n#define FN_%08x fn_%08x\n#define RECOMP_RAW_%08x\n#endif\n"
+                             "void FN_%08x(X86 *c);\n"
+                             "void entry_%08x(X86 *c) { RECOMP_ENTER(%du, FN_%08x(c)); }\n"
+                             % (addr, addr, addr, addr, addr, addr, index, addr))
             private = [(i, a) for i, a in entries if private_masks and a in private_masks]
             if private:
                 for index, addr in private:
@@ -152,8 +175,15 @@ def emit_entry_chunks(out, entry_names, module=None, checked_returns=(), private
                     variant = BodyVariant(EntryForm.CHECKED, ReturnForm.CHECKED)
                     body, entry = symbol("fn_checked", addr), symbol("entry_checked", addr)
                     fh.write(entry_signature(variant, body) + ";\n")
-                    fh.write("%s { recomp_enter_checked(c, %du, expected, %s); }\n"
-                             % (entry_signature(variant, entry), index, body))
+                    if module:
+                        fh.write("%s { recomp_enter_checked(c, %du, expected, %s); }\n"
+                                 % (entry_signature(variant, entry), index, body))
+                    else:
+                        fh.write("%s {\n#ifdef RECOMP_RAW_%08x\n"
+                                 "    RECOMP_ENTER_CHECKED(%du, %s, %s(c, expected));\n#else\n"
+                                 "    RECOMP_ENTER_CHECKED(%du, %s, FN_%08x(c));\n#endif\n}\n"
+                                 % (entry_signature(variant, entry), addr, index, body, body,
+                                    index, body, addr))
         paths.append(str(path))
     return paths
 
@@ -164,7 +194,6 @@ def _entry_dispatch(signature, base_call):
 {
     RecompSaved saved_; recomp_save(c, &saved_);
     if (recomp_profile_enabled) { recomp_call(c, recomp_func_addrs[i]); return; }
-    recomp_execution_checkpoint(c);
 #ifndef RECOMP_NO_HOOKS
     if (__builtin_expect(__atomic_load_n(&recomp_hooked[i], __ATOMIC_ACQUIRE) != 0u, 0)) {
         /* A hook callback observes the full register file, so a pending lazy
@@ -184,10 +213,10 @@ def _entry_dispatch(signature, base_call):
 
 
 def emit_entry_dispatch():
-    """The call-site policy, compiled once per image.
+    """The slow half of the call-site policy, entered only when recomp_slow[i] is set.
 
-    Profiling still enters recomp_call (including module lookup and its frame
-    watch). Raw/base tables bypass this seam for call-original and comparisons.
+    The entry stub has already taken the execution checkpoint. Profiling still
+    enters recomp_call (including module lookup and its frame watch). Raw/base tables bypass this seam for call-original and comparisons.
     A guest return address is already on the guest stack before entering here.
     The acquire flag load observes the installer's published callback pointer.
     """
@@ -280,7 +309,8 @@ def write_table(out, entry_names, functions, call_returns, private_masks=None, k
         for _a in entry_names:
             fh.write("    recomp_run_base,\n")
         fh.write("};\n")
-        fh.write("uint8_t recomp_hooked[%d] = {0};\n\n" % len(entry_names))
+        fh.write("uint8_t recomp_hooked[%d] = {0};\n" % len(entry_names))
+        fh.write("uint8_t recomp_slow[%d] = {0};\n\n" % len(entry_names))
         fh.write(emit_entry_dispatch())
         known_modes = set(known_modes or ())
         for addr in sorted(private_masks or ()):
@@ -298,16 +328,16 @@ def write_table(out, entry_names, functions, call_returns, private_masks=None, k
                 cr_words[off >> 5] |= 1 << (off & 31)
         else:
             cr_min, cr_words = 0, [0]
-        fh.write("static const uint32_t recomp_call_return_min = 0x%08xu;\n" % cr_min)
-        fh.write("static const uint32_t recomp_call_return_bits[] = {\n")
+        fh.write("const uint32_t recomp_call_return_min = 0x%08xu;\n" % cr_min)
+        fh.write("const uint32_t recomp_call_return_span = %du;\n" % (len(cr_words) * 32))
+        fh.write("const uint32_t recomp_call_return_bits[] = {\n")
         for w in cr_words:
             fh.write("    0x%08xu,\n" % w)
         fh.write("};\n")
         fh.write("""int recomp_is_call_return(uint32_t target)
 {
     uint32_t off = target - recomp_call_return_min;
-    if (target < recomp_call_return_min ||
-        off >= (uint32_t)(sizeof recomp_call_return_bits / sizeof recomp_call_return_bits[0]) * 32u)
+    if (off >= recomp_call_return_span)
         return 0;
     return (recomp_call_return_bits[off >> 5] >> (off & 31)) & 1u;
 }

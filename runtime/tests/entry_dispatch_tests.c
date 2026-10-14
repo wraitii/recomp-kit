@@ -77,6 +77,7 @@ int main(void) {
     CHECK(c.r[0] == 21 && native_calls == 2);
     recomp_hook_ptrs[0] = hook;
     __atomic_store_n(&recomp_hooked[0], 1, __ATOMIC_RELEASE);
+    recomp_slow_update(0);
     entry_0d001030(&c);
 #ifdef RECOMP_NO_HOOKS
     CHECK(c.r[0] == 31 && hook_calls == 0);
@@ -85,6 +86,8 @@ int main(void) {
 #endif
     CHECK(c.r[1] == 2 && native_calls == 3);
     recomp_frame_watch = 1;
+    for (uint32_t i = 0; i < recomp_func_count; i++)
+        recomp_slow_update(i);
     recomp_hook_ptrs[0] = frame_hook;
     entry_0d001030(&c);
 #ifdef RECOMP_NO_HOOKS
@@ -94,6 +97,7 @@ int main(void) {
     CHECK(frame_changes == 3 && c.r[5] == 1 && hook_calls == 2);
 #endif
     __atomic_store_n(&recomp_hooked[0], 0, __ATOMIC_RELEASE);
+    recomp_slow_update(0);
     unsigned hooks_before = hook_calls;
     entry_0d001000(&c);
     CHECK(native_calls == 5 && hook_calls == hooks_before);
