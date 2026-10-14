@@ -236,10 +236,11 @@ fn source(t: u32, pixel: bool) -> Result<String, RenderError> {
     })
 }
 impl Program {
-    /// Decode one bounded SM1.1 program; unknown instructions fail by name.
+    /// Decode one bounded SM1.0/1.1 program; unknown instructions fail by name.
     pub fn parse(words: &[u32], pixel: bool) -> Result<Self, RenderError> {
-        if words.first().copied() != Some(if pixel { 0xffff0101 } else { 0xfffe0101 }) {
-            return Err(fail("only vs.1.1 / ps.1.1 are supported"));
+        let version = if pixel { 0xffff0100 } else { 0xfffe0100 };
+        if !matches!(words.first(), Some(&word) if word == version || word == version + 1) {
+            return Err(fail("only vs.1.0/1.1 and ps.1.0/1.1 are supported"));
         }
         let mut i = 1;
         let mut body = String::new();
