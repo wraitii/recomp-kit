@@ -43,6 +43,12 @@ current viewport, and preserves color/depth/stencil outside the selected regions
 An empty array clears the viewport. The bridge validates guest spans and copies
 unaligned records before calling Rust; rectangle memory is consumed before return.
 
+CreateDevice and Reset accept lockable 32-bit backbuffers. LockRect stages GPU
+pixels in guest memory in D3D byte order; writable UnlockRect uploads only the
+locked rectangle in queue order after prior draws. Read-only locks preserve
+GPU contents, and Reset rejects an outstanding backbuffer lock. The bridge
+supports READONLY and NOSYSLOCK flags for these locks.
+
 The renderer boundary is a CXX bridge. Rust owns typed device, resource and
 storage state; C++ retains guest COM dispatch, memory validation and HRESULT
 conversion. CXX-generated headers are build output and are not tracked.

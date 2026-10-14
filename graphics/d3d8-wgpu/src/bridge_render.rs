@@ -617,6 +617,20 @@ pub(crate) fn read_pixels(device: &Device, out: &mut [u8]) -> Status {
     }
 }
 
+pub(crate) fn write_pixels(
+    device: &mut Device,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Status {
+    match renderer_mut(device, "write_pixels") {
+        Ok(renderer) => status_from_error_or_ok(renderer.write_pixels(x, y, width, height, rgba)),
+        Err(status) => status,
+    }
+}
+
 pub(crate) fn present(device: &mut Device) -> Status {
     match renderer_mut(device, "present") {
         Ok(renderer) => status_from_error_or_ok(renderer.present()),

@@ -1519,6 +1519,14 @@ pub mod ffi {
         ) -> Status;
         fn read_pixels_len(device: &Device, out: &mut u64) -> Status;
         fn read_pixels(device: &Device, out: &mut [u8]) -> Status;
+        fn write_pixels(
+            device: &mut Device,
+            x: u32,
+            y: u32,
+            width: u32,
+            height: u32,
+            rgba: &[u8],
+        ) -> Status;
         fn present(device: &mut Device) -> Status;
         fn present_handoff(device: &Device, bpp: u32) -> FrameHandoffResult;
         fn scene_boundary(device: &mut Device, mode: u32) -> Status;
@@ -1714,7 +1722,7 @@ use crate::bridge_render::{
     get_light_enable, get_material, get_viewport, light_enable, present, present_handoff,
     process_vertices, read_pixels, read_pixels_len, read_texture, release_texture, scene_boundary,
     set_light, set_material, set_render_state, set_render_target, set_texture,
-    set_texture_stage_state, set_transform, set_viewport,
+    set_texture_stage_state, set_transform, set_viewport, write_pixels,
 };
 use crate::d3d8::{
     resource::{D3d8LevelLayout, format_bytes as cpu_format_bytes, level_layout},
@@ -2281,7 +2289,7 @@ fn validate_present_params(params: &PresentParams) -> Result<u32, RenderError> {
     }
     let interval_ok = params.fullscreen_presentation_interval == 0
         || params.fullscreen_presentation_interval == PRESENT_INTERVAL_IMMEDIATE;
-    if params.flags != 0 || params.fullscreen_refresh_rate != 0 || !interval_ok {
+    if params.flags & !1 != 0 || params.fullscreen_refresh_rate != 0 || !interval_ok {
         return Err(invalid("unsupported present flags/refresh/interval"));
     }
     let depth = DepthFormat::from_d3dformat(params.auto_depth_stencil_format)

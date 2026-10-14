@@ -762,8 +762,8 @@ void D8_CreateDevice(X86 *c) {
                    (swap == D3DSWAPEFFECT_FLIP && !windowed);
     bool interval_ok = interval == 0 || interval == D3DPRESENT_INTERVAL_IMMEDIATE;
     if (rd32(pp + 12) > 1 || rd32(pp + 16) || !swap_ok ||
-        (depth && !d8_depth_format(depth_format)) || rd32(pp + 40) || rd32(pp + 44) ||
-        !interval_ok) {
+        (depth && !d8_depth_format(depth_format)) ||
+        (rd32(pp + 40) & ~D3DPRESENTFLAG_LOCKABLE_BACKBUFFER) || rd32(pp + 44) || !interval_ok) {
         com_ret(c, D8_ERR_NOTAVAILABLE);
         return;
     }
@@ -788,6 +788,7 @@ void D8_CreateDevice(X86 *c) {
     dev->d3d8_height = h;
     dev->d3d8_format = format;
     dev->d3d8_depth_format = depth ? depth_format : 0;
+    dev->d3d8_present_flags = rd32(pp + 40);
     D3dHostDevice *cpu = d8_cpu_state(dev);
     auto dimensions = recomp::d3d::set_device_dimensions(*cpu->value, w, h);
     if (!d3d_bridge_ok(dimensions)) {
@@ -818,6 +819,9 @@ void D8_CreateDevice(X86 *c) {
         return;
     }
     wr32(out, view);
+    LOGW("d3d8: GPU device created %ux%u format=0x%x depth=0x%x lockable=%u", w, h, format,
+         depth ? depth_format : 0,
+         (dev->d3d8_present_flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER) != 0);
     com_ret(c, D8_OK);
 #else
     com_ret(c, D8_ERR_NOTAVAILABLE);
@@ -852,6 +856,10 @@ void Dev_Reset(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
+    if (ComObj *backbuffer = com_get(dev->d3d8_backbuffer); backbuffer && backbuffer->lock_count) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
     recomp::d3d::PresentParams params{};
     params.back_buffer_width = rd32(pp);
     params.back_buffer_height = rd32(pp + 4);
@@ -877,6 +885,7 @@ void Dev_Reset(X86 *c) {
     dev->d3d8_width = params.back_buffer_width;
     dev->d3d8_height = params.back_buffer_height;
     dev->d3d8_format = params.back_buffer_format;
+    dev->d3d8_present_flags = params.flags;
     dev->d3d8_depth_format =
         params.enable_auto_depth_stencil ? params.auto_depth_stencil_format : 0;
     device_discard_implicit_surfaces(dev);
@@ -1860,10 +1869,6 @@ void Surface_GetDevice(X86 *c) {
     com_ret(c, D8_OK);
 }
 
-// A texture level can be locked through its surface view; the implicit
-// backbuffer cannot (its bytes belong to the host render target, not the
-// shim), so that stops by name rather than returning a pointer into host
-// memory.
 void Surface_LockRect(X86 *c) {
     ComObj *surface = com_this_arg(c, IF_D3D8SURFACE8);
     uint32_t out = arg(c, 1);
@@ -1872,6 +1877,50 @@ void Surface_LockRect(X86 *c) {
         return;
     }
     if (!surface->d3d8_texture) {
+        ComObj *dev = com_get(surface->d3d8_owner);
+        if (dev && dev->d3d8_backbuffer == surface->id) {
+            const uint32_t flags = arg(c, 3);
+            if (!(dev->d3d8_present_flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER) ||
+                surface->lock_count || (flags & ~(D3DLOCK_READONLY | D3DLOCK_NOSYSLOCK))) {
+                com_ret(c, D8_ERR_INVALIDCALL);
+                return;
+            }
+            surface->bpp = 32;
+            surface->pitch = surface->width * 4;
+            uint32_t offset;
+            if (!d8_lock_offset(surface, arg(c, 2), &offset)) {
+                com_ret(c, D8_ERR_INVALIDCALL);
+                return;
+            }
+            const uint32_t bytes = surface->pitch * surface->height;
+            const uint32_t base = heap_alloc(bytes, false);
+            if (!base) {
+                com_ret(c, E_OUTOFMEMORY);
+                return;
+            }
+            std::vector<uint8_t> rgba(bytes);
+            auto status = recomp::d3d::read_pixels(*dev->d3d8_device->value,
+                                                   rust::Slice<uint8_t>(rgba.data(), rgba.size()));
+            if (!d3d_bridge_ok(status)) {
+                heap_free(base);
+                com_ret(c, bridge_result(c, status));
+                return;
+            }
+            for (size_t i = 0; i < rgba.size(); i += 4)
+                std::swap(rgba[i], rgba[i + 2]);
+            memcpy(gm_ptr(base), rgba.data(), bytes);
+            surface->pixels = base;
+            surface->lock_count = 1;
+            surface->d3d8_lock_flags = flags;
+            surface->d3d8_lock_rect = {0, 0, surface->width, surface->height};
+            if (const uint32_t rect = arg(c, 2))
+                for (size_t i = 0; i < 4; ++i)
+                    surface->d3d8_lock_rect[i] = rd32(rect + uint32_t(i) * 4);
+            wr32(out, surface->pitch);
+            wr32(out + 4, base + offset);
+            com_ret(c, D8_OK);
+            return;
+        }
         fprintf(stderr, "d3d8: IDirect3DSurface8::LockRect on a host render target is not "
                         "implemented\n");
         fflush(stderr);
@@ -1889,7 +1938,40 @@ void Surface_LockRect(X86 *c) {
     com_ret(c, base ? D8_OK : E_OUTOFMEMORY);
 }
 void Surface_UnlockRect(X86 *c) {
-    d8_stage_unlock(com_this_arg(c, IF_D3D8SURFACE8));
+    ComObj *surface = com_this_arg(c, IF_D3D8SURFACE8);
+    ComObj *dev = surface ? com_get(surface->d3d8_owner) : nullptr;
+    if (surface && !surface->d3d8_texture && dev && dev->d3d8_backbuffer == surface->id) {
+        if (!surface->lock_count || !surface->pixels) {
+            com_ret(c, D8_ERR_INVALIDCALL);
+            return;
+        }
+        uint32_t result = D8_OK;
+        if (!(surface->d3d8_lock_flags & D3DLOCK_READONLY)) {
+            const auto &rect = surface->d3d8_lock_rect;
+            const uint32_t width = rect[2] - rect[0], height = rect[3] - rect[1];
+            std::vector<uint8_t> rgba(size_t(width) * height * 4);
+            const uint8_t *pixels = gm_ptr(surface->pixels);
+            for (uint32_t y = 0; y < height; ++y)
+                for (uint32_t x = 0; x < width; ++x) {
+                    const uint8_t *src =
+                        pixels + size_t(y + rect[1]) * surface->pitch + size_t(x + rect[0]) * 4;
+                    uint8_t *dst = rgba.data() + (size_t(y) * width + x) * 4;
+                    dst[0] = src[2];
+                    dst[1] = src[1];
+                    dst[2] = src[0];
+                    dst[3] = surface->rmask == D3DFMT_X8R8G8B8 ? 255 : src[3];
+                }
+            result = bridge_result(c, recomp::d3d::write_pixels(
+                                          *dev->d3d8_device->value, rect[0], rect[1], width, height,
+                                          rust::Slice<const uint8_t>(rgba.data(), rgba.size())));
+        }
+        heap_free(surface->pixels);
+        surface->pixels = 0;
+        surface->lock_count = 0;
+        com_ret(c, result);
+        return;
+    }
+    d8_stage_unlock(surface);
     com_ret(c, D8_OK);
 }
 
