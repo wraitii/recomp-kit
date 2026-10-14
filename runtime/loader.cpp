@@ -760,8 +760,7 @@ uint32_t loader_module_export(const LoaderModule &m, const char *name) {
         return 0;
     for (uint32_t i = 0; i < nnames; ++i) {
         uint32_t name_rva = rd32(m.base + names + 4 * i);
-        if (!in(name_rva, 1) ||
-            gm_str(m.base + name_rva, std::min(260u, m.size - name_rva)) != name)
+        if (!in(name_rva, 1) || gm_str(m.base + name_rva, m.size - name_rva) != name)
             continue;
         uint32_t ordinal = rd16(m.base + ords + 2 * i);
         if (ordinal >= nfuncs)

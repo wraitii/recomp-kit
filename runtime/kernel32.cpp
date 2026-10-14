@@ -4849,12 +4849,8 @@ void set_current_directory_named(X86 *c, const std::string &want) {
         set_eax(c, 0);
         return;
     }
-    if (want.size() >= 2 && want[1] == ':')
-        g_cur_dir = want;
-    else if (!want.empty() && (want[0] == '\\' || want[0] == '/'))
-        g_cur_dir = "C:" + want;
-    else
-        g_cur_dir = g_cur_dir + "\\" + want;
+    g_cur_dir = full_path_named(want);
+    set_last_error(ERROR_SUCCESS_);
     set_eax(c, 1);
 }
 
@@ -5154,6 +5150,26 @@ std::string full_path_named(const std::string &name) {
         full = "C:" + name;
     else
         full = g_cur_dir + "\\" + name;
+    std::replace(full.begin(), full.end(), '/', '\\');
+    if (full.size() >= 3 && full[1] == ':' && full[2] == '\\') {
+        std::vector<std::string> components;
+        for (const auto &component : split_path(full.substr(3))) {
+            if (component == ".")
+                continue;
+            if (component == "..") {
+                if (!components.empty())
+                    components.pop_back();
+            } else {
+                components.push_back(component);
+            }
+        }
+        full.resize(3);
+        for (const auto &component : components) {
+            if (full.size() > 3)
+                full += '\\';
+            full += component;
+        }
+    }
     return full;
 }
 
