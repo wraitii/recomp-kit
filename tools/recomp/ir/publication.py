@@ -22,14 +22,14 @@ class PublicationPlan:
 
 
 def plan(s, successors, fields, *, access_fields=None, reloaded=(), kept=None,
-         lazy_fields=(), preserved=None, eager_events=()):
+         lazy_fields=(), preserved=None, eager_events=(), clobbers=None):
     return analyze(s, successors, fields, access_fields=access_fields,
                    reloaded=reloaded, kept=kept, lazy_fields=lazy_fields,
-                   preserved=preserved, eager_events=eager_events).required
+                   preserved=preserved, eager_events=eager_events, clobbers=clobbers).required
 
 
 def analyze(s, successors, fields, *, access_fields=None, reloaded=(), kept=None,
-            lazy_fields=(), preserved=None, eager_events=(), returned_lazy=()):
+            lazy_fields=(), preserved=None, eager_events=(), returned_lazy=(), clobbers=None):
     """Return publication requirements and facts already known before each event.
 
 `fields` groups register lanes by runtime field. LOAD/STORE have read-only CPU
@@ -45,6 +45,8 @@ does not publish them, and they stay known across it only if already known.
 flags retain that residency across calls, but eager observers require fields.
 `returned_lazy` identifies full-output calls whose returned descriptors can
 stay resident without reloading fields; specialized calls can omit outputs.
+`clobbers` maps a summarized helper to the keys it writes: every other fact
+survives it, and its reloads make the written groups known.
 At joins each fact requires every predecessor to carry its exit value.
 Starting with no facts gives a conservative least fixed point for loops.
 
@@ -132,7 +134,18 @@ Starting with no facts gives a conservative least fixed point for loops.
                 publications[v.id] = tuple(required)
                 known_before[v.id] = tuple(already_known)
                 resident_before[v.id] = tuple(already_resident)
-                if v.opc in OPAQUE:
+                written = clobbers.get(v.id) if clobbers else None
+                if written is not None:
+                    reloads = b.reloads.get(v.id, {})
+                    for n, keys in enumerate(groups):
+                        if not any(key in written for key in keys):
+                            continue
+                        known.pop(n, None)
+                        resident.pop(n, None)
+                        if all(key in reloaded and key in reloads for key in keys):
+                            known[n] = values(reloads, keys)
+                            resident[n] = known[n]
+                elif v.opc in OPAQUE:
                     # A division error handler, an opaque callee and the string
                     # helper's fault path may leave arbitrary CPU state behind,
                     # so no must-fact survives.

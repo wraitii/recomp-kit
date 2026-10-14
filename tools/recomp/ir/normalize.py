@@ -44,6 +44,17 @@ def _string_helpers():
 STRING_HELPERS = _string_helpers()
 
 
+def string_effect(helper):
+    """The CPU fields a string helper reads and writes on normal return, and
+    whether it writes the arithmetic flags. ECX counts only the REP forms."""
+    base = helper.split("_")[-1][:4]
+    pointers = {"movs": ("ESI", "EDI"), "cmps": ("ESI", "EDI"),
+                "stos": ("EDI",), "scas": ("EDI",)}[base]
+    counter = ("ECX",) if "_" in helper else ()
+    reads = frozenset(pointers + counter + ("DF",) + (("EAX",) if base in ("stos", "scas") else ()))
+    return reads, frozenset(pointers + counter), base in ("cmps", "scas")
+
+
 #: Lazy-flag producers recognised at a seam: (kind, primary p-code opcode).
 #: The primary op must write a non-flag destination. SUB/CMP, ADD, logic/TEST
 #: INC/DEC and carry-aware ADC/SBB are recognised; everything else stays eager.

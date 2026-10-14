@@ -19,7 +19,7 @@ from .x87_facts import InstructionFact
 from .invocation import (EntryBinding, binding_invocation,
                          private_invocation, tail_invocation)
 from . import call_values, lowering
-from .normalize import codegen_ir, CC_DEFINES
+from .normalize import codegen_ir, CC_DEFINES, string_effect
 from .x87_cw import CW_FAST, CW_PC_RC, ModeCondition, condition_of, proven_fact, Dynamic, Guarded
 
 
@@ -103,6 +103,8 @@ def ssa_settle_plan(cgi, flag_off_name):
     def access(i):
         ins = cgi.insns[i]
         if ins.mnem.upper() in ("CALL", "RET", "TAIL"):
+            return (frozenset(), frozenset())
+        if all(op.opc == "STRINGOP" and not string_effect(op.data["helper"])[2] for op in ins.ops) and ins.ops:
             return (frozenset(), frozenset())
         if any(op.opc in _SSA_EAGER_OPS for op in ins.ops):
             return None
@@ -475,10 +477,27 @@ def prepare(fir, request, *, lifter=None, normalized=None):
     cc_entry, cc_calls = flag_region.SETTLE, {}
     if lazy_flags:
         cc_entry, cc_calls = ssa_settle_plan(cgi, flag_off_name)
+    # DIVERGENCE(original): [ssa-state-locals] a string helper publishes and
+    # reloads only the fields it reads and writes. Its faults reach guest
+    # handlers only in null-check builds, which translate with exact state.
+    mandatory_registers = {lifter.register(name) for name in X86_32.names("mandatory")}
+    mandatory_fields = {field for register, field in fields if register in mandatory_registers}
+    string_effects = {}
+    if local_state:
+        for ins in cgi.insns:
+            for op in ins.ops:
+                if op.opc == "STRINGOP" and op.data["helper"] not in string_effects:
+                    reads, writes, flags = string_effect(op.data["helper"])
+                    touched = reads | writes | mandatory_fields | (FLAG_FIELDS if flags else frozenset())
+                    string_effects[op.data["helper"]] = (
+                        frozenset(key for key, (field, _) in mapping.items()
+                                  if field in writes or (flags and field in FLAG_FIELDS)),
+                        frozenset(key for key, (field, _) in mapping.items() if field not in touched))
     s = build(cgi,
               register_groups=groups,
               call_targets=call_symbols, indirect_call_symbol=indirect_call_symbol,
-              flag_off_name=flag_off_name, kept_calls=kept_fields)
+              flag_off_name=flag_off_name, kept_calls=kept_fields,
+              string_writes={helper: written for helper, (written, _) in string_effects.items()})
     if any(key != MEMORY and key not in mapping for key in s.inputs):
         raise SSAError("unmapped runtime register")
     canonicalize(s)
@@ -491,8 +510,6 @@ def prepare(fir, request, *, lifter=None, normalized=None):
     # EIP/ESP/EBP eager; division, string helpers, calls and returns
     # still publish every required field. The strict path keeps all
     # pre-access snapshots.
-    mandatory_registers = {lifter.register(name) for name in X86_32.names("mandatory")}
-    mandatory_fields = {field for register, field in fields if register in mandatory_registers}
     access_fields = ({key for key, (field, _) in mapping.items() if field in mandatory_fields}
                      if local_state else None)
     # Compiler conventions do not cover every binary boundary: CRT
@@ -503,10 +520,14 @@ def prepare(fir, request, *, lifter=None, normalized=None):
                   if v.opc == "CALL" and v.data in kept_fields}
     transparent_calls = {v.id: transparent_fields[v.data] for b in s.blocks.values() for v in b.ops
                          if v.opc == "CALL" and v.data in transparent_fields}
+    string_events = {v.id: string_effects[v.data["helper"]] for b in s.blocks.values() for v in b.ops
+                     if v.opc == "STRINGOP" and v.data["helper"] in string_effects}
+    transparent_calls.update({ident: untouched for ident, (_, untouched) in string_events.items()})
     publication_facts = publication_analysis(s, fir.succ, groups, access_fields=access_fields,
                                              reloaded=set(mapping) - flag_keys, kept=transparent_calls,
                                              lazy_fields=flag_keys if lazy_flags else (),
                                              preserved=kept_calls, eager_events=CC_EAGER_EVENTS,
+                                             clobbers={ident: written for ident, (written, _) in string_events.items()},
                                              returned_lazy={v.id for b in s.blocks.values() for v in b.ops
                                                             if v.opc == "CALLIND" or
                                                             (v.opc == "CALL" and v.data not in contract_calls)})
