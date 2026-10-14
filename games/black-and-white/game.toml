@@ -6,6 +6,7 @@ bundle_id = "dev.recompkit.blackandwhite"
 executable = "runblack.exe"
 sha256 = "3f58bc02a6c421b4e66ef08716646bf0e1fa55ab292786edb521d7596ed48aba"
 image_base = 0x00400000
+host_arena_base = 0
 entry_point = 0x007ca49f
 guest_root = 'C:\Black & White'
 guest_size = 0x10800000
@@ -14,6 +15,7 @@ store_hooks = false
 
 [translate]
 code_map = "metadata"
+private_leaf_contracts = true
 entry_points = [
     0x00545b42,
     0x0057f810,
