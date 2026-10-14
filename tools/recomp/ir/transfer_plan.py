@@ -2,7 +2,7 @@ from dataclasses import dataclass, replace
 
 from .operations import EXITS, OBSERVES
 from .simplify import state_roots
-from .call_contracts import continuation_outputs, FIELDS
+from .call_contracts import continuation_outputs, FIELDS, ARITH_FLAGS
 from .call_state import CallState, OPAQUE_STATE
 from .ssa import MEMORY
 
@@ -54,6 +54,7 @@ class CallPlan:
     skipped: frozenset
     fallback: Publication
     state: CallState | None = None
+    settle_guard: bool = False
 
     @property
     def required_outputs(self):
@@ -82,7 +83,7 @@ def flag_publication(s, state, required, record, first_keys, defines, bits):
     return FlagPublication(record, mask, covered, roots)
 
 
-def calls(s, publications, known_before, contracts, kept, lane_field, never_skip, private, flag_keys):
+def calls(s, publications, known_before, resident_before, contracts, kept, lane_field, never_skip, private, flag_keys):
     result = {}
     for b in s.blocks.values():
         for v in b.ops:
@@ -95,13 +96,17 @@ def calls(s, publications, known_before, contracts, kept, lane_field, never_skip
                                 and field not in contract.reads and field in contract.kills)
             guard = tuple(key for key in required if lane_field.get(key) in skipped)
             guard += tuple(key for key in kept.get(v.id, ()) if key in s.inputs)
+            resident_flags = frozenset(guard) & flag_keys & set(resident_before[v.id])
+            settle_guard = bool(resident_flags) and not (skipped & set(ARITH_FLAGS)) and not (set(required) & flag_keys)
+            if settle_guard:
+                guard = tuple(key for key in guard if key not in resident_flags)
             fallback = ()
             if v.data in private:
                 known = set(known_before[v.id]) - flag_keys
                 fallback = tuple(key for key in b.snapshots[v.id]
                                  if key != MEMORY and key in s.inputs and key not in known)
             result[v.id] = CallPlan(Publication(tuple(key for key in required if lane_field.get(key) not in skipped)),
-                                    guard, skipped, Publication(fallback))
+                                    guard, skipped, Publication(fallback), settle_guard=settle_guard)
     return result
 
 
@@ -136,7 +141,7 @@ def build(s, groups, facts, contracts, kept, lane_field, never_skip,
                     publication.required = tuple(dict.fromkeys((*publication.required, *input_keys)))
                 returns[v.id] = ReturnPlan(publication, Publication(fallback))
     call_plans = calls(s, {key: value.required for key, value in publications.items()},
-                       facts.known_before, contracts, kept, lane_field, never_skip, private, flag_keys)
+                       facts.known_before, facts.resident_before, contracts, kept, lane_field, never_skip, private, flag_keys)
     roots = []
     for b in s.blocks.values():
         for v in b.ops:

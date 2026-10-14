@@ -30,8 +30,8 @@ At a direct CALL in an SSA body the caller may skip publishing field ``F`` iff
 ``reads`` and ``writes`` is transparent: the caller keeps its own value across
 the call instead of publishing and reloading it.
 
-SLEIGH omits AF for ADD/ADC/SUB/SBB/CMP/INC/DEC, which both emitters define,
-so those instructions add the AF write here.
+SLEIGH omits AF for arithmetic and logic instructions which both emitters
+define, so those instructions add the AF write here.
 
 The analysis is conservative.  Indirect calls without a target fact, CALLOTHER, unbound targets,
 failed lifts, SEH/alternate-entry/rewritten bodies, tail transfers and targets
@@ -61,7 +61,8 @@ IMPORT_ABI = Contract(frozenset(("EAX", "ECX", "EDX", "ESP")), frozenset(),
                       frozenset(("EAX", "ECX", "EDX", "ESP")) | frozenset(ARITH_FLAGS),
                       frozenset(("EBX", "ESI", "EDI", "EBP")))
 
-AF_WRITERS = frozenset(("ADD", "ADC", "SUB", "SBB", "CMP", "INC", "DEC"))
+AF_WRITERS = frozenset(("ADD", "ADC", "SUB", "SBB", "CMP", "INC", "DEC",
+                        "AND", "OR", "XOR", "TEST"))
 FLAG_FREE = frozenset(("MOV", "MOVSX", "MOVZX", "XCHG", "NOT", "LEAVE", "LEA", "PUSH", "POP",
                        "RET", "NOP", "CALL", "JMP", "CLD", "STD", "CDQ", "CWDE", "CBW", "WAIT"))
 FLAG_WRITING_X87 = frozenset(("FCOMI", "FCOMIP", "FUCOMI", "FUCOMIP"))

@@ -309,7 +309,8 @@ static EagerFlags eager_flags(int op, int bits, uint32_t a, uint32_t b, const Ea
     case X86_CC_LOGIC:
         r = a & b;
         f.cf = 0;
-        f.of = 0; // AF is preserved.
+        f.of = 0;
+        f.af = 0;
         f.zf = r == 0;
         f.sf = (r >> (bits - 1)) & 1u;
         f.pf = parity8(r);
@@ -346,7 +347,7 @@ static uint32_t flag_random(void) {
 
 static void test_lazy_flags() {
     static const uint8_t ops[] = {X86_CC_ADD, X86_CC_SUB, X86_CC_LOGIC, X86_CC_INC, X86_CC_DEC};
-    static const uint8_t masks[] = {0x3fu, 0x3fu, 0x3bu, 0x3eu, 0x3eu};
+    static const uint8_t masks[] = {0x3fu, 0x3fu, 0x3fu, 0x3eu, 0x3eu};
     for (int bits = 8; bits <= 32; bits *= 2) {
         for (unsigned oi = 0; oi < sizeof ops / sizeof *ops; ++oi) {
             for (int t = 0; t < 4096; ++t) {
@@ -425,6 +426,28 @@ static void test_lazy_flags() {
     CHECK(((eflags >> 6) & 1u) == want.zf);
     CHECK(((eflags >> 7) & 1u) == want.sf);
     CHECK(((eflags >> 11) & 1u) == want.of);
+    memset(&c, 0, sizeof c);
+    c.eflags_of = c.eflags_sf = 1;
+    c.cc_op = X86_CC_ADD;
+    c.cc_size = 4;
+    c.cc_mask = 0x3fu;
+    c.cc_a = 0xffffffffu;
+    c.cc_b = 1;
+    c.cc_res = 0;
+    x86_cc_settle_or_drop(&c, X86_CCF_CF);
+    CHECK(c.cc_op == X86_CC_NONE && c.eflags_cf == 1);
+    CHECK(c.eflags_of == 1 && c.eflags_sf == 1 && c.eflags_pf == 0 && c.eflags_zf == 0 &&
+          c.eflags_af == 0);
+    c.cc_op = X86_CC_INC;
+    c.cc_size = 4;
+    c.cc_mask = 0x3eu;
+    c.cc_a = 0xffffffffu;
+    c.cc_b = 1;
+    c.cc_res = 0;
+    x86_cc_settle_or_drop(&c, X86_CCF_CF);
+    CHECK(c.cc_op == X86_CC_NONE && c.eflags_cf == 1);
+    CHECK(c.eflags_of == 1 && c.eflags_sf == 1 && c.eflags_pf == 0 && c.eflags_zf == 0 &&
+          c.eflags_af == 0);
 }
 
 // The state test_interp_unicorn.py mirrors: registers from a fixed table,

@@ -93,30 +93,32 @@ def ssa_settle_plan(cgi, flag_off_name):
     from each call instruction index to the post-call region summary
     (`flag_region.summarize`), which `call_cc_action` turns into a decision.
     The classification is over the codegen ops, so it matches what the
-    emitter actually materialises: an eager seam is an observer, a call is a
-    normal region boundary, and unknown forms settle.
+    emitter actually materialises: an eager seam is an observer, a call or a
+    resolved tail is a normal region boundary, and unknown forms settle.  A
+    resolved tail enters another translated body whose entry dispatch settles
+    before any hook; an unresolved or import tail stays a BRANCHIND observer.
     """
     n = len(cgi.insns)
 
     def access(i):
         ins = cgi.insns[i]
-        if ins.mnem.upper() in ("CALL", "RET"):
+        if ins.mnem.upper() in ("CALL", "RET", "TAIL"):
             return (frozenset(), frozenset())
         if any(op.opc in _SSA_EAGER_OPS for op in ins.ops):
             return None
         reads, writes = set(), set()
         for op in ins.ops:
+            for v in op.ins:
+                if v is not None and v[0] == "register":
+                    for k in range(v[2]):
+                        name = flag_off_name.get(v[1] + k)
+                        if name and name not in writes:
+                            reads.add(name)
             if op.out is not None and op.out[0] == "register":
                 for k in range(op.out[2]):
                     name = flag_off_name.get(op.out[1] + k)
                     if name:
                         writes.add(name)
-            for v in op.ins:
-                if v is not None and v[0] == "register":
-                    for k in range(v[2]):
-                        name = flag_off_name.get(v[1] + k)
-                        if name:
-                            reads.add(name)
         return (frozenset(reads), frozenset(writes))
 
     def successors(i):
@@ -125,7 +127,7 @@ def ssa_settle_plan(cgi, flag_off_name):
         return list(cgi.succ[i])
 
     def is_end(i):
-        return cgi.insns[i].mnem.upper() in ("CALL", "RET")
+        return cgi.insns[i].mnem.upper() in ("CALL", "RET", "TAIL")
 
     def summarize(start):
         return flag_region.summarize(start, successors, access, is_end,
@@ -136,7 +138,7 @@ def ssa_settle_plan(cgi, flag_off_name):
     entry = flag_region.SETTLE
     if start is not None:
         found = summarize(start)
-        entry = flag_region.SETTLE if found is None else flag_region.decision(*found)
+        entry = call_cc_action(found, frozenset())
     calls = {}
     for i, ins in enumerate(cgi.insns):
         if ins.mnem.upper() != "CALL":
@@ -504,7 +506,10 @@ def prepare(fir, request, *, lifter=None, normalized=None):
     publication_facts = publication_analysis(s, fir.succ, groups, access_fields=access_fields,
                                              reloaded=set(mapping) - flag_keys, kept=transparent_calls,
                                              lazy_fields=flag_keys if lazy_flags else (),
-                                             preserved=kept_calls, eager_events=CC_EAGER_EVENTS)
+                                             preserved=kept_calls, eager_events=CC_EAGER_EVENTS,
+                                             returned_lazy={v.id for b in s.blocks.values() for v in b.ops
+                                                            if v.opc == "CALLIND" or
+                                                            (v.opc == "CALL" and v.data not in contract_calls)})
     transfers = transfer_plan.build(s, groups, publication_facts,
                                     call_contracts or {}, kept_calls, lane_field, CONTRACT_NEVER_SKIP,
                                     contract_calls, return_fields, flag_keys, flag_first_key,
@@ -513,9 +518,9 @@ def prepare(fir, request, *, lifter=None, normalized=None):
                                     request.private_input_arguments)
     live = simplify(s, transfers.live_publications, canonical=False, extra_roots=transfers.roots,
                     removable=frozenset(("CALL_RELOAD", "CALL_KEEP")), groups=groups)
-    reads_entry_flags = any(
-        v.opc == "INPUT" and v.data in flag_keys and v.id in live and s.resolve(v) is v
-        for v in s.values)
+    reads_entry_flags = frozenset(
+        flag_off_name[v.data[1]] for v in s.values
+        if v.opc == "INPUT" and v.data in flag_keys and v.id in live and s.resolve(v) is v)
     if lazy_flags:
         # A post-call reload reads the flag fields directly, right after the
         # site's action, so the action materialises a descriptor that defines
@@ -530,13 +535,15 @@ def prepare(fir, request, *, lifter=None, normalized=None):
         cc_calls.update({b.index: flag_region.REMOVE for b in s.blocks.values()
                          for v in b.ops
                          if v.opc == "CALL" and flag_keys <= set(kept_calls.get(v.id, ()))})
-    if reads_entry_flags or fir.entries:
-        # The SSA builder loads live entry flag INPUTs straight from the fields,
-        # immediately after the entry settle.  Those loads are not codegen ops,
-        # so the region walk cannot see them: it may have classified the entry
-        # region as REMOVE or DROP while a caller descriptor is still pending,
-        # and the later guest read would use a stale field.  Settle first.
+    if fir.entries:
         cc_entry = flag_region.SETTLE
+    elif reads_entry_flags:
+        if cc_entry == flag_region.REMOVE:
+            cc_entry = ("x86_cc_settle_mask", reads_entry_flags)
+        elif cc_entry == flag_region.DROP:
+            cc_entry = ("x86_cc_settle_or_drop", reads_entry_flags)
+        elif isinstance(cc_entry, tuple):
+            cc_entry = (cc_entry[0], cc_entry[1] | reads_entry_flags)
     arithmetic_plan = x87_plan.prepare(s, fir, live, strict=x87_scalar_strict,
                                        convention=x87_convention, defer_ie=defer_ie,
                                        known_mode=x87_known_mode, cw_clone=x87_cw_clone,

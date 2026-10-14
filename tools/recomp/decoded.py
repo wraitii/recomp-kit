@@ -316,7 +316,7 @@ class Translator(ControlFlow):
         return lines
 
     def flags_logic(self, size, r="r_"):
-        return ["c->eflags_cf = 0;", "c->eflags_of = 0;",
+        return ["c->eflags_cf = 0;", "c->eflags_of = 0;", "c->eflags_af = 0;",
                 "c->eflags_zf = (%s == 0);" % r,
                 "c->eflags_sf = (%s >> %d) & 1u;" % (r, size - 1),
                 "c->eflags_pf = parity8(%s);" % r]
