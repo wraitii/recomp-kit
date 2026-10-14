@@ -1035,7 +1035,7 @@ fn ff_vertices(
         .map_err(|_| RenderError::out_of_memory("Draw", "fixed-function texture stages"))?;
     for stage in 0..8 {
         let coord = tss(state, stage, 11);
-        let transform = if tss(state, stage, 24) & 255 != 0 {
+        let transform = if !transformed && tss(state, stage, 24) & 255 != 0 {
             Some(state.transform(16 + stage)?)
         } else {
             None
@@ -1080,7 +1080,11 @@ fn ff_vertices(
     for &index in order {
         let fetch = |e: &VertexFetch<'_>| e.fetch(index);
         let p = fetch(&position)?;
-        let viewp = transform_point(&worldview, p);
+        let viewp = if transformed {
+            [p[0], p[1], p[2], 1.0]
+        } else {
+            transform_point(&worldview, p)
+        };
         let clip = if transformed {
             if p[3] == 0.0 || !p[3].is_finite() {
                 return Err(invalid("Draw", "invalid POSITIONT reciprocal w"));
@@ -1111,7 +1115,7 @@ fn ff_vertices(
             } else {
                 [n[0], n[1], n[2]]
             };
-            if rs(state, 143) != 0 {
+            if !transformed && rs(state, 143) != 0 {
                 normalize3(normal)
             } else {
                 normal
@@ -1131,12 +1135,6 @@ fn ff_vertices(
         for (stage, (&(coord, transform), texcoord)) in
             stage_coords.iter().zip(&texcoords).enumerate()
         {
-            if transformed && coord & 0xffff0000 != 0 {
-                return Err(unsupported(
-                    "Draw",
-                    "texture-coordinate generation with POSITIONT is not implemented",
-                ));
-            }
             let mut uv = match coord & 0xffff0000 {
                 0 => texcoord
                     .as_ref()

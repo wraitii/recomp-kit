@@ -84,7 +84,7 @@
     },
     {
       "name": "D3DXDebugMute",
-      "handler": "imports_unsupported"
+      "handler": "X_D3DXDebugMute"
     },
     {
       "name": "D3DXMatrixMultiply",
