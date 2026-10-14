@@ -30,6 +30,7 @@ from settings import Settings
 from frontend import external_exits
 from ir import call_contracts, call_values, contract_variants, production, x87_mode, x87_facts, x87_report, prepared_store
 from ir import c_symbols
+from ir import indirect_targets as indirect_target_facts
 from ir.c_symbols import Declaration
 from ir.artifacts import ArtifactStore
 from ir.body import FrozenMap
@@ -148,9 +149,9 @@ def _scan(task):
                 or fn.dead_addrs or addr in tr.noreturn_callees):
             try:
                 fir = ctx.artifacts.lifted(tr, ctx.lifter, fn)
-                prepared = call_contracts.prepare(fir) if not entries else None
+                prepared = call_contracts.prepare(fir, image=ctx.image) if not entries else None
                 fir.entries = tuple(entries)
-                mode_prepared = x87_mode.prepare(fir)
+                mode_prepared = x87_mode.prepare(fir, ctx.image)
             except (LiftError, RecursionError):
                 prepared = None
             else:
@@ -512,10 +513,12 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
         mode_prepared = entry_model.cw_inputs(scanned)
         mode_opaque = conservative | helpers | {addr for addr, row in scanned.items() if row.exclusion is not None}
         x87_facts_loaded = x87_facts.load(settings.x87_facts, ctx, mode_prepared, mode_opaque)
+        indirect_targets = indirect_target_facts.load(settings, ctx.program)
         mode_sites = x87_facts_loaded.mode_sites()
         entry_verification = {row["function"]: x87_facts.EntryContract.from_row(row)
                               for row in settings.x87_entry_contracts if row.get("verify")}
-        mode_summaries = x87_mode.summarize(mode_prepared, mode_opaque)
+        mode_summaries = x87_mode.summarize(mode_prepared, mode_opaque, indirect=indirect_targets,
+                                            effects=settings.call_effects)
         x87_counts = {addr: row.x87_count for addr, row in scanned.items()}
         mode_exposure = x87_mode.exposure_report(mode_prepared, calls, mode_opaque, x87_counts,
                                                 {addr: row.writers for addr, row in scanned.items()})
@@ -536,7 +539,7 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
                 calls, prepared,
                 analyzable=lambda a: bool(scanned.get(a) and scanned[a].register_facts is not None
                                           and a not in helpers and a not in conservative),
-                roots=roots)
+                roots=roots, indirect=indirect_targets, effects=settings.call_effects)
         phase("contracts")
         private_targets, private_rejections = {}, {}
         register_uses = {}
@@ -633,6 +636,8 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
         output.write_table(args.out, entry_names, symbols, call_returns, private_masks, known_modes)
     output.write_symbols(
         args.out, str(settings.exe), ctx.image.base, symbols, settings.curated)
+    output.write_call_facts(args.out, {ctx.image.insn_end(site, "CALL"): targets
+                                       for site, (kind, targets) in indirect_targets.items() if kind == "call"})
     decisions = [decision for addr in sorted(results) if addr in selected_callers
                  for decision in results[addr].decisions]
     decisions.sort(key=lambda item: (item.get("site", ""), item.get("target", ""),

@@ -76,9 +76,11 @@ class PE(object):
              self.base + s.VirtualAddress + max(s.Misc_VirtualSize, s.SizeOfRawData))
             for s in pe.sections if s.Characteristics & 0x20000000]
         pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
-        self.iat_names = {imp.address + delta: imp.name.decode("ascii", "replace")
-                          for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", [])
-                          for imp in entry.imports if imp.name}
+        self.iat_keys = {imp.address + delta: "%s!%s" % (entry.dll.decode("ascii", "replace").lower(),
+                                                         imp.name.decode("ascii", "replace"))
+                         for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", [])
+                         for imp in entry.imports if imp.name}
+        self.iat_names = {addr: key.partition("!")[2] for addr, key in self.iat_keys.items()}
         pe.close()
 
     def is_exec(self, va):

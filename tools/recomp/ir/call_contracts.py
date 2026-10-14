@@ -33,7 +33,7 @@ the call instead of publishing and reloading it.
 SLEIGH omits AF for ADD/ADC/SUB/SBB/CMP/INC/DEC, which both emitters define,
 so those instructions add the AF write here.
 
-The analysis is conservative.  Indirect calls, CALLOTHER, unbound targets,
+The analysis is conservative.  Indirect calls without a target fact, CALLOTHER, unbound targets,
 failed lifts, SEH/alternate-entry/rewritten bodies, tail transfers and targets
 whose dispatch can be swapped all contribute ``reads=all, kills=none``.
 Preservation uses byte-backed normalization and SSA for call-free bodies;
@@ -44,6 +44,7 @@ from collections import namedtuple
 from .lift import Lifter
 from .cfg import call_graph
 from .guest import X86_32
+from .import_sites import EMPTY_EFFECTS, resolve as resolve_imports
 
 GPRS = X86_32.names("gpr")
 ARITH_FLAGS = X86_32.names("arithmetic_flag")
@@ -55,6 +56,10 @@ Contract = namedtuple("Contract", ("reads", "kills", "writes", "preserves"),
 
 #: reads and writes everything, kills nothing.
 CONSERVATIVE = Contract(frozenset(FIELDS), frozenset(), frozenset(FIELDS))
+
+IMPORT_ABI = Contract(frozenset(("EAX", "ECX", "EDX", "ESP")), frozenset(),
+                      frozenset(("EAX", "ECX", "EDX", "ESP")) | frozenset(ARITH_FLAGS),
+                      frozenset(("EBX", "ESI", "EDI", "EBP")))
 
 AF_WRITERS = frozenset(("ADD", "ADC", "SUB", "SBB", "CMP", "INC", "DEC"))
 FLAG_FREE = frozenset(("MOV", "MOVSX", "MOVZX", "XCHG", "NOT", "LEAVE", "LEA", "PUSH", "POP",
@@ -231,10 +236,11 @@ class _Prepared(object):
 
     Per reachable instruction: the cells it reads before writing and writes
     itself, its direct call target (None when not a direct CALL) and whether
-    it is opaque (indirect call, CALLOTHER, unbound CALL).
+    it is opaque (indirect call, CALLOTHER, unbound CALL). Indirect CALLs map
+    their index to the site address for ``summarize``'s indirect facts.
     """
 
-    __slots__ = ("language", "entry", "order", "succ", "preds", "use", "defs", "call", "opaque", "returns", "writes", "preserves")
+    __slots__ = ("language", "entry", "order", "succ", "preds", "use", "defs", "call", "opaque", "sites", "indirect", "imports", "returns", "writes", "preserves")
 
     def __init__(self, fir, cells, bits):
         self.language = cells.language
@@ -242,6 +248,7 @@ class _Prepared(object):
         self.entry = indices.get(fir.addr)
         self.order, self.succ, self.preds = [], {}, {}
         self.use, self.defs, self.call, self.opaque, self.returns = {}, {}, {}, set(), []
+        self.sites, self.indirect, self.imports = {}, {}, {}
         self.writes = 0
         self.preserves = frozenset()
         if self.entry is None:
@@ -263,7 +270,8 @@ class _Prepared(object):
                 self.preds[j].append(i)
             ins = fir.insns[i]
             use = defs = local = 0
-            unknown = any(op.opc == "CALLIND" for op in ins.ops)
+            unknown = False
+            indirect = any(op.opc == "CALLIND" for op in ins.ops)
             for op in ins.ops:
                 if op.opc == "CALLOTHER":
                     unknown = True
@@ -279,7 +287,7 @@ class _Prepared(object):
             target = None
             if ins.mnem.upper() == "CALL":
                 target = _is_callable_target(ins)
-                if target is None:
+                if target is None and not indirect:
                     unknown = True
             if ins.mnem.upper() in AF_WRITERS:
                 defs |= bits.fields(("AF",))
@@ -291,7 +299,11 @@ class _Prepared(object):
                 target = None
                 self.writes = bits.all
             self.use[i], self.defs[i], self.call[i] = use, defs, target
-            if unknown:
+            if indirect or ins.mnem.upper() == "CALL":
+                self.sites[i] = ins.addr
+            if indirect:
+                self.indirect[i] = ins.addr
+            if unknown or indirect:
                 self.opaque.add(i)
             if _is_return(ins):
                 self.returns.append(i)
@@ -308,7 +320,7 @@ def _is_return(ins):
     return ins.mnem.upper() == "RET" or any(op.opc == "RETURN" for op in ins.ops)
 
 
-def prepare(fir, language=None):
+def prepare(fir, language=None, image=None):
     """The callee-independent facts of one lifted body, None unless its CFG is closed.
 
     Plain data, so workers can hand it to the process that solves the call graph."""
@@ -316,6 +328,8 @@ def prepare(fir, language=None):
         return None
     cells = mapping(language or fir.language)
     p = _Prepared(fir, cells, _bits(cells))
+    if image is not None:
+        p.imports = resolve_imports(fir, image)
     if (any(ins.raw and len(ins.raw) == 1 and 0x50 <= ins.raw[0] <= 0x57
             for ins in fir.insns) and not fir.entries and not fir.seh and not any(
             op.opc in ("CALL", "CALLIND", "CALLOTHER") for ins in fir.insns for op in ins.ops)):
@@ -383,18 +397,53 @@ def _preserved_registers(fir):
                          for b in returns for key in keys))
 
 
-def summarize(p, callee_lookup, cells=None):
+def join_contracts(contracts):
+    """Contract of a call where exactly one of ``contracts`` runs.
+
+    Any target may read or write a field, so reads and writes are unions. A
+    field is killed or preserved only when every target does so. The join
+    must not be called with an empty sequence."""
+    contracts = list(contracts)
+    reads = frozenset().union(*(c.reads for c in contracts))
+    writes = frozenset().union(*(c.writes for c in contracts))
+    kills = frozenset.intersection(*(c.kills for c in contracts))
+    preserves = frozenset.intersection(*(c.preserves for c in contracts))
+    return Contract(reads, kills - preserves, writes, preserves)
+
+
+def _call_contract(site, target, fact, key, lookup, effects):
+    regs = effects["sites"].get(site, {}).get("regs")
+    if regs is None and fact is not None and fact[0] == "call":
+        found = [lookup(t) for t in fact[1]]
+        return join_contracts(found) if None not in found else None
+    if regs is None and key is not None:
+        regs = effects["imports"].get(key, {}).get("regs", "abi")
+    if regs is not None:
+        return IMPORT_ABI if regs == "abi" else None
+    return lookup(target) if target is not None else None
+
+
+def summarize(p, callee_lookup, cells=None, indirect=None, effects=None):
     """Compute one function's contract from its prepared facts.
 
-    ``callee_lookup(target)`` returns a Contract or None for no summary."""
+    ``callee_lookup(target)`` returns a Contract or None for no summary.
+    ``indirect`` maps indirect CALL sites to ``(kind, targets)`` facts; an
+    indirect CALL without a usable "call" fact, or whose target lacks a
+    summary, is unknown. ``effects`` holds the configured call overrides."""
     cells = cells or mapping(p.language)
     bits = _bits(cells)
+    indirect = indirect or {}
+    effects = effects or EMPTY_EFFECTS
     use, defs = dict(p.use), dict(p.defs)
     writes = p.writes
-    for i, target in p.call.items():
-        if target is None:
+    contracts = {}
+    for i, site in p.sites.items():
+        target = p.call.get(i)
+        if target is None and i not in p.indirect:
             continue
-        contract = callee_lookup(target)
+        contracts[i] = _call_contract(site, target, indirect.get(site), p.imports.get(site),
+                                      callee_lookup, effects)
+    for i, contract in contracts.items():
         if contract is None:
             use[i] = bits.all
             writes = bits.all
@@ -525,7 +574,7 @@ def continuation_outputs(s, publications, groups, lane_field, extra_roots=(), ca
     return outputs
 
 
-def analyze(targets, prepared, *, analyzable, roots, progress=None, language=None):
+def analyze(targets, prepared, *, analyzable, roots, progress=None, language=None, indirect=None, effects=None):
     """Contracts for every analyzable body reachable from `roots`.
 
     `targets[addr]` lists a function's direct CALL targets, `prepared[addr]` is
@@ -535,7 +584,21 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
     analyzable closure are not in the result; a call-site lookup that misses
     them must treat them as ``CONSERVATIVE``. Direct callees are analyzed
     before callers; recursive components iterate to a fixed point.
+    `indirect` holds the ``(kind, targets)`` facts of indirect sites; their
+    "call" targets are call-graph edges too.
     """
+    indirect = indirect or {}
+
+    def callees(addr):
+        out = list(targets.get(addr, ()))
+        body = prepared.get(addr)
+        if body is not None:
+            for site in body.indirect.values():
+                fact = indirect.get(site)
+                if fact is not None and fact[0] == "call":
+                    out.extend(fact[1])
+        return out
+
     needed, stack = set(), []
     for addr in sorted(roots):
         if analyzable(addr) and addr not in needed:
@@ -543,7 +606,7 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
             stack.append(addr)
     while stack:
         addr = stack.pop()
-        for target in targets.get(addr, ()):
+        for target in callees(addr):
             if analyzable(target) and target not in needed:
                 needed.add(target)
                 stack.append(target)
@@ -559,7 +622,7 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
     cells = mapping(language)
     contracts = {}
     components = call_graph(sorted(needed),
-                            lambda a: [t for t in targets.get(a, ()) if t in firs])
+                            lambda a: [t for t in callees(a) if t in firs])
     done = 0
     for comp in components:
         # Sound bottom for both analyses: the may-liveness least fixed point and
@@ -576,13 +639,12 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
         # and kills.  If the safety cap is hit the result is not a fixed point,
         # and a non-converged may-analysis would under-approximate reads, so
         # fall back to the conservative contract for the whole component.
-        recursive = len(comp) > 1 or any(
-            t == comp[0] for t in targets.get(comp[0], ()))
+        recursive = len(comp) > 1 or any(t == comp[0] for t in callees(comp[0]))
         if not recursive:
             # No call into the component: one pass is the fixed point.
             for addr in comp:
                 if addr in firs:
-                    contracts[addr] = summarize(firs[addr], lookup, cells)
+                    contracts[addr] = summarize(firs[addr], lookup, cells, indirect, effects)
                     done += 1
                     if progress is not None:
                         progress(done, len(needed))
@@ -593,7 +655,7 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
             for addr in comp:
                 if addr not in firs:
                     continue
-                new = summarize(firs[addr], lookup, cells)
+                new = summarize(firs[addr], lookup, cells, indirect, effects)
                 current = live.get(addr)
                 if current is None or new != current:
                     live[addr] = new

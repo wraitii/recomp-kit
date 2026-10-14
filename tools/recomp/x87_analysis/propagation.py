@@ -7,6 +7,7 @@ from pathlib import Path
 import driver
 import game_config
 from ir import x87, x87_boundaries, x87_mode, x87_facts
+from ir import indirect_targets
 from .common import MASK, settings_for, scan_fingerprint, scan, read_scan, apply_contracts, preserving, coverage
 from .core import CW_NEUTRAL_TRANSCENDENTALS, internal_pcode_flow, tail_region, cfg_relations, context_graph
 
@@ -64,9 +65,11 @@ def main(argv=None):
                 for _, site, target in body.calls:
                     if target in relations:
                         boundaries['calls'][site] = relations[target]
-    intrinsic = x87_mode.summarize(prepared, opaque)
-    summaries = x87_mode.summarize(prepared, opaque, boundaries)
-    base_summaries = x87_mode.summarize(prepared, opaque, base_boundaries) if return_metadata else summaries
+    indirect = indirect_targets.load(settings, ctx.program)
+    call_effects = settings.call_effects
+    intrinsic = x87_mode.summarize(prepared, opaque, indirect=indirect, effects=call_effects)
+    summaries = x87_mode.summarize(prepared, opaque, boundaries, indirect, call_effects)
+    base_summaries = x87_mode.summarize(prepared, opaque, base_boundaries, indirect, call_effects) if return_metadata else summaries
     unconditional = {"intrinsic": sum(preserving(s) for s in intrinsic.values()),
                      "with_boundary_contracts": sum(preserving(s) for s in base_summaries.values()),
                      "x87_intrinsic": sum(preserving(intrinsic[a]) for a, r in scanned.items() if r.x87_count),
@@ -76,7 +79,7 @@ def main(argv=None):
     if contract_rows:
         for count in range(1, len(contract_rows) + 1):
             bodies, effects = apply_contracts(prepared, boundaries, ctx.image, contract_rows[:count])
-            relations = x87_mode.summarize(bodies, opaque, effects)
+            relations = x87_mode.summarize(bodies, opaque, effects, indirect, call_effects)
             sensitivity.append({"contracts": [r["name"] for r in contract_rows[:count]],
                                 "preserving_functions": sum(preserving(s) for s in relations.values()),
                                 "preserving_x87_functions": sum(preserving(relations[a]) for a, r in scanned.items() if r.x87_count),

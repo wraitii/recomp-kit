@@ -31,6 +31,8 @@ def scan_fingerprint(ctx):
     inputs += list(ctx.settings.code_map.rglob("*"))
     if ctx.settings.x87_mode_metadata:
         inputs.append(ctx.settings.x87_mode_metadata)
+    if ctx.settings.indirect_targets:
+        inputs.append(ctx.settings.indirect_targets)
     for path in sorted(set(p.resolve() for p in inputs if p.is_file())):
         fingerprint.update(str(path).encode())
         fingerprint.update(path.read_bytes())

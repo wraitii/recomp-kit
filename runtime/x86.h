@@ -625,6 +625,15 @@ uint64_t recomp_override_hash(void);
 int32_t recomp_index_of(uint32_t addr);
 int recomp_is_call_return(uint32_t target);
 
+typedef struct RecompCallFact { uint32_t ret, first, count; } RecompCallFact;
+extern const RecompCallFact recomp_call_facts[];
+extern const uint32_t recomp_call_fact_count;
+extern const uint32_t recomp_call_fact_targets[];
+#ifdef RECOMP_CHECK_CALL_FACTS
+void recomp_call_fact_violation(uint32_t ret, uint32_t target);
+void recomp_import_cw_violation(const char *name, uint16_t before, uint16_t after);
+#endif
+
 /* ------------------------------------------------ auxiliary modules -- */
 
 /* Additional translated guest code (RECOMP_EXTRA_CODE libraries). Its table.c

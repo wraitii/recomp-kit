@@ -452,6 +452,9 @@ static void diagnose_unsupported_import(const X86 *c, const char *desc, uint8_t 
 // Copy dispatch metadata before calling a shim, then restore EIP/ESP according to its calling convention.
 namespace {
 uint64_t g_import_calls = 0;
+#ifdef RECOMP_CHECK_CALL_FACTS
+thread_local uint64_t g_guest_entries = 0;
+#endif
 } // namespace
 uint64_t imports_call_count() {
     return g_import_calls;
@@ -560,6 +563,10 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     // them, so after the call they are gone and this is the only point they
     // can be read. Only meaningful for a known stdcall count; a cdecl or
     // unknown shim reports none rather than inventing them.
+#ifdef RECOMP_CHECK_CALL_FACTS
+    const uint16_t cw_before = c->fpu_cw;
+    const uint64_t entries_before = g_guest_entries;
+#endif
     bool skip = false;
     if (g_call_observer) {
         uint32_t args[8];
@@ -592,6 +599,10 @@ bool imports_dispatch(X86 *c, uint32_t target) {
             diagnose_unsupported_import(c, desc, argc);
         set_eax(c, 0);
     }
+#ifdef RECOMP_CHECK_CALL_FACTS
+    if (c->fpu_cw != cw_before && g_guest_entries == entries_before)
+        recomp_import_cw_violation(tramps()[idx].desc.c_str(), cw_before, c->fpu_cw);
+#endif
     // Read after the shim ran, so the pointer is into the table as it is now.
     if (g_return_observer)
         g_return_observer(desc, c->r[R_EAX]);
@@ -671,6 +682,9 @@ void recomp_callback_return(X86 *c) {
 }
 
 uint32_t guest_call(X86 *c, uint32_t fn, const uint32_t *args, int nargs) {
+#ifdef RECOMP_CHECK_CALL_FACTS
+    ++g_guest_entries;
+#endif
     Callback *call = new Callback{};
     call->cpu = c;
     call->saved_esp = c->r[R_ESP];
