@@ -486,6 +486,7 @@ struct HostCursor {
 bool host_cursor_snapshot(uint64_t *revision, HostCursor *cursor);
 void win32_cursor_changed();
 uint32_t win32_load_cursor_file(X86 *c, const std::string &name);
+uint32_t win32_load_cursor_resource(uint32_t module, uint32_t id);
 void win32_cursor_from_icon(uint32_t handle, uint32_t hot_x, uint32_t hot_y);
 struct GdiImage;
 bool win32_read_cursor(uint32_t handle, GdiImage *image, uint32_t *hot_x = nullptr,

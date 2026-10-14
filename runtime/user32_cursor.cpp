@@ -3,6 +3,7 @@
 #include "memory.h"
 #include "win32.h"
 #include "imports.h"
+#include "resources.h"
 #include "../platform/os.h"
 #include <algorithm>
 #include <map>
@@ -176,6 +177,47 @@ uint32_t win32_load_cursor_file(X86 *c, const std::string &name) {
     }
     uint32_t handle = next_cursor++;
     cursors[handle] = std::move(cursor);
+    return handle;
+}
+
+// A cursor group from a module's resources. RT_CURSOR data is the hotspot
+// followed by the DIB, so it is framed as a one-image .cur for decode_cursor.
+// Windows shares a loaded resource cursor, so a repeated load returns its handle.
+uint32_t win32_load_cursor_resource(uint32_t module, uint32_t id) {
+    static std::map<std::pair<uint32_t, uint32_t>, uint32_t> loaded;
+    auto known = loaded.find({module, id});
+    if (known != loaded.end())
+        return known->second;
+    uint32_t bytes = 0,
+             group = resource_data(resource_find(12, id, nullptr, module), &bytes, nullptr, module);
+    if (!group || bytes < 20 || rd16(group + 2) != 2 || !rd16(group + 4))
+        return 0;
+    uint32_t data =
+        resource_data(resource_find(1, rd16(group + 18), nullptr, module), &bytes, nullptr, module);
+    if (!data || bytes < 4 + 40)
+        return 0;
+    uint32_t size = bytes - 4, file = heap_alloc(22 + size, true);
+    if (!file)
+        return 0;
+    wr16(file + 2, 2);
+    wr16(file + 4, 1);
+    wr16(file + 10, rd16(data));
+    wr16(file + 12, rd16(data + 2));
+    wr32(file + 14, size);
+    wr32(file + 18, 22);
+    memcpy(g_mem + file + 22, g_mem + data + 4, size);
+    HostCursor cursor;
+    HostCursorFrame frame;
+    bool ok = decode_cursor(file, 22 + size, &frame);
+    heap_free(file);
+    if (!ok)
+        return 0;
+    cursor.frames.push_back(std::move(frame));
+    cursor.sequence = {0};
+    cursor.rates = {1};
+    uint32_t handle = next_cursor++;
+    cursors[handle] = std::move(cursor);
+    loaded[{module, id}] = handle;
     return handle;
 }
 
