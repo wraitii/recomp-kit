@@ -1315,7 +1315,7 @@ void Dev_Present(X86 *c) {
             if (result.status.code == recomp::d3d::StatusCode::Ok) {
                 presented = host_display_present_native_texture(
                     result.handoff.texture, (int)result.handoff.width, (int)result.handoff.height,
-                    result.handoff.busy);
+                    result.handoff.busy, result.handoff.ready_event, result.handoff.ready_value);
                 if (!presented) {
                     __atomic_store_n(result.handoff.busy, 0u, __ATOMIC_RELEASE);
                     dev->d3d9_device->native_present_available = false;
@@ -4002,6 +4002,20 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
 
     guest_call(c, addref, manager);
 
+    uint32_t scratch = 0;
+    uint32_t scratch_size = 0;
+    auto temporary = [&](uint32_t bytes) -> uint32_t {
+        if (!bytes)
+            return 0;
+        if (bytes > scratch_size) {
+            if (scratch)
+                heap_free(scratch);
+            scratch = heap_alloc(bytes, false, 16);
+            scratch_size = scratch ? bytes : 0;
+        }
+        return scratch;
+    };
+
     uint32_t failure = D3D_OK9;
     for (size_t i = 0; i < commands.size() && !oom; ++i) {
         const recomp::d3d::D3dxEffectCommand &cmd = commands[i];
@@ -4043,14 +4057,13 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
                 stale = true;
                 break;
             }
-            uint32_t buf = heap_alloc(64, false, 16);
+            uint32_t buf = temporary(64);
             if (!buf) {
                 oom = true;
                 break;
             }
             memcpy(gm_ptr(buf), cmd.matrix.data(), 64);
             result = guest_call(c, fn, manager, cmd.state, buf);
-            heap_free(buf);
             break;
         }
         case recomp::d3d::D3dxEffectCommandKind::SetTexture: {
@@ -4102,7 +4115,7 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
             }
             uint32_t count = (uint32_t)cmd.values.size() / 4;
             uint32_t bytes = (uint32_t)cmd.values.size() * 4;
-            uint32_t buf = bytes ? heap_alloc(bytes, false, 16) : 0;
+            uint32_t buf = temporary(bytes);
             if (bytes && !buf) {
                 oom = true;
                 break;
@@ -4110,8 +4123,6 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
             if (bytes)
                 memcpy(gm_ptr(buf), cmd.values.data(), bytes);
             result = guest_call(c, fn, manager, cmd.index, buf, count);
-            if (buf)
-                heap_free(buf);
             break;
         }
         default:
@@ -4125,6 +4136,8 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
             failure = result;
     }
 
+    if (scratch)
+        heap_free(scratch);
     unpin();
     guest_call(c, release, manager);
     if (oom)

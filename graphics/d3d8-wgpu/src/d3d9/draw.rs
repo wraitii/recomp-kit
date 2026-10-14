@@ -6,7 +6,7 @@ use crate::RenderError;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 pub const D3DPT_POINTLIST: u32 = 1;
 pub const D3DPT_LINELIST: u32 = 2;
@@ -202,7 +202,7 @@ pub(crate) struct StreamData {
     pub stream: u32,
     pub stride: u32,
     pub offset: u32,
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<Vec<u8>>,
 }
 
 pub(crate) struct DrawCommand {
@@ -212,7 +212,7 @@ pub(crate) struct DrawCommand {
     pub base_vertex: i32,
     pub indexed: bool,
     pub index_format: u32,
-    pub index_bytes: Vec<u8>,
+    pub index_bytes: Arc<Vec<u8>>,
     pub min_vertex: u32,
     pub num_vertices: u32,
     pub streams: Vec<StreamData>,
@@ -567,6 +567,24 @@ fn native_vertex_format(element_type: u8) -> Option<wgpu::VertexFormat> {
     })
 }
 
+struct NativeGeometry {
+    vertex: wgpu::Buffer,
+    index: wgpu::Buffer,
+    vertex_offset: u64,
+    vertex_size: u64,
+    index_offset: u64,
+    index_size: u64,
+    index_format: wgpu::IndexFormat,
+    base_vertex: i32,
+    count: u32,
+}
+
+struct CachedGeometry {
+    bytes: Weak<Vec<u8>>,
+    buffer: wgpu::Buffer,
+    index_bounds: HashMap<(u32, u32, u32), (u32, u32)>,
+}
+
 struct PackedVertices {
     bytes: Vec<u8>,
     attributes: Vec<wgpu::VertexAttribute>,
@@ -663,6 +681,125 @@ fn pack_shader_vertices(
         attributes,
         stride,
     })
+}
+
+fn native_geometry(
+    gpu: &D3d9Gpu,
+    draw: &mut D3d9DrawState,
+    command: &DrawCommand,
+    linked: &[LinkedInput],
+) -> Result<Option<(NativeGeometry, PackedVertices)>, RenderError> {
+    if !command.indexed
+        || command.primitive != D3DPT_TRIANGLELIST
+        || linked.is_empty()
+        || super::trace_enabled()
+    {
+        return Ok(None);
+    }
+    let stream = stream_for(command, u32::from(linked[0].stream))?;
+    if stream.stride == 0
+        || stream.stride % 4 != 0
+        || stream.offset % 4 != 0
+        || stream.stride > gpu.limits().max_vertex_buffer_array_stride
+    {
+        return Ok(None);
+    }
+    let mut attributes = Vec::with_capacity(linked.len());
+    for input in linked {
+        let Some(format) = native_vertex_format(input.element_type) else {
+            return Ok(None);
+        };
+        if u32::from(input.stream) != stream.stream
+            || u64::from(input.offset) % format.size().min(4) != 0
+            || u64::from(input.offset) + format.size() > u64::from(stream.stride)
+        {
+            return Ok(None);
+        }
+        attributes.push(wgpu::VertexAttribute {
+            format,
+            offset: u64::from(input.offset),
+            shader_location: input.location,
+        });
+    }
+    if !matches!(command.index_format, 101 | 102) {
+        return Err(invalid("Draw", "invalid index format"));
+    }
+    let count = primitive_vertex_count(command.primitive, command.primitive_count)?;
+    let start = command.start_vertex as usize;
+    let end = start
+        .checked_add(count as usize)
+        .ok_or_else(|| invalid("Draw", "index range overflow"))?;
+    if end > index_count(command.index_format, &command.index_bytes) {
+        return Err(invalid("Draw", "index range exceeds the index stream"));
+    }
+    let index_buffer = draw.geometry_buffer(gpu, &command.index_bytes)?;
+    let cached = draw
+        .geometry
+        .get_mut(&(Arc::as_ptr(&command.index_bytes) as usize))
+        .expect("index geometry was cached");
+    let range = (command.start_vertex, count, command.index_format);
+    let (min_raw, max_raw) = if let Some(&bounds) = cached.index_bounds.get(&range) {
+        bounds
+    } else {
+        let mut min = u32::MAX;
+        let mut max = 0;
+        for index in start..end {
+            let raw = indexed_vertex_index(&command.index_bytes, command.index_format, index);
+            min = min.min(raw);
+            max = max.max(raw);
+        }
+        if cached.index_bounds.len() >= 256 {
+            cached.index_bounds.clear();
+        }
+        cached.index_bounds.insert(range, (min, max));
+        (min, max)
+    };
+    if min_raw < command.min_vertex
+        || u64::from(max_raw) >= u64::from(command.min_vertex) + u64::from(command.num_vertices)
+    {
+        return Err(invalid("Draw", "index outside MinVertexIndex/NumVertices"));
+    }
+    let max_index = i64::from(max_raw) + i64::from(command.base_vertex);
+    if i64::from(min_raw) + i64::from(command.base_vertex) < 0 || max_index > i64::from(u32::MAX) {
+        return Err(invalid(
+            "Draw",
+            "index plus base vertex is outside the vertex window",
+        ));
+    }
+    let max_index = max_index as u32;
+    for input in linked {
+        VertexFetch::prepare(
+            command,
+            input.stream,
+            input.offset,
+            input.element_type,
+            max_index,
+        )?;
+    }
+    let index_stride = if command.index_format == 101 { 2 } else { 4 };
+    let geometry = NativeGeometry {
+        vertex: draw.geometry_buffer(gpu, &stream.bytes)?,
+        index: index_buffer,
+        vertex_offset: u64::from(stream.offset),
+        vertex_size: stream.bytes.len() as u64 - u64::from(stream.offset),
+        index_offset: start as u64 * index_stride,
+        index_size: u64::from(count) * index_stride,
+        index_format: if command.index_format == 101 {
+            wgpu::IndexFormat::Uint16
+        } else {
+            wgpu::IndexFormat::Uint32
+        },
+        base_vertex: command.base_vertex,
+        count,
+    };
+    Ok(Some((
+        geometry,
+        PackedVertices {
+            bytes: Vec::new(),
+            attributes,
+            stride: u64::from(stream.stride),
+        },
+    )))
 }
 
 fn flat_to_u8(values: &[f32]) -> Vec<u8> {
@@ -987,10 +1124,13 @@ fn ff_vertices(
         } else {
             ff_colors(state, viewp, normal, vertex, &lights)?
         };
-        append_f32_le(&mut out, &clip);
-        append_f32_le(&mut out, &colors[0]);
-        append_f32_le(&mut out, &colors[1]);
-        for (&(coord, transform), texcoord) in stage_coords.iter().zip(&texcoords) {
+        let mut packed = [0.0f32; 48];
+        packed[..4].copy_from_slice(&clip);
+        packed[4..8].copy_from_slice(&colors[0]);
+        packed[8..12].copy_from_slice(&colors[1]);
+        for (stage, (&(coord, transform), texcoord)) in
+            stage_coords.iter().zip(&texcoords).enumerate()
+        {
             if transformed && coord & 0xffff0000 != 0 {
                 return Err(unsupported(
                     "Draw",
@@ -1025,14 +1165,17 @@ fn ff_vertices(
             if let Some(transform) = transform {
                 uv = transform_point(&transform, uv);
             }
-            append_f32_le(&mut out, &uv);
+            let start = 12 + stage * 4;
+            packed[start..start + 4].copy_from_slice(&uv);
         }
         let fog = if transformed {
             vertex[1].map(|v| v[3]).unwrap_or(1.0)
         } else {
             fog_factor(state, viewp[2].abs(), rs(state, 140))
         };
-        append_f32_le(&mut out, &[fog, viewp[2], 0.0, 0.0]);
+        packed[44] = fog;
+        packed[45] = viewp[2];
+        append_f32_le(&mut out, &packed);
     }
     Ok(out)
 }
@@ -1630,6 +1773,7 @@ struct PendingDraw {
     vertex_offset: u64,
     vertex_size: u64,
     has_attributes: bool,
+    native_geometry: Option<NativeGeometry>,
     index_range: Option<(u64, u64, wgpu::IndexFormat)>,
     vertex_count: u32,
     viewport: super::state::Viewport,
@@ -1659,7 +1803,9 @@ pub(crate) struct D3d9DrawState {
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     batch: DrawBatch,
     index_remap: Vec<u32>,
+    geometry: HashMap<usize, CachedGeometry>,
     upload: Option<wgpu::Buffer>,
+    staging: Option<wgpu::util::StagingBelt>,
     bind_groups: HashMap<BindGroupKey, wgpu::BindGroup>,
 }
 impl D3d9DrawState {
@@ -1671,6 +1817,7 @@ impl D3d9DrawState {
         self.variant_shaders.clear();
         self.samplers.clear();
         self.bind_groups.clear();
+        self.geometry.clear();
     }
 
     pub(crate) fn discard_batch(&mut self) {
@@ -1681,9 +1828,52 @@ impl D3d9DrawState {
         self.clear();
         self.discard_batch();
         self.upload = None;
+        self.staging = None;
         self.bind_groups.clear();
     }
     pub fn drop_resource(&mut self, _id: u32) {}
+
+    fn geometry_buffer(
+        &mut self,
+        gpu: &D3d9Gpu,
+        bytes: &Arc<Vec<u8>>,
+    ) -> Result<wgpu::Buffer, RenderError> {
+        let key = Arc::as_ptr(bytes) as usize;
+        if let Some(cached) = self.geometry.get(&key) {
+            return Ok(cached.buffer.clone());
+        }
+        if bytes.len() as u64 > gpu.limits().max_buffer_size {
+            return Err(RenderError::out_of_memory(
+                "Draw",
+                "geometry exceeds the device buffer limit",
+            ));
+        }
+        self.geometry
+            .retain(|_, cached| cached.bytes.strong_count() != 0);
+        let total: u64 = self
+            .geometry
+            .values()
+            .map(|cached| cached.buffer.size())
+            .sum();
+        if total.saturating_add(bytes.len() as u64) > 128 << 20 {
+            self.geometry.clear();
+        }
+        let buffer = make_buffer(
+            gpu,
+            "d3d9-geometry",
+            bytes,
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX,
+        );
+        self.geometry.insert(
+            key,
+            CachedGeometry {
+                bytes: Arc::downgrade(bytes),
+                buffer: buffer.clone(),
+                index_bounds: HashMap::new(),
+            },
+        );
+        Ok(buffer)
+    }
 
     fn source(
         &mut self,
@@ -2068,8 +2258,6 @@ pub(crate) fn execute(
     if snapshot.command.primitive_count == 0 {
         return Ok(());
     }
-    let (order, draw_indices, _, topology) =
-        expanded_indices(&snapshot.command, &mut draw.index_remap)?;
     if !matches!(rs(state, 9), 1 | 2) {
         return Err(unsupported(
             "Draw",
@@ -2121,21 +2309,40 @@ pub(crate) fn execute(
     let linked = vs
         .map(|v| link_inputs(declaration, &v.program))
         .transpose()?;
-    let vertices = if let Some(linked) = &linked {
-        pack_shader_vertices(&snapshot.command, linked, &order)?
-    } else {
-        PackedVertices {
-            bytes: ff_vertices(&snapshot.command, declaration, &order, state)?,
-            attributes: (0..12)
-                .map(|i| wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x4,
-                    offset: u64::from(i) * 16,
-                    shader_location: i,
-                })
-                .collect(),
-            stride: 192,
-        }
-    };
+    let direct = linked
+        .as_ref()
+        .map(|linked| native_geometry(gpu, draw, &snapshot.command, linked))
+        .transpose()?
+        .flatten();
+    let (native_geometry, vertices, order, draw_indices, topology) =
+        if let Some((geometry, vertices)) = direct {
+            (
+                Some(geometry),
+                vertices,
+                Vec::new(),
+                None,
+                wgpu::PrimitiveTopology::TriangleList,
+            )
+        } else {
+            let (order, draw_indices, _, topology) =
+                expanded_indices(&snapshot.command, &mut draw.index_remap)?;
+            let vertices = if let Some(linked) = &linked {
+                pack_shader_vertices(&snapshot.command, linked, &order)?
+            } else {
+                PackedVertices {
+                    bytes: ff_vertices(&snapshot.command, declaration, &order, state)?,
+                    attributes: (0..12)
+                        .map(|i| wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: u64::from(i) * 16,
+                            shader_location: i,
+                        })
+                        .collect(),
+                    stride: 192,
+                }
+            };
+            (None, vertices, order, draw_indices, topology)
+        };
     if super::trace_enabled() {
         static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2532,9 +2739,14 @@ pub(crate) fn execute(
     } else {
         None
     };
-    let vertex_count = draw_indices
-        .as_ref()
-        .map_or(order.len(), |indices| indices.len()) as u32;
+    let vertex_count = native_geometry.as_ref().map_or_else(
+        || {
+            draw_indices
+                .as_ref()
+                .map_or(order.len(), |indices| indices.len()) as u32
+        },
+        |geometry| geometry.count,
+    );
     let blend = color(rs(state, 193));
     draw.batch.draws.push(PendingDraw {
         pipeline,
@@ -2545,6 +2757,7 @@ pub(crate) fn execute(
         vertex_offset: vertex_offset as u64,
         vertex_size: vertex_size as u64,
         has_attributes,
+        native_geometry,
         index_range,
         vertex_count,
         viewport: vp,
@@ -2640,7 +2853,24 @@ fn flush_inner(gpu: &D3d9Gpu, draw: &mut D3d9DrawState) -> Result<(), RenderErro
         .upload
         .as_ref()
         .expect("draw upload buffer was created");
-    gpu.queue.write_buffer(upload, 0, &draw.batch.data);
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("d3d9-draw-batch"),
+        });
+    let staging = draw
+        .staging
+        .get_or_insert_with(|| wgpu::util::StagingBelt::new(1 << 20));
+    staging
+        .write_buffer(
+            &mut encoder,
+            upload,
+            0,
+            wgpu::BufferSize::new(needed).expect("draw upload is nonempty"),
+            &gpu.device,
+        )
+        .copy_from_slice(&draw.batch.data);
+    staging.finish();
     let mut bind_groups = Vec::with_capacity(draw.batch.draws.len());
     for pending in &draw.batch.draws {
         let key = BindGroupKey {
@@ -2716,11 +2946,6 @@ fn flush_inner(gpu: &D3d9Gpu, draw: &mut D3d9DrawState) -> Result<(), RenderErro
             }),
         }
     });
-    let mut encoder = gpu
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("d3d9-draw-batch"),
-        });
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("d3d9-draw-batch"),
@@ -2732,7 +2957,14 @@ fn flush_inner(gpu: &D3d9Gpu, draw: &mut D3d9DrawState) -> Result<(), RenderErro
         for (pending, bind_group) in draw.batch.draws.iter().zip(&bind_groups) {
             pass.set_pipeline(&pending.pipeline);
             pass.set_bind_group(0, bind_group, &pending.uniform_offsets);
-            if pending.has_attributes {
+            if let Some(geometry) = &pending.native_geometry {
+                pass.set_vertex_buffer(
+                    0,
+                    geometry.vertex.slice(
+                        geometry.vertex_offset..geometry.vertex_offset + geometry.vertex_size,
+                    ),
+                );
+            } else if pending.has_attributes {
                 pass.set_vertex_buffer(
                     0,
                     upload
@@ -2760,7 +2992,15 @@ fn flush_inner(gpu: &D3d9Gpu, draw: &mut D3d9DrawState) -> Result<(), RenderErro
                     .scissor
                     .unwrap_or([0, 0, draw.batch.width, draw.batch.height]);
             pass.set_scissor_rect(left, top, width, height);
-            if let Some((offset, size, format)) = pending.index_range {
+            if let Some(geometry) = &pending.native_geometry {
+                pass.set_index_buffer(
+                    geometry
+                        .index
+                        .slice(geometry.index_offset..geometry.index_offset + geometry.index_size),
+                    geometry.index_format,
+                );
+                pass.draw_indexed(0..geometry.count, geometry.base_vertex, 0..1);
+            } else if let Some((offset, size, format)) = pending.index_range {
                 pass.set_index_buffer(upload.slice(offset..offset + size), format);
                 pass.draw_indexed(0..pending.vertex_count, 0, 0..1);
             } else {
@@ -2769,6 +3009,7 @@ fn flush_inner(gpu: &D3d9Gpu, draw: &mut D3d9DrawState) -> Result<(), RenderErro
         }
     }
     gpu.queue.submit(std::iter::once(encoder.finish()));
+    staging.recall();
     draw.batch.draws.clear();
     draw.batch.data.clear();
     draw.batch.color_view = None;

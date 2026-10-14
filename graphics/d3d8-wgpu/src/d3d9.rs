@@ -174,7 +174,7 @@ pub(crate) struct SurfaceView {
 pub(crate) enum GpuRegistryEntry {
     Buffer {
         buffer: wgpu::Buffer,
-        uploaded: Arc<Mutex<Vec<u8>>>,
+        uploaded: Arc<Mutex<Arc<Vec<u8>>>>,
         size: u32,
         format: u32,
         fvf: u32,
@@ -2486,6 +2486,8 @@ pub fn d3d9_present_handoff(device: &mut D3d9Device) -> crate::bridge::FrameHand
         Err(status) => crate::bridge::FrameHandoffResult {
             status,
             handoff: crate::bridge::FrameHandoff {
+                ready_event: std::ptr::null_mut(),
+                ready_value: 0,
                 texture: std::ptr::null_mut(),
                 busy: std::ptr::null_mut(),
                 width: 0,
@@ -4401,11 +4403,7 @@ fn bound_textures(
     Ok(out)
 }
 
-fn read_draw_buffer(
-    gpu: &D3d9Gpu,
-    entry: &GpuRegistryEntry,
-    out: &mut [u8],
-) -> Result<(), RenderError> {
+fn read_draw_buffer(gpu: &D3d9Gpu, entry: &GpuRegistryEntry) -> Result<Arc<Vec<u8>>, RenderError> {
     let GpuRegistryEntry::Buffer {
         buffer,
         uploaded,
@@ -4417,10 +4415,11 @@ fn read_draw_buffer(
         return Err(unsupported("Draw", "resource is not a buffer"));
     };
     if fresh.load(Ordering::Acquire) {
-        gpu.read_buffer(buffer, *size, out)
+        let mut bytes = alloc_bytes(*size)?;
+        gpu.read_buffer(buffer, *size, &mut bytes)?;
+        Ok(Arc::new(bytes))
     } else {
-        out.copy_from_slice(&uploaded.lock().unwrap());
-        Ok(())
+        Ok(Arc::clone(&uploaded.lock().unwrap()))
     }
 }
 
@@ -4436,16 +4435,14 @@ fn collect_streams(
             continue;
         }
         require_unlocked(device, source.buffer, "Draw vertex buffer")?;
-        let Some(entry @ GpuRegistryEntry::Buffer { size, .. }) =
-            device.registry.get(&source.buffer)
+        let Some(entry @ GpuRegistryEntry::Buffer { .. }) = device.registry.get(&source.buffer)
         else {
             return Err(unsupported(
                 "Draw",
                 format!("vertex stream {stream} has no GPU buffer"),
             ));
         };
-        let mut bytes = alloc_bytes(*size)?;
-        read_draw_buffer(gpu, entry, &mut bytes)?;
+        let bytes = read_draw_buffer(gpu, entry)?;
         out.push(draw::StreamData {
             stream,
             stride: source.stride,
@@ -4460,12 +4457,11 @@ fn index_buffer(
     gpu: &D3d9Gpu,
     device: &D3d9Device,
     id: u32,
-) -> Result<(Vec<u8>, u32), RenderError> {
+) -> Result<(Arc<Vec<u8>>, u32), RenderError> {
     require_unlocked(device, id, "Draw index buffer")?;
     match device.registry.get(&id) {
-        Some(entry @ GpuRegistryEntry::Buffer { size, format, .. }) => {
-            let mut bytes = alloc_bytes(*size)?;
-            read_draw_buffer(gpu, entry, &mut bytes)?;
+        Some(entry @ GpuRegistryEntry::Buffer { format, .. }) => {
+            let bytes = read_draw_buffer(gpu, entry)?;
             Ok((bytes, *format))
         }
         _ => Err(unsupported("Draw", "index buffer has no GPU storage")),
@@ -4863,7 +4859,7 @@ pub fn d3d9_draw_primitive(
         base_vertex: 0,
         indexed: false,
         index_format: 0,
-        index_bytes: Vec::new(),
+        index_bytes: Arc::default(),
         min_vertex: 0,
         num_vertices: 0,
         streams,
@@ -4960,7 +4956,7 @@ pub fn d3d9_draw_primitive_up(
         stream: 0,
         stride,
         offset: 0,
-        bytes: vertices.to_vec(),
+        bytes: Arc::new(vertices.to_vec()),
     }];
     let command = draw::DrawCommand {
         primitive,
@@ -4969,7 +4965,7 @@ pub fn d3d9_draw_primitive_up(
         base_vertex: 0,
         indexed: false,
         index_format: 0,
-        index_bytes: Vec::new(),
+        index_bytes: Arc::default(),
         min_vertex: 0,
         num_vertices: 0,
         streams,
@@ -5037,7 +5033,7 @@ pub fn d3d9_draw_indexed_primitive_up(
         stream: 0,
         stride,
         offset: 0,
-        bytes: vertices.to_vec(),
+        bytes: Arc::new(vertices.to_vec()),
     }];
     let command = draw::DrawCommand {
         primitive,
@@ -5046,7 +5042,7 @@ pub fn d3d9_draw_indexed_primitive_up(
         base_vertex: 0,
         indexed: true,
         index_format,
-        index_bytes: indices.to_vec(),
+        index_bytes: Arc::new(indices.to_vec()),
         min_vertex,
         num_vertices,
         streams,

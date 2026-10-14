@@ -4,8 +4,12 @@ use crate::backend::OffscreenTarget;
 use crate::bridge::FrameHandoff;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::backend::native_present::{ReadyEvent, create_ready_event, signal_ready};
+
 pub(crate) struct PresentRing {
     device: wgpu::Device,
+    ready_event: ReadyEvent,
+    ready_value: u64,
     textures: Vec<wgpu::Texture>,
     busy: Vec<Box<AtomicU32>>,
     next: usize,
@@ -91,6 +95,8 @@ fn prepare_handoff(
         }
         *slot = Some(PresentRing {
             device: gpu.device.clone(),
+            ready_event: create_ready_event(&gpu.device)?,
+            ready_value: 0,
             textures: (0..3)
                 .map(|_| {
                     gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -141,15 +147,22 @@ fn prepare_handoff(
             depth_or_array_layers: 1,
         },
     );
-    let submission_index = gpu.queue.submit([encoder.finish()]);
+    let ready_value = ring.ready_value.checked_add(1).ok_or_else(|| {
+        RenderError::new(
+            "D3D9::PresentHandoff",
+            "native GPU synchronization value overflow",
+        )
+    })?;
+    gpu.queue.submit([encoder.finish()]);
+    let ready_event = signal_ready(&gpu.queue, &ring.ready_event, ready_value)?;
+    ring.ready_value = ready_value;
     gpu.device
-        .poll(wgpu::PollType::Wait {
-            submission_index: Some(submission_index),
-            timeout: None,
-        })
+        .poll(wgpu::PollType::Poll)
         .map_err(|error| RenderError::new("D3D9::PresentHandoff", error.to_string()))?;
     ring.next = (index + 1) % ring.textures.len();
     Ok(FrameHandoff {
+        ready_event,
+        ready_value,
         texture,
         busy: ring.busy[index].as_ref() as *const AtomicU32 as *mut u32,
         width: target.width,

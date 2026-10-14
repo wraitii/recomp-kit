@@ -12,6 +12,7 @@ use crate::d3d9::D3d9Device;
 use crate::d3d9::d3dx_shader;
 use crate::d3d9::resource::D3DPOOL_DEFAULT;
 use crate::d3d9::state::{EffectKeys, EffectSnapshot};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
@@ -221,7 +222,7 @@ struct EfxParam {
 #[derive(Clone)]
 struct EfxPass {
     name: Vec<u8>,
-    states: Vec<EfxState>,
+    states: Arc<Vec<EfxState>>,
     annotations: Vec<u32>,
 }
 
@@ -237,7 +238,13 @@ struct EfxObject {
     data: Vec<u8>,
     param: Vec<u8>,
     ctab: OnceLock<Result<Vec<CtabConst>, RenderError>>,
-    preshader_ctab: OnceLock<Result<Vec<CtabConst>, RenderError>>,
+    preshader: OnceLock<Result<Option<Arc<ShaderPreshader>>, RenderError>>,
+}
+
+struct ShaderPreshader {
+    program: preshader::Preshader,
+    constants: Vec<CtabConst>,
+    outputs: Vec<u32>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -627,7 +634,7 @@ fn parse_effect(blob: &[u8]) -> Result<D3dxEffect, RenderError> {
             }
             passes.push(EfxPass {
                 name: pname,
-                states,
+                states: Arc::new(states),
                 annotations: pass_annotations,
             });
         }
@@ -662,7 +669,7 @@ fn parse_effect(blob: &[u8]) -> Result<D3dxEffect, RenderError> {
                 data: body[at..end].to_vec(),
                 param: Vec::new(),
                 ctab: OnceLock::new(),
-                preshader_ctab: OnceLock::new(),
+                preshader: OnceLock::new(),
             },
         );
         at = end + ((4 - (size & 3)) & 3);
@@ -720,7 +727,7 @@ fn parse_effect(blob: &[u8]) -> Result<D3dxEffect, RenderError> {
             let Some(pass) = technique.passes.get_mut(index as usize) else {
                 return Err(invalid_data("resource names a pass that does not exist"));
             };
-            let Some(state) = pass.states.get_mut(state_index as usize) else {
+            let Some(state) = Arc::make_mut(&mut pass.states).get_mut(state_index as usize) else {
                 return Err(invalid_data(
                     "resource names a pass state that does not exist",
                 ));
@@ -774,7 +781,7 @@ fn parse_effect(blob: &[u8]) -> Result<D3dxEffect, RenderError> {
             data: Vec::new(),
             param: Vec::new(),
             ctab: OnceLock::new(),
-            preshader_ctab: OnceLock::new(),
+            preshader: OnceLock::new(),
         });
         match usage {
             0 => entry.data = state.shader.clone().unwrap_or_default(),
@@ -1094,20 +1101,20 @@ impl D3dxEffect {
             .unwrap_or(false)
     }
 
-    fn pool_value(&self, index: usize) -> Option<Vec<u8>> {
+    fn pool_value(&self, index: usize) -> Option<Cow<'_, [u8]>> {
         let param = self.params.get(index)?;
         if self.shared(index) {
             if let Some(pool) = &self.pool {
                 let state = pool.lock().unwrap();
                 if let Some(entry) = state.entries.get(&param.type_.name) {
                     if entry.shape == ParamShape::of(&param.type_) {
-                        return Some(entry.value.clone());
+                        return Some(Cow::Owned(entry.value.clone()));
                     }
                 }
             }
         }
         match &param.value {
-            EfxValue::Numeric(bytes) => Some(bytes.clone()),
+            EfxValue::Numeric(bytes) => Some(Cow::Borrowed(bytes)),
             _ => None,
         }
     }
@@ -1144,7 +1151,7 @@ impl D3dxEffect {
         match &self.params[index].value {
             EfxValue::Numeric(_) => {
                 if let Some(bytes) = self.pool_value(index) {
-                    self.params[index].value = EfxValue::Numeric(bytes);
+                    self.params[index].value = EfxValue::Numeric(bytes.into_owned());
                 }
             }
             EfxValue::Object(_) => {
@@ -1203,7 +1210,7 @@ impl D3dxEffect {
     fn target_numeric(&self, target: &ParamTarget) -> Option<Vec<u8>> {
         let bytes = match (target.annot, target.root) {
             (Some(index), _) => match &self.annotations[index].value {
-                EfxValue::Numeric(bytes) => bytes.clone(),
+                EfxValue::Numeric(bytes) => Cow::Borrowed(bytes.as_slice()),
                 _ => return None,
             },
             (_, Some(root)) => match &self.params[root].value {
@@ -1896,7 +1903,7 @@ fn pass_shader_bytes(effect: &D3dxEffect, pass: &EfxPass, pixel: bool) -> Vec<u8
     } else {
         FXS_VERTEXSHADER
     };
-    for state in &pass.states {
+    for state in pass.states.iter() {
         if state.op != op {
             continue;
         }
@@ -2199,7 +2206,7 @@ pub fn d3dx_effect_current_technique(effect: &D3dxEffect) -> u32 {
 
 fn technique_supported(effect: &D3dxEffect, technique: &EfxTechnique) -> Result<(), RenderError> {
     for pass in &technique.passes {
-        for state in &pass.states {
+        for state in pass.states.iter() {
             if state.op <= 102 {
                 if RENDER_STATES.get(state.op as usize).is_none() {
                     return Err(unsupported(
@@ -2351,7 +2358,7 @@ pub fn d3dx_effect_is_parameter_used(effect: &D3dxEffect, param: u32, tech: u32)
         return false;
     };
     for pass in &tech.passes {
-        for state in &pass.states {
+        for state in pass.states.iter() {
             if state_uses_name(effect, state, &name) {
                 return true;
             }
@@ -2465,7 +2472,7 @@ pub fn d3dx_effect_prepare_shaders(
     let mut ids = BTreeSet::new();
     for technique in &effect.techniques {
         for pass in &technique.passes {
-            for state in &pass.states {
+            for state in pass.states.iter() {
                 if state.op != FXS_VERTEXSHADER && state.op != FXS_PIXELSHADER {
                     continue;
                 }
@@ -2536,10 +2543,6 @@ fn constant_registers(
     let data = effect
         .pool_value(index)
         .ok_or_else(|| invalid_data("shader constant parameter has no numeric value"))?;
-    let words: Vec<u32> = data
-        .chunks_exact(4)
-        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
-        .collect();
     let rows = param.type_.rows.max(1) as usize;
     let cols = param.type_.cols.max(1) as usize;
     let count = constant.count as usize;
@@ -2574,10 +2577,12 @@ fn constant_registers(
                 lane < constant.cols as usize && lane < cols && register < rows
             };
             let value = if in_range {
-                let word = words
-                    .get(index)
-                    .copied()
+                let bytes = index
+                    .checked_mul(4)
+                    .and_then(|at| at.checked_add(4).and_then(|end| data.get(at..end)))
                     .ok_or_else(|| invalid_data("shader constant data is too short"))?;
+                let word =
+                    u32::from_le_bytes(bytes.try_into().expect("constant word has four bytes"));
                 match param.type_.type_ {
                     FXT_FLOAT => f32::from_bits(word),
                     FXT_INT => (word as i32) as f32,
@@ -2789,12 +2794,12 @@ impl StateSink<'_> {
         &mut self,
         pixel: bool,
         start: u32,
-        values: &[f32],
+        values: Cow<'_, [f32]>,
     ) -> Result<(), RenderError> {
         match self {
             StateSink::Device(device) => device
                 .state
-                .set_constants_f(pixel, start, values)
+                .set_constants_f(pixel, start, &values)
                 .map_err(|_| invalid_data("shader constant range is out of bounds")),
             StateSink::Commands(commands) => {
                 let kind = if pixel {
@@ -2803,7 +2808,7 @@ impl StateSink<'_> {
                     D3dxEffectCommandKind::SetVertexShaderConstantF
                 };
                 let mut command = effect_command(kind, start, 0, 0);
-                command.values = values.to_vec();
+                command.values = values.into_owned();
                 commands.push(command);
                 Ok(())
             }
@@ -2973,7 +2978,6 @@ fn apply_shader_constants(
     pixel: bool,
     object: &EfxObject,
 ) -> Result<(), RenderError> {
-    let code = &object.data;
     let ctab = object_ctab(object)?;
     for constant in ctab {
         let index = effect
@@ -2982,7 +2986,7 @@ fn apply_shader_constants(
         match constant.set {
             D3DXRS_FLOAT4 => {
                 let values = constant_registers(effect, index, constant)?;
-                sink.shader_constants(pixel, constant.index, &values)?;
+                sink.shader_constants(pixel, constant.index, Cow::Owned(values))?;
             }
             D3DXRS_SAMPLER => {
                 if constant.count != 1 {
@@ -3011,19 +3015,29 @@ fn apply_shader_constants(
             }
         }
     }
-    if let Some(code) = preshader::shader_preshader(code)? {
-        let program = preshader::parse(code)?;
-        let preshader_ctab = object
-            .preshader_ctab
-            .get_or_init(|| parse_ctab(code))
-            .as_ref()
-            .map(Vec::as_slice)
-            .map_err(Clone::clone)?;
-        let inputs = ctab_inputs_from(effect, preshader_ctab)?;
-        let values = preshader::evaluate(&program, &inputs)?;
-        for register in program.output_registers() {
+    let compiled = object
+        .preshader
+        .get_or_init(|| {
+            let Some(code) = preshader::shader_preshader(&object.data)? else {
+                return Ok(None);
+            };
+            let program = preshader::parse(code)?;
+            let constants = parse_ctab(code)?;
+            let outputs = program.output_registers();
+            Ok(Some(Arc::new(ShaderPreshader {
+                program,
+                constants,
+                outputs,
+            })))
+        })
+        .as_ref()
+        .map_err(Clone::clone)?;
+    if let Some(compiled) = compiled {
+        let inputs = ctab_inputs_from(effect, &compiled.constants)?;
+        let values = preshader::evaluate(&compiled.program, &inputs)?;
+        for &register in &compiled.outputs {
             let start = register as usize * 4;
-            sink.shader_constants(pixel, register, &values[start..start + 4])?;
+            sink.shader_constants(pixel, register, Cow::Borrowed(&values[start..start + 4]))?;
         }
     }
     Ok(())
@@ -3263,7 +3277,7 @@ fn touched_keys(effect: &D3dxEffect, skip_shader: bool) -> Result<EffectKeys, Re
         return Ok(keys);
     };
     for pass in &technique.passes {
-        for state in &pass.states {
+        for state in pass.states.iter() {
             if state.op <= 102 {
                 let rs = *RENDER_STATES
                     .get(state.op as usize)

@@ -174,6 +174,8 @@ pub mod ffi {
         light: Light,
     }
     struct FrameHandoff {
+        ready_event: *mut u8,
+        ready_value: u64,
         texture: *mut u8,
         busy: *mut u32,
         width: u32,
