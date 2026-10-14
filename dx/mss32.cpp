@@ -68,13 +68,18 @@ int driver_volume(uint32_t driver, float volume) {
     auto it = g_drivers.find(driver);
     if (it == g_drivers.end())
         return miles_volume_mb(volume);
-    if (bits_to_float(it->second.reverb_wet) != 0.0f) {
-        LOGW("mss32: wet reverb DSP is unsupported for driver %08x", driver);
-        abort();
-    }
-    return std::clamp(miles_volume_mb(it->second.master) +
-                          miles_volume_mb(volume * bits_to_float(it->second.reverb_dry)),
-                      -10000, 0);
+    return std::clamp(miles_volume_mb(it->second.master / 127.0f) + miles_volume_mb(volume), -10000,
+                      0);
+}
+
+float driver_dry(uint32_t driver) {
+    auto it = g_drivers.find(driver);
+    return it == g_drivers.end() ? 1.0f : bits_to_float(it->second.reverb_dry);
+}
+
+float driver_wet(uint32_t driver) {
+    auto it = g_drivers.find(driver);
+    return it == g_drivers.end() ? 0.0f : bits_to_float(it->second.reverb_wet);
 }
 
 struct Sample {
@@ -203,8 +208,7 @@ int32_t sample3d_pan_mb(const Sample &s) {
 }
 
 int sample_volume(const Sample &s) {
-    return driver_volume(s.driver, s.volume01 * bits_to_float(s.reverb_dry) *
-                                       (s.is_3d ? sample3d_distance_gain(s) : 1.0f));
+    return driver_volume(s.driver, s.volume01 * (s.is_3d ? sample3d_distance_gain(s) : 1.0f));
 }
 
 // Push a sample's current volume and pan to its host channel. A playing 3D
@@ -214,6 +218,9 @@ void sample_apply_mix(Sample &s) {
         return;
     host_audio_set_volume(s.channel, std::max(-10000, sample_volume(s)));
     host_audio_set_pan(s.channel, s.is_3d ? sample3d_pan_mb(s) : miles_pan_mb(s.pan01));
+    host_audio_set_reverb_send(s.channel, s.driver,
+                               bits_to_float(s.reverb_dry) * driver_dry(s.driver),
+                               bits_to_float(s.reverb_wet) * driver_wet(s.driver));
 }
 
 void sample_update_3d_mix() {
@@ -233,6 +240,9 @@ void sample_play(Sample &s) {
     p.loop = s.loops == 0 ? 1 : 0;
     p.volume = std::max(-10000, sample_volume(s));
     p.pan = s.is_3d ? sample3d_pan_mb(s) : miles_pan_mb(s.pan01);
+    host_audio_set_reverb_send(s.channel, s.driver,
+                               bits_to_float(s.reverb_dry) * driver_dry(s.driver),
+                               bits_to_float(s.reverb_wet) * driver_wet(s.driver));
     host_audio_play(&p);
     s.playing = true;
 }
@@ -597,8 +607,18 @@ void ail_set_digital_master_reverb(X86 *c) {
             imports_unsupported(c);
             return;
         }
+        float decay = bits_to_float(arg(c, 1)), delay = bits_to_float(arg(c, 2)),
+              damping = bits_to_float(arg(c, 3));
+        if (!std::isfinite(decay) || decay < 0 || decay > 100 || !std::isfinite(delay) ||
+            delay < 0 || delay > 2 || !std::isfinite(damping) || damping < 0 || damping > 4) {
+            LOGW("mss32: invalid master reverb decay=%g predelay=%g damping=%g", decay, delay,
+                 damping);
+            imports_unsupported(c);
+            return;
+        }
         for (int i = 0; i < 3; ++i)
             it->second.reverb[i] = arg(c, i + 1);
+        driver_apply_mix(handle);
     }
     set_eax(c, 0);
 }
@@ -675,6 +695,7 @@ void ail_wave_close(X86 *c) {
     auto it = g_drivers.find(id);
     if (it != g_drivers.end()) {
         driver_release(it->second);
+        host_audio_delete_reverb(id);
         g_drivers.erase(it);
     }
     if (g_last_digital_driver == id)
@@ -838,7 +859,7 @@ void ail_set_sample_reverb_levels(X86 *c) {
     if (!s)
         return;
     float dry = bits_to_float(arg(c, 1)), wet = bits_to_float(arg(c, 2));
-    if (!std::isfinite(dry) || dry < 0.0f || wet != 0.0f) {
+    if (!std::isfinite(dry) || dry < 0.0f || !std::isfinite(wet) || wet < 0.0f) {
         LOGW("mss32: AIL_set_sample_reverb_levels unsupported sample=%08x dry=%g wet=%g", arg(c, 0),
              dry, wet);
         imports_unsupported(c);
@@ -897,12 +918,19 @@ struct Stream {
 std::vector<Stream> g_streams(64);
 
 void driver_apply_mix(uint32_t driver) {
+    auto it = g_drivers.find(driver);
+    if (it != g_drivers.end()) {
+        Driver &d = it->second;
+        host_audio_set_reverb(driver, bits_to_float(d.reverb[0]), bits_to_float(d.reverb[1]),
+                              bits_to_float(d.reverb[2]));
+    }
     for (auto &s : g_samples)
         if (s.alive && s.driver == driver)
             sample_apply_mix(s);
     for (auto &s : g_streams)
         if (s.alive && s.driver == driver && s.channel >= 0)
-            host_audio_set_volume(s.channel, driver_volume(s.driver, s.volume / 127.0f));
+            host_audio_set_volume(
+                s.channel, driver_volume(s.driver, s.volume / 127.0f * driver_dry(s.driver)));
 }
 
 void ail_set_digital_master_reverb_levels(X86 *c) {
@@ -1108,7 +1136,7 @@ void stream_start(Stream &s) {
         p.sample_rate = (int32_t)s.source.rate();
         p.channels = (int32_t)s.source.channels();
         p.bits = 16;
-        p.volume = driver_volume(s.driver, s.volume / 127.0f);
+        p.volume = driver_volume(s.driver, s.volume / 127.0f * driver_dry(s.driver));
         host_audio_play(&p);
         s.submitted = p.bytes;
         s.pending.clear();
@@ -1148,7 +1176,8 @@ void ail_stream_status(X86 *c) {
 void ail_set_stream_volume(X86 *c) {
     if (Stream *s = stream_for(arg(c, 0))) {
         s->volume = std::clamp((int32_t)arg(c, 1), 0, 127);
-        host_audio_set_volume(s->channel, driver_volume(s->driver, s->volume / 127.0f));
+        host_audio_set_volume(s->channel,
+                              driver_volume(s->driver, s->volume / 127.0f * driver_dry(s->driver)));
     }
     set_eax(c, 0);
 }
@@ -1190,7 +1219,8 @@ void ail_set_stream_volume_levels(X86 *c) {
         float l = std::clamp(bits_to_float(arg(c, 1)), 0.0f, 1.0f);
         float r = std::clamp(bits_to_float(arg(c, 2)), 0.0f, 1.0f);
         s->volume = std::clamp((int)std::lround(std::max(l, r) * 127.0f), 0, 127);
-        host_audio_set_volume(s->channel, driver_volume(s->driver, s->volume / 127.0f));
+        host_audio_set_volume(s->channel,
+                              driver_volume(s->driver, s->volume / 127.0f * driver_dry(s->driver)));
     }
     set_eax(c, 0);
 }
@@ -1505,6 +1535,7 @@ void ail_close_digital_driver(X86 *c) {
     auto it = g_drivers.find(id);
     if (it != g_drivers.end()) {
         driver_release(it->second);
+        host_audio_delete_reverb(id);
         g_drivers.erase(it);
     }
     if (g_last_digital_driver == id)
@@ -1766,6 +1797,8 @@ void mss32_reset() {
     g_samples.assign(g_samples.size(), Sample{});
     g_streams.assign(g_streams.size(), Stream{});
     g_ail_timers.assign(g_ail_timers.size(), AilTimer{});
+    for (auto &[id, driver] : g_drivers)
+        host_audio_delete_reverb(id);
     g_drivers.clear();
     g_malloc_cb = g_free_cb = 0;
     g_last_digital_driver = 0;

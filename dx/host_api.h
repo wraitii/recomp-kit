@@ -287,6 +287,9 @@ uint32_t host_audio_voice_remaining_bytes(int32_t channel);
 
 void host_audio_stop(int32_t channel);
 void host_audio_set_volume(int32_t channel, int32_t volume);
+void host_audio_set_reverb(uint32_t bus, float decay, float predelay, float damping);
+void host_audio_delete_reverb(uint32_t bus);
+void host_audio_set_reverb_send(int32_t channel, uint32_t bus, float dry, float wet);
 void host_audio_set_pan(int32_t channel, int32_t pan);
 void host_audio_set_frequency(int32_t channel, uint32_t hz);
 // Bytes the host has consumed on this channel, for GetCurrentPosition. A host

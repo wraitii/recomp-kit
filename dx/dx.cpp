@@ -557,8 +557,10 @@ int32_t dx_alloc_audio_channel() {
 
 void dx_free_audio_channel(int32_t ch) {
     auto &used = audio_channels();
-    if (ch >= 0 && (size_t)ch < used.size())
+    if (ch >= 0 && (size_t)ch < used.size()) {
+        host_audio_set_reverb_send(ch, 0, 1.0f, 0.0f);
         used[(size_t)ch] = false;
+    }
 }
 
 // Group the file players in one callback: the runtime has four frame slots,

@@ -53,6 +53,8 @@
 
 #include <assert.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <deque>
 #include <map>
@@ -116,7 +118,101 @@ struct Player {
     float volume = 1.0f;
     float pan_l = 1.0f, pan_r = 1.0f; // channel pan gains, applied at render
     bool playing = false;
+    uint32_t reverb_bus = 0;
+    float reverb_dry = 1.0f, reverb_wet = 0.0f;
 };
+
+struct ReverbDelay {
+    std::vector<float> data;
+    size_t position = 0;
+    float read() const {
+        return data[position];
+    }
+    void write(float value) {
+        data[position] = value;
+        position = (position + 1) % data.size();
+    }
+    void resize(size_t count) {
+        if (data.size() == count)
+            return;
+        data.assign(count, 0.0f);
+        position = 0;
+    }
+};
+struct Reverb {
+    std::array<ReverbDelay, 6> delays;
+    ReverbDelay predelay;
+    std::array<float, 6> feedback{};
+    std::array<float, 3> filter{};
+    float x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    float decay = 0, pre = 0, damping = 0;
+    double rate = 0;
+    uint64_t remaining = 0;
+    std::vector<float> input;
+
+    void configure(float seconds, float delay, float damp, double sample_rate) {
+        if (rate == sample_rate && decay == seconds && pre == delay && damping == damp)
+            return;
+        decay = seconds;
+        pre = delay;
+        damping = damp;
+        rate = sample_rate;
+        const float times[] = {0.0297f, 0.0371f, 0.0411f, 0.0437f, 0.005f, 0.0017f};
+        for (size_t i = 0; i < delays.size(); ++i) {
+            delays[i].resize(std::max(1L, lrint(times[i] * rate)));
+            double exponent = i < 4 ? double(times[i]) / std::max(decay, 0.0001f)
+                                    : (i == 4 ? 0.05162435823280926 : 0.051634066746556816);
+            feedback[i] = float(pow(0.0010000000474974513, exponent));
+        }
+        predelay.resize(std::max(1L, lrint(pre * rate)));
+        if (damping <= 0.0001f) {
+            filter = {};
+        } else {
+            double c = 1.0 / tan(double(damping) * 0.39269909262657166);
+            double a = 1.0 / (1.0 + (sqrt(2.0) + c) * c);
+            filter = {float(a), float(2.0 * (1.0 - c * c) * a),
+                      float((1.0 - sqrt(2.0) * c + c * c) * a)};
+        }
+    }
+
+    void render(float *left, float *right, uint32_t frames) {
+        for (uint32_t i = 0; i < frames; ++i) {
+            float signal = input[i];
+            if (signal != 0)
+                remaining = uint64_t((decay + pre + 0.1f) * rate);
+            if (!remaining || decay <= 0.0001f)
+                continue;
+            --remaining;
+            if (pre > 0) {
+                signal = predelay.read();
+                predelay.write(input[i]);
+            }
+            float filtered = float((double(signal) + 2.0 * x1 + x2) * filter[0] -
+                                   double(y1) * filter[1] - double(y2) * filter[2]);
+            x2 = x1;
+            x1 = signal;
+            y2 = y1;
+            y1 = filtered;
+            float sum = 0;
+            for (size_t j = 0; j < 4; ++j)
+                sum += delays[j].read();
+            for (size_t j = 0; j < 4; ++j)
+                delays[j].write(float(double(filtered) + double(feedback[j]) * delays[j].read()));
+            float first = delays[4].read();
+            float stored = float(double(sum) + double(feedback[4]) * first);
+            delays[4].write(stored);
+            float a = float(double(first) - double(feedback[4]) * stored);
+            float second = delays[5].read();
+            float b = float(double(feedback[5]) * second);
+            float next = float(double(a) * 0.25 + b);
+            delays[5].write(next);
+            left[i] += float(double(second) - double(feedback[5]) * next);
+            right[i] +=
+                float(double(second) - double(feedback[5]) * (double(a) * 0.15000000596046448 + b));
+        }
+    }
+};
+std::map<uint32_t, Reverb> g_reverbs;
 
 std::mutex g_render_mutex;
 std::map<int32_t, Player> g_players; // render mutex
@@ -160,6 +256,8 @@ inline void sample_at(const Segment &s, double pos, float *l, float *r) {
 
 // Render mutex held. Adds `frames` of this player into the mix.
 void render_player(int32_t id, Player &p, float *left, float *right, uint32_t frames) {
+    auto bus = g_reverbs.find(p.reverb_bus);
+    float *send = bus == g_reverbs.end() ? nullptr : bus->second.input.data();
     for (uint32_t i = 0; i < frames && p.playing; ++i) {
         if (p.segments.empty()) {
             p.playing = false;
@@ -173,8 +271,10 @@ void render_player(int32_t id, Player &p, float *left, float *right, uint32_t fr
         }
         float l, r;
         sample_at(s, p.pos, &l, &r);
-        left[i] += l * p.volume * p.pan_l;
-        right[i] += r * p.volume * p.pan_r;
+        if (send)
+            send[i] += (l + r) * 0.5f * p.volume * p.reverb_wet;
+        left[i] += l * p.volume * p.pan_l * p.reverb_dry;
+        right[i] += r * p.volume * p.pan_r * p.reverb_dry;
         const double step = double(s.rate) / g_render_rate;
         p.pos += step;
         p.played += step;
@@ -203,11 +303,18 @@ void render_block(float *left, float *right, uint32_t frames) {
     uint32_t busy = 0;
     {
         std::lock_guard<std::mutex> render(g_render_mutex);
+        for (auto &[id, bus] : g_reverbs) {
+            if (bus.rate != g_render_rate)
+                bus.configure(bus.decay, bus.pre, bus.damping, g_render_rate);
+            bus.input.assign(frames, 0.0f);
+        }
         for (auto &entry : g_players) {
             if (entry.second.playing)
                 ++busy;
             render_player(entry.first, entry.second, left, right, frames);
         }
+        for (auto &[id, bus] : g_reverbs)
+            bus.render(left, right, frames);
         if (g_music)
             g_music(g_music_context, left, right, frames);
     }
@@ -1490,6 +1597,33 @@ extern "C" void host_audio_stop(int32_t id) {
         return;
     }
     player_stop(id);
+}
+
+extern "C" void host_audio_set_reverb(uint32_t id, float decay, float predelay, float damping) {
+    std::lock_guard<std::mutex> api(g_api_mutex);
+    std::lock_guard<std::mutex> render(g_render_mutex);
+    g_reverbs[id].configure(decay, predelay, damping, g_render_rate);
+}
+
+extern "C" void host_audio_delete_reverb(uint32_t id) {
+    std::lock_guard<std::mutex> api(g_api_mutex);
+    std::lock_guard<std::mutex> render(g_render_mutex);
+    g_reverbs.erase(id);
+    for (auto &[channel, player] : g_players)
+        if (player.reverb_bus == id) {
+            player.reverb_bus = 0;
+            player.reverb_dry = 1;
+            player.reverb_wet = 0;
+        }
+}
+
+extern "C" void host_audio_set_reverb_send(int32_t id, uint32_t bus, float dry, float wet) {
+    std::lock_guard<std::mutex> api(g_api_mutex);
+    std::lock_guard<std::mutex> render(g_render_mutex);
+    Player &player = g_players[id];
+    player.reverb_bus = bus;
+    player.reverb_dry = dry;
+    player.reverb_wet = wet;
 }
 
 extern "C" void host_audio_set_volume(int32_t id, int32_t volume) {
