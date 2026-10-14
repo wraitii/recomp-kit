@@ -26,6 +26,11 @@ pub mod ffi {
         status: Status,
         handle: u32,
     }
+    struct VertexStream<'a> {
+        stream: u32,
+        stride: u32,
+        data: &'a [u8],
+    }
 
     struct ConstantRead {
         status: Status,
@@ -1393,6 +1398,21 @@ pub mod ffi {
         fn bind_shader(device: &mut Device, pixel: bool, handle: u32) -> Status;
         fn delete_shader(device: &mut Device, pixel: bool, handle: u32) -> Status;
         fn selected_shader(device: &Device, pixel: bool) -> u32;
+        fn shader_stream_count(device: &Device) -> u32;
+        fn draw_vertex_streams(
+            device: &mut Device,
+            topology: u32,
+            streams: &[VertexStream],
+            start_vertex: u32,
+            primitive_count: u32,
+            indexed: bool,
+            indices: &[u8],
+            index_format: u32,
+            base_vertex: u32,
+            min_index: u32,
+            num_vertices: u32,
+            start_index: u32,
+        ) -> Status;
         fn set_shader_constants(
             device: &mut Device,
             pixel: bool,
@@ -2819,6 +2839,92 @@ pub fn selected_shader(device: &Device, pixel: bool) -> u32 {
     } else {
         device.vertex_fvf
     }
+}
+
+pub fn shader_stream_count(device: &Device) -> u32 {
+    device
+        .shaders
+        .get(&device.vertex_shader)
+        .and_then(|s| s.parsed_declaration.as_ref())
+        .map_or(1, |d| d.stream_count)
+}
+
+pub fn draw_vertex_streams(
+    device: &mut Device,
+    topology: u32,
+    streams: &[ffi::VertexStream],
+    start_vertex: u32,
+    primitive_count: u32,
+    indexed: bool,
+    indices: &[u8],
+    index_format: u32,
+    base_vertex: u32,
+    min_index: u32,
+    num_vertices: u32,
+    start_index: u32,
+) -> Status {
+    use crate::d3d9::draw::{DrawCommand, expanded_indices};
+    let Some(declaration) = device
+        .shaders
+        .get(&device.vertex_shader)
+        .and_then(|s| s.parsed_declaration.as_ref())
+    else {
+        return status(
+            StatusCode::InvalidArgument,
+            "Draw: multi-stream shader has no declaration",
+        );
+    };
+    let command = DrawCommand {
+        primitive: topology,
+        primitive_count,
+        start_vertex,
+        base_vertex: base_vertex as i32,
+        indexed,
+        index_format,
+        index_bytes: if indexed {
+            let size = if index_format == 101 { 2usize } else { 4 };
+            let Some(at) = (start_index as usize).checked_mul(size) else {
+                return status(StatusCode::InvalidArgument, "Draw: index offset overflow");
+            };
+            let Some(bytes) = indices.get(at..) else {
+                return status(
+                    StatusCode::InvalidArgument,
+                    "Draw: index offset outside buffer",
+                );
+            };
+            bytes.to_vec()
+        } else {
+            Vec::new()
+        },
+        min_vertex: min_index,
+        num_vertices,
+        streams: Vec::new(),
+    };
+    let (order, _, gpu_topology) = match expanded_indices(&command) {
+        Ok(value) => value,
+        Err(error) => return status_from_error(error),
+    };
+    let vertices = match declaration.pack_vertices(streams, &order) {
+        Ok(value) => value,
+        Err(error) => return status_from_error(error),
+    };
+    let stride = declaration.layout.stride as u32;
+    let topology = match gpu_topology {
+        wgpu::PrimitiveTopology::PointList => 1,
+        wgpu::PrimitiveTopology::LineList => 2,
+        wgpu::PrimitiveTopology::LineStrip => 3,
+        wgpu::PrimitiveTopology::TriangleList => 4,
+        wgpu::PrimitiveTopology::TriangleStrip => 5,
+    };
+    draw_primitive(
+        device,
+        topology,
+        device.vertex_shader,
+        &vertices,
+        stride,
+        0,
+        primitive_count,
+    )
 }
 
 pub fn set_shader_constants(

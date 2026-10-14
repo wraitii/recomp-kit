@@ -73,6 +73,7 @@
       "SetPixelShaderConstant": "Dev_SetPixelShaderConstant",
       "GetPixelShaderConstant": "Dev_GetPixelShaderConstant",
       "SetStreamSource": "Dev_SetStreamSource",
+      "GetStreamSource": "Dev_GetStreamSource",
       "SetIndices": "Dev_SetIndices",
       "CopyRects": "Dev_CopyRects",
       "ValidateDevice": "Dev_ValidateDevice",

@@ -38,6 +38,10 @@ strips/fans and diagnostic draws retain expansion; `RECOMP_D3D8_EXPAND_INDICES=1
 forces it for comparisons. Queued vertex/index bytes and constants are immutable
 snapshots. Shaders and supported render pipelines are cached per device.
 
+Programmable declarations support sixteen vertex streams. Multi-stream draws
+reuse D3D9 index ordering and checked byte fetches to pack only referenced
+attributes into immutable vertex snapshots, preserving register types and bits.
+
 Clear accepts host copies of guest D3DRECT arrays, clips each rectangle to the
 current viewport, and preserves color/depth/stencil outside the selected regions.
 An empty array clears the viewport. The bridge validates guest spans and copies

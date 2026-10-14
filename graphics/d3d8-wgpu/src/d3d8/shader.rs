@@ -12,13 +12,17 @@ fn fail(s: impl Into<String>) -> RenderError {
 pub struct Declaration {
     pub layout: FvfLayout,
     fields: Vec<(u32, u32)>,
+    source_fields: Vec<(u32, u64)>,
+    pub stream_count: u32,
     pub constants: Vec<(usize, [f32; 4])>,
 }
 impl Declaration {
     /// Decode a copied declaration, checking stream layout and constant bounds.
     pub fn parse(words: &[u32]) -> Result<Self, RenderError> {
-        let mut attributes = Vec::new();
+        let mut attributes: Vec<wgpu::VertexAttribute> = Vec::new();
         let mut fields = Vec::new();
+        let mut source_fields = Vec::new();
+        let mut offsets = [0u64; 16];
         let mut constants = Vec::new();
         let mut offset = 0;
         let mut stream = None;
@@ -30,23 +34,38 @@ impl Declaration {
                 if i != words.len() || fields.is_empty() {
                     return Err(fail("invalid declaration END"));
                 }
+                let mut bases = [0u64; 16];
+                let mut stride = 0;
+                for (index, size) in offsets.iter().enumerate() {
+                    bases[index] = stride;
+                    stride += size;
+                }
+                for (attr, &(stream, source_offset)) in attributes.iter_mut().zip(&source_fields) {
+                    attr.offset = bases[stream as usize] + source_offset;
+                }
                 return Ok(Self {
                     layout: FvfLayout {
-                        stride: offset,
+                        stride,
                         attributes,
                         pre_transformed: false,
                         texcoord_sets: 2,
                     },
                     fields,
+                    stream_count: source_fields.iter().map(|(s, _)| s + 1).max().unwrap_or(0),
+                    source_fields,
                     constants,
                 });
             }
             match t >> 29 {
                 0 if t == 0 => {}
-                1 if t == 0x20000000 => stream = Some(0),
-                2 if stream == Some(0) => {
+                1 if t & !15 == 0x20000000 => {
+                    stream = Some(t & 15);
+                    offset = offsets[(t & 15) as usize];
+                }
+                2 if stream.is_some() => {
                     if t & 0x10000000 != 0 {
                         offset += u64::from((t >> 16) & 15) * 4;
+                        offsets[stream.unwrap() as usize] = offset;
                         continue;
                     }
                     let reg = t & 31;
@@ -71,6 +90,8 @@ impl Declaration {
                         shader_location: reg,
                     });
                     offset += format.size();
+                    offsets[stream.unwrap() as usize] = offset;
+                    source_fields.push((stream.unwrap(), attributes.last().unwrap().offset));
                     fields.push((reg, ty));
                 }
                 4 => {
@@ -88,17 +109,56 @@ impl Declaration {
                     i += n * 4;
                 }
                 _ => {
-                    return Err(fail(format!(
-                        "unsupported declaration token {t:#010x} (only stream 0 is supported)"
-                    )));
+                    return Err(fail(format!("unsupported declaration token {t:#010x}")));
                 }
             }
         }
         Err(fail("unterminated declaration"))
     }
+    pub fn pack_vertices(
+        &self,
+        streams: &[crate::bridge::ffi::VertexStream],
+        order: &[u32],
+    ) -> Result<Vec<u8>, RenderError> {
+        let stride = self.layout.stride as usize;
+        let size = order
+            .len()
+            .checked_mul(stride)
+            .ok_or_else(|| RenderError::invalid("Draw", "vertex repack size overflow"))?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(size)
+            .map_err(|_| RenderError::out_of_memory("Draw", "vertex repack allocation failed"))?;
+        out.resize(size, 0);
+        for (vertex, &index) in order.iter().enumerate() {
+            for (attr, &(stream, offset)) in self.layout.attributes.iter().zip(&self.source_fields)
+            {
+                let source = streams
+                    .iter()
+                    .find(|s| s.stream == stream)
+                    .ok_or_else(|| fail(format!("vertex stream {stream} is not bound")))?;
+                let bytes = crate::d3d9::draw::vertex_element_bytes(
+                    source.data,
+                    source.stride,
+                    0,
+                    offset,
+                    attr.format.size() as usize,
+                    index,
+                )?;
+                let at = vertex * stride + attr.offset as usize;
+                out[at..at + bytes.len()].copy_from_slice(bytes);
+            }
+        }
+        Ok(out)
+    }
+
     /// Declaration-only shaders select fixed-function processing. Restrict
     /// this mapping to existing FVFs, including byte offsets and stride.
     pub fn fixed_fvf(&self) -> Result<u32, RenderError> {
+        if self.stream_count != 1 {
+            return Err(fail(
+                "multi-stream fixed-function declarations are not supported",
+            ));
+        }
         for fvf in [0x42, 0x142, 0x242, 0x112, 0x152] {
             let layout = FvfLayout::decode(fvf)?;
             let expected: Vec<_> = match fvf {
@@ -574,7 +634,7 @@ mod tests {
         assert_eq!(d.layout.attributes[1].offset, 16);
         assert_eq!(d.constants[0].0, 2);
         assert_eq!(d.constants[0].1[3].to_bits(), 4);
-        assert!(Declaration::parse(&[0x20000001, 0x40020000, u32::MAX]).is_err());
+        assert!(Declaration::parse(&[0x20000010, 0x40020000, u32::MAX]).is_err());
         assert!(Declaration::parse(&[0x20000000, 0x40020000, 0x40020000, u32::MAX]).is_err());
     }
     #[test]

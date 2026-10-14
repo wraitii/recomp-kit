@@ -428,11 +428,11 @@ void write_caps(uint32_t addr) {
     // `DeviceState::validate_point_draw`), so no larger size is offered.
     // MaxPrimitiveCount (+0xb4) is the DX8 HAL-scale batch limit; a draw is not
     // otherwise bounded by the bridge. MaxVertexIndex (+0xb8) is the 16-bit
-    // vertex-index ceiling; MaxStreams (+0xbc) is one because SetStreamSource
-    // accepts only stream 0. MaxStreamStride (+0xc0) is the DX8 HAL maximum.
+    // vertex-index ceiling; MaxStreams (+0xbc) covers the declaration's sixteen
+    // stream indices. MaxStreamStride (+0xc0) is the DX8 HAL maximum.
     wr32(addr + 0xb4, 0x00555555u);
     wr32(addr + 0xb8, 0x0000ffffu);
-    wr32(addr + 0xbc, 1);
+    wr32(addr + 0xbc, 16);
     wr32(addr + 0xc0, 508);
 #ifdef RECOMP_D3D8_WGPU
     wr32(addr + 0xc4, 0xfffe0101u); // vs.1.1
@@ -889,6 +889,7 @@ void Dev_Reset(X86 *c) {
     dev->d3d8_depth_format =
         params.enable_auto_depth_stencil ? params.auto_depth_stencil_format : 0;
     device_discard_implicit_surfaces(dev);
+    dev->d3d8_streams = {};
     for (uint32_t texture_id : bound_textures) {
         if (ComObj *texture = com_get(texture_id))
             com_release_internal(texture);
@@ -2294,6 +2295,9 @@ void buffer_destroy(ComObj *o) {
     // The owning device binds buffers weakly; drop any binding that points here
     // so a later draw does not resolve a dead object id.
     if (ComObj *dev = com_get(o->d3d8_owner)) {
+        for (auto &stream : dev->d3d8_streams)
+            if (stream[0] == o->id)
+                stream = {};
         if (dev->d3d8_device) {
             auto info = d8_device_info(dev);
             if (info.stream_vb == o->id)
@@ -2382,9 +2386,7 @@ void Dev_CreateIndexBuffer(X86 *c) {
     com_ret(c, D8_OK);
 }
 
-// (this, StreamNumber, pStreamData, Stride). This renderer currently supports one vertex stream and
-// has no per-stream offset (that arrived in D3D9); any other stream is
-// INVALIDCALL rather than a silent drop.
+// (this, StreamNumber, pStreamData, Stride).
 void Dev_SetStreamSource(X86 *c) {
     ComObj *dev = d8_dev(c);
     uint32_t stream = arg(c, 1);
@@ -2393,11 +2395,13 @@ void Dev_SetStreamSource(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if (stream != 0) {
-        LOGW("d3d8: SetStreamSource stream %u is not implemented (this renderer supports one "
-             "stream)",
-             stream);
+    if (stream >= dev->d3d8_streams.size() || (vb && vb->kind != K_D3D8VERTEXBUFFER)) {
         com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    dev->d3d8_streams[stream] = {vb ? vb->id : 0, vb ? arg(c, 3) : 0};
+    if (stream != 0) {
+        com_ret(c, D8_OK);
         return;
     }
     if (!vb) {
@@ -2416,6 +2420,32 @@ void Dev_SetStreamSource(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
+    com_ret(c, D8_OK);
+}
+
+void Dev_GetStreamSource(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t stream = arg(c, 1), out = arg(c, 2), stride = arg(c, 3);
+    if (!dev || stream >= dev->d3d8_streams.size() || !out || !gm_valid(out, 4) || !stride ||
+        !gm_valid(stride, 4)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    auto binding = dev->d3d8_streams[stream];
+    if (stream == 0) {
+        auto info = d8_device_info(dev);
+        binding = {info.stream_vb, info.stream_stride};
+    }
+    ComObj *buffer = com_get(binding[0]);
+    uint32_t view = buffer ? com_view(buffer, IF_D3D8VERTEXBUFFER8) : 0;
+    if (buffer && !view) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    if (buffer)
+        com_addref(buffer);
+    wr32(out, view);
+    wr32(stride, binding[1]);
     com_ret(c, D8_OK);
 }
 
@@ -2965,6 +2995,25 @@ bool d8_sync_texture(X86 *c, ComObj *dev, uint32_t stage) {
 }
 
 // (this, PrimitiveType, StartVertex, PrimitiveCount)
+std::vector<recomp::d3d::VertexStream> d8_vertex_streams(ComObj *dev) {
+    std::vector<recomp::d3d::VertexStream> streams;
+    auto info = d8_device_info(dev);
+    for (uint32_t index = 0; index < dev->d3d8_streams.size(); ++index) {
+        auto binding = dev->d3d8_streams[index];
+        if (index == 0)
+            binding = {info.stream_vb, info.stream_stride};
+        ComObj *buffer = com_get(binding[0]);
+        const uint8_t *data = d8_buffer_bytes(buffer);
+        if (!data || !buffer->pixels_bytes)
+            continue;
+        recomp::d3d::VertexStream stream{};
+        stream.stream = index;
+        stream.stride = binding[1];
+        stream.data = rust::Slice<const uint8_t>(data, buffer->pixels_bytes);
+        streams.push_back(stream);
+    }
+    return streams;
+}
 void Dev_DrawPrimitive(X86 *c) {
     ComObj *dev = d8_dev(c);
     if (!dev || !dev->d3d8_device) {
@@ -2981,6 +3030,15 @@ void Dev_DrawPrimitive(X86 *c) {
     for (uint32_t stage = 0; stage < (d8_pixel_shader_bound(dev) ? 4u : 2u); ++stage)
         if (!d8_sync_texture(c, dev, stage))
             return;
+    if (recomp::d3d::shader_stream_count(*dev->d3d8_device->value) > 1) {
+        auto streams = d8_vertex_streams(dev);
+        auto status = recomp::d3d::draw_vertex_streams(
+            *dev->d3d8_device->value, arg(c, 1),
+            rust::Slice<const recomp::d3d::VertexStream>(streams.data(), streams.size()), arg(c, 2),
+            arg(c, 3), false, rust::Slice<const uint8_t>(), 0, 0, 0, 0, 0);
+        com_ret(c, bridge_result(c, status));
+        return;
+    }
     auto status = recomp::d3d::draw_primitive(*dev->d3d8_device->value, arg(c, 1),
                                               d8_selected_vertex_shader(dev),
                                               rust::Slice<const uint8_t>(bytes, vb->pixels_bytes),
@@ -3070,6 +3128,17 @@ void Dev_DrawIndexedPrimitive(X86 *c) {
     for (uint32_t stage = 0; stage < (d8_pixel_shader_bound(dev) ? 4u : 2u); ++stage)
         if (!d8_sync_texture(c, dev, stage))
             return;
+    if (recomp::d3d::shader_stream_count(*dev->d3d8_device->value) > 1) {
+        auto streams = d8_vertex_streams(dev);
+        auto status = recomp::d3d::draw_vertex_streams(
+            *dev->d3d8_device->value, topology,
+            rust::Slice<const recomp::d3d::VertexStream>(streams.data(), streams.size()), 0,
+            prim_count, true, rust::Slice<const uint8_t>(ibytes, ib->pixels_bytes),
+            d8_resource_info(ib).index_format, device_state.base_vertex, min_index, num_vertices,
+            start_index);
+        com_ret(c, bridge_result(c, status));
+        return;
+    }
     auto status = recomp::d3d::draw_indexed_primitive(
         *dev->d3d8_device->value, topology, d8_selected_vertex_shader(dev),
         rust::Slice<const uint8_t>(vbytes, vb->pixels_bytes), stride,
@@ -3231,6 +3300,7 @@ void d3d8_reset() {
         if (!dev->d3d8_device)
             continue;
         recomp::d3d::global_reset(*dev->d3d8_device->value);
+        dev->d3d8_streams = {};
         dev->d3d8_target = 0;
         dev->d3d8_target_depth = 0;
         dev->d3d8_backbuffer = 0;

@@ -299,7 +299,7 @@ fn indexed_vertex_index(bytes: &[u8], index_format: u32, index: usize) -> u32 {
     }
 }
 
-fn expanded_indices(
+pub(crate) fn expanded_indices(
     command: &DrawCommand,
 ) -> Result<(Vec<u32>, u32, wgpu::PrimitiveTopology), RenderError> {
     let count = primitive_vertex_count(command.primitive, command.primitive_count)?;
@@ -387,21 +387,42 @@ fn fetch_element(
     index: u32,
 ) -> Result<[f32; 4], RenderError> {
     let data = stream_for(command, stream as u32)?;
-    let base = (index as usize)
-        .checked_mul(data.stride as usize)
-        .and_then(|v| v.checked_add(data.offset as usize))
-        .and_then(|v| v.checked_add(offset as usize))
-        .ok_or_else(|| invalid("Draw", "vertex offset overflow"))?;
     let size = element_size(element_type)
         .ok_or_else(|| unsupported("Draw", "unsupported vertex element type"))?
         as usize;
+    expand_element(
+        element_type,
+        vertex_element_bytes(
+            &data.bytes,
+            data.stride,
+            data.offset,
+            u64::from(offset),
+            size,
+            index,
+        )?,
+    )
+}
+
+pub(crate) fn vertex_element_bytes(
+    bytes: &[u8],
+    stride: u32,
+    stream_offset: u32,
+    offset: u64,
+    size: usize,
+    index: u32,
+) -> Result<&[u8], RenderError> {
+    let base = (index as usize)
+        .checked_mul(stride as usize)
+        .and_then(|v| v.checked_add(stream_offset as usize))
+        .and_then(|v| v.checked_add(offset as usize))
+        .ok_or_else(|| invalid("Draw", "vertex offset overflow"))?;
     let end = base
         .checked_add(size)
         .ok_or_else(|| invalid("Draw", "vertex offset overflow"))?;
-    if end > data.bytes.len() {
+    if end > bytes.len() {
         return Err(invalid("Draw", "vertex fetch is outside the stream"));
     }
-    expand_element(element_type, &data.bytes[base..end])
+    Ok(&bytes[base..end])
 }
 
 fn canonical_shader_vertices(
