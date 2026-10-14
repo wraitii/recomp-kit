@@ -365,9 +365,10 @@ static bool parse_dib(uint32_t at, uint32_t bytes, Dib *out, uint32_t pixel_offs
     *out = d;
     return true;
 }
-bool gdi_decode_image(uint32_t at, uint32_t bytes, GdiImage *image, uint32_t pixel_offset) {
+bool gdi_decode_image(uint32_t at, uint32_t bytes, GdiImage *image, uint32_t pixel_offset,
+                      bool preserve_alpha) {
     Dib d;
-    return parse_dib(at, bytes, &d, pixel_offset) && snapshot_dib(d, image);
+    return parse_dib(at, bytes, &d, pixel_offset) && snapshot_dib(d, image, preserve_alpha);
 }
 // LoadImage(LR_CREATEDIBSECTION) and CreateDIBSection expose the source DIB's
 // own bit depth and row order. Keep them: the font loader reads the pixel

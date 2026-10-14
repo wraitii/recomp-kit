@@ -374,6 +374,107 @@ void deliver_pending_input() {
 // the selected game profile.
 // ---------------------------------------------------------------------------
 bool g_pointer_hidden = false;
+bool g_guest_cursor_visible = true;
+uint64_t g_cursor_revision = 0, g_cursor_started = 0;
+HostCursor g_guest_cursor;
+std::vector<SDL_Cursor *> g_native_cursors;
+size_t g_cursor_step = SIZE_MAX;
+
+void update_native_cursor() {
+    if (!SDL_IsMainThread())
+        return;
+    if (host_cursor_snapshot(&g_cursor_revision, &g_guest_cursor)) {
+        SDL_SetCursor(SDL_GetDefaultCursor());
+        for (SDL_Cursor *cursor : g_native_cursors)
+            SDL_DestroyCursor(cursor);
+        g_native_cursors.clear();
+        g_guest_cursor_visible = g_guest_cursor.visible;
+        g_cursor_started = SDL_GetTicksNS();
+        g_cursor_step = SIZE_MAX;
+        for (const auto &frame : g_guest_cursor.frames) {
+            SDL_Surface *surface =
+                SDL_CreateSurfaceFrom(frame.width, frame.height, SDL_PIXELFORMAT_ARGB8888,
+                                      const_cast<uint32_t *>(frame.pixels.data()), frame.width * 4);
+            SDL_Cursor *cursor =
+                surface ? SDL_CreateColorCursor(surface, frame.hot_x, frame.hot_y) : nullptr;
+            SDL_DestroySurface(surface);
+            if (!cursor) {
+                fprintf(stderr, "[host] native cursor creation failed: %s\n", SDL_GetError());
+                abort();
+            }
+            g_native_cursors.push_back(cursor);
+        }
+        if (g_native_cursors.empty() && g_guest_cursor.handle) {
+            SDL_SystemCursor type;
+            switch (g_guest_cursor.handle) {
+            case 0x2af00:
+                type = SDL_SYSTEM_CURSOR_DEFAULT;
+                break;
+            case 0x2af01:
+                type = SDL_SYSTEM_CURSOR_TEXT;
+                break;
+            case 0x2af02:
+                type = SDL_SYSTEM_CURSOR_WAIT;
+                break;
+            case 0x2af03:
+                type = SDL_SYSTEM_CURSOR_CROSSHAIR;
+                break;
+            case 0x2af80:
+                type = SDL_SYSTEM_CURSOR_NWSE_RESIZE;
+                break;
+            case 0x2af81:
+                type = SDL_SYSTEM_CURSOR_NESW_RESIZE;
+                break;
+            case 0x2af82:
+                type = SDL_SYSTEM_CURSOR_EW_RESIZE;
+                break;
+            case 0x2af83:
+                type = SDL_SYSTEM_CURSOR_NS_RESIZE;
+                break;
+            case 0x2af84:
+                type = SDL_SYSTEM_CURSOR_MOVE;
+                break;
+            case 0x2af88:
+                type = SDL_SYSTEM_CURSOR_NOT_ALLOWED;
+                break;
+            case 0x2af89:
+                type = SDL_SYSTEM_CURSOR_POINTER;
+                break;
+            case 0x2af8a:
+                type = SDL_SYSTEM_CURSOR_PROGRESS;
+                break;
+            default:
+                fprintf(stderr, "[host] unsupported native cursor handle %08x\n",
+                        g_guest_cursor.handle);
+                abort();
+            }
+            SDL_Cursor *cursor = SDL_CreateSystemCursor(type);
+            if (!cursor) {
+                fprintf(stderr, "[host] system cursor creation failed: %s\n", SDL_GetError());
+                abort();
+            }
+            g_native_cursors.push_back(cursor);
+            g_guest_cursor.sequence = {0};
+            g_guest_cursor.rates = {1};
+        }
+    }
+    if (g_native_cursors.empty())
+        return;
+    uint64_t total = 0;
+    for (uint32_t rate : g_guest_cursor.rates)
+        total += rate;
+    uint64_t tick = ((SDL_GetTicksNS() - g_cursor_started) * 60 / 1000000000) % total;
+    size_t step = 0;
+    while (tick >= g_guest_cursor.rates[step])
+        tick -= g_guest_cursor.rates[step++];
+    if (step != g_cursor_step) {
+        if (!SDL_SetCursor(g_native_cursors[g_guest_cursor.sequence[step]])) {
+            fprintf(stderr, "[host] native cursor selection failed: %s\n", SDL_GetError());
+            abort();
+        }
+        g_cursor_step = step;
+    }
+}
 bool g_relative_mouse = false;
 // Preserve each game's prior capture mode explicitly instead of inferring it
 // from a private guest cursor hook.
@@ -456,12 +557,14 @@ void update_platform_pointer_capture() {
         g_pointer_sample_valid = false;
         fprintf(stderr, "[host] relative mouse capture: %s\n", relative ? "ON" : "OFF");
     }
-    if (want && !g_pointer_hidden) {
+    const bool hide = (want && kRelativeMouseCapture) ||
+                      (g_focused && !g_guest_cursor_visible && !mods_page_visible());
+    if (hide && !g_pointer_hidden) {
         trace_state("capture ON: hiding the OS cursor");
         SDL_HideCursor();
         g_pointer_hidden = true;
     }
-    if (!want && g_pointer_hidden) {
+    if (!hide && g_pointer_hidden) {
         trace_state("capture OFF: showing the OS cursor");
         SDL_ShowCursor();
         g_pointer_hidden = false;
@@ -1544,6 +1647,8 @@ void pump() {
     service(0.0);
     after_events();
     host_input_script_tick(host_present_count());
+    update_native_cursor();
+    update_platform_pointer_capture();
 
     // A bounded run for automated verification: the same MAX_FRAMES /
     // MAX_SECONDS the headless host honours. Unset, this is two comparisons
@@ -2061,7 +2166,12 @@ int main(int argc, char **argv) {
     report(stdout, false);
     boot_report_unlock();
     // Whatever else happens, the user gets their cursor back.
+    g_guest_cursor_visible = true;
     apply_pointer_capture(false);
+    SDL_SetCursor(SDL_GetDefaultCursor());
+    for (SDL_Cursor *cursor : g_native_cursors)
+        SDL_DestroyCursor(cursor);
+    g_native_cursors.clear();
     SDL_HideWindow(g_window);
     gpu::release_window_surface(g_surface);
     SDL_DestroyWindow(g_window);

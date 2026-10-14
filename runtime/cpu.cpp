@@ -76,6 +76,78 @@ int32_t module_index(const RecompModule *m, uint32_t target) {
     }
     return (lo < m->func_count && m->func_addrs[lo] == target) ? (int32_t)lo : -1;
 }
+bool module_is_call_return(const RecompModule *m, uint32_t target) {
+    uint32_t lo = 0, hi = m->call_return_count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (m->call_returns[mid] < target)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo < m->call_return_count && m->call_returns[lo] == target;
+}
+
+// Module entry and call-return lookups repeat a small set of targets, so a
+// direct-mapped cache fronts the containing scan and the binary searches, as
+// recomp_lookup_cache does for the main image. Each slot packs the target in
+// the high word and a module number plus payload in the low word; zero is
+// empty, kNoModule means no module owns the target.
+const uint32_t kModuleCacheSize = 1u << 16;
+const uint32_t kNoModule = 31u;
+uint64_t g_module_entry_cache[kModuleCacheSize];
+uint64_t g_module_return_cache[kModuleCacheSize];
+uint32_t g_module_cache_slot(uint32_t target) {
+    return (uint32_t)(target * 2654435761u) >> 16;
+}
+uint32_t module_position(const RecompModule *m) {
+    const std::vector<const RecompModule *> &v = modules();
+    for (uint32_t i = 0; i < v.size(); ++i)
+        if (v[i] == m)
+            return i;
+    return kNoModule;
+}
+struct ModuleEntry {
+    const RecompModule *module;
+    int32_t index;
+};
+ModuleEntry module_entry(uint32_t target) {
+    uint32_t slot = g_module_cache_slot(target);
+    uint64_t e = __atomic_load_n(&g_module_entry_cache[slot], __ATOMIC_ACQUIRE);
+    if ((uint32_t)(e >> 32) == target && (uint32_t)e) {
+        uint32_t low = (uint32_t)e;
+        uint32_t mod = low >> 27;
+        if (mod == kNoModule)
+            return {nullptr, -1};
+        return {modules()[mod - 1], (int32_t)((low & 0x07ffffffu) - 1)};
+    }
+    const RecompModule *m = recomp_module_containing(target);
+    int32_t idx = m ? module_index(m, target) : -1;
+    uint32_t pos = m ? module_position(m) : kNoModule;
+    if ((!m || pos + 1 < kNoModule) && (uint32_t)(idx + 1) < (1u << 27)) {
+        uint32_t mod = m ? pos + 1 : kNoModule;
+        uint32_t low = (mod << 27) | (uint32_t)(idx + 1);
+        __atomic_store_n(&g_module_entry_cache[slot], ((uint64_t)target << 32) | low,
+                         __ATOMIC_RELEASE);
+    }
+    return {m, idx};
+}
+bool module_call_return(uint32_t target) {
+    uint32_t slot = g_module_cache_slot(target);
+    uint64_t e = __atomic_load_n(&g_module_return_cache[slot], __ATOMIC_ACQUIRE);
+    if ((uint32_t)(e >> 32) == target && (uint32_t)e)
+        return (uint32_t)e & 1u;
+    const RecompModule *m = recomp_module_containing(target);
+    bool ret = m && module_is_call_return(m, target);
+    uint32_t pos = m ? module_position(m) : kNoModule;
+    if (!m || pos < kNoModule) {
+        uint32_t mod = m ? pos + 1 : kNoModule;
+        __atomic_store_n(&g_module_return_cache[slot],
+                         ((uint64_t)target << 32) | (mod << 1) | (ret ? 1u : 0u), __ATOMIC_RELEASE);
+    }
+    return ret;
+}
+const RecompModule *g_last_module = nullptr;
 } // namespace
 
 extern "C" {
@@ -106,36 +178,28 @@ const RecompModule *recomp_module_named(const char *name) {
     return nullptr;
 }
 const RecompModule *recomp_module_containing(uint32_t addr) {
-    for (const RecompModule *m : modules())
-        if (addr >= m->base && addr < m->end)
-            return m;
+    const RecompModule *m = __atomic_load_n(&g_last_module, __ATOMIC_RELAXED);
+    if (m && addr >= m->base && addr < m->end)
+        return m;
+    for (const RecompModule *c : modules())
+        if (addr >= c->base && addr < c->end) {
+            __atomic_store_n(&g_last_module, c, __ATOMIC_RELAXED);
+            return c;
+        }
     return nullptr;
 }
 int32_t recomp_module_lookup(uint32_t target) {
-    const RecompModule *m = recomp_module_containing(target);
-    return m ? module_index(m, target) : -1;
+    return module_entry(target).index;
 }
 int recomp_module_is_call_return(uint32_t target) {
-    const RecompModule *m = recomp_module_containing(target);
-    if (!m)
-        return 0;
-    uint32_t lo = 0, hi = m->call_return_count;
-    while (lo < hi) {
-        uint32_t mid = lo + (hi - lo) / 2;
-        if (m->call_returns[mid] < target)
-            lo = mid + 1;
-        else
-            hi = mid;
-    }
-    return lo < m->call_return_count && m->call_returns[lo] == target;
+    return module_call_return(target) ? 1 : 0;
 }
 int recomp_module_call(X86 *c, uint32_t target) {
-    const RecompModule *m = recomp_module_containing(target);
-    if (!m)
+    ModuleEntry e = module_entry(target);
+    if (!e.module || e.index < 0)
         return 0;
-    int32_t i = module_index(m, target);
-    if (i < 0)
-        return 0;
+    const RecompModule *m = e.module;
+    int32_t i = e.index;
     recomp_execution_checkpoint(c);
 #ifdef RECOMP_NO_HOOKS
     m->base_ptrs[i](c);
@@ -236,8 +300,8 @@ void recomp_unknown_call(X86 *c, uint32_t target) {
                      "EBP=%08x chain:%s self_vt=%08x obj_vt=%08x self_flags=%08x "
                      "self_20=%08x FS:[0]=%08x): raising an access violation, as Windows "
                      "would, for the guest's handlers",
-                     target, ret, c->r[R_EAX], c->r[R_ECX], c->r[R_EDX], c->r[R_ESI],
-                     c->r[R_EDI], c->r[R_EBP], chain.c_str(), self_vt, obj_vt,
+                     target, ret, c->r[R_EAX], c->r[R_ECX], c->r[R_EDX], c->r[R_ESI], c->r[R_EDI],
+                     c->r[R_EBP], chain.c_str(), self_vt, obj_vt,
                      gm_valid(self + 8, 4) ? rd32(self + 8) : 0u,
                      gm_valid(self + 0x20, 4) ? rd32(self + 0x20) : 0u,
                      c->fs_base && gm_valid(c->fs_base, 4) ? rd32(c->fs_base) : 0u);

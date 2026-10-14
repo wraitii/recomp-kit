@@ -2530,7 +2530,7 @@ pub fn d3d9_available_texture_mem(device: &D3d9Device) -> ValueResult {
     match gpu.available_texture_mem_bytes() {
         Ok(bytes) => {
             let mb = bytes.saturating_add(MB / 2) / MB;
-            let mb = mb.min(u32::MAX as u64 / MB);
+            let mb = mb.min(i32::MAX as u64 / MB);
             ValueResult {
                 status: status(StatusCode::Ok, ""),
                 value: (mb * MB) as u32,

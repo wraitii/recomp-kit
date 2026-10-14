@@ -313,16 +313,120 @@ uint32_t gm_put_wstr(uint32_t a, const std::string &s, uint32_t cap) {
 namespace {
 
 struct Blk {
+    uint32_t addr; // block start
     uint32_t size; // rounded, multiple of 16
     uint32_t req;  // bytes the guest asked for
     bool used;
+    bool listed;      // in the free index
+    Blk *prev, *next; // address order
 };
 
-// Every block in address order, plus an index of just the free ones so that
-// first fit walks free blocks instead of the whole heap.
-std::map<uint32_t, Blk> *g_blocks = nullptr;
+// Every block is a node in an address-ordered list, with an open-addressing
+// hash for lookup and a set of just the free ones so first fit walks free
+// blocks instead of the whole heap.
+Blk *g_block_head = nullptr, *g_block_tail = nullptr;
+std::vector<Blk *> g_block_slots;
+size_t g_block_live = 0, g_block_tombs = 0;
+Blk *g_node_pool = nullptr;
+const Blk *kHashTomb = (const Blk *)1;
 std::set<uint32_t> *g_free = nullptr;
 uint64_t g_total_allocs = 0, g_total_frees = 0;
+
+uint32_t block_bucket(uint32_t addr, size_t cap) {
+    return (uint32_t)((addr >> 4) * 2654435761u) & (uint32_t)(cap - 1);
+}
+Blk *find_block(uint32_t addr) {
+    size_t cap = g_block_slots.size();
+    if (!cap)
+        return nullptr;
+    for (uint32_t i = block_bucket(addr, cap);;) {
+        Blk *n = g_block_slots[i];
+        if (!n)
+            return nullptr;
+        if (n != kHashTomb && n->addr == addr)
+            return n;
+        i = (i + 1) & (uint32_t)(cap - 1);
+    }
+}
+void block_rehash(size_t cap) {
+    g_block_slots.assign(cap, nullptr);
+    g_block_live = g_block_tombs = 0;
+    for (Blk *n = g_block_head; n; n = n->next) {
+        uint32_t i = block_bucket(n->addr, cap);
+        while (g_block_slots[i])
+            i = (i + 1) & (uint32_t)(cap - 1);
+        g_block_slots[i] = n;
+        ++g_block_live;
+    }
+}
+void block_hash_put(Blk *n) {
+    size_t cap = g_block_slots.size();
+    uint32_t i = block_bucket(n->addr, cap);
+    while (g_block_slots[i] && g_block_slots[i] != kHashTomb)
+        i = (i + 1) & (uint32_t)(cap - 1);
+    if (g_block_slots[i] == kHashTomb)
+        --g_block_tombs;
+    g_block_slots[i] = n;
+    ++g_block_live;
+}
+void block_hash_del(Blk *n) {
+    size_t cap = g_block_slots.size();
+    uint32_t i = block_bucket(n->addr, cap);
+    while (g_block_slots[i] != n)
+        i = (i + 1) & (uint32_t)(cap - 1);
+    g_block_slots[i] = (Blk *)kHashTomb;
+    --g_block_live;
+    ++g_block_tombs;
+}
+Blk *block_new(uint32_t addr, uint32_t size, uint32_t req, bool used) {
+    Blk *n = g_node_pool;
+    if (n)
+        g_node_pool = n->next;
+    else
+        n = new Blk();
+    n->addr = addr;
+    n->size = size;
+    n->req = req;
+    n->used = used;
+    n->listed = !used;
+    n->prev = n->next = nullptr;
+    return n;
+}
+Blk *block_add(Blk *at, uint32_t addr, uint32_t size, uint32_t req, bool used) {
+    Blk *n = block_new(addr, size, req, used);
+    size_t cap = g_block_slots.size();
+    if (!cap || (g_block_live + g_block_tombs + 1) * 4 > cap * 3)
+        block_rehash(cap ? cap * 2 : 256);
+    n->prev = at;
+    n->next = at ? at->next : g_block_head;
+    if (n->prev)
+        n->prev->next = n;
+    else
+        g_block_head = n;
+    if (n->next)
+        n->next->prev = n;
+    else
+        g_block_tail = n;
+    block_hash_put(n);
+    if (n->listed)
+        g_free->insert(addr);
+    return n;
+}
+void block_remove(Blk *n) {
+    if (n->listed)
+        g_free->erase(n->addr);
+    if (n->prev)
+        n->prev->next = n->next;
+    else
+        g_block_head = n->next;
+    if (n->next)
+        n->next->prev = n->prev;
+    else
+        g_block_tail = n->prev;
+    block_hash_del(n);
+    n->next = g_node_pool;
+    g_node_pool = n;
+}
 
 // Optional per-allocation tracing (RECOMP_HEAP_TRACE=1): remembers the guest
 // site and requested size of every live block so the out-of-memory dump can
@@ -419,20 +523,6 @@ inline bool size_is_sane(uint32_t size) {
     return size <= HEAP_ARENA_BYTES;
 }
 
-// Records a block, keeping the free index in step.
-void put_block(uint32_t addr, uint32_t size, uint32_t req, bool used) {
-    (*g_blocks)[addr] = Blk{size, req, used};
-    if (used)
-        g_free->erase(addr);
-    else
-        g_free->insert(addr);
-}
-
-void drop_block(std::map<uint32_t, Blk>::iterator it) {
-    g_free->erase(it->first);
-    g_blocks->erase(it);
-}
-
 // Optional redzones (RECOMP_HEAP_CANARY=1, =2 aborts on the first hit). Every
 // block is over-allocated by at least 16 bytes and the bytes between the
 // requested size and the end of the block are filled with a pattern. A guest
@@ -523,13 +613,13 @@ void poison_check(uint32_t addr, const Blk &b, const char *when) {
         abort();
 }
 void canary_sweep(const char *when) {
-    for (auto &kv : *g_blocks)
-        if (kv.second.used)
-            canary_check(kv.first, kv.second, when);
+    for (Blk *b = g_block_head; b; b = b->next)
+        if (b->used)
+            canary_check(b->addr, *b, when);
     for (uint32_t a : g_held) {
-        auto it = g_blocks->find(a);
-        if (it != g_blocks->end())
-            poison_check(a, it->second, when);
+        Blk *b = find_block(a);
+        if (b)
+            poison_check(a, *b, when);
     }
 }
 void canary_tick() {
@@ -540,8 +630,6 @@ void canary_tick() {
 }
 
 void heap_reset() {
-    if (!g_blocks)
-        g_blocks = new std::map<uint32_t, Blk>();
     if (!g_free)
         g_free = new std::set<uint32_t>();
     if (!g_live)
@@ -562,10 +650,17 @@ void heap_reset() {
     g_held_bytes = 0;
     g_free_site.clear();
     g_live->clear();
-    g_blocks->clear();
     g_free->clear();
-    g_live->clear();
-    put_block(HEAP_BASE, HEAP_LIMIT - HEAP_BASE, 0, false);
+    g_block_slots.clear();
+    g_block_live = g_block_tombs = 0;
+    while (g_block_head) {
+        Blk *n = g_block_head;
+        g_block_head = n->next;
+        n->next = g_node_pool;
+        g_node_pool = n;
+    }
+    g_block_tail = nullptr;
+    block_add(nullptr, HEAP_BASE, HEAP_LIMIT - HEAP_BASE, 0, false);
     g_total_allocs = g_total_frees = 0;
 }
 
@@ -624,10 +719,19 @@ void mem_shutdown() {
         os_vm_release(g_mem, GUEST_SIZE);
         g_mem = nullptr;
     }
-    if (g_blocks) {
-        delete g_blocks;
-        g_blocks = nullptr;
+    while (g_block_head) {
+        Blk *n = g_block_head;
+        g_block_head = n->next;
+        delete n;
     }
+    g_block_tail = nullptr;
+    while (g_node_pool) {
+        Blk *n = g_node_pool;
+        g_node_pool = n->next;
+        delete n;
+    }
+    g_block_slots.clear();
+    g_block_live = g_block_tombs = 0;
     if (g_free) {
         delete g_free;
         g_free = nullptr;
@@ -639,7 +743,7 @@ void mem_shutdown() {
 }
 
 uint32_t heap_alloc(uint32_t size, bool zero, uint32_t align) {
-    if (!g_blocks)
+    if (!g_free || !g_block_head)
         return 0;
     if (!size_is_sane(size)) {
         LOGW("heap_alloc: refusing a %u byte request, the arena is %u bytes", size,
@@ -673,11 +777,11 @@ uint32_t heap_alloc(uint32_t size, bool zero, uint32_t align) {
         align = 16;
     uint32_t need = align_up((size ? size : 1) + canary_pad(), 16);
 
-    for (uint32_t start : *g_free) {
-        auto it = g_blocks->find(start);
-        if (it == g_blocks->end() || it->second.used)
+    for (auto fit = g_free->begin(); fit != g_free->end(); ++fit) {
+        Blk *b = find_block(*fit);
+        if (!b || b->used || !b->listed)
             continue; // index out of step
-        uint32_t len = it->second.size;
+        uint32_t start = b->addr, len = b->size;
         uint32_t user = align_up(start, align);
         if (user < start)
             continue; // overflow
@@ -686,17 +790,18 @@ uint32_t heap_alloc(uint32_t size, bool zero, uint32_t align) {
             continue; // does not fit
 
         uint32_t tail = len - pad - need;
-        drop_block(it);
+        Blk *at = b->prev;
+        block_remove(b);
         if (pad)
-            put_block(start, pad, 0, false);
-        put_block(user, need, size, true);
+            at = block_add(at, start, pad, 0, false);
+        Blk *used_block = block_add(at, user, need, size, true);
         if (tail)
-            put_block(user + need, tail, 0, false);
+            block_add(used_block, user + need, tail, 0, false);
         if (zero)
             memset(g_mem + user, 0, need);
         ++g_total_allocs;
         live_set(user, heap_site(), size);
-        canary_fill(user, (*g_blocks)[user]);
+        canary_fill(user, *used_block);
         canary_tick();
         return user;
     }
@@ -716,47 +821,38 @@ uint32_t heap_alloc(uint32_t size, bool zero, uint32_t align) {
 }
 
 bool heap_owns(uint32_t addr) {
-    if (!g_blocks)
-        return false;
-    auto it = g_blocks->find(addr);
-    return it != g_blocks->end() && it->second.used;
+    Blk *b = find_block(addr);
+    return b && b->used;
 }
 
 uint32_t heap_size(uint32_t addr) {
-    if (!g_blocks)
+    Blk *b = find_block(addr);
+    if (!b || !b->used)
         return 0xffffffffu;
-    auto it = g_blocks->find(addr);
-    if (it == g_blocks->end() || !it->second.used)
-        return 0xffffffffu;
-    return it->second.req;
+    return b->req;
 }
 
 // Returns a freed block to the free list and merges it with free neighbours.
-static void release_free_block(std::map<uint32_t, Blk>::iterator it) {
-    g_free->insert(it->first);
+static void release_free_block(Blk *b) {
+    b->used = false;
+    b->listed = true;
+    g_free->insert(b->addr);
     // Merge only with blocks on the free list: a quarantined block is free but held.
-    // Coalesce with the following block.
-    auto next = std::next(it);
-    if (next != g_blocks->end() && g_free->count(next->first) &&
-        next->first == it->first + it->second.size) {
-        it->second.size += next->second.size;
-        drop_block(next);
+    Blk *next = b->next;
+    if (next && !next->used && next->listed && next->addr == b->addr + b->size) {
+        b->size += next->size;
+        block_remove(next);
     }
-    // Coalesce with the preceding block.
-    if (it != g_blocks->begin()) {
-        auto prev = std::prev(it);
-        if (g_free->count(prev->first) && prev->first + prev->second.size == it->first) {
-            prev->second.size += it->second.size;
-            drop_block(it);
-        }
+    Blk *prev = b->prev;
+    if (prev && !prev->used && prev->listed && prev->addr + prev->size == b->addr) {
+        prev->size += b->size;
+        block_remove(b);
     }
 }
 
 bool heap_free(uint32_t addr) {
-    if (!g_blocks || !addr)
-        return false;
-    auto it = g_blocks->find(addr);
-    if (it == g_blocks->end() || !it->second.used) {
+    Blk *b = addr ? find_block(addr) : nullptr;
+    if (!b || !b->used) {
         LOGW("heap_free: %08x is not a live allocation", addr);
         if (g_canary) {
             auto fs = g_free_site.find(addr);
@@ -774,10 +870,10 @@ bool heap_free(uint32_t addr) {
         }
         return false;
     }
-    canary_check(addr, it->second, "free");
+    canary_check(addr, *b, "free");
     g_canary_reported.erase(addr);
-    it->second.used = false;
-    it->second.req = 0;
+    b->used = false;
+    b->req = 0;
     ++g_total_frees;
     live_erase(addr);
     canary_tick();
@@ -798,27 +894,27 @@ bool heap_free(uint32_t addr) {
             return (uint64_t)(e ? strtoul(e, nullptr, 0) : 48ul) << 20;
         }();
         if (g_canary) {
-            memset(g_mem + addr, POISON_BYTE, it->second.size);
+            memset(g_mem + addr, POISON_BYTE, b->size);
             const X86 *c = guest_current_context();
             g_free_site[addr] = c ? c->eip : 0;
         }
         g_held.push_back(addr);
-        g_held_bytes += it->second.size;
+        g_held_bytes += b->size;
         while (g_held_bytes > budget && !g_held.empty()) {
             uint32_t old = g_held.front();
             g_held.pop_front();
-            auto oit = g_blocks->find(old);
-            if (oit == g_blocks->end() || oit->second.used)
+            Blk *oit = find_block(old);
+            if (!oit || oit->used)
                 continue;
-            poison_check(old, oit->second, "release");
+            poison_check(old, *oit, "release");
             g_free_site.erase(old);
             g_canary_reported.erase(old);
-            g_held_bytes -= oit->second.size;
+            g_held_bytes -= oit->size;
             release_free_block(oit);
         }
         return true;
     }
-    release_free_block(it);
+    release_free_block(b);
     return true;
 }
 
@@ -827,61 +923,60 @@ bool heap_free(uint32_t addr) {
 uint32_t heap_realloc(uint32_t addr, uint32_t new_size, bool zero) {
     if (!addr)
         return heap_alloc(new_size, zero);
-    if (!g_blocks)
+    if (!g_free)
         return 0;
     if (!size_is_sane(new_size)) {
         LOGW("heap_realloc: refusing a %u byte request, the arena is %u bytes", new_size,
              HEAP_ARENA_BYTES);
         return 0;
     }
-    auto it = g_blocks->find(addr);
-    if (it == g_blocks->end() || !it->second.used) {
+    Blk *b = find_block(addr);
+    if (!b || !b->used) {
         LOGW("heap_realloc: %08x is not a live allocation", addr);
         return 0;
     }
-    canary_check(addr, it->second, "realloc");
+    canary_check(addr, *b, "realloc");
     g_canary_reported.erase(addr);
-    uint32_t old_req = it->second.req;
+    uint32_t old_req = b->req;
     uint32_t need = align_up((new_size ? new_size : 1) + canary_pad(), 16);
-    uint32_t have = it->second.size;
+    uint32_t have = b->size;
 
     if (need <= have) {
         uint32_t tail = have - need;
         if (tail >= 16) {
-            it->second.size = need;
-            auto next = std::next(it);
-            if (next != g_blocks->end() && g_free->count(next->first) &&
-                next->first == addr + have) {
-                uint32_t merged = tail + next->second.size;
-                drop_block(next);
-                put_block(addr + need, merged, 0, false);
+            b->size = need;
+            Blk *next = b->next;
+            if (next && !next->used && next->listed && next->addr == addr + have) {
+                uint32_t merged = tail + next->size;
+                block_remove(next);
+                block_add(b, addr + need, merged, 0, false);
             } else {
-                put_block(addr + need, tail, 0, false);
+                block_add(b, addr + need, tail, 0, false);
             }
         }
-        it->second.req = new_size;
+        b->req = new_size;
         live_set(addr, heap_site(), new_size);
         if (zero && new_size > old_req)
             memset(g_mem + addr + old_req, 0, new_size - old_req);
-        canary_fill(addr, it->second);
+        canary_fill(addr, *b);
         return addr;
     }
 
     // Try to grow into a free neighbour.
-    auto next = std::next(it);
-    if (next != g_blocks->end() && g_free->count(next->first) && next->first == addr + have &&
-        have + next->second.size >= need) {
-        uint32_t total = have + next->second.size;
-        drop_block(next);
+    Blk *next = b->next;
+    if (next && !next->used && next->listed && next->addr == addr + have &&
+        have + next->size >= need) {
+        uint32_t total = have + next->size;
+        block_remove(next);
         uint32_t tail = total - need;
-        it->second.size = need;
-        it->second.req = new_size;
+        b->size = need;
+        b->req = new_size;
         live_set(addr, heap_site(), new_size);
         if (tail)
-            put_block(addr + need, tail, 0, false);
+            block_add(b, addr + need, tail, 0, false);
         if (zero)
             memset(g_mem + addr + old_req, 0, new_size - old_req);
-        canary_fill(addr, it->second);
+        canary_fill(addr, *b);
         return addr;
     }
 
@@ -900,18 +995,18 @@ HeapStats heap_stats() {
     HeapStats s{};
     s.total_allocs = g_total_allocs;
     s.total_frees = g_total_frees;
-    if (!g_blocks)
+    if (!g_free)
         return s;
-    for (auto &kv : *g_blocks) {
-        if (kv.second.used) {
+    for (Blk *b = g_block_head; b; b = b->next) {
+        if (b->used) {
             ++s.used_blocks;
-            s.used_bytes += kv.second.size;
-            s.req_bytes += kv.second.req;
+            s.used_bytes += b->size;
+            s.req_bytes += b->req;
         } else {
             ++s.free_blocks;
-            s.free_bytes += kv.second.size;
-            if (kv.second.size > s.largest_free)
-                s.largest_free = kv.second.size;
+            s.free_bytes += b->size;
+            if (b->size > s.largest_free)
+                s.largest_free = b->size;
         }
     }
     return s;
@@ -920,41 +1015,41 @@ HeapStats heap_stats() {
 // Check that the heap block map covers the arena without gaps, overlap or adjacent free blocks.
 // Return the first invariant failure, or an empty string when the allocation structure is consistent.
 std::string heap_check() {
-    if (!g_blocks)
+    if (!g_free)
         return "heap not initialised";
     uint32_t cursor = HEAP_BASE;
     bool prev_free = false;
     char buf[160];
-    for (auto &kv : *g_blocks) {
-        if (kv.first != cursor) {
-            snprintf(buf, sizeof buf, "gap or overlap at %08x (expected %08x)", kv.first, cursor);
+    for (Blk *b = g_block_head; b; b = b->next) {
+        if (b->addr != cursor) {
+            snprintf(buf, sizeof buf, "gap or overlap at %08x (expected %08x)", b->addr, cursor);
             return buf;
         }
-        if (kv.second.size == 0 || (kv.second.size & 15)) {
-            snprintf(buf, sizeof buf, "block %08x has bad size %u", kv.first, kv.second.size);
+        if (b->size == 0 || (b->size & 15)) {
+            snprintf(buf, sizeof buf, "block %08x has bad size %u", b->addr, b->size);
             return buf;
         }
-        if (!kv.second.used && prev_free) {
-            snprintf(buf, sizeof buf, "adjacent free blocks at %08x", kv.first);
+        if (!b->used && prev_free) {
+            snprintf(buf, sizeof buf, "adjacent free blocks at %08x", b->addr);
             return buf;
         }
-        prev_free = !kv.second.used;
-        cursor += kv.second.size;
+        prev_free = !b->used;
+        cursor += b->size;
     }
     if (cursor != HEAP_LIMIT) {
         snprintf(buf, sizeof buf, "heap ends at %08x, expected %08x", cursor, HEAP_LIMIT);
         return buf;
     }
     for (uint32_t a : *g_free) {
-        auto it = g_blocks->find(a);
-        if (it == g_blocks->end() || it->second.used) {
+        Blk *b = find_block(a);
+        if (!b || b->used || !b->listed) {
             snprintf(buf, sizeof buf, "free index holds %08x, which is not a free block", a);
             return buf;
         }
     }
     size_t free_count = 0;
-    for (auto &kv : *g_blocks)
-        if (!kv.second.used)
+    for (Blk *b = g_block_head; b; b = b->next)
+        if (!b->used)
             ++free_count;
     if (free_count != g_free->size()) {
         snprintf(buf, sizeof buf, "free index has %zu entries, the heap has %zu free blocks",

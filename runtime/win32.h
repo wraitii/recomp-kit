@@ -473,6 +473,25 @@ bool host_window_visible(uint32_t hwnd);
 X86 *guest_current_context();
 uint32_t guest_current_thread_id();
 bool host_cursor_visible();
+struct HostCursorFrame {
+    int width = 0, height = 0, hot_x = 0, hot_y = 0;
+    std::vector<uint32_t> pixels;
+};
+struct HostCursor {
+    uint32_t handle = 0;
+    bool visible = true;
+    std::vector<HostCursorFrame> frames;
+    std::vector<uint32_t> sequence, rates;
+};
+bool host_cursor_snapshot(uint64_t *revision, HostCursor *cursor);
+void win32_cursor_changed();
+uint32_t win32_load_cursor_file(X86 *c, const std::string &name);
+void win32_cursor_from_icon(uint32_t handle, uint32_t hot_x, uint32_t hot_y);
+struct GdiImage;
+bool win32_read_cursor(uint32_t handle, GdiImage *image, uint32_t *hot_x = nullptr,
+                       uint32_t *hot_y = nullptr);
+void win32_copy_cursor(uint32_t source, uint32_t destination, int width = 0, int height = 0);
+void win32_delete_cursor(uint32_t handle);
 bool host_cursor_clip(int32_t out[4]);
 
 // Calls the window's WNDPROC through recomp_call.

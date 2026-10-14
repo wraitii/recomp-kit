@@ -84,6 +84,7 @@ struct Sample {
     int32_t channel = -1;
     RiffWave wave{};
     float volume01 = 1.0f, pan01 = 0.5f;
+    uint32_t reverb_dry = 0x3f800000, reverb_wet = 0;
     uint32_t loops = 1, remaining = 0;
     bool playing = false;
     uint32_t eos_cb = 0; // AIL_register_EOS_callback for a 2D sample
@@ -202,7 +203,8 @@ int32_t sample3d_pan_mb(const Sample &s) {
 }
 
 int sample_volume(const Sample &s) {
-    return driver_volume(s.driver, s.volume01 * (s.is_3d ? sample3d_distance_gain(s) : 1.0f));
+    return driver_volume(s.driver, s.volume01 * bits_to_float(s.reverb_dry) *
+                                       (s.is_3d ? sample3d_distance_gain(s) : 1.0f));
 }
 
 // Push a sample's current volume and pan to its host channel. A playing 3D
@@ -829,6 +831,32 @@ void ail_set_sample_volume_pan(X86 *c) {
     s->volume01 = v;
     s->pan01 = p;
     sample_apply_mix(*s);
+}
+
+void ail_set_sample_reverb_levels(X86 *c) {
+    Sample *s = sample_for(arg(c, 0));
+    if (!s)
+        return;
+    float dry = bits_to_float(arg(c, 1)), wet = bits_to_float(arg(c, 2));
+    if (!std::isfinite(dry) || dry < 0.0f || wet != 0.0f) {
+        LOGW("mss32: AIL_set_sample_reverb_levels unsupported sample=%08x dry=%g wet=%g", arg(c, 0),
+             dry, wet);
+        imports_unsupported(c);
+        return;
+    }
+    s->reverb_dry = arg(c, 1);
+    s->reverb_wet = arg(c, 2);
+    sample_apply_mix(*s);
+}
+
+void ail_sample_reverb_levels(X86 *c) {
+    Sample *s = sample_for(arg(c, 0));
+    if (!s)
+        return;
+    if (arg(c, 1))
+        wr32(arg(c, 1), s->reverb_dry);
+    if (arg(c, 2))
+        wr32(arg(c, 2), s->reverb_wet);
 }
 
 void ail_set_sample_playback_rate(X86 *c) {
@@ -1661,7 +1689,7 @@ const ImportShim g_mss32_shims[] = {
     AIL(sample_ms_position, 12, imports_unsupported),
     AIL(sample_playback_rate, 4, ail_sample_playback_rate),
     AIL(sample_position, 4, imports_unsupported),
-    AIL(sample_reverb_levels, 12, imports_unsupported),
+    AIL(sample_reverb_levels, 12, ail_sample_reverb_levels),
     AIL(sample_volume_pan, 12, ail_sample_volume_pan),
     AIL(service_stream, 8, ail_service_stream),
     AIL(set_3D_doppler_factor, 8, imports_unsupported),
@@ -1680,7 +1708,7 @@ const ImportShim g_mss32_shims[] = {
     AIL(set_sample_3D_position, 16, ail_set_sample_3D_position),
     AIL(set_sample_3D_velocity_vector, 16, imports_unsupported),
     AIL(set_sample_position, 8, imports_unsupported),
-    AIL(set_sample_reverb_levels, 12, imports_unsupported),
+    AIL(set_sample_reverb_levels, 12, ail_set_sample_reverb_levels),
     AIL(set_stream_ms_position, 8, imports_unsupported),
     AIL(stream_loop_count, 4, ail_stream_loop_count),
     AIL(stream_ms_position, 12, imports_unsupported),

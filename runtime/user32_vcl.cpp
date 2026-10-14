@@ -5,6 +5,7 @@
 #include "win32.h"
 #include "resources.h"
 #include "gdi_image.h"
+#include "../platform/os.h"
 #include <algorithm>
 #include <set>
 #include <vector>
@@ -115,8 +116,20 @@ void pump_mouse_input(X86 *c) {
     mouse_input.pop_front();
     uint32_t hwnd = find_window(capture) ? capture : mouse_window(0, input.x, input.y);
     auto *w = find_window(hwnd);
-    if (!w)
+    if (!w) {
+        if (recomp_env("TRACE_POINTER") && input.message != 0x200) {
+            LOGW("host mouse %04x screen=(%d,%d): no target window", input.message, input.x,
+                 input.y);
+            for (const auto &[handle, window] : windows()) {
+                int32_t x, y;
+                client_origin(handle, &x, &y);
+                LOGW("mouse window %08x parent=%08x visible=%d enabled=%d client=(%d,%d %dx%d)",
+                     handle, window.parent, window.visible, window.enabled, x, y, window.w,
+                     window.h);
+            }
+        }
         return;
+    }
     uint32_t top = hwnd;
     for (size_t n = 0; w->parent && n < windows().size(); ++n) {
         top = w->parent;
@@ -183,8 +196,9 @@ void pump_mouse_input(X86 *c) {
         previous.y = input.y;
         break;
     }
-    LOGV("host mouse %04x screen=(%d,%d) -> hwnd=%08x client=(%d,%d) mk=%x", input.message, input.x,
-         input.y, hwnd, int16_t(lp), int16_t(lp >> 16), input.mk);
+    if (recomp_env("TRACE_POINTER"))
+        LOGW("host mouse %04x screen=(%d,%d) -> hwnd=%08x client=(%d,%d) mk=%x", input.message,
+             input.x, input.y, hwnd, int16_t(lp), int16_t(lp >> 16), input.mk);
     queue().push_back(
         {hwnd, input.message, input.mk, lp, input.time, uint32_t(input.x), uint32_t(input.y)});
 }
@@ -1474,13 +1488,16 @@ void draw_icon_ex(X86 *c) {
 }
 void copy_icon(X86 *c) {
     GdiImage image;
-    set_eax(c, gdi_read_icon(arg(c, 0), &image) ? gdi_create_icon(image) : 0);
+    bool ok = win32_read_cursor(arg(c, 0), &image) || gdi_read_icon(arg(c, 0), &image);
+    uint32_t result = ok ? gdi_create_icon(image) : 0;
+    win32_copy_cursor(arg(c, 0), result);
+    set_eax(c, result);
 }
 void copy_image(X86 *c) {
     GdiImage image;
     uint32_t type = arg(c, 1);
-    bool ok =
-        type == 0 ? gdi_read_bitmap(arg(c, 0), &image, true) : gdi_read_icon(arg(c, 0), &image);
+    bool ok = type == 0 ? gdi_read_bitmap(arg(c, 0), &image, true)
+                        : win32_read_cursor(arg(c, 0), &image) || gdi_read_icon(arg(c, 0), &image);
     if (!ok || type > 2) {
         set_eax(c, 0);
         return;
@@ -1501,22 +1518,26 @@ void copy_image(X86 *c) {
                 image.pixels[size_t(int64_t(y) * image.height / h) * image.width +
                              int64_t(x) * image.width / w];
     uint32_t result = type == 0 ? gdi_image_bitmap(scaled) : gdi_create_icon(scaled);
+    if (type != 0)
+        win32_copy_cursor(arg(c, 0), result, w, h);
     if (result && (arg(c, 4) & 8)) {
         if (type == 0)
             gdi_delete_bitmap(arg(c, 0));
         else
-            gdi_delete_icon(arg(c, 0));
+            win32_delete_cursor(arg(c, 0));
     }
     set_eax(c, result);
 }
 void destroy_cursor(X86 *c) {
-    gdi_delete_icon(arg(c, 0));
+    win32_delete_cursor(arg(c, 0));
     set_eax(c, arg(c, 0) != 0);
 }
 void icon_info(X86 *c) {
     uint32_t p = arg(c, 1);
     GdiImage image;
-    if (!p || !gm_valid(p, 20) || !gdi_read_icon(arg(c, 0), &image)) {
+    uint32_t hot_x = 0, hot_y = 0;
+    bool cursor = win32_read_cursor(arg(c, 0), &image, &hot_x, &hot_y);
+    if (!p || !gm_valid(p, 20) || (!cursor && !gdi_read_icon(arg(c, 0), &image))) {
         set_eax(c, 0);
         return;
     }
@@ -1527,9 +1548,9 @@ void icon_info(X86 *c) {
         set_eax(c, 0);
         return;
     }
-    wr32(p, 1);
-    wr32(p + 4, 0);
-    wr32(p + 8, 0);
+    wr32(p, cursor ? 0 : 1);
+    wr32(p + 4, hot_x);
+    wr32(p + 8, hot_y);
     wr32(p + 12, mask);
     wr32(p + 16, bitmap);
     set_eax(c, 1);

@@ -15,7 +15,8 @@ bool gdi_draw_image(uint32_t dc, const GdiImage &image, int32_t x, int32_t y, in
                     int32_t height);
 // Decode a Windows DIB resource. BMP files may supply a pixel offset
 // relative to the DIB header; zero selects packed resource layout.
-bool gdi_decode_image(uint32_t dib, uint32_t bytes, GdiImage *image, uint32_t pixel_offset = 0);
+bool gdi_decode_image(uint32_t dib, uint32_t bytes, GdiImage *image, uint32_t pixel_offset = 0,
+                      bool preserve_alpha = false);
 // Create a bitmap that keeps a raw DIB's own bit depth, palette, bitfields and
 // row order, as LoadImage(LR_CREATEDIBSECTION)/CreateDIBSection do on Windows.
 // gdi_image_bitmap always yields 32-bpp; this keeps a 24-bpp source at 24-bpp.

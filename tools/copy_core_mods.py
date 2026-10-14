@@ -10,7 +10,7 @@ def copy_core_mods(game_dir, destination):
     if destination.exists():
         shutil.rmtree(destination)
     source = Path(game_dir) / "mods/core"
-    allowed = {".toml", ".json", ".lua", ".png", ".bmp", ".txt"}
+    allowed = {".toml", ".json", ".lua", ".png", ".bmp", ".txt", ".thm"}
     files = []
     for path in source.rglob("*") if source.exists() else []:
         if path.is_file() and not path.is_symlink() and path.suffix.lower() in allowed:

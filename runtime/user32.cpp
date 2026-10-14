@@ -1373,9 +1373,6 @@ void u_IsWindowUnicode(X86 *c) {
 // An icon or cursor assembled from bitmaps: a distinct handle, never drawn by
 // the host, which paints its own pointer.
 static uint32_t g_next_icon = 0x0002b000u;
-// A cursor loaded from a file is the same kind of handle: distinct, and never
-// drawn by the host. The file is not read - the host paints its own pointer -
-// but a readable path gets a handle so the guest's cursor bookkeeping works.
 // The update region is a flag here, so validating any rectangle validates
 // the window, and the update rectangle is the whole client while it is set.
 void u_ValidateRect(X86 *c) {
@@ -1411,7 +1408,10 @@ void u_GetUpdateRgn(X86 *c) {
     set_eax(c, pending ? 2 : 1); // SIMPLEREGION / NULLREGION
 }
 void u_LoadCursorFromFileW(X86 *c) {
-    set_eax(c, arg(c, 0) && gm_valid(arg(c, 0), 2) ? g_next_icon++ : 0);
+    set_eax(c, win32_load_cursor_file(c, gm_wstr(arg(c, 0))));
+}
+void u_LoadCursorFromFileA(X86 *c) {
+    set_eax(c, win32_load_cursor_file(c, gm_str(arg(c, 0))));
 }
 void u_CreateIconIndirect(X86 *c) {
     uint32_t info = arg(c, 0);
@@ -1424,13 +1424,16 @@ void u_CreateIconIndirect(X86 *c) {
                     if (mask.pixels[size_t(y) * mask.width + x] & 0xffffff)
                         image.pixels[size_t(y) * image.width + x] = 0;
         }
-        set_eax(c, gdi_create_icon(image));
+        uint32_t handle = gdi_create_icon(image);
+        if (!rd32(info))
+            win32_cursor_from_icon(handle, rd32(info + 4), rd32(info + 8));
+        set_eax(c, handle);
         return;
     }
     set_eax(c, arg(c, 0) ? g_next_icon++ : 0);
 }
 void u_DestroyIcon(X86 *c) {
-    gdi_delete_icon(arg(c, 0));
+    win32_delete_cursor(arg(c, 0));
     set_eax(c, arg(c, 0) ? 1 : 0);
 }
 void u_LoadIconA(X86 *c) {
@@ -1439,6 +1442,8 @@ void u_LoadIconA(X86 *c) {
 void u_SetCursor(X86 *c) {
     uint32_t prev = g_cursor;
     g_cursor = arg(c, 0);
+    if (g_cursor != prev)
+        win32_cursor_changed();
     set_eax(c, prev);
 }
 void u_SetCursorPos(X86 *c) {
@@ -1470,6 +1475,7 @@ void u_GetKeyState(X86 *c) {
 }
 void u_ShowCursor(X86 *c) {
     g_cursor_show += arg(c, 0) ? 1 : -1;
+    win32_cursor_changed();
     set_eax(c, (uint32_t)g_cursor_show);
 }
 
@@ -1689,7 +1695,7 @@ void win32_cover_display(X86 *c, uint32_t hwnd, uint32_t w, uint32_t h) {
     auto &saved = user32::covered_bounds();
     if (!saved.count(hwnd))
         saved[hwnd] = {win->x, win->y, win->w, win->h};
-    user32::set_window_pos(c, win, 0, 0, 0, int32_t(w), int32_t(h), 0x14 /* NOZORDER|NOACTIVATE */);
+    user32::set_window_pos(c, win, 0, 0, 0, int32_t(w), int32_t(h), 0x54);
 }
 bool win32_top_level(uint32_t hwnd) {
     auto *win = user32::find_window(hwnd);
@@ -2034,7 +2040,7 @@ const ImportShim g_user32_shims[] = {
     {"USER32.dll", "GetUpdateRect", 3, u_GetUpdateRect},
     {"USER32.dll", "GetUpdateRgn", 3, u_GetUpdateRgn},
     {"USER32.dll", "GetScrollBarInfo", 3, nullptr},
-    {"USER32.dll", "LoadCursorFromFileA", 1, u_LoadCursorFromFileW},
+    {"USER32.dll", "LoadCursorFromFileA", 1, u_LoadCursorFromFileA},
     {"USER32.dll", "LoadCursorFromFileW", 1, u_LoadCursorFromFileW},
     {"USER32.dll", "CreateIconIndirect", 1, u_CreateIconIndirect},
     {"USER32.dll", "ScreenToClient", 2, u_ScreenToClient},

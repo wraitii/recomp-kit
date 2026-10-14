@@ -615,8 +615,9 @@ bool mods_load_all() {
                     continue;
                 }
                 if (m.api != POP_MOD_API_VERSION) {
-                    rejected.push_back(
-                        {m.id, "api " + std::to_string(m.api) + " is not this host's api 1"});
+                    rejected.push_back({m.id, "api " + std::to_string(m.api) +
+                                                  " is not this host's api " +
+                                                  std::to_string(POP_MOD_API_VERSION)});
                     continue;
                 }
                 std::string want = mods_symbols_exe_sha256();
