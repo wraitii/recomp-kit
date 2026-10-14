@@ -404,6 +404,14 @@ class Translator(ControlFlow):
             L.append(write_op(dst, 32, addr_expr(src)))
             return L
 
+        if m in ("LDS", "LES"):
+            dst, src = ops
+            if src.kind != "mem" or dst.size != 32:
+                raise TranslateError("%s without a 32-bit register and memory operand" % m)
+            L.append("uint32_t a_ = %s; uint32_t v_ = rd32(a_); (void)rd16(a_ + 4u);" % addr_expr(src))
+            L.append(write_op(dst, 32, "v_"))
+            return L
+
         if m in ("MOVSX", "MOVZX"):
             dst, src = ops
             ssize = src.size if src.kind == "mem" and src.size else (
@@ -465,7 +473,7 @@ class Translator(ControlFlow):
             return L
 
         if m == "PUSH":
-            size = operand_size(ops, hint=32)
+            size = 32 if ops[0].kind == "sreg" else operand_size(ops, hint=32)
             if size == 16:
                 L.append("uint32_t v_ = %s;" % read_op(ops[0], 16))
                 L.append("c->r[4] -= 2; wr16(c->r[4], (uint16_t)v_);")
@@ -483,6 +491,8 @@ class Translator(ControlFlow):
             return L
 
         if m == "POP":
+            if ops[0].kind == "sreg":
+                return ["c->r[4] += 4;"]
             size = operand_size(ops, hint=32)
             if size == 16:
                 L.append("uint32_t v_ = rd16(c->r[4]); c->r[4] += 2;")
@@ -1085,7 +1095,7 @@ class Translator(ControlFlow):
             if ins.rep:
                 raise TranslateError("prefix %s on %s" % (ins.rep, m))
             return ["%s(c);" % m.lower()]
-        if ins.rep in ("REP", "REPE"):
+        if ins.rep in ("REP", "REPE", "REPNE"):
             return ["rep_%s%s(c);" % (kind, suf)]
         if ins.rep:
             raise TranslateError("prefix %s on %s" % (ins.rep, m))

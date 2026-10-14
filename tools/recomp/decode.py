@@ -123,6 +123,8 @@ class Image(PE):
                          "FIMUL", "FIDIV", "FIDIVR", "FICOM", "FICOMP",
                          "FNSTSW", "FSTSW", "FNSTCW", "FSTCW", "FLDCW",
                          "FNSTENV", "FLDENV", "FNSAVE", "FSAVE", "FRSTOR"))
+    STRING_OPS = frozenset(("MOVS", "STOS", "LODS", "CMPS", "SCAS", "INS", "OUTS"))
+    LEGACY_PREFIXES = frozenset((0xF0, 0xF2, 0xF3, 0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67))
     REP_PREFIX = {"rep": "REP", "repe": "REPE", "repz": "REPE",
                   "repne": "REPNE", "repnz": "REPNE"}
     #: Mnemonics capstone spells differently from the listing grammar.
@@ -189,6 +191,12 @@ class Image(PE):
             words = words[1:]
         mnem = words[-1].upper()
         mnem = self.MNEM_ALIAS.get(mnem, mnem)
+        if rep is None and mnem[:-1] in self.STRING_OPS:
+            for byte in instruction_bytes:
+                if byte not in self.LEGACY_PREFIXES:
+                    break
+                if byte in (0xF2, 0xF3):
+                    rep = "REPNE" if byte == 0xF2 else "REP"
         if mnem_override is not None:
             mnem = mnem_override
         operands = []

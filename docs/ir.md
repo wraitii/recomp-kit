@@ -29,6 +29,9 @@ independently of private host transport.
 `Program.body` attaches the same validated records to exploratory lifted IR;
 the driver shares its image and decode cache with the program model. SLEIGH
 still validates instruction lengths and effects independently.
+Configured entries inside mapped instructions decode an alternate stream until
+it rejoins a mapped instruction or terminates; CFG fallthrough uses instruction
+addresses so the interleaved streams remain distinct.
 Decode records contain structural operands without listing text. Exploratory
 lifting uses `decode_span_record`; the production listing path formats those
 records separately and retains its operand-width restrictions.
@@ -450,6 +453,11 @@ see stale fields;
 `[ssa-x87-binary32]` the binary32 exponent-range policy; `[ssa-x87-convention]`
 popped residue unpublished at calls and returns. Interior fault and SEH
 equivalence is unverified.
+
+DIVERGENCE(original): the eager emitter treats LDS/LES and segment PUSH/POP
+under the runtime's flat segment model. LDS/LES read the selector but do not
+validate or retain it; segment POP only adjusts ESP. Selector faults, segment
+state changes and 16-bit segment stack operations are not modeled.
 
 ## Validation
 

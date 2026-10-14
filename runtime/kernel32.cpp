@@ -2161,7 +2161,8 @@ void k_TlsFree(X86 *c) {
 }
 
 // One microsecond tick, driven by the same clock as GetTickCount so a guest
-// that mixes the two never sees them disagree.
+// that mixes the two never sees them disagree. Reads within one millisecond
+// increase until the sub-millisecond range is exhausted, then stay constant.
 void k_QueryPerformanceFrequency(X86 *c) {
     uint32_t p = arg(c, 0);
     if (p) {
@@ -2173,9 +2174,12 @@ void k_QueryPerformanceFrequency(X86 *c) {
 
 void k_QueryPerformanceCounter(X86 *c) {
     host_note_cadence("QueryPerformanceCounter");
+    static uint64_t last;
     uint32_t p = arg(c, 0);
     if (p) {
-        uint64_t ticks = (uint64_t)host_millis() * 1000ull;
+        uint64_t ms = (uint64_t)host_millis() * 1000ull;
+        uint64_t ticks = last < ms ? ms : std::min<uint64_t>(last + 1, ms + 999ull);
+        last = ticks;
         wr32(p, (uint32_t)ticks);
         wr32(p + 4, (uint32_t)(ticks >> 32));
     }
