@@ -544,8 +544,8 @@ void D9_CheckDeviceFormatConversion(X86 *c) {
 // textures, four render targets.
 void D9_GetDeviceCaps(X86 *c) {
     uint32_t out = arg(c, 3);
-    if (!this_d3d9(c) || arg(c, 1) != 0 || arg(c, 2) < D3DDEVTYPE_HAL || arg(c, 2) > 3 ||
-        !out || !gm_valid(out, 304)) {
+    if (!this_d3d9(c) || arg(c, 1) != 0 || arg(c, 2) < D3DDEVTYPE_HAL || arg(c, 2) > 3 || !out ||
+        !gm_valid(out, 304)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
@@ -643,11 +643,10 @@ void D9_CreateDevice(X86 *c) {
          "refresh=%u interval=0x%x behavior=0x%x desktop=%ux%u fmt=%u FPU CW %04x -> %04x",
          request.present.windowed, request.present.width, request.present.height,
          request.present.format, request.present.count, request.present.multisample_type,
-         request.present.multisample_quality, request.present.swap_effect,
-         request.present.flags, request.present.fullscreen_refresh_rate,
-         request.present.presentation_interval, request.behavior_flags,
-         request.display_mode.width, request.display_mode.height, request.display_mode.format,
-         previous_cw, c->fpu_cw);
+         request.present.multisample_quality, request.present.swap_effect, request.present.flags,
+         request.present.fullscreen_refresh_rate, request.present.presentation_interval,
+         request.behavior_flags, request.display_mode.width, request.display_mode.height,
+         request.display_mode.format, previous_cw, c->fpu_cw);
     recomp::d3d::D3d9CreateResult result =
         recomp::d3d::d3d9_create_device(*dev->d3d9_device->value, request);
     if (result.status.code != recomp::d3d::StatusCode::Ok) {
@@ -692,9 +691,9 @@ void Dev_SetScissorRect(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    com_ret(c, bridge_result(c, dev->d3d9_device->set_scissor(
-                                    (int32_t)rd32(r), (int32_t)rd32(r + 4),
-                                    (int32_t)rd32(r + 8), (int32_t)rd32(r + 12))));
+    com_ret(c, bridge_result(
+                   c, dev->d3d9_device->set_scissor((int32_t)rd32(r), (int32_t)rd32(r + 4),
+                                                    (int32_t)rd32(r + 8), (int32_t)rd32(r + 12))));
 }
 
 static ComObj *device_backbuffer(ComObj *dev);
@@ -776,8 +775,8 @@ void Dev_Reset(X86 *c) {
     request.window_valid = false;
     if (windowed) {
         int32_t w = 0, h = 0;
-        if (device_window && host_window_rect(device_window, nullptr, nullptr, &w, &h) &&
-            w > 0 && h > 0) {
+        if (device_window && host_window_rect(device_window, nullptr, nullptr, &w, &h) && w > 0 &&
+            h > 0) {
             if (!request.present.width)
                 request.present.width = (uint32_t)w;
             if (!request.present.height)
@@ -788,9 +787,8 @@ void Dev_Reset(X86 *c) {
         request.window_valid = focus_window && win32_top_level(focus_window) && device_window &&
                                win32_top_level(device_window);
     }
-    request.implicit_external_refs =
-        implicit_surface_externally_referenced(dev->d3d9_backbuffer) ||
-        implicit_surface_externally_referenced(dev->d3d9_depthbuffer);
+    request.implicit_external_refs = implicit_surface_externally_referenced(dev->d3d9_backbuffer) ||
+                                     implicit_surface_externally_referenced(dev->d3d9_depthbuffer);
     request.display_mode = d3d9_device_display_mode(request.present);
     recomp::d3d::D3d9ResetResult result{};
     d3d9_reset_transaction(dev, request, result);
@@ -996,8 +994,7 @@ void Dev_Clear(X86 *c) {
     memcpy(&z, &zbits, 4);
     rust::Slice<const recomp::d3d::D3d9Rect> rect_slice(list.empty() ? nullptr : list.data(),
                                                         list.size());
-    com_ret(c,
-            bridge_result(c, dev->d3d9_device->clear(flags, color, z, arg(c, 6), rect_slice)));
+    com_ret(c, bridge_result(c, dev->d3d9_device->clear(flags, color, z, arg(c, 6), rect_slice)));
 }
 
 // (this, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion). The back
@@ -1098,9 +1095,6 @@ static uint8_t *resource_bytes(ComObj *o) {
         return gm_ptr(o->pixels);
     return o->blob.empty() ? nullptr : o->blob.data();
 }
-
-
-
 
 static void d3d9_release_staging(D3d9HostResource *h) {
     if (!h)
@@ -4021,8 +4015,7 @@ static ComObj *device_backbuffer(ComObj *dev) {
         return nullptr;
     ComObj *s = com_get(dev->d3d9_backbuffer);
     if (!s) {
-        recomp::d3d::D3d9SurfaceDescriptorResult desc =
-            dev->d3d9_device->backbuffer_descriptor();
+        recomp::d3d::D3d9SurfaceDescriptorResult desc = dev->d3d9_device->backbuffer_descriptor();
         if (desc.status.code != recomp::d3d::StatusCode::Ok)
             return nullptr;
         s = com_new(K_D3D9SURFACE);
@@ -4065,9 +4058,9 @@ void Dev_StretchRect(X86 *c) {
     }
     rust::Slice<const recomp::d3d::D3d9Rect> srs(have_src ? &sr : nullptr, have_src ? 1 : 0);
     rust::Slice<const recomp::d3d::D3d9Rect> drs(have_dst ? &dr : nullptr, have_dst ? 1 : 0);
-    com_ret(c, bridge_result(c, dev->d3d9_device->stretch_rect(d3d9_target_id(src), srs,
-                                                               d3d9_target_id(dst), drs,
-                                                               arg(c, 5))));
+    com_ret(c,
+            bridge_result(c, dev->d3d9_device->stretch_rect(d3d9_target_id(src), srs,
+                                                            d3d9_target_id(dst), drs, arg(c, 5))));
 }
 
 void Dev_UpdateSurface(X86 *c) {
@@ -4095,25 +4088,23 @@ void Dev_UpdateSurface(X86 *c) {
         dx = (int32_t)rd32(arg(c, 4));
         dy = (int32_t)rd32(arg(c, 4) + 4);
     }
-    rust::Slice<const recomp::d3d::D3d9Rect> sr_slice(have_src ? &sr : nullptr,
-                                                      have_src ? 1 : 0);
-    com_ret(
-        c, bridge_result(c, dev->d3d9_device->update_surface(
-                                *src->d3d9_resource, src->d3d9_face, src->d3d9_level, sr_slice,
-                                *dst->d3d9_resource, dst->d3d9_face, dst->d3d9_level, dx, dy)));
+    rust::Slice<const recomp::d3d::D3d9Rect> sr_slice(have_src ? &sr : nullptr, have_src ? 1 : 0);
+    com_ret(c, bridge_result(c, dev->d3d9_device->update_surface(
+                                    *src->d3d9_resource, src->d3d9_face, src->d3d9_level, sr_slice,
+                                    *dst->d3d9_resource, dst->d3d9_face, dst->d3d9_level, dx, dy)));
 }
 
 void Dev_UpdateTexture(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *src = com_this(arg(c, 1)), *dst = com_this(arg(c, 2));
-    if (!dev || !dev->d3d9_device || !src || !dst || !src->d3d9_resource ||
-        !dst->d3d9_resource || src->dev_d3d != dev->id || dst->dev_d3d != dev->id ||
+    if (!dev || !dev->d3d9_device || !src || !dst || !src->d3d9_resource || !dst->d3d9_resource ||
+        src->dev_d3d != dev->id || dst->dev_d3d != dev->id ||
         src->d3d9_resource.get() == dst->d3d9_resource.get()) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    com_ret(c, bridge_result(c, dev->d3d9_device->update_texture(*src->d3d9_resource,
-                                                                 *dst->d3d9_resource)));
+    com_ret(c, bridge_result(
+                   c, dev->d3d9_device->update_texture(*src->d3d9_resource, *dst->d3d9_resource)));
 }
 
 void Dev_GetRenderTargetData(X86 *c) {
@@ -4144,16 +4135,14 @@ void Dev_ColorFill(X86 *c) {
         return;
     }
     rust::Slice<const recomp::d3d::D3d9Rect> slice(have ? &r : nullptr, have ? 1 : 0);
-    com_ret(
-        c, bridge_result(c, dev->d3d9_device->color_fill(d3d9_target_id(s), slice, arg(c, 3))));
+    com_ret(c, bridge_result(c, dev->d3d9_device->color_fill(d3d9_target_id(s), slice, arg(c, 3))));
 }
 static ComObj *device_depthbuffer(ComObj *dev) {
     if (!dev || !dev->d3d9_device)
         return nullptr;
     ComObj *s = com_get(dev->d3d9_depthbuffer);
     if (!s) {
-        recomp::d3d::D3d9SurfaceDescriptorResult desc =
-            dev->d3d9_device->depthbuffer_descriptor();
+        recomp::d3d::D3d9SurfaceDescriptorResult desc = dev->d3d9_device->depthbuffer_descriptor();
         if (desc.status.code != recomp::d3d::StatusCode::Ok)
             return nullptr;
         s = com_new(K_D3D9SURFACE);
@@ -4429,8 +4418,8 @@ void Dev_SetStreamSource(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *vb = com_this(arg(c, 2));
     uint32_t stream = arg(c, 1);
-    if (!dev || !dev->d3d9_device || stream >= 16 ||
-        (arg(c, 2) && (!vb || vb->kind != K_D3D9VB)) || (vb && vb->dev_d3d != dev->id)) {
+    if (!dev || !dev->d3d9_device || stream >= 16 || (arg(c, 2) && (!vb || vb->kind != K_D3D9VB)) ||
+        (vb && vb->dev_d3d != dev->id)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
@@ -4557,8 +4546,7 @@ void Dev_DrawPrimitive(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    recomp::d3d::Status status =
-        dev->d3d9_device->draw_primitive(arg(c, 1), arg(c, 2), prim_count);
+    recomp::d3d::Status status = dev->d3d9_device->draw_primitive(arg(c, 1), arg(c, 2), prim_count);
     if (status.code == recomp::d3d::StatusCode::Ok)
         d3d9_refresh_bindings(dev);
     com_ret(c, bridge_result(c, status));
@@ -5090,8 +5078,7 @@ void Surf_GetDesc(X86 *c) {
             com_ret(c, D3DERR_INVALIDCALL);
             return;
         }
-        recomp::d3d::D3d9TextureDescriptorResult td =
-            parent->d3d9_resource->texture_descriptor();
+        recomp::d3d::D3d9TextureDescriptorResult td = parent->d3d9_resource->texture_descriptor();
         recomp::d3d::D3d9LevelDescriptorResult ld =
             parent->d3d9_resource->texture_level_descriptor(s->d3d9_face, s->d3d9_level);
         if (td.status.code != recomp::d3d::StatusCode::Ok) {
@@ -5644,8 +5631,7 @@ void Dev_SetTextureStageState(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    com_ret(
-        c, bridge_result(c, dev->d3d9_device->set_texture_stage_state(stage, type, arg(c, 3))));
+    com_ret(c, bridge_result(c, dev->d3d9_device->set_texture_stage_state(stage, type, arg(c, 3))));
 }
 
 void Dev_SetRenderState(X86 *c) {
@@ -5693,9 +5679,9 @@ void Dev_SetVertexShaderConstantF(X86 *c) {
     }
     std::vector<float> values(count * 4);
     memcpy(values.data(), gm_ptr(data), count * 16);
-    com_ret(c, bridge_result(c, dev->d3d9_device->set_shader_constants_f(
-                                    false, start,
-                                    rust::Slice<const float>(values.data(), values.size()))));
+    com_ret(c, bridge_result(
+                   c, dev->d3d9_device->set_shader_constants_f(
+                          false, start, rust::Slice<const float>(values.data(), values.size()))));
 }
 void Dev_SetPixelShaderConstantF(X86 *c) {
     ComObj *dev = this_device9(c);
@@ -5714,9 +5700,9 @@ void Dev_SetPixelShaderConstantF(X86 *c) {
     }
     std::vector<float> values(count * 4);
     memcpy(values.data(), gm_ptr(data), count * 16);
-    com_ret(c, bridge_result(c, dev->d3d9_device->set_shader_constants_f(
-                                    true, start,
-                                    rust::Slice<const float>(values.data(), values.size()))));
+    com_ret(c, bridge_result(
+                   c, dev->d3d9_device->set_shader_constants_f(
+                          true, start, rust::Slice<const float>(values.data(), values.size()))));
 }
 
 // The DLL's one export. Not a COM method: the guest calls it directly.
