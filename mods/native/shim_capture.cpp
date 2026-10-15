@@ -98,7 +98,7 @@ bool on_call(const char *desc, const uint32_t *args, uint32_t argc, uint32_t *re
     return true;
 }
 
-void on_return(const char *desc, uint32_t eax) {
+void on_return(const char *desc, uint32_t eax, uint32_t caller) {
     if (g_state.open && !g_state.in_flight.empty()) {
         const size_t slot = g_state.in_flight.back();
         g_state.in_flight.pop_back();
@@ -108,7 +108,7 @@ void on_return(const char *desc, uint32_t eax) {
     // The observer this one displaced still reports failures while a capture
     // is open; a capture must not make the rest of the runtime go quiet.
     if (g_chained)
-        g_chained(desc, eax);
+        g_chained(desc, eax, caller);
 }
 
 } // namespace

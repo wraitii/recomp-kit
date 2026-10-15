@@ -606,7 +606,7 @@ bool imports_dispatch(X86 *c, uint32_t target) {
 #endif
     // Read after the shim ran, so the pointer is into the table as it is now.
     if (g_return_observer)
-        g_return_observer(tramps()[idx].desc.c_str(), c->r[R_EAX]);
+        g_return_observer(tramps()[idx].desc.c_str(), c->r[R_EAX], ret_addr);
     LOGV("<- %s (eax=%08x)", desc, c->r[R_EAX]);
 
     uint32_t pop = 4;

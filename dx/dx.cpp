@@ -8,6 +8,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <unordered_map>
 #include <vector>
 
 #include "../runtime/imports.h"
@@ -28,14 +29,15 @@ const size_t MAX_AUDIO_CHANNELS = 128;
 // A guest that gives up during Direct3D initialisation says nothing about
 // why: it takes the failure branch and exits. The one thing that identifies
 // the cause is which method returned which HRESULT, so every COM method in
-// this layer is watched and any failing return is named once. Naming it here
+// this layer is watched and any failing return is named with its guest call
+// site, again at every power-of-two repeat count. Naming it here
 // rather than at each `com_ret(c, DDERR_...)` keeps several hundred call
 // sites free of logging and, more importantly, means a failure path added
 // later is reported without anyone remembering to instrument it.
 // ---------------------------------------------------------------------------
 // Every DirectDraw/Direct3D/DirectSound/DirectInput error the SDK headers
 // name, so a failure reads as a name rather than a number. Generated from
-// ddraw.h, d3d.h, dsound.h and dinput.h.
+// ddraw.h, d3d.h, d3d9.h, d3dx9.h, dsound.h and dinput.h.
 const char *hresult_name(uint32_t hr) {
     switch (hr) {
     case 0x80004001u:
@@ -194,6 +196,20 @@ const char *hresult_name(uint32_t hr) {
         return "DDERR_UNSUPPORTEDFORMAT";
     case 0x88760208u:
         return "DDERR_UNSUPPORTEDMASK";
+    case 0x88760866u:
+        return "D3DERR_NOTFOUND";
+    case 0x88760867u:
+        return "D3DERR_MOREDATA";
+    case 0x88760868u:
+        return "D3DERR_DEVICELOST";
+    case 0x88760869u:
+        return "D3DERR_DEVICENOTRESET";
+    case 0x8876086au:
+        return "D3DERR_NOTAVAILABLE";
+    case 0x8876086cu:
+        return "D3DERR_INVALIDCALL";
+    case 0x88760b59u:
+        return "D3DXERR_INVALIDDATA";
     case 0x88760209u:
         return "DDERR_INVALIDSTREAM";
     case 0x88760219u:
@@ -516,23 +532,41 @@ const char *hresult_name(uint32_t hr) {
     }
 }
 
-void dx_report_failure(const char *desc, uint32_t eax) {
-    if (!(eax & 0x80000000u))
+struct FailureSite {
+    const char *desc;
+    uint32_t eax, caller;
+    bool operator==(const FailureSite &) const = default;
+};
+
+struct FailureSiteHash {
+    size_t operator()(const FailureSite &s) const {
+        return std::hash<const void *>()(s.desc) ^ (size_t(s.eax) * 0x9e3779b97f4a7c15ull) ^
+               (size_t(s.caller) << 17);
+    }
+};
+
+[[gnu::noinline]] void report_failure(const char *desc, uint32_t eax, uint32_t caller) {
+    static auto *watched = new std::unordered_map<const char *, bool>();
+    auto [kind, unseen] = watched->try_emplace(desc, false);
+    if (unseen) {
+        const char *method = strstr(desc, "::");
+        kind->second =
+            method && strcmp(method, "::GetAvailableTextureMem") != 0 && strstr(desc, "IDirect");
+    }
+    if (!kind->second)
         return;
-    if (!desc)
+    static auto *sites = new std::unordered_map<FailureSite, uint64_t, FailureSiteHash>();
+    uint64_t count = ++(*sites)[FailureSite{desc, eax, caller}];
+    if (count & (count - 1))
         return;
-    const char *method = strstr(desc, "::");
-    if (!method || strcmp(method, "::GetAvailableTextureMem") == 0)
-        return;
-    if (!strstr(desc, "IDirect") && !strstr(desc, "IDirect3D"))
-        return;
-    char key[160];
-    snprintf(key, sizeof key, "dxfail.%s.%08x", desc, eax);
     const char *n = hresult_name(eax);
-    if (n)
-        log_once(key, "dx: %s failed: %s (0x%08x)", desc, n, eax);
-    else
-        log_once(key, "dx: %s failed: 0x%08x", desc, eax);
+    LOGW("dx: %s failed: %s (0x%08x) returning to 0x%08x, %llu times", desc, n ? n : "HRESULT", eax,
+         caller, (unsigned long long)count);
+}
+
+void dx_report_failure(const char *desc, uint32_t eax, uint32_t caller) {
+    if ((eax & 0x80000000u) && desc)
+        report_failure(desc, eax, caller);
 }
 
 } // namespace

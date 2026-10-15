@@ -59,7 +59,7 @@ bool refuse_args(const char *, const uint32_t *a, uint32_t n, uint32_t *result) 
 
 int g_chained_calls = 0;
 const char *g_chained_desc = nullptr;
-void chained_observer(const char *desc, uint32_t) {
+void chained_observer(const char *desc, uint32_t, uint32_t) {
     ++g_chained_calls;
     g_chained_desc = desc;
 }

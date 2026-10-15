@@ -738,9 +738,13 @@ static void put_caps9(uint32_t p) {
 void D9_GetDeviceCaps(X86 *c) {
     if (kD3d9WgpuEnabled) {
         uint32_t out = arg(c, 3);
-        if (!this_d3d9(c) || arg(c, 1) != 0 || arg(c, 2) != D3DDEVTYPE_HAL || !out ||
-            !gm_valid(out, 304)) {
+        if (!this_d3d9(c) || arg(c, 1) != 0 || arg(c, 2) < D3DDEVTYPE_HAL || arg(c, 2) > 3 ||
+            !out || !gm_valid(out, 304)) {
             com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        if (arg(c, 2) != D3DDEVTYPE_HAL) {
+            com_ret(c, D3DERR_NOTAVAILABLE);
             return;
         }
         recomp::d3d::D3d9CapsResult result = recomp::d3d::d3d9_adapter_caps(arg(c, 1));

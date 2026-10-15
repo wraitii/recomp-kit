@@ -37,14 +37,14 @@ bool imports_has_dll(const char *dll_lower);
 
 // ---------------------------------------------------------------------------
 // Return observer. Called after every dispatched shim with the trampoline's
-// description ("DDRAW.dll!IDirect3D2::CreateDevice") and the value the shim
-// left in EAX. It exists so a layer that knows what its own return values
-// mean -- the DirectX shims and their HRESULTs -- can report a failure once,
-// by name, without every one of several hundred failure sites having to log
-// for itself. The observer must not touch the guest context: it is a
+// description ("DDRAW.dll!IDirect3D2::CreateDevice"), the value the shim
+// left in EAX and the guest return address. It exists so a layer that knows
+// what its own return values mean -- the DirectX shims and their HRESULTs --
+// can report a failure by name and call site, without every one of several
+// hundred failure sites having to log for itself. The observer must not touch the guest context: it is a
 // spectator, and the shim's return value has already been decided.
 // ---------------------------------------------------------------------------
-typedef void (*ImportReturnObserver)(const char *desc, uint32_t eax);
+typedef void (*ImportReturnObserver)(const char *desc, uint32_t eax, uint32_t caller);
 void imports_set_return_observer(ImportReturnObserver fn);
 
 // ---------------------------------------------------------------------------
