@@ -305,8 +305,6 @@ void char_width32(X86 *c) {
         wr32(out + (ch - first) * 4, uint32_t(pen.advance(ch)));
     set_eax(c, 1);
 }
-// ABC: a zero left and right bearing around the advance, which is how the
-// bitmap and Open Sans paths draw them.
 void char_abc_widths(X86 *c) {
     uint32_t dc = arg(c, 0), first = arg(c, 1), last = arg(c, 2), out = arg(c, 3);
     if (!dc_of(dc) || last < first || !out || last - first > GUEST_SIZE / 12 - 1 ||
@@ -317,9 +315,15 @@ void char_abc_widths(X86 *c) {
     const Pen pen = pen_of(dc);
     for (uint32_t ch = first; ch <= last; ++ch) {
         uint32_t at = out + (ch - first) * 12;
-        wr32(at, 0);
-        wr32(at + 4, uint32_t(pen.advance(ch)));
-        wr32(at + 8, 0);
+        int32_t bearing = 0, width = int32_t(pen.advance(ch));
+        if (pen.face) {
+            const auto &glyph = truetype_glyph(pen.face, pen.scale, ch);
+            bearing = glyph.x;
+            width = glyph.w;
+        }
+        wr32(at, uint32_t(bearing));
+        wr32(at + 4, uint32_t(width));
+        wr32(at + 8, uint32_t(pen.advance(ch) - bearing - width));
     }
     set_eax(c, 1);
 }
