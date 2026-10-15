@@ -53,7 +53,6 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h> // on iOS this supplies the UIKit entry point and renames main
 #ifdef __EMSCRIPTEN__
-#include "../gpu/d3d9_backend.h"
 #include <emscripten/emscripten.h>
 #include <emscripten/wasmfs.h>
 #include <thread>
@@ -1781,7 +1780,6 @@ int web_idle_wait(double seconds) {
 }
 
 void web_frame() {
-    host_d9_frame(true);
     service(0.0);
     after_events();
     int bw, bh, dw, dh;
@@ -1792,9 +1790,7 @@ void web_frame() {
         host_present_resize(dw, dh);
         host_display_set_screen(dw, dh);
     }
-    host_d9_pump();
     host_present_pump();
-    host_d9_frame(false);
     if (g_web_guest_done.load())
         emscripten_cancel_main_loop();
 }
@@ -1877,9 +1873,6 @@ int web_main(int argc, char **argv) {
     host_present_on_mode_change(on_mode_change);
     host_input_set_notify(dinput_host_input_changed);
     host_present_start(g_surface, dw, dh);
-    if (!host_d9_web_start(g_gpu.get()))
-        fprintf(stderr,
-                RECOMP_APP_NAME ": no WebGPU Direct3D 9 renderer; the game draws on the CPU\n");
 
     const char *capture = recomp_env("HOST_AUDIO_CAPTURE");
     if (capture && *capture)

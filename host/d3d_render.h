@@ -89,9 +89,6 @@ void host_d3d_collect_present_targets();
 // The renderer behind host_d3d_draw, over gpu.h. One instance per device; the
 // shim callbacks use the shared one. main sets it once the device exists; the
 // tests set their own.
-// Test only: run the Direct3D 9 GPU renderer (d3d9_metal.mm) on `device`.
-// False when the device is not Metal.
-bool host_d9_use_device_for_test(gpu::Device *device);
 
 class D3DRenderer {
   public:

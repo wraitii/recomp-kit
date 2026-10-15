@@ -83,30 +83,6 @@ class VulkanDevice final : public Device {
     void destroy(Swapchain s) override;
     double now_seconds() override;
 
-    // --- for renderers that record their own Vulkan (d3d9_vulkan.cpp) ---
-    VkDevice native_device() const {
-        return device_;
-    }
-    VkPhysicalDevice native_physical() const {
-        return physical_;
-    }
-    uint32_t native_queue_family() const {
-        return queue_family_;
-    }
-    const VkPhysicalDeviceFeatures &native_features() const {
-        return enabled_features_;
-    }
-    bool native_core13() const {
-        return core13_;
-    }
-    // Submits `cb` on the device's queue, behind the transfers the device has
-    // pending, so it runs before any command buffer committed after it.
-    bool submit_native(VkCommandBuffer cb, VkFence fence);
-    // A handle the presenter can sample for an image the caller owns and
-    // keeps in VK_IMAGE_LAYOUT_GENERAL. destroy() on it forgets the handle
-    // and leaves the image alone.
-    Texture import_image(VkImage image, VkImageView view, const TextureDesc &desc);
-
     // --- shared with vulkan_swapchain.cpp ---
     struct Tex {
         VkImage image = VK_NULL_HANDLE;
@@ -263,7 +239,6 @@ class VulkanDevice final : public Device {
     uint32_t subgroup_size_ = 32;
     bool subgroup_arithmetic_ = false;
     bool anisotropy_ = false;
-    VkPhysicalDeviceFeatures enabled_features_{};
     bool core13_ = false;
     bool full_subgroups_ = false; // computeFullSubgroups enabled
     bool failed_ = false;

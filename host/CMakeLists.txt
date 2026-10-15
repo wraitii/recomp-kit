@@ -168,26 +168,6 @@ set(RECOMP_PRESENT_SOURCES ${HOST}/present_pixels.cpp ${HOST}/present_thread.cpp
                         ${HOST}/d3d_render.cpp
                         ${HOST}/gpu2d.cpp
                         ${HOST}/indexed_frame.cpp)
-# The Direct3D 9 device's GPU renderer: the host entry points, and a backend
-# per GPU API (host/gpu/d3d9_backend.h). Without one the shim draws on the CPU.
-list(APPEND RECOMP_PRESENT_SOURCES ${HOST}/gpu/d3d9_host.cpp)
-if(RECOMP_D9_VULKAN)
-  list(APPEND RECOMP_PRESENT_SOURCES ${HOST}/gpu/vulkan/d3d9_vulkan.cpp)
-  set_source_files_properties(${HOST}/gpu/d3d9_host.cpp PROPERTIES COMPILE_DEFINITIONS RECOMP_D9_VULKAN=1)
-  set_source_files_properties(${HOST}/gpu/vulkan/d3d9_vulkan.cpp PROPERTIES
-    INCLUDE_DIRECTORIES "${RECOMP_ROOT}/third_party/volk;${RECOMP_ROOT}/third_party/vulkan-headers/include"
-    COMPILE_DEFINITIONS "VK_NO_PROTOTYPES;RECOMP_D9_VULKAN=1")
-  set(RECOMP_D9_LIBS glslang::glslang glslang::glslang-default-resource-limits)
-  list(APPEND RECOMP_CORE_LIBS ${RECOMP_D9_LIBS})
-endif()
-if(EMSCRIPTEN)
-  list(APPEND RECOMP_PRESENT_SOURCES ${HOST}/gpu/webgpu/d3d9_webgpu.cpp)
-endif()
-if(APPLE)
-  list(APPEND RECOMP_PRESENT_SOURCES ${HOST}/gpu/metal/d3d9_metal.mm)
-  set_source_files_properties(${HOST}/gpu/metal/d3d9_metal.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
-endif()
-
 # The host's platform file: desktop or iPadOS (host/sdl/platform_ui.h), and
 # the launcher's (host/launcher/launcher_sdl.h; iPadOS keeps its own in
 # platform_ui_ios.mm).
@@ -308,9 +288,7 @@ recomp_host(host_tests UI_LAYER
           ${RECOMP_ROOT}/dx/dinput_joystick.cpp
           ${RECOMP_ROOT}/dx/d3d11.cpp ${RECOMP_ROOT}/dx/dxgi.cpp
           ${RECOMP_ROOT}/dx/d3dcompiler.cpp ${RECOMP_ROOT}/dx/d3dx10.cpp
-          ${RECOMP_ROOT}/dx/d3d9_shader.cpp ${RECOMP_ROOT}/dx/d3d9_shadergen.cpp
-          ${RECOMP_ROOT}/dx/host_d9_default.cpp
-  LIBS recomp_platform recomp_runtime gpu_backend gpu_fake ${RECOMP_D9_LIBS}
+  LIBS recomp_platform recomp_runtime gpu_backend gpu_fake
   FRAMEWORKS ${FW_FOUNDATION} ${FW_METAL})
 recomp_link_sdl(host_tests)
 recomp_test_binary(host_tests)

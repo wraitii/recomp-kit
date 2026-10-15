@@ -85,13 +85,6 @@ class WebGpuDevice final : public Device {
     void destroy(Swapchain s) override;
     double now_seconds() override;
 
-    // --- for renderers that record their own WebGPU (d3d9_webgpu.cpp) ---
-    WGPUDevice native_device() const {
-        return device_;
-    }
-    WGPUQueue native_queue() const {
-        return queue_;
-    }
     bool has_feature(WGPUFeatureName f) const;
     // A handle the presenter can use for a texture the caller owns; destroy()
     // forgets the handle and leaves the texture alone.

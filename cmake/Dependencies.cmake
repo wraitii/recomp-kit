@@ -28,26 +28,6 @@ FetchContent_Declare(SDL3
   GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(SDL3)
 
-# glslang compiles the Direct3D 9 renderer's GLSL to SPIR-V at run time
-# (host/gpu/vulkan/d3d9_vulkan.cpp): every platform that renders on Vulkan.
-set(RECOMP_D9_VULKAN OFF)
-if(NOT IOS AND NOT EMSCRIPTEN)
-  set(RECOMP_D9_VULKAN ON)
-  set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
-  set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
-  set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
-  set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
-  set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
-  set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
-  set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
-  set(ENABLE_CTEST OFF CACHE BOOL "" FORCE)
-  FetchContent_Declare(glslang
-    GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
-    GIT_TAG 16.6.0
-    GIT_SHALLOW TRUE)
-  FetchContent_MakeAvailable(glslang)
-endif()
-
 # recomp_link_sdl(<target>): link SDL3 statically and give the target its headers.
 function(recomp_link_sdl target)
   target_link_libraries(${target} PRIVATE SDL3::SDL3-static)

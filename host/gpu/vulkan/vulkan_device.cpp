@@ -194,7 +194,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::create() {
     f2.features.fillModeNonSolid = base.fillModeNonSolid;
     f2.features.occlusionQueryPrecise = base.occlusionQueryPrecise;
     f2.features.depthClamp = base.depthClamp;
-    d->enabled_features_ = f2.features;
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceDynamicRenderingFeaturesKHR fdr{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
@@ -717,34 +716,6 @@ void VulkanDevice::transition_if_external(Cmd &c, Tex &t, VkImageLayout to) {
     vkCmdPipelineBarrier(c.buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
     t.layout = to;
-}
-
-Texture VulkanDevice::import_image(VkImage image, VkImageView view, const TextureDesc &desc) {
-    Tex t;
-    t.image = image;
-    t.view = view;
-    t.desc = desc;
-    t.layout = VK_IMAGE_LAYOUT_GENERAL;
-    t.external = true;
-    std::lock_guard lock(mutex_);
-    uint64_t id = next_id_++;
-    textures_[id] = t;
-    return {id};
-}
-
-bool VulkanDevice::submit_native(VkCommandBuffer cb, VkFence fence) {
-    if (failed_)
-        return false;
-    flush_pending();
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cb;
-    std::lock_guard lock(queue_mutex_);
-    if (vkQueueSubmit(queue_, 1, &si, fence) != VK_SUCCESS) {
-        fail("native submit failed");
-        return false;
-    }
-    return true;
 }
 
 // ----------------------------------------------------------------- buffers

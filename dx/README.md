@@ -12,8 +12,8 @@ Every module is compiled and `dx_register_shims()` registers all of them; a
 build does not select by game or era. A game reaches only the ones its imports
 name, so the rest cost registration, not behaviour. The work behind them is
 split three ways: the DX3-7 recorder, audio and input leave through callbacks
-in `host_api.h`; D3D8 hands its draws to the Rust `graphics/d3d8-wgpu` crate;
-D3D9 and D3D11 render through `host_d9.h` and `host/gpu2d` on the host GPU.
+in `host_api.h`; D3D8 and D3D9 hand their draws to the Rust
+`graphics/d3d8-wgpu` crate; D3D11 renders through `host/gpu2d` on the host GPU.
 
 ## By era and subsystem
 
@@ -22,7 +22,7 @@ D3D9 and D3D11 render through `host_d9.h` and `host/gpu2d` on the host GPU.
 | Common | `com.h/.cpp`, `dx.h/.cpp`, `host_api.h/.cpp`, `display_stubs.cpp`, `coherence.h`, `passes.h`, `frame_dump.h/.cpp` | guest COM objects and vtables; `dx_register_shims()` and `dx_reset()`; the host callback seam with weak no-op defaults; display coherence and frame/draw mapping hooks; frame capture |
 | DirectDraw and Direct3D 2-7 (DX3-7) | `ddraw.cpp/.h`, `d3d.cpp`, `d3d7.cpp`, `dxtypes.h`, `dxt_decode.h` | IDirectDraw/2/4 with surfaces/2/3/4, palettes and clippers; IDirect3D/2 and IDirect3D7 devices, viewports, materials, lights and textures; DX6 constants and DXT decode |
 | Direct3D 8 (DX8) | `d3d8.cpp`, `d3d8_fpu.h`, `d3d8_bindings.json`, `d3d8_constants.json` | IDirect3D8 factory, device, surface, texture, vertex-buffer and index-buffer vtables behind the Rust renderer; the guest x87 control-word change `CreateDevice` implies |
-| Direct3D 9 (DX9) | `d3d9.cpp`, `d3d9_raster.cpp/.h`, `d3d9_shader.cpp/.h`, `d3d9_shadergen.cpp`, `d3d9_pipeline.h`, `d3d9_glsl.h`, `d3d9_msl.h`, `d3d9_wgsl.h`, `host_d9.h`, `host_d9_default.cpp`, `d3dx9.cpp` | IDirect3D9 device and resources; SM 1.1-2.0 bytecode decode plus an interpreter/CPU rasterizer and MSL/GLSL/WGSL generation for the host GPU backends; D3DX9 matrix/vector maths and effects |
+| Direct3D 9 (DX9) | `d3d9.cpp`, `d3dx9.cpp` | IDirect3D9 device and resources over the Rust renderer; D3DX9 matrix/vector maths and effect loading |
 | Direct3D 10/11 and DXGI | `d3d11.cpp/.h`, `dxgi.cpp`, `d3dx10.cpp`, `d3dcompiler.cpp` | ID3D11Device/context/resources for one fixed 2D quad pipeline; IDXGISwapChain over guest-owned back buffers; D3DX10 row-vector maths; a tagged-source `ID3DBlob` shim |
 | DirectSound and WinMM audio | `dsound.cpp`, `waveout.cpp`, `audio3d.h` | IDirectSound, buffers, 3D buffer/listener and notification positions; WinMM `waveOut` queues; the 3D model shared with Miles |
 | DirectInput and XInput | `dinput.cpp`, `dinput_joystick.cpp/.h`, `xinput.cpp` | IDirectInputA mouse and keyboard; the virtual pad as a DirectInput joystick; the virtual pad as XInput user 0 across `xinput1_3`, `1_4` and `9_1_0` |
@@ -37,7 +37,7 @@ D3D9 and D3D11 render through `host_d9.h` and `host/gpu2d` on the host GPU.
 | --- | --- | --- |
 | DX3-7 (`ddraw`, `d3d`, `d3d7`) | the kit's own, `host/d3d_render.cpp` over `host/gpu/` | fixed-function immediate mode; vertex lighting is recorded but not applied |
 | D3D8 (`d3d8.cpp`) | the Rust `graphics/d3d8-wgpu` crate (wgpu) | optional; without it the no-renderer path advertises no adapter |
-| D3D9 (`d3d9.cpp`) | the kit's own GPU (`host/gpu/d3d9_host.cpp` plus Metal, Vulkan and WebGPU backends) and a CPU fallback (`d3d9_raster.cpp`) | shader-only, SM 1.1-2.0 without flow control; fixed-function T&L and programs outside that range are refused by name; `d3d9_shadergen.cpp` emits the backend's shading language |
+| D3D9 (`d3d9.cpp`) | the Rust `graphics/d3d8-wgpu` crate (wgpu) | base D3D9 (no D3D9Ex) and `d3dx9_33` effects; vs 1.1/2.0 and ps 1.1-2.0 without flow control, so SM3, `ps_2_x`, loops/branches, `texldl`/`sincos` and ps 1.x texture-register ops fail by name; also refused: multisampling, MIRRORONCE, point sprites, P8 palettes, effect struct parameters and pool-shared samplers. `EvictManagedResources` keeps residency; INTZ samples through the comparison sampler; occlusion counts on Metal are the covered viewport area |
 | D3D11 (`d3d11.cpp`) | the kit's own, `host/gpu2d.cpp` | one fixed 2D layered-quad pipeline; `d3dcompiler.cpp` is a tagged-source blob, not a compiler |
 | Video | FFmpeg (`mf_media.cpp`, `avi.cpp`, parts of `bink.cpp`, `waveout.cpp` ADPCM), minimp3 (`dshow.cpp`, `mp3_source.cpp`), Bink video in `bink.cpp` | containers, demux and frame helpers are kit code |
 

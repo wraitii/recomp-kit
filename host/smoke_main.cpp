@@ -39,7 +39,6 @@
 #include "present.h"
 #include "d3d_render.h"
 #include "gpu/gpu_factory.h"
-#include "../dx/host_d9.h"
 #include "../runtime/display_seam.h"
 #include "../runtime/guest.h"
 #include "../runtime/loader.h"
@@ -190,19 +189,6 @@ void write_dump(const char *name) {
     uint32_t space_w, space_h;
     pointer_space(&space_w, &space_h);
     char path[1024];
-    if (recomp_env("D3D9_PROBE_DUMPS"))
-        host_d9_probe_next_frame(name);
-    // A Direct3D 9 device on the GPU presents no CPU pixels; read its frame back.
-    uint32_t gw = 0, gh = 0;
-    if (host_d9_read_presented(nullptr, 0, &gw, &gh) || (gw && gh)) {
-        std::vector<uint8_t> rgb((size_t)gw * gh * 3);
-        if (host_d9_read_presented(rgb.data(), (uint32_t)rgb.size(), &gw, &gh)) {
-            g_last_rgb.swap(rgb);
-            ++g_last_rgb_version;
-            g_last_w = (int)gw;
-            g_last_h = (int)gh;
-        }
-    }
     if (g_last_w && g_last_h) {
         snprintf(path, sizeof path, "%s/smoke_%s_present.ppm", host_dump_dir(), name);
         if (host_write_ppm(path, g_last_rgb.data(), g_last_w, g_last_h)) {

@@ -2,7 +2,7 @@ set(RECOMP_DX_SOURCES
   com.cpp dx.cpp host_api.cpp display_stubs.cpp ddraw.cpp d3d.cpp d3d7.cpp d3d11.cpp dxgi.cpp d3dcompiler.cpp
   d3dx10.cpp dsound.cpp dshow.cpp mp3_source.cpp dinput.cpp dinput_joystick.cpp xinput.cpp qmixer.cpp
   mss32.cpp redbook.cpp avi.cpp waveout.cpp fmod.cpp soundlib.cpp galaxy_stub.cpp riff.cpp wav_source.cpp bink.cpp video_frame.cpp mf_media.cpp
-  mf.cpp weanetr.cpp d3d9.cpp d3d9_raster.cpp d3d9_shader.cpp d3d9_shadergen.cpp host_d9_default.cpp
+  mf.cpp weanetr.cpp d3d9.cpp
   d3dx9.cpp d3d8.cpp)
 
 # A static archive lets ordinary hosts share miniz with the launcher without
@@ -63,17 +63,6 @@ add_custom_command(OUTPUT "${RECOMP_D3D9_CONSTANTS}"
           "${RECOMP_ROOT}/third_party/wine-d3d9/d3d9types.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/d3d9_constants.json"
   VERBATIM)
-set(RECOMP_D3DX9_INTERFACES "${RECOMP_D3D9_GENERATED_DIR}/d3dx9_interfaces.inc")
-add_custom_command(OUTPUT "${RECOMP_D3DX9_INTERFACES}"
-  COMMAND ${CMAKE_COMMAND} -E make_directory "${RECOMP_D3D9_GENERATED_DIR}"
-  COMMAND ${Python3_EXECUTABLE} "${RECOMP_ROOT}/tools/gen_com_interfaces.py"
-          --reference "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9effect.h"
-          --bindings "${CMAKE_CURRENT_SOURCE_DIR}/d3dx9_bindings.json"
-          --sdk-version 26
-          --output "${RECOMP_D3DX9_INTERFACES}"
-  DEPENDS "${RECOMP_ROOT}/tools/gen_com_interfaces.py"
-          "${RECOMP_ROOT}/third_party/wine-d3d9/d3dx9effect.h" "${CMAKE_CURRENT_SOURCE_DIR}/d3dx9_bindings.json"
-  VERBATIM)
 set(RECOMP_D3DX9_33_INTERFACES "${RECOMP_D3D9_GENERATED_DIR}/d3dx9_33_interfaces.inc")
 add_custom_command(OUTPUT "${RECOMP_D3DX9_33_INTERFACES}"
   COMMAND ${CMAKE_COMMAND} -E make_directory "${RECOMP_D3D9_GENERATED_DIR}"
@@ -111,7 +100,7 @@ add_custom_command(OUTPUT "${RECOMP_D3DX9_IMPORTS}"
           "${CMAKE_CURRENT_SOURCE_DIR}/d3dx9_imports.json"
   VERBATIM)
 add_custom_target(d3d9_generated DEPENDS "${RECOMP_D3D9_INTERFACES}" "${RECOMP_D3D9_CONSTANTS}"
-                  "${RECOMP_D3DX9_INTERFACES}" "${RECOMP_D3DX9_33_INTERFACES}" "${RECOMP_D3DX9_IMPORTS}")
+                  "${RECOMP_D3DX9_33_INTERFACES}" "${RECOMP_D3DX9_IMPORTS}")
 
 add_library(recomp_dx OBJECT ${RECOMP_DX_SOURCES})
 add_dependencies(recomp_dx d3d8_com_tables d3d9_generated)
@@ -122,7 +111,6 @@ target_compile_options(recomp_dx PRIVATE ${RECOMP_WARN_HOST})
 recomp_optimize(recomp_dx 2)
 
 option(RECOMP_D3D8_WGPU "Build the Rust D3D8/wgpu renderer" OFF)
-option(RECOMP_D3D9_WGPU "Select the Rust D3D9/wgpu scaffold" OFF)
 set(RECOMP_D3D8_WGPU_DIR "")
 if(EXISTS "${RECOMP_GAME_DIR}/graphics/d3d8-wgpu/Cargo.toml")
   set(RECOMP_D3D8_WGPU_DIR "${RECOMP_GAME_DIR}/graphics/d3d8-wgpu")
@@ -202,9 +190,6 @@ if(RECOMP_D3D8_WGPU_DIR AND EXISTS "${RECOMP_D3D8_WGPU_DIR}/Cargo.toml")
   add_dependencies(d3d8_wgpu d3d8_wgpu_rust)
   if(RECOMP_D3D8_WGPU)
     target_compile_definitions(recomp_dx PRIVATE RECOMP_D3D8_WGPU=1)
-  endif()
-  if(RECOMP_D3D9_WGPU)
-    target_compile_definitions(recomp_dx PRIVATE RECOMP_D3D9_WGPU=1)
   endif()
   target_link_libraries(recomp_dx PUBLIC d3d8_wgpu)
 else()

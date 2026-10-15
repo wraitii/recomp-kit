@@ -87,8 +87,7 @@ def game_defines(game_dir, build_root):
     """The cache paths and the game's [render] switches, passed on every configure."""
     render = game_config.load(game_dir, build_root)["render"]
     return ["-DRECOMP_GAME_DIR=%s" % Path(game_dir).as_posix(), "-DRECOMP_BUILD_ROOT=%s" % Path(build_root).as_posix(),
-            "-DRECOMP_D3D8_WGPU=" + ("ON" if render["d3d8_wgpu"] else "OFF"),
-            "-DRECOMP_D3D9_WGPU=" + ("ON" if render["d3d9_wgpu"] else "OFF")]
+            "-DRECOMP_D3D8_WGPU=" + ("ON" if render["d3d8_wgpu"] else "OFF")]
 
 
 def configure(preset, extra=(), build_dir=None):

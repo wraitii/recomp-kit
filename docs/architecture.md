@@ -94,8 +94,9 @@ borrowed slices are copied before return; queued work retains its bytes and
 GPU handles. Global COM reset drops holders after guest heap reset and does not
 free stale guest allocations. The device owns one implicit swap chain: Rust
 creates the windowed back buffer and optional auto-depth target, validates
-presentation parameters for create and reset, and presents by reading the
-target back as owned CPU RGBA for the host seam. `Present`, `Reset`,
+presentation parameters for create and reset, and presents by handing the
+target's texture to the presenter, falling back to an owned CPU RGBA readback;
+source and destination rectangles go through a separate presented image. `Present`, `Reset`,
 `TestCooperativeLevel` and the presentation caps/`Check*` answers are Rust.
 A single shared loss/reset-required token is carried by the device and every
 resource's GPU clone, so blocked contexts stop GPU submissions without being
@@ -119,13 +120,16 @@ retains bound/recorded children internally; externally referenced children and
 level views retain the device through ref hooks. FVF declarations have an
 internal-only identity cache. Reset preserves shader/declaration objects, rejects
 live state blocks and clears pipeline bindings/defaults only at final commit.
-Shader execution, drawing, queries, additional swap chains and Windows resource
-interop remain deferred.
+Shader translation to WGSL, drawing, fixed-function vertex processing and
+event/occlusion queries are Rust; draws are batched per frame and submitted on
+a worker thread. Additional swap chains and Windows resource interop are not
+implemented.
 
-D3DX buffers will own bytes, constant tables will own reflection data, and
-effects, effect compilers and pools will own parameters, preshaders and shared
-values in Rust. C++ retains the COM identity and marshals guest calls for every
-D3D9 and D3DX object. Unported shader/state/query and D3DX methods fail by name.
+D3DX buffers own bytes, constant tables own reflection data, and effects and
+pools own parameters, preshaders and shared values in Rust. C++ retains the COM
+identity and marshals guest calls for every D3D9 and D3DX object, and the
+`d3dx9_26` effect entry points create the same Rust-backed objects as
+`d3dx9_33`. Unported shader/state/query and D3DX methods fail by name.
 
 ## A frame through the host
 

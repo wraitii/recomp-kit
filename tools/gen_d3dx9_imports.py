@@ -61,16 +61,7 @@ def render(references, spec, sdk_version):
     lines.append('static const ImportShim ' + table + '[] = {')
     for entry in sorted(spec['imports'], key=lambda item: item['name']):
         argc = declaration_arity(text, entry['name'])
-        if entry.get('flag_on') is not None:
-            lines.extend([
-                '#ifdef RECOMP_D3D9_WGPU',
-                f'    {{"{dll}", "{entry["name"]}", {argc}, {entry["handler"]}}},',
-                '#else',
-                f'    {{"{dll}", "{entry["name"]}", {argc}, imports_unsupported}},',
-                '#endif',
-            ])
-        else:
-            lines.append(f'    {{"{dll}", "{entry["name"]}", {argc}, {entry["handler"]}}},')
+        lines.append(f'    {{"{dll}", "{entry["name"]}", {argc}, {entry["handler"]}}},')
     lines.extend(['};', ''])
     return '\n'.join(lines)
 

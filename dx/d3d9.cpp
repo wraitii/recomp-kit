@@ -3,10 +3,6 @@
 #include "../runtime/guest.h"
 #include "../runtime/memory.h"
 #include "host_api.h"
-#include "d3d9_pipeline.h"
-#include "d3d9_raster.h"
-#include "d3d9_shader.h"
-#include "host_d9.h"
 #include "frame_dump.h"
 #include "d3d9_constants.inc"
 #include "d3d_bridge_helpers.h"
@@ -15,11 +11,6 @@
 #include "../runtime/win32.h"
 #include "../platform/os.h"
 #include "../runtime/display_seam.h"
-#ifdef RECOMP_D3D9_WGPU
-constexpr bool kD3d9WgpuEnabled = true;
-#else
-constexpr bool kD3d9WgpuEnabled = false;
-#endif
 #include <unordered_map>
 #include <map>
 #include <set>
@@ -76,11 +67,6 @@ static void d3d9_setup_guest_fpu(X86 *c, uint32_t behavior_flags) {
 struct ComObj;
 static ComObj *device_backbuffer(ComObj *dev);
 static ComObj *device_depthbuffer(ComObj *dev);
-static bool gpu_on();
-static HostD9Target gpu_target(ComObj *dev);
-static void target_viewport(ComObj *dev, const HostD9Target &t, int32_t vp[4]);
-static void gpu_target_drawn(ComObj *dev, bool color, bool depth);
-static void gpu_sync(ComObj *o);
 static void device_discard_implicit_surfaces(ComObj *dev);
 static bool implicit_surface_externally_referenced(uint32_t field);
 static void create_texture_wgpu(X86 *c, recomp::d3d::D3d9TextureKind kind);
@@ -94,17 +80,6 @@ static ComObj *level_owner(ComObj *o, uint32_t *face, uint32_t *level, bool *vol
 
 // One scratch block for structures a method fills in for the guest.
 static uint32_t g_scratch = 0, g_scratch_size = 0;
-static uint32_t scratch9(uint32_t n) {
-    if (g_scratch_size < n) {
-        if (g_scratch)
-            heap_free(g_scratch);
-        g_scratch = heap_alloc(n, true, 16);
-        g_scratch_size = g_scratch ? n : 0;
-    }
-    if (g_scratch)
-        memset(gm_ptr(g_scratch), 0, g_scratch_size);
-    return g_scratch;
-}
 
 static ComObj *this_d3d9(X86 *c) {
     ComObj *o = com_this_arg(c);
@@ -127,22 +102,6 @@ static bool d3d9_flush_resource_owner(X86 *c, ComObj *resource) {
 }
 
 static uint32_t g_d3d9_display_owner = 0;
-
-extern "C" bool d3d9_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp) {
-    ComObj *dev = g_d3d9_display_owner ? com_get(g_d3d9_display_owner) : nullptr;
-    if (!dev || !dev->d3d9_device)
-        return false;
-    recomp::d3d::D3d9PresentParams present = dev->d3d9_device->effective_present();
-    if (present.windowed != 0 || present.width == 0 || present.height == 0)
-        return false;
-    if (w)
-        *w = present.width;
-    if (h)
-        *h = present.height;
-    if (bpp)
-        *bpp = 32;
-    return true;
-}
 
 static void d3d9_clear_virtual_display(ComObj *dev) {
     if (!dev || g_d3d9_display_owner != dev->id)
@@ -358,47 +317,28 @@ void D9_GetAdapterCount(X86 *c) {
 // driver version, four ids, the identifier GUID and the WHQL level.
 void D9_GetAdapterIdentifier(X86 *c) {
     uint32_t out = arg(c, 3);
-    if (!out || (kD3d9WgpuEnabled && (!this_d3d9(c) || arg(c, 1) != 0 || !gm_valid(out, 1100)))) {
+    if (!out || !this_d3d9(c) || arg(c, 1) != 0 || !gm_valid(out, 1100)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (kD3d9WgpuEnabled) {
-        recomp::d3d::D3d9AdapterIdentifierResult result =
-            recomp::d3d::d3d9_adapter_identifier(arg(c, 1));
-        if (result.status.code != recomp::d3d::StatusCode::Ok) {
-            com_ret(c, bridge_result(c, result.status));
-            return;
-        }
-        memset(gm_ptr(out), 0, 1100);
-        std::string description(result.description.data(), result.description.size());
-        gm_put_str(out, "wgpu", 512);
-        gm_put_str(out + 512, description.c_str(), 512);
-        gm_put_str(out + 1024, "\\\\.\\DISPLAY1", 32);
-        wr32(out + 1056, result.driver_version_low);
-        wr32(out + 1060, result.driver_version_high);
-        wr32(out + 1064, result.vendor_id);
-        wr32(out + 1068, result.device_id);
-        wr32(out + 1072, result.sub_sys_id);
-        wr32(out + 1076, result.revision);
-        wr32(out + 1096, result.whql_level);
-        com_ret(c, D3D_OK9);
+    recomp::d3d::D3d9AdapterIdentifierResult result =
+        recomp::d3d::d3d9_adapter_identifier(arg(c, 1));
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
         return;
     }
     memset(gm_ptr(out), 0, 1100);
-    // Games of this era pick their feature set by vendor and device id, and
-    // turn off whatever they do not recognise (Most Wanted offers shadows
-    // only on NVIDIA and ATI). The renderer covers what a GeForce 7800 GTX
-    // offered, hardware shadow maps included, so that is the card it names.
-    gm_put_str(out, "nv4_disp.dll", 512);
-    gm_put_str(out + 512, "NVIDIA GeForce 7800 GTX", 512);
+    std::string description(result.description.data(), result.description.size());
+    gm_put_str(out, "wgpu", 512);
+    gm_put_str(out + 512, description.c_str(), 512);
     gm_put_str(out + 1024, "\\\\.\\DISPLAY1", 32);
-    // Driver[512], Description[512], DeviceName[32], then:
-    wr32(out + 1056, 0x000a249b); // DriverVersion 6.14.10.9371 (low, high)
-    wr32(out + 1060, 0x0006000e);
-    wr32(out + 1064, 0x10de); // VendorId
-    wr32(out + 1068, 0x0091); // DeviceId
-    wr32(out + 1076, 0xa1);   // Revision
-    wr32(out + 1096, 1);      // WHQLLevel: certified
+    wr32(out + 1056, result.driver_version_low);
+    wr32(out + 1060, result.driver_version_high);
+    wr32(out + 1064, result.vendor_id);
+    wr32(out + 1068, result.device_id);
+    wr32(out + 1072, result.sub_sys_id);
+    wr32(out + 1076, result.revision);
+    wr32(out + 1096, result.whql_level);
     com_ret(c, D3D_OK9);
 }
 
@@ -472,75 +412,50 @@ static void put_mode(uint32_t p, const recomp::d3d::D3d9DisplayMode &mode) {
 }
 
 void D9_GetAdapterModeCount(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        if (!this_d3d9(c) || arg(c, 1) != 0 || arg(c, 2) != d3d9_display_format(32)) {
-            set_eax(c, 0);
-            return;
-        }
-        set_eax(c, (uint32_t)d3d9_display_modes().size());
+    if (!this_d3d9(c) || arg(c, 1) != 0 || arg(c, 2) != d3d9_display_format(32)) {
+        set_eax(c, 0);
         return;
     }
-    set_eax(c, 1);
+    set_eax(c, (uint32_t)d3d9_display_modes().size());
 }
 
 static void put_display_mode(uint32_t p) {
     if (!p)
         return;
-    if (!kD3d9WgpuEnabled) {
-        wr32(p + 0, 1280);
-        wr32(p + 4, 960);
-        wr32(p + 8, 60);
-        wr32(p + 12, 22);
-        return;
-    }
     put_mode(p, d3d9_current_display_mode());
 }
 void D9_EnumAdapterModes(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        ComObj *d3d = this_d3d9(c);
-        uint32_t out = arg(c, 4);
-        uint32_t format = d3d9_display_format(32);
-        if (!d3d || arg(c, 1) != 0 || !out || !gm_valid(out, 16) || arg(c, 2) != format) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        std::vector<recomp::d3d::D3d9DisplayMode> modes = d3d9_display_modes();
-        uint32_t mode = arg(c, 3);
-        if (mode >= modes.size()) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        put_mode(out, modes[mode]);
-        com_ret(c, D3D_OK9);
+    ComObj *d3d = this_d3d9(c);
+    uint32_t out = arg(c, 4);
+    uint32_t format = d3d9_display_format(32);
+    if (!d3d || arg(c, 1) != 0 || !out || !gm_valid(out, 16) || arg(c, 2) != format) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    put_display_mode(arg(c, 4));
+    std::vector<recomp::d3d::D3d9DisplayMode> modes = d3d9_display_modes();
+    uint32_t mode = arg(c, 3);
+    if (mode >= modes.size()) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    put_mode(out, modes[mode]);
     com_ret(c, D3D_OK9);
 }
 void D9_GetAdapterDisplayMode(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        ComObj *d3d = this_d3d9(c);
-        uint32_t out = arg(c, 2);
-        if (!d3d || arg(c, 1) != 0 || !out || !gm_valid(out, 16)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        if (desktop_format9() == 0) {
-            com_ret(c, D3DERR_NOTAVAILABLE);
-            return;
-        }
-        put_display_mode(out);
-        com_ret(c, D3D_OK9);
+    ComObj *d3d = this_d3d9(c);
+    uint32_t out = arg(c, 2);
+    if (!d3d || arg(c, 1) != 0 || !out || !gm_valid(out, 16)) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    put_display_mode(arg(c, 2));
+    if (desktop_format9() == 0) {
+        com_ret(c, D3DERR_NOTAVAILABLE);
+        return;
+    }
+    put_display_mode(out);
     com_ret(c, D3D_OK9);
 }
 void D9_CheckDeviceType(X86 *c) {
-    if (!kD3d9WgpuEnabled) {
-        com_ret(c, D3D_OK9);
-        return;
-    }
     if (!this_d3d9(c)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -554,10 +469,6 @@ void D9_CheckDeviceType(X86 *c) {
     com_ret(c, bridge_result(c, recomp::d3d::d3d9_check_device_type(request)));
 }
 void D9_CheckDeviceFormat(X86 *c) {
-    if (!kD3d9WgpuEnabled) {
-        com_ret(c, D3D_OK9);
-        return;
-    }
     if (!this_d3d9(c)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -583,39 +494,23 @@ static uint32_t multisample_count(uint32_t type, uint32_t quality) {
 // (this, Adapter, DeviceType, SurfaceFormat, Windowed, MultiSampleType,
 // pQualityLevels)
 void D9_CheckDeviceMultiSampleType(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        uint32_t quality = arg(c, 6);
-        if (!this_d3d9(c) || (quality && !gm_valid(quality, 4))) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::D3d9CheckMultiSampleRequest request{};
-        request.adapter = arg(c, 1);
-        request.device_type = arg(c, 2);
-        request.surface_format = arg(c, 3);
-        request.windowed = arg(c, 4);
-        request.multisample_type = arg(c, 5);
-        recomp::d3d::ValueResult result = recomp::d3d::d3d9_check_device_multisample_type(request);
-        if (result.status.code == recomp::d3d::StatusCode::Ok && quality)
-            wr32(quality, result.value);
-        com_ret(c, bridge_result(c, result.status));
+    uint32_t quality = arg(c, 6);
+    if (!this_d3d9(c) || (quality && !gm_valid(quality, 4))) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    uint32_t type = arg(c, 5), quality = arg(c, 6);
-    uint32_t levels = type == 0 ? 1 : type == 1 ? 2 : (type == 2 || type == 4) ? 1 : 0;
-    if (!levels) {
-        com_ret(c, 0x8876086au); // D3DERR_NOTAVAILABLE
-        return;
-    }
-    if (quality && gm_valid(quality, 4))
-        wr32(quality, levels);
-    com_ret(c, D3D_OK9);
+    recomp::d3d::D3d9CheckMultiSampleRequest request{};
+    request.adapter = arg(c, 1);
+    request.device_type = arg(c, 2);
+    request.surface_format = arg(c, 3);
+    request.windowed = arg(c, 4);
+    request.multisample_type = arg(c, 5);
+    recomp::d3d::ValueResult result = recomp::d3d::d3d9_check_device_multisample_type(request);
+    if (result.status.code == recomp::d3d::StatusCode::Ok && quality)
+        wr32(quality, result.value);
+    com_ret(c, bridge_result(c, result.status));
 }
 void D9_CheckDepthStencilMatch(X86 *c) {
-    if (!kD3d9WgpuEnabled) {
-        com_ret(c, D3D_OK9);
-        return;
-    }
     if (!this_d3d9(c)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -629,10 +524,6 @@ void D9_CheckDepthStencilMatch(X86 *c) {
     com_ret(c, bridge_result(c, recomp::d3d::d3d9_check_depth_stencil_match(request)));
 }
 void D9_CheckDeviceFormatConversion(X86 *c) {
-    if (!kD3d9WgpuEnabled) {
-        com_ret(c, D3D_OK9);
-        return;
-    }
     if (!this_d3d9(c)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -649,118 +540,27 @@ void D9_CheckDeviceFormatConversion(X86 *c) {
 // renderer implements: shader model 3.0, trilinear and 16x anisotropic
 // filtering, the usual blend, compare and stencil sets, non-power-of-two
 // textures, four render targets.
-static void put_caps9(uint32_t p) {
-    if (!p)
-        return;
-    memset(gm_ptr(p), 0, 304);
-    auto f = [&](uint32_t off, float v) { wrf32(p + off, v); };
-    wr32(p + 0, D3DDEVTYPE_HAL);
-    wr32(p + 8, 0x00020000u);  // Caps: READ_SCANLINE
-    wr32(p + 12, 0x00020000u); // Caps2: FULLSCREENGAMMA
-    wr32(
-        p + 16,
-        0x000003a0u); // Caps3: ALPHA_FULLSCREEN_FLIP_OR_DISCARD, COPY_TO_VIDMEM, COPY_TO_SYSTEMMEM, LINEAR_TO_SRGB
-    wr32(p + 20, 0x8000000fu); // PresentationIntervals: IMMEDIATE, ONE..FOUR
-    wr32(p + 28, 0x001bbef0u); // DevCaps: HWTRANSFORMANDLIGHT, PUREDEVICE, HWRASTERIZATION, ...
-    wr32(
-        p + 32,
-        0x0003ccf2u); // PrimitiveMiscCaps: masks, cull modes, blend op, separate alpha, independent write masks
-    wr32(
-        p + 36,
-        0x0f732191u); // RasterCaps: dither, zbias, fog, anisotropy, scissor, slope-scale depth bias
-    wr32(p + 40, 0x000000ffu); // ZCmpCaps: all
-    wr32(p + 44, 0x00003fffu); // SrcBlendCaps: all, BLENDFACTOR
-    wr32(p + 48, 0x00003fffu); // DestBlendCaps
-    wr32(p + 52, 0x000000ffu); // AlphaCmpCaps
-    wr32(p + 56, 0x00084208u); // ShadeCaps
-    wr32(
-        p + 60,
-        0x0001ec45u); // TextureCaps: PERSPECTIVE, ALPHA, CUBEMAP, MIPMAP, MIPCUBEMAP, PROJECTED, VOLUMEMAP, ...
-    wr32(
-        p + 64,
-        0x03030700u); // TextureFilterCaps: MIN point/linear/aniso, MIP point/linear, MAG point/linear
-    wr32(p + 68, 0x03030300u);  // CubeTextureFilterCaps
-    wr32(p + 72, 0x03030300u);  // VolumeTextureFilterCaps
-    wr32(p + 76, 0x0000003fu);  // TextureAddressCaps
-    wr32(p + 80, 0x0000003fu);  // VolumeTextureAddressCaps
-    wr32(p + 84, 0x0000001fu);  // LineCaps
-    wr32(p + 88, 4096);         // MaxTextureWidth
-    wr32(p + 92, 4096);         // MaxTextureHeight
-    wr32(p + 96, 512);          // MaxVolumeExtent
-    wr32(p + 100, 8192);        // MaxTextureRepeat
-    wr32(p + 104, 8192);        // MaxTextureAspectRatio
-    wr32(p + 108, 16);          // MaxAnisotropy
-    f(112, 1e10f);              // MaxVertexW
-    f(116, -1e8f);              // GuardBandLeft
-    f(120, -1e8f);              // GuardBandTop
-    f(124, 1e8f);               // GuardBandRight
-    f(128, 1e8f);               // GuardBandBottom
-    wr32(p + 136, 0x000001ffu); // StencilCaps: all ops, TWOSIDED
-    wr32(p + 140, 0x00080008u); // FVFCaps: 8 texture coordinates, PSIZE
-    wr32(p + 144, 0x03feffffu); // TextureOpCaps
-    wr32(p + 148, 8);           // MaxTextureBlendStages
-    wr32(p + 152, 8);           // MaxSimultaneousTextures
-    wr32(p + 156, 0x0000007bu); // VertexProcessingCaps
-    wr32(p + 160, 8);           // MaxActiveLights
-    wr32(p + 164, 6);           // MaxUserClipPlanes
-    wr32(p + 168, 4);           // MaxVertexBlendMatrices
-    f(176, 8192.0f);            // MaxPointSize
-    wr32(p + 180, 1048575);     // MaxPrimitiveCount
-    wr32(p + 184, 1048575);     // MaxVertexIndex
-    wr32(p + 188, 16);          // MaxStreams
-    wr32(p + 192, 255);         // MaxStreamStride
-    wr32(p + 196, 0xfffe0300u); // VertexShaderVersion vs_3_0
-    wr32(p + 200, 256);         // MaxVertexShaderConst
-    wr32(p + 204, 0xffff0300u); // PixelShaderVersion ps_3_0
-    f(208, 3.4e38f);            // PixelShaderMaxValue
-    wr32(
-        p + 212,
-        0x00000051u); // DevCaps2: STREAMOFFSET, CAN_STRETCHRECT_FROM_TEXTURES, VERTEXELEMENTSCANSHARESTREAMOFFSET
-    wr32(p + 232, 1);           // NumberOfAdaptersInGroup
-    wr32(p + 236, 0x0000030fu); // DeclTypes
-    wr32(p + 240, 4);           // NumSimultaneousRTs
-    wr32(p + 244, 0x03000300u); // StretchRectFilterCaps: point, linear
-    wr32(p + 248, 1);           // VS20Caps.Caps: PREDICATION
-    wr32(p + 252, 24);          // VS20Caps.DynamicFlowControlDepth
-    wr32(p + 256, 32);          // VS20Caps.NumTemps
-    wr32(p + 260, 4);           // VS20Caps.StaticFlowControlDepth
-    wr32(p + 264, 0x1f);        // PS20Caps.Caps
-    wr32(p + 268, 24);          // PS20Caps.DynamicFlowControlDepth
-    wr32(p + 272, 32);          // PS20Caps.NumTemps
-    wr32(p + 276, 4);           // PS20Caps.StaticFlowControlDepth
-    wr32(p + 280, 512);         // PS20Caps.NumInstructionSlots
-    wr32(p + 284, 0x00000300u); // VertexTextureFilterCaps
-    wr32(p + 288, 0xffffffffu); // MaxVShaderInstructionsExecuted
-    wr32(p + 292, 0xffffffffu); // MaxPShaderInstructionsExecuted
-    wr32(p + 296, 32768);       // MaxVertexShader30InstructionSlots
-    wr32(p + 300, 32768);       // MaxPixelShader30InstructionSlots
-}
 void D9_GetDeviceCaps(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        uint32_t out = arg(c, 3);
-        if (!this_d3d9(c) || arg(c, 1) != 0 || arg(c, 2) < D3DDEVTYPE_HAL || arg(c, 2) > 3 ||
-            !out || !gm_valid(out, 304)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        if (arg(c, 2) != D3DDEVTYPE_HAL) {
-            com_ret(c, D3DERR_NOTAVAILABLE);
-            return;
-        }
-        recomp::d3d::D3d9CapsResult result = recomp::d3d::d3d9_adapter_caps(arg(c, 1));
-        if (result.status.code != recomp::d3d::StatusCode::Ok || result.caps.size() != 304) {
-            com_ret(c, bridge_result(c, result.status));
-            return;
-        }
-        memcpy(gm_ptr(out), result.caps.data(), 304);
-        com_ret(c, D3D_OK9);
+    uint32_t out = arg(c, 3);
+    if (!this_d3d9(c) || arg(c, 1) != 0 || arg(c, 2) < D3DDEVTYPE_HAL || arg(c, 2) > 3 ||
+        !out || !gm_valid(out, 304)) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    put_caps9(arg(c, 3));
+    if (arg(c, 2) != D3DDEVTYPE_HAL) {
+        com_ret(c, D3DERR_NOTAVAILABLE);
+        return;
+    }
+    recomp::d3d::D3d9CapsResult result = recomp::d3d::d3d9_adapter_caps(arg(c, 1));
+    if (result.status.code != recomp::d3d::StatusCode::Ok || result.caps.size() != 304) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    memcpy(gm_ptr(out), result.caps.data(), 304);
     com_ret(c, D3D_OK9);
 }
 void D9_GetAdapterMonitor(X86 *c) {
-    if (kD3d9WgpuEnabled && (!this_d3d9(c) || arg(c, 1) != 0)) {
+    if (!this_d3d9(c) || arg(c, 1) != 0) {
         set_eax(c, 0);
         return;
     }
@@ -774,128 +574,84 @@ void D9_CreateDevice(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (kD3d9WgpuEnabled)
-        com_out_ptr(out, 0);
+    com_out_ptr(out, 0);
     if (!d3d) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (kD3d9WgpuEnabled) {
-        if (!present || !gm_valid(present, 56)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::D3d9DeviceRequest request{};
-        request.adapter = arg(c, 1);
-        request.device_type = arg(c, 2);
-        request.behavior_flags = arg(c, 4);
-        request.present.width = rd32(present + 0);
-        request.present.height = rd32(present + 4);
-        request.present.format = rd32(present + 8);
-        request.present.count = rd32(present + 12);
-        request.present.multisample_type = rd32(present + 16);
-        request.present.multisample_quality = rd32(present + 20);
-        request.present.swap_effect = rd32(present + 24);
-        request.present.windowed = rd32(present + 32);
-        request.present.enable_auto_depth_stencil = rd32(present + 36);
-        request.present.auto_depth_stencil_format = rd32(present + 40);
-        request.present.flags = rd32(present + 44);
-        request.present.fullscreen_refresh_rate = rd32(present + 48);
-        request.present.presentation_interval = rd32(present + 52);
-        uint32_t focus_window = arg(c, 3);
-        uint32_t device_window = rd32(present + 28);
-        if (!device_window)
-            device_window = focus_window;
-        if (focus_window && !host_window_rect(focus_window, nullptr, nullptr, nullptr, nullptr)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        if (request.present.windowed) {
-            int32_t w = 0, h = 0;
-            if (!device_window || !host_window_rect(device_window, nullptr, nullptr, &w, &h) ||
-                w <= 0 || h <= 0) {
-                com_ret(c, D3DERR_INVALIDCALL);
-                return;
-            }
-            if (!request.present.width)
-                request.present.width = (uint32_t)w;
-            if (!request.present.height)
-                request.present.height = (uint32_t)h;
-        } else if (!focus_window || !win32_top_level(focus_window) || !device_window ||
-                   !win32_top_level(device_window)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        request.display_mode = d3d9_device_display_mode(request.present);
-        ComObj *dev = com_new(K_D3D9DEVICE);
-        if (!dev) {
-            com_ret(c, E_OUTOFMEMORY);
-            return;
-        }
-        dev->dev_d3d = d3d->id;
-        com_addref(d3d);
-        dev->d3d9_focus_window = focus_window;
-        dev->hwnd = device_window;
-        dev->d3d9_device = std::make_shared<D3d9HostDevice>();
-        uint16_t previous_cw = c->fpu_cw;
-        d3d9_setup_guest_fpu(c, request.behavior_flags);
-        LOGW("d3d9: CreateDevice windowed=%u %ux%u fmt=%u count=%u msaa=%u/%u swap=%u flags=0x%x "
-             "refresh=%u interval=0x%x behavior=0x%x desktop=%ux%u fmt=%u FPU CW %04x -> %04x",
-             request.present.windowed, request.present.width, request.present.height,
-             request.present.format, request.present.count, request.present.multisample_type,
-             request.present.multisample_quality, request.present.swap_effect,
-             request.present.flags, request.present.fullscreen_refresh_rate,
-             request.present.presentation_interval, request.behavior_flags,
-             request.display_mode.width, request.display_mode.height, request.display_mode.format,
-             previous_cw, c->fpu_cw);
-        recomp::d3d::D3d9CreateResult result =
-            recomp::d3d::d3d9_create_device(*dev->d3d9_device->value, request);
-        if (result.status.code != recomp::d3d::StatusCode::Ok) {
-            com_release(dev);
-            com_ret(c, bridge_result(c, result.status));
-            return;
-        }
-        uint32_t view = com_view(dev, IF_D3DDEVICE9);
-        if (!view) {
-            com_release(dev);
-            com_ret(c, E_OUTOFMEMORY);
-            return;
-        }
-        wr32(present + 0, result.present.width);
-        wr32(present + 4, result.present.height);
-        wr32(present + 8, result.present.format);
-        wr32(present + 12, result.present.count);
-        wr32(present + 16, result.present.multisample_type);
-        wr32(present + 20, result.present.multisample_quality);
-        wr32(present + 24, result.present.swap_effect);
-        wr32(present + 36, result.present.enable_auto_depth_stencil);
-        wr32(present + 40, result.present.auto_depth_stencil_format);
-        wr32(present + 44, result.present.flags);
-        wr32(present + 48, result.present.fullscreen_refresh_rate);
-        wr32(present + 52, result.present.presentation_interval);
-        dev->width = result.present.width;
-        dev->height = result.present.height;
-        dev->bpp = 32;
-        d3d9_sync_virtual_display(c, dev, dev->hwnd);
-        com_out_ptr(out, view);
-        com_ret(c, D3D_OK9);
+    if (!present || !gm_valid(present, 56)) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    com_out_ptr(out, 0);
+    recomp::d3d::D3d9DeviceRequest request{};
+    request.adapter = arg(c, 1);
+    request.device_type = arg(c, 2);
+    request.behavior_flags = arg(c, 4);
+    request.present.width = rd32(present + 0);
+    request.present.height = rd32(present + 4);
+    request.present.format = rd32(present + 8);
+    request.present.count = rd32(present + 12);
+    request.present.multisample_type = rd32(present + 16);
+    request.present.multisample_quality = rd32(present + 20);
+    request.present.swap_effect = rd32(present + 24);
+    request.present.windowed = rd32(present + 32);
+    request.present.enable_auto_depth_stencil = rd32(present + 36);
+    request.present.auto_depth_stencil_format = rd32(present + 40);
+    request.present.flags = rd32(present + 44);
+    request.present.fullscreen_refresh_rate = rd32(present + 48);
+    request.present.presentation_interval = rd32(present + 52);
+    uint32_t focus_window = arg(c, 3);
+    uint32_t device_window = rd32(present + 28);
+    if (!device_window)
+        device_window = focus_window;
+    if (focus_window && !host_window_rect(focus_window, nullptr, nullptr, nullptr, nullptr)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (request.present.windowed) {
+        int32_t w = 0, h = 0;
+        if (!device_window || !host_window_rect(device_window, nullptr, nullptr, &w, &h) ||
+            w <= 0 || h <= 0) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        if (!request.present.width)
+            request.present.width = (uint32_t)w;
+        if (!request.present.height)
+            request.present.height = (uint32_t)h;
+    } else if (!focus_window || !win32_top_level(focus_window) || !device_window ||
+               !win32_top_level(device_window)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    request.display_mode = d3d9_device_display_mode(request.present);
     ComObj *dev = com_new(K_D3D9DEVICE);
     if (!dev) {
         com_ret(c, E_OUTOFMEMORY);
         return;
     }
     dev->dev_d3d = d3d->id;
-    // D3DPRESENT_PARAMETERS: back buffer size and format first, the device
-    // window at 28 and Windowed at 32.
-    if (present) {
-        dev->width = rd32(present + 0);
-        dev->height = rd32(present + 4);
-        dev->bpp = 32;
-        dev->hwnd = rd32(present + 28);
-        dev->samples = multisample_count(rd32(present + 16), rd32(present + 20));
+    com_addref(d3d);
+    dev->d3d9_focus_window = focus_window;
+    dev->hwnd = device_window;
+    dev->d3d9_device = std::make_shared<D3d9HostDevice>();
+    uint16_t previous_cw = c->fpu_cw;
+    d3d9_setup_guest_fpu(c, request.behavior_flags);
+    LOGW("d3d9: CreateDevice windowed=%u %ux%u fmt=%u count=%u msaa=%u/%u swap=%u flags=0x%x "
+         "refresh=%u interval=0x%x behavior=0x%x desktop=%ux%u fmt=%u FPU CW %04x -> %04x",
+         request.present.windowed, request.present.width, request.present.height,
+         request.present.format, request.present.count, request.present.multisample_type,
+         request.present.multisample_quality, request.present.swap_effect,
+         request.present.flags, request.present.fullscreen_refresh_rate,
+         request.present.presentation_interval, request.behavior_flags,
+         request.display_mode.width, request.display_mode.height, request.display_mode.format,
+         previous_cw, c->fpu_cw);
+    recomp::d3d::D3d9CreateResult result =
+        recomp::d3d::d3d9_create_device(*dev->d3d9_device->value, request);
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_release(dev);
+        com_ret(c, bridge_result(c, result.status));
+        return;
     }
     uint32_t view = com_view(dev, IF_D3DDEVICE9);
     if (!view) {
@@ -903,20 +659,22 @@ void D9_CreateDevice(X86 *c) {
         com_ret(c, E_OUTOFMEMORY);
         return;
     }
-    {
-        ComObj *bb = device_backbuffer(dev);
-        D9Pipeline &pl = d9_pipeline(dev->id);
-        pl.color_target[0] = bb ? bb->id : 0;
-        pl.scissor[2] = (int32_t)dev->width;
-        pl.scissor[3] = (int32_t)dev->height;
-        if (present && rd32(present + 36)) {
-            device_depthbuffer(dev);
-            pl.rs[7] = 1; // ZENABLE defaults on with an automatic depth buffer
-            pl.states_changed();
-        }
-    }
-    LOGW("d3d9: CreateDevice %ux%u, window %08x, %s renderer", dev->width, dev->height, dev->hwnd,
-         host_d9_active() ? "GPU" : "CPU");
+    wr32(present + 0, result.present.width);
+    wr32(present + 4, result.present.height);
+    wr32(present + 8, result.present.format);
+    wr32(present + 12, result.present.count);
+    wr32(present + 16, result.present.multisample_type);
+    wr32(present + 20, result.present.multisample_quality);
+    wr32(present + 24, result.present.swap_effect);
+    wr32(present + 36, result.present.enable_auto_depth_stencil);
+    wr32(present + 40, result.present.auto_depth_stencil_format);
+    wr32(present + 44, result.present.flags);
+    wr32(present + 48, result.present.fullscreen_refresh_rate);
+    wr32(present + 52, result.present.presentation_interval);
+    dev->width = result.present.width;
+    dev->height = result.present.height;
+    dev->bpp = 32;
+    d3d9_sync_virtual_display(c, dev, dev->hwnd);
     com_out_ptr(out, view);
     com_ret(c, D3D_OK9);
 }
@@ -928,25 +686,17 @@ static ComObj *device_depthbuffer(ComObj *dev);
 void Dev_SetScissorRect(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t r = arg(c, 1);
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device || !r || !gm_valid(r, 16)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        com_ret(c, bridge_result(c, dev->d3d9_device->set_scissor(
-                                        (int32_t)rd32(r), (int32_t)rd32(r + 4),
-                                        (int32_t)rd32(r + 8), (int32_t)rd32(r + 12))));
+    if (!dev || !dev->d3d9_device || !r || !gm_valid(r, 16)) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (dev && r)
-        for (int i = 0; i < 4; ++i)
-            d9_pipeline(dev->id).scissor[i] = (int32_t)rd32(r + 4u * (uint32_t)i);
-    com_ret(c, dev && r ? D3D_OK9 : D3DERR_INVALIDCALL);
+    com_ret(c, bridge_result(c, dev->d3d9_device->set_scissor(
+                                    (int32_t)rd32(r), (int32_t)rd32(r + 4),
+                                    (int32_t)rd32(r + 8), (int32_t)rd32(r + 12))));
 }
 
 static ComObj *device_backbuffer(ComObj *dev);
 static ComObj *device_depthbuffer(ComObj *dev);
-static void device_forget_buffers(ComObj *dev);
 
 static void d3d9_reset_transaction(ComObj *dev, const recomp::d3d::D3d9ResetRequest &request,
                                    recomp::d3d::D3d9ResetResult &result) {
@@ -998,148 +748,111 @@ void Dev_Reset(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (kD3d9WgpuEnabled) {
-        if (!dev->d3d9_device || !gm_valid(present, 56)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::D3d9ResetRequest request{};
-        request.present.width = rd32(present + 0);
-        request.present.height = rd32(present + 4);
-        request.present.format = rd32(present + 8);
-        request.present.count = rd32(present + 12);
-        request.present.multisample_type = rd32(present + 16);
-        request.present.multisample_quality = rd32(present + 20);
-        request.present.swap_effect = rd32(present + 24);
-        request.present.windowed = rd32(present + 32);
-        request.present.enable_auto_depth_stencil = rd32(present + 36);
-        request.present.auto_depth_stencil_format = rd32(present + 40);
-        request.present.flags = rd32(present + 44);
-        request.present.fullscreen_refresh_rate = rd32(present + 48);
-        request.present.presentation_interval = rd32(present + 52);
-        uint32_t focus_window = dev->d3d9_focus_window;
-        uint32_t device_window = rd32(present + 28);
-        if (!device_window)
-            device_window = focus_window;
-        bool windowed = request.present.windowed != 0;
-        request.window_valid = false;
-        if (windowed) {
-            int32_t w = 0, h = 0;
-            if (device_window && host_window_rect(device_window, nullptr, nullptr, &w, &h) &&
-                w > 0 && h > 0) {
-                if (!request.present.width)
-                    request.present.width = (uint32_t)w;
-                if (!request.present.height)
-                    request.present.height = (uint32_t)h;
-                request.window_valid = true;
-            }
-        } else {
-            request.window_valid = focus_window && win32_top_level(focus_window) && device_window &&
-                                   win32_top_level(device_window);
-        }
-        request.implicit_external_refs =
-            implicit_surface_externally_referenced(dev->d3d9_backbuffer) ||
-            implicit_surface_externally_referenced(dev->d3d9_depthbuffer);
-        request.display_mode = d3d9_device_display_mode(request.present);
-        recomp::d3d::D3d9ResetResult result{};
-        d3d9_reset_transaction(dev, request, result);
-        wr32(present + 0, result.present.width);
-        wr32(present + 4, result.present.height);
-        wr32(present + 8, result.present.format);
-        wr32(present + 12, result.present.count);
-        if (result.status.code != recomp::d3d::StatusCode::Ok) {
-            com_ret(c, bridge_result(c, result.status));
-            return;
-        }
-        if (dev->hwnd != device_window)
-            win32_uncover_display(c, dev->hwnd);
-        dev->hwnd = device_window;
-        device_discard_implicit_surfaces(dev);
-        d3d9_sync_virtual_display(c, dev, dev->hwnd);
-        LOGW("d3d9: Reset to %ux%u windowed=%u", request.present.width, request.present.height,
-             request.present.windowed);
-        com_ret(c, D3D_OK9);
+    if (!dev->d3d9_device || !gm_valid(present, 56)) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    dev->width = rd32(present + 0);
-    dev->height = rd32(present + 4);
-    dev->samples = multisample_count(rd32(present + 16), rd32(present + 20));
-    device_forget_buffers(dev);
-    ComObj *bb = device_backbuffer(dev);
-    dev->render_target = bb ? bb->id : 0;
-    D9Pipeline &pl = d9_pipeline(dev->id);
-    pl.color_target[0] = dev->render_target;
-    for (int i = 1; i < 4; ++i)
-        pl.color_target[i] = 0;
-    pl.viewport_set = false;
-    pl.scissor[0] = pl.scissor[1] = 0;
-    pl.scissor[2] = (int32_t)dev->width;
-    pl.scissor[3] = (int32_t)dev->height;
-    if (rd32(present + 36)) { // EnableAutoDepthStencil
-        device_depthbuffer(dev);
-        pl.rs[7] = 1;
-        pl.states_changed();
-    } else
-        dev->zbuffer_obj = 0;
-    LOGW("d3d9: Reset to %ux%u", dev->width, dev->height);
+    recomp::d3d::D3d9ResetRequest request{};
+    request.present.width = rd32(present + 0);
+    request.present.height = rd32(present + 4);
+    request.present.format = rd32(present + 8);
+    request.present.count = rd32(present + 12);
+    request.present.multisample_type = rd32(present + 16);
+    request.present.multisample_quality = rd32(present + 20);
+    request.present.swap_effect = rd32(present + 24);
+    request.present.windowed = rd32(present + 32);
+    request.present.enable_auto_depth_stencil = rd32(present + 36);
+    request.present.auto_depth_stencil_format = rd32(present + 40);
+    request.present.flags = rd32(present + 44);
+    request.present.fullscreen_refresh_rate = rd32(present + 48);
+    request.present.presentation_interval = rd32(present + 52);
+    uint32_t focus_window = dev->d3d9_focus_window;
+    uint32_t device_window = rd32(present + 28);
+    if (!device_window)
+        device_window = focus_window;
+    bool windowed = request.present.windowed != 0;
+    request.window_valid = false;
+    if (windowed) {
+        int32_t w = 0, h = 0;
+        if (device_window && host_window_rect(device_window, nullptr, nullptr, &w, &h) &&
+            w > 0 && h > 0) {
+            if (!request.present.width)
+                request.present.width = (uint32_t)w;
+            if (!request.present.height)
+                request.present.height = (uint32_t)h;
+            request.window_valid = true;
+        }
+    } else {
+        request.window_valid = focus_window && win32_top_level(focus_window) && device_window &&
+                               win32_top_level(device_window);
+    }
+    request.implicit_external_refs =
+        implicit_surface_externally_referenced(dev->d3d9_backbuffer) ||
+        implicit_surface_externally_referenced(dev->d3d9_depthbuffer);
+    request.display_mode = d3d9_device_display_mode(request.present);
+    recomp::d3d::D3d9ResetResult result{};
+    d3d9_reset_transaction(dev, request, result);
+    wr32(present + 0, result.present.width);
+    wr32(present + 4, result.present.height);
+    wr32(present + 8, result.present.format);
+    wr32(present + 12, result.present.count);
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    if (dev->hwnd != device_window)
+        win32_uncover_display(c, dev->hwnd);
+    dev->hwnd = device_window;
+    device_discard_implicit_surfaces(dev);
+    d3d9_sync_virtual_display(c, dev, dev->hwnd);
+    LOGW("d3d9: Reset to %ux%u windowed=%u", request.present.width, request.present.height,
+         request.present.windowed);
     com_ret(c, D3D_OK9);
 }
 
 void Dev_TestCooperativeLevel(X86 *c) {
     ComObj *dev = this_device9(c);
-    if (!dev || (kD3d9WgpuEnabled && !dev->d3d9_device)) {
+    if (!dev || !dev->d3d9_device) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (kD3d9WgpuEnabled) {
-        recomp::d3d::ValueResult result = dev->d3d9_device->test_cooperative_level();
-        if (result.status.code != recomp::d3d::StatusCode::Ok) {
-            com_ret(c, bridge_result(c, result.status));
-            return;
-        }
-        if (result.value == 1) {
-            com_ret(c, D3DERR_DEVICELOST);
-            return;
-        }
-        if (result.value == 2) {
-            com_ret(c, D3DERR_DEVICENOTRESET);
-            return;
-        }
-        com_ret(c, D3D_OK9);
+    recomp::d3d::ValueResult result = dev->d3d9_device->test_cooperative_level();
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    if (result.value == 1) {
+        com_ret(c, D3DERR_DEVICELOST);
+        return;
+    }
+    if (result.value == 2) {
+        com_ret(c, D3DERR_DEVICENOTRESET);
         return;
     }
     com_ret(c, D3D_OK9);
 }
 void Dev_GetAvailableTextureMem(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        ComObj *dev = this_device9(c);
-        if (!dev || !dev->d3d9_device) {
-            imports_unsupported(c);
-            return;
-        }
-        recomp::d3d::ValueResult result = dev->d3d9_device->available_texture_mem();
-        if (result.status.code != recomp::d3d::StatusCode::Ok) {
-            std::string message(result.status.message.data(), result.status.message.size());
-            LOGW("d3d9: GetAvailableTextureMem: %s", message.c_str());
-            imports_unsupported(c);
-            return;
-        }
-        set_eax(c, result.value);
+    ComObj *dev = this_device9(c);
+    if (!dev || !dev->d3d9_device) {
+        imports_unsupported(c);
         return;
     }
-    set_eax(c, 256u * 1024u * 1024u);
+    recomp::d3d::ValueResult result = dev->d3d9_device->available_texture_mem();
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        std::string message(result.status.message.data(), result.status.message.size());
+        LOGW("d3d9: GetAvailableTextureMem: %s", message.c_str());
+        imports_unsupported(c);
+        return;
+    }
+    set_eax(c, result.value);
 }
 void Dev_GetNumberOfSwapChains(X86 *c) {
     ComObj *dev = this_device9(c);
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        set_eax(c, dev->d3d9_device->number_of_swap_chains().value);
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    set_eax(c, 1);
+    set_eax(c, dev->d3d9_device->number_of_swap_chains().value);
 }
 // (this, iSwapChain, pMode)
 void Dev_GetDisplayMode(X86 *c) {
@@ -1149,31 +862,26 @@ void Dev_GetDisplayMode(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (kD3d9WgpuEnabled) {
-        if (arg(c, 1) != 0 || !dev->d3d9_device) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::D3d9DisplayMode mode = d3d9_current_display_mode();
-        recomp::d3d::D3d9DisplayModeRequest request{};
-        request.swap_chain = arg(c, 1);
-        request.width = mode.width;
-        request.height = mode.height;
-        request.refresh_rate = mode.refresh_rate;
-        request.format = mode.format;
-        recomp::d3d::D3d9DisplayModeResult result = dev->d3d9_device->display_mode(request);
-        if (result.status.code != recomp::d3d::StatusCode::Ok) {
-            com_ret(c, bridge_result(c, result.status));
-            return;
-        }
-        wr32(out + 0, result.width);
-        wr32(out + 4, result.height);
-        wr32(out + 8, result.refresh_rate);
-        wr32(out + 12, result.format);
-        com_ret(c, D3D_OK9);
+    if (arg(c, 1) != 0 || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    put_display_mode(out);
+    recomp::d3d::D3d9DisplayMode mode = d3d9_current_display_mode();
+    recomp::d3d::D3d9DisplayModeRequest request{};
+    request.swap_chain = arg(c, 1);
+    request.width = mode.width;
+    request.height = mode.height;
+    request.refresh_rate = mode.refresh_rate;
+    request.format = mode.format;
+    recomp::d3d::D3d9DisplayModeResult result = dev->d3d9_device->display_mode(request);
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    wr32(out + 0, result.width);
+    wr32(out + 4, result.height);
+    wr32(out + 8, result.refresh_rate);
+    wr32(out + 12, result.format);
     com_ret(c, D3D_OK9);
 }
 void Dev_GetDirect3D(X86 *c) {
@@ -1194,10 +902,6 @@ void Dev_GetDirect3D(X86 *c) {
     com_ret(c, D3D_OK9);
 }
 void Dev_GetCreationParameters(X86 *c) {
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 1);
     if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 16)) {
@@ -1218,23 +922,18 @@ void Dev_GetCreationParameters(X86 *c) {
 }
 void Dev_GetDeviceCaps(X86 *c) {
     uint32_t out = arg(c, 1);
-    if (kD3d9WgpuEnabled) {
-        ComObj *dev = this_device9(c);
-        if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 304)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::D3d9CapsResult result = dev->d3d9_device->caps();
-        if (result.status.code != recomp::d3d::StatusCode::Ok) {
-            com_ret(c, bridge_result(c, result.status));
-            return;
-        }
-        if (result.caps.size() >= 304)
-            memcpy(gm_ptr(out), result.caps.data(), 304);
-        com_ret(c, D3D_OK9);
+    ComObj *dev = this_device9(c);
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 304)) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    put_caps9(out);
+    recomp::d3d::D3d9CapsResult result = dev->d3d9_device->caps();
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    if (result.caps.size() >= 304)
+        memcpy(gm_ptr(out), result.caps.data(), 304);
     com_ret(c, D3D_OK9);
 }
 void Dev_EvictManagedResources(X86 *c) {
@@ -1242,31 +941,19 @@ void Dev_EvictManagedResources(X86 *c) {
 }
 void Dev_BeginScene(X86 *c) {
     ComObj *dev = this_device9(c);
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        com_ret(c, bridge_result(c, dev->d3d9_device->begin_scene()));
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (dev)
-        dev->in_scene = true;
-    com_ret(c, dev ? D3D_OK9 : D3DERR_INVALIDCALL);
+    com_ret(c, bridge_result(c, dev->d3d9_device->begin_scene()));
 }
 void Dev_EndScene(X86 *c) {
     ComObj *dev = this_device9(c);
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        com_ret(c, bridge_result(c, dev->d3d9_device->end_scene()));
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (dev)
-        dev->in_scene = false;
-    com_ret(c, dev ? D3D_OK9 : D3DERR_INVALIDCALL);
+    com_ret(c, bridge_result(c, dev->d3d9_device->end_scene()));
 }
 // Defined with the resources below.
 static ComObj *device_backbuffer(ComObj *dev);
@@ -1282,82 +969,33 @@ void Dev_Clear(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (kD3d9WgpuEnabled) {
-        if (!dev->d3d9_device) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        if ((!count && rects) ||
-            (count && (count > 0x0fffffffu || !rects || !gm_fits(rects, count * 16u)))) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        std::vector<recomp::d3d::D3d9Rect> list;
-        list.reserve(count);
-        for (uint32_t i = 0; i < count; ++i) {
-            recomp::d3d::D3d9Rect r;
-            uint32_t a = rects + i * 16u;
-            r.left = (int32_t)rd32(a);
-            r.top = (int32_t)rd32(a + 4);
-            r.right = (int32_t)rd32(a + 8);
-            r.bottom = (int32_t)rd32(a + 12);
-            list.push_back(r);
-        }
-        float z;
-        uint32_t zbits = arg(c, 5);
-        memcpy(&z, &zbits, 4);
-        rust::Slice<const recomp::d3d::D3d9Rect> rect_slice(list.empty() ? nullptr : list.data(),
-                                                            list.size());
-        com_ret(c,
-                bridge_result(c, dev->d3d9_device->clear(flags, color, z, arg(c, 6), rect_slice)));
+    if (!dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (gpu_on()) {
-        HostD9Target target = gpu_target(dev);
-        int32_t vp[4];
-        target_viewport(dev, target, vp);
-        std::vector<int32_t> rs;
-        if (count && rects && gm_fits(rects, count * 16u))
-            for (uint32_t i = 0; i < count * 4; ++i)
-                rs.push_back((int32_t)rd32(rects + 4 * i));
-        float z;
-        uint32_t zbits = arg(c, 5);
-        memcpy(&z, &zbits, 4);
-        host_d9_clear(&target, vp, (uint32_t)(rs.size() / 4), rs.empty() ? nullptr : rs.data(),
-                      flags, color, z, arg(c, 6));
-        gpu_target_drawn(dev, flags & 1u, flags & 6u);
-        com_ret(c, D3D_OK9);
+    if ((!count && rects) ||
+        (count && (count > 0x0fffffffu || !rects || !gm_fits(rects, count * 16u)))) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    ComObj *s = com_get(dev->render_target);
-    if (!s)
-        s = device_backbuffer(dev);
-    static uint32_t g_clears = 0;
-    if (++g_clears <= 24)
-        LOGW("d3d9: clear %u: flags %x colour %08x rects %u, target %u (%ux%u, %u bpp)%s", g_clears,
-             flags, color, count, s ? s->id : 0, s ? s->width : 0, s ? s->height : 0,
-             s ? s->bpp : 0, (s && s->id == dev->palette_obj) ? ", the back buffer" : "");
-    uint8_t *bytes = resource_bytes(s);
-    if ((flags & 1u) && bytes && s->bpp == 32) {
-        uint32_t n = (count && rects) ? count : 1;
-        for (uint32_t r = 0; r < n; ++r) {
-            int32_t x1 = 0, y1 = 0, x2 = (int32_t)s->width, y2 = (int32_t)s->height;
-            if (count && rects) {
-                uint32_t q = rects + r * 16u;
-                x1 = std::max(x1, (int32_t)rd32(q));
-                y1 = std::max(y1, (int32_t)rd32(q + 4));
-                x2 = std::min(x2, (int32_t)rd32(q + 8));
-                y2 = std::min(y2, (int32_t)rd32(q + 12));
-            }
-            for (int32_t y = y1; y < y2; ++y) {
-                uint8_t *row = bytes + (size_t)y * s->pitch;
-                for (int32_t x = x1; x < x2; ++x)
-                    memcpy(row + 4 * x, &color, 4);
-            }
-        }
-        d9_raster_invalidate(s->id);
+    std::vector<recomp::d3d::D3d9Rect> list;
+    list.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        recomp::d3d::D3d9Rect r;
+        uint32_t a = rects + i * 16u;
+        r.left = (int32_t)rd32(a);
+        r.top = (int32_t)rd32(a + 4);
+        r.right = (int32_t)rd32(a + 8);
+        r.bottom = (int32_t)rd32(a + 12);
+        list.push_back(r);
     }
-    com_ret(c, D3D_OK9);
+    float z;
+    uint32_t zbits = arg(c, 5);
+    memcpy(&z, &zbits, 4);
+    rust::Slice<const recomp::d3d::D3d9Rect> rect_slice(list.empty() ? nullptr : list.data(),
+                                                        list.size());
+    com_ret(c,
+            bridge_result(c, dev->d3d9_device->clear(flags, color, z, arg(c, 6), rect_slice)));
 }
 
 // (this, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion). The back
@@ -1365,98 +1003,66 @@ void Dev_Clear(X86 *c) {
 // on screen.
 void Dev_Present(X86 *c) {
     ComObj *dev = this_device9(c);
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        if (arg(c, 3) && arg(c, 3) != dev->hwnd) {
-            LOGW("d3d9: Present hDestWindowOverride %08x is not the device window %08x", arg(c, 3),
-                 dev->hwnd);
-            imports_unsupported(c);
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::D3d9Rect sr{}, dr{};
-        bool have_src = arg(c, 1) != 0;
-        bool have_dst = arg(c, 2) != 0;
-        if ((have_src && !read_guest_rect(arg(c, 1), &sr)) ||
-            (have_dst && !read_guest_rect(arg(c, 2), &dr))) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        rust::Slice<const recomp::d3d::D3d9Rect> srs(have_src ? &sr : nullptr, have_src ? 1 : 0);
-        rust::Slice<const recomp::d3d::D3d9Rect> drs(have_dst ? &dr : nullptr, have_dst ? 1 : 0);
-        bool presented = false;
-        if (!dx_dump_enabled() && dev->d3d9_device->native_present_available) {
-            auto result = dev->d3d9_device->present_handoff(srs, drs);
-            if (result.status.code == recomp::d3d::StatusCode::Ok) {
-                presented = host_display_present_native_texture(
-                    result.handoff.texture, (int)result.handoff.width, (int)result.handoff.height,
-                    result.handoff.busy, result.handoff.ready_event, result.handoff.ready_value);
-                if (!presented) {
-                    __atomic_store_n(result.handoff.busy, 0u, __ATOMIC_RELEASE);
-                    dev->d3d9_device->native_present_available = false;
-                    LOGW("d3d9: presenter declined native texture handoff; using RGBA readback");
-                }
-            } else if (result.status.code != recomp::d3d::StatusCode::Unsupported) {
-                com_ret(c, bridge_result(c, result.status));
-                return;
-            } else {
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (arg(c, 3) && arg(c, 3) != dev->hwnd) {
+        LOGW("d3d9: Present hDestWindowOverride %08x is not the device window %08x", arg(c, 3),
+             dev->hwnd);
+        imports_unsupported(c);
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3d9Rect sr{}, dr{};
+    bool have_src = arg(c, 1) != 0;
+    bool have_dst = arg(c, 2) != 0;
+    if ((have_src && !read_guest_rect(arg(c, 1), &sr)) ||
+        (have_dst && !read_guest_rect(arg(c, 2), &dr))) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    rust::Slice<const recomp::d3d::D3d9Rect> srs(have_src ? &sr : nullptr, have_src ? 1 : 0);
+    rust::Slice<const recomp::d3d::D3d9Rect> drs(have_dst ? &dr : nullptr, have_dst ? 1 : 0);
+    bool presented = false;
+    if (!dx_dump_enabled() && dev->d3d9_device->native_present_available) {
+        auto result = dev->d3d9_device->present_handoff(srs, drs);
+        if (result.status.code == recomp::d3d::StatusCode::Ok) {
+            presented = host_display_present_native_texture(
+                result.handoff.texture, (int)result.handoff.width, (int)result.handoff.height,
+                result.handoff.busy, result.handoff.ready_event, result.handoff.ready_value);
+            if (!presented) {
+                __atomic_store_n(result.handoff.busy, 0u, __ATOMIC_RELEASE);
                 dev->d3d9_device->native_present_available = false;
-                std::string message(result.status.message.data(), result.status.message.size());
-                LOGW("d3d9: %s; using RGBA readback", message.c_str());
+                LOGW("d3d9: presenter declined native texture handoff; using RGBA readback");
             }
+        } else if (result.status.code != recomp::d3d::StatusCode::Unsupported) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
+        } else {
+            dev->d3d9_device->native_present_available = false;
+            std::string message(result.status.message.data(), result.status.message.size());
+            LOGW("d3d9: %s; using RGBA readback", message.c_str());
         }
-        if (!presented) {
-            recomp::d3d::D3d9FrameResult result = dev->d3d9_device->present(srs, drs);
-            if (result.status.code != recomp::d3d::StatusCode::Ok) {
-                com_ret(c, bridge_result(c, result.status));
-                return;
-            }
-            if (!result.bytes.empty()) {
-                dx_dump_frame_rgba(result.bytes.data(), result.width, result.height);
-                host_display_present_window_rgba(result.bytes.data(), (int)result.width,
-                                                 (int)result.height);
-            }
-        }
-        const uint32_t interval = dev->d3d9_device->effective_present().presentation_interval;
-        if (interval != 0x80000000u) {
-            const int refreshes = interval >= 8u ? 4 : interval >= 4u ? 3 : interval == 2u ? 2 : 1;
-            const double delay = host_present_refresh_delay(refreshes);
-            if (delay > 0)
-                guest_sleep_ms((uint32_t)(delay * 1000.0));
-        }
-        com_ret(c, D3D_OK9);
-        return;
     }
-    ComObj *bb = dev ? device_backbuffer(dev) : nullptr;
-    if (bb && gpu_on()) {
-        gpu_sync(bb);
-        ddraw_external_present_begin();
-        host_present(nullptr, (int)bb->width, (int)bb->height, 32, nullptr, (int)bb->pitch);
-        host_d9_present(bb->id, bb->width, bb->height);
-        ddraw_external_present_end();
-        com_ret(c, D3D_OK9);
-        return;
-    }
-    uint8_t *bbytes = resource_bytes(bb);
-    if (bb && bbytes) {
-        uint32_t lit = 0, n = bb->width * bb->height;
-        for (uint32_t i = 0; i < n; i += 97) {
-            uint32_t v;
-            memcpy(&v, bbytes + (size_t)i * 4, 4);
-            if (v & 0x00ffffffu)
-                ++lit;
+    if (!presented) {
+        recomp::d3d::D3d9FrameResult result = dev->d3d9_device->present(srs, drs);
+        if (result.status.code != recomp::d3d::StatusCode::Ok) {
+            com_ret(c, bridge_result(c, result.status));
+            return;
         }
-        LOGW("d3d9: present back buffer %u (%ux%u, %u bpp), %u of %u sampled pixels lit, target "
-             "now %u",
-             bb->id, bb->width, bb->height, bb->bpp, lit, (n + 96) / 97, dev->render_target);
+        if (!result.bytes.empty()) {
+            dx_dump_frame_rgba(result.bytes.data(), result.width, result.height);
+            host_display_present_window_rgba(result.bytes.data(), (int)result.width,
+                                             (int)result.height);
+        }
     }
-    if (bb && bbytes && bb->bpp == 32) {
-        ddraw_external_present_begin();
-        host_present(bbytes, (int)bb->width, (int)bb->height, 32, nullptr, (int)bb->pitch);
-        ddraw_external_present_end();
+    const uint32_t interval = dev->d3d9_device->effective_present().presentation_interval;
+    if (interval != 0x80000000u) {
+        const int refreshes = interval >= 8u ? 4 : interval >= 4u ? 3 : interval == 2u ? 2 : 1;
+        const double delay = host_present_refresh_delay(refreshes);
+        if (delay > 0)
+            guest_sleep_ms((uint32_t)(delay * 1000.0));
     }
     com_ret(c, D3D_OK9);
 }
@@ -1491,37 +1097,8 @@ static uint8_t *resource_bytes(ComObj *o) {
     return o->blob.empty() ? nullptr : o->blob.data();
 }
 
-static void gpu_before_lock(ComObj *s);
-static void gpu_after_unlock(ComObj *o, uint32_t lo, uint32_t hi);
-static void gpu_forget(ComObj *o);
 
-static uint32_t stage_lock(ComObj *o) {
-    if (!o || o->blob.empty())
-        return 0;
-    if (o->lock_count == 0)
-        gpu_before_lock(o);
-    if (o->lock_count++ == 0) {
-        o->pixels = heap_alloc((uint32_t)o->blob.size(), false, 16);
-        if (!o->pixels) {
-            o->lock_count = 0;
-            return 0;
-        }
-        memcpy(gm_ptr(o->pixels), o->blob.data(), o->blob.size());
-    }
-    return o->pixels;
-}
 
-static void stage_unlock(ComObj *o) {
-    if (!o || o->lock_count <= 0)
-        return;
-    if (--o->lock_count == 0 && o->pixels) {
-        memcpy(o->blob.data(), gm_ptr(o->pixels), o->blob.size());
-        heap_free(o->pixels);
-        o->pixels = 0;
-        d9_raster_invalidate(o->id);
-        gpu_after_unlock(o, 0, (uint32_t)o->blob.size());
-    }
-}
 
 static void d3d9_release_staging(D3d9HostResource *h) {
     if (!h)
@@ -1533,357 +1110,30 @@ static void d3d9_release_staging(D3d9HostResource *h) {
 }
 
 static void d3d9_resource_destroy(ComObj *o) {
-    if (kD3d9WgpuEnabled) {
-        if (o->d3d9_resource && o->dev_d3d) {
-            if (ComObj *dev = com_get(o->dev_d3d)) {
-                if (dev->d3d9_device)
-                    dev->d3d9_device->unregister_resource(o->id);
-            }
+    if (o->d3d9_resource && o->dev_d3d) {
+        if (ComObj *dev = com_get(o->dev_d3d)) {
+            if (dev->d3d9_device)
+                dev->d3d9_device->unregister_resource(o->id);
         }
-        if (!o->d3d9_parent && o->d3d9_resource)
-            d3d9_release_staging(o->d3d9_resource.get());
-        o->d3d9_resource.reset();
-        if (o->d3d9_parent_retained) {
-            o->d3d9_parent_retained = false;
-            if (ComObj *parent = com_get(o->d3d9_parent))
-                com_release_internal(parent);
-        }
-        o->d3d9_parent = 0;
-        if (o->d3d9_owner_retained) {
-            o->d3d9_owner_retained = false;
-            if (ComObj *dev = com_get(o->dev_d3d))
-                com_release_internal(dev);
-        }
-        o->dev_d3d = 0;
-        return;
     }
-    if (o->pixels)
-        heap_free(o->pixels);
-    o->pixels = 0;
-    o->lock_count = 0;
-    o->pixels_bytes = 0;
-    std::vector<uint8_t>().swap(o->blob);
-    d9_raster_invalidate(o->id);
-    gpu_forget(o);
-}
-
-// Bytes per pixel for the formats this game creates. D3DFMT_A8R8G8B8 is 21,
-// X8R8G8B8 22, R5G6B5 23, A8 28, D24S8 75, and the DXT block formats carry
-// their four characters.
-static uint32_t format_bytes(uint32_t fmt) {
-    switch (fmt) {
-    case 27:
-    case 28:
-    case 41:
-    case 50:
-    case 52: // R3G3B2, A8, P8, L8, A4L4
-        return 1;
-    case 23:
-    case 24:
-    case 25:
-    case 26:
-    case 29:
-    case 30:
-    case 40:
-    case 51:
-    case 60:
-    case 61:
-    case 70:
-    case 73:
-    case 80:
-    case 81:
-    case 111:
-        return 2;
-    case 36:
-    case 113: // A16B16G16R16, A16B16G16R16F
-        return 8;
-    case 116: // A32B32G32R32F
-        return 16;
-    default:
-        return 4;
+    if (!o->d3d9_parent && o->d3d9_resource)
+        d3d9_release_staging(o->d3d9_resource.get());
+    o->d3d9_resource.reset();
+    if (o->d3d9_parent_retained) {
+        o->d3d9_parent_retained = false;
+        if (ComObj *parent = com_get(o->d3d9_parent))
+            com_release_internal(parent);
     }
-}
-
-// The DXT formats, stored as blocks of 4x4 pixels.
-static uint32_t dxt_block_bytes(uint32_t fmt) {
-    switch (fmt) {
-    case D3DFMT_DXT1:
-        return 8;
-    case D3DFMT_DXT2:
-    case D3DFMT_DXT3:
-    case D3DFMT_DXT4:
-    case D3DFMT_DXT5:
-        return 16;
-    default:
-        return 0;
+    o->d3d9_parent = 0;
+    if (o->d3d9_owner_retained) {
+        o->d3d9_owner_retained = false;
+        if (ComObj *dev = com_get(o->dev_d3d))
+            com_release_internal(dev);
     }
+    o->dev_d3d = 0;
 }
 
-static ComObj *make_surface(ComObj *dev, uint32_t w, uint32_t h, uint32_t fmt) {
-    ComObj *s = com_new(K_D3D9SURFACE);
-    if (!s)
-        return nullptr;
-    s->dev_d3d = dev ? dev->id : 0;
-    s->width = w ? w : 1;
-    s->height = h ? h : 1;
-    s->rmask = fmt; // the D3DFORMAT, which a Direct3D 9 surface has no other field for
-    if (uint32_t block = dxt_block_bytes(fmt)) {
-        // A compressed surface is rows of blocks; Pitch is the bytes in one.
-        uint32_t bw = (s->width + 3) / 4, bh = (s->height + 3) / 4;
-        s->bpp = 0;
-        s->pitch = bw * block;
-        resource_alloc(s, s->pitch * bh);
-    } else {
-        s->bpp = format_bytes(fmt) * 8;
-        s->pitch = s->width * format_bytes(fmt);
-        resource_alloc(s, s->pitch * s->height);
-    }
-    return s;
-}
-
-// ---- What the CPU renderer needs to know about surfaces and textures --------
-bool d9_surface_info(uint32_t surface_id, D9SurfaceInfo *out) {
-    ComObj *s = com_get(surface_id);
-    if (!s || s->kind != K_D3D9SURFACE)
-        return false;
-    out->data = resource_bytes(s);
-    out->size = s->blob.size();
-    out->width = s->width;
-    out->height = s->height;
-    out->pitch = s->pitch;
-    out->format = s->rmask;
-    return true;
-}
-
-uint32_t d9_texture_level0(uint32_t texture_id) {
-    ComObj *t = com_get(texture_id);
-    if (!t)
-        return 0;
-    if (t->kind == K_D3D9SURFACE)
-        return t->id;
-    if (t->kind != K_D3D9TEXTURE)
-        return 0;
-    if (t->caps) // a cube: face zero, level zero, once it exists
-        return t->surfaces.empty() ? 0 : t->surfaces[0];
-    return t->back_obj;
-}
-
-// The surface behind a 2D texture's level, or null.
-static ComObj *texture_level(ComObj *tex, uint32_t level) {
-    if (!tex || tex->kind != K_D3D9TEXTURE || tex->caps)
-        return nullptr;
-    if (level < tex->surfaces.size())
-        return com_get(tex->surfaces[level]);
-    return level == 0 ? com_get(tex->back_obj) : nullptr;
-}
-
-// ---- The GPU's copies ------------------------------------------------------
-// With a GPU renderer running, every texture, surface and buffer has a mirror
-// on the host under the object's id; a surface that belongs to a texture is a
-// slot of its container's mirror. The shim's bytes stay the reference for what
-// the game wrote, the GPU's for what was drawn: a slot the game unlocked is
-// uploaded before the next draw that reads it, and a slot the GPU drew into is
-// read back before the game locks it.
 static const uint32_t USAGE_RENDERTARGET = 1, USAGE_DEPTHSTENCIL = 2;
-
-struct GpuMirror {
-    bool defined = false;
-    std::vector<uint8_t> cpu_dirty;      // by slot
-    std::vector<uint8_t> gpu_newer;      // by slot
-    uint32_t dirty_lo = 0, dirty_hi = 0; // buffers: the changed byte range
-};
-static std::unordered_map<uint32_t, GpuMirror> &gpu_mirrors() {
-    static auto *m = new std::unordered_map<uint32_t, GpuMirror>();
-    return *m;
-}
-// D3DUSAGE of every texture and surface, by id.
-static std::unordered_map<uint32_t, uint32_t> &resource_usage() {
-    static auto *m = new std::unordered_map<uint32_t, uint32_t>();
-    return *m;
-}
-static bool gpu_on() {
-    return host_d9_active() != 0;
-}
-static bool is_depth_format(uint32_t fmt) {
-    return (fmt >= 70 && fmt <= 82) || fmt == 0x5a544e49u /* INTZ */ ||
-           fmt == 0x34324644u /* DF24 */ || fmt == 0x36314644u /* DF16 */;
-}
-
-// A surface's place in its mirror: the container's id and the slot, or the
-// surface's own id and slot zero.
-static uint32_t mirror_slot(ComObj *s, uint32_t *slot) {
-    *slot = 0;
-    if (!s)
-        return 0;
-    if (s->kind == K_D3D9SURFACE && s->front_obj) {
-        ComObj *tex = com_get(s->front_obj);
-        if (tex && tex->kind == K_D3D9TEXTURE) {
-            for (size_t i = 0; i < tex->surfaces.size(); ++i)
-                if (tex->surfaces[i] == s->id) {
-                    *slot = (uint32_t)i;
-                    return tex->id;
-                }
-        }
-    }
-    return s->id;
-}
-static HostD9Surface surface_ref(ComObj *s) {
-    HostD9Surface r = {0, 0, 0};
-    if (!s)
-        return r;
-    uint32_t slot;
-    r.id = mirror_slot(s, &slot);
-    ComObj *owner = com_get(r.id);
-    if (owner && owner->kind == K_D3D9TEXTURE && owner->caps) {
-        r.face = slot % 6;
-        r.level = slot / 6;
-    } else {
-        r.level = slot;
-    }
-    return r;
-}
-static uint32_t slot_count(ComObj *o) {
-    if (o->kind == K_D3D9TEXTURE)
-        return (uint32_t)std::max<size_t>(o->surfaces.size(), 1);
-    return 1;
-}
-static ComObj *slot_surface(ComObj *o, uint32_t slot) {
-    if (o->kind != K_D3D9TEXTURE)
-        return o;
-    return slot < o->surfaces.size() ? com_get(o->surfaces[slot]) : nullptr;
-}
-
-// Creates the mirror of a texture or stand-alone surface on first use.
-static GpuMirror &gpu_define(ComObj *o) {
-    GpuMirror &m = gpu_mirrors()[o->id];
-    if (m.defined)
-        return m;
-    HostD9TextureDesc d{};
-    d.id = o->id;
-    d.format = o->rmask ? o->rmask : 22;
-    d.width = o->width ? o->width : 1;
-    d.height = o->height ? o->height : 1;
-    uint32_t usage = resource_usage()[o->id];
-    if (is_depth_format(d.format))
-        usage |= USAGE_DEPTHSTENCIL;
-    d.usage = (usage & USAGE_RENDERTARGET ? HOST_D9_USAGE_RENDERTARGET : 0) |
-              (usage & USAGE_DEPTHSTENCIL ? HOST_D9_USAGE_DEPTH : 0);
-    d.samples = o->kind == K_D3D9SURFACE ? o->samples : 0;
-    if (o->kind == K_D3D9TEXTURE && o->caps) {
-        d.kind = HOST_D9_TEX_CUBE;
-        d.levels = o->pal_flags ? o->pal_flags : 1;
-    } else {
-        d.kind = HOST_D9_TEX_2D;
-        d.levels = o->kind == K_D3D9TEXTURE ? slot_count(o) : 1;
-    }
-    host_d9_texture_define(&d);
-    m.defined = true;
-    uint32_t n = o->kind == K_D3D9TEXTURE && o->caps ? 6 * d.levels : slot_count(o);
-    // A target's first contents are whatever is drawn; a texture's are what
-    // the game wrote, so every slot starts out needing an upload.
-    m.cpu_dirty.assign(n, d.usage ? 0 : 1);
-    m.gpu_newer.assign(n, 0);
-    return m;
-}
-
-// Uploads every slot the game changed since the GPU last saw it.
-static void gpu_sync(ComObj *o) {
-    if (!o)
-        return;
-    GpuMirror &m = gpu_define(o);
-    for (uint32_t slot = 0; slot < m.cpu_dirty.size(); ++slot) {
-        if (!m.cpu_dirty[slot])
-            continue;
-        m.cpu_dirty[slot] = 0;
-        ComObj *s = slot_surface(o, slot);
-        if (!s || s->blob.empty())
-            continue;
-        HostD9Surface r = surface_ref(s);
-        host_d9_texture_upload(o->id, r.face, r.level, resource_bytes(s), s->pitch);
-    }
-}
-
-// The surface is about to be read or written by the game.
-static void gpu_before_lock(ComObj *s) {
-    if (!s || s->kind != K_D3D9SURFACE)
-        return;
-    uint32_t slot;
-    uint32_t id = mirror_slot(s, &slot);
-    auto it = gpu_mirrors().find(id);
-    if (it == gpu_mirrors().end() || slot >= it->second.gpu_newer.size() ||
-        !it->second.gpu_newer[slot])
-        return;
-    it->second.gpu_newer[slot] = 0;
-    if (s->bpp == 32 && !s->blob.empty()) {
-        HostD9Surface r = surface_ref(s);
-        host_d9_texture_read(id, r.face, r.level, s->blob.data(), s->pitch);
-    }
-}
-// The game wrote the resource.
-static void gpu_after_unlock(ComObj *o, uint32_t lo, uint32_t hi) {
-    if (!o)
-        return;
-    if (o->kind == K_D3D9VB || o->kind == K_D3D9IB) {
-        GpuMirror &m = gpu_mirrors()[o->id];
-        if (m.dirty_hi <= m.dirty_lo) {
-            m.dirty_lo = lo;
-            m.dirty_hi = hi;
-        } else {
-            m.dirty_lo = std::min(m.dirty_lo, lo);
-            m.dirty_hi = std::max(m.dirty_hi, hi);
-        }
-        m.defined = true;
-        return;
-    }
-    uint32_t slot;
-    uint32_t id = mirror_slot(o, &slot);
-    auto it = gpu_mirrors().find(id);
-    if (it == gpu_mirrors().end())
-        return; // not mirrored yet: its first use uploads everything
-    if (slot < it->second.cpu_dirty.size())
-        it->second.cpu_dirty[slot] = 1;
-}
-static void gpu_drawn_into(ComObj *s) {
-    if (!s)
-        return;
-    uint32_t slot;
-    uint32_t id = mirror_slot(s, &slot);
-    ComObj *owner = com_get(id);
-    if (!owner)
-        return;
-    GpuMirror &m = gpu_define(owner);
-    if (slot < m.gpu_newer.size()) {
-        m.gpu_newer[slot] = 1;
-        m.cpu_dirty[slot] = 0;
-    }
-}
-static void gpu_sync_buffer(ComObj *b) {
-    if (!b)
-        return;
-    GpuMirror &m = gpu_mirrors()[b->id];
-    if (!m.defined) {
-        m.defined = true;
-        m.dirty_lo = 0;
-        m.dirty_hi = (uint32_t)b->blob.size();
-    }
-    if (m.dirty_hi > m.dirty_lo && !b->blob.empty()) {
-        uint32_t hi = std::min<uint32_t>(m.dirty_hi, (uint32_t)b->blob.size());
-        host_d9_buffer_upload(b->id, (uint32_t)b->blob.size(), m.dirty_lo,
-                              b->blob.data() + m.dirty_lo, hi - m.dirty_lo);
-    }
-    m.dirty_lo = m.dirty_hi = 0;
-}
-static void gpu_forget(ComObj *o) {
-    auto it = gpu_mirrors().find(o->id);
-    if (it != gpu_mirrors().end()) {
-        if (o->kind == K_D3D9VB || o->kind == K_D3D9IB)
-            host_d9_buffer_drop(o->id);
-        else if (it->second.defined)
-            host_d9_texture_drop(o->id);
-        gpu_mirrors().erase(it);
-    }
-    resource_usage().erase(o->id);
-}
 
 static void d3d9_register_wgpu_resource(ComObj *dev, ComObj *o) {
     if (!dev || !dev->d3d9_device || !o || !o->d3d9_resource)
@@ -1992,7 +1242,7 @@ static ComObj *com_level_view(ComObj *tex, uint32_t face, uint32_t level, bool v
     com_retain_internal(tex);
     s->d3d9_parent_retained = true;
     tex->d3d9_levels[slot] = s->id;
-    if (kD3d9WgpuEnabled && s->dev_d3d) {
+    if (s->dev_d3d) {
         if (ComObj *dev = com_get(s->dev_d3d)) {
             if (dev->d3d9_device) {
                 recomp::d3d::Status status = dev->d3d9_device->register_resource_view(
@@ -4720,188 +3970,30 @@ static void level_unlock_wgpu(X86 *c, ComObj *o, uint32_t face, uint32_t level) 
 
 // (this, Length, Usage, FVF, Pool, ppVertexBuffer, pSharedHandle)
 void Dev_CreateVertexBuffer(X86 *c) {
-    ComObj *dev = this_device9(c);
-    uint32_t bytes = arg(c, 1), out = arg(c, 5);
-    if (kD3d9WgpuEnabled) {
-        create_buffer_wgpu(c, recomp::d3d::D3d9BufferKind::Vertex);
-        return;
-    }
-    if (!dev || !out) {
-        com_ret(c, D3DERR_INVALIDCALL);
-        return;
-    }
-    ComObj *vb = com_new(K_D3D9VB);
-    if (!vb || !resource_alloc(vb, bytes)) {
-        if (vb)
-            com_release(vb);
-        com_ret(c, E_OUTOFMEMORY);
-        return;
-    }
-    vb->dev_d3d = dev->id;
-    vb->buf_bytes = bytes;
-    uint32_t view_ = com_view(vb, IF_D3DVERTEXBUFFER9);
-    if (!view_) {
-        com_release(vb);
-        com_ret(c, E_OUTOFMEMORY);
-        return;
-    }
-    com_out_ptr(out, view_);
-    com_ret(c, D3D_OK9);
+    create_buffer_wgpu(c, recomp::d3d::D3d9BufferKind::Vertex);
 }
 
 // (this, Length, Usage, Format, Pool, ppIndexBuffer, pSharedHandle)
 void Dev_CreateIndexBuffer(X86 *c) {
-    ComObj *dev = this_device9(c);
-    uint32_t bytes = arg(c, 1), out = arg(c, 5);
-    if (kD3d9WgpuEnabled) {
-        create_buffer_wgpu(c, recomp::d3d::D3d9BufferKind::Index);
-        return;
-    }
-    if (!dev || !out) {
-        com_ret(c, D3DERR_INVALIDCALL);
-        return;
-    }
-    ComObj *ib = com_new(K_D3D9IB);
-    if (!ib || !resource_alloc(ib, bytes)) {
-        if (ib)
-            com_release(ib);
-        com_ret(c, E_OUTOFMEMORY);
-        return;
-    }
-    ib->dev_d3d = dev->id;
-    ib->buf_bytes = bytes;
-    ib->rmask = arg(c, 3) == D3DFMT_INDEX32 ? 4 : 2;
-    uint32_t view_ = com_view(ib, IF_D3DINDEXBUFFER9);
-    if (!view_) {
-        com_release(ib);
-        com_ret(c, E_OUTOFMEMORY);
-        return;
-    }
-    com_out_ptr(out, view_);
-    com_ret(c, D3D_OK9);
+    create_buffer_wgpu(c, recomp::d3d::D3d9BufferKind::Index);
 }
 
 // (this, Width, Height, Levels, Usage, Format, Pool, ppTexture, pSharedHandle)
 void Dev_CreateTexture(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        create_texture_wgpu(c, recomp::d3d::D3d9TextureKind::Texture2D);
-        return;
-    }
-    ComObj *dev = this_device9(c);
-    uint32_t w = arg(c, 1), h = arg(c, 2), fmt = arg(c, 5), out = arg(c, 7);
-    if (!dev || !out) {
-        com_ret(c, D3DERR_INVALIDCALL);
-        return;
-    }
-    ComObj *tex = com_new(K_D3D9TEXTURE);
-    if (!tex) {
-        com_ret(c, E_OUTOFMEMORY);
-        return;
-    }
-    tex->dev_d3d = dev->id;
-    tex->width = w;
-    tex->height = h;
-    tex->bpp = format_bytes(fmt) * 8;
-    // Every level gets its own surface. Levels = 0 asks for the full chain;
-    // a game uploads each level with its own LockRect.
-    uint32_t levels = arg(c, 3);
-    if (!levels) {
-        levels = 1;
-        for (uint32_t d = std::max(w, h); d > 1; d >>= 1)
-            ++levels;
-    }
-    tex->rmask = fmt;
-    uint32_t usage = arg(c, 4);
-    resource_usage()[tex->id] = usage & (USAGE_RENDERTARGET | USAGE_DEPTHSTENCIL);
-    for (uint32_t l = 0; l < levels && l < 16; ++l) {
-        ComObj *s = make_surface(dev, std::max(w >> l, 1u), std::max(h >> l, 1u), fmt);
-        if (!s)
-            break;
-        s->front_obj = tex->id;
-        tex->surfaces.push_back(s->id);
-    }
-    tex->back_obj = tex->surfaces.empty() ? 0 : tex->surfaces[0];
-    uint32_t view_ = com_view(tex, IF_D3DTEXTURE9);
-    if (!view_) {
-        com_release(tex);
-        com_ret(c, E_OUTOFMEMORY);
-        return;
-    }
-    com_out_ptr(out, view_);
-    com_ret(c, D3D_OK9);
+    create_texture_wgpu(c, recomp::d3d::D3d9TextureKind::Texture2D);
 }
 
 // (this, EdgeLength, Levels, Usage, Format, Pool, ppCubeTexture, pSharedHandle)
 void Dev_CreateCubeTexture(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        create_texture_wgpu(c, recomp::d3d::D3d9TextureKind::Cube);
-        return;
-    }
-    ComObj *dev = this_device9(c);
-    uint32_t edge = arg(c, 1), fmt = arg(c, 4), out = arg(c, 6);
-    if (!dev || !out) {
-        com_ret(c, D3DERR_INVALIDCALL);
-        return;
-    }
-    ComObj *tex = com_new(K_D3D9TEXTURE);
-    if (!tex) {
-        com_ret(c, E_OUTOFMEMORY);
-        return;
-    }
-    tex->dev_d3d = dev->id;
-    tex->width = tex->height = edge;
-    tex->bpp = format_bytes(fmt) * 8;
-    tex->rmask = fmt;
-    tex->caps = 1;                              // a cube map
-    tex->pal_flags = arg(c, 2) ? arg(c, 2) : 1; // levels, reusing a field cubes do not use
-    resource_usage()[tex->id] = arg(c, 3) & (USAGE_RENDERTARGET | USAGE_DEPTHSTENCIL);
-    uint32_t view = com_view(tex, IF_D3DCUBETEXTURE9);
-    if (!view) {
-        com_release(tex);
-        com_ret(c, E_OUTOFMEMORY);
-        return;
-    }
-    LOGV("d3d9: CreateCubeTexture %u -> %08x into %08x", edge, view, out);
-    com_out_ptr(out, view);
-    com_ret(c, D3D_OK9);
+    create_texture_wgpu(c, recomp::d3d::D3d9TextureKind::Cube);
 }
 
 void Dev_CreateVolumeTexture(X86 *c) {
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     create_texture_wgpu(c, recomp::d3d::D3d9TextureKind::Volume);
 }
 
 static void create_surface_method(X86 *c, uint32_t out_index, uint32_t fmt_index, uint32_t usage) {
-    if (kD3d9WgpuEnabled) {
-        create_surface_wgpu(c, out_index, usage);
-        return;
-    }
-    ComObj *dev = this_device9(c);
-    uint32_t w = arg(c, 1), h = arg(c, 2), fmt = arg(c, fmt_index), out = arg(c, out_index);
-    if (!dev || !out) {
-        com_ret(c, D3DERR_INVALIDCALL);
-        return;
-    }
-    ComObj *s = make_surface(dev, w, h, fmt);
-    if (!s) {
-        com_ret(c, E_OUTOFMEMORY);
-        return;
-    }
-    // CreateRenderTarget and CreateDepthStencilSurface: MultiSample, MultisampleQuality.
-    if (out_index == 7)
-        s->samples = multisample_count(arg(c, 4), arg(c, 5));
-    resource_usage()[s->id] = usage;
-    uint32_t view_ = com_view(s, IF_D3DSURFACE9);
-    if (!view_) {
-        com_release(s);
-        com_ret(c, E_OUTOFMEMORY);
-        return;
-    }
-    com_out_ptr(out, view_);
-    com_ret(c, D3D_OK9);
+    create_surface_wgpu(c, out_index, usage);
 }
 // (this, Width, Height, Format, MultiSample, MultisampleQuality, Discard,
 //  ppSurface, pSharedHandle)
@@ -4923,40 +4015,26 @@ void Dev_CreateOffscreenPlainSurface(X86 *c) {
 // which SetRenderTarget overwrites, so after the game switched targets the
 // "back buffer" was whatever it had last drawn into.
 static ComObj *device_backbuffer(ComObj *dev) {
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device)
-            return nullptr;
-        ComObj *s = com_get(dev->d3d9_backbuffer);
-        if (!s) {
-            recomp::d3d::D3d9SurfaceDescriptorResult desc =
-                dev->d3d9_device->backbuffer_descriptor();
-            if (desc.status.code != recomp::d3d::StatusCode::Ok)
-                return nullptr;
-            s = com_new(K_D3D9SURFACE);
-            if (!s)
-                return nullptr;
-            s->d3d9_implicit = true;
-            s->d3d9_resource = std::make_shared<D3d9HostResource>();
-            s->d3d9_target_depth = false;
-            s->dev_d3d = dev->id;
-            com_internalize(s);
-            dev->d3d9_backbuffer = s->id;
-            if (dev->d3d9_device)
-                dev->d3d9_device->register_implicit_targets(dev->d3d9_backbuffer,
-                                                            dev->d3d9_depthbuffer);
-        }
-        return s;
-    }
-    ComObj *s = com_get(dev->palette_obj);
+    if (!dev || !dev->d3d9_device)
+        return nullptr;
+    ComObj *s = com_get(dev->d3d9_backbuffer);
     if (!s) {
-        s = make_surface(dev, dev->width ? dev->width : 640, dev->height ? dev->height : 480, 22);
-        dev->palette_obj = s ? s->id : 0;
-        if (s)
-            s->samples = dev->samples;
-        if (s)
-            resource_usage()[s->id] = USAGE_RENDERTARGET;
-        if (s && !com_get(dev->render_target))
-            dev->render_target = s->id;
+        recomp::d3d::D3d9SurfaceDescriptorResult desc =
+            dev->d3d9_device->backbuffer_descriptor();
+        if (desc.status.code != recomp::d3d::StatusCode::Ok)
+            return nullptr;
+        s = com_new(K_D3D9SURFACE);
+        if (!s)
+            return nullptr;
+        s->d3d9_implicit = true;
+        s->d3d9_resource = std::make_shared<D3d9HostResource>();
+        s->d3d9_target_depth = false;
+        s->dev_d3d = dev->id;
+        com_internalize(s);
+        dev->d3d9_backbuffer = s->id;
+        if (dev->d3d9_device)
+            dev->d3d9_device->register_implicit_targets(dev->d3d9_backbuffer,
+                                                        dev->d3d9_depthbuffer);
     }
     return s;
 }
@@ -4970,221 +4048,124 @@ void Dev_StretchRect(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (kD3d9WgpuEnabled) {
-        ComObj *dev = this_device9(c);
-        if (!dev || !dev->d3d9_device || src->dev_d3d != dev->id || dst->dev_d3d != dev->id) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::D3d9Rect sr{}, dr{};
-        bool have_src = arg(c, 2) != 0;
-        bool have_dst = arg(c, 4) != 0;
-        if ((have_src && !read_guest_rect(arg(c, 2), &sr)) ||
-            (have_dst && !read_guest_rect(arg(c, 4), &dr))) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        rust::Slice<const recomp::d3d::D3d9Rect> srs(have_src ? &sr : nullptr, have_src ? 1 : 0);
-        rust::Slice<const recomp::d3d::D3d9Rect> drs(have_dst ? &dr : nullptr, have_dst ? 1 : 0);
-        com_ret(c, bridge_result(c, dev->d3d9_device->stretch_rect(d3d9_target_id(src), srs,
-                                                                   d3d9_target_id(dst), drs,
-                                                                   arg(c, 5))));
+    ComObj *dev = this_device9(c);
+    if (!dev || !dev->d3d9_device || src->dev_d3d != dev->id || dst->dev_d3d != dev->id) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (gpu_on()) {
-        uint32_t slot;
-        ComObj *sowner = com_get(mirror_slot(src, &slot));
-        ComObj *downer = com_get(mirror_slot(dst, &slot));
-        if (sowner)
-            gpu_sync(sowner);
-        if (downer)
-            gpu_sync(downer);
-        int32_t sr[4] = {0, 0, (int32_t)src->width, (int32_t)src->height};
-        int32_t dr[4] = {0, 0, (int32_t)dst->width, (int32_t)dst->height};
-        if (arg(c, 2))
-            for (int i = 0; i < 4; ++i)
-                sr[i] = (int32_t)rd32(arg(c, 2) + 4u * (uint32_t)i);
-        if (arg(c, 4))
-            for (int i = 0; i < 4; ++i)
-                dr[i] = (int32_t)rd32(arg(c, 4) + 4u * (uint32_t)i);
-        host_d9_stretch(surface_ref(src), sr, surface_ref(dst), dr, arg(c, 5));
-        gpu_drawn_into(dst);
-        com_ret(c, D3D_OK9);
+    recomp::d3d::D3d9Rect sr{}, dr{};
+    bool have_src = arg(c, 2) != 0;
+    bool have_dst = arg(c, 4) != 0;
+    if ((have_src && !read_guest_rect(arg(c, 2), &sr)) ||
+        (have_dst && !read_guest_rect(arg(c, 4), &dr))) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    uint8_t *sbytes = resource_bytes(src), *dbytes = resource_bytes(dst);
-    if (!sbytes || !dbytes || src->bpp != 32 || dst->bpp != 32) {
-        com_ret(c, D3D_OK9);
-        return;
-    }
-    auto rect = [](uint32_t p, ComObj *s, int32_t r[4]) {
-        r[0] = 0;
-        r[1] = 0;
-        r[2] = (int32_t)s->width;
-        r[3] = (int32_t)s->height;
-        if (p)
-            for (int i = 0; i < 4; ++i)
-                r[i] = (int32_t)rd32(p + 4u * (uint32_t)i);
-        r[0] = std::max(r[0], 0);
-        r[1] = std::max(r[1], 0);
-        r[2] = std::min(r[2], (int32_t)s->width);
-        r[3] = std::min(r[3], (int32_t)s->height);
-    };
-    ComObj *dev_ = com_get(dst->dev_d3d);
-    static uint32_t g_stretches = 0;
-    if (++g_stretches <= 24)
-        LOGW("d3d9: StretchRect %u (%ux%u, %u bpp) -> %u (%ux%u, %u bpp)%s", src->id, src->width,
-             src->height, src->bpp, dst->id, dst->width, dst->height, dst->bpp,
-             (dev_ && dst->id == dev_->palette_obj) ? ", onto the back buffer" : "");
-    int32_t sr[4], dr[4];
-    rect(arg(c, 2), src, sr);
-    rect(arg(c, 4), dst, dr);
-    int32_t sw = sr[2] - sr[0], sh = sr[3] - sr[1], dw = dr[2] - dr[0], dh = dr[3] - dr[1];
-    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) {
-        com_ret(c, D3D_OK9);
-        return;
-    }
-    for (int32_t y = 0; y < dh; ++y) {
-        int32_t sy = sr[1] + y * sh / dh;
-        uint8_t *drow = dbytes + (size_t)(dr[1] + y) * dst->pitch;
-        const uint8_t *srow = sbytes + (size_t)sy * src->pitch;
-        for (int32_t x = 0; x < dw; ++x)
-            memcpy(drow + 4 * (dr[0] + x), srow + 4 * (sr[0] + x * sw / dw), 4);
-    }
-    d9_raster_invalidate(dst->id);
-    com_ret(c, D3D_OK9);
+    rust::Slice<const recomp::d3d::D3d9Rect> srs(have_src ? &sr : nullptr, have_src ? 1 : 0);
+    rust::Slice<const recomp::d3d::D3d9Rect> drs(have_dst ? &dr : nullptr, have_dst ? 1 : 0);
+    com_ret(c, bridge_result(c, dev->d3d9_device->stretch_rect(d3d9_target_id(src), srs,
+                                                               d3d9_target_id(dst), drs,
+                                                               arg(c, 5))));
 }
 
 void Dev_UpdateSurface(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *src = com_this(arg(c, 1)), *dst = com_this(arg(c, 3));
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device || !src || !dst || src->kind != K_D3D9SURFACE ||
-            dst->kind != K_D3D9SURFACE || src->dev_d3d != dev->id || dst->dev_d3d != dev->id ||
-            !src->d3d9_resource || !dst->d3d9_resource ||
-            src->d3d9_resource.get() == dst->d3d9_resource.get()) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::D3d9Rect sr{};
-        bool have_src = arg(c, 2) != 0;
-        if (have_src && !read_guest_rect(arg(c, 2), &sr)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        int32_t dx = 0, dy = 0;
-        if (arg(c, 4)) {
-            if (!gm_valid(arg(c, 4), 8)) {
-                com_ret(c, D3DERR_INVALIDCALL);
-                return;
-            }
-            dx = (int32_t)rd32(arg(c, 4));
-            dy = (int32_t)rd32(arg(c, 4) + 4);
-        }
-        rust::Slice<const recomp::d3d::D3d9Rect> sr_slice(have_src ? &sr : nullptr,
-                                                          have_src ? 1 : 0);
-        com_ret(
-            c, bridge_result(c, dev->d3d9_device->update_surface(
-                                    *src->d3d9_resource, src->d3d9_face, src->d3d9_level, sr_slice,
-                                    *dst->d3d9_resource, dst->d3d9_face, dst->d3d9_level, dx, dy)));
+    if (!dev || !dev->d3d9_device || !src || !dst || src->kind != K_D3D9SURFACE ||
+        dst->kind != K_D3D9SURFACE || src->dev_d3d != dev->id || dst->dev_d3d != dev->id ||
+        !src->d3d9_resource || !dst->d3d9_resource ||
+        src->d3d9_resource.get() == dst->d3d9_resource.get()) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    imports_unsupported(c);
-    com_ret(c, D3DERR_INVALIDCALL);
+    recomp::d3d::D3d9Rect sr{};
+    bool have_src = arg(c, 2) != 0;
+    if (have_src && !read_guest_rect(arg(c, 2), &sr)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    int32_t dx = 0, dy = 0;
+    if (arg(c, 4)) {
+        if (!gm_valid(arg(c, 4), 8)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        dx = (int32_t)rd32(arg(c, 4));
+        dy = (int32_t)rd32(arg(c, 4) + 4);
+    }
+    rust::Slice<const recomp::d3d::D3d9Rect> sr_slice(have_src ? &sr : nullptr,
+                                                      have_src ? 1 : 0);
+    com_ret(
+        c, bridge_result(c, dev->d3d9_device->update_surface(
+                                *src->d3d9_resource, src->d3d9_face, src->d3d9_level, sr_slice,
+                                *dst->d3d9_resource, dst->d3d9_face, dst->d3d9_level, dx, dy)));
 }
 
 void Dev_UpdateTexture(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *src = com_this(arg(c, 1)), *dst = com_this(arg(c, 2));
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device || !src || !dst || !src->d3d9_resource ||
-            !dst->d3d9_resource || src->dev_d3d != dev->id || dst->dev_d3d != dev->id ||
-            src->d3d9_resource.get() == dst->d3d9_resource.get()) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        com_ret(c, bridge_result(c, dev->d3d9_device->update_texture(*src->d3d9_resource,
-                                                                     *dst->d3d9_resource)));
+    if (!dev || !dev->d3d9_device || !src || !dst || !src->d3d9_resource ||
+        !dst->d3d9_resource || src->dev_d3d != dev->id || dst->dev_d3d != dev->id ||
+        src->d3d9_resource.get() == dst->d3d9_resource.get()) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    imports_unsupported(c);
-    com_ret(c, D3DERR_INVALIDCALL);
+    com_ret(c, bridge_result(c, dev->d3d9_device->update_texture(*src->d3d9_resource,
+                                                                 *dst->d3d9_resource)));
 }
 
 void Dev_GetRenderTargetData(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *src = com_this(arg(c, 1)), *dst = com_this(arg(c, 2));
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device || !src || !dst || src->kind != K_D3D9SURFACE ||
-            dst->kind != K_D3D9SURFACE || !dst->d3d9_resource || src->dev_d3d != dev->id ||
-            dst->dev_d3d != dev->id) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        com_ret(c, bridge_result(c, dev->d3d9_device->get_render_target_data(
-                                        d3d9_target_id(src), *dst->d3d9_resource, dst->d3d9_face,
-                                        dst->d3d9_level)));
+    if (!dev || !dev->d3d9_device || !src || !dst || src->kind != K_D3D9SURFACE ||
+        dst->kind != K_D3D9SURFACE || !dst->d3d9_resource || src->dev_d3d != dev->id ||
+        dst->dev_d3d != dev->id) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    imports_unsupported(c);
-    com_ret(c, D3DERR_INVALIDCALL);
+    com_ret(c, bridge_result(c, dev->d3d9_device->get_render_target_data(
+                                    d3d9_target_id(src), *dst->d3d9_resource, dst->d3d9_face,
+                                    dst->d3d9_level)));
 }
 
 void Dev_ColorFill(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *s = com_this(arg(c, 1));
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device || !s || s->kind != K_D3D9SURFACE || s->dev_d3d != dev->id) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::D3d9Rect r{};
-        bool have = arg(c, 2) != 0;
-        if (have && !read_guest_rect(arg(c, 2), &r)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        rust::Slice<const recomp::d3d::D3d9Rect> slice(have ? &r : nullptr, have ? 1 : 0);
-        com_ret(
-            c, bridge_result(c, dev->d3d9_device->color_fill(d3d9_target_id(s), slice, arg(c, 3))));
+    if (!dev || !dev->d3d9_device || !s || s->kind != K_D3D9SURFACE || s->dev_d3d != dev->id) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    imports_unsupported(c);
-    com_ret(c, D3DERR_INVALIDCALL);
+    recomp::d3d::D3d9Rect r{};
+    bool have = arg(c, 2) != 0;
+    if (have && !read_guest_rect(arg(c, 2), &r)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    rust::Slice<const recomp::d3d::D3d9Rect> slice(have ? &r : nullptr, have ? 1 : 0);
+    com_ret(
+        c, bridge_result(c, dev->d3d9_device->color_fill(d3d9_target_id(s), slice, arg(c, 3))));
 }
 static ComObj *device_depthbuffer(ComObj *dev) {
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device)
-            return nullptr;
-        ComObj *s = com_get(dev->d3d9_depthbuffer);
-        if (!s) {
-            recomp::d3d::D3d9SurfaceDescriptorResult desc =
-                dev->d3d9_device->depthbuffer_descriptor();
-            if (desc.status.code != recomp::d3d::StatusCode::Ok)
-                return nullptr;
-            s = com_new(K_D3D9SURFACE);
-            if (!s)
-                return nullptr;
-            s->d3d9_implicit = true;
-            s->d3d9_resource = std::make_shared<D3d9HostResource>();
-            s->d3d9_target_depth = true;
-            s->dev_d3d = dev->id;
-            com_internalize(s);
-            dev->d3d9_depthbuffer = s->id;
-            if (dev->d3d9_device)
-                dev->d3d9_device->register_implicit_targets(dev->d3d9_backbuffer,
-                                                            dev->d3d9_depthbuffer);
-        }
-        return s;
-    }
-    ComObj *s = com_get(dev->zbuffer_obj);
+    if (!dev || !dev->d3d9_device)
+        return nullptr;
+    ComObj *s = com_get(dev->d3d9_depthbuffer);
     if (!s) {
-        s = make_surface(dev, dev->width ? dev->width : 640, dev->height ? dev->height : 480, 75);
-        dev->zbuffer_obj = s ? s->id : 0;
-        if (s)
-            s->samples = dev->samples;
-        if (s)
-            resource_usage()[s->id] = USAGE_DEPTHSTENCIL;
+        recomp::d3d::D3d9SurfaceDescriptorResult desc =
+            dev->d3d9_device->depthbuffer_descriptor();
+        if (desc.status.code != recomp::d3d::StatusCode::Ok)
+            return nullptr;
+        s = com_new(K_D3D9SURFACE);
+        if (!s)
+            return nullptr;
+        s->d3d9_implicit = true;
+        s->d3d9_resource = std::make_shared<D3d9HostResource>();
+        s->d3d9_target_depth = true;
+        s->dev_d3d = dev->id;
+        com_internalize(s);
+        dev->d3d9_depthbuffer = s->id;
+        if (dev->d3d9_device)
+            dev->d3d9_device->register_implicit_targets(dev->d3d9_backbuffer,
+                                                        dev->d3d9_depthbuffer);
     }
     return s;
 }
@@ -5202,27 +4183,15 @@ static void device_discard_implicit_surfaces(ComObj *dev) {
             com_release_internal(s);
     }
     dev->render_target = 0;
-    if (kD3d9WgpuEnabled && dev->d3d9_device)
+    if (dev->d3d9_device)
         dev->d3d9_device->register_implicit_targets(0, 0);
-}
-
-// Drops the device's own back and depth buffers; the game's references to them
-// keep the objects alive, and the device makes new ones on next use.
-static void device_forget_buffers(ComObj *dev) {
-    for (uint32_t *field : {&dev->palette_obj, &dev->zbuffer_obj}) {
-        ComObj *s = com_get(*field);
-        if (s)
-            com_release(s);
-        *field = 0;
-    }
 }
 
 // (this, iSwapChain, iBackBuffer, Type, ppBackBuffer)
 void Dev_GetBackBuffer(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 4);
-    if (kD3d9WgpuEnabled &&
-        (!dev || arg(c, 1) || arg(c, 2) || arg(c, 3) || !out || !gm_valid(out, 4))) {
+    if (!dev || arg(c, 1) || arg(c, 2) || arg(c, 3) || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
@@ -5245,30 +4214,21 @@ void Dev_GetBackBuffer(X86 *c) {
 void Dev_GetDepthStencilSurface(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 1);
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        com_out_ptr(out, 0);
-        recomp::d3d::ValueResult result = dev->d3d9_device->depth_stencil();
-        if (result.status.code != recomp::d3d::StatusCode::Ok) {
-            com_ret(c, bridge_result(c, result.status));
-            return;
-        }
-        if (result.value == 0) {
-            com_ret(c, D3DERR_NOTFOUND);
-            return;
-        }
-        ComObj *s = result.value == 0xffffffffu ? device_depthbuffer(dev) : com_get(result.value);
-        return_surface_handle(c, s, out);
-        return;
-    }
-    ComObj *s = dev ? device_depthbuffer(dev) : nullptr;
-    if (!s || !out) {
+    if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
+    com_out_ptr(out, 0);
+    recomp::d3d::ValueResult result = dev->d3d9_device->depth_stencil();
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    if (result.value == 0) {
+        com_ret(c, D3DERR_NOTFOUND);
+        return;
+    }
+    ComObj *s = result.value == 0xffffffffu ? device_depthbuffer(dev) : com_get(result.value);
     return_surface_handle(c, s, out);
 }
 
@@ -5278,29 +4238,17 @@ void Dev_GetDepthStencilSurface(X86 *c) {
 void Dev_GetRenderTarget(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 2);
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device || arg(c, 1) != 0 || !out || !gm_valid(out, 4)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        com_out_ptr(out, 0);
-        recomp::d3d::ValueResult result = dev->d3d9_device->render_target();
-        if (result.status.code != recomp::d3d::StatusCode::Ok) {
-            com_ret(c, bridge_result(c, result.status));
-            return;
-        }
-        ComObj *s = result.value == 0 ? device_backbuffer(dev) : com_get(result.value);
-        return_surface_handle(c, s, out);
-        return;
-    }
-    if (!dev || !out) {
+    if (!dev || !dev->d3d9_device || arg(c, 1) != 0 || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
     com_out_ptr(out, 0);
-    ComObj *s = dev->render_target ? com_get(dev->render_target) : nullptr;
-    if (!s)
-        s = device_backbuffer(dev);
+    recomp::d3d::ValueResult result = dev->d3d9_device->render_target();
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    ComObj *s = result.value == 0 ? device_backbuffer(dev) : com_get(result.value);
     return_surface_handle(c, s, out);
 }
 
@@ -5308,80 +4256,52 @@ void Dev_SetRenderTarget(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *s = com_this(arg(c, 2));
     uint32_t index = arg(c, 1);
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device || (arg(c, 2) && (!s || s->kind != K_D3D9SURFACE)) ||
-            (s && s->dev_d3d != dev->id) || (index == 0 && !s)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        uint32_t face = 0, level = 0;
-        bool volume = false;
-        uint32_t id = 0;
-        if (s) {
-            id = d3d9_target_id(s);
-            face = s->d3d9_face;
-            level = s->d3d9_level;
-            volume = s->d3d9_volume;
-        }
-        recomp::d3d::Status status =
-            dev->d3d9_device->set_render_target(index, id, face, level, volume);
-        if (d3d_bridge_ok(status))
-            d3d9_refresh_bindings(dev);
-        com_ret(c, bridge_result(c, status));
-        return;
-    }
-    if (!dev || index > 3) {
+    if (!dev || !dev->d3d9_device || (arg(c, 2) && (!s || s->kind != K_D3D9SURFACE)) ||
+        (s && s->dev_d3d != dev->id) || (index == 0 && !s)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (index == 0 && !(s && s->kind == K_D3D9SURFACE)) {
-        com_ret(c, D3DERR_INVALIDCALL); // target 0 cannot be unset
-        return;
+    uint32_t face = 0, level = 0;
+    bool volume = false;
+    uint32_t id = 0;
+    if (s) {
+        id = d3d9_target_id(s);
+        face = s->d3d9_face;
+        level = s->d3d9_level;
+        volume = s->d3d9_volume;
     }
-    D9Pipeline &pl = d9_pipeline(dev->id);
-    pl.color_target[index] = (s && s->kind == K_D3D9SURFACE) ? s->id : 0;
-    if (index == 0) {
-        dev->render_target = s->id;
-        // Setting render target 0 resets the viewport and scissor to the target.
-        pl.viewport_set = false;
-        pl.scissor[0] = pl.scissor[1] = 0;
-        pl.scissor[2] = (int32_t)s->width;
-        pl.scissor[3] = (int32_t)s->height;
-    }
-    com_ret(c, D3D_OK9);
+    recomp::d3d::Status status =
+        dev->d3d9_device->set_render_target(index, id, face, level, volume);
+    if (d3d_bridge_ok(status))
+        d3d9_refresh_bindings(dev);
+    com_ret(c, bridge_result(c, status));
 }
 
 void Dev_SetDepthStencilSurface(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *s = com_this(arg(c, 1));
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device || (arg(c, 1) && (!s || s->kind != K_D3D9SURFACE)) ||
-            (s && s->dev_d3d != dev->id)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        uint32_t face = 0, level = 0;
-        bool volume = false;
-        uint32_t id = 0;
-        if (s) {
-            if (s->d3d9_implicit && s->d3d9_target_depth) {
-                id = 0xffffffffu;
-            } else {
-                id = s->id;
-                face = s->d3d9_face;
-                level = s->d3d9_level;
-                volume = s->d3d9_volume;
-            }
-        }
-        recomp::d3d::Status status = dev->d3d9_device->set_depth_stencil(id, face, level, volume);
-        if (d3d_bridge_ok(status))
-            d3d9_refresh_bindings(dev);
-        com_ret(c, bridge_result(c, status));
+    if (!dev || !dev->d3d9_device || (arg(c, 1) && (!s || s->kind != K_D3D9SURFACE)) ||
+        (s && s->dev_d3d != dev->id)) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (dev)
-        dev->zbuffer_obj = (s && s->kind == K_D3D9SURFACE) ? s->id : 0;
-    com_ret(c, D3D_OK9);
+    uint32_t face = 0, level = 0;
+    bool volume = false;
+    uint32_t id = 0;
+    if (s) {
+        if (s->d3d9_implicit && s->d3d9_target_depth) {
+            id = 0xffffffffu;
+        } else {
+            id = s->id;
+            face = s->d3d9_face;
+            level = s->d3d9_level;
+            volume = s->d3d9_volume;
+        }
+    }
+    recomp::d3d::Status status = dev->d3d9_device->set_depth_stencil(id, face, level, volume);
+    if (d3d_bridge_ok(status))
+        d3d9_refresh_bindings(dev);
+    com_ret(c, bridge_result(c, status));
 }
 
 // (this, pVertexElements, ppDecl): the element array is kept verbatim, since
@@ -5393,92 +4313,57 @@ void Dev_CreateVertexDeclaration(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (kD3d9WgpuEnabled) {
-        if (!dev->d3d9_device || !gm_valid(out, 4)) {
+    if (!dev->d3d9_device || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    std::vector<recomp::d3d::D3d9VertexElement> elements;
+    for (uint32_t i = 0; i < 65 && elems; ++i) {
+        uint32_t e = elems + i * 8u;
+        if (!gm_valid(e, 8)) {
             com_ret(c, D3DERR_INVALIDCALL);
             return;
         }
-        std::vector<recomp::d3d::D3d9VertexElement> elements;
-        for (uint32_t i = 0; i < 65 && elems; ++i) {
-            uint32_t e = elems + i * 8u;
-            if (!gm_valid(e, 8)) {
-                com_ret(c, D3DERR_INVALIDCALL);
-                return;
-            }
-            recomp::d3d::D3d9VertexElement element{};
-            element.stream = rd16(e);
-            element.offset = rd16(e + 2);
-            element.element_type = gm_ptr(e)[4];
-            element.method = gm_ptr(e)[5];
-            element.usage = gm_ptr(e)[6];
-            element.usage_index = gm_ptr(e)[7];
-            elements.push_back(element);
-            if (element.stream == 0xff)
-                break;
-        }
-        recomp::d3d::ValueResult result = dev->d3d9_device->create_vertex_declaration(
-            rust::Slice<const recomp::d3d::D3d9VertexElement>(elements.data(), elements.size()));
-        if (!d3d_bridge_ok(result.status)) {
-            com_ret(c, bridge_result(c, result.status));
-            return;
-        }
-        ComObj *d = d3d9_make_object(dev, K_D3D9DECL, IF_D3DVERTEXDECL9, result.value, out);
-        if (!d) {
-            dev->d3d9_device->destroy_declaration(result.value);
-            com_ret(c, E_OUTOFMEMORY);
-            return;
-        }
-        dev->d3d9_device->decl_views[result.value] = d->id;
-        com_ret(c, D3D_OK9);
-        return;
-    }
-    ComObj *d = com_new(K_D3D9DECL);
-    if (!d) {
-        com_ret(c, E_OUTOFMEMORY);
-        return;
-    }
-    d->dev_d3d = dev->id;
-    // D3DVERTEXELEMENT9 is 8 bytes and the array ends with D3DDECL_END, whose
-    // Stream is 0xff. Copy until that, so the declaration survives the call.
-    for (uint32_t i = 0; i < 65 && elems; ++i) {
-        uint32_t e = elems + i * 8u;
-        uint16_t stream = rd16(e);
-        for (int b = 0; b < 8; ++b)
-            d->blob.push_back(gm_ptr(e)[b]);
-        if (stream == 0xff)
+        recomp::d3d::D3d9VertexElement element{};
+        element.stream = rd16(e);
+        element.offset = rd16(e + 2);
+        element.element_type = gm_ptr(e)[4];
+        element.method = gm_ptr(e)[5];
+        element.usage = gm_ptr(e)[6];
+        element.usage_index = gm_ptr(e)[7];
+        elements.push_back(element);
+        if (element.stream == 0xff)
             break;
     }
-    uint32_t view_ = com_view(d, IF_D3DVERTEXDECL9);
-    if (!view_) {
-        com_release(d);
+    recomp::d3d::ValueResult result = dev->d3d9_device->create_vertex_declaration(
+        rust::Slice<const recomp::d3d::D3d9VertexElement>(elements.data(), elements.size()));
+    if (!d3d_bridge_ok(result.status)) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    ComObj *d = d3d9_make_object(dev, K_D3D9DECL, IF_D3DVERTEXDECL9, result.value, out);
+    if (!d) {
+        dev->d3d9_device->destroy_declaration(result.value);
         com_ret(c, E_OUTOFMEMORY);
         return;
     }
-    com_out_ptr(out, view_);
+    dev->d3d9_device->decl_views[result.value] = d->id;
     com_ret(c, D3D_OK9);
 }
 
 void Dev_SetVertexDeclaration(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *d = com_this(arg(c, 1));
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device || (arg(c, 1) && (!d || d->kind != K_D3D9DECL)) ||
-            (d && d->dev_d3d != dev->id)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::Status status =
-            dev->d3d9_device->set_vertex_declaration(d ? d->d3d9_state_handle : 0);
-        if (d3d_bridge_ok(status))
-            d3d9_refresh_bindings(dev);
-        com_ret(c, bridge_result(c, status));
+    if (!dev || !dev->d3d9_device || (arg(c, 1) && (!d || d->kind != K_D3D9DECL)) ||
+        (d && d->dev_d3d != dev->id)) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (dev) {
-        dev->current_viewport = (d && d->kind == K_D3D9DECL) ? d->id : 0;
-        d9_pipeline(dev->id).declaration = dev->current_viewport;
-    }
-    com_ret(c, D3D_OK9);
+    recomp::d3d::Status status =
+        dev->d3d9_device->set_vertex_declaration(d ? d->d3d9_state_handle : 0);
+    if (d3d_bridge_ok(status))
+        d3d9_refresh_bindings(dev);
+    com_ret(c, bridge_result(c, status));
 }
 
 void Dev_CreateQuery(X86 *c) {
@@ -5493,67 +4378,40 @@ void Dev_CreateQuery(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (kD3d9WgpuEnabled) {
-        if (!dev->d3d9_device) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::ValueResult result = dev->d3d9_device->create_query(type);
-        if (!out) {
-            if (result.status.code == recomp::d3d::StatusCode::Ok && result.value) {
-                dev->d3d9_device->destroy_query(result.value);
-                com_ret(c, D3D_OK9);
-            } else {
-                com_ret(c, D3DERR_NOTAVAILABLE);
-            }
-            return;
-        }
-        if (!gm_valid(out, 4)) {
-            if (result.status.code == recomp::d3d::StatusCode::Ok && result.value)
-                dev->d3d9_device->destroy_query(result.value);
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        if (result.status.code != recomp::d3d::StatusCode::Ok) {
-            com_ret(c, bridge_result(c, result.status));
-            return;
-        }
-        ComObj *q = com_new(K_D3D9QUERY);
-        if (!q) {
-            dev->d3d9_device->destroy_query(result.value);
-            com_ret(c, E_OUTOFMEMORY);
-            return;
-        }
-        q->dev_d3d = dev->id;
-        q->d3d9_query = result.value;
-        com_retain_internal(dev);
-        q->d3d9_owner_retained = true;
-        uint32_t view_ = com_view(q, IF_D3DQUERY9);
-        if (!view_) {
-            com_release(q);
-            com_ret(c, E_OUTOFMEMORY);
-            return;
-        }
-        com_out_ptr(out, view_);
-        com_ret(c, D3D_OK9);
+    if (!dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    bool creatable = type == D3DQUERYTYPE_OCCLUSION && gpu_on();
+    recomp::d3d::ValueResult result = dev->d3d9_device->create_query(type);
     if (!out) {
-        com_ret(c, creatable ? D3D_OK9 : D3DERR_NOTAVAILABLE);
+        if (result.status.code == recomp::d3d::StatusCode::Ok && result.value) {
+            dev->d3d9_device->destroy_query(result.value);
+            com_ret(c, D3D_OK9);
+        } else {
+            com_ret(c, D3DERR_NOTAVAILABLE);
+        }
         return;
     }
-    if (!creatable) {
-        LOGW("d3d9: CreateQuery unsupported for query type %u", type);
-        imports_unsupported(c);
+    if (!gm_valid(out, 4)) {
+        if (result.status.code == recomp::d3d::StatusCode::Ok && result.value)
+            dev->d3d9_device->destroy_query(result.value);
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
     }
     ComObj *q = com_new(K_D3D9QUERY);
     if (!q) {
+        dev->d3d9_device->destroy_query(result.value);
         com_ret(c, E_OUTOFMEMORY);
         return;
     }
-    q->dev_d3d = dev ? dev->id : 0;
-    q->dev_type = type;
+    q->dev_d3d = dev->id;
+    q->d3d9_query = result.value;
+    com_retain_internal(dev);
+    q->d3d9_owner_retained = true;
     uint32_t view_ = com_view(q, IF_D3DQUERY9);
     if (!view_) {
         com_release(q);
@@ -5569,68 +4427,35 @@ void Dev_SetStreamSource(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *vb = com_this(arg(c, 2));
     uint32_t stream = arg(c, 1);
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device || stream >= 16 ||
-            (arg(c, 2) && (!vb || vb->kind != K_D3D9VB)) || (vb && vb->dev_d3d != dev->id)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::Status status =
-            dev->d3d9_device->set_stream_source(stream, vb ? vb->id : 0, arg(c, 3), arg(c, 4));
-        if (d3d_bridge_ok(status))
-            d3d9_bind_slot(dev, 16 + stream, vb ? vb->id : 0);
-        com_ret(c, bridge_result(c, status));
-        return;
-    }
-    if (!dev) {
+    if (!dev || !dev->d3d9_device || stream >= 16 ||
+        (arg(c, 2) && (!vb || vb->kind != K_D3D9VB)) || (vb && vb->dev_d3d != dev->id)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (stream >= 16 || (arg(c, 2) && (!vb || vb->kind != K_D3D9VB))) {
-        com_ret(c, D3DERR_INVALIDCALL);
-        return;
-    }
-    if (stream >= 8) {
-        LOGW("d3d9: SetStreamSource unsupported for stream %u", stream);
-        imports_unsupported(c);
-    }
-    D9Pipeline::Stream &st = d9_pipeline(dev->id).stream[stream];
-    st.vb = (vb && vb->kind == K_D3D9VB) ? vb->id : 0;
-    st.offset = arg(c, 3);
-    st.stride = arg(c, 4);
-    if (stream == 0) {
-        dev->back_obj = st.vb;
-        dev->lock_off = arg(c, 3);
-        dev->rate = arg(c, 4); // the stride, reusing a spare field
-    }
-    com_ret(c, D3D_OK9);
+    recomp::d3d::Status status =
+        dev->d3d9_device->set_stream_source(stream, vb ? vb->id : 0, arg(c, 3), arg(c, 4));
+    if (d3d_bridge_ok(status))
+        d3d9_bind_slot(dev, 16 + stream, vb ? vb->id : 0);
+    com_ret(c, bridge_result(c, status));
 }
 
 void Dev_SetIndices(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *ib = com_this(arg(c, 1));
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device || (arg(c, 1) && (!ib || ib->kind != K_D3D9IB)) ||
-            (ib && ib->dev_d3d != dev->id)) {
-            log_once(("d3d9.SetIndices:" + std::to_string(arg(c, 1))).c_str(),
-                     "d3d9: SetIndices rejected device=%08x id=%08x buffer=%08x id=%08x kind=%u "
-                     "owner=%08x",
-                     arg(c, 0), dev ? dev->id : 0, arg(c, 1), ib ? ib->id : 0,
-                     ib ? static_cast<unsigned>(ib->kind) : 0, ib ? ib->dev_d3d : 0);
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::Status status = dev->d3d9_device->set_indices(ib ? ib->id : 0);
-        if (d3d_bridge_ok(status))
-            d3d9_bind_slot(dev, 32, ib ? ib->id : 0);
-        com_ret(c, bridge_result(c, status));
+    if (!dev || !dev->d3d9_device || (arg(c, 1) && (!ib || ib->kind != K_D3D9IB)) ||
+        (ib && ib->dev_d3d != dev->id)) {
+        log_once(("d3d9.SetIndices:" + std::to_string(arg(c, 1))).c_str(),
+                 "d3d9: SetIndices rejected device=%08x id=%08x buffer=%08x id=%08x kind=%u "
+                 "owner=%08x",
+                 arg(c, 0), dev ? dev->id : 0, arg(c, 1), ib ? ib->id : 0,
+                 ib ? static_cast<unsigned>(ib->kind) : 0, ib ? ib->dev_d3d : 0);
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (dev) {
-        dev->front_obj = (ib && ib->kind == K_D3D9IB) ? ib->id : 0;
-        d9_pipeline(dev->id).index_buffer = dev->front_obj;
-    }
-    com_ret(c, D3D_OK9);
+    recomp::d3d::Status status = dev->d3d9_device->set_indices(ib ? ib->id : 0);
+    if (d3d_bridge_ok(status))
+        d3d9_bind_slot(dev, 32, ib ? ib->id : 0);
+    com_ret(c, bridge_result(c, status));
 }
 
 // (this, Stage, pTexture): the texture behind a sampler, for the renderer.
@@ -5638,46 +4463,28 @@ void Dev_SetTexture(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *tex = com_this(arg(c, 2));
     uint32_t stage = arg(c, 1);
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        if (stage >= 16) {
-            if (stage >= D3DDMAPSAMPLER && stage <= D3DVERTEXTEXTURESAMPLER3)
-                imports_unsupported(c);
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        if (arg(c, 2)) {
-            if (!tex || tex->dev_d3d != dev->id ||
-                (tex->kind != K_D3D9TEXTURE && tex->kind != K_D3D9CUBETEXTURE &&
-                 tex->kind != K_D3D9VOLUMETEXTURE)) {
-                com_ret(c, D3DERR_INVALIDCALL);
-                return;
-            }
-        }
-        recomp::d3d::Status status = dev->d3d9_device->set_texture(stage, tex ? tex->id : 0);
-        if (d3d_bridge_ok(status))
-            d3d9_bind_slot(dev, stage, tex ? tex->id : 0);
-        com_ret(c, bridge_result(c, status));
-        return;
-    }
-    if (!dev) {
+    if (!dev || !dev->d3d9_device) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
     if (stage >= 16) {
-        if (stage >= D3DDMAPSAMPLER && stage <= D3DVERTEXTEXTURESAMPLER3) {
-            LOGW("d3d9: SetTexture unsupported for sampler %u", stage);
+        if (stage >= D3DDMAPSAMPLER && stage <= D3DVERTEXTEXTURESAMPLER3)
             imports_unsupported(c);
-        }
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    dev->texture_handle = tex ? tex->id : 0;
-    d9_pipeline(dev->id).sampler_tex[stage] = tex ? tex->id : 0;
-    com_ret(c, D3D_OK9);
+    if (arg(c, 2)) {
+        if (!tex || tex->dev_d3d != dev->id ||
+            (tex->kind != K_D3D9TEXTURE && tex->kind != K_D3D9CUBETEXTURE &&
+             tex->kind != K_D3D9VOLUMETEXTURE)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+    }
+    recomp::d3d::Status status = dev->d3d9_device->set_texture(stage, tex ? tex->id : 0);
+    if (d3d_bridge_ok(status))
+        d3d9_bind_slot(dev, stage, tex ? tex->id : 0);
+    com_ret(c, bridge_result(c, status));
 }
 
 static uint32_t g_draws = 0;
@@ -5733,141 +4540,6 @@ static uint32_t inline_bytes(uint64_t count, uint32_t stride) {
     return static_cast<uint32_t>(count) * stride;
 }
 
-// The render target and depth buffer a draw or clear goes to, mirrored.
-static HostD9Target gpu_target(ComObj *dev) {
-    HostD9Target t{};
-    D9Pipeline &pl = d9_pipeline(dev->id);
-    for (int i = 0; i < 4; ++i) {
-        ComObj *s = com_get(pl.color_target[i]);
-        if (i == 0 && !s)
-            s = com_get(dev->render_target) ? com_get(dev->render_target) : device_backbuffer(dev);
-        if (!s)
-            continue;
-        uint32_t slot;
-        ComObj *owner = com_get(mirror_slot(s, &slot));
-        if (owner)
-            gpu_sync(owner);
-        t.color[i] = surface_ref(s);
-    }
-    if (ComObj *z = com_get(dev->zbuffer_obj)) {
-        uint32_t slot;
-        ComObj *owner = com_get(mirror_slot(z, &slot));
-        if (owner)
-            gpu_sync(owner);
-        t.depth = surface_ref(z);
-    }
-    return t;
-}
-static void gpu_target_drawn(ComObj *dev, bool color, bool depth) {
-    D9Pipeline &pl = d9_pipeline(dev->id);
-    if (color)
-        for (int i = 0; i < 4; ++i) {
-            ComObj *s = com_get(pl.color_target[i]);
-            if (i == 0 && !s)
-                s = com_get(dev->render_target);
-            gpu_drawn_into(s);
-        }
-    if (depth)
-        gpu_drawn_into(com_get(dev->zbuffer_obj));
-}
-static void target_viewport(ComObj *dev, const HostD9Target &t, int32_t vp[4]) {
-    D9Pipeline &pl = d9_pipeline(dev->id);
-    if (pl.viewport_set) {
-        for (int i = 0; i < 4; ++i)
-            vp[i] = (int32_t)pl.viewport[i];
-        return;
-    }
-    ComObj *rt =
-        com_get(pl.color_target[0]) ? com_get(pl.color_target[0]) : com_get(dev->render_target);
-    (void)t;
-    vp[0] = vp[1] = 0;
-    vp[2] = rt ? (int32_t)rt->width : (int32_t)dev->width;
-    vp[3] = rt ? (int32_t)rt->height : (int32_t)dev->height;
-}
-
-// One draw, handed to the GPU renderer with everything the device has bound.
-static void gpu_draw(X86 *c, ComObj *dev, HostD9Draw &d) {
-    D9Pipeline &pl = d9_pipeline(dev->id);
-    if (pl.vs.empty() || pl.ps.empty()) {
-        LOGW("d3d9: GPU draw unsupported: no vertex/pixel shader bound (primitive %u)",
-             d.primitive);
-        imports_unsupported(c);
-    }
-    d.target = gpu_target(dev);
-    target_viewport(dev, d.target, d.viewport);
-    d.depth_range[0] = pl.viewport_z[0];
-    d.depth_range[1] = pl.viewport_z[1];
-    for (int i = 0; i < 4; ++i)
-        d.scissor[i] = pl.scissor[i];
-    if (!pl.vs_key)
-        pl.vs_key = d9sh::code_key(pl.vs.data(), pl.vs.size());
-    if (!pl.ps_key)
-        pl.ps_key = d9sh::code_key(pl.ps.data(), pl.ps.size());
-    const d9sh::Program &vs = d9sh::program_for_key(pl.vs_key, pl.vs.data(), pl.vs.size());
-    const d9sh::Program &ps = d9sh::program_for_key(pl.ps_key, pl.ps.data(), pl.ps.size());
-    d.vs_key = pl.vs_key;
-    d.ps_key = pl.ps_key;
-    d.vs = pl.vs.data();
-    d.vs_size = (uint32_t)pl.vs.size();
-    d.ps = pl.ps.data();
-    d.ps_size = (uint32_t)pl.ps.size();
-    d.vconst = &pl.vconst[0][0];
-    d.vconst_count = std::min<uint32_t>(vs.max_const, 256);
-    d.pconst = &pl.pconst[0][0];
-    d.pconst_count = std::min<uint32_t>(ps.max_const, 32);
-    ComObj *decl = com_get(pl.declaration);
-    if (!decl || decl->kind != K_D3D9DECL) {
-        LOGW("d3d9: GPU draw unsupported: no vertex declaration bound (primitive %u)", d.primitive);
-        imports_unsupported(c);
-    }
-    d.decl = decl->blob.data();
-    d.decl_size = (uint32_t)decl->blob.size();
-    d.decl_id = decl->id;
-    for (int i = 0; i < 8; ++i) {
-        if (d.stream[i].stride && !d.stream[i].buffer)
-            continue; // the draw's own inline vertices
-        ComObj *vb = com_get(pl.stream[i].vb);
-        if (!vb)
-            continue;
-        gpu_sync_buffer(vb);
-        d.stream[i].buffer = vb->id;
-        d.stream[i].offset = pl.stream[i].offset;
-        d.stream[i].stride = pl.stream[i].stride;
-    }
-    for (int s = 0; s < 16; ++s) {
-        ComObj *tex = com_get(pl.sampler_tex[s]);
-        if (!tex || (tex->kind != K_D3D9TEXTURE && tex->kind != K_D3D9SURFACE))
-            continue;
-        gpu_sync(tex);
-        d.sampler_texture[s] = tex->id;
-    }
-    d.sampler_state = &pl.sampler_state[0][0];
-    d.render_state = pl.rs;
-    d.render_state_set = (const uint8_t *)pl.rs_set;
-    d.state_version = pl.state_version;
-    for (int st = 0; st < 8; ++st)
-        if (pl.tss[st][24] & 0x100) // D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_PROJECTED
-            d.projected_mask |= 1u << st;
-    d.label = pl.label;
-    host_d9_draw(&d);
-    bool color_write = !pl.rs_set[168] || (pl.rs[168] & 0xf) != 0;
-    bool z_write = (!pl.rs_set[14] || pl.rs[14]) && (!pl.rs_set[7] || pl.rs[7]);
-    gpu_target_drawn(dev, color_write, z_write);
-}
-
-// Hands one draw to the CPU renderer with what the device has bound.
-static void raster(X86 *c, const D9DrawCall &call) {
-    ComObj *dev = this_device9(c);
-    if (!dev)
-        return;
-    ComObj *target = com_get(dev->render_target);
-    if (!target)
-        target = device_backbuffer(dev);
-    ComObj *decl = com_get(dev->current_viewport); // SetVertexDeclaration keeps it here
-    static const std::vector<uint8_t> none;
-    d9_raster_draw(dev, target, (decl && decl->kind == K_D3D9DECL) ? decl->blob : none, call);
-}
-
 // (this, PrimitiveType, StartVertex, PrimitiveCount)
 void Dev_DrawPrimitive(X86 *c) {
     if (draw_worth_reporting())
@@ -5879,49 +4551,15 @@ void Dev_DrawPrimitive(X86 *c) {
         com_ret(c, D3D_OK9);
         return;
     }
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::Status status =
-            dev->d3d9_device->draw_primitive(arg(c, 1), arg(c, 2), prim_count);
-        if (status.code == recomp::d3d::StatusCode::Ok)
-            d3d9_refresh_bindings(dev);
-        com_ret(c, bridge_result(c, status));
-        return;
-    }
-    if (dev && gpu_on()) {
-        bool have_stream = false;
-        for (int i = 0; i < 8; ++i)
-            if (d9_pipeline(dev->id).stream[i].vb)
-                have_stream = true;
-        if (!have_stream) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        HostD9Draw d{};
-        d.primitive = arg(c, 1);
-        d.primitive_count = prim_count;
-        d.start = arg(c, 2);
-        gpu_draw(c, dev, d);
-        com_ret(c, D3D_OK9);
-        return;
-    }
-    ComObj *vb = dev ? com_get(dev->back_obj) : nullptr;
-    if (!vb || !resource_bytes(vb) || dev->lock_off >= vb->blob.size()) {
+    if (!dev || !dev->d3d9_device) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    D9DrawCall call;
-    call.prim = arg(c, 1);
-    call.prim_count = prim_count;
-    call.vertex_data = resource_bytes(vb) + dev->lock_off;
-    call.vertex_bytes = vb->blob.size() - dev->lock_off;
-    call.stride = dev->rate;
-    call.first = arg(c, 2);
-    raster(c, call);
-    com_ret(c, D3D_OK9);
+    recomp::d3d::Status status =
+        dev->d3d9_device->draw_primitive(arg(c, 1), arg(c, 2), prim_count);
+    if (status.code == recomp::d3d::StatusCode::Ok)
+        d3d9_refresh_bindings(dev);
+    com_ret(c, bridge_result(c, status));
 }
 
 // (this, Type, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount)
@@ -5935,113 +4573,18 @@ void Dev_DrawIndexedPrimitive(X86 *c) {
         com_ret(c, D3D_OK9);
         return;
     }
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::Status status = dev->d3d9_device->draw_indexed_primitive(
-            arg(c, 1), (int32_t)arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5), prim_count);
-        com_ret(c, bridge_result(c, status));
-        return;
-    }
-    if (dev && gpu_on()) {
-        ComObj *ibo = com_get(d9_pipeline(dev->id).index_buffer);
-        if (!ibo) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        gpu_sync_buffer(ibo);
-        HostD9Draw d{};
-        d.primitive = arg(c, 1);
-        d.primitive_count = prim_count;
-        d.start = arg(c, 5);
-        d.base_vertex = (int32_t)arg(c, 2);
-        d.index_buffer = ibo->id;
-        d.index_size = ibo->rmask ? ibo->rmask : 2;
-        gpu_draw(c, dev, d);
-        com_ret(c, D3D_OK9);
-        return;
-    }
-    ComObj *vb = dev ? com_get(dev->back_obj) : nullptr;
-    ComObj *ib = dev ? com_get(dev->front_obj) : nullptr;
-    if (!vb || !resource_bytes(vb) || !ib || !resource_bytes(ib) ||
-        dev->lock_off >= vb->blob.size()) {
+    if (!dev || !dev->d3d9_device) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    D9DrawCall call;
-    call.prim = arg(c, 1);
-    call.prim_count = prim_count;
-    call.vertex_data = resource_bytes(vb) + dev->lock_off;
-    call.vertex_bytes = vb->blob.size() - dev->lock_off;
-    call.stride = dev->rate;
-    call.index_data = resource_bytes(ib);
-    call.index_bytes = ib->blob.size();
-    call.index_size = ib->rmask ? ib->rmask : 2;
-    call.base_vertex = (int32_t)arg(c, 2);
-    call.first = arg(c, 5);
-    raster(c, call);
-    com_ret(c, D3D_OK9);
+    recomp::d3d::Status status = dev->d3d9_device->draw_indexed_primitive(
+        arg(c, 1), (int32_t)arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5), prim_count);
+    com_ret(c, bridge_result(c, status));
 }
 
 // (this, PrimitiveType, PrimitiveCount, pVertexStreamZeroData, Stride): the
 // vertices travel with the call rather than in a buffer, which is how this
 // game draws.
-// What a rasterizer will need from a draw, spelled out for the first few: the
-// bound vertex declaration decoded, the raw vertices as floats, the bound
-// texture, and the surface being drawn into.
-static void describe_draw_inputs(X86 *c, uint32_t vertices, uint32_t stride, uint32_t nverts) {
-    ComObj *dev = this_device9(c);
-    if (!dev)
-        return;
-    ComObj *decl = com_get(dev->current_viewport); // SetVertexDeclaration keeps it here
-    if (decl && decl->kind == K_D3D9DECL) {
-        static const char *types[] = {"FLOAT1",    "FLOAT2",   "FLOAT3",   "FLOAT4",  "D3DCOLOR",
-                                      "UBYTE4",    "SHORT2",   "SHORT4",   "UBYTE4N", "SHORT2N",
-                                      "SHORT4N",   "USHORT2N", "USHORT4N", "UDEC3",   "DEC3N",
-                                      "FLOAT16_2", "FLOAT16_4"};
-        static const char *usages[] = {
-            "POSITION", "BLENDWEIGHT", "BLENDINDICES", "NORMAL", "PSIZE", "TEXCOORD", "TANGENT",
-            "BINORMAL", "TESSFACTOR",  "POSITIONT",    "COLOR",  "FOG",   "DEPTH",    "SAMPLE"};
-        char line[512];
-        size_t used = 0;
-        for (size_t i = 0; i + 8 <= decl->blob.size(); i += 8) {
-            uint16_t stream = (uint16_t)(decl->blob[i] | (decl->blob[i + 1] << 8));
-            if (stream == 0xff)
-                break;
-            uint16_t off = (uint16_t)(decl->blob[i + 2] | (decl->blob[i + 3] << 8));
-            uint8_t type = decl->blob[i + 4], usage = decl->blob[i + 6], index = decl->blob[i + 7];
-            used += (size_t)snprintf(line + used, sizeof line - used, " %s%u@%u:%s",
-                                     usage < 14 ? usages[usage] : "?", index, off,
-                                     type < 17 ? types[type] : "?");
-            if (used >= sizeof line)
-                break;
-        }
-        LOGW("d3d9:   declaration %u:%s", decl->id, line);
-    } else {
-        LOGW("d3d9:   no vertex declaration bound (FVF path)");
-    }
-    for (uint32_t v = 0; v < nverts && v < 4; ++v) {
-        uint32_t base = vertices + v * stride;
-        char line[256]{};
-        size_t used = 0;
-        for (uint32_t o = 0; o + 4 <= stride && o < 40; o += 4)
-            used += (size_t)snprintf(
-                line + used, sizeof line - used, " %g", (double)[&] {
-                    float f;
-                    uint32_t bits = rd32(base + o);
-                    memcpy(&f, &bits, 4);
-                    return f;
-                }());
-        LOGW("d3d9:   vertex %u:%s", v, line);
-    }
-    ComObj *tex = com_get(dev->texture_handle);
-    ComObj *rt = com_get(dev->render_target);
-    LOGW("d3d9:   texture %u (%ux%u), target %u (%ux%u)%s", tex ? tex->id : 0, tex ? tex->width : 0,
-         tex ? tex->height : 0, rt ? rt->id : 0, rt ? rt->width : 0, rt ? rt->height : 0,
-         (rt && rt->id == dev->palette_obj) ? ", the back buffer" : "");
-}
 
 void Dev_DrawPrimitiveUP(X86 *c) {
     if (draw_worth_reporting()) {
@@ -6059,38 +4602,14 @@ void Dev_DrawPrimitiveUP(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (!kD3d9WgpuEnabled && g_draws <= 8)
-        describe_draw_inputs(c, arg(c, 3), arg(c, 4),
-                             static_cast<uint32_t>(primitive_vertices(arg(c, 1), prim_count)));
-    if (kD3d9WgpuEnabled) {
-        if (!dev->d3d9_device) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::Status status = dev->d3d9_device->draw_primitive_up(
-            arg(c, 1), prim_count, rust::Slice<const uint8_t>(gm_ptr(arg(c, 3)), bytes), arg(c, 4));
-        d3d9_refresh_bindings(dev);
-        com_ret(c, bridge_result(c, status));
+    if (!dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (gpu_on()) {
-        HostD9Draw d{};
-        d.primitive = arg(c, 1);
-        d.primitive_count = prim_count;
-        d.stream[0].stride = arg(c, 4);
-        d.inline_vertices = gm_ptr(arg(c, 3));
-        d.inline_bytes = bytes;
-        gpu_draw(c, dev, d);
-        com_ret(c, D3D_OK9);
-        return;
-    }
-    D9DrawCall call;
-    call.prim = arg(c, 1);
-    call.prim_count = prim_count;
-    call.vertices = arg(c, 3);
-    call.stride = arg(c, 4);
-    raster(c, call);
-    com_ret(c, D3D_OK9);
+    recomp::d3d::Status status = dev->d3d9_device->draw_primitive_up(
+        arg(c, 1), prim_count, rust::Slice<const uint8_t>(gm_ptr(arg(c, 3)), bytes), arg(c, 4));
+    d3d9_refresh_bindings(dev);
+    com_ret(c, bridge_result(c, status));
 }
 
 // (this, PrimitiveType, MinVertexIndex, NumVertices, PrimitiveCount,
@@ -6115,42 +4634,16 @@ void Dev_DrawIndexedPrimitiveUP(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (kD3d9WgpuEnabled) {
-        if (!dev->d3d9_device) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::Status status = dev->d3d9_device->draw_indexed_primitive_up(
-            arg(c, 1), arg(c, 2), arg(c, 3), prim_count,
-            rust::Slice<const uint8_t>(gm_ptr(arg(c, 5)), ibytes), arg(c, 6),
-            rust::Slice<const uint8_t>(gm_ptr(arg(c, 7)), vbytes), arg(c, 8));
-        d3d9_refresh_bindings(dev);
-        com_ret(c, bridge_result(c, status));
+    if (!dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (gpu_on()) {
-        HostD9Draw d{};
-        d.primitive = arg(c, 1);
-        d.primitive_count = prim_count;
-        d.stream[0].stride = arg(c, 8);
-        d.inline_vertices = gm_ptr(arg(c, 7));
-        d.inline_bytes = vbytes;
-        d.inline_indices = gm_ptr(arg(c, 5));
-        d.inline_index_bytes = ibytes;
-        d.index_size = isize;
-        gpu_draw(c, dev, d);
-        com_ret(c, D3D_OK9);
-        return;
-    }
-    D9DrawCall call;
-    call.prim = arg(c, 1);
-    call.prim_count = prim_count;
-    call.vertices = arg(c, 7);
-    call.stride = arg(c, 8);
-    call.indices = arg(c, 5);
-    call.index_size = arg(c, 6) == D3DFMT_INDEX32 ? 4 : 2;
-    raster(c, call);
-    com_ret(c, D3D_OK9);
+    recomp::d3d::Status status = dev->d3d9_device->draw_indexed_primitive_up(
+        arg(c, 1), arg(c, 2), arg(c, 3), prim_count,
+        rust::Slice<const uint8_t>(gm_ptr(arg(c, 5)), ibytes), arg(c, 6),
+        rust::Slice<const uint8_t>(gm_ptr(arg(c, 7)), vbytes), arg(c, 8));
+    d3d9_refresh_bindings(dev);
+    com_ret(c, bridge_result(c, status));
 }
 
 // ---------------------------------------------------------------------------
@@ -6172,24 +4665,11 @@ static void resource_type_wgpu(X86 *c, ComObj *o) {
 
 void Res_GetType(X86 *c) {
     ComObj *o = com_this_arg(c);
-    if (kD3d9WgpuEnabled) {
-        if (o && o->d3d9_implicit) {
-            com_ret(c, 1);
-            return;
-        }
-        resource_type_wgpu(c, o);
+    if (o && o->d3d9_implicit) {
+        com_ret(c, 1);
         return;
     }
-    uint32_t type = 0;
-    if (o && o->kind == K_D3D9SURFACE)
-        type = 1;
-    else if (o && o->kind == K_D3D9TEXTURE)
-        type = o->caps ? 5 : 3;
-    else if (o && o->kind == K_D3D9VB)
-        type = 6;
-    else if (o && o->kind == K_D3D9IB)
-        type = 7;
-    com_ret(c, type);
+    resource_type_wgpu(c, o);
 }
 
 void Buf_GetType(X86 *c) {
@@ -6247,31 +4727,7 @@ static void resource_container(X86 *c) {
 // (this, riid, ppContainer): the texture a level or face belongs to, or the
 // device when the surface stands alone.
 void Surf_GetContainer(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        resource_container(c);
-        return;
-    }
-    ComObj *s = com_this_arg(c);
-    uint32_t out = arg(c, 2);
-    if (!s || !out) {
-        com_ret(c, D3DERR_INVALIDCALL);
-        return;
-    }
-    ComObj *parent = com_get(s->front_obj);
-    if (parent) {
-        com_addref(parent);
-        com_out_ptr(out, com_view(parent, parent->caps ? IF_D3DCUBETEXTURE9 : IF_D3DTEXTURE9));
-        com_ret(c, D3D_OK9);
-        return;
-    }
-    ComObj *dev = com_get(s->dev_d3d);
-    if (!dev) {
-        com_ret(c, D3DERR_INVALIDCALL);
-        return;
-    }
-    com_addref(dev);
-    com_out_ptr(out, com_view(dev, IF_D3DDEVICE9));
-    com_ret(c, D3D_OK9);
+    resource_container(c);
 }
 
 void Res_GetDevice(X86 *c) {
@@ -6281,12 +4737,12 @@ void Res_GetDevice(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (kD3d9WgpuEnabled && !o->d3d9_resource && !o->d3d9_implicit && !o->dev_d3d) {
+    if (!o->d3d9_resource && !o->d3d9_implicit && !o->dev_d3d) {
         imports_unsupported(c);
         return;
     }
     ComObj *dev = com_get(o->dev_d3d);
-    if (!dev || (kD3d9WgpuEnabled && !dev->d3d9_device)) {
+    if (!dev || !dev->d3d9_device) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
@@ -6458,20 +4914,6 @@ static void resource_preload(X86 *c) {
     com_ret(c, D3D_OK9);
 }
 
-// Lock hands the guest the storage this resource was created with. Unlock is
-// a no-op: there is nothing to upload to yet.
-static void buffer_lock(X86 *c) {
-    ComObj *o = com_this_arg(c);
-    uint32_t offset = arg(c, 1), out = arg(c, 3);
-    if (!o || !out) {
-        com_ret(c, D3DERR_INVALIDCALL);
-        return;
-    }
-    uint32_t staged = offset < o->blob.size() ? stage_lock(o) : 0;
-    com_out_ptr(out, staged ? staged + offset : 0);
-    com_ret(c, staged ? D3D_OK9 : E_OUTOFMEMORY);
-}
-
 static void buffer_lock_wgpu(X86 *c) {
     ComObj *o = com_this_arg(c);
     uint32_t offset = arg(c, 1), size = arg(c, 2), out = arg(c, 3), flags = arg(c, 4);
@@ -6553,164 +4995,75 @@ static void buffer_unlock_wgpu(X86 *c) {
 }
 
 void VB_Lock(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        buffer_lock_wgpu(c);
-        return;
-    }
-    buffer_lock(c);
+    buffer_lock_wgpu(c);
 }
 void IB_Lock(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        buffer_lock_wgpu(c);
-        return;
-    }
-    buffer_lock(c);
+    buffer_lock_wgpu(c);
 }
 void Buf_Unlock(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        buffer_unlock_wgpu(c);
-        return;
-    }
-    stage_unlock(com_this_arg(c));
-    com_ret(c, D3D_OK9);
+    buffer_unlock_wgpu(c);
 }
 // D3DVERTEXBUFFER_DESC / D3DINDEXBUFFER_DESC: Format, Type, Usage, Pool, Size.
 void Buf_GetDesc(X86 *c) {
     ComObj *o = com_this_arg(c);
     uint32_t d = arg(c, 1);
-    if (kD3d9WgpuEnabled) {
-        if (!o || (o->kind != K_D3D9VB && o->kind != K_D3D9IB) || !o->d3d9_resource) {
-            imports_unsupported(c);
-            return;
-        }
-        uint32_t desc_size = o->kind == K_D3D9VB ? 24 : 20;
-        if (!d || !gm_valid(d, desc_size)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::D3d9BufferDescriptorResult result = o->d3d9_resource->descriptor();
-        if (result.status.code != recomp::d3d::StatusCode::Ok) {
-            com_ret(c, bridge_result(c, result.status));
-            return;
-        }
-        memset(gm_ptr(d), 0, desc_size);
-        wr32(d + 0, result.descriptor.format);
-        wr32(d + 4, result.descriptor.resource_type);
-        wr32(d + 8, result.descriptor.usage);
-        wr32(d + 12, result.descriptor.pool);
-        wr32(d + 16, result.descriptor.size);
-        if (o->kind == K_D3D9VB)
-            wr32(d + 20, result.descriptor.fvf);
-        com_ret(c, D3D_OK9);
+    if (!o || (o->kind != K_D3D9VB && o->kind != K_D3D9IB) || !o->d3d9_resource) {
+        imports_unsupported(c);
         return;
     }
-    if (!o || !d) {
+    uint32_t desc_size = o->kind == K_D3D9VB ? 24 : 20;
+    if (!d || !gm_valid(d, desc_size)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    memset(gm_ptr(d), 0, 20);
-    wr32(d + 16, o->buf_bytes);
+    recomp::d3d::D3d9BufferDescriptorResult result = o->d3d9_resource->descriptor();
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    memset(gm_ptr(d), 0, desc_size);
+    wr32(d + 0, result.descriptor.format);
+    wr32(d + 4, result.descriptor.resource_type);
+    wr32(d + 8, result.descriptor.usage);
+    wr32(d + 12, result.descriptor.pool);
+    wr32(d + 16, result.descriptor.size);
+    if (o->kind == K_D3D9VB)
+        wr32(d + 20, result.descriptor.fvf);
     com_ret(c, D3D_OK9);
 }
 
 // D3DLOCKED_RECT is { INT Pitch; void *pBits; }.
 void Surf_LockRect(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        ComObj *o = com_this_arg(c);
-        if (o && o->d3d9_implicit) {
-            imports_unsupported(c);
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        level_lock_wgpu(c, o, 0, 0, false, arg(c, 2), 0, arg(c, 3), arg(c, 1), false);
-        return;
-    }
-    ComObj *s = com_this_arg(c);
-    uint32_t out = arg(c, 1);
-    if (!s || !out) {
+    ComObj *o = com_this_arg(c);
+    if (o && o->d3d9_implicit) {
+        imports_unsupported(c);
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    uint32_t staged = stage_lock(s);
-    wr32(out, s->pitch);
-    wr32(out + 4, staged);
-    com_ret(c, staged ? D3D_OK9 : E_OUTOFMEMORY);
+    level_lock_wgpu(c, o, 0, 0, false, arg(c, 2), 0, arg(c, 3), arg(c, 1), false);
 }
 void Surf_UnlockRect(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        ComObj *o = com_this_arg(c);
-        if (o && o->d3d9_implicit) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        level_unlock_wgpu(c, o, 0, 0);
+    ComObj *o = com_this_arg(c);
+    if (o && o->d3d9_implicit) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    stage_unlock(com_this_arg(c));
-    com_ret(c, D3D_OK9);
+    level_unlock_wgpu(c, o, 0, 0);
 }
 // D3DSURFACE_DESC: Format, Type, Usage, Pool, MultiSampleType, Quality,
 // Width, Height.
 void Surf_GetDesc(X86 *c) {
     ComObj *s = com_this_arg(c);
     uint32_t d = arg(c, 1);
-    if (kD3d9WgpuEnabled) {
-        if (s && s->d3d9_implicit) {
-            ComObj *dev = com_get(s->dev_d3d);
-            if (!dev || !dev->d3d9_device || !d || !gm_valid(d, 32)) {
-                com_ret(c, D3DERR_INVALIDCALL);
-                return;
-            }
-            recomp::d3d::D3d9SurfaceDescriptorResult result =
-                s->d3d9_target_depth ? dev->d3d9_device->depthbuffer_descriptor()
-                                     : dev->d3d9_device->backbuffer_descriptor();
-            if (result.status.code != recomp::d3d::StatusCode::Ok) {
-                com_ret(c, bridge_result(c, result.status));
-                return;
-            }
-            memset(gm_ptr(d), 0, 32);
-            wr32(d + 0, result.descriptor.format);
-            wr32(d + 4, result.descriptor.resource_type);
-            wr32(d + 8, result.descriptor.usage);
-            wr32(d + 12, result.descriptor.pool);
-            wr32(d + 24, result.descriptor.width);
-            wr32(d + 28, result.descriptor.height);
-            com_ret(c, D3D_OK9);
-            return;
-        }
-        if (!s || !s->d3d9_resource || !d || !gm_valid(d, 32)) {
+    if (s && s->d3d9_implicit) {
+        ComObj *dev = com_get(s->dev_d3d);
+        if (!dev || !dev->d3d9_device || !d || !gm_valid(d, 32)) {
             com_ret(c, D3DERR_INVALIDCALL);
             return;
         }
-        if (s->d3d9_parent) {
-            ComObj *parent = com_get(s->d3d9_parent);
-            if (!parent || !parent->d3d9_resource) {
-                com_ret(c, D3DERR_INVALIDCALL);
-                return;
-            }
-            recomp::d3d::D3d9TextureDescriptorResult td =
-                parent->d3d9_resource->texture_descriptor();
-            recomp::d3d::D3d9LevelDescriptorResult ld =
-                parent->d3d9_resource->texture_level_descriptor(s->d3d9_face, s->d3d9_level);
-            if (td.status.code != recomp::d3d::StatusCode::Ok) {
-                com_ret(c, bridge_result(c, td.status));
-                return;
-            }
-            if (ld.status.code != recomp::d3d::StatusCode::Ok) {
-                com_ret(c, bridge_result(c, ld.status));
-                return;
-            }
-            memset(gm_ptr(d), 0, 32);
-            wr32(d + 0, ld.descriptor.format);
-            wr32(d + 4, td.descriptor.resource_type);
-            wr32(d + 8, td.descriptor.usage);
-            wr32(d + 12, td.descriptor.pool);
-            wr32(d + 24, ld.descriptor.width);
-            wr32(d + 28, ld.descriptor.height);
-            com_ret(c, D3D_OK9);
-            return;
-        }
-        recomp::d3d::D3d9SurfaceDescriptorResult result = s->d3d9_resource->surface_descriptor();
+        recomp::d3d::D3d9SurfaceDescriptorResult result =
+            s->d3d9_target_depth ? dev->d3d9_device->depthbuffer_descriptor()
+                                 : dev->d3d9_device->backbuffer_descriptor();
         if (result.status.code != recomp::d3d::StatusCode::Ok) {
             com_ret(c, bridge_result(c, result.status));
             return;
@@ -6720,153 +5073,25 @@ void Surf_GetDesc(X86 *c) {
         wr32(d + 4, result.descriptor.resource_type);
         wr32(d + 8, result.descriptor.usage);
         wr32(d + 12, result.descriptor.pool);
-        wr32(d + 16, result.descriptor.multisample_type);
-        wr32(d + 20, result.descriptor.multisample_quality);
         wr32(d + 24, result.descriptor.width);
         wr32(d + 28, result.descriptor.height);
         com_ret(c, D3D_OK9);
         return;
     }
-    if (!s || !d) {
+    if (!s || !s->d3d9_resource || !d || !gm_valid(d, 32)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    memset(gm_ptr(d), 0, 32);
-    wr32(d + 0, s->rmask ? s->rmask : 22);
-    wr32(d + 24, s->width);
-    wr32(d + 28, s->height);
-    com_ret(c, D3D_OK9);
-}
-
-// A texture level is the surface made with the texture.
-// A cube face, made on first ask and kept, so the game gets the same surface
-// back every time. Returning success without writing the pointer - which is
-// what the stub did - had the game store nothing and throw the cube away.
-// The surface for one face and level of a cube, made on first ask and kept on
-// the texture, indexed face + 6 * level.
-static ComObj *cube_face(ComObj *tex, uint32_t face, uint32_t level) {
-    if (!tex || tex->kind != K_D3D9TEXTURE || !tex->caps || face > 5 || level > 15)
-        return nullptr;
-    size_t slot = face + 6u * level;
-    if (tex->surfaces.size() <= slot)
-        tex->surfaces.resize(slot + 1, 0);
-    ComObj *s = com_get(tex->surfaces[slot]);
-    if (!s) {
-        uint32_t edge = std::max(tex->width >> level, 1u);
-        s = make_surface(com_get(tex->dev_d3d), edge, edge, tex->rmask ? tex->rmask : 22);
-        if (!s)
-            return nullptr;
-        s->front_obj = tex->id;
-        tex->surfaces[slot] = s->id;
-    }
-    return s;
-}
-
-// (this, FaceType, Level, ppCubeMapSurface). A face is a view into the
-// texture, so handing one out references the texture too: the game takes
-// face zero, releases the cube, and goes on using it for the other five.
-void Tex_GetCubeMapSurface(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        ComObj *tex = com_this_arg(c);
-        uint32_t out = arg(c, 3);
-        if (!out || !gm_valid(out, 4)) {
+    if (s->d3d9_parent) {
+        ComObj *parent = com_get(s->d3d9_parent);
+        if (!parent || !parent->d3d9_resource) {
             com_ret(c, D3DERR_INVALIDCALL);
             return;
         }
-        ComObj *s = com_level_view(tex, arg(c, 1), arg(c, 2), false);
-        if (!s) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        uint32_t view = com_view(s, IF_D3DSURFACE9);
-        if (!view) {
-            com_release(s);
-            com_ret(c, E_OUTOFMEMORY);
-            return;
-        }
-        com_out_ptr(out, view);
-        com_ret(c, D3D_OK9);
-        return;
-    }
-    ComObj *tex = com_this_arg(c);
-    uint32_t out = arg(c, 3);
-    ComObj *s = cube_face(tex, arg(c, 1), arg(c, 2));
-    if (!s || !out) {
-        com_ret(c, D3DERR_INVALIDCALL);
-        return;
-    }
-    uint32_t view = com_view(s, IF_D3DSURFACE9);
-    if (!view) {
-        com_ret(c, E_OUTOFMEMORY);
-        return;
-    }
-    com_addref(tex);
-    com_addref(s);
-    com_out_ptr(out, view);
-    com_ret(c, D3D_OK9);
-}
-
-// Returns a count, not an HRESULT. The stub returned zero, which told the
-// game its textures had no levels at all.
-// (this, FaceType, Level, pLockedRect, pRect, Flags)
-void Tex_LockRectCube(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        level_lock_wgpu(c, com_this_arg(c), arg(c, 1), arg(c, 2), false, arg(c, 4), 0, arg(c, 5),
-                        arg(c, 3), false);
-        return;
-    }
-    ComObj *s = cube_face(com_this_arg(c), arg(c, 1), arg(c, 2));
-    uint32_t out = arg(c, 3);
-    if (!s || !out) {
-        com_ret(c, D3DERR_INVALIDCALL);
-        return;
-    }
-    uint32_t staged = stage_lock(s);
-    wr32(out, s->pitch);
-    wr32(out + 4, staged);
-    com_ret(c, staged ? D3D_OK9 : E_OUTOFMEMORY);
-}
-// (this, FaceType, Level)
-void Tex_UnlockRectCube(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        level_unlock_wgpu(c, com_this_arg(c), arg(c, 1), arg(c, 2));
-        return;
-    }
-    stage_unlock(cube_face(com_this_arg(c), arg(c, 1), arg(c, 2)));
-    com_ret(c, D3D_OK9);
-}
-
-void Tex_GetLevelCount(X86 *c) {
-    ComObj *tex = com_this_arg(c);
-    if (kD3d9WgpuEnabled) {
-        if (!tex || !tex->d3d9_resource) {
-            imports_unsupported(c);
-            return;
-        }
-        recomp::d3d::D3d9TextureDescriptorResult result = tex->d3d9_resource->texture_descriptor();
-        if (result.status.code != recomp::d3d::StatusCode::Ok) {
-            com_ret(c, bridge_result(c, result.status));
-            return;
-        }
-        com_ret(c, result.descriptor.levels);
-        return;
-    }
-    set_eax(c, (tex && !tex->caps && !tex->surfaces.empty()) ? (uint32_t)tex->surfaces.size() : 1);
-}
-
-// (this, Level, pDesc): the same D3DSURFACE_DESC a surface describes itself
-// with, for the level the texture was created at.
-void Tex_GetLevelDesc(X86 *c) {
-    ComObj *tex = com_this_arg(c);
-    uint32_t d = arg(c, 2);
-    if (kD3d9WgpuEnabled) {
-        if (!tex || !tex->d3d9_resource || !d || !gm_valid(d, 32)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::D3d9TextureDescriptorResult td = tex->d3d9_resource->texture_descriptor();
+        recomp::d3d::D3d9TextureDescriptorResult td =
+            parent->d3d9_resource->texture_descriptor();
         recomp::d3d::D3d9LevelDescriptorResult ld =
-            tex->d3d9_resource->texture_level_descriptor(0, arg(c, 1));
+            parent->d3d9_resource->texture_level_descriptor(s->d3d9_face, s->d3d9_level);
         if (td.status.code != recomp::d3d::StatusCode::Ok) {
             com_ret(c, bridge_result(c, td.status));
             return;
@@ -6885,84 +5110,131 @@ void Tex_GetLevelDesc(X86 *c) {
         com_ret(c, D3D_OK9);
         return;
     }
-    ComObj *s = texture_level(tex, arg(c, 1));
-    if (!tex || !d) {
-        com_ret(c, D3DERR_INVALIDCALL);
+    recomp::d3d::D3d9SurfaceDescriptorResult result = s->d3d9_resource->surface_descriptor();
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
         return;
     }
     memset(gm_ptr(d), 0, 32);
-    wr32(d + 0, tex->rmask ? tex->rmask : 22);
-    wr32(d + 24, s ? s->width : tex->width);
-    wr32(d + 28, s ? s->height : tex->height);
+    wr32(d + 0, result.descriptor.format);
+    wr32(d + 4, result.descriptor.resource_type);
+    wr32(d + 8, result.descriptor.usage);
+    wr32(d + 12, result.descriptor.pool);
+    wr32(d + 16, result.descriptor.multisample_type);
+    wr32(d + 20, result.descriptor.multisample_quality);
+    wr32(d + 24, result.descriptor.width);
+    wr32(d + 28, result.descriptor.height);
+    com_ret(c, D3D_OK9);
+}
+
+// (this, FaceType, Level, ppCubeMapSurface). A face is a view into the
+// texture, so handing one out references the texture too: the game takes
+// face zero, releases the cube, and goes on using it for the other five.
+void Tex_GetCubeMapSurface(X86 *c) {
+    ComObj *tex = com_this_arg(c);
+    uint32_t out = arg(c, 3);
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    ComObj *s = com_level_view(tex, arg(c, 1), arg(c, 2), false);
+    if (!s) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t view = com_view(s, IF_D3DSURFACE9);
+    if (!view) {
+        com_release(s);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    com_out_ptr(out, view);
+    com_ret(c, D3D_OK9);
+}
+
+// Returns a count, not an HRESULT. The stub returned zero, which told the
+// game its textures had no levels at all.
+// (this, FaceType, Level, pLockedRect, pRect, Flags)
+void Tex_LockRectCube(X86 *c) {
+    level_lock_wgpu(c, com_this_arg(c), arg(c, 1), arg(c, 2), false, arg(c, 4), 0, arg(c, 5),
+                    arg(c, 3), false);
+}
+// (this, FaceType, Level)
+void Tex_UnlockRectCube(X86 *c) {
+    level_unlock_wgpu(c, com_this_arg(c), arg(c, 1), arg(c, 2));
+}
+
+void Tex_GetLevelCount(X86 *c) {
+    ComObj *tex = com_this_arg(c);
+    if (!tex || !tex->d3d9_resource) {
+        imports_unsupported(c);
+        return;
+    }
+    recomp::d3d::D3d9TextureDescriptorResult result = tex->d3d9_resource->texture_descriptor();
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    com_ret(c, result.descriptor.levels);
+}
+
+// (this, Level, pDesc): the same D3DSURFACE_DESC a surface describes itself
+// with, for the level the texture was created at.
+void Tex_GetLevelDesc(X86 *c) {
+    ComObj *tex = com_this_arg(c);
+    uint32_t d = arg(c, 2);
+    if (!tex || !tex->d3d9_resource || !d || !gm_valid(d, 32)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::D3d9TextureDescriptorResult td = tex->d3d9_resource->texture_descriptor();
+    recomp::d3d::D3d9LevelDescriptorResult ld =
+        tex->d3d9_resource->texture_level_descriptor(0, arg(c, 1));
+    if (td.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, td.status));
+        return;
+    }
+    if (ld.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, ld.status));
+        return;
+    }
+    memset(gm_ptr(d), 0, 32);
+    wr32(d + 0, ld.descriptor.format);
+    wr32(d + 4, td.descriptor.resource_type);
+    wr32(d + 8, td.descriptor.usage);
+    wr32(d + 12, td.descriptor.pool);
+    wr32(d + 24, ld.descriptor.width);
+    wr32(d + 28, ld.descriptor.height);
     com_ret(c, D3D_OK9);
 }
 
 void Tex_GetSurfaceLevel(X86 *c) {
     ComObj *tex = com_this_arg(c);
     uint32_t out = arg(c, 2);
-    if (kD3d9WgpuEnabled) {
-        if (!out || !gm_valid(out, 4)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        ComObj *s = com_level_view(tex, 0, arg(c, 1), false);
-        if (!s) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        uint32_t view = com_view(s, IF_D3DSURFACE9);
-        if (!view) {
-            com_release(s);
-            com_ret(c, E_OUTOFMEMORY);
-            return;
-        }
-        com_out_ptr(out, view);
-        com_ret(c, D3D_OK9);
-        return;
-    }
-    ComObj *s = texture_level(tex, arg(c, 1));
-    if (!s || !out) {
+    if (!out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    // A level is a view into the texture and references it, the same way a
-    // cube face does.
-    s->front_obj = tex->id;
-    com_addref(tex);
-    com_addref(s);
-    uint32_t view_ = com_view(s, IF_D3DSURFACE9);
-    if (!view_) {
+    ComObj *s = com_level_view(tex, 0, arg(c, 1), false);
+    if (!s) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t view = com_view(s, IF_D3DSURFACE9);
+    if (!view) {
         com_release(s);
         com_ret(c, E_OUTOFMEMORY);
         return;
     }
-    com_out_ptr(out, view_);
+    com_out_ptr(out, view);
     com_ret(c, D3D_OK9);
 }
 void Tex_LockRect(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        level_lock_wgpu(c, com_this_arg(c), 0, arg(c, 1), false, arg(c, 3), 0, arg(c, 4), arg(c, 2),
-                        false);
-        return;
-    }
-    ComObj *s = texture_level(com_this_arg(c), arg(c, 1));
-    uint32_t out = arg(c, 2);
-    if (!s || !out) {
-        com_ret(c, D3DERR_INVALIDCALL);
-        return;
-    }
-    uint32_t staged = stage_lock(s);
-    wr32(out, s->pitch);
-    wr32(out + 4, staged);
-    com_ret(c, staged ? D3D_OK9 : E_OUTOFMEMORY);
+    level_lock_wgpu(c, com_this_arg(c), 0, arg(c, 1), false, arg(c, 3), 0, arg(c, 4), arg(c, 2),
+                    false);
 }
 void Tex_UnlockRect(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        level_unlock_wgpu(c, com_this_arg(c), 0, arg(c, 1));
-        return;
-    }
-    stage_unlock(texture_level(com_this_arg(c), arg(c, 1)));
-    com_ret(c, D3D_OK9);
+    level_unlock_wgpu(c, com_this_arg(c), 0, arg(c, 1));
 }
 
 static void autogen_set_filter(X86 *c) {
@@ -7136,11 +5408,7 @@ void VolTex_AddDirtyBox(X86 *c) {
 }
 
 void Vol_GetContainer(X86 *c) {
-    if (kD3d9WgpuEnabled) {
-        resource_container(c);
-        return;
-    }
-    com_ret(c, D3DERR_INVALIDCALL);
+    resource_container(c);
 }
 
 void Vol_GetDesc(X86 *c) {
@@ -7188,12 +5456,8 @@ void Vol_UnlockBox(X86 *c) {
 }
 
 static const uint32_t S_FALSE9 = 1;
-static std::unordered_map<uint32_t, uint32_t> &query_state() { // id -> 1 begun, 2 ended
-    static auto *m = new std::unordered_map<uint32_t, uint32_t>();
-    return *m;
-}
 static void query_destroy(ComObj *o) {
-    if (kD3d9WgpuEnabled && o->d3d9_query) {
+    if (o->d3d9_query) {
         if (ComObj *dev = com_get(o->dev_d3d)) {
             if (dev->d3d9_device)
                 dev->d3d9_device->destroy_query(o->d3d9_query);
@@ -7206,50 +5470,39 @@ static void query_destroy(ComObj *o) {
             com_release_internal(dev);
     }
     o->dev_d3d = 0;
-    if (query_state().erase(o->id))
-        host_d9_query_drop(o->id);
 }
 void Query_GetType9(X86 *c) {
     ComObj *q = com_this_arg(c);
-    if (kD3d9WgpuEnabled) {
-        ComObj *dev = q ? com_get(q->dev_d3d) : nullptr;
-        if (!q || !q->d3d9_query || !dev || !dev->d3d9_device) {
-            imports_unsupported(c);
-            return;
-        }
-        recomp::d3d::ValueResult result = dev->d3d9_device->query_type(q->d3d9_query);
-        if (!d3d_bridge_ok(result.status)) {
-            bridge_result(c, result.status);
-            return;
-        }
-        set_eax(c, result.value);
+    ComObj *dev = q ? com_get(q->dev_d3d) : nullptr;
+    if (!q || !q->d3d9_query || !dev || !dev->d3d9_device) {
+        imports_unsupported(c);
         return;
     }
-    set_eax(c, q ? q->dev_type : 0);
+    recomp::d3d::ValueResult result = dev->d3d9_device->query_type(q->d3d9_query);
+    if (!d3d_bridge_ok(result.status)) {
+        bridge_result(c, result.status);
+        return;
+    }
+    set_eax(c, result.value);
 }
 void Query_GetDataSize(X86 *c) {
     ComObj *q = com_this_arg(c);
-    uint32_t type = q ? q->dev_type : 0;
-    if (kD3d9WgpuEnabled) {
-        ComObj *dev = q ? com_get(q->dev_d3d) : nullptr;
-        if (!q || !q->d3d9_query || !dev || !dev->d3d9_device) {
-            imports_unsupported(c);
-            return;
-        }
-        recomp::d3d::ValueResult kind = dev->d3d9_device->query_type(q->d3d9_query);
-        if (!d3d_bridge_ok(kind.status)) {
-            bridge_result(c, kind.status);
-            return;
-        }
-        recomp::d3d::ValueResult result = recomp::d3d::d3d9_query_data_size(kind.value);
-        if (!d3d_bridge_ok(result.status)) {
-            bridge_result(c, result.status);
-            return;
-        }
-        set_eax(c, result.value);
+    ComObj *dev = q ? com_get(q->dev_d3d) : nullptr;
+    if (!q || !q->d3d9_query || !dev || !dev->d3d9_device) {
+        imports_unsupported(c);
         return;
     }
-    set_eax(c, (type == D3DQUERYTYPE_OCCLUSION || type == D3DQUERYTYPE_EVENT) ? 4 : 0);
+    recomp::d3d::ValueResult kind = dev->d3d9_device->query_type(q->d3d9_query);
+    if (!d3d_bridge_ok(kind.status)) {
+        bridge_result(c, kind.status);
+        return;
+    }
+    recomp::d3d::ValueResult result = recomp::d3d::d3d9_query_data_size(kind.value);
+    if (!d3d_bridge_ok(result.status)) {
+        bridge_result(c, result.status);
+        return;
+    }
+    set_eax(c, result.value);
 }
 // (this, dwIssueFlags): D3DISSUE_END 1, D3DISSUE_BEGIN 2.
 void Query_Issue(X86 *c) {
@@ -7259,32 +5512,16 @@ void Query_Issue(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (kD3d9WgpuEnabled) {
-        if (!q->d3d9_query) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        ComObj *dev = com_get(q->dev_d3d);
-        if (!dev || !dev->d3d9_device) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        com_ret(c, bridge_result(c, dev->d3d9_device->query_issue(q->d3d9_query, flags)));
+    if (!q->d3d9_query) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (q->dev_type == D3DQUERYTYPE_OCCLUSION && gpu_on()) {
-        if (flags == D3DISSUE_BEGIN) {
-            host_d9_query_begin(q->id);
-            query_state()[q->id] = 1;
-        } else {
-            host_d9_query_end(q->id);
-            query_state()[q->id] = 2;
-        }
-        com_ret(c, D3D_OK9);
+    ComObj *dev = com_get(q->dev_d3d);
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    LOGW("d3d9: IDirect3DQuery9::Issue unsupported for query type %u", q->dev_type);
-    imports_unsupported(c);
+    com_ret(c, bridge_result(c, dev->d3d9_device->query_issue(q->d3d9_query, flags)));
 }
 // (this, pData, dwSize, dwGetDataFlags)
 void Query_GetData(X86 *c) {
@@ -7295,83 +5532,39 @@ void Query_GetData(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (kD3d9WgpuEnabled) {
-        if (!q->d3d9_query) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        if (size) {
-            if (!data || !gm_valid(data, size)) {
-                com_ret(c, D3DERR_INVALIDCALL);
-                return;
-            }
-        } else if (size != 0) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        ComObj *dev = com_get(q->dev_d3d);
-        if (!dev || !dev->d3d9_device) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        uint8_t staged[4]{};
-        rust::Slice<uint8_t> out(size ? staged : nullptr, size);
-        recomp::d3d::ValueResult result =
-            dev->d3d9_device->query_get_data(q->d3d9_query, out, size, flags);
-        if (result.status.code != recomp::d3d::StatusCode::Ok) {
-            com_ret(c, bridge_result(c, result.status));
-            return;
-        }
-        if (!result.value) {
-            com_ret(c, S_FALSE9);
-            return;
-        }
-        if (size)
-            memcpy(gm_ptr(data), staged, size);
-        com_ret(c, D3D_OK9);
+    if (!q->d3d9_query) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (flags & D3DGETDATA_FLUSH) {
-        LOGW("d3d9: IDirect3DQuery9::GetData D3DGETDATA_FLUSH unsupported");
-        imports_unsupported(c);
+    if (size) {
+        if (!data || !gm_valid(data, size)) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+    } else if (size != 0) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
     }
-    if (q->dev_type != D3DQUERYTYPE_OCCLUSION || !gpu_on()) {
-        LOGW("d3d9: IDirect3DQuery9::GetData unsupported for query type %u", q->dev_type);
-        imports_unsupported(c);
+    ComObj *dev = com_get(q->dev_d3d);
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
     }
-    auto it = query_state().find(q->id);
-    if (it == query_state().end() || it->second != 2) {
+    uint8_t staged[4]{};
+    rust::Slice<uint8_t> out(size ? staged : nullptr, size);
+    recomp::d3d::ValueResult result =
+        dev->d3d9_device->query_get_data(q->d3d9_query, out, size, flags);
+    if (result.status.code != recomp::d3d::StatusCode::Ok) {
+        com_ret(c, bridge_result(c, result.status));
+        return;
+    }
+    if (!result.value) {
         com_ret(c, S_FALSE9);
         return;
-    }
-    uint32_t count = 0;
-    int r = host_d9_query_result(q->id, &count);
-    if (r == 0) {
-        com_ret(c, S_FALSE9);
-        return;
-    }
-    if (r < 0) {
-        LOGW("d3d9: IDirect3DQuery9::GetData host error");
-        imports_unsupported(c);
     }
     if (size)
-        wr32(data, count);
+        memcpy(gm_ptr(data), staged, size);
     com_ret(c, D3D_OK9);
-}
-
-// The pipeline record, and the device setters that write it
-// ---------------------------------------------------------------------------
-D9Pipeline &d9_pipeline(uint32_t device_id) {
-    // Records are never erased and map nodes do not move, so the last one
-    // asked for can be handed out again without a lookup.
-    static auto *records = new std::map<uint32_t, D9Pipeline>();
-    static thread_local uint32_t last_id = 0;
-    static thread_local D9Pipeline *last = nullptr;
-    if (last && last_id == device_id)
-        return *last;
-    last = &(*records)[device_id];
-    last_id = device_id;
-    return *last;
 }
 
 // (this, State, Value)
@@ -7379,67 +5572,36 @@ D9Pipeline &d9_pipeline(uint32_t device_id) {
 void Dev_SetViewport(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t v = arg(c, 1);
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device || !v || !gm_valid(v, 24)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::Viewport viewport{};
-        viewport.x = rd32(v);
-        viewport.y = rd32(v + 4);
-        viewport.width = rd32(v + 8);
-        viewport.height = rd32(v + 12);
-        memcpy(&viewport.min_z, gm_ptr(v + 16), 4);
-        memcpy(&viewport.max_z, gm_ptr(v + 20), 4);
-        com_ret(c, bridge_result(c, dev->d3d9_device->set_viewport(viewport)));
+    if (!dev || !dev->d3d9_device || !v || !gm_valid(v, 24)) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (dev && v) {
-        D9Pipeline &p = d9_pipeline(dev->id);
-        for (int i = 0; i < 4; ++i)
-            p.viewport[i] = rd32(v + 4u * (uint32_t)i);
-        uint32_t b0 = rd32(v + 16), b1 = rd32(v + 20);
-        memcpy(&p.viewport_z[0], &b0, 4);
-        memcpy(&p.viewport_z[1], &b1, 4);
-        p.viewport_set = true;
-    }
-    com_ret(c, D3D_OK9);
+    recomp::d3d::Viewport viewport{};
+    viewport.x = rd32(v);
+    viewport.y = rd32(v + 4);
+    viewport.width = rd32(v + 8);
+    viewport.height = rd32(v + 12);
+    memcpy(&viewport.min_z, gm_ptr(v + 16), 4);
+    memcpy(&viewport.max_z, gm_ptr(v + 20), 4);
+    com_ret(c, bridge_result(c, dev->d3d9_device->set_viewport(viewport)));
 }
 void Dev_GetViewport(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t v = arg(c, 1);
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device || !v || !gm_valid(v, 24)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        recomp::d3d::ViewportResult result = dev->d3d9_device->viewport();
-        if (d3d_bridge_ok(result.status)) {
-            wr32(v, result.viewport.x);
-            wr32(v + 4, result.viewport.y);
-            wr32(v + 8, result.viewport.width);
-            wr32(v + 12, result.viewport.height);
-            memcpy(gm_ptr(v + 16), &result.viewport.min_z, 4);
-            memcpy(gm_ptr(v + 20), &result.viewport.max_z, 4);
-        }
-        com_ret(c, bridge_result(c, result.status));
+    if (!dev || !dev->d3d9_device || !v || !gm_valid(v, 24)) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (dev && v) {
-        D9Pipeline &p = d9_pipeline(dev->id);
-        ComObj *rt = com_get(dev->render_target);
-        uint32_t whole[4] = {0, 0, rt ? rt->width : 640, rt ? rt->height : 480};
-        for (int i = 0; i < 4; ++i)
-            wr32(v + 4u * (uint32_t)i, p.viewport_set ? p.viewport[i] : whole[i]);
-        float z0 = p.viewport_set ? p.viewport_z[0] : 0.0f,
-              z1 = p.viewport_set ? p.viewport_z[1] : 1.0f;
-        uint32_t b0, b1;
-        memcpy(&b0, &z0, 4);
-        memcpy(&b1, &z1, 4);
-        wr32(v + 16, b0);
-        wr32(v + 20, b1);
+    recomp::d3d::ViewportResult result = dev->d3d9_device->viewport();
+    if (d3d_bridge_ok(result.status)) {
+        wr32(v, result.viewport.x);
+        wr32(v + 4, result.viewport.y);
+        wr32(v + 8, result.viewport.width);
+        wr32(v + 12, result.viewport.height);
+        memcpy(gm_ptr(v + 16), &result.viewport.min_z, 4);
+        memcpy(gm_ptr(v + 20), &result.viewport.max_z, 4);
     }
-    com_ret(c, D3D_OK9);
+    com_ret(c, bridge_result(c, result.status));
 }
 
 // (this, State, pMatrix): world, view, projection and texture transforms,
@@ -7447,27 +5609,14 @@ void Dev_GetViewport(X86 *c) {
 void Dev_SetTransform(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t state = arg(c, 1), m = arg(c, 2);
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device || !m || !gm_valid(m, 64)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        float matrix[16];
-        memcpy(matrix, gm_ptr(m), 64);
-        com_ret(c, bridge_result(c, dev->d3d9_device->set_transform(
-                                        state, rust::Slice<const float>(matrix, 16))));
+    if (!dev || !dev->d3d9_device || !m || !gm_valid(m, 64)) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (dev && m) {
-        uint32_t slot =
-            state < 256 ? state : (state >= 256 && state < 260 ? state - 256 + 24 : 0xffffffffu);
-        if (slot < 32)
-            for (int i = 0; i < 16; ++i) {
-                uint32_t b = rd32(m + 4u * (uint32_t)i);
-                memcpy(&d9_pipeline(dev->id).transform[slot][i], &b, 4);
-            }
-    }
-    com_ret(c, D3D_OK9);
+    float matrix[16];
+    memcpy(matrix, gm_ptr(m), 64);
+    com_ret(c, bridge_result(c, dev->d3d9_device->set_transform(
+                                    state, rust::Slice<const float>(matrix, 16))));
 }
 
 // (this, State, pMatrix): multiply the current transform by the supplied
@@ -7475,10 +5624,6 @@ void Dev_SetTransform(X86 *c) {
 void Dev_MultiplyTransform(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t state = arg(c, 1), m = arg(c, 2);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !m || !gm_valid(m, 64)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -7493,46 +5638,22 @@ void Dev_MultiplyTransform(X86 *c) {
 void Dev_SetTextureStageState(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t stage = arg(c, 1), type = arg(c, 2);
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        com_ret(
-            c, bridge_result(c, dev->d3d9_device->set_texture_stage_state(stage, type, arg(c, 3))));
+    if (!dev || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (dev && stage < 8 && type < 33)
-        d9_pipeline(dev->id).tss[stage][type] = arg(c, 3);
-    com_ret(c, D3D_OK9);
+    com_ret(
+        c, bridge_result(c, dev->d3d9_device->set_texture_stage_state(stage, type, arg(c, 3))));
 }
 
 void Dev_SetRenderState(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t state = arg(c, 1);
-    if (kD3d9WgpuEnabled) {
-        if (!dev || !dev->d3d9_device) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        com_ret(c, bridge_result(c, dev->d3d9_device->set_render_state(state, arg(c, 2))));
-        return;
-    }
-    if (!dev) {
+    if (!dev || !dev->d3d9_device) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (state < D3DRS_ZENABLE || state > D3DRS_BLENDOPALPHA) {
-        com_ret(c, D3DERR_INVALIDCALL);
-        return;
-    }
-    D9Pipeline &p = d9_pipeline(dev->id);
-    if (p.rs[state] != arg(c, 2) || !p.rs_set[state]) {
-        p.rs[state] = arg(c, 2);
-        p.rs_set[state] = true;
-        p.states_changed();
-    }
-    com_ret(c, D3D_OK9);
+    com_ret(c, bridge_result(c, dev->d3d9_device->set_render_state(state, arg(c, 2))));
 }
 
 // (this, Sampler, Type, Value)
@@ -7543,112 +5664,57 @@ void Dev_SetSamplerState(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (kD3d9WgpuEnabled) {
-        if (!dev->d3d9_device || sampler >= 16) {
-            if (sampler >= D3DDMAPSAMPLER && sampler <= D3DVERTEXTEXTURESAMPLER3)
-                imports_unsupported(c);
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        com_ret(c, bridge_result(c, dev->d3d9_device->set_sampler_state(sampler, type, arg(c, 3))));
-        return;
-    }
-    if (sampler >= 16) {
-        if (sampler >= D3DDMAPSAMPLER && sampler <= D3DVERTEXTEXTURESAMPLER3) {
-            LOGW("d3d9: SetSamplerState unsupported for sampler %u", sampler);
+    if (!dev->d3d9_device || sampler >= 16) {
+        if (sampler >= D3DDMAPSAMPLER && sampler <= D3DVERTEXTEXTURESAMPLER3)
             imports_unsupported(c);
-        }
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    if (type < D3DSAMP_ADDRESSU || type > D3DSAMP_DMAPOFFSET) {
-        com_ret(c, D3DERR_INVALIDCALL);
-        return;
-    }
-    D9Pipeline &p = d9_pipeline(dev->id);
-    if (p.sampler_state[sampler][type] != arg(c, 3)) {
-        p.sampler_state[sampler][type] = arg(c, 3);
-        p.states_changed();
-    }
-    com_ret(c, D3D_OK9);
-}
-
-static bool write_registers(float (*table)[4], uint32_t limit, uint32_t start, uint32_t data,
-                            uint32_t count) {
-    if (count == 0)
-        return true;
-    if (start > limit || count > limit - start)
-        return false;
-    if (!data || !gm_valid(data, count * 16))
-        return false;
-    for (uint32_t i = 0; i < count; ++i)
-        for (uint32_t k = 0; k < 4; ++k) {
-            uint32_t bits = rd32(data + i * 16 + k * 4);
-            memcpy(&table[start + i][k], &bits, 4);
-        }
-    return true;
+    com_ret(c, bridge_result(c, dev->d3d9_device->set_sampler_state(sampler, type, arg(c, 3))));
 }
 
 // (this, StartRegister, pConstantData, Vector4fCount)
 void Dev_SetVertexShaderConstantF(X86 *c) {
     ComObj *dev = this_device9(c);
-    if (kD3d9WgpuEnabled) {
-        uint32_t start = arg(c, 1), data = arg(c, 2), count = arg(c, 3);
-        if (!dev || !dev->d3d9_device || count > 256 || start > 256 - count) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        if (!count) {
-            com_ret(c, D3D_OK9);
-            return;
-        }
-        if (!data || !gm_valid(data, count * 16)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        std::vector<float> values(count * 4);
-        memcpy(values.data(), gm_ptr(data), count * 16);
-        com_ret(c, bridge_result(c, dev->d3d9_device->set_shader_constants_f(
-                                        false, start,
-                                        rust::Slice<const float>(values.data(), values.size()))));
-        return;
-    }
-    if (!dev ||
-        !write_registers(d9_pipeline(dev->id).vconst, 256, arg(c, 1), arg(c, 2), arg(c, 3))) {
+    uint32_t start = arg(c, 1), data = arg(c, 2), count = arg(c, 3);
+    if (!dev || !dev->d3d9_device || count > 256 || start > 256 - count) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    com_ret(c, D3D_OK9);
+    if (!count) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    if (!data || !gm_valid(data, count * 16)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    std::vector<float> values(count * 4);
+    memcpy(values.data(), gm_ptr(data), count * 16);
+    com_ret(c, bridge_result(c, dev->d3d9_device->set_shader_constants_f(
+                                    false, start,
+                                    rust::Slice<const float>(values.data(), values.size()))));
 }
 void Dev_SetPixelShaderConstantF(X86 *c) {
     ComObj *dev = this_device9(c);
-    if (kD3d9WgpuEnabled) {
-        uint32_t start = arg(c, 1), data = arg(c, 2), count = arg(c, 3);
-        if (!dev || !dev->d3d9_device || count > 32 || start > 32 - count) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        if (!count) {
-            com_ret(c, D3D_OK9);
-            return;
-        }
-        if (!data || !gm_valid(data, count * 16)) {
-            com_ret(c, D3DERR_INVALIDCALL);
-            return;
-        }
-        std::vector<float> values(count * 4);
-        memcpy(values.data(), gm_ptr(data), count * 16);
-        com_ret(c, bridge_result(c, dev->d3d9_device->set_shader_constants_f(
-                                        true, start,
-                                        rust::Slice<const float>(values.data(), values.size()))));
-        return;
-    }
-    if (!dev ||
-        !write_registers(d9_pipeline(dev->id).pconst, 32, arg(c, 1), arg(c, 2), arg(c, 3))) {
+    uint32_t start = arg(c, 1), data = arg(c, 2), count = arg(c, 3);
+    if (!dev || !dev->d3d9_device || count > 32 || start > 32 - count) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    com_ret(c, D3D_OK9);
+    if (!count) {
+        com_ret(c, D3D_OK9);
+        return;
+    }
+    if (!data || !gm_valid(data, count * 16)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    std::vector<float> values(count * 4);
+    memcpy(values.data(), gm_ptr(data), count * 16);
+    com_ret(c, bridge_result(c, dev->d3d9_device->set_shader_constants_f(
+                                    true, start,
+                                    rust::Slice<const float>(values.data(), values.size()))));
 }
 
 // The DLL's one export. Not a COM method: the guest calls it directly.
@@ -7712,10 +5778,6 @@ static uint32_t d3d9_shader_id(ComObj *dev, uint32_t handle, bool pixel) {
 void Dev_GetRenderState(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 2);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -7728,10 +5790,6 @@ void Dev_GetRenderState(X86 *c) {
 void Dev_GetTextureStageState(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 3);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -7744,10 +5802,6 @@ void Dev_GetTextureStageState(X86 *c) {
 void Dev_GetSamplerState(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 3);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -7760,10 +5814,6 @@ void Dev_GetSamplerState(X86 *c) {
 void Dev_GetTransform(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 2);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !out || (!out || !gm_valid(out, 64))) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -7777,10 +5827,6 @@ void Dev_GetTransform(X86 *c) {
 void Dev_GetScissorRect(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 1);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 16)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -7797,10 +5843,6 @@ void Dev_GetScissorRect(X86 *c) {
 void Dev_SetMaterial(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t p = arg(c, 1);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !p || !gm_valid(p, 68)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -7813,10 +5855,6 @@ void Dev_SetMaterial(X86 *c) {
 void Dev_GetMaterial(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t p = arg(c, 1);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !p || !gm_valid(p, 68)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -7829,10 +5867,6 @@ void Dev_GetMaterial(X86 *c) {
 void Dev_SetLight(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t p = arg(c, 2);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !p || !gm_valid(p, 104)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -7846,10 +5880,6 @@ void Dev_SetLight(X86 *c) {
 void Dev_GetLight(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t p = arg(c, 2);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !p || !gm_valid(p, 104)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -7863,10 +5893,6 @@ void Dev_GetLight(X86 *c) {
 }
 void Dev_LightEnable(X86 *c) {
     ComObj *dev = this_device9(c);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -7876,10 +5902,6 @@ void Dev_LightEnable(X86 *c) {
 void Dev_GetLightEnable(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 2);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -7892,10 +5914,6 @@ void Dev_GetLightEnable(X86 *c) {
 void Dev_SetClipPlane(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t p = arg(c, 2);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !p || !gm_valid(p, 16)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -7908,10 +5926,6 @@ void Dev_SetClipPlane(X86 *c) {
 void Dev_GetClipPlane(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t p = arg(c, 2);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !p || !gm_valid(p, 16)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -7924,10 +5938,6 @@ void Dev_GetClipPlane(X86 *c) {
 void Dev_GetTexture(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 2);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -7944,10 +5954,6 @@ void Dev_GetTexture(X86 *c) {
 void Dev_GetStreamSource(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 2), offset = arg(c, 3), stride = arg(c, 4);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4) || !offset || !gm_valid(offset, 4) ||
         !stride || !gm_valid(stride, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
@@ -7966,10 +5972,6 @@ void Dev_GetStreamSource(X86 *c) {
 }
 void Dev_SetStreamSourceFreq(X86 *c) {
     ComObj *dev = this_device9(c);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -7979,10 +5981,6 @@ void Dev_SetStreamSourceFreq(X86 *c) {
 void Dev_GetStreamSourceFreq(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 2);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -7995,10 +5993,6 @@ void Dev_GetStreamSourceFreq(X86 *c) {
 void Dev_GetIndices(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 1);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8015,10 +6009,6 @@ void Dev_GetIndices(X86 *c) {
 void Dev_GetFVF(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 1);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8031,10 +6021,6 @@ void Dev_GetFVF(X86 *c) {
 void Dev_SetFVF(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t fvf = arg(c, 1);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8075,10 +6061,6 @@ void Dev_SetFVF(X86 *c) {
 void Dev_GetVertexDeclaration(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 1);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8101,10 +6083,6 @@ void Dev_GetVertexDeclaration(X86 *c) {
 void Dev_CreateVertexShader(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 2);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8130,10 +6108,6 @@ void Dev_CreateVertexShader(X86 *c) {
 void Dev_SetVertexShader(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *s = com_this(arg(c, 1));
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || (arg(c, 1) && (!s || s->kind != K_D3D9VS)) ||
         (s && s->dev_d3d != dev->id)) {
         com_ret(c, D3DERR_INVALIDCALL);
@@ -8147,10 +6121,6 @@ void Dev_SetVertexShader(X86 *c) {
 void Dev_GetVertexShader(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 1);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8164,10 +6134,6 @@ void Dev_GetVertexShader(X86 *c) {
 void Dev_CreatePixelShader(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 2);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8193,10 +6159,6 @@ void Dev_CreatePixelShader(X86 *c) {
 void Dev_SetPixelShader(X86 *c) {
     ComObj *dev = this_device9(c);
     ComObj *s = com_this(arg(c, 1));
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || (arg(c, 1) && (!s || s->kind != K_D3D9PS)) ||
         (s && s->dev_d3d != dev->id)) {
         com_ret(c, D3DERR_INVALIDCALL);
@@ -8210,10 +6172,6 @@ void Dev_SetPixelShader(X86 *c) {
 void Dev_GetPixelShader(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 1);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8227,10 +6185,6 @@ void Dev_GetPixelShader(X86 *c) {
 static void d3d9_get_function(X86 *c, bool pixel) {
     ComObj *o = com_this_arg(c);
     uint32_t data = arg(c, 1), size = arg(c, 2);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!o || o->kind != (pixel ? K_D3D9PS : K_D3D9VS) || !size || !gm_valid(size, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8270,10 +6224,6 @@ void PS_GetFunction(X86 *c) {
 void Decl_GetDeclaration(X86 *c) {
     ComObj *o = com_this_arg(c);
     uint32_t data = arg(c, 1), count = arg(c, 2);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!o || o->kind != K_D3D9DECL || !count || !gm_valid(count, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8314,10 +6264,6 @@ void Decl_GetDeclaration(X86 *c) {
 }
 static void d3d9_constant_i(X86 *c, bool pixel, bool set) {
     ComObj *dev = this_device9(c);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8351,10 +6297,6 @@ static void d3d9_constant_i(X86 *c, bool pixel, bool set) {
 }
 static void d3d9_constant_b(X86 *c, bool pixel, bool set) {
     ComObj *dev = this_device9(c);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8391,10 +6333,6 @@ static void d3d9_constant_b(X86 *c, bool pixel, bool set) {
 void Dev_GetVertexShaderConstantF(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t data = arg(c, 2), count = arg(c, 3);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || count > 256 || arg(c, 1) > 256 - count) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8416,10 +6354,6 @@ void Dev_GetVertexShaderConstantF(X86 *c) {
 void Dev_GetPixelShaderConstantF(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t data = arg(c, 2), count = arg(c, 3);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || count > 32 || arg(c, 1) > 32 - count) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8465,10 +6399,6 @@ void Dev_GetPixelShaderConstantB(X86 *c) {
 void Dev_CreateStateBlock(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 2);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8491,10 +6421,6 @@ void Dev_CreateStateBlock(X86 *c) {
 }
 void Dev_BeginStateBlock(X86 *c) {
     ComObj *dev = this_device9(c);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8507,10 +6433,6 @@ void Dev_BeginStateBlock(X86 *c) {
 void Dev_EndStateBlock(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t out = arg(c, 1);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!dev || !dev->d3d9_device || !out || !gm_valid(out, 4)) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8537,10 +6459,6 @@ void Dev_EndStateBlock(X86 *c) {
 }
 void SB_Capture(X86 *c) {
     ComObj *b = com_this_arg(c);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!b || b->kind != K_D3D9STATEBLOCK) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8557,10 +6475,6 @@ void SB_Capture(X86 *c) {
 }
 void SB_Apply(X86 *c) {
     ComObj *b = com_this_arg(c);
-    if (!kD3d9WgpuEnabled) {
-        imports_unsupported(c);
-        return;
-    }
     if (!b || b->kind != K_D3D9STATEBLOCK) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
@@ -8605,7 +6519,7 @@ static void d3d9_device_destroy(ComObj *o) {
 }
 
 static void d3d9_child_refs_changed(ComObj *o) {
-    if (!kD3d9WgpuEnabled || !o || !o->dev_d3d)
+    if (!o || !o->dev_d3d)
         return;
     ComObj *dev = com_get(o->dev_d3d);
     if (!dev || !dev->d3d9_device)
@@ -8623,42 +6537,38 @@ static void d3d9_child_refs_changed(ComObj *o) {
 static void d3d9_pipeline_object_destroy(ComObj *o) {
     if (!o)
         return;
-    if (kD3d9WgpuEnabled) {
-        ComObj *dev = com_get(o->dev_d3d);
-        if (dev && dev->d3d9_device) {
-            D3d9HostDevice *host = dev->d3d9_device.get();
-            switch (o->kind) {
-            case K_D3D9VS:
-                host->shader_views.erase(o->d3d9_state_handle);
-                host->destroy_shader(false, o->d3d9_state_handle);
-                break;
-            case K_D3D9PS:
-                host->shader_views.erase(o->d3d9_state_handle);
-                host->destroy_shader(true, o->d3d9_state_handle);
-                break;
-            case K_D3D9DECL:
-                host->decl_views.erase(o->d3d9_state_handle);
-                host->fvf_decls.erase(o->id);
-                host->destroy_declaration(o->d3d9_state_handle);
-                break;
-            case K_D3D9STATEBLOCK:
-                d3d9_drop_block_refs(dev, o->d3d9_state_handle);
-                host->block_views.erase(o->d3d9_state_handle);
-                host->destroy_state_block(o->d3d9_state_handle);
-                break;
-            default:
-                break;
-            }
+    ComObj *dev = com_get(o->dev_d3d);
+    if (dev && dev->d3d9_device) {
+        D3d9HostDevice *host = dev->d3d9_device.get();
+        switch (o->kind) {
+        case K_D3D9VS:
+            host->shader_views.erase(o->d3d9_state_handle);
+            host->destroy_shader(false, o->d3d9_state_handle);
+            break;
+        case K_D3D9PS:
+            host->shader_views.erase(o->d3d9_state_handle);
+            host->destroy_shader(true, o->d3d9_state_handle);
+            break;
+        case K_D3D9DECL:
+            host->decl_views.erase(o->d3d9_state_handle);
+            host->fvf_decls.erase(o->id);
+            host->destroy_declaration(o->d3d9_state_handle);
+            break;
+        case K_D3D9STATEBLOCK:
+            d3d9_drop_block_refs(dev, o->d3d9_state_handle);
+            host->block_views.erase(o->d3d9_state_handle);
+            host->destroy_state_block(o->d3d9_state_handle);
+            break;
+        default:
+            break;
         }
-        if (o->d3d9_owner_retained) {
-            o->d3d9_owner_retained = false;
-            if (dev)
-                com_release_internal(dev);
-        }
-        o->dev_d3d = 0;
-        o->d3d9_state_handle = 0;
-        return;
     }
+    if (o->d3d9_owner_retained) {
+        o->d3d9_owner_retained = false;
+        if (dev)
+            com_release_internal(dev);
+    }
+    o->dev_d3d = 0;
     o->d3d9_state_handle = 0;
 }
 
@@ -8714,8 +6624,6 @@ void d3d9_register() {
     com_register_iid(IF_D3DSTATEBLOCK9, IID_IDirect3DStateBlock9_);
     com_bind(IF_D3DTEXTURE9, K_D3D9TEXTURE);
     com_bind(IF_D3DCUBETEXTURE9, K_D3D9CUBETEXTURE);
-    if (!kD3d9WgpuEnabled)
-        com_bind(IF_D3DCUBETEXTURE9, K_D3D9TEXTURE);
     com_bind(IF_D3DVOLUMETEXTURE9, K_D3D9VOLUMETEXTURE);
     com_bind(IF_D3DVOLUME9, K_D3D9VOLUME);
     com_bind(IF_D3DBASETEXTURE9, K_D3D9TEXTURE);
