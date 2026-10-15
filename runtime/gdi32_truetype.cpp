@@ -3,8 +3,12 @@
 // executable - and is copied, since the caller may free its buffer. The kit's
 // bundled Open Sans stands in for Windows' own interface faces.
 #include "gdi32_truetype.h"
+#include "game_config.h"
+#include "win32.h"
+#include "../platform/os.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -99,12 +103,54 @@ uint32_t truetype_add_memory(const uint8_t *data, size_t size) {
     return added;
 }
 
-const TrueTypeFace *truetype_find(const std::string &family) {
+const TrueTypeFace *truetype_find(const std::string &family, int32_t weight, bool italic) {
+    static const bool loaded = [] {
+        const char *const paths[] = RECOMP_FONT_FILES;
+        for (const char *path : paths) {
+            if (!path)
+                break;
+            const std::string host = win32_host_path(std::string(RECOMP_GUEST_ROOT) + "\\" + path);
+            int fd = os_fd_open(host.c_str(), OS_O_RDONLY);
+            OsStat stat{};
+            std::vector<uint8_t> bytes;
+            if (fd >= 0 && os_fd_stat(fd, &stat) == 0 && stat.size >= 12 &&
+                stat.size <= (64u << 20)) {
+                bytes.resize(size_t(stat.size));
+                size_t read = 0;
+                while (read < bytes.size()) {
+                    int64_t count = os_fd_read(fd, bytes.data() + read, bytes.size() - read);
+                    if (count <= 0)
+                        break;
+                    read += size_t(count);
+                }
+                if (read != bytes.size())
+                    bytes.clear();
+            }
+            if (fd >= 0)
+                os_fd_close(fd);
+            if (!truetype_add_memory(bytes.data(), bytes.size())) {
+                LOGW("gdi: cannot load configured font \"%s\"", path);
+                abort();
+            }
+        }
+        return true;
+    }();
+    (void)loaded;
     const std::string key = lower_ascii(family);
+    const TrueTypeFace *best = nullptr;
+    int best_score = 3;
     for (auto it = faces().rbegin(); it != faces().rend(); ++it) // the latest registration wins
-        if ((*it)->family == key)
-            return it->get();
-    return nullptr;
+        if ((*it)->family == key) {
+            const auto &face = **it;
+            const uint8_t style = face.info.data[face.info.head + 45];
+            const int score =
+                int(bool(style & 1) != (weight >= 600)) + int(bool(style & 2) != italic);
+            if (score < best_score) {
+                best = &face;
+                best_score = score;
+            }
+        }
+    return best;
 }
 
 namespace {

@@ -125,8 +125,6 @@ constexpr uint32_t PALETTE_HANDLE_BASE = 0x00058000u;
 constexpr uint32_t DC_HANDLE_BASE = 0x00060000u;
 constexpr uint32_t DEFAULT_BITMAP = 0x0004f001u;  // what SelectObject reports as "previous"
 constexpr uint32_t DEFAULT_PALETTE = 0x0004f002u; // the system palette handle
-constexpr uint32_t TEXT_HEIGHT = 16;
-constexpr uint32_t TEXT_AVERAGE_CHAR_WIDTH = 7;
 
 uint32_t g_next_bitmap = BITMAP_HANDLE_BASE;
 uint32_t g_next_palette = PALETTE_HANDLE_BASE;
@@ -720,38 +718,6 @@ void g_GetDeviceCaps(X86 *c) {
     set_eax(c, value);
 }
 
-void g_GetTextMetricsA(X86 *c) {
-    uint32_t tm = arg(c, 1);
-    if (!tm || !gm_valid(tm, 56)) {
-        set_eax(c, 0);
-        return;
-    }
-    memset(g_mem + tm, 0, 56);
-    wr32(tm + 0, TEXT_HEIGHT);              // tmHeight
-    wr32(tm + 4, 13);                       // tmAscent
-    wr32(tm + 8, 3);                        // tmDescent
-    wr32(tm + 12, 3);                       // tmInternalLeading
-    wr32(tm + 16, 1);                       // tmExternalLeading
-    wr32(tm + 20, TEXT_AVERAGE_CHAR_WIDTH); // tmAveCharWidth
-    wr32(tm + 24, 14);                      // tmMaxCharWidth
-    wr32(tm + 28, 400);                     // tmWeight
-    g_mem[tm + 44] = 0x20;                  // tmFirstChar
-    g_mem[tm + 45] = 0xff;                  // tmLastChar
-    g_mem[tm + 46] = 0x3f;                  // tmDefaultChar
-    g_mem[tm + 47] = 0x20;                  // tmBreakChar
-    g_mem[tm + 52] = 0x02;                  // tmPitchAndFamily: variable pitch
-    set_eax(c, 1);
-}
-void g_GetTextExtentPointA(X86 *c) {
-    uint32_t size = arg(c, 3);
-    if (!size || !gm_valid(size, 8)) {
-        set_eax(c, 0);
-        return;
-    }
-    wr32(size, arg(c, 2) * TEXT_AVERAGE_CHAR_WIDTH);
-    wr32(size + 4, TEXT_HEIGHT);
-    set_eax(c, 1);
-}
 void g_SetTextColor(X86 *c) {
     auto *found = dc_of(arg(c, 0));
     if (!found) {
@@ -817,8 +783,6 @@ const ImportShim g_gdi32_shims[] = {
     {"GDI32.dll", "SetSystemPaletteUse", 2, g_SetSystemPaletteUse},
     {"GDI32.dll", "GetDIBits", 7, g_GetDIBits},
     {"GDI32.dll", "GetDeviceCaps", 2, g_GetDeviceCaps},
-    {"GDI32.dll", "GetTextMetricsA", 2, g_GetTextMetricsA},
-    {"GDI32.dll", "GetTextExtentPointA", 4, g_GetTextExtentPointA},
     {"GDI32.dll", "SetTextColor", 2, g_SetTextColor},
     {"GDI32.dll", "SetBkColor", 2, g_SetBkColor},
     {"GDI32.dll", "SetBkMode", 2, g_SetBkMode},

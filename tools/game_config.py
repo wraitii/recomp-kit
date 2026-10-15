@@ -345,6 +345,10 @@ def load(game_dir, build_root=None):
         raise ValueError("%s: [media] cd_tracks must be a list of strings" % source)
     cfg.setdefault("hooks", {})
     render = cfg.setdefault("render", {})
+    fonts = cfg.setdefault("fonts", {}).setdefault("files", [])
+    if not isinstance(fonts, list) or any(
+            not isinstance(path, str) or not path or "\0" in path for path in fonts):
+        raise ValueError("%s: [fonts] files must be a list of nonempty paths" % source)
     if not isinstance(render.setdefault("d3d8_wgpu", False), bool):
         raise ValueError("%s: [render] d3d8_wgpu must be a boolean" % source)
     if not isinstance(render.setdefault("d3d9_wgpu", False), bool):

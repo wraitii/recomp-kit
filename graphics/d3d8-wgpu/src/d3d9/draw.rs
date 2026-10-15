@@ -1250,6 +1250,22 @@ fn ff_vertices(
                 }
             };
             if let Some(transform) = transform {
+                if let Some(usage) = texcoord_sources[stage] {
+                    let source = unique_texcoords[usage as usize]
+                        .as_ref()
+                        .expect("prepared texture coordinate");
+                    let count = match source.element_type {
+                        D3DDECLTYPE_FLOAT1 => 1,
+                        D3DDECLTYPE_FLOAT2 | D3DDECLTYPE_SHORT2 | D3DDECLTYPE_SHORT2N
+                        | D3DDECLTYPE_USHORT2N | D3DDECLTYPE_FLOAT16_2 => 2,
+                        D3DDECLTYPE_FLOAT3 | D3DDECLTYPE_UDEC3 | D3DDECLTYPE_DEC3N => 3,
+                        _ => 4,
+                    };
+                    if count < 4 {
+                        uv[count..].fill(0.0);
+                        uv[count] = 1.0;
+                    }
+                }
                 uv = transform_point(&transform, uv);
             }
             let start = 12 + stage * 4;
@@ -2471,6 +2487,14 @@ pub(crate) fn execute(
                     tss(state, texture.stage, 4),
                     tss(state, texture.stage, 5),
                     tss(state, texture.stage, 6)
+                );
+                eprintln!(
+                    "[d3d9-trace] stage={} coord_index={:#x} transform_flags={:#x} matrix={:?} address={:?}",
+                    texture.stage,
+                    tss(state, texture.stage, 11),
+                    tss(state, texture.stage, 24),
+                    state.transform(16 + texture.stage)?,
+                    [ss(state, texture.stage, 1), ss(state, texture.stage, 2), ss(state, texture.stage, 3)]
                 );
             }
             eprintln!(

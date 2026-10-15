@@ -57,8 +57,8 @@ void create_font_a(X86 *c) {
 }
 // TEXTMETRICW is 60 bytes on x86: eleven DWORDs, four UTF-16
 // characters, five BYTE fields and three bytes of trailing padding.
-void metrics(uint32_t out, int32_t scale, uint32_t weight) {
-    memset(g_mem + out, 0, 60);
+void metrics(uint32_t out, int32_t scale, uint32_t weight, bool wide = true) {
+    memset(g_mem + out, 0, wide ? 60 : 56);
     wr32(out, 16u * scale);
     wr32(out + 4, 13u * scale);
     wr32(out + 8, 3u * scale);
@@ -67,12 +67,14 @@ void metrics(uint32_t out, int32_t scale, uint32_t weight) {
     wr32(out + 28, weight);
     wr32(out + 36, 96);
     wr32(out + 40, 96);
-    wr16(out + 44, 32);
-    wr16(out + 46, 127);
-    wr16(out + 48, '?');
-    wr16(out + 50, ' ');
-    wr8(out + 55, 0x30);
-    wr8(out + 56, 0);
+    for (uint32_t i = 0; i < 4; ++i) {
+        const uint8_t chars[] = {32, 127, '?', ' '};
+        if (wide)
+            wr16(out + 44 + i * 2, chars[i]);
+        else
+            wr8(out + 44 + i, chars[i]);
+    }
+    wr8(out + (wide ? 55 : 51), 0x30);
 }
 // All wide text entry points share these bitmap glyphs and DC colour/clip rules.
 void glyph(uint32_t hdc, int64_t x, int64_t y, uint32_t ch, bool underline = false) {
@@ -150,7 +152,8 @@ Pen pen_of(uint32_t hdc) {
     }
     if (family.empty())
         return pen;
-    pen.face = truetype_find(family);
+    pen.face =
+        truetype_find(family, int32_t(font_word(it->second, 16)), it->second.logfont[20] != 0);
     if (!pen.face) {
         // A face every Windows has and the program never supplied: what it
         // gets with no font of its own set, from the VCL's default font.
@@ -168,10 +171,10 @@ Pen pen_of(uint32_t hdc) {
     pen.metrics = truetype_metrics(pen.face, pen.scale);
     return pen;
 }
-void get_metrics(X86 *c) {
+template <bool Wide> void get_metrics(X86 *c) {
     auto *dc = dc_of(arg(c, 0));
     uint32_t out = arg(c, 1);
-    if (!dc || !out || !gm_valid(out, 60)) {
+    if (!dc || !out || !gm_valid(out, Wide ? 60 : 56)) {
         set_eax(c, 0);
         return;
     }
@@ -179,7 +182,7 @@ void get_metrics(X86 *c) {
     uint32_t weight = font == objects().end() ? 400 : font_word(font->second, 16);
     if (!weight)
         weight = 400;
-    metrics(out, font_scale(arg(c, 0)), weight);
+    metrics(out, font_scale(arg(c, 0)), weight, Wide);
     const Pen pen = pen_of(arg(c, 0));
     if (pen.face) {
         wr32(out, uint32_t(pen.metrics.height));
@@ -320,17 +323,17 @@ void char_abc_widths(X86 *c) {
     }
     set_eax(c, 1);
 }
-void extent(X86 *c) {
+template <bool Wide> void extent(X86 *c) {
     uint32_t dc = arg(c, 0), text = arg(c, 1), n = arg(c, 2), out = arg(c, 3);
     if (!dc_of(dc) || !out || !gm_valid(out, 8) || n > GUEST_SIZE / 2 ||
-        (n && (!text || !gm_valid(text, n * 2)))) {
+        (n && (!text || !gm_valid(text, n * (Wide ? 2 : 1))))) {
         set_eax(c, 0);
         return;
     }
     const Pen pen = pen_of(dc);
     uint64_t width = 0;
     for (uint32_t i = 0; i < n; ++i)
-        width += uint64_t(pen.advance(rd16(text + 2 * i)));
+        width += uint64_t(pen.advance(Wide ? rd16(text + 2 * i) : rd8(text + i)));
     if (width > INT_MAX) {
         set_eax(c, 0);
         return;
@@ -591,9 +594,12 @@ void register_text() {
                                        G("TextOutW", 5, text_out_w),
                                        G("ExtTextOutA", 8, ext_text_out_a),
                                        G("ExtTextOutW", 8, ext_text_out_w),
-                                       G("GetTextExtentPoint32W", 4, extent),
-                                       G("GetTextExtentPointW", 4, extent),
-                                       G("GetTextMetricsW", 2, get_metrics),
+                                       G("GetTextExtentPoint32W", 4, extent<true>),
+                                       G("GetTextExtentPoint32A", 4, extent<false>),
+                                       G("GetTextExtentPointA", 4, extent<false>),
+                                       G("GetTextExtentPointW", 4, extent<true>),
+                                       G("GetTextMetricsW", 2, get_metrics<true>),
+                                       G("GetTextMetricsA", 2, get_metrics<false>),
                                        G("GetOutlineTextMetricsA", 3, outline_text_metrics),
                                        G("GetCharABCWidthsA", 4, char_abc_widths),
                                        G("GetCharWidth32A", 4, char_width32),

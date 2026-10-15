@@ -67,6 +67,7 @@ def render_header(cfg):
     lines.append("#define RECOMP_GAME_DIR %s" % c_string(Path(cfg["dir"]).resolve().as_posix()))
     lines.append("#define RECOMP_KIT_DIR %s" % c_string(Path(__file__).resolve().parents[1].as_posix()))
     lines.append("#define RECOMP_ENVIRONMENT_PASSTHROUGH %s" % c_string_list(cfg["environment"]["passthrough"]))
+    lines.append("#define RECOMP_FONT_FILES %s" % c_string_list(cfg["fonts"]["files"]))
     # The on-screen controls a fresh profile starts with, and how the pad maps
     # onto the keyboard/mouse or a real controller (games/stub/game.toml [controls]).
     controls = cfg["controls"]

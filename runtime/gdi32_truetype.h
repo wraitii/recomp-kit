@@ -36,7 +36,8 @@ struct TrueTypeGlyph {
 // Registers every font in `data` and returns how many could be read.
 uint32_t truetype_add_memory(const uint8_t *data, size_t size);
 // The registered face with this family name, compared without case, or null.
-const TrueTypeFace *truetype_find(const std::string &family);
+const TrueTypeFace *truetype_find(const std::string &family, int32_t weight = 400,
+                                  bool italic = false);
 // The bundled face that stands in for this Windows face, or null when the name
 // is not one of Windows' sans-serif interface faces. A weight of 600 or more
 // takes the semibold. Only for a family truetype_find does not know: what a
