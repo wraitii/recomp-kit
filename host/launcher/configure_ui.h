@@ -30,6 +30,7 @@ class ConfigureUi {
     bool ready() const;
     bool done() const;
     bool dirty() const;
+    bool take_controller_request();
     void key(Key key);
     void pointer(int x, int y, bool pressed);
     void draw(Canvas &canvas, int scale);
@@ -49,6 +50,7 @@ class ConfigureUi {
     bool ready_ = false;
     bool dirty_ = true;
     bool done_ = false;
+    bool controller_requested_ = false;
 };
 
 } // namespace launcher

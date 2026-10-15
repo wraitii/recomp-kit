@@ -16,8 +16,6 @@
 #include "layout_fallback.h"
 #include "layout_store.h"
 #include "overlay.h"
-#include "pad_guest_view.h"
-#include "pad_mapper_editor.h"
 #include "router.h"
 #include "vpad.h"
 
@@ -60,15 +58,12 @@ bool trace() {
 // The legacy mapped binding runs only when the active profile enables it.
 Binding g_binding;
 PadMapper g_mapper;
-PadMapperEditor g_mapper_editor;
 std::mutex g_mapper_view_mutex;
 PadState g_mapper_raw;
 PadState g_mapper_calibrated;
 PadState g_mapper_guest;
 PadState g_mapper_guest_physical;
 std::string g_mapper_status;
-PadMapperProfile g_mapper_open_profile;
-bool g_mapper_open = false;
 std::set<int> g_mapper_keys;
 std::set<int> g_legacy_binding_keys;
 
@@ -173,8 +168,9 @@ PadMapperProfile load_mapper_profile() {
 
 bool save_mapper_profile(const PadMapperProfile &profile, std::string *error) {
     const std::string dir = std::string(mods_overlay_profile_dir()) + "/controls";
-    OsStat stat{};
-    if (os_mkdir(dir.c_str()) != 0 && (os_stat(dir.c_str(), &stat) != 0 || !stat.is_dir)) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
         if (error)
             *error = "could not create controls profile directory";
         return false;
@@ -533,6 +529,11 @@ void host_init(const HostHooks &hooks) {
                      host_resource("controls"));
     mods_controls_set_names(g_store.names());
     g_binding.set_table(load_mapped_table());
+    host_mapper_load();
+}
+
+void host_mapper_load() {
+    set_mapper_status({});
     const PadMapperProfile profile = load_mapper_profile();
     std::string error;
     if (!g_mapper.set_profile(profile, &error)) {
@@ -587,7 +588,7 @@ void host_gamepad_state(const PadState &raw) {
         g_mapper_guest_physical = mapped;
         g_mapper_guest = merge(mapped, g_router.pad());
     }
-    if (!g_game_focused || g_mapper_editor.is_open() || g_editor.is_open()) {
+    if (!g_game_focused || g_editor.is_open()) {
         std::vector<TouchAction> release;
         g_mapper.release(&release);
         emit_owned_actions(KeyOwner::Mapper, release);
@@ -622,25 +623,6 @@ std::string host_mapper_status() {
     return g_mapper_status;
 }
 
-void host_mapper_open() {
-    if (g_mapper_editor.is_open())
-        return;
-    release_everything();
-    g_rumble.stop();
-    g_mapper_open_profile = g_mapper.snapshot();
-    g_mapper_editor.open(g_mapper_open_profile, g_screen);
-    g_mapper_open = true;
-    mods_controls_set_editing(true);
-    mods_page_close();
-    vpad().set_source(kPadSourceController, PadState{});
-    vpad().set_source(kPadSourceTouch, PadState{});
-    publish();
-}
-
-bool host_mapper_editing() {
-    return g_mapper_editor.is_open();
-}
-
 bool host_mapper_apply(const PadMapperProfile &profile, bool persist) {
     std::string error;
     if (!validate_pad_mapper_profile(profile, &error)) {
@@ -665,52 +647,13 @@ bool host_mapper_apply(const PadMapperProfile &profile, bool persist) {
     }
     publish_pad_mode(profile);
     set_mapper_status({});
-    if (g_mapper_open || g_mapper_editor.is_open())
-        vpad().set_source(kPadSourceController, PadState{});
-    else
-        host_gamepad_state(host_mapper_raw_state());
-    return true;
-}
-
-void host_mapper_cancel() {
-    if (g_mapper_open)
-        (void)host_mapper_apply(g_mapper_open_profile, false);
-    g_mapper_editor.close();
-    g_mapper_open = false;
-    mods_controls_set_editing(false);
     host_gamepad_state(host_mapper_raw_state());
-    publish();
-}
-
-bool host_mapper_key(int scancode, bool down) {
-    if (!g_mapper_editor.is_open())
-        return false;
-    g_mapper_editor.key(scancode, down);
     return true;
-}
-
-void host_mapper_pointer(double px, double py, int state) {
-    if (g_mapper_editor.is_open())
-        g_mapper_editor.pointer(px, py, state);
-}
-
-void host_mapper_wheel(double notches) {
-    if (g_mapper_editor.is_open())
-        g_mapper_editor.wheel(notches);
-}
-
-void host_mapper_escape() {
-    if (g_mapper_editor.is_open())
-        g_mapper_editor.escape();
 }
 
 // While the editor is open every finger is its own: the router sees none of
 // them, so a control never fires while it is being moved.
 bool host_finger_down(int64_t id, double px, double py, uint64_t now) {
-    if (g_mapper_editor.is_open()) {
-        host_mapper_pointer(px, py, 1);
-        return true;
-    }
     if (g_editor.is_open()) {
         g_editor.finger_down(id, px, py);
         return true;
@@ -727,10 +670,6 @@ bool host_finger_down(int64_t id, double px, double py, uint64_t now) {
 }
 
 bool host_finger_motion(int64_t id, double px, double py, uint64_t now) {
-    if (g_mapper_editor.is_open()) {
-        host_mapper_pointer(px, py, 0);
-        return true;
-    }
     if (g_editor.is_open()) {
         g_editor.finger_motion(id, px, py);
         return true;
@@ -739,10 +678,6 @@ bool host_finger_motion(int64_t id, double px, double py, uint64_t now) {
 }
 
 bool host_finger_up(int64_t id, uint64_t now) {
-    if (g_mapper_editor.is_open()) {
-        host_mapper_pointer(0, 0, -1);
-        return true;
-    }
     if (g_editor.is_open()) {
         g_editor.finger_up(id);
         return true;
@@ -751,10 +686,6 @@ bool host_finger_up(int64_t id, uint64_t now) {
 }
 
 bool host_finger_cancel(int64_t id) {
-    if (g_mapper_editor.is_open()) {
-        host_mapper_pointer(0, 0, -1);
-        return true;
-    }
     if (g_editor.is_open()) {
         // Cancelled, not lifted: the finger's gesture is dropped, so a
         // system-taken finger never commits a drag or chooses a picker item.
@@ -821,8 +752,6 @@ void host_pump(uint64_t now) {
         publish();
         return;
     }
-    if (mods_controls_take_mapper_request() && !g_editor.is_open() && !g_mapper_editor.is_open())
-        host_mapper_open();
     // The settings page's "Edit controls" row, and the edit_layout action.
     if (mods_controls_take_edit_request() && !g_editor.is_open())
         open_editor();
@@ -856,46 +785,6 @@ void host_pump(uint64_t now) {
         g_editor.set_screen(g_screen);
         publish();
         return;
-    }
-
-    if (g_mapper_editor.is_open()) {
-        g_mapper_editor.set_screen(g_screen);
-        const PadMapperEditorAction action = g_mapper_editor.take_action();
-        if (action == PadMapperEditorAction::Apply) {
-            if (host_mapper_apply(g_mapper_editor.profile(), true)) {
-                g_mapper_editor.close();
-                g_mapper_open = false;
-                mods_controls_set_editing(false);
-                host_gamepad_state(host_mapper_raw_state());
-            }
-        } else if (action == PadMapperEditorAction::Cancel) {
-            host_mapper_cancel();
-        }
-        if (g_mapper_editor.is_open()) {
-            PadMapper preview;
-            PadState raw, calibrated, guest;
-            std::vector<TouchAction> ignored;
-            std::string preview_status = host_mapper_status();
-            {
-                std::lock_guard<std::mutex> lock(g_mapper_view_mutex);
-                raw = g_mapper_raw;
-            }
-            std::string preview_error;
-            if (preview.set_profile(g_mapper_editor.profile(), &preview_error)) {
-                preview.process(raw, &calibrated, &guest, &ignored);
-            } else {
-                calibrated = raw;
-                guest = PadState{};
-                preview_status = "Invalid controller profile draft: " + preview_error;
-            }
-            guest = merge(guest, g_router.pad());
-            const HostPadGuestState actual = pad_guest_view_snapshot(g_mapper_editor.guest_api());
-            host_present_set_controls(
-                g_mapper_editor.view(g_screen, raw, calibrated, guest, actual, preview_status));
-            vpad().set_source(kPadSourceController, PadState{});
-            vpad().set_source(kPadSourceTouch, PadState{});
-            return;
-        }
     }
 
     if (g_have_layout) {

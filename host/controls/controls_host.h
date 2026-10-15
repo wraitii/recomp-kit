@@ -45,14 +45,8 @@ PadState host_mapper_raw_state();
 PadState host_mapper_calibrated_state();
 PadState host_mapper_guest_state();
 std::string host_mapper_status();
-void host_mapper_open();
-bool host_mapper_editing();
+void host_mapper_load();
 bool host_mapper_apply(const PadMapperProfile &profile, bool persist);
-void host_mapper_cancel();
-bool host_mapper_key(int scancode, bool down);
-void host_mapper_pointer(double px, double py, int state);
-void host_mapper_wheel(double notches);
-void host_mapper_escape();
 // A finger event at drawable pixel (px, py). True when the controls claimed
 // the finger; the caller must then not give it to the gesture mapper.
 bool host_finger_down(int64_t id, double px, double py, uint64_t now);

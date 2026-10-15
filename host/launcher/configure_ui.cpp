@@ -14,6 +14,7 @@ const Color kFocus{240, 200, 90, 255};
 const Color kError{230, 100, 90, 255};
 constexpr int kRestore = 0;
 constexpr int kDone = 1;
+constexpr int kController = 2;
 } // namespace
 
 ConfigureUi::ConfigureUi(std::string game, ConfigureActions actions)
@@ -38,6 +39,12 @@ bool ConfigureUi::done() const {
 
 bool ConfigureUi::dirty() const {
     return dirty_;
+}
+
+bool ConfigureUi::take_controller_request() {
+    const bool requested = controller_requested_;
+    controller_requested_ = false;
+    return requested;
 }
 
 void ConfigureUi::change(int delta) {
@@ -71,6 +78,8 @@ void ConfigureUi::action(int id) {
         } else {
             message_ = "Recommended settings restored.";
         }
+    } else if (id == kController) {
+        controller_requested_ = true;
     } else if (id == kDone) {
         done_ = true;
     }
@@ -80,7 +89,7 @@ void ConfigureUi::action(int id) {
 void ConfigureUi::key(Key key) {
     if (done_)
         return;
-    const int count = int(settings_.size()) + 2;
+    const int count = int(settings_.size()) + 3;
     if (count == 0)
         return;
     switch (key) {
@@ -224,11 +233,11 @@ void ConfigureUi::draw(Canvas &canvas, int scale) {
 
     const int button_h = 24 * scale;
     const int button_gap = 8 * scale;
-    const int button_w = (w - 2 * margin - button_gap) / 2;
+    const int button_w = (w - 2 * margin - 2 * button_gap) / 3;
     const int button_y = std::max(y + 3 * scale, h - 40 * scale);
-    const char *labels[] = {"Restore recommended", "Done"};
-    buttons_.resize(2);
-    for (int i = 0; i < 2; ++i) {
+    const char *labels[] = {"Restore recommended", "Done", "Controller setup"};
+    buttons_.resize(3);
+    for (int i = 0; i < 3; ++i) {
         const int x = margin + i * (button_w + button_gap);
         const Rect rect{x, button_y, button_w, button_h};
         buttons_[size_t(i)] = rect;

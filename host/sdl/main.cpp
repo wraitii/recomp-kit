@@ -1158,42 +1158,8 @@ void window_point_to_drawable(double px, double py, double *dx, double *dy) {
 // consuming keys). Fingers go to the editor through host_finger_*, which the
 // normal path already calls first. True: the event is spent.
 bool handle_editor_event(const SDL_Event &event) {
-    const bool layout_editor = controls::host_editing();
-    const bool mapper_editor = controls::host_mapper_editing();
-    if (!layout_editor && !mapper_editor)
+    if (!controls::host_editing())
         return false;
-    if (mapper_editor) {
-        switch (event.type) {
-        case SDL_EVENT_MOUSE_MOTION: {
-            double dx, dy;
-            window_point_to_drawable(event.motion.x, event.motion.y, &dx, &dy);
-            controls::host_mapper_pointer(dx, dy, 0);
-            return true;
-        }
-        case SDL_EVENT_MOUSE_BUTTON_DOWN:
-        case SDL_EVENT_MOUSE_BUTTON_UP: {
-            if (event.button.button != SDL_BUTTON_LEFT)
-                return true;
-            double dx, dy;
-            window_point_to_drawable(event.button.x, event.button.y, &dx, &dy);
-            controls::host_mapper_pointer(dx, dy,
-                                          event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ? 1 : -1);
-            return true;
-        }
-        case SDL_EVENT_MOUSE_WHEEL:
-            controls::host_mapper_wheel(
-                event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event.wheel.y : event.wheel.y);
-            return true;
-        case SDL_EVENT_KEY_DOWN:
-        case SDL_EVENT_KEY_UP:
-            controls::host_mapper_key(event.key.scancode, event.type == SDL_EVENT_KEY_DOWN);
-            return true;
-        case SDL_EVENT_TEXT_INPUT:
-            return true;
-        default:
-            return false;
-        }
-    }
     switch (event.type) {
     case SDL_EVENT_MOUSE_MOTION: {
         double dx, dy;

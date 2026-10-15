@@ -152,9 +152,11 @@ unchanged; absolute Win32 positions use the compositor's current guest mapping.
 `host/controls/` holds the on-screen controls: a layout model and hit test, a
 router that owns each finger, a virtual pad that on-screen and physical
 controllers both write to, the overlay that draws it and the on-device editor.
-The controller setup editor calibrates normalized SDL axes and routes each
+The standalone `--configure` window and the launcher's Configure button offer
+Controller setup; it is not part of the in-game F10 page. The controller
+setup editor calibrates normalized SDL axes and routes each
 physical axis, button and hat direction to guest controls and keyboard keys.
-Its preview runs on a draft profile while guest input is neutral; Apply saves
+Its preview runs on a draft profile before the game starts; Apply saves
 the profile under `controls/mapper-v1.txt` in the selected game profile.
 Calibration includes center and range capture, radial stick and per-axis
 deadzones, saturation, response curves and inversion. Output scale and offset

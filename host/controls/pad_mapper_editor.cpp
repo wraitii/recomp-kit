@@ -480,7 +480,7 @@ ControlsView PadMapperEditor::view(const Screen &screen, const PadState &raw,
                                      : guest_actual.api == 1 ? "DirectInput read"
                                                              : "XInput read";
         add_key(margin, row_top, width - margin * 2, row_h - gap,
-                "Game input paused while editing; actual = last guest read / " + api_name +
+                "Game starts after configuration; actual = last guest read / " + api_name +
                     (profile_.native_enabled ? " / preview is mapper output"
                                              : " / Joystick output off; preview is disabled"),
                 false, 700);
