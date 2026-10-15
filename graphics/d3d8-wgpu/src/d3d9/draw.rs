@@ -4,6 +4,7 @@ use super::shader::VertexElement;
 use super::state::{D3d9State, MAX_SAMPLERS};
 use super::{SurfaceView, TargetRect, wgsl};
 use crate::RenderError;
+use smallvec::{SmallVec, smallvec};
 use std::borrow::Cow;
 use std::sync::{Arc, Weak};
 
@@ -186,6 +187,9 @@ pub(crate) fn expand_element(element_type: u8, bytes: &[u8]) -> Result<[f32; 4],
     Ok(out)
 }
 
+pub(crate) type BoundTextures = SmallVec<[BoundTexture; 4]>;
+pub(crate) type Streams = SmallVec<[StreamData; 2]>;
+
 #[derive(Clone, PartialEq)]
 pub(crate) struct BoundTexture {
     pub stage: u32,
@@ -217,14 +221,14 @@ pub(crate) struct DrawCommand {
     pub index_bytes: Arc<Vec<u8>>,
     pub min_vertex: u32,
     pub num_vertices: u32,
-    pub streams: Vec<StreamData>,
+    pub streams: Streams,
 }
 
 pub(crate) struct DrawSnapshot {
     pub command: DrawCommand,
     pub target: SurfaceView,
     pub depth: Option<SurfaceView>,
-    pub textures: Vec<BoundTexture>,
+    pub textures: BoundTextures,
 }
 
 struct LinkedInput {
@@ -552,6 +556,35 @@ impl GeometryData {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct LayoutAttribute {
+    format: wgpu::VertexFormat,
+    offset: u32,
+    location: u32,
+}
+
+impl LayoutAttribute {
+    fn new(attribute: &wgpu::VertexAttribute) -> Result<Self, RenderError> {
+        Ok(Self {
+            format: attribute.format,
+            offset: u32::try_from(attribute.offset)
+                .map_err(|_| invalid("Draw", "vertex attribute offset exceeds 32 bits"))?,
+            location: attribute.shader_location,
+        })
+    }
+
+    fn wgpu(self) -> wgpu::VertexAttribute {
+        wgpu::VertexAttribute {
+            format: self.format,
+            offset: u64::from(self.offset),
+            shader_location: self.location,
+        }
+    }
+}
+
+type VertexAttributes = SmallVec<[LayoutAttribute; 8]>;
+type VertexLayouts = SmallVec<[(u64, VertexAttributes); 2]>;
+
 struct NativeStream {
     data: GeometryData,
     offset: u64,
@@ -559,8 +592,8 @@ struct NativeStream {
 }
 
 struct NativeGeometry {
-    vertices: Vec<NativeStream>,
-    layouts: Vec<(u64, Vec<wgpu::VertexAttribute>)>,
+    vertices: SmallVec<[NativeStream; 2]>,
+    layouts: VertexLayouts,
     topology: wgpu::PrimitiveTopology,
     strip_format: Option<wgpu::IndexFormat>,
     index: GeometryData,
@@ -680,7 +713,7 @@ fn native_geometry(
     draw: &mut D3d9DrawState,
     command: &DrawCommand,
     linked: &[LinkedInput],
-) -> Result<Option<NativeGeometry>, RenderError> {
+) -> Result<Option<Box<NativeGeometry>>, RenderError> {
     let topology = match command.primitive {
         D3DPT_POINTLIST => wgpu::PrimitiveTopology::PointList,
         D3DPT_LINELIST => wgpu::PrimitiveTopology::LineList,
@@ -716,14 +749,14 @@ fn native_geometry(
         let slot = match streams.iter().position(|(id, _)| *id == stream_id) {
             Some(slot) => slot,
             None => {
-                streams.push((stream_id, Vec::new()));
+                streams.push((stream_id, SmallVec::new()));
                 streams.len() - 1
             }
         };
-        streams[slot].1.push(wgpu::VertexAttribute {
+        streams[slot].1.push(LayoutAttribute {
             format,
-            offset: u64::from(input.offset),
-            shader_location: input.location,
+            offset: u32::from(input.offset),
+            location: input.location,
         });
     }
     if streams.len() as u32 > gpu.limits().max_vertex_buffers {
@@ -805,8 +838,8 @@ fn native_geometry(
     }
     let first = (i64::from(command.base_vertex) + i64::from(min_raw)) as u64;
     let span = u64::from(max_raw - min_raw + 1);
-    let mut vertices = Vec::with_capacity(streams.len());
-    let mut layouts = Vec::with_capacity(streams.len());
+    let mut vertices = SmallVec::new();
+    let mut layouts = SmallVec::new();
     for (stream_id, attributes) in streams.drain(..) {
         let stream = stream_for(command, stream_id)?;
         let stride = u64::from(stream.stride);
@@ -821,7 +854,7 @@ fn native_geometry(
         layouts.push((stride, attributes));
     }
     draw.native_streams = streams;
-    Ok(Some(NativeGeometry {
+    Ok(Some(Box::new(NativeGeometry {
         vertices,
         layouts,
         topology,
@@ -832,7 +865,7 @@ fn native_geometry(
         index_format,
         base_vertex: -(min_raw as i32),
         count,
-    }))
+    })))
 }
 
 fn flat_to_u8(values: &[f32]) -> Vec<u8> {
@@ -1909,7 +1942,7 @@ impl LayoutKey {
 struct PipelineKey {
     modules: [wgpu::ShaderModule; 2],
     layout: wgpu::BindGroupLayout,
-    buffers: Vec<(u64, Vec<wgpu::VertexAttribute>)>,
+    buffers: VertexLayouts,
     target: wgpu::ColorTargetState,
     primitive: wgpu::PrimitiveState,
     depth: Option<wgpu::DepthStencilState>,
@@ -1975,7 +2008,7 @@ struct PendingTexture {
 struct BindGroupKey {
     layout: wgpu::BindGroupLayout,
     uniform_sizes: [u64; 4],
-    textures: Vec<(u32, wgpu::TextureView, wgpu::Sampler)>,
+    textures: SmallVec<[(u32, wgpu::TextureView, wgpu::Sampler); 4]>,
 }
 
 struct PendingDraw {
@@ -1983,11 +2016,11 @@ struct PendingDraw {
     layout: wgpu::BindGroupLayout,
     uniform_offsets: [u32; 4],
     uniform_sizes: [u64; 4],
-    textures: Vec<PendingTexture>,
+    textures: Arc<[PendingTexture]>,
     vertex_offset: u64,
     vertex_size: u64,
     has_attributes: bool,
-    native_geometry: Option<NativeGeometry>,
+    native_geometry: Option<Box<NativeGeometry>>,
     index_range: Option<(u64, u64, wgpu::IndexFormat)>,
     vertex_count: u32,
     viewport: super::state::Viewport,
@@ -2002,7 +2035,7 @@ fn same_bindings(a: &PendingDraw, b: &PendingDraw) -> bool {
         && a.textures.len() == b.textures.len()
         && a.textures
             .iter()
-            .zip(&b.textures)
+            .zip(b.textures.iter())
             .all(|(x, y)| x.stage == y.stage && x.view == y.view && x.sampler == y.sampler)
 }
 
@@ -2024,15 +2057,15 @@ struct DrawMemo {
     ff_key: Option<[u32; 5]>,
     target: (wgpu::TextureFormat, u32),
     depth: Option<(wgpu::TextureFormat, u32)>,
-    textures: Vec<BoundTexture>,
-    bindings: Vec<PendingTexture>,
+    textures: BoundTextures,
+    bindings: Arc<[PendingTexture]>,
     vs_count: u32,
     ps_count: u32,
     modules: [wgpu::ShaderModule; 2],
     layout: wgpu::BindGroupLayout,
     pipeline: Option<(
         (
-            Vec<(u64, Vec<wgpu::VertexAttribute>)>,
+            VertexLayouts,
             wgpu::PrimitiveTopology,
             Option<wgpu::IndexFormat>,
         ),
@@ -2058,9 +2091,9 @@ pub(crate) struct D3d9DrawState {
     linked: Vec<LinkedInput>,
     ff_uniforms: Vec<f32>,
     index_slots: FastMap<u32, u32>,
-    native_streams: Vec<(u32, Vec<wgpu::VertexAttribute>)>,
+    native_streams: SmallVec<[(u32, VertexAttributes); 2]>,
     pipeline_memo: Option<(PipelineKey, wgpu::RenderPipeline)>,
-    memos: Vec<DrawMemo>,
+    memos: Vec<Box<DrawMemo>>,
 }
 impl D3d9DrawState {
     pub fn clear(&mut self) {
@@ -2289,10 +2322,16 @@ impl D3d9DrawState {
                 bind_group_layouts: &[&key.layout],
                 push_constant_ranges: &[],
             });
+        let attributes: Vec<Vec<_>> = key
+            .buffers
+            .iter()
+            .map(|(_, attributes)| attributes.iter().map(|a| a.wgpu()).collect())
+            .collect();
         let buffers: Vec<_> = key
             .buffers
             .iter()
-            .map(|(stride, attributes)| wgpu::VertexBufferLayout {
+            .zip(&attributes)
+            .map(|((stride, _), attributes)| wgpu::VertexBufferLayout {
                 array_stride: *stride,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes,
@@ -2574,7 +2613,7 @@ fn resolve_shading(
     snapshot: &DrawSnapshot,
     target: (wgpu::TextureFormat, u32),
     depth: Option<(wgpu::TextureFormat, u32)>,
-) -> Result<DrawMemo, RenderError> {
+) -> Result<Box<DrawMemo>, RenderError> {
     let vertex_key = if let Some(v) = vs {
         translated_key(
             ShaderOrigin::Guest(state.shader(false)),
@@ -2687,13 +2726,13 @@ fn resolve_shading(
             textures: texture_layouts,
         },
     )?;
-    Ok(DrawMemo {
+    Ok(Box::new(DrawMemo {
         fingerprint: state.pipeline_fingerprint(),
         ff_key,
         target,
         depth,
         textures: snapshot.textures.clone(),
-        bindings,
+        bindings: bindings.into(),
         vs_count,
         ps_count,
         modules: [
@@ -2702,7 +2741,7 @@ fn resolve_shading(
         ],
         layout,
         pipeline: None,
-    })
+    }))
 }
 
 pub(crate) fn execute(
@@ -2710,7 +2749,7 @@ pub(crate) fn execute(
     draw: &mut D3d9DrawState,
     state: &D3d9State,
     objects: &super::shader::D3d9Objects,
-    snapshot: DrawSnapshot,
+    snapshot: &DrawSnapshot,
 ) -> Result<(), RenderError> {
     if snapshot.command.primitive_count == 0 {
         return Ok(());
@@ -2781,7 +2820,7 @@ pub(crate) fn execute(
         .map(|linked| native_geometry(gpu, draw, &snapshot.command, linked))
         .transpose()?
         .flatten();
-    let (mut native_geometry, mut vertices, order, draw_indices, topology) =
+    let (mut native_geometry, vertices, order, draw_indices, topology) =
         if let Some(geometry) = direct {
             let topology = geometry.topology;
             (
@@ -2993,8 +3032,15 @@ pub(crate) fn execute(
     let has_attributes = !vertices.attributes.is_empty();
     let buffers = match native_geometry.as_mut() {
         Some(geometry) => std::mem::take(&mut geometry.layouts),
-        None if has_attributes => vec![(vertices.stride, std::mem::take(&mut vertices.attributes))],
-        None => Vec::new(),
+        None if has_attributes => smallvec![(
+            vertices.stride,
+            vertices
+                .attributes
+                .iter()
+                .map(LayoutAttribute::new)
+                .collect::<Result<_, _>>()?
+        )],
+        None => SmallVec::new(),
     };
     let strip_index_format = native_geometry.as_ref().and_then(|g| g.strip_format);
     let pipeline = match &memo.pipeline {
@@ -3361,7 +3407,7 @@ fn flush_inner(gpu: &D3d9Gpu, draw: &mut D3d9DrawState) -> Result<(), RenderErro
                         }),
                     });
                 }
-                for texture in &pending.textures {
+                for texture in pending.textures.iter() {
                     entries.push(wgpu::BindGroupEntry {
                         binding: 4 + texture.stage,
                         resource: wgpu::BindingResource::TextureView(&texture.view),
@@ -3684,7 +3730,7 @@ pub(crate) fn clear(
         PipelineKey {
             modules: [shader.clone(), shader],
             layout,
-            buffers: Vec::new(),
+            buffers: SmallVec::new(),
             target: wgpu::ColorTargetState {
                 format: target.texture.format(),
                 blend: None,

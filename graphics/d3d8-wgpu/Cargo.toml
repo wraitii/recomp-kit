@@ -32,6 +32,7 @@ half = { version = "2", features = ["bytemuck"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "bmp", "pnm"] }
 log = "0.4"
 pollster = "0.4"
+smallvec = { version = "1", features = ["union"] }
 texpresso = "2"
 wgpu = "27"
 winit = "0.30"

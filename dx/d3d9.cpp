@@ -4035,7 +4035,8 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
     std::vector<uint32_t> pinned_heap;
     size_t pinned_count = 0;
     auto pinned_at = [&](size_t i) {
-        return i < std::size(pinned_inline) ? pinned_inline[i] : pinned_heap[i - std::size(pinned_inline)];
+        return i < std::size(pinned_inline) ? pinned_inline[i]
+                                            : pinned_heap[i - std::size(pinned_inline)];
     };
     auto pin = [&](uint32_t id) {
         for (size_t i = 0; i < pinned_count; ++i)
@@ -4176,10 +4177,12 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
             break;
         }
         case recomp::d3d::D3dxEffectCommandKind::SetTexture:
-            result = invoke(EFX_MANAGER_SET_TEXTURE, "SetTexture", {manager, cmd.index, resolved[i]});
+            result =
+                invoke(EFX_MANAGER_SET_TEXTURE, "SetTexture", {manager, cmd.index, resolved[i]});
             break;
         case recomp::d3d::D3dxEffectCommandKind::SetVertexShader:
-            result = invoke(EFX_MANAGER_SET_VERTEX_SHADER, "SetVertexShader", {manager, resolved[i]});
+            result =
+                invoke(EFX_MANAGER_SET_VERTEX_SHADER, "SetVertexShader", {manager, resolved[i]});
             break;
         case recomp::d3d::D3dxEffectCommandKind::SetPixelShader:
             result = invoke(EFX_MANAGER_SET_PIXEL_SHADER, "SetPixelShader", {manager, resolved[i]});
@@ -4226,8 +4229,7 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
     return failure;
 }
 
-static uint32_t efx_run(X86 *c, ComObj *fx, ComObj *dev,
-                        recomp::d3d::D3dxEffectRunResult &result) {
+static uint32_t efx_run(X86 *c, ComObj *fx, ComObj *dev, recomp::d3d::D3dxEffectRunResult &result) {
     D3dxEffectHost *host = efx_host(fx);
     uint32_t hr;
     if (result.status.code != recomp::d3d::StatusCode::Ok) {
@@ -4504,8 +4506,8 @@ static bool d3dx_matrix_read(uint32_t addr, float out[16]) {
     return true;
 }
 
-static void d3dx_matrix_write(uint32_t addr, const rust::Vec<float> &values) {
-    for (size_t i = 0; i < values.size() && i < 16; ++i)
+static void d3dx_matrix_write(uint32_t addr, const std::array<float, 16> &values) {
+    for (size_t i = 0; i < values.size(); ++i)
         d3dx_wf(addr + (uint32_t)i * 4, values[i]);
 }
 

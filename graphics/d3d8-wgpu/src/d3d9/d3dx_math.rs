@@ -5,7 +5,7 @@ const WORDS: usize = 16;
 fn invalid(message: &str) -> D3dxMatrixResult {
     D3dxMatrixResult {
         status: status(StatusCode::InvalidArgument, message),
-        values: Vec::new(),
+        values: [0.0; WORDS],
     }
 }
 
@@ -13,7 +13,7 @@ pub fn d3dx_matrix_multiply(a: &[f32], b: &[f32]) -> D3dxMatrixResult {
     if a.len() != WORDS || b.len() != WORDS {
         return invalid("D3DXMatrixMultiply expects two 4x4 matrices");
     }
-    let mut out = vec![0.0f32; WORDS];
+    let mut out = [0.0f32; WORDS];
     for row in 0..4 {
         for column in 0..4 {
             let mut sum = 0.0f32;
@@ -33,7 +33,7 @@ pub fn d3dx_matrix_transpose(a: &[f32]) -> D3dxMatrixResult {
     if a.len() != WORDS {
         return invalid("D3DXMatrixTranspose expects a 4x4 matrix");
     }
-    let mut out = vec![0.0f32; WORDS];
+    let mut out = [0.0f32; WORDS];
     for row in 0..4 {
         for column in 0..4 {
             out[row * 4 + column] = a[column * 4 + row];
@@ -123,7 +123,7 @@ pub fn d3dx_matrix_inverse(a: &[f32]) -> D3dxMatrixInverseResult {
             ),
             valid: false,
             determinant: 0.0,
-            values: Vec::new(),
+            values: [0.0; WORDS],
         };
     }
     let mut inv = cofactor(a);
@@ -133,7 +133,7 @@ pub fn d3dx_matrix_inverse(a: &[f32]) -> D3dxMatrixInverseResult {
             status: status(StatusCode::Ok, ""),
             valid: false,
             determinant,
-            values: Vec::new(),
+            values: [0.0; WORDS],
         };
     }
     let scale = 1.0f32 / determinant;
@@ -144,6 +144,6 @@ pub fn d3dx_matrix_inverse(a: &[f32]) -> D3dxMatrixInverseResult {
         status: status(StatusCode::Ok, ""),
         valid: true,
         determinant,
-        values: inv.to_vec(),
+        values: inv,
     }
 }

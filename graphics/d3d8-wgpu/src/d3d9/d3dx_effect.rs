@@ -1232,14 +1232,14 @@ impl D3dxEffect {
         }
     }
 
-    fn pool_object(&self, index: usize) -> u32 {
+    fn pool_object(&self, index: usize, slot: usize) -> u32 {
         if let Some(object) =
-            self.with_pool_entry(index, |entry| entry.objects.first().copied().unwrap_or(0))
+            self.with_pool_entry(index, |entry| entry.objects.get(slot).copied().unwrap_or(0))
         {
             return object;
         }
         match self.params.get(index).map(|param| &param.value) {
-            Some(EfxValue::Object(ids)) => ids.first().copied().unwrap_or(0),
+            Some(EfxValue::Object(ids)) => ids.get(slot).copied().unwrap_or(0),
             _ => 0,
         }
     }
@@ -1353,10 +1353,7 @@ impl D3dxEffect {
         let Some(root) = target.root else {
             return 0;
         };
-        self.pool_objects(root)
-            .get(target.object.unwrap_or(0))
-            .copied()
-            .unwrap_or(0)
+        self.pool_object(root, target.object.unwrap_or(0))
     }
 
     fn state_shader_object(effect: &D3dxEffect, state: &EfxState) -> Option<u32> {
@@ -2663,20 +2660,6 @@ pub fn d3dx_effect_prepare_shaders(
     }
 }
 
-fn constant_registers(
-    effect: &D3dxEffect,
-    index: usize,
-    constant: &CtabConst,
-) -> Result<Vec<f32>, RenderError> {
-    let param = effect
-        .params
-        .get(index)
-        .ok_or_else(|| invalid_data("shader constant parameter is missing"))?;
-    effect
-        .with_numeric(index, |data| registers_from(param, data, constant))
-        .ok_or_else(|| invalid_data("shader constant parameter has no numeric value"))?
-}
-
 struct RegisterLayout {
     rows: usize,
     cols: usize,
@@ -2793,17 +2776,6 @@ fn registers_into(
     out: &mut [f32],
 ) -> Result<(), RenderError> {
     register_layout(param, constant)?.write(data, out)
-}
-
-fn registers_from(
-    param: &EfxParam,
-    data: &[u8],
-    constant: &CtabConst,
-) -> Result<Vec<f32>, RenderError> {
-    let layout = register_layout(param, constant)?;
-    let mut out = vec![0.0f32; layout.count * 4];
-    layout.write(data, &mut out)?;
-    Ok(out)
 }
 
 fn constant_registers_into(
@@ -3066,6 +3038,41 @@ impl StateSink<'_> {
             }
         }
     }
+
+    fn shader_registers(
+        &mut self,
+        pixel: bool,
+        start: u32,
+        count: u32,
+        fill: impl FnOnce(&mut [f32]) -> Result<(), RenderError>,
+    ) -> Result<(), RenderError> {
+        let len = count as usize * 4;
+        match self {
+            StateSink::Device(_) => {
+                let mut values = vec![0.0f32; len];
+                fill(&mut values)?;
+                self.shader_constants(pixel, start, Cow::Owned(values))
+            }
+            StateSink::Commands(commands, values_out) => {
+                let offset = values_out.len();
+                values_out.resize(offset + len, 0.0);
+                if let Err(error) = fill(&mut values_out[offset..]) {
+                    values_out.truncate(offset);
+                    return Err(error);
+                }
+                let kind = if pixel {
+                    D3dxEffectCommandKind::SetPixelShaderConstantF
+                } else {
+                    D3dxEffectCommandKind::SetVertexShaderConstantF
+                };
+                let mut command = effect_command(kind, start, 0, 0);
+                command.offset = offset as u32;
+                command.count = len as u32;
+                commands.push(command);
+                Ok(())
+            }
+        }
+    }
 }
 
 fn effect_command(
@@ -3156,7 +3163,7 @@ fn apply_sampler_state(
                 let index = effect
                     .find_param_index(name)
                     .ok_or_else(|| invalid_data("sampler texture parameter is missing"))?;
-                effect.pool_object(index)
+                effect.pool_object(index, 0)
             }
             None => 0,
         };
@@ -3327,8 +3334,9 @@ fn apply_shader_constants(
         match constant.set {
             D3DXRS_FLOAT4 => {
                 if stale(index) {
-                    let values = constant_registers(effect, index, constant)?;
-                    sink.shader_constants(pixel, constant.index, Cow::Owned(values))?;
+                    sink.shader_registers(pixel, constant.index, constant.count, |out| {
+                        constant_registers_into(effect, index, constant, out)
+                    })?;
                 }
             }
             D3DXRS_SAMPLER => {
@@ -3504,7 +3512,7 @@ fn apply_state(
                     let index = effect
                         .find_param_index(name)
                         .ok_or_else(|| invalid_data("texture parameter is missing"))?;
-                    effect.pool_object(index)
+                    effect.pool_object(index, 0)
                 }
                 None => 0,
             };

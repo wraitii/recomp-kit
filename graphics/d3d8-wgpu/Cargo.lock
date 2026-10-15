@@ -539,6 +539,7 @@ dependencies = [
  "metal",
  "naga",
  "pollster",
+ "smallvec",
  "texpresso",
  "wgpu",
  "winit",

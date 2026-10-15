@@ -615,14 +615,14 @@ pub mod ffi {
 
     struct D3dxMatrixResult {
         status: Status,
-        values: Vec<f32>,
+        values: [f32; 16],
     }
 
     struct D3dxMatrixInverseResult {
         status: Status,
         valid: bool,
         determinant: f32,
-        values: Vec<f32>,
+        values: [f32; 16],
     }
 
     #[derive(Clone, Copy)]

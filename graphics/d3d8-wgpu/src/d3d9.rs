@@ -4376,8 +4376,8 @@ fn bound_textures_cached(
     cache: &mut [Option<CachedBinding>; state::MAX_SAMPLERS],
     target: &SurfaceView,
     depth: Option<&SurfaceView>,
-) -> Result<Vec<draw::BoundTexture>, RenderError> {
-    let mut out = Vec::new();
+) -> Result<draw::BoundTextures, RenderError> {
+    let mut out = draw::BoundTextures::new();
     for stage in 0..state::MAX_SAMPLERS as u32 {
         let id = device.state.texture(stage)?;
         if id == 0 {
@@ -4410,8 +4410,8 @@ fn bound_textures_cached(
 fn collect_streams(
     device: &D3d9Device,
     state: &state::D3d9State,
-) -> Result<Vec<draw::StreamData>, RenderError> {
-    let mut out = Vec::new();
+) -> Result<draw::Streams, RenderError> {
+    let mut out = draw::Streams::new();
     for stream in 0..state::MAX_STREAMS as u32 {
         let source = state.stream_source(stream)?;
         if source.buffer == 0 {
@@ -4555,7 +4555,7 @@ fn dispatch_draw(device: &mut D3d9Device, command: draw::DrawCommand) -> Result<
         &mut device.draw,
         &device.state,
         &device.objects,
-        snapshot,
+        &snapshot,
     )?;
     mark_draw_fresh(device);
     Ok(())
@@ -4956,7 +4956,7 @@ pub fn d3d9_draw_primitive_up(
             "DrawPrimitiveUP vertex data is shorter than the primitive span",
         );
     }
-    let streams = vec![draw::StreamData {
+    let streams = smallvec::smallvec![draw::StreamData {
         stream: 0,
         stride,
         offset: 0,
@@ -5033,7 +5033,7 @@ pub fn d3d9_draw_indexed_primitive_up(
             "DrawIndexedPrimitiveUP vertex data is shorter than MinVertexIndex + NumVertices",
         );
     }
-    let streams = vec![draw::StreamData {
+    let streams = smallvec::smallvec![draw::StreamData {
         stream: 0,
         stride,
         offset: 0,
