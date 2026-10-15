@@ -2304,7 +2304,9 @@ bool d3d7_stage_surface(ComObj *s) {
         uint32_t *busy = result.handoff.busy;
         const uint32_t w = result.handoff.width, h = result.handoff.height;
         ddraw_external_present_begin();
-        if (host_display_stage_native_texture(native, (int)w, (int)h, busy))
+        if (host_display_stage_native_texture(native, (int)w, (int)h, busy,
+                                              result.handoff.ready_event,
+                                              result.handoff.ready_value))
             return true;
         __atomic_store_n(busy, 0u, __ATOMIC_RELEASE);
     }

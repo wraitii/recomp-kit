@@ -19,7 +19,8 @@ use crate::bridge::{
 use crate::d3d9::gpu::{D3d9Gpu, D3d9Loss};
 pub use crate::d3d9::resource::D3d9Resource;
 use crate::d3d9::resource::StagedStorage;
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -31,6 +32,7 @@ pub mod d3dx_shader;
 pub mod draw;
 pub mod format;
 pub mod gpu;
+mod present;
 pub mod query;
 pub mod resource;
 pub mod shader;
@@ -172,7 +174,7 @@ pub(crate) struct SurfaceView {
 pub(crate) enum GpuRegistryEntry {
     Buffer {
         buffer: wgpu::Buffer,
-        uploaded: Arc<Mutex<Vec<u8>>>,
+        uploaded: Arc<Mutex<Arc<Vec<u8>>>>,
         size: u32,
         format: u32,
         fvf: u32,
@@ -269,8 +271,10 @@ pub struct D3d9Device {
     state: state::D3d9State,
     objects: shader::D3d9Objects,
     registry: BTreeMap<u32, GpuRegistryEntry>,
+    view_cache: RefCell<HashMap<TextureViewKey, wgpu::TextureView>>,
     locks: BTreeMap<u32, Vec<Arc<AtomicU32>>>,
     draw: draw::D3d9DrawState,
+    present_ring: Option<present::PresentRing>,
     queries: query::D3d9Queries,
     render_target_id: u32,
     depth_target_id: u32,
@@ -1298,8 +1302,10 @@ impl Default for D3d9Device {
             state: state::D3d9State::default(),
             objects: shader::D3d9Objects::default(),
             registry: BTreeMap::new(),
+            view_cache: RefCell::new(HashMap::new()),
             locks: BTreeMap::new(),
             draw: draw::D3d9DrawState::default(),
+            present_ring: None,
             queries: query::D3d9Queries::new(),
             render_target_id: 0,
             depth_target_id: 0,
@@ -2061,6 +2067,11 @@ pub fn d3d9_reset(device: &mut D3d9Device, request: &D3d9ResetRequest) -> D3d9Re
             ),
         );
     }
+    if device.loss.as_ref().is_some_and(|loss| loss.is_blocked()) {
+        device.draw.discard_batch();
+    } else if let Err(error) = flush_draws(device) {
+        return reset_fail(request.present, bridge_error(error));
+    }
     if let Err(error) = poll_device(device.gpu.as_ref().expect("device is initialized")) {
         if let Some(loss) = device.loss.as_ref() {
             loss.mark_reset_required();
@@ -2223,6 +2234,19 @@ pub fn d3d9_prepare_resource_reset(
 pub fn d3d9_reset_ready(device: &mut D3d9Device) -> Status {
     let required_features = device.features;
     let required_limits = device.limits.clone();
+    let Some(flush_gpu) = device.restore.as_ref().map(|plan| plan.d3d9_gpu.clone()) else {
+        return status(StatusCode::InvalidArgument, "no reset is in progress");
+    };
+    if flush_gpu.is_physical() {
+        device.draw.discard_batch();
+        return status(StatusCode::DeviceLost, flush_gpu.loss().physical_message());
+    }
+    if let Err(error) = flush_draws_with_gpu(device, &flush_gpu) {
+        if flush_gpu.is_physical() {
+            return status(StatusCode::DeviceLost, flush_gpu.loss().physical_message());
+        }
+        return bridge_error(error);
+    }
     let Some(plan) = device.restore.as_mut() else {
         return status(StatusCode::InvalidArgument, "no reset is in progress");
     };
@@ -2300,7 +2324,8 @@ pub fn d3d9_finish_reset(device: &mut D3d9Device) -> D3d9ResetResult {
         .state
         .set_target_size(plan.present.width, plan.present.height);
     device.state.clear_pipeline();
-    device.draw.clear();
+    device.draw.reset();
+    device.view_cache.borrow_mut().clear();
     device.render_target_id = 0;
     device.depth_target_id = 0;
     device.implicit_backbuffer_id = 0;
@@ -2365,10 +2390,14 @@ pub fn d3d9_test_cooperative_level(device: &mut D3d9Device, thread_id: u32) -> V
         };
     }
     if let Err(error) = poll_device(device.gpu.as_ref().expect("device is initialized")) {
+        device.draw.discard_batch();
         return ValueResult {
             status: error,
             value: 0,
         };
+    }
+    if device.loss.as_ref().is_some_and(|loss| loss.is_blocked()) {
+        device.draw.discard_batch();
     }
     let value = if device.loss.as_ref().is_some_and(|loss| loss.is_physical()) {
         if replacement_ready(device).is_ok() {
@@ -2400,30 +2429,79 @@ fn frame_fail(status: Status) -> D3d9FrameResult {
     }
 }
 
-pub fn d3d9_present(device: &mut D3d9Device) -> D3d9FrameResult {
+fn prepare_present(device: &mut D3d9Device) -> Result<(), Status> {
     if device.gpu.is_none() {
-        return frame_fail(status(
+        return Err(status(
             StatusCode::InvalidArgument,
             "D3D9 device is not initialized",
         ));
     }
     if let Some(loss) = device.loss.as_ref() {
         if loss.is_physical() {
-            return frame_fail(status(StatusCode::DeviceLost, loss.physical_message()));
+            return Err(status(StatusCode::DeviceLost, loss.physical_message()));
         }
         if loss.is_reset_required() {
-            return frame_fail(status(
+            return Err(status(
                 StatusCode::DeviceLost,
                 "the device needs a successful Reset before Present",
             ));
         }
     }
-    let Some(targets) = device.targets.as_ref() else {
-        return frame_fail(status(
+    if device.targets.is_none() {
+        return Err(status(
             StatusCode::InvalidArgument,
             "D3D9 device has no implicit swap chain",
         ));
-    };
+    }
+    let gpu = bridge_gpu(device).map_err(bridge_error)?;
+    let result = flush_draws_with_gpu(device, &gpu);
+    let result = bridge_gpu_ok(&gpu, result);
+    if result.code != StatusCode::Ok {
+        return Err(result);
+    }
+    Ok(())
+}
+
+pub fn d3d9_present_handoff(device: &mut D3d9Device) -> crate::bridge::FrameHandoffResult {
+    let result = prepare_present(device).and_then(|()| {
+        let gpu = bridge_gpu(device).map_err(bridge_error)?;
+        let target = &device
+            .targets
+            .as_ref()
+            .expect("swap chain is initialized")
+            .target;
+        present::handoff(&mut device.present_ring, &gpu, target).map_err(|error| {
+            if gpu.is_physical() {
+                status(StatusCode::DeviceLost, gpu.loss().physical_message())
+            } else {
+                bridge_error(error)
+            }
+        })
+    });
+    match result {
+        Ok(handoff) => crate::bridge::FrameHandoffResult {
+            status: status(StatusCode::Ok, ""),
+            handoff,
+        },
+        Err(status) => crate::bridge::FrameHandoffResult {
+            status,
+            handoff: crate::bridge::FrameHandoff {
+                ready_event: std::ptr::null_mut(),
+                ready_value: 0,
+                texture: std::ptr::null_mut(),
+                busy: std::ptr::null_mut(),
+                width: 0,
+                height: 0,
+            },
+        },
+    }
+}
+
+pub fn d3d9_present(device: &mut D3d9Device) -> D3d9FrameResult {
+    if let Err(status) = prepare_present(device) {
+        return frame_fail(status);
+    }
+    let targets = device.targets.as_ref().expect("swap chain is initialized");
     let width = targets.target.width;
     let height = targets.target.height;
     let mut bytes = Vec::new();
@@ -3285,8 +3363,8 @@ fn validate_binding(device: &D3d9Device, id: u32, allowed: &[u32]) -> Result<(),
 
 fn bridge_bindings(bindings: state::D3d9Bindings) -> BridgeBindings {
     BridgeBindings {
-        textures: bindings.textures.to_vec(),
-        streams: bindings.streams.to_vec(),
+        textures: bindings.textures,
+        streams: bindings.streams,
         indices: bindings.indices,
         vertex_shader: bindings.vertex_shader,
         pixel_shader: bindings.pixel_shader,
@@ -3296,8 +3374,8 @@ fn bridge_bindings(bindings: state::D3d9Bindings) -> BridgeBindings {
 
 fn empty_bridge_bindings() -> BridgeBindings {
     BridgeBindings {
-        textures: vec![0; state::MAX_SAMPLERS],
-        streams: vec![0; state::MAX_STREAMS],
+        textures: [0; state::MAX_SAMPLERS],
+        streams: [0; state::MAX_STREAMS],
         indices: 0,
         vertex_shader: 0,
         pixel_shader: 0,
@@ -3847,6 +3925,15 @@ fn bridge_gpu(device: &D3d9Device) -> Result<D3d9Gpu, RenderError> {
     device.resource_gpu().cloned()
 }
 
+fn flush_draws(device: &mut D3d9Device) -> Result<(), RenderError> {
+    let gpu = bridge_gpu(device)?;
+    flush_draws_with_gpu(device, &gpu)
+}
+
+fn flush_draws_with_gpu(device: &mut D3d9Device, gpu: &D3d9Gpu) -> Result<(), RenderError> {
+    draw::flush(gpu, &mut device.draw)
+}
+
 fn device_gpu(device: &D3d9Device) -> Result<D3d9Gpu, Status> {
     let gpu = match device.resource_gpu() {
         Ok(gpu) => gpu.clone(),
@@ -3957,7 +4044,49 @@ fn index_element_size(index_format: u32) -> Result<u32, RenderError> {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TextureViewKey {
+    texture: wgpu::Texture,
+    format: Option<wgpu::TextureFormat>,
+    dimension: Option<wgpu::TextureViewDimension>,
+    aspect: wgpu::TextureAspect,
+    base_mip_level: u32,
+    mip_level_count: Option<u32>,
+    base_array_layer: u32,
+    array_layer_count: Option<u32>,
+    usage: Option<wgpu::TextureUsages>,
+}
+
+fn cached_texture_view(
+    cache: &RefCell<HashMap<TextureViewKey, wgpu::TextureView>>,
+    texture: &wgpu::Texture,
+    descriptor: wgpu::TextureViewDescriptor<'_>,
+) -> wgpu::TextureView {
+    let key = TextureViewKey {
+        texture: texture.clone(),
+        format: descriptor.format,
+        dimension: descriptor.dimension,
+        aspect: descriptor.aspect,
+        base_mip_level: descriptor.base_mip_level,
+        mip_level_count: descriptor.mip_level_count,
+        base_array_layer: descriptor.base_array_layer,
+        array_layer_count: descriptor.array_layer_count,
+        usage: descriptor.usage,
+    };
+    let mut views = cache.borrow_mut();
+    if let Some(view) = views.get(&key) {
+        return view.clone();
+    }
+    if views.len() >= 256 {
+        views.clear();
+    }
+    let view = texture.create_view(&descriptor);
+    views.insert(key, view.clone());
+    view
+}
+
 fn texture_view(
+    cache: &RefCell<HashMap<TextureViewKey, wgpu::TextureView>>,
     texture: &wgpu::Texture,
     face: u32,
     level: u32,
@@ -3970,17 +4099,22 @@ fn texture_view(
         wgpu::TextureViewDimension::D2
     };
     let array_layer = if cube && !volume { face } else { 0 };
-    texture.create_view(&wgpu::TextureViewDescriptor {
-        dimension: Some(dimension),
-        base_mip_level: level,
-        mip_level_count: Some(1),
-        base_array_layer: array_layer,
-        array_layer_count: Some(1),
-        ..Default::default()
-    })
+    cached_texture_view(
+        cache,
+        texture,
+        wgpu::TextureViewDescriptor {
+            dimension: Some(dimension),
+            base_mip_level: level,
+            mip_level_count: Some(1),
+            base_array_layer: array_layer,
+            array_layer_count: Some(1),
+            ..Default::default()
+        },
+    )
 }
 
 fn sampling_view(
+    cache: &RefCell<HashMap<TextureViewKey, wgpu::TextureView>>,
     texture: &wgpu::Texture,
     kind: resource::TextureKind,
     depth: bool,
@@ -3991,22 +4125,34 @@ fn sampling_view(
         wgpu::TextureAspect::All
     };
     match kind {
-        resource::TextureKind::Cube => texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::Cube),
-            aspect,
-            base_array_layer: 0,
-            array_layer_count: Some(6),
-            ..Default::default()
-        }),
-        resource::TextureKind::Volume => texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D3),
-            aspect,
-            ..Default::default()
-        }),
-        resource::TextureKind::Texture2D => texture.create_view(&wgpu::TextureViewDescriptor {
-            aspect,
-            ..Default::default()
-        }),
+        resource::TextureKind::Cube => cached_texture_view(
+            cache,
+            texture,
+            wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::Cube),
+                aspect,
+                base_array_layer: 0,
+                array_layer_count: Some(6),
+                ..Default::default()
+            },
+        ),
+        resource::TextureKind::Volume => cached_texture_view(
+            cache,
+            texture,
+            wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D3),
+                aspect,
+                ..Default::default()
+            },
+        ),
+        resource::TextureKind::Texture2D => cached_texture_view(
+            cache,
+            texture,
+            wgpu::TextureViewDescriptor {
+                aspect,
+                ..Default::default()
+            },
+        ),
     }
 }
 
@@ -4087,6 +4233,7 @@ fn resolve_target_view(
             Ok(SurfaceView {
                 texture: texture.clone(),
                 view: texture_view(
+                    &device.view_cache,
                     texture,
                     face,
                     level,
@@ -4118,6 +4265,7 @@ fn resolve_target_view(
                 .as_ref()
                 .ok_or_else(|| unsupported("D3D9", "texture view has no GPU storage"))?;
             let view = texture_view(
+                &device.view_cache,
                 texture,
                 *alias_face,
                 *alias_level,
@@ -4145,7 +4293,11 @@ fn resolve_target_view(
             ..
         }) => Ok(SurfaceView {
             texture: texture.clone(),
-            view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            view: cached_texture_view(
+                &device.view_cache,
+                texture,
+                wgpu::TextureViewDescriptor::default(),
+            ),
             format: *format,
             width: *width,
             height: *height,
@@ -4237,7 +4389,7 @@ fn bound_textures(
         let is_depth = format::is_depth(format);
         out.push(draw::BoundTexture {
             stage,
-            view: sampling_view(&texture, kind, is_depth),
+            view: sampling_view(&device.view_cache, &texture, kind, is_depth),
             width,
             height,
             depth: is_depth,
@@ -4251,11 +4403,7 @@ fn bound_textures(
     Ok(out)
 }
 
-fn read_draw_buffer(
-    gpu: &D3d9Gpu,
-    entry: &GpuRegistryEntry,
-    out: &mut [u8],
-) -> Result<(), RenderError> {
+fn read_draw_buffer(gpu: &D3d9Gpu, entry: &GpuRegistryEntry) -> Result<Arc<Vec<u8>>, RenderError> {
     let GpuRegistryEntry::Buffer {
         buffer,
         uploaded,
@@ -4267,10 +4415,11 @@ fn read_draw_buffer(
         return Err(unsupported("Draw", "resource is not a buffer"));
     };
     if fresh.load(Ordering::Acquire) {
-        gpu.read_buffer(buffer, *size, out)
+        let mut bytes = alloc_bytes(*size)?;
+        gpu.read_buffer(buffer, *size, &mut bytes)?;
+        Ok(Arc::new(bytes))
     } else {
-        out.copy_from_slice(&uploaded.lock().unwrap());
-        Ok(())
+        Ok(Arc::clone(&uploaded.lock().unwrap()))
     }
 }
 
@@ -4286,16 +4435,14 @@ fn collect_streams(
             continue;
         }
         require_unlocked(device, source.buffer, "Draw vertex buffer")?;
-        let Some(entry @ GpuRegistryEntry::Buffer { size, .. }) =
-            device.registry.get(&source.buffer)
+        let Some(entry @ GpuRegistryEntry::Buffer { .. }) = device.registry.get(&source.buffer)
         else {
             return Err(unsupported(
                 "Draw",
                 format!("vertex stream {stream} has no GPU buffer"),
             ));
         };
-        let mut bytes = alloc_bytes(*size)?;
-        read_draw_buffer(gpu, entry, &mut bytes)?;
+        let bytes = read_draw_buffer(gpu, entry)?;
         out.push(draw::StreamData {
             stream,
             stride: source.stride,
@@ -4310,12 +4457,11 @@ fn index_buffer(
     gpu: &D3d9Gpu,
     device: &D3d9Device,
     id: u32,
-) -> Result<(Vec<u8>, u32), RenderError> {
+) -> Result<(Arc<Vec<u8>>, u32), RenderError> {
     require_unlocked(device, id, "Draw index buffer")?;
     match device.registry.get(&id) {
-        Some(entry @ GpuRegistryEntry::Buffer { size, format, .. }) => {
-            let mut bytes = alloc_bytes(*size)?;
-            read_draw_buffer(gpu, entry, &mut bytes)?;
+        Some(entry @ GpuRegistryEntry::Buffer { format, .. }) => {
+            let bytes = read_draw_buffer(gpu, entry)?;
             Ok((bytes, *format))
         }
         _ => Err(unsupported("Draw", "index buffer has no GPU storage")),
@@ -4393,7 +4539,7 @@ fn dispatch_draw(device: &mut D3d9Device, command: draw::DrawCommand) -> Result<
         depth,
         textures,
     };
-    gpu.validate("Draw", || {
+    let result = gpu.validate("Draw", || {
         draw::execute(
             &gpu,
             &mut device.draw,
@@ -4401,7 +4547,10 @@ fn dispatch_draw(device: &mut D3d9Device, command: draw::DrawCommand) -> Result<
             &device.objects,
             snapshot,
         )
-    })?;
+    });
+    if let Err(error) = result {
+        return Err(error);
+    }
     mark_draw_fresh(device);
     Ok(())
 }
@@ -4494,6 +4643,9 @@ pub fn d3d9_begin_scene(device: &mut D3d9Device) -> Status {
     if device.in_scene {
         return status(StatusCode::InvalidArgument, "BeginScene is already active");
     }
+    if let Err(error) = flush_draws(device) {
+        return bridge_error(error);
+    }
     device.in_scene = true;
     status(StatusCode::Ok, "")
 }
@@ -4502,8 +4654,18 @@ pub fn d3d9_end_scene(device: &mut D3d9Device) -> Status {
     if !device.in_scene {
         return status(StatusCode::InvalidArgument, "EndScene without BeginScene");
     }
+    if let Err(error) = flush_draws(device) {
+        return bridge_error(error);
+    }
     device.in_scene = false;
     status(StatusCode::Ok, "")
+}
+
+pub fn d3d9_flush(device: &mut D3d9Device) -> Status {
+    match flush_draws(device) {
+        Ok(()) => status(StatusCode::Ok, ""),
+        Err(error) => bridge_error(error),
+    }
 }
 
 pub fn d3d9_set_render_target(
@@ -4524,6 +4686,9 @@ pub fn d3d9_set_render_target(
         if let Err(error) = validate_color_target(device, id) {
             return bridge_error(error);
         }
+    }
+    if let Err(error) = flush_draws(device) {
+        return bridge_error(error);
     }
     match resolve_target_view(device, id, face, level, volume) {
         Ok(view) => {
@@ -4547,6 +4712,9 @@ pub fn d3d9_set_depth_stencil(
     level: u32,
     volume: bool,
 ) -> Status {
+    if let Err(error) = flush_draws(device) {
+        return bridge_error(error);
+    }
     if id == 0 {
         device.depth_target_id = 0;
         return status(StatusCode::Ok, "");
@@ -4602,6 +4770,9 @@ pub fn d3d9_clear(
         Ok(gpu) => gpu,
         Err(status) => return status,
     };
+    if let Err(error) = flush_draws_with_gpu(device, &gpu) {
+        return bridge_gpu_ok(&gpu, Err(error));
+    }
     let target = match resolve_target_view(device, device.render_target_id, 0, 0, false) {
         Ok(view) => view,
         Err(error) => return bridge_error(error),
@@ -4688,7 +4859,7 @@ pub fn d3d9_draw_primitive(
         base_vertex: 0,
         indexed: false,
         index_format: 0,
-        index_bytes: Vec::new(),
+        index_bytes: Arc::default(),
         min_vertex: 0,
         num_vertices: 0,
         streams,
@@ -4785,7 +4956,7 @@ pub fn d3d9_draw_primitive_up(
         stream: 0,
         stride,
         offset: 0,
-        bytes: vertices.to_vec(),
+        bytes: Arc::new(vertices.to_vec()),
     }];
     let command = draw::DrawCommand {
         primitive,
@@ -4794,7 +4965,7 @@ pub fn d3d9_draw_primitive_up(
         base_vertex: 0,
         indexed: false,
         index_format: 0,
-        index_bytes: Vec::new(),
+        index_bytes: Arc::default(),
         min_vertex: 0,
         num_vertices: 0,
         streams,
@@ -4862,7 +5033,7 @@ pub fn d3d9_draw_indexed_primitive_up(
         stream: 0,
         stride,
         offset: 0,
-        bytes: vertices.to_vec(),
+        bytes: Arc::new(vertices.to_vec()),
     }];
     let command = draw::DrawCommand {
         primitive,
@@ -4871,7 +5042,7 @@ pub fn d3d9_draw_indexed_primitive_up(
         base_vertex: 0,
         indexed: true,
         index_format,
-        index_bytes: indices.to_vec(),
+        index_bytes: Arc::new(indices.to_vec()),
         min_vertex,
         num_vertices,
         streams,
@@ -5002,6 +5173,9 @@ pub fn d3d9_stretch_rect(
     ) {
         return bridge_error(error);
     }
+    if let Err(error) = flush_draws_with_gpu(device, &gpu) {
+        return bridge_gpu_ok(&gpu, Err(error));
+    }
     match copy::stretch_rect(&gpu, &source, src_rect, &destination, dst_rect, filter) {
         Ok(()) => {
             mark_target_fresh(device, dst);
@@ -5031,6 +5205,9 @@ pub fn d3d9_update_surface(
         Ok(rects) => rects.into_iter().next(),
         Err(status) => return status,
     };
+    if let Err(error) = flush_draws_with_gpu(device, &gpu) {
+        return bridge_gpu_ok(&gpu, Err(error));
+    }
     match resource::update_surface(
         &gpu,
         source,
@@ -5056,6 +5233,9 @@ pub fn d3d9_update_texture(
         Ok(gpu) => gpu,
         Err(error) => return bridge_error(error),
     };
+    if let Err(error) = flush_draws_with_gpu(device, &gpu) {
+        return bridge_gpu_ok(&gpu, Err(error));
+    }
     match resource::update_texture(&gpu, source, destination) {
         Ok(()) => status(StatusCode::Ok, ""),
         Err(error) => bridge_error(error),
@@ -5160,6 +5340,9 @@ pub fn d3d9_get_render_target_data(
         Ok(bytes) => bytes,
         Err(error) => return bridge_error(error),
     };
+    if let Err(error) = flush_draws_with_gpu(device, &gpu) {
+        return bridge_gpu_ok(&gpu, Err(error));
+    }
     if let Err(error) = copy::copy_to_cpu(&gpu, &source, None, &mut bytes) {
         return bridge_error(error);
     }
@@ -5187,6 +5370,9 @@ pub fn d3d9_color_fill(
         Ok(rects) => rects.into_iter().next(),
         Err(status) => return status,
     };
+    if let Err(error) = flush_draws_with_gpu(device, &gpu) {
+        return bridge_gpu_ok(&gpu, Err(error));
+    }
     match copy::color_fill(&gpu, &destination, rect, color) {
         Ok(()) => {
             mark_target_fresh(device, dst);
@@ -5258,6 +5444,9 @@ pub fn d3d9_query_issue(device: &mut D3d9Device, handle: u32, flags: u32) -> Sta
         Err(status) => return status,
     };
     let begin = flags == 2;
+    if let Err(error) = flush_draws_with_gpu(device, &gpu) {
+        return bridge_gpu_ok(&gpu, Err(error));
+    }
     match device.queries.issue(&gpu, handle, begin) {
         Ok(()) => status(StatusCode::Ok, ""),
         Err(error) => bridge_error(error),
@@ -5304,6 +5493,12 @@ pub fn d3d9_query_get_data(
             return ValueResult { status, value: 0 };
         }
     };
+    if let Err(error) = flush_draws_with_gpu(device, &gpu) {
+        return ValueResult {
+            status: bridge_gpu_ok(&gpu, Err(error)),
+            value: 0,
+        };
+    }
     match device.queries.get_data(&gpu, handle, flags & 1 != 0) {
         Ok(crate::d3d9::query::QueryPoll::Ready(value)) => {
             if size == 4 {

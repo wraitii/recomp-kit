@@ -132,11 +132,9 @@ bool dir_refresh(const std::string &dir, const OsStat &st,
 }
 // 1 = listed and the wanted name is present (*real is the directory spelling),
 // 0 = listed but absent, -1 = the directory could not be stat'd or listed.
-int lookup_name(const std::string &dir, const std::string &wanted_lower, std::string *real) {
+int lookup_name(const std::string &dir, const OsStat &st, const std::string &wanted_lower,
+                std::string *real) {
     std::lock_guard<std::mutex> lock(dir_index_mutex());
-    OsStat st;
-    if (os_stat(dir.c_str(), &st) != 0 || !st.is_dir)
-        return -1;
     std::unordered_map<std::string, DirIndex>::iterator it;
     if (!dir_refresh(dir, st, &it))
         return -1;
@@ -200,7 +198,7 @@ bool resolve_in(const std::string &root, const std::string &rel, bool create, bo
         }
         // Always use the directory's spelling, even on case-insensitive hosts.
         std::string found_name;
-        int lk = lookup_name(host, lower(name), &found_name);
+        int lk = lookup_name(host, st, lower(name), &found_name);
         if (lk < 0)
             return false;
         bool found = lk == 1;
@@ -223,8 +221,12 @@ bool resolve_in(const std::string &root, const std::string &rel, bool create, bo
             return false;
         if (mutation && st.is_symlink)
             return false;
-        if (i + 1 < comps.size() && (os_stat(host.c_str(), &st) != 0 || !st.is_dir))
-            return false;
+        if (i + 1 < comps.size()) {
+            if (st.is_symlink && os_stat(host.c_str(), &st) != 0)
+                return false;
+            if (!st.is_dir)
+                return false;
+        }
     }
     *out = host;
     return true;

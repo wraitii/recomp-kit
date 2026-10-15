@@ -1145,14 +1145,30 @@ void s_SHGetFolderPathA(X86 *c) {
     set_eax(c, 0); // S_OK
 }
 
-void s_SHGetSpecialFolderPathA(X86 *c) {
+template <bool Wide> void s_SHGetSpecialFolderPath(X86 *c) {
     uint32_t buf = arg(c, 1);
-    std::string guest = shell_folder_guest_path(arg(c, 2), arg(c, 3) != 0);
-    if (!buf) {
+    if (!buf || !gm_valid(buf, Wide ? 520 : 260)) {
         set_eax(c, 0);
         return;
     }
-    gm_put_str(buf, guest.c_str(), 260);
+    uint32_t csidl = arg(c, 2);
+    switch (csidl & 0xff) {
+    case 0x05:
+    case 0x1a:
+    case 0x1c:
+    case 0x23:
+    case 0x26:
+        break;
+    default:
+        LOGW("SHGetSpecialFolderPath: unsupported CSIDL %#x", csidl);
+        imports_unsupported(c);
+        return;
+    }
+    std::string guest = shell_folder_guest_path(csidl, arg(c, 3) != 0);
+    if constexpr (Wide)
+        gm_put_wstr(buf, guest, 260);
+    else
+        gm_put_str(buf, guest.c_str(), 260);
     set_eax(c, 1);
 }
 
@@ -2919,7 +2935,8 @@ const ImportShim g_misc_shims[] = {
     {"GDI32.dll", "GetSystemPaletteEntries", 4, g_GetSystemPaletteEntries},
     // SHELL32
     {"SHELL32.dll", "ShellExecuteA", 6, s_ShellExecuteA},
-    {"SHELL32.dll", "SHGetSpecialFolderPathA", 4, s_SHGetSpecialFolderPathA},
+    {"SHELL32.dll", "SHGetSpecialFolderPathA", 4, s_SHGetSpecialFolderPath<false>},
+    {"SHELL32.dll", "SHGetSpecialFolderPathW", 4, s_SHGetSpecialFolderPath<true>},
     {"SHFOLDER.dll", "SHGetFolderPathA", 5, s_SHGetFolderPathA},
     // ole32
     {"ole32.dll", "CoInitialize", 1, o_CoInitialize},

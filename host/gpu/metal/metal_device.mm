@@ -495,6 +495,20 @@ CommandBuffer MetalDevice::begin() {
         return {id};
     }
 }
+bool MetalDevice::wait_native_event(CommandBuffer cb, void *event, uint64_t value) {
+    @autoreleasepool {
+        id<MTLEvent> native = (__bridge id<MTLEvent>)event;
+        if (!native || (native.device && native.device != device_))
+            return false;
+        std::lock_guard lock(mutex_);
+        Cmd *c = cmd(cb);
+        if (!c)
+            return false;
+        end_encoders(*c);
+        [c->buffer encodeWaitForEvent:native value:value];
+        return true;
+    }
+}
 void MetalDevice::end_encoders(Cmd &c) {
     if (c.render) {
         [c.render endEncoding];

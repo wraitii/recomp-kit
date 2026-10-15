@@ -1254,7 +1254,8 @@ void Dev_Present(X86 *c) {
             if (d3d_bridge_ok(handoff.status)) {
                 if (host_display_present_native_texture(
                         handoff.handoff.texture, int(handoff.handoff.width),
-                        int(handoff.handoff.height), handoff.handoff.busy)) {
+                        int(handoff.handoff.height), handoff.handoff.busy,
+                        handoff.handoff.ready_event, handoff.handoff.ready_value)) {
                     com_ret(c, D8_OK);
                     return;
                 }

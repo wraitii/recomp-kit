@@ -1352,7 +1352,7 @@ fn patch_rows(
 }
 
 pub fn d3d9_d3dx_surface_read(
-    device: &D3d9Device,
+    device: &mut D3d9Device,
     resource: &mut D3d9Resource,
     face: u32,
     level: u32,
@@ -1367,6 +1367,9 @@ pub fn d3d9_d3dx_surface_read(
         Ok(gpu) => gpu.clone(),
         Err(error) => return fail_surface_read(error),
     };
+    if let Err(error) = super::flush_draws_with_gpu(device, &gpu) {
+        return fail_surface_read(error);
+    }
     if let Err(error) = resource::readback_level(&gpu, resource, face, level) {
         return fail_surface_read(error);
     }
@@ -1415,7 +1418,7 @@ pub fn d3d9_d3dx_surface_read(
 }
 
 pub fn d3d9_d3dx_surface_store(
-    device: &D3d9Device,
+    device: &mut D3d9Device,
     resource: &mut D3d9Resource,
     face: u32,
     level: u32,
@@ -1435,6 +1438,9 @@ pub fn d3d9_d3dx_surface_store(
         Ok(gpu) => gpu.clone(),
         Err(error) => return fail_status(error),
     };
+    if let Err(error) = super::flush_draws_with_gpu(device, &gpu) {
+        return fail_status(error);
+    }
     if let Err(error) = resource::readback_level(&gpu, resource, face, level) {
         return fail_status(error);
     }
@@ -1793,7 +1799,7 @@ fn encode_dds(
 }
 
 pub fn d3d9_d3dx_save_surface(
-    device: &D3d9Device,
+    device: &mut D3d9Device,
     resource: &mut D3d9Resource,
     face: u32,
     level: u32,
@@ -1811,6 +1817,9 @@ pub fn d3d9_d3dx_save_surface(
         Ok(gpu) => gpu.clone(),
         Err(error) => return fail_bytes(error),
     };
+    if let Err(error) = super::flush_draws_with_gpu(device, &gpu) {
+        return fail_bytes(error);
+    }
     if let Err(error) = resource::readback_level(&gpu, resource, face, level) {
         return fail_bytes(error);
     }
@@ -1882,7 +1891,7 @@ pub fn d3d9_d3dx_save_surface(
 }
 
 pub fn d3d9_d3dx_save_texture(
-    device: &D3d9Device,
+    device: &mut D3d9Device,
     resource: &mut D3d9Resource,
     format: u32,
 ) -> D3dxBytesResult {
@@ -1893,6 +1902,9 @@ pub fn d3d9_d3dx_save_texture(
         Ok(gpu) => gpu.clone(),
         Err(error) => return fail_bytes(error),
     };
+    if let Err(error) = super::flush_draws_with_gpu(device, &gpu) {
+        return fail_bytes(error);
+    }
     let (kind, source_format, w, h, d, levels) = match resource.texture_shape() {
         Some(shape) => shape,
         None => {

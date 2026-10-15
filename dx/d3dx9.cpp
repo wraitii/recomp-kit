@@ -28,6 +28,13 @@
 #include <iterator>
 #include <algorithm>
 
+void X_D3DXDebugMute(X86 *c) {
+    static uint32_t mute = 0;
+    uint32_t previous = mute;
+    mute = arg(c, 0);
+    set_eax(c, previous);
+}
+
 // ---------------------------------------------------------------------------
 // Guest floats
 // ---------------------------------------------------------------------------

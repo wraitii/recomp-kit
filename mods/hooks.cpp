@@ -1222,7 +1222,7 @@ PopModStatus mods_hook_return(const PopModApi *api, pop_cpu_v1 *cpu, uint32_t ea
 
 void mods_hooks_unwind_to_esp(uint32_t esp) {
     bool dropped = false;
-    uint32_t keep_views = mods_view_depth();
+    uint32_t keep_views = 0;
     while (t_stack.depth && t_stack.frames[t_stack.depth - 1].esp_at_entry < esp) {
         // Every abandoned frame remembers how many snapshots existed before it
         // began, so an outer invocation keeps the view it is still using.

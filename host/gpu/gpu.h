@@ -215,6 +215,13 @@ class Device {
         return {};
     }
 
+    virtual bool wait_native_event(CommandBuffer cb, void *event, uint64_t value) {
+        (void)cb;
+        (void)event;
+        (void)value;
+        return false;
+    }
+
     // Runs on a backend thread after the buffer finishes; `status` says how.
     virtual void on_complete(CommandBuffer cb,
                              std::function<void(CommandStatus, double gpu_ms)> fn) = 0;
