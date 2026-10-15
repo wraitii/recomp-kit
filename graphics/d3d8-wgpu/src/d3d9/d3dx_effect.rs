@@ -293,7 +293,11 @@ impl ParamShape {
             && self.elements == t.elements
             && self.semantic == t.semantic
             && self.members.len() == t.members.len()
-            && self.members.iter().zip(&t.members).all(|(a, b)| a.matches(b))
+            && self
+                .members
+                .iter()
+                .zip(&t.members)
+                .all(|(a, b)| a.matches(b))
     }
 }
 
@@ -2816,7 +2820,11 @@ fn constant_registers_into(
         .ok_or_else(|| invalid_data("shader constant parameter has no numeric value"))?
 }
 
-fn ctab_params(effect: &D3dxEffect, ctab: &[CtabConst], what: &str) -> Result<Vec<usize>, RenderError> {
+fn ctab_params(
+    effect: &D3dxEffect,
+    ctab: &[CtabConst],
+    what: &str,
+) -> Result<Vec<usize>, RenderError> {
     ctab.iter()
         .map(|constant| {
             effect
@@ -2826,7 +2834,10 @@ fn ctab_params(effect: &D3dxEffect, ctab: &[CtabConst], what: &str) -> Result<Ve
         .collect()
 }
 
-fn compile_preshader(effect: &D3dxEffect, code: &[u8]) -> Result<Arc<CompiledPreshader>, RenderError> {
+fn compile_preshader(
+    effect: &D3dxEffect,
+    code: &[u8],
+) -> Result<Arc<CompiledPreshader>, RenderError> {
     let program = preshader::parse(code)?;
     let constants = parse_ctab(code)?;
     let params = ctab_params(effect, &constants, "preshader input")?;
@@ -3264,8 +3275,8 @@ fn selector_index(effect: &D3dxEffect, state: &EfxState) -> Result<usize, Render
         .selector
         .as_ref()
         .ok_or_else(|| invalid_data("array selector resource is missing"))?;
-    let code = selector_code(state)
-        .ok_or_else(|| invalid_data("array selector preshader is missing"))?;
+    let code =
+        selector_code(state).ok_or_else(|| invalid_data("array selector preshader is missing"))?;
     let output = run_preshader(effect, &state.selector_program, code)?;
     let value = output
         .first()

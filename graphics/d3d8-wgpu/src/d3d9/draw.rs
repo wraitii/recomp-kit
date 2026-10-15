@@ -538,7 +538,12 @@ enum GeometryData {
 }
 
 impl GeometryData {
-    fn slice<'a>(&'a self, upload: &'a wgpu::Buffer, offset: u64, size: u64) -> wgpu::BufferSlice<'a> {
+    fn slice<'a>(
+        &'a self,
+        upload: &'a wgpu::Buffer,
+        offset: u64,
+        size: u64,
+    ) -> wgpu::BufferSlice<'a> {
         match self {
             GeometryData::Buffer(buffer) => buffer.slice(offset..offset + size),
             _ => upload.slice(offset..offset + size),
@@ -1281,8 +1286,11 @@ fn ff_vertices(
                         .expect("prepared texture coordinate");
                     let count = match source.element_type {
                         D3DDECLTYPE_FLOAT1 => 1,
-                        D3DDECLTYPE_FLOAT2 | D3DDECLTYPE_SHORT2 | D3DDECLTYPE_SHORT2N
-                        | D3DDECLTYPE_USHORT2N | D3DDECLTYPE_FLOAT16_2 => 2,
+                        D3DDECLTYPE_FLOAT2
+                        | D3DDECLTYPE_SHORT2
+                        | D3DDECLTYPE_SHORT2N
+                        | D3DDECLTYPE_USHORT2N
+                        | D3DDECLTYPE_FLOAT16_2 => 2,
                         D3DDECLTYPE_FLOAT3 | D3DDECLTYPE_UDEC3 | D3DDECLTYPE_DEC3N => 3,
                         _ => 4,
                     };
@@ -2704,7 +2712,11 @@ pub(crate) fn execute(
                     tss(state, texture.stage, 11),
                     tss(state, texture.stage, 24),
                     state.transform(16 + texture.stage)?,
-                    [ss(state, texture.stage, 1), ss(state, texture.stage, 2), ss(state, texture.stage, 3)]
+                    [
+                        ss(state, texture.stage, 1),
+                        ss(state, texture.stage, 2),
+                        ss(state, texture.stage, 3)
+                    ]
                 );
             }
             eprintln!(
@@ -3059,7 +3071,11 @@ pub(crate) fn execute(
         for vertex in &mut geometry.vertices {
             stream(&mut vertex.data, &mut vertex.offset, vertex.size);
         }
-        stream(&mut geometry.index, &mut geometry.index_offset, geometry.index_size);
+        stream(
+            &mut geometry.index,
+            &mut geometry.index_offset,
+            geometry.index_size,
+        );
     }
     let vertex_size = vertices.bytes.len();
     let vertex_offset = aligned(draw.batch.data.len(), 4)
@@ -3348,8 +3364,9 @@ fn flush_inner(gpu: &D3d9Gpu, draw: &mut D3d9DrawState) -> Result<(), RenderErro
                 } else if pending.has_attributes {
                     pass.set_vertex_buffer(
                         0,
-                        upload
-                            .slice(pending.vertex_offset..pending.vertex_offset + pending.vertex_size),
+                        upload.slice(
+                            pending.vertex_offset..pending.vertex_offset + pending.vertex_size,
+                        ),
                     );
                 }
                 let viewport_key = (

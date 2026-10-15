@@ -4360,7 +4360,6 @@ fn bound_textures(
     Ok(out)
 }
 
-
 fn collect_streams(
     device: &D3d9Device,
     state: &state::D3d9State,
@@ -4390,10 +4389,7 @@ fn collect_streams(
     Ok(out)
 }
 
-fn index_buffer(
-    device: &D3d9Device,
-    id: u32,
-) -> Result<(Arc<Vec<u8>>, u32), RenderError> {
+fn index_buffer(device: &D3d9Device, id: u32) -> Result<(Arc<Vec<u8>>, u32), RenderError> {
     require_unlocked(device, id, "Draw index buffer")?;
     match device.registry.get(&id) {
         Some(GpuRegistryEntry::Buffer { uploaded, format }) => {
@@ -4476,7 +4472,13 @@ fn dispatch_draw(device: &mut D3d9Device, command: draw::DrawCommand) -> Result<
     if gpu.is_physical() {
         return Err(RenderError::new("Draw", gpu.loss().physical_message()));
     }
-    draw::execute(&gpu, &mut device.draw, &device.state, &device.objects, snapshot)?;
+    draw::execute(
+        &gpu,
+        &mut device.draw,
+        &device.state,
+        &device.objects,
+        snapshot,
+    )?;
     mark_draw_fresh(device);
     Ok(())
 }

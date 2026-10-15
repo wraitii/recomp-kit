@@ -1,8 +1,9 @@
+use crate::RenderError;
 use crate::backend::GpuContext;
 use crate::bridge::{
-    status, status_from_error, AdapterInfo, AdapterInfoResult, Device, FrameHandoff,
-    FrameHandoffResult, Light, LightResult, Material, MaterialResult, Rect, Status, StatusCode,
-    TextureLevel, Viewport, ViewportResult,
+    AdapterInfo, AdapterInfoResult, Device, FrameHandoff, FrameHandoffResult, Light, LightResult,
+    Material, MaterialResult, Rect, Status, StatusCode, TextureLevel, Viewport, ViewportResult,
+    status, status_from_error,
 };
 use crate::d3d8::{
     device::{Device as RenderDevice, TextureLevelUpload},
@@ -12,7 +13,6 @@ use crate::d3d8::{
         Light as RenderLight, LitInput, Material as RenderMaterial, Viewport as RenderViewport,
     },
 };
-use crate::RenderError;
 
 fn gpu_error(error: RenderError) -> Status {
     status(StatusCode::Backend, error.to_string())
@@ -130,7 +130,10 @@ pub(crate) fn clear(
 ) -> Status {
     let mut internal_rects = Vec::new();
     if internal_rects.try_reserve_exact(rects.len()).is_err() {
-        return status(StatusCode::OutOfMemory, "clear: rectangle allocation failed");
+        return status(
+            StatusCode::OutOfMemory,
+            "clear: rectangle allocation failed",
+        );
     }
     internal_rects.extend(rects.iter().map(|rect| crate::d3d8::state::Rect {
         x1: rect.x1,
@@ -139,13 +142,9 @@ pub(crate) fn clear(
         y2: rect.y2,
     }));
     match renderer_mut(device, "clear") {
-        Ok(renderer) => status_from_error_or_ok(renderer.clear(
-            &internal_rects,
-            flags,
-            color,
-            z,
-            stencil,
-        )),
+        Ok(renderer) => {
+            status_from_error_or_ok(renderer.clear(&internal_rects, flags, color, z, stencil))
+        }
         Err(status) => status,
     }
 }
@@ -586,7 +585,13 @@ pub(crate) fn process_vertices(
         Err(error) => return status_from_error(error),
     };
     if src_stride as usize != layout.stride {
-        return status(StatusCode::InvalidArgument, format!("process_vertices: stream stride {src_stride} does not match FVF {src_fvf:#06x} stride {}", layout.stride));
+        return status(
+            StatusCode::InvalidArgument,
+            format!(
+                "process_vertices: stream stride {src_stride} does not match FVF {src_fvf:#06x} stride {}",
+                layout.stride
+            ),
+        );
     }
     device
         .state_mut()
