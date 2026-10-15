@@ -191,12 +191,6 @@ class Image(PE):
             words = words[1:]
         mnem = words[-1].upper()
         mnem = self.MNEM_ALIAS.get(mnem, mnem)
-        if rep is None and mnem[:-1] in self.STRING_OPS:
-            for byte in instruction_bytes:
-                if byte not in self.LEGACY_PREFIXES:
-                    break
-                if byte in (0xF2, 0xF3):
-                    rep = "REPNE" if byte == 0xF2 else "REP"
         if mnem_override is not None:
             mnem = mnem_override
         operands = []
@@ -225,6 +219,15 @@ class Image(PE):
             else:
                 raise TranslateError("unknown capstone operand type %d" % op.type)
             operands.append(item)
+        # A MOVSD/MOVSS/CMPSD with an XMM operand is SSE, not a string
+        # instruction, so its mandatory F2/F3 is not a repeat prefix.
+        if (rep is None and mnem[:-1] in self.STRING_OPS
+                and not any(op.kind == "xmm" for op in operands)):
+            for byte in instruction_bytes:
+                if byte not in self.LEGACY_PREFIXES:
+                    break
+                if byte in (0xF2, 0xF3):
+                    rep = "REPNE" if byte == 0xF2 else "REP"
         record = self._DecodeRecord(
             addr, raw, ci.id, mnem, ci.mnemonic, rep, tuple(operands), ci.addr_size, len(raw))
         self._decode_records[key] = record
@@ -246,7 +249,8 @@ class Image(PE):
             return Insn(addr, "UNMODELLED", None, [],
                         "%08x  %s %s: %s" % (addr, mnemonic.upper(), operands, error))
         mnem, rep = record.opcode, record.rep
-        if rep or mnem in STRING_MNEM:
+        if rep or (mnem in STRING_MNEM
+                   and not any(op.kind == "xmm" for op in record.operands)):
             ops = []            # implicit ES:EDI / ESI operands carry nothing
         text = "%08x  %s%s%s" % (record.address, mnem, "." + rep if rep else "",
                                  (" " + ",".join(ops)) if ops else "")
