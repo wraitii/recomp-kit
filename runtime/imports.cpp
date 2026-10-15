@@ -633,43 +633,74 @@ bool imports_dispatch(X86 *c, uint32_t target) {
 // ---------------------------------------------------------------------------
 namespace {
 struct Callback {
+    Callback *next;
     X86 *cpu;
     jmp_buf env;
     uint32_t saved_esp, saved_eip, return_sp, profile_depth;
 };
 struct Callbacks {
     std::vector<Callback *> stack;
+    Callback *free = nullptr;
+
+    Callback *acquire() {
+        if (!free)
+            return new Callback{};
+        Callback *call = free;
+        free = call->next;
+        return call;
+    }
+
+    void recycle(Callback *call) {
+        call->next = free;
+        free = call;
+    }
+
     ~Callbacks() {
         for (Callback *call : stack)
             delete call;
+        while (free) {
+            Callback *call = free;
+            free = call->next;
+            delete call;
+        }
     }
 };
-thread_local Callbacks callbacks;
+Callbacks &callback_state() {
+    static thread_local Callbacks *cached = nullptr;
+    if (!cached) {
+        static thread_local Callbacks owned;
+        cached = &owned;
+    }
+    return *cached;
+}
 } // namespace
 
 uint32_t recomp_callback_depth(void) {
-    return (uint32_t)callbacks.stack.size();
+    return (uint32_t)callback_state().stack.size();
 }
 
 void recomp_callback_truncate(uint32_t depth) {
-    while (callbacks.stack.size() > depth) {
-        delete callbacks.stack.back();
-        callbacks.stack.pop_back();
+    Callbacks &local = callback_state();
+    while (local.stack.size() > depth) {
+        local.recycle(local.stack.back());
+        local.stack.pop_back();
     }
 }
 
 void recomp_callback_reset(X86 *c) {
-    for (size_t i = callbacks.stack.size(); i-- > 0;)
-        if (!c || callbacks.stack[i]->cpu == c) {
-            delete callbacks.stack[i];
-            callbacks.stack.erase(callbacks.stack.begin() + i);
+    Callbacks &local = callback_state();
+    for (size_t i = local.stack.size(); i-- > 0;)
+        if (!c || local.stack[i]->cpu == c) {
+            local.recycle(local.stack[i]);
+            local.stack.erase(local.stack.begin() + i);
         }
 }
 
 void recomp_callback_return(X86 *c) {
-    if (callbacks.stack.empty())
+    Callbacks &local = callback_state();
+    if (local.stack.empty())
         return;
-    Callback *call = callbacks.stack.back();
+    Callback *call = local.stack.back();
     // Every translated return here is deeper on the host stack than this
     // live guest_call. Match the guest return slot as well: a completing SEH
     // landing may RET to an older callback's identical sentinel, in which
@@ -685,7 +716,8 @@ uint32_t guest_call(X86 *c, uint32_t fn, const uint32_t *args, int nargs) {
 #ifdef RECOMP_CHECK_CALL_FACTS
     ++g_guest_entries;
 #endif
-    Callback *call = new Callback{};
+    Callbacks &local = callback_state();
+    Callback *call = local.acquire();
     call->cpu = c;
     call->saved_esp = c->r[R_ESP];
     call->saved_eip = c->eip;
@@ -699,15 +731,15 @@ uint32_t guest_call(X86 *c, uint32_t fn, const uint32_t *args, int nargs) {
     wr32(esp, GUEST_RETURN_SENTINEL);
     c->r[R_ESP] = esp;
     call->return_sp = esp;
-    callbacks.stack.push_back(call);
+    local.stack.push_back(call);
     if (!RECOMP_SETJMP(call->env))
         recomp_run(c, fn);
-    recomp_seh_callback_leave(c, recomp_callback_depth());
+    recomp_seh_callback_leave(c, static_cast<uint32_t>(local.stack.size()));
     uint32_t eax = c->r[R_EAX];
     c->r[R_ESP] = call->saved_esp;
     c->eip = call->saved_eip;
-    callbacks.stack.pop_back();
-    delete call;
+    local.stack.pop_back();
+    local.recycle(call);
     return eax;
 }
 

@@ -174,6 +174,8 @@ pub mod ffi {
         light: Light,
     }
     struct FrameHandoff {
+        ready_event: *mut u8,
+        ready_value: u64,
         texture: *mut u8,
         busy: *mut u32,
         width: u32,
@@ -731,8 +733,8 @@ pub mod ffi {
     }
 
     struct D3d9Bindings {
-        textures: Vec<u32>,
-        streams: Vec<u32>,
+        textures: [u32; 16],
+        streams: [u32; 16],
         indices: u32,
         vertex_shader: u32,
         pixel_shader: u32,
@@ -947,7 +949,7 @@ pub mod ffi {
             bytes: &[u8],
         ) -> D3dxCreateResult;
         fn d3d9_d3dx_surface_read(
-            device: &D3d9Device,
+            device: &mut D3d9Device,
             resource: &mut D3d9Resource,
             face: u32,
             level: u32,
@@ -956,7 +958,7 @@ pub mod ffi {
             color_key: u32,
         ) -> D3dxSurfaceReadResult;
         fn d3d9_d3dx_surface_store(
-            device: &D3d9Device,
+            device: &mut D3d9Device,
             resource: &mut D3d9Resource,
             face: u32,
             level: u32,
@@ -966,7 +968,7 @@ pub mod ffi {
             filter: u32,
         ) -> Status;
         fn d3d9_d3dx_save_surface(
-            device: &D3d9Device,
+            device: &mut D3d9Device,
             resource: &mut D3d9Resource,
             face: u32,
             level: u32,
@@ -975,7 +977,7 @@ pub mod ffi {
             format: u32,
         ) -> D3dxBytesResult;
         fn d3d9_d3dx_save_texture(
-            device: &D3d9Device,
+            device: &mut D3d9Device,
             resource: &mut D3d9Resource,
             format: u32,
         ) -> D3dxBytesResult;
@@ -1175,6 +1177,7 @@ pub mod ffi {
         ) -> Status;
         fn d3d9_begin_scene(device: &mut D3d9Device) -> Status;
         fn d3d9_end_scene(device: &mut D3d9Device) -> Status;
+        fn d3d9_flush(device: &mut D3d9Device) -> Status;
         fn d3d9_set_render_target(
             device: &mut D3d9Device,
             index: u32,
@@ -1306,6 +1309,7 @@ pub mod ffi {
         fn d3d9_finish_reset(device: &mut D3d9Device) -> D3d9ResetResult;
         fn d3d9_abort_reset(device: &mut D3d9Device) -> Status;
         fn d3d9_present(device: &mut D3d9Device) -> D3d9FrameResult;
+        fn d3d9_present_handoff(device: &mut D3d9Device) -> FrameHandoffResult;
         fn d3d9_backbuffer_descriptor(device: &D3d9Device) -> D3d9SurfaceDescriptorResult;
         fn d3d9_depthbuffer_descriptor(device: &D3d9Device) -> D3d9SurfaceDescriptorResult;
         fn d3d9_number_of_swap_chains(device: &D3d9Device) -> ValueResult;
@@ -1760,19 +1764,19 @@ use crate::d3d9::{
     d3d9_get_texture_stage_state, d3d9_get_transform, d3d9_get_vertex_declaration,
     d3d9_get_viewport, d3d9_level_bytes, d3d9_level_lock_commit, d3d9_level_lock_prepare,
     d3d9_level_unlock, d3d9_lod, d3d9_multiply_transform, d3d9_number_of_swap_chains, d3d9_preload,
-    d3d9_prepare_resource_reset, d3d9_present, d3d9_priority, d3d9_readback_buffer,
-    d3d9_readback_level, d3d9_register_resource, d3d9_registered_resource_ids, d3d9_reset,
-    d3d9_reset_ready, d3d9_resource_type, d3d9_set_autogen_filter, d3d9_set_clip_plane,
-    d3d9_set_fvf_binding, d3d9_set_indices, d3d9_set_light, d3d9_set_light_enable, d3d9_set_lod,
-    d3d9_set_material, d3d9_set_priority, d3d9_set_private_data, d3d9_set_render_state,
-    d3d9_set_sampler_state, d3d9_set_scissor, d3d9_set_shader, d3d9_set_shader_constants_b,
-    d3d9_set_shader_constants_f, d3d9_set_shader_constants_i, d3d9_set_stream_freq,
-    d3d9_set_stream_source, d3d9_set_texture, d3d9_set_texture_stage_state, d3d9_set_transform,
-    d3d9_set_vertex_declaration, d3d9_set_viewport, d3d9_shader_function, d3d9_shader_size,
-    d3d9_state_block_bindings, d3d9_surface_descriptor, d3d9_test_cooperative_level,
-    d3d9_texture_descriptor, d3d9_texture_level_descriptor, d3d9_texture_volume_descriptor,
-    d3d9_unregister_resource, d3d9_upload_buffer, d3d9_upload_level, new_d3d9_device,
-    new_d3d9_resource,
+    d3d9_prepare_resource_reset, d3d9_present, d3d9_present_handoff, d3d9_priority,
+    d3d9_readback_buffer, d3d9_readback_level, d3d9_register_resource,
+    d3d9_registered_resource_ids, d3d9_reset, d3d9_reset_ready, d3d9_resource_type,
+    d3d9_set_autogen_filter, d3d9_set_clip_plane, d3d9_set_fvf_binding, d3d9_set_indices,
+    d3d9_set_light, d3d9_set_light_enable, d3d9_set_lod, d3d9_set_material, d3d9_set_priority,
+    d3d9_set_private_data, d3d9_set_render_state, d3d9_set_sampler_state, d3d9_set_scissor,
+    d3d9_set_shader, d3d9_set_shader_constants_b, d3d9_set_shader_constants_f,
+    d3d9_set_shader_constants_i, d3d9_set_stream_freq, d3d9_set_stream_source, d3d9_set_texture,
+    d3d9_set_texture_stage_state, d3d9_set_transform, d3d9_set_vertex_declaration,
+    d3d9_set_viewport, d3d9_shader_function, d3d9_shader_size, d3d9_state_block_bindings,
+    d3d9_surface_descriptor, d3d9_test_cooperative_level, d3d9_texture_descriptor,
+    d3d9_texture_level_descriptor, d3d9_texture_volume_descriptor, d3d9_unregister_resource,
+    d3d9_upload_buffer, d3d9_upload_level, new_d3d9_device, new_d3d9_resource,
 };
 use crate::d3d9::{
     D3dxConstantTable, d3dx_constant_table_apply, d3dx_constant_table_constant,
@@ -1785,9 +1789,9 @@ use crate::d3d9::{
 use crate::d3d9::{
     d3d9_begin_scene, d3d9_clear, d3d9_color_fill, d3d9_create_query, d3d9_destroy_query,
     d3d9_draw_indexed_primitive, d3d9_draw_indexed_primitive_up, d3d9_draw_primitive,
-    d3d9_draw_primitive_up, d3d9_end_scene, d3d9_get_depth_stencil, d3d9_get_render_target,
-    d3d9_get_render_target_data, d3d9_query_data_size, d3d9_query_get_data, d3d9_query_issue,
-    d3d9_query_type, d3d9_register_implicit_targets, d3d9_register_resource_view,
+    d3d9_draw_primitive_up, d3d9_end_scene, d3d9_flush, d3d9_get_depth_stencil,
+    d3d9_get_render_target, d3d9_get_render_target_data, d3d9_query_data_size, d3d9_query_get_data,
+    d3d9_query_issue, d3d9_query_type, d3d9_register_implicit_targets, d3d9_register_resource_view,
     d3d9_set_depth_stencil, d3d9_set_render_target, d3d9_stretch_rect, d3d9_update_surface,
     d3d9_update_texture,
 };

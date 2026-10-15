@@ -198,7 +198,7 @@ pub struct BufferState {
     pub fvf: u32,
     pub format: u32,
     pub bytes: Vec<u8>,
-    pub uploaded: Arc<Mutex<Vec<u8>>>,
+    pub uploaded: Arc<Mutex<Arc<Vec<u8>>>>,
     pub lock_count: Arc<AtomicU32>,
     pub writable: Vec<(u32, u32)>,
     pub writable_dirty: bool,
@@ -889,7 +889,7 @@ pub fn create_buffer(
         pool: request.pool,
         fvf: request.fvf,
         format: request.format,
-        uploaded: Arc::new(Mutex::new(alloc_bytes(request.size)?)),
+        uploaded: Arc::new(Mutex::new(Arc::new(alloc_bytes(request.size)?))),
         bytes,
         lock_count: Arc::new(AtomicU32::new(0)),
         writable: Vec::new(),
@@ -1354,7 +1354,8 @@ pub fn upload_buffer(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(), R
     let align = wgpu::COPY_BUFFER_ALIGNMENT as u32;
     let copy_lo = (lo - lo % align) as usize;
     let copy_hi = (hi.next_multiple_of(align) as usize).min(b.bytes.len());
-    b.uploaded.lock().unwrap()[copy_lo..copy_hi].copy_from_slice(&b.bytes[copy_lo..copy_hi]);
+    Arc::make_mut(&mut b.uploaded.lock().unwrap())[copy_lo..copy_hi]
+        .copy_from_slice(&b.bytes[copy_lo..copy_hi]);
     b.dirty_lo = 0;
     b.dirty_hi = 0;
     b.gpu_generation = b.generation;
@@ -1371,7 +1372,7 @@ pub fn readback_buffer(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(),
     };
     let mut out = alloc_bytes(b.bytes.len() as u32)?;
     gpu.read_buffer(buffer, b.bytes.len() as u32, &mut out)?;
-    b.uploaded.lock().unwrap().copy_from_slice(&out);
+    Arc::make_mut(&mut b.uploaded.lock().unwrap()).copy_from_slice(&out);
     b.bytes = out;
     b.gpu_generation = b.generation;
     resource.clear_gpu_newer();
@@ -1630,7 +1631,7 @@ pub fn preload(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(), RenderE
 #[derive(Default)]
 pub struct StagedStorage {
     pub buffer: Option<wgpu::Buffer>,
-    pub uploaded: Option<Arc<Mutex<Vec<u8>>>>,
+    pub uploaded: Option<Arc<Mutex<Arc<Vec<u8>>>>>,
     pub texture: Option<wgpu::Texture>,
 }
 
@@ -1679,7 +1680,7 @@ fn stage_buffer(gpu: &D3d9Gpu, b: &BufferState) -> Result<StagedStorage, RenderE
     let mut uploaded = alloc_bytes(b.size)?;
     uploaded.copy_from_slice(&b.bytes);
     Ok(StagedStorage {
-        uploaded: Some(Arc::new(Mutex::new(uploaded))),
+        uploaded: Some(Arc::new(Mutex::new(Arc::new(uploaded)))),
         buffer: Some(buffer),
         texture: None,
     })
