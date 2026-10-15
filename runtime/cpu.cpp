@@ -448,11 +448,15 @@ void recomp_unmodelled(X86 *c, uint32_t addr) {
     abort();
 }
 
-// INT3: a breakpoint no debugger will handle. On Windows that is an unhandled
-// exception, so the process ends; so does this one, with the address.
+// INT3: a breakpoint no debugger will handle. Windows hands STATUS_BREAKPOINT
+// to the program's own handlers and ends the process when none takes it.
 void recomp_breakpoint(X86 *c, uint32_t addr) {
-    LOGW("INT3 at %08x (ESP=%08x, return=%08x): breakpoint reached, stopping", addr, c->r[R_ESP],
+    LOGW("INT3 at %08x (ESP=%08x, return=%08x): raising STATUS_BREAKPOINT", addr, c->r[R_ESP],
          rd32(c->r[R_ESP]));
+    recomp_seh_raise_fault(c, 0x80000003u, addr);
+    LOGW("INT3 at %08x: unhandled breakpoint, stopping", addr);
+    fflush(stdout);
+    fflush(stderr);
     abort();
 }
 

@@ -362,7 +362,7 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                 wanted.add(indices[b.insn.addr + b.insn.length])
             if set(fir.succ[i]) != wanted:
                 raise SSAError("branch disagrees with supplied CFG")
-        elif any(op.opc in ("TAIL", "TRAP") for op in b.insn.ops):
+        elif any(op.opc in ("TAIL", "TRAP", "BREAKPOINT") for op in b.insn.ops):
             if fir.succ[i]:
                 raise SSAError("tail exit has successors")
         elif branches and branches[0].opc == "RETURN":

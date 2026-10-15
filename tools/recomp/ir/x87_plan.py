@@ -171,7 +171,7 @@ class X87Plan:
                     elif v.opc in X87_FLUSH_STRICT_OPS:
                         if scalar.observe_loads:
                             operations.extend(scalar.flush())
-                    elif v.opc in ('RETURN', 'TAIL'):
+                    elif v.opc in ('RETURN', 'TAIL', 'BREAKPOINT'):
                         operations.extend(scalar.flush())
                     elif v.opc in ('BRANCH', 'CBRANCH', 'BRANCHIND'):
                         if self.carry_mode:

@@ -319,7 +319,7 @@ class PreparedFunction:
 def validate_operations(s):
     supported = frozenset((
         "MEMORY", "X87_REG", "X87_MEM", "CALL", "CALL_RELOAD", "CALL_KEEP", "CALLIND",
-        "STRINGOP", "LOAD", "STORE", "DIV32", "IDIV32", "RETURN", "SEH", "TRAP", "TAIL",
+        "STRINGOP", "LOAD", "STORE", "DIV32", "IDIV32", "RETURN", "SEH", "TRAP", "BREAKPOINT", "TAIL",
         "BRANCHIND", "BRANCH", "CBRANCH", "PACK", "BYTE", "COPY", "INT_ZEXT", "INT_SEXT",
         "INT_ADD", "INT_SUB", "INT_MULT", "INT_AND", "INT_OR", "INT_XOR", "INT_EQUAL",
         "INT_NOTEQUAL", "INT_LESS", "INT_LESSEQUAL", "BOOL_AND", "BOOL_OR", "BOOL_XOR",

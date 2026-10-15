@@ -327,6 +327,9 @@ def emit_prepared(prepared, external_entry=False):
                     lines.extend(seh_lines(v.data["kind"], v.data["eip"]))
                 elif v.opc == "TRAP":
                     lines.append("recomp_unknown_call(c, 0x%xu); return;" % v.data)
+                elif v.opc == "BREAKPOINT":
+                    lines.extend(publish(v))
+                    lines.append("recomp_breakpoint(c, 0x%xu); return;" % v.data)
                 elif v.opc == "TAIL":
                     lines.extend(boundary.event(v))
                 elif v.opc == "BRANCHIND":

@@ -976,7 +976,7 @@ class Translator(ControlFlow):
         if m == "INT":
             return ["recomp_int(c, %s);" % hexlit(parse_imm(ins.ops[0]))]
         if m == "INT3":
-            return ["recomp_int(c, 3u);"]
+            return ["recomp_breakpoint(c, %s); return;" % hexlit(ins.addr)]
         if m == "IN":
             size = operand_size(ops[:1], hint=32)
             port = read_op(ops[1], 32) if len(ops) > 1 else "0u"

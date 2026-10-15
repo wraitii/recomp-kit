@@ -265,6 +265,10 @@ def codegen_ir(fir, lifter, tails=()):
             insns.append(Insn(ins.addr, ins.length, ins.mnem, [], 0,
                               False, False, [], ins.raw, ins.decode))
             continue
+        if mnem == "INT3":
+            insns.append(Insn(ins.addr, ins.length, ins.mnem, [Op("BREAKPOINT", None, [], ins.addr)], 0,
+                              False, False, [], ins.raw, ins.decode))
+            continue
         if mnem not in SUPPORTED_MNEMONICS:
             raise SSAError("%08x: C emitter: unsupported instruction %s" % (ins.addr, mnem))
         ops = normalize_direct_ram(ins, lifter)

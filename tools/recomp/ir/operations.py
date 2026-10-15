@@ -60,6 +60,7 @@ _add("BRANCHIND", observes=True, exit_publish=True, terminator=True)
 _add("BRANCH", terminator=True)
 _add("CBRANCH", terminator=True)
 _add("TRAP", terminator=True, faults=True, opaque=True)
+_add("BREAKPOINT", observes=True, exit_publish=True, terminator=True, faults=True)
 _add("CALLOTHER", faults=True, opaque=True)
 
 
@@ -97,5 +98,5 @@ FLAG_EAGER_OBSERVERS = ((RETURNING_OPAQUE - frozenset(("CALL", "CALLIND")))
                         | frozenset(("CALLOTHER",)))
 FLAG_EAGER_CODEGEN = FLAG_EAGER_OBSERVERS - frozenset(("CALLOTHER",))
 X87_RESET_OPS = RETURNING_OPAQUE
-X87_FLUSH_OPS = X87_RESET_OPS | frozenset(("RETURN", "TAIL"))
+X87_FLUSH_OPS = X87_RESET_OPS | frozenset(("RETURN", "TAIL", "BREAKPOINT"))
 X87_FLUSH_STRICT_OPS = frozenset(("LOAD", "STORE"))
