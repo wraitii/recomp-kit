@@ -284,6 +284,27 @@ int os_listdir(const char *dir, OsListDirFn fn, void *user) {
     FindClose(h);
     return 0;
 }
+struct OsFileLock {
+    HANDLE handle;
+};
+
+OsFileLock *os_file_lock(const char *path) {
+    HANDLE handle = CreateFileW(widen(path).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = GetLastError() == ERROR_SHARING_VIOLATION ? EWOULDBLOCK : EACCES;
+        return nullptr;
+    }
+    return new OsFileLock{handle};
+}
+
+void os_file_unlock(OsFileLock *lock) {
+    if (lock) {
+        CloseHandle(lock->handle);
+        delete lock;
+    }
+}
+
 int os_mkstemp(char *template_path) {
     size_t len = strlen(template_path);
     if (len < 6 || strcmp(template_path + len - 6, "XXXXXX") != 0)

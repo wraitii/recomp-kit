@@ -77,6 +77,9 @@ int os_listdir(const char *dir, OsListDirFn fn, void *user);
 // The trailing XXXXXX of `template_path` is replaced in place; returns an open
 // read-write descriptor for the new file, or -1.
 int os_mkstemp(char *template_path);
+typedef struct OsFileLock OsFileLock;
+OsFileLock *os_file_lock(const char *path);
+void os_file_unlock(OsFileLock *lock);
 // mkdtemp: replaces the trailing XXXXXX and creates the directory; 0 or -1.
 int os_mkdtemp(char *template_path);
 // A writable temporary directory without a trailing separator ("/tmp", %TEMP%).

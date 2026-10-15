@@ -4,6 +4,7 @@
 // launcher_platform_android.cpp is Android, and host/sdl/platform_ui_ios.mm
 // holds the iPadOS one.
 #pragma once
+#include "configure_ui.h"
 #include "launcher_ui.h"
 
 #include <SDL3/SDL.h>
@@ -36,6 +37,8 @@ struct RunOptions {
 // launcher's swapchain is gone when this returns.
 std::string run(SDL_Window *window, gpu::Device *device, void *native_surface, Platform &platform,
                 const RunOptions &options);
+
+bool configure(SDL_Window *window, gpu::Device *device, void *native_surface);
 
 // This target's platform.
 std::unique_ptr<Platform> make_platform(SDL_Window *window);

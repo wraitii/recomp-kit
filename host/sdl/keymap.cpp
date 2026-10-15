@@ -1,6 +1,10 @@
 #include "keymap.h"
+#include "../input.h"
 
+#include <array>
+#include <mutex>
 #include <SDL3/SDL_keycode.h>
+#include <SDL3/SDL_keyboard.h>
 #include <SDL3/SDL_scancode.h>
 
 namespace {
@@ -115,6 +119,55 @@ const Row kRows[] = {
     {SDL_SCANCODE_UP, 0x7E},
 };
 } // namespace
+
+namespace {
+std::array<std::string, 256> g_key_names;
+std::mutex g_key_names_mutex;
+
+std::string system_key_name_from_dik(uint32_t dik) {
+    if (!dik)
+        return {};
+    SDL_Scancode scancode = SDL_SCANCODE_UNKNOWN;
+    for (const Row &row : kRows) {
+        if (host_key_mapping(row.key).dik == dik) {
+            scancode = static_cast<SDL_Scancode>(row.scancode);
+            break;
+        }
+    }
+    if (scancode == SDL_SCANCODE_UNKNOWN) {
+        static const struct {
+            uint8_t dik;
+            SDL_Scancode scancode;
+        } special[] = {{0x56, SDL_SCANCODE_NONUSBACKSLASH},
+                       {0xd2, SDL_SCANCODE_INSERT},
+                       {0xdb, SDL_SCANCODE_LGUI},
+                       {0xdc, SDL_SCANCODE_RGUI},
+                       {0xdd, SDL_SCANCODE_APPLICATION}};
+        for (const auto &key : special) {
+            if (key.dik == dik) {
+                scancode = key.scancode;
+                break;
+            }
+        }
+    }
+    if (scancode == SDL_SCANCODE_UNKNOWN)
+        return {};
+    const SDL_Keycode key = SDL_GetKeyFromScancode(scancode, SDL_KMOD_NONE, false);
+    const char *name = key == SDLK_UNKNOWN ? nullptr : SDL_GetKeyName(key);
+    return name ? name : "";
+}
+} // namespace
+
+void host_key_names_refresh() {
+    std::lock_guard<std::mutex> lock(g_key_names_mutex);
+    for (uint32_t dik = 0; dik < g_key_names.size(); ++dik)
+        g_key_names[dik] = system_key_name_from_dik(dik);
+}
+
+std::string host_key_name_from_dik(uint32_t dik) {
+    std::lock_guard<std::mutex> lock(g_key_names_mutex);
+    return dik < g_key_names.size() ? g_key_names[dik] : "";
+}
 
 uint16_t host_keycode_from_scancode(int sdl_scancode) {
     for (const Row &row : kRows)

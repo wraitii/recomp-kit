@@ -353,6 +353,19 @@ def load(game_dir, build_root=None):
     relative_capture = input_config.setdefault("relative_mouse_capture", True)
     if not isinstance(relative_capture, bool):
         raise ValueError("%s: [input] relative_mouse_capture must be a boolean" % source)
+    keyboard_names = input_config.setdefault("keyboard_names", "system")
+    if keyboard_names not in ("system", "us"):
+        raise ValueError('%s: [input] keyboard_names must be "system" or "us", not %r'
+                         % (source, keyboard_names))
+    sensitivity = input_config.setdefault("mouse_sensitivity", 100)
+    if type(sensitivity) is not int or not 25 <= sensitivity <= 400 or sensitivity % 25:
+        raise ValueError("%s: [input] mouse_sensitivity must be an integer from 25 to 400 in steps of 25" % source)
+    acceleration = input_config.setdefault("mouse_acceleration", False)
+    if not isinstance(acceleration, bool):
+        raise ValueError("%s: [input] mouse_acceleration must be a boolean" % source)
+    input_config["keyboard_names"] = keyboard_names
+    input_config["mouse_sensitivity"] = sensitivity
+    input_config["mouse_acceleration"] = acceleration
     cfg.setdefault("bundle", {}).setdefault("exclude", [])
     touch = cfg.setdefault("touch", {})
     touch.setdefault("keypad", "auto")
@@ -360,6 +373,12 @@ def load(game_dir, build_root=None):
         raise ValueError('%s: [touch] keypad must be "auto" or "hidden", not %r' % (source, touch["keypad"]))
     cfg["controls"] = load_controls(cfg.get("controls", {}), touch, source)
     settings = cfg.setdefault("settings", {})
+    window_mode = settings.setdefault("window_mode", "windowed")
+    if window_mode not in ("windowed", "borderless", "fullscreen"):
+        raise ValueError("%s: [settings] window_mode must be windowed, borderless or fullscreen" % source)
+    overlay = settings.setdefault("performance_overlay", "off")
+    if overlay not in ("off", "counters", "graph"):
+        raise ValueError("%s: [settings] performance_overlay must be off, counters or graph" % source)
     rows = settings.setdefault("rows", list(SETTINGS_ROWS))
     if not isinstance(rows, list):
         raise ValueError("%s: [settings] rows must be a list, not %r" % (source, rows))
