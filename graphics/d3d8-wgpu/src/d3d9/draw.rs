@@ -2017,8 +2017,10 @@ struct DrawBatch {
     last_uniform: Option<([u32; 4], [u64; 4])>,
 }
 
+const DRAW_MEMOS: usize = 16;
+
 struct DrawMemo {
-    generation: u64,
+    fingerprint: u64,
     ff_key: Option<[u32; 5]>,
     target: (wgpu::TextureFormat, u32),
     depth: Option<(wgpu::TextureFormat, u32)>,
@@ -2058,11 +2060,11 @@ pub(crate) struct D3d9DrawState {
     index_slots: FastMap<u32, u32>,
     native_streams: Vec<(u32, Vec<wgpu::VertexAttribute>)>,
     pipeline_memo: Option<(PipelineKey, wgpu::RenderPipeline)>,
-    memo: Option<DrawMemo>,
+    memos: Vec<DrawMemo>,
 }
 impl D3d9DrawState {
     pub fn clear(&mut self) {
-        self.memo = None;
+        self.memos.clear();
         self.pipeline_memo = None;
         self.pipelines.clear();
         self.layouts.clear();
@@ -2686,7 +2688,7 @@ fn resolve_shading(
         },
     )?;
     Ok(DrawMemo {
-        generation: state.pipeline_generation(),
+        fingerprint: state.pipeline_fingerprint(),
         ff_key,
         target,
         depth,
@@ -2925,13 +2927,18 @@ pub(crate) fn execute(
         .depth
         .as_ref()
         .map(|depth| (depth.texture.format(), depth.format));
-    let memo = draw.memo.take().filter(|memo| {
-        memo.generation == state.pipeline_generation()
-            && memo.ff_key == ff_key
-            && memo.target == target_key
-            && memo.depth == depth_key
-            && memo.textures == snapshot.textures
-    });
+    let fingerprint = state.pipeline_fingerprint();
+    let memo = draw
+        .memos
+        .iter()
+        .rposition(|memo| {
+            memo.fingerprint == fingerprint
+                && memo.ff_key == ff_key
+                && memo.target == target_key
+                && memo.depth == depth_key
+                && memo.textures == snapshot.textures
+        })
+        .map(|index| draw.memos.remove(index));
     let mut memo = match memo {
         Some(memo) => memo,
         None => resolve_shading(
@@ -3231,7 +3238,10 @@ pub(crate) fn execute(
         blend_constant: blend,
         scissor,
     });
-    draw.memo = Some(memo);
+    if draw.memos.len() >= DRAW_MEMOS {
+        draw.memos.remove(0);
+    }
+    draw.memos.push(memo);
     draw.linked = linked_inputs;
     draw.ff_uniforms = ff_uniforms;
     if draw.batch.data.len() >= 32 << 20 {

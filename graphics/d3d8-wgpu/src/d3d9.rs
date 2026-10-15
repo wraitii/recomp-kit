@@ -160,6 +160,7 @@ pub struct TargetRect {
     pub bottom: i32,
 }
 
+#[derive(Clone)]
 pub(crate) struct SurfaceView {
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
@@ -221,6 +222,20 @@ pub(crate) enum GpuRegistryEntry {
     },
 }
 
+struct DrawViews {
+    key: (u32, u32, u64),
+    target: SurfaceView,
+    depth: Option<SurfaceView>,
+    textures: [Option<CachedBinding>; state::MAX_SAMPLERS],
+}
+
+struct CachedBinding {
+    id: u32,
+    texture: wgpu::Texture,
+    lod: Option<Arc<AtomicU32>>,
+    binding: draw::BoundTexture,
+}
+
 struct RestorePlan {
     gpu: Option<GpuContext>,
     d3d9_gpu: D3d9Gpu,
@@ -269,6 +284,8 @@ pub struct D3d9Device {
     state: state::D3d9State,
     objects: shader::D3d9Objects,
     registry: FastMap<u32, GpuRegistryEntry>,
+    registry_epoch: u64,
+    draw_views: Option<Box<DrawViews>>,
     view_cache: RefCell<FastMap<TextureViewKey, wgpu::TextureView>>,
     locks: BTreeMap<u32, Vec<Arc<AtomicU32>>>,
     draw: draw::D3d9DrawState,
@@ -1260,6 +1277,8 @@ impl Default for D3d9Device {
             state: state::D3d9State::default(),
             objects: shader::D3d9Objects::default(),
             registry: FastMap::default(),
+            registry_epoch: 0,
+            draw_views: None,
             view_cache: RefCell::new(FastMap::default()),
             locks: BTreeMap::new(),
             draw: draw::D3d9DrawState::default(),
@@ -1680,6 +1699,7 @@ pub fn d3d9_create_device(
     device.creator_thread = request.thread_id;
     device.loss = Some(loss);
     device.targets = Some(targets);
+    device.registry_epoch += 1;
     D3d9CreateResult {
         status: status(StatusCode::Ok, ""),
         present,
@@ -1718,6 +1738,7 @@ pub fn d3d9_register_resource(device: &mut D3d9Device, id: u32, resource: &D3d9R
     device.locks.insert(id, resource.lock_handles());
     if let Some(entry) = gpu_entry_from_resource(resource) {
         device.registry.insert(id, entry);
+        device.registry_epoch += 1;
     }
     status(StatusCode::Ok, "")
 }
@@ -1871,6 +1892,7 @@ pub fn d3d9_register_resource_view(
             fresh: fresh_or_new(resource.level_freshness(face, level)),
         },
     );
+    device.registry_epoch += 1;
     status(StatusCode::Ok, "")
 }
 
@@ -1881,12 +1903,14 @@ pub fn d3d9_register_implicit_targets(
 ) -> Status {
     device.implicit_backbuffer_id = backbuffer;
     device.implicit_depthbuffer_id = depth;
+    device.registry_epoch += 1;
     status(StatusCode::Ok, "")
 }
 
 pub fn d3d9_unregister_resource(device: &mut D3d9Device, id: u32) -> Status {
     device.resources.remove(&id);
     device.registry.remove(&id);
+    device.registry_epoch += 1;
     device.locks.remove(&id);
     device.draw.drop_resource(id);
     if device.render_target_id == id {
@@ -2271,6 +2295,7 @@ pub fn d3d9_finish_reset(device: &mut D3d9Device) -> D3d9ResetResult {
     let lost = plan.loss.is_physical();
     device.targets = Some(plan.targets);
     device.registry = plan.registry;
+    device.registry_epoch += 1;
     device.present = plan.present;
     device.display_mode = plan.display_mode;
     device
@@ -4270,92 +4295,114 @@ fn resolve_target_view(
     }
 }
 
-fn bound_textures(
+fn resolve_binding(device: &D3d9Device, id: u32, stage: u32) -> Result<CachedBinding, RenderError> {
+    let (texture, kind, format, width, height, lod) = match device.registry.get(&id) {
+        Some(GpuRegistryEntry::Texture {
+            texture,
+            kind,
+            format,
+            width,
+            height,
+            lod,
+            ..
+        }) => (
+            texture.clone(),
+            *kind,
+            *format,
+            *width,
+            *height,
+            Some(Arc::clone(lod)),
+        ),
+        Some(GpuRegistryEntry::TextureAlias {
+            gpu: Some(texture),
+            kind,
+            format,
+            width,
+            height,
+            lod,
+            ..
+        }) => (
+            texture.clone(),
+            *kind,
+            *format,
+            *width,
+            *height,
+            Some(Arc::clone(lod)),
+        ),
+        Some(GpuRegistryEntry::Surface {
+            texture,
+            format,
+            width,
+            height,
+            ..
+        }) => (
+            texture.clone(),
+            resource::TextureKind::Texture2D,
+            *format,
+            *width,
+            *height,
+            None,
+        ),
+        _ => {
+            return Err(unsupported(
+                "Draw",
+                format!("sampler stage {stage} has no GPU texture"),
+            ));
+        }
+    };
+    let is_depth = format::is_depth(format);
+    let binding = draw::BoundTexture {
+        stage,
+        view: sampling_view(&device.view_cache, &texture, kind, is_depth),
+        width,
+        height,
+        depth: is_depth,
+        cube: kind == resource::TextureKind::Cube,
+        volume: kind == resource::TextureKind::Volume,
+        format,
+        lod: lod.as_ref().map_or(0, |lod| lod.load(Ordering::Acquire)),
+        levels: texture.mip_level_count(),
+    };
+    Ok(CachedBinding {
+        id,
+        texture,
+        lod,
+        binding,
+    })
+}
+
+fn bound_textures_cached(
     device: &D3d9Device,
-    state: &state::D3d9State,
+    cache: &mut [Option<CachedBinding>; state::MAX_SAMPLERS],
     target: &SurfaceView,
     depth: Option<&SurfaceView>,
 ) -> Result<Vec<draw::BoundTexture>, RenderError> {
     let mut out = Vec::new();
     for stage in 0..state::MAX_SAMPLERS as u32 {
-        let id = state.texture(stage)?;
+        let id = device.state.texture(stage)?;
         if id == 0 {
             continue;
         }
         require_unlocked(device, id, "Draw texture")?;
-        let (texture, kind, format, width, height, lod) = match device.registry.get(&id) {
-            Some(GpuRegistryEntry::Texture {
-                texture,
-                kind,
-                format,
-                width,
-                height,
-                lod,
-                ..
-            }) => (
-                texture.clone(),
-                *kind,
-                *format,
-                *width,
-                *height,
-                lod.load(Ordering::Acquire),
-            ),
-            Some(GpuRegistryEntry::TextureAlias {
-                gpu: Some(texture),
-                kind,
-                format,
-                width,
-                height,
-                lod,
-                ..
-            }) => (
-                texture.clone(),
-                *kind,
-                *format,
-                *width,
-                *height,
-                lod.load(Ordering::Acquire),
-            ),
-            Some(GpuRegistryEntry::Surface {
-                texture,
-                format,
-                width,
-                height,
-                ..
-            }) => (
-                texture.clone(),
-                resource::TextureKind::Texture2D,
-                *format,
-                *width,
-                *height,
-                0,
-            ),
-            _ => {
-                return Err(unsupported(
-                    "Draw",
-                    format!("sampler stage {stage} has no GPU texture"),
-                ));
+        let cached = match cache[stage as usize].take() {
+            Some(mut cached) if cached.id == id => {
+                if let Some(lod) = &cached.lod {
+                    cached.binding.lod = lod.load(Ordering::Acquire);
+                }
+                cached
             }
+            _ => resolve_binding(device, id, stage)?,
         };
-        if texture == target.texture || depth.is_some_and(|depth| texture == depth.texture) {
+        if cached.texture == target.texture
+            || depth.is_some_and(|depth| cached.texture == depth.texture)
+        {
             return Err(unsupported(
                 "Draw",
                 "the current render target is bound as a sampler",
             ));
         }
-        let is_depth = format::is_depth(format);
-        out.push(draw::BoundTexture {
-            stage,
-            view: sampling_view(&device.view_cache, &texture, kind, is_depth),
-            width,
-            height,
-            depth: is_depth,
-            cube: kind == resource::TextureKind::Cube,
-            volume: kind == resource::TextureKind::Volume,
-            format,
-            lod,
-            levels: texture.mip_level_count(),
-        });
+        out.push(cached.binding.clone());
+        cache[stage as usize] = Some(cached);
     }
     Ok(out)
 }
@@ -4439,8 +4486,10 @@ fn mark_draw_fresh(device: &D3d9Device) {
     }
 }
 
-fn dispatch_draw(device: &mut D3d9Device, command: draw::DrawCommand) -> Result<(), RenderError> {
-    let gpu = bridge_gpu(device)?;
+fn resolve_draw_views(
+    device: &D3d9Device,
+    key: (u32, u32, u64),
+) -> Result<Box<DrawViews>, RenderError> {
     let target = resolve_target_view(device, device.render_target_id, 0, 0, false)?;
     let depth = if device.depth_target_id == 0 {
         None
@@ -4462,13 +4511,42 @@ fn dispatch_draw(device: &mut D3d9Device, command: draw::DrawCommand) -> Result<
             "depth surface is smaller than the render target",
         ));
     }
-    let textures = bound_textures(device, &device.state, &target, depth.as_ref())?;
-    let snapshot = draw::DrawSnapshot {
-        command,
+    Ok(Box::new(DrawViews {
+        key,
         target,
         depth,
+        textures: Default::default(),
+    }))
+}
+
+fn dispatch_draw(device: &mut D3d9Device, command: draw::DrawCommand) -> Result<(), RenderError> {
+    let gpu = bridge_gpu(device)?;
+    require_unlocked(device, device.render_target_id, "D3D9 surface")?;
+    if device.depth_target_id != 0 {
+        require_unlocked(device, device.depth_target_id, "D3D9 surface")?;
+    }
+    let key = (
+        device.render_target_id,
+        device.depth_target_id,
+        device.registry_epoch,
+    );
+    let mut views = match device.draw_views.take() {
+        Some(views) if views.key == key => views,
+        _ => resolve_draw_views(device, key)?,
+    };
+    let textures = bound_textures_cached(
+        device,
+        &mut views.textures,
+        &views.target,
+        views.depth.as_ref(),
+    )?;
+    let snapshot = draw::DrawSnapshot {
+        command,
+        target: views.target.clone(),
+        depth: views.depth.clone(),
         textures,
     };
+    device.draw_views = Some(views);
     if gpu.is_physical() {
         return Err(RenderError::new("Draw", gpu.loss().physical_message()));
     }

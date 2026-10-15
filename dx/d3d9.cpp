@@ -4026,11 +4026,21 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
         resolved = resolved_heap.data();
     }
     std::fill(resolved, resolved + command_count, 0u);
-    std::vector<uint32_t> pinned;
+    uint32_t pinned_inline[32];
+    std::vector<uint32_t> pinned_heap;
+    size_t pinned_count = 0;
+    auto pinned_at = [&](size_t i) {
+        return i < std::size(pinned_inline) ? pinned_inline[i] : pinned_heap[i - std::size(pinned_inline)];
+    };
     auto pin = [&](uint32_t id) {
-        if (std::find(pinned.begin(), pinned.end(), id) != pinned.end())
-            return false;
-        pinned.push_back(id);
+        for (size_t i = 0; i < pinned_count; ++i)
+            if (pinned_at(i) == id)
+                return false;
+        if (pinned_count < std::size(pinned_inline))
+            pinned_inline[pinned_count] = id;
+        else
+            pinned_heap.push_back(id);
+        ++pinned_count;
         return true;
     };
     bool stale = false;
@@ -4077,8 +4087,8 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
     }
 
     auto unpin = [&]() {
-        for (uint32_t id : pinned)
-            if (ComObj *o = com_get(id))
+        for (size_t i = 0; i < pinned_count; ++i)
+            if (ComObj *o = com_get(pinned_at(i)))
                 com_release(o);
     };
 

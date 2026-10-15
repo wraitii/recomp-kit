@@ -477,13 +477,13 @@ impl D3d9StateBlock {
 
     fn apply_to(&self, state: &mut D3d9State) {
         for (index, value) in &self.render {
-            state.render[*index as usize] = *value;
+            state.put_render(*index as usize, *value);
         }
         for (stage, index, value) in &self.tss {
-            state.tss[*stage as usize][*index as usize] = *value;
+            state.put_tss(*stage as usize, *index as usize, *value);
         }
         for (sampler, index, value) in &self.sampler {
-            state.sampler[*sampler as usize][*index as usize] = *value;
+            state.put_sampler(*sampler as usize, *index as usize, *value);
         }
         for (index, value) in &self.transform {
             state.transform[*index as usize] = *value;
@@ -507,28 +507,28 @@ impl D3d9StateBlock {
             state.clip.insert(*index, *value);
         }
         for (stage, id) in &self.textures {
-            state.textures[*stage as usize] = *id;
+            state.put_texture(*stage as usize, *id);
         }
         for (stream, value) in &self.streams {
-            state.streams[*stream as usize] = *value;
+            state.put_stream(*stream as usize, *value);
         }
         for (stream, value) in &self.stream_freq {
-            state.stream_freq[*stream as usize] = *value;
+            state.put_stream_freq(*stream as usize, *value);
         }
         if let Some(indices) = self.indices {
             state.indices = indices;
         }
         if let Some(fvf) = self.fvf {
-            state.fvf = fvf;
+            state.put_declaration(state.declaration, fvf);
         }
         if let Some(declaration) = self.declaration {
-            state.declaration = declaration;
+            state.put_declaration(declaration, state.fvf);
         }
         if let Some(shader) = self.vertex_shader {
-            state.vertex_shader = shader;
+            state.put_shader(false, shader);
         }
         if let Some(shader) = self.pixel_shader {
-            state.pixel_shader = shader;
+            state.put_shader(true, shader);
         }
         for (index, value) in &self.vs_const_f {
             state.vs_const_f[*index as usize] = *value;
@@ -590,7 +590,7 @@ pub struct D3d9State {
     next_block: u32,
     recording: Option<D3d9StateBlock>,
     recording_handle: u32,
-    pipeline_generation: u64,
+    pipeline_fingerprint: u64,
 }
 
 impl Default for D3d9State {
@@ -637,7 +637,7 @@ impl Default for D3d9State {
                 transform[index as usize][15] = 1.0;
             }
         }
-        Self {
+        let mut state = Self {
             render,
             tss,
             sampler,
@@ -668,8 +668,10 @@ impl Default for D3d9State {
             next_block: 1,
             recording: None,
             recording_handle: 0,
-            pipeline_generation: 0,
-        }
+            pipeline_fingerprint: 0,
+        };
+        state.pipeline_fingerprint = state.full_fingerprint();
+        state
     }
 }
 
@@ -720,10 +722,7 @@ impl D3d9State {
         if self.recording.is_some() {
             self.recording.as_mut().unwrap().set_render(state, value);
         } else {
-            if self.render[state as usize] != value {
-                self.render[state as usize] = value;
-                self.pipeline_generation += 1;
-            }
+            self.put_render(state as usize, value);
         }
         Ok(())
     }
@@ -763,10 +762,7 @@ impl D3d9State {
                 .unwrap()
                 .set_tss(stage, state, value);
         } else {
-            if self.tss[stage as usize][state as usize] != value {
-                self.tss[stage as usize][state as usize] = value;
-                self.pipeline_generation += 1;
-            }
+            self.put_tss(stage as usize, state as usize, value);
         }
         Ok(())
     }
@@ -775,8 +771,89 @@ impl D3d9State {
         self.render[state as usize]
     }
 
-    pub(crate) fn pipeline_generation(&self) -> u64 {
-        self.pipeline_generation
+    pub(crate) fn pipeline_fingerprint(&self) -> u64 {
+        self.pipeline_fingerprint
+    }
+
+    fn track(&mut self, slot: u64, old: u32, new: u32) {
+        if old != new {
+            self.pipeline_fingerprint ^= fingerprint_word(slot, old) ^ fingerprint_word(slot, new);
+        }
+    }
+
+    fn put_render(&mut self, index: usize, value: u32) {
+        let old = std::mem::replace(&mut self.render[index], value);
+        self.track(index as u64, old, value);
+    }
+
+    fn put_tss(&mut self, stage: usize, index: usize, value: u32) {
+        let old = std::mem::replace(&mut self.tss[stage][index], value);
+        self.track(FP_TSS + (stage * 33 + index) as u64, old, value);
+    }
+
+    fn put_sampler(&mut self, sampler: usize, index: usize, value: u32) {
+        let old = std::mem::replace(&mut self.sampler[sampler][index], value);
+        self.track(FP_SAMPLER + (sampler * 14 + index) as u64, old, value);
+    }
+
+    fn put_texture(&mut self, stage: usize, id: u32) {
+        let old = std::mem::replace(&mut self.textures[stage], id);
+        self.track(FP_TEXTURE + stage as u64, old, id);
+    }
+
+    fn put_stream(&mut self, stream: usize, source: StreamSource) {
+        let old = std::mem::replace(&mut self.streams[stream], source);
+        self.track(FP_STRIDE + stream as u64, old.stride, source.stride);
+    }
+
+    fn put_stream_freq(&mut self, stream: usize, divider: u32) {
+        let old = std::mem::replace(&mut self.stream_freq[stream], divider);
+        self.track(FP_FREQ + stream as u64, old, divider);
+    }
+
+    fn put_declaration(&mut self, handle: u32, fvf: u32) {
+        let old = std::mem::replace(&mut self.declaration, handle);
+        self.track(FP_DECLARATION, old, handle);
+        let old = std::mem::replace(&mut self.fvf, fvf);
+        self.track(FP_FVF, old, fvf);
+    }
+
+    fn put_shader(&mut self, pixel: bool, handle: u32) {
+        let (field, slot) = if pixel {
+            (&mut self.pixel_shader, FP_PIXEL_SHADER)
+        } else {
+            (&mut self.vertex_shader, FP_VERTEX_SHADER)
+        };
+        let old = std::mem::replace(field, handle);
+        self.track(slot, old, handle);
+    }
+
+    fn full_fingerprint(&self) -> u64 {
+        let mut hash = 0;
+        for (index, &value) in self.render.iter().enumerate() {
+            hash ^= fingerprint_word(index as u64, value);
+        }
+        for (stage, row) in self.tss.iter().enumerate() {
+            for (index, &value) in row.iter().enumerate() {
+                hash ^= fingerprint_word(FP_TSS + (stage * 33 + index) as u64, value);
+            }
+        }
+        for (sampler, row) in self.sampler.iter().enumerate() {
+            for (index, &value) in row.iter().enumerate() {
+                hash ^= fingerprint_word(FP_SAMPLER + (sampler * 14 + index) as u64, value);
+            }
+        }
+        for stage in 0..MAX_SAMPLERS {
+            hash ^= fingerprint_word(FP_TEXTURE + stage as u64, self.textures[stage]);
+        }
+        for stream in 0..MAX_STREAMS {
+            hash ^= fingerprint_word(FP_STRIDE + stream as u64, self.streams[stream].stride);
+            hash ^= fingerprint_word(FP_FREQ + stream as u64, self.stream_freq[stream]);
+        }
+        hash ^ fingerprint_word(FP_DECLARATION, self.declaration)
+            ^ fingerprint_word(FP_FVF, self.fvf)
+            ^ fingerprint_word(FP_VERTEX_SHADER, self.vertex_shader)
+            ^ fingerprint_word(FP_PIXEL_SHADER, self.pixel_shader)
     }
 
     pub(crate) fn texture_stage_raw(&self, stage: u32, state: u32) -> u32 {
@@ -828,10 +905,7 @@ impl D3d9State {
                 .unwrap()
                 .set_sampler(sampler, state, value);
         } else {
-            if self.sampler[sampler as usize][state as usize] != value {
-                self.sampler[sampler as usize][state as usize] = value;
-                self.pipeline_generation += 1;
-            }
+            self.put_sampler(sampler as usize, state as usize, value);
         }
         Ok(())
     }
@@ -1139,10 +1213,7 @@ impl D3d9State {
         if self.recording.is_some() {
             self.recording.as_mut().unwrap().set_texture(stage, id);
         } else {
-            if self.textures[stage as usize] != id {
-                self.textures[stage as usize] = id;
-                self.pipeline_generation += 1;
-            }
+            self.put_texture(stage as usize, id);
         }
         Ok(())
     }
@@ -1182,10 +1253,7 @@ impl D3d9State {
                 block.streams.push((stream, source));
             }
         } else {
-            if self.streams[stream as usize].stride != source.stride {
-                self.pipeline_generation += 1;
-            }
-            self.streams[stream as usize] = source;
+            self.put_stream(stream as usize, source);
         }
         Ok(())
     }
@@ -1231,10 +1299,7 @@ impl D3d9State {
                 .unwrap()
                 .set_stream_freq(stream, divider);
         } else {
-            if self.stream_freq[stream as usize] != divider {
-                self.stream_freq[stream as usize] = divider;
-                self.pipeline_generation += 1;
-            }
+            self.put_stream_freq(stream as usize, divider);
         }
         Ok(())
     }
@@ -1263,11 +1328,7 @@ impl D3d9State {
             block.declaration = Some(handle);
             block.fvf = Some(fvf);
         } else {
-            if self.declaration != handle || self.fvf != fvf {
-                self.declaration = handle;
-                self.fvf = fvf;
-                self.pipeline_generation += 1;
-            }
+            self.put_declaration(handle, fvf);
         }
     }
 
@@ -1287,14 +1348,8 @@ impl D3d9State {
             } else {
                 block.vertex_shader = Some(handle);
             }
-        } else if pixel {
-            if self.pixel_shader != handle {
-                self.pixel_shader = handle;
-                self.pipeline_generation += 1;
-            }
-        } else if self.vertex_shader != handle {
-            self.vertex_shader = handle;
-            self.pipeline_generation += 1;
+        } else {
+            self.put_shader(pixel, handle);
         }
     }
 
@@ -1723,7 +1778,6 @@ impl D3d9State {
             ));
         }
         block.apply_to(self);
-        self.pipeline_generation += 1;
         self.blocks.insert(handle, block);
         Ok(())
     }
@@ -1764,14 +1818,12 @@ impl D3d9State {
         let blocks = std::mem::take(&mut self.blocks);
         let next_block = self.next_block;
         let recording_handle = self.recording_handle;
-        let generation = self.pipeline_generation;
         drop(blocks);
         *self = Self::default();
         self.target_width = target_width;
         self.target_height = target_height;
         self.next_block = next_block;
         self.recording_handle = recording_handle;
-        self.pipeline_generation = generation + 1;
     }
 
     pub fn has_live_state_blocks(&self) -> bool {
@@ -1779,13 +1831,11 @@ impl D3d9State {
     }
 
     pub fn clear_up_stream(&mut self) {
-        self.streams[0] = StreamSource::default();
-        self.pipeline_generation += 1;
+        self.put_stream(0, StreamSource::default());
     }
 
     pub fn clear_up_indexed(&mut self) {
-        self.streams[0] = StreamSource::default();
-        self.pipeline_generation += 1;
+        self.put_stream(0, StreamSource::default());
         self.indices = 0;
     }
 
@@ -1911,12 +1961,28 @@ pub(crate) struct EffectSnapshot {
 impl EffectSnapshot {
     pub(crate) fn restore(&self, state: &mut D3d9State) {
         self.block.apply_to(state);
-        state.pipeline_generation += 1;
     }
 
     pub(crate) fn bindings(&self) -> D3d9Bindings {
         self.block.bindings()
     }
+}
+
+const FP_TSS: u64 = 256;
+const FP_SAMPLER: u64 = 1024;
+const FP_TEXTURE: u64 = 2048;
+const FP_STRIDE: u64 = 2112;
+const FP_FREQ: u64 = 2176;
+const FP_DECLARATION: u64 = 2240;
+const FP_FVF: u64 = 2241;
+const FP_VERTEX_SHADER: u64 = 2242;
+const FP_PIXEL_SHADER: u64 = 2243;
+
+fn fingerprint_word(slot: u64, value: u32) -> u64 {
+    let mut z = (slot << 32 | u64::from(value)).wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 fn transform_index(state: u32) -> Option<u32> {

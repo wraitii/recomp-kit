@@ -362,6 +362,7 @@ pub struct D3dxEffect {
     children: RefCell<ChildState>,
     param_names: FastMap<Vec<u8>, usize>,
     pass_version: u64,
+    command_capacity: usize,
     targets: RefCell<FastMap<u32, ParamTarget>>,
 }
 
@@ -389,6 +390,7 @@ impl Default for D3dxEffect {
             children: RefCell::new(ChildState::default()),
             param_names: Default::default(),
             pass_version: 0,
+            command_capacity: 0,
             targets: RefCell::default(),
         }
     }
@@ -2696,21 +2698,18 @@ impl RegisterLayout {
     }
 
     fn fill(&self, data: &[u8], out: &mut [f32], convert: impl Fn(u32) -> f32) {
+        let step = if self.columns { self.cols * 4 } else { 4 };
         for (register, slot) in out.chunks_exact_mut(4).enumerate() {
             let element = register / self.stride;
             let register = register % self.stride;
             if register >= self.valid {
                 continue;
             }
-            for (lane, value) in slot[..self.lanes].iter_mut().enumerate() {
-                let index = self.index(element, register, lane) * 4;
-                let word = u32::from_le_bytes([
-                    data[index],
-                    data[index + 1],
-                    data[index + 2],
-                    data[index + 3],
-                ]);
-                *value = convert(word);
+            let mut index = self.index(element, register, 0) * 4;
+            for value in &mut slot[..self.lanes] {
+                let word: [u8; 4] = data[index..index + 4].try_into().expect("four bytes");
+                *value = convert(u32::from_le_bytes(word));
+                index += step;
             }
         }
     }
@@ -3805,7 +3804,7 @@ fn prepare_pass(
     };
     let manager = effect.manager_mode;
     let mut commands = if manager {
-        Vec::with_capacity(states.len() * 2)
+        Vec::with_capacity(effect.command_capacity.max(states.len() * 2))
     } else {
         Vec::new()
     };
@@ -3822,6 +3821,7 @@ fn prepare_pass(
             }
         }
         effect.pass_version = ctx.now;
+        effect.command_capacity = effect.command_capacity.max(commands.len());
         effect.batch = Some(if commit {
             EffectBatch::Commit
         } else {
