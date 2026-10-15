@@ -885,7 +885,7 @@ bool export_profile(const std::string &profile_dir, const std::string &zip_path,
     bool ok = true;
     for (const Entry &e : entries) {
         const std::string top = e.relative.substr(0, e.relative.find('/'));
-        bool skipped = junk(e.relative);
+        bool skipped = junk(e.relative) || same_name(top, "session.lock");
         for (const std::string &s : skip)
             skipped |= wildcard_match(s.c_str(), top.c_str());
         if (skipped || e.is_dir)
@@ -920,7 +920,8 @@ bool import_profile(const std::string &zip_path, const std::string &profile_dir,
         return false;
     const std::string root = normalize(profile_dir);
     for (const Entry &e : entries) {
-        if (e.is_dir || junk(e.relative))
+        if (e.is_dir || junk(e.relative) ||
+            same_name(e.relative.substr(0, e.relative.find('/')), "session.lock"))
             continue;
         const std::string target = join(root, e.relative);
         mkdirs(parent_of(target));

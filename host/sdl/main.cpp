@@ -20,6 +20,7 @@
 #include "../../mods/display_settings.h"
 #include "game_config.h"
 #include "../../runtime/layout.h"
+#include "../../runtime/key_names.h"
 #include "../../platform/os.h"
 #include "../audio.h"
 #include "../audio_capture.h"
@@ -28,6 +29,7 @@
 #include "../../runtime/display_seam.h"
 #include "../d3d_render.h"
 #include "../game_path.h"
+#include "../preferences.h"
 #include "../launcher/launcher_sdl.h"
 #include "../gpu/gpu_factory.h"
 #include "../input.h"
@@ -66,6 +68,9 @@
 #include <string.h>
 
 #include <atomic>
+#include <cerrno>
+#include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -476,6 +481,7 @@ void update_native_cursor() {
     }
 }
 bool g_relative_mouse = false;
+double g_mouse_sensitivity = 1.0;
 // Preserve each game's prior capture mode explicitly instead of inferring it
 // from a private guest cursor hook.
 constexpr bool kRelativeMouseCapture = RECOMP_INPUT_RELATIVE_MOUSE_CAPTURE != 0;
@@ -704,8 +710,9 @@ void handle_mouse_move(const SDL_MouseMotionEvent &motion) {
     PendingInput e;
     if (g_relative_mouse) {
         e.kind = PendingInput::RELATIVE_MOTION;
-        e.dx = motion.xrel;
-        e.dy = motion.yrel;
+        const double sensitivity = motion.which == SDL_TOUCH_MOUSEID ? 1.0 : g_mouse_sensitivity;
+        e.dx = motion.xrel * sensitivity;
+        e.dy = motion.yrel * sensitivity;
         queue_or_apply(e);
         return;
     }
@@ -1327,6 +1334,9 @@ void handle_event(const SDL_Event &event) {
             break;
         handle_key(event.key, event.type == SDL_EVENT_KEY_DOWN);
         break;
+    case SDL_EVENT_KEYMAP_CHANGED:
+        host_key_names_refresh();
+        break;
     case SDL_EVENT_WINDOW_FOCUS_LOST:
         trace_state("focus LOST");
         controls::host_set_focused(false);
@@ -1938,6 +1948,7 @@ int main(int argc, char **argv) {
     // packaged build can be checked on a machine with neither a display nor
     // the game.
     const char *exe_flag = nullptr;
+    bool configure_requested = false;
     if (const char *v = recomp_env("MAX_FRAMES"))
         g_run_max_frames = (uint32_t)strtoul(v, nullptr, 0);
     if (const char *v = recomp_env("MAX_SECONDS"))
@@ -1959,9 +1970,11 @@ int main(int argc, char **argv) {
             exe_flag = argv[i] + 6;
         else if (strcmp(argv[i], "--launcher") == 0)
             continue; // launcher::requested reads it
+        else if (strcmp(argv[i], "--configure") == 0)
+            configure_requested = true;
         else {
             fprintf(stderr, "usage: " RECOMP_APP_NAME " [--exe <" RECOMP_EXECUTABLE
-                            ">] [--launcher] [--version] [--probe-layout]\n");
+                            ">] [--launcher] [--configure] [--version] [--probe-layout]\n");
             return 2;
         }
     }
@@ -1995,7 +2008,8 @@ int main(int argc, char **argv) {
             SDL_Log("[android] game data: %s", game.exe.c_str());
     }
 #else
-    GamePath game = platform_ui_resolve_game(exe_flag, &game_error);
+    GamePath game =
+        configure_requested ? GamePath{} : platform_ui_resolve_game(exe_flag, &game_error);
 #endif
     if (!game_error.empty()) {
 #ifdef __ANDROID__
@@ -2021,6 +2035,50 @@ int main(int argc, char **argv) {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, RECOMP_APP_NAME ": SDL_Init failed: %s\n", SDL_GetError());
         return 3;
+    }
+
+    std::error_code profile_error;
+    std::filesystem::create_directories(host_layout().profile_dir, profile_error);
+    std::unique_ptr<OsFileLock, decltype(&os_file_unlock)> profile_lock(
+        profile_error ? nullptr
+                      : os_file_lock((host_layout().profile_dir + "/session.lock").c_str()),
+        os_file_unlock);
+    if (!profile_lock) {
+        const bool busy = !profile_error && (errno == EWOULDBLOCK || errno == EAGAIN);
+        const std::string message =
+            busy ? "This game's profile is already in use. Close the game or its Configure window, "
+                   "then try again."
+                 : "The game's profile folder could not be opened for writing: " +
+                       host_layout().profile_dir;
+        fprintf(stderr, "[host] %s\n", message.c_str());
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, RECOMP_GAME_NAME, message.c_str(), nullptr);
+        SDL_Quit();
+        return 2;
+    }
+    std::string preferences_error;
+    if (!host_preferences::load(&preferences_error)) {
+        fprintf(stderr, "[host] %s\n", preferences_error.c_str());
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, RECOMP_GAME_NAME, preferences_error.c_str(),
+                                 nullptr);
+        SDL_Quit();
+        return 2;
+    }
+    host_key_names_refresh();
+    guest_key_names_set_provider(host_key_name_from_dik);
+    if (configure_requested) {
+        const std::string title = std::string("Configure ") + RECOMP_GAME_NAME;
+        SDL_Window *window = SDL_CreateWindow(title.c_str(), 800, 620,
+                                              SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+        if (!window) {
+            fprintf(stderr, "[configure] %s\n", SDL_GetError());
+            SDL_Quit();
+            return 3;
+        }
+        SDL_SetWindowMinimumSize(window, 640, 520);
+        const bool configured = launcher::configure(window, nullptr, nullptr);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return configured ? 0 : 2;
     }
 
     g_gpu = gpu::create_default_device();
@@ -2103,6 +2161,20 @@ int main(int argc, char **argv) {
         }
     }
     std::string exe = game.exe;
+    if (!host_preferences::reload(&preferences_error)) {
+        fprintf(stderr, "[host] %s\n", preferences_error.c_str());
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, RECOMP_GAME_NAME, preferences_error.c_str(),
+                                 g_window);
+        return 2;
+    }
+    guest_key_names_use_system(host_preferences::keyboard_names() ==
+                               host_preferences::KeyboardNames::System);
+    g_mouse_sensitivity = host_preferences::mouse_sensitivity() / 100.0;
+    SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE,
+                host_preferences::mouse_acceleration() ==
+                        host_preferences::MouseAcceleration::System
+                    ? "1"
+                    : "0");
 
     // The renderer first: the presenter shares its device, so a present
     // cannot run ahead of the scene it is showing.

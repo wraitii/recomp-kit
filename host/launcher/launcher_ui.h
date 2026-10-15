@@ -93,6 +93,7 @@ enum Action : int {
     kDeleteData,
     kOpenFolder,
     kStore,
+    kConfigure,
     kBack,
     kCancel,
     kOk,
@@ -130,6 +131,9 @@ class Launcher {
     }
     void key(Key k);
     void activate(int id);
+    void show_message(const std::string &text) {
+        show(text);
+    }
     void tick(); // picker results and import progress, on the host's thread
     void draw(Canvas &canvas, int scale);
 
@@ -138,6 +142,12 @@ class Launcher {
     }
     bool quit() const {
         return quit_;
+    }
+    bool configure_requested() const {
+        return configure_requested_;
+    }
+    void clear_configure_request() {
+        configure_requested_ = false;
     }
     std::string exe() const {
         return status_.exe;
@@ -182,6 +192,7 @@ class Launcher {
     int columns_ = 1; // Up and Down move a whole row
     int pressed_ = -1;
     bool finished_ = false, quit_ = false, dirty_ = true, confirm_delete_ = false;
+    bool configure_requested_ = false;
     double countdown_ = 0;
     std::string unplayable_;
     Picked importing_;

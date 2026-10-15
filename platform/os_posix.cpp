@@ -16,6 +16,7 @@
 #include <strings.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -233,6 +234,30 @@ int os_listdir(const char *dir, OsListDirFn fn, void *user) {
 }
 int os_mkstemp(char *template_path) {
     return mkstemp(template_path);
+}
+
+struct OsFileLock {
+    int fd;
+};
+
+OsFileLock *os_file_lock(const char *path) {
+    int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return nullptr;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        const int error = errno;
+        close(fd);
+        errno = error;
+        return nullptr;
+    }
+    return new OsFileLock{fd};
+}
+
+void os_file_unlock(OsFileLock *lock) {
+    if (lock) {
+        close(lock->fd);
+        delete lock;
+    }
 }
 
 int os_mkdtemp(char *template_path) {

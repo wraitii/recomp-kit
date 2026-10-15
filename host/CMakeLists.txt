@@ -194,7 +194,8 @@ endif()
 # the launcher's (host/launcher/launcher_sdl.h; iPadOS keeps its own in
 # platform_ui_ios.mm).
 set(RECOMP_LAUNCHER_SOURCES $<TARGET_OBJECTS:launcher_core> $<TARGET_OBJECTS:recomp_miniz>
-                         ${HOST}/launcher/launcher_config.cpp ${HOST}/launcher/launcher_sdl.cpp)
+                         ${HOST}/launcher/launcher_config.cpp ${HOST}/launcher/launcher_sdl.cpp
+                         ${HOST}/launcher/configure_ui.cpp ${HOST}/preferences.cpp)
 if(IOS)
   set(RECOMP_PLATFORM_UI ${HOST}/sdl/platform_ui_ios.mm)
   list(APPEND FW_METAL "-framework UIKit" "-framework UniformTypeIdentifiers" "-framework CoreHaptics")
