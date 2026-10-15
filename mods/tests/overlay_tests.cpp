@@ -59,6 +59,8 @@ void layers() {
     mods_overlay_reset();
 
     std::string base = ROOT;
+    write_file(base + "/game/data/fromgame.txt", "game");
+    win32_init((base + "/game").c_str());
     write_file(base + "/profile/data/shared.txt", "profile");
     write_file(base + "/moda/data/shared.txt", "mod-a");
     write_file(base + "/moda/data/froma.txt", "a");
@@ -89,7 +91,7 @@ MOD_TEST_SUITE(overlay_read_precedence) {
     MOD_CHECK(read_file(win32_host_path_op("DATA\\FROMA.TXT", WIN32_FILE_READ)) == "a");
     MOD_CHECK(read_file(win32_host_path_op("data\\fromb.txt", WIN32_FILE_READ)) == "b");
     // The GOG folder is last but reachable.
-    std::string level = win32_host_path_op("levels\\levl2001.dat", WIN32_FILE_READ);
+    std::string level = win32_host_path_op("data\\fromgame.txt", WIN32_FILE_READ);
     MOD_CHECK(level.find(win32_game_dir()) == 0);
 }
 
@@ -110,7 +112,7 @@ MOD_TEST_SUITE(overlay_never_mutates_a_lower_tier) {
     MOD_CHECK(read_file(std::string(ROOT) + "/moda/data/froma.txt") == "a");
 
     // The same for a GOG file: the original is never opened for writing.
-    std::string gog = win32_host_path_op("levels\\levl2001.dat", WIN32_FILE_WRITE);
+    std::string gog = win32_host_path_op("data\\fromgame.txt", WIN32_FILE_WRITE);
     MOD_CHECK(gog.find(mods_overlay_profile_dir()) == 0);
     MOD_CHECK(gog.find(win32_game_dir()) != 0);
 
@@ -124,12 +126,12 @@ MOD_TEST_SUITE(overlay_never_mutates_a_lower_tier) {
         fclose(f);
 
     // And the same through the guest's own API, which is what actually matters.
-    uint32_t name = mod_test_put_str("levels\\levl2001.dat");
+    uint32_t name = mod_test_put_str("data\\fromgame.txt");
     uint32_t h =
         mod_test_call_import(c, "KERNEL32.dll", "CreateFileA", {name, 0x40000000u, 0, 0, 3, 0, 0});
     MOD_CHECK(h != 0xffffffffu);
     // Whatever handle it got, it is not the GOG file.
-    MOD_CHECK(win32_host_path_op("levels\\levl2001.dat", WIN32_FILE_WRITE).find(win32_game_dir()) !=
+    MOD_CHECK(win32_host_path_op("data\\fromgame.txt", WIN32_FILE_WRITE).find(win32_game_dir()) !=
               0);
     mod_test_call_import(c, "KERNEL32.dll", "CloseHandle", {h});
 }
@@ -142,7 +144,7 @@ MOD_TEST_SUITE(overlay_deletes_reach_the_profile_only) {
     // A file only a mod has: nothing in the profile to delete, and v1 has no
     // tombstones, so it cannot be hidden either.
     MOD_CHECK(win32_host_path_op("data\\fromb.txt", WIN32_FILE_DELETE).empty());
-    MOD_CHECK(win32_host_path_op("levels\\levl2001.dat", WIN32_FILE_DELETE).empty());
+    MOD_CHECK(win32_host_path_op("data\\fromgame.txt", WIN32_FILE_DELETE).empty());
     MOD_CHECK(read_file(win32_host_path_op("data\\fromb.txt", WIN32_FILE_READ)) == "b");
     // A file the profile does have deletes from there, and the mod's copy is
     // then what a read finds.

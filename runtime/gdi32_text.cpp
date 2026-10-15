@@ -592,6 +592,7 @@ void register_text() {
                                        G("ExtTextOutA", 8, ext_text_out_a),
                                        G("ExtTextOutW", 8, ext_text_out_w),
                                        G("GetTextExtentPoint32W", 4, extent),
+                                       G("GetTextExtentPoint32A", 4, imports_unsupported),
                                        G("GetTextExtentPointW", 4, extent),
                                        G("GetTextMetricsW", 2, get_metrics),
                                        G("GetOutlineTextMetricsA", 3, outline_text_metrics),

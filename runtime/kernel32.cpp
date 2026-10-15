@@ -5512,6 +5512,13 @@ void k_SleepEx(X86 *c) {
 }
 
 const ImportShim g_kernel32_shims[] = {
+    {"KERNEL32.dll", "DosDateTimeToFileTime", 3, imports_unsupported},
+    {"KERNEL32.dll", "GetConsoleMode", 2, imports_unsupported},
+    {"KERNEL32.dll", "LocalFileTimeToFileTime", 2, imports_unsupported},
+    {"KERNEL32.dll", "ReadConsoleInputA", 4, imports_unsupported},
+    {"KERNEL32.dll", "SetConsoleMode", 2, imports_unsupported},
+    {"KERNEL32.dll", "SetEnvironmentVariableW", 2, imports_unsupported},
+    {"KERNEL32.dll", "WriteConsoleA", 5, imports_unsupported},
     // memory
     {"KERNEL32.dll", "HeapCreate", 3, k_HeapCreate},
     {"KERNEL32.dll", "HeapDestroy", 1, k_HeapDestroy},

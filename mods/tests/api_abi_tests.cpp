@@ -19,7 +19,9 @@ MOD_TEST_SUITE(api_abi) {
     MOD_CHECK_EQ(offsetof(PopModApi, hook_install_at_callsite), 320u);
     MOD_CHECK_EQ(offsetof(PopModApi, hook_install_ex), 328u);
     MOD_CHECK_EQ(offsetof(PopModApi, texture_override_provider_ex), 336u);
-    MOD_CHECK_EQ(sizeof(PopModApi), 344u);
+    MOD_CHECK_EQ(offsetof(PopModApi, guest_call), 344u);
+    MOD_CHECK_EQ(offsetof(PopModApi, screen_size), 352u);
+    MOD_CHECK_EQ(sizeof(PopModApi), 360u);
 
     pop_cpu_v1 cpu;
     pop_cpu_v1_init(&cpu);

@@ -29,6 +29,7 @@ def write(out):
     }
     T.emit_body_chunks(out, functions, bodies, {}, dependencies)
     T.emit_entry_chunks(out, addresses)
+    (out / "fixture_overrides.h").write_text("#define FN_0d001000 fixture_native\n")
     (out / "fixture_table.c").write_text('''#include "x86.h"
 void fn_0d001000(X86 *c);
 void fn_0d001010(X86 *c);
@@ -44,6 +45,7 @@ void (*const recomp_raw_ptrs[])(X86 *) = {
     fn_0d001000, fn_0d001010, fn_0d001020, fn_0d001030
 };
 uint8_t recomp_hooked[4] = {0};
+uint8_t recomp_slow[4] = {0};
 RecompHookFn recomp_hook_ptrs[4] = {0};
 ''' + T.emit_entry_dispatch())
 

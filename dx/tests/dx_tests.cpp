@@ -6058,7 +6058,7 @@ static void test_unchanged_state_produces_no_buffered_event() {
         CHECK_EQ(call_method(kb, 5 /* GetProperty */, {20, ks}), DI_OK);
         CHECK_EQ(rd16(ks + 16), uint32_t('C'));
         CHECK_EQ(rd16(ks + 18), uint32_t('t'));
-        wr32(ks + 8, 0x56); // not a key the table names
+        wr32(ks + 8, 0xffffffffu); // outside the keyboard scan-code table
         CHECK_EQ(call_method(kb, 5, {20, ks}), 0x80070490u);
     }
     CHECK_EQ(call_method(kb, DID_Acquire, {}), DI_OK);
@@ -6659,7 +6659,7 @@ static void test_d3d7_translation() {
     CHECK_EQ(d3d7_translate_texture_stage_state(28, t), 1);
     CHECK_EQ(t[0], 28u);
     CHECK_EQ(d3d7_translate_texture_stage_state(29, t), -1);
-    CHECK_EQ(d3d7_translate_texture_stage_state(0, t), -1);
+    CHECK_EQ(d3d7_translate_texture_stage_state(0, t), 0);
 
     // ---- 8:8:8 -> 5:6:5 truncates the low bits (the boundary copy).
     CHECK_EQ(d3d7_rgb888_to_rgb565(0x00000000u), 0x0000u);
@@ -8346,8 +8346,10 @@ static uint32_t g_ds8_enum_calls;
 
 static void ds8_enum_callback(X86 *c) {
     ++g_ds8_enum_calls;
-    CHECK_EQ(arg(c, 0), 0u); // the primary device has no GUID
-    const char *expected[] = {"Primary Sound Driver", "dsound.dll"};
+    CHECK(g_ds8_enum_calls <= 2);
+    CHECK((arg(c, 0) == 0) == (g_ds8_enum_calls == 1));
+    const char *expected[] = {
+        g_ds8_enum_calls == 1 ? "Primary Sound Driver" : "Recomp Software Playback", "dsound.dll"};
     for (unsigned n = 0; n < 2; ++n) {
         uint32_t str = arg(c, n + 1);
         for (unsigned j = 0; j <= strlen(expected[n]); ++j)
@@ -8384,7 +8386,7 @@ static void test_dsound8() {
     uint32_t cb = imports_alloc_trampoline("TEST", "DSEnum", ds8_enum_callback, 4);
     g_ds8_enum_calls = 0;
     CHECK_EQ(call_shim(tramp("DSOUND.dll", "ord2"), {cb, 0x12345678u}), DS_OK);
-    CHECK_EQ(g_ds8_enum_calls, 1u);
+    CHECK_EQ(g_ds8_enum_calls, 2u);
     CHECK_EQ(call_shim(tramp("DSOUND.dll", "ord2"), {0, 0}), DSERR_INVALIDPARAM);
 }
 
@@ -9101,9 +9103,11 @@ static void test_mss32_sample() {
         if (dest == sc(0x500)) {
             CHECK_EQ(loaded, dest);
         } else {
-            CHECK_EQ(heap_size(loaded), 52u);
+            uint32_t block = rd32(loaded - 4);
+            CHECK_EQ(loaded & 31u, 0u);
+            CHECK_EQ(heap_size(block), 84u);
             call_shim(tramp("mss32.dll", "_AIL_mem_free_lock@4"), {loaded});
-            CHECK(!heap_owns(loaded));
+            CHECK(!heap_owns(block));
         }
     }
     CHECK_EQ(call_shim(read, {name, GUEST_SIZE - 1}), 0u);

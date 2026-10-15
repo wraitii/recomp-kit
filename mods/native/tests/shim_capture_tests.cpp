@@ -92,6 +92,7 @@ bool prepare_capture_hooks() {
     prepare();
     sched_set_guest_thread(true);
     mods_hooks_reset();
+    mods_hooks_arm();
     const bool loaded = loader_load(nullptr);
     MOD_CHECK(loaded);
     if (!loaded)

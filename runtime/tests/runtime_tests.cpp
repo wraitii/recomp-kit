@@ -9,6 +9,7 @@
 #include "../mods_seam.h"
 #include "../intrinsics.h"
 #include "../interp.h"
+#include "../thunks.h"
 #include "../loader.h"
 #include "../discovery.h"
 #include "../memory.h"
@@ -3044,8 +3045,9 @@ static void test_scheduling(X86 *c) {
     while (wall_seconds() - t0 < 0.05)
         recomp_execution_checkpoint(c);
     check(g_service_loops > before, "translated-call polling lets the service worker advance");
+    saved_cpu.checkpoint_countdown = c->checkpoint_countdown;
     check(memcmp(c, &saved_cpu, sizeof(*c)) == 0,
-          "translated checkpoints preserve the polling thread's complete CPU");
+          "translated checkpoints preserve guest CPU state apart from their host countdown");
     *c = original_cpu;
     before = g_service_loops;
     sched_atomic_enter(c->r[R_ESP]);
@@ -3529,8 +3531,9 @@ static void test_guest_thunks(X86 *c) {
     wr32(sp - 4, g_fake_ret);
     wr32(sp - 8, 0xaabbccdd);
     hits = thunk_hits;
-    recomp_unknown_call(c, code + 96);
-    check(thunk_hits == hits && c->r[R_ESP] == sp && rd32(sp - 8) == 0xaabbccdd,
+    check(!recomp_run_thunk(c, code + 96) && !interp_call(c, code + 96),
+          "both decoders refuse the unsupported routine");
+    check(thunk_hits == hits && c->r[R_ESP] == sp - 4 && rd32(sp - 8) == 0xaabbccdd,
           "an undecodable routine leaves no speculative PUSH before the unknown-call fallback");
     c->r[R_ESP] = sp;
     // Exercise the remaining opcode forms from a stack-resident thunk.
@@ -3877,34 +3880,23 @@ static void test_intrinsics(X86 *c) {
     c->r[R_ESP] = esp0;
 }
 
-// A call the runtime cannot deliver must still consume the pushed return
-// address, or every frame after it is displaced by four bytes.
 static void test_undeliverable_calls(X86 *c) {
-    section("undeliverable calls behave as a RET");
+    section("undeliverable calls fail explicitly");
+    char exe[4096];
+    check(os_exe_path(exe, sizeof exe) == 0, "unknown-call tests know their executable");
+    for (const char *mode : {"unknown", "shim"}) {
+        const char *args[] = {exe, "--child-undeliverable", mode, nullptr};
+        int64_t pid = 0;
+        int code = -1;
+        check(os_spawn(args, &pid) == 0 && os_wait(pid, &code) == 0 && code == 134,
+              "%s dispatch aborts instead of inventing a return value (exit %d)", mode, code);
+    }
     uint32_t esp0 = c->r[R_ESP];
-
-    uint32_t sp = esp0 - 4;
-    wr32(sp, 0x00401234);
-    c->r[R_ESP] = sp;
-    recomp_unknown_call(c, 0x00abcdef);
-    check(c->r[R_ESP] == esp0 && c->eip == 0x00401234 && c->r[R_EAX] == 0,
-          "recomp_unknown_call popped the return address and resumed at %08x", c->eip);
-
-    sp = esp0 - 4;
-    wr32(sp, 0x00405678);
-    c->r[R_ESP] = sp;
-    recomp_unknown_call(c, 0x0fdfff00); // the callback return sentinel
+    wr32(esp0 - 4, 0x00405678);
+    c->r[R_ESP] = esp0 - 4;
+    recomp_unknown_call(c, GUEST_RETURN_SENTINEL);
     check(c->r[R_ESP] == esp0 && c->eip == 0x00405678,
-          "so does a call to the callback return sentinel");
-
-    sp = esp0 - 4;
-    wr32(sp, 0x00409abc);
-    c->r[R_ESP] = sp;
-    recomp_shim_call(c, 0x0ff00000 + 16 * 4000); // in range, never allocated
-    check(c->r[R_ESP] == esp0 && c->eip == 0x00409abc && c->r[R_EAX] == 0,
-          "so does a shim call to an unallocated trampoline");
-
-    c->r[R_ESP] = esp0;
+          "a callback return sentinel still consumes its saved return address");
 }
 
 // Synthetic named bitmap in the loaded PE's resource arena. Restore every
@@ -7580,6 +7572,9 @@ static void test_auxiliary_modules() {
     check(loader_module_count() == RECOMP_AUX_MODULE_COUNT, "%u auxiliary modules mapped",
           loader_module_count());
     for (uint32_t i = 0; const LoaderModule *m = loader_module(i); ++i) {
+        LoaderModule *mapped = loader_module_named(m->name.c_str());
+        LoaderModule saved = *mapped;
+        mapped->entry = 0;
         gm_put_wstr(s, m->name.c_str(), 64);
         gm_put_str(s + 128, m->name.c_str(), 64);
         uint32_t h = call_import(&c, "KERNEL32.dll", "LoadLibraryW", {s});
@@ -7615,8 +7610,10 @@ static void test_auxiliary_modules() {
         gm_put_str(s + 256, "no-such-export", 64);
         check(call_import(&c, "KERNEL32.dll", "GetProcAddress", {h, s + 256}) == 0,
               "GetProcAddress(%s, no-such-export) -> 0", m->name.c_str());
-        if (!m->export_rva)
+        if (!m->export_rva) {
+            *mapped = saved;
             continue;
+        }
         uint32_t dir = m->base + m->export_rva;
         uint32_t nnames = rd32(dir + 24), names = rd32(dir + 32);
         for (uint32_t n = 0; n < nnames && n < 4; ++n) {
@@ -7631,6 +7628,7 @@ static void test_auxiliary_modules() {
         check(recomp_module_containing(m->base) == nullptr ||
                   recomp_module_containing(m->base)->base == m->base,
               "a registered translation of %s agrees on its base", m->name.c_str());
+        *mapped = saved;
     }
 }
 
@@ -7982,6 +7980,17 @@ int main(int argc, char **argv) {
         uint32_t target = imports_alloc_trampoline("STRICT.dll", "Probe", nullptr, ARGC_UNKNOWN);
         imports_dispatch(&c, target);
         return 0;
+    }
+    if (argc == 3 && !strcmp(argv[1], "--child-undeliverable")) {
+        mem_init();
+        imports_init();
+        X86 c;
+        loader_init_context(&c);
+        if (!strcmp(argv[2], "shim"))
+            recomp_shim_call(&c, 0x0ff00000 + 16 * 4000);
+        else
+            recomp_unknown_call(&c, GUEST_SIZE + 4);
+        return 1;
     }
     const bool unsupported_child = argc > 3 && strcmp(argv[1], "--child-unsupported") == 0;
     const bool child = argc > 1 && strcmp(argv[1], "--child-setjmp-abort") == 0;

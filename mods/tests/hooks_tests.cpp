@@ -51,6 +51,7 @@ void reset_world() {
     g_log.clear();
     mods_set_context_provider(test_provider);
     mods_hooks_reset();
+    mods_hooks_arm();
     mem_init();
     loader_load(nullptr);
     MOD_CHECK(mods_symbols_load(nullptr));
@@ -176,14 +177,23 @@ MOD_TEST_SUITE(hook_guest_call_import_preserves_registers) {
 extern "C" uint64_t mods_view_test_push_count();
 MOD_TEST_SUITE(hook_callsite_filter_snapshot_and_entry_identity) {
     reset_world();
-    constexpr uint32_t target = 0x401000, match = 0x517613, other = 0x5176d7;
+    const uint32_t target = OUTER;
+    constexpr uint32_t match = RET_ADDR, other = RET_ADDR + 4;
     uint32_t ids[3]{};
+    uint32_t replacement = 0;
+    MOD_CHECK_EQ(mods_hook_install(
+                     0, target,
+                     [](const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
+                         MOD_CHECK_EQ(api->hook_return(api, cpu, 100, 0), POP_OK);
+                     },
+                     POP_HOOK_REPLACE, nullptr, &replacement),
+                 POP_OK);
     auto before = [](const PopModApi *, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
         note("before");
         MOD_CHECK_EQ(mods_view_depth(), 1u);
         // AFTER/WRAP filtering must use entry identity even if BEFORE changes
         // the guest return address. The original RET must still see the edit.
-        wr32(cpu->esp, 0x5176d7);
+        wr32(cpu->esp, RET_ADDR + 4);
     };
     auto wrap = [](const PopModApi *a, pop_cpu_v1 *cpu, PopHookInvocation *inv, void *) {
         note("wrap-in");
@@ -222,7 +232,7 @@ MOD_TEST_SUITE(hook_callsite_filter_snapshot_and_entry_identity) {
         MOD_CHECK_EQ(c->r[R_EAX], ret == match ? 101u : 100u);
         MOD_CHECK_EQ(c->r[R_ESP], sp + 4);
         MOD_CHECK_EQ(c->eip, other);
-        MOD_CHECK_EQ(mods_view_test_push_count() - snapshots, ret == match ? 3u : 0u);
+        MOD_CHECK_EQ(mods_view_test_push_count() - snapshots, ret == match ? 4u : 1u);
         MOD_CHECK_EQ(g_log.size(), ret == match ? 4u : 0u);
         if (g_log.size() == 4) {
             MOD_CHECK_STR(g_log[0].c_str(), "before");
@@ -235,6 +245,7 @@ MOD_TEST_SUITE(hook_callsite_filter_snapshot_and_entry_identity) {
     }
     for (auto id : ids)
         MOD_CHECK_EQ(mods_hook_remove(0, id), POP_OK);
+    MOD_CHECK_EQ(mods_hook_remove(0, replacement), POP_OK);
     MOD_CHECK_EQ(recomp_hooked[recomp_index_of(target)], 0u);
 }
 
@@ -895,8 +906,11 @@ MOD_TEST_SUITE(hook_attribution_survives_a_partial_unwind) {
     MOD_CHECK_STR(g_log[0].c_str(), "outer");
     MOD_CHECK_STR(g_log[1].c_str(), "inner");
     // The surviving frame's hook is named; the abandoned one is not.
-    MOD_CHECK(seen_in_unwind.find("004ec6f0") != std::string::npos);
-    MOD_CHECK(seen_in_unwind.find("0040c690") == std::string::npos);
+    char outer[9], inner[9];
+    snprintf(outer, sizeof outer, "%08x", OUTER);
+    snprintf(inner, sizeof inner, "%08x", INNER);
+    MOD_CHECK(seen_in_unwind.find(outer) != std::string::npos);
+    MOD_CHECK(seen_in_unwind.find(inner) == std::string::npos);
 }
 
 // ---------------------------------------------------------------------------

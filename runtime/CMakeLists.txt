@@ -48,7 +48,7 @@ set(ENTRY_FIXTURE_SOURCES
   ${ENTRY_FIXTURE_DIR}/chunk_entries_0d000000.c
   ${ENTRY_FIXTURE_DIR}/fixture_table.c)
 add_custom_command(
-  OUTPUT ${ENTRY_FIXTURE_SOURCES} ${ENTRY_FIXTURE_DIR}/body.h
+  OUTPUT ${ENTRY_FIXTURE_SOURCES} ${ENTRY_FIXTURE_DIR}/body.h ${ENTRY_FIXTURE_DIR}/fixture_overrides.h
   COMMAND ${Python3_EXECUTABLE} ${RECOMP_ROOT}/tools/recomp/tests/gen_entry_fixture.py ${ENTRY_FIXTURE_DIR}
   DEPENDS ${RECOMP_ROOT}/tools/recomp/tests/gen_entry_fixture.py ${RECOMP_ROOT}/tools/recomp/output.py
   COMMENT "Generating stable-entry dispatch fixture"
@@ -56,6 +56,7 @@ add_custom_command(
 foreach(entry_test entry_dispatch_tests entry_dispatch_nohooks_tests)
   add_executable(${entry_test} tests/entry_dispatch_tests.c ${ENTRY_FIXTURE_SOURCES})
   target_include_directories(${entry_test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${ENTRY_FIXTURE_DIR})
+  target_compile_definitions(${entry_test} PRIVATE RECOMP_OVERRIDE_HEADER="fixture_overrides.h")
   target_compile_options(${entry_test} PRIVATE ${RECOMP_WARN_HOST})
   recomp_optimize(${entry_test} 2)
   recomp_test_binary(${entry_test})
@@ -70,7 +71,8 @@ add_custom_target(dispatch_tests DEPENDS entry_dispatch_tests entry_dispatch_noh
 # override them and provide real entry dispatch to hook.
 add_executable(call_trace_tests tests/call_trace_tests.cpp ${ENTRY_FIXTURE_SOURCES} tests/stub_recomp_call.cpp)
 target_include_directories(call_trace_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${ENTRY_FIXTURE_DIR})
-target_link_libraries(call_trace_tests PRIVATE recomp_platform recomp_runtime)
+target_compile_definitions(call_trace_tests PRIVATE RECOMP_OVERRIDE_HEADER="fixture_overrides.h")
+target_link_libraries(call_trace_tests PRIVATE recomp_platform recomp_runtime recomp_dx_null)
 target_compile_options(call_trace_tests PRIVATE ${RECOMP_WARN_HOST})
 recomp_optimize(call_trace_tests 1)
 recomp_test_binary(call_trace_tests)
@@ -98,7 +100,7 @@ recomp_optimize(recomp_snapshot 2)
 # The suite spawns itself for the abort check; portable since sub-project 3.
 if(NOT IOS AND NOT ANDROID)
 add_executable(seh_tests tests/seh_tests.cpp)
-target_link_libraries(seh_tests PRIVATE recomp_platform recomp_runtime_testing)
+target_link_libraries(seh_tests PRIVATE recomp_platform recomp_runtime_testing recomp_dx_null)
 target_compile_options(seh_tests PRIVATE ${RECOMP_WARN_HOST})
 recomp_optimize(seh_tests 1)
 recomp_test_binary(seh_tests)
@@ -115,7 +117,7 @@ add_test(NAME runtime_tests COMMAND runtime_tests WORKING_DIRECTORY ${RECOMP_ROO
 # code through the interpreter. It takes two seconds when that returns.
 set_tests_properties(runtime_tests PROPERTIES LABELS game TIMEOUT 600
                      ENVIRONMENT RECOMP_PYTHON=${Python3_EXECUTABLE})
-add_executable(gdi_tests tests/gdi_tests.cpp tests/stub_recomp_call.cpp)
+add_executable(gdi_tests tests/gdi_tests.cpp tests/stub_recomp_call.cpp ${RECOMP_ROOT}/dx/com.cpp)
 target_link_libraries(gdi_tests PRIVATE recomp_platform recomp_runtime)
 target_compile_options(gdi_tests PRIVATE ${RECOMP_WARN_HOST})
 recomp_optimize(gdi_tests 1)

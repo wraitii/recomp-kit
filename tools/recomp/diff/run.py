@@ -45,12 +45,15 @@ from pathlib import Path
 
 import numpy as np
 import pefile
-from unicorn import (Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_HOOK_INTR, UC_HOOK_MEM_INVALID,
+import capstone
+from capstone import x86_const as CS_X86
+from unicorn import (Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_HOOK_INTR, UC_HOOK_MEM_INVALID, UC_HOOK_CODE,
                      UC_PROT_READ, UC_PROT_WRITE, UC_PROT_EXEC, UC_PROT_ALL)
 from unicorn.x86_const import (
     UC_X86_REG_EAX, UC_X86_REG_ECX, UC_X86_REG_EDX, UC_X86_REG_EBX, UC_X86_REG_ESP,
     UC_X86_REG_EBP, UC_X86_REG_ESI, UC_X86_REG_EDI, UC_X86_REG_EFLAGS, UC_X86_REG_EIP,
     UC_X86_REG_FS, UC_X86_REG_SS, UC_X86_REG_DS, UC_X86_REG_ES, UC_X86_REG_GDTR)
+from unicorn.x86_const import UC_X86_REG_FPTAG, UC_X86_REG_FPSW
 
 KIT = Path(__file__).resolve().parents[3]
 sys.path[:0] = [str(KIT / "tools"), str(KIT / "tools/recomp")]
@@ -232,7 +235,52 @@ class Emu:
         self.u.hook_add(UC_HOOK_INTR, lambda uc, n, _: uc.emu_stop())
         self.fault = None
         self.u.hook_add(UC_HOOK_MEM_INVALID, self.on_fault)
+        self.decoder = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        self.decoder.detail = True
+        self.flag_effects = {}
+        self.flag_mask = FLAG_MASK
+        self.stack_fault = False
+        self.u.hook_add(UC_HOOK_CODE, self.on_instruction)
         self.image = image
+
+    def on_instruction(self, uc, addr, size, _):
+        raw = bytes(uc.mem_read(addr, size))
+        effect = self.flag_effects.get(raw)
+        if effect is None:
+            instruction = next(self.decoder.disasm(raw, addr))
+            written = undefined = 0
+            required = set()
+            mnemonic = instruction.mnemonic
+            fpu = instruction.group(CS_X86.X86_GRP_FPU)
+            if not fpu or mnemonic in ("fcomi", "fcomip", "fucomi", "fucomip"):
+                for name, bit in FLAGS.items():
+                    if any(instruction.eflags & getattr(CS_X86, "X86_EFLAGS_" + action + "_" + name, 0)
+                           for action in ("MODIFY", "SET", "RESET")):
+                        written |= bit
+                    if instruction.eflags & getattr(CS_X86, "X86_EFLAGS_UNDEFINED_" + name, 0):
+                        undefined |= bit
+            if fpu:
+                if mnemonic.startswith(("fadd", "fsub", "fmul", "fdiv", "fcom", "fucom", "fst", "fist")) or mnemonic in (
+                        "fabs", "fchs", "fsqrt", "frndint", "fsin", "fcos", "fsincos", "fptan", "fxch", "ftst", "fxtract"):
+                    if mnemonic not in ("fstcw", "fstsw", "fstenv"):
+                        required.add(0)
+                if mnemonic in ("fcompp", "fucompp", "fprem", "fprem1", "fpatan", "fyl2x", "fyl2xp1", "fscale"):
+                    required.update((0, 1))
+                if mnemonic not in ("ffree",):
+                    for operand in instruction.operands:
+                        if operand.type == CS_X86.X86_OP_REG and CS_X86.X86_REG_ST0 <= operand.reg <= CS_X86.X86_REG_ST7:
+                            required.add(operand.reg - CS_X86.X86_REG_ST0)
+            if instruction.mnemonic in ("imul", "mul"):
+                undefined |= FLAGS["PF"] | FLAGS["ZF"] | FLAGS["SF"]
+            effect = written, undefined, tuple(sorted(required))
+            self.flag_effects[raw] = effect
+        written, undefined, required = effect
+        self.flag_mask = (self.flag_mask | written) & ~undefined
+        if required:
+            tag = uc.reg_read(UC_X86_REG_FPTAG)
+            top = (uc.reg_read(UC_X86_REG_FPSW) >> 11) & 7
+            if any((tag >> (2 * ((top + slot) & 7))) & 3 == 3 for slot in required):
+                self.stack_fault = True
 
     def on_fault(self, uc, access, addr, size, value, _):
         self.fault = addr
@@ -391,7 +439,8 @@ def compare_states(want, got, region_list):
     for name, a, b in zip(REG_NAMES, want["regs"], got["regs"]):
         if a != b:
             problems.append("%s %08x != %08x" % (name, a, b))
-    flags = [n for n, bit in FLAGS.items() if (want["eflags"] ^ got["eflags"]) & bit]
+    flags = [n for n, bit in FLAGS.items()
+             if (want["eflags"] ^ got["eflags"]) & bit & want.get("flag_mask", FLAG_MASK)]
     if want["fpu_top"] != got["fpu_top"]:
         problems.append("x87 TOP %d != %d" % (want["fpu_top"], got["fpu_top"]))
     else:
@@ -455,13 +504,20 @@ def emulate_original(u, emu, addr, data, region_list, args, regs, eflags, cw, st
     u.emu_start(FPU_RESET, FPU_RESET + 8)
     u.reg_write(UC_X86_REG_EFLAGS, eflags)
     emu.fault = None
+    emu.flag_mask = FLAG_MASK
+    emu.stack_fault = False
     try:
         u.emu_start(addr, MAGIC_RET, count=args.max_insns)
     except UcError:
         return emu.fault_kind(), None
     if u.reg_read(UC_X86_REG_EIP) != MAGIC_RET:
         return "original did not return", None
-    return None, oracle_snapshot(u, fnsave(u), region_list)
+    saved_fpu = fnsave(u)
+    if emu.stack_fault or struct.unpack_from("<H", saved_fpu, 4)[0] & 0x40:
+        return "original x87 stack fault", None
+    oracle = oracle_snapshot(u, saved_fpu, region_list)
+    oracle["flag_mask"] = emu.flag_mask
+    return None, oracle
 
 
 def run_variant(native, mode, addr, data, fills, stack, region_list, regs, eflags, cw):

@@ -11,11 +11,12 @@
 CTest labels: `nogame`, `game`, `gpu`, `device`, `mods`. Run a subset with
 `ctest --test-dir <build root>/cmake/macos -L nogame` or `-R dx_tests`.
 
-`d3d8_surface_tests` (`nogame`) exercises the backbuffer descriptor, texture
+`d3d8_surface_tests` (`gpu`) exercises the backbuffer descriptor, texture
 levels and staging, vtable calling convention, identity, bounds and
 device/factory ownership through guest COM dispatch. Its devices are
-constructed state fixtures; it does not create a GPU or demonstrate game
-rendering. It uses Rust CPU storage and mip layouts through CXX, including
+constructed state fixtures, with offscreen GPU devices for render-target binding;
+it does not demonstrate game rendering. It uses Rust CPU storage and mip layouts
+through CXX, including
 live locked resources across generation reset.
 `d3d7_mipmap_tests` (`gpu`) follows DirectDraw implicit mip attachments and
 per-level locks through D3D7 texture binding and real GPU readback. It checks
@@ -54,6 +55,13 @@ exercise the Vorbis and AVI/Indeo decoders in the native suites.
 scratch/BSS/TEB fills, in a fresh directory. `--replay-inputs DIR` checks
 executable, selected functions and input settings before replay. Original
 memory is reset independently for each mode.
+
+The diff oracle excludes architecturally undefined output flags and discards
+inputs that read empty x87 slots. Unicorn does not reliably report the x87 stack
+fault bit, so the harness also checks operand tags before each instruction.
+Ordinary/specialized comparisons still include every tracked flag. Accepted
+binary32 exponent-range and extended-precision differences remain visible in
+original-byte comparisons; see [IR tradeoffs](ir.md).
 
 `--mode paired` compares the production specialization-enabled and forced
 ordinary variants within a run; `pair` contains those discrepancies and `oracle`

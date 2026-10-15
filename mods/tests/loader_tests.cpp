@@ -116,6 +116,7 @@ void fresh() {
     // which is the property production gets by never retiring at all.
     MOD_CHECK(mods_test_reset_loader());
     mods_hooks_reset();
+    mods_hooks_arm();
     mods_overlay_reset();
     // After the reset, because mods_overlay_reset clears the profile
     // directory along with everything else.
@@ -250,17 +251,20 @@ void two_case_conflict() {
 } // namespace
 
 // Keep the existing first-run record test first in reverse registration order.
-MOD_TEST_SUITE(loader_packaged_core_display) {
+MOD_TEST_SUITE(loader_core_plugin_artifact) {
     fresh();
-    os_setenv("RECOMP_CORE_MODS_DIR", mods_test_build_path("recomp/mods/core").c_str());
+    std::string core = mod_test_dir("core-artifact");
+    const char *user = TREE;
+    TREE = core.c_str();
+    install("fixture", manifest("test.core", "[plugin]\npath = \"" + plug("good_a") + "\"\n"),
+            plug("good_a").c_str());
+    TREE = user;
+    os_setenv("RECOMP_CORE_MODS_DIR", core.c_str());
     MOD_CHECK(mods_load_all());
-    MOD_CHECK(loaded("core.display"));
-    MOD_CHECK_EQ(mods_record_status("core.display"), POP_OK);
-    if (!loaded("core.display"))
-        fprintf(stderr, "core.display: %s\n", reason("core.display").c_str());
+    MOD_CHECK(loaded("test.core"));
+    MOD_CHECK_EQ(mods_record_status("test.core"), POP_OK);
     // A no-load open proves the loader opened the installed artifact itself.
-    void *lib = os_dlopen_noload(
-        (mods_test_build_path("recomp/mods/core/display/") + plug("display")).c_str());
+    void *lib = os_dlopen_noload((core + "/fixture/" + plug("good_a")).c_str());
     MOD_CHECK(lib != nullptr);
     if (lib)
         os_dlclose(lib);
@@ -451,7 +455,7 @@ MOD_TEST_SUITE(loader_negative_cases) {
     one("missing dependency", manifest("needs.absent", "requires = [\"nobody.here >= 1.0.0\"]\n"),
         nullptr, "not loaded");
     one("wrong game hash",
-        "id = \"wrong.game\"\nname = \"W\"\nversion = \"1.0.0\"\napi = 1\n"
+        "id = \"wrong.game\"\nname = \"W\"\nversion = \"1.0.0\"\napi = 2\n"
         "game = \"0000000000000000\"\n",
         nullptr, "game");
     one("wrong api version",
@@ -865,7 +869,7 @@ MOD_TEST_SUITE(loader_retained_api_and_in_flight_teardown) {
                          // The teardown does NOT run while a callback is on the stack.
                          g_complete_during_callback = mods_shutdown_complete();
                          g_allocs_during_callback = mods_guest_alloc_count(g_inflight_owner);
-                         api->hook_return(api, cpu, 0, 0);
+                         mods_hook_return(api, cpu, 0, 0);
                      },
                      POP_HOOK_BEFORE, nullptr, &id),
                  POP_OK);
