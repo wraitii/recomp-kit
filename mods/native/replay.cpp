@@ -33,7 +33,7 @@ void Seams::finish() const {
                                  std::to_string(position_));
 }
 std::string validate(const Capture &c) {
-    if (!c.arena_size || c.arena_size > 256u * 1024 * 1024 || !c.page_size ||
+    if (!c.arena_size || c.arena_size > 512u * 1024 * 1024 || !c.page_size ||
         (c.page_size & (c.page_size - 1)) || c.arena_size % c.page_size)
         return "invalid arena/page geometry";
     if (c.entry.size != sizeof(pop_cpu_v1) || c.exit.size != sizeof(pop_cpu_v1))

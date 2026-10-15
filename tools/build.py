@@ -424,23 +424,27 @@ def build_diff_harness(build_root, out):
     if not archive.exists():
         sys.exit("%s is missing: build the game first" % archive)
     sources = [ROOT / "tools/recomp/tests/harness.c", ROOT / "tools/recomp/diff/host.c",
-               ROOT / "platform/os_posix.cpp"]
-    inputs = sources + [archive, ROOT / "runtime/x86.h", gen / "table.c"]
+               ROOT / "platform/os_posix.cpp", ROOT / "platform/env.cpp",
+               ROOT / "tools/recomp/diff/host.cpp"]
+    inputs = sources + [Path(__file__), archive, ROOT / "runtime/x86.h", gen / "table.c"]
     if out.exists() and out.stat().st_mtime > max(p.stat().st_mtime for p in inputs):
         print("diff harness up to date: %s" % out)
         return
     out.parent.mkdir(parents=True, exist_ok=True)
     darwin = platform.system() == "Darwin"
     cc = ["xcrun", "clang"] if darwin else ["clang"]
-    os_obj = out.with_name("os_posix.o")
-    subprocess.check_call(cc + ["-x", "c++", "-std=c++17", "-O1", "-fno-exceptions", "-fPIC",
-                                "-I", str(ROOT), "-c", str(sources[2]), "-o", str(os_obj)])
+    objects = []
+    for source in sources[2:]:
+        obj = out.with_name(source.stem + ".o")
+        subprocess.check_call(cc + ["-x", "c++", "-std=c++17", "-O1", "-fno-exceptions", "-fPIC",
+                                    "-I", str(ROOT), "-c", str(source), "-o", str(obj)])
+        objects.append(str(obj))
     whole = (["-dynamiclib", "-Wl,-force_load," + str(archive), "-lc++",
                "-framework", "CoreFoundation", "-framework", "CoreServices"] if darwin else
              ["-shared", "-Wl,--whole-archive", str(archive), "-Wl,--no-whole-archive", "-lm"])
     subprocess.check_call(cc + ["-O1", "-ffp-contract=off", "-std=c11", "-w", "-fPIC",
                                 "-I", str(gen), "-I", str(ROOT), "-I", str(ROOT / "runtime"),
-                                str(sources[0]), str(sources[1]), str(os_obj)] + whole +
+                                str(sources[0]), str(sources[1])] + objects + whole +
                           ["-o", str(out)])
     print("built diff harness: %s" % out)
 

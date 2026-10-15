@@ -1772,7 +1772,7 @@ void k_SetLastError(X86 *c) {
 }
 
 // The guest CPU is fixed by recomp_cpuid(): GenuineIntel family 6, model 3
-// (Pentium II), with FPU, TSC and CMOV and no MMX. Answer from that same model
+// (Pentium II), with FPU, TSC, CMOV and MMX. Answer from that same model
 // so CPUID and this API can never disagree. Feature codes follow winnt.h; an
 // unknown code is FALSE, as on Windows.
 void k_IsProcessorFeaturePresent(X86 *c) {
@@ -1793,10 +1793,11 @@ void k_IsProcessorFeaturePresent(X86 *c) {
     switch ((uint32_t)arg(c, 0)) {
     // CMPXCHG8B is deliberately absent from this runtime's CPUID EDX mask.
     // Do not infer it from the nominal CPU family/model.
+    case PF_MMX_INSTRUCTIONS_AVAILABLE:  // CPUID EDX bit 23 is advertised
     case PF_RDTSC_INSTRUCTION_AVAILABLE: // CPUID EDX bit 4 is advertised
         present = true;
         break;
-    default: // the FDIV erratum, FPU emulation, MMX/SSE/3DNow and the rest
+    default: // the FDIV erratum, FPU emulation, SSE/3DNow and the rest
         present = false;
         break;
     }
@@ -2165,7 +2166,8 @@ void k_TlsFree(X86 *c) {
 }
 
 // One microsecond tick, driven by the same clock as GetTickCount so a guest
-// that mixes the two never sees them disagree.
+// that mixes the two never sees them disagree. Reads within one millisecond
+// increase until the sub-millisecond range is exhausted, then stay constant.
 void k_QueryPerformanceFrequency(X86 *c) {
     uint32_t p = arg(c, 0);
     if (p) {
@@ -2177,9 +2179,12 @@ void k_QueryPerformanceFrequency(X86 *c) {
 
 void k_QueryPerformanceCounter(X86 *c) {
     host_note_cadence("QueryPerformanceCounter");
+    static uint64_t last;
     uint32_t p = arg(c, 0);
     if (p) {
-        uint64_t ticks = (uint64_t)host_millis() * 1000ull;
+        uint64_t ms = (uint64_t)host_millis() * 1000ull;
+        uint64_t ticks = last < ms ? ms : std::min<uint64_t>(last + 1, ms + 999ull);
+        last = ticks;
         wr32(p, (uint32_t)ticks);
         wr32(p + 4, (uint32_t)(ticks >> 32));
     }
@@ -5507,6 +5512,13 @@ void k_SleepEx(X86 *c) {
 }
 
 const ImportShim g_kernel32_shims[] = {
+    {"KERNEL32.dll", "DosDateTimeToFileTime", 3, imports_unsupported},
+    {"KERNEL32.dll", "GetConsoleMode", 2, imports_unsupported},
+    {"KERNEL32.dll", "LocalFileTimeToFileTime", 2, imports_unsupported},
+    {"KERNEL32.dll", "ReadConsoleInputA", 4, imports_unsupported},
+    {"KERNEL32.dll", "SetConsoleMode", 2, imports_unsupported},
+    {"KERNEL32.dll", "SetEnvironmentVariableW", 2, imports_unsupported},
+    {"KERNEL32.dll", "WriteConsoleA", 5, imports_unsupported},
     // memory
     {"KERNEL32.dll", "HeapCreate", 3, k_HeapCreate},
     {"KERNEL32.dll", "HeapDestroy", 1, k_HeapDestroy},

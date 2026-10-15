@@ -768,13 +768,20 @@ void BinkCopyToBuffer(X86 *c) {
     BinkPlayer *p = player_for(arg(c, 0));
     if (!p || !p->have_frame || p->failed)
         return;
-    uint32_t type = arg(c, 6) & 0xff;
+    uint32_t flags = arg(c, 6);
+    uint32_t type = flags & 0xff;
+    uint32_t scaling = flags & 0x70000000;
+    if (scaling && scaling != 0x30000000) {
+        video_error("unsupported BinkCopyToBuffer scaling mode");
+        return;
+    }
+    uint32_t xscale = scaling == 0x30000000 ? 2 : 1;
     if (type != VIDEO_RGB565 && type != VIDEO_RGB555 && type != VIDEO_XRGB8888)
         return;
     uint64_t bpp = type == VIDEO_XRGB8888 ? 4 : 2;
     uint64_t pitch = arg(c, 2), xbytes = (uint64_t)arg(c, 4) * bpp;
     uint64_t rows = std::min(arg(c, 3), (uint32_t)p->frame->height);
-    uint64_t row_bytes = (uint64_t)p->frame->width * bpp;
+    uint64_t row_bytes = (uint64_t)p->frame->width * bpp * xscale;
     if (!rows)
         return;
     uint64_t start = (uint64_t)arg(c, 1) + (uint64_t)arg(c, 5) * pitch + xbytes;
@@ -785,12 +792,18 @@ void BinkCopyToBuffer(X86 *c) {
         return;
     }
     uint32_t blit_start = host_millis();
-    for (uint32_t row = 0; row < rows; ++row)
-        video_frame_convert_row(g_mem + start + row * pitch,
-                                p->frame->data[0] + (ptrdiff_t)row * p->frame->linesize[0],
+    for (uint32_t row = 0; row < rows; ++row) {
+        uint8_t *dest = g_mem + start + row * pitch;
+        video_frame_convert_row(dest, p->frame->data[0] + (ptrdiff_t)row * p->frame->linesize[0],
                                 p->frame->data[1] + (ptrdiff_t)(row / 2) * p->frame->linesize[1],
                                 p->frame->data[2] + (ptrdiff_t)(row / 2) * p->frame->linesize[2],
                                 (uint32_t)p->frame->width, (VideoSurfaceType)type);
+        if (xscale == 2)
+            for (uint32_t x = (uint32_t)p->frame->width; x-- > 0;) {
+                memmove(dest + x * 2 * bpp, dest + x * bpp, bpp);
+                memcpy(dest + (x * 2 + 1) * bpp, dest + x * 2 * bpp, bpp);
+            }
+    }
     p->blit_ms += host_millis() - blit_start;
 }
 

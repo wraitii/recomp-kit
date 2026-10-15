@@ -2406,6 +2406,17 @@ void m_mixerGetNumDevs(X86 *c) {
 void m_mixerNoDriver(X86 *c) {
     set_eax(c, 6); // MMSYSERR_NODRIVER
 }
+// Wave in and out: there is no wave device either. Games that list output
+// devices fall through to DirectSound, and no wave handle can ever be open.
+void m_waveGetNumDevs(X86 *c) {
+    set_eax(c, 0);
+}
+void m_waveBadDevice(X86 *c) {
+    set_eax(c, MMSYSERR_BADDEVICEID);
+}
+void m_waveInvalidHandle(X86 *c) {
+    set_eax(c, 5); // MMSYSERR_INVALHANDLE
+}
 
 // VERSION.dll: the executable's own version resource, read out of the mapped
 // image. A game that shows its version asks for its own module's
@@ -3104,29 +3115,27 @@ const ImportShim g_misc_shims[] = {
     {"DINPUT8.dll", "DirectInput8Create", 5, nullptr},
     {"SHFOLDER.dll", "SHGetFolderPathA", 5, s_SHGetFolderPathA},
     {"DSOUND.dll", "ord6", 3, nullptr}, // DirectSoundCaptureCreate
-    // Wave in and out: the audio task owns the behaviour; these keep the
-    // stack balanced until it lands.
-    {"WINMM.dll", "waveOutGetNumDevs", 0, nullptr},
-    {"WINMM.dll", "waveOutGetDevCapsA", 3, nullptr},
-    {"WINMM.dll", "waveOutOpen", 6, nullptr},
-    {"WINMM.dll", "waveOutClose", 1, nullptr},
-    {"WINMM.dll", "waveOutPrepareHeader", 3, nullptr},
-    {"WINMM.dll", "waveOutUnprepareHeader", 3, nullptr},
-    {"WINMM.dll", "waveOutWrite", 3, nullptr},
-    {"WINMM.dll", "waveOutReset", 1, nullptr},
-    {"WINMM.dll", "waveOutGetPosition", 3, nullptr},
-    {"WINMM.dll", "waveOutSetVolume", 2, nullptr},
-    {"WINMM.dll", "waveInGetNumDevs", 0, nullptr},
-    {"WINMM.dll", "waveInGetDevCapsA", 3, nullptr},
-    {"WINMM.dll", "waveInOpen", 6, nullptr},
-    {"WINMM.dll", "waveInClose", 1, nullptr},
-    {"WINMM.dll", "waveInPrepareHeader", 3, nullptr},
-    {"WINMM.dll", "waveInUnprepareHeader", 3, nullptr},
-    {"WINMM.dll", "waveInAddBuffer", 3, nullptr},
-    {"WINMM.dll", "waveInStart", 1, nullptr},
-    {"WINMM.dll", "waveInStop", 1, nullptr},
-    {"WINMM.dll", "waveInReset", 1, nullptr},
-    {"WINMM.dll", "waveInGetPosition", 3, nullptr},
+    {"WINMM.dll", "waveOutGetNumDevs", 0, m_waveGetNumDevs},
+    {"WINMM.dll", "waveOutGetDevCapsA", 3, m_waveBadDevice},
+    {"WINMM.dll", "waveOutOpen", 6, m_waveBadDevice},
+    {"WINMM.dll", "waveOutClose", 1, m_waveInvalidHandle},
+    {"WINMM.dll", "waveOutPrepareHeader", 3, m_waveInvalidHandle},
+    {"WINMM.dll", "waveOutUnprepareHeader", 3, m_waveInvalidHandle},
+    {"WINMM.dll", "waveOutWrite", 3, m_waveInvalidHandle},
+    {"WINMM.dll", "waveOutReset", 1, m_waveInvalidHandle},
+    {"WINMM.dll", "waveOutGetPosition", 3, m_waveInvalidHandle},
+    {"WINMM.dll", "waveOutSetVolume", 2, m_waveInvalidHandle},
+    {"WINMM.dll", "waveInGetNumDevs", 0, m_waveGetNumDevs},
+    {"WINMM.dll", "waveInGetDevCapsA", 3, m_waveBadDevice},
+    {"WINMM.dll", "waveInOpen", 6, m_waveBadDevice},
+    {"WINMM.dll", "waveInClose", 1, m_waveInvalidHandle},
+    {"WINMM.dll", "waveInPrepareHeader", 3, m_waveInvalidHandle},
+    {"WINMM.dll", "waveInUnprepareHeader", 3, m_waveInvalidHandle},
+    {"WINMM.dll", "waveInAddBuffer", 3, m_waveInvalidHandle},
+    {"WINMM.dll", "waveInStart", 1, m_waveInvalidHandle},
+    {"WINMM.dll", "waveInStop", 1, m_waveInvalidHandle},
+    {"WINMM.dll", "waveInReset", 1, m_waveInvalidHandle},
+    {"WINMM.dll", "waveInGetPosition", 3, m_waveInvalidHandle},
     // Winsock 2, offline. LHMultiplayerR delay-loads this DLL by ordinal, so
     // its ImgDelayDescr names ordinals rather than names; the table below
     // covers exactly that ordinal set (plus the byte-order twins). WSAStartup

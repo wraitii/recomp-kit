@@ -125,6 +125,7 @@ int main(int argc, char **argv) {
     uint8_t saved_hooked = recomp_hooked[index_];
     recomp_hook_ptrs[index_] = copy_fixture;
     recomp_hooked[index_] = 1;
+    recomp_slow_update(index_);
     constexpr uint32_t n = 65536;
     uint32_t src = heap_alloc(n), dst = heap_alloc(n);
     CHECK(src && dst);
@@ -197,7 +198,8 @@ int main(int argc, char **argv) {
         ProfileSlot *main_slot = sched_current_holder_slot();
         recomp_hook_ptrs[index_] = worker;
         recomp_hooked[index_] = 1;
-        import_call(&c, "CreateThread", {0, 0, target, 0, 0, 0});
+        uint32_t worker_handle = import_call(&c, "CreateThread", {0, 0, target, 0, 0, 0});
+        CHECK(import_call(&c, "WaitForSingleObject", {worker_handle, 0xffffffffu}) == 0);
         for (int tries = 0; tries < 100 && !worker_ran; ++tries)
             import_call(&c, "Sleep", {2});
         CHECK(worker_ran);
@@ -229,6 +231,7 @@ int main(int argc, char **argv) {
     }
     recomp_hook_ptrs[index_] = saved_hook;
     recomp_hooked[index_] = saved_hooked;
+    recomp_slow_update(index_);
     profile_stop();
     printf("profile tests: %s (%d failures; %s)\n", failures ? "FAIL" : "PASS", failures,
            enabled ? "enabled" : "disabled");

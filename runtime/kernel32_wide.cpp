@@ -1,4 +1,4 @@
-// UTF-16 kernel32 entry points. File operations share the ANSI shim's path seam.
+// UTF-16 kernel32 entry points and shared profile APIs.
 #include "kernel32_internal.h"
 #include "windows_version.h"
 #include "loader.h"
@@ -271,6 +271,60 @@ void k_GetPrivateProfileStringW(X86 *c) {
     if (used == 0)
         wr16(out + 2, 0);
     set_eax(c, used);
+}
+uint32_t profile_integer(const std::string &text) {
+    const size_t end = std::min<size_t>(text.size(), 29);
+    size_t pos = 0;
+    while (pos < end && (unsigned char)text[pos] <= ' ')
+        ++pos;
+    bool negative = pos < end && text[pos] == '-';
+    if (pos < end && (text[pos] == '+' || text[pos] == '-'))
+        ++pos;
+    uint32_t base = 10, result = 0;
+    if (pos + 1 < end && text[pos] == '0') {
+        const char prefix = text[pos + 1];
+        if (prefix == 'x' || prefix == 'o' || prefix == 'b') {
+            base = prefix == 'x' ? 16 : prefix == 'o' ? 8 : 2;
+            pos += 2;
+        }
+    }
+    for (; pos < end; ++pos) {
+        const unsigned char ch = text[pos];
+        uint32_t digit = ch >= '0' && ch <= '9'   ? ch - '0'
+                         : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10
+                         : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10
+                                                  : 16;
+        if (digit >= base)
+            break;
+        result = result * base + digit;
+    }
+    return negative ? 0u - result : result;
+}
+void get_private_profile_int(X86 *c, bool wide) {
+    auto string = [wide](uint32_t address) { return wide ? gm_wstr(address) : gm_str(address); };
+    const std::string section = string(arg(c, 0)), key = string(arg(c, 1));
+    uint32_t result = arg(c, 2);
+    ProfileFile ini;
+    if (arg(c, 0) && arg(c, 1) && profile_read(string(arg(c, 3)), ini)) {
+        std::string current, name, value;
+        for (const auto &line : ini.lines) {
+            if (profile_section(line, current))
+                continue;
+            if (equal_name(current, section) && profile_key(line, name, value) &&
+                equal_name(name, key)) {
+                if (!value.empty())
+                    result = profile_integer(value);
+                break;
+            }
+        }
+    }
+    set_eax(c, result);
+}
+void k_GetPrivateProfileIntA(X86 *c) {
+    get_private_profile_int(c, false);
+}
+void k_GetPrivateProfileIntW(X86 *c) {
+    get_private_profile_int(c, true);
 }
 void k_WritePrivateProfileStringW(X86 *c) {
     if (!arg(c, 0)) {
@@ -1035,6 +1089,8 @@ static const ImportShim g_kernel32_wide[] = {
     {"KERNEL32.dll", "CreateFileMappingW", 6, k_CreateFileMappingW},
 
     {"KERNEL32.dll", "GetPrivateProfileStringW", 6, k_GetPrivateProfileStringW},
+    {"KERNEL32.dll", "GetPrivateProfileIntA", 4, k_GetPrivateProfileIntA},
+    {"KERNEL32.dll", "GetPrivateProfileIntW", 4, k_GetPrivateProfileIntW},
     {"KERNEL32.dll", "WritePrivateProfileStringW", 4, k_WritePrivateProfileStringW},
 
     {"KERNEL32.dll", "CreateFileW", 7, k_CreateFileW},

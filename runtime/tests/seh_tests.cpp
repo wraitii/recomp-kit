@@ -136,6 +136,9 @@ extern "C" void recomp_jump(X86 *c, uint32_t target) {
         recomp_seh_intercept(c, target);
     recomp_call(c, target);
 }
+extern "C" void recomp_unknown_jump(X86 *c, uint32_t target) {
+    recomp_unknown_call(c, target);
+}
 extern "C" void mods_hooks_unwind_to_esp(uint32_t esp) {
     unwound_mod_esp = esp;
 }
@@ -226,6 +229,8 @@ static void record_null_call(X86 *, uint32_t record, uint32_t) {
     CHECK(rd32(record + 16) == 2);
     CHECK(rd32(record + 20) == 8);
     CHECK(rd32(record + 24) == 0x64);
+    CHECK(visits == 1 && null_calls == 1);
+    std::exit(failures ? 1 : 0);
 }
 static void null_call_faults() {
     X86 c;
@@ -236,20 +241,9 @@ static void null_call_faults() {
     registration(&c, reg, 0xffffffff, handler_search);
     c.r[R_ESP] = reg - 36;
     wr32(c.r[R_ESP], NULL_CALL_RETURN); // the CALL's return address
-    const uint32_t esp = c.r[R_ESP];
     recomp_seh_test_unhandled_hook(record_null_call);
     recomp_unknown_call(&c, 0x64);
-    CHECK(visits == 1 && seen[0] == reg && null_calls == 1);
-    // Taken by nothing - here only because the test hook stands in for the
-    // abort - the call returns zero, as it always did.
-    CHECK(c.r[R_ESP] == esp + 4 && c.eip == NULL_CALL_RETURN && c.r[R_EAX] == 0);
-    clear_observations();
-    c.r[R_ESP] = esp;
-    recomp_unknown_call(&c, 0x00c00000);
-    CHECK(visits == 0 && null_calls == 1);
-    CHECK(c.r[R_ESP] == esp + 4 && c.eip == NULL_CALL_RETURN);
-    recomp_seh_test_unhandled_hook(nullptr);
-    wr32(c.fs_base, 0xffffffff);
+    CHECK(false);
 }
 
 // A DIV/IDIV by zero raises #DE. Windows delivers it to the guest's handlers
@@ -726,13 +720,16 @@ int main(int argc, char **argv) {
     outer_handler = imports_alloc_trampoline("SEH.dll", "outer", outer_accept, ARGC_CDECL);
     if (diagnostic)
         return diagnostic_case(argv[1], argv[2]);
+    if (argc > 1 && !strcmp(argv[1], "null-call")) {
+        null_call_faults();
+        return 1;
+    }
     if (argc > 1) {
         fatal_case(argv[1]);
         return 1;
     }
     delay_load_return();
     chain_walk();
-    null_call_faults();
     div_error_faults();
     leave_before_stack_pop();
     unwind_and_leave();
@@ -744,6 +741,11 @@ int main(int argc, char **argv) {
     teardown();
     char exe[4096];
     CHECK(os_exe_path(exe, sizeof exe) == 0);
+    const char *null_args[] = {exe, "null-call", nullptr};
+    int64_t null_pid = 0;
+    int null_code = -1;
+    CHECK(os_spawn(null_args, &null_pid) == 0 && os_wait(null_pid, &null_code) == 0 &&
+          null_code == 0);
     chain_diagnostics(exe);
     for (const char *which :
          {"cycle", "invalid", "continue", "missing-target", "missing-checkpoint", "unhandled"}) {

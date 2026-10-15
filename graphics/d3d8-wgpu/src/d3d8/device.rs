@@ -1991,6 +1991,9 @@ impl Device {
         };
         let vs = bound_vs.filter(|(_, p)| !p.declaration_only);
         let ps = self.shaders.get(&self.pixel_shader).map(|s| &s.1);
+        if let Some(ps) = ps {
+            ps.validate_draw()?;
+        }
         let programmable = vs.is_some() || ps.is_some();
         if vs.is_some() {
             survey_or_skip!(self.state.validate_shader_draw());
@@ -3120,6 +3123,51 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     pub fn read_pixels_into(&self, out: &mut [u8]) -> Result<(), RenderError> {
         self.flush_draws();
         self.gpu.read_pixels_into(&self.targets.backbuffer, out)
+    }
+
+    pub fn write_pixels(
+        &mut self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<(), RenderError> {
+        let backbuffer = &self.targets.backbuffer;
+        if width == 0
+            || height == 0
+            || u64::from(x) + u64::from(width) > u64::from(backbuffer.width)
+            || u64::from(y) + u64::from(height) > u64::from(backbuffer.height)
+            || rgba.len() as u64 != u64::from(width) * u64::from(height) * 4
+        {
+            return Err(RenderError::invalid(
+                "write_pixels",
+                "invalid backbuffer region or byte count",
+            ));
+        }
+        self.flush_draws();
+        for target in std::iter::once(backbuffer).chain(self.targets.backbuffer_padded.iter()) {
+            self.gpu.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &target.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        Ok(())
     }
 
     /// True when this device records unsupported draw rejections

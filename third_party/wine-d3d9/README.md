@@ -26,5 +26,5 @@ checkout's `../reference/wine/include/d3d9types.h` at reference HEAD
 pinned bytes are vendored so every generator reads the same source.
 
 Generated C++ includes stay in the build tree. Support choices come from
-`dx/d3d9_bindings.json`, `dx/d3dx9_bindings.json`, `dx/d3dx9_imports.json` and
+`dx/d3d9_bindings.json`, `dx/d3dx9_imports.json` and
 `dx/d3d9.cpp`, not from the mere presence of an API declaration or constant.

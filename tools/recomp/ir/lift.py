@@ -158,6 +158,24 @@ class Lifter(object):
             raise LiftError("%08x: SLEIGH decodes %d of %d bytes" % (addr, sum(marks), len(data)))
         return marks
 
+    def length(self, addr, data):
+        """Length of the one instruction SLEIGH decodes at the start of `data`."""
+        try:
+            marks = [op.inputs[0].size for op in self.ctx.translate(data, addr, max_instructions=1).ops
+                     if op.opcode == pypcode.OpCode.IMARK]
+        except Exception as e:
+            raise LiftError("%08x: SLEIGH decode failed: %s" % (addr, e))
+        if len(marks) != 1:
+            raise LiftError("%08x: SLEIGH decodes %d instructions" % (addr, len(marks)))
+        return marks[0]
+
+    def ends_flow(self, addr, data):
+        """Whether the one instruction in `data` never falls through."""
+        ops = self.ctx.translate(data, addr, max_instructions=1).ops
+        return any(op.opcode in (pypcode.OpCode.BRANCH, pypcode.OpCode.BRANCHIND, pypcode.OpCode.RETURN)
+                   and not (op.opcode == pypcode.OpCode.BRANCH and op.inputs[0].space.name == "const")
+                   for op in ops)
+
     def lift(self, addr, data, mnem=None, decode=None):
         """Lift exactly `data` (one listed instruction) at guest `addr`.
 

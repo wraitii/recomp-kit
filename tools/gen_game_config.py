@@ -83,6 +83,10 @@ def render_header(cfg):
     lines.append("#define RECOMP_GUEST_SIZE %s" % c_hex(game["guest_size"]))
     lines.append("#define RECOMP_STRICT_IMPORTS %d" % int(game["strict_imports"]))
     lines.append("#define RECOMP_INPUT_RELATIVE_MOUSE_CAPTURE %d" % int(cfg["input"]["relative_mouse_capture"]))
+    input_config = cfg["input"]
+    lines.append("#define RECOMP_INPUT_KEYBOARD_NAMES %d" % (input_config["keyboard_names"] == "us"))
+    lines.append("#define RECOMP_INPUT_MOUSE_SENSITIVITY %d" % input_config["mouse_sensitivity"])
+    lines.append("#define RECOMP_INPUT_MOUSE_ACCELERATION %d" % int(input_config["mouse_acceleration"]))
     lines.append("#define RECOMP_CD_AUDIO_TRACKS %s" % c_string_list(cfg.get("media", {}).get("cd_tracks", [])))
     lines.append("#define RECOMP_AUX_MODULE_COUNT %d" % len(cfg["aux_modules"]))
     lines.append("#define RECOMP_AUX_MODULES {%s}" % ", ".join(
@@ -103,6 +107,9 @@ def render_header(cfg):
     # One bit per settings-page row, in game_config.SETTINGS_ROWS order.
     mask = sum(1 << i for i, row in enumerate(game_config.SETTINGS_ROWS) if row in cfg["settings"]["rows"])
     lines.append("#define RECOMP_SETTINGS_ROWS 0x%03xu" % mask)
+    settings = cfg["settings"]
+    lines.append("#define RECOMP_SETTINGS_WINDOW_MODE %d" % ("windowed", "borderless", "fullscreen").index(settings["window_mode"]))
+    lines.append("#define RECOMP_SETTINGS_PERFORMANCE_OVERLAY %d" % ("off", "counters", "graph").index(settings["performance_overlay"]))
     # The launcher's data: what to call the game, where to get it, where an
     # install may be, and what an import copies (host/launcher/).
     launcher = cfg["launcher"]

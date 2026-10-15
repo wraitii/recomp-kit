@@ -106,10 +106,6 @@ void alias_ansi(X86 *c, const char *name);
 void ensure_system_classes();
 } // namespace user32
 
-// GetKeyNameText's name for the key in lParam: scan code in bits 16-23, the
-// extended flag in bit 24 and "do not distinguish left/right" in bit 25. The
-// layout is the US one the runtime keyboard table models. Shared by the A and
-// W shims so the two cannot drift.
 std::string key_name_text(uint32_t lparam);
 
 void user32_wide_register();

@@ -37,11 +37,26 @@ indices and base/start offsets rather than upload hints. Sparse unlit spans,
 strips/fans and diagnostic draws retain expansion; `RECOMP_D3D8_EXPAND_INDICES=1`
 forces it for comparisons. Queued vertex/index bytes and constants are immutable
 snapshots. Shaders and supported render pipelines are cached per device.
+DrawIndexedPrimitiveUP supports triangle lists and fans with 16/32-bit guest
+indices and a single vertex stream. It checks guest spans before borrowing,
+queues immutable snapshots, and clears stream zero and index bindings.
+
+Programmable declarations support sixteen vertex streams. Multi-stream draws
+reuse D3D9 index ordering and checked byte fetches to pack only referenced
+attributes into immutable vertex snapshots, preserving register types and bits.
 
 Clear accepts host copies of guest D3DRECT arrays, clips each rectangle to the
 current viewport, and preserves color/depth/stencil outside the selected regions.
 An empty array clears the viewport. The bridge validates guest spans and copies
 unaligned records before calling Rust; rectangle memory is consumed before return.
+SetViewport rejects rectangles outside the current logical render target with
+D3DERR_INVALIDCALL and preserves the previous viewport. Empty viewports clear no pixels.
+
+CreateDevice and Reset accept lockable 32-bit backbuffers. LockRect stages GPU
+pixels in guest memory in D3D byte order; writable UnlockRect uploads only the
+locked rectangle in queue order after prior draws. Read-only locks preserve
+GPU contents, and Reset rejects an outstanding backbuffer lock. The bridge
+supports READONLY and NOSYSLOCK flags for these locks.
 
 The renderer boundary is a CXX bridge. Rust owns typed device, resource and
 storage state; C++ retains guest COM dispatch, memory validation and HRESULT
@@ -137,6 +152,9 @@ onto wgpu depth formats; the backend-defined D24 precision remains a fidelity
 caveat. Draws reject unsupported reached state by name.
 
 CPU textures keep native texel layouts and stage locks through guest memory.
+CreateImageSurface uses the same storage for standalone SYSTEMMEM surfaces,
+including descriptors, locks, CopyRects and device retention. CopyRects accepts
+the zero-count/null-array form for copying a whole surface, including compressed mips.
 GPU sampling and indexed triangle lists use immutable draw snapshots, with
 expansion available for other supported topologies and diagnostic comparisons.
 Resource pool/usage,

@@ -305,7 +305,7 @@ pub(crate) fn set_transform(device: &mut Device, kind: u32, values: &[f32]) -> S
 }
 
 pub(crate) fn set_viewport(device: &mut Device, viewport: &Viewport) -> Status {
-    device.state_mut().viewport = RenderViewport {
+    let value = RenderViewport {
         x: viewport.x,
         y: viewport.y,
         width: viewport.width,
@@ -313,6 +313,9 @@ pub(crate) fn set_viewport(device: &mut Device, viewport: &Viewport) -> Status {
         min_z: viewport.min_z,
         max_z: viewport.max_z,
     };
+    if let Err(error) = device.state_mut().set_viewport(value) {
+        return status_from_error(error);
+    }
     device.viewport_was_set = true;
     status(StatusCode::Ok, "")
 }
@@ -620,6 +623,20 @@ pub(crate) fn read_pixels_len(device: &Device, out: &mut u64) -> Status {
 pub(crate) fn read_pixels(device: &Device, out: &mut [u8]) -> Status {
     match renderer(device, "read_pixels") {
         Ok(renderer) => status_from_error_or_ok(renderer.read_pixels_into(out)),
+        Err(status) => status,
+    }
+}
+
+pub(crate) fn write_pixels(
+    device: &mut Device,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Status {
+    match renderer_mut(device, "write_pixels") {
+        Ok(renderer) => status_from_error_or_ok(renderer.write_pixels(x, y, width, height, rgba)),
         Err(status) => status,
     }
 }

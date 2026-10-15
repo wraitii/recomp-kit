@@ -87,6 +87,17 @@ target_link_libraries(controls_tests PRIVATE recomp_platform)
 recomp_link_sdl(controls_tests)
 recomp_optimize(controls_tests 1)
 recomp_test_binary(controls_tests)
+get_target_property(CONTROLLER_PREVIEW_SOURCES controls_tests SOURCES)
+list(FILTER CONTROLLER_PREVIEW_SOURCES EXCLUDE REGEX "/tests/")
+add_executable(controller_preview EXCLUDE_FROM_ALL ${CONTROLLER_PREVIEW_SOURCES}
+               ${HOST}/controls/pad_mapper.cpp ${HOST}/controls/pad_mapper_editor.cpp
+               ${RECOMP_ROOT}/tools/controller_preview.cpp)
+target_include_directories(controller_preview PRIVATE ${RECOMP_ROOT})
+target_compile_options(controller_preview PRIVATE ${RECOMP_WARN_WERROR})
+target_link_libraries(controller_preview PRIVATE recomp_platform)
+recomp_link_sdl(controller_preview)
+recomp_optimize(controller_preview 1)
+
 add_test(NAME controls_tests COMMAND controls_tests WORKING_DIRECTORY ${RECOMP_ROOT})
 set_tests_properties(controls_tests PROPERTIES LABELS nogame)
 
@@ -162,6 +173,8 @@ set(RECOMP_CONTROLS_SOURCES ${HOST}/controls/json.cpp ${HOST}/controls/layout.cp
                           ${HOST}/controls/overlay_paint.cpp ${HOST}/controls/pad_art.cpp
                           ${HOST}/controls/haptics.cpp
                           ${HOST}/controls/editor.cpp ${HOST}/controls/editor_actions.cpp
+                         ${HOST}/controls/pad_mapper.cpp ${HOST}/controls/pad_mapper_editor.cpp
+                         ${HOST}/controls/pad_guest_view.cpp
                          ${HOST}/keypad_layout.cpp ${HOST}/keypad_modifiers.cpp)
 set(RECOMP_PRESENT_SOURCES ${HOST}/present_pixels.cpp ${HOST}/present_thread.cpp ${HOST}/compositor.cpp
                         ${HOST}/ui_layer.cpp ${HOST}/performance_overlay.cpp ${RECOMP_CONTROLS_SOURCES}
@@ -172,7 +185,8 @@ set(RECOMP_PRESENT_SOURCES ${HOST}/present_pixels.cpp ${HOST}/present_thread.cpp
 # the launcher's (host/launcher/launcher_sdl.h; iPadOS keeps its own in
 # platform_ui_ios.mm).
 set(RECOMP_LAUNCHER_SOURCES $<TARGET_OBJECTS:launcher_core> $<TARGET_OBJECTS:recomp_miniz>
-                         ${HOST}/launcher/launcher_config.cpp ${HOST}/launcher/launcher_sdl.cpp)
+                         ${HOST}/launcher/launcher_config.cpp ${HOST}/launcher/launcher_sdl.cpp
+                         ${HOST}/launcher/configure_ui.cpp ${HOST}/preferences.cpp)
 if(IOS)
   set(RECOMP_PLATFORM_UI ${HOST}/sdl/platform_ui_ios.mm)
   list(APPEND FW_METAL "-framework UIKit" "-framework UniformTypeIdentifiers" "-framework CoreHaptics")

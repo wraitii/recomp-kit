@@ -2,15 +2,19 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let mut paths: Vec<String> = std::env::args().skip(1).collect();
+    let d3d8_create = paths.first().is_some_and(|p| p == "--d3d8-create");
+    if d3d8_create {
+        paths.remove(0);
+    }
     if paths.is_empty() {
-        eprintln!("usage: shader-corpus <shader.bin>...");
+        eprintln!("usage: shader-corpus [--d3d8-create] <shader.bin>...");
         return ExitCode::FAILURE;
     }
     paths.sort();
     let mut ok = 0usize;
     let mut failed = 0usize;
     for path in &paths {
-        match inspect(path) {
+        match inspect(path, d3d8_create) {
             Ok(version) => {
                 println!("ok {version} {path}");
                 ok += 1;
@@ -29,7 +33,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn inspect(path: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn inspect(path: &str, d3d8_create: bool) -> Result<String, Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path)?;
     if bytes.is_empty() || bytes.len() % 4 != 0 {
         return Err(format!(
@@ -43,6 +47,14 @@ fn inspect(path: &str) -> Result<String, Box<dyn std::error::Error>> {
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let pixel = words[0] >> 16 == 0xffff;
+    if d3d8_create {
+        let program = d3d8_wgpu::d3d8::shader::Program::parse(&words, pixel)?;
+        let draw = match program.validate_draw() {
+            Ok(()) => "draw supported".to_owned(),
+            Err(error) => format!("draw unavailable: {error}"),
+        };
+        return Ok(format!("D3D8 creation ({draw})"));
+    }
     let program = d3d8_wgpu::d3d9::wgsl::Program::decode(&words, pixel)?;
     let wgsl = d3d8_wgpu::d3d9::wgsl::translate(&program, &Default::default())?;
     d3d8_wgpu::d3d9::wgsl::validate(&wgsl)?;

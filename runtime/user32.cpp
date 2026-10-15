@@ -1877,11 +1877,6 @@ void u_MapVirtualKeyA(X86 *c) {
     set_eax(c, map_virtual_key(arg(c, 0), arg(c, 1)));
 }
 
-// GetKeyNameText's names, shared with the W shim (user32_wide.cpp) and with
-// DirectInput's DIPROP_KEYNAME through key_names.h. lParam carries the scan code
-// in bits 16-23 and the extended flag in bit 24, which is bit 7 of the DIK code.
-// Bit 25 asks for no left/right distinction, so the right-hand modifiers are
-// named like the left ones. The names are the US layout's.
 std::string key_name_text(uint32_t lparam) {
     uint32_t dik = (lparam >> 16) & 0x7f;
     if (lparam & 0x01000000u)
@@ -1894,12 +1889,60 @@ std::string key_name_text(uint32_t lparam) {
         else if (dik == 0xb8)
             dik = 0x38; // Right Alt -> Alt
     }
-    const char *name = dik_key_name(dik);
-    return name ? name : "";
+    return guest_key_name(dik);
 }
+
+static std::string key_name_ansi(const std::string &text) {
+    static const uint16_t cp1252[32] = {
+        0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021, 0x02c6, 0x2030, 0x0160,
+        0x2039, 0x0152, 0x008d, 0x017d, 0x008f, 0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022,
+        0x2013, 0x2014, 0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178};
+    std::string out;
+    for (size_t i = 0; i < text.size();) {
+        const uint8_t first = static_cast<uint8_t>(text[i++]);
+        uint32_t code = first;
+        uint32_t extra = 0;
+        if ((first & 0xe0) == 0xc0) {
+            code = first & 0x1f;
+            extra = 1;
+        } else if ((first & 0xf0) == 0xe0) {
+            code = first & 0x0f;
+            extra = 2;
+        } else if ((first & 0xf8) == 0xf0) {
+            code = first & 0x07;
+            extra = 3;
+        }
+        bool valid = i + extra <= text.size();
+        for (uint32_t j = 0; valid && j < extra; ++j) {
+            const uint8_t next = static_cast<uint8_t>(text[i++]);
+            valid = (next & 0xc0) == 0x80;
+            code = (code << 6) | (next & 0x3f);
+        }
+        if (!valid || code > 0xffff) {
+            out.push_back('?');
+            continue;
+        }
+        if (code <= 0xff && !(code >= 0x80 && code <= 0x9f)) {
+            out.push_back(static_cast<char>(code));
+            continue;
+        }
+        bool found = false;
+        for (size_t j = 0; j < 32; ++j) {
+            if (cp1252[j] == code) {
+                out.push_back(static_cast<char>(0x80 + j));
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            out.push_back('?');
+    }
+    return out;
+}
+
 void u_GetKeyNameTextA(X86 *c) {
     const std::string text = key_name_text(arg(c, 0));
-    set_eax(c, text.empty() ? 0 : put_text(arg(c, 1), arg(c, 2), text, false));
+    set_eax(c, text.empty() ? 0 : put_text(arg(c, 1), arg(c, 2), key_name_ansi(text), false));
 }
 
 // The single character the en-US layout produces for a key, or -1 when the key
@@ -2004,6 +2047,7 @@ void u_ToAsciiEx(X86 *c) {
 }
 
 const ImportShim g_user32_shims[] = {
+    {"USER32.dll", "ChangeDisplaySettingsA", 2, imports_unsupported},
     // Published Win32 stdcall signatures; unsupported calls retain named faults.
     {"USER32.dll", "GetMenuStringA", 5, imports_unsupported},
     {"USER32.dll", "VkKeyScanA", 1, imports_unsupported},

@@ -583,12 +583,16 @@ impl GpuContext {
         width: u32,
         height: u32,
     ) -> Result<(), RenderError> {
-        if width == 0
-            || height == 0
-            || x.checked_add(width).is_none_or(|n| n > target.width)
+        if x.checked_add(width).is_none_or(|n| n > target.width)
             || y.checked_add(height).is_none_or(|n| n > target.height)
         {
-            return Err(RenderError::new("Clear", "viewport outside logical target"));
+            return Err(RenderError::invalid(
+                "Clear",
+                format!(
+                    "region ({x}, {y} {width}x{height}) outside logical target {}x{}",
+                    target.width, target.height
+                ),
+            ));
         }
         if flags & 6 != 0 && target.depth.is_none() {
             return Err(RenderError::new(
@@ -601,6 +605,9 @@ impl GpuContext {
                 "Clear",
                 "stencil requested without stencil aspect",
             ));
+        }
+        if width == 0 || height == 0 {
+            return Ok(());
         }
         if x == 0 && y == 0 && width == target.texture.width() && height == target.texture.height()
         {

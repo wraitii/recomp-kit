@@ -270,7 +270,7 @@ enum ComKind : uint16_t {
 // DIPROP_SATURATION (dx/dinput_joystick.cpp). The zone and saturation are in
 // 0..10000 of the distance from centre, as DirectInput states them.
 struct JoyAxisRange {
-    int32_t min = -32768, max = 32767;
+    int32_t min = 0, max = 65535;
     uint32_t deadzone = 0, saturation = 10000;
 };
 // One field of a custom joystick data format: the guest's offset for one
@@ -528,6 +528,10 @@ struct ComObj {
     // Weak cache of the externally held implicit backbuffer surface. The
     // surface holds its device alive; the device must not retain it in return.
     uint32_t d3d8_backbuffer = 0;
+    uint32_t d3d8_present_flags = 0;
+    std::array<std::array<uint32_t, 2>, 16> d3d8_streams{};
+    uint32_t d3d8_lock_flags = 0;
+    std::array<uint32_t, 4> d3d8_lock_rect{};
     // Weak cache of the implicit autodepth surface, materialized on demand
     // when D3DPRESENT_PARAMETERS asked for one. Same ownership rule as the
     // backbuffer: the surface retains the device, not the reverse.

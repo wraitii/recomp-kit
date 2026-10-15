@@ -12,6 +12,8 @@
 #include "display_settings.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <charconv>
 #include <map>
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,32 +78,75 @@ void mods_settings_reset() {
 bool mods_settings_load(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f)
-        return true; // no file yet is not an error
+        return errno == ENOENT;
     std::string text;
     char buf[8192];
     size_t n;
     while ((n = fread(buf, 1, sizeof buf, f)) > 0)
         text.append(buf, n);
-    fclose(f);
+    const bool read_ok = !ferror(f);
+    if (fclose(f) != 0 || !read_ok)
+        return false;
 
-    // {"mod.id/key": 7, ...} - the same shape the registry store uses.
+    std::map<std::string, int64_t> parsed;
     size_t i = 0;
-    while ((i = text.find('"', i)) != std::string::npos) {
-        size_t end = text.find('"', i + 1);
-        if (end == std::string::npos)
-            break;
-        std::string key = text.substr(i + 1, end - i - 1);
-        size_t colon = text.find(':', end);
-        if (colon == std::string::npos)
-            break;
-        stored()[key] = strtoll(text.c_str() + colon + 1, nullptr, 10);
-        i = text.find(',', colon);
-        if (i == std::string::npos)
-            break;
+    auto space = [&] {
+        while (i < text.size() &&
+               (text[i] == ' ' || text[i] == '\t' || text[i] == '\r' || text[i] == '\n'))
+            ++i;
+    };
+    auto take = [&](char c) {
+        space();
+        if (i == text.size() || text[i] != c)
+            return false;
+        ++i;
+        return true;
+    };
+    if (!take('{'))
+        return false;
+    space();
+    if (i < text.size() && text[i] != '}') {
+        for (;;) {
+            if (!take('"'))
+                return false;
+            const size_t start = i;
+            while (i < text.size() && text[i] != '"') {
+                if (static_cast<unsigned char>(text[i]) < 32 || text[i] == '\\')
+                    return false;
+                ++i;
+            }
+            const std::string key = text.substr(start, i - start);
+            if (!take('"') || !take(':'))
+                return false;
+            space();
+            const size_t number = i;
+            if (i < text.size() && text[i] == '-')
+                ++i;
+            const size_t digits = i;
+            while (i < text.size() && text[i] >= '0' && text[i] <= '9')
+                ++i;
+            if (digits == i || (i - digits > 1 && text[digits] == '0'))
+                return false;
+            int64_t value = 0;
+            if (std::from_chars(text.data() + number, text.data() + i, value).ec != std::errc{} ||
+                !parsed.emplace(key, value).second)
+                return false;
+            space();
+            if (i < text.size() && text[i] == '}')
+                break;
+            if (!take(','))
+                return false;
+        }
     }
+    if (!take('}'))
+        return false;
+    space();
+    if (i != text.size())
+        return false;
+    stored() = std::move(parsed);
     for (Entry &e : entries()) {
         auto it = stored().find(e.mod_id + "/" + e.key);
-        if (it != stored().end())
+        if (it != stored().end() && it->second >= e.min && it->second <= e.max)
             e.value = it->second;
     }
     return true;

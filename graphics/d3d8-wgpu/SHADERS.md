@@ -16,7 +16,15 @@ bump state, preserving queued work across later state changes and deletion.
 
 ## Supported slice
 
-- `vs.1.1`, `ps.1.1`; other versions fail during creation by name.
+- `vs.1.0/1.1`, `ps.1.0/1.1`; other versions fail during creation by name.
+- Creation validates and retains consecutive TEXM3X3PAD/TEXM3X3PAD/TEXM3X3VSPEC
+  sequences, including their `_bx2` source modifier. These programs remain
+  queryable and bindable; drawing with them fails by name because cube/volume
+  sampling and four-component texture-coordinate varyings are not implemented.
+  Cube/volume capabilities remain unadvertised. This permits applications to
+  create their shader libraries before selecting a rendering path.
+  `shader-corpus --d3d8-create <shader.bin>...` checks creation from copied
+  bytecode and reports draw availability separately; it does not validate GPU execution.
 - Stream-0 declarations: FLOAT1/2/3/4, D3DCOLOR, UBYTE4, SHORT2/4, SKIP and
   CONST. Float inputs extend with zero components and w=1. Packed D3DCOLOR is
   BGRA bytes converted to floating RGBA. Declaration-only shaders support the

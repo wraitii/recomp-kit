@@ -143,7 +143,7 @@ MOD_TEST_SUITE(capture_corpus_has_every_field_replay_needs) {
     // Everything pop_replay::validate and the replay itself read back.
     MOD_CHECK(text.find("\"version\": 1") != std::string::npos);
     MOD_CHECK(text.find("\"target\": 305397760") != std::string::npos);
-    MOD_CHECK(text.find("\"arena_size\": 268435456") != std::string::npos);
+    MOD_CHECK(text.find("\"arena_size\": " + std::to_string(GUEST_SIZE)) != std::string::npos);
     MOD_CHECK(text.find("\"live_flags\": 0") != std::string::npos);
     MOD_CHECK(text.find("\"entry\": {") != std::string::npos);
     MOD_CHECK(text.find("\"exit\": {") != std::string::npos);

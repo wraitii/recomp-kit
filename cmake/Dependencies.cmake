@@ -11,13 +11,7 @@ set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
 set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
-# Android keeps the renderer: without it a window has no software surface,
-# and the launcher draws through one on a device without Vulkan.
-if(ANDROID)
-  set(SDL_RENDER ON CACHE BOOL "" FORCE)
-else()
-  set(SDL_RENDER OFF CACHE BOOL "" FORCE)
-endif()
+set(SDL_RENDER ON CACHE BOOL "" FORCE)
 set(SDL_GPU OFF CACHE BOOL "" FORCE)
 if(EMSCRIPTEN)
   set(SDL_PTHREADS ON CACHE BOOL "" FORCE) # the game runs on a thread of its own

@@ -161,42 +161,15 @@ bool g_drew_since_seal = false;
 
 namespace {
 
-// The display modes this shim offers, and the only ones SetDisplayMode
-// accepts. ONE table, read by both, because a mode the game was offered and
-// then refused is a contradiction that costs a run to find.
-//
-// RECOMP_DDRAW_MODES replaces it with a comma-separated list of WxHxB, as in
-// "640x480x8,1280x960x16". Unset, or set to nothing, keeps the modes below.
-// The original modes retain both depths; higher native modes are RGB565.
-//
-// A malformed list is refused WHOLE rather than in part. A list honoured up to
-// its first mistake offers a set nobody wrote down, and the run that followed
-// would quietly be about that set instead.
-//
-// Eight and sixteen bits only, because those are the two pixel formats the
-// enumeration below can describe. Offering another depth would be a lie the
-// guest would act on: it would select the mode and then be handed a surface
-// laid out some other way.
-//
-// A WARNING ABOUT THE VARIABLE, PAID FOR BY A CRASH
-//
-// The variable restricts the list from the moment the process starts, and this
-// game does not ask what is available before its first SetDisplayMode: it
-// boots straight into 640x480x8. RECOMP_DDRAW_MODES="800x600x16" therefore has
-// that first call refused, and the guest, which does not check, walks into a
-// SIGBUS at EIP 004a45a3. Measured, not guessed.
-//
-// So the variable is for a list that still contains the boot mode, and a
-// script that wants to force one single mode uses ddraw_set_modes() at
-// runtime, after the game is up. The check below says so rather than leaving
-// the next person to find the crash.
 struct Mode {
     uint32_t w, h, bpp;
 };
 const Mode kBuiltInModes[] = {
-    {640, 480, 8},    {640, 480, 16},   {800, 600, 8},    {800, 600, 16},
-    {1024, 768, 8},   {1024, 768, 16},  {1280, 720, 16},  {1280, 960, 16},
-    {1600, 1200, 16}, {1920, 1080, 16}, {2560, 1440, 16}, {3840, 2160, 16},
+    {640, 480, 8},    {640, 480, 16},   {800, 600, 8},    {800, 600, 16},   {1024, 768, 8},
+    {1024, 768, 16},  {1280, 720, 16},  {1280, 960, 16},  {1600, 1200, 16}, {1920, 1080, 16},
+    {2560, 1440, 16}, {3840, 2160, 16}, {640, 480, 32},   {800, 600, 32},   {1024, 768, 32},
+    {1280, 720, 32},  {1280, 960, 32},  {1600, 1200, 32}, {1920, 1080, 32}, {2560, 1440, 32},
+    {3840, 2160, 32},
 };
 
 std::vector<Mode> &mode_table() {
@@ -231,7 +204,7 @@ bool parse_one_mode(const char *&p, Mode *out) {
         return false;
     if (!m.w || !m.h)
         return false;
-    if (m.bpp != 8 && m.bpp != 16)
+    if (m.bpp != 8 && m.bpp != 16 && m.bpp != 32)
         return false;
     *out = m;
     return true;
@@ -260,12 +233,6 @@ void use_built_in_modes(std::vector<Mode> &v) {
     v.assign(kBuiltInModes, kBuiltInModes + (sizeof kBuiltInModes / sizeof kBuiltInModes[0]));
 }
 
-// The modes the front end runs in without asking what is available. BOTH of
-// them: it selects 640x480x8 first and 640x480x16 a moment later, and a list
-// missing either has that call refused. Measured twice - a list with only the
-// 8-bit one died on "SetDisplayMode(640, 480, 16) is not one of the offered
-// modes" followed by a jump through a null target, because the game does not
-// check the return.
 bool has_mode(const std::vector<Mode> &v, uint32_t w, uint32_t h, uint32_t bpp) {
     for (const Mode &m : v)
         if (m.w == w && m.h == h && m.bpp == bpp)
@@ -285,20 +252,10 @@ const std::vector<Mode> &modes() {
             LOGW("ddraw: RECOMP_DDRAW_MODES offers %zu mode%s instead of the "
                  "built-in list; SetDisplayMode accepts the same set",
                  v.size(), v.size() == 1 ? "" : "s");
-            const bool has8 = has_mode(v, 640, 480, 8);
-            const bool has16 = has_mode(v, 640, 480, 16);
-            if (!has8 || !has16)
-                LOGW("ddraw: and it is missing %s, which the front end selects "
-                     "without asking what is available and without checking "
-                     "the refusal; the guest will die on it. Offer both "
-                     "640x480x8 and 640x480x16, or use ddraw_set_modes() "
-                     "after boot.",
-                     !has8 && !has16 ? "640x480x8 and 640x480x16"
-                                     : (!has8 ? "640x480x8" : "640x480x16"));
             return v;
         }
         LOGW("ddraw: RECOMP_DDRAW_MODES=\"%s\" is not a comma-separated list of "
-             "WxHxB with a depth of 8 or 16; keeping the built-in modes",
+             "WxHxB with a depth of 8, 16 or 32; keeping the built-in modes",
              spec);
     }
     use_built_in_modes(v);
@@ -1715,11 +1672,6 @@ void ddraw_reset_modes(void) {
     mode_table().clear();
 }
 
-// Replace the offered set while the game is running, which is what a display
-// script's `mode` verb does and what the environment variable cannot safely
-// do - see the warning above the table. A null or empty spec restores the
-// built-in list. On a malformed spec the table is left exactly as it was, so a
-// typo narrows nothing.
 int ddraw_set_modes(const char *spec) {
     if (!spec || !*spec) {
         use_built_in_modes(mode_table());
@@ -1732,7 +1684,7 @@ int ddraw_set_modes(const char *spec) {
     std::vector<Mode> parsed;
     if (!parse_modes(spec, &parsed) || parsed.empty()) {
         LOGW("ddraw: ddraw_set_modes(\"%s\") is not a comma-separated list of "
-             "WxHxB with a depth of 8 or 16; the offered modes are unchanged",
+             "WxHxB with a depth of 8, 16 or 32; the offered modes are unchanged",
              spec);
         return 0;
     }
@@ -1742,7 +1694,7 @@ int ddraw_set_modes(const char *spec) {
 }
 
 int ddraw_add_mode(int w, int h, int bpp) {
-    if (w <= 0 || h <= 0 || w > 65535 || h > 65535 || (bpp != 8 && bpp != 16))
+    if (w <= 0 || h <= 0 || w > 65535 || h > 65535 || (bpp != 8 && bpp != 16 && bpp != 32))
         return 0;
     const auto &offered = modes();
     if (!has_mode(offered, w, h, bpp))
@@ -4982,10 +4934,10 @@ void DD_EnumDisplayModes(X86 *c) {
             wr32(pf + DDPF_OFF_dwRGBBitCount, 8);
         } else {
             wr32(pf + DDPF_OFF_dwFlags, DDPF_RGB);
-            wr32(pf + DDPF_OFF_dwRGBBitCount, 16);
-            wr32(pf + DDPF_OFF_dwRBitMask, 0xf800);
-            wr32(pf + DDPF_OFF_dwGBitMask, 0x07e0);
-            wr32(pf + DDPF_OFF_dwBBitMask, 0x001f);
+            wr32(pf + DDPF_OFF_dwRGBBitCount, m.bpp);
+            wr32(pf + DDPF_OFF_dwRBitMask, m.bpp == 16 ? 0xf800 : 0x00ff0000);
+            wr32(pf + DDPF_OFF_dwGBitMask, m.bpp == 16 ? 0x07e0 : 0x0000ff00);
+            wr32(pf + DDPF_OFF_dwBBitMask, m.bpp == 16 ? 0x001f : 0x000000ff);
         }
         if (guest_call(c, cb, desc, ctx) != DDENUMRET_OK)
             break;
@@ -5077,9 +5029,9 @@ void DD_GetDisplayMode(X86 *c) {
     } else {
         wr32(pf + DDPF_OFF_dwFlags, DDPF_RGB);
         wr32(pf + DDPF_OFF_dwRGBBitCount, bpp);
-        wr32(pf + DDPF_OFF_dwRBitMask, 0xf800);
-        wr32(pf + DDPF_OFF_dwGBitMask, 0x07e0);
-        wr32(pf + DDPF_OFF_dwBBitMask, 0x001f);
+        wr32(pf + DDPF_OFF_dwRBitMask, bpp == 16 ? 0xf800 : 0x00ff0000);
+        wr32(pf + DDPF_OFF_dwGBitMask, bpp == 16 ? 0x07e0 : 0x0000ff00);
+        wr32(pf + DDPF_OFF_dwBBitMask, bpp == 16 ? 0x001f : 0x000000ff);
     }
     com_ret(c, DD_OK);
 }
@@ -5196,12 +5148,6 @@ void set_display_mode(X86 *c, uint32_t w, uint32_t h, uint32_t bpp) {
         com_ret(c, DDERR_INVALIDPARAMS);
         return;
     }
-    // AFTER the acceptance check, with the rest of the state changes. A
-    // refused SetDisplayMode is a no-op, and a refusal is not hypothetical:
-    // RECOMP_DDRAW_MODES without 640x480x8 has the game's very first call
-    // refused, and the game does not check the return. Forgetting the cursor
-    // there would leave it drawing in the mode it still has with a pointer
-    // the shim has thrown away.
     dd->mode_w = w;
     dd->mode_h = h;
     dd->mode_bpp = bpp;

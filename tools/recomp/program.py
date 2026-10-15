@@ -186,9 +186,36 @@ class Program(object):
             for n in sizes:
                 out.append((at, n))
                 at += n
+        for start, lengths in self.overlapping_runs(addr, {at for at, _ in out}):
+            for n in lengths:
+                out.append((start, n))
+                start += n
         out.sort()
         self._instructions[addr] = out
         return out
+
+    def overlapping_runs(self, addr, starts):
+        """[(entry, [lengths])] decoded from configured entries inside a mapped instruction.
+
+        Hand-written code may jump into the middle of an instruction to execute
+        its trailing bytes as other instructions. Each run decodes from the
+        entry until it reaches a mapped instruction or ends flow."""
+        runs = []
+        for entry in sorted(e for e in self.configured_entries if e not in starts):
+            if self.containing(entry) != addr:
+                continue
+            at, lengths = entry, []
+            while at not in starts:
+                if self.containing(at) != addr or len(lengths) == 16:
+                    raise TranslateError("%08x: overlapping entry %08x does not rejoin the function"
+                                         % (addr, entry))
+                n = self.lifter.length(at, self.pe.bytes_at(at, 15))
+                lengths.append(n)
+                at += n
+                if self.lifter.ends_flow(at - n, self.pe.bytes_at(at - n, n)):
+                    break
+            runs.append((entry, lengths))
+        return runs
 
     def owners(self):
         """{instruction address: function}. Covers every function; decodes them all."""
@@ -288,8 +315,8 @@ class Program(object):
                             and op.ins[0][1] in noreturn):
                         falls = False
             if falls:
-                if k + 1 < len(insns) and insns[k + 1].addr == ins.addr + ins.length:
-                    out.append(k + 1)
+                if ins.addr + ins.length in index:
+                    out.append(index[ins.addr + ins.length])
                 else:
                     leave.append(ins.addr + ins.length)
             succ.append(sorted(set(out)))

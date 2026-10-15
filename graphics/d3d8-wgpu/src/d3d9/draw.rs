@@ -306,7 +306,7 @@ fn indexed_vertex_index(bytes: &[u8], index_format: u32, index: usize) -> u32 {
     }
 }
 
-fn expanded_indices(
+pub(crate) fn expanded_indices(
     command: &DrawCommand,
     dense_remap: &mut Vec<u32>,
     slots: &mut FastMap<u32, u32>,
@@ -475,6 +475,28 @@ struct VertexFetch<'a> {
     stride: usize,
     size: usize,
     element_type: u8,
+}
+
+pub(crate) fn vertex_element_bytes(
+    bytes: &[u8],
+    stride: u32,
+    stream_offset: u32,
+    offset: u64,
+    size: usize,
+    index: u32,
+) -> Result<&[u8], RenderError> {
+    let base = (index as usize)
+        .checked_mul(stride as usize)
+        .and_then(|v| v.checked_add(stream_offset as usize))
+        .and_then(|v| v.checked_add(offset as usize))
+        .ok_or_else(|| invalid("Draw", "vertex offset overflow"))?;
+    let end = base
+        .checked_add(size)
+        .ok_or_else(|| invalid("Draw", "vertex offset overflow"))?;
+    if end > bytes.len() {
+        return Err(invalid("Draw", "vertex fetch is outside the stream"));
+    }
+    Ok(&bytes[base..end])
 }
 
 impl<'a> VertexFetch<'a> {

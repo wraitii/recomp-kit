@@ -233,6 +233,7 @@ void Launcher::rebuild() {
                     add(kUseCandidate + int(i), "Import " + shorten(display(found_[i]), 40));
         }
         add(kManage, "Manage...");
+        add(kConfigure, "Configure...");
         if (!spec_.store_url.empty() && status_.state == State::NotFound)
             add(kStore, "Where to get the game");
         add(kQuit, "Quit");
@@ -482,6 +483,9 @@ void Launcher::activate(int id) {
         screen_ = Screen::Manage;
         focus_ = 0;
         rebuild();
+        break;
+    case kConfigure:
+        configure_requested_ = true;
         break;
     case kExportSaves: {
         auto weak = std::weak_ptr<Shared>(shared_);

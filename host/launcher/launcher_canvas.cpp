@@ -37,6 +37,19 @@ void Canvas::put(int x, int y, Color c) {
     p[3] = 255;
 }
 
+void Canvas::composite_rgba(const std::vector<uint8_t> &pixels) {
+    if (pixels.size() != px_.size())
+        return;
+    for (size_t i = 0; i < pixels.size(); i += 4) {
+        const int remaining = 255 - pixels[i + 3];
+        px_[i] = uint8_t(std::min(255, pixels[i + (bgra_ ? 2 : 0)] + px_[i] * remaining / 255));
+        px_[i + 1] = uint8_t(std::min(255, pixels[i + 1] + px_[i + 1] * remaining / 255));
+        px_[i + 2] =
+            uint8_t(std::min(255, pixels[i + (bgra_ ? 0 : 2)] + px_[i + 2] * remaining / 255));
+        px_[i + 3] = 255;
+    }
+}
+
 void Canvas::clear(Color c) {
     fill({0, 0, w_, h_}, {c.r, c.g, c.b, 255});
 }

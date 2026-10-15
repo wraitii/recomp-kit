@@ -3,11 +3,19 @@
 
 #include "../../platform/os.h"
 #include "../gpu/gpu.h"
+#include "../controls/controls_host.h"
+#include "../controls/gamepad_sdl.h"
+#include "../controls/overlay_paint.h"
+#include "../controls/pad_mapper_editor.h"
+#include "../input_touch.h"
+#include "../preferences.h"
+#include "../sdl/keymap.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <sstream>
 
 namespace launcher {
 
@@ -108,6 +116,295 @@ struct Presenter {
     }
 };
 
+ConfigureActions preferences_actions() {
+    ConfigureActions actions;
+    actions.read = [](std::vector<ConfigureSetting> *out, std::string *error) {
+        if (!host_preferences::load(error))
+            return false;
+        std::size_t count = 0;
+        const host_preferences::SettingInfo *infos = host_preferences::settings(&count);
+        out->clear();
+        for (std::size_t i = 0; i < count; ++i) {
+            const host_preferences::SettingInfo &info = infos[i];
+            ConfigureSetting setting;
+            setting.id = info.id;
+            setting.label = info.label;
+            setting.description = info.description;
+            setting.wrap = info.choices != nullptr;
+            if (info.choices) {
+                std::istringstream choices(info.choices);
+                std::string value;
+                while (std::getline(choices, value, '|'))
+                    setting.values.push_back(value);
+            } else {
+                for (int value = info.minimum; value <= info.maximum; value += info.step)
+                    setting.values.push_back(std::to_string(value) + "%");
+            }
+            const int raw = host_preferences::get(info.setting);
+            setting.value = (raw - info.minimum) / info.step;
+            setting.recommended = (info.recommended - info.minimum) / info.step;
+            if (setting.value < 0 || setting.value >= int(setting.values.size()))
+                setting.value =
+                    std::clamp(setting.recommended, 0, std::max(0, int(setting.values.size()) - 1));
+            out->push_back(std::move(setting));
+        }
+        if (error)
+            error->clear();
+        return true;
+    };
+    actions.set = [](const std::string &id, int index, std::string *error) {
+        std::size_t count = 0;
+        const host_preferences::SettingInfo *infos = host_preferences::settings(&count);
+        for (std::size_t i = 0; i < count; ++i)
+            if (id == infos[i].id) {
+                const bool changed = host_preferences::set(
+                    infos[i].setting, infos[i].minimum + index * infos[i].step, error);
+                if (changed && infos[i].setting == host_preferences::Setting::KeyboardNames)
+                    host_key_names_refresh();
+                return changed;
+            }
+        if (error)
+            *error = "This setting is unavailable.";
+        return false;
+    };
+    actions.restore_recommended = [](std::string *error) { return host_preferences::reset(error); };
+    return actions;
+}
+
+bool run_configure_ui(SDL_Window *window, gpu::Device *device, void *native_surface,
+                      const std::string &game) {
+    ConfigureUi ui(game, preferences_actions());
+    SDL_InitSubSystem(SDL_INIT_GAMEPAD);
+    SDL_ShowWindow(window);
+    SDL_RaiseWindow(window);
+    int dw = 0, dh = 0, bw = 0, bh = 0;
+    SDL_GetWindowSizeInPixels(window, &dw, &dh);
+    SDL_GetWindowSize(window, &bw, &bh);
+    Presenter presenter;
+    presenter.device = device;
+    presenter.window = window;
+    if (!presenter.open(native_surface, std::max(1, dw), std::max(1, dh))) {
+        const std::string error =
+            "Could not open the Configure display: " + std::string(SDL_GetError());
+        fprintf(stderr, "[configure] %s\n", error.c_str());
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Configure", error.c_str(), window);
+        presenter.close();
+        return false;
+    }
+    Canvas canvas;
+    controls::PadMapperEditor controller;
+    controls::host_set_focused(false);
+    controls::host_mapper_load();
+    std::vector<uint8_t> controller_pixels;
+    auto screen = [&] {
+        SDL_GetWindowSizeInPixels(window, &dw, &dh);
+        SDL_GetWindowSize(window, &bw, &bh);
+        return controls::Screen{dw, dh, bw > 0 ? double(dw) / bw : 1.0, {0, 0, dw, dh}, {}};
+    };
+    bool redraw = true;
+    auto to_canvas = [&](float x, float y, int *cx, int *cy) {
+        *cx = bw > 0 ? int(x * float(dw) / float(bw)) : int(x);
+        *cy = bh > 0 ? int(y * float(dh) / float(bh)) : int(y);
+    };
+    while (!ui.done()) {
+        SDL_Event event;
+        if (SDL_WaitEventTimeout(&event, controller.is_open() ? 16 : 250)) {
+            do {
+                controls::gamepad_handle_event(event);
+                controller.set_device(controls::gamepad_name(), controls::gamepad_connected());
+                controller.observe_input(controls::host_mapper_raw_state());
+                if (controller.is_open()) {
+                    controller.set_screen(screen());
+                    switch (event.type) {
+                    case SDL_EVENT_MOUSE_MOTION: {
+                        int x, y;
+                        to_canvas(event.motion.x, event.motion.y, &x, &y);
+                        controller.pointer(x, y, 0);
+                        break;
+                    }
+                    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+                    case SDL_EVENT_MOUSE_BUTTON_UP:
+                        if (event.button.button == SDL_BUTTON_LEFT) {
+                            int x, y;
+                            to_canvas(event.button.x, event.button.y, &x, &y);
+                            controller.pointer(x, y,
+                                               event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ? 1 : -1);
+                        }
+                        break;
+                    case SDL_EVENT_MOUSE_WHEEL:
+                        controller.wheel(event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED
+                                             ? -event.wheel.y
+                                             : event.wheel.y);
+                        break;
+                    case SDL_EVENT_FINGER_DOWN:
+                    case SDL_EVENT_FINGER_MOTION:
+                    case SDL_EVENT_FINGER_UP:
+                        controller.pointer(event.tfinger.x * dw, event.tfinger.y * dh,
+                                           event.type == SDL_EVENT_FINGER_DOWN ? 1
+                                           : event.type == SDL_EVENT_FINGER_UP ? -1
+                                                                               : 0);
+                        break;
+                    case SDL_EVENT_KEY_DOWN:
+                    case SDL_EVENT_KEY_UP:
+                        controller.key(event.key.scancode, event.type == SDL_EVENT_KEY_DOWN);
+                        break;
+                    case SDL_EVENT_WINDOW_FOCUS_LOST:
+                        controller.suspend();
+                        break;
+                    default:
+                        break;
+                    }
+                    if (event.type == SDL_EVENT_QUIT)
+                        controller.request_close();
+                    continue;
+                }
+                switch (event.type) {
+                case SDL_EVENT_QUIT:
+                    ui.key(Key::Back);
+                    break;
+                case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+                case SDL_EVENT_WINDOW_RESIZED:
+                case SDL_EVENT_WINDOW_EXPOSED:
+                    redraw = true;
+                    break;
+                case SDL_EVENT_KEYMAP_CHANGED:
+                    host_key_names_refresh();
+                    break;
+                case SDL_EVENT_MOUSE_BUTTON_DOWN:
+                case SDL_EVENT_MOUSE_BUTTON_UP:
+                    if (event.button.button == SDL_BUTTON_LEFT) {
+                        int x, y;
+                        to_canvas(event.button.x, event.button.y, &x, &y);
+                        ui.pointer(x, y, event.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
+                    }
+                    break;
+                case SDL_EVENT_FINGER_DOWN:
+                case SDL_EVENT_FINGER_UP:
+                    ui.pointer(int(event.tfinger.x * float(dw)), int(event.tfinger.y * float(dh)),
+                               event.type == SDL_EVENT_FINGER_DOWN);
+                    break;
+                case SDL_EVENT_KEY_DOWN:
+                    switch (event.key.scancode) {
+                    case SDL_SCANCODE_UP:
+                        ui.key(Key::Up);
+                        break;
+                    case SDL_SCANCODE_DOWN:
+                        ui.key(Key::Down);
+                        break;
+                    case SDL_SCANCODE_LEFT:
+                        ui.key(Key::Left);
+                        break;
+                    case SDL_SCANCODE_RIGHT:
+                        ui.key(Key::Right);
+                        break;
+                    case SDL_SCANCODE_TAB:
+                        ui.key((event.key.mod & SDL_KMOD_SHIFT) ? Key::Previous : Key::Next);
+                        break;
+                    case SDL_SCANCODE_RETURN:
+                    case SDL_SCANCODE_KP_ENTER:
+                    case SDL_SCANCODE_SPACE:
+                        ui.key(Key::Activate);
+                        break;
+                    case SDL_SCANCODE_ESCAPE:
+                    case SDL_SCANCODE_AC_BACK:
+                        ui.key(Key::Back);
+                        break;
+                    default:
+                        break;
+                    }
+                    break;
+                case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+                    switch (event.gbutton.button) {
+                    case SDL_GAMEPAD_BUTTON_DPAD_UP:
+                        ui.key(Key::Up);
+                        break;
+                    case SDL_GAMEPAD_BUTTON_DPAD_DOWN:
+                        ui.key(Key::Down);
+                        break;
+                    case SDL_GAMEPAD_BUTTON_DPAD_LEFT:
+                        ui.key(Key::Left);
+                        break;
+                    case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:
+                        ui.key(Key::Right);
+                        break;
+                    case SDL_GAMEPAD_BUTTON_SOUTH:
+                    case SDL_GAMEPAD_BUTTON_START:
+                        ui.key(Key::Activate);
+                        break;
+                    case SDL_GAMEPAD_BUTTON_EAST:
+                    case SDL_GAMEPAD_BUTTON_BACK:
+                        ui.key(Key::Back);
+                        break;
+                    default:
+                        break;
+                    }
+                    break;
+                default:
+                    break;
+                }
+                if (ui.take_controller_request()) {
+                    controls::host_mapper_load();
+                    controller.open(controls::host_mapper_profile(), screen());
+                    redraw = true;
+                }
+            } while (SDL_PollEvent(&event));
+        }
+        controls::gamepad_poll();
+        controller.set_device(controls::gamepad_name(), controls::gamepad_connected());
+        const controls::Screen controller_screen = screen();
+        if (controller.is_open()) {
+            const auto action = controller.take_action();
+            if (action == controls::PadMapperEditorAction::CloseWindow)
+                ui.key(Key::Back);
+            if (action == controls::PadMapperEditorAction::CloseWindow ||
+                action == controls::PadMapperEditorAction::Cancel ||
+                (action == controls::PadMapperEditorAction::Apply &&
+                 controls::host_mapper_apply(controller.profile(), true))) {
+                controller.close();
+                redraw = true;
+            }
+        }
+        if (dw <= 0 || dh <= 0)
+            continue;
+        if (redraw || controller.is_open() || ui.dirty() || canvas.width() != dw ||
+            canvas.height() != dh) {
+            redraw = false;
+            presenter.resize(dw, dh);
+            const bool bgra = presenter.format == gpu::Format::BGRA8;
+            canvas.resize(dw, dh, bgra);
+            const int scale = std::max(1, std::min(dw / 640, dh / 520));
+            if (controller.is_open()) {
+                controls::PadMapper preview;
+                controls::PadState calibrated, guest;
+                std::vector<TouchAction> ignored;
+                const controls::PadState raw = controls::host_mapper_raw_state();
+                std::string error;
+                std::string status = controls::host_mapper_status();
+                if (preview.set_profile(controller.profile(), &error))
+                    preview.process(raw, &calibrated, &guest, &ignored);
+                else
+                    status = "Invalid controller profile draft: " + error;
+                controller.set_screen(controller_screen);
+                const auto view =
+                    controller.view(controller_screen, raw, calibrated, guest, status);
+                controller_pixels.assign(size_t(dw) * size_t(dh) * 4, 0);
+                controls::Canvas raster(controller_pixels, dw, dh);
+                controls::paint_editor(raster, view, {0, 0, dw, dh});
+                canvas.clear({16, 18, 24, 255});
+                canvas.composite_rgba(controller_pixels);
+            } else {
+                ui.draw(canvas, scale);
+            }
+            presenter.show(canvas);
+        }
+    }
+    controller.close();
+    controls::host_gamepad_state({});
+    controls::host_set_focused(true);
+    presenter.close();
+    return ui.ready();
+}
+
 void write_ppm(const std::string &path, const Canvas &c, bool bgra) {
     FILE *f = fopen((path + ".part").c_str(), "wb");
     if (!f)
@@ -128,6 +425,35 @@ void write_ppm(const std::string &path, const Canvas &c, bool bgra) {
 }
 
 } // namespace
+
+bool configure(SDL_Window *window, gpu::Device *device, void *native_surface) {
+    if (!window)
+        return false;
+    std::string error;
+    if (!host_preferences::reload(&error)) {
+        fprintf(stderr, "[configure] %s\n", error.c_str());
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Configure", error.c_str(), window);
+        return false;
+    }
+    const char *window_title = SDL_GetWindowTitle(window);
+    const std::string previous_title = window_title ? window_title : "";
+    int previous_width = 0, previous_height = 0;
+    SDL_GetWindowSize(window, &previous_width, &previous_height);
+    int minimum_width = 0, minimum_height = 0;
+    SDL_GetWindowMinimumSize(window, &minimum_width, &minimum_height);
+    SDL_SetWindowMinimumSize(window, std::max(minimum_width, 640), std::max(minimum_height, 520));
+    const std::string configure_title = "Configure " + spec_from_config().title;
+    SDL_SetWindowTitle(window, configure_title.c_str());
+    const bool resized = previous_width < 640 || previous_height < 520;
+    if (resized)
+        SDL_SetWindowSize(window, std::max(previous_width, 640), std::max(previous_height, 520));
+    const bool result = run_configure_ui(window, device, native_surface, spec_from_config().title);
+    SDL_SetWindowMinimumSize(window, minimum_width, minimum_height);
+    if (resized)
+        SDL_SetWindowSize(window, previous_width, previous_height);
+    SDL_SetWindowTitle(window, previous_title.c_str());
+    return result;
+}
 
 std::string run(SDL_Window *window, gpu::Device *device, void *native_surface, Platform &platform,
                 const RunOptions &options) {
@@ -214,6 +540,9 @@ std::string run(SDL_Window *window, gpu::Device *device, void *native_surface, P
                 case SDL_EVENT_WINDOW_RESIZED:
                 case SDL_EVENT_WINDOW_EXPOSED:
                     redraw = true;
+                    break;
+                case SDL_EVENT_KEYMAP_CHANGED:
+                    host_key_names_refresh();
                     break;
                 case SDL_EVENT_MOUSE_BUTTON_DOWN:
                 case SDL_EVENT_MOUSE_BUTTON_UP:
@@ -307,6 +636,20 @@ std::string run(SDL_Window *window, gpu::Device *device, void *native_surface, P
             launcher.advance(std::min(0.1, double(now - last) / 1e9));
         last = now;
         launcher.tick();
+        if (launcher.configure_requested()) {
+            launcher.clear_configure_request();
+            presenter.close();
+            if (!configure(window, device, native_surface))
+                launcher.show_message("Configure could not load preferences or open the window.");
+            SDL_GetWindowSizeInPixels(window, &dw, &dh);
+            if (!presenter.open(native_surface, std::max(1, dw), std::max(1, dh))) {
+                fprintf(stderr, "[launcher] no swapchain for the window: %s\n", SDL_GetError());
+                for (SDL_Gamepad *g : pads)
+                    SDL_CloseGamepad(g);
+                return "";
+            }
+            redraw = true;
+        }
         {
             static int last_state = -1, last_screen = -1;
             const int st = int(launcher.status().state), sc = int(launcher.screen());

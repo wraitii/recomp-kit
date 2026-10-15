@@ -87,6 +87,11 @@ class Context(object):
             if lengths is None:
                 raise TranslateError("%08x: decoder cannot tile the mapped span at %08x" % (addr, start))
             insns.extend(code_map.decode_span(image, start, lengths))
+        runs = self.program.overlapping_runs(addr, {ins.addr for ins in insns})
+        for start, lengths in runs:
+            insns.extend(code_map.decode_span(image, start, "".join("%x" % n for n in lengths)))
+        if runs:
+            insns.sort(key=lambda ins: ins.addr)
         for ins in insns:
             if ins.addr in self.trap_instructions:
                 ins.raw = "%08x  UNMODELLED direct transfer: %s" % (ins.addr, ins.raw.split("  ", 1)[1])

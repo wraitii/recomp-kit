@@ -6,13 +6,14 @@
 // Design: docs/superpowers/specs/2026-09-17-touch-controls-design.md, 7.2-7.4.
 #include "../../dx/host_api.h"
 #include "game_config.h"
+#include "pad_mapper.h"
 #include "vpad.h"
 
 extern "C" {
 
 // 0 off, 1 mapped, 2 native, as [controls] pad in game.toml.
 int host_pad_mode(void) {
-    return RECOMP_CONTROLS_PAD;
+    return controls::pad_mapper_runtime_mode(RECOMP_CONTROLS_PAD);
 }
 
 // Which native APIs serve the pad: bit 0 DirectInput, bit 1 XInput. The

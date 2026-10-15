@@ -428,11 +428,11 @@ void write_caps(uint32_t addr) {
     // `DeviceState::validate_point_draw`), so no larger size is offered.
     // MaxPrimitiveCount (+0xb4) is the DX8 HAL-scale batch limit; a draw is not
     // otherwise bounded by the bridge. MaxVertexIndex (+0xb8) is the 16-bit
-    // vertex-index ceiling; MaxStreams (+0xbc) is one because SetStreamSource
-    // accepts only stream 0. MaxStreamStride (+0xc0) is the DX8 HAL maximum.
+    // vertex-index ceiling; MaxStreams (+0xbc) covers the declaration's sixteen
+    // stream indices. MaxStreamStride (+0xc0) is the DX8 HAL maximum.
     wr32(addr + 0xb4, 0x00555555u);
     wr32(addr + 0xb8, 0x0000ffffu);
-    wr32(addr + 0xbc, 1);
+    wr32(addr + 0xbc, 16);
     wr32(addr + 0xc0, 508);
 #ifdef RECOMP_D3D8_WGPU
     wr32(addr + 0xc4, 0xfffe0101u); // vs.1.1
@@ -762,8 +762,8 @@ void D8_CreateDevice(X86 *c) {
                    (swap == D3DSWAPEFFECT_FLIP && !windowed);
     bool interval_ok = interval == 0 || interval == D3DPRESENT_INTERVAL_IMMEDIATE;
     if (rd32(pp + 12) > 1 || rd32(pp + 16) || !swap_ok ||
-        (depth && !d8_depth_format(depth_format)) || rd32(pp + 40) || rd32(pp + 44) ||
-        !interval_ok) {
+        (depth && !d8_depth_format(depth_format)) ||
+        (rd32(pp + 40) & ~D3DPRESENTFLAG_LOCKABLE_BACKBUFFER) || rd32(pp + 44) || !interval_ok) {
         com_ret(c, D8_ERR_NOTAVAILABLE);
         return;
     }
@@ -788,6 +788,7 @@ void D8_CreateDevice(X86 *c) {
     dev->d3d8_height = h;
     dev->d3d8_format = format;
     dev->d3d8_depth_format = depth ? depth_format : 0;
+    dev->d3d8_present_flags = rd32(pp + 40);
     D3dHostDevice *cpu = d8_cpu_state(dev);
     auto dimensions = recomp::d3d::set_device_dimensions(*cpu->value, w, h);
     if (!d3d_bridge_ok(dimensions)) {
@@ -818,6 +819,9 @@ void D8_CreateDevice(X86 *c) {
         return;
     }
     wr32(out, view);
+    LOGW("d3d8: GPU device created %ux%u format=0x%x depth=0x%x lockable=%u", w, h, format,
+         depth ? depth_format : 0,
+         (dev->d3d8_present_flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER) != 0);
     com_ret(c, D8_OK);
 #else
     com_ret(c, D8_ERR_NOTAVAILABLE);
@@ -852,6 +856,10 @@ void Dev_Reset(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
+    if (ComObj *backbuffer = com_get(dev->d3d8_backbuffer); backbuffer && backbuffer->lock_count) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
     recomp::d3d::PresentParams params{};
     params.back_buffer_width = rd32(pp);
     params.back_buffer_height = rd32(pp + 4);
@@ -878,9 +886,11 @@ void Dev_Reset(X86 *c) {
     dev->d3d8_width = params.back_buffer_width;
     dev->d3d8_height = params.back_buffer_height;
     dev->d3d8_format = params.back_buffer_format;
+    dev->d3d8_present_flags = params.flags;
     dev->d3d8_depth_format =
         params.enable_auto_depth_stencil ? params.auto_depth_stencil_format : 0;
     device_discard_implicit_surfaces(dev);
+    dev->d3d8_streams = {};
     for (uint32_t texture_id : bound_textures) {
         if (ComObj *texture = com_get(texture_id))
             com_release_internal(texture);
@@ -1600,6 +1610,54 @@ void Dev_CreateTexture(X86 *c) {
     com_ret(c, D8_OK);
 }
 
+void Dev_CreateImageSurface(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t w = arg(c, 1), h = arg(c, 2), format = arg(c, 3), out = arg(c, 4);
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, 0);
+    if (!dev) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    ComObj *surface = com_new(K_D3D8SURFACE);
+    if (!surface) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    auto configuration = d8_resource(surface)->configure_texture(w, h, 1, format);
+    if (!d3d_bridge_ok(configuration.status)) {
+        com_release(surface);
+        com_ret(c, bridge_result(c, configuration.status));
+        return;
+    }
+    const auto &layout = configuration.levels[0];
+    if (layout.byte_len > GUEST_SIZE || !storage_alloc(surface, layout.byte_len)) {
+        com_release(surface);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    surface->d3d8_owner = dev->id;
+    surface->d3d8_owner_retained = true;
+    com_addref(dev);
+    surface->rmask = format;
+    surface->width = w;
+    surface->height = h;
+    surface->bpp = d8_format_bytes(format) * 8;
+    surface->pitch = layout.pitch;
+    d8_resource(surface)->set_flags(0, D3DPOOL_SYSTEMMEM, false, false, 0, 0, 0, 0);
+    uint32_t view = com_view(surface, IF_D3D8SURFACE8);
+    if (!view) {
+        com_release(surface);
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    wr32(out, view);
+    com_ret(c, D8_OK);
+}
+
 // (this, Width, Height, Format, MultiSampleType, ppSurface). A standalone
 // depth-stencil surface the guest can bind with SetRenderTarget. D3D8 accepts
 // D16, D24X8, D24S8 and D32. The object stores the descriptor and is retired
@@ -1788,8 +1846,7 @@ bool d8_lock_offset(const ComObj *level, uint32_t rect, uint32_t *offset) {
     return true;
 }
 
-// A texture level is one K_D3D8SURFACE; the implicit backbuffer has no blob
-// and leaves d3d8_texture zero. The level's own bytes back its lock.
+// CPU surfaces own storage; implicit backbuffer and depth surfaces do not.
 void Surface_GetDesc(X86 *c) {
     ComObj *surface = com_this_arg(c, IF_D3D8SURFACE8);
     uint32_t out = arg(c, 1);
@@ -1798,7 +1855,7 @@ void Surface_GetDesc(X86 *c) {
         return;
     }
     uint32_t format, usage, pool, size, width, height;
-    if (surface->d3d8_texture) {
+    if (surface->d3d8_storage) {
         format = surface->rmask;
         usage = d8_resource_info(surface).usage;
         pool = d8_resource_info(surface).pool;
@@ -1863,10 +1920,6 @@ void Surface_GetDevice(X86 *c) {
     com_ret(c, D8_OK);
 }
 
-// A texture level can be locked through its surface view; the implicit
-// backbuffer cannot (its bytes belong to the host render target, not the
-// shim), so that stops by name rather than returning a pointer into host
-// memory.
 void Surface_LockRect(X86 *c) {
     ComObj *surface = com_this_arg(c, IF_D3D8SURFACE8);
     uint32_t out = arg(c, 1);
@@ -1874,7 +1927,51 @@ void Surface_LockRect(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if (!surface->d3d8_texture) {
+    if (!surface->d3d8_storage) {
+        ComObj *dev = com_get(surface->d3d8_owner);
+        if (dev && dev->d3d8_backbuffer == surface->id) {
+            const uint32_t flags = arg(c, 3);
+            if (!(dev->d3d8_present_flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER) ||
+                surface->lock_count || (flags & ~(D3DLOCK_READONLY | D3DLOCK_NOSYSLOCK))) {
+                com_ret(c, D8_ERR_INVALIDCALL);
+                return;
+            }
+            surface->bpp = 32;
+            surface->pitch = surface->width * 4;
+            uint32_t offset;
+            if (!d8_lock_offset(surface, arg(c, 2), &offset)) {
+                com_ret(c, D8_ERR_INVALIDCALL);
+                return;
+            }
+            const uint32_t bytes = surface->pitch * surface->height;
+            const uint32_t base = heap_alloc(bytes, false);
+            if (!base) {
+                com_ret(c, E_OUTOFMEMORY);
+                return;
+            }
+            std::vector<uint8_t> rgba(bytes);
+            auto status = recomp::d3d::read_pixels(*dev->d3d8_device->value,
+                                                   rust::Slice<uint8_t>(rgba.data(), rgba.size()));
+            if (!d3d_bridge_ok(status)) {
+                heap_free(base);
+                com_ret(c, bridge_result(c, status));
+                return;
+            }
+            for (size_t i = 0; i < rgba.size(); i += 4)
+                std::swap(rgba[i], rgba[i + 2]);
+            memcpy(gm_ptr(base), rgba.data(), bytes);
+            surface->pixels = base;
+            surface->lock_count = 1;
+            surface->d3d8_lock_flags = flags;
+            surface->d3d8_lock_rect = {0, 0, surface->width, surface->height};
+            if (const uint32_t rect = arg(c, 2))
+                for (size_t i = 0; i < 4; ++i)
+                    surface->d3d8_lock_rect[i] = rd32(rect + uint32_t(i) * 4);
+            wr32(out, surface->pitch);
+            wr32(out + 4, base + offset);
+            com_ret(c, D8_OK);
+            return;
+        }
         fprintf(stderr, "d3d8: IDirect3DSurface8::LockRect on a host render target is not "
                         "implemented\n");
         fflush(stderr);
@@ -1892,7 +1989,40 @@ void Surface_LockRect(X86 *c) {
     com_ret(c, base ? D8_OK : E_OUTOFMEMORY);
 }
 void Surface_UnlockRect(X86 *c) {
-    d8_stage_unlock(com_this_arg(c, IF_D3D8SURFACE8));
+    ComObj *surface = com_this_arg(c, IF_D3D8SURFACE8);
+    ComObj *dev = surface ? com_get(surface->d3d8_owner) : nullptr;
+    if (surface && !surface->d3d8_texture && dev && dev->d3d8_backbuffer == surface->id) {
+        if (!surface->lock_count || !surface->pixels) {
+            com_ret(c, D8_ERR_INVALIDCALL);
+            return;
+        }
+        uint32_t result = D8_OK;
+        if (!(surface->d3d8_lock_flags & D3DLOCK_READONLY)) {
+            const auto &rect = surface->d3d8_lock_rect;
+            const uint32_t width = rect[2] - rect[0], height = rect[3] - rect[1];
+            std::vector<uint8_t> rgba(size_t(width) * height * 4);
+            const uint8_t *pixels = gm_ptr(surface->pixels);
+            for (uint32_t y = 0; y < height; ++y)
+                for (uint32_t x = 0; x < width; ++x) {
+                    const uint8_t *src =
+                        pixels + size_t(y + rect[1]) * surface->pitch + size_t(x + rect[0]) * 4;
+                    uint8_t *dst = rgba.data() + (size_t(y) * width + x) * 4;
+                    dst[0] = src[2];
+                    dst[1] = src[1];
+                    dst[2] = src[0];
+                    dst[3] = surface->rmask == D3DFMT_X8R8G8B8 ? 255 : src[3];
+                }
+            result = bridge_result(c, recomp::d3d::write_pixels(
+                                          *dev->d3d8_device->value, rect[0], rect[1], width, height,
+                                          rust::Slice<const uint8_t>(rgba.data(), rgba.size())));
+        }
+        heap_free(surface->pixels);
+        surface->pixels = 0;
+        surface->lock_count = 0;
+        com_ret(c, result);
+        return;
+    }
+    d8_stage_unlock(surface);
     com_ret(c, D8_OK);
 }
 
@@ -2215,6 +2345,9 @@ void buffer_destroy(ComObj *o) {
     // The owning device binds buffers weakly; drop any binding that points here
     // so a later draw does not resolve a dead object id.
     if (ComObj *dev = com_get(o->d3d8_owner)) {
+        for (auto &stream : dev->d3d8_streams)
+            if (stream[0] == o->id)
+                stream = {};
         if (dev->d3d8_device) {
             auto info = d8_device_info(dev);
             if (info.stream_vb == o->id)
@@ -2303,9 +2436,7 @@ void Dev_CreateIndexBuffer(X86 *c) {
     com_ret(c, D8_OK);
 }
 
-// (this, StreamNumber, pStreamData, Stride). This renderer currently supports one vertex stream and
-// has no per-stream offset (that arrived in D3D9); any other stream is
-// INVALIDCALL rather than a silent drop.
+// (this, StreamNumber, pStreamData, Stride).
 void Dev_SetStreamSource(X86 *c) {
     ComObj *dev = d8_dev(c);
     uint32_t stream = arg(c, 1);
@@ -2314,11 +2445,13 @@ void Dev_SetStreamSource(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if (stream != 0) {
-        LOGW("d3d8: SetStreamSource stream %u is not implemented (this renderer supports one "
-             "stream)",
-             stream);
+    if (stream >= dev->d3d8_streams.size() || (vb && vb->kind != K_D3D8VERTEXBUFFER)) {
         com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    dev->d3d8_streams[stream] = {vb ? vb->id : 0, vb ? arg(c, 3) : 0};
+    if (stream != 0) {
+        com_ret(c, D8_OK);
         return;
     }
     if (!vb) {
@@ -2337,6 +2470,32 @@ void Dev_SetStreamSource(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
+    com_ret(c, D8_OK);
+}
+
+void Dev_GetStreamSource(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    uint32_t stream = arg(c, 1), out = arg(c, 2), stride = arg(c, 3);
+    if (!dev || stream >= dev->d3d8_streams.size() || !out || !gm_valid(out, 4) || !stride ||
+        !gm_valid(stride, 4)) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    auto binding = dev->d3d8_streams[stream];
+    if (stream == 0) {
+        auto info = d8_device_info(dev);
+        binding = {info.stream_vb, info.stream_stride};
+    }
+    ComObj *buffer = com_get(binding[0]);
+    uint32_t view = buffer ? com_view(buffer, IF_D3D8VERTEXBUFFER8) : 0;
+    if (buffer && !view) {
+        com_ret(c, E_OUTOFMEMORY);
+        return;
+    }
+    if (buffer)
+        com_addref(buffer);
+    wr32(out, view);
+    wr32(stride, binding[1]);
     com_ret(c, D8_OK);
 }
 
@@ -2539,7 +2698,7 @@ bool d8_shader_words(uint32_t addr, bool declaration, std::vector<uint32_t> &out
             else if (op == 81)
                 extra = 5;
             else if (op == 1 || (op >= 6 && op <= 7) || (op >= 14 && op <= 16) || op == 19 ||
-                     op == 78 || op == 79)
+                     op == 73 || op == 77 || op == 78 || op == 79)
                 extra = 2;
             else if (op == 4 || op == 18 || op == 80)
                 extra = 4;
@@ -2778,12 +2937,14 @@ void Dev_CopyRects(X86 *c) {
     ComObj *src = com_this(arg(c, 1), IF_D3D8SURFACE8);
     ComObj *dst = com_this(arg(c, 4), IF_D3D8SURFACE8);
     uint32_t rects = arg(c, 2), count = arg(c, 3), points = arg(c, 5);
-    if (!dev || !src || !dst || !count || src->rmask != dst->rmask || d8_resource_info(src).depth ||
-        d8_resource_info(dst).depth) {
+    const bool whole_surface = !rects && !count && !points;
+    if (!dev || !src || !dst || (!count && !whole_surface) || src->rmask != dst->rmask ||
+        d8_resource_info(src).depth || d8_resource_info(dst).depth) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
-    if (!gm_valid(rects, count * 16) || (points && !gm_valid(points, count * 8))) {
+    if (!whole_surface && (count > UINT32_MAX / 16 || !gm_valid(rects, count * 16) ||
+                           (points && !gm_valid(points, count * 8)))) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
@@ -2803,11 +2964,13 @@ void Dev_CopyRects(X86 *c) {
     }
     const uint32_t block = d8_block_bytes(src->rmask);
     const uint32_t texel = block ? block : src->bpp / 8;
+    if (whole_surface)
+        count = 1;
     for (uint32_t i = 0; i < count; ++i) {
-        int32_t left = (int32_t)rd32(rects + i * 16);
-        int32_t top = (int32_t)rd32(rects + i * 16 + 4);
-        int32_t right = (int32_t)rd32(rects + i * 16 + 8);
-        int32_t bottom = (int32_t)rd32(rects + i * 16 + 12);
+        int32_t left = whole_surface ? 0 : (int32_t)rd32(rects + i * 16);
+        int32_t top = whole_surface ? 0 : (int32_t)rd32(rects + i * 16 + 4);
+        int32_t right = whole_surface ? (int32_t)src->width : (int32_t)rd32(rects + i * 16 + 8);
+        int32_t bottom = whole_surface ? (int32_t)src->height : (int32_t)rd32(rects + i * 16 + 12);
         int32_t dx = left, dy = top;
         if (points) {
             dx = (int32_t)rd32(points + i * 8);
@@ -2823,13 +2986,13 @@ void Dev_CopyRects(X86 *c) {
         if (block) {
             // Block formats address 4x4 blocks; D3D8 requires a block-aligned
             // rect. The block row pitch is the level pitch.
-            if ((left & 3) || (top & 3) || (dx & 3) || (dy & 3) || ((right - left) & 3) ||
-                ((bottom - top) & 3)) {
+            if (!whole_surface && ((left & 3) || (top & 3) || (dx & 3) || (dy & 3) ||
+                                   ((right - left) & 3) || ((bottom - top) & 3))) {
                 com_ret(c, D8_ERR_INVALIDCALL);
                 return;
             }
-            const uint32_t row = uint32_t(right - left) / 4 * block;
-            const uint32_t rows = uint32_t(bottom - top) / 4;
+            const uint32_t row = (uint32_t(right - left) + 3) / 4 * block;
+            const uint32_t rows = (uint32_t(bottom - top) + 3) / 4;
             const uint8_t *s =
                 sbase + (uint32_t)(top / 4) * src->pitch + (uint32_t)(left / 4) * block;
             uint8_t *d = dbase + (uint32_t)(dy / 4) * dst->pitch + (uint32_t)(dx / 4) * block;
@@ -2891,6 +3054,25 @@ bool d8_sync_texture(X86 *c, ComObj *dev, uint32_t stage) {
 }
 
 // (this, PrimitiveType, StartVertex, PrimitiveCount)
+std::vector<recomp::d3d::VertexStream> d8_vertex_streams(ComObj *dev) {
+    std::vector<recomp::d3d::VertexStream> streams;
+    auto info = d8_device_info(dev);
+    for (uint32_t index = 0; index < dev->d3d8_streams.size(); ++index) {
+        auto binding = dev->d3d8_streams[index];
+        if (index == 0)
+            binding = {info.stream_vb, info.stream_stride};
+        ComObj *buffer = com_get(binding[0]);
+        const uint8_t *data = d8_buffer_bytes(buffer);
+        if (!data || !buffer->pixels_bytes)
+            continue;
+        recomp::d3d::VertexStream stream{};
+        stream.stream = index;
+        stream.stride = binding[1];
+        stream.data = rust::Slice<const uint8_t>(data, buffer->pixels_bytes);
+        streams.push_back(stream);
+    }
+    return streams;
+}
 void Dev_DrawPrimitive(X86 *c) {
     ComObj *dev = d8_dev(c);
     if (!dev || !dev->d3d8_device) {
@@ -2907,6 +3089,15 @@ void Dev_DrawPrimitive(X86 *c) {
     for (uint32_t stage = 0; stage < (d8_pixel_shader_bound(dev) ? 4u : 2u); ++stage)
         if (!d8_sync_texture(c, dev, stage))
             return;
+    if (recomp::d3d::shader_stream_count(*dev->d3d8_device->value) > 1) {
+        auto streams = d8_vertex_streams(dev);
+        auto status = recomp::d3d::draw_vertex_streams(
+            *dev->d3d8_device->value, arg(c, 1),
+            rust::Slice<const recomp::d3d::VertexStream>(streams.data(), streams.size()), arg(c, 2),
+            arg(c, 3), false, rust::Slice<const uint8_t>(), 0, 0, 0, 0, 0);
+        com_ret(c, bridge_result(c, status));
+        return;
+    }
     auto status = recomp::d3d::draw_primitive(*dev->d3d8_device->value, arg(c, 1),
                                               d8_selected_vertex_shader(dev),
                                               rust::Slice<const uint8_t>(bytes, vb->pixels_bytes),
@@ -2925,6 +3116,7 @@ void Dev_DrawPrimitiveUP(X86 *c) {
         return;
     }
     recomp::d3d::set_stream(*dev->d3d8_device->value, 0, 0);
+    dev->d3d8_streams[0] = {};
     const uint32_t topology = arg(c, 1), count = arg(c, 2);
     const uint32_t vertices = arg(c, 3), stride = arg(c, 4);
     if (!stride) {
@@ -2968,6 +3160,63 @@ void Dev_DrawPrimitiveUP(X86 *c) {
     com_ret(c, bridge_result(c, status));
 }
 
+void Dev_DrawIndexedPrimitiveUP(X86 *c) {
+    ComObj *dev = d8_dev(c);
+    if (!dev || !dev->d3d8_device) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    recomp::d3d::set_stream(*dev->d3d8_device->value, 0, 0);
+    dev->d3d8_streams[0] = {};
+    recomp::d3d::set_indices(*dev->d3d8_device->value, 0, 0);
+    const uint32_t topology = arg(c, 1), min_index = arg(c, 2), num_vertices = arg(c, 3);
+    const uint32_t count = arg(c, 4), indices = arg(c, 5), format = arg(c, 6);
+    const uint32_t vertices = arg(c, 7), stride = arg(c, 8);
+    if (!stride || (format != D3DFMT_INDEX16 && format != D3DFMT_INDEX32) ||
+        recomp::d3d::shader_stream_count(*dev->d3d8_device->value) > 1) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    if (!count) {
+        com_ret(c, D8_OK);
+        return;
+    }
+    uint64_t index_count;
+    switch (topology) {
+    case 4:
+        index_count = uint64_t(count) * 3;
+        break;
+    case 6:
+        index_count = uint64_t(count) + 2;
+        break;
+    default:
+        fprintf(stderr, "d3d8: DrawIndexedPrimitiveUP unsupported topology %u\n", topology);
+        imports_unsupported(c);
+        return;
+    }
+    const uint64_t vertex_end = uint64_t(min_index) + num_vertices;
+    if (!num_vertices || vertex_end > UINT32_MAX) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    const uint64_t vbytes = vertex_end * stride;
+    const uint64_t ibytes = index_count * (format == D3DFMT_INDEX16 ? 2u : 4u);
+    if (!vertices || !indices || vbytes > UINT32_MAX || ibytes > UINT32_MAX ||
+        !gm_valid(vertices, uint32_t(vbytes)) || !gm_valid(indices, uint32_t(ibytes))) {
+        com_ret(c, D8_ERR_INVALIDCALL);
+        return;
+    }
+    for (uint32_t stage = 0; stage < (d8_pixel_shader_bound(dev) ? 4u : 2u); ++stage)
+        if (!d8_sync_texture(c, dev, stage))
+            return;
+    auto status = recomp::d3d::draw_indexed_primitive(
+        *dev->d3d8_device->value, topology, d8_selected_vertex_shader(dev),
+        rust::Slice<const uint8_t>(gm_ptr(vertices), size_t(vbytes)), stride,
+        rust::Slice<const uint8_t>(gm_ptr(indices), size_t(ibytes)), format, 0, min_index,
+        num_vertices, 0, count);
+    com_ret(c, bridge_result(c, status));
+}
+
 // (this, PrimitiveType, MinIndex, NumVertices, StartIndex, PrimitiveCount). The
 // Rust owns indexed range validation and triangle-list expansion. Guest COM
 // identities and memory staging remain here.
@@ -2996,6 +3245,17 @@ void Dev_DrawIndexedPrimitive(X86 *c) {
     for (uint32_t stage = 0; stage < (d8_pixel_shader_bound(dev) ? 4u : 2u); ++stage)
         if (!d8_sync_texture(c, dev, stage))
             return;
+    if (recomp::d3d::shader_stream_count(*dev->d3d8_device->value) > 1) {
+        auto streams = d8_vertex_streams(dev);
+        auto status = recomp::d3d::draw_vertex_streams(
+            *dev->d3d8_device->value, topology,
+            rust::Slice<const recomp::d3d::VertexStream>(streams.data(), streams.size()), 0,
+            prim_count, true, rust::Slice<const uint8_t>(ibytes, ib->pixels_bytes),
+            d8_resource_info(ib).index_format, device_state.base_vertex, min_index, num_vertices,
+            start_index);
+        com_ret(c, bridge_result(c, status));
+        return;
+    }
     auto status = recomp::d3d::draw_indexed_primitive(
         *dev->d3d8_device->value, topology, d8_selected_vertex_shader(dev),
         rust::Slice<const uint8_t>(vbytes, vb->pixels_bytes), stride,
@@ -3158,6 +3418,7 @@ void d3d8_reset() {
             continue;
         recomp::d3d::global_reset(*dev->d3d8_device->value);
         dev->d3d8_device->forget_textures();
+        dev->d3d8_streams = {};
         dev->d3d8_target = 0;
         dev->d3d8_target_depth = 0;
         dev->d3d8_backbuffer = 0;

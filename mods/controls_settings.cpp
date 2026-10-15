@@ -19,7 +19,7 @@ namespace {
 std::mutex g_names_mutex;
 std::vector<std::string> g_names = {"pad", "keys", "pad+keys"};
 
-// EDIT_ROW is not one of these: it is never declared or persisted.
+// EDIT_ROW is an action, never declared or persisted.
 constexpr int kStoredRowCount = CONTROLS_EDIT_ROW;
 const char *const kKeys[kStoredRowCount] = {
     "layout", "size", "opacity", "haptics", "pad_with_controller", "snap"};

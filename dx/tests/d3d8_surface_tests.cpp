@@ -164,6 +164,13 @@ static ComObj *make_test_device(uint32_t w, uint32_t h, uint32_t format) {
     return dev;
 }
 
+static ComObj *make_gpu_test_device(uint32_t w, uint32_t h, uint32_t format, uint32_t depth = 0) {
+    ComObj *dev = make_test_device(w, h, format);
+    check(d3d_bridge_ok(recomp::d3d::initialize_gpu(*dev->d3d8_device->value, w, h, format, depth)),
+          "initialize render-target fixture GPU");
+    return dev;
+}
+
 static recomp::d3d::ResourceInfo test_resource_info(ComObj *object) {
     if (!object->d3d8_resource)
         return {};
@@ -202,8 +209,8 @@ static void test_texture() {
 
     check(call_method(tex, 10, {}) == 3, "GetType reports D3DRTYPE_TEXTURE");
     check(call_method(tex, 13, {}) == 1, "GetLevelCount is one");
-    check(call_method(tex, 11, {4}) == 0 && call_method(tex, 12, {}) == 4,
-          "SetLOD returns the old LOD and GetLOD reads the new one");
+    check(call_method(tex, 11, {4}) == 0 && call_method(tex, 12, {}) == 0,
+          "SetLOD clamps to the only mip level");
 
     check(call_method(tex, 14, {0, sc(32)}) == 0, "GetLevelDesc succeeds");
     check(rd32(sc(32)) == 23 && rd32(sc(36)) == 1 && rd32(sc(44)) == 2 && rd32(sc(56)) == 1 &&
@@ -439,7 +446,7 @@ static void test_render_target_texture() {
 // by the headless replay, not here.
 static void test_depth() {
     cpu_reset();
-    ComObj *dev = make_test_device(64, 48, 22);
+    ComObj *dev = make_gpu_test_device(64, 48, 22, 80);
     uint32_t device = com_view(dev, IF_D3D8DEVICE);
 
     // No autodepth: the request is refused and clears the output.
@@ -491,7 +498,7 @@ static void test_depth() {
 // uses the shared autodepth attachment (DIVERGENCE in dx/d3d8.cpp).
 static void test_create_depth_stencil_surface() {
     cpu_reset();
-    ComObj *dev = make_test_device(64, 48, 22);
+    ComObj *dev = make_gpu_test_device(64, 48, 22);
     uint32_t device = com_view(dev, IF_D3D8DEVICE);
 
     // (this, Width, Height, Format, MultiSampleType, ppSurface). Slot 26.
@@ -530,7 +537,7 @@ static void test_create_depth_stencil_surface() {
     check(dev->refs == 0, "device released after standalone depth");
 
     // Rejected cases: bad format, zero size and multisample.
-    ComObj *dev2 = make_test_device(64, 48, 22);
+    ComObj *dev2 = make_gpu_test_device(64, 48, 22);
     uint32_t device2 = com_view(dev2, IF_D3D8DEVICE);
     wr32(sc(0), 0xfeedface);
     check(call_method(device2, 26, {32, 16, 21, 0, sc(0)}) == 0x8876086c && rd32(sc(0)) == 0,
@@ -548,7 +555,7 @@ static void test_create_depth_stencil_surface() {
 // them; the bridge must not leave dangling handles.
 static void test_implicit_surface_lifetime() {
     cpu_reset();
-    ComObj *dev = make_test_device(64, 48, 22);
+    ComObj *dev = make_gpu_test_device(64, 48, 22, 77);
     dev->d3d8_depth_format = 77;
     uint32_t device = com_view(dev, IF_D3D8DEVICE);
 
@@ -577,7 +584,7 @@ static void test_implicit_surface_lifetime() {
 // handle. Internal binding/parent refs must not keep the device alive in a cycle.
 static void test_render_target_switching() {
     cpu_reset();
-    ComObj *dev = make_test_device(64, 48, 22);
+    ComObj *dev = make_gpu_test_device(64, 48, 22, 71);
     dev->d3d8_depth_format = 71;
     uint32_t device = com_view(dev, IF_D3D8DEVICE);
     check(call_method(device, 32, {sc(0)}) == 0, "GetRenderTarget returns implicit color");
@@ -706,7 +713,8 @@ static void test_buffers() {
     check(call_method(device, 83, {0, vb, 24}) == 0, "SetStreamSource accepts stream 0");
     check(test_device_info(dev).stream_vb == v->id && test_device_info(dev).stream_stride == 24,
           "stream source is stored on the device");
-    check(call_method(device, 83, {1, vb, 24}) == 0x8876086c, "a second stream is rejected");
+    check(call_method(device, 83, {1, vb, 24}) == 0, "a second stream is accepted");
+    check(call_method(device, 83, {16, vb, 24}) == 0x8876086c, "stream 16 is rejected");
     check(call_method(device, 85, {ib, 3}) == 0, "SetIndices stores the index buffer");
     check(test_device_info(dev).index_buffer == i->id && test_device_info(dev).base_vertex == 3,
           "base vertex is stored");
@@ -958,7 +966,7 @@ static void test_caps() {
         {"MaxActiveLights", 0xa0, 8u},
         {"MaxPrimitiveCount", 0xb4, 0x00555555u},
         {"MaxVertexIndex", 0xb8, 0x0000ffffu},
-        {"MaxStreams", 0xbc, 1u},
+        {"MaxStreams", 0xbc, 16u},
         {"MaxStreamStride", 0xc0, 508u},
         {"VertexShaderVersion", 0xc4, 0u},
         {"MaxVertexShaderConst", 0xc8, 0u},
@@ -1118,7 +1126,7 @@ int main(int argc, char **argv) {
     }
     cpu_reset();
     uint32_t factory = call_shim(tramp("d3d8.dll", "Direct3DCreate8"), {220});
-    check(factory && call_method(factory, 4) == 0, "no-Rust factory advertises no adapter");
+    check(factory && call_method(factory, 4) == 1, "factory advertises its adapter");
     uint32_t pp = sc(192);
     wr32(pp, 319);
     wr32(pp + 4, 241);

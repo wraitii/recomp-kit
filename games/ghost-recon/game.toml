@@ -34,6 +34,7 @@ alternate_entries = [
     0x00572ebf,
 ]
 native = { header = "native/ghost_recon_native.h", sources = [
+    "native/keyboard_labels.cpp",
     "native/projection_cull/projection_cull.c",
     "native/projection_cull/projection_build.c",
     "native/scene_post/scene_post.c",
@@ -47,9 +48,14 @@ d3d8_wgpu = true
 
 [input]
 relative_mouse_capture = true
+keyboard_names = "system"
+mouse_sensitivity = 100
+mouse_acceleration = false
 
 [settings]
 rows = ["window", "performance_overlay", "controls"]
+window_mode = "windowed"
+performance_overlay = "off"
 
 [controls]
 default_layout = "hidden"

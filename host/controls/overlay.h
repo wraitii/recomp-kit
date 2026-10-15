@@ -27,6 +27,8 @@ struct DrawControl {
     Kind kind = Kind::Key;
     Rect rect;
     std::string label;
+    int text_scale = 0;
+    bool focused = false;
     bool pressed = false;
     bool lit = false; // a latched or locked modifier key
     PadButton button = PadButton::Cross;
@@ -38,6 +40,21 @@ struct DrawControl {
     int layer = 0;             // ControlsView::layers index: its layout group's + 1
     bool group_visible = true; // Toggle: its target group is shown (else label_off is drawn)
     std::string label_off;
+};
+
+struct DrawMeter {
+    Rect rect;
+    std::string label;
+    double value = 0;
+    bool bipolar = false;
+    int text_scale = 1;
+};
+
+struct DrawText {
+    Rect rect;
+    std::string text;
+    int scale = 1;
+    bool muted = true;
 };
 
 struct ControlsView {
@@ -59,6 +76,9 @@ struct ControlsView {
     int selected = -1;
     std::vector<DrawControl> toolbar;
     std::vector<DrawControl> picker_rows;
+    std::vector<DrawMeter> meters;
+    std::vector<DrawText> text;
+    std::vector<DrawText> popup_text;
     Rect picker;
     Rect grid_area;
     int grid_step = 0;

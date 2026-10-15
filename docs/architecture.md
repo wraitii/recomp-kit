@@ -155,10 +155,42 @@ and handles edge scrolling and focus. Relative DirectInput counts pass through
 unchanged; absolute Win32 positions use the compositor's current guest mapping.
 `host/controls/` holds the on-screen controls: a layout model and hit test, a
 router that owns each finger, a virtual pad that on-screen and physical
-controllers both write to, a binding stage that turns the pad into keys and
-mouse (or, in `native` mode, into the DirectInput joystick and XInput devices
-in `dx/`), the overlay that draws it and the on-device editor. Everything but
-the overlay and the SDL glue is SDL-free and unit-tested in `controls_tests`.
+controllers both write to, the overlay that draws it and the on-device editor.
+The standalone `--configure` window and the launcher's Configure button offer
+Controller setup; it is not part of the in-game F10 page. The controller
+setup editor calibrates normalized SDL axes and routes each
+physical axis, button and hat direction to guest controls and keyboard keys.
+Overview shows the connected device, live inputs and starting presets. Controller
+output is always available; each input can send a controller control, a keyboard
+key, both or neither. Old profiles with controller output disabled are converted
+to unassigned controller outputs, preserving their key bindings and calibration.
+The built-in keyboard/mouse preset retains the supplied bindings, including mouse
+and host actions; other presets replace it. Mapping separates
+physical input selection from explicit output choosers, with input identification
+and optional keyboard capture. Existing key assignments remain visible. Calibration exposes
+centered or one-sided axis response, drift, direction and range controls;
+More options sections retain response curves, scale, offset and direction buttons.
+Presets and unsaved exits require an explicit choice; Tab/Shift+Tab and Enter
+operate the visible controls. Its preview runs before the game starts; Save saves
+the profile under `controls/mapper-v1.txt` in the selected game profile.
+Calibration includes center and range capture, radial stick and per-axis
+deadzones, saturation, response curves and inversion. Output scale and offset
+allow pedals to feed separate axes or opposite halves of a combined axis.
+`pad = "mapped"`, `"native"` and `"off"` initialize the profile defaults;
+saved profiles can enable joystick and keyboard output together at runtime.
+Games that enumerate controllers only at startup need a restart after enabling
+joystick exposure. The current SDL host opens the first recognized controller;
+calibration is stored per game profile, not separately for each physical device.
+The existing mapped binding remains available for keyboard/mouse controls.
+DirectInput and XInput still report delivered state to the runtime monitor; the
+pre-game editor shows its draft output rather than unavailable guest reads. Guest-requested
+DirectInput ranges and formats remain authoritative. The calibration and
+mapping model is SDL-free; existing controls and pad suites exercise the
+underlying input and API adapters.
+The optional `controller_preview` build target renders the editor to a PPM
+without starting the game or opening a window. Run it with an output path and
+`overview`, `mapping`, `axis`, `advanced`, `calibration`, `response`, `presets`,
+`discard` or `disconnected`; optional width, height and DPI scale follow.
 See `docs/superpowers/specs/2026-09-17-touch-controls-design.md`.
 `mods/display_settings.cpp` validates host display choices and applies rendering
 and projection changes at the frame boundary. `mods/settings.cpp` atomically

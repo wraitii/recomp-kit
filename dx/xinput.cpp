@@ -313,6 +313,22 @@ void XInputGetState_(X86 *c) {
         fill_gamepad(out + STATE_OFF_Gamepad, s);
     else
         gm_zero(out + STATE_OFF_Gamepad, GP_SIZE);
+    const uint32_t gp = out + STATE_OFF_Gamepad;
+    HostPadGuestState observed{};
+    observed.api = 2;
+    observed.packet = packet;
+    const uint32_t offsets[4] = {GP_OFF_sThumbLX, GP_OFF_sThumbLY, GP_OFF_sThumbRX,
+                                 GP_OFF_sThumbRY};
+    for (int i = 0; i < 6; ++i) {
+        observed.present[i] = 1;
+        observed.minimum[i] = i < 4 ? -32768 : 0;
+        observed.maximum[i] = i < 4 ? 32767 : 255;
+        observed.axes[i] = i < 4 ? (int16_t)rd16(gp + offsets[i])
+                                 : rd8(gp + (i == 4 ? GP_OFF_bLeftTrigger : GP_OFF_bRightTrigger));
+    }
+    observed.buttons_present = 1;
+    observed.buttons = rd16(gp + GP_OFF_wButtons);
+    host_pad_report_guest_state(&observed);
     set_eax(c, XI_ERROR_SUCCESS);
 }
 

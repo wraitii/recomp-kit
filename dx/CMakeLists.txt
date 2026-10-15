@@ -213,8 +213,7 @@ endif()
 
 
 if(NOT IOS AND NOT ANDROID)
-# Descriptor/lifetime tests construct guest device state explicitly; no Rust
-# adapter or GPU is used. This also builds the optional renderer's off path.
+# Descriptor/lifetime tests use CPU resources and GPU-backed render-target fixtures.
 add_executable(d3d8_surface_tests tests/d3d8_surface_tests.cpp
   ${RECOMP_ROOT}/runtime/tests/stub_recomp_call.cpp)
 target_link_libraries(d3d8_surface_tests PRIVATE recomp_platform recomp_dx_null recomp_runtime)
@@ -222,7 +221,7 @@ target_compile_options(d3d8_surface_tests PRIVATE ${RECOMP_WARN_HOST})
 recomp_optimize(d3d8_surface_tests 1)
 recomp_test_binary(d3d8_surface_tests)
 add_test(NAME d3d8_surface_tests COMMAND d3d8_surface_tests)
-set_tests_properties(d3d8_surface_tests PROPERTIES LABELS nogame)
+set_tests_properties(d3d8_surface_tests PROPERTIES LABELS gpu)
 if(TARGET d3d8_wgpu)
   add_executable(d3d8_render_tests tests/d3d8_render_tests.cpp
     ${RECOMP_ROOT}/runtime/tests/stub_recomp_call.cpp)

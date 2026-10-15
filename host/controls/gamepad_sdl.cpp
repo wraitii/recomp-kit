@@ -1,6 +1,7 @@
 // gamepad_sdl.cpp - see gamepad_sdl.h.
 #include "gamepad_sdl.h"
 
+#include "controls_host.h"
 #include "vpad.h"
 
 #include <stdio.h>
@@ -15,7 +16,7 @@ bool g_buttons[kSdlPadButtonCount] = {};
 int16_t g_axes[kSdlAxisCount] = {};
 
 void publish() {
-    vpad().set_source(kPadSourceController, pad_from_sdl(g_buttons, g_axes));
+    host_gamepad_state(pad_from_sdl_raw(g_buttons, g_axes));
 }
 
 // Reads every mapped button and axis from SDL's current state.
@@ -122,6 +123,11 @@ void gamepad_poll() {
         return;
     read_all();
     publish();
+}
+
+std::string gamepad_name() {
+    const char *name = g_pad ? SDL_GetGamepadName(g_pad) : nullptr;
+    return name ? name : "Controller";
 }
 
 bool gamepad_connected() {

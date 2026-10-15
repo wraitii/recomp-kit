@@ -358,8 +358,8 @@ void Device_GetProperty(X86 *c) {
             com_ret(c, DIERR_INVALIDPARAM);
             return;
         }
-        const char *name = dik_key_name(rd32(ph + 8));
-        if (!name) {
+        const std::string name = guest_key_name(rd32(ph + 8));
+        if (name.empty()) {
             com_ret(c, DIERR_OBJECTNOTFOUND_);
             return;
         }

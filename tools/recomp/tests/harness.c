@@ -88,7 +88,7 @@ void recomp_rdtsc(X86 *c) {
     c->r[R_EDX] = (uint32_t)(fake_tsc >> 32);
 }
 /* Deterministic CPUID (plan correction 5): GenuineIntel, family 6 model 3,
- * features FPU|TSC|CMOV only.  The real runtime must report the same values. */
+ * features FPU|TSC|CMOV|MMX.  The real runtime must report the same values. */
 void recomp_cpuid(X86 *c) {
     switch (c->r[R_EAX]) {
     case 0:
@@ -98,10 +98,10 @@ void recomp_cpuid(X86 *c) {
         c->r[R_ECX] = 0x6c65746e; /* "ntel" */
         break;
     case 1:
-        c->r[R_EAX] = 0x00000630; /* family 6, model 3, stepping 0 */
+        c->r[R_EAX] = 0x00000633; /* family 6, model 3, stepping 3 */
         c->r[R_EBX] = 0;
         c->r[R_ECX] = 0;
-        c->r[R_EDX] = (1u << 0) | (1u << 4) | (1u << 15); /* FPU TSC CMOV */
+        c->r[R_EDX] = (1u << 0) | (1u << 4) | (1u << 15) | (1u << 23); /* FPU TSC CMOV MMX */
         break;
     default:
         c->r[R_EAX] = c->r[R_EBX] = c->r[R_ECX] = c->r[R_EDX] = 0;

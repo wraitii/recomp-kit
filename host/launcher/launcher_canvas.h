@@ -32,6 +32,7 @@ class Canvas {
         return px_.data();
     }
     void clear(Color c);
+    void composite_rgba(const std::vector<uint8_t> &pixels);
     void fill(Rect r, Color c);
     void frame(Rect r, int thickness, Color c);
     // Text at `size` pixels per font pixel; returns the width drawn. Characters

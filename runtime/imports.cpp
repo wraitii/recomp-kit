@@ -478,14 +478,10 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     if (idx >= tramps().size() || !tramps()[idx].atomic)
         recomp_execution_checkpoint_charge(c, kImportCheckpointCost);
     if (idx >= tramps().size()) {
-        // No shim to say how many arguments to drop, but the return address
-        // must still be consumed or the guest stack is displaced from here on.
         LOGW("imports: call to unallocated trampoline %08x (ESP=%08x, return=%08x)", target,
              c->r[R_ESP], rd32(c->r[R_ESP]));
-        c->eip = rd32(c->r[R_ESP]);
-        c->r[R_ESP] += 4;
-        set_eax(c, 0);
-        return true;
+        fflush(stderr);
+        abort();
     }
     // The shim may allocate trampolines (GetProcAddress, a COM shim, a guest
     // callback), which reallocates this vector, so nothing may hold a

@@ -33,6 +33,8 @@ class Recovery:
         self.sleigh = pypcode.Context("x86:LE:32:default")
         self.instructions = {}
         self.covered = {}
+        self.speculative = set()
+        self.trusted_seeds = set()
         self.seeds = defaultdict(set)
         self.pending = deque()
         self.roots = set()
@@ -131,17 +133,32 @@ class Recovery:
                 return at + step
         return None
 
-    def seed(self, target, evidence, root=False):
+    def seed(self, target, evidence, root=False, speculative=False):
         if not self.image.is_exec(target):
             return
         if root:
             self.roots.add(target)
-        if target not in self.seeds:
-            self.pending.append(target)
+        first = target not in self.seeds
         self.seeds[target].add(evidence)
+        if not speculative:
+            self.trusted_seeds.add(target)
         owner = self.covered.get(target)
-        if owner is not None and owner != target:
-            self.conflicts.add((target, owner, evidence))
+        if owner in self.speculative and (owner != target or not speculative):
+            self.retract(owner)
+            first = True
+        elif owner is not None and owner != target:
+            if not speculative:
+                self.conflicts.add((target, owner, evidence))
+            return
+        if first:
+            self.pending.append(target)
+
+    def retract(self, address):
+        self.speculative.discard(address)
+        size = self.instructions.pop(address).size
+        for at in range(address, address + size):
+            if self.covered.get(at) == address:
+                del self.covered[at]
 
     def decode(self, address):
         end = next(hi for lo, hi in self.image.exec_ranges if lo <= address < hi)
@@ -170,40 +187,54 @@ class Recovery:
                 return False
         return True
 
-    def record(self, ins):
+    def record(self, ins, speculative=False):
         if self.pointer_run_at(ins.address):
             return False
-        for at in range(ins.address, ins.address + ins.size):
-            if self.at_known_data(at):
-                return False
-        for at in range(ins.address, ins.address + ins.size):
+        span = range(ins.address, ins.address + ins.size)
+        if any(self.at_known_data(at) for at in span):
+            return False
+        for at in span:
             owner = self.covered.get(at)
-            if owner is not None and owner != ins.address:
-                self.conflicts.add((ins.address, owner, "overlapping decode"))
+            if owner is not None and owner != ins.address and (speculative or owner not in self.speculative):
+                if not speculative:
+                    self.conflicts.add((ins.address, owner, "overlapping decode"))
                 return False
-            if at != ins.address and at in self.seeds:
-                self.conflicts.add((at, ins.address, "; ".join(sorted(self.seeds[at]))))
+            if at != ins.address and at in self.seeds and (speculative or at in self.trusted_seeds):
+                if not speculative:
+                    self.conflicts.add((at, ins.address, "; ".join(sorted(self.seeds[at]))))
                 return False
+        if not speculative:
+            for at in span:
+                owner = self.covered.get(at)
+                if owner in self.speculative and owner != ins.address:
+                    self.retract(owner)
         self.instructions[ins.address] = ins
-        self.covered.update((at, ins.address) for at in range(ins.address, ins.address + ins.size))
+        self.covered.update((at, ins.address) for at in span)
+        if speculative:
+            self.speculative.add(ins.address)
         if ins.group(capstone.CS_GRP_CALL) or ins.group(capstone.CS_GRP_JUMP):
             if ins.operands and ins.operands[0].type == x86.X86_OP_IMM:
                 target = ins.operands[0].imm & 0xffffffff
-                self.seed(target, "direct:%08x" % ins.address, ins.group(capstone.CS_GRP_CALL))
+                self.seed(target, "direct:%08x" % ins.address, ins.group(capstone.CS_GRP_CALL) and not speculative, speculative)
         return True
 
     def trace(self):
         while self.pending:
             at = self.pending.popleft()
+            speculative = at not in self.trusted_seeds
             while self.image.is_exec(at):
                 if self.at_known_data(at):
                     break
                 if at in self.covered:
-                    if self.covered[at] != at:
-                        self.conflicts.add((at, self.covered[at], "entry alignment"))
-                    break
+                    owner = self.covered[at]
+                    if speculative or owner not in self.speculative:
+                        if owner != at and not speculative:
+                            self.conflicts.add((at, owner, "entry alignment"))
+                        break
+                    self.retract(owner)
+                    continue
                 ins = self.decode(at)
-                if ins is None or not self.record(ins):
+                if ins is None or not self.record(ins, speculative):
                     break
                 if ins.group(capstone.CS_GRP_RET) or ins.group(capstone.CS_GRP_IRET) or ins.mnemonic in ("jmp", "ljmp", "int3", "ud2"):
                     break
@@ -338,17 +369,22 @@ class Recovery:
                     self.gaps.append((at, data_start, "data-boundary"))
                     at = data_start
                     continue
-                if not self.record(ins):
+                if any(inner in self.covered or inner in self.seeds for inner in range(at + 1, at + ins.size)):
+                    self.gaps.append((at, at + 1, "sweep-padding"))
                     at += 1
                     continue
+                if not self.record(ins, True):
+                    at += 1
+                    continue
+                self.trace()
                 at += ins.size
         for ins in self.instructions.values():
-            if (ins.group(capstone.CS_GRP_CALL) or ins.group(capstone.CS_GRP_JUMP)) and ins.operands and ins.operands[0].type == x86.X86_OP_IMM:
+            if ins.address not in self.speculative and (ins.group(capstone.CS_GRP_CALL) or ins.group(capstone.CS_GRP_JUMP)) and ins.operands and ins.operands[0].type == x86.X86_OP_IMM:
                 target = ins.operands[0].imm & 0xffffffff
                 if target not in self.instructions:
                     self.traps[ins.address] = "direct transfer to unmapped instruction %08x" % target
         for target, evidence in self.seeds.items():
-            if target not in self.instructions and not self.at_known_data(target):
+            if target in self.trusted_seeds and target not in self.instructions and not self.at_known_data(target):
                 self.conflicts.add((target, self.covered.get(target, target), "; ".join(sorted(evidence))))
 
     def report(self):

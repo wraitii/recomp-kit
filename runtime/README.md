@@ -20,6 +20,7 @@ owns. Compile the runtime with `-I<repo root>` so `guest.h` can find it.
 | `cpu.cpp` | the call-outs `x86.h` declares, plus the `_setjmp`/`_longjmp` intrinsics |
 | `intrinsics.h` | the intrinsic contract generated code uses for `_setjmp`/`_longjmp` |
 | `kernel32.cpp` | heap, files, modules, TLS, sync objects, time, strings and locale |
+| `kernel32_wide.cpp` | UTF-16 entry points and INI string/integer APIs through the guest filesystem overlay |
 | `user32.cpp` | window classes and windows, the message queue, paint/DC/input stubs |
 | `misc.cpp` | GDI32, ADVAPI32 registry, SHELL32, ole32, IMM32, WSOCK32, WINMM (clock, mmio, MIDI out) |
 | `win32.h` | what the host app and the DirectX shims call into |
@@ -290,3 +291,7 @@ version-4 GUID in guest memory, without advancing the guest RNG.
 MoveFileA/W share UTF-8 path resolution and reject an existing destination.
 DIVERGENCE(original): the rename seam currently cannot move files across
 volumes and checks destination existence before renaming rather than atomically.
+
+CPUID reports FPU, TSC, CMOV and MMX for the emulated Pentium II;
+`IsProcessorFeaturePresent(PF_MMX_INSTRUCTIONS_AVAILABLE)` agrees. The translator
+models original MMX instructions; SSE, SSE2 and 3DNow remain unadvertised.
