@@ -267,15 +267,15 @@ static void test_joy_pure_helpers() {
     e.value = -32767;
     CHECK(joy_event(e, r, &ofs, &data));
     CHECK_EQ(ofs, 20u);
-    CHECK_EQ((int32_t)data, -32768);
+    CHECK_EQ((int32_t)data, 0);
     e.index = 4; // l2 -> Rx; the event value runs 0..32767
     e.value = 32767;
     CHECK(joy_event(e, r, &ofs, &data));
     CHECK_EQ(ofs, 12u);
-    CHECK_EQ((int32_t)data, 32767);
+    CHECK_EQ((int32_t)data, 65535);
     e.value = 0;
     CHECK(joy_event(e, r, &ofs, &data));
-    CHECK_EQ((int32_t)data, -32768);
+    CHECK_EQ((int32_t)data, 0);
     e.kind = 7;
     CHECK(!joy_event(e, r, &ofs, &data));
 }
@@ -492,7 +492,7 @@ static void test_joy_dinput8() {
     CHECK_EQ(call_method(dev, DID_Acquire, {}), DI_OK);
     CHECK_EQ(call_method(dev, DID_Poll, {}), DI_OK);
     g_pad.lx = 32767;
-    CHECK_EQ(read_state_axis(dev, SDK_DIJOYSTATE, 0), 32767);
+    CHECK_EQ(read_state_axis(dev, SDK_DIJOYSTATE, 0), 65535);
     // The version 8 device's own slots, past the ones it shares.
     CHECK_EQ(call_method(dev, DID8_GetImageInfo, {sc(0x900)}), DI8_E_NOTIMPL);
 }
@@ -512,7 +512,7 @@ static void test_joy_device_state() {
     uint32_t st = sc(0x400);
     memset(gm_ptr(st), 0xAB, SDK_DIJOYSTATE + 4);
     CHECK_EQ(call_method(dev, DID_GetDeviceState, {SDK_DIJOYSTATE, st}), DI_OK);
-    CHECK_EQ((int32_t)rd32(st + 0), 0);
+    CHECK_EQ((int32_t)rd32(st + 0), 32768);
     CHECK_EQ(rd32(st + 32), 0xFFFFFFFFu);
     CHECK_EQ(rd8(st + 48), 0u);
     CHECK_EQ(rd8(st + SDK_DIJOYSTATE), 0xABu); // nothing past the record
@@ -520,9 +520,9 @@ static void test_joy_device_state() {
     CHECK_EQ(call_method(dev, DID_GetDeviceState, {SDK_DIJOYSTATE2, st}), DIERR_INVALIDPARAM);
 
     g_pad.lx = 32767;
-    CHECK_EQ(read_state_axis(dev, SDK_DIJOYSTATE, 0), 32767);
+    CHECK_EQ(read_state_axis(dev, SDK_DIJOYSTATE, 0), 65535);
     g_pad.ly = -32767;
-    CHECK_EQ(read_state_axis(dev, SDK_DIJOYSTATE, 4), -32768);
+    CHECK_EQ(read_state_axis(dev, SDK_DIJOYSTATE, 4), 0);
 
     // A 0..1000 range on X, by offset: the stick at rest reads the centre.
     set_range(dev, PH_BYOFFSET, 0, 0, 1000);
@@ -531,7 +531,7 @@ static void test_joy_device_state() {
     g_pad.lx = 32767;
     CHECK_EQ(read_state_axis(dev, SDK_DIJOYSTATE, 0), 1000);
     // Y still has the default range.
-    CHECK_EQ(read_state_axis(dev, SDK_DIJOYSTATE, 4), -32768);
+    CHECK_EQ(read_state_axis(dev, SDK_DIJOYSTATE, 4), 0);
 
     // Range reads back.
     uint32_t p = sc(0x100);
@@ -578,7 +578,7 @@ static void test_joy_device_state() {
     // DIJOYSTATE2 is accepted, and the state is laid out the same.
     uint32_t dev2 = make_joystick(SDK_DIJOYSTATE2);
     g_pad.rx = 32767;
-    CHECK_EQ(read_state_axis(dev2, SDK_DIJOYSTATE2, 8), 32767);
+    CHECK_EQ(read_state_axis(dev2, SDK_DIJOYSTATE2, 8), 65535);
     CHECK_EQ(rd8(sc(0x400) + 49), 0x80u);
 
     // Capabilities: 6 axes, 13 buttons, 1 POV, attached, no force feedback.
@@ -740,7 +740,7 @@ static void test_joy_device_data() {
     CHECK_EQ(call_method(dev, DID_GetDeviceData, {N, out, inout, 0}), DI_OK);
     CHECK_EQ(rd32(inout), 1u);
     CHECK_EQ(rd32(out + 0), 0u);
-    CHECK_EQ((int32_t)rd32(out + 4), -32768);
+    CHECK_EQ((int32_t)rd32(out + 4), 0);
 
     // The DirectInput 8 stride carries uAppData.
     pad_edge(0, 2, 1); // square: button 0
@@ -812,8 +812,8 @@ static void test_joy_custom_format() {
     uint32_t st = sc(0x400);
     memset(gm_ptr(st), 0x5A, 16);
     CHECK_EQ(call_method(dev, DID_GetDeviceState, {16, st}), DI_OK);
-    CHECK_EQ((int32_t)rd32(st + 0), -32768);
-    CHECK_EQ((int32_t)rd32(st + 4), 32767);
+    CHECK_EQ((int32_t)rd32(st + 0), 0);
+    CHECK_EQ((int32_t)rd32(st + 4), 65535);
     CHECK_EQ(rd8(st + 8), 0x80u);
     CHECK_EQ(rd8(st + 9), 0u);
     CHECK_EQ(rd8(st + 10), 0x5Au);

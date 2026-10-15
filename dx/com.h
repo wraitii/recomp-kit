@@ -272,7 +272,7 @@ enum ComKind : uint16_t {
 // DIPROP_SATURATION (dx/dinput_joystick.cpp). The zone and saturation are in
 // 0..10000 of the distance from centre, as DirectInput states them.
 struct JoyAxisRange {
-    int32_t min = -32768, max = 32767;
+    int32_t min = 0, max = 65535;
     uint32_t deadzone = 0, saturation = 10000;
 };
 // One field of a custom joystick data format: the guest's offset for one
