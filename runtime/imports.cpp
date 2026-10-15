@@ -452,7 +452,7 @@ static void diagnose_unsupported_import(const X86 *c, const char *desc, uint8_t 
 // Copy dispatch metadata before calling a shim, then restore EIP/ESP according to its calling convention.
 namespace {
 uint64_t g_import_calls = 0;
-constexpr uint32_t kImportCheckpointCost = 64;
+constexpr uint32_t kImportCheckpointCost = 8;
 #ifdef RECOMP_CHECK_CALL_FACTS
 thread_local uint64_t g_guest_entries = 0;
 #endif
@@ -504,8 +504,8 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     // and the guest return address.
     static const char *trace_filter = recomp_env("TRACE_IMPORTS");
     const bool need_desc = trace_filter != nullptr || log_level() >= 2 ||
-                           g_call_observer != nullptr || g_return_observer != nullptr ||
-                           fn == nullptr || fn == imports_unsupported || argc == ARGC_UNKNOWN;
+                           g_call_observer != nullptr || fn == nullptr ||
+                           fn == imports_unsupported || argc == ARGC_UNKNOWN;
     char desc[512];
     desc[0] = 0;
     if (need_desc) {
@@ -606,7 +606,7 @@ bool imports_dispatch(X86 *c, uint32_t target) {
 #endif
     // Read after the shim ran, so the pointer is into the table as it is now.
     if (g_return_observer)
-        g_return_observer(desc, c->r[R_EAX]);
+        g_return_observer(tramps()[idx].desc.c_str(), c->r[R_EAX]);
     LOGV("<- %s (eax=%08x)", desc, c->r[R_EAX]);
 
     uint32_t pop = 4;
@@ -713,10 +713,49 @@ void recomp_callback_return(X86 *c) {
     RECOMP_LONGJMP(call->env, 1);
 }
 
+namespace {
+struct HostCall {
+    uint32_t fn, nargs;
+    RecompHostCall call;
+};
+HostCall g_host_calls[32];
+uint32_t g_host_call_count = 0;
+
+RecompHostCall host_call_for(uint32_t fn, int nargs) {
+    for (uint32_t i = 0; i < g_host_call_count; ++i) {
+        const HostCall &entry = g_host_calls[i];
+        if (entry.fn != fn || entry.nargs != (uint32_t)nargs)
+            continue;
+        if (recomp_hooks_ever) {
+            int32_t index = recomp_index_of(fn);
+            if (index >= 0 && __atomic_load_n(&recomp_hooked[index], __ATOMIC_ACQUIRE))
+                return nullptr;
+        }
+        return entry.call;
+    }
+    return nullptr;
+}
+} // namespace
+
+extern "C" void recomp_register_host_call(uint32_t fn, uint32_t nargs, RecompHostCall call) {
+    if (g_host_call_count == std::size(g_host_calls)) {
+        fprintf(stderr, "recomp_register_host_call: no room for %08x\n", fn);
+        abort();
+    }
+    g_host_calls[g_host_call_count++] = {fn, nargs, call};
+}
+
+extern "C" uint32_t recomp_guest_call(X86 *c, uint32_t fn, const uint32_t *args, int nargs) {
+    return guest_call(c, fn, args, nargs);
+}
+
 uint32_t guest_call(X86 *c, uint32_t fn, const uint32_t *args, int nargs) {
 #ifdef RECOMP_CHECK_CALL_FACTS
     ++g_guest_entries;
 #endif
+    if (g_host_call_count)
+        if (RecompHostCall host = host_call_for(fn, nargs))
+            return host(c, args);
     Callbacks &local = callback_state();
     Callback *call = local.acquire();
     call->cpu = c;

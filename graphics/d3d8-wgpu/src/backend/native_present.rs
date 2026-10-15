@@ -34,8 +34,18 @@ pub(crate) fn signal_ready(
         command.encode_signal_event(event, value);
         command.commit();
     });
+    Ok(ready_event_handle(event))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn ready_event_handle(event: &ReadyEvent) -> *mut u8 {
     let raw: &metal::SharedEventRef = event;
-    Ok((raw as *const metal::SharedEventRef).cast_mut().cast())
+    (raw as *const metal::SharedEventRef).cast_mut().cast()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn ready_event_handle(_: &ReadyEvent) -> *mut u8 {
+    std::ptr::null_mut()
 }
 
 #[cfg(not(target_os = "macos"))]

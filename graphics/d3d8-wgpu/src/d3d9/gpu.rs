@@ -2,9 +2,10 @@ use super::format;
 use crate::RenderError;
 use crate::backend::GpuContext;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 pub const COPY_ALIGN: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+const STAGING_CHUNK: u64 = 1 << 20;
 
 fn align_up(value: u32, align: u32) -> u32 {
     value.div_ceil(align) * align
@@ -120,12 +121,77 @@ impl PendingClear {
     }
 }
 
+enum SubmitJob {
+    Frame(wgpu::CommandEncoder, wgpu::util::StagingBelt),
+    After(Box<dyn FnOnce(&wgpu::Queue) + Send>),
+    Sync(mpsc::Sender<()>),
+}
+
+struct Submitter {
+    jobs: Option<mpsc::Sender<SubmitJob>>,
+    belts: mpsc::Receiver<wgpu::util::StagingBelt>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Submitter {
+    fn new(queue: wgpu::Queue) -> Self {
+        let (jobs, received) = mpsc::channel::<SubmitJob>();
+        let (returned, belts) = mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("d3d9-submit".into())
+            .spawn(move || {
+                for job in received {
+                    match job {
+                        SubmitJob::Frame(encoder, mut staging) => {
+                            queue.submit([encoder.finish()]);
+                            staging.recall();
+                            let _ = returned.send(staging);
+                        }
+                        SubmitJob::After(work) => work(&queue),
+                        SubmitJob::Sync(done) => {
+                            let _ = done.send(());
+                        }
+                    }
+                }
+            })
+            .expect("failed to start the D3D9 submit thread");
+        Self {
+            jobs: Some(jobs),
+            belts,
+            thread: Some(thread),
+        }
+    }
+
+    fn send(&self, job: SubmitJob) {
+        self.jobs
+            .as_ref()
+            .expect("D3D9 submit queue is open")
+            .send(job)
+            .expect("D3D9 submit thread exited");
+    }
+
+    fn sync(&self) {
+        let (done, wait) = mpsc::channel();
+        self.send(SubmitJob::Sync(done));
+        wait.recv().expect("D3D9 submit thread exited");
+    }
+}
+
+impl Drop for Submitter {
+    fn drop(&mut self) {
+        self.jobs = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 struct PendingWork {
     device: wgpu::Device,
-    queue: wgpu::Queue,
     encoder: Option<wgpu::CommandEncoder>,
     staging: wgpu::util::StagingBelt,
     clear: Option<PendingClear>,
+    submitter: Submitter,
 }
 
 fn frame_encoder<'a>(
@@ -152,8 +218,13 @@ impl PendingWork {
             return;
         };
         self.staging.finish();
-        self.queue.submit([encoder.finish()]);
-        self.staging.recall();
+        let next = self
+            .submitter
+            .belts
+            .try_recv()
+            .unwrap_or_else(|_| wgpu::util::StagingBelt::new(STAGING_CHUNK));
+        let staging = std::mem::replace(&mut self.staging, next);
+        self.submitter.send(SubmitJob::Frame(encoder, staging));
     }
 }
 
@@ -196,10 +267,10 @@ impl D3d9Gpu {
             queue: gpu.queue.clone(),
             pending: Arc::new(Mutex::new(PendingWork {
                 device: gpu.device.clone(),
-                queue: gpu.queue.clone(),
                 encoder: None,
-                staging: wgpu::util::StagingBelt::new(1 << 20),
+                staging: wgpu::util::StagingBelt::new(STAGING_CHUNK),
                 clear: None,
+                submitter: Submitter::new(gpu.queue.clone()),
             })),
             loss,
             mipgen: Arc::new(Mutex::new(MipGenState::default())),
@@ -208,12 +279,20 @@ impl D3d9Gpu {
     }
 
     pub fn queue(&self) -> &wgpu::Queue {
-        self.submit_pending();
+        let mut pending = self.pending.lock().unwrap();
+        pending.submit();
+        pending.submitter.sync();
         &self.queue
     }
 
     pub fn submit_pending(&self) {
         self.pending.lock().unwrap().submit();
+    }
+
+    pub(crate) fn submit_then(&self, work: impl FnOnce(&wgpu::Queue) + Send + 'static) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.submit();
+        pending.submitter.send(SubmitJob::After(Box::new(work)));
     }
 
     pub fn record<R>(

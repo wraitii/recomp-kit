@@ -632,6 +632,14 @@ static inline void recomp_slow_update(uint32_t i) {
  * because a hook callback observes the full register file. */
 extern uint8_t recomp_hooks_ever;
 
+/* A host implementation of a stdcall guest function that guest_call runs in
+ * place of the translation while the function is not hooked. args holds the
+ * nargs stack arguments; the result is EAX. The implementation must leave the
+ * guest's callee-saved registers and ESP as the original would. */
+typedef uint32_t (*RecompHostCall)(X86 *c, const uint32_t *args);
+void recomp_register_host_call(uint32_t fn, uint32_t nargs, RecompHostCall call);
+uint32_t recomp_guest_call(X86 *c, uint32_t fn, const uint32_t *args, int nargs);
+
 uint32_t recomp_override_count(void);
 uint64_t recomp_override_hash(void);
 

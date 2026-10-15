@@ -186,6 +186,7 @@ pub(crate) fn expand_element(element_type: u8, bytes: &[u8]) -> Result<[f32; 4],
     Ok(out)
 }
 
+#[derive(Clone, PartialEq)]
 pub(crate) struct BoundTexture {
     pub stage: u32,
     pub view: wgpu::TextureView,
@@ -1963,6 +1964,7 @@ struct SamplerKey {
     depth: bool,
 }
 
+#[derive(Clone)]
 struct PendingTexture {
     stage: u32,
     view: wgpu::TextureView,
@@ -2015,6 +2017,27 @@ struct DrawBatch {
     last_uniform: Option<([u32; 4], [u64; 4])>,
 }
 
+struct DrawMemo {
+    generation: u64,
+    ff_key: Option<[u32; 5]>,
+    target: (wgpu::TextureFormat, u32),
+    depth: Option<(wgpu::TextureFormat, u32)>,
+    textures: Vec<BoundTexture>,
+    bindings: Vec<PendingTexture>,
+    vs_count: u32,
+    ps_count: u32,
+    modules: [wgpu::ShaderModule; 2],
+    layout: wgpu::BindGroupLayout,
+    pipeline: Option<(
+        (
+            Vec<(u64, Vec<wgpu::VertexAttribute>)>,
+            wgpu::PrimitiveTopology,
+            Option<wgpu::IndexFormat>,
+        ),
+        wgpu::RenderPipeline,
+    )>,
+}
+
 #[derive(Default)]
 pub(crate) struct D3d9DrawState {
     shaders: FastMap<String, wgpu::ShaderModule>,
@@ -2035,9 +2058,11 @@ pub(crate) struct D3d9DrawState {
     index_slots: FastMap<u32, u32>,
     native_streams: Vec<(u32, Vec<wgpu::VertexAttribute>)>,
     pipeline_memo: Option<(PipelineKey, wgpu::RenderPipeline)>,
+    memo: Option<DrawMemo>,
 }
 impl D3d9DrawState {
     pub fn clear(&mut self) {
+        self.memo = None;
         self.pipeline_memo = None;
         self.pipelines.clear();
         self.layouts.clear();
@@ -2536,6 +2561,148 @@ fn static_uniform_entry(
     }
 }
 
+fn resolve_shading(
+    gpu: &D3d9Gpu,
+    draw: &mut D3d9DrawState,
+    state: &D3d9State,
+    vs: Option<&super::shader::ShaderRecord>,
+    ps: Option<&super::shader::ShaderRecord>,
+    ff_key: Option<[u32; 5]>,
+    ff_uniform_count: u32,
+    snapshot: &DrawSnapshot,
+    target: (wgpu::TextureFormat, u32),
+    depth: Option<(wgpu::TextureFormat, u32)>,
+) -> Result<DrawMemo, RenderError> {
+    let vertex_key = if let Some(v) = vs {
+        translated_key(
+            ShaderOrigin::Guest(state.shader(false)),
+            &v.program,
+            state,
+            &snapshot.textures,
+        )?
+    } else if let Some(key) = &ff_key {
+        ShaderVariantKey {
+            pixel: false,
+            shader: ShaderOrigin::DeclaredFixedFunction,
+            state: KeyWords::from_slice(key),
+        }
+    } else {
+        fixed_function_key(false, state, &snapshot.textures)
+    };
+    let vertex_source = draw.source(vertex_key, || {
+        let source = if let Some(v) = vs {
+            translated_source(&v.program, state, &snapshot.textures)?
+        } else if let Some(key) = &ff_key {
+            ffvs::source(key)
+        } else {
+            ff_vertex_source()
+        };
+        Ok(shading_source(source, state))
+    })?;
+    let pixel_key = if let Some(p) = ps {
+        translated_key(
+            ShaderOrigin::Guest(state.shader(true)),
+            &p.program,
+            state,
+            &snapshot.textures,
+        )?
+    } else {
+        fixed_function_key(true, state, &snapshot.textures)
+    };
+    let pixel_source = draw.source(pixel_key, || {
+        let source = if let Some(p) = ps {
+            translated_source(&p.program, state, &snapshot.textures)?
+        } else {
+            ff_fragment_source(state, &snapshot.textures)?
+        };
+        Ok(shading_source(source, state))
+    })?;
+    if vs.is_some() && rs(state, 28) != 0 && rs(state, 35) != 0 {
+        return Err(unsupported(
+            "Draw",
+            "D3DRS_FOGTABLEMODE with translated vertex shaders is deferred",
+        ));
+    }
+    if rs(state, 152) != 0 {
+        return Err(unsupported(
+            "Draw",
+            "D3DRS_CLIPPLANEENABLE is not implemented",
+        ));
+    }
+    for &stage in &pixel_source.texture_stages {
+        if !snapshot.textures.iter().any(|t| t.stage == stage) {
+            return Err(unsupported(
+                "Draw",
+                format!("shader samples unbound texture stage {stage}"),
+            ));
+        }
+    }
+    let textures: Vec<&BoundTexture> = snapshot
+        .textures
+        .iter()
+        .filter(|t| pixel_source.texture_stages.contains(&t.stage))
+        .collect();
+    let mut bindings = Vec::with_capacity(textures.len());
+    for texture in &textures {
+        let (key, descriptor) = sampler(state, texture)?;
+        bindings.push(PendingTexture {
+            stage: texture.stage,
+            view: texture.view.clone(),
+            sampler: draw.sampler(gpu, key, descriptor)?,
+        });
+    }
+    let vs_count = match (&vs, ff_key.is_some()) {
+        (Some(v), _) => v.program.const_limit(),
+        (None, true) => ff_uniform_count,
+        (None, false) => 1,
+    };
+    let ps_count = ps.map(|p| p.program.const_limit()).unwrap_or(1);
+    let mut texture_layouts = [None; MAX_SAMPLERS];
+    for t in &textures {
+        let format = super::format::d3d_to_wgpu(t.format)
+            .ok_or_else(|| unsupported("Draw", "texture format"))?;
+        let filterable = format
+            .guaranteed_format_features(gpu.features())
+            .flags
+            .contains(wgpu::TextureFormatFeatureFlags::FILTERABLE);
+        if !t.depth && !filterable && [5, 6, 7].iter().any(|&id| ss(state, t.stage, id) == 2) {
+            return Err(unsupported(
+                "Draw",
+                format!("non-filterable sampler format {}", t.format),
+            ));
+        }
+        texture_layouts[t.stage as usize] = Some(TextureLayout {
+            depth: t.depth,
+            filterable,
+            dimension: texture_dimension(t),
+        });
+    }
+    let layout = draw.layout(
+        gpu,
+        LayoutKey::Draw {
+            vs: vs_count,
+            ps: ps_count,
+            textures: texture_layouts,
+        },
+    )?;
+    Ok(DrawMemo {
+        generation: state.pipeline_generation(),
+        ff_key,
+        target,
+        depth,
+        textures: snapshot.textures.clone(),
+        bindings,
+        vs_count,
+        ps_count,
+        modules: [
+            draw.variant_shader(gpu, &vertex_source)?,
+            draw.variant_shader(gpu, &pixel_source)?,
+        ],
+        layout,
+        pipeline: None,
+    })
+}
+
 pub(crate) fn execute(
     gpu: &D3d9Gpu,
     draw: &mut D3d9DrawState,
@@ -2753,62 +2920,33 @@ pub(crate) fn execute(
             }
         }
     }
-    let vertex_key = if let Some(v) = vs {
-        translated_key(
-            ShaderOrigin::Guest(state.shader(false)),
-            &v.program,
+    let target_key = (snapshot.target.texture.format(), snapshot.target.format);
+    let depth_key = snapshot
+        .depth
+        .as_ref()
+        .map(|depth| (depth.texture.format(), depth.format));
+    let memo = draw.memo.take().filter(|memo| {
+        memo.generation == state.pipeline_generation()
+            && memo.ff_key == ff_key
+            && memo.target == target_key
+            && memo.depth == depth_key
+            && memo.textures == snapshot.textures
+    });
+    let mut memo = match memo {
+        Some(memo) => memo,
+        None => resolve_shading(
+            gpu,
+            draw,
             state,
-            &snapshot.textures,
-        )?
-    } else if let Some(key) = &ff_key {
-        ShaderVariantKey {
-            pixel: false,
-            shader: ShaderOrigin::DeclaredFixedFunction,
-            state: KeyWords::from_slice(key),
-        }
-    } else {
-        fixed_function_key(false, state, &snapshot.textures)
+            vs,
+            ps,
+            ff_key,
+            (ff_uniforms.len() / 4) as u32,
+            &snapshot,
+            target_key,
+            depth_key,
+        )?,
     };
-    let vertex_source = draw.source(vertex_key, || {
-        let source = if let Some(v) = vs {
-            translated_source(&v.program, state, &snapshot.textures)?
-        } else if let Some(key) = &ff_key {
-            ffvs::source(key)
-        } else {
-            ff_vertex_source()
-        };
-        Ok(shading_source(source, state))
-    })?;
-    let pixel_key = if let Some(p) = ps {
-        translated_key(
-            ShaderOrigin::Guest(state.shader(true)),
-            &p.program,
-            state,
-            &snapshot.textures,
-        )?
-    } else {
-        fixed_function_key(true, state, &snapshot.textures)
-    };
-    let pixel_source = draw.source(pixel_key, || {
-        let source = if let Some(p) = ps {
-            translated_source(&p.program, state, &snapshot.textures)?
-        } else {
-            ff_fragment_source(state, &snapshot.textures)?
-        };
-        Ok(shading_source(source, state))
-    })?;
-    if vs.is_some() && rs(state, 28) != 0 && rs(state, 35) != 0 {
-        return Err(unsupported(
-            "Draw",
-            "D3DRS_FOGTABLEMODE with translated vertex shaders is deferred",
-        ));
-    }
-    if rs(state, 152) != 0 {
-        return Err(unsupported(
-            "Draw",
-            "D3DRS_CLIPPLANEENABLE is not implemented",
-        ));
-    }
     if snapshot.command.primitive == 1
         && (rs(state, 156) != 0 || rs(state, 157) != 0 || f32::from_bits(rs(state, 154)) != 1.0)
     {
@@ -2817,62 +2955,6 @@ pub(crate) fn execute(
             "point size/sprite/scaling state is not implemented",
         ));
     }
-    for &stage in &pixel_source.texture_stages {
-        if !snapshot.textures.iter().any(|t| t.stage == stage) {
-            return Err(unsupported(
-                "Draw",
-                format!("shader samples unbound texture stage {stage}"),
-            ));
-        }
-    }
-    let textures: Vec<&BoundTexture> = snapshot
-        .textures
-        .iter()
-        .filter(|t| pixel_source.texture_stages.contains(&t.stage))
-        .collect();
-    let mut texture_bindings = Vec::with_capacity(textures.len());
-    for texture in &textures {
-        let (key, descriptor) = sampler(state, texture)?;
-        texture_bindings.push(PendingTexture {
-            stage: texture.stage,
-            view: texture.view.clone(),
-            sampler: draw.sampler(gpu, key, descriptor)?,
-        });
-    }
-    let vs_count = match (&vs, ff_key.is_some()) {
-        (Some(v), _) => v.program.const_limit(),
-        (None, true) => (ff_uniforms.len() / 4) as u32,
-        (None, false) => 1,
-    };
-    let ps_count = ps.map(|p| p.program.const_limit()).unwrap_or(1);
-    let mut texture_layouts = [None; MAX_SAMPLERS];
-    for t in &textures {
-        let format = super::format::d3d_to_wgpu(t.format)
-            .ok_or_else(|| unsupported("Draw", "texture format"))?;
-        let filterable = format
-            .guaranteed_format_features(gpu.features())
-            .flags
-            .contains(wgpu::TextureFormatFeatureFlags::FILTERABLE);
-        if !t.depth && !filterable && [5, 6, 7].iter().any(|&id| ss(state, t.stage, id) == 2) {
-            return Err(unsupported(
-                "Draw",
-                format!("non-filterable sampler format {}", t.format),
-            ));
-        }
-        texture_layouts[t.stage as usize] = Some(TextureLayout {
-            depth: t.depth,
-            filterable,
-            dimension: texture_dimension(t),
-        });
-    }
-    let layout = draw.layout(
-        gpu,
-        LayoutKey::Draw {
-            vs: vs_count,
-            ps: ps_count,
-            textures: texture_layouts,
-        },
-    )?;
     let vp = state.viewport();
     if vp.width == 0 || vp.height == 0 || vp.min_z < 0.0 || vp.max_z > 1.0 || vp.min_z > vp.max_z {
         return Err(unsupported(
@@ -2901,10 +2983,6 @@ pub(crate) fn execute(
     for (bytes, word) in psp.chunks_exact_mut(4).zip(psp_words) {
         bytes.copy_from_slice(&word.to_le_bytes());
     }
-    let modules = [
-        draw.variant_shader(gpu, &vertex_source)?,
-        draw.variant_shader(gpu, &pixel_source)?,
-    ];
     let has_attributes = !vertices.attributes.is_empty();
     let buffers = match native_geometry.as_mut() {
         Some(geometry) => std::mem::take(&mut geometry.layouts),
@@ -2912,37 +2990,48 @@ pub(crate) fn execute(
         None => Vec::new(),
     };
     let strip_index_format = native_geometry.as_ref().and_then(|g| g.strip_format);
-    let cull = match rs(state, 22) {
-        1 => None,
-        2 => Some(wgpu::Face::Front),
-        _ => Some(wgpu::Face::Back),
+    let pipeline = match &memo.pipeline {
+        Some((shape, pipeline))
+            if shape.0 == buffers && shape.1 == topology && shape.2 == strip_index_format =>
+        {
+            pipeline.clone()
+        }
+        _ => {
+            let cull = match rs(state, 22) {
+                1 => None,
+                2 => Some(wgpu::Face::Front),
+                _ => Some(wgpu::Face::Back),
+            };
+            let target = wgpu::ColorTargetState {
+                format: snapshot.target.texture.format(),
+                blend: blend_state(state, opaque_format(snapshot.target.format))?,
+                write_mask: wgpu::ColorWrites::from_bits_truncate(rs(state, 168)),
+            };
+            let pipeline = draw.pipeline(
+                gpu,
+                PipelineKey {
+                    modules: memo.modules.clone(),
+                    layout: memo.layout.clone(),
+                    buffers: buffers.clone(),
+                    target,
+                    primitive: wgpu::PrimitiveState {
+                        topology,
+                        strip_index_format,
+                        front_face: wgpu::FrontFace::Cw,
+                        cull_mode: cull,
+                        ..Default::default()
+                    },
+                    depth: depth_state(state, snapshot.depth.as_ref())?,
+                    multisample: wgpu::MultisampleState {
+                        mask: u64::from(rs(state, 162)),
+                        ..Default::default()
+                    },
+                },
+            )?;
+            memo.pipeline = Some(((buffers, topology, strip_index_format), pipeline.clone()));
+            pipeline
+        }
     };
-    let target = wgpu::ColorTargetState {
-        format: snapshot.target.texture.format(),
-        blend: blend_state(state, opaque_format(snapshot.target.format))?,
-        write_mask: wgpu::ColorWrites::from_bits_truncate(rs(state, 168)),
-    };
-    let pipeline = draw.pipeline(
-        gpu,
-        PipelineKey {
-            modules,
-            layout: layout.clone(),
-            buffers,
-            target,
-            primitive: wgpu::PrimitiveState {
-                topology,
-                strip_index_format,
-                front_face: wgpu::FrontFace::Cw,
-                cull_mode: cull,
-                ..Default::default()
-            },
-            depth: depth_state(state, snapshot.depth.as_ref())?,
-            multisample: wgpu::MultisampleState {
-                mask: u64::from(rs(state, 162)),
-                ..Default::default()
-            },
-        },
-    )?;
     if draw
         .batch
         .color_view
@@ -2966,10 +3055,10 @@ pub(crate) fn execute(
         if ff_key.is_some() {
             bytemuck::cast_slice(&ff_uniforms)
         } else {
-            state.constants_f_bytes(false, vs_count)?
+            state.constants_f_bytes(false, memo.vs_count)?
         },
         bytemuck::cast_slice(&vsp),
-        state.constants_f_bytes(true, ps_count)?,
+        state.constants_f_bytes(true, memo.ps_count)?,
         &psp,
     ];
     let alignment = gpu.limits().min_uniform_buffer_offset_alignment.max(1) as usize;
@@ -3127,10 +3216,10 @@ pub(crate) fn execute(
     let blend = color(rs(state, 193));
     draw.batch.draws.push(PendingDraw {
         pipeline,
-        layout,
+        layout: memo.layout.clone(),
         uniform_offsets,
         uniform_sizes,
-        textures: texture_bindings,
+        textures: memo.bindings.clone(),
         vertex_offset: vertex_offset as u64,
         vertex_size: vertex_size as u64,
         has_attributes,
@@ -3142,6 +3231,7 @@ pub(crate) fn execute(
         blend_constant: blend,
         scissor,
     });
+    draw.memo = Some(memo);
     draw.linked = linked_inputs;
     draw.ff_uniforms = ff_uniforms;
     if draw.batch.data.len() >= 32 << 20 {

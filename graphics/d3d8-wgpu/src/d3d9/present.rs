@@ -4,7 +4,9 @@ use crate::backend::OffscreenTarget;
 use crate::bridge::FrameHandoff;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::backend::native_present::{ReadyEvent, create_ready_event, signal_ready};
+use crate::backend::native_present::{
+    ReadyEvent, create_ready_event, ready_event_handle, signal_ready,
+};
 
 pub(crate) struct PresentRing {
     device: wgpu::Device,
@@ -123,38 +125,40 @@ fn prepare_handoff(
     let index = ring.next;
     let texture = native_texture(&ring.textures[index])?;
     wait_slot(&ring.busy[index])?;
-    let mut encoder = gpu
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("d3d9-present-copy"),
-        });
-    encoder.copy_texture_to_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &target.texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::TexelCopyTextureInfo {
-            texture: &ring.textures[index],
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::Extent3d {
-            width: target.width,
-            height: target.height,
-            depth_or_array_layers: 1,
-        },
-    );
     let ready_value = ring.ready_value.checked_add(1).ok_or_else(|| {
         RenderError::new(
             "D3D9::PresentHandoff",
             "native GPU synchronization value overflow",
         )
     })?;
-    gpu.queue().submit([encoder.finish()]);
-    let ready_event = signal_ready(gpu.queue(), &ring.ready_event, ready_value)?;
+    gpu.record(|encoder, _| {
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &ring.textures[index],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: target.width,
+                height: target.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    });
+    let event = ring.ready_event.clone();
+    gpu.submit_then(move |queue| {
+        if let Err(error) = signal_ready(queue, &event, ready_value) {
+            log::error!("{error}");
+        }
+    });
+    let ready_event = ready_event_handle(&ring.ready_event);
     ring.ready_value = ready_value;
     gpu.device
         .poll(wgpu::PollType::Poll)

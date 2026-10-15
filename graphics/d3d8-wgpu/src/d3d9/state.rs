@@ -590,6 +590,7 @@ pub struct D3d9State {
     next_block: u32,
     recording: Option<D3d9StateBlock>,
     recording_handle: u32,
+    pipeline_generation: u64,
 }
 
 impl Default for D3d9State {
@@ -667,6 +668,7 @@ impl Default for D3d9State {
             next_block: 1,
             recording: None,
             recording_handle: 0,
+            pipeline_generation: 0,
         }
     }
 }
@@ -718,7 +720,10 @@ impl D3d9State {
         if self.recording.is_some() {
             self.recording.as_mut().unwrap().set_render(state, value);
         } else {
-            self.render[state as usize] = value;
+            if self.render[state as usize] != value {
+                self.render[state as usize] = value;
+                self.pipeline_generation += 1;
+            }
         }
         Ok(())
     }
@@ -758,13 +763,20 @@ impl D3d9State {
                 .unwrap()
                 .set_tss(stage, state, value);
         } else {
-            self.tss[stage as usize][state as usize] = value;
+            if self.tss[stage as usize][state as usize] != value {
+                self.tss[stage as usize][state as usize] = value;
+                self.pipeline_generation += 1;
+            }
         }
         Ok(())
     }
 
     pub(crate) fn render_raw(&self, state: u32) -> u32 {
         self.render[state as usize]
+    }
+
+    pub(crate) fn pipeline_generation(&self) -> u64 {
+        self.pipeline_generation
     }
 
     pub(crate) fn texture_stage_raw(&self, stage: u32, state: u32) -> u32 {
@@ -816,7 +828,10 @@ impl D3d9State {
                 .unwrap()
                 .set_sampler(sampler, state, value);
         } else {
-            self.sampler[sampler as usize][state as usize] = value;
+            if self.sampler[sampler as usize][state as usize] != value {
+                self.sampler[sampler as usize][state as usize] = value;
+                self.pipeline_generation += 1;
+            }
         }
         Ok(())
     }
@@ -1124,7 +1139,10 @@ impl D3d9State {
         if self.recording.is_some() {
             self.recording.as_mut().unwrap().set_texture(stage, id);
         } else {
-            self.textures[stage as usize] = id;
+            if self.textures[stage as usize] != id {
+                self.textures[stage as usize] = id;
+                self.pipeline_generation += 1;
+            }
         }
         Ok(())
     }
@@ -1164,6 +1182,9 @@ impl D3d9State {
                 block.streams.push((stream, source));
             }
         } else {
+            if self.streams[stream as usize].stride != source.stride {
+                self.pipeline_generation += 1;
+            }
             self.streams[stream as usize] = source;
         }
         Ok(())
@@ -1210,7 +1231,10 @@ impl D3d9State {
                 .unwrap()
                 .set_stream_freq(stream, divider);
         } else {
-            self.stream_freq[stream as usize] = divider;
+            if self.stream_freq[stream as usize] != divider {
+                self.stream_freq[stream as usize] = divider;
+                self.pipeline_generation += 1;
+            }
         }
         Ok(())
     }
@@ -1239,8 +1263,11 @@ impl D3d9State {
             block.declaration = Some(handle);
             block.fvf = Some(fvf);
         } else {
-            self.declaration = handle;
-            self.fvf = fvf;
+            if self.declaration != handle || self.fvf != fvf {
+                self.declaration = handle;
+                self.fvf = fvf;
+                self.pipeline_generation += 1;
+            }
         }
     }
 
@@ -1261,9 +1288,13 @@ impl D3d9State {
                 block.vertex_shader = Some(handle);
             }
         } else if pixel {
-            self.pixel_shader = handle;
-        } else {
+            if self.pixel_shader != handle {
+                self.pixel_shader = handle;
+                self.pipeline_generation += 1;
+            }
+        } else if self.vertex_shader != handle {
             self.vertex_shader = handle;
+            self.pipeline_generation += 1;
         }
     }
 
@@ -1692,6 +1723,7 @@ impl D3d9State {
             ));
         }
         block.apply_to(self);
+        self.pipeline_generation += 1;
         self.blocks.insert(handle, block);
         Ok(())
     }
@@ -1732,12 +1764,14 @@ impl D3d9State {
         let blocks = std::mem::take(&mut self.blocks);
         let next_block = self.next_block;
         let recording_handle = self.recording_handle;
+        let generation = self.pipeline_generation;
         drop(blocks);
         *self = Self::default();
         self.target_width = target_width;
         self.target_height = target_height;
         self.next_block = next_block;
         self.recording_handle = recording_handle;
+        self.pipeline_generation = generation + 1;
     }
 
     pub fn has_live_state_blocks(&self) -> bool {
@@ -1746,10 +1780,12 @@ impl D3d9State {
 
     pub fn clear_up_stream(&mut self) {
         self.streams[0] = StreamSource::default();
+        self.pipeline_generation += 1;
     }
 
     pub fn clear_up_indexed(&mut self) {
         self.streams[0] = StreamSource::default();
+        self.pipeline_generation += 1;
         self.indices = 0;
     }
 
@@ -1875,6 +1911,7 @@ pub(crate) struct EffectSnapshot {
 impl EffectSnapshot {
     pub(crate) fn restore(&self, state: &mut D3d9State) {
         self.block.apply_to(state);
+        state.pipeline_generation += 1;
     }
 
     pub(crate) fn bindings(&self) -> D3d9Bindings {
