@@ -116,7 +116,7 @@ struct Service : std::enable_shared_from_this<Service> {
     bool tick_pending = false, seal_pending = false;
     double last_link_tick = -1, window_started = -1;
     unsigned faults = 0, logged_faults = 0;
-    double frame_period = 1.0 / 60, fake_now = 0;
+    double frame_period = 1.0 / 60, fake_now = 0, queued_flip = 0;
     void fault(unsigned bit, const char *reason) { // mutex held
         if (logged_faults & bit)
             return;
@@ -208,6 +208,7 @@ struct Service : std::enable_shared_from_this<Service> {
     uint64_t history_epoch = 0;
     std::shared_ptr<Composite> cached;
     std::shared_ptr<Composite> cached_settings;
+    std::vector<std::shared_ptr<Composite>> composite_pool;
     UiFrame cached_ui{};
 #ifdef POPM_PRESENT_HAS_UI_LAYER
     UiFrame previous_ui{}; // guest thread only, including sealed frames that were dropped
@@ -528,6 +529,16 @@ struct Service : std::enable_shared_from_this<Service> {
         c->format = format;
         return c;
     }
+    std::shared_ptr<Composite> pooled_composite(int w, int h, gpu::Format format) {
+        for (const auto &c : composite_pool)
+            if (c.use_count() == 1 && c->w == w && c->h == h && c->format == format)
+                return c;
+        std::erase_if(composite_pool, [](const auto &c) { return c.use_count() == 1; });
+        auto c = composite(w, h, format);
+        if (c)
+            composite_pool.push_back(c);
+        return c;
+    }
     // Apply backpressure before the first write. Dropping an unrendered frame
     // loses persistent surface updates (dirty HUD rectangles, cursor erasure),
     // even if later whole-scene frames can still be displayed. Completed frames
@@ -814,7 +825,7 @@ struct Service : std::enable_shared_from_this<Service> {
             bool reuse_composition = f->repeat && cached && cached->w == w && cached->h == h &&
                                      cached->format == out_format;
             std::shared_ptr<Composite> out =
-                reuse_composition ? cached : composite(w, h, out_format);
+                reuse_composition ? cached : pooled_composite(w, h, out_format);
             gpu::CommandBuffer cb = device->begin();
             if (!cb || !out) {
                 if (drawable)
@@ -1194,6 +1205,7 @@ extern "C" void host_present_stop() {
         s->history.overlay = {};
         s->cached.reset();
         s->cached_settings.reset();
+        s->composite_pool.clear();
         s->cached_input = {};
         s->cached_ui = {};
         s->targets = {};
@@ -1815,25 +1827,25 @@ bool host_present_suspended(void) {
     return g_present_suspended.load();
 }
 
-// Present with a sync interval returns at a vertical blank on Windows, and a
-// renderer that asks for one paces its whole loop by it. This is how long
-// until the presenter's next refresh boundary, `intervals` refreshes on, on the
-// device clock the pacer keeps. The caller waits it out in the scheduler: a
-// host sleep here would hold the guest baton for the whole wait and freeze
-// every other guest thread with it. A headless presenter has no display to
-// wait for, so a smoke still runs as fast as it can.
+// Present with a sync interval queues a flip for a vertical blank on Windows:
+// it blocks only while the previously queued frame is still waiting for its
+// blank, so a renderer slower than the display never waits and one faster is
+// paced to it. This is how long until that earlier frame reaches the screen,
+// on the device clock the pacer keeps. The caller waits it out in the
+// scheduler: a host sleep here would hold the guest baton for the whole wait
+// and freeze every other guest thread with it. A headless presenter has no
+// display to wait for, so a smoke still runs as fast as it can.
 extern "C" double host_present_refresh_delay(int intervals) {
     auto s = active.load();
     if (!s || s->fake || !s->device || intervals <= 0)
         return 0.0;
-    double period, now;
-    {
-        std::lock_guard lock(s->mutex);
-        period = s->frame_period > 0 ? s->frame_period : 1.0 / 60;
-        now = s->device->now_seconds();
-    }
-    const double next = (std::floor(now / period) + intervals) * period;
-    return next > now ? next - now : 0.0;
+    std::lock_guard lock(s->mutex);
+    const double period = s->frame_period > 0 ? s->frame_period : 1.0 / 60;
+    const double now = s->device->now_seconds();
+    const double previous = s->queued_flip;
+    const double blank = std::ceil(now / period) * period;
+    s->queued_flip = std::max(blank, previous + intervals * period);
+    return previous > now ? previous - now : 0.0;
 }
 
 extern "C" void host_present_seal_window() {

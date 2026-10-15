@@ -452,6 +452,7 @@ static void diagnose_unsupported_import(const X86 *c, const char *desc, uint8_t 
 // Copy dispatch metadata before calling a shim, then restore EIP/ESP according to its calling convention.
 namespace {
 uint64_t g_import_calls = 0;
+constexpr uint32_t kImportCheckpointCost = 64;
 #ifdef RECOMP_CHECK_CALL_FACTS
 thread_local uint64_t g_guest_entries = 0;
 #endif
@@ -475,7 +476,7 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     // except at an atomic import, and inside a sched_atomic_enter stretch.
     uint32_t idx = (target - TRAMP_BASE) / TRAMP_STRIDE;
     if (idx >= tramps().size() || !tramps()[idx].atomic)
-        sched_checkpoint();
+        recomp_execution_checkpoint_charge(c, kImportCheckpointCost);
     if (idx >= tramps().size()) {
         // No shim to say how many arguments to drop, but the return address
         // must still be consumed or the guest stack is displaced from here on.

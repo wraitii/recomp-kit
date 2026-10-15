@@ -118,10 +118,12 @@ extern "C" void recomp_profile_push(uint32_t index) {
     local->slot.top.store(index, std::memory_order_relaxed);
 }
 extern "C" uint32_t recomp_profile_depth() {
+    if (!recomp_profile_enabled)
+        return 0;
     return local ? static_cast<uint32_t>(local->stack.size()) : 0;
 }
 extern "C" void recomp_profile_truncate(uint32_t depth) {
-    if (!local)
+    if (!recomp_profile_enabled || !local)
         return;
     if (depth < local->stack.size())
         local->stack.resize(depth);

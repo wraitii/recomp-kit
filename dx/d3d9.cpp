@@ -244,25 +244,14 @@ static void d3d9_reconcile(std::set<uint32_t> &current, const std::set<uint32_t>
             d3d9_ref_add(id);
     current = desired;
 }
-static size_t d3d9_unique_ids(const std::array<uint32_t, 38> &ids, std::array<uint32_t, 38> &out) {
-    auto end = std::remove_copy(ids.begin(), ids.end(), out.begin(), 0u);
-    std::sort(out.begin(), end);
-    return (size_t)(std::unique(out.begin(), end) - out.begin());
-}
 static void d3d9_reconcile_bindings(std::array<uint32_t, 38> &snapshot,
                                     const std::array<uint32_t, 38> &ids) {
-    if (snapshot == ids)
-        return;
-    std::array<uint32_t, 38> old_ids{};
-    std::array<uint32_t, 38> new_ids{};
-    const size_t old_count = d3d9_unique_ids(snapshot, old_ids);
-    const size_t new_count = d3d9_unique_ids(ids, new_ids);
-    for (size_t i = 0; i < old_count; ++i)
-        if (!std::binary_search(new_ids.begin(), new_ids.begin() + new_count, old_ids[i]))
-            d3d9_ref_del(old_ids[i]);
-    for (size_t i = 0; i < new_count; ++i)
-        if (!std::binary_search(old_ids.begin(), old_ids.begin() + old_count, new_ids[i]))
-            d3d9_ref_add(new_ids[i]);
+    for (size_t i = 0; i < ids.size(); ++i)
+        if (snapshot[i] != ids[i] && ids[i])
+            d3d9_ref_add(ids[i]);
+    for (size_t i = 0; i < ids.size(); ++i)
+        if (snapshot[i] != ids[i] && snapshot[i])
+            d3d9_ref_del(snapshot[i]);
     snapshot = ids;
 }
 static void d3d9_refresh_bindings(ComObj *dev) {
@@ -284,6 +273,21 @@ static void d3d9_refresh_bindings(ComObj *dev) {
                                              : std::array<uint32_t, 38>{};
     d3d9_reconcile_bindings(host->live_bindings, live);
     d3d9_reconcile_bindings(host->recording_bindings, recording);
+}
+static void d3d9_bind_slot(ComObj *dev, size_t slot, uint32_t id) {
+    D3d9HostDevice *host = dev->d3d9_device.get();
+    if (host->recording_block) {
+        d3d9_refresh_bindings(dev);
+        return;
+    }
+    uint32_t &current = host->live_bindings[slot];
+    if (current == id)
+        return;
+    if (id)
+        d3d9_ref_add(id);
+    if (current)
+        d3d9_ref_del(current);
+    current = id;
 }
 static void d3d9_refresh_block_bindings(ComObj *dev, uint32_t handle) {
     if (!dev || !dev->d3d9_device)
@@ -307,14 +311,12 @@ static void d3d9_drop_all_refs(ComObj *dev) {
     if (!dev || !dev->d3d9_device)
         return;
     D3d9HostDevice *host = dev->d3d9_device.get();
-    std::array<uint32_t, 38> live_ids{};
-    std::array<uint32_t, 38> recording_ids{};
-    const size_t live_count = d3d9_unique_ids(host->live_bindings, live_ids);
-    const size_t recording_count = d3d9_unique_ids(host->recording_bindings, recording_ids);
-    for (size_t i = 0; i < live_count; ++i)
-        d3d9_ref_del(live_ids[i]);
-    for (size_t i = 0; i < recording_count; ++i)
-        d3d9_ref_del(recording_ids[i]);
+    for (uint32_t id : host->live_bindings)
+        if (id)
+            d3d9_ref_del(id);
+    for (uint32_t id : host->recording_bindings)
+        if (id)
+            d3d9_ref_del(id);
     host->live_bindings.fill(0);
     host->recording_bindings.fill(0);
     for (auto &entry : host->block_refs)
@@ -3872,10 +3874,17 @@ void Efx_SetTexture(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
+    recomp::d3d::ValueResult previous =
+        recomp::d3d::d3dx_effect_texture(*efx_host(fx)->value, handle);
     recomp::d3d::Status result =
         recomp::d3d::d3dx_effect_set_texture(*efx_host(fx)->value, handle, tex ? tex->id : 0);
     if (result.code != recomp::d3d::StatusCode::Ok) {
         efx_status(c, result);
+        return;
+    }
+    if (previous.status.code == recomp::d3d::StatusCode::Ok &&
+        previous.value == (tex ? tex->id : 0)) {
+        com_ret(c, D3D_OK9);
         return;
     }
     efx_refresh_textures(fx);
@@ -4008,13 +4017,22 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
              (unsigned)command_count);
         return D3DERR_INVALIDCALL;
     }
-    uint32_t addref = efx_manager_method(manager, EFX_MANAGER_ADDREF, "AddRef");
-    uint32_t release = efx_manager_method(manager, EFX_MANAGER_RELEASE, "Release");
-    if (!addref || !release)
-        return D3DERR_INVALIDCALL;
     const recomp::d3d::D3dxEffectCommand *cmd_list = commands.data();
-    std::vector<uint32_t> resolved(command_count, 0);
-    std::set<uint32_t> pinned;
+    uint32_t resolved_inline[128];
+    std::vector<uint32_t> resolved_heap;
+    uint32_t *resolved = resolved_inline;
+    if (command_count > std::size(resolved_inline)) {
+        resolved_heap.resize(command_count);
+        resolved = resolved_heap.data();
+    }
+    std::fill(resolved, resolved + command_count, 0u);
+    std::vector<uint32_t> pinned;
+    auto pin = [&](uint32_t id) {
+        if (std::find(pinned.begin(), pinned.end(), id) != pinned.end())
+            return false;
+        pinned.push_back(id);
+        return true;
+    };
     bool stale = false;
     bool oom = false;
     for (size_t i = 0; i < command_count && !stale && !oom; ++i) {
@@ -4033,7 +4051,7 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
                 oom = true;
                 break;
             }
-            if (pinned.insert(cmd.value).second)
+            if (pin(cmd.value))
                 com_addref(o);
         } else if (cmd.kind == recomp::d3d::D3dxEffectCommandKind::SetVertexShader ||
                    cmd.kind == recomp::d3d::D3dxEffectCommandKind::SetPixelShader) {
@@ -4053,7 +4071,7 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
                 oom = true;
                 break;
             }
-            if (pinned.insert(it->second).second)
+            if (pin(it->second))
                 com_addref(o);
         }
     }
@@ -4068,8 +4086,6 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
         unpin();
         return oom ? E_OUTOFMEMORY : D3DERR_INVALIDCALL;
     }
-
-    guest_call(c, addref, manager);
 
     auto temporary = [&](uint32_t bytes) -> uint32_t {
         if (!bytes)
@@ -4205,7 +4221,6 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
     }
 
     unpin();
-    guest_call(c, release, manager);
     if (oom)
         return E_OUTOFMEMORY;
     if (stale)
@@ -4228,10 +4243,8 @@ static uint32_t efx_run(X86 *c, ComObj *fx, ComObj *dev,
     uint32_t hr = efx_dispatch_commands(c, fx, dev, result.commands);
     if (result.reserved)
         recomp::d3d::d3dx_effect_batch_finish(*host->value, !efx_hr_failed(hr));
-    efx_refresh_textures(fx);
-    if (ComObj *pool = com_get(host->pool_obj))
-        efx_refresh_pool_textures(pool);
-    d3d9_refresh_bindings(dev);
+    else
+        d3d9_refresh_bindings(dev);
     return hr;
 }
 
@@ -4255,8 +4268,9 @@ void Efx_Begin(X86 *c) {
     }
     if (passes)
         wr32(passes, result.value);
+    D3dxEffectHost *host = efx_host(fx);
+    host->restores_state = !(arg(c, 2) & 1) && !host->state_manager;
     efx_refresh_saved(dev, fx);
-    d3d9_refresh_bindings(dev);
     com_ret(c, D3D_OK9);
 }
 
@@ -4310,9 +4324,12 @@ void Efx_End(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
+    D3dxEffectHost *host = efx_host(fx);
     recomp::d3d::Status result =
-        recomp::d3d::d3dx_effect_end(*efx_host(fx)->value, *dev->d3d9_device->value);
-    d3d9_refresh_bindings(dev);
+        recomp::d3d::d3dx_effect_end(*host->value, *dev->d3d9_device->value);
+    if (host->restores_state)
+        d3d9_refresh_bindings(dev);
+    host->restores_state = false;
     if (result.code == recomp::d3d::StatusCode::Ok)
         efx_drop_saved(fx);
     efx_status(c, result);
@@ -5529,7 +5546,7 @@ void Dev_SetStreamSource(X86 *c) {
         recomp::d3d::Status status =
             dev->d3d9_device->set_stream_source(stream, vb ? vb->id : 0, arg(c, 3), arg(c, 4));
         if (d3d_bridge_ok(status))
-            d3d9_refresh_bindings(dev);
+            d3d9_bind_slot(dev, 16 + stream, vb ? vb->id : 0);
         com_ret(c, bridge_result(c, status));
         return;
     }
@@ -5573,7 +5590,7 @@ void Dev_SetIndices(X86 *c) {
         }
         recomp::d3d::Status status = dev->d3d9_device->set_indices(ib ? ib->id : 0);
         if (d3d_bridge_ok(status))
-            d3d9_refresh_bindings(dev);
+            d3d9_bind_slot(dev, 32, ib ? ib->id : 0);
         com_ret(c, bridge_result(c, status));
         return;
     }
@@ -5610,7 +5627,7 @@ void Dev_SetTexture(X86 *c) {
         }
         recomp::d3d::Status status = dev->d3d9_device->set_texture(stage, tex ? tex->id : 0);
         if (d3d_bridge_ok(status))
-            d3d9_refresh_bindings(dev);
+            d3d9_bind_slot(dev, stage, tex ? tex->id : 0);
         com_ret(c, bridge_result(c, status));
         return;
     }
@@ -5893,8 +5910,6 @@ void Dev_DrawIndexedPrimitive(X86 *c) {
         }
         recomp::d3d::Status status = dev->d3d9_device->draw_indexed_primitive(
             arg(c, 1), (int32_t)arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5), prim_count);
-        if (status.code == recomp::d3d::StatusCode::Ok)
-            d3d9_refresh_bindings(dev);
         com_ret(c, bridge_result(c, status));
         return;
     }
@@ -8452,7 +8467,10 @@ void Dev_BeginStateBlock(X86 *c) {
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
-    com_ret(c, bridge_result(c, dev->d3d9_device->begin_state_block()));
+    recomp::d3d::Status status = dev->d3d9_device->begin_state_block();
+    if (d3d_bridge_ok(status))
+        dev->d3d9_device->recording_block = true;
+    com_ret(c, bridge_result(c, status));
 }
 void Dev_EndStateBlock(X86 *c) {
     ComObj *dev = this_device9(c);
@@ -8467,6 +8485,8 @@ void Dev_EndStateBlock(X86 *c) {
     }
     wr32(out, 0);
     recomp::d3d::ValueResult result = dev->d3d9_device->end_state_block();
+    if (d3d_bridge_ok(result.status))
+        dev->d3d9_device->recording_block = false;
     if (!d3d_bridge_ok(result.status)) {
         com_ret(c, bridge_result(c, result.status));
         return;

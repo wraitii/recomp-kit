@@ -763,6 +763,18 @@ impl D3d9State {
         Ok(())
     }
 
+    pub(crate) fn render_raw(&self, state: u32) -> u32 {
+        self.render[state as usize]
+    }
+
+    pub(crate) fn texture_stage_raw(&self, stage: u32, state: u32) -> u32 {
+        self.tss[stage as usize][state as usize]
+    }
+
+    pub(crate) fn sampler_raw(&self, sampler: u32, state: u32) -> u32 {
+        self.sampler[sampler as usize][state as usize]
+    }
+
     pub fn texture_stage_state(&self, stage: u32, state: u32) -> Result<u32, RenderError> {
         if stage as usize >= MAX_TEXTURE_STAGES {
             return Err(invalid(
@@ -1294,6 +1306,23 @@ impl D3d9State {
             }
         }
         Ok(())
+    }
+
+    pub fn constants_f_bytes(&self, pixel: bool, count: u32) -> Result<&[u8], RenderError> {
+        let constants: &[[f32; 4]] = if pixel {
+            &self.ps_const_f
+        } else {
+            &self.vs_const_f
+        };
+        constants
+            .get(..count as usize)
+            .map(bytemuck::cast_slice)
+            .ok_or_else(|| {
+                invalid(
+                    "GetShaderConstantF",
+                    "shader float constant range is out of bounds",
+                )
+            })
     }
 
     pub fn constants_f(

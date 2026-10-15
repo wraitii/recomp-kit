@@ -153,7 +153,10 @@ fn wgpu_format(view: &SurfaceView, op: &'static str) -> Result<wgpu::TextureForm
     format::d3d_to_wgpu(view.format)
         .map(|_| view.texture.format())
         .ok_or_else(|| {
-            RenderError::new(op, format!("D3D format {} has no wgpu mapping", view.format))
+            RenderError::new(
+                op,
+                format!("D3D format {} has no wgpu mapping", view.format),
+            )
         })
 }
 
@@ -252,39 +255,35 @@ fn raw_copy(
     let src_z = if src.volume { src_slice } else { src_face };
     let dst_z = if dst.volume { dst_slice } else { dst_face };
     gpu.validate(op, || {
-        let mut encoder = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("d3d9-copy"),
-            });
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &src.texture,
-                mip_level: src_level,
-                origin: wgpu::Origin3d {
-                    x: src_rect.left,
-                    y: src_rect.top,
-                    z: src_z,
+        gpu.record(|encoder, _| {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &src.texture,
+                    mip_level: src_level,
+                    origin: wgpu::Origin3d {
+                        x: src_rect.left,
+                        y: src_rect.top,
+                        z: src_z,
+                    },
+                    aspect: wgpu::TextureAspect::All,
                 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &dst.texture,
-                mip_level: dst_level,
-                origin: wgpu::Origin3d {
-                    x: dst_rect.left,
-                    y: dst_rect.top,
-                    z: dst_z,
+                wgpu::TexelCopyTextureInfo {
+                    texture: &dst.texture,
+                    mip_level: dst_level,
+                    origin: wgpu::Origin3d {
+                        x: dst_rect.left,
+                        y: dst_rect.top,
+                        z: dst_z,
+                    },
+                    aspect: wgpu::TextureAspect::All,
                 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: src_rect.width(),
-                height: src_rect.height(),
-                depth_or_array_layers: 1,
-            },
-        );
-        gpu.queue.submit(std::iter::once(encoder.finish()));
+                wgpu::Extent3d {
+                    width: src_rect.width(),
+                    height: src_rect.height(),
+                    depth_or_array_layers: 1,
+                },
+            );
+        });
         Ok(())
     })
 }
@@ -464,12 +463,7 @@ fn blit(
                 multiview: None,
                 cache: None,
             });
-        let mut encoder = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("d3d9-copy"),
-            });
-        {
+        gpu.record(|encoder, _| {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("d3d9-copy"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -494,8 +488,7 @@ fn blit(
                 dst_rect.height(),
             );
             pass.draw(0..3, 0..1);
-        }
-        gpu.queue.submit(std::iter::once(encoder.finish()));
+        });
         Ok(())
     })
 }
@@ -840,12 +833,7 @@ pub(crate) fn color_fill(
                 multiview: None,
                 cache: None,
             });
-        let mut encoder = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("d3d9-fill"),
-            });
-        {
+        gpu.record(|encoder, _| {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("d3d9-fill"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -865,8 +853,7 @@ pub(crate) fn color_fill(
             pass.set_bind_group(0, &bind_group, &[]);
             pass.set_scissor_rect(rect.left, rect.top, rect.width(), rect.height());
             pass.draw(0..3, 0..1);
-        }
-        gpu.queue.submit(std::iter::once(encoder.finish()));
+        });
         Ok(())
     })
 }

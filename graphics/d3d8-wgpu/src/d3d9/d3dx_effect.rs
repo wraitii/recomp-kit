@@ -10,13 +10,14 @@ use crate::bridge::{
 };
 use crate::d3d9::D3d9Device;
 use crate::d3d9::d3dx_shader;
+use crate::d3d9::fast_map::FastMap;
 use crate::d3d9::resource::D3DPOOL_DEFAULT;
 use crate::d3d9::state::{EffectKeys, EffectSnapshot};
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const FX_TAG: u32 = 0xFEFF_0901;
@@ -209,6 +210,22 @@ struct EfxState {
     preshader: Option<Vec<u8>>,
     referenced: Option<Vec<u8>>,
     selector: Option<Vec<u8>>,
+    preshader_program: OnceLock<Result<Arc<CompiledPreshader>, RenderError>>,
+    selector_program: OnceLock<Result<Arc<CompiledPreshader>, RenderError>>,
+    deps: OnceLock<Option<Vec<usize>>>,
+}
+
+struct CompiledPreshader {
+    program: preshader::Preshader,
+    constants: Vec<CtabConst>,
+    params: Vec<usize>,
+    outputs: Vec<u32>,
+}
+
+static NEXT_VERSION: AtomicU64 = AtomicU64::new(1);
+
+fn next_version() -> u64 {
+    NEXT_VERSION.fetch_add(1, Ordering::Relaxed)
 }
 
 #[derive(Clone)]
@@ -217,6 +234,7 @@ struct EfxParam {
     value: EfxValue,
     flags: u32,
     annotations: Vec<u32>,
+    version: u64,
 }
 
 #[derive(Clone)]
@@ -238,13 +256,9 @@ struct EfxObject {
     data: Vec<u8>,
     param: Vec<u8>,
     ctab: OnceLock<Result<Vec<CtabConst>, RenderError>>,
-    preshader: OnceLock<Result<Option<Arc<ShaderPreshader>>, RenderError>>,
-}
-
-struct ShaderPreshader {
-    program: preshader::Preshader,
-    constants: Vec<CtabConst>,
-    outputs: Vec<u32>,
+    ctab_params: OnceLock<Result<Vec<usize>, RenderError>>,
+    preshader: OnceLock<Result<Option<Arc<CompiledPreshader>>, RenderError>>,
+    const_version: Cell<u64>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -270,6 +284,17 @@ impl ParamShape {
             members: t.members.iter().map(ParamShape::of).collect(),
         }
     }
+
+    fn matches(&self, t: &EfxType) -> bool {
+        self.type_ == t.type_
+            && self.class == t.class
+            && self.rows == t.rows
+            && self.cols == t.cols
+            && self.elements == t.elements
+            && self.semantic == t.semantic
+            && self.members.len() == t.members.len()
+            && self.members.iter().zip(&t.members).all(|(a, b)| a.matches(b))
+    }
 }
 
 struct PoolEntry {
@@ -277,6 +302,7 @@ struct PoolEntry {
     value: Vec<u8>,
     objects: Vec<u32>,
     members: BTreeSet<u32>,
+    version: u64,
 }
 
 #[derive(Default)]
@@ -330,6 +356,9 @@ pub struct D3dxEffect {
     manager_mode: bool,
     batch: Option<EffectBatch>,
     children: RefCell<ChildState>,
+    param_names: FastMap<Vec<u8>, usize>,
+    pass_version: u64,
+    targets: RefCell<FastMap<u32, ParamTarget>>,
 }
 
 impl Default for D3dxEffect {
@@ -354,6 +383,9 @@ impl Default for D3dxEffect {
             manager_mode: false,
             batch: None,
             children: RefCell::new(ChildState::default()),
+            param_names: Default::default(),
+            pass_version: 0,
+            targets: RefCell::default(),
         }
     }
 }
@@ -521,6 +553,9 @@ fn read_state(body: &[u8], at: usize) -> Result<(EfxState, usize), RenderError> 
             preshader: None,
             referenced: None,
             selector: None,
+            preshader_program: OnceLock::new(),
+            selector_program: OnceLock::new(),
+            deps: OnceLock::new(),
         },
         at + 16,
     ))
@@ -548,6 +583,7 @@ fn read_annotations(
             value,
             flags: 0,
             annotations: Vec::new(),
+            version: 0,
         });
     }
     Ok(())
@@ -597,6 +633,7 @@ fn parse_effect(blob: &[u8]) -> Result<D3dxEffect, RenderError> {
             value,
             flags,
             annotations: param_annotations,
+            version: 0,
         });
     }
     for _ in 0..ntech {
@@ -669,7 +706,9 @@ fn parse_effect(blob: &[u8]) -> Result<D3dxEffect, RenderError> {
                 data: body[at..end].to_vec(),
                 param: Vec::new(),
                 ctab: OnceLock::new(),
+                ctab_params: OnceLock::new(),
                 preshader: OnceLock::new(),
+                const_version: Cell::new(0),
             },
         );
         at = end + ((4 - (size & 3)) & 3);
@@ -781,7 +820,9 @@ fn parse_effect(blob: &[u8]) -> Result<D3dxEffect, RenderError> {
             data: Vec::new(),
             param: Vec::new(),
             ctab: OnceLock::new(),
+            ctab_params: OnceLock::new(),
             preshader: OnceLock::new(),
+            const_version: Cell::new(0),
         });
         match usage {
             0 => entry.data = state.shader.clone().unwrap_or_default(),
@@ -798,6 +839,12 @@ fn parse_effect(blob: &[u8]) -> Result<D3dxEffect, RenderError> {
                 *id = 0;
             }
         }
+    }
+    for (index, param) in effect.params.iter().enumerate() {
+        effect
+            .param_names
+            .entry(param.type_.name.clone())
+            .or_insert(index);
     }
     Ok(effect)
 }
@@ -958,8 +1005,9 @@ fn write_matrix(
     }
 }
 
+#[derive(Clone)]
 struct ParamTarget {
-    ty: EfxType,
+    ty: Arc<EfxType>,
     flags: u32,
     annotation_count: u32,
     root: Option<usize>,
@@ -1061,11 +1109,24 @@ impl D3dxEffect {
     }
 
     fn target(&self, handle: u32) -> Option<ParamTarget> {
+        if let Some(target) = self.targets.borrow().get(&handle) {
+            return Some(target.clone());
+        }
+        let target = self.resolve_target(handle)?;
+        let mut targets = self.targets.borrow_mut();
+        if targets.len() >= 4096 {
+            targets.clear();
+        }
+        targets.insert(handle, target.clone());
+        Some(target)
+    }
+
+    fn resolve_target(&self, handle: u32) -> Option<ParamTarget> {
         if handle & H_MASK == H_ANNOT {
             let index = handle_index(handle, H_ANNOT)? as usize;
             let param = self.annotations.get(index)?;
             return Some(ParamTarget {
-                ty: param.type_.clone(),
+                ty: Arc::new(param.type_.clone()),
                 flags: param.flags,
                 annotation_count: param.annotations.len() as u32,
                 root: None,
@@ -1078,7 +1139,7 @@ impl D3dxEffect {
         let param = self.params.get(root)?;
         let (node, offset, object) = resolve_node(&param.type_, &path)?;
         Some(ParamTarget {
-            ty: node,
+            ty: Arc::new(node),
             flags: param.flags,
             annotation_count: param.annotations.len() as u32,
             root: Some(root),
@@ -1089,9 +1150,51 @@ impl D3dxEffect {
     }
 
     fn find_param_index(&self, name: &[u8]) -> Option<usize> {
-        self.params
-            .iter()
-            .position(|param| param.type_.name == name)
+        self.param_names.get(name).copied()
+    }
+
+    fn param_version(&self, index: usize) -> u64 {
+        let param = &self.params[index];
+        let mut version = param.version;
+        if param.flags & FX_PARAM_SHARED != 0 {
+            if let Some(pool) = &self.pool {
+                if let Some(entry) = pool.lock().unwrap().entries.get(&param.type_.name) {
+                    version = version.max(entry.version);
+                }
+            }
+        }
+        version
+    }
+
+    fn with_pool_entry<R>(&self, index: usize, f: impl FnOnce(&PoolEntry) -> R) -> Option<R> {
+        let param = self.params.get(index)?;
+        if !self.shared(index) {
+            return None;
+        }
+        let state = self.pool.as_ref()?.lock().unwrap();
+        let entry = state.entries.get(&param.type_.name)?;
+        if entry.shape.matches(&param.type_) {
+            Some(f(entry))
+        } else {
+            None
+        }
+    }
+
+    fn with_numeric<R>(&self, index: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let mut f = Some(f);
+        self.with_pool_entry(index, |entry| f.take().map(|f| f(&entry.value)))
+            .flatten()
+            .or_else(|| match &self.params.get(index)?.value {
+                EfxValue::Numeric(bytes) => f.take().map(|f| f(bytes)),
+                _ => None,
+            })
+    }
+
+    fn touch(&mut self, root: Option<usize>) {
+        if let Some(index) = root {
+            self.params[index].version = next_version();
+        }
+        self.publish_shared(root);
     }
 
     fn shared(&self, index: usize) -> bool {
@@ -1102,45 +1205,35 @@ impl D3dxEffect {
     }
 
     fn pool_value(&self, index: usize) -> Option<Cow<'_, [u8]>> {
-        let param = self.params.get(index)?;
-        if self.shared(index) {
-            if let Some(pool) = &self.pool {
-                let state = pool.lock().unwrap();
-                if let Some(entry) = state.entries.get(&param.type_.name) {
-                    if entry.shape == ParamShape::of(&param.type_) {
-                        return Some(Cow::Owned(entry.value.clone()));
-                    }
-                }
-            }
+        if let Some(value) = self.with_pool_entry(index, |entry| entry.value.clone()) {
+            return Some(Cow::Owned(value));
         }
-        match &param.value {
+        match &self.params.get(index)?.value {
             EfxValue::Numeric(bytes) => Some(Cow::Borrowed(bytes)),
             _ => None,
         }
     }
 
     fn pool_objects(&self, index: usize) -> Vec<u32> {
-        let Some(param) = self.params.get(index) else {
-            return Vec::new();
-        };
-        if self.shared(index) {
-            if let Some(pool) = &self.pool {
-                let state = pool.lock().unwrap();
-                if let Some(entry) = state.entries.get(&param.type_.name) {
-                    if entry.shape == ParamShape::of(&param.type_) {
-                        return entry.objects.clone();
-                    }
-                }
-            }
+        if let Some(objects) = self.with_pool_entry(index, |entry| entry.objects.clone()) {
+            return objects;
         }
-        match &param.value {
-            EfxValue::Object(ids) => ids.clone(),
+        match self.params.get(index).map(|param| &param.value) {
+            Some(EfxValue::Object(ids)) => ids.clone(),
             _ => Vec::new(),
         }
     }
 
     fn pool_object(&self, index: usize) -> u32 {
-        self.pool_objects(index).first().copied().unwrap_or(0)
+        if let Some(object) =
+            self.with_pool_entry(index, |entry| entry.objects.first().copied().unwrap_or(0))
+        {
+            return object;
+        }
+        match self.params.get(index).map(|param| &param.value) {
+            Some(EfxValue::Object(ids)) => ids.first().copied().unwrap_or(0),
+            _ => 0,
+        }
     }
 
     fn sync_shared(&mut self, root: Option<usize>) {
@@ -1150,9 +1243,22 @@ impl D3dxEffect {
         }
         match &self.params[index].value {
             EfxValue::Numeric(_) => {
-                if let Some(bytes) = self.pool_value(index) {
-                    self.params[index].value = EfxValue::Numeric(bytes.into_owned());
+                let Some(pool) = &self.pool else { return };
+                let param = &mut self.params[index];
+                let state = pool.lock().unwrap();
+                let Some(entry) = state.entries.get(&param.type_.name) else {
+                    return;
+                };
+                if !entry.shape.matches(&param.type_)
+                    || (param.version != 0 && entry.version == param.version)
+                {
+                    return;
                 }
+                if let EfxValue::Numeric(bytes) = &mut param.value {
+                    bytes.clear();
+                    bytes.extend_from_slice(&entry.value);
+                }
+                param.version = param.version.max(entry.version);
             }
             EfxValue::Object(_) => {
                 self.params[index].value = EfxValue::Object(self.pool_objects(index))
@@ -1171,40 +1277,42 @@ impl D3dxEffect {
         let Some(pool) = &self.pool else {
             return;
         };
-        let name = self.params[index].type_.name.clone();
-        let shape = ParamShape::of(&self.params[index].type_);
-        let (value, objects) = match &self.params[index].value {
+        let id = self.id;
+        let param = &self.params[index];
+        let mut state = pool.lock().unwrap();
+        if let Some(entry) = state.entries.get_mut(&param.type_.name)
+            && entry.shape.matches(&param.type_)
+        {
+            if let EfxValue::Numeric(bytes) = &param.value {
+                let copy = entry.value.len().min(bytes.len());
+                entry.value[..copy].copy_from_slice(&bytes[..copy]);
+            }
+            if let EfxValue::Object(ids) = &param.value {
+                entry.objects.clone_from(ids);
+            }
+            entry.version = entry.version.max(param.version);
+            entry.members.insert(id);
+            return;
+        }
+        let name = param.type_.name.clone();
+        let shape = ParamShape::of(&param.type_);
+        let (value, objects) = match &param.value {
             EfxValue::Numeric(bytes) => (bytes.clone(), Vec::new()),
             EfxValue::Object(ids) => (Vec::new(), ids.clone()),
             EfxValue::Sampler(_) => (Vec::new(), Vec::new()),
         };
-        let id = self.id;
-        let mut state = pool.lock().unwrap();
-        match state.entries.get_mut(&name) {
-            Some(entry) if entry.shape == shape => {
-                if let EfxValue::Numeric(bytes) = &self.params[index].value {
-                    let copy = entry.value.len().min(bytes.len());
-                    entry.value[..copy].copy_from_slice(&bytes[..copy]);
-                }
-                if let EfxValue::Object(ids) = &self.params[index].value {
-                    entry.objects = ids.clone();
-                }
-                entry.members.insert(id);
-            }
-            _ => {
-                let mut members = BTreeSet::new();
-                members.insert(id);
-                state.entries.insert(
-                    name,
-                    PoolEntry {
-                        shape,
-                        value,
-                        objects,
-                        members,
-                    },
-                );
-            }
-        }
+        let mut members = BTreeSet::new();
+        members.insert(id);
+        state.entries.insert(
+            name,
+            PoolEntry {
+                shape,
+                value,
+                objects,
+                members,
+                version: param.version,
+            },
+        );
     }
 
     fn target_numeric(&self, target: &ParamTarget) -> Option<Vec<u8>> {
@@ -1372,6 +1480,7 @@ pub fn d3dx_effect_join_pool(
                     value,
                     objects,
                     members,
+                    version: 0,
                 },
             );
         }
@@ -1449,8 +1558,10 @@ pub fn d3dx_effect_set(effect: &mut D3dxEffect, handle: u32, setter: u32, data: 
         return invalid_call("ID3DXEffect::SetValue");
     }
     effect.sync_shared(target.root);
+    let mut stack = [0u32; 64];
+    let mut heap = Vec::new();
     if setter == SET_VALUE {
-        let Ok(words) = source_words(data) else {
+        let Ok(words) = source_words(data, &mut stack, &mut heap) else {
             return invalid_call("ID3DXEffect::SetValue");
         };
         let len = target.ty.bytes as usize;
@@ -1463,7 +1574,7 @@ pub fn d3dx_effect_set(effect: &mut D3dxEffect, handle: u32, setter: u32, data: 
         for (slot, word) in words.iter().enumerate() {
             dst[slot * 4..slot * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
-        effect.publish_shared(target.root);
+        effect.touch(target.root);
         return ok();
     }
     if !setter_applies(setter, target.ty.class) || target.ty.type_ == FXT_STRING {
@@ -1472,7 +1583,7 @@ pub fn d3dx_effect_set(effect: &mut D3dxEffect, handle: u32, setter: u32, data: 
     let Some(element_words) = setter_element_words(setter) else {
         return invalid_call("ID3DXEffect::SetValue");
     };
-    let Ok(words) = source_words(data) else {
+    let Ok(words) = source_words(data, &mut stack, &mut heap) else {
         return invalid_call("ID3DXEffect::SetValue");
     };
     if words.is_empty() || words.len() % element_words != 0 {
@@ -1566,18 +1677,31 @@ pub fn d3dx_effect_set(effect: &mut D3dxEffect, handle: u32, setter: u32, data: 
         }
         _ => return invalid_call("ID3DXEffect::SetValue"),
     }
-    effect.publish_shared(target.root);
+    effect.touch(target.root);
     ok()
 }
 
-fn source_words(data: &[u8]) -> Result<Vec<u32>, RenderError> {
+fn source_words<'a>(
+    data: &[u8],
+    stack: &'a mut [u32; 64],
+    heap: &'a mut Vec<u32>,
+) -> Result<&'a [u32], RenderError> {
     if data.len() % 4 != 0 {
         return Err(invalid_data("setter input is not DWORD aligned"));
     }
-    Ok(data
+    let words = data
         .chunks_exact(4)
-        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
-        .collect())
+        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]));
+    let count = data.len() / 4;
+    if count <= stack.len() {
+        for (slot, word) in stack.iter_mut().zip(words) {
+            *slot = word;
+        }
+        Ok(&stack[..count])
+    } else {
+        heap.extend(words);
+        Ok(heap)
+    }
 }
 
 fn target_numeric_mut<'a>(
@@ -1769,7 +1893,7 @@ pub fn d3dx_effect_set_texture(effect: &mut D3dxEffect, handle: u32, id: u32) ->
             _ => return invalid_call("ID3DXEffect::SetTexture"),
         },
     }
-    effect.publish_shared(target.root);
+    effect.touch(target.root);
     ok()
 }
 
@@ -2540,9 +2664,75 @@ fn constant_registers(
         .params
         .get(index)
         .ok_or_else(|| invalid_data("shader constant parameter is missing"))?;
-    let data = effect
-        .pool_value(index)
-        .ok_or_else(|| invalid_data("shader constant parameter has no numeric value"))?;
+    effect
+        .with_numeric(index, |data| registers_from(param, data, constant))
+        .ok_or_else(|| invalid_data("shader constant parameter has no numeric value"))?
+}
+
+struct RegisterLayout {
+    rows: usize,
+    cols: usize,
+    count: usize,
+    stride: usize,
+    columns: bool,
+    lanes: usize,
+    valid: usize,
+    float: bool,
+    convert: fn(u32) -> f32,
+}
+
+impl RegisterLayout {
+    fn index(&self, element: usize, register: usize, lane: usize) -> usize {
+        let base = element * self.rows * self.cols;
+        if self.columns {
+            base + lane * self.cols + register
+        } else {
+            base + register * self.cols + lane
+        }
+    }
+
+    fn fill(&self, data: &[u8], out: &mut [f32], convert: impl Fn(u32) -> f32) {
+        for (register, slot) in out.chunks_exact_mut(4).enumerate() {
+            let element = register / self.stride;
+            let register = register % self.stride;
+            if register >= self.valid {
+                continue;
+            }
+            for (lane, value) in slot[..self.lanes].iter_mut().enumerate() {
+                let index = self.index(element, register, lane) * 4;
+                let word = u32::from_le_bytes([
+                    data[index],
+                    data[index + 1],
+                    data[index + 2],
+                    data[index + 3],
+                ]);
+                *value = convert(word);
+            }
+        }
+    }
+
+    fn write(&self, data: &[u8], out: &mut [f32]) -> Result<(), RenderError> {
+        out.fill(0.0);
+        if let Some(last) = (0..self.count)
+            .rev()
+            .find(|register| register % self.stride < self.valid)
+            .filter(|_| self.lanes > 0)
+        {
+            let max_index = self.index(last / self.stride, last % self.stride, self.lanes - 1);
+            if (max_index + 1) * 4 > data.len() {
+                return Err(invalid_data("shader constant data is too short"));
+            }
+            if self.float {
+                self.fill(data, out, f32::from_bits);
+            } else {
+                self.fill(data, out, self.convert);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn register_layout(param: &EfxParam, constant: &CtabConst) -> Result<RegisterLayout, RenderError> {
     let rows = param.type_.rows.max(1) as usize;
     let cols = param.type_.cols.max(1) as usize;
     let count = constant.count as usize;
@@ -2560,86 +2750,132 @@ fn constant_registers(
     if stride == 0 || count > 256 || count > stride * constant.elements.max(1) as usize {
         return Err(invalid_data("shader constant register span is invalid"));
     }
-    let mut out = Vec::with_capacity(count * 4);
-    for register in 0..count {
-        let element = register / stride;
-        let register = register % stride;
-        let base = element * rows * cols;
-        for lane in 0..4usize {
-            let index = if constant.class == FXC_MATRIX_COLUMNS {
-                base + lane * cols + register
-            } else {
-                base + register * cols + lane
-            };
-            let in_range = if constant.class == FXC_MATRIX_COLUMNS {
-                lane < constant.rows as usize && lane < rows && register < cols
-            } else {
-                lane < constant.cols as usize && lane < cols && register < rows
-            };
-            let value = if in_range {
-                let bytes = index
-                    .checked_mul(4)
-                    .and_then(|at| at.checked_add(4).and_then(|end| data.get(at..end)))
-                    .ok_or_else(|| invalid_data("shader constant data is too short"))?;
-                let word =
-                    u32::from_le_bytes(bytes.try_into().expect("constant word has four bytes"));
-                match param.type_.type_ {
-                    FXT_FLOAT => f32::from_bits(word),
-                    FXT_INT => (word as i32) as f32,
-                    FXT_BOOL => (word != 0) as u32 as f32,
-                    _ => {
-                        return Err(unsupported(
-                            "BeginPass",
-                            "shader constant type is unsupported",
-                        ));
-                    }
-                }
-            } else {
-                0.0
-            };
-            out.push(value);
+    let columns = constant.class == FXC_MATRIX_COLUMNS;
+    let (lanes, valid) = if columns {
+        ((constant.rows as usize).min(rows).min(4), cols)
+    } else {
+        ((constant.cols as usize).min(cols).min(4), rows)
+    };
+    let convert: fn(u32) -> f32 = match param.type_.type_ {
+        FXT_FLOAT => f32::from_bits,
+        FXT_INT => |word| (word as i32) as f32,
+        FXT_BOOL => |word| (word != 0) as u32 as f32,
+        _ if lanes == 0 || valid == 0 => |_| 0.0,
+        _ => {
+            return Err(unsupported(
+                "BeginPass",
+                "shader constant type is unsupported",
+            ));
         }
-    }
+    };
+    Ok(RegisterLayout {
+        rows,
+        cols,
+        count,
+        stride,
+        columns,
+        lanes,
+        valid,
+        float: param.type_.type_ == FXT_FLOAT,
+        convert,
+    })
+}
+
+fn registers_into(
+    param: &EfxParam,
+    data: &[u8],
+    constant: &CtabConst,
+    out: &mut [f32],
+) -> Result<(), RenderError> {
+    register_layout(param, constant)?.write(data, out)
+}
+
+fn registers_from(
+    param: &EfxParam,
+    data: &[u8],
+    constant: &CtabConst,
+) -> Result<Vec<f32>, RenderError> {
+    let layout = register_layout(param, constant)?;
+    let mut out = vec![0.0f32; layout.count * 4];
+    layout.write(data, &mut out)?;
     Ok(out)
 }
 
-fn ctab_inputs_from(effect: &D3dxEffect, ctab: &[CtabConst]) -> Result<Vec<[f32; 4]>, RenderError> {
+fn constant_registers_into(
+    effect: &D3dxEffect,
+    index: usize,
+    constant: &CtabConst,
+    out: &mut [f32],
+) -> Result<(), RenderError> {
+    let param = effect
+        .params
+        .get(index)
+        .ok_or_else(|| invalid_data("shader constant parameter is missing"))?;
+    effect
+        .with_numeric(index, |data| registers_into(param, data, constant, out))
+        .ok_or_else(|| invalid_data("shader constant parameter has no numeric value"))?
+}
+
+fn ctab_params(effect: &D3dxEffect, ctab: &[CtabConst], what: &str) -> Result<Vec<usize>, RenderError> {
+    ctab.iter()
+        .map(|constant| {
+            effect
+                .find_param_index(&constant.name)
+                .ok_or_else(|| invalid_data(format!("{what} parameter is missing")))
+        })
+        .collect()
+}
+
+fn compile_preshader(effect: &D3dxEffect, code: &[u8]) -> Result<Arc<CompiledPreshader>, RenderError> {
+    let program = preshader::parse(code)?;
+    let constants = parse_ctab(code)?;
+    let params = ctab_params(effect, &constants, "preshader input")?;
+    let outputs = program.output_registers();
+    Ok(Arc::new(CompiledPreshader {
+        program,
+        constants,
+        params,
+        outputs,
+    }))
+}
+
+fn run_preshader<'a>(
+    effect: &D3dxEffect,
+    cell: &'a OnceLock<Result<Arc<CompiledPreshader>, RenderError>>,
+    code: &[u8],
+) -> Result<Vec<f32>, RenderError> {
+    let compiled = cell
+        .get_or_init(|| compile_preshader(effect, code))
+        .as_ref()
+        .map_err(Clone::clone)?;
+    let inputs = ctab_inputs_with(effect, &compiled.constants, &compiled.params)?;
+    preshader::evaluate(&compiled.program, &inputs)
+}
+
+fn ctab_inputs_with(
+    effect: &D3dxEffect,
+    ctab: &[CtabConst],
+    params: &[usize],
+) -> Result<Vec<[f32; 4]>, RenderError> {
     let mut inputs = vec![[0.0f32; 4]; 256];
-    for constant in ctab {
+    for (constant, &index) in ctab.iter().zip(params) {
         if constant.set != D3DXRS_FLOAT4 {
             return Err(unsupported(
                 "Preshader",
                 format!("input register set {} is unsupported", constant.set),
             ));
         }
-        let index = effect
-            .find_param_index(&constant.name)
-            .ok_or_else(|| invalid_data("preshader input parameter is missing"))?;
-        let registers = constant_registers(effect, index, constant)?;
-        let start = constant.index as usize;
-        if start * 4 + registers.len() > inputs.len() * 4 {
+        let start = constant.index as usize * 4;
+        let range = start..start + constant.count as usize * 4;
+        let flat = inputs.as_flattened_mut();
+        if range.end > flat.len() {
             return Err(invalid_data(
                 "preshader input register range is out of bounds",
             ));
         }
-        for (offset, value) in registers.iter().enumerate() {
-            let register = start + offset / 4;
-            let lane = offset % 4;
-            inputs[register][lane] = *value;
-        }
+        constant_registers_into(effect, index, constant, &mut flat[range])?;
     }
     Ok(inputs)
-}
-
-fn ctab_inputs(effect: &D3dxEffect, code: &[u8]) -> Result<Vec<[f32; 4]>, RenderError> {
-    let ctab = parse_ctab(code)?;
-    ctab_inputs_from(effect, &ctab)
-}
-
-fn evaluate_numeric(effect: &D3dxEffect, code: &[u8]) -> Result<Vec<f32>, RenderError> {
-    let parsed = preshader::parse(code)?;
-    let inputs = ctab_inputs(effect, code)?;
-    preshader::evaluate(&parsed, &inputs)
 }
 
 fn sampler_state_parameter(effect: &D3dxEffect, state: &EfxState) -> Result<usize, RenderError> {
@@ -2832,12 +3068,72 @@ fn effect_command(
     }
 }
 
+#[derive(Clone, Copy)]
+struct Apply {
+    since: Option<u64>,
+    now: u64,
+    commit: bool,
+}
+
+impl Apply {
+    fn all(self) -> Self {
+        Self {
+            since: None,
+            ..self
+        }
+    }
+}
+
+fn selector_code(state: &EfxState) -> Option<&[u8]> {
+    let blob = state.selector.as_deref()?;
+    let name_size = rd_u32(blob, 0).ok()? as usize;
+    let start = 4usize.checked_add(name_size)?;
+    blob.get(start..).filter(|code| !code.is_empty())
+}
+
+fn state_deps<'a>(effect: &D3dxEffect, state: &'a EfxState) -> Option<&'a [usize]> {
+    state
+        .deps
+        .get_or_init(|| {
+            let mut deps = Vec::new();
+            if let Some(name) = &state.referenced {
+                deps.push(effect.find_param_index(name)?);
+            }
+            if state.selector.is_some() && selector_code(state).is_none() {
+                return None;
+            }
+            for code in [state.preshader.as_deref(), selector_code(state)]
+                .into_iter()
+                .flatten()
+            {
+                let ctab = parse_ctab(code).ok()?;
+                deps.extend(ctab_params(effect, &ctab, "state").ok()?);
+            }
+            Some(deps)
+        })
+        .as_deref()
+}
+
+fn dirty(effect: &D3dxEffect, state: &EfxState, since: Option<u64>) -> bool {
+    let Some(since) = since else {
+        return true;
+    };
+    state_deps(effect, state).is_none_or(|deps| {
+        deps.iter()
+            .any(|&index| effect.param_version(index) > since)
+    })
+}
+
 fn apply_sampler_state(
     effect: &D3dxEffect,
     sink: &mut StateSink,
     state: &EfxState,
     stage: u32,
+    since: Option<u64>,
 ) -> Result<(), RenderError> {
+    if !dirty(effect, state, since) {
+        return Ok(());
+    }
     if state.op == FXS_SAMPLER_TEXTURE {
         let id = match &state.referenced {
             Some(name) => {
@@ -2862,7 +3158,7 @@ fn apply_sampler_state(
 
 fn numeric_value(effect: &D3dxEffect, state: &EfxState) -> Result<u32, RenderError> {
     if let Some(code) = &state.preshader {
-        let output = evaluate_numeric(effect, code)?;
+        let output = run_preshader(effect, &state.preshader_program, code)?;
         let value = output.first().copied().unwrap_or(0.0);
         let input = match state.type_.type_ {
             FXT_FLOAT => FXT_FLOAT,
@@ -2880,13 +3176,14 @@ fn numeric_value(effect: &D3dxEffect, state: &EfxState) -> Result<u32, RenderErr
         let index = effect
             .find_param_index(name)
             .ok_or_else(|| invalid_data("referenced state parameter is missing"))?;
-        let bytes = effect
-            .pool_value(index)
-            .ok_or_else(|| invalid_data("referenced state parameter has no numeric value"))?;
-        if bytes.len() < 4 {
-            return Err(invalid_data("referenced state parameter is too short"));
-        }
-        let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let word = effect
+            .with_numeric(index, |bytes| {
+                bytes
+                    .get(..4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            })
+            .ok_or_else(|| invalid_data("referenced state parameter has no numeric value"))?
+            .ok_or_else(|| invalid_data("referenced state parameter is too short"))?;
         return Ok(convert_word(
             effect.params[index].type_.type_,
             word,
@@ -2904,7 +3201,7 @@ fn numeric_value(effect: &D3dxEffect, state: &EfxState) -> Result<u32, RenderErr
 fn transform_value(effect: &D3dxEffect, state: &EfxState) -> Result<[f32; 16], RenderError> {
     let (words, type_) = if let Some(code) = &state.preshader {
         (
-            evaluate_numeric(effect, code)?
+            run_preshader(effect, &state.preshader_program, code)?
                 .into_iter()
                 .map(f32::to_bits)
                 .collect::<Vec<_>>(),
@@ -2963,18 +3260,13 @@ fn transform_value(effect: &D3dxEffect, state: &EfxState) -> Result<[f32; 16], R
 }
 
 fn selector_index(effect: &D3dxEffect, state: &EfxState) -> Result<usize, RenderError> {
-    let blob = state
+    state
         .selector
         .as_ref()
         .ok_or_else(|| invalid_data("array selector resource is missing"))?;
-    let name_size = rd_u32(blob, 0)? as usize;
-    let start = 4usize
-        .checked_add(name_size)
-        .ok_or_else(|| invalid_data("array selector name size overflows"))?;
-    if start >= blob.len() {
-        return Err(invalid_data("array selector preshader is missing"));
-    }
-    let output = evaluate_numeric(effect, &blob[start..])?;
+    let code = selector_code(state)
+        .ok_or_else(|| invalid_data("array selector preshader is missing"))?;
+    let output = run_preshader(effect, &state.selector_program, code)?;
     let value = output
         .first()
         .copied()
@@ -3005,16 +3297,23 @@ fn apply_shader_constants(
     sink: &mut StateSink,
     pixel: bool,
     object: &EfxObject,
+    ctx: Apply,
+    changed: Option<u64>,
 ) -> Result<(), RenderError> {
     let ctab = object_ctab(object)?;
-    for constant in ctab {
-        let index = effect
-            .find_param_index(&constant.name)
-            .ok_or_else(|| invalid_data("shader constant parameter is missing"))?;
+    let params = object
+        .ctab_params
+        .get_or_init(|| ctab_params(effect, ctab, "shader constant"))
+        .as_ref()
+        .map_err(Clone::clone)?;
+    let stale = |index: usize| changed.is_none_or(|since| effect.param_version(index) > since);
+    for (constant, &index) in ctab.iter().zip(params) {
         match constant.set {
             D3DXRS_FLOAT4 => {
-                let values = constant_registers(effect, index, constant)?;
-                sink.shader_constants(pixel, constant.index, Cow::Owned(values))?;
+                if stale(index) {
+                    let values = constant_registers(effect, index, constant)?;
+                    sink.shader_constants(pixel, constant.index, Cow::Owned(values))?;
+                }
             }
             D3DXRS_SAMPLER => {
                 if constant.count != 1 {
@@ -3025,8 +3324,9 @@ fn apply_shader_constants(
                 }
                 let states = sampler_param_states(effect, index)
                     .ok_or_else(|| invalid_data("shader sampler parameter is missing"))?;
+                let since = if changed.is_none() { None } else { ctx.since };
                 for state in states {
-                    apply_sampler_state(effect, sink, state, constant.index)?;
+                    apply_sampler_state(effect, sink, state, constant.index, since)?;
                 }
             }
             D3DXRS_BOOL | D3DXRS_INT4 => {
@@ -3049,25 +3349,21 @@ fn apply_shader_constants(
             let Some(code) = preshader::shader_preshader(&object.data)? else {
                 return Ok(None);
             };
-            let program = preshader::parse(code)?;
-            let constants = parse_ctab(code)?;
-            let outputs = program.output_registers();
-            Ok(Some(Arc::new(ShaderPreshader {
-                program,
-                constants,
-                outputs,
-            })))
+            compile_preshader(effect, code).map(Some)
         })
         .as_ref()
         .map_err(Clone::clone)?;
     if let Some(compiled) = compiled {
-        let inputs = ctab_inputs_from(effect, &compiled.constants)?;
-        let values = preshader::evaluate(&compiled.program, &inputs)?;
-        for &register in &compiled.outputs {
-            let start = register as usize * 4;
-            sink.shader_constants(pixel, register, Cow::Borrowed(&values[start..start + 4]))?;
+        if compiled.params.iter().any(|&index| stale(index)) {
+            let inputs = ctab_inputs_with(effect, &compiled.constants, &compiled.params)?;
+            let values = preshader::evaluate(&compiled.program, &inputs)?;
+            for &register in &compiled.outputs {
+                let start = register as usize * 4;
+                sink.shader_constants(pixel, register, Cow::Borrowed(&values[start..start + 4]))?;
+            }
         }
     }
+    object.const_version.set(ctx.now);
     Ok(())
 }
 
@@ -3076,13 +3372,13 @@ fn apply_shader_state(
     sink: &mut StateSink,
     state: &EfxState,
     pixel: bool,
-    commit: bool,
+    ctx: Apply,
 ) -> Result<(), RenderError> {
     let id = if state.selector.is_some() {
         let index = match selector_index(effect, state) {
             Ok(index) => index,
             Err(error) => {
-                if commit && error.kind == crate::RenderErrorKind::InvalidArgument {
+                if ctx.commit && error.kind == crate::RenderErrorKind::InvalidArgument {
                     return Ok(());
                 }
                 return Err(error);
@@ -3122,12 +3418,16 @@ fn apply_shader_state(
             .map(|entry| entry.1)
             .ok_or_else(|| invalid_data("pass shader was not prepared"))?,
     };
-    sink.shader(pixel, handle)?;
+    let changed = dirty(effect, state, ctx.since);
+    if changed {
+        sink.shader(pixel, handle)?;
+    }
     if handle != 0 {
         if let Some(id) = id {
             if let Some(object) = effect.objects.get(&id) {
                 if !object.data.is_empty() {
-                    apply_shader_constants(effect, sink, pixel, object)?;
+                    let since = (!changed).then(|| object.const_version.get());
+                    apply_shader_constants(effect, sink, pixel, object, ctx, since)?;
                 }
             }
         }
@@ -3139,8 +3439,30 @@ fn apply_state(
     effect: &D3dxEffect,
     sink: &mut StateSink,
     state: &EfxState,
-    commit: bool,
+    ctx: Apply,
 ) -> Result<(), RenderError> {
+    match state.op {
+        FXS_VERTEXSHADER => return apply_shader_state(effect, sink, state, false, ctx),
+        FXS_PIXELSHADER => return apply_shader_state(effect, sink, state, true, ctx),
+        FXS_SETSAMPLER => {
+            let index = sampler_state_parameter(effect, state)?;
+            let states = sampler_param_states(effect, index)
+                .ok_or_else(|| invalid_data("set sampler parameter is not a sampler"))?;
+            let child = if dirty(effect, state, ctx.since) {
+                ctx.all()
+            } else {
+                ctx
+            };
+            for sampler_state in states {
+                apply_sampler_state(effect, sink, sampler_state, state.index, child.since)?;
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+    if !dirty(effect, state, ctx.since) {
+        return Ok(());
+    }
     match state.op {
         0..=102 => {
             let rs = *RENDER_STATES
@@ -3160,8 +3482,6 @@ fn apply_state(
             let matrix = transform_value(effect, state)?;
             sink.transform(D3DTS_TEXTURE0 + state.index, matrix)?;
         }
-        FXS_VERTEXSHADER => apply_shader_state(effect, sink, state, false, commit)?,
-        FXS_PIXELSHADER => apply_shader_state(effect, sink, state, true, commit)?,
         FXS_SAMPLER_TEXTURE => {
             let id = match &state.referenced {
                 Some(name) => {
@@ -3173,14 +3493,6 @@ fn apply_state(
                 None => 0,
             };
             sink.texture(state.index, id)?;
-        }
-        FXS_SETSAMPLER => {
-            let index = sampler_state_parameter(effect, state)?;
-            let states = sampler_param_states(effect, index)
-                .ok_or_else(|| invalid_data("set sampler parameter is not a sampler"))?;
-            for sampler_state in states {
-                apply_sampler_state(effect, sink, sampler_state, state.index)?;
-            }
         }
         FXS_SAMPLER_FIRST..=FXS_SAMPLER_LAST => {
             let samp = state.op - FXS_SAMPLER_FIRST + 1;
@@ -3480,15 +3792,25 @@ fn prepare_pass(
     } else {
         "ID3DXEffect::BeginPass"
     };
-    let mut commands = Vec::new();
     let manager = effect.manager_mode;
+    let mut commands = if manager {
+        Vec::with_capacity(states.len() * 2)
+    } else {
+        Vec::new()
+    };
+    let ctx = Apply {
+        since: commit.then_some(effect.pass_version),
+        now: next_version(),
+        commit,
+    };
     if manager {
         let mut sink = StateSink::Commands(&mut commands);
         for state in states {
-            if let Err(error) = apply_state(effect, &mut sink, state, commit) {
+            if let Err(error) = apply_state(effect, &mut sink, state, ctx) {
                 return run_result(failed(label, error));
             }
         }
+        effect.pass_version = ctx.now;
         effect.batch = Some(if commit {
             EffectBatch::Commit
         } else {
@@ -3502,10 +3824,11 @@ fn prepare_pass(
     } else {
         let mut sink = StateSink::Device(device);
         for state in states {
-            if let Err(error) = apply_state(effect, &mut sink, state, commit) {
+            if let Err(error) = apply_state(effect, &mut sink, state, ctx) {
                 return run_result(failed(label, error));
             }
         }
+        effect.pass_version = ctx.now;
         effect.pass = index as i32;
         D3dxEffectRunResult {
             status: ok(),
@@ -3590,6 +3913,7 @@ fn clear_lost_textures(effect: &mut D3dxEffect, device: &D3d9Device) {
             for id in ids.iter_mut() {
                 if *id != 0 && device.resource_pool(*id) == Some(D3DPOOL_DEFAULT) {
                     *id = 0;
+                    param.version = next_version();
                 }
             }
         }
@@ -3600,6 +3924,7 @@ fn clear_lost_textures(effect: &mut D3dxEffect, device: &D3d9Device) {
             for id in &mut entry.objects {
                 if *id != 0 && device.resource_pool(*id) == Some(D3DPOOL_DEFAULT) {
                     *id = 0;
+                    entry.version = next_version();
                 }
             }
         }

@@ -204,9 +204,7 @@ pub struct BufferState {
     pub writable_dirty: bool,
     pub dirty_lo: u32,
     pub dirty_hi: u32,
-    pub gpu: Option<wgpu::Buffer>,
     pub generation: u64,
-    pub gpu_generation: u64,
 }
 
 pub struct TextureState {
@@ -331,13 +329,6 @@ impl D3d9Resource {
             .ok_or_else(|| unsupported("D3D9", "resource has no GPU context"))
     }
 
-    pub fn gpu_buffer(&self) -> Option<&wgpu::Buffer> {
-        match self.state.as_ref()? {
-            ResourceState::Buffer(b) => b.gpu.as_ref(),
-            _ => None,
-        }
-    }
-
     pub fn gpu_texture(&self) -> Option<&wgpu::Texture> {
         match self.state.as_ref()? {
             ResourceState::Texture(t) => t.gpu.as_ref(),
@@ -412,28 +403,6 @@ impl D3d9Resource {
             ResourceState::Texture(t) => texture_index(t.kind, face, level, t.levels)
                 .and_then(|index| t.subresources.get(index))
                 .map(|l| Arc::clone(&l.gpu_newer)),
-            _ => None,
-        }
-    }
-
-    pub fn gpu_newer(&self) -> bool {
-        self.gpu_newer.load(Ordering::Acquire)
-    }
-
-    pub fn clear_gpu_newer(&self) {
-        self.gpu_newer.store(false, Ordering::Release);
-    }
-
-    pub fn mark_gpu_newer(&self) {
-        self.gpu_newer.store(true, Ordering::Release);
-    }
-
-    pub fn buffer_gpu(&self) -> Option<(wgpu::Buffer, u32, u32, u32, u64)> {
-        match self.state.as_ref()? {
-            ResourceState::Buffer(b) => b
-                .gpu
-                .as_ref()
-                .map(|gpu| (gpu.clone(), b.size, b.format, b.fvf, b.usage as u64)),
             _ => None,
         }
     }
@@ -868,17 +837,6 @@ pub fn create_buffer(
             }
         }
     }
-    let usage = match request.kind {
-        BufferKind::Vertex => wgpu::BufferUsages::VERTEX,
-        BufferKind::Index => wgpu::BufferUsages::INDEX,
-    } | wgpu::BufferUsages::COPY_DST
-        | wgpu::BufferUsages::COPY_SRC;
-    let buffer = if allocates_gpu(gpu, request.pool) {
-        let aligned = (request.size as u64).next_multiple_of(wgpu::MAP_ALIGNMENT);
-        Some(gpu.create_buffer(aligned, usage)?)
-    } else {
-        None
-    };
     let bytes = alloc_bytes(request.size)?;
     let initial_dirty = request.pool == D3DPOOL_MANAGED;
     resource.gpu = Some(gpu.clone());
@@ -896,9 +854,7 @@ pub fn create_buffer(
         writable_dirty: false,
         dirty_lo: 0,
         dirty_hi: if initial_dirty { request.size } else { 0 },
-        gpu: buffer,
         generation: 0,
-        gpu_generation: 0,
     }));
     Ok(())
 }
@@ -1314,19 +1270,13 @@ pub fn create_surface(
     Ok(())
 }
 
-pub fn upload_buffer(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(), RenderError> {
-    if gpu.is_blocked() {
-        return Ok(());
-    }
+pub fn upload_buffer(resource: &mut D3d9Resource) -> Result<(), RenderError> {
     let Some(ResourceState::Buffer(b)) = resource.state.as_mut() else {
         return Err(invalid("PreLoad", "resource is not a buffer"));
     };
     if b.lock_count.load(Ordering::Acquire) != 0 {
         return Err(invalid("PreLoad", "buffer is locked"));
     }
-    let Some(buffer) = b.gpu.as_ref() else {
-        return Ok(());
-    };
     if b.dirty_hi <= b.dirty_lo {
         return Ok(());
     }
@@ -1350,7 +1300,6 @@ pub fn upload_buffer(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(), R
             );
         }
     }
-    gpu.write_buffer_padded(buffer, &b.bytes, lo, hi)?;
     let align = wgpu::COPY_BUFFER_ALIGNMENT as u32;
     let copy_lo = (lo - lo % align) as usize;
     let copy_hi = (hi.next_multiple_of(align) as usize).min(b.bytes.len());
@@ -1358,50 +1307,7 @@ pub fn upload_buffer(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(), R
         .copy_from_slice(&b.bytes[copy_lo..copy_hi]);
     b.dirty_lo = 0;
     b.dirty_hi = 0;
-    b.gpu_generation = b.generation;
-    resource.clear_gpu_newer();
     Ok(())
-}
-
-pub fn readback_buffer(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(), RenderError> {
-    let Some(ResourceState::Buffer(b)) = resource.state.as_mut() else {
-        return Err(invalid("Lock", "resource is not a buffer"));
-    };
-    let Some(buffer) = b.gpu.as_ref() else {
-        return Err(unsupported("Lock", "buffer has no GPU storage"));
-    };
-    let mut out = alloc_bytes(b.bytes.len() as u32)?;
-    gpu.read_buffer(buffer, b.bytes.len() as u32, &mut out)?;
-    Arc::make_mut(&mut b.uploaded.lock().unwrap()).copy_from_slice(&out);
-    b.bytes = out;
-    b.gpu_generation = b.generation;
-    resource.clear_gpu_newer();
-    Ok(())
-}
-
-pub fn sync_buffer_for_lock(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(), RenderError> {
-    if gpu.is_blocked() {
-        return Ok(());
-    }
-    let gpu_newer = matches!(resource.state.as_ref(), Some(ResourceState::Buffer(b)) if b.gpu_generation > b.generation);
-    if !gpu_newer {
-        return Ok(());
-    }
-    match readback_buffer(gpu, resource) {
-        Err(_) if gpu.is_physical() => Ok(()),
-        result => result,
-    }
-}
-
-pub fn mark_buffer_gpu_written(resource: &mut D3d9Resource) -> Result<(), RenderError> {
-    match resource.state.as_mut() {
-        Some(ResourceState::Buffer(b)) => {
-            b.gpu_generation = b.generation.wrapping_add(1);
-            resource.gpu_newer.store(true, Ordering::Release);
-            Ok(())
-        }
-        _ => Err(invalid("D3D9", "resource is not a buffer")),
-    }
 }
 
 pub fn level_descriptor(
@@ -1608,7 +1514,7 @@ pub fn preload(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(), RenderE
         None => return Err(invalid("PreLoad", "resource is not initialized")),
     };
     match plan {
-        PreloadPlan::Buffer => upload_buffer(gpu, resource),
+        PreloadPlan::Buffer => upload_buffer(resource),
         PreloadPlan::Surface => upload_level(gpu, resource, 0, 0),
         PreloadPlan::Texture {
             faces,
@@ -1630,14 +1536,12 @@ pub fn preload(gpu: &D3d9Gpu, resource: &mut D3d9Resource) -> Result<(), RenderE
 
 #[derive(Default)]
 pub struct StagedStorage {
-    pub buffer: Option<wgpu::Buffer>,
-    pub uploaded: Option<Arc<Mutex<Arc<Vec<u8>>>>>,
     pub texture: Option<wgpu::Texture>,
 }
 
 pub fn stage_restore(gpu: &D3d9Gpu, resource: &D3d9Resource) -> Result<StagedStorage, RenderError> {
     match resource.state.as_ref() {
-        Some(ResourceState::Buffer(b)) => stage_buffer(gpu, b),
+        Some(ResourceState::Buffer(_)) => Ok(StagedStorage::default()),
         Some(ResourceState::Texture(t)) => stage_texture(gpu, t),
         Some(ResourceState::Surface(s)) => stage_surface(gpu, s),
         None => Err(invalid("Reset", "resource is not initialized")),
@@ -1646,44 +1550,11 @@ pub fn stage_restore(gpu: &D3d9Gpu, resource: &D3d9Resource) -> Result<StagedSto
 
 pub fn install_staged(resource: &mut D3d9Resource, staged: StagedStorage, gpu: &D3d9Gpu) {
     match resource.state.as_mut() {
-        Some(ResourceState::Buffer(b)) => {
-            b.gpu = staged.buffer;
-            if let Some(uploaded) = staged.uploaded {
-                b.uploaded = uploaded;
-            }
-        }
         Some(ResourceState::Texture(t)) => t.gpu = staged.texture,
         Some(ResourceState::Surface(s)) => s.gpu = staged.texture,
-        None => {}
+        _ => {}
     }
     resource.gpu = Some(gpu.clone());
-}
-
-fn stage_buffer(gpu: &D3d9Gpu, b: &BufferState) -> Result<StagedStorage, RenderError> {
-    if !has_gpu_storage(b.pool) {
-        return Ok(StagedStorage::default());
-    }
-    if b.gpu_generation > b.generation {
-        return Err(unsupported(
-            "Reset",
-            "buffer has GPU-only contents that cannot be recovered",
-        ));
-    }
-    let aligned = (b.size as u64).next_multiple_of(wgpu::MAP_ALIGNMENT);
-    let usage = match b.kind {
-        BufferKind::Vertex => wgpu::BufferUsages::VERTEX,
-        BufferKind::Index => wgpu::BufferUsages::INDEX,
-    } | wgpu::BufferUsages::COPY_DST
-        | wgpu::BufferUsages::COPY_SRC;
-    let buffer = gpu.create_buffer(aligned, usage)?;
-    gpu.write_buffer_padded(&buffer, &b.bytes, 0, b.size)?;
-    let mut uploaded = alloc_bytes(b.size)?;
-    uploaded.copy_from_slice(&b.bytes);
-    Ok(StagedStorage {
-        uploaded: Some(Arc::new(Mutex::new(Arc::new(uploaded)))),
-        buffer: Some(buffer),
-        texture: None,
-    })
 }
 
 fn stage_texture(gpu: &D3d9Gpu, t: &TextureState) -> Result<StagedStorage, RenderError> {
@@ -1727,8 +1598,6 @@ fn stage_texture(gpu: &D3d9Gpu, t: &TextureState) -> Result<StagedStorage, Rende
         )?;
     }
     Ok(StagedStorage {
-        buffer: None,
-        uploaded: None,
         texture: Some(texture),
     })
 }
@@ -1764,8 +1633,6 @@ fn stage_surface(gpu: &D3d9Gpu, s: &SurfaceState) -> Result<StagedStorage, Rende
         )?;
     }
     Ok(StagedStorage {
-        buffer: None,
-        uploaded: None,
         texture: Some(texture),
     })
 }
@@ -1867,44 +1734,12 @@ pub fn readback_level(
     readback_level_explicit(gpu, resource, face, level)
 }
 
-pub fn mark_gpu_written(
-    resource: &mut D3d9Resource,
-    face: u32,
-    level: u32,
-) -> Result<(), RenderError> {
-    match resource.state.as_mut() {
-        Some(ResourceState::Surface(s)) => {
-            if face != 0 || level != 0 {
-                return Err(invalid("D3D9", "surface has one subresource"));
-            }
-            s.level.gpu_newer.store(true, Ordering::Release);
-            Ok(())
-        }
-        Some(ResourceState::Texture(t)) => {
-            let index = texture_index(t.kind, face, level, t.levels)
-                .ok_or_else(|| invalid("D3D9", "texture subresource out of range"))?;
-            t.subresources[index]
-                .gpu_newer
-                .store(true, Ordering::Release);
-            Ok(())
-        }
-        _ => Err(invalid("D3D9", "resource is not a texture")),
-    }
-}
-
 pub fn level_generation(
     resource: &D3d9Resource,
     face: u32,
     level: u32,
 ) -> Result<u64, RenderError> {
     Ok(resource.level(face, level)?.generation)
-}
-
-pub fn buffer_generations(resource: &D3d9Resource) -> Result<(u64, u64), RenderError> {
-    match resource.state.as_ref() {
-        Some(ResourceState::Buffer(b)) => Ok((b.generation, b.gpu_generation)),
-        _ => Err(invalid("D3D9", "resource is not a buffer")),
-    }
 }
 
 pub fn is_default_pool(resource: &D3d9Resource) -> bool {

@@ -153,8 +153,8 @@ fn prepare_handoff(
             "native GPU synchronization value overflow",
         )
     })?;
-    gpu.queue.submit([encoder.finish()]);
-    let ready_event = signal_ready(&gpu.queue, &ring.ready_event, ready_value)?;
+    gpu.queue().submit([encoder.finish()]);
+    let ready_event = signal_ready(gpu.queue(), &ring.ready_event, ready_value)?;
     ring.ready_value = ready_value;
     gpu.device
         .poll(wgpu::PollType::Poll)

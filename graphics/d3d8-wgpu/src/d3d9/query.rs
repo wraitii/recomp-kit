@@ -107,8 +107,8 @@ impl D3d9Queries {
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
         let done = Arc::clone(&record.done);
         record.generation = generation;
-        gpu.queue.submit(std::iter::empty());
-        gpu.queue.on_submitted_work_done(move || {
+        gpu.queue().submit(std::iter::empty());
+        gpu.queue().on_submitted_work_done(move || {
             done.fetch_max(generation, Ordering::AcqRel);
         });
         Ok(())
@@ -134,7 +134,7 @@ impl D3d9Queries {
             return Err(RenderError::new("GetData", "query type is not implemented"));
         }
         if flush {
-            gpu.queue.submit(std::iter::empty());
+            gpu.queue().submit(std::iter::empty());
         }
         if let Err(error) = gpu.device.poll(wgpu::PollType::Poll) {
             return Err(RenderError::new("GetData", error.to_string()));

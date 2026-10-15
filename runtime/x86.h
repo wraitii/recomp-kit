@@ -513,6 +513,12 @@ static inline void recomp_execution_checkpoint(X86 *c) {
     if (__builtin_expect(c->checkpoint_countdown-- == 0u, 0))
         recomp_execution_checkpoint_due(c);
 }
+static inline void recomp_execution_checkpoint_charge(X86 *c, uint32_t cost) {
+    if (c->checkpoint_countdown < cost)
+        recomp_execution_checkpoint_due(c);
+    else
+        c->checkpoint_countdown -= cost;
+}
 
 /* RECOMP_WATCH_FRAME=1 reports a guest call that returns with EBP changed.
  * A routine that loses the frame pointer corrupts nothing and crashes nowhere:

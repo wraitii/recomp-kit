@@ -23,6 +23,7 @@
 #include "../runtime/imports.h"
 #include "../runtime/win32.h"
 
+#include <atomic>
 #include <deque>
 #include <stdio.h>
 #include <string.h>
@@ -145,6 +146,7 @@ struct ThreadStack {
 // Trivially destructible on purpose: a guest longjmp across these frames must
 // not need to run anything.
 thread_local ThreadStack t_stack = {};
+std::atomic<bool> g_hook_stack_used{false};
 
 // `after_ret` says the guest RET has already happened, so eip is the caller's
 // return address rather than the callee entry: true for the after phase, and
@@ -362,6 +364,7 @@ const char *mods_intern_desc(const char *text) {
 }
 
 const char *mods_push_active_callback(const char *desc) {
+    g_hook_stack_used.store(true, std::memory_order_relaxed);
     const char *prev = t_stack.active;
     t_stack.active = desc;
     return prev;
@@ -402,6 +405,7 @@ static void mods_hook_dispatch(X86 *c, uint32_t index) {
         return;
     }
 
+    g_hook_stack_used.store(true, std::memory_order_relaxed);
     PopHookInvocation *inv = &t_stack.frames[t_stack.depth++];
     // Only the scalars: the three chains are 2 KB and copy_chain fills each
     // up to its count, which is all anything reads.
@@ -1221,6 +1225,8 @@ PopModStatus mods_hook_return(const PopModApi *api, pop_cpu_v1 *cpu, uint32_t ea
 // ---------------------------------------------------------------- unwind
 
 void mods_hooks_unwind_to_esp(uint32_t esp) {
+    if (!g_hook_stack_used.load(std::memory_order_relaxed))
+        return;
     bool dropped = false;
     uint32_t keep_views = 0;
     while (t_stack.depth && t_stack.frames[t_stack.depth - 1].esp_at_entry < esp) {

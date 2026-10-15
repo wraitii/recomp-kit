@@ -70,7 +70,7 @@ struct SehState {
             release_dispatch(d);
     }
 };
-thread_local SehState state;
+thread_local SehState tls_state;
 #ifdef POPM_TESTING
 thread_local RecompSehUnhandledHook unhandled_hook = nullptr;
 #endif
@@ -78,6 +78,7 @@ thread_local RecompSehUnhandledHook unhandled_hook = nullptr;
 // Verbose traces retain guest addresses only; they distinguish an omitted
 // establishment from a checkpoint retired while its registration remains live.
 void trace_frames(X86 *c, const char *phase) {
+    SehState &state = tls_state;
     LOGV("SEH %s: pending=%08x EIP=%08x ESP=%08x live=%zu", phase, state.g_seh_pending_target,
          c->eip, c->r[R_ESP], state.frames.size());
     if (log_level() < 2)
@@ -141,6 +142,7 @@ void fill_context(X86 *c, uint32_t context, uint32_t eip) {
 }
 
 SehDispatch *new_dispatch(X86 *c, uint32_t supplied_record = 0, uint32_t fault_eip = 0) {
+    SehState &state = tls_state;
     if (supplied_record && !gm_valid(supplied_record, RECORD_BYTES))
         invalid_chain(c, 0, supplied_record, "invalid exception record");
     uint32_t storage = heap_alloc(RECORD_BYTES + CONTEXT_BYTES, true);
@@ -154,6 +156,7 @@ SehDispatch *new_dispatch(X86 *c, uint32_t supplied_record = 0, uint32_t fault_e
 }
 
 void finish_dispatch(SehDispatch *d) {
+    SehState &state = tls_state;
     if (state.dispatches.empty() || state.dispatches.back() != d)
         invalid_chain(d->cpu, 0, d->record, "dispatch ownership mismatch");
     state.dispatches.pop_back();
@@ -246,6 +249,7 @@ void recomp_context_fill(X86 *src, uint32_t context, uint32_t eip) {
 void recomp_seh_validate_chain(X86 *c, const char *phase, const char *detail) {
     if (log_level() < 2 || !c)
         return;
+    SehState &state = tls_state;
     auto &last = state.diagnostics[c];
     if (last.failed)
         return;
@@ -289,6 +293,7 @@ void recomp_seh_validate_chain(X86 *c, const char *phase, const char *detail) {
 }
 
 jmp_buf *recomp_seh_frame_enter(X86 *c) {
+    SehState &state = tls_state;
     recomp_seh_validate_chain(c, "enter", "");
     uint32_t reg = chain_head(c);
     validate_registration(c, reg, 0);
@@ -309,10 +314,12 @@ jmp_buf *recomp_seh_frame_enter(X86 *c) {
 }
 
 uint64_t recomp_seh_frame_mark(X86 *) {
+    SehState &state = tls_state;
     return state.generation;
 }
 
 void recomp_seh_frame_orphan(X86 *c, uint64_t mark) {
+    SehState &state = tls_state;
     for (SehFrame *f : state.frames)
         if (f->cpu == c && f->generation > mark && !f->retired &&
             f->callback_depth == recomp_callback_depth() && f->registration >= c->r[R_ESP]) {
@@ -323,6 +330,7 @@ void recomp_seh_frame_orphan(X86 *c, uint64_t mark) {
 }
 
 jmp_buf *recomp_seh_frame_adopt(X86 *c) {
+    SehState &state = tls_state;
     for (size_t i = state.frames.size(); i-- > 0;) {
         SehFrame *f = state.frames[i];
         if (f->cpu != c || !f->orphan || f->callback_depth != recomp_callback_depth())
@@ -340,6 +348,7 @@ jmp_buf *recomp_seh_frame_adopt(X86 *c) {
 }
 
 void recomp_seh_frame_leave(X86 *c) {
+    SehState &state = tls_state;
     recomp_seh_validate_chain(c, "leave", "");
     // FS:[0] has already been restored by the guest epilogue. It may do
     // this before popping local storage, while ESP is still below the removed
@@ -367,12 +376,14 @@ void recomp_seh_frame_leave(X86 *c) {
 }
 
 uint32_t recomp_seh_pending_target(void) {
+    SehState &state = tls_state;
     return state.g_seh_pending_target;
 }
 
 // Called only for computed jumps, before even an existing dispatch-table hit.
 // The dispatcher keeps its own ESP; the pending registration identifies env.
 void recomp_seh_intercept(X86 *c, uint32_t target) {
+    SehState &state = tls_state;
     recomp_seh_validate_chain(c, "intercept", "");
     trace_frames(c, "intercept");
     uint32_t reg = state.g_seh_pending_target;
@@ -414,6 +425,7 @@ void recomp_seh_intercept(X86 *c, uint32_t target) {
 }
 
 void recomp_seh_land(X86 *c) {
+    SehState &state = tls_state;
     trace_frames(c, "landing");
     SehFrame *landing = state.landing;
     if (!landing || landing->cpu != c || !landing->finished)
@@ -436,6 +448,7 @@ void recomp_seh_land(X86 *c) {
 }
 
 void recomp_seh_callback_leave(X86 *c, uint32_t depth) {
+    SehState &state = tls_state;
     for (size_t i = state.frames.size(); i-- > 0;) {
         SehFrame *f = state.frames[i];
         if (f->cpu != c)
@@ -455,6 +468,7 @@ void recomp_seh_callback_leave(X86 *c, uint32_t depth) {
 }
 
 void recomp_seh_reset(X86 *c) {
+    SehState &state = tls_state;
     if (c)
         state.diagnostics.erase(c);
     else
@@ -491,6 +505,7 @@ int recomp_seh_raise_fault(X86 *c, uint32_t code, uint32_t fault_eip) {
 // the dispatcher and lands on the saved host checkpoint.
 void recomp_seh_unwind(X86 *c, uint32_t target, uint32_t target_ip, uint32_t record,
                        uint32_t retval) {
+    SehState &state = tls_state;
     recomp_seh_validate_chain(c, "unwind", "");
     trace_frames(c, "unwind begin");
     SehDispatch *d = new_dispatch(c, record);
@@ -527,6 +542,7 @@ void recomp_seh_test_unhandled_hook(RecompSehUnhandledHook hook) {
     unhandled_hook = hook;
 }
 uint32_t recomp_seh_test_frame_count(X86 *c) {
+    SehState &state = tls_state;
     uint32_t n = 0;
     for (SehFrame *f : state.frames)
         if (f->cpu == c)

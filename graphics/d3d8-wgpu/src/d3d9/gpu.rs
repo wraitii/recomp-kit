@@ -62,9 +62,111 @@ impl D3d9Loss {
     }
 }
 
+pub(crate) struct PendingClear {
+    pub color: Option<(wgpu::TextureView, wgpu::Color)>,
+    pub depth: Option<(
+        wgpu::TextureView,
+        wgpu::Operations<f32>,
+        Option<wgpu::Operations<u32>>,
+    )>,
+}
+
+impl PendingClear {
+    pub(crate) fn folds_into(
+        &self,
+        color_view: &wgpu::TextureView,
+        depth: Option<&(wgpu::TextureView, bool)>,
+    ) -> bool {
+        self.color
+            .as_ref()
+            .is_none_or(|(view, _)| view == color_view)
+            && self.depth.as_ref().is_none_or(|(view, _, stencil)| {
+                depth.is_some_and(|(batch_view, has_stencil)| {
+                    batch_view == view && *has_stencil == stencil.is_some()
+                })
+            })
+    }
+
+    fn record(&self, encoder: &mut wgpu::CommandEncoder) {
+        let color = self
+            .color
+            .as_ref()
+            .map(|(view, value)| wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(*value),
+                    store: wgpu::StoreOp::Store,
+                },
+            });
+        let colors = [color];
+        let colors: &[Option<wgpu::RenderPassColorAttachment>] =
+            if self.color.is_some() { &colors } else { &[] };
+        let depth = self.depth.as_ref().map(|(view, depth_ops, stencil_ops)| {
+            wgpu::RenderPassDepthStencilAttachment {
+                view,
+                depth_ops: Some(*depth_ops),
+                stencil_ops: *stencil_ops,
+            }
+        });
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("d3d9-clear"),
+            color_attachments: colors,
+            depth_stencil_attachment: depth,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+    }
+}
+
+struct PendingWork {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    encoder: Option<wgpu::CommandEncoder>,
+    staging: wgpu::util::StagingBelt,
+    clear: Option<PendingClear>,
+}
+
+fn frame_encoder<'a>(
+    device: &wgpu::Device,
+    encoder: &'a mut Option<wgpu::CommandEncoder>,
+) -> &'a mut wgpu::CommandEncoder {
+    encoder.get_or_insert_with(|| {
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("d3d9-frame"),
+        })
+    })
+}
+
+impl PendingWork {
+    fn apply_clear(&mut self) {
+        if let Some(clear) = self.clear.take() {
+            clear.record(frame_encoder(&self.device, &mut self.encoder));
+        }
+    }
+
+    fn submit(&mut self) {
+        self.apply_clear();
+        let Some(encoder) = self.encoder.take() else {
+            return;
+        };
+        self.staging.finish();
+        self.queue.submit([encoder.finish()]);
+        self.staging.recall();
+    }
+}
+
+impl Drop for PendingWork {
+    fn drop(&mut self) {
+        self.submit();
+    }
+}
+
 pub struct D3d9Gpu {
     pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
+    queue: wgpu::Queue,
+    pending: Arc<Mutex<PendingWork>>,
     loss: D3d9Loss,
     mipgen: Arc<Mutex<MipGenState>>,
     depth_upload: Arc<Mutex<Option<DepthUpload>>>,
@@ -75,6 +177,7 @@ impl Clone for D3d9Gpu {
         Self {
             device: self.device.clone(),
             queue: self.queue.clone(),
+            pending: Arc::clone(&self.pending),
             loss: self.loss.clone(),
             mipgen: Arc::clone(&self.mipgen),
             depth_upload: Arc::clone(&self.depth_upload),
@@ -91,10 +194,60 @@ impl D3d9Gpu {
         Self {
             device: gpu.device.clone(),
             queue: gpu.queue.clone(),
+            pending: Arc::new(Mutex::new(PendingWork {
+                device: gpu.device.clone(),
+                queue: gpu.queue.clone(),
+                encoder: None,
+                staging: wgpu::util::StagingBelt::new(1 << 20),
+                clear: None,
+            })),
             loss,
             mipgen: Arc::new(Mutex::new(MipGenState::default())),
             depth_upload: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        self.submit_pending();
+        &self.queue
+    }
+
+    pub fn submit_pending(&self) {
+        self.pending.lock().unwrap().submit();
+    }
+
+    pub fn record<R>(
+        &self,
+        f: impl FnOnce(&mut wgpu::CommandEncoder, &mut wgpu::util::StagingBelt) -> R,
+    ) -> R {
+        self.record_folding_clear(|_| false, |encoder, staging, _| f(encoder, staging))
+    }
+
+    pub(crate) fn record_folding_clear<R>(
+        &self,
+        folds: impl FnOnce(&PendingClear) -> bool,
+        f: impl FnOnce(
+            &mut wgpu::CommandEncoder,
+            &mut wgpu::util::StagingBelt,
+            Option<PendingClear>,
+        ) -> R,
+    ) -> R {
+        let mut pending = self.pending.lock().unwrap();
+        let fold = pending.clear.take_if(|clear| folds(clear));
+        pending.apply_clear();
+        let PendingWork {
+            device,
+            encoder,
+            staging,
+            ..
+        } = &mut *pending;
+        f(frame_encoder(device, encoder), staging, fold)
+    }
+
+    pub(crate) fn set_clear(&self, clear: PendingClear) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.apply_clear();
+        pending.clear = Some(clear);
     }
 
     pub fn loss(&self) -> &D3d9Loss {
@@ -111,7 +264,7 @@ impl D3d9Gpu {
 
     pub fn flush(&self) -> Result<(), RenderError> {
         self.validate("RestoreFlush", || {
-            self.queue.submit(std::iter::empty());
+            self.queue().submit(std::iter::empty());
             self.device
                 .poll(wgpu::PollType::Wait {
                     submission_index: None,
@@ -171,24 +324,6 @@ impl D3d9Gpu {
             return Err(RenderError::new(operation, error.to_string()));
         }
         value
-    }
-
-    pub fn create_buffer(
-        &self,
-        size: u64,
-        usage: wgpu::BufferUsages,
-    ) -> Result<wgpu::Buffer, RenderError> {
-        if size == 0 {
-            return Err(RenderError::invalid("CreateBuffer", "zero buffer size"));
-        }
-        self.validate("CreateBuffer", || {
-            Ok(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("d3d9-buffer"),
-                size,
-                usage,
-                mapped_at_creation: false,
-            }))
-        })
     }
 
     pub fn create_texture(
@@ -254,7 +389,7 @@ impl D3d9Gpu {
                 } else {
                     wgpu::TextureAspect::All
                 };
-                self.queue.write_texture(
+                self.queue().write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture,
                         mip_level: level,
@@ -327,7 +462,7 @@ impl D3d9Gpu {
             raw.extend_from_slice(&value.to_le_bytes());
         }
         self.validate("UploadTexture", || {
-            self.queue.write_texture(
+            self.queue().write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &source,
                     mip_level: 0,
@@ -373,12 +508,7 @@ impl D3d9Gpu {
         })?;
         let _ = source_view;
         self.validate("UploadTexture", || {
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("d3d9-depth-upload"),
-                });
-            {
+            self.record(|encoder, _| {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("d3d9-depth-upload"),
                     color_attachments: &[],
@@ -396,8 +526,7 @@ impl D3d9Gpu {
                 pass.set_pipeline(&pipeline);
                 pass.set_bind_group(0, &bind, &[]);
                 pass.draw(0..3, 0..1);
-            }
-            self.queue.submit(std::iter::once(encoder.finish()));
+            });
             Ok(())
         })
     }
@@ -560,7 +689,7 @@ impl D3d9Gpu {
                         depth_or_array_layers: 1,
                     },
                 );
-                self.queue.submit(std::iter::once(encoder.finish()));
+                self.queue().submit(std::iter::once(encoder.finish()));
                 self.map_buffer(&buffer, buffer_bytes)?;
                 {
                     let mapped = buffer.slice(0..buffer_bytes).get_mapped_range();
@@ -582,93 +711,6 @@ impl D3d9Gpu {
                 Ok(())
             })?;
         }
-        Ok(())
-    }
-
-    pub fn write_buffer_padded(
-        &self,
-        buffer: &wgpu::Buffer,
-        logical: &[u8],
-        lo: u32,
-        hi: u32,
-    ) -> Result<(), RenderError> {
-        if logical.is_empty() || hi <= lo {
-            return Ok(());
-        }
-        let padded_len =
-            (logical.len() as u32).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as u32);
-        let align_lo = lo - (lo % wgpu::COPY_BUFFER_ALIGNMENT as u32);
-        let align_hi = hi
-            .min(padded_len)
-            .next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as u32);
-        if align_hi <= align_lo {
-            return Ok(());
-        }
-        let size = (align_hi - align_lo) as usize;
-        let mut staged = Vec::new();
-        staged.try_reserve_exact(size).map_err(|_| {
-            RenderError::out_of_memory("UploadBuffer", "buffer staging allocation failed")
-        })?;
-        staged.resize(size, 0);
-        let copy_lo = align_lo as usize;
-        let copy_hi = (align_hi as usize).min(logical.len());
-        if copy_hi > copy_lo {
-            staged[..copy_hi - copy_lo].copy_from_slice(&logical[copy_lo..copy_hi]);
-        }
-        self.validate("UploadBuffer", || {
-            self.queue.write_buffer(buffer, align_lo as u64, &staged);
-            Ok(())
-        })
-    }
-
-    pub fn read_buffer(
-        &self,
-        buffer: &wgpu::Buffer,
-        logical_len: u32,
-        out: &mut [u8],
-    ) -> Result<(), RenderError> {
-        if logical_len == 0 {
-            return Ok(());
-        }
-        let padded = logical_len
-            .next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as u32)
-            .next_multiple_of(8);
-        if out.len() < logical_len as usize {
-            return Err(RenderError::invalid(
-                "ReadbackBuffer",
-                "destination is smaller than the buffer",
-            ));
-        }
-        let mut staged = Vec::new();
-        staged
-            .try_reserve_exact(logical_len as usize)
-            .map_err(|_| {
-                RenderError::out_of_memory("ReadbackBuffer", "readback allocation failed")
-            })?;
-        staged.resize(logical_len as usize, 0);
-        self.validate("ReadbackBuffer", || {
-            let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("d3d9-readback"),
-                size: padded as u64,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("d3d9-readback"),
-                });
-            encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, padded as u64);
-            self.queue.submit(std::iter::once(encoder.finish()));
-            self.map_buffer(&staging, padded as u64)?;
-            {
-                let mapped = staging.slice(0..padded as u64).get_mapped_range();
-                staged.copy_from_slice(&mapped[..logical_len as usize]);
-            }
-            staging.unmap();
-            Ok(())
-        })?;
-        out[..logical_len as usize].copy_from_slice(&staged);
         Ok(())
     }
 
@@ -727,12 +769,7 @@ impl D3d9Gpu {
                             },
                         ],
                     });
-                    let mut encoder =
-                        self.device
-                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("d3d9-mipgen"),
-                            });
-                    {
+                    self.record(|encoder, _| {
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("d3d9-mipgen"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -751,8 +788,7 @@ impl D3d9Gpu {
                         pass.set_pipeline(&pipeline);
                         pass.set_bind_group(0, &bind, &[]);
                         pass.draw(0..3, 0..1);
-                    }
-                    self.queue.submit(std::iter::once(encoder.finish()));
+                    });
                 }
             }
             let _ = (base_width, base_height);

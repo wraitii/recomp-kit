@@ -139,13 +139,12 @@ extern "C" void recomp_watch_hit(uint32_t addr, uint32_t n, uint64_t value) {
 // Logging helpers (declared in guest.h; kept here so every translation unit in
 // the runtime gets them without a separate object file).
 // ---------------------------------------------------------------------------
-int log_level() {
-    static int lvl = -1;
-    if (lvl < 0) {
-        const char *e = recomp_env("LOG");
-        lvl = e ? atoi(e) : 1;
-    }
-    return lvl;
+int g_log_level = -1;
+
+int log_level_init() {
+    const char *e = recomp_env("LOG");
+    g_log_level = e ? atoi(e) : 1;
+    return g_log_level;
 }
 
 void log_msg(int level, const char *fmt, ...) {

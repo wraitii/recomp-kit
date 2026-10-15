@@ -1159,7 +1159,6 @@ pub mod ffi {
         fn d3d9_autogen_capable(resource: &D3d9Resource) -> ValueResult;
         fn d3d9_format_autogen_capable(format: u32) -> ValueResult;
         fn d3d9_upload_buffer(resource: &mut D3d9Resource) -> Status;
-        fn d3d9_readback_buffer(resource: &mut D3d9Resource) -> Status;
         fn d3d9_upload_level(resource: &mut D3d9Resource, face: u32, level: u32) -> Status;
         fn d3d9_readback_level(resource: &mut D3d9Resource, face: u32, level: u32) -> Status;
         fn d3d9_register_resource_view(
@@ -1765,7 +1764,7 @@ use crate::d3d9::{
     d3d9_get_viewport, d3d9_level_bytes, d3d9_level_lock_commit, d3d9_level_lock_prepare,
     d3d9_level_unlock, d3d9_lod, d3d9_multiply_transform, d3d9_number_of_swap_chains, d3d9_preload,
     d3d9_prepare_resource_reset, d3d9_present, d3d9_present_handoff, d3d9_priority,
-    d3d9_readback_buffer, d3d9_readback_level, d3d9_register_resource,
+    d3d9_readback_level, d3d9_register_resource,
     d3d9_registered_resource_ids, d3d9_reset, d3d9_reset_ready, d3d9_resource_type,
     d3d9_set_autogen_filter, d3d9_set_clip_plane, d3d9_set_fvf_binding, d3d9_set_indices,
     d3d9_set_light, d3d9_set_light_enable, d3d9_set_lod, d3d9_set_material, d3d9_set_priority,

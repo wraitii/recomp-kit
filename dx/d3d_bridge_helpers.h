@@ -367,6 +367,7 @@ struct D3d9HostDevice {
     std::unordered_map<uint32_t, uint32_t> block_views;
     std::array<uint32_t, 38> live_bindings{};
     std::array<uint32_t, 38> recording_bindings{};
+    bool recording_block = false;
     std::map<uint32_t, std::set<uint32_t>> block_refs;
 };
 
@@ -388,6 +389,7 @@ struct D3dxEffectHost {
     uint32_t device_id = 0;
     uint32_t pool_obj = 0;
     uint32_t state_manager = 0;
+    bool restores_state = false;
     std::set<uint32_t> texture_refs;
     std::set<uint32_t> saved_refs;
     std::set<uint32_t> published_shaders;
@@ -540,9 +542,6 @@ struct D3d9HostResource {
     }
     recomp::d3d::Status upload_buffer() {
         return recomp::d3d::d3d9_upload_buffer(*value);
-    }
-    recomp::d3d::Status readback_buffer() {
-        return recomp::d3d::d3d9_readback_buffer(*value);
     }
     recomp::d3d::Status upload_level(uint32_t face, uint32_t level) {
         return recomp::d3d::d3d9_upload_level(*value, face, level);
