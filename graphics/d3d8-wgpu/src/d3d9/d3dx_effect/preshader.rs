@@ -179,7 +179,7 @@ fn op_inputs(op: u32) -> Option<u32> {
     Some(match op {
         0x100 | 0x101 | 0x103 | 0x104 | 0x105 | 0x106 | 0x107 => 1,
         0x200 | 0x201 | 0x202 | 0x203 | 0x204 | 0x205 | 0x208 | 0x500 => 2,
-        0x300 => 3,
+        0x300 | 0x301 => 3,
         _ => return None,
     })
 }
@@ -448,9 +448,16 @@ fn eval_op(op: u32, args: &[f64; MAX_INPUTS]) -> Result<f64, RenderError> {
         }
         0x204 => args[0] + args[1],
         0x205 => args[0] * args[1],
-        0x208 => 0.0,
+        0x208 => args[0] / args[1],
         0x300 => {
             if args[0] >= 0.0 {
+                args[1]
+            } else {
+                args[2]
+            }
+        }
+        0x301 => {
+            if args[0] != 0.0 {
                 args[1]
             } else {
                 args[2]

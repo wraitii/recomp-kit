@@ -26,6 +26,7 @@
       "QueryInterface": "native",
       "AddRef": "native",
       "Release": "native",
+      "RegisterSoftwareDevice": "native",
       "GetAdapterCount": "native",
       "GetAdapterIdentifier": "rust",
       "GetAdapterModeCount": "native",
@@ -624,6 +625,7 @@
       "QueryInterface": "native",
       "AddRef": "native",
       "Release": "native",
+      "GetDevice": "native",
       "GetDeclaration": "rust"
     }
   },
