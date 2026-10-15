@@ -156,7 +156,12 @@ The standalone `--configure` window and the launcher's Configure button offer
 Controller setup; it is not part of the in-game F10 page. The controller
 setup editor calibrates normalized SDL axes and routes each
 physical axis, button and hat direction to guest controls and keyboard keys.
-Its preview runs on a draft profile before the game starts; Apply saves
+Overview shows the connected device and its live inputs. Mapping separates
+physical input selection from explicit output choosers, with input identification
+and keyboard capture. Calibration exposes drift, direction and range controls;
+advanced sections retain response curves, scale, offset and direction buttons.
+Presets and unsaved exits require an explicit choice; Tab/Shift+Tab and Enter
+operate the visible controls. Its preview runs before the game starts; Save changes saves
 the profile under `controls/mapper-v1.txt` in the selected game profile.
 Calibration includes center and range capture, radial stick and per-axis
 deadzones, saturation, response curves and inversion. Output scale and offset
@@ -167,11 +172,15 @@ Games that enumerate controllers only at startup need a restart after enabling
 joystick exposure. The current SDL host opens the first recognized controller;
 calibration is stored per game profile, not separately for each physical device.
 The existing mapped binding remains available for keyboard/mouse controls.
-DirectInput and XInput report their latest delivered axis values and ranges
-to a thread-safe monitor, separate from the editor's preview. Guest-requested
+DirectInput and XInput still report delivered state to the runtime monitor; the
+pre-game editor shows its draft output rather than unavailable guest reads. Guest-requested
 DirectInput ranges and formats remain authoritative. The calibration and
 mapping model is SDL-free; existing controls and pad suites exercise the
 underlying input and API adapters.
+The optional `controller_preview` build target renders the editor to a PPM
+without starting the game or opening a window. Run it with an output path and
+`overview`, `mapping`, `axis`, `advanced`, `calibration`, `response`, `presets`,
+`discard` or `disconnected`; optional width, height and DPI scale follow.
 See `docs/superpowers/specs/2026-09-17-touch-controls-design.md`.
 `mods/display_settings.cpp` validates host display choices and applies rendering
 and projection changes at the frame boundary. `mods/settings.cpp` atomically

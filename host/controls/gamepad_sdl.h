@@ -9,6 +9,7 @@
 #include <SDL3/SDL.h>
 
 #include <cstdint>
+#include <string>
 
 namespace controls {
 
@@ -22,6 +23,7 @@ void gamepad_handle_event(const SDL_Event &e);
 // (a no-op when nothing changed).
 void gamepad_poll();
 bool gamepad_connected();
+std::string gamepad_name();
 // SDL_RumbleGamepad on the open pad; false when there is none or SDL refused.
 bool gamepad_rumble(uint16_t low, uint16_t high, uint32_t ms);
 

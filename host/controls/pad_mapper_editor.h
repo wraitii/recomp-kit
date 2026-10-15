@@ -7,67 +7,76 @@
 #include <utility>
 #include <vector>
 
-struct HostPadGuestState;
-
 namespace controls {
 
-enum class PadMapperEditorAction { None, Apply, Cancel };
+enum class PadMapperEditorAction { None, Apply, Cancel, CloseWindow };
 
 class PadMapperEditor {
   public:
     void open(const PadMapperProfile &profile, const Screen &screen);
     void close();
     void set_screen(const Screen &screen);
+    void set_device(const std::string &name, bool connected);
+    void suspend();
+    void observe_input(const PadState &raw);
     bool is_open() const;
     const PadMapperProfile &profile() const;
     ControlsView view(const Screen &screen, const PadState &raw, const PadState &calibrated,
-                      const PadState &guest_preview, const ::HostPadGuestState &guest_actual,
-                      const std::string &status);
-    void pointer(double px, double py, int state); // -1 up, 0 move, 1 down
+                      const PadState &guest_preview, const std::string &status);
+    void pointer(double px, double py, int state);
     void wheel(double notches);
     void escape();
+    void request_close();
     void key(int scancode, bool down);
     PadMapperEditorAction take_action();
-    uint32_t guest_api() const;
 
   private:
-    enum class Page { Calibration, Bindings, GameView };
-    enum class Capture { None, AxisNegative, AxisPositive, ButtonKey };
-    enum class AxisField { Deadzone, Saturation, Curve, Inverted, Mode, StickDeadzone };
-
+    enum class Page { Overview, Mapping, Calibration };
+    enum class Popup { None, Axis, Button, NegativeButton, PositiveButton, Preset, Discard };
+    enum class Capture { None, NegativeKey, PositiveKey, ButtonKey, Identify };
     void changed();
     void activate(int id);
-    void move_selection(int delta);
-    void adjust(int delta);
+    void select(int source);
+    void cancel_calibration();
+    void preset(int index);
     void add_key(int x, int y, int w, int h, const std::string &label, bool lit, int id);
+    void add_text(int x, int y, int w, int h, const std::string &text, bool muted = true,
+                  int scale = 1);
     void add_meter(int x, int y, int w, int h, const std::string &label, float value, bool bipolar);
-
+    ButtonBinding &button();
     PadMapperProfile profile_;
+    std::string original_;
     Screen screen_;
-    Page page_ = Page::Calibration;
-    AxisField axis_field_ = AxisField::Deadzone;
+    Page page_ = Page::Overview;
+    Popup popup_ = Popup::None;
     Capture capture_ = Capture::None;
     PadMapperEditorAction action_ = PadMapperEditorAction::None;
     std::string validation_error_;
+    std::string device_;
+    bool connected_ = false;
     bool open_ = false;
-    bool pointer_down_ = false;
+    bool close_requested_ = false;
+    bool advanced_ = false;
+    bool shift_ = false;
     bool sweep_ = false;
     bool center_capture_ = false;
     double center_sum_ = 0;
     unsigned center_samples_ = 0;
-    float sweep_min_ = 0, sweep_max_ = 0;
-    float sweep_old_min_ = 0, sweep_old_max_ = 1;
-    float sweep_old_center_ = 0;
-    int selected_axis_ = 0;
-    int selected_binding_ = 0;
-    int binding_part_ = 0;
+    AxisCalibration before_capture_;
+    float sweep_min_ = 0, sweep_max_ = 1;
+    int selected_ = 0;
+    int group_ = 0;
     int scroll_ = 0;
     int visible_rows_ = 1;
-    uint32_t guest_api_ = 0;
-    int preset_ = -1;
-    uint64_t last_guest_view_hash_ = 0;
-    bool have_telemetry_ = false;
-    PadState last_raw_, last_calibrated_, last_guest_;
+    int detail_scroll_ = 0;
+    int detail_max_ = 0;
+    int focus_ = 0;
+    int pressed_ = -1;
+    int preset_pending_ = -1;
+    double pointer_x_ = 0;
+    int sidebar_edge_ = 0;
+    PadState identify_start_;
+    PadState last_raw_;
     uint64_t revision_ = 1;
     ControlsView frame_;
     std::vector<std::pair<Rect, int>> widget_ids_;

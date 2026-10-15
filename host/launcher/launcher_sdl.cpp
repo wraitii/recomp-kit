@@ -6,7 +6,6 @@
 #include "../controls/controls_host.h"
 #include "../controls/gamepad_sdl.h"
 #include "../controls/overlay_paint.h"
-#include "../controls/pad_guest_view.h"
 #include "../controls/pad_mapper_editor.h"
 #include "../input_touch.h"
 #include "../preferences.h"
@@ -212,6 +211,8 @@ bool run_configure_ui(SDL_Window *window, gpu::Device *device, void *native_surf
         if (SDL_WaitEventTimeout(&event, controller.is_open() ? 16 : 250)) {
             do {
                 controls::gamepad_handle_event(event);
+                controller.set_device(controls::gamepad_name(), controls::gamepad_connected());
+                controller.observe_input(controls::host_mapper_raw_state());
                 if (controller.is_open()) {
                     controller.set_screen(screen());
                     switch (event.type) {
@@ -248,13 +249,14 @@ bool run_configure_ui(SDL_Window *window, gpu::Device *device, void *native_surf
                         controller.key(event.key.scancode, event.type == SDL_EVENT_KEY_DOWN);
                         break;
                     case SDL_EVENT_WINDOW_FOCUS_LOST:
-                        controller.pointer(0, 0, -1);
+                        controller.suspend();
                         break;
                     default:
                         break;
                     }
-                    if (event.type != SDL_EVENT_QUIT)
-                        continue;
+                    if (event.type == SDL_EVENT_QUIT)
+                        controller.request_close();
+                    continue;
                 }
                 switch (event.type) {
                 case SDL_EVENT_QUIT:
@@ -348,10 +350,14 @@ bool run_configure_ui(SDL_Window *window, gpu::Device *device, void *native_surf
             } while (SDL_PollEvent(&event));
         }
         controls::gamepad_poll();
+        controller.set_device(controls::gamepad_name(), controls::gamepad_connected());
         const controls::Screen controller_screen = screen();
         if (controller.is_open()) {
             const auto action = controller.take_action();
-            if (action == controls::PadMapperEditorAction::Cancel ||
+            if (action == controls::PadMapperEditorAction::CloseWindow)
+                ui.key(Key::Back);
+            if (action == controls::PadMapperEditorAction::CloseWindow ||
+                action == controls::PadMapperEditorAction::Cancel ||
                 (action == controls::PadMapperEditorAction::Apply &&
                  controls::host_mapper_apply(controller.profile(), true))) {
                 controller.close();
@@ -379,9 +385,8 @@ bool run_configure_ui(SDL_Window *window, gpu::Device *device, void *native_surf
                 else
                     status = "Invalid controller profile draft: " + error;
                 controller.set_screen(controller_screen);
-                const auto view = controller.view(
-                    controller_screen, raw, calibrated, guest,
-                    controls::pad_guest_view_snapshot(controller.guest_api()), status);
+                const auto view =
+                    controller.view(controller_screen, raw, calibrated, guest, status);
                 controller_pixels.assign(size_t(dw) * size_t(dh) * 4, 0);
                 controls::Canvas raster(controller_pixels, dw, dh);
                 controls::paint_editor(raster, view, {0, 0, dw, dh});

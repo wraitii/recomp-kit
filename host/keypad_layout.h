@@ -84,6 +84,7 @@ enum KeypadScan {
     kScanLCtrl = 224,
     kScanLShift = 225,
     kScanLAlt = 226,
+    kScanRShift = 229,
 };
 
 bool keypad_is_modifier(int scancode);

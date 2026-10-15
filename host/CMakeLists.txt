@@ -87,6 +87,17 @@ target_link_libraries(controls_tests PRIVATE recomp_platform)
 recomp_link_sdl(controls_tests)
 recomp_optimize(controls_tests 1)
 recomp_test_binary(controls_tests)
+get_target_property(CONTROLLER_PREVIEW_SOURCES controls_tests SOURCES)
+list(FILTER CONTROLLER_PREVIEW_SOURCES EXCLUDE REGEX "/tests/")
+add_executable(controller_preview EXCLUDE_FROM_ALL ${CONTROLLER_PREVIEW_SOURCES}
+               ${HOST}/controls/pad_mapper.cpp ${HOST}/controls/pad_mapper_editor.cpp
+               ${RECOMP_ROOT}/tools/controller_preview.cpp)
+target_include_directories(controller_preview PRIVATE ${RECOMP_ROOT})
+target_compile_options(controller_preview PRIVATE ${RECOMP_WARN_WERROR})
+target_link_libraries(controller_preview PRIVATE recomp_platform)
+recomp_link_sdl(controller_preview)
+recomp_optimize(controller_preview 1)
+
 add_test(NAME controls_tests COMMAND controls_tests WORKING_DIRECTORY ${RECOMP_ROOT})
 set_tests_properties(controls_tests PROPERTIES LABELS nogame)
 

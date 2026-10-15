@@ -67,7 +67,9 @@ void paint_editor_key(Canvas &c, const DrawControl &d, const Rect &r) {
                  d.lit ? flat(kAccentR, kAccentG, kAccentB, 235) : flat(40, 48, 64, 235));
     std::string label = d.label;
     const Rgba text_color = d.lit ? Rgba{10, 12, 20, 255} : Rgba{235, 242, 255, 255};
-    const int scale = c.text_width(label.c_str(), 2) > w - 8 ? 1 : 2;
+    int scale = d.text_scale ? d.text_scale : 2;
+    if (c.text_width(label.c_str(), scale) > w - 8)
+        scale = std::max(1, scale / 2);
     while (!label.empty() && c.text_width(label.c_str(), scale) > w - 8)
         label.pop_back();
     if (label != d.label && label.size() > 2) {
@@ -76,6 +78,12 @@ void paint_editor_key(Canvas &c, const DrawControl &d, const Rect &r) {
     }
     c.text(x + (w - c.text_width(label.c_str(), scale)) / 2, y + (h - 8 * scale) / 2, label.c_str(),
            text_color, scale, true);
+    if (d.focused)
+        c.stroke({{double(x + 2), double(y + 2)},
+                  {double(x + w - 3), double(y + 2)},
+                  {double(x + w - 3), double(y + h - 3)},
+                  {double(x + 2), double(y + h - 3)}},
+                 1.5, true, flat(kAccentR, kAccentG, kAccentB, 255));
 }
 
 void paint_meter(Canvas &c, const DrawMeter &m, const Rect &r) {
@@ -93,13 +101,14 @@ void paint_meter(Canvas &c, const DrawMeter &m, const Rect &r) {
         c.rect(x + 2, y + 2, int((w - 4) * value), h - 4, flat(93, 170, 255, 235));
     }
     std::string label = m.label;
-    while (!label.empty() && c.text_width(label.c_str(), 1) > w - 10)
+    while (!label.empty() && c.text_width(label.c_str(), m.text_scale) > w - 10)
         label.pop_back();
     if (label != m.label && label.size() > 2) {
         label.back() = '.';
         label[label.size() - 2] = '.';
     }
-    c.text(x + 5, y + (h - 8) / 2, label.c_str(), Rgba{245, 248, 255, 255}, 1, true);
+    c.text(x + 5, y + (h - 8 * m.text_scale) / 2, label.c_str(), Rgba{245, 248, 255, 255},
+           m.text_scale, true);
 }
 
 } // namespace
@@ -124,6 +133,27 @@ void paint_editor(Canvas &c, const ControlsView &view, const Rect &r) {
         paint_one(c, d, r);
     for (const DrawMeter &m : view.meters)
         paint_meter(c, m, r);
+    const auto paint_text = [&](const DrawText &t) {
+        const int columns = std::max(1, t.rect.w / (6 * t.scale));
+        std::string remaining = t.text;
+        for (int y = t.rect.y; !remaining.empty() && y + 8 * t.scale <= t.rect.y + t.rect.h;
+             y += 11 * t.scale) {
+            size_t count = std::min(size_t(columns), remaining.size());
+            if (count < remaining.size()) {
+                const size_t space = remaining.rfind(' ', count);
+                if (space != std::string::npos && space > 0)
+                    count = space;
+            }
+            const std::string line = remaining.substr(0, count);
+            c.text(t.rect.x - r.x, y - r.y, line.c_str(),
+                   t.muted ? Rgba{160, 174, 194, 255} : Rgba{235, 242, 255, 255}, t.scale, true);
+            remaining.erase(0, count);
+            while (!remaining.empty() && remaining.front() == ' ')
+                remaining.erase(0, 1);
+        }
+    };
+    for (const DrawText &t : view.text)
+        paint_text(t);
     // The selection: a 3 px accent frame on the control's own edge.
     if (view.selected >= 0 && view.selected < int(view.controls.size())) {
         const Rect &b = view.controls[view.selected].rect;
@@ -138,11 +168,18 @@ void paint_editor(Canvas &c, const ControlsView &view, const Rect &r) {
         c.rect(g.x - r.x, g.y - r.y, g.w, g.h, flat(kAccentR, kAccentG, kAccentB, 200));
     for (const DrawControl &d : view.toolbar)
         paint_editor_key(c, d, r);
+    if (!view.popup_text.empty()) {
+        Paint dim = flat(0, 0, 0, 160);
+        dim.replace = false;
+        c.rect(-r.x, -r.y, view.dw, view.dh, dim);
+    }
     if (!view.picker.empty())
         c.rect(view.picker.x - r.x, view.picker.y - r.y, view.picker.w, view.picker.h,
                flat(6, 9, 15, 235));
     for (const DrawControl &d : view.picker_rows)
         paint_editor_key(c, d, r);
+    for (const DrawText &t : view.popup_text)
+        paint_text(t);
 }
 
 void paint_layer(Canvas &c, const ControlsView &view, int layer, const Rect &r) {

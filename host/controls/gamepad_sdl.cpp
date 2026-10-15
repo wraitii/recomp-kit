@@ -125,6 +125,11 @@ void gamepad_poll() {
     publish();
 }
 
+std::string gamepad_name() {
+    const char *name = g_pad ? SDL_GetGamepadName(g_pad) : nullptr;
+    return name ? name : "Controller";
+}
+
 bool gamepad_connected() {
     return g_pad != nullptr;
 }
