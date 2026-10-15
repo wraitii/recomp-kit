@@ -1409,7 +1409,7 @@ pub fn d3dx_effect_create(
             }
         }
         Err(error) => D3dxEffectCreateResult {
-            status: failed("D3DXCreateEffectFromFileA", error),
+            status: failed("D3DXCreateEffect", error),
             parameters: 0,
             techniques: 0,
         },
@@ -1445,7 +1445,7 @@ pub fn d3dx_effect_join_pool(
         }
         if effect.params[index].type_.class == FXC_OBJECT && !effect.params[index].type_.texture() {
             return failed(
-                "D3DXCreateEffectFromFileA",
+                "D3DXCreateEffect",
                 unsupported(
                     "Pool",
                     "shared sampler, string and shader parameters are unsupported",
@@ -1682,6 +1682,34 @@ pub fn d3dx_effect_set(effect: &mut D3dxEffect, handle: u32, setter: u32, data: 
         }
         _ => return invalid_call("ID3DXEffect::SetValue"),
     }
+    effect.touch(target.root);
+    ok()
+}
+
+pub fn d3dx_effect_set_raw(
+    effect: &mut D3dxEffect,
+    handle: u32,
+    offset: u32,
+    data: &[u8],
+) -> Status {
+    let Some(target) = effect.target(handle) else {
+        return invalid_call("ID3DXEffect::SetRawValue");
+    };
+    if target.ty.class == FXC_OBJECT || target.ty.class == FXC_STRUCT {
+        return invalid_call("ID3DXEffect::SetRawValue");
+    }
+    effect.sync_shared(target.root);
+    let Some(dst) = target_numeric_mut(effect, &target) else {
+        return invalid_call("ID3DXEffect::SetRawValue");
+    };
+    let start = offset as usize;
+    let Some(end) = start
+        .checked_add(data.len())
+        .filter(|end| *end <= dst.len())
+    else {
+        return invalid_call("ID3DXEffect::SetRawValue");
+    };
+    dst[start..end].copy_from_slice(data);
     effect.touch(target.root);
     ok()
 }

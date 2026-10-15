@@ -27,9 +27,12 @@ pub const D3DFMT_Q8W8V8U8: u32 = 63;
 pub const D3DFMT_V16U16: u32 = 64;
 pub const D3DFMT_D16_LOCKABLE: u32 = 70;
 pub const D3DFMT_D32: u32 = 71;
+pub const D3DFMT_D15S1: u32 = 73;
 pub const D3DFMT_D24S8: u32 = 75;
+pub const D3DFMT_D24X4S4: u32 = 79;
 pub const D3DFMT_D24X8: u32 = 77;
 pub const D3DFMT_D16: u32 = 80;
+pub const D3DFMT_L16: u32 = 81;
 pub const D3DFMT_D32F_LOCKABLE: u32 = 82;
 pub const D3DFMT_VERTEXDATA: u32 = 100;
 pub const D3DFMT_INDEX16: u32 = 101;
@@ -46,6 +49,9 @@ pub const D3DFMT_DXT2: u32 = 0x3254_5844;
 pub const D3DFMT_DXT3: u32 = 0x3354_5844;
 pub const D3DFMT_DXT4: u32 = 0x3454_5844;
 pub const D3DFMT_DXT5: u32 = 0x3554_5844;
+pub const D3DFMT_INTZ: u32 = 0x5A54_4E49;
+pub const D3DFMT_DF24: u32 = 0x3432_4644;
+pub const D3DFMT_DF16: u32 = 0x3631_4644;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StorageClass {
@@ -62,6 +68,7 @@ pub enum Conversion {
     BgraOpaque,
     RgbaOpaque,
     DepthDirect,
+    Luminance16,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -377,7 +384,7 @@ pub fn info(fmt: u32) -> Option<FormatInfo> {
             8,
             T::Bc1RgbaUnorm,
             Conversion::Direct,
-            Some(wgpu::Features::TEXTURE_COMPRESSION_BC),
+            None,
             false,
             false,
         ),
@@ -387,7 +394,7 @@ pub fn info(fmt: u32) -> Option<FormatInfo> {
             16,
             T::Bc2RgbaUnorm,
             Conversion::Direct,
-            Some(wgpu::Features::TEXTURE_COMPRESSION_BC),
+            None,
             false,
             false,
         ),
@@ -397,7 +404,17 @@ pub fn info(fmt: u32) -> Option<FormatInfo> {
             16,
             T::Bc3RgbaUnorm,
             Conversion::Direct,
-            Some(wgpu::Features::TEXTURE_COMPRESSION_BC),
+            None,
+            false,
+            false,
+        ),
+        D3DFMT_L16 => f(
+            StorageClass::Uncompressed,
+            2,
+            0,
+            T::Rgba16Unorm,
+            Conversion::Luminance16,
+            Some(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM),
             false,
             false,
         ),
@@ -451,7 +468,46 @@ pub fn info(fmt: u32) -> Option<FormatInfo> {
             false,
             true,
         ),
-        D3DFMT_D32 => None,
+        D3DFMT_D32 => f(
+            StorageClass::Depth,
+            4,
+            0,
+            T::Depth32Float,
+            Conversion::DepthDirect,
+            None,
+            false,
+            false,
+        ),
+        D3DFMT_D15S1 | D3DFMT_D24X4S4 => f(
+            StorageClass::Depth,
+            if fmt == D3DFMT_D15S1 { 2 } else { 4 },
+            0,
+            T::Depth24PlusStencil8,
+            Conversion::DepthDirect,
+            None,
+            false,
+            false,
+        ),
+        D3DFMT_INTZ | D3DFMT_DF24 => f(
+            StorageClass::Depth,
+            4,
+            0,
+            T::Depth24Plus,
+            Conversion::DepthDirect,
+            None,
+            false,
+            false,
+        ),
+        D3DFMT_DF16 => f(
+            StorageClass::Depth,
+            2,
+            0,
+            T::Depth16Unorm,
+            Conversion::DepthDirect,
+            None,
+            false,
+            false,
+        ),
         _ => None,
     }
 }
@@ -525,6 +581,7 @@ pub fn physical_bpp(fmt: u32) -> u32 {
         }) => 0,
         Some(f) => match f.conversion {
             Conversion::Direct | Conversion::DepthDirect => f.bpp,
+            Conversion::Luminance16 => 8,
             _ => 4,
         },
         None => 0,
@@ -567,6 +624,22 @@ pub fn needs_initial_upload(fmt: u32) -> bool {
 
 pub fn depth_readback_supported(fmt: u32) -> bool {
     matches!(fmt, D3DFMT_D16_LOCKABLE | D3DFMT_D32F_LOCKABLE)
+}
+
+pub fn sampleable_depth(fmt: u32) -> bool {
+    matches!(fmt, D3DFMT_INTZ | D3DFMT_DF24 | D3DFMT_DF16)
+}
+
+pub fn needs_bc_decode(fmt: u32, features: wgpu::Features) -> bool {
+    is_block(fmt) && !features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC)
+}
+
+pub fn device_format(fmt: u32, features: wgpu::Features) -> Option<wgpu::TextureFormat> {
+    if needs_bc_decode(fmt, features) {
+        Some(wgpu::TextureFormat::Rgba8Unorm)
+    } else {
+        d3d_to_wgpu(fmt)
+    }
 }
 
 pub fn copy_bytes(src: &[u8]) -> Result<Vec<u8>, RenderError> {
@@ -1367,6 +1440,22 @@ pub fn upload_bytes(
             }
             Ok(out)
         }
+        Conversion::Luminance16 => {
+            if src.len() < pixels * 2 {
+                return Err(RenderError::invalid(
+                    "UploadTexture",
+                    "source level is shorter than its layout",
+                ));
+            }
+            let mut out = fallible_vec(pixels * 8)?;
+            for luminance in src[..pixels * 2].chunks_exact(2) {
+                out.extend_from_slice(luminance);
+                out.extend_from_slice(luminance);
+                out.extend_from_slice(luminance);
+                out.extend_from_slice(&[0xFF, 0xFF]);
+            }
+            Ok(out)
+        }
         Conversion::ToRgba8 => {
             if src.len() < pixels * texel {
                 return Err(RenderError::invalid(
@@ -1388,6 +1477,126 @@ pub fn upload_bytes(
             Ok(out)
         }
     }
+}
+
+pub fn decode_bc_level(
+    fmt: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    src: &[u8],
+) -> Result<Vec<u8>, RenderError> {
+    let block = block_bytes(fmt) as usize;
+    let (w, h, d) = (width as usize, height as usize, depth as usize);
+    let blocks_w = w.div_ceil(4);
+    let blocks_h = h.div_ceil(4);
+    let guest_slice = blocks_w * blocks_h * block;
+    if src.len() < guest_slice * d {
+        return Err(RenderError::invalid(
+            "UploadTexture",
+            "source level is shorter than its layout",
+        ));
+    }
+    let slice_pixels = w * h * 4;
+    let mut out = fallible_vec(slice_pixels * d)?;
+    out.resize(slice_pixels * d, 0);
+    for slice in 0..d {
+        let src_slice = &src[slice * guest_slice..(slice + 1) * guest_slice];
+        let dst_slice = &mut out[slice * slice_pixels..(slice + 1) * slice_pixels];
+        for by in 0..blocks_h {
+            for bx in 0..blocks_w {
+                let start = (by * blocks_w + bx) * block;
+                let texels = decode_bc_block(fmt, &src_slice[start..start + block]);
+                let rows = (h - by * 4).min(4);
+                let cols = (w - bx * 4).min(4);
+                for ty in 0..rows {
+                    for tx in 0..cols {
+                        let o = ((by * 4 + ty) * w + bx * 4 + tx) * 4;
+                        dst_slice[o..o + 4].copy_from_slice(&texels[ty * 4 + tx]);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn decode_bc_block(fmt: u32, p: &[u8]) -> [[u8; 4]; 16] {
+    if fmt == D3DFMT_DXT1 {
+        return bc_colour_block(p, false);
+    }
+    let mut texels = bc_colour_block(&p[8..], true);
+    let alpha = if matches!(fmt, D3DFMT_DXT2 | D3DFMT_DXT3) {
+        bc_alpha4(p)
+    } else {
+        bc_alpha8(p)
+    };
+    for (texel, a) in texels.iter_mut().zip(alpha) {
+        texel[3] = a;
+    }
+    texels
+}
+
+fn bc_colour_block(p: &[u8], always_four: bool) -> [[u8; 4]; 16] {
+    let c0 = u16::from_le_bytes([p[0], p[1]]) as u32;
+    let c1 = u16::from_le_bytes([p[2], p[3]]) as u32;
+    let rgb = |c: u32| {
+        [
+            expand_n((c >> 11) & 0x1F, 5),
+            expand_n((c >> 5) & 0x3F, 6),
+            expand_n(c & 0x1F, 5),
+        ]
+    };
+    let (a, b) = (rgb(c0), rgb(c1));
+    let weighted = |w: u32| {
+        let [r, g, bl] =
+            [0usize, 1, 2].map(|c| ((w * a[c] as u32 + (3 - w) * b[c] as u32) / 3) as u8);
+        [r, g, bl, 0xFF]
+    };
+    let palette = if always_four || c0 > c1 {
+        [
+            [a[0], a[1], a[2], 0xFF],
+            [b[0], b[1], b[2], 0xFF],
+            weighted(2),
+            weighted(1),
+        ]
+    } else {
+        let mid = [0usize, 1, 2].map(|c| ((a[c] as u32 + b[c] as u32) / 2) as u8);
+        [
+            [a[0], a[1], a[2], 0xFF],
+            [b[0], b[1], b[2], 0xFF],
+            [mid[0], mid[1], mid[2], 0xFF],
+            [0, 0, 0, 0],
+        ]
+    };
+    let bits = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
+    std::array::from_fn(|i| palette[((bits >> (2 * i)) & 3) as usize])
+}
+
+fn bc_alpha4(p: &[u8]) -> [u8; 16] {
+    std::array::from_fn(|i| {
+        let nibble = (p[i / 2] >> ((i & 1) * 4)) & 0xF;
+        (nibble << 4) | nibble
+    })
+}
+
+fn bc_alpha8(p: &[u8]) -> [u8; 16] {
+    let (a0, a1) = (p[0] as u32, p[1] as u32);
+    let mut table = [0u8; 8];
+    table[0] = p[0];
+    table[1] = p[1];
+    if a0 > a1 {
+        for i in 1..=6u32 {
+            table[i as usize + 1] = (((7 - i) * a0 + i * a1) / 7) as u8;
+        }
+    } else {
+        for i in 1..=4u32 {
+            table[i as usize + 1] = (((5 - i) * a0 + i * a1) / 5) as u8;
+        }
+        table[7] = 0xFF;
+    }
+    let bits = (0..6).fold(0u64, |acc, i| acc | (p[2 + i] as u64) << (8 * i));
+    std::array::from_fn(|i| table[((bits >> (3 * i)) & 7) as usize])
 }
 
 pub fn readback_bytes(
@@ -1426,6 +1635,19 @@ pub fn readback_bytes(
                     texel_bytes[3],
                 ]);
                 out.extend_from_slice(&swap_rgb10(word).to_le_bytes());
+            }
+            Ok(out)
+        }
+        Conversion::Luminance16 => {
+            if src.len() < pixels * 8 {
+                return Err(RenderError::invalid(
+                    "ReadbackTexture",
+                    "GPU level is shorter than its layout",
+                ));
+            }
+            let mut out = fallible_vec(pixels * 2)?;
+            for texel_bytes in src[..pixels * 8].chunks_exact(8) {
+                out.extend_from_slice(&texel_bytes[..2]);
             }
             Ok(out)
         }

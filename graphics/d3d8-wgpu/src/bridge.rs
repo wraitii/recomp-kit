@@ -217,7 +217,6 @@ pub mod ffi {
         behavior_flags: u32,
         present: D3d9PresentParams,
         display_mode: D3d9DisplayMode,
-        thread_id: u32,
     }
 
     struct D3d9CreateResult {
@@ -242,7 +241,6 @@ pub mod ffi {
         display_mode: D3d9DisplayMode,
         implicit_external_refs: bool,
         window_valid: bool,
-        thread_id: u32,
     }
 
     struct D3d9ResetResult {
@@ -1056,6 +1054,12 @@ pub mod ffi {
             setter: u32,
             data: &[u8],
         ) -> Status;
+        fn d3dx_effect_set_raw(
+            effect: &mut D3dxEffect,
+            handle: u32,
+            offset: u32,
+            data: &[u8],
+        ) -> Status;
         fn d3dx_effect_get(effect: &D3dxEffect, handle: u32, kind: u32) -> D3dxBytesResult;
         fn d3dx_effect_set_texture(effect: &mut D3dxEffect, handle: u32, id: u32) -> Status;
         fn d3dx_effect_texture(effect: &D3dxEffect, handle: u32) -> ValueResult;
@@ -1299,7 +1303,7 @@ pub mod ffi {
         fn d3d9_unregister_resource(device: &mut D3d9Device, id: u32) -> Status;
         fn d3d9_registered_resource_ids(device: &D3d9Device) -> ValuesResult;
         fn d3d9_reset(device: &mut D3d9Device, request: &D3d9ResetRequest) -> D3d9ResetResult;
-        fn d3d9_test_cooperative_level(device: &mut D3d9Device, thread_id: u32) -> ValueResult;
+        fn d3d9_test_cooperative_level(device: &mut D3d9Device) -> ValueResult;
         fn d3d9_prepare_resource_reset(
             device: &mut D3d9Device,
             id: u32,
@@ -1313,8 +1317,16 @@ pub mod ffi {
         );
         fn d3d9_finish_reset(device: &mut D3d9Device) -> D3d9ResetResult;
         fn d3d9_abort_reset(device: &mut D3d9Device) -> Status;
-        fn d3d9_present(device: &mut D3d9Device) -> D3d9FrameResult;
-        fn d3d9_present_handoff(device: &mut D3d9Device) -> FrameHandoffResult;
+        fn d3d9_present(
+            device: &mut D3d9Device,
+            src_rect: &[D3d9Rect],
+            dst_rect: &[D3d9Rect],
+        ) -> D3d9FrameResult;
+        fn d3d9_present_handoff(
+            device: &mut D3d9Device,
+            src_rect: &[D3d9Rect],
+            dst_rect: &[D3d9Rect],
+        ) -> FrameHandoffResult;
         fn d3d9_backbuffer_descriptor(device: &D3d9Device) -> D3d9SurfaceDescriptorResult;
         fn d3d9_depthbuffer_descriptor(device: &D3d9Device) -> D3d9SurfaceDescriptorResult;
         fn d3d9_number_of_swap_chains(device: &D3d9Device) -> ValueResult;
@@ -1740,10 +1752,11 @@ use crate::d3d9::d3dx_effect::{
     d3dx_effect_param_semantic, d3dx_effect_pass_desc, d3dx_effect_pass_shader,
     d3dx_effect_pool_id, d3dx_effect_pool_id_of, d3dx_effect_pool_texture_refs,
     d3dx_effect_prepare_shaders, d3dx_effect_recycle, d3dx_effect_release,
-    d3dx_effect_saved_bindings, d3dx_effect_set, d3dx_effect_set_state_manager,
-    d3dx_effect_set_technique, d3dx_effect_set_texture, d3dx_effect_shutdown,
-    d3dx_effect_technique_desc, d3dx_effect_texture, d3dx_effect_texture_refs,
-    d3dx_effect_validate_technique, new_d3dx_effect, new_d3dx_effect_pool,
+    d3dx_effect_saved_bindings, d3dx_effect_set, d3dx_effect_set_raw,
+    d3dx_effect_set_state_manager, d3dx_effect_set_technique, d3dx_effect_set_texture,
+    d3dx_effect_shutdown, d3dx_effect_technique_desc, d3dx_effect_texture,
+    d3dx_effect_texture_refs, d3dx_effect_validate_technique, new_d3dx_effect,
+    new_d3dx_effect_pool,
 };
 use crate::d3d9::{
     D3d9Device, D3d9Resource, D3dxSurfaceData, d3d9_abort_reset, d3d9_adapter_caps,

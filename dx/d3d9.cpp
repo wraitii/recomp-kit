@@ -827,7 +827,6 @@ void D9_CreateDevice(X86 *c) {
             return;
         }
         request.display_mode = d3d9_device_display_mode(request.present);
-        request.thread_id = guest_current_thread_id();
         ComObj *dev = com_new(K_D3D9DEVICE);
         if (!dev) {
             com_ret(c, E_OUTOFMEMORY);
@@ -1042,7 +1041,6 @@ void Dev_Reset(X86 *c) {
             implicit_surface_externally_referenced(dev->d3d9_backbuffer) ||
             implicit_surface_externally_referenced(dev->d3d9_depthbuffer);
         request.display_mode = d3d9_device_display_mode(request.present);
-        request.thread_id = guest_current_thread_id();
         recomp::d3d::D3d9ResetResult result{};
         d3d9_reset_transaction(dev, request, result);
         wr32(present + 0, result.present.width);
@@ -1094,8 +1092,7 @@ void Dev_TestCooperativeLevel(X86 *c) {
         return;
     }
     if (kD3d9WgpuEnabled) {
-        recomp::d3d::ValueResult result =
-            dev->d3d9_device->test_cooperative_level(guest_current_thread_id());
+        recomp::d3d::ValueResult result = dev->d3d9_device->test_cooperative_level();
         if (result.status.code != recomp::d3d::StatusCode::Ok) {
             com_ret(c, bridge_result(c, result.status));
             return;
@@ -1373,14 +1370,26 @@ void Dev_Present(X86 *c) {
             com_ret(c, D3DERR_INVALIDCALL);
             return;
         }
-        if (arg(c, 1) || arg(c, 2) || arg(c, 3) || arg(c, 4)) {
+        if (arg(c, 3) && arg(c, 3) != dev->hwnd) {
+            LOGW("d3d9: Present hDestWindowOverride %08x is not the device window %08x", arg(c, 3),
+                 dev->hwnd);
             imports_unsupported(c);
             com_ret(c, D3DERR_INVALIDCALL);
             return;
         }
+        recomp::d3d::D3d9Rect sr{}, dr{};
+        bool have_src = arg(c, 1) != 0;
+        bool have_dst = arg(c, 2) != 0;
+        if ((have_src && !read_guest_rect(arg(c, 1), &sr)) ||
+            (have_dst && !read_guest_rect(arg(c, 2), &dr))) {
+            com_ret(c, D3DERR_INVALIDCALL);
+            return;
+        }
+        rust::Slice<const recomp::d3d::D3d9Rect> srs(have_src ? &sr : nullptr, have_src ? 1 : 0);
+        rust::Slice<const recomp::d3d::D3d9Rect> drs(have_dst ? &dr : nullptr, have_dst ? 1 : 0);
         bool presented = false;
         if (!dx_dump_enabled() && dev->d3d9_device->native_present_available) {
-            auto result = dev->d3d9_device->present_handoff();
+            auto result = dev->d3d9_device->present_handoff(srs, drs);
             if (result.status.code == recomp::d3d::StatusCode::Ok) {
                 presented = host_display_present_native_texture(
                     result.handoff.texture, (int)result.handoff.width, (int)result.handoff.height,
@@ -1400,7 +1409,7 @@ void Dev_Present(X86 *c) {
             }
         }
         if (!presented) {
-            recomp::d3d::D3d9FrameResult result = dev->d3d9_device->present();
+            recomp::d3d::D3d9FrameResult result = dev->d3d9_device->present(srs, drs);
             if (result.status.code != recomp::d3d::StatusCode::Ok) {
                 com_ret(c, bridge_result(c, result.status));
                 return;
@@ -1411,9 +1420,10 @@ void Dev_Present(X86 *c) {
                                                  (int)result.height);
             }
         }
-        recomp::d3d::D3d9PresentParams effective = dev->d3d9_device->effective_present();
-        if (effective.presentation_interval != 0x80000000u) {
-            const double delay = host_present_refresh_delay(1);
+        const uint32_t interval = dev->d3d9_device->effective_present().presentation_interval;
+        if (interval != 0x80000000u) {
+            const int refreshes = interval >= 8u ? 4 : interval >= 4u ? 3 : interval == 2u ? 2 : 1;
+            const double delay = host_present_refresh_delay(refreshes);
             if (delay > 0)
                 guest_sleep_ms((uint32_t)(delay * 1000.0));
         }
@@ -3315,21 +3325,8 @@ void X_D3DX33CreateEffectPool(X86 *c) {
     com_ret(c, D3D_OK9);
 }
 
-void X_D3DXCreateEffectFromFileA(X86 *c) {
-    uint32_t device_addr = arg(c, 0), file = arg(c, 1), flags = arg(c, 4);
-    uint32_t pool_addr = arg(c, 5), out = arg(c, 6), errors = arg(c, 7);
-    if (errors && gm_valid(errors, 4))
-        wr32(errors, 0);
-    if (!out || !gm_valid(out, 4)) {
-        com_ret(c, D3DERR_INVALIDCALL);
-        return;
-    }
-    wr32(out, 0);
-    ComObj *dev = com_this(device_addr);
-    if (!dev || dev->kind != K_D3D9DEVICE || !dev->d3d9_device || !file) {
-        com_ret(c, D3DERR_INVALIDCALL);
-        return;
-    }
+void efx_create(X86 *c, ComObj *dev, uint32_t pool_addr, uint32_t flags, uint32_t out,
+                const uint8_t *bytes, size_t size) {
     ComObj *pool = pool_addr ? com_this(pool_addr) : nullptr;
     if (pool_addr && (!pool || pool->kind != K_D3DXEFFECTPOOL || !pool->d3dx_effect_pool)) {
         com_ret(c, D3DERR_INVALIDCALL);
@@ -3338,21 +3335,14 @@ void X_D3DXCreateEffectFromFileA(X86 *c) {
     if (flags & ~EFX_KNOWN_CREATION_FLAGS) {
         com_ret(c, bridge_result(
                        c, recomp::d3d::Status{recomp::d3d::StatusCode::Unsupported,
-                                              rust::String("D3DXCreateEffectFromFileA: "
+                                              rust::String("D3DXCreateEffect: "
                                                            "unknown effect creation flags")}));
-        return;
-    }
-    std::string path = win32_host_path_op(gm_str(file, 1024), WIN32_FILE_READ);
-    std::vector<uint8_t> bytes;
-    if (!d3dx_read_file(path, bytes)) {
-        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
     auto host = std::make_shared<D3dxEffectHost>();
     host->device_id = dev->id;
     recomp::d3d::D3dxEffectCreateResult result = recomp::d3d::d3dx_effect_create(
-        *host->value, *dev->d3d9_device->value,
-        rust::Slice<const uint8_t>(bytes.data(), bytes.size()), flags);
+        *host->value, *dev->d3d9_device->value, rust::Slice<const uint8_t>(bytes, size), flags);
     if (result.status.code != recomp::d3d::StatusCode::Ok) {
         com_ret(c, bridge_result(c, result.status));
         return;
@@ -3397,6 +3387,30 @@ void X_D3DXCreateEffectFromFileA(X86 *c) {
     }
     com_out_ptr(out, view);
     com_ret(c, D3D_OK9);
+}
+
+void X_D3DXCreateEffectFromFileA(X86 *c) {
+    uint32_t device_addr = arg(c, 0), file = arg(c, 1), flags = arg(c, 4);
+    uint32_t pool_addr = arg(c, 5), out = arg(c, 6), errors = arg(c, 7);
+    if (errors && gm_valid(errors, 4))
+        wr32(errors, 0);
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    wr32(out, 0);
+    ComObj *dev = com_this(device_addr);
+    if (!dev || dev->kind != K_D3D9DEVICE || !dev->d3d9_device || !file) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    std::string path = win32_host_path_op(gm_str(file, 1024), WIN32_FILE_READ);
+    std::vector<uint8_t> bytes;
+    if (!d3dx_read_file(path, bytes)) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    efx_create(c, dev, pool_addr, flags, out, bytes.data(), bytes.size());
 }
 
 void Efx_GetDesc(X86 *c) {
@@ -3701,6 +3715,20 @@ void Efx_SetValue(X86 *c) {
         return;
     }
     efx_apply(c, 0, size ? (const uint8_t *)gm_ptr(addr) : nullptr, size);
+}
+
+void Efx_SetRawValue(X86 *c) {
+    ComObj *fx = efx_this(c);
+    uint32_t addr = arg(c, 2), offset = arg(c, 3), bytes = arg(c, 4);
+    if (!fx || (bytes && (!addr || !gm_valid(addr, bytes)))) {
+        com_ret(c, D3DERR_INVALIDCALL);
+        return;
+    }
+    uint32_t handle = efx_resolve_handle(fx, arg(c, 1), 0);
+    efx_status(
+        c, recomp::d3d::d3dx_effect_set_raw(
+               *efx_host(fx)->value, handle, offset,
+               rust::Slice<const uint8_t>(bytes ? (const uint8_t *)gm_ptr(addr) : nullptr, bytes)));
 }
 
 void Efx_SetBool(X86 *c) {

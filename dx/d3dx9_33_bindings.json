@@ -170,7 +170,8 @@
       "OnLostDevice": "Efx_OnLostDevice",
       "OnResetDevice": "Efx_OnResetDevice",
       "SetStateManager": "Efx_SetStateManager",
-      "GetStateManager": "Efx_GetStateManager"
+      "GetStateManager": "Efx_GetStateManager",
+      "SetRawValue": "Efx_SetRawValue"
     },
     "flag_on": {
       "QueryInterface": "native",
@@ -236,7 +237,8 @@
       "OnLostDevice": "rust",
       "OnResetDevice": "rust",
       "SetStateManager": "rust",
-      "GetStateManager": "native"
+      "GetStateManager": "native",
+      "SetRawValue": "rust"
     }
   }
 ]

@@ -157,8 +157,8 @@ struct D3d9HostDevice {
     recomp::d3d::D3d9ResetResult reset(const recomp::d3d::D3d9ResetRequest &request) {
         return recomp::d3d::d3d9_reset(*value, request);
     }
-    recomp::d3d::ValueResult test_cooperative_level(uint32_t thread_id) {
-        return recomp::d3d::d3d9_test_cooperative_level(*value, thread_id);
+    recomp::d3d::ValueResult test_cooperative_level() {
+        return recomp::d3d::d3d9_test_cooperative_level(*value);
     }
     recomp::d3d::ValuesResult registered_resource_ids() const {
         return recomp::d3d::d3d9_registered_resource_ids(*value);
@@ -174,11 +174,14 @@ struct D3d9HostDevice {
     recomp::d3d::Status abort_reset() {
         return recomp::d3d::d3d9_abort_reset(*value);
     }
-    recomp::d3d::D3d9FrameResult present() {
-        return recomp::d3d::d3d9_present(*value);
+    recomp::d3d::D3d9FrameResult present(rust::Slice<const recomp::d3d::D3d9Rect> src_rect,
+                                         rust::Slice<const recomp::d3d::D3d9Rect> dst_rect) {
+        return recomp::d3d::d3d9_present(*value, src_rect, dst_rect);
     }
-    recomp::d3d::FrameHandoffResult present_handoff() {
-        return recomp::d3d::d3d9_present_handoff(*value);
+    recomp::d3d::FrameHandoffResult
+    present_handoff(rust::Slice<const recomp::d3d::D3d9Rect> src_rect,
+                    rust::Slice<const recomp::d3d::D3d9Rect> dst_rect) {
+        return recomp::d3d::d3d9_present_handoff(*value, src_rect, dst_rect);
     }
 
     recomp::d3d::D3dxSurfaceReadResult d3dx_surface_read(D3d9HostResource &resource, uint32_t face,

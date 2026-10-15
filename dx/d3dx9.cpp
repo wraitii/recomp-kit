@@ -280,7 +280,6 @@ static uint32_t rd32_le(const uint8_t *b) {
 }
 
 static const uint32_t D3D_OKX = 0u;
-static const uint32_t E_NOTIMPLX = 0x80004001u;
 static const uint32_t D3DERR_INVALIDCALLX = 0x8876086cu;
 
 enum : uint32_t {
@@ -1950,83 +1949,37 @@ template <void (*F)(X86 *)> void shared_setter(X86 *c) {
         share_parameter(id, (uint32_t)index);
 }
 
-void X_D3DXCreateEffectPool(X86 *c) {
-    uint32_t out = arg(c, 0);
-    ComObj *o = com_new(K_D3DXEFFECTPOOL);
-    uint32_t view = o ? com_view(o, IF_D3DXEFFECTPOOL) : 0;
-    if (!view || !out) {
-        if (o)
-            com_release(o);
-        set_eax(c, E_NOTIMPLX);
-        return;
-    }
-    com_out_ptr(out, view);
-    set_eax(c, D3D_OKX);
-}
-
 // (pDevice, hSrcModule, pSrcResource, pDefines, pInclude, Flags, pPool,
 //  ppEffect, ppCompilationErrors)
 void X_D3DXCreateEffectFromResourceA(X86 *c) {
     uint32_t device = arg(c, 0), module = arg(c, 1), resource = arg(c, 2);
-    // A null module is the executable itself, as it is for FindResource.
+    uint32_t flags = arg(c, 5), pool = arg(c, 6), out = arg(c, 7), errors = arg(c, 8);
+    if (errors && gm_valid(errors, 4))
+        wr32(errors, 0);
+    if (!out || !gm_valid(out, 4)) {
+        com_ret(c, D3DERR_INVALIDCALLX);
+        return;
+    }
+    wr32(out, 0);
+    ComObj *dev = com_this(device);
+    if (!dev || dev->kind != K_D3D9DEVICE || !dev->d3d9_device) {
+        com_ret(c, D3DERR_INVALIDCALLX);
+        return;
+    }
     if (!module)
         module = IMAGE_BASE;
-    uint32_t out = arg(c, 7), errors = arg(c, 8);
-    if (!out) {
-        set_eax(c, D3DERR_INVALIDCALLX);
-        return;
-    }
-    if (errors)
-        wr32(errors, 0);
-    ComObj *fxo = com_new(K_D3DXEFFECT);
-    uint32_t view = fxo ? com_view(fxo, IF_D3DXEFFECT) : 0;
-    if (!view) {
-        if (fxo)
-            com_release(fxo);
-        set_eax(c, E_NOTIMPLX);
-        return;
-    }
-    FxEffect &fx = effects()[fxo->id];
-    fx.self = fxo->id;
-    if (ComObj *pool = com_this(arg(c, 6)); pool && pool->kind == K_D3DXEFFECTPOOL)
-        fx.pool = pool->id;
-    ComObj *dev = com_this(device);
-    if (dev && dev->kind == K_D3D9DEVICE) {
-        fx.device = dev->id;
-        fxo->dev_d3d = dev->id;
-    }
-    char name[64];
-    if (resource > 0xffffu)
-        snprintf(name, sizeof name, "%s", gm_str(resource, 63).c_str());
-    else
-        snprintf(name, sizeof name, "#%u", resource);
-    fx.resource = name;
     uint32_t addr = 0, size = 0;
     if (!find_rcdata(module, resource, &addr, &size)) {
-        LOGW("d3dx9: effect %s: no RCDATA resource of that name in module %08x", name, module);
-    } else if (!fx_parse(gm_ptr(addr), size, fx)) {
-        LOGW("d3dx9: effect %s: %u bytes did not parse as fx_2_0", name, size);
-    } else {
-        size_t passes = 0, shaders = 0;
-        for (const FxTechnique &t : fx.techniques)
-            for (const FxPass &p : t.passes) {
-                ++passes;
-                shaders += pass_shader(fx, p, FXS_VERTEXSHADER) != nullptr;
-                shaders += pass_shader(fx, p, FXS_PIXELSHADER) != nullptr;
-            }
-        static uint32_t reported = 0;
-        if (++reported <= 64)
-            LOGV("d3dx9: effect %s: %zu parameters, %zu techniques, %zu passes, %zu shaders", name,
-                 fx.params.size(), fx.techniques.size(), passes, shaders);
+        LOGW("d3dx9: effect resource %08x: no RCDATA resource of that name in module %08x",
+             resource, module);
+        com_ret(c, D3DERR_INVALIDCALLX);
+        return;
     }
-    join_pool(fxo->id);
-    ++g_effect_generation;
-    com_out_ptr(out, view);
-    set_eax(c, D3D_OKX);
+    efx_create(c, dev, pool, flags, out, (const uint8_t *)gm_ptr(addr), size);
 }
 
 static const ImportShim g_d3dx9_exports[] = {
-    {"d3dx9_26.dll", "D3DXCreateEffectPool", 1, X_D3DXCreateEffectPool},
+    {"d3dx9_26.dll", "D3DXCreateEffectPool", 1, X_D3DX33CreateEffectPool},
     {"d3dx9_26.dll", "D3DXCreateEffectFromResourceA", 9, X_D3DXCreateEffectFromResourceA},
     {"d3dx9_26.dll", "D3DXMatrixMultiply", 3, X_D3DXMatrixMultiply},
     {"d3dx9_26.dll", "D3DXMatrixInverse", 3, X_D3DXMatrixInverse},
@@ -2046,18 +1999,6 @@ static const ImportShim g_d3dx9_exports[] = {
 #include "d3dx9_imports.inc"
 
 #ifdef RECOMP_D3D9_WGPU
-static bool d3dx9_wgpu_blocked(void (*fn)(X86 *)) {
-    return fn == X_D3DXCreateEffectPool || fn == X_D3DXCreateEffectFromResourceA;
-}
-
-static void d3dx9_register_exports(const ImportShim *shims, size_t count) {
-    std::vector<ImportShim> guarded(shims, shims + count);
-    for (ImportShim &shim : guarded)
-        if (d3dx9_wgpu_blocked(shim.fn))
-            shim.fn = imports_unsupported;
-    imports_register(guarded.data(), guarded.size());
-}
-
 static void d3dx9_define(ComIface iface, const char *dll, const char *name,
                          const ComMethod *methods, size_t count) {
     std::vector<ComMethod> guarded(methods, methods + count);
@@ -2067,10 +2008,6 @@ static void d3dx9_define(ComIface iface, const char *dll, const char *name,
     com_define(iface, dll, name, guarded.data(), guarded.size());
 }
 #else
-static void d3dx9_register_exports(const ImportShim *shims, size_t count) {
-    imports_register(shims, count);
-}
-
 static void d3dx9_define(ComIface iface, const char *dll, const char *name,
                          const ComMethod *methods, size_t count) {
     com_define(iface, dll, name, methods, count);
@@ -2114,6 +2051,6 @@ void d3dx9_register() {
     com_set_destructor(K_D3DXEFFECT, fx_destroy);
     com_set_destructor(K_D3DXEFFECTPOOL, d3dx_effect_pool_destroy);
     com_set_destructor(K_D3DXCONSTANTTABLE, d3dx_ctab_destroy);
-    d3dx9_register_exports(g_d3dx9_exports, std::size(g_d3dx9_exports));
-    d3dx9_register_exports(g_d3dx9_33_exports, std::size(g_d3dx9_33_exports));
+    imports_register(g_d3dx9_exports, std::size(g_d3dx9_exports));
+    imports_register(g_d3dx9_33_exports, std::size(g_d3dx9_33_exports));
 }

@@ -231,7 +231,9 @@ impl GpuContext {
         let requested = wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
             | wgpu::Features::TEXTURE_COMPRESSION_BC
             | wgpu::Features::TEXTURE_COMPRESSION_BC_SLICED_3D
-            | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
+            | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+            | wgpu::Features::POLYGON_MODE_LINE
+            | wgpu::Features::POLYGON_MODE_POINT;
         Self::from_adapter(adapter, None, None, requested).await
     }
 

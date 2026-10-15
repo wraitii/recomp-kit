@@ -115,8 +115,13 @@ const D3DCREATE_KNOWN: u32 = D3DCREATE_FPU_PRESERVE
 const D3DCREATE_VERTEXPROCESSING: u32 = D3DCREATE_SOFTWARE_VERTEXPROCESSING
     | D3DCREATE_HARDWARE_VERTEXPROCESSING
     | D3DCREATE_MIXED_VERTEXPROCESSING;
-const D3DCREATE_IMPLEMENTED: u32 =
-    D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_FPU_PRESERVE | D3DCREATE_NOWINDOWCHANGES;
+const D3DCREATE_IMPLEMENTED: u32 = D3DCREATE_VERTEXPROCESSING
+    | D3DCREATE_MULTITHREADED
+    | D3DCREATE_PUREDEVICE
+    | D3DCREATE_DISABLE_DRIVER_MANAGEMENT
+    | D3DCREATE_DISABLE_DRIVER_MANAGEMENT_EX
+    | D3DCREATE_FPU_PRESERVE
+    | D3DCREATE_NOWINDOWCHANGES;
 
 const D3DFMT_A8R8G8B8: u32 = 21;
 const D3DFMT_X8R8G8B8: u32 = 22;
@@ -129,7 +134,12 @@ const D3DPRESENTFLAG_KNOWN: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004 | 0x00
 
 const D3DPRESENT_INTERVAL_DEFAULT: u32 = 0x0000_0000;
 const D3DPRESENT_INTERVAL_ONE: u32 = 0x0000_0001;
+const D3DPRESENT_INTERVAL_TWO: u32 = 0x0000_0002;
+const D3DPRESENT_INTERVAL_THREE: u32 = 0x0000_0004;
+const D3DPRESENT_INTERVAL_FOUR: u32 = 0x0000_0008;
 const D3DPRESENT_INTERVAL_IMMEDIATE: u32 = 0x8000_0000;
+
+const D3DTEXF_LINEAR: u32 = 2;
 
 const D3DCAPS2_CANAUTOGENMIPMAP: u32 = 0x4000_0000;
 const D3DPTEXTURECAPS_ALPHA: u32 = 0x0000_0004;
@@ -138,8 +148,66 @@ const D3DPTEXTURECAPS_VOLUMEMAP: u32 = 0x0000_2000;
 const D3DPTEXTURECAPS_MIPMAP: u32 = 0x0000_4000;
 const D3DPTEXTURECAPS_MIPVOLUMEMAP: u32 = 0x0000_8000;
 const D3DPTEXTURECAPS_MIPCUBEMAP: u32 = 0x0001_0000;
-const D3DPTFILTERCAPS_POINTLINEAR: u32 = 0x0003_0303;
-const D3DPTADDRESSCAPS_WRAPMIRRORCLAMP: u32 = 0x0000_0007;
+const D3DPTEXTURECAPS_PERSPECTIVE: u32 = 0x0000_0001;
+const D3DPTEXTURECAPS_PROJECTED: u32 = 0x0000_0400;
+const D3DPTFILTERCAPS_MINFPOINT: u32 = 0x0000_0100;
+const D3DPTFILTERCAPS_MINFLINEAR: u32 = 0x0000_0200;
+const D3DPTFILTERCAPS_MINFANISOTROPIC: u32 = 0x0000_0400;
+const D3DPTFILTERCAPS_MIPFPOINT: u32 = 0x0001_0000;
+const D3DPTFILTERCAPS_MIPFLINEAR: u32 = 0x0002_0000;
+const D3DPTFILTERCAPS_MAGFPOINT: u32 = 0x0100_0000;
+const D3DPTFILTERCAPS_MAGFLINEAR: u32 = 0x0200_0000;
+const D3DPTFILTERCAPS_MAGFANISOTROPIC: u32 = 0x0400_0000;
+const D3DPTFILTERCAPS_SAMPLING: u32 = D3DPTFILTERCAPS_MINFPOINT
+    | D3DPTFILTERCAPS_MINFLINEAR
+    | D3DPTFILTERCAPS_MINFANISOTROPIC
+    | D3DPTFILTERCAPS_MIPFPOINT
+    | D3DPTFILTERCAPS_MIPFLINEAR
+    | D3DPTFILTERCAPS_MAGFPOINT
+    | D3DPTFILTERCAPS_MAGFLINEAR
+    | D3DPTFILTERCAPS_MAGFANISOTROPIC;
+const D3DPTADDRESSCAPS_WRAP: u32 = 0x0000_0001;
+const D3DPTADDRESSCAPS_MIRROR: u32 = 0x0000_0002;
+const D3DPTADDRESSCAPS_CLAMP: u32 = 0x0000_0004;
+const D3DPTADDRESSCAPS_BORDER: u32 = 0x0000_0008;
+const D3DPTADDRESSCAPS_INDEPENDENTUV: u32 = 0x0000_0010;
+const D3DPTADDRESSCAPS_ALL: u32 = D3DPTADDRESSCAPS_WRAP
+    | D3DPTADDRESSCAPS_MIRROR
+    | D3DPTADDRESSCAPS_CLAMP
+    | D3DPTADDRESSCAPS_BORDER
+    | D3DPTADDRESSCAPS_INDEPENDENTUV;
+const D3DPMISCCAPS_MASKZ: u32 = 0x0000_0002;
+const D3DPMISCCAPS_CULLNONE: u32 = 0x0000_0010;
+const D3DPMISCCAPS_CULLCW: u32 = 0x0000_0020;
+const D3DPMISCCAPS_CULLCCW: u32 = 0x0000_0040;
+const D3DPMISCCAPS_COLORWRITEENABLE: u32 = 0x0000_0080;
+const D3DPMISCCAPS_TSSARGTEMP: u32 = 0x0000_0400;
+const D3DPMISCCAPS_BLENDOP: u32 = 0x0000_0800;
+const D3DPMISCCAPS_SEPARATEALPHABLEND: u32 = 0x0002_0000;
+const D3DPRASTERCAPS_ZTEST: u32 = 0x0000_0010;
+const D3DPRASTERCAPS_FOGVERTEX: u32 = 0x0000_0080;
+const D3DPRASTERCAPS_FOGTABLE: u32 = 0x0000_0100;
+const D3DPRASTERCAPS_ANISOTROPY: u32 = 0x0002_0000;
+const D3DPRASTERCAPS_SLOPESCALEDEPTHBIAS: u32 = 0x0200_0000;
+const D3DPCMPCAPS_ALL: u32 = 0x0000_00ff;
+const D3DPBLENDCAPS_DEST: u32 = 0x0000_23ff;
+const D3DPBLENDCAPS_SRC: u32 = 0x0000_33ff;
+const D3DPSHADECAPS_COLORGOURAUDRGB: u32 = 0x0000_0008;
+const D3DPSHADECAPS_SPECULARGOURAUDRGB: u32 = 0x0000_0200;
+const D3DSTENCILCAPS_ALL: u32 = 0x0000_01ff;
+const D3DTEXOPCAPS_IMPLEMENTED: u32 = 0x0380_ffff;
+const D3DVTXPCAPS_TEXGEN: u32 = 0x0000_0001;
+const D3DVTXPCAPS_MATERIALSOURCE7: u32 = 0x0000_0002;
+const D3DVTXPCAPS_DIRECTIONALLIGHTS: u32 = 0x0000_0008;
+const D3DVTXPCAPS_POSITIONALLIGHTS: u32 = 0x0000_0010;
+const D3DVTXPCAPS_LOCALVIEWER: u32 = 0x0000_0020;
+const D3DPS20CAPS_ARBITRARYSWIZZLE: u32 = 0x0000_0001;
+const D3DPS20CAPS_NODEPENDENTREADLIMIT: u32 = 0x0000_0008;
+const D3DPS20CAPS_NOTEXINSTRUCTIONLIMIT: u32 = 0x0000_0010;
+const D3DUSAGE_QUERY_FILTER: u32 = 0x0002_0000;
+const D3DUSAGE_QUERY_SRGBWRITE: u32 = 0x0004_0000;
+const D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING: u32 = 0x0008_0000;
+const D3DUSAGE_QUERY_WRAPANDMIP: u32 = 0x0020_0000;
 const D3DVS_VERSION_2_0: u32 = 0xfffe_0200;
 const D3DPS_VERSION_2_0: u32 = 0xffff_0200;
 const D3D_MAX_PRIMITIVE_COUNT: u32 = 0x000f_ffff;
@@ -147,6 +215,7 @@ const D3D_MAX_VERTEX_INDEX: u32 = 0x000f_ffff;
 
 struct ImplicitTargets {
     target: OffscreenTarget,
+    presented: OffscreenTarget,
     format: u32,
     depth_format: u32,
 }
@@ -275,7 +344,6 @@ pub struct D3d9Device {
     loss: Option<Arc<D3d9Loss>>,
     targets: Option<ImplicitTargets>,
     resources: FastMap<u32, ResourceRegistration>,
-    creator_thread: u32,
     features: wgpu::Features,
     limits: wgpu::Limits,
     replacement: Option<(GpuContext, Arc<D3d9Loss>)>,
@@ -1268,7 +1336,6 @@ impl Default for D3d9Device {
             loss: None,
             targets: None,
             resources: FastMap::default(),
-            creator_thread: 0,
             features: wgpu::Features::empty(),
             limits: wgpu::Limits::default(),
             replacement: None,
@@ -1412,19 +1479,7 @@ fn validate_present_params(
         ));
     }
     match present.swap_effect {
-        D3DSWAPEFFECT_DISCARD => {}
-        D3DSWAPEFFECT_COPY => {
-            return Err(RenderError::new(
-                "D3DPRESENT_PARAMETERS",
-                "D3DSWAPEFFECT_COPY is not implemented; only D3DSWAPEFFECT_DISCARD",
-            ));
-        }
-        D3DSWAPEFFECT_FLIP => {
-            return Err(RenderError::new(
-                "D3DPRESENT_PARAMETERS",
-                "D3DSWAPEFFECT_FLIP is not implemented",
-            ));
-        }
+        D3DSWAPEFFECT_DISCARD | D3DSWAPEFFECT_FLIP | D3DSWAPEFFECT_COPY => {}
         other => {
             return Err(RenderError::invalid(
                 "D3DPRESENT_PARAMETERS",
@@ -1447,14 +1502,19 @@ fn validate_present_params(
             "multisample quality must be zero without multisampling",
         ));
     }
-    if present.presentation_interval != D3DPRESENT_INTERVAL_DEFAULT
-        && present.presentation_interval != D3DPRESENT_INTERVAL_ONE
-        && present.presentation_interval != D3DPRESENT_INTERVAL_IMMEDIATE
-    {
+    if !matches!(
+        present.presentation_interval,
+        D3DPRESENT_INTERVAL_DEFAULT
+            | D3DPRESENT_INTERVAL_ONE
+            | D3DPRESENT_INTERVAL_TWO
+            | D3DPRESENT_INTERVAL_THREE
+            | D3DPRESENT_INTERVAL_FOUR
+            | D3DPRESENT_INTERVAL_IMMEDIATE
+    ) {
         return Err(RenderError::new(
             "D3DPRESENT_PARAMETERS",
             format!(
-                "presentation interval {:#x} is not implemented; DEFAULT, ONE and IMMEDIATE are",
+                "presentation interval {:#x} is not a D3DPRESENT_INTERVAL",
                 present.presentation_interval
             ),
         ));
@@ -1566,8 +1626,10 @@ fn create_targets(
             depth_format,
         )?);
     }
+    let presented = gpu.create_target(present.width, present.height, present.format, 0)?;
     Ok(ImplicitTargets {
         target,
+        presented,
         format: present.format,
         depth_format,
     })
@@ -1636,16 +1698,6 @@ pub fn d3d9_create_device(
             "exactly one vertex processing D3DCREATE flag is required",
         );
     }
-    if vertex_processing != D3DCREATE_HARDWARE_VERTEXPROCESSING {
-        return fail(
-            &request.present,
-            StatusCode::Unsupported,
-            format!(
-                "D3DCREATE vertex processing flag {vertex_processing:#x} is not implemented; \
-                 only D3DCREATE_HARDWARE_VERTEXPROCESSING"
-            ),
-        );
-    }
     let extra = request.behavior_flags & !D3DCREATE_IMPLEMENTED;
     if extra != 0 {
         return fail(
@@ -1695,7 +1747,6 @@ pub fn d3d9_create_device(
         device.depth_target_id = u32::MAX;
         let _ = device.state.set_render_state(7, 1);
     }
-    device.creator_thread = request.thread_id;
     device.loss = Some(loss);
     device.targets = Some(targets);
     device.registry_epoch += 1;
@@ -2022,15 +2073,6 @@ pub fn d3d9_reset(device: &mut D3d9Device, request: &D3d9ResetRequest) -> D3d9Re
             ),
         );
     }
-    if request.thread_id != device.creator_thread {
-        return reset_fail(
-            request.present,
-            status(
-                StatusCode::InvalidArgument,
-                "Reset must be called from the thread that created the device",
-            ),
-        );
-    }
     if device.restore.is_some() {
         return reset_fail(
             request.present,
@@ -2347,21 +2389,12 @@ pub fn d3d9_abort_reset(device: &mut D3d9Device) -> Status {
     status(StatusCode::Ok, "")
 }
 
-pub fn d3d9_test_cooperative_level(device: &mut D3d9Device, thread_id: u32) -> ValueResult {
+pub fn d3d9_test_cooperative_level(device: &mut D3d9Device) -> ValueResult {
     if device.gpu.is_none() {
         return ValueResult {
             status: status(
                 StatusCode::InvalidArgument,
                 "D3D9 device is not initialized",
-            ),
-            value: 0,
-        };
-    }
-    if thread_id != device.creator_thread {
-        return ValueResult {
-            status: status(
-                StatusCode::InvalidArgument,
-                "TestCooperativeLevel must be called from the thread that created the device",
             ),
             value: 0,
         };
@@ -2409,7 +2442,51 @@ fn frame_fail(status: Status) -> D3d9FrameResult {
     }
 }
 
-fn prepare_present(device: &mut D3d9Device) -> Result<(), Status> {
+fn present_image(
+    device: &D3d9Device,
+    gpu: &D3d9Gpu,
+    src_rect: &[crate::bridge::D3d9Rect],
+    dst_rect: &[crate::bridge::D3d9Rect],
+) -> Result<bool, Status> {
+    if src_rect.is_empty() && dst_rect.is_empty() {
+        return Ok(false);
+    }
+    let src = map_rects(src_rect)?.into_iter().next();
+    let dst = map_rects(dst_rect)?.into_iter().next();
+    let backbuffer = resolve_target_view(device, 0, 0, 0, false).map_err(bridge_error)?;
+    let targets = device.targets.as_ref().expect("swap chain is initialized");
+    let presented = SurfaceView {
+        texture: targets.presented.texture.clone(),
+        view: targets.presented.view.clone(),
+        format: targets.format,
+        width: targets.presented.width,
+        height: targets.presented.height,
+        depth: 1,
+        cube: false,
+        volume: false,
+        subresource: (0, 0, 0),
+    };
+    let result = copy::stretch_rect(gpu, &backbuffer, src, &presented, dst, D3DTEXF_LINEAR);
+    let result = bridge_gpu_ok(gpu, result);
+    if result.code != StatusCode::Ok {
+        return Err(result);
+    }
+    Ok(true)
+}
+
+fn presented_target(targets: &ImplicitTargets, rects: bool) -> &OffscreenTarget {
+    if rects {
+        &targets.presented
+    } else {
+        &targets.target
+    }
+}
+
+fn prepare_present(
+    device: &mut D3d9Device,
+    src_rect: &[crate::bridge::D3d9Rect],
+    dst_rect: &[crate::bridge::D3d9Rect],
+) -> Result<bool, Status> {
     if device.gpu.is_none() {
         return Err(status(
             StatusCode::InvalidArgument,
@@ -2440,17 +2517,20 @@ fn prepare_present(device: &mut D3d9Device) -> Result<(), Status> {
     if result.code != StatusCode::Ok {
         return Err(result);
     }
-    Ok(())
+    present_image(device, &gpu, src_rect, dst_rect)
 }
 
-pub fn d3d9_present_handoff(device: &mut D3d9Device) -> crate::bridge::FrameHandoffResult {
-    let result = prepare_present(device).and_then(|()| {
+pub fn d3d9_present_handoff(
+    device: &mut D3d9Device,
+    src_rect: &[crate::bridge::D3d9Rect],
+    dst_rect: &[crate::bridge::D3d9Rect],
+) -> crate::bridge::FrameHandoffResult {
+    let result = prepare_present(device, src_rect, dst_rect).and_then(|rects| {
         let gpu = bridge_gpu(device).map_err(bridge_error)?;
-        let target = &device
-            .targets
-            .as_ref()
-            .expect("swap chain is initialized")
-            .target;
+        let target = presented_target(
+            device.targets.as_ref().expect("swap chain is initialized"),
+            rects,
+        );
         present::handoff(&mut device.present_ring, &gpu, target).map_err(|error| {
             if gpu.is_physical() {
                 status(StatusCode::DeviceLost, gpu.loss().physical_message())
@@ -2478,13 +2558,19 @@ pub fn d3d9_present_handoff(device: &mut D3d9Device) -> crate::bridge::FrameHand
     }
 }
 
-pub fn d3d9_present(device: &mut D3d9Device) -> D3d9FrameResult {
-    if let Err(status) = prepare_present(device) {
-        return frame_fail(status);
-    }
+pub fn d3d9_present(
+    device: &mut D3d9Device,
+    src_rect: &[crate::bridge::D3d9Rect],
+    dst_rect: &[crate::bridge::D3d9Rect],
+) -> D3d9FrameResult {
+    let rects = match prepare_present(device, src_rect, dst_rect) {
+        Ok(rects) => rects,
+        Err(status) => return frame_fail(status),
+    };
     let targets = device.targets.as_ref().expect("swap chain is initialized");
-    let width = targets.target.width;
-    let height = targets.target.height;
+    let target = presented_target(targets, rects);
+    let width = target.width;
+    let height = target.height;
     let mut bytes = Vec::new();
     let len = (width as usize)
         .saturating_mul(height as usize)
@@ -2497,7 +2583,7 @@ pub fn d3d9_present(device: &mut D3d9Device) -> D3d9FrameResult {
     }
     bytes.resize(len, 0);
     let gpu = device.gpu.as_ref().expect("device is initialized");
-    if let Err(error) = gpu.read_pixels_into(&targets.target, &mut bytes) {
+    if let Err(error) = gpu.read_pixels_into(target, &mut bytes) {
         if let Some(loss) = device.loss.as_ref().filter(|loss| loss.is_physical()) {
             return frame_fail(status(StatusCode::DeviceLost, loss.physical_message()));
         }
@@ -2716,34 +2802,81 @@ fn caps_image(probe: &D3d9Probe) -> Vec<u8> {
     put_u32(
         &mut caps,
         20,
-        D3DPRESENT_INTERVAL_IMMEDIATE | D3DPRESENT_INTERVAL_ONE,
+        D3DPRESENT_INTERVAL_IMMEDIATE
+            | D3DPRESENT_INTERVAL_ONE
+            | D3DPRESENT_INTERVAL_TWO
+            | D3DPRESENT_INTERVAL_THREE
+            | D3DPRESENT_INTERVAL_FOUR,
     );
     put_u32(&mut caps, 28, 0x0001_0000 | 0x0008_0000);
     put_u32(
         &mut caps,
+        32,
+        D3DPMISCCAPS_MASKZ
+            | D3DPMISCCAPS_CULLNONE
+            | D3DPMISCCAPS_CULLCW
+            | D3DPMISCCAPS_CULLCCW
+            | D3DPMISCCAPS_COLORWRITEENABLE
+            | D3DPMISCCAPS_TSSARGTEMP
+            | D3DPMISCCAPS_BLENDOP
+            | D3DPMISCCAPS_SEPARATEALPHABLEND,
+    );
+    put_u32(
+        &mut caps,
+        36,
+        D3DPRASTERCAPS_ZTEST
+            | D3DPRASTERCAPS_FOGVERTEX
+            | D3DPRASTERCAPS_FOGTABLE
+            | D3DPRASTERCAPS_ANISOTROPY
+            | D3DPRASTERCAPS_SLOPESCALEDEPTHBIAS,
+    );
+    put_u32(&mut caps, 40, D3DPCMPCAPS_ALL);
+    put_u32(&mut caps, 44, D3DPBLENDCAPS_SRC);
+    put_u32(&mut caps, 48, D3DPBLENDCAPS_DEST);
+    put_u32(&mut caps, 52, D3DPCMPCAPS_ALL);
+    put_u32(
+        &mut caps,
+        56,
+        D3DPSHADECAPS_COLORGOURAUDRGB | D3DPSHADECAPS_SPECULARGOURAUDRGB,
+    );
+    put_u32(
+        &mut caps,
         60,
         D3DPTEXTURECAPS_ALPHA
+            | D3DPTEXTURECAPS_PERSPECTIVE
+            | D3DPTEXTURECAPS_PROJECTED
             | D3DPTEXTURECAPS_CUBEMAP
             | D3DPTEXTURECAPS_VOLUMEMAP
             | D3DPTEXTURECAPS_MIPMAP
             | D3DPTEXTURECAPS_MIPVOLUMEMAP
             | D3DPTEXTURECAPS_MIPCUBEMAP,
     );
-    put_u32(&mut caps, 64, D3DPTFILTERCAPS_POINTLINEAR);
-    put_u32(&mut caps, 68, D3DPTFILTERCAPS_POINTLINEAR);
-    put_u32(&mut caps, 72, D3DPTFILTERCAPS_POINTLINEAR);
-    put_u32(&mut caps, 76, D3DPTADDRESSCAPS_WRAPMIRRORCLAMP);
-    put_u32(&mut caps, 80, D3DPTADDRESSCAPS_WRAPMIRRORCLAMP);
+    put_u32(&mut caps, 64, D3DPTFILTERCAPS_SAMPLING);
+    put_u32(&mut caps, 68, D3DPTFILTERCAPS_SAMPLING);
+    put_u32(&mut caps, 72, D3DPTFILTERCAPS_SAMPLING);
+    put_u32(&mut caps, 76, D3DPTADDRESSCAPS_ALL);
+    put_u32(&mut caps, 80, D3DPTADDRESSCAPS_ALL);
     put_u32(&mut caps, 88, probe.max_texture_dimension_2d);
     put_u32(&mut caps, 92, probe.max_texture_dimension_2d);
     put_u32(&mut caps, 96, probe.max_texture_dimension_3d);
     put_u32(&mut caps, 100, probe.max_texture_dimension_2d);
     put_u32(&mut caps, 104, probe.max_texture_dimension_2d);
-    put_u32(&mut caps, 108, 1);
+    put_u32(&mut caps, 108, 16);
+    put_u32(&mut caps, 136, D3DSTENCILCAPS_ALL);
+    put_u32(&mut caps, 140, 8);
+    put_u32(&mut caps, 144, D3DTEXOPCAPS_IMPLEMENTED);
     put_u32(&mut caps, 148, 8);
     put_u32(&mut caps, 152, 8);
+    put_u32(
+        &mut caps,
+        156,
+        D3DVTXPCAPS_TEXGEN
+            | D3DVTXPCAPS_MATERIALSOURCE7
+            | D3DVTXPCAPS_DIRECTIONALLIGHTS
+            | D3DVTXPCAPS_POSITIONALLIGHTS
+            | D3DVTXPCAPS_LOCALVIEWER,
+    );
     put_u32(&mut caps, 160, 8);
-    put_u32(&mut caps, 164, 6);
     put_u32(&mut caps, 180, D3D_MAX_PRIMITIVE_COUNT);
     put_u32(&mut caps, 184, D3D_MAX_VERTEX_INDEX);
     put_u32(&mut caps, 188, 16);
@@ -2754,6 +2887,21 @@ fn caps_image(probe: &D3d9Probe) -> Vec<u8> {
     put_u32(&mut caps, 232, 1);
     put_u32(&mut caps, 236, 0x1ffff);
     put_u32(&mut caps, 240, 1);
+    put_u32(
+        &mut caps,
+        244,
+        D3DPTFILTERCAPS_MINFPOINT | D3DPTFILTERCAPS_MINFLINEAR,
+    );
+    put_u32(&mut caps, 256, 32);
+    put_u32(
+        &mut caps,
+        264,
+        D3DPS20CAPS_ARBITRARYSWIZZLE
+            | D3DPS20CAPS_NODEPENDENTREADLIMIT
+            | D3DPS20CAPS_NOTEXINSTRUCTIONLIMIT,
+    );
+    put_u32(&mut caps, 272, 32);
+    put_u32(&mut caps, 280, 512);
     caps
 }
 
@@ -2895,6 +3043,37 @@ fn format_allows_render_target(probe: &D3d9Probe, fmt: u32) -> bool {
         .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
 }
 
+fn query_usage_supported(probe: &D3d9Probe, fmt: u32, resource_type: u32, query: u32) -> bool {
+    let Some(wgpu_format) = format::d3d_to_wgpu(fmt) else {
+        return false;
+    };
+    let flags = wgpu_format.guaranteed_format_features(probe.features).flags;
+    let render_target = format_allows_render_target(probe, fmt);
+    let answers = [
+        (
+            D3DUSAGE_QUERY_FILTER,
+            flags.contains(wgpu::TextureFormatFeatureFlags::FILTERABLE),
+        ),
+        (D3DUSAGE_QUERY_SRGBWRITE, render_target),
+        (
+            D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+            render_target && flags.contains(wgpu::TextureFormatFeatureFlags::BLENDABLE),
+        ),
+        (
+            D3DUSAGE_QUERY_WRAPANDMIP,
+            !format::is_depth(fmt)
+                && matches!(
+                    resource_type,
+                    resource::D3DRTYPE_TEXTURE
+                        | resource::D3DRTYPE_CUBETEXTURE
+                        | resource::D3DRTYPE_VOLUMETEXTURE
+                ),
+        ),
+    ];
+    let answered = answers.iter().fold(0, |mask, &(bit, _)| mask | bit);
+    (query & !answered) == 0 && answers.iter().all(|&(bit, ok)| query & bit == 0 || ok)
+}
+
 pub fn d3d9_check_device_type(request: &D3d9CheckDeviceTypeRequest) -> Status {
     if let Err(status) = check_adapter(request.adapter, request.device_type) {
         return status;
@@ -2950,12 +3129,6 @@ pub fn d3d9_check_device_format(request: &D3d9CheckDeviceFormatRequest) -> Statu
         Err(error) => return bridge_error(error),
     };
     let fmt = request.check_format;
-    if request.usage & resource::D3DUSAGE_QUERY_MASK != 0 {
-        return status(
-            StatusCode::NotAvailable,
-            "D3DUSAGE query capabilities are not implemented",
-        );
-    }
     if matches!(
         request.resource_type,
         resource::D3DRTYPE_VERTEXBUFFER | resource::D3DRTYPE_INDEXBUFFER
@@ -2989,6 +3162,13 @@ pub fn d3d9_check_device_format(request: &D3d9CheckDeviceFormatRequest) -> Statu
         return status(
             StatusCode::NotAvailable,
             format!("unknown D3DUSAGE bits {unknown:#x}"),
+        );
+    }
+    let query = request.usage & resource::D3DUSAGE_QUERY_MASK;
+    if !query_usage_supported(probe, fmt, request.resource_type, query) {
+        return status(
+            StatusCode::NotAvailable,
+            format!("D3DUSAGE query bits {query:#x} are not available for D3DFORMAT {fmt}"),
         );
     }
     let depth = format::is_depth(fmt);
@@ -3218,6 +3398,12 @@ pub fn d3d9_check_depth_stencil_match(request: &D3d9CheckDepthStencilRequest) ->
 pub fn d3d9_check_device_format_conversion(request: &D3d9CheckFormatConversionRequest) -> Status {
     if let Err(status) = check_adapter(request.adapter, request.device_type) {
         return status;
+    }
+    if request.source_format == request.destination_format
+        && format::is_supported(request.source_format)
+        && !format::is_block(request.source_format)
+    {
+        return status(StatusCode::Ok, "");
     }
     status(
         StatusCode::NotAvailable,
@@ -3912,7 +4098,7 @@ fn flush_draws(device: &mut D3d9Device) -> Result<(), RenderError> {
 }
 
 fn flush_draws_with_gpu(device: &mut D3d9Device, gpu: &D3d9Gpu) -> Result<(), RenderError> {
-    draw::flush(gpu, &mut device.draw)
+    draw::flush(gpu, &mut device.draw, &mut device.queries)
 }
 
 fn device_gpu(device: &D3d9Device) -> Result<D3d9Gpu, Status> {
@@ -4552,6 +4738,7 @@ fn dispatch_draw(device: &mut D3d9Device, command: draw::DrawCommand) -> Result<
     draw::execute(
         &gpu,
         &mut device.draw,
+        &mut device.queries,
         &device.state,
         &device.objects,
         &snapshot,
@@ -4820,6 +5007,7 @@ pub fn d3d9_clear(
         draw::clear(
             &gpu,
             &mut device.draw,
+            &mut device.queries,
             &target,
             depth.as_ref(),
             flags,
@@ -5386,7 +5574,11 @@ pub fn d3d9_color_fill(
 }
 
 pub fn d3d9_create_query(device: &mut D3d9Device, kind: u32) -> ValueResult {
-    match device.queries.create(kind) {
+    let gpu = match device_gpu(device) {
+        Ok(gpu) => gpu,
+        Err(status) => return ValueResult { status, value: 0 },
+    };
+    match device.queries.create(&gpu, kind) {
         Ok(handle) => ValueResult {
             status: status(StatusCode::Ok, ""),
             value: handle,

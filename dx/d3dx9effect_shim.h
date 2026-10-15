@@ -6,6 +6,8 @@ struct X86;
 
 void X_D3DXCreateEffectFromFileA(X86 *c);
 void X_D3DX33CreateEffectPool(X86 *c);
+void efx_create(X86 *c, ComObj *dev, uint32_t pool, uint32_t flags, uint32_t out,
+                const uint8_t *bytes, size_t size);
 
 void Efx_GetDesc(X86 *c);
 void Efx_GetParameterDesc(X86 *c);
@@ -22,6 +24,7 @@ void Efx_GetPassByName(X86 *c);
 void Efx_GetAnnotation(X86 *c);
 void Efx_GetAnnotationByName(X86 *c);
 void Efx_SetValue(X86 *c);
+void Efx_SetRawValue(X86 *c);
 void Efx_GetValue(X86 *c);
 void Efx_SetBool(X86 *c);
 void Efx_GetBool(X86 *c);

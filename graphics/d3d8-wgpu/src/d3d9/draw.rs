@@ -1,6 +1,7 @@
 use super::gpu::{D3d9Gpu, PendingClear};
+use super::query::D3d9Queries;
 use super::shader::VertexElement;
-use super::state::{D3d9State, MAX_SAMPLERS};
+use super::state::{D3d9State, MAX_ANISOTROPY, MAX_SAMPLERS};
 use super::{SurfaceView, TargetRect, wgsl};
 use crate::RenderError;
 use crate::fast_map::FastMap;
@@ -1777,6 +1778,7 @@ fn blend_state(state: &D3d9State, opaque: bool) -> Result<Option<wgpu::BlendStat
     }))
 }
 fn sampler(
+    gpu: &D3d9Gpu,
     state: &D3d9State,
     t: &BoundTexture,
 ) -> Result<(SamplerKey, wgpu::SamplerDescriptor<'static>), RenderError> {
@@ -1785,6 +1787,21 @@ fn sampler(
             1 => wgpu::AddressMode::Repeat,
             2 => wgpu::AddressMode::MirrorRepeat,
             3 => wgpu::AddressMode::ClampToEdge,
+            4 if gpu
+                .features()
+                .contains(wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER) =>
+            {
+                wgpu::AddressMode::ClampToBorder
+            }
+            4 => {
+                return Err(unsupported(
+                    "Draw",
+                    format!(
+                        "sampler {} border address mode requires ADDRESS_MODE_CLAMP_TO_BORDER",
+                        t.stage
+                    ),
+                ));
+            }
             v => {
                 return Err(unsupported(
                     "Draw",
@@ -1822,6 +1839,36 @@ fn sampler(
     } else {
         t.levels.saturating_sub(1) as f32
     };
+    let anisotropic = [5, 6].iter().any(|&id| ss(state, t.stage, id) == 3);
+    let mipmap_filter = filter(7)?;
+    let (mag_filter, min_filter) = if anisotropic {
+        (wgpu::FilterMode::Linear, wgpu::FilterMode::Linear)
+    } else {
+        (filter(5)?, filter(6)?)
+    };
+    let anisotropy_clamp = if anisotropic && mipmap_filter == wgpu::FilterMode::Linear {
+        ss(state, t.stage, 10).clamp(1, MAX_ANISOTROPY) as u16
+    } else {
+        1
+    };
+    let border_color = if [1, 2, 3].iter().any(|&id| ss(state, t.stage, id) == 4) {
+        Some(match ss(state, t.stage, 4) {
+            0x0000_0000 => wgpu::SamplerBorderColor::TransparentBlack,
+            0xff00_0000 => wgpu::SamplerBorderColor::OpaqueBlack,
+            0xffff_ffff => wgpu::SamplerBorderColor::OpaqueWhite,
+            v => {
+                return Err(unsupported(
+                    "Draw",
+                    format!(
+                        "sampler {} border color {v:#010x} is not implemented",
+                        t.stage
+                    ),
+                ));
+            }
+        })
+    } else {
+        None
+    };
     let key = SamplerKey {
         address: [
             ss(state, t.stage, 1),
@@ -1833,6 +1880,8 @@ fn sampler(
             ss(state, t.stage, 6),
             ss(state, t.stage, 7),
         ],
+        anisotropy: anisotropy_clamp,
+        border: border_color,
         lod_min: lod_min.to_bits(),
         lod_max: lod_max.to_bits(),
         depth: t.depth,
@@ -1844,11 +1893,13 @@ fn sampler(
             address_mode_u: address(1)?,
             address_mode_v: address(2)?,
             address_mode_w: address(3)?,
-            mag_filter: filter(5)?,
-            min_filter: filter(6)?,
-            mipmap_filter: filter(7)?,
+            mag_filter,
+            min_filter,
+            mipmap_filter,
             lod_min_clamp: lod_min,
             lod_max_clamp: lod_max,
+            anisotropy_clamp,
+            border_color,
             compare: if t.depth {
                 Some(wgpu::CompareFunction::LessEqual)
             } else {
@@ -1992,6 +2043,8 @@ struct CachedShaderSource {
 struct SamplerKey {
     address: [u32; 3],
     filters: [u32; 3],
+    anisotropy: u16,
+    border: Option<wgpu::SamplerBorderColor>,
     lod_min: u32,
     lod_max: u32,
     depth: bool,
@@ -2685,7 +2738,7 @@ fn resolve_shading(
         .collect();
     let mut bindings = Vec::with_capacity(textures.len());
     for texture in &textures {
-        let (key, descriptor) = sampler(state, texture)?;
+        let (key, descriptor) = sampler(gpu, state, texture)?;
         bindings.push(PendingTexture {
             stage: texture.stage,
             view: texture.view.clone(),
@@ -2700,13 +2753,18 @@ fn resolve_shading(
     let ps_count = ps.map(|p| p.program.const_limit()).unwrap_or(1);
     let mut texture_layouts = [None; MAX_SAMPLERS];
     for t in &textures {
-        let format = super::format::d3d_to_wgpu(t.format)
+        let format = super::format::device_format(t.format, gpu.features())
             .ok_or_else(|| unsupported("Draw", "texture format"))?;
         let filterable = format
             .guaranteed_format_features(gpu.features())
             .flags
             .contains(wgpu::TextureFormatFeatureFlags::FILTERABLE);
-        if !t.depth && !filterable && [5, 6, 7].iter().any(|&id| ss(state, t.stage, id) == 2) {
+        if !t.depth
+            && !filterable
+            && [5, 6, 7]
+                .iter()
+                .any(|&id| matches!(ss(state, t.stage, id), 2 | 3))
+        {
             return Err(unsupported(
                 "Draw",
                 format!("non-filterable sampler format {}", t.format),
@@ -2744,9 +2802,31 @@ fn resolve_shading(
     }))
 }
 
+fn fill_mode(gpu: &D3d9Gpu, state: &D3d9State) -> Result<wgpu::PolygonMode, RenderError> {
+    let (mode, feature) = match rs(state, 8) {
+        1 => (wgpu::PolygonMode::Point, wgpu::Features::POLYGON_MODE_POINT),
+        2 => (wgpu::PolygonMode::Line, wgpu::Features::POLYGON_MODE_LINE),
+        3 => return Ok(wgpu::PolygonMode::Fill),
+        v => {
+            return Err(unsupported(
+                "Draw",
+                format!("D3DRS_FILLMODE value {v} is not implemented"),
+            ));
+        }
+    };
+    if !gpu.features().contains(feature) {
+        return Err(unsupported(
+            "Draw",
+            format!("D3DRS_FILLMODE value {} requires {feature:?}", rs(state, 8)),
+        ));
+    }
+    Ok(mode)
+}
+
 pub(crate) fn execute(
     gpu: &D3d9Gpu,
     draw: &mut D3d9DrawState,
+    queries: &mut D3d9Queries,
     state: &D3d9State,
     objects: &super::shader::D3d9Objects,
     snapshot: &DrawSnapshot,
@@ -2761,7 +2841,6 @@ pub(crate) fn execute(
         ));
     }
     for (id, default) in [
-        (8, 3),
         (48, 0),
         (136, 1),
         (163, 0),
@@ -3072,6 +3151,7 @@ pub(crate) fn execute(
                         strip_index_format,
                         front_face: wgpu::FrontFace::Cw,
                         cull_mode: cull,
+                        polygon_mode: fill_mode(gpu, state)?,
                         ..Default::default()
                     },
                     depth: depth_state(state, snapshot.depth.as_ref())?,
@@ -3093,7 +3173,7 @@ pub(crate) fn execute(
         || draw.batch.depth.as_ref().map(|(view, _)| view)
             != snapshot.depth.as_ref().map(|depth| &depth.view)
     {
-        flush(gpu, draw)?;
+        flush(gpu, draw, queries)?;
     }
     if draw.batch.draws.is_empty() {
         draw.batch.color_view = Some(snapshot.target.view.clone());
@@ -3171,7 +3251,7 @@ pub(crate) fn execute(
     let estimated = estimate_size(draw.batch.data.len(), shared_uniforms)
         .ok_or_else(|| invalid("Draw", "draw upload size overflow"))?;
     if estimated > upload_limit && !draw.batch.draws.is_empty() {
-        flush(gpu, draw)?;
+        flush(gpu, draw, queries)?;
         shared_uniforms = [None; 4];
     }
     let estimated = estimate_size(draw.batch.data.len(), shared_uniforms)
@@ -3291,10 +3371,10 @@ pub(crate) fn execute(
     draw.linked = linked_inputs;
     draw.ff_uniforms = ff_uniforms;
     if draw.batch.data.len() >= 32 << 20 {
-        flush(gpu, draw)?;
+        flush(gpu, draw, queries)?;
     }
     if super::trace_enabled() {
-        flush(gpu, draw)?;
+        flush(gpu, draw, queries)?;
         static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if count < super::trace_draw_limit()
@@ -3329,11 +3409,15 @@ pub(crate) fn execute(
     Ok(())
 }
 
-pub(crate) fn flush(gpu: &D3d9Gpu, draw: &mut D3d9DrawState) -> Result<(), RenderError> {
+pub(crate) fn flush(
+    gpu: &D3d9Gpu,
+    draw: &mut D3d9DrawState,
+    queries: &mut D3d9Queries,
+) -> Result<(), RenderError> {
     if draw.batch.draws.is_empty() {
         return Ok(());
     }
-    match gpu.validate("DrawFlush", || flush_inner(gpu, draw)) {
+    match gpu.validate("DrawFlush", || flush_inner(gpu, draw, queries)) {
         Ok(()) => Ok(()),
         Err(error) => {
             draw.discard_batch();
@@ -3342,10 +3426,22 @@ pub(crate) fn flush(gpu: &D3d9Gpu, draw: &mut D3d9DrawState) -> Result<(), Rende
     }
 }
 
-fn flush_inner(gpu: &D3d9Gpu, draw: &mut D3d9DrawState) -> Result<(), RenderError> {
+fn flush_inner(
+    gpu: &D3d9Gpu,
+    draw: &mut D3d9DrawState,
+    queries: &mut D3d9Queries,
+) -> Result<(), RenderError> {
     if draw.batch.draws.is_empty() {
         return Ok(());
     }
+    let area = draw
+        .batch
+        .draws
+        .iter()
+        .map(|pending| u64::from(pending.viewport.width) * u64::from(pending.viewport.height))
+        .max()
+        .unwrap_or(0);
+    let segment = queries.open_segment(area)?;
     let needed = draw.batch.data.len().max(4) as u64;
     if needed > gpu.limits().max_buffer_size || needed > u32::MAX as u64 {
         return Err(RenderError::out_of_memory(
@@ -3483,8 +3579,11 @@ fn flush_inner(gpu: &D3d9Gpu, draw: &mut D3d9DrawState) -> Result<(), RenderErro
                 color_attachments: &colors,
                 depth_stencil_attachment: depth,
                 timestamp_writes: None,
-                occlusion_query_set: None,
+                occlusion_query_set: segment.and(queries.occlusion_set()),
             });
+            if let Some(index) = segment {
+                pass.begin_occlusion_query(index);
+            }
             let mut cached_viewport = None;
             let mut cached_stencil = None;
             let mut cached_blend = None;
@@ -3572,6 +3671,9 @@ fn flush_inner(gpu: &D3d9Gpu, draw: &mut D3d9DrawState) -> Result<(), RenderErro
                     pass.draw(0..pending.vertex_count, 0..1);
                 }
             }
+            if segment.is_some() {
+                pass.end_occlusion_query();
+            }
         },
     );
     bind_groups.clear();
@@ -3587,6 +3689,7 @@ fn flush_inner(gpu: &D3d9Gpu, draw: &mut D3d9DrawState) -> Result<(), RenderErro
 pub(crate) fn clear(
     gpu: &D3d9Gpu,
     draw: &mut D3d9DrawState,
+    queries: &mut D3d9Queries,
     target: &SurfaceView,
     depth: Option<&SurfaceView>,
     flags: u32,
@@ -3619,7 +3722,7 @@ pub(crate) fn clear(
     if rects.is_empty() {
         return Ok(());
     }
-    flush(gpu, draw)?;
+    flush(gpu, draw, queries)?;
     let depth = depth.filter(|_| flags & 6 != 0);
     let full_color = flags & 1 == 0 || !target.texture.format().is_srgb();
     let full_rect = rects.len() == 1

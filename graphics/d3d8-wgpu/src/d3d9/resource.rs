@@ -751,7 +751,7 @@ fn allocates_gpu(gpu: &D3d9Gpu, pool: u32) -> bool {
 fn texture_wgpu_usage(format: u32, usage: u32, autogen: bool) -> wgpu::TextureUsages {
     let depth_format = format::is_depth(format);
     let mut out = wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC;
-    if !depth_format {
+    if !depth_format || format::sampleable_depth(format) {
         out |= wgpu::TextureUsages::TEXTURE_BINDING;
     }
     if usage & D3DUSAGE_RENDERTARGET != 0 || depth_format || autogen {
@@ -1037,13 +1037,14 @@ pub fn create_texture(
             && !gpu
                 .features()
                 .contains(wgpu::Features::TEXTURE_COMPRESSION_BC_SLICED_3D)
+            && !format::needs_bc_decode(request.format, gpu.features())
         {
             return Err(unsupported(
                 "CreateTexture",
                 "compressed volume textures need TEXTURE_COMPRESSION_BC_SLICED_3D",
             ));
         }
-        let wgpu_format = format::d3d_to_wgpu(request.format)
+        let wgpu_format = format::device_format(request.format, gpu.features())
             .ok_or_else(|| unsupported("CreateTexture", "unsupported texture format"))?;
         let features = wgpu_format.guaranteed_format_features(gpu.features());
         if request.usage & D3DUSAGE_RENDERTARGET != 0 || depth_stencil || autogen {
@@ -1058,7 +1059,7 @@ pub fn create_texture(
             }
         }
     }
-    let wgpu_format = format::d3d_to_wgpu(request.format)
+    let wgpu_format = format::device_format(request.format, gpu.features())
         .ok_or_else(|| unsupported("CreateTexture", "unsupported texture format"))?;
     let texture = if allocates_gpu(gpu, request.pool) {
         let layers = texture_layer_count(request.kind, request.depth);
@@ -1238,6 +1239,12 @@ pub fn create_surface(
         )?;
     }
     let texture = if allocates_gpu(gpu, request.pool) {
+        if format::needs_bc_decode(request.format, gpu.features()) {
+            return Err(unsupported(
+                "CreateSurface",
+                "compressed surfaces need TEXTURE_COMPRESSION_BC",
+            ));
+        }
         let wgpu_format = format::d3d_to_wgpu(request.format)
             .ok_or_else(|| unsupported("CreateSurface", "unsupported surface format"))?;
         Some(gpu.create_texture(
@@ -1324,6 +1331,22 @@ pub fn level_descriptor(
     Ok((l.width, l.height, l.depth, levels))
 }
 
+fn upload_texels(
+    gpu: &D3d9Gpu,
+    fmt: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    src: &[u8],
+) -> Result<(u32, Vec<u8>), RenderError> {
+    if format::needs_bc_decode(fmt, gpu.features()) {
+        let decoded = format::decode_bc_level(fmt, width, height, depth, src)?;
+        Ok((format::D3DFMT_A8B8G8R8, decoded))
+    } else {
+        Ok((fmt, format::upload_bytes(fmt, width, height, depth, src)?))
+    }
+}
+
 pub fn upload_level(
     gpu: &D3d9Gpu,
     resource: &mut D3d9Resource,
@@ -1400,12 +1423,12 @@ pub fn upload_level(
             };
             gpu.write_depth32(texture, width, height, &bytes)?;
         } else {
-            let converted = {
+            let (target, converted) = {
                 let l = &t.subresources[index];
-                format::upload_bytes(format, width, height, depth, &l.bytes)?
+                upload_texels(gpu, format, width, height, depth, &l.bytes)?
             };
             gpu.write_texture(
-                texture, format, level, width, height, depth, layer, is_3d, &converted,
+                texture, target, level, width, height, depth, layer, is_3d, &converted,
             )?;
         }
         let l = &mut t.subresources[index];
@@ -1569,7 +1592,7 @@ fn stage_texture(gpu: &D3d9Gpu, t: &TextureState) -> Result<StagedStorage, Rende
             ));
         }
     }
-    let wgpu_format = format::d3d_to_wgpu(t.format)
+    let wgpu_format = format::device_format(t.format, gpu.features())
         .ok_or_else(|| unsupported("Reset", "unsupported texture format"))?;
     let layers = texture_layer_count(t.kind, t.depth);
     let texture = gpu.create_texture(
@@ -1653,10 +1676,10 @@ fn upload_staged_texture(
                 let floats = bytes_to_f32(&l.bytes)?;
                 gpu.write_depth32(texture, l.width, l.height, &floats)?;
             } else {
-                let converted =
-                    format::upload_bytes(t.format, l.width, l.height, l.depth, &l.bytes)?;
+                let (target, converted) =
+                    upload_texels(gpu, t.format, l.width, l.height, l.depth, &l.bytes)?;
                 gpu.write_texture(
-                    texture, t.format, level, l.width, l.height, l.depth, layer, is_3d, &converted,
+                    texture, target, level, l.width, l.height, l.depth, layer, is_3d, &converted,
                 )?;
             }
         }
