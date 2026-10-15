@@ -28,13 +28,11 @@ const char *const hats[] = {"D-pad up", "D-pad right", "D-pad down", "D-pad left
 const uint16_t bits[] = {kPadCross, kPadCircle, kPadSquare, kPadTriangle, kPadL1,    kPadR1, kPadL2,
                          kPadR2,    kPadL3,     kPadR3,     kPadSelect,   kPadStart, kPadPs};
 const uint8_t hat_bits[] = {kHatUp, kHatRight, kHatDown, kHatLeft};
-const char *const presets[] = {"Standard controller", "Centered sticks",
-                               "Separate triggers / pedals", "Combined triggers / pedals",
-                               "Built-in keyboard mapping"};
+const char *const presets[] = {"Standard controller", "Combined triggers / pedals",
+                               "Built-in keyboard / mouse"};
+constexpr int kPresetCount = sizeof(presets) / sizeof(presets[0]);
 const char *const preset_help[] = {
     "Pass sticks, triggers, buttons and D-pad through to the game controller.",
-    "Use centered stick axes with standard controller outputs.",
-    "Keep left and right triggers on separate output axes.",
     "Combine the two triggers into opposite halves of one output axis.",
     "Use this game's built-in controller-to-keyboard and mouse bindings."};
 float axis(const PadState &p, int i) {
@@ -88,8 +86,8 @@ bool active(const PadState &p, int source) {
 } // namespace
 
 void PadMapperEditor::open(const PadMapperProfile &profile, const Screen &screen) {
-    profile_ = profile;
-    original_ = serialize_pad_mapper_profile(profile);
+    profile_ = pad_mapper_with_controller_output(profile);
+    original_ = serialize_pad_mapper_profile(profile_);
     screen_ = screen;
     page_ = Page::Overview;
     popup_ = Popup::None;
@@ -98,7 +96,7 @@ void PadMapperEditor::open(const PadMapperProfile &profile, const Screen &screen
     validation_error_.clear();
     open_ = true;
     close_requested_ = false;
-    advanced_ = shift_ = sweep_ = center_capture_ = false;
+    keyboard_ = advanced_ = shift_ = sweep_ = center_capture_ = false;
     selected_ = group_ = scroll_ = detail_scroll_ = 0;
     focus_ = 1;
     pressed_ = -1;
@@ -146,7 +144,7 @@ void PadMapperEditor::add_key(int x, int y, int w, int h, const std::string &lab
     d.kind = Kind::Key;
     d.rect = {x, y, w, h};
     d.label = label;
-    d.text_scale = std::max(1, int(std::lround(screen_.scale))) * 2;
+    d.text_scale = std::max(1, int(std::lround(screen_.scale)));
     d.lit = lit;
     d.focused = focus_ == id;
     frame_.toolbar.push_back(d);
@@ -229,23 +227,18 @@ ControlsView PadMapperEditor::view(const Screen &screen, const PadState &raw,
         add_text(x, y, width, height, s, muted, text_scale);
     };
     add_text(m, m, w - 2 * m, px(24), "Controller setup", false, 2 * text_scale);
-    text(m, px(46), w - 2 * m, px(22),
-         connected_ ? "Connected: " + device_
-                    : "No controller detected. Connect a supported controller to test its inputs.");
-    const int tab_w = (w - 2 * m - 2 * gap) / 3;
+    text(m, px(46), w - 2 * m, px(22), connected_ ? device_ : "No controller connected");
+    const int tab_w = std::min(px(148), (w - 2 * m - 2 * gap) / 3);
     const char *tabs[] = {"Overview", "Mapping", "Calibration"};
     for (int i = 0; i < 3; ++i)
-        add_key(m + i * (tab_w + gap), px(72), tab_w, row, tabs[i], int(page_) == i, i + 1);
-    const int top = px(151), bottom = h - px(110), body_h = bottom - top;
+        add_key(m + i * (tab_w + gap), px(76), tab_w, row, tabs[i], int(page_) == i, i + 1);
+    const int top = px(154), bottom = h - px(76), body_h = bottom - top;
     const bool dirty = serialize_pad_mapper_profile(profile_) != original_;
-    text(m, h - px(94), w - 2 * m, px(25),
-         dirty ? "Unsaved changes. Save to use this profile next time you play."
-               : "No changes. This profile applies to this game, across connected controllers.");
-    const int footer_y = h - px(64), button_w = px(152);
+    const int footer_y = h - px(52), button_w = px(100);
     add_key(w - m - 2 * button_w - gap, footer_y, button_w, row, "Cancel", false, 11);
-    add_key(w - m - button_w, footer_y, button_w, row, "Save changes", dirty, 10);
-    text(m, footer_y + px(8), std::max(px(80), w - 3 * m - 2 * button_w - gap), px(24),
-         "Tab: focus   Enter: choose   Esc: back");
+    add_key(w - m - button_w, footer_y, button_w, row, "Save", dirty, 10);
+    if (dirty)
+        text(m, footer_y + px(8), w - 3 * m - 2 * button_w - gap, px(22), "Unsaved changes");
     std::string message = validation_error_.empty() ? status : validation_error_;
     if (capture_ == Capture::Identify)
         message = "Move one stick or trigger, or press a button. Esc stops identifying.";
@@ -256,47 +249,27 @@ ControlsView PadMapperEditor::view(const Screen &screen, const PadState &raw,
     else if (sweep_)
         message = "Move this input through its full travel, then choose Finish range. Cancel "
                   "capture restores it.";
-    if (message.empty())
-        message =
-            page_ == Page::Overview
-                ? "Test your controller here. Choose Mapping to change what an input sends."
-            : page_ == Page::Mapping
-                ? "Select a physical input on the left. Set what it sends to the game on the right."
-                : "Select an axis. Adjust only if it drifts, moves the wrong way, or cannot reach "
-                  "full range.";
-    text(m, px(114), w - 2 * m, px(31), message, false);
+    if (!message.empty())
+        text(m, px(114), w - 2 * m, px(34), message, false);
 
     if (page_ == Page::Overview) {
         const int col = (w - 2 * m - gap) / 2, right = m + col + gap;
-        text(m, top, col, px(22), "What this controller sends", false);
-        add_key(m, top + px(26), col, row,
-                profile_.native_enabled ? "Controller output: On" : "Controller output: Off",
-                profile_.native_enabled, 14);
-        text(m, top + px(64), col, px(35),
-             "Expose a controller to the game. Use the game's own options to assign gameplay "
-             "actions.");
-        add_key(m, top + px(107), col, row,
-                profile_.legacy_mapped ? "Built-in keyboard / mouse: On"
-                                       : "Built-in keyboard / mouse: Off",
-                profile_.legacy_mapped, 15);
-        text(m, top + px(145), col, px(36),
-             "Use this game's supplied key and mouse bindings. Custom key assignments work "
-             "independently.");
-        add_key(m, top + px(190), col, row, "Choose a starting preset...", false, 12);
-        text(m, top + px(228), col, std::max(px(22), body_h - px(228)),
-             "Presets replace the draft after confirmation. Existing profiles are kept until you "
-             "save.");
-        text(right, top, col, px(22), "Live physical inputs", false);
+        text(m, top, col, px(22), "Controller mappings", false);
+        text(m, top + px(30), col, px(46),
+             "Change controller outputs and add keyboard keys in Mapping.");
+        if (profile_.legacy_mapped)
+            text(m, top + px(86), col, px(46), "Built-in keyboard / mouse preset active.");
+        add_key(m, top + px(148), px(148), row, "Presets...", false, 12);
+        text(right, top, col, px(22), "Test controller", false);
         for (int i = 0; i < 6; ++i)
-            add_meter(right, top + px(26) + i * px(28), col, px(22),
-                      std::string(axes[i]) + "  " + number(axis(raw, i)), axis(raw, i), i < 4);
-        text(right, top + px(204), col, px(38), "Press a button to identify it:", true);
+            add_meter(right, top + px(26) + i * px(28), col, px(22), axes[i], axis(raw, i), i < 4);
+
         std::string held;
         for (int i = 6; i < 23; ++i)
             if (active(raw, i))
                 held += (held.empty() ? "" : ", ") + source_name(i);
-        text(right, top + px(228), col, std::max(px(22), body_h - px(228)),
-             held.empty() ? "No buttons pressed" : held, false);
+        text(right, top + px(204), col, std::max(px(22), body_h - px(204)),
+             held.empty() ? "Press a button or move a stick to test." : held, false);
     } else {
         const int side_w = std::min(px(208), (w - 2 * m) / 3), x = m + side_w + gap,
                   content_w = w - m - x;
@@ -336,15 +309,15 @@ ControlsView PadMapperEditor::view(const Screen &screen, const PadState &raw,
             const int y = detail_top + (index++ - detail_scroll_) * px(35);
             if (y < detail_top || y + row > detail_bottom)
                 return;
-            const int label_w = content_w * 44 / 100;
+            const int label_w = std::min(px(170), content_w * 44 / 100);
             text(x, y + px(8), label_w - gap, row - px(8), label, false);
-            const int value_x = x + label_w, value_w = content_w - label_w;
+            const int value_x = x + label_w, value_w = std::min(px(260), content_w - label_w);
             if (minus) {
                 const int small = px(28);
                 add_key(value_x, y, small, row, "-", false, minus);
                 text(value_x + small + gap, y + px(8), value_w - 2 * (small + gap), row - px(8),
                      value, false);
-                add_key(x + content_w - small, y, small, row, "+", false, plus);
+                add_key(value_x + value_w - small, y, small, row, "+", false, plus);
             } else if (id)
                 add_key(value_x, y, value_w, row, value, false, id);
             else
@@ -358,22 +331,26 @@ ControlsView PadMapperEditor::view(const Screen &screen, const PadState &raw,
         if (page_ == Page::Mapping) {
             if (selected_ < 6) {
                 const AxisBinding &b = profile_.axis_bindings[size_t(selected_)];
-                line("Controller axis",
+                line("Controller output",
                      b.guest_axis == MapperAxis::None ? "None" : axes[int(b.guest_axis) - 1], 200);
                 const AxisCalibration &calibration = profile_.axes[size_t(selected_)];
-                if (calibration.mode == MapperAxisMode::Centered) {
-                    const char *negative = selected_ < 4
-                                               ? (selected_ % 2 ? "Move up: key" : "Move left: key")
-                                               : "Low end: key";
-                    const char *positive =
-                        selected_ < 4 ? (selected_ % 2 ? "Move down: key" : "Move right: key")
-                                      : "High end: key";
-                    line(calibration.inverted ? positive : negative, key_name(b.negative_key), 201);
-                    line(calibration.inverted ? negative : positive, key_name(b.positive_key), 202);
+                if (keyboard_ || b.negative_key || b.positive_key) {
+                    if (calibration.mode == MapperAxisMode::Centered) {
+                        const char *negative =
+                            selected_ < 4 ? (selected_ % 2 ? "Move up: key" : "Move left: key")
+                                          : "Low end: key";
+                        const char *positive =
+                            selected_ < 4 ? (selected_ % 2 ? "Move down: key" : "Move right: key")
+                                          : "High end: key";
+                        line(calibration.inverted ? positive : negative, key_name(b.negative_key),
+                             201);
+                        line(calibration.inverted ? negative : positive, key_name(b.positive_key),
+                             202);
+                    } else
+                        line("Key past half travel", key_name(b.positive_key), 202);
                 } else
-                    line("Key past half travel", key_name(b.positive_key), 202);
-                note("Keys engage past half travel. Click a field to assign; Delete clears it.");
-                line("More mapping options", advanced_ ? "Hide advanced" : "Show advanced", 13);
+                    line("Keyboard", "Add key mapping...", 17);
+                line("", advanced_ ? "Fewer options" : "More options...", 13);
                 if (advanced_) {
                     if (calibration.mode == MapperAxisMode::Pedal)
                         line("Negative range key", key_name(b.negative_key), 201);
@@ -389,26 +366,20 @@ ControlsView PadMapperEditor::view(const Screen &screen, const PadState &raw,
                 }
             } else {
                 const ButtonBinding &b = button();
-                line("Controller button / D-pad", button_name(b), 205);
-                line("Keyboard key", key_name(b.key), 206);
-                note("Click the key field, then press a key. Delete removes it.");
-                note("Controller and keyboard outputs can be used together.");
+                line("Controller output", button_name(b), 205);
+                if (keyboard_ || b.key)
+                    line("Keyboard key", key_name(b.key), 206);
+                else
+                    line("Keyboard", "Add key mapping...", 17);
             }
-            if (!profile_.native_enabled)
-                note("Controller output is OFF in Overview. Key assignments still work.");
             if (profile_.legacy_mapped)
-                note("Built-in keyboard / mouse bindings are also active. They may send additional "
-                     "keys.");
+                note("Built-in keyboard / mouse mapping is also enabled.");
             if (selected_ < 6) {
                 const int y = detail_top + (index++ - detail_scroll_) * px(35);
                 if (y >= detail_top && y + row <= detail_bottom) {
                     const auto target = profile_.axis_bindings[size_t(selected_)].guest_axis;
-                    add_meter(x, y, content_w, row,
-                              "Controller output preview" +
-                                  std::string(profile_.native_enabled ? "" : " (disabled)"),
-                              profile_.native_enabled && target != MapperAxis::None
-                                  ? axis(guest_preview, int(target) - 1)
-                                  : 0,
+                    add_meter(x, y, content_w, row, "Output",
+                              target != MapperAxis::None ? axis(guest_preview, int(target) - 1) : 0,
                               target != MapperAxis::L2 && target != MapperAxis::R2);
                 }
             }
@@ -423,15 +394,19 @@ ControlsView PadMapperEditor::view(const Screen &screen, const PadState &raw,
                           "Adjusted " + number(axis(calibrated, selected_)),
                           axis(calibrated, selected_), c.mode == MapperAxisMode::Centered);
             }
-            line("Ignore small movements", number(c.deadzone, true), 0, 220, 221);
-            note("Increase only if this input moves while untouched.");
-            line("Reverse direction", c.inverted ? "On" : "Off", 222);
+            line("Axis mode",
+                 c.mode == MapperAxisMode::Centered ? "Centered (stick / wheel)"
+                                                    : "One-sided (trigger / pedal)",
+                 236);
+            line("Deadzone", number(c.deadzone, true), 0, 220, 221);
+
+            line("Reverse direction", c.inverted ? "[x] Reversed" : "[ ] Reversed", 222);
             line("Resting position", center_capture_ ? "Recording..." : "Record at rest", 223);
             line("Full movement range", sweep_ ? "Finish range" : "Record range",
                  sweep_ ? 225 : 224);
             if (sweep_ || center_capture_)
                 line("Calibration in progress", "Cancel capture", 226);
-            line("More response options", advanced_ ? "Hide advanced" : "Show advanced", 13);
+            line("", advanced_ ? "Fewer options" : "More options...", 13);
             if (advanced_) {
                 line("Reach full output at", number(c.saturation, true), 0, 230, 231);
                 line("Response curve", number(c.curve), 0, 232, 233);
@@ -439,15 +414,11 @@ ControlsView PadMapperEditor::view(const Screen &screen, const PadState &raw,
                 line("Stick pair deadzone", number(profile_.stick_deadzone, true), 0, 234, 235);
                 note("Shared circular deadzone for both sticks; separate from the axis deadzone "
                      "above.");
-                line("Input behavior",
-                     c.mode == MapperAxisMode::Centered ? "Returns to center" : "Starts at one end",
-                     236);
-                note("Centered inputs use -1 to +1. One-ended inputs use 0 to 1.");
                 line("Recorded minimum", number(c.minimum), 0);
                 line("Recorded rest", number(c.center), 0);
                 line("Recorded maximum", number(c.maximum), 0);
             }
-            line("Reset this axis", "Restore defaults", 227);
+            line("", "Reset this axis", 227);
         }
         const int visible = std::max(1, (detail_bottom - detail_top) / px(35));
         detail_max_ = std::max(0, index - visible);
@@ -456,17 +427,15 @@ ControlsView PadMapperEditor::view(const Screen &screen, const PadState &raw,
             const int small = px(92);
             add_key(x, bottom - row, small, row, "Scroll up", false, 90);
             add_key(x + small + gap, bottom - row, small, row, "Scroll down", false, 91);
-            text(x + 2 * (small + gap), bottom - row + px(8), content_w - 2 * (small + gap), row,
-                 "More options below; mouse wheel scrolls.");
         }
     }
     if (popup_ != Popup::None) {
         widget_ids_.clear();
         frame_.guides.clear();
-        const int popup_height = popup_ == Popup::Discard                          ? 240
-                                 : popup_ == Popup::Preset && preset_pending_ >= 0 ? 260
-                                 : popup_ == Popup::Axis                           ? 300
-                                                                                   : 480;
+        const int popup_height = popup_ == Popup::Discard                           ? 240
+                                 : popup_ == Popup::Preset && preset_pending_ >= 0  ? 260
+                                 : popup_ == Popup::Axis || popup_ == Popup::Preset ? 300
+                                                                                    : 480;
         const int pw = std::min(w - 2 * m, px(560)), ph = std::min(h - 2 * m, px(popup_height));
         const int x = (w - pw) / 2, y = (h - ph) / 2;
         frame_.picker = {x - gap, y - gap, pw + 2 * gap, ph + 2 * gap};
@@ -496,7 +465,7 @@ ControlsView PadMapperEditor::view(const Screen &screen, const PadState &raw,
                 add_key(x, at + px(96), pw, row, "Replace draft with this preset", false, 520);
                 add_key(x, at + px(136), pw, row, "Back to presets", false, 523);
             } else
-                for (int i = 0; i < 5; ++i) {
+                for (int i = 0; i < kPresetCount; ++i) {
                     add_key(x, at, pw, row, presets[i], false, 500 + i);
                     add_text(x + gap, at + row + px(3), pw - 2 * gap, px(26), preset_help[i], true,
                              text_scale);
@@ -548,6 +517,7 @@ void PadMapperEditor::cancel_calibration() {
 }
 void PadMapperEditor::select(int source) {
     cancel_calibration();
+    keyboard_ = false;
     selected_ = std::clamp(source, 0, 22);
     group_ = selected_ < 6 ? 0 : selected_ < 19 ? 1 : 2;
     const int first = group_ == 0 ? 0 : group_ == 1 ? 6 : 19;
@@ -562,20 +532,15 @@ void PadMapperEditor::preset(int index) {
         profile_ = pad_mapper_native_profile();
         break;
     case 1:
-        profile_ = pad_mapper_centered_sticks();
-        break;
-    case 2:
-        profile_ = pad_mapper_separate_pedals();
-        break;
-    case 3:
         profile_ = pad_mapper_combined_pedals();
         break;
-    case 4:
+    case 2:
         profile_ = pad_mapper_default_profile();
         profile_.native_enabled = false;
         profile_.legacy_mapped = true;
         break;
     }
+    profile_ = pad_mapper_with_controller_output(profile_);
 }
 void PadMapperEditor::activate(int id) {
     validation_error_.clear();
@@ -600,18 +565,16 @@ void PadMapperEditor::activate(int id) {
     } else if (id == 13) {
         advanced_ = !advanced_;
         detail_scroll_ = 0;
-    } else if (id == 14)
-        profile_.native_enabled = !profile_.native_enabled;
-    else if (id == 15)
-        profile_.legacy_mapped = !profile_.legacy_mapped;
-    else if (id == 16) {
+    } else if (id == 16) {
         if (!connected_)
             validation_error_ = "Connect a controller before identifying an input.";
         else {
             capture_ = Capture::Identify;
             identify_start_ = last_raw_;
         }
-    } else if (id == 20)
+    } else if (id == 17)
+        keyboard_ = true;
+    else if (id == 20)
         scroll_ = std::max(0, scroll_ - 1);
     else if (id == 21)
         ++scroll_;
@@ -719,14 +682,14 @@ void PadMapperEditor::activate(int id) {
         }
         popup_ = Popup::None;
         focus_ = selected_ < 6 ? 200 : 205;
-    } else if (id >= 500 && id < 505) {
+    } else if (id >= 500 && id < 500 + kPresetCount) {
         preset_pending_ = id - 500;
         focus_ = 523;
     } else if (id == 520 && preset_pending_ >= 0) {
         cancel_calibration();
         preset(preset_pending_);
         popup_ = Popup::None;
-        validation_error_ = "Preset loaded into the draft. Test it, then Save changes to keep it.";
+        validation_error_ = "Preset loaded into the draft. Test it, then Save to keep it.";
         focus_ = 12;
     } else if (id == 521) {
         close_requested_ = false;

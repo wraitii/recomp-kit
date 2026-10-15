@@ -534,7 +534,7 @@ void host_init(const HostHooks &hooks) {
 
 void host_mapper_load() {
     set_mapper_status({});
-    const PadMapperProfile profile = load_mapper_profile();
+    const PadMapperProfile profile = pad_mapper_with_controller_output(load_mapper_profile());
     std::string error;
     if (!g_mapper.set_profile(profile, &error)) {
         set_mapper_status("Could not initialize controller profile: " + error);
@@ -623,7 +623,8 @@ std::string host_mapper_status() {
     return g_mapper_status;
 }
 
-bool host_mapper_apply(const PadMapperProfile &profile, bool persist) {
+bool host_mapper_apply(const PadMapperProfile &requested, bool persist) {
+    const PadMapperProfile profile = pad_mapper_with_controller_output(requested);
     std::string error;
     if (!validate_pad_mapper_profile(profile, &error)) {
         set_mapper_status("Controller profile was not applied: " + error);

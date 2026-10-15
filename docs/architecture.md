@@ -156,12 +156,18 @@ The standalone `--configure` window and the launcher's Configure button offer
 Controller setup; it is not part of the in-game F10 page. The controller
 setup editor calibrates normalized SDL axes and routes each
 physical axis, button and hat direction to guest controls and keyboard keys.
-Overview shows the connected device and its live inputs. Mapping separates
+Overview shows the connected device, live inputs and starting presets. Controller
+output is always available; each input can send a controller control, a keyboard
+key, both or neither. Old profiles with controller output disabled are converted
+to unassigned controller outputs, preserving their key bindings and calibration.
+The built-in keyboard/mouse preset retains the supplied bindings, including mouse
+and host actions; other presets replace it. Mapping separates
 physical input selection from explicit output choosers, with input identification
-and keyboard capture. Calibration exposes drift, direction and range controls;
-advanced sections retain response curves, scale, offset and direction buttons.
+and optional keyboard capture. Existing key assignments remain visible. Calibration exposes
+centered or one-sided axis response, drift, direction and range controls;
+More options sections retain response curves, scale, offset and direction buttons.
 Presets and unsaved exits require an explicit choice; Tab/Shift+Tab and Enter
-operate the visible controls. Its preview runs before the game starts; Save changes saves
+operate the visible controls. Its preview runs before the game starts; Save saves
 the profile under `controls/mapper-v1.txt` in the selected game profile.
 Calibration includes center and range capture, radial stick and per-axis
 deadzones, saturation, response curves and inversion. Output scale and offset

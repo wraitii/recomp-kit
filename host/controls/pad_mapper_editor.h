@@ -57,6 +57,7 @@ class PadMapperEditor {
     bool open_ = false;
     bool close_requested_ = false;
     bool advanced_ = false;
+    bool keyboard_ = false;
     bool shift_ = false;
     bool sweep_ = false;
     bool center_capture_ = false;

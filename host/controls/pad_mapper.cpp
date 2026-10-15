@@ -329,6 +329,26 @@ bool parse_field(const std::string &key, const std::string &value, PadMapperProf
 
 } // namespace
 
+PadMapperProfile pad_mapper_with_controller_output(const PadMapperProfile &profile) {
+    PadMapperProfile result = profile;
+    if (!result.native_enabled) {
+        for (AxisBinding &b : result.axis_bindings) {
+            b.guest_axis = MapperAxis::None;
+            b.negative_guest_buttons = b.positive_guest_buttons = 0;
+        }
+        for (ButtonBinding &b : result.buttons) {
+            b.guest_buttons = 0;
+            b.guest_hat = 0;
+        }
+        for (ButtonBinding &b : result.hat) {
+            b.guest_buttons = 0;
+            b.guest_hat = 0;
+        }
+    }
+    result.native_enabled = true;
+    return result;
+}
+
 PadMapperProfile pad_mapper_default_profile() {
     PadMapperProfile p;
     p.legacy_mapped = false;
@@ -382,7 +402,6 @@ PadMapperProfile pad_mapper_keyboard_profile(const MappedTable &legacy_defaults)
         b.guest_buttons = 0;
         b.guest_hat = 0;
     }
-    p.native_enabled = false;
     if (legacy_defaults.left == StickMode::Arrows || legacy_defaults.left == StickMode::Wasd ||
         legacy_defaults.left == StickMode::HorizontalArrows) {
         const bool wasd = legacy_defaults.left == StickMode::Wasd;

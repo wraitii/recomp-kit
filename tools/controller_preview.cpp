@@ -54,7 +54,7 @@ int main(int argc, char **argv) {
             return 1;
         if (page == "axis" && !click("Left stick horizontal"))
             return 1;
-        if (page == "advanced" && !click("Show advanced"))
+        if (page == "advanced" && !click("More options..."))
             return 1;
     }
     if (page == "calibration" || page == "response") {
@@ -63,22 +63,22 @@ int main(int argc, char **argv) {
         if (page == "response") {
             for (int i = 0; i < 8; ++i) {
                 if (std::any_of(frame.toolbar.begin(), frame.toolbar.end(),
-                                [](const auto &d) { return d.label == "Show advanced"; }))
+                                [](const auto &d) { return d.label == "More options..."; }))
                     break;
                 if (!click("Scroll down"))
                     return 1;
             }
-            if (!click("Show advanced"))
+            if (!click("More options..."))
                 return 1;
             for (int i = 0; i < 6; ++i)
                 if (!click("Scroll down"))
                     return 1;
         }
     }
-    if (page == "presets" && !click("Choose a starting preset..."))
+    if (page == "presets" && !click("Presets..."))
         return 1;
     if (page == "discard") {
-        if (!click("Controller output: On") || !click("Cancel"))
+        if (!click("Calibration") || !click("+") || !click("Cancel"))
             return 1;
     }
     if (page == "disconnected") {

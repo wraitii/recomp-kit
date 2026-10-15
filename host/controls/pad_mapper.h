@@ -53,6 +53,7 @@ struct PadMapperProfile {
     std::array<ButtonBinding, 4> hat{}; // up, right, down, left
 };
 
+PadMapperProfile pad_mapper_with_controller_output(const PadMapperProfile &profile);
 PadMapperProfile pad_mapper_default_profile();
 PadMapperProfile pad_mapper_centered_sticks();
 PadMapperProfile pad_mapper_separate_pedals();
