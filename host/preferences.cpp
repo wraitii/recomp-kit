@@ -1,6 +1,7 @@
 #include "preferences.h"
 
 #include "game_config.h"
+#include "../dx/adapter_profiles.h"
 #include "../mods/mods_internal.h"
 
 #include <algorithm>
@@ -24,6 +25,9 @@ constexpr SettingInfo kSettings[] = {
     {Setting::PerformanceOverlay, "performance_overlay", "Performance overlay",
      "Choose which performance information appears on screen.", 0, 2, 1,
      RECOMP_SETTINGS_PERFORMANCE_OVERLAY, "Off|Counters|Graph"},
+    {Setting::ReportedGpu, "reported_gpu", "Reported graphics card",
+     "Choose which graphics card Direct3D reports to the game.", 0,
+     int(std::size(kAdapterProfiles)), 1, 0, RECOMP_ADAPTER_PROFILE_CHOICES},
 };
 
 constexpr const char *kInputModId = "host.input";
@@ -46,8 +50,10 @@ const char *key(Setting setting) {
 }
 
 const char *mod_id(Setting setting) {
-    return setting == Setting::WindowMode || setting == Setting::PerformanceOverlay ? kDisplayModId
-                                                                                    : kInputModId;
+    return setting == Setting::WindowMode || setting == Setting::PerformanceOverlay ||
+                   setting == Setting::ReportedGpu
+               ? kDisplayModId
+               : kInputModId;
 }
 
 int fallback(Setting setting) {

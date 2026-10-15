@@ -10,7 +10,8 @@ enum class Setting {
     MouseSensitivity,
     MouseAcceleration,
     WindowMode,
-    PerformanceOverlay
+    PerformanceOverlay,
+    ReportedGpu
 };
 
 enum class KeyboardNames { System = 0, US = 1 };

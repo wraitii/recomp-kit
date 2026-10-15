@@ -47,6 +47,7 @@
 #include "keymap.h"
 #include "platform_ui.h"
 #include "version.h"
+#include "../../dx/adapter_profiles.h"
 #include "../../dx/dx.h"
 #include "../../runtime/loader.h"
 #include "../../runtime/mods_seam.h"
@@ -2129,6 +2130,7 @@ int main(int argc, char **argv) {
     guest_key_names_use_system(host_preferences::keyboard_names() ==
                                host_preferences::KeyboardNames::System);
     g_mouse_sensitivity = host_preferences::mouse_sensitivity() / 100.0;
+    adapter_profile_select(host_preferences::get(host_preferences::Setting::ReportedGpu));
     SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE,
                 host_preferences::mouse_acceleration() ==
                         host_preferences::MouseAcceleration::System

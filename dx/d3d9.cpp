@@ -1,3 +1,4 @@
+#include "adapter_profiles.h"
 #include "com.h"
 #include "dx.h"
 #include "../runtime/guest.h"
@@ -329,13 +330,14 @@ void D9_GetAdapterIdentifier(X86 *c) {
     }
     memset(gm_ptr(out), 0, 1100);
     std::string description(result.description.data(), result.description.size());
-    gm_put_str(out, "wgpu", 512);
-    gm_put_str(out + 512, description.c_str(), 512);
+    const AdapterProfile *profile = adapter_profile();
+    gm_put_str(out, profile ? profile->driver : "wgpu", 512);
+    gm_put_str(out + 512, profile ? profile->description : description.c_str(), 512);
     gm_put_str(out + 1024, "\\\\.\\DISPLAY1", 32);
-    wr32(out + 1056, result.driver_version_low);
-    wr32(out + 1060, result.driver_version_high);
-    wr32(out + 1064, result.vendor_id);
-    wr32(out + 1068, result.device_id);
+    wr32(out + 1056, profile ? profile->driver_version_low : result.driver_version_low);
+    wr32(out + 1060, profile ? profile->driver_version_high : result.driver_version_high);
+    wr32(out + 1064, profile ? profile->vendor_id : result.vendor_id);
+    wr32(out + 1068, profile ? profile->device_id : result.device_id);
     wr32(out + 1072, result.sub_sys_id);
     wr32(out + 1076, result.revision);
     wr32(out + 1096, result.whql_level);

@@ -1,6 +1,7 @@
 // Bounded D3D8 guest COM bridge. Guest layouts stay 32-bit; host renderer
 // pointers are owned here. Unimplemented slots fail by name through the import
 // dispatcher. Descriptors and COM lifetime are tested separately from GPU work.
+#include "adapter_profiles.h"
 #include "com.h"
 #include "dx.h"
 #include "d3d8_fpu.h"
@@ -542,6 +543,16 @@ void D8_GetAdapterIdentifier(X86 *c) {
         return;
     }
     memset(gm_ptr(out), 0, 1068);
+    if (const AdapterProfile *profile = adapter_profile()) {
+        gm_put_str(out, profile->driver, 512);
+        gm_put_str(out + 512, profile->description, 512);
+        wr32(out + 1024, profile->driver_version_low);
+        wr32(out + 1028, profile->driver_version_high);
+        wr32(out + 1032, profile->vendor_id);
+        wr32(out + 1036, profile->device_id);
+        com_ret(c, D8_OK);
+        return;
+    }
 #ifdef RECOMP_D3D8_WGPU
     strncpy((char *)gm_ptr(out), "wgpu", 511);
     const auto &name = adapter_cache().info.name;
