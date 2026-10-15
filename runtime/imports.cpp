@@ -756,6 +756,21 @@ uint32_t guest_call(X86 *c, uint32_t fn, const uint32_t *args, int nargs) {
     if (g_host_call_count)
         if (RecompHostCall host = host_call_for(fn, nargs))
             return host(c, args);
+    if (imports_is_trampoline(fn)) {
+        const uint32_t saved_esp = c->r[R_ESP], saved_eip = c->eip;
+        uint32_t esp = saved_esp;
+        for (int i = nargs - 1; i >= 0; --i) {
+            esp -= 4;
+            wr32(esp, args[i]);
+        }
+        esp -= 4;
+        wr32(esp, GUEST_RETURN_SENTINEL);
+        c->r[R_ESP] = esp;
+        imports_dispatch(c, fn);
+        c->r[R_ESP] = saved_esp;
+        c->eip = saved_eip;
+        return c->r[R_EAX];
+    }
     Callbacks &local = callback_state();
     Callback *call = local.acquire();
     call->cpu = c;
