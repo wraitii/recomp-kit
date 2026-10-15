@@ -176,5 +176,9 @@ enum SdlPadAxis : int {
 // radial dead zone; SDL's +y is already down. Triggers are v / 32767 clamped
 // to [0, 1], and past 0.5 also set the l2/r2 bit.
 PadState pad_from_sdl(const bool buttons[kSdlPadButtonCount], const int16_t axes[kSdlAxisCount]);
+// Same conversion without the legacy radial stick deadzone. Calibration and
+// meters must see the physical center and full raw range.
+PadState pad_from_sdl_raw(const bool buttons[kSdlPadButtonCount],
+                          const int16_t axes[kSdlAxisCount]);
 
 } // namespace controls

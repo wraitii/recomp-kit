@@ -15,6 +15,7 @@ enum ControlsRow {
     CONTROLS_HAPTICS_ROW,
     CONTROLS_PAD_WITH_CONTROLLER_ROW,
     CONTROLS_SNAP_ROW,
+    CONTROLS_MAPPER_ROW,
     CONTROLS_EDIT_ROW,
     CONTROLS_ROW_COUNT
 };
@@ -42,6 +43,7 @@ int mods_controls_value(ControlsRow row);
 std::string mods_controls_layout_name();
 PopModStatus mods_controls_set(ControlsRow row, int value);
 // EDIT_ROW ignores the delta and requests the editor instead of a value change.
+// MAPPER_ROW ignores the delta and requests controller setup.
 PopModStatus mods_controls_nudge(ControlsRow row, int delta);
 std::string mods_controls_line(ControlsRow row);
 // Which form factor a set of hidden-group bits belongs to; the same order as
@@ -68,6 +70,7 @@ void mods_controls_set_hidden_groups(ControlsForm form, uint32_t bits);
 void mods_controls_flush();
 // Set by the EDIT row; the host polls this and clears it.
 bool mods_controls_take_edit_request();
+bool mods_controls_take_mapper_request();
 // True while the layout editor is open (the host sets it). The F10 page's
 // gates read it too, so the editor takes the pointer and the page's own
 // drawing the same way the page does.

@@ -16,11 +16,15 @@
 #include "layout_fallback.h"
 #include "layout_store.h"
 #include "overlay.h"
+#include "pad_guest_view.h"
+#include "pad_mapper_editor.h"
 #include "router.h"
 #include "vpad.h"
 
 #include <filesystem>
+#include <mutex>
 #include <stdio.h>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -43,6 +47,7 @@ Router g_router;
 Screen g_screen;
 bool g_keyboard_absent = false;
 bool g_controller_present = false;
+bool g_game_focused = false;
 
 // RECOMP_CONTROLS_TRACE: log the merged pad on every change, and each
 // auto-hide decision.
@@ -52,9 +57,59 @@ bool trace() {
     return on;
 }
 
-// The mapped binding: RECOMP_CONTROLS_PAD == 1 drives it from the shared
-// virtual pad every pump; the other pad modes (off, native) leave it unused.
+// The legacy mapped binding runs only when the active profile enables it.
 Binding g_binding;
+PadMapper g_mapper;
+PadMapperEditor g_mapper_editor;
+std::mutex g_mapper_view_mutex;
+PadState g_mapper_raw;
+PadState g_mapper_calibrated;
+PadState g_mapper_guest;
+PadState g_mapper_guest_physical;
+std::string g_mapper_status;
+PadMapperProfile g_mapper_open_profile;
+bool g_mapper_open = false;
+std::set<int> g_mapper_keys;
+std::set<int> g_legacy_binding_keys;
+
+void set_mapper_status(std::string status) {
+    std::lock_guard<std::mutex> lock(g_mapper_view_mutex);
+    g_mapper_status = std::move(status);
+}
+
+enum class KeyOwner { Mapper, LegacyBinding };
+
+bool key_owned(int scancode) {
+    return g_mapper_keys.count(scancode) || g_legacy_binding_keys.count(scancode);
+}
+
+void emit_owned_actions(KeyOwner owner, const std::vector<TouchAction> &actions) {
+    std::vector<TouchAction> out;
+    for (const TouchAction &action : actions) {
+        if (action.kind != TouchAction::Key) {
+            out.push_back(action);
+            continue;
+        }
+        const bool was_owned = key_owned(action.scancode);
+        std::set<int> &keys = owner == KeyOwner::Mapper ? g_mapper_keys : g_legacy_binding_keys;
+        if (action.down)
+            keys.insert(action.scancode);
+        else
+            keys.erase(action.scancode);
+        const bool is_owned = key_owned(action.scancode);
+        if (was_owned != is_owned) {
+            TouchAction edge = action;
+            edge.down = is_owned;
+            out.push_back(edge);
+        }
+    }
+    if (!out.empty() && g_hooks.touch_actions)
+        g_hooks.touch_actions(out);
+}
+
+void publish_pad_mode(const PadMapperProfile &profile) {
+    set_pad_mapper_runtime_mode(profile.native_enabled ? 2 : profile.legacy_mapped ? 1 : 0);
+}
 
 // Reads a whole file as text; false (leaving *out alone) when it cannot be
 // opened, same contract as layout_store.cpp's own copy.
@@ -84,6 +139,71 @@ MappedTable load_mapped_table() {
     if (read_text_file(path, &text) && !parse_mapped(text, &table, &error))
         fprintf(stderr, "[controls] bad %s: %s\n", path.c_str(), error.c_str());
     return table;
+}
+
+std::string mapper_path() {
+    return std::string(mods_overlay_profile_dir()) + "/controls/mapper-v1.txt";
+}
+
+PadMapperProfile default_mapper_profile() {
+    PadMapperProfile profile = pad_mapper_default_profile();
+    profile.legacy_mapped = RECOMP_CONTROLS_PAD == 1;
+    profile.native_enabled = RECOMP_CONTROLS_PAD == 2;
+    return profile;
+}
+
+PadMapperProfile load_mapper_profile() {
+    PadMapperProfile profile = default_mapper_profile();
+    std::string text, error;
+    const std::string path = mapper_path();
+    if (!read_text_file(path, &text)) {
+        OsStat stat{};
+        if (os_stat(path.c_str(), &stat) == 0)
+            set_mapper_status("Could not read controller profile file");
+        return profile;
+    }
+    PadMapperProfile loaded;
+    if (!parse_pad_mapper_profile(text, &loaded, &error)) {
+        set_mapper_status("Could not load controller profile: " + error);
+        fprintf(stderr, "[controls] bad %s: %s\n", path.c_str(), error.c_str());
+        return profile;
+    }
+    return loaded;
+}
+
+bool save_mapper_profile(const PadMapperProfile &profile, std::string *error) {
+    const std::string dir = std::string(mods_overlay_profile_dir()) + "/controls";
+    OsStat stat{};
+    if (os_mkdir(dir.c_str()) != 0 && (os_stat(dir.c_str(), &stat) != 0 || !stat.is_dir)) {
+        if (error)
+            *error = "could not create controls profile directory";
+        return false;
+    }
+    const std::string text = serialize_pad_mapper_profile(profile, error);
+    if (text.empty()) {
+        if (error && error->empty())
+            *error = "profile could not be serialized";
+        return false;
+    }
+    const std::string path = mapper_path();
+    const std::string temp = path + ".tmp";
+    const int fd = os_fd_open(temp.c_str(), OS_O_WRONLY | OS_O_CREAT | OS_O_TRUNC);
+    if (fd < 0) {
+        if (error)
+            *error = "could not open profile file";
+        return false;
+    }
+    const int64_t written = os_fd_write(fd, text.data(), text.size());
+    const int synced = os_fd_fsync(fd);
+    os_fd_close(fd);
+    if (written != int64_t(text.size()) || synced != 0 ||
+        os_rename(temp.c_str(), path.c_str()) != 0) {
+        os_unlink(temp.c_str());
+        if (error)
+            *error = "could not replace profile file";
+        return false;
+    }
+    return true;
 }
 
 // What g_layout was loaded and sized for.
@@ -204,8 +324,7 @@ void reload(const std::string &name, Form form) {
     g_router.set_layout(nullptr, g_sink); // releases against the old layout
     std::vector<TouchAction> released;
     g_binding.release_all(&released);
-    if (!released.empty() && g_hooks.touch_actions)
-        g_hooks.touch_actions(released);
+    emit_owned_actions(KeyOwner::LegacyBinding, released);
     g_loaded = true;
     g_loaded_name = name;
     g_loaded_form = form;
@@ -328,14 +447,17 @@ void release_everything() {
     g_router.cancel_all(g_sink);
     std::vector<TouchAction> actions;
     g_binding.release_all(&actions);
-    if (!actions.empty() && g_hooks.touch_actions)
-        g_hooks.touch_actions(actions);
+    emit_owned_actions(KeyOwner::LegacyBinding, actions);
+    actions.clear();
+    g_mapper.release(&actions);
+    emit_owned_actions(KeyOwner::Mapper, actions);
     // The router's pad reaches the guest only through the shared vpad, and
     // host_pump publishes it after the editing early return -- so without
     // this line the cleared pad would never arrive while the editor is open
     // (pad = "native": a held on-screen button stays down for the whole
     // editing session) or while the app is in the background.
     vpad().set_source(kPadSourceTouch, g_router.pad());
+    vpad().set_source(kPadSourceController, PadState{});
 }
 
 void close_editor();
@@ -362,9 +484,9 @@ void open_editor() {
     g_layout.scale = g_file_scale * size_factor();
     g_editor.set_screen(g_screen);
     g_editor.set_names(g_store.names());
-    // RECOMP_CONTROLS_PAD == 1 is the mapped binding; the other pad modes
-    // drive the guest's pad directly, so Bind edits the button itself.
-    g_editor.open(g_layout, g_loaded_form, g_binding.table(), RECOMP_CONTROLS_PAD != 1,
+    // In native mode Bind edits the guest button directly; mapped mode keeps
+    // the legacy binding as a separate output path.
+    g_editor.open(g_layout, g_loaded_form, g_binding.table(), !g_mapper.snapshot().legacy_mapped,
                   mods_controls_value(CONTROLS_SNAP_ROW) != 0);
     g_editor_name = g_layout.name;
     g_editor_renamed = false;
@@ -411,6 +533,13 @@ void host_init(const HostHooks &hooks) {
                      host_resource("controls"));
     mods_controls_set_names(g_store.names());
     g_binding.set_table(load_mapped_table());
+    const PadMapperProfile profile = load_mapper_profile();
+    std::string error;
+    if (!g_mapper.set_profile(profile, &error)) {
+        set_mapper_status("Could not initialize controller profile: " + error);
+        fprintf(stderr, "[controls] bad controller profile: %s\n", error.c_str());
+    }
+    publish_pad_mode(profile);
 }
 
 void host_set_screen(const Screen &s, const Rect &game, int safe_bottom) {
@@ -431,9 +560,157 @@ void host_set_wanted(bool keyboard_absent, bool controller_present) {
     g_controller_present = controller_present;
 }
 
+void host_set_focused(bool focused) {
+    if (g_game_focused == focused)
+        return;
+    g_game_focused = focused;
+    if (!focused) {
+        release_everything();
+        g_rumble.stop();
+        mods_controls_flush();
+        vpad().set_source(kPadSourceTouch, PadState{});
+        vpad().set_source(kPadSourceController, PadState{});
+    } else {
+        host_gamepad_state(host_mapper_raw_state());
+    }
+}
+
+void host_gamepad_state(const PadState &raw) {
+    PadState calibrated, mapped;
+    std::vector<TouchAction> key_edges;
+    g_mapper.process(raw, &calibrated, &mapped, &key_edges);
+    const PadMapperProfile profile = g_mapper.snapshot();
+    {
+        std::lock_guard<std::mutex> lock(g_mapper_view_mutex);
+        g_mapper_raw = raw;
+        g_mapper_calibrated = calibrated;
+        g_mapper_guest_physical = mapped;
+        g_mapper_guest = merge(mapped, g_router.pad());
+    }
+    if (!g_game_focused || g_mapper_editor.is_open() || g_editor.is_open()) {
+        std::vector<TouchAction> release;
+        g_mapper.release(&release);
+        emit_owned_actions(KeyOwner::Mapper, release);
+        vpad().set_source(kPadSourceController, PadState{});
+        return;
+    }
+    emit_owned_actions(KeyOwner::Mapper, key_edges);
+    vpad().set_source(kPadSourceController, profile.native_enabled ? mapped : PadState{});
+}
+
+PadMapperProfile host_mapper_profile() {
+    return g_mapper.snapshot();
+}
+
+PadState host_mapper_raw_state() {
+    std::lock_guard<std::mutex> lock(g_mapper_view_mutex);
+    return g_mapper_raw;
+}
+
+PadState host_mapper_calibrated_state() {
+    std::lock_guard<std::mutex> lock(g_mapper_view_mutex);
+    return g_mapper_calibrated;
+}
+
+PadState host_mapper_guest_state() {
+    std::lock_guard<std::mutex> lock(g_mapper_view_mutex);
+    return g_mapper_guest;
+}
+
+std::string host_mapper_status() {
+    std::lock_guard<std::mutex> lock(g_mapper_view_mutex);
+    return g_mapper_status;
+}
+
+void host_mapper_open() {
+    if (g_mapper_editor.is_open())
+        return;
+    release_everything();
+    g_rumble.stop();
+    g_mapper_open_profile = g_mapper.snapshot();
+    g_mapper_editor.open(g_mapper_open_profile, g_screen);
+    g_mapper_open = true;
+    mods_controls_set_editing(true);
+    mods_page_close();
+    vpad().set_source(kPadSourceController, PadState{});
+    vpad().set_source(kPadSourceTouch, PadState{});
+    publish();
+}
+
+bool host_mapper_editing() {
+    return g_mapper_editor.is_open();
+}
+
+bool host_mapper_apply(const PadMapperProfile &profile, bool persist) {
+    std::string error;
+    if (!validate_pad_mapper_profile(profile, &error)) {
+        set_mapper_status("Controller profile was not applied: " + error);
+        return false;
+    }
+    if (persist && !save_mapper_profile(profile, &error)) {
+        set_mapper_status("Controller profile was not saved: " + error);
+        fprintf(stderr, "[controls] could not save %s: %s\n", mapper_path().c_str(), error.c_str());
+        return false;
+    }
+    std::vector<TouchAction> old_keys;
+    g_mapper.release(&old_keys);
+    emit_owned_actions(KeyOwner::Mapper, old_keys);
+    old_keys.clear();
+    g_binding.release_all(&old_keys);
+    emit_owned_actions(KeyOwner::LegacyBinding, old_keys);
+    if (!g_mapper.set_profile(profile, &error)) {
+        set_mapper_status("Controller profile was not applied: " + error);
+        fprintf(stderr, "[controls] bad controller profile: %s\n", error.c_str());
+        return false;
+    }
+    publish_pad_mode(profile);
+    set_mapper_status({});
+    if (g_mapper_open || g_mapper_editor.is_open())
+        vpad().set_source(kPadSourceController, PadState{});
+    else
+        host_gamepad_state(host_mapper_raw_state());
+    return true;
+}
+
+void host_mapper_cancel() {
+    if (g_mapper_open)
+        (void)host_mapper_apply(g_mapper_open_profile, false);
+    g_mapper_editor.close();
+    g_mapper_open = false;
+    mods_controls_set_editing(false);
+    host_gamepad_state(host_mapper_raw_state());
+    publish();
+}
+
+bool host_mapper_key(int scancode, bool down) {
+    if (!g_mapper_editor.is_open())
+        return false;
+    g_mapper_editor.key(scancode, down);
+    return true;
+}
+
+void host_mapper_pointer(double px, double py, int state) {
+    if (g_mapper_editor.is_open())
+        g_mapper_editor.pointer(px, py, state);
+}
+
+void host_mapper_wheel(double notches) {
+    if (g_mapper_editor.is_open())
+        g_mapper_editor.wheel(notches);
+}
+
+void host_mapper_escape() {
+    if (g_mapper_editor.is_open())
+        g_mapper_editor.escape();
+}
+
 // While the editor is open every finger is its own: the router sees none of
 // them, so a control never fires while it is being moved.
 bool host_finger_down(int64_t id, double px, double py, uint64_t now) {
+    if (g_mapper_editor.is_open()) {
+        host_mapper_pointer(px, py, 1);
+        return true;
+    }
     if (g_editor.is_open()) {
         g_editor.finger_down(id, px, py);
         return true;
@@ -450,6 +727,10 @@ bool host_finger_down(int64_t id, double px, double py, uint64_t now) {
 }
 
 bool host_finger_motion(int64_t id, double px, double py, uint64_t now) {
+    if (g_mapper_editor.is_open()) {
+        host_mapper_pointer(px, py, 0);
+        return true;
+    }
     if (g_editor.is_open()) {
         g_editor.finger_motion(id, px, py);
         return true;
@@ -458,6 +739,10 @@ bool host_finger_motion(int64_t id, double px, double py, uint64_t now) {
 }
 
 bool host_finger_up(int64_t id, uint64_t now) {
+    if (g_mapper_editor.is_open()) {
+        host_mapper_pointer(0, 0, -1);
+        return true;
+    }
     if (g_editor.is_open()) {
         g_editor.finger_up(id);
         return true;
@@ -466,6 +751,10 @@ bool host_finger_up(int64_t id, uint64_t now) {
 }
 
 bool host_finger_cancel(int64_t id) {
+    if (g_mapper_editor.is_open()) {
+        host_mapper_pointer(0, 0, -1);
+        return true;
+    }
     if (g_editor.is_open()) {
         // Cancelled, not lifted: the finger's gesture is dropped, so a
         // system-taken finger never commits a drag or chooses a picker item.
@@ -532,6 +821,8 @@ void host_pump(uint64_t now) {
         publish();
         return;
     }
+    if (mods_controls_take_mapper_request() && !g_editor.is_open() && !g_mapper_editor.is_open())
+        host_mapper_open();
     // The settings page's "Edit controls" row, and the edit_layout action.
     if (mods_controls_take_edit_request() && !g_editor.is_open())
         open_editor();
@@ -565,6 +856,46 @@ void host_pump(uint64_t now) {
         g_editor.set_screen(g_screen);
         publish();
         return;
+    }
+
+    if (g_mapper_editor.is_open()) {
+        g_mapper_editor.set_screen(g_screen);
+        const PadMapperEditorAction action = g_mapper_editor.take_action();
+        if (action == PadMapperEditorAction::Apply) {
+            if (host_mapper_apply(g_mapper_editor.profile(), true)) {
+                g_mapper_editor.close();
+                g_mapper_open = false;
+                mods_controls_set_editing(false);
+                host_gamepad_state(host_mapper_raw_state());
+            }
+        } else if (action == PadMapperEditorAction::Cancel) {
+            host_mapper_cancel();
+        }
+        if (g_mapper_editor.is_open()) {
+            PadMapper preview;
+            PadState raw, calibrated, guest;
+            std::vector<TouchAction> ignored;
+            std::string preview_status = host_mapper_status();
+            {
+                std::lock_guard<std::mutex> lock(g_mapper_view_mutex);
+                raw = g_mapper_raw;
+            }
+            std::string preview_error;
+            if (preview.set_profile(g_mapper_editor.profile(), &preview_error)) {
+                preview.process(raw, &calibrated, &guest, &ignored);
+            } else {
+                calibrated = raw;
+                guest = PadState{};
+                preview_status = "Invalid controller profile draft: " + preview_error;
+            }
+            guest = merge(guest, g_router.pad());
+            const HostPadGuestState actual = pad_guest_view_snapshot(g_mapper_editor.guest_api());
+            host_present_set_controls(
+                g_mapper_editor.view(g_screen, raw, calibrated, guest, actual, preview_status));
+            vpad().set_source(kPadSourceController, PadState{});
+            vpad().set_source(kPadSourceTouch, PadState{});
+            return;
+        }
     }
 
     if (g_have_layout) {
@@ -610,22 +941,27 @@ void host_pump(uint64_t now) {
                     g_keyboard_absent ? "absent" : "present",
                     g_controller_present ? "present" : "absent");
     }
-    vpad().set_source(kPadSourceTouch, g_router.pad());
-
-#if RECOMP_CONTROLS_PAD == 1
-    // The mapped binding turns the merged pad into keys/mouse; other pad
-    // modes (off, native) leave the virtual pad for host_pad_* to read
-    // directly.
+    vpad().set_source(kPadSourceTouch, g_game_focused ? g_router.pad() : PadState{});
     {
+        std::lock_guard<std::mutex> lock(g_mapper_view_mutex);
+        g_mapper_guest = merge(g_mapper_guest_physical, g_router.pad());
+    }
+
+    // The legacy binding remains available per profile. It sees calibrated
+    // physical input merged with touch controls, never the remapped guest pad.
+    if (g_game_focused && g_mapper.snapshot().legacy_mapped) {
         std::vector<TouchAction> actions;
         std::vector<std::string> names;
-        g_binding.tick(vpad().state(), now, &actions, &names);
-        if (!actions.empty() && g_hooks.touch_actions)
-            g_hooks.touch_actions(actions);
+        const PadState legacy_pad = merge(host_mapper_calibrated_state(), g_router.pad());
+        g_binding.tick(legacy_pad, now, &actions, &names);
+        emit_owned_actions(KeyOwner::LegacyBinding, actions);
         for (const std::string &name : names)
             g_sink.action(name);
+    } else {
+        std::vector<TouchAction> actions;
+        g_binding.release_all(&actions);
+        emit_owned_actions(KeyOwner::LegacyBinding, actions);
     }
-#endif
 
     {
         // Serial first: the values read after it are at least as new.

@@ -6,8 +6,11 @@
 #pragma once
 
 #include "layout.h"
+#include "pad_mapper.h"
+#include "vpad.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 struct TouchAction;
@@ -31,8 +34,25 @@ void host_init(const HostHooks &hooks);
 // controls area: the layout anchors in it and every finger there is claimed.
 void host_set_screen(const Screen &s, const Rect &game, int safe_bottom);
 // keyboard_absent: no hardware keyboard is attached (or RECOMP_KEYPAD forces
-// the controls on). controller_present: reserved for Task 12.
+// the controls on). controller_present: a physical SDL gamepad is connected.
 void host_set_wanted(bool keyboard_absent, bool controller_present);
+void host_set_focused(bool focused);
+// Physical SDL input stays raw until the profile calibrates it. Called on
+// every device event and poll so short presses keep their edge timing.
+void host_gamepad_state(const PadState &raw);
+PadMapperProfile host_mapper_profile();
+PadState host_mapper_raw_state();
+PadState host_mapper_calibrated_state();
+PadState host_mapper_guest_state();
+std::string host_mapper_status();
+void host_mapper_open();
+bool host_mapper_editing();
+bool host_mapper_apply(const PadMapperProfile &profile, bool persist);
+void host_mapper_cancel();
+bool host_mapper_key(int scancode, bool down);
+void host_mapper_pointer(double px, double py, int state);
+void host_mapper_wheel(double notches);
+void host_mapper_escape();
 // A finger event at drawable pixel (px, py). True when the controls claimed
 // the finger; the caller must then not give it to the gesture mapper.
 bool host_finger_down(int64_t id, double px, double py, uint64_t now);

@@ -230,7 +230,9 @@ void stick_pair(int16_t x, int16_t y, float *ox, float *oy) {
 }
 } // namespace
 
-PadState pad_from_sdl(const bool buttons[kSdlPadButtonCount], const int16_t axes[kSdlAxisCount]) {
+namespace {
+PadState pad_from_sdl_impl(const bool buttons[kSdlPadButtonCount],
+                           const int16_t axes[kSdlAxisCount], bool deadzone) {
     static const struct {
         int sdl;
         uint16_t bit;
@@ -256,8 +258,15 @@ PadState pad_from_sdl(const bool buttons[kSdlPadButtonCount], const int16_t axes
     for (const auto &h : kHat)
         if (buttons[h.sdl])
             p.hat |= h.bit;
-    stick_pair(axes[kSdlAxisLeftX], axes[kSdlAxisLeftY], &p.lx, &p.ly);
-    stick_pair(axes[kSdlAxisRightX], axes[kSdlAxisRightY], &p.rx, &p.ry);
+    if (deadzone) {
+        stick_pair(axes[kSdlAxisLeftX], axes[kSdlAxisLeftY], &p.lx, &p.ly);
+        stick_pair(axes[kSdlAxisRightX], axes[kSdlAxisRightY], &p.rx, &p.ry);
+    } else {
+        p.lx = unit_axis(axes[kSdlAxisLeftX], -1.0f);
+        p.ly = unit_axis(axes[kSdlAxisLeftY], -1.0f);
+        p.rx = unit_axis(axes[kSdlAxisRightX], -1.0f);
+        p.ry = unit_axis(axes[kSdlAxisRightY], -1.0f);
+    }
     p.l2 = unit_axis(axes[kSdlAxisLeftTrigger], 0.0f);
     p.r2 = unit_axis(axes[kSdlAxisRightTrigger], 0.0f);
     if (p.l2 > 0.5f)
@@ -265,6 +274,16 @@ PadState pad_from_sdl(const bool buttons[kSdlPadButtonCount], const int16_t axes
     if (p.r2 > 0.5f)
         p.buttons |= kPadR2;
     return p;
+}
+} // namespace
+
+PadState pad_from_sdl(const bool buttons[kSdlPadButtonCount], const int16_t axes[kSdlAxisCount]) {
+    return pad_from_sdl_impl(buttons, axes, true);
+}
+
+PadState pad_from_sdl_raw(const bool buttons[kSdlPadButtonCount],
+                          const int16_t axes[kSdlAxisCount]) {
+    return pad_from_sdl_impl(buttons, axes, false);
 }
 
 } // namespace controls

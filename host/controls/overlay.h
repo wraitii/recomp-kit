@@ -40,6 +40,13 @@ struct DrawControl {
     std::string label_off;
 };
 
+struct DrawMeter {
+    Rect rect;
+    std::string label;
+    double value = 0;
+    bool bipolar = false;
+};
+
 struct ControlsView {
     bool wanted = false;   // draw anything at all
     uint64_t revision = 0; // changes when anything below changes
@@ -59,6 +66,7 @@ struct ControlsView {
     int selected = -1;
     std::vector<DrawControl> toolbar;
     std::vector<DrawControl> picker_rows;
+    std::vector<DrawMeter> meters;
     Rect picker;
     Rect grid_area;
     int grid_step = 0;

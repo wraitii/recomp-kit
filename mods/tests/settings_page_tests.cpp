@@ -1,6 +1,7 @@
 // settings_page_tests.cpp - navigation, editing and the drawing itself.
 #include "mods_tests.h"
 #include "../display_settings.h"
+#include "../controls_settings.h"
 #include "../mods_internal.h"
 #include "../../runtime/memory.h"
 #include <limits>
@@ -222,9 +223,9 @@ MOD_TEST_SUITE(page_toggles_on_its_reserved_key) {
     MOD_CHECK(mods_input_key(0x44, 0x79, true)); // F10, consumed
     mods_input_key(0x44, 0x79, false);
     MOD_CHECK(mods_page_visible());
-    // Three mod settings, the controls' seven rows and either all nine
+    // Three mod settings, the controls rows and either all nine
     // display rows or only the three host controls when no symbols are available.
-    MOD_CHECK_EQ(mods_page_line_count(), mods_symbols_count() ? 19u : 13u);
+    MOD_CHECK_EQ(mods_page_line_count(), (mods_symbols_count() ? 12u : 6u) + CONTROLS_ROW_COUNT);
     MOD_CHECK(mods_input_key(0x44, 0x79, true));
     mods_input_key(0x44, 0x79, false);
     MOD_CHECK(!mods_page_visible());
@@ -237,8 +238,7 @@ MOD_TEST_SUITE(page_shows_only_the_rows_the_game_lists) {
                                 1u << DISPLAY_CONTROLS_BIT);
     setup();
     mods_page_open(nullptr);
-    // Three mod settings, Display, Performance overlay and the controls' seven.
-    MOD_CHECK_EQ(mods_page_line_count(), 12u);
+    MOD_CHECK_EQ(mods_page_line_count(), 5u + CONTROLS_ROW_COUNT);
     MOD_CHECK(std::string(mods_page_line(0)).find("Display:") == 0);
     MOD_CHECK(std::string(mods_page_line(1)).find("Performance overlay:") == 0);
     MOD_CHECK(std::string(mods_page_line(2)).find("Controls") == 0);

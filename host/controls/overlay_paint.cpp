@@ -65,11 +65,41 @@ void paint_editor_key(Canvas &c, const DrawControl &d, const Rect &r) {
     const double radius = std::min(8.0, std::min(w, h) / 3.0);
     c.round_rect(x, y, w, h, radius,
                  d.lit ? flat(kAccentR, kAccentG, kAccentB, 235) : flat(40, 48, 64, 235));
-    const char *label = d.label.c_str();
+    std::string label = d.label;
     const Rgba text_color = d.lit ? Rgba{10, 12, 20, 255} : Rgba{235, 242, 255, 255};
-    const int scale = c.text_width(label, 2) > w - 8 ? 1 : 2;
-    c.text(x + (w - c.text_width(label, scale)) / 2, y + (h - 8 * scale) / 2, label, text_color,
-           scale, true);
+    const int scale = c.text_width(label.c_str(), 2) > w - 8 ? 1 : 2;
+    while (!label.empty() && c.text_width(label.c_str(), scale) > w - 8)
+        label.pop_back();
+    if (label != d.label && label.size() > 2) {
+        label.back() = '.';
+        label[label.size() - 2] = '.';
+    }
+    c.text(x + (w - c.text_width(label.c_str(), scale)) / 2, y + (h - 8 * scale) / 2, label.c_str(),
+           text_color, scale, true);
+}
+
+void paint_meter(Canvas &c, const DrawMeter &m, const Rect &r) {
+    const int x = m.rect.x - r.x, y = m.rect.y - r.y, w = m.rect.w, h = m.rect.h;
+    if (w <= 0 || h <= 0)
+        return;
+    c.round_rect(x, y, w, h, std::min(4.0, h / 3.0), flat(20, 25, 34, 230));
+    const double value = std::clamp(m.value, m.bipolar ? -1.0 : 0.0, 1.0);
+    if (m.bipolar) {
+        const int centre = x + w / 2;
+        const int length = int((w / 2 - 2) * std::abs(value));
+        c.rect(value < 0 ? centre - length : centre, y + 2, length, h - 4, flat(93, 170, 255, 235));
+        c.rect(centre, y + 1, 1, h - 2, flat(205, 215, 230, 180));
+    } else {
+        c.rect(x + 2, y + 2, int((w - 4) * value), h - 4, flat(93, 170, 255, 235));
+    }
+    std::string label = m.label;
+    while (!label.empty() && c.text_width(label.c_str(), 1) > w - 10)
+        label.pop_back();
+    if (label != m.label && label.size() > 2) {
+        label.back() = '.';
+        label[label.size() - 2] = '.';
+    }
+    c.text(x + 5, y + (h - 8) / 2, label.c_str(), Rgba{245, 248, 255, 255}, 1, true);
 }
 
 } // namespace
@@ -92,6 +122,8 @@ void paint_editor(Canvas &c, const ControlsView &view, const Rect &r) {
         c.rect(b.x - r.x, b.y - r.y, b.w, b.h, flat(6, 9, 15, 150));
     for (const DrawControl &d : view.controls)
         paint_one(c, d, r);
+    for (const DrawMeter &m : view.meters)
+        paint_meter(c, m, r);
     // The selection: a 3 px accent frame on the control's own edge.
     if (view.selected >= 0 && view.selected < int(view.controls.size())) {
         const Rect &b = view.controls[view.selected].rect;

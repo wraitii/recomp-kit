@@ -19,8 +19,8 @@ namespace {
 std::mutex g_names_mutex;
 std::vector<std::string> g_names = {"pad", "keys", "pad+keys"};
 
-// EDIT_ROW is not one of these: it is never declared or persisted.
-constexpr int kStoredRowCount = CONTROLS_EDIT_ROW;
+// MAPPER_ROW and EDIT_ROW are actions, never declared or persisted.
+constexpr int kStoredRowCount = CONTROLS_MAPPER_ROW;
 const char *const kKeys[kStoredRowCount] = {
     "layout", "size", "opacity", "haptics", "pad_with_controller", "snap"};
 const char *const kLabels[kStoredRowCount] = {
@@ -33,7 +33,7 @@ const int kMax[kStoredRowCount] = {0, 2, 100, 1, 1, 1};
 
 // Written by the settings page and the on-screen tab, read by the host loop
 // that lays the controls out: each value is atomic on its own.
-std::atomic<int> values[CONTROLS_ROW_COUNT] = {0, 1, 100, 1, 0, 1, 0};
+std::atomic<int> values[CONTROLS_ROW_COUNT] = {0, 1, 100, 1, 0, 1, 0, 0};
 // The hidden-group bits: one 16-bit lane per form factor, packed into the
 // single stored "hidden" value with kHiddenPacked as the marker that says so.
 // A value without the marker was written by the build that kept one set of
@@ -49,6 +49,7 @@ std::atomic<bool> hidden_legacy{false};
 // A hidden-group change the host has not flushed to the settings store yet.
 std::atomic<bool> hidden_dirty{false};
 std::atomic<bool> edit_request{false};
+std::atomic<bool> mapper_request{false};
 std::atomic<bool> editing{false};
 std::atomic<bool> initialized{false};
 
@@ -196,10 +197,12 @@ void mods_controls_reset() {
     values[CONTROLS_HAPTICS_ROW] = 1;
     values[CONTROLS_PAD_WITH_CONTROLLER_ROW] = 0;
     values[CONTROLS_SNAP_ROW] = 1;
+    values[CONTROLS_MAPPER_ROW] = 0;
     values[CONTROLS_EDIT_ROW] = 0;
     unpack_hidden(kHiddenPacked);
     hidden_dirty = false;
     edit_request = false;
+    mapper_request = false;
     editing = false;
 }
 
@@ -214,6 +217,10 @@ std::string mods_controls_layout_name() {
 PopModStatus mods_controls_set(ControlsRow row, int value) {
     if (row < 0 || row >= CONTROLS_ROW_COUNT)
         return POP_E_INVAL;
+    if (row == CONTROLS_MAPPER_ROW) {
+        mapper_request = true;
+        return POP_OK;
+    }
     if (row == CONTROLS_EDIT_ROW) {
         edit_request = true;
         return POP_OK;
@@ -232,6 +239,10 @@ PopModStatus mods_controls_set(ControlsRow row, int value) {
 PopModStatus mods_controls_nudge(ControlsRow row, int delta) {
     if (row < 0 || row >= CONTROLS_ROW_COUNT)
         return POP_E_INVAL;
+    if (row == CONTROLS_MAPPER_ROW) {
+        mapper_request = true;
+        return POP_OK;
+    }
     if (row == CONTROLS_EDIT_ROW) {
         edit_request = true;
         return POP_OK;
@@ -283,6 +294,9 @@ std::string mods_controls_line(ControlsRow row) {
     case CONTROLS_EDIT_ROW:
         snprintf(buf, sizeof buf, "%-22s %s", "Edit controls", ">");
         break;
+    case CONTROLS_MAPPER_ROW:
+        snprintf(buf, sizeof buf, "%-22s %s", "Controller setup", ">");
+        break;
     default:
         buf[0] = '\0';
     }
@@ -317,6 +331,10 @@ void mods_controls_flush() {
 
 bool mods_controls_take_edit_request() {
     return edit_request.exchange(false);
+}
+
+bool mods_controls_take_mapper_request() {
+    return mapper_request.exchange(false);
 }
 
 bool mods_controls_editing() {

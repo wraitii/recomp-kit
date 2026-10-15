@@ -87,6 +87,9 @@ HOST_DEFAULT void host_audio_stop(int32_t) {}
 HOST_DEFAULT void host_audio_set_volume(int32_t, int32_t) {}
 HOST_DEFAULT void host_audio_set_pan(int32_t, int32_t) {}
 HOST_DEFAULT void host_audio_set_frequency(int32_t, uint32_t) {}
+HOST_DEFAULT void host_audio_set_reverb(uint32_t, float, float, float) {}
+HOST_DEFAULT void host_audio_delete_reverb(uint32_t) {}
+HOST_DEFAULT void host_audio_set_reverb_send(int32_t, uint32_t, float, float) {}
 HOST_DEFAULT uint32_t host_audio_position(int32_t) {
     return 0;
 }
@@ -120,6 +123,7 @@ HOST_DEFAULT int host_pad_next_event(uint32_t, HostPadEvent *) {
     return 0;
 }
 HOST_DEFAULT void host_pad_rumble(uint16_t, uint16_t) {}
+HOST_DEFAULT void host_pad_report_guest_state(const HostPadGuestState *) {}
 HOST_DEFAULT const char *host_pad_native_axes(void) {
     return "x,y,z,rz,rx,ry";
 }

@@ -7,6 +7,7 @@
 #include "../imports.h"
 #include "../thunks.h"
 #include <stdio.h>
+#include <stdlib.h>
 
 extern "C" void recomp_call(X86 *c, uint32_t target) {
     if (recomp_module_call(c, target))
@@ -32,4 +33,9 @@ extern "C" int recomp_is_call_return(uint32_t) {
 // call already reaches, so the two behave alike here.
 extern "C" void recomp_jump(X86 *c, uint32_t target) {
     recomp_call(c, target);
+}
+
+extern "C" void recomp_unknown_jump(X86 *, uint32_t target) {
+    fprintf(stderr, "[stub] unknown jump to %08x\n", target);
+    abort();
 }

@@ -151,10 +151,25 @@ and handles edge scrolling and focus. Relative DirectInput counts pass through
 unchanged; absolute Win32 positions use the compositor's current guest mapping.
 `host/controls/` holds the on-screen controls: a layout model and hit test, a
 router that owns each finger, a virtual pad that on-screen and physical
-controllers both write to, a binding stage that turns the pad into keys and
-mouse (or, in `native` mode, into the DirectInput joystick and XInput devices
-in `dx/`), the overlay that draws it and the on-device editor. Everything but
-the overlay and the SDL glue is SDL-free and unit-tested in `controls_tests`.
+controllers both write to, the overlay that draws it and the on-device editor.
+The controller setup editor calibrates normalized SDL axes and routes each
+physical axis, button and hat direction to guest controls and keyboard keys.
+Its preview runs on a draft profile while guest input is neutral; Apply saves
+the profile under `controls/mapper-v1.txt` in the selected game profile.
+Calibration includes center and range capture, radial stick and per-axis
+deadzones, saturation, response curves and inversion. Output scale and offset
+allow pedals to feed separate axes or opposite halves of a combined axis.
+`pad = "mapped"`, `"native"` and `"off"` initialize the profile defaults;
+saved profiles can enable joystick and keyboard output together at runtime.
+Games that enumerate controllers only at startup need a restart after enabling
+joystick exposure. The current SDL host opens the first recognized controller;
+calibration is stored per game profile, not separately for each physical device.
+The existing mapped binding remains available for keyboard/mouse controls.
+DirectInput and XInput report their latest delivered axis values and ranges
+to a thread-safe monitor, separate from the editor's preview. Guest-requested
+DirectInput ranges and formats remain authoritative. The calibration and
+mapping model is SDL-free; existing controls and pad suites exercise the
+underlying input and API adapters.
 See `docs/superpowers/specs/2026-09-17-touch-controls-design.md`.
 `mods/display_settings.cpp` validates host display choices and applies rendering
 and projection changes at the frame boundary. `mods/settings.cpp` atomically

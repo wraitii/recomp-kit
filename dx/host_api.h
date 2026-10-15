@@ -349,6 +349,15 @@ void host_pad_rumble(uint16_t low, uint16_t high);
 const char *host_pad_native_axes(void);
 const char *host_pad_native_buttons(void);
 
+typedef struct HostPadGuestState {
+    uint32_t api, packet;
+    uint32_t partial, buttons_present, pov_present;
+    int32_t axes[6], minimum[6], maximum[6];
+    uint32_t buttons, pov;
+    uint8_t present[6];
+} HostPadGuestState;
+void host_pad_report_guest_state(const HostPadGuestState *state);
+
 // ---------------------------------------------------------------------------
 // How the guest has been reaching its surfaces.
 //
