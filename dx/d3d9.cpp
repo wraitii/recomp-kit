@@ -4004,7 +4004,8 @@ static bool efx_hr_failed(uint32_t hr) {
 }
 
 static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
-                                      const rust::Vec<recomp::d3d::D3dxEffectCommand> &commands) {
+                                      const rust::Vec<recomp::d3d::D3dxEffectCommand> &commands,
+                                      const rust::Vec<float> &values) {
     D3dxEffectHost *host = efx_host(fx);
     if (!host || !dev || !dev->d3d9_device)
         return D3DERR_INVALIDCALL;
@@ -4109,44 +4110,55 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
         return host->dispatch_scratch;
     };
 
+    struct ManagerMethod {
+        uint32_t fn = 0;
+        RecompHostCall host = nullptr;
+        bool resolved = false;
+    };
+    ManagerMethod methods[EFX_MANAGER_SET_PIXEL_SHADER_CONSTANT_F / 4 + 1];
+    auto method = [&](uint32_t offset, const char *name, uint32_t nargs) -> const ManagerMethod & {
+        ManagerMethod &m = methods[offset / 4];
+        if (!m.resolved) {
+            m.fn = efx_manager_method(manager, offset, name);
+            m.host = m.fn ? recomp_host_call(m.fn, nargs) : nullptr;
+            m.resolved = true;
+        }
+        return m;
+    };
+    auto invoke = [&](uint32_t offset, const char *name,
+                      std::initializer_list<uint32_t> args) -> uint32_t {
+        const ManagerMethod &m = method(offset, name, (uint32_t)args.size());
+        if (!m.fn) {
+            stale = true;
+            return D3D_OK9;
+        }
+        if (m.host)
+            return m.host(c, args.begin());
+        return guest_call(c, m.fn, args.begin(), (int)args.size());
+    };
+    const float *value_data = values.data();
+    const size_t value_total = values.size();
+
     uint32_t failure = D3D_OK9;
     for (size_t i = 0; i < command_count && !oom; ++i) {
         const recomp::d3d::D3dxEffectCommand &cmd = cmd_list[i];
         uint32_t result = D3D_OK9;
         switch (cmd.kind) {
-        case recomp::d3d::D3dxEffectCommandKind::SetRenderState: {
-            uint32_t fn =
-                efx_manager_method(manager, EFX_MANAGER_SET_RENDER_STATE, "SetRenderState");
-            if (!fn) {
-                stale = true;
-                break;
-            }
-            result = guest_call(c, fn, manager, cmd.state, cmd.value);
+        case recomp::d3d::D3dxEffectCommandKind::SetRenderState:
+            result = invoke(EFX_MANAGER_SET_RENDER_STATE, "SetRenderState",
+                            {manager, cmd.state, cmd.value});
             break;
-        }
-        case recomp::d3d::D3dxEffectCommandKind::SetTextureStageState: {
-            uint32_t fn = efx_manager_method(manager, EFX_MANAGER_SET_TEXTURE_STAGE_STATE,
-                                             "SetTextureStageState");
-            if (!fn) {
-                stale = true;
-                break;
-            }
-            result = guest_call(c, fn, manager, cmd.index, cmd.state, cmd.value);
+        case recomp::d3d::D3dxEffectCommandKind::SetTextureStageState:
+            result = invoke(EFX_MANAGER_SET_TEXTURE_STAGE_STATE, "SetTextureStageState",
+                            {manager, cmd.index, cmd.state, cmd.value});
             break;
-        }
-        case recomp::d3d::D3dxEffectCommandKind::SetSamplerState: {
-            uint32_t fn =
-                efx_manager_method(manager, EFX_MANAGER_SET_SAMPLER_STATE, "SetSamplerState");
-            if (!fn) {
-                stale = true;
-                break;
-            }
-            result = guest_call(c, fn, manager, cmd.index, cmd.state, cmd.value);
+        case recomp::d3d::D3dxEffectCommandKind::SetSamplerState:
+            result = invoke(EFX_MANAGER_SET_SAMPLER_STATE, "SetSamplerState",
+                            {manager, cmd.index, cmd.state, cmd.value});
             break;
-        }
         case recomp::d3d::D3dxEffectCommandKind::SetTransform: {
-            uint32_t fn = efx_manager_method(manager, EFX_MANAGER_SET_TRANSFORM, "SetTransform");
-            if (!fn) {
+            if (cmd.count != 16 || (size_t)cmd.offset + 16 > value_total) {
+                LOGW("d3d9: ID3DXEffectStateManager::SetTransform has an invalid matrix span");
                 stale = true;
                 break;
             }
@@ -4155,68 +4167,40 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
                 oom = true;
                 break;
             }
-            memcpy(gm_ptr(buf), cmd.matrix.data(), 64);
-            result = guest_call(c, fn, manager, cmd.state, buf);
+            memcpy(gm_ptr(buf), value_data + cmd.offset, 64);
+            result = invoke(EFX_MANAGER_SET_TRANSFORM, "SetTransform", {manager, cmd.state, buf});
             break;
         }
-        case recomp::d3d::D3dxEffectCommandKind::SetTexture: {
-            uint32_t fn = efx_manager_method(manager, EFX_MANAGER_SET_TEXTURE, "SetTexture");
-            if (!fn) {
-                stale = true;
-                break;
-            }
-            result = guest_call(c, fn, manager, cmd.index, resolved[i]);
+        case recomp::d3d::D3dxEffectCommandKind::SetTexture:
+            result = invoke(EFX_MANAGER_SET_TEXTURE, "SetTexture", {manager, cmd.index, resolved[i]});
             break;
-        }
-        case recomp::d3d::D3dxEffectCommandKind::SetVertexShader: {
-            uint32_t fn =
-                efx_manager_method(manager, EFX_MANAGER_SET_VERTEX_SHADER, "SetVertexShader");
-            if (!fn) {
-                stale = true;
-                break;
-            }
-            result = guest_call(c, fn, manager, resolved[i]);
+        case recomp::d3d::D3dxEffectCommandKind::SetVertexShader:
+            result = invoke(EFX_MANAGER_SET_VERTEX_SHADER, "SetVertexShader", {manager, resolved[i]});
             break;
-        }
-        case recomp::d3d::D3dxEffectCommandKind::SetPixelShader: {
-            uint32_t fn =
-                efx_manager_method(manager, EFX_MANAGER_SET_PIXEL_SHADER, "SetPixelShader");
-            if (!fn) {
-                stale = true;
-                break;
-            }
-            result = guest_call(c, fn, manager, resolved[i]);
+        case recomp::d3d::D3dxEffectCommandKind::SetPixelShader:
+            result = invoke(EFX_MANAGER_SET_PIXEL_SHADER, "SetPixelShader", {manager, resolved[i]});
             break;
-        }
         case recomp::d3d::D3dxEffectCommandKind::SetVertexShaderConstantF:
         case recomp::d3d::D3dxEffectCommandKind::SetPixelShaderConstantF: {
             bool vertex = cmd.kind == recomp::d3d::D3dxEffectCommandKind::SetVertexShaderConstantF;
-            uint32_t fn =
-                efx_manager_method(manager,
-                                   vertex ? EFX_MANAGER_SET_VERTEX_SHADER_CONSTANT_F
-                                          : EFX_MANAGER_SET_PIXEL_SHADER_CONSTANT_F,
-                                   vertex ? "SetVertexShaderConstantF" : "SetPixelShaderConstantF");
-            if (!fn) {
+            const char *name = vertex ? "SetVertexShaderConstantF" : "SetPixelShaderConstantF";
+            if (cmd.count % 4 != 0 || (size_t)cmd.offset + cmd.count > value_total ||
+                cmd.count > UINT32_MAX / 4) {
+                LOGW("d3d9: ID3DXEffectStateManager::%s has an invalid constant span", name);
                 stale = true;
                 break;
             }
-            const size_t value_count = cmd.values.size();
-            if (value_count % 4 != 0 || value_count > UINT32_MAX / 4) {
-                LOGW("d3d9: ID3DXEffectStateManager::%s has an invalid constant span",
-                     vertex ? "SetVertexShaderConstantF" : "SetPixelShaderConstantF");
-                stale = true;
-                break;
-            }
-            uint32_t count = (uint32_t)value_count / 4;
-            uint32_t bytes = (uint32_t)value_count * 4;
+            uint32_t bytes = cmd.count * 4;
             uint32_t buf = temporary(bytes);
             if (bytes && !buf) {
                 oom = true;
                 break;
             }
             if (bytes)
-                memcpy(gm_ptr(buf), cmd.values.data(), bytes);
-            result = guest_call(c, fn, manager, cmd.index, buf, count);
+                memcpy(gm_ptr(buf), value_data + cmd.offset, bytes);
+            result = invoke(vertex ? EFX_MANAGER_SET_VERTEX_SHADER_CONSTANT_F
+                                   : EFX_MANAGER_SET_PIXEL_SHADER_CONSTANT_F,
+                            name, {manager, cmd.index, buf, cmd.count / 4});
             break;
         }
         default:
@@ -4239,8 +4223,9 @@ static uint32_t efx_dispatch_commands(X86 *c, ComObj *fx, ComObj *dev,
 }
 
 static uint32_t efx_run(X86 *c, ComObj *fx, ComObj *dev,
-                        const recomp::d3d::D3dxEffectRunResult &result) {
+                        recomp::d3d::D3dxEffectRunResult &result) {
     D3dxEffectHost *host = efx_host(fx);
+    uint32_t hr;
     if (result.status.code != recomp::d3d::StatusCode::Ok) {
         if (result.reserved)
             recomp::d3d::d3dx_effect_batch_finish(*host->value, false);
@@ -4248,13 +4233,16 @@ static uint32_t efx_run(X86 *c, ComObj *fx, ComObj *dev,
         if (ComObj *pool = com_get(host->pool_obj))
             efx_refresh_pool_textures(pool);
         d3d9_refresh_bindings(dev);
-        return bridge_result(c, result.status);
+        hr = bridge_result(c, result.status);
+    } else {
+        hr = efx_dispatch_commands(c, fx, dev, result.commands, result.values);
+        if (result.reserved)
+            recomp::d3d::d3dx_effect_batch_finish(*host->value, !efx_hr_failed(hr));
+        else
+            d3d9_refresh_bindings(dev);
     }
-    uint32_t hr = efx_dispatch_commands(c, fx, dev, result.commands);
-    if (result.reserved)
-        recomp::d3d::d3dx_effect_batch_finish(*host->value, !efx_hr_failed(hr));
-    else
-        d3d9_refresh_bindings(dev);
+    recomp::d3d::d3dx_effect_recycle(*host->value, std::move(result.commands),
+                                     std::move(result.values));
     return hr;
 }
 

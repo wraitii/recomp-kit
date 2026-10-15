@@ -638,6 +638,7 @@ extern uint8_t recomp_hooks_ever;
  * guest's callee-saved registers and ESP as the original would. */
 typedef uint32_t (*RecompHostCall)(X86 *c, const uint32_t *args);
 void recomp_register_host_call(uint32_t fn, uint32_t nargs, RecompHostCall call);
+RecompHostCall recomp_host_call(uint32_t fn, uint32_t nargs);
 uint32_t recomp_guest_call(X86 *c, uint32_t fn, const uint32_t *args, int nargs);
 
 uint32_t recomp_override_count(void);

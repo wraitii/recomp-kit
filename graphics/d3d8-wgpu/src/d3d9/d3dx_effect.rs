@@ -362,7 +362,8 @@ pub struct D3dxEffect {
     children: RefCell<ChildState>,
     param_names: FastMap<Vec<u8>, usize>,
     pass_version: u64,
-    command_capacity: usize,
+    spare_commands: Vec<D3dxEffectCommand>,
+    spare_values: Vec<f32>,
     targets: RefCell<FastMap<u32, ParamTarget>>,
 }
 
@@ -390,7 +391,8 @@ impl Default for D3dxEffect {
             children: RefCell::new(ChildState::default()),
             param_names: Default::default(),
             pass_version: 0,
-            command_capacity: 0,
+            spare_commands: Vec::new(),
+            spare_values: Vec::new(),
             targets: RefCell::default(),
         }
     }
@@ -2922,7 +2924,7 @@ fn sampler_param_states<'a>(effect: &'a D3dxEffect, index: usize) -> Option<&'a 
 
 enum StateSink<'a> {
     Device(&'a mut D3d9Device),
-    Commands(&'a mut Vec<D3dxEffectCommand>),
+    Commands(&'a mut Vec<D3dxEffectCommand>, &'a mut Vec<f32>),
 }
 
 impl StateSink<'_> {
@@ -2932,7 +2934,7 @@ impl StateSink<'_> {
                 .state
                 .set_render_state(state, value)
                 .map_err(|_| invalid_data("render state is out of bounds")),
-            StateSink::Commands(commands) => {
+            StateSink::Commands(commands, values_out) => {
                 commands.push(effect_command(
                     D3dxEffectCommandKind::SetRenderState,
                     0,
@@ -2955,7 +2957,7 @@ impl StateSink<'_> {
                 .state
                 .set_texture_stage_state(stage, state, value)
                 .map_err(|_| invalid_data("texture stage state is out of bounds")),
-            StateSink::Commands(commands) => {
+            StateSink::Commands(commands, values_out) => {
                 commands.push(effect_command(
                     D3dxEffectCommandKind::SetTextureStageState,
                     stage,
@@ -2973,7 +2975,7 @@ impl StateSink<'_> {
                 .state
                 .set_sampler_state(sampler, state, value)
                 .map_err(|_| invalid_data("sampler state is out of bounds")),
-            StateSink::Commands(commands) => {
+            StateSink::Commands(commands, values_out) => {
                 commands.push(effect_command(
                     D3dxEffectCommandKind::SetSamplerState,
                     sampler,
@@ -2991,9 +2993,11 @@ impl StateSink<'_> {
                 .state
                 .set_transform(state, matrix)
                 .map_err(|_| invalid_data("texture transform is out of bounds")),
-            StateSink::Commands(commands) => {
+            StateSink::Commands(commands, values_out) => {
                 let mut command = effect_command(D3dxEffectCommandKind::SetTransform, 0, state, 0);
-                command.matrix = matrix;
+                command.offset = values_out.len() as u32;
+                command.count = 16;
+                values_out.extend_from_slice(&matrix);
                 commands.push(command);
                 Ok(())
             }
@@ -3006,7 +3010,7 @@ impl StateSink<'_> {
                 .state
                 .set_texture(stage, id)
                 .map_err(|_| invalid_data("texture stage is out of bounds")),
-            StateSink::Commands(commands) => {
+            StateSink::Commands(commands, values_out) => {
                 commands.push(effect_command(
                     D3dxEffectCommandKind::SetTexture,
                     stage,
@@ -3024,7 +3028,7 @@ impl StateSink<'_> {
                 device.state.set_shader(pixel, handle);
                 Ok(())
             }
-            StateSink::Commands(commands) => {
+            StateSink::Commands(commands, values_out) => {
                 let kind = if pixel {
                     D3dxEffectCommandKind::SetPixelShader
                 } else {
@@ -3047,14 +3051,16 @@ impl StateSink<'_> {
                 .state
                 .set_constants_f(pixel, start, &values)
                 .map_err(|_| invalid_data("shader constant range is out of bounds")),
-            StateSink::Commands(commands) => {
+            StateSink::Commands(commands, values_out) => {
                 let kind = if pixel {
                     D3dxEffectCommandKind::SetPixelShaderConstantF
                 } else {
                     D3dxEffectCommandKind::SetVertexShaderConstantF
                 };
                 let mut command = effect_command(kind, start, 0, 0);
-                command.values = values.into_owned();
+                command.offset = values_out.len() as u32;
+                command.count = values.len() as u32;
+                values_out.extend_from_slice(&values);
                 commands.push(command);
                 Ok(())
             }
@@ -3073,8 +3079,8 @@ fn effect_command(
         index,
         state,
         value,
-        matrix: [0.0; 16],
-        values: Vec::new(),
+        offset: 0,
+        count: 0,
     }
 }
 
@@ -3803,25 +3809,23 @@ fn prepare_pass(
         "ID3DXEffect::BeginPass"
     };
     let manager = effect.manager_mode;
-    let mut commands = if manager {
-        Vec::with_capacity(effect.command_capacity.max(states.len() * 2))
-    } else {
-        Vec::new()
-    };
+    let mut commands = std::mem::take(&mut effect.spare_commands);
+    let mut values = std::mem::take(&mut effect.spare_values);
+    commands.clear();
+    values.clear();
     let ctx = Apply {
         since: commit.then_some(effect.pass_version),
         now: next_version(),
         commit,
     };
     if manager {
-        let mut sink = StateSink::Commands(&mut commands);
+        let mut sink = StateSink::Commands(&mut commands, &mut values);
         for state in states {
             if let Err(error) = apply_state(effect, &mut sink, state, ctx) {
                 return run_result(failed(label, error));
             }
         }
         effect.pass_version = ctx.now;
-        effect.command_capacity = effect.command_capacity.max(commands.len());
         effect.batch = Some(if commit {
             EffectBatch::Commit
         } else {
@@ -3830,6 +3834,7 @@ fn prepare_pass(
         D3dxEffectRunResult {
             status: ok(),
             commands,
+            values,
             reserved: true,
         }
     } else {
@@ -3844,6 +3849,7 @@ fn prepare_pass(
         D3dxEffectRunResult {
             status: ok(),
             commands,
+            values,
             reserved: false,
         }
     }
@@ -3853,7 +3859,21 @@ fn run_result(status: Status) -> D3dxEffectRunResult {
     D3dxEffectRunResult {
         status,
         commands: Vec::new(),
+        values: Vec::new(),
         reserved: false,
+    }
+}
+
+pub fn d3dx_effect_recycle(
+    effect: &mut D3dxEffect,
+    commands: Vec<D3dxEffectCommand>,
+    values: Vec<f32>,
+) {
+    if commands.capacity() > effect.spare_commands.capacity() {
+        effect.spare_commands = commands;
+    }
+    if values.capacity() > effect.spare_values.capacity() {
+        effect.spare_values = values;
     }
 }
 

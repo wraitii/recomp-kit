@@ -585,13 +585,14 @@ pub mod ffi {
         index: u32,
         state: u32,
         value: u32,
-        matrix: [f32; 16],
-        values: Vec<f32>,
+        offset: u32,
+        count: u32,
     }
 
     struct D3dxEffectRunResult {
         status: Status,
         commands: Vec<D3dxEffectCommand>,
+        values: Vec<f32>,
         reserved: bool,
     }
 
@@ -1084,6 +1085,11 @@ pub mod ffi {
             device: &mut D3d9Device,
         ) -> D3dxEffectRunResult;
         fn d3dx_effect_batch_finish(effect: &mut D3dxEffect, ok: bool) -> Status;
+        fn d3dx_effect_recycle(
+            effect: &mut D3dxEffect,
+            commands: Vec<D3dxEffectCommand>,
+            values: Vec<f32>,
+        );
         fn d3dx_effect_batch_active(effect: &D3dxEffect) -> bool;
         fn d3dx_effect_set_state_manager(effect: &mut D3dxEffect, active: bool) -> Status;
         fn d3dx_effect_end_pass(effect: &mut D3dxEffect) -> Status;
@@ -1733,11 +1739,11 @@ use crate::d3d9::d3dx_effect::{
     d3dx_effect_on_reset, d3dx_effect_param_desc, d3dx_effect_param_name,
     d3dx_effect_param_semantic, d3dx_effect_pass_desc, d3dx_effect_pass_shader,
     d3dx_effect_pool_id, d3dx_effect_pool_id_of, d3dx_effect_pool_texture_refs,
-    d3dx_effect_prepare_shaders, d3dx_effect_release, d3dx_effect_saved_bindings, d3dx_effect_set,
-    d3dx_effect_set_state_manager, d3dx_effect_set_technique, d3dx_effect_set_texture,
-    d3dx_effect_shutdown, d3dx_effect_technique_desc, d3dx_effect_texture,
-    d3dx_effect_texture_refs, d3dx_effect_validate_technique, new_d3dx_effect,
-    new_d3dx_effect_pool,
+    d3dx_effect_prepare_shaders, d3dx_effect_recycle, d3dx_effect_release,
+    d3dx_effect_saved_bindings, d3dx_effect_set, d3dx_effect_set_state_manager,
+    d3dx_effect_set_technique, d3dx_effect_set_texture, d3dx_effect_shutdown,
+    d3dx_effect_technique_desc, d3dx_effect_texture, d3dx_effect_texture_refs,
+    d3dx_effect_validate_technique, new_d3dx_effect, new_d3dx_effect_pool,
 };
 use crate::d3d9::{
     D3d9Device, D3d9Resource, D3dxSurfaceData, d3d9_abort_reset, d3d9_adapter_caps,

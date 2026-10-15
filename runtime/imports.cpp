@@ -745,6 +745,10 @@ extern "C" void recomp_register_host_call(uint32_t fn, uint32_t nargs, RecompHos
     g_host_calls[g_host_call_count++] = {fn, nargs, call};
 }
 
+extern "C" RecompHostCall recomp_host_call(uint32_t fn, uint32_t nargs) {
+    return g_host_call_count ? host_call_for(fn, (int)nargs) : nullptr;
+}
+
 extern "C" uint32_t recomp_guest_call(X86 *c, uint32_t fn, const uint32_t *args, int nargs) {
     return guest_call(c, fn, args, nargs);
 }
