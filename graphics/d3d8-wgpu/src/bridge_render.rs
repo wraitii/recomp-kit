@@ -304,7 +304,7 @@ pub(crate) fn set_transform(device: &mut Device, kind: u32, values: &[f32]) -> S
 }
 
 pub(crate) fn set_viewport(device: &mut Device, viewport: &Viewport) -> Status {
-    device.state_mut().viewport = RenderViewport {
+    let value = RenderViewport {
         x: viewport.x,
         y: viewport.y,
         width: viewport.width,
@@ -312,6 +312,9 @@ pub(crate) fn set_viewport(device: &mut Device, viewport: &Viewport) -> Status {
         min_z: viewport.min_z,
         max_z: viewport.max_z,
     };
+    if let Err(error) = device.state_mut().set_viewport(value) {
+        return status_from_error(error);
+    }
     device.viewport_was_set = true;
     status(StatusCode::Ok, "")
 }

@@ -391,6 +391,33 @@ impl DeviceState {
         }
     }
 
+    pub fn set_viewport(&mut self, viewport: Viewport) -> Result<(), RenderError> {
+        if viewport
+            .x
+            .checked_add(viewport.width)
+            .is_none_or(|x| x > self.target_width)
+            || viewport
+                .y
+                .checked_add(viewport.height)
+                .is_none_or(|y| y > self.target_height)
+        {
+            return Err(RenderError::invalid(
+                "SetViewport",
+                format!(
+                    "viewport ({}, {} {}x{}) outside render target {}x{}; previous viewport retained",
+                    viewport.x,
+                    viewport.y,
+                    viewport.width,
+                    viewport.height,
+                    self.target_width,
+                    self.target_height
+                ),
+            ));
+        }
+        self.viewport = viewport;
+        Ok(())
+    }
+
     /// `IDirect3DDevice8::SetTransform`. Accepts `D3DTS_WORLD`, `D3DTS_VIEW`,
     /// `D3DTS_PROJECTION` and the eight `D3DTS_TEXTURE0`..`D3DTS_TEXTURE7`
     /// states. The world/view/projection matrices drive the raster transform;

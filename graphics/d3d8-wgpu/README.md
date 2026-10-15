@@ -49,6 +49,8 @@ Clear accepts host copies of guest D3DRECT arrays, clips each rectangle to the
 current viewport, and preserves color/depth/stencil outside the selected regions.
 An empty array clears the viewport. The bridge validates guest spans and copies
 unaligned records before calling Rust; rectangle memory is consumed before return.
+SetViewport rejects rectangles outside the current logical render target with
+D3DERR_INVALIDCALL and preserves the previous viewport. Empty viewports clear no pixels.
 
 CreateDevice and Reset accept lockable 32-bit backbuffers. LockRect stages GPU
 pixels in guest memory in D3D byte order; writable UnlockRect uploads only the

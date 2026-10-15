@@ -194,6 +194,7 @@ impl Device {
         }
         self.target = target;
         self.targets.current = key;
+        self.state.set_target_size(width, height);
         // Pipelines are keyed by the target's color/depth format and write mask,
         // so a target switch needs no cache invalidation.
         if change_color {
