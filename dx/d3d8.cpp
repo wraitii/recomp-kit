@@ -869,6 +869,7 @@ void Dev_Reset(X86 *c) {
     std::array<uint32_t, 8> bound_textures{};
     for (uint32_t stage = 0; stage < bound_textures.size(); ++stage)
         bound_textures[stage] = d8_bound_texture(dev, stage);
+    dev->d3d8_device->forget_textures();
     auto status = recomp::d3d::reset_device(*dev->d3d8_device->value, params);
     if (!d3d_bridge_ok(status)) {
         com_ret(c, bridge_result(c, status));
@@ -1452,6 +1453,7 @@ void Dev_SetRenderTarget(X86 *c) {
         com_ret(c, D8_ERR_INVALIDCALL);
         return;
     }
+    dev->d3d8_device->forget_textures();
     auto status = recomp::d3d::set_render_target(
         *dev->d3d8_device->value, texture ? rt->id : 0, texture ? rt->d3d8_level : 0,
         texture ? d8_resource_level_generation(rt) : 0, texture ? rt->rmask : dev->d3d8_format,
@@ -2873,6 +2875,10 @@ bool d8_sync_texture(X86 *c, ComObj *dev, uint32_t stage) {
         texture_id = tex->d3d8_levels[0];
         format = tex->rmask;
     }
+    auto &sync = dev->d3d8_device->texture_sync[stage];
+    if (sync.matches(texture_id, format, levels))
+        return true;
+    sync.valid = false;
     auto status = recomp::d3d::set_texture(
         *dev->d3d8_device->value, stage, texture_id, format,
         rust::Slice<const recomp::d3d::TextureLevel>(levels.data(), levels.size()));
@@ -2880,6 +2886,7 @@ bool d8_sync_texture(X86 *c, ComObj *dev, uint32_t stage) {
         com_ret(c, bridge_result(c, status));
         return false;
     }
+    sync.record(texture_id, format, levels);
     return true;
 }
 
@@ -3150,6 +3157,7 @@ void d3d8_reset() {
         if (!dev->d3d8_device)
             continue;
         recomp::d3d::global_reset(*dev->d3d8_device->value);
+        dev->d3d8_device->forget_textures();
         dev->d3d8_target = 0;
         dev->d3d8_target_depth = 0;
         dev->d3d8_backbuffer = 0;

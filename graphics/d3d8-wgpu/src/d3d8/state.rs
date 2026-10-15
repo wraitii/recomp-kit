@@ -27,6 +27,8 @@ pub const MAX_TEXTURE_STAGES: usize = 8;
 /// active fail by name rather than being silently dropped.
 pub const MAX_SUPPORTED_TEXTURE_STAGES: u32 = 2;
 
+static NO_TEXTURE_STAGE_STATES: BTreeMap<u32, u32> = BTreeMap::new();
+
 /// `D3DTSS_TCI_PASSTHRU`: the stage samples the vertex texture-coordinate set
 /// named by the low word of `D3DTSS_TEXCOORDINDEX`.
 pub const TEXCOORD_GEN_PASSTHRU: u32 = 0;
@@ -604,8 +606,7 @@ impl DeviceState {
     /// Shader sampling consumes sampler state, independently of combiner/texgen
     /// state. Reuse the same validation and sampler defaults as fixed function.
     pub fn resolve_shader_sampler(&self, stage: usize) -> Result<TextureStage, RenderError> {
-        let mut copy = self.clone();
-        copy.texture_stages[0] = self.texture_stages[stage].clone();
+        let mut states = self.texture_stages[stage].clone();
         for (id, value) in [
             (1, 4),
             (2, 2),
@@ -616,9 +617,15 @@ impl DeviceState {
             (11, 0),
             (24, 0),
         ] {
-            copy.texture_stages[0].insert(id, value);
+            states.insert(id, value);
         }
-        copy.resolve_texture_stage(0, true)
+        Self::resolve_stage(
+            0,
+            &states,
+            &self.texture_transforms,
+            self.states.texture_factor,
+            true,
+        )
     }
 
     /// A programmable VS supplies oTn directly; TEXCOORDINDEX and texture
@@ -628,10 +635,16 @@ impl DeviceState {
         stage: u32,
         bound: bool,
     ) -> Result<TextureStage, RenderError> {
-        let mut copy = self.clone();
-        copy.texture_stages[stage as usize].insert(11, stage);
-        copy.texture_stages[stage as usize].insert(24, 0);
-        copy.resolve_texture_stage(stage, bound)
+        let mut states = self.texture_stages[stage as usize].clone();
+        states.insert(11, stage);
+        states.insert(24, 0);
+        Self::resolve_stage(
+            stage,
+            &states,
+            &self.texture_transforms,
+            self.states.texture_factor,
+            bound,
+        )
     }
 
     /// Fixed-function vertex lighting/material and fog-generation switches are
@@ -674,9 +687,11 @@ impl DeviceState {
     /// diffuse colour and at stage 1 the stage-0 result (handled by the
     /// shader). Every other op, argument, filter or address mode fails by name,
     /// including an active stage >= 2.
-    pub fn resolve_texture_stage(
-        &self,
+    fn resolve_stage(
         stage: u32,
+        states: &BTreeMap<u32, u32>,
+        texture_transforms: &[Mat4; MAX_TEXTURE_STAGES],
+        texture_factor: u32,
         texture_bound: bool,
     ) -> Result<TextureStage, RenderError> {
         use D3DTEXTURESTAGESTATETYPE as Ts;
@@ -687,12 +702,9 @@ impl DeviceState {
                 "stage {stage} is beyond {MAX_TEXTURE_STAGES}"
             )));
         }
-        let raw = |state: Ts, default: u32| {
-            self.texture_stage_state(stage, state.raw())
-                .unwrap_or(default)
-        };
-        let explicit_color = self.texture_stage_state(stage, Ts::ColorOp.raw());
-        let explicit_alpha = self.texture_stage_state(stage, Ts::AlphaOp.raw());
+        let raw = |state: Ts, default: u32| states.get(&state.raw()).copied().unwrap_or(default);
+        let explicit_color = states.get(&Ts::ColorOp.raw()).copied();
+        let explicit_alpha = states.get(&Ts::AlphaOp.raw()).copied();
         // D3D8's defaults are stage-dependent: stage 0 is
         // MODULATE/SELECTARG1, every later stage is DISABLE/DISABLE. WineD3D's
         // `init_default_texture_state` (`dlls/wined3d/stateblock.c`) sets
@@ -809,7 +821,7 @@ impl DeviceState {
         };
         // `D3DTSS_RESULTARG` is only interesting with a temp register, which
         // the guest never uses; refuse anything but the default CURRENT.
-        if let Some(result_arg) = self.texture_stage_state(stage, Ts::ResultArg.raw()) {
+        if let Some(result_arg) = states.get(&Ts::ResultArg.raw()).copied() {
             if result_arg != d3dta::CURRENT {
                 return Err(fail(format!(
                     "D3DTSS_RESULTARG = {result_arg:#010x} is not implemented"
@@ -828,8 +840,8 @@ impl DeviceState {
         // generation path rather than being silently ignored.
         let tex_transform = match (tex_coord_gen, transform_flags) {
             (TEXCOORD_GEN_PASSTHRU, 0) => Mat4::IDENTITY,
-            (TEXCOORD_GEN_PASSTHRU, 2) => self.texture_transforms[stage as usize],
-            (TEXCOORD_GEN_CAMERASPACEPOSITION, 0x103) => self.texture_transforms[stage as usize],
+            (TEXCOORD_GEN_PASSTHRU, 2) => texture_transforms[stage as usize],
+            (TEXCOORD_GEN_CAMERASPACEPOSITION, 0x103) => texture_transforms[stage as usize],
             (TEXCOORD_GEN_PASSTHRU, other) => {
                 return Err(fail(format!(
                     "D3DTSS_TEXTURETRANSFORMFLAGS = {other:#010x} is not DISABLE or D3DTTFF_COUNT2 for a vertex texture coordinate"
@@ -948,7 +960,7 @@ impl DeviceState {
             alpha_op,
             alpha_arg1,
             alpha_arg2,
-            texture_factor: self.states.texture_factor,
+            texture_factor,
             tex_coord_index: tex_coord_set,
             tex_coord_gen,
             tex_transform_flags: transform_flags,
@@ -961,6 +973,34 @@ impl DeviceState {
             address_u,
             address_v,
         })
+    }
+
+    pub fn resolve_texture_stage(
+        &self,
+        stage: u32,
+        texture_bound: bool,
+    ) -> Result<TextureStage, RenderError> {
+        let states = self
+            .texture_stages
+            .get(stage as usize)
+            .unwrap_or(&NO_TEXTURE_STAGE_STATES);
+        Self::resolve_stage(
+            stage,
+            states,
+            &self.texture_transforms,
+            self.states.texture_factor,
+            texture_bound,
+        )
+    }
+
+    pub fn inactive_texture_stage() -> Result<TextureStage, RenderError> {
+        Self::resolve_stage(
+            1,
+            &NO_TEXTURE_STAGE_STATES,
+            &[Mat4::IDENTITY; MAX_TEXTURE_STAGES],
+            RenderStates::d3d_defaults().texture_factor,
+            false,
+        )
     }
 
     /// Compact, deterministic dump of the draw-relevant device state used as

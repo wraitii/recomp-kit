@@ -9,9 +9,43 @@
 #include <set>
 #include <unordered_map>
 #include <utility>
+#include <vector>
+
+struct D3dTextureSync {
+    bool valid = false;
+    uint32_t texture_id = 0;
+    uint32_t format = 0;
+    std::vector<uint64_t> generations;
+
+    bool matches(uint32_t id, uint32_t fmt,
+                 const std::vector<recomp::d3d::TextureLevel> &levels) const {
+        if (!valid || texture_id != id || format != fmt || generations.size() != levels.size())
+            return false;
+        for (size_t index = 0; index < levels.size(); ++index)
+            if (levels[index].force_upload || generations[index] != levels[index].generation)
+                return false;
+        return true;
+    }
+
+    void record(uint32_t id, uint32_t fmt, const std::vector<recomp::d3d::TextureLevel> &levels) {
+        valid = true;
+        texture_id = id;
+        format = fmt;
+        generations.clear();
+        for (const auto &level : levels) {
+            valid &= !level.force_upload;
+            generations.push_back(level.generation);
+        }
+    }
+};
 
 struct D3dHostDevice {
     rust::Box<recomp::d3d::Device> value;
+    std::array<D3dTextureSync, 8> texture_sync;
+
+    void forget_textures() {
+        texture_sync = {};
+    }
 
     D3dHostDevice() : value(recomp::d3d::new_device()) {}
 };

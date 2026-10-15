@@ -1,9 +1,9 @@
-use super::fast_map::FastMap;
 use super::gpu::{D3d9Gpu, PendingClear};
 use super::shader::VertexElement;
 use super::state::{D3d9State, MAX_SAMPLERS};
 use super::{SurfaceView, TargetRect, wgsl};
 use crate::RenderError;
+use crate::fast_map::FastMap;
 use smallvec::{SmallVec, smallvec};
 use std::borrow::Cow;
 use std::sync::{Arc, Weak};

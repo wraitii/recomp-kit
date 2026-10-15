@@ -16,10 +16,10 @@ use crate::bridge::{
     D3d9VertexElement, FloatValuesResult, Status, StatusCode, ValueResult, ValuesResult, Viewport,
     ViewportResult, status,
 };
-use crate::d3d9::fast_map::FastMap;
 use crate::d3d9::gpu::{D3d9Gpu, D3d9Loss};
 pub use crate::d3d9::resource::D3d9Resource;
 use crate::d3d9::resource::StagedStorage;
+use crate::fast_map::FastMap;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -31,7 +31,6 @@ pub mod d3dx_effect;
 pub mod d3dx_math;
 pub mod d3dx_shader;
 pub mod draw;
-mod fast_map;
 pub mod format;
 pub mod gpu;
 mod present;

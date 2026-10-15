@@ -1,6 +1,7 @@
 //! CPU resource storage and draw preparation, independent of adapters and GPUs.
 //! The bridge owns guest staging; these bytes retain their native D3D layout.
 use crate::RenderError;
+use crate::fast_map::FastMap;
 use std::borrow::Cow;
 
 /// Stable storage. Allocation is fallible; its address never changes before drop.
@@ -354,25 +355,6 @@ pub fn indexed_list_into(
     indexed_list_bounds(output, vertices, indices, draw, true)
 }
 
-#[derive(Default)]
-struct IndexHasher(u64);
-
-impl std::hash::Hasher for IndexHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.0 = self.0.rotate_left(8) ^ u64::from(byte);
-        }
-    }
-    fn write_u32(&mut self, value: u32) {
-        self.0 = u64::from(value);
-    }
-}
-
-type IndexSlots = std::collections::HashMap<u32, u32, std::hash::BuildHasherDefault<IndexHasher>>;
-
 /// Pack only distinct referenced vertices in first-use order. In particular,
 /// sparse gaps are never copied or evaluated by fixed-function lighting.
 /// All source reads are validated before the packed output is modified.
@@ -388,7 +370,7 @@ pub fn packed_indexed_list_into(
         return Ok(());
     };
     output.clear();
-    let mut slots = IndexSlots::default();
+    let mut slots: FastMap<u32, u32> = FastMap::default();
     let stride = draw.stride as usize;
     for index in remapped.iter_mut() {
         let next = slots.len() as u32;

@@ -1092,10 +1092,15 @@ void d3d7_sync_texture(ComObj *dev, uint32_t stage) {
     if (!dev || !dev->d3d7_host || stage >= 8 || recomp::d3d::d3d7_recording(*dev->d3d7->value))
         return;
     ComObj *tex = com_get(recomp::d3d::d3d7_get_texture(*dev->d3d7->value, stage).value);
+    auto &sync = dev->d3d7_host->texture_sync[stage];
     if (!tex || tex->kind != K_SURFACE || !tex->pixels || !tex->width || !tex->height) {
-        host_require(recomp::d3d::set_texture(*dev->d3d7_host->value, stage, 0, 0,
-                                              rust::Slice<const recomp::d3d::TextureLevel>()),
-                     "SetTexture");
+        const std::vector<recomp::d3d::TextureLevel> none;
+        if (!sync.matches(0, 0, none)) {
+            host_require(recomp::d3d::set_texture(*dev->d3d7_host->value, stage, 0, 0,
+                                                  rust::Slice<const recomp::d3d::TextureLevel>()),
+                         "SetTexture");
+            sync.record(0, 0, none);
+        }
         return;
     }
     // Reuse the conversion of this surface while its content generation is
@@ -1166,10 +1171,14 @@ void d3d7_sync_texture(ComObj *dev, uint32_t stage) {
         lvl.data = rust::Slice<const uint8_t>(converted.data(), converted.size());
         levels.push_back(lvl);
     }
+    if (sync.matches(tex->id, D3D8FMT_A8R8G8B8, levels))
+        return;
+    sync.valid = false;
     host_require(recomp::d3d::set_texture(
                      *dev->d3d7_host->value, stage, tex->id, D3D8FMT_A8R8G8B8,
                      rust::Slice<const recomp::d3d::TextureLevel>(levels.data(), levels.size())),
                  "SetTexture");
+    sync.record(tex->id, D3D8FMT_A8R8G8B8, levels);
 }
 
 // ---------------------------------------------------------------- device caps

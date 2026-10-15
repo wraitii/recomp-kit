@@ -19,6 +19,7 @@ use crate::backend::native_present::{ReadyEvent, create_ready_event, signal_read
 use crate::{
     RenderError,
     backend::{GpuContext, OffscreenTarget},
+    fast_map::FastMap,
 };
 
 #[path = "render_targets.rs"]
@@ -244,20 +245,27 @@ fn trace_draw(
 ) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNT: AtomicU32 = AtomicU32::new(0);
-    let Ok(raw) = std::env::var("RECOMP_D3D8_TRACE_DRAWS") else {
-        return;
-    };
-    let limit: u32 = raw.parse().unwrap_or(8);
+    static CONFIG: std::sync::OnceLock<Option<(u32, u32, bool)>> = std::sync::OnceLock::new();
     // `RECOMP_D3D8_TRACE_DRAWS_START=<n>` skips the first `n` traced draws so a
     // later draw can be captured; `RECOMP_D3D8_TRACE_DRAWS` still caps how many
-    // are printed from that offset.
-    let start: u32 = std::env::var("RECOMP_D3D8_TRACE_DRAWS_START")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    // `RECOMP_D3D8_TRACE_STAGE1=1` counts and prints only draws with a texture
-    // bound at stage 1 (the world draws), so the cap is not spent on menus.
-    if std::env::var_os("RECOMP_D3D8_TRACE_STAGE1").is_some() && stage1.is_none() {
+    // are printed from that offset. `RECOMP_D3D8_TRACE_STAGE1=1` counts and
+    // prints only draws with a texture bound at stage 1 (the world draws), so
+    // the cap is not spent on menus.
+    let Some((limit, start, stage1_only)) = *CONFIG.get_or_init(|| {
+        let raw = std::env::var("RECOMP_D3D8_TRACE_DRAWS").ok()?;
+        let start = std::env::var("RECOMP_D3D8_TRACE_DRAWS_START")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        Some((
+            raw.parse().unwrap_or(8),
+            start,
+            std::env::var_os("RECOMP_D3D8_TRACE_STAGE1").is_some(),
+        ))
+    }) else {
+        return;
+    };
+    if stage1_only && stage1.is_none() {
         return;
     }
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
@@ -668,13 +676,20 @@ fn trace_shader_draw(
 ) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNT: AtomicU32 = AtomicU32::new(0);
-    let Some(limit) = std::env::var("RECOMP_D3D8_TRACE_SHADER_DRAWS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-    else {
+    static CONFIG: std::sync::OnceLock<Option<(u32, bool)>> = std::sync::OnceLock::new();
+    let Some((limit, stage2_only)) = *CONFIG.get_or_init(|| {
+        let limit = std::env::var("RECOMP_D3D8_TRACE_SHADER_DRAWS")
+            .ok()?
+            .parse::<u32>()
+            .ok()?;
+        Some((
+            limit,
+            std::env::var_os("RECOMP_D3D8_TRACE_SHADER_STAGE2").is_some(),
+        ))
+    }) else {
         return;
     };
-    if std::env::var_os("RECOMP_D3D8_TRACE_SHADER_STAGE2").is_some() && !samplers[2] {
+    if stage2_only && !samplers[2] {
         return;
     }
     let capture = COUNT.fetch_add(1, Ordering::Relaxed);
@@ -873,7 +888,7 @@ fn sampler_descriptor(
 /// caller never holds a map borrow while recording GPU work; used for samplers
 /// (and uniform buffers). Counters feed `RECOMP_D3D8_DRAW_STATS`.
 struct KeyedCache<K, V> {
-    map: std::collections::HashMap<K, V>,
+    map: FastMap<K, V>,
     hits: u64,
     misses: u64,
 }
@@ -881,7 +896,7 @@ struct KeyedCache<K, V> {
 impl<K, V> Default for KeyedCache<K, V> {
     fn default() -> Self {
         Self {
-            map: std::collections::HashMap::new(),
+            map: FastMap::default(),
             hits: 0,
             misses: 0,
         }
@@ -1179,7 +1194,7 @@ pub struct Device {
     pub vertex_shader: u32,
     pub pixel_shader: u32,
     pub shader_uniform: shader::Uniform,
-    programmable_modules: std::collections::HashMap<(u32, u32, u32, bool), wgpu::ShaderModule>,
+    programmable_modules: FastMap<(u32, u32, u32, bool), wgpu::ShaderModule>,
     shader: Option<wgpu::ShaderModule>,
     textured_shader: Option<wgpu::ShaderModule>,
     lit_shader: Option<wgpu::ShaderModule>,
@@ -1187,7 +1202,7 @@ pub struct Device {
     gpu_lit_shaders: std::collections::HashMap<(u32, bool), wgpu::ShaderModule>,
     /// Comparison switch; ProcessVertices and unsupported states remain CPU-lit.
     cpu_lighting: bool,
-    pipelines: std::collections::HashMap<DrawPipelineKey, wgpu::RenderPipeline>,
+    pipelines: FastMap<DrawPipelineKey, wgpu::RenderPipeline>,
     pub state: DeviceState,
     pub gpu: GpuContext,
     target: OffscreenTarget,
@@ -1218,7 +1233,7 @@ pub struct Device {
     uniform_groups: std::cell::RefCell<[Option<wgpu::BindGroup>; 2]>,
     /// Stage texture/sampler groups, keyed by the bound objects. Cleared when
     /// it grows past `MAX_TEXTURE_GROUPS` so it cannot pin textures forever.
-    texture_groups: std::cell::RefCell<std::collections::HashMap<TextureGroupKey, wgpu::BindGroup>>,
+    texture_groups: std::cell::RefCell<FastMap<TextureGroupKey, wgpu::BindGroup>>,
     batch: std::cell::RefCell<DrawBatch>,
     /// Present handoff ring (see [`FrameRing`]); created on first use.
     frame_ring: std::cell::RefCell<Option<FrameRing>>,
@@ -1273,7 +1288,7 @@ impl Device {
             lit_textured_shader: None,
             gpu_lit_shaders: Default::default(),
             cpu_lighting: std::env::var_os("RECOMP_D3D8_CPU_LIGHTING").is_some(),
-            pipelines: std::collections::HashMap::new(),
+            pipelines: FastMap::default(),
             state: DeviceState::new(width, height),
             stage_textures: std::array::from_fn(|_| None),
             texture_cache: TextureCache::new(MAX_CACHED_TEXTURES),
@@ -2030,8 +2045,8 @@ impl Device {
         // bound texture stays inactive and passes CURRENT through, preserving
         // the established untextured path. Stage >= 2 that is active fails by
         // name inside the resolver and is recorded by the survey.
-        let inactive_sampler = DeviceState::new(1, 1).resolve_texture_stage(1, false)?;
-        let mut stages = Vec::new();
+        let inactive_sampler = DeviceState::inactive_texture_stage()?;
+        let mut stages = [inactive_sampler; 4];
         for stage in 0..4 {
             let resolved = if let Some(ps) = ps {
                 if ps.samplers[stage] {
@@ -2052,7 +2067,7 @@ impl Device {
             } else {
                 inactive_sampler
             };
-            stages.push(resolved);
+            stages[stage] = resolved;
         }
         let stage0 = stages[0];
         let stage1 = stages[1];
@@ -2672,8 +2687,9 @@ impl Device {
                         // Groups already recorded in this pass stay alive in it.
                         texture_groups.clear();
                     }
-                    let texture_group =
-                        texture_groups.entry(t.pairs.clone()).or_insert_with(|| {
+                    let texture_group: &wgpu::BindGroup = match texture_groups.get(&t.pairs) {
+                        Some(group) => group,
+                        None => texture_groups.entry(t.pairs.clone()).or_insert_with(|| {
                             let entries: Vec<_> = t
                                 .pairs
                                 .iter()
@@ -2696,8 +2712,9 @@ impl Device {
                                 layout: &self.draw_layouts.bgl_stage_textures,
                                 entries: &entries,
                             })
-                        });
-                    pass.set_bind_group(1, &*texture_group, &[]);
+                        }),
+                    };
+                    pass.set_bind_group(1, texture_group, &[]);
                 }
                 let vstart = d.vertex_base;
                 pass.set_vertex_buffer(0, db.slice(vstart..vstart + d.vertex_len));

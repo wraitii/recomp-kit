@@ -10,9 +10,9 @@ use crate::bridge::{
 };
 use crate::d3d9::D3d9Device;
 use crate::d3d9::d3dx_shader;
-use crate::d3d9::fast_map::FastMap;
 use crate::d3d9::resource::D3DPOOL_DEFAULT;
 use crate::d3d9::state::{EffectKeys, EffectSnapshot};
+use crate::fast_map::FastMap;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};

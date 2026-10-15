@@ -43,7 +43,8 @@ static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0
 /// True when the texture dump is enabled, so the caller can skip the RGBA
 /// conversion that is otherwise only done for a real upload.
 pub fn texture_enabled() -> bool {
-    std::env::var_os(DUMP_ENV).is_some_and(|v| !v.is_empty())
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os(DUMP_ENV).is_some_and(|v| !v.is_empty()))
 }
 
 /// Write one bound level as a PNG and print a summary line.
