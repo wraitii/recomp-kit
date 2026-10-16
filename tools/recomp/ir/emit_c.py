@@ -1,4 +1,5 @@
 """C emission of finalized SSA, boundary operations and x87 recipes."""
+from itertools import count
 from .prepare import PreparedFunction, prepare
 from .ssa import SSAError
 from . import operations, c_symbols
@@ -214,9 +215,11 @@ def emit_prepared(prepared, external_entry=False):
             return "(%s << %d) | %s" % (a[0], v.args[1].size * 8, a[1])
         raise SSAError("unsupported integer operation %s" % opc)
 
+    caches = count()
     boundary = BoundaryPrinter(prepared.transport,
                                {name: mapping[keys[0]][0] for name, keys in prepared.state_groups},
-                               ref, mask)
+                               ref, mask,
+                               lambda: "ic_%s_%d" % (prepared.options.symbol, next(caches)))
 
     def publish(event):
         return boundary.publication(event)

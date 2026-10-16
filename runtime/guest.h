@@ -77,7 +77,7 @@ uint32_t gm_put_wstr(uint32_t a, const std::string &s, uint32_t cap);
 extern int g_log_level;
 int log_level_init();
 inline int log_level() {
-    return g_log_level >= 0 ? g_log_level : log_level_init();
+    return __builtin_expect(g_log_level < 0, 0) ? log_level_init() : g_log_level;
 }
 void log_msg(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 // Logs at most once for a given key. Returns true the first time.

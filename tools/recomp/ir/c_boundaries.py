@@ -47,9 +47,10 @@ def cc_action_lines(action):
 
 
 class Printer:
-    def __init__(self, transport, fields, ref, mask):
+    def __init__(self, transport, fields, ref, mask, cache_name):
         self.plan = transport.boundaries
         self.fields, self.ref, self.mask = fields, ref, mask
+        self.cache_name = cache_name
 
     def value(self, value):
         if value.whole is not None:
@@ -94,7 +95,10 @@ class Printer:
             input_value = self.value(operation.input_value) if operation.input_value is not None else None
             return ["%s;" % c_symbols.render_invocation(operation.invocation, input_value)]
         if isinstance(operation, IndirectInvoke):
-            return ["%s(c, (uint32_t)%s);" % (operation.helper, self.ref(operation.target))]
+            target = "(uint32_t)%s" % self.ref(operation.target)
+            if operation.helper == "recomp_call":
+                return ["recomp_icall(c, %s, &%s);" % (target, self.cache_name())]
+            return ["%s(c, %s);" % (operation.helper, target)]
         if isinstance(operation, SettleFlags):
             return cc_action_lines(operation.action)
         if isinstance(operation, Guard):

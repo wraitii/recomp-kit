@@ -31,7 +31,7 @@ void recomp_seh_land(X86 *c);
 uint32_t recomp_seh_pending_target(void);
 void recomp_seh_intercept(X86 *c, uint32_t target);
 /* Verbose-only, bounded validation. Logs the first failure and last good point. */
-void recomp_seh_validate_chain(X86 *c, const char *phase, const char *detail);
+void recomp_seh_validate_chain_body(X86 *c, const char *phase, const char *detail);
 
 /* Fills a Windows x86 CONTEXT with src's control, integer and segment
  * registers at `eip`; ContextFlags and the float/debug areas are untouched. */
@@ -58,6 +58,14 @@ uint32_t recomp_seh_test_frame_count(X86 *c);
 #endif
 
 #ifdef __cplusplus
+}
+#endif
+
+#ifdef __cplusplus
+#include "guest.h"
+static inline void recomp_seh_validate_chain(X86 *c, const char *phase, const char *detail) {
+    if (c && log_level() >= 2)
+        recomp_seh_validate_chain_body(c, phase, detail);
 }
 #endif
 #endif

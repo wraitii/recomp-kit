@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from ir.emit_c import memory_helpers, TABLE_RETURN_HELPERS, FLOAT_HELPERS
 CHUNK_ADDRESS_BITS = 14
 CHUNK_SOURCE_BUDGET = 2 * 1024 * 1024
 ENTRY_ADDRESS_BITS = 16
+INDIRECT_CACHE = re.compile(r"recomp_icall\(c, [^;]*, &(\w+)\);")
 
 BODY_HEADER = """/* generated -- translated bodies do not depend on replacement policy */
 #ifndef RECOMP_BODY_H
@@ -86,6 +88,7 @@ def emit_body_chunks(out, functions, bodies, entries_by_fn, dependencies, known_
     for name, group in partition_chunks(functions, bodies):
         path = Path(out, name)
         text = {fn.addr: "\n".join(bodies[fn.addr]) for fn in group}
+        caches = sorted(set(INDIRECT_CACHE.findall("\n".join(text.values()))))
         declarations = set()
         for fn in group:
             declarations |= dependencies[fn.addr]
@@ -103,6 +106,8 @@ def emit_body_chunks(out, functions, bodies, entries_by_fn, dependencies, known_
                 fh.write(TABLE_RETURN_HELPERS)
             if any('recomp_fcom_(' in body for body in text.values()):
                 fh.write(FLOAT_HELPERS)
+            for cache in caches:
+                fh.write("static RecompICache %s;\n" % cache)
             for addr in calls:
                 fh.write(declaration(Declaration("entry", addr)) + "\n")
             for addr in checked:
@@ -432,6 +437,10 @@ void recomp_call(X86 *c, uint32_t target)
 }
 static void recomp_call_inner(X86 *c, uint32_t target)
 {
+    if (target >= GUEST_SHIM_BASE && target < GUEST_SHIM_END) {
+        recomp_shim_call(c, target);
+        return;
+    }
     int32_t i = recomp_lookup(target);
     if (i >= 0) {
         recomp_execution_checkpoint(c);
@@ -451,13 +460,12 @@ static void recomp_call_inner(X86 *c, uint32_t target)
         if (recomp_profile_enabled) recomp_profile_pop();
         return;
     }
-    /* Modules, shims and unknown targets read the guest's own flag fields. */
-    x86_cc_settle(c);
     if (recomp_module_call(c, target)) return;
     if (target >= GUEST_SHIM_BASE && target < GUEST_SHIM_END) {
         recomp_shim_call(c, target);
         return;
     }
+    x86_cc_settle(c);
     recomp_unknown_call(c, target);
 }
 

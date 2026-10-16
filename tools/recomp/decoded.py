@@ -743,7 +743,7 @@ class Translator(ControlFlow):
                 return L
             L.append("uint32_t t_ = %s;" % read_op(ops[0], 32))
             L.append("c->r[4] -= 4; wr32(c->r[4], %s);" % hexlit(nxt))
-            L.append("recomp_call(c, t_);")
+            L.append("recomp_icall(c, t_, &ic_%08x);" % ins.addr)
             L.append("x86_cc_settle(c);")
             return L
 

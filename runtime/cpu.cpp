@@ -160,8 +160,34 @@ void recomp_run(X86 *c, uint32_t target) {
     recomp_call(c, target);
 }
 
+uint32_t recomp_dispatch_epoch = 1;
+
+void recomp_icall_slow(X86 *c, uint32_t target, RecompICache *ic) {
+#ifndef RECOMP_CHECK_CALL_FACTS
+    int32_t i = recomp_index_of(target);
+    if (i >= 0 && recomp_base_ptrs[i] == recomp_raw_ptrs[i]) {
+        ic->target = target;
+        ic->epoch = recomp_dispatch_epoch;
+        ic->index = i;
+        ic->fn = recomp_base_ptrs[i];
+        ic->module = nullptr;
+    } else if (i < 0) {
+        ModuleEntry e = module_entry(target);
+        if (e.module && e.index >= 0) {
+            ic->target = target;
+            ic->epoch = recomp_dispatch_epoch;
+            ic->index = e.index;
+            ic->fn = nullptr;
+            ic->module = e.module;
+        }
+    }
+#endif
+    recomp_call(c, target);
+}
+
 void recomp_module_register(const RecompModule *m) {
     modules().push_back(m);
+    ++recomp_dispatch_epoch;
 }
 uint32_t recomp_module_count(void) {
     return (uint32_t)modules().size();
@@ -198,18 +224,20 @@ int recomp_module_call(X86 *c, uint32_t target) {
     ModuleEntry e = module_entry(target);
     if (!e.module || e.index < 0)
         return 0;
-    const RecompModule *m = e.module;
-    int32_t i = e.index;
+    recomp_module_invoke(c, e.module, e.index);
+    return 1;
+}
+void recomp_module_invoke(X86 *c, const RecompModule *m, int32_t i) {
     recomp_execution_checkpoint(c);
 #ifdef RECOMP_NO_HOOKS
     m->base_ptrs[i](c);
 #else
-    if (__atomic_load_n(&m->hooked[i], __ATOMIC_ACQUIRE))
+    if (__atomic_load_n(&m->hooked[i], __ATOMIC_ACQUIRE)) {
+        x86_cc_settle(c);
         m->hook_ptrs[i](c, (uint32_t)i);
-    else
+    } else
         m->base_ptrs[i](c);
 #endif
-    return 1;
 }
 
 void recomp_module_jump(X86 *c, uint32_t target) {

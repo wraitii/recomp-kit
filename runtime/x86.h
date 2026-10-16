@@ -622,15 +622,27 @@ extern uint8_t recomp_hooked[];
  * recomp_hooked or a process-wide observer (profiling, frame watch). The slow
  * path rereads recomp_hooked with acquire, so writers update this after it. */
 extern uint8_t recomp_slow[];
+extern uint32_t recomp_dispatch_epoch;
 static inline void recomp_slow_update(uint32_t i) {
     uint8_t slow = __atomic_load_n(&recomp_hooked[i], __ATOMIC_RELAXED) |
                    (uint8_t)(recomp_profile_enabled || recomp_frame_watch);
     __atomic_store_n(&recomp_slow[i], slow, __ATOMIC_RELEASE);
+    ++recomp_dispatch_epoch;
 }
 /* Set once any mod hook is installed and never cleared.  A call whose
  * contract dropped CPU fields publishes them anyway while this is set,
  * because a hook callback observes the full register file. */
 extern uint8_t recomp_hooks_ever;
+
+struct RecompModule;
+typedef struct RecompICache {
+    uint32_t target;
+    uint32_t epoch;
+    int32_t index;
+    void (*fn)(X86 *c);
+    const struct RecompModule *module;
+} RecompICache;
+void recomp_icall_slow(X86 *c, uint32_t target, RecompICache *ic);
 
 /* A host implementation of a stdcall guest function that guest_call runs in
  * place of the translation while the function is not hooked. args holds the
@@ -690,6 +702,7 @@ int32_t recomp_module_lookup(uint32_t target);
 int recomp_module_is_call_return(uint32_t target);
 /* Dispatches target through the owning module's tables; 0 when no module owns it. */
 int recomp_module_call(X86 *c, uint32_t target);
+void recomp_module_invoke(X86 *c, const RecompModule *m, int32_t i);
 void recomp_module_jump(X86 *c, uint32_t target);
 
 /* RET has already popped EIP and applied any immediate stack adjustment.
@@ -850,6 +863,29 @@ RECOMP_HOT_INLINE void x86_cc_settle_or_drop(X86 *c, uint32_t need) {
         } else
             c->cc_op = X86_CC_NONE;
     }
+}
+
+static inline void recomp_icall(X86 *c, uint32_t target, RecompICache *ic) {
+#ifndef RECOMP_CHECK_CALL_FACTS
+    if (target - GUEST_SHIM_BASE < GUEST_SHIM_END - GUEST_SHIM_BASE) {
+        if (!recomp_frame_watch) {
+            recomp_shim_call(c, target);
+            return;
+        }
+    } else if (ic->target == target && ic->epoch == recomp_dispatch_epoch) {
+        if (ic->module) {
+            if (!recomp_frame_watch) {
+                recomp_module_invoke(c, ic->module, ic->index);
+                return;
+            }
+        } else if (!__atomic_load_n(&recomp_slow[ic->index], __ATOMIC_RELAXED)) {
+            recomp_execution_checkpoint(c);
+            ic->fn(c);
+            return;
+        }
+    }
+#endif
+    recomp_icall_slow(c, target, ic);
 }
 
 /* Clear the dead descriptor payload so a full-struct comparison does not see
