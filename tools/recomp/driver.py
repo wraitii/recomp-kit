@@ -79,6 +79,7 @@ class Context(object):
         self.interior = program.interior_entries()
         self.tr = decoded.Translator(self.image, set(self.entries), settings.allow_unmodelled)
         self.tr.provisional = program.provisional
+        self.tr.mapped_containing = program.containing
         self.tr.noreturn_callees = set(program.noreturn)
         self.tr.noreturn_sites = set(program.noreturn_calls)
         self.tr.jumptables = dict(program.tables)
@@ -117,9 +118,6 @@ class Context(object):
                                  % (addr, " ".join("%08x" % e for e in stale)))
         return fn, entries
 
-    def dispatchable(self, target):
-        return target in self.entries or decoded.GUEST_SHIM_BASE <= target < decoded.GUEST_SHIM_END
-
 
 def _init(settings, artifacts=None):
     global _CTX
@@ -134,7 +132,7 @@ def _scan(task):
     for addr in task.addresses:
         fn, entries = ctx.load(addr)
         tr.analyze(fn, entries)
-        calls, refs, dangling, returns = [], set(), set(), []
+        calls, refs, returns = [], set(), []
         for i, ins in enumerate(fn.insns):
             if ins.mnem == "CALL":
                 returns.append(fn.fallthrough[i] or (fn.insns[i + 1].addr if i + 1 < len(fn.insns) else fn.end))
@@ -144,15 +142,11 @@ def _scan(task):
                     continue
                 if ins.mnem == "CALL":
                     calls.append(target)
-                    if not ctx.dispatchable(target) and addr not in ctx.program.provisional:
-                        dangling.add(target)
                 if target in ctx.entries and target not in ctx.known and ctx.program.containing(target) != addr:
                     refs.add(target)
         external_targets = set()
         for targets in external_exits(tr, fn).values():
             external_targets.update(targets)
-            if addr not in ctx.program.provisional:
-                dangling.update(t for t in targets if not ctx.dispatchable(t))
         reason = "decoded-only code map" if ctx.decoded_only else production.exclusion(fn)
         escapes = bool(tr.seh_escaping_returns(fn))
         site = (bool(fn.seh_sites) or any(fn.insns[i].mnem == "POP" for i in fn.seh_restores)
@@ -176,7 +170,7 @@ def _scan(task):
             if x87_mode.writer_effect(mnem) is not None:
                 writers.append({"site": ins.addr, "mnemonic": mnem})
         rows.append(ScanRow(addr, Row(addr, fn.name, len(fn.insns), fn.insns[0].addr, fn.insns[-1].addr),
-                     calls, refs, sorted(dangling), returns, reason, escapes, prepared, mode_prepared, x87_count,
+                     calls, refs, returns, reason, escapes, prepared, mode_prepared, x87_count,
                      writers, sorted(external_targets)))
     ctx.artifacts.flush_counts()
     return rows
@@ -517,14 +511,6 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
 
         entry_model = program.classify_entries(scanned)
         internal = entry_model.internal
-
-        dangling = sorted((addr, t) for addr, row in scanned.items() for t in row.dangling)
-        if dangling:
-            for addr, t in dangling:
-                log("  fn_%08x dispatches to %08x, which is not an entry point" % (addr, t))
-            raise TranslateError(
-                "%d literal dispatch targets are not entry points; add them in Ghidra "
-                "(function or referenced entry), re-export the code map and regenerate" % len(dangling))
 
         conservative = native_replaced(settings)
         mode_prepared = entry_model.cw_inputs(scanned)

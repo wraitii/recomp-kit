@@ -35,6 +35,8 @@ class Recovery:
         self.covered = {}
         self.speculative = set()
         self.trusted_seeds = set()
+        self.ghidra_spans = []
+        self.ghidra_entries = {}
         self.seeds = defaultdict(set)
         self.pending = deque()
         self.roots = set()
@@ -137,6 +139,11 @@ class Recovery:
     def seed(self, target, evidence, root=False, speculative=False):
         if not self.image.is_exec(target):
             return
+        if evidence.startswith("direct:") and self.at_known_data(target):
+            owner = self.ghidra_owner(target)
+            if owner not in (None, target):
+                self.ghidra_entries[target] = owner
+            return
         if root:
             self.roots.add(target)
         first = target not in self.seeds
@@ -158,6 +165,18 @@ class Recovery:
             return
         if first:
             self.pending.append(target)
+
+    def ghidra_owner(self, target):
+        for start, end, owner in self.ghidra_spans:
+            if start <= target < end:
+                at = start
+                while at < target:
+                    ins = self.decode(at)
+                    if ins is None:
+                        return None
+                    at += ins.size
+                return owner if at == target else None
+        return None
 
     def retract(self, address):
         self.speculative.discard(address)
@@ -230,6 +249,9 @@ class Recovery:
             speculative = at not in self.trusted_seeds
             while self.image.is_exec(at):
                 if self.at_known_data(at):
+                    owner = self.ghidra_owner(at)
+                    if owner not in (None, at):
+                        self.ghidra_entries[at] = owner
                     break
                 if at in self.covered:
                     owner = self.covered[at]
@@ -434,6 +456,8 @@ class Recovery:
                 if at != owner:
                     entries[at] = (owner, "branch")
             functions[owner] = [(start, sum(lengths), "".join("%x" % n for n in lengths)) for start, lengths in runs]
+        for target, owner in self.ghidra_entries.items():
+            entries.setdefault(target, (owner, "branch"))
         return functions, entries
 
     def publish(self, executable, output, body_bytes):
@@ -476,6 +500,10 @@ def build(executable, base, evidence, extra_data, exclude_map=None):
                                                for spans in code_map.read_map(exclude_map)[1].values()
                                                for start, size, _ in spans]
     recovery.excluded_bytes = sum(hi - lo for lo, hi, _ in excluded)
+    if exclude_map is not None:
+        recovery.ghidra_spans = sorted((start, start + size, owner)
+                                       for owner, spans in code_map.read_map(exclude_map)[1].items()
+                                       for start, size, _ in spans)
     for lo, hi, kind in list(extra_data) + excluded:
         recovery.data_ranges.append((lo, hi, kind))
         recovery.known_mask[lo - recovery.image.base:hi - recovery.image.base] = b"\x01" * (hi - lo)

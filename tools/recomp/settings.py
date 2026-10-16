@@ -57,7 +57,7 @@ class Settings(object):
         self.private_input_registers = dict(translate.get("private_input_registers", {})) if not self.module else {}
         self.checked_returns = frozenset(translate["checked_returns"]) if not self.module else frozenset()
         self.state_contract_callers = frozenset(translate["state_contract_callers"]) if not self.module else frozenset()
-        self.discover = translate.get("discover", True) and not self.module
+        self.discover = translate.get("discover", True)
         self.discovered = None
         self.allow_unmodelled = allow_unmodelled
         self.jobs = jobs

@@ -485,12 +485,11 @@ void recomp_x87_contract_violation(X86 *c, uint32_t addr, uint16_t mask, uint16_
     abort();
 }
 
-// An SSE/SSE2 instruction the translator left as a trap (MMX is translated).
-// The CPUID below advertises neither extension, so only a guest that skips the
-// CPUID check gets here; continuing would compute garbage, so this is fatal.
+// An instruction the translation left as a trap: one the translator could not
+// model, or a branch it could not resolve. Continuing would run guessed code,
+// so this is fatal.
 void recomp_unmodelled(X86 *c, uint32_t addr) {
-    LOGW("unmodelled SSE instruction at %08x (ESP=%08x, return=%08x): the guest used a "
-         "CPU extension recomp_cpuid does not advertise",
+    LOGW("untranslated instruction at %08x (ESP=%08x, return=%08x): the translation left a trap here",
          addr, c->r[R_ESP], rd32(c->r[R_ESP]));
     abort();
 }

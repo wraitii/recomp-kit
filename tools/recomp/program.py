@@ -17,7 +17,7 @@ from ir.lift import Lifter
 
 
 FunctionDescription = namedtuple("FunctionDescription", "addr name count first last")
-ScanRow = namedtuple("ScanRow", "addr description calls references dangling returns exclusion seh_escapes register_facts cw_facts x87_count writers external_targets")
+ScanRow = namedtuple("ScanRow", "addr description calls references returns exclusion seh_escapes register_facts cw_facts x87_count writers external_targets")
 
 
 @dataclass

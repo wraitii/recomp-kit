@@ -1057,7 +1057,8 @@ class Translator(ControlFlow):
         if t in self.func_addrs:
             self.call_targets.add(t)
             return ["CALL_FN(%08x); return;" % t]
-        if fn.addr in getattr(self, "provisional", ()) and not GUEST_SHIM_BASE <= t < GUEST_SHIM_END:
+        mapped = getattr(self, "mapped_containing", lambda t: None)(t) is not None
+        if fn.addr in getattr(self, "provisional", ()) and not mapped and not GUEST_SHIM_BASE <= t < GUEST_SHIM_END:
             self.unmodelled.append((ins.addr, "transfer to unmapped instruction %08x" % t))
             return ["recomp_unmodelled(c, %s); return;" % hexlit(ins.addr)]
         return ["c->eip = %s; recomp_jump(c, %s); return;" % (hexlit(ins.addr), hexlit(t))]
