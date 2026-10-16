@@ -296,6 +296,7 @@ void sample_play(Sample &s) {
     host_audio_set_reverb_send(s.channel, s.driver,
                                bits_to_float(s.reverb_dry) * driver_dry(s.driver),
                                bits_to_float(s.reverb_wet) * driver_wet(s.driver));
+    host_audio_set_frequency(s.channel, s.rate);
     host_audio_play(&p);
     s.playing = true;
 }
@@ -556,6 +557,7 @@ void ail_set_named_sample_file(X86 *c) {
     if (!s)
         return;
     sample_stop(*s);
+    s->rate = 0;
     if (sample_load_image(*s, arg(c, 2), arg(c, 3)))
         set_eax(c, 1);
     else {
