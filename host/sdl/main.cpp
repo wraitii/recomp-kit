@@ -1886,6 +1886,7 @@ int web_main(int argc, char **argv) {
     mods_display_default_overlay(platform_ui_default_overlay());
     host_present_on_mode_change(on_mode_change);
     host_input_set_notify(dinput_host_input_changed);
+    host_present_set_bilinear(RECOMP_SETTINGS_PRESENTATION_FILTER != 0);
     host_present_start(g_surface, dw, dh);
 
     const char *capture = recomp_env("HOST_AUDIO_CAPTURE");
@@ -2174,6 +2175,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, RECOMP_APP_NAME ": the window has no drawable size\n");
         return 3;
     }
+    host_present_set_bilinear(
+        host_preferences::get(host_preferences::Setting::PresentationFilter) != 0);
     host_present_start(g_surface, dw, dh);
     // Said out loud, because "the keyboard does nothing" and "the window
     // never gained focus" look identical from the outside.

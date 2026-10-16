@@ -182,7 +182,10 @@ void draw(Pass &pass, const CompositorInput &in, gpu::Texture tex, CompositeRect
     pass.device->set_bytes(pass.cb, gpu::Stage::Vertex, 0, &q, sizeof q);
     pass.device->set_bytes(pass.cb, gpu::Stage::Fragment, 0, &q, sizeof q);
     pass.device->set_texture(pass.cb, gpu::Stage::Fragment, 0, tex);
-    pass.device->set_sampler(pass.cb, gpu::Stage::Fragment, 0, gpu::SamplerState{});
+    gpu::SamplerState sampler;
+    if (tex != in.settings_page)
+        sampler.mag = sampler.min = in.presentation_filter;
+    pass.device->set_sampler(pass.cb, gpu::Stage::Fragment, 0, sampler);
     pass.device->draw(pass.cb, gpu::Primitive::TriangleStrip, 0, 4);
 }
 gpu::Texture upload(Pass &pass, const UiElement &e) {
