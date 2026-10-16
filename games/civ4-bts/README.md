@@ -34,8 +34,7 @@ translation input.
 
 The main executable's map is exported from Ghidra with `Civ4ExportCodeMap.java`.
 The Ghidra project is `ghidra/Civ4BTS.gpr`, imported with automatic analysis
-disabled; decline the GUI's analysis prompt to keep that state. Add the game
-repository's `tools/ghidra_scripts/` to Script Manager, enable the ghidraLlm API,
+disabled; decline the GUI's analysis prompt to keep that state. Add the shared `../ghidra_scripts/` folder to Script Manager, enable the ghidraLlm API,
 and verify the program with `./tools/ghidra_api /program/info`. The default
 server is port 8166; `GHIDRA_API_BASE` selects another. After deliberate analysis
 has produced instruction boundaries:

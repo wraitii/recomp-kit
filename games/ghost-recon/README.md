@@ -45,9 +45,7 @@ The map (`recomp-code-map-v3`) holds spans, jump tables, interior entries and
 non-returning calls, addresses only. Fix gaps in Ghidra (`ApplyCodeMapFixes.java`
 documents its operations), then re-export and repack; the translator model in
 `recomp-kit/tools/recomp/program.py` fails by name on anything the map lacks.
-The exporter refuses an existing destination. `GhostReconExportRecomp.java`
-writes private reference listings; its output stays ignored.
-
+The exporter refuses an existing destination. 
 ## Native replacements
 
 | Source | Original addresses | Purpose / comparison switch |

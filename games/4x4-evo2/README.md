@@ -104,7 +104,7 @@ has been added.
 
 The code map is exported from Ghidra with the game's `Evo2ExportCodeMap.java`
 script. From the game repository root, after deliberate analysis has produced
-instruction boundaries (Ghidra API setup is in the game's `docs/ghidra_api.md`):
+instruction boundaries (Ghidra API setup is in `../ghidra_scripts/ghidra-helpers.md`):
 
 ```sh
 GHIDRA_API_BASE=http://127.0.0.1:8169 ./tools/ghidra_api \

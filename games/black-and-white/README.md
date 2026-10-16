@@ -34,8 +34,7 @@ builds the smoke binary `build/recomp/pop_headless`. Runtime and CMake edits nee
 only the `--target` build; add `--regenerate` only when a translation input
 changed (listings, the game profile, code map or translator sources).
 
-A clean regeneration needs the private auxiliary DLL listing exports staged under
-`build/recomp/listings/<DLL>`. The executable listings decode from the packed map.
+The executable and auxiliary modules decode from their packed maps.
 A full regeneration translates all modules with no failures expected; per-module
 counts land in `build/recomp/translate-*-report.json` (`functions_ok ==
 functions_total`, `failures` and `unmodelled` empty).
