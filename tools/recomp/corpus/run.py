@@ -210,7 +210,7 @@ def bind_boundary_calls(body, mode, row_addr, direct, indirect_sites):
         raise ValueError('boundary indirect call sites differ from declared calls')
     body = re.sub(r'\bCALL_FN\(([0-9a-f]{8})\)', lambda m: f'{mode}_fnwrap_{m[1]}(c)', body)
     body = re.sub(r'\brecomp_call\(c, t_\);', f'{mode}_indirect_{row_addr}(c, t_);', body)
-    body = re.sub(r'\brecomp_icall\(c, ([^,;]+), &ic_\w+\);',
+    body = re.sub(r'\brecomp_icall\(c, ([^,;]+), &ic_\w+, [^;]*\);',
                   lambda m: f'{mode}_indirect_{row_addr}(c, {m[1]});', body)
     if re.search(r'\brecomp_(?:call|icall)\b', body):
         raise ValueError('unbound indirect call remains in boundary row')

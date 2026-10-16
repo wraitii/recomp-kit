@@ -97,7 +97,7 @@ class Printer:
         if isinstance(operation, IndirectInvoke):
             target = "(uint32_t)%s" % self.ref(operation.target)
             if operation.helper == "recomp_call":
-                return ["recomp_icall(c, %s, &%s);" % (target, self.cache_name())]
+                return ["recomp_icall(c, %s, &%s, 0x%xu);" % (target, self.cache_name(), operation.site)]
             return ["%s(c, %s);" % (operation.helper, target)]
         if isinstance(operation, SettleFlags):
             return cc_action_lines(operation.action)

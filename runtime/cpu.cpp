@@ -162,7 +162,7 @@ void recomp_run(X86 *c, uint32_t target) {
 
 uint32_t recomp_dispatch_epoch = 1;
 
-void recomp_icall_slow(X86 *c, uint32_t target, RecompICache *ic) {
+void recomp_icall_slow(X86 *c, uint32_t target, RecompICache *ic, uint32_t site) {
 #ifndef RECOMP_CHECK_CALL_FACTS
     int32_t i = recomp_index_of(target);
     if (i >= 0 && recomp_base_ptrs[i] == recomp_raw_ptrs[i]) {
@@ -182,6 +182,7 @@ void recomp_icall_slow(X86 *c, uint32_t target, RecompICache *ic) {
         }
     }
 #endif
+    observe_pend(site);
     recomp_call(c, target);
 }
 
@@ -295,9 +296,23 @@ void recomp_shim_call(X86 *c, uint32_t target) {
     abort();
 }
 
+void recomp_region_missing(X86 *c, uint32_t target) {
+    LOGW("recomp_region_missing: %08x is not an instruction of its decoded region (from=%08x)", target, c->eip);
+    fflush(stdout);
+    fflush(stderr);
+    abort();
+}
+
 void recomp_unknown_call(X86 *c, uint32_t target) {
-    if (recomp_run_thunk(c, target))
+    uint32_t site = observe_take();
+    if (recomp_run_thunk(c, target)) {
+        observe_indirect(site, target, "thunk");
         return;
+    }
+    if (target >= GUEST_NULL_LIMIT && recomp_region_enter(c, target)) {
+        observe_indirect(site, target, "region");
+        return;
+    }
     // Code no translation covers runs in the interpreter when every
     // instruction in it decodes: code the guest built or copied into its heap
     // at run time, and code inside the image that discovery missed. The
@@ -307,8 +322,11 @@ void recomp_unknown_call(X86 *c, uint32_t target) {
     // call through a null pointer faults at the call, and there are no
     // instructions at it to interpret. Reading them would be the very
     // dereference this page exists to refuse.
-    if (target >= GUEST_NULL_LIMIT && interp_call(c, target))
+    if (target >= GUEST_NULL_LIMIT && interp_call(c, target)) {
+        observe_indirect(site, target, "interp");
         return;
+    }
+    observe_indirect(site, target, "unknown");
     if (target == GUEST_RETURN_SENTINEL) {
         recomp_callback_return(c);
         // With no matching live callback this is an ordinary undeliverable
@@ -373,6 +391,7 @@ void recomp_unknown_call(X86 *c, uint32_t target) {
     // Every undeliverable call is an address the run proves is code, so it is
     // also what a regeneration wants back (see discovery.h).
     discovery_note("call", target, ret);
+    observe_write();
     fflush(stdout);
     fflush(stderr);
     abort();

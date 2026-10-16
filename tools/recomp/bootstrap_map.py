@@ -42,6 +42,7 @@ class Recovery:
         self.gaps = []
         self.traps = {}
         self.data_ranges = []
+        self.excluded_bytes = 0
         self.known_mask = bytearray(self.pe.OPTIONAL_HEADER.SizeOfImage)
         self.has_evidence = False
         self.data_mask = None
@@ -143,6 +144,11 @@ class Recovery:
         if not speculative:
             self.trusted_seeds.add(target)
         owner = self.covered.get(target)
+        if evidence.startswith("direct:") and not speculative and owner not in (None, target):
+            while owner not in (None, target):
+                self.retract(owner)
+                owner = self.covered.get(target)
+            first = True
         if owner in self.speculative and (owner != target or not speculative):
             self.retract(owner)
             first = True
@@ -247,7 +253,7 @@ class Recovery:
                 self.seed(self.image.base + symbol.address, "export:%d" % symbol.ordinal, True)
         for target, slot in self.relocations:
             if not self.image.is_exec(slot) and not self.at_known_data(target):
-                self.seed(target, "relocation:%08x" % slot)
+                self.seed(target, "relocation:%08x" % slot, False, True)
         tls = getattr(self.pe, "DIRECTORY_ENTRY_TLS", None)
         if tls and tls.struct.AddressOfCallBacks:
             at = tls.struct.AddressOfCallBacks + self.delta
@@ -260,7 +266,7 @@ class Recovery:
             ins = self.instructions.get(owner)
             if ins and any(op.type == x86.X86_OP_IMM and op.imm & 0xffffffff == target for op in ins.operands):
                 if not self.at_known_data(target):
-                    self.seed(target, "relocated-immediate:%08x" % owner)
+                    self.seed(target, "relocated-immediate:%08x" % owner, False, True)
         self.trace()
 
     def pointer_tables(self):
@@ -284,7 +290,7 @@ class Recovery:
                     self.tables.append((slots[0][0], at))
                     for slot, target in slots:
                         if not self.at_known_data(target):
-                            self.seed(target, "pointer-run:%08x" % slot)
+                            self.seed(target, "pointer-run:%08x" % slot, False, True)
                 if len(slots) < 2:
                     at = slots[0][0] + 1 if slots else at + 1
         self.trace()
@@ -389,20 +395,17 @@ class Recovery:
 
     def report(self):
         return {
-            "instructions": len(self.instructions), "entries": len(self.seeds),
+            "instructions": len(self.instructions), "entries": len(self.seeds), "excluded_bytes": self.excluded_bytes,
             "pointer_runs": [{"start": "%08x" % a, "end": "%08x" % b} for a, b in self.tables],
             "gaps": [{"start": "%08x" % a, "end": "%08x" % b, "kind": kind} for a, b, kind in self.gaps],
             "traps": {"%08x" % at: reason for at, reason in sorted(self.traps.items())},
-            "conflicts": [{"target": "%08x" % a, "instruction": "%08x" % b, "evidence": evidence}
+            "conflicts": [{"target": "%08x" % a, "instruction": "%08x" % b, "evidence": evidence,
+                           "kind": "shared" if a in self.instructions else "rejected"}
                           for a, b, evidence in sorted(self.conflicts)],
             "seeds": {"%08x" % at: sorted(evidence) for at, evidence in sorted(self.seeds.items())},
         }
 
-    def publish(self, executable, output, body_bytes):
-        if self.conflicts:
-            raise TranslateError("%d entry/boundary conflicts; no code map published" % len(self.conflicts))
-        if output.exists():
-            raise TranslateError("Output exists: %s" % output)
+    def code_map_rows(self, body_bytes=4096):
         groups = defaultdict(list)
         owned = {entry for _, _, entry in self.function_ranges}
         window = previous = None
@@ -420,32 +423,41 @@ class Recovery:
         for owner, group in groups.items():
             if owner not in self.instructions or self.function_of(owner) not in (None, owner):
                 raise TranslateError("function %08x has no instruction at its entry" % owner)
+        functions = {}
+        entries = {}
+        for owner, group in sorted(groups.items()):
+            runs = []
+            for at, size in group:
+                if not runs or at != runs[-1][0] + sum(runs[-1][1]):
+                    runs.append((at, []))
+                runs[-1][1].append(size)
+                if at != owner:
+                    entries[at] = (owner, "branch")
+            functions[owner] = [(start, sum(lengths), "".join("%x" % n for n in lengths)) for start, lengths in runs]
+        return functions, entries
+
+    def publish(self, executable, output, body_bytes):
+        if output.exists():
+            raise TranslateError("Output exists: %s" % output)
+        functions, entries = self.code_map_rows(body_bytes)
         output.parent.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".bootstrap-map-", dir=output.parent))
         try:
             spans = [code_map.SPANS_HEADER]
-            entries = [code_map.ENTRIES_HEADER]
-            for owner, group in sorted(groups.items()):
-                runs = []
-                for at, size in group:
-                    if not runs or at != runs[-1][0] + sum(runs[-1][1]):
-                        runs.append((at, []))
-                    runs[-1][1].append(size)
-                    if at != owner:
-                        entries.append("%08x\t%08x\tbranch" % (at, owner))
-                for start, lengths in runs:
-                    spans.append("%s\t%08x\t%d\t%s" % ("" if start == owner else "%08x" % owner,
-                                 start, sum(lengths), "".join("%x" % n for n in lengths)))
+            for owner, rows in functions.items():
+                for start, size, lengths in rows:
+                    spans.append("%s\t%08x\t%d\t%s" % ("" if start == owner else "%08x" % owner, start, size, lengths))
+            entry_rows = [code_map.ENTRIES_HEADER] + ["%08x\t%08x\t%s" % (at, owner, kind) for at, (owner, kind) in entries.items()]
             metadata = {
                 "format": code_map.FORMAT, "status": "complete", "provenance": "provisional-sweep",
                 "emitter": "decoded", "trap_instructions": ",".join("%08x" % at for at in sorted(self.traps)), "executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
-                "image_base": "%08x" % self.image.base, "functions": str(len(groups)),
+                "image_base": "%08x" % self.image.base, "functions": str(len(functions)),
                 "instructions": str(len(self.instructions)),
                 "instruction_bytes": str(sum(ins.size for ins in self.instructions.values())),
             }
             (staging / "metadata.txt").write_text("".join("%s=%s\n" % item for item in metadata.items()))
             (staging / "spans.tsv").write_text("\n".join(spans) + "\n")
-            (staging / "entries.tsv").write_text("\n".join(entries) + "\n")
+            (staging / "entries.tsv").write_text("\n".join(entry_rows) + "\n")
             (staging / "tables.tsv").write_text(code_map.TABLES_HEADER + "\n")
             (staging / "noreturn.tsv").write_text(code_map.NORETURN_HEADER + "\n")
             code_map.read_map(staging)
@@ -454,13 +466,17 @@ class Recovery:
         finally:
             if staging.exists():
                 shutil.rmtree(staging)
-        return len(groups)
+        return len(functions)
 
 
-def build(executable, base, evidence, extra_data):
+def build(executable, base, evidence, extra_data, exclude_map=None):
     recovery = Recovery(executable, base)
     recovery.load_evidence(evidence)
-    for lo, hi, kind in extra_data:
+    excluded = [] if exclude_map is None else [(start, start + size, "Ghidra code map")
+                                               for spans in code_map.read_map(exclude_map)[1].values()
+                                               for start, size, _ in spans]
+    recovery.excluded_bytes = sum(hi - lo for lo, hi, _ in excluded)
+    for lo, hi, kind in list(extra_data) + excluded:
         recovery.data_ranges.append((lo, hi, kind))
         recovery.known_mask[lo - recovery.image.base:hi - recovery.image.base] = b"\x01" * (hi - lo)
     recovery.initial_seeds()
@@ -469,6 +485,10 @@ def build(executable, base, evidence, extra_data):
     recovery.sweep()
     recovery.index_tables()
     return recovery
+
+
+def discover(executable, base, exclude_map=None):
+    return build(executable, base, None, [], exclude_map)
 
 
 def main():
@@ -480,10 +500,12 @@ def main():
     parser.add_argument("--body-bytes", type=int, default=4096)
     parser.add_argument("--evidence", type=Path, default=None,
                         help="JSON with data_ranges and entries (RVAs) from a PDB")
+    parser.add_argument("--exclude-map", type=Path, default=None,
+                        help="Ghidra code map directory whose spans are excluded from discovery")
     args = parser.parse_args()
     if args.body_bytes <= 0:
         parser.error("--body-bytes must be positive")
-    recovery = build(args.exe, args.base, args.evidence, [])
+    recovery = build(args.exe, args.base, args.evidence, [], args.exclude_map)
     if args.evidence:
         extra = set()
         while True:
@@ -492,7 +514,7 @@ def main():
             if not found - extra:
                 break
             extra |= found
-            recovery = build(args.exe, args.base, args.evidence, sorted(extra))
+            recovery = build(args.exe, args.base, args.evidence, sorted(extra), args.exclude_map)
     report = recovery.report()
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2) + "\n")

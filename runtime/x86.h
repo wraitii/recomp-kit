@@ -19,6 +19,7 @@
 #include <limits.h>
 #include <string.h>
 #include <math.h>
+#include "observe.h"
 #ifndef M_LN2 /* glibc and MSVC hide the M_ constants without feature macros */
 #define M_LN2 0.693147180559945309417
 #endif
@@ -568,6 +569,7 @@ void recomp_unknown_jump(X86 *c, uint32_t target);
 void recomp_shim_call(X86 *c, uint32_t target);
 /* target is neither a translated function nor a shim.  Logs; may abort. */
 void recomp_unknown_call(X86 *c, uint32_t target);
+void recomp_region_missing(X86 *c, uint32_t target);
 /* A popped callback sentinel can bypass translated callers. The innermost
  * guest_call owns the live host return checkpoint and its guest stack range. */
 void recomp_callback_return(X86 *c);
@@ -642,7 +644,7 @@ typedef struct RecompICache {
     void (*fn)(X86 *c);
     const struct RecompModule *module;
 } RecompICache;
-void recomp_icall_slow(X86 *c, uint32_t target, RecompICache *ic);
+void recomp_icall_slow(X86 *c, uint32_t target, RecompICache *ic, uint32_t site);
 
 /* A host implementation of a stdcall guest function that guest_call runs in
  * place of the translation while the function is not hooked. args holds the
@@ -865,14 +867,14 @@ RECOMP_HOT_INLINE void x86_cc_settle_or_drop(X86 *c, uint32_t need) {
     }
 }
 
-static inline void recomp_icall(X86 *c, uint32_t target, RecompICache *ic) {
+static inline void recomp_icall(X86 *c, uint32_t target, RecompICache *ic, uint32_t site) {
 #ifndef RECOMP_CHECK_CALL_FACTS
     if (target - GUEST_SHIM_BASE < GUEST_SHIM_END - GUEST_SHIM_BASE) {
-        if (!recomp_frame_watch) {
+        if (!recomp_frame_watch && !recomp_observe_on) {
             recomp_shim_call(c, target);
             return;
         }
-    } else if (ic->target == target && ic->epoch == recomp_dispatch_epoch) {
+    } else if (ic->target == target && ic->epoch == recomp_dispatch_epoch && !recomp_observe_on) {
         if (ic->module) {
             if (!recomp_frame_watch) {
                 recomp_module_invoke(c, ic->module, ic->index);
@@ -885,7 +887,7 @@ static inline void recomp_icall(X86 *c, uint32_t target, RecompICache *ic) {
         }
     }
 #endif
-    recomp_icall_slow(c, target, ic);
+    recomp_icall_slow(c, target, ic, site);
 }
 
 /* Clear the dead descriptor payload so a full-struct comparison does not see

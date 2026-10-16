@@ -14,6 +14,8 @@ int recomp_run_thunk(X86 *c, uint32_t target);
 // Runtime-only test binaries use the weak default with no translated entries.
 int recomp_thunk_target_kind(uint32_t target);
 
+int recomp_region_enter(X86 *c, uint32_t target);
+
 #ifdef __cplusplus
 }
 #endif

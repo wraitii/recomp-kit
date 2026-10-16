@@ -217,10 +217,11 @@ class Translator(ControlFlow):
     # -- emission ----------------------------------------------------------
 
     def translate(self, fn, entries=(), body_symbol=None):
-        """Emit fn_ADDR, plus one thin wrapper per alternate entry point.
+        """Emit the body, dispatched by target address, plus one thin fn_ wrapper per entry.
 
-        With entries, the body becomes `static void body_ADDR(X86 *, uint32_t)`
-        preceded by a dispatch switch and every entry is a one-line wrapper."""
+        Without body_symbol the body is `void region_ADDR(X86 *, uint32_t target)`,
+        with a case for every live instruction, and fn_ADDR and each entry call it.
+        With body_symbol the body takes entry_ over its entries and the fallback."""
         self.call_targets = set()
         entries = sorted(set(entries))
         dead = {i for i, ins in enumerate(fn.insns) if ins.addr in fn.dead_addrs}
@@ -245,23 +246,42 @@ class Translator(ControlFlow):
         if last.mnem not in TERMINATORS and (fn.fallthrough[live[-1]] or fn.end) in fn.index:
             labels.add(fn.fallthrough[live[-1]] or fn.end)
 
+        region = body_symbol is None
+        if region:
+            labels.update(fn.insns[i].addr for i in live)
         head = fn.insns[0].addr != fn.addr
         if head:
             labels.add(fn.addr)
         out = []
-        if entries:
-            out.append("RECOMP_COLD void %s(X86 *c, uint32_t entry_) {" % body_symbol
-                       if body_symbol else "static void body_%08x(X86 *c, uint32_t entry_) {" % fn.addr)
+        if region:
+            out.append("void region_%08x(X86 *c, uint32_t target) {" % fn.addr)
+            out.append("    x86_cc_settle(c);")
+            if fn.seh_escapes:
+                out.append("    uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
+            if head:
+                out.append("    if (target == %s) goto L_%08x;" % (hexlit(fn.addr), fn.addr))
+            out.append("    static const uint32_t addrs_[] = {")
+            out.extend("        %s," % hexlit(fn.insns[i].addr) for i in live)
+            out.append("    };")
+            out.append("    static void *const labels_[] = {")
+            out.extend("        &&L_%08x," % fn.insns[i].addr for i in live)
+            out.append("    };")
+            out.append("    uint32_t lo_ = 0, hi_ = %d;" % len(live))
+            out.append("    while (lo_ < hi_) {")
+            out.append("        uint32_t mid_ = lo_ + (hi_ - lo_) / 2;")
+            out.append("        if (addrs_[mid_] < target) lo_ = mid_ + 1; else hi_ = mid_;")
+            out.append("    }")
+            out.append("    if (lo_ == %d || addrs_[lo_] != target) recomp_region_missing(c, target);" % len(live))
+            out.append("    goto *labels_[lo_];")
+        elif entries:
+            out.append("RECOMP_COLD void %s(X86 *c, uint32_t entry_) {" % body_symbol)
             out.append("    x86_cc_settle(c);")
             if fn.seh_escapes:
                 out.append("    uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
             out.append("    switch (entry_) {")
             for e in entries:
                 out.append("    case %s: goto L_%08x;" % (hexlit(e), e))
-            if body_symbol:
-                out.append("    default: recomp_jump(c, entry_); return;")
-            else:
-                out.append("    default: goto L_%08x;" % fn.addr if head else "    default: break;")
+            out.append("    default: recomp_jump(c, entry_); return;")
             out.append("    }")
         else:
             out.append("void fn_%08x(X86 *c) {" % fn.addr)
@@ -287,13 +307,12 @@ class Translator(ControlFlow):
                 and not self.never_returns(last)):
             out.append("    " + " ".join(self.goto_target(fn, fn.fallthrough[live[-1]] or fn.end, last)))
         out.append("}")
-        referenced = set(re.findall(r'\bgoto (L_[0-9a-f]+);', '\n'.join(out)))
+        referenced = set(re.findall(r'(?:\bgoto |&&)(L_[0-9a-f]+)\b', '\n'.join(out)))
         out = [line for line in out if not (line.startswith('L_')
                and line.endswith(': ;') and line[:-3] not in referenced)]
-        if entries and body_symbol is None:
-            out.append("void fn_%08x(X86 *c) { body_%08x(c, 0u); }" % (fn.addr, fn.addr))
-            for e in entries:
-                out.append("void fn_%08x(X86 *c) { body_%08x(c, %s); }" % (e, fn.addr, hexlit(e)))
+        if region:
+            for e in sorted({fn.addr, *entries}):
+                out.append("void fn_%08x(X86 *c) { region_%08x(c, %s); }" % (e, fn.addr, hexlit(e)))
         return out
 
     # ---- helpers used by emit -------------------------------------------
@@ -743,7 +762,7 @@ class Translator(ControlFlow):
                 return L
             L.append("uint32_t t_ = %s;" % read_op(ops[0], 32))
             L.append("c->r[4] -= 4; wr32(c->r[4], %s);" % hexlit(nxt))
-            L.append("recomp_icall(c, t_, &ic_%08x);" % ins.addr)
+            L.append("recomp_icall(c, t_, &ic_%08x, %s);" % (ins.addr, hexlit(ins.addr)))
             L.append("x86_cc_settle(c);")
             return L
 
@@ -1038,7 +1057,7 @@ class Translator(ControlFlow):
         if t in self.func_addrs:
             self.call_targets.add(t)
             return ["CALL_FN(%08x); return;" % t]
-        if getattr(self, "provisional", False) and not GUEST_SHIM_BASE <= t < GUEST_SHIM_END:
+        if fn.addr in getattr(self, "provisional", ()) and not GUEST_SHIM_BASE <= t < GUEST_SHIM_END:
             self.unmodelled.append((ins.addr, "transfer to unmapped instruction %08x" % t))
             return ["recomp_unmodelled(c, %s); return;" % hexlit(ins.addr)]
         return ["c->eip = %s; recomp_jump(c, %s); return;" % (hexlit(ins.addr), hexlit(t))]
