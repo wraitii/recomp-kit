@@ -1,0 +1,89 @@
+[game]
+id = "civ4-bts"
+name = "Civilization IV: Beyond the Sword"
+app_name = "Civ4BTSRecomp"
+bundle_id = "dev.recompkit.civ4bts"
+executable = "Civ4BeyondSword.exe"
+sha256 = "90dbdbdcbd6c631c9d575881d0241d9a2012b1a5957bacbe68212745da22174e"
+image_base = 0x00400000
+heap_base = 0x11000000
+heap_end = 0x80000000
+guest_size = 0x80000000
+host_arena_base = 0
+entry_point = 0x008f47fa
+guest_root = 'C:\Civilization IV\Beyond the Sword'
+store_hooks = false
+
+[environment]
+passthrough = ["PYTHONVERBOSE"]
+
+[translate]
+code_map = "metadata"
+native = { header = "native/civ4_native.h", sources = ["native/effect_state_manager.c"] }
+
+[input]
+relative_mouse_capture = false
+
+[fonts]
+files = [
+  '..\Resource\Civ4\sylfaen.ttf',
+  '..\Resource\Civ4\sylfaenb.ttf',
+  '..\Resource\Civ4\sylfaeni.ttf',
+  '..\Resource\Civ4\sylfaenbi.ttf',
+  '..\Resource\Fonts\arial.ttf',
+]
+
+[controls]
+default_layout = "hidden"
+pad = "off"
+
+[setup]
+required_dirs = ["Assets"]
+
+[modules.aux.msvcr71]
+name = "msvcr71.dll"
+aliases = ["msvcrt.dll"]
+sha256 = "8094af5ee310714caebccaeee7769ffb08048503ba478b879edfef5f1a24fefe"
+base = 0x10000000
+size = 0x00056000
+
+[modules.aux.msvcp71]
+name = "msvcp71.dll"
+sha256 = "df96156f6a548fd6fe5672918de5ae4509d3c810a57bffd2a91de45a3ed5b23b"
+base = 0x10100000
+size = 0x0007b000
+
+[modules.aux.boost_python]
+name = "boost_python-vc71-mt-1_32.dll"
+sha256 = "196722e9709d9fc69791bafa654972542ae299c9a40efec5ba29ce8ba44acf27"
+base = 0x10200000
+size = 0x0002b000
+
+[modules.aux.python24]
+name = "python24.dll"
+sha256 = "85e590546b9e367d333b5d7d31b576ccc593bc93c033c549b601ec15dfe36bc3"
+base = 0x10300000
+size = 0x001ca000
+
+[modules.aux.cvgamecore]
+name = "CvGameCoreDLL.dll"
+original_path = "Assets/CvGameCoreDLL.dll"
+sha256 = "7f9f23905177396972f87a168ec785f006be1d5b9ff730484b05c565a9396278"
+base = 0x10500000
+size = 0x004c1000
+
+[modules.aux.zlib1]
+name = "zlib1.dll"
+sha256 = "b09537250201236472ccd3caff5c0c12a5fad262e1e951350e9e5ed2a81d9dde"
+base = 0x10c00000
+size = 0x00013000
+
+[modules.aux.msxml3]
+name = "msxml3.dll"
+sha256 = "100a15f4ee73e99cc1828ecf6e8f3d3b538fa40abe5a1872e8b800165955d540"
+base = 0x10a00000
+size = 0x00113000
+com_classes = [
+  { clsid = "f6d90f11-9c73-11d3-b32e-00c04f990bb4", name = "DOMDocument30" },
+  { clsid = "373984c9-b845-449b-91e7-45ac83036ade", name = "XMLSchemaCache" },
+]

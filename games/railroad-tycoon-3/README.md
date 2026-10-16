@@ -1,8 +1,147 @@
 # Railroad Tycoon 3
 
+Native port of the GOG **Railroad Tycoon 3 (2003)** `RT3.exe` (32-bit x86, MSVC 7-era C++). This directory is the game's configuration root (`--game railroad-tycoon-3`).
+
+## Build and run
+
+From the game repository root (the one containing `recomp-kit/`); prerequisites are in
+[CONTRIBUTING](../../CONTRIBUTING.md#prerequisites):
+
+```sh
+git submodule update --init --recursive recomp-kit
+python3 -m venv tools/.venv
+tools/.venv/bin/python -m pip install -r recomp-kit/requirements-dev.txt
+RECOMP_BUILD_ROOT=$PWD/build tools/.venv/bin/python recomp-kit/tools/setup.py \
+  --game railroad-tycoon-3 --install "/absolute/path/to/your/installed/game"
+tools/.venv/bin/python tools/build.py --regenerate --target app --jobs 8 \
+  --allow-unmodelled "RT3 bring-up: unsupported MMX/3DNow/SSE instructions trap at their own address"
+open build/RailroadTycoon3Recomp.app
+```
+
+The installation must contain `RT3.exe` and the installed data. Setup links it at
+`build/original`. The supported executable hash is in [game.toml](game.toml).
+
+For subsequent builds:
+
+```sh
+tools/.venv/bin/python tools/build.py --target app --jobs 8
+```
+
+Add `--regenerate` after changing translation inputs: the code map, translator
+or translation settings. Regeneration currently needs `--allow-unmodelled` (as in
+the first build above): the image still contains MMX/3DNow (`femms`, `pf*`) and
+scalar-SSE instructions the translator cannot model. They translate to a trap at
+their own address, and remain fidelity gaps if reached (see Status below).
+`--regenerate --target gen` generates translated C without configuring or
+building the app.
+
+Translation uses the kit defaults: SSA, relaxed
+fault-state publication (`fault_state = "relaxed"`) and MSVC x87 call convention
+(`msvc_x87_convention = true`). `DIVERGENCE(original):` relaxed publication can
+leave diagnostic CPU/x87 state stale at a fault; the MSVC convention elides
+popped x87 residue at calls and returns. For conservative comparison, set
+`fault_state = "exact"` and `msvc_x87_convention = false`,
+then regenerate.
+
+`[game] store_hooks = false` removes per-store watchpoint and DirectDraw dirty-range
+checks. DirectDraw Unlock compares the whole locked surface against its saved
+contents, and `RECOMP_WATCH` diagnostics are unavailable. This trades cheaper
+guest stores for more Unlock scanning; frequent small writes to large locked
+surfaces can favor hooks. The hooks-disabled app rebuilds and all 31 native
+suites pass. An approximate in-game profile comparison confirms the store-hook
+samples are gone, but scene differences leave the net performance change
+inconclusive.
+Set `store_hooks = true` and rebuild to restore dirty-range tracking and watchpoints.
+
+## Status
+
+The code map is exported and validated: 6,039 functions and 510,070
+instructions, decoded from the real executable by `tools/build.py --regenerate`
+and in agreement with Ghidra's boundaries. The game boots, loads a map and
+renders the 3D world (terrain colour and detail, UI, DXT textures).
+
+Unsupported SSE/XMM and 3DNow instructions emit named traps. The previous
+52 `skip_functions` entries are unnecessary with the current kit; all mapped
+functions are translated. The kit now lowers `movups xmm3, xmmword ptr [ecx]` at the former first stop,
+`00581699`; `mulps xmm2, xmm3` at `005816a8` still traps. The runtime reports a CPUID
+without MMX/SSE/3DNow, so the guest selects the x87 math tier. Full vector
+lowering remains necessary before advertising those features.
+
+The v3 map adds Ghidra's jump targets, referenced interior entries and
+non-returning functions/calls. Its migration exposed stale function bodies,
+misdecoded instructions and four missing callable helpers, repaired against
+the original executable. See Ghidra cleanup notes (`docs/ghidra-cleanup.md` in the game repository).
+Generation emits 5,859 SSA bodies and 180 decoded bodies. It reports 128
+unmodelled instructions, while the generated bodies contain 3,443 distinct
+instruction trap sites including vector fallbacks not counted by that report.
+Computed jumps without recorded targets use runtime dispatch and fail with a
+named diagnostic if their destination has no translated entry.
+Advertising SSE support requires auditing the remaining lowering gaps first.
+
+Host overhead: the renderer uploads only each draw's requested vertex interval,
+including packed software-lighting output, and the guest-store watch/dirty gate
+is forced inline. Vertex/index buffers retain guest backing across locks, and
+unchanged render-target texture binds retain queued draws. Guest COM lifetime
+checks and Metal readback cover these paths. Compact unlit triangle lists use
+GPU indices, including vertex shaders with declaration-derived layouts and
+padded strides. Fixed-function lighting for 0x112/0x152 runs in the GPU vertex
+shader for both indexed and nonindexed draws. Lit triangle lists pack distinct
+referenced vertices and remap GPU indices, skipping unused sparse gaps.
+`RECOMP_D3D8_CPU_LIGHTING=1` forces the CPU comparison path; unsafe attenuation,
+nonfinite state/positional inputs and `ProcessVertices` retain CPU processing.
+`DIVERGENCE(original):` GPU lighting rounding and `pow` may differ from the CPU
+reference and original D3D8 hardware; synthetic Metal comparisons allow up to
+two 8-bit channel levels per pixel.
+Sparse unlit, strip/fan and diagnostic draws retain expansion
+(`RECOMP_D3D8_EXPAND_INDICES=1` forces it for comparisons). CPU byte-equivalence
+and Metal readback cover both lit layouts, both index widths, offsets, repeated
+indices and queued snapshots. A fresh in-game profile is needed to quantify the
+latest performance change. Validation: 161 Rust tests and the Metal headless
+probe pass; the app rebuilds. Native suites pass 31/31 with Metal and game-directory fixture access. These checks
+establish synthetic renderer equivalence, not original-D3D8 gameplay equivalence.
+
+Known gaps and diagnostics:
+
+- Samply profiles include `frame` spans at each guest window-present boundary,
+  covering D3D8 native texture handoff and CPU readback. Markers enable
+  automatically when launched under samply; `RECOMP_PROFILE_MARKERS=1` also
+  writes `marker-<pid>.txt` in the system temporary directory. Spans measure
+  time between guest presents, including pacing, rather than GPU execution time.
+- `RECOMP_D3D8_DUMP_TEXTURES=<dir>` writes bound texture levels as PNG
+  (`RECOMP_D3D8_DUMP_TEXTURE_LEVEL=<n>` limits to one level);
+  `RECOMP_D3D8_TRACE_DRAWS=<n>` (`RECOMP_D3D8_TRACE_DRAWS_START=<n>` skips that
+  many draws first; `RECOMP_D3D8_TRACE_STAGE1=1` restricts to two-stage world
+  draws) and `RECOMP_D3D8_TRACE_PROCESS_VERTICES=<n>` dump draw and
+  `ProcessVertices` state; `RECOMP_TRACE_CALLS` traces guest function entries.
+  `RECOMP_D3D8_TRACE_SHADERS=1` reports shader creation handles and token counts.
+  `RECOMP_D3D8_TRACE_SHADER_DRAWS=<n>` captures four shader bindings, constants
+  and sample vertices; `RECOMP_D3D8_TRACE_SHADER_STAGE2=1` selects shaders that
+  sample stage 2 (the water pass), and `RECOMP_D3D8_TRACE_SHADER_DIR=<dir>`
+  captures GPU-rendered inputs as PNGs.
+- The kit implements D3D8 vs.1.1/ps.1.1 creation, binding, deletion, queries,
+  declarations, constants and four-stage sampling with `texbem` bump matrices.
+  Signed `V8U8` bump textures retain their two-byte guest layout and signed
+  GPU samples across mip levels, supporting the ocean bump maps produced by
+  `FUN_00542550` (`0x005425ea` stores format `0x3c`). Shader caps enable the
+  engine's programmable path. Startup creates all five shipped shaders
+  successfully; synthetic Metal readback tests cover constants and dependent
+  sampling. A guest COM/GPU regression verifies that rendering to a texture
+  surface and sampling its parent texture share the same GPU image. A manual
+  in-game check reports the dark water/reflection issue resolved; original-D3D8
+  visual equivalence remains unverified. See [shader coverage](../../graphics/d3d8-wgpu/SHADERS.md).
+- `IDirect3DTexture8::SetLOD` is not applied to the mip clamp, and render-target
+  textures bind level 0 only.
+- The terrain's colour map is extracted by the game from the `.gmp` to a loose
+  `Maps/<name>_A.tga`, then found through the directory scan in
+  `GrafxResMgr::ScanAndRegisterFiles`. That scan depends on `FindFirstFile`
+  returning `.` and `..` first, which the kit's kernel32 shim now does.
+
+
+## Code map
+
 The GOG `RT3.exe` identified by [game.toml](game.toml) is the behavioral reference. The packed [code map](metadata/) contains 6,039 functions across 6,760 spans and 510,070 instruction boundaries, without executable bytes, instruction text or analysis names. The private executable supplies those bytes during translation.
 
-Ghidra research, export scripts and engine notes remain in the [Railroad Tycoon 3 workbench](../../../). To refresh the map, export `recomp-code-map-v3-export` from the matching executable into a fresh directory, then run:
+Ghidra research, export scripts and engine notes remain in the game repository. To refresh the map, export `recomp-code-map-v3-export` from the matching executable into a fresh directory, then run:
 
 ```sh
 python tools/recomp/code_map.py --pack /path/to/v3-export --exe /path/to/RT3.exe --out games/railroad-tycoon-3/metadata

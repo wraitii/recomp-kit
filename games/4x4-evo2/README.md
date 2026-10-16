@@ -1,0 +1,119 @@
+# 4x4 Evolution 2
+
+Native port of PC **4x4 Evolution 2**: the supported executable identity, the
+exported code map, the native replacements and the renderer configuration. This
+directory is the game's configuration root (`--game 4x4-evo2`).
+
+`game.toml` records the supported executable identity and translation settings;
+`metadata/` holds the exported code map without instruction contents or names.
+
+## Setup and build
+
+From the game repository root (the one containing `recomp-kit/`):
+
+```sh
+git submodule update --init --recursive recomp-kit
+python3 -m venv tools/.venv
+tools/.venv/bin/python -m pip install -r recomp-kit/requirements-dev.txt
+RECOMP_BUILD_ROOT=$PWD/build tools/.venv/bin/python recomp-kit/tools/setup.py \
+  --game 4x4-evo2 --install "/absolute/path/to/your/installed/game"
+tools/.venv/bin/python tools/build.py --regenerate
+open build/Evo2Recomp.app
+```
+
+Setup checks the executable against `game.toml` and links the installation at
+`build/original`; no game files are copied or changed. Prerequisites are in
+[CONTRIBUTING](../../CONTRIBUTING.md#prerequisites). Later builds need only
+`tools/.venv/bin/python tools/build.py`. Add `--regenerate` after changing a
+translation input: the code map, the translator or a translation setting.
+`--regenerate --target gen` generates translated C without building.
+
+Standalone host settings and controller setup open without starting the game:
+
+```sh
+build/Evo2Recomp.app/Contents/MacOS/Evo2Recomp --configure
+```
+
+Select **Controller setup**. **Overview** tests the connected controller and
+offers starting presets. **Mapping** assigns a physical input to a controller
+output, a keyboard key, or both; **Identify input** selects the control you move
+or press. **Calibration** corrects drift, direction, and range. **Axis mode**
+selects **Centered (stick / wheel)** or **One-sided (trigger / pedal)** response.
+Presets cover standard controller, combined triggers / pedals, and built-in
+keyboard / mouse mappings. Extra response and mapping settings are behind **More
+options...**. **Save** saves the profile; Cancel offers to discard unsaved edits.
+Normal launches start the game directly when its data is available.
+
+## Renderers
+
+The original `tridx8tl.dll` and `Tridx8.dll` hardware renderers are translated
+auxiliary modules. Their Direct3D 8 calls use the kit's GPU backend. The second
+DLL is relocated to 0x11000000 because both originals prefer 0x10000000;
+the guest arena includes both images. The saved `system/metal.ini` selects this
+path with `useDirect3D=1` and `rendererDLLPath=tridx8tl.dll` (hardware TnL) or
+`tridx8.dll`. `useDirect3D=0` retains the original software rasterizer.
+Unregistered renderer DLLs fail to load and the original engine falls back to
+software rendering. OpenGL (`TRIGL.DLL`) remains unsupported.
+
+To reproduce the renderer maps, import and analyze each supported DLL in
+Ghidra. Run `Evo2RebaseRenderer` before analyzing `Tridx8.dll`; it relocates both
+the image and its HIGHLOW pointer operands. Inspect `SeedRelocationEntries`
+in `dry` mode and apply the verified candidates to recover runtime initializer
+and callback entries missed by auto-analysis, then analyze their callees.
+Run `Evo2ExportCodeMap`
+with an absolute destination and the DLL name as its second
+argument. Pack each export with `code_map.py` into `metadata-tridx8tl` or
+`metadata-tridx8`; the latter requires `--base 0x11000000`. Regenerate and
+rebuild the windowed app afterward.
+
+DIVERGENCE(original): the kit exposes no wave input/output devices and returns
+device or handle errors for those APIs. DirectSound remains the audio path.
+QueryPerformanceCounter uses synthetic microsecond ticks within the runtime's
+millisecond clock, saturating after 999 increments in one millisecond. Segment
+operations use the kit's flat model; selector validation remains a fidelity gap.
+
+## Frame pacing and video memory
+
+`native/frame_pacing.cpp` wraps the retained translated frame-completion function
+at `0x00495d10`. Its hardware branch presents through `0x005c75d0`; the software
+branch presents through `0x006029d0`. Both pump messages through `0x0060b7b0`.
+Gameplay then samples `getTime` (`0x0060b020`) at `0x004639a7`, so the wait is
+included in the original elapsed timestep. The main loop divides elapsed timer
+ticks by 18 and then 65536; timer initialization uses 1179648 ticks per second.
+These relationships and the hook entry bytes were checked against the supported
+executable and Ghidra on port 8168.
+
+DIVERGENCE(original): the default cap is 60 frames per second, using monotonic
+deadlines and cooperative guest sleeps. The original rendering, message pump,
+registers, flags and timing calculations remain translated. Set
+`RECOMP_EVO2_FPS=0` to retain uncapped original behavior; a value from 1 through
+1000 overrides the cap. Slow frames do not trigger catch-up bursts. High-rate
+physics behavior remains an original fidelity limitation; no physics equations
+or timer values are changed.
+
+A separate VRAM hook is unnecessary for the translated hardware renderer.
+`tridx8tl.dll` samples `IDirect3DDevice8::GetAvailableTextureMem` during mode
+creation, retains the result at `0x1062a5d4`, and returns it unchanged from
+`APIDLLgetVideoMemory` (`0x100036c0`). The kit reports a fixed 384 MiB, safely below
+the signed 32-bit limit, rather than the host GPU's potentially multi-gigabyte
+memory size. This already avoids oversized modern VRAM reports. The value is a
+modeled budget, not a measurement or allocation limit; no 256 MiB game override
+has been added.
+
+## Code map
+
+The code map is exported from Ghidra with the game's `Evo2ExportCodeMap.java`
+script. From the game repository root, after deliberate analysis has produced
+instruction boundaries (Ghidra API setup is in the game's `docs/ghidra_api.md`):
+
+```sh
+GHIDRA_API_BASE=http://127.0.0.1:8169 ./tools/ghidra_api \
+  /script/run '{"name":"Evo2ExportCodeMap","args":["/ABS/PATH/analysis/code-map-export"]}'
+tools/.venv/bin/python recomp-kit/tools/recomp/code_map.py --pack analysis/code-map-export \
+  --exe build/original/4x42.exe --out recomp-kit/games/4x4-evo2/metadata
+tools/.venv/bin/python tools/build.py --regenerate
+```
+
+The exporter checks the executable hash, architecture and image base and refuses
+an existing output directory. Entries Ghidra cannot represent stay explicit in
+`[translate] entry_points` in `game.toml`.

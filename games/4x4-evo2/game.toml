@@ -1,0 +1,35 @@
+[game]
+id = "4x4-evo2"
+name = "4x4 Evolution 2"
+app_name = "Evo2Recomp"
+bundle_id = "dev.recompkit.4x4evo2"
+executable = "4x42.exe"
+sha256 = "ab8286e6bce8a1bf3769acddfeb0a79df2e5d43c72f462a89aa90f477951ec75"
+image_base = 0x00400000
+guest_size = 0x12000000
+host_arena_base = 0
+entry_point = 0x0061673c
+guest_root = 'C:\4x4 Evolution 2'
+
+[translate]
+code_map = "metadata"
+entry_points = [0x0060ffed, 0x00610022]
+native = { header = "native/frame_pacing.h", sources = ["native/frame_pacing.cpp"] }
+
+[render]
+d3d8_wgpu = true
+
+[controls]
+pad = "native"
+
+[modules.aux.tridx8tl]
+name = "tridx8tl.dll"
+sha256 = "d95b2b609aed33c3b0da5522d148b316fc2cf0b43aecf34d83b66812ffeae4cb"
+base = 0x10000000
+size = 0x00632000
+
+[modules.aux.tridx8]
+name = "Tridx8.dll"
+sha256 = "776637512246b490e97b5e3c0ea2ebbddd461d04e0e9c1291ae7b5fb1ebb534e"
+base = 0x11000000
+size = 0x0062a000

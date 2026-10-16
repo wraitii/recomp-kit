@@ -1,0 +1,9 @@
+format=recomp-code-map-v3
+status=complete
+program=Civ4BeyondSword.exe
+executable_sha256=90dbdbdcbd6c631c9d575881d0241d9a2012b1a5957bacbe68212745da22174e
+language=x86:LE:32:default
+image_base=00400000
+functions=61932
+instructions=2081189
+instruction_bytes=6655210

@@ -1,0 +1,9 @@
+format=recomp-code-map-v3
+status=complete
+program=4x42.exe
+executable_sha256=ab8286e6bce8a1bf3769acddfeb0a79df2e5d43c72f462a89aa90f477951ec75
+language=x86:LE:32:default
+image_base=00400000
+functions=4903
+instructions=523194
+instruction_bytes=1801646

@@ -1,0 +1,9 @@
+format=recomp-code-map-v3
+status=complete
+program=tridx8tl.dll
+executable_sha256=d95b2b609aed33c3b0da5522d148b316fc2cf0b43aecf34d83b66812ffeae4cb
+language=x86:LE:32:default
+image_base=10000000
+functions=310
+instructions=17613
+instruction_bytes=51996

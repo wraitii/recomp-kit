@@ -1,18 +1,52 @@
 # Tom Clancy's Ghost Recon (2001)
 
-A native port by static recompilation. You supply a **GOG 1.4** installation;
-Desert Siege and Island Thunder use the same executable with their expansion
-data. Ghidra is not needed: the build decodes your executable with the code map
-in `metadata/`.
+Native port of the GOG 1.4 **Tom Clancy's Ghost Recon**. Expansions (Desert Siege,
+Island Thunder) use the same executable with their expansion data. This directory
+is the game's configuration root (`--game ghost-recon`).
+
+## Setup and build
+
+From the game repository root (the one containing `recomp-kit/`):
 
 ```sh
-.venv/bin/python tools/setup.py --game ghost-recon --install "/path/to/Ghost Recon"
-.venv/bin/python tools/build.py --game ghost-recon --regenerate
-open build/ghost-recon/GhostReconRecomp.app
+git submodule update --init --recursive recomp-kit
+python3 -m venv tools/.venv
+tools/.venv/bin/python -m pip install -r recomp-kit/requirements-dev.txt
+RECOMP_BUILD_ROOT=$PWD/build tools/.venv/bin/python recomp-kit/tools/setup.py \
+  --game ghost-recon --install "/path/to/Ghost Recon"
+tools/.venv/bin/python tools/build.py --regenerate
+open build/GhostReconRecomp.app
 ```
+
+Setup checks the executable against `game.toml` and links your installation; no
+game files are copied or changed. Ghidra is not needed to build: the build decodes
+the executable with the code map in `metadata/`. Prerequisites are in
+[CONTRIBUTING](../../CONTRIBUTING.md#prerequisites). Later builds need only
+`tools/.venv/bin/python tools/build.py`.
+
+`tools/build.py` in the game repository forwards to the kit with `--game ghost-recon`
+and outputs in `build/`; `--projection-cull-tests` and `--port-tab-tests` replay the
+native replacements against their translated originals.
 
 Ctrl+Option+M releases mouse capture. `RECOMP_FXAA=1` enables optional scene
 antialiasing.
+
+## Code map
+
+Export from Ghidra, then pack into the kit (from the game repository root):
+
+```sh
+./tools/ghidra_api /script/run '{"name":"GhostReconExportCodeMap.java","args":["/ABS/PATH/analysis/code-map-export"]}'
+tools/.venv/bin/python recomp-kit/tools/recomp/code_map.py --pack analysis/code-map-export \
+  --exe build/original/GhostRecon.exe --out recomp-kit/games/ghost-recon/metadata
+```
+
+The map (`recomp-code-map-v3`) holds spans, jump tables, interior entries and
+non-returning calls, addresses only. Fix gaps in Ghidra (`ApplyCodeMapFixes.java`
+documents its operations), then re-export and repack; the translator model in
+`recomp-kit/tools/recomp/program.py` fails by name on anything the map lacks.
+The exporter refuses an existing destination. `GhostReconExportRecomp.java`
+writes private reference listings; its output stays ignored.
 
 ## Native replacements
 
