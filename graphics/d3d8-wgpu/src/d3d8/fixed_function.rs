@@ -506,6 +506,7 @@ fn rhw_vertex(in: VertexInputRhw) -> VertexOutput {
     }
     out.position = vec4<f32>(ndc_x * w, ndc_y * w, in.position.z * w, w);
     out.fogdist = in.position.z;
+    out.fogfactor = f32(in.specular >> 24u) / 255.0;
     let a = f32((in.color >> 24u) & 0xffu) / 255.0;
     let r = f32((in.color >> 16u) & 0xffu) / 255.0;
     let g = f32((in.color >> 8u) & 0xffu) / 255.0;
@@ -1077,6 +1078,7 @@ fn rhw_vertex(in: VertexInputRhw) -> VertexOutput {
     }
     out.position = vec4<f32>(ndc_x * w, ndc_y * w, in.position.z * w, w);
     out.fogdist = in.position.z;
+    out.fogfactor = f32(in.specular >> 24u) / 255.0;
     // Pre-transformed draws never generate texture coordinates; the entry
     // point is shared, so leave an unused value.
     out.cam_pos = vec4<f32>(0.0, 0.0, 0.0, 1.0);
