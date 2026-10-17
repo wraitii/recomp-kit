@@ -865,8 +865,10 @@ void com_QueryInterface(X86 *c) {
 static uint32_t com_public_refs(const ComObj *o) {
     if (!o->alive)
         return 0;
-    return (uint32_t)(o->refs -
-                      ((o->kind == K_D3D9VB || o->kind == K_D3D9IB) ? o->internal_refs : 0));
+    return (uint32_t)(o->refs - ((o->kind == K_D3D8SURFACE || o->kind == K_D3D8TEXTURE ||
+                                  o->kind == K_D3D9VB || o->kind == K_D3D9IB)
+                                     ? o->internal_refs
+                                     : 0));
 }
 
 void com_AddRef(X86 *c) {
