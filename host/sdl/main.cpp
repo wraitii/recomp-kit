@@ -1906,7 +1906,7 @@ static OsChildProcess *launch_guest_process(const char *exe, const char *args) {
     char host[4096];
     if (os_exe_path(host, sizeof host) != 0)
         return nullptr;
-    const char *argv[] = {host, "--exe", exe, "--guest-args", args, nullptr};
+    const char *argv[] = {host, "--exe", exe, "--guest-args", args, "--wait-for-profile", nullptr};
     return os_child_spawn(argv);
 }
 
@@ -1919,6 +1919,7 @@ int main(int argc, char **argv) {
     // the game.
     const char *exe_flag = nullptr;
     bool configure_requested = false;
+    bool wait_for_profile = false;
     if (const char *v = recomp_env("MAX_FRAMES"))
         g_run_max_frames = (uint32_t)strtoul(v, nullptr, 0);
     if (const char *v = recomp_env("MAX_SECONDS"))
@@ -1943,7 +1944,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, RECOMP_APP_NAME ": could not set guest arguments\n");
                 return 2;
             }
-        } else if (strcmp(argv[i], "--launcher") == 0)
+        } else if (strcmp(argv[i], "--wait-for-profile") == 0)
+            wait_for_profile = true;
+        else if (strcmp(argv[i], "--launcher") == 0)
             continue; // launcher::requested reads it
         else if (strcmp(argv[i], "--configure") == 0)
             configure_requested = true;
@@ -2038,8 +2041,25 @@ int main(int argc, char **argv) {
         profile_error ? nullptr
                       : os_file_lock((host_layout().profile_dir + "/session.lock").c_str()),
         os_file_unlock);
+    int profile_lock_error = profile_lock ? 0 : errno;
+    if (!profile_error && !profile_lock && wait_for_profile &&
+        (profile_lock_error == EWOULDBLOCK || profile_lock_error == EAGAIN)) {
+        fprintf(stderr,
+                "[host] restart: waiting for the previous instance to release the profile\n");
+        const uint64_t deadline = os_monotonic_ns() + 30000000000ull;
+        while (!profile_lock &&
+               (profile_lock_error == EWOULDBLOCK || profile_lock_error == EAGAIN) &&
+               os_monotonic_ns() < deadline) {
+            os_sleep_us(10000);
+            profile_lock.reset(os_file_lock((host_layout().profile_dir + "/session.lock").c_str()));
+            profile_lock_error = profile_lock ? 0 : errno;
+        }
+        if (!profile_lock)
+            fprintf(stderr, "[host] restart: profile handoff failed or timed out\n");
+    }
     if (!profile_lock) {
-        const bool busy = !profile_error && (errno == EWOULDBLOCK || errno == EAGAIN);
+        const bool busy =
+            !profile_error && (profile_lock_error == EWOULDBLOCK || profile_lock_error == EAGAIN);
         const std::string message =
             busy ? "This game's profile is already in use. Close the game or its Configure window, "
                    "then try again."

@@ -56,6 +56,8 @@ directories, security attributes and startup/creation flags fail explicitly.
 Returned process handles support close, waits and exit-code queries. Child
 primary-thread handles can be closed; status/waits on POSIX fail with named
 diagnostics because host process exit does not establish guest thread exit.
+Restart children wait up to 30 seconds for the previous instance's profile lock;
+ordinary launches still reject an occupied profile immediately.
 
 ## The shim contract
 
