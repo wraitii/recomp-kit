@@ -17,7 +17,7 @@ from ir.lift import Lifter
 
 
 FunctionDescription = namedtuple("FunctionDescription", "addr name count first last")
-ScanRow = namedtuple("ScanRow", "addr description calls references dangling returns exclusion seh_escapes register_facts cw_facts x87_count writers external_targets")
+ScanRow = namedtuple("ScanRow", "addr description calls references returns exclusion seh_escapes register_facts cw_facts x87_count writers external_targets")
 
 
 @dataclass
@@ -145,7 +145,7 @@ class Body(object):
 
 
 class Program(object):
-    def __init__(self, settings, image=None):
+    def __init__(self, settings, image=None, discovered=None):
         from decode import Image
 
         root = settings.code_map
@@ -161,6 +161,9 @@ class Program(object):
         self.tables, self.interior, noreturn, self.noreturn_calls = code_map.read_program(root)
         self.functions = {addr: Function(addr, rows, addr in noreturn)
                           for addr, rows in spans.items()}
+        self.provisional = frozenset(self.functions) if self.metadata.get("provenance") == "provisional-sweep" else frozenset()
+        if discovered is not None:
+            self.provisional = self.provisional | self.merge_discovered(*discovered)
         self.configured_entries = settings.configured_entries
         self.noreturn = frozenset(noreturn)
         self.lifter = Lifter()
@@ -169,6 +172,15 @@ class Program(object):
         self._entries = None
         self._spans = sorted((start, start + size, addr)
                              for addr, fn in self.functions.items() for start, size, _ in fn.spans)
+
+    def merge_discovered(self, functions, entries):
+        """Adds discovered bodies and entries the Ghidra map does not name; returns their owners."""
+        added = frozenset(addr for addr in functions if addr not in self.functions)
+        for addr in added:
+            self.functions[addr] = Function(addr, functions[addr], False)
+        for addr, owner in entries.items():
+            self.interior.setdefault(addr, owner)
+        return added
 
     def instructions(self, addr):
         """[(address, length)] of one function, in address order."""

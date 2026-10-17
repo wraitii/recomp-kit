@@ -204,11 +204,24 @@ function only ever reached through a pointer nothing resolves, a jump-table
 slot no listing owns, a block Ghidra ended early. Each shows up at run time as
 a call or jump the address table cannot place.
 
-`RECOMP_DISCOVERY=<file>` writes those addresses with the instruction that named
-them (`runtime/discovery.h`). They are evidence for the Ghidra analysis: create the
-function or entry there, re-export the code map and regenerate; translation never
-guesses entry points. Meanwhile `runtime/interp.cpp` runs what the translation
-lacks, so a gap costs speed rather than correctness.
+The translator fills part of the gap itself: a bootstrap sweep of each image
+(`bootstrap_map.py`, `discover` in `[translate]`) adds provisional bodies that the
+Ghidra map does not name, and a branch into Ghidra-owned code is recorded as an
+entry of its owner. Provisional bodies are emitted as decoded regions; a provisional
+jump into mapped code dispatches at run time, and one into unmapped code traps.
+Ghidra stays the authority: the sweep's bodies are evidence, and the fix for any of
+them is to create the function or entry in Ghidra, re-export and regenerate.
+
+`RECOMP_DISCOVERY=<file>` writes the addresses the translation still does not carry,
+with the instruction that named them (`runtime/discovery.h`). Meanwhile
+`runtime/interp.cpp` runs what the translation lacks, so a gap costs speed rather
+than correctness.
+
+`RECOMP_OBSERVE=<file>` writes one `site target kind count desc` row per indirect
+transfer, grouped by how it resolved: `known` (translated function table), `module`
+(another module's table), `shim` (Win32 import), `region` (decoded region), `interp`
+(interpreted), `thunk`, and `unknown`. It is written at exit, so quit the game
+normally to keep it.
 
 ## Current boundaries
 

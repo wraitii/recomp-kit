@@ -268,6 +268,17 @@ Entry edges, missing recipes, incompatible widths and unresolved cycles retain
 eager publication. Deferred fields are excluded from publication liveness, while
 their operands, incoming carry and result remain live.
 
+### Settle-first invariant
+
+Every reader of CPU flag state settles first. Generated bodies settle or drop a
+pending descriptor before their first flag read, and aux module bodies settle at
+entry. Shims and other runtime callers do not read flag state, so they do not
+settle before calling; `tools/check_flag_state.py` lists the files allowed to touch
+it and runs in every build. Callers settle before an indirect call only for translated
+overrides (base differs from raw), hooked module entries and unknown targets.
+Hooked entries and `recomp_jump` settle before the hook runs; the entry thunk
+settles before a hook as well.
+
 ### Call contracts
 
 `call_contracts.py` summarizes every body (decoded included) over the eight GPRs

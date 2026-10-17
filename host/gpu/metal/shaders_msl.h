@@ -21,9 +21,9 @@ vertex Varying compositor_vertex(uint id [[vertex_id]], constant Quad& q [[buffe
 }
 fragment float4 compositor_fragment(Varying v [[stage_in]],
                                     constant Quad& q [[buffer(0)]],
-                                    texture2d<float> tex [[texture(0)]]) {
-    constexpr sampler nearest(coord::normalized,address::clamp_to_edge,filter::nearest);
-    float4 c=tex.sample(nearest,v.uv);
+                                    texture2d<float> tex [[texture(0)]],
+                                    sampler sampling [[sampler(0)]]) {
+    float4 c=tex.sample(sampling,v.uv);
     if(q.opaque) c.a=1;
     return c;
 }

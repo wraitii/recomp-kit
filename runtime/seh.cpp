@@ -246,9 +246,7 @@ void recomp_context_fill(X86 *src, uint32_t context, uint32_t eip) {
 
 // Inspection only: do not repair or dereference an invalid link. Retain the
 // last valid boundary so one message bounds the first corrupting guest code.
-void recomp_seh_validate_chain(X86 *c, const char *phase, const char *detail) {
-    if (log_level() < 2 || !c)
-        return;
+void recomp_seh_validate_chain_body(X86 *c, const char *phase, const char *detail) {
     SehState &state = tls_state;
     auto &last = state.diagnostics[c];
     if (last.failed)

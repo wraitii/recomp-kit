@@ -45,6 +45,7 @@ class Invoke:
 @dataclass(frozen=True)
 class IndirectInvoke:
     helper: str
+    site: int
     target: Value
 
 
@@ -182,7 +183,7 @@ def plan(prepared, invocations):
                                                  s.resolve(source) if source is not None else None,
                                                  lazy and field in flag_fields),)
             elif event.opc == "CALLIND":
-                events[event.id] = (publications[event.id], IndirectInvoke(event.data, s.resolve(event.args[1])))
+                events[event.id] = (publications[event.id], IndirectInvoke(*event.data, s.resolve(event.args[1])))
                 if lazy:
                     events[event.id] += (SettleFlags(prepared.cc_calls.get(block.index)),)
             elif event.opc == "RETURN":

@@ -21,6 +21,7 @@ from tempfile import TemporaryDirectory
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent)]
 
+import bootstrap_map
 import code_map
 import game_config
 import decoded
@@ -52,17 +53,24 @@ def phase(name):
     _CLOCK[0] = now
 
 
+def discovered_rows(settings):
+    if settings.discovered is None and settings.discover:
+        settings.discovered = bootstrap_map.discover(settings.exe, settings.base, settings.code_map).code_map_rows()
+    return settings.discovered
+
+
 class Context(object):
     """What one process needs to read, lift and emit functions."""
 
     def __init__(self, settings, artifacts=None):
         self.settings = settings
         self.image = decoded.Image(settings.exe, settings.base)
-        self.program = Program(settings, self.image)
+        self.program = Program(settings, self.image, discovered_rows(settings))
         program = self.program
         self.decoded_only = program.metadata.get("emitter") == "decoded"
-        if program.metadata.get("provenance") == "provisional-sweep" and not settings.allow_unmodelled:
-            raise TranslateError("provisional code maps require --allow-unmodelled with an explicit reason")
+        if program.provisional and not settings.allow_unmodelled:
+            raise TranslateError("%d discovered functions are provisional and require --allow-unmodelled with an explicit reason"
+                                 % len(program.provisional))
         self.trap_instructions = {int(at, 16) for at in program.metadata.get("trap_instructions", "").split(",") if at}
         if self.decoded_only:
             settings.call_contracts = False
@@ -70,7 +78,8 @@ class Context(object):
         self.entries = program.entries()
         self.interior = program.interior_entries()
         self.tr = decoded.Translator(self.image, set(self.entries), settings.allow_unmodelled)
-        self.tr.provisional = program.metadata.get("provenance") == "provisional-sweep"
+        self.tr.provisional = program.provisional
+        self.tr.mapped_containing = program.containing
         self.tr.noreturn_callees = set(program.noreturn)
         self.tr.noreturn_sites = set(program.noreturn_calls)
         self.tr.jumptables = dict(program.tables)
@@ -109,9 +118,6 @@ class Context(object):
                                  % (addr, " ".join("%08x" % e for e in stale)))
         return fn, entries
 
-    def dispatchable(self, target):
-        return target in self.entries or decoded.GUEST_SHIM_BASE <= target < decoded.GUEST_SHIM_END
-
 
 def _init(settings, artifacts=None):
     global _CTX
@@ -126,7 +132,7 @@ def _scan(task):
     for addr in task.addresses:
         fn, entries = ctx.load(addr)
         tr.analyze(fn, entries)
-        calls, refs, dangling, returns = [], set(), set(), []
+        calls, refs, returns = [], set(), []
         for i, ins in enumerate(fn.insns):
             if ins.mnem == "CALL":
                 returns.append(fn.fallthrough[i] or (fn.insns[i + 1].addr if i + 1 < len(fn.insns) else fn.end))
@@ -136,15 +142,11 @@ def _scan(task):
                     continue
                 if ins.mnem == "CALL":
                     calls.append(target)
-                    if not ctx.dispatchable(target):
-                        dangling.add(target)
                 if target in ctx.entries and target not in ctx.known and ctx.program.containing(target) != addr:
                     refs.add(target)
         external_targets = set()
         for targets in external_exits(tr, fn).values():
             external_targets.update(targets)
-            if not ctx.tr.provisional:
-                dangling.update(t for t in targets if not ctx.dispatchable(t))
         reason = "decoded-only code map" if ctx.decoded_only else production.exclusion(fn)
         escapes = bool(tr.seh_escaping_returns(fn))
         site = (bool(fn.seh_sites) or any(fn.insns[i].mnem == "POP" for i in fn.seh_restores)
@@ -168,7 +170,7 @@ def _scan(task):
             if x87_mode.writer_effect(mnem) is not None:
                 writers.append({"site": ins.addr, "mnemonic": mnem})
         rows.append(ScanRow(addr, Row(addr, fn.name, len(fn.insns), fn.insns[0].addr, fn.insns[-1].addr),
-                     calls, refs, sorted(dangling), returns, reason, escapes, prepared, mode_prepared, x87_count,
+                     calls, refs, returns, reason, escapes, prepared, mode_prepared, x87_count,
                      writers, sorted(external_targets)))
     ctx.artifacts.flush_counts()
     return rows
@@ -302,17 +304,20 @@ def _emit(task):
                 deps |= {Declaration("entry", t) for t in tr.call_targets}
             if entries and not external:
                 wrappers = tr.translate(fn, entries)
-                head = "void fn_%08x(X86 *c) {" % addr
-                kept = [line for line in wrappers if not line.startswith(head)]
+                own = "void fn_%08x(X86 *c) { region_%08x(c, %s); }" % (addr, addr, decoded.hexlit(addr))
+                kept = [line for line in wrappers if line != own]
                 if len(kept) != len(wrappers) - 1:
                     raise TranslateError("%08x: prepared entry wrapper layout changed" % addr)
                 lines = kept + lines
                 deps |= {Declaration("entry", t) for t in tr.call_targets}
+        region = None
         if lines is None:
             lines = tr.translate(fn, entries)
             deps = {Declaration("entry", t) for t in tr.call_targets}
+            live = [ins.addr for ins in fn.insns if ins.addr not in fn.dead_addrs]
+            region = (min(live), max(live) + 1, "region_%08x" % addr)
         out.append(EmissionResult(addr, lines, re.sub(r"^[0-9a-f]{8}: ", "", reason) if reason else None,
-                    tuple(tr.unmodelled), frozenset(requests), tuple(decisions), frozenset(deps)))
+                    tuple(tr.unmodelled), frozenset(requests), tuple(decisions), frozenset(deps), region))
     return out
 
 
@@ -474,6 +479,7 @@ def main(argv=None):
     started = time.monotonic()
     log = (lambda *a: None) if args.quiet else (lambda *a: print(*a, file=sys.stderr, flush=True))
     settings = Settings(game_config.load(args.game), args.allow_unmodelled, jobs_for(args.jobs), args.module)
+    discovered_rows(settings)
     ctx = Context(settings)
     settings, program = ctx.settings, ctx.program
     phase("load")
@@ -505,14 +511,6 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
 
         entry_model = program.classify_entries(scanned)
         internal = entry_model.internal
-
-        dangling = sorted((addr, t) for addr, row in scanned.items() for t in row.dangling)
-        if dangling:
-            for addr, t in dangling:
-                log("  fn_%08x dispatches to %08x, which is not an entry point" % (addr, t))
-            raise TranslateError(
-                "%d literal dispatch targets are not entry points; add them in Ghidra "
-                "(function or referenced entry), re-export the code map and regenerate" % len(dangling))
 
         conservative = native_replaced(settings)
         mode_prepared = entry_model.cw_inputs(scanned)
@@ -638,7 +636,8 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
     if settings.module:
         output.write_module_table(args.out, entry_names, symbols, call_returns, settings.module)
     else:
-        output.write_table(args.out, entry_names, symbols, call_returns, private_masks, known_modes)
+        output.write_table(args.out, entry_names, symbols, call_returns, private_masks, known_modes,
+                           [row.region for row in results.values() if row.region])
     output.write_symbols(
         args.out, str(settings.exe), ctx.image.base, symbols, settings.curated)
     output.write_call_facts(args.out, {ctx.image.insn_end(site, "CALL"): targets

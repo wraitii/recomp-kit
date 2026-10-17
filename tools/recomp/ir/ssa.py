@@ -300,7 +300,7 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                 # keep their instruction order.
                 target = read(op.ins[0])
                 before = dict(state)
-                value = emit("CALLIND", 0, [state[MEMORY], target], data=indirect_call_symbol)
+                value = emit("CALLIND", 0, [state[MEMORY], target], data=(indirect_call_symbol, b.insn.addr))
                 b.snapshots[value.id] = before
                 b.cc_snapshots[value.id] = cc_active
                 state[MEMORY] = emit("MEMORY", 0, [value])

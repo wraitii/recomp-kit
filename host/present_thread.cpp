@@ -59,6 +59,11 @@ extern "C" __attribute__((weak)) void host_present_mode(int *w, int *h, int *bpp
 }
 
 static std::atomic<bool> g_present_suspended{false};
+static std::atomic<bool> g_present_bilinear{false};
+
+void host_present_set_bilinear(bool enabled) {
+    g_present_bilinear = enabled;
+}
 static std::mutex g_present_controls_mutex;
 static controls::ControlsView g_present_controls; // wanted = false until the host publishes
 
@@ -465,6 +470,8 @@ struct Service : std::enable_shared_from_this<Service> {
             f->supplied = true;
         }
         f->input.scale_override = mods_display_scale();
+        f->input.presentation_filter =
+            g_present_bilinear.load() ? gpu::Filter::Linear : gpu::Filter::Nearest;
         if (prefix_pending)
             f->prefix->done = false;
         if (f->dropped) {
@@ -867,6 +874,7 @@ struct Service : std::enable_shared_from_this<Service> {
                                  rect.y);
                 } else {
                     CompositorInput in{};
+                    in.presentation_filter = f->input.presentation_filter;
                     in.legacy = true;
                     in.legacy_frame = out->texture;
                     in.guest_w = out->w;

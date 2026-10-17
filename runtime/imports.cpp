@@ -465,6 +465,8 @@ void imports_call_leaves_surfaces() {
 }
 
 bool imports_dispatch(X86 *c, uint32_t target) {
+    if (g_call_observer || g_return_observer)
+        x86_cc_settle(c);
     if (!imports_is_trampoline(target))
         return false;
     // A bounded scheduling checkpoint. Cooperative threads must not depend on
@@ -475,9 +477,10 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     // runs before the shim so the guest state is a consistent call boundary -
     // except at an atomic import, and inside a sched_atomic_enter stretch.
     uint32_t idx = (target - TRAMP_BASE) / TRAMP_STRIDE;
-    if (idx >= tramps().size() || !tramps()[idx].atomic)
+    std::vector<Tramp> &table = tramps();
+    if (idx >= table.size() || !table[idx].atomic)
         recomp_execution_checkpoint_charge(c, kImportCheckpointCost);
-    if (idx >= tramps().size()) {
+    if (idx >= table.size()) {
         LOGW("imports: call to unallocated trampoline %08x (ESP=%08x, return=%08x)", target,
              c->r[R_ESP], rd32(c->r[R_ESP]));
         fflush(stderr);
@@ -486,8 +489,8 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     // The shim may allocate trampolines (GetProcAddress, a COM shim, a guest
     // callback), which reallocates this vector, so nothing may hold a
     // reference to the element across the call.
-    void (*fn)(X86 *) = tramps()[idx].fn;
-    uint8_t argc = tramps()[idx].argc;
+    void (*fn)(X86 *) = table[idx].fn;
+    uint8_t argc = table[idx].argc;
     // A guest exception can longjmp across fn(c). Keep no C++ owner live
     // across that call, and do not retain a pointer into the movable vector.
     // The copy exists because the shim can reallocate `tramps()`; only take it
@@ -499,18 +502,18 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     // contains the substring, with its stdcall arguments (hex and as float)
     // and the guest return address.
     static const char *trace_filter = recomp_env("TRACE_IMPORTS");
-    const bool need_desc = trace_filter != nullptr || log_level() >= 2 ||
-                           g_call_observer != nullptr || fn == nullptr ||
-                           fn == imports_unsupported || argc == ARGC_UNKNOWN;
+    const bool need_desc = trace_filter != nullptr || g_call_observer != nullptr ||
+                           fn == nullptr || fn == imports_unsupported ||
+                           argc == ARGC_UNKNOWN || log_level() >= 2;
     char desc[512];
     desc[0] = 0;
     if (need_desc) {
-        const std::string &d = tramps()[idx].desc;
+        const std::string &d = table[idx].desc;
         size_t n = std::min(d.size(), sizeof desc - 1);
         memcpy(desc, d.data(), n);
         desc[n] = 0;
     }
-    ++tramps()[idx].calls;
+    ++table[idx].calls;
     ++g_import_calls;
 
     uint32_t ret_addr = rd32(c->r[R_ESP]);
@@ -542,7 +545,7 @@ bool imports_dispatch(X86 *c, uint32_t target) {
         }
         return false;
     };
-    if (trace_match()) {
+    if (trace_filter != nullptr && trace_match()) {
         char line[512];
         int n = snprintf(line, sizeof line, "import: %s ret=%08x", desc, ret_addr);
         uint32_t na = (argc == ARGC_CDECL || argc == ARGC_UNKNOWN) ? 0u : (uint32_t)argc;
@@ -582,27 +585,31 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     if (skip) {
         // The observer refused the call and has set the result itself.
     } else if (fn) {
-        if (fn == imports_unsupported)
+        if (fn == imports_unsupported) {
+            x86_cc_settle(c);
             diagnose_unsupported_import(c, desc, argc);
+        }
         fn(c);
     } else if (RECOMP_STRICT_IMPORTS && argc == ARGC_UNKNOWN) {
         // A game profile can require that an import with no known stdcall
         // arity stop the run instead of returning 0 with its arguments left
         // on the stack. Both the diagnostic and the abort name dll!function.
+        x86_cc_settle(c);
         diagnose_unsupported_import(c, desc, argc);
         imports_unsupported(c);
     } else {
+        x86_cc_settle(c);
         if (log_once(desc, "unimplemented import %s: returning 0", desc))
             diagnose_unsupported_import(c, desc, argc);
         set_eax(c, 0);
     }
 #ifdef RECOMP_CHECK_CALL_FACTS
     if (c->fpu_cw != cw_before && g_guest_entries == entries_before)
-        recomp_import_cw_violation(tramps()[idx].desc.c_str(), cw_before, c->fpu_cw);
+        recomp_import_cw_violation(table[idx].desc.c_str(), cw_before, c->fpu_cw);
 #endif
     // Read after the shim ran, so the pointer is into the table as it is now.
     if (g_return_observer)
-        g_return_observer(tramps()[idx].desc.c_str(), c->r[R_EAX], ret_addr);
+        g_return_observer(table[idx].desc.c_str(), c->r[R_EAX], ret_addr);
     LOGV("<- %s (eax=%08x)", desc, c->r[R_EAX]);
 
     uint32_t pop = 4;

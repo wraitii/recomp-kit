@@ -110,6 +110,7 @@ def render_header(cfg):
     settings = cfg["settings"]
     lines.append("#define RECOMP_SETTINGS_WINDOW_MODE %d" % ("windowed", "borderless", "fullscreen").index(settings["window_mode"]))
     lines.append("#define RECOMP_SETTINGS_PERFORMANCE_OVERLAY %d" % ("off", "counters", "graph").index(settings["performance_overlay"]))
+    lines.append("#define RECOMP_SETTINGS_PRESENTATION_FILTER %d" % ("nearest", "bilinear").index(settings["presentation_filter"]))
     # The launcher's data: what to call the game, where to get it, where an
     # install may be, and what an import copies (host/launcher/).
     launcher = cfg["launcher"]

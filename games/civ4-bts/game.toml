@@ -21,6 +21,9 @@ passthrough = ["PYTHONVERBOSE"]
 code_map = "metadata"
 native = { header = "native/civ4_native.h", sources = ["native/effect_state_manager.c"] }
 
+[settings]
+presentation_filter = "nearest"
+
 [input]
 relative_mouse_capture = false
 

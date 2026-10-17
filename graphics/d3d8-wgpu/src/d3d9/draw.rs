@@ -2700,7 +2700,9 @@ fn resolve_shading(
         ShaderVariantKey {
             pixel: false,
             shader: ShaderOrigin::DeclaredFixedFunction,
-            state: KeyWords::from_slice(key),
+            state: KeyWords::from_slice(&[
+                key[0], key[1], key[2], key[3], key[4], rs(state, 9),
+            ]),
         }
     } else {
         fixed_function_key(false, state, &snapshot.textures)
