@@ -82,6 +82,14 @@ static void directory_watch_events(ConstFSEventStreamRef, void *context, size_t 
 
 extern "C" {
 
+const char *os_platform_name(void) {
+#ifdef __APPLE__
+    return "macos";
+#else
+    return "linux";
+#endif
+}
+
 OsThread *os_thread_create(void *(*fn)(void *), void *arg, size_t stack_bytes) {
     OsThread *t = (OsThread *)calloc(1, sizeof *t);
     if (!t)

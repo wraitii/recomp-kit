@@ -46,12 +46,30 @@ native = { header = "native/bw_native.h", sources = [
 [render]
 d3d8_wgpu = true
 
+[launcher]
+install_names = ["Black & White"]
+
 [settings]
 rows = ["window", "performance_overlay", "controls"]
 
 [controls]
 default_layout = "hidden"
 pad = "off"
+
+[setup.versions.stock_1_2]
+label = "Black & White 1.2"
+size = 9992893
+sha256 = "8b950ab537e77b32c22affea8d2e3dc6e8e62155d9f68a6a82d2a1114c4775ca"
+status = "preparation_required"
+preparations = ["manual_1_42"]
+
+[setup.preparations.manual_1_42]
+mode = "manual"
+applies_to = ["stock_1_2"]
+explanation = "The supported target is the 1.42 folder. The exact fan-patch order and content deltas are unverified; prepare your own files manually and select the result for reinspection. The library does not patch game files."
+required_inputs = ["Black & White 1.20 files", "Black & White 1.42 fan patch"]
+required_tools = []
+outputs = ["executable", "auxiliary:LHLogR", "auxiliary:LHMultiplayerR", "auxiliary:LHaudiodllR", "auxiliary:IFC22", "auxiliary:wearasr", "auxiliary:ScriptLibraryR", "auxiliary:LanguageR"]
 
 [modules.aux.LHLogR]
 name = "LHLogR.dll"

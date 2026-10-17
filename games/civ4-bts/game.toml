@@ -40,6 +40,11 @@ pad = "off"
 [setup]
 required_dirs = ["Assets"]
 
+[setup.layout]
+executable_dir = "Beyond the Sword"
+data_root = "Beyond the Sword"
+required_dirs = ["Assets", "Beyond the Sword/Assets"]
+
 [modules.aux.msvcr71]
 name = "msvcr71.dll"
 aliases = ["msvcrt.dll"]
@@ -87,3 +92,10 @@ com_classes = [
   { clsid = "f6d90f11-9c73-11d3-b32e-00c04f990bb4", name = "DOMDocument30" },
   { clsid = "373984c9-b845-449b-91e7-45ac83036ade", name = "XMLSchemaCache" },
 ]
+
+[[setup.checklist.items]]
+id = "msxml3"
+role = "auxiliary:msxml3"
+purpose = "Required translated auxiliary module; the configured exact SHA-256 is checked automatically."
+acquisition = "Use the matching msxml3.dll from a copy you own, or obtain it manually through Winetricks and place it beside Civ4BeyondSword.exe. The library does not run Winetricks or need Wine at launch."
+accepted_forms = ["msxml3.dll beside Civ4BeyondSword.exe matching the configured SHA-256"]

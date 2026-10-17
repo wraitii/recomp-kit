@@ -159,6 +159,10 @@ struct OsDirectoryWatch {
 
 extern "C" {
 
+const char *os_platform_name(void) {
+    return "windows";
+}
+
 OsThread *os_thread_create(void *(*fn)(void *), void *arg, size_t stack_bytes) {
     ThreadStart *start = (ThreadStart *)malloc(sizeof *start);
     OsThread *t = (OsThread *)calloc(1, sizeof *t);

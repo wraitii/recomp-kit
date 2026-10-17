@@ -59,6 +59,12 @@ pre { max-height: 230px; overflow: auto; white-space: pre-wrap; overflow-wrap: a
 .source-options strong, .source-options span { display: block; }
 .source-options span { color: var(--muted); font-size: 13px; margin-top: 8px; }
 .selected { padding: 12px 16px; border: 1px solid var(--line); border-radius: 8px; overflow-wrap: anywhere; font-size: 13px; }
+.recovery-job { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin: 10px 0; }
+.recovery-job p { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.recovery-actions { gap: 6px; }
+.recovery-actions button { padding: 6px 10px; font-size: 12px; }
+.candidate-choice { display: flex; align-items: start; gap: 8px; margin: 6px 0; color: var(--text); }
+.candidate-choice input { flex: 0 0 auto; margin-top: 5px; }
 progress { width: 100%; height: 10px; accent-color: var(--accent); }
 #message, #install-message { padding: 12px 16px; border: 1px solid #a47b57; border-radius: 8px; overflow-wrap: anywhere; }
 #setup { border-top: 1px solid var(--line); margin-top: 18px; padding-top: 12px; }
@@ -68,3 +74,8 @@ label { display: block; margin: 16px 0; color: var(--muted); font-size: 13px; }
 input { min-width: 0; flex: 1; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 9px; }
 [hidden] { display: none !important; }
 @media (max-width: 760px) { header, main { padding: 16px; } dialog { padding: 22px; } .source-options { grid-template-columns: 1fr; } }
+#assisted-items { display: grid; gap: .5rem; margin-block: 1rem; }
+#assisted-items article { border: 1px solid var(--line, #394048); border-radius: .5rem; padding: .75rem; }
+#assisted-items article p { margin: .25rem 0 0; }
+#assisted-path { overflow-wrap: anywhere; user-select: all; }
+#assisted-checklist { max-height: 18rem; overflow: auto; white-space: pre-wrap; }

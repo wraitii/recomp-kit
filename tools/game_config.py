@@ -6,6 +6,7 @@ tomllib, so the pinned tomli is the fallback."""
 import os
 from pathlib import Path
 import re
+import ntpath
 import struct
 
 try:
@@ -140,6 +141,239 @@ def validate_heap_base(value, heap_end=HEAP_END):
     if value % 0x1000 or not (0x00400000 < value < heap_end):
         raise ValueError("[game] heap_base %#x must be page aligned and between 0x00400000 and %#x" % (value, heap_end))
     return value
+
+
+def relative_game_path(value, source, where, allow_parent=False):
+    if not isinstance(value, str) or not value or "\0" in value:
+        raise ValueError("%s: %s must be a non-empty relative path" % (source, where))
+    value = value.replace("\\", "/")
+    drive, _ = ntpath.splitdrive(value)
+    if drive or value.startswith("/"):
+        raise ValueError("%s: %s must be relative to the game content root" % (source, where))
+    parts = []
+    for part in value.split("/"):
+        if not part or part == ".":
+            continue
+        if part == "..":
+            if not allow_parent or not parts:
+                raise ValueError("%s: %s escapes the game content root" % (source, where))
+            parts.pop()
+        else:
+            parts.append(part)
+    if not parts:
+        return "."
+    return "/".join(parts)
+
+
+def relative_path_list(value, source, where):
+    if not isinstance(value, list):
+        raise ValueError("%s: %s must be a list of relative paths" % (source, where))
+    paths = [relative_game_path(path, source, "%s[%d]" % (where, index))
+             for index, path in enumerate(value)]
+    if len(set(paths)) != len(paths):
+        raise ValueError("%s: %s contains duplicate paths" % (source, where))
+    return paths
+
+
+def validate_installation_hints(cfg, source):
+    game = cfg["game"]
+    launcher = cfg["launcher"]
+    candidates = launcher.setdefault("candidate_executables", [game["executable"]])
+    if (not isinstance(candidates, list) or not candidates
+            or any(not isinstance(name, str) or not name or "/" in name or "\\" in name
+                   or ":" in name or name in (".", "..") or "\0" in name for name in candidates)):
+        raise ValueError("%s: [launcher] candidate_executables must be a non-empty list of file names" % source)
+    if len({name.lower() for name in candidates}) != len(candidates):
+        raise ValueError("%s: [launcher] candidate_executables contains duplicates" % source)
+    if game["executable"].lower() not in {name.lower() for name in candidates}:
+        candidates.insert(0, game["executable"])
+
+    setup = cfg["setup"]
+    layout = setup.setdefault("layout", {})
+    if not isinstance(layout, dict):
+        raise ValueError("%s: [setup] layout must be a table" % source)
+    for key in ("executable_dir", "data_root"):
+        layout[key] = relative_game_path(layout.get(key, "."), source,
+                                         "[setup.layout] " + key)
+    for key in ("required_dirs", "required_files"):
+        layout[key] = relative_path_list(layout.get(key, []), source,
+                                         "[setup.layout] " + key)
+
+    legacy_dirs = setup.setdefault("required_dirs", [])
+    if not isinstance(legacy_dirs, list):
+        raise ValueError("%s: [setup] required_dirs must be a list" % source)
+    for index, path in enumerate(legacy_dirs):
+        if not isinstance(path, str) or not path:
+            raise ValueError("%s: [setup] required_dirs[%d] must be a non-empty path" % (source, index))
+        if path.startswith(("/", "\\")) or ntpath.splitdrive(path)[0]:
+            raise ValueError("%s: [setup] required_dirs[%d] must be relative" % (source, index))
+        relative_game_path(layout["executable_dir"] + "/" + path, source,
+                           "[setup] required_dirs[%d]" % index, allow_parent=True)
+    for index, path in enumerate(cfg["fonts"]["files"]):
+        if not isinstance(path, str) or not path:
+            raise ValueError("%s: [fonts] files[%d] must be a non-empty path" % (source, index))
+        normalized = path.replace("\\", "/")
+        if normalized.startswith("/") or ntpath.splitdrive(normalized)[0]:
+            raise ValueError("%s: [fonts] files[%d] must be relative" % (source, index))
+        relative_game_path(layout["executable_dir"] + "/" + path, source,
+                           "[fonts] files[%d]" % index, allow_parent=True)
+
+    versions = setup.setdefault("versions", {})
+    if not isinstance(versions, dict):
+        raise ValueError("%s: [setup] versions must be a table" % source)
+    statuses = {"supported", "preparation_required", "recognized_unsupported", "incomplete"}
+    for key, version in versions.items():
+        where = "[setup.versions.%s]" % key
+        if not isinstance(version, dict):
+            raise ValueError("%s: %s must be a table" % (source, where))
+        label, size, digest = (version.get(field) for field in ("label", "size", "sha256"))
+        if not isinstance(label, str) or not label:
+            raise ValueError("%s: %s label must be a non-empty string" % (source, where))
+        if type(size) is not int or size <= 0:
+            raise ValueError("%s: %s size must be a positive integer" % (source, where))
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+            raise ValueError("%s: %s sha256 must contain 64 hexadecimal digits" % (source, where))
+        if version.get("status") not in statuses:
+            raise ValueError("%s: %s status must be one of %s" % (source, where, ", ".join(sorted(statuses))))
+        preparations = version.setdefault("preparations", [])
+        if not isinstance(preparations, list) or not all(isinstance(v, str) and v for v in preparations):
+            raise ValueError("%s: %s preparations must be a list of IDs" % (source, where))
+
+    preparations = setup.setdefault("preparations", {})
+    if not isinstance(preparations, dict):
+        raise ValueError("%s: [setup] preparations must be a table" % source)
+    for key, preparation in preparations.items():
+        where = "[setup.preparations.%s]" % key
+        if not isinstance(preparation, dict) or preparation.get("mode") != "manual":
+            raise ValueError("%s: %s currently requires mode = 'manual'" % (source, where))
+        explanation = preparation.get("explanation")
+        if not isinstance(explanation, str) or not explanation:
+            raise ValueError("%s: %s explanation must be a non-empty string" % (source, where))
+        for field in ("applies_to", "required_inputs", "required_tools", "outputs"):
+            values = preparation.get(field, [])
+            if not isinstance(values, list) or not all(isinstance(v, str) and v for v in values):
+                raise ValueError("%s: %s %s must be a list of non-empty strings" % (source, where, field))
+            preparation[field] = values
+        if not preparation["outputs"]:
+            raise ValueError("%s: %s outputs must name at least one validated artifact role" % (source, where))
+        if any(v not in versions for v in preparation["applies_to"]):
+            raise ValueError("%s: %s applies_to names an unknown version" % (source, where))
+    for key, version in versions.items():
+        for preparation in version["preparations"]:
+            if preparation not in preparations or key not in preparations[preparation]["applies_to"]:
+                raise ValueError("%s: [setup.versions.%s] references an unknown or inapplicable preparation %s"
+                                 % (source, key, preparation))
+
+    required_roles = [{"role": "executable",
+                       "path": relative_game_path(layout["executable_dir"] + "/" + game["executable"],
+                                                  source, "[game] executable"),
+                       "kind": "file", "sha256": game["sha256"]}]
+    for module in cfg["aux_modules"]:
+        declared = cfg.get("modules", {}).get("aux", {}).get(module["key"], {})
+        original = declared.get("original_path", module["name"])
+        original = relative_game_path(original, source,
+                                      "[modules.aux.%s] original_path" % module["key"])
+        required_roles.append({"role": "auxiliary:" + module["key"],
+                               "path": relative_game_path(layout["executable_dir"] + "/" + original,
+                                                          source, "[modules.aux.%s]" % module["key"]),
+                               "kind": "file", "sha256": module["sha256"]})
+    for path in layout["required_files"]:
+        required_roles.append({"role": "data:" + path, "path": path, "kind": "file"})
+    for path in layout["required_dirs"]:
+        required_roles.append({"role": "data:" + path, "path": path, "kind": "directory"})
+    for path in setup["required_dirs"]:
+        normalized = relative_game_path(layout["executable_dir"] + "/" + path, source,
+                                        "[setup] required_dirs", allow_parent=True)
+        required_roles.append({"role": "data:" + normalized, "path": normalized, "kind": "directory"})
+    for path in cfg["fonts"]["files"]:
+        path = relative_game_path(layout["executable_dir"] + "/" + path, source, "[fonts] files",
+                                  allow_parent=True)
+        required_roles.append({"role": "data:" + path, "path": path, "kind": "file"})
+    deduped_roles = {}
+    for artifact in required_roles:
+        previous = deduped_roles.get(artifact["role"])
+        if previous and previous["kind"] != artifact["kind"]:
+            raise ValueError("%s: artifact role %s is both a file and a directory" % (source, artifact["role"]))
+        deduped_roles[artifact["role"]] = artifact
+    required_roles = list(deduped_roles.values())
+    setup["required_roles"] = required_roles
+    artifacts = dict(deduped_roles)
+    for key, preparation in preparations.items():
+        for role in preparation["outputs"]:
+            if role not in artifacts:
+                raise ValueError("%s: [setup.preparations.%s] outputs names an unknown artifact role %s"
+                                 % (source, key, role))
+
+    checklist = setup.setdefault("checklist", {})
+    if not isinstance(checklist, dict):
+        raise ValueError("%s: [setup] checklist must be a table" % source)
+    items = checklist.setdefault("items", [])
+    if not isinstance(items, list):
+        raise ValueError("%s: [setup.checklist] items must be a list" % source)
+    seen_ids = set()
+    aux_keys = {module["key"] for module in cfg["aux_modules"]}
+    for index, item in enumerate(items):
+        where = "[setup.checklist.items[%d]]" % index
+        if not isinstance(item, dict):
+            raise ValueError("%s: %s must be a table" % (source, where))
+        item_id, role = item.get("id"), item.get("role")
+        if not isinstance(item_id, str) or not item_id or item_id in seen_ids:
+            raise ValueError("%s: %s id must be a unique non-empty string" % (source, where))
+        seen_ids.add(item_id)
+        if role == "executable":
+            pass
+        elif isinstance(role, str) and role.startswith("auxiliary:"):
+            if role.partition(":")[2] not in aux_keys:
+                raise ValueError("%s: %s role names an unknown auxiliary module" % (source, where))
+        elif isinstance(role, str) and role.startswith("data:"):
+            relative_game_path(role.partition(":")[2], source, where + " role")
+        else:
+            raise ValueError("%s: %s role must be executable, auxiliary:<id>, or data:<path>" % (source, where))
+        if role.startswith("data:"):
+            path = relative_game_path(role.partition(":")[2], source, where + " role")
+            item["role"] = role = "data:" + path
+            artifacts.setdefault(role, {"role": role, "path": path, "kind": "file"})
+        if role not in artifacts:
+            raise ValueError("%s: %s role is not a declared artifact" % (source, where))
+        for field in ("purpose", "acquisition"):
+            if not isinstance(item.get(field), str) or not item[field]:
+                raise ValueError("%s: %s %s must be a non-empty string" % (source, where, field))
+        if not isinstance(item.get("required", True), bool):
+            raise ValueError("%s: %s required must be a boolean" % (source, where))
+        if (not isinstance(item.get("accepted_forms", []), list) or not item.get("accepted_forms", [])
+                or not all(isinstance(v, str) and v for v in item.get("accepted_forms", []))):
+            raise ValueError("%s: %s accepted_forms must be a non-empty list of non-empty strings" % (source, where))
+        if role in {artifact["role"] for artifact in required_roles} and not item.get("required", True):
+            raise ValueError("%s: %s cannot make a required artifact optional" % (source, where))
+    explicit = {}
+    for item in items:
+        if item["role"] in explicit:
+            raise ValueError("%s: [setup.checklist] repeats role %s" % (source, item["role"]))
+        explicit[item["role"]] = item
+    normalized_items = []
+    for artifact in required_roles:
+        role = artifact["role"]
+        item = explicit.pop(role, None)
+        if item is None:
+            item = {"id": role, "role": role,
+                    "purpose": "Required game content.",
+                    "acquisition": "Locate this item in your own game copy.",
+                    "accepted_forms": ["Exact fingerprint declared by this artifact role"
+                                       if artifact.get("sha256") else
+                                       ("Directory at " if artifact["kind"] == "directory" else "File at ")
+                                       + artifact["path"]]}
+        item.update({key: value for key, value in artifact.items() if key in ("path", "kind", "sha256")})
+        item["required"] = True
+        normalized_items.append(item)
+    for role, item in explicit.items():
+        artifact = artifacts[role]
+        item.update({key: value for key, value in artifact.items() if key in ("path", "kind", "sha256")})
+        item.setdefault("required", False)
+        normalized_items.append(item)
+    normalized_ids = [item["id"] for item in normalized_items]
+    if len(set(normalized_ids)) != len(normalized_ids):
+        raise ValueError("%s: [setup.checklist] contains duplicate item IDs" % source)
+    checklist["items"] = normalized_items
 
 
 def load_controls(controls, touch, source):
@@ -396,7 +630,7 @@ def load(game_dir, build_root=None):
     launcher.setdefault("title", game["name"])
     launcher.setdefault("store", "")
     for key in ("install_names", "gog_ids", "steam_ids"):
-        value = launcher.setdefault(key, [])
+        value = launcher.setdefault(key, [game["name"]] if key == "install_names" else [])
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             raise ValueError("%s: [launcher] %s must be a list of strings" % (source, key))
     for key in ("title", "store"):
@@ -425,6 +659,7 @@ def load(game_dir, build_root=None):
         raise ValueError("%s: [translate] code_map must be a non-empty path" % source)
     cfg["code_map_path"] = (game_dir / code_map).resolve() if code_map else None
     cfg["aux_modules"] = load_aux_modules(cfg, game_dir, source)
+    validate_installation_hints(cfg, source)
     # [translate] overrides: a header the generated sources include before they
     # define FN_<addr>, so a game can replace one translated function with a
     # native one (output.py's RECOMP_OVERRIDE_HEADER). Absent by default,

@@ -51,6 +51,7 @@ void *os_dlsym(void *handle, const char *name);
 int os_dlclose(void *handle);          // 0 on success
 const char *os_dlerror(void);          // text for the last failure
 const char *os_plugin_extension(void); // ".dylib", ".so" or ".dll"
+const char *os_platform_name(void);
 
 // ---------------------------------------------------------------------------
 // Paths. UTF-8 everywhere; the Win32 implementation converts.

@@ -991,16 +991,34 @@ std::vector<std::string> detect_under(const Spec &spec, const std::vector<std::s
 }
 
 namespace {
+struct DiscoveryRoot {
+    const char *platform;
+    const char *kind;
+    const char *path;
+};
+
+const DiscoveryRoot discovery_roots[] = {
+#define RECOMP_DISCOVERY_ROOT(platform, kind, path) {platform, kind, path},
+#include "discovery_paths.inc"
+#undef RECOMP_DISCOVERY_ROOT
+};
+
+std::vector<std::string> discovery_paths(const char *platform, const char *kind) {
+    std::vector<std::string> paths;
+    for (const DiscoveryRoot &root : discovery_roots)
+        if (strcmp(root.platform, platform) == 0 && strcmp(root.kind, kind) == 0)
+            paths.emplace_back(root.path);
+    return paths;
+}
+
 std::string env(const char *name) {
-    const char *v = getenv(name);
+    const char *v = os_getenv(name);
     return v ? v : "";
 }
 
 // drive_c folders where a Windows install usually lands.
 void add_drive_c(std::vector<std::string> *bases, const std::string &drive_c) {
-    for (const char *sub :
-         {"GOG Games", "Program Files (x86)/GOG Galaxy/Games", "Program Files (x86)/GOG.com",
-          "Program Files (x86)", "Program Files", "Games"})
+    for (const std::string &sub : discovery_paths("shared", "drive_install"))
         bases->push_back(join(drive_c, sub));
 }
 
@@ -1034,7 +1052,6 @@ void add_bottles(std::vector<std::string> *bases, const std::string &bottles) {
 
 std::vector<std::string> detect_installs(const Spec &spec) {
     std::vector<std::string> bases;
-#ifdef _WIN32
     char buf[4096];
     for (const std::string &id : spec.gog_ids)
         if (os_registry_read(("HKLM\\SOFTWARE\\GOG.com\\Games\\" + id).c_str(), "path", buf,
@@ -1049,39 +1066,38 @@ std::vector<std::string> detect_installs(const Spec &spec) {
             bases.push_back(normalize(buf));
     if (os_registry_read("HKCU\\Software\\Valve\\Steam", "SteamPath", buf, sizeof buf) == 0)
         add_steam_libraries(&bases, normalize(buf));
-    const std::string system_drive = env("SystemDrive").empty() ? "C:" : env("SystemDrive");
-    add_drive_c(&bases, system_drive + "/");
-#elif defined(__APPLE__)
     const std::string home = env("HOME");
-    bases.push_back(join(home, "Games"));
-    bases.push_back(join(home, "Downloads"));
-    bases.push_back("/Applications");
-    add_bottles(&bases, join(home, "Library/Application Support/CrossOver/Bottles"));
-    add_bottles(&bases, join(home, "Library/Containers/com.isaacmarovitz.Whisky/Bottles"));
-    add_steam_libraries(&bases, join(home, "Library/Application Support/Steam"));
-    for (const std::string &v : children("/Volumes"))
-        bases.push_back(join("/Volumes", v));
-#else
-    const std::string home = env("HOME");
-    bases.push_back(join(home, "Games"));
-    bases.push_back(join(home, "Games/Heroic"));
-    bases.push_back(join(home, "Downloads"));
-    add_drive_c(&bases, join(home, ".wine/drive_c"));
-    for (const std::string &g : children(join(home, "Games")))
-        add_drive_c(&bases, join(join(join(home, "Games"), g), "drive_c"));
-    for (const char *steam :
-         {".local/share/Steam", ".steam/steam", ".var/app/com.valvesoftware.Steam/data/Steam"}) {
-        const std::string root = join(home, steam);
-        add_steam_libraries(&bases, root);
-        const std::string compat = join(root, "steamapps/compatdata");
+    const std::string platform = os_platform_name();
+    for (const std::string &path : discovery_paths(platform.c_str(), "system_drive")) {
+        const std::string system_drive = env("SystemDrive").empty() ? "C:" : env("SystemDrive");
+        add_drive_c(&bases, join(system_drive + "/", path));
+    }
+    for (const std::string &path : discovery_paths(platform.c_str(), "home"))
+        bases.push_back(join(home, path));
+    for (const std::string &path : discovery_paths(platform.c_str(), "absolute"))
+        bases.push_back(path);
+    for (const std::string &path : discovery_paths(platform.c_str(), "wine"))
+        add_drive_c(&bases, join(home, path));
+    for (const std::string &path : discovery_paths(platform.c_str(), "games_wine"))
+        for (const std::string &game : children(join(home, path)))
+            add_drive_c(&bases, join(join(join(home, path), game), "drive_c"));
+    for (const std::string &path : discovery_paths(platform.c_str(), "bottles"))
+        add_bottles(&bases, join(home, path));
+    for (const std::string &path : discovery_paths(platform.c_str(), "steam"))
+        add_steam_libraries(&bases, join(home, path));
+    for (const std::string &path : discovery_paths(platform.c_str(), "compatdata")) {
+        const std::string compat = join(join(home, path), "steamapps/compatdata");
         for (const std::string &id : children(compat))
             add_drive_c(&bases, join(join(compat, id), "pfx/drive_c"));
     }
-    const std::string user = env("USER");
-    for (const char *media : {"/run/media/", "/media/"})
-        for (const std::string &v : children(media + user))
-            bases.push_back(join(media + user, v));
-#endif
+    for (const std::string &path : discovery_paths(platform.c_str(), "volume_children"))
+        for (const std::string &volume : children(path))
+            bases.push_back(join(path, volume));
+    for (const std::string &path : discovery_paths(platform.c_str(), "media_user_children")) {
+        const std::string user_path = join(path, env("USER"));
+        for (const std::string &volume : children(user_path))
+            bases.push_back(join(user_path, volume));
+    }
     return detect_under(spec, bases);
 }
 

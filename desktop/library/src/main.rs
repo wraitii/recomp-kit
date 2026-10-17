@@ -91,6 +91,7 @@ async fn pick(kind: String) -> Option<String> {
                 .pick_file()
                 .await
         }
+        "reference" => dialog.pick_file().await,
         _ => dialog.pick_file().await,
     };
     chosen.map(|file| file.path().to_string_lossy().into_owned())
@@ -98,7 +99,8 @@ async fn pick(kind: String) -> Option<String> {
 
 #[tauri::command]
 async fn query(request: Value, app: tauri::AppHandle) -> Result<Value, String> {
-    if !matches!(request["action"].as_str(), Some("catalog" | "check")) {
+    if !matches!(request["action"].as_str(), Some("catalog" | "check" | "inspect" | "job_log"
+        | "assisted_start" | "assisted_status" | "assisted_path" | "assisted_cancel" | "assisted_recheck")) {
         return Err("Unsupported query".into());
     }
     tauri::async_runtime::spawn_blocking(move || {
@@ -113,7 +115,10 @@ async fn query(request: Value, app: tauri::AppHandle) -> Result<Value, String> {
                     return Ok(event["result"].clone());
                 }
                 if event["kind"] == "error" {
-                    return Err(event["message"].as_str().unwrap_or("Query failed").into());
+                    return Err(serde_json::to_string(&json!({
+                        "message": event["message"].as_str().unwrap_or("Query failed"),
+                        "diagnostic": event.get("diagnostic")
+                    })).unwrap_or_else(|_| "Query failed".into()));
                 }
             }
         }
@@ -124,6 +129,40 @@ async fn query(request: Value, app: tauri::AppHandle) -> Result<Value, String> {
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn open_assisted_folder(game: String, job_id: String, app: tauri::AppHandle) -> Result<(), String> {
+    let result = query(json!({"action":"assisted_path", "game":game, "jobId":job_id}), app).await?;
+    let folder = result["dropFolder"].as_str().ok_or("The saved job has no safe drop folder")?;
+    let path = PathBuf::from(folder);
+    if !path.is_dir() || path.is_symlink() {
+        return Err("The saved drop folder is no longer available".into());
+    }
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let program = "xdg-open";
+    Command::new(program).arg(path).spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn cancel_assisted(game: String, job_id: String, app: tauri::AppHandle) -> Result<Value, String> {
+    let confirmed = rfd::AsyncMessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title("Remove prepared files?")
+        .set_description("This removes files copied into this job’s owned preparation folder. It does not change the selected source. This cannot be undone.")
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .show()
+        .await;
+    if confirmed != rfd::MessageDialogResult::Yes {
+        return Ok(json!({"confirmed": false}));
+    }
+    query(json!({"action":"assisted_cancel", "game":game, "jobId":job_id,
+                 "confirmed":true}), app).await
 }
 
 #[tauri::command]
@@ -274,6 +313,8 @@ fn main() {
             query,
             start_job,
             cancel_job,
+            open_assisted_folder,
+            cancel_assisted,
             open_url
         ])
         .build(tauri::generate_context!())

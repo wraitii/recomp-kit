@@ -21,10 +21,11 @@ kit as a submodule.
 
 ## Desktop library
 
-Recomp Library is a desktop app, coming soon, that turns your copy into a native
-game. Point it at an installed game folder or a GOG offline installer; it
-checks the version, builds the port and keeps it ready to play. Black & White
-is not sold digitally, so it needs an installed folder with the fan patch.
+The desktop library imports installed folders and ZIPs with exact version checks,
+and offers an assisted drop folder for manual preparation. Other installers and
+disc images are reference-only; the library never runs them. ZIP imports reject
+unsafe paths, links and special files and enforce entry and expanded-size limits.
+Black & White needs an installed folder with the fan patch.
 
 ## Building from source
 
