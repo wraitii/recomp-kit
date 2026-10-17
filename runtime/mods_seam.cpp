@@ -147,6 +147,10 @@ extern "C" __attribute__((weak)) int mods_display_filtering() {
 }
 
 extern "C" __attribute__((weak)) void host_display_present_window(const uint32_t *, int, int) {}
+extern "C" __attribute__((weak)) void
+host_display_present_window_viewport(const uint32_t *argb, int w, int h, int32_t, int32_t) {
+    host_display_present_window(argb, w, h);
+}
 extern "C" __attribute__((weak)) void host_display_present_window_rgba(uint8_t *, int, int) {}
 extern "C" __attribute__((weak)) int
 host_display_present_native_texture(void *, int, int, uint32_t *, void *, uint64_t) {

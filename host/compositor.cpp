@@ -486,5 +486,8 @@ LayoutSnapshot compositor_resize_layout(const LayoutSnapshot &layout, int w, int
     in.scene.offset_y *= double(h) / layout.drawable_h;
     auto result = compositor_layout_snapshot(&in);
     result.frame_id = layout.frame_id;
+    result.viewport = layout.viewport;
+    result.guest_origin_x = layout.guest_origin_x;
+    result.guest_origin_y = layout.guest_origin_y;
     return result;
 }

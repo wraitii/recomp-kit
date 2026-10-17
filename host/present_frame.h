@@ -53,6 +53,8 @@ struct Frame {
     bool had_draws = false, supplied = false, gpu = false, shown = false;
     bool released = false, dropped = false, success = true, repeat = false, staged_pixels = false;
     bool completion_fallback = false;
+    bool viewport = false;
+    int32_t viewport_x = 0, viewport_y = 0;
     double presented_ts = 0, gpu_ts = 0, submitted_ts = 0, sealed_ts = 0, gpu_ms = 0;
     double acknowledgement_deadline = 0;
     unsigned pending_prefixes = 0;

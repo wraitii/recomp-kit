@@ -122,6 +122,9 @@ int32_t g_pointer_sample_x = 0, g_pointer_sample_y = 0;
 int g_pointer_sample_w = 0, g_pointer_sample_h = 0;
 bool g_borderless_frame_dirty = true;
 int g_windowed_x = 0, g_windowed_y = 0, g_windowed_w = 0, g_windowed_h = 0;
+bool g_game_window_shown = false;
+bool g_viewport_active = false;
+int g_viewport_w = 0, g_viewport_h = 0;
 uint32_t g_pending_mode_w = 0, g_pending_mode_h = 0;
 uint8_t g_buttons = 0; // for the MK_ bits in a mouse message
 
@@ -150,8 +153,13 @@ void post(uint32_t msg, uint32_t wparam, uint32_t lparam) {
         return;
     }
     if (msg >= 0x200 && msg <= 0x209) {
-        host_post_client_mouse_message(host_main_window(), msg, wparam, int16_t(lparam),
-                                       int16_t(lparam >> 16));
+        int32_t origin_x = 0, origin_y = 0;
+        if (host_gate_viewport(&origin_x, &origin_y, nullptr, nullptr))
+            host_post_mouse_message(msg, wparam, int32_t(int16_t(lparam)) + origin_x,
+                                    int32_t(int16_t(lparam >> 16)) + origin_y);
+        else
+            host_post_client_mouse_message(host_main_window(), msg, wparam, int16_t(lparam),
+                                           int16_t(lparam >> 16));
         return;
     }
     uint32_t hwnd = host_main_window();
@@ -174,6 +182,21 @@ HostWindowSize window_size_for(int gw, int gh) {
     const float density =
         g_window ? SDL_GetWindowPixelDensity(g_window) : SDL_GetDisplayContentScale(display);
     return host_window_size_for(gw, gh, visible.w, visible.h, density > 0 ? density : 1.0);
+}
+
+HostWindowSize viewport_window_size_for(int gw, int gh) {
+    SDL_Rect visible = {0, 0, 0, 0};
+    SDL_DisplayID display = g_window ? SDL_GetDisplayForWindow(g_window) : SDL_GetPrimaryDisplay();
+    if (!SDL_GetDisplayUsableBounds(display, &visible))
+        visible.w = visible.h = 0;
+    double scale = 1.0;
+    if (visible.w > 0)
+        scale = std::min(scale, visible.w * 0.95 / gw);
+    if (visible.h > 0)
+        scale = std::min(scale, visible.h * 0.95 / gh);
+    const int w = std::max(1, int(std::lround(gw * scale)));
+    const int h = std::max(1, int(std::lround(gh * scale)));
+    return {w, h, w, h};
 }
 
 // The area a fullscreen window fills, read on the main thread and kept for the
@@ -1428,6 +1451,7 @@ void handle_event(const SDL_Event &event) {
             fprintf(stderr, "[host] %s: asking the game to close\n",
                     event.type == SDL_EVENT_QUIT ? "quit requested" : "window close requested");
         g_close_requested = true;
+        host_message_box_cancel_all();
         break;
     default:
         break;
@@ -1608,6 +1632,26 @@ void apply_window_mode() {
     post_drawable_size();
 }
 
+bool viewport_source(int32_t *origin_x, int32_t *origin_y, int *w, int *h, bool *active) {
+    LayoutSnapshot sealed;
+    if (!g_game_window_shown || !host_gate_layout_published()) {
+        if (!host_present_copy_sealed_layout(&sealed))
+            return false;
+        *origin_x = sealed.guest_origin_x;
+        *origin_y = sealed.guest_origin_y;
+        *w = sealed.guest_w;
+        *h = sealed.guest_h;
+        *active = sealed.viewport;
+        return true;
+    }
+    *active = host_gate_viewport(origin_x, origin_y, w, h);
+    if (!*active) {
+        *origin_x = *origin_y = 0;
+        *w = *h = 0;
+    }
+    return true;
+}
+
 // The display mode changed under us, which resizes the window.
 void apply_mode_change() {
     if (!g_mode_dirty)
@@ -1616,6 +1660,12 @@ void apply_mode_change() {
     host_pointer_set_mode((int)g_pending_mode_w, (int)g_pending_mode_h);
     g_mode_w = (int)g_pending_mode_w;
     g_mode_h = (int)g_pending_mode_h;
+    host_set_client_size(host_main_window(), g_mode_w, g_mode_h);
+    int32_t origin_x = 0, origin_y = 0;
+    int viewport_w = 0, viewport_h = 0;
+    bool viewport = false;
+    if (viewport_source(&origin_x, &origin_y, &viewport_w, &viewport_h, &viewport) && viewport)
+        return;
     const HostWindowSize size = window_size_for(g_mode_w, g_mode_h);
     // The minimum first, since a window cannot shrink below the one it had. It
     // is the guest's frame when that fits the screen, so integer scaling always
@@ -1626,7 +1676,45 @@ void apply_mode_change() {
         SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
         post_drawable_size();
     }
-    host_set_client_size(host_main_window(), g_mode_w, g_mode_h);
+}
+
+void apply_viewport_change() {
+    int32_t origin_x = 0, origin_y = 0;
+    int w = 0, h = 0;
+    bool active = false;
+    if (!viewport_source(&origin_x, &origin_y, &w, &h, &active))
+        return;
+    if (active == g_viewport_active && (!active || (w == g_viewport_w && h == g_viewport_h)))
+        return;
+    g_viewport_active = active;
+    g_viewport_w = w;
+    g_viewport_h = h;
+    if (!g_window || g_window_mode != 0 || g_fullscreen_transition)
+        return;
+    const HostWindowSize size =
+        active ? viewport_window_size_for(w, h) : window_size_for(g_mode_w, g_mode_h);
+    SDL_SetWindowMinimumSize(g_window, size.min_w, size.min_h);
+    SDL_SetWindowSize(g_window, size.w, size.h);
+    SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    post_drawable_size();
+    if (!active)
+        host_set_client_size(host_main_window(), g_mode_w, g_mode_h);
+}
+
+void show_game_window() {
+    if (!g_window || g_game_window_shown)
+        return;
+    g_game_window_shown = true;
+    SDL_ShowWindow(g_window);
+    SDL_RaiseWindow(g_window);
+}
+
+void show_sealed_game_window() {
+    if (g_game_window_shown)
+        return;
+    LayoutSnapshot sealed;
+    if (host_present_copy_sealed_layout(&sealed))
+        show_game_window();
 }
 
 // True when this thread may touch the window at all.
@@ -1642,6 +1730,19 @@ bool on_host_thread() {
     return false;
 }
 
+void service_message_box() {
+    if (!host_message_box_pending())
+        return;
+    if (g_close_requested) {
+        host_message_box_cancel_all();
+        return;
+    }
+    const bool began = sched_host_modal_begin();
+    if (began || !sched_holds_baton())
+        host_message_box_service();
+    sched_host_modal_end(began);
+}
+
 // One turn of the host's event loop, called from inside guest code.
 //
 // The tick can arrive on any guest thread: the runtime's cooperative scheduler
@@ -1651,6 +1752,7 @@ bool on_host_thread() {
 void pump() {
     if (!on_host_thread())
         return;
+    service_message_box();
     // First: anything an idle slice decoded but could not apply. This thread
     // reached here through the guest's own clock read, so it holds the baton
     // and a mod callback dispatched from here is serialised against every
@@ -1658,6 +1760,8 @@ void pump() {
     deliver_pending_input();
     apply_window_mode();
     apply_mode_change();
+    apply_viewport_change();
+    show_sealed_game_window();
     service(0.0);
     after_events();
     host_input_script_tick(host_present_count());
@@ -1675,16 +1779,59 @@ void pump() {
     }
 }
 
+int show_message_box(const HostMessageBoxRequest *request, uint32_t *button_id) {
+    if (!g_window || !on_host_thread())
+        return -1;
+    if (request->has_owner)
+        show_game_window();
+    std::vector<SDL_MessageBoxButtonData> buttons;
+    buttons.reserve(request->button_count);
+    for (uint32_t i = 0; i < request->button_count; ++i) {
+        SDL_MessageBoxButtonFlags flags = 0;
+        if (request->buttons[i].flags & HOST_MESSAGEBOX_BUTTON_DEFAULT)
+            flags |= SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT;
+        if (request->buttons[i].flags & HOST_MESSAGEBOX_BUTTON_ESCAPE)
+            flags |= SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT;
+        buttons.push_back({flags, int(request->buttons[i].id), request->buttons[i].text});
+    }
+    SDL_MessageBoxFlags flags = SDL_MESSAGEBOX_BUTTONS_LEFT_TO_RIGHT;
+    if (request->icon & (HOST_MESSAGEBOX_ERROR | HOST_MESSAGEBOX_WARNING)) {
+        if (request->icon & HOST_MESSAGEBOX_ERROR)
+            flags |= SDL_MESSAGEBOX_ERROR;
+        else
+            flags |= SDL_MESSAGEBOX_WARNING;
+    } else if (request->icon & (HOST_MESSAGEBOX_INFORMATION | HOST_MESSAGEBOX_QUESTION)) {
+        flags |= SDL_MESSAGEBOX_INFORMATION;
+    }
+    SDL_MessageBoxData data{};
+    data.flags = flags;
+    data.window = request->has_owner ? g_window : nullptr;
+    data.title = request->title;
+    data.message = request->text;
+    data.numbuttons = int(buttons.size());
+    data.buttons = buttons.data();
+    int chosen = -1;
+    if (!SDL_ShowMessageBox(&data, &chosen)) {
+        fprintf(stderr, "[host] SDL_ShowMessageBox failed: %s\n", SDL_GetError());
+        return -1;
+    }
+    *button_id = chosen < 0 ? 0xffffffffu : uint32_t(chosen);
+    return 0;
+}
+
 // The runtime's idle wait, called on the run thread when the guest is about to
 // block. Returns 1 when input arrived, so the caller can re-check its own
 // condition at once.
 int idle_wait(double seconds) {
     if (!on_host_thread())
         return 0;
+    service_message_box();
     if (seconds < 0.0)
         seconds = 0.0;
     apply_window_mode();
     apply_mode_change();
+    apply_viewport_change();
+    show_sealed_game_window();
     int changed = service(seconds);
     after_events();
     return changed;
@@ -2220,8 +2367,6 @@ int main(int argc, char **argv) {
         controls::host_init(hooks);
     }
 
-    SDL_ShowWindow(g_window);
-    SDL_RaiseWindow(g_window);
     SDL_PumpEvents();
     int bw, bh, dw, dh;
     window_sizes(&bw, &bh, &dw, &dh);
@@ -2258,6 +2403,7 @@ int main(int argc, char **argv) {
     options.close_unwind_grace = 15.0;
     options.close_watchdog_grace = 30.0;
 
+    host_set_message_box_presenter(show_message_box);
     if (!host_input_script_load())
         return 2;
     if (!boot_load(options)) {

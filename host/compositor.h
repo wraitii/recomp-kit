@@ -33,6 +33,8 @@ struct LayoutSnapshot {
     HostScreenClass cls = HOST_SCREEN_MENU;
     int scale_override = 0;
     bool legacy = false, classic = false, narrow = false;
+    bool viewport = false;
+    int32_t guest_origin_x = 0, guest_origin_y = 0;
 };
 struct CompositorInput;
 LayoutSnapshot compositor_layout_snapshot(const CompositorInput *in);

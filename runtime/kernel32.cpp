@@ -2515,6 +2515,7 @@ struct GuestThread {
     // Blocking state.  `blocked` alone is enough to keep the thread off the
     // runnable list; the rest says when it may come back.
     bool blocked = false;
+    bool host_modal = false;
     WaitKind wait_kind = W_NONE;
     uint32_t wait_h[MAXIMUM_WAIT_OBJECTS_];
     uint32_t wait_n = 0;
@@ -2913,7 +2914,7 @@ void dump_scheduler_locked(const char *what, size_t me) {
 }
 
 bool thread_runnable(const GuestThread *t) {
-    if (t->finished)
+    if (t->finished || t->host_modal)
         return false;
     if (!t->is_main && !t->spawned)
         return false;
@@ -3153,6 +3154,15 @@ size_t sched_next_runnable_locked(size_t from) {
     return NO_THREAD;
 }
 
+size_t sched_wait_driver_locked() {
+    for (size_t i = 0; i < threads().size(); ++i) {
+        const GuestThread *t = threads()[i];
+        if (!t->finished && !t->host_modal && (t->is_main || t->spawned))
+            return i;
+    }
+    return NO_THREAD;
+}
+
 // Caller holds g_sched_m.  The earliest deadline among blocked threads, or 0
 // when none of them is timed, in which case only a signal can release them.
 double sched_earliest_deadline_locked() {
@@ -3282,7 +3292,7 @@ void sched_handoff_on_exit_locked(size_t me, const char *why) {
     sched_expire_locked();
     size_t next = sched_next_runnable_locked(me);
     if (next == NO_THREAD)
-        next = 0;
+        next = sched_wait_driver_locked();
     g_baton = next;
     record_handoff_locked(me, next, why);
     g_sched_cv.notify_all();
@@ -3401,6 +3411,49 @@ void guest_event_signal_from_host(uint32_t handle) {
 // that would post the message cannot run and the wait becomes a deadlock.
 bool host_guest_yield() {
     return guest_yield();
+}
+
+bool sched_host_modal_begin() {
+    if (!t_is_guest)
+        return false;
+    GuestThread *me = cur_thread();
+    g_sched_m.lock();
+    if (me->host_modal) {
+        g_sched_m.unlock();
+        return false;
+    }
+    const bool held_baton = g_baton == me->index;
+    me->host_modal = true;
+    if (held_baton) {
+        size_t next = sched_next_runnable_locked(me->index);
+        if (next == NO_THREAD)
+            next = sched_wait_driver_locked();
+        g_baton = next;
+        record_handoff_locked(me->index, next, "host modal wait");
+    }
+    g_sched_cv.notify_all();
+    g_sched_m.unlock();
+    return true;
+}
+
+void sched_host_modal_end(bool began) {
+    if (!began)
+        return;
+    GuestThread *me = cur_thread();
+    g_sched_m.lock();
+    me->host_modal = false;
+    const bool was_blocked = me->blocked;
+    me->blocked = false;
+    g_sched_cv.notify_all();
+    while (g_baton != me->index) {
+        if (g_baton >= threads().size() || threads()[g_baton]->finished) {
+            g_baton = me->index;
+            break;
+        }
+        g_sched_cv.wait_for(g_sched_m, std::chrono::milliseconds(2));
+    }
+    me->blocked = was_blocked;
+    g_sched_m.unlock();
 }
 
 // The guest stack pointers of this thread's open sched_atomic_enter stretches,

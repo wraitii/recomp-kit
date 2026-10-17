@@ -183,6 +183,12 @@ struct D3d9HostDevice {
                     rust::Slice<const recomp::d3d::D3d9Rect> dst_rect) {
         return recomp::d3d::d3d9_present_handoff(*value, src_rect, dst_rect);
     }
+    recomp::d3d::D3d9FrameResult present_readback() const {
+        return recomp::d3d::d3d9_present_readback(*value);
+    }
+    void commit_present() {
+        recomp::d3d::d3d9_commit_present(*value);
+    }
 
     recomp::d3d::D3dxSurfaceReadResult d3dx_surface_read(D3d9HostResource &resource, uint32_t face,
                                                          uint32_t level,

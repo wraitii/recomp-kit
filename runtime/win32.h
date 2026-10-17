@@ -399,6 +399,38 @@ bool host_messages_pending();
 // Blocks the calling guest thread for `ms` and lets the other guest threads
 // run. GetMessageA uses it so waiting for a message is a real wait.
 void guest_sleep_ms(uint32_t ms);
+
+enum HostMessageBoxIcon : uint32_t {
+    HOST_MESSAGEBOX_ERROR = 1,
+    HOST_MESSAGEBOX_WARNING = 2,
+    HOST_MESSAGEBOX_INFORMATION = 4,
+    HOST_MESSAGEBOX_QUESTION = 8,
+};
+enum HostMessageBoxButtonFlag : uint32_t {
+    HOST_MESSAGEBOX_BUTTON_DEFAULT = 1,
+    HOST_MESSAGEBOX_BUTTON_ESCAPE = 2,
+};
+struct HostMessageBoxButton {
+    uint32_t id;
+    const char *text;
+    uint32_t flags;
+};
+struct HostMessageBoxRequest {
+    const char *title;
+    const char *text;
+    uint32_t icon;
+    bool has_owner;
+    uint32_t button_count;
+    const HostMessageBoxButton *buttons;
+};
+typedef int (*HostMessageBoxPresenter)(const HostMessageBoxRequest *request, uint32_t *button_id);
+void host_set_message_box_presenter(HostMessageBoxPresenter presenter);
+bool host_message_box_pending();
+void host_message_box_service();
+void host_message_box_cancel_all();
+uint32_t user32_message_box_show(X86 *c, uint32_t owner, const std::string &title,
+                                 const std::string &text, uint32_t type);
+
 // WaitForMultipleObjects for the calling guest thread: WAIT_OBJECT_0 + i,
 // WAIT_ABANDONED_0 + i, WAIT_TIMEOUT (0x102) or WAIT_FAILED. A zero timeout
 // answers from the current state, taking what it reports as Windows does.
@@ -410,6 +442,13 @@ uint32_t guest_wait_objects(const uint32_t *handles, uint32_t count, bool wait_a
 // sleep: a cooperative thread holds the baton for as long as it sits there, so
 // the thread that would satisfy the wait could never run.
 bool host_guest_yield();
+
+// Release the baton while the host shows a blocking modal dialog on this
+// thread, then take it back. `was_blocked` reports whether this thread was
+// already parked in a scheduler wait; that state is restored after the dialog.
+// True means the baton was released and the matching end call is required.
+bool sched_host_modal_begin();
+void sched_host_modal_end(bool began);
 
 // Signals a guest event object from a host thread - an AppKit event handler,
 // an audio callback, anything not running guest code. Safe to call while a

@@ -5,10 +5,13 @@
 #include "memory.h"
 #include "resources.h"
 #include "win32.h"
+#include "user32_internal.h"
+#include "gdi32_internal.h"
 #include <algorithm>
 #include <map>
 #include <array>
 #include <cstdio>
+#include <climits>
 
 namespace {
 constexpr uint32_t NONE = 0xffffffffu;
@@ -589,6 +592,184 @@ void win32_forget_scrollbars(uint32_t hwnd) {
         else
             ++i;
 }
+namespace {
+struct ProgressState {
+    int32_t min = 0, max = 100, pos = 0, step = 10;
+    uint32_t bar = 0xff0a6ad4u, background = 0xfff0f0f0u;
+    bool diagnosed = false;
+};
+std::map<uint32_t, ProgressState> &progress_states() {
+    static std::map<uint32_t, ProgressState> value;
+    return value;
+}
+void progress_paint(X86 *c) {
+    uint32_t hwnd = arg(c, 0);
+    user32::Window *w = user32::find_window(hwnd);
+    if (!w)
+        return;
+    w->update_pending = false;
+    uint32_t hdc = gdi_window_dc(hwnd);
+    auto &state = progress_states()[hwnd];
+    int width = 0, height = 0;
+    if (gdi::dc_size(hdc, &width, &height)) {
+        gdi::fill(hdc, {0, 0, width, height}, state.background);
+        gdi::fill(hdc, {0, 0, width, 1}, 0xff808080);
+        gdi::fill(hdc, {0, height - 1, width, height}, 0xff808080);
+        gdi::fill(hdc, {0, 0, 1, height}, 0xff808080);
+        gdi::fill(hdc, {width - 1, 0, width, height}, 0xff808080);
+        int64_t span = int64_t(state.max) - state.min;
+        int fill = span > 0 ? int(((int64_t(state.pos) - state.min) * (width - 2)) / span) : 0;
+        fill = std::max(0, std::min(width - 2, fill));
+        if (fill > 0) {
+            if (w->style & 1)
+                gdi::fill(hdc, {1, 1, 1 + fill, height - 1}, state.bar);
+            else
+                for (int x = 1; x < 1 + fill; x += 6)
+                    gdi::fill(hdc, {x, 1, std::min(1 + fill, x + 4), height - 1}, state.bar);
+        }
+    }
+    gdi_release_window_dc(hwnd, hdc);
+}
+void progress_proc(X86 *c) {
+    uint32_t hwnd = arg(c, 0), msg = arg(c, 1);
+    if (msg == 0x0002) {
+        progress_states().erase(hwnd);
+        user32::def_window_proc(c, true);
+        return;
+    }
+    if (msg == 0x000f) {
+        progress_paint(c);
+        set_eax(c, 0);
+        return;
+    }
+    if (msg < 0x0400) {
+        user32::def_window_proc(c, true);
+        return;
+    }
+    auto &state = progress_states()[hwnd];
+    if (user32::Window *w = user32::find_window(hwnd)) {
+        uint32_t unsupported = w->style & 0x0eu;
+        if (unsupported && !state.diagnosed) {
+            state.diagnosed = true;
+            LOGW("progress control: style bits %02x are unsupported", unsupported);
+        }
+    }
+    int64_t value = 0;
+    bool changed = false, value_changed = false;
+    switch (msg) {
+    case 0x0401: {
+        uint32_t old = uint32_t(uint16_t(state.min)) | uint32_t(uint16_t(state.max)) << 16;
+        const int32_t old_min = state.min, old_max = state.max;
+        state.min = int16_t(arg(c, 3));
+        state.max = int16_t(arg(c, 3) >> 16);
+        changed = old_min != state.min || old_max != state.max;
+        set_eax(c, old);
+        break;
+    }
+    case 0x0402: {
+        uint32_t old = uint32_t(state.pos);
+        value = int32_t(arg(c, 2));
+        state.pos = int32_t(std::max<int64_t>(INT32_MIN, std::min<int64_t>(INT32_MAX, value)));
+        state.pos = std::max(state.min, std::min(state.max, state.pos));
+        changed = value_changed = old != uint32_t(state.pos);
+        set_eax(c, old);
+        break;
+    }
+    case 0x0403: {
+        uint32_t old = uint32_t(state.pos);
+        value = int64_t(state.pos) + int32_t(arg(c, 2));
+        state.pos = int32_t(std::max<int64_t>(INT32_MIN, std::min<int64_t>(INT32_MAX, value)));
+        state.pos = std::max(state.min, std::min(state.max, state.pos));
+        changed = value_changed = old != uint32_t(state.pos);
+        set_eax(c, old);
+        break;
+    }
+    case 0x0404: {
+        uint32_t old = uint32_t(state.step);
+        state.step = int32_t(arg(c, 2));
+        set_eax(c, old);
+        break;
+    }
+    case 0x0405: {
+        uint32_t old = uint32_t(state.pos);
+        value = int64_t(state.pos) + state.step;
+        if (state.step >= 0 && value > state.max)
+            state.pos = state.min;
+        else if (state.step < 0 && value < state.min)
+            state.pos = state.max;
+        else
+            state.pos = int32_t(std::max<int64_t>(INT32_MIN, std::min<int64_t>(INT32_MAX, value)));
+        changed = value_changed = old != uint32_t(state.pos);
+        set_eax(c, old);
+        break;
+    }
+    case 0x0406: {
+        uint32_t old = uint32_t(uint16_t(state.min)) | uint32_t(uint16_t(state.max)) << 16;
+        const int32_t old_min = state.min, old_max = state.max;
+        state.min = int32_t(arg(c, 2));
+        state.max = int32_t(arg(c, 3));
+        changed = old_min != state.min || old_max != state.max;
+        set_eax(c, old);
+        break;
+    }
+    case 0x0407: {
+        uint32_t out = arg(c, 3);
+        if (out && gm_valid(out, 8)) {
+            wr32(out, uint32_t(state.min));
+            wr32(out + 4, uint32_t(state.max));
+        }
+        set_eax(c, arg(c, 2) ? uint32_t(state.min) : uint32_t(state.max));
+        return;
+    }
+    case 0x0408:
+        set_eax(c, uint32_t(state.pos));
+        return;
+    case 0x0409: {
+        uint32_t old = state.bar;
+        state.bar = gdi::argb(arg(c, 3));
+        changed = old != state.bar;
+        set_eax(c, old);
+        break;
+    }
+    case 0x2001: {
+        uint32_t old = state.background;
+        state.background = gdi::argb(arg(c, 3));
+        changed = old != state.background;
+        set_eax(c, old);
+        break;
+    }
+    default:
+        log_once(("progress-message:" + std::to_string(msg)).c_str(),
+                 "progress control: message %04x is unsupported", msg);
+        user32::def_window_proc(c, true);
+        return;
+    }
+    if (!changed)
+        return;
+    if (user32::Window *w = user32::find_window(hwnd))
+        w->update_pending = true;
+    if (value_changed)
+        user32::paint_window_now(c, hwnd);
+}
+
+} // namespace
+
+namespace user32 {
+void ensure_progress_class() {
+    if (classes().count("msctls_progress32"))
+        return;
+    WndClass wc;
+    wc.style = 0x4088;
+    wc.wndproc =
+        imports_alloc_trampoline("COMCTL32.dll", "Progress window procedure", progress_proc, 4);
+    wc.name = "msctls_progress32";
+    wc.unicode = true;
+    wc.atom = 0xc000 + uint32_t(classes().size());
+    classes()["msctls_progress32"] = wc;
+    classes()["#atom" + std::to_string(wc.atom)] = wc;
+}
+} // namespace user32
+
 namespace {
 const ImportShim shims[] = {
 #define I(name, n) {"COMCTL32.dll", "ImageList_" #name, n, il_##name}

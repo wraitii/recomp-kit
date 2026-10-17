@@ -148,16 +148,24 @@ here, so continuing would run the guest past a point Windows never reaches.
   synchronously, and only when the region is dirty; `BeginPaint` validates it.
   A posted `WM_PAINT` would arrive whenever the guest next pumped, and a guest
   that never pumps would never paint.
+- **Resource modeless dialogs use guest callbacks and GDI composition.**
+  Screen DC pixels supply the startup background beneath child controls until
+  the game renderer takes over. `DIVERGENCE(original):` dialog fonts use the
+  existing bundled substitutes when unavailable, and progress controls use
+  unthemed software painting. Modal indirect dialogs remain unsupported.
 - **A wait yields to other guest threads.** Finite waits expire only after their
   deadline, and infinite waits remain pending until satisfied or shutdown. See
   **Threads** below for ownership, suspension and deadlock diagnostics.
 - **`VirtualAlloc` works in whole pages**, base and size, and `MEM_DECOMMIT`
   discards the contents so a recommit sees zeroes.
-- **A message box is answered with its default button.** There is no display,
-  so nobody can click it, but replying `IDOK` to an `MB_YESNO` box would hand
-  the caller an answer that box never offered. `MessageBoxA`/`W` return the
-  default button of the button set the caller asked for, honouring
-  `MB_DEFBUTTON1/2/3`, which is what pressing Return would have given.
+- **A message box is presented by the host on its UI thread.** The guest
+  caller is suspended in the scheduler while the host shows the SDL box, so
+  other guest threads and host events keep running. The result is a copied
+  button ID, with `MB_DEFBUTTON*` choosing the return-key default and the
+  Cancel/OK button choosing Escape. Without a host presenter, or for an
+  unsupported flag, the call reports a named diagnostic and returns zero.
+  `DIVERGENCE(original):` SDL substitutes its information icon for the Windows
+  question icon; guest UI-thread message processing pauses during native UI.
 
 ## Threads
 

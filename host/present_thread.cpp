@@ -221,6 +221,8 @@ struct Service : std::enable_shared_from_this<Service> {
 #endif
     CompositorInput cached_input{};
     std::shared_ptr<Target> cached_target;
+    bool cached_viewport = false;
+    int32_t cached_viewport_x = 0, cached_viewport_y = 0;
     uint8_t last_pixel = 0;
     uint64_t unique = 0, repeats = 0, drops = 0, waits = 0, last_id = 0;
     uint64_t settings_pages = 0; // sealed frames that carried the settings page
@@ -253,6 +255,8 @@ struct Service : std::enable_shared_from_this<Service> {
     std::array<LayoutSnapshot, 3> layouts;
     unsigned layout_slot = 0;
     bool layout_valid = false;
+    LayoutSnapshot first_sealed_layout;
+    bool first_sealed_layout_valid = false;
     std::set<uint64_t> test_released;
     unsigned pending_commands = 0;
 
@@ -314,6 +318,9 @@ struct Service : std::enable_shared_from_this<Service> {
                 cached_ui = f->ui;
                 cached_input = f->input;
                 cached_input.ui = &cached_ui;
+                cached_viewport = f->viewport;
+                cached_viewport_x = f->viewport_x;
+                cached_viewport_y = f->viewport_y;
                 if (!f->repeat)
                     cached_target = f->input.legacy ? f->target : f->scene_lease;
                 if (fake && f->target && !f->target->test_pixels.empty())
@@ -514,6 +521,10 @@ struct Service : std::enable_shared_from_this<Service> {
             mailbox.erase(old);
             drop(discarded);
         }
+        if (!first_sealed_layout_valid) {
+            first_sealed_layout = frame_layout(*f);
+            first_sealed_layout_valid = true;
+        }
         mailbox.push_back(std::move(f));
         seal_pending = true;
         wake.notify_one();
@@ -658,9 +669,16 @@ struct Service : std::enable_shared_from_this<Service> {
         writing->target = target;
         return target->scene;
     }
+    LayoutSnapshot frame_layout(const Frame &f) const {
+        LayoutSnapshot layout = compositor_layout_snapshot(&f.input);
+        layout.frame_id = f.frame_id;
+        layout.viewport = f.viewport;
+        layout.guest_origin_x = f.viewport_x;
+        layout.guest_origin_y = f.viewport_y;
+        return layout;
+    }
     void publish_layout(Frame &f) {
-        f.layout = compositor_layout_snapshot(&f.input);
-        f.layout.frame_id = f.frame_id;
+        f.layout = frame_layout(f);
     }
 
     void tick(double ts) {
@@ -735,6 +753,9 @@ struct Service : std::enable_shared_from_this<Service> {
                 f->ui = cached_ui;
                 f->input.ui = &f->ui;
                 f->target = cached_target;
+                f->viewport = cached_viewport;
+                f->viewport_x = cached_viewport_x;
+                f->viewport_y = cached_viewport_y;
                 // Retain the original guest domain and source texture. The
                 // cached composite is already drawable-sized; declaring that
                 // size to be guest coordinates corrupts picking on repeats.
@@ -1216,6 +1237,10 @@ extern "C" void host_present_stop() {
         s->composite_pool.clear();
         s->cached_input = {};
         s->cached_ui = {};
+        s->cached_viewport = false;
+        s->cached_viewport_x = s->cached_viewport_y = 0;
+        s->first_sealed_layout = {};
+        s->first_sealed_layout_valid = false;
         s->targets = {};
         if (s->device && s->chain) {
             s->device->destroy(s->chain);
@@ -1295,6 +1320,7 @@ extern "C" void host_present_stage_rgba(const uint8_t *rgba, int w, int h) {
     s->guest_w = w;
     s->guest_h = h;
     s->writing->staged_pixels = true;
+    s->writing->viewport = false;
     auto &t = *s->writing->target;
     if (s->fake)
         t.test_pixels.assign(rgba, rgba + size_t(w) * h * 4);
@@ -1313,6 +1339,20 @@ extern "C" void host_present_stage_rgba(const uint8_t *rgba, int w, int h) {
             s->device->upload(t.pixels, {0, 0, w, h}, rgba, w * 4);
     }
 }
+extern "C" void host_present_stage_rgba_viewport(const uint8_t *rgba, int w, int h,
+                                                 int32_t origin_x, int32_t origin_y) {
+    host_present_stage_rgba(rgba, w, h);
+    auto s = active.load();
+    if (!s)
+        return;
+    std::lock_guard lock(s->mutex);
+    if (!s->stop && s->writing) {
+        s->writing->viewport = true;
+        s->writing->viewport_x = origin_x;
+        s->writing->viewport_y = origin_y;
+    }
+}
+
 // Whether a real device is presenting, so a guest-side GPU path has a queue to
 // put its work on and a frame to stage it into.
 bool host_present_gpu_ready() {
@@ -1334,6 +1374,7 @@ bool host_present_stage_texture(gpu::Texture src, int w, int h, int guest_w, int
     std::lock_guard lock(s->mutex);
     if (s->stop || !s->writing || !s->writing->target)
         return false;
+    s->writing->viewport = false;
     auto &t = *s->writing->target;
     t.device = s->device;
     if (!t.pixels || t.pixels_w != w || t.pixels_h != h || t.pixels_format != format) {
@@ -1603,6 +1644,16 @@ bool host_present_copy_layout(LayoutSnapshot *out) {
     if (!s->layout_valid)
         return false;
     *out = s->layouts[s->layout_slot];
+    return true;
+}
+bool host_present_copy_sealed_layout(LayoutSnapshot *out) {
+    auto s = active.load();
+    if (!s || !out)
+        return false;
+    std::lock_guard lock(s->mutex);
+    if (!s->first_sealed_layout_valid)
+        return false;
+    *out = s->first_sealed_layout;
     return true;
 }
 void host_present_test_begin(bool automatic, bool offscreen, unsigned display_frames) {

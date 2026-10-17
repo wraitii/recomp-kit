@@ -31,6 +31,7 @@ struct Window {
     uint32_t style = 0, exstyle = 0;
     int32_t x = 0, y = 0, w = 0, h = 0;
     std::string cls, title_utf8;
+    uint32_t title_ordinal = 0;
     bool unicode = false;
     std::map<std::string, uint32_t> props;
     uint32_t menu = 0, parent = 0, owner = 0, id = 0;
@@ -92,6 +93,8 @@ constexpr uint32_t desktop_handle = 0x00020000;
 void pump_window_timers();
 // Whether some visible window has an update region a paint would answer.
 bool paint_pending();
+bool window_paintable(uint32_t hwnd);
+void paint_window_now(X86 *c, uint32_t hwnd);
 void window_created(uint32_t hwnd);
 // Siblings in back-to-front stacking order, respecting WS_EX_TOPMOST.
 std::vector<uint32_t> window_z_order(uint32_t parent);
@@ -102,6 +105,13 @@ bool destroy_window(X86 *c, uint32_t hwnd);
 void client_origin(uint32_t hwnd, int32_t *x, int32_t *y);
 void display_rect(uint32_t out);
 void alias_ansi(X86 *c, const char *name);
+uint32_t find_dlg_item(uint32_t dialog, uint32_t id);
+uint32_t create_dialog_param(X86 *c, bool wide);
+void ensure_dialog_classes();
+void dialog_set_msg_result(uint32_t hwnd, uint32_t value);
+uint32_t dialog_get_msg_result(uint32_t hwnd);
+bool is_dialog(uint32_t hwnd);
+void ensure_progress_class();
 // Registers the system control classes (STATIC) on first use.
 void ensure_system_classes();
 } // namespace user32

@@ -20,6 +20,7 @@ struct PresentedSurface {
     uint32_t owner = 0, hwnd = 0;
     int w = 0, h = 0;
     bool fullscreen = false;
+    bool client_view = false;
     uint64_t last_present_ns = 0;
     std::vector<uint32_t> pixels;
     // A presenter whose frame is on the GPU: the pixels are fetched only when
@@ -1140,8 +1141,9 @@ std::vector<Rect> clipped_children(uint32_t hwnd, uint32_t surface) {
 uint32_t gdi_window_dc(uint32_t hwnd) {
     DeviceContext dc;
     dc.memory = false;
-    // GetDC(NULL) has state/capabilities even when there is no desktop bitmap.
-    if (hwnd) {
+    if (!hwnd) {
+        dc.surface = user32::desktop_handle;
+    } else {
         auto *w = user32::find_window(hwnd);
         if (!w)
             return 0;
@@ -1157,6 +1159,8 @@ uint32_t gdi_window_dc(uint32_t hwnd) {
     }
     uint32_t handle = g_next_dc++;
     dcs()[handle] = dc;
+    if (!hwnd)
+        surface_of(dcs()[handle]);
     return handle;
 }
 bool gdi_release_window_dc(uint32_t hwnd, uint32_t hdc) {
@@ -1189,8 +1193,32 @@ std::vector<user32::Window *> visible_surfaces() {
     collect_surfaces(0, result);
     return result;
 }
+bool dialog_viewport(int screen_w, int screen_h, int32_t *x, int32_t *y, int *w, int *h) {
+    if (presented_surface().owner || ddraw_gdi_primary_active() || mf_owns_the_screen())
+        return false;
+    const auto order = user32::window_z_order(0);
+    for (auto it = order.rbegin(); it != order.rend(); ++it) {
+        auto *window = user32::find_window(*it);
+        if (!window || !window->visible)
+            continue;
+        if (!user32::is_dialog(*it))
+            return false;
+        const int64_t left = std::max<int64_t>(0, window->x);
+        const int64_t top = std::max<int64_t>(0, window->y);
+        const int64_t right = std::min<int64_t>(screen_w, int64_t(window->x) + window->w);
+        const int64_t bottom = std::min<int64_t>(screen_h, int64_t(window->y) + window->h);
+        if (right <= left || bottom <= top)
+            return false;
+        *x = int32_t(left);
+        *y = int32_t(top);
+        *w = int(right - left);
+        *h = int(bottom - top);
+        return true;
+    }
+    return false;
+}
 } // namespace
-void gdi_composite_windows(uint32_t *argb, int w, int h) {
+static void composite_windows(uint32_t *argb, int w, int h, int32_t origin_x, int32_t origin_y) {
     // A media session owns the screen while it plays. The game leaves its own
     // window black for the video renderer to draw into, so compositing those
     // windows over the session's frame paints the picture out entirely.
@@ -1198,9 +1226,13 @@ void gdi_composite_windows(uint32_t *argb, int w, int h) {
         return;
     if (!argb || w <= 0 || h <= 0)
         return;
-    int32_t origin_x = 0, origin_y = 0;
-    if (ddraw_gdi_primary_active())
-        user32::client_origin(host_main_window(), &origin_x, &origin_y);
+    if (!presented_surface().owner && !ddraw_gdi_primary_active()) {
+        if (auto *desktop = user32::find_window(user32::desktop_handle)) {
+            auto &screen = desktop->surface;
+            if (screen.w == w && screen.h == h && screen.argb.size() == size_t(w) * h)
+                memcpy(argb, screen.argb.data(), screen.argb.size() * sizeof(uint32_t));
+        }
+    }
     for (auto *window : visible_surfaces()) {
         auto &s = window->surface;
         // A layered window: LWA_COLORKEY drops every pixel of the key colour,
@@ -1255,6 +1287,12 @@ void gdi_composite_windows(uint32_t *argb, int w, int h) {
             }
     }
 }
+void gdi_composite_windows(uint32_t *argb, int w, int h) {
+    int32_t origin_x = 0, origin_y = 0;
+    if (ddraw_gdi_primary_active())
+        user32::client_origin(host_main_window(), &origin_x, &origin_y);
+    composite_windows(argb, w, h, origin_x, origin_y);
+}
 // Flush window writes, or refresh an unchanged surface on the host's display
 // clock. A retained DC can be drawn into across pump iterations, so ReleaseDC
 // alone is insufficient. Never change primary pixels: borrow its readback as
@@ -1296,8 +1334,10 @@ bool presented_pixels(PresentedSurface &s) {
 void gdi_present_windows(bool refresh) {
     auto surfaces = visible_surfaces();
     auto &presented = presented_surface();
+    auto *desktop = user32::find_window(user32::desktop_handle);
+    const bool desktop_dirty = desktop && desktop->surface.dirty;
     if ((!presented.owner && surfaces.empty()) ||
-        (!refresh &&
+        (!refresh && !desktop_dirty &&
          std::none_of(surfaces.begin(), surfaces.end(), [](auto *w) { return w->surface.dirty; })))
         return;
     // A recent external Present owns this refresh interval. Explicit dirty
@@ -1326,7 +1366,20 @@ void gdi_present_windows(bool refresh) {
     }
     const Placement where = presented.owner ? placement(presented.hwnd, presented.fullscreen, w, h)
                                             : Placement{0, 0, w, h, true};
-    const int32_t x = where.x, y = where.y;
+    const bool client_view = presented.owner && presented.client_view && !presented.fullscreen;
+    int32_t origin_x = 0, origin_y = 0;
+    if (client_view) {
+        if (!where.visible || where.w <= 0 || where.h <= 0 ||
+            uint64_t(where.w) * where.h > GUEST_SIZE / 4) {
+            ddraw_gdi_end_primary(primary);
+            return;
+        }
+        origin_x = where.x;
+        origin_y = where.y;
+        w = where.w;
+        h = where.h;
+    }
+    const int32_t x = where.x - origin_x, y = where.y - origin_y;
     const int width = where.w, height = where.h;
     // A snapshot the screen's own size, covering all of it, is drawn over
     // everything below, so the screen is that snapshot: no base to read, no
@@ -1335,11 +1388,13 @@ void gdi_present_windows(bool refresh) {
     // the settings page is drawn over repeats too - fetching it from the GPU
     // if that is where it is, which happens only while the program has
     // stopped presenting.
-    if (presented.owner && where.visible && x == 0 && y == 0 && width == w && height == h &&
-        presented.w == w && presented.h == h) {
+    if (presented.owner && !presented.client_view && where.visible && x == 0 && y == 0 &&
+        width == w && height == h && presented.w == w && presented.h == h) {
         ddraw_gdi_end_primary(primary);
         for (auto *window : surfaces)
             window->surface.dirty = false;
+        if (desktop)
+            desktop->surface.dirty = false;
         if (refresh && !mf_owns_the_screen() && presented_pixels(presented))
             host_display_present_window(presented.pixels.data(), w, h);
         return;
@@ -1352,7 +1407,10 @@ void gdi_present_windows(bool refresh) {
                 gdi::read_pixel(primary, px, py, &pixels[size_t(py) * w + px]);
         ddraw_gdi_end_primary(primary);
     }
-    gdi_composite_windows(pixels.data(), w, h);
+    if (client_view)
+        composite_windows(pixels.data(), w, h, origin_x, origin_y);
+    else
+        gdi_composite_windows(pixels.data(), w, h);
     if (presented.owner) {
         if (visible && width > 0 && height > 0) {
             const int64_t x0 = std::max<int64_t>(0, x),
@@ -1388,14 +1446,29 @@ void gdi_present_windows(bool refresh) {
     }
     for (auto *window : surfaces)
         window->surface.dirty = false;
-    if (!mf_owns_the_screen())
+    if (desktop)
+        desktop->surface.dirty = false;
+    if (mf_owns_the_screen())
+        return;
+    int32_t viewport_x = 0, viewport_y = 0;
+    int viewport_w = 0, viewport_h = 0;
+    if (dialog_viewport(w, h, &viewport_x, &viewport_y, &viewport_w, &viewport_h)) {
+        std::vector<uint32_t> cropped(size_t(viewport_w) * viewport_h);
+        for (int row = 0; row < viewport_h; ++row)
+            memcpy(cropped.data() + size_t(row) * viewport_w,
+                   pixels.data() + size_t(viewport_y + row) * w + viewport_x,
+                   size_t(viewport_w) * sizeof(uint32_t));
+        host_display_present_window_viewport(cropped.data(), viewport_w, viewport_h, viewport_x,
+                                             viewport_y);
+    } else {
         host_display_present_window(pixels.data(), w, h);
+    }
 }
 
 // The copy is made under the guest baton before the host can seal a frame.
 // GDI refreshes use this snapshot, never the mutable mapped back buffer.
 extern "C" void gdi_present_surface(uint32_t owner, uint32_t hwnd, const uint32_t *argb, int w,
-                                    int h, bool fullscreen) {
+                                    int h, bool fullscreen, bool client_view) {
     if (!owner || !argb || w <= 0 || h <= 0 || uint64_t(w) * h > GUEST_SIZE / 4)
         return;
     auto &s = presented_surface();
@@ -1404,6 +1477,7 @@ extern "C" void gdi_present_surface(uint32_t owner, uint32_t hwnd, const uint32_
     s.w = w;
     s.h = h;
     s.fullscreen = fullscreen;
+    s.client_view = client_view;
     s.pixels.assign(argb, argb + size_t(w) * h);
     s.fetch = nullptr;
     s.last_present_ns = 0;
@@ -1411,6 +1485,7 @@ extern "C" void gdi_present_surface(uint32_t owner, uint32_t hwnd, const uint32_
     s.last_present_ns = os_monotonic_ns();
 }
 extern "C" void gdi_present_external(uint32_t owner, uint32_t hwnd, int w, int h, bool fullscreen,
+                                     bool client_view,
                                      bool (*fetch)(uint32_t, uint32_t *, int, int)) {
     if (!owner || w <= 0 || h <= 0)
         return;
@@ -1420,6 +1495,7 @@ extern "C" void gdi_present_external(uint32_t owner, uint32_t hwnd, int w, int h
     s.w = w;
     s.h = h;
     s.fullscreen = fullscreen;
+    s.client_view = client_view;
     s.pixels.clear();
     s.fetch = fetch;
     s.last_present_ns = os_monotonic_ns();

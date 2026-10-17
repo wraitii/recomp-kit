@@ -34,6 +34,27 @@ This nested installation flow still needs end-to-end verification. Prerequisites
 `tools/.venv/bin/python tools/build.py`; add `--regenerate` after changing a
 translation input.
 
+## Voice capture
+
+`native/voice_capture.c` replaces capture device selection (`0x008ebb20`), the
+voice checkbox adapter (`0x008e1fa0`) and capture activation (`0x008e2010`).
+DIVERGENCE(original): selection remembers the device while voice is off;
+enabling voice creates it, disabling voice stops/releases it, and capture
+activation is ignored while voice is off. `RECOMP_CIV4_LAZY_CAPTURE=0` selects
+the translated originals.
+
+Ghidra disassembly/decompilation of the pinned executable shows the constructor
+(`0x008ec3c0`) selecting capture regardless of the profile, buffer creation
+(`0x009f76d0`) calling `Start(1)`, and teardown (`0x009f69e0`) stopping/releasing
+the buffer and device. The Python checkbox calls `setUseVoice` (`0x004f32e0`),
+whose vtable slot `0x138` points to `0x008e1fa0`; playback state is at `+0x790`.
+Deferred creation reapplies the cached capture volume (`+0x780`) after the
+original selector copies playback volume into it. Device validation/errors
+remain on the original path when enabled. Host DirectSound capture is still
+unimplemented; this change avoids unused setup, and does not provide recording.
+The profile getter also checks the setup mode, so its displayed checkbox is not
+by itself proof of the underlying playback state.
+
 ## Code map
 
 The main executable's map is exported from Ghidra with `ExportCodeMap.java`, which
