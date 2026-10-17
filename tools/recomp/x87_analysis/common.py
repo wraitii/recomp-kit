@@ -1,14 +1,10 @@
 """Shared analysis inputs, contracts and reports."""
-from concurrent.futures import ProcessPoolExecutor
 import hashlib
 import json
 from pathlib import Path
-import pickle
 
-import driver
 import game_config
 from settings import Settings
-from program import ScanRow
 from ir import x87, x87_mode
 from ir.x87_cw import CW_PC_RC
 
@@ -22,43 +18,6 @@ def settings_for(args):
         raise ValueError("original executable SHA-256 does not match game configuration")
     return settings
 
-
-def scan_fingerprint(ctx):
-    fingerprint = hashlib.sha256()
-    kit = Path(__file__).resolve().parents[3]
-    inputs = list((kit / "tools").rglob("*.py"))
-    inputs += list(ctx.settings.game_dir.rglob("*.toml"))
-    inputs += list(ctx.settings.code_map.rglob("*"))
-    if ctx.settings.x87_mode_metadata:
-        inputs.append(ctx.settings.x87_mode_metadata)
-    if ctx.settings.indirect_targets:
-        inputs.append(ctx.settings.indirect_targets)
-    for path in sorted(set(p.resolve() for p in inputs if p.is_file())):
-        fingerprint.update(str(path).encode())
-        fingerprint.update(path.read_bytes())
-    fingerprint.update(ctx.image.data)
-    fingerprint.update(repr(sorted(ctx.program.configured_entries)).encode())
-    return fingerprint.hexdigest()
-
-
-def read_scan(path, ctx):
-    stamp, scanned, helpers = pickle.loads(path.read_bytes())
-    if stamp != scan_fingerprint(ctx):
-        raise ValueError("stale scan cache; refresh with propagation --scan-cache")
-    return {addr: ScanRow(*row) for addr, row in scanned.items()}, helpers
-
-
-def scan(ctx, jobs, cache=None):
-    if cache and cache.exists():
-        try:
-            return read_scan(cache, ctx)
-        except ValueError:
-            pass
-    scanned, helpers = driver.scan_program(ctx.settings, jobs)
-    if cache:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_bytes(pickle.dumps((scan_fingerprint(ctx), scanned, helpers)))
-    return scanned, helpers
 
 
 def apply_contracts(prepared, boundaries, image, rows):

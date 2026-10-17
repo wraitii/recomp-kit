@@ -61,7 +61,7 @@ def producer_digest(kit):
     return digest(entries)
 
 
-def identity(settings):
+def identity(settings, indirect=True):
     kit = Path(__file__).resolve().parents[3]
     policy = {key: value for key, value in settings.cfg["translate"].items()
               if key not in ("x87_facts", "code_map")}
@@ -76,7 +76,7 @@ def identity(settings):
         "native": {name: tree_digest(kit / name, ("*.c", "*.cpp", "*.h"))
                    for name in ("runtime", "dx", "mods")},
         "game_native": tree_digest(settings.game_dir, ("*.c", "*.cpp", "*.h"))}
-    if settings.indirect_targets:
+    if indirect and settings.indirect_targets:
         inputs["indirect_targets"] = hashlib.sha256(settings.indirect_targets.read_bytes()).hexdigest()
     return {"executable_sha256": settings.sha256.lower(),
             "producer": PRODUCER,

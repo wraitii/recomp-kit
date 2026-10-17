@@ -6,8 +6,9 @@ from pathlib import Path
 
 import driver
 import game_config
+import scan
 from ir import x87, x87_boundaries, x87_mode
-from .common import MASK, settings_for, scan_fingerprint, scan, read_scan, apply_contracts, preserving, coverage, context_contracts
+from .common import MASK, settings_for, apply_contracts, preserving, coverage, context_contracts
 from .core import CW_NEUTRAL_TRANSCENDENTALS, internal_pcode_flow, tail_region, cfg_relations, context_graph
 
 mode = x87_mode
@@ -44,11 +45,12 @@ def main(argv=None):
     executable_hash = hashlib.sha256(Path(settings.exe).read_bytes()).hexdigest()
     if executable_hash != settings.sha256.lower():
         raise ValueError('original executable SHA-256 does not match game configuration')
-    opaque = driver.native_replaced(settings)
     contracts = context_contracts(args.contracts, ctx)
     scanned, reverse = {}, {}
-    if args.scan_cache:
-        scanned, _ = read_scan(args.scan_cache, ctx)
+    seed = scan.read_cache(ctx, args.scan_cache) if args.scan_cache else None
+    opaque = seed.opaque() if seed else scan.native_replaced(settings)
+    if seed:
+        scanned = seed.scanned
         for owner, row in scanned.items():
             for target in set(row.calls) | set(row.external_targets):
                 target = ctx.program.containing(target)
@@ -155,7 +157,7 @@ def main(argv=None):
         records.append(record)
         print('%08x' % root, record['classification'], record.get('instructions'),
               'inline calls', record.get('inlined_calls'), 'frontier', len(record.get('frontier', [])))
-    report = {'input_fingerprint': scan_fingerprint(ctx),
+    report = {'input_fingerprint': scan.fingerprint(ctx.settings),
               'executable_sha256': settings.sha256,
               'scope': 'requested normal entry contexts; bounded direct calls; terminating/unwind paths excluded',
               'contracts': contracts,

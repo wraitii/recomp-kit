@@ -4,11 +4,13 @@ import hashlib
 import json
 from pathlib import Path
 
+import callgraph
 import driver
 import game_config
+import scan
 from ir import x87, x87_boundaries, x87_mode, x87_facts
 from ir import indirect_targets
-from .common import MASK, settings_for, scan_fingerprint, scan, read_scan, apply_contracts, preserving, coverage
+from .common import MASK, settings_for, apply_contracts, preserving, coverage
 from .core import CW_NEUTRAL_TRANSCENDENTALS, internal_pcode_flow, tail_region, cfg_relations, context_graph
 
 mode = x87_mode
@@ -36,10 +38,10 @@ def main(argv=None):
     args.out = args.out or args.build_root / "recomp/x87-audit/propagation.json"
     ctx = driver.Context(settings)
     fact_identity = x87_facts.identity(settings)
-    scanned, helpers = scan(ctx, args.jobs, args.scan_cache)
-    entry_model = ctx.program.classify_entries(scanned)
-    prepared = entry_model.cw_inputs(scanned)
-    opaque = driver.native_replaced(settings) | helpers
+    seed = scan.load(ctx, args.jobs, args.scan_cache)
+    scanned = seed.scanned
+    prepared = seed.cw_inputs()
+    opaque = seed.opaque()
     boundaries = x87_boundaries.load(settings.x87_mode_metadata, prepared, ctx.image,
                                      settings.x87_imports_preserve_pc_rc)
     base_boundaries = boundaries
@@ -89,34 +91,15 @@ def main(argv=None):
         summaries = relations
     analyses = {addr: x87_mode.analyze(body, summaries, opaque, boundaries=boundaries)
                 for addr, body in prepared.items() if body and addr not in opaque}
-    unknown_entries = {}
-
-    def unknown_entry(target, reason):
-        owner = ctx.program.containing(target)
-        if owner is not None:
-            unknown_entries.setdefault(owner, []).append(reason)
-
-    for target, site in entry_model.relocated.items():
-        unknown_entry(target, "address taken by relocation at %08x" % site)
-    for target in settings.configured_entries | {settings.cfg["game"]["entry_point"]}:
-        unknown_entry(target, "configured or process entry at %08x" % target)
-    for (owner, _site), targets in ctx.program.tables.items():
-        for target in targets:
-            if target not in entry_model.internal.get(owner, ()):
-                unknown_entry(target, "external jump-table entry at %08x" % target)
-    for addr, row in scanned.items():
-        modeled = {target for _, _, target in prepared[addr].calls} if prepared[addr] else set()
-        for target in (row.references | set(row.external_targets)) - modeled:
-            unknown_entry(target, "unmodeled external reference from %08x" % addr)
-    direct_calls = {addr: set(row.calls) | set(row.external_targets) for addr, row in scanned.items()}
+    graph = callgraph.build(seed, ctx.program, settings, indirect)
     mnemonics = {}
     for addr in scanned:
         fn, _ = ctx.load(addr)
         mnemonics.update((ins.addr, ins.mnem.upper().removeprefix("WAIT ")) for ins in fn.insns)
 
     def ordinary(contracts):
-        return x87_mode.ordinary_entries(prepared, summaries, contracts, direct_calls,
-                                        unknown_entries, opaque, boundaries)
+        return x87_mode.ordinary_entries(prepared, summaries, contracts, graph,
+                                        opaque, boundaries)
 
     baseline_entries, baseline, baseline_gaps = ordinary(settings.x87_entry_contracts)
     if args.facts_out:

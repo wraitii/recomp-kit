@@ -377,7 +377,7 @@ def propagate(prepared, summaries, roots, opaque_targets=(), boundaries=None):
     return entries, results
 
 
-def ordinary_entries(prepared, summaries, contracts, direct_calls, unknown_entries,
+def ordinary_entries(prepared, summaries, contracts, callgraph,
                      opaque_targets=(), boundaries=None):
     """Join every static caller and unknown entry before folding a shared body.
 
@@ -393,7 +393,7 @@ def ordinary_entries(prepared, summaries, contracts, direct_calls, unknown_entri
         if addr not in prepared or prepared[addr] is None or addr in opaque:
             raise ValueError("%08x: CW contract requires a prepared unreplaced body" % addr)
     callers, edges = {}, {}
-    for addr, targets in direct_calls.items():
+    for addr, targets in callgraph.join_edges.items():
         for target in targets:
             callers.setdefault(target, set()).add(addr)
             edges.setdefault(target, {})[(addr, None)] = UNKNOWN
@@ -421,7 +421,7 @@ def ordinary_entries(prepared, summaries, contracts, direct_calls, unknown_entri
                 continue
             edges[target][(addr, site)] = result.calls.get(site, UNKNOWN)
             incoming = list(edges[target].values())
-            if target in unknown_entries or not incoming:
+            if callgraph.can_enter_unmodeled(target) or not incoming:
                 incoming.append(UNKNOWN)
             fact = roots.get(target, join(incoming))
             if fact != entries[target]:
@@ -433,7 +433,7 @@ def ordinary_entries(prepared, summaries, contracts, direct_calls, unknown_entri
     for addr in prepared:
         if addr in roots:
             continue
-        for reason in unknown_entries.get(addr, ()):
+        for reason in callgraph.unmodeled(addr):
             gaps.append({"function": "%08x" % addr, "kind": "unknown_entry", "reason": reason})
         if not callers.get(addr):
             gaps.append({"function": "%08x" % addr, "kind": "unknown_entry",

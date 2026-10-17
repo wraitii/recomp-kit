@@ -27,8 +27,8 @@ import game_config
 import decoded
 import output
 import emission_cache
+import scan
 from settings import Settings
-from frontend import external_exits
 from ir import call_contracts, call_values, contract_variants, production, x87_mode, x87_facts, x87_report, prepared_store
 from ir import c_symbols
 from ir import indirect_targets as indirect_target_facts
@@ -36,12 +36,12 @@ from ir.c_symbols import Declaration
 from ir.artifacts import ArtifactStore
 from ir.body import FrozenMap
 from ir.selection import Eligibility
-from phases import (ScanTask, EscapeTask, ProgramAnalysis, Selection, PreparationTask,
+from phases import (ProgramAnalysis, Selection, PreparationTask,
                     FunctionPlan, EmissionTask, EmissionResult, CandidateTask, CandidateResult,
                     PrivatePreparationTask, PrivateEmissionResult, FinalFunctionPlan, FinalEmissionTask)
 from ir.lift import Lifter, LiftError
 from ir.ssa import SSAError
-from program import FunctionDescription as Row, Program, ScanRow, TranslateError
+from program import Program, TranslateError
 
 _CTX = None
 _CLOCK = [time.monotonic()]
@@ -121,81 +121,6 @@ class Context(object):
 def _init(settings, artifacts=None):
     global _CTX
     _CTX = Context(settings, artifacts)
-
-
-def _scan(task):
-    """Per-function facts the whole-program steps need, with the SSA contract inputs."""
-    ctx, tr = _CTX, _CTX.tr
-    tr.seh_helpers = set()
-    rows = []
-    for addr in task.addresses:
-        fn, entries = ctx.load(addr)
-        tr.analyze(fn, entries)
-        calls, refs, returns = [], set(), []
-        for i, ins in enumerate(fn.insns):
-            if ins.mnem == "CALL":
-                returns.append(fn.fallthrough[i] or (fn.insns[i + 1].addr if i + 1 < len(fn.insns) else fn.end))
-            if ins.mnem == "CALL" or ins.mnem == "JMP" or ins.mnem in decoded.JCC:
-                target = tr.branch_target(ins)
-                if target is None:
-                    continue
-                if ins.mnem == "CALL":
-                    calls.append(target)
-                if target in ctx.entries and target not in ctx.known and ctx.program.containing(target) != addr:
-                    refs.add(target)
-        external_targets = set()
-        for targets in external_exits(tr, fn).values():
-            external_targets.update(targets)
-        reason = "decoded-only code map" if ctx.decoded_only else production.exclusion(fn)
-        escapes = bool(tr.seh_escaping_returns(fn))
-        site = (bool(fn.seh_sites) or any(fn.insns[i].mnem == "POP" for i in fn.seh_restores)
-                or tr.image.msvc_seh_epilog(addr) or any(map(tr.seh_except_entry, fn.insns)))
-        prepared, mode_prepared = None, None
-        if not (escapes or fn.pushed_continuations or fn.return_jumps or addr in tr.noreturn_callees):
-            try:
-                fir = ctx.artifacts.lifted(tr, ctx.lifter, fn)
-                prepared = (call_contracts.prepare(fir, image=ctx.image)
-                            if not (entries or site or fn.dead_addrs) else None)
-                fir.entries = tuple(entries)
-                mode_prepared = x87_mode.prepare(fir, ctx.image)
-            except (LiftError, RecursionError):
-                prepared = None
-            else:
-                prepared = None if site or fn.dead_addrs else prepared or False
-        x87_count, writers = 0, []
-        for ins in fn.insns:
-            mnem = ins.mnem.upper().removeprefix("WAIT ")
-            x87_count += mnem.startswith("F") and mnem != "FEMMS"
-            if x87_mode.writer_effect(mnem) is not None:
-                writers.append({"site": ins.addr, "mnemonic": mnem})
-        rows.append(ScanRow(addr, Row(addr, fn.name, len(fn.insns), fn.insns[0].addr, fn.insns[-1].addr),
-                     calls, refs, returns, reason, escapes, prepared, mode_prepared, x87_count,
-                     writers, sorted(external_targets)))
-    ctx.artifacts.flush_counts()
-    return rows
-
-
-def _escapes(task):
-    addrs, helpers = task.addresses, task.helpers
-    ctx, tr = _CTX, _CTX.tr
-    tr.seh_helpers = set(helpers)
-    found = []
-    for addr in addrs:
-        fn, entries = ctx.load(addr)
-        if tr.seh_escaping_returns(fn):
-            found.append(addr)
-    return found
-
-
-def scan_program(settings, jobs):
-    ctx = Context(settings)
-    with ProcessPoolExecutor(max_workers=jobs, initializer=_init, initargs=(settings,)) as pool:
-        scanned = {row.addr: row for batch in pool.map(_scan,
-                   [ScanTask(tuple(part)) for part in chunked(sorted(ctx.program.functions), jobs * 24)]) for row in batch}
-        helpers = seh_helpers(pool, chunked(sorted(scanned), jobs * 24),
-                              {addr: row.seh_escapes for addr, row in scanned.items()},
-                              {addr: row.calls for addr, row in scanned.items()})
-    return scanned, helpers
 
 
 def _prepare(task):
@@ -400,38 +325,6 @@ def _cw_effect(x87):
     return x87["preserved"], x87["known"], x87["value"]
 
 
-def native_replaced(settings):
-    """Addresses a native replacement header names; their call sites keep full publication."""
-    header = settings.native_header
-    named, seen = set(), set()
-    stack = [(settings.game_dir / header).resolve()] if header else []
-    while stack:
-        path = stack.pop()
-        if path in seen or not path.is_file():
-            continue
-        seen.add(path)
-        text = path.read_text(errors="replace")
-        named.update(int(m, 16) for m in re.findall(r"FN_([0-9a-fA-F]{8})", text))
-        stack.extend((path.parent / inc).resolve() for inc in re.findall(r'#\s*include\s+"([^"]+)"', text))
-    return named
-
-
-def seh_helpers(pool, parts, escapes, calls):
-    """Fixpoint of functions that return with an established SEH frame."""
-    helpers = {addr for addr, esc in escapes.items() if esc}
-    while True:
-        pending = sorted(addr for addr, targets in calls.items()
-                         if addr not in helpers and helpers.intersection(targets))
-        if not pending:
-            return helpers
-        found = set()
-        for part in pool.map(_escapes, [EscapeTask(tuple(p), frozenset(helpers)) for p in chunked(pending, len(parts))]):
-            found.update(part)
-        if not found:
-            return helpers
-        helpers |= found
-
-
 def symbol_rows(ctx, entry_names, rows):
     program = ctx.program
     kinds = program.entries()
@@ -511,25 +404,16 @@ def main(argv=None):
 
 def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs):
     program = ctx.program
+    seed = scan.build(ctx, settings.jobs, artifacts)
+    scanned, helpers = seed.scanned, seed.helpers
+    phase("scan")
+    rows = {addr: row.description for addr, row in scanned.items()}
+    calls = {addr: row.calls for addr, row in scanned.items()}
     with ProcessPoolExecutor(max_workers=settings.jobs, initializer=_init, initargs=(settings, artifacts)) as pool:
-        scanned = {}
-        for part in pool.map(_scan, [ScanTask(tuple(part)) for part in parts]):
-            for row in part:
-                scanned[row.addr] = row
-        phase("scan")
-
-        rows = {addr: row.description for addr, row in scanned.items()}
-        calls = {addr: row.calls for addr, row in scanned.items()}
-        escapes = {addr: row.seh_escapes for addr, row in scanned.items()}
-        helpers = seh_helpers(pool, parts, escapes, calls)
-        phase("seh helpers")
-
-        entry_model = program.classify_entries(scanned)
-        internal = entry_model.internal
-
-        conservative = native_replaced(settings)
-        mode_prepared = entry_model.cw_inputs(scanned)
-        mode_opaque = conservative | helpers | {addr for addr, row in scanned.items() if row.exclusion is not None}
+        internal = seed.internal
+        conservative = seed.native_replaced
+        mode_prepared = seed.cw_inputs()
+        mode_opaque = seed.opaque(exclusions=True)
         x87_facts_loaded = x87_facts.load(settings.x87_facts, ctx, mode_prepared, mode_opaque)
         indirect_targets = indirect_target_facts.load(settings, ctx.program)
         mode_sites = x87_facts_loaded.mode_sites()

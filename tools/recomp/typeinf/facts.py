@@ -27,19 +27,20 @@ _WORKER = {}
 
 def contracts(settings, jobs):
     import driver
+    import scan
     from ir import call_contracts
     from ir import indirect_targets
     driver.discovered_rows(settings)
-    scanned, helpers = driver.scan_program(settings, jobs)
-    conservative = driver.native_replaced(settings)
-    program = driver.Context(settings).program
+    ctx = driver.Context(settings)
+    found_scan = scan.build(ctx, jobs)
+    scanned, helpers = found_scan.scanned, found_scan.helpers
     found = call_contracts.analyze(
         {addr: row.calls for addr, row in scanned.items()},
         {addr: row.register_facts or None for addr, row in scanned.items()},
         analyzable=lambda a: bool(scanned.get(a) and scanned[a].register_facts is not None
-                                  and a not in helpers and a not in conservative),
+                                  and a not in helpers and a not in found_scan.native_replaced),
         roots=[addr for addr, row in scanned.items() if row.exclusion is None],
-        indirect=indirect_targets.load(settings, program), effects=settings.call_effects)
+        indirect=indirect_targets.load(settings, ctx.program), effects=settings.call_effects)
     return {addr: frozenset(contract.preserves) for addr, contract in found.items() if contract is not None}
 
 

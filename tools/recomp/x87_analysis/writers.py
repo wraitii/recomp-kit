@@ -6,8 +6,9 @@ from pathlib import Path
 
 import driver
 import game_config
+import scan
 from ir import x87, x87_boundaries, x87_mode
-from .common import MASK, settings_for, scan_fingerprint, scan, read_scan, apply_contracts, preserving, coverage
+from .common import MASK, settings_for, apply_contracts, preserving, coverage
 from .core import CW_NEUTRAL_TRANSCENDENTALS, internal_pcode_flow, tail_region, cfg_relations, context_graph
 
 mode = x87_mode
@@ -64,13 +65,14 @@ def main(argv=None):
     settings = settings_for(args)
     args.out = args.out or args.build_root / "recomp/x87-audit/writers.json"
     ctx = driver.Context(settings)
-    scanned, helpers = read_scan(args.scan_cache, ctx)
+    seed = scan.read_cache(ctx, args.scan_cache)
+    scanned = seed.scanned
     prepared = {a: r.cw_facts for a, r in scanned.items()}
     roots = set(args.root)
     if roots - scanned.keys():
         raise ValueError('analysis roots must be mapped function entries')
     enriched, provenance = dict(prepared), {}
-    opaque = driver.native_replaced(settings) | helpers
+    opaque = seed.opaque()
     lifted, tail_records = {}, {}
     for addr, row in sorted(scanned.items()):
         if not row.writers and prepared[addr] is not None and addr not in roots:
