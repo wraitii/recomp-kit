@@ -193,19 +193,36 @@ const TrueTypeFace *truetype_windows_substitute(const std::string &family, int32
     return face;
 }
 
+namespace {
+void windows_vertical_metrics(const TrueTypeFace *face, int &ascent, int &descent, int &gap) {
+    stbtt_GetFontVMetrics(&face->info, &ascent, &descent, &gap);
+    const int line_height = ascent - descent + gap;
+    const uint32_t offset = stbtt__find_table(face->info.data, face->info.fontstart, "OS/2");
+    if (offset && offset <= face->size && face->size - offset >= 78) {
+        const uint8_t *os2 = face->bytes + offset;
+        ascent = int(os2[74]) * 256 + os2[75];
+        descent = -(int(os2[76]) * 256 + os2[77]);
+    }
+    gap = std::max(0, line_height - (ascent - descent));
+}
+} // namespace
+
 double truetype_scale(const TrueTypeFace *face, int32_t lf_height) {
     if (lf_height < 0)
         return stbtt_ScaleForMappingEmToPixels(&face->info, -float(lf_height));
-    return stbtt_ScaleForPixelHeight(&face->info, lf_height ? float(lf_height) : 16.0f);
+    int ascent = 0, descent = 0, gap = 0;
+    windows_vertical_metrics(face, ascent, descent, gap);
+    return double(lf_height ? lf_height : 16) / (ascent - descent);
 }
 
 TrueTypeMetrics truetype_metrics(const TrueTypeFace *face, double scale) {
     int ascent = 0, descent = 0, gap = 0;
-    stbtt_GetFontVMetrics(&face->info, &ascent, &descent, &gap);
+    windows_vertical_metrics(face, ascent, descent, gap);
     TrueTypeMetrics m;
     m.ascent = int32_t(std::lround(ascent * scale));
     m.descent = int32_t(std::lround(-descent * scale));
     m.height = m.ascent + m.descent;
+    m.external = int32_t(std::lround(gap * scale));
     const uint16_t units_per_em = uint16_t((face->info.data[face->info.head + 18] << 8) |
                                            face->info.data[face->info.head + 19]);
     m.internal = std::max(0, m.height - int32_t(std::lround(units_per_em * scale)));
