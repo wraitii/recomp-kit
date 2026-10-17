@@ -1,4 +1,5 @@
 #include "../platform/os.h"
+#include "../runtime/installation_manifest.h"
 #include "controls/json.h"
 
 #include <cstdio>
@@ -10,29 +11,6 @@ namespace {
 std::string parent(const std::string &path) {
     const size_t slash = path.find_last_of('/');
     return slash == std::string::npos ? std::string() : path.substr(0, slash);
-}
-
-bool safe_relative(const std::string &path) {
-    if (path.empty() || path[0] == '/' || path.find('\\') != std::string::npos ||
-        path.find(':') != std::string::npos || path.find('\0') != std::string::npos ||
-        path.back() == '/')
-        return false;
-    size_t start = 0;
-    while (start < path.size()) {
-        const size_t end = path.find('/', start);
-        const std::string part = path.substr(start, end == std::string::npos ? end : end - start);
-        if (part.empty() || part == "." || part == "..")
-            return false;
-        if (end == std::string::npos)
-            break;
-        start = end + 1;
-    }
-    return true;
-}
-
-bool contained(const std::string &root, const std::string &path) {
-    return path.size() > root.size() && path.compare(0, root.size(), root) == 0 &&
-           (path[root.size()] == '/' || path[root.size()] == '\\');
 }
 
 } // namespace
@@ -54,8 +32,10 @@ int main() {
         os_realpath(game_folder.c_str(), canonical_root, sizeof canonical_root) != 0 ||
         os_realpath(manifest_path.c_str(), canonical_manifest, sizeof canonical_manifest) != 0 ||
         os_realpath(executable, canonical_self, sizeof canonical_self) != 0 ||
-        !contained(canonical_root, canonical_manifest) ||
-        !contained(canonical_root, canonical_self)) {
+        canonical_root == std::string(canonical_manifest) ||
+        !installation_manifest_detail::path_within(canonical_root, canonical_manifest) ||
+        canonical_root == std::string(canonical_self) ||
+        !installation_manifest_detail::path_within(canonical_root, canonical_self)) {
         fprintf(stderr, "Configure launcher cannot inspect %s\n", manifest_path.c_str());
         return 2;
     }
@@ -89,7 +69,8 @@ int main() {
     const controls::Json *launch_paths = manifest.get("launchPaths");
     const std::string role = launch_paths ? launch_paths->str("game", "") : "";
     const std::string configure_role = launch_paths ? launch_paths->str("configure", "") : "";
-    if (!safe_relative(role) || !safe_relative(configure_role)) {
+    if (!installation_manifest_detail::safe_relative(role) ||
+        !installation_manifest_detail::safe_relative(configure_role)) {
         fprintf(stderr, "Configure launcher manifest has invalid launch roles\n");
         return 2;
     }
@@ -98,8 +79,10 @@ int main() {
     const std::string configure_path = game_folder + "/" + configure_role;
     if (os_realpath(main_path.c_str(), canonical_main, sizeof canonical_main) != 0 ||
         os_realpath(configure_path.c_str(), canonical_configure, sizeof canonical_configure) != 0 ||
-        !contained(canonical_root, canonical_main) ||
-        !contained(canonical_root, canonical_configure) ||
+        canonical_root == std::string(canonical_main) ||
+        !installation_manifest_detail::path_within(canonical_root, canonical_main) ||
+        canonical_root == std::string(canonical_configure) ||
+        !installation_manifest_detail::path_within(canonical_root, canonical_configure) ||
         std::string(canonical_configure) != canonical_self) {
         fprintf(stderr, "Configure launcher role does not match its manifest\n");
         return 2;

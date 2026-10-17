@@ -18,10 +18,12 @@ import subprocess
 import sys
 import tempfile
 import threading
+import unicodedata
 import uuid
 import zipfile
 
 import game_config
+import source_inspection
 from setup import validate_game
 from web_launcher import game_entry
 from source_inspection import (MAX_DISCOVERY_CANDIDATES, MAX_DISCOVERY_ENTRIES,
@@ -136,15 +138,15 @@ def run(command, log_path=None, build_monitor=None, env=None):
                     ["Review the build log and free destination space before retrying."],
                     {"path": str(build_monitor["root"]), "baselineBytes": build_monitor["baselineBytes"],
                      "currentBytes": current, "growthBytes": growth,
-                     "limitBytes": install_jobs.MAX_BUILD_BYTES, "sampleIntervalSeconds": 0.5})
+                     "limitBytes": install_jobs.MAX_BUILD_BYTES, "sampleIntervalSeconds": 2})
             free = shutil.disk_usage(build_monitor["volume"]).free
             if free < install_jobs.SAFETY_RESERVE_BYTES:
                 raise install_jobs.JobError("disk_safety_reserve", "The destination volume reached the configured free-space reserve during the build.",
                     ["Free destination space and retry the installation."],
                     {"path": str(build_monitor["volume"]), "freeBytes": free,
                      "safetyReserveBytes": install_jobs.SAFETY_RESERVE_BYTES,
-                     "sampleIntervalSeconds": 0.5})
-            next_monitor = max(time.monotonic(), started + 0.5)
+                     "sampleIntervalSeconds": 2})
+            next_monitor = max(time.monotonic(), started + 2)
 
         with (log if log else nullcontext()) as active_log:
             while True:
@@ -725,6 +727,14 @@ def catalog(storage, repair=False):
                             job_destination = locator.get("destination", root) if isinstance(locator, dict) else root
                             with install_jobs.DestinationLock(job_destination):
                                 journal = recover_publication(job_destination, identifier)
+                                if (journal.get("mode") == "assisted"
+                                        and journal.get("stage") in ("copying", "validating", "building")
+                                        and not journal.get("publication")):
+                                    job_paths, journal = install_jobs.load_job(job_destination, identifier)
+                                    assisted = {**journal.get("assisted", {}), "settle": None,
+                                                "recipeChanged": False, "recipeSessionId": None, "states": []}
+                                    install_jobs.update_job(job_paths, journal, "waiting_for_input",
+                                                            assisted=assisted)
                             if journal.get("stage") != "complete":
                                 remaining.append(locator)
                                 if journal.get("mode") == "assisted" and journal.get("stage") in ("waiting_for_input", "cancelling_assisted"):
@@ -776,8 +786,6 @@ def catalog(storage, repair=False):
             item.update(game_entry(cfg), id=directory.name, installation=str(destination),
                         needsRust=True)
             item["state"] = "notInstalled"
-            if recoverable_jobs:
-                item["recoverableJobs"] = recoverable_jobs
             facts_path = root / ".recomp" / "installation.json"
             facts = {}
             if not destination_busy and root.exists():
@@ -813,13 +821,15 @@ def catalog(storage, repair=False):
                     except (OSError, ValueError) as error:
                         item["registrationError"] = str(error)
             if activity_path.is_file() and not destination_busy:
-                recoverable = []
                 for locator in activity.get("activeJobs", []):
                     identifier = locator.get("jobId") if isinstance(locator, dict) else locator
                     job_destination = locator.get("destination", activity.get("destination", root)) if isinstance(locator, dict) else activity.get("destination", root)
                     try:
                         _, journal = install_jobs.load_job(job_destination, identifier)
                         if journal.get("stage") != "complete":
+                            if (journal.get("mode") == "assisted"
+                                    and journal.get("stage") in ("waiting_for_input", "cancelling_assisted")):
+                                continue
                             attempt = journal.get("attempt")
                             can_resume = (journal.get("stage") not in ("publishing", "cleaning", "complete")
                                           and isinstance(attempt, int) and attempt > 0)
@@ -827,22 +837,23 @@ def catalog(storage, repair=False):
                                        "recheck_preparation", "open_log"]
                             if can_resume:
                                 actions.insert(0, "retry_failed_stage")
-                            recoverable.append({"jobId": identifier, "stage": journal.get("stage"),
-                                                "destination": str(Path(job_destination).resolve()),
-                                                "source": journal.get("source"),
-                                                "candidateId": journal.get("candidateId"),
-                                                "log": journal.get("log"),
-                                                "error": journal.get("errors", [])[-1] if journal.get("errors") else None,
-                                                "canResume": can_resume, "actions": actions})
+                            recoverable_jobs.append({"jobId": identifier, "stage": journal.get("stage"),
+                                                     "destination": str(Path(job_destination).resolve()),
+                                                     "source": journal.get("source"),
+                                                     "candidateId": journal.get("candidateId"),
+                                                     "log": journal.get("log"),
+                                                     "error": journal.get("errors", [])[-1] if journal.get("errors") else None,
+                                                     "canResume": can_resume, "actions": actions})
                     except (OSError, ValueError, KeyError) as error:
                         item.setdefault("recoveryErrors", []).append(str(error))
-                if recoverable:
-                    item["recoverableJobs"] = recoverable
-                    if item["state"] != "ready":
-                        item["state"] = "needsBuild"
+            if recoverable_jobs:
+                item["recoverableJobs"] = recoverable_jobs
+                if item["state"] != "ready":
+                    item["state"] = "needsBuild"
             if destination_busy:
                 item["state"] = "busy"
-            if item["state"] == "notInstalled" and (cfg["code_map_path"] is None or not cfg["code_map_path"].exists()):
+            if (item["state"] == "notInstalled" and not recoverable_jobs
+                    and (cfg["code_map_path"] is None or not cfg["code_map_path"].exists())):
                 item["state"] = "unavailable"
                 item["detail"] = "Translation metadata is not available in this checkout."
         except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
@@ -1258,6 +1269,11 @@ def prepare_install(request, storage):
         if saved.get("gameId") != game_id:
             raise SourceError("destination_game_mismatch", "This destination belongs to a different game.",
                               ["Choose the original destination or an empty folder."], str(root))
+        if source_kind not in ("folder", "executable") or Path(selected["contentRoot"]).resolve() != data.resolve():
+            raise SourceError("managed_install_rebuild_source_required",
+                              "An existing installation can only be rebuilt from its managed original copy.",
+                              ["Choose the installed original folder or choose an empty destination."],
+                              str(selected["contentRoot"]), {"managedSource": str(data), "destination": str(root)})
     return {"gameId": game_id, "directory": directory, "sourcePath": source_path,
             "root": root, "cfg": cfg,
             "sourceKind": source_kind, "explicitSource": explicit_source, "selected": selected}
@@ -1361,7 +1377,7 @@ def install(request, storage, prepared=None):
                   "retainedLogsAdditionalBytes": 0,
                   "retainedBackupAdditionalBytes": 0,
                   "existingAllocatedBytesExcludedByFilesystemFreeSpace": True,
-                  "buildMonitorSampleIntervalSeconds": 0.5,
+                  "buildMonitorSampleIntervalSeconds": 2,
                   "monitorRoots": [".recomp/" + job_paths["staging"].name,
                                    ".recomp/" + job_paths["logs"].name],
                   "externalCachesOutsideMonitor": ["user toolchain/configuration caches"]}
@@ -1466,8 +1482,6 @@ def install(request, storage, prepared=None):
         check_cancel()
         stage = "copying"
         install_jobs.update_job(job_paths, journal, stage)
-        if data.is_dir() and (root / ".recomp" / "installation.json").is_file():
-            source = data
         if reusable_copy:
             source_facts = journal["validatedInputs"]["source"]
             copied = journal["validatedInputs"]["stagedOriginal"]
@@ -1499,30 +1513,26 @@ def install(request, storage, prepared=None):
         emit("stage", stage="building", message="Building the game app")
         stage = "building"
         install_jobs.update_job(job_paths, journal, stage)
-        check_space(job_paths, journal, root, "building", install_jobs.MAX_BUILD_BYTES,
-                    log_path, space_plan)
-        for child in list(build_root.iterdir()):
-            if child.name != "original":
-                remove(child)
         publish_dir = staging / "publish"
         if publish_dir.exists():
             remove(publish_dir)
+        monitor_baseline = copied["bytes"] + (
+            journal.get("assisted", {}).get("validatedDropBytes", 0) if assisted_job else 0)
+        existing_growth = max(0, install_jobs.tree_size(staging, check_cancel) - monitor_baseline)
+        check_space(job_paths, journal, root, "building",
+                    max(0, install_jobs.MAX_BUILD_BYTES - existing_growth), log_path, space_plan)
         isolated_env = os.environ.copy()
         isolated_env["RECOMP_SOURCE_EXECUTABLE"] = executable_relative.as_posix()
         isolated_env["RECOMP_SOURCE_AUX_PATHS"] = json.dumps(selected["auxiliaryPaths"], ensure_ascii=False)
-        isolated_paths = {"TMPDIR": staging / "tmp", "TMP": staging / "tmp", "TEMP": staging / "tmp",
-                          "CARGO_HOME": staging / "cargo-home", "XDG_CACHE_HOME": staging / "xdg-cache",
-                          "CCACHE_DIR": staging / "ccache"}
+        isolated_paths = {"TMPDIR": staging / "tmp", "TMP": staging / "tmp", "TEMP": staging / "tmp"}
         for key, value in isolated_paths.items():
             value.mkdir(parents=True, exist_ok=True)
             isolated_env[key] = str(value)
-        monitor_baseline = (copied["bytes"] + journal.get("assisted", {}).get("validatedDropBytes", 0)
-                            if assisted_job else copied["bytes"])
         log_event(log_path, "building", "build started",
                   {"stagingBaselineBytes": monitor_baseline,
                    "buildAllowanceBytes": install_jobs.MAX_BUILD_BYTES,
-                   "isolatedEnvironmentRoots": {key: value.relative_to(root).as_posix()
-                                                 for key, value in isolated_paths.items()}})
+                   "temporaryEnvironmentRoots": {key: value.relative_to(root).as_posix()
+                                                   for key, value in isolated_paths.items()}})
         run([sys.executable, str(KIT / "tools/build.py"), "--game", game_id,
              "--build-root", str(build_root), "--regenerate", "--target", "app"], log_path,
             build_monitor={"root": staging, "volume": root,
@@ -1827,7 +1837,7 @@ def preflight_request(request):
         source_bytes = archive_uncompressed_size(source)
         destination_copy_bytes = source_bytes * 2
     elif source.is_dir():
-        source_bytes = install_jobs.payload_identity(source, check_cancel)["bytes"]
+        source_bytes = install_jobs.payload_size(source, check_cancel)["bytes"]
         destination_copy_bytes = source_bytes
     else:
         raise install_jobs.JobError("preflight_source_unsupported", "The selected source has no bounded space estimate.")
@@ -2001,7 +2011,8 @@ def continue_assisted(request, storage):
                                      if not item.get("required", True) and item["status"] == "verified"}
                 unsupported_optional = {item.get("id") for item in selected.get("requiredRoles", [])
                                         if not item.get("required", True) and item.get("found")
-                                        and item.get("actualPath") != item.get("path")}
+                                        and unicodedata.normalize("NFC", item.get("actualPath", "").replace("\\", "/")).casefold()
+                                            != unicodedata.normalize("NFC", item.get("path", "").replace("\\", "/")).casefold()}
                 excluded_optional = [item.get("actualPath") or item["path"]
                                      for item in cfg["setup"]["checklist"]["items"]
                                      if not item.get("required", True)

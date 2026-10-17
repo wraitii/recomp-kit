@@ -678,9 +678,11 @@ async function pollAssisted(revision) {
       }
     }
     assistedItemStates = new Map(itemList.map((item) => [item.id, item.status]));
+    const requiredVerified = itemList.filter((item) => item.required).every((item) => item.status === "verified");
+    const candidateProblem = requiredVerified ? result.diagnostics?.find((item) => item.message)?.message : "";
     const message = result.recipeChanged ? "The build recipe changed. Choose Recheck preparation to refresh this job." :
       result.canContinue ? "Required files are verified. Continue starts the build only after checking prerequisites again." :
-      result.checking ? "Checking stable files…" : "Waiting for required files to be copied and settle.";
+      candidateProblem || (result.checking ? "Checking stable files…" : "Waiting for required files to be copied and settle.");
     element("assisted-summary").textContent = message;
     if (itemAnnouncement) {
       assistedStatusText = itemAnnouncement;

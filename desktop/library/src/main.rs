@@ -87,7 +87,7 @@ async fn pick(kind: String) -> Option<String> {
         "folder" | "kit" => dialog.pick_folder().await,
         "source" => {
             dialog
-                .add_filter("Game archive or GOG installer", &["zip", "exe"])
+                .add_filter("Game executable or ZIP", &["zip", "exe"])
                 .pick_file()
                 .await
         }
@@ -279,25 +279,6 @@ fn main() {
             }
             let storage = data.join("games");
             std::fs::create_dir_all(&storage)?;
-            if let Ok(entries) = std::fs::read_dir(legacy.join("games")) {
-                for entry in entries {
-                    let entry = entry?;
-                    let old = entry.path();
-                    if !old.join("imported.json").is_file() && !old.join("location.json").is_file() {
-                        continue;
-                    }
-                    let record = storage.join(entry.file_name()).join("location.json");
-                    if !record.exists() {
-                        std::fs::create_dir_all(record.parent().unwrap())?;
-                        let bytes = if old.join("location.json").is_file() {
-                            std::fs::read(old.join("location.json"))?
-                        } else {
-                            serde_json::to_vec(&json!({"path": old}))?
-                        };
-                        std::fs::write(record, bytes)?;
-                    }
-                }
-            }
             app.manage(Library {
                 settings: Mutex::new(settings),
                 job: Mutex::new(None),

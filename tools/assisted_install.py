@@ -2,7 +2,7 @@ import hashlib
 import json
 import os
 import errno
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import stat
 import time
 import unicodedata
@@ -246,13 +246,15 @@ def _item_states(cfg, checks, snapshot, base_states=None):
 
 
 def _item_digest(snapshot, item_path, optional_paths=()):
-    prefix = item_path.rstrip("/")
-    optional = [path.rstrip("/") for path in optional_paths]
+    prefix = unicodedata.normalize("NFC", item_path.replace("\\", "/")).strip("/").casefold()
+    optional = [unicodedata.normalize("NFC", path.replace("\\", "/")).strip("/").casefold()
+                for path in optional_paths]
     rows = []
     for row in snapshot["rows"]:
-        if not (row[0] == prefix or row[0].startswith(prefix + "/")):
+        relative = unicodedata.normalize("NFC", row[0]).casefold()
+        if not (relative == prefix or relative.startswith(prefix + "/")):
             continue
-        if any(row[0] == path or row[0].startswith(path + "/") for path in optional):
+        if any(relative == path or relative.startswith(path + "/") for path in optional):
             continue
         rows.append((row[0], row[1], row[2], 0 if row[1] == "d" else row[3], row[4], row[5]))
     if not rows:
@@ -261,11 +263,14 @@ def _item_digest(snapshot, item_path, optional_paths=()):
 
 
 def _item_changed(snapshot, item_path, optional_paths=()):
-    optional = [path.rstrip("/") for path in optional_paths]
+    prefix = unicodedata.normalize("NFC", item_path.replace("\\", "/")).strip("/").casefold()
+    optional = [unicodedata.normalize("NFC", path.replace("\\", "/")).strip("/").casefold()
+                for path in optional_paths]
     for changed in snapshot["changedPaths"]:
-        if changed != item_path and not changed.startswith(item_path.rstrip("/") + "/"):
+        relative = unicodedata.normalize("NFC", changed).casefold()
+        if relative != prefix and not relative.startswith(prefix + "/"):
             continue
-        if any(changed == path or changed.startswith(path + "/") for path in optional):
+        if any(relative == path or relative.startswith(path + "/") for path in optional):
             continue
         return True
     return False
@@ -356,9 +361,9 @@ def start(request, storage, kit, cancel=None, recipe=None, inspect_folder=None, 
     recipe_identity = recipe(directory) if recipe else install_jobs.recipe_identity(kit, directory)
     with install_jobs.DestinationLock(storage, lock_name="registry.lock"):
         with install_jobs.DestinationLock(root):
-            facts = root / ".recomp" / "installed.json"
+            facts = root / ".recomp" / "installation.json"
             if facts.is_file():
-                saved = install_jobs.read_versioned(facts, "installed_facts")
+                saved = install_jobs.read_versioned(facts, "installation")
                 if saved.get("gameId") != game_id:
                     raise install_jobs.JobError("destination_game_mismatch", "The destination belongs to another game.")
                 raise install_jobs.JobError("assisted_update_unsupported", "Assisted preparation cannot replace an installed content folder yet.",
@@ -444,7 +449,6 @@ def status(request, storage, kit, session_id, cancel=None):
             optional_paths = [item["path"] for item in cfg["setup"]["checklist"]["items"]
                               if not item.get("required", True)]
             states = []
-            required_stable = True
             item_changed = False
             for item in cfg["setup"]["checklist"]["items"]:
                 ignored_optional = (optional_paths if item.get("required", True) else
@@ -458,8 +462,6 @@ def status(request, storage, kit, session_id, cancel=None):
                 present = digest is not None
                 stable = (present and not _item_changed(snapshot, item["path"], ignored_optional)
                           and now - record["since"] >= STABLE_SECONDS)
-                if item.get("required", True) and present and not stable:
-                    required_stable = False
                 status_value = "missing" if not present else "settling" if not stable else "checking"
                 message = "Waiting for this file or folder." if not present else (
                     "Wait for files to finish copying." if not stable else "Checking this item.")
@@ -506,30 +508,24 @@ def status(request, storage, kit, session_id, cancel=None):
                 cfg, content, artifacts=stable_items)
             states = _item_states(cfg, checks, snapshot, states)
             layout_diagnostics = []
-            for check in checks:
-                actual = check.get("actualPath")
-                if not check.get("found") or not actual:
-                    continue
-                if check.get("role") == "executable" and PurePosixPath(actual).parent != PurePosixPath("."):
-                    layout_diagnostics.append({"code": "nested_layout_unsupported", "stage": "checking",
-                        "path": actual, "message": "This executable is inside a nested layout the installer cannot preserve.",
-                        "details": {"path": actual}, "recovery": ["choose_another_copy", "cancel_job"],
-                        "required": check.get("required", True), "id": check.get("id")})
-                elif actual != check.get("path"):
-                    layout_diagnostics.append({"code": "assembly_pending", "stage": "checking",
-                        "path": actual, "message": "This file uses path spelling the installer cannot preserve yet.",
-                        "details": {"expectedPath": check.get("path"), "actualPath": actual},
-                        "recovery": ["choose_another_copy", "cancel_job"],
-                        "required": check.get("required", True), "id": check.get("id")})
-            if layout_diagnostics:
-                states = [{**item, "status": "unreadable",
-                           "message": "This complete copy uses an unsupported folder layout.",
-                           "diagnostic": next((diagnostic for diagnostic in layout_diagnostics
-                                               if diagnostic.get("id") == item["id"]), None)}
-                          if any(diagnostic.get("id") == item["id"] for diagnostic in layout_diagnostics)
-                          else item for item in states]
             all_required = all(not item["required"] or item["status"] == "verified" for item in states)
-            all_required = all_required and not any(item.get("required", True) for item in layout_diagnostics)
+            installable = False
+            if all_required:
+                inspection = source_inspection.inspect_folder(cfg, content, cancel)
+                viable = [candidate for candidate in inspection["candidates"] if candidate.get("installable")]
+                installable = (inspection.get("scanComplete") is True and len(viable) == 1
+                               and Path(viable[0]["contentRoot"]).resolve() == content.resolve())
+                if not installable:
+                    layout_diagnostics = [diagnostic for candidate in inspection["candidates"]
+                                          for diagnostic in candidate.get("diagnostics", [])]
+                    layout_diagnostics = layout_diagnostics or inspection.get("diagnostics", [])
+                    if not layout_diagnostics:
+                        layout_diagnostics = [{"code": "candidate_not_installable", "stage": "checking",
+                            "path": ".", "message": "The supplied files do not form one complete supported installation layout.",
+                            "details": {"viableCandidates": len(viable),
+                                        "scanComplete": inspection.get("scanComplete")},
+                            "recovery": ["retry_check", "open_drop_folder", "cancel_job"]}]
+            all_required = all_required and installable
             after = _snapshot(content, cancel)
             before_items = {item["id"]: _item_digest(
                                 snapshot, item["path"], optional_paths if item.get("required", True) else

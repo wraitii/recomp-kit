@@ -38,7 +38,9 @@ installation lock. Profiles use the manifest identity under the platform user-da
 directory, so renaming the game folder does not change the profile key.
 
 Publication stages both apps on the destination volume, retains backups, and
-replaces the manifest last. Updates preserve `original/`; the registry changes
+replaces the manifest last. Rebuilds use and preserve the installed `original/`;
+importing another copy requires a new destination. Validated retries retain build
+outputs, and dependency caches remain reusable between jobs. The registry changes
 after publication. Use **Locate game folder** to attach a moved installation
 without rebuilding. Keep both apps, `original/` and `.recomp/` together. macOS is
 the library's installation target for this pass; Windows/Linux installed layouts,

@@ -12,9 +12,10 @@ kit checkout, Python, or build tools.
 
 ## Scope and non-goals
 
-- In scope: installing from the user's own folders, archives, installers and disc
-  images; producing a self-contained game folder. macOS first; Windows and Linux follow
-  the same manifest and path-resolution contract.
+- Current milestone: macOS installed folders, ZIPs, assisted preparation, movable
+  game folders and interruption recovery. Additional installer, archive and disc
+  adapters in Step 4 follow individually against real inputs. Windows and Linux
+  packaging follow the macOS validation pass.
 - Out of scope: downloading game content, bundling game data, executing installers
   (including under Wine), bypassing copy protection or DRM, patching a user's files in
   place, and making Wine a dependency of the library or the finished app.
@@ -25,8 +26,9 @@ kit checkout, Python, or build tools.
 
 ## Decisions
 
-- **External tools:** ship innoextract (zlib-style licence), unshield (MIT) and
-  libarchive (BSD-2-Clause), keeping each upstream notice in the bundle. Check each
+- **External tools:** evaluate innoextract (zlib-style licence), unshield (MIT) and
+  libarchive (BSD-2-Clause) as their adapters are implemented; none ship in the current
+  milestone. Keep each selected upstream notice in the bundle. Check each
   shipped file against libarchive's per-file exceptions (Apache-2.0, BSD-4-clause,
   public domain). unshield is preferred as a linked library if its C API proves usable
   in Step 4; libarchive stays only if it covers the image reading we need.
@@ -115,8 +117,8 @@ points, not completed steps.
 - [x] Review `tools/library.py`, `tools/game_config.py`, `tools/package_desktop.py`,
   `tools/recomp/finish_bundle.py`, `desktop/library/`, `web/library/`, and the host
   launcher, game-path and layout code.
-- [x] Write the schema note below before code changes. Every persisted or exchanged
-  object carries a schema version; readers reject unknown major versions without
+- [x] Write the schema note below before code changes. Durable records carry
+  a schema version; readers reject unknown major versions without
   rewriting them.
 - [x] Define `installation.json`, including profile, build, paths, fingerprints,
   sidecars and owned artifacts, with no embedded commands and containment checks.
@@ -127,7 +129,8 @@ and the new contract does not promise compatibility with existing development in
 
 ### Step 1 schema
 
-Persisted and exchanged objects use `schema: {major, minor}`. Readers accept unknown
+Durable records use `schema: {major, minor}`; internal UI events need no independent
+version contract. Readers accept unknown
 minor versions only when they add optional fields without changing required semantics;
 they reject an unknown major without rewriting the record. Source
 inspection returns a versioned source kind and payload identity, diagnostics, and
@@ -302,10 +305,11 @@ unsupported inputs produce an actionable explanation or route to assisted mode.
 Progress: the Python backend now stages folder and ZIP installs under job-owned
 directories, fingerprints bounded source and recipe inputs, journals retries, and
 uses installed facts as the publication commit record. It now keeps bounded attempt
-logs, preflights additional volume space, isolates temporary/cache directories under
-the job, and monitors staged build growth with a best-effort ceiling. The monitor can
-overshoot between scans, and global toolchain caches outside the job are not counted.
-Strict per-job filesystem quotas are deferred as follow-up work beyond Step 9. Step 9
+logs, preflights additional volume space, keeps temporary files under the job, and
+monitors staged build growth with a best-effort ceiling. Validated retries retain
+build outputs; dependency caches use their normal toolchain locations. The monitor
+can overshoot between scans, and shared toolchain caches are not counted.
+Strict per-job filesystem quotas are outside this milestone. Step 9
 will validate the current monitor and exercise interruption recovery, UI actions and
 cleanup failure end to end. Windows process and lock guarantees remain unverified.
 
@@ -363,7 +367,7 @@ Depends on Steps 1, 2 and 5. Implements the requirements in "Assisted mode requi
 Completion: a user can supply content by hand, see exactly what is missing, and reach
 OK or a clear FAIL without the library ever starting a build on unverified input.
 Backend and desktop UI changes compile; runtime folder-watcher, restart, and cancellation
-exercises remain for Step 9. Strict filesystem quotas are deferred follow-up work; the
+exercises remain for Step 9. Strict filesystem quotas are outside this milestone; the
 current build-output ceiling is best-effort and does not cover global compiler caches.
 
 ## Step 7 Publish a movable game folder and sidecars
@@ -509,6 +513,16 @@ guidance stays in the Black & White and Civilization IV READMEs. No extraction-t
 binaries were added; their bundling and notices remain part of unfinished Step 4.
 Keep this plan for the holistic review while earlier implementation and runtime
 validation items remain open.
+
+Cleanup review (2026-10-17): fixed assisted Continue, recovery actions and nested
+layout validation; interrupted assisted builds return to preparation for fresh
+validation and explicit Continue. Rebuilds require the installed original copy.
+Space estimates no longer hash payloads, validated retries retain build outputs,
+and game recipe identities exclude library UI inputs. Native launchers share path
+checks; runtime launch validation no longer depends on installer ownership records.
+Python/JavaScript syntax, all game configs, game-literal and formatting checks,
+diff review, and library/windowed app builds passed. No tests or apps were run;
+the end-to-end exercises in Step 9 remain pending.
 
 ## Open questions
 

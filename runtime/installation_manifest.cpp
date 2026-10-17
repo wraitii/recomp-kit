@@ -24,19 +24,6 @@ std::string parent(const std::string &path) {
     return slash == std::string::npos ? std::string() : path.substr(0, slash);
 }
 
-bool safe_relative(const std::string &path) {
-    if (path.empty() || path[0] == '/' || path.find('\\') != std::string::npos ||
-        path.find(':') != std::string::npos || path.find('\0') != std::string::npos ||
-        path.back() == '/')
-        return false;
-    std::stringstream input(path);
-    std::string part;
-    while (std::getline(input, part, '/'))
-        if (part.empty() || part == "." || part == "..")
-            return false;
-    return true;
-}
-
 bool safe_profile(const std::string &value) {
     if (value.empty() || value.size() > 64)
         return false;
@@ -144,8 +131,6 @@ InstallationManifest installation_manifest_for_process() {
     result.profile_suffix = profile ? profile->str("relativeRoot", "") : "";
     const controls::Json *fingerprints = root.get("fingerprints");
     const controls::Json *launch_paths = root.get("launchPaths");
-    const controls::Json *sidecars = root.get("sidecars");
-    const controls::Json *owned = root.get("ownedArtifacts");
     const controls::Json *executable_fingerprint =
         fingerprints ? fingerprints->get("executable") : nullptr;
     const uint64_t declared_size =
@@ -155,44 +140,25 @@ InstallationManifest installation_manifest_for_process() {
     if (!schema || schema->type != controls::Json::Object || schema->num("major", 0) != 1 ||
         !paths || paths->type != controls::Json::Object || result.game_id != RECOMP_GAME_ID ||
         result.game_id.find_first_of("/\\:") != std::string::npos ||
-        !safe_profile(result.profile_id) || !safe_relative(result.executable) ||
-        !safe_relative(result.data_root) ||
-        (!result.profile_suffix.empty() && !safe_relative(result.profile_suffix)) ||
+        !safe_profile(result.profile_id) ||
+        !installation_manifest_detail::safe_relative(result.executable) ||
+        !installation_manifest_detail::safe_relative(result.data_root) ||
+        (!result.profile_suffix.empty() &&
+         !installation_manifest_detail::safe_relative(result.profile_suffix)) ||
         !executable_fingerprint || executable_fingerprint->type != controls::Json::Object ||
-        !launch_paths || launch_paths->type != controls::Json::Object || !sidecars ||
-        sidecars->type != controls::Json::Array || sidecars->a.size() != 1 || !owned ||
-        owned->type != controls::Json::Array || owned->a.size() != 4 || declared_size == 0 ||
+        !launch_paths || launch_paths->type != controls::Json::Object || declared_size == 0 ||
         declared_hash != LOADER_EXPECTED_SHA256) {
         result.error = "manifest schema, profile identity, or relative paths failed validation";
         return result;
     }
     const std::string expected_game =
         std::string(RECOMP_APP_NAME) + ".app/Contents/MacOS/" + RECOMP_APP_NAME;
-    const controls::Json &configure = sidecars->a[0];
     const std::string expected_configure =
         std::string("Configure ") + RECOMP_GAME_NAME + ".app/Contents/MacOS/ConfigureLauncher";
     if (launch_paths->str("game", "") != expected_game ||
-        launch_paths->str("configure", "") != expected_configure ||
-        configure.type != controls::Json::Object || configure.str("id", "") != "configure" ||
-        configure.str("role", "") != "configure" || configure.str("target", "") != "configure" ||
-        configure.str("profileId", "") != result.profile_id) {
+        launch_paths->str("configure", "") != expected_configure) {
         result.error = "manifest launch roles differ from this build";
         return result;
-    }
-    const std::string expected_owned[] = {std::string(RECOMP_APP_NAME) + ".app",
-                                          std::string("Configure ") + RECOMP_GAME_NAME + ".app",
-                                          "original", ".recomp/logs"};
-    bool owned_seen[4] = {};
-    for (size_t i = 0; i < owned->a.size(); ++i) {
-        size_t matched = 4;
-        for (size_t j = 0; j < 4; ++j)
-            if (owned->a[i].type == controls::Json::String && owned->a[i].s == expected_owned[j])
-                matched = j;
-        if (matched == 4 || owned_seen[matched]) {
-            result.error = "manifest owned-artifact declaration differs from this build";
-            return result;
-        }
-        owned_seen[matched] = true;
     }
     char profile_base[4096];
     if (os_user_data_dir(result.profile_id.c_str(), profile_base, sizeof profile_base) != 0) {
@@ -242,16 +208,8 @@ InstallationManifest installation_manifest_for_process() {
         result.error = "manifest root, executable, or data directory cannot be resolved";
         return result;
     }
-    const auto contained = [](const char *root_path, const char *candidate_path) {
-        const size_t length = strlen(root_path);
-        const size_t candidate_length = strlen(candidate_path);
-        if (candidate_length < length)
-            return false;
-        return strncmp(root_path, candidate_path, length) == 0 &&
-               (candidate_path[length] == '/' || candidate_path[length] == '\\' ||
-                candidate_path[length] == '\0');
-    };
-    if (!contained(base, image_path) || !contained(base, data_path)) {
+    if (!installation_manifest_detail::path_within(base, image_path) ||
+        !installation_manifest_detail::path_within(base, data_path)) {
         result.error = "manifest paths escape the game folder after resolving symbolic links";
         return result;
     }
@@ -294,7 +252,8 @@ InstallationManifest installation_manifest_for_process() {
         const std::string hash = entry.str("sha256", "");
         const uint64_t size = (uint64_t)entry.num("size", 0);
         if (entry.type != controls::Json::Object || entry.str("name", "") != expected_aux[i].name ||
-            !safe_relative(relative) || hash != expected_aux[i].sha256 || size == 0) {
+            !installation_manifest_detail::safe_relative(relative) ||
+            hash != expected_aux[i].sha256 || size == 0) {
             result.error = "manifest auxiliary fingerprint differs from compiled expectations";
             return result;
         }
@@ -317,9 +276,9 @@ InstallationManifest installation_manifest_for_process() {
         const std::string declared_auxiliary = result.game_folder + "/" + relative;
         OsStat auxiliary{};
         if (os_realpath(declared_auxiliary.c_str(), auxiliary_path, sizeof auxiliary_path) != 0 ||
-            !contained(base, auxiliary_path) || os_stat(auxiliary_path, &auxiliary) != 0 ||
-            !auxiliary.is_regular || auxiliary.size != size ||
-            loader_hash_file(auxiliary_path) != hash) {
+            !installation_manifest_detail::path_within(base, auxiliary_path) ||
+            os_stat(auxiliary_path, &auxiliary) != 0 || !auxiliary.is_regular ||
+            auxiliary.size != size || loader_hash_file(auxiliary_path) != hash) {
             result.error =
                 "manifest auxiliary file failed its path, size, or hash check: " + relative;
             return result;

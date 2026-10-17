@@ -28,13 +28,10 @@ MAX_RETAINED_LOG_BYTES = 64 * 1024 * 1024
 MAX_MONITOR_ENTRIES = 200000
 MAX_MONITOR_DEPTH = 128
 RECIPE_DIRS = ("runtime", "dx", "host", "platform", "mods", "graphics", "cmake", "third_party")
-RECIPE_FILES = ("CMakeLists.txt", "CMakePresets.json", "tools/build.py", "tools/game_config.py",
-                "tools/gen_game_config.py", "tools/setup.py", "tools/install_jobs.py", "tools/stage_game_files.py",
-                "tools/copy_layouts.py", "tools/recomp/finish_bundle.py", "tools/library.py",
-                "tools/source_inspection.py", "tools/zip_adapter.py", "host/configure_launcher.cpp",
-                "runtime/installation_manifest.cpp", "runtime/installation_manifest.h",
-                "web/library/app.js", "web/library/index.html", "web/library/style.css",
-                "desktop/library/src/main.rs")
+RECIPE_FILES = ("CMakeLists.txt", "CMakePresets.json")
+RECIPE_TOOL_EXCLUDES = {"assisted_install.py", "build_library.py", "check_game_literals.py",
+                        "check_repo.py", "format.py", "install_jobs.py", "ios_logs.py",
+                        "setup.py", "source_inspection.py", "test.py", "zip_adapter.py"}
 IGNORED_PARTS = {".git", "__pycache__", ".pytest_cache", "tests", "test", ".venv"}
 JOURNAL_STAGES = {"inspecting", "discovering", "preparing", "extracting", "copying", "validating",
                   "building", "publishing", "cleaning", "waiting_for_input", "cancelling_assisted",
@@ -636,9 +633,8 @@ def copy_payload(source, destination, cancel=None, expected_bytes=None, exclude_
     return {"files": file_count, "bytes": total}
 
 
-def payload_identity(root, cancel=None, exclude_paths=None):
+def payload_files(root, cancel=None, exclude_paths=None):
     root = Path(root).resolve(strict=True)
-    digest = hashlib.sha256(b"recomp-payload-v1\n")
     files = []
     entries = 0
     excluded = {unicodedata.normalize("NFC", Path(value).as_posix()).casefold()
@@ -690,8 +686,14 @@ def payload_identity(root, cancel=None, exclude_paths=None):
             raise JobError("payload_path_collision", "The game copy contains paths that collide by case or Unicode spelling.",
                            details={"paths": [normalized[key], relative]})
         normalized[key] = relative
+    return root, sorted(files, key=lambda item: unicodedata.normalize("NFC", item.relative_to(root).as_posix()))
+
+
+def payload_identity(root, cancel=None, exclude_paths=None):
+    root, files = payload_files(root, cancel, exclude_paths)
+    digest = hashlib.sha256(b"recomp-payload-v1\n")
     total = 0
-    for path in sorted(files, key=lambda item: unicodedata.normalize("NFC", item.relative_to(root).as_posix())):
+    for path in files:
         relative = unicodedata.normalize("NFC", path.relative_to(root).as_posix())
         info = path.stat()
         if info.st_size > MAX_PAYLOAD_BYTES or total + info.st_size > MAX_PAYLOAD_BYTES:
@@ -726,6 +728,18 @@ def payload_identity(root, cancel=None, exclude_paths=None):
         digest.update(relative.encode("utf-8") + b"\0" + str(info.st_size).encode() + b"\0")
         digest.update(file_hash.digest())
     return {"algorithm": "sha256", "sha256": digest.hexdigest(), "files": len(files), "bytes": total}
+
+
+def payload_size(root, cancel=None, exclude_paths=None):
+    root, files = payload_files(root, cancel, exclude_paths)
+    total = 0
+    for path in files:
+        if cancel:
+            cancel()
+        total += path.stat().st_size
+        if total > MAX_PAYLOAD_BYTES:
+            raise JobError("payload_size_limit", "The game copy exceeds the payload size limit.")
+    return {"files": len(files), "bytes": total}
 
 
 def recipe_identity(kit, game_dir):
@@ -763,7 +777,7 @@ def recipe_identity(kit, game_dir):
                     else:
                         raise JobError("recipe_special_file", "The build recipe contains a special file.",
                                        details={"path": str(path)})
-    tools = kit / "tools"
+    tools = kit / "tools/recomp"
     if tools.is_dir():
         stack = [tools]
         while stack:
@@ -784,6 +798,14 @@ def recipe_identity(kit, game_dir):
                         stack.append(path)
                     elif child.is_file(follow_symlinks=False) and path.suffix == ".py":
                         files.add(path)
+    for child in os.scandir(kit / "tools"):
+        path = Path(child.path)
+        if path.suffix == ".py" and path.name not in RECIPE_TOOL_EXCLUDES:
+            if child.is_symlink():
+                raise JobError("recipe_symlink", "The build recipe contains a symbolic link.",
+                               details={"path": str(path)})
+            if child.is_file(follow_symlinks=False):
+                files.add(path)
     if game_dir.is_dir():
         stack = [game_dir]
         while stack:

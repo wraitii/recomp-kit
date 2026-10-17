@@ -75,11 +75,6 @@ GamePath game_path_resolve(const char *flag, const char *data_root) {
         g.data_root = installation.game_folder + "/" + installation.data_root;
         g.install_lock_path = installation.game_folder + "/.recomp/install.lock";
         g.source = GamePathSource::Installed;
-        if (!game_path_is_supported(g.exe, nullptr)) {
-            g.error = "Installed executable failed its supported-version check: " + g.exe;
-            g.exe.clear();
-            return g;
-        }
         return g;
     }
     // The build's own copy of the game: game.toml names it by an absolute
