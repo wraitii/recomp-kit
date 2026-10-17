@@ -11,7 +11,8 @@ enum class Setting {
     MouseAcceleration,
     WindowMode,
     PerformanceOverlay,
-    ReportedGpu
+    ReportedGpu,
+    PresentationFilter
 };
 
 enum class KeyboardNames { System = 0, US = 1 };

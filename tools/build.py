@@ -568,6 +568,10 @@ def regenerate_selection(value, cfg, parser):
 def main():
     """Check inputs, translate under the build lock when needed, then configure and build."""
     args, parser = parse_args(sys.argv[1:])
+    if not args.function_corpus:
+        status = subprocess.call([sys.executable, str(ROOT / "tools/check_flag_state.py")])
+        if status:
+            sys.exit(status)
     if args.target == "library":
         from build_library import build as build_library
         build_library(args.build_root, args.config)

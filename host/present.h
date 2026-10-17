@@ -318,6 +318,7 @@ void host_present_set_device(gpu::Device *device);
 gpu::Device *host_present_device(void);
 // `native_surface` is what the window layer hands over (a CAMetalLayer* on
 // macOS); the presenter makes its swapchain from it on the worker.
+void host_present_set_bilinear(bool enabled);
 void host_present_start(void *native_surface, int drawable_w, int drawable_h);
 // One presenter turn on the calling thread, for a host that drives the GPU from
 // its own loop (the web); host_present_start starts no worker there.

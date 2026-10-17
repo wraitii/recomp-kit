@@ -205,12 +205,14 @@ def bind_boundary_calls(body, mode, row_addr, direct, indirect_sites):
         raise ValueError('boundary direct calls differ from decoded/declared set')
     if re.search(r'\brecomp_(?:jump|setjmp|seh|unknown_call)\b', body):
         raise ValueError('unsupported emitted transfer in boundary row')
-    emitted = len(re.findall(r'\brecomp_call\s*\(', body))
+    emitted = len(re.findall(r'\brecomp_(?:call|icall)\s*\(', body))
     if emitted != len(indirect_sites):
         raise ValueError('boundary indirect call sites differ from declared calls')
     body = re.sub(r'\bCALL_FN\(([0-9a-f]{8})\)', lambda m: f'{mode}_fnwrap_{m[1]}(c)', body)
     body = re.sub(r'\brecomp_call\(c, t_\);', f'{mode}_indirect_{row_addr}(c, t_);', body)
-    if re.search(r'\brecomp_call\b', body):
+    body = re.sub(r'\brecomp_icall\(c, ([^,;]+), &ic_\w+, [^;]*\);',
+                  lambda m: f'{mode}_indirect_{row_addr}(c, {m[1]});', body)
+    if re.search(r'\brecomp_(?:call|icall)\b', body):
         raise ValueError('unbound indirect call remains in boundary row')
     return body
 

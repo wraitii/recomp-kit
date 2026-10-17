@@ -60,6 +60,7 @@ struct CompositorInput {
     // Wide view off: the scene was projected at the guest's aspect, so on a
     // wider drawable it is boxed at that aspect with its HUD and input.
     bool narrow = false;
+    gpu::Filter presentation_filter = gpu::Filter::Nearest;
 };
 
 // Encode only: never commits, waits or presents. The caller supplies an open

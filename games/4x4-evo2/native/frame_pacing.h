@@ -5,8 +5,10 @@
 extern "C" {
 #endif
 void evo2_complete_frame(X86 *c);
+void evo2_load_input_bindings(X86 *c);
 #ifdef __cplusplus
 }
 #endif
 #define FN_00495d10 evo2_complete_frame
+#define FN_004823d0 evo2_load_input_bindings
 #endif

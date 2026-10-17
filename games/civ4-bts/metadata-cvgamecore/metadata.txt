@@ -1,10 +1,9 @@
 format=recomp-code-map-v3
 status=complete
-provenance=provisional-sweep
-emitter=decoded
-trap_instructions=
+program=CvGameCoreDLL.dll
 executable_sha256=7f9f23905177396972f87a168ec785f006be1d5b9ff730484b05c565a9396278
+language=x86:LE:32:default
 image_base=10500000
-functions=12713
-instructions=1217747
-instruction_bytes=3565387
+functions=19515
+instructions=725855
+instruction_bytes=2381657

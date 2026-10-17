@@ -44,6 +44,15 @@ keyboard / mouse mappings. Extra response and mapping settings are behind **More
 options...**. **Save** saves the profile; Cancel offers to discard unsaved edits.
 Normal launches start the game directly when its data is available.
 
+BUGFIX(original): `native/input.cpp` wraps the retained binding loader
+(`0x004823d0`) to refresh the primary controller's cached button count after a
+successful load, matching the original counter at `0x004839c0`. Initialization
+(`0x00481760`) counts default bindings before loading saved ones; live traces
+confirmed that restored D-pad slots 13–16 were excluded by gameplay's stale
+count of 13 (`0x0048ac00`). `RECOMP_INPUT_FIXUP=0` retains original behavior.
+D-pad-to-horn behavior was verified in-game. Other cached controller fields
+and the original handling of holes in the binding table remain unchanged.
+
 ## Renderers
 
 The original `tridx8tl.dll` and `Tridx8.dll` hardware renderers are translated

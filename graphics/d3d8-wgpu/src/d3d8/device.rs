@@ -268,6 +268,19 @@ fn trace_draw(
     if stage1_only && stage1.is_none() {
         return;
     }
+    static TEXTURE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    if let Some(texture_id) = *TEXTURE.get_or_init(|| {
+        let raw = std::env::var("RECOMP_D3D8_TRACE_TEXTURE").ok()?;
+        u32::from_str_radix(raw.trim_start_matches("0x"), 16).ok()
+    }) {
+        if ![stage0, stage1]
+            .iter()
+            .flatten()
+            .any(|texture| texture.texture_id == texture_id)
+        {
+            return;
+        }
+    }
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
     if n < start || n >= start.saturating_add(limit) {
         return;
@@ -401,6 +414,9 @@ fn trace_draw(
         let mut line = format!("[d3d8-trace]   v{i} pos=({x},{y},{z})");
         if let Some(c) = attr(1) {
             line.push_str(&format!(" color=0x{:08X}", u32_at(v, c.offset as usize)));
+        }
+        if let Some(s) = attr(4) {
+            line.push_str(&format!(" specular=0x{:08X}", u32_at(v, s.offset as usize)));
         }
         if let Some(t) = attr(2) {
             let o = t.offset as usize;

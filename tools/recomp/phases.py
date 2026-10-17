@@ -76,6 +76,7 @@ class EmissionResult:
     requests: frozenset
     decisions: tuple
     dependencies: frozenset
+    region: tuple | None = None
 
 
 @dataclass(frozen=True)

@@ -32,7 +32,9 @@ translation input.
 
 ## Code map
 
-The main executable's map is exported from Ghidra with `Civ4ExportCodeMap.java`.
+The main executable's map is exported from Ghidra with `ExportCodeMap.java`, which
+takes the destination, image base and executable SHA-256 and is shared with the
+auxiliary modules.
 The Ghidra project is `ghidra/Civ4BTS.gpr`, imported with automatic analysis
 disabled; decline the GUI's analysis prompt to keep that state. Add the shared `../ghidra_scripts/` folder to Script Manager, enable the ghidraLlm API,
 and verify the program with `./tools/ghidra_api /program/info`. The default
@@ -40,7 +42,7 @@ server is port 8166; `GHIDRA_API_BASE` selects another. After deliberate analysi
 has produced instruction boundaries:
 
 ```sh
-./tools/ghidra_api /script/run '{"name":"Civ4ExportCodeMap.java","args":["/ABS/PATH/analysis/code-map-export"]}'
+./tools/ghidra_api /script/run '{"name":"ExportCodeMap.java","args":["/ABS/PATH/analysis/code-map-export","0x00400000","90dbdbdcbd6c631c9d575881d0241d9a2012b1a5957bacbe68212745da22174e"]}'
 tools/.venv/bin/python recomp-kit/tools/recomp/code_map.py --pack analysis/code-map-export \
   --exe build/original/Civ4BeyondSword.exe --out recomp-kit/games/civ4-bts/metadata
 tools/.venv/bin/python tools/build.py --regenerate
@@ -69,3 +71,38 @@ tools/.venv/bin/python recomp-kit/tools/recomp/bootstrap_map.py --exe build/orig
 
 `zlib1.dll` embeds strings and tables in `.text`; its data ranges were checked by
 hex dump and kept in `analysis/zlib1-data-evidence.json`.
+
+### CvGameCoreDLL
+
+`CvGameCoreDLL.dll` is mapped at guest base `0x10500000` (file base `0x10000000`).
+Its Ghidra map is seeded from evidence, then exported and packed:
+
+1. Import `Assets/CvGameCoreDLL.dll` into `ghidra/Civ4BTS.gpr` with automatic
+   analysis off. Make it the active program.
+2. Write `slots.tsv` from the PE file's type-3 base relocations (`rva` column,
+   one line per slot). `RebaseAuxModule.java` moves the image to the guest base
+   and relocates exactly these slots once, so Ghidra's own relocation pass is not used.
+3. `RebaseAuxModule.java` with the SHA-256, `0x10000000`, `0x10500000` and `slots.tsv`.
+   It turns every analyzer off first.
+4. Seed functions with `SeedAuxEntries.java`: observed targets (`site target kind
+   count desc` rows, one per line, `-` for none), then `audit`, then `apply`.
+   It refuses to run while any analyzer is on and follows direct calls from
+   what it creates.
+5. For pointers found in `.rdata` that name seeded code, write a `slot target`
+   TSV and run `LinkDataSlots.java` on it, so the code map records them as data
+   entries.
+6. Export with `ExportCodeMap.java` (`0x10500000`, the file's SHA-256), then pack:
+
+```sh
+tools/.venv/bin/python recomp-kit/tools/recomp/code_map.py --pack analysis/cvgamecore-export \
+  --exe "Civilization IV Complete/Civ4/Beyond the Sword/Assets/CvGameCoreDLL.dll" \
+  --out recomp-kit/games/civ4-bts/metadata-cvgamecore --base 0x10500000
+tools/.venv/bin/python tools/build.py --regenerate cvgamecore --target app \
+  --allow-unmodelled "<reason>"
+```
+
+The translator also runs a bootstrap sweep of the image for every module (`discover`
+in `[translate]`, on by default). Sweep bodies outside the Ghidra map are provisional:
+they are emitted as decoded regions, and a provisional jump into mapped code goes
+through the runtime dispatch rather than a trap. Those builds need `--allow-unmodelled`
+with a reason.
