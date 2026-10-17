@@ -537,6 +537,97 @@ int os_wait(int64_t pid, int *exit_code) {
     return 0;
 }
 
+struct OsChildProcess {
+    pid_t pid;
+    bool exited = false;
+    uint32_t exit_code = 0;
+};
+
+OsChildProcess *os_child_spawn(const char *const argv[]) {
+    pid_t pid;
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attributes;
+    int error = posix_spawn_file_actions_init(&actions);
+    if (error) {
+        errno = error;
+        return nullptr;
+    }
+    error = posix_spawnattr_init(&attributes);
+    if (error) {
+        posix_spawn_file_actions_destroy(&actions);
+        errno = error;
+        return nullptr;
+    }
+#ifdef __APPLE__
+    error = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_CLOEXEC_DEFAULT);
+    for (int fd = 0; fd < 3 && !error; ++fd)
+        if (fcntl(fd, F_GETFD) >= 0)
+            error = posix_spawn_file_actions_addinherit_np(&actions, fd);
+#elif defined(__GLIBC__)
+#if __GLIBC_PREREQ(2, 34)
+    error = posix_spawn_file_actions_addclosefrom_np(&actions, 3);
+#else
+    error = ENOTSUP;
+#endif
+#else
+    error = ENOTSUP;
+#endif
+    if (!error)
+        error = posix_spawn(&pid, argv[0], &actions, &attributes, (char *const *)argv, environ);
+    posix_spawnattr_destroy(&attributes);
+    posix_spawn_file_actions_destroy(&actions);
+    if (error) {
+        errno = error;
+        return nullptr;
+    }
+    return new OsChildProcess{pid};
+}
+
+uint32_t os_child_id(OsChildProcess *child, int) {
+    return (uint32_t)child->pid;
+}
+
+int os_child_poll(OsChildProcess *child, int primary_thread, uint32_t *exit_code) {
+    if (primary_thread)
+        return OS_CHILD_THREAD_UNSUPPORTED;
+    if (!child->exited) {
+        int status;
+        pid_t result;
+        do {
+            result = waitpid(child->pid, &status, WNOHANG);
+        } while (result < 0 && errno == EINTR);
+        if (result <= 0)
+            return result < 0 ? OS_CHILD_ERROR : OS_CHILD_RUNNING;
+        child->exited = true;
+        child->exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+    }
+    *exit_code = child->exit_code;
+    return OS_CHILD_EXITED;
+}
+
+static void *reap_child(void *value) {
+    auto *child = static_cast<OsChildProcess *>(value);
+    while (waitpid(child->pid, nullptr, 0) < 0 && errno == EINTR) {
+    }
+    delete child;
+    return nullptr;
+}
+
+void os_child_close(OsChildProcess *child) {
+    uint32_t code;
+    if (os_child_poll(child, 0, &code) != 0) {
+        delete child;
+        return;
+    }
+    OsThread *thread = os_thread_create(reap_child, child, 0);
+    if (thread)
+        os_thread_detach(thread);
+    else {
+        fprintf(stderr, "os_child_close: cannot create child reaper\n");
+        delete child;
+    }
+}
+
 static int native_flags(int flags) {
     int f = 0;
     switch (flags & 3) {

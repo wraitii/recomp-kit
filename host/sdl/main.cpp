@@ -1902,6 +1902,14 @@ int web_main(int argc, char **argv) {
 } // namespace
 #endif
 
+static OsChildProcess *launch_guest_process(const char *exe, const char *args) {
+    char host[4096];
+    if (os_exe_path(host, sizeof host) != 0)
+        return nullptr;
+    const char *argv[] = {host, "--exe", exe, "--guest-args", args, nullptr};
+    return os_child_spawn(argv);
+}
+
 int main(int argc, char **argv) {
 #ifdef __EMSCRIPTEN__
     return web_main(argc, argv);
@@ -1930,16 +1938,23 @@ int main(int argc, char **argv) {
             exe_flag = argv[++i];
         else if (strncmp(argv[i], "--exe=", 6) == 0)
             exe_flag = argv[i] + 6;
-        else if (strcmp(argv[i], "--launcher") == 0)
+        else if (strcmp(argv[i], "--guest-args") == 0 && i + 1 < argc) {
+            if (os_setenv("RECOMP_GUEST_ARGS", argv[++i]) != 0) {
+                fprintf(stderr, RECOMP_APP_NAME ": could not set guest arguments\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--launcher") == 0)
             continue; // launcher::requested reads it
         else if (strcmp(argv[i], "--configure") == 0)
             configure_requested = true;
         else {
             fprintf(stderr, "usage: " RECOMP_APP_NAME " [--exe <" RECOMP_EXECUTABLE
-                            ">] [--launcher] [--configure] [--version] [--probe-layout]\n");
+                            ">] [--guest-args <command line>] [--launcher] [--configure] "
+                            "[--version] [--probe-layout]\n");
             return 2;
         }
     }
+    win32_set_process_launcher(launch_guest_process);
     std::string game_error;
 #ifndef __ANDROID__
     const InstallationManifest installed_location = installation_manifest_location_for_process();

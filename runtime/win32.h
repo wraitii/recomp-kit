@@ -35,6 +35,8 @@ void win32_forget_scrollbars(uint32_t hwnd);
 // loaded EXE).
 void win32_init(const std::string &game_dir);
 const std::string &win32_game_dir();
+struct OsChildProcess;
+void win32_set_process_launcher(OsChildProcess *(*launch)(const char *exe, const char *args));
 // Guest spelling shared by shell folder APIs; creation uses the write overlay.
 std::string shell_folder_guest_path(uint32_t csidl, bool create);
 

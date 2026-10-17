@@ -110,6 +110,17 @@ int os_spawn(const char *const argv[], int64_t *pid_out);
 // Waits for the child. exit_code receives the exit status, or 128 + signal on
 // POSIX when it died by a signal (so an abort reads as 134 everywhere); 0 or -1.
 int os_wait(int64_t pid, int *exit_code);
+typedef struct OsChildProcess OsChildProcess;
+enum {
+    OS_CHILD_ERROR = -1,
+    OS_CHILD_THREAD_UNSUPPORTED = -2,
+    OS_CHILD_RUNNING = 0,
+    OS_CHILD_EXITED = 1
+};
+OsChildProcess *os_child_spawn(const char *const argv[]);
+uint32_t os_child_id(OsChildProcess *child, int primary_thread);
+int os_child_poll(OsChildProcess *child, int primary_thread, uint32_t *exit_code);
+void os_child_close(OsChildProcess *child);
 
 // ---------------------------------------------------------------------------
 // Descriptors. Binary mode always; created files are mode 0644.

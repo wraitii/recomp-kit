@@ -77,6 +77,7 @@ uint32_t g_unhandled_filter = 0;
 uint32_t g_cmdline_addr = 0;
 uint32_t g_envblock_addr = 0;
 uint32_t g_envblockw_addr = 0;
+OsChildProcess *(*g_process_launcher)(const char *, const char *) = nullptr;
 bool g_tls_used[TLS_SLOTS] = {false};
 uint32_t g_process_heap = 0;
 
@@ -95,11 +96,14 @@ enum HKind {
     H_HEAP,
     H_MAPPING,
     H_MODULE,
-    H_STD
+    H_STD,
+    H_CHILD_PROCESS,
+    H_CHILD_THREAD
 };
 
 struct HObj {
     HKind kind = H_NONE;
+    std::shared_ptr<OsChildProcess> child;
     std::shared_ptr<OsDirectoryWatch> watch;
     std::string object_name; // Named events, mutexes and mappings share a kernel object.
     uint32_t references = 1;
@@ -292,6 +296,10 @@ void win32_invalidate_dir_cache() {
 
 const std::string &win32_game_dir() {
     return g_game_dir;
+}
+
+void win32_set_process_launcher(OsChildProcess *(*launch)(const char *, const char *)) {
+    g_process_launcher = launch;
 }
 
 // Called with the guest baton held, like the file shims. Reopening this path
@@ -2938,6 +2946,19 @@ bool object_available(uint32_t h, uint32_t tid) {
         return o->owner_tid == 0 || o->owner_tid == tid;
     case H_THREAD:
         return o->exit_code != 0x103; // signalled once it ends
+    case H_CHILD_PROCESS:
+    case H_CHILD_THREAD: {
+        uint32_t code;
+        int result = os_child_poll(o->child.get(), o->kind == H_CHILD_THREAD, &code);
+        if (result < 0) {
+            LOGW("WaitForSingleObject/WaitForMultipleObjects: child %s status %s",
+                 o->kind == H_CHILD_THREAD ? "primary thread" : "process",
+                 result == OS_CHILD_THREAD_UNSUPPORTED ? "is unsupported on this platform"
+                                                       : "query failed");
+            abort();
+        }
+        return result != 0;
+    }
     default:
         return true;
     }
@@ -3893,6 +3914,28 @@ void k_ExitThread(X86 *c) {
 // thread being polled make progress: on Windows the poller would simply be
 // descheduled here.
 void k_GetExitCodeThread(X86 *c) {
+    HObj *child = handle_get(arg(c, 0), H_CHILD_THREAD);
+    if (child) {
+        uint32_t out = arg(c, 1), code = 0x103;
+        if (!out || !gm_valid(out, 4)) {
+            set_last_error(87);
+            set_eax(c, 0);
+            return;
+        }
+        int result = os_child_poll(child->child.get(), 1, &code);
+        if (result == OS_CHILD_THREAD_UNSUPPORTED) {
+            LOGW("GetExitCodeThread: child primary-thread status is unsupported on this platform");
+            abort();
+        }
+        if (result < 0) {
+            set_last_error(ERROR_ACCESS_DENIED_);
+            set_eax(c, 0);
+            return;
+        }
+        wr32(out, code);
+        set_eax(c, 1);
+        return;
+    }
     HObj *o = handle_get(arg(c, 0), H_THREAD);
     uint32_t p = arg(c, 1);
     if (!o) {
@@ -5325,6 +5368,117 @@ void open_mutex_named(X86 *c, const std::string &name) {
     set_eax(c, 0);
 }
 
+void k_CreateProcessA(X86 *c) {
+    uint32_t startup = arg(c, 8), info = arg(c, 9);
+    if (!startup || !gm_valid(startup, 68) || rd32(startup) != 68 || !info || !gm_valid(info, 16) ||
+        (!arg(c, 0) && !arg(c, 1))) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    auto unsupported = [&](const char *what) {
+        LOGW("CreateProcessA: unsupported %s", what);
+        set_last_error(ERROR_CALL_NOT_IMPLEMENTED_);
+        set_eax(c, 0);
+    };
+    if (arg(c, 2) || arg(c, 3) || arg(c, 4) || arg(c, 5) || arg(c, 6) || rd32(startup + 44) ||
+        rd32(startup + 4) || rd32(startup + 8) || rd32(startup + 12) || rd16(startup + 50) ||
+        rd32(startup + 52)) {
+        unsupported("security attributes, inherited handles, creation flags, environment or "
+                    "startup options");
+        return;
+    }
+    std::string directory = arg(c, 7) ? gm_str(arg(c, 7)) : g_cur_dir;
+    if (lower(full_path_named(directory)) != lower(full_path_named(RECOMP_GUEST_ROOT))) {
+        unsupported("child working directory");
+        return;
+    }
+    std::string line = arg(c, 1) ? gm_str(arg(c, 1)) : gm_str(arg(c, 0));
+    size_t first = line.find_first_not_of(" \t"), end;
+    if (first == std::string::npos) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    std::string executable;
+    if (line[first] == '"') {
+        end = line.find('"', first + 1);
+        if (end == std::string::npos) {
+            set_last_error(87);
+            set_eax(c, 0);
+            return;
+        }
+        executable = line.substr(first + 1, end - first - 1);
+        ++end;
+    } else {
+        end = line.find_first_of(" \t", first);
+        if (end == std::string::npos)
+            end = line.size();
+        while (!arg(c, 0) && end < line.size() &&
+               lower(full_path_named(line.substr(first, end - first))) !=
+                   lower(module_file_name(0))) {
+            end = line.find_first_of(" \t", end + 1);
+            if (end == std::string::npos)
+                end = line.size();
+        }
+        executable = line.substr(first, end - first);
+    }
+    if (arg(c, 0))
+        executable = gm_str(arg(c, 0));
+    if (lower(full_path_named(executable)) != lower(module_file_name(0))) {
+        LOGW("CreateProcessA: executable is not the translated image: %s", executable.c_str());
+        set_last_error(193);
+        set_eax(c, 0);
+        return;
+    }
+    if (!g_process_launcher) {
+        unsupported("process creation in this host");
+        return;
+    }
+    size_t args = line.find_first_not_of(" \t", end);
+    std::string extra = args == std::string::npos ? "" : line.substr(args);
+    std::string host_exe = g_game_dir + "/" RECOMP_EXECUTABLE;
+    OsChildProcess *child = g_process_launcher(host_exe.c_str(), extra.c_str());
+    if (!child) {
+        LOGW("CreateProcessA: native child launch failed for %s", executable.c_str());
+        set_last_error(ERROR_ACCESS_DENIED_);
+        set_eax(c, 0);
+        return;
+    }
+    std::shared_ptr<OsChildProcess> owner(child, os_child_close);
+    uint32_t process = handle_new(H_CHILD_PROCESS), thread = handle_new(H_CHILD_THREAD);
+    handles()[process].child = handles()[thread].child = owner;
+    wr32(info, process);
+    wr32(info + 4, thread);
+    wr32(info + 8, os_child_id(child, 0));
+    wr32(info + 12, os_child_id(child, 1));
+    fprintf(stderr, "[recomp] CreateProcessA: relaunched translated image with arguments: %s\n",
+            extra.c_str());
+    set_eax(c, 1);
+}
+
+void k_GetExitCodeProcess(X86 *c) {
+    uint32_t out = arg(c, 1), code = 0x103;
+    HObj *process = handle_get(arg(c, 0), H_CHILD_PROCESS);
+    if (!out || !gm_valid(out, 4)) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    if (!process && arg(c, 0) != 0xffffffffu) {
+        set_last_error(ERROR_INVALID_HANDLE_);
+        set_eax(c, 0);
+        return;
+    }
+    if (process && os_child_poll(process->child.get(), 0, &code) < 0) {
+        set_last_error(ERROR_ACCESS_DENIED_);
+        set_eax(c, 0);
+        return;
+    }
+    wr32(out, code);
+    set_eax(c, 1);
+}
+
 void get_command_line(X86 *c) {
     if (!g_cmdline_addr) {
         // The CRT skips argv[0] before passing lpCmdLine to WinMain. Quote
@@ -5643,7 +5797,8 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "GetProcessAffinityMask", 3, k_GetProcessAffinityMask},
     {"KERNEL32.dll", "SetProcessAffinityMask", 2, k_SetProcessAffinityMask},
     {"KERNEL32.dll", "SetThreadAffinityMask", 2, k_SetThreadAffinityMask},
-    {"KERNEL32.dll", "CreateProcessA", 10, nullptr},
+    {"KERNEL32.dll", "CreateProcessA", 10, k_CreateProcessA},
+    {"KERNEL32.dll", "GetExitCodeProcess", 2, k_GetExitCodeProcess},
     {"KERNEL32.dll", "DebugBreak", 0, nullptr},
     {"KERNEL32.dll", "FatalAppExitA", 2, nullptr},
     {"KERNEL32.dll", "GetDateFormatA", 6, nullptr},

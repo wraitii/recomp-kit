@@ -49,6 +49,14 @@ from `0x00040004`, pseudo modules from `0x60000000`.
 `eflags_misc` `0x202` so `PUSHFD` reads `0x202`. The CRT's `__ftol`,
 `__ctrlfp` and `__statfp` depend on those x87 values.
 
+`CreateProcessA` supports restarting the translated image through the windowed
+host, preserving the installation, inherited profile environment and guest
+arguments (`--guest-args`). Other executables, custom environments, working
+directories, security attributes and startup/creation flags fail explicitly.
+Returned process handles support close, waits and exit-code queries. Child
+primary-thread handles can be closed; status/waits on POSIX fail with named
+diagnostics because host process exit does not establish guest thread exit.
+
 ## The shim contract
 
 ```c
