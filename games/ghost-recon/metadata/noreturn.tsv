@@ -102,6 +102,7 @@ address	kind
 006f270c	call
 006f2eef	call
 006f3693	function
+006f3e17	call
 006f3e38	call
 006f3e1c	function
 006f3e5e	call
@@ -109,11 +110,13 @@ address	kind
 006f3e65	function
 006f57ce	call
 006f57f2	call
+006f5829	call
 006f5792	function
 006f5847	call
 006f5858	call
 006f582e	function
 006f5d7b	call
+006f5dad	call
 006f672b	call
 006f7a73	call
 006f8cd6	function
