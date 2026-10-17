@@ -55,11 +55,12 @@ class Functions:
             return None
         if addr not in self.stack_pops:
             try:
-                fir = self.program.body(addr).ir
+                body = self.program.body(addr)
             except Exception:
                 self.stack_pops[addr] = None
             else:
-                tail = bool(fir.import_tails) or any(op.opc == "TAIL" for ins in fir.insns for op in ins.ops)
+                fir = body.ir
+                tail = bool(fir.import_tails or body.exits) or any(op.opc == "TAIL" for ins in fir.insns for op in ins.ops)
                 self.stack_pops[addr] = stack_pops(fir, tail)
         return self.stack_pops[addr]
 
@@ -142,7 +143,7 @@ def _preserved(functions, lifted, abi):
     preserved, assumed = {addr: frozenset() for addr in lifted}, {}
 
     def preserves(target, name):
-        if target is None:
+        if target is None or target not in lifted:
             return abi and name in CALLEE_SAVED
         return name in preserved.get(target, ())
 

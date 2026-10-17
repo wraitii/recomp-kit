@@ -59,12 +59,15 @@ def function_values(program, addr):
     if addr not in program.functions:
         raise TranslateError("%08x: not a function in the code map" % addr)
     try:
-        fir = program.body(addr).ir
+        body = program.body(addr)
     except (TranslateError, LiftError) as error:
         raise TranslateError("%08x: body cannot be built: %s" % (addr, error)) from error
+    fir = body.ir
+    for k, target in body.exits:
+        fir.exits.setdefault(k, []).append(target)
     lanes = _register_lanes(program.lifter)
     index = {ins.addr: k for k, ins in enumerate(fir.insns)}
-    tail_exit = bool(fir.import_tails) or any(op.opc == "TAIL" for ins in fir.insns for op in ins.ops)
+    tail_exit = bool(fir.import_tails or fir.exits) or any(op.opc == "TAIL" for ins in fir.insns for op in ins.ops)
     pops = stack_pops(fir, tail_exit)
     try:
         ssa = _build(fir, program.lifter, lanes)
@@ -114,8 +117,9 @@ def absolute_call_targets(fv):
 
 def direct_call_sites(fv):
     ssa = _require_ssa(fv)
-    return sorted((DirectCall(site, value.data) for site, value in _calls(ssa) if value.opc == "CALL"),
-                  key=lambda record: record.site_addr)
+    calls = [DirectCall(site, value.data) for site, value in _calls(ssa) if value.opc == "CALL"]
+    calls += [DirectCall(source.insn.addr, _whole(ssa, value.args[0]).data) for source, value in _tails(ssa)]
+    return sorted(calls, key=lambda record: record.site_addr)
 
 
 def memory_accesses(fv):
@@ -184,6 +188,8 @@ def call_register_lanes(fv):
     records = [CallRegisters(block.insn.addr, value.opc, _gpr_lanes(fv, block.snapshots[value.id]),
                              _gpr_lanes(fv, block.reloads[value.id]), value)
                for block, value in _call_ops(ssa)]
+    records += [CallRegisters(source.insn.addr, value.opc, _gpr_lanes(fv, source.exit), _gpr_lanes(fv, {}), value)
+                for source, value in _tails(ssa)]
     return sorted(records, key=lambda record: record.site_addr)
 
 
@@ -229,7 +235,7 @@ def _register_lanes(lifter):
 
 
 def _build(fir, lifter, lanes):
-    cgi = codegen_ir(fir, lifter)
+    cgi = codegen_ir(fir, lifter, {target for targets in fir.exits.values() for target in targets})
     targets = {op.ins[0][1] for ins in cgi.insns for op in ins.ops
                if op.opc == "CALL" and op.ins[0][0] == "ram"}
     return build(cgi, register_groups=list(lanes.values()), call_targets=targets,
@@ -247,6 +253,18 @@ def _call_ops(ssa):
         for value in block.ops:
             if value.opc in ("CALL", "CALLIND"):
                 yield block, value
+
+
+def _tails(ssa):
+    for block in ssa.blocks.values():
+        for value in block.ops:
+            if value.opc == "TAIL":
+                target = block.insn.addr
+                sources = [source for source in ssa.blocks.values() if source is not block and any(
+                    op.opc in ("BRANCH", "CBRANCH") and op.ins and op.ins[0][:2] == ("ram", target)
+                    for op in source.insn.ops)]
+                for source in sources or [block]:
+                    yield source, value
 
 
 def _calls(ssa):

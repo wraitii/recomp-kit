@@ -59,7 +59,7 @@ def main():
     parser.add_argument("--timeout", type=float, default=1800)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--explain", type=lambda v: int(v, 16), action="append", default=[])
-    parser.add_argument("--no-abi", action="store_true", help="do not assume indirect callees preserve EBX/ESI/EDI/EBP")
+    parser.add_argument("--no-abi", action="store_true", help="do not assume indirect or unlifted callees preserve EBX/ESI/EDI/EBP")
     args = parser.parse_args()
     game_config.resolve_game_args(args)
     program = Program(Settings(game_config.load(args.game_dir, args.build_root), None, 1, None))

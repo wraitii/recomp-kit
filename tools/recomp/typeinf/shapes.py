@@ -1,5 +1,4 @@
 from collections import defaultdict, deque
-from itertools import combinations
 
 from .values import MAX_FIELD_OFFSET
 
@@ -131,7 +130,10 @@ def conflicts(shapes):
 def _overlapping(fields):
     extents = sorted({(offset, size) for offset, field in fields.items() for size in field["sizes"]})
     offsets = set()
-    for (first, first_size), (second, second_size) in combinations(extents, 2):
-        if first < second < first + first_size < second + second_size:
-            offsets.update((first, second))
+    for k, (first, first_size) in enumerate(extents):
+        for second, second_size in extents[k + 1:]:
+            if second >= first + first_size:
+                break
+            if first < second and first + first_size < second + second_size:
+                offsets.update((first, second))
     return sorted(offsets)
