@@ -14,7 +14,7 @@ guest_root = 'C:\4x4 Evolution 2'
 [translate]
 code_map = "metadata"
 entry_points = [0x0060ffed, 0x00610022]
-native = { header = "native/frame_pacing.h", sources = ["native/frame_pacing.cpp"] }
+native = { header = "native/frame_pacing.h", sources = ["native/frame_pacing.cpp", "native/input.cpp"] }
 
 [render]
 d3d8_wgpu = true
