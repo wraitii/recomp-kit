@@ -3,7 +3,7 @@
 from collections import namedtuple
 
 from program import PE, TranslateError
-from x86_frontend import STRING_MNEM, MSVC_SEH_PROLOG, MSVC_SEH_EPILOG
+from x86_frontend import STRING_MNEM, MSVC_SEH_PROLOG, MSVC_SEH_EPILOG, MSVC_EH3_FRAME, MSVC_EH3_HANDLER
 
 
 DecodeOperand = namedtuple(
@@ -109,6 +109,24 @@ class Image(PE):
         info = self.rd32(handler + 1)
         return (self.rd32(info) in (0x19930520, 0x19930521, 0x19930522)
                 and self.rd32(info + 12) == 0)
+
+    def msvc_eh3_finally_only(self, va, levels):
+        """Does va open an __except_handler3 frame whose scopes at `levels`, and those
+        enclosing them, have no filter? The handler then only runs __finally blocks
+        while unwinding and never resumes the frame."""
+        if (levels is None or not self.code_matches(va, MSVC_EH3_FRAME)
+                or not self.code_matches(self.rd32(va + 11), MSVC_EH3_HANDLER)):
+            return False
+        scope, seen, todo = self.rd32(va + 6), set(), list(levels)
+        while todo:
+            level = todo.pop()
+            if level == 0xffffffff or level in seen:
+                continue
+            seen.add(level)
+            if level >= 0x100 or self.rd32(scope + 12 * level + 4) != 0:
+                return False
+            todo.append(self.rd32(scope + 12 * level))
+        return True
 
 
 

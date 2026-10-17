@@ -431,7 +431,12 @@ class Recovery:
         groups = defaultdict(list)
         owned = {entry for _, _, entry in self.function_ranges}
         window = previous = None
+        flows_into = None
         for at, ins in sorted(self.instructions.items()):
+            if (at != flows_into and at not in self.seeds and self.function_of(at) is None
+                    and set(ins.bytes) <= {0x90, 0xcc}):
+                continue
+            flows_into = None if ins.group(capstone.CS_GRP_RET) or ins.mnemonic in ("jmp", "ljmp", "int3", "ud2") else at + ins.size
             owner = self.function_of(at)
             if owner is None and previous and previous[0] == at and previous[1] in owned and at not in self.roots:
                 owner = previous[1]

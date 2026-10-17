@@ -294,7 +294,7 @@ def write_table(out, entry_names, functions, call_returns, private_masks=None, k
             fh.write("    0x%08xu,\n" % a)
         fh.write("};\nstatic const uint32_t recomp_call_return_count = %d;\n\n" % len(call_returns))
         rows = sorted(regions or (), key=lambda row: row[0])
-        for _start, _end, symbol in rows:
+        for symbol in sorted({symbol for _start, _end, symbol in rows}):
             fh.write("void %s(X86 *c, uint32_t target);\n" % symbol)
         fh.write("typedef struct {\n    uint32_t start;\n    uint32_t end;\n    void (*fn)(X86 *, uint32_t);\n} RecompRegion;\n")
         fh.write("static const RecompRegion recomp_regions[] = {\n")

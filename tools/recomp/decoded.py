@@ -367,7 +367,7 @@ class Translator(ControlFlow):
             # user-mode image are the signature - and refusing the image over
             # bytes nothing executes helps nobody. Reaching one is still fatal,
             # loudly and with its address, which is the property that matters.
-            if not self.allow_unmodelled:
+            if not self.traps_unmodelled(fn):
                 raise TranslateError("%08x %s: %s" % (ins.addr, ins.raw.split("  ", 1)[1], e))
             self.unmodelled.append((ins.addr, "%s: %s" % (ins.raw.split("  ", 1)[1], e)))
             body = ["recomp_unmodelled(c, 0x%08xu);" % ins.addr]
@@ -745,7 +745,7 @@ class Translator(ControlFlow):
                     self.call_targets.add(t)
                     L.append("CALL_FN(%08x);" % t)
                 else:
-                    self.reject_offimage_call(t)
+                    self.reject_offimage_call(fn, t)
                     L.append("recomp_call(c, %s);" % hexlit(t))
                 # An SSA callee may return with a pending flags descriptor; the
                 # decoded caller reads the guest's fields directly.
@@ -1026,7 +1026,10 @@ class Translator(ControlFlow):
 
     # ---- control-flow helpers -------------------------------------------
 
-    def reject_offimage_call(self, t):
+    def traps_unmodelled(self, fn):
+        return self.allow_unmodelled or fn.addr in getattr(self, "provisional", ())
+
+    def reject_offimage_call(self, fn, t):
         """A direct CALL whose literal target is not in the image at all.
 
         No such instruction can be real: the bytes were decoded out of step
@@ -1041,7 +1044,7 @@ class Translator(ControlFlow):
 
         Only a call. A conditional jump out of the image is how a bad
         speculative block gives itself away."""
-        if not self.allow_unmodelled:
+        if not self.traps_unmodelled(fn):
             return
         if self.image.end <= self.image.base:
             return  # a translator built without bytes, as the unit tests are

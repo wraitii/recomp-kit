@@ -353,6 +353,88 @@ MSVC_SEH_PROLOG = (b"\x68" + b"\0" * 4 + bytes.fromhex(
     "c745fcffffffff8945f88d45f064a300000000c3"))
 MSVC_SEH_PROLOG = tuple(None if 1 <= i <= 4 else b for i, b in enumerate(MSVC_SEH_PROLOG))
 MSVC_SEH_EPILOG = tuple(bytes.fromhex("8b4df064890d00000000595f5e5bc951c3"))
+# PUSH EBP; MOV EBP,ESP; PUSH -1; PUSH scope; PUSH handler; MOV EAX,FS:[0]; PUSH EAX; MOV FS:[0],ESP
+MSVC_EH3_FRAME = tuple(None if 6 <= i < 10 or 11 <= i < 15 else b for i, b in enumerate(bytes.fromhex(
+    "558bec6aff68000000006800000000" "64a100000000" "50" "648925" "00000000")))
+MSVC_EH3_HANDLER = tuple(bytes.fromhex("558bec83ec0853565755fc8b5d0c8b4508f74004060000000f85"))
+
+
+EXPLICIT_DESTINATION = frozenset(("MOV", "LEA", "ADD", "SUB", "AND", "OR", "XOR", "INC", "DEC",
+                                  "NEG", "NOT", "SHL", "SHR", "SAR", "MOVZX", "MOVSX", "POP",
+                                  "PUSH", "CMP", "TEST", "JMP", "NOP")) | JCC - {"LOOP"}
+
+
+def register_constants(fn, successors):
+    """Constant 32-bit registers before each instruction, joined over the body's flow.
+
+    Only XOR r,r and MOV r,imm create constants. Instructions outside
+    EXPLICIT_DESTINATION and x87 forget every register; a direct call forgets
+    EAX, ECX and EDX and keeps the callee-saved registers the compiled caller
+    relies on."""
+    before = {fn.index[fn.addr]: {}}
+    work = [fn.index[fn.addr]]
+    while work:
+        i = work.pop()
+        ins, state = fn.insns[i], dict(before[i])
+        mnem = ins.mnem
+        if mnem == "CALL":
+            for reg in (R_EAX, R_ECX, R_EDX):
+                state.pop(reg, None)
+        elif mnem in EXPLICIT_DESTINATION or mnem.startswith("F"):
+            try:
+                ops = [parse_operand(o) for o in ins.ops]
+            except TranslateError:
+                ops = None
+            if ops is None:
+                state = {}
+            elif ops and ops[0].kind == "reg" and mnem not in ("PUSH", "CMP", "TEST"):
+                reg = ops[0].reg
+                state.pop(reg, None)
+                if ops[0].size == 32 and len(ops) == 2:
+                    if mnem == "XOR" and ops[1].kind == "reg" and ops[1].reg == reg and ops[1].size == 32:
+                        state[reg] = 0
+                    elif mnem == "MOV" and ops[1].kind == "imm":
+                        state[reg] = ops[1].imm & 0xffffffff
+        else:
+            state = {}
+        for j in successors(fn, i):
+            joined = state if j not in before else {r: v for r, v in before[j].items() if state.get(r) == v}
+            if before.get(j) != joined:
+                before[j] = joined
+                work.append(j)
+    return before
+
+
+def eh3_trylevels(fn, successors):
+    """The constant trylevels an EBP-framed EH3 body stores to [EBP-4]; None if another write reaches it."""
+    levels, constants = set(), None
+    for i, ins in enumerate(fn.insns):
+        if not ins.ops or ins.mnem in ("CMP", "TEST", "PUSH"):
+            continue
+        try:
+            dst = parse_operand(ins.ops[0])
+            src = parse_operand(ins.ops[1]) if len(ins.ops) == 2 else None
+        except TranslateError:
+            continue
+        if (dst.kind != "mem" or dst.base != R_EBP or dst.index is not None or dst.seg is not None
+                or dst.disp & 0xffffffff != 0xfffffffc):
+            continue
+        value = src.imm & 0xffffffff if src is not None and src.kind == "imm" else None
+        if ins.mnem == "MOV" and src is not None and src.kind == "reg" and src.size == 32:
+            constants = constants or register_constants(fn, successors)
+            value = constants.get(i, {}).get(src.reg)
+            if value is None:
+                return None
+            levels.add(value)
+        elif ins.mnem == "MOV" and value is not None:
+            levels.add(value)
+        elif ins.mnem == "AND" and value == 0:
+            levels.add(0)
+        elif ins.mnem == "OR" and value == 0xffffffff:
+            levels.add(value)
+        else:
+            return None
+    return levels
 
 
 class ControlFlow(object):

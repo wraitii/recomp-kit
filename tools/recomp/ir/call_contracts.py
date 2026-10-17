@@ -503,11 +503,11 @@ def summarize(p, callee_lookup, cells=None, indirect=None, effects=None):
                     frozenset(f for f in FIELDS if writes & bits.field_bits[f]), p.preserves)
 
 
-def cfg_is_closed(fir):
+def cfg_is_closed(fir, ends=()):
     """False for a body whose control can leave without a modeled edge.
 
     Tail jumps, computed jumps without a decoded table and calls with no fallthrough are
-    conservatively outside this model.
+    conservatively outside this model, except calls in `ends`, which end their path.
     """
     for i, ins in enumerate(fir.insns):
         mnem = ins.mnem.upper()
@@ -521,7 +521,7 @@ def cfg_is_closed(fir):
             if not succ:
                 return False
         elif mnem == "CALL":
-            if not succ:
+            if not succ and i not in ends:
                 return False
         elif not succ and not _is_return(ins):
             return False

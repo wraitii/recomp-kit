@@ -68,13 +68,11 @@ class Context(object):
         self.program = Program(settings, self.image, discovered_rows(settings))
         program = self.program
         self.decoded_only = program.metadata.get("emitter") == "decoded"
-        if program.provisional and not settings.allow_unmodelled:
-            raise TranslateError("%d discovered functions are provisional and require --allow-unmodelled with an explicit reason"
-                                 % len(program.provisional))
+        if program.metadata.get("provenance") == "provisional-sweep" and not settings.allow_unmodelled:
+            raise TranslateError("provisional code maps require --allow-unmodelled with an explicit reason")
         self.trap_instructions = {int(at, 16) for at in program.metadata.get("trap_instructions", "").split(",") if at}
         if self.decoded_only:
             settings.call_contracts = False
-            self.image.allow_unmodelled = settings.allow_unmodelled
         self.entries = program.entries()
         self.interior = program.interior_entries()
         self.tr = decoded.Translator(self.image, set(self.entries), settings.allow_unmodelled)
@@ -90,6 +88,7 @@ class Context(object):
     def load(self, addr):
         """The decoded function, indexed, with the entries the map gives it."""
         image = self.image
+        image.allow_unmodelled = (self.decoded_only and self.settings.allow_unmodelled) or addr in self.program.provisional
         insns = []
         for start, size, lengths in self.program.functions[addr].spans:
             lengths = lengths or code_map.linear_lengths(self.lifter, image, start, size)
@@ -152,17 +151,17 @@ def _scan(task):
         site = (bool(fn.seh_sites) or any(fn.insns[i].mnem == "POP" for i in fn.seh_restores)
                 or tr.image.msvc_seh_epilog(addr) or any(map(tr.seh_except_entry, fn.insns)))
         prepared, mode_prepared = None, None
-        if not (escapes or fn.pushed_continuations or fn.return_jumps
-                or fn.dead_addrs or addr in tr.noreturn_callees):
+        if not (escapes or fn.pushed_continuations or fn.return_jumps or addr in tr.noreturn_callees):
             try:
                 fir = ctx.artifacts.lifted(tr, ctx.lifter, fn)
-                prepared = call_contracts.prepare(fir, image=ctx.image) if not (entries or site) else None
+                prepared = (call_contracts.prepare(fir, image=ctx.image)
+                            if not (entries or site or fn.dead_addrs) else None)
                 fir.entries = tuple(entries)
                 mode_prepared = x87_mode.prepare(fir, ctx.image)
             except (LiftError, RecursionError):
                 prepared = None
             else:
-                prepared = None if site else prepared or False
+                prepared = None if site or fn.dead_addrs else prepared or False
         x87_count, writers = 0, []
         for ins in fn.insns:
             mnem = ins.mnem.upper().removeprefix("WAIT ")
@@ -314,8 +313,16 @@ def _emit(task):
         if lines is None:
             lines = tr.translate(fn, entries)
             deps = {Declaration("entry", t) for t in tr.call_targets}
-            live = [ins.addr for ins in fn.insns if ins.addr not in fn.dead_addrs]
-            region = (min(live), max(live) + 1, "region_%08x" % addr)
+            runs = []
+            for i, ins in enumerate(fn.insns):
+                if ins.addr in fn.dead_addrs:
+                    continue
+                end = fn.fallthrough[i] or ins.addr + 1
+                if runs and runs[-1][1] == ins.addr:
+                    runs[-1][1] = end
+                else:
+                    runs.append([ins.addr, end])
+            region = tuple((start, end, "region_%08x" % addr) for start, end in runs)
         out.append(EmissionResult(addr, lines, re.sub(r"^[0-9a-f]{8}: ", "", reason) if reason else None,
                     tuple(tr.unmodelled), frozenset(requests), tuple(decisions), frozenset(deps), region))
     return out
@@ -521,7 +528,7 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
         entry_verification = {row["function"]: x87_facts.EntryContract.from_row(row)
                               for row in settings.x87_entry_contracts if row.get("verify")}
         mode_summaries = x87_mode.summarize(mode_prepared, mode_opaque, indirect=indirect_targets,
-                                            effects=settings.call_effects)
+                                            effects=settings.call_effects, noreturn=ctx.program.noreturn)
         x87_counts = {addr: row.x87_count for addr, row in scanned.items()}
         mode_exposure = x87_mode.exposure_report(mode_prepared, calls, mode_opaque, x87_counts,
                                                 {addr: row.writers for addr, row in scanned.items()})
@@ -637,7 +644,7 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
         output.write_module_table(args.out, entry_names, symbols, call_returns, settings.module)
     else:
         output.write_table(args.out, entry_names, symbols, call_returns, private_masks, known_modes,
-                           [row.region for row in results.values() if row.region])
+                           [run for row in results.values() if row.region for run in row.region])
     output.write_symbols(
         args.out, str(settings.exe), ctx.image.base, symbols, settings.curated)
     output.write_call_facts(args.out, {ctx.image.insn_end(site, "CALL"): targets

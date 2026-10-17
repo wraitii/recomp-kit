@@ -30,8 +30,10 @@ def indirect_jump(ins):
 def prepare(fir, image=None):
     """Prepare closed byte-backed IR; secondary entries contribute unknown facts.
 
-    SEH bodies qualify only when every frame they establish is unwind-only:
-    an exception then never resumes here, so normal returns stay sound.
+    SEH bodies qualify only when every frame they establish is unwind-only
+    (`FunctionIR.seh_unwind_only`): an exception then never resumes here, so
+    normal returns stay sound.
+    A call that never returns ends its path without reaching a return.
     """
     tails = {i: None for i, ins in enumerate(fir.insns) if not fir.succ[i] and indirect_jump(ins)}
     for i, targets in fir.exits.items():
@@ -48,14 +50,13 @@ def prepare(fir, image=None):
         tails[i] = literal[0]
     if not fir.insns or any(not ins.raw for ins in fir.insns):
         return None
-    if fir.seh and (image is None or any(set(kinds) - {"enter", "leave"} for kinds in fir.seh.values())
-                    or not all(image.msvc_unwind_only(fir.seh_handlers.get(i))
-                               for i, kinds in fir.seh.items() if "enter" in kinds)):
+    if fir.seh and (any(set(kinds) - {"enter", "leave"} for kinds in fir.seh.values())
+                    or not all(i in fir.seh_unwind_only for i, kinds in fir.seh.items() if "enter" in kinds)):
         return None
-    if not tails and not cfg_is_closed(fir):
+    if not tails and not cfg_is_closed(fir, fir.noreturn):
         return None
     for i, ins in enumerate(fir.insns):
-        if not fir.succ[i] and i not in tails and instruction_mnemonic(ins) != "RET":
+        if not fir.succ[i] and i not in tails and i not in fir.noreturn and instruction_mnemonic(ins) != "RET":
             return None
     entry = next((i for i, ins in enumerate(fir.insns) if ins.addr == fir.addr), None)
     if entry is None:
@@ -120,7 +121,9 @@ def _lost_mask(before, after):
 
 
 def _call_summary(target, summaries, opaque_targets, recursive):
-    if target is None or target in opaque_targets or target in recursive:
+    if target is None or target in recursive:
+        return None
+    if target in opaque_targets and summaries.get(target, UNKNOWN_SUMMARY) == UNKNOWN_SUMMARY:
         return None
     return summaries.get(target)
 
@@ -149,7 +152,8 @@ def _configured_summary(value):
 
 
 def _run(prepared, summaries, opaque_targets, recursive=frozenset(),
-         initial=ENTRY, boundaries=None, indirect=None, call_effects=None):
+         initial=ENTRY, boundaries=None, indirect=None, call_effects=None, roots=None):
+    roots = prepared.entries if roots is None else roots
     boundaries = boundaries or {}
     indirect = indirect or {}
     call_effects = call_effects or EMPTY_EFFECTS
@@ -181,15 +185,15 @@ def _run(prepared, summaries, opaque_targets, recursive=frozenset(),
     call_sites = {i: site for i, site, _target in prepared.calls}
     incoming, outgoing = {}, {}
     call_facts, losses, loss_keys, gaps = {}, [], set(), []
-    work = list(prepared.entries)
+    work = list(roots)
     queued = set(work)
     while work:
         i = work.pop()
         queued.discard(i)
         predecessors = [edge_fact(p, i) for p in prepared.preds[i] if p in outgoing]
-        if i == prepared.entry:
+        if i == roots[0]:
             predecessors.append(initial)
-        elif i in prepared.entries:
+        elif i in roots:
             predecessors.append(UNKNOWN)
         state = join(predecessors)
         if incoming.get(i) == state and i in outgoing:
@@ -229,6 +233,8 @@ def _run(prepared, summaries, opaque_targets, recursive=frozenset(),
             call_facts[site] = state
             summary = call_summary(i, target)
             unresolved = CW_PC_RC & ~(summary.preserved_mask | summary.known_mask) if summary else CW_PC_RC
+            if not prepared.succ[i] and i not in prepared.returns:
+                unresolved, summary = 0, ReturnSummary(CW_MASK, 0, 0)
             if unresolved:
                 gaps.append({"site": "%08x" % site,
                              "target": None if target is None else "%08x" % target,
@@ -281,37 +287,51 @@ def _summary(fact):
     return ReturnSummary(fact.entry_mask, fact.known_mask, fact.known_value)
 
 
-def summarize(prepared_by_addr, opaque_targets=(), boundaries=None, indirect=None, effects=None):
-    """Prove return relations, including induction over finite recursive returns."""
+def summarize(prepared_by_addr, opaque_targets=(), boundaries=None, indirect=None, effects=None, noreturn=()):
+    """Prove return relations, including induction over finite recursive returns.
+
+    A call enters at one entry, so each entry's relation follows only the paths
+    from it; calls to a secondary entry use that entry's own relation. An entry
+    with no reachable return, or a function the code map marks noreturn and
+    whose body is not analyzed, never hands control back, so it preserves vacuously.
+    """
     opaque_targets = frozenset(opaque_targets)
     indirect = indirect or {}
     summaries = {addr: UNKNOWN_SUMMARY for addr, body in prepared_by_addr.items()
                  if body is None or addr in opaque_targets}
     analyzable = {addr: body for addr, body in prepared_by_addr.items()
                   if body is not None and addr not in opaque_targets}
+    summaries.update((addr, ReturnSummary(CW_MASK, 0, 0)) for addr in noreturn if addr not in analyzable)
+
+    owners = {body.sites[i]: addr for addr, body in analyzable.items() for i in body.entries
+              if i != body.entry and body.sites[i] not in prepared_by_addr}
 
     def callees(body):
         for _, site, target in body.calls:
             if target is not None:
-                yield target
+                yield owners.get(target, target)
             elif site in indirect:
-                yield from indirect[site][1]
+                yield from (owners.get(t, t) for t in indirect[site][1])
     targets = {addr: list(callees(p)) for addr, p in analyzable.items()}
     components = call_graph(sorted(analyzable), lambda addr: targets.get(addr, ()))
     for component in components:
         recursive = len(component) > 1 or any(addr in targets.get(addr, ()) for addr in component)
+        entries = [(addr, i) for addr in component for i in analyzable[addr].entries
+                   if i == analyzable[addr].entry or analyzable[addr].sites[i] in owners]
         if recursive:
-            for addr in component:
-                summaries[addr] = ReturnSummary(CW_MASK, 0, 0)
+            for addr, i in entries:
+                summaries[analyzable[addr].sites[i]] = ReturnSummary(CW_MASK, 0, 0)
         changed = True
         while changed:
             changed = False
-            for addr in component:
+            for addr, i in entries:
                 result = _run(analyzable[addr], summaries, opaque_targets, boundaries=boundaries,
-                              indirect=indirect, call_effects=effects)
-                summary = _summary(result.returns)
-                if summaries.get(addr) != summary:
-                    summaries[addr] = summary
+                              indirect=indirect, call_effects=effects, roots=(i,))
+                body = analyzable[addr]
+                returned = any(body.sites[r] in result.sites for r in body.returns)
+                summary = _summary(result.returns) if returned else ReturnSummary(CW_MASK, 0, 0)
+                if summaries.get(analyzable[addr].sites[i]) != summary:
+                    summaries[analyzable[addr].sites[i]] = summary
                     changed = True
             if not recursive:
                 break

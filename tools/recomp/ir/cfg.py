@@ -12,7 +12,7 @@ class FunctionIR(object):
 
     def __init__(self, addr, insns, succ, tables=None, exits=None, entries=(),
                  noreturn=None, seh=None, language=X86_32.language, import_tails=None,
-                 seh_handlers=None):
+                 seh_handlers=None, seh_unwind_only=frozenset()):
         self.addr = addr
         self.language = language
         #: Other instruction addresses generated code can enter at, with the
@@ -31,6 +31,9 @@ class FunctionIR(object):
         self.seh = seh or {}
         #: SEH `enter` index -> the handler its registration record names.
         self.seh_handlers = seh_handlers or {}
+        #: SEH `enter` indices whose frame never resumes this body: its handler
+        #: only unwinds (C++ without try blocks, EH3 with __finally scopes only).
+        self.seh_unwind_only = seh_unwind_only
         self.import_tails = import_tails or {}
         #: Indices of computed jumps whose complete target set is `succ[i]`:
         #: decoded jump tables with every case inside this body. Any other

@@ -1,6 +1,7 @@
 """Construct raw function IR from decoded boundaries and structural flow facts."""
 from ir.cfg import FunctionIR
 from ir.lift import LiftError
+from x86_frontend import MSVC_EH3_FRAME, eh3_trylevels
 
 
 def function_ir(tr, lifter, fn):
@@ -25,8 +26,12 @@ def function_ir(tr, lifter, fn):
         if tr.never_returns(ins):
             noreturn[i] = insns[i].addr + insns[i].length
             succ[i] = []
+    eh3 = fn.addr + len(MSVC_EH3_FRAME) - 7 if image.msvc_eh3_finally_only(fn.addr, eh3_trylevels(fn, tr.successors)) else None
+    unwind_only = frozenset(i for i, handler in fn.seh_sites.items()
+                            if image.msvc_unwind_only(handler) or fn.insns[i].addr == eh3)
     return FunctionIR(fn.addr, insns, succ, table_jumps(tr, fn), external_exits(tr, fn),
                       noreturn=noreturn, seh=tr.seh_effects(fn), seh_handlers=dict(fn.seh_sites),
+                      seh_unwind_only=unwind_only,
                       language=lifter.language,
                       import_tails={i: slot for i, ins in enumerate(fn.insns)
                                     if (slot := tr.import_tail_slot(ins)) is not None})
