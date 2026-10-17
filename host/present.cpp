@@ -258,7 +258,7 @@ extern "C" void host_display_present_gpu2d(uint32_t id, int w, int h) {
 }
 namespace {
 void present_argb(const uint32_t *argb, int w, int h, bool viewport, int32_t origin_x,
-                  int32_t origin_y) {
+                  int32_t origin_y, uint32_t style) {
     if (!argb || w <= 0 || h <= 0)
         return;
     if (!viewport && (g_mode_w != w || g_mode_h != h || g_mode_bpp != 32))
@@ -279,7 +279,7 @@ void present_argb(const uint32_t *argb, int w, int h, bool viewport, int32_t ori
     }
     host_page_overlay(nullptr, w, h, 32, w * 4, nullptr);
     if (viewport)
-        host_present_stage_rgba_viewport(rgba.data(), w, h, origin_x, origin_y);
+        host_present_stage_rgba_viewport(rgba.data(), w, h, origin_x, origin_y, style);
     else
         host_present_stage_rgba(rgba.data(), w, h);
     host_present_seal_window();
@@ -287,12 +287,13 @@ void present_argb(const uint32_t *argb, int w, int h, bool viewport, int32_t ori
 } // namespace
 
 extern "C" void host_display_present_window(const uint32_t *argb, int w, int h) {
-    present_argb(argb, w, h, false, 0, 0);
+    present_argb(argb, w, h, false, 0, 0, 0);
 }
 
 extern "C" void host_display_present_window_viewport(const uint32_t *argb, int w, int h,
-                                                     int32_t origin_x, int32_t origin_y) {
-    present_argb(argb, w, h, true, origin_x, origin_y);
+                                                     int32_t origin_x, int32_t origin_y,
+                                                     uint32_t style) {
+    present_argb(argb, w, h, true, origin_x, origin_y, style);
 }
 
 // Same bookkeeping and owned snapshot as the ARGB seam, without channel

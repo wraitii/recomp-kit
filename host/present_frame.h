@@ -54,6 +54,7 @@ struct Frame {
     bool released = false, dropped = false, success = true, repeat = false, staged_pixels = false;
     bool completion_fallback = false;
     bool viewport = false;
+    uint32_t viewport_style = 0;
     int32_t viewport_x = 0, viewport_y = 0;
     double presented_ts = 0, gpu_ts = 0, submitted_ts = 0, sealed_ts = 0, gpu_ms = 0;
     double acknowledgement_deadline = 0;
@@ -75,4 +76,5 @@ struct Message {
     void *surface = nullptr;
     int w = 640, h = 480;
     bool install = false;
+    int viewport = -1;
 };

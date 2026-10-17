@@ -1188,12 +1188,20 @@ void collect_surfaces(uint32_t parent, std::vector<user32::Window *> &out) {
         collect_surfaces(hwnd, out);
     }
 }
-std::vector<user32::Window *> visible_surfaces() {
+std::vector<user32::Window *> visible_surfaces(uint32_t root = 0) {
     std::vector<user32::Window *> result;
-    collect_surfaces(0, result);
+    if (root) {
+        auto *window = user32::find_window(root);
+        if (!window || !window->visible)
+            return result;
+        if (!window->surface.argb.empty())
+            result.push_back(window);
+    }
+    collect_surfaces(root, result);
     return result;
 }
-bool dialog_viewport(int screen_w, int screen_h, int32_t *x, int32_t *y, int *w, int *h) {
+bool dialog_viewport(int screen_w, int screen_h, int32_t *x, int32_t *y, int *w, int *h,
+                     uint32_t *style, uint32_t *hwnd) {
     if (presented_surface().owner || ddraw_gdi_primary_active() || mf_owns_the_screen())
         return false;
     const auto order = user32::window_z_order(0);
@@ -1201,6 +1209,7 @@ bool dialog_viewport(int screen_w, int screen_h, int32_t *x, int32_t *y, int *w,
         auto *window = user32::find_window(*it);
         if (!window || !window->visible)
             continue;
+        *hwnd = *it;
         if (!user32::is_dialog(*it))
             return false;
         const int64_t left = std::max<int64_t>(0, window->x);
@@ -1213,12 +1222,14 @@ bool dialog_viewport(int screen_w, int screen_h, int32_t *x, int32_t *y, int *w,
         *y = int32_t(top);
         *w = int(right - left);
         *h = int(bottom - top);
+        *style = window->style;
         return true;
     }
     return false;
 }
 } // namespace
-static void composite_windows(uint32_t *argb, int w, int h, int32_t origin_x, int32_t origin_y) {
+static void composite_windows(uint32_t *argb, int w, int h, int32_t origin_x, int32_t origin_y,
+                              bool include_screen = true, uint32_t root = 0) {
     // A media session owns the screen while it plays. The game leaves its own
     // window black for the video renderer to draw into, so compositing those
     // windows over the session's frame paints the picture out entirely.
@@ -1226,14 +1237,14 @@ static void composite_windows(uint32_t *argb, int w, int h, int32_t origin_x, in
         return;
     if (!argb || w <= 0 || h <= 0)
         return;
-    if (!presented_surface().owner && !ddraw_gdi_primary_active()) {
+    if (include_screen && !presented_surface().owner && !ddraw_gdi_primary_active()) {
         if (auto *desktop = user32::find_window(user32::desktop_handle)) {
             auto &screen = desktop->surface;
             if (screen.w == w && screen.h == h && screen.argb.size() == size_t(w) * h)
                 memcpy(argb, screen.argb.data(), screen.argb.size() * sizeof(uint32_t));
         }
     }
-    for (auto *window : visible_surfaces()) {
+    for (auto *window : visible_surfaces(root)) {
         auto &s = window->surface;
         // A layered window: LWA_COLORKEY drops every pixel of the key colour,
         // LWA_ALPHA blends the rest over what is already there. Together they
@@ -1289,9 +1300,12 @@ static void composite_windows(uint32_t *argb, int w, int h, int32_t origin_x, in
 }
 void gdi_composite_windows(uint32_t *argb, int w, int h) {
     int32_t origin_x = 0, origin_y = 0;
+    const uint32_t root = presented_surface().owner    ? presented_surface().hwnd
+                          : ddraw_gdi_primary_active() ? host_main_window()
+                                                       : 0;
     if (ddraw_gdi_primary_active())
-        user32::client_origin(host_main_window(), &origin_x, &origin_y);
-    composite_windows(argb, w, h, origin_x, origin_y);
+        user32::client_origin(root, &origin_x, &origin_y);
+    composite_windows(argb, w, h, origin_x, origin_y, true, root);
 }
 // Flush window writes, or refresh an unchanged surface on the host's display
 // clock. A retained DC can be drawn into across pump iterations, so ReleaseDC
@@ -1407,10 +1421,18 @@ void gdi_present_windows(bool refresh) {
                 gdi::read_pixel(primary, px, py, &pixels[size_t(py) * w + px]);
         ddraw_gdi_end_primary(primary);
     }
+    int32_t viewport_x = 0, viewport_y = 0;
+    int viewport_w = 0, viewport_h = 0;
+    uint32_t viewport_style = 0, viewport_window = 0;
+    const bool viewport = dialog_viewport(w, h, &viewport_x, &viewport_y, &viewport_w, &viewport_h,
+                                          &viewport_style, &viewport_window);
+    const uint32_t root = presented.owner ? presented.hwnd : viewport_window;
     if (client_view)
-        composite_windows(pixels.data(), w, h, origin_x, origin_y);
-    else
+        composite_windows(pixels.data(), w, h, origin_x, origin_y, false, root);
+    else if (primary)
         gdi_composite_windows(pixels.data(), w, h);
+    else
+        composite_windows(pixels.data(), w, h, 0, 0, viewport, root);
     if (presented.owner) {
         if (visible && width > 0 && height > 0) {
             const int64_t x0 = std::max<int64_t>(0, x),
@@ -1450,16 +1472,14 @@ void gdi_present_windows(bool refresh) {
         desktop->surface.dirty = false;
     if (mf_owns_the_screen())
         return;
-    int32_t viewport_x = 0, viewport_y = 0;
-    int viewport_w = 0, viewport_h = 0;
-    if (dialog_viewport(w, h, &viewport_x, &viewport_y, &viewport_w, &viewport_h)) {
+    if (viewport) {
         std::vector<uint32_t> cropped(size_t(viewport_w) * viewport_h);
         for (int row = 0; row < viewport_h; ++row)
             memcpy(cropped.data() + size_t(row) * viewport_w,
                    pixels.data() + size_t(viewport_y + row) * w + viewport_x,
                    size_t(viewport_w) * sizeof(uint32_t));
         host_display_present_window_viewport(cropped.data(), viewport_w, viewport_h, viewport_x,
-                                             viewport_y);
+                                             viewport_y, viewport_style);
     } else {
         host_display_present_window(pixels.data(), w, h);
     }

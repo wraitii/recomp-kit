@@ -39,7 +39,7 @@ extern "C" {
 // Synchronous owned-pixel snapshot: the host copies ARGB before returning.
 void host_display_present_window(const uint32_t *argb, int w, int h);
 void host_display_present_window_viewport(const uint32_t *argb, int w, int h, int32_t origin_x,
-                                          int32_t origin_y);
+                                          int32_t origin_y, uint32_t style);
 // Synchronous RGBA snapshot. Windowed hosts force alpha opaque in caller-owned
 // scratch storage before copying it; callers must dump raw pixels beforehand.
 void host_display_present_window_rgba(uint8_t *rgba, int w, int h);

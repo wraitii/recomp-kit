@@ -275,7 +275,7 @@ void host_frame_seal(void);
 void host_present_first_write(void);
 void host_present_stage_rgba(const uint8_t *rgba, int w, int h);
 void host_present_stage_rgba_viewport(const uint8_t *rgba, int w, int h, int32_t origin_x,
-                                      int32_t origin_y);
+                                      int32_t origin_y, uint32_t style);
 // Includes bounded command-completion recovery; faults reports that degraded
 // path. Only drawable acknowledgements enter the windowed continuous metric.
 uint64_t host_present_unique_completed(void);
@@ -328,7 +328,7 @@ void host_present_pump(void);
 void host_present_start_offscreen(int w, int h);
 // Main-thread messages. No GPU work or wait for the worker here.
 void host_present_resize(int drawable_w, int drawable_h);
-void host_present_install_surface(void *native_surface, int w, int h);
+void host_present_install_surface(void *native_surface, int w, int h, int viewport = -1);
 
 struct HostSceneTarget {
     gpu::Texture world, overlay;

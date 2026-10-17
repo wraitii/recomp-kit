@@ -102,6 +102,10 @@ enum {
 namespace {
 
 SDL_Window *g_window = nullptr;
+SDL_Window *g_game_window = nullptr;
+SDL_Window *g_dialog_window = nullptr;
+void *g_game_surface = nullptr;
+void *g_dialog_surface = nullptr;
 void *g_surface = nullptr; // the native surface the presenter draws into
 std::unique_ptr<gpu::Device> g_gpu;
 bool g_close_requested = false; // the user asked to close
@@ -125,6 +129,7 @@ int g_windowed_x = 0, g_windowed_y = 0, g_windowed_w = 0, g_windowed_h = 0;
 bool g_game_window_shown = false;
 bool g_viewport_active = false;
 int g_viewport_w = 0, g_viewport_h = 0;
+uint32_t g_viewport_style = 0;
 uint32_t g_pending_mode_w = 0, g_pending_mode_h = 0;
 uint8_t g_buttons = 0; // for the MK_ bits in a mouse message
 
@@ -559,7 +564,7 @@ bool window_fullscreen() {
 // settings page - the page is navigated with a real cursor. It is not tied to
 // what the guest is doing: an FMV reads the mouse exactly as gameplay does.
 bool pointer_capture_wanted() {
-    if (!platform_ui_pointer_capture_supported())
+    if (g_viewport_active || !platform_ui_pointer_capture_supported())
         return false;
     // DirectDraw owns a game display; other renderers can instead acquire a
     // DirectInput mouse. Ordinary launcher/settings windows keep the OS cursor.
@@ -1244,6 +1249,9 @@ void handle_event(const SDL_Event &event) {
         return;
     if (handle_editor_event(event))
         return;
+    SDL_Window *event_window = SDL_GetWindowFromEvent(&event);
+    if (event_window && event_window != g_window)
+        return;
     const SDL_WindowID ours = g_window ? SDL_GetWindowID(g_window) : 0;
     switch (event.type) {
     case SDL_EVENT_MOUSE_MOTION:
@@ -1591,7 +1599,7 @@ void apply_window_mode() {
     int request = host_display_take_window();
     if (request >= 0)
         g_wanted_window_mode = request;
-    if (!g_window || g_fullscreen_transition)
+    if (!g_window || g_viewport_active || !g_game_window_shown || g_fullscreen_transition)
         return;
     if (window_fullscreen()) {
         if (g_wanted_window_mode != 2) {
@@ -1632,23 +1640,18 @@ void apply_window_mode() {
     post_drawable_size();
 }
 
-bool viewport_source(int32_t *origin_x, int32_t *origin_y, int *w, int *h, bool *active) {
+bool viewport_source(int32_t *origin_x, int32_t *origin_y, int *w, int *h, bool *active,
+                     uint32_t *style = nullptr) {
     LayoutSnapshot sealed;
-    if (!g_game_window_shown || !host_gate_layout_published()) {
-        if (!host_present_copy_sealed_layout(&sealed))
-            return false;
-        *origin_x = sealed.guest_origin_x;
-        *origin_y = sealed.guest_origin_y;
-        *w = sealed.guest_w;
-        *h = sealed.guest_h;
-        *active = sealed.viewport;
-        return true;
-    }
-    *active = host_gate_viewport(origin_x, origin_y, w, h);
-    if (!*active) {
-        *origin_x = *origin_y = 0;
-        *w = *h = 0;
-    }
+    if (!host_present_copy_sealed_layout(&sealed))
+        return false;
+    *origin_x = sealed.guest_origin_x;
+    *origin_y = sealed.guest_origin_y;
+    *w = sealed.guest_w;
+    *h = sealed.guest_h;
+    *active = sealed.viewport;
+    if (style)
+        *style = sealed.viewport_style;
     return true;
 }
 
@@ -1682,39 +1685,77 @@ void apply_viewport_change() {
     int32_t origin_x = 0, origin_y = 0;
     int w = 0, h = 0;
     bool active = false;
-    if (!viewport_source(&origin_x, &origin_y, &w, &h, &active))
+    uint32_t style = 0;
+    if (!viewport_source(&origin_x, &origin_y, &w, &h, &active, &style))
         return;
-    if (active == g_viewport_active && (!active || (w == g_viewport_w && h == g_viewport_h)))
+    if (active == g_viewport_active &&
+        (!active || (w == g_viewport_w && h == g_viewport_h && style == g_viewport_style)))
         return;
+    apply_pointer_capture(false);
+    if (!g_game_window) {
+        g_game_window = g_window;
+        g_game_surface = g_surface;
+    }
+    SDL_Window *previous = g_window;
+    if (active) {
+        const HostWindowSize size = viewport_window_size_for(w, h);
+        const bool bordered = (style & 0x00c00000u) != 0;
+        if (!g_dialog_window) {
+            SDL_WindowFlags flags =
+                SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY |
+                (SDL_GetWindowFlags(g_game_window) & (SDL_WINDOW_METAL | SDL_WINDOW_VULKAN));
+            if (!bordered)
+                flags |= SDL_WINDOW_BORDERLESS;
+            g_dialog_window = SDL_CreateWindow(RECOMP_GAME_NAME, size.w, size.h, flags);
+            if (!g_dialog_window) {
+                fprintf(stderr, "[host] dialog window creation failed: %s\n", SDL_GetError());
+                boot_request_close("dialog window creation failed");
+                return;
+            }
+            g_dialog_surface = gpu::native_surface_for_window(g_dialog_window);
+            if (!g_dialog_surface) {
+                fprintf(stderr, "[host] dialog window has no native presentation surface\n");
+                boot_request_close("dialog presentation surface unavailable");
+                return;
+            }
+        }
+        SDL_SetWindowBordered(g_dialog_window, bordered);
+        SDL_SetWindowSize(g_dialog_window, size.w, size.h);
+        SDL_SetWindowPosition(g_dialog_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        g_window = g_dialog_window;
+        g_surface = g_dialog_surface;
+    } else {
+        g_window = g_game_window;
+        g_surface = g_game_surface;
+    }
     g_viewport_active = active;
     g_viewport_w = w;
     g_viewport_h = h;
-    if (!g_window || g_window_mode != 0 || g_fullscreen_transition)
-        return;
-    const HostWindowSize size =
-        active ? viewport_window_size_for(w, h) : window_size_for(g_mode_w, g_mode_h);
-    SDL_SetWindowMinimumSize(g_window, size.min_w, size.min_h);
-    SDL_SetWindowSize(g_window, size.w, size.h);
-    SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    g_viewport_style = style;
+    g_pointer_sample_valid = false;
+    if (previous != g_window)
+        SDL_HideWindow(previous);
+    int bw, bh, dw, dh;
+    window_sizes(&bw, &bh, &dw, &dh);
+    host_present_install_surface(g_surface, dw, dh, active);
     post_drawable_size();
-    if (!active)
+    SDL_ShowWindow(g_window);
+    SDL_RaiseWindow(g_window);
+    if (!active) {
+        g_game_window_shown = true;
         host_set_client_size(host_main_window(), g_mode_w, g_mode_h);
+    }
 }
 
-void show_game_window() {
-    if (!g_window || g_game_window_shown)
+void show_sealed_game_window() {
+    if (g_game_window_shown || g_viewport_active)
+        return;
+    LayoutSnapshot sealed;
+    if (!host_present_copy_sealed_layout(&sealed) || sealed.viewport)
         return;
     g_game_window_shown = true;
     SDL_ShowWindow(g_window);
     SDL_RaiseWindow(g_window);
-}
-
-void show_sealed_game_window() {
-    if (g_game_window_shown)
-        return;
-    LayoutSnapshot sealed;
-    if (host_present_copy_sealed_layout(&sealed))
-        show_game_window();
 }
 
 // True when this thread may touch the window at all.
@@ -1758,9 +1799,9 @@ void pump() {
     // and a mod callback dispatched from here is serialised against every
     // other guest thread, which is the whole point.
     deliver_pending_input();
+    apply_viewport_change();
     apply_window_mode();
     apply_mode_change();
-    apply_viewport_change();
     show_sealed_game_window();
     service(0.0);
     after_events();
@@ -1782,8 +1823,13 @@ void pump() {
 int show_message_box(const HostMessageBoxRequest *request, uint32_t *button_id) {
     if (!g_window || !on_host_thread())
         return -1;
-    if (request->has_owner)
-        show_game_window();
+    if (request->has_owner) {
+        apply_viewport_change();
+        SDL_ShowWindow(g_window);
+        SDL_RaiseWindow(g_window);
+        if (!g_viewport_active)
+            g_game_window_shown = true;
+    }
     std::vector<SDL_MessageBoxButtonData> buttons;
     buttons.reserve(request->button_count);
     for (uint32_t i = 0; i < request->button_count; ++i) {
@@ -1828,9 +1874,9 @@ int idle_wait(double seconds) {
     service_message_box();
     if (seconds < 0.0)
         seconds = 0.0;
+    apply_viewport_change();
     apply_window_mode();
     apply_mode_change();
-    apply_viewport_change();
     show_sealed_game_window();
     int changed = service(seconds);
     after_events();
@@ -2377,6 +2423,7 @@ int main(int argc, char **argv) {
     host_present_set_bilinear(
         host_preferences::get(host_preferences::Setting::PresentationFilter) != 0);
     host_present_start(g_surface, dw, dh);
+    host_present_install_surface(g_surface, dw, dh, false);
     // Said out loud, because "the keyboard does nothing" and "the window
     // never gained focus" look identical from the outside.
     printf(RECOMP_APP_NAME ": window %dx%d points, %dx%d pixels, focus %s\n", bw, bh, dw, dh,
@@ -2445,9 +2492,15 @@ int main(int argc, char **argv) {
     for (SDL_Cursor *cursor : g_native_cursors)
         SDL_DestroyCursor(cursor);
     g_native_cursors.clear();
-    SDL_HideWindow(g_window);
-    gpu::release_window_surface(g_surface);
-    SDL_DestroyWindow(g_window);
+    if (g_dialog_window) {
+        SDL_HideWindow(g_dialog_window);
+        gpu::release_window_surface(g_dialog_surface);
+        SDL_DestroyWindow(g_dialog_window);
+    }
+    SDL_Window *game_window = g_game_window ? g_game_window : g_window;
+    SDL_HideWindow(game_window);
+    gpu::release_window_surface(g_game_surface ? g_game_surface : g_surface);
+    SDL_DestroyWindow(game_window);
     // The audio device goes before the SDL it runs on, not in the exit
     // handlers after it: there its stream is destroyed through a freed mutex.
     host_audio_shutdown();

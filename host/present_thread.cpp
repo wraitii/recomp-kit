@@ -192,6 +192,7 @@ struct Service : std::enable_shared_from_this<Service> {
     gpu::Device *device = nullptr;
     gpu::Swapchain chain;
     void *surface = nullptr;
+    int surface_viewport = -1;
     // The display pacer: a thread that wakes the worker once per refresh, in
     // place of the CVDisplayLink the AppKit host used.
     std::thread pacer;
@@ -222,6 +223,7 @@ struct Service : std::enable_shared_from_this<Service> {
     CompositorInput cached_input{};
     std::shared_ptr<Target> cached_target;
     bool cached_viewport = false;
+    uint32_t cached_viewport_style = 0;
     int32_t cached_viewport_x = 0, cached_viewport_y = 0;
     uint8_t last_pixel = 0;
     uint64_t unique = 0, repeats = 0, drops = 0, waits = 0, last_id = 0;
@@ -255,8 +257,8 @@ struct Service : std::enable_shared_from_this<Service> {
     std::array<LayoutSnapshot, 3> layouts;
     unsigned layout_slot = 0;
     bool layout_valid = false;
-    LayoutSnapshot first_sealed_layout;
-    bool first_sealed_layout_valid = false;
+    LayoutSnapshot sealed_layout;
+    bool sealed_layout_valid = false;
     std::set<uint64_t> test_released;
     unsigned pending_commands = 0;
 
@@ -319,6 +321,7 @@ struct Service : std::enable_shared_from_this<Service> {
                 cached_input = f->input;
                 cached_input.ui = &cached_ui;
                 cached_viewport = f->viewport;
+                cached_viewport_style = f->viewport_style;
                 cached_viewport_x = f->viewport_x;
                 cached_viewport_y = f->viewport_y;
                 if (!f->repeat)
@@ -521,10 +524,8 @@ struct Service : std::enable_shared_from_this<Service> {
             mailbox.erase(old);
             drop(discarded);
         }
-        if (!first_sealed_layout_valid) {
-            first_sealed_layout = frame_layout(*f);
-            first_sealed_layout_valid = true;
-        }
+        sealed_layout = frame_layout(*f);
+        sealed_layout_valid = true;
         mailbox.push_back(std::move(f));
         seal_pending = true;
         wake.notify_one();
@@ -673,6 +674,7 @@ struct Service : std::enable_shared_from_this<Service> {
         LayoutSnapshot layout = compositor_layout_snapshot(&f.input);
         layout.frame_id = f.frame_id;
         layout.viewport = f.viewport;
+        layout.viewport_style = f.viewport_style;
         layout.guest_origin_x = f.viewport_x;
         layout.guest_origin_y = f.viewport_y;
         return layout;
@@ -686,11 +688,13 @@ struct Service : std::enable_shared_from_this<Service> {
             return;
         if (auto m = message.exchange(nullptr)) {
             if (m->install) {
+                const bool changed_surface = surface != m->surface;
                 if (device && chain) {
                     device->destroy(chain);
                     chain = {};
                 }
                 surface = m->surface;
+                surface_viewport = m->viewport;
                 if (device && surface && !fake)
                     chain = device->create_swapchain(surface, m->w, m->h);
                 std::lock_guard lock(mutex);
@@ -704,6 +708,25 @@ struct Service : std::enable_shared_from_this<Service> {
                     }
                     flights.clear();
                     sweep();
+                }
+                if (changed_surface) {
+                    cached.reset();
+                    cached_settings.reset();
+                    cached_target.reset();
+                    cached_ui = {};
+                    cached_input = {};
+                    cached_viewport = false;
+                    cached_viewport_style = 0;
+                    cached_viewport_x = cached_viewport_y = 0;
+                    last_id = 0;
+                    for (auto it = mailbox.begin(); it != mailbox.end();) {
+                        if (surface_viewport >= 0 && (*it)->viewport != bool(surface_viewport)) {
+                            auto old = *it;
+                            it = mailbox.erase(it);
+                            drop(old);
+                        } else
+                            ++it;
+                    }
                 }
             } else if (!fake && device && chain)
                 device->resize(chain, m->w, m->h);
@@ -741,7 +764,8 @@ struct Service : std::enable_shared_from_this<Service> {
                 // a newer queued image would visibly move the game backwards.
                 if (!flights.empty())
                     return;
-                if (!last_id)
+                if (!last_id ||
+                    (surface_viewport >= 0 && cached_viewport != bool(surface_viewport)))
                     return;
                 f = std::make_shared<Frame>();
                 f->repeat = true;
@@ -754,6 +778,7 @@ struct Service : std::enable_shared_from_this<Service> {
                 f->input.ui = &f->ui;
                 f->target = cached_target;
                 f->viewport = cached_viewport;
+                f->viewport_style = cached_viewport_style;
                 f->viewport_x = cached_viewport_x;
                 f->viewport_y = cached_viewport_y;
                 // Retain the original guest domain and source texture. The
@@ -769,8 +794,12 @@ struct Service : std::enable_shared_from_this<Service> {
                     f->input.scene.offset_y *= sy;
                 }
             } else {
-                auto requested = std::find_if(mailbox.begin(), mailbox.end(),
-                                              [](const auto &v) { return bool(v->capture); });
+                if (surface_viewport >= 0 && mailbox.back()->viewport != bool(surface_viewport))
+                    return;
+                auto requested = std::find_if(mailbox.begin(), mailbox.end(), [&](const auto &v) {
+                    return bool(v->capture) &&
+                           (surface_viewport < 0 || v->viewport == bool(surface_viewport));
+                });
                 if (requested != mailbox.end()) {
                     f = *requested;
                     mailbox.erase(requested);
@@ -1166,10 +1195,11 @@ void host_present_resize(int w, int h) {
     do {
         m->install = old && old->install;
         m->surface = m->install ? old->surface : nullptr;
+        m->viewport = m->install ? old->viewport : -1;
     } while (!s->message.compare_exchange_weak(old, m));
     s->wake.notify_one();
 }
-void host_present_install_surface(void *native_surface, int w, int h) {
+void host_present_install_surface(void *native_surface, int w, int h, int viewport) {
     auto s = active.load();
     if (!s)
         return;
@@ -1186,6 +1216,7 @@ void host_present_install_surface(void *native_surface, int w, int h) {
     m->w = w;
     m->h = h;
     m->install = true;
+    m->viewport = viewport;
     s->message.store(m);
     s->wake.notify_one();
 }
@@ -1239,8 +1270,8 @@ extern "C" void host_present_stop() {
         s->cached_ui = {};
         s->cached_viewport = false;
         s->cached_viewport_x = s->cached_viewport_y = 0;
-        s->first_sealed_layout = {};
-        s->first_sealed_layout_valid = false;
+        s->sealed_layout = {};
+        s->sealed_layout_valid = false;
         s->targets = {};
         if (s->device && s->chain) {
             s->device->destroy(s->chain);
@@ -1340,7 +1371,8 @@ extern "C" void host_present_stage_rgba(const uint8_t *rgba, int w, int h) {
     }
 }
 extern "C" void host_present_stage_rgba_viewport(const uint8_t *rgba, int w, int h,
-                                                 int32_t origin_x, int32_t origin_y) {
+                                                 int32_t origin_x, int32_t origin_y,
+                                                 uint32_t style) {
     host_present_stage_rgba(rgba, w, h);
     auto s = active.load();
     if (!s)
@@ -1348,6 +1380,7 @@ extern "C" void host_present_stage_rgba_viewport(const uint8_t *rgba, int w, int
     std::lock_guard lock(s->mutex);
     if (!s->stop && s->writing) {
         s->writing->viewport = true;
+        s->writing->viewport_style = style;
         s->writing->viewport_x = origin_x;
         s->writing->viewport_y = origin_y;
     }
@@ -1651,9 +1684,9 @@ bool host_present_copy_sealed_layout(LayoutSnapshot *out) {
     if (!s || !out)
         return false;
     std::lock_guard lock(s->mutex);
-    if (!s->first_sealed_layout_valid)
+    if (!s->sealed_layout_valid)
         return false;
-    *out = s->first_sealed_layout;
+    *out = s->sealed_layout;
     return true;
 }
 void host_present_test_begin(bool automatic, bool offscreen, unsigned display_frames) {

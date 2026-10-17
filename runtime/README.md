@@ -150,7 +150,9 @@ here, so continuing would run the guest past a point Windows never reaches.
   that never pumps would never paint.
 - **Resource modeless dialogs use guest callbacks and GDI composition.**
   Screen DC pixels supply the startup background beneath child controls until
-  the game renderer takes over. `DIVERGENCE(original):` dialog fonts use the
+  the game renderer takes over. The SDL host presents startup dialogs in a
+  separate window sized to their guest rectangle, with borders selected from
+  the guest style; gameplay retains its own window and fullscreen setting. `DIVERGENCE(original):` dialog fonts use the
   existing bundled substitutes when unavailable, and progress controls use
   unthemed software painting. Modal indirect dialogs remain unsupported.
 - **A wait yields to other guest threads.** Finite waits expire only after their

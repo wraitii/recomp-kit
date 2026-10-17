@@ -487,6 +487,7 @@ LayoutSnapshot compositor_resize_layout(const LayoutSnapshot &layout, int w, int
     auto result = compositor_layout_snapshot(&in);
     result.frame_id = layout.frame_id;
     result.viewport = layout.viewport;
+    result.viewport_style = layout.viewport_style;
     result.guest_origin_x = layout.guest_origin_x;
     result.guest_origin_y = layout.guest_origin_y;
     return result;
