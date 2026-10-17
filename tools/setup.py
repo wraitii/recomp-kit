@@ -20,7 +20,12 @@ import game_config  # noqa: E402
 def validate_game(directory, executable, sha256, required_dirs=()):
     """Require the supported executable and game-data directories before creating a link."""
     directory = directory.expanduser().resolve()
-    image = directory / executable
+    relative = Path(executable)
+    if relative.is_absolute() or any(part in ("", ".", "..") for part in relative.parts):
+        raise ValueError(f"Unsafe executable path: {executable}")
+    image = directory / relative
+    if not image.resolve().is_relative_to(directory):
+        raise ValueError(f"Executable path escapes {directory}: {executable}")
     if not image.is_file():
         raise ValueError(f"{executable} was not found in {directory}")
     digest = hashlib.sha256(image.read_bytes()).hexdigest()

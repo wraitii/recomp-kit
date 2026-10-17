@@ -3,13 +3,16 @@
 #pragma once
 #include <string>
 
-enum class GamePathSource { Flag, Environment, Checkout, Saved, DataRoot, None };
+enum class GamePathSource { Flag, Environment, Installed, Checkout, Saved, DataRoot, None };
 struct GamePath {
     std::string exe; // "" when nothing resolved
+    std::string data_root;
+    std::string install_lock_path;
+    std::string error;
     GamePathSource source = GamePathSource::None;
 };
-// Order: `flag`, RECOMP_EXE, the checkout's original/gog above the
-// executable (developer mode), <profile_dir>/game-path.txt when its file
+// Order: `flag`, RECOMP_EXE, installed manifest, checkout, then
+// <profile_dir>/game-path.txt when its file
 // exists and hashes to the supported digest.
 // When data_root is supplied, search only <data_root>/game/<executable>.
 // The platform host supplies the root; the loader still verifies the hash.

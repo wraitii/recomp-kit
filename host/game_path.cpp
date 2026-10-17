@@ -4,6 +4,7 @@
 #include "../runtime/layout.h"
 #include "../platform/os.h"
 #include "../runtime/loader.h"
+#include "../runtime/installation_manifest.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +63,23 @@ GamePath game_path_resolve(const char *flag, const char *data_root) {
     if (const char *env = recomp_env("EXE"); env && *env) {
         g.exe = env;
         g.source = GamePathSource::Environment;
+        return g;
+    }
+    const InstallationManifest installation = installation_manifest_for_process();
+    if (installation.found) {
+        if (!installation.valid) {
+            g.error = "Invalid installed manifest " + installation.path + ": " + installation.error;
+            return g;
+        }
+        g.exe = installation.game_folder + "/" + installation.executable;
+        g.data_root = installation.game_folder + "/" + installation.data_root;
+        g.install_lock_path = installation.game_folder + "/.recomp/install.lock";
+        g.source = GamePathSource::Installed;
+        if (!game_path_is_supported(g.exe, nullptr)) {
+            g.error = "Installed executable failed its supported-version check: " + g.exe;
+            g.exe.clear();
+            return g;
+        }
         return g;
     }
     // The build's own copy of the game: game.toml names it by an absolute

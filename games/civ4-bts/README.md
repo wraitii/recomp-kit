@@ -24,8 +24,12 @@ tools/.venv/bin/python tools/build.py --regenerate
 
 Setup checks the executable against `game.toml` and links the installation at
 `build/original`. Beyond the Sword also uses base Civ4 data from its parent
-directory; the installation link preserves that layout, but packaging will need
-to account for it. Prerequisites are in
+directory; the installation link preserves that layout. For a desktop library
+import, select the complete Civ4 content root containing `Beyond the Sword/` and
+the base-game assets. The library preserves these relationships under `original/`
+and verifies each auxiliary DLL. The pinned `msxml3.dll` must be supplied manually;
+its stock-install provenance is unknown, and Wine is not a launch dependency.
+This nested installation flow still needs end-to-end verification. Prerequisites are in
 [CONTRIBUTING](../../CONTRIBUTING.md#prerequisites). Later builds need only
 `tools/.venv/bin/python tools/build.py`; add `--regenerate` after changing a
 translation input.

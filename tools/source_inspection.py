@@ -434,11 +434,23 @@ def _candidate(cfg, root, selected_relative, cancel, byte_budget, diagnostics, d
     candidate_id = hashlib.sha256((str(content_root.resolve()) + "\0" + actual_exec_rel + "\0"
                                    + str(main_fact.get("sha256"))).encode("utf-8")).hexdigest()[:24]
     candidate_diagnostics = list(diagnostics)
+    preparation_details = []
+    for preparation_id in preparations:
+        definition = setup.get("preparations", {}).get(preparation_id, {})
+        preparation_details.append({"id": preparation_id,
+                                    "mode": definition.get("mode", "manual"),
+                                    "explanation": definition.get("explanation", ""),
+                                    "requiredInputs": definition.get("required_inputs", []),
+                                    "requiredTools": definition.get("required_tools", []),
+                                    "outputs": definition.get("outputs", [])})
+    actual_data_root = data_root or "."
     return {"id": candidate_id, "contentRoot": str(content_root), "contentRootRelative": content_relative or ".",
             "executable": {"path": actual_exec_rel, "size": main_fact.get("size"),
                            "sha256": main_fact.get("sha256"), "status": main_fact["status"]},
+            "dataRoot": actual_data_root,
             "layout": {"executableDir": layout["executable_dir"], "dataRoot": layout["data_root"]},
-            "version": {"status": identity_status, "label": label, "preparations": preparations},
+            "version": {"status": identity_status, "label": label, "preparations": preparations,
+                        "preparationDetails": preparation_details},
             "status": status, "installable": installable, "requiredRoles": checks,
             "diagnostics": candidate_diagnostics}
 

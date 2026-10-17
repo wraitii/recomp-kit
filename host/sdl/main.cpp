@@ -20,6 +20,7 @@
 #include "../../mods/display_settings.h"
 #include "game_config.h"
 #include "../../runtime/layout.h"
+#include "../../runtime/installation_manifest.h"
 #include "../../runtime/key_names.h"
 #include "../../platform/os.h"
 #include "../audio.h"
@@ -1940,6 +1941,19 @@ int main(int argc, char **argv) {
         }
     }
     std::string game_error;
+#ifndef __ANDROID__
+    const InstallationManifest installed_location = installation_manifest_location_for_process();
+    std::unique_ptr<OsFileLock, decltype(&os_file_unlock)> installation_lock(
+        installed_location.found && installed_location.error.empty()
+            ? os_file_lock((installed_location.game_folder + "/.recomp/install.lock").c_str())
+            : nullptr,
+        os_file_unlock);
+    if (installed_location.found && installed_location.error.empty() && !installation_lock) {
+        fprintf(stderr, "Another process is updating this installation: %s\n",
+                installed_location.game_folder.c_str());
+        return 2;
+    }
+#endif
 #ifdef __ANDROID__
     platform_ui_init_hints(); // stdout and stderr reach logcat from here on
     (void)exe_flag;           // The mobile app always uses its own external data root.
@@ -1969,9 +1983,10 @@ int main(int argc, char **argv) {
             SDL_Log("[android] game data: %s", game.exe.c_str());
     }
 #else
-    GamePath game =
-        configure_requested ? GamePath{} : platform_ui_resolve_game(exe_flag, &game_error);
+    GamePath game = platform_ui_resolve_game(exe_flag, &game_error);
 #endif
+    if (game.source == GamePathSource::Flag || game.source == GamePathSource::Environment)
+        fprintf(stderr, "[launch] executable override selected: %s\n", game.exe.c_str());
     if (!game_error.empty()) {
 #ifdef __ANDROID__
         // The kit page needs a running presenter and initialized mod rows;
@@ -1991,7 +2006,11 @@ int main(int argc, char **argv) {
     if (game.source == GamePathSource::Checkout &&
         os_chdir(host_layout().checkout_root.c_str()) != 0)
         fprintf(stderr, "[host] could not enter %s\n", host_layout().checkout_root.c_str());
-
+    if (game.source == GamePathSource::Installed && os_chdir(game.data_root.c_str()) != 0) {
+        fprintf(stderr, RECOMP_APP_NAME ": could not enter installed game data folder %s\n",
+                game.data_root.c_str());
+        return 2;
+    }
     platform_ui_init_hints();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, RECOMP_APP_NAME ": SDL_Init failed: %s\n", SDL_GetError());

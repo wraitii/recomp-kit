@@ -1,5 +1,6 @@
 #include "layout.h"
 #include "game_config.h"
+#include "installation_manifest.h"
 
 #include "../platform/os.h"
 
@@ -41,18 +42,21 @@ HostLayout compute() {
         if (c == '\\')
             c = '/';
     const std::string dir = parent(exe);
+    const InstallationManifest installation = installation_manifest_for_process();
     // A checkout above the executable makes this a developer run whatever the
     // executable's own shape (build/recomp/recomp_smoke or build/PopRecomp.app).
     // The checkout is the game's directory (its game.toml; outputs under its
     // build/) or, for the kit's own stub builds, the kit itself.
     std::string up = dir;
-    for (int depth = 0; depth < 12 && !up.empty(); ++depth) {
-        if (exists(up + "/game.toml") || exists(up + "/AGENTS.md")) {
-            l.checkout_root = up;
-            l.developer = true;
-            break;
+    if (!installation.found) {
+        for (int depth = 0; depth < 12 && !up.empty(); ++depth) {
+            if (exists(up + "/game.toml") || exists(up + "/AGENTS.md")) {
+                l.checkout_root = up;
+                l.developer = true;
+                break;
+            }
+            up = parent(up);
         }
-        up = parent(up);
     }
     if (l.developer)
         l.build_dir = ends_with(dir, "/recomp") && dir != l.checkout_root + "/build/recomp" &&
@@ -76,9 +80,17 @@ HostLayout compute() {
     const char *env = recomp_env("PROFILE_DIR");
     if (env && *env)
         l.profile_dir = env;
-    else if (l.developer)
+    else if (installation.valid) {
+        char buf[4096];
+        if (os_user_data_dir(installation.profile_id.c_str(), buf, sizeof buf) == 0) {
+            l.profile_dir = buf;
+            if (!installation.profile_suffix.empty())
+                l.profile_dir += "/" + installation.profile_suffix;
+        }
+    }
+    if (l.profile_dir.empty() && l.developer)
         l.profile_dir = l.build_dir + "/profile";
-    else {
+    else if (l.profile_dir.empty()) {
         char buf[4096];
         if (os_user_data_dir(RECOMP_APP_NAME, buf, sizeof buf) == 0)
             l.profile_dir = buf;

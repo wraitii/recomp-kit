@@ -27,6 +27,25 @@ disc images are reference-only; the library never runs them. ZIP imports reject
 unsafe paths, links and special files and enforce entry and expanded-size limits.
 Black & White needs an installed folder with the fan patch.
 
+On macOS, an installed folder contains the game app, a native Configure app,
+`original/`, and `.recomp/installation.json`. The manifest keeps executable and
+data-root paths relative to that folder, so the app resolves them from its own
+location, including beneath a checkout. Resolution order is command-line override,
+`RECOMP_EXE`, installed manifest, checkout detection, then a saved executable path.
+An invalid installed manifest reports an error instead of selecting another copy.
+Configure reads its target from the manifest and shares the game's profile and
+installation lock. Profiles use the manifest identity under the platform user-data
+directory, so renaming the game folder does not change the profile key.
+
+Publication stages both apps on the destination volume, retains backups, and
+replaces the manifest last. Updates preserve `original/`; the registry changes
+after publication. Use **Locate game folder** to attach a moved installation
+without rebuilding. Keep both apps, `original/` and `.recomp/` together. macOS is
+the library's installation target for this pass; Windows/Linux installed layouts,
+direct launches after a move, interruption recovery and Gatekeeper prompts remain
+unverified. Copying and renaming the built game bundle preserves its signature and
+executable permission; that check does not establish launch behavior.
+
 ## Building from source
 
 From a game's repository root (the one containing `recomp-kit/`), with the game's

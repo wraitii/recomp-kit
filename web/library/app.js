@@ -19,8 +19,13 @@ let lastAction = "";
 let checkRevision = 0;
 let candidateId = "";
 let inspectionReady = false;
+let candidateCanInstall = false;
 let resumeJob = null;
 let sourceKind = "";
+let candidateSummary = "";
+let candidateContentRoot = "";
+let preflightReady = false;
+let preflightRevision = 0;
 let activeJobId = "";
 let failedJobId = "";
 let inspecting = false;
@@ -78,8 +83,8 @@ function lock(value) {
     input.disabled = busy || checking || inspecting || input.dataset.unavailable === "true";
   }
   element("cancel").disabled = !busy;
-  element("continue").disabled = busy || checking || inspecting || !checksReady;
-  element("install").disabled = busy || checking || inspecting || !checksReady || !inspectionReady || !candidateId || !source || !destination;
+  element("review-copy").disabled = busy || checking || inspecting || !inspectionReady || !candidateId;
+  element("install").disabled = busy || checking || inspecting || !checksReady || !preflightReady || !inspectionReady || !candidateCanInstall || !candidateId || !source || !destination;
   element("pick-destination").disabled = busy || checking || inspecting;
   element("assisted-continue").disabled = busy || assistedPollInFlight || !assistedCanContinue;
   element("assisted-recheck").disabled = busy || !assistedJob;
@@ -155,9 +160,40 @@ function renderInspection(result) {
   target.replaceChildren();
   const candidates = result?.candidates || [];
   const viable = candidates.filter((item) => item.installable);
-  inspectionReady = Boolean(result?.scanComplete && viable.length);
-  candidateId = viable.length === 1 ? viable[0].id : "";
-  if (viable.length > 1) inspectionReady = false;
+  inspectionReady = Boolean(result?.scanComplete && candidates.length);
+  const chosen = candidates.length === 1 ? candidates[0] : null;
+  candidateId = chosen?.id || "";
+  candidateCanInstall = Boolean(chosen?.installable);
+  candidateContentRoot = chosen?.contentRoot || "";
+  candidateSummary = chosen ? `${chosen.version?.label || chosen.status || "Copy selected"}${chosen.version?.preparations?.length ? ` · preparation: ${chosen.version.preparations.join(", ")}` : ""}` : "";
+  if (candidates.length > 1) { inspectionReady = false; candidateCanInstall = false; }
+  const renderPreparation = (candidate) => {
+    const guidance = target.querySelector("#preparation-guidance");
+    guidance.replaceChildren();
+    const preparations = candidate?.version?.preparationDetails || [];
+    for (const preparation of preparations) {
+      const section = document.createElement("section");
+      const heading = document.createElement("strong");
+      heading.textContent = `Preparation required: ${preparation.id}`;
+      const explanation = document.createElement("p");
+      explanation.textContent = preparation.explanation || "Prepare the listed files manually, then inspect the result again.";
+      section.append(heading, explanation);
+      for (const [label, items] of [["Required inputs", preparation.requiredInputs], ["Tools", preparation.requiredTools], ["Expected result", preparation.outputs]]) {
+        if (!items?.length) continue;
+        const row = document.createElement("p");
+        row.textContent = `${label}: ${items.join(", ")}`;
+        section.append(row);
+      }
+      const prepare = document.createElement("button");
+      prepare.textContent = "Prepare files manually";
+      prepare.onclick = () => attempt(() => startAssisted(source));
+      const reinspect = document.createElement("button");
+      reinspect.textContent = "Reinspect prepared copy";
+      reinspect.onclick = () => attempt(async () => { await inspectSource(source); await checkRequirements(); });
+      section.append(prepare, reinspect);
+      guidance.append(section);
+    }
+  };
   for (const candidate of candidates) {
     const label = document.createElement("label");
     label.className = "candidate-choice";
@@ -165,13 +201,19 @@ function renderInspection(result) {
     input.type = "radio";
     input.name = "candidate";
     input.value = candidate.id;
-    input.dataset.unavailable = String(!candidate.installable || !result.scanComplete);
-    input.disabled = !candidate.installable || !result.scanComplete || busy || checking;
+    input.dataset.unavailable = String(!result.scanComplete);
+    input.disabled = !result.scanComplete || busy || checking;
     input.checked = candidate.id === candidateId;
     input.onchange = () => {
       candidateId = candidate.id;
+      candidateContentRoot = candidate.contentRoot || "";
+      candidateSummary = `${candidate.version?.label || candidate.status || "Copy selected"}${candidate.version?.preparations?.length ? ` · preparation: ${candidate.version.preparations.join(", ")}` : ""}`;
       if (resumeJob && candidate.id !== resumeJob.candidateId) resumeJob = null;
       inspectionReady = true;
+      candidateCanInstall = Boolean(candidate.installable);
+      renderPreparation(candidate);
+      preflightReady = false;
+      if (!element("requirements").hidden) void updateSpaceEstimate();
       lock(false);
     };
     const detail = document.createElement("span");
@@ -182,6 +224,10 @@ function renderInspection(result) {
     label.append(input, detail);
     target.append(label);
   }
+  const guidance = document.createElement("div");
+  guidance.id = "preparation-guidance";
+  target.append(guidance);
+  renderPreparation(chosen);
   for (const diagnostic of result?.diagnostics || []) {
     const note = document.createElement("p");
     note.textContent = diagnostic.message;
@@ -201,6 +247,8 @@ async function inspectSource(path) {
   const selectedGame = selected?.id;
   source = path;
   candidateId = "";
+  preflightReady = false;
+  preflightRevision++;
   inspectionReady = false;
   sourceKind = "";
   element("inspection").replaceChildren();
@@ -234,7 +282,7 @@ function step(index, installing = false) {
   for (const [i, name] of ["requirements", "source", "job", "ready"].entries()) element(name).hidden = i !== index;
   element("assisted").hidden = true;
   element("steps").hidden = index === 3 || (index === 2 && lastAction === "play");
-  const active = installing ? 3 : index;
+  const active = index === 1 ? 0 : index === 0 ? 1 : 2;
   for (const [i, item] of [...element("steps").children].entries()) {
     item.classList.toggle("active", i === active);
     item.classList.toggle("done", i < active);
@@ -245,6 +293,11 @@ function step(index, installing = false) {
     element("installed-location").textContent = `Installed in ${destination}`;
     element("update-note").hidden = !selected?.updateAvailable;
     element("rebuild").textContent = selected?.updateAvailable ? "Update app" : "Rebuild app";
+  }
+  if (index === 0) {
+    const heading = element("requirements").querySelector("h3");
+    heading.tabIndex = -1;
+    heading.focus();
   }
 }
 
@@ -280,9 +333,11 @@ async function openGame(game) {
   checksReady = false;
   source = game.managedSource || "";
   candidateId = "";
+  preflightReady = false;
   inspectionReady = Boolean(game.managedSource);
   resumeJob = null;
   destination = game.installation || "";
+  element("destination-kind").value = "final";
   element("destination").value = destination;
   element("pick-destination").disabled = false;
   element("install-title").textContent = game.title;
@@ -294,17 +349,61 @@ async function openGame(game) {
   renderRecovery();
   message(game.maintenanceError || "");
   if (game.state === "ready") { step(3); return; }
-  step(0);
+  step(1);
   if (game.state === "unavailable") {
     element("checks").replaceChildren();
     element("check-status").textContent = game.detail || "This game is not available in this version of recomp-kit.";
-    element("continue").disabled = true;
     element("recheck").hidden = true;
     element("change-copy").hidden = true;
     return;
   }
   element("recheck").hidden = false;
-  await checkRequirements();
+  element("discovery").textContent = "Looking for installed copies… You can choose a folder or file now.";
+  discoverCopies(game.id);
+}
+
+async function discoverCopies(gameId) {
+  const target = element("discovery");
+  try {
+    const result = await backend.query({ action: "discover", game: gameId });
+    if (selected?.id !== gameId || !element("installer").open) return;
+    target.replaceChildren();
+    const found = result.candidates || [];
+    if (!found.some((candidate) => candidate.installable)) {
+      target.textContent = result.scanComplete ? "No supported copies were found. Choose a folder or game file." : "Search was incomplete. Choose a folder or game file to inspect it directly.";
+    }
+    if (!found.length) return;
+    const heading = document.createElement("p");
+      heading.textContent = `Found ${found.length} ${found.length === 1 ? "candidate" : "candidates"}. Choose a supported copy to review.`;
+    target.append(heading);
+    for (const candidate of found) {
+      const button = document.createElement("button");
+      button.className = "discovery-choice";
+      const version = typeof candidate.version === "object" ? candidate.version?.label : candidate.version;
+      button.textContent = `${candidate.installable ? version || "Supported" : candidate.status || "Needs preparation"} · ${candidate.contentRoot || candidate.executable?.path || "Candidate location unavailable"}`;
+      button.disabled = false;
+      button.onclick = () => attempt(async () => {
+        if (!candidate.installable) {
+          source = candidate.contentRoot || candidate.executable?.path || "";
+          renderInspection({ scanComplete: true, candidates: [candidate], diagnostics: [] });
+          message(candidate.diagnostics?.[0]?.message || `This copy needs preparation (${candidate.status || "unsupported"}). Choose manual preparation or another copy.`);
+          return;
+        }
+        source = candidate.contentRoot;
+        candidateId = candidate.id;
+        sourceKind = "folder";
+        inspectionReady = true;
+        renderInspection({ scanComplete: true, candidates: [candidate], diagnostics: [] });
+        element("selected-source").textContent = `Selected: ${source}`;
+        element("selected-source").hidden = false;
+        await checkRequirements();
+        if (checksReady) step(1);
+      });
+      target.append(button);
+    }
+  } catch (error) {
+    if (selected?.id === gameId) target.textContent = `Automatic search unavailable: ${errorText(error)} Choose a folder or game file.`;
+  }
 }
 
 async function checkRequirements() {
@@ -372,14 +471,22 @@ async function checkRequirements() {
   }
 }
 
+async function chooseDroppedPath(path) {
+  resumeJob = null;
+  await inspectSource(path);
+  await checkRequirements();
+  if (checksReady) step(1);
+}
+
 async function chooseSource(kind) {
   const path = await backend.pick(kind);
   if (!path) return;
   resumeJob = null;
-  step(0);
+  preflightReady = false;
+  step(1);
   await inspectSource(path);
   await checkRequirements();
-  if (checksReady) step(1);
+  step(1);
 }
 
 async function retrySavedJob(job) {
@@ -452,13 +559,13 @@ async function changeDestination(job) {
   if (!folder) return;
   resumeJob = null;
   const separator = folder.includes("\\") ? "\\" : "/";
-  destination = `${folder.replace(/[\\/]+$/, "")}${separator}${selected.id}`;
+  destination = element("destination-kind").value === "final" ? folder : `${folder.replace(/[\\/]+$/, "")}${separator}${selected.id}`;
   element("destination").value = destination;
   if (!inspectionReady && source) await inspectSource(source);
   message("This destination applies to a new job; the saved job remains unchanged.");
   step(0);
   await checkRequirements();
-  if (checksReady) step(1);
+    if (checksReady) step(1);
   lock(false);
 }
 
@@ -479,7 +586,7 @@ async function recheckPreparation(job) {
     const issue = candidate?.diagnostics?.find((item) => item.severity === "error");
     if (issue) message(issue.message);
   }
-  step(0);
+  step(1);
   await checkRequirements();
   if (checksReady) step(1);
 }
@@ -685,7 +792,7 @@ async function cancelAssisted(job = assistedJob) {
     element("assisted").hidden = true;
     await refresh();
     message("The job-owned preparation folder was removed. The selected source was left unchanged.");
-    step(0);
+    step(1);
   } catch (error) {
     if (selected?.id === game) await resumePreparation(previousJob || job);
     throw error;
@@ -810,8 +917,46 @@ element("close").onclick = close;
 element("refresh").onclick = () => attempt(refresh);
 element("change-copy").onclick = () => { message(""); step(1); };
 element("recheck").onclick = () => attempt(checkRequirements);
-element("continue").onclick = () => step(1);
-element("back").onclick = () => attempt(async () => { step(0); await checkRequirements(); });
+element("review-copy").onclick = () => attempt(async () => {
+  step(0);
+  await checkRequirements();
+  element("review-summary").textContent = `${selected.title} · ${candidateSummary || "Copy selected"} · ${source}\nThe source stays untouched. Installation creates ${destination || "a new game folder"}/ with the app, Configure app, original/ and .recomp/.`;
+  await updateSpaceEstimate();
+});
+async function updateSpaceEstimate() {
+  const revision = ++preflightRevision;
+  preflightReady = false;
+  element("space-summary").textContent = "Checking available space…";
+  lock(false);
+  if (!["folder", "executable", "zip"].includes(sourceKind)) {
+    element("space-summary").textContent = "Choose an installed folder, executable or ZIP to estimate space.";
+    lock(false);
+    return;
+  }
+  try {
+    const preflightSource = sourceKind === "zip" ? source : candidateContentRoot || source;
+    const estimate = await backend.query({ action: "preflight", source: preflightSource, sourceKind, destination });
+    if (revision !== preflightRevision) return;
+    const mib = (value) => `${(value / (1024 ** 2)).toFixed(0)} MiB`;
+    element("space-summary").textContent = `Source volume: ${mib(estimate.source.freeBytes)} free. Destination volume: ${mib(estimate.destination.freeBytes)} free; estimated peak ${mib(estimate.destination.requiredBytes)}${estimate.destination.enough ? "" : " (not enough space)"}.`;
+    preflightReady = estimate.destination.enough;
+  } catch (error) {
+    if (revision === preflightRevision) element("space-summary").textContent = `Space estimate failed: ${errorText(error)}`;
+  }
+  if (revision === preflightRevision) lock(false);
+}
+async function locateInstallation() {
+  const path = await backend.pick("folder");
+  if (!path) return;
+  const adopted = await backend.query({ action: "adopt", game: selected.id, destination: path });
+  destination = adopted.destination;
+  await refresh();
+  selected = (await backend.query({ action: "catalog" })).games.find((game) => game.id === selected.id);
+  step(3);
+  message("Game folder attached to this library. You can launch it directly from its folder too.");
+}
+for (const id of ["locate-installation", "locate-ready"]) element(id).onclick = () => attempt(locateInstallation);
+element("back").onclick = () => step(1);
 element("folder").onclick = () => attempt(() => chooseSource("folder"));
 element("archive").onclick = () => attempt(() => chooseSource("source"));
 element("reference").onclick = () => attempt(async () => {
@@ -864,8 +1009,11 @@ element("pick-destination").onclick = () => attempt(async () => {
   const folder = await backend.pick("folder");
   if (!folder) return;
   const separator = folder.includes("\\") ? "\\" : "/";
-  destination = `${folder.replace(/[\\/]+$/, "")}${separator}${selected.id}`;
+  destination = element("destination-kind").value === "final" ? folder : `${folder.replace(/[\\/]+$/, "")}${separator}${selected.id}`;
   element("destination").value = destination;
+  preflightReady = false;
+  if (!element("requirements").hidden) await updateSpaceEstimate();
+  else element("space-summary").textContent = "Destination changed. Review the copy again to check space.";
   resumeJob = null;
   message("This destination applies to a new job; the saved job remains unchanged.");
   lock(false);
@@ -901,6 +1049,18 @@ element("settings").onclick = () => {
   element("setup").open = true;
   message("");
 };
+element("destination-kind").onchange = () => {
+  const current = destination;
+  if (!current || !selected) return;
+  const separator = current.includes("\\") ? "\\" : "/";
+  const parent = current.replace(/[\\/]+$/, "").slice(0, current.replace(/[\\/]+$/, "").lastIndexOf(separator));
+  destination = element("destination-kind").value === "final" ? current : `${parent}${separator}${selected.id}`;
+  element("destination").value = destination;
+  preflightReady = false;
+  if (!element("requirements").hidden) void updateSpaceEstimate();
+  else element("space-summary").textContent = "Destination changed. Review the copy again to check space.";
+  lock(false);
+};
 element("installer").addEventListener("close", () => { stopAssistedPolling(); element("steps").hidden = false; });
 element("save").onclick = () => attempt(async () => {
   await backend.save({ kit: element("kit").value.trim(), python: element("python").value.trim() });
@@ -917,6 +1077,10 @@ for (const [button, field, kind] of [["pick-kit", "kit", "kit"], ["pick-python",
 
 await attempt(async () => {
   await backend.listen(jobEvent);
+  window.__TAURI__?.event.listen("tauri://drag-drop", ({ payload }) => {
+    const path = payload?.paths?.[0];
+    if (path && selected && !busy) attempt(() => chooseDroppedPath(path));
+  });
   const settings = await backend.settings();
   element("kit").value = settings.kit;
   element("python").value = settings.python;

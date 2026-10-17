@@ -99,7 +99,7 @@ async fn pick(kind: String) -> Option<String> {
 
 #[tauri::command]
 async fn query(request: Value, app: tauri::AppHandle) -> Result<Value, String> {
-    if !matches!(request["action"].as_str(), Some("catalog" | "check" | "inspect" | "job_log"
+    if !matches!(request["action"].as_str(), Some("catalog" | "check" | "inspect" | "discover" | "preflight" | "adopt" | "job_log"
         | "assisted_start" | "assisted_status" | "assisted_path" | "assisted_cancel" | "assisted_recheck")) {
         return Err("Unsupported query".into());
     }

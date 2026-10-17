@@ -26,6 +26,9 @@ tools/.venv/bin/python tools/build.py --regenerate --target app
 ```
 
 Setup links the installed game at `build/original`; it changes no game files.
+The desktop library accepts a supported 1.42 installed folder. Installer and disc
+sources use assisted preparation; patch order and content deltas remain unverified,
+so the library gives manual guidance and rechecks the resulting files.
 Prerequisites are in [CONTRIBUTING](../../CONTRIBUTING.md#prerequisites). The
 translator needs `tools/.venv`; the system Python lacks `pefile`.
 

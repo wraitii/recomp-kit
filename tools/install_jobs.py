@@ -29,9 +29,12 @@ MAX_MONITOR_ENTRIES = 200000
 MAX_MONITOR_DEPTH = 128
 RECIPE_DIRS = ("runtime", "dx", "host", "platform", "mods", "graphics", "cmake", "third_party")
 RECIPE_FILES = ("CMakeLists.txt", "CMakePresets.json", "tools/build.py", "tools/game_config.py",
-                "tools/gen_game_config.py", "tools/setup.py", "tools/stage_game_files.py",
+                "tools/gen_game_config.py", "tools/setup.py", "tools/install_jobs.py", "tools/stage_game_files.py",
                 "tools/copy_layouts.py", "tools/recomp/finish_bundle.py", "tools/library.py",
-                "tools/source_inspection.py", "tools/zip_adapter.py")
+                "tools/source_inspection.py", "tools/zip_adapter.py", "host/configure_launcher.cpp",
+                "runtime/installation_manifest.cpp", "runtime/installation_manifest.h",
+                "web/library/app.js", "web/library/index.html", "web/library/style.css",
+                "desktop/library/src/main.rs")
 IGNORED_PARTS = {".git", "__pycache__", ".pytest_cache", "tests", "test", ".venv"}
 JOURNAL_STAGES = {"inspecting", "discovering", "preparing", "extracting", "copying", "validating",
                   "building", "publishing", "cleaning", "waiting_for_input", "cancelling_assisted",
@@ -44,6 +47,27 @@ class JobError(ValueError):
         self.code = code
         self.recovery = recovery or []
         self.details = details or {}
+
+
+def process_start_time(pid=None):
+    pid = os.getpid() if pid is None else pid
+    if platform.system() == "Linux":
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_text().split()
+            boot = next(int(line.split()[1]) for line in Path("/proc/stat").read_text().splitlines()
+                        if line.startswith("btime "))
+            ticks = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+            return boot + int(fields[21]) / ticks
+        except (OSError, StopIteration, ValueError, IndexError):
+            return None
+    if platform.system() == "Darwin":
+        try:
+            value = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                                   capture_output=True, text=True, timeout=2, check=True).stdout.strip()
+            return time.mktime(time.strptime(value, "%a %b %d %H:%M:%S %Y")) if value else None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+    return None
 
 
 def job_id(value=None):
@@ -113,6 +137,11 @@ class DestinationLock:
         except BaseException:
             self.close()
             raise
+        owner = json.dumps({"pid": os.getpid(), "startTime": process_start_time()}, separators=(",", ":")).encode()
+        os.lseek(self.fd, 0, os.SEEK_SET)
+        os.ftruncate(self.fd, 0)
+        os.write(self.fd, owner)
+        os.fsync(self.fd)
         return self
 
     def close(self):

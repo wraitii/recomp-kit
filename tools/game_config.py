@@ -4,6 +4,7 @@ This module is the only place that knows the schema. Python 3.9 has no
 tomllib, so the pinned tomli is the fallback."""
 
 import os
+import json
 from pathlib import Path
 import re
 import ntpath
@@ -657,6 +658,14 @@ def load(game_dir, build_root=None):
     cfg["build_root"] = build_root
     exe = game.get("developer_exe")
     cfg["developer_exe_path"] = ((game_dir / exe) if exe else build_root / "original" / game["executable"]).resolve()
+    selected_executable = os.environ.get("RECOMP_SOURCE_EXECUTABLE")
+    cfg["source_executable_override"] = bool(selected_executable)
+    if selected_executable:
+        selected_executable = relative_game_path(selected_executable, source,
+                                                  "RECOMP_SOURCE_EXECUTABLE")
+        if game.get("developer_exe"):
+            raise ValueError("RECOMP_SOURCE_EXECUTABLE cannot override a fixed developer executable")
+        cfg["developer_exe_path"] = (build_root / "original" / selected_executable).resolve()
     code_map = translate.get("code_map")
     if code_map is not None and (not isinstance(code_map, str) or not code_map):
         raise ValueError("%s: [translate] code_map must be a non-empty path" % source)
@@ -681,6 +690,13 @@ def load(game_dir, build_root=None):
 
 def load_aux_modules(cfg, game_dir, source):
     modules = []
+    try:
+        source_aux_paths = json.loads(os.environ.get("RECOMP_SOURCE_AUX_PATHS", "{}"))
+    except json.JSONDecodeError as error:
+        raise ValueError("RECOMP_SOURCE_AUX_PATHS must be a JSON object") from error
+    if not isinstance(source_aux_paths, dict) or any(not isinstance(key, str) or not isinstance(value, str)
+                                                      for key, value in source_aux_paths.items()):
+        raise ValueError("RECOMP_SOURCE_AUX_PATHS must map module names to relative paths")
     guest_size = cfg["game"].get("guest_size", GUEST_SIZE_DEFAULT)
     seen_classes = set()
     for key, entry in sorted(cfg.get("modules", {}).get("aux", {}).items()):
@@ -692,8 +708,16 @@ def load_aux_modules(cfg, game_dir, source):
             raise ValueError("%s: [modules.aux.%s] invalid base or size" % (source, key))
         if "path" in entry and "original_path" in entry:
             raise ValueError("%s: [modules.aux.%s] path and original_path conflict" % (source, key))
-        path = (game_dir / entry["path"] if "path" in entry else
-                cfg["build_root"] / "original" / entry.get("original_path", entry["name"]))
+        if "path" in entry:
+            path = game_dir / entry["path"]
+        elif entry["name"] in source_aux_paths:
+            relative = relative_game_path(source_aux_paths[entry["name"]], source,
+                                          "RECOMP_SOURCE_AUX_PATHS." + entry["name"])
+            path = cfg["build_root"] / "original" / relative
+        elif cfg.get("source_executable_override"):
+            path = cfg["developer_exe_path"].parent / entry.get("original_path", entry["name"])
+        else:
+            path = cfg["build_root"] / "original" / entry.get("original_path", entry["name"])
         com_classes = []
         for item in entry.get("com_classes", []):
             where = "[modules.aux.%s] com_classes" % key

@@ -270,6 +270,50 @@ int os_getcwd(char *buf, size_t cap) {
         return -1;
     return copy_out(narrow(w), buf, cap);
 }
+int os_realpath(const char *path, char *buf, size_t cap) {
+    DWORD needed = GetFullPathNameW(widen(path).c_str(), 0, nullptr, nullptr);
+    if (!needed)
+        return -1;
+    std::wstring full(needed, L'\0');
+    DWORD written = GetFullPathNameW(widen(path).c_str(), needed, full.data(), nullptr);
+    if (!written || written >= needed)
+        return -1;
+    full.resize(written);
+    HANDLE file =
+        CreateFileW(full.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return -1;
+    std::wstring resolved(32768, L'\0');
+    DWORD length = GetFinalPathNameByHandleW(file, resolved.data(), (DWORD)resolved.size(),
+                                             FILE_NAME_NORMALIZED);
+    CloseHandle(file);
+    if (!length || length >= resolved.size())
+        return -1;
+    resolved.resize(length);
+    if (resolved.rfind(L"\\\\?\\UNC\\", 0) == 0)
+        resolved = L"\\\\" + resolved.substr(8);
+    else if (resolved.rfind(L"\\\\?\\", 0) == 0)
+        resolved.erase(0, 4);
+    return copy_out(narrow(resolved), buf, cap);
+}
+int os_directory_contains(const char *path, const char *name) {
+    std::wstring pattern = widen(path) + L"\\*";
+    WIN32_FIND_DATAW entry{};
+    HANDLE search = FindFirstFileW(pattern.c_str(), &entry);
+    if (search == INVALID_HANDLE_VALUE)
+        return 0;
+    int found = 0;
+    do {
+        if (_stricmp(narrow(entry.cFileName).c_str(), name) == 0 &&
+            (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            found = 1;
+            break;
+        }
+    } while (FindNextFileW(search, &entry));
+    FindClose(search);
+    return found;
+}
 int os_chdir(const char *path) {
     return SetCurrentDirectoryW(widen(path).c_str()) ? 0 : -1;
 }
@@ -293,11 +337,33 @@ struct OsFileLock {
 };
 
 OsFileLock *os_file_lock(const char *path) {
-    HANDLE handle = CreateFileW(widen(path).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                                OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE handle =
+        CreateFileW(widen(path).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
         errno = GetLastError() == ERROR_SHARING_VIOLATION ? EWOULDBLOCK : EACCES;
         return nullptr;
+    }
+    BY_HANDLE_FILE_INFORMATION file_info{};
+    if (!GetFileInformationByHandle(handle, &file_info) ||
+        (file_info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY))) {
+        CloseHandle(handle);
+        errno = EACCES;
+        return nullptr;
+    }
+    FILETIME created{}, exited{}, kernel{}, user{};
+    ULARGE_INTEGER start{};
+    if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user))
+        start.LowPart = created.dwLowDateTime, start.HighPart = created.dwHighDateTime;
+    char owner[128];
+    const int size = snprintf(owner, sizeof owner, "{\"pid\":%lld,\"startTime\":%llu}",
+                              (long long)GetCurrentProcessId(), (unsigned long long)start.QuadPart);
+    if (size > 0 && size < (int)sizeof owner) {
+        SetFilePointer(handle, 0, nullptr, FILE_BEGIN);
+        SetEndOfFile(handle);
+        DWORD written = 0;
+        WriteFile(handle, owner, (DWORD)size, &written, nullptr);
+        FlushFileBuffers(handle);
     }
     return new OsFileLock{handle};
 }

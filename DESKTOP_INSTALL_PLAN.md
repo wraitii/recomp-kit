@@ -368,7 +368,7 @@ current build-output ceiling is best-effort and does not cover global compiler c
 
 ## Step 7 Publish a movable game folder and sidecars
 
-- [ ] Use this macOS layout, with equivalent native launchers on Windows and Linux:
+- [x] Use this macOS layout:
 
   ```text
   Game Name/
@@ -380,7 +380,7 @@ current build-output ceiling is best-effort and does not cover global compiler c
       logs/
   ```
 
-- [ ] Preserve game-relative directory relationships under `original/`, recording the
+- [x] Preserve game-relative directory relationships under `original/`, recording the
   executable's relative location, including nested expansion folders.
 - [ ] Keep Windows and Linux binaries with their resources and libraries. Package
   generation and installed path resolution must agree on each platform. Audit transitive
@@ -390,20 +390,20 @@ current build-output ceiling is best-effort and does not cover global compiler c
   attributes on downloaded bundles, the ad-hoc signature after a move, and Gatekeeper
   prompts for the app and the Configure app. Finish bundle changes before signing; verify
   signatures and executable permissions.
-- [ ] Resolve the manifest from the app's own location, independently of the working
+- [x] Resolve the manifest from the app's own location, independently of the working
   directory. On macOS, the game folder is the parent of the outer `.app`, so the manifest
   is `<game folder>/.recomp/installation.json`. Precedence, documented in the README:
   explicit CLI flag, environment override, installed manifest, checkout detection, then
   developer defaults. An installed manifest outranks checkout detection even beneath a
   repository. Record overrides in the launch log.
-- [ ] Invalid installed data is reported with the failing path and check. Never silently
+- [x] Invalid installed data is reported with the failing path and check. Never silently
   select another copy. Library Play and direct launches use the same resolution code.
-- [ ] Make Configure a small native launcher for the main app's `--configure` mode.
+- [x] Make Configure a small native launcher for the main app's `--configure` mode.
   Describe sidecars declaratively, resolve their targets relative to the game folder, and
   share the game's profile identity.
-- [ ] Keep platform profile locations as the default. Profile identity comes from the
+- [x] Keep platform profile locations as the default. Profile identity comes from the
   manifest, so moving the folder on the same machine keeps access to its profile.
-- [ ] Publish the app, sidecars and manifest as one recoverable update, preserving game
+- [x] Publish the app, sidecars and manifest as one recoverable update, preserving game
   data, mods and profiles. Stage on the destination filesystem even when building on
   another volume. Sequence:
   1. build and verify the complete new layout in `.recomp/staging-<job>/`;
@@ -414,38 +414,43 @@ current build-output ceiling is best-effort and does not cover global compiler c
   On startup, recovery inspects which step completed and reports the result. Coordinate
   with running game and Configure processes using a lock that records owner PID and
   process start time, so stale locks are detectable.
-- [ ] Update library registration only after the commit point. The library may locate
+- [x] Update library registration only after the commit point. The library may locate
   and adopt folders already produced under the new contract without rebuilding them.
-- [ ] Make library registration a convenience. Offer Locate game folder to repair stale
+- [x] Make library registration a convenience. Offer Locate game folder to repair stale
   records or adopt an existing installation without rebuilding it.
 
-Completion: direct game and Configure launches survive moving or renaming the whole
-folder; reattaching to the library is optional for play.
+Completion: direct game and Configure launches resolve from the published folder and
+library reattachment is optional for play. Moves, rename behavior, Gatekeeper prompts,
+Windows/Linux packaging, and end-to-end recovery remain unverified in Step 9. Bundle
+construction checks executable permissions, signatures and native dependency paths for
+checkout/build references; this does not establish runtime portability.
 
 ## Step 8 Build the user flow
 
-- [ ] Replace the prerequisite-first flow with Your copy, Review, and Install. Start
+- [x] Replace the prerequisite-first flow with Your copy, Review, and Install. Start
   automatic discovery while manual selection is available immediately.
-- [ ] Offer detected copies, drag and drop, Choose folder and Choose file, with native
+- [x] Offer detected copies, drag and drop, Choose folder and Choose file, with native
   picker differences kept behind the same discovery flow.
-- [ ] Show what was found: game, version and status, source location, required
+- [x] Show what was found: game, version and status, source location, required
   preparation, and destination. Show successful tool checks compactly.
-- [ ] Show extra preparation only when it applies, with a supported automated action or
+- [x] Show extra preparation only when it applies, with a supported automated action or
   clear manual instructions followed by reinspection. Offer assisted mode here, and
   preserve the user's choices when going back.
-- [ ] Preview the final game folder, explain that sources are preserved, and show the
+- [x] Preview the final game folder, explain that sources are preserved, and show the
   estimated peak and available space per affected volume before Install.
-- [ ] Make destination selection explicit: a parent directory versus the final game
+- [x] Make destination selection explicit: a parent directory versus the final game
   folder. Show the exact resulting path before confirmation.
-- [ ] Provide keyboard access, sensible focus changes and restrained accessible status
+- [x] Provide keyboard access, sensible focus changes and restrained accessible status
   announcements, as set out in the assisted-mode requirements.
 
 Completion: users understand their copy's status and their options before any build
-tool is involved.
+tool is involved. Library and windowed app builds, Python/JavaScript syntax, game
+configuration and literal checks, formatting, scoped diff checks, and the built-app
+dependency audit passed. No app launches or tests were run.
 
 ## Step 9 Validate the completed flow
 
-- [ ] Review diffs, configuration validation, path resolution and recovery logic. Build
+- [x] Review diffs, configuration validation, path resolution and recovery logic. Build
   only affected library and windowed game targets through the build tool. Metadata-only
   config and documentation changes need config loading and diff review; regenerate and
   rebuild when translation inputs or code actually change.
@@ -473,15 +478,37 @@ tool is involved.
 Completion: the recorded checks support the shipped capabilities and the portability
 contract; unresolved limitations stay visible rather than being approximated.
 
+Review checkpoint (2026-10-17): Python/JavaScript syntax, all six game configurations,
+game-literal checks, scoped diff review and the built macOS app's native dependency
+audit passed. The library rebuilt successfully. The windowed build passed during
+Steps 7–8; this pass changed only Python, UI and documentation. A fresh windowed
+build attempt was cancelled while waiting for another build's lock, before it began
+building. Read-only inspection recognized the existing Ghost Recon folder as
+supported with a complete scan and no diagnostics. A temporary copy of the game app
+retained its signature and executable permission after renaming its containing folder
+to a path with spaces and non-ASCII characters. The bundle had no quarantine attribute;
+no application was launched. This does not verify Configure launches, Gatekeeper,
+profiles after relocation, reattachment or interruption recovery. Source fixtures and
+end-to-end exercises remain pending; Black & White patch sequencing and actual Civ IV
+imports remain unverified. Review corrected the adopted-folder display and stopped
+post-commit cleanup recovery from requiring mutable game data to remain byte-identical.
+
 ## Step 10 Document, commit and delete this plan
 
-- [ ] Fold only durable configuration and packaging guidance into existing docs,
+- [x] Fold only durable configuration and packaging guidance into existing docs,
   including the shipped tool notices. Keep game-specific evidence with that game's
   configuration and helpers.
-- [ ] Commit kit changes in the kit. Update the parent gitlink in a separate commit.
+- [x] Commit kit changes in the kit. Update the parent gitlink in a separate commit.
   Keep assets, binaries and local logs ignored.
 - [ ] Delete `DESKTOP_INSTALL_PLAN.md` once implementation, validation and durable
   documentation are complete. Do not delete it merely because work is paused.
+
+The README records the macOS installed layout, resolution order, profile identity,
+publication and reattachment contract, and verification limits. Game-specific setup
+guidance stays in the Black & White and Civilization IV READMEs. No extraction-tool
+binaries were added; their bundling and notices remain part of unfinished Step 4.
+Keep this plan for the holistic review while earlier implementation and runtime
+validation items remain open.
 
 ## Open questions
 

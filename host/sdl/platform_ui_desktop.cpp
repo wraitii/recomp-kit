@@ -107,7 +107,10 @@ void platform_ui_init_hints() {
 GamePath platform_ui_resolve_game(const char *flag, std::string *error) {
     if (error)
         error->clear();
-    return game_path_resolve(flag); // an empty result means: show the picker
+    GamePath result = game_path_resolve(flag);
+    if (error && !result.error.empty())
+        *error = result.error;
+    return result;
 }
 
 SDL_Window *platform_ui_create_window(const char *title, int window_w, int window_h, int min_w,

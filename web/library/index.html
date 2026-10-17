@@ -16,25 +16,27 @@
   </main>
   <dialog id="installer" aria-labelledby="install-title">
     <div class="modal-heading"><h2 id="install-title"></h2><button id="close" aria-label="Close game setup">Close</button></div>
-    <ol id="steps" class="steps"><li>Requirements</li><li>Your copy</li><li>Build</li><li>Install</li></ol>
+    <ol id="steps" class="steps"><li>Your copy</li><li>Review</li><li>Install</li></ol>
     <p id="install-message" role="status" hidden></p>
     <section id="recovery" hidden aria-live="polite"><h3>Saved installation</h3><div id="recovery-jobs"></div></section>
     <div id="inspection" role="status" hidden></div>
     <section id="requirements">
-      <h3>Requirements</h3><p class="muted">These tools are needed to build the game app.</p>
+      <h3>Review</h3><p class="muted">These tools are needed to build the game app.</p>
       <p id="check-status" role="status"></p><div id="checks"></div>
       <p class="muted">You can prepare files manually while build tools are missing. This creates an isolated drop folder and checks its contents; it never extracts or runs the selected reference.</p>
       <div class="buttons"><button id="assisted-no-source">Prepare files manually</button></div>
-      <div class="buttons actions"><button id="change-copy" hidden>Choose a different copy</button><button id="recheck">Check again</button><button id="continue" class="primary" disabled>Continue</button></div>
+      <h4>Copy and destination</h4><p id="review-summary"></p><button id="locate-installation">Locate game folder</button>
+      <label>Destination type<select id="destination-kind"><option value="parent">Choose a parent directory</option><option value="final">Choose the final game folder</option></select></label><label>Final game folder<div class="field"><input id="destination" readonly><button id="pick-destination">Choose…</button></div></label>
+      <p class="muted">Your source stays untouched. The estimate includes the staged copy and build outputs.</p><p id="space-summary" role="status">Space estimate appears after choosing a copy and destination.</p>
+      <div class="buttons actions"><button id="change-copy" hidden>Choose a different copy</button><button id="recheck">Check tools</button><button id="install" class="primary" disabled>Install</button></div>
     </section>
     <section id="source" hidden>
-      <h3>Choose your game copy</h3><p id="copy-help"></p>
+      <h3>Your copy</h3><p id="copy-help"></p><div id="discovery" role="status" aria-live="polite"></div>
       <div class="source-options"><button id="folder"><strong>Installed game folder</strong><span>Choose the folder containing your game files.</span></button><button id="archive"><strong>Game executable or ZIP</strong><span>Choose the original game executable or a ZIP archive.</span></button></div>
       <p class="muted">Other installers and disc images are reference-only. To use them, prepare files yourself and copy them into the assisted drop folder.</p>
       <div class="buttons"><button id="reference">Choose a media reference</button><button id="assisted-with-source">Prepare files manually</button></div>
       <p id="selected-source" class="selected" hidden></p>
-      <label>Install folder<div class="field"><input id="destination" readonly><button id="pick-destination">Choose…</button></div></label><p class="muted">The app and game files will be saved here. Your originals stay untouched. Temporary build files are removed after installation.</p>
-      <div class="buttons actions"><button id="back">Back</button><button id="install" class="primary" disabled>Build and install</button></div>
+      <div class="buttons actions"><button id="back">Back</button><button id="review-copy" class="primary" disabled>Review copy</button></div>
     </section>
     <section id="assisted" hidden>
       <h3>Prepare your game files</h3>
@@ -51,7 +53,7 @@
       <details><summary>Installation details</summary><pre id="log"></pre></details>
       <div class="buttons actions"><button id="cancel">Cancel installation</button><button id="retry" hidden>Try again</button><button id="play-existing" class="primary" hidden>Play installed game</button></div>
     </section>
-    <section id="ready" hidden><h3>Installed</h3><p id="installed-location"></p><p id="update-note" class="muted" hidden>An updated build is available. You can keep playing the installed version.</p><div class="buttons actions"><button id="rebuild">Rebuild app</button><button id="play" class="primary">Play game</button></div></section>
+    <section id="ready" hidden><h3>Installed</h3><p id="installed-location"></p><p id="update-note" class="muted" hidden>An updated build is available. You can keep playing the installed version.</p><div class="buttons actions"><button id="locate-ready">Locate another game folder</button><button id="rebuild">Rebuild app</button><button id="play" class="primary">Play game</button></div></section>
     <details id="setup"><summary>Advanced library settings</summary><p class="muted">Locations of the kit and Python used to build games.</p>
       <label>Recomp-kit folder<div class="field"><input id="kit" spellcheck="false"><button id="pick-kit">Browse…</button></div></label>
       <label>Python program<div class="field"><input id="python" spellcheck="false"><button id="pick-python">Browse…</button></div></label>

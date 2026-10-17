@@ -16,6 +16,12 @@
 #include <strings.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#if TARGET_OS_OSX
+#include <libproc.h>
+#endif
+#endif
 #include <sys/file.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -224,6 +230,38 @@ int os_rmdir(const char *path) {
 int os_getcwd(char *buf, size_t cap) {
     return getcwd(buf, cap) ? 0 : -1;
 }
+int os_realpath(const char *path, char *buf, size_t cap) {
+    char *resolved = realpath(path, nullptr);
+    if (!resolved)
+        return -1;
+    const size_t size = strlen(resolved) + 1;
+    if (size > cap) {
+        free(resolved);
+        errno = ERANGE;
+        return -1;
+    }
+    memcpy(buf, resolved, size);
+    free(resolved);
+    return 0;
+}
+
+int os_directory_contains(const char *path, const char *name) {
+    DIR *directory = opendir(path);
+    if (!directory)
+        return 0;
+    const size_t wanted = strlen(name);
+    struct dirent *entry;
+    int found = 0;
+    while ((entry = readdir(directory)))
+        if (strlen(entry->d_name) == wanted && strcasecmp(entry->d_name, name) == 0) {
+            struct stat info{};
+            std::string child = std::string(path) + "/" + entry->d_name;
+            found = stat(child.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
+            break;
+        }
+    closedir(directory);
+    return found;
+}
 int os_chdir(const char *path) {
     return chdir(path);
 }
@@ -249,14 +287,68 @@ struct OsFileLock {
 };
 
 OsFileLock *os_file_lock(const char *path) {
-    int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    int flags = O_CREAT | O_RDWR | O_CLOEXEC;
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    int fd = open(path, flags, 0600);
     if (fd < 0)
         return nullptr;
+    struct stat file_info;
+    int stat_result = fstat(fd, &file_info);
+    if (stat_result != 0 || !S_ISREG(file_info.st_mode)) {
+        const int error = stat_result != 0 ? errno : EINVAL;
+        close(fd);
+        errno = error;
+        return nullptr;
+    }
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         const int error = errno;
         close(fd);
         errno = error;
         return nullptr;
+    }
+    double start_time = 0;
+#if defined(__APPLE__) && TARGET_OS_OSX
+    struct proc_bsdinfo info{};
+    if (proc_pidinfo(getpid(), PROC_PIDTBSDINFO, 0, &info, sizeof info) == sizeof info)
+        start_time = (double)info.pbi_start_tvsec + (double)info.pbi_start_tvusec / 1000000.0;
+#elif defined(__linux__)
+    FILE *stat_file = fopen("/proc/self/stat", "r");
+    FILE *system_file = fopen("/proc/stat", "r");
+    long long ticks = 0, boot = 0;
+    if (stat_file && system_file) {
+        char line[4096];
+        if (fgets(line, sizeof line, stat_file)) {
+            char *tail = strrchr(line, ')');
+            if (tail) {
+                char *save = nullptr;
+                char *field = strtok_r(tail + 2, " ", &save);
+                for (int index = 0; field && index < 19; ++index)
+                    field = strtok_r(nullptr, " ", &save);
+                if (field)
+                    ticks = strtoll(field, nullptr, 10);
+            }
+        }
+        while (fgets(line, sizeof line, system_file))
+            if (sscanf(line, "btime %lld", &boot) == 1)
+                break;
+    }
+    if (stat_file)
+        fclose(stat_file);
+    if (system_file)
+        fclose(system_file);
+    long hz = sysconf(_SC_CLK_TCK);
+    if (ticks && boot && hz > 0)
+        start_time = (double)boot + (double)ticks / hz;
+#endif
+    char owner[128];
+    const int owner_size = snprintf(owner, sizeof owner, "{\"pid\":%lld,\"startTime\":%.6f}",
+                                    (long long)getpid(), start_time);
+    if (owner_size > 0 && owner_size < (int)sizeof owner) {
+        ftruncate(fd, 0);
+        if (pwrite(fd, owner, (size_t)owner_size, 0) == owner_size)
+            fsync(fd);
     }
     return new OsFileLock{fd};
 }
