@@ -596,7 +596,7 @@ def write_module_table(out, entry_names, functions, call_returns, module):
         fh.write("{\n    recomp_module_register(&%smodule);\n}\n" % prefix)
 
 
-def write_call_facts(out, facts):
+def write_call_facts(out, facts, cw_effects):
     rows, targets = [], []
     for ret, found in sorted(facts.items()):
         rows.append("    {0x%08xu, %du, %du},\n" % (ret, len(targets), len(found)))
@@ -610,7 +610,10 @@ def write_call_facts(out, facts):
         fh.write("const uint32_t recomp_call_fact_targets[] = {\n")
         for t in targets or [0]:
             fh.write("    0x%08xu,\n" % t)
-        fh.write("};\n")
+        fh.write("};\n\nconst RecompCwEffect recomp_cw_effects[] = {\n")
+        for ret, (preserved, known, value) in sorted(cw_effects.items()) or [(0, (0, 0, 0))]:
+            fh.write("    {0x%08xu, 0x%04xu, 0x%04xu, 0x%04xu},\n" % (ret, preserved, known, value))
+        fh.write("};\nconst uint32_t recomp_cw_effect_count = %d;\n" % len(cw_effects))
 
 
 def write_symbols(out, executable, image_base, functions, curated):

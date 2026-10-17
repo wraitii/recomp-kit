@@ -392,6 +392,14 @@ def jobs_for(override):
     return max(1, os.cpu_count() or 1)
 
 
+def _cw_effect(x87):
+    if x87 == "preserve":
+        return 0xffff, 0, 0
+    if x87 == "unknown":
+        return 0, 0, 0
+    return x87["preserved"], x87["known"], x87["value"]
+
+
 def native_replaced(settings):
     """Addresses a native replacement header names; their call sites keep full publication."""
     header = settings.native_header
@@ -648,7 +656,9 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
     output.write_symbols(
         args.out, str(settings.exe), ctx.image.base, symbols, settings.curated)
     output.write_call_facts(args.out, {ctx.image.insn_end(site, "CALL"): targets
-                                       for site, (kind, targets) in indirect_targets.items() if kind == "call"})
+                                       for site, (kind, targets) in indirect_targets.items() if kind == "call"},
+                            {ctx.image.insn_end(site, "CALL"): _cw_effect(row["x87"])
+                             for site, row in settings.call_effects["sites"].items() if "x87" in row})
     decisions = [decision for addr in sorted(results) if addr in selected_callers
                  for decision in results[addr].decisions]
     decisions.sort(key=lambda item: (item.get("site", ""), item.get("target", ""),

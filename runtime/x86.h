@@ -669,6 +669,12 @@ typedef struct RecompCallFact {
 extern const RecompCallFact recomp_call_facts[];
 extern const uint32_t recomp_call_fact_count;
 extern const uint32_t recomp_call_fact_targets[];
+typedef struct RecompCwEffect {
+    uint32_t ret;
+    uint16_t preserved, known, value;
+} RecompCwEffect;
+extern const RecompCwEffect recomp_cw_effects[];
+extern const uint32_t recomp_cw_effect_count;
 #ifdef RECOMP_CHECK_CALL_FACTS
 void recomp_call_fact_violation(uint32_t ret, uint32_t target);
 void recomp_import_cw_violation(const char *name, uint16_t before, uint16_t after);

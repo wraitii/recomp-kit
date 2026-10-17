@@ -455,6 +455,18 @@ uint64_t g_import_calls = 0;
 constexpr uint32_t kImportCheckpointCost = 8;
 #ifdef RECOMP_CHECK_CALL_FACTS
 thread_local uint64_t g_guest_entries = 0;
+
+bool cw_effect_allows(uint32_t ret, uint16_t before, uint16_t after) {
+    uint32_t lo = 0, hi = recomp_cw_effect_count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (recomp_cw_effects[mid].ret < ret) lo = mid + 1; else hi = mid;
+    }
+    if (lo == recomp_cw_effect_count || recomp_cw_effects[lo].ret != ret)
+        return before == after;
+    const RecompCwEffect &e = recomp_cw_effects[lo];
+    return !((before ^ after) & e.preserved) && (after & e.known) == e.value;
+}
 #endif
 } // namespace
 uint64_t imports_call_count() {
@@ -604,7 +616,7 @@ bool imports_dispatch(X86 *c, uint32_t target) {
         set_eax(c, 0);
     }
 #ifdef RECOMP_CHECK_CALL_FACTS
-    if (c->fpu_cw != cw_before && g_guest_entries == entries_before)
+    if (g_guest_entries == entries_before && !cw_effect_allows(ret_addr, cw_before, c->fpu_cw))
         recomp_import_cw_violation(table[idx].desc.c_str(), cw_before, c->fpu_cw);
 #endif
     // Read after the shim ran, so the pointer is into the table as it is now.

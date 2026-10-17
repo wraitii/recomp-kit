@@ -102,9 +102,11 @@ class Image:
             raw, words = self.raw[:n - 6], self.words
             near = at[self.executable[:n - 6] & ((raw == 0xE8) | (raw == 0xE9))]
             cond = at[self.executable[:n - 6] & (raw == 0x0F) & ((self.raw[1:n - 5] & 0xF0) == 0x80)]
-            sites = np.concatenate([near, cond]) + self.program.pe.base
+            short = at[self.executable[:n - 6] & ((raw == 0xEB) | ((raw & 0xF0) == 0x70) | ((raw & 0xFC) == 0xE0))]
+            sites = np.concatenate([near, cond, short]) + self.program.pe.base
             targets = np.concatenate([near + 5 + words[near + 1].view(np.int32),
-                                      cond + 6 + words[cond + 2].view(np.int32)]) + self.program.pe.base
+                                      cond + 6 + words[cond + 2].view(np.int32),
+                                      short + 2 + self.raw[short + 1].view(np.int8)]) + self.program.pe.base
             keep = np.isin(targets, np.fromiter(self.program.functions, dtype=np.int64))
             self._callers = defaultdict(list)
             for site, found in zip(sites[keep].tolist(), targets[keep].tolist()):
