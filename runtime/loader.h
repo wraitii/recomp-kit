@@ -46,7 +46,7 @@ const std::vector<SectionInfo> &loader_sections();
 // Auxiliary load references own DllMain attach/detach. The verified, IAT-patched
 // image is retained so a later load starts with fresh globals and CRT state.
 struct LoaderModule {
-    std::string name, path;
+    std::string name, path, sha256;
     std::vector<std::string> aliases;
     uint32_t base = 0, size = 0, entry = 0, export_rva = 0, export_size = 0;
     bool attached = false;

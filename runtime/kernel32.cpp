@@ -1381,13 +1381,22 @@ std::string library_name(const std::string &module_name) {
     return name;
 }
 
+bool explicit_library_path(const std::string &name) {
+    return name.find_first_of("\\/:") != std::string::npos;
+}
+
 void get_module_handle_named(X86 *c, const std::string &module_name) {
     std::string name = library_name(module_name);
     // A handle lookup must neither attach a mapped DLL nor acquire a reference.
     if (LoaderModule *m = loader_module_named(name.c_str())) {
-        if (!m->attached)
+        bool matches = m->attached;
+        if (matches && explicit_library_path(module_name)) {
+            std::string host = win32_host_path(module_name);
+            matches = !host.empty() && loader_hash_file(host.c_str()) == m->sha256;
+        }
+        if (!matches)
             set_last_error(126); // ERROR_MOD_NOT_FOUND
-        set_eax(c, m->attached ? m->base : 0);
+        set_eax(c, matches ? m->base : 0);
         return;
     }
     auto it = modules().find(name);
@@ -1448,6 +1457,34 @@ bool runtime_serves_module(const std::string &lower_name) {
 // loader_attach_module owns the rest of it for the COM class factories too.
 void load_library_named(X86 *c, const std::string &module_name) {
     std::string name = library_name(module_name);
+    LoaderModule *mapped = loader_module_named(name.c_str());
+    std::string host = win32_host_path(module_name);
+    OsStat stat;
+    bool exists = !host.empty() && os_stat(host.c_str(), &stat) == 0 && !stat.is_dir;
+    if (!exists && explicit_library_path(module_name) && (mapped || !runtime_serves_module(name))) {
+        log_once(("loadlib:missing:" + module_name).c_str(),
+                 "LoadLibrary(\"%s\"): requested file not found (ERROR_MOD_NOT_FOUND)",
+                 module_name.c_str());
+        set_last_error(126);
+        set_eax(c, 0);
+        return;
+    }
+    if (exists && mapped) {
+        std::string digest = loader_hash_file(host.c_str());
+        if (digest.empty() || digest != mapped->sha256) {
+            LOGW("LoadLibrary(\"%s\"): unsupported DLL identity at %s; SHA-256 %s; "
+                 "translated module %s at %s requires SHA-256 %s",
+                 module_name.c_str(), host.c_str(), digest.empty() ? "unreadable" : digest.c_str(),
+                 mapped->name.c_str(), mapped->path.c_str(), mapped->sha256.c_str());
+            fflush(stderr);
+            abort();
+        }
+    } else if (exists && !runtime_serves_module(name)) {
+        LOGW("LoadLibrary(\"%s\"): existing DLL at %s has no translation or shims; SHA-256 %s",
+             module_name.c_str(), host.c_str(), loader_hash_file(host.c_str()).c_str());
+        fflush(stderr);
+        abort();
+    }
     auto it = modules().find(name);
     if (it != modules().end()) {
         set_eax(c, it->second);
@@ -1455,7 +1492,7 @@ void load_library_named(X86 *c, const std::string &module_name) {
     }
     // Restore post-IAT bytes before each fresh attach, just as remapping the
     // original DLL would. Never restore the main image or run its EXE entry.
-    if (LoaderModule *m = loader_module_named(name.c_str())) {
+    if (LoaderModule *m = mapped) {
         if (m->base == loader_image_base()) {
             set_eax(c, m->base);
             return;
@@ -1496,7 +1533,9 @@ void k_LoadLibraryExW(X86 *c) {
         return;
     }
     std::string guest = gm_wstr(arg(c, 0));
-    if (LoaderModule *m = loader_module_named(library_name(guest).c_str()))
+    if (LoaderModule *m = explicit_library_path(guest)
+                              ? nullptr
+                              : loader_module_named(library_name(guest).c_str()))
         if (m->attached) {
             ++m->load_refs;
             set_eax(c, m->base);

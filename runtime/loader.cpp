@@ -485,6 +485,7 @@ bool map_aux_module(const AuxSpec &spec) {
         g_error = m.path + " has SHA-256 " + digest + ", expected " + spec.sha256;
         return false;
     }
+    m.sha256 = digest;
     PeLayout pe;
     if (!pe_layout(file, m.path, pe))
         return false;
@@ -933,6 +934,7 @@ bool loader_load(const char *exe_path) {
     g_entry = image_base + entry_rva;
     g_main.name = RECOMP_EXECUTABLE;
     g_main.path = g_exe_path;
+    g_main.sha256 = digest;
     g_main.base = g_base;
     g_main.size = g_size;
     g_main.entry = g_entry;

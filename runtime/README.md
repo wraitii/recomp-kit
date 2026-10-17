@@ -134,9 +134,12 @@ here, so continuing would run the guest past a point Windows never reaches.
   itself, because only `GetMessageA` knows the filter and only the runtime can
   yield the baton. With no host installed at all it returns -1, the documented
   error, rather than blocking forever or inventing a `WM_NULL`.
-- **`LoadLibraryA` only succeeds for DLLs the runtime has shims for.** Anything
-  else reports `ERROR_MOD_NOT_FOUND`, so the guest takes its own "feature
-  unavailable" path instead of calling into nothing.
+- **DLL identity precedes basename lookup.** `LoadLibraryA/W` verify requested
+  files against the mapped translation's recorded SHA-256 before returning a
+  cached handle or attaching code. An existing unsupported DLL stops with its
+  requested path and hash; a missing file returns `ERROR_MOD_NOT_FOUND`, allowing
+  the original fallback. Registered shim modules remain virtual. Full-path
+  handle queries and data-file loads also respect the requested file.
 - **`CreateWindowExA` sends `WM_NCCREATE` then `WM_CREATE`** and honours their
   failure returns by cancelling creation, as Windows does.
 - **Painting follows the window's update region, not the clock.** Showing a
