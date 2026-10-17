@@ -617,7 +617,7 @@ def load(game_dir, build_root=None):
     overlay = settings.setdefault("performance_overlay", "off")
     if overlay not in ("off", "counters", "graph"):
         raise ValueError("%s: [settings] performance_overlay must be off, counters or graph" % source)
-    presentation_filter = settings.setdefault("presentation_filter", "nearest")
+    presentation_filter = settings.setdefault("presentation_filter", "bilinear")
     if presentation_filter not in ("nearest", "bilinear"):
         raise ValueError("%s: [settings] presentation_filter must be nearest or bilinear" % source)
     rows = settings.setdefault("rows", list(SETTINGS_ROWS))
