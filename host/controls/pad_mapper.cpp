@@ -463,12 +463,6 @@ bool parse_pad_mapper_profile(const std::string &text, PadMapperProfile *profile
         if (eq == std::string::npos || eq == 0 || eq + 1 == line.size())
             return fail("invalid profile line: " + line);
         const std::string key = line.substr(0, eq), value = line.substr(eq + 1);
-        const bool legacy = key == "legacy_mapped" || key == "native_enabled" ||
-                            key.find(".key") != std::string::npos ||
-                            key.find("negative_key") != std::string::npos ||
-                            key.find("positive_key") != std::string::npos;
-        if (legacy)
-            continue;
         if (!seen.insert(key).second)
             return fail("duplicate profile field: " + key);
         if (!parse_field(key, value, &next))

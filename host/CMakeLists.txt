@@ -174,7 +174,6 @@ set(RECOMP_CONTROLS_SOURCES ${HOST}/controls/layout.cpp
                           ${HOST}/controls/haptics.cpp
                           ${HOST}/controls/editor.cpp ${HOST}/controls/editor_actions.cpp
                          ${HOST}/controls/pad_mapper.cpp ${HOST}/controls/pad_mapper_editor.cpp
-                         ${HOST}/controls/pad_guest_view.cpp
                          ${HOST}/keypad_layout.cpp ${HOST}/keypad_modifiers.cpp)
 set(RECOMP_PRESENT_SOURCES ${HOST}/present_pixels.cpp ${HOST}/present_thread.cpp ${HOST}/compositor.cpp
                         ${HOST}/ui_layer.cpp ${HOST}/performance_overlay.cpp ${RECOMP_CONTROLS_SOURCES}

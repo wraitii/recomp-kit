@@ -170,45 +170,10 @@ MOD_TEST_SUITE(controls_settings_defaults) {
     MOD_CHECK_EQ(mods_controls_value(CONTROLS_PAD_WITH_CONTROLLER_ROW), 0);
     MOD_CHECK_EQ(mods_controls_value(CONTROLS_SNAP_ROW), 1);
     MOD_CHECK_EQ(mods_controls_hidden_groups(CONTROLS_FORM_TABLET), 0u);
-    // Size clamps at its ends, like the old keypad size row.
+    // Size clamps at its ends.
     MOD_CHECK_EQ(mods_controls_set(CONTROLS_SIZE_ROW, 7), POP_OK);
     MOD_CHECK_EQ(mods_controls_value(CONTROLS_SIZE_ROW), 2);
     MOD_CHECK(mods_controls_line(CONTROLS_SIZE_ROW).find("Large") != std::string::npos);
-    mods_controls_reset();
-    mods_settings_reset();
-}
-
-// A profile that only ever knew the old host.keypad/* keys migrates into
-// host.controls/* the first time mods_controls_init runs; the keypad keys
-// stay on disk untouched (this only reads them through
-// mods_settings_stored_value, never declares them).
-MOD_TEST_SUITE(controls_settings_migration) {
-    fresh();
-    mods_controls_reset();
-    FILE *f = fopen(mods_settings_path(), "wb");
-    MOD_CHECK(f != nullptr);
-    if (f) {
-        MOD_CHECK(fputs("{\"host.keypad/left\": 0, \"host.keypad/right\": 1, "
-                        "\"host.keypad/size\": 2}\n",
-                        f) >= 0);
-        MOD_CHECK_EQ(fclose(f), 0);
-    }
-    MOD_CHECK(mods_settings_load(mods_settings_path()));
-    mods_controls_set_names({"pad", "keys", "pad+keys"});
-    mods_controls_init("pad");
-    MOD_CHECK_EQ(mods_controls_value(CONTROLS_LAYOUT_ROW), 1); // the index of "keys"
-    MOD_CHECK(mods_controls_layout_name() == "keys");
-    // The keypad's bits belong to whichever form first asks for them.
-    MOD_CHECK_EQ(mods_controls_hidden_groups(CONTROLS_FORM_TABLET), 1u); // left 0, right 1
-    MOD_CHECK_EQ(mods_controls_hidden_groups(CONTROLS_FORM_PHONE_PORTRAIT), 0u);
-    MOD_CHECK_EQ(mods_controls_value(CONTROLS_SIZE_ROW), 2);
-    // Nothing under host.controls/ was written by the migration itself.
-    int64_t discard = 0;
-    MOD_CHECK(!mods_settings_stored_value("host.controls/layout", &discard));
-    // The keypad keys are untouched and still readable.
-    int64_t left = -1;
-    MOD_CHECK(mods_settings_stored_value("host.keypad/left", &left));
-    MOD_CHECK_EQ(left, 0);
     mods_controls_reset();
     mods_settings_reset();
 }
@@ -292,28 +257,6 @@ MOD_TEST_SUITE(controls_settings_hidden_groups_per_form) {
     MOD_CHECK_EQ(mods_controls_hidden_groups(CONTROLS_FORM_PHONE_PORTRAIT), 1u);
     MOD_CHECK_EQ(mods_controls_hidden_groups(CONTROLS_FORM_PHONE_LANDSCAPE), 2u);
     MOD_CHECK_EQ(mods_controls_hidden_groups(CONTROLS_FORM_TABLET), 0u);
-    mods_controls_reset();
-    mods_settings_reset();
-}
-
-// A profile from the build that kept one set of bits for every form: they
-// belong to the form the player hid the group in, which is the first one to
-// ask, and the other forms start clean.
-MOD_TEST_SUITE(controls_settings_hidden_groups_legacy_value) {
-    fresh();
-    mods_controls_reset();
-    FILE *f = fopen(mods_settings_path(), "wb");
-    MOD_CHECK(f != nullptr);
-    if (f) {
-        MOD_CHECK(fputs("{\"host.controls/layout\": 1, \"host.controls/hidden\": 1}\n", f) >= 0);
-        MOD_CHECK_EQ(fclose(f), 0);
-    }
-    MOD_CHECK(mods_settings_load(mods_settings_path()));
-    mods_controls_set_names({"pad", "keys", "pad+keys"});
-    mods_controls_init("keys");
-    MOD_CHECK_EQ(mods_controls_hidden_groups(CONTROLS_FORM_PHONE_PORTRAIT), 1u);
-    MOD_CHECK_EQ(mods_controls_hidden_groups(CONTROLS_FORM_TABLET), 0u);
-    MOD_CHECK_EQ(mods_controls_hidden_groups(CONTROLS_FORM_PHONE_LANDSCAPE), 0u);
     mods_controls_reset();
     mods_settings_reset();
 }

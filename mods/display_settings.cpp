@@ -4,11 +4,21 @@
 
 #include <algorithm>
 #include <atomic>
-#include <vector>
 
 namespace {
-const char *keys[] = {"window", "performance_overlay"};
-int desired[DISPLAY_ROW_COUNT] = {0, 0};
+const char *const kWindowChoices[] = {"windowed", "borderless", "fullscreen"};
+const char *const kOverlayChoices[] = {"off", "counters", "graph"};
+struct RowSpec {
+    const char *key;
+    int maximum;
+    int count;
+    const char *const *choices;
+};
+constexpr RowSpec kRows[DISPLAY_ROW_COUNT] = {
+    {"window", 2, 3, kWindowChoices},
+    {"performance_overlay", 2, 3, kOverlayChoices},
+};
+int desired[DISPLAY_ROW_COUNT] = {};
 std::atomic<int> overlay{0};
 int scene_w = 0, scene_h = 0; // guest baton only
 bool initialized = false;
@@ -52,13 +62,13 @@ void mods_display_init() {
     if (initialized)
         return;
     initialized = true;
-    const int maximum[] = {2, 2};
     for (int i = 0; i < DISPLAY_ROW_COUNT; ++i) {
-        mods_settings_declare(MODS_OWNER_RUNTIME, "host.display", keys[i], keys[i], POP_SETTING_INT,
-                              desired[i], 0, maximum[i]);
+        const RowSpec &row = kRows[i];
+        mods_settings_declare(MODS_OWNER_RUNTIME, "host.display", row.key, row.key,
+                              POP_SETTING_INT, desired[i], 0, row.maximum);
         int64_t value = desired[i];
-        mods_settings_get(MODS_OWNER_RUNTIME, keys[i], &value);
-        desired[i] = int(std::clamp<int64_t>(value, 0, maximum[i]));
+        mods_settings_get(MODS_OWNER_RUNTIME, row.key, &value);
+        desired[i] = int(std::clamp<int64_t>(value, 0, row.maximum));
     }
     overlay = desired[DISPLAY_OVERLAY];
     host_display_request_window(desired[DISPLAY_WINDOW]);
@@ -70,11 +80,13 @@ int mods_display_value(DisplayRow row) {
     return desired[row];
 }
 PopModStatus mods_display_nudge(DisplayRow row, int delta) {
-    const int counts[] = {3, 3};
-    if (row < 0 || row >= DISPLAY_ROW_COUNT || !counts[row])
+    if (row < 0 || row >= DISPLAY_ROW_COUNT)
+        return POP_E_RANGE;
+    const RowSpec &spec = kRows[row];
+    if (!spec.count)
         return POP_E_RANGE;
     const int current = mods_display_value(row);
-    const int value = (current + delta + counts[row]) % counts[row];
+    const int value = (current + delta + spec.count) % spec.count;
     return mods_display_set(row, value);
 }
 // Validate and persist a display change on the owning thread, then update its live host service.
@@ -85,10 +97,10 @@ PopModStatus mods_display_set(DisplayRow row, int value) {
         return POP_E_INVAL;
     if (!mods_settings_row_listed(row))
         return POP_E_STATE; // this game has no such row
-    const int maximum[] = {2, 2};
-    if (value < 0 || value > maximum[row])
+    const RowSpec &spec = kRows[row];
+    if (value < 0 || value > spec.maximum)
         return POP_E_RANGE;
-    const auto status = mods_settings_set(MODS_OWNER_RUNTIME, keys[row], value);
+    const auto status = mods_settings_set(MODS_OWNER_RUNTIME, spec.key, value);
     if (status != POP_OK)
         return status;
     desired[row] = value;
@@ -134,11 +146,11 @@ std::string mods_display_line(DisplayRow row) {
     switch (row) {
     case DISPLAY_WINDOW:
         result = std::string("Display: ") +
-                 std::vector<const char *>{"windowed", "borderless", "fullscreen"}[desired[row]];
+                 kRows[DISPLAY_WINDOW].choices[desired[DISPLAY_WINDOW]];
         break;
     case DISPLAY_OVERLAY:
         result = std::string("Performance overlay: ") +
-                 std::vector<const char *>{"off", "counters", "graph"}[desired[row]];
+                 kRows[DISPLAY_OVERLAY].choices[desired[DISPLAY_OVERLAY]];
         break;
     default:
         return {};

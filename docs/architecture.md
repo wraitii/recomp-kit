@@ -173,8 +173,7 @@ the profile under `controls/mapper-v1.txt` in the selected game profile.
 Calibration includes center and range capture, radial stick and per-axis
 deadzones, saturation, response curves and inversion. Output scale and offset
 allow pedals to feed separate axes or opposite halves of a combined axis.
-The pad is always exposed natively through DirectInput and XInput; legacy
-`pad = "mapped"`/`"off"` keys in older profiles are read and ignored.
+The pad is always exposed natively through DirectInput and XInput.
 Games that enumerate controllers only at startup need a restart after enabling
 joystick exposure. The current SDL host opens the first recognized controller;
 calibration is stored per game profile, not separately for each physical device.

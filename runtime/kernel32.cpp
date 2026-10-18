@@ -2424,7 +2424,7 @@ void k_WaitForMultipleObjects(X86 *c) {
 // The baton moves only where Windows would have descheduled the running
 // thread anyway: a wait that cannot be satisfied yet, Sleep, and the status
 // poll a spin loop makes (GetExitCodeThread).  A guest that makes no such
-// call never yields.  That is why the frame limiter's GetTickCount spin is
+// call never yields.  That is why the guest's frame limiter GetTickCount spin is
 // left alone - nothing it waits for is another thread's to produce, and
 // yielding on every clock read would cost a context switch per read.
 //
@@ -3307,7 +3307,7 @@ bool guest_yield() {
 
 // A bounded scheduling checkpoint, called from imports_dispatch before every
 // shim.  Scheduling must not depend on which polling API the game happens to
-// call: the frame limiter spins on GetTickCount and would otherwise starve the
+// call: the guest's frame limiter spins on GetTickCount and would otherwise starve the
 // DirectInput service threads indefinitely, expired 200 ms waits and all.  Any
 // call into the runtime is a checkpoint, and a thread yields at most once per
 // millisecond so the check costs a clock read on the hot path.

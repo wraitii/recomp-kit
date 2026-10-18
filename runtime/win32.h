@@ -334,7 +334,7 @@ uint32_t host_pinned_clock_value();
 //                 run, one gap of 39 seconds. The first version traced only
 //                 this, which made the headline number - how often the guest
 //                 asks the time - describe a call the game does not make.
-//   GetTickCount  the one it does. The frame limiter spins here, so the
+//   GetTickCount  the one it does. The guest's frame limiter spins here, so the
 //                 interval between these is the shape of the main loop.
 //   QueryPerformanceCounter
 //                 the high-resolution clock, traced for the same reason: a

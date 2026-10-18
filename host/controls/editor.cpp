@@ -127,7 +127,7 @@ void add_item(std::vector<PickerItem> *items, const std::string &label, const st
     items->push_back(PickerItem{label, value, Rect{}});
 }
 
-std::vector<std::string> key_names() {
+std::vector<std::string> scancode_names() {
     std::vector<std::string> out;
     for (int sc = 0; sc < 512; ++sc)
         if (const char *nm = scancode_name(sc))
@@ -809,7 +809,7 @@ void Editor::bind_items() {
     std::vector<PickerItem> items;
     switch (c.kind) {
     case Kind::Key:
-        for (const std::string &k : key_names())
+        for (const std::string &k : scancode_names())
             add_item(&items, k, k);
         break;
     case Kind::Button:

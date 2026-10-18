@@ -23,10 +23,8 @@ HEAP_BASE_DEFAULT = 0x01000000
 
 # The settings page's rows, in mods/display_settings.h DisplayRow order; the
 # controls' seven rows are one entry. [settings] rows names the ones a game
-# shows. Without the key a game shows every row. "keypad" is the pre-touch-
-# controls spelling of "controls"; SETTINGS_ROW_ALIASES keeps it loading.
+# shows. Without the key a game shows every row.
 SETTINGS_ROWS = ("window", "performance_overlay", "controls")
-SETTINGS_ROW_ALIASES = {"keypad": "controls"}
 
 # [controls] default_layout and the on-screen layout picker's choices.
 CONTROLS_LAYOUTS = ("pad", "keys", "pad+keys", "hidden")
@@ -384,6 +382,11 @@ def load_controls(controls, source):
     if mobile not in MOBILE_CONTROLS:
         raise ValueError("%s: [controls] mobile_control must be one of %s, not %r"
                          % (source, ", ".join(MOBILE_CONTROLS), mobile))
+    unknown_controls = sorted(k for k in controls
+                              if k not in ("default_layout", "mobile_control", "native"))
+    if unknown_controls:
+        raise ValueError("%s: [controls] may name only default_layout, mobile_control and native, not %s"
+                         % (source, ", ".join(unknown_controls)))
 
     native = dict(controls.get("native", {}))
     unknown_native = sorted(k for k in native if k not in ("xinput", "dinput", "axes", "buttons"))
@@ -599,7 +602,6 @@ def load(game_dir, build_root=None):
     rows = settings.setdefault("rows", list(SETTINGS_ROWS))
     if not isinstance(rows, list):
         raise ValueError("%s: [settings] rows must be a list, not %r" % (source, rows))
-    rows = [SETTINGS_ROW_ALIASES.get(row, row) for row in rows]
     unknown = [row for row in rows if row not in SETTINGS_ROWS]
     if unknown:
         raise ValueError("%s: [settings] rows may name only %s, not %s"

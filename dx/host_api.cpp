@@ -123,7 +123,6 @@ HOST_DEFAULT int host_pad_next_event(uint32_t, HostPadEvent *) {
     return 0;
 }
 HOST_DEFAULT void host_pad_rumble(uint16_t, uint16_t) {}
-HOST_DEFAULT void host_pad_report_guest_state(const HostPadGuestState *) {}
 HOST_DEFAULT const char *host_pad_native_axes(void) {
     return "x,y,z,rz,rx,ry";
 }

@@ -1,10 +1,10 @@
 # Touch controls design: a data-driven on-screen gamepad and keyboard
 
 Date: 2026-09-17
-Status: built on branch `touch-controls` (all six steps of section 11).
-This document describes what the branch does, not what was first proposed:
-where the build settled somewhere else, the built behaviour is what is
-written here, with a sentence of reasoning.
+Status: implemented. The mapped keys-and-mouse pad output described by the
+original design was removed; the pad is always native through DirectInput and
+XInput. This document otherwise describes the built behaviour, not what was
+first proposed.
 
 ## 1. Goal
 
@@ -22,10 +22,8 @@ and desktops are all covered.
 | Topic | Decision |
 |---|---|
 | Architecture | One widget system for pad and keyboard (approach A). Not a second overlay stack, not scripting. |
-| Pad output | Per game: `native` (DirectInput joystick + XInput) or `mapped` (keys and mouse). |
 | Customization | Layout files plus an in-game editor opened from F10: move, resize, add, remove, rebind; save; reset. |
 | Pad and keyboard together | Whole-layout switching: one layout on screen at a time (e.g. `pad`, `keys`, `pad+keys`), with a toggle control to cycle. |
-| Mapped stick defaults | Left stick → arrow keys. Right stick → mouse cursor. ✕ → left click. |
 | Edited layouts | Per game, in that game's profile. No global layouts. |
 | Physical controller connected | On-screen pad-only layouts auto-hide; F10 can force them back. Key layouts stay. |
 | Stick default | Floating. It can be set to fixed per stick in the editor. |
@@ -210,18 +208,9 @@ shows layout, size, opacity, haptics and Edit controls; `pad_with_controller`
 and `snap` are on the F10 fallback page (and snap also on the editor's
 toolbar), because the Display tab holds eight rows.
 
-The existing `host.keypad/left`, `/right` and `/size` values migrate on
-first run:
-
-- `left` and `right` become the visibility of the matching groups in the
-  `keys` layout.
-- `size` becomes a scale factor of 0.89, 1.0 or 1.11 applied to that
-  layout.
-
 Only `pad`, `keys` and `pad+keys` can be the default at first launch, so
 the index cannot point at a layout that no longer exists. If an index is
-out of range at load, the game's `default_layout` is used. After the
-migration the `host.keypad/*` keys are no longer written.
+out of range at load, the game's `default_layout` is used.
 
 ## 6. Touch routing
 
@@ -283,8 +272,7 @@ each axis the value with the larger magnitude wins.
 
 ### 7.3 `native`: DirectInput joystick
 
-`dx/dinput.cpp` gains a joystick device kind, present when
-`[controls] pad = "native"`:
+`dx/dinput.cpp` gains a joystick device kind:
 
 - **Enumeration.** `EnumDevices` lists one `DI8DEVTYPE_GAMEPAD` instance
   ("Recomp Virtual Pad", with fixed instance and product GUIDs) for the
@@ -315,8 +303,6 @@ each axis the value with the larger magnitude wins.
   - A game expecting another order gets a `[controls.native]` remap table
     in `game.toml`.
 
-With `pad = "mapped"` or `"off"`, `CreateDevice` behaves as it does today.
-
 ### 7.4 `native`: XInput
 
 New `dx/xinput.cpp` registers import tables for `xinput1_3.dll`,
@@ -337,65 +323,9 @@ New `dx/xinput.cpp` registers import tables for `xinput1_3.dll`,
   start→START, L3/R3→thumbs, dpad→DPAD.
 - Sticks are scaled to ±32767 with Y up. Triggers are scaled to 0–255.
 - PS has no public XInput bit and is not reported.
-- **The DLLs are always registered**, whatever `pad` is. With
-  `pad != "native"` every entry point answers
-  `ERROR_DEVICE_NOT_CONNECTED` (and `XInputSetState` does nothing), so the
-  game still takes its no-controller path. Leaving the imports unregistered
-  was worse: a static import nothing has registered gets a generic stub
-  whose argument count is wrong, which corrupts the stack on a `__stdcall`
-  return, and a real Windows machine always has an XInput redistributable
-  to import from.
-
-### 7.5 `mapped`: keys and mouse
-
-`host/controls/binding.{h,cpp}` evaluates a table from `game.toml` on each
-input tick:
-
-```toml
-[controls]
-default_layout = "pad"      # "pad" | "keys" | "pad+keys" | "hidden"
-pad = "mapped"              # "native" | "mapped" | "off"
-
-[controls.mapped]
-left_stick = "arrows"       # "cursor" | "arrows" | "wasd" | "scroll" | "wheel" | "none"
-right_stick = "cursor"
-cursor_speed = 900          # points per second at full deflection
-cross = "mouse_left"
-circle = "mouse_right"
-square = "key:Space"
-triangle = "key:Tab"
-l1 = "key:PageUp"
-r1 = "key:PageDown"
-l2 = "mouse_middle"
-r2 = "key:LShift"
-start = "key:Escape"
-select = "key:F10"
-dpad = "arrows"
-```
-
-Those values are also the kit defaults for any entry a game leaves out.
-
-- **Button targets:** `key:<name>`, `mouse_left|right|middle`,
-  `wheel_up|down`, `action:<host action>` or `none`.
-- **`cursor`** moves the host cursor through the synthetic mouse path
-  touch uses, so the absolute cursor, relative DirectInput motion and
-  `WM_MOUSEMOVE` stay consistent. Speed follows the square of the
-  deflection.
-- **`arrows` and `wasd`** press their keys when an axis passes 0.5 and
-  release them below 0.35, so the keys don't flicker.
-- **`scroll`** emits `TouchMapper`'s two-finger pan action, one
-  `kTouchPanStep` per tick at full deflection.
-- **`wheel`** sends wheel notches at a rate that grows with deflection.
-- **Player overrides.** The editor saves overrides for single entries to
-  `<profile>/controls/binding.txt`, read on top of the `game.toml` table.
-  The file is the same `k=v;k=v` syntax as the generated table and the
-  `RECOMP_CONTROLS_MAPPED` switch, not JSON: one parser, one format to
-  test. It holds only the entries the player changed.
-- **Generated config.** `tools/gen_game_config.py` turns `[controls]` into
-  the generated config header and replaces `RECOMP_TOUCH_KEYPAD_DEFAULT`.
-  `[touch] keypad` is still read as an old spelling of `default_layout`
-  ("auto" → "keys", "hidden" → "hidden") until every game repo is
-  re-pinned.
+- **The DLLs are always registered**, so both static imports and
+  `LoadLibrary` resolve. The vpad is always reported, and a game that wants
+  its no-controller path still has one when the pad reports neutral input.
 
 ### 7.6 Rumble and haptics
 
@@ -517,12 +447,10 @@ Reached from the F10 page ("Edit controls") or an `edit_layout` action.
   - Done.
 - **Bind picker:**
   - Key controls: the key list.
-  - Pad buttons and sticks in mapped mode: the targets from 7.5.
-  - Pad buttons in native mode: the pad button list.
-- **Saving:** Done writes `<profile>/controls/<name>.<form>.json` (and
-  `binding.txt` if changed) through a temporary file and a rename, then
-  leaves the editor. After a rename-save the old user file is deleted.
-  Reset deletes the file.
+  - Pad buttons: the pad button list.
+- **Saving:** Done writes `<profile>/controls/<name>.<form>.json` through a
+  temporary file and a rename, then leaves the editor. After a rename-save
+  the old user file is deleted. Reset deletes the file.
 - **Input while editing:** the editor's own hit test runs first, so
   controls never fire while being edited (see "Opening" above).
 - **Desktop:** the mouse drives the editor, and the scroll wheel resizes.
@@ -535,7 +463,6 @@ Reached from the F10 page ("Edit controls") or an `edit_layout` action.
 | `host/controls/builtin_layouts.cpp` | Embedded `keys`, `pad`, `pad+keys` JSON for three form factors. |
 | `host/controls/router.{h,cpp}` | Finger ownership, control state, modifier machine use, auto-hide; emits key, vpad, action and tap events. SDL-free. |
 | `host/controls/vpad.{h,cpp}` | Snapshot, edge queue, source merge. |
-| `host/controls/binding.{h,cpp}` | Mapped-mode table, defaults, overrides, evaluation. SDL-free. |
 | `host/controls/gamepad_sdl.cpp` | `SDL_Gamepad` open, close, hot-plug → vpad; rumble out. |
 | `host/controls/haptics.{h,cpp}` + `host/sdl/platform_ui_*` | Rumble and tap per platform. |
 | `host/controls/raster.{h,cpp}`, `pad_art.{h,cpp}` | Anti-aliased shaded shape primitives, and the DualSense-styled control art drawn with them. |
@@ -545,7 +472,7 @@ Reached from the F10 page ("Edit controls") or an `edit_layout` action.
 | `host/keypad_layout.*`, `keypad_modifiers.*` | Scan names and modifier machine kept; half tables move into `builtin_layouts.cpp`. |
 | `host/present*.{h,cpp}` | `host_present_set_controls`, `host_present_game_rect`, portrait placement. |
 | `host/sdl/main.cpp`, `host/input_gate.cpp` | Wiring; pointer mapping through the game rectangle. |
-| `mods/controls_settings.{h,cpp}` | Replaces `keypad_settings`: section 5 settings, migration. |
+| `mods/controls_settings.{h,cpp}` | Section 5 settings. |
 | `dx/dinput.cpp` | Joystick device (7.3). |
 | `dx/xinput.cpp` | XInput DLLs (7.4). |
 | `host/Info-ios.plist.in`, `cmake/IosBundle.cmake`, `platform/android/...` | Orientation (8.2). |
@@ -560,12 +487,11 @@ on every platform before the PR merges.
 
 1. **Layout model and keypad port.**
    - Includes the JSON model, the router, and the overlay drawing `key`
-     controls, plus the tablet `keys` built-in and the settings migration.
+     controls, plus the tablet `keys` built-in.
    - No visible change: the iPad keypad looks and behaves exactly as
      before.
-2. **Pad and mapped binding.**
-   - Adds `button`, `dpad`, `stick` and `toggle` controls, the vpad and the
-     binding stage.
+2. **Pad and layouts.**
+   - Adds `button`, `dpad`, `stick` and `toggle` controls and the vpad.
    - Adds the raster helper, the DualSense look, the tablet `pad` and
      `pad+keys` built-ins, `[controls]` in `game.toml`, layout cycling,
      button haptics and opacity.
@@ -582,7 +508,7 @@ on every platform before the PR merges.
      lookup and the orientation changes.
    - Adds `host_present_game_rect` and the portrait layout.
    - Targets: iPhone and an Android phone.
-6. **Editor**, including binding overrides and snapping.
+6. **Editor**, including snapping.
 
 ## 12. Testing
 
@@ -597,8 +523,6 @@ on every platform before the PR merges.
   - Dpad sectors.
   - Ownership with several fingers.
   - Source merge.
-  - Binding hysteresis, cursor speed and override precedence.
-  - Settings migration from `host.keypad/*`.
   - Raster primitives against reference pixels.
 - **Step-1 regression:** the tablet `keys` built-in yields the same key
   rectangles and scancodes as the old tables at all three sizes.

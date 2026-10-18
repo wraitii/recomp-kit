@@ -48,7 +48,7 @@ def main():
             try: child.wait(timeout=15)
             except subprocess.TimeoutExpired: child.kill();child.wait()
             code=124
-    result=dict(exit=code,drawable=a.size,clock='real',limit=120,profile=a.readback_timings,stage_counters=a.readback_counters,displayed_fps_verified=False,renderer_submit_draws=a.submit_draws,readback_workers=a.readback_workers,readback_kernel=a.readback_kernel,binary_sha256=hashlib.sha256(a.binary.read_bytes()).hexdigest(),core_sha256=core_hashes)
+    result=dict(exit=code,drawable=a.size,clock='real',profile=a.readback_timings,stage_counters=a.readback_counters,displayed_fps_verified=False,renderer_submit_draws=a.submit_draws,readback_workers=a.readback_workers,readback_kernel=a.readback_kernel,binary_sha256=hashlib.sha256(a.binary.read_bytes()).hexdigest(),core_sha256=core_hashes)
     if code==0 and (o/'frames.csv').exists():
         rows=[r for r in csv.DictReader((o/'frames.csv').open()) if r['screen_class']=='2' and r['repeat']=='0']
         if rows:

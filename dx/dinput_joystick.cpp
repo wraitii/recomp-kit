@@ -639,28 +639,8 @@ uint32_t joy_get_device_state(ComObj *d, uint32_t size, uint32_t out) {
     const uint32_t packet = host_pad_state(&s);
     uint8_t buf[JOY_DIJOYSTATE2_SIZE];
     fill_state(buf, s, d->joy_ranges);
-    HostPadGuestState observed{};
-    observed.api = 1;
-    observed.packet = packet;
-    for (uint32_t i = 0; i < JOY_AXES; ++i) {
-        const uint32_t offset = guest_ofs(d, i);
-        observed.present[i] = offset != 0xFFFFFFFFu && offset <= size && size - offset >= 4;
-        memcpy(&observed.axes[i], buf + i * 4, 4);
-        observed.minimum[i] = d->joy_ranges[i].min;
-        observed.maximum[i] = d->joy_ranges[i].max;
-    }
-    observed.pov_present = guest_ofs(d, JOY_AXES) != 0xFFFFFFFFu;
-    memcpy(&observed.pov, buf + JOY_OFF_POV, 4);
-    for (uint32_t i = 0; i < JOY_BUTTONS; ++i) {
-        if (guest_ofs(d, kObjButton0 + i) == 0xFFFFFFFFu)
-            continue;
-        observed.buttons_present = 1;
-        if (buf[JOY_OFF_BUTTONS + i])
-            observed.buttons |= 1u << i;
-    }
     if (d->joy_format.empty()) {
         memcpy(gm_ptr(out), buf, size < sizeof buf ? size : sizeof buf);
-        host_pad_report_guest_state(&observed);
         return DI_OK;
     }
     const std::vector<JoyObject> &objs = joy_objects();
@@ -668,7 +648,6 @@ uint32_t joy_get_device_state(ComObj *d, uint32_t size, uint32_t out) {
         const JoyObject &o = objs[slot.object];
         memcpy(gm_ptr(out + slot.ofs), buf + o.ofs, object_width(o));
     }
-    host_pad_report_guest_state(&observed);
     return DI_OK;
 }
 
@@ -682,7 +661,7 @@ uint32_t joy_get_device_state(ComObj *d, uint32_t size, uint32_t out) {
 uint32_t joy_get_device_data(ComObj *d, uint32_t objsize, uint32_t out, uint32_t inout,
                              uint32_t flags) {
     struct Record {
-        uint32_t ofs, data, sequence, native_ofs;
+        uint32_t ofs, data, sequence;
     };
     uint32_t want = rd32(inout);
     bool peek = (flags & DIGDD_PEEK) != 0;
@@ -710,7 +689,7 @@ uint32_t joy_get_device_data(ComObj *d, uint32_t objsize, uint32_t out, uint32_t
             if (objs[i].ofs == ofs)
                 gofs = guest_ofs(d, i);
         if (gofs != 0xFFFFFFFFu)
-            records.push_back(Record{gofs, data, e.sequence, ofs});
+            records.push_back(Record{gofs, data, e.sequence});
     }
     uint32_t n = (uint32_t)records.size();
     if (out) {
@@ -725,19 +704,6 @@ uint32_t joy_get_device_data(ComObj *d, uint32_t objsize, uint32_t out, uint32_t
             wr32(a + DIDOD_OFF_dwSequence, records[i].sequence);
             if (objsize >= DIDEVICEOBJECTDATA_DX8_SIZE)
                 wr32(a + DIDOD_OFF_uAppData, 0);
-            const Record &record = records[i];
-            if (record.native_ofs < JOY_AXES * 4) {
-                const uint32_t axis = record.native_ofs / 4;
-                HostPadGuestState observed{};
-                observed.api = 1;
-                observed.partial = 1;
-                observed.packet = record.sequence;
-                observed.present[axis] = 1;
-                observed.axes[axis] = (int32_t)record.data;
-                observed.minimum[axis] = d->joy_ranges[axis].min;
-                observed.maximum[axis] = d->joy_ranges[axis].max;
-                host_pad_report_guest_state(&observed);
-            }
         }
     }
     wr32(inout, n);

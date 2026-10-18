@@ -241,7 +241,7 @@ MOD_TEST_SUITE(page_shows_only_the_rows_the_game_lists) {
     MOD_CHECK(std::string(mods_page_line(0)).find("Display:") == 0);
     MOD_CHECK(std::string(mods_page_line(1)).find("Performance overlay:") == 0);
     MOD_CHECK(std::string(mods_page_line(2)).find("Mobile controls") == 0);
-    // An unlisted row cannot be set and keeps its neutral value.
+    // A value outside the row's range is refused.
     MOD_CHECK_EQ(mods_display_set(DISPLAY_WINDOW, 3), POP_E_RANGE);
     mods_page_close();
     teardown();

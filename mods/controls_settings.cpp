@@ -21,31 +21,32 @@ std::vector<std::string> g_names = {"pad", "keys", "pad+keys"};
 
 // EDIT_ROW is an action, never declared or persisted.
 constexpr int kStoredRowCount = CONTROLS_EDIT_ROW;
-const char *const kKeys[kStoredRowCount] = {
-    "mobile_control", "layout", "size", "opacity", "haptics", "pad_with_controller", "snap"};
-const char *const kLabels[kStoredRowCount] = {
-    "Mobile controls", "Controls",        "Controls size",   "Controls opacity",
-    "Button haptics",  "Pad with controller", "Editor snapping"};
-const int kMin[kStoredRowCount] = {0, 0, 0, 20, 0, 0, 0};
-// The layout row's true maximum is dynamic (g_names.size()); this entry is
-// unused for it and only fills out the array.
-const int kMax[kStoredRowCount] = {2, 0, 2, 100, 1, 1, 1};
+struct RowSpec {
+    const char *key;
+    const char *label;
+    int minimum;
+    int maximum;
+    int initial;
+};
+constexpr RowSpec kRows[CONTROLS_ROW_COUNT] = {
+    {"mobile_control", "Mobile controls", 0, 2, 1},
+    {"layout", "Controls", 0, 0, 0},
+    {"size", "Controls size", 0, 2, 1},
+    {"opacity", "Controls opacity", 20, 100, 100},
+    {"haptics", "Button haptics", 0, 1, 1},
+    {"pad_with_controller", "Pad with controller", 0, 1, 0},
+    {"snap", "Editor snapping", 0, 1, 1},
+    {nullptr, nullptr, 0, 0, 0},
+};
 
 // Written by the settings page and the on-screen tab, read by the host loop
 // that lays the controls out: each value is atomic on its own.
-std::atomic<int> values[CONTROLS_ROW_COUNT] = {1, 0, 1, 100, 1, 0, 1, 0};
+std::atomic<int> values[CONTROLS_ROW_COUNT];
 // The hidden-group bits: one 16-bit lane per form factor, packed into the
-// single stored "hidden" value with kHiddenPacked as the marker that says so.
-// A value without the marker was written by the build that kept one set of
-// bits for every form; it waits in hidden_legacy_bits until a form asks for
-// it (adopt_legacy), because only the host knows which form the player was
-// looking at when they hid the group.
+// single stored "hidden" value.
 constexpr int kHiddenLaneBits = 16;
-constexpr int64_t kHiddenPacked = int64_t(1) << (kHiddenLaneBits * CONTROLS_FORM_COUNT);
-constexpr int64_t kHiddenMax = (kHiddenPacked << 1) - 1;
-std::atomic<uint32_t> hidden_groups[CONTROLS_FORM_COUNT] = {0, 0, 0};
-std::atomic<uint32_t> hidden_legacy_bits{0};
-std::atomic<bool> hidden_legacy{false};
+constexpr int64_t kHiddenMax = (int64_t(1) << (kHiddenLaneBits * CONTROLS_FORM_COUNT)) - 1;
+std::atomic<uint32_t> hidden_groups[CONTROLS_FORM_COUNT] = {};
 // A hidden-group change the host has not flushed to the settings store yet.
 std::atomic<bool> hidden_dirty{false};
 std::atomic<bool> edit_request{false};
@@ -76,30 +77,17 @@ std::string name_at(int index) {
 
 // The three lanes as one stored value.
 int64_t packed_hidden() {
-    int64_t v = kHiddenPacked;
+    int64_t v = 0;
     for (int f = 0; f < CONTROLS_FORM_COUNT; ++f)
         v |= int64_t(hidden_groups[f].load()) << (kHiddenLaneBits * f);
     return v;
 }
 
-// A stored value back into the lanes, marked or not (see kHiddenPacked).
 void unpack_hidden(int64_t v) {
     if (v < 0)
         v = 0;
-    const bool packed = (v & kHiddenPacked) != 0;
     for (int f = 0; f < CONTROLS_FORM_COUNT; ++f)
-        hidden_groups[f] = packed ? uint32_t((v >> (kHiddenLaneBits * f)) & 0xffff) : 0u;
-    hidden_legacy_bits = packed ? 0u : uint32_t(v & 0xffff);
-    hidden_legacy = !packed && hidden_legacy_bits.load() != 0;
-}
-
-// The one set of bits an older profile holds belongs to the form the player
-// hid the group in, and the first form to ask for them is that one.
-void adopt_legacy(ControlsForm form) {
-    if (!hidden_legacy.exchange(false))
-        return;
-    hidden_groups[form] = hidden_legacy_bits.exchange(0);
-    hidden_dirty = true; // rewrite it in the packed form
+        hidden_groups[f] = uint32_t((v >> (kHiddenLaneBits * f)) & 0xffff);
 }
 } // namespace
 
@@ -114,7 +102,7 @@ void mods_controls_refresh_names() {
     // The row was declared with the old name count, and mods_settings_declare
     // is a no-op once a key exists, so the maximum is moved in place. Without
     // this a layout saved under a new name could not be selected.
-    mods_settings_set_range(MODS_OWNER_RUNTIME, kKeys[CONTROLS_LAYOUT_ROW], 0, layout_max());
+    mods_settings_set_range(MODS_OWNER_RUNTIME, kRows[CONTROLS_LAYOUT_ROW].key, 0, layout_max());
     mods_controls_set(CONTROLS_LAYOUT_ROW,
                       std::clamp(values[CONTROLS_LAYOUT_ROW].load(), 0, layout_max()));
 }
@@ -125,61 +113,35 @@ void mods_controls_init(const char *default_layout, int mobile_default) {
 
     const std::string want = default_layout ? default_layout : "";
     const int found = index_of(want);
+    for (int i = 0; i < CONTROLS_ROW_COUNT; ++i)
+        values[i] = kRows[i].initial;
     values[CONTROLS_MOBILE_ROW] = std::clamp(mobile_default, 0, 2);
     values[CONTROLS_LAYOUT_ROW] = want == "hidden" ? layout_max() : found >= 0 ? found : 0;
-    values[CONTROLS_SIZE_ROW] = 1;
-    values[CONTROLS_OPACITY_ROW] = 100;
-    values[CONTROLS_HAPTICS_ROW] = 1;
-    values[CONTROLS_PAD_WITH_CONTROLLER_ROW] = 0;
-    values[CONTROLS_SNAP_ROW] = 1;
-    unpack_hidden(kHiddenPacked);
-
-    // Migrate a saved keypad profile the first time host.controls/layout has
-    // never been written. The keypad's own keys are left on disk untouched:
-    // this only reads them, never declares or rewrites them.
-    int64_t discard = 0;
-    if (!mods_settings_stored_value("host.controls/layout", &discard)) {
-        int64_t left = 1, right = 1, size = -1;
-        const bool has_left = mods_settings_stored_value("host.keypad/left", &left);
-        const bool has_right = mods_settings_stored_value("host.keypad/right", &right);
-        if (has_left || has_right) {
-            const int keys_index = index_of("keys");
-            values[CONTROLS_LAYOUT_ROW] = keys_index >= 0 ? keys_index : 0;
-            uint32_t bits = 0;
-            if (has_left && left == 0)
-                bits |= 1;
-            if (has_right && right == 0)
-                bits |= 2;
-            hidden_legacy_bits = bits;
-            hidden_legacy = bits != 0;
-            if (mods_settings_stored_value("host.keypad/size", &size))
-                values[CONTROLS_SIZE_ROW] = int(size);
-        }
-    }
+    unpack_hidden(0);
 
     for (int i = 0; i < kStoredRowCount; ++i) {
-        const int max = i == CONTROLS_LAYOUT_ROW ? layout_max() : kMax[i];
-        mods_settings_declare(MODS_OWNER_RUNTIME, "host.controls", kKeys[i], kLabels[i],
-                              POP_SETTING_INT, values[i], kMin[i], max);
+        const RowSpec &row = kRows[i];
+        const int max = i == CONTROLS_LAYOUT_ROW ? layout_max() : row.maximum;
+        mods_settings_declare(MODS_OWNER_RUNTIME, "host.controls", row.key, row.label,
+                              POP_SETTING_INT, values[i], row.minimum, max);
         int64_t v = values[i].load();
-        mods_settings_get(MODS_OWNER_RUNTIME, kKeys[i], &v);
+        mods_settings_get(MODS_OWNER_RUNTIME, row.key, &v);
         // A layout index out of range means the profile names a layout this
         // build no longer discovers (a deleted user copy, a game that ships
         // fewer files). The spec has that fall back to the game's
         // default_layout, which values[] already holds: clamping instead
         // landed on the Hidden slot, so losing one file left a blank screen.
-        if (i == CONTROLS_LAYOUT_ROW && (v < kMin[i] || v > max))
+        if (i == CONTROLS_LAYOUT_ROW && (v < row.minimum || v > max))
             continue;
-        values[i] = int(std::clamp<int64_t>(v, kMin[i], max));
+        values[i] = int(std::clamp<int64_t>(v, row.minimum, max));
     }
-    // The hidden bits' own value carries all three form lanes (kHiddenPacked).
-    const int64_t hidden_initial =
-        hidden_legacy.load() ? int64_t(hidden_legacy_bits.load()) : packed_hidden();
+    // The hidden bits' own value carries all three form lanes.
+    const int64_t hidden_initial = packed_hidden();
     mods_settings_declare(MODS_OWNER_RUNTIME, "host.controls", "hidden", "hidden", POP_SETTING_INT,
                           hidden_initial, 0, kHiddenMax);
     int64_t hv = hidden_initial;
     mods_settings_get(MODS_OWNER_RUNTIME, "hidden", &hv);
-    unpack_hidden(std::clamp<int64_t>(hv, 0, kHiddenMax));
+    unpack_hidden(hv);
     hidden_dirty = false;
 }
 
@@ -195,15 +157,9 @@ void mods_controls_reset() {
         std::lock_guard<std::mutex> lock(g_names_mutex);
         g_names = {"pad", "keys", "pad+keys"};
     }
-    values[CONTROLS_MOBILE_ROW] = 1;
-    values[CONTROLS_LAYOUT_ROW] = 0;
-    values[CONTROLS_SIZE_ROW] = 1;
-    values[CONTROLS_OPACITY_ROW] = 100;
-    values[CONTROLS_HAPTICS_ROW] = 1;
-    values[CONTROLS_PAD_WITH_CONTROLLER_ROW] = 0;
-    values[CONTROLS_SNAP_ROW] = 1;
-    values[CONTROLS_EDIT_ROW] = 0;
-    unpack_hidden(kHiddenPacked);
+    for (int i = 0; i < CONTROLS_ROW_COUNT; ++i)
+        values[i] = kRows[i].initial;
+    unpack_hidden(0);
     hidden_dirty = false;
     edit_request = false;
     editing = false;
@@ -224,12 +180,12 @@ PopModStatus mods_controls_set(ControlsRow row, int value) {
         edit_request = true;
         return POP_OK;
     }
-    const int max = row == CONTROLS_LAYOUT_ROW ? layout_max() : kMax[row];
-    const int v = std::clamp(value, kMin[row], max);
+    const int max = row == CONTROLS_LAYOUT_ROW ? layout_max() : kRows[row].maximum;
+    const int v = std::clamp(value, kRows[row].minimum, max);
     values[row] = v;
     if (!initialized)
         return POP_OK; // nothing declared yet: the value is applied when it is
-    return mods_settings_set(MODS_OWNER_RUNTIME, kKeys[row], v);
+    return mods_settings_set(MODS_OWNER_RUNTIME, kRows[row].key, v);
 }
 
 // The layout choice and the on/off rows turn over in either direction, like
@@ -264,34 +220,35 @@ std::string mods_controls_line(ControlsRow row) {
     switch (row) {
     case CONTROLS_MOBILE_ROW: {
         static const char *const modes[3] = {"Off", "Mobile only", "Always"};
-        snprintf(buf, sizeof buf, "%-22s %s", "Mobile controls",
+        snprintf(buf, sizeof buf, "%-22s %s", kRows[row].label,
                  modes[std::clamp(mods_controls_value(row), 0, 2)]);
         break;
     }
     case CONTROLS_LAYOUT_ROW: {
         const std::string name = mods_controls_layout_name();
-        snprintf(buf, sizeof buf, "%-22s %s", "Controls", name.empty() ? "hidden" : name.c_str());
+        snprintf(buf, sizeof buf, "%-22s %s", kRows[row].label,
+                 name.empty() ? "hidden" : name.c_str());
         break;
     }
     case CONTROLS_SIZE_ROW: {
         static const char *const sizes[3] = {"Small", "Medium", "Large"};
-        snprintf(buf, sizeof buf, "%-22s %s", "Controls size",
+        snprintf(buf, sizeof buf, "%-22s %s", kRows[row].label,
                  sizes[std::clamp(mods_controls_value(row), 0, 2)]);
         break;
     }
     case CONTROLS_OPACITY_ROW:
-        snprintf(buf, sizeof buf, "%-22s %d%%", "Controls opacity", mods_controls_value(row));
+        snprintf(buf, sizeof buf, "%-22s %d%%", kRows[row].label, mods_controls_value(row));
         break;
     case CONTROLS_HAPTICS_ROW:
-        snprintf(buf, sizeof buf, "%-22s %s", "Button haptics",
+        snprintf(buf, sizeof buf, "%-22s %s", kRows[row].label,
                  mods_controls_value(row) ? "on" : "off");
         break;
     case CONTROLS_PAD_WITH_CONTROLLER_ROW:
-        snprintf(buf, sizeof buf, "%-22s %s", "Pad with controller",
+        snprintf(buf, sizeof buf, "%-22s %s", kRows[row].label,
                  mods_controls_value(row) ? "on" : "off");
         break;
     case CONTROLS_SNAP_ROW:
-        snprintf(buf, sizeof buf, "%-22s %s", "Editor snapping",
+        snprintf(buf, sizeof buf, "%-22s %s", kRows[row].label,
                  mods_controls_value(row) ? "on" : "off");
         break;
     case CONTROLS_EDIT_ROW:
@@ -324,14 +281,12 @@ bool mods_controls_row_applies(ControlsRow row) {
 uint32_t mods_controls_hidden_groups(ControlsForm form) {
     if (form < 0 || form >= CONTROLS_FORM_COUNT)
         return 0;
-    adopt_legacy(form);
     return hidden_groups[form].load();
 }
 
 void mods_controls_set_hidden_groups(ControlsForm form, uint32_t bits) {
     if (form < 0 || form >= CONTROLS_FORM_COUNT)
         return;
-    adopt_legacy(form);
     const uint32_t v = bits & 0xffffu;
     if (hidden_groups[form].exchange(v) == v)
         return;

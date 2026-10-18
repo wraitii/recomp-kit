@@ -42,8 +42,6 @@ void host_set_focused(bool focused);
 void host_gamepad_state(const PadState &raw);
 PadMapperProfile host_mapper_profile();
 PadState host_mapper_raw_state();
-PadState host_mapper_calibrated_state();
-PadState host_mapper_guest_state();
 std::string host_mapper_status();
 void host_mapper_load();
 bool host_mapper_apply(const PadMapperProfile &profile, bool persist);

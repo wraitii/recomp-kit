@@ -482,7 +482,7 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     if (!imports_is_trampoline(target))
         return false;
     // A bounded scheduling checkpoint. Cooperative threads must not depend on
-    // the guest happening to call a blocking API: the frame limiter spins on
+    // the guest happening to call a blocking API: the guest's frame limiter spins on
     // GetTickCount and would otherwise starve the service threads for as long
     // as it liked, expired waits and all. Every call into the runtime is a
     // checkpoint, rate limited to one yield per millisecond per thread, and it

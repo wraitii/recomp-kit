@@ -21,7 +21,6 @@
 #include <filesystem>
 #include <mutex>
 #include <stdio.h>
-#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -57,9 +56,6 @@ bool trace() {
 PadMapper g_mapper;
 std::mutex g_mapper_view_mutex;
 PadState g_mapper_raw;
-PadState g_mapper_calibrated;
-PadState g_mapper_guest;
-PadState g_mapper_guest_physical;
 std::string g_mapper_status;
 
 void set_mapper_status(std::string status) {
@@ -464,14 +460,11 @@ void host_set_focused(bool focused) {
 }
 
 void host_gamepad_state(const PadState &raw) {
-    PadState calibrated, mapped;
-    g_mapper.process(raw, &calibrated, &mapped);
+    PadState mapped;
+    g_mapper.process(raw, nullptr, &mapped);
     {
         std::lock_guard<std::mutex> lock(g_mapper_view_mutex);
         g_mapper_raw = raw;
-        g_mapper_calibrated = calibrated;
-        g_mapper_guest_physical = mapped;
-        g_mapper_guest = merge(mapped, g_router.pad());
     }
     if (!g_game_focused || g_editor.is_open()) {
         vpad().set_source(kPadSourceController, PadState{});
@@ -487,16 +480,6 @@ PadMapperProfile host_mapper_profile() {
 PadState host_mapper_raw_state() {
     std::lock_guard<std::mutex> lock(g_mapper_view_mutex);
     return g_mapper_raw;
-}
-
-PadState host_mapper_calibrated_state() {
-    std::lock_guard<std::mutex> lock(g_mapper_view_mutex);
-    return g_mapper_calibrated;
-}
-
-PadState host_mapper_guest_state() {
-    std::lock_guard<std::mutex> lock(g_mapper_view_mutex);
-    return g_mapper_guest;
 }
 
 std::string host_mapper_status() {
@@ -705,10 +688,6 @@ void host_pump(uint64_t now) {
                     g_controller_present ? "present" : "absent");
     }
     vpad().set_source(kPadSourceTouch, g_game_focused ? g_router.pad() : PadState{});
-    {
-        std::lock_guard<std::mutex> lock(g_mapper_view_mutex);
-        g_mapper_guest = merge(g_mapper_guest_physical, g_router.pad());
-    }
 
     {
         // Serial first: the values read after it are at least as new.

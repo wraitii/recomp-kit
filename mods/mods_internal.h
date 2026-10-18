@@ -183,9 +183,7 @@ void mods_settings_declare(uint32_t owner, const char *mod_id, const char *key, 
 // is clamped into the new range; an undeclared key is ignored.
 void mods_settings_set_range(uint32_t owner, const char *key, int64_t min, int64_t max);
 // The persisted value under "mod_id/key", whether or not anything has
-// declared that key this run. Used for one-time migrations that read an
-// older owner's settings without declaring them (controls_settings.cpp
-// reading host.keypad/*).
+// declared that key this run.
 bool mods_settings_stored_value(const char *mod_id_slash_key, int64_t *out);
 
 // ---- host services and the page (T9) --------------------------------------

@@ -186,7 +186,7 @@ flight — the same invariant the single-threaded runtime had.
 
 **Every call into the runtime is a scheduling checkpoint.** `imports_dispatch`
 yields if the running thread has held the baton for a millisecond. Scheduling
-must not depend on which API the guest happens to poll: the frame limiter spins
+must not depend on which API the guest happens to poll: the guest's frame limiter spins
 on `GetTickCount`, and when only blocking calls yielded it could starve the
 DirectInput workers indefinitely with their 200 ms waits already expired. The
 millisecond rate limit bounds the yield frequency. Translated direct, indirect,
