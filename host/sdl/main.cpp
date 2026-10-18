@@ -147,6 +147,8 @@ uint32_t mouse_wparam() {
     return host_mouse_wparam(g_buttons, host_guest_modifiers());
 }
 void post(uint32_t msg, uint32_t wparam, uint32_t lparam) {
+    if (msg >= 0x0200 && msg <= 0x020e && dinput_host_mouse_exclusive())
+        return;
     // Mouse input is addressed to a point, not to a window: the runtime
     // hit-tests it, activates what it lands on, and converts the position into
     // that window's client coordinates - which is what Windows does and what
@@ -592,7 +594,9 @@ void update_platform_pointer_capture() {
         g_pointer_sample_valid = false;
         fprintf(stderr, "[host] relative mouse capture: %s\n", relative ? "ON" : "OFF");
     }
-    const bool hide = (want && kRelativeMouseCapture) ||
+    const bool hide = (want && (kRelativeMouseCapture || dinput_host_mouse_exclusive())) ||
+                      (g_focused && mods_page_visible() && dinput_host_mouse_exclusive() &&
+                       !mods_controls_editing()) ||
                       (g_focused && !g_guest_cursor_visible && !mods_page_visible());
     if (hide && !g_pointer_hidden) {
         trace_state("capture ON: hiding the OS cursor");
@@ -2061,6 +2065,8 @@ int web_main(int argc, char **argv) {
     }
     g_surface = gpu::native_surface_for_window(g_window);
     fprintf(stderr, "GPU backend: %s\n", gpu::default_backend_name());
+    if (recomp_env("TRACE_POINTER"))
+        fprintf(stderr, "[host] pointer tracing enabled\n");
     int bw, bh, dw, dh;
     window_sizes(&bw, &bh, &dw, &dh);
     if (dw <= 0 || dh <= 0) {
@@ -2339,6 +2345,8 @@ int main(int argc, char **argv) {
         return 3;
     }
     fprintf(stderr, "GPU backend: %s\n", gpu::default_backend_name());
+    if (recomp_env("TRACE_POINTER"))
+        fprintf(stderr, "[host] pointer tracing enabled\n");
     // The launcher: when the game is missing or not the supported build, or the
     // player asked for it. Mobile shows it briefly even when the game is ready,
     // so a touch can open it.

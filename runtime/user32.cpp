@@ -57,6 +57,11 @@ bool (*g_message_waiter)() = nullptr;
 void (*g_window_shown)(uint32_t) = nullptr;
 uint8_t g_key_state[256] = {0};
 
+bool trace_pointer() {
+    static const bool on = recomp_env("TRACE_POINTER") != nullptr;
+    return on;
+}
+
 // WS_VISIBLE: a window created with it is shown as part of creation.
 const uint32_t WS_VISIBLE = 0x10000000u;
 
@@ -643,8 +648,12 @@ void u_ScreenToClient(X86 *c) {
              (int32_t)rd32(p + 4), w->x, w->y);
         int32_t x, y;
         client_origin(w->hwnd, &x, &y);
+        int32_t sx = (int32_t)rd32(p), sy = (int32_t)rd32(p + 4);
         wr32(p, rd32(p) - uint32_t(x));
         wr32(p + 4, rd32(p + 4) - uint32_t(y));
+        if (trace_pointer())
+            fprintf(stderr, "[cursor] ScreenToClient %d,%d - %d,%d -> %d,%d\n", sx, sy, x, y,
+                    (int32_t)rd32(p), (int32_t)rd32(p + 4));
     }
     set_eax(c, w ? 1 : 0);
 }
@@ -663,8 +672,12 @@ void u_ClientToScreen(X86 *c) {
     if (p && w) {
         int32_t x, y;
         client_origin(w->hwnd, &x, &y);
+        int32_t cx = (int32_t)rd32(p), cy = (int32_t)rd32(p + 4);
         wr32(p, rd32(p) + uint32_t(x));
         wr32(p + 4, rd32(p + 4) + uint32_t(y));
+        if (trace_pointer())
+            fprintf(stderr, "[cursor] ClientToScreen %d,%d + %d,%d -> %d,%d\n", cx, cy, x, y,
+                    (int32_t)rd32(p), (int32_t)rd32(p + 4));
     }
     set_eax(c, 1);
 }
@@ -1294,9 +1307,11 @@ void u_GetSystemMetrics(X86 *c) {
     case 15:
         v = 19;
         break;
+    case 23:
+        v = 0;
+        break;
     case 19:
     case 22:
-    case 23:
     case 41:
     case 42:
     case 44:
@@ -1503,6 +1518,8 @@ void u_SetCursor(X86 *c) {
 void u_SetCursorPos(X86 *c) {
     g_cursor_x = (int32_t)arg(c, 0);
     g_cursor_y = (int32_t)arg(c, 1);
+    if (trace_pointer())
+        fprintf(stderr, "[cursor] SetCursorPos %d,%d\n", g_cursor_x, g_cursor_y);
     set_eax(c, 1);
 }
 void u_GetCursorPos(X86 *c) {
@@ -1511,6 +1528,8 @@ void u_GetCursorPos(X86 *c) {
         wr32(p, (uint32_t)g_cursor_x);
         wr32(p + 4, (uint32_t)g_cursor_y);
     }
+    if (trace_pointer())
+        fprintf(stderr, "[cursor] GetCursorPos -> %d,%d\n", g_cursor_x, g_cursor_y);
     set_eax(c, 1);
 }
 void u_GetMessagePos(X86 *c) {

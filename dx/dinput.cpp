@@ -82,7 +82,9 @@ const uint32_t DIMOFS_BUTTON0 = 12;
 // Only the baton holder edits device ownership. The SDL idle pump reads the
 // published count without touching guest memory or the COM registry.
 std::set<uint32_t> g_acquired_mice;
+std::set<uint32_t> g_exclusive_mice;
 std::atomic<uint32_t> g_acquired_mouse_count{0};
+std::atomic<uint32_t> g_exclusive_mouse_count{0};
 void publish_mouse_acquisition(ComObj *d) {
     if (d->dev_type != DIDEVTYPE_MOUSE)
         return;
@@ -90,7 +92,12 @@ void publish_mouse_acquisition(ComObj *d) {
         g_acquired_mice.insert(d->id);
     else
         g_acquired_mice.erase(d->id);
+    if (d->acquired && (d->di_coop & DISCL_EXCLUSIVE))
+        g_exclusive_mice.insert(d->id);
+    else
+        g_exclusive_mice.erase(d->id);
     g_acquired_mouse_count.store(uint32_t(g_acquired_mice.size()));
+    g_exclusive_mouse_count.store(uint32_t(g_exclusive_mice.size()));
 }
 void device_destroy(ComObj *d) {
     d->acquired = false;
@@ -258,6 +265,9 @@ void poll_device(ComObj *d) {
     for (uint32_t b = 0; b < 8; ++b) {
         uint8_t now = g_host_in.buttons[b] & 0x80u;
         if (now != (d->last_buttons[b] & 0x80u)) {
+            if (recomp_env("TRACE_POINTER"))
+                fprintf(stderr, "[dinput-button] device %u button %u %s coop %x\n", d->id, b,
+                        now ? "down" : "up", d->di_coop);
             if (d->buffer_size)
                 d->events.push_back(pack_event(DIMOFS_BUTTON0 + b, now ? 0x80 : 0));
             d->last_buttons[b] = now;
@@ -641,6 +651,7 @@ void Device_SetCooperativeLevel(X86 *c) {
         return;
     }
     d->di_coop = arg(c, 2);
+    publish_mouse_acquisition(d);
     com_ret(c, DI_OK);
 }
 
@@ -1148,6 +1159,10 @@ extern "C" int dinput_host_mouse_acquired() {
     return g_acquired_mouse_count.load() != 0;
 }
 
+extern "C" int dinput_host_mouse_exclusive() {
+    return g_exclusive_mouse_count.load() != 0;
+}
+
 // Called by the host after it has fed new mouse or keyboard state through
 // host_input_state. Signals every device that registered a notification event,
 // which wakes guest service threads so they can call GetDeviceData. It signals
@@ -1173,6 +1188,8 @@ void dinput_reset() {
     g_host_in = HostInput();
     g_acquired_mice.clear();
     g_acquired_mouse_count = 0;
+    g_exclusive_mice.clear();
+    g_exclusive_mouse_count = 0;
     std::lock_guard<std::mutex> lock(g_notify_m);
     g_notify.clear();
 }

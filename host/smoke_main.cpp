@@ -339,6 +339,8 @@ uint32_t make_lparam(int32_t x, int32_t y) {
 }
 
 void post(uint32_t msg, uint32_t wparam, uint32_t lparam) {
+    if (msg >= 0x0200 && msg <= 0x020e && dinput_host_mouse_exclusive())
+        return;
     if (msg >= 0x0100 && msg <= 0x0109) {
         host_post_key_message(msg, wparam, lparam);
         return;

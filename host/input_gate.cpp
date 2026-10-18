@@ -1,5 +1,6 @@
 // input_gate.cpp - see input_gate.h.
 #include "input_gate.h"
+#include "../dx/host_api.h"
 #include "../runtime/mods_seam.h"
 #include "../runtime/win32.h"
 
@@ -38,6 +39,8 @@ bool g_phys_mod[256];
 uint8_t g_guest_modifiers;
 
 void post(uint32_t msg, uint32_t wparam, uint32_t lparam) {
+    if (msg >= 0x0200 && msg <= 0x020e && dinput_host_mouse_exclusive())
+        return;
     // Keyboard input is addressed to the focus, not to a window the host
     // picked: the runtime knows which window has it, and in a VCL application
     // the first window created is the invisible application one, which does
