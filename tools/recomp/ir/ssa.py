@@ -61,12 +61,17 @@ class SSA:
         return v
 
     def resolve(self, v):
-        path = []
-        while v.id in self.aliases:
+        aliases = self.aliases
+        target = aliases.get(v.id)
+        if target is None:
+            return v
+        path = [v.id]
+        v = target
+        while v.id in aliases:
             path.append(v.id)
-            v = self.aliases[v.id]
+            v = aliases[v.id]
         for ident in path:
-            self.aliases[ident] = v
+            aliases[ident] = v
         return v
 
     def simplify_phis(self):
@@ -86,21 +91,25 @@ class SSA:
 
     def compact(self):
         """Resolve graph references and densely renumber before building ID-based plans."""
-        resolve = self.resolve
-        values = [v for v in self.values if resolve(v) is v]
+        resolved = [None] * len(self.values)
+        for value in self.values:
+            resolved[value.id] = value
+        for ident, value in self.aliases.items():
+            resolved[ident] = self.resolve(value)
+        values = [v for v in self.values if resolved[v.id] is v]
 
         def state(lanes):
             for key, value in lanes.items():
-                lanes[key] = resolve(value)
+                lanes[key] = resolved[value.id]
 
         for value in values:
-            value.args = tuple(resolve(arg) for arg in value.args)
+            value.args = tuple(resolved[arg.id] for arg in value.args)
         state(self.inputs)
-        self.entry_ops = [v for v in self.entry_ops if resolve(v) is v]
+        self.entry_ops = [v for v in self.entry_ops if resolved[v.id] is v]
         records = set()
         for block in self.blocks.values():
-            block.phis = [v for v in block.phis if resolve(v) is v]
-            block.ops = [v for v in block.ops if resolve(v) is v]
+            block.phis = [v for v in block.phis if resolved[v.id] is v]
+            block.ops = [v for v in block.ops if resolved[v.id] is v]
             state(block.state)
             state(block.exit)
             for snapshots in (block.snapshots, block.reloads):
@@ -115,7 +124,7 @@ class SSA:
             for name in ("op", "a", "b", "carry", "res"):
                 value = getattr(record, name)
                 if value is not None:
-                    setattr(record, name, resolve(value))
+                    setattr(record, name, resolved[value.id])
             state(record.flags)
         self.values = values
         self.aliases.clear()
