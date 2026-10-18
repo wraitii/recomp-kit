@@ -28,7 +28,9 @@ def icon(path):
                      + chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b""))
 
 
-def build(build_root, config):
+def build(build_root, config, portable=False, python_root=None):
+    if portable and (platform.system() != "Darwin" or platform.machine() != "arm64" or not python_root):
+        raise ValueError("--package-library requires arm64 macOS and --library-python-root")
     source = ROOT / "desktop/library"
     output = Path(build_root) / "library"
     output.mkdir(parents=True, exist_ok=True)
@@ -60,6 +62,9 @@ def build(build_root, config):
                           "CFBundleShortVersionString": "0.1.0", "CFBundleVersion": "0.1.0",
                           "NSHighResolutionCapable": True}, stream)
         subprocess.run(["codesign", "--force", "--sign", "-", str(bundle)], check=True)
+        if portable:
+            from package_library import package
+            package(bundle, build_root, python_root)
         print(f"Library app: {bundle}")
     else:
         output.mkdir(parents=True, exist_ok=True)

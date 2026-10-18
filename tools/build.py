@@ -93,6 +93,11 @@ def game_defines(game_dir, build_root):
 def configure(preset, extra=(), build_dir=None):
     """Configure a preset; `build_dir` overrides the preset's binary directory."""
     command = [cmake_tool("cmake"), "--preset", preset, "-DPython3_EXECUTABLE=" + sys.executable]
+    dependencies = ROOT.parent / "dependencies"
+    if (dependencies / "manifest.json").is_file():
+        command += ["-DRECOMP_DEPENDENCIES=" + str(dependencies),
+                    "-DCMAKE_MAKE_PROGRAM=" + str(Path(sys.executable).parent / "ninja"),
+                    "-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"]
     if build_dir is not None:
         command += ["-B", str(build_dir)]
     subprocess.run(command + list(extra), cwd=ROOT, check=True)
@@ -508,6 +513,8 @@ def parse_args(argv, system=None):
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 2, 8))
     parser.add_argument("--preset", default=default_preset(system), help="CMake configure preset")
     parser.add_argument("--config", choices=("Release", "Debug"), default="Release")
+    parser.add_argument("--package-library", action="store_true")
+    parser.add_argument("--library-python-root", type=Path)
     game_config.add_game_args(parser)
     parser.add_argument("--stub", action="store_true",
                         help="Link the hosts against a stub translation (no game code; CI's build)")
@@ -583,7 +590,7 @@ def main():
             sys.exit(status)
     if args.target == "library":
         from build_library import build as build_library
-        build_library(args.build_root, args.config)
+        build_library(args.build_root, args.config, args.package_library, args.library_python_root)
         return
     if args.diff_harness:
         out = args.harness_out or (args.build_root / "recomp/diff" / harness_name())

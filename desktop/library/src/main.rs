@@ -41,6 +41,8 @@ fn command(settings: &Settings, storage: &PathBuf, request: &Value) -> Command {
     if let Some(home) = std::env::var_os("HOME") {
         paths.push(PathBuf::from(home).join(".cargo/bin"));
     }
+    cmd.env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("PYTHONNOUSERSITE", "1");
     #[cfg(target_os = "macos")]
     paths.extend([
         PathBuf::from("/opt/homebrew/bin"),
@@ -290,16 +292,25 @@ fn main() {
             let data = app.path().data_dir()?.join("recomp-kit");
             std::fs::create_dir_all(&data)?;
             let settings_file = data.join("settings.json");
-            let settings = std::fs::read(&settings_file)
+            let resources = app.path().resource_dir()?;
+            let bundled = resources.join("kit/tools/library.py").is_file();
+            let mut settings: Settings = std::fs::read(&settings_file)
                 .or_else(|_| std::fs::read(legacy.join("settings.json")))
                 .ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                 .unwrap_or_else(|| Settings {
-                    kit: option_env!("RECOMP_LIBRARY_KIT").unwrap_or("").into(),
-                    python: option_env!("RECOMP_LIBRARY_PYTHON")
+                    kit: if bundled { resources.join("kit").to_string_lossy().into_owned() }
+                        else { option_env!("RECOMP_LIBRARY_KIT").unwrap_or("").into() },
+                    python: if bundled { resources.join("python/bin/python3").to_string_lossy().into_owned() }
+                        else { option_env!("RECOMP_LIBRARY_PYTHON")
                         .unwrap_or("python3")
-                        .into(),
+                        .into() },
                 });
+            if bundled && (settings.kit.ends_with("/Contents/Resources/kit")
+                || !PathBuf::from(&settings.kit).join("tools/library.py").is_file()) {
+                settings.kit = resources.join("kit").to_string_lossy().into_owned();
+                settings.python = resources.join("python/bin/python3").to_string_lossy().into_owned();
+            }
             if !settings_file.exists() {
                 std::fs::write(&settings_file, serde_json::to_vec(&settings)?)?;
             }

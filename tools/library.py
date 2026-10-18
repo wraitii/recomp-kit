@@ -945,6 +945,7 @@ def job_log(request, storage):
 
 def prerequisites(needs_rust, needs_innoextract=False):
     checks = []
+    bundled_dependencies = (KIT.parent / "dependencies/manifest.json").is_file()
     brew = shutil.which("brew")
     if not brew and os.name != "nt":
         brew = next((str(path) for path in (Path("/opt/homebrew/bin/brew"), Path("/usr/local/bin/brew"),
@@ -965,12 +966,12 @@ def prerequisites(needs_rust, needs_innoextract=False):
              ("cmake", "CMake", "https://cmake.org/download/"),
              ("ninja", "Ninja", "https://ninja-build.org/"),
              ("git", "Git", "https://git-scm.com/downloads")]
-    if needs_rust:
+    if needs_rust and not bundled_dependencies:
         tools += [("cargo", "Cargo", "https://rustup.rs/"),
                   ("rustc", "Rust compiler", "https://rustup.rs/")]
     if needs_innoextract:
         tools += [("innoextract", "GOG installer extraction", "https://constexpr.org/innoextract/")]
-    if os.name != "nt":
+    if os.name != "nt" and not bundled_dependencies:
         tools += [("make", "Make (video dependency)", "https://www.gnu.org/software/make/")]
     def shell_command(arguments):
         return subprocess.list2cmdline(arguments) if os.name == "nt" else shlex.join(arguments)

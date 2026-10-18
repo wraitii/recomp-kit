@@ -2,6 +2,10 @@
 # a branch, so a configure today and a configure next year build the same bytes.
 include(FetchContent)
 
+set(RECOMP_DEPENDENCIES "" CACHE PATH "Prebuilt desktop dependencies")
+if(RECOMP_DEPENDENCIES)
+  find_package(SDL3 3.4.16 EXACT CONFIG REQUIRED PATHS "${RECOMP_DEPENDENCIES}/sdl/lib/cmake/SDL3" NO_DEFAULT_PATH)
+else()
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
@@ -21,6 +25,8 @@ FetchContent_Declare(SDL3
   GIT_TAG release-3.4.16
   GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(SDL3)
+
+endif()
 
 # recomp_link_sdl(<target>): link SDL3 statically and give the target its headers.
 function(recomp_link_sdl target)
@@ -63,11 +69,15 @@ if(RECOMP_VIDEO)
     message(FATAL_ERROR "RECOMP_VIDEO is not supported on ${CMAKE_SYSTEM_NAME}")
   endif()
   include(ExternalProject)
-  if(NOT WIN32 OR NOT CMAKE_HOST_WIN32)
+  if(NOT RECOMP_DEPENDENCIES AND (NOT WIN32 OR NOT CMAKE_HOST_WIN32))
     set(RECOMP_FFMPEG_SHELL /bin/sh)
     find_program(RECOMP_FFMPEG_MAKE NAMES make REQUIRED)
   endif()
-  set(RECOMP_FFMPEG_PREFIX "${CMAKE_BINARY_DIR}/ffmpeg")
+  if(RECOMP_DEPENDENCIES)
+    set(RECOMP_FFMPEG_PREFIX "${RECOMP_DEPENDENCIES}/ffmpeg")
+  else()
+    set(RECOMP_FFMPEG_PREFIX "${CMAKE_BINARY_DIR}/ffmpeg")
+  endif()
   set(RECOMP_FFMPEG_CONFIGURE
     --prefix=${RECOMP_FFMPEG_PREFIX}
     --enable-shared --disable-static --disable-programs --disable-doc
@@ -199,6 +209,7 @@ if(RECOMP_VIDEO)
     get_filename_component(RECOMP_FFMPEG_MSYS_BIN "${RECOMP_FFMPEG_MAKE}" DIRECTORY)
     list(APPEND RECOMP_FFMPEG_ENV --modify "PATH=path_list_prepend:${RECOMP_FFMPEG_MSYS_BIN}")
   endif()
+  if(NOT RECOMP_DEPENDENCIES)
   ExternalProject_Add(ffmpeg
     URL https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz
     URL_HASH SHA256=733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1
@@ -220,6 +231,7 @@ if(RECOMP_VIDEO)
   foreach(component avformat avcodec avutil)
     add_dependencies(ffmpeg::${component} ffmpeg)
   endforeach()
+  endif()
 endif()
 
 # Object-library consumers must inherit both the headers and the dynamic link.
