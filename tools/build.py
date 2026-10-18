@@ -95,9 +95,12 @@ def configure(preset, extra=(), build_dir=None):
     command = [cmake_tool("cmake"), "--preset", preset, "-DPython3_EXECUTABLE=" + sys.executable]
     dependencies = ROOT.parent / "dependencies"
     if (dependencies / "manifest.json").is_file():
+        manifest = json.loads((dependencies / "manifest.json").read_text())
+        if platform.system() != "Darwin" or platform.machine() != manifest["architecture"]:
+            raise ValueError("Bundled dependencies do not match this operating system and architecture")
         command += ["-DRECOMP_DEPENDENCIES=" + str(dependencies),
                     "-DCMAKE_MAKE_PROGRAM=" + str(Path(sys.executable).parent / "ninja"),
-                    "-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"]
+                    "-DCMAKE_OSX_DEPLOYMENT_TARGET=" + manifest["macosMinimum"]]
     if build_dir is not None:
         command += ["-B", str(build_dir)]
     subprocess.run(command + list(extra), cwd=ROOT, check=True)

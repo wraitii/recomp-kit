@@ -31,6 +31,8 @@ def icon(path):
 def build(build_root, config, portable=False, python_root=None):
     if portable and (platform.system() != "Darwin" or platform.machine() != "arm64" or not python_root):
         raise ValueError("--package-library requires arm64 macOS and --library-python-root")
+    if portable:
+        os.environ["MACOSX_DEPLOYMENT_TARGET"] = "14.0"
     source = ROOT / "desktop/library"
     output = Path(build_root) / "library"
     output.mkdir(parents=True, exist_ok=True)
@@ -60,7 +62,8 @@ def build(build_root, config, portable=False, python_root=None):
             plistlib.dump({"CFBundleExecutable": "recomp-library", "CFBundleIdentifier": "dev.recompkit.library",
                           "CFBundleName": "Recomp Library", "CFBundlePackageType": "APPL",
                           "CFBundleShortVersionString": "0.1.0", "CFBundleVersion": "0.1.0",
-                          "NSHighResolutionCapable": True}, stream)
+                          "NSHighResolutionCapable": True,
+                          **({"LSMinimumSystemVersion": "14.0"} if portable else {})}, stream)
         subprocess.run(["codesign", "--force", "--sign", "-", str(bundle)], check=True)
         if portable:
             from package_library import package

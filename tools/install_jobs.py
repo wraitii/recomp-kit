@@ -833,6 +833,9 @@ def recipe_identity(kit, game_dir):
                     raise JobError("recipe_special_file", "The build recipe contains a special file.",
                                    details={"path": str(path)})
     digest = hashlib.sha256(b"recomp-recipe-v1\n")
+    dependencies = kit.parent / "dependencies/manifest.json"
+    if dependencies.is_file():
+        digest.update(b"bundled-dependencies\0" + dependencies.read_bytes())
     total = 0
     for path in sorted(files, key=lambda item: unicodedata.normalize("NFC", item.relative_to(kit).as_posix())):
         digest.update(path.relative_to(kit).as_posix().encode("utf-8") + b"\0")

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   pull_request:
   push:
-    branches: [main, desktop-library-package]
+    branches: [main]
     paths:
       - desktop/library/**
       - web/library/**
@@ -44,6 +44,7 @@ jobs:
           key: library-arm64-macos14-${{ hashFiles('cmake/Dependencies.cmake', 'dx/CMakeLists.txt', 'graphics/d3d8-wgpu/**', 'desktop/library/Cargo.lock', 'desktop/library/Cargo.toml', 'tools/build_d3d8_wgpu.py') }}-${{ github.sha }}
           restore-keys: |
             library-arm64-macos14-${{ hashFiles('cmake/Dependencies.cmake', 'dx/CMakeLists.txt', 'graphics/d3d8-wgpu/**', 'desktop/library/Cargo.lock', 'desktop/library/Cargo.toml', 'tools/build_d3d8_wgpu.py') }}-
+            library-arm64-macos14-
       - name: Prepare pinned standalone Python
         run: |
           curl --fail --location --retry 3 -o "$RUNNER_TEMP/python.tar.gz" 'https://github.com/astral-sh/python-build-standalone/releases/download/20261013/cpython-3.14.8%2B20261013-aarch64-apple-darwin-install_only_stripped.tar.gz'
@@ -70,6 +71,7 @@ jobs:
           "$resources/python/bin/python3" "$resources/kit/tools/build.py" --game stub --stub --target app --build-root "$RUNNER_TEMP/relocated-build"
           codesign --verify --deep --strict "$RUNNER_TEMP/Relocated Library/Recomp Library.app"
       - name: Upload portable application
+        if: ${{ !cancelled() && hashFiles('build/library/recomp-library-macos-arm64.zip') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: recomp-library-macos-arm64
@@ -77,7 +79,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Preserve build caches
-        if: always() && steps.cache.outputs.cache-hit != 'true'
+        if: ${{ !cancelled() && steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: |

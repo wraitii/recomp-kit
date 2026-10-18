@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -64,7 +65,24 @@ def package(bundle, build_root, python_root):
     cmake_build = dependency_build / "cmake/macos-stub"
     subprocess.run([str(python / "bin/cmake"), "--install", str(cmake_build / "_deps/sdl3-build"),
                     "--prefix", str(dependencies / "sdl")], check=True)
+    if not (dependencies / "sdl/lib/cmake/SDL3/SDL3Config.cmake").is_file():
+        raise ValueError("SDL did not install its development package")
+    shutil.copy2(cmake_build / "_deps/sdl3-src/LICENSE.txt", dependencies / "sdl/LICENSE.txt")
     shutil.copytree(cmake_build / "ffmpeg", dependencies / "ffmpeg", symlinks=True)
+    shutil.copy2(ROOT / "third_party/ffmpeg/NOTICE.md", dependencies / "ffmpeg/NOTICE.md")
+    sources = resources / "sources"
+    sources.mkdir()
+    shutil.copy2(cmake_build / "ffmpeg-prefix/src/ffmpeg-7.1.1.tar.xz", sources)
+    registry = Path(os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))) / "registry/src"
+    for lock in (ROOT / "desktop/library/Cargo.lock", ROOT / "graphics/d3d8-wgpu/Cargo.lock"):
+        for entry in tomllib.loads(lock.read_text())["package"]:
+            name = f"{entry['name']}-{entry['version']}"
+            for crate in registry.glob(f"*/{name}"):
+                for path in crate.rglob("*"):
+                    if path.is_file() and path.name.upper().startswith(("LICENSE", "COPYING", "NOTICE", "COPYRIGHT")):
+                        destination = resources / "licenses/cargo" / name / path.relative_to(crate)
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(path, destination)
     bridge = dependencies / "d3d8"
     bridge.mkdir()
     for name in ("d3d_bridge.h", "native-libs.rsp"):
