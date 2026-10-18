@@ -66,7 +66,7 @@ and notes. Without a game repository, `tools/build.py --game <id>` in this kit
 builds into `build/<id>/`. `tools/build.py --target library` builds the desktop
 library. On arm64 macOS, add `--package-library --library-python-root /path/to/python`
 with a standalone Python installation to bundle the source kit, conversion tools,
-CMake, Ninja, SDL and FFmpeg development files, and the Rust renderer. The
+CMake, Ninja, SDL and FFmpeg development files, Lua, and the Rust renderer. The
 `Desktop library` workflow builds and relocates this package without game files;
 its ad hoc signed artifact targets macOS 14 and still needs Apple Command Line
 Tools to compile games locally. Developer ID signing and notarization are not yet

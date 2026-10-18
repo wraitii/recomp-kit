@@ -1,16 +1,23 @@
-# Vendored Lua 5.4: the library only, lua.c and luac.c are not vendored.
-file(GLOB RECOMP_LUA_SOURCES CONFIGURE_DEPENDS ${RECOMP_ROOT}/third_party/lua/*.c)
-add_library(lua STATIC ${RECOMP_LUA_SOURCES})
-set_target_properties(lua PROPERTIES
-  C_STANDARD 99 C_EXTENSIONS OFF
-  ARCHIVE_OUTPUT_DIRECTORY ${RECOMP_ARCHIVE_DIR} OUTPUT_NAME lua)
-target_include_directories(lua PUBLIC ${RECOMP_ROOT}/third_party/lua)
-target_compile_options(lua PRIVATE -Wall -Wextra -Wno-unused-parameter)
-target_compile_definitions(lua PRIVATE
-  $<$<PLATFORM_ID:Darwin>:LUA_USE_MACOSX>
-  $<$<PLATFORM_ID:iOS>:LUA_USE_IOS>
-  $<$<PLATFORM_ID:Linux>:LUA_USE_LINUX>)
-recomp_optimize(lua 2)
+if(RECOMP_DEPENDENCIES)
+  add_library(lua STATIC IMPORTED GLOBAL)
+  set_target_properties(lua PROPERTIES
+    IMPORTED_LOCATION "${RECOMP_DEPENDENCIES}/liblua.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${RECOMP_ROOT}/third_party/lua")
+else()
+  # Vendored Lua 5.4: the library only, lua.c and luac.c are not vendored.
+  file(GLOB RECOMP_LUA_SOURCES CONFIGURE_DEPENDS ${RECOMP_ROOT}/third_party/lua/*.c)
+  add_library(lua STATIC ${RECOMP_LUA_SOURCES})
+  set_target_properties(lua PROPERTIES
+    C_STANDARD 99 C_EXTENSIONS OFF
+    ARCHIVE_OUTPUT_DIRECTORY ${RECOMP_ARCHIVE_DIR} OUTPUT_NAME lua)
+  target_include_directories(lua PUBLIC ${RECOMP_ROOT}/third_party/lua)
+  target_compile_options(lua PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  target_compile_definitions(lua PRIVATE
+    $<$<PLATFORM_ID:Darwin>:LUA_USE_MACOSX>
+    $<$<PLATFORM_ID:iOS>:LUA_USE_IOS>
+    $<$<PLATFORM_ID:Linux>:LUA_USE_LINUX>)
+  recomp_optimize(lua 2)
+endif()
 
 # The mod foundation. Globbed as the scripts globbed, so a new module is
 # picked up by the next configure.

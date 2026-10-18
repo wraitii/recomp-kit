@@ -69,6 +69,7 @@ def package(bundle, build_root, python_root):
         raise ValueError("SDL did not install its development package")
     shutil.copy2(cmake_build / "_deps/sdl3-src/LICENSE.txt", dependencies / "sdl/LICENSE.txt")
     shutil.copytree(cmake_build / "ffmpeg", dependencies / "ffmpeg", symlinks=True)
+    shutil.copy2(cmake_build / "lib/liblua.a", dependencies / "liblua.a")
     shutil.copy2(ROOT / "third_party/ffmpeg/NOTICE.md", dependencies / "ffmpeg/NOTICE.md")
     sources = resources / "sources"
     sources.mkdir()
