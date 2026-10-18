@@ -1,12 +1,12 @@
 // run_record_tests.cpp - that mods_run_record_capture_payload can be called
 // from anywhere without harming the process that called it.
 //
-// The record's CONTENT is covered by tools/recomp/mods_test.sh and by Gate B,
-// which read a real run's record. What is covered here is the property those
-// cannot see: the capture walks a directory a mod author controls, and a mod
-// author is free to put a symlink cycle, a named pipe or a hundred nested
-// directories in it. Each of the cases below took the process down or hung it
-// before, and each is silent about it in a record that never gets written.
+// The record's CONTENT is covered by Gate B, which reads a real run's record.
+// What is covered here is the property it cannot see: the capture walks a
+// directory a mod author controls, and a mod author is free to put a symlink
+// cycle, a named pipe or a hundred nested directories in it. Each of the cases
+// below took the process down or hung it before, and each is silent about it in
+// a record that never gets written.
 #include "mods_tests.h"
 #include "../../platform/os.h"
 #ifndef _WIN32

@@ -1385,8 +1385,7 @@ MOD_TEST_SUITE(loader_an_empty_run_still_writes_its_record) {
     MOD_CHECK_EQ(os_stat(record.c_str(), &st), 0);
     MOD_CHECK(st.size > 0);
 
-    // The mod set the record names is the run record's own business and is
-    // asserted against a fresh process in tools/recomp/mods_test.sh; this
+    // The mod set the record names is the run record's own business; this
     // binary has loaded mods many times over, so what it accumulates here
     // would not be evidence either way.
 }
