@@ -84,6 +84,30 @@ class Context(object):
         self.lifter = Lifter()
         self.known = frozenset(program.functions)
         self.artifacts = ArtifactStore(artifacts)
+        self.dropped_discovered = getattr(settings, "discovered_dropped", {})
+        if settings.discovered and not settings.discovered_checked:
+            settings.discovered_checked = True
+            dropped = self._drop_undecodable_discovered()
+            if dropped:
+                settings.discovered_dropped = dropped
+                self.__init__(settings, artifacts)
+
+    def _drop_undecodable_discovered(self):
+        """Sweep-discovered bodies are guesses; a decode failure drops that guess."""
+        functions, entries = self.settings.discovered
+        dropped = {}
+        for addr in sorted(functions):
+            try:
+                self.load(addr)
+            except (TranslateError, LiftError, SSAError, RecursionError) as error:
+                dropped[addr] = str(error)
+        if dropped:
+            self.settings.discovered = (
+                {addr: rows for addr, rows in functions.items() if addr not in dropped},
+                {addr: row for addr, row in entries.items()
+                 if addr not in dropped and row[0] not in dropped},
+            )
+        return dropped
 
     def load(self, addr):
         """The decoded function, indexed, with the entries the map gives it."""
@@ -389,6 +413,10 @@ def main(argv=None):
     settings = Settings(game_config.load(args.game), args.allow_unmodelled, jobs_for(args.jobs), args.module)
     discovered_rows(settings)
     ctx = Context(settings)
+    if ctx.dropped_discovered:
+        log("  dropped %d undecodable discovered functions" % len(ctx.dropped_discovered))
+        for addr, reason in sorted(ctx.dropped_discovered.items()):
+            log("    %08x  %s" % (addr, reason))
     settings, program = ctx.settings, ctx.program
     phase("load")
     if args.regen_function:
