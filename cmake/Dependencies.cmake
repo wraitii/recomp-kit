@@ -6,26 +6,25 @@ set(RECOMP_DEPENDENCIES "" CACHE PATH "Prebuilt desktop dependencies")
 if(RECOMP_DEPENDENCIES)
   find_package(SDL3 3.4.16 EXACT CONFIG REQUIRED PATHS "${RECOMP_DEPENDENCIES}/sdl/lib/cmake/SDL3" NO_DEFAULT_PATH)
 else()
-set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-set(SDL_STATIC ON CACHE BOOL "" FORCE)
-set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
-set(SDL_TESTS OFF CACHE BOOL "" FORCE)
-set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
-# Subsystems the host does not use stay out of the binary.
-set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
-set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
-set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
-set(SDL_RENDER ON CACHE BOOL "" FORCE)
-set(SDL_GPU OFF CACHE BOOL "" FORCE)
-if(EMSCRIPTEN)
-  set(SDL_PTHREADS ON CACHE BOOL "" FORCE) # the game runs on a thread of its own
-endif()
-FetchContent_Declare(SDL3
-  GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-  GIT_TAG release-3.4.16
-  GIT_SHALLOW TRUE)
-FetchContent_MakeAvailable(SDL3)
-
+  set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+  set(SDL_STATIC ON CACHE BOOL "" FORCE)
+  set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+  set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+  set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+  # Subsystems the host does not use stay out of the binary.
+  set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
+  set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
+  set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
+  set(SDL_RENDER ON CACHE BOOL "" FORCE)
+  set(SDL_GPU OFF CACHE BOOL "" FORCE)
+  if(EMSCRIPTEN)
+    set(SDL_PTHREADS ON CACHE BOOL "" FORCE) # the game runs on a thread of its own
+  endif()
+  FetchContent_Declare(SDL3
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+    GIT_TAG release-3.4.16
+    GIT_SHALLOW TRUE)
+  FetchContent_MakeAvailable(SDL3)
 endif()
 
 # recomp_link_sdl(<target>): link SDL3 statically and give the target its headers.
@@ -210,27 +209,27 @@ if(RECOMP_VIDEO)
     list(APPEND RECOMP_FFMPEG_ENV --modify "PATH=path_list_prepend:${RECOMP_FFMPEG_MSYS_BIN}")
   endif()
   if(NOT RECOMP_DEPENDENCIES)
-  ExternalProject_Add(ffmpeg
-    URL https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz
-    URL_HASH SHA256=733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    CONFIGURE_COMMAND ${RECOMP_FFMPEG_ENV} ${RECOMP_FFMPEG_SHELL} <SOURCE_DIR>/configure ${RECOMP_FFMPEG_CONFIGURE}
-    BUILD_COMMAND ${RECOMP_FFMPEG_ENV} ${RECOMP_FFMPEG_MAKE} -j8
-    INSTALL_COMMAND ${RECOMP_FFMPEG_ENV} ${RECOMP_FFMPEG_MAKE} install
-    BUILD_BYPRODUCTS ${RECOMP_FFMPEG_LIBRARIES} ${RECOMP_FFMPEG_IMPLIBRARIES})
-  if(WIN32)
-    # Windows finds a DLL beside the executable: every host and test binary
-    # is built into RECOMP_OUT.
-    ExternalProject_Add_Step(ffmpeg copy_dlls
-      COMMAND ${CMAKE_COMMAND} -E make_directory ${RECOMP_OUT}
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${RECOMP_FFMPEG_LIBRARIES} ${RECOMP_OUT}
-      DEPENDEES install)
-  endif()
-  # Imported include paths must exist at generation time, before installation.
-  file(MAKE_DIRECTORY "${RECOMP_FFMPEG_PREFIX}/include")
-  foreach(component avformat avcodec avutil)
-    add_dependencies(ffmpeg::${component} ffmpeg)
-  endforeach()
+    ExternalProject_Add(ffmpeg
+      URL https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz
+      URL_HASH SHA256=733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+      CONFIGURE_COMMAND ${RECOMP_FFMPEG_ENV} ${RECOMP_FFMPEG_SHELL} <SOURCE_DIR>/configure ${RECOMP_FFMPEG_CONFIGURE}
+      BUILD_COMMAND ${RECOMP_FFMPEG_ENV} ${RECOMP_FFMPEG_MAKE} -j8
+      INSTALL_COMMAND ${RECOMP_FFMPEG_ENV} ${RECOMP_FFMPEG_MAKE} install
+      BUILD_BYPRODUCTS ${RECOMP_FFMPEG_LIBRARIES} ${RECOMP_FFMPEG_IMPLIBRARIES})
+    if(WIN32)
+      # Windows finds a DLL beside the executable: every host and test binary
+      # is built into RECOMP_OUT.
+      ExternalProject_Add_Step(ffmpeg copy_dlls
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${RECOMP_OUT}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${RECOMP_FFMPEG_LIBRARIES} ${RECOMP_OUT}
+        DEPENDEES install)
+    endif()
+    # Imported include paths must exist at generation time, before installation.
+    file(MAKE_DIRECTORY "${RECOMP_FFMPEG_PREFIX}/include")
+    foreach(component avformat avcodec avutil)
+      add_dependencies(ffmpeg::${component} ffmpeg)
+    endforeach()
   endif()
 endif()
 
