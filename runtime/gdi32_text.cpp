@@ -189,6 +189,7 @@ template <bool Wide> void get_metrics(X86 *c) {
         wr32(out + 4, uint32_t(pen.metrics.ascent));
         wr32(out + 8, uint32_t(pen.metrics.descent));
         wr32(out + 12, uint32_t(pen.metrics.internal));
+        wr32(out + 16, uint32_t(pen.metrics.external));
         wr32(out + 20, uint32_t(pen.metrics.average));
         wr32(out + 24, uint32_t(pen.metrics.maximum));
     }
@@ -200,6 +201,7 @@ void metrics_a(uint8_t *out, uint32_t weight, const Pen &pen) {
     put32(4, uint32_t(pen.metrics.ascent));
     put32(8, uint32_t(pen.metrics.descent));
     put32(12, uint32_t(pen.metrics.internal));
+    put32(16, uint32_t(pen.metrics.external));
     put32(20, uint32_t(pen.metrics.average));
     put32(24, uint32_t(pen.metrics.maximum));
     put32(28, weight);
@@ -470,7 +472,7 @@ uint32_t draw_text(uint32_t hdc, uint32_t text, uint32_t count, uint32_t rp, uin
     Rect rect{int32_t(rd32(rp)), int32_t(rd32(rp + 4)), int32_t(rd32(rp + 8)),
               int32_t(rd32(rp + 12))};
     const Pen pen = pen_of(hdc);
-    const int64_t ch = pen.height();
+    const int64_t ch = pen.height() + ((flags & 0x200) ? pen.metrics.external : 0);
     struct Cell {
         uint16_t ch;
         bool underline;

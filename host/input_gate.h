@@ -200,6 +200,8 @@ void host_pointer_drawable_position(double *x, double *y);
 
 // Publish the acknowledged presenter mapping by value.
 void host_gate_publish_layout(const LayoutSnapshot &snapshot);
+bool host_gate_viewport(int32_t *origin_x, int32_t *origin_y, int *w, int *h);
+bool host_gate_layout_published();
 
 // Deliver captured device counts without position feedback or drawable scaling.
 // The cosmetic message cursor clamps, but DirectInput motion keeps moving at edges.

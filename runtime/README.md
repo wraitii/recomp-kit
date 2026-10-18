@@ -49,6 +49,16 @@ from `0x00040004`, pseudo modules from `0x60000000`.
 `eflags_misc` `0x202` so `PUSHFD` reads `0x202`. The CRT's `__ftol`,
 `__ctrlfp` and `__statfp` depend on those x87 values.
 
+`CreateProcessA` supports restarting the translated image through the windowed
+host, preserving the installation, inherited profile environment and guest
+arguments (`--guest-args`). Other executables, custom environments, working
+directories, security attributes and startup/creation flags fail explicitly.
+Returned process handles support close, waits and exit-code queries. Child
+primary-thread handles can be closed; status/waits on POSIX fail with named
+diagnostics because host process exit does not establish guest thread exit.
+Restart children wait up to 30 seconds for the previous instance's profile lock;
+ordinary launches still reject an occupied profile immediately.
+
 ## The shim contract
 
 ```c
@@ -124,9 +134,12 @@ here, so continuing would run the guest past a point Windows never reaches.
   itself, because only `GetMessageA` knows the filter and only the runtime can
   yield the baton. With no host installed at all it returns -1, the documented
   error, rather than blocking forever or inventing a `WM_NULL`.
-- **`LoadLibraryA` only succeeds for DLLs the runtime has shims for.** Anything
-  else reports `ERROR_MOD_NOT_FOUND`, so the guest takes its own "feature
-  unavailable" path instead of calling into nothing.
+- **DLL identity precedes basename lookup.** `LoadLibraryA/W` verify requested
+  files against the mapped translation's recorded SHA-256 before returning a
+  cached handle or attaching code. An existing unsupported DLL stops with its
+  requested path and hash; a missing file returns `ERROR_MOD_NOT_FOUND`, allowing
+  the original fallback. Registered shim modules remain virtual. Full-path
+  handle queries and data-file loads also respect the requested file.
 - **`CreateWindowExA` sends `WM_NCCREATE` then `WM_CREATE`** and honours their
   failure returns by cancelling creation, as Windows does.
 - **Painting follows the window's update region, not the clock.** Showing a
@@ -135,16 +148,26 @@ here, so continuing would run the guest past a point Windows never reaches.
   synchronously, and only when the region is dirty; `BeginPaint` validates it.
   A posted `WM_PAINT` would arrive whenever the guest next pumped, and a guest
   that never pumps would never paint.
+- **Resource modeless dialogs use guest callbacks and GDI composition.**
+  Screen DC pixels supply the startup background beneath child controls until
+  the game renderer takes over. The SDL host presents startup dialogs in a
+  separate window sized to their guest rectangle, with borders selected from
+  the guest style; gameplay retains its own window and fullscreen setting. `DIVERGENCE(original):` dialog fonts use the
+  existing bundled substitutes when unavailable, and progress controls use
+  unthemed software painting. Modal indirect dialogs remain unsupported.
 - **A wait yields to other guest threads.** Finite waits expire only after their
   deadline, and infinite waits remain pending until satisfied or shutdown. See
   **Threads** below for ownership, suspension and deadlock diagnostics.
 - **`VirtualAlloc` works in whole pages**, base and size, and `MEM_DECOMMIT`
   discards the contents so a recommit sees zeroes.
-- **A message box is answered with its default button.** There is no display,
-  so nobody can click it, but replying `IDOK` to an `MB_YESNO` box would hand
-  the caller an answer that box never offered. `MessageBoxA`/`W` return the
-  default button of the button set the caller asked for, honouring
-  `MB_DEFBUTTON1/2/3`, which is what pressing Return would have given.
+- **A message box is presented by the host on its UI thread.** The guest
+  caller is suspended in the scheduler while the host shows the SDL box, so
+  other guest threads and host events keep running. The result is a copied
+  button ID, with `MB_DEFBUTTON*` choosing the return-key default and the
+  Cancel/OK button choosing Escape. Without a host presenter, or for an
+  unsupported flag, the call reports a named diagnostic and returns zero.
+  `DIVERGENCE(original):` SDL substitutes its information icon for the Windows
+  question icon; guest UI-thread message processing pauses during native UI.
 
 ## Threads
 

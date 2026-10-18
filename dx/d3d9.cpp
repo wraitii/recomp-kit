@@ -129,6 +129,28 @@ static void d3d9_sync_virtual_display(X86 *c, ComObj *dev, uint32_t hwnd) {
         win32_cover_display(c, hwnd, present.width, present.height);
 }
 
+static bool fetch_presented(uint32_t owner, uint32_t *argb, int w, int h) {
+    ComObj *dev = com_get(owner);
+    if (!dev || dev->kind != K_D3D9DEVICE || !dev->d3d9_device || w <= 0 || h <= 0) {
+        log_once("d3d9.fetch.device", "d3d9: GDI refresh has no presentable D3D9 device");
+        return false;
+    }
+    recomp::d3d::D3d9FrameResult result = dev->d3d9_device->present_readback();
+    if (result.status.code != recomp::d3d::StatusCode::Ok || result.width != uint32_t(w) ||
+        result.height != uint32_t(h) || result.bytes.size() != size_t(w) * h * 4) {
+        std::string message(result.status.message.data(), result.status.message.size());
+        log_once("d3d9.fetch.readback",
+                 "d3d9: GDI could not read back the presented frame (%ux%u): %s", result.width,
+                 result.height, message.c_str());
+        return false;
+    }
+    const uint8_t *src = result.bytes.data();
+    for (size_t i = 0; i < size_t(w) * h; ++i)
+        argb[i] = 0xff000000u | uint32_t(src[i * 4]) << 16 | uint32_t(src[i * 4 + 1]) << 8 |
+                  uint32_t(src[i * 4 + 2]);
+    return true;
+}
+
 static bool read_guest_rect(uint32_t addr, recomp::d3d::D3d9Rect *out) {
     if (!addr || !gm_valid(addr, 16))
         return false;
@@ -800,6 +822,7 @@ void Dev_Reset(X86 *c) {
         com_ret(c, bridge_result(c, result.status));
         return;
     }
+    gdi_forget_surface(dev->id);
     if (dev->hwnd != device_window)
         win32_uncover_display(c, dev->hwnd);
     dev->hwnd = device_window;
@@ -1023,14 +1046,27 @@ void Dev_Present(X86 *c) {
     }
     rust::Slice<const recomp::d3d::D3d9Rect> srs(have_src ? &sr : nullptr, have_src ? 1 : 0);
     rust::Slice<const recomp::d3d::D3d9Rect> drs(have_dst ? &dr : nullptr, have_dst ? 1 : 0);
+    const auto present_params = dev->d3d9_device->effective_present();
+    const bool fullscreen = present_params.windowed == 0;
+    int32_t client_w = 0, client_h = 0;
+    const bool direct =
+        fullscreen ||
+        (host_window_visible(dev->hwnd) &&
+         host_window_rect(dev->hwnd, nullptr, nullptr, &client_w, &client_h) &&
+         client_w == int32_t(present_params.width) && client_h == int32_t(present_params.height));
     bool presented = false;
-    if (!dx_dump_enabled() && dev->d3d9_device->native_present_available) {
+    if (!dx_dump_enabled() && direct && dev->d3d9_device->native_present_available) {
         auto result = dev->d3d9_device->present_handoff(srs, drs);
         if (result.status.code == recomp::d3d::StatusCode::Ok) {
             presented = host_display_present_native_texture(
                 result.handoff.texture, (int)result.handoff.width, (int)result.handoff.height,
                 result.handoff.busy, result.handoff.ready_event, result.handoff.ready_value);
-            if (!presented) {
+            if (presented) {
+                dev->d3d9_device->commit_present();
+                gdi_present_external(dev->id, dev->hwnd, (int)result.handoff.width,
+                                     (int)result.handoff.height, fullscreen, !fullscreen,
+                                     fetch_presented);
+            } else {
                 __atomic_store_n(result.handoff.busy, 0u, __ATOMIC_RELEASE);
                 dev->d3d9_device->native_present_available = false;
                 LOGW("d3d9: presenter declined native texture handoff; using RGBA readback");
@@ -1050,10 +1086,16 @@ void Dev_Present(X86 *c) {
             com_ret(c, bridge_result(c, result.status));
             return;
         }
-        if (!result.bytes.empty()) {
+        if (!result.bytes.empty() && result.width && result.height) {
             dx_dump_frame_rgba(result.bytes.data(), result.width, result.height);
-            host_display_present_window_rgba(result.bytes.data(), (int)result.width,
-                                             (int)result.height);
+            const size_t count = size_t(result.width) * result.height;
+            std::vector<uint32_t> argb(count);
+            for (size_t i = 0; i < count; ++i)
+                argb[i] = 0xff000000u | uint32_t(result.bytes[i * 4]) << 16 |
+                          uint32_t(result.bytes[i * 4 + 1]) << 8 |
+                          uint32_t(result.bytes[i * 4 + 2]);
+            gdi_present_surface(dev->id, dev->hwnd, argb.data(), (int)result.width,
+                                (int)result.height, fullscreen, !fullscreen);
         }
     }
     const uint32_t interval = dev->d3d9_device->effective_present().presentation_interval;
@@ -6491,6 +6533,7 @@ static void d3d9_drop_fvf_cache(ComObj *dev) {
 }
 
 static void d3d9_device_destroy(ComObj *o) {
+    gdi_forget_surface(o->id);
     device_discard_implicit_surfaces(o);
     d3d9_clear_virtual_display(o);
     if (o->d3d9_device) {

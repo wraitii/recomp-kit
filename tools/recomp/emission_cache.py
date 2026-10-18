@@ -59,7 +59,7 @@ def tree(out):
 def load(root, settings, out):
     index = Path(root) / 'index.pickle'
     if not index.is_file():
-        raise TranslateError('selected regeneration needs a cached full generation; run --regenerate first')
+        raise TranslateError('selected regeneration needs a cached full generation; run --regenerate --cache-emission first')
     with index.open('rb') as stream:
         state = pickle.load(stream)
     if state.get('format') != FORMAT or state['identity'] != identity(settings):

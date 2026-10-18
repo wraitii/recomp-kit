@@ -8,6 +8,7 @@ bundle_id = "dev.recompkit.railroadtycoon3"
 executable = "RT3.exe"
 sha256 = "accb099b0d8ebac8b50c539a5cc91a863bc9ae399ae70da382ff1c22301e38a2"
 image_base = 0x00400000
+host_arena_base = 0
 entry_point = 0x005a313b
 guest_root = 'C:\Railroad Tycoon 3'
 # Remove per-store checks; DirectDraw Unlock compares the whole locked surface.

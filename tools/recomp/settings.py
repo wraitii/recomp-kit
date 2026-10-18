@@ -59,6 +59,8 @@ class Settings(object):
         self.state_contract_callers = frozenset(translate["state_contract_callers"]) if not self.module else frozenset()
         self.discover = translate.get("discover", True)
         self.discovered = None
+        self.discovered_checked = False
+        self.discovered_dropped = {}
         self.allow_unmodelled = allow_unmodelled
         self.jobs = jobs
         relaxed = translate["fault_state"] == "relaxed"

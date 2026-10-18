@@ -19,7 +19,7 @@ passthrough = ["PYTHONVERBOSE"]
 
 [translate]
 code_map = "metadata"
-native = { header = "native/civ4_native.h", sources = ["native/effect_state_manager.c"] }
+native = { header = "native/civ4_native.h", sources = ["native/effect_state_manager.c", "native/voice_capture.c"] }
 
 [settings]
 presentation_filter = "nearest"

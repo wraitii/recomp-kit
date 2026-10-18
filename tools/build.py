@@ -449,12 +449,14 @@ def build_diff_harness(build_root, out):
     print("built diff harness: %s" % out)
 
 
-def run_translator(stage, game_dir, build_root, allow_unmodelled=None, aux_modules=(), regen_functions=(), main=True):
+def run_translator(stage, game_dir, build_root, allow_unmodelled=None, aux_modules=(), regen_functions=(), main=True,
+                   cache_emission=False):
     if main:
         command = [sys.executable, str(ROOT / "tools/recomp/driver.py"), "--out", str(stage),
                    "--game", str(game_dir),
                    "--report", str(Path(build_root) / "recomp/translate-report.json")]
-        command += ["--emission-cache", str(Path(build_root) / "recomp/emission-cache")]
+        if cache_emission or regen_functions:
+            command += ["--emission-cache", str(Path(build_root) / "recomp/emission-cache")]
         for function in regen_functions:
             command += ["--regen-function", function]
         if allow_unmodelled:
@@ -486,6 +488,8 @@ def parse_args(argv, system=None):
                              "(comma-separated; 'main' names the game image)")
     parser.add_argument("--regen-function", action="append", default=[], metavar="HEX_ADDR",
                         help="Re-emit selected functions from validated whole-image preparation")
+    parser.add_argument("--cache-emission", action="store_true",
+                        help="Save prepared graphs during full regeneration for later --regen-function runs")
     parser.add_argument("--function-corpus", type=Path, metavar="MANIFEST",
                         help="Build/check/report a game-owned native-reference function corpus")
     parser.add_argument("--corpus-checks", type=int, default=4096)
@@ -608,6 +612,7 @@ def main():
                 selection = regenerate_selection(args.regenerate, cfg, parser)
                 translate_args = {
                     "allow_unmodelled": args.allow_unmodelled,
+                    "cache_emission": args.cache_emission,
                 }
                 fingerprint = translation_fingerprint(args.game_dir, cfg, translate_args)
                 stamp = args.build_root / "recomp/translate.stamp"
@@ -622,12 +627,14 @@ def main():
                     publish_generated(args.build_root, regenerate_selected)
                     stamp.unlink(missing_ok=True)
                 elif selection is None:
-                    if translated and stamp.is_file() and stamp.read_text().strip() == fingerprint:
+                    cache_ready = not args.cache_emission or (args.build_root / "recomp/emission-cache/index.pickle").is_file()
+                    if translated and cache_ready and stamp.is_file() and stamp.read_text().strip() == fingerprint:
                         print("translation inputs unchanged; keeping %s/recomp/gen" % args.build_root)
                     else:
                         publish_generated(args.build_root,
                                           lambda stage: run_translator(stage, args.game_dir, args.build_root,
-                                                                       args.allow_unmodelled, cfg["aux_modules"]))
+                                                                       args.allow_unmodelled, cfg["aux_modules"],
+                                                                       cache_emission=args.cache_emission))
                         stamp.parent.mkdir(parents=True, exist_ok=True)
                         temporary = stamp.with_name("translate.stamp.new")
                         temporary.write_text(fingerprint + "\n")
@@ -639,7 +646,8 @@ def main():
                     aux = [module for module in cfg["aux_modules"] if module["key"] in selection]
                     publish_generated(args.build_root,
                                       lambda stage: run_translator(stage, args.game_dir, args.build_root,
-                                                                   args.allow_unmodelled, aux, main=main_image),
+                                                                   args.allow_unmodelled, aux, main=main_image,
+                                                                   cache_emission=args.cache_emission),
                                       partial=True, main=main_image)
                     stamp.unlink(missing_ok=True)
             # Generated sources include the adjacent runtime header. Refresh

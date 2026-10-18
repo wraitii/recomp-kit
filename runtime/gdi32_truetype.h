@@ -11,7 +11,8 @@
 namespace gdi {
 struct TrueTypeFace;
 struct TrueTypeMetrics {
-    int32_t ascent = 0, descent = 0, height = 0, internal = 0, average = 0, maximum = 0;
+    int32_t ascent = 0, descent = 0, height = 0, internal = 0, external = 0, average = 0,
+            maximum = 0;
 };
 struct TrueTypeOutlineMetrics {
     uint8_t panose[10] = {};

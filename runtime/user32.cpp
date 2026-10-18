@@ -57,6 +57,11 @@ bool (*g_message_waiter)() = nullptr;
 void (*g_window_shown)(uint32_t) = nullptr;
 uint8_t g_key_state[256] = {0};
 
+bool trace_pointer() {
+    static const bool on = recomp_env("TRACE_POINTER") != nullptr;
+    return on;
+}
+
 // WS_VISIBLE: a window created with it is shown as part of creation.
 const uint32_t WS_VISIBLE = 0x10000000u;
 
@@ -458,6 +463,27 @@ void u_UpdateWindow(X86 *c) {
     set_eax(c, 1);
 }
 
+bool window_paintable(uint32_t hwnd) {
+    const Window *w = find_window(hwnd);
+    if (!w || !w->visible || w->w <= 0 || w->h <= 0)
+        return false;
+    const Window *ancestor = w;
+    size_t hops = 0;
+    while (ancestor && ancestor->visible && (ancestor->style & 0x40000000u) && ancestor->parent &&
+           hops++ < windows().size())
+        ancestor = find_window(ancestor->parent);
+    return ancestor && ancestor->visible && hops <= windows().size();
+}
+
+void paint_window_now(X86 *c, uint32_t hwnd) {
+    Window *w = find_window(hwnd);
+    if (!w || !w->update_pending || !window_paintable(hwnd))
+        return;
+    uint32_t result = c->r[R_EAX];
+    host_dispatch_to_wndproc(c, hwnd, 0x000f /* WM_PAINT */, 0, 0);
+    set_eax(c, result);
+}
+
 // SetWindowPos's body, shared with the runtime's own callers: DXGI sizes a
 // fullscreen swap chain's output window the way Windows does, through here.
 void set_window_pos(X86 *c, Window *w, uint32_t after, int32_t x, int32_t y, int32_t cx, int32_t cy,
@@ -554,7 +580,8 @@ void u_GetClientRect(X86 *c) {
 void u_GetWindowInfo(X86 *c) {
     Window *w = find_window(arg(c, 0));
     uint32_t p = arg(c, 1);
-    if (!w || !p || !gm_valid(p, 0x3c) || rd32(p) < 0x3c) {
+    if (!w || !p || !gm_valid(p, 0x3c)) {
+        set_last_error(1400);
         set_eax(c, 0);
         return;
     }
@@ -621,8 +648,12 @@ void u_ScreenToClient(X86 *c) {
              (int32_t)rd32(p + 4), w->x, w->y);
         int32_t x, y;
         client_origin(w->hwnd, &x, &y);
+        int32_t sx = (int32_t)rd32(p), sy = (int32_t)rd32(p + 4);
         wr32(p, rd32(p) - uint32_t(x));
         wr32(p + 4, rd32(p + 4) - uint32_t(y));
+        if (trace_pointer())
+            fprintf(stderr, "[cursor] ScreenToClient %d,%d - %d,%d -> %d,%d\n", sx, sy, x, y,
+                    (int32_t)rd32(p), (int32_t)rd32(p + 4));
     }
     set_eax(c, w ? 1 : 0);
 }
@@ -641,8 +672,12 @@ void u_ClientToScreen(X86 *c) {
     if (p && w) {
         int32_t x, y;
         client_origin(w->hwnd, &x, &y);
+        int32_t cx = (int32_t)rd32(p), cy = (int32_t)rd32(p + 4);
         wr32(p, rd32(p) + uint32_t(x));
         wr32(p + 4, rd32(p + 4) + uint32_t(y));
+        if (trace_pointer())
+            fprintf(stderr, "[cursor] ClientToScreen %d,%d + %d,%d -> %d,%d\n", cx, cy, x, y,
+                    (int32_t)rd32(p), (int32_t)rd32(p + 4));
     }
     set_eax(c, 1);
 }
@@ -712,6 +747,12 @@ void u_SetWindowLongA(X86 *c) {
         set_eax(c, 0);
         return;
     }
+    if (is_dialog(w->hwnd) && idx == 0) {
+        old = dialog_get_msg_result(w->hwnd);
+        dialog_set_msg_result(w->hwnd, v);
+        set_eax(c, old);
+        return;
+    }
     switch (idx) {
     case -4:
         old = w->wndproc;
@@ -758,6 +799,10 @@ void u_GetWindowLongA(X86 *c) {
         set_eax(c, 0);
         return;
     }
+    if (is_dialog(w->hwnd) && idx == 0) {
+        set_eax(c, dialog_get_msg_result(w->hwnd));
+        return;
+    }
     switch (idx) {
     case -4:
         set_eax(c, w->wndproc);
@@ -797,14 +842,25 @@ void u_SetWindowTextA(X86 *c) {
     set_eax(c, 1);
 }
 
+uint32_t find_dlg_item(uint32_t dialog, uint32_t id) {
+    for (const auto &kv : windows())
+        if (kv.second.parent == dialog && kv.second.id == id)
+            return kv.first;
+    return 0;
+}
+
 void u_SetDlgItemTextA(X86 *c) {
-    set_eax(c, 1);
+    uint32_t item = find_dlg_item(arg(c, 0), arg(c, 1));
+    if (!item) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t ok = deliver_message(c, item, 0x000c, 0, arg(c, 2), false);
+    set_eax(c, ok);
 }
 
 void u_CreateDialogParamA(X86 *c) {
-    log_once("CreateDialogParamA",
-             "CreateDialogParamA: dialogs are not implemented, returning NULL");
-    set_eax(c, 0);
+    set_eax(c, create_dialog_param(c, false));
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,9 +1307,11 @@ void u_GetSystemMetrics(X86 *c) {
     case 15:
         v = 19;
         break;
+    case 23:
+        v = 0;
+        break;
     case 19:
     case 22:
-    case 23:
     case 41:
     case 42:
     case 44:
@@ -1460,6 +1518,8 @@ void u_SetCursor(X86 *c) {
 void u_SetCursorPos(X86 *c) {
     g_cursor_x = (int32_t)arg(c, 0);
     g_cursor_y = (int32_t)arg(c, 1);
+    if (trace_pointer())
+        fprintf(stderr, "[cursor] SetCursorPos %d,%d\n", g_cursor_x, g_cursor_y);
     set_eax(c, 1);
 }
 void u_GetCursorPos(X86 *c) {
@@ -1468,6 +1528,8 @@ void u_GetCursorPos(X86 *c) {
         wr32(p, (uint32_t)g_cursor_x);
         wr32(p + 4, (uint32_t)g_cursor_y);
     }
+    if (trace_pointer())
+        fprintf(stderr, "[cursor] GetCursorPos -> %d,%d\n", g_cursor_x, g_cursor_y);
     set_eax(c, 1);
 }
 void u_GetMessagePos(X86 *c) {
@@ -1545,54 +1607,19 @@ void u_GetKeyboardLayout(X86 *c) {
 // ---------------------------------------------------------------------------
 // Message boxes and formatting
 // ---------------------------------------------------------------------------
-// The answer a message box gets when there is nobody to click it.
-//
-// There is no display, so the box cannot be shown and cannot be answered by a
-// person. What it must not do is answer with a button the caller never
-// offered: returning IDOK to an MB_YESNO box is not one of that box's two
-// possible answers, and a caller that switches on the result then takes a path
-// Windows could never have produced. So the reply is the default button of the
-// button set the caller asked for, which is what pressing Return on the box
-// gives, and MB_DEFBUTTON1/2/3 select which of them that is.
-uint32_t message_box_default(uint32_t type) {
-    // MB_OK, MB_OKCANCEL, MB_ABORTRETRYIGNORE, MB_YESNOCANCEL, MB_YESNO,
-    // MB_RETRYCANCEL, MB_CANCELTRYCONTINUE, indexed by type & MB_TYPEMASK.
-    static const uint8_t sets[7][3] = {
-        {1, 0, 0},   // IDOK
-        {1, 2, 0},   // IDOK, IDCANCEL
-        {3, 4, 5},   // IDABORT, IDRETRY, IDIGNORE
-        {6, 7, 2},   // IDYES, IDNO, IDCANCEL
-        {6, 7, 0},   // IDYES, IDNO
-        {4, 2, 0},   // IDRETRY, IDCANCEL
-        {2, 10, 11}, // IDCANCEL, IDTRYAGAIN, IDCONTINUE
-    };
-    uint32_t set = type & 0x0000000fu;
-    if (set > 6)
-        set = 0;
-    uint32_t want = (type & 0x00000f00u) >> 8; // MB_DEFBUTTON1/2/3
-    if (want > 2 || sets[set][want] == 0)
-        want = 0;
-    return sets[set][want];
-}
-
 void u_MessageBoxA(X86 *c) {
-    uint32_t answer = message_box_default(arg(c, 3));
-    LOGW("MessageBoxA: [%s] %s -> default button %u", gm_str(arg(c, 2), 256).c_str(),
-         gm_str(arg(c, 1), 1024).c_str(), answer);
+    std::string text = gm_str(arg(c, 1), 1024);
+    std::string title = gm_str(arg(c, 2), 256);
+    uint32_t answer = user32_message_box_show(c, arg(c, 0), title, text, arg(c, 3));
+    LOGW("MessageBoxA: [%s] %s -> %u", title.c_str(), text.c_str(), answer);
     set_eax(c, answer);
 }
 
 void u_MessageBoxW(X86 *c) {
-    std::string text;
-    uint32_t p = arg(c, 1);
-    for (int i = 0; i < 1024; ++i) {
-        uint16_t w = rd16(p + 2 * i);
-        if (!w)
-            break;
-        text.push_back((char)(w < 256 ? w : '?'));
-    }
-    uint32_t answer = message_box_default(arg(c, 3));
-    LOGW("MessageBoxW: %s -> default button %u", text.c_str(), answer);
+    std::string text = gm_wstr(arg(c, 1), 1024);
+    std::string title = gm_wstr(arg(c, 2), 256);
+    uint32_t answer = user32_message_box_show(c, arg(c, 0), title, text, arg(c, 3));
+    LOGW("MessageBoxW: [%s] %s -> %u", title.c_str(), text.c_str(), answer);
     set_eax(c, answer);
 }
 

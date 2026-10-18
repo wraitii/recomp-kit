@@ -102,6 +102,10 @@ enum {
 namespace {
 
 SDL_Window *g_window = nullptr;
+SDL_Window *g_game_window = nullptr;
+SDL_Window *g_dialog_window = nullptr;
+void *g_game_surface = nullptr;
+void *g_dialog_surface = nullptr;
 void *g_surface = nullptr; // the native surface the presenter draws into
 std::unique_ptr<gpu::Device> g_gpu;
 bool g_close_requested = false; // the user asked to close
@@ -122,6 +126,10 @@ int32_t g_pointer_sample_x = 0, g_pointer_sample_y = 0;
 int g_pointer_sample_w = 0, g_pointer_sample_h = 0;
 bool g_borderless_frame_dirty = true;
 int g_windowed_x = 0, g_windowed_y = 0, g_windowed_w = 0, g_windowed_h = 0;
+bool g_game_window_shown = false;
+bool g_viewport_active = false;
+int g_viewport_w = 0, g_viewport_h = 0;
+uint32_t g_viewport_style = 0;
 uint32_t g_pending_mode_w = 0, g_pending_mode_h = 0;
 uint8_t g_buttons = 0; // for the MK_ bits in a mouse message
 
@@ -139,6 +147,8 @@ uint32_t mouse_wparam() {
     return host_mouse_wparam(g_buttons, host_guest_modifiers());
 }
 void post(uint32_t msg, uint32_t wparam, uint32_t lparam) {
+    if (msg >= 0x0200 && msg <= 0x020e && dinput_host_mouse_exclusive())
+        return;
     // Mouse input is addressed to a point, not to a window: the runtime
     // hit-tests it, activates what it lands on, and converts the position into
     // that window's client coordinates - which is what Windows does and what
@@ -150,8 +160,13 @@ void post(uint32_t msg, uint32_t wparam, uint32_t lparam) {
         return;
     }
     if (msg >= 0x200 && msg <= 0x209) {
-        host_post_client_mouse_message(host_main_window(), msg, wparam, int16_t(lparam),
-                                       int16_t(lparam >> 16));
+        int32_t origin_x = 0, origin_y = 0;
+        if (host_gate_viewport(&origin_x, &origin_y, nullptr, nullptr))
+            host_post_mouse_message(msg, wparam, int32_t(int16_t(lparam)) + origin_x,
+                                    int32_t(int16_t(lparam >> 16)) + origin_y);
+        else
+            host_post_client_mouse_message(host_main_window(), msg, wparam, int16_t(lparam),
+                                           int16_t(lparam >> 16));
         return;
     }
     uint32_t hwnd = host_main_window();
@@ -174,6 +189,21 @@ HostWindowSize window_size_for(int gw, int gh) {
     const float density =
         g_window ? SDL_GetWindowPixelDensity(g_window) : SDL_GetDisplayContentScale(display);
     return host_window_size_for(gw, gh, visible.w, visible.h, density > 0 ? density : 1.0);
+}
+
+HostWindowSize viewport_window_size_for(int gw, int gh) {
+    SDL_Rect visible = {0, 0, 0, 0};
+    SDL_DisplayID display = g_window ? SDL_GetDisplayForWindow(g_window) : SDL_GetPrimaryDisplay();
+    if (!SDL_GetDisplayUsableBounds(display, &visible))
+        visible.w = visible.h = 0;
+    double scale = 1.0;
+    if (visible.w > 0)
+        scale = std::min(scale, visible.w * 0.95 / gw);
+    if (visible.h > 0)
+        scale = std::min(scale, visible.h * 0.95 / gh);
+    const int w = std::max(1, int(std::lround(gw * scale)));
+    const int h = std::max(1, int(std::lround(gh * scale)));
+    return {w, h, w, h};
 }
 
 // The area a fullscreen window fills, read on the main thread and kept for the
@@ -536,7 +566,7 @@ bool window_fullscreen() {
 // settings page - the page is navigated with a real cursor. It is not tied to
 // what the guest is doing: an FMV reads the mouse exactly as gameplay does.
 bool pointer_capture_wanted() {
-    if (!platform_ui_pointer_capture_supported())
+    if (g_viewport_active || !platform_ui_pointer_capture_supported())
         return false;
     // DirectDraw owns a game display; other renderers can instead acquire a
     // DirectInput mouse. Ordinary launcher/settings windows keep the OS cursor.
@@ -564,7 +594,9 @@ void update_platform_pointer_capture() {
         g_pointer_sample_valid = false;
         fprintf(stderr, "[host] relative mouse capture: %s\n", relative ? "ON" : "OFF");
     }
-    const bool hide = (want && kRelativeMouseCapture) ||
+    const bool hide = (want && (kRelativeMouseCapture || dinput_host_mouse_exclusive())) ||
+                      (g_focused && mods_page_visible() && dinput_host_mouse_exclusive() &&
+                       !mods_controls_editing()) ||
                       (g_focused && !g_guest_cursor_visible && !mods_page_visible());
     if (hide && !g_pointer_hidden) {
         trace_state("capture ON: hiding the OS cursor");
@@ -1221,6 +1253,9 @@ void handle_event(const SDL_Event &event) {
         return;
     if (handle_editor_event(event))
         return;
+    SDL_Window *event_window = SDL_GetWindowFromEvent(&event);
+    if (event_window && event_window != g_window)
+        return;
     const SDL_WindowID ours = g_window ? SDL_GetWindowID(g_window) : 0;
     switch (event.type) {
     case SDL_EVENT_MOUSE_MOTION:
@@ -1428,6 +1463,7 @@ void handle_event(const SDL_Event &event) {
             fprintf(stderr, "[host] %s: asking the game to close\n",
                     event.type == SDL_EVENT_QUIT ? "quit requested" : "window close requested");
         g_close_requested = true;
+        host_message_box_cancel_all();
         break;
     default:
         break;
@@ -1567,7 +1603,7 @@ void apply_window_mode() {
     int request = host_display_take_window();
     if (request >= 0)
         g_wanted_window_mode = request;
-    if (!g_window || g_fullscreen_transition)
+    if (!g_window || g_viewport_active || !g_game_window_shown || g_fullscreen_transition)
         return;
     if (window_fullscreen()) {
         if (g_wanted_window_mode != 2) {
@@ -1608,6 +1644,21 @@ void apply_window_mode() {
     post_drawable_size();
 }
 
+bool viewport_source(int32_t *origin_x, int32_t *origin_y, int *w, int *h, bool *active,
+                     uint32_t *style = nullptr) {
+    LayoutSnapshot sealed;
+    if (!host_present_copy_sealed_layout(&sealed))
+        return false;
+    *origin_x = sealed.guest_origin_x;
+    *origin_y = sealed.guest_origin_y;
+    *w = sealed.guest_w;
+    *h = sealed.guest_h;
+    *active = sealed.viewport;
+    if (style)
+        *style = sealed.viewport_style;
+    return true;
+}
+
 // The display mode changed under us, which resizes the window.
 void apply_mode_change() {
     if (!g_mode_dirty)
@@ -1616,6 +1667,12 @@ void apply_mode_change() {
     host_pointer_set_mode((int)g_pending_mode_w, (int)g_pending_mode_h);
     g_mode_w = (int)g_pending_mode_w;
     g_mode_h = (int)g_pending_mode_h;
+    host_set_client_size(host_main_window(), g_mode_w, g_mode_h);
+    int32_t origin_x = 0, origin_y = 0;
+    int viewport_w = 0, viewport_h = 0;
+    bool viewport = false;
+    if (viewport_source(&origin_x, &origin_y, &viewport_w, &viewport_h, &viewport) && viewport)
+        return;
     const HostWindowSize size = window_size_for(g_mode_w, g_mode_h);
     // The minimum first, since a window cannot shrink below the one it had. It
     // is the guest's frame when that fits the screen, so integer scaling always
@@ -1626,7 +1683,83 @@ void apply_mode_change() {
         SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
         post_drawable_size();
     }
-    host_set_client_size(host_main_window(), g_mode_w, g_mode_h);
+}
+
+void apply_viewport_change() {
+    int32_t origin_x = 0, origin_y = 0;
+    int w = 0, h = 0;
+    bool active = false;
+    uint32_t style = 0;
+    if (!viewport_source(&origin_x, &origin_y, &w, &h, &active, &style))
+        return;
+    if (active == g_viewport_active &&
+        (!active || (w == g_viewport_w && h == g_viewport_h && style == g_viewport_style)))
+        return;
+    apply_pointer_capture(false);
+    if (!g_game_window) {
+        g_game_window = g_window;
+        g_game_surface = g_surface;
+    }
+    SDL_Window *previous = g_window;
+    if (active) {
+        const HostWindowSize size = viewport_window_size_for(w, h);
+        const bool bordered = (style & 0x00c00000u) != 0;
+        if (!g_dialog_window) {
+            SDL_WindowFlags flags =
+                SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY |
+                (SDL_GetWindowFlags(g_game_window) & (SDL_WINDOW_METAL | SDL_WINDOW_VULKAN));
+            if (!bordered)
+                flags |= SDL_WINDOW_BORDERLESS;
+            g_dialog_window = SDL_CreateWindow(RECOMP_GAME_NAME, size.w, size.h, flags);
+            if (!g_dialog_window) {
+                fprintf(stderr, "[host] dialog window creation failed: %s\n", SDL_GetError());
+                boot_request_close("dialog window creation failed");
+                return;
+            }
+            g_dialog_surface = gpu::native_surface_for_window(g_dialog_window);
+            if (!g_dialog_surface) {
+                fprintf(stderr, "[host] dialog window has no native presentation surface\n");
+                boot_request_close("dialog presentation surface unavailable");
+                return;
+            }
+        }
+        SDL_SetWindowBordered(g_dialog_window, bordered);
+        SDL_SetWindowSize(g_dialog_window, size.w, size.h);
+        SDL_SetWindowPosition(g_dialog_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        g_window = g_dialog_window;
+        g_surface = g_dialog_surface;
+    } else {
+        g_window = g_game_window;
+        g_surface = g_game_surface;
+    }
+    g_viewport_active = active;
+    g_viewport_w = w;
+    g_viewport_h = h;
+    g_viewport_style = style;
+    g_pointer_sample_valid = false;
+    if (previous != g_window)
+        SDL_HideWindow(previous);
+    int bw, bh, dw, dh;
+    window_sizes(&bw, &bh, &dw, &dh);
+    host_present_install_surface(g_surface, dw, dh, active);
+    post_drawable_size();
+    SDL_ShowWindow(g_window);
+    SDL_RaiseWindow(g_window);
+    if (!active) {
+        g_game_window_shown = true;
+        host_set_client_size(host_main_window(), g_mode_w, g_mode_h);
+    }
+}
+
+void show_sealed_game_window() {
+    if (g_game_window_shown || g_viewport_active)
+        return;
+    LayoutSnapshot sealed;
+    if (!host_present_copy_sealed_layout(&sealed) || sealed.viewport)
+        return;
+    g_game_window_shown = true;
+    SDL_ShowWindow(g_window);
+    SDL_RaiseWindow(g_window);
 }
 
 // True when this thread may touch the window at all.
@@ -1642,6 +1775,19 @@ bool on_host_thread() {
     return false;
 }
 
+void service_message_box() {
+    if (!host_message_box_pending())
+        return;
+    if (g_close_requested) {
+        host_message_box_cancel_all();
+        return;
+    }
+    const bool began = sched_host_modal_begin();
+    if (began || !sched_holds_baton())
+        host_message_box_service();
+    sched_host_modal_end(began);
+}
+
 // One turn of the host's event loop, called from inside guest code.
 //
 // The tick can arrive on any guest thread: the runtime's cooperative scheduler
@@ -1651,13 +1797,16 @@ bool on_host_thread() {
 void pump() {
     if (!on_host_thread())
         return;
+    service_message_box();
     // First: anything an idle slice decoded but could not apply. This thread
     // reached here through the guest's own clock read, so it holds the baton
     // and a mod callback dispatched from here is serialised against every
     // other guest thread, which is the whole point.
     deliver_pending_input();
+    apply_viewport_change();
     apply_window_mode();
     apply_mode_change();
+    show_sealed_game_window();
     service(0.0);
     after_events();
     host_input_script_tick(host_present_count());
@@ -1675,16 +1824,64 @@ void pump() {
     }
 }
 
+int show_message_box(const HostMessageBoxRequest *request, uint32_t *button_id) {
+    if (!g_window || !on_host_thread())
+        return -1;
+    if (request->has_owner) {
+        apply_viewport_change();
+        SDL_ShowWindow(g_window);
+        SDL_RaiseWindow(g_window);
+        if (!g_viewport_active)
+            g_game_window_shown = true;
+    }
+    std::vector<SDL_MessageBoxButtonData> buttons;
+    buttons.reserve(request->button_count);
+    for (uint32_t i = 0; i < request->button_count; ++i) {
+        SDL_MessageBoxButtonFlags flags = 0;
+        if (request->buttons[i].flags & HOST_MESSAGEBOX_BUTTON_DEFAULT)
+            flags |= SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT;
+        if (request->buttons[i].flags & HOST_MESSAGEBOX_BUTTON_ESCAPE)
+            flags |= SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT;
+        buttons.push_back({flags, int(request->buttons[i].id), request->buttons[i].text});
+    }
+    SDL_MessageBoxFlags flags = SDL_MESSAGEBOX_BUTTONS_LEFT_TO_RIGHT;
+    if (request->icon & (HOST_MESSAGEBOX_ERROR | HOST_MESSAGEBOX_WARNING)) {
+        if (request->icon & HOST_MESSAGEBOX_ERROR)
+            flags |= SDL_MESSAGEBOX_ERROR;
+        else
+            flags |= SDL_MESSAGEBOX_WARNING;
+    } else if (request->icon & (HOST_MESSAGEBOX_INFORMATION | HOST_MESSAGEBOX_QUESTION)) {
+        flags |= SDL_MESSAGEBOX_INFORMATION;
+    }
+    SDL_MessageBoxData data{};
+    data.flags = flags;
+    data.window = request->has_owner ? g_window : nullptr;
+    data.title = request->title;
+    data.message = request->text;
+    data.numbuttons = int(buttons.size());
+    data.buttons = buttons.data();
+    int chosen = -1;
+    if (!SDL_ShowMessageBox(&data, &chosen)) {
+        fprintf(stderr, "[host] SDL_ShowMessageBox failed: %s\n", SDL_GetError());
+        return -1;
+    }
+    *button_id = chosen < 0 ? 0xffffffffu : uint32_t(chosen);
+    return 0;
+}
+
 // The runtime's idle wait, called on the run thread when the guest is about to
 // block. Returns 1 when input arrived, so the caller can re-check its own
 // condition at once.
 int idle_wait(double seconds) {
     if (!on_host_thread())
         return 0;
+    service_message_box();
     if (seconds < 0.0)
         seconds = 0.0;
+    apply_viewport_change();
     apply_window_mode();
     apply_mode_change();
+    show_sealed_game_window();
     int changed = service(seconds);
     after_events();
     return changed;
@@ -1868,6 +2065,8 @@ int web_main(int argc, char **argv) {
     }
     g_surface = gpu::native_surface_for_window(g_window);
     fprintf(stderr, "GPU backend: %s\n", gpu::default_backend_name());
+    if (recomp_env("TRACE_POINTER"))
+        fprintf(stderr, "[host] pointer tracing enabled\n");
     int bw, bh, dw, dh;
     window_sizes(&bw, &bh, &dw, &dh);
     if (dw <= 0 || dh <= 0) {
@@ -1902,6 +2101,14 @@ int web_main(int argc, char **argv) {
 } // namespace
 #endif
 
+static OsChildProcess *launch_guest_process(const char *exe, const char *args) {
+    char host[4096];
+    if (os_exe_path(host, sizeof host) != 0)
+        return nullptr;
+    const char *argv[] = {host, "--exe", exe, "--guest-args", args, "--wait-for-profile", nullptr};
+    return os_child_spawn(argv);
+}
+
 int main(int argc, char **argv) {
 #ifdef __EMSCRIPTEN__
     return web_main(argc, argv);
@@ -1911,6 +2118,7 @@ int main(int argc, char **argv) {
     // the game.
     const char *exe_flag = nullptr;
     bool configure_requested = false;
+    bool wait_for_profile = false;
     if (const char *v = recomp_env("MAX_FRAMES"))
         g_run_max_frames = (uint32_t)strtoul(v, nullptr, 0);
     if (const char *v = recomp_env("MAX_SECONDS"))
@@ -1930,16 +2138,25 @@ int main(int argc, char **argv) {
             exe_flag = argv[++i];
         else if (strncmp(argv[i], "--exe=", 6) == 0)
             exe_flag = argv[i] + 6;
+        else if (strcmp(argv[i], "--guest-args") == 0 && i + 1 < argc) {
+            if (os_setenv("RECOMP_GUEST_ARGS", argv[++i]) != 0) {
+                fprintf(stderr, RECOMP_APP_NAME ": could not set guest arguments\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--wait-for-profile") == 0)
+            wait_for_profile = true;
         else if (strcmp(argv[i], "--launcher") == 0)
             continue; // launcher::requested reads it
         else if (strcmp(argv[i], "--configure") == 0)
             configure_requested = true;
         else {
             fprintf(stderr, "usage: " RECOMP_APP_NAME " [--exe <" RECOMP_EXECUTABLE
-                            ">] [--launcher] [--configure] [--version] [--probe-layout]\n");
+                            ">] [--guest-args <command line>] [--launcher] [--configure] "
+                            "[--version] [--probe-layout]\n");
             return 2;
         }
     }
+    win32_set_process_launcher(launch_guest_process);
     std::string game_error;
 #ifndef __ANDROID__
     const InstallationManifest installed_location = installation_manifest_location_for_process();
@@ -2023,8 +2240,25 @@ int main(int argc, char **argv) {
         profile_error ? nullptr
                       : os_file_lock((host_layout().profile_dir + "/session.lock").c_str()),
         os_file_unlock);
+    int profile_lock_error = profile_lock ? 0 : errno;
+    if (!profile_error && !profile_lock && wait_for_profile &&
+        (profile_lock_error == EWOULDBLOCK || profile_lock_error == EAGAIN)) {
+        fprintf(stderr,
+                "[host] restart: waiting for the previous instance to release the profile\n");
+        const uint64_t deadline = os_monotonic_ns() + 30000000000ull;
+        while (!profile_lock &&
+               (profile_lock_error == EWOULDBLOCK || profile_lock_error == EAGAIN) &&
+               os_monotonic_ns() < deadline) {
+            os_sleep_us(10000);
+            profile_lock.reset(os_file_lock((host_layout().profile_dir + "/session.lock").c_str()));
+            profile_lock_error = profile_lock ? 0 : errno;
+        }
+        if (!profile_lock)
+            fprintf(stderr, "[host] restart: profile handoff failed or timed out\n");
+    }
     if (!profile_lock) {
-        const bool busy = !profile_error && (errno == EWOULDBLOCK || errno == EAGAIN);
+        const bool busy =
+            !profile_error && (profile_lock_error == EWOULDBLOCK || profile_lock_error == EAGAIN);
         const std::string message =
             busy ? "This game's profile is already in use. Close the game or its Configure window, "
                    "then try again."
@@ -2111,6 +2345,8 @@ int main(int argc, char **argv) {
         return 3;
     }
     fprintf(stderr, "GPU backend: %s\n", gpu::default_backend_name());
+    if (recomp_env("TRACE_POINTER"))
+        fprintf(stderr, "[host] pointer tracing enabled\n");
     // The launcher: when the game is missing or not the supported build, or the
     // player asked for it. Mobile shows it briefly even when the game is ready,
     // so a touch can open it.
@@ -2185,8 +2421,6 @@ int main(int argc, char **argv) {
         controls::host_init(hooks);
     }
 
-    SDL_ShowWindow(g_window);
-    SDL_RaiseWindow(g_window);
     SDL_PumpEvents();
     int bw, bh, dw, dh;
     window_sizes(&bw, &bh, &dw, &dh);
@@ -2197,6 +2431,7 @@ int main(int argc, char **argv) {
     host_present_set_bilinear(
         host_preferences::get(host_preferences::Setting::PresentationFilter) != 0);
     host_present_start(g_surface, dw, dh);
+    host_present_install_surface(g_surface, dw, dh, false);
     // Said out loud, because "the keyboard does nothing" and "the window
     // never gained focus" look identical from the outside.
     printf(RECOMP_APP_NAME ": window %dx%d points, %dx%d pixels, focus %s\n", bw, bh, dw, dh,
@@ -2223,6 +2458,7 @@ int main(int argc, char **argv) {
     options.close_unwind_grace = 15.0;
     options.close_watchdog_grace = 30.0;
 
+    host_set_message_box_presenter(show_message_box);
     if (!host_input_script_load())
         return 2;
     if (!boot_load(options)) {
@@ -2264,9 +2500,15 @@ int main(int argc, char **argv) {
     for (SDL_Cursor *cursor : g_native_cursors)
         SDL_DestroyCursor(cursor);
     g_native_cursors.clear();
-    SDL_HideWindow(g_window);
-    gpu::release_window_surface(g_surface);
-    SDL_DestroyWindow(g_window);
+    if (g_dialog_window) {
+        SDL_HideWindow(g_dialog_window);
+        gpu::release_window_surface(g_dialog_surface);
+        SDL_DestroyWindow(g_dialog_window);
+    }
+    SDL_Window *game_window = g_game_window ? g_game_window : g_window;
+    SDL_HideWindow(game_window);
+    gpu::release_window_surface(g_game_surface ? g_game_surface : g_surface);
+    SDL_DestroyWindow(game_window);
     // The audio device goes before the SDL it runs on, not in the exit
     // handlers after it: there its stream is destroyed through a freed mutex.
     host_audio_shutdown();

@@ -4,6 +4,8 @@
 // leaves unhandled there. Without the class that lookup fails, the subclass
 // falls back to DefWindowProc, and every caption stays blank.
 #include "memory.h"
+#include "resources.h"
+#include "loader.h"
 #include "user32_internal.h"
 #include <climits>
 
@@ -52,6 +54,7 @@ void paint(X86 *c, uint32_t hwnd, uint32_t into) {
     if (!into)
         w->update_pending = false; // painting validates, as BeginPaint does
     const uint32_t parent = w->parent, font = w->font, flags = text_flags(w->style);
+    const uint32_t style = w->style, title_ordinal = w->title_ordinal, hinstance = w->hinstance;
     const int32_t width = w->w, height = w->h;
     const std::string text = w->title_utf8;
     uint32_t hdc = into ? into : gdi_window_dc(hwnd);
@@ -69,6 +72,17 @@ void paint(X86 *c, uint32_t hwnd, uint32_t into) {
     uint32_t pixel;
     if (brush && gdi::brush_color(brush, &pixel))
         gdi::fill(hdc, {0, 0, width, height}, pixel);
+    if ((style & 0x1f) == 0x0e && title_ordinal) {
+        uint32_t bytes = 0;
+        uint32_t module = hinstance && hinstance != loader_image_base() ? hinstance : 0;
+        uint32_t data = resource_data(resource_find(2, title_ordinal, nullptr, module), &bytes);
+        GdiImage image;
+        if (data && gdi_decode_image(data, bytes, &image))
+            gdi_draw_image(hdc, image, 0, 0, image.width, image.height);
+        else
+            log_once(("static-bitmap:" + std::to_string(title_ordinal)).c_str(),
+                     "STATIC SS_BITMAP: bitmap resource %u could not be decoded", title_ordinal);
+    }
     uint32_t units = text.empty() ? 0 : wide_units(text);
     if (flags && units && units < (UINT32_MAX - 32) / 2) {
         if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
@@ -91,8 +105,15 @@ void static_proc(X86 *c) {
     switch (msg) {
     case 0x000c: // WM_SETTEXT: the new caption has to be drawn
         def_window_proc(c, w && w->unicode);
-        if (Window *after = find_window(hwnd))
+        if (Window *after = find_window(hwnd)) {
+            after->title_ordinal = 0;
             after->update_pending = true;
+            if (window_paintable(hwnd)) {
+                uint32_t result = c->r[R_EAX];
+                paint(c, hwnd, 0);
+                set_eax(c, result);
+            }
+        }
         return;
     case 0x000f: // WM_PAINT
     case 0x0318: // WM_PRINTCLIENT

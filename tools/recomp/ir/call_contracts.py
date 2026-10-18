@@ -40,6 +40,8 @@ Preservation uses byte-backed normalization and SSA for call-free bodies;
 no emission is inspected.
 """
 from collections import namedtuple
+from copy import copy
+from functools import cache
 
 from .lift import Lifter
 from .cfg import call_graph
@@ -156,14 +158,6 @@ def _scc_cap(size, cell_count):
 
 
 _MAPPINGS = {}
-_LIFTERS = {}
-
-
-def _lifter(language):
-    lifter = _LIFTERS.get(language)
-    if lifter is None:
-        lifter = _LIFTERS[language] = Lifter(language)
-    return lifter
 
 
 def mapping(language=None):
@@ -171,7 +165,7 @@ def mapping(language=None):
     language = language or "x86:LE:32:default"
     cells = _MAPPINGS.get(language)
     if cells is None:
-        cells = _MAPPINGS[language] = Mapping(_lifter(language))
+        cells = _MAPPINGS[language] = Mapping(_preservation_lifter(language))
     return cells
 
 
@@ -406,6 +400,11 @@ def _whole_lanes(s, lanes):
     return None
 
 
+@cache
+def _preservation_lifter(language):
+    return Lifter(language)
+
+
 def _preserved_registers(fir, contracts=None, sites=None, ir=None, pops=None):
     """GPRs equal to their entry value at every return.
 
@@ -420,7 +419,7 @@ def _preserved_registers(fir, contracts=None, sites=None, ir=None, pops=None):
     from .preservation import forward
 
     contracts, sites, pops = contracts or {}, sites or {}, pops or {}
-    lifter = _lifter(fir.language)
+    lifter = copy(_preservation_lifter(fir.language))
     registers = {name: lifter.register(name) for name in GPRS}
     groups = {name: tuple((space, offset + n) for n in range(size))
               for name, (space, offset, size) in registers.items()}
@@ -763,7 +762,7 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
                 fir = bodies(addr) if callable(bodies) else bodies[addr]
                 if fir.entries or fir.seh:
                     continue
-                preservation[addr] = (fir, codegen_ir(fir, _lifter(fir.language)))
+                preservation[addr] = (fir, codegen_ir(fir, copy(_preservation_lifter(fir.language))))
             except (SSAError, RecursionError, KeyError):
                 continue
     pops = {addr: p.pops for addr, p in firs.items()}

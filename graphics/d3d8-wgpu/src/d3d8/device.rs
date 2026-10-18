@@ -2,24 +2,24 @@
 //! This is an isolated probe implementation, with no COM or guest addresses.
 use super::{
     fixed_function::{
-        AlphaTestUniform, FogUniform, FvfLayout, StagesUniform, TEXTURED_WGSL, TransformUniform,
-        UNLIT_WGSL, gpu_lit_layout, gpu_lit_shader_source, gpu_lit_source, lit_layout,
-        lit_shader_source,
+        gpu_lit_layout, gpu_lit_shader_source, gpu_lit_source, lit_layout, lit_shader_source,
+        AlphaTestUniform, FogUniform, FvfLayout, StagesUniform, TransformUniform, TEXTURED_WGSL,
+        UNLIT_WGSL,
     },
     resource::{
-        IndexedDraw, VertexBuffer, expand_indexed_into, expand_nonindexed_into, indexed_list_into,
-        packed_indexed_list_into,
+        expand_indexed_into, expand_nonindexed_into, indexed_list_into, packed_indexed_list_into,
+        IndexedDraw, VertexBuffer,
     },
     shader::{self, Declaration, Program},
     state::{DeviceState, LightingUniform, LitInput, MAX_TEXTURE_STAGES},
     stats, survey,
     texture_cache::{TextureCache, TextureKey},
 };
-use crate::backend::native_present::{ReadyEvent, create_ready_event, signal_ready};
+use crate::backend::native_present::{create_ready_event, signal_ready, ReadyEvent};
 use crate::{
-    RenderError,
     backend::{GpuContext, OffscreenTarget},
     fast_map::FastMap,
+    RenderError,
 };
 
 #[path = "render_targets.rs"]
@@ -1048,13 +1048,10 @@ struct StageBindings {
     pairs: TextureGroupKey,
 }
 
-/// One recorded draw. Its uniforms live in `DrawBatch::data` at `ub_base`
-/// (at the `DRAW_UB_*` offsets; consecutive draws with identical uniforms share
-/// one block) and its vertices at `vertex_base`.
+/// One recorded draw with immutable uniform and vertex offsets into `DrawBatch::data`.
 struct PendingDraw {
     pipeline: wgpu::RenderPipeline,
-    ub_base: u64,
-    lighting_offset: u64,
+    uniform_offsets: [u32; 6],
     vertex_base: u64,
     vertex_len: u64,
     stages: bool,
@@ -1073,8 +1070,7 @@ struct PendingDraw {
 struct DrawBatch {
     draws: Vec<PendingDraw>,
     data: Vec<u8>,
-    /// Offset and length of the most recent uniform block, for sharing.
-    last_ub: Option<(usize, usize)>,
+    last_uniforms: [Option<(usize, usize)>; 6],
     color_view: Option<wgpu::TextureView>,
     depth: Option<(wgpu::TextureView, bool)>,
 }
@@ -1241,8 +1237,9 @@ pub struct Device {
     /// 0x152); sized and fully overwritten by `light_vertices`.
     lit_scratch: Vec<u8>,
     /// Persistent upload buffer for immutable batched uniforms, vertices and
-    /// indices. One queue write and submission per flush preserves draw order.
+    /// indices. Each flush uploads and submits in draw order.
     draw_buffer: std::cell::RefCell<Option<wgpu::Buffer>>,
+    draw_staging: std::cell::RefCell<wgpu::util::StagingBelt>,
     draw_layouts: DrawLayouts,
     /// Group-0 bind groups over `draw_buffer` (unlit, textured); the real block
     /// offsets are dynamic. Dropped when the buffer is recreated.
@@ -1314,6 +1311,7 @@ impl Device {
             index_rebased: Vec::new(),
             lit_scratch: Vec::new(),
             draw_buffer: Default::default(),
+            draw_staging: std::cell::RefCell::new(wgpu::util::StagingBelt::new(1 << 20)),
             draw_layouts,
             uniform_groups: Default::default(),
             texture_groups: Default::default(),
@@ -2079,10 +2077,9 @@ impl Device {
                     self.stage_textures[stage].is_some()
                 ))
             } else if stage < 2 {
-                survey_or_skip!(
-                    self.state
-                        .resolve_texture_stage(stage as u32, self.stage_textures[stage].is_some())
-                )
+                survey_or_skip!(self
+                    .state
+                    .resolve_texture_stage(stage as u32, self.stage_textures[stage].is_some()))
             } else {
                 inactive_sampler
             };
@@ -2413,7 +2410,7 @@ impl Device {
             let end = count as usize * vertices.stride as usize;
             (&vertices.bytes()[begin..end], end - begin)
         };
-        let (ub_base, vertex_base, index_range) = {
+        let (uniform_offsets, vertex_base, index_range) = {
             let mut batch = self.batch.borrow_mut();
             if batch.draws.is_empty() {
                 batch.color_view = Some(self.target.view.clone());
@@ -2423,10 +2420,6 @@ impl Device {
                     .as_ref()
                     .map(|d| (d.view.clone(), d.has_stencil));
             }
-            // Uniform blocks are rebuilt on the stack and shared with the
-            // previous draw when byte-identical: state rarely changes between
-            // consecutive draws, and the block is 1 KB against a few hundred
-            // bytes of vertices.
             let mut ub_storage = [0u8; DRAW_EXTENDED_VERTEX_OFFSET as usize];
             let ub_len = if extended_lighting {
                 DRAW_EXTENDED_VERTEX_OFFSET
@@ -2451,21 +2444,29 @@ impl Device {
             if let Some(stages) = &stages_uniform {
                 put(ub, DRAW_UB_STAGES, bytemuck::bytes_of(stages));
             }
-            let shared = batch
-                .last_ub
-                .filter(|&(at, len)| len == ub.len() && batch.data[at..at + len] == *ub)
-                .map(|(at, _)| at);
-            let ub_base = match shared {
-                Some(at) => at,
-                None => {
-                    // Uniform binding offsets need 256-byte alignment.
+            let banks = [
+                (DRAW_UB_TRANSFORM, std::mem::size_of::<TransformUniform>()),
+                (DRAW_UB_STAGES, std::mem::size_of::<StagesUniform>()),
+                (DRAW_UB_FOG, std::mem::size_of::<FogUniform>()),
+                (DRAW_UB_ALPHA_TEST, std::mem::size_of::<AlphaTestUniform>()),
+                (DRAW_UB_PROGRAM, std::mem::size_of_val(&program_uniform)),
+                (lighting_offset, std::mem::size_of::<LightingUniform>()),
+            ];
+            let mut uniform_offsets = [0; 6];
+            for (index, (offset, size)) in banks.into_iter().enumerate() {
+                let bytes = &ub[offset as usize..offset as usize + size];
+                let shared = batch.last_uniforms[index]
+                    .filter(|&(at, len)| len == size && batch.data[at..at + len] == *bytes)
+                    .map(|(at, _)| at);
+                let at = shared.unwrap_or_else(|| {
                     let at = batch.data.len().next_multiple_of(256);
                     batch.data.resize(at, 0);
-                    batch.data.extend_from_slice(ub);
-                    batch.last_ub = Some((at, ub.len()));
+                    batch.data.extend_from_slice(bytes);
+                    batch.last_uniforms[index] = Some((at, size));
                     at
-                }
-            };
+                });
+                uniform_offsets[index] = at as u32;
+            }
             // Vertex buffer offsets need 4-byte alignment only.
             let vertex_base = batch.data.len().next_multiple_of(4);
             batch.data.resize(vertex_base, 0);
@@ -2479,7 +2480,7 @@ impl Device {
                 batch.data.extend_from_slice(bytes);
                 (at as u64, bytes.len() as u64)
             });
-            (ub_base as u64, vertex_base as u64, index_range)
+            (uniform_offsets, vertex_base as u64, index_range)
         };
         self.frame_stats.uniform_writes += 1;
         if let Some(scratch) = lit_scratch.take() {
@@ -2558,8 +2559,7 @@ impl Device {
         };
         self.batch.borrow_mut().draws.push(PendingDraw {
             pipeline,
-            ub_base,
-            lighting_offset,
+            uniform_offsets,
             vertex_base,
             vertex_len: vertex_len as u64,
             stages: stages_uniform.is_some(),
@@ -2608,7 +2608,6 @@ impl Device {
             *self.uniform_groups.borrow_mut() = [None, None];
         }
         let db = slot.as_ref().unwrap();
-        self.gpu.queue.write_buffer(db, 0, &batch.data);
         {
             let mut groups = self.uniform_groups.borrow_mut();
             let entry = |binding: u32, size: usize| wgpu::BindGroupEntry {
@@ -2647,6 +2646,16 @@ impl Device {
         let mut encoder = gpu.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("D3D8 draw batch"),
         });
+        let mut staging = self.draw_staging.borrow_mut();
+        staging
+            .write_buffer(
+                &mut encoder,
+                db,
+                0,
+                wgpu::BufferSize::new(needed).expect("draw batch upload is nonempty"),
+                gpu,
+            )
+            .copy_from_slice(&batch.data);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("D3D8 draw batch"),
@@ -2676,30 +2685,31 @@ impl Device {
                 }),
                 ..Default::default()
             });
+            let mut cached_pipeline = None;
+            let mut cached_uniforms = None;
+            let mut cached_viewport = None;
             for d in &batch.draws {
                 // Uniform blocks are addressed by dynamic offset into the one
                 // draw buffer, so a single group per layout serves every draw.
                 let kind = usize::from(d.stages);
                 let group = uniform_groups[kind].as_ref().unwrap();
-                let base = d.ub_base;
-                let offsets = [
-                    (base + DRAW_UB_TRANSFORM) as u32,
-                    (base + DRAW_UB_STAGES) as u32,
-                    (base + DRAW_UB_FOG) as u32,
-                    (base + DRAW_UB_ALPHA_TEST) as u32,
-                    (base + DRAW_UB_PROGRAM) as u32,
-                    (base + d.lighting_offset) as u32,
-                ];
-                pass.set_pipeline(&d.pipeline);
+                let offsets = d.uniform_offsets;
+                if cached_pipeline != Some(&d.pipeline) {
+                    pass.set_pipeline(&d.pipeline);
+                    cached_pipeline = Some(&d.pipeline);
+                }
                 // Binding order: transform, [stages], fog, alpha, [program], lighting.
-                if d.stages {
-                    pass.set_bind_group(0, group, &offsets);
-                } else {
-                    pass.set_bind_group(
-                        0,
-                        group,
-                        &[offsets[0], offsets[2], offsets[3], offsets[5]],
-                    );
+                if cached_uniforms != Some((kind, offsets)) {
+                    if d.stages {
+                        pass.set_bind_group(0, group, &offsets);
+                    } else {
+                        pass.set_bind_group(
+                            0,
+                            group,
+                            &[offsets[0], offsets[2], offsets[3], offsets[5]],
+                        );
+                    }
+                    cached_uniforms = Some((kind, offsets));
                 }
                 if let Some(t) = &d.textures {
                     if texture_groups.len() >= MAX_TEXTURE_GROUPS {
@@ -2738,15 +2748,26 @@ impl Device {
                 let vstart = d.vertex_base;
                 pass.set_vertex_buffer(0, db.slice(vstart..vstart + d.vertex_len));
                 let v = &d.viewport;
-                pass.set_scissor_rect(v.x, v.y, v.width, v.height);
-                pass.set_viewport(
-                    v.x as f32 + D3D8_HALF_PIXEL,
-                    v.y as f32 + D3D8_HALF_PIXEL,
-                    v.width as f32,
-                    v.height as f32,
-                    v.min_z,
-                    v.max_z,
+                let viewport_key = (
+                    v.x,
+                    v.y,
+                    v.width,
+                    v.height,
+                    v.min_z.to_bits(),
+                    v.max_z.to_bits(),
                 );
+                if cached_viewport != Some(viewport_key) {
+                    pass.set_scissor_rect(v.x, v.y, v.width, v.height);
+                    pass.set_viewport(
+                        v.x as f32 + D3D8_HALF_PIXEL,
+                        v.y as f32 + D3D8_HALF_PIXEL,
+                        v.width as f32,
+                        v.height as f32,
+                        v.min_z,
+                        v.max_z,
+                    );
+                    cached_viewport = Some(viewport_key);
+                }
                 if let Some((at, len)) = d.indices {
                     pass.set_index_buffer(db.slice(at..at + len), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..d.count, 0, 0..1);
@@ -2755,11 +2776,13 @@ impl Device {
                 }
             }
         }
+        staging.finish();
         self.gpu.queue.submit([encoder.finish()]);
+        staging.recall();
         self.submits.set(self.submits.get() + 1);
         batch.draws.clear();
         batch.data.clear();
-        batch.last_ub = None;
+        batch.last_uniforms = [None; 6];
         drop(batch);
         drop(slot);
         if self.publish_pending.replace(false) {

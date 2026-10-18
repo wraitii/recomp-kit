@@ -216,6 +216,7 @@ const D3D_MAX_VERTEX_INDEX: u32 = 0x000f_ffff;
 struct ImplicitTargets {
     target: OffscreenTarget,
     presented: OffscreenTarget,
+    pending: OffscreenTarget,
     format: u32,
     depth_format: u32,
 }
@@ -1627,9 +1628,11 @@ fn create_targets(
         )?);
     }
     let presented = gpu.create_target(present.width, present.height, present.format, 0)?;
+    let pending = gpu.create_target(present.width, present.height, present.format, 0)?;
     Ok(ImplicitTargets {
         target,
         presented,
+        pending,
         format: present.format,
         depth_format,
     })
@@ -2442,51 +2445,45 @@ fn frame_fail(status: Status) -> D3d9FrameResult {
     }
 }
 
+fn target_surface(target: &OffscreenTarget, format: u32) -> SurfaceView {
+    SurfaceView {
+        texture: target.texture.clone(),
+        view: target.view.clone(),
+        format,
+        width: target.width,
+        height: target.height,
+        depth: 1,
+        cube: false,
+        volume: false,
+        subresource: (0, 0, 0),
+    }
+}
+
 fn present_image(
     device: &D3d9Device,
     gpu: &D3d9Gpu,
     src_rect: &[crate::bridge::D3d9Rect],
     dst_rect: &[crate::bridge::D3d9Rect],
-) -> Result<bool, Status> {
-    if src_rect.is_empty() && dst_rect.is_empty() {
-        return Ok(false);
-    }
+    target: &OffscreenTarget,
+) -> Result<(), Status> {
     let src = map_rects(src_rect)?.into_iter().next();
     let dst = map_rects(dst_rect)?.into_iter().next();
     let backbuffer = resolve_target_view(device, 0, 0, 0, false).map_err(bridge_error)?;
     let targets = device.targets.as_ref().expect("swap chain is initialized");
-    let presented = SurfaceView {
-        texture: targets.presented.texture.clone(),
-        view: targets.presented.view.clone(),
-        format: targets.format,
-        width: targets.presented.width,
-        height: targets.presented.height,
-        depth: 1,
-        cube: false,
-        volume: false,
-        subresource: (0, 0, 0),
-    };
+    let presented = target_surface(target, targets.format);
     let result = copy::stretch_rect(gpu, &backbuffer, src, &presented, dst, D3DTEXF_LINEAR);
     let result = bridge_gpu_ok(gpu, result);
     if result.code != StatusCode::Ok {
         return Err(result);
     }
-    Ok(true)
-}
-
-fn presented_target(targets: &ImplicitTargets, rects: bool) -> &OffscreenTarget {
-    if rects {
-        &targets.presented
-    } else {
-        &targets.target
-    }
+    Ok(())
 }
 
 fn prepare_present(
     device: &mut D3d9Device,
     src_rect: &[crate::bridge::D3d9Rect],
     dst_rect: &[crate::bridge::D3d9Rect],
-) -> Result<bool, Status> {
+) -> Result<(), Status> {
     if device.gpu.is_none() {
         return Err(status(
             StatusCode::InvalidArgument,
@@ -2504,12 +2501,19 @@ fn prepare_present(
             ));
         }
     }
-    if device.targets.is_none() {
-        return Err(status(
-            StatusCode::InvalidArgument,
-            "D3D9 device has no implicit swap chain",
-        ));
-    }
+    let (pending, presented, format) = match device.targets.as_ref() {
+        Some(targets) => (
+            targets.pending.clone(),
+            targets.presented.clone(),
+            targets.format,
+        ),
+        None => {
+            return Err(status(
+                StatusCode::InvalidArgument,
+                "D3D9 device has no implicit swap chain",
+            ));
+        }
+    };
     let gpu = bridge_gpu(device).map_err(bridge_error)?;
     let result = flush_draws_with_gpu(device, &gpu);
     device.draw.end_frame();
@@ -2517,7 +2521,56 @@ fn prepare_present(
     if result.code != StatusCode::Ok {
         return Err(result);
     }
-    present_image(device, &gpu, src_rect, dst_rect)
+    if !src_rect.is_empty() || !dst_rect.is_empty() {
+        let from = target_surface(&presented, format);
+        let to = target_surface(&pending, format);
+        let result = copy::stretch_rect(&gpu, &from, None, &to, None, D3DTEXF_LINEAR);
+        let result = bridge_gpu_ok(&gpu, result);
+        if result.code != StatusCode::Ok {
+            return Err(result);
+        }
+    }
+    present_image(device, &gpu, src_rect, dst_rect, &pending)
+}
+
+fn commit_presented(device: &mut D3d9Device) {
+    if let Some(targets) = device.targets.as_mut() {
+        std::mem::swap(&mut targets.presented, &mut targets.pending);
+    }
+}
+
+fn read_presented(device: &D3d9Device, target: &OffscreenTarget) -> D3d9FrameResult {
+    let Some(gpu) = device.gpu.as_ref() else {
+        return frame_fail(status(
+            StatusCode::InvalidArgument,
+            "D3D9 device is not initialized",
+        ));
+    };
+    let width = target.width;
+    let height = target.height;
+    let mut bytes = Vec::new();
+    let len = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4);
+    if bytes.try_reserve_exact(len).is_err() {
+        return frame_fail(status(
+            StatusCode::OutOfMemory,
+            "present readback allocation failed",
+        ));
+    }
+    bytes.resize(len, 0);
+    if let Err(error) = gpu.read_pixels_into(target, &mut bytes) {
+        if let Some(loss) = device.loss.as_ref().filter(|loss| loss.is_physical()) {
+            return frame_fail(status(StatusCode::DeviceLost, loss.physical_message()));
+        }
+        return frame_fail(bridge_error(error));
+    }
+    D3d9FrameResult {
+        status: status(StatusCode::Ok, ""),
+        width,
+        height,
+        bytes,
+    }
 }
 
 pub fn d3d9_present_handoff(
@@ -2525,13 +2578,15 @@ pub fn d3d9_present_handoff(
     src_rect: &[crate::bridge::D3d9Rect],
     dst_rect: &[crate::bridge::D3d9Rect],
 ) -> crate::bridge::FrameHandoffResult {
-    let result = prepare_present(device, src_rect, dst_rect).and_then(|rects| {
+    let result = prepare_present(device, src_rect, dst_rect).and_then(|()| {
         let gpu = bridge_gpu(device).map_err(bridge_error)?;
-        let target = presented_target(
-            device.targets.as_ref().expect("swap chain is initialized"),
-            rects,
-        );
-        present::handoff(&mut device.present_ring, &gpu, target).map_err(|error| {
+        let target = device
+            .targets
+            .as_ref()
+            .expect("swap chain is initialized")
+            .pending
+            .clone();
+        present::handoff(&mut device.present_ring, &gpu, &target).map_err(|error| {
             if gpu.is_physical() {
                 status(StatusCode::DeviceLost, gpu.loss().physical_message())
             } else {
@@ -2558,43 +2613,39 @@ pub fn d3d9_present_handoff(
     }
 }
 
+pub fn d3d9_commit_present(device: &mut D3d9Device) {
+    commit_presented(device);
+}
+
+pub fn d3d9_present_readback(device: &D3d9Device) -> D3d9FrameResult {
+    let Some(targets) = device.targets.as_ref() else {
+        return frame_fail(status(
+            StatusCode::InvalidArgument,
+            "D3D9 device has no implicit swap chain",
+        ));
+    };
+    read_presented(device, &targets.presented)
+}
+
 pub fn d3d9_present(
     device: &mut D3d9Device,
     src_rect: &[crate::bridge::D3d9Rect],
     dst_rect: &[crate::bridge::D3d9Rect],
 ) -> D3d9FrameResult {
-    let rects = match prepare_present(device, src_rect, dst_rect) {
-        Ok(rects) => rects,
-        Err(status) => return frame_fail(status),
-    };
-    let targets = device.targets.as_ref().expect("swap chain is initialized");
-    let target = presented_target(targets, rects);
-    let width = target.width;
-    let height = target.height;
-    let mut bytes = Vec::new();
-    let len = (width as usize)
-        .saturating_mul(height as usize)
-        .saturating_mul(4);
-    if bytes.try_reserve_exact(len).is_err() {
-        return frame_fail(status(
-            StatusCode::OutOfMemory,
-            "present readback allocation failed",
-        ));
+    if let Err(status) = prepare_present(device, src_rect, dst_rect) {
+        return frame_fail(status);
     }
-    bytes.resize(len, 0);
-    let gpu = device.gpu.as_ref().expect("device is initialized");
-    if let Err(error) = gpu.read_pixels_into(target, &mut bytes) {
-        if let Some(loss) = device.loss.as_ref().filter(|loss| loss.is_physical()) {
-            return frame_fail(status(StatusCode::DeviceLost, loss.physical_message()));
-        }
-        return frame_fail(bridge_error(error));
+    let target = device
+        .targets
+        .as_ref()
+        .expect("swap chain is initialized")
+        .pending
+        .clone();
+    let result = read_presented(device, &target);
+    if result.status.code == StatusCode::Ok {
+        commit_presented(device);
     }
-    D3d9FrameResult {
-        status: status(StatusCode::Ok, ""),
-        width,
-        height,
-        bytes,
-    }
+    result
 }
 
 fn empty_surface_descriptor() -> D3d9SurfaceDescriptor {

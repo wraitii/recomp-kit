@@ -274,6 +274,8 @@ bool host_present_suspended(void);
 void host_frame_seal(void);
 void host_present_first_write(void);
 void host_present_stage_rgba(const uint8_t *rgba, int w, int h);
+void host_present_stage_rgba_viewport(const uint8_t *rgba, int w, int h, int32_t origin_x,
+                                      int32_t origin_y, uint32_t style);
 // Includes bounded command-completion recovery; faults reports that degraded
 // path. Only drawable acknowledgements enter the windowed continuous metric.
 uint64_t host_present_unique_completed(void);
@@ -326,7 +328,7 @@ void host_present_pump(void);
 void host_present_start_offscreen(int w, int h);
 // Main-thread messages. No GPU work or wait for the worker here.
 void host_present_resize(int drawable_w, int drawable_h);
-void host_present_install_surface(void *native_surface, int w, int h);
+void host_present_install_surface(void *native_surface, int w, int h, int viewport = -1);
 
 struct HostSceneTarget {
     gpu::Texture world, overlay;
@@ -362,6 +364,7 @@ void host_present_prefix_done(void *handle, bool success);
 
 // Triple-buffered publication. T9 consumes a VALUE under the guest baton.
 bool host_present_copy_layout(LayoutSnapshot *out);
+bool host_present_copy_sealed_layout(LayoutSnapshot *out);
 // Read-only headless evidence. Only a GPU-completed composition is exposed;
 // copying it never waits for a pending frame while the guest owns the baton.
 struct HostCompletedComposite {

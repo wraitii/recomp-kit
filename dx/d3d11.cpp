@@ -431,7 +431,7 @@ void present(Object &o, uint32_t owner, uint32_t hwnd, bool fullscreen) {
     // every GPU frame back.
     const bool gpu = gpu_available() && gdi_surface_covers_screen(owner, hwnd, w, h, fullscreen);
     if (o.host_owned && gpu) {
-        gdi_present_external(owner, hwnd, w, h, fullscreen, fetch_presented);
+        gdi_present_external(owner, hwnd, w, h, fullscreen, false, fetch_presented);
         host_display_present_gpu2d(o.id, w, h);
         o.readbacks = 0;
         o.host_refused = false;
@@ -444,7 +444,7 @@ void present(Object &o, uint32_t owner, uint32_t hwnd, bool fullscreen) {
     cpu_view(o);
     std::vector<uint32_t> argb(size_t(w) * h);
     to_argb(o, argb.data());
-    gdi_present_surface(owner, hwnd, argb.data(), w, h, fullscreen);
+    gdi_present_surface(owner, hwnd, argb.data(), w, h, fullscreen, false);
 }
 void get_device(X86 *c) {
     auto *o = get(com_this_arg(c));

@@ -38,6 +38,8 @@ extern "C" {
 #endif
 // Synchronous owned-pixel snapshot: the host copies ARGB before returning.
 void host_display_present_window(const uint32_t *argb, int w, int h);
+void host_display_present_window_viewport(const uint32_t *argb, int w, int h, int32_t origin_x,
+                                          int32_t origin_y, uint32_t style);
 // Synchronous RGBA snapshot. Windowed hosts force alpha opaque in caller-owned
 // scratch storage before copying it; callers must dump raw pixels beforehand.
 void host_display_present_window_rgba(uint8_t *rgba, int w, int h);
@@ -75,7 +77,7 @@ extern "C" {
 // canvases. The runtime copies pixels synchronously and keeps the last frame
 // across GDI refreshes; owner identifies which presenter may retire it.
 void gdi_present_surface(uint32_t owner, uint32_t hwnd, const uint32_t *argb, int w, int h,
-                         bool fullscreen);
+                         bool fullscreen, bool client_view);
 void gdi_forget_surface(uint32_t owner);
 #ifdef __cplusplus
 }
@@ -127,6 +129,7 @@ void host_gpu2d_present_readback(uint32_t id, int w, int h);
 // the screen and calls `fetch` for ARGB pixels only when it has to compose
 // over them. `fetch` fills w x h ARGB and returns false when it cannot.
 void gdi_present_external(uint32_t owner, uint32_t hwnd, int w, int h, bool fullscreen,
+                          bool client_view,
                           bool (*fetch)(uint32_t owner, uint32_t *argb, int w, int h));
 // Whether a w x h present into `hwnd` would be the whole screen, with nothing
 // composed around or over it.

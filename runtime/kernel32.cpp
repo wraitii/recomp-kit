@@ -77,6 +77,7 @@ uint32_t g_unhandled_filter = 0;
 uint32_t g_cmdline_addr = 0;
 uint32_t g_envblock_addr = 0;
 uint32_t g_envblockw_addr = 0;
+OsChildProcess *(*g_process_launcher)(const char *, const char *) = nullptr;
 bool g_tls_used[TLS_SLOTS] = {false};
 uint32_t g_process_heap = 0;
 
@@ -95,11 +96,14 @@ enum HKind {
     H_HEAP,
     H_MAPPING,
     H_MODULE,
-    H_STD
+    H_STD,
+    H_CHILD_PROCESS,
+    H_CHILD_THREAD
 };
 
 struct HObj {
     HKind kind = H_NONE;
+    std::shared_ptr<OsChildProcess> child;
     std::shared_ptr<OsDirectoryWatch> watch;
     std::string object_name; // Named events, mutexes and mappings share a kernel object.
     uint32_t references = 1;
@@ -292,6 +296,10 @@ void win32_invalidate_dir_cache() {
 
 const std::string &win32_game_dir() {
     return g_game_dir;
+}
+
+void win32_set_process_launcher(OsChildProcess *(*launch)(const char *, const char *)) {
+    g_process_launcher = launch;
 }
 
 // Called with the guest baton held, like the file shims. Reopening this path
@@ -1373,13 +1381,22 @@ std::string library_name(const std::string &module_name) {
     return name;
 }
 
+bool explicit_library_path(const std::string &name) {
+    return name.find_first_of("\\/:") != std::string::npos;
+}
+
 void get_module_handle_named(X86 *c, const std::string &module_name) {
     std::string name = library_name(module_name);
     // A handle lookup must neither attach a mapped DLL nor acquire a reference.
     if (LoaderModule *m = loader_module_named(name.c_str())) {
-        if (!m->attached)
+        bool matches = m->attached;
+        if (matches && explicit_library_path(module_name)) {
+            std::string host = win32_host_path(module_name);
+            matches = !host.empty() && loader_hash_file(host.c_str()) == m->sha256;
+        }
+        if (!matches)
             set_last_error(126); // ERROR_MOD_NOT_FOUND
-        set_eax(c, m->attached ? m->base : 0);
+        set_eax(c, matches ? m->base : 0);
         return;
     }
     auto it = modules().find(name);
@@ -1440,6 +1457,34 @@ bool runtime_serves_module(const std::string &lower_name) {
 // loader_attach_module owns the rest of it for the COM class factories too.
 void load_library_named(X86 *c, const std::string &module_name) {
     std::string name = library_name(module_name);
+    LoaderModule *mapped = loader_module_named(name.c_str());
+    std::string host = win32_host_path(module_name);
+    OsStat stat;
+    bool exists = !host.empty() && os_stat(host.c_str(), &stat) == 0 && !stat.is_dir;
+    if (!exists && explicit_library_path(module_name) && (mapped || !runtime_serves_module(name))) {
+        log_once(("loadlib:missing:" + module_name).c_str(),
+                 "LoadLibrary(\"%s\"): requested file not found (ERROR_MOD_NOT_FOUND)",
+                 module_name.c_str());
+        set_last_error(126);
+        set_eax(c, 0);
+        return;
+    }
+    if (exists && mapped) {
+        std::string digest = loader_hash_file(host.c_str());
+        if (digest.empty() || digest != mapped->sha256) {
+            LOGW("LoadLibrary(\"%s\"): unsupported DLL identity at %s; SHA-256 %s; "
+                 "translated module %s at %s requires SHA-256 %s",
+                 module_name.c_str(), host.c_str(), digest.empty() ? "unreadable" : digest.c_str(),
+                 mapped->name.c_str(), mapped->path.c_str(), mapped->sha256.c_str());
+            fflush(stderr);
+            abort();
+        }
+    } else if (exists && !runtime_serves_module(name)) {
+        LOGW("LoadLibrary(\"%s\"): existing DLL at %s has no translation or shims; SHA-256 %s",
+             module_name.c_str(), host.c_str(), loader_hash_file(host.c_str()).c_str());
+        fflush(stderr);
+        abort();
+    }
     auto it = modules().find(name);
     if (it != modules().end()) {
         set_eax(c, it->second);
@@ -1447,7 +1492,7 @@ void load_library_named(X86 *c, const std::string &module_name) {
     }
     // Restore post-IAT bytes before each fresh attach, just as remapping the
     // original DLL would. Never restore the main image or run its EXE entry.
-    if (LoaderModule *m = loader_module_named(name.c_str())) {
+    if (LoaderModule *m = mapped) {
         if (m->base == loader_image_base()) {
             set_eax(c, m->base);
             return;
@@ -1488,7 +1533,9 @@ void k_LoadLibraryExW(X86 *c) {
         return;
     }
     std::string guest = gm_wstr(arg(c, 0));
-    if (LoaderModule *m = loader_module_named(library_name(guest).c_str()))
+    if (LoaderModule *m = explicit_library_path(guest)
+                              ? nullptr
+                              : loader_module_named(library_name(guest).c_str()))
         if (m->attached) {
             ++m->load_refs;
             set_eax(c, m->base);
@@ -2468,6 +2515,7 @@ struct GuestThread {
     // Blocking state.  `blocked` alone is enough to keep the thread off the
     // runnable list; the rest says when it may come back.
     bool blocked = false;
+    bool host_modal = false;
     WaitKind wait_kind = W_NONE;
     uint32_t wait_h[MAXIMUM_WAIT_OBJECTS_];
     uint32_t wait_n = 0;
@@ -2866,7 +2914,7 @@ void dump_scheduler_locked(const char *what, size_t me) {
 }
 
 bool thread_runnable(const GuestThread *t) {
-    if (t->finished)
+    if (t->finished || t->host_modal)
         return false;
     if (!t->is_main && !t->spawned)
         return false;
@@ -2938,6 +2986,19 @@ bool object_available(uint32_t h, uint32_t tid) {
         return o->owner_tid == 0 || o->owner_tid == tid;
     case H_THREAD:
         return o->exit_code != 0x103; // signalled once it ends
+    case H_CHILD_PROCESS:
+    case H_CHILD_THREAD: {
+        uint32_t code;
+        int result = os_child_poll(o->child.get(), o->kind == H_CHILD_THREAD, &code);
+        if (result < 0) {
+            LOGW("WaitForSingleObject/WaitForMultipleObjects: child %s status %s",
+                 o->kind == H_CHILD_THREAD ? "primary thread" : "process",
+                 result == OS_CHILD_THREAD_UNSUPPORTED ? "is unsupported on this platform"
+                                                       : "query failed");
+            abort();
+        }
+        return result != 0;
+    }
     default:
         return true;
     }
@@ -3093,6 +3154,15 @@ size_t sched_next_runnable_locked(size_t from) {
     return NO_THREAD;
 }
 
+size_t sched_wait_driver_locked() {
+    for (size_t i = 0; i < threads().size(); ++i) {
+        const GuestThread *t = threads()[i];
+        if (!t->finished && !t->host_modal && (t->is_main || t->spawned))
+            return i;
+    }
+    return NO_THREAD;
+}
+
 // Caller holds g_sched_m.  The earliest deadline among blocked threads, or 0
 // when none of them is timed, in which case only a signal can release them.
 double sched_earliest_deadline_locked() {
@@ -3222,7 +3292,7 @@ void sched_handoff_on_exit_locked(size_t me, const char *why) {
     sched_expire_locked();
     size_t next = sched_next_runnable_locked(me);
     if (next == NO_THREAD)
-        next = 0;
+        next = sched_wait_driver_locked();
     g_baton = next;
     record_handoff_locked(me, next, why);
     g_sched_cv.notify_all();
@@ -3341,6 +3411,49 @@ void guest_event_signal_from_host(uint32_t handle) {
 // that would post the message cannot run and the wait becomes a deadlock.
 bool host_guest_yield() {
     return guest_yield();
+}
+
+bool sched_host_modal_begin() {
+    if (!t_is_guest)
+        return false;
+    GuestThread *me = cur_thread();
+    g_sched_m.lock();
+    if (me->host_modal) {
+        g_sched_m.unlock();
+        return false;
+    }
+    const bool held_baton = g_baton == me->index;
+    me->host_modal = true;
+    if (held_baton) {
+        size_t next = sched_next_runnable_locked(me->index);
+        if (next == NO_THREAD)
+            next = sched_wait_driver_locked();
+        g_baton = next;
+        record_handoff_locked(me->index, next, "host modal wait");
+    }
+    g_sched_cv.notify_all();
+    g_sched_m.unlock();
+    return true;
+}
+
+void sched_host_modal_end(bool began) {
+    if (!began)
+        return;
+    GuestThread *me = cur_thread();
+    g_sched_m.lock();
+    me->host_modal = false;
+    const bool was_blocked = me->blocked;
+    me->blocked = false;
+    g_sched_cv.notify_all();
+    while (g_baton != me->index) {
+        if (g_baton >= threads().size() || threads()[g_baton]->finished) {
+            g_baton = me->index;
+            break;
+        }
+        g_sched_cv.wait_for(g_sched_m, std::chrono::milliseconds(2));
+    }
+    me->blocked = was_blocked;
+    g_sched_m.unlock();
 }
 
 // The guest stack pointers of this thread's open sched_atomic_enter stretches,
@@ -3893,6 +4006,28 @@ void k_ExitThread(X86 *c) {
 // thread being polled make progress: on Windows the poller would simply be
 // descheduled here.
 void k_GetExitCodeThread(X86 *c) {
+    HObj *child = handle_get(arg(c, 0), H_CHILD_THREAD);
+    if (child) {
+        uint32_t out = arg(c, 1), code = 0x103;
+        if (!out || !gm_valid(out, 4)) {
+            set_last_error(87);
+            set_eax(c, 0);
+            return;
+        }
+        int result = os_child_poll(child->child.get(), 1, &code);
+        if (result == OS_CHILD_THREAD_UNSUPPORTED) {
+            LOGW("GetExitCodeThread: child primary-thread status is unsupported on this platform");
+            abort();
+        }
+        if (result < 0) {
+            set_last_error(ERROR_ACCESS_DENIED_);
+            set_eax(c, 0);
+            return;
+        }
+        wr32(out, code);
+        set_eax(c, 1);
+        return;
+    }
     HObj *o = handle_get(arg(c, 0), H_THREAD);
     uint32_t p = arg(c, 1);
     if (!o) {
@@ -5325,6 +5460,117 @@ void open_mutex_named(X86 *c, const std::string &name) {
     set_eax(c, 0);
 }
 
+void k_CreateProcessA(X86 *c) {
+    uint32_t startup = arg(c, 8), info = arg(c, 9);
+    if (!startup || !gm_valid(startup, 68) || rd32(startup) != 68 || !info || !gm_valid(info, 16) ||
+        (!arg(c, 0) && !arg(c, 1))) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    auto unsupported = [&](const char *what) {
+        LOGW("CreateProcessA: unsupported %s", what);
+        set_last_error(ERROR_CALL_NOT_IMPLEMENTED_);
+        set_eax(c, 0);
+    };
+    if (arg(c, 2) || arg(c, 3) || arg(c, 4) || arg(c, 5) || arg(c, 6) || rd32(startup + 44) ||
+        rd32(startup + 4) || rd32(startup + 8) || rd32(startup + 12) || rd16(startup + 50) ||
+        rd32(startup + 52)) {
+        unsupported("security attributes, inherited handles, creation flags, environment or "
+                    "startup options");
+        return;
+    }
+    std::string directory = arg(c, 7) ? gm_str(arg(c, 7)) : g_cur_dir;
+    if (lower(full_path_named(directory)) != lower(full_path_named(RECOMP_GUEST_ROOT))) {
+        unsupported("child working directory");
+        return;
+    }
+    std::string line = arg(c, 1) ? gm_str(arg(c, 1)) : gm_str(arg(c, 0));
+    size_t first = line.find_first_not_of(" \t"), end;
+    if (first == std::string::npos) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    std::string executable;
+    if (line[first] == '"') {
+        end = line.find('"', first + 1);
+        if (end == std::string::npos) {
+            set_last_error(87);
+            set_eax(c, 0);
+            return;
+        }
+        executable = line.substr(first + 1, end - first - 1);
+        ++end;
+    } else {
+        end = line.find_first_of(" \t", first);
+        if (end == std::string::npos)
+            end = line.size();
+        while (!arg(c, 0) && end < line.size() &&
+               lower(full_path_named(line.substr(first, end - first))) !=
+                   lower(module_file_name(0))) {
+            end = line.find_first_of(" \t", end + 1);
+            if (end == std::string::npos)
+                end = line.size();
+        }
+        executable = line.substr(first, end - first);
+    }
+    if (arg(c, 0))
+        executable = gm_str(arg(c, 0));
+    if (lower(full_path_named(executable)) != lower(module_file_name(0))) {
+        LOGW("CreateProcessA: executable is not the translated image: %s", executable.c_str());
+        set_last_error(193);
+        set_eax(c, 0);
+        return;
+    }
+    if (!g_process_launcher) {
+        unsupported("process creation in this host");
+        return;
+    }
+    size_t args = line.find_first_not_of(" \t", end);
+    std::string extra = args == std::string::npos ? "" : line.substr(args);
+    std::string host_exe = g_game_dir + "/" RECOMP_EXECUTABLE;
+    OsChildProcess *child = g_process_launcher(host_exe.c_str(), extra.c_str());
+    if (!child) {
+        LOGW("CreateProcessA: native child launch failed for %s", executable.c_str());
+        set_last_error(ERROR_ACCESS_DENIED_);
+        set_eax(c, 0);
+        return;
+    }
+    std::shared_ptr<OsChildProcess> owner(child, os_child_close);
+    uint32_t process = handle_new(H_CHILD_PROCESS), thread = handle_new(H_CHILD_THREAD);
+    handles()[process].child = handles()[thread].child = owner;
+    wr32(info, process);
+    wr32(info + 4, thread);
+    wr32(info + 8, os_child_id(child, 0));
+    wr32(info + 12, os_child_id(child, 1));
+    fprintf(stderr, "[recomp] CreateProcessA: relaunched translated image with arguments: %s\n",
+            extra.c_str());
+    set_eax(c, 1);
+}
+
+void k_GetExitCodeProcess(X86 *c) {
+    uint32_t out = arg(c, 1), code = 0x103;
+    HObj *process = handle_get(arg(c, 0), H_CHILD_PROCESS);
+    if (!out || !gm_valid(out, 4)) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    if (!process && arg(c, 0) != 0xffffffffu) {
+        set_last_error(ERROR_INVALID_HANDLE_);
+        set_eax(c, 0);
+        return;
+    }
+    if (process && os_child_poll(process->child.get(), 0, &code) < 0) {
+        set_last_error(ERROR_ACCESS_DENIED_);
+        set_eax(c, 0);
+        return;
+    }
+    wr32(out, code);
+    set_eax(c, 1);
+}
+
 void get_command_line(X86 *c) {
     if (!g_cmdline_addr) {
         // The CRT skips argv[0] before passing lpCmdLine to WinMain. Quote
@@ -5643,7 +5889,8 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "GetProcessAffinityMask", 3, k_GetProcessAffinityMask},
     {"KERNEL32.dll", "SetProcessAffinityMask", 2, k_SetProcessAffinityMask},
     {"KERNEL32.dll", "SetThreadAffinityMask", 2, k_SetThreadAffinityMask},
-    {"KERNEL32.dll", "CreateProcessA", 10, nullptr},
+    {"KERNEL32.dll", "CreateProcessA", 10, k_CreateProcessA},
+    {"KERNEL32.dll", "GetExitCodeProcess", 2, k_GetExitCodeProcess},
     {"KERNEL32.dll", "DebugBreak", 0, nullptr},
     {"KERNEL32.dll", "FatalAppExitA", 2, nullptr},
     {"KERNEL32.dll", "GetDateFormatA", 6, nullptr},

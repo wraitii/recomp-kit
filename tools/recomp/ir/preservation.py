@@ -20,9 +20,9 @@ def forward(s, calls=False, stack_reload=None):
         if value.id in shapes:
             return shapes[value.id]
         if value.id in active:
-            return (value.id, 0)
+            return (value, 0)
         active.add(value.id)
-        result = (value.id, 0)
+        result = (value, 0)
         special = stack_reload(value) if stack_reload is not None else None
         if special is not None:
             base, delta = special
@@ -50,7 +50,7 @@ def forward(s, calls=False, stack_reload=None):
         if value.id in bounds:
             return bounds[value.id]
         root, offset = address(value)
-        base = s.values[root]
+        base = root
         result = (root, offset, offset)
         if base.opc == "INT_AND" and base.size == 4:
             a, b = map(s.resolve, base.args)

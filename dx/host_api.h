@@ -580,6 +580,7 @@ const HostD3DDrawSnapshot *host_frame_draw(HostFrameHandle f, uint32_t i);
 
 // Thread-safe host capture eligibility; no guest/COM access in the idle pump.
 int dinput_host_mouse_acquired(void);
+int dinput_host_mouse_exclusive(void);
 
 #ifdef __cplusplus
 } // extern "C"

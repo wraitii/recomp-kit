@@ -1,5 +1,6 @@
 // input_gate.cpp - see input_gate.h.
 #include "input_gate.h"
+#include "../dx/host_api.h"
 #include "../runtime/mods_seam.h"
 #include "../runtime/win32.h"
 
@@ -38,6 +39,8 @@ bool g_phys_mod[256];
 uint8_t g_guest_modifiers;
 
 void post(uint32_t msg, uint32_t wparam, uint32_t lparam) {
+    if (msg >= 0x0200 && msg <= 0x020e && dinput_host_mouse_exclusive())
+        return;
     // Keyboard input is addressed to the focus, not to a window the host
     // picked: the runtime knows which window has it, and in a VCL application
     // the first window created is the invisible application one, which does
@@ -48,8 +51,13 @@ void post(uint32_t msg, uint32_t wparam, uint32_t lparam) {
         return;
     }
     if (msg >= 0x0200 && msg <= 0x0209) {
-        host_post_client_mouse_message(host_main_window(), msg, wparam, int16_t(lparam),
-                                       int16_t(lparam >> 16));
+        int32_t origin_x = 0, origin_y = 0;
+        if (host_gate_viewport(&origin_x, &origin_y, nullptr, nullptr))
+            host_post_mouse_message(msg, wparam, int32_t(int16_t(lparam)) + origin_x,
+                                    int32_t(int16_t(lparam >> 16)) + origin_y);
+        else
+            host_post_client_mouse_message(host_main_window(), msg, wparam, int16_t(lparam),
+                                           int16_t(lparam >> 16));
         return;
     }
     uint32_t hwnd = host_main_window();
@@ -514,6 +522,24 @@ void host_gate_publish_layout(const LayoutSnapshot &snapshot) {
     std::lock_guard lock(g_layout_mutex);
     g_layout_slots[(g_layout_serial + 1) % 3] = snapshot;
     ++g_layout_serial;
+}
+bool host_gate_viewport(int32_t *origin_x, int32_t *origin_y, int *w, int *h) {
+    take_layout();
+    if (!g_layout.viewport)
+        return false;
+    if (origin_x)
+        *origin_x = g_layout.guest_origin_x;
+    if (origin_y)
+        *origin_y = g_layout.guest_origin_y;
+    if (w)
+        *w = g_layout.guest_w;
+    if (h)
+        *h = g_layout.guest_h;
+    return true;
+}
+bool host_gate_layout_published() {
+    take_layout();
+    return g_layout_seen != 0;
 }
 void host_gate_fallback_layout(int w, int h) {
     take_layout();

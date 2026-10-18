@@ -558,6 +558,62 @@ int os_wait(int64_t pid, int *exit_code) {
     return 0;
 }
 
+struct OsChildProcess {
+    PROCESS_INFORMATION info;
+};
+
+OsChildProcess *os_child_spawn(const char *const argv[]) {
+    std::wstring command;
+    for (size_t i = 0; argv[i]; ++i) {
+        if (i)
+            command += L' ';
+        command += L'"';
+        size_t slashes = 0;
+        for (wchar_t ch : widen(argv[i])) {
+            if (ch == L'\\') {
+                ++slashes;
+                continue;
+            }
+            command.append(ch == L'"' ? 2 * slashes + 1 : slashes, L'\\');
+            slashes = 0;
+            command += ch;
+        }
+        command.append(2 * slashes, L'\\');
+        command += L'"';
+    }
+    STARTUPINFOW startup = {};
+    startup.cb = sizeof startup;
+    PROCESS_INFORMATION info = {};
+    if (!CreateProcessW(widen(argv[0]).c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                        nullptr, &startup, &info))
+        return nullptr;
+    return new OsChildProcess{info};
+}
+
+uint32_t os_child_id(OsChildProcess *child, int primary_thread) {
+    return primary_thread ? child->info.dwThreadId : child->info.dwProcessId;
+}
+
+int os_child_poll(OsChildProcess *child, int primary_thread, uint32_t *exit_code) {
+    HANDLE handle = primary_thread ? child->info.hThread : child->info.hProcess;
+    DWORD result = WaitForSingleObject(handle, 0);
+    if (result == WAIT_TIMEOUT)
+        return OS_CHILD_RUNNING;
+    if (result != WAIT_OBJECT_0)
+        return OS_CHILD_ERROR;
+    DWORD code;
+    if (!(primary_thread ? GetExitCodeThread(handle, &code) : GetExitCodeProcess(handle, &code)))
+        return OS_CHILD_ERROR;
+    *exit_code = code;
+    return OS_CHILD_EXITED;
+}
+
+void os_child_close(OsChildProcess *child) {
+    CloseHandle(child->info.hThread);
+    CloseHandle(child->info.hProcess);
+    delete child;
+}
+
 int os_fd_open(const char *path, int flags) {
     return _wopen(widen(path).c_str(), native_flags(flags), _S_IREAD | _S_IWRITE);
 }

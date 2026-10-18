@@ -819,7 +819,7 @@ void k_VerSetConditionMask(X86 *c) {
     set_eax64(c, mask);
 }
 void k_GetCurrentProcessId(X86 *c) {
-    set_eax(c, 1);
+    set_eax(c, (uint32_t)os_process_id());
 }
 void k_IsDebuggerPresent(X86 *c) {
     set_eax(c, 0);

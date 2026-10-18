@@ -1,4 +1,5 @@
 #include "input_script.h"
+#include "../dx/host_api.h"
 #include "input.h"
 #include "input_gate.h"
 #include "boot.h"
@@ -26,7 +27,9 @@ void deliver(const HostScriptStep &step) {
         y = step.op == HOST_SCRIPT_MOVEBY ? (int32_t)((uint32_t)y + dy) : step.y;
         if (!host_gate_motion(x, y, dx, dy)) {
             host_input_motion(x, y, dx, dy);
-            host_post_client_mouse_message(host_main_window(), 0x200, 0, (int16_t)x, (int16_t)y);
+            if (!dinput_host_mouse_exclusive())
+                host_post_client_mouse_message(host_main_window(), 0x200, 0, (int16_t)x,
+                                               (int16_t)y);
         }
         break;
     }

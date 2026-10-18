@@ -256,16 +256,16 @@ extern "C" void host_display_present_gpu2d(uint32_t id, int w, int h) {
     host_page_overlay(nullptr, w, h, 32, w * 4, nullptr);
     host_present_seal_window();
 }
-extern "C" void host_display_present_window(const uint32_t *argb, int w, int h) {
+namespace {
+void present_argb(const uint32_t *argb, int w, int h, bool viewport, int32_t origin_x,
+                  int32_t origin_y, uint32_t style) {
     if (!argb || w <= 0 || h <= 0)
         return;
-    if (g_mode_w != w || g_mode_h != h || g_mode_bpp != 32)
+    if (!viewport && (g_mode_w != w || g_mode_h != h || g_mode_bpp != 32))
         host_set_display_mode(w, h, 32);
     host_present_first_write();
     const size_t n = size_t(w) * h;
     std::vector<uint8_t> rgba(n * 4);
-    // Word to word through plain pointers, which the compiler vectorizes; the
-    // byte-indexed form it replaces cost a 1080p frame several milliseconds.
     const uint32_t *src = argb;
     uint8_t *dst = rgba.data();
     for (size_t i = 0; i < n; ++i) {
@@ -277,12 +277,23 @@ extern "C" void host_display_present_window(const uint32_t *argb, int w, int h) 
         ReportLock held;
         ++g_present_count;
     }
-    // The settings page's input is registered on the first frame a host draws;
-    // a program that only ever presents windows (a D3D11 renderer, the VCL)
-    // reaches no other present, and F10 would open nothing.
     host_page_overlay(nullptr, w, h, 32, w * 4, nullptr);
-    host_present_stage_rgba(rgba.data(), w, h);
+    if (viewport)
+        host_present_stage_rgba_viewport(rgba.data(), w, h, origin_x, origin_y, style);
+    else
+        host_present_stage_rgba(rgba.data(), w, h);
     host_present_seal_window();
+}
+} // namespace
+
+extern "C" void host_display_present_window(const uint32_t *argb, int w, int h) {
+    present_argb(argb, w, h, false, 0, 0, 0);
+}
+
+extern "C" void host_display_present_window_viewport(const uint32_t *argb, int w, int h,
+                                                     int32_t origin_x, int32_t origin_y,
+                                                     uint32_t style) {
+    present_argb(argb, w, h, true, origin_x, origin_y, style);
 }
 
 // Same bookkeeping and owned snapshot as the ARGB seam, without channel
