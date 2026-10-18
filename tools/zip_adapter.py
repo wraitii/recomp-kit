@@ -169,7 +169,9 @@ def list_archive(path):
         return entries
 
 
-def archive_uncompressed_size(path):
+def archive_uncompressed_size(path, cancel=None):
+    if cancel:
+        cancel()
     with open_archive(path) as (_, (_, declared)):
         return declared
 

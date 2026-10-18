@@ -66,8 +66,7 @@ def largest_frame(ico):
     return image.convert("RGBA")
 
 
-def write_icons(exe_path, dest, sizes=IOS_ICONS):
-    """Write every icon file into `dest`; returns the paths written."""
+def load_icon(exe_path):
     try:
         icon = ico_bytes(exe_path)
     except MissingIconError:
@@ -79,7 +78,12 @@ def write_icons(exe_path, dest, sizes=IOS_ICONS):
         if len(matches) != 1:
             raise
         icon = matches[0].read_bytes()
-    frame = largest_frame(icon)
+    return icon
+
+
+def write_icons(exe_path, dest, sizes=IOS_ICONS):
+    """Write every icon file into `dest`; returns the paths written."""
+    frame = largest_frame(load_icon(exe_path))
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
     written = []

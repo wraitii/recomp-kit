@@ -83,7 +83,9 @@ function lock(value) {
     input.disabled = busy || checking || inspecting || input.dataset.unavailable === "true";
   }
   element("cancel").disabled = !busy;
-  element("inspection-back").disabled = busy || checking;
+  element("inspection-back").disabled = busy || checking || inspecting;
+  element("inspection-cancel").hidden = !inspecting;
+  element("inspection-cancel").disabled = !inspecting;
   element("review-copy").disabled = busy || checking || inspecting || !inspectionReady || !candidateCanInstall || !candidateId;
   element("install").disabled = busy || checking || inspecting || !checksReady || !preflightReady || !inspectionReady || !candidateCanInstall || !candidateId || !source || !destination;
   element("pick-destination").disabled = busy || checking || inspecting;
@@ -183,10 +185,15 @@ function renderInspection(result) {
     let help = `Choose a complete game folder containing ${selected.executable}, or prepare the required files using a checklist.`;
     if (ready) {
       title = "Your copy is supported";
-      help = "Version verified. Next, review the install location and build tools.";
+      help = sourceKind === "inno"
+        ? "Executable version verified. Game data will be extracted and checked during installation."
+        : "Version verified. Next, review the install location and build tools.";
     } else if (candidates.length > 1 && !candidate) {
       title = "Choose a copy to use";
       help = "Multiple copies found. Select one to check.";
+    } else if (sourceKind === "inno") {
+      title = "This installer needs attention";
+      help = result.diagnostics?.[0]?.message || `The extracted files do not match the supported version of ${selected.title || selected.id}.`;
     } else if (media) {
       title = sourceKind.includes("inno") ? "This installer can’t be imported yet" : "This media can’t be imported yet";
       help = `Install or extract it outside this app, then choose the folder containing ${selected.executable}. Or collect the files using a preparation checklist.`;
@@ -417,6 +424,7 @@ async function openGame(game) {
   activeJobId = "";
   checksReady = false;
   source = game.managedSource || "";
+  sourceKind = game.managedSource ? "folder" : "";
   candidateId = "";
   preflightReady = false;
   inspectionReady = Boolean(game.managedSource);
@@ -485,7 +493,7 @@ async function checkRequirements() {
   element("recheck").hidden = false;
   element("build-requirements").hidden = true;
   try {
-    const result = await backend.query({ action: "check", needsRust: selected?.needsRust ?? true, needsInnoextract: false });
+    const result = await backend.query({ action: "check", needsRust: selected?.needsRust ?? true, needsInnoextract: sourceKind === "inno" });
     if (revision !== checkRevision) return;
     element("check-status").textContent = result.ready ? "All requirements are installed." : "Install the missing tools below, then choose Check again.";
     for (const check of result.checks) {
@@ -563,12 +571,13 @@ async function retrySavedJob(job) {
   if (!job.canResume || !job.source?.path || !job.candidateId || !job.destination) {
     throw new Error("This saved job does not have enough validated information to retry.");
   }
+  sourceKind = job.source.kind;
   checking = true;
   lock(false);
   let checked;
   try {
     checked = await backend.query({ action: "check", needsRust: selected?.needsRust ?? true,
-      needsInnoextract: false });
+      needsInnoextract: sourceKind === "inno" });
   } finally {
     checking = false;
     lock(false);
@@ -1017,6 +1026,7 @@ async function reviewInstallation() {
   await checkRequirements();
   if (currentScreen === 0) await updateSpaceEstimate();
 }
+element("inspection-cancel").onclick = () => attempt(() => backend.cancel());
 element("review-copy").onclick = () => attempt(reviewInstallation);
 async function updateSpaceEstimate() {
   const revision = ++preflightRevision;
@@ -1028,14 +1038,14 @@ async function updateSpaceEstimate() {
   }
   element("space-summary").textContent = "Checking available space…";
   lock(false);
-  if (!["folder", "executable", "zip"].includes(sourceKind)) {
-    element("space-summary").textContent = "Choose an installed folder, executable or ZIP to estimate space.";
+  if (!["folder", "executable", "zip", "inno"].includes(sourceKind)) {
+    element("space-summary").textContent = "Choose an installed folder, executable, ZIP or supported installer to estimate space.";
     lock(false);
     return;
   }
   try {
-    const preflightSource = sourceKind === "zip" ? source : candidateContentRoot || source;
-    const estimate = await backend.query({ action: "preflight", source: preflightSource, sourceKind, destination });
+    const preflightSource = ["zip", "inno"].includes(sourceKind) ? source : candidateContentRoot || source;
+    const estimate = await backend.query({ action: "preflight", game: selected.id, source: preflightSource, sourceKind, destination });
     if (revision !== preflightRevision || currentScreen !== 0) return;
     const installedBytes = estimate.source.bytes + 40_000_000 + 10 * candidateExecutableBytes;
     element("space-summary").textContent = `About ${gigabytes(installedBytes)} installed · ${gigabytes(estimate.destination.requiredBytes)} free needed during the build.${estimate.destination.enough ? "" : ` Only ${gigabytes(estimate.destination.freeBytes)} available. Choose another location.`}`;

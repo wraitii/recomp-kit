@@ -190,6 +190,23 @@ def validate_installation_hints(cfg, source):
         candidates.insert(0, game["executable"])
 
     setup = cfg["setup"]
+    installers = setup.setdefault("installers", [])
+    if not isinstance(installers, list):
+        raise ValueError("%s: setup.installers must be an array of tables" % source)
+    for installer in installers:
+        if (not isinstance(installer, dict) or installer.get("format") != "inno"
+                or not isinstance(installer.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-fA-F]{64}", installer["sha256"])
+                or any(type(installer.get(key)) is not int or installer[key] <= 0
+                       for key in ("size", "expanded_size"))):
+            raise ValueError("%s: each setup.installers entry needs format=inno, sha256, size and expanded_size" % source)
+        moves = installer.setdefault("move_files", {})
+        if not isinstance(moves, dict):
+            raise ValueError("%s: setup.installers move_files must map source paths to destination paths" % source)
+        for old, new in moves.items():
+            for path in (old, new):
+                if relative_game_path(path, source, "setup.installers.move_files") == ".":
+                    raise ValueError("%s: setup.installers move_files must name files" % source)
     layout = setup.setdefault("layout", {})
     if not isinstance(layout, dict):
         raise ValueError("%s: [setup] layout must be a table" % source)

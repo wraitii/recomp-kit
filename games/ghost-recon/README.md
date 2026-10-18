@@ -6,6 +6,14 @@ is the game's configuration root (`--game ghost-recon`).
 
 ## Setup and build
 
+In Recomp Toolkit, choose `setup_tom_clancys_ghost_recon_1.4.0.0_(19232).exe`
+to import the GOG release, including Desert Siege and Island Thunder. Install
+`innoextract` 1.9 or later first (`brew install innoextract` on macOS). The recipe
+records the verified installer checksum, expanded size and relocation of
+`__support/app/Data/Save/Script/default.ass` to `Data/Save/Script/default.ass`,
+matching the installed copy. Extraction produces the supported executable
+without running setup or applying patches.
+
 From the game repository root (the one containing `recomp-kit/`):
 
 ```sh

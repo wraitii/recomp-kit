@@ -21,9 +21,15 @@ kit as a submodule.
 
 ## Recomp Toolkit
 
-Recomp Toolkit imports installed folders and ZIPs with exact version checks,
-and offers an assisted drop folder for manual preparation. Other installers and
-disc images are reference-only; the library never runs them. ZIP imports reject
+Recomp Toolkit imports installed folders, ZIPs and GOG Inno installers
+with exact version checks, and offers an assisted drop folder for manual preparation.
+Installer imports require `innoextract` 1.9 or later (on macOS: `brew install innoextract`)
+and recognize supported games by extracting and hashing only executable candidates
+and required modules, with data paths checked against the installer listing.
+Full extraction validates a private copy of the EXE and accompanying Inno BIN slices;
+external RAR payloads remain unsupported. Each game's optional `setup.installers`
+recipes supply verified layout adjustments for known releases. The library never
+executes installers. Other installers and disc images are reference-only. ZIP imports reject
 unsafe paths, links and special files and enforce entry and expanded-size limits.
 Black & White needs an installed folder with the fan patch.
 

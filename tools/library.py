@@ -30,8 +30,9 @@ from source_inspection import (MAX_DISCOVERY_CANDIDATES, MAX_DISCOVERY_ENTRIES,
                                MAX_DISCOVERY_HASH_BYTES, MAX_DISCOVERY_ROOTS,
                                expand_discovery_roots, inspect_folder, probe_bytes,
                                sibling_payload_facts)
-from zip_adapter import (ZipError, archive_digest, archive_uncompressed_size,
-                         extract as extract_zip)
+import zip_adapter
+from zip_adapter import ZipError
+from inno_adapter import InnoAdapter, InnoError
 
 CANCEL_FILE = None
 KIT = Path(__file__).resolve().parents[1]
@@ -1020,7 +1021,7 @@ def prerequisites(needs_rust, needs_innoextract=False):
                        "url": "https://developer.apple.com/documentation/xcode/installing-the-command-line-tools/",
                        "help": "Open Terminal (Applications → Utilities), paste this command and press Enter. Choose Install in the window that appears, then check again when it finishes.",
                        "command": "xcode-select --install"})
-    modules = ("capstone", "pefile", "numpy", "pypcode")
+    modules = ("capstone", "pefile", "numpy", "pypcode", "PIL", "resvg_py")
     missing = [module for module in modules if importlib.util.find_spec(module) is None]
     checks.append({"label": "Game conversion tools", "ok": not missing,
                    "detail": ", ".join(missing) if missing else "Installed", "url": "",
@@ -1033,6 +1034,10 @@ def prerequisites(needs_rust, needs_innoextract=False):
                 check["methods"].append({"label": "Download", "help": "Open the official setup page and follow the instructions for your system.", "url": check["url"]})
     return {"checks": checks, "ready": all(check["ok"] for check in checks), "homebrew": brew,
             "python": sys.executable, "platform": platform.system()}
+
+
+def archive_adapter(cfg, source_kind):
+    return InnoAdapter(cfg["setup"]["installers"]) if source_kind == "inno" else zip_adapter
 
 
 def inspect_source(cfg, source):
@@ -1055,28 +1060,36 @@ def inspect_source(cfg, source):
         result["source"]["kind"] = "executable"
         result["source"]["probe"] = probe["evidence"]
         return _add_sibling_facts(result, source)
-    if probe["kind"] == "zip":
+    if probe["kind"] in ("zip", "inno"):
+        kind = probe["kind"]
+        adapter = archive_adapter(cfg, kind)
         try:
-            digest = archive_digest(source, check_cancel)
+            digest = adapter.archive_digest(source, check_cancel)
             with tempfile.TemporaryDirectory(prefix="recomp-toolkit-inspect-") as temporary:
                 extracted = Path(temporary) / "content"
-                extract_zip(source, extracted, check_cancel)
-                if archive_digest(source, check_cancel) != digest:
-                    raise SourceError("source_changed", "The ZIP changed while it was being inspected.",
+                if kind == "inno":
+                    result = adapter.inspect(cfg, source, extracted, check_cancel)
+                else:
+                    adapter.extract(source, extracted, check_cancel)
+                    result = inspect_folder(cfg, extracted, check_cancel)
+                if adapter.archive_digest(source, check_cancel) != digest:
+                    raise SourceError("source_changed", "The archive changed while it was being inspected.",
                                       ["Inspect the archive again and retry the import."], str(source))
-                result = inspect_folder(cfg, extracted, check_cancel)
             _set_archive_candidate_ids(result, digest)
-            result["source"].update(kind="zip", path=str(source), archiveSha256=digest)
-            result["limits"].update({"maxArchiveEntries": 20000,
-                                     "maxArchiveBytes": 4 * 1024 * 1024 * 1024})
+            result["source"].update(kind=kind, path=str(source), archiveSha256=digest)
+            if kind == "zip":
+                result["limits"].update({"maxArchiveEntries": 20000,
+                                         "maxArchiveBytes": 4 * 1024 * 1024 * 1024})
             return result
-        except ZipError as error:
+        except (ZipError, InnoError) as error:
             return _source_diagnostic(source, error.code, str(error),
-                                      ["Choose a ZIP without unsafe paths, special files, or excessive contents."],
-                                      source_kind="zip")
+                                      ["Check the selected source and choose the file again, or use an installed game folder."],
+                                      source_kind=kind)
+        except InterruptedError:
+            raise
         except (OSError, zipfile.BadZipFile, RuntimeError) as error:
-            return _source_diagnostic(source, "unreadable_archive", "The ZIP could not be read safely.",
-                                      ["Check the archive and try again."], {"error": str(error)}, "zip")
+            return _source_diagnostic(source, "unreadable_archive", "The archive could not be read safely.",
+                                      ["Check the archive and try again."], {"error": str(error)}, kind)
     messages = {
         "zip": ("unsupported_archive", "The ZIP did not contain a supported game copy.",
                 ["Choose a complete installed game folder or a ZIP containing the game files."]),
@@ -1099,17 +1112,6 @@ def inspect_source(cfg, source):
         "unknown": ("unsupported_source", "The selected file is not a recognized game executable or supported archive.",
                     ["Choose an installed game folder or a supported source file."]),
     }
-    if probe["kind"] == "inno":
-        helper_available = shutil.which("innoextract") is not None
-        message = ("An Inno Setup installer was recognized, but safe installer import is not available yet."
-                   if helper_available else
-                   "An Inno Setup installer was recognized, but innoextract is not installed and safe installer import is not available yet.")
-        recovery = ["Choose an installed game folder."]
-        if not helper_available:
-            recovery.append("Install innoextract before using this installer after installer import becomes available.")
-        result = _source_diagnostic(source, "installer_adapter_pending", message, recovery,
-                                    {"probe": probe["evidence"], "innoextractAvailable": helper_available}, "inno")
-        return _add_sibling_facts(result, source)
     code, message, recovery = messages.get(probe["kind"], messages["unknown"])
     result = _source_diagnostic(source, code, message, recovery, {"probe": probe["evidence"],
                                                                   "sourceKind": probe["kind"]}, probe["kind"])
@@ -1256,7 +1258,7 @@ def prepare_install(request, storage):
                               "The selected source overlaps the library destination or its cleanup folders.",
                               ["Choose a complete game folder outside the library destination."],
                               str(source_root), {"destination": str(root)})
-    elif source_kind == "zip":
+    elif source_kind in ("zip", "inno"):
         if source_path.is_relative_to(root):
             raise SourceError("source_destination_overlap",
                               "The selected archive overlaps the library destination.",
@@ -1304,6 +1306,7 @@ def install(request, storage, prepared=None):
     root = prepared["root"]
     cfg = prepared["cfg"]
     source_kind = prepared["sourceKind"]
+    adapter = archive_adapter(cfg, source_kind)
     explicit_source = prepared["explicitSource"]
     selected = prepared["selected"]
     bind_selected_auxiliary_paths(cfg, selected, root)
@@ -1320,14 +1323,15 @@ def install(request, storage, prepared=None):
     job_identifier = request.get("jobId")
     recipe_facts = recipe(directory)
     emit("stage", stage="fingerprinting", message="Reading your game files")
-    source_identity = ({"kind": "zip", "sha256": archive_digest(source_path, check_cancel)}
-                       if source_kind == "zip" else
+    source_identity = ({"kind": source_kind, "sha256": adapter.archive_digest(source_path, check_cancel)}
+                       if source_kind in ("zip", "inno") else
                        {"kind": "folder", **install_jobs.payload_identity(selected["contentRoot"], check_cancel,
                                                                                 exclude_paths=exclude_paths,
                                                                                 progress=file_progress())})
     if assisted_request:
         source_identity["excludedOptionalPaths"] = list(exclude_paths)
-    archive_bytes = archive_uncompressed_size(source_path) if source_kind == "zip" else 0
+    archive_bytes = adapter.archive_uncompressed_size(source_path, check_cancel) if source_kind in ("zip", "inno") else 0
+    installer_bytes = adapter.source_size(source_path) if source_kind == "inno" else 0
     copy_estimate = source_identity.get("bytes", archive_bytes)
     resumed = bool(job_identifier)
     if job_identifier:
@@ -1388,6 +1392,7 @@ def install(request, storage, prepared=None):
     journal["log"] = f".recomp-toolkit/logs/{log_path.name}"
     space_plan = {"policy": "install-space-v1", "volume": str(root),
                   "archiveExpansionEstimateBytes": archive_bytes,
+                  "installerSnapshotBytes": installer_bytes,
                   "sourceCopyEstimateBytes": copy_estimate,
                   "buildAllowanceBytes": install_jobs.MAX_BUILD_BYTES,
                   "safetyReserveBytes": install_jobs.SAFETY_RESERVE_BYTES,
@@ -1456,31 +1461,32 @@ def install(request, storage, prepared=None):
         else:
             stage = "validating"
             install_jobs.update_job(job_paths, journal, stage)
-        if source_kind == "zip" and not reusable_copy:
+        if source_kind in ("zip", "inno") and not reusable_copy:
             stage = "extracting"
             emit("stage", stage=stage, message="Extracting the game archive")
             install_jobs.update_job(job_paths, journal, stage)
             check_space(job_paths, journal, root, "extracting",
-                        archive_bytes + copy_estimate + install_jobs.MAX_BUILD_BYTES,
+                        archive_bytes + installer_bytes + copy_estimate + install_jobs.MAX_BUILD_BYTES,
                         log_path, space_plan)
             log_event(log_path, stage, "archive extraction started",
                       {"declaredExpansionBytes": archive_bytes})
             extracted = staging / "extracted"
             try:
-                extract_zip(source_path, extracted, check_cancel)
-            except ZipError as error:
+                adapter.extract(source_path, extracted, check_cancel,
+                                **({"progress": file_progress(archive_bytes)} if source_kind == "inno" else {}))
+            except (ZipError, InnoError) as error:
                 raise SourceError(error.code, str(error), ["Check the archive and inspect it again."], str(source_path)) from error
             extracted_result = inspect_folder(cfg, extracted, check_cancel)
             _set_archive_candidate_ids(extracted_result, source_identity["sha256"], clear_content_root=False)
             selected_now = select_candidate(extracted_result, selected["id"])
             source = Path(selected_now["contentRoot"])
-            if archive_digest(source_path, check_cancel) != selected.get("archiveSha256"):
-                raise SourceError("source_changed", "The ZIP changed after its contents were inspected.",
+            if adapter.archive_digest(source_path, check_cancel) != selected.get("archiveSha256"):
+                raise SourceError("source_changed", "The archive changed after its contents were inspected.",
                                   ["Inspect the archive again and retry the import."], str(source_path))
-            if archive_digest(source_path, check_cancel) != source_identity["sha256"]:
-                raise SourceError("source_changed", "The ZIP changed while its contents were being extracted.",
+            if adapter.archive_digest(source_path, check_cancel) != source_identity["sha256"]:
+                raise SourceError("source_changed", "The archive changed while its contents were being extracted.",
                                   ["Inspect the archive again and retry the import."], str(source_path))
-        elif source_kind != "zip":
+        elif source_kind not in ("zip", "inno"):
             source = Path(selected["contentRoot"])
             current = inspect_source(cfg, source_path)
             selected_now = select_candidate(current, selected["id"], explicit_source)
@@ -1524,7 +1530,7 @@ def install(request, storage, prepared=None):
         if copied["sha256"] != source_facts["sha256"]:
             raise SourceError("copy_validation_failed", "The staged game copy differs from its source.",
                               ["Check storage space and source permissions."], str(source))
-        if source_kind == "zip" and not reusable_copy:
+        if source_kind in ("zip", "inno") and not reusable_copy:
             shutil.rmtree(staging / "extracted")
         validate_game(staged_data, executable_relative, cfg["game"]["sha256"], required)
         for module in cfg["aux_modules"]:
@@ -1591,6 +1597,10 @@ def install(request, storage, prepared=None):
                     fmt=plistlib.FMT_XML)
             game_bundle = publish_root / f"{cfg['game']['app_name']}.app"
             configure_bundle = publish_root / configure_name
+            from app_icons import set_bundle_icon, svg_image, write_desktop_icons
+            configure_icons = build_root / "icons/configure"
+            write_desktop_icons(svg_image("configure"), configure_icons)
+            set_bundle_icon(configure_bundle, configure_icons / "icon.icns")
             game_executable = game_bundle / "Contents" / "MacOS" / cfg["game"]["app_name"]
             if not os.access(game_executable, os.X_OK) or not os.access(configure_executable, os.X_OK):
                 raise ValueError("A published app executable is missing its executable permission")
@@ -1608,8 +1618,8 @@ def install(request, storage, prepared=None):
             raise ValueError("Installation staging is missing the game application")
         check_cancel()
         current_recipe = recipe(directory)
-        current_source = ({"kind": "zip", "sha256": archive_digest(source_path, check_cancel)}
-                          if source_kind == "zip" else
+        current_source = ({"kind": source_kind, "sha256": adapter.archive_digest(source_path, check_cancel)}
+                          if source_kind in ("zip", "inno") else
                           {"kind": "folder", **install_jobs.payload_identity(selected["contentRoot"], check_cancel,
                                                                                exclude_paths=exclude_paths)})
         if assisted_job:
@@ -1863,8 +1873,16 @@ def preflight_request(request):
         raise install_jobs.JobError("preflight_path_invalid", "Choose a destination with an existing parent directory.")
     source_kind = request.get("sourceKind")
     if source_kind == "zip":
-        source_bytes = archive_uncompressed_size(source)
+        source_bytes = zip_adapter.archive_uncompressed_size(source, check_cancel)
         destination_copy_bytes = source_bytes * 2
+    elif source_kind == "inno":
+        validate_inspection_request(request)
+        directory = KIT / "games" / request["game"]
+        if directory.parent != KIT / "games" or not (directory / "game.toml").is_file():
+            raise ValueError("Unknown game")
+        adapter = archive_adapter(game_config.load(directory), source_kind)
+        source_bytes = adapter.archive_uncompressed_size(source, check_cancel)
+        destination_copy_bytes = source_bytes * 2 + adapter.source_size(source)
     elif source.is_dir():
         source_bytes = install_jobs.payload_size(source, check_cancel)["bytes"]
         destination_copy_bytes = source_bytes

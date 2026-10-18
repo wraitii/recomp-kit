@@ -15,6 +15,12 @@ function(recomp_mac_bundle target)
   string(REPLACE "&" "&amp;" RECOMP_GAME_NAME_XML "${RECOMP_GAME_NAME_XML}")
   string(REPLACE "<" "&lt;" RECOMP_GAME_NAME_XML "${RECOMP_GAME_NAME_XML}")
   string(REPLACE ">" "&gt;" RECOMP_GAME_NAME_XML "${RECOMP_GAME_NAME_XML}")
+  set(RECOMP_BUNDLE_VERSION "1")
+  set(RECOMP_BUNDLE_SHORT_VERSION "0.1")
+  if(RECOMP_VERSION)
+    string(REGEX REPLACE "^v" "" RECOMP_BUNDLE_VERSION "${RECOMP_VERSION}")
+    set(RECOMP_BUNDLE_SHORT_VERSION "${RECOMP_BUNDLE_VERSION}")
+  endif()
   configure_file(${RECOMP_ROOT}/host/Info.plist.in ${CMAKE_BINARY_DIR}/generated/Info.plist @ONLY)
   set_target_properties(${target} PROPERTIES
     MACOSX_BUNDLE ON
@@ -47,7 +53,17 @@ function(recomp_mac_bundle target)
     endforeach()
   endif()
   set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS
-    ${RECOMP_ROOT}/tools/recomp/finish_bundle.py)
+    ${CMAKE_BINARY_DIR}/generated/Info.plist
+    ${RECOMP_ROOT}/tools/recomp/finish_bundle.py
+    ${RECOMP_ROOT}/tools/app_icons.py
+    ${RECOMP_ROOT}/tools/extract_icon.py)
+  file(GLOB icon_sidecars CONFIGURE_DEPENDS
+    "${RECOMP_DEVELOPER_GAME_DIR}/*.[iI][cC][oO]")
+  foreach(icon_source "${RECOMP_DEVELOPER_EXE}" ${icon_sidecars})
+    if(EXISTS "${icon_source}")
+      set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${icon_source}")
+    endif()
+  endforeach()
   add_custom_command(TARGET ${target} POST_BUILD
     COMMAND ${Python3_EXECUTABLE} ${RECOMP_ROOT}/tools/recomp/finish_bundle.py
             --bundle ${RECOMP_BUILD_DIR}/${RECOMP_APP_NAME}.app

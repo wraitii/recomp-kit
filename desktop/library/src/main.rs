@@ -21,6 +21,17 @@ struct Library {
     settings_file: PathBuf,
 }
 
+fn cancellation_path(state: &Library) -> Result<PathBuf, String> {
+    Ok(state.storage.join(format!(
+        "cancel-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos()
+    )))
+}
+
 fn command(settings: &Settings, storage: &PathBuf, request: &Value) -> Command {
     let mut cmd = Command::new(&settings.python);
     cmd.arg("-u")
@@ -121,7 +132,7 @@ async fn pick(kind: String, app: tauri::AppHandle) -> Option<String> {
 }
 
 #[tauri::command]
-async fn query(request: Value, app: tauri::AppHandle) -> Result<Value, String> {
+async fn query(mut request: Value, app: tauri::AppHandle) -> Result<Value, String> {
     if !matches!(request["action"].as_str(), Some("catalog" | "check" | "inspect" | "discover" | "preflight" | "adopt" | "job_log"
         | "assisted_start" | "assisted_status" | "assisted_path" | "assisted_cancel" | "assisted_recheck")) {
         return Err("Unsupported query".into());
@@ -129,9 +140,24 @@ async fn query(request: Value, app: tauri::AppHandle) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<Library>();
         let settings = state.settings.lock().unwrap().clone();
-        let output = command(&settings, &state.storage, &request)
-            .output()
-            .map_err(|e| format!("Cannot start Python: {e}"))?;
+        let cancel_file = if request["action"] == "inspect" {
+            let mut active = state.job.lock().unwrap();
+            if active.is_some() {
+                return Err("Another operation is already running".into());
+            }
+            let path = cancellation_path(&state)?;
+            request["cancelFile"] = json!(path);
+            *active = Some(path.clone());
+            Some(path)
+        } else {
+            None
+        };
+        let output = command(&settings, &state.storage, &request).output();
+        if let Some(path) = cancel_file {
+            *state.job.lock().unwrap() = None;
+            let _ = std::fs::remove_file(path);
+        }
+        let output = output.map_err(|e| format!("Cannot start Python: {e}"))?;
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             if let Ok(event) = serde_json::from_str::<Value>(line) {
                 if event["kind"] == "result" && output.status.success() {
@@ -202,14 +228,7 @@ fn start_job(mut request: Value, app: tauri::AppHandle, state: State<Library>) -
     if active.is_some() {
         return Err("Another job is already running".into());
     }
-    let cancel_file = state.storage.join(format!(
-        "cancel-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_nanos()
-    ));
+    let cancel_file = cancellation_path(&state)?;
     request["cancelFile"] = json!(cancel_file);
     let settings = state.settings.lock().unwrap().clone();
     let mut cmd = command(&settings, &state.storage, &request);

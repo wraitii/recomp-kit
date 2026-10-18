@@ -22,8 +22,13 @@ def package(bundle, build_root, python_root):
                    env=dict(os.environ, MACOSX_DEPLOYMENT_TARGET="14.0"))
     resources = bundle / "Contents/Resources"
     if resources.exists():
-        shutil.rmtree(resources)
-    resources.mkdir(parents=True)
+        for child in resources.iterdir():
+            if child.name != "icon.icns":
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+    resources.mkdir(parents=True, exist_ok=True)
     kit = resources / "kit"
     tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT).decode().split("\0")
     for name in filter(None, tracked):

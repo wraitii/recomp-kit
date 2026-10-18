@@ -287,17 +287,18 @@ def _resolve_case(root, base_relative, relative, want_directory, directory_index
         expected_kind = "directory" if (want_directory or not is_last) else "file"
         if entry["kind"] != expected_kind:
             return None, None
-        try:
-            _safe_path(root, entry["path"])
-        except OSError:
-            return None, "unsafe_path"
+        if not entry.get("listed"):
+            try:
+                _safe_path(root, entry["path"])
+            except OSError:
+                return None, "unsafe_path"
         actual.append(entry["name"])
     return ("/".join(actual[len(base_parts):]) if actual[len(base_parts):] else "."), None
 
 
 def validate_required_roles(cfg, root, cancel=None, directory_index=None, byte_budget=None,
                             base_relative="", executable_relative=None, executable_fact=None,
-                            artifacts=None):
+                            artifacts=None, listed=False):
     root = Path(root).resolve(strict=True)
     if directory_index is None:
         diagnostics = []
@@ -332,7 +333,7 @@ def validate_required_roles(cfg, root, cancel=None, directory_index=None, byte_b
         if fact is not None:
             artifact_status = ("wrong_version" if fact["status"] == "verified" and not found else fact["status"])
         else:
-            artifact_status = "verified" if found else "missing" if reason is None else "unreadable"
+            artifact_status = ("listed" if listed else "verified") if found else "missing" if reason is None else "unreadable"
         checks.append({"id": artifact.get("id"), "role": role, "path": artifact["path"], "kind": artifact["kind"],
                        "required": artifact.get("required", True), "found": found, "status": artifact_status,
                        "expectedSha256": expected_hash, "actualPath": actual, "reason": reason,
@@ -349,7 +350,7 @@ def validate_required_roles(cfg, root, cancel=None, directory_index=None, byte_b
     return checks, diagnostics, missing_required, modules_ok
 
 
-def _candidate(cfg, root, selected_relative, cancel, byte_budget, diagnostics, directory_index):
+def _candidate(cfg, root, selected_relative, cancel, byte_budget, diagnostics, directory_index, listed=False):
     game = cfg["game"]
     setup = cfg["setup"]
     layout = setup["layout"]
@@ -374,7 +375,7 @@ def _candidate(cfg, root, selected_relative, cancel, byte_budget, diagnostics, d
     main_supported = main_fact["status"] == "verified" and main_fact["sha256"] == expected_main
     checks, role_diagnostics, missing_required, modules_ok = validate_required_roles(
         cfg, root, cancel, directory_index, byte_budget, content_relative,
-        actual_exec_rel, main_fact)
+        actual_exec_rel, main_fact, listed=listed)
     diagnostics.extend(role_diagnostics)
 
     identity_status = "unknown"
@@ -455,7 +456,8 @@ def _candidate(cfg, root, selected_relative, cancel, byte_budget, diagnostics, d
             "diagnostics": candidate_diagnostics}
 
 
-def inspect_folder(cfg, selected_path, cancel=None, selected_executable=None, discovery_budget=None):
+def inspect_folder(cfg, selected_path, cancel=None, selected_executable=None, discovery_budget=None,
+                   archive_entries=None):
     selected = Path(selected_path).expanduser().resolve(strict=True)
     if selected.is_file():
         selected_root = selected.parent
@@ -473,7 +475,24 @@ def inspect_folder(cfg, selected_path, cancel=None, selected_executable=None, di
         raise ValueError("Selected source is not a regular file or folder")
     diagnostics = []
     try:
-        files, entries_seen, directory_index = _scan(selected_root, cancel, diagnostics, discovery_budget)
+        if archive_entries is None:
+            files, entries_seen, directory_index = _scan(selected_root, cancel, diagnostics, discovery_budget)
+        else:
+            files, directory_index = [], {"": {}}
+            entries_seen = len(archive_entries)
+            for relative, size in archive_entries.items():
+                _cancelled(cancel)
+                parts = PurePosixPath(relative).parts
+                for index, part in enumerate(parts):
+                    parent = "/".join(parts[:index])
+                    member = "/".join(parts[:index + 1])
+                    kind = "file" if index == len(parts) - 1 and size is not None else "directory"
+                    directory_index.setdefault(_fold(parent), {})[_fold(part)] = {
+                        "name": part, "kind": kind, "path": selected_root / member, "listed": True}
+                    if kind == "directory":
+                        directory_index.setdefault(_fold(member), {})
+                if size is not None:
+                    files.append((relative, selected_root / relative))
     except OSError as error:
         diagnostics.append(_diag("inaccessible_path", ".", "The selected game folder could not be inspected.",
                                  {"error": str(error)}, ["Choose a readable game folder."]))
@@ -503,7 +522,7 @@ def inspect_folder(cfg, selected_path, cancel=None, selected_executable=None, di
             discovery_budget[2] += 1
         local_diagnostics = []
         candidate = _candidate(cfg, selected_root, relative, cancel, byte_budget,
-                               local_diagnostics, directory_index)
+                               local_diagnostics, directory_index, listed=archive_entries is not None)
         if candidate:
             inspected.append(candidate)
             for diagnostic in local_diagnostics:

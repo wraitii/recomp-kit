@@ -11,6 +11,14 @@ entry_point = 0x006f3d14
 guest_root = 'C:\Ghost Recon'
 store_hooks = false
 
+[[setup.installers]]
+format = "inno"
+label = "GOG 1.4.0.0 (19232)"
+sha256 = "7338f5ea2a04dd1bf2e2a7a5a7b8022585a2eb0f8b38a2db8cc24bf41c19b9f9"
+size = 528591248
+expanded_size = 1034493539
+move_files = { "__support/app/Data/Save/Script/default.ass" = "Data/Save/Script/default.ass" }
+
 [translate]
 code_map = "metadata"
 # Proven by tools/recomp/typeinf/dispatch.py: python -m typeinf.dispatch --game ghost-recon --targets <this file>

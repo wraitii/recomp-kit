@@ -1,0 +1,306 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="-52 -52 616 616" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">Recomp Toolkit — Particle portal</title>
+  <desc id="desc">A classic binary application dissolves into pixels through a luminous portal and emerges as a modern application at the upper right, on a blue background.</desc>
+  <defs>
+    <linearGradient id="background" x1="72" y1="20" x2="440" y2="512" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2585EF" />
+      <stop offset=".5" stop-color="#1555C3" />
+      <stop offset="1" stop-color="#102B78" />
+    </linearGradient>
+    <radialGradient id="ambient" cx="0" cy="0" r="1" gradientTransform="translate(290 218) rotate(135) scale(270 220)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#63DFFF" stop-opacity=".35" />
+      <stop offset="1" stop-color="#63DFFF" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="rim" x1="-65" y1="-132" x2="65" y2="132" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#E7FFFF" />
+      <stop offset=".32" stop-color="#70EEFF" />
+      <stop offset=".65" stop-color="#63A5FF" />
+      <stop offset="1" stop-color="#B9A0FF" />
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="-130" x2="0" y2="130" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#82F5FF" stop-opacity=".04" />
+      <stop offset="1" stop-color="#AF8EFF" stop-opacity=".02" />
+    </linearGradient>
+    <linearGradient id="modern" x1="293" y1="100" x2="432" y2="241" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF" />
+      <stop offset="1" stop-color="#B9E8FF" />
+    </linearGradient>
+    <linearGradient id="screen" x1="300" y1="143" x2="422" y2="226" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#164DC3" />
+      <stop offset="1" stop-color="#097FC2" />
+    </linearGradient>
+    <filter id="shadow" x="-40%" y="-40%" width="180%" height="200%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#061B57" flood-opacity=".4" />
+    </filter>
+    <filter id="glow" x="-60%" y="-40%" width="220%" height="180%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="7" />
+    </filter>
+    <mask id="legacy-shape" maskUnits="userSpaceOnUse" x="76" y="263" width="156" height="134">
+      <rect x="75.70" y="319.70" width="19.59" height="19.59" fill="white" opacity="1.00" />
+      <rect x="75.70" y="338.70" width="19.59" height="19.59" fill="white" opacity="1.00" />
+      <rect x="94.70" y="338.70" width="19.59" height="19.59" fill="white" opacity="1.00" />
+      <rect x="75.70" y="357.70" width="19.59" height="19.59" fill="white" opacity="1.00" />
+      <rect x="94.70" y="357.70" width="19.59" height="19.59" fill="white" opacity="1.00" />
+      <rect x="113.72" y="357.72" width="19.57" height="19.57" fill="white" opacity="1.00" />
+      <rect x="75.70" y="376.70" width="19.59" height="19.59" fill="white" opacity="1.00" />
+      <rect x="94.70" y="376.70" width="19.59" height="19.59" fill="white" opacity="1.00" />
+      <rect x="113.70" y="376.70" width="19.59" height="19.59" fill="white" opacity="1.00" />
+      <rect x="75.70" y="395.70" width="19.59" height="19.59" fill="white" opacity="1.00" />
+      <rect x="94.70" y="395.70" width="19.59" height="19.59" fill="white" opacity="1.00" />
+      <rect x="113.70" y="395.70" width="19.59" height="19.59" fill="white" opacity="1.00" />
+      <rect x="132.70" y="395.70" width="19.59" height="19.59" fill="white" opacity="1.00" />
+    </mask>
+    <mask id="modern-shape" maskUnits="userSpaceOnUse" x="283" y="91" width="159" height="153">
+      <rect x="305.66" y="90.66" width="23.68" height="23.68" fill="white" opacity="1.00" />
+      <rect x="328.64" y="90.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="351.64" y="90.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="374.64" y="90.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="397.64" y="90.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="420.64" y="90.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="328.64" y="113.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="351.64" y="113.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="374.64" y="113.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="397.64" y="113.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="420.64" y="113.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="351.64" y="136.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="374.64" y="136.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="397.64" y="136.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="420.64" y="136.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="374.64" y="159.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="397.64" y="159.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="420.64" y="159.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="374.65" y="182.65" width="23.69" height="23.69" fill="white" opacity="1.00" />
+      <rect x="397.64" y="182.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="420.64" y="182.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="397.64" y="205.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="420.64" y="205.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+      <rect x="420.64" y="228.64" width="23.72" height="23.72" fill="white" opacity="1.00" />
+    </mask>
+    <g id="legacy-art">
+      <path d="M76 263H232V397H76Z" fill="#B4C3D4" />
+      <path d="M79 394V266H229" stroke="#F4F8FD" stroke-width="6" />
+      <path d="M79 394H229V266" stroke="#5B708C" stroke-width="6" />
+      <path d="M86 273H222V298H86Z" fill="#214E9C" />
+      <path d="M93 280H103V290H93Z" fill="#D0E3F7" />
+      <path d="M110 284H157" stroke="#DBE9FA" stroke-width="4" />
+      <path d="M86 307H222V382H86Z" fill="#193251" />
+      <path d="M86 382V307H222" stroke="#71839A" stroke-width="3" />
+      <path d="M109 320H132V326H138V357H132V363H109V357H103V326H109ZM115 328V355H126V328Z" fill="#BBD8DC" fill-rule="evenodd" />
+      <path d="M161 320H173V355H184V363H152V355H164V332H155V325H161Z" fill="#BBD8DC" />
+      <path d="M94 389H129" stroke="#EAF1F8" stroke-width="3" />
+    </g>
+    <g id="modern-art">
+      <rect x="283" y="91" width="159" height="153" rx="24" fill="url(#modern)" />
+      <rect x="284" y="92" width="157" height="151" rx="23" stroke="#FFFFFF" stroke-opacity=".8" stroke-width="2" />
+      <path d="M284 131H441" stroke="#9BBFED" stroke-opacity=".6" stroke-width="2" />
+      <g fill="#4880C8">
+        <circle cx="301" cy="112" r="3" />
+        <circle cx="312" cy="112" r="3" />
+        <circle cx="323" cy="112" r="3" />
+      </g>
+      <path d="M398 112H423" stroke="#73A4DD" stroke-width="4" stroke-linecap="round" />
+      <rect x="296" y="143" width="133" height="88" rx="13" fill="url(#screen)" />
+      <rect x="315" y="160" width="29" height="49" rx="14.5" stroke="#E9FCFF" stroke-width="8" />
+      <path d="M363 172L375 163V209M363 209H388" stroke="#E9FCFF" stroke-width="8" stroke-linecap="round" stroke-linejoin="round" />
+      <path d="M402 205H412" stroke="#6CF0F7" stroke-width="4" stroke-linecap="round" />
+    </g>
+  </defs>
+  <rect x="8" y="8" width="496" height="496" rx="110" fill="url(#background)" />
+  <rect x="8" y="8" width="496" height="496" rx="110" fill="url(#ambient)" />
+  <rect x="9" y="9" width="494" height="494" rx="109" stroke="#FFFFFF" stroke-opacity=".15" stroke-width="2" />
+  <g transform="translate(258 260) rotate(-43) scale(1.18 1.68)">
+    <ellipse cy="5" rx="72" ry="143" stroke="#082E84" stroke-opacity=".4" stroke-width="21" />
+    <ellipse rx="67" ry="137" stroke="#70DDFF" stroke-opacity=".65" stroke-width="16" filter="url(#glow)" />
+    <ellipse rx="67" ry="137" fill="url(#glass)" stroke="url(#rim)" stroke-width="10" />
+    <ellipse rx="60" ry="130" stroke="#B4F7FF" stroke-opacity=".45" stroke-width="2" />
+  </g>
+  <g transform="translate(-24.024 -41.48) scale(1.196)" filter="url(#shadow)">
+    <g mask="url(#legacy-shape)">
+      <use href="#legacy-art" />
+    </g>
+  </g>
+  <g transform="translate(-182.056 -64.9087) scale(1.4605)" filter="url(#shadow)">
+    <g mask="url(#modern-shape)">
+      <use href="#modern-art" />
+    </g>
+  </g>
+  <g id="moving-fragments">
+    <svg x="66.57" y="318.20" width="23.35" height="23.35" viewBox="75.74 300.74 19.52 19.52" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="134.75" y="409.10" width="23.33" height="23.33" viewBox="132.75 376.75 19.51 19.51" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="331.60" y="168.37" width="34.42" height="34.42" viewBox="351.72 159.72 23.57 23.57" overflow="hidden">
+      <use href="#modern-art" />
+    </svg>
+    <svg x="89.36" y="340.96" width="23.24" height="23.24" viewBox="94.78 319.78 19.44 19.44" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="157.56" y="431.86" width="23.21" height="23.21" viewBox="151.79 395.79 19.42 19.42" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="398.86" y="269.30" width="34.16" height="34.16" viewBox="397.80 228.80 23.40 23.40" overflow="hidden">
+      <use href="#modern-art" />
+    </svg>
+    <svg x="112.20" y="363.72" width="23.10" height="23.10" viewBox="113.84 338.84 19.33 19.33" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="298.11" y="134.99" width="34.07" height="34.07" viewBox="328.83 136.83 23.35 23.35" overflow="hidden">
+      <use href="#modern-art" />
+    </svg>
+    <svg x="66.86" y="295.57" width="22.96" height="22.96" viewBox="75.89 281.89 19.22 19.22" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="135.07" y="386.48" width="22.92" height="22.92" viewBox="132.91 357.91 19.19 19.19" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="365.36" y="236.01" width="33.70" height="33.70" viewBox="374.94 205.94 23.11 23.11" overflow="hidden">
+      <use href="#modern-art" />
+    </svg>
+    <svg x="89.77" y="318.33" width="22.75" height="22.75" viewBox="94.97 300.97 19.06 19.06" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="264.60" y="101.73" width="33.58" height="33.58" viewBox="305.98 113.98 23.04 23.04" overflow="hidden">
+      <use href="#modern-art" />
+    </svg>
+    <svg x="157.99" y="409.23" width="22.70" height="22.70" viewBox="151.99 376.99 19.02 19.02" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="112.73" y="341.07" width="22.51" height="22.51" viewBox="114.06 320.06 18.88 18.88" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="180.96" y="431.96" width="22.45" height="22.45" viewBox="171.08 396.08 18.83 18.83" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="331.82" y="202.84" width="33.10" height="33.10" viewBox="352.13 183.13 22.75 22.75" overflow="hidden">
+      <use href="#modern-art" />
+    </svg>
+    <svg x="231.05" y="68.59" width="32.95" height="32.95" viewBox="283.17 91.17 22.66 22.66" overflow="hidden">
+      <use href="#modern-art" />
+    </svg>
+    <svg x="67.51" y="272.89" width="22.29" height="22.29" viewBox="76.14 263.14 18.72 18.72" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="135.75" y="363.78" width="22.23" height="22.23" viewBox="133.16 339.16 18.67 18.67" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="90.58" y="295.59" width="21.99" height="21.99" viewBox="95.25 282.25 18.50 18.50" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="158.83" y="386.48" width="21.92" height="21.92" viewBox="152.28 358.28 18.45 18.45" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="298.20" y="169.82" width="32.38" height="32.38" viewBox="329.34 160.34 22.32 22.32" overflow="hidden">
+      <use href="#modern-art" />
+    </svg>
+    <svg x="113.71" y="318.26" width="21.65" height="21.65" viewBox="114.37 301.37 18.26 18.26" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="181.98" y="409.14" width="21.58" height="21.58" viewBox="171.40 377.40 18.21 18.21" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="365.29" y="271.14" width="31.73" height="31.73" viewBox="375.53 229.53 21.94 21.94" overflow="hidden">
+      <use href="#modern-art" />
+    </svg>
+    <svg x="264.47" y="136.94" width="31.53" height="31.53" viewBox="306.58 137.58 21.83 21.83" overflow="hidden">
+      <use href="#modern-art" />
+    </svg>
+    <svg x="136.91" y="340.89" width="21.29" height="21.29" viewBox="133.49 320.49 18.01 18.01" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="205.20" y="431.77" width="21.21" height="21.21" viewBox="190.52 396.52 17.95 17.95" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="91.89" y="272.62" width="20.99" height="20.99" viewBox="95.60 263.60 17.81 17.81" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="160.19" y="363.49" width="20.90" height="20.90" viewBox="152.63 339.63 17.75 17.75" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="331.44" y="238.39" width="30.80" height="30.80" viewBox="352.79 206.79 21.43 21.43" overflow="hidden">
+      <use href="#modern-art" />
+    </svg>
+    <svg x="230.59" y="104.23" width="30.58" height="30.58" viewBox="283.85 114.85 21.31 21.31" overflow="hidden">
+      <use href="#modern-art" />
+    </svg>
+    <svg x="115.23" y="295.18" width="20.58" height="20.58" viewBox="114.73 282.73 17.53 17.53" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="183.55" y="386.03" width="20.49" height="20.49" viewBox="171.76 358.76 17.47 17.47" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="297.42" y="205.81" width="29.78" height="29.78" viewBox="330.06 184.06 20.87 20.87" overflow="hidden">
+      <use href="#modern-art" />
+    </svg>
+    <svg x="206.99" y="408.52" width="20.06" height="20.06" viewBox="190.91 377.91 17.19 17.19" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="162.17" y="340.12" width="19.70" height="19.70" viewBox="153.02 321.02 16.96 16.96" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="230.53" y="430.94" width="19.60" height="19.60" viewBox="210.05 397.05 16.90 16.90" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="263.19" y="173.42" width="28.67" height="28.67" viewBox="307.35 161.35 20.30 20.30" overflow="hidden">
+      <use href="#modern-art" />
+    </svg>
+    <svg x="117.40" y="271.68" width="19.34" height="19.34" viewBox="115.13 264.13 16.73 16.73" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="185.78" y="362.50" width="19.23" height="19.23" viewBox="172.17 340.17 16.67 16.67" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="141.09" y="294.00" width="18.86" height="18.86" viewBox="134.28 283.28 16.44 16.44" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="329.70" y="275.26" width="27.77" height="27.77" viewBox="353.58 230.58 19.85 19.85" overflow="hidden">
+      <use href="#modern-art" />
+    </svg>
+    <svg x="209.49" y="384.80" width="18.75" height="18.75" viewBox="191.31 359.31 16.37 16.37" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="228.71" y="141.22" width="27.50" height="27.50" viewBox="284.64 138.64 19.72 19.72" overflow="hidden">
+      <use href="#modern-art" />
+    </svg>
+    <svg x="164.89" y="316.25" width="18.36" height="18.36" viewBox="153.43 302.43 16.14 16.14" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="233.31" y="407.03" width="18.25" height="18.25" viewBox="210.46 378.46 16.08 16.08" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="295.00" y="243.23" width="26.56" height="26.56" viewBox="330.87 207.87 19.26 19.26" overflow="hidden">
+      <use href="#modern-art" />
+    </svg>
+    <svg x="188.79" y="338.41" width="17.85" height="17.85" viewBox="172.58 321.58 15.85 15.85" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+    <svg x="257.24" y="429.17" width="17.74" height="17.74" viewBox="229.61 397.61 15.78 15.78" overflow="hidden">
+      <use href="#legacy-art" />
+    </svg>
+  </g>
+  <g id="particle-flow">
+    <rect x="191.97" y="294.31" width="13.26" height="13.26" rx="0" fill="#a8bcd1" opacity="0.95" />
+    <rect x="217.62" y="303.28" width="13.26" height="13.26" rx="0" fill="#97badb" opacity="0.95" />
+    <rect x="274.92" y="233.92" width="13.26" height="13.26" rx=".6" fill="#f2faff" opacity="0.95" />
+    <rect x="224.06" y="183.59" width="14.85" height="14.85" rx=".6" fill="#ebf6ff" opacity="0.95" />
+    <rect x="307.76" y="286.33" width="14.36" height="14.36" rx=".6" fill="#d8ecfd" opacity="0.95" />
+    <rect x="218.00" y="245.44" width="16.81" height="16.81" rx="0" fill="#80bef7" opacity="0.95" />
+    <rect x="257.11" y="277.91" width="12.75" height="12.75" rx="0" fill="#8fc6f8" opacity="0.95" />
+    <rect x="232.33" y="331.87" width="15.87" height="15.87" rx="0" fill="#a2bbd4" opacity="0.95" />
+    <rect x="237.18" y="218.40" width="14.78" height="14.78" rx=".6" fill="#cbe5fc" opacity="0.95" />
+    <rect x="170.24" y="264.99" width="18.02" height="18.02" rx="0" fill="#a2bbd4" opacity="0.95" />
+    <rect x="225.87" y="277.27" width="13.03" height="13.03" rx="0" fill="#79b6ef" opacity="0.95" />
+    <rect x="247.73" y="253.47" width="12.98" height="12.98" rx=".6" fill="#a5d2fa" opacity="0.95" />
+    <rect x="276.66" y="262.79" width="14.83" height="14.83" rx=".6" fill="#c8e4fc" opacity="0.95" />
+    <rect x="242.86" y="295.97" width="16.39" height="16.39" rx="0" fill="#79b6ef" opacity="0.95" />
+  </g>
+  <g id="portal-front" transform="translate(258 260) rotate(-43) scale(1.18 1.68)">
+    <path d="M0-137C-37-137-67-76-67 0S-37 137 0 137" stroke="#8CF4FF" stroke-opacity=".6" stroke-width="15" filter="url(#glow)" />
+    <path d="M0-137C-37-137-67-76-67 0S-37 137 0 137" stroke="url(#rim)" stroke-width="10" />
+    <path d="M0-137C-37-137-67-76-67 0S-37 137 0 137" stroke="#EAFFFF" stroke-opacity=".85" stroke-width="3" />
+  </g>
+  <path d="M381 65V81M373 73H389" stroke="#B3F4FF" stroke-width="3" stroke-linecap="round" transform="translate(0 -25.00)" />
+  <circle cx="448" cy="266" r="3" fill="#88DFFF" />
+  <circle cx="102" cy="219" r="3" fill="#88DFFF" fill-opacity=".7" />
+</svg>

@@ -6,26 +6,9 @@ import plistlib
 import shutil
 import subprocess
 import sys
-import struct
-import zlib
+from app_icons import set_bundle_icon, svg_image, write_desktop_icons
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def icon(path):
-    size = 64
-    glyph = ["11110", "10001", "10001", "11110", "10100", "10010", "10001"]
-    pixels = bytearray()
-    for y in range(size):
-        pixels.append(0)
-        for x in range(size):
-            gx, gy = (x - 17) // 6, (y - 11) // 6
-            ink = 0 <= gx < 5 and 0 <= gy < 7 and glyph[gy][gx] == "1"
-            pixels.extend((183, 229, 154, 255) if ink else (26, 32, 36, 255))
-    def chunk(kind, data):
-        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
-    path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
-                     + chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b""))
 
 
 def build(build_root, config, portable=False, python_root=None):
@@ -37,11 +20,8 @@ def build(build_root, config, portable=False, python_root=None):
     output = Path(build_root) / "toolkit"
     output.mkdir(parents=True, exist_ok=True)
     app_icon = output / "icon.png"
-    icon(app_icon)
+    write_desktop_icons(svg_image("icon"), output)
     windows_icon = output / "icon.ico"
-    png = app_icon.read_bytes()
-    windows_icon.write_bytes(struct.pack("<HHH", 0, 1, 1)
-                             + struct.pack("<BBBBHHII", 64, 64, 0, 0, 1, 32, len(png), 22) + png)
     env = dict(os.environ, CARGO_TARGET_DIR=str(output / "rust"),
                RECOMP_TOOLKIT_KIT=str(ROOT), RECOMP_TOOLKIT_PYTHON=sys.executable,
                TAURI_CONFIG=json.dumps({"bundle": {"icon": [str(app_icon), str(windows_icon)]}}))
@@ -64,6 +44,7 @@ def build(build_root, config, portable=False, python_root=None):
                           "CFBundleShortVersionString": "0.1.0", "CFBundleVersion": "0.1.0",
                           "NSHighResolutionCapable": True,
                           **({"LSMinimumSystemVersion": "14.0"} if portable else {})}, stream)
+        set_bundle_icon(bundle, output / "icon.icns")
         subprocess.run(["codesign", "--force", "--sign", "-", str(bundle)], check=True)
         if portable:
             from package_library import package
