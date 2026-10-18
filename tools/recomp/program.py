@@ -295,6 +295,7 @@ class Program(object):
             insns.append(self.lifter.lift(at, raw, decode=decoded))
         index = {ins.addr: k for k, ins in enumerate(insns)}
         noreturn = self.noreturn
+        noreturn_calls = {}
         succ, exits, tables, dynamic = [], [], [], []
         for k, ins in enumerate(insns):
             out, falls = [], True
@@ -325,6 +326,7 @@ class Program(object):
                             ins.addr in self.noreturn_calls or op.ins[0][0] == "ram"
                             and op.ins[0][1] in noreturn):
                         falls = False
+                        noreturn_calls[k] = ins.addr + ins.length
             if falls:
                 if ins.addr + ins.length in index:
                     out.append(index[ins.addr + ins.length])
@@ -332,4 +334,5 @@ class Program(object):
                     leave.append(ins.addr + ins.length)
             succ.append(sorted(set(out)))
             exits.extend((k, t) for t in leave)
-        return Body(FunctionIR(addr, insns, succ, tables, language=self.lifter.language), exits, dynamic)
+        return Body(FunctionIR(addr, insns, succ, tables, noreturn=noreturn_calls,
+                               language=self.lifter.language), exits, dynamic)

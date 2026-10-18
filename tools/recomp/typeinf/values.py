@@ -36,7 +36,7 @@ IndirectCall = namedtuple("IndirectCall", "site_addr base_value displacement")
 CallRegisters = namedtuple("CallRegisters", "site_addr opc before after value")
 ReturnRegisters = namedtuple("ReturnRegisters", "site_addr lanes")
 MemoryAccess = namedtuple("MemoryAccess", "site_addr access size address value base constant value_base value_offset")
-Reload = namedtuple("Reload", "target name before")
+Reload = namedtuple("Reload", "site_addr target name before")
 
 _WHOLE = weakref.WeakKeyDictionary()
 
@@ -53,6 +53,7 @@ class FunctionValues:
     reloads: dict = field(default_factory=dict)
     tail_exit: bool = False
     pops: int = None
+    dynamic: bool = False
 
 
 def function_values(program, addr):
@@ -75,10 +76,10 @@ def function_values(program, addr):
         forward(ssa)
     except SSAError as error:
         return FunctionValues(addr, tuple(fir.insns), index, lanes, lanes, fallback=str(error), tail_exit=tail_exit,
-                              pops=pops)
+                              pops=pops, dynamic=bool(body.dynamic))
     entry = {name: tuple(ssa.inputs.get(key) for key in keys) for name, keys in lanes.items()}
     return FunctionValues(addr, tuple(fir.insns), index, lanes, entry, ssa=ssa, reloads=_reload_sites(ssa, lanes),
-                          tail_exit=tail_exit, pops=pops)
+                          tail_exit=tail_exit, pops=pops, dynamic=bool(body.dynamic))
 
 
 def stack_pops(fir, tail_exit):
@@ -132,13 +133,19 @@ def memory_accesses(fv):
 def frame_ids(fv):
     ssa = _require_ssa(fv)
     users = _users(ssa)
+    reloads = _call_reload_links(fv, ssa)
     frame = set()
     for name in FRAME_REGISTERS:
         frame |= _register_ids(ssa, fv.entry[name])
-    grew = True
-    while grew:
-        frame = _close(frame, users)
-        grew = _add_call_reloads(fv, ssa, frame)
+    pending = list(frame)
+    while pending:
+        node = pending.pop()
+        found = [user.id for user in users[node] if user.opc in FRAME_OPS]
+        found.extend(reloads.get(node, ()))
+        for value in found:
+            if value not in frame:
+                frame.add(value)
+                pending.append(value)
     return frame
 
 
@@ -161,26 +168,15 @@ def _register_ids(ssa, lanes):
     return ids
 
 
-def _close(frame, users):
-    closed, pending = set(frame), list(frame)
-    while pending:
-        for user in users[pending.pop()]:
-            if user.id not in closed and user.opc in FRAME_OPS:
-                closed.add(user.id)
-                pending.append(user.id)
-    return closed
-
-
-def _add_call_reloads(fv, ssa, frame):
-    added = False
+def _call_reload_links(fv, ssa):
+    links = defaultdict(set)
     for block, value in _call_ops(ssa):
         for name in FRAME_REGISTERS:
             before = _register_ids(ssa, [block.snapshots[value.id].get(key) for key in fv.registers[name]])
             after = _register_ids(ssa, [block.reloads[value.id].get(key) for key in fv.registers[name]])
-            if before & frame and not after <= frame:
-                frame |= after
-                added = True
-    return added
+            for node in before:
+                links[node] |= after
+    return links
 
 
 def call_register_lanes(fv):
@@ -239,7 +235,7 @@ def _build(fir, lifter, lanes):
     targets = {op.ins[0][1] for ins in cgi.insns for op in ins.ops
                if op.opc == "CALL" and op.ins[0][0] == "ram"}
     return build(cgi, register_groups=list(lanes.values()), call_targets=targets,
-                 indirect_call_symbol=INDIRECT_SYMBOL)
+                 indirect_call_symbol=INDIRECT_SYMBOL, track_all_registers=True)
 
 
 def _require_ssa(fv):
@@ -393,14 +389,18 @@ def _slot_holds(fv, load, offsets, entry):
 class Frame:
     ZERO = "entry"
 
-    def __init__(self, fv, preserves, pops):
+    def __init__(self, fv, preserves, pops, targets=None):
         ssa = fv.ssa
-        self.ssa, self.parent, self.inconsistent, self.esp_reloads = ssa, {}, 0, set()
+        self.ssa, self.parent, self.conflicts, self.esp_reloads = ssa, {}, set(), set()
         esp = whole_lane_value(ssa, fv.entry["ESP"])
         if esp is not None:
             self._union(esp.id, self.ZERO, 0)
         for block, value in _call_ops(ssa):
             target = value.data if value.opc == "CALL" else None
+            candidates = ((target,) if target is not None else targets(block.insn.addr, value)
+                          if targets is not None else ())
+            cleanups = {pops(candidate) for candidate in candidates}
+            cleanup = next(iter(cleanups)) if len(cleanups) == 1 else None
             for name in FRAME_REGISTERS:
                 keys = fv.registers[name]
                 reload = whole_lane_value(ssa, [block.reloads[value.id].get(key) for key in keys])
@@ -410,9 +410,10 @@ class Frame:
                     continue
                 if name == "ESP":
                     self.esp_reloads.add(reload.id)
-                if name == "ESP" and target is not None and pops(target) is not None:
-                    self._union(reload.id, form[0].id, form[1] + 4 + pops(target))
-                elif name == "EBP" and preserves(target, "EBP"):
+                if name == "ESP" and cleanup is not None:
+                    self._union(reload.id, form[0].id, form[1] + 4 + cleanup)
+                elif name == "EBP" and (all(preserves(t, "EBP") for t in candidates)
+                                         if candidates else targets is None and preserves(target, "EBP")):
                     self._union(reload.id, form[0].id, form[1])
         for value in ssa.values:
             if value.opc == "PHI" and value.size == 4 and ssa.resolve(value) is value:
@@ -436,6 +437,10 @@ class Frame:
         root = self._find(node)[0]
         return root == self.ZERO or any(self._find(reload)[0] == root for reload in self.esp_reloads)
 
+    @property
+    def inconsistent(self):
+        return sum(self._stack_class(node) for node in self.conflicts)
+
     def _find(self, node):
         delta = 0
         path = []
@@ -452,7 +457,8 @@ class Frame:
         first_root, first_delta = self._find(first)
         second_root, second_delta = self._find(second)
         if first_root == second_root:
-            self.inconsistent += first_delta != second_delta + delta
+            if first_delta != second_delta + delta:
+                self.conflicts.add(first_root)
         elif first_root == self.ZERO:
             self.parent[second_root] = (first_root, first_delta - second_delta - delta)
         else:
@@ -475,7 +481,7 @@ def _reload_sites(ssa, registers):
                 continue
             before = whole_lane_value(ssa, [block.snapshots[value.id].get(key) for key in keys])
             target = value.data if value.opc == "CALL" else None
-            sites[reload.id] = Reload(target, name, before)
+            sites[reload.id] = Reload(block.insn.addr, target, name, before)
     return sites
 
 

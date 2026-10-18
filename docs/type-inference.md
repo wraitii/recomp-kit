@@ -5,6 +5,62 @@ pointer nesting, vtable holders and interface labels. Its outputs are research
 facts for Ghidra and, once a site can be bounded, for translator call facts.
 Ghidra annotations are never an input.
 
+## Whole-image dispatch bounds
+
+Run from the kit root with the project's Python environment:
+
+```sh
+PYTHONPATH=tools:tools/recomp python -m typeinf.nominal \
+    --game <id> --build-root <build> --structure-only --observe <edges.tsv> \
+    --out <report.json> --targets <targets.tsv> --basis <basis.tsv>
+```
+
+`nominal.py` combines the existing dispatch proofs with `structure.py` bounds.
+The basis file distinguishes `proof`, `nominal`, `structure` and
+`structure+observed`. Outputs are candidates; installation into the game's
+configured `indirect_targets` file is a separate step. The build fingerprints
+that file. Per-function facts and preservation contracts are cached under
+`<build>/typeinf`, keyed by executable, configuration and analysis sources.
+
+Structural candidates are tables installed by constant vptr stores anywhere in
+the image. A receiver requires its called slots and requirements propagated up
+from direct callees. An observed target anchors compatible table prefixes from
+slot zero through the called slot: known `RET n` cleanup must agree throughout
+the prefix. Unknown cleanup and nonreturning methods impose no incompatibility;
+nonreturning targets remain in the bound. An unlifted candidate leaves the site
+open. Observed edges constrain compatibility; they are not an exhaustive target
+list. Bounds excluding an observed target are rejected and reported.
+
+This relies on the C++ assumptions that every runtime table is visibly installed
+and overrides preserve argument cleanup across an interface. Register usage,
+field extents and apparent return width do not establish incompatibility.
+Requirements on an observed method's other arguments or result are not imposed
+on competing implementations.
+
+`alias.py` merges receiver types only with value-identity evidence. It follows
+preserved registers and memory SSA through disjoint stores, private stack pushes
+and callees proved to write only private stack memory. Receiver and vptr values
+must both match. Combined call requirements are directional: an earlier call
+must dominate the site borrowing its requirements. Unknown stores, callbacks,
+dynamic control flow and open exception flow remain barriers. ABI/frame
+isolation assumptions permit treating outgoing stack storage as private;
+`--no-abi` disables these assumptions. `--explain-function HEX` reports identities,
+proofs and barriers; `--explain-site HEX` explains a bound.
+
+`--scope HEX --scope-depth N` limits fact collection for iteration. Scoped
+structural bounds are reported but never emitted. Callers and separate reads of
+a global are not pooled merely because their layouts or source address match.
+
+Without `--structure-only`, `globals.py` and the nominal writer solver also run.
+Configured allocator entries require byte-backed evidence. The global census
+rejects unexplained address uses and nearby escaped/indexed addresses, with
+`--escape-window` defaulting to `0x1000`. This window is a heuristic, not proof
+against arbitrary indirect writes to a cell; reducing it weakens the premise.
+Global writer inference remains experimental. Structural-only bounds do not
+depend on this census.
+
+## Shape research solver
+
 ```
 tools/recomp/typeinf/run.py --game <id> --root ADDR [--root ...] [--vtable TABLE]
     [--depth 3] [--observe observe.txt] [--explain ADDR] [--no-abi] --out report.json

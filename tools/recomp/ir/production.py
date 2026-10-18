@@ -67,7 +67,8 @@ def prepare_ssa(tr, lifter, fn, entries, request, artifacts=None):
     body = BodyRequest(c_symbols.body_symbol(variant, fn.addr), variant, request.policy,
                        call_symbols=calls, tail_symbols=tails,
                        call_contracts={t: request.contracts[t] for t in calls if t in request.contracts},
-                       indirect_contracts=request.indirect_contracts,
+                       indirect_contracts={ins.addr: request.indirect_contracts[ins.addr]
+                                           for ins in fn.insns if ins.addr in request.indirect_contracts},
                        checked_calls=set(calls) & request.checked_returns,
                        contract_calls=set(calls) & request.contract_calls if not fir.entries and not fir.seh else (),
                        private_input_arguments=request.private_input_arguments,

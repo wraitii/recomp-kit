@@ -21,8 +21,14 @@ move_files = { "__support/app/Data/Save/Script/default.ass" = "Data/Save/Script/
 
 [translate]
 code_map = "metadata"
-# Proven by tools/recomp/typeinf/dispatch.py: python -m typeinf.dispatch --game ghost-recon --targets <this file>
+# Proven dispatch sites plus C++ vtable-prefix bounds from typeinf.nominal --structure-only --observe <edges>.
 indirect_targets = "metadata/indirect-targets.tsv"
+# 006f4dc9 returns FUN_006f9414/FUN_006f9eb7 from the small-block heap or
+# HeapAlloc(DAT_00946b80,...); its only direct caller is __nh_malloc 006f4d9d,
+# which both _malloc 006f4d8b and operator_new 006f339f call.
+allocators = [
+    { function = 0x006f4dc9, evidence = "VC6 CRT small-block/heap allocator; sole direct caller __nh_malloc; HeapAlloc fallback" },
+]
 private_leaf_contracts = true
 private_input_arguments = false
 private_input_registers = { "00755990" = "ECX", "007b80e0" = "ECX", "0052f200" = "ECX", "00569150" = "ECX", "00538240" = "ECX" }

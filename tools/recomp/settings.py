@@ -42,6 +42,8 @@ class Settings(object):
         self.x87_facts = self.game_dir / facts if facts and not self.module else None
         indirect = translate.get("indirect_targets")
         self.indirect_targets = self.game_dir / indirect if indirect and not self.module else None
+        self.allocators = (frozenset(row["function"] for row in translate.get("allocators", ()))
+                           if not self.module else frozenset())
         self.call_effects = {"sites": {}, "imports": {}}
         for row in translate.get("call_effects", []):
             fields = {field: row[field] for field in ("regs", "x87") if field in row}

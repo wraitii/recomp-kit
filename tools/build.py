@@ -354,7 +354,10 @@ def translation_fingerprint(game_dir, cfg, translate_args):
     sources += [ROOT / "tools/game_config.py", ROOT / "tools/gen_game_config.py"]
     for path in sources:
         h.update(path.relative_to(ROOT).as_posix().encode() + b"\0" + path.read_bytes())
-    for name in ("game.toml", cfg["translate"].get("globals", "globals.toml")):
+    for name in ("game.toml", cfg["translate"].get("globals", "globals.toml"),
+                 cfg["translate"].get("indirect_targets")):
+        if name is None:
+            continue
         path = game_dir / name
         if path.is_file():
             h.update(name.encode() + b"\0" + path.read_bytes())

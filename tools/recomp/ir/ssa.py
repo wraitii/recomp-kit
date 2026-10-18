@@ -142,7 +142,8 @@ MEMORY = ("memory", 0)
 
 
 def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None,
-          flag_off_name=None, kept_calls=None, kept_indirect=None, string_writes=None):
+          flag_off_name=None, kept_calls=None, kept_indirect=None, string_writes=None,
+          track_all_registers=False):
     """Build SSA for reachable integer instructions using the supplied CFG.
 
     A direct CALL is admitted only when its literal target appears in
@@ -238,6 +239,8 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                     raise SSAError("%08x: direct ram operand requires normalization" % ins.addr)
                 if space == "register":
                     keys.update((space, off + n) for n in range(size))
+    if track_all_registers:
+        keys.update(key for group in register_groups for key in group)
     keys = sorted(keys)
     s = SSA()
     s.entry = entry

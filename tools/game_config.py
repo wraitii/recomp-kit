@@ -583,6 +583,16 @@ def load(game_dir, build_root=None):
                 or type(row.get("verify", False)) is not bool):
             raise ValueError("%s: invalid x87 entry contract %r" % (source, row))
         seen.add(addr)
+    allocators = translate.setdefault("allocators", [])
+    if not isinstance(allocators, list):
+        raise ValueError("%s: [translate] allocators must be a list" % source)
+    seen_allocators = set()
+    for row in allocators:
+        addr = row.get("function") if isinstance(row, dict) else None
+        if (type(addr) is not int or not 0 <= addr <= 0xffffffff or addr in seen_allocators
+                or not isinstance(row.get("evidence"), str) or not row["evidence"]):
+            raise ValueError("%s: invalid allocator entry %r" % (source, row))
+        seen_allocators.add(addr)
     checked = translate.setdefault("checked_returns", [])
     if not isinstance(checked, list) or not all(type(v) is int and 0 <= v <= 0xffffffff for v in checked):
         raise ValueError("%s: [translate] checked_returns must be a list of 32-bit addresses" % source)

@@ -336,9 +336,12 @@ class Bounds:
         if not found.sites:
             return None
         result = {"method": method, "sites": {}}
-        for site, slot, _, _, kinds in found.sites:
+        for site, slot, _, _, kinds, global_addr, _ in found.sites:
             if all(site != row[0] for row in own):
-                result["sites"][site] = {"slot": slot, "failure": "receiver is not this: " + ", ".join(sorted(kinds))}
+                row = {"slot": slot, "failure": "receiver is not this: " + ", ".join(sorted(kinds))}
+                if global_addr is not None:
+                    row["global"] = "0x%08x" % global_addr
+                result["sites"][site] = row
         if not own:
             return result
         try:
@@ -347,12 +350,17 @@ class Bounds:
             result["dispatch"] = dispatch
         except ProofError as error:
             result["failure"] = str(error)
-            for site, slot, _, _, _ in own:
-                result["sites"][site] = {"slot": slot, "failure": str(error)}
+            for site, slot, _, _, _, global_addr, _ in own:
+                row = {"slot": slot, "failure": str(error)}
+                if global_addr is not None:
+                    row["global"] = "0x%08x" % global_addr
+                result["sites"][site] = row
             return result
-        for site, slot, fields, ecx, _ in own:
+        for site, slot, fields, ecx, _, global_addr, _ in own:
             row = result["sites"][site] = {"slot": slot, "fields": sorted(offset for _, offset in fields
                                                                           if offset is not None)}
+            if global_addr is not None:
+                row["global"] = "0x%08x" % global_addr
             try:
                 if len(fields) != 1 or ecx != fields:
                     raise ProofError("receiver is not the field whose table is read")
