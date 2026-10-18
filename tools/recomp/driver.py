@@ -662,7 +662,7 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
         "x87_compiler_facts": x87_facts_loaded.report(),
         "x87_mode": x87_report.mode_report(settings, mode_prepared, mode_summaries, mode_opaque,
                                 known_modes & private_masks.keys(), x87_counts, mode_exposure,
-                                selected_callers | checked_returns),
+                                selected_callers | checked_returns, indirect_targets),
     }
     with open(os.path.join(args.out, "contract-report.json"), "w") as fh:
         json.dump(contract_report, fh, sort_keys=True, indent=1)

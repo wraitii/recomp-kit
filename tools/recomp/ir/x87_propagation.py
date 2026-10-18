@@ -335,11 +335,20 @@ def summarize(prepared_by_addr, opaque_targets=(), boundaries=None, indirect=Non
     return summaries
 
 
-def analyze(prepared, summaries, opaque_targets=(), initial=ENTRY, boundaries=None):
+def analyze(prepared, summaries, opaque_targets=(), initial=ENTRY, boundaries=None,
+            indirect=None, effects=None):
     """Propagate mode facts through one function and report calls/returns/losses."""
     if prepared is None:
         return Analysis({}, UNKNOWN, (), {})
-    return _run(prepared, summaries, frozenset(opaque_targets), initial=initial, boundaries=boundaries)
+    return _run(prepared, summaries, frozenset(opaque_targets), initial=initial, boundaries=boundaries,
+                indirect=indirect, call_effects=effects)
+
+
+def _call_edges(prepared, indirect):
+    for _, site, target in prepared.calls:
+        targets = (target,) if target is not None else (indirect or {}).get(site, (None, ()))[1]
+        for target in targets:
+            yield site, target
 
 
 def mode_preserving_leaf(prepared):
@@ -348,8 +357,8 @@ def mode_preserving_leaf(prepared):
                 and all(effect[1][0] == "keep" for effect in prepared.effects))
 
 
-def propagate(prepared, summaries, roots, opaque_targets=(), boundaries=None):
-    """Contextual direct-call facts; roots are explicit assumptions, not entry proofs."""
+def propagate(prepared, summaries, roots, opaque_targets=(), boundaries=None, indirect=None, effects=None):
+    """Contextual call facts; roots are explicit assumptions, not entry proofs."""
     entries = dict(roots)
     results, work = {}, list(roots)
     edges = {}
@@ -359,10 +368,10 @@ def propagate(prepared, summaries, roots, opaque_targets=(), boundaries=None):
         if body is None or addr in opaque_targets:
             results[addr] = Analysis({}, UNKNOWN, (), {})
             continue
-        result = analyze(body, summaries, opaque_targets, entries[addr], boundaries)
+        result = analyze(body, summaries, opaque_targets, entries[addr], boundaries, indirect, effects)
         results[addr] = result
-        for _, site, target in body.calls:
-            if target is None or site not in result.calls:
+        for site, target in _call_edges(body, indirect):
+            if target not in prepared or site not in result.calls:
                 continue
             edges.setdefault(target, {})[(addr, site)] = result.calls[site]
             incoming = list(edges[target].values())
@@ -375,7 +384,7 @@ def propagate(prepared, summaries, roots, opaque_targets=(), boundaries=None):
 
 
 def ordinary_entries(prepared, summaries, contracts, callgraph,
-                     opaque_targets=(), boundaries=None):
+                     opaque_targets=(), boundaries=None, indirect=None, effects=None):
     """Join every static caller and unknown entry before folding a shared body.
 
     Contracts constrain every invocation at their named primary entry. All
@@ -390,6 +399,8 @@ def ordinary_entries(prepared, summaries, contracts, callgraph,
         if addr not in prepared or prepared[addr] is None or addr in opaque:
             raise ValueError("%08x: CW contract requires a prepared unreplaced body" % addr)
     callers, edges = {}, {}
+    residual = {(edge.source, target) for target in prepared for edge in callgraph.callers(target)
+                if edge.provenance in ("tail_jump", "fallthrough", "jump_table")}
     for addr, targets in callgraph.join_edges.items():
         for target in targets:
             callers.setdefault(target, set()).add(addr)
@@ -397,10 +408,12 @@ def ordinary_entries(prepared, summaries, contracts, callgraph,
     for addr, body in prepared.items():
         if body is None or addr in opaque:
             continue
-        for _, site, target in body.calls:
-            if target is not None:
-                edges.setdefault(target, {}).pop((addr, None), None)
-                edges[target][(addr, site)] = UNKNOWN
+        for site, target in _call_edges(body, indirect):
+            callers.setdefault(target, set()).add(addr)
+            edges.setdefault(target, {})
+            if (addr, target) not in residual:
+                edges[target].pop((addr, None), None)
+            edges[target][(addr, site)] = UNKNOWN
     entries = {addr: roots.get(addr, UNKNOWN) for addr in prepared}
     results = {}
     work = deque(prepared)
@@ -411,12 +424,17 @@ def ordinary_entries(prepared, summaries, contracts, callgraph,
         body = prepared[addr]
         if body is None or addr in opaque:
             continue
-        result = analyze(body, summaries, opaque, entries[addr], boundaries)
+        result = analyze(body, summaries, opaque, entries[addr], boundaries, indirect, effects)
         results[addr] = result
-        for _, site, target in body.calls:
-            if target is None or target not in prepared:
+        changed = set()
+        for site, target in _call_edges(body, indirect):
+            if target not in prepared:
                 continue
-            edges[target][(addr, site)] = result.calls.get(site, UNKNOWN)
+            incoming = result.calls.get(site, UNKNOWN)
+            if edges[target][(addr, site)] != incoming:
+                edges[target][(addr, site)] = incoming
+                changed.add(target)
+        for target in changed:
             incoming = list(edges[target].values())
             if callgraph.can_enter_unmodeled(target) or not incoming:
                 incoming.append(UNKNOWN)

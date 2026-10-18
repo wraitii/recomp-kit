@@ -183,7 +183,8 @@ def exposure_report(prepared_by_addr, direct_calls_by_addr, opaque_targets=(),
     }
 
 
-def mode_report(settings, prepared, summaries, opaque, known_modes, x87_counts, exposure, selected=()):
+def mode_report(settings, prepared, summaries, opaque, known_modes, x87_counts, exposure, selected=(),
+                indirect=None):
     functions = []
     for addr in sorted(set(selected) | settings.state_contract_callers | settings.checked_returns):
         body = prepared.get(addr)
@@ -193,7 +194,7 @@ def mode_report(settings, prepared, summaries, opaque, known_modes, x87_counts, 
         if body is None or addr in opaque:
             row["reason"] = "opaque function"
         else:
-            analysis = analyze(body, summaries, opaque)
+            analysis = analyze(body, summaries, opaque, indirect=indirect, effects=settings.call_effects)
             targets = {site: target for _, site, target in body.calls}
             row["calls"] = [{"site": "%08x" % site,
                              "target": "%08x" % targets[site] if targets[site] is not None else None,

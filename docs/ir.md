@@ -440,6 +440,16 @@ compiler-facing emission boundary as typed `InstructionFact` records matched to
 their function and site; a bare `ModeCondition` is not a proof and is rejected
 there (legacy tuples remain accepted only by analysis/verification APIs).
 
+The offline `python -m x87_analysis.propagation --game <id> --facts-out <file>`
+uses configured `indirect_targets` for return summaries, local call transfer and
+caller-to-callee entry joins. Every possible returning target must support the
+fact; terminal targets do not constrain a continuation. Return preservation
+flows up to callers, while concrete incoming modes flow down and join across
+all modeled callers and unknown entries. A function preserving its incoming
+mode does not establish what that mode is. Hypothetical `--root NAME=HEX` entry
+assumptions stay separate from emitted compiler facts. Generating facts does
+not enable them: production loads only the configured `x87_facts` file.
+
 ### Policies
 
 | `[translate]` key | Default | Effect |

@@ -68,9 +68,11 @@ def main(argv=None):
                         boundaries['calls'][site] = relations[target]
     indirect = indirect_targets.load(settings, ctx.program)
     call_effects = settings.call_effects
-    intrinsic = summarize(prepared, opaque, indirect=indirect, effects=call_effects)
-    summaries = summarize(prepared, opaque, boundaries, indirect, call_effects)
-    base_summaries = summarize(prepared, opaque, base_boundaries, indirect, call_effects) if return_metadata else summaries
+    intrinsic = summarize(prepared, opaque, indirect=indirect, effects=call_effects,
+                          noreturn=ctx.program.noreturn)
+    summaries = summarize(prepared, opaque, boundaries, indirect, call_effects, ctx.program.noreturn)
+    base_summaries = summarize(prepared, opaque, base_boundaries, indirect, call_effects,
+                               ctx.program.noreturn) if return_metadata else summaries
     unconditional = {"intrinsic": sum(preserving(s) for s in intrinsic.values()),
                      "with_boundary_contracts": sum(preserving(s) for s in base_summaries.values()),
                      "x87_intrinsic": sum(preserving(intrinsic[a]) for a, r in scanned.items() if r.x87_count),
@@ -80,7 +82,7 @@ def main(argv=None):
     if contract_rows:
         for count in range(1, len(contract_rows) + 1):
             bodies, effects = apply_contracts(prepared, boundaries, ctx.image, contract_rows[:count])
-            relations = summarize(bodies, opaque, effects, indirect, call_effects)
+            relations = summarize(bodies, opaque, effects, indirect, call_effects, ctx.program.noreturn)
             sensitivity.append({"contracts": [r["name"] for r in contract_rows[:count]],
                                 "preserving_functions": sum(preserving(s) for s in relations.values()),
                                 "preserving_x87_functions": sum(preserving(relations[a]) for a, r in scanned.items() if r.x87_count),
@@ -88,7 +90,8 @@ def main(argv=None):
                                     if preserving(relations[a]) and not preserving(summaries[a])]})
         prepared, boundaries = bodies, effects
         summaries = relations
-    analyses = {addr: analyze(body, summaries, opaque, boundaries=boundaries)
+    analyses = {addr: analyze(body, summaries, opaque, boundaries=boundaries,
+                             indirect=indirect, effects=call_effects)
                 for addr, body in prepared.items() if body and addr not in opaque}
     graph = callgraph.build(seed, ctx.program, settings, indirect)
     mnemonics = {}
@@ -98,7 +101,7 @@ def main(argv=None):
 
     def ordinary(contracts):
         return ordinary_entries(prepared, summaries, contracts, graph,
-                                opaque, boundaries)
+                                opaque, boundaries, indirect, call_effects)
 
     baseline_entries, baseline, baseline_gaps = ordinary(settings.x87_entry_contracts)
     if args.facts_out:
@@ -171,7 +174,7 @@ def main(argv=None):
         contracts = [row for row in settings.x87_entry_contracts if row["function"] != addr] + [contract]
         entries, results, gaps = ordinary(contracts)
         contextual_entries, contextual = propagate(
-            prepared, summaries, {addr: Fact(MASK, 0, 0)}, opaque, boundaries)
+            prepared, summaries, {addr: Fact(MASK, 0, 0)}, opaque, boundaries, indirect, call_effects)
         report["roots"][name] = {"function": "%08x" % addr,
             "assumption": "hypothetical PC=RC=0 at every primary-entry invocation",
             "ordinary": coverage(results, mnemonics),
