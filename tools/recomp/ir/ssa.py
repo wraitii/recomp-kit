@@ -61,12 +61,17 @@ class SSA:
         return v
 
     def resolve(self, v):
-        path = []
-        while v.id in self.aliases:
+        aliases = self.aliases
+        target = aliases.get(v.id)
+        if target is None:
+            return v
+        path = [v.id]
+        v = target
+        while v.id in aliases:
             path.append(v.id)
-            v = self.aliases[v.id]
+            v = aliases[v.id]
         for ident in path:
-            self.aliases[ident] = v
+            aliases[ident] = v
         return v
 
     def simplify_phis(self):

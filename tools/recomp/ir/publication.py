@@ -54,6 +54,7 @@ Starting with no facts gives a conservative least fixed point for loops.
 """
     groups = [tuple(key for key in keys if key in s.inputs) for keys in fields]
     groups = [keys for keys in groups if keys]
+    group_indices = range(len(groups))
     access_fields = None if access_fields is None else frozenset(access_fields)
     predecessors = {i: [] for i in s.blocks}
     for e in [s.entry] + s.alternates:
@@ -64,15 +65,21 @@ Starting with no facts gives a conservative least fixed point for loops.
 
     resolved = {}
 
-    def values(state, keys):
-        cache_key = id(state), keys
-        current = resolved.get(cache_key)
+    def values(state, group):
+        ident = id(state)
+        cached = resolved.get(ident)
+        if cached is None:
+            cached = resolved[ident] = [None] * len(groups)
+        current = cached[group]
         if current is None:
-            current = tuple(s.resolve(state[key]) for key in keys)
-            resolved[cache_key] = current
+            current = tuple(s.resolve(state[key]) for key in groups[group])
+            cached[group] = current
         return current
 
     lazy_fields = frozenset(lazy_fields)
+    any_lazy = [any(key in lazy_fields for key in keys) for keys in groups]
+    all_lazy = [all(key in lazy_fields for key in keys) for keys in groups]
+    access_groups = [access_fields is None or any(key in access_fields for key in keys) for keys in groups]
     eager_events = frozenset(eager_events)
     known_exit = {i: set() for i in s.blocks}
     resident_exit = {i: set() for i in s.blocks}
@@ -87,10 +94,10 @@ Starting with no facts gives a conservative least fixed point for loops.
         pending.remove(i)
         b = s.blocks[i]
         changed = False
-        known = {n: values(b.state, keys) for n, keys in enumerate(groups)
-                 if all((p == -1 and not any(key in lazy_fields for key in keys))
+        known = {n: values(b.state, n) for n in group_indices
+                 if all((p == -1 and not any_lazy[n])
                         or (p != -1 and n in known_exit[p]) for p in predecessors[i])}
-        resident = {n: values(b.state, keys) for n, keys in enumerate(groups)
+        resident = {n: values(b.state, n) for n in group_indices
                     if all(p == -1 or n in resident_exit[p] for p in predecessors[i])}
         for v in b.ops:
             if v.opc not in OBSERVES:
@@ -104,12 +111,12 @@ Starting with no facts gives a conservative least fixed point for loops.
             already_known = []
             already_resident = []
             for n, keys in enumerate(groups):
-                current = values(state, keys)
+                current = values(state, n)
                 if known.get(n) == current:
                     already_known.extend(keys)
                 if resident.get(n) == current:
                     already_resident.extend(keys)
-                if access and access_fields is not None and not any(key in access_fields for key in keys):
+                if access and not access_groups[n]:
                     # A skipped snapshot does not make a publication fact.
                     # The older CPU value stays known until a real observer.
                     continue
@@ -120,7 +127,7 @@ Starting with no facts gives a conservative least fixed point for loops.
                     if resident.get(n) == current:
                         kept_resident.add(n)
                     continue
-                lazy = all(key in lazy_fields for key in keys)
+                lazy = all_lazy[n]
                 available = resident if lazy and v.opc not in eager_events else known
                 if available.get(n) != current:
                     required.extend(keys)
@@ -147,7 +154,7 @@ Starting with no facts gives a conservative least fixed point for loops.
                     known.pop(n, None)
                     resident.pop(n, None)
                     if all(key in reloaded and key in reloads for key in keys):
-                        known[n] = values(reloads, keys)
+                        known[n] = values(reloads, n)
                         resident[n] = known[n]
             elif v.opc in OPAQUE:
                 # A division error handler, an opaque callee and the string
@@ -159,23 +166,23 @@ Starting with no facts gives a conservative least fixed point for loops.
                 reloads = b.reloads.get(v.id, {})
                 for n, keys in enumerate(groups):
                     if n in kept_groups:
-                        if n in kept_known and not any(key in lazy_fields for key in keys):
-                            known[n] = values(reloads, keys)
+                        if n in kept_known and not any_lazy[n]:
+                            known[n] = values(reloads, n)
                         if n in kept_resident:
-                            resident[n] = values(reloads, keys)
+                            resident[n] = values(reloads, n)
                     elif all(key in saved and key in lazy_fields and key in reloads for key in keys):
-                        current = values(state, keys)
+                        current = values(state, n)
                         if saved_resident.get(n) == current:
-                            resident[n] = values(reloads, keys)
+                            resident[n] = values(reloads, n)
                     elif all(key in reloaded and key in reloads for key in keys):
-                        known[n] = values(reloads, keys)
+                        known[n] = values(reloads, n)
                         resident[n] = known[n]
                     elif v.id in returned_lazy and all(key in lazy_fields and key in reloads for key in keys):
-                        resident[n] = values(reloads, keys)
-        outgoing = {n for n, keys in enumerate(groups)
-                    if known.get(n) == values(b.exit, keys)}
-        resident_outgoing = {n for n, keys in enumerate(groups)
-                             if resident.get(n) == values(b.exit, keys)}
+                        resident[n] = values(reloads, n)
+        outgoing = {n for n in group_indices
+                    if known.get(n) == values(b.exit, n)}
+        resident_outgoing = {n for n in group_indices
+                             if resident.get(n) == values(b.exit, n)}
         if resident_outgoing != resident_exit[i]:
             resident_exit[i] = resident_outgoing
             changed = True

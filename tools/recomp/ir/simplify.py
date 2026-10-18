@@ -135,7 +135,10 @@ Only values with operands that can still alias are revisited.
                 continue
             v.args = tuple(s.resolve(a) for a in v.args)
             a, replacement = v.args, None
-            if _rewrite_signed_sub_predicate(s, v) or _rewrite_signed_sub_le(s, v):
+            if v.size == 1 and (
+                    (v.opc in {"INT_XOR", "INT_NOTEQUAL", "INT_EQUAL", "BOOL_XOR"}
+                     and _rewrite_signed_sub_predicate(s, v))
+                    or (v.opc in {"INT_OR", "BOOL_OR"} and _rewrite_signed_sub_le(s, v))):
                 changed = True
                 remaining.append(v)
                 continue
