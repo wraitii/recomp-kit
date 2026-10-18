@@ -1,10 +1,10 @@
 """Lifted CFG regions, real call contexts and saved-CW provenance."""
 from frontend import function_ir
-from ir import x87_mode as mode, x87_provenance as bits
+from ir import x87_cw as mode, x87_provenance as bits
 from ir.call_contracts import cfg_is_closed
 from ir.cfg import FunctionIR
 from ir.lift import BRANCHES
-from .common import MASK
+from ir.call_sites import direct_target
 
 CW_NEUTRAL_TRANSCENDENTALS = frozenset(('F2XM1', 'FPATAN', 'FPREM', 'FPREM1',
                                       'FSCALE', 'FSIN', 'FCOS', 'FSINCOS',
@@ -377,7 +377,7 @@ def context_graph(ctx, root, depth, limit, opaque, contracts=()):
             transfers.add(site)
         call = any(op.opc in ('CALL', 'CALLIND') for op in ins.ops)
         if call:
-            target = mode.direct_call_target(ins)
+            target = direct_target(ins)
             reason = None
             if target in boundary_functions:
                 boundaries[key] = boundary_functions[target]

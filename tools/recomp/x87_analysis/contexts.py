@@ -1,5 +1,5 @@
 import argparse
-from collections import Counter, deque
+from collections import Counter
 import hashlib
 import json
 from pathlib import Path
@@ -7,11 +7,10 @@ from pathlib import Path
 import driver
 import game_config
 import scan
-from ir import x87, x87_boundaries, x87_mode
-from .common import MASK, settings_for, apply_contracts, preserving, coverage, context_contracts
-from .core import CW_NEUTRAL_TRANSCENDENTALS, internal_pcode_flow, tail_region, cfg_relations, context_graph
-
-mode = x87_mode
+from ir.x87_cw import UNKNOWN, fact_dict, instruction_mnemonic, join
+from ir.call_sites import direct_target
+from .common import MASK, settings_for, context_contracts
+from .core import CW_NEUTRAL_TRANSCENDENTALS, internal_pcode_flow, cfg_relations, context_graph
 
 
 def main(argv=None):
@@ -42,9 +41,7 @@ def main(argv=None):
     settings = settings_for(args)
     args.out = args.out or args.build_root / "recomp/x87-audit/contexts.json"
     ctx = driver.Context(settings)
-    executable_hash = hashlib.sha256(Path(settings.exe).read_bytes()).hexdigest()
-    if executable_hash != settings.sha256.lower():
-        raise ValueError('original executable SHA-256 does not match game configuration')
+    executable_hash = settings.sha256.lower()
     contracts = context_contracts(args.contracts, ctx)
     scanned, reverse = {}, {}
     seed = scan.read_cache(ctx, args.scan_cache) if args.scan_cache else None
@@ -87,21 +84,21 @@ def main(argv=None):
             details = dict(cases[0][2])
             for field in ('outgoing', 'calls'):
                 indices = set().union(*(facts.get(field, {}) for _, _, facts in cases))
-                details[field] = {i: mode.join(facts[field][i] for _, _, facts in cases
+                details[field] = {i: join(facts[field][i] for _, _, facts in cases
                                                     if i in facts.get(field, {})) for i in indices}
             for field in ('reachable', 'unmatched_returns'):
                 details[field] = sorted(set().union(*(facts.get(field, []) for _, _, facts in cases)))
             relations = None if any(relation is None for _, relation, _ in cases) else {
-                i: mode.join(relation[i] for _, relation, _ in cases if i in relation)
+                i: join(relation[i] for _, relation, _ in cases if i in relation)
                 for i in set().union(*(relation for _, relation, _ in cases))}
             terminal = [i for i, successors in enumerate(fir.succ) if not successors
                         and i not in terminating and i in details.get('outgoing', {})]
-            return_fact = mode.join(details.get('outgoing', {}).get(i, mode.UNKNOWN)
-                                          for i in terminal)
+            return_fact = join(details.get('outgoing', {}).get(i, UNKNOWN)
+                               for i in terminal)
             exposures = [{'node': i, 'site': '%08x' % fir.insns[i].addr,
-                          'target': None if mode.direct_call_target(fir.insns[i]) is None else
-                              '%08x' % mode.direct_call_target(fir.insns[i]),
-                          **mode.fact_dict(fact)}
+                          'target': None if direct_target(fir.insns[i]) is None else
+                              '%08x' % direct_target(fir.insns[i]),
+                          **fact_dict(fact)}
                          for i, fact in details.get('calls', {}).items()
                          if fact.entry_mask & MASK != MASK]
             obstacles = [{'node': i, 'site': '%08x' % ins.addr, 'kind': 'internal_pcode_flow'}
@@ -109,7 +106,7 @@ def main(argv=None):
             obstacles += [{'node': i, 'site': '%08x' % ins.addr, 'kind': 'unmodeled_user_operation'}
                           for i, ins in enumerate(fir.insns)
                           if any(op.opc == 'CALLOTHER' for op in ins.ops)
-                          and mode.instruction_mnemonic(ins) not in CW_NEUTRAL_TRANSCENDENTALS]
+                          and instruction_mnemonic(ins) not in CW_NEUTRAL_TRANSCENDENTALS]
             restored = relations is not None and return_fact.entry_mask & MASK == MASK
             graph = [[ins.addr, [[ret, call] for ret, call in key[1]], list(fir.succ[i])]
                      for i, (key, ins) in enumerate(zip(keys, fir.insns))]
@@ -128,25 +125,25 @@ def main(argv=None):
                                                  'constant_address': address}
                                                 for i, address in details.get('memory_invalidations', {}).items()],
                           call_argument_cw_bits=[{'node': i, 'site': '%08x' % fir.insns[i].addr,
-                                                 'arguments': [mode.fact_dict(fact) for fact in facts]}
+                                                 'arguments': [fact_dict(fact) for fact in facts]}
                                                 for i, facts in details.get('call_arguments', {}).items()],
                           tail_sites=['%08x' % site for site in sorted(transfers)],
                           cfg_provenance=relations is not None,
                           alignment_cases=[{'residue': residue, 'checked': relation is not None,
                                             'unmatched_returns': len(facts.get('unmatched_returns', [])),
-                                            'return_fact': mode.fact_dict(mode.join(
-                                                facts.get('outgoing', {}).get(i, mode.UNKNOWN)
+                                            'return_fact': fact_dict(join(
+                                                facts.get('outgoing', {}).get(i, UNKNOWN)
                                                 for i, successors in enumerate(fir.succ)
                                                 if not successors and i not in terminating
                                                 and i in facts.get('outgoing', {})))}
                                            for residue, relation, facts in cases],
                           provenance_failure=details.get('failure'),
-                          return_fact=mode.fact_dict(return_fact),
+                          return_fact=fact_dict(return_fact),
                           unmatched_returns=[{'node': i, 'site': '%08x' % fir.insns[i].addr}
                                              for i in details.get('unmatched_returns', [])],
                           obstacles=obstacles, call_exposure=exposures,
                           load_relations=[{'node': i, 'site': '%08x' % fir.insns[i].addr,
-                                           **mode.fact_dict(fact)} for i, fact in (relations or {}).items()],
+                                           **fact_dict(fact)} for i, fact in (relations or {}).items()],
                           frontier=[{'site': '%08x' % key[0], 'stack': list(key[1]),
                                      'target': None if target is None else '%08x' % target, 'reason': reason}
                                     for key, (target, reason) in sorted(frontier.items())],

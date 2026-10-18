@@ -1,5 +1,5 @@
 import argparse
-from collections import Counter, deque
+from collections import deque
 import hashlib
 import json
 from pathlib import Path
@@ -8,12 +8,11 @@ import callgraph
 import driver
 import game_config
 import scan
-from ir import x87, x87_boundaries, x87_mode, x87_facts
+from ir import x87_facts
 from ir import indirect_targets
-from .common import MASK, settings_for, apply_contracts, preserving, coverage
-from .core import CW_NEUTRAL_TRANSCENDENTALS, internal_pcode_flow, tail_region, cfg_relations, context_graph
-
-mode = x87_mode
+from ir.x87_cw import Fact, ReturnSummary, UNKNOWN_SUMMARY, fact_dict, summary_dict
+from ir.x87_propagation import analyze, ordinary_entries, propagate, summarize
+from .common import MASK, settings_for, apply_contracts, preserving, coverage, load_boundaries
 
 
 def main(argv=None):
@@ -42,8 +41,8 @@ def main(argv=None):
     scanned = seed.scanned
     prepared = seed.cw_inputs()
     opaque = seed.opaque()
-    boundaries = x87_boundaries.load(settings.x87_mode_metadata, prepared, ctx.image,
-                                     settings.x87_imports_preserve_pc_rc)
+    boundaries = load_boundaries(settings.x87_mode_metadata, prepared, ctx.image,
+                                 settings.x87_imports_preserve_pc_rc)
     base_boundaries = boundaries
     return_metadata = None
     if args.return_metadata:
@@ -59,7 +58,7 @@ def main(argv=None):
             raise ValueError('return metadata requires the imports-preserve-PC/RC contract')
         if any(int(row['preserved_mask'], 16) & ~0xffff for row in return_metadata['proofs']):
             raise ValueError('return metadata preservation mask exceeds the control word')
-        relations = {int(row['entry'], 16): x87_mode.ReturnSummary(int(row['preserved_mask'], 16), 0, 0)
+        relations = {int(row['entry'], 16): ReturnSummary(int(row['preserved_mask'], 16), 0, 0)
                      for row in return_metadata['proofs']}
         boundaries = {**boundaries, 'calls': dict(boundaries['calls'])}
         for body in prepared.values():
@@ -69,9 +68,9 @@ def main(argv=None):
                         boundaries['calls'][site] = relations[target]
     indirect = indirect_targets.load(settings, ctx.program)
     call_effects = settings.call_effects
-    intrinsic = x87_mode.summarize(prepared, opaque, indirect=indirect, effects=call_effects)
-    summaries = x87_mode.summarize(prepared, opaque, boundaries, indirect, call_effects)
-    base_summaries = x87_mode.summarize(prepared, opaque, base_boundaries, indirect, call_effects) if return_metadata else summaries
+    intrinsic = summarize(prepared, opaque, indirect=indirect, effects=call_effects)
+    summaries = summarize(prepared, opaque, boundaries, indirect, call_effects)
+    base_summaries = summarize(prepared, opaque, base_boundaries, indirect, call_effects) if return_metadata else summaries
     unconditional = {"intrinsic": sum(preserving(s) for s in intrinsic.values()),
                      "with_boundary_contracts": sum(preserving(s) for s in base_summaries.values()),
                      "x87_intrinsic": sum(preserving(intrinsic[a]) for a, r in scanned.items() if r.x87_count),
@@ -81,7 +80,7 @@ def main(argv=None):
     if contract_rows:
         for count in range(1, len(contract_rows) + 1):
             bodies, effects = apply_contracts(prepared, boundaries, ctx.image, contract_rows[:count])
-            relations = x87_mode.summarize(bodies, opaque, effects, indirect, call_effects)
+            relations = summarize(bodies, opaque, effects, indirect, call_effects)
             sensitivity.append({"contracts": [r["name"] for r in contract_rows[:count]],
                                 "preserving_functions": sum(preserving(s) for s in relations.values()),
                                 "preserving_x87_functions": sum(preserving(relations[a]) for a, r in scanned.items() if r.x87_count),
@@ -89,7 +88,7 @@ def main(argv=None):
                                     if preserving(relations[a]) and not preserving(summaries[a])]})
         prepared, boundaries = bodies, effects
         summaries = relations
-    analyses = {addr: x87_mode.analyze(body, summaries, opaque, boundaries=boundaries)
+    analyses = {addr: analyze(body, summaries, opaque, boundaries=boundaries)
                 for addr, body in prepared.items() if body and addr not in opaque}
     graph = callgraph.build(seed, ctx.program, settings, indirect)
     mnemonics = {}
@@ -98,8 +97,8 @@ def main(argv=None):
         mnemonics.update((ins.addr, ins.mnem.upper().removeprefix("WAIT ")) for ins in fn.insns)
 
     def ordinary(contracts):
-        return x87_mode.ordinary_entries(prepared, summaries, contracts, graph,
-                                        opaque, boundaries)
+        return ordinary_entries(prepared, summaries, contracts, graph,
+                                opaque, boundaries)
 
     baseline_entries, baseline, baseline_gaps = ordinary(settings.x87_entry_contracts)
     if args.facts_out:
@@ -127,13 +126,13 @@ def main(argv=None):
               "instruction_boundaries": [{"function": "%08x" % addr,
                   "site": "%08x" % body.sites[index], "effect": effect[0],
                   "mask": "%04x" % effect[1], "value": "%04x" % effect[2], "reason": effect[3],
-                  "load_relation": x87_mode.fact_dict(body.word_relations[index])
+                  "load_relation": fact_dict(body.word_relations[index])
                       if index in body.word_relations else None}
                   for addr, body in prepared.items() if body
                   for index, effect in body.effects if effect[0] != "keep"],
               "relations": [{"function": "%08x" % addr,
-                             "intrinsic": x87_mode.summary_dict(intrinsic[addr]),
-                             "with_boundary_contracts": x87_mode.summary_dict(summaries[addr])}
+                             "intrinsic": summary_dict(intrinsic[addr]),
+                             "with_boundary_contracts": summary_dict(summaries[addr])}
                             for addr in sorted(prepared)],
               "roots": {}}
 
@@ -141,7 +140,7 @@ def main(argv=None):
         queue, seen, blockers = deque([(root, [])]), set(), []
         while queue:
             addr, path = queue.popleft()
-            if addr in seen or preserving(summaries.get(addr, x87_mode.UNKNOWN_SUMMARY)):
+            if addr in seen or preserving(summaries.get(addr, UNKNOWN_SUMMARY)):
                 continue
             seen.add(addr)
             if addr not in analyses:
@@ -171,8 +170,8 @@ def main(argv=None):
         contract = {"function": addr, "mask": MASK, "value": 0}
         contracts = [row for row in settings.x87_entry_contracts if row["function"] != addr] + [contract]
         entries, results, gaps = ordinary(contracts)
-        contextual_entries, contextual = x87_mode.propagate(
-            prepared, summaries, {addr: x87_mode.Fact(MASK, 0, 0)}, opaque, boundaries)
+        contextual_entries, contextual = propagate(
+            prepared, summaries, {addr: Fact(MASK, 0, 0)}, opaque, boundaries)
         report["roots"][name] = {"function": "%08x" % addr,
             "assumption": "hypothetical PC=RC=0 at every primary-entry invocation",
             "ordinary": coverage(results, mnemonics),

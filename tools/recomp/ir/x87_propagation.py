@@ -5,29 +5,18 @@ from .x87_cw import (CW_MASK, CW_NEUTRAL, CW_NEUTRAL_USER_OPS, CW_PC_RC, ENTRY, 
                      ReturnSummary, UNKNOWN, UNKNOWN_SUMMARY, fact_dict,
                      instruction_effect, instruction_mnemonic, invalidate, join,
                      join_summaries, overwrite)
+from . import call_sites
 from .cfg import call_graph
 from .call_contracts import cfg_is_closed
-from .import_sites import CALLBACK_IMPORTS, EMPTY_EFFECTS, resolve as resolve_imports
+from .import_sites import CALLBACK_IMPORTS, EMPTY_EFFECTS
 
 Prepared = namedtuple("Prepared", ("addr", "entry", "sites", "order", "succ", "preds",
                                    "effects", "calls", "returns", "x87_count", "word_relations", "entries",
-                                   "imports"))
+                                   "call_sites"))
 Analysis = namedtuple("Analysis", ("calls", "returns", "losses", "sites", "gaps"), defaults=((),))
 
 
-def direct_call_target(ins):
-    for op in ins.ops:
-        if op.opc == "CALL" and op.ins:
-            space, target, _size = op.ins[0]
-            return target if space == "ram" else None
-    return None
-
-
-def indirect_jump(ins):
-    return instruction_mnemonic(ins) == "JMP" and any(op.opc == "BRANCHIND" for op in ins.ops)
-
-
-def prepare(fir, image=None):
+def prepare(fir, image=None, sites=None):
     """Prepare closed byte-backed IR; secondary entries contribute unknown facts.
 
     SEH bodies qualify only when every frame they establish is unwind-only
@@ -35,20 +24,14 @@ def prepare(fir, image=None):
     normal returns stay sound.
     A call that never returns ends its path without reaching a return.
     """
-    tails = {i: None for i, ins in enumerate(fir.insns) if not fir.succ[i] and indirect_jump(ins)}
-    for i, targets in fir.exits.items():
-        ins = fir.insns[i]
-        literal = [op.ins[0][1] for op in ins.ops
-                   if op.opc == "BRANCH" and op.ins[0][0] == "ram"]
-        if instruction_mnemonic(ins) != "JMP" or fir.succ[i]:
-            return None
-        if indirect_jump(ins):
-            tails[i] = None
-            continue
-        if len(targets) != 1 or literal != list(targets):
-            return None
-        tails[i] = literal[0]
-    if not fir.insns or any(not ins.raw for ins in fir.insns):
+    if not fir.insns:
+        return None
+    rows = sites if sites is not None else call_sites.build(fir, image)
+    tails = {i: row.targets[0].address if row.targets else None
+             for i, row in rows.items() if row.kind == "tail"}
+    if any(i not in tails for i in fir.exits):
+        return None
+    if any(not ins.raw for ins in fir.insns):
         return None
     if fir.seh and (any(set(kinds) - {"enter", "leave"} for kinds in fir.seh.values())
                     or not all(i in fir.seh_unwind_only for i, kinds in fir.seh.items() if "enter" in kinds)):
@@ -88,7 +71,7 @@ def prepare(fir, image=None):
         if i in tails:
             calls.append((i, ins.addr, tails[i]))
         elif any(op.opc in ("CALL", "CALLIND") for op in ins.ops):
-            calls.append((i, ins.addr, direct_call_target(ins)))
+            calls.append((i, ins.addr, rows[i].targets[0].address if rows[i].targets else None))
         if i in tails or mnem == "RET" or any(op.opc == "RETURN" for op in ins.ops):
             returns.append(i)
         for target in succ[i]:
@@ -100,7 +83,7 @@ def prepare(fir, image=None):
                     tuple(calls), tuple(returns),
                     sum(1 for i in order if instruction_mnemonic(fir.insns[i]).startswith("F")
                         and instruction_mnemonic(fir.insns[i]) != "FEMMS"), word_relations or {}, roots,
-                    resolve_imports(fir, image) if image is not None else {})
+                    rows)
 
 
 def _apply_summary(fact, summary):
@@ -151,6 +134,32 @@ def _configured_summary(value):
     return ReturnSummary(value["preserved"], value["known"], value["value"])
 
 
+def _domain(summaries, opaque_targets, recursive, call_boundaries, call_effects):
+    def boundary(row):
+        return call_boundaries.get(row.site, call_sites.MISSING)
+
+    def override(row):
+        value = call_effects["sites"].get(row.site, {}).get("x87")
+        return call_sites.MISSING if value is None else _configured_summary(value)
+
+    def indirect(row, facts):
+        fact = facts.get(row.site)
+        return call_sites.MISSING if fact is None else fact[1]
+
+    def import_value(row):
+        if row.import_key is None:
+            return call_sites.MISSING
+        default = "unknown" if row.import_key in CALLBACK_IMPORTS else "preserve"
+        return _configured_summary(call_effects["imports"].get(row.import_key, {}).get("x87", default))
+
+    def lookup(target):
+        return _call_summary(target, summaries, opaque_targets, recursive)
+
+    return call_sites.Domain(lookup=lookup, join=join_summaries, override=override,
+                             import_value=import_value, boundary=boundary, indirect=indirect,
+                             indirect_with_direct=False)
+
+
 def _run(prepared, summaries, opaque_targets, recursive=frozenset(),
          initial=ENTRY, boundaries=None, indirect=None, call_effects=None, roots=None):
     roots = prepared.entries if roots is None else roots
@@ -160,21 +169,10 @@ def _run(prepared, summaries, opaque_targets, recursive=frozenset(),
     call_boundaries = boundaries.get("calls", {})
     edge_boundaries = boundaries.get("edges", {})
 
-    def call_summary(i, target):
-        site = prepared.sites[i]
-        if site in call_boundaries:
-            return call_boundaries[site]
-        override = call_effects["sites"].get(site, {}).get("x87")
-        if override is not None:
-            return _configured_summary(override)
-        if target is None and site in indirect:
-            found = [_call_summary(t, summaries, opaque_targets, recursive) for t in indirect[site][1]]
-            return None if any(summary is None for summary in found) else join_summaries(found)
-        key = prepared.imports.get(site)
-        if key is not None:
-            default = "unknown" if key in CALLBACK_IMPORTS else "preserve"
-            return _configured_summary(call_effects["imports"].get(key, {}).get("x87", default))
-        return _call_summary(target, summaries, opaque_targets, recursive)
+    domain = _domain(summaries, opaque_targets, recursive, call_boundaries, call_effects)
+
+    def call_summary(i):
+        return call_sites.resolve(prepared.call_sites[i], domain, indirect)
 
     def edge_fact(p, i):
         fact = outgoing[p]
@@ -182,7 +180,7 @@ def _run(prepared, summaries, opaque_targets, recursive=frozenset(),
         return _apply_summary(fact, effect) if effect else fact
     effects = dict(prepared.effects)
     calls = {i: target for i, _site, target in prepared.calls}
-    call_sites = {i: site for i, site, _target in prepared.calls}
+    site_of = {i: site for i, site, _target in prepared.calls}
     incoming, outgoing = {}, {}
     call_facts, losses, loss_keys, gaps = {}, [], set(), []
     work = list(roots)
@@ -200,8 +198,7 @@ def _run(prepared, summaries, opaque_targets, recursive=frozenset(),
             continue
         incoming[i] = state
         if i in calls:
-            target = calls[i]
-            state = _apply_summary(state, call_summary(i, target))
+            state = _apply_summary(state, call_summary(i))
         kind, mask, value, reason = effects[i]
         if i in prepared.word_relations:
             relation = prepared.word_relations[i]
@@ -229,9 +226,9 @@ def _run(prepared, summaries, opaque_targets, recursive=frozenset(),
                              "control-flow join loses predecessor facts", None, _lost_mask(before, state), prepared.sites[p])
         if i in calls:
             target = calls[i]
-            site = call_sites[i]
+            site = site_of[i]
             call_facts[site] = state
-            summary = call_summary(i, target)
+            summary = call_summary(i)
             unresolved = CW_PC_RC & ~(summary.preserved_mask | summary.known_mask) if summary else CW_PC_RC
             if not prepared.succ[i] and i not in prepared.returns:
                 unresolved, summary = 0, ReturnSummary(CW_MASK, 0, 0)

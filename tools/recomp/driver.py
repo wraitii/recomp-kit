@@ -29,7 +29,7 @@ import output
 import emission_cache
 import scan
 from settings import Settings
-from ir import call_contracts, call_values, contract_variants, production, x87_mode, x87_facts, x87_report, prepared_store
+from ir import call_contracts, call_values, contract_variants, production, x87_facts, x87_propagation, x87_report, prepared_store
 from ir import c_symbols
 from ir import indirect_targets as indirect_target_facts
 from ir.c_symbols import Declaration
@@ -419,11 +419,11 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
         mode_sites = x87_facts_loaded.mode_sites()
         entry_verification = {row["function"]: x87_facts.EntryContract.from_row(row)
                               for row in settings.x87_entry_contracts if row.get("verify")}
-        mode_summaries = x87_mode.summarize(mode_prepared, mode_opaque, indirect=indirect_targets,
-                                            effects=settings.call_effects, noreturn=ctx.program.noreturn)
+        mode_summaries = x87_propagation.summarize(mode_prepared, mode_opaque, indirect=indirect_targets,
+                                                   effects=settings.call_effects, noreturn=ctx.program.noreturn)
         x87_counts = {addr: row.x87_count for addr, row in scanned.items()}
-        mode_exposure = x87_mode.exposure_report(mode_prepared, calls, mode_opaque, x87_counts,
-                                                {addr: row.writers for addr, row in scanned.items()})
+        mode_exposure = x87_report.exposure_report(mode_prepared, calls, mode_opaque, x87_counts,
+                                                   {addr: row.writers for addr, row in scanned.items()})
         eligibility = Eligibility(settings, scanned, mode_opaque)
         if (settings.private_input_arguments or settings.private_input_registers) and not eligibility.enabled:
             raise TranslateError("private register arguments require call contracts, relaxed local state and a game translation")

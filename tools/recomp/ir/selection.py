@@ -1,7 +1,8 @@
 """Production eligibility policy shared by driver selection phases."""
 from dataclasses import dataclass
 
-from . import contract_variants, x87_mode
+from . import contract_variants
+from .x87_propagation import mode_preserving_leaf
 
 
 @dataclass(frozen=True)
@@ -33,7 +34,7 @@ class Eligibility:
         if not self.settings.emit.x87_cw_clone or self.settings.emit.x87_scalar_strict:
             return set()
         return {addr for addr in candidates if self.scanned[addr].x87_count and addr not in self.opaque
-                and x87_mode.mode_preserving_leaf(prepared.get(addr))}
+                and mode_preserving_leaf(prepared.get(addr))}
 
     def callers(self, private_targets):
         if not self.enabled:

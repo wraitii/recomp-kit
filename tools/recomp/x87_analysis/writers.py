@@ -1,17 +1,15 @@
 import argparse
-from collections import Counter, deque
-import hashlib
+from collections import Counter
 import json
 from pathlib import Path
 
 import driver
 import game_config
 import scan
-from ir import x87, x87_boundaries, x87_mode
-from .common import MASK, settings_for, apply_contracts, preserving, coverage
-from .core import CW_NEUTRAL_TRANSCENDENTALS, internal_pcode_flow, tail_region, cfg_relations, context_graph
-
-mode = x87_mode
+from ir.x87_cw import UNKNOWN_SUMMARY, fact_dict, instruction_mnemonic, summary_dict
+from ir.x87_propagation import analyze, prepare, summarize
+from .common import MASK, settings_for
+from .core import CW_NEUTRAL_TRANSCENDENTALS, internal_pcode_flow, tail_region, cfg_relations
 
 
 def reload_envelopes(prepared, summaries, scanned):
@@ -24,7 +22,7 @@ def reload_envelopes(prepared, summaries, scanned):
         calls = {i: (site, target) for i, site, target in body.calls}
         writers = {i for i in body.order if body.sites[i] in reload_sites}
         for origin, site, target in body.calls:
-            summary = summaries.get(target, mode.UNKNOWN_SUMMARY)
+            summary = summaries.get(target, UNKNOWN_SUMMARY)
             if not summary.known_mask & MASK:
                 continue
             seen, todo = set(), list(body.succ[origin])
@@ -82,26 +80,26 @@ def main(argv=None):
         except ValueError as error:
             tail_records[addr] = {'error': str(error)}
             continue
-        body = mode.prepare(fir)
+        body = prepare(fir)
         tail_records[addr] = {'transfers': transfers, 'instructions': len(fir.insns),
                               'prepared': body is not None}
         if body is None:
             continue
         body = body._replace(effects=tuple(
-            (i, ('keep', 0, 0, None) if mode.instruction_mnemonic(fir.insns[i]) in CW_NEUTRAL_TRANSCENDENTALS
+            (i, ('keep', 0, 0, None) if instruction_mnemonic(fir.insns[i]) in CW_NEUTRAL_TRANSCENDENTALS
              else effect) for i, effect in body.effects))
         tail_records[addr]['provenance_obstacles'] = (
             [{'kind': 'alternate_entry', 'site': '%08x' % site} for site in fir.entries]
             + [{'kind': 'internal_pcode_flow', 'site': '%08x' % ins.addr,
-                'mnemonic': mode.instruction_mnemonic(ins)} for ins in fir.insns if internal_pcode_flow(ins)]
+                'mnemonic': instruction_mnemonic(ins)} for ins in fir.insns if internal_pcode_flow(ins)]
             + [{'kind': 'unmodeled_user_operation', 'site': '%08x' % ins.addr,
-                'mnemonic': mode.instruction_mnemonic(ins)} for ins in fir.insns
+                'mnemonic': instruction_mnemonic(ins)} for ins in fir.insns
                if any(op.opc == 'CALLOTHER' for op in ins.ops)
-               and mode.instruction_mnemonic(ins) not in CW_NEUTRAL_TRANSCENDENTALS])
+               and instruction_mnemonic(ins) not in CW_NEUTRAL_TRANSCENDENTALS])
         relations = cfg_relations(fir, ctx.lifter)
         provenance[addr] = relations
         enriched[addr] = body._replace(word_relations=relations or {})
-    summaries = mode.summarize(enriched, opaque)
+    summaries = summarize(enriched, opaque)
     rows = []
     for addr, row in sorted(scanned.items()):
         if not row.writers and addr not in roots:
@@ -110,7 +108,7 @@ def main(argv=None):
         record = {'function': '%08x' % addr, 'writers': [dict(w, site='%08x' % w['site']) for w in row.writers],
                   'prepared': body is not None, 'cfg_provenance': provenance.get(addr) is not None,
                   'tail_region': tail_records.get(addr),
-                  'return_relation': mode.summary_dict(summaries[addr])}
+                  'return_relation': summary_dict(summaries[addr])}
         record['known_return_override_mask'] = '%04x' % (summaries[addr].known_mask & MASK)
         if body is None or addr in opaque:
             fn, entries = ctx.load(addr)
@@ -123,9 +121,9 @@ def main(argv=None):
             record.update(classification='unresolved_body', reason=row.exclusion,
                           preparation_obstacles=reasons or ['no closed byte-backed mode CFG'])
         else:
-            result = mode.analyze(body, summaries, opaque)
+            result = analyze(body, summaries, opaque)
             exposed = [{'site': '%08x' % site, 'target': None if target is None else '%08x' % target,
-                        **mode.fact_dict(result.calls[site]),
+                        **fact_dict(result.calls[site]),
                         'scope': 'entry PC/RC equality is unproven here; this alone does not prove a mode change'}
                        for _, site, target in body.calls
                        if site in result.calls and result.calls[site].entry_mask & MASK != MASK]
@@ -134,7 +132,7 @@ def main(argv=None):
             record.update(classification='restored_with_call_exposure' if restored and exposed else
                           'contained' if restored else 'known_return_override' if known_override else 'unresolved',
                           call_exposure=exposed,
-                          load_relations=[{'site': '%08x' % body.sites[i], **mode.fact_dict(f)}
+                          load_relations=[{'site': '%08x' % body.sites[i], **fact_dict(f)}
                                           for i, f in sorted(body.word_relations.items())],
                           gaps=list(result.gaps))
         rows.append(record)
@@ -148,7 +146,7 @@ def main(argv=None):
                   {'function': '%08x' % a, 'modifier': '%08x' % target}
                   for a, row in sorted(scanned.items()) if enriched[a] is None
                   for target in sorted(set(row.calls))
-                  if summaries.get(target, mode.UNKNOWN_SUMMARY).known_mask & MASK]}
+                  if summaries.get(target, UNKNOWN_SUMMARY).known_mask & MASK]}
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=1) + '\n')
     print(report['counts'])

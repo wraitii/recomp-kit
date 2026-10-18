@@ -8,13 +8,15 @@ import re
 
 import decoded
 from frontend import external_exits
-from ir import call_contracts, production, x87_facts, x87_mode
+from ir import call_contracts, call_sites, production, x87_facts
+from ir.x87_cw import writer_effect
+from ir.x87_propagation import prepare as prepare_x87
 from ir.lift import LiftError
 from phases import ScanTask, EscapeTask
 from program import FunctionDescription as Row, EntryModel
 
 ScanRow = namedtuple("ScanRow", "addr description calls jumps references returns exclusion seh_escapes register_facts cw_facts x87_count writers external_targets")
-CACHE_VERSION = "recomp-scan-v1"
+CACHE_VERSION = "recomp-scan-v2"
 _WORKER = {}
 
 
@@ -56,10 +58,11 @@ def _scan(task):
         if not (escapes or fn.pushed_continuations or fn.return_jumps or addr in tr.noreturn_callees):
             try:
                 fir = ctx.artifacts.lifted(tr, ctx.lifter, fn)
-                prepared = (call_contracts.prepare(fir, image=ctx.image)
-                            if not (entries or site or fn.dead_addrs) else None)
                 fir.entries = tuple(entries)
-                mode_prepared = x87_mode.prepare(fir, ctx.image)
+                sites = call_sites.build(fir, ctx.image)
+                prepared = (call_contracts.prepare(fir, image=ctx.image, sites=sites)
+                            if not (entries or site or fn.dead_addrs) else None)
+                mode_prepared = prepare_x87(fir, ctx.image, sites=sites)
             except (LiftError, RecursionError):
                 prepared = None
             else:
@@ -68,7 +71,7 @@ def _scan(task):
         for ins in fn.insns:
             mnem = ins.mnem.upper().removeprefix("WAIT ")
             x87_count += mnem.startswith("F") and mnem != "FEMMS"
-            if x87_mode.writer_effect(mnem) is not None:
+            if writer_effect(mnem) is not None:
                 writers.append({"site": ins.addr, "mnemonic": mnem})
         rows.append(ScanRow(addr, Row(addr, fn.name, len(fn.insns), fn.insns[0].addr, fn.insns[-1].addr),
                      calls, sorted(jumps), refs, returns, reason, escapes, prepared, mode_prepared, x87_count,

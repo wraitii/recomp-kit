@@ -44,7 +44,8 @@ from collections import namedtuple
 from .lift import Lifter
 from .cfg import call_graph
 from .guest import X86_32
-from .import_sites import EMPTY_EFFECTS, resolve as resolve_imports
+from . import call_sites
+from .import_sites import EMPTY_EFFECTS
 
 GPRS = X86_32.names("gpr")
 ARITH_FLAGS = X86_32.names("arithmetic_flag")
@@ -182,13 +183,6 @@ def contract_from_cells(reads_cells, killed_cells, cells=None):
     return Contract(reads, kills)
 
 
-def _is_callable_target(ins):
-    for op in ins.ops:
-        if op.opc == "CALL" and op.ins:
-            return op.ins[0][1] if op.ins[0][0] == "ram" else None
-    return None
-
-
 class _Bits(object):
     """Integer bit masks over the contract cells (GPR lanes, then flags)."""
 
@@ -241,15 +235,15 @@ class _Prepared(object):
     their index to the site address for ``summarize``'s indirect facts.
     """
 
-    __slots__ = ("language", "entry", "order", "succ", "preds", "use", "defs", "call", "opaque", "sites", "indirect", "imports", "returns", "writes", "preserves")
+    __slots__ = ("language", "entry", "order", "succ", "preds", "use", "defs", "call", "opaque", "call_sites", "returns", "writes", "preserves")
 
-    def __init__(self, fir, cells, bits):
+    def __init__(self, fir, cells, bits, sites=None):
         self.language = cells.language
         indices = {ins.addr: i for i, ins in enumerate(fir.insns)}
         self.entry = indices.get(fir.addr)
         self.order, self.succ, self.preds = [], {}, {}
         self.use, self.defs, self.call, self.opaque, self.returns = {}, {}, {}, set(), []
-        self.sites, self.indirect, self.imports = {}, {}, {}
+        self.call_sites = {}
         self.writes = 0
         self.preserves = frozenset()
         if self.entry is None:
@@ -285,11 +279,13 @@ class _Prepared(object):
                     produced = bits.varnode(cells, op.out)
                     local |= produced
                     defs |= produced
+            row = sites.get(i)
             target = None
-            if ins.mnem.upper() == "CALL":
-                target = _is_callable_target(ins)
-                if target is None and not indirect:
-                    unknown = True
+            if row is not None and row.kind != "tail":
+                self.call_sites[i] = row
+                target = row.targets[0].address if row.targets else None
+            if ins.mnem.upper() == "CALL" and target is None and not indirect:
+                unknown = True
             if ins.mnem.upper() in AF_WRITERS:
                 defs |= bits.fields(("AF",))
             self.writes |= defs
@@ -300,37 +296,26 @@ class _Prepared(object):
                 target = None
                 self.writes = bits.all
             self.use[i], self.defs[i], self.call[i] = use, defs, target
-            if indirect or ins.mnem.upper() == "CALL":
-                self.sites[i] = ins.addr
-            if indirect:
-                self.indirect[i] = ins.addr
             if unknown or indirect:
                 self.opaque.add(i)
             if _is_return(ins):
                 self.returns.append(i)
 
 
-def _is_callable_target(ins):
-    for op in ins.ops:
-        if op.opc == "CALL" and op.ins:
-            return op.ins[0][1] if op.ins[0][0] == "ram" else None
-    return None
-
-
 def _is_return(ins):
     return ins.mnem.upper() == "RET" or any(op.opc == "RETURN" for op in ins.ops)
 
 
-def prepare(fir, language=None, image=None):
+def prepare(fir, language=None, image=None, sites=None):
     """The callee-independent facts of one lifted body, None unless its CFG is closed.
 
     Plain data, so workers can hand it to the process that solves the call graph."""
     if not fir.insns or not cfg_is_closed(fir):
         return None
     cells = mapping(language or fir.language)
-    p = _Prepared(fir, cells, _bits(cells))
-    if image is not None:
-        p.imports = resolve_imports(fir, image)
+    if sites is None:
+        sites = call_sites.build(fir, image)
+    p = _Prepared(fir, cells, _bits(cells), sites)
     if (any(ins.raw and len(ins.raw) == 1 and 0x50 <= ins.raw[0] <= 0x57
             for ins in fir.insns) and not fir.entries and not fir.seh and not any(
             op.opc in ("CALL", "CALLIND", "CALLOTHER") for ins in fir.insns for op in ins.ops)):
@@ -412,16 +397,32 @@ def join_contracts(contracts):
     return Contract(reads, kills - preserves, writes, preserves)
 
 
-def _call_contract(site, target, fact, key, lookup, effects):
-    regs = effects["sites"].get(site, {}).get("regs")
-    if regs is None and fact is not None and fact[0] == "call":
-        found = [lookup(t) for t in fact[1]]
-        return join_contracts(found) if None not in found else None
-    if regs is None and key is not None:
-        regs = effects["imports"].get(key, {}).get("regs", "abi")
-    if regs is not None:
-        return IMPORT_ABI if regs == "abi" else None
-    return lookup(target) if target is not None else None
+def _domain(lookup, effects):
+    def regs(value):
+        return IMPORT_ABI if value == "abi" else None
+
+    def override(row):
+        value = effects["sites"].get(row.site, {}).get("regs")
+        return call_sites.MISSING if value is None else regs(value)
+
+    def indirect(row, facts):
+        fact = facts.get(row.site)
+        return fact[1] if fact is not None and fact[0] == "call" else call_sites.MISSING
+
+    def import_value(row):
+        if row.import_key is None:
+            return call_sites.MISSING
+        return regs(effects["imports"].get(row.import_key, {}).get("regs", "abi"))
+
+    return call_sites.Domain(lookup=lookup, join=join_contracts, override=override,
+                             import_value=import_value, indirect=indirect)
+
+
+def _resolved_sites(p, callee_lookup, indirect, effects):
+    domain = _domain(callee_lookup, effects or EMPTY_EFFECTS)
+    indirect = indirect or {}
+    return {i: call_sites.resolve(row, domain, indirect)
+            for i, row in p.call_sites.items() if row.kind != "unknown"}
 
 
 def summarize(p, callee_lookup, cells=None, indirect=None, effects=None):
@@ -437,13 +438,7 @@ def summarize(p, callee_lookup, cells=None, indirect=None, effects=None):
     effects = effects or EMPTY_EFFECTS
     use, defs = dict(p.use), dict(p.defs)
     writes = p.writes
-    contracts = {}
-    for i, site in p.sites.items():
-        target = p.call.get(i)
-        if target is None and i not in p.indirect:
-            continue
-        contracts[i] = _call_contract(site, target, indirect.get(site), p.imports.get(site),
-                                      callee_lookup, effects)
+    contracts = _resolved_sites(p, callee_lookup, indirect, effects)
     for i, contract in contracts.items():
         if contract is None:
             use[i] = bits.all
@@ -594,8 +589,8 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
         out = list(targets.get(addr, ()))
         body = prepared.get(addr)
         if body is not None:
-            for site in body.indirect.values():
-                fact = indirect.get(site)
+            for row in body.call_sites.values():
+                fact = indirect.get(row.site)
                 if fact is not None and fact[0] == "call":
                     out.extend(fact[1])
         return out

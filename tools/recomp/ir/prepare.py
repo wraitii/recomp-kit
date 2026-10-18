@@ -14,7 +14,7 @@ from .contract_variants import (output_mask as contract_output_mask, PrivateLayo
                                 ProvisionalBindings, FinalBindings, select_layout)
 from .body import (BodyRequest, BodyVariant, EntryForm, ReturnForm, EmissionPolicy,
                    FrozenMap, PreparedOptions)
-from . import x87_mode
+from .x87_propagation import mode_preserving_leaf, prepare as prepare_x87
 from .x87_facts import InstructionFact
 from .invocation import (EntryBinding, binding_invocation,
                          private_invocation, tail_invocation)
@@ -371,7 +371,7 @@ def prepare(fir, request, *, lifter=None, normalized=None):
     _validate_mode_sites(x87_mode_sites, {ins.addr for ins in fir.insns}, fir.addr)
     if x87_known_mode:
         if (return_fields is None or x87_scalar_strict or not x87_cw_clone
-                or not x87_mode.mode_preserving_leaf(x87_mode.prepare(fir))):
+                or not mode_preserving_leaf(prepare_x87(fir))):
             raise SSAError("known x87 mode requires a guarded private control-word-preserving leaf")
     report_calls = request.report_calls
     checked_calls = frozenset(checked_calls)
