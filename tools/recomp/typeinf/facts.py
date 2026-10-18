@@ -40,7 +40,8 @@ def contracts(settings, jobs):
         analyzable=lambda a: bool(scanned.get(a) and scanned[a].register_facts is not None
                                   and a not in helpers and a not in found_scan.native_replaced),
         roots=[addr for addr, row in scanned.items() if row.exclusion is None],
-        indirect=indirect_targets.load(settings, ctx.program), effects=settings.call_effects)
+        indirect=indirect_targets.load(settings, ctx.program), effects=settings.call_effects,
+        noreturn=ctx.program.noreturn)
     return {addr: frozenset(contract.preserves) for addr, contract in found.items() if contract is not None}
 
 

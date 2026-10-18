@@ -136,6 +136,15 @@ def plan(prepared, invocations):
                          (publish(state, Publication(publication.required)),), (result,))
         return result
 
+    def guarded_call(block, event, call, primary, invoke):
+        if call.guard or call.settle_guard:
+            guarded = publish(block.snapshots[event.id], Publication(call.guard), direct=True,
+                              clear=lazy and any(key in prepared.flag_keys
+                                                 for key in prepared.kept_calls.get(event.id, ())))
+            settle = (SettleFlags(flag_region.SETTLE),) if call.settle_guard else ()
+            primary += (Guard("hooks", None, (*settle, guarded)),)
+        return (*primary, invoke)
+
     publications, events = {}, {}
     for block in s.blocks.values():
         for event in block.ops:
@@ -164,13 +173,7 @@ def plan(prepared, invocations):
                                   (*primary, Invoke(invocation, input_value)),
                                   (fallback, Invoke(invocation.fallback))),)
                 else:
-                    if call.guard or call.settle_guard:
-                        guarded = publish(block.snapshots[event.id],
-                                          Publication(call.guard), direct=True,
-                                          clear=lazy and any(key in prepared.flag_keys for key in prepared.kept_calls.get(event.id, ())))
-                        settle = (SettleFlags(flag_region.SETTLE),) if call.settle_guard else ()
-                        primary += (Guard("hooks", None, (*settle, guarded)),)
-                    body = (*primary, Invoke(invocation))
+                    body = guarded_call(block, event, call, primary, Invoke(invocation))
                 events[event.id] = body + ((SettleFlags(prepared.cc_calls.get(block.index)),) if lazy else ())
             elif event.opc in ("CALL_RELOAD", "CALL_KEEP"):
                 field, lane = lane_fields[event.data]
@@ -183,7 +186,9 @@ def plan(prepared, invocations):
                                                  s.resolve(source) if source is not None else None,
                                                  lazy and field in flag_fields),)
             elif event.opc == "CALLIND":
-                events[event.id] = (publications[event.id], IndirectInvoke(*event.data, s.resolve(event.args[1])))
+                call = prepared.transfers.calls[event.id]
+                events[event.id] = guarded_call(block, event, call, (publications[event.id],),
+                                                IndirectInvoke(*event.data, s.resolve(event.args[1])))
                 if lazy:
                     events[event.id] += (SettleFlags(prepared.cc_calls.get(block.index)),)
             elif event.opc == "RETURN":

@@ -397,7 +397,21 @@ def join_contracts(contracts):
     return Contract(reads, kills - preserves, writes, preserves)
 
 
-def _domain(lookup, effects):
+Terminal = namedtuple("Terminal", "reads")
+
+
+def _join_indirect(values):
+    """Join over an indirect site's targets, where a ``Terminal`` target never
+    returns: it adds its reads to the call but nothing to its continuation."""
+    returning = [value for value in values if not isinstance(value, Terminal)]
+    if not returning:
+        return None
+    joined = join_contracts(returning)
+    return joined._replace(reads=joined.reads.union(
+        *(value.reads for value in values if isinstance(value, Terminal))))
+
+
+def _domain(lookup, effects, noreturn):
     def regs(value):
         return IMPORT_ABI if value == "abi" else None
 
@@ -414,18 +428,31 @@ def _domain(lookup, effects):
             return call_sites.MISSING
         return regs(effects["imports"].get(row.import_key, {}).get("regs", "abi"))
 
-    return call_sites.Domain(lookup=lookup, join=join_contracts, override=override,
-                             import_value=import_value, indirect=indirect)
+    def indirect_lookup(target):
+        contract = lookup(target)
+        if target not in noreturn:
+            return contract
+        return Terminal(frozenset(FIELDS) if contract is None else contract.reads)
+
+    return call_sites.Domain(lookup=lookup, join=_join_indirect, override=override,
+                             import_value=import_value, indirect=indirect, indirect_lookup=indirect_lookup)
 
 
-def _resolved_sites(p, callee_lookup, indirect, effects):
-    domain = _domain(callee_lookup, effects or EMPTY_EFFECTS)
+def _resolved_sites(p, callee_lookup, indirect, effects, noreturn):
+    domain = _domain(callee_lookup, effects or EMPTY_EFFECTS, frozenset(noreturn))
     indirect = indirect or {}
     return {i: call_sites.resolve(row, domain, indirect)
             for i, row in p.call_sites.items() if row.kind != "unknown"}
 
 
-def summarize(p, callee_lookup, cells=None, indirect=None, effects=None):
+def indirect_site_contracts(p, callee_lookup, indirect=None, effects=None, noreturn=()):
+    """Joined contract for each proven indirect call site in one prepared body."""
+    return {p.call_sites[i].site: contract
+            for i, contract in _resolved_sites(p, callee_lookup, indirect, effects, noreturn).items()
+            if contract is not None and p.call_sites[i].kind == "indirect"}
+
+
+def summarize(p, callee_lookup, cells=None, indirect=None, effects=None, noreturn=()):
     """Compute one function's contract from its prepared facts.
 
     ``callee_lookup(target)`` returns a Contract or None for no summary.
@@ -438,7 +465,7 @@ def summarize(p, callee_lookup, cells=None, indirect=None, effects=None):
     effects = effects or EMPTY_EFFECTS
     use, defs = dict(p.use), dict(p.defs)
     writes = p.writes
-    contracts = _resolved_sites(p, callee_lookup, indirect, effects)
+    contracts = _resolved_sites(p, callee_lookup, indirect, effects, noreturn)
     for i, contract in contracts.items():
         if contract is None:
             use[i] = bits.all
@@ -570,7 +597,8 @@ def continuation_outputs(s, publications, groups, lane_field, extra_roots=(), ca
     return outputs
 
 
-def analyze(targets, prepared, *, analyzable, roots, progress=None, language=None, indirect=None, effects=None):
+def analyze(targets, prepared, *, analyzable, roots, progress=None, language=None, indirect=None, effects=None,
+            noreturn=()):
     """Contracts for every analyzable body reachable from `roots`.
 
     `targets[addr]` lists a function's direct CALL targets, `prepared[addr]` is
@@ -640,7 +668,7 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
             # No call into the component: one pass is the fixed point.
             for addr in comp:
                 if addr in firs:
-                    contracts[addr] = summarize(firs[addr], lookup, cells, indirect, effects)
+                    contracts[addr] = summarize(firs[addr], lookup, cells, indirect, effects, noreturn)
                     done += 1
                     if progress is not None:
                         progress(done, len(needed))
@@ -651,7 +679,7 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
             for addr in comp:
                 if addr not in firs:
                     continue
-                new = summarize(firs[addr], lookup, cells, indirect, effects)
+                new = summarize(firs[addr], lookup, cells, indirect, effects, noreturn)
                 current = live.get(addr)
                 if current is None or new != current:
                     live[addr] = new

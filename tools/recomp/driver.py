@@ -151,7 +151,8 @@ def _prepare(task):
                     production.ProductionRequest(ctx.settings.emit, ctx.known, callee_contracts,
                         checked_returns, frozenset(private_targets) if selected else frozenset(), selected,
                         mode_sites.get(addr), entry_verification.get(addr),
-                        selection.input_arguments), ctx.artifacts)
+                        selection.input_arguments,
+                        indirect_contracts=analysis.indirect_contracts), ctx.artifacts)
             except (SSAError, LiftError) as error:
                 reason = str(error)
             else:
@@ -441,7 +442,15 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
                 calls, prepared,
                 analyzable=lambda a: bool(scanned.get(a) and scanned[a].register_facts is not None
                                           and a not in helpers and a not in conservative),
-                roots=roots, indirect=indirect_targets, effects=settings.call_effects)
+                roots=roots, indirect=indirect_targets, effects=settings.call_effects,
+                noreturn=ctx.program.noreturn)
+        indirect_contracts = {}
+        if indirect_targets and contracts:
+            for row in scanned.values():
+                if row.register_facts:
+                    indirect_contracts.update(call_contracts.indirect_site_contracts(
+                        row.register_facts, contracts.get, indirect_targets, settings.call_effects,
+                        ctx.program.noreturn))
         phase("contracts")
         private_targets, private_rejections = {}, {}
         register_uses = {}
@@ -465,7 +474,8 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
         phase("private candidates")
 
         analysis = ProgramAnalysis(frozenset(helpers), FrozenMap.of(internal), FrozenMap.of(contracts),
-                                   FrozenMap.of(mode_sites), FrozenMap.of(entry_verification))
+                                   FrozenMap.of(mode_sites), FrozenMap.of(entry_verification),
+                                   FrozenMap.of(indirect_contracts))
         input_arguments = dict(settings.private_input_registers)
         selection = Selection(FrozenMap.of(private_targets), frozenset(checked_returns),
                               frozenset(selected_callers), frozenset(known_modes), FrozenMap.of(private_rejections),

@@ -83,14 +83,16 @@ def flag_publication(s, state, required, record, first_keys, defines, bits):
     return FlagPublication(record, mask, covered, roots)
 
 
-def calls(s, publications, known_before, resident_before, contracts, kept, lane_field, never_skip, private, flag_keys):
+def calls(s, publications, known_before, resident_before, contracts, kept, lane_field, never_skip,
+          private, flag_keys, indirect_contracts):
     result = {}
     for b in s.blocks.values():
         for v in b.ops:
-            if v.opc != "CALL":
+            if v.opc not in ("CALL", "CALLIND"):
                 continue
             required = publications[v.id]
-            contract = contracts.get(v.data)
+            contract = (contracts.get(v.data) if v.opc == "CALL"
+                        else indirect_contracts.get(v.data[1]))
             skipped = frozenset(field for field in lane_field.values()
                                 if contract is not None and field not in never_skip
                                 and field not in contract.reads and field in contract.kills)
@@ -117,7 +119,7 @@ def publication_roots(s, state, required, groups, flags=None):
 
 def build(s, groups, facts, contracts, kept, lane_field, never_skip,
           private, return_fields, flag_keys, first_keys, defines, bits, lazy_flags, eager_events,
-          explicit_input_argument=None, call_input_arguments=()):
+          explicit_input_argument=None, call_input_arguments=(), indirect_contracts=()):
     input_keys = tuple(key for key, field in lane_field.items() if field == explicit_input_argument)
     call_input_arguments = dict(call_input_arguments)
     publications = {key: Publication(tuple(value)) for key, value in facts.required.items()}
@@ -141,18 +143,20 @@ def build(s, groups, facts, contracts, kept, lane_field, never_skip,
                     publication.required = tuple(dict.fromkeys((*publication.required, *input_keys)))
                 returns[v.id] = ReturnPlan(publication, Publication(fallback))
     call_plans = calls(s, {key: value.required for key, value in publications.items()},
-                       facts.known_before, facts.resident_before, contracts, kept, lane_field, never_skip, private, flag_keys)
+                       facts.known_before, facts.resident_before, contracts, kept, lane_field,
+                       never_skip, private, flag_keys, indirect_contracts)
     roots = []
     for b in s.blocks.values():
         for v in b.ops:
-            if v.opc == "CALL":
+            if v.opc in ("CALL", "CALLIND"):
                 call = call_plans[v.id]
                 publications[v.id] = call.publication
-                input_argument = call_input_arguments.get(v.data)
-                if v.data in private and input_argument:
-                    keys = tuple(key for key, field in lane_field.items() if field == input_argument)
-                    roots.extend(state_roots(s, b.snapshots[v.id], keys, groups))
-                if v.data not in private:
+                if v.opc == "CALL":
+                    input_argument = call_input_arguments.get(v.data)
+                    if v.data in private and input_argument:
+                        keys = tuple(key for key, field in lane_field.items() if field == input_argument)
+                        roots.extend(state_roots(s, b.snapshots[v.id], keys, groups))
+                if v.opc == "CALLIND" or v.data not in private:
                     roots.extend(state_roots(s, b.snapshots[v.id], call.guard, groups))
             if v.opc not in OBSERVES:
                 continue

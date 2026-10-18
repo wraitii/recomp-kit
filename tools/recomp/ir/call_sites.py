@@ -6,8 +6,8 @@ from .x87_cw import instruction_mnemonic
 
 Target = namedtuple("Target", "address provenance")
 CallSite = namedtuple("CallSite", "owner site kind targets import_key")
-Domain = namedtuple("Domain", "lookup join override import_value boundary indirect indirect_with_direct",
-                   defaults=(None, None, None, None, None, None, True))
+Domain = namedtuple("Domain", "lookup join override import_value boundary indirect indirect_with_direct indirect_lookup",
+                   defaults=(None, None, None, None, None, None, True, None))
 MISSING = object()
 
 
@@ -64,7 +64,8 @@ def resolve(row, domain, facts):
     if domain.indirect is not None and (domain.indirect_with_direct or not row.targets):
         found = domain.indirect(row, facts)
         if found is not MISSING:
-            values = [domain.lookup(target) for target in found]
+            lookup = domain.indirect_lookup or domain.lookup
+            values = [lookup(target) for target in found]
             return None if None in values else domain.join(values)
     value = domain.import_value(row) if domain.import_value is not None else MISSING
     if value is not MISSING:

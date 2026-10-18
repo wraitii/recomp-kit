@@ -89,7 +89,7 @@ MEMORY = ("memory", 0)
 
 
 def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None,
-          flag_off_name=None, kept_calls=None, string_writes=None):
+          flag_off_name=None, kept_calls=None, kept_indirect=None, string_writes=None):
     """Build SSA for reachable integer instructions using the supplied CFG.
 
     A direct CALL is admitted only when its literal target appears in
@@ -101,15 +101,16 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
     and are deliberately rejected. A ram varnode is a control target only;
     ordinary guest memory remains behind LOAD/STORE and the memory token.
 
-    `kept_calls` maps a direct-call target to register keys its callee preserves.
-    After such a call each kept field becomes a
-    ``CALL_KEEP`` of the call and the pre-call lanes instead of a reload.
-    `string_writes` maps a string helper to the register keys it writes; only
-    those are reloaded after it, and a helper writing no flag keeps the
-    pending descriptor.
+    `kept_calls` maps a direct-call target to register keys its callee preserves;
+    `kept_indirect` does the same for a CALLIND site. After such a call each
+    kept field becomes a ``CALL_KEEP`` of the call and the pre-call lanes
+    instead of a reload. `string_writes` maps a string helper to the register
+    keys it writes; only those are reloaded after it, and a helper writing no
+    flag keeps the pending descriptor.
     """
     call_targets = frozenset(call_targets)
     kept_calls = kept_calls or {}
+    kept_indirect = kept_indirect or {}
     string_writes = string_writes or {}
     if not fir.insns or len(fir.succ) != len(fir.insns):
         raise SSAError("empty function or invalid successor table")
@@ -292,20 +293,24 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
                     cc_active = None
                 continue
             if op.opc == "CALLIND":
-                # An opaque indirect call: publish the pre-call CPU (including
-                # the target), dispatch through the runtime, then reload every
-                # tracked register lane, flag and the memory token. The target
-                # expression was read before the return-address store that the
-                # lifted CALL sequence already emitted, so ESP-relative reads
-                # keep their instruction order.
+                # A bounded indirect call publishes only the fields its joined
+                # target contract needs, dispatches through the runtime, then
+                # keeps preserved lanes and reloads the rest. The target was
+                # read before the return-address store that the lifted CALL
+                # sequence already emitted, so ESP-relative reads keep their
+                # instruction order.
                 target = read(op.ins[0])
                 before = dict(state)
                 value = emit("CALLIND", 0, [state[MEMORY], target], data=(indirect_call_symbol, b.insn.addr))
                 b.snapshots[value.id] = before
                 b.cc_snapshots[value.id] = cc_active
                 state[MEMORY] = emit("MEMORY", 0, [value])
-                reload(value)
-                cc_active = None
+                kept = kept_indirect.get(b.insn.addr, frozenset())
+                reload(value, kept)
+                if flag_off_name and all(("register", off) in kept for off in flag_off_name):
+                    b.cc_keep = (before, dict(state))
+                else:
+                    cc_active = None
                 continue
             args = [read(v) for v in op.ins]
             primary = (ins_cc is not None and not cc_ready

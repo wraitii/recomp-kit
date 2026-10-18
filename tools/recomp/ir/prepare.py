@@ -449,25 +449,35 @@ def prepare(fir, request, *, lifter=None, normalized=None):
             key = ("register", off + n)
             lane_field[key] = name
             field_lanes.setdefault(name, set()).add(key)
-    kept_fields = {}
-    transparent_fields = {}
-    if call_contracts and not fir.seh:
+
+    def kept(contract, target=None):
+        fields_ = {field for field in CONTRACT_FIELDS
+                   if field not in CONTRACT_NEVER_SKIP
+                   and (field in contract.preserves or field not in contract.writes)}
+        if not set(CONTRACT_FLAGS) <= fields_:
+            fields_ -= set(CONTRACT_FLAGS)
+        keys = frozenset(key for field in fields_ for key in field_lanes[field])
+        transparent = frozenset(
+            key for field in fields_
+            if (field not in contract.reads and field not in contract.writes)
+            or (field == request.private_input_arguments.get(target)
+                and target in contract_calls)
+            for key in field_lanes[field])
+        return keys, transparent
+
+    kept_fields, transparent_fields = {}, {}
+    kept_sites, transparent_sites = {}, {}
+    if not fir.seh:
         for target, contract in call_contracts.items():
-            fields_ = {field for field in CONTRACT_FIELDS
-                       if field not in CONTRACT_NEVER_SKIP
-                       and (field in contract.preserves or
-                            field not in contract.writes)}
-            if not set(CONTRACT_FLAGS) <= fields_:
-                fields_ -= set(CONTRACT_FLAGS)
-            if fields_:
-                kept_fields[target] = frozenset(
-                    key for field in fields_ for key in field_lanes[field])
-                transparent_fields[target] = frozenset(
-                    key for field in fields_
-                    if (field not in contract.reads and field not in contract.writes)
-                    or (field == request.private_input_arguments.get(target)
-                        and target in contract_calls)
-                    for key in field_lanes[field])
+            keys, transparent = kept(contract, target)
+            if keys:
+                kept_fields[target] = keys
+                transparent_fields[target] = transparent
+        for site, contract in request.indirect_contracts.items():
+            keys, transparent = kept(contract)
+            if keys:
+                kept_sites[site] = keys
+                transparent_sites[site] = transparent
     tail_symbols = normalize_bindings(tail_symbols, "tail", allow_checked=False)
     seh_mark = any("orphan" in kinds for kinds in fir.seh.values())
     fir = cgi
@@ -496,7 +506,7 @@ def prepare(fir, request, *, lifter=None, normalized=None):
     s = build(cgi,
               register_groups=groups,
               call_targets=call_symbols, indirect_call_symbol=indirect_call_symbol,
-              flag_off_name=flag_off_name, kept_calls=kept_fields,
+              flag_off_name=flag_off_name, kept_calls=kept_fields, kept_indirect=kept_sites,
               string_writes={helper: written for helper, (written, _) in string_effects.items()})
     if any(key != MEMORY and key not in mapping for key in s.inputs):
         raise SSAError("unmapped runtime register")
@@ -518,8 +528,12 @@ def prepare(fir, request, *, lifter=None, normalized=None):
     # summaries prove which fields a boundary does not observe.
     kept_calls = {v.id: kept_fields[v.data] for b in s.blocks.values() for v in b.ops
                   if v.opc == "CALL" and v.data in kept_fields}
+    kept_calls.update({v.id: kept_sites[v.data[1]] for b in s.blocks.values() for v in b.ops
+                       if v.opc == "CALLIND" and v.data[1] in kept_sites})
     transparent_calls = {v.id: transparent_fields[v.data] for b in s.blocks.values() for v in b.ops
                          if v.opc == "CALL" and v.data in transparent_fields}
+    transparent_calls.update({v.id: transparent_sites[v.data[1]] for b in s.blocks.values() for v in b.ops
+                              if v.opc == "CALLIND" and v.data[1] in transparent_sites})
     string_events = {v.id: string_effects[v.data["helper"]] for b in s.blocks.values() for v in b.ops
                      if v.opc == "STRINGOP" and v.data["helper"] in string_effects}
     transparent_calls.update({ident: untouched for ident, (_, untouched) in string_events.items()})
@@ -536,7 +550,8 @@ def prepare(fir, request, *, lifter=None, normalized=None):
                                     contract_calls, return_fields, flag_keys, flag_first_key,
                                     CC_DEFINES, CC_BIT_VALUES, lazy_flags, CC_EAGER_EVENTS,
                                     request.layout.input_argument if request.layout else None,
-                                    request.private_input_arguments)
+                                    request.private_input_arguments,
+                                    indirect_contracts=request.indirect_contracts)
     live = simplify(s, transfers.live_publications, canonical=False, extra_roots=transfers.roots,
                     removable=frozenset(("CALL_RELOAD", "CALL_KEEP")), groups=groups)
     reads_entry_flags = frozenset(
@@ -555,7 +570,8 @@ def prepare(fir, request, *, lifter=None, normalized=None):
                     for i, summary in cc_calls.items()}
         cc_calls.update({b.index: flag_region.REMOVE for b in s.blocks.values()
                          for v in b.ops
-                         if v.opc == "CALL" and flag_keys <= set(kept_calls.get(v.id, ()))})
+                         if v.opc in ("CALL", "CALLIND")
+                         and flag_keys <= set(kept_calls.get(v.id, ()))})
     if fir.entries:
         cc_entry = flag_region.SETTLE
     elif reads_entry_flags:

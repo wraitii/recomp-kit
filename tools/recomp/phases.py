@@ -23,6 +23,7 @@ class ProgramAnalysis:
     contracts: FrozenMap
     mode_sites: FrozenMap
     entry_verification: FrozenMap
+    indirect_contracts: FrozenMap = FrozenMap()
 
     def for_addresses(self, addresses, calls=None):
         targets = {target for addr in addresses for target in calls[addr]} if calls is not None else set()

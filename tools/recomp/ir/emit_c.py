@@ -296,10 +296,10 @@ def emit_prepared(prepared, external_entry=False):
                 elif v.opc in ("CALL_RELOAD", "CALL_KEEP"):
                     lines.extend(boundary.event(v))
                 elif v.opc == "CALLIND":
-                    # Publish the required pre-call state, including the target,
-                    # then dispatch through the runtime. The return address was
-                    # already stored by the preceding lifted CALL sequence, and the
-                    # SSA builder reloads every tracked lane/flag afterward.
+                    # Publish the joined contract's pre-call state, including the
+                    # target, then dispatch through the runtime. The return address
+                    # was already stored by the preceding lifted CALL sequence, and
+                    # the SSA builder keeps or reloads each lane/flag afterward.
                     lines.extend(boundary.event(v))
                 elif v.opc == "STRINGOP":
                     # Byte-audited string instruction. Publication before the helper

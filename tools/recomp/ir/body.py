@@ -105,6 +105,7 @@ class BodyRequest:
     call_symbols: FrozenMap = field(default_factory=FrozenMap)
     tail_symbols: FrozenMap = field(default_factory=FrozenMap)
     call_contracts: FrozenMap = field(default_factory=FrozenMap)
+    indirect_contracts: FrozenMap = field(default_factory=FrozenMap)
     checked_calls: frozenset = frozenset()
     contract_calls: frozenset = frozenset()
     private_input_arguments: FrozenMap = field(default_factory=FrozenMap)
@@ -114,7 +115,7 @@ class BodyRequest:
     report_calls: bool = False
 
     def __post_init__(self):
-        for name in ("call_symbols", "tail_symbols", "call_contracts", "mode_sites"):
+        for name in ("call_symbols", "tail_symbols", "call_contracts", "indirect_contracts", "mode_sites"):
             object.__setattr__(self, name, FrozenMap.of(getattr(self, name)))
         for name in ("checked_calls", "contract_calls"):
             object.__setattr__(self, name, frozenset(getattr(self, name)))

@@ -40,9 +40,10 @@ class ProductionRequest:
     mode_sites: FrozenMap = FrozenMap()
     entry_verify: object | None = None
     private_input_arguments: FrozenMap = FrozenMap()
+    indirect_contracts: FrozenMap = FrozenMap()
 
     def __post_init__(self):
-        for name in ("contracts", "mode_sites"):
+        for name in ("contracts", "indirect_contracts", "mode_sites"):
             object.__setattr__(self, name, FrozenMap.of(getattr(self, name)))
         for name in ("known", "checked_returns", "contract_calls"):
             object.__setattr__(self, name, frozenset(getattr(self, name)))
@@ -66,6 +67,7 @@ def prepare_ssa(tr, lifter, fn, entries, request, artifacts=None):
     body = BodyRequest(c_symbols.body_symbol(variant, fn.addr), variant, request.policy,
                        call_symbols=calls, tail_symbols=tails,
                        call_contracts={t: request.contracts[t] for t in calls if t in request.contracts},
+                       indirect_contracts=request.indirect_contracts,
                        checked_calls=set(calls) & request.checked_returns,
                        contract_calls=set(calls) & request.contract_calls if not fir.entries and not fir.seh else (),
                        private_input_arguments=request.private_input_arguments,
