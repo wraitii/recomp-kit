@@ -17,7 +17,7 @@ def forward(s):
         value = s.resolve(value)
         if value.id in shapes:
             return shapes[value.id]
-        result = (value.id, 0)
+        result = (value, 0)
         if value.opc in ("INT_ADD", "INT_SUB") and value.size == 4:
             a, b = map(s.resolve, value.args)
             if b.opc == "CONST":
@@ -34,7 +34,7 @@ def forward(s):
         if value.id in bounds:
             return bounds[value.id]
         root, offset = address(value)
-        base = s.values[root]
+        base = root
         result = (root, offset, offset)
         if base.opc == "INT_AND" and base.size == 4:
             a, b = map(s.resolve, base.args)

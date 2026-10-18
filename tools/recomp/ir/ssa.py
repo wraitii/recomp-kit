@@ -84,6 +84,50 @@ class SSA:
                         self.aliases[phi.id] = args.pop()
                         changed = True
 
+    def compact(self):
+        """Resolve graph references and densely renumber before building ID-based plans."""
+        resolve = self.resolve
+        values = [v for v in self.values if resolve(v) is v]
+
+        def state(lanes):
+            for key, value in lanes.items():
+                lanes[key] = resolve(value)
+
+        for value in values:
+            value.args = tuple(resolve(arg) for arg in value.args)
+        state(self.inputs)
+        self.entry_ops = [v for v in self.entry_ops if resolve(v) is v]
+        records = set()
+        for block in self.blocks.values():
+            block.phis = [v for v in block.phis if resolve(v) is v]
+            block.ops = [v for v in block.ops if resolve(v) is v]
+            state(block.state)
+            state(block.exit)
+            for snapshots in (block.snapshots, block.reloads):
+                for lanes in snapshots.values():
+                    state(lanes)
+            if block.cc_keep is not None:
+                for lanes in block.cc_keep:
+                    state(lanes)
+            records.update((block.cc_entry, block.cc_exit, *block.cc_snapshots.values()))
+        records.discard(None)
+        for record in records:
+            for name in ("op", "a", "b", "carry", "res"):
+                value = getattr(record, name)
+                if value is not None:
+                    setattr(record, name, resolve(value))
+            state(record.flags)
+        self.values = values
+        self.aliases.clear()
+        identifiers = {v.id: i for i, v in enumerate(self.values)}
+        for block in self.blocks.values():
+            for name in ("snapshots", "reloads", "cc_snapshots"):
+                snapshots = getattr(block, name)
+                setattr(block, name, {identifiers[ident]: snapshot
+                                     for ident, snapshot in snapshots.items() if ident in identifiers})
+        for ident, value in enumerate(self.values):
+            value.id = ident
+
 
 MEMORY = ("memory", 0)
 
@@ -198,13 +242,18 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
             predecessors[j].append(i)
     reload_groups = [tuple(group) for group in register_groups
                      if len(group) > 1 and all(key in s.inputs for key in group)]
-    for i in sorted(reachable):
-        b = Block(i, fir.insns[i])
-        s.blocks[i] = b
+    s.blocks = {i: Block(i, fir.insns[i]) for i in sorted(reachable)}
+    from .coalesce import initialize, connect
+    joins = initialize(s, reload_groups, predecessors)
+    for i, b in s.blocks.items():
+        grouped_phis, b.phis = b.phis, []
         for key in keys:
+            if key in b.state:
+                continue
             phi = s.value("PHI", s.inputs[key].size, data=(key, predecessors[i]))
             b.phis.append(phi)
             b.state[key] = phi
+        b.phis.extend(grouped_phis)
     for i, b in s.blocks.items():
         state, temps = dict(b.state), {}
         ins_cc = b.insn.cc
@@ -378,11 +427,11 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
             raise SSAError("instruction requires one fallthrough successor")
     for i, b in s.blocks.items():
         for phi in b.phis:
+            if phi.size > 1:
+                continue
             key, preds = phi.data
             phi.args = tuple(s.inputs[key] if p == -1 else s.blocks[p].exit[key] for p in preds)
-    if register_groups:
-        from .coalesce import registers
-        registers(s, register_groups)
+    connect(s, joins)
     s.simplify_phis()
     if flag_off_name:
         from .cc_carry import carry

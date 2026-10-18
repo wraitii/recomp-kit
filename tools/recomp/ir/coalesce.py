@@ -8,15 +8,15 @@ This changes representation only, without inferring dead upper register bits.
 from .operations import TERMINATORS
 
 
-def registers(s, groups):
-    """Coalesce complete groups before the builder simplifies their lane phis."""
+def initialize(s, groups, predecessors):
+    """Create wide inputs and joins with byte lanes for instruction state."""
     s.entry_ops = []
-    positions = {i: next((n for n, v in enumerate(b.ops) if v.opc in TERMINATORS), len(b.ops))
-                 for i, b in s.blocks.items()}
+    joins = []
     for keys in groups:
         keys = tuple(keys)
         if len(keys) <= 1 or not all(key in s.inputs for key in keys):
             continue
+        start = len(s.values)
         source = s.value("INPUT", len(keys), data=keys[0])
         for n, key in enumerate(keys):
             byte = s.value("BYTE", 1, [source], n)
@@ -24,16 +24,25 @@ def registers(s, groups):
             s.aliases[s.inputs[key].id] = byte
         phis = {}
         for i, b in s.blocks.items():
-            lanes = [b.state[key] for key in keys]
-            predecessors = lanes[0].data[1]
-            phi = s.value("PHI", len(keys), data=(keys, predecessors))
+            phi = s.value("PHI", len(keys), data=(keys, predecessors[i]))
             phis[i] = phi
             b.phis.append(phi)
             bytes_ = [s.value("BYTE", 1, [phi], n) for n in range(len(keys))]
             b.ops[:0] = bytes_
-            positions[i] += len(bytes_)
-            for lane, byte in zip(lanes, bytes_):
-                s.aliases[lane.id] = byte
+            b.state.update(zip(keys, bytes_))
+        joins.append((keys, source, phis, start, len(s.values)))
+    return joins
+
+
+def connect(s, joins):
+    if not joins:
+        return
+    values = s.values[:joins[0][3]] + s.values[joins[-1][4]:]
+    positions = {i: next((n for n, v in enumerate(b.ops) if v.opc in TERMINATORS), len(b.ops))
+                 for i, b in s.blocks.items()}
+    for keys, source, phis, start, end in joins:
+        values.extend(s.values[start:end])
+        packed_start = len(s.values)
         for i, phi in phis.items():
             args = []
             for p in phi.data[1]:
@@ -46,3 +55,5 @@ def registers(s, groups):
                 positions[p] += 1
                 args.append(packed)
             phi.args = tuple(args)
+        values.extend(s.values[packed_start:])
+    s.values = values

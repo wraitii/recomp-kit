@@ -7,6 +7,7 @@ all incoming paths prove its current value already resides in the CPU. Facts
 are relative to block entry/exit state, so a loop phi's previous iteration can
 never be mistaken for its newly assigned value. Helpers invalidate facts.
 """
+from collections import deque
 from dataclasses import dataclass
 from .operations import EXITS, OBSERVES, OPAQUE
 
@@ -79,103 +80,111 @@ Starting with no facts gives a conservative least fixed point for loops.
     known_before = {}
     resident_before = {}
     returned_lazy = frozenset(returned_lazy)
-    changed = True
-    while changed:
+    todo = deque(s.blocks)
+    pending = set(s.blocks)
+    while todo:
+        i = todo.popleft()
+        pending.remove(i)
+        b = s.blocks[i]
         changed = False
-        for i, b in s.blocks.items():
-            known = {n: values(b.state, keys) for n, keys in enumerate(groups)
-                     if all((p == -1 and not any(key in lazy_fields for key in keys))
-                            or (p != -1 and n in known_exit[p]) for p in predecessors[i])}
-            resident = {n: values(b.state, keys) for n, keys in enumerate(groups)
-                        if all(p == -1 or n in resident_exit[p] for p in predecessors[i])}
-            for v in b.ops:
-                if v.opc not in OBSERVES:
+        known = {n: values(b.state, keys) for n, keys in enumerate(groups)
+                 if all((p == -1 and not any(key in lazy_fields for key in keys))
+                        or (p != -1 and n in known_exit[p]) for p in predecessors[i])}
+        resident = {n: values(b.state, keys) for n, keys in enumerate(groups)
+                    if all(p == -1 or n in resident_exit[p] for p in predecessors[i])}
+        for v in b.ops:
+            if v.opc not in OBSERVES:
+                continue
+            state = b.exit if v.opc in EXITS else b.snapshots[v.id]
+            access = v.opc in RELAXABLE_ACCESS
+            held = kept.get(v.id, ()) if kept else ()
+            saved = preserved.get(v.id, ()) if preserved else ()
+            kept_groups, kept_known, kept_resident = set(), set(), set()
+            required = []
+            already_known = []
+            already_resident = []
+            for n, keys in enumerate(groups):
+                current = values(state, keys)
+                if known.get(n) == current:
+                    already_known.extend(keys)
+                if resident.get(n) == current:
+                    already_resident.extend(keys)
+                if access and access_fields is not None and not any(key in access_fields for key in keys):
+                    # A skipped snapshot does not make a publication fact.
+                    # The older CPU value stays known until a real observer.
                     continue
-                state = b.exit if v.opc in EXITS else b.snapshots[v.id]
-                access = v.opc in RELAXABLE_ACCESS
-                held = kept.get(v.id, ()) if kept else ()
-                saved = preserved.get(v.id, ()) if preserved else ()
-                kept_groups, kept_known, kept_resident = set(), set(), set()
-                required = []
-                already_known = []
-                already_resident = []
-                for n, keys in enumerate(groups):
-                    current = values(state, keys)
+                if held and all(key in held for key in keys):
+                    kept_groups.add(n)
                     if known.get(n) == current:
-                        already_known.extend(keys)
+                        kept_known.add(n)
                     if resident.get(n) == current:
-                        already_resident.extend(keys)
-                    if access and access_fields is not None and not any(key in access_fields for key in keys):
-                        # A skipped snapshot does not make a publication fact.
-                        # The older CPU value stays known until a real observer.
-                        continue
-                    if held and all(key in held for key in keys):
-                        kept_groups.add(n)
-                        if known.get(n) == current:
-                            kept_known.add(n)
-                        if resident.get(n) == current:
-                            kept_resident.add(n)
-                        continue
-                    lazy = all(key in lazy_fields for key in keys)
-                    available = resident if lazy and v.opc not in eager_events else known
-                    if available.get(n) != current:
-                        required.extend(keys)
-                    if v.opc != "BRANCHIND":
-                        # Only a table jump's default arm publishes; its case
-                        # edges leave the CPU as it was.
-                        resident[n] = current
-                        if lazy and v.opc not in eager_events:
-                            known.pop(n, None)
-                        else:
-                            known[n] = current
-                if v.opc not in eager_events and any(key in lazy_fields for key in required):
-                    required.extend(key for keys in groups for key in keys
-                                    if key in lazy_fields and key not in required)
-                publications[v.id] = tuple(required)
-                known_before[v.id] = tuple(already_known)
-                resident_before[v.id] = tuple(already_resident)
-                written = clobbers.get(v.id) if clobbers else None
-                if written is not None:
-                    reloads = b.reloads.get(v.id, {})
-                    for n, keys in enumerate(groups):
-                        if not any(key in written for key in keys):
-                            continue
+                        kept_resident.add(n)
+                    continue
+                lazy = all(key in lazy_fields for key in keys)
+                available = resident if lazy and v.opc not in eager_events else known
+                if available.get(n) != current:
+                    required.extend(keys)
+                if v.opc != "BRANCHIND":
+                    # Only a table jump's default arm publishes; its case
+                    # edges leave the CPU as it was.
+                    resident[n] = current
+                    if lazy and v.opc not in eager_events:
                         known.pop(n, None)
-                        resident.pop(n, None)
-                        if all(key in reloaded and key in reloads for key in keys):
+                    else:
+                        known[n] = current
+            if v.opc not in eager_events and any(key in lazy_fields for key in required):
+                required.extend(key for keys in groups for key in keys
+                                if key in lazy_fields and key not in required)
+            publications[v.id] = tuple(required)
+            known_before[v.id] = tuple(already_known)
+            resident_before[v.id] = tuple(already_resident)
+            written = clobbers.get(v.id) if clobbers else None
+            if written is not None:
+                reloads = b.reloads.get(v.id, {})
+                for n, keys in enumerate(groups):
+                    if not any(key in written for key in keys):
+                        continue
+                    known.pop(n, None)
+                    resident.pop(n, None)
+                    if all(key in reloaded and key in reloads for key in keys):
+                        known[n] = values(reloads, keys)
+                        resident[n] = known[n]
+            elif v.opc in OPAQUE:
+                # A division error handler, an opaque callee and the string
+                # helper's fault path may leave arbitrary CPU state behind,
+                # so no must-fact survives.
+                saved_resident = dict(resident)
+                known.clear()
+                resident.clear()
+                reloads = b.reloads.get(v.id, {})
+                for n, keys in enumerate(groups):
+                    if n in kept_groups:
+                        if n in kept_known and not any(key in lazy_fields for key in keys):
                             known[n] = values(reloads, keys)
-                            resident[n] = known[n]
-                elif v.opc in OPAQUE:
-                    # A division error handler, an opaque callee and the string
-                    # helper's fault path may leave arbitrary CPU state behind,
-                    # so no must-fact survives.
-                    saved_resident = dict(resident)
-                    known.clear()
-                    resident.clear()
-                    reloads = b.reloads.get(v.id, {})
-                    for n, keys in enumerate(groups):
-                        if n in kept_groups:
-                            if n in kept_known and not any(key in lazy_fields for key in keys):
-                                known[n] = values(reloads, keys)
-                            if n in kept_resident:
-                                resident[n] = values(reloads, keys)
-                        elif all(key in saved and key in lazy_fields and key in reloads for key in keys):
-                            current = values(state, keys)
-                            if saved_resident.get(n) == current:
-                                resident[n] = values(reloads, keys)
-                        elif all(key in reloaded and key in reloads for key in keys):
-                            known[n] = values(reloads, keys)
-                            resident[n] = known[n]
-                        elif v.id in returned_lazy and all(key in lazy_fields and key in reloads for key in keys):
+                        if n in kept_resident:
                             resident[n] = values(reloads, keys)
-            outgoing = {n for n, keys in enumerate(groups)
-                        if known.get(n) == values(b.exit, keys)}
-            resident_outgoing = {n for n, keys in enumerate(groups)
-                                 if resident.get(n) == values(b.exit, keys)}
-            if resident_outgoing != resident_exit[i]:
-                resident_exit[i] = resident_outgoing
-                changed = True
-            if outgoing != known_exit[i]:
-                known_exit[i] = outgoing
-                changed = True
+                    elif all(key in saved and key in lazy_fields and key in reloads for key in keys):
+                        current = values(state, keys)
+                        if saved_resident.get(n) == current:
+                            resident[n] = values(reloads, keys)
+                    elif all(key in reloaded and key in reloads for key in keys):
+                        known[n] = values(reloads, keys)
+                        resident[n] = known[n]
+                    elif v.id in returned_lazy and all(key in lazy_fields and key in reloads for key in keys):
+                        resident[n] = values(reloads, keys)
+        outgoing = {n for n, keys in enumerate(groups)
+                    if known.get(n) == values(b.exit, keys)}
+        resident_outgoing = {n for n, keys in enumerate(groups)
+                             if resident.get(n) == values(b.exit, keys)}
+        if resident_outgoing != resident_exit[i]:
+            resident_exit[i] = resident_outgoing
+            changed = True
+        if outgoing != known_exit[i]:
+            known_exit[i] = outgoing
+            changed = True
+        if changed:
+            for j in sorted(set(successors[i])):
+                if j not in pending:
+                    pending.add(j)
+                    todo.append(j)
     return PublicationPlan(publications, known_before, resident_before)

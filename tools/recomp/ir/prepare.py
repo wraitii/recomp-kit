@@ -504,6 +504,7 @@ def prepare(fir, request, *, lifter=None, normalized=None):
     if not fir.entries and not seh_mark:
         from .preservation import forward
         forward(s)
+    s.compact()
     # DIVERGENCE(original): [ssa-state-locals] guest load/store faults
     # and store watch callbacks may observe earlier GPR/flag values
     # under the agreed performance-mode policy. Keep diagnostic
