@@ -20,7 +20,7 @@ def main():
     if a.readback_counters:a.readback_timings=True
     o=a.out.resolve();o.mkdir(parents=True,exist_ok=False)
     for n in ('profile','user-mods'): (o/n).mkdir()
-    (o/'profile/mod-settings.json').write_text(json.dumps({'host.display/rendering':0,'host.display/wide_view':1,'host.display/frame_limit':3,'host.display/performance_overlay':0}))
+    (o/'profile/mod-settings.json').write_text(json.dumps({'host.display/performance_overlay':0}))
     a.binary=a.binary or a.game_dir/'build/recomp/recomp_smoke'
     a.core=a.core or a.game_dir/'build/recomp/mods/core'
     script=(a.game_dir/'smoke/gate-c.script').read_text().split('# Let the selected shaman finish')[0]

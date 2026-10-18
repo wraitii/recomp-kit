@@ -2213,99 +2213,6 @@ static uint32_t g_fake_time = 0;
 static uint32_t fake_clock() {
     return g_fake_time;
 }
-static int g_display_fps = 0;
-extern "C" int mods_display_fps() {
-    return g_display_fps;
-}
-
-static void test_native_draw_waits(X86 *c) {
-    section("native cap replaces both original draw waits without changing simulation time");
-    // These are synthetic shim calls, so even unused configured sites can
-    // exercise the clock hook without executing the image's draw loop.
-    // A game that has no frame clock configures every site as 0.
-    if (RECOMP_HOOK_FRAME_CLOCK_BEGIN == 0 || RECOMP_HOOK_FRAME_CLOCK_WAIT == 0 ||
-        RECOMP_HOOK_FRAME_CLOCK_WAIT_CLAMP == 0 ||
-        !gm_valid(RECOMP_HOOK_FRAME_CLOCK_WAIT_DEADLINE, 4) ||
-        !gm_valid(RECOMP_HOOK_FRAME_CLOCK_CLAMP_DEADLINE, 4)) {
-        printf("  [SKIP] frame clock hooks are sentinels for this game\n");
-        ++g_skips;
-        return;
-    }
-    const uint32_t canaries = scratch_block(32);
-    const uint32_t old_ret = g_fake_ret, old_edi = c->r[R_EDI];
-    const uint8_t old_limit = rd8(canaries), old_flags = rd8(canaries + 4);
-    const uint32_t addresses[] = {RECOMP_HOOK_FRAME_CLOCK_CLAMP_DEADLINE,
-                                  RECOMP_HOOK_FRAME_CLOCK_WAIT_DEADLINE, canaries + 8,
-                                  canaries + 12, canaries + 16};
-    uint32_t saved[5];
-    for (int i = 0; i < 5; ++i)
-        saved[i] = rd32(addresses[i]);
-    host_set_time_source(fake_clock);
-    g_fake_time = 1000;
-    wr8(canaries, 40);
-    wr8(canaries + 4, 8);
-    wr32(canaries + 8, 1234);
-    wr32(canaries + 12, 83);
-    wr32(canaries + 16, 99);
-    for (int rate : {40, 60, 120}) {
-        g_display_fps = rate;
-        for (uint32_t caller : {RECOMP_HOOK_FRAME_CLOCK_WAIT, RECOMP_HOOK_FRAME_CLOCK_WAIT_CLAMP}) {
-            g_fake_ret = RECOMP_HOOK_FRAME_CLOCK_BEGIN;
-            check(call_import(c, "KERNEL32.dll", "GetTickCount", {}) == 1000 && rd8(canaries) == 40,
-                  "%d Hz pacing preserves unrelated storage and the real clock", rate);
-            wr32(RECOMP_HOOK_FRAME_CLOCK_CLAMP_DEADLINE, 1016);
-            wr32(RECOMP_HOOK_FRAME_CLOCK_WAIT_DEADLINE, 1025);
-            c->r[R_EDI] = 60;
-            g_fake_ret = caller;
-            uint32_t now = call_import(c, "KERNEL32.dll", "GetTickCount", {});
-            const bool alternate = caller == RECOMP_HOOK_FRAME_CLOCK_WAIT_CLAMP;
-            check(now == 1000 && rd32(alternate ? RECOMP_HOOK_FRAME_CLOCK_CLAMP_DEADLINE
-                                                : RECOMP_HOOK_FRAME_CLOCK_WAIT_DEADLINE) == now,
-                  "%08x retires its old wait at %d Hz, without accelerating time", caller, rate);
-            check(rd32(alternate
-                           ? RECOMP_HOOK_FRAME_CLOCK_WAIT_DEADLINE
-                           : RECOMP_HOOK_FRAME_CLOCK_CLAMP_DEADLINE) == (alternate ? 1025u : 1016u),
-                  "only the active draw deadline changes");
-            check(c->r[R_EDI] == (alternate ? uint32_t(rate) : 60u),
-                  "alternate wait uses the selected cap for the measured rendering-rate ceiling");
-            check(rd32(canaries + 8) == 1234 && rd32(canaries + 12) == 83 &&
-                      rd32(canaries + 16) == 99 && rd8(canaries + 4) == 8,
-                  "unrelated timing and flag canaries stay intact");
-        }
-    }
-    wr32(RECOMP_HOOK_FRAME_CLOCK_CLAMP_DEADLINE, 1016);
-    wr32(RECOMP_HOOK_FRAME_CLOCK_WAIT_DEADLINE, 1025);
-    c->r[R_EDI] = 60;
-    g_fake_ret = GUEST_RETURN_SENTINEL;
-    check(call_import(c, "KERNEL32.dll", "GetTickCount", {}) == 1000 &&
-              rd32(RECOMP_HOOK_FRAME_CLOCK_CLAMP_DEADLINE) == 1016 &&
-              rd32(RECOMP_HOOK_FRAME_CLOCK_WAIT_DEADLINE) == 1025 && c->r[R_EDI] == 60,
-          "unrelated clock calls cannot alter draw pacing");
-    for (const char *pin : {"RECOMP_PIN_CLOCK"}) {
-        os_setenv(pin, "1000,8");
-        g_fake_ret = RECOMP_HOOK_FRAME_CLOCK_WAIT_CLAMP;
-        call_import(c, "KERNEL32.dll", "GetTickCount", {});
-        check(rd32(RECOMP_HOOK_FRAME_CLOCK_CLAMP_DEADLINE) == 1016 && c->r[R_EDI] == 60,
-              "%s retains original fixture behavior", pin);
-        os_unsetenv(pin);
-    }
-    g_display_fps = 0;
-    g_fake_ret = RECOMP_HOOK_FRAME_CLOCK_BEGIN;
-    call_import(c, "KERNEL32.dll", "GetTickCount", {});
-    check(rd8(canaries) == 40, "original mode preserves unrelated storage");
-    g_fake_ret = RECOMP_HOOK_FRAME_CLOCK_WAIT_CLAMP;
-    call_import(c, "KERNEL32.dll", "GetTickCount", {});
-    check(rd32(RECOMP_HOOK_FRAME_CLOCK_CLAMP_DEADLINE) == 1016 && c->r[R_EDI] == 60,
-          "original mode keeps its alternate wait and rate ceiling");
-    host_clear_time_source();
-    g_fake_ret = old_ret;
-    c->r[R_EDI] = old_edi;
-    wr8(canaries, old_limit);
-    wr8(canaries + 4, old_flags);
-    for (int i = 0; i < 5; ++i)
-        wr32(addresses[i], saved[i]);
-}
-
 static uint32_t g_callback_hits = 0;
 static uint32_t g_callback_args[4] = {0, 0, 0, 0};
 
@@ -8130,7 +8037,6 @@ int main(int argc, char **argv) {
     test_mmio(c);
     test_gdi_and_com(c);
     test_cxx_throw_description(c);
-    test_native_draw_waits(c);
     test_midi(c);
     test_windows(c);
     test_synchronous_geometry(c);

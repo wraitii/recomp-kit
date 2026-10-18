@@ -1,6 +1,8 @@
 // editor.cpp - the on-screen controls layout editor's model (editor.h).
 #include "editor.h"
 
+#include "../keypad_layout.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -140,14 +142,10 @@ bool usable_name(const std::string &name) {
 
 } // namespace
 
-void Editor::open(const Layout &layout, Form form, const MappedTable &mapped, bool native,
-                  bool snap) {
+void Editor::open(const Layout &layout, Form form, bool snap) {
     open_ = true;
     layout_ = layout;
     form_ = form;
-    mapped_ = mapped;
-    mapped_changed_ = false;
-    native_ = native;
     snap_ = snap;
     // The band depends on where this layout's anchors resolve, so it is
     // taken again now the layout is known.
@@ -161,7 +159,7 @@ void Editor::close() {
     reset_transient();
 }
 
-// Everything but the edited layout, the binding table and the settings:
+// Everything but the edited layout and the settings:
 // selection, gestures, picker and every pending result.
 void Editor::reset_transient() {
     sel_group_ = sel_control_ = -1;
@@ -778,7 +776,6 @@ void Editor::choose(const PickerItem &item) {
     if (kind != Picker::Bind || !selection_valid())
         return;
     Control &c = layout_.groups[sel_group_].controls[sel_control_];
-    std::string err;
     switch (c.kind) {
     case Kind::Key:
         if (int sc = scancode_from_name(v)) {
@@ -786,28 +783,19 @@ void Editor::choose(const PickerItem &item) {
             c.label.clear();
         }
         break;
-    case Kind::Button:
-        if (native_) {
-            PadButton b;
-            if (pad_button_from_name(v, &b))
-                c.button = b;
-        } else if (parse_mapped(std::string(pad_button_name(c.button)) + "=" + v, &mapped_, &err)) {
-            mapped_changed_ = true;
-        }
+    case Kind::Button: {
+        PadButton b;
+        if (pad_button_from_name(v, &b))
+            c.button = b;
         break;
-    case Kind::Stick:
-        if (parse_mapped((c.stick == 0 ? "left_stick=" : "right_stick=") + v, &mapped_, &err))
-            mapped_changed_ = true;
-        break;
-    case Kind::Dpad:
-        if (parse_mapped("dpad=" + v, &mapped_, &err))
-            mapped_changed_ = true;
-        break;
+    }
     case Kind::Toggle:
         c.target = v;
         break;
     case Kind::Action:
         c.action = v;
+        break;
+    default:
         break;
     }
     changed();
@@ -825,28 +813,11 @@ void Editor::bind_items() {
             add_item(&items, k, k);
         break;
     case Kind::Button:
-        if (native_) {
-            for (int b = 0; b < int(PadButton::Count); ++b)
-                add_item(&items, pad_button_name(PadButton(b)), pad_button_name(PadButton(b)));
-        } else {
-            for (const char *t :
-                 {"none", "mouse_left", "mouse_right", "mouse_middle", "wheel_up", "wheel_down"})
-                add_item(&items, t, t);
-            for (const std::string &k : key_names())
-                add_item(&items, "key:" + k, "key:" + k);
-            add_item(&items, "action:settings", "action:settings");
-        }
-        break;
-    case Kind::Stick:
-        if (!native_)
-            for (const char *m :
-                 {"cursor", "arrows", "horizontal_arrows", "wasd", "scroll", "wheel", "none"})
-                add_item(&items, m, m);
+        for (int b = 0; b < int(PadButton::Count); ++b)
+            add_item(&items, pad_button_name(PadButton(b)), pad_button_name(PadButton(b)));
         break;
     case Kind::Dpad:
-        if (!native_)
-            for (const char *m : {"arrows", "wasd", "none"})
-                add_item(&items, m, m);
+    case Kind::Stick:
         break;
     case Kind::Toggle:
         for (const std::string &n : names_)

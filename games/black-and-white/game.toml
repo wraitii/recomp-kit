@@ -54,7 +54,7 @@ rows = ["window", "performance_overlay", "controls"]
 
 [controls]
 default_layout = "hidden"
-pad = "off"
+mobile_control = "mobile-only"
 
 [setup.versions.stock_1_2]
 label = "Black & White 1.2"

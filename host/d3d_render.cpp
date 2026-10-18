@@ -997,7 +997,6 @@ D3DRenderer::Impl::Impl(gpu::Device *device) : device_(device) {
     }
     hd_.pack.open(packPath);
     ok_ = true;
-    mods_display_texture_pack(uint32_t(hd_.pack.files.size()));
     // Preload the pack's priority list before the first game frame. Stop at
     // 75% of the budget, leaving headroom for textures encountered later.
     std::ifstream preload(std::filesystem::path(packPath) / "preload.txt");

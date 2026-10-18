@@ -44,8 +44,7 @@ PerformanceOverlay::~PerformanceOverlay() {
 
 // Rasterize a pacing snapshot into the overlay texture. The graph uses a fixed
 // 50 ms scale and marks samples exceeding the selected frame budget.
-void PerformanceOverlay::update(gpu::Device *device, const FramePacingSnapshot &s, int mode,
-                                int limit) {
+void PerformanceOverlay::update(gpu::Device *device, const FramePacingSnapshot &s, int mode) {
     const int used = mode == 2 ? height : 88;
     pixels_.assign(size_t(width) * used * 4, 0);
     Canvas c{pixels_, width, used};
@@ -57,18 +56,12 @@ void PerformanceOverlay::update(gpu::Device *device, const FramePacingSnapshot &
     c.text(10, 24, line, 235, 242, 255);
     snprintf(line, sizeof line, "GPU %4.1f ms  AGE %4.1f ms", s.gpu_ms, s.age_ms);
     c.text(10, 42, line, 204, 217, 237);
-    char cap[24];
-    if (limit)
-        snprintf(cap, sizeof cap, "CAP %d", limit);
-    else
-        snprintf(cap, sizeof cap, "ORIGINAL");
-    snprintf(line, sizeof line, "RPT %3.0f%% DROP %llu %s", s.repeat_percent,
-             (unsigned long long)s.drops, cap);
-    line[26] = 0;
+    snprintf(line, sizeof line, "RPT %3.0f%% DROP %llu", s.repeat_percent,
+             (unsigned long long)s.drops);
     c.text(10, 60, line, 204, 217, 237);
     if (mode == 2) {
         // Fixed 0..50ms axis from the bottom edge. A red bar means a missed budget.
-        const double budget = 1000.0 / (limit ? limit : 60);
+        const double budget = 1000.0 / 60.0;
         const int base = used - 13;
         c.fill(10, base, width - 20, 1, 51, 71, 92, 255);
         c.fill(10, base - int(std::min(50.0, budget) * .7), width - 20, 1, 102, 122, 140, 204);
@@ -93,12 +86,11 @@ void PerformanceOverlay::update(gpu::Device *device, const FramePacingSnapshot &
 }
 
 void PerformanceOverlay::draw(gpu::Device *device, gpu::CommandBuffer cb, gpu::Texture target,
-                              int w, int h, const FramePacingSnapshot &s, double now, int mode,
-                              int limit) {
+                              int w, int h, const FramePacingSnapshot &s, double now, int mode) {
     if (!mode || !device || !target || !cb || w <= 0 || h <= 0)
         return;
     if (!texture_ || mode != last_mode_ || now - refreshed_ >= .25 || device_ != device) {
-        update(device, s, mode, limit);
+        update(device, s, mode);
         refreshed_ = now;
         last_mode_ = mode;
     }

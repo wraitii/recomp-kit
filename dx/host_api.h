@@ -333,7 +333,7 @@ typedef struct HostPadEvent {
     uint8_t index;
     int32_t value;
 } HostPadEvent;
-/* 0 off, 1 mapped, 2 native (RECOMP_CONTROLS_PAD). Weak default: 0. */
+/* Native pad mode is 2 in the app; the weak default is 0 for headless/tests. */
 int host_pad_mode(void);
 /* Bit 0: serve DirectInput joystick; bit 1: serve XInput. Weak default: 0. */
 int host_pad_native_apis(void);

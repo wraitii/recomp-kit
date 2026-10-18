@@ -25,40 +25,19 @@ HEAP_BASE_DEFAULT = 0x01000000
 # controls' seven rows are one entry. [settings] rows names the ones a game
 # shows. Without the key a game shows every row. "keypad" is the pre-touch-
 # controls spelling of "controls"; SETTINGS_ROW_ALIASES keeps it loading.
-SETTINGS_ROWS = ("rendering", "ui_scale", "wide_view", "window", "resolution", "frame_limit",
-                 "performance_overlay", "textures", "filtering", "controls")
+SETTINGS_ROWS = ("window", "performance_overlay", "controls")
 SETTINGS_ROW_ALIASES = {"keypad": "controls"}
 
 # [controls] default_layout and the on-screen layout picker's choices.
 CONTROLS_LAYOUTS = ("pad", "keys", "pad+keys", "hidden")
-# [controls.mapped] left_stick/right_stick/dpad modes.
-STICK_MODES = ("cursor", "arrows", "horizontal_arrows", "wasd", "scroll", "wheel", "none")
+# [controls] mobile_control: where the on-screen controls may appear.
+MOBILE_CONTROLS = ("off", "mobile-only", "always")
 # [controls.native] buttons: the pad button names a physical button maps to.
 PAD_BUTTONS = ("cross", "circle", "square", "triangle", "l1", "r1", "l2", "r2", "l3", "r3",
                "select", "start", "ps")
-MAPPED_DEFAULTS = {"left_stick": "arrows", "right_stick": "cursor", "dpad": "arrows",
-                   "cursor_speed": 900, "cross": "mouse_left", "circle": "mouse_right",
-                   "square": "key:Space", "triangle": "key:Tab", "l1": "key:PageUp",
-                   "r1": "key:PageDown", "l2": "mouse_middle", "r2": "key:LShift",
-                   "start": "key:Escape", "select": "key:F10", "l3": "none", "r3": "none",
-                   "ps": "action:settings"}
 # [controls.native] axes: the six DirectInput/XInput axis names a physical
 # axis maps to.
 NATIVE_AXES = ("x", "y", "z", "rx", "ry", "rz")
-# Mirrors the name column of host/controls/layout.cpp's kScancodes table (its
-# scancode_from_name); keep both lists in sync.
-KEY_NAMES = (
-    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S",
-    "T", "U", "V", "W", "X", "Y", "Z", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "Return",
-    "Escape", "Backspace", "Tab", "Space", "Minus", "Equals", "LeftBracket", "RightBracket",
-    "Backslash", "Semicolon", "Apostrophe", "Grave", "Comma", "Period", "Slash", "F1", "F2", "F3",
-    "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "Insert", "Home", "PageUp", "Delete",
-    "End", "PageDown", "Right", "Left", "Down", "Up", "LCtrl", "LShift", "LAlt",
-)
-# key:<name>, mouse_left/right/middle, wheel_up/down, action:<name> or none.
-BUTTON_TARGET_RE = re.compile(
-    r"^(key:[A-Za-z0-9]+|mouse_(left|right|middle)|wheel_(up|down)|"
-    r"action:(settings|system_keyboard|edit_layout)|none)$")
 HEAP_END = 0x0e000000        # default heap end; reserved low runtime regions start here
 GUEST_SIZE_DEFAULT = 0x10000000   # runtime/x86.h GUEST_SIZE: the arena, 256 MB unless a module needs more
 AUX_REQUIRED_KEYS = ("name", "sha256", "base", "size")
@@ -394,44 +373,17 @@ def validate_installation_hints(cfg, source):
     checklist["items"] = normalized_items
 
 
-def load_controls(controls, touch, source):
-    """Validate [controls], merging [controls.mapped]/[controls.native] over their
-    defaults. `touch` is the already-defaulted [touch] table: its `keypad` knob
-    only sets `default_layout` when the game has not named one itself."""
+def load_controls(controls, source):
+    """Validate [controls] and merge [controls.native] over its defaults."""
     controls = dict(controls)
-    if "default_layout" not in controls:
-        controls["default_layout"] = {"auto": "keys", "hidden": "hidden"}[touch["keypad"]]
+    controls.setdefault("default_layout", "pad")
     if controls["default_layout"] not in CONTROLS_LAYOUTS:
         raise ValueError("%s: [controls] default_layout must be one of %s, not %r"
                          % (source, ", ".join(CONTROLS_LAYOUTS), controls["default_layout"]))
-    pad = controls.setdefault("pad", "mapped")
-    if pad not in ("native", "mapped", "off"):
-        raise ValueError('%s: [controls] pad must be "native", "mapped" or "off", not %r' % (source, pad))
-
-    mapped = dict(MAPPED_DEFAULTS)
-    mapped.update(controls.get("mapped", {}))
-    unknown = sorted(k for k in mapped if k not in MAPPED_DEFAULTS)
-    if unknown:
-        raise ValueError("%s: [controls.mapped] may name only %s, not %s"
-                         % (source, ", ".join(sorted(MAPPED_DEFAULTS)), ", ".join(unknown)))
-    for key, value in mapped.items():
-        if key == "cursor_speed":
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-                raise ValueError("%s: [controls.mapped] cursor_speed must be a positive integer, not %r"
-                                 % (source, value))
-        elif key in ("left_stick", "right_stick"):
-            if value not in STICK_MODES:
-                raise ValueError("%s: [controls.mapped] %s must be one of %s, not %r"
-                                 % (source, key, ", ".join(STICK_MODES), value))
-        elif key == "dpad":
-            if value not in ("arrows", "wasd", "none"):
-                raise ValueError('%s: [controls.mapped] dpad must be "arrows", "wasd" or "none", not %r'
-                                 % (source, value))
-        elif not isinstance(value, str) or not BUTTON_TARGET_RE.match(value):
-            raise ValueError("%s: [controls.mapped] %s is not a valid target: %r" % (source, key, value))
-        elif value.startswith("key:") and value[len("key:"):] not in KEY_NAMES:
-            raise ValueError("%s: [controls.mapped] %s names no key: %r" % (source, key, value))
-    controls["mapped"] = mapped
+    mobile = controls.setdefault("mobile_control", "mobile-only")
+    if mobile not in MOBILE_CONTROLS:
+        raise ValueError("%s: [controls] mobile_control must be one of %s, not %r"
+                         % (source, ", ".join(MOBILE_CONTROLS), mobile))
 
     native = dict(controls.get("native", {}))
     unknown_native = sorted(k for k in native if k not in ("xinput", "dinput", "axes", "buttons"))
@@ -633,11 +585,7 @@ def load(game_dir, build_root=None):
     input_config["mouse_sensitivity"] = sensitivity
     input_config["mouse_acceleration"] = acceleration
     cfg.setdefault("bundle", {}).setdefault("exclude", [])
-    touch = cfg.setdefault("touch", {})
-    touch.setdefault("keypad", "auto")
-    if touch["keypad"] not in ("auto", "hidden"):
-        raise ValueError('%s: [touch] keypad must be "auto" or "hidden", not %r' % (source, touch["keypad"]))
-    cfg["controls"] = load_controls(cfg.get("controls", {}), touch, source)
+    cfg["controls"] = load_controls(cfg.get("controls", {}), source)
     settings = cfg.setdefault("settings", {})
     window_mode = settings.setdefault("window_mode", "windowed")
     if window_mode not in ("windowed", "borderless", "fullscreen"):

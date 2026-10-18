@@ -28,13 +28,11 @@ const char *const hats[] = {"D-pad up", "D-pad right", "D-pad down", "D-pad left
 const uint16_t bits[] = {kPadCross, kPadCircle, kPadSquare, kPadTriangle, kPadL1,    kPadR1, kPadL2,
                          kPadR2,    kPadL3,     kPadR3,     kPadSelect,   kPadStart, kPadPs};
 const uint8_t hat_bits[] = {kHatUp, kHatRight, kHatDown, kHatLeft};
-const char *const presets[] = {"Standard controller", "Combined triggers / pedals",
-                               "Built-in keyboard / mouse"};
+const char *const presets[] = {"Standard controller", "Combined triggers / pedals"};
 constexpr int kPresetCount = sizeof(presets) / sizeof(presets[0]);
 const char *const preset_help[] = {
     "Pass sticks, triggers, buttons and D-pad through to the game controller.",
-    "Combine the two triggers into opposite halves of one output axis.",
-    "Use this game's built-in controller-to-keyboard and mouse bindings."};
+    "Combine the two triggers into opposite halves of one output axis."};
 float axis(const PadState &p, int i) {
     switch (i) {
     case 0:
@@ -65,10 +63,6 @@ std::string source_name(int source) {
 std::string output_name(int target) {
     return target == 0 ? "None" : target <= 13 ? buttons[target - 1] : hats[target - 14];
 }
-std::string key_name(int key) {
-    const char *name = key ? scancode_name(key) : nullptr;
-    return name ? name : "Not assigned";
-}
 std::string button_name(const ButtonBinding &b) {
     for (int i = 0; i < 13; ++i)
         if (b.guest_buttons == bits[i] && !b.guest_hat)
@@ -86,7 +80,7 @@ bool active(const PadState &p, int source) {
 } // namespace
 
 void PadMapperEditor::open(const PadMapperProfile &profile, const Screen &screen) {
-    profile_ = pad_mapper_with_controller_output(profile);
+    profile_ = profile;
     original_ = serialize_pad_mapper_profile(profile_);
     screen_ = screen;
     page_ = Page::Overview;
@@ -96,7 +90,7 @@ void PadMapperEditor::open(const PadMapperProfile &profile, const Screen &screen
     validation_error_.clear();
     open_ = true;
     close_requested_ = false;
-    keyboard_ = advanced_ = shift_ = sweep_ = center_capture_ = false;
+    advanced_ = sweep_ = center_capture_ = false;
     selected_ = group_ = scroll_ = detail_scroll_ = 0;
     focus_ = 1;
     pressed_ = -1;
@@ -122,7 +116,6 @@ void PadMapperEditor::set_device(const std::string &name, bool connected) {
 void PadMapperEditor::suspend() {
     capture_ = Capture::None;
     pressed_ = -1;
-    shift_ = false;
     cancel_calibration();
 }
 bool PadMapperEditor::is_open() const {
@@ -257,8 +250,6 @@ ControlsView PadMapperEditor::view(const Screen &screen, const PadState &raw,
         text(m, top, col, px(22), "Controller mappings", false);
         text(m, top + px(30), col, px(46),
              "Change controller outputs and add keyboard keys in Mapping.");
-        if (profile_.legacy_mapped)
-            text(m, top + px(86), col, px(46), "Built-in keyboard / mouse preset active.");
         add_key(m, top + px(148), px(148), row, "Presets...", false, 12);
         text(right, top, col, px(22), "Test controller", false);
         for (int i = 0; i < 6; ++i)
@@ -333,47 +324,21 @@ ControlsView PadMapperEditor::view(const Screen &screen, const PadState &raw,
                 const AxisBinding &b = profile_.axis_bindings[size_t(selected_)];
                 line("Controller output",
                      b.guest_axis == MapperAxis::None ? "None" : axes[int(b.guest_axis) - 1], 200);
-                const AxisCalibration &calibration = profile_.axes[size_t(selected_)];
-                if (keyboard_ || b.negative_key || b.positive_key) {
-                    if (calibration.mode == MapperAxisMode::Centered) {
-                        const char *negative =
-                            selected_ < 4 ? (selected_ % 2 ? "Move up: key" : "Move left: key")
-                                          : "Low end: key";
-                        const char *positive =
-                            selected_ < 4 ? (selected_ % 2 ? "Move down: key" : "Move right: key")
-                                          : "High end: key";
-                        line(calibration.inverted ? positive : negative, key_name(b.negative_key),
-                             201);
-                        line(calibration.inverted ? negative : positive, key_name(b.positive_key),
-                             202);
-                    } else
-                        line("Key past half travel", key_name(b.positive_key), 202);
-                } else
-                    line("Keyboard", "Add key mapping...", 17);
                 line("", advanced_ ? "Fewer options" : "More options...", 13);
                 if (advanced_) {
-                    if (calibration.mode == MapperAxisMode::Pedal)
-                        line("Negative range key", key_name(b.negative_key), 201);
                     line("Output scale", number(b.scale), 0, 210, 211);
                     line("Output offset", number(b.offset), 0, 212, 213);
                     note("Output = calibrated input x scale + offset; clipped to the axis range.");
-                    line("Negative direction button", button_name({b.negative_guest_buttons, 0, 0}),
+                    line("Negative direction button", button_name({b.negative_guest_buttons, 0}),
                          214);
-                    line("Positive direction button", button_name({b.positive_guest_buttons, 0, 0}),
+                    line("Positive direction button", button_name({b.positive_guest_buttons, 0}),
                          215);
-                    note("Direction outputs engage at half travel. Keys work even with controller "
-                         "output off.");
+                    note("Direction outputs engage at half travel.");
                 }
             } else {
                 const ButtonBinding &b = button();
                 line("Controller output", button_name(b), 205);
-                if (keyboard_ || b.key)
-                    line("Keyboard key", key_name(b.key), 206);
-                else
-                    line("Keyboard", "Add key mapping...", 17);
             }
-            if (profile_.legacy_mapped)
-                note("Built-in keyboard / mouse mapping is also enabled.");
             if (selected_ < 6) {
                 const int y = detail_top + (index++ - detail_scroll_) * px(35);
                 if (y >= detail_top && y + row <= detail_bottom) {
@@ -488,7 +453,7 @@ ControlsView PadMapperEditor::view(const Screen &screen, const PadState &raw,
                         selected = label == button_name({popup_ == Popup::NegativeButton
                                                              ? binding.negative_guest_buttons
                                                              : binding.positive_guest_buttons,
-                                                         0, 0});
+                                                         0});
                 }
                 add_key(x + (i % 2) * (cw + gap), at + (i / 2) * (row + gap), cw, row, label,
                         selected, 400 + i);
@@ -517,7 +482,6 @@ void PadMapperEditor::cancel_calibration() {
 }
 void PadMapperEditor::select(int source) {
     cancel_calibration();
-    keyboard_ = false;
     selected_ = std::clamp(source, 0, 22);
     group_ = selected_ < 6 ? 0 : selected_ < 19 ? 1 : 2;
     const int first = group_ == 0 ? 0 : group_ == 1 ? 6 : 19;
@@ -534,13 +498,7 @@ void PadMapperEditor::preset(int index) {
     case 1:
         profile_ = pad_mapper_combined_pedals();
         break;
-    case 2:
-        profile_ = pad_mapper_default_profile();
-        profile_.native_enabled = false;
-        profile_.legacy_mapped = true;
-        break;
     }
-    profile_ = pad_mapper_with_controller_output(profile_);
 }
 void PadMapperEditor::activate(int id) {
     validation_error_.clear();
@@ -572,8 +530,7 @@ void PadMapperEditor::activate(int id) {
             capture_ = Capture::Identify;
             identify_start_ = last_raw_;
         }
-    } else if (id == 17)
-        keyboard_ = true;
+    }
     else if (id == 20)
         scroll_ = std::max(0, scroll_ - 1);
     else if (id == 21)
@@ -589,16 +546,10 @@ void PadMapperEditor::activate(int id) {
     else if (id == 200) {
         popup_ = Popup::Axis;
         focus_ = 400;
-    } else if (id == 201)
-        capture_ = Capture::NegativeKey;
-    else if (id == 202)
-        capture_ = Capture::PositiveKey;
-    else if (id == 205) {
+    } else if (id == 205) {
         popup_ = Popup::Button;
         focus_ = 400;
-    } else if (id == 206)
-        capture_ = Capture::ButtonKey;
-    else if (id >= 210 && id <= 215) {
+    } else if (id >= 210 && id <= 215) {
         AxisBinding &b = profile_.axis_bindings[size_t(selected_)];
         if (id == 210 || id == 211)
             b.scale = std::clamp(b.scale + (id == 210 ? -0.05f : 0.05f), -4.0f, 4.0f);
@@ -762,31 +713,9 @@ void PadMapperEditor::request_close() {
 void PadMapperEditor::key(int scancode, bool down) {
     if (!open_)
         return;
-    if (capture_ == Capture::None && (scancode == kScanLShift || scancode == kScanRShift)) {
-        shift_ = down;
-        return;
-    }
     if (!down)
         return;
-    if (capture_ != Capture::None && capture_ != Capture::Identify) {
-        if (scancode == kScanEscape)
-            capture_ = Capture::None;
-        else {
-            const int value = scancode == kScanDelete || scancode == kScanBackspace ? 0 : scancode;
-            if (value && !scancode_name(value)) {
-                validation_error_ = "This key is unavailable. Try another key, or Esc to cancel.";
-                return;
-            }
-            if (capture_ == Capture::NegativeKey)
-                profile_.axis_bindings[size_t(selected_)].negative_key = value;
-            else if (capture_ == Capture::PositiveKey)
-                profile_.axis_bindings[size_t(selected_)].positive_key = value;
-            else
-                button().key = value;
-            capture_ = Capture::None;
-            validation_error_.clear();
-        }
-    } else if (scancode == kScanEscape)
+    if (scancode == kScanEscape)
         escape();
     else if (scancode == kScanTab || scancode == kScanDown || scancode == kScanUp ||
              scancode == kScanLeft || scancode == kScanRight) {
@@ -796,8 +725,7 @@ void PadMapperEditor::key(int scancode, bool down) {
                                [&](const auto &item) { return item.second == focus_; });
         int index = it == widget_ids_.end() ? -1 : int(it - widget_ids_.begin());
         const int direction =
-            scancode == kScanUp || scancode == kScanLeft || (scancode == kScanTab && shift_) ? -1
-                                                                                             : 1;
+            scancode == kScanUp || scancode == kScanLeft ? -1 : 1;
         index = (index + direction + int(widget_ids_.size())) % int(widget_ids_.size());
         focus_ = widget_ids_[size_t(index)].second;
     } else if (scancode == kScanReturn || scancode == kScanSpace) {

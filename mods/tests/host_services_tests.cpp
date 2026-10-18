@@ -4,7 +4,6 @@
 #include "../../platform/os.h"
 #include "../mods_internal.h"
 #include <string>
-#include <fstream>
 #include <thread>
 
 static const PopModApi *test_provider(uint32_t owner);
@@ -240,19 +239,11 @@ MOD_TEST_SUITE(texture_provider_is_content_keyed) {
 #include "../display_settings.h"
 #include "../../dx/host_api.h"
 #include <cmath>
-#include <fstream>
 namespace {
 int anchor_calls = 0, last_h = 0, last_v = 0;
 uint64_t last_anchor = 0;
 int drawable_w = 0, drawable_h = 0;
-int mode_offers = 0, offered_w = 0, offered_h = 0;
 } // namespace
-extern "C" int host_display_offer_mode(int w, int h, int) {
-    ++mode_offers;
-    offered_w = w;
-    offered_h = h;
-    return 1;
-}
 extern "C" int32_t host_display_anchor(uint64_t id, int8_t h, int8_t v, int) {
     ++anchor_calls;
     last_anchor = id;
@@ -291,125 +282,12 @@ MOD_TEST_SUITE(display_api_thread_and_aspect) {
     MOD_CHECK_EQ(g_api.display_transition(&g_api, nullptr), POP_E_INVAL);
     MOD_CHECK_EQ(g_api.ui_elements(&g_api, nullptr, 0), 0u);
 }
-MOD_TEST_SUITE(display_settings_apply_at_next_frame_without_epoch_change) {
-    setup();
-    mods_display_init();
-    mods_display_transition(10, HOST_SCREEN_GAMEPLAY);
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_RENDERING, 1), POP_OK);
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_WIDE, 0), POP_OK);
-    MOD_CHECK(mods_display_pending(DISPLAY_RENDERING));
-    MOD_CHECK(mods_display_pending(DISPLAY_WIDE));
-    MOD_CHECK_EQ(mods_display_classic(), 0);
-    MOD_CHECK_EQ(mods_display_wide(), 1);
-    MOD_CHECK(mods_display_line(DISPLAY_RENDERING).find("pending") == std::string::npos);
-    mods_display_transition(10, HOST_SCREEN_GAMEPLAY);
-    MOD_CHECK_EQ(mods_display_classic(), 1);
-    mods_display_transition(11, HOST_SCREEN_GAMEPLAY);
-    MOD_CHECK_EQ(mods_display_classic(), 1);
-    MOD_CHECK_EQ(mods_display_wide(), 0);
-    MOD_CHECK(!mods_display_pending(DISPLAY_RENDERING));
-    g_api.mod_id = "core.display";
-    mods_display_transition(12, HOST_SCREEN_MENU);
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_RENDERING, 0), POP_OK);
-    mods_display_transition(12, HOST_SCREEN_MENU);
-    drawable_w = 3840;
-    drawable_h = 2160;
-    MOD_CHECK(std::fabs(g_api.host_aspect(&g_api) - 4.f / 3.f) < 0.00001f);
-    g_api.mod_id = "other.mod";
-    MOD_CHECK(std::fabs(g_api.host_aspect(&g_api) - 16.f / 9.f) < 0.00001f);
-    g_api.mod_id = "core.display";
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_WIDE, 1), POP_OK);
-    mods_display_transition(12, HOST_SCREEN_MENU);
-    MOD_CHECK(std::fabs(g_api.host_aspect(&g_api) - 16.f / 9.f) < 0.00001f);
-    drawable_w = drawable_h = 0;
-    MOD_CHECK_EQ(mods_display_classic(), 0);
-    MOD_CHECK_EQ(mods_display_wide(), 1);
-    MOD_CHECK(!mods_display_pending(DISPLAY_RENDERING));
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_UI_SCALE, 4), POP_OK);
-    MOD_CHECK_EQ(mods_display_scale(), 4);
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_UI_SCALE, 5), POP_E_RANGE);
-    mods_display_reset();
-}
-MOD_TEST_SUITE(enhanced_preserves_selected_resolution) {
-    setup();
-    mods_display_reset();
-    char path[512];
-    snprintf(path, sizeof path, "%s/display-modes-XXXXXX", os_temp_dir());
-    int fd = os_mkstemp(path);
-    MOD_CHECK(fd >= 0);
-    if (fd < 0)
-        return;
-    os_fd_close(fd);
-    {
-        std::ofstream f(path);
-        f << R"({"modes":[{"w":640,"h":480,"bpp":16,"passed":true},
-                       {"w":800,"h":600,"bpp":16,"passed":true}]})";
-    }
-    MOD_CHECK(mods_display_load_modes(path));
-    os_unlink(path);
-    mode_offers = 0;
-    mods_display_init();
-    MOD_CHECK_EQ(mode_offers, 0); // startup keeps the current mode
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_CLASSIC_MODE, 1), POP_OK);
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_RENDERING, 1), POP_OK);
-    MOD_CHECK_EQ(mode_offers, 1);
-    MOD_CHECK_EQ(offered_w, 800);
-    MOD_CHECK_EQ(offered_h, 600);
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_RENDERING, 0), POP_OK);
-    mods_display_transition(12, HOST_SCREEN_MENU);
-    MOD_CHECK_EQ(mode_offers, 1); // returning to Enhanced keeps the selected mode
-    mods_display_reset();
-}
-MOD_TEST_SUITE(display_page_and_passing_mode_list) {
-    setup();
-    char path[512];
-    snprintf(path, sizeof path, "%s/display-modes-XXXXXX", os_temp_dir());
-    int fd = os_mkstemp(path);
-    MOD_CHECK(fd >= 0);
-    if (fd < 0)
-        return;
-    os_fd_close(fd);
-    {
-        std::ofstream f(path);
-        f << R"({"modes":[{"w":640,"h":480,"bpp":16,"passed":true},{"w":800,"h":600,"bpp":16,"passed":false},{"width":1920,"height":1080,"bpp":16,"status":"pass"}]})";
-    }
-    MOD_CHECK(mods_display_load_modes(path));
-    os_unlink(path);
-    mods_page_init();
-    mods_page_open(nullptr);
-    MOD_CHECK(std::string(mods_page_line(0)).find("Rendering: Enhanced") != std::string::npos);
-    MOD_CHECK(std::string(mods_page_line(1)).find("UI scale: auto") != std::string::npos);
-    MOD_CHECK(std::string(mods_page_line(2)).find("Wide view: on") != std::string::npos);
-    MOD_CHECK(std::string(mods_page_line(3)).find("Display: windowed") != std::string::npos);
-    MOD_CHECK(std::string(mods_page_line(4)).find("Resolution: 640x480") != std::string::npos);
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_CLASSIC_MODE, 2),
-                 POP_E_RANGE); // failing 800x600 excluded
-    mods_display_transition(30, HOST_SCREEN_GAMEPLAY);
-    mods_input_key(0xcd, 0, true);
-    mods_input_key(0xcd, 0, false);
-    MOD_CHECK(mods_display_pending(DISPLAY_RENDERING));
-    mods_display_transition(31, HOST_SCREEN_GAMEPLAY);
-    MOD_CHECK(std::string(mods_page_line(0)).find("pending until next level") == std::string::npos);
-    mods_page_close();
-    mods_input_remove_all(MODS_OWNER_RUNTIME);
-    mods_display_reset();
-}
-
 MOD_TEST_SUITE(display_pacing_overlay_and_domain) {
     setup();
     mods_display_live_defaults();
     mods_page_init();
-    MOD_CHECK_EQ(mods_display_fps(), 60);
     MOD_CHECK_EQ(mods_display_overlay(), 2);
     mods_display_transition(10, HOST_SCREEN_GAMEPLAY);
-    for (int choice = 0; choice < 4; ++choice) {
-        const int rates[] = {0, 40, 60, 120};
-        MOD_CHECK_EQ(mods_display_set(DISPLAY_FPS, choice), POP_OK);
-        MOD_CHECK_EQ(mods_display_fps(), rates[choice]);
-        MOD_CHECK(!mods_display_pending(DISPLAY_FPS));
-    }
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_FPS, 4), POP_E_RANGE);
-    MOD_CHECK_EQ(mods_display_fps(), 120);
     MOD_CHECK(mods_input_key(0x57, 0, true));
     MOD_CHECK_EQ(mods_display_overlay(), 0);
     MOD_CHECK(mods_input_key(0x57, 0, false));
@@ -417,20 +295,7 @@ MOD_TEST_SUITE(display_pacing_overlay_and_domain) {
     mods_input_key(0x57, 0, true);
     mods_input_key(0x57, 0, false);
     MOD_CHECK_EQ(mods_display_overlay(), 1);
-    mods_display_scene_domain(852, 480);
-    MOD_CHECK_EQ(mods_display_scene_width(640, 480), 852);
-    MOD_CHECK_EQ(mods_display_scene_width(800, 600), 800); // mode change invalidates old height
-    mods_display_transition(11, HOST_SCREEN_MENU);
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_RENDERING, 1), POP_OK);
-    mods_display_transition(11, HOST_SCREEN_MENU);
-    MOD_CHECK_EQ(mods_display_scene_width(640, 480), 640);
-    drawable_w = 1920;
-    drawable_h = 1080;
-    MOD_CHECK(std::fabs(g_api.host_aspect(&g_api) - 4.f / 3.f) < 0.00001f);
-    drawable_w = drawable_h = 0;
-    mods_page_close();
-    mods_input_remove_all(MODS_OWNER_RUNTIME);
-    mods_display_reset();
+    MOD_CHECK(!mods_page_visible());
 }
 
 MOD_TEST_SUITE(higher_resolution_provider_validates_layout_and_keeps_legacy_api) {
@@ -468,38 +333,4 @@ MOD_TEST_SUITE(higher_resolution_provider_validates_layout_and_keeps_legacy_api)
     replacement = {sizeof(replacement), 4, 4, 36, data, 144};
     mods_host_services_remove_all(MODS_OWNER_FIRST_MOD);
     MOD_CHECK_EQ(mods_texture_override_ex(9, 2, 2, 16, &out), 0);
-}
-
-MOD_TEST_SUITE(hd_controls_persist_across_restart) {
-    char dir[512];
-    snprintf(dir, sizeof dir, "%s/pop-hd-settings-XXXXXX", os_temp_dir());
-    const bool made = os_mkdtemp(dir) == 0;
-    MOD_CHECK(made);
-    if (!made)
-        return;
-    const std::string previous_profile = mods_overlay_profile_dir();
-    mods_overlay_set_profile_dir(dir);
-    setup();
-    const std::string path = mods_settings_path();
-    MOD_CHECK(mods_settings_load(path.c_str()));
-    mods_display_init();
-    MOD_CHECK_EQ(mods_display_textures(), 1);
-    MOD_CHECK_EQ(mods_display_filtering(), 3);
-    mods_display_transition(100, HOST_SCREEN_GAMEPLAY);
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_TEXTURES, 0), POP_OK);
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_FILTERING, 4), POP_OK);
-    MOD_CHECK_EQ(mods_display_textures(), 0);
-    MOD_CHECK_EQ(mods_display_filtering(), 4);
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_FILTERING, 5), POP_E_RANGE);
-    MOD_CHECK(mods_settings_save());
-    mods_display_reset();
-    mods_settings_reset();
-    MOD_CHECK(mods_settings_load(path.c_str()));
-    mods_display_init();
-    MOD_CHECK_EQ(mods_display_textures(), 0);
-    MOD_CHECK_EQ(mods_display_filtering(), 4);
-    mods_settings_reset();
-    mods_overlay_set_profile_dir(previous_profile.c_str());
-    os_unlink(path.c_str());
-    os_rmdir(dir);
 }

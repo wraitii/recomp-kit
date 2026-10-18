@@ -782,12 +782,6 @@ void system_strip_insets(double *top, double *bottom) {
 }
 
 void handle_mouse_move(const SDL_MouseMotionEvent &motion) {
-    // A real pointer move (not one the touch path or the binding itself
-    // synthesized, which both arrive as SDL_TOUCH_MOUSEID): feed the mapped
-    // binding's Cursor stick mode. A touch's own placement reaches it through
-    // the kTouchPlaceEvent handler below instead, in window points.
-    if (motion.which != SDL_TOUCH_MOUSEID)
-        controls::host_pointer_moved(motion.x, motion.y);
     PendingInput e;
     if (g_relative_mouse) {
         e.kind = PendingInput::RELATIVE_MOTION;
@@ -1445,7 +1439,6 @@ void handle_event(const SDL_Event &event) {
         if (event.user.code == kTouchPlaceEvent) {
             const double px = double((intptr_t)event.user.data1) / 16.0;
             const double py = double((intptr_t)event.user.data2) / 16.0;
-            controls::host_pointer_moved(px, py);
             PendingInput e;
             e.kind = PendingInput::PLACE;
             view_point_to_drawable(px, py, &e.x, &e.y, &e.drawable_w, &e.drawable_h);

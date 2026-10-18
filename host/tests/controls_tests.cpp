@@ -1,6 +1,5 @@
 // controls_tests.cpp - the on-screen controls: json, layouts, router, pad, binding, editor.
 #include "../../platform/os.h"
-#include "../controls/binding.h"
 #include "../controls/builtin_layouts.h"
 #include "../controls/editor.h"
 #include "../controls/editor_actions.h"
@@ -1512,502 +1511,6 @@ static void test_raster_shape_bounds_are_clamped() {
         CHECK(b == 0);
 }
 
-// parse_mapped changes only the entries it names, and leaves *table alone on
-// any error; write_mapped round-trips through parse_mapped.
-static void test_binding_parse_mapped() {
-    MappedTable t;
-    std::string err;
-    CHECK(parse_mapped("cross=key:Space;left_stick=cursor", &t, &err));
-    CHECK(t.buttons[int(PadButton::Cross)].type == Target::Key);
-    CHECK(t.buttons[int(PadButton::Cross)].value == kScanSpace);
-    CHECK(t.left == StickMode::Cursor);
-    CHECK(t.dpad == StickMode::Arrows); // untouched
-    // untouched: MappedTable's own default (tools/game_config.py's MAPPED_DEFAULTS)
-    CHECK(t.buttons[int(PadButton::Circle)].type == Target::Mouse &&
-          t.buttons[int(PadButton::Circle)].value == 1);
-
-    MappedTable before = t;
-    CHECK(!parse_mapped("cross=key:Nope", &t, &err));
-    CHECK(write_mapped(t) == write_mapped(before)); // unchanged on error
-    CHECK(!parse_mapped("bogus=none", &t, &err));
-    CHECK(write_mapped(t) == write_mapped(before));
-
-    MappedTable w;
-    w.buttons[int(PadButton::Cross)] = Target{Target::Mouse, 0, ""};
-    w.buttons[int(PadButton::Ps)] = Target{Target::Action, 0, "settings"};
-    w.buttons[int(PadButton::L1)] = Target{Target::Wheel, 1, ""};
-    w.cursor_speed = 450;
-    const std::string text = write_mapped(w);
-    MappedTable w2;
-    CHECK(parse_mapped(text, &w2, &err));
-    CHECK(write_mapped(w2) == text);
-}
-
-// Cross mapped to mouse_left (the built-in default): a press places the
-// cursor and clicks; a release only lifts the button.
-static void test_binding_button_mouse() {
-    MappedTable t;
-    t.buttons[int(PadButton::Cross)] = Target{Target::Mouse, 0, ""};
-    Binding b;
-    b.set_table(t);
-    b.set_bounds(1000, 800);
-    b.set_cursor(100, 100);
-    PadState p;
-    std::vector<TouchAction> out;
-    std::vector<std::string> actions;
-    p.buttons = kPadCross;
-    b.tick(p, 0, &out, &actions);
-    CHECK(out.size() == 2);
-    CHECK(out[0].kind == TouchAction::Motion && out[0].place && out[0].x == 100 && out[0].y == 100);
-    CHECK(out[1].kind == TouchAction::Button && out[1].button == 0 && out[1].down);
-    out.clear();
-    p.buttons = 0;
-    b.tick(p, 10ull * 1000000ull, &out, &actions);
-    CHECK(out.size() == 1);
-    CHECK(out[0].kind == TouchAction::Button && out[0].button == 0 && !out[0].down);
-}
-
-// Right stick on Cursor (the default), speed 900, bounds 1000x800: the
-// cursor moves by cursor_speed * |v|^2 * dt each tick and clamps at the edge.
-static void test_binding_cursor_stick() {
-    MappedTable t; // right_stick=cursor, cursor_speed=900 by default
-    Binding b;
-    b.set_table(t);
-    b.set_bounds(1000, 800);
-    b.set_cursor(0, 0);
-    PadState p;
-    p.rx = 1;
-    std::vector<TouchAction> out;
-    std::vector<std::string> actions;
-    uint64_t now = 0;
-    for (int i = 0; i < 3; ++i) {
-        out.clear();
-        b.tick(p, now, &out, &actions);
-        now += 10ull * 1000000ull;
-    }
-    CHECK(std::fabs(b.cursor_x() - 18.0) <= 0.5);
-
-    Binding b2;
-    b2.set_table(t);
-    b2.set_bounds(1000, 800);
-    b2.set_cursor(0, 0);
-    p.rx = 0.5f;
-    now = 0;
-    for (int i = 0; i < 3; ++i) {
-        out.clear();
-        b2.tick(p, now, &out, &actions);
-        now += 10ull * 1000000ull;
-    }
-    CHECK(std::fabs(b2.cursor_x() - 4.5) <= 0.3);
-
-    Binding b3;
-    b3.set_table(t);
-    b3.set_bounds(1000, 800);
-    b3.set_cursor(0, 0);
-    p.rx = 1;
-    now = 0;
-    for (int i = 0; i < 200; ++i) {
-        out.clear();
-        b3.tick(p, now, &out, &actions);
-        now += 10ull * 1000000ull;
-    }
-    CHECK(b3.cursor_x() == 999.0); // clamped to w - 1: no point outside the window
-}
-
-// Left stick on Arrows (the default): per-axis hysteresis, 0.5 to press and
-// 0.35 to release.
-static void test_binding_arrows_stick() {
-    MappedTable t; // left_stick=arrows by default
-    Binding b;
-    b.set_table(t);
-    PadState p;
-    std::vector<TouchAction> out;
-    std::vector<std::string> actions;
-    p.lx = 0.6f;
-    b.tick(p, 0, &out, &actions);
-    CHECK(out.size() == 1 && out[0].kind == TouchAction::Key && out[0].scancode == kScanRight &&
-          out[0].down);
-    out.clear();
-    p.lx = 0.4f;
-    b.tick(p, 1, &out, &actions);
-    CHECK(out.empty());
-    out.clear();
-    p.lx = 0.3f;
-    b.tick(p, 2, &out, &actions);
-    CHECK(out.size() == 1 && out[0].scancode == kScanRight && !out[0].down);
-    out.clear();
-    p.lx = 0;
-    p.ly = -0.9f;
-    b.tick(p, 3, &out, &actions);
-    CHECK(out.size() == 1 && out[0].scancode == kScanUp && out[0].down);
-}
-
-// A racing diagonal steers without overriding separately held face buttons.
-static void test_binding_horizontal_arrows() {
-    MappedTable table;
-    std::string error;
-    CHECK(
-        parse_mapped("left_stick=horizontal_arrows;cross=key:Up;square=key:Down", &table, &error));
-    MappedTable copy;
-    CHECK(parse_mapped(write_mapped(table), &copy, &error));
-    CHECK(copy.left == StickMode::HorizontalArrows);
-    Binding binding;
-    binding.set_table(copy);
-    PadState pad;
-    std::vector<TouchAction> out;
-    std::vector<std::string> actions;
-    pad.ly = -1;
-    binding.tick(pad, 0, &out, &actions);
-    CHECK(out.empty()); // vertical motion cannot accelerate
-    pad.buttons = uint16_t(1u << int(PadButton::Cross));
-    binding.tick(pad, 1, &out, &actions);
-    CHECK(out.size() == 1 && out[0].scancode == kScanUp && out[0].down);
-    out.clear();
-    pad.lx = -1;
-    pad.ly = 1;
-    binding.tick(pad, 2, &out, &actions);
-    CHECK(out.size() == 1 && out[0].scancode == kScanLeft && out[0].down);
-    out.clear();
-    pad.lx = 0;
-    binding.tick(pad, 3, &out, &actions);
-    CHECK(out.size() == 1 && out[0].scancode == kScanLeft && !out[0].down);
-    out.clear();
-    pad.buttons = uint16_t(1u << int(PadButton::Square));
-    binding.tick(pad, 4, &out, &actions);
-    CHECK(out.size() == 2 && out[0].scancode == kScanUp && !out[0].down &&
-          out[1].scancode == kScanDown && out[1].down);
-    out.clear();
-    pad = {};
-    binding.tick(pad, 5, &out, &actions);
-    CHECK(out.size() == 1 && out[0].scancode == kScanDown && !out[0].down);
-}
-
-// Two fingers must survive the complete router -> mapped binding path, not
-// just work when a test constructs an already-combined PadState. Exercise
-// both press orders and both release orders on the shipped tablet layouts.
-static void test_tablet_simultaneous_controls() {
-    struct HeldKeys : ControlsSink {
-        bool keys[512]{};
-        void key(int scancode, bool down) override {
-            CHECK(scancode > 0 && scancode < 512);
-            if (scancode > 0 && scancode < 512)
-                keys[scancode] = down;
-        }
-        void action(const std::string &) override {}
-        void switch_layout(const std::string &) override {}
-        void group_visibility_changed() override {}
-        void tap() override {}
-    };
-    struct Input {
-        Kind kind;
-        int id;
-        int key;
-        int direction = 0; // stick x, in full travel radii
-    };
-    struct Pair {
-        const char *layout;
-        Input inputs[2];
-    };
-    const Pair pairs[] = {
-        {"keys", {{Kind::Key, kScanUp, kScanUp}, {Kind::Key, kScanLeft, kScanLeft}}},
-        {"keys", {{Kind::Key, kScanW, kScanW}, {Kind::Key, kScanA, kScanA}}},
-        {"keys", {{Kind::Key, kScanLShift, kScanLShift}, {Kind::Key, kScanA, kScanA}}},
-        {"pad",
-         {{Kind::Button, int(PadButton::Cross), kScanUp},
-          {Kind::Button, int(PadButton::Square), kScanDown}}},
-        {"pad",
-         {{Kind::Button, int(PadButton::Cross), kScanUp},
-          {Kind::Button, int(PadButton::Circle), kScanSpace}}},
-        {"pad", {{Kind::Button, int(PadButton::Cross), kScanUp}, {Kind::Stick, 0, kScanLeft, -1}}},
-        {"pad", {{Kind::Button, int(PadButton::Cross), kScanUp}, {Kind::Stick, 0, kScanRight, 1}}},
-        {"pad",
-         {{Kind::Button, int(PadButton::Square), kScanDown}, {Kind::Stick, 0, kScanLeft, -1}}},
-    };
-    const Screen s = screen(2420, 1668, 2.0);
-    for (const Pair &pair : pairs)
-        for (int first_down : {0, 1})
-            for (int first_up : {0, 1}) {
-                Layout layout;
-                std::string error;
-                CHECK(parse_layout(builtin_layout(pair.layout, Form::Tablet), &layout, &error));
-                Router router;
-                HeldKeys sink;
-                router.set_layout(&layout, sink);
-                router.set_screen(s);
-                MappedTable table;
-                CHECK(parse_mapped("left_stick=horizontal_arrows;cross=key:Up;"
-                                   "square=key:Down;circle=key:Space",
-                                   &table, &error));
-                Binding binding;
-                binding.set_table(table);
-                uint64_t now = 0;
-                auto pump = [&] {
-                    std::vector<TouchAction> output;
-                    std::vector<std::string> actions;
-                    binding.tick(router.pad(), now, &output, &actions);
-                    for (const auto &a : output)
-                        if (a.kind == TouchAction::Key)
-                            sink.key(a.scancode, a.down);
-                    now += 10000000;
-                };
-                auto press = [&](int index) {
-                    const Input &input = pair.inputs[index];
-                    for (int g = 0; g < int(layout.groups.size()); ++g)
-                        for (int c = 0; c < int(layout.groups[g].controls.size()); ++c) {
-                            const Control &ctl = layout.groups[g].controls[c];
-                            if (ctl.kind != input.kind)
-                                continue;
-                            const int id = ctl.kind == Kind::Key      ? ctl.scancode
-                                           : ctl.kind == Kind::Button ? int(ctl.button)
-                                                                      : ctl.stick;
-                            if (id != input.id)
-                                continue;
-                            double x, y;
-                            center(layout, g, c, s, &x, &y);
-                            CHECK(router.finger_down(index + 1, x, y, now, sink));
-                            if (input.direction)
-                                CHECK(router.finger_motion(index + 1,
-                                                           x + input.direction * ctl.radius *
-                                                                   layout.scale * s.scale,
-                                                           y, now, sink));
-                            pump();
-                            return;
-                        }
-                    CHECK(false); // every requested control must exist in the built-in
-                };
-                press(first_down);
-                CHECK(sink.keys[pair.inputs[first_down].key]);
-                CHECK(!sink.keys[pair.inputs[1 - first_down].key]);
-                press(1 - first_down);
-                // Hold through many host pumps; neither input may cancel the other.
-                for (int i = 0; i < 60; ++i) {
-                    pump();
-                    CHECK(sink.keys[pair.inputs[0].key] && sink.keys[pair.inputs[1].key]);
-                }
-                CHECK(router.finger_up(first_up + 1, now, sink));
-                pump();
-                CHECK(!sink.keys[pair.inputs[first_up].key]);
-                CHECK(sink.keys[pair.inputs[1 - first_up].key]);
-                CHECK(router.finger_up(2 - first_up, now, sink));
-                pump();
-                for (bool held : sink.keys)
-                    CHECK(!held);
-                CHECK(router.pad() == PadState());
-            }
-}
-
-// l1 = wheel_up: one Wheel(+1) per press, nothing on release.
-static void test_binding_wheel_button() {
-    MappedTable t;
-    std::string err;
-    CHECK(parse_mapped("l1=wheel_up", &t, &err));
-    Binding b;
-    b.set_table(t);
-    PadState p;
-    p.buttons = kPadL1;
-    std::vector<TouchAction> out;
-    std::vector<std::string> actions;
-    b.tick(p, 0, &out, &actions);
-    CHECK(out.size() == 1 && out[0].kind == TouchAction::Wheel && out[0].wheel == 1);
-    out.clear();
-    p.buttons = 0;
-    b.tick(p, 1, &out, &actions);
-    CHECK(out.empty());
-}
-
-// ps = action:settings: the action name once per press, nothing on release.
-static void test_binding_action_button() {
-    MappedTable t;
-    std::string err;
-    CHECK(parse_mapped("ps=action:settings", &t, &err));
-    Binding b;
-    b.set_table(t);
-    PadState p;
-    p.buttons = kPadPs;
-    std::vector<TouchAction> out;
-    std::vector<std::string> actions;
-    b.tick(p, 0, &out, &actions);
-    CHECK(actions.size() == 1 && actions[0] == "settings");
-    actions.clear();
-    b.tick(p, 1, &out, &actions); // held: no repeat
-    CHECK(actions.empty());
-    p.buttons = 0;
-    b.tick(p, 2, &out, &actions); // release: nothing
-    CHECK(actions.empty());
-}
-
-// Scroll mode taps the arrow key once per whole kTouchPanStep accumulated.
-static void test_binding_scroll_stick() {
-    MappedTable t;
-    std::string err;
-    CHECK(parse_mapped("left_stick=scroll", &t, &err));
-    Binding b;
-    b.set_table(t);
-    PadState p;
-    p.lx = 1;
-    std::vector<TouchAction> out;
-    std::vector<std::string> actions;
-    uint64_t now = 0;
-    int right_taps = 0;
-    for (int i = 0; i < 100; ++i) {
-        out.clear();
-        b.tick(p, now, &out, &actions);
-        for (const TouchAction &a : out)
-            if (a.kind == TouchAction::Key && a.scancode == kScanRight && a.down)
-                ++right_taps;
-        now += 10ull * 1000000ull;
-    }
-    CHECK(right_taps >= 18 && right_taps <= 22);
-}
-
-// release_all lets go of every key and mouse button the binding is holding.
-static void test_binding_release_all() {
-    MappedTable t; // left_stick=arrows by default
-    t.buttons[int(PadButton::Cross)] = Target{Target::Mouse, 0, ""};
-    Binding b;
-    b.set_table(t);
-    b.set_cursor(0, 0);
-    PadState p;
-    p.buttons = kPadCross;
-    p.lx = 1;
-    std::vector<TouchAction> out;
-    std::vector<std::string> actions;
-    b.tick(p, 0, &out, &actions);
-    out.clear();
-    b.release_all(&out);
-    bool key_right_up = false, mouse_left_up = false;
-    for (const TouchAction &a : out) {
-        if (a.kind == TouchAction::Key && a.scancode == kScanRight && !a.down)
-            key_right_up = true;
-        if (a.kind == TouchAction::Button && a.button == 0 && !a.down)
-            mouse_left_up = true;
-    }
-    CHECK(key_right_up && mouse_left_up);
-}
-
-// The cursor starts unknown; the first set_bounds (no set_cursor yet, as
-// happens the first time the host reports the window's size) centres it, so
-// a button press with no prior pointer event still lands somewhere sane
-// rather than at (0, 0). Bounds 1000x800 centre at (499.5, 399.5), the
-// midpoint of [0, 999] x [0, 799].
-static void test_binding_cursor_starts_centred() {
-    MappedTable t; // cross=mouse_left by default
-    Binding b;
-    b.set_table(t);
-    b.set_bounds(1000, 800); // no set_cursor call at all
-    PadState p;
-    p.buttons = kPadCross;
-    std::vector<TouchAction> out;
-    std::vector<std::string> actions;
-    b.tick(p, 0, &out, &actions);
-    CHECK(out.size() == 2);
-    CHECK(out[0].kind == TouchAction::Motion && out[0].x == 499.5 && out[0].y == 399.5);
-    CHECK(out[1].kind == TouchAction::Button && out[1].button == 0 && out[1].down);
-}
-
-// left_stick=arrows and dpad=arrows both alias onto the Right key (the
-// defaults do exactly this): held_keys_ is ref-counted, so the key stays
-// down until every source holding it lets go, not just the first to release.
-static void test_binding_aliased_key_is_ref_counted() {
-    MappedTable t; // left_stick=arrows, dpad=arrows by default
-    Binding b;
-    b.set_table(t);
-    PadState p;
-    std::vector<TouchAction> out;
-    std::vector<std::string> actions;
-
-    p.lx = 1; // stick right: one Down
-    b.tick(p, 0, &out, &actions);
-    CHECK(out.size() == 1 && out[0].kind == TouchAction::Key && out[0].scancode == kScanRight &&
-          out[0].down);
-
-    out.clear();
-    p.hat = kHatRight; // dpad-right too, same key: already held, no second Down
-    b.tick(p, 1, &out, &actions);
-    CHECK(out.empty());
-
-    out.clear();
-    p.hat = 0; // dpad-right released: the stick still holds it, no Up
-    b.tick(p, 2, &out, &actions);
-    CHECK(out.empty());
-
-    out.clear();
-    p.lx = 0; // the stick returns to neutral: now it releases
-    b.tick(p, 3, &out, &actions);
-    CHECK(out.size() == 1 && out[0].kind == TouchAction::Key && out[0].scancode == kScanRight &&
-          !out[0].down);
-}
-
-// Two pad buttons mapped to mouse_left: the mouse button stays down until
-// both are released, not just the first.
-static void test_binding_aliased_mouse_button_is_ref_counted() {
-    MappedTable t;
-    t.buttons[int(PadButton::Cross)] = Target{Target::Mouse, 0, ""};
-    t.buttons[int(PadButton::Circle)] = Target{Target::Mouse, 0, ""};
-    Binding b;
-    b.set_table(t);
-    b.set_bounds(1000, 800);
-    b.set_cursor(50, 50);
-    PadState p;
-    std::vector<TouchAction> out;
-    std::vector<std::string> actions;
-
-    p.buttons = kPadCross;
-    b.tick(p, 0, &out, &actions);
-    CHECK(out.size() == 2); // Motion + Button down
-
-    out.clear();
-    p.buttons |= kPadCircle; // already held: no second Motion/Button
-    b.tick(p, 1, &out, &actions);
-    CHECK(out.empty());
-
-    out.clear();
-    p.buttons &= ~kPadCross; // circle still holds it: no Up
-    b.tick(p, 2, &out, &actions);
-    CHECK(out.empty());
-
-    out.clear();
-    p.buttons &= ~kPadCircle; // both released: now it lifts
-    b.tick(p, 3, &out, &actions);
-    CHECK(out.size() == 1 && out[0].kind == TouchAction::Button && out[0].button == 0 &&
-          !out[0].down);
-}
-
-// After release_all, a button release_all forced up but the pad still holds
-// does not re-fire until the pad itself reports it released: a one-shot
-// Action target must not repeat every tick just because release_all reset
-// the internal edge state.
-static void test_binding_release_all_latches_still_held_buttons() {
-    MappedTable t; // ps=action:settings by default
-    Binding b;
-    b.set_table(t);
-    PadState p;
-    p.buttons = kPadPs;
-    std::vector<TouchAction> out;
-    std::vector<std::string> actions;
-
-    b.tick(p, 0, &out, &actions);
-    CHECK(actions.size() == 1 && actions[0] == "settings");
-
-    out.clear();
-    b.release_all(&out);
-
-    actions.clear();
-    b.tick(p, 1, &out, &actions); // ps is still held: must not re-fire
-    CHECK(actions.empty());
-    b.tick(p, 2, &out, &actions); // still held on a later tick: still nothing
-    CHECK(actions.empty());
-
-    p.buttons = 0;
-    b.tick(p, 3, &out, &actions); // now the pad reports it released
-    CHECK(actions.empty());
-
-    actions.clear();
-    p.buttons = kPadPs; // a fresh press fires normally again
-    b.tick(p, 4, &out, &actions);
-    CHECK(actions.size() == 1 && actions[0] == "settings");
-}
-
 // The rumble decision's whole truth table: a connected controller always
 // wins (it has its own motors), the device motor only stands in when there
 // is no controller, and neither leaves nothing to rumble.
@@ -3127,7 +2630,7 @@ static void test_editor_open_and_toolbar() {
     Screen s = editor_screen();
     CHECK(!e.is_open());
     e.set_screen(s);
-    e.open(editor_pad(), Form::Tablet, MappedTable{}, false, true);
+    e.open(editor_pad(), Form::Tablet, true);
     CHECK(e.is_open());
     CHECK(e.snap());
     CHECK(e.layout().name == "pad");
@@ -3168,7 +2671,7 @@ static void test_editor_select_drag_and_reanchor() {
     Editor e;
     Screen s = editor_screen();
     e.set_screen(s);
-    e.open(editor_pad(), Form::Tablet, MappedTable{}, false, true);
+    e.open(editor_pad(), Form::Tablet, true);
     Rect before = cross_rect(e, s);
     CHECK(before.x == 2020 && before.y == 1120 && before.w == 120);
     CHECK(e.layout().groups[2].controls[0].anchor == Anchor::BottomRight);
@@ -3210,7 +2713,7 @@ static void test_editor_snap_off_and_snap_to_control() {
     Editor e;
     Screen s = editor_screen();
     e.set_screen(s);
-    e.open(editor_pad(), Form::Tablet, MappedTable{}, false, false);
+    e.open(editor_pad(), Form::Tablet, false);
     CHECK(!e.snap());
     Rect before = cross_rect(e, s);
     double cx = before.x + 60, cy = before.y + 60;
@@ -3245,7 +2748,7 @@ static void test_editor_pinch() {
     Editor e;
     Screen s = editor_screen();
     e.set_screen(s);
-    e.open(editor_pad(), Form::Tablet, MappedTable{}, false, true);
+    e.open(editor_pad(), Form::Tablet, true);
     Rect r = cross_rect(e, s);
     double cx = r.x + 60, cy = r.y + 60;
     e.finger_down(1, cx, cy);
@@ -3283,7 +2786,7 @@ static void test_editor_add_delete_bind() {
     Editor e;
     Screen s = editor_screen();
     e.set_screen(s);
-    e.open(editor_pad(), Form::Tablet, MappedTable{}, false, true);
+    e.open(editor_pad(), Form::Tablet, true);
     size_t groups = e.layout().groups.size();
     tap_tool(e, Tool::Add);
     CHECK(!e.picker().empty());
@@ -3324,18 +2827,13 @@ static void test_editor_add_delete_bind() {
     for (const auto &g : e.layout().groups)
         CHECK(g.id != "custom");
 
-    // Bind in mapped mode: cross -> key:Space.
+    // Bind a pad button to another pad button.
     tap_rect(e, cross_rect(e, s));
     tap_tool(e, Tool::Bind);
-    CHECK(pick(e, "key:Space"));
-    const Target &t = e.mapped().buttons[int(PadButton::Cross)];
-    CHECK(t.type == Target::Key && t.value == kScanSpace);
-    // A stick binds to a stick mode.
-    tap_rect(e, control_rect(e.layout(), 0, 1, e.content_screen()));
-    tap_tool(e, Tool::Bind);
-    CHECK(pick(e, "wasd"));
-    CHECK(e.mapped().right == StickMode::Wasd);
+    CHECK(pick(e, "start"));
+    CHECK(e.layout().groups[2].controls[0].button == PadButton::Start);
     // Stick cycles floating/fixed and the dead zone.
+    tap_rect(e, control_rect(e.layout(), 0, 1, e.content_screen()));
     double dz = e.layout().groups[0].controls[1].deadzone;
     tap_tool(e, Tool::Stick);
     CHECK(e.layout().groups[0].controls[1].deadzone != dz ||
@@ -3357,14 +2855,13 @@ static void test_editor_bind_native_button() {
     Editor e;
     Screen s = editor_screen();
     e.set_screen(s);
-    e.open(editor_pad(), Form::Tablet, MappedTable{}, true, true);
+    e.open(editor_pad(), Form::Tablet, true);
     tap_rect(e, cross_rect(e, s));
     tap_tool(e, Tool::Bind);
     for (const auto &it : e.picker())
         CHECK(it.value.rfind("key:", 0) != 0);
     CHECK(pick(e, "start"));
     CHECK(e.layout().groups[2].controls[0].button == PadButton::Start);
-    CHECK(e.mapped().buttons[int(PadButton::Cross)].type == Target::Mouse);
 }
 
 static void test_editor_grid_key_moves_its_group() {
@@ -3375,7 +2872,7 @@ static void test_editor_grid_key_moves_its_group() {
     std::string err;
     CHECK(parse_layout(kTinyLayout, &l, &err));
     l.safe_inset = true;
-    e.open(l, Form::Tablet, MappedTable{}, false, false);
+    e.open(l, Form::Tablet, false);
     Rect box = group_rect(e.layout(), 0, e.content_screen());
     Rect key = control_rect(e.layout(), 0, 0, e.content_screen());
     e.finger_down(1, key.x + 5, key.y + 5);
@@ -3406,7 +2903,7 @@ static void test_editor_done_reset_and_layout_names() {
     Screen s = editor_screen();
     e.set_screen(s);
     e.set_names({"pad", "keys", "pad+keys", "pad copy"});
-    e.open(editor_pad(), Form::Tablet, MappedTable{}, false, true);
+    e.open(editor_pad(), Form::Tablet, true);
     CHECK(!e.take_save());
     tap_tool(e, Tool::Done);
     CHECK(e.take_save());
@@ -3465,7 +2962,7 @@ static void test_editor_tools_mid_gesture() {
         // Finger 1 holds the cross, finger 2 taps Delete, then touches empty space.
         Editor e;
         e.set_screen(s);
-        e.open(editor_pad(), Form::Tablet, MappedTable{}, false, true);
+        e.open(editor_pad(), Form::Tablet, true);
         Rect cross = cross_rect(e, s);
         std::vector<Rect> before;
         for (int c = 1; c < 4; ++c)
@@ -3491,7 +2988,7 @@ static void test_editor_tools_mid_gesture() {
         // Add during a drag: the drag is committed and ends; the new control stays put.
         Editor e;
         e.set_screen(s);
-        e.open(editor_pad(), Form::Tablet, MappedTable{}, false, false);
+        e.open(editor_pad(), Form::Tablet, false);
         Rect cross = cross_rect(e, s);
         e.finger_down(1, cross.x + 60, cross.y + 60);
         e.finger_motion(1, cross.x + 60 - 1000, cross.y + 60);
@@ -3517,7 +3014,7 @@ static void test_editor_tools_mid_gesture() {
         // close() drops the gesture and pending results.
         Editor e;
         e.set_screen(s);
-        e.open(editor_pad(), Form::Tablet, MappedTable{}, false, true);
+        e.open(editor_pad(), Form::Tablet, true);
         Rect cross = cross_rect(e, s);
         e.finger_down(1, cross.x + 60, cross.y + 60);
         tap_tool(e, Tool::Done);
@@ -3541,7 +3038,7 @@ static void test_editor_reanchor_every_side() {
     for (const Case &k : cases) {
         Editor e;
         e.set_screen(s);
-        e.open(editor_pad(), Form::Tablet, MappedTable{}, false, false);
+        e.open(editor_pad(), Form::Tablet, false);
         Rect r = cross_rect(e, s);
         e.finger_down(1, r.x + 60, r.y + 60);
         e.finger_motion(1, k.cx, k.cy);
@@ -3559,8 +3056,7 @@ static void test_editor_picker_scroll_is_not_a_tap() {
     Editor e;
     Screen s = editor_screen();
     e.set_screen(s);
-    e.open(editor_pad(), Form::Tablet, MappedTable{}, false, true);
-    CHECK(!e.mapped_changed());
+    e.open(editor_pad(), Form::Tablet, true);
     tap_rect(e, cross_rect(e, s));
     tap_tool(e, Tool::Bind);
     CHECK(e.picker().size() == 12);
@@ -3571,27 +3067,15 @@ static void test_editor_picker_scroll_is_not_a_tap() {
     e.finger_up(3);
     CHECK(!e.picker().empty());
     CHECK(e.picker().front().value != first);
-    CHECK(!e.mapped_changed());
-    CHECK(e.mapped().buttons[int(PadButton::Cross)].type == Target::Mouse);
-    CHECK(pick(e, "wheel_up"));
-    CHECK(e.mapped_changed());
-    CHECK(e.mapped().buttons[int(PadButton::Cross)].type == Target::Wheel);
-
-    // Native: a button bind leaves the table untouched.
-    Editor n;
-    n.set_screen(s);
-    n.open(editor_pad(), Form::Tablet, MappedTable{}, true, true);
-    tap_rect(n, cross_rect(n, s));
-    tap_tool(n, Tool::Bind);
-    CHECK(pick(n, "circle"));
-    CHECK(!n.mapped_changed());
+    CHECK(pick(e, "circle"));
+    CHECK(e.layout().groups[2].controls[0].button == PadButton::Circle);
 }
 
 static void test_editor_pinch_keeps_aspect_and_area() {
     Editor e;
     Screen s = editor_screen();
     e.set_screen(s);
-    e.open(editor_pad(), Form::Tablet, MappedTable{}, false, true);
+    e.open(editor_pad(), Form::Tablet, true);
     // L1 is 100x50 at the top-left: growing is capped where w hits 240,
     // shrinking where h hits 24; the result stays in the area.
     Rect r = control_rect(e.layout(), 3, 0, e.content_screen());
@@ -3618,7 +3102,7 @@ static void test_editor_custom_group_beside_a_grid_custom() {
     std::string err;
     CHECK(parse_layout(kTinyLayout, &l, &err));
     l.groups[0].id = "custom";
-    e.open(l, Form::Tablet, MappedTable{}, false, false);
+    e.open(l, Form::Tablet, false);
     tap_tool(e, Tool::Add);
     CHECK(pick(e, "dpad"));
     CHECK(e.layout().groups.back().id == "custom-2");
@@ -3634,7 +3118,7 @@ static void test_editor_layout_switch_and_delete() {
     Screen s = editor_screen();
     e.set_screen(s);
     e.set_names({"pad", "keys", "pad+keys", "mine"});
-    e.open(editor_pad(), Form::Tablet, MappedTable{}, false, true);
+    e.open(editor_pad(), Form::Tablet, true);
     std::string name;
     // Built-in: delete is refused.
     tap_tool(e, Tool::Layout);
@@ -3657,7 +3141,7 @@ static void test_editor_layout_switch_and_delete() {
     // A user layout can be deleted; a rename replaces its old name.
     Layout mine = editor_pad();
     mine.name = "mine";
-    e.open(mine, Form::Tablet, MappedTable{}, false, true);
+    e.open(mine, Form::Tablet, true);
     tap_tool(e, Tool::Layout);
     CHECK(pick(e, "delete"));
     CHECK(e.take_delete(&name));
@@ -3682,7 +3166,7 @@ static void test_editor_view() {
     Editor e;
     const Screen s = editor_screen();
     e.set_screen(s);
-    e.open(editor_pad(), Form::Tablet, MappedTable{}, false, true);
+    e.open(editor_pad(), Form::Tablet, true);
 
     ControlsView v = make_view(e, s);
     CHECK(v.wanted && v.editing);
@@ -3750,7 +3234,7 @@ static void test_editor_paints_its_layer() {
     Editor e;
     const Screen s = editor_screen();
     e.set_screen(s);
-    e.open(editor_pad(), Form::Tablet, MappedTable{}, false, true);
+    e.open(editor_pad(), Form::Tablet, true);
     const Rect cross = cross_rect(e, s);
     tap_rect(e, cross);
     const ControlsView v = make_view(e, s);
@@ -3788,25 +3272,6 @@ static void test_editor_paints_its_layer() {
     CHECK(c2.at(s.dw - 2, s.dh - 2).a == 0);
 }
 
-// binding.txt holds the player's changes alone, not the whole table.
-static void test_write_mapped_diff() {
-    MappedTable base;
-    CHECK(write_mapped_diff(base, base).empty());
-    MappedTable changed = base;
-    changed.buttons[int(PadButton::Cross)] = Target{Target::Key, kScanSpace, ""};
-    changed.left = StickMode::Cursor;
-    const std::string text = write_mapped_diff(base, changed);
-    CHECK(text == "cross=key:Space;left_stick=cursor");
-    // It reads back as the same table, applied over the base.
-    MappedTable round = base;
-    std::string err;
-    CHECK(parse_mapped(text, &round, &err));
-    CHECK(round.buttons[int(PadButton::Cross)].type == Target::Key);
-    CHECK(round.buttons[int(PadButton::Cross)].value == kScanSpace);
-    CHECK(round.left == StickMode::Cursor);
-    CHECK(round.right == base.right);
-}
-
 // Records what apply_editor_results asks the host for.
 namespace {
 struct FakeEditorHost : EditorHost {
@@ -3817,12 +3282,6 @@ struct FakeEditorHost : EditorHost {
     }
     void delete_layout(const std::string &name, Form form) override {
         calls.push_back("delete:" + name + "." + form_name(form));
-    }
-    void write_binding(const std::string &text) override {
-        calls.push_back(text.empty() ? "binding:none" : "binding:" + text);
-    }
-    void apply_mapped(const MappedTable &) override {
-        calls.push_back("apply_mapped");
     }
     std::vector<std::string> names() override {
         return name_list;
@@ -3842,7 +3301,7 @@ struct FakeEditorHost : EditorHost {
 // An editor open on the stand-in pad layout, with the built-in names.
 static void open_for_results(Editor &e, const Screen &s) {
     e.set_screen(s);
-    e.open(editor_pad(), Form::Tablet, MappedTable{}, false, true);
+    e.open(editor_pad(), Form::Tablet, true);
     e.set_names({"pad", "keys", "pad+keys"});
 }
 
@@ -3852,48 +3311,27 @@ static void test_apply_results_save() {
     const Screen s = editor_screen();
     open_for_results(e, s);
     FakeEditorHost host;
-    MappedTable base;
     bool renamed = false;
     tap_tool(e, Tool::Done);
-    CHECK(apply_editor_results(e, host, "pad", base, &renamed) == EditorNext::Close);
+    CHECK(apply_editor_results(e, host, "pad", &renamed) == EditorNext::Close);
     CHECK(!renamed);
     CHECK((host.calls == std::vector<std::string>{"save:pad.tablet", "snap:on"}));
 
     // Nothing pending: nothing happens, and the editor stays open.
     host.calls.clear();
-    CHECK(apply_editor_results(e, host, "pad", base, &renamed) == EditorNext::Keep);
+    CHECK(apply_editor_results(e, host, "pad", &renamed) == EditorNext::Keep);
     CHECK(host.calls.empty());
 }
 
-// A bind that changes the mapped table writes the binding difference too.
-static void test_apply_results_save_binding() {
-    Editor e;
-    const Screen s = editor_screen();
-    open_for_results(e, s);
-    tap_rect(e, cross_rect(e, s));
-    tap_tool(e, Tool::Bind);
-    CHECK(pick(e, "key:Space"));
-    CHECK(e.mapped_changed());
-    tap_tool(e, Tool::Done);
-    FakeEditorHost host;
-    CHECK(apply_editor_results(e, host, "pad", MappedTable{}, nullptr) == EditorNext::Close);
-    CHECK(host.calls.size() == 4);
-    CHECK(host.calls[0] == "save:pad.tablet");
-    CHECK(host.calls[1] == "binding:cross=key:Space");
-    CHECK(host.calls[2] == "apply_mapped");
-    CHECK(host.calls[3] == "snap:on");
-}
-
-// Reset removes the player's copy and the binding, and the editor reopens.
+// Reset removes the player's copy and the editor reopens.
 static void test_apply_results_reset() {
     Editor e;
     const Screen s = editor_screen();
     open_for_results(e, s);
     tap_tool(e, Tool::Reset);
     FakeEditorHost host;
-    CHECK(apply_editor_results(e, host, "pad", MappedTable{}, nullptr) == EditorNext::Reopen);
-    CHECK(
-        (host.calls == std::vector<std::string>{"delete:pad.tablet", "binding:none", "set_names"}));
+    CHECK(apply_editor_results(e, host, "pad", nullptr) == EditorNext::Reopen);
+    CHECK((host.calls == std::vector<std::string>{"delete:pad.tablet", "set_names"}));
 }
 
 // A duplicate keeps the original; a rename replaces it. Both save under the
@@ -3909,7 +3347,7 @@ static void test_apply_results_duplicate_and_rename() {
     bool renamed = false;
     tap_tool(e, Tool::Done);
     host.name_list = {"pad", "keys", "pad+keys", "pad copy"};
-    CHECK(apply_editor_results(e, host, "pad", MappedTable{}, &renamed) == EditorNext::Close);
+    CHECK(apply_editor_results(e, host, "pad", &renamed) == EditorNext::Close);
     CHECK(!renamed);
     // No delete: "pad" is still there.
     CHECK((host.calls == std::vector<std::string>{"save:pad copy.tablet", "snap:on", "set_names",
@@ -3924,7 +3362,7 @@ static void test_apply_results_duplicate_and_rename() {
     CHECK(pick(r, "rename"));
     FakeEditorHost host2;
     renamed = false;
-    CHECK(apply_editor_results(r, host2, "pad copy", MappedTable{}, &renamed) == EditorNext::Keep);
+    CHECK(apply_editor_results(r, host2, "pad copy", &renamed) == EditorNext::Keep);
     CHECK(renamed);
     CHECK(host2.calls.empty());
     r.text("mine");
@@ -3932,7 +3370,7 @@ static void test_apply_results_duplicate_and_rename() {
     CHECK(r.layout().name == "mine");
     tap_tool(r, Tool::Done);
     host2.name_list = {"pad", "keys", "pad+keys", "mine"};
-    CHECK(apply_editor_results(r, host2, "pad copy", MappedTable{}, &renamed) == EditorNext::Close);
+    CHECK(apply_editor_results(r, host2, "pad copy", &renamed) == EditorNext::Close);
     CHECK((host2.calls == std::vector<std::string>{"save:mine.tablet", "snap:on",
                                                    "delete:pad copy.tablet", "set_names",
                                                    "select:mine"}));
@@ -3948,7 +3386,7 @@ static void test_apply_results_switch_and_delete() {
     CHECK(pick(e, "switch"));
     CHECK(pick(e, "keys"));
     FakeEditorHost host;
-    CHECK(apply_editor_results(e, host, "pad", MappedTable{}, nullptr) == EditorNext::Reopen);
+    CHECK(apply_editor_results(e, host, "pad", nullptr) == EditorNext::Reopen);
     CHECK((host.calls == std::vector<std::string>{"select:keys"}));
 
     // Delete works on a user layout: duplicate first, so the name is not a
@@ -3960,7 +3398,7 @@ static void test_apply_results_switch_and_delete() {
     tap_tool(d, Tool::Layout);
     CHECK(pick(d, "delete"));
     FakeEditorHost host2;
-    CHECK(apply_editor_results(d, host2, "pad", MappedTable{}, nullptr) == EditorNext::Reopen);
+    CHECK(apply_editor_results(d, host2, "pad", nullptr) == EditorNext::Reopen);
     CHECK((host2.calls == std::vector<std::string>{"delete:pad copy.tablet", "set_names"}));
 }
 
@@ -3971,7 +3409,7 @@ static void test_editor_done_without_a_tap() {
     open_for_results(e, s);
     e.done();
     FakeEditorHost host;
-    CHECK(apply_editor_results(e, host, "pad", MappedTable{}, nullptr) == EditorNext::Close);
+    CHECK(apply_editor_results(e, host, "pad", nullptr) == EditorNext::Close);
     CHECK(host.calls.front() == "save:pad.tablet");
 }
 
@@ -3986,7 +3424,7 @@ static void dump_editor(const char *dir, const Screen &s) {
         std::string err;
         if (builtin_layout("pad", Form::Tablet))
             (void)parse_layout(builtin_layout("pad", Form::Tablet), &l, &err);
-        e.open(l, Form::Tablet, MappedTable{}, false, true);
+        e.open(l, Form::Tablet, true);
         e.set_names({"pad", "keys", "pad+keys"});
         if (state > 0) {
             // Select the first control and drag it a little, so the
@@ -4045,7 +3483,7 @@ static void test_editor_reserves_the_toolbar_band() {
     Editor e;
     const Screen s = editor_screen();
     e.set_screen(s);
-    e.open(l, Form::Tablet, MappedTable{}, false, true);
+    e.open(l, Form::Tablet, true);
     // The content area starts below the toolbar, and so does the tab.
     const Rect bar = e.toolbar().back().rect;
     const Rect area = anchor_area(e.layout(), e.content_screen());
@@ -4222,20 +3660,6 @@ int main(int argc, char **argv) {
     test_make_view_revision_ignores_undrawn_press();
     test_tablet_fallback();
     test_raster_shape_bounds_are_clamped();
-    test_binding_parse_mapped();
-    test_binding_button_mouse();
-    test_binding_cursor_stick();
-    test_binding_arrows_stick();
-    test_binding_horizontal_arrows();
-    test_tablet_simultaneous_controls();
-    test_binding_wheel_button();
-    test_binding_action_button();
-    test_binding_scroll_stick();
-    test_binding_release_all();
-    test_binding_cursor_starts_centred();
-    test_binding_aliased_key_is_ref_counted();
-    test_binding_aliased_mouse_button_is_ref_counted();
-    test_binding_release_all_latches_still_held_buttons();
     test_rumble_sink_truth_table();
     test_controls_area_below_the_game();
     test_router_claims_the_controls_area();
@@ -4277,9 +3701,7 @@ int main(int argc, char **argv) {
     test_editor_layout_switch_and_delete();
     test_editor_view();
     test_editor_paints_its_layer();
-    test_write_mapped_diff();
     test_apply_results_save();
-    test_apply_results_save_binding();
     test_apply_results_reset();
     test_apply_results_duplicate_and_rename();
     test_apply_results_switch_and_delete();

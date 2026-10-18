@@ -371,9 +371,7 @@ MOD_TEST_SUITE(settings_page_without_symbols_shows_host_controls) {
     mods_display_reset();
     mods_page_init();
     MOD_CHECK_EQ(mods_page_open(nullptr), POP_OK);
-    const DisplayRow hidden[] = {DISPLAY_RENDERING,    DISPLAY_UI_SCALE, DISPLAY_WIDE,
-                                 DISPLAY_CLASSIC_MODE, DISPLAY_TEXTURES, DISPLAY_FILTERING};
-    const DisplayRow visible[] = {DISPLAY_WINDOW, DISPLAY_FPS, DISPLAY_OVERLAY};
+    const DisplayRow visible[] = {DISPLAY_WINDOW, DISPLAY_OVERLAY};
     auto page_has_row = [](DisplayRow row) {
         const std::string label = mods_display_line(row);
         for (uint32_t i = 0; i < mods_page_line_count(); ++i)
@@ -381,15 +379,11 @@ MOD_TEST_SUITE(settings_page_without_symbols_shows_host_controls) {
                 return true;
         return false;
     };
-    for (DisplayRow row : hidden) {
-        MOD_CHECK(!mods_display_row_applies(row));
-        MOD_CHECK(!page_has_row(row));
-    }
     for (DisplayRow row : visible) {
         MOD_CHECK(mods_display_row_applies(row));
         MOD_CHECK(page_has_row(row));
     }
-    MOD_CHECK_EQ(mods_page_line_count(), 3u + CONTROLS_ROW_COUNT);
+    MOD_CHECK_EQ(mods_page_line_count(), 2u + CONTROLS_ROW_COUNT);
     // The first visible row still targets window mode after filtering.
     mods_input_key(0xcd, 0, true);
     mods_input_key(0xcd, 0, false);

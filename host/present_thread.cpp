@@ -939,8 +939,7 @@ struct Service : std::enable_shared_from_this<Service> {
                     snapshot = pacing.snapshot(ts, drops);
                 }
                 performance_overlay.draw(device, cb, drawable, drawable_desc.width,
-                                         drawable_desc.height, snapshot, ts, mods_display_overlay(),
-                                         mods_display_fps());
+                                         drawable_desc.height, snapshot, ts, mods_display_overlay());
                 const controls::ControlsView controls_view = host_present_controls();
                 if (controls_view.wanted)
                     controls_overlay.draw(device, cb, drawable, drawable_desc.width,

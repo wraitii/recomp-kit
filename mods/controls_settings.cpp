@@ -22,18 +22,18 @@ std::vector<std::string> g_names = {"pad", "keys", "pad+keys"};
 // EDIT_ROW is an action, never declared or persisted.
 constexpr int kStoredRowCount = CONTROLS_EDIT_ROW;
 const char *const kKeys[kStoredRowCount] = {
-    "layout", "size", "opacity", "haptics", "pad_with_controller", "snap"};
+    "mobile_control", "layout", "size", "opacity", "haptics", "pad_with_controller", "snap"};
 const char *const kLabels[kStoredRowCount] = {
-    "Controls",       "Controls size",       "Controls opacity",
-    "Button haptics", "Pad with controller", "Editor snapping"};
-const int kMin[kStoredRowCount] = {0, 0, 20, 0, 0, 0};
+    "Mobile controls", "Controls",        "Controls size",   "Controls opacity",
+    "Button haptics",  "Pad with controller", "Editor snapping"};
+const int kMin[kStoredRowCount] = {0, 0, 0, 20, 0, 0, 0};
 // The layout row's true maximum is dynamic (g_names.size()); this entry is
 // unused for it and only fills out the array.
-const int kMax[kStoredRowCount] = {0, 2, 100, 1, 1, 1};
+const int kMax[kStoredRowCount] = {2, 0, 2, 100, 1, 1, 1};
 
 // Written by the settings page and the on-screen tab, read by the host loop
 // that lays the controls out: each value is atomic on its own.
-std::atomic<int> values[CONTROLS_ROW_COUNT] = {0, 1, 100, 1, 0, 1, 0};
+std::atomic<int> values[CONTROLS_ROW_COUNT] = {1, 0, 1, 100, 1, 0, 1, 0};
 // The hidden-group bits: one 16-bit lane per form factor, packed into the
 // single stored "hidden" value with kHiddenPacked as the marker that says so.
 // A value without the marker was written by the build that kept one set of
@@ -51,6 +51,8 @@ std::atomic<bool> hidden_dirty{false};
 std::atomic<bool> edit_request{false};
 std::atomic<bool> editing{false};
 std::atomic<bool> initialized{false};
+std::atomic<bool> platform_touch{true};
+std::atomic<bool> layout_available{true};
 
 int layout_max() {
     std::lock_guard<std::mutex> lock(g_names_mutex);
@@ -117,12 +119,13 @@ void mods_controls_refresh_names() {
                       std::clamp(values[CONTROLS_LAYOUT_ROW].load(), 0, layout_max()));
 }
 
-void mods_controls_init(const char *default_layout) {
+void mods_controls_init(const char *default_layout, int mobile_default) {
     if (initialized.exchange(true))
         return;
 
     const std::string want = default_layout ? default_layout : "";
     const int found = index_of(want);
+    values[CONTROLS_MOBILE_ROW] = std::clamp(mobile_default, 0, 2);
     values[CONTROLS_LAYOUT_ROW] = want == "hidden" ? layout_max() : found >= 0 ? found : 0;
     values[CONTROLS_SIZE_ROW] = 1;
     values[CONTROLS_OPACITY_ROW] = 100;
@@ -186,10 +189,13 @@ bool mods_controls_initialized() {
 
 void mods_controls_reset() {
     initialized = false;
+    platform_touch = true;
+    layout_available = true;
     {
         std::lock_guard<std::mutex> lock(g_names_mutex);
         g_names = {"pad", "keys", "pad+keys"};
     }
+    values[CONTROLS_MOBILE_ROW] = 1;
     values[CONTROLS_LAYOUT_ROW] = 0;
     values[CONTROLS_SIZE_ROW] = 1;
     values[CONTROLS_OPACITY_ROW] = 100;
@@ -238,7 +244,9 @@ PopModStatus mods_controls_nudge(ControlsRow row, int delta) {
     }
     const int current = mods_controls_value(row);
     int value;
-    if (row == CONTROLS_LAYOUT_ROW) {
+    if (row == CONTROLS_MOBILE_ROW) {
+        value = (current + delta + 3) % 3;
+    } else if (row == CONTROLS_LAYOUT_ROW) {
         const int count = layout_max() + 1;
         value = ((current + delta) % count + count) % count;
     } else if (row == CONTROLS_SIZE_ROW) {
@@ -254,6 +262,12 @@ PopModStatus mods_controls_nudge(ControlsRow row, int delta) {
 std::string mods_controls_line(ControlsRow row) {
     char buf[128];
     switch (row) {
+    case CONTROLS_MOBILE_ROW: {
+        static const char *const modes[3] = {"Off", "Mobile only", "Always"};
+        snprintf(buf, sizeof buf, "%-22s %s", "Mobile controls",
+                 modes[std::clamp(mods_controls_value(row), 0, 2)]);
+        break;
+    }
     case CONTROLS_LAYOUT_ROW: {
         const std::string name = mods_controls_layout_name();
         snprintf(buf, sizeof buf, "%-22s %s", "Controls", name.empty() ? "hidden" : name.c_str());
@@ -287,6 +301,24 @@ std::string mods_controls_line(ControlsRow row) {
         buf[0] = '\0';
     }
     return buf;
+}
+
+void mods_controls_set_platform(bool touch_device) {
+    platform_touch = touch_device;
+}
+
+void mods_controls_set_layout_available(bool available) {
+    layout_available = available;
+}
+
+bool mods_controls_row_applies(ControlsRow row) {
+    if (row == CONTROLS_MOBILE_ROW)
+        return true;
+    const int mobile = mods_controls_value(CONTROLS_MOBILE_ROW);
+    const bool active = mobile == 2 || (mobile == 1 && platform_touch.load());
+    if (!active)
+        return false;
+    return row != CONTROLS_EDIT_ROW || layout_available.load();
 }
 
 uint32_t mods_controls_hidden_groups(ControlsForm form) {

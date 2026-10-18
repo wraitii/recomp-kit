@@ -6,7 +6,7 @@
 namespace controls {
 
 EditorNext apply_editor_results(Editor &e, EditorHost &host, const std::string &opened_name,
-                                const MappedTable &base, bool *renamed) {
+                                bool *renamed) {
     if (!e.is_open())
         return EditorNext::Keep;
     // Every result first: close() clears them all, and a save that also
@@ -26,10 +26,6 @@ EditorNext apply_editor_results(Editor &e, EditorHost &host, const std::string &
     if (save) {
         const std::string name = e.layout().name;
         host.save_layout(e.layout(), form);
-        if (e.mapped_changed()) {
-            host.write_binding(write_mapped_diff(base, e.mapped()));
-            host.apply_mapped(e.mapped());
-        }
         host.set_snap(e.snap());
         // Saved under a new name: a rename leaves nothing behind, while a
         // duplicate keeps the layout it was copied from.
@@ -42,10 +38,9 @@ EditorNext apply_editor_results(Editor &e, EditorHost &host, const std::string &
         return EditorNext::Close;
     }
     if (reset) {
-        // Back to the game's own layout: the player's copy and their binding
-        // both go, and the editor reopens on what is left.
+        // Back to the game's own layout: the player's copy goes, and the
+        // editor reopens on what is left.
         host.delete_layout(opened_name, form);
-        host.write_binding("");
         host.set_names(host.names());
         return EditorNext::Reopen;
     }

@@ -30,7 +30,6 @@
 #include "../performance_overlay.h"
 #include "../controls/overlay.h"
 #include "../controls/router.h"
-#include "../../runtime/frame_deadline.h"
 #include "../audio_capture.h"
 #include "../midi.h"
 #include "../script.h"
@@ -8464,69 +8463,6 @@ static void test_display_settings_bridge() {
     CHECK(display_offered_modes == supported);
 }
 
-static void test_native_frame_metrics() {
-    // Rounded sleeps must average to the requested cadence, including 120Hz's
-    // fractional 8.333ms period. Slow work must not trigger a catch-up burst.
-    for (int rate : {40, 60, 120}) {
-        FrameDeadline deadline;
-        int64_t now = 0;
-        for (int i = 0; i < rate * 10; ++i) {
-            deadline.begin(rate, now);
-            now += 2000000;
-            now += int64_t(deadline.wait_ms(now)) * 1000000;
-        }
-        CHECK_NEAR(double(now) / 1e9, 10, .001);
-        now += 1000000000;
-        deadline.begin(rate, now);
-        CHECK(deadline.wait_ms(now) > 0);
-        deadline.begin(0, now);
-        CHECK_EQ(deadline.wait_ms(now), 0u);
-        deadline.begin(120, now);
-        CHECK_EQ(deadline.wait_ms(now), 9u);
-        deadline.begin(60, now);
-        CHECK_EQ(deadline.wait_ms(now), 17u);
-    }
-    for (int rate : {40, 60, 120}) {
-        FrameDeadline deadline;
-        int64_t now = 1000000000;
-        // An inactive guest keeps entering the outer loop but skips drawing
-        // and both end-of-frame waits. Those passes must not reserve future
-        // presentation slots that are then slept through after activation.
-        for (int i = 0; i < 50000; ++i) {
-            deadline.begin(rate, now);
-            now += 100000; // five seconds away, many non-rendering passes
-        }
-        deadline.begin(rate, now);
-        CHECK(deadline.wait_ms(now) <= uint32_t((1000 + rate - 1) / rate));
-        const int64_t resumed = now;
-        for (int i = 0; i < rate * 2; ++i) {
-            deadline.begin(rate, now);
-            now += 2000000;
-            now += int64_t(deadline.wait_ms(now)) * 1000000;
-        }
-        CHECK_NEAR(double(now - resumed) / 1e9, 2, .001);
-    }
-    FramePacing p;
-    // 60 new frames with alternate repeats on a 120Hz display.
-    for (int i = 0; i <= 240; ++i)
-        p.displayed(double(i) / 120, i % 2, 2, 4);
-    auto s = p.snapshot(2, 3);
-    CHECK_NEAR(s.new_fps, 60, .01);
-    CHECK_NEAR(s.display_fps, 120, .01);
-    CHECK_NEAR(s.median_ms, 1000.0 / 60, .01);
-    CHECK_NEAR(s.p95_ms, 1000.0 / 60, .01);
-    CHECK_NEAR(s.repeat_percent, 50, .01);
-    CHECK_EQ(s.drops, 3u);
-    CHECK_NEAR(s.gpu_ms, 2, .01);
-    CHECK_NEAR(s.age_ms, 4, .01);
-    CHECK_EQ(p.snapshot(5, 3).new_fps, 0); // a stalled producer cannot keep reporting 60
-    CHECK(p.snapshot(5, 3).intervals_ms.empty());
-    p.displayed(NAN, false, 0, 0);
-    CHECK_EQ(p.snapshot(2, 3).new_frames, s.new_frames);
-    p.displayed(2.2, false, 3, 8);
-    p.displayed(2.5, false, 3, 8);
-    CHECK(p.snapshot(2.5, 3).intervals_ms.back() > 299);
-}
 static void test_native_stick_motion_pixels() {
     struct Sink : controls::ControlsSink {
         void key(int, bool) override {}
@@ -8621,7 +8557,7 @@ static void test_native_overlay_pixels() {
     snapshot.new_fps = 60;
     snapshot.display_fps = 120;
     snapshot.intervals_ms = {8, 16, 33, 50};
-    overlay.draw(device.get(), cb, target, 640, 480, snapshot, 1, 2, 60);
+    overlay.draw(device.get(), cb, target, 640, 480, snapshot, 1, 2);
     device->commit(cb);
     device->wait(cb);
     CHECK(device->status(cb) == gpu::CommandStatus::Completed);
@@ -8688,7 +8624,6 @@ int main(int argc, char **argv) {
     }
     mem_init();
     test_fullscreen_edge_presentation();
-    test_native_frame_metrics();
     test_native_overlay_pixels();
     test_native_stick_motion_pixels();
     // Focused headless validation when the sandbox cannot create audio/Metal

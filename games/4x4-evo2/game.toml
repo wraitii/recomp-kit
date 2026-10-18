@@ -20,7 +20,7 @@ native = { header = "native/frame_pacing.h", sources = ["native/frame_pacing.cpp
 d3d8_wgpu = true
 
 [controls]
-pad = "native"
+mobile_control = "mobile-only"
 
 [modules.aux.tridx8tl]
 name = "tridx8tl.dll"

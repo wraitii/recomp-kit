@@ -97,8 +97,8 @@ enum { BATTERY_OFF_BatteryType = 0, BATTERY_OFF_BatteryLevel = 1, BATTERY_SIZE =
 const uint32_t BATTERY_TYPE_WIRED = 1;
 const uint32_t BATTERY_LEVEL_FULL = 3;
 
-// Mirrors joy_served() (dinput_joystick.cpp): user 0 exists only in native
-// pad mode with the XInput bit set in RECOMP_CONTROLS_PAD's native-API mask.
+// Mirrors joy_served() (dinput_joystick.cpp): user 0 exists only when the
+// host serves a native pad and the XInput bit is set in its native-API mask.
 bool served() {
     return host_pad_mode() == 2 && (host_pad_native_apis() & 2) != 0;
 }
@@ -522,9 +522,8 @@ const ImportShim g_xinput910_exports[] = {
 } // namespace
 
 // dx_register_shims calls this beside dinput_register(). Registration stays
-// unconditional, never gated on host_pad_mode(): host_pad_mode() is decided
-// once, from RECOMP_CONTROLS_PAD, so it is effectively compile-time for a
-// running process, but that is beside the point anyway. The loader's
+// unconditional, never gated on host_pad_mode(): the app always serves the
+// pad, while headless and test hosts keep the weak default of 0. The loader's
 // patch_iat() (runtime/loader.cpp) walks every IAT slot unconditionally and
 // calls imports_alloc_trampoline(dll, name, nullptr, ARGC_UNKNOWN) for a
 // static import whose (dll, name) nothing has registered - it never leaves

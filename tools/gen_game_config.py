@@ -27,11 +27,6 @@ ADDRESSES = (("image_base", "RECOMP_IMAGE_BASE"), ("entry_point", "RECOMP_ENTRY_
 # leaves out for compile-time guards (sprites) are not here: those stay
 # undefined so `#ifdef RECOMP_HOOK_SPRITES_COUNT` keeps working.
 HOOK_DEFAULTS = {
-    "frame_clock_begin": 0,
-    "frame_clock_wait": 0,
-    "frame_clock_wait_clamp": 0,
-    "frame_clock_clamp_deadline": 0,
-    "frame_clock_wait_deadline": 0,
     "cursor_surface_ptrs": [0],
     "camera": 0,
 }
@@ -68,13 +63,12 @@ def render_header(cfg):
     lines.append("#define RECOMP_KIT_DIR %s" % c_string(Path(__file__).resolve().parents[1].as_posix()))
     lines.append("#define RECOMP_ENVIRONMENT_PASSTHROUGH %s" % c_string_list(cfg["environment"]["passthrough"]))
     lines.append("#define RECOMP_FONT_FILES %s" % c_string_list(cfg["fonts"]["files"]))
-    # The on-screen controls a fresh profile starts with, and how the pad maps
-    # onto the keyboard/mouse or a real controller (games/stub/game.toml [controls]).
+    # The on-screen controls a fresh profile starts with and where they may appear
+    # (games/stub/game.toml [controls]).
     controls = cfg["controls"]
     lines.append("#define RECOMP_CONTROLS_DEFAULT_LAYOUT %s" % c_string(controls["default_layout"]))
-    lines.append("#define RECOMP_CONTROLS_PAD %d" % ("off", "mapped", "native").index(controls["pad"]))
-    lines.append("#define RECOMP_CONTROLS_MAPPED %s" % c_string(
-        ";".join("%s=%s" % (k, controls["mapped"][k]) for k in sorted(controls["mapped"]))))
+    lines.append("#define RECOMP_CONTROLS_MOBILE_CONTROL %d" %
+                 game_config.MOBILE_CONTROLS.index(controls["mobile_control"]))
     native = controls["native"]
     lines.append("#define RECOMP_CONTROLS_XINPUT %d" % int(native["xinput"]))
     lines.append("#define RECOMP_CONTROLS_DINPUT %d" % int(native["dinput"]))

@@ -33,7 +33,7 @@ class PadMapperEditor {
   private:
     enum class Page { Overview, Mapping, Calibration };
     enum class Popup { None, Axis, Button, NegativeButton, PositiveButton, Preset, Discard };
-    enum class Capture { None, NegativeKey, PositiveKey, ButtonKey, Identify };
+    enum class Capture { None, Identify };
     void changed();
     void activate(int id);
     void select(int source);
@@ -57,8 +57,6 @@ class PadMapperEditor {
     bool open_ = false;
     bool close_requested_ = false;
     bool advanced_ = false;
-    bool keyboard_ = false;
-    bool shift_ = false;
     bool sweep_ = false;
     bool center_capture_ = false;
     double center_sum_ = 0;

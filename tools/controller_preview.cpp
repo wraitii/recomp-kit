@@ -30,8 +30,7 @@ int main(int argc, char **argv) {
     auto view = [&] {
         controls::PadMapper mapper;
         mapper.set_profile(editor.profile());
-        std::vector<TouchAction> ignored;
-        mapper.process(raw, &calibrated, &output, &ignored);
+        mapper.process(raw, &calibrated, &output);
         return editor.view(screen, raw, calibrated, output, "");
     };
     controls::ControlsView frame = view();

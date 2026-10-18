@@ -72,7 +72,7 @@ set_tests_properties(keypad_tests PROPERTIES LABELS nogame)
 add_executable(controls_tests ${HOST}/controls/json.cpp ${HOST}/controls/layout.cpp
                               ${HOST}/controls/builtin_layouts.cpp ${HOST}/controls/layout_store.cpp
                               ${HOST}/controls/router.cpp ${HOST}/controls/vpad.cpp
-                              ${HOST}/controls/binding.cpp ${HOST}/controls/overlay_view.cpp
+                              ${HOST}/controls/overlay_view.cpp
                               ${HOST}/controls/raster.cpp ${HOST}/controls/overlay_paint.cpp
                               ${HOST}/controls/pad_art.cpp
                               ${HOST}/controls/haptics.cpp
@@ -168,7 +168,7 @@ set(RECOMP_CORE_LIBS recomp_platform recomp_runtime recomp_snapshot recomp_dx re
 set(RECOMP_CONTROLS_SOURCES ${HOST}/controls/layout.cpp
                          ${HOST}/controls/builtin_layouts.cpp ${HOST}/controls/layout_store.cpp
                          ${HOST}/controls/router.cpp ${HOST}/controls/vpad.cpp
-                         ${HOST}/controls/binding.cpp ${HOST}/controls/overlay_view.cpp
+                         ${HOST}/controls/overlay_view.cpp
                          ${HOST}/controls/overlay.cpp ${HOST}/controls/raster.cpp
                           ${HOST}/controls/overlay_paint.cpp ${HOST}/controls/pad_art.cpp
                           ${HOST}/controls/haptics.cpp

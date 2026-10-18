@@ -223,9 +223,8 @@ MOD_TEST_SUITE(page_toggles_on_its_reserved_key) {
     MOD_CHECK(mods_input_key(0x44, 0x79, true)); // F10, consumed
     mods_input_key(0x44, 0x79, false);
     MOD_CHECK(mods_page_visible());
-    // Three mod settings, the controls rows and either all nine
-    // display rows or only the three host controls when no symbols are available.
-    MOD_CHECK_EQ(mods_page_line_count(), (mods_symbols_count() ? 12u : 6u) + CONTROLS_ROW_COUNT);
+    // Three mod settings, the two display rows and the controls rows.
+    MOD_CHECK_EQ(mods_page_line_count(), 5u + CONTROLS_ROW_COUNT);
     MOD_CHECK(mods_input_key(0x44, 0x79, true));
     mods_input_key(0x44, 0x79, false);
     MOD_CHECK(!mods_page_visible());
@@ -241,12 +240,9 @@ MOD_TEST_SUITE(page_shows_only_the_rows_the_game_lists) {
     MOD_CHECK_EQ(mods_page_line_count(), 5u + CONTROLS_ROW_COUNT);
     MOD_CHECK(std::string(mods_page_line(0)).find("Display:") == 0);
     MOD_CHECK(std::string(mods_page_line(1)).find("Performance overlay:") == 0);
-    MOD_CHECK(std::string(mods_page_line(2)).find("Controls") == 0);
+    MOD_CHECK(std::string(mods_page_line(2)).find("Mobile controls") == 0);
     // An unlisted row cannot be set and keeps its neutral value.
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_UI_SCALE, 3), POP_E_STATE);
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_RENDERING, 1), POP_E_STATE);
-    MOD_CHECK_EQ(mods_display_scale(), 0);
-    MOD_CHECK_EQ(mods_display_classic(), 0);
+    MOD_CHECK_EQ(mods_display_set(DISPLAY_WINDOW, 3), POP_E_RANGE);
     mods_page_close();
     teardown();
     // Without the controls rows.
@@ -257,18 +253,6 @@ MOD_TEST_SUITE(page_shows_only_the_rows_the_game_lists) {
     mods_page_close();
     teardown();
     mods_settings_rows_for_test((2u << DISPLAY_CONTROLS_BIT) - 1);
-}
-
-MOD_TEST_SUITE(textures_row_says_what_the_pack_holds) {
-    mods_display_reset();
-    MOD_CHECK(mods_display_line(DISPLAY_TEXTURES) == "Textures: HD pack");
-    mods_display_texture_pack(0);
-    MOD_CHECK(mods_display_line(DISPLAY_TEXTURES) == "Textures: original (no texture pack)");
-    mods_display_texture_pack(12);
-    MOD_CHECK(mods_display_line(DISPLAY_TEXTURES) == "Textures: HD pack");
-    mods_display_texture_pack(0);
-    MOD_CHECK(mods_display_line(DISPLAY_TEXTURES) == "Textures: original (no texture pack)");
-    mods_display_reset();
 }
 
 MOD_TEST_SUITE(page_draws_into_host_storage_only) {

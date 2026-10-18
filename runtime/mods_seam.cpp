@@ -127,12 +127,8 @@ __attribute__((weak)) int mods_display_wide() {
     return 1;
 }
 __attribute__((weak)) void mods_display_scene_domain(int, int) {}
-__attribute__((weak)) void mods_display_texture_pack(uint32_t) {}
 __attribute__((weak)) int mods_display_scene_width(int w, int) {
     return w;
-}
-__attribute__((weak)) int mods_display_fps() {
-    return 0;
 }
 __attribute__((weak)) int mods_display_overlay() {
     return 0;

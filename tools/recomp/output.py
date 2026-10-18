@@ -237,16 +237,17 @@ def emit_entry_dispatch():
 
 def emit_contract_prepare(addr, known_mode=False):
     mode_guard = "        (!mode_proven && (c->fpu_cw & 0x0f00u) != 0u) ||\n" if known_mode else ""
+    unused_mode = "" if known_mode else "    (void)mode_proven;\n"
     return """
 static inline int entry_contract_prepare_%08x(X86 *c, int mode_proven)
 {
-    if (RECOMP_UNLIKELY(recomp_hooks_ever || recomp_profile_enabled || recomp_frame_watch ||
+%s    if (RECOMP_UNLIKELY(recomp_hooks_ever || recomp_profile_enabled || recomp_frame_watch ||
 %s        c->checkpoint_countdown == 0u || entry_contract_base_%08x != fn_%08x))
         return 0;
     --c->checkpoint_countdown;
     return 1;
 }
-""" % (addr, mode_guard, addr, addr)
+""" % (addr, unused_mode, mode_guard, addr, addr)
 
 
 def emit_contract_base(addr):

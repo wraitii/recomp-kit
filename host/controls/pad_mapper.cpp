@@ -1,7 +1,5 @@
 #include "pad_mapper.h"
 
-#include "../keypad_layout.h"
-
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -18,8 +16,6 @@ const uint16_t kButtonBits[13] = {kPadCross,  kPadCircle, kPadSquare, kPadTriang
 const uint8_t kHatBits[4] = {kHatUp, kHatRight, kHatDown, kHatLeft};
 const MapperAxis kAxes[kSdlAxisCount] = {MapperAxis::LX, MapperAxis::LY, MapperAxis::RX,
                                          MapperAxis::RY, MapperAxis::L2, MapperAxis::R2};
-std::atomic<int> g_runtime_mode{-1};
-
 float axis_value(const PadState &p, int i) {
     switch (i) {
     case 0:
@@ -182,22 +178,6 @@ bool parse_bool(const std::string &s, bool *out) {
     return false;
 }
 
-std::string scancode_name_or_zero(int sc) {
-    if (!sc)
-        return "none";
-    const char *name = scancode_name(sc);
-    return name ? name : "";
-}
-
-bool parse_scancode(const std::string &s, int *out) {
-    if (s == "none") {
-        *out = 0;
-        return true;
-    }
-    *out = scancode_from_name(s);
-    return *out != 0;
-}
-
 bool parse_field(const std::string &key, const std::string &value, PadMapperProfile *p) {
     if (key == "version") {
         int v;
@@ -206,10 +186,6 @@ bool parse_field(const std::string &key, const std::string &value, PadMapperProf
         p->version = uint32_t(v);
         return true;
     }
-    if (key == "legacy_mapped")
-        return parse_bool(value, &p->legacy_mapped);
-    if (key == "native_enabled")
-        return parse_bool(value, &p->native_enabled);
     if (key == "stick_deadzone")
         return parse_float(value, &p->stick_deadzone);
 
@@ -254,10 +230,6 @@ bool parse_field(const std::string &key, const std::string &value, PadMapperProf
             AxisBinding &b = p->axis_bindings[size_t(i)];
             if (field == "guest")
                 return parse_axis(value, &b.guest_axis);
-            if (field == "negative_key")
-                return parse_scancode(value, &b.negative_key);
-            if (field == "positive_key")
-                return parse_scancode(value, &b.positive_key);
             if (field == "scale")
                 return parse_float(value, &b.scale);
             if (field == "offset")
@@ -294,8 +266,6 @@ bool parse_field(const std::string &key, const std::string &value, PadMapperProf
                 b.guest_hat = uint8_t(v);
                 return true;
             }
-            if (field == "key")
-                return parse_scancode(value, &b.key);
             return false;
         }
     }
@@ -319,8 +289,6 @@ bool parse_field(const std::string &key, const std::string &value, PadMapperProf
                 b.guest_hat = uint8_t(v);
                 return true;
             }
-            if (field == "key")
-                return parse_scancode(value, &b.key);
             return false;
         }
     }
@@ -329,30 +297,8 @@ bool parse_field(const std::string &key, const std::string &value, PadMapperProf
 
 } // namespace
 
-PadMapperProfile pad_mapper_with_controller_output(const PadMapperProfile &profile) {
-    PadMapperProfile result = profile;
-    if (!result.native_enabled) {
-        for (AxisBinding &b : result.axis_bindings) {
-            b.guest_axis = MapperAxis::None;
-            b.negative_guest_buttons = b.positive_guest_buttons = 0;
-        }
-        for (ButtonBinding &b : result.buttons) {
-            b.guest_buttons = 0;
-            b.guest_hat = 0;
-        }
-        for (ButtonBinding &b : result.hat) {
-            b.guest_buttons = 0;
-            b.guest_hat = 0;
-        }
-    }
-    result.native_enabled = true;
-    return result;
-}
-
 PadMapperProfile pad_mapper_default_profile() {
     PadMapperProfile p;
-    p.legacy_mapped = false;
-    p.native_enabled = true;
     for (int i = 0; i < kSdlAxisCount; ++i) {
         p.axes[size_t(i)].mode = i >= 4 ? MapperAxisMode::Pedal : MapperAxisMode::Centered;
         p.axes[size_t(i)].deadzone = 0.0f;
@@ -390,63 +336,8 @@ PadMapperProfile pad_mapper_combined_pedals() {
     return p;
 }
 
-PadMapperProfile pad_mapper_keyboard_profile(const MappedTable &legacy_defaults) {
-    PadMapperProfile p = pad_mapper_default_profile();
-    for (AxisBinding &b : p.axis_bindings)
-        b.guest_axis = MapperAxis::None;
-    for (ButtonBinding &b : p.buttons) {
-        b.guest_buttons = 0;
-        b.guest_hat = 0;
-    }
-    for (ButtonBinding &b : p.hat) {
-        b.guest_buttons = 0;
-        b.guest_hat = 0;
-    }
-    if (legacy_defaults.left == StickMode::Arrows || legacy_defaults.left == StickMode::Wasd ||
-        legacy_defaults.left == StickMode::HorizontalArrows) {
-        const bool wasd = legacy_defaults.left == StickMode::Wasd;
-        p.axis_bindings[0].negative_key = wasd ? kScanA : kScanLeft;
-        p.axis_bindings[0].positive_key = wasd ? kScanD : kScanRight;
-        if (legacy_defaults.left != StickMode::HorizontalArrows) {
-            p.axis_bindings[1].negative_key = wasd ? kScanW : kScanUp;
-            p.axis_bindings[1].positive_key = wasd ? kScanS : kScanDown;
-        }
-    }
-    if (legacy_defaults.right == StickMode::Arrows || legacy_defaults.right == StickMode::Wasd ||
-        legacy_defaults.right == StickMode::HorizontalArrows) {
-        const bool wasd = legacy_defaults.right == StickMode::Wasd;
-        p.axis_bindings[2].negative_key = wasd ? kScanA : kScanLeft;
-        p.axis_bindings[2].positive_key = wasd ? kScanD : kScanRight;
-        if (legacy_defaults.right != StickMode::HorizontalArrows) {
-            p.axis_bindings[3].negative_key = wasd ? kScanW : kScanUp;
-            p.axis_bindings[3].positive_key = wasd ? kScanS : kScanDown;
-        }
-    }
-    for (int i = 0; i < 13; ++i) {
-        if (legacy_defaults.buttons[i].type == Target::Key)
-            p.buttons[size_t(i)].key = legacy_defaults.buttons[i].value;
-    }
-    const bool dpad_wasd = legacy_defaults.dpad == StickMode::Wasd;
-    if (legacy_defaults.dpad != StickMode::None) {
-        p.hat[0].key = dpad_wasd ? kScanW : kScanUp;
-        p.hat[1].key = dpad_wasd ? kScanD : kScanRight;
-        p.hat[2].key = dpad_wasd ? kScanS : kScanDown;
-        p.hat[3].key = dpad_wasd ? kScanA : kScanLeft;
-    }
-    return p;
-}
-
 PadMapperProfile pad_mapper_native_profile() {
     return pad_mapper_default_profile();
-}
-
-void set_pad_mapper_runtime_mode(int mode) {
-    g_runtime_mode.store(mode, std::memory_order_relaxed);
-}
-
-int pad_mapper_runtime_mode(int fallback) {
-    const int mode = g_runtime_mode.load(std::memory_order_relaxed);
-    return mode < 0 ? fallback : mode;
 }
 
 bool validate_pad_mapper_profile(const PadMapperProfile &p, std::string *error) {
@@ -485,10 +376,6 @@ bool validate_pad_mapper_profile(const PadMapperProfile &p, std::string *error) 
             return fail("axis " + std::to_string(i) + " has invalid output transform");
         if ((b.negative_guest_buttons | b.positive_guest_buttons) & ~uint16_t(0x1fff))
             return fail("axis " + std::to_string(i) + " has invalid guest button bits");
-        if (b.negative_key < 0 || b.positive_key < 0 ||
-            (b.negative_key && !scancode_name(b.negative_key)) ||
-            (b.positive_key && !scancode_name(b.positive_key)))
-            return fail("axis " + std::to_string(i) + " has invalid key binding");
     }
     for (int i = 0; i < 13; ++i) {
         const ButtonBinding &b = p.buttons[size_t(i)];
@@ -496,8 +383,6 @@ bool validate_pad_mapper_profile(const PadMapperProfile &p, std::string *error) 
             return fail("button " + std::to_string(i) + " has invalid guest button bits");
         if (b.guest_hat & ~uint8_t(0x0f))
             return fail("button " + std::to_string(i) + " has invalid guest hat bits");
-        if (b.key && !scancode_name(b.key))
-            return fail("button " + std::to_string(i) + " has invalid key binding");
     }
     for (int i = 0; i < 4; ++i) {
         const ButtonBinding &b = p.hat[size_t(i)];
@@ -505,8 +390,6 @@ bool validate_pad_mapper_profile(const PadMapperProfile &p, std::string *error) 
             return fail("hat direction " + std::to_string(i) + " has invalid guest button bits");
         if (b.guest_hat & ~uint8_t(0x0f))
             return fail("hat direction " + std::to_string(i) + " has invalid guest hat bits");
-        if (b.key && !scancode_name(b.key))
-            return fail("hat direction " + std::to_string(i) + " has invalid key binding");
     }
     return true;
 }
@@ -520,9 +403,7 @@ std::string serialize_pad_mapper_profile(const PadMapperProfile &p, std::string 
     }
     if (error)
         error->clear();
-    std::string out = "version=1\nlegacy_mapped=" + std::string(p.legacy_mapped ? "1" : "0") +
-                      "\nnative_enabled=" + (p.native_enabled ? "1" : "0") +
-                      "\nstick_deadzone=" + number(p.stick_deadzone) + "\n";
+    std::string out = "version=1\nstick_deadzone=" + number(p.stick_deadzone) + "\n";
     for (int i = 0; i < kSdlAxisCount; ++i) {
         const AxisCalibration &c = p.axes[size_t(i)];
         const std::string x = "axis." + std::to_string(i) + ".";
@@ -537,8 +418,6 @@ std::string serialize_pad_mapper_profile(const PadMapperProfile &p, std::string 
         const AxisBinding &b = p.axis_bindings[size_t(i)];
         const std::string y = "axis_binding." + std::to_string(i) + ".";
         out += y + "guest=" + axis_name(b.guest_axis) + "\n";
-        out += y + "negative_key=" + scancode_name_or_zero(b.negative_key) + "\n";
-        out += y + "positive_key=" + scancode_name_or_zero(b.positive_key) + "\n";
         out += y + "scale=" + number(b.scale) + "\n";
         out += y + "offset=" + number(b.offset) + "\n";
         out += y + "negative_guest_buttons=" + std::to_string(b.negative_guest_buttons) + "\n";
@@ -549,14 +428,12 @@ std::string serialize_pad_mapper_profile(const PadMapperProfile &p, std::string 
         const std::string x = "button." + std::to_string(i) + ".";
         out += x + "guest_buttons=" + std::to_string(b.guest_buttons) + "\n";
         out += x + "guest_hat=" + std::to_string(b.guest_hat) + "\n";
-        out += x + "key=" + scancode_name_or_zero(b.key) + "\n";
     }
     for (int i = 0; i < 4; ++i) {
         const ButtonBinding &b = p.hat[size_t(i)];
         const std::string x = "hat." + std::to_string(i) + ".";
         out += x + "guest_buttons=" + std::to_string(b.guest_buttons) + "\n";
         out += x + "guest_hat=" + std::to_string(b.guest_hat) + "\n";
-        out += x + "key=" + scancode_name_or_zero(b.key) + "\n";
     }
     return out;
 }
@@ -586,6 +463,12 @@ bool parse_pad_mapper_profile(const std::string &text, PadMapperProfile *profile
         if (eq == std::string::npos || eq == 0 || eq + 1 == line.size())
             return fail("invalid profile line: " + line);
         const std::string key = line.substr(0, eq), value = line.substr(eq + 1);
+        const bool legacy = key == "legacy_mapped" || key == "native_enabled" ||
+                            key.find(".key") != std::string::npos ||
+                            key.find("negative_key") != std::string::npos ||
+                            key.find("positive_key") != std::string::npos;
+        if (legacy)
+            continue;
         if (!seen.insert(key).second)
             return fail("duplicate profile field: " + key);
         if (!parse_field(key, value, &next))
@@ -593,7 +476,7 @@ bool parse_pad_mapper_profile(const std::string &text, PadMapperProfile *profile
     }
     if (!seen.count("version"))
         return fail("missing profile version");
-    if (seen.size() != 145)
+    if (seen.size() != 114)
         return fail("incomplete pad mapper profile");
     std::string validation;
     if (!validate_pad_mapper_profile(next, &validation))
@@ -619,8 +502,7 @@ PadMapperProfile PadMapper::snapshot() const {
     return profile_;
 }
 
-void PadMapper::process(const PadState &input, PadState *calibrated, PadState *guest,
-                        std::vector<TouchAction> *key_edges) {
+void PadMapper::process(const PadState &input, PadState *calibrated, PadState *guest) {
     std::lock_guard<std::mutex> lock(mutex_);
     PadState physical;
     physical.buttons = input.buttons & uint16_t(0x1fff);
@@ -646,85 +528,35 @@ void PadMapper::process(const PadState &input, PadState *calibrated, PadState *g
 
     PadState mapped;
     float mapped_axes[kSdlAxisCount] = {};
-    std::vector<int> desired_keys;
     for (int i = 0; i < kSdlAxisCount; ++i) {
         const AxisBinding &b = profile_.axis_bindings[size_t(i)];
         const float value = axis_value(physical, i);
         route_axis(mapped_axes, b.guest_axis, value * b.scale + b.offset);
-        if (value < -0.5f) {
+        if (value < -0.5f)
             mapped.buttons |= b.negative_guest_buttons;
-            if (b.negative_key)
-                desired_keys.push_back(b.negative_key);
-        }
-        if (value > 0.5f) {
+        if (value > 0.5f)
             mapped.buttons |= b.positive_guest_buttons;
-            if (b.positive_key)
-                desired_keys.push_back(b.positive_key);
-        }
     }
     for (int i = 0; i < 13; ++i) {
-        const bool down = (physical.buttons & kButtonBits[i]) != 0;
-        const ButtonBinding &b = profile_.buttons[size_t(i)];
-        if (down) {
+        if (physical.buttons & kButtonBits[i]) {
+            const ButtonBinding &b = profile_.buttons[size_t(i)];
             mapped.buttons |= b.guest_buttons;
             mapped.hat |= b.guest_hat;
-            if (b.key)
-                desired_keys.push_back(b.key);
         }
     }
     for (int i = 0; i < 4; ++i) {
-        const bool down = (physical.hat & kHatBits[i]) != 0;
-        const ButtonBinding &b = profile_.hat[size_t(i)];
-        if (down) {
+        if (physical.hat & kHatBits[i]) {
+            const ButtonBinding &b = profile_.hat[size_t(i)];
             mapped.buttons |= b.guest_buttons;
             mapped.hat |= b.guest_hat;
-            if (b.key)
-                desired_keys.push_back(b.key);
         }
     }
     for (int i = 0; i < kSdlAxisCount; ++i) {
         const float lo = i < 4 ? -1.0f : 0.0f;
         set_axis_value(&mapped, i, std::max(lo, std::min(1.0f, mapped_axes[i])));
     }
-    std::sort(desired_keys.begin(), desired_keys.end());
-    desired_keys.erase(std::unique(desired_keys.begin(), desired_keys.end()), desired_keys.end());
-    if (key_edges) {
-        for (int key : held_keys_) {
-            if (!std::binary_search(desired_keys.begin(), desired_keys.end(), key)) {
-                TouchAction a{};
-                a.kind = TouchAction::Key;
-                a.scancode = key;
-                a.down = false;
-                key_edges->push_back(a);
-            }
-        }
-        for (int key : desired_keys) {
-            if (!std::binary_search(held_keys_.begin(), held_keys_.end(), key)) {
-                TouchAction a{};
-                a.kind = TouchAction::Key;
-                a.scancode = key;
-                a.down = true;
-                key_edges->push_back(a);
-            }
-        }
-    }
-    held_keys_ = std::move(desired_keys);
     if (guest)
         *guest = mapped;
-}
-
-void PadMapper::release(std::vector<TouchAction> *key_edges) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (key_edges) {
-        for (int key : held_keys_) {
-            TouchAction a{};
-            a.kind = TouchAction::Key;
-            a.scancode = key;
-            a.down = false;
-            key_edges->push_back(a);
-        }
-    }
-    held_keys_.clear();
 }
 
 } // namespace controls

@@ -21,11 +21,6 @@ globals = "globals.toml"
 entry_points = []
 
 [hooks]
-frame_clock_begin = 0x00401100
-frame_clock_wait = 0x00401200
-frame_clock_wait_clamp = 0x00401300
-frame_clock_clamp_deadline = 0x00600000
-frame_clock_wait_deadline = 0x00600010
 cursor_surface_ptrs = [0x00600100, 0x00600104]
 camera = 0x00600400
 
@@ -34,10 +29,10 @@ relative_mouse_capture = false
 
 [controls]
 # The on-screen controls a fresh profile shows when no hardware keyboard is attached:
-# "pad", "keys", "pad+keys" or "hidden". pad: "mapped" (keys and mouse), "native"
-# (DirectInput joystick and XInput) or "off".
+# "pad", "keys", "pad+keys" or "hidden". mobile_control: "off", "mobile-only" or
+# "always".
 default_layout = "pad"
-pad = "mapped"
+mobile_control = "mobile-only"
 
 [bundle]
 exclude = []

@@ -59,7 +59,7 @@ void open_any(SDL_JoystickID skip) {
 }
 
 void close_pad() {
-    // Zero first, so a mapped binding or a buffered reader sees every release
+    // Zero first, so the pad consumer or a buffered reader sees every release
     // before the pad is reported gone.
     for (bool &b : g_buttons)
         b = false;

@@ -1,6 +1,5 @@
-// F10 opens the game's native Options tabs once its menus are initialized.
-// The host overlay below remains available to fixtures and early mod-init
-// callbacks that run before the native menu/font resources exist.
+// F10 opens this host-owned settings overlay. The game's own menus can open
+// the same page through the mod API, filtered to one mod.
 //
 // WHERE IT DRAWS, WHICH IS THE ONE THING NOT TO GET WRONG. mods_page_draw is
 // given a HOST-OWNED copy of the frame - the presenter's own buffer. The
@@ -25,7 +24,6 @@ bool g_open = false;
 uint32_t g_cursor = 0;
 std::string g_filter; // "" means every mod
 std::vector<std::string> g_lines;
-std::vector<uint32_t> g_index; // line -> settings entry index
 
 // A row is either a menu entry or a setting; the page shows the menu entries
 // first, because that is what a mod registered for a person to choose.
@@ -41,7 +39,6 @@ std::vector<Row> g_rows;
 // Keep row metadata alongside labels so navigation can dispatch the correct action.
 void rebuild() {
     g_lines.clear();
-    g_index.clear();
     g_rows.clear();
     if (g_filter.empty()) {
         for (int i = 0; i < DISPLAY_ROW_COUNT; ++i) {
@@ -52,6 +49,8 @@ void rebuild() {
         }
         for (int i = 0; i < CONTROLS_ROW_COUNT && mods_settings_row_listed(DISPLAY_CONTROLS_BIT);
              ++i) {
+            if (!mods_controls_row_applies(ControlsRow(i)))
+                continue;
             g_lines.push_back(mods_controls_line(ControlsRow(i)));
             Row row{false, uint32_t(i)};
             row.is_controls = true;
@@ -89,7 +88,6 @@ void rebuild() {
             snprintf(buf, sizeof buf, "%-22s %lld  [%lld..%lld]", label, (long long)value,
                      (long long)mn, (long long)mx);
         g_lines.push_back(buf);
-        g_index.push_back(i);
         g_rows.push_back({false, i});
     }
     if (g_cursor >= g_lines.size())
@@ -240,7 +238,7 @@ void put_pixel(void *pixels, int w, int h, int bpp, int pitch, int x, int y, uin
 // runtime's other registrations are hooks, which this does not touch.
 void mods_page_init() {
     mods_display_init();
-    mods_controls_init(RECOMP_CONTROLS_DEFAULT_LAYOUT);
+    mods_controls_init(RECOMP_CONTROLS_DEFAULT_LAYOUT, RECOMP_CONTROLS_MOBILE_CONTROL);
     mods_input_remove_all(MODS_OWNER_RUNTIME);
     uint32_t id = 0;
     // Owned by the runtime, so no mod's rollback removes the page's keyboard.

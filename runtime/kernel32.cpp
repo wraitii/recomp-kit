@@ -12,7 +12,6 @@
 #include "windows_version.h"
 #include "mods_seam.h"
 #include "display_seam.h"
-#include "frame_deadline.h"
 #include "memory.h"
 #include "win32.h"
 #include "native_seam.h"
@@ -1974,60 +1973,10 @@ void k_GetDriveTypeA(X86 *c) {
 // -------------------------------------------------------------------------
 // Time
 // -------------------------------------------------------------------------
-// Native pacing replaces both draw-loop waits in the pinned executable.
-// 0049cfc0 selects the second one when game-state 2 has frame-rate flags set;
-// 0049cfe0 supplies its default 60 (or 24/20/14) Hz limit. Neither deadline
-// drives simulation: 004a5590 uses 005cd92c/005cd930 and the real clock.
-// Return the draw deadline to retire after reading the real host time.
-static uint32_t native_frame_clock(X86 *c) {
-    using Clock = std::chrono::steady_clock;
-    static FrameDeadline deadline;
-    static int active = 0;
-    const uint32_t caller = rd32(c->r[R_ESP]);
-    if (caller != RECOMP_HOOK_FRAME_CLOCK_BEGIN && caller != RECOMP_HOOK_FRAME_CLOCK_WAIT &&
-        caller != RECOMP_HOOK_FRAME_CLOCK_WAIT_CLAMP)
-        return 0;
-    if (recomp_env("PIN_CLOCK"))
-        return 0;
-    const int requested = mods_display_fps();
-    if (caller == RECOMP_HOOK_FRAME_CLOCK_BEGIN) { // before 1000 / DrawFrameRateLimit
-        // Keep DrawFrameRateLimit as the legacy animation cadence. Retiring
-        // the old wait below already replaces its deadline; changing this
-        // byte would make visual animation inherit the presentation cap.
-        deadline.begin(requested, std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                      Clock::now().time_since_epoch())
-                                      .count());
-        active = requested;
-    } else if (active && (caller == RECOMP_HOOK_FRAME_CLOCK_WAIT ||
-                          caller == RECOMP_HOOK_FRAME_CLOCK_WAIT_CLAMP)) {
-        const auto ms = deadline.wait_ms(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch())
-                .count());
-        // A bounded cooperative sleep also services input/audio.
-        if (ms)
-            sched_sleep_ms(ms);
-        if (caller == RECOMP_HOOK_FRAME_CLOCK_WAIT_CLAMP) {
-            // The instructions after this wait clamp the measured rendering
-            // rate (005ca850) to EDI. Keeping the original 60 here would also
-            // double frame-rate-scaled camera/animation motion at 120 Hz.
-            c->r[R_EDI] = uint32_t(active);
-            return RECOMP_HOOK_FRAME_CLOCK_CLAMP_DEADLINE;
-        }
-        return RECOMP_HOOK_FRAME_CLOCK_WAIT_DEADLINE;
-    }
-    return 0;
-}
 void k_GetTickCount(X86 *c) {
-    const uint32_t draw_deadline = native_frame_clock(c);
-    // The cadence trace's main signal: this game's frame limiter spins here,
-    // so the interval between these calls is the shape of the main loop.
+    // The cadence trace's main signal: interval between these calls.
     host_note_cadence("GetTickCount");
     const uint32_t now = host_millis();
-    // The fractional native deadline has already paced this frame. Retiring
-    // only this draw wait prevents the guest's integer-millisecond deadline
-    // from adding another wait. Every caller still receives real host time.
-    if (draw_deadline)
-        wr32(draw_deadline, now);
     set_eax(c, now);
 }
 // Sleep suspends the caller for at least the interval it asks for, and lets

@@ -56,7 +56,7 @@
   {
    "name": "GetTickCount",
    "effect": "preserve",
-   "evidence": "runtime/kernel32.cpp::k_GetTickCount: native_frame_clock, host_note_cadence, host_millis, guest deadline write, set_eax. No guest callback or guest CW write. Original get_elapsed_ticks at 0051d890 calls the PE IAT slot, subtracts TickAtStart and returns; import names are checked against original PE bytes."
+   "evidence": "runtime/kernel32.cpp::k_GetTickCount: host_note_cadence, host_millis, set_eax. No guest callback or guest CW write. Original get_elapsed_ticks at 0051d890 calls the PE IAT slot, subtracts TickAtStart and returns; import names are checked against original PE bytes."
   }
  ]
 }

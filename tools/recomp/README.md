@@ -11,7 +11,7 @@ Use those wrappers for an ordinary first build.
 | `buildlock.sh`, `buildlock.py` | The shared process lock over build/recomp, as a shell entry and a Python module |
 | `build_core.py`, `finish_bundle.py`, `snapshot_gen.py` | Install core mods reproducibly, finish the app bundle, copy one consistent generation of gen/ |
 | `texture_pack.py`, `package_texture_pack.py` | Prepare and package optional local replacement textures |
-| `presentation_smoke.py`, `performance_run.py` | Bounded presentation measurements and diagnostics |
+| `performance_run.py` | Bounded presentation measurements and diagnostics |
 | `diff/`, `tests/` | Unicorn differential harness (`diff/run.py`) and the native host (`tests/harness.c`) it and the entry-thunk fixture build on |
 | `corpus/` | Eager, SSA and native comparison of real game functions ([README](corpus/README.md)) |
 

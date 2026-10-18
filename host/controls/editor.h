@@ -6,7 +6,6 @@
 // Design: docs/superpowers/specs/2026-09-17-touch-controls-design.md section 9.
 #pragma once
 
-#include "binding.h"
 #include "layout.h"
 
 #include <cstdint>
@@ -33,9 +32,8 @@ struct PickerItem {
 
 class Editor {
   public:
-    // Starts on a copy of `layout`; `mapped` is the current binding table;
-    // `native` true hides mapped targets (Bind edits control.button instead).
-    void open(const Layout &layout, Form form, const MappedTable &mapped, bool native, bool snap);
+    // Starts on a copy of `layout`.
+    void open(const Layout &layout, Form form, bool snap);
     void close();
     bool is_open() const {
         return open_;
@@ -85,12 +83,6 @@ class Editor {
     const Layout &layout() const {
         return layout_;
     }
-    const MappedTable &mapped() const {
-        return mapped_;
-    }
-    bool mapped_changed() const {
-        return mapped_changed_;
-    }
     int selected_group() const {
         return sel_group_;
     }
@@ -117,7 +109,7 @@ class Editor {
     }
 
     // Results the host acts on; each returns true once.
-    bool take_save();   // Done: host saves layout() for form() and mapped() if changed, then closes
+    bool take_save();   // Done: host saves layout() for form(), then closes
     bool take_reset();  // Reset: host deletes the user copy, reloads, reopens
     bool take_cancel(); // back gesture (cancel()): host closes without saving
     void cancel();
@@ -182,9 +174,6 @@ class Editor {
     bool open_ = false;
     Layout layout_;
     Form form_ = Form::Tablet;
-    MappedTable mapped_;
-    bool mapped_changed_ = false;
-    bool native_ = false;
     bool snap_ = true;
     Screen screen_;      // the edited layout's: the toolbar band reserved
     Screen full_screen_; // as given: the toolbar and picker are laid out in it

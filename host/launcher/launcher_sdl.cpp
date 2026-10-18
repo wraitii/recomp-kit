@@ -376,12 +376,11 @@ bool run_configure_ui(SDL_Window *window, gpu::Device *device, void *native_surf
             if (controller.is_open()) {
                 controls::PadMapper preview;
                 controls::PadState calibrated, guest;
-                std::vector<TouchAction> ignored;
                 const controls::PadState raw = controls::host_mapper_raw_state();
                 std::string error;
                 std::string status = controls::host_mapper_status();
                 if (preview.set_profile(controller.profile(), &error))
-                    preview.process(raw, &calibrated, &guest, &ignored);
+                    preview.process(raw, &calibrated, &guest);
                 else
                     status = "Invalid controller profile draft: " + error;
                 controller.set_screen(controller_screen);

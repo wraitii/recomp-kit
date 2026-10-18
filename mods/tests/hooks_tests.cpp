@@ -1173,38 +1173,3 @@ MOD_TEST_SUITE(hook_queued_input_waits_for_the_callback_to_return) {
 
 #include "../display_settings.h"
 #include "../../dx/host_api.h"
-MOD_TEST_SUITE(wide_view_keeps_resolution_callbacks_active) {
-    reset_world();
-    mods_host_set_main_thread();
-    mods_display_reset();
-    mods_display_init();
-    g_api[2].mod_id = "core.display";
-    uint32_t id = 0;
-    MOD_CHECK_EQ(mods_hook_install(
-                     0, INNER,
-                     [](const PopModApi *api, pop_cpu_v1 *cpu, PopHookInvocation *, void *) {
-                         api->hook_return(api, cpu, 1, 0);
-                     },
-                     POP_HOOK_BEFORE, nullptr, &id),
-                 POP_OK);
-    static int calls = 0;
-    calls = 0;
-    MOD_CHECK_EQ(mods_hook_install(
-                     2, INNER,
-                     [](const PopModApi *, pop_cpu_v1 *, PopHookInvocation *, void *) { ++calls; },
-                     POP_HOOK_AFTER, nullptr, &id),
-                 POP_OK);
-    mods_display_transition(1, HOST_SCREEN_GAMEPLAY);
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_WIDE, 0), POP_OK);
-    enter(INNER);
-    MOD_CHECK_EQ(calls, 1); // queued, still enabled
-    mods_display_transition(2, HOST_SCREEN_GAMEPLAY);
-    enter(INNER);
-    MOD_CHECK_EQ(calls, 2); // sky/resolution correction remains active
-    MOD_CHECK_EQ(mods_display_set(DISPLAY_WIDE, 1), POP_OK);
-    mods_display_transition(3, HOST_SCREEN_GAMEPLAY);
-    enter(INNER);
-    MOD_CHECK_EQ(calls, 3); // no reload or lost callback
-    mods_hooks_reset();
-    mods_display_reset();
-}

@@ -14,11 +14,11 @@ class PerformanceOverlay {
     // Blend the overlay onto `target` (drawable pixels `w` x `h`) inside `cb`.
     // `mode` 0 draws nothing, 1 the counters, 2 the counters and the graph.
     void draw(gpu::Device *device, gpu::CommandBuffer cb, gpu::Texture target, int w, int h,
-              const FramePacingSnapshot &s, double now, int mode, int limit);
+              const FramePacingSnapshot &s, double now, int mode);
 
   private:
     static constexpr int width = 330, height = 136;
-    void update(gpu::Device *device, const FramePacingSnapshot &s, int mode, int limit);
+    void update(gpu::Device *device, const FramePacingSnapshot &s, int mode);
     gpu::Device *device_ = nullptr;
     gpu::Texture texture_;
     int texture_h_ = 0;

@@ -9,6 +9,7 @@
 #include <vector>
 
 enum ControlsRow {
+    CONTROLS_MOBILE_ROW,
     CONTROLS_LAYOUT_ROW,
     CONTROLS_SIZE_ROW,
     CONTROLS_OPACITY_ROW,
@@ -29,9 +30,14 @@ void mods_controls_set_names(std::vector<std::string> names);
 // re-clamps its value.
 void mods_controls_refresh_names();
 // default_layout: RECOMP_CONTROLS_DEFAULT_LAYOUT, e.g. "pad", "keys",
-// "pad+keys" or "hidden". Idempotent; mods_controls_reset() lets the tests
-// start over. Migrates a saved host.keypad/* profile the first time it sees one.
-void mods_controls_init(const char *default_layout);
+// "pad+keys" or "hidden"; mobile_default: 0 off, 1 mobile-only, 2 always.
+// Idempotent; mods_controls_reset() lets the tests start over. Migrates a
+// saved host.keypad/* profile the first time it sees one.
+void mods_controls_init(const char *default_layout, int mobile_default = 1);
+// The host's platform and active-layout state, for the F10 page's row gates.
+void mods_controls_set_platform(bool touch_device);
+void mods_controls_set_layout_available(bool available);
+bool mods_controls_row_applies(ControlsRow row);
 void mods_controls_reset();
 // True once mods_controls_init has run (and until mods_controls_reset).
 bool mods_controls_initialized();

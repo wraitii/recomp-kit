@@ -437,4 +437,4 @@ performance_overlay = "off"
 
 [controls]
 default_layout = "hidden"
-pad = "off"
+mobile_control = "mobile-only"

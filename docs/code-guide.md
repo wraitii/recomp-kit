@@ -8,7 +8,7 @@ translated locally into `build/recomp/gen/` and are never edited in place.
 
 | Change | Start here | Major entry points |
 | --- | --- | --- |
-| Host display settings | [display_settings.cpp](../mods/display_settings.cpp), [settings_page.cpp](../mods/settings_page.cpp) | `mods_display_init`, `mods_display_set`, `apply_transition` |
+| Host display settings | [display_settings.cpp](../mods/display_settings.cpp), [settings_page.cpp](../mods/settings_page.cpp) | `mods_display_init`, `mods_display_set` |
 | Mouse edges, coordinate mapping | [input_gate.cpp](../host/input_gate.cpp) | `take_layout`, `host_gate_pointer_event`, `host_gate_window_pointer` |
 | Window, focus, quit (SDL3) | [sdl/main.cpp](../host/sdl/main.cpp) | `handle_event`, `apply_focus`, `apply_window_mode`, `pump`, `applicationShouldTerminate` |
 | Frame lifetime and pacing | [present_thread.cpp](../host/present_thread.cpp) | `acquire`, `host_frame_seal`, `sweep` |
@@ -30,10 +30,10 @@ translated locally into `build/recomp/gen/` and are never edited in place.
 ## Follow display settings
 
 The settings page calls `mods_display_nudge` and `mods_display_set`. The setter
-validates choices and persists them through the shared settings store. Host-only
-values publish immediately; render and projection changes pass through
-`apply_transition` at the frame boundary. Game-owned menus can open the shared
-settings page through the mod API.
+validates choices and persists them through the shared settings store, and the
+host-only values publish immediately. Rendering, projection, texture and frame
+choices are fixed kit defaults rather than rows. Game-owned menus can open the
+shared settings page through the mod API.
 
 ## Read guest-facing code
 

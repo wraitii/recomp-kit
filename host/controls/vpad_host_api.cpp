@@ -11,9 +11,10 @@
 
 extern "C" {
 
-// 0 off, 1 mapped, 2 native, as [controls] pad in game.toml.
+// The app always serves the native pad; only headless and test hosts use the
+// weak default of 0.
 int host_pad_mode(void) {
-    return controls::pad_mapper_runtime_mode(RECOMP_CONTROLS_PAD);
+    return 2;
 }
 
 // Which native APIs serve the pad: bit 0 DirectInput, bit 1 XInput. The
