@@ -8,6 +8,11 @@ bundle_id = "dev.recompkit.railroadtycoon3"
 executable = "RT3.exe"
 sha256 = "accb099b0d8ebac8b50c539a5cc91a863bc9ae399ae70da382ff1c22301e38a2"
 image_base = 0x00400000
+# The stock 0x01000000-0x0e000000 arena is 208 MB; RT3's large maps exhaust it.
+# The 1 GB heap sits above the fixed runtime band, whose top is 0x10000000.
+heap_base = 0x10000000
+heap_end = 0x50000000
+guest_size = 0x50000000
 host_arena_base = 0
 entry_point = 0x005a313b
 guest_root = 'C:\Railroad Tycoon 3'
