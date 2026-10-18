@@ -425,7 +425,7 @@ def build_diff_harness(build_root, out):
         sys.exit("%s is missing: build the game first" % archive)
     sources = [ROOT / "tools/recomp/tests/harness.c", ROOT / "tools/recomp/diff/host.c",
                ROOT / "platform/os_posix.cpp", ROOT / "platform/env.cpp",
-               ROOT / "tools/recomp/diff/host.cpp"]
+               ROOT / "tools/recomp/diff/host.cpp", ROOT / "runtime/guest_strings.cpp"]
     inputs = sources + [Path(__file__), archive, ROOT / "runtime/x86.h", gen / "table.c"]
     if out.exists() and out.stat().st_mtime > max(p.stat().st_mtime for p in inputs):
         print("diff harness up to date: %s" % out)

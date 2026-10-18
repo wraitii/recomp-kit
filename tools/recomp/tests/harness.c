@@ -54,6 +54,11 @@ void recomp_unknown_call(X86 *c, uint32_t target) {
     harness_escape("unknown-call", target);
     last_unknown = target;
 }
+void recomp_region_missing(X86 *c, uint32_t target) {
+    (void)c;
+    harness_escape("region-missing", target);
+    last_unknown = target;
+}
 uint32_t recomp_guest_call(X86 *c, uint32_t fn, const uint32_t *args, int nargs) {
     (void)c;
     (void)args;
