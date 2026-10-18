@@ -1139,7 +1139,7 @@ element("cancel").onclick = () => attempt(async () => {
 element("settings").onclick = () => {
   selected = null;
   source = "";
-  element("install-title").textContent = "Library settings";
+  element("install-title").textContent = "Recomp Toolkit settings";
   element("installer").showModal();
   for (const name of ["steps", "requirements", "source", "job", "ready", "copy-result", "preparation-plan"]) element(name).hidden = true;
   element("setup").hidden = false;

@@ -1,7 +1,7 @@
 export function platform() {
   const desktop = window.__TAURI__;
   if (!desktop) {
-    const unavailable = async () => { throw new Error("Local compilation requires the desktop library app. Browser play remains available through the kit’s web launcher."); };
+    const unavailable = async () => { throw new Error("Local compilation requires Recomp Toolkit. Browser play remains available through the kit’s web launcher."); };
     return { settings: unavailable, save: unavailable, pick: unavailable, query: unavailable,
       start: unavailable, cancel: unavailable, openFolder: unavailable, openAssistedFolder: unavailable, cancelAssisted: unavailable,
       open: (url) => window.open(url, "_blank", "noopener"),

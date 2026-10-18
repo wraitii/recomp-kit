@@ -68,8 +68,8 @@ def build(build_root, config, portable=False, python_root=None):
         if portable:
             from package_library import package
             package(bundle, build_root, python_root)
-        print(f"Library app: {bundle}")
+        print(f"Recomp Toolkit app: {bundle}")
     else:
         output.mkdir(parents=True, exist_ok=True)
         shutil.copy2(binary, output / binary.name)
-        print(f"Library app: {output / binary.name}")
+        print(f"Recomp Toolkit app: {output / binary.name}")

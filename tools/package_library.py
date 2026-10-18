@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def package(bundle, build_root, python_root):
     if sys.platform != "darwin" or os.uname().machine != "arm64":
-        raise ValueError("Library packaging currently requires native arm64 macOS")
+        raise ValueError("Recomp Toolkit packaging currently requires native arm64 macOS")
     python_root = Path(python_root).resolve()
     if not (python_root / "bin/python3").is_file():
         raise ValueError("Provide a standalone Python installation with --toolkit-python-root")
@@ -108,4 +108,4 @@ def package(bundle, build_root, python_root):
     subprocess.run(["codesign", "--verify", "--deep", "--strict", str(bundle)], check=True)
     archive = bundle.parent / "recomp-toolkit-macos-arm64.zip"
     subprocess.run(["ditto", "-c", "-k", "--keepParent", str(bundle), str(archive)], check=True)
-    print(f"Portable library: {archive} ({archive.stat().st_size / 1048576:.1f} MiB)")
+    print(f"Portable Recomp Toolkit: {archive} ({archive.stat().st_size / 1048576:.1f} MiB)")
