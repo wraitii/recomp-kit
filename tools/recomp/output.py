@@ -16,8 +16,8 @@ from ir.emit_c import memory_helpers, TABLE_RETURN_HELPERS, FLOAT_HELPERS
 # Oversize functions stand alone; recursively split only an over-budget bucket.
 # SSA bodies are larger per guest instruction than decoded ones; at 512 KiB the
 # median bucket chunk compiled in ~0.2 s, so per-file overhead dominated.
-CHUNK_ADDRESS_BITS = 14
-CHUNK_SOURCE_BUDGET = 2 * 1024 * 1024
+CHUNK_ADDRESS_BITS = 16
+CHUNK_SOURCE_BUDGET = 4 * 1024 * 1024
 ENTRY_ADDRESS_BITS = 16
 INDIRECT_CACHE = re.compile(r"recomp_icall\(c, [^;]*, &(\w+), [^;]*\);")
 
@@ -53,7 +53,7 @@ def partition_chunks(functions, bodies, budget=CHUNK_SOURCE_BUDGET):
     """Bound source size without moving functions outside their address bucket.
 
     The assignment is independent of input order and other buckets. A split can
-    move neighbours within one 16 KiB guest-address bucket, never the whole image.
+    move neighbours within one 64 KiB guest-address bucket, never the whole image.
     Function bodies and their alternate-entry wrappers remain indivisible.
     """
     buckets = defaultdict(list)
