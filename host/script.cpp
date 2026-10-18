@@ -27,7 +27,7 @@ struct Named {
 };
 
 // The keys a script has any reason to press. DirectInput set-1 scan codes, the
-// same numbers input.mm maps the real keyboard to.
+// same numbers input.cpp maps the real keyboard to.
 const Named kKeys[] = {
     {"ESCAPE", 0x01}, {"RETURN", 0x1c}, {"SPACE", 0x39},    {"TAB", 0x0f},   {"BACK", 0x0e},
     {"UP", 0xc8},     {"DOWN", 0xd0},   {"LEFT", 0xcb},     {"RIGHT", 0xcd}, {"PAUSE", 0xc5},

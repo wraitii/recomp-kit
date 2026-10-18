@@ -10,13 +10,16 @@ native replacements come from the selected game's `game.toml` and build files.
 | Source | Role |
 | --- | --- |
 | `boot.{h,cpp}` | Shared image loading, runtime setup, guest entry, close handling, fault reporting, and watchdog. |
+| `game_path.{h,cpp}`, `preferences.{h,cpp}`, `configure_launcher.cpp` | Game discovery, persisted host settings, and the Configure launcher. |
 | `sdl/main.cpp`, `sdl/platform_ui_*` | SDL3 app window, event pump, game selection, and platform-specific window services. |
+| `launcher/` | Desktop game library: scanning, importing, installing, and configuration UI. |
+| `controls/` | On-screen controls, controller mapping, layout storage, and the interactive layout editor. |
 | `headless_main.cpp` | Runs without a visible window and can write presented frames to disk. |
 | `smoke_main.cpp` | Script-driven host for repeatable input and presentation capture. |
-| `present.{h,cpp}`, `present_thread.cpp`, `compositor.{h,cpp}` | Pixel conversion, frame composition, and presentation. |
+| `present.{h,cpp}`, `present_thread.cpp`, `compositor.{h,cpp}`, `frame_pacing.h`, `performance_overlay.{h,cpp}` | Pixel conversion, frame composition, pacing metrics, overlays, and presentation. |
 | `ui_layer.{h,cpp}` | Reconstructs supported UI blits from recorded frame writes into owned RGBA pixels and masks, tracking elements across frames; the presenter scales this layer separately from the game image. |
 | `d3d_render.{h,cpp}`, `gpu2d.cpp`, `gpu/` | Host renderer and the device interface implemented by the available GPU backends. |
-| `input.{h,cpp}`, `input_script*`, `sdl/keymap.cpp` | Input translation, guest notifications, and timed scripted input. |
+| `input.{h,cpp}`, `input_gate.{h,cpp}`, `input_touch.{h,cpp}`, `input_script*`, `sdl/keymap.cpp` | Input translation, gating, touch gestures, guest notifications, and timed scripted input. |
 | `audio/`, `audio.h` | Software audio mixer, SDL output, MIDI synthesis, offline rendering, and audio capture. |
 
 `ui_layer` is a pixel reconstruction layer, not a menu system. It replays

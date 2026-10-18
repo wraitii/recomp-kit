@@ -10,13 +10,7 @@
 #include "../dx/passes.h"
 #include "../dx/ddraw.h"
 #include "../runtime/mods_seam.h"
-#if defined(POPM_COMPOSITOR_TEST_UI_DOUBLE)
-#include "tests/compositor_ui_double.h"
-#elif __has_include("ui_layer.h")
 #include "ui_layer.h"
-#else
-#include "ui_frame_contract.h"
-#endif
 #include <string.h>
 #include <algorithm>
 #include <array>
@@ -46,7 +40,7 @@ extern "C" void host_set_render_resolution(int w, int h) {
             int(uint32_t(size)), size ? "logical canvas retained" : "automatic");
 }
 
-// Minimal hosts can link the service without the app's present.mm. Unknown
+// Minimal hosts can link the service without the app's present.cpp. Unknown
 // mode keeps first-write acquisition on the service's last guest dimensions.
 // App and smoke hosts override this with their current display mode.
 extern "C" __attribute__((weak)) void host_present_mode(int *w, int *h, int *bpp) {
@@ -216,7 +210,7 @@ struct Service : std::enable_shared_from_this<Service> {
     std::shared_ptr<Composite> cached_settings;
     std::vector<std::shared_ptr<Composite>> composite_pool;
     UiFrame cached_ui{};
-#ifdef POPM_PRESENT_HAS_UI_LAYER
+#ifdef RECOMP_PRESENT_HAS_UI_LAYER
     UiFrame previous_ui{}; // guest thread only, including sealed frames that were dropped
     uint64_t previous_ui_epoch = 0;
 #endif
@@ -1324,7 +1318,7 @@ extern "C" void host_present_first_write() {
     s->acquire(w > 0 ? w : s->guest_w, h > 0 ? h : s->guest_h, 0, 0);
 }
 extern "C" int host_present_needs_legacy_pixels() {
-#ifdef POPM_PRESENT_HAS_UI_LAYER
+#ifdef RECOMP_PRESENT_HAS_UI_LAYER
     auto s = active.load();
     if (!s || mods_display_classic())
         return 1;
@@ -1558,7 +1552,7 @@ extern "C" void host_frame_seal() {
         }
     }
     host_d3d_seal_commands();
-#ifdef POPM_PRESENT_HAS_UI_LAYER
+#ifdef RECOMP_PRESENT_HAS_UI_LAYER
     // Extraction reads shim leases on the guest thread before publication.
     // Only immutable value types pass to the worker.
     if (s->previous_ui_epoch != s->epoch ||
@@ -1602,7 +1596,7 @@ extern "C" void host_frame_seal() {
     }
     attach_settings_page(s);
     s->seal(f.id, host_frame_class(f), host_frame_had_draws(f) != 0);
-#ifdef POPM_PRESENT_HAS_UI_LAYER
+#ifdef RECOMP_PRESENT_HAS_UI_LAYER
     s->previous_ui_epoch = s->epoch;
 #endif
 }

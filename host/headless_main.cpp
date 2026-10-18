@@ -9,7 +9,7 @@
 // is answered by dx.
 //
 // The boot sequence itself is not here. host/boot.cpp owns
-// everything the windowed host in main.mm also needs - the load, the
+// everything the windowed host in sdl/main.cpp also needs - the load, the
 // heartbeat on the guest's clock, the synthesised activation, the close, the
 // unwind, the watchdog and the fault handler - and this file is what is left
 // once that is taken out: the caps, a presenter that writes files, and the
@@ -435,7 +435,7 @@ extern "C" void host_d3d_texture_destroyed(uint32_t handle) {
 // This host used to model the play cursor with arithmetic and stub out
 // everything else, which answered the question the guest asks - has the cursor
 // moved - and none of the questions a person asks after a run sounds wrong.
-// It now links the same audio.mm the windowed host uses and runs its engine in
+// It now links the same audio mixer the windowed host uses and runs its engine in
 // manual rendering mode: the same player nodes, the same mixer, the same
 // scheduling, rendered into a buffer instead of into a device. Nothing is
 // heard, no hardware is opened, and what comes out is what would have.

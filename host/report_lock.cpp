@@ -5,7 +5,7 @@
 // host_present, host_d3d_draw and the rest, and read from the watchdog thread
 // when it prints a report; every one of those writers has to hold this, and
 // they live in files that have no business linking the loader, the shims or
-// anything else boot.cpp needs. Splitting it out is what lets present.mm take
+// anything else boot.cpp needs. Splitting it out is what lets present.cpp take
 // the same lock the watchdog does without dragging the whole boot sequence
 // into a test binary that only wants to check a palette expansion.
 //

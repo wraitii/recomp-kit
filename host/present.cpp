@@ -2,16 +2,16 @@
 #include "../platform/os.h"
 #include <atomic>
 #include <cstring>
-// present.mm - host_present for the windowed host.
+// present.cpp - host_present for the windowed host.
 //
 // There is one thing on the screen and it is the DirectDraw surface. Software
 // drawing writes into it directly; Direct3D drawing gets there through
-// d3d_render.mm, which mirrors the render-target surface on the GPU and writes
+// d3d_render.cpp, which mirrors the render-target surface on the GPU and writes
 // its result back into the surface's own memory before anything reads it -
 // which is where a real HAL device put it too. By the time a present happens,
 // the surface holds both, in the order the guest produced them.
 //
-// This compatibility input expands the surface to RGBA. present_thread.mm
+// This compatibility input expands the surface to RGBA. present_thread.cpp
 // owns sealed targets, composition, drawables and retirement.
 //
 // Palette expansion goes through host/indexed_frame.cpp, which

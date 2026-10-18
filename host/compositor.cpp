@@ -1,11 +1,5 @@
 #include "compositor.h"
-#ifdef POPM_COMPOSITOR_TEST_UI_DOUBLE
-#include "tests/compositor_ui_double.h"
-#elif __has_include("ui_layer.h")
 #include "ui_layer.h"
-#else
-#include "ui_frame_contract.h"
-#endif
 
 #include <algorithm>
 #include <cmath>

@@ -1,5 +1,5 @@
 // Test-only implementation of the immutable frame/lease ABI, with no guest.
-// Link test_frame_builder.mm instead of ddraw.cpp in a standalone host test.
+// Link test_frame_builder.cpp instead of ddraw.cpp in a standalone host test.
 #pragma once
 #include "../../dx/host_api.h"
 #include <array>

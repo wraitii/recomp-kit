@@ -3,7 +3,7 @@
 #include "../../runtime/display_seam.h"
 #include "../../runtime/native_seam.h"
 #include "../../dx/passes.h"
-// host_tests.mm - headless tests for the macOS host.
+// host_tests.cpp - headless tests for the host.
 //
 // No window is ever created and no audio device is ever opened. The Direct3D
 // tests do run on the real GPU, into a GPU texture the test allocates and
@@ -109,7 +109,7 @@ static void check(bool ok, const char *what, const char *file, int line) {
     } while (0)
 
 // ===========================================================================
-// present.mm
+// present.cpp
 // ===========================================================================
 static void test_present_suspend_flag() {
     CHECK(!host_present_suspended());
@@ -316,7 +316,7 @@ static void test_letterbox() {
 }
 
 // ===========================================================================
-// input.mm
+// input.cpp
 // ===========================================================================
 static void test_scancodes() {
     // Positional, so the letter is the key's place on the board.
@@ -503,7 +503,7 @@ static void test_mouse_move_reaches_the_guest() {
     host_input_set_notify(count_notify);
     g_notified = 0;
 
-    // What main.mm does for one mouseMoved: scale the platform delta, keeping
+    // What sdl/main.cpp does for one mouse move: scale the platform delta, keeping
     // the remainder, then feed the mapped position and that delta.
     HostMouseAccumulator remainder = {0.0, 0.0};
     int32_t dx = 0, dy = 0;
@@ -1080,7 +1080,7 @@ static void test_message_translation() {
 }
 
 // ===========================================================================
-// audio.mm
+// audio/
 // ===========================================================================
 static void test_game_path() {
     char dir[512];
@@ -2498,7 +2498,7 @@ static void test_midi_soundfont() {
 }
 
 // ===========================================================================
-// d3d_render.mm
+// d3d_render.cpp
 // ===========================================================================
 namespace {
 
@@ -5122,11 +5122,6 @@ extern "C" void ddraw_drain_present_releases() {}
 // DISP-T8: deterministic display-link/offscreen substitute. These assertions
 // run without a Metal device; the production GPU path is covered separately.
 #include "../present_test.h"
-#if __has_include("../ui_layer.h")
-#include "../ui_layer.h"
-#else
-#include "compositor_ui_double.h"
-#endif
 #include <atomic>
 #include <chrono>
 #include <future>
@@ -6635,7 +6630,7 @@ static void test_present_counts() {
 // ---------------------------------------------------------------------------
 // The input gate, driven through the PRODUCTION path.
 //
-// host_key_event is what main.mm runs for every key: the gate, and then the
+// host_key_event is what sdl/main.cpp runs for every key: the gate, and then the
 // host's own delivery. Driving it here rather than reproducing the sequence is
 // the point - a test that hand-delivers what it thinks the host would deliver
 // stays green when the host stops doing it.
@@ -7880,7 +7875,7 @@ static void test_t9_relative_crossing_and_layout_mailbox() {
     CHECK_EQ(hud.kind, HitResult::HIT_ELEMENT);
     CHECK_EQ(hud.gx, 600);
     CHECK_EQ(hud.gy, 440);
-    // This is the correction main.mm delivers to DirectInput, not a zero-delta
+    // This is the correction sdl/main.cpp delivers to DirectInput, not a zero-delta
     // guestclick. Crossing the anchor moves the integrated pointer to its rect.
     CHECK_EQ(scene.gx + dx, 600);
     CHECK_EQ(scene.gy + dy, 440);
@@ -7985,7 +7980,7 @@ static void test_generic_pointer_place() {
 }
 
 static void test_t9_window_motion_round1() {
-    // The exact production mapping/filter/DirectInput path used by main.mm.
+    // The exact production mapping/filter/DirectInput path used by sdl/main.cpp.
     // Repeat at 1x/2x backing and multiple composed sizes, over menu elements,
     // letterboxing, subpixel moves, capture and release. The model guest only
     // integrates deltas and clamps at 640x480, just like the game's menu.

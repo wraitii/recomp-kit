@@ -1,13 +1,13 @@
-// input.mm - keyboard and mouse for the windowed host.
+// input.cpp - keyboard and mouse for the windowed host.
 //
 // The game reads input twice over: DirectInput for the keyboard array and the
 // mouse deltas, and the Win32 message queue plus GetAsyncKeyState for
-// everything else. Both come from the same NSEvent here, so they cannot
+// everything else. Both come from the same host input state here, so they cannot
 // disagree.
 //
-// There is no AppKit in this file on purpose. main.mm decodes NSEvents and
-// calls in with plain numbers, which is what lets the scan-code table and the
-// state machine be tested with no application object in the process.
+// There is no window-system code in this file on purpose. sdl/main.cpp decodes
+// SDL events and calls in with plain numbers, which is what lets the scan-code
+// table and the state machine be tested with no application object in the process.
 #include "input.h"
 #include "../dx/host_api.h"
 #include "../runtime/win32.h"
@@ -279,7 +279,7 @@ void log_once(const char *message) {
 
 // The guest's DirectInput threads wait on an event; input nobody announces is
 // input the game never sees. Whose function this is is decided by the host:
-// main.mm installs the DirectInput shim's, and the test binary - which links
+// sdl/main.cpp installs the DirectInput shim's, and the test binary - which links
 // none of dx - installs its own or none at all. That indirection is
 // not a preference: a weak declaration does not survive a static link, so the
 // choice is a function pointer or a link-time dependency on the shims from a

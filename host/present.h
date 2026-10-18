@@ -1,4 +1,4 @@
-// present.h - what main.mm and the tests need from present.mm.
+// present.h - what sdl/main.cpp and the tests need from present.cpp.
 //
 // The pixel maths is here as plain functions with no Metal in them, because
 // that is the part a headless test can check: a palette expansion either
@@ -133,8 +133,8 @@ void host_present_mode(int *w, int *h, int *bpp);
 // Other classes and Classic still require the complete CPU compatibility image.
 int host_present_needs_legacy_pixels(void);
 // Called on the guest's thread when the mode changes, so the host can resize
-// its window. It is not safe to touch AppKit from it directly; main.mm records
-// the request and acts on it from its own event pump.
+// its window. It is not safe to touch the window from it directly; sdl/main.cpp
+// records the request and acts on it from its own event pump.
 void host_present_on_mode_change(void (*fn)(int w, int h, int bpp));
 
 // How many frames have been presented.

@@ -162,7 +162,7 @@ extern "C" struct HostFit host_present_fit(double dw, double dh, int gw, int gh)
     double fractional = std::min(dw / gw, dh / gh);
     // A whole multiple keeps every guest pixel the same size on screen, which
     // is what stops 1998 art from shimmering. Below 1:1 there is no whole
-    // multiple to take: main.mm sets the window's contentMinSize to the guest
+    // multiple to take: sdl/main.cpp sets the window's minimum size to the guest
     // mode so that cannot happen, and this fractional fall-back exists only so
     // that a drawable that is somehow smaller still shows the whole frame
     // instead of cropping it.

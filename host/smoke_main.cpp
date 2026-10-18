@@ -1,4 +1,4 @@
-// smoke_main.mm - the recompiled game, driven by a script, with no window.
+// smoke_main.cpp - the recompiled game, driven by a script, with no window.
 //
 // build/recomp/smoke exists so gameplay is checked before a person sees a
 // build. It boots the real game exactly as the windowed host does, presses the
@@ -1515,8 +1515,8 @@ extern "C" uint32_t host_audio_position(int32_t channel) {
 //
 // Modelled on the same cursor host_audio_position uses, which is the guest's
 // clock and not the wall, so a pinned run's refills are as reproducible as the
-// rest of it. That is not what the app host does - audio.mm answers from the
-// audio device's own cursor there, because a device consumes at its own rate
+// rest of it. That is not what the app host does - the audio device's own cursor
+// answers there, because a device consumes at its own rate
 // whatever the guest clock says - and the difference is the whole reason a
 // pinned smoke run has a fixed sound count while an unpinned app run does not.
 //

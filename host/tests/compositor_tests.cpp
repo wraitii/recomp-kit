@@ -1,11 +1,7 @@
 #include "../compositor.h"
 #include "../gpu/gpu_factory.h"
 #include <memory>
-#ifdef POPM_COMPOSITOR_TEST_UI_DOUBLE
-#include "compositor_ui_double.h"
-#else
 #include "../ui_layer.h"
-#endif
 #include <algorithm>
 #include <cstdio>
 #include <vector>

@@ -8,7 +8,7 @@
 // host's own delivery, which is what a window actually runs. The delivery
 // lives here rather than in sdl/main.cpp so a headless test can drive exactly
 // the path the window drives; sdl/main.cpp is left with event decoding and
-// nothing else, and smoke_main.mm keeps its own scripted delivery.
+// nothing else, and smoke_main.cpp keeps its own scripted delivery.
 //
 // PHYSICAL STATE IS NOT GUEST STATE. The keyboard's real transitions decide
 // what is offered to the filter, and the guest's delivered state decides what
@@ -58,7 +58,7 @@ bool host_key_event(uint16_t mac_keycode, bool down, uint32_t character);
 // guest's message queue and asks the mod layer, which is a callback into
 // guest-visible state. A host that called it from the scheduler's idle slice
 // would be racing whichever guest thread holds the baton, which is the fault
-// smoke_main.mm's idle waiter was moved off.
+// smoke_main.cpp's idle waiter was moved off.
 //
 // The mask it carries is the GATE's, which is the guest's, and not any host's
 // idea of which physical buttons are down - the same separation this file

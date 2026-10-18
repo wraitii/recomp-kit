@@ -1,5 +1,5 @@
 // shaders_msl.h - the MSL behind every program gpu/shaders.md names. Moved
-// verbatim from compositor.mm, performance_overlay.h and d3d_render.mm; the
+// verbatim from compositor.cpp, performance_overlay.h and d3d_render.cpp; the
 // slot numbers are the ones shaders.md documents.
 #pragma once
 
