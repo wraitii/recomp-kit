@@ -40,6 +40,8 @@ Preservation uses byte-backed normalization and SSA for call-free bodies;
 no emission is inspected.
 """
 from collections import namedtuple
+from copy import copy
+from functools import cache
 
 from .lift import Lifter
 from .cfg import call_graph
@@ -366,13 +368,18 @@ def substantive_register_uses(prepared, instructions):
     return {field: tuple(sorted(set(indices))) for field, indices in out.items() if indices}
 
 
+@cache
+def _preservation_lifter(language):
+    return Lifter(language)
+
+
 def _preserved_registers(fir):
     from .normalize import codegen_ir
     from .ssa import build, SSAError
     from .simplify import canonicalize
     from .preservation import forward
 
-    lifter = Lifter(fir.language)
+    lifter = copy(_preservation_lifter(fir.language))
     registers = {name: lifter.register(name) for name in GPRS}
     groups = {name: tuple((space, offset + n) for n in range(size))
               for name, (space, offset, size) in registers.items()}

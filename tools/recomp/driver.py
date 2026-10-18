@@ -7,7 +7,8 @@ come from the decoded emitter, fed the map's own instruction boundaries.
 """
 import argparse
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 import json
 import os
@@ -142,9 +143,54 @@ class Context(object):
         return fn, entries
 
 
-def _init(settings, artifacts=None):
+def _init(settings, artifacts=None, cache_prepared=False, load_prepared=False):
     global _CTX
     _CTX = Context(settings, artifacts)
+    _CTX.prepared = {}
+    _CTX.cache_prepared = cache_prepared
+    _CTX.load_prepared = load_prepared
+
+
+class OwnedWorkers:
+    def __init__(self, workers, owners):
+        self.workers, self.owners = workers, owners
+
+    def map(self, function, tasks):
+        futures = []
+        for task in tasks:
+            addresses = (task.addresses if isinstance(task, PreparationTask) else
+                         tuple(plan.addr for plan in task.plans) if isinstance(task, EmissionTask) else (task.addr,))
+            owner = self.owners[addresses[0]]
+            if any(self.owners[addr] != owner for addr in addresses):
+                raise TranslateError("prepared body batch crosses worker ownership")
+            futures.append(self.workers[owner].submit(function, task))
+        return (future.result() for future in futures)
+
+
+@contextmanager
+def owned_workers(settings, artifacts, addresses, cache_prepared):
+    with ThreadPoolExecutor(max_workers=settings.jobs) as shutdown, ExitStack() as stack:
+        workers = []
+        for _ in range(settings.jobs):
+            worker = ProcessPoolExecutor(max_workers=1, initializer=_init,
+                                         initargs=(settings, artifacts, cache_prepared))
+            stack.callback(shutdown.submit, worker.shutdown)
+            workers.append(worker)
+        yield OwnedWorkers(workers, {addr: index % settings.jobs for index, addr in enumerate(addresses)})
+
+
+def _store_prepared(path, body):
+    _CTX.prepared[path] = body
+    if _CTX.cache_prepared:
+        prepared_store.write(path, body)
+
+
+def _take_prepared(path):
+    if path in _CTX.prepared:
+        return _CTX.prepared.pop(path)
+    if _CTX.load_prepared:
+        return prepared_store.read(path)
+    raise TranslateError("prepared body is unavailable in its owning worker: %s" % path)
 
 
 def _prepare(task):
@@ -180,7 +226,7 @@ def _prepare(task):
                 reason = str(error)
             else:
                 path = Path(store) / ("%08x.pickle" % addr)
-                prepared_store.write(path, body)
+                _store_prepared(path, body)
                 requests = body.requests
                 groups = dict(body.state_groups)
                 sites = []
@@ -215,7 +261,7 @@ def _prepare(task):
 def _finalize(task):
     plans = []
     for plan in task.plans:
-        body = prepared_store.read(plan.path) if plan.path is not None else None
+        body = _take_prepared(plan.path) if plan.path is not None else None
         if body is not None:
             body.finalize(task.layouts)
         plans.append(FinalFunctionPlan(plan.addr, body, plan.reason))
@@ -310,7 +356,7 @@ def _prepare_private(task):
     plan = production.prepare_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit, layout, known_mode, ctx.artifacts)
     if plan.body is not None:
         path = Path(store) / ("private-%08x-%04x.pickle" % (addr, layout.output_mask))
-        prepared_store.write(path, plan.body)
+        _store_prepared(path, plan.body)
         plan = replace(plan, body=path)
     ctx.artifacts.flush_counts()
     return plan
@@ -318,7 +364,7 @@ def _prepare_private(task):
 
 def _private(plan):
     if plan.body is not None:
-        plan = replace(plan, body=prepared_store.read(plan.body))
+        plan = replace(plan, body=_take_prepared(plan.body))
         plan.body.finalize({})
     lines = production.emit_private_prepared(plan)
     return PrivateEmissionResult(plan.addr, tuple(lines))
@@ -437,7 +483,7 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
     phase("scan")
     rows = {addr: row.description for addr, row in scanned.items()}
     calls = {addr: row.calls for addr, row in scanned.items()}
-    with ProcessPoolExecutor(max_workers=settings.jobs, initializer=_init, initargs=(settings, artifacts)) as pool:
+    with owned_workers(settings, artifacts, addrs, args.emission_cache is not None) as pool:
         internal = seed.internal
         conservative = seed.native_replaced
         mode_prepared = seed.cw_inputs()
@@ -517,8 +563,9 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
             affected = {plan.addr for plan in plans.values()
                         if any(input_arguments.get(site[0]) != settings.private_input_registers.get(site[0])
                                and input_arguments.get(site[0]) is not None for site in plan.input_sites)}
+            refresh_parts = [[addr for addr in part if addr in affected] for part in parts]
             refresh_tasks = [PreparationTask(tuple(part), analysis.for_addresses(part, calls), selection, store)
-                             for part in chunked(affected, settings.jobs * 24)]
+                             for part in refresh_parts if part]
             for batch in pool.map(_prepare, refresh_tasks):
                 plans.update({plan.addr: plan for plan in batch})
         else:
@@ -643,13 +690,16 @@ def translate_selected(args, settings, ctx, log, started):
     if unknown:
         raise TranslateError("selected regeneration has unmapped functions: " + " ".join("%08x" % addr for addr in sorted(unknown)))
     analysis = state['analysis']
-    layouts = FrozenMap.of({plan.addr: plan.layout for plan in state['private_plans']})
+    layouts = {}
+    for plan in state['private_plans']:
+        layouts.setdefault(plan.addr, []).append(plan.layout)
+    layouts = FrozenMap.of({addr: tuple(variants) for addr, variants in layouts.items()})
     plans = [replace(state['plans'][addr], path=Path(args.emission_cache) / state['plans'][addr].path
                      if state['plans'][addr].path is not None else None) for addr in sorted(selected)]
     tasks = [EmissionTask(tuple(part), analysis, layouts) for part in
              (plans[index::settings.jobs] for index in range(settings.jobs)) if part]
     results = state['results']
-    with ProcessPoolExecutor(max_workers=settings.jobs, initializer=_init, initargs=(settings,)) as pool:
+    with ProcessPoolExecutor(max_workers=settings.jobs, initializer=_init, initargs=(settings, None, False, True)) as pool:
         for batch in pool.map(_finalize_and_emit, tasks):
             for result in batch:
                 if result.requests != results[result.addr].requests:

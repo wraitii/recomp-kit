@@ -59,7 +59,8 @@ def _scan(task):
                 prepared = (call_contracts.prepare(fir, image=ctx.image)
                             if not (entries or site or fn.dead_addrs) else None)
                 fir.entries = tuple(entries)
-                mode_prepared = x87_mode.prepare(fir, ctx.image)
+                mode_prepared = x87_mode.prepare(fir, ctx.image,
+                                               imports=prepared.imports if prepared is not None else None)
             except (LiftError, RecursionError):
                 prepared = None
             else:

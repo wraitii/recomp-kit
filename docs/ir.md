@@ -365,8 +365,8 @@ Emission requires those final decisions
 and checks them against both the caller requests and private callee records.
 Final binding hands fresh graphs directly to emission in the same worker, avoiding
 another SSA serialization round trip.
-Prepared SSA graphs pass between workers in temporary files through
-`prepared_store.py`, encoding value references by ID. Each body is emitted once;
+Prepared SSA graphs stay in their owning worker through preparation, final binding
+and emission; only planning summaries cross processes. Each body is emitted once;
 full-output integer private entries alias the checked body.
 The report distinguishes each edge's required outputs from its entry mask.
 
@@ -502,7 +502,8 @@ The current contract is C with CPU-field transport.
 ### Selected regeneration
 
 `tools/build.py --regen-function HEX_ADDR` (repeatable) re-emits selected
-functions using the whole-image preparation saved by a full regeneration.
+functions using preparation saved by `--regenerate --cache-emission`.
+Full regeneration keeps prepared graphs in RAM and skips the persistent cache by default.
 Unchanged generated files retain timestamps, so Ninja recompiles affected
 C chunks and relinks the requested target. Address buckets can include
 neighboring functions; this is chunk compilation, not an isolated object per

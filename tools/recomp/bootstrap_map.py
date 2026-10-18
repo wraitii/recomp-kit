@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import struct
 import tempfile
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ import pefile
 import pypcode
 
 import code_map
+from ir.lift import Lifter
 from program import PE, TranslateError
 
 
@@ -36,6 +38,8 @@ class Recovery:
         self.speculative = set()
         self.trusted_seeds = set()
         self.ghidra_spans = []
+        self.ghidra_lengths = {}
+        self.source_lifter = None
         self.ghidra_entries = {}
         self.seeds = defaultdict(set)
         self.pending = deque()
@@ -185,6 +189,36 @@ class Recovery:
             if self.covered.get(at) == address:
                 del self.covered[at]
 
+    def pointer_source(self, slot, target):
+        index = bisect.bisect_right(self.ghidra_spans, (slot + 3, 1 << 32, 0)) - 1
+        if index < 0 or self.ghidra_spans[index][1] <= slot:
+            return True
+        start, end, _ = self.ghidra_spans[index]
+        lengths = self.ghidra_lengths.get(start)
+        if not lengths:
+            if self.source_lifter is None:
+                self.source_lifter = Lifter()
+            lengths = code_map.linear_lengths(self.source_lifter, self.image, start, end - start)
+            if lengths is None:
+                raise TranslateError("%08x: cannot recover mapped pointer-source instruction boundaries" % start)
+            self.ghidra_lengths[start] = lengths
+        if slot < start or slot + 4 > end:
+            return False
+        at = start
+        for length in lengths:
+            size = int(length, 16)
+            if at + size > slot:
+                ins = self.decode(at)
+                if ins is None or slot + 4 > at + size:
+                    return False
+                immediate = getattr(ins, "imm_size", 0) == 4 and at + ins.imm_offset == slot
+                displacement = getattr(ins, "disp_size", 0) == 4 and at + ins.disp_offset == slot
+                return any((immediate and op.type == x86.X86_OP_IMM and op.imm & 0xffffffff == target)
+                           or (displacement and op.type == x86.X86_OP_MEM and op.mem.disp & 0xffffffff == target)
+                           for op in ins.operands)
+            at += size
+        return False
+
     def decode(self, address):
         end = next(hi for lo, hi in self.image.exec_ranges if lo <= address < hi)
         raw = self.image.bytes_at(address, min(15, end - address))
@@ -292,29 +326,45 @@ class Recovery:
         self.trace()
 
     def pointer_tables(self):
+        base, size = self.image.base, self.image.size
+        executable, blocked = bytearray(size), bytearray(size)
+        for low, high in self.image.exec_ranges:
+            executable[low - base:high - base] = b"\x01" * (high - low)
+        for at in self.covered:
+            blocked[at - base] = 1
         for section in self.pe.sections:
             if not section.Characteristics & 0x40000000:
                 continue
-            start = self.image.base + section.VirtualAddress
+            start = base + section.VirtualAddress
             end = start + section.SizeOfRawData
-            at = start
-            while at + 8 <= end:
+            data = memoryview(self.image.data)[start - base:end - base]
+            candidates = {}
+            for alignment in range(4):
+                stop = alignment + (len(data) - alignment) // 4 * 4
+                for index, (target,) in enumerate(struct.iter_unpack("<I", data[alignment:stop])):
+                    relative = target - base
+                    if not (0 <= relative < size and executable[relative]):
+                        continue
+                    offset = start - base + alignment + index * 4
+                    if blocked.find(b"\x01", offset, offset + 4) != -1:
+                        continue
+                    original = int.from_bytes(self.original[offset:offset + 4], "little") + self.delta
+                    if target == original:
+                        candidates[base + offset] = target
+            next_at = start
+            for at in sorted(candidates):
+                if at < next_at or at + 8 > end:
+                    continue
                 slots = []
-                while at + 4 <= end and not any(p in self.covered for p in range(at, at + 4)):
-                    offset = at - self.image.base
-                    original_target = int.from_bytes(self.original[offset:offset + 4], "little") + self.delta
-                    target = self.image.rd32(at)
-                    if target != original_target or not self.image.is_exec(target):
-                        break
-                    slots.append((at, target))
+                while at in candidates:
+                    slots.append((at, candidates[at]))
                     at += 4
                 if len(slots) >= 2:
                     self.tables.append((slots[0][0], at))
                     for slot, target in slots:
-                        if not self.at_known_data(target):
+                        if not self.at_known_data(target) and self.pointer_source(slot, target):
                             self.seed(target, "pointer-run:%08x" % slot, False, True)
-                if len(slots) < 2:
-                    at = slots[0][0] + 1 if slots else at + 1
+                next_at = at if len(slots) >= 2 else slots[0][0] + 1
         self.trace()
 
     def index_tables(self):
@@ -501,14 +551,13 @@ class Recovery:
 def build(executable, base, evidence, extra_data, exclude_map=None):
     recovery = Recovery(executable, base)
     recovery.load_evidence(evidence)
-    excluded = [] if exclude_map is None else [(start, start + size, "Ghidra code map")
-                                               for spans in code_map.read_map(exclude_map)[1].values()
-                                               for start, size, _ in spans]
+    mapped = code_map.read_map(exclude_map)[1] if exclude_map is not None else {}
+    excluded = [(start, start + size, "Ghidra code map")
+                for spans in mapped.values() for start, size, _ in spans]
     recovery.excluded_bytes = sum(hi - lo for lo, hi, _ in excluded)
-    if exclude_map is not None:
-        recovery.ghidra_spans = sorted((start, start + size, owner)
-                                       for owner, spans in code_map.read_map(exclude_map)[1].items()
-                                       for start, size, _ in spans)
+    recovery.ghidra_spans = sorted((start, start + size, owner)
+                                   for owner, spans in mapped.items() for start, size, _ in spans)
+    recovery.ghidra_lengths = {start: lengths for spans in mapped.values() for start, _, lengths in spans}
     for lo, hi, kind in list(extra_data) + excluded:
         recovery.data_ranges.append((lo, hi, kind))
         recovery.known_mask[lo - recovery.image.base:hi - recovery.image.base] = b"\x01" * (hi - lo)

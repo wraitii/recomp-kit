@@ -27,7 +27,7 @@ def indirect_jump(ins):
     return instruction_mnemonic(ins) == "JMP" and any(op.opc == "BRANCHIND" for op in ins.ops)
 
 
-def prepare(fir, image=None):
+def prepare(fir, image=None, imports=None):
     """Prepare closed byte-backed IR; secondary entries contribute unknown facts.
 
     SEH bodies qualify only when every frame they establish is unwind-only
@@ -95,12 +95,14 @@ def prepare(fir, image=None):
             preds[target].append(i)
     from .x87_provenance import relations
     word_relations = relations(fir) if any(instruction_mnemonic(fir.insns[i]) == "FLDCW" for i in order) else {}
+    if imports is None:
+        imports = resolve_imports(fir, image) if image is not None else {}
     return Prepared(fir.addr, entry, sites, order, succ,
                     tuple(tuple(row) for row in preds), tuple(effects),
                     tuple(calls), tuple(returns),
                     sum(1 for i in order if instruction_mnemonic(fir.insns[i]).startswith("F")
                         and instruction_mnemonic(fir.insns[i]) != "FEMMS"), word_relations or {}, roots,
-                    resolve_imports(fir, image) if image is not None else {})
+                    imports)
 
 
 def _apply_summary(fact, summary):
