@@ -502,6 +502,25 @@ def _leaves(fv, value, preserves):
 
 def value_views(fv, value, preserves):
     _require_ssa(fv)
+    views, pending, seen = [], [(value, 0)], set()
+    while pending:
+        current, offset = pending.pop()
+        for leaf in _leaves(fv, current, preserves)[0]:
+            form = _address_form(fv.ssa, leaf)
+            if form is None:
+                continue
+            base, at = form
+            if base.id == leaf.id:
+                views.append((base, offset + at))
+            elif base.id in seen:
+                return _flat_views(fv, value, preserves)
+            else:
+                seen.add(base.id)
+                pending.append((base, offset + at))
+    return views
+
+
+def _flat_views(fv, value, preserves):
     forms = (_address_form(fv.ssa, leaf) for leaf in _leaves(fv, value, preserves)[0])
     return [form for form in forms if form is not None]
 

@@ -15,13 +15,14 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from .core import CALLEE_SAVED, Functions, _exits, _forms, _views, this_node, vtable_slots
-from .values import (FRAME_REGISTERS, GPRS, call_register_lanes, direct_call_sites, indirect_call_sites,
-                     loaded_field, memory_accesses)
+from .values import (FRAME_REGISTERS, GPRS, _address_form, call_register_lanes, direct_call_sites, frame_ids,
+                     indirect_call_sites, loaded_field, memory_accesses, whole_lane_value)
 
-Facts = namedtuple("Facts", "addr entry writes calls exits sites error")
+Facts = namedtuple("Facts", "addr entry writes calls exits sites error reloads", defaults=(frozenset(),))
 LINK_REGISTERS = tuple(name for name in GPRS if name not in FRAME_REGISTERS)
 RESULT_REGISTERS = ("EAX", "ECX", "EDX")
-VERSION = "dispatch-facts-v1"
+UNTRACKED_RELOADS = frozenset(CALLEE_SAVED | {"ESP"})
+VERSION = "dispatch-facts-v4"
 
 _WORKER = {}
 
@@ -53,15 +54,14 @@ def contracts(settings, jobs):
             roots=[addr for addr, row in scanned.items() if row.exclusion is None],
             indirect=indirect_targets.load(settings, ctx.program), effects=settings.call_effects,
             noreturn=ctx.program.noreturn, bodies=contract_body)
-    return {addr: frozenset(contract.preserves) for addr, contract in found.items() if contract is not None}
+    return {addr: (contract.preserves | frozenset(GPRS).difference(contract.writes), contract.kills)
+            for addr, contract in found.items() if contract is not None}
 
 
 def oracle(preserved, abi=True):
     def preserves(target, name):
-        found = preserved.get(target) if target is not None else None
-        if found is None:
-            return abi and name in CALLEE_SAVED
-        return name in found
+        kept, killed = preserved.get(target, (frozenset(), frozenset())) if target is not None else ((), ())
+        return name in kept or abi and name in CALLEE_SAVED and name not in killed
     return preserves
 
 
@@ -130,7 +130,7 @@ def function_facts(functions, addr, preserves):
                      or "not lifted")
     entry = this_node(addr, fv)
     program = functions.program
-    writes = []
+    writes, reloads = [], set()
     for access in memory_accesses(fv):
         if access.access != "write":
             continue
@@ -141,6 +141,9 @@ def function_facts(functions, addr, preserves):
             table = (value.data if value.opc == "CONST" and access.size == 4
                      and vtable_slots(program, value.data) else None)
             writes.append((access.site_addr, base.id, constant, table))
+            reload = fv.reloads.get(base.id)
+            if table is not None and reload is not None and reload.name in UNTRACKED_RELOADS:
+                reloads.add(base.id)
     registers = {record.site_addr: record for record in call_register_lanes(fv)}
     calls = []
     for call in direct_call_sites(fv):
@@ -153,19 +156,42 @@ def function_facts(functions, addr, preserves):
     exits = {name: frozenset((source, offset) for kind, source, offset in
                              (view for view in views if view[0] == "through"))
              for name, views in _exits(addr, fv, preserves).items()}
-    sites = []
+    sites, frame = [], None
     for record in indirect_call_sites(fv):
-        fields = set()
+        fields, kinds = set(), set()
         for leaf, at in _forms(fv, record.base_value, 0, preserves):
             holder = loaded_field(fv, leaf) if leaf is not None and at == 0 else None
-            fields |= {(None, None)} if holder is None else {
-                (None if root is None else root.id, offset)
-                for root, offset in _forms(fv, holder[0], holder[1], preserves)}
+            if holder is None:
+                fields.add((None, None))
+                kinds.add("vtable not loaded from the receiver")
+                continue
+            for root, offset in _forms(fv, holder[0], holder[1], preserves):
+                fields.add((None if root is None else root.id, offset))
+                if root is not None and (entry is None or root.id != entry[1]):
+                    frame = frame_ids(fv) if frame is None else frame
+                    kinds.add(_root_kind(fv, root, frame))
         before = registers.get(record.site_addr)
         ecx = frozenset() if before is None else _ids(_views(addr, fv, before.before["ECX"], preserves))
-        sites.append((record.site_addr, record.displacement, frozenset(fields), ecx))
+        sites.append((record.site_addr, record.displacement, frozenset(fields), ecx, frozenset(kinds)))
     return Facts(addr, None if entry is None else entry[1], tuple(writes), tuple(calls),
-                 {name: found for name, found in exits.items() if found}, tuple(sites), None)
+                 {name: found for name, found in exits.items() if found}, tuple(sites), None,
+                 frozenset(reloads))
+
+
+def _root_kind(fv, root, frame):
+    for name in GPRS:
+        value = whole_lane_value(fv.ssa, fv.entry[name])
+        if value is not None and value.id == root.id:
+            return "entry %s" % name
+    site = fv.reloads.get(root.id)
+    if site is not None:
+        return "%s after %s call" % (site.name, "a direct" if site.target else "an indirect")
+    if root.opc == "LOAD":
+        form = _address_form(fv.ssa, root.args[1])
+        if form is None:
+            return "global"
+        return "stack slot" if form[0].id in frame else "loaded pointer"
+    return {"PHI": "merge", "INT_ADD": "indexed"}.get(root.opc, root.opc.lower())
 
 
 def _ids(views):

@@ -105,13 +105,14 @@ def _rewrite_signed_sub_le(s, value):
     return False
 
 
-def canonicalize(s):
+def canonicalize(s, signed_sub=True):
     """Propagate copies/constants and cancel byte decomposition/reassembly.
 
 Only equal-width values may alias one another. PACK of an entire BYTE sequence
 recovers its source; partial packs stay explicit. Constant evaluation uses the
 output width and p-code's zero result for shifts beyond the input width.
-Only values with operands that can still alias are revisited.
+Only values with operands that can still alias are revisited. `signed_sub`
+controls the predicate rewrites needed by codegen but not by preservation.
 """
     constants = {}
     for v in s.values:
@@ -135,7 +136,7 @@ Only values with operands that can still alias are revisited.
                 continue
             v.args = tuple(s.resolve(a) for a in v.args)
             a, replacement = v.args, None
-            if _rewrite_signed_sub_predicate(s, v) or _rewrite_signed_sub_le(s, v):
+            if signed_sub and (_rewrite_signed_sub_predicate(s, v) or _rewrite_signed_sub_le(s, v)):
                 changed = True
                 remaining.append(v)
                 continue

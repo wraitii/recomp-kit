@@ -441,7 +441,7 @@ def _preserved_registers(fir, contracts=None, sites=None, ir=None, pops=None):
         s = build(ir, register_groups=groups.values(), call_targets=call_targets,
                   indirect_call_symbol="preservation", kept_calls=kept_calls,
                   kept_indirect=kept_sites)
-        canonicalize(s)
+        canonicalize(s, signed_sub=False)
         owners = {v.id: b for b in s.blocks.values() for v in b.ops}
         esp = groups["ESP"]
 
@@ -458,7 +458,7 @@ def _preserved_registers(fir, contracts=None, sites=None, ir=None, pops=None):
             base = None if state is None else _whole_lanes(s, [state.get(key) for key in esp])
             return None if count is None or base is None else (base, 4 + count)
 
-        if not forward(s, calls=True, stack_reload=stack_reload):
+        if not forward(s, calls=True, stack_reload=stack_reload, signed_sub=False):
             return frozenset()
     except (SSAError, RecursionError):
         return frozenset()

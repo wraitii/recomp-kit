@@ -11,7 +11,7 @@ from .ssa import MEMORY
 from .simplify import canonicalize
 
 
-def forward(s, calls=False, stack_reload=None):
+def forward(s, calls=False, stack_reload=None, signed_sub=True):
     owners = {v.id: b for b in s.blocks.values() for v in b.ops}
     shapes, bounds, active = {}, {}, set()
 
@@ -148,5 +148,5 @@ def forward(s, calls=False, stack_reload=None):
                     s.aliases[effect.id] = effect.args[0].args[0]
             block.ops = [effect for effect in block.ops
                          if effect.opc != "LOAD" or effect.id not in s.aliases]
-        canonicalize(s)
+        canonicalize(s, signed_sub=signed_sub)
     return changed

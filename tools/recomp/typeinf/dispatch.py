@@ -30,7 +30,7 @@ sys.path[:0] = [str(KIT / "tools"), str(KIT / "tools" / "recomp")]
 from .core import vtable_slots  # noqa: E402
 from .facts import cached, collect, contracts, default_jobs, source_key  # noqa: E402
 
-MAX_POSITIONS = 4
+MAX_POSITIONS = 32
 
 
 class ProofError(Exception):
@@ -141,12 +141,16 @@ class Bounds:
     def __init__(self, image, facts):
         self.image, self.facts = image, facts
         self.installs = defaultdict(list)
+        self.untracked, self.untracked_in = {}, {}
         self.writes = defaultdict(lambda: defaultdict(set))
         for addr, found in facts.items():
             for site, node, offset, table in found.writes:
                 self.writes[(addr, node)][offset].add(table)
                 if table is not None:
                     self.installs[table].append((addr, site, node, offset))
+                    if node in found.reloads:
+                        self.untracked.setdefault(table, site)
+                        self.untracked_in.setdefault(addr, site)
         self.installing = self._installing()
         self.edges, self.unlifted, self.linked = self._edges()
         self._objects, self._closures, self._incomplete = {}, {}, {}
@@ -254,6 +258,9 @@ class Bounds:
         return dict(positions), cyclic
 
     def seeds(self, table):
+        if table in self.untracked:
+            raise ProofError("table %08x is installed at %08x through a register reloaded after a call" % (
+                table, self.untracked[table]))
         installs = self.installs.get(table, ())
         sites = {site for _, site, _, _ in installs}
         for at, code in self.image.literals(table):
@@ -309,6 +316,9 @@ class Bounds:
     def written(self, positions, field):
         tables = set()
         for node, found in positions.items():
+            if node[0] in self.untracked_in:
+                raise ProofError("%08x installs a table at %08x through a register reloaded after a call" % (
+                    node[0], self.untracked_in[node[0]]))
             offsets = self.writes.get(node)
             if not offsets:
                 continue
@@ -323,19 +333,24 @@ class Bounds:
         found = self.facts[method]
         own = [site for site in found.sites if found.entry is not None
                and any(root == found.entry for root, _ in site[2])]
-        if not own:
+        if not found.sites:
             return None
         result = {"method": method, "sites": {}}
+        for site, slot, _, _, kinds in found.sites:
+            if all(site != row[0] for row in own):
+                result["sites"][site] = {"slot": slot, "failure": "receiver is not this: " + ", ".join(sorted(kinds))}
+        if not own:
+            return result
         try:
             positions, _ = self.objects(method)
             dispatch = self.dispatch_tables(method)
             result["dispatch"] = dispatch
         except ProofError as error:
             result["failure"] = str(error)
-            for site, slot, _, _ in own:
+            for site, slot, _, _, _ in own:
                 result["sites"][site] = {"slot": slot, "failure": str(error)}
             return result
-        for site, slot, fields, ecx in own:
+        for site, slot, fields, ecx, _ in own:
             row = result["sites"][site] = {"slot": slot, "fields": sorted(offset for _, offset in fields
                                                                           if offset is not None)}
             try:
@@ -368,7 +383,7 @@ def main():
     parser.add_argument("--targets", type=Path, help="write proven sites as an indirect-targets file")
     parser.add_argument("--explain", type=lambda v: int(v, 16), action="append", default=[])
     parser.add_argument("--no-abi", action="store_true",
-                        help="do not assume indirect or unanalyzed callees preserve EBX/ESI/EDI/EBP")
+                        help="do not assume callees preserve EBX/ESI/EDI/EBP unless their contract kills it")
     args = parser.parse_args()
     game_config.resolve_game_args(args)
     settings = Settings(game_config.load(args.game_dir, args.build_root), None, args.jobs, None)
