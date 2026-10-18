@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 
 from . import contract_variants
+from .call_contracts import closed
 from .x87_propagation import mode_preserving_leaf
 
 
@@ -18,7 +19,7 @@ class Eligibility:
 
     def checked(self, addr):
         row = self.scanned.get(addr)
-        return bool(row and row.register_facts and row.exclusion is None and addr not in self.opaque)
+        return bool(row and closed(row.register_facts) and row.exclusion is None and addr not in self.opaque)
 
     def candidates(self):
         if not self.enabled:
@@ -42,10 +43,10 @@ class Eligibility:
         result = set(self.settings.state_contract_callers)
         if self.settings.private_input_registers:
             result |= {addr for addr, row in self.scanned.items()
-                       if addr not in self.opaque and row.register_facts and row.cw_facts
+                       if addr not in self.opaque and closed(row.register_facts) and row.cw_facts
                        and any(target in self.settings.private_input_registers for target in row.calls)}
         if self.settings.private_leaf_contracts:
             result |= {addr for addr, row in self.scanned.items()
-                       if addr not in self.opaque and row.register_facts and row.cw_facts
+                       if addr not in self.opaque and closed(row.register_facts) and row.cw_facts
                        and any(t in private_targets for t in row.calls)}
         return result

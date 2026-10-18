@@ -2,7 +2,7 @@
 from dataclasses import dataclass
 
 from .body import FrozenMap
-from .call_contracts import FIELDS, ARITH_FLAGS
+from .call_contracts import FIELDS, ARITH_FLAGS, closed
 from .call_contracts import GPRS
 
 INPUT_ARGUMENT_REGISTERS = tuple(field for field in GPRS if field not in ("ESP", "EBP"))
@@ -141,11 +141,11 @@ def select_layout(layouts, target, mask):
 def eligible_leaves(scanned, opaque):
     uses = {}
     for addr, row in scanned.items():
-        if addr in opaque or not row.register_facts or not row.cw_facts:
+        if addr in opaque or not closed(row.register_facts) or not row.cw_facts:
             continue
         for target in row.calls:
             uses[target] = uses.get(target, 0) + 1
     return {addr for addr, row in scanned.items()
-            if addr not in opaque and row.register_facts and row.cw_facts and row.cw_facts.returns
+            if addr not in opaque and closed(row.register_facts) and row.cw_facts and row.cw_facts.returns
             and not row.cw_facts.calls and uses.get(addr, 0) >= 2
             and row.description.count <= 64 * uses[addr]}

@@ -34,7 +34,7 @@ SLEIGH omits AF for arithmetic and logic instructions which both emitters
 define, so those instructions add the AF write here.
 
 The analysis is conservative.  Indirect calls without a target fact, CALLOTHER, unbound targets,
-failed lifts, SEH/alternate-entry/rewritten bodies, tail transfers and targets
+failed lifts, SEH/alternate-entry/rewritten bodies, indirect tail transfers and targets
 whose dispatch can be swapped all contribute ``reads=all, kills=none``.
 Preservation uses byte-backed normalization and SSA for call-free bodies;
 no emission is inspected.
@@ -235,7 +235,7 @@ class _Prepared(object):
     their index to the site address for ``summarize``'s indirect facts.
     """
 
-    __slots__ = ("language", "entry", "order", "succ", "preds", "use", "defs", "call", "opaque", "call_sites", "returns", "writes", "preserves")
+    __slots__ = ("language", "entry", "order", "succ", "preds", "use", "defs", "call", "opaque", "call_sites", "returns", "tails", "writes", "preserves")
 
     def __init__(self, fir, cells, bits, sites=None):
         self.language = cells.language
@@ -244,6 +244,7 @@ class _Prepared(object):
         self.order, self.succ, self.preds = [], {}, {}
         self.use, self.defs, self.call, self.opaque, self.returns = {}, {}, {}, set(), []
         self.call_sites = {}
+        self.tails = frozenset()
         self.writes = 0
         self.preserves = frozenset()
         if self.entry is None:
@@ -281,9 +282,11 @@ class _Prepared(object):
                     defs |= produced
             row = sites.get(i)
             target = None
-            if row is not None and row.kind != "tail":
+            if row is not None and (row.kind != "tail" or row.targets):
                 self.call_sites[i] = row
                 target = row.targets[0].address if row.targets else None
+                if row.kind == "tail":
+                    self.tails |= {i}
             if ins.mnem.upper() == "CALL" and target is None and not indirect:
                 unknown = True
             if ins.mnem.upper() in AF_WRITERS:
@@ -298,7 +301,7 @@ class _Prepared(object):
             self.use[i], self.defs[i], self.call[i] = use, defs, target
             if unknown or indirect:
                 self.opaque.add(i)
-            if _is_return(ins):
+            if _is_return(ins) or i in self.tails:
                 self.returns.append(i)
 
 
@@ -306,18 +309,25 @@ def _is_return(ins):
     return ins.mnem.upper() == "RET" or any(op.opc == "RETURN" for op in ins.ops)
 
 
+def closed(prepared):
+    return bool(prepared) and not prepared.tails
+
+
 def prepare(fir, language=None, image=None, sites=None):
     """The callee-independent facts of one lifted body, None unless its CFG is closed.
 
     Plain data, so workers can hand it to the process that solves the call graph."""
-    if not fir.insns or not cfg_is_closed(fir):
+    if not fir.insns:
         return None
-    cells = mapping(language or fir.language)
     if sites is None:
         sites = call_sites.build(fir, image)
+    tails = frozenset(i for i, row in sites.items() if row.kind == "tail" and row.targets)
+    if not cfg_is_closed(fir, tails=tails):
+        return None
+    cells = mapping(language or fir.language)
     p = _Prepared(fir, cells, _bits(cells), sites)
     if (any(ins.raw and len(ins.raw) == 1 and 0x50 <= ins.raw[0] <= 0x57
-            for ins in fir.insns) and not fir.entries and not fir.seh and not any(
+            for ins in fir.insns) and not p.tails and not fir.entries and not fir.seh and not any(
             op.opc in ("CALL", "CALLIND", "CALLOTHER") for ins in fir.insns for op in ins.ops)):
         p.preserves = _preserved_registers(fir)
     return None if p.entry is None else p
@@ -525,15 +535,18 @@ def summarize(p, callee_lookup, cells=None, indirect=None, effects=None, noretur
                     frozenset(f for f in FIELDS if writes & bits.field_bits[f]), p.preserves)
 
 
-def cfg_is_closed(fir, ends=()):
+def cfg_is_closed(fir, ends=(), tails=()):
     """False for a body whose control can leave without a modeled edge.
 
     Tail jumps, computed jumps without a decoded table and calls with no fallthrough are
-    conservatively outside this model, except calls in `ends`, which end their path.
+    conservatively outside this model, except calls in `ends`, which end their path, and
+    jumps in `tails`, which are modeled as calls to their target.
     """
     for i, ins in enumerate(fir.insns):
         mnem = ins.mnem.upper()
         succ = fir.succ[i]
+        if i in tails:
+            continue
         if i in fir.exits:
             return False
         if mnem == "RET":
@@ -618,6 +631,9 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
         body = prepared.get(addr)
         if body is not None:
             for row in body.call_sites.values():
+                if row.kind == "tail":
+                    out.extend(t.address for t in row.targets)
+                    continue
                 fact = indirect.get(row.site)
                 if fact is not None and fact[0] == "call":
                     out.extend(fact[1])
