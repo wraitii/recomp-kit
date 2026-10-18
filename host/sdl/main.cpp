@@ -68,8 +68,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cmath>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -415,24 +417,64 @@ uint64_t g_cursor_revision = 0, g_cursor_started = 0;
 HostCursor g_guest_cursor;
 std::vector<SDL_Cursor *> g_native_cursors;
 size_t g_cursor_step = SIZE_MAX;
+double g_cursor_scale = 1.0;
+
+double native_cursor_scale() {
+    int bw, bh, dw, dh;
+    window_sizes(&bw, &bh, &dw, &dh);
+    if (bw <= 0 || bh <= 0 || g_mode_w <= 0 || g_mode_h <= 0)
+        return 1.0;
+    const PointRect game = game_rect_points();
+    if (game.w <= 0 || game.h <= 0)
+        return 1.0;
+    return std::max(1.0, std::min(game.w / g_mode_w, game.h / g_mode_h));
+}
+
+SDL_Surface *cursor_surface(const HostCursorFrame &frame, int *hot_x, int *hot_y) {
+    SDL_Surface *source =
+        SDL_CreateSurfaceFrom(frame.width, frame.height, SDL_PIXELFORMAT_ARGB8888,
+                              const_cast<uint32_t *>(frame.pixels.data()), frame.width * 4);
+    if (!source)
+        return nullptr;
+    const int w = std::max(1, int(std::lround(frame.width * g_cursor_scale)));
+    const int h = std::max(1, int(std::lround(frame.height * g_cursor_scale)));
+    *hot_x = std::clamp(int(std::lround(frame.hot_x * double(w) / frame.width)), 0, w - 1);
+    *hot_y = std::clamp(int(std::lround(frame.hot_y * double(h) / frame.height)), 0, h - 1);
+    if (w == frame.width && h == frame.height)
+        return source;
+    SDL_Surface *scaled = SDL_CreateSurface(w, h, SDL_PIXELFORMAT_ARGB8888);
+    if (!scaled || !SDL_BlitSurfaceScaled(source, nullptr, scaled, nullptr, SDL_SCALEMODE_LINEAR)) {
+        SDL_DestroySurface(source);
+        if (scaled)
+            SDL_DestroySurface(scaled);
+        return nullptr;
+    }
+    SDL_DestroySurface(source);
+    return scaled;
+}
 
 void update_native_cursor() {
     if (!SDL_IsMainThread())
         return;
-    if (host_cursor_snapshot(&g_cursor_revision, &g_guest_cursor)) {
+    const double scale = native_cursor_scale();
+    const bool changed = host_cursor_snapshot(&g_cursor_revision, &g_guest_cursor);
+    const bool scale_changed = std::abs(scale - g_cursor_scale) > 1e-6;
+    if (changed || scale_changed) {
         SDL_SetCursor(SDL_GetDefaultCursor());
         for (SDL_Cursor *cursor : g_native_cursors)
             SDL_DestroyCursor(cursor);
         g_native_cursors.clear();
-        g_guest_cursor_visible = g_guest_cursor.visible;
-        g_cursor_started = SDL_GetTicksNS();
+        g_cursor_scale = scale;
         g_cursor_step = SIZE_MAX;
+        if (changed) {
+            g_guest_cursor_visible = g_guest_cursor.visible;
+            g_cursor_started = SDL_GetTicksNS();
+        }
         for (const auto &frame : g_guest_cursor.frames) {
-            SDL_Surface *surface =
-                SDL_CreateSurfaceFrom(frame.width, frame.height, SDL_PIXELFORMAT_ARGB8888,
-                                      const_cast<uint32_t *>(frame.pixels.data()), frame.width * 4);
+            int hot_x = frame.hot_x, hot_y = frame.hot_y;
+            SDL_Surface *surface = cursor_surface(frame, &hot_x, &hot_y);
             SDL_Cursor *cursor =
-                surface ? SDL_CreateColorCursor(surface, frame.hot_x, frame.hot_y) : nullptr;
+                surface ? SDL_CreateColorCursor(surface, hot_x, hot_y) : nullptr;
             SDL_DestroySurface(surface);
             if (!cursor) {
                 fprintf(stderr, "[host] native cursor creation failed: %s\n", SDL_GetError());
@@ -614,7 +656,13 @@ void update_platform_pointer_capture() {
     // window's resize edges remain reachable.
     int bw, bh, dw, dh;
     window_sizes(&bw, &bh, &dw, &dh);
-    HostRect rect = host_pointer_confinement_wanted(want, g_window_mode) && !relative && g_window
+    const bool fullscreen_hold =
+        (g_window_mode != 0 || window_fullscreen()) && g_window &&
+        platform_ui_pointer_capture_supported() && window_focused() &&
+        !window_minimized_or_hidden() && !g_capture_release_held && !mods_page_visible() &&
+        !mods_controls_editing() && !g_viewport_active && !g_fullscreen_transition;
+    HostRect rect = host_pointer_confinement_wanted(want || fullscreen_hold, g_window_mode) &&
+                            !relative && g_window
                         ? host_pointer_confinement_rect({0, 0, double(bw), double(bh)})
                         : HostRect{};
     if (g_window && (rect.x != g_pointer_confinement.x || rect.y != g_pointer_confinement.y ||
