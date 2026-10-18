@@ -81,7 +81,28 @@ fn save_settings(value: Settings, state: State<Library>) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn pick(kind: String) -> Option<String> {
+async fn pick(kind: String, app: tauri::AppHandle) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    if kind == "copy" {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.run_on_main_thread(move || {
+            let chosen = objc2::MainThreadMarker::new().and_then(|marker| {
+                let panel = objc2_app_kit::NSOpenPanel::openPanel(marker);
+                panel.setCanChooseDirectories(true);
+                panel.setCanChooseFiles(true);
+                panel.setAllowsMultipleSelection(false);
+                if panel.runModal() != objc2_app_kit::NSModalResponseOK {
+                    return None;
+                }
+                panel.URL()?.path().map(|path| path.to_string())
+            });
+            let _ = sender.send(chosen);
+        }).ok()?;
+        return tauri::async_runtime::spawn_blocking(move || receiver.recv().ok().flatten())
+            .await.ok().flatten();
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
     let dialog = rfd::AsyncFileDialog::new();
     let chosen = match kind.as_str() {
         "folder" | "kit" => dialog.pick_folder().await,
@@ -91,7 +112,7 @@ async fn pick(kind: String) -> Option<String> {
                 .pick_file()
                 .await
         }
-        "reference" => dialog.pick_file().await,
+        "copy" => dialog.set_title("Choose your game executable, archive, installer, or disc image").pick_file().await,
         _ => dialog.pick_file().await,
     };
     chosen.map(|file| file.path().to_string_lossy().into_owned())
@@ -135,9 +156,14 @@ async fn query(request: Value, app: tauri::AppHandle) -> Result<Value, String> {
 async fn open_assisted_folder(game: String, job_id: String, app: tauri::AppHandle) -> Result<(), String> {
     let result = query(json!({"action":"assisted_path", "game":game, "jobId":job_id}), app).await?;
     let folder = result["dropFolder"].as_str().ok_or("The saved job has no safe drop folder")?;
-    let path = PathBuf::from(folder);
-    if !path.is_dir() || path.is_symlink() {
-        return Err("The saved drop folder is no longer available".into());
+    open_folder(folder.to_owned())
+}
+
+#[tauri::command]
+fn open_folder(path: String) -> Result<(), String> {
+    let path = PathBuf::from(path);
+    if !path.is_absolute() || !path.is_dir() || path.is_symlink() {
+        return Err("The folder is no longer available".into());
     }
     #[cfg(target_os = "macos")]
     let program = "open";
@@ -295,6 +321,7 @@ fn main() {
             start_job,
             cancel_job,
             open_assisted_folder,
+            open_folder,
             cancel_assisted,
             open_url
         ])

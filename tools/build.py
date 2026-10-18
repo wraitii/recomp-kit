@@ -450,7 +450,7 @@ def build_diff_harness(build_root, out):
 
 
 def run_translator(stage, game_dir, build_root, allow_unmodelled=None, aux_modules=(), regen_functions=(), main=True,
-                   cache_emission=False):
+                   cache_emission=True):
     if main:
         command = [sys.executable, str(ROOT / "tools/recomp/driver.py"), "--out", str(stage),
                    "--game", str(game_dir),
@@ -486,6 +486,8 @@ def parse_args(argv, system=None):
     parser.add_argument("--regenerate", nargs="?", const="all", default=None, metavar="MODULES",
                         help="Regenerate translated C: all images, or only the named auxiliary modules "
                              "(comma-separated; 'main' names the game image)")
+    parser.add_argument("--no-emission-cache", action="store_true",
+                        help="Skip the prepared-body cache used by selected-function regeneration")
     parser.add_argument("--regen-function", action="append", default=[], metavar="HEX_ADDR",
                         help="Re-emit selected functions from validated whole-image preparation")
     parser.add_argument("--cache-emission", action="store_true",
@@ -523,6 +525,9 @@ def parse_args(argv, system=None):
                         help="Android: push the configured game install minus [bundle].exclude before launch")
     parser.add_argument("--console", action="store_true", help="After launching on the device, stream its console")
     args = parser.parse_args(argv)
+    args.cache_emission = args.cache_emission or not args.no_emission_cache
+    if not args.cache_emission and args.regen_function:
+        parser.error("--regen-function requires the emission cache")
     if args.push_game and (args.target != "android" or args.no_install):
         parser.error("--push-game requires --target android without --no-install")
     if args.target == "ios" and not args.stub and not args.team:

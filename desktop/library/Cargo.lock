@@ -2785,6 +2785,8 @@ name = "recomp-library"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "objc2",
+ "objc2-app-kit",
  "rfd",
  "serde",
  "serde_json",

@@ -561,7 +561,7 @@ def rotate_logs(log_dir, current=None, keep_count=MAX_RETAINED_LOGS,
             retained_bytes += size
 
 
-def copy_payload(source, destination, cancel=None, expected_bytes=None, exclude_paths=None):
+def copy_payload(source, destination, cancel=None, expected_bytes=None, exclude_paths=None, progress=None):
     source = Path(source).resolve(strict=True)
     destination = Path(destination)
     if destination.exists() or destination.is_symlink() or destination.resolve().is_relative_to(source):
@@ -619,6 +619,8 @@ def copy_payload(source, destination, cancel=None, expected_bytes=None, exclude_
                         if total + file_bytes > MAX_PAYLOAD_BYTES:
                             raise JobError("payload_size_limit", "The staged game copy exceeds its size limit.")
                         output_stream.write(chunk)
+                        if progress:
+                            progress(total + file_bytes, relative)
                     output_stream.flush()
                     os.fsync(output_stream.fileno())
                 after = src.stat()
@@ -689,7 +691,7 @@ def payload_files(root, cancel=None, exclude_paths=None):
     return root, sorted(files, key=lambda item: unicodedata.normalize("NFC", item.relative_to(root).as_posix()))
 
 
-def payload_identity(root, cancel=None, exclude_paths=None):
+def payload_identity(root, cancel=None, exclude_paths=None, progress=None):
     root, files = payload_files(root, cancel, exclude_paths)
     digest = hashlib.sha256(b"recomp-payload-v1\n")
     total = 0
@@ -717,6 +719,8 @@ def payload_identity(root, cancel=None, exclude_paths=None):
                 if total + read > MAX_PAYLOAD_BYTES:
                     raise JobError("payload_size_limit", "The game copy exceeds the payload fingerprint size limit.")
                 file_hash.update(chunk)
+                if progress:
+                    progress(total + read, relative)
         after = path.stat()
         if initial != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
             raise JobError("source_changed", "A game file changed during fingerprinting.",

@@ -51,6 +51,21 @@ def emit(kind, **fields):
     print(json.dumps({"kind": kind, **fields}), flush=True)
 
 
+def file_progress(total=None):
+    next_update = 0
+
+    def report(completed, path):
+        nonlocal next_update
+        now = time.monotonic()
+        if now < next_update and completed != total:
+            return
+        next_update = now + 0.25
+        emit("progress", current=path, bytes=completed, totalBytes=total,
+             fraction=min(1, completed / total) if total else None)
+
+    return report
+
+
 def cancel(signum, frame):
     raise InterruptedError("Installation cancelled")
 
@@ -97,7 +112,7 @@ def run(command, log_path=None, build_monitor=None, env=None):
     def read_output():
         try:
             while True:
-                chunk = process.stdout.read(65536)
+                chunk = process.stdout.readline(65536)
                 if not chunk:
                     break
                 while True:
@@ -508,6 +523,7 @@ def recipe(game_dir):
 def log_event(path, stage, event, details=None, failure=False):
     try:
         install_jobs.append_job_log(path, stage, event, details, failure)
+        emit("log", text=f"[{stage}] {event}" + (f" · {json.dumps(details)}" if details else ""))
     except (OSError, ValueError) as error:
         emit("log", text=f"Could not persist the {stage} job log event: {error}")
 
@@ -1302,10 +1318,12 @@ def install(request, storage, prepared=None):
     install_jobs.ensure_metadata(root)
     job_identifier = request.get("jobId")
     recipe_facts = recipe(directory)
+    emit("stage", stage="fingerprinting", message="Reading your game files")
     source_identity = ({"kind": "zip", "sha256": archive_digest(source_path, check_cancel)}
                        if source_kind == "zip" else
                        {"kind": "folder", **install_jobs.payload_identity(selected["contentRoot"], check_cancel,
-                                                                                exclude_paths=exclude_paths)})
+                                                                                exclude_paths=exclude_paths,
+                                                                                progress=file_progress())})
     if assisted_request:
         source_identity["excludedOptionalPaths"] = list(exclude_paths)
     archive_bytes = archive_uncompressed_size(source_path) if source_kind == "zip" else 0
@@ -1397,7 +1415,7 @@ def install(request, storage, prepared=None):
         staged_data = build_root / "original"
         reusable_copy = False
         if resumed and staged_data.is_dir() and journal.get("validatedInputs", {}).get("stagedOriginal"):
-            current_copy = install_jobs.payload_identity(staged_data, check_cancel)
+            current_copy = install_jobs.payload_identity(staged_data, check_cancel, progress=file_progress())
             reusable_copy = current_copy == journal["validatedInputs"]["stagedOriginal"]
             if reusable_copy:
                 validate_game(staged_data, executable_relative, cfg["game"]["sha256"],
@@ -1439,6 +1457,7 @@ def install(request, storage, prepared=None):
             install_jobs.update_job(job_paths, journal, stage)
         if source_kind == "zip" and not reusable_copy:
             stage = "extracting"
+            emit("stage", stage=stage, message="Extracting the game archive")
             install_jobs.update_job(job_paths, journal, stage)
             check_space(job_paths, journal, root, "extracting",
                         archive_bytes + copy_estimate + install_jobs.MAX_BUILD_BYTES,
@@ -1486,16 +1505,21 @@ def install(request, storage, prepared=None):
             source_facts = journal["validatedInputs"]["source"]
             copied = journal["validatedInputs"]["stagedOriginal"]
         else:
-            source_facts = install_jobs.payload_identity(source, check_cancel, exclude_paths=exclude_paths)
+            emit("stage", stage="fingerprinting", message="Checking the game files before copying")
+            source_facts = install_jobs.payload_identity(source, check_cancel, exclude_paths=exclude_paths,
+                                                         progress=file_progress(copy_estimate))
             space_plan["sourceCopyBytesEstimate"] = source_facts["bytes"]
             check_space(job_paths, journal, root, "copying",
                         source_facts["bytes"] + install_jobs.MAX_BUILD_BYTES,
                         log_path, space_plan)
             log_event(log_path, "copying", "validated source copy started",
                       {"files": source_facts["files"], "bytes": source_facts["bytes"]})
+            emit("stage", stage="copying", message="Copying your game files")
             install_jobs.copy_payload(source, staged_data, check_cancel, source_facts["bytes"],
-                                      exclude_paths=exclude_paths)
-            copied = install_jobs.payload_identity(staged_data, check_cancel)
+                                      exclude_paths=exclude_paths, progress=file_progress(source_facts["bytes"]))
+            emit("stage", stage="fingerprinting", message="Checking the copied files")
+            copied = install_jobs.payload_identity(staged_data, check_cancel,
+                                                   progress=file_progress(source_facts["bytes"]))
         if copied["sha256"] != source_facts["sha256"]:
             raise SourceError("copy_validation_failed", "The staged game copy differs from its source.",
                               ["Check storage space and source permissions."], str(source))
@@ -1522,6 +1546,7 @@ def install(request, storage, prepared=None):
         check_space(job_paths, journal, root, "building",
                     max(0, install_jobs.MAX_BUILD_BYTES - existing_growth), log_path, space_plan)
         isolated_env = os.environ.copy()
+        isolated_env["PYTHONUNBUFFERED"] = "1"
         isolated_env["RECOMP_SOURCE_EXECUTABLE"] = executable_relative.as_posix()
         isolated_env["RECOMP_SOURCE_AUX_PATHS"] = json.dumps(selected["auxiliaryPaths"], ensure_ascii=False)
         isolated_paths = {"TMPDIR": staging / "tmp", "TMP": staging / "tmp", "TEMP": staging / "tmp"}
@@ -1534,10 +1559,11 @@ def install(request, storage, prepared=None):
                    "temporaryEnvironmentRoots": {key: value.relative_to(root).as_posix()
                                                    for key, value in isolated_paths.items()}})
         run([sys.executable, str(KIT / "tools/build.py"), "--game", game_id,
-             "--build-root", str(build_root), "--regenerate", "--target", "app"], log_path,
+             "--build-root", str(build_root), "--regenerate", "--no-emission-cache", "--target", "app"], log_path,
             build_monitor={"root": staging, "volume": root,
                            "baselineBytes": monitor_baseline}, env=isolated_env)
         log_event(log_path, "building", "build completed")
+        emit("stage", stage="packaging", message="Preparing the finished app")
         binary = artifact(cfg, build_root, installed=False)
         if not binary.is_file():
             raise ValueError("Build finished without the expected game application")
@@ -1630,6 +1656,7 @@ def install(request, storage, prepared=None):
                 "previousIdentity": None,
                 "stagedToken": staged_data_token, "stagedIdentity": copied})
         stage = "publishing"
+        emit("stage", stage=stage, message="Saving the finished installation")
         install_jobs.update_job(job_paths, journal, stage)
         check_space(job_paths, journal, root, "publishing", 0, log_path, space_plan)
         log_event(log_path, "publishing", "staged app and original validated",
@@ -1657,12 +1684,12 @@ def install(request, storage, prepared=None):
                                              "originalIdentity": copied, "appIdentity": app_facts,
                                              "manifest": facts, "manifestIdentity": manifest_digest,
                                              "previousManifestIdentity": manifest_identity(previous_manifest) if previous_manifest else None})
-        for artifact in artifact_specs:
-            destination = root / artifact["destination"]
-            staged = root / artifact["staged"]
-            backup = job_paths["backup"] / artifact["backup"]
+        for spec in artifact_specs:
+            destination = root / spec["destination"]
+            staged = root / spec["staged"]
+            backup = job_paths["backup"] / spec["backup"]
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if artifact["hadPrevious"]:
+            if spec["hadPrevious"]:
                 destination.replace(backup)
                 install_jobs._sync_directory(destination.parent)
                 install_jobs._sync_directory(backup.parent)
@@ -1686,6 +1713,7 @@ def install(request, storage, prepared=None):
         cleanup_complete = False
         try:
             stage = "cleaning"
+            emit("stage", stage=stage, message="Removing temporary build files")
             install_jobs.update_job(job_paths, journal, stage)
             log_event(log_path, stage, "owned staging cleanup started")
             install_jobs.remove_owned(job_paths["staging"], job_paths["meta"], job_identifier,
@@ -1841,7 +1869,8 @@ def preflight_request(request):
         destination_copy_bytes = source_bytes
     else:
         raise install_jobs.JobError("preflight_source_unsupported", "The selected source has no bounded space estimate.")
-    required = destination_copy_bytes + install_jobs.MAX_BUILD_BYTES + install_jobs.SAFETY_RESERVE_BYTES
+    required = (destination_copy_bytes + install_jobs.MAX_BUILD_BYTES + install_jobs.SAFETY_RESERVE_BYTES
+                + install_jobs.MAX_ATTEMPT_LOG_BYTES)
     destination_space = shutil.disk_usage(destination.parent)
     source_space = shutil.disk_usage(source)
     return {"source": {"path": str(source), "bytes": source_bytes, "freeBytes": source_space.free},
@@ -2113,6 +2142,7 @@ def main():
         elif action == "check":
             result = prerequisites(request.get("needsRust", True), request.get("needsInnoextract", False))
         elif action == "install":
+            emit("stage", stage="checking", message="Checking your copy and install location")
             if request.get("jobId"):
                 result = resume_install(request, storage)
             else:
