@@ -162,4 +162,5 @@ def emit_private_prepared(plan):
 
 def private_contract(tr, lifter, fn, artifacts=None):
     artifacts = artifacts if artifacts is not None else ArtifactStore()
-    return summarize(prepare(artifacts.normalized(artifacts.lifted(tr, lifter, fn), lifter)), lambda _: None)
+    fir = artifacts.lifted(tr, lifter, fn)
+    return summarize(prepare(artifacts.normalized(fir, lifter)), lambda _: None, body=fir)

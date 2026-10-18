@@ -436,6 +436,14 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
                 raise TranslateError("%08x: private input register requires an unreplaced, closed single-entry body without SEH" % addr)
         contracts = {}
         if settings.call_contracts:
+            reprepared = ArtifactStore(artifacts)
+
+            def contract_body(addr):
+                fn, entries = ctx.load(ctx.program.containing(addr) or addr)
+                fir = reprepared.lifted(ctx.tr, ctx.lifter, fn)
+                fir.entries = tuple(entries)
+                return fir
+
             prepared = {addr: row.register_facts or None for addr, row in scanned.items()}
             roots = [addr for addr, row in scanned.items() if row.exclusion is None]
             contracts = call_contracts.analyze(
@@ -443,7 +451,7 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
                 analyzable=lambda a: bool(scanned.get(a) and scanned[a].register_facts is not None
                                           and a not in helpers and a not in conservative),
                 roots=roots, indirect=indirect_targets, effects=settings.call_effects,
-                noreturn=ctx.program.noreturn)
+                noreturn=ctx.program.noreturn, bodies=contract_body)
         indirect_contracts = {}
         if indirect_targets and contracts:
             for row in scanned.values():

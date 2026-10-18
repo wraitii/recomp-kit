@@ -41,14 +41,16 @@ retains translated originals. Direct, tail and computed transfers preserve their
 guest stack operations. Replacement headers are compilation dependencies of
 `table.c` only, in addition to native sources that explicitly include them.
 
-Integer SSA forwards a register's PUSH value into a matching POP or LEAVE only
-when every memory path proves the saved word unchanged. Guest stores and ESP
-adjustments remain; unknown aliases, calls and opaque effects block forwarding.
-Call-free bodies can additionally prove that a GPR returns its entry value.
-This preservation contract lets callers retain the value in host SSA while
-still publishing any input the callee reads. Hooked dispatch retains its CPU
-reload fallback. The register-preservation diff suite covers restoration after
-intermediate EBP publication, including functions that use EBP as scratch.
+Integer SSA forwards a register's PUSH value into a matching POP or LEAVE when
+every memory path proves the saved slot unchanged. Unknown aliases and opaque
+effects block forwarding; a call crosses only when its return stack adjustment
+is known, under the x86 stack-discipline premise that a callee does not write
+its caller's save slot. Bodies can prove a GPR returns its entry value even
+across calls, using the callee contracts known below. This preservation contract
+lets callers retain the value in host SSA while still publishing any input the
+callee reads. Hooked dispatch retains its CPU reload fallback. The
+register-preservation diff suite covers restoration after intermediate EBP
+publication, including functions that use EBP as scratch.
 
 Body chunks contain only local callee declarations, with no global function
 list or hook indices. They start in fixed 16 KiB guest-address buckets and

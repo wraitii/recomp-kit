@@ -50,6 +50,7 @@ from .import_sites import EMPTY_EFFECTS
 GPRS = X86_32.names("gpr")
 ARITH_FLAGS = X86_32.names("arithmetic_flag")
 FIELDS = GPRS + ARITH_FLAGS
+CALLEE_SAVED = frozenset(("EBX", "ESI", "EDI", "EBP"))
 
 #: Field sets.  Plain data so it can cross a process boundary.
 Contract = namedtuple("Contract", ("reads", "kills", "writes", "preserves"),
@@ -155,6 +156,14 @@ def _scc_cap(size, cell_count):
 
 
 _MAPPINGS = {}
+_LIFTERS = {}
+
+
+def _lifter(language):
+    lifter = _LIFTERS.get(language)
+    if lifter is None:
+        lifter = _LIFTERS[language] = Lifter(language)
+    return lifter
 
 
 def mapping(language=None):
@@ -162,7 +171,7 @@ def mapping(language=None):
     language = language or "x86:LE:32:default"
     cells = _MAPPINGS.get(language)
     if cells is None:
-        cells = _MAPPINGS[language] = Mapping(Lifter(language))
+        cells = _MAPPINGS[language] = Mapping(_lifter(language))
     return cells
 
 
@@ -235,7 +244,7 @@ class _Prepared(object):
     their index to the site address for ``summarize``'s indirect facts.
     """
 
-    __slots__ = ("language", "entry", "order", "succ", "preds", "use", "defs", "call", "opaque", "call_sites", "returns", "tails", "writes", "preserves")
+    __slots__ = ("language", "entry", "order", "succ", "preds", "use", "defs", "call", "opaque", "call_sites", "returns", "tails", "writes", "preserves", "stack_saves", "pops")
 
     def __init__(self, fir, cells, bits, sites=None):
         self.language = cells.language
@@ -247,6 +256,8 @@ class _Prepared(object):
         self.tails = frozenset()
         self.writes = 0
         self.preserves = frozenset()
+        self.stack_saves = False
+        self.pops = None
         if self.entry is None:
             return
         n = len(fir.insns)
@@ -305,6 +316,17 @@ class _Prepared(object):
                 self.returns.append(i)
 
 
+def _stack_pops(fir):
+    found = set()
+    for ins in fir.insns:
+        raw = bytes(ins.raw or b"").lstrip(b"\xf3")
+        if raw[:1] == b"\xc3":
+            found.add(0)
+        elif raw[:1] == b"\xc2" and len(raw) == 3:
+            found.add(int.from_bytes(raw[1:], "little"))
+    return found.pop() if len(found) == 1 else None
+
+
 def _is_return(ins):
     return ins.mnem.upper() == "RET" or any(op.opc == "RETURN" for op in ins.ops)
 
@@ -326,10 +348,12 @@ def prepare(fir, language=None, image=None, sites=None):
         return None
     cells = mapping(language or fir.language)
     p = _Prepared(fir, cells, _bits(cells), sites)
-    if (any(ins.raw and len(ins.raw) == 1 and 0x50 <= ins.raw[0] <= 0x57
-            for ins in fir.insns) and not p.tails and not fir.entries and not fir.seh and not any(
+    p.pops = _stack_pops(fir)
+    p.stack_saves = any(ins.raw and len(ins.raw) == 1 and 0x50 <= ins.raw[0] <= 0x57
+                        for ins in fir.insns)
+    if (p.stack_saves and not p.tails and not fir.entries and not fir.seh and not any(
             op.opc in ("CALL", "CALLIND", "CALLOTHER") for ins in fir.insns for op in ins.ops)):
-        p.preserves = _preserved_registers(fir)
+        p.preserves = _preserved_registers(fir, sites=sites)
     return None if p.entry is None else p
 
 
@@ -361,20 +385,81 @@ def substantive_register_uses(prepared, instructions):
     return {field: tuple(sorted(set(indices))) for field, indices in out.items() if indices}
 
 
-def _preserved_registers(fir):
+def _kept_fields(contract):
+    if contract is None:
+        return CALLEE_SAVED
+    return frozenset(field for field in GPRS
+                     if field in contract.preserves or field not in contract.writes)
+
+
+def _whole_lanes(s, lanes):
+    if any(lane is None for lane in lanes):
+        return None
+    lanes = [s.resolve(lane) for lane in lanes]
+    first = lanes[0]
+    if all(lane is first for lane in lanes):
+        return first
+    if all(lane.opc == "BYTE" and lane.data == index for index, lane in enumerate(lanes)):
+        sources = {s.resolve(lane.args[0]).id for lane in lanes}
+        if len(sources) == 1:
+            return s.resolve(first.args[0])
+    return None
+
+
+def _preserved_registers(fir, contracts=None, sites=None, ir=None, pops=None):
+    """GPRs equal to their entry value at every return.
+
+    `contracts` maps call-site indices to the joined callee contract. Callees
+    without one fall back to the ABI's callee-saved set. Calls cross the stack
+    save proof under the x86 stack-discipline premise; `pops` gives each direct
+    target's return stack adjustment so a post-call ESP reload resolves to its
+    pre-call stack slot."""
     from .normalize import codegen_ir
     from .ssa import build, SSAError
     from .simplify import canonicalize
     from .preservation import forward
 
-    lifter = Lifter(fir.language)
+    contracts, sites, pops = contracts or {}, sites or {}, pops or {}
+    lifter = _lifter(fir.language)
     registers = {name: lifter.register(name) for name in GPRS}
     groups = {name: tuple((space, offset + n) for n in range(size))
               for name, (space, offset, size) in registers.items()}
     try:
-        s = build(codegen_ir(fir, lifter), register_groups=groups.values())
+        if ir is None:
+            ir = codegen_ir(fir, lifter)
+        call_targets = {op.ins[0][1] for ins in ir.insns for op in ins.ops
+                        if op.opc == "CALL" and op.ins and op.ins[0][0] == "ram"}
+        kept_calls, kept_sites = {}, {}
+        for index, row in sites.items():
+            if row.kind == "tail":
+                continue
+            fields = _kept_fields(contracts.get(index))
+            keys = frozenset(key for field in fields for key in groups[field])
+            if row.kind == "indirect":
+                kept_sites[row.site] = keys
+            elif row.targets:
+                kept_calls[row.targets[0].address] = keys
+        s = build(ir, register_groups=groups.values(), call_targets=call_targets,
+                  indirect_call_symbol="preservation", kept_calls=kept_calls,
+                  kept_indirect=kept_sites)
         canonicalize(s)
-        if not forward(s):
+        owners = {v.id: b for b in s.blocks.values() for v in b.ops}
+        esp = groups["ESP"]
+
+        def stack_reload(value):
+            value = s.resolve(value)
+            if value.opc != "CALL_RELOAD" or value.data != esp[0] or not value.args:
+                return None
+            call = s.resolve(value.args[0])
+            if call.opc != "CALL":
+                return None
+            count = pops.get(call.data)
+            block = owners.get(call.id)
+            state = None if block is None else block.snapshots.get(call.id)
+            base = None if state is None else _whole_lanes(s, [state.get(key) for key in esp])
+            return None if count is None or base is None else (base, 4 + count)
+
+        if not forward(s, calls=True, stack_reload=stack_reload):
             return frozenset()
     except (SSAError, RecursionError):
         return frozenset()
@@ -462,13 +547,16 @@ def indirect_site_contracts(p, callee_lookup, indirect=None, effects=None, noret
             if contract is not None and p.call_sites[i].kind == "indirect"}
 
 
-def summarize(p, callee_lookup, cells=None, indirect=None, effects=None, noreturn=()):
+def summarize(p, callee_lookup, cells=None, indirect=None, effects=None, noreturn=(), body=None, ir=None, pops=None):
     """Compute one function's contract from its prepared facts.
 
     ``callee_lookup(target)`` returns a Contract or None for no summary.
     ``indirect`` maps indirect CALL sites to ``(kind, targets)`` facts; an
     indirect CALL without a usable "call" fact, or whose target lacks a
-    summary, is unknown. ``effects`` holds the configured call overrides."""
+    summary, is unknown. ``effects`` holds the configured call overrides.
+    ``body`` lets a body with calls prove its own push/pop saves against the
+    callee contracts; without it only the call-free proof from ``prepare`` is
+    available."""
     cells = cells or mapping(p.language)
     bits = _bits(cells)
     indirect = indirect or {}
@@ -476,6 +564,8 @@ def summarize(p, callee_lookup, cells=None, indirect=None, effects=None, noretur
     use, defs = dict(p.use), dict(p.defs)
     writes = p.writes
     contracts = _resolved_sites(p, callee_lookup, indirect, effects, noreturn)
+    preserved = (p.preserves if body is None or not p.stack_saves or p.tails
+                 else _preserved_registers(body, contracts, p.call_sites, ir, pops))
     for i, contract in contracts.items():
         if contract is None:
             use[i] = bits.all
@@ -531,8 +621,8 @@ def summarize(p, callee_lookup, cells=None, indirect=None, effects=None, noretur
     reads = frozenset(f for f in FIELDS if live_in[p.entry] & bits.field_bits[f])
     kills = frozenset(f for f in FIELDS
                       if killed & bits.field_bits[f] == bits.field_bits[f])
-    return Contract(reads, kills - p.preserves,
-                    frozenset(f for f in FIELDS if writes & bits.field_bits[f]), p.preserves)
+    return Contract(reads, kills - preserved,
+                    frozenset(f for f in FIELDS if writes & bits.field_bits[f]), preserved)
 
 
 def cfg_is_closed(fir, ends=(), tails=()):
@@ -611,7 +701,7 @@ def continuation_outputs(s, publications, groups, lane_field, extra_roots=(), ca
 
 
 def analyze(targets, prepared, *, analyzable, roots, progress=None, language=None, indirect=None, effects=None,
-            noreturn=()):
+            noreturn=(), bodies=None):
     """Contracts for every analyzable body reachable from `roots`.
 
     `targets[addr]` lists a function's direct CALL targets, `prepared[addr]` is
@@ -622,7 +712,9 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
     them must treat them as ``CONSERVATIVE``. Direct callees are analyzed
     before callers; recursive components iterate to a fixed point.
     `indirect` holds the ``(kind, targets)`` facts of indirect sites; their
-    "call" targets are call-graph edges too.
+    "call" targets are call-graph edges too. `bodies` supplies a FIR per
+    address (a callable or mapping) so push/pop saves can cross calls using
+    the contracts already known below.
     """
     indirect = indirect or {}
 
@@ -660,6 +752,58 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
     if any(p.language != (language or X86_32.language) for p in firs.values()):
         raise ValueError("call-contract analysis language disagrees with prepared bodies")
     cells = mapping(language)
+    preservation = {}
+    if bodies is not None:
+        from .normalize import codegen_ir
+        from .ssa import SSAError
+        for addr, p in firs.items():
+            if not p.stack_saves or not p.call_sites or p.tails:
+                continue
+            try:
+                fir = bodies(addr) if callable(bodies) else bodies[addr]
+                if fir.entries or fir.seh:
+                    continue
+                preservation[addr] = (fir, codegen_ir(fir, _lifter(fir.language)))
+            except (SSAError, RecursionError, KeyError):
+                continue
+    pops = {addr: p.pops for addr, p in firs.items()}
+    resolved_pops = {}
+
+    def resolve_pops(addr, seen=()):
+        """Return a body's stack adjustment, following tail thunks and owner entries."""
+        if addr in resolved_pops:
+            return resolved_pops[addr]
+        if addr in seen:
+            return None
+        p = firs.get(addr)
+        if p is not None:
+            if p.pops is not None:
+                resolved_pops[addr] = p.pops
+                return p.pops
+            tails = [target.address for row in p.call_sites.values() if row.kind == "tail"
+                     for target in row.targets]
+            count = resolve_pops(tails[0], seen + (addr,)) if len(tails) == 1 else None
+            if count is not None:
+                resolved_pops[addr] = count
+            return count
+        if bodies is None:
+            return None
+        try:
+            fir = bodies(addr) if callable(bodies) else bodies[addr]
+            count = _stack_pops(fir)
+        except (KeyError, OSError):
+            count = None
+        if count is not None:
+            resolved_pops[addr] = count
+        return count
+
+    for p in firs.values():
+        if not p.stack_saves or not p.call_sites or p.tails:
+            continue
+        for row in p.call_sites.values():
+            for target in row.targets:
+                resolve_pops(target.address)
+    pops.update(resolved_pops)
     contracts = {}
     components = call_graph(sorted(needed),
                             lambda a: [t for t in callees(a) if t in firs])
@@ -684,7 +828,9 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
             # No call into the component: one pass is the fixed point.
             for addr in comp:
                 if addr in firs:
-                    contracts[addr] = summarize(firs[addr], lookup, cells, indirect, effects, noreturn)
+                    body, ir = preservation.get(addr, (None, None))
+                    contracts[addr] = summarize(firs[addr], lookup, cells, indirect, effects, noreturn,
+                                                body=body, ir=ir, pops=pops)
                     done += 1
                     if progress is not None:
                         progress(done, len(needed))
@@ -695,7 +841,9 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
             for addr in comp:
                 if addr not in firs:
                     continue
-                new = summarize(firs[addr], lookup, cells, indirect, effects, noreturn)
+                body, ir = preservation.get(addr, (None, None))
+                new = summarize(firs[addr], lookup, cells, indirect, effects, noreturn,
+                                body=body, ir=ir, pops=pops)
                 current = live.get(addr)
                 if current is None or new != current:
                     live[addr] = new

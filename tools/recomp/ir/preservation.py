@@ -1,24 +1,39 @@
 """Forward proven register saves without removing guest stores or stack motion.
 
-Every incoming memory path must reach the same PUSH value. Unknown aliases,
-calls and opaque effects stop forwarding. Aligned stack locals
-use modular address intervals to prove disjointness. A surviving store to the
-same four bytes establishes that the removed restore load cannot fault.
+Every incoming memory path must reach the same PUSH value. Unknown aliases
+and opaque effects stop forwarding. Aligned stack locals use modular address
+intervals to prove disjointness. A surviving store to the same four bytes
+establishes that the removed restore load cannot fault. `calls=True` crosses a
+call's memory token, relying on the x86 stack discipline that a callee does not
+write its caller's save slot.
 """
 from .ssa import MEMORY
 from .simplify import canonicalize
 
 
-def forward(s):
+def forward(s, calls=False, stack_reload=None):
     owners = {v.id: b for b in s.blocks.values() for v in b.ops}
-    shapes, bounds = {}, {}
+    shapes, bounds, active = {}, {}, set()
 
     def address(value):
         value = s.resolve(value)
         if value.id in shapes:
             return shapes[value.id]
+        if value.id in active:
+            return (value.id, 0)
+        active.add(value.id)
         result = (value.id, 0)
-        if value.opc in ("INT_ADD", "INT_SUB") and value.size == 4:
+        special = stack_reload(value) if stack_reload is not None else None
+        if special is not None:
+            base, delta = special
+            root, offset = address(base)
+            result = (root, (offset + delta) & 0xffffffff)
+        elif value.opc == "PHI":
+            forms = [address(arg) for arg in value.args
+                     if arg is not None and s.resolve(arg) is not value]
+            if forms and all(form == forms[0] for form in forms):
+                result = forms[0]
+        elif value.opc in ("INT_ADD", "INT_SUB") and value.size == 4:
             a, b = map(s.resolve, value.args)
             if b.opc == "CONST":
                 root, offset = address(a)
@@ -26,6 +41,7 @@ def forward(s):
             elif a.opc == "CONST" and value.opc == "INT_ADD":
                 root, offset = address(b)
                 result = (root, (offset + a.data) & 0xffffffff)
+        active.discard(value.id)
         shapes[value.id] = result
         return result
 
@@ -69,6 +85,7 @@ def forward(s):
             if load.opc != "LOAD" or load.size != 4:
                 continue
             target = load.args[1]
+            target_address = address(target)
             pending, visited, saved_value = [load.args[0]], set(), None
             while pending:
                 token = pending.pop()
@@ -90,7 +107,8 @@ def forward(s):
                     if effect.opc == "STORE":
                         source, value = effect.args[1:]
                         origin = owners[effect.id].insn.raw or b""
-                        if (address(source) == address(target) and value.size == 4
+                        source_address = address(source)
+                        if (source_address == target_address and value.size == 4
                                 and origin == bytes([0x50 + register])):
                             source_value = s.resolve(value)
                             if saved_value is not None and source_value is not saved_value:
@@ -101,7 +119,13 @@ def forward(s):
                         elif disjoint(target, 4, source, value.size):
                             pending.append(effect.args[0])
                             continue
+                        elif calls and source_address[0] != target_address[0]:
+                            pending.append(effect.args[0])
+                            continue
                     elif effect.opc in ("LOAD", "X87_REG"):
+                        pending.append(effect.args[0])
+                        continue
+                    elif calls and effect.opc in ("CALL", "CALLIND"):
                         pending.append(effect.args[0])
                         continue
                     elif effect.opc == "X87_MEM":

@@ -16,7 +16,7 @@ from phases import ScanTask, EscapeTask
 from program import FunctionDescription as Row, EntryModel
 
 ScanRow = namedtuple("ScanRow", "addr description calls jumps references returns exclusion seh_escapes register_facts cw_facts x87_count writers external_targets")
-CACHE_VERSION = "recomp-scan-v2"
+CACHE_VERSION = "recomp-scan-v3"
 _WORKER = {}
 
 

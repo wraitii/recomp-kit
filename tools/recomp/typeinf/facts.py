@@ -9,6 +9,7 @@ Nodes are SSA value ids local to the function.
 import hashlib
 import os
 import pickle
+from tempfile import TemporaryDirectory
 from collections import namedtuple
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -30,18 +31,28 @@ def contracts(settings, jobs):
     import scan
     from ir import call_contracts
     from ir import indirect_targets
+    from ir.artifacts import ArtifactStore
     driver.discovered_rows(settings)
     ctx = driver.Context(settings)
-    found_scan = scan.build(ctx, jobs)
-    scanned, helpers = found_scan.scanned, found_scan.helpers
-    found = call_contracts.analyze(
-        {addr: row.calls for addr, row in scanned.items()},
-        {addr: row.register_facts or None for addr, row in scanned.items()},
-        analyzable=lambda a: bool(scanned.get(a) and scanned[a].register_facts is not None
-                                  and a not in helpers and a not in found_scan.native_replaced),
-        roots=[addr for addr, row in scanned.items() if row.exclusion is None],
-        indirect=indirect_targets.load(settings, ctx.program), effects=settings.call_effects,
-        noreturn=ctx.program.noreturn)
+    with TemporaryDirectory(prefix="typeinf-scan-") as temporary:
+        found_scan = scan.build(ctx, jobs, temporary)
+        scanned, helpers = found_scan.scanned, found_scan.helpers
+        store = ArtifactStore(temporary)
+
+        def contract_body(addr):
+            fn, entries = ctx.load(ctx.program.containing(addr) or addr)
+            fir = store.lifted(ctx.tr, ctx.lifter, fn)
+            fir.entries = tuple(entries)
+            return fir
+
+        found = call_contracts.analyze(
+            {addr: row.calls for addr, row in scanned.items()},
+            {addr: row.register_facts or None for addr, row in scanned.items()},
+            analyzable=lambda a: bool(scanned.get(a) and scanned[a].register_facts is not None
+                                      and a not in helpers and a not in found_scan.native_replaced),
+            roots=[addr for addr, row in scanned.items() if row.exclusion is None],
+            indirect=indirect_targets.load(settings, ctx.program), effects=settings.call_effects,
+            noreturn=ctx.program.noreturn, bodies=contract_body)
     return {addr: frozenset(contract.preserves) for addr, contract in found.items() if contract is not None}
 
 
