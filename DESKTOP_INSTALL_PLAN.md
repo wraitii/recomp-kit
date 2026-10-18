@@ -168,7 +168,7 @@ must be relative and contained under the selected platform profile directory. Th
 registry stores the absolute installed-folder location and references the installation
 manifest. Job paths may be absolute transiently. Cleanup paths must be explicitly owned
 by the journal and proven inside job staging or the journaled publication backup area
-under `.recomp/` before use.
+under `.recomp-toolkit/` before use.
 
 Payload identity is a deterministic digest over sorted content-layout entries (normalized
 relative path, size and SHA-256), excluding the selected outer folder or archive filename.
@@ -336,7 +336,7 @@ exercised end to end.
   live job. Reject source, destination and staging overlap before any write or cleanup.
   Delete only paths proven to belong to the job, never data inferred from a malformed
   record.
-- [ ] Keep per-attempt logs under `.recomp/logs/`, rotated by count and size. Distinguish
+- [ ] Keep per-attempt logs under `.recomp-toolkit/logs/`, rotated by count and size. Distinguish
   user cancellation from failure. Treat cleanup failure after successful publication as a
   warning, with Play still available.
 
@@ -379,7 +379,7 @@ current build-output ceiling is best-effort and does not cover global compiler c
     Game Name.app
     Configure Game Name.app
     original/
-    .recomp/
+    .recomp-toolkit/
       installation.json
       logs/
   ```
@@ -396,7 +396,7 @@ current build-output ceiling is best-effort and does not cover global compiler c
   signatures and executable permissions.
 - [x] Resolve the manifest from the app's own location, independently of the working
   directory. On macOS, the game folder is the parent of the outer `.app`, so the manifest
-  is `<game folder>/.recomp/installation.json`. Precedence, documented in the README:
+  is `<game folder>/.recomp-toolkit/installation.json`. Precedence, documented in the README:
   explicit CLI flag, environment override, installed manifest, checkout detection, then
   developer defaults. An installed manifest outranks checkout detection even beneath a
   repository. Record overrides in the launch log.
@@ -410,8 +410,8 @@ current build-output ceiling is best-effort and does not cover global compiler c
 - [x] Publish the app, sidecars and manifest as one recoverable update, preserving game
   data, mods and profiles. Stage on the destination filesystem even when building on
   another volume. Sequence:
-  1. build and verify the complete new layout in `.recomp/staging-<job>/`;
-  2. move the existing app and sidecars to `.recomp/backup-<job>/`;
+  1. build and verify the complete new layout in `.recomp-toolkit/staging-<job>/`;
+  2. move the existing app and sidecars to `.recomp-toolkit/backup-<job>/`;
   3. move the verified new app and sidecars into place;
   4. atomically replace `installation.json` last. This is the commit point. Before it,
      rollback moves the backup back; after it, only cleanup remains.

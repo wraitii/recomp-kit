@@ -66,7 +66,7 @@ fn save_settings(value: Settings, state: State<Library>) -> Result<(), String> {
         return Err("Wait for the current installation to finish".into());
     }
     if !PathBuf::from(&value.kit).join("tools/library.py").is_file() {
-        return Err("Choose a recomp-kit checkout containing tools/library.py".into());
+        return Err("Choose a Recomp Toolkit source folder containing tools/library.py".into());
     }
     if value.python.is_empty() {
         return Err("Select a Python interpreter".into());
@@ -288,21 +288,19 @@ fn open_url(url: String) -> Result<(), String> {
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
-            let legacy = app.path().app_data_dir()?;
-            let data = app.path().data_dir()?.join("recomp-kit");
+            let data = app.path().data_dir()?.join("recomp-toolkit");
             std::fs::create_dir_all(&data)?;
             let settings_file = data.join("settings.json");
             let resources = app.path().resource_dir()?;
             let bundled = resources.join("kit/tools/library.py").is_file();
             let mut settings: Settings = std::fs::read(&settings_file)
-                .or_else(|_| std::fs::read(legacy.join("settings.json")))
                 .ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                 .unwrap_or_else(|| Settings {
                     kit: if bundled { resources.join("kit").to_string_lossy().into_owned() }
-                        else { option_env!("RECOMP_LIBRARY_KIT").unwrap_or("").into() },
+                        else { option_env!("RECOMP_TOOLKIT_KIT").unwrap_or("").into() },
                     python: if bundled { resources.join("python/bin/python3").to_string_lossy().into_owned() }
-                        else { option_env!("RECOMP_LIBRARY_PYTHON")
+                        else { option_env!("RECOMP_TOOLKIT_PYTHON")
                         .unwrap_or("python3")
                         .into() },
                 });
@@ -337,7 +335,7 @@ fn main() {
             open_url
         ])
         .build(tauri::generate_context!())
-        .expect("Unable to create Recomp Library")
+        .expect("Unable to create Recomp Toolkit")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
                 if let Err(error) = stop(&app.state::<Library>()) {

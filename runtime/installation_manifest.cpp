@@ -61,8 +61,8 @@ InstallationManifest installation_manifest_location_for_process() {
     if (bundle.size() < 5 || bundle.compare(bundle.size() - 4, 4, ".app") != 0)
         return result;
     std::string folder = parent(bundle);
-    const std::string metadata_dir = folder + "/.recomp";
-    const std::string candidate = folder + "/.recomp/installation.json";
+    const std::string metadata_dir = folder + "/.recomp-toolkit";
+    const std::string candidate = folder + "/.recomp-toolkit/installation.json";
     OsStat metadata{}, st{};
     const int metadata_status = os_lstat(metadata_dir.c_str(), &metadata);
     if (metadata_status == 0 && (!metadata.is_dir || metadata.is_symlink)) {

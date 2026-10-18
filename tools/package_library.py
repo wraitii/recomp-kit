@@ -15,8 +15,8 @@ def package(bundle, build_root, python_root):
         raise ValueError("Library packaging currently requires native arm64 macOS")
     python_root = Path(python_root).resolve()
     if not (python_root / "bin/python3").is_file():
-        raise ValueError("Provide a standalone Python installation with --library-python-root")
-    dependency_build = Path(build_root) / "library-dependencies"
+        raise ValueError("Provide a standalone Python installation with --toolkit-python-root")
+    dependency_build = Path(build_root) / "toolkit-dependencies"
     subprocess.run([sys.executable, str(ROOT / "tools/build.py"), "--game", "stub", "--stub",
                     "--target", "app", "--build-root", str(dependency_build)], check=True,
                    env=dict(os.environ, MACOSX_DEPLOYMENT_TARGET="14.0"))
@@ -106,6 +106,6 @@ def package(bundle, build_root, python_root):
                 subprocess.run(["codesign", "--force", "--sign", "-", str(path)], check=True)
     subprocess.run(["codesign", "--force", "--sign", "-", str(bundle)], check=True)
     subprocess.run(["codesign", "--verify", "--deep", "--strict", str(bundle)], check=True)
-    archive = bundle.parent / "recomp-library-macos-arm64.zip"
+    archive = bundle.parent / "recomp-toolkit-macos-arm64.zip"
     subprocess.run(["ditto", "-c", "-k", "--keepParent", str(bundle), str(archive)], check=True)
     print(f"Portable library: {archive} ({archive.stat().st_size / 1048576:.1f} MiB)")

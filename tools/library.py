@@ -381,7 +381,7 @@ def installed_manifest(cfg, game_id, job_id, executable_relative, data_root_rela
                              "apps": app_identities, "original": original_identity},
             "sidecars": [{"id": "configure", "role": "configure", "target": "configure",
                            "profileId": app_name}],
-            "ownedArtifacts": [app_bundle.as_posix(), sidecar, "original", ".recomp/logs"],
+            "ownedArtifacts": [app_bundle.as_posix(), sidecar, "original", ".recomp-toolkit/logs"],
             "log": log_path, "recipeIdentity": {"algorithm": recipe_identity["algorithm"],
                 "sha256": recipe_identity["sha256"], "platform": recipe_identity["platform"]},
             "launch": {"executable": str(executable_relative),
@@ -401,7 +401,7 @@ def installed_app_identities(cfg, root):
 
 def read_installation_manifest(root, missing_ok=False):
     root = Path(root).resolve(strict=True)
-    metadata = root / ".recomp"
+    metadata = root / ".recomp-toolkit"
     path = metadata / "installation.json"
     if not metadata.exists() and not metadata.is_symlink() and missing_ok:
         return {}
@@ -420,7 +420,7 @@ def read_installation_manifest(root, missing_ok=False):
 
 def validate_installed_manifest(cfg, root, manifest):
     root = Path(root).resolve(strict=True)
-    metadata = root / ".recomp"
+    metadata = root / ".recomp-toolkit"
     manifest_path = metadata / "installation.json"
     if not isinstance(manifest, dict):
         raise install_jobs.JobError("installation_manifest_invalid", "The installed manifest root must be an object.")
@@ -459,7 +459,7 @@ def validate_installed_manifest(cfg, root, manifest):
             or sidecars[0] != {"id": "configure", "role": "configure", "target": "configure",
                                "profileId": manifest["profileId"]}
             or set(owned) != {app_bundle.as_posix(),
-                              f"Configure {cfg['game']['name']}.app", "original", ".recomp/logs"}):
+                              f"Configure {cfg['game']['name']}.app", "original", ".recomp-toolkit/logs"}):
         raise install_jobs.JobError("installation_manifest_invalid", "The installed launch roles differ from this build.")
     paths = manifest.get("paths", {})
     executable = paths.get("executable")
@@ -548,7 +548,7 @@ def check_space(job_paths, journal, root, phase, additional_bytes, log_path, pla
 
 
 def error_diagnostic(error, stage, root, log_path):
-    log_relative = f".recomp/logs/{Path(log_path).name}"
+    log_relative = f".recomp-toolkit/logs/{Path(log_path).name}"
     if isinstance(error, InterruptedError):
         return {"code": "cancelled", "stage": "cancelled", "path": ".",
                 "message": "The installation was cancelled.",
@@ -604,7 +604,7 @@ def recover_publication(root, identifier):
     root = Path(root).expanduser().resolve()
     job_paths, journal = install_jobs.load_job(root, identifier)
     publication = journal.get("publication")
-    manifest_path = root / ".recomp" / "installation.json"
+    manifest_path = root / ".recomp-toolkit" / "installation.json"
     if journal.get("stage") == "complete":
         committed_facts = read_installation_manifest(root, missing_ok=True)
         saved_facts = journal.get("validatedOutputs", {}).get("installed", {})
@@ -732,7 +732,7 @@ def catalog(storage, repair=False):
             if activity.get("activeJobs") and isinstance(activity["activeJobs"][0], dict):
                 locator_destination = activity["activeJobs"][0].get("destination", locator_destination)
             root = Path(registry.get("destination", locator_destination)).expanduser().resolve()
-            if root.exists() and (root / ".recomp").exists():
+            if root.exists() and (root / ".recomp-toolkit").exists():
                 try:
                     with install_jobs.DestinationLock(storage, lock_name="registry.lock"):
                         activity = (install_jobs.read_versioned(activity_path, "activity")
@@ -802,7 +802,7 @@ def catalog(storage, repair=False):
             item.update(game_entry(cfg), id=directory.name, installation=str(destination),
                         needsRust=True)
             item["state"] = "notInstalled"
-            facts_path = root / ".recomp" / "installation.json"
+            facts_path = root / ".recomp-toolkit" / "installation.json"
             facts = {}
             if not destination_busy and root.exists():
                 try:
@@ -824,7 +824,7 @@ def catalog(storage, repair=False):
             if item["state"] == "ready":
                 try:
                     item["managedSource"] = str(root / "original")
-                    item["buildLog"] = str(root / facts.get("log", f".recomp/logs/{facts.get('jobId', '')}.log"))
+                    item["buildLog"] = str(root / facts.get("log", f".recomp-toolkit/logs/{facts.get('jobId', '')}.log"))
                     item["updateAvailable"] = facts.get("recipeIdentity", {}).get("sha256") != recipe(directory).get("sha256")
                 except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
                     item["updateCheckError"] = str(error)
@@ -907,14 +907,14 @@ def job_log(request, storage):
             destination = destination_input.resolve(strict=True)
             if destination_input != destination or not destination.is_dir():
                 raise install_jobs.JobError("unsafe_job_destination", "The saved job destination is not canonical.")
-            facts_path = destination / ".recomp" / "installation.json"
+            facts_path = destination / ".recomp-toolkit" / "installation.json"
             if not facts_path.is_file() or read_installation_manifest(destination).get("jobId") != identifier:
                 raise install_jobs.JobError("unknown_job", "The requested job is not registered for this game.")
         with install_jobs.DestinationLock(destination):
             job_paths, journal = install_jobs.load_job(destination, identifier)
             attempt = journal.get("attempt")
             expected_name = f"{identifier}-{attempt}.log"
-            expected_log = f".recomp/logs/{expected_name}"
+            expected_log = f".recomp-toolkit/logs/{expected_name}"
             if (type(attempt) is not int or attempt < 1 or journal.get("log") != expected_log
                     or journal.get("gameId") != game_id
                     or Path(journal.get("destination", "")).resolve() != destination):
@@ -1058,7 +1058,7 @@ def inspect_source(cfg, source):
     if probe["kind"] == "zip":
         try:
             digest = archive_digest(source, check_cancel)
-            with tempfile.TemporaryDirectory(prefix="recomp-library-inspect-") as temporary:
+            with tempfile.TemporaryDirectory(prefix="recomp-toolkit-inspect-") as temporary:
                 extracted = Path(temporary) / "content"
                 extract_zip(source, extracted, check_cancel)
                 if archive_digest(source, check_cancel) != digest:
@@ -1250,7 +1250,7 @@ def prepare_install(request, storage):
         source_path_resolved = source_root.resolve()
         inside_destination = source_path_resolved.is_relative_to(destination_path)
         destination_inside_source = destination_path.is_relative_to(source_path_resolved)
-        exact_managed_data = source_path_resolved == data.resolve() and (root / ".recomp" / "installation.json").is_file()
+        exact_managed_data = source_path_resolved == data.resolve() and (root / ".recomp-toolkit" / "installation.json").is_file()
         if ((inside_destination or destination_inside_source) and not exact_managed_data):
             raise SourceError("source_destination_overlap",
                               "The selected source overlaps the library destination or its cleanup folders.",
@@ -1262,11 +1262,11 @@ def prepare_install(request, storage):
                               "The selected archive overlaps the library destination.",
                               ["Choose an archive and destination in separate folders."], str(source_path),
                               {"destination": str(root)})
-    facts = root / ".recomp" / "installation.json"
+    facts = root / ".recomp-toolkit" / "installation.json"
     unrelated = []
     if root.exists() and not facts.is_file():
         for entry in root.iterdir():
-            if entry.name != ".recomp":
+            if entry.name != ".recomp-toolkit":
                 unrelated.append(entry.name)
                 continue
             if entry.is_symlink() or not entry.is_dir():
@@ -1385,7 +1385,7 @@ def install(request, storage, prepared=None):
     job_identifier = journal["jobId"]
     log_dir = job_paths["logs"]
     log_path = log_dir / f"{job_identifier}-{journal.get('attempt', 1)}.log"
-    journal["log"] = f".recomp/logs/{log_path.name}"
+    journal["log"] = f".recomp-toolkit/logs/{log_path.name}"
     space_plan = {"policy": "install-space-v1", "volume": str(root),
                   "archiveExpansionEstimateBytes": archive_bytes,
                   "sourceCopyEstimateBytes": copy_estimate,
@@ -1397,8 +1397,8 @@ def install(request, storage, prepared=None):
                   "retainedBackupAdditionalBytes": 0,
                   "existingAllocatedBytesExcludedByFilesystemFreeSpace": True,
                   "buildMonitorSampleIntervalSeconds": 2,
-                  "monitorRoots": [".recomp/" + job_paths["staging"].name,
-                                   ".recomp/" + job_paths["logs"].name],
+                  "monitorRoots": [".recomp-toolkit/" + job_paths["staging"].name,
+                                   ".recomp-toolkit/" + job_paths["logs"].name],
                   "externalCachesOutsideMonitor": ["user toolchain/configuration caches"]}
     install_jobs.update_job(job_paths, journal, journal.get("stage", "inspecting"), log=journal["log"])
     stage = "copying"
@@ -1675,7 +1675,7 @@ def install(request, storage, prepared=None):
         journal.setdefault("ownedTokens", {})["backup"] = backup_token
         allowed_destinations = [item["destination"] for item in artifact_specs]
         manifest_digest = manifest_identity(facts)
-        current_manifest_path = root / ".recomp" / "installation.json"
+        current_manifest_path = root / ".recomp-toolkit" / "installation.json"
         if current_manifest_path.is_symlink():
             raise install_jobs.JobError("unsafe_manifest_path", "The installation manifest is a symbolic link.")
         previous_manifest = (read_installation_manifest(root)
@@ -1697,7 +1697,7 @@ def install(request, storage, prepared=None):
             staged.replace(destination)
             install_jobs._sync_directory(staged.parent)
             install_jobs._sync_directory(destination.parent)
-        install_jobs.write_json(root / ".recomp" / "installation.json", facts)
+        install_jobs.write_json(root / ".recomp-toolkit" / "installation.json", facts)
         committed = True
         log_event(log_path, "publishing", "installation manifest committed",
                   {"jobId": job_identifier, "gameId": game_id})
@@ -1892,7 +1892,7 @@ def adopt_request(request, storage):
     registry_dir = install_jobs.registry_game_dir(storage, game_id)
     with install_jobs.DestinationLock(storage, lock_name="registry.lock"):
         with install_jobs.DestinationLock(root):
-            manifest_path = root / ".recomp" / "installation.json"
+            manifest_path = root / ".recomp-toolkit" / "installation.json"
             manifest = read_installation_manifest(root)
             validate_installed_manifest(cfg, root, manifest)
             registry_path = registry_dir / "registry.json"

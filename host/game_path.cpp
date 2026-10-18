@@ -73,7 +73,7 @@ GamePath game_path_resolve(const char *flag, const char *data_root) {
         }
         g.exe = installation.game_folder + "/" + installation.executable;
         g.data_root = installation.game_folder + "/" + installation.data_root;
-        g.install_lock_path = installation.game_folder + "/.recomp/install.lock";
+        g.install_lock_path = installation.game_folder + "/.recomp-toolkit/install.lock";
         g.source = GamePathSource::Installed;
         return g;
     }

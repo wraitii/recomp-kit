@@ -1,4 +1,4 @@
-name: Desktop library
+name: Recomp Toolkit
 
 on:
   workflow_dispatch:
@@ -11,13 +11,13 @@ on:
       - tools/**
       - cmake/**
       - dx/CMakeLists.txt
-      - .github/workflows/library.yml
+      - .github/workflows/toolkit.yml
 
 permissions:
   contents: read
 
 concurrency:
-  group: library-${{ github.head_ref || github.ref_name }}
+  group: toolkit-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -37,14 +37,14 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: |
-            build/library-dependencies
-            build/library/rust
+            build/toolkit-dependencies
+            build/toolkit/rust
             ~/.cargo/registry
             ~/.cargo/git
-          key: library-arm64-macos14-${{ hashFiles('cmake/Dependencies.cmake', 'dx/CMakeLists.txt', 'graphics/d3d8-wgpu/**', 'desktop/library/Cargo.lock', 'desktop/library/Cargo.toml', 'tools/build_d3d8_wgpu.py') }}-${{ github.sha }}
+          key: toolkit-arm64-macos14-${{ hashFiles('cmake/Dependencies.cmake', 'dx/CMakeLists.txt', 'graphics/d3d8-wgpu/**', 'desktop/library/Cargo.lock', 'desktop/library/Cargo.toml', 'tools/build_d3d8_wgpu.py') }}-${{ github.sha }}
           restore-keys: |
-            library-arm64-macos14-${{ hashFiles('cmake/Dependencies.cmake', 'dx/CMakeLists.txt', 'graphics/d3d8-wgpu/**', 'desktop/library/Cargo.lock', 'desktop/library/Cargo.toml', 'tools/build_d3d8_wgpu.py') }}-
-            library-arm64-macos14-
+            toolkit-arm64-macos14-${{ hashFiles('cmake/Dependencies.cmake', 'dx/CMakeLists.txt', 'graphics/d3d8-wgpu/**', 'desktop/library/Cargo.lock', 'desktop/library/Cargo.toml', 'tools/build_d3d8_wgpu.py') }}-
+            toolkit-arm64-macos14-
       - name: Prepare pinned standalone Python
         run: |
           curl --fail --location --retry 3 -o "$RUNNER_TEMP/python.tar.gz" 'https://github.com/astral-sh/python-build-standalone/releases/download/20261013/cpython-3.14.8%2B20261013-aarch64-apple-darwin-install_only_stripped.tar.gz'
@@ -56,26 +56,26 @@ jobs:
       - name: Build portable application without game files
         run: >-
           "$RUNNER_TEMP/standalone/python/bin/python3" tools/build.py
-          --target library --package-library
-          --library-python-root "$RUNNER_TEMP/standalone/python"
+          --target toolkit --package-toolkit
+          --toolkit-python-root "$RUNNER_TEMP/standalone/python"
           --build-root "$PWD/build"
       - name: Verify relocated build environment
         run: |
-          mkdir -p "$RUNNER_TEMP/Relocated Library"
-          ditto -x -k build/library/recomp-library-macos-arm64.zip "$RUNNER_TEMP/Relocated Library"
-          resources="$RUNNER_TEMP/Relocated Library/Recomp Library.app/Contents/Resources"
+          mkdir -p "$RUNNER_TEMP/Relocated Toolkit"
+          ditto -x -k build/toolkit/recomp-toolkit-macos-arm64.zip "$RUNNER_TEMP/Relocated Toolkit"
+          resources="$RUNNER_TEMP/Relocated Toolkit/Recomp Toolkit.app/Contents/Resources"
           export PATH="$resources/python/bin:/usr/bin:/bin:/usr/sbin:/sbin"
           "$resources/python/bin/python3" -c 'import capstone, pefile, numpy, pypcode, tomli'
           "$resources/python/bin/cmake" --version
           "$resources/python/bin/ninja" --version
           "$resources/python/bin/python3" "$resources/kit/tools/build.py" --game stub --stub --target app --build-root "$RUNNER_TEMP/relocated-build"
-          codesign --verify --deep --strict "$RUNNER_TEMP/Relocated Library/Recomp Library.app"
+          codesign --verify --deep --strict "$RUNNER_TEMP/Relocated Toolkit/Recomp Toolkit.app"
       - name: Upload portable application
-        if: ${{ !cancelled() && hashFiles('build/library/recomp-library-macos-arm64.zip') != '' }}
+        if: ${{ !cancelled() && hashFiles('build/toolkit/recomp-toolkit-macos-arm64.zip') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: recomp-library-macos-arm64
-          path: build/library/recomp-library-macos-arm64.zip
+          name: recomp-toolkit-macos-arm64
+          path: build/toolkit/recomp-toolkit-macos-arm64.zip
           if-no-files-found: error
           retention-days: 14
       - name: Preserve build caches
@@ -83,8 +83,8 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: |
-            build/library-dependencies
-            build/library/rust
+            build/toolkit-dependencies
+            build/toolkit/rust
             ~/.cargo/registry
             ~/.cargo/git
           key: ${{ steps.cache.outputs.cache-primary-key }}

@@ -30,7 +30,7 @@ import web_launcher  # noqa: E402
 
 # What each --target builds. `plugins` is every mod plugin the game ships.
 TARGETS = {
-    "library": [],
+    "toolkit": [],
     "app": ["recomp_app"],
     "smoke": ["recomp_smoke"],
     "headless": ["recomp_headless"],
@@ -516,8 +516,8 @@ def parse_args(argv, system=None):
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 2, 8))
     parser.add_argument("--preset", default=default_preset(system), help="CMake configure preset")
     parser.add_argument("--config", choices=("Release", "Debug"), default="Release")
-    parser.add_argument("--package-library", action="store_true")
-    parser.add_argument("--library-python-root", type=Path)
+    parser.add_argument("--package-toolkit", action="store_true")
+    parser.add_argument("--toolkit-python-root", type=Path)
     game_config.add_game_args(parser)
     parser.add_argument("--stub", action="store_true",
                         help="Link the hosts against a stub translation (no game code; CI's build)")
@@ -591,9 +591,9 @@ def main():
         status = subprocess.call([sys.executable, str(ROOT / "tools/check_flag_state.py")])
         if status:
             sys.exit(status)
-    if args.target == "library":
+    if args.target == "toolkit":
         from build_library import build as build_library
-        build_library(args.build_root, args.config, args.package_library, args.library_python_root)
+        build_library(args.build_root, args.config, args.package_toolkit, args.toolkit_python_root)
         return
     if args.diff_harness:
         out = args.harness_out or (args.build_root / "recomp/diff" / harness_name())

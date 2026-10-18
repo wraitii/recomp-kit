@@ -434,7 +434,7 @@ async function openGame(game) {
   step(1);
   if (game.state === "unavailable") {
     element("checks").replaceChildren();
-    element("check-status").textContent = game.detail || "This game is not available in this version of recomp-kit.";
+    element("check-status").textContent = game.detail || "This game is not available in this version of Recomp Toolkit.";
     element("recheck").hidden = true;
     return;
   }

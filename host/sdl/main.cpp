@@ -2162,7 +2162,8 @@ int main(int argc, char **argv) {
     const InstallationManifest installed_location = installation_manifest_location_for_process();
     std::unique_ptr<OsFileLock, decltype(&os_file_unlock)> installation_lock(
         installed_location.found && installed_location.error.empty()
-            ? os_file_lock((installed_location.game_folder + "/.recomp/install.lock").c_str())
+            ? os_file_lock(
+                  (installed_location.game_folder + "/.recomp-toolkit/install.lock").c_str())
             : nullptr,
         os_file_unlock);
     if (installed_location.found && installed_location.error.empty() && !installation_lock) {

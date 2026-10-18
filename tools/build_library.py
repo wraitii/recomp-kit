@@ -30,11 +30,11 @@ def icon(path):
 
 def build(build_root, config, portable=False, python_root=None):
     if portable and (platform.system() != "Darwin" or platform.machine() != "arm64" or not python_root):
-        raise ValueError("--package-library requires arm64 macOS and --library-python-root")
+        raise ValueError("--package-toolkit requires arm64 macOS and --toolkit-python-root")
     if portable:
         os.environ["MACOSX_DEPLOYMENT_TARGET"] = "14.0"
     source = ROOT / "desktop/library"
-    output = Path(build_root) / "library"
+    output = Path(build_root) / "toolkit"
     output.mkdir(parents=True, exist_ok=True)
     app_icon = output / "icon.png"
     icon(app_icon)
@@ -43,7 +43,7 @@ def build(build_root, config, portable=False, python_root=None):
     windows_icon.write_bytes(struct.pack("<HHH", 0, 1, 1)
                              + struct.pack("<BBBBHHII", 64, 64, 0, 0, 1, 32, len(png), 22) + png)
     env = dict(os.environ, CARGO_TARGET_DIR=str(output / "rust"),
-               RECOMP_LIBRARY_KIT=str(ROOT), RECOMP_LIBRARY_PYTHON=sys.executable,
+               RECOMP_TOOLKIT_KIT=str(ROOT), RECOMP_TOOLKIT_PYTHON=sys.executable,
                TAURI_CONFIG=json.dumps({"bundle": {"icon": [str(app_icon), str(windows_icon)]}}))
     command = ["cargo", "build", "--manifest-path", str(source / "Cargo.toml")]
     if config == "Release":
@@ -52,15 +52,15 @@ def build(build_root, config, portable=False, python_root=None):
         command.append("--locked")
     subprocess.run(command, cwd=source, env=env, check=True)
     binary = output / "rust" / ("release" if config == "Release" else "debug") / (
-        "recomp-library.exe" if os.name == "nt" else "recomp-library")
+        "recomp-toolkit.exe" if os.name == "nt" else "recomp-toolkit")
     if platform.system() == "Darwin":
-        bundle = output / "Recomp Library.app"
+        bundle = output / "Recomp Toolkit.app"
         contents = bundle / "Contents"
         (contents / "MacOS").mkdir(parents=True, exist_ok=True)
-        shutil.copy2(binary, contents / "MacOS/recomp-library")
+        shutil.copy2(binary, contents / "MacOS/recomp-toolkit")
         with (contents / "Info.plist").open("wb") as stream:
-            plistlib.dump({"CFBundleExecutable": "recomp-library", "CFBundleIdentifier": "dev.recompkit.library",
-                          "CFBundleName": "Recomp Library", "CFBundlePackageType": "APPL",
+            plistlib.dump({"CFBundleExecutable": "recomp-toolkit", "CFBundleIdentifier": "dev.recomptoolkit.app",
+                          "CFBundleName": "Recomp Toolkit", "CFBundlePackageType": "APPL",
                           "CFBundleShortVersionString": "0.1.0", "CFBundleVersion": "0.1.0",
                           "NSHighResolutionCapable": True,
                           **({"LSMinimumSystemVersion": "14.0"} if portable else {})}, stream)

@@ -361,7 +361,7 @@ def start(request, storage, kit, cancel=None, recipe=None, inspect_folder=None, 
     recipe_identity = recipe(directory) if recipe else install_jobs.recipe_identity(kit, directory)
     with install_jobs.DestinationLock(storage, lock_name="registry.lock"):
         with install_jobs.DestinationLock(root):
-            facts = root / ".recomp" / "installation.json"
+            facts = root / ".recomp-toolkit" / "installation.json"
             if facts.is_file():
                 saved = install_jobs.read_versioned(facts, "installation")
                 if saved.get("gameId") != game_id:
@@ -369,14 +369,14 @@ def start(request, storage, kit, cancel=None, recipe=None, inspect_folder=None, 
                 raise install_jobs.JobError("assisted_update_unsupported", "Assisted preparation cannot replace an installed content folder yet.",
                                             ["Choose an empty destination, or use its current installed folder for a regular rebuild."])
             for child in root.iterdir():
-                if child.name == ".recomp" and child.is_dir() and not child.is_symlink():
+                if child.name == ".recomp-toolkit" and child.is_dir() and not child.is_symlink():
                     allowed = {"install.lock", "registry.lock", "jobs", "logs"}
                     extras = [entry.name for entry in child.iterdir()
                               if entry.name not in allowed]
                     if extras:
                         raise install_jobs.JobError("destination_not_empty", "The destination has unrelated files.",
                                                     ["Choose an empty destination."], {"entries": extras})
-                elif child.name != ".recomp":
+                elif child.name != ".recomp-toolkit":
                     raise install_jobs.JobError("destination_not_empty", "The destination has unrelated files.",
                                                 ["Choose an empty destination."], {"entry": child.name})
             job_paths, journal = install_jobs.create_job(root, game_id, source_record,

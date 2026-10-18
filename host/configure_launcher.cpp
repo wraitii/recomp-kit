@@ -22,10 +22,10 @@ int main() {
         return 2;
     }
     const std::string game_folder = parent(parent(parent(parent(executable))));
-    const std::string manifest_path = game_folder + "/.recomp/installation.json";
+    const std::string manifest_path = game_folder + "/.recomp-toolkit/installation.json";
     OsStat metadata_stat{}, manifest_stat{};
     char canonical_root[4096], canonical_manifest[4096], canonical_self[4096];
-    if (os_lstat((game_folder + "/.recomp").c_str(), &metadata_stat) != 0 ||
+    if (os_lstat((game_folder + "/.recomp-toolkit").c_str(), &metadata_stat) != 0 ||
         !metadata_stat.is_dir || metadata_stat.is_symlink ||
         os_lstat(manifest_path.c_str(), &manifest_stat) != 0 || !manifest_stat.is_regular ||
         manifest_stat.is_symlink || manifest_stat.size > 1024 * 1024 ||

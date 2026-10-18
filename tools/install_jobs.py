@@ -80,7 +80,7 @@ def job_id(value=None):
 
 def destination_paths(destination):
     root = Path(destination).expanduser().resolve()
-    meta = root / ".recomp"
+    meta = root / ".recomp-toolkit"
     if meta.is_symlink():
         raise JobError("unsafe_metadata_path", "The installation metadata folder is a symbolic link.")
     return root, meta
@@ -350,7 +350,7 @@ def create_job(destination, game_id, source, source_identity, recipe_identity, c
                "sourceIdentity": source_identity, "recipeIdentity": recipe_identity,
                "candidateId": candidate_id, "attempt": attempt, "mode": mode,
                "stage": "inspecting", "validatedInputs": {}, "validatedOutputs": {},
-               "errors": [], "log": f".recomp/logs/{identifier}-{attempt}.log",
+               "errors": [], "log": f".recomp-toolkit/logs/{identifier}-{attempt}.log",
                "owned": {"staging": f"staging-{identifier}", "backup": f"backup-{identifier}"},
                "ownedTokens": {"staging": staging_token},
                "createdAt": int(time.time()), "updatedAt": int(time.time())}
