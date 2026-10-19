@@ -132,6 +132,8 @@ pools own parameters, preshaders and shared values in Rust. C++ retains the COM
 identity and marshals guest calls for every D3D9 and D3DX object, and the
 `d3dx9_26` effect entry points create the same Rust-backed objects as
 `d3dx9_33`. Unported shader/state/query and D3DX methods fail by name.
+`D3DXCompileShader` compiles guest HLSL through pinned vkd3d-shader 2.1 into
+guest-owned D3D bytecode buffers; CMake fetches the pinned SPIRV-Headers input.
 
 ## A frame through the host
 

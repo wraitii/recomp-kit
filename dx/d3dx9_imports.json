@@ -9,7 +9,7 @@
     },
     {
       "name": "D3DXCompileShader",
-      "handler": "imports_unsupported"
+      "handler": "X_D3DXCompileShader"
     },
     {
       "name": "D3DXGetShaderVersion",
@@ -87,9 +87,17 @@
       "handler": "X_D3DXDebugMute"
     },
     {
+      "name": "D3DXCheckVersion",
+      "handler": "X_D3DXCheckVersion"
+    },
+    {
       "name": "D3DXMatrixMultiply",
       "handler": "X_D3DX33MatrixMultiply",
       "flag_on": "rust"
+    },
+    {
+      "name": "D3DXMatrixMultiplyTranspose",
+      "handler": "X_D3DXMatrixMultiplyTranspose"
     },
     {
       "name": "D3DXMatrixInverse",

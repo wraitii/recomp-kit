@@ -1973,13 +1973,13 @@ static void d3dx_ctab_pointer_array(X86 *c, uint32_t setter, uint32_t element) {
 }
 
 void D3DXBuffer_GetBufferPointer(X86 *c) {
-    ComObj *o = d3dx_ctab_this(c);
-    set_eax(c, o ? o->d3dx_ctab_buffer : 0);
+    ComObj *o = com_this(arg(c, 0));
+    set_eax(c, o && o->kind == K_D3DXCONSTANTTABLE ? o->d3dx_ctab_buffer : 0);
 }
 
 void D3DXBuffer_GetBufferSize(X86 *c) {
-    ComObj *o = d3dx_ctab_this(c);
-    set_eax(c, o ? o->d3dx_ctab_size : 0);
+    ComObj *o = com_this(arg(c, 0));
+    set_eax(c, o && o->kind == K_D3DXCONSTANTTABLE ? o->d3dx_ctab_size : 0);
 }
 
 void D3DXConstantTable_GetDesc(X86 *c) {

@@ -24,6 +24,7 @@ enum {
 
 void D3DXBuffer_GetBufferPointer(X86 *c);
 void D3DXBuffer_GetBufferSize(X86 *c);
+void X_D3DXCompileShader(X86 *c);
 
 void D3DXConstantTable_GetDesc(X86 *c);
 void D3DXConstantTable_GetConstantDesc(X86 *c);

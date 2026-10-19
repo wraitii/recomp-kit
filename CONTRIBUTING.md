@@ -6,7 +6,7 @@
   come from it). On Windows use `.venv/Scripts/python.exe` below.
 - macOS: Xcode Command Line Tools. Linux: clang, lld, make and the SDL headers
   listed in `.github/workflows/checks.yml`. Windows: LLVM clang in a Visual
-  Studio developer prompt.
+  Studio developer prompt. Builds also require Flex and Bison 3.0 or newer.
 - [Ghidra 12.1.3](https://github.com/NationalSecurityAgency/ghidra/releases/tag/Ghidra_12.1.3_build)
   and a matching JDK, unless the game ships a code map (`[translate] code_map`).
 - Your own installation of the game. `game.toml` pins the executable's SHA-256.

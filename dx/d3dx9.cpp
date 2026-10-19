@@ -65,6 +65,29 @@ void X_D3DXMatrixMultiply(X86 *c) {
     set_eax(c, out);
 }
 
+void X_D3DXMatrixMultiplyTranspose(X86 *c) {
+    uint32_t out = arg(c, 0), a = arg(c, 1), b = arg(c, 2);
+    float A[16], B[16], R[16];
+    read_matrix(a, A);
+    read_matrix(b, B);
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) {
+            float s = 0.0f;
+            for (int k = 0; k < 4; ++k)
+                s += A[i * 4 + k] * B[k * 4 + j];
+            R[j * 4 + i] = s;
+        }
+    write_matrix(out, R);
+    set_eax(c, out);
+}
+
+void X_D3DXCheckVersion(X86 *c) {
+    uint32_t d3d = arg(c, 0), d3dx = arg(c, 1);
+    if (d3d != 32 || d3dx < 26)
+        LOGW("d3dx9: D3DXCheckVersion(D3D %u, D3DX %u): unsupported SDK version", d3d, d3dx);
+    set_eax(c, d3d == 32 && d3dx >= 26 ? 1 : 0);
+}
+
 void X_D3DXMatrixTranspose(X86 *c) {
     uint32_t out = arg(c, 0), in = arg(c, 1);
     float M[16], R[16];
@@ -327,6 +350,18 @@ void X_D3DXCreateEffectFromResourceA(X86 *c) {
     efx_create(c, dev, pool, flags, out, (const uint8_t *)gm_ptr(addr), size);
 }
 
+static const ImportShim g_d3dx9_27_exports[] = {
+    {"d3dx9_27.dll", "D3DXCheckVersion", 2, X_D3DXCheckVersion},
+    {"d3dx9_27.dll", "D3DXCompileShader", 10, X_D3DXCompileShader},
+    {"d3dx9_27.dll", "D3DXGetPixelShaderProfile", 1, X_D3DXGetPixelShaderProfile},
+    {"d3dx9_27.dll", "D3DXGetVertexShaderProfile", 1, X_D3DXGetVertexShaderProfile},
+    {"d3dx9_27.dll", "D3DXMatrixMultiply", 3, X_D3DX33MatrixMultiply},
+    {"d3dx9_27.dll", "D3DXMatrixMultiplyTranspose", 3, X_D3DXMatrixMultiplyTranspose},
+    {"d3dx9_27.dll", "D3DXMatrixTranspose", 2, X_D3DX33MatrixTranspose},
+    {"d3dx9_27.dll", "D3DXVec3Transform", 3, X_D3DXVec3Transform},
+    {"d3dx9_27.dll", "D3DXVec3TransformNormal", 3, X_D3DXVec3TransformNormal},
+};
+
 static const ImportShim g_d3dx9_exports[] = {
     {"d3dx9_26.dll", "D3DXCreateEffectPool", 1, X_D3DX33CreateEffectPool},
     {"d3dx9_26.dll", "D3DXCreateEffectFromResourceA", 9, X_D3DXCreateEffectFromResourceA},
@@ -376,5 +411,6 @@ void d3dx9_register() {
     com_set_destructor(K_D3DXEFFECTPOOL, d3dx_effect_pool_destroy);
     com_set_destructor(K_D3DXCONSTANTTABLE, d3dx_ctab_destroy);
     imports_register(g_d3dx9_exports, std::size(g_d3dx9_exports));
+    imports_register(g_d3dx9_27_exports, std::size(g_d3dx9_27_exports));
     imports_register(g_d3dx9_33_exports, std::size(g_d3dx9_33_exports));
 }

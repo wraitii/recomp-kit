@@ -2,8 +2,10 @@ set(RECOMP_DX_SOURCES
   com.cpp dx.cpp host_api.cpp display_stubs.cpp ddraw.cpp d3d.cpp d3d7.cpp d3d11.cpp dxgi.cpp d3dcompiler.cpp
   d3dx10.cpp dsound.cpp dshow.cpp mp3_source.cpp dinput.cpp dinput_joystick.cpp xinput.cpp qmixer.cpp
   mss32.cpp redbook.cpp avi.cpp waveout.cpp fmod.cpp soundlib.cpp galaxy_stub.cpp riff.cpp wav_source.cpp bink.cpp video_frame.cpp mf_media.cpp
-  mf.cpp weanetr.cpp d3d9.cpp
+  mf.cpp weanetr.cpp d3d9.cpp d3dx9_compile.cpp
   d3dx9.cpp d3d8.cpp)
+
+include(${CMAKE_SOURCE_DIR}/cmake/Vkd3dShader.cmake)
 
 # A static archive lets ordinary hosts share miniz with the launcher without
 # duplicating its object, and includes it for hosts that have no launcher.
@@ -105,7 +107,7 @@ add_custom_target(d3d9_generated DEPENDS "${RECOMP_D3D9_INTERFACES}" "${RECOMP_D
 add_library(recomp_dx OBJECT ${RECOMP_DX_SOURCES})
 add_dependencies(recomp_dx d3d8_com_tables d3d9_generated)
 target_include_directories(recomp_dx PUBLIC "${RECOMP_D3D8_GENERATED_DIR}" "${RECOMP_D3D9_GENERATED_DIR}")
-target_link_libraries(recomp_dx PUBLIC recomp_runtime recomp_frame_dump)
+target_link_libraries(recomp_dx PUBLIC recomp_runtime recomp_frame_dump vkd3d_shader)
 recomp_link_video(recomp_dx)
 target_compile_options(recomp_dx PRIVATE ${RECOMP_WARN_HOST})
 recomp_optimize(recomp_dx 2)
