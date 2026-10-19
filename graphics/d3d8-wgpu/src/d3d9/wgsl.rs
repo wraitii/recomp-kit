@@ -46,6 +46,7 @@ const OP_CRS: u32 = 33;
 const OP_SGN: u32 = 34;
 const OP_ABS: u32 = 35;
 const OP_NRM: u32 = 36;
+const OP_SINCOS: u32 = 37;
 const OP_MOVA: u32 = 46;
 const OP_DEFB: u32 = 47;
 const OP_DEFI: u32 = 48;
@@ -165,6 +166,9 @@ fn operand_count(op: u32, major: u32, minor: u32, pixel: bool) -> Option<u32> {
             } else {
                 1
             }
+        }
+        OP_SINCOS => {
+            if major >= 3 { 2 } else { 4 }
         }
         OP_DCL => 2,
         OP_DEF | OP_DEFI => 5,
@@ -970,6 +974,10 @@ impl<'a> Gen<'a> {
                 format!("select({c}, {b}, {a} >= vec4<f32>(0.0))")
             }
             OP_LIT => format!("d9_lit({})", self.s(inst, 0)),
+            OP_SINCOS => {
+                let a = self.s(inst, 0);
+                format!("vec4<f32>(cos(({a}).x), sin(({a}).x), 0.0, 0.0)")
+            }
             OP_DST => {
                 let a = self.s(inst, 0);
                 let b = self.s(inst, 1);

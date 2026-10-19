@@ -32,7 +32,7 @@ bump state, preserving queued work across later state changes and deletion.
 - 96 vertex and eight pixel float4 constants. Declaration CONST and shader DEF
   are local to the program, independent of the Set/Get device banks.
 - MOV, ADD, SUB, MAD, MUL, RCP, RSQ, DP3/4, MIN/MAX, SLT/SGE, EXP/LOG,
-  EXPP/LOGP, LIT, DST, LRP, FRC, M4x4/M4x3/M3x4/M3x3/M3x2, CND and DEF.
+  EXPP/LOGP, LIT, DST, LRP, FRC, M4x4/M4x3/M3x4/M3x3/M3x2, CND, SINCOS and DEF.
   Stage-specific instructions are rejected where not implemented. Source
   swizzles, negation, bias, signed scale (`_bx2`), complement, destination
   masks, saturation and shift modifiers are decoded. Temporaries preserve
