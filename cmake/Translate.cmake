@@ -51,11 +51,18 @@ function(recomp_translation_overrides target dir header)
   endif()
 endfunction()
 
+# Generated bodies keep line tables for profiling without full debug-info cost.
+function(recomp_generated_source_options)
+  set_property(SOURCE ${ARGN} APPEND PROPERTY COMPILE_OPTIONS
+    "$<$<C_COMPILER_ID:Clang,AppleClang>:-Xclang;-disable-lifetime-markers>"
+    "$<$<AND:$<NOT:$<CONFIG:Debug>>,$<C_COMPILER_ID:Clang,AppleClang>>:-gline-tables-only>"
+    "$<$<AND:$<NOT:$<CONFIG:Debug>>,$<C_COMPILER_ID:GNU>>:-g1>")
+endfunction()
+
 # Submit isolated giants first so their compile can overlap the small chunks.
 function(recomp_translation_sources result dir)
   file(GLOB sources CONFIGURE_DEPENDS ${dir}/chunk_*.c ${dir}/table.c ${dir}/call_facts.c)
-  set_property(SOURCE ${sources} APPEND PROPERTY COMPILE_OPTIONS
-    "$<$<C_COMPILER_ID:Clang,AppleClang>:-Xclang;-disable-lifetime-markers>")
+  recomp_generated_source_options(${sources})
   set(giants ${sources})
   list(FILTER giants INCLUDE REGEX "/chunk_fn_[0-9a-f]+\\.c$")
   if(giants)
@@ -88,8 +95,7 @@ function(recomp_make_piece index)
   target_link_options(${target} PRIVATE "-Wl,-undefined,dynamic_lookup")
   target_include_directories(${target} PRIVATE ${RECOMP_GEN_DIR} ${RECOMP_ROOT} ${RECOMP_ROOT}/runtime)
   target_compile_options(${target} PRIVATE ${RECOMP_WARN_GEN})
-  set_property(SOURCE ${ARGN} APPEND PROPERTY COMPILE_OPTIONS
-    "$<$<C_COMPILER_ID:Clang,AppleClang>:-Xclang;-disable-lifetime-markers>")
+  recomp_generated_source_options(${ARGN})
   recomp_optimize(${target} 2)
 endfunction()
 
@@ -157,8 +163,7 @@ if(RECOMP_HAVE_GEN)
   target_include_directories(recomp_gen PRIVATE ${RECOMP_GEN_DIR} ${RECOMP_ROOT} ${RECOMP_ROOT}/runtime)
   target_include_directories(recomp_gen INTERFACE ${RECOMP_GEN_DIR})
   target_compile_options(recomp_gen PRIVATE ${RECOMP_WARN_GEN})
-  set_property(SOURCE ${RECOMP_GEN_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
-    "$<$<C_COMPILER_ID:Clang,AppleClang>:-Xclang;-disable-lifetime-markers>")
+  recomp_generated_source_options(${RECOMP_GEN_SOURCES})
   recomp_translation_overrides(recomp_gen "${RECOMP_GEN_DIR}" "${RECOMP_EFFECTIVE_OVERRIDE}")
   recomp_optimize(recomp_gen 2)
   # Desktop macOS keeps each auxiliary image in its own dylib: one static

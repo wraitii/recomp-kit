@@ -5,19 +5,33 @@ from enum import Enum
 import hashlib
 from importlib.metadata import version
 import json
+import lzma
 from pathlib import Path
 import pickle
 import shutil
 import sqlite3
 import struct
 import sys
+import threading
 
 from program import TranslateError
 from ir import x87_facts
 
-FORMAT = 'recomp-emission-cache-v4'
+FORMAT = 'recomp-emission-cache-v5'
 NON_PRODUCING = x87_facts.NON_PRODUCING
 RE_RUN_MODULES = x87_facts.RE_RUN_MODULES
+
+
+CACHE_ERRORS = (lzma.LZMAError, pickle.UnpicklingError, EOFError, ValueError, TypeError,
+                AttributeError, ImportError, IndexError, KeyError)
+
+
+def pack(value):
+    return lzma.compress(pickle.dumps(value, protocol=5), preset=0)
+
+
+def unpack(data):
+    return pickle.loads(lzma.decompress(data))
 
 
 def source_revisions(root=None):
@@ -143,11 +157,13 @@ class AnalysisCache:
         self.namespace = namespace
         root = Path(root)
         root.mkdir(parents=True, exist_ok=True)
-        path = root / 'analysis.sqlite'
-        self.connection = (sqlite3.connect(path.as_uri() + '?mode=ro', uri=True) if readonly else sqlite3.connect(path))
+        self.path = root / 'analysis.sqlite'
+        self.connection = (sqlite3.connect(self.path.as_uri() + '?mode=ro', uri=True) if readonly
+                           else sqlite3.connect(self.path))
         if not readonly:
             self.connection.execute('CREATE TABLE IF NOT EXISTS results (key TEXT PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID')
         self.pending, self.used, self.counts = {}, set(), {}
+        self.vacuum, self.vacuum_error = None, None
 
     def key(self, fir, request):
         return preparation_key(self.namespace, fir, request)
@@ -157,7 +173,10 @@ class AnalysisCache:
         value = self.pending.get(key)
         if value is None:
             row = self.connection.execute('SELECT value FROM results WHERE key = ?', (key,)).fetchone()
-            value = pickle.loads(row[0]) if row is not None else None
+            try:
+                value = unpack(row[0]) if row is not None else None
+            except CACHE_ERRORS:
+                value = None
         counter = kind + ('_hits' if value is not None else '_misses')
         self.counts[counter] = self.counts.get(counter, 0) + 1
         return value
@@ -173,12 +192,29 @@ class AnalysisCache:
         try:
             with self.connection:
                 self.connection.executemany('INSERT OR REPLACE INTO results VALUES (?, ?)',
-                    ((key, pickle.dumps(value, protocol=5)) for key, value in self.pending.items()))
+                    ((key, pack(value)) for key, value in self.pending.items()))
                 self.connection.execute('CREATE TEMP TABLE used (key TEXT PRIMARY KEY) WITHOUT ROWID')
                 self.connection.executemany('INSERT INTO used VALUES (?)', ((key,) for key in self.used))
                 self.connection.execute('DELETE FROM results WHERE key NOT IN (SELECT key FROM used)')
         finally:
             self.connection.close()
+        self.vacuum = threading.Thread(target=self._vacuum, name='analysis-cache-vacuum', daemon=True)
+        self.vacuum.start()
+
+    def _vacuum(self):
+        try:
+            connection = sqlite3.connect(self.path)
+            try:
+                connection.execute('VACUUM')
+            finally:
+                connection.close()
+        except sqlite3.Error as error:
+            self.vacuum_error = error
+
+    def wait(self):
+        if self.vacuum is not None:
+            self.vacuum.join()
+        return self.vacuum_error
 
 
 def relocate(plan, root):
@@ -193,8 +229,10 @@ class PreparationCache:
         manifest = self.root / 'preparation.pickle'
         self.previous, self.entries, self.counts = {}, {}, {}
         if manifest.is_file():
-            with manifest.open('rb') as stream:
-                state = pickle.load(stream)
+            try:
+                state = unpack(manifest.read_bytes())
+            except CACHE_ERRORS:
+                state = {}
             if state.get('format') == FORMAT and state.get('namespace') == namespace:
                 self.previous = state['entries']
 
@@ -234,8 +272,10 @@ def load(root, settings, out):
     index = Path(root) / 'index.pickle'
     if not index.is_file():
         raise TranslateError('selected regeneration needs a cached full generation; run --regenerate --cache-emission first')
-    with index.open('rb') as stream:
-        state = pickle.load(stream)
+    try:
+        state = unpack(index.read_bytes())
+    except CACHE_ERRORS as error:
+        raise TranslateError('selected regeneration needs a cached full generation; run --regenerate --cache-emission first') from error
     if state.get('format') != FORMAT or state['identity'] != identity(settings):
         raise TranslateError('selected regeneration rejected: preparation, policy or translation inputs changed; run a full --regenerate')
     if state['tree'] != tree(out):
@@ -267,8 +307,7 @@ def save(root, settings, out, plans, private_plans, analysis, functions, entries
     if preparation is not None:
         namespace, entries = preparation
         temporary = root / 'preparation.pickle.new'
-        with temporary.open('wb') as stream:
-            pickle.dump({'format': FORMAT, 'namespace': namespace, 'entries': entries}, stream, protocol=5)
+        temporary.write_bytes(pack({'format': FORMAT, 'namespace': namespace, 'entries': entries}))
         temporary.replace(root / 'preparation.pickle')
         retained = {path.name for plan in [*plans.values(), *private_plans, *entries.values()]
                     for path in (getattr(plan, 'path', None), getattr(plan, 'body', None))
@@ -282,8 +321,7 @@ def save(root, settings, out, plans, private_plans, analysis, functions, entries
 def write_index(root, state):
     root = Path(root)
     temporary = root / 'index.pickle.new'
-    with temporary.open('wb') as stream:
-        pickle.dump(state, stream, protocol=5)
+    temporary.write_bytes(pack(state))
     temporary.replace(root / 'index.pickle')
 
 

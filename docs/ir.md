@@ -512,8 +512,9 @@ The current contract is C with CPU-field transport.
 ### Cached preparation and selected regeneration
 
 Full regeneration caches pre-finalization SSA bodies in the ignored
-`recomp/emission-cache` (`recomp-emission-cache-v3`) by default;
-`--no-emission-cache` disables it. A small manifest keys ordinary bodies,
+`recomp/emission-cache` (`recomp-emission-cache-v5`) by default;
+`--no-emission-cache` disables it. Bodies, manifests and analysis summaries are
+LZMA-compressed. A small manifest keys ordinary bodies,
 preparation failures and private variants by instruction bytes, decoded operands,
 control flow and effective preparation requests. Code-map additions preserve matching bodies;
 preparation-source, dependency, executable and policy changes invalidate reuse
@@ -532,7 +533,8 @@ stack-save proof is needed, resolved callee contracts and relevant stack-pop
 counts. The coordinator solves the current call graph and recursive components,
 reusing matching summaries before building preservation SSA. It alone writes
 SQLite, committing result batches in one transaction; workers never write
-the database. Graph payloads keep the existing compact serialization.
+the database. Graph payloads keep the existing compact serialization, and the
+database is vacuumed in the background after pruning.
 
 `tools/build.py --regen-function HEX_ADDR` (repeatable) re-emits selected
 functions using the saved preparation.

@@ -708,6 +708,8 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
         preparation_entries, preparation_counts = pool.preparation_state()
     if analysis_cache is not None:
         preparation_counts.update(analysis_cache.counts)
+        if (vacuum_error := analysis_cache.wait()) is not None:
+            log("  analysis cache vacuum failed: %s" % vacuum_error)
     log("  preparation cache: " + json.dumps(preparation_counts, sort_keys=True))
 
     workload = Counter()
