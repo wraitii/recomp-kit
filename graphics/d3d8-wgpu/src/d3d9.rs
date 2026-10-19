@@ -4747,7 +4747,6 @@ fn resolve_draw_views(
             "depth surface is smaller than the render target",
         ));
     }
-    let depth = depth.filter(|d| d.width == target.width && d.height == target.height);
     Ok(Box::new(DrawViews {
         key,
         target,
@@ -4771,15 +4770,6 @@ fn dispatch_draw(device: &mut D3d9Device, command: draw::DrawCommand) -> Result<
         Some(views) if views.key == key => views,
         _ => resolve_draw_views(device, key)?,
     };
-    if device.depth_target_id != 0
-        && views.depth.is_none()
-        && (device.state.render_state(7)? != 0 || device.state.render_state(52)? != 0)
-    {
-        return Err(unsupported(
-            "Draw",
-            "depth or stencil with a depth surface larger than the render target is not implemented",
-        ));
-    }
     let textures = bound_textures_cached(
         device,
         &mut views.textures,

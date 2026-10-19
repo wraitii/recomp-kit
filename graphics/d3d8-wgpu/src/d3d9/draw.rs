@@ -2146,10 +2146,17 @@ struct DrawBatch {
     draws: Vec<PendingDraw>,
     data: Vec<u8>,
     color_view: Option<wgpu::TextureView>,
+    color_key_view: Option<wgpu::TextureView>,
+    padded_color: Option<PaddedColor>,
     depth: Option<(wgpu::TextureView, bool)>,
     width: u32,
     height: u32,
     last_uniform: Option<([u32; 4], [u64; 4])>,
+}
+
+struct PaddedColor {
+    texture: wgpu::Texture,
+    source: SurfaceView,
 }
 
 const DRAW_MEMOS: usize = 16;
@@ -3219,22 +3226,13 @@ pub(crate) fn execute(
     };
     if draw
         .batch
-        .color_view
+        .color_key_view
         .as_ref()
         .is_some_and(|view| *view != snapshot.target.view)
         || draw.batch.depth.as_ref().map(|(view, _)| view)
             != snapshot.depth.as_ref().map(|depth| &depth.view)
     {
         flush(gpu, draw, queries)?;
-    }
-    if draw.batch.draws.is_empty() {
-        draw.batch.color_view = Some(snapshot.target.view.clone());
-        draw.batch.depth = snapshot
-            .depth
-            .as_ref()
-            .map(|depth| (depth.view.clone(), super::format::has_stencil(depth.format)));
-        draw.batch.width = snapshot.target.width;
-        draw.batch.height = snapshot.target.height;
     }
     let uniform_values: [&[u8]; 4] = [
         if ff_key.is_some() {
@@ -3313,6 +3311,78 @@ pub(crate) fn execute(
             "Draw",
             "draw upload exceeds the device buffer limit",
         ));
+    }
+    if draw.batch.draws.is_empty() {
+        draw.batch.color_key_view = Some(snapshot.target.view.clone());
+        let padded_size = snapshot.depth.as_ref().map(|depth| {
+            (
+                depth.width.max(snapshot.target.width),
+                depth.height.max(snapshot.target.height),
+            )
+        });
+        if padded_size.is_some_and(|(width, height)| {
+            width != snapshot.target.width || height != snapshot.target.height
+        }) {
+            let (width, height) = padded_size.unwrap();
+            let format = snapshot.target.texture.format();
+            let (texture, view) = gpu.validate("DrawTargetPadding", || {
+                let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("d3d9-padded-color-target"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::COPY_SRC
+                        | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                Ok((texture, view))
+            })?;
+            let source = snapshot.target.clone();
+            gpu.record(|encoder, _| {
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &source.texture,
+                        mip_level: source.subresource.1,
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: 0,
+                            z: source.subresource.0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: source.width,
+                        height: source.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            });
+            draw.batch.color_view = Some(view);
+            draw.batch.padded_color = Some(PaddedColor { texture, source });
+        } else {
+            draw.batch.color_view = Some(snapshot.target.view.clone());
+            draw.batch.padded_color = None;
+        }
+        draw.batch.depth = snapshot
+            .depth
+            .as_ref()
+            .map(|depth| (depth.view.clone(), super::format::has_stencil(depth.format)));
+        draw.batch.width = snapshot.target.width;
+        draw.batch.height = snapshot.target.height;
     }
     let mut uniform_offsets = [0u32; 4];
     for (index, bytes) in uniform_values.iter().enumerate() {
@@ -3584,9 +3654,14 @@ fn flush_inner(
         .color_view
         .as_ref()
         .expect("draw batch has a color target");
+    let color_key_view = draw
+        .batch
+        .color_key_view
+        .as_ref()
+        .expect("draw batch has a color target key");
     let depth_target = draw.batch.depth.as_ref();
     gpu.record_folding_clear(
-        |clear| clear.folds_into(color_view, depth_target),
+        |clear| clear.folds_into(color_key_view, depth_target),
         |encoder, staging, fold| {
             let folded_color = fold
                 .as_ref()
@@ -3726,6 +3801,32 @@ fn flush_inner(
             if segment.is_some() {
                 pass.end_occlusion_query();
             }
+            drop(pass);
+            if let Some(padded) = &draw.batch.padded_color {
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &padded.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &padded.source.texture,
+                        mip_level: padded.source.subresource.1,
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: 0,
+                            z: padded.source.subresource.0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: padded.source.width,
+                        height: padded.source.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
         },
     );
     bind_groups.clear();
@@ -3733,6 +3834,8 @@ fn flush_inner(
     draw.batch.draws.clear();
     draw.batch.data.clear();
     draw.batch.color_view = None;
+    draw.batch.color_key_view = None;
+    draw.batch.padded_color = None;
     draw.batch.depth = None;
     draw.batch.last_uniform = None;
     Ok(())
