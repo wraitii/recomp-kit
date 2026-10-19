@@ -436,6 +436,19 @@ def load(game_dir, build_root=None):
     strict_imports = game.setdefault("strict_imports", False)
     if not isinstance(strict_imports, bool):
         raise ValueError("%s: [game] strict_imports must be a boolean" % source)
+    registry = cfg.setdefault("registry", {})
+    hives = ("HKEY_CLASSES_ROOT", "HKEY_CURRENT_USER", "HKEY_LOCAL_MACHINE",
+             "HKEY_USERS", "HKEY_CURRENT_CONFIG")
+    if not isinstance(registry, dict):
+        raise ValueError("%s: [registry] must contain registry key tables" % source)
+    for key, values in registry.items():
+        if key.split("\\")[0] not in hives or "\0" in key or not isinstance(values, dict):
+            raise ValueError("%s: invalid registry key %r" % (source, key))
+        for name, value in values.items():
+            if "\0" in name or not (isinstance(value, str) and "\0" not in value
+                                   or type(value) is int and 0 <= value <= 0xffffffff):
+                raise ValueError("%s: registry value %s\\%s must be a string or DWORD" %
+                                 (source, key, name))
     environment = cfg.setdefault("environment", {})
     passthrough = environment.setdefault("passthrough", [])
     if not isinstance(passthrough, list) or any(
@@ -648,6 +661,7 @@ def load(game_dir, build_root=None):
         raise ValueError("%s: [translate] code_map must be a non-empty path" % source)
     cfg["code_map_path"] = (game_dir / code_map).resolve() if code_map else None
     cfg["aux_modules"] = load_aux_modules(cfg, game_dir, source)
+    lift_heap_above_aux(cfg, source)
     validate_installation_hints(cfg, source)
     # [translate] overrides: a header the generated sources include before they
     # define FN_<addr>, so a game can replace one translated function with a
@@ -727,6 +741,25 @@ def load_aux_modules(cfg, game_dir, source):
         if left["base"] + left["size"] > right["base"]:
             raise ValueError("%s: auxiliary modules overlap" % source)
     return modules
+
+
+def lift_heap_above_aux(cfg, source):
+    """Start the heap after any fixed auxiliary mapping that lands inside it.
+
+    The configured heap base is the lowest address the heap may start at;
+    auxiliary DLLs are placed first and can push it up without the game
+    profile having to spell out every layout change."""
+    game = cfg["game"]
+    base, end = game["heap_base"], game["heap_end"]
+    overlapping = [module for module in cfg["aux_modules"]
+                   if module["base"] < end and module["base"] + module["size"] > base]
+    if not overlapping:
+        return
+    base = max((module["base"] + module["size"] + 0xfff) & ~0xfff for module in overlapping)
+    if base >= end:
+        raise ValueError("%s: auxiliary modules leave no room for the heap below %#x"
+                         % (source, end))
+    game["heap_base"] = base
 
 
 def validate_guest_layout(cfg, source):

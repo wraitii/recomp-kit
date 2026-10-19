@@ -13,11 +13,18 @@ guest_size = 0x80000000
 heap_base = 0x10000000
 heap_end = 0x80000000
 host_arena_base = 0
-guest_root = 'C:\Program Files\Electronic Arts\SPORE'
+guest_root = 'C:\Program Files\Electronic Arts\SPORE\SporebinEP1'
 windows_version = "5.1.2600"
 
 [translate]
 code_map = "metadata"
+
+[modules.aux.goggame]
+name = "goggame-1948823323.dll"
+original_path = "SporebinEP1/goggame-1948823323.dll"
+sha256 = "06bed869d828c58c91a9b2b5edd92544e456cea7c8b684872c8598fd6ff20aab"
+base = 0x10000000
+size = 0x0003a000
 
 [launcher]
 install_names = ["SPORE Collection", "Spore"]
@@ -30,4 +37,22 @@ required_dirs = ["Data", "DataEP1", "bp1content"]
 
 [controls]
 default_layout = "hidden"
-pad = "off"
+
+[registry.'HKEY_LOCAL_MACHINE\SOFTWARE\Electronic Arts\spore']
+reindexyesorno = 0
+installcompleted = 1
+appdir = "Spore"
+installloc = 'C:\Program Files\Electronic Arts\SPORE'
+datadir = 'C:\Program Files\Electronic Arts\SPORE\Data'
+playerdir = "My Spore Creations"
+locale = "en-us"
+
+[registry.'HKEY_LOCAL_MACHINE\SOFTWARE\Electronic Arts\spore_EP1']
+AddOnID = 2
+PackID = 128448390
+DataDir = 'C:\Program Files\Electronic Arts\SPORE\DataEP1\'
+
+[registry.'HKEY_LOCAL_MACHINE\SOFTWARE\Electronic Arts\spore Creepy and Cute Parts Pack']
+AddOnID = 1
+PackID = 116700625
+DataDir = 'C:\Program Files\Electronic Arts\SPORE\bp1content\'

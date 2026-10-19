@@ -33,7 +33,8 @@ HOOK_DEFAULTS = {
 
 
 def c_string(value):
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return '"' + (value.replace("\\", "\\\\").replace('"', '\\"')
+                 .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")) + '"'
 
 
 def c_hex(value):
@@ -63,6 +64,11 @@ def render_header(cfg):
     lines.append("#define RECOMP_KIT_DIR %s" % c_string(Path(__file__).resolve().parents[1].as_posix()))
     lines.append("#define RECOMP_ENVIRONMENT_PASSTHROUGH %s" % c_string_list(cfg["environment"]["passthrough"]))
     lines.append("#define RECOMP_FONT_FILES %s" % c_string_list(cfg["fonts"]["files"]))
+    registry = ["{%s, %s, %s, %s}" % (
+        c_string(key), c_string(name), c_string(value) if isinstance(value, str) else "0",
+        "0u" if isinstance(value, str) else c_hex(value))
+        for key, values in cfg["registry"].items() for name, value in values.items()]
+    lines.append("#define RECOMP_REGISTRY_DEFAULTS {%s}" % ", ".join(registry + ["{0, 0, 0, 0u}"]))
     # The on-screen controls a fresh profile starts with and where they may appear
     # (games/stub/game.toml [controls]).
     controls = cfg["controls"]

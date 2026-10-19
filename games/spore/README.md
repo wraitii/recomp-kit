@@ -34,17 +34,26 @@ python3 -m venv tools/.venv
 tools/.venv/bin/python -m pip install -r recomp-kit/requirements-dev.txt
 RECOMP_BUILD_ROOT=$PWD/build tools/.venv/bin/python recomp-kit/tools/setup.py \
   --game spore --install "$PWD/SPORE"
-tools/.venv/bin/python tools/build.py --regenerate
+tools/.venv/bin/python tools/build.py --regenerate \
+  --allow-unmodelled "Spore bring-up: unsupported instructions trap at their own address"
 ```
+
+The allowance covers instructions the recovered boundaries cannot model; each
+one traps at its own address if reached.
 
 Setup checks the pinned executable against `game.toml`, validates the data
 directories and links the installation as `build/original`. It refuses to
 continue until `[translate] code_map` names a packed map.
 
-## Blockers
+## Installation registry
 
-1. Establish how the game reads its install and data paths, and whether the
-   registry values need host handling.
+`game.toml` supplies the installation values from the GOG Collection's
+`goggame-1948823323.script`; saved registry values override these defaults.
+The guest root maps to `SporebinEP1`, with the content directories alongside it.
+Startup `0x007e7db0` reads `spore\DataDir` through `0x006ab870`; without it,
+the package path resolves to the executable directory. The separate config-path
+fallback finds `../Data/Config`, but cannot supply packaged default preferences
+or option definitions, leading to the `setOption` error at `0x007c8eee`.
 
 ## steam_api.dll
 
@@ -54,6 +63,25 @@ The GOG build ships a 15 KB `steam_api.dll` that is not a Steam client. Its
 `runtime/steam_api.cpp` is a deliberately marked mock of those three answers;
 it logs a warning when `SteamAPI_Init` is reached and leaves any other
 `steam_api` import a strict named failure.
+
+## goggame-1948823323.dll
+
+The GOG build loads this helper from `SporebinEP1`; it exports no functions and
+is mapped as an auxiliary image for its `DllMain`. `metadata-goggame/` is a
+bootstrap code map. Auxiliary mappings may push the heap start up, so this DLL
+owns `0x10000000`..`0x1003a000` and the effective heap base becomes
+`0x1003a000`.
+
+## D3DX shader compilation
+
+The `D3DXCompileShader` IAT at `0x011e2014` is called at `0x006fb5df`,
+`0x006fec68`, `0x00713d5e`, `0x00713df8`, `0x011f6cd4` and `0x011f7aeb`.
+Each supplies entry point `main`, null macros/includes/constant-table output,
+and its profile from the guest; flags are `0x12`/`0x32`, `0x2` and `0`.
+The native compiler is vkd3d-shader 2.1. `DIVERGENCE(original):` it emits
+full-precision bytecode when `D3DXSHADER_PARTIALPRECISION` is set, which the
+Direct3D 9 rules permit; `SKIPVALIDATION` still passes through vkd3d's HLSL
+front end, so malformed source may fail compilation.
 
 ## MSVCR90.dll
 

@@ -337,43 +337,70 @@ def sync_tree(src, dst):
         sync_file(sp, dst / rel)
 
 
-def translation_fingerprint(game_dir, cfg, translate_args):
-    """A hash of everything that can change the translated sources.
+def translation_fingerprints(cfg, allow_unmodelled=None):
+    """Per-image hashes of everything that can change that image's translated sources.
 
-    The 39k-function pass takes well over a minute, so a repeated
-    `--regenerate` with the same inputs should not run it again. The hash
-    covers the translator and game configuration, the executable identity,
-    and the code map."""
-    h = hashlib.sha256()
-    h.update(b"recomp-translate-v2\n")
-    translator_root = ROOT / "tools/recomp"
-    # Frontend packages (notably ir/) affect production output just as the
-    # top-level translator does. Keep tests out of the cache identity.
-    sources = sorted(path for path in translator_root.rglob("*.py")
-                     if "tests" not in path.relative_to(translator_root).parts)
-    sources += [ROOT / "tools/game_config.py", ROOT / "tools/gen_game_config.py"]
-    for path in sources:
-        h.update(path.relative_to(ROOT).as_posix().encode() + b"\0" + path.read_bytes())
-    for name in ("game.toml", cfg["translate"].get("globals", "globals.toml"),
-                 cfg["translate"].get("indirect_targets")):
-        if name is None:
-            continue
-        path = game_dir / name
-        if path.is_file():
-            h.update(name.encode() + b"\0" + path.read_bytes())
-    h.update(b"exe\0" + hashlib.sha256(cfg["developer_exe_path"].read_bytes()).digest())
-    if cfg.get("code_map_path"):
-        from code_map import MAP_FILES
-        for name in MAP_FILES:
-            h.update(name.encode() + b"\0" + (cfg["code_map_path"] / name).read_bytes())
-        for module in cfg["aux_modules"]:
-            h.update(module["key"].encode() + b"\0" + hashlib.sha256(module["path"].read_bytes()).digest())
-            for name in MAP_FILES:
-                h.update(name.encode() + b"\0" + (module["code_map_path"] / name).read_bytes())
-    for key in sorted(translate_args):
-        value = translate_args[key]
-        h.update(("arg:%s=%s\n" % (key, value if value is not None else "")).encode())
-    return h.hexdigest()
+    Each image owns its executable, code map and translation settings. Runtime
+    layout values such as the heap range are absent: they steer the build, not
+    the generated C. Adding an auxiliary module therefore leaves the main
+    image's fingerprint alone, and a partial regeneration updates only the
+    images it actually emits."""
+    from emission_cache import identity, source_revisions
+    from settings import Settings
+
+    def stable(value):
+        if isinstance(value, Path):
+            return value.as_posix()
+        if isinstance(value, bytes):
+            return value.hex()
+        if isinstance(value, dict):
+            return {key: stable(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [stable(item) for item in value]
+        return value
+
+    translation_game = {key: cfg["game"][key] for key in ("image_base", "entry_point", "sha256")}
+    config = dict(cfg)
+    config["game"] = translation_game
+    images = {"main": None}
+    images.update({module["key"]: module["key"] for module in cfg["aux_modules"]})
+    finalization = json.dumps(source_revisions()["finalization"], sort_keys=True).encode()
+    fingerprints = {}
+    for key, module in images.items():
+        settings = Settings(config, allow_unmodelled, module=module)
+        settings.module = stable(settings.module)
+        h = hashlib.sha256(b"recomp-translate-v3\n" + finalization + b"\0" + identity(settings).encode())
+        for path in (ROOT / "tools/game_config.py", ROOT / "tools/gen_game_config.py"):
+            h.update(path.relative_to(ROOT).as_posix().encode() + b"\0" + path.read_bytes())
+        fingerprints[key] = h.hexdigest()
+    return fingerprints
+
+
+STAMP_FORMAT = 2
+
+
+def read_translation_stamp(path):
+    try:
+        stamp = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    if stamp.get("format") != STAMP_FORMAT or not isinstance(stamp.get("images"), dict):
+        return {}
+    return {key: value for key, value in stamp["images"].items()
+            if isinstance(key, str) and isinstance(value, str)}
+
+
+def write_translation_stamp(path, images):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".new")
+    temporary.write_text(json.dumps({"format": STAMP_FORMAT, "images": dict(sorted(images.items()))},
+                                    indent=2) + "\n")
+    temporary.replace(path)
+
+
+def image_generated(build_root, key):
+    gen = Path(build_root) / "recomp/gen"
+    return (gen / "table.c").is_file() if key == "main" else (gen / ("aux-" + key)).is_dir()
 
 
 def publish_generated(build_root, translate, partial=False, main=True):
@@ -632,12 +659,9 @@ def main():
                 if not cfg.get("code_map_path"):
                     parser.error("Translation needs the game's code map: set [translate] code_map in game.toml")
                 selection = regenerate_selection(args.regenerate, cfg, parser)
-                translate_args = {
-                    "allow_unmodelled": args.allow_unmodelled,
-                    "cache_emission": args.cache_emission,
-                }
-                fingerprint = translation_fingerprint(args.game_dir, cfg, translate_args)
+                fingerprints = translation_fingerprints(cfg, args.allow_unmodelled)
                 stamp = args.build_root / "recomp/translate.stamp"
+                stamped = read_translation_stamp(stamp)
                 translated = (args.build_root / "recomp/gen/table.c").is_file()
                 if args.regen_function:
                     if not translated or selection is not None:
@@ -647,20 +671,21 @@ def main():
                         run_translator(stage, args.game_dir, args.build_root,
                                        args.allow_unmodelled, (), args.regen_function)
                     publish_generated(args.build_root, regenerate_selected)
-                    stamp.unlink(missing_ok=True)
+                    stamped.pop("main", None)
+                    write_translation_stamp(stamp, stamped)
                 elif selection is None:
                     cache_ready = not args.cache_emission or (args.build_root / "recomp/emission-cache/index.pickle").is_file()
-                    if translated and cache_ready and stamp.is_file() and stamp.read_text().strip() == fingerprint:
+                    current = (set(stamped) == set(fingerprints)
+                               and all(stamped[key] == value and image_generated(args.build_root, key)
+                                       for key, value in fingerprints.items()))
+                    if translated and cache_ready and current:
                         print("translation inputs unchanged; keeping %s/recomp/gen" % args.build_root)
                     else:
                         publish_generated(args.build_root,
                                           lambda stage: run_translator(stage, args.game_dir, args.build_root,
                                                                        args.allow_unmodelled, cfg["aux_modules"],
                                                                        cache_emission=args.cache_emission))
-                        stamp.parent.mkdir(parents=True, exist_ok=True)
-                        temporary = stamp.with_name("translate.stamp.new")
-                        temporary.write_text(fingerprint + "\n")
-                        temporary.replace(stamp)
+                        write_translation_stamp(stamp, fingerprints)
                 else:
                     if not translated:
                         parser.error("a partial --regenerate needs an existing translation; run --regenerate first")
@@ -671,7 +696,9 @@ def main():
                                                                    args.allow_unmodelled, aux, main=main_image,
                                                                    cache_emission=args.cache_emission),
                                       partial=True, main=main_image)
-                    stamp.unlink(missing_ok=True)
+                    stamped.update((key, fingerprints[key]) for key in selection if key in fingerprints)
+                    write_translation_stamp(stamp, {key: value for key, value in stamped.items()
+                                                    if key in fingerprints})
             # Generated sources include the adjacent runtime header. Refresh
             # it under the same lock even when their translation is unchanged.
             header = args.build_root / "recomp/gen/x86.h"

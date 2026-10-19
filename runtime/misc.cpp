@@ -382,6 +382,7 @@ std::map<std::string, RegValues, CiLess> &regstore() {
     static std::map<std::string, RegValues, CiLess> m;
     return m;
 }
+bool reg_ensure_ancestors(const std::string &path);
 std::map<uint32_t, std::string> &regkeys() {
     static std::map<uint32_t, std::string> m;
     return m;
@@ -446,18 +447,11 @@ std::string registry_path() {
     return host_state_file("registry.json");
 }
 
-// Load the profile registry into the guest key/value store and reset transient key handles.
-// An absent file leaves defaults available through the normal registry shim behavior.
-void registry_load() {
-    regstore().clear();
-    regkeys().clear();
-    g_next_hkey = 0x00030004;
-    g_registry_dirty = false;
-
+static void registry_load_file() {
     std::string path = registry_path();
     FILE *f = fopen(path.c_str(), "rb");
     if (!f) {
-        LOGV("registry: %s does not exist yet, starting empty", path.c_str());
+        LOGV("registry: %s does not exist yet, using installation defaults", path.c_str());
         return;
     }
     std::string text;
@@ -524,6 +518,33 @@ void registry_load() {
             it->second.seq = ++g_reg_seq;
     }
     LOGV("registry: loaded %zu keys from %s", regstore().size(), path.c_str());
+}
+
+void registry_load() {
+    regstore().clear();
+    regkeys().clear();
+    g_reg_seq = 0;
+    g_next_hkey = 0x00030004;
+    g_registry_dirty = false;
+    registry_load_file();
+    const struct {
+        const char *key, *name, *text;
+        uint32_t dword;
+    } defaults[] = RECOMP_REGISTRY_DEFAULTS;
+    for (const auto &entry : defaults) {
+        if (!entry.key)
+            break;
+        reg_ensure_ancestors(entry.key);
+        auto &values = regstore()[entry.key];
+        if (values.count(entry.name))
+            continue;
+        RegValue value;
+        value.type = entry.text ? 1 : 4;
+        value.str = entry.text ? entry.text : "";
+        value.dword = entry.dword;
+        value.seq = ++g_reg_seq;
+        values.emplace(entry.name, std::move(value));
+    }
 }
 
 // Persist the registry when changed, creating the destination directories as needed.
