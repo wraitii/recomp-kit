@@ -12,6 +12,7 @@
 #include "../runtime/win32.h"
 #include "../runtime/mods_seam.h"
 #include "../runtime/call_trace.h"
+#include "../runtime/observe.h"
 #include "../runtime/gdi32_internal.h"
 #include "../runtime/display_seam.h"
 #include "../dx/dx.h"
@@ -447,8 +448,13 @@ void fault_handler(const char *name) {
         sig_write(active);
         sig_write("\n");
     }
+    // The observe report counts indirect calls and shims, so a fatal signal is
+    // its last chance to be written: abort skips the atexit hook, and the path
+    // that leads here is usually one that would have ended the run at once.
+    observe_write_on_fault();
     sig_write("[host] no run report from a signal handler: printing one is not "
-              "signal-safe and could hang instead of exiting\n");
+              "signal-safe and could hang instead of exiting (an OBSERVE report, "
+              "if enabled, was already written)\n");
     os_exit_immediately(same_text(name, "an abort from the runtime") ? 6 : 5);
 }
 

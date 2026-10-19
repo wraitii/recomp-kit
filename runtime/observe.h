@@ -13,11 +13,15 @@ static inline uint32_t observe_take(void) {
     return 0;
 }
 static inline void observe_write(void) {}
+static inline void observe_write_on_fault(void) {}
 #else
 extern uint8_t recomp_observe_on;
 extern uint32_t recomp_observe_site;
 void observe_record(uint32_t site, uint32_t target, const char *kind);
 void observe_write(void);
+// Writes the report from inside a fatal-signal handler, where stdio and an
+// uncontended lock are unavailable; a no-op if the lock is held.
+void observe_write_on_fault(void);
 static inline void observe_indirect(uint32_t site, uint32_t target, const char *kind) {
     if (recomp_observe_on && site)
         observe_record(site, target, kind);
