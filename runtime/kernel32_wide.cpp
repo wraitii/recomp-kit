@@ -15,16 +15,6 @@
 #include <cctype>
 
 namespace {
-// gm_wstr produces valid UTF-8. Count UTF-16 units, including surrogate pairs.
-uint32_t utf16_units(const std::string &s) {
-    uint32_t n = 0;
-    for (unsigned char ch : s) {
-        if ((ch & 0xc0) != 0x80)
-            n += ch >= 0xf0 ? 2 : 1;
-    }
-    return n;
-}
-
 const uint16_t kCp1252High[32] = {
     0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021, 0x02c6, 0x2030, 0x0160,
     0x2039, 0x0152, 0x008d, 0x017d, 0x008f, 0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022,
@@ -636,46 +626,7 @@ void k_GetDateFormatW(X86 *c) {
 // ignores it. lpTime NULL means the current local time; lpFormat NULL means the
 // locale's default picture. cchTime == 0 is a size query that writes nothing.
 void k_GetTimeFormatW(X86 *c) {
-    uint32_t flags = arg(c, 1), input = arg(c, 2), picture = arg(c, 3);
-    uint32_t out = arg(c, 4), cap = arg(c, 5);
-    int hour, minute, second;
-    if (input) {
-        if (!gm_valid(input, 16)) {
-            set_last_error(87 /* ERROR_INVALID_PARAMETER */);
-            set_eax(c, 0);
-            return;
-        }
-        hour = rd16(input + 8);
-        minute = rd16(input + 10);
-        second = rd16(input + 12);
-    } else {
-        struct tm t{};
-        if (os_localtime((int64_t)(os_wall_time_us() / 1000000), &t) != 0) {
-            set_eax(c, 0);
-            return;
-        }
-        hour = t.tm_hour;
-        minute = t.tm_min;
-        second = t.tm_sec;
-    }
-    if (hour > 23 || minute > 59 || second > 59) {
-        set_last_error(87);
-        set_eax(c, 0);
-        return;
-    }
-    std::string text = kernel32_format_time(hour, minute, second,
-                                            picture ? gm_wstr(picture) : std::string(), flags);
-    uint32_t need = utf16_units(text) + 1; // WCHAR count, including the NUL
-    if (cap == 0) {
-        set_eax(c, need);
-        return;
-    }
-    if (!out || cap < need) {
-        set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */);
-        set_eax(c, 0);
-        return;
-    }
-    set_eax(c, gm_put_wstr(out, text, cap) + 1);
+    kernel32_get_time_format(c, true);
 }
 
 uint32_t g_thread_lcid = 0x0409; // The runtime exposes one process-wide locale.
@@ -1222,6 +1173,50 @@ static const ImportShim g_kernel32_wide[] = {
     {"KERNEL32.dll", "QueryDosDeviceW", 3, k_QueryDosDeviceW},
 };
 } // namespace
+
+void kernel32_get_time_format(X86 *c, bool wide) {
+    uint32_t flags = arg(c, 1), input = arg(c, 2), picture = arg(c, 3);
+    uint32_t out = arg(c, 4), cap = arg(c, 5);
+    int hour, minute, second;
+    if (input) {
+        if (!gm_valid(input, 16)) {
+            set_last_error(87 /* ERROR_INVALID_PARAMETER */);
+            set_eax(c, 0);
+            return;
+        }
+        hour = rd16(input + 8);
+        minute = rd16(input + 10);
+        second = rd16(input + 12);
+    } else {
+        struct tm t{};
+        if (os_localtime((int64_t)(os_wall_time_us() / 1000000), &t) != 0) {
+            set_eax(c, 0);
+            return;
+        }
+        hour = t.tm_hour;
+        minute = t.tm_min;
+        second = t.tm_sec;
+    }
+    if (hour > 23 || minute > 59 || second > 59) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    std::string text = kernel32_format_time(
+        hour, minute, second, picture ? (wide ? gm_wstr(picture) : gm_str(picture)) : std::string(),
+        flags);
+    uint32_t need = (wide ? utf16_units(text) : (uint32_t)text.size()) + 1;
+    if (cap == 0) {
+        set_eax(c, need);
+        return;
+    }
+    if (!out || cap < need) {
+        set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */);
+        set_eax(c, 0);
+        return;
+    }
+    set_eax(c, wide ? gm_put_wstr(out, text, cap) + 1 : gm_put_str(out, text.c_str(), cap) + 1);
+}
 
 std::string kernel32_format_time(int hour, int minute, int second, const std::string &picture,
                                  uint32_t flags) {

@@ -11,13 +11,6 @@
 #include <string>
 
 namespace user32 {
-uint32_t utf16_units(const std::string &s) {
-    uint32_t n = 0;
-    for (unsigned char ch : s)
-        if ((ch & 0xc0) != 0x80)
-            n += ch >= 0xf0 ? 2 : 1;
-    return n;
-}
 uint32_t put_text(uint32_t out, uint32_t cap, const std::string &text, bool wide) {
     if (!out || !cap || cap > 0x1000000 || !gm_valid(out, cap * (wide ? 2 : 1)))
         return 0;
@@ -437,7 +430,8 @@ void draw_text(X86 *c) {
 void draw_text_ex(X86 *c) {
     uint32_t p = arg(c, 5);
     if (p && gm_valid(p, 20) && rd32(p) == 20)
-        wr32(p + 16, utf16_units(gm_wstr(arg(c, 1), arg(c, 2) == 0xffffffffu ? 0x8000 : arg(c, 2))));
+        wr32(p + 16,
+             utf16_units(gm_wstr(arg(c, 1), arg(c, 2) == 0xffffffffu ? 0x8000 : arg(c, 2))));
     draw_text(c);
 }
 uint16_t case_unit(uint16_t ch, bool upper) {
@@ -477,7 +471,7 @@ void is_char_upper(X86 *c) {
 void is_char_alpha(X86 *c) {
     uint16_t ch = (uint16_t)arg(c, 0);
     set_eax(c, (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-                    (ch >= 0xc0 && ch <= 0xff && ch != 0xd7 && ch != 0xf7));
+                   (ch >= 0xc0 && ch <= 0xff && ch != 0xd7 && ch != 0xf7));
 }
 void lower(X86 *c) {
     char_case(c, false, false);
