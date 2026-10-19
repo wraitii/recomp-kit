@@ -1,3 +1,4 @@
+import functools
 import pickle
 
 from .ssa import Value
@@ -8,6 +9,12 @@ MAGIC = b'recomp-prepared-v2\n'
 
 def _value_ref(ident):
     raise RuntimeError('prepared value reference outside its reader')
+
+
+def _lookup(values, ident):
+    if type(ident) is not int or not 0 <= ident < len(values):
+        raise ValueError('prepared body value reference %r is out of range' % (ident,))
+    return values[ident]
 
 
 def _unsafe_ref():
@@ -28,15 +35,10 @@ class Reader(pickle.Unpickler):
         super().__init__(stream)
         self.values = values
 
-    def _value(self, ident):
-        if type(ident) is not int or not 0 <= ident < len(self.values):
-            raise ValueError('prepared body value reference %r is out of range' % (ident,))
-        return self.values[ident]
-
     def find_class(self, module, name):
         if module == __name__:
             if name == '_value_ref':
-                return self._value
+                return functools.partial(_lookup, self.values)
             if name == '_unsafe_ref':
                 return _unsafe_ref
         return super().find_class(module, name)
