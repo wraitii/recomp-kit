@@ -15,16 +15,6 @@
 #include <cctype>
 
 namespace {
-// gm_wstr produces valid UTF-8. Count UTF-16 units, including surrogate pairs.
-uint32_t wide_units(const std::string &s) {
-    uint32_t n = 0;
-    for (unsigned char ch : s) {
-        if ((ch & 0xc0) != 0x80)
-            n += ch >= 0xf0 ? 2 : 1;
-    }
-    return n;
-}
-
 void k_CreateFileW(X86 *c) {
     create_file_named(c, gm_wstr(arg(c, 0)));
 }
@@ -71,7 +61,7 @@ void k_FindNextFileW(X86 *c) {
 void k_GetCurrentDirectoryW(X86 *c) {
     const std::string path = current_directory();
     uint32_t cap = arg(c, 0), out = arg(c, 1);
-    uint32_t need = wide_units(path) + 1;
+    uint32_t need = utf16_units(path) + 1;
     if (!cap) {
         set_eax(c, need);
         return;
@@ -90,7 +80,7 @@ void k_GetFullPathNameW(X86 *c) {
     std::string full = full_path_named(gm_wstr(arg(c, 0)));
     std::replace(full.begin(), full.end(), '/', '\\');
     uint32_t len = arg(c, 1), buf = arg(c, 2), pfile = arg(c, 3);
-    uint32_t need = wide_units(full) + 1;
+    uint32_t need = utf16_units(full) + 1;
     if (!buf || len < need) {
         set_eax(c, need);
         return;
@@ -99,7 +89,7 @@ void k_GetFullPathNameW(X86 *c) {
     if (pfile) {
         size_t slash = full.find_last_of('\\');
         wr32(pfile,
-             buf + (slash == std::string::npos ? 0 : 2 * wide_units(full.substr(0, slash + 1))));
+             buf + (slash == std::string::npos ? 0 : 2 * utf16_units(full.substr(0, slash + 1))));
     }
     set_eax(c, n);
 }
@@ -131,7 +121,7 @@ void k_QueryDosDeviceW(X86 *c) {
         return;
     }
     std::string result = name ? "\\Device\\HarddiskVolume1" : "C:";
-    uint32_t need = wide_units(result) + 2; // MULTI_SZ includes its extra NUL.
+    uint32_t need = utf16_units(result) + 2; // MULTI_SZ includes its extra NUL.
     if (!out || cap < need) {
         set_last_error(122);
         set_eax(c, 0);
@@ -257,7 +247,7 @@ void k_GetPrivateProfileStringW(X86 *c) {
         return;
     }
     for (const auto &name : names) {
-        uint32_t need = wide_units(name) + 1;
+        uint32_t need = utf16_units(name) + 1;
         if (need >= cap - used) {
             gm_put_wstr(out + used * 2, name, cap - used - 1);
             wr16(out + (cap - 2) * 2, 0);
@@ -437,7 +427,7 @@ void k_FormatMessageW(X86 *c) {
         return;
     }
     std::string text = "Error " + std::to_string(arg(c, 2));
-    uint32_t need = wide_units(text) + 1;
+    uint32_t need = utf16_units(text) + 1;
     if (flags & 0x100) { // FORMAT_MESSAGE_ALLOCATE_BUFFER
         cap = std::max(cap, need);
         if (cap > GUEST_SIZE / 2 || !gm_valid(out, 4)) {
@@ -559,46 +549,7 @@ void k_GetDateFormatW(X86 *c) {
 // ignores it. lpTime NULL means the current local time; lpFormat NULL means the
 // locale's default picture. cchTime == 0 is a size query that writes nothing.
 void k_GetTimeFormatW(X86 *c) {
-    uint32_t flags = arg(c, 1), input = arg(c, 2), picture = arg(c, 3);
-    uint32_t out = arg(c, 4), cap = arg(c, 5);
-    int hour, minute, second;
-    if (input) {
-        if (!gm_valid(input, 16)) {
-            set_last_error(87 /* ERROR_INVALID_PARAMETER */);
-            set_eax(c, 0);
-            return;
-        }
-        hour = rd16(input + 8);
-        minute = rd16(input + 10);
-        second = rd16(input + 12);
-    } else {
-        struct tm t{};
-        if (os_localtime((int64_t)(os_wall_time_us() / 1000000), &t) != 0) {
-            set_eax(c, 0);
-            return;
-        }
-        hour = t.tm_hour;
-        minute = t.tm_min;
-        second = t.tm_sec;
-    }
-    if (hour > 23 || minute > 59 || second > 59) {
-        set_last_error(87);
-        set_eax(c, 0);
-        return;
-    }
-    std::string text = kernel32_format_time(hour, minute, second,
-                                            picture ? gm_wstr(picture) : std::string(), flags);
-    uint32_t need = wide_units(text) + 1; // WCHAR count, including the NUL
-    if (cap == 0) {
-        set_eax(c, need);
-        return;
-    }
-    if (!out || cap < need) {
-        set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */);
-        set_eax(c, 0);
-        return;
-    }
-    set_eax(c, gm_put_wstr(out, text, cap) + 1);
+    kernel32_get_time_format(c, true);
 }
 
 uint32_t g_thread_lcid = 0x0409; // The runtime exposes one process-wide locale.
@@ -904,7 +855,7 @@ void k_GlobalAddAtomW(X86 *c) {
         return;
     }
     std::string name = atom_name(p);
-    if (name.empty() || wide_units(name) > 255) {
+    if (name.empty() || utf16_units(name) > 255) {
         set_last_error(87);
         set_eax(c, 0);
         return;
@@ -1014,7 +965,7 @@ void k_EnumResourceNamesW(X86 *c) {
     for (const auto &name : names) {
         uint32_t guest_name = name.id, temporary = 0;
         if (name.is_string) {
-            uint32_t cap = wide_units(name.name) + 1;
+            uint32_t cap = utf16_units(name.name) + 1;
             temporary = heap_alloc(cap * 2, true);
             if (!temporary) {
                 set_last_error(8);
@@ -1115,6 +1066,50 @@ static const ImportShim g_kernel32_wide[] = {
     {"KERNEL32.dll", "QueryDosDeviceW", 3, k_QueryDosDeviceW},
 };
 } // namespace
+
+void kernel32_get_time_format(X86 *c, bool wide) {
+    uint32_t flags = arg(c, 1), input = arg(c, 2), picture = arg(c, 3);
+    uint32_t out = arg(c, 4), cap = arg(c, 5);
+    int hour, minute, second;
+    if (input) {
+        if (!gm_valid(input, 16)) {
+            set_last_error(87 /* ERROR_INVALID_PARAMETER */);
+            set_eax(c, 0);
+            return;
+        }
+        hour = rd16(input + 8);
+        minute = rd16(input + 10);
+        second = rd16(input + 12);
+    } else {
+        struct tm t{};
+        if (os_localtime((int64_t)(os_wall_time_us() / 1000000), &t) != 0) {
+            set_eax(c, 0);
+            return;
+        }
+        hour = t.tm_hour;
+        minute = t.tm_min;
+        second = t.tm_sec;
+    }
+    if (hour > 23 || minute > 59 || second > 59) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    std::string text = kernel32_format_time(
+        hour, minute, second, picture ? (wide ? gm_wstr(picture) : gm_str(picture)) : std::string(),
+        flags);
+    uint32_t need = (wide ? utf16_units(text) : (uint32_t)text.size()) + 1;
+    if (cap == 0) {
+        set_eax(c, need);
+        return;
+    }
+    if (!out || cap < need) {
+        set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */);
+        set_eax(c, 0);
+        return;
+    }
+    set_eax(c, wide ? gm_put_wstr(out, text, cap) + 1 : gm_put_str(out, text.c_str(), cap) + 1);
+}
 
 std::string kernel32_format_time(int hour, int minute, int second, const std::string &picture,
                                  uint32_t flags) {

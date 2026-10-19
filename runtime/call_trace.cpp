@@ -58,7 +58,6 @@ constexpr uint32_t kLabelCap = 64;
 constexpr uint32_t kArgs = 4;
 constexpr uint32_t kMaxDumps = 16;
 constexpr uint32_t kDumpTextCap = 32;
-constexpr uint32_t kMaxModules = 16;
 
 enum DumpBaseKind {
     DUMP_ARG = 0, // base register value read from the guest stack

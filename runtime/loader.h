@@ -103,7 +103,7 @@ uint32_t loader_tls_block_for_thread(uint32_t tls_array);
 
 // Resets `c` to the process-start state: zeroed registers, ESP just below
 // STACK_TOP with a sentinel return address pushed, FS base at the TEB, x87
-// control word 0x027f.
+// control word 0x037f.
 void loader_init_context(X86 *c);
 
 // Process-wide context used by run_entry() and by hosts that do not keep their

@@ -2,8 +2,8 @@
 // paint/DC stubs and the input helpers the host layer feeds.
 //
 // Windows are bookkeeping only: no pixels are produced here. The host layer
-// (Task 7) pushes real events in with host_post_message() and the guest pulls
-// them out through PeekMessageA/GetMessageA exactly as it would on Win32.
+// pushes real events in with host_post_message() and the guest pulls them out
+// through PeekMessageA/GetMessageA exactly as it would on Win32.
 #include "user32_internal.h"
 #include "key_names.h"
 #include "gdi_image.h"
@@ -46,7 +46,6 @@ std::map<uint32_t, std::deque<Msg>> &thread_queues() {
 }
 
 uint32_t g_next_hwnd = 0x00020004;
-uint32_t g_next_gdi = 0x00028004;
 uint32_t g_main_hwnd = 0;
 uint32_t g_cursor = 0;
 int32_t g_cursor_x = 0, g_cursor_y = 0;
@@ -193,14 +192,6 @@ bool host_window_visible(uint32_t hwnd) {
 bool host_cursor_visible() {
     return g_cursor_show >= 0;
 }
-bool host_cursor_clip(int32_t *out) {
-    if (!g_clipped)
-        return false;
-    for (int i = 0; i < 4; ++i)
-        out[i] = g_clip[i];
-    return true;
-}
-
 uint32_t host_dispatch_to_wndproc(X86 *c, uint32_t hwnd, uint32_t msg, uint32_t wparam,
                                   uint32_t lparam) {
     Window *w = find_window(hwnd);
@@ -1188,7 +1179,7 @@ void def_window_proc(X86 *c, bool wide) {
         set_eax(c, put_text(arg(c, 3), arg(c, 2), w ? w->title_utf8 : "", wide));
         return;
     case 0x000e: // WM_GETTEXTLENGTH
-        set_eax(c, w ? (wide ? wide_units(w->title_utf8) : uint32_t(w->title_utf8.size())) : 0);
+        set_eax(c, w ? (wide ? utf16_units(w->title_utf8) : uint32_t(w->title_utf8.size())) : 0);
         return;
     case 0x000f: // DefWindowProc validates an otherwise unhandled paint.
         if (w)
@@ -1552,8 +1543,6 @@ void u_ShowCursor(X86 *c) {
     set_eax(c, (uint32_t)g_cursor_show);
 }
 
-// The cursor is confined by bookkeeping only; the host layer reads the clip
-// rectangle back when it decides where a real cursor may go.
 void u_ClipCursor(X86 *c) {
     uint32_t r = arg(c, 0);
     if (!r) {

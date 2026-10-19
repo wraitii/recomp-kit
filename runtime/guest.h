@@ -1,5 +1,5 @@
 // guest.h - guest address space layout, memory accessors and shared helpers
-// for the recompiled Populous: The Beginning runtime.
+// for the recompiled runtime.
 #pragma once
 
 // The CPU state, memory accessors and instruction helpers are owned by the
@@ -29,12 +29,12 @@ static const uint32_t IMAGE_BASE = GUEST_IMAGE_BASE; // PE preferred base, no re
 static const uint32_t HEAP_BASE = GUEST_HEAP_BASE; // heap arena start
 static const uint32_t HEAP_LIMIT = GUEST_HEAP_END; // heap arena end (exclusive)
 static const uint32_t STACK_TOP = GUEST_STACK_TOP; // initial ESP region top, grows down
-// 8 MB. A fixed megabyte was exhausted by Siege of Avalon's 1.19 launcher on
-// Play, although that executable reserves only a megabyte on Windows
-// (SizeOfStackReserve 0x100000): the same code runs deeper under the kit than
-// natively, and why is not yet established. Until it is, the guest gets
-// headroom rather than the program's own reserve. The region below the stack
-// down to the default heap end (0x0e000000) is otherwise unused.
+// 8 MB. A fixed megabyte was exhausted by a deep guest launcher even though
+// its executable reserves only a megabyte on Windows (SizeOfStackReserve
+// 0x100000): the same code runs deeper under the kit than natively, and why is
+// not yet established. Until it is, the guest gets headroom rather than the
+// program's own reserve. The region below the stack down to the default heap
+// end (0x0e000000) is otherwise unused.
 static const uint32_t STACK_SIZE = 0x00800000u;
 static const uint32_t STACK_LIMIT = STACK_TOP - STACK_SIZE;
 static const uint32_t TEB_BASE = GUEST_TEB_BASE; // FS segment base
@@ -69,6 +69,14 @@ std::string gm_wstr(uint32_t a, size_t max_chars = 0x8000);
 // the terminator, without splitting surrogate pairs or leaving the guest arena.
 // Invalid UTF-8 bytes become U+FFFD. Returns units written excluding NUL.
 uint32_t gm_put_wstr(uint32_t a, const std::string &s, uint32_t cap);
+// UTF-16 code units in UTF-8 text, including surrogate pairs.
+static inline uint32_t utf16_units(const std::string &s) {
+    uint32_t n = 0;
+    for (unsigned char ch : s)
+        if ((ch & 0xc0) != 0x80)
+            n += ch >= 0xf0 ? 2 : 1;
+    return n;
+}
 
 // ---------------------------------------------------------------------------
 // Logging. RECOMP_LOG=0 silences everything, 1 (default) prints warnings and

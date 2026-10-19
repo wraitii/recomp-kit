@@ -649,6 +649,13 @@ void g_GetPaletteEntries(X86 *c) {
 void g_GetSystemPaletteUse(X86 *c) {
     set_eax(c, 1); // SYSPAL_STATIC
 }
+void g_GetSystemPaletteEntries(X86 *c) {
+    // There is no host palette behind these DCs. Reporting zero entries is the
+    // documented "no palette" answer; the DirectDraw shims own real palettes.
+    log_once("GetSystemPaletteEntries",
+             "GetSystemPaletteEntries: no host palette, returning 0 entries");
+    set_eax(c, 0);
+}
 void g_SetSystemPaletteUse(X86 *c) {
     set_eax(c, 1); // the previous use
 }
@@ -781,6 +788,7 @@ const ImportShim g_gdi32_shims[] = {
     {"GDI32.dll", "RealizePalette", 1, g_RealizePalette},
     {"GDI32.dll", "GetPaletteEntries", 4, g_GetPaletteEntries},
     {"GDI32.dll", "GetSystemPaletteUse", 1, g_GetSystemPaletteUse},
+    {"GDI32.dll", "GetSystemPaletteEntries", 4, g_GetSystemPaletteEntries},
     {"GDI32.dll", "SetSystemPaletteUse", 2, g_SetSystemPaletteUse},
     {"GDI32.dll", "GetDIBits", 7, g_GetDIBits},
     {"GDI32.dll", "GetDeviceCaps", 2, g_GetDeviceCaps},

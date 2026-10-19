@@ -27,7 +27,6 @@ void discovery_write(void);
 
 // What has been recorded so far, for the run report.
 uint32_t discovery_count(void);
-void discovery_print(FILE *out);
 
 #ifdef __cplusplus
 }

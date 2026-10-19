@@ -93,12 +93,6 @@ add_test(NAME interp_tests COMMAND interp_tests WORKING_DIRECTORY ${RECOMP_ROOT}
 set_tests_properties(interp_tests PROPERTIES LABELS nogame TIMEOUT 120)
 endif()
 
-# Linked by the hosts and mod tests, not by the unit tests.
-add_library(recomp_snapshot OBJECT snapshot.cpp)
-target_link_libraries(recomp_snapshot PUBLIC recomp_runtime)
-target_compile_options(recomp_snapshot PRIVATE ${RECOMP_WARN_HOST})
-recomp_optimize(recomp_snapshot 2)
-
 # The suite spawns itself for the abort check; portable since sub-project 3.
 if(NOT IOS AND NOT ANDROID)
 add_executable(seh_tests tests/seh_tests.cpp)

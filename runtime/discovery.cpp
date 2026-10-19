@@ -85,17 +85,6 @@ extern "C" uint32_t discovery_count(void) {
     return (uint32_t)finds().size();
 }
 
-extern "C" void discovery_print(FILE *out) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (finds().empty())
-        return;
-    fprintf(out, "discovered code the translation does not carry: %zu address%s\n", finds().size(),
-            finds().size() == 1 ? "" : "es");
-    for (const auto &kv : finds())
-        fprintf(out, "    %08x  %s from %08x, %u time%s\n", kv.first, kv.second.kind.c_str(),
-                kv.second.from, kv.second.hits, kv.second.hits == 1 ? "" : "s");
-}
-
 namespace {
 void write_locked() {
     const char *file = path();

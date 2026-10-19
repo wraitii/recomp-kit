@@ -1,7 +1,7 @@
-// misc.cpp - the smaller import sets: GDI32, ADVAPI32 (registry), SHELL32,
-// ole32, IMM32, WSOCK32 and the non-audio half of WINMM (the millisecond
-// clock, multimedia timers and mmio file access). MIDI and aux output are
-// logging-only here; real audio belongs to the audio task.
+// misc.cpp - the smaller import sets: ADVAPI32 (registry), SHELL32, ole32,
+// IMM32, WSOCK32 and the non-audio half of WINMM (the millisecond clock,
+// multimedia timers and mmio file access). MIDI output is forwarded to the host
+// synthesizer; real audio belongs to the audio task.
 #include "imports.h"
 #include "game_config.h"
 #include "layout.h"
@@ -720,16 +720,9 @@ void a_RegCloseKey(X86 *c) {
 
 // The backing store is UTF-8. W sizes are UTF-16 units for names and
 // UTF-16 bytes (including NUL) for REG_SZ/REG_EXPAND_SZ data.
-uint32_t reg_units(const std::string &s) {
-    uint32_t n = 0;
-    for (unsigned char ch : s)
-        if ((ch & 0xc0) != 0x80)
-            n += ch >= 0xf0 ? 2 : 1;
-    return n;
-}
 uint32_t reg_value_size(const RegValue &rv, bool wide) {
     if (rv.type == 1 || rv.type == 2)
-        return wide ? (reg_units(rv.str) + 1) * 2 : uint32_t(rv.str.size() + 1);
+        return wide ? (utf16_units(rv.str) + 1) * 2 : uint32_t(rv.str.size() + 1);
     return rv.type == 4 || rv.type == 5 ? 4 : uint32_t(rv.bin.size());
 }
 uint32_t reg_read_value(const RegValue &rv, bool wide, uint32_t type, uint32_t data,
@@ -896,7 +889,7 @@ std::vector<std::string> reg_children(const std::string &path) {
 uint32_t reg_write_name(const std::string &name, uint32_t out, uint32_t len) {
     if (!len || !gm_valid(len, 4))
         return 87;
-    uint32_t have = rd32(len), need = reg_units(name);
+    uint32_t have = rd32(len), need = utf16_units(name);
     wr32(len, need);
     if (!out || have <= need)
         return 234;
@@ -1027,11 +1020,11 @@ void reg_query_info_key(X86 *c, bool wide) {
     auto it = regstore().find(path);
     uint32_t maxkey = 0, maxname = 0, maxdata = 0, count = 0;
     for (const auto &name : keys)
-        maxkey = std::max(maxkey, wide ? reg_units(name) : uint32_t(name.size()));
+        maxkey = std::max(maxkey, wide ? utf16_units(name) : uint32_t(name.size()));
     if (it != regstore().end()) {
         count = uint32_t(it->second.size());
         for (const auto &v : it->second) {
-            maxname = std::max(maxname, wide ? reg_units(v.first) : uint32_t(v.first.size()));
+            maxname = std::max(maxname, wide ? utf16_units(v.first) : uint32_t(v.first.size()));
             maxdata = std::max(maxdata, reg_value_size(v.second, wide));
         }
     }
@@ -1108,20 +1101,6 @@ void a_RegFlushKey(X86 *c) {
 }
 void a_RegDenied(X86 *c) {
     set_eax(c, 5);
-}
-
-// -------------------------------------------------------------------------
-// GDI32
-// -------------------------------------------------------------------------
-void g_GetStockObject(X86 *c) {
-    set_eax(c, 0x00031000 + arg(c, 0));
-}
-void g_GetSystemPaletteEntries(X86 *c) {
-    // There is no host palette behind these DCs. Reporting zero entries is the
-    // documented "no palette" answer; the DirectDraw shims own real palettes.
-    log_once("GetSystemPaletteEntries",
-             "GetSystemPaletteEntries: no host palette, returning 0 entries");
-    set_eax(c, 0);
 }
 
 // -------------------------------------------------------------------------
@@ -2139,7 +2118,6 @@ void m_mmioAscend(X86 *c) {
 const uint32_t MMSYSERR_NOERROR = 0;
 const uint32_t MMSYSERR_BADDEVICEID = 2;
 const uint32_t MMSYSERR_INVALPARAM = 11;
-const uint32_t MMSYSERR_NODRIVER = 6;
 const uint32_t MIDIERR_UNPREPARED = 64;
 
 // MIDIOUTCAPSA: wMid, wPid, vDriverVersion, szPname[32], wTechnology, wVoices,
@@ -2152,7 +2130,7 @@ const uint16_t MOD_SWSYNTH = 7;
 // reserved, dwOffset, dwReserved[8]. Sixty-four bytes.
 const uint32_t MIDIHDR_SIZE = 64;
 const uint32_t MHDR_OFF_lpData = 0, MHDR_OFF_dwBufferLength = 4;
-const uint32_t MHDR_OFF_dwUser = 12, MHDR_OFF_dwFlags = 16;
+const uint32_t MHDR_OFF_dwFlags = 16;
 const uint32_t MHDR_DONE = 0x1, MHDR_PREPARED = 0x2, MHDR_INQUEUE = 0x4;
 
 // The one open device. The game opens exactly one; the handle is a token
@@ -2439,7 +2417,7 @@ VersionResource find_version_resource() {
     const auto &name = names.front();
     uint32_t id = name.id, temp = 0;
     if (name.is_string) {
-        uint32_t units = reg_units(name.name) + 1;
+        uint32_t units = utf16_units(name.name) + 1;
         temp = heap_alloc(units * 2);
         if (!temp)
             return r;
@@ -2930,9 +2908,6 @@ const ImportShim g_misc_shims[] = {
     {"ADVAPI32.dll", "RegSaveKeyW", 3, a_RegDenied},
     {"ADVAPI32.dll", "RegRestoreKeyW", 3, a_RegDenied},
     {"ADVAPI32.dll", "RegReplaceKeyW", 4, a_RegDenied},
-    // GDI32
-    {"GDI32.dll", "GetStockObject", 1, g_GetStockObject},
-    {"GDI32.dll", "GetSystemPaletteEntries", 4, g_GetSystemPaletteEntries},
     // SHELL32
     {"SHELL32.dll", "ShellExecuteA", 6, s_ShellExecuteA},
     {"SHELL32.dll", "SHGetSpecialFolderPathA", 4, s_SHGetSpecialFolderPath<false>},
@@ -3113,7 +3088,6 @@ const ImportShim g_misc_shims[] = {
     {"d3dx9_26.dll", "D3DXVec3TransformCoordArray", 6, nullptr},
     {"d3dx9_26.dll", "D3DXVec3Normalize", 2, nullptr},
     {"DINPUT8.dll", "DirectInput8Create", 5, nullptr},
-    {"SHFOLDER.dll", "SHGetFolderPathA", 5, s_SHGetFolderPathA},
     {"DSOUND.dll", "ord6", 3, nullptr}, // DirectSoundCaptureCreate
     {"WINMM.dll", "waveOutGetNumDevs", 0, m_waveGetNumDevs},
     {"WINMM.dll", "waveOutGetDevCapsA", 3, m_waveBadDevice},

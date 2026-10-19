@@ -1,6 +1,5 @@
 // win32.h - services shared between the Win32 shim modules, plus the small
-// surface the host application (Task 7) and the DirectX shims (later task)
-// use to drive the guest.
+// surface the host application and the DirectX shims use to drive the guest.
 #pragma once
 #include "game_config.h"
 #include "guest.h"
@@ -534,7 +533,6 @@ bool win32_read_cursor(uint32_t handle, GdiImage *image, uint32_t *hot_x = nullp
                        uint32_t *hot_y = nullptr);
 void win32_copy_cursor(uint32_t source, uint32_t destination, int width = 0, int height = 0);
 void win32_delete_cursor(uint32_t handle);
-bool host_cursor_clip(int32_t out[4]);
 
 // Calls the window's WNDPROC through recomp_call.
 uint32_t host_dispatch_to_wndproc(X86 *c, uint32_t hwnd, uint32_t msg, uint32_t wparam,

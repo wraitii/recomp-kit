@@ -163,7 +163,7 @@ endfunction()
 # The mixer, its output device and the synth: portable, over SDL audio.
 set(RECOMP_AUDIO_SOURCES ${HOST}/audio/mixer.cpp ${HOST}/audio/sdl_sink.cpp ${HOST}/audio/midi_synth.cpp
                       ${HOST}/audio_math.cpp ${HOST}/audio_capture.cpp)
-set(RECOMP_CORE_LIBS recomp_platform recomp_runtime recomp_snapshot recomp_dx recomp_mods lua host_common gpu_backend)
+set(RECOMP_CORE_LIBS recomp_platform recomp_runtime recomp_dx recomp_mods lua host_common gpu_backend)
 # The on-screen controls the presenter draws (controls_host.cpp is the app's own).
 set(RECOMP_CONTROLS_SOURCES ${HOST}/controls/layout.cpp
                          ${HOST}/controls/builtin_layouts.cpp ${HOST}/controls/layout_store.cpp

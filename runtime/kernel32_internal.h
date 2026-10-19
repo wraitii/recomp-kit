@@ -57,3 +57,6 @@ enum Kernel32TimeFlag {
 // GetTimeFormat shims so both write identical text.
 std::string kernel32_format_time(int hour, int minute, int second, const std::string &picture,
                                  uint32_t flags);
+
+// Shared GetTimeFormatA/W input, validation, size query and buffer handling.
+void kernel32_get_time_format(X86 *c, bool wide);

@@ -17,12 +17,16 @@ owns. Compile the runtime with `-I<repo root>` so `guest.h` can find it.
 | `memory.h/.cpp` | the 256 MB arena and the first-fit heap allocator |
 | `loader.h/.cpp` | SHA-256 check, PE mapping, IAT patching, TEB/stack setup, `run_entry` |
 | `imports.h/.cpp` | shim table, trampoline allocation, dispatch, coverage reporting |
-| `cpu.cpp` | the call-outs `x86.h` declares, plus the `_setjmp`/`_longjmp` intrinsics |
-| `intrinsics.h` | the intrinsic contract generated code uses for `_setjmp`/`_longjmp` |
-| `kernel32.cpp` | heap, files, modules, TLS, sync objects, time, strings and locale |
-| `kernel32_wide.cpp` | UTF-16 entry points and INI string/integer APIs through the guest filesystem overlay |
-| `user32.cpp` | window classes and windows, the message queue, paint/DC/input stubs |
-| `misc.cpp` | GDI32, ADVAPI32 registry, SHELL32, ole32, IMM32, WSOCK32, WINMM (clock, mmio, MIDI out) |
+| `cpu.cpp`, `intrinsics.h` | the call-outs `x86.h` declares and the `_setjmp`/`_longjmp` intrinsic contract |
+| `kernel32.cpp`, `kernel32_wide.cpp` | heap, files, modules, TLS, sync objects, time, strings, locale and the UTF-16/INI entry points |
+| `user32*.cpp` | window classes, windows, messages, cursor/dialog/static/VCL helpers and UTF-16 entry points |
+| `gdi32*.cpp` | the GDI model: objects, DCs and palettes; software draw, text and TrueType rasterization |
+| `misc.cpp`, `misc_dlls.cpp` | ADVAPI32 registry, SHELL32, ole32, IMM32, WSOCK32, WINMM, and small optional-DLL probes |
+| `comctl32.cpp`, `imagehlp.cpp`, `media_foundation.cpp`, `msimg32.cpp`, `oleaut32.cpp` | common controls, DbgHelp, Media Foundation, msimg32 and automation shims |
+| `seh.cpp`, `interp.cpp`, `thunks.cpp` | guest exception checkpoints, the interpreter and thunk dispatch |
+| `call_trace.cpp`, `discovery.cpp`, `observe.cpp`, `profile.cpp` | call tracing, discovery and profiling diagnostics |
+| `installation_manifest.cpp`, `layout.cpp`, `key_names.cpp`, `resources.cpp` | installation, input layout, key names and resource helpers |
+| `mods_seam.cpp`, `native_seam.h` | the mod and native-override seams |
 | `win32.h` | what the host app and the DirectX shims call into |
 | `tests/` | `runtime_tests.cpp` plus the test-only `recomp_call` |
 
@@ -34,15 +38,18 @@ Guest address `a` is `g_mem + a`.
 | --- | --- |
 | `0x00400000`–`loader_image_limit()` | image at its preferred base, no relocation (the limit comes from the image's `SizeOfImage`) |
 | `[game] heap_base`–`heap_end` (default `0x01000000`–`0x0e000000`) | heap arena (HeapAlloc/GlobalAlloc/LocalAlloc/VirtualAlloc) |
-| `0x0ef00000`–`0x0f000000` | stack, growing down |
+| `0x0e800000`–`0x0f000000` | stack, growing down |
+| `0x0f000000`–`0x0fd00000` | mod heap |
 | `0x0fe00000` | TEB: FS:[0] SEH head, FS:[4]/[8] stack bounds, FS:[0x18] self, FS:[0x2c] TLS |
 | `0x0fe01000` | 64 TLS slots |
 | `0x0ff00000 + 16*i` | trampoline for import `i` |
 
 Handles are small integers outside the arena's mapped regions and are never
 dereferenced: kernel objects from `0x00010004`, windows from `0x00020004`,
-GDI objects from `0x00028004`, registry keys from `0x00030004`, mmio files
-from `0x00040004`, pseudo modules from `0x60000000`.
+icons from `0x0002a000`/`0x0002b000`, registry keys from `0x00030004`, mmio
+files from `0x00040004`, stock GDI objects from `0x0004f100`, bitmaps from
+`0x00050000`, palettes from `0x00058000`, DCs from `0x00060000`, image icons
+from `0x00090000`, pseudo modules from `0x60000000`.
 
 `loader_init_context` sets the process-start CPU state: x87 control word
 `0x037f`, clear status word, all-empty tag word `0xffff`, `fpu_top` 0, and
@@ -118,8 +125,9 @@ into that form. It cannot work, because the host `setjmp` would belong to a
 frame that has returned by the time `_longjmp` fires, so it logs what the call
 site should emit and aborts.
 
-`RaiseException` and `RtlUnwind` log their arguments and abort: there is no SEH
-here, so continuing would run the guest past a point Windows never reaches.
+`RaiseException` and `RtlUnwind` go through the guest exception checkpoints in
+`seh.cpp`. An exception the guest does not handle logs its state and aborts;
+continuing would run the guest past a point Windows never reaches.
 
 ## Behaviour worth knowing before you debug something
 
@@ -253,9 +261,9 @@ the configured guest root.
 ## Tests
 
 ```
-.venv/bin/python tools/test.py --native          # build and run
-.venv/bin/python tools/test.py --compile-only    # build only
-.venv/bin/ctest --preset macos -R runtime_tests  # one suite
+tools/.venv/bin/python tools/test.py --native          # build and run
+tools/.venv/bin/python tools/test.py --compile-only    # build only
+tools/.venv/bin/ctest --preset macos -R runtime_tests  # one suite
 ```
 
 Run from the repository root. The tests load the real EXE, cross-check the

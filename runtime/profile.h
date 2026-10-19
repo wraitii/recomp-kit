@@ -16,10 +16,10 @@ void sched_register_profile_slot(ProfileSlot *slot);
 ProfileSlot *sched_current_holder_slot();
 std::vector<ProfileSample> profile_snapshot();
 void profile_stop();
-// Task 0 wiring point: call once per measured frame with guest phase milliseconds.
-// No-op with profiling disabled (or invalid input). Until Task 0 calls this,
-// guest_ms_per_frame is omitted; enabled reporting averages the supplied frames.
-// This does not measure time or change guest/scheduler state.
+// Call once per measured frame with guest phase milliseconds. No-op with
+// profiling disabled (or invalid input). Until a caller supplies this,
+// guest_ms_per_frame is omitted; enabled reporting averages the supplied
+// frames. This does not measure time or change guest/scheduler state.
 void profile_note_guest_ms(double milliseconds);
 extern "C" {
 extern const int recomp_profile_enabled;

@@ -83,7 +83,7 @@ void paint(X86 *c, uint32_t hwnd, uint32_t into) {
             log_once(("static-bitmap:" + std::to_string(title_ordinal)).c_str(),
                      "STATIC SS_BITMAP: bitmap resource %u could not be decoded", title_ordinal);
     }
-    uint32_t units = text.empty() ? 0 : wide_units(text);
+    uint32_t units = text.empty() ? 0 : utf16_units(text);
     if (flags && units && units < (UINT32_MAX - 32) / 2) {
         if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
             wr32(block + 8, uint32_t(width));

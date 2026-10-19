@@ -11,7 +11,6 @@
 #include "loader.h"
 #include "win32.h"
 #include "thunks.h"
-#include "loader.h"
 #include "seh.h"
 #include "../platform/os.h"
 
@@ -196,14 +195,6 @@ uint32_t recomp_module_count(void) {
 const RecompModule *recomp_module_at(uint32_t i) {
     return i < modules().size() ? modules()[i] : nullptr;
 }
-const RecompModule *recomp_module_named(const char *name) {
-    if (!name)
-        return nullptr;
-    for (const RecompModule *m : modules())
-        if (os_strcasecmp(m->name, name) == 0)
-            return m;
-    return nullptr;
-}
 const RecompModule *recomp_module_containing(uint32_t addr) {
     const RecompModule *m = __atomic_load_n(&g_last_module, __ATOMIC_RELAXED);
     if (m && addr >= m->base && addr < m->end)
@@ -297,7 +288,8 @@ void recomp_shim_call(X86 *c, uint32_t target) {
 }
 
 void recomp_region_missing(X86 *c, uint32_t target) {
-    LOGW("recomp_region_missing: %08x is not an instruction of its decoded region (from=%08x)", target, c->eip);
+    LOGW("recomp_region_missing: %08x is not an instruction of its decoded region (from=%08x)",
+         target, c->eip);
     fflush(stdout);
     fflush(stderr);
     abort();
@@ -489,7 +481,8 @@ void recomp_x87_contract_violation(X86 *c, uint32_t addr, uint16_t mask, uint16_
 // model, or a branch it could not resolve. Continuing would run guessed code,
 // so this is fatal.
 void recomp_unmodelled(X86 *c, uint32_t addr) {
-    LOGW("untranslated instruction at %08x (ESP=%08x, return=%08x): the translation left a trap here",
+    LOGW("untranslated instruction at %08x (ESP=%08x, return=%08x): the translation left a trap "
+         "here",
          addr, c->r[R_ESP], rd32(c->r[R_ESP]));
     abort();
 }

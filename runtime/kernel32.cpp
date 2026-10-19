@@ -1705,7 +1705,7 @@ void k_GetEnvironmentStringsW(X86 *c) {
     if (!g_envblockw_addr || !heap_owns(g_envblockw_addr)) {
         uint32_t chars = 1;
         for (const auto &entry : guest_environment())
-            chars += (uint32_t)entry.size() * 2 + 1;
+            chars += utf16_units(entry) + 1;
         uint32_t a = heap_alloc(chars * 2, true);
         uint32_t at = a;
         for (const auto &entry : guest_environment())
@@ -2075,50 +2075,11 @@ void k_GetTimeZoneInformation(X86 *c) {
     set_eax(c, 0); // TIME_ZONE_ID_UNKNOWN
 }
 
-// ANSI twin of k_GetTimeFormatW (kernel32_wide.cpp); both share the picture
-// formatter so a caller that falls back from W to A sees the same text. The
-// only caller, TempleSaveGame::UpdateDateAndTime, reaches A when W fails.
+// ANSI twin of k_GetTimeFormatW (kernel32_wide.cpp); both share the input,
+// validation and buffer handling so a caller that falls back from W to A sees
+// the same text and errors.
 void k_GetTimeFormatA(X86 *c) {
-    uint32_t flags = arg(c, 1), input = arg(c, 2), picture = arg(c, 3);
-    uint32_t out = arg(c, 4), cap = arg(c, 5);
-    int hour, minute, second;
-    if (input) {
-        if (!gm_valid(input, 16)) {
-            set_last_error(87 /* ERROR_INVALID_PARAMETER */);
-            set_eax(c, 0);
-            return;
-        }
-        hour = rd16(input + 8);
-        minute = rd16(input + 10);
-        second = rd16(input + 12);
-    } else {
-        struct tm t{};
-        if (os_localtime((int64_t)(os_wall_time_us() / 1000000), &t) != 0) {
-            set_eax(c, 0);
-            return;
-        }
-        hour = t.tm_hour;
-        minute = t.tm_min;
-        second = t.tm_sec;
-    }
-    if (hour > 23 || minute > 59 || second > 59) {
-        set_last_error(87);
-        set_eax(c, 0);
-        return;
-    }
-    std::string text = kernel32_format_time(hour, minute, second,
-                                            picture ? gm_str(picture) : std::string(), flags);
-    uint32_t need = (uint32_t)text.size() + 1; // bytes, including the NUL
-    if (cap == 0) {
-        set_eax(c, need);
-        return;
-    }
-    if (!out || cap < need) {
-        set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */);
-        set_eax(c, 0);
-        return;
-    }
-    set_eax(c, gm_put_str(out, text.c_str(), cap) + 1);
+    kernel32_get_time_format(c, false);
 }
 
 // -------------------------------------------------------------------------
@@ -4117,9 +4078,10 @@ void k_SetUnhandledExceptionFilter(X86 *c) {
 void k_UnhandledExceptionFilter(X86 *c) {
     set_eax(c, 1);
 } // EXCEPTION_EXECUTE_HANDLER
-// There is no SEH in the runtime, so an exception the guest raises cannot be
-// delivered anywhere. Continuing would run the guest past a point it never
-// reaches on Windows, so both abort with the state that caused them.
+// RaiseException and RtlUnwind go through the guest exception checkpoints in
+// seh.cpp. An exception the guest does not handle cannot be delivered anywhere;
+// continuing would run the guest past a point it never reaches on Windows, so
+// an unhandled raise aborts with the state that caused it.
 } // namespace
 
 // Create the guest thread context and its cooperative host worker.
@@ -4630,9 +4592,7 @@ void get_environment_variable(X86 *c, bool wide) {
         if (eq != name.size() || os_strcasecmp(entry.substr(0, eq).c_str(), name.c_str()) != 0)
             continue;
         std::string value = entry.substr(eq + 1);
-        uint32_t length = 0;
-        for (unsigned char ch : value)
-            length += wide ? ((ch & 0xc0) != 0x80 ? (ch >= 0xf0 ? 2 : 1) : 0) : 1;
+        uint32_t length = wide ? utf16_units(value) : (uint32_t)value.size();
         uint32_t out = arg(c, 1), cap = arg(c, 2);
         if (cap <= length) {
             set_eax(c, length + 1);

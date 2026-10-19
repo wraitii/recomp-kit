@@ -63,6 +63,7 @@ extern uint8_t *g_mem;
  *                             loader (loader_image_limit()) for it.
  *   GUEST_HEAP_BASE..GUEST_HEAP_END  heap arena (configurable)
  *   0x0f000000                stack top, grows down (8 MB)
+ *   0x0f000000..0x0fd00000    mod heap (mods/guest_mem.cpp)
  *   0x0fe00000                TEB (FS base)
  *   0x0ff00000 + 16*i         import shim trampoline for import i
  */
@@ -799,7 +800,6 @@ typedef struct RecompModule {
 void recomp_module_register(const RecompModule *m);
 uint32_t recomp_module_count(void);
 const RecompModule *recomp_module_at(uint32_t i);
-const RecompModule *recomp_module_named(const char *name);
 const RecompModule *recomp_module_containing(uint32_t addr);
 /* Index into the owning module's tables, or -1 when no module has addr as an entry. */
 int32_t recomp_module_lookup(uint32_t target);

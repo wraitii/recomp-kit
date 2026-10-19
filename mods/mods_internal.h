@@ -21,10 +21,10 @@
 #define MODS_OWNER_LUA 1u
 #define MODS_OWNER_FIRST_MOD 2u
 
-// The mod heap: the gap between the game heap's HEAP_LIMIT (0x0e000000) and
-// the guest stack's lower limit (0x0ef00000), less a megabyte of guard.
-#define MOD_HEAP_BASE 0x0e000000u
-#define MOD_HEAP_END 0x0ee00000u
+// The mod heap: the gap above the guest stack, with a megabyte of guard below
+// the TEB. Stack growth is downward, so the region above STACK_TOP is unused.
+#define MOD_HEAP_BASE STACK_TOP
+#define MOD_HEAP_END (TEB_BASE - 0x00100000u)
 
 extern "C" {
 

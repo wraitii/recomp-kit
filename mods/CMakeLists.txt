@@ -107,7 +107,7 @@ if(TARGET recomp_gen AND NOT IOS AND NOT ANDROID)
   target_include_directories(mods_tests PRIVATE ${RECOMP_GAME_DIR})
   # Game-native translation sources can call the DirectX boundary. Supply its
   # null-host implementation so framework tests never create graphics/audio devices.
-  target_link_libraries(mods_tests PRIVATE recomp_platform recomp_runtime_testing recomp_snapshot recomp_dx_null recomp_mods_testing lua)
+  target_link_libraries(mods_tests PRIVATE recomp_platform recomp_runtime_testing recomp_dx_null recomp_mods_testing lua)
   target_compile_options(mods_tests PRIVATE ${RECOMP_WARN_HOST})
   recomp_optimize(mods_tests 1)
   recomp_link_gen(mods_tests)

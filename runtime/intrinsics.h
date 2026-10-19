@@ -31,8 +31,8 @@
 #include <setjmp.h>
 #include <stdint.h>
 
-#if __has_include("x86.h")
-#include "x86.h"
+#if __has_include("runtime/x86.h")
+#include "runtime/x86.h"
 #else
 #include "x86.h"
 #endif
@@ -40,10 +40,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/* Identity in the generated baseline; the native host overrides only the
- * audited visual phase reads, keeping the guest's render-frame ID intact. */
-uint32_t recomp_visual_animation_tick(uint32_t original_tick);
 
 /* Saves the guest register file, keyed by the guest jmp_buf at ESP+4, and
  * returns the host jmp_buf to pass to setjmp. */

@@ -1001,7 +1001,7 @@ void menu_string(X86 *c) {
         set_eax(c, 0);
         return;
     }
-    set_eax(c, !arg(c, 2) || !arg(c, 3) ? wide_units(m->text)
+    set_eax(c, !arg(c, 2) || !arg(c, 3) ? utf16_units(m->text)
                                         : put_text(arg(c, 2), arg(c, 3), m->text, true));
 }
 bool read_menu_info(uint32_t p, MenuItem *item) {
@@ -1061,7 +1061,7 @@ void get_menu_info(X86 *c) {
         wr32(p + 32, m->data);
     if ((mask & 0x40) || ((mask & 0x10) && !(m->type & 0x904))) {
         uint32_t out = rd32(p + 36), cap = rd32(p + 40);
-        wr32(p + 40, out && cap ? put_text(out, cap, m->text, true) : wide_units(m->text));
+        wr32(p + 40, out && cap ? put_text(out, cap, m->text, true) : utf16_units(m->text));
     }
     if (mask & 0x10) {
         if (m->type & 0x100)
