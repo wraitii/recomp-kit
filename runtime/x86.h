@@ -983,8 +983,9 @@ static inline void recomp_icall(X86 *c, uint32_t target, RecompICache *ic, uint3
                 return;
             }
         } else if (!__atomic_load_n(&recomp_slow[ic->index], __ATOMIC_RELAXED)) {
+            void (*fn)(X86 *) = ic->fn;
             recomp_execution_checkpoint(c);
-            ic->fn(c);
+            fn(c);
             return;
         }
     }
