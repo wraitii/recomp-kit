@@ -6895,6 +6895,7 @@ function	start	bytes	lengths
 	0060b820	30	
 	0060b840	144	
 	0060b8d0	135	
+	0060b960	54	
 	0060b9a0	90	
 	0060ba00	27	
 	0060ba20	42	
@@ -6903,7 +6904,6 @@ function	start	bytes	lengths
 	0060bab0	8	
 	0060bac0	8	
 	0060bad0	8	
-0060bae0	0060b960	54	
 	0060bae0	8	
 	0060baf0	103	
 	0060bb60	56	

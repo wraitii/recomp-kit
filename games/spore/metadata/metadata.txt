@@ -4,6 +4,6 @@ program=SporeApp.exe
 executable_sha256=99e5de9e5891421e518526080671844775198e0b6b125e8b71d54df821ce03c1
 language=x86:LE:32:default
 image_base=00400000
-functions=92557
+functions=92558
 instructions=4646000
 instruction_bytes=15477395
