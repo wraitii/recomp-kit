@@ -108,6 +108,7 @@ def pack(export_root, executable, out, base=None):
         raise ValueError('export image base does not match the mapped image')
     lifter = Lifter()
     rows = [SPANS_HEADER]
+    owners = set()
     explicit = 0
     for row in (export_root / 'instruction_map.tsv').read_text().splitlines()[1:]:
         function, start, lengths = row.split('\t')
@@ -115,9 +116,11 @@ def pack(export_root, executable, out, base=None):
         size = sum(int(c, 16) for c in lengths)
         keep = '' if linear_lengths(lifter, image, addr, size) == lengths else lengths
         explicit += bool(keep)
+        owners.add(int(function, 16) if function != start else addr)
         rows.append('%s\t%s\t%d\t%s' % ('' if function == start else function, start, size, keep))
     out.mkdir(parents=True, exist_ok=True)
     metadata['format'] = FORMAT
+    metadata['functions'] = str(len(owners))
     (out / 'metadata.txt').write_text(''.join('%s=%s\n' % item for item in metadata.items()))
     (out / 'spans.tsv').write_text('\n'.join(rows) + '\n')
     for name, header in (('tables.tsv', TABLES_HEADER), ('entries.tsv', ENTRIES_HEADER),

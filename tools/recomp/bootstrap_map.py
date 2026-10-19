@@ -20,6 +20,15 @@ from ir.lift import Lifter
 from program import PE, TranslateError
 
 
+RANK_TRUSTED = 100
+RANK_MAPPED_FLOW = 90
+RANK_RELOCATED_FLOW = 70
+RANK_RELOCATION = 60
+RANK_RELOCATED_IMMEDIATE = 55
+RANK_SWEEP = 30
+RANK_POINTER = 20
+
+
 class Recovery:
     def __init__(self, executable, base):
         self.pe = pefile.PE(str(executable))
@@ -36,7 +45,11 @@ class Recovery:
         self.instructions = {}
         self.covered = {}
         self.speculative = set()
+        self.speculative_seeds = set()
         self.trusted_seeds = set()
+        self.seed_rank = {}
+        self.instruction_rank = {}
+        self.discarded_seeds = []
         self.ghidra_spans = []
         self.ghidra_lengths = {}
         self.source_lifter = None
@@ -102,7 +115,7 @@ class Recovery:
             self.data_ranges.append((self.image.base + start, self.image.base + end, "PDB data"))
             self.known_mask[start:end] = b"\x01" * (end - start)
         for rva in evidence.get("entries", ()):
-            self.seed(self.image.base + rva, "PDB entry", True)
+            self.seed(self.image.base + rva, "PDB entry", RANK_TRUSTED, root=True)
         self.function_ranges = [(self.image.base + lo, self.image.base + hi, self.image.base + entry)
                                 for lo, hi, entry in evidence.get("functions", ())]
         self.function_starts = [lo for lo, _, _ in self.function_ranges]
@@ -140,7 +153,7 @@ class Recovery:
                 return at + step
         return None
 
-    def seed(self, target, evidence, root=False, speculative=False):
+    def seed(self, target, evidence, rank, root=False):
         if not self.image.is_exec(target):
             return
         if evidence.startswith("direct:") and self.at_known_data(target):
@@ -150,25 +163,43 @@ class Recovery:
             return
         if root:
             self.roots.add(target)
-        first = target not in self.seeds
+        old_rank = self.seed_rank.get(target)
+        effective = rank if old_rank is None else max(rank, old_rank)
+        first = old_rank is None or effective > old_rank
         self.seeds[target].add(evidence)
-        if not speculative:
+        self.seed_rank[target] = effective
+        if effective >= RANK_TRUSTED:
+            self.speculative_seeds.discard(target)
             self.trusted_seeds.add(target)
+        elif target not in self.trusted_seeds:
+            self.speculative_seeds.add(target)
         owner = self.covered.get(target)
-        if evidence.startswith("direct:") and not speculative and owner not in (None, target):
-            while owner not in (None, target):
-                self.retract(owner)
-                owner = self.covered.get(target)
-            first = True
-        if owner in self.speculative and (owner != target or not speculative):
+        while owner not in (None, target) and self.instruction_rank.get(owner, 0) < effective:
             self.retract(owner)
+            owner = self.covered.get(target)
             first = True
-        elif owner is not None and owner != target:
-            if not speculative:
+        if owner == target:
+            if self.instruction_rank.get(target, 0) < effective:
+                self.retract(target)
+                first = True
+        elif owner is not None:
+            if effective >= RANK_TRUSTED:
                 self.conflicts.add((target, owner, evidence))
+            elif effective < self.instruction_rank.get(owner, 0):
+                self.discard_seed(target, "covered by %08x rank %d" % (owner, self.instruction_rank[owner]))
             return
         if first:
             self.pending.append(target)
+
+    def discard_seed(self, target, reason):
+        evidence = sorted(self.seeds.pop(target, ()))
+        if not evidence:
+            return
+        self.seed_rank.pop(target, None)
+        self.speculative_seeds.discard(target)
+        self.trusted_seeds.discard(target)
+        self.roots.discard(target)
+        self.discarded_seeds.append((target, reason, tuple(evidence)))
 
     def ghidra_owner(self, target):
         for start, end, owner in self.ghidra_spans:
@@ -184,24 +215,29 @@ class Recovery:
 
     def retract(self, address):
         self.speculative.discard(address)
+        self.instruction_rank.pop(address, None)
         size = self.instructions.pop(address).size
         for at in range(address, address + size):
             if self.covered.get(at) == address:
                 del self.covered[at]
 
-    def pointer_source(self, slot, target):
-        index = bisect.bisect_right(self.ghidra_spans, (slot + 3, 1 << 32, 0)) - 1
-        if index < 0 or self.ghidra_spans[index][1] <= slot:
-            return True
-        start, end, _ = self.ghidra_spans[index]
+    def span_lengths(self, start, end):
         lengths = self.ghidra_lengths.get(start)
         if not lengths:
             if self.source_lifter is None:
                 self.source_lifter = Lifter()
             lengths = code_map.linear_lengths(self.source_lifter, self.image, start, end - start)
             if lengths is None:
-                raise TranslateError("%08x: cannot recover mapped pointer-source instruction boundaries" % start)
+                raise TranslateError("%08x: cannot recover mapped instruction boundaries" % start)
             self.ghidra_lengths[start] = lengths
+        return lengths
+
+    def pointer_source(self, slot, target):
+        index = bisect.bisect_right(self.ghidra_spans, (slot + 3, 1 << 32, 0)) - 1
+        if index < 0 or self.ghidra_spans[index][1] <= slot:
+            return True
+        start, end, _ = self.ghidra_spans[index]
+        lengths = self.span_lengths(start, end)
         if slot < start or slot + 4 > end:
             return False
         at = start
@@ -246,41 +282,52 @@ class Recovery:
                 return False
         return True
 
-    def record(self, ins, speculative=False):
+    def record(self, ins, rank, flow=False):
+        speculative = rank < RANK_TRUSTED
         if self.pointer_run_at(ins.address):
             return False
         span = range(ins.address, ins.address + ins.size)
         if any(self.at_known_data(at) for at in span):
             return False
+        retract = set()
         for at in span:
             owner = self.covered.get(at)
-            if owner is not None and owner != ins.address and (speculative or owner not in self.speculative):
-                if not speculative:
-                    self.conflicts.add((ins.address, owner, "overlapping decode"))
-                return False
-            if at != ins.address and at in self.seeds and (speculative or at in self.trusted_seeds):
-                if not speculative:
-                    self.conflicts.add((at, ins.address, "; ".join(sorted(self.seeds[at]))))
-                return False
-        if not speculative:
-            for at in span:
-                owner = self.covered.get(at)
-                if owner in self.speculative and owner != ins.address:
-                    self.retract(owner)
+            if owner is not None and owner != ins.address:
+                owner_rank = self.instruction_rank.get(owner, 0)
+                if owner_rank > rank or (owner_rank == rank and not (flow and owner in self.speculative)):
+                    if rank >= RANK_TRUSTED:
+                        self.conflicts.add((ins.address, owner, "overlapping decode"))
+                    return False
+                retract.add(owner)
+            if at != ins.address and at in self.seeds:
+                if self.seed_rank.get(at, 0) >= rank:
+                    if rank >= RANK_TRUSTED:
+                        self.conflicts.add((at, ins.address, "; ".join(sorted(self.seeds[at]))))
+                    return False
+                self.discard_seed(at, "covered by %08x rank %d" % (ins.address, rank))
+        for owner in retract:
+            if owner in self.instructions and (self.instruction_rank[owner] < rank
+                                                or flow and owner in self.speculative):
+                self.retract(owner)
         self.instructions[ins.address] = ins
         self.covered.update((at, ins.address) for at in span)
+        self.instruction_rank[ins.address] = rank
         if speculative:
             self.speculative.add(ins.address)
         if ins.group(capstone.CS_GRP_CALL) or ins.group(capstone.CS_GRP_JUMP):
             if ins.operands and ins.operands[0].type == x86.X86_OP_IMM:
                 target = ins.operands[0].imm & 0xffffffff
-                self.seed(target, "direct:%08x" % ins.address, ins.group(capstone.CS_GRP_CALL) and not speculative, speculative)
+                call = ins.group(capstone.CS_GRP_CALL)
+                self.seed(target, "direct:%08x" % ins.address, rank, root=call and rank >= RANK_MAPPED_FLOW)
         return True
 
     def trace(self):
         while self.pending:
             at = self.pending.popleft()
-            speculative = at not in self.trusted_seeds
+            if at not in self.seeds:
+                continue
+            rank = self.seed_rank.get(at, RANK_SWEEP)
+            speculative = rank < RANK_TRUSTED
             while self.image.is_exec(at):
                 if self.at_known_data(at):
                     owner = self.ghidra_owner(at)
@@ -289,32 +336,33 @@ class Recovery:
                     break
                 if at in self.covered:
                     owner = self.covered[at]
-                    if speculative or owner not in self.speculative:
-                        if owner != at and not speculative:
-                            self.conflicts.add((at, owner, "entry alignment"))
-                        break
-                    self.retract(owner)
-                    continue
+                    owner_rank = self.instruction_rank.get(owner, 0)
+                    if rank > owner_rank or (rank == owner_rank and owner != at and owner in self.speculative):
+                        self.retract(owner)
+                        continue
+                    if owner != at and not speculative:
+                        self.conflicts.add((at, owner, "entry alignment"))
+                    break
                 ins = self.decode(at)
-                if ins is None or not self.record(ins, speculative):
+                if ins is None or not self.record(ins, rank, flow=True):
                     break
                 if ins.group(capstone.CS_GRP_RET) or ins.group(capstone.CS_GRP_IRET) or ins.mnemonic in ("jmp", "ljmp", "int3", "ud2"):
                     break
                 at += ins.size
 
     def initial_seeds(self):
-        self.seed(self.image.base + self.pe.OPTIONAL_HEADER.AddressOfEntryPoint, "PE entry", True)
+        self.seed(self.image.base + self.pe.OPTIONAL_HEADER.AddressOfEntryPoint, "PE entry", RANK_TRUSTED, root=True)
         for symbol in getattr(getattr(self.pe, "DIRECTORY_ENTRY_EXPORT", None), "symbols", ()):
             if not symbol.forwarder:
-                self.seed(self.image.base + symbol.address, "export:%d" % symbol.ordinal, True)
+                self.seed(self.image.base + symbol.address, "export:%d" % symbol.ordinal, RANK_TRUSTED, root=True)
         for target, slot in self.relocations:
             if not self.image.is_exec(slot) and not self.at_known_data(target):
-                self.seed(target, "relocation:%08x" % slot, False, True)
+                self.seed(target, "relocation:%08x" % slot, RANK_RELOCATION)
         tls = getattr(self.pe, "DIRECTORY_ENTRY_TLS", None)
         if tls and tls.struct.AddressOfCallBacks:
             at = tls.struct.AddressOfCallBacks + self.delta
             while self.image.rd32(at):
-                self.seed(self.image.rd32(at), "TLS:%08x" % at, True)
+                self.seed(self.image.rd32(at), "TLS:%08x" % at, RANK_TRUSTED, root=True)
                 at += 4
         self.trace()
         for target, slot in self.relocations:
@@ -322,7 +370,38 @@ class Recovery:
             ins = self.instructions.get(owner)
             if ins and any(op.type == x86.X86_OP_IMM and op.imm & 0xffffffff == target for op in ins.operands):
                 if not self.at_known_data(target):
-                    self.seed(target, "relocated-immediate:%08x" % owner, False, True)
+                    rank = (RANK_RELOCATED_FLOW if ins.group(capstone.CS_GRP_CALL) or ins.group(capstone.CS_GRP_JUMP)
+                            else RANK_RELOCATED_IMMEDIATE)
+                    self.seed(target, "relocated-immediate:%08x" % owner, rank)
+        self.trace()
+
+    def direct_flow_target(self, at, size):
+        raw = bytes(self.image.bytes_at(at, size))
+        first = raw[0] if raw else 0
+        prefixes = {0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0x66, 0x67, 0xf0, 0xf2, 0xf3}
+        if first not in prefixes and first not in (0xe8, 0xe9, 0xeb, 0x0f) and not 0x70 <= first <= 0x7f:
+            return None
+        ins = next(self.md.disasm(raw, at, count=1), None)
+        if ins is None or ins.size != size or not ins.operands:
+            return None
+        if not (ins.group(capstone.CS_GRP_CALL) or ins.group(capstone.CS_GRP_JUMP)):
+            return None
+        operand = ins.operands[0]
+        if operand.type != x86.X86_OP_IMM:
+            return None
+        return operand.imm & 0xffffffff, ins.group(capstone.CS_GRP_CALL)
+
+    def mapped_flow_seeds(self):
+        for start, end, _ in self.ghidra_spans:
+            at = start
+            for length in self.span_lengths(start, end):
+                size = int(length, 16)
+                flow = self.direct_flow_target(at, size)
+                if flow is not None:
+                    target, call = flow
+                    if not self.at_known_data(target):
+                        self.seed(target, "mapped-flow:%08x" % at, RANK_MAPPED_FLOW, root=call)
+                at += size
         self.trace()
 
     def pointer_tables(self):
@@ -335,6 +414,7 @@ class Recovery:
         for section in self.pe.sections:
             if not section.Characteristics & 0x40000000:
                 continue
+            executable_section = bool(section.Characteristics & 0x20000000)
             start = base + section.VirtualAddress
             end = start + section.SizeOfRawData
             data = memoryview(self.image.data)[start - base:end - base]
@@ -346,6 +426,8 @@ class Recovery:
                     if not (0 <= relative < size and executable[relative]):
                         continue
                     offset = start - base + alignment + index * 4
+                    if executable_section and base + offset not in self.reloc_slots:
+                        continue
                     if blocked.find(b"\x01", offset, offset + 4) != -1:
                         continue
                     original = int.from_bytes(self.original[offset:offset + 4], "little") + self.delta
@@ -363,7 +445,7 @@ class Recovery:
                     self.tables.append((slots[0][0], at))
                     for slot, target in slots:
                         if not self.at_known_data(target) and self.pointer_source(slot, target):
-                            self.seed(target, "pointer-run:%08x" % slot, False, True)
+                            self.seed(target, "pointer-run:%08x" % slot, RANK_POINTER)
                 next_at = at if len(slots) >= 2 else slots[0][0] + 1
         self.trace()
 
@@ -447,11 +529,21 @@ class Recovery:
                     self.gaps.append((at, data_start, "data-boundary"))
                     at = data_start
                     continue
-                if any(inner in self.covered or inner in self.seeds for inner in range(at + 1, at + ins.size)):
+                rank = max(RANK_SWEEP, self.seed_rank.get(at, 0))
+                blocked = False
+                for inner in range(at + 1, at + ins.size):
+                    owner = self.covered.get(inner)
+                    if owner is not None and self.instruction_rank.get(owner, 0) >= rank:
+                        blocked = True
+                        break
+                    if inner in self.seeds and self.seed_rank.get(inner, 0) >= rank:
+                        blocked = True
+                        break
+                if blocked:
                     self.gaps.append((at, at + 1, "sweep-padding"))
                     at += 1
                     continue
-                if not self.record(ins, True):
+                if not self.record(ins, rank):
                     at += 1
                     continue
                 self.trace()
@@ -475,6 +567,9 @@ class Recovery:
                            "kind": "shared" if a in self.instructions else "rejected"}
                           for a, b, evidence in sorted(self.conflicts)],
             "seeds": {"%08x" % at: sorted(evidence) for at, evidence in sorted(self.seeds.items())},
+            "seed_ranks": {"%08x" % at: self.seed_rank[at] for at in sorted(self.seed_rank)},
+            "discarded_seeds": [{"address": "%08x" % at, "reason": reason, "evidence": list(evidence)}
+                                for at, reason, evidence in self.discarded_seeds],
         }
 
     def code_map_rows(self, body_bytes=4096):
@@ -562,6 +657,7 @@ def build(executable, base, evidence, extra_data, exclude_map=None):
         recovery.data_ranges.append((lo, hi, kind))
         recovery.known_mask[lo - recovery.image.base:hi - recovery.image.base] = b"\x01" * (hi - lo)
     recovery.initial_seeds()
+    recovery.mapped_flow_seeds()
     recovery.pointer_tables()
     recovery.index_tables()
     recovery.sweep()
