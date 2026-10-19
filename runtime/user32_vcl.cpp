@@ -336,6 +336,35 @@ void get_parent(X86 *c) {
     Window *w = find_window(arg(c, 0));
     set_eax(c, w ? (w->parent ? w->parent : w->owner) : 0);
 }
+void get_ancestor(X86 *c) {
+    enum : uint32_t { GA_PARENT = 1, GA_ROOT = 2, GA_ROOTOWNER = 3 };
+    uint32_t hwnd = arg(c, 0), flags = arg(c, 1);
+    Window *w = find_window(hwnd);
+    if (!w) {
+        set_eax(c, 0);
+        return;
+    }
+    if (flags == GA_PARENT) {
+        set_eax(c, hwnd == desktop_handle ? 0 : (w->parent ? w->parent : desktop_handle));
+        return;
+    }
+    if (flags != GA_ROOT && flags != GA_ROOTOWNER) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t current = hwnd;
+    for (size_t n = 0; n <= windows().size(); ++n) {
+        w = find_window(current);
+        if (!w)
+            break;
+        uint32_t next = flags == GA_ROOT ? w->parent : (w->parent ? w->parent : w->owner);
+        if (!next || next == current)
+            break;
+        current = next;
+    }
+    set_eax(c, current);
+}
 void set_parent(X86 *c) {
     Window *w = find_window(arg(c, 0));
     uint32_t parent = arg(c, 1);
@@ -1565,6 +1594,7 @@ const ImportShim shims[] = {
     U("RemovePropW", 2, remove_prop),
     U("SetParent", 2, set_parent),
     U("GetParent", 1, get_parent),
+    U("GetAncestor", 2, get_ancestor),
     U("IsChild", 2, child_of),
     U("EnumChildWindows", 3, enum_children),
     U("EnumThreadWindows", 3, enum_thread),

@@ -30,7 +30,7 @@ void mock_steam_apps(X86 *c) {
         g_mock_steam_vtable = heap_alloc(8 * 4, true);
         g_mock_steam_apps = heap_alloc(4, true);
         uint32_t owns = imports_alloc_trampoline("steam_api.dll", "__recomp_mock_steam_apps_owns",
-                                                 mock_owns_app, ARGC_CDECL);
+                                                 mock_owns_app, 1);
         if (g_mock_steam_vtable && g_mock_steam_apps && owns) {
             wr32(g_mock_steam_vtable + 6 * 4, owns);
             wr32(g_mock_steam_apps, g_mock_steam_vtable);

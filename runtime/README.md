@@ -185,7 +185,7 @@ they are ready by setting a field it polls and then loop on
 `WaitForSingleObject` for the rest of the process, so a body run to completion
 inside `CreateThread` never comes back.
 
-Each guest thread owns a register file, a 256 KB guest stack, a TEB and a TLS
+Each guest thread owns a register file, a 1 MB guest stack, a TEB and a TLS
 array, and runs on its own host thread so guest code can nest host C frames
 freely. **Exactly one of them executes at a time**, named by a baton held
 under a mutex. Nothing in the guest arena, the shims or the generated code
@@ -219,6 +219,11 @@ run deadline ends the process in that case.
 **A wait is taken when it is granted.** The scheduler decrements the semaphore,
 clears the auto-reset event or takes the mutex at the moment it releases a
 waiter, so one signal releases exactly one of them.
+
+**APCs are queued per thread and delivered at an alertable wait.**
+`QueueUserAPC` appends the routine and wakes an alertable waiter;
+`WaitForSingleObjectEx` and `SleepEx` run queued routines and report
+`WAIT_IO_COMPLETION`. Non-alertable waits leave them queued.
 
 **Suspension is a count.** `SuspendThread` and `ResumeThread` both return the
 previous count and a thread runs again only at zero, so two suspends need two

@@ -1184,6 +1184,21 @@ void o_CoInitialize(X86 *c) {
 void o_CoUninitialize(X86 *c) {
     set_eax(c, 0);
 }
+void o_CoLockObjectExternal(X86 *c) {
+    log_once("ole32:CoLockObjectExternal",
+             "ole32!CoLockObjectExternal: external COM locking is not modelled; S_OK");
+    set_eax(c, 0);
+}
+void o_RegisterDragDrop(X86 *c) {
+    log_once("ole32:RegisterDragDrop",
+             "ole32!RegisterDragDrop: OLE drag-and-drop is not modelled; S_OK");
+    set_eax(c, 0);
+}
+void o_RevokeDragDrop(X86 *c) {
+    log_once("ole32:RevokeDragDrop",
+             "ole32!RevokeDragDrop: OLE drag-and-drop is not modelled; S_OK");
+    set_eax(c, 0);
+}
 
 // Generate a version-4 GUID using host entropy, without consuming guest RNG.
 // GUID Data1/2/3 are little endian, so the version nibble resides in byte 7.
@@ -1374,6 +1389,9 @@ void i_ImmGetProperty(X86 *c) {
 }
 void i_ImmGetDescriptionA(X86 *c) {
     set_eax(c, 0);
+}
+void i_ImmDisableTextFrameService(X86 *c) {
+    set_eax(c, 1);
 }
 
 // -------------------------------------------------------------------------
@@ -2940,6 +2958,9 @@ const ImportShim g_misc_shims[] = {
     {"ole32.dll", "OleInitialize", 1, o_CoInitialize},
     {"ole32.dll", "OleUninitialize", 0, o_CoUninitialize},
     {"ole32.dll", "CoInitializeEx", 2, o_CoInitialize},
+    {"ole32.dll", "CoLockObjectExternal", 3, o_CoLockObjectExternal},
+    {"ole32.dll", "RegisterDragDrop", 2, o_RegisterDragDrop},
+    {"ole32.dll", "RevokeDragDrop", 1, o_RevokeDragDrop},
     {"ole32.dll", "CoTaskMemAlloc", 1, o_CoTaskMemAlloc},
     {"ole32.dll", "CoTaskMemFree", 1, o_CoTaskMemFree},
     {"ole32.dll", "StringFromCLSID", 2, o_StringFromCLSID},
@@ -2962,6 +2983,7 @@ const ImportShim g_misc_shims[] = {
     {"IMM32.dll", "ImmDestroyContext", 1, i_ImmDestroyContext},
     {"IMM32.dll", "ImmGetProperty", 2, i_ImmGetProperty},
     {"IMM32.dll", "ImmGetDescriptionA", 3, i_ImmGetDescriptionA},
+    {"IMM32.dll", "ImmDisableTextFrameService", 1, i_ImmDisableTextFrameService},
     // WSOCK32. D3DPopTB.exe imports these five by ordinal, so each shim is
     // registered under both the ordinal the IAT uses and the documented name
     // (which is what GetProcAddress would ask for).

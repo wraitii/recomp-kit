@@ -531,6 +531,21 @@ void g_CreateCompatibleDC(X86 *c) {
     set_eax(c, hdc);
 }
 
+void g_CreateDCA(X86 *c) {
+    uint32_t hdc = gdi_window_dc(0);
+    if (recomp_env("TRACE_GDI"))
+        LOGW("gdi: CreateDCA(\"%s\", \"%s\") -> %08x", gm_str(arg(c, 0)).c_str(),
+             gm_str(arg(c, 1)).c_str(), hdc);
+    set_eax(c, hdc);
+}
+
+void g_ExtEscape(X86 *c) {
+    char key[48];
+    snprintf(key, sizeof key, "gdi:ExtEscape:%u", arg(c, 1));
+    log_once(key, "gdi: ExtEscape(%u) is not implemented; returning 0", arg(c, 1));
+    set_eax(c, 0);
+}
+
 void g_DeleteDC(X86 *c) {
     set_eax(c, dcs().erase(arg(c, 0)) ? 1 : 0);
 }
@@ -780,6 +795,8 @@ const ImportShim g_gdi32_shims[] = {
     {"GDI32.dll", "GetObjectW", 3, g_GetObjectA},
     {"GDI32.dll", "DeleteObject", 1, g_DeleteObject},
     {"GDI32.dll", "CreateCompatibleDC", 1, g_CreateCompatibleDC},
+    {"GDI32.dll", "CreateDCA", 4, g_CreateDCA},
+    {"GDI32.dll", "ExtEscape", 6, g_ExtEscape},
     {"GDI32.dll", "DeleteDC", 1, g_DeleteDC},
     {"GDI32.dll", "SelectObject", 2, g_SelectObject},
     {"GDI32.dll", "SetDIBColorTable", 4, g_SetDIBColorTable},

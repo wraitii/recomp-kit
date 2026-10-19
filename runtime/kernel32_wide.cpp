@@ -15,6 +15,82 @@
 #include <cctype>
 
 namespace {
+// gm_wstr produces valid UTF-8. Count UTF-16 units, including surrogate pairs.
+uint32_t utf16_units(const std::string &s) {
+    uint32_t n = 0;
+    for (unsigned char ch : s) {
+        if ((ch & 0xc0) != 0x80)
+            n += ch >= 0xf0 ? 2 : 1;
+    }
+    return n;
+}
+
+const uint16_t kCp1252High[32] = {
+    0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021, 0x02c6, 0x2030, 0x0160,
+    0x2039, 0x0152, 0x008d, 0x017d, 0x008f, 0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022,
+    0x2013, 0x2014, 0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178};
+
+std::string ansi_to_utf8(const std::string &s) {
+    std::string out;
+    for (unsigned char b : s) {
+        uint32_t u = b >= 0x80 && b <= 0x9f ? kCp1252High[b - 0x80] : b;
+        if (u < 0x80) {
+            out += (char)u;
+        } else if (u < 0x800) {
+            out += (char)(0xc0 | (u >> 6));
+            out += (char)(0x80 | (u & 0x3f));
+        } else {
+            out += (char)(0xe0 | (u >> 12));
+            out += (char)(0x80 | ((u >> 6) & 0x3f));
+            out += (char)(0x80 | (u & 0x3f));
+        }
+    }
+    return out;
+}
+
+std::string utf8_to_ansi(const std::string &s) {
+    std::string out;
+    for (size_t i = 0; i < s.size();) {
+        unsigned char first = (unsigned char)s[i++];
+        uint32_t u = first, extra = 0;
+        if ((first & 0xe0) == 0xc0) {
+            u = first & 0x1f;
+            extra = 1;
+        } else if ((first & 0xf0) == 0xe0) {
+            u = first & 0x0f;
+            extra = 2;
+        } else if ((first & 0xf8) == 0xf0) {
+            u = first & 0x07;
+            extra = 3;
+        }
+        bool valid = i + extra <= s.size();
+        for (uint32_t k = 0; valid && k < extra; ++k) {
+            unsigned char next = (unsigned char)s[i++];
+            valid = (next & 0xc0) == 0x80;
+            u = (u << 6) | (next & 0x3f);
+        }
+        if (!valid || u > 0xffff) {
+            out += '?';
+            continue;
+        }
+        if (u <= 0xff && !(u >= 0x80 && u <= 0x9f)) {
+            out += (char)u;
+            continue;
+        }
+        bool found = false;
+        for (uint32_t k = 0; k < 32; ++k) {
+            if (kCp1252High[k] == u) {
+                out += (char)(0x80 + k);
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            out += '?';
+    }
+    return out;
+}
+
 void k_CreateFileW(X86 *c) {
     create_file_named(c, gm_wstr(arg(c, 0)));
 }
@@ -92,6 +168,17 @@ void k_GetFullPathNameW(X86 *c) {
              buf + (slash == std::string::npos ? 0 : 2 * utf16_units(full.substr(0, slash + 1))));
     }
     set_eax(c, n);
+}
+void k_GetLongPathNameW(X86 *c) {
+    std::string path = gm_wstr(arg(c, 0));
+    std::replace(path.begin(), path.end(), '/', '\\');
+    uint32_t len = arg(c, 2), buf = arg(c, 1);
+    uint32_t need = utf16_units(path) + 1;
+    if (!buf || len < need) {
+        set_eax(c, need);
+        return;
+    }
+    set_eax(c, gm_put_wstr(buf, path, len));
 }
 void k_GetSystemDirectoryW(X86 *c) {
     const std::string dir = "C:\\Windows\\System32";
@@ -549,7 +636,46 @@ void k_GetDateFormatW(X86 *c) {
 // ignores it. lpTime NULL means the current local time; lpFormat NULL means the
 // locale's default picture. cchTime == 0 is a size query that writes nothing.
 void k_GetTimeFormatW(X86 *c) {
-    kernel32_get_time_format(c, true);
+    uint32_t flags = arg(c, 1), input = arg(c, 2), picture = arg(c, 3);
+    uint32_t out = arg(c, 4), cap = arg(c, 5);
+    int hour, minute, second;
+    if (input) {
+        if (!gm_valid(input, 16)) {
+            set_last_error(87 /* ERROR_INVALID_PARAMETER */);
+            set_eax(c, 0);
+            return;
+        }
+        hour = rd16(input + 8);
+        minute = rd16(input + 10);
+        second = rd16(input + 12);
+    } else {
+        struct tm t{};
+        if (os_localtime((int64_t)(os_wall_time_us() / 1000000), &t) != 0) {
+            set_eax(c, 0);
+            return;
+        }
+        hour = t.tm_hour;
+        minute = t.tm_min;
+        second = t.tm_sec;
+    }
+    if (hour > 23 || minute > 59 || second > 59) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    std::string text = kernel32_format_time(hour, minute, second,
+                                            picture ? gm_wstr(picture) : std::string(), flags);
+    uint32_t need = utf16_units(text) + 1; // WCHAR count, including the NUL
+    if (cap == 0) {
+        set_eax(c, need);
+        return;
+    }
+    if (!out || cap < need) {
+        set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */);
+        set_eax(c, 0);
+        return;
+    }
+    set_eax(c, gm_put_wstr(out, text, cap) + 1);
 }
 
 uint32_t g_thread_lcid = 0x0409; // The runtime exposes one process-wide locale.
@@ -952,12 +1078,26 @@ void k_SizeofResource(X86 *c) {
 void k_FreeResource(X86 *c) {
     set_eax(c, 0);
 } // PE resources remain image-backed.
-void k_EnumResourceNamesW(X86 *c) {
+void enum_resource_names(X86 *c, bool wide) {
     uint32_t module = arg(c, 0), type = arg(c, 1), callback = arg(c, 2), param = arg(c, 3);
     std::vector<ResourceName> names;
-    uint32_t image;
-    if (!callback || !resource_module(module, image) ||
-        !resource_names(type, &names, nullptr, image)) {
+    uint32_t image, lookup_type = type, type_storage = 0;
+    bool valid = callback && resource_module(module, image);
+    if (valid && !wide && type > 0xffff) {
+        std::string text = ansi_to_utf8(gm_str(type));
+        uint32_t cap = (uint32_t)text.size() + 1;
+        type_storage = heap_alloc(cap, true);
+        if (!type_storage) {
+            set_last_error(8);
+            set_eax(c, 0);
+            return;
+        }
+        gm_put_str(type_storage, text.c_str(), cap);
+        lookup_type = type_storage;
+    }
+    if (!valid || !resource_names(lookup_type, &names, nullptr, image, wide)) {
+        if (type_storage)
+            heap_free(type_storage);
         set_last_error(1814);
         set_eax(c, 0);
         return;
@@ -965,14 +1105,20 @@ void k_EnumResourceNamesW(X86 *c) {
     for (const auto &name : names) {
         uint32_t guest_name = name.id, temporary = 0;
         if (name.is_string) {
-            uint32_t cap = utf16_units(name.name) + 1;
-            temporary = heap_alloc(cap * 2, true);
+            std::string ansi = wide ? name.name : utf8_to_ansi(name.name);
+            uint32_t cap = wide ? utf16_units(name.name) + 1 : (uint32_t)ansi.size() + 1;
+            temporary = heap_alloc(cap * (wide ? 2 : 1), true);
             if (!temporary) {
+                if (type_storage)
+                    heap_free(type_storage);
                 set_last_error(8);
                 set_eax(c, 0);
                 return;
             }
-            gm_put_wstr(temporary, name.name, cap);
+            if (wide)
+                gm_put_wstr(temporary, name.name, cap);
+            else
+                gm_put_str(temporary, ansi.c_str(), cap);
             guest_name = temporary;
         }
         uint32_t keep_going = guest_call(c, callback, module, type, guest_name, param);
@@ -981,7 +1127,15 @@ void k_EnumResourceNamesW(X86 *c) {
         if (!keep_going)
             break;
     }
+    if (type_storage)
+        heap_free(type_storage);
     set_eax(c, 1);
+}
+void k_EnumResourceNamesW(X86 *c) {
+    enum_resource_names(c, true);
+}
+void k_EnumResourceNamesA(X86 *c) {
+    enum_resource_names(c, false);
 }
 
 static const ImportShim g_kernel32_wide[] = {
@@ -990,6 +1144,7 @@ static const ImportShim g_kernel32_wide[] = {
     {"KERNEL32.dll", "LockResource", 1, k_LockResource},
     {"KERNEL32.dll", "SizeofResource", 2, k_SizeofResource},
     {"KERNEL32.dll", "FreeResource", 1, k_FreeResource},
+    {"KERNEL32.dll", "EnumResourceNamesA", 4, k_EnumResourceNamesA},
     {"KERNEL32.dll", "EnumResourceNamesW", 4, k_EnumResourceNamesW},
 
     {"KERNEL32.dll", "GetCommandLineW", 0, k_GetCommandLineW},
@@ -1048,6 +1203,7 @@ static const ImportShim g_kernel32_wide[] = {
     {"KERNEL32.dll", "FindFirstFileW", 2, k_FindFirstFileW},
     {"KERNEL32.dll", "FindNextFileW", 2, k_FindNextFileW},
     {"KERNEL32.dll", "GetFullPathNameW", 4, k_GetFullPathNameW},
+    {"KERNEL32.dll", "GetLongPathNameW", 3, k_GetLongPathNameW},
     {"KERNEL32.dll", "SetCurrentDirectoryW", 1, k_SetCurrentDirectoryW},
     {"KERNEL32.dll", "GetCurrentDirectoryW", 2, k_GetCurrentDirectoryW},
     {"KERNEL32.dll", "GetFileAttributesW", 1, k_GetFileAttributesW},
@@ -1066,50 +1222,6 @@ static const ImportShim g_kernel32_wide[] = {
     {"KERNEL32.dll", "QueryDosDeviceW", 3, k_QueryDosDeviceW},
 };
 } // namespace
-
-void kernel32_get_time_format(X86 *c, bool wide) {
-    uint32_t flags = arg(c, 1), input = arg(c, 2), picture = arg(c, 3);
-    uint32_t out = arg(c, 4), cap = arg(c, 5);
-    int hour, minute, second;
-    if (input) {
-        if (!gm_valid(input, 16)) {
-            set_last_error(87 /* ERROR_INVALID_PARAMETER */);
-            set_eax(c, 0);
-            return;
-        }
-        hour = rd16(input + 8);
-        minute = rd16(input + 10);
-        second = rd16(input + 12);
-    } else {
-        struct tm t{};
-        if (os_localtime((int64_t)(os_wall_time_us() / 1000000), &t) != 0) {
-            set_eax(c, 0);
-            return;
-        }
-        hour = t.tm_hour;
-        minute = t.tm_min;
-        second = t.tm_sec;
-    }
-    if (hour > 23 || minute > 59 || second > 59) {
-        set_last_error(87);
-        set_eax(c, 0);
-        return;
-    }
-    std::string text = kernel32_format_time(
-        hour, minute, second, picture ? (wide ? gm_wstr(picture) : gm_str(picture)) : std::string(),
-        flags);
-    uint32_t need = (wide ? utf16_units(text) : (uint32_t)text.size()) + 1;
-    if (cap == 0) {
-        set_eax(c, need);
-        return;
-    }
-    if (!out || cap < need) {
-        set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */);
-        set_eax(c, 0);
-        return;
-    }
-    set_eax(c, wide ? gm_put_wstr(out, text, cap) + 1 : gm_put_str(out, text.c_str(), cap) + 1);
-}
 
 std::string kernel32_format_time(int hour, int minute, int second, const std::string &picture,
                                  uint32_t flags) {

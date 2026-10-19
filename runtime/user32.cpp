@@ -532,6 +532,9 @@ void u_SetWindowPos(X86 *c) {
                        int32_t(arg(c, 5)), arg(c, 6));
     set_eax(c, 1);
 }
+void u_MoveWindow(X86 *c) {
+    set_eax(c, find_window(arg(c, 0)) != nullptr);
+}
 // The bounds a window had before a display took it over, by handle.
 std::map<uint32_t, std::array<int32_t, 4>> &covered_bounds() {
     static std::map<uint32_t, std::array<int32_t, 4>> m;
@@ -2078,6 +2081,7 @@ const ImportShim g_user32_shims[] = {
     {"USER32.dll", "ShowWindow", 2, u_ShowWindow},
     {"USER32.dll", "UpdateWindow", 1, u_UpdateWindow},
     {"USER32.dll", "SetWindowPos", 7, u_SetWindowPos},
+    {"USER32.dll", "MoveWindow", 6, u_MoveWindow},
     {"USER32.dll", "GetWindowRect", 2, u_GetWindowRect},
     {"USER32.dll", "GetClientRect", 2, u_GetClientRect},
     {"USER32.dll", "GetWindowInfo", 2, u_GetWindowInfo},

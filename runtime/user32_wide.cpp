@@ -11,6 +11,13 @@
 #include <string>
 
 namespace user32 {
+uint32_t utf16_units(const std::string &s) {
+    uint32_t n = 0;
+    for (unsigned char ch : s)
+        if ((ch & 0xc0) != 0x80)
+            n += ch >= 0xf0 ? 2 : 1;
+    return n;
+}
 uint32_t put_text(uint32_t out, uint32_t cap, const std::string &text, bool wide) {
     if (!out || !cap || cap > 0x1000000 || !gm_valid(out, cap * (wide ? 2 : 1)))
         return 0;
@@ -333,7 +340,7 @@ void load_icon(X86 *c) {
 // non-zero handles LoadIconA/LoadCursorA return; a bitmap is decoded into a
 // real GDI image. The two resource forms reuse the loaders above so the icon
 // group/cursor handling cannot drift between LoadIcon and LoadImage.
-void load_image_a(X86 *c) {
+void load_image(X86 *c, bool wide) {
     enum {
         IMAGE_BITMAP = 0,
         IMAGE_ICON = 1,
@@ -342,19 +349,17 @@ void load_image_a(X86 *c) {
     };
     uint32_t type = arg(c, 2);
     if (!(arg(c, 5) & LR_LOADFROMFILE)) {
-        // resource_find consumes UTF-16 names. Preserve MAKEINTRESOURCE values,
-        // but convert ANSI names before using the shared wide resource loaders.
-        uint32_t name = arg(c, 1), wide = 0;
-        if ((type == IMAGE_ICON || type == IMAGE_BITMAP) && name > 0xffff) {
+        uint32_t name = arg(c, 1), converted = 0;
+        if (!wide && (type == IMAGE_ICON || type == IMAGE_BITMAP) && name > 0xffff) {
             std::string text = gm_str(name);
             uint32_t cap = utf16_units(text) + 1;
-            wide = heap_alloc(cap * 2, true);
-            if (!wide) {
+            converted = heap_alloc(cap * 2, true);
+            if (!converted) {
                 set_eax(c, 0);
                 return;
             }
-            gm_put_wstr(wide, text, cap);
-            wr32(c->r[R_ESP] + 8, wide);
+            gm_put_wstr(converted, text, cap);
+            wr32(c->r[R_ESP] + 8, converted);
         }
         if (type == IMAGE_ICON)
             load_icon(c);
@@ -364,13 +369,13 @@ void load_image_a(X86 *c) {
             load_bitmap(c);
         else
             set_eax(c, 0);
-        if (wide) {
+        if (converted) {
             wr32(c->r[R_ESP] + 8, name);
-            heap_free(wide);
+            heap_free(converted);
         }
         return;
     }
-    std::string name = arg(c, 1) ? gm_str(arg(c, 1)) : std::string();
+    std::string name = arg(c, 1) ? (wide ? gm_wstr(arg(c, 1)) : gm_str(arg(c, 1))) : std::string();
     if (name.empty()) {
         set_eax(c, 0);
         return;
@@ -381,8 +386,7 @@ void load_image_a(X86 *c) {
         return;
     }
     if (type == IMAGE_CURSOR) {
-        set_last_error(120); // File cursor decoding is not implemented.
-        set_eax(c, 0);
+        set_eax(c, win32_load_cursor_file(c, name));
         return;
     }
     if (type != IMAGE_BITMAP) {
@@ -420,14 +424,20 @@ void load_image_a(X86 *c) {
         heap_free(temp);
     set_eax(c, bitmap);
 }
+void load_image_a(X86 *c) {
+    load_image(c, false);
+}
+void load_image_w(X86 *c) {
+    load_image(c, true);
+}
+
 void draw_text(X86 *c) {
     set_eax(c, gdi::draw_text(arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4)));
 }
 void draw_text_ex(X86 *c) {
     uint32_t p = arg(c, 5);
     if (p && gm_valid(p, 20) && rd32(p) == 20)
-        wr32(p + 16,
-             utf16_units(gm_wstr(arg(c, 1), arg(c, 2) == 0xffffffffu ? 0x8000 : arg(c, 2))));
+        wr32(p + 16, utf16_units(gm_wstr(arg(c, 1), arg(c, 2) == 0xffffffffu ? 0x8000 : arg(c, 2))));
     draw_text(c);
 }
 uint16_t case_unit(uint16_t ch, bool upper) {
@@ -467,7 +477,7 @@ void is_char_upper(X86 *c) {
 void is_char_alpha(X86 *c) {
     uint16_t ch = (uint16_t)arg(c, 0);
     set_eax(c, (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-                   (ch >= 0xc0 && ch <= 0xff && ch != 0xd7 && ch != 0xf7));
+                    (ch >= 0xc0 && ch <= 0xff && ch != 0xd7 && ch != 0xf7));
 }
 void lower(X86 *c) {
     char_case(c, false, false);
@@ -697,6 +707,7 @@ const ImportShim shims[] = {
     W("LoadBitmapA", 2, load_bitmap),
     W("LoadIconW", 2, load_icon),
     W("LoadImageA", 6, load_image_a),
+    W("LoadImageW", 6, load_image_w),
     W("LoadStringW", 4, load_string_w),
     W("LoadStringA", 4, load_string_a),
     W("DrawTextW", 5, draw_text),

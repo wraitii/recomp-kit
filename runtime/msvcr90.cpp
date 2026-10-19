@@ -8,6 +8,7 @@
 #include "imports.h"
 #include "guest.h"
 #include "game_config.h"
+#include "intrinsics.h"
 #include "memory.h"
 #include "kernel32_internal.h"
 #include "../platform/os.h"
@@ -37,6 +38,7 @@ std::vector<uint32_t> g_onexit;
 uint32_t g_signal_handlers[32];
 std::map<std::string, uint32_t> g_env_cache;
 thread_local uint32_t g_tm_slot;
+thread_local uint32_t g_cvt_slot;
 
 uint32_t guest_slot(uint32_t &slot, uint32_t size = 4) {
     if (!slot)
@@ -267,6 +269,10 @@ void crt_abort(X86 *c) {
     fflush(stdout);
     fflush(stderr);
     abort();
+}
+
+void crt_longjmp(X86 *c) {
+    recomp_longjmp(c);
 }
 
 void crt_onexit(X86 *c) {
@@ -1636,6 +1642,83 @@ double stack_double(X86 *c, int slot) {
     return d;
 }
 
+std::string cvt_digits(double value, int count, int &decpt, int &sign, bool significant) {
+    sign = std::signbit(value) ? 1 : 0;
+    decpt = 0;
+    std::string mantissa = "0";
+    if (std::isfinite(value) && value != 0) {
+        char text[832];
+        snprintf(text, sizeof text, "%.800e", std::fabs(value));
+        char *exp_start = strchr(text, 'e');
+        decpt = atoi(exp_start + 1) + 1;
+        mantissa.clear();
+        for (char *p = text; p != exp_start; ++p)
+            if (*p >= '0' && *p <= '9')
+                mantissa += *p;
+        mantissa.resize(18, '0');
+        if (mantissa[17] >= '5') {
+            int i = 16;
+            while (i >= 0 && mantissa[i] == '9')
+                mantissa[i--] = '0';
+            if (i >= 0) {
+                ++mantissa[i];
+            } else {
+                mantissa.insert(mantissa.begin(), '1');
+                ++decpt;
+            }
+        }
+        mantissa.resize(17);
+    }
+    int digits = significant ? count : decpt + count;
+    digits = std::min(digits, 347);
+    if (digits < 0)
+        return {};
+
+    std::string out(1, '0');
+    for (int i = 0; i < digits; ++i)
+        out += i < (int)mantissa.size() ? mantissa[i] : '0';
+    char round_digit = digits < (int)mantissa.size() ? mantissa[digits] : '0';
+    if (round_digit >= '5') {
+        int i = (int)out.size() - 1;
+        while (i >= 0 && out[i] == '9') {
+            out[i] = '0';
+            --i;
+        }
+        if (i >= 0)
+            ++out[i];
+    }
+    if (out[0] == '1') {
+        ++decpt;
+    } else {
+        out.erase(0, 1);
+    }
+    if (significant && (int)out.size() > digits)
+        out.resize((size_t)digits);
+    return out;
+}
+
+uint32_t cvt_slot() {
+    if (!g_cvt_slot)
+        g_cvt_slot = heap_alloc(350, true);
+    return g_cvt_slot;
+}
+
+void crt_cvt(X86 *c, bool significant) {
+    int decpt = 0, sign = 0;
+    std::string digits = cvt_digits(stack_double(c, 0), (int32_t)arg(c, 2), decpt, sign, significant);
+    uint32_t decpt_p = arg(c, 3), sign_p = arg(c, 4);
+    if (decpt_p && gm_valid(decpt_p, 4))
+        wr32(decpt_p, (uint32_t)decpt);
+    if (sign_p && gm_valid(sign_p, 4))
+        wr32(sign_p, (uint32_t)sign);
+    uint32_t out = cvt_slot();
+    put_guest_text(out, digits, GUEST_SIZE);
+    set_eax(c, out);
+}
+
+void crt_fcvt(X86 *c) { crt_cvt(c, false); }
+void crt_ecvt(X86 *c) { crt_cvt(c, true); }
+
 // The compiler intrinsics take and return a double in ST(0), not on the stack.
 void crt_ci_log(X86 *c) { fset(c, 0, std::log(ST(c, 0))); }
 void crt_ci_cos(X86 *c) { fset(c, 0, std::cos(ST(c, 0))); }
@@ -1781,6 +1864,7 @@ const ImportShim g_msvcr90_shims[] = {
     {"MSVCR90.dll", "_crt_debugger_hook", ARGC_CDECL, crt_debugger_hook},
     {"MSVCR90.dll", "?terminate@@YAXXZ", ARGC_CDECL, crt_terminate},
     {"MSVCR90.dll", "abort", ARGC_CDECL, crt_abort},
+    {"MSVCR90.dll", "longjmp", ARGC_CDECL, crt_longjmp},
     {"MSVCR90.dll", "_purecall", ARGC_CDECL, crt_purecall},
     {"MSVCR90.dll", "_onexit", ARGC_CDECL, crt_onexit},
     {"MSVCR90.dll", "__dllonexit", ARGC_CDECL, crt_dllonexit},
@@ -1846,6 +1930,8 @@ const ImportShim g_msvcr90_shims[] = {
     {"MSVCR90.dll", "_strtoui64", ARGC_CDECL, crt_strtoui64},
     {"MSVCR90.dll", "atof", ARGC_CDECL, crt_atof},
     {"MSVCR90.dll", "strtod", ARGC_CDECL, crt_strtod},
+    {"MSVCR90.dll", "_fcvt", ARGC_CDECL, crt_fcvt},
+    {"MSVCR90.dll", "_ecvt", ARGC_CDECL, crt_ecvt},
     {"MSVCR90.dll", "_ltoa", ARGC_CDECL, crt_ltoa},
     {"MSVCR90.dll", "_ultoa", ARGC_CDECL, crt_ultoa},
     {"MSVCR90.dll", "atoi", ARGC_CDECL, crt_atoi},

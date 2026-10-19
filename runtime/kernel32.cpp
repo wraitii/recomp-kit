@@ -211,8 +211,11 @@ uint32_t cur_thread_id();
 // Blocking primitives, implemented on the scheduler further down. Every one of
 // them deschedules the caller rather than spinning or inventing an answer.
 void sched_sleep_ms(uint32_t ms);
+uint32_t sched_sleep_ex(X86 *c, uint32_t ms, bool alertable);
 uint32_t sched_wait_objects(const uint32_t *handles, uint32_t count, bool wait_all,
                             uint32_t timeout_ms);
+uint32_t sched_wait_objects_ex(X86 *c, const uint32_t *handles, uint32_t count, bool wait_all,
+                               uint32_t timeout_ms, bool alertable);
 void sched_enter_critsec(uint32_t cs);
 bool sched_try_critsec(uint32_t cs);
 void sched_leave_critsec(uint32_t cs);
@@ -1788,6 +1791,71 @@ void k_GetVersion(X86 *c) {
     set_eax(c, windows_version::packed);
 }
 
+static constexpr char kComputerName[] = "RECOMP-PC";
+
+static void computer_name(X86 *c, uint32_t out, uint32_t size, uint32_t error) {
+    constexpr uint32_t required = sizeof kComputerName;
+    if (!size || !gm_valid(size, 4)) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t capacity = rd32(size);
+    if (capacity < required) {
+        wr32(size, required);
+        set_last_error(error);
+        set_eax(c, 0);
+        return;
+    }
+    if (!out || !gm_valid(out, required)) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    memcpy(g_mem + out, kComputerName, required);
+    wr32(size, required - 1);
+    set_eax(c, 1);
+}
+
+void k_GetComputerNameA(X86 *c) {
+    computer_name(c, arg(c, 0), arg(c, 1), 111);
+}
+
+void k_GetComputerNameExA(X86 *c) {
+    uint32_t type = arg(c, 0);
+    if (type >= 8) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    if (type == 2 || type == 6) {
+        constexpr char domain[] = "";
+        uint32_t out = arg(c, 1), size = arg(c, 2);
+        if (!size || !gm_valid(size, 4)) {
+            set_last_error(87);
+            set_eax(c, 0);
+            return;
+        }
+        uint32_t capacity = rd32(size);
+        if (capacity < sizeof domain) {
+            wr32(size, sizeof domain);
+            set_last_error(234);
+            set_eax(c, 0);
+            return;
+        }
+        if (!out || !gm_valid(out, sizeof domain)) {
+            set_last_error(87);
+            set_eax(c, 0);
+            return;
+        }
+        memcpy(g_mem + out, domain, sizeof domain);
+        wr32(size, 0);
+        set_eax(c, 1);
+        return;
+    }
+    computer_name(c, arg(c, 1), arg(c, 2), 234);
+}
+
 void k_GetStdHandle(X86 *c) {
     int32_t which = (int32_t)arg(c, 0);
     int fd = which == -10 ? 0 : which == -11 ? 1 : 2;
@@ -2352,12 +2420,8 @@ void k_WaitForSingleObject(X86 *c) {
 }
 
 void k_WaitForSingleObjectEx(X86 *c) {
-    if (arg(c, 2)) {
-        LOGW("WaitForSingleObjectEx: alertable waits are unsupported");
-        imports_unsupported(c);
-        return;
-    }
-    k_WaitForSingleObject(c);
+    uint32_t h = arg(c, 0);
+    set_eax(c, sched_wait_objects_ex(c, &h, 1, false, arg(c, 1), arg(c, 2) != 0));
 }
 
 void k_WaitForMultipleObjects(X86 *c) {
@@ -2395,7 +2459,7 @@ void k_WaitForMultipleObjects(X86 *c) {
 //                            (the pre-scheduler behaviour, for bisection)
 // -------------------------------------------------------------------------
 const uint32_t STILL_ACTIVE_ = 0x103;
-const uint32_t THREAD_STACK_BYTES = 0x00040000u; // 256 KB, committed
+const uint32_t THREAD_STACK_BYTES = 0x00100000u; // PE SizeOfStackReserve, committed
 const uint32_t WAIT_TIMEOUT_ = 0x102;
 
 // What a blocked thread is waiting for.  A blocked thread is not runnable and
@@ -2404,6 +2468,11 @@ const uint32_t WAIT_TIMEOUT_ = 0x102;
 // decremented, an auto-reset event cleared, a mutex owned) by the scheduler
 // itself, so exactly one waiter can ever be released by one signal.
 enum WaitKind : uint8_t { W_NONE, W_OBJECTS, W_CRITSEC };
+
+struct GuestApc {
+    uint32_t proc = 0;
+    uint32_t param = 0;
+};
 
 struct GuestThread {
     size_t index = 0;
@@ -2435,6 +2504,8 @@ struct GuestThread {
     bool has_deadline = false;
     double deadline = 0.0;    // monotonic seconds
     uint32_t wait_result = 0; // what the wait returns once released
+    std::vector<GuestApc> apcs;
+    bool alertable = false;
     double last_yield = 0.0;  // for the bounded scheduling checkpoint
     jmp_buf exit_jmp;
     uint32_t exit_code = 0;
@@ -2996,6 +3067,14 @@ void critsec_take(uint32_t cs, uint32_t tid) {
 bool sched_satisfy_locked(GuestThread *t) {
     if (!t->blocked)
         return true;
+    if (t->alertable && !t->apcs.empty()) {
+        t->blocked = false;
+        t->wait_kind = W_NONE;
+        t->wait_n = 0;
+        t->has_deadline = false;
+        t->wait_result = 0xc0; // WAIT_IO_COMPLETION
+        return true;
+    }
     if (t->wait_kind == W_OBJECTS) {
         if (t->wait_all) {
             for (uint32_t i = 0; i < t->wait_n; ++i)
@@ -3438,6 +3517,33 @@ void sched_wake_all() {
     g_sched_m.unlock();
 }
 
+uint32_t deliver_pending_apcs(X86 *c, GuestThread *t) {
+    uint32_t delivered = 0;
+    for (;;) {
+        uint32_t proc = 0, param = 0;
+        g_sched_m.lock();
+        if (t->apcs.empty()) {
+            g_sched_m.unlock();
+            break;
+        }
+        proc = t->apcs.front().proc;
+        param = t->apcs.front().param;
+        t->apcs.erase(t->apcs.begin());
+        g_sched_m.unlock();
+        uint32_t args[1] = {param};
+        guest_call(c, proc, args, 1);
+        ++delivered;
+    }
+    return delivered;
+}
+
+bool has_pending_apcs(GuestThread *t) {
+    g_sched_m.lock();
+    bool pending = !t->apcs.empty();
+    g_sched_m.unlock();
+    return pending;
+}
+
 void sched_sleep_ms(uint32_t ms) {
     sched_run_checkpoint();
     GuestThread *me = cur_thread();
@@ -3455,12 +3561,42 @@ void sched_sleep_ms(uint32_t ms) {
     guest_block("sleep");
 }
 
+uint32_t sched_sleep_ex(X86 *c, uint32_t ms, bool alertable) {
+    if (!alertable) {
+        sched_sleep_ms(ms);
+        return 0;
+    }
+    GuestThread *me = cur_thread();
+    if (has_pending_apcs(me)) {
+        deliver_pending_apcs(c, me);
+        return 0xc0;
+    }
+    sched_run_checkpoint();
+    if (ms == 0) {
+        guest_yield();
+        return 0;
+    }
+    g_sched_m.lock();
+    me->blocked = true;
+    me->wait_kind = W_NONE;
+    me->wait_n = 0;
+    me->alertable = true;
+    me->has_deadline = true;
+    me->deadline = sched_now() + (double)ms / 1000.0;
+    g_sched_m.unlock();
+    uint32_t result = guest_block("alertable sleep");
+    me->alertable = false;
+    if (result == 0xc0)
+        deliver_pending_apcs(c, me);
+    return result;
+}
+
 // WAIT_OBJECT_0 + index, WAIT_TIMEOUT or WAIT_FAILED. Nothing here reports a
 // timeout that did not happen: a zero timeout answers from the current state,
 // and any other wait is a real block that ends when the object is taken or the
 // deadline passes.
-uint32_t sched_wait_objects(const uint32_t *handles_, uint32_t count, bool wait_all,
-                            uint32_t timeout_ms) {
+uint32_t sched_wait_objects_impl(X86 *c, const uint32_t *handles_, uint32_t count, bool wait_all,
+                                 uint32_t timeout_ms, bool alertable) {
     sched_run_checkpoint();
     if (!count || count > MAXIMUM_WAIT_OBJECTS_) {
         set_last_error(87);
@@ -3473,6 +3609,11 @@ uint32_t sched_wait_objects(const uint32_t *handles_, uint32_t count, bool wait_
         }
     }
     GuestThread *me = cur_thread();
+
+    if (alertable && has_pending_apcs(me)) {
+        deliver_pending_apcs(c, me);
+        return 0xc0; // WAIT_IO_COMPLETION
+    }
 
     // Satisfiable right now?  Taken here so a zero timeout still consumes.
     g_sched_m.lock();
@@ -3509,12 +3650,27 @@ uint32_t sched_wait_objects(const uint32_t *handles_, uint32_t count, bool wait_
     me->wait_kind = W_OBJECTS;
     me->wait_all = wait_all;
     me->wait_n = count;
+    me->alertable = alertable;
     for (uint32_t i = 0; i < count; ++i)
         me->wait_h[i] = handles_[i];
     me->has_deadline = timeout_ms != 0xffffffffu; // INFINITE has none
     me->deadline = me->has_deadline ? sched_now() + (double)timeout_ms / 1000.0 : 0.0;
     g_sched_m.unlock();
-    return guest_block("wait");
+    uint32_t result = guest_block("wait");
+    me->alertable = false;
+    if (result == 0xc0)
+        deliver_pending_apcs(c, me);
+    return result;
+}
+
+uint32_t sched_wait_objects(const uint32_t *handles, uint32_t count, bool wait_all,
+                            uint32_t timeout_ms) {
+    return sched_wait_objects_impl(nullptr, handles, count, wait_all, timeout_ms, false);
+}
+
+uint32_t sched_wait_objects_ex(X86 *c, const uint32_t *handles, uint32_t count, bool wait_all,
+                               uint32_t timeout_ms, bool alertable) {
+    return sched_wait_objects_impl(c, handles, count, wait_all, timeout_ms, alertable);
 }
 
 void sched_enter_critsec(uint32_t cs) {
@@ -3851,6 +4007,35 @@ bool thread_spawn(uint32_t h) {
 
 void k_CreateThread(X86 *c) {
     set_eax(c, kernel32_create_guest_thread(c, arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5)));
+}
+
+void k_QueueUserAPC(X86 *c) {
+    uint32_t proc = arg(c, 1), param = arg(c, 2), h = arg(c, 0);
+    if (!proc) {
+        set_last_error(87); // ERROR_INVALID_PARAMETER
+        set_eax(c, 0);
+        return;
+    }
+    GuestThread *target = nullptr;
+    if (h == 0xfffffffeu) {
+        target = cur_thread();
+    } else {
+        for (GuestThread *t : threads())
+            if (t->spawned && t->handle == h) {
+                target = t;
+                break;
+            }
+    }
+    if (!target) {
+        set_last_error(ERROR_INVALID_HANDLE_);
+        set_eax(c, 0);
+        return;
+    }
+    g_sched_m.lock();
+    target->apcs.push_back(GuestApc{proc, param});
+    g_sched_cv.notify_all();
+    g_sched_m.unlock();
+    set_eax(c, 1);
 }
 
 void k_ExitThread(X86 *c) {
@@ -4656,6 +4841,22 @@ void k_SetErrorMode(X86 *c) {
 }
 void k_GetLogicalDrives(X86 *c) {
     set_eax(c, 0x4);
+}
+
+static uint32_t g_execution_state = 0;
+void k_SetThreadExecutionState(X86 *c) {
+    const uint32_t continuous = 0x80000000u;
+    const uint32_t valid = continuous | 0x1 | 0x2 | 0x40;
+    uint32_t flags = arg(c, 0);
+    if (flags & ~valid) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t previous = g_execution_state;
+    if (flags & continuous)
+        g_execution_state = flags;
+    set_eax(c, previous);
 }
 
 void k_GlobalMemoryStatus(X86 *c) {
@@ -5696,10 +5897,7 @@ void k_SetWaitableTimer(X86 *c) {
 }
 
 void k_SleepEx(X86 *c) {
-    // No APCs are ever queued, so an alertable wait is a plain one and
-    // nothing was delivered.
-    k_Sleep(c);
-    set_eax(c, 0);
+    set_eax(c, sched_sleep_ex(c, arg(c, 0), arg(c, 1) != 0));
 }
 
 const ImportShim g_kernel32_shims[] = {
@@ -5802,7 +6000,8 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "IsBadWritePtr", 2, k_IsBadWritePtr},
     {"KERNEL32.dll", "IsBadCodePtr", 1, k_IsBadCodePtr},
     // ABI known; these APIs remain unsupported and stop with a named diagnostic.
-    {"KERNEL32.dll", "GetComputerNameA", 2, imports_unsupported},
+    {"KERNEL32.dll", "GetComputerNameA", 2, k_GetComputerNameA},
+    {"KERNEL32.dll", "GetComputerNameExA", 3, k_GetComputerNameExA},
     {"KERNEL32.dll", "WinExec", 2, imports_unsupported},
     {"KERNEL32.dll", "lstrcpynA", 3, imports_unsupported},
     {"KERNEL32.dll", "FormatMessageA", 7, k_FormatMessageA},
@@ -5844,7 +6043,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "GetLongPathNameA", 3, nullptr},
     {"KERNEL32.dll", "GetOverlappedResult", 4, nullptr},
     {"KERNEL32.dll", "HeapValidate", 3, nullptr},
-    {"KERNEL32.dll", "QueueUserAPC", 3, nullptr},
+    {"KERNEL32.dll", "QueueUserAPC", 3, k_QueueUserAPC},
     {"KERNEL32.dll", "SetConsoleCtrlHandler", 2, k_SetConsoleCtrlHandler},
     {"KERNEL32.dll", "TerminateThread", 2, nullptr},
     {"KERNEL32.dll", "GetTimeZoneInformation", 1, k_GetTimeZoneInformation},
@@ -5943,6 +6142,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "EnumSystemLocalesA", 2, k_EnumSystemLocalesA},
     {"KERNEL32.dll", "GlobalMemoryStatus", 1, k_GlobalMemoryStatus},
     {"KERNEL32.dll", "SetErrorMode", 1, k_SetErrorMode},
+    {"KERNEL32.dll", "SetThreadExecutionState", 1, k_SetThreadExecutionState},
     {"KERNEL32.dll", "GetLogicalDrives", 0, k_GetLogicalDrives},
     {"KERNEL32.dll", "GetLocaleInfoW", 4, k_GetLocaleInfoW},
 };

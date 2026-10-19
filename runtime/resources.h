@@ -21,5 +21,6 @@ uint32_t resource_data(uint32_t entry, uint32_t *size, std::string *why = nullpt
                        uint32_t module = 0);
 // Snapshot the names before guest callbacks run; no references into the directory
 // or temporary guest buffers escape this reader. False explains failure in why.
+// `wide_type` selects the encoding of a string type identifier at a guest address.
 bool resource_names(uint32_t type_id_or_name, std::vector<ResourceName> *names,
-                    std::string *why = nullptr, uint32_t module = 0);
+                    std::string *why = nullptr, uint32_t module = 0, bool wide_type = true);
