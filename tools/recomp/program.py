@@ -254,11 +254,30 @@ class Program(object):
             found.setdefault(owner, []).append(addr)
         return {owner: sorted(addrs) for owner, addrs in found.items()}
 
+    def entry_thunk_target(self, addr):
+        """The body a function entry forwards to, for the thunk forms Ghidra folds."""
+        try:
+            b = self.pe.bytes_at(addr, 16)
+        except TranslateError:
+            return None
+        if b[0] == 0x83 and b[1] in (0xE9, 0xC1) and b[3] == 0xE9:
+            size = 8
+        elif b[0] == 0x81 and b[1] in (0xE9, 0xC1) and b[6] == 0xE9:
+            size = 11
+        elif b[0] in (0xB8, 0xB9) and b[5] == 0xE9:
+            size = 10
+        elif b[0] == 0xE9:
+            size = 5
+        else:
+            return None
+        return addr + size + int.from_bytes(b[size - 4:size], "little", signed=True)
+
     def entries(self):
         """Every address generated code can be entered at, with why.
 
         Function starts, jump-table targets, interior entries Ghidra found
-        referenced from elsewhere, and the game's configured entries."""
+        referenced from elsewhere, entry-thunk bodies and the game's configured
+        entries."""
         if self._entries is not None:
             return self._entries
         found = {addr: "function" for addr in self.functions}
@@ -267,6 +286,10 @@ class Program(object):
                 found.setdefault(target, "table")
         for addr, (_owner, kind) in self.interior.items():
             found.setdefault(addr, kind)
+        for addr in self.functions:
+            target = self.entry_thunk_target(addr)
+            if target not in (None, addr) and self.containing(target) is not None:
+                found.setdefault(target, "thunk")
         for addr in self.configured_entries:
             found.setdefault(addr, "config")
         self._entries = found
