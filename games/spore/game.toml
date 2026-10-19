@@ -1,0 +1,33 @@
+# GOG SPORE Collection. Target the Galactic Adventures executable because GOG's
+# primary play task launches it; base-game content stays in Data/.
+[game]
+id = "spore"
+name = "Spore"
+app_name = "SporeRecomp"
+bundle_id = "dev.recompkit.spore"
+executable = "SporeApp.exe"
+sha256 = "99e5de9e5891421e518526080671844775198e0b6b125e8b71d54df821ce03c1"
+image_base = 0x00400000
+entry_point = 0x011e11e1
+guest_size = 0x80000000
+heap_base = 0x10000000
+heap_end = 0x80000000
+host_arena_base = 0
+guest_root = 'C:\Program Files\Electronic Arts\SPORE'
+windows_version = "5.1.2600"
+
+[translate]
+code_map = "metadata"
+
+[launcher]
+install_names = ["SPORE Collection", "Spore"]
+gog_ids = ["1948823323"]
+
+[setup.layout]
+executable_dir = "SporebinEP1"
+data_root = "."
+required_dirs = ["Data", "DataEP1", "bp1content"]
+
+[controls]
+default_layout = "hidden"
+pad = "off"
