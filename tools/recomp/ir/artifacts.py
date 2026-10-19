@@ -61,11 +61,11 @@ class ArtifactStore:
         if self.root is not None:
             (self.root / ("counts-%d.json" % os.getpid())).write_text(json.dumps(self.counts))
 
-    def lifted(self, tr, lifter, fn):
+    def input_key(self, tr, lifter, fn):
         for ins in fn.insns:
             if ins.decode is None:
                 raise LiftError("%08x: instruction decode evidence missing" % ins.addr)
-        key = ("frontend-v4", lifter.language, fn.addr,
+        return ("frontend-v4", lifter.language, fn.addr,
                tuple((ins.addr, ins.mnem, ins.decode.source_bytes) for ins in fn.insns),
                tuple(tuple(tr.successors(fn, i)) for i in range(len(fn.insns))),
                tuple((i, tr.never_returns(ins)) for i, ins in enumerate(fn.insns)),
@@ -73,7 +73,9 @@ class ArtifactStore:
                                         if owner == fn.addr), fn.return_jumps, fn.dead_addrs,
                fn.pushed_continuations, tuple(fn.fallthrough), tuple(fn.contiguous), fn.end,
                external_exits(tr, fn), table_jumps(tr, fn))
-        return self._get("lifted", key, lambda: function_ir(tr, lifter, fn))
+
+    def lifted(self, tr, lifter, fn):
+        return self._get("lifted", self.input_key(tr, lifter, fn), lambda: function_ir(tr, lifter, fn))
 
     def reuse_normalized(self, addr):
         self.reusable.add(addr)

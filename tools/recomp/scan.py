@@ -22,7 +22,10 @@ _WORKER = {}
 
 def _init(settings, artifacts=None):
     import driver
+    import emission_cache
     _WORKER["ctx"] = driver.Context(settings, artifacts)
+    _WORKER['cache'] = (emission_cache.AnalysisCache(*settings.preparation_cache, readonly=True)
+                        if getattr(settings, 'preparation_cache', None) else None)
 
 
 def _scan(task):
@@ -33,6 +36,23 @@ def _scan(task):
     for addr in task.addresses:
         fn, entries = ctx.load(addr)
         tr.analyze(fn, entries)
+        cache, key = _WORKER['cache'], None
+        if cache is not None:
+            targets = {target for ins in fn.insns
+                       if ins.mnem in ('CALL', 'JMP') or ins.mnem in decoded.JCC
+                       if (target := tr.branch_target(ins)) is not None}
+            bindings = [(target, target in ctx.entries, target in ctx.known, ctx.program.containing(target))
+                        for target in sorted(targets)]
+            try:
+                key = cache.key(None, ('scan', ctx.artifacts.input_key(tr, ctx.lifter, fn), entries,
+                                      bindings, addr in tr.noreturn_callees, ctx.decoded_only))
+            except (LiftError, RecursionError):
+                pass
+            if key is not None:
+                cached = cache.get(key, 'scan')
+                if cached is not None:
+                    rows.append((key, cached, True))
+                    continue
         calls, jumps, refs, returns = [], set(), set(), []
         for i, ins in enumerate(fn.insns):
             if ins.mnem == "CALL":
@@ -73,9 +93,10 @@ def _scan(task):
             x87_count += mnem.startswith("F") and mnem != "FEMMS"
             if writer_effect(mnem) is not None:
                 writers.append({"site": ins.addr, "mnemonic": mnem})
-        rows.append(ScanRow(addr, Row(addr, fn.name, len(fn.insns), fn.insns[0].addr, fn.insns[-1].addr),
+        row = ScanRow(addr, Row(addr, fn.name, len(fn.insns), fn.insns[0].addr, fn.insns[-1].addr),
                      calls, sorted(jumps), refs, returns, reason, escapes, prepared, mode_prepared, x87_count,
-                     writers, sorted(external_targets)))
+                     writers, sorted(external_targets))
+        rows.append((key, row, False))
     ctx.artifacts.flush_counts()
     return rows
 
@@ -150,10 +171,20 @@ class ScanResult:
         return found
 
 
-def build(ctx, jobs, artifacts=None):
+def build(ctx, jobs, artifacts=None, cache=None):
     with ProcessPoolExecutor(max_workers=jobs, initializer=_init, initargs=(ctx.settings, artifacts)) as pool:
-        scanned = {row.addr: row for batch in pool.map(_scan,
-                   [ScanTask(tuple(part)) for part in chunked(sorted(ctx.program.functions), jobs * 24)]) for row in batch}
+        scanned = {}
+        for batch in pool.map(_scan,
+                [ScanTask(tuple(part)) for part in chunked(sorted(ctx.program.functions), jobs * 24)]):
+            for key, row, hit in batch:
+                scanned[row.addr] = row
+                if cache is not None and key is not None:
+                    counter = 'scan_hits' if hit else 'scan_misses'
+                    cache.counts[counter] = cache.counts.get(counter, 0) + 1
+                    if hit:
+                        cache.retain(key)
+                    else:
+                        cache.put(key, row)
         helpers = seh_helpers(pool, chunked(sorted(scanned), jobs * 24),
                               {addr: row.seh_escapes for addr, row in scanned.items()},
                               {addr: row.calls for addr, row in scanned.items()})

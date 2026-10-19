@@ -700,7 +700,7 @@ def continuation_outputs(s, publications, groups, lane_field, extra_roots=(), ca
 
 
 def analyze(targets, prepared, *, analyzable, roots, progress=None, language=None, indirect=None, effects=None,
-            noreturn=(), bodies=None):
+            noreturn=(), bodies=None, summary_cache=None):
     """Contracts for every analyzable body reachable from `roots`.
 
     `targets[addr]` lists a function's direct CALL targets, `prepared[addr]` is
@@ -752,19 +752,7 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
         raise ValueError("call-contract analysis language disagrees with prepared bodies")
     cells = mapping(language)
     preservation = {}
-    if bodies is not None:
-        from .normalize import codegen_ir
-        from .ssa import SSAError
-        for addr, p in firs.items():
-            if not p.stack_saves or not p.call_sites or p.tails:
-                continue
-            try:
-                fir = bodies(addr) if callable(bodies) else bodies[addr]
-                if fir.entries or fir.seh:
-                    continue
-                preservation[addr] = (fir, codegen_ir(fir, copy(_preservation_lifter(fir.language))))
-            except (SSAError, RecursionError, KeyError):
-                continue
+    body_inputs, summary_inputs = {}, {}
     pops = {addr: p.pops for addr, p in firs.items()}
     resolved_pops = {}
 
@@ -803,6 +791,47 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
             for target in row.targets:
                 resolve_pops(target.address)
     pops.update(resolved_pops)
+
+    def summary(addr, lookup):
+        from .normalize import codegen_ir
+        from .ssa import SSAError
+
+        p = firs[addr]
+        body, ir, key = None, None, None
+        if addr not in body_inputs:
+            try:
+                if bodies is not None and p.stack_saves and p.call_sites and not p.tails:
+                    body = bodies(addr) if callable(bodies) else bodies[addr]
+                    if body.entries or body.seh:
+                        body = None
+            except (SSAError, RecursionError, KeyError):
+                body = None
+            body_inputs[addr] = body
+        body = body_inputs[addr]
+        if summary_cache is not None:
+            if addr not in summary_inputs:
+                call_pops = {op.ins[0][1]: pops.get(op.ins[0][1])
+                             for ins in body.insns for op in ins.ops
+                             if op.opc == 'CALL' and op.ins and op.ins[0][0] == 'ram'} if body is not None else {}
+                summary_inputs[addr] = summary_cache.key(body,
+                    ('contract-inputs', {name: getattr(p, name) for name in p.__slots__}, call_pops))
+            key = summary_cache.key(None, ('contract', summary_inputs[addr],
+                                          _resolved_sites(p, lookup, indirect, effects, noreturn)))
+            cached = summary_cache.get(key)
+            if cached is not None:
+                return cached
+        if body is not None:
+            try:
+                if addr not in preservation:
+                    preservation[addr] = codegen_ir(body, copy(_preservation_lifter(body.language)))
+                ir = preservation[addr]
+            except (SSAError, RecursionError, KeyError):
+                body = None
+        result = summarize(p, lookup, cells, indirect, effects, noreturn, body=body, ir=ir, pops=pops)
+        if key is not None:
+            summary_cache.put(key, result)
+        return result
+
     contracts = {}
     components = call_graph(sorted(needed),
                             lambda a: [t for t in callees(a) if t in firs])
@@ -827,9 +856,7 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
             # No call into the component: one pass is the fixed point.
             for addr in comp:
                 if addr in firs:
-                    body, ir = preservation.get(addr, (None, None))
-                    contracts[addr] = summarize(firs[addr], lookup, cells, indirect, effects, noreturn,
-                                                body=body, ir=ir, pops=pops)
+                    contracts[addr] = summary(addr, lookup)
                     done += 1
                     if progress is not None:
                         progress(done, len(needed))
@@ -840,9 +867,7 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
             for addr in comp:
                 if addr not in firs:
                     continue
-                body, ir = preservation.get(addr, (None, None))
-                new = summarize(firs[addr], lookup, cells, indirect, effects, noreturn,
-                                body=body, ir=ir, pops=pops)
+                new = summary(addr, lookup)
                 current = live.get(addr)
                 if current is None or new != current:
                     live[addr] = new

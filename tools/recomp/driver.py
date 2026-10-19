@@ -148,7 +148,13 @@ def _init(settings, artifacts=None, cache_prepared=False, load_prepared=False):
     _CTX = Context(settings, artifacts)
     _CTX.prepared = {}
     _CTX.cache_prepared = cache_prepared
-    _CTX.load_prepared = load_prepared
+    _CTX.load_prepared = load_prepared or cache_prepared
+    _CTX.preparation_cache = (emission_cache.PreparationCache(*settings.preparation_cache)
+                              if getattr(settings, 'preparation_cache', None) else None)
+
+
+def _preparation_state():
+    return _CTX.preparation_cache.state() if _CTX.preparation_cache else ({}, {})
 
 
 class OwnedWorkers:
@@ -166,6 +172,15 @@ class OwnedWorkers:
             futures.append(self.workers[owner].submit(function, task))
         return (future.result() for future in futures)
 
+    def preparation_state(self):
+        entries, counts = {}, Counter()
+        futures = [worker.submit(_preparation_state) for worker in self.workers]
+        for future in futures:
+            rows, workload = future.result()
+            entries.update(rows)
+            counts.update(workload)
+        return entries, dict(counts)
+
 
 @contextmanager
 def owned_workers(settings, artifacts, addresses, cache_prepared):
@@ -182,7 +197,9 @@ def owned_workers(settings, artifacts, addresses, cache_prepared):
 def _store_prepared(path, body):
     _CTX.prepared[path] = body
     if _CTX.cache_prepared:
-        prepared_store.write(path, body)
+        temporary = path.with_suffix('.pickle.new')
+        prepared_store.write(temporary, body)
+        temporary.replace(path)
 
 
 def _take_prepared(path):
@@ -209,6 +226,7 @@ def _prepare(task):
         tr.analyze(fn, entries)
         reason = "decoded-only code map" if ctx.decoded_only else production.exclusion(fn)
         path, requests, input_sites = None, set(), ()
+        cache, key = ctx.preparation_cache, None
         if reason is None:
             try:
                 selected = addr in selected_callers
@@ -216,17 +234,26 @@ def _prepare(task):
                 callee_contracts = {t: contracts[t] for t in targets if t in contracts}
                 if selected:
                     callee_contracts.update(private_targets)
-                body = production.prepare_ssa(
-                    tr, ctx.lifter, fn, entries,
+                request = production.ssa_request(
+                    tr, fn, entries,
                     production.ProductionRequest(ctx.settings.emit, ctx.known, callee_contracts,
                         checked_returns, frozenset(private_targets) if selected else frozenset(), selected,
                         mode_sites.get(addr), entry_verification.get(addr),
                         selection.input_arguments,
-                        indirect_contracts=analysis.indirect_contracts), ctx.artifacts)
+                        indirect_contracts=analysis.indirect_contracts))
+                if cache is not None:
+                    key = cache.key(ctx.artifacts.input_key(tr, ctx.lifter, fn), request)
+                    cached = cache.get(key, 'ordinary')
+                    if cached is not None:
+                        plans.append(cached)
+                        continue
+                fir = ctx.artifacts.lifted(tr, ctx.lifter, fn)
+                fir.entries = tuple(production.external_entries(tr, fn, entries))
+                body = production.prepare_inputs(fir, request, ctx.lifter, ctx.artifacts)
             except (SSAError, LiftError) as error:
                 reason = str(error)
             else:
-                path = Path(store) / ("%08x.pickle" % addr)
+                path = cache.path(key) if key is not None else Path(store) / ("%08x.pickle" % addr)
                 _store_prepared(path, body)
                 requests = body.requests
                 groups = dict(body.state_groups)
@@ -254,7 +281,10 @@ def _prepare(task):
                 input_sites = tuple(sites)
         if reason is not None and addr in checked_returns:
             raise TranslateError("%08x: checked-return body failed preparation: %s" % (addr, reason))
-        plans.append(FunctionPlan(addr, path, reason, frozenset(requests), input_sites))
+        plan = FunctionPlan(addr, path, reason, frozenset(requests), input_sites)
+        plans.append(plan)
+        if key is not None:
+            cache.put(key, plan)
     ctx.artifacts.flush_counts()
     return plans
 
@@ -354,11 +384,22 @@ def _prepare_private(task):
     ctx = _CTX
     fn, entries = ctx.load(addr)
     ctx.tr.analyze(fn, entries)
-    plan = production.prepare_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit, layout, known_mode, ctx.artifacts)
+    cache, key = ctx.preparation_cache, None
+    request = production.private_request(fn, ctx.settings.emit, layout, known_mode)
+    if cache is not None:
+        key = cache.key(ctx.artifacts.input_key(ctx.tr, ctx.lifter, fn), request)
+        cached = cache.get(key, 'private')
+        if cached is not None:
+            return cached
+    inputs = (ctx.artifacts.lifted(ctx.tr, ctx.lifter, fn), request)
+    plan = production.prepare_private(ctx.tr, ctx.lifter, fn, ctx.settings.emit, layout, known_mode, ctx.artifacts,
+                                      inputs=inputs)
     if plan.body is not None:
-        path = Path(store) / ("private-%08x-%04x.pickle" % (addr, layout.output_mask))
+        path = cache.path(key) if key is not None else Path(store) / ("private-%08x-%04x.pickle" % (addr, layout.output_mask))
         _store_prepared(path, plan.body)
         plan = replace(plan, body=path)
+    if key is not None:
+        cache.put(key, plan)
     ctx.artifacts.flush_counts()
     return plan
 
@@ -479,7 +520,10 @@ def main(argv=None):
 
 def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs):
     program = ctx.program
-    seed = scan.build(ctx, settings.jobs, artifacts)
+    if args.emission_cache:
+        settings.preparation_cache = (args.emission_cache.resolve(), emission_cache.identity(settings, code_map=False))
+    analysis_cache = emission_cache.AnalysisCache(*settings.preparation_cache) if args.emission_cache else None
+    seed = scan.build(ctx, settings.jobs, artifacts, analysis_cache)
     scanned, helpers = seed.scanned, seed.helpers
     phase("scan")
     rows = {addr: row.description for addr, row in scanned.items()}
@@ -508,6 +552,7 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
         for addr in settings.private_input_registers:
             if not eligibility.checked(addr):
                 raise TranslateError("%08x: private input register requires an unreplaced, closed single-entry body without SEH" % addr)
+        phase("mode analysis")
         contracts = {}
         if settings.call_contracts:
             reprepared = ArtifactStore(artifacts)
@@ -525,7 +570,10 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
                 analyzable=lambda a: bool(scanned.get(a) and scanned[a].register_facts is not None
                                           and a not in helpers and a not in conservative),
                 roots=roots, indirect=indirect_targets, effects=settings.call_effects,
-                noreturn=ctx.program.noreturn, bodies=contract_body)
+                noreturn=ctx.program.noreturn, bodies=contract_body, summary_cache=analysis_cache)
+        if analysis_cache is not None:
+            analysis_cache.finish()
+        phase("register contracts")
         indirect_contracts = {}
         if indirect_targets and contracts:
             for row in scanned.values():
@@ -608,6 +656,10 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
         for row in pool.map(_private, private_plans):
             results[row.addr].lines.extend(row.lines)
         phase("private entries")
+        preparation_entries, preparation_counts = pool.preparation_state()
+    if analysis_cache is not None:
+        preparation_counts.update(analysis_cache.counts)
+    log("  preparation cache: " + json.dumps(preparation_counts, sort_keys=True))
 
     workload = Counter()
     for path in artifacts.glob("counts-*.json"):
@@ -641,6 +693,7 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
     decisions.sort(key=lambda item: (item.get("site", ""), item.get("target", ""),
                                      json.dumps(item, sort_keys=True, separators=(",", ":"))))
     contract_report = {
+        "preparation_cache": preparation_counts,
         "frontend_work": dict(workload),
         "configured_callers": ["%08x" % a for a in sorted(settings.state_contract_callers)],
         "selected_callers": ["%08x" % a for a in sorted(selected_callers)],
@@ -669,7 +722,8 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
         fh.write("\n")
     if args.emission_cache:
         emission_cache.save(args.emission_cache, settings, args.out, plans, private_plans,
-                            analysis, functions, entries_by_fn, results, contract_report, known_modes)
+                            analysis, functions, entries_by_fn, results, contract_report, known_modes,
+                            (settings.preparation_cache[1], preparation_entries))
     phase("write")
 
     emitted = sum(1 for a in addrs if results[a].reason is None)
@@ -686,6 +740,7 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
     if args.report:
         with open(args.report, "w") as fh:
             json.dump({
+                "preparation_cache": preparation_counts,
                 "frontend_work": dict(workload),
                 "functions": len(addrs),
                 "entry_points": len(entry_names),

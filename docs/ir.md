@@ -509,20 +509,40 @@ tested on 14 selected functions, agreed on the recorded inputs but increased
 linked text and bridge traffic while C already benefits from Clang's optimizer.
 The current contract is C with CPU-field transport.
 
-### Selected regeneration
+### Cached preparation and selected regeneration
+
+Full regeneration caches pre-finalization SSA bodies in the ignored
+`recomp/emission-cache` (`recomp-emission-cache-v3`) by default;
+`--no-emission-cache` disables it. A small manifest keys ordinary bodies,
+preparation failures and private variants by instruction bytes, decoded operands,
+control flow and effective preparation requests. Code-map additions preserve matching bodies;
+preparation-source, dependency, executable and policy changes invalidate reuse
+broadly. Whole-program solvers, candidate selection, specialization layouts and
+emission run fresh. Workers load saved bodies only for finalization; unchanged
+body files are retained and obsolete ones pruned after a successful generation.
+
+Per-function scan facts and register-contract summaries use `analysis.sqlite`
+in the same cache directory. Scan keys include local frontend inputs and the
+entry/ownership lookups of directly referenced targets. Scan workers open
+read-only connections; the coordinator stores their returned misses. SEH helper
+propagation and entry classification run fresh. Prepared-body hits are checked
+before lifting, so a scan hit does not merely move lifting to preparation.
+Contract keys cover per-function scan facts, instruction/control-flow inputs where a
+stack-save proof is needed, resolved callee contracts and relevant stack-pop
+counts. The coordinator solves the current call graph and recursive components,
+reusing matching summaries before building preservation SSA. It alone writes
+SQLite, committing result batches in one transaction; workers never write
+the database. Graph payloads keep the existing compact serialization.
 
 `tools/build.py --regen-function HEX_ADDR` (repeatable) re-emits selected
-functions using preparation saved by `--regenerate --cache-emission`.
-Full regeneration keeps prepared graphs in RAM and skips the persistent cache by default.
+functions using the saved preparation.
 Unchanged generated files retain timestamps, so Ninja recompiles affected
 C chunks and relinks the requested target. Address buckets can include
 neighboring functions; this is chunk compilation, not an isolated object per
 function.
 
-The ignored `recomp/emission-cache` (`recomp-emission-cache-v2`) validates
-preparation sources, executable, map, policy, facts, native evidence and the
-generated tree. It stores pre-finalization bodies, including private bodies, so
-selected regeneration re-runs `lowering.py`, `c_boundaries.py`, `call_values.py`
+Selected regeneration additionally validates the whole map, facts, native
+evidence and generated tree. It re-runs `lowering.py`, `c_boundaries.py`, `call_values.py`
 and the printers from the cached SSA. Those modules are excluded from the
 preparation identity; `prepare.py`, `c_symbols.py` and the frontend remain in it.
 Contracts, selection, shared layouts and entry tables remain those of the full

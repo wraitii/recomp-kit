@@ -1,5 +1,6 @@
 """Production body preparation and wrappers for the existing dispatch ABI."""
 from dataclasses import dataclass
+from frontend import external_exits
 
 from .artifacts import ArtifactStore
 from .body import BodyRequest, BodyVariant, EntryForm, ReturnForm, EmissionPolicy, FrozenMap
@@ -50,32 +51,49 @@ class ProductionRequest:
         object.__setattr__(self, "private_input_arguments", FrozenMap.of(self.private_input_arguments))
 
 
-def prepare_ssa(tr, lifter, fn, entries, request, artifacts=None):
-    artifacts = artifacts if artifacts is not None else ArtifactStore()
+def ssa_request(tr, fn, entries, request):
     calls = {}
     for ins in fn.insns:
         if ins.mnem == "CALL":
             target = tr.branch_target(ins)
             if target in request.known:
                 calls[target] = EntryBinding(target, target in request.checked_returns)
-    fir = artifacts.lifted(tr, lifter, fn)
-    fir.entries = tuple(external_entries(tr, fn, entries))
+    external = tuple(external_entries(tr, fn, entries))
     checked = fn.addr in request.checked_returns
-    variant = BodyVariant(EntryForm.CHECKED if checked else EntryForm.MULTIPLE if fir.entries else EntryForm.ORDINARY,
+    variant = BodyVariant(EntryForm.CHECKED if checked else EntryForm.MULTIPLE if external else EntryForm.ORDINARY,
                           ReturnForm.CHECKED if checked else ReturnForm.ORDINARY)
-    tails = {t: EntryBinding(t, False) for targets in fir.exits.values() for t in targets if t in tr.func_addrs}
+    tails = {t: EntryBinding(t, False) for targets in external_exits(tr, fn).values() for t in targets if t in tr.func_addrs}
     body = BodyRequest(c_symbols.body_symbol(variant, fn.addr), variant, request.policy,
                        call_symbols=calls, tail_symbols=tails,
                        call_contracts={t: request.contracts[t] for t in calls if t in request.contracts},
                        indirect_contracts={ins.addr: request.indirect_contracts[ins.addr]
                                            for ins in fn.insns if ins.addr in request.indirect_contracts},
                        checked_calls=set(calls) & request.checked_returns,
-                       contract_calls=set(calls) & request.contract_calls if not fir.entries and not fir.seh else (),
-                       private_input_arguments=request.private_input_arguments,
+                       contract_calls=set(calls) & request.contract_calls if not external and not tr.seh_effects(fn) else (),
+                       private_input_arguments={t: request.private_input_arguments[t] for t in calls
+                                                if t in request.private_input_arguments},
                        mode_sites=request.mode_sites, entry_verify=request.entry_verify,
                        report_calls=request.report_calls)
+    return body
+
+
+def ssa_inputs(tr, lifter, fn, entries, request, artifacts):
+    body = ssa_request(tr, fn, entries, request)
+    fir = artifacts.lifted(tr, lifter, fn)
+    fir.entries = tuple(external_entries(tr, fn, entries))
+    return fir, body
+
+
+def prepare_ssa(tr, lifter, fn, entries, request, artifacts=None):
+    artifacts = artifacts if artifacts is not None else ArtifactStore()
+    fir, body = ssa_inputs(tr, lifter, fn, entries, request, artifacts)
+    return prepare_inputs(fir, body, lifter, artifacts)
+
+
+def prepare_inputs(fir, body, lifter, artifacts):
     try:
-        return prepare_body(fir, body, lifter=lifter, normalized=artifacts.normalized(fir, lifter, tails))
+        return prepare_body(fir, body, lifter=lifter,
+                            normalized=artifacts.normalized(fir, lifter, body.tail_symbols))
     except RecursionError:
         raise SSAError("SSA graph recursion budget")
 
@@ -117,12 +135,22 @@ class PrivatePlan:
     body: object | None
 
 
-def prepare_private(tr, lifter, fn, policy, layout, known_mode=False, artifacts=None, finalize=False):
-    artifacts = artifacts if artifacts is not None else ArtifactStore()
+def private_request(fn, policy, layout, known_mode):
     variant = BodyVariant(EntryForm.PRIVATE, ReturnForm.PRIVATE,
                           Guarded(CW_FAST, "entry") if known_mode else Dynamic())
-    fir = artifacts.lifted(tr, lifter, fn)
-    request = BodyRequest(c_symbols.body_symbol(variant, fn.addr, layout), variant, policy, layout=layout)
+    return BodyRequest(c_symbols.body_symbol(variant, fn.addr, layout), variant, policy, layout=layout)
+
+
+def private_inputs(tr, lifter, fn, policy, layout, known_mode, artifacts):
+    return artifacts.lifted(tr, lifter, fn), private_request(fn, policy, layout, known_mode)
+
+
+def prepare_private(tr, lifter, fn, policy, layout, known_mode=False, artifacts=None, finalize=False,
+                    inputs=None):
+    artifacts = artifacts if artifacts is not None else ArtifactStore()
+    fir, request = inputs if inputs is not None else private_inputs(
+        tr, lifter, fn, policy, layout, known_mode, artifacts)
+    variant = request.variant
     body = prepare_body(fir, request, lifter=lifter, normalized=artifacts.normalized(fir, lifter))
     if finalize:
         body.finalize({})

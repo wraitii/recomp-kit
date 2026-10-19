@@ -498,11 +498,11 @@ def parse_args(argv, system=None):
                         help="Regenerate translated C: all images, or only the named auxiliary modules "
                              "(comma-separated; 'main' names the game image)")
     parser.add_argument("--no-emission-cache", action="store_true",
-                        help="Skip the prepared-body cache used by selected-function regeneration")
+                        help="Disable prepared-body reuse and selected-function regeneration")
     parser.add_argument("--regen-function", action="append", default=[], metavar="HEX_ADDR",
                         help="Re-emit selected functions from validated whole-image preparation")
     parser.add_argument("--cache-emission", action="store_true",
-                        help="Save prepared graphs during full regeneration for later --regen-function runs")
+                        help="Cache prepared graphs for incremental and selected-function regeneration (default)")
     parser.add_argument("--function-corpus", type=Path, metavar="MANIFEST",
                         help="Build/check/report a game-owned native-reference function corpus")
     parser.add_argument("--corpus-checks", type=int, default=4096)
