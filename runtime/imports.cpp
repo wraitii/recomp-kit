@@ -843,6 +843,7 @@ void imports_init() {
     oleaut32_register();
     misc_dlls_register();
     msvcr90_register();
+    steam_api_register();
     comctl32_register();
     media_foundation_register();
     imports_register(g_user32_shims, g_user32_shim_count);
