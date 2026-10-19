@@ -12,7 +12,7 @@ from collections import defaultdict, namedtuple
 from dataclasses import dataclass, field
 
 from ir.guest import X86_32
-from ir.lift import LiftError
+from ir.lift import LiftError, Op
 from ir.normalize import codegen_ir
 from ir.preservation import forward
 from ir.simplify import canonicalize
@@ -68,10 +68,10 @@ def function_values(program, addr):
         fir.exits.setdefault(k, []).append(target)
     lanes = _register_lanes(program.lifter)
     index = {ins.addr: k for k, ins in enumerate(fir.insns)}
-    tail_exit = bool(fir.import_tails or fir.exits) or any(op.opc == "TAIL" for ins in fir.insns for op in ins.ops)
+    tail_exit = bool(fir.import_tails or fir.exits or body.dynamic) or any(op.opc == "TAIL" for ins in fir.insns for op in ins.ops)
     pops = stack_pops(fir, tail_exit)
     try:
-        ssa = _build(fir, program.lifter, lanes)
+        ssa = _build(fir, program.lifter, lanes, body.dynamic)
         canonicalize(ssa)
         forward(ssa)
     except SSAError as error:
@@ -230,8 +230,15 @@ def _register_lanes(lifter):
     return lanes
 
 
-def _build(fir, lifter, lanes):
+def _build(fir, lifter, lanes, dynamic=()):
+    if dynamic and (list(dynamic) != [len(fir.insns) - 1]
+                    or any(list(fir.succ[i]) != [i + 1] for i in range(len(fir.insns) - 1))):
+        raise SSAError("%08x: computed jump is not a straight-line tail transfer" % fir.addr)
     cgi = codegen_ir(fir, lifter, {target for targets in fir.exits.values() for target in targets})
+    for i in dynamic:
+        ins = cgi.insns[i]
+        ins.ops = [Op("CALLIND", op.out, op.ins) if op.opc == "BRANCHIND" else op for op in ins.ops]
+        ins.ops.append(Op("TRAP", None, (), ins.addr))
     targets = {op.ins[0][1] for ins in cgi.insns for op in ins.ops
                if op.opc == "CALL" and op.ins[0][0] == "ram"}
     return build(cgi, register_groups=list(lanes.values()), call_targets=targets,

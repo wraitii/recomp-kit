@@ -590,7 +590,7 @@ def main():
     if scope is not None:
         _outside_scope(layer, image, scope)
     fixpoint_done = time.monotonic()
-    from ir.indirect_targets import load as load_targets
+    from ir.indirect_targets import instruction_kind, load as load_targets
     aliases = Aliases(program, preserved, load_targets(settings, program), abi=not args.no_abi, settings=settings)
     structure = Structure(facts, image, observed, aliases)
     print("image %.1fs, census %.1fs, fixpoint %.1fs" % (
@@ -617,7 +617,8 @@ def main():
             merged[site] = set(row["targets"])
             added.add(site)
         lines = ["recomp-indirect-targets-v1\t%s" % settings.sha256.lower(), "site\tkind\ttargets"]
-        lines += ["%08x\tcall\t%s" % (site, ",".join("%08x" % target for target in sorted(targets)))
+        lines += ["%08x\t%s\t%s" % (site, instruction_kind(program.pe, site),
+                                   ",".join("%08x" % target for target in sorted(targets)))
                   for site, targets in sorted(merged.items())]
         args.targets.write_text("\n".join(lines) + "\n")
         print("targets %d (dispatch %d, nominal %d, structure %d, added %d)" % (

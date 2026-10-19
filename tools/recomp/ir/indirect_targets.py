@@ -8,6 +8,12 @@ KINDS = {"call": 2, "jump": 4}
 _HEX = re.compile(r"[0-9a-f]{8}")
 
 
+def instruction_kind(image, site):
+    opcode, modrm = image.bytes_at(site, 2)
+    return next((kind for kind, field in KINDS.items()
+                 if opcode == 0xFF and (modrm >> 3) & 7 == field), None)
+
+
 def load(settings, program):
     if settings.indirect_targets is None:
         return {}
@@ -34,8 +40,7 @@ def load(settings, program):
             raise TranslateError("%s: site %08x has unknown kind %r" % (path, addr, kind))
         if addr not in owners:
             raise TranslateError("%s: site %08x is not an instruction start in the code map" % (path, addr))
-        opcode, modrm = program.pe.bytes_at(addr, 2)
-        if opcode != 0xFF or (modrm >> 3) & 7 != KINDS[kind]:
+        if instruction_kind(program.pe, addr) != kind:
             raise TranslateError("%s: site %08x is not an indirect %s" % (path, addr, kind))
         parsed = []
         for target in targets.split(","):

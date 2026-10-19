@@ -60,7 +60,7 @@ class Functions:
                 self.stack_pops[addr] = None
             else:
                 fir = body.ir
-                tail = bool(fir.import_tails or body.exits) or any(op.opc == "TAIL" for ins in fir.insns for op in ins.ops)
+                tail = bool(fir.import_tails or body.exits or body.dynamic) or any(op.opc == "TAIL" for ins in fir.insns for op in ins.ops)
                 self.stack_pops[addr] = stack_pops(fir, tail)
         return self.stack_pops[addr]
 

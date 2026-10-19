@@ -1,8 +1,9 @@
 from dataclasses import dataclass, field
 
+from ir.indirect_targets import instruction_kind
+
 SHIM = "shim"
 TARGET_KINDS = frozenset(("known", "module", SHIM))
-CALL_REG = 2
 
 
 @dataclass
@@ -21,11 +22,10 @@ def parse_line(line):
     return int(fields[0], 16), int(fields[1], 16), fields[2]
 
 
-def is_indirect_call(pe, site):
+def is_indirect_transfer(pe, site):
     if not (pe.base <= site and site + 2 <= pe.end):
         return False
-    opcode, modrm = pe.bytes_at(site, 2)
-    return opcode == 0xFF and (modrm >> 3) & 7 == CALL_REG
+    return instruction_kind(pe, site) is not None
 
 
 def load_observed(path, program):
@@ -37,7 +37,7 @@ def load_observed(path, program):
                 continue
             site, target, kind = parse_line(line)
             if site not in checked:
-                checked[site] = is_indirect_call(program.pe, site)
+                checked[site] = is_indirect_transfer(program.pe, site)
             if not checked[site] or kind == SHIM or not program.pe.is_exec(target):
                 continue
             if target in program.functions:

@@ -29,6 +29,7 @@ sys.path[:0] = [str(KIT / "tools"), str(KIT / "tools" / "recomp")]
 
 from .core import vtable_slots  # noqa: E402
 from .facts import cached, collect, contracts, default_jobs, source_key  # noqa: E402
+from ir.indirect_targets import instruction_kind  # noqa: E402
 
 MAX_POSITIONS = 32
 
@@ -420,7 +421,8 @@ def main():
     args.out.write_text(json.dumps({"stats": stats, "methods": methods}, indent=1, default=_plain))
     if args.targets:
         lines = ["recomp-indirect-targets-v1\t%s" % settings.sha256.lower(), "site\tkind\ttargets"]
-        lines += ["%08x\tcall\t%s" % (site, ",".join("%08x" % t for t in row["targets"]))
+        lines += ["%08x\t%s\t%s" % (site, instruction_kind(bounds.image.program.pe, site),
+                                   ",".join("%08x" % t for t in row["targets"]))
                   for site, row in sorted(proven.items())]
         args.targets.write_text("\n".join(lines) + "\n")
     for addr in args.explain:

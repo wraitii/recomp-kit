@@ -30,6 +30,11 @@ the prefix. Unknown cleanup and nonreturning methods impose no incompatibility;
 nonreturning targets remain in the bound. An unlifted candidate leaves the site
 open. Observed edges constrain compatibility; they are not an exhaustive target
 list. Bounds excluding an observed target are rejected and reported.
+Straight-line virtual JMP forwarders use the same receiver analysis and emit
+`jump` bounds.
+Their SSA view ends at the transfer without pushing a return address or
+inferring cleanup or preservation. CW analysis removes conservative internal
+successors only after byte-checked bounds identify function-entry targets.
 
 This relies on the C++ assumptions that every runtime table is visibly installed
 and overrides preserve argument cleanup across an interface. Register usage,

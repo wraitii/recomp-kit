@@ -8,7 +8,7 @@ import re
 
 import decoded
 from frontend import external_exits
-from ir import call_contracts, call_sites, production, x87_facts
+from ir import call_contracts, call_sites, indirect_targets, production, x87_facts
 from ir.x87_cw import writer_effect
 from ir.x87_propagation import prepare as prepare_x87
 from ir.lift import LiftError
@@ -24,6 +24,7 @@ def _init(settings, artifacts=None):
     import driver
     import emission_cache
     _WORKER["ctx"] = driver.Context(settings, artifacts)
+    _WORKER["indirect"] = indirect_targets.load(settings, _WORKER["ctx"].program)
     _WORKER['cache'] = (emission_cache.AnalysisCache(*settings.preparation_cache, readonly=True)
                         if getattr(settings, 'preparation_cache', None) else None)
 
@@ -82,7 +83,7 @@ def _scan(task):
                 sites = call_sites.build(fir, ctx.image)
                 prepared = (call_contracts.prepare(fir, image=ctx.image, sites=sites, frontend=key)
                             if not (entries or site or fn.dead_addrs) else None)
-                mode_prepared = prepare_x87(fir, ctx.image, sites=sites)
+                mode_prepared = prepare_x87(fir, ctx.image, sites=sites, indirect=_WORKER["indirect"])
             except (LiftError, RecursionError):
                 prepared = None
             else:

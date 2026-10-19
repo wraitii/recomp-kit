@@ -16,7 +16,7 @@ Prepared = namedtuple("Prepared", ("addr", "entry", "sites", "order", "succ", "p
 Analysis = namedtuple("Analysis", ("calls", "returns", "losses", "sites", "gaps"), defaults=((),))
 
 
-def prepare(fir, image=None, sites=None):
+def prepare(fir, image=None, sites=None, indirect=None):
     """Prepare closed byte-backed IR; secondary entries contribute unknown facts.
 
     SEH bodies qualify only when every frame they establish is unwind-only
@@ -26,7 +26,12 @@ def prepare(fir, image=None, sites=None):
     """
     if not fir.insns:
         return None
-    rows = sites if sites is not None else call_sites.build(fir, image)
+    rows = dict(sites) if sites is not None else call_sites.build(fir, image)
+    bounded = {i for i, ins in enumerate(fir.insns)
+               if (indirect or {}).get(ins.addr, (None, ()))[0] == "jump"
+               and i in fir.exits and not fir.exits[i] and call_sites.indirect_jump(ins)}
+    for i in bounded:
+        rows[i] = call_sites.CallSite(fir.addr, fir.insns[i].addr, "tail", (), None)
     tails = {i: row.targets[0].address if row.targets else None
              for i, row in rows.items() if row.kind == "tail"}
     if any(i not in tails for i in fir.exits):
@@ -45,15 +50,16 @@ def prepare(fir, image=None, sites=None):
     if entry is None:
         return None
     roots = (entry,) + tuple(i for i, ins in enumerate(fir.insns) if ins.addr in fir.entries)
+    successors = [() if i in bounded else targets for i, targets in enumerate(fir.succ)]
     seen, todo = set(), list(roots)
     while todo:
         i = todo.pop()
         if i in seen or not 0 <= i < len(fir.insns):
             continue
         seen.add(i)
-        todo.extend(fir.succ[i])
+        todo.extend(successors[i])
     order = tuple(i for i in range(len(fir.insns)) if i in seen)
-    succ = tuple(tuple(j for j in fir.succ[i] if j in seen) if i in seen else ()
+    succ = tuple(tuple(j for j in successors[i] if j in seen) if i in seen else ()
                  for i in range(len(fir.insns)))
     preds = [[] for _ in fir.insns]
     effects, calls, returns = [], [], []
