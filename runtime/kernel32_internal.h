@@ -31,6 +31,7 @@ void open_mutex_named(X86 *c, const std::string &name);
 void kernel32_wide_reset();
 
 void get_command_line(X86 *c);
+uint32_t win32_command_line();
 void startup_info(X86 *c);
 void wait_multiple_objects(X86 *c);
 void kernel32_wide_reset_command_line();

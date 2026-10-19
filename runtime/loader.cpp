@@ -269,11 +269,19 @@ bool patch_iat(const std::vector<uint8_t> &file, size_t opt_off, uint16_t opt_ma
                 continue;
             }
             // A DLL with a shim table keeps its per-name stubs, including the
-            // deliberate logging-only ones. A DLL with no table at all is not
-            // merely unimplemented: calling into it must stop with the name of
+            // deliberate logging-only ones. A strict DLL is one whose table is
+            // still being filled in: its gaps must abort under their own name,
+            // not return zero. A DLL with no table at all is not merely
+            // unimplemented either: calling into it must stop with the name of
             // the missing dll!function rather than returning zero.
-            void (*unknown)(X86 *) = imports_has_dll(dll.c_str()) ? nullptr : imports_unsupported;
-            uint32_t tramp = imports_alloc_trampoline(dll.c_str(), namebuf, unknown, ARGC_UNKNOWN);
+            uint32_t tramp = imports_resolve(dll.c_str(), namebuf);
+            if (!tramp) {
+                void (*unknown)(X86 *) =
+                    (imports_has_dll(dll.c_str()) && !imports_is_strict_dll(dll.c_str()))
+                        ? nullptr
+                        : imports_unsupported;
+                tramp = imports_alloc_trampoline(dll.c_str(), namebuf, unknown, ARGC_UNKNOWN);
+            }
             if (!tramp) {
                 g_error = "ran out of import trampolines";
                 return false;
@@ -1088,6 +1096,9 @@ bool loader_load(const char *exe_path) {
     }
     if (!patch_iat(file, opt_off, opt_magic, g_base, g_size))
         return false;
+    // Data imports the CRT reads before any call, now that the IAT holds their
+    // guest addresses.
+    msvcr90_init();
 
     if (g_entry != LOADER_EXPECTED_ENTRY)
         LOGW("entry point is %08x, expected %08x", g_entry, LOADER_EXPECTED_ENTRY);

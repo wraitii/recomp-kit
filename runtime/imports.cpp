@@ -65,6 +65,10 @@ std::set<std::string> &registered_dlls() {
     static auto *s = new std::set<std::string>();
     return *s;
 }
+std::set<std::string> &strict_dlls() {
+    static auto *s = new std::set<std::string>();
+    return *s;
+}
 
 struct DataImport {
     uint32_t size = 0;
@@ -135,6 +139,15 @@ void imports_register(const ImportShim *shims, size_t count) {
 
 bool imports_has_dll(const char *dll_lower) {
     return registered_dlls().count(lower_dll(dll_lower)) != 0;
+}
+
+void imports_register_strict(const char *dll) {
+    registered_dlls().insert(lower_dll(dll));
+    strict_dlls().insert(lower_dll(dll));
+}
+
+bool imports_is_strict_dll(const char *dll_lower) {
+    return strict_dlls().count(lower_dll(dll_lower)) != 0;
 }
 
 uint32_t imports_alloc_trampoline(const char *dll, const char *name, void (*fn)(X86 *),
@@ -829,6 +842,7 @@ void imports_init() {
     kernel32_wide_register();
     oleaut32_register();
     misc_dlls_register();
+    msvcr90_register();
     comctl32_register();
     media_foundation_register();
     imports_register(g_user32_shims, g_user32_shim_count);

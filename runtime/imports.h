@@ -32,6 +32,11 @@ void imports_unsupported(X86 *c);
 // Registers a shim table. Later registrations override earlier ones for the
 // same (dll, name); a null fn never overrides a non-null one.
 void imports_register(const ImportShim *shims, size_t count);
+// Declares a DLL whose unimplemented imports must stop the run under their
+// own name instead of returning 0 from a logging-only stub. A table that is
+// still being filled in uses this so every gap stays a named failure.
+void imports_register_strict(const char *dll);
+bool imports_is_strict_dll(const char *dll_lower);
 // True if a shim table registered an entry for this DLL (case-insensitive).
 bool imports_has_dll(const char *dll_lower);
 
@@ -77,6 +82,9 @@ void oleaut32_register();
 void oleaut32_reset();
 void oleaut32_thread_exit(X86 *c);
 void misc_dlls_register();
+void msvcr90_register();
+// Fills the CRT's data imports once the image is mapped and the IAT is bound.
+void msvcr90_init();
 void comctl32_register();
 void media_foundation_register();
 

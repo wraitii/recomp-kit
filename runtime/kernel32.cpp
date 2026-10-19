@@ -5520,7 +5520,7 @@ void k_GetExitCodeProcess(X86 *c) {
     set_eax(c, 1);
 }
 
-void get_command_line(X86 *c) {
+uint32_t win32_command_line() {
     if (!g_cmdline_addr) {
         // The CRT skips argv[0] before passing lpCmdLine to WinMain. Quote
         // the executable so whitespace in its path never becomes game args.
@@ -5529,7 +5529,11 @@ void get_command_line(X86 *c) {
             line += std::string(" ") + extra;
         g_cmdline_addr = guest_strdup(line.c_str());
     }
-    set_eax(c, g_cmdline_addr);
+    return g_cmdline_addr;
+}
+
+void get_command_line(X86 *c) {
+    set_eax(c, win32_command_line());
 }
 
 void startup_info(X86 *c) {
