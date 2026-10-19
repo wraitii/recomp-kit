@@ -1617,7 +1617,29 @@ void u_MessageBoxW(X86 *c) {
 
 // The Win32 format subset (%s %c %d %i %u %x %X %% with width/precision and
 // the l/h size prefixes). `va` points at the guest argument array.
-static void format_into(X86 *c, uint32_t out, const std::string &fmt, uint32_t va) {
+static std::string utf8_codepoint(uint32_t u) {
+    if (u >= 0xd800 && u < 0xe000)
+        u = 0xfffd;
+    std::string out;
+    if (u < 0x80) {
+        out += (char)u;
+    } else if (u < 0x800) {
+        out += (char)(0xc0 | (u >> 6));
+        out += (char)(0x80 | (u & 0x3f));
+    } else if (u < 0x10000) {
+        out += (char)(0xe0 | (u >> 12));
+        out += (char)(0x80 | ((u >> 6) & 0x3f));
+        out += (char)(0x80 | (u & 0x3f));
+    } else {
+        out += (char)(0xf0 | (u >> 18));
+        out += (char)(0x80 | ((u >> 12) & 0x3f));
+        out += (char)(0x80 | ((u >> 6) & 0x3f));
+        out += (char)(0x80 | (u & 0x3f));
+    }
+    return out;
+}
+
+static void format_into(X86 *c, uint32_t out, const std::string &fmt, uint32_t va, bool wide) {
     std::string res;
     size_t i = 0;
     while (i < fmt.size()) {
@@ -1641,7 +1663,7 @@ static void format_into(X86 *c, uint32_t out, const std::string &fmt, uint32_t v
             while (i < fmt.size() && isdigit((unsigned char)fmt[i]))
                 spec.push_back(fmt[i++]);
         }
-        while (i < fmt.size() && (fmt[i] == 'l' || fmt[i] == 'h'))
+        while (i < fmt.size() && (fmt[i] == 'l' || fmt[i] == 'h' || fmt[i] == 'w'))
             ++i;
         if (i >= fmt.size())
             break;
@@ -1650,15 +1672,23 @@ static void format_into(X86 *c, uint32_t out, const std::string &fmt, uint32_t v
         va += 4;
         char buf[512];
         switch (conv) {
-        case 's': {
-            std::string s = gm_str(v, 1024);
+        case 's':
+        case 'S': {
+            std::string s = (wide == (conv == 's')) ? gm_wstr(v, 1024) : gm_str(v, 1024);
             spec.push_back('s');
             snprintf(buf, sizeof buf, spec.c_str(), s.c_str());
             break;
         }
         case 'c':
-            spec.push_back('c');
-            snprintf(buf, sizeof buf, spec.c_str(), (int)(v & 0xff));
+        case 'C':
+            if (wide == (conv == 'c')) {
+                std::string s = utf8_codepoint(v & 0xffff);
+                spec.push_back('s');
+                snprintf(buf, sizeof buf, spec.c_str(), s.c_str());
+            } else {
+                spec.push_back('c');
+                snprintf(buf, sizeof buf, spec.c_str(), (int)(v & 0xff));
+            }
             break;
         case 'd':
         case 'i':
@@ -1684,19 +1714,28 @@ static void format_into(X86 *c, uint32_t out, const std::string &fmt, uint32_t v
         }
         res += buf;
     }
-    if (out)
-        memcpy(g_mem + out, res.c_str(), res.size() + 1);
-    set_eax(c, (uint32_t)res.size());
+    uint32_t len = wide ? utf16_units(res) : (uint32_t)res.size();
+    if (out) {
+        if (wide)
+            len = gm_put_wstr(out, res, len + 1);
+        else
+            memcpy(g_mem + out, res.c_str(), res.size() + 1);
+    }
+    set_eax(c, len);
 }
 
 void u_wvsprintfA(X86 *c) {
-    format_into(c, arg(c, 0), gm_str(arg(c, 1), 4096), arg(c, 2));
+    format_into(c, arg(c, 0), gm_str(arg(c, 1), 4096), arg(c, 2), false);
 }
 
-// wsprintfA is the cdecl varargs twin: after its two fixed arguments the
+// wsprintfA/W are the cdecl varargs twins: after their two fixed arguments the
 // values themselves begin at ESP+12, not a va_list pointer.
 void u_wsprintfA(X86 *c) {
-    format_into(c, arg(c, 0), gm_str(arg(c, 1), 4096), c->r[R_ESP] + 12);
+    format_into(c, arg(c, 0), gm_str(arg(c, 1), 4096), c->r[R_ESP] + 12, false);
+}
+
+void u_wsprintfW(X86 *c) {
+    format_into(c, arg(c, 0), gm_wstr(arg(c, 1), 4096), c->r[R_ESP] + 12, true);
 }
 
 } // namespace user32
@@ -1792,6 +1831,12 @@ void u_WaitMessage(X86 *c) {
 }
 
 // Clipboard: nothing is shared with the host clipboard.
+uint32_t g_clipboard_viewer = 0;
+void u_SetClipboardViewer(X86 *c) {
+    uint32_t previous = g_clipboard_viewer;
+    g_clipboard_viewer = arg(c, 0);
+    set_eax(c, previous);
+}
 void u_OpenClipboard(X86 *c) {
     set_eax(c, 1);
 }
@@ -1815,6 +1860,11 @@ void u_SetCapture(X86 *c) {
 }
 void u_ReleaseCapture(X86 *c) {
     g_capture_hwnd = 0;
+    set_eax(c, 1);
+}
+
+void u_TrackMouseEvent(X86 *c) {
+    // DIVERGENCE(original): the request is accepted but no WM_MOUSELEAVE is posted.
     set_eax(c, 1);
 }
 
@@ -2134,6 +2184,7 @@ const ImportShim g_user32_shims[] = {
     {"USER32.dll", "wvsprintfA", 3, u_wvsprintfA},
     // Variadic and therefore cdecl: the caller cleans the stack.
     {"USER32.dll", "wsprintfA", ARGC_CDECL, u_wsprintfA},
+    {"USER32.dll", "wsprintfW", ARGC_CDECL, u_wsprintfW},
     // Not imported by D3DPopTB.exe, but registered so GetProcAddress and the
     // host layer can reach them.
     {"USER32.dll", "SendMessageA", 4, u_SendMessageA},
@@ -2148,6 +2199,7 @@ const ImportShim g_user32_shims[] = {
     {"USER32.dll", "AdjustWindowRect", 3, u_AdjustWindowRect},
     {"USER32.dll", "SetCapture", 1, u_SetCapture},
     {"USER32.dll", "ReleaseCapture", 0, u_ReleaseCapture},
+    {"USER32.dll", "TrackMouseEvent", 1, u_TrackMouseEvent},
     {"USER32.dll", "GetDesktopWindow", 0, nullptr},
     {"USER32.dll", "MapVirtualKeyA", 2, u_MapVirtualKeyA},
     {"USER32.dll", "GetKeyNameTextA", 3, u_GetKeyNameTextA},
@@ -2167,6 +2219,7 @@ const ImportShim g_user32_shims[] = {
     {"USER32.dll", "CloseWindow", 1, u_CloseWindow},
     {"USER32.dll", "SetForegroundWindow", 1, u_SetForegroundWindow},
     {"USER32.dll", "SetActiveWindow", 1, u_SetActiveWindow},
+    {"USER32.dll", "SetClipboardViewer", 1, u_SetClipboardViewer},
     {"USER32.dll", "OpenClipboard", 1, u_OpenClipboard},
     {"USER32.dll", "CloseClipboard", 0, u_CloseClipboard},
     {"USER32.dll", "IsClipboardFormatAvailable", 1, u_IsClipboardFormatAvailable},

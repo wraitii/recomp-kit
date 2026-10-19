@@ -959,7 +959,7 @@ class Translator(ControlFlow):
                 keep = "<" if m in ("MINSD", "MINSS") else ">"
                 L.append("{ %s a_ = %s, b_ = %s; %s }"
                          % (t, scalar(dst, single), scalar(src, single),
-                            store_scalar(dst, "b_ %s a_ ? a_ : b_" % keep, single)))
+                            store_scalar(dst, "a_ %s b_ ? a_ : b_" % keep, single)))
             elif m in ("COMISD", "UCOMISD", "COMISS", "UCOMISS"):
                 L.append("recomp_comis(c, %s, %s);" % (scalar(dst, single), scalar(src, single)))
             elif m in ("CVTSI2SD", "CVTSI2SS"):

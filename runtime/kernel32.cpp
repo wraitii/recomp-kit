@@ -5276,7 +5276,15 @@ void delete_file_named(X86 *c, const std::string &name) {
     set_eax(c, rc == 0 ? 1 : 0);
 }
 
-void move_file_named(X86 *c, const std::string &source, const std::string &dest) {
+void move_file_ex_named(X86 *c, const std::string &source, const std::string &dest,
+                        uint32_t flags) {
+    enum { REPLACE_EXISTING = 1, COPY_ALLOWED = 2, WRITE_THROUGH = 8 };
+    if (flags & ~(REPLACE_EXISTING | COPY_ALLOWED | WRITE_THROUGH)) {
+        LOGW("MoveFileEx: unsupported flags 0x%x", flags);
+        set_last_error(ERROR_CALL_NOT_IMPLEMENTED_);
+        set_eax(c, 0);
+        return;
+    }
     std::string from = win32_host_path_op(source, WIN32_FILE_RENAME_SRC);
     std::string to = win32_host_path_op(dest, WIN32_FILE_RENAME_DST);
     if (from.empty() || to.empty()) {
@@ -5284,17 +5292,48 @@ void move_file_named(X86 *c, const std::string &source, const std::string &dest)
         set_eax(c, 0);
         return;
     }
-    OsStat st;
-    if (os_lstat(to.c_str(), &st) == 0) {
+    OsStat to_stat{}, from_stat{};
+    bool exists = os_lstat(to.c_str(), &to_stat) == 0;
+    if (exists && !(flags & REPLACE_EXISTING)) {
         set_last_error(ERROR_ALREADY_EXISTS_);
         set_eax(c, 0);
         return;
     }
     int rc = os_rename(from.c_str(), to.c_str());
+    if (rc != 0 && errno == EXDEV && (flags & COPY_ALLOWED) &&
+        os_lstat(from.c_str(), &from_stat) == 0 && from_stat.is_regular) {
+        FILE *in = fopen(from.c_str(), "rb");
+        FILE *out = in ? fopen(to.c_str(), "wb") : nullptr;
+        if (!out) {
+            if (in)
+                fclose(in);
+            set_last_error(ERROR_ACCESS_DENIED_);
+            set_eax(c, 0);
+            return;
+        }
+        char buf[65536];
+        size_t n;
+        bool ok = true;
+        while ((n = fread(buf, 1, sizeof buf, in)) > 0)
+            if (fwrite(buf, 1, n, out) != n) {
+                ok = false;
+                break;
+            }
+        ok = ok && ferror(in) == 0;
+        fclose(in);
+        ok = fclose(out) == 0 && ok;
+        if (ok)
+            ok = os_unlink(from.c_str()) == 0;
+        rc = ok ? 0 : -1;
+    }
     if (rc != 0)
         set_last_error(errno == ENOENT ? ERROR_FILE_NOT_FOUND_ : ERROR_ACCESS_DENIED_);
     win32_invalidate_dir_cache();
     set_eax(c, rc == 0 ? 1 : 0);
+}
+
+void move_file_named(X86 *c, const std::string &source, const std::string &dest) {
+    move_file_ex_named(c, source, dest, 0);
 }
 
 void copy_file_named(X86 *c, const std::string &source, const std::string &dest) {

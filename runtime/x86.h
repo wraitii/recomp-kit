@@ -522,11 +522,11 @@ static inline uint32_t recomp_sse_divps(uint32_t a, uint32_t b) {
 }
 static inline uint32_t recomp_sse_minps(uint32_t a, uint32_t b) {
     float x = recomp_sse_f32(a), y = recomp_sse_f32(b);
-    return recomp_sse_f32_bits(y < x ? x : y);
+    return x < y ? a : b;
 }
 static inline uint32_t recomp_sse_maxps(uint32_t a, uint32_t b) {
     float x = recomp_sse_f32(a), y = recomp_sse_f32(b);
-    return recomp_sse_f32_bits(y > x ? x : y);
+    return x > y ? a : b;
 }
 static inline uint32_t recomp_sse_sqrtps(uint32_t a) {
     return recomp_sse_f32_bits(recomp_sse_sqrtf(recomp_sse_f32(a)));

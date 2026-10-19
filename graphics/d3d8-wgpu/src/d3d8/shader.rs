@@ -138,6 +138,7 @@ impl Declaration {
                     .ok_or_else(|| fail(format!("vertex stream {stream} is not bound")))?;
                 let bytes = crate::d3d9::draw::vertex_element_bytes(
                     source.data,
+                    source.stream,
                     source.stride,
                     0,
                     offset,

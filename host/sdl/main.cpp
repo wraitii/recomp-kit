@@ -213,18 +213,23 @@ HostWindowSize viewport_window_size_for(int gw, int gh) {
 // itself, which keeps clear of a camera notch, or else the window's display.
 std::atomic<int> g_screen_w{0}, g_screen_h{0};
 void note_screen_size() {
+    SDL_DisplayID display = g_window ? SDL_GetDisplayForWindow(g_window) : SDL_GetPrimaryDisplay();
     int w = 0, h = 0;
     if (g_window && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN)) {
         if (!SDL_GetWindowSize(g_window, &w, &h))
             w = h = 0;
     } else {
         SDL_Rect bounds = {0, 0, 0, 0};
-        SDL_DisplayID display =
-            g_window ? SDL_GetDisplayForWindow(g_window) : SDL_GetPrimaryDisplay();
         if (SDL_GetDisplayBounds(display, &bounds)) {
             w = bounds.w;
             h = bounds.h;
         }
+    }
+    if (const SDL_DisplayMode *mode = SDL_GetDesktopDisplayMode(display)) {
+        const int pw = int(std::lround(mode->w * mode->pixel_density));
+        const int ph = int(std::lround(mode->h * mode->pixel_density));
+        if (pw > 0 && ph > 0)
+            host_display_set_screen(pw, ph);
     }
     if (w <= 0 || h <= 0)
         return;
@@ -2553,6 +2558,7 @@ int main(int argc, char **argv) {
     SDL_DestroyWindow(game_window);
     // The audio device goes before the SDL it runs on, not in the exit
     // handlers after it: there its stream is destroyed through a freed mutex.
+    host_audio_queue_report(stdout);
     host_audio_shutdown();
     SDL_Quit();
     platform_ui_process_exit(0);

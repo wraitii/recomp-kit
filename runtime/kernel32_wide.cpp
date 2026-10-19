@@ -176,6 +176,37 @@ void k_GetSystemDirectoryW(X86 *c) {
     set_eax(c, !arg(c, 0) || cap <= dir.size() ? (uint32_t)dir.size() + 1
                                                : gm_put_wstr(arg(c, 0), dir, cap));
 }
+void k_MoveFileExW(X86 *c) {
+    move_file_ex_named(c, gm_wstr(arg(c, 0)), gm_wstr(arg(c, 1)), arg(c, 2));
+}
+void k_GetVolumePathNameW(X86 *c) {
+    std::string name = gm_wstr(arg(c, 0));
+    uint32_t out = arg(c, 1), cap = arg(c, 2);
+    if (name.empty() || !out || !cap) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    std::string full = full_path_named(name);
+    std::string root;
+    if (full.size() >= 3 && full[1] == ':' && full[2] == '\\')
+        root = full.substr(0, 3);
+    else if (full.size() >= 2 && full[1] == ':')
+        root = full.substr(0, 2) + '\\';
+    if (root.empty()) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    root[0] = (char)toupper((unsigned char)root[0]);
+    if (cap < utf16_units(root) + 1) {
+        set_last_error(206); // ERROR_FILENAME_EXCED_RANGE
+        set_eax(c, 0);
+        return;
+    }
+    gm_put_wstr(out, root, cap);
+    set_eax(c, 1);
+}
 void k_GetVolumeInformationW(X86 *c) {
     volume_information_named(c, gm_wstr(arg(c, 0)), true);
 }
@@ -1162,10 +1193,12 @@ static const ImportShim g_kernel32_wide[] = {
     {"KERNEL32.dll", "SetFileAttributesW", 2, k_SetFileAttributesW},
     {"KERNEL32.dll", "DeleteFileW", 1, k_DeleteFileW},
     {"KERNEL32.dll", "MoveFileW", 2, k_MoveFileW},
+    {"KERNEL32.dll", "MoveFileExW", 3, k_MoveFileExW},
     {"KERNEL32.dll", "CopyFileW", 3, k_CopyFileW},
     {"KERNEL32.dll", "CreateDirectoryW", 2, k_CreateDirectoryW},
     {"KERNEL32.dll", "RemoveDirectoryW", 1, k_RemoveDirectoryW},
     {"KERNEL32.dll", "GetSystemDirectoryW", 2, k_GetSystemDirectoryW},
+    {"KERNEL32.dll", "GetVolumePathNameW", 3, k_GetVolumePathNameW},
     {"KERNEL32.dll", "GetVolumeInformationW", 8, k_GetVolumeInformationW},
     {"KERNEL32.dll", "GetDriveTypeW", 1, k_GetDriveTypeW},
     {"KERNEL32.dll", "GetLogicalDriveStringsW", 2, k_GetLogicalDriveStringsW},

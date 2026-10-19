@@ -323,9 +323,29 @@ pub(crate) fn expanded_indices(
         .try_reserve_exact(unique_capacity)
         .map_err(|_| RenderError::out_of_memory("Draw", "index expansion allocation failed"))?;
     let dense_range = command.num_vertices as usize;
+    // Retail D3D9 uses MinVertexIndex/NumVertices as hints; the fetch below is
+    // bounded by the actual stream. The dense remap still indexes by the hint
+    // range, so it is disabled when the span falls outside it.
     let use_dense_remap = packed_indices
         && dense_range <= 1_048_576
-        && dense_range <= (count as usize).saturating_mul(8).max(4096);
+        && dense_range <= (count as usize).saturating_mul(8).max(4096)
+        && {
+            let start = command.start_vertex as usize;
+            let end = start.checked_add(count as usize);
+            let available = index_count(command.index_format, &command.index_bytes);
+            match end {
+                Some(end) if end <= available => (start..end).all(|i| {
+                    let raw = i64::from(indexed_vertex_index(
+                        &command.index_bytes,
+                        command.index_format,
+                        i,
+                    ));
+                    raw >= i64::from(command.min_vertex)
+                        && raw < i64::from(command.min_vertex) + i64::from(command.num_vertices)
+                }),
+                _ => false,
+            }
+        };
     if use_dense_remap {
         dense_remap
             .try_reserve(dense_range.saturating_sub(dense_remap.len()))
@@ -364,11 +384,6 @@ pub(crate) fn expanded_indices(
         }
         for i in start..end {
             let raw = indexed_vertex_index(&command.index_bytes, command.index_format, i) as i64;
-            if raw < i64::from(command.min_vertex)
-                || raw >= i64::from(command.min_vertex) + i64::from(command.num_vertices)
-            {
-                return Err(invalid("Draw", "index outside MinVertexIndex/NumVertices"));
-            }
             let absolute = raw + i64::from(command.base_vertex);
             if absolute < 0 || absolute > u32::MAX as i64 {
                 return Err(invalid(
@@ -479,6 +494,7 @@ struct VertexFetch<'a> {
 
 pub(crate) fn vertex_element_bytes(
     bytes: &[u8],
+    stream: u32,
     stride: u32,
     stream_offset: u32,
     offset: u64,
@@ -494,7 +510,13 @@ pub(crate) fn vertex_element_bytes(
         .checked_add(size)
         .ok_or_else(|| invalid("Draw", "vertex offset overflow"))?;
     if end > bytes.len() {
-        return Err(invalid("Draw", "vertex fetch is outside the stream"));
+        return Err(invalid(
+            "Draw",
+            format!(
+                "vertex fetch is outside stream {stream}: stride {stride}, stream offset {stream_offset}, element offset {offset}, element size {size}, index {index}, required end {end}, available {}",
+                bytes.len()
+            ),
+        ));
     }
     Ok(&bytes[base..end])
 }
@@ -520,7 +542,23 @@ impl<'a> VertexFetch<'a> {
             .and_then(|v| v.checked_add(size))
             .ok_or_else(|| invalid("Draw", "vertex offset overflow"))?;
         if end > data.bytes.len() {
-            return Err(invalid("Draw", "vertex fetch is outside the stream"));
+            return Err(invalid(
+                "Draw",
+                format!(
+                    "vertex fetch is outside stream {stream}: stride {}, stream offset {}, element offset {offset}, element size {size}, max index {max_index}, required end {end}, available {}; primitive {}, primitives {}, indexed {}, base vertex {}, min vertex {}, vertex count {}, start {}, index format {}",
+                    data.stride,
+                    data.offset,
+                    data.bytes.len(),
+                    command.primitive,
+                    command.primitive_count,
+                    command.indexed,
+                    command.base_vertex,
+                    command.min_vertex,
+                    command.num_vertices,
+                    command.start_vertex,
+                    command.index_format
+                ),
+            ));
         }
         Ok(Self {
             bytes: &data.bytes[start..],
@@ -825,11 +863,6 @@ fn native_geometry(
         }
         (min, max)
     };
-    if min_raw < command.min_vertex
-        || u64::from(max_raw) >= u64::from(command.min_vertex) + u64::from(command.num_vertices)
-    {
-        return Err(invalid("Draw", "index outside MinVertexIndex/NumVertices"));
-    }
     let max_index = i64::from(max_raw) + i64::from(command.base_vertex);
     if i64::from(min_raw) + i64::from(command.base_vertex) < 0 || max_index > i64::from(u32::MAX) {
         return Err(invalid(
@@ -1640,12 +1673,6 @@ fn depth_state(
     depth: Option<&SurfaceView>,
 ) -> Result<Option<wgpu::DepthStencilState>, RenderError> {
     let Some(depth) = depth else {
-        if rs(state, 7) != 0 || rs(state, 52) != 0 {
-            return Err(invalid(
-                "Draw",
-                "depth or stencil enabled without a depth surface",
-            ));
-        }
         return Ok(None);
     };
     if rs(state, 7) == 2 {
@@ -2016,7 +2043,7 @@ struct PipelineKey {
     modules: [wgpu::ShaderModule; 2],
     layout: wgpu::BindGroupLayout,
     buffers: VertexLayouts,
-    target: wgpu::ColorTargetState,
+    target: Option<wgpu::ColorTargetState>,
     primitive: wgpu::PrimitiveState,
     depth: Option<wgpu::DepthStencilState>,
     multisample: wgpu::MultisampleState,
@@ -2412,6 +2439,7 @@ impl D3d9DrawState {
                 attributes,
             })
             .collect();
+        let targets = key.target.clone().map(|target| [Some(target)]);
         let pipeline = gpu
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2426,7 +2454,7 @@ impl D3d9DrawState {
                 fragment: Some(wgpu::FragmentState {
                     module: &key.modules[1],
                     entry_point: Some("ps_main"),
-                    targets: &[Some(key.target.clone())],
+                    targets: targets.as_ref().map_or(&[], |targets| targets.as_slice()),
                     compilation_options: Default::default(),
                 }),
                 primitive: key.primitive,
@@ -3169,7 +3197,7 @@ pub(crate) fn execute(
                     modules: memo.modules.clone(),
                     layout: memo.layout.clone(),
                     buffers: buffers.clone(),
-                    target,
+                    target: Some(target),
                     primitive: wgpu::PrimitiveState {
                         topology,
                         strip_index_format,
@@ -3801,10 +3829,13 @@ pub(crate) fn clear(
         });
         return Ok(());
     }
+    let depth_matches = depth.is_some_and(|d| d.width == target.width && d.height == target.height);
+    let pass_depth = depth.filter(|_| depth_matches);
+    let separate_depth = depth.filter(|_| !depth_matches);
     let mut source = String::from(
         "struct Params {color:vec4<f32>,depth:vec4<f32>}\n@group(0) @binding(0) var<uniform> params:Params;\n@vertex fn vs_main(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32>{let p=array<vec2<f32>,3>(vec2<f32>(-1.0,-1.0),vec2<f32>(3.0,-1.0),vec2<f32>(-1.0,3.0));return vec4<f32>(p[i],0.0,1.0);}\n",
     );
-    if flags & 2 != 0 {
+    if flags & 2 != 0 && pass_depth.is_some() {
         source += "struct Out {@location(0) color:vec4<f32>,@builtin(frag_depth) depth:f32}\n@fragment fn ps_main()->Out{var o:Out;o.color=params.color;o.depth=params.depth.x;return o;}\n";
     } else {
         source += "@fragment fn ps_main()->@location(0) vec4<f32>{return params.color;}\n";
@@ -3836,85 +3867,145 @@ pub(crate) fn clear(
         depth_fail_op: wgpu::StencilOperation::Keep,
         pass_op: wgpu::StencilOperation::Replace,
     };
-    let ds = depth
-        .map(|d| {
-            Ok::<_, RenderError>(wgpu::DepthStencilState {
-                format: d.texture.format(),
-                depth_write_enabled: flags & 2 != 0,
-                depth_compare: wgpu::CompareFunction::Always,
-                stencil: wgpu::StencilState {
-                    front: face,
-                    back: face,
-                    read_mask: u32::MAX,
-                    write_mask: if flags & 4 != 0 { u32::MAX } else { 0 },
-                },
-                bias: Default::default(),
-            })
+    let depth_state = |d: &SurfaceView| {
+        Ok::<_, RenderError>(wgpu::DepthStencilState {
+            format: d.texture.format(),
+            depth_write_enabled: flags & 2 != 0,
+            depth_compare: wgpu::CompareFunction::Always,
+            stencil: wgpu::StencilState {
+                front: face,
+                back: face,
+                read_mask: u32::MAX,
+                write_mask: if flags & 4 != 0 { u32::MAX } else { 0 },
+            },
+            bias: Default::default(),
         })
-        .transpose()?;
-    let pipeline = draw.pipeline(
-        gpu,
-        PipelineKey {
-            modules: [shader.clone(), shader],
-            layout,
-            buffers: SmallVec::new(),
-            target: wgpu::ColorTargetState {
-                format: target.texture.format(),
-                blend: None,
-                write_mask: if flags & 1 != 0 {
-                    wgpu::ColorWrites::ALL
-                } else {
-                    wgpu::ColorWrites::empty()
+    };
+    let color_pipeline = if flags & 1 != 0 || pass_depth.is_some() {
+        Some(draw.pipeline(
+            gpu,
+            PipelineKey {
+                modules: [shader.clone(), shader.clone()],
+                layout: layout.clone(),
+                buffers: SmallVec::new(),
+                target: Some(wgpu::ColorTargetState {
+                    format: target.texture.format(),
+                    blend: None,
+                    write_mask: if flags & 1 != 0 {
+                        wgpu::ColorWrites::ALL
+                    } else {
+                        wgpu::ColorWrites::empty()
+                    },
+                }),
+                primitive: Default::default(),
+                depth: pass_depth.map(&depth_state).transpose()?,
+                multisample: Default::default(),
+            },
+        )?)
+    } else {
+        None
+    };
+    let depth_pipeline = match separate_depth {
+        Some(d) => {
+            let source = "struct Params {color:vec4<f32>,depth:vec4<f32>}\n@group(0) @binding(0) var<uniform> params:Params;\n@vertex fn vs_main(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32>{let p=array<vec2<f32>,3>(vec2<f32>(-1.0,-1.0),vec2<f32>(3.0,-1.0),vec2<f32>(-1.0,3.0));return vec4<f32>(p[i],0.0,1.0);}\n@fragment fn ps_main()->@builtin(frag_depth) f32{return params.depth.x;}\n";
+            let shader = draw.shader(gpu, source)?;
+            Some(draw.pipeline(
+                gpu,
+                PipelineKey {
+                    modules: [shader.clone(), shader],
+                    layout: layout.clone(),
+                    buffers: SmallVec::new(),
+                    target: None,
+                    primitive: Default::default(),
+                    depth: Some(depth_state(d)?),
+                    multisample: Default::default(),
                 },
-            },
-            primitive: Default::default(),
-            depth: ds,
-            multisample: Default::default(),
-        },
-    )?;
+            )?)
+        }
+        None => None,
+    };
     gpu.record(|encoder, _| {
-        let colors = [Some(wgpu::RenderPassColorAttachment {
-            view: &target.view,
-            resolve_target: None,
-            depth_slice: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Load,
-                store: wgpu::StoreOp::Store,
-            },
-        })];
-        let depth = depth.map(|d| wgpu::RenderPassDepthStencilAttachment {
-            view: &d.view,
-            depth_ops: Some(wgpu::Operations {
-                load: wgpu::LoadOp::Load,
-                store: wgpu::StoreOp::Store,
-            }),
-            stencil_ops: if super::format::has_stencil(d.format) {
-                Some(wgpu::Operations {
+        if let Some(pipeline) = &color_pipeline {
+            let colors = [Some(wgpu::RenderPassColorAttachment {
+                view: &target.view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
                     load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
-                })
-            } else {
-                None
-            },
-        });
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("d3d9-clear"),
-            color_attachments: &colors,
-            depth_stencil_attachment: depth,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.set_stencil_reference(stencil);
-        for r in rects {
-            let l = r.left.clamp(0, target.width as i32) as u32;
-            let t = r.top.clamp(0, target.height as i32) as u32;
-            let right = r.right.clamp(0, target.width as i32) as u32;
-            let bottom = r.bottom.clamp(0, target.height as i32) as u32;
-            if right > l && bottom > t {
-                pass.set_scissor_rect(l, t, right - l, bottom - t);
-                pass.draw(0..3, 0..1);
+                },
+            })];
+            let depth = pass_depth.map(|d| wgpu::RenderPassDepthStencilAttachment {
+                view: &d.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: if super::format::has_stencil(d.format) {
+                    Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    })
+                } else {
+                    None
+                },
+            });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("d3d9-clear"),
+                color_attachments: &colors,
+                depth_stencil_attachment: depth,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.set_stencil_reference(stencil);
+            for r in rects {
+                let l = r.left.clamp(0, target.width as i32) as u32;
+                let t = r.top.clamp(0, target.height as i32) as u32;
+                let right = r.right.clamp(0, target.width as i32) as u32;
+                let bottom = r.bottom.clamp(0, target.height as i32) as u32;
+                if right > l && bottom > t {
+                    pass.set_scissor_rect(l, t, right - l, bottom - t);
+                    pass.draw(0..3, 0..1);
+                }
+            }
+        }
+        if let (Some(d), Some(pipeline)) = (separate_depth, &depth_pipeline) {
+            let depth = Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &d.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: if super::format::has_stencil(d.format) {
+                    Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    })
+                } else {
+                    None
+                },
+            });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("d3d9-clear-depth"),
+                color_attachments: &[],
+                depth_stencil_attachment: depth,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.set_stencil_reference(stencil);
+            for r in rects {
+                let l = r.left.clamp(0, d.width as i32) as u32;
+                let t = r.top.clamp(0, d.height as i32) as u32;
+                let right = r.right.clamp(0, d.width as i32) as u32;
+                let bottom = r.bottom.clamp(0, d.height as i32) as u32;
+                if right > l && bottom > t {
+                    pass.set_scissor_rect(l, t, right - l, bottom - t);
+                    pass.draw(0..3, 0..1);
+                }
             }
         }
     });

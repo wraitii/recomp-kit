@@ -11,9 +11,11 @@
 #include "intrinsics.h"
 #include "memory.h"
 #include "kernel32_internal.h"
+#include "win32.h"
 #include "../platform/os.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -1194,6 +1196,38 @@ bool read_tm(uint32_t src, std::tm &tm) {
     return true;
 }
 
+void crt_stat64i32(X86 *c) {
+    uint32_t name = arg(c, 0), dst = arg(c, 1);
+    if (!name || !dst || !gm_valid(dst, 48)) {
+        wr32(guest_slot(g_errno_addr), EINVAL);
+        set_eax(c, 0xffffffffu);
+        return;
+    }
+    std::string host = win32_host_path_op(gm_str(name, 4096), WIN32_FILE_READ);
+    OsStat st{};
+    if (host.empty() || os_stat(host.c_str(), &st) != 0) {
+        wr32(guest_slot(g_errno_addr), ENOENT);
+        set_eax(c, 0xffffffffu);
+        return;
+    }
+    uint16_t mode = st.is_dir ? 0x4000 : 0x8000; // _S_IFDIR / _S_IFREG
+    mode |= 0x0100;                              // _S_IREAD
+    if (!st.is_readonly)
+        mode |= 0x0080; // _S_IWRITE
+    wr32(dst + 0, 0);
+    wr16(dst + 4, (uint16_t)st.ino);
+    wr16(dst + 6, mode);
+    wr16(dst + 8, st.is_dir ? 2 : 1);
+    wr16(dst + 10, 0);
+    wr16(dst + 12, 0);
+    wr32(dst + 16, 0);
+    wr32(dst + 20, st.is_dir ? 0 : (uint32_t)st.size);
+    wr64(dst + 24, (uint64_t)st.atime);
+    wr64(dst + 32, (uint64_t)st.mtime);
+    wr64(dst + 40, (uint64_t)st.ctime);
+    set_eax(c, 0);
+}
+
 void crt_time64(X86 *c) {
     uint64_t now = (uint64_t)std::time(nullptr);
     uint32_t dst = arg(c, 0);
@@ -1584,6 +1618,215 @@ std::string guest_format(uint32_t fmtp, uint32_t argp) {
     return format_host(std::string(guest_cstr(fmtp)), args);
 }
 
+bool scan_space(char ch) {
+    return std::isspace((unsigned char)ch) != 0;
+}
+
+void scan_write_int(uint32_t p, FmtLen len, bool sign, uint64_t value) {
+    if (len == FmtLen::LL || len == FmtLen::I64) {
+        if (!gm_valid(p, 8))
+            return;
+        wr32(p, (uint32_t)value);
+        wr32(p + 4, (uint32_t)(value >> 32));
+    } else if (len == FmtLen::H) {
+        if (!gm_valid(p, 2))
+            return;
+        wr16(p, sign ? (uint16_t)(int16_t)value : (uint16_t)value);
+    } else if (len == FmtLen::HH) {
+        if (!gm_valid(p, 1))
+            return;
+        wr8(p, sign ? (uint8_t)(int8_t)value : (uint8_t)value);
+    } else if (gm_valid(p, 4)) {
+        wr32(p, sign ? (uint32_t)(int32_t)value : (uint32_t)value);
+    }
+}
+
+int scan_guest(const std::string &input, const std::string &fmt, uint32_t argp) {
+    size_t i = 0, s = 0;
+    int assigned = 0;
+    bool converted = false;
+    while (i < fmt.size()) {
+        if (scan_space(fmt[i])) {
+            while (i < fmt.size() && scan_space(fmt[i]))
+                ++i;
+            while (s < input.size() && scan_space(input[s]))
+                ++s;
+            continue;
+        }
+        if (fmt[i] != '%') {
+            if (s >= input.size())
+                return converted ? assigned : -1;
+            if (input[s] != fmt[i])
+                break;
+            ++s;
+            ++i;
+            continue;
+        }
+        ++i;
+        if (i < fmt.size() && fmt[i] == '%') {
+            if (s >= input.size())
+                return converted ? assigned : -1;
+            if (input[s] != '%')
+                break;
+            ++s;
+            ++i;
+            continue;
+        }
+        bool suppress = false;
+        if (i < fmt.size() && fmt[i] == '*') {
+            suppress = true;
+            ++i;
+        }
+        int width = -1;
+        while (i < fmt.size() && fmt[i] >= '0' && fmt[i] <= '9')
+            width = (width < 0 ? 0 : width) * 10 + (fmt[i++] - '0');
+        FmtLen len = FmtLen::None;
+        if (i < fmt.size()) {
+            char m = fmt[i];
+            if (m == 'h') {
+                ++i;
+                if (i < fmt.size() && fmt[i] == 'h') {
+                    len = FmtLen::HH;
+                    ++i;
+                } else {
+                    len = FmtLen::H;
+                }
+            } else if (m == 'l') {
+                ++i;
+                if (i < fmt.size() && fmt[i] == 'l') {
+                    len = FmtLen::LL;
+                    ++i;
+                } else {
+                    len = FmtLen::L;
+                }
+            } else if (m == 'L') {
+                len = FmtLen::LDouble;
+                ++i;
+            } else if (m == 'I') {
+                ++i;
+                if (i + 1 < fmt.size() && fmt[i] == '6' && fmt[i + 1] == '4') {
+                    len = FmtLen::I64;
+                    i += 2;
+                } else if (i + 1 < fmt.size() && fmt[i] == '3' && fmt[i + 1] == '2') {
+                    len = FmtLen::I32;
+                    i += 2;
+                } else {
+                    len = FmtLen::I32;
+                }
+            } else if (m == 'w') {
+                ++i;
+            } else if (m == 'z') {
+                len = FmtLen::Z;
+                ++i;
+            } else if (m == 't') {
+                len = FmtLen::T;
+                ++i;
+            } else if (m == 'j') {
+                len = FmtLen::LL;
+                ++i;
+            }
+        }
+        if (i >= fmt.size())
+            break;
+        char conv = fmt[i++];
+        uint32_t dst = suppress ? 0 : (gm_valid(argp, 4) ? rd32(argp) : 0);
+        if (!suppress)
+            argp += 4;
+        if (conv != 'c' && conv != '[' && conv != 'n')
+            while (s < input.size() && scan_space(input[s]))
+                ++s;
+
+        if (conv == 'n') {
+            if (!suppress)
+                scan_write_int(dst, len, true, s);
+            converted = true;
+            continue;
+        }
+        if (s >= input.size())
+            return converted ? assigned : -1;
+        if (conv == 'c') {
+            size_t n = width < 0 ? 1 : (size_t)width;
+            if (s + n > input.size() || (!suppress && !gm_valid(dst, (uint32_t)n)))
+                break;
+            if (!suppress) {
+                for (size_t k = 0; k < n; ++k)
+                    wr8(dst + (uint32_t)k, (uint8_t)input[s + k]);
+                ++assigned;
+            }
+            s += n;
+            converted = true;
+            continue;
+        }
+        if (conv == 's') {
+            size_t begin = s;
+            size_t limit = width < 0 ? input.size() - s : (size_t)width;
+            while (s < input.size() && s - begin < limit && !scan_space(input[s]))
+                ++s;
+            size_t n = s - begin;
+            if (!n)
+                break;
+            converted = true;
+            if (!suppress) {
+                if (!gm_valid(dst, (uint32_t)n + 1))
+                    break;
+                for (size_t k = 0; k < n; ++k)
+                    wr8(dst + (uint32_t)k, (uint8_t)input[begin + k]);
+                wr8(dst + (uint32_t)n, 0);
+                ++assigned;
+            }
+            continue;
+        }
+        size_t token_len = width < 0 ? input.size() - s : (size_t)width;
+        std::string token = input.substr(s, token_len);
+        char *end = nullptr;
+        errno = 0;
+        if (conv == 'd' || conv == 'i' || conv == 'u' || conv == 'o' || conv == 'x' ||
+            conv == 'X' || conv == 'p') {
+            bool sign = conv == 'd' || conv == 'i';
+            int base = conv == 'o' ? 8 : (conv == 'x' || conv == 'X' || conv == 'p' ? 16 : 10);
+            if (conv == 'i')
+                base = 0;
+            uint64_t value = sign ? (uint64_t)std::strtoll(token.c_str(), &end, base)
+                                  : std::strtoull(token.c_str(), &end, base);
+            if (end == token.c_str())
+                break;
+            s += (size_t)(end - token.c_str());
+            converted = true;
+            if (!suppress) {
+                scan_write_int(dst, conv == 'p' ? FmtLen::I32 : len, sign, value);
+                ++assigned;
+            }
+            continue;
+        }
+        if (conv == 'f' || conv == 'F' || conv == 'e' || conv == 'E' || conv == 'g' ||
+            conv == 'G' || conv == 'a' || conv == 'A') {
+            double value = std::strtod(token.c_str(), &end);
+            if (end == token.c_str())
+                break;
+            s += (size_t)(end - token.c_str());
+            converted = true;
+            if (!suppress) {
+                bool as_double = len == FmtLen::L || len == FmtLen::LDouble;
+                if (as_double && gm_valid(dst, 8)) {
+                    uint64_t bits;
+                    memcpy(&bits, &value, sizeof bits);
+                    wr32(dst, (uint32_t)bits);
+                    wr32(dst + 4, (uint32_t)(bits >> 32));
+                } else if (!as_double && gm_valid(dst, 4)) {
+                    float f = (float)value;
+                    uint32_t bits;
+                    memcpy(&bits, &f, sizeof bits);
+                    wr32(dst, bits);
+                }
+                ++assigned;
+            }
+            continue;
+        }
+        break;
+    }
+    return assigned;
+}
+
 uint32_t put_guest_text(uint32_t dst, const std::string &s, uint32_t cap) {
     if (!dst)
         return 0;
@@ -1600,6 +1843,11 @@ uint32_t put_guest_text(uint32_t dst, const std::string &s, uint32_t cap) {
     if (limit)
         g_mem[dst + n] = 0;
     return n;
+}
+
+void crt_sscanf(X86 *c) {
+    int n = scan_guest(gm_str(arg(c, 0), 1 << 20), gm_str(arg(c, 1), 4096), c->r[R_ESP] + 12);
+    set_eax(c, (uint32_t)n);
 }
 
 void crt_sprintf(X86 *c) {
@@ -1874,6 +2122,7 @@ const ImportShim g_msvcr90_shims[] = {
     {"MSVCR90.dll", "_XcptFilter", ARGC_CDECL, crt_xcpt_filter},
     {"MSVCR90.dll", "signal", ARGC_CDECL, crt_signal},
     {"MSVCR90.dll", "rand", ARGC_CDECL, crt_rand},
+    {"MSVCR90.dll", "_stat64i32", ARGC_CDECL, crt_stat64i32},
     {"MSVCR90.dll", "_time32", ARGC_CDECL, crt_time32},
     {"MSVCR90.dll", "_time64", ARGC_CDECL, crt_time64},
     {"MSVCR90.dll", "_localtime64", ARGC_CDECL, crt_localtime64},
@@ -1936,6 +2185,7 @@ const ImportShim g_msvcr90_shims[] = {
     {"MSVCR90.dll", "_ultoa", ARGC_CDECL, crt_ultoa},
     {"MSVCR90.dll", "atoi", ARGC_CDECL, crt_atoi},
     {"MSVCR90.dll", "atol", ARGC_CDECL, crt_atoi},
+    {"MSVCR90.dll", "sscanf", ARGC_CDECL, crt_sscanf},
     {"MSVCR90.dll", "sprintf", ARGC_CDECL, crt_sprintf},
     {"MSVCR90.dll", "vsprintf", ARGC_CDECL, crt_vsprintf},
     {"MSVCR90.dll", "_snprintf", ARGC_CDECL, crt_snprintf},

@@ -40,6 +40,14 @@ const OP_M4X3: u32 = 21;
 const OP_M3X4: u32 = 22;
 const OP_M3X3: u32 = 23;
 const OP_M3X2: u32 = 24;
+const OP_REP: u32 = 38;
+const OP_ENDREP: u32 = 39;
+const OP_IF: u32 = 40;
+const OP_IFC: u32 = 41;
+const OP_ELSE: u32 = 42;
+const OP_ENDIF: u32 = 43;
+const OP_BREAK: u32 = 44;
+const OP_BREAKC: u32 = 45;
 const OP_DCL: u32 = 31;
 const OP_POW: u32 = 32;
 const OP_CRS: u32 = 33;
@@ -170,6 +178,9 @@ fn operand_count(op: u32, major: u32, minor: u32, pixel: bool) -> Option<u32> {
         OP_SINCOS => {
             if major >= 3 { 2 } else { 4 }
         }
+        OP_REP | OP_IF => 1,
+        OP_IFC | OP_BREAKC => 2,
+        OP_ENDREP | OP_ELSE | OP_ENDIF | OP_BREAK => 0,
         OP_DCL => 2,
         OP_DEF | OP_DEFI => 5,
         OP_DEFB => 2,
@@ -203,6 +214,47 @@ fn src_of(t: u32, major: u32) -> (Src, bool) {
     )
 }
 
+fn read_src(
+    p: &mut Program,
+    words: &[u32],
+    k: &mut usize,
+    end: usize,
+    inst: &mut Inst,
+) -> Result<(), RenderError> {
+    if *k >= end || *k >= words.len() {
+        return Err(fail("instruction source extends past the staged bytecode"));
+    }
+    let (mut s, extra) = src_of(words[*k], p.major);
+    *k += 1;
+    if extra {
+        if *k >= end || *k >= words.len() {
+            return Err(fail("relative address token extends past the instruction"));
+        }
+        let (addr, _) = src_of(words[*k], p.major);
+        *k += 1;
+        if addr.ty != R_ADDR || addr.index != 0 {
+            return Err(fail("relative address token is not a0"));
+        }
+        s.rel_comp = uniform_component(addr.swz)
+            .ok_or_else(|| fail("relative address component is not uniform"))?;
+    }
+    if s.rel && (p.pixel || s.ty != R_CONST) {
+        return Err(fail(
+            "relative addressing is only implemented for vertex float constants",
+        ));
+    }
+    check_reg(s.ty, s.index, p.pixel, p.major, p.minor, false)?;
+    if s.ty == R_CONST {
+        if s.rel {
+            p.relative = true;
+        }
+        p.max_const = p.max_const.max(s.index + 1);
+    }
+    inst.src[inst.nsrc as usize] = s;
+    inst.nsrc += 1;
+    Ok(())
+}
+
 fn check_reg(
     ty: u32,
     index: u32,
@@ -220,7 +272,7 @@ fn check_reg(
     match ty {
         R_TEMP => {
             let limit = if !pixel {
-                11
+                if major == 2 && minor == 1 { 31 } else { 11 }
             } else if major == 1 && minor <= 3 {
                 1
             } else if major == 1 {
@@ -498,11 +550,41 @@ impl Program {
                     "coissue is only implemented for pixel shader model 1.x",
                 ));
             }
-            if inst.ctrl != 0 && !(op == OP_TEX && inst.ctrl <= 2) {
+            let comparison = matches!(op, OP_IFC | OP_BREAKC);
+            if comparison {
+                if !(1..=6).contains(&inst.ctrl) {
+                    return Err(fail(format!(
+                        "comparison control {} is not implemented",
+                        inst.ctrl
+                    )));
+                }
+            } else if inst.ctrl != 0 && !(op == OP_TEX && inst.ctrl <= 2) {
                 return Err(fail(format!(
                     "instruction control {} is not implemented",
                     inst.ctrl
                 )));
+            }
+            let control_sources = match op {
+                OP_REP | OP_IF => Some(1),
+                OP_IFC | OP_BREAKC => Some(2),
+                OP_ENDREP | OP_ELSE | OP_ENDIF | OP_BREAK => Some(0),
+                _ => None,
+            };
+            if let Some(expected) = control_sources {
+                let mut k = at;
+                let end = at + len;
+                while k < end && inst.nsrc < 4 {
+                    read_src(&mut p, words, &mut k, end, &mut inst)?;
+                }
+                if inst.nsrc != expected {
+                    return Err(fail(format!(
+                        "instruction {op} has {} source operands, expected {expected}",
+                        inst.nsrc
+                    )));
+                }
+                p.code.push(inst);
+                i = end;
+                continue;
             }
             if op == OP_TEXKILL {
                 let (s, _) = src_of(words[at], p.major);
@@ -530,31 +612,7 @@ impl Program {
                 }
             }
             while k < end && inst.nsrc < 4 {
-                let (mut s, extra) = src_of(words[k], p.major);
-                k += 1;
-                if extra {
-                    let (addr, _) = src_of(words[k], p.major);
-                    k += 1;
-                    if addr.ty != R_ADDR || addr.index != 0 {
-                        return Err(fail("relative address token is not a0"));
-                    }
-                    s.rel_comp = uniform_component(addr.swz)
-                        .ok_or_else(|| fail("relative address component is not uniform"))?;
-                }
-                if s.rel && (p.pixel || s.ty != R_CONST) {
-                    return Err(fail(
-                        "relative addressing is only implemented for vertex float constants",
-                    ));
-                }
-                check_reg(s.ty, s.index, p.pixel, p.major, p.minor, false)?;
-                if s.ty == R_CONST {
-                    if s.rel {
-                        p.relative = true;
-                    }
-                    p.max_const = p.max_const.max(s.index + 1);
-                }
-                inst.src[inst.nsrc as usize] = s;
-                inst.nsrc += 1;
+                read_src(&mut p, words, &mut k, end, &mut inst)?;
             }
             if matches!(op, OP_M4X4 | OP_M4X3 | OP_M3X4 | OP_M3X3 | OP_M3X2)
                 && inst.nsrc > 1
@@ -1077,6 +1135,137 @@ impl<'a> Gen<'a> {
         self.commit(&db, &format!("pair{n}b"));
     }
 
+    fn comparison(&mut self, inst: &Inst) -> String {
+        let a = self.s(inst, 0);
+        let b = self.s(inst, 1);
+        let op = match inst.ctrl {
+            1 => ">",
+            2 => "==",
+            3 => ">=",
+            4 => "<",
+            5 => "!=",
+            6 => "<=",
+            _ => {
+                self.fail(format!("comparison control {} is not implemented", inst.ctrl));
+                "=="
+            }
+        };
+        format!("((({a}).x) {op} (({b}).x))")
+    }
+
+    fn rep(&mut self, code: &[Inst], i: &mut usize, loops: u32) {
+        let inst = code[*i];
+        *i += 1;
+        if inst.src[0].ty != R_CONSTINT {
+            self.fail("REP count is not an integer constant");
+            return;
+        }
+        let count = self.s(&inst, 0);
+        let n = self.seq;
+        self.seq += 1;
+        self.body += &format!("let rep{n} = bitcast<u32>(i32(({count}).x));\n");
+        self.body += &format!(
+            "for (var rep_i{n}: u32 = 0u; rep_i{n} < rep{n}; rep_i{n}++) {{\n"
+        );
+        let stop = self.emit_sequence(code, i, &[OP_ENDREP], loops + 1);
+        if stop == Some(OP_ENDREP) {
+            *i += 1;
+        } else {
+            self.fail("REP has no matching ENDREP");
+        }
+        self.body += "}\n";
+    }
+
+    fn conditional(&mut self, code: &[Inst], i: &mut usize, loops: u32) {
+        let inst = code[*i];
+        *i += 1;
+        let cond = if inst.op == OP_IFC {
+            self.comparison(&inst)
+        } else {
+            let value = self.s(&inst, 0);
+            format!("(({value}).x != 0.0)")
+        };
+        self.body += &format!("if ({cond}) {{\n");
+        let stop = self.emit_sequence(code, i, &[OP_ELSE, OP_ENDIF], loops);
+        match stop {
+            Some(OP_ENDIF) => {
+                *i += 1;
+            }
+            Some(OP_ELSE) => {
+                *i += 1;
+                self.body += "} else {\n";
+                let stop = self.emit_sequence(code, i, &[OP_ENDIF], loops);
+                if stop == Some(OP_ENDIF) {
+                    *i += 1;
+                } else {
+                    self.fail("IF has no matching ENDIF");
+                }
+            }
+            _ => self.fail("IF has no matching ENDIF"),
+        }
+        self.body += "}\n";
+    }
+
+    fn emit_sequence(
+        &mut self,
+        code: &[Inst],
+        i: &mut usize,
+        stops: &[u32],
+        loops: u32,
+    ) -> Option<u32> {
+        while *i < code.len() {
+            let op = code[*i].op;
+            if stops.contains(&op) {
+                return Some(op);
+            }
+            if code[*i].coissue {
+                self.fail("coissue instruction without a preceding instruction");
+                *i += 1;
+                continue;
+            }
+            if *i + 1 < code.len() && code[*i + 1].coissue {
+                self.coissue_pair(&code[*i], &code[*i + 1]);
+                *i += 2;
+            } else {
+                match op {
+                    OP_REP => self.rep(code, i, loops),
+                    OP_IF | OP_IFC => self.conditional(code, i, loops),
+                    OP_BREAK => {
+                        if loops == 0 {
+                            self.fail("BREAK is used outside a REP loop");
+                        } else {
+                            self.body += "break;\n";
+                        }
+                        *i += 1;
+                    }
+                    OP_BREAKC => {
+                        let inst = code[*i];
+                        *i += 1;
+                        if loops == 0 {
+                            self.fail("BREAKC is used outside a REP loop");
+                        } else {
+                            let cond = self.comparison(&inst);
+                            self.body += &format!("if ({cond}) {{ break; }}\n");
+                        }
+                    }
+                    OP_ENDREP | OP_ELSE | OP_ENDIF => {
+                        self.fail(format!("unexpected control instruction {op}"));
+                        *i += 1;
+                    }
+                    _ => {
+                        let inst = code[*i];
+                        self.instruction(&inst);
+                        *i += 1;
+                    }
+                }
+            }
+            if self.failed.is_some() {
+                break;
+            }
+        }
+        None
+    }
+
     fn generate(&mut self) -> Result<(), RenderError> {
         let defs: Vec<(u32, [f32; 4])> = self.p.defs.iter().map(|(&k, &v)| (k, v)).collect();
         for (index, value) in defs {
@@ -1088,22 +1277,7 @@ impl<'a> Gen<'a> {
         }
         let code = self.p.code.clone();
         let mut i = 0usize;
-        while i < code.len() {
-            if code[i].coissue {
-                self.fail("coissue instruction without a preceding instruction");
-                break;
-            }
-            if i + 1 < code.len() && code[i + 1].coissue {
-                self.coissue_pair(&code[i], &code[i + 1]);
-                i += 2;
-            } else {
-                self.instruction(&code[i]);
-                i += 1;
-            }
-            if self.failed.is_some() {
-                break;
-            }
-        }
+        self.emit_sequence(&code, &mut i, &[], 0);
         if let Some(cause) = self.failed.take() {
             return Err(fail(cause));
         }

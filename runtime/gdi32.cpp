@@ -80,6 +80,11 @@ void win32_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp) {
     *w = 1024;
     *h = 768;
     *bpp = 32;
+    int32_t host_w = 0, host_h = 0;
+    if (host_display_screen(&host_w, &host_h) && host_w > 0 && host_h > 0) {
+        *w = uint32_t(host_w);
+        *h = uint32_t(host_h);
+    }
     if (const char *size = recomp_env("SMOKE_DRAWABLE")) {
         int width = 0, height = 0;
         char trailing = 0;

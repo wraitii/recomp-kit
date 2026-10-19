@@ -346,9 +346,9 @@ fn register_operand_count(op: u32, params: u16) -> u16 {
 
 fn version_supported(pixel: bool, major: u32, minor: u32) -> bool {
     if pixel {
-        (major == 1 && (1..=4).contains(&minor)) || (major == 2 && minor == 0)
+        (major == 1 && (1..=4).contains(&minor)) || (major == 2 && minor <= 1)
     } else {
-        (major == 1 && minor == 1) || (major == 2 && minor == 0)
+        (major == 1 && minor == 1) || (major == 2 && minor <= 1)
     }
 }
 
@@ -373,9 +373,12 @@ pub fn shader_word_count(words: &[u32], pixel: bool) -> Result<usize, RenderErro
     let major = (version_token >> 8) & 0xff;
     let minor = version_token & 0xff;
     if !version_supported(pixel, major, minor) {
+        let stage = if pixel { "ps" } else { "vs" };
         return Err(unsupported(
             "CreateShader",
-            format!("shader model {major}.{minor} is not implemented"),
+            format!(
+                "shader model {stage}_{major}_{minor} (raw token {version_token:#010x}) is not implemented"
+            ),
         ));
     }
     let version = major * 256 + minor;

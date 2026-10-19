@@ -560,10 +560,6 @@ void D9_CheckDeviceFormatConversion(X86 *c) {
     com_ret(c, bridge_result(c, recomp::d3d::d3d9_check_device_format_conversion(request)));
 }
 
-// D3DCAPS9 (304 bytes), as a GeForce 7800 GTX reports it for what the
-// renderer implements: shader model 3.0, trilinear and 16x anisotropic
-// filtering, the usual blend, compare and stencil sets, non-power-of-two
-// textures, four render targets.
 void D9_GetDeviceCaps(X86 *c) {
     uint32_t out = arg(c, 3);
     if (!this_d3d9(c) || arg(c, 1) != 0 || arg(c, 2) < D3DDEVTYPE_HAL || arg(c, 2) > 3 || !out ||
