@@ -58,7 +58,7 @@ def ssa_request(tr, fn, entries, request):
         if ins.mnem == "CALL":
             target = tr.branch_target(ins)
             if target in request.known:
-                if tr.image.import_thunk_name(target) == "setjmp3":
+                if (tr.image.import_thunk_name(target) or "").lstrip("_") == "setjmp3":
                     calls[target] = "RECOMP_SETJMP3"
                     setjmp_targets.add(target)
                 else:

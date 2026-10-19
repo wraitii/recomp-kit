@@ -745,7 +745,7 @@ class Translator(ControlFlow):
                 t = int(ins.ops[0], 16)
                 L.append("c->r[4] -= 4; wr32(c->r[4], %s);" % hexlit(nxt))
                 if t in self.func_addrs:
-                    if self.image.import_thunk_name(t) == "setjmp3":
+                    if (self.image.import_thunk_name(t) or "").lstrip("_") == "setjmp3":
                         L.append("RECOMP_SETJMP3(c);")
                     else:
                         self.call_targets.add(t)
