@@ -305,4 +305,4 @@ def codegen_ir(fir, lifter, tails=()):
         normalized.text = original.text
     succ = add_exit_stubs(insns, fir.succ, fir.exits, tails)
     return FunctionIR(fir.addr, insns, succ, fir.tables, entries=fir.entries, language=fir.language,
-                      import_tails=fir.import_tails, tableless=fir.tableless)
+                      import_tails=fir.import_tails)

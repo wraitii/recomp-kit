@@ -53,11 +53,16 @@ class ProductionRequest:
 
 def ssa_request(tr, fn, entries, request):
     calls = {}
+    setjmp_targets = set()
     for ins in fn.insns:
         if ins.mnem == "CALL":
             target = tr.branch_target(ins)
             if target in request.known:
-                calls[target] = EntryBinding(target, target in request.checked_returns)
+                if tr.image.import_thunk_name(target) == "setjmp3":
+                    calls[target] = "RECOMP_SETJMP3"
+                    setjmp_targets.add(target)
+                else:
+                    calls[target] = EntryBinding(target, target in request.checked_returns)
     external = tuple(external_entries(tr, fn, entries))
     checked = fn.addr in request.checked_returns
     variant = BodyVariant(EntryForm.CHECKED if checked else EntryForm.MULTIPLE if external else EntryForm.ORDINARY,
@@ -65,13 +70,15 @@ def ssa_request(tr, fn, entries, request):
     tails = {t: EntryBinding(t, False) for targets in external_exits(tr, fn).values() for t in targets if t in tr.func_addrs}
     body = BodyRequest(c_symbols.body_symbol(variant, fn.addr), variant, request.policy,
                        call_symbols=calls, tail_symbols=tails,
-                       call_contracts={t: request.contracts[t] for t in calls if t in request.contracts},
+                       call_contracts={t: request.contracts[t] for t in calls
+                                       if t in request.contracts and t not in setjmp_targets},
                        indirect_contracts={ins.addr: request.indirect_contracts[ins.addr]
                                            for ins in fn.insns if ins.addr in request.indirect_contracts},
-                       checked_calls=set(calls) & request.checked_returns,
-                       contract_calls=set(calls) & request.contract_calls if not external and not tr.seh_effects(fn) else (),
+                       checked_calls=(set(calls) & request.checked_returns) - setjmp_targets,
+                       contract_calls=(set(calls) & request.contract_calls) - setjmp_targets
+                       if not external and not tr.seh_effects(fn) else (),
                        private_input_arguments={t: request.private_input_arguments[t] for t in calls
-                                                if t in request.private_input_arguments},
+                                                if t in request.private_input_arguments and t not in setjmp_targets},
                        mode_sites=request.mode_sites, entry_verify=request.entry_verify,
                        report_calls=request.report_calls)
     return body

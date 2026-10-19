@@ -51,6 +51,15 @@ class Image(PE):
         self._DecodeRecord = DecodeRecord
         self._operand_record = operand_record
 
+    def import_thunk_name(self, va):
+        if not hasattr(self, "_import_thunk_cache"):
+            self._import_thunk_cache = {}
+        if va not in self._import_thunk_cache:
+            raw = self.bytes_at(va, 6) if self.is_exec(va) and va + 6 <= self.end else b""
+            slot = int.from_bytes(raw[2:], "little") if raw[:2] == b"\xff\x25" else None
+            self._import_thunk_cache[va] = self.iat_names.get(slot) if slot is not None else None
+        return self._import_thunk_cache[va]
+
     def seh_constructor_helper(self, va):
         """Return the handler stored by Delphi's returning constructor helper.
 

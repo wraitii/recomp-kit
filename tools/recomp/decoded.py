@@ -230,10 +230,8 @@ class Translator(ControlFlow):
         dead = {i for i, ins in enumerate(fn.insns) if ins.addr in fn.dead_addrs}
         live = [i for i in range(len(fn.insns)) if i not in dead]
         labels = set(fn.pushed_continuations) | set(entries)
-        tableless = any(ins.mnem == "JMP" and self.branch_target(ins) is None
-                        and not self.jumptables.get((fn.addr, ins.addr)) for ins in fn.insns)
-        self.dispatch_targets = sorted(fn.addrs - fn.dead_addrs) if tableless else []
-        if tableless:
+        if any(ins.mnem == "JMP" and self.branch_target(ins) is None
+               and not self.jumptables.get((fn.addr, ins.addr)) for ins in fn.insns):
             labels.update(fn.insns[i].addr for i in live)
         for i in live:
             ins = fn.insns[i]
@@ -295,13 +293,6 @@ class Translator(ControlFlow):
                 out.append("    uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
             if head:
                 out.append("    goto L_%08x;" % fn.addr)
-        if self.dispatch_targets:
-            out.append("    static const uint32_t dispatch_addrs_[] = {")
-            out.extend("        %s," % hexlit(t) for t in self.dispatch_targets)
-            out.append("    };")
-            out.append("    static void *const dispatch_labels_[] = {")
-            out.extend("        &&L_%08x," % t for t in self.dispatch_targets)
-            out.append("    };")
         for position, i in enumerate(live):
             ins = fn.insns[i]
             if ins.addr in labels:
@@ -754,8 +745,11 @@ class Translator(ControlFlow):
                 t = int(ins.ops[0], 16)
                 L.append("c->r[4] -= 4; wr32(c->r[4], %s);" % hexlit(nxt))
                 if t in self.func_addrs:
-                    self.call_targets.add(t)
-                    L.append("CALL_FN(%08x);" % t)
+                    if self.image.import_thunk_name(t) == "setjmp3":
+                        L.append("RECOMP_SETJMP3(c);")
+                    else:
+                        self.call_targets.add(t)
+                        L.append("CALL_FN(%08x);" % t)
                 else:
                     self.reject_offimage_call(fn, t)
                     L.append("recomp_call(c, %s);" % hexlit(t))
@@ -933,7 +927,8 @@ class Translator(ControlFlow):
             dst, src = ops[0], ops[1]
             # Which host type this form works in. The conversions name both,
             # so they spell their own operands out instead.
-            single = m.endswith("SS") and m not in ("CVTSD2SS",)
+            single = ((m.endswith("SS") and m != "CVTSD2SS")
+                      or m in ("CVTTSS2SI", "CVTSS2SI"))
 
             def scalar(op, as_single):
                 if op.kind == "xmm":
@@ -971,7 +966,9 @@ class Translator(ControlFlow):
                 L.append(store_scalar(dst, "(%s)(int32_t)%s" % ("float" if single else "double",
                                                                 read_op(src, 32)), single))
             elif m in ("CVTTSD2SI", "CVTTSS2SI"):
-                L.append(write_op(dst, 32, "(uint32_t)(int32_t)%s" % scalar(src, single)))
+                value = ("recomp_sse_cvttss2si(%s)" % scalar(src, True) if single
+                         else "(int32_t)%s" % scalar(src, False))
+                L.append(write_op(dst, 32, "(uint32_t)%s" % value))
             elif m in ("CVTSS2SI", "CVTSD2SI"):
                 helper = "recomp_sse_cvtss2si" if single else "recomp_sse_cvtsd2si"
                 L.append(write_op(dst, 32, "(uint32_t)%s(%s)" % (helper, scalar(src, single))))
@@ -1217,19 +1214,10 @@ class Translator(ControlFlow):
             # that transfer in the current host frame; nonlocal targets and
             # holes in the listing retain the existing runtime dispatch.
             L.append("if (t_ >= %s && t_ < %s) {" % (hexlit(fn.insns[0].addr), hexlit(fn.end)))
-            if self.dispatch_targets:
-                count = len(self.dispatch_targets)
-                L.append("uint32_t dl_ = 0, dh_ = %d;" % count)
-                L.append("while (dl_ < dh_) {")
-                L.append("    uint32_t dm_ = dl_ + (dh_ - dl_) / 2;")
-                L.append("    if (dispatch_addrs_[dm_] < t_) dl_ = dm_ + 1; else dh_ = dm_;")
-                L.append("}")
-                L.append("if (dl_ < %d && dispatch_addrs_[dl_] == t_) goto *dispatch_labels_[dl_];" % count)
-            else:
-                L.append("switch (t_) {")
-                for t in sorted(fn.addrs - fn.dead_addrs):
-                    L.append("case %s: goto L_%08x;" % (hexlit(t), t))
-                L.extend(["default: break;", "}"])
+            L.append("switch (t_) {")
+            for t in sorted(fn.addrs - fn.dead_addrs):
+                L.append("case %s: goto L_%08x;" % (hexlit(t), t))
+            L.extend(["default: break;", "}"])
             L.append("}")
             L.append("c->eip = %s; recomp_jump(c, t_); return;" % hexlit(ins.addr))
             return L

@@ -49,6 +49,11 @@ jmp_buf *recomp_setjmp_prepare(X86 *c);
  * Call it with the result of setjmp on the buffer prepare() returned. */
 void recomp_setjmp_return(X86 *c, int value);
 
+#define RECOMP_SETJMP3(c) do { \
+    jmp_buf *b_ = recomp_setjmp_prepare(c); \
+    recomp_setjmp_return(c, setjmp(*b_)); \
+} while (0)
+
 /* Not a working substitution: logs the required call-site form and aborts. */
 void recomp_setjmp(X86 *c);
 
