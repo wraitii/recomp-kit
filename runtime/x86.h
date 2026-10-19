@@ -480,6 +480,102 @@ static inline float recomp_sse_sqrtf(float v) {
     return sqrtf(v);
 }
 
+/* CVTSS2SI/CVTSD2SI round according to MXCSR. The runtime exposes the reset
+ * MXCSR, whose rounding mode is round-to-nearest-even, and models no guest
+ * writes to it. Values that round outside int32 produce the indefinite result. */
+static inline int32_t recomp_sse_cvtsd2si(double v) {
+    double rounded = nearbyint(v);
+    if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0)) return INT32_MIN;
+    return (int32_t)rounded;
+}
+static inline int32_t recomp_sse_cvtss2si(float v) {
+    return recomp_sse_cvtsd2si((double)v);
+}
+static inline int32_t recomp_sse_cvttss2si(float v) {
+    double d = (double)v;
+    if (!(d >= -2147483648.0 && d < 2147483648.0)) return INT32_MIN;
+    return (int32_t)d;
+}
+
+static inline float recomp_sse_f32(uint32_t bits) {
+    float v;
+    memcpy(&v, &bits, 4);
+    return v;
+}
+static inline uint32_t recomp_sse_f32_bits(float v) {
+    uint32_t bits;
+    memcpy(&bits, &v, 4);
+    return bits;
+}
+static inline uint32_t recomp_sse_addps(uint32_t a, uint32_t b) {
+    return recomp_sse_f32_bits(recomp_sse_f32(a) + recomp_sse_f32(b));
+}
+static inline uint32_t recomp_sse_subps(uint32_t a, uint32_t b) {
+    return recomp_sse_f32_bits(recomp_sse_f32(a) - recomp_sse_f32(b));
+}
+static inline uint32_t recomp_sse_mulps(uint32_t a, uint32_t b) {
+    return recomp_sse_f32_bits(recomp_sse_f32(a) * recomp_sse_f32(b));
+}
+static inline uint32_t recomp_sse_divps(uint32_t a, uint32_t b) {
+    return recomp_sse_f32_bits(recomp_sse_f32(a) / recomp_sse_f32(b));
+}
+static inline uint32_t recomp_sse_minps(uint32_t a, uint32_t b) {
+    float x = recomp_sse_f32(a), y = recomp_sse_f32(b);
+    return recomp_sse_f32_bits(y < x ? x : y);
+}
+static inline uint32_t recomp_sse_maxps(uint32_t a, uint32_t b) {
+    float x = recomp_sse_f32(a), y = recomp_sse_f32(b);
+    return recomp_sse_f32_bits(y > x ? x : y);
+}
+static inline uint32_t recomp_sse_sqrtps(uint32_t a) {
+    return recomp_sse_f32_bits(recomp_sse_sqrtf(recomp_sse_f32(a)));
+}
+/* The original RCPPS/RSQRTPS are approximate. These return the IEEE result,
+ * which is also what the Unicorn oracle produces. DIVERGENCE(original): the
+ * low bits may differ from a real x86 approximation instruction. */
+static inline uint32_t recomp_sse_rcpps(uint32_t a) {
+    return recomp_sse_f32_bits(1.0f / recomp_sse_f32(a));
+}
+static inline uint32_t recomp_sse_rsqrtps(uint32_t a) {
+    float x = recomp_sse_f32(a);
+    if (isnan(x)) return recomp_sse_f32_bits(x);
+    if (x == 0.0f) return (a >> 31) ? 0xff800000u : 0x7f800000u;
+    if (a >> 31) return 0xffc00000u;
+    return recomp_sse_f32_bits(1.0f / recomp_sse_sqrtf(x));
+}
+static inline float recomp_sse_rcpss(float v) {
+    return recomp_sse_f32(recomp_sse_rcpps(recomp_sse_f32_bits(v)));
+}
+static inline float recomp_sse_rsqrtss(float v) {
+    return recomp_sse_f32(recomp_sse_rsqrtps(recomp_sse_f32_bits(v)));
+}
+static inline uint32_t recomp_sse_cmpps(unsigned pred, uint32_t a, uint32_t b) {
+    float x = recomp_sse_f32(a), y = recomp_sse_f32(b);
+    int r;
+    switch (pred & 7u) {
+    case 0: r = x == y; break;
+    case 1: r = x < y; break;
+    case 2: r = x <= y; break;
+    case 3: r = isnan(x) || isnan(y); break;
+    case 4: r = !(x == y); break;
+    case 5: r = !(x < y); break;
+    case 6: r = !(x <= y); break;
+    default: r = !(isnan(x) || isnan(y)); break;
+    }
+    return r ? 0xffffffffu : 0u;
+}
+
+/* FXSAVE is used here only to probe MXCSR_MASK. The runtime exposes the reset
+ * x87/SSE environment and does not model guest MXCSR writes, so publish that
+ * environment and a mask advertising the usual DAZ support. */
+static inline void recomp_fxsave(uint32_t addr) {
+    for (uint32_t offset = 0; offset < 512; offset += 4) wr32(addr + offset, 0u);
+    wr16(addr, 0x037fu);
+    wr16(addr + 4, 0xffffu);
+    wr32(addr + 0x18, 0x1f80u);
+    wr32(addr + 0x1c, 0xffffu);
+}
+
 /* COMISD/UCOMISD and their single-precision forms: the one place SSE writes
  * the guest's flags. Unordered - either operand a NaN - sets ZF, PF and CF
  * together, and the rest of EFLAGS is cleared either way. The difference
@@ -2228,6 +2324,103 @@ static inline uint64_t mmx_psra(uint64_t a, uint64_t count, unsigned bits) {
     for (unsigned i = 0; i < MMX_LANES(bits); i++)
         r = mmx_put(r, bits, i, (uint64_t)(mmx_slane(a, bits, i) >> c));
     return r;
+}
+static inline uint64_t mmx_pminub(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    for (unsigned i = 0; i < 8; i++) {
+        uint64_t x = mmx_lane(a, 8, i), y = mmx_lane(b, 8, i);
+        r = mmx_put(r, 8, i, x < y ? x : y);
+    }
+    return r;
+}
+static inline uint64_t mmx_pmaxub(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    for (unsigned i = 0; i < 8; i++) {
+        uint64_t x = mmx_lane(a, 8, i), y = mmx_lane(b, 8, i);
+        r = mmx_put(r, 8, i, x > y ? x : y);
+    }
+    return r;
+}
+
+static inline uint64_t xmm_low64(const uint32_t a[4]) {
+    return (uint64_t)a[0] | ((uint64_t)a[1] << 32);
+}
+static inline uint64_t xmm_high64(const uint32_t a[4]) {
+    return (uint64_t)a[2] | ((uint64_t)a[3] << 32);
+}
+static inline void xmm_put64(uint32_t a[4], unsigned half, uint64_t v) {
+    a[2 * half] = (uint32_t)v;
+    a[2 * half + 1] = (uint32_t)(v >> 32);
+}
+#define RECOMP_XMM_BIN(name, fn)                                                                   \
+    static inline void name(uint32_t d[4], const uint32_t s[4], unsigned bits) {                   \
+        uint64_t dl = xmm_low64(d), dh = xmm_high64(d);                                            \
+        uint64_t sl = xmm_low64(s), sh = xmm_high64(s);                                            \
+        xmm_put64(d, 0, fn(dl, sl, bits));                                                         \
+        xmm_put64(d, 1, fn(dh, sh, bits));                                                         \
+    }
+#define RECOMP_XMM_BIN64(name, fn)                                                                 \
+    static inline void name(uint32_t d[4], const uint32_t s[4]) {                                  \
+        uint64_t dl = xmm_low64(d), dh = xmm_high64(d);                                            \
+        uint64_t sl = xmm_low64(s), sh = xmm_high64(s);                                            \
+        xmm_put64(d, 0, fn(dl, sl));                                                               \
+        xmm_put64(d, 1, fn(dh, sh));                                                               \
+    }
+RECOMP_XMM_BIN(xmm_padd, mmx_padd)
+RECOMP_XMM_BIN(xmm_psub, mmx_psub)
+RECOMP_XMM_BIN(xmm_padds, mmx_padds)
+RECOMP_XMM_BIN(xmm_psubs, mmx_psubs)
+RECOMP_XMM_BIN(xmm_paddus, mmx_paddus)
+RECOMP_XMM_BIN(xmm_psubus, mmx_psubus)
+RECOMP_XMM_BIN(xmm_pcmpeq, mmx_pcmpeq)
+RECOMP_XMM_BIN(xmm_pcmpgt, mmx_pcmpgt)
+RECOMP_XMM_BIN64(xmm_pmullw, mmx_pmullw)
+RECOMP_XMM_BIN64(xmm_pmulhw, mmx_pmulhw)
+RECOMP_XMM_BIN64(xmm_pmaddwd, mmx_pmaddwd)
+RECOMP_XMM_BIN64(xmm_pminub, mmx_pminub)
+RECOMP_XMM_BIN64(xmm_pmaxub, mmx_pmaxub)
+#undef RECOMP_XMM_BIN
+#undef RECOMP_XMM_BIN64
+#define RECOMP_XMM_SHIFT(name, fn)                                                                 \
+    static inline void name(uint32_t d[4], uint64_t count, unsigned bits) {                        \
+        uint64_t dl = xmm_low64(d), dh = xmm_high64(d);                                            \
+        xmm_put64(d, 0, fn(dl, count, bits));                                                      \
+        xmm_put64(d, 1, fn(dh, count, bits));                                                      \
+    }
+RECOMP_XMM_SHIFT(xmm_psll, mmx_psll)
+RECOMP_XMM_SHIFT(xmm_psrl, mmx_psrl)
+RECOMP_XMM_SHIFT(xmm_psra, mmx_psra)
+#undef RECOMP_XMM_SHIFT
+static inline void xmm_punpck(uint32_t d[4], const uint32_t s[4], unsigned bits, int high) {
+    uint64_t dl = xmm_low64(d), dh = xmm_high64(d);
+    uint64_t sl = xmm_low64(s), sh = xmm_high64(s);
+    uint64_t lo, hi;
+    if (bits == 64) {
+        lo = high ? dh : dl;
+        hi = high ? sh : sl;
+    } else if (high) {
+        lo = mmx_punpckl(dh, sh, bits);
+        hi = bits == 32 ? 0 : mmx_punpckh(dh, sh, bits);
+    } else {
+        lo = mmx_punpckl(dl, sl, bits);
+        hi = bits == 32 ? 0 : mmx_punpckh(dl, sl, bits);
+    }
+    xmm_put64(d, 0, lo);
+    xmm_put64(d, 1, hi);
+}
+static inline void xmm_pack(uint32_t d[4], const uint32_t s[4], unsigned from, int is_signed) {
+    uint64_t dl = xmm_low64(d), dh = xmm_high64(d);
+    uint64_t sl = xmm_low64(s), sh = xmm_high64(s);
+    xmm_put64(d, 0, mmx_pack(dl, dh, from, is_signed));
+    xmm_put64(d, 1, mmx_pack(sl, sh, from, is_signed));
+}
+static inline void xmm_psrldq(uint32_t d[4], unsigned count) {
+    uint8_t in[16];
+    memcpy(in, d, 16);
+    memset(d, 0, 16);
+    if (count < 16)
+        for (unsigned i = 0; i < 16 - count; i++)
+            ((uint8_t *)d)[i] = in[i + count];
 }
 
 /* ----------------------------------------------------------------- misc */

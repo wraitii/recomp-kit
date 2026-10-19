@@ -355,16 +355,48 @@ def emit_prepared(prepared, external_entry=False):
                     grouped = {}
                     for j in sorted(set(fir.succ[i])):
                         grouped.setdefault(j, fir.insns[j].addr)
-                    lines.append("switch ((uint32_t)%s) {" % ref(v.args[0]))
-                    for j, addr in grouped.items():
-                        lines.append("case 0x%xu:" % addr)
-                        lines.extend(edge(i, j))
-                    lines.append("default:")
-                    lines.extend(x87_printer.operations(program.defaults.get(v.id, ())))
-                    lines.extend(publish(v))
-                    lines.append("c->eip = 0x%xu; recomp_jump(c, (uint32_t)%s); return;" % (
-                        b.insn.addr, ref(v.args[0])))
-                    lines.append("}")
+                    target = ref(v.args[0])
+                    default_lines = [*x87_printer.operations(program.defaults.get(v.id, ())),
+                                     *publish(v),
+                                     "c->eip = 0x%xu; recomp_jump(c, (uint32_t)%s); return;" % (
+                                         b.insn.addr, target)]
+                    if i not in fir.tableless:
+                        lines.append("switch ((uint32_t)%s) {" % target)
+                        for j, addr in grouped.items():
+                            lines.append("case 0x%xu:" % addr)
+                            lines.extend(edge(i, j))
+                        lines.append("default:")
+                        lines.extend(default_lines)
+                        lines.append("}")
+                    else:
+                        # An undecoded computed jump may enter any instruction in
+                        # the body. Emit a binary search over the live target
+                        # addresses instead of a case for every one, matching the
+                        # decoded emitter's table-less dispatch.
+                        dispatch = sorted(grouped.items(), key=lambda item: item[1])
+                        if dispatch:
+                            tag = "%s%d" % (block_label, i)
+                            lines.append("{")
+                            lines.append("uint32_t t_ = (uint32_t)%s;" % target)
+                            lines.append("static const uint32_t dispatch_addrs_%s[] = {" % tag)
+                            lines.extend("    0x%xu," % addr for _, addr in dispatch)
+                            lines.append("};")
+                            lines.append("static void *const dispatch_labels_%s[] = {" % tag)
+                            lines.extend("    &&D_%s_%d," % (tag, n) for n in range(len(dispatch)))
+                            lines.append("};")
+                            lines.append("uint32_t dl_ = 0, dh_ = %d;" % len(dispatch))
+                            lines.append("while (dl_ < dh_) {")
+                            lines.append("    uint32_t dm_ = dl_ + (dh_ - dl_) / 2;")
+                            lines.append("    if (dispatch_addrs_%s[dm_] < t_) dl_ = dm_ + 1; else dh_ = dm_;" % tag)
+                            lines.append("}")
+                            lines.append("if (dl_ < %d && dispatch_addrs_%s[dl_] == t_) goto *dispatch_labels_%s[dl_];" % (
+                                len(dispatch), tag, tag))
+                            lines.append("}")
+                        lines.extend(default_lines)
+                        if dispatch:
+                            for n, (j, _) in enumerate(dispatch):
+                                lines.append("D_%s_%d: ;" % (tag, n))
+                                lines.extend(edge(i, j))
                 elif v.opc == "BRANCH":
                     lines.extend(edge(i, indices[v.args[0].data], following))
                 elif v.opc == "CBRANCH":

@@ -103,4 +103,7 @@ def cpu_field(name):
         return "c->" + {"EIP": "eip", "FS_OFFSET": "fs_base"}[name]
     if name in (*X86_32.names("arithmetic_flag"), *X86_32.names("direction_flag")):
         return "c->eflags_" + name.lower()
+    if name.startswith("XMM") and "_D" in name:
+        reg, lane = name[3:].split("_D")
+        return "c->xmm[%s][%d]" % (reg, "abcd".index(lane))
     raise ValueError("unknown runtime CPU field " + name)

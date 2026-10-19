@@ -34,7 +34,8 @@ def function_ir(tr, lifter, fn):
                       seh_unwind_only=unwind_only,
                       language=lifter.language,
                       import_tails={i: slot for i, ins in enumerate(fn.insns)
-                                    if (slot := tr.import_tail_slot(ins)) is not None})
+                                    if (slot := tr.import_tail_slot(ins)) is not None},
+                      tableless=tableless_jumps(tr, fn))
 
 
 def external_exits(tr, fn):
@@ -86,3 +87,9 @@ def table_jumps(tr, fn):
             continue
         result.add(i)
     return result
+
+
+def tableless_jumps(tr, fn):
+    """The subset of `table_jumps` with no decoded target set."""
+    return {i for i in table_jumps(tr, fn)
+            if not tr.jumptables.get((fn.addr, fn.insns[i].addr))}

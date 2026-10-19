@@ -35,8 +35,8 @@ GUEST_SHIM_END = 0x10000000
 # --------------------------------------------------------------- registers --
 
 
-#: MMX on the MMn registers, which the translator emits. The rest of the
-#: vector set (SSE, SSE2, and the SSE extensions to MMX) stays a trap.
+#: MMX on the MMn registers and their XMM SSE2 counterparts are emitted by
+#: decoded.py; unsupported vector forms still become traps at their own address.
 MMX_BINARY = {
     "PADDB": ("mmx_padd", 8), "PADDW": ("mmx_padd", 16), "PADDD": ("mmx_padd", 32),
     "PADDQ": ("mmx_padd", 64),
@@ -51,6 +51,7 @@ MMX_BINARY = {
     "PCMPGTB": ("mmx_pcmpgt", 8), "PCMPGTW": ("mmx_pcmpgt", 16), "PCMPGTD": ("mmx_pcmpgt", 32),
     "PACKSSWB": ("mmx_packsswb", 0), "PACKSSDW": ("mmx_packssdw", 0),
     "PACKUSWB": ("mmx_packuswb", 0),
+    "PMINUB": ("mmx_pminub", 0), "PMAXUB": ("mmx_pmaxub", 0),
     "PUNPCKLBW": ("mmx_punpckl", 8), "PUNPCKLWD": ("mmx_punpckl", 16),
     "PUNPCKLDQ": ("mmx_punpckl", 32),
     "PUNPCKHBW": ("mmx_punpckh", 8), "PUNPCKHWD": ("mmx_punpckh", 16),
@@ -69,7 +70,8 @@ MMN_RE = re.compile(r"\bMM[0-7]\b")
 def is_mmx_insn(mnem, ops):
     """An instruction the translator emits as MMX: an MMX mnemonic whose
     operands name an MMn register and no XMM one."""
-    if mnem not in MMX_BINARY and mnem not in MMX_SHIFT and mnem not in ("MOVQ", "MOVD", "PSHUFW"):
+    if mnem not in MMX_BINARY and mnem not in MMX_SHIFT and mnem not in (
+            "MOVQ", "MOVD", "MOVNTQ", "PSHUFW"):
         return False
     return (any(MMN_RE.search(o) for o in ops) and not any(XMM_RE.search(o) for o in ops))
 
@@ -196,6 +198,7 @@ for _dst, _src in (("E", "Z"), ("NE", "NZ"), ("NAE", "C"), ("NB", "NC"),
 
 JCC = {"J" + k: v for k, v in COND.items()}
 JCC["JECXZ"] = ("c->r[1] == 0", ())
+JCC["JCXZ"] = ("(c->r[1] & 0xffffu) == 0", ())
 # LOOP decrements ECX and branches while it is not zero; the decrement is
 # the condition, so it happens whichever way the branch goes.
 JCC["LOOP"] = ("(c->r[1] = c->r[1] - 1u) != 0u", ())
@@ -227,8 +230,10 @@ class Translator(ControlFlow):
         dead = {i for i, ins in enumerate(fn.insns) if ins.addr in fn.dead_addrs}
         live = [i for i in range(len(fn.insns)) if i not in dead]
         labels = set(fn.pushed_continuations) | set(entries)
-        if any(ins.mnem == "JMP" and self.branch_target(ins) is None
-               and not self.jumptables.get((fn.addr, ins.addr)) for ins in fn.insns):
+        tableless = any(ins.mnem == "JMP" and self.branch_target(ins) is None
+                        and not self.jumptables.get((fn.addr, ins.addr)) for ins in fn.insns)
+        self.dispatch_targets = sorted(fn.addrs - fn.dead_addrs) if tableless else []
+        if tableless:
             labels.update(fn.insns[i].addr for i in live)
         for i in live:
             ins = fn.insns[i]
@@ -290,6 +295,13 @@ class Translator(ControlFlow):
                 out.append("    uint64_t seh_mark_ = recomp_seh_frame_mark(c);")
             if head:
                 out.append("    goto L_%08x;" % fn.addr)
+        if self.dispatch_targets:
+            out.append("    static const uint32_t dispatch_addrs_[] = {")
+            out.extend("        %s," % hexlit(t) for t in self.dispatch_targets)
+            out.append("    };")
+            out.append("    static void *const dispatch_labels_[] = {")
+            out.extend("        &&L_%08x," % t for t in self.dispatch_targets)
+            out.append("    };")
         for position, i in enumerate(live):
             ins = fn.insns[i]
             if ins.addr in labels:
@@ -799,8 +811,9 @@ class Translator(ControlFlow):
         SSE_LANE_OPS = {"PXOR": "^", "XORPD": "^", "XORPS": "^", "PAND": "&", "ANDPD": "&",
                         "ANDPS": "&", "POR": "|", "ORPD": "|", "ORPS": "|"}
         SSE_LANE_FORMS = ("PANDN", "ANDNPD", "ANDNPS", "PCMPEQD", "PUNPCKLDQ", "PUNPCKHDQ",
-                          "PUNPCKLQDQ", "UNPCKLPD", "UNPCKHPD", "MOVDDUP", "MOVLPD", "MOVLPS",
-                          "MOVHPD", "MOVHPS", "MOVLHPS", "SHUFPS", "SHUFPD", "MOVAPD", "MOVUPD")
+                          "PUNPCKLQDQ", "PUNPCKHQDQ", "UNPCKLPD", "UNPCKHPD", "UNPCKLPS",
+                          "UNPCKHPS", "MOVDDUP", "MOVLPD", "MOVLPS", "MOVHPD", "MOVHPS",
+                          "MOVLHPS", "MOVHLPS", "SHUFPS", "SHUFPD", "MOVAPD", "MOVUPD")
         if m in SSE_LANE_OPS or m in SSE_LANE_FORMS:
             dst, src = ops[0], ops[1]
 
@@ -832,15 +845,15 @@ class Translator(ControlFlow):
                          for i in range(4))
             elif m in ("MOVAPD", "MOVUPD"):   # MOVAPS and MOVUPS under another name
                 L.extend(put(dst, i, sv(i)) for i in range(4))
-            elif m == "PUNPCKLDQ":            # d0 s0 d1 s1
+            elif m in ("PUNPCKLDQ", "UNPCKLPS"):   # d0 s0 d1 s1
                 L.extend([put(dst, 0, d(0)), put(dst, 1, sv(0)),
                           put(dst, 2, d(1)), put(dst, 3, sv(1))])
-            elif m == "PUNPCKHDQ":            # d2 s2 d3 s3
+            elif m in ("PUNPCKHDQ", "UNPCKHPS"):   # d2 s2 d3 s3
                 L.extend([put(dst, 0, d(2)), put(dst, 1, sv(2)),
                           put(dst, 2, d(3)), put(dst, 3, sv(3))])
             elif m in ("PUNPCKLQDQ", "UNPCKLPD"):   # d0 d1 s0 s1
                 L.extend([put(dst, 2, sv(0)), put(dst, 3, sv(1))])
-            elif m == "UNPCKHPD":                   # d2 d3 s2 s3
+            elif m in ("UNPCKHPD", "PUNPCKHQDQ"):   # d2 d3 s2 s3
                 L.extend([put(dst, 0, d(2)), put(dst, 1, d(3)),
                           put(dst, 2, sv(2)), put(dst, 3, sv(3))])
             elif m == "MOVDDUP":                    # s0 s1 s0 s1
@@ -850,6 +863,8 @@ class Translator(ControlFlow):
                 # Raw low source lanes replace the high destination lanes.
                 # Snapshot the source before stores, including dst == src.
                 L.extend(put(dst, 2 + i, sv(i)) for i in range(2))
+            elif m == "MOVHLPS":
+                L.extend(put(dst, i, sv(2 + i)) for i in range(2))
             elif m in ("MOVLPD", "MOVLPS", "MOVHPD", "MOVHPS"):
                 # One 64-bit half moves; the other half keeps what it had.
                 half = 0 if m in ("MOVLPD", "MOVLPS") else 2
@@ -870,6 +885,35 @@ class Translator(ControlFlow):
                           put(dst, 2, sv(hi)), put(dst, 3, sv(hi + 1))])
             return L
 
+        SSE_PACKED_FLOAT = ("ADDPS", "SUBPS", "MULPS", "DIVPS", "MINPS", "MAXPS")
+        SSE_PACKED_UNARY = ("SQRTPS", "RCPPS", "RSQRTPS")
+        SSE_CMP_PS = {"CMPEQPS": 0, "CMPLTPS": 1, "CMPLEPS": 2, "CMPUNORDPS": 3,
+                      "CMPNEQPS": 4, "CMPNLTPS": 5, "CMPNLEPS": 6, "CMPORDPS": 7}
+        if m in SSE_PACKED_FLOAT or m in SSE_PACKED_UNARY or m in SSE_CMP_PS or m == "MOVMSKPS":
+            def lane(op, i):
+                if op.kind == "xmm":
+                    return "c->xmm[%d][%d]" % (op.reg, i)
+                return "rd32(%s + %du)" % (addr_expr(op), 4 * i)
+
+            dst, src = ops[0], ops[1]
+            if m in SSE_PACKED_FLOAT:
+                helper = "recomp_sse_%s" % m.lower()
+                L.extend("c->xmm[%d][%d] = %s(c->xmm[%d][%d], %s);"
+                         % (dst.reg, i, helper, dst.reg, i, lane(src, i)) for i in range(4))
+            elif m in SSE_PACKED_UNARY:
+                helper = "recomp_sse_%s" % m.lower()
+                L.extend("c->xmm[%d][%d] = %s(c->xmm[%d][%d]);"
+                         % (dst.reg, i, helper, dst.reg, i) for i in range(4))
+            elif m in SSE_CMP_PS:
+                pred = SSE_CMP_PS[m]
+                L.extend("c->xmm[%d][%d] = recomp_sse_cmpps(%du, c->xmm[%d][%d], %s);"
+                         % (dst.reg, i, pred, dst.reg, i, lane(src, i)) for i in range(4))
+            else:
+                L.append(write_op(dst, 32,
+                                  " | ".join("(((c->xmm[%d][%d] >> 31) & 1u) << %d)"
+                                             % (src.reg, i, i) for i in range(4))))
+            return L
+
         # Scalar double and single forms. The host's double and float are the
         # same IEEE formats in the same rounding mode, and scalar SSE leaves
         # the lanes above its result alone, which is why nothing here clears
@@ -878,8 +922,8 @@ class Translator(ControlFlow):
                            "ADDSS": "+", "SUBSS": "-", "MULSS": "*", "DIVSS": "/"}
         SSE_SCALAR_FORMS = ("MOVSD", "MOVSS", "SQRTSD", "SQRTSS", "MINSD", "MAXSD",
                             "MINSS", "MAXSS", "CVTSI2SD", "CVTSI2SS", "CVTTSD2SI",
-                            "CVTTSS2SI", "CVTSD2SS", "CVTSS2SD", "COMISD", "UCOMISD",
-                            "COMISS", "UCOMISS")
+                            "CVTTSS2SI", "CVTSS2SI", "CVTSD2SI", "CVTSD2SS", "CVTSS2SD", "COMISD", "UCOMISD",
+                            "COMISS", "UCOMISS", "RCPSS", "RSQRTSS")
         # Only MOVSD and MOVSS are shared with another instruction; the rest
         # of these mnemonics are SSE whatever their operands are, and a
         # conversion's source or destination is often memory or a register.
@@ -910,6 +954,9 @@ class Translator(ControlFlow):
                 L.append(store_scalar(dst, "%s(%s)" % ("recomp_sse_sqrtf" if single
                                                        else "recomp_sse_sqrt",
                                                        scalar(src, single)), single))
+            elif m in ("RCPSS", "RSQRTSS"):
+                L.append(store_scalar(dst, "recomp_sse_%s(%s)" % (m.lower(), scalar(src, True)),
+                                      True))
             elif m in ("MINSD", "MAXSD", "MINSS", "MAXSS"):
                 # The hardware returns its second operand when either is a NaN
                 # or both are zero, which is what this spelling does.
@@ -925,6 +972,9 @@ class Translator(ControlFlow):
                                                                 read_op(src, 32)), single))
             elif m in ("CVTTSD2SI", "CVTTSS2SI"):
                 L.append(write_op(dst, 32, "(uint32_t)(int32_t)%s" % scalar(src, single)))
+            elif m in ("CVTSS2SI", "CVTSD2SI"):
+                helper = "recomp_sse_cvtss2si" if single else "recomp_sse_cvtsd2si"
+                L.append(write_op(dst, 32, "(uint32_t)%s(%s)" % (helper, scalar(src, single))))
             elif m == "CVTSD2SS":
                 L.append(store_scalar(dst, "(float)%s" % scalar(src, False), True))
             elif m == "CVTSS2SD":
@@ -938,7 +988,82 @@ class Translator(ControlFlow):
                              for i in range(1 if single else 2, 4))
             return L
 
-        if m in ("MOVUPS", "MOVAPS", "MOVDQU", "MOVDQA", "MOVQ", "MOVD", "PSHUFD"):
+        if m == "CVTPI2PS":
+            dst, src = ops
+            if dst.kind != "xmm":
+                raise TranslateError("CVTPI2PS destination is not an XMM register")
+            if src.kind == "mm":
+                L.append("uint64_t s_ = c->mm[%d];" % src.reg)
+            elif src.kind == "mem":
+                L.append("uint64_t s_ = rd64(%s);" % addr_expr(src))
+            else:
+                raise TranslateError("CVTPI2PS source is not MMX or memory")
+            L.append("c->xmm[%d][0] = recomp_sse_f32_bits((float)(int32_t)(uint32_t)s_);"
+                     % dst.reg)
+            L.append("c->xmm[%d][1] = recomp_sse_f32_bits((float)(int32_t)(uint32_t)(s_ >> 32));"
+                     % dst.reg)
+            return L
+
+        if m == "CVTPS2PI":
+            dst, src = ops
+            if dst.kind != "mm":
+                raise TranslateError("CVTPS2PI destination is not an MMX register")
+            if src.kind == "xmm":
+                lo, hi = "c->xmm[%d][0]" % src.reg, "c->xmm[%d][1]" % src.reg
+            elif src.kind == "mem":
+                lo, hi = "rd32(%s)" % addr_expr(src), "rd32(%s + 4u)" % addr_expr(src)
+            else:
+                raise TranslateError("CVTPS2PI source is not XMM or memory")
+            L.append("c->mm[%d] = (uint64_t)(uint32_t)recomp_sse_cvtss2si(recomp_sse_f32(%s))"
+                     " | ((uint64_t)(uint32_t)recomp_sse_cvtss2si(recomp_sse_f32(%s)) << 32);"
+                     % (dst.reg, lo, hi))
+            return L
+
+        if m == "CVTTPS2DQ":
+            dst, src = ops
+            if dst.kind != "xmm":
+                raise TranslateError("CVTTPS2DQ destination is not an XMM register")
+
+            def lane(op, i):
+                if op.kind == "xmm":
+                    return "c->xmm[%d][%d]" % (op.reg, i)
+                return "rd32(%s + %du)" % (addr_expr(op), 4 * i)
+
+            L.extend("c->xmm[%d][%d] = (uint32_t)recomp_sse_cvttss2si(recomp_sse_f32(%s));"
+                     % (dst.reg, i, lane(src, i)) for i in range(4))
+            return L
+
+        if m == "PEXTRW":
+            dst, src = ops[0], ops[1]
+            if src.kind != "xmm":
+                raise TranslateError("PEXTRW source is not an XMM register")
+            sel = parse_imm(ins.ops[2]) & 7
+            value = "((c->xmm[%d][%d] >> %du) & 0xffffu)" % (src.reg, sel >> 1, (sel & 1) * 16)
+            if dst.kind == "mem":
+                L.append(write_op(dst, 16, value))
+            else:
+                L.append(write_op(dst, 32, "(uint32_t)%s" % value))
+            return L
+
+        if m == "MOVDQ2Q":
+            dst, src = ops
+            if dst.kind != "mm" or src.kind != "xmm":
+                raise TranslateError("MOVDQ2Q form")
+            L.append("c->mm[%d] = (uint64_t)c->xmm[%d][0] | ((uint64_t)c->xmm[%d][1] << 32);"
+                     % (dst.reg, src.reg, src.reg))
+            return L
+
+        if m == "PSRLDQ":
+            dst, src = ops
+            if dst.kind != "xmm" or src.kind != "imm":
+                raise TranslateError("PSRLDQ form")
+            L.append("xmm_psrldq(c->xmm[%d], %du);" % (dst.reg, parse_imm(ins.ops[1]) & 0xff))
+            return L
+
+        if m in MMX_BINARY or m in MMX_SHIFT:
+            return self.emit_sse_packed(ins, m, ops)
+
+        if m in ("MOVUPS", "MOVAPS", "MOVDQU", "MOVDQA", "MOVNTPS", "MOVQ", "MOVD", "PSHUFD"):
             def lane(op, i):
                 if op.kind == "xmm":
                     return "c->xmm[%d][%d]" % (op.reg, i)
@@ -1013,6 +1138,8 @@ class Translator(ControlFlow):
         if m == "STMXCSR":
             # No translated SSE arithmetic changes MXCSR, so expose its reset value.
             return ["wr32(%s, 0x1f80u);" % addr_expr(ops[0])]
+        if m == "FXSAVE":
+            return ["recomp_fxsave(%s);" % addr_expr(ops[0])]
 
         # ------------------------------------------------------------ x87 --
         if m.startswith("F"):
@@ -1090,10 +1217,20 @@ class Translator(ControlFlow):
             # that transfer in the current host frame; nonlocal targets and
             # holes in the listing retain the existing runtime dispatch.
             L.append("if (t_ >= %s && t_ < %s) {" % (hexlit(fn.insns[0].addr), hexlit(fn.end)))
-            L.append("switch (t_) {")
-            for t in sorted(fn.addrs - fn.dead_addrs):
-                L.append("case %s: goto L_%08x;" % (hexlit(t), t))
-            L.extend(["default: break;", "}", "}"])
+            if self.dispatch_targets:
+                count = len(self.dispatch_targets)
+                L.append("uint32_t dl_ = 0, dh_ = %d;" % count)
+                L.append("while (dl_ < dh_) {")
+                L.append("    uint32_t dm_ = dl_ + (dh_ - dl_) / 2;")
+                L.append("    if (dispatch_addrs_[dm_] < t_) dl_ = dm_ + 1; else dh_ = dm_;")
+                L.append("}")
+                L.append("if (dl_ < %d && dispatch_addrs_[dl_] == t_) goto *dispatch_labels_[dl_];" % count)
+            else:
+                L.append("switch (t_) {")
+                for t in sorted(fn.addrs - fn.dead_addrs):
+                    L.append("case %s: goto L_%08x;" % (hexlit(t), t))
+                L.extend(["default: break;", "}"])
+            L.append("}")
             L.append("c->eip = %s; recomp_jump(c, t_); return;" % hexlit(ins.addr))
             return L
         L.append("switch (t_) {")
@@ -1127,6 +1264,58 @@ class Translator(ControlFlow):
 
     # ---- x87 -------------------------------------------------------------
 
+    def emit_sse_packed(self, ins, m, ops):
+        dst = ops[0]
+        if dst.kind != "xmm":
+            raise TranslateError("%s destination is not an XMM register" % m)
+
+        def source(op):
+            if op.kind == "xmm":
+                return "c->xmm[%d]" % op.reg, []
+            if op.kind == "mem":
+                return "s_", ["uint32_t ad_ = %s;" % addr_expr(op),
+                              "uint32_t s_[4] = { rd32(ad_), rd32(ad_ + 4u), "
+                              "rd32(ad_ + 8u), rd32(ad_ + 12u) };"]
+            raise TranslateError("%s source is not XMM or memory" % m)
+
+        if m in MMX_SHIFT:
+            fn, bits = MMX_SHIFT[m]
+            count = ops[1]
+            if count.kind == "imm":
+                expr, lines = hexlit(count.imm), []
+            elif count.kind == "xmm":
+                expr = "((uint64_t)c->xmm[%d][0] | ((uint64_t)c->xmm[%d][1] << 32))" \
+                    % (count.reg, count.reg)
+                lines = []
+            elif count.kind == "mem":
+                expr, lines = "rd64(%s)" % addr_expr(count), []
+            else:
+                raise TranslateError("%s shift count form" % m)
+            wrapped = fn.replace("mmx_", "xmm_", 1)
+            return lines + ["%s(c->xmm[%d], (uint64_t)%s, %du);" % (wrapped, dst.reg, expr, bits)]
+
+        fn, bits = MMX_BINARY[m]
+        src, lines = source(ops[1])
+        if fn == "mmx_punpckl":
+            lines.append("xmm_punpck(c->xmm[%d], %s, %du, 0);" % (dst.reg, src, bits))
+        elif fn == "mmx_punpckh":
+            lines.append("xmm_punpck(c->xmm[%d], %s, %du, 1);" % (dst.reg, src, bits))
+        elif fn in ("mmx_packsswb", "mmx_packssdw", "mmx_packuswb"):
+            from_bits = 16 if fn in ("mmx_packsswb", "mmx_packuswb") else 32
+            signed = 0 if fn == "mmx_packuswb" else 1
+            lines.append("xmm_pack(c->xmm[%d], %s, %du, %d);"
+                         % (dst.reg, src, from_bits, signed))
+        elif fn in ("mmx_pcmpeq", "mmx_pcmpgt"):
+            lines.append("%s(c->xmm[%d], %s, %du);" % (fn.replace("mmx_", "xmm_", 1),
+                                                       dst.reg, src, bits))
+        else:
+            wrapped = fn.replace("mmx_", "xmm_", 1)
+            if bits:
+                lines.append("%s(c->xmm[%d], %s, %du);" % (wrapped, dst.reg, src, bits))
+            else:
+                lines.append("%s(c->xmm[%d], %s);" % (wrapped, dst.reg, src))
+        return lines
+
     def emit_mmx(self, ins, m):
         """MMX on the eight MMn registers, through runtime/x86.h's helpers."""
         ops = [parse_operand(o) for o in ins.ops]
@@ -1156,6 +1345,11 @@ class Translator(ControlFlow):
             if s.kind == "mm":
                 return [write_op(dst, 32, "(uint32_t)c->mm[%d]" % s.reg)]
             raise TranslateError("MOVD form")
+        if m == "MOVNTQ":
+            dst, s = ops
+            if dst.kind == "mem" and s.kind == "mm":
+                return ["wr64(%s, c->mm[%d]);" % (addr_expr(dst), s.reg)]
+            raise TranslateError("MOVNTQ form")
         dst = ops[0]
         if dst.kind != "mm":
             raise TranslateError("%s destination is not an MMX register" % m)

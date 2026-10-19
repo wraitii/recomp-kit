@@ -12,7 +12,7 @@ class FunctionIR(object):
 
     def __init__(self, addr, insns, succ, tables=None, exits=None, entries=(),
                  noreturn=None, seh=None, language=X86_32.language, import_tails=None,
-                 seh_handlers=None, seh_unwind_only=frozenset()):
+                 seh_handlers=None, seh_unwind_only=frozenset(), tableless=None):
         self.addr = addr
         self.language = language
         #: Other instruction addresses generated code can enter at, with the
@@ -36,9 +36,13 @@ class FunctionIR(object):
         self.seh_unwind_only = seh_unwind_only
         self.import_tails = import_tails or {}
         #: Indices of computed jumps whose complete target set is `succ[i]`:
-        #: decoded jump tables with every case inside this body. Any other
-        #: BRANCHIND stays an opaque effect.
+        #: decoded jump tables with every case inside this body, and table-less
+        #: jumps lowered to the body's full address set. Any other BRANCHIND
+        #: stays an opaque effect.
         self.tables = frozenset(tables or ())
+        #: Computed jumps with no decoded target set, which may enter any
+        #: instruction in the body.
+        self.tableless = frozenset(tableless or ())
 
 
 def call_graph(functions, direct_targets):

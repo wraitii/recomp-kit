@@ -12,7 +12,7 @@ REG8H = ["AH", "CH", "DH", "BH"]
 
 R_EAX, R_ECX, R_EDX, R_EBX, R_ESP, R_EBP, R_ESI, R_EDI = range(8)
 
-JCC = frozenset(('JA', 'JAE', 'JB', 'JBE', 'JC', 'JE', 'JECXZ', 'JG', 'JGE', 'JL', 'JLE', 'JNA', 'JNAE', 'JNB', 'JNBE', 'JNC', 'JNE', 'JNG', 'JNGE', 'JNL', 'JNLE', 'JNO', 'JNP', 'JNS', 'JNZ', 'JO', 'JP', 'JPE', 'JPO', 'JS', 'JZ', 'LOOP'))
+JCC = frozenset(('JA', 'JAE', 'JB', 'JBE', 'JC', 'JE', 'JECXZ', 'JCXZ', 'JG', 'JGE', 'JL', 'JLE', 'JNA', 'JNAE', 'JNB', 'JNBE', 'JNC', 'JNE', 'JNG', 'JNGE', 'JNL', 'JNLE', 'JNO', 'JNP', 'JNS', 'JNZ', 'JO', 'JP', 'JPE', 'JPO', 'JS', 'JZ', 'LOOP'))
 
 STRING_MNEM = frozenset(("STOSB", "STOSW", "STOSD", "MOVSB", "MOVSW", "MOVSD",
                          "LODSB", "LODSW", "LODSD", "SCASB", "SCASW", "SCASD",

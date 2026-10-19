@@ -34,6 +34,8 @@ CONTRACT_NEVER_SKIP = frozenset(X86_32.names("stack") + X86_32.names("frame"))
 
 
 CC_BIT_VALUES = {"cf": 1, "pf": 2, "af": 4, "zf": 8, "sf": 0x10, "of": 0x20}
+#: The 32-bit guest's XMM register bank, one dword sub-register per runtime lane.
+XMM_FIELDS = tuple("XMM%d_D%s" % (reg, lane) for reg in range(8) for lane in "abcd")
 #: Seams whose observer may read the guest's fields directly, so flags stay eager.
 CC_EAGER_EVENTS = operations.FLAG_EAGER_CODEGEN
 
@@ -422,6 +424,8 @@ def prepare(fir, request, *, lifter=None, normalized=None):
     fields.append((lifter.register("FS_OFFSET"), "FS_OFFSET"))
     for name in ("CF", "PF", "AF", "ZF", "SF", "OF", "DF"):
         fields.append((lifter.register(name), name))
+    for name in XMM_FIELDS:
+        fields.append((lifter.register(name), name))
     mapping = {}
     for (_, off, size), field in fields:
         for n in range(size):
@@ -591,8 +595,7 @@ def prepare(fir, request, *, lifter=None, normalized=None):
     prepared = PreparedFunction(options, fir, s, live, fields, mapping, flag_keys,
                                 kept_calls, transfers, cc_entry, cc_calls, seh_mark,
                                 arithmetic_plan, report_calls,
-                                tuple((name, tuple(keys)) for name, keys in zip(
-                                    (*X86_32.names("gpr"), "EIP", "FS_OFFSET", "CF", "PF", "AF", "ZF", "SF", "OF", "DF"), groups)))
+                                tuple((name, tuple(keys)) for (_, name), keys in zip(fields, groups)))
     prepared.bind_provisional()
     validate_operations(s)
     return prepared

@@ -12,7 +12,7 @@ SUPPORTED_MNEMONICS = frozenset((
     "MOV", "MOVSX", "MOVZX", "XCHG", "NOT", "LEAVE", "LEA", "PUSH", "POP", "RET", "NOP", "ADD", "SUB", "CMP", "INC", "DEC",
     "ADC", "SBB", "SHL", "SHR", "DIV",
     "CLD", "STD", "SAHF", "MUL",
-    "TEST", "AND", "OR", "XOR", "JMP", "JZ", "JNZ", "JE", "JNE",
+    "TEST", "AND", "OR", "XOR", "JMP", "JZ", "JNZ", "JE", "JNE", "MOVSS", "XORPS",
     "JA", "JAE", "JB", "JBE", "JC", "JNC", "JG", "JGE", "JL", "JLE", "JS", "JNS",
     "JO", "JNO", "JP", "JNP", "JPE", "JPO", "CALL",
 )) | EXTRA_MNEMONICS
@@ -305,4 +305,4 @@ def codegen_ir(fir, lifter, tails=()):
         normalized.text = original.text
     succ = add_exit_stubs(insns, fir.succ, fir.exits, tails)
     return FunctionIR(fir.addr, insns, succ, fir.tables, entries=fir.entries, language=fir.language,
-                      import_tails=fir.import_tails)
+                      import_tails=fir.import_tails, tableless=fir.tableless)
