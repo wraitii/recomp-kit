@@ -434,10 +434,13 @@ def build_diff_harness(build_root, out):
     gen = Path(build_root) / "recomp/gen"
     if not archive.exists():
         sys.exit("%s is missing: build the game first" % archive)
+    # Desktop macOS splits the main translation's bodies into dylibs beside the
+    # archive; the harness links those instead of a monolithic archive.
+    pieces = sorted(archive.parent.parent.glob("librecomp_piece_*.dylib"))
     sources = [ROOT / "tools/recomp/tests/harness.c", ROOT / "tools/recomp/diff/host.c",
                ROOT / "platform/os_posix.cpp", ROOT / "platform/env.cpp",
                ROOT / "tools/recomp/diff/host.cpp", ROOT / "runtime/guest_strings.cpp"]
-    inputs = sources + [Path(__file__), archive, ROOT / "runtime/x86.h", gen / "table.c"]
+    inputs = sources + [Path(__file__), archive, ROOT / "runtime/x86.h", gen / "table.c"] + pieces
     if out.exists() and out.stat().st_mtime > max(p.stat().st_mtime for p in inputs):
         print("diff harness up to date: %s" % out)
         return
@@ -450,7 +453,8 @@ def build_diff_harness(build_root, out):
         subprocess.check_call(cc + ["-x", "c++", "-std=c++17", "-O1", "-fno-exceptions", "-fPIC",
                                     "-I", str(ROOT), "-c", str(source), "-o", str(obj)])
         objects.append(str(obj))
-    whole = (["-dynamiclib", "-Wl,-force_load," + str(archive), "-lc++",
+    whole = (["-dynamiclib", "-Wl,-force_load," + str(archive)] + [str(p) for p in pieces] + [
+               "-Wl,-rpath," + str(archive.parent.parent), "-lc++",
                "-framework", "CoreFoundation", "-framework", "CoreServices"] if darwin else
              ["-shared", "-Wl,--whole-archive", str(archive), "-Wl,--no-whole-archive", "-lm"])
     subprocess.check_call(cc + ["-O1", "-ffp-contract=off", "-std=c11", "-w", "-fPIC",

@@ -51,6 +51,9 @@ function(recomp_mac_bundle target)
     foreach(aux_target ${RECOMP_GEN_AUX_TARGETS})
       list(APPEND aux_args --aux-dylib "$<TARGET_FILE:${aux_target}>")
     endforeach()
+    foreach(piece ${RECOMP_GEN_PIECES})
+      list(APPEND aux_args --aux-dylib "$<TARGET_FILE:${piece}>")
+    endforeach()
   endif()
   set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS
     ${CMAKE_BINARY_DIR}/generated/Info.plist
