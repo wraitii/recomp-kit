@@ -255,19 +255,24 @@ def build(fir, *, register_groups=(), call_targets=(), indirect_call_symbol=None
             predecessors[j].append(i)
     reload_groups = [tuple(group) for group in register_groups
                      if len(group) > 1 and all(key in s.inputs for key in group)]
+    inherited = {i: preds[0] for i, preds in predecessors.items()
+                 if len(preds) == 1 and preds[0] >= 0 and preds[0] < i}
     s.blocks = {i: Block(i, fir.insns[i]) for i in sorted(reachable)}
     from .coalesce import initialize, connect
-    joins = initialize(s, reload_groups, predecessors)
+    joins = initialize(s, reload_groups, predecessors, inherited)
     for i, b in s.blocks.items():
         grouped_phis, b.phis = b.phis, []
-        for key in keys:
-            if key in b.state:
-                continue
-            phi = s.value("PHI", s.inputs[key].size, data=(key, predecessors[i]))
-            b.phis.append(phi)
-            b.state[key] = phi
+        if i not in inherited:
+            for key in keys:
+                if key in b.state:
+                    continue
+                phi = s.value("PHI", s.inputs[key].size, data=(key, predecessors[i]))
+                b.phis.append(phi)
+                b.state[key] = phi
         b.phis.extend(grouped_phis)
     for i, b in s.blocks.items():
+        if i in inherited:
+            b.state = dict(s.blocks[inherited[i]].exit)
         state, temps = dict(b.state), {}
         ins_cc = b.insn.cc
         cc_rec = CcRecord(ins_cc["kind"], ins_cc["size"]) if ins_cc is not None else None

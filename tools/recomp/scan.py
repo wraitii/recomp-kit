@@ -15,8 +15,8 @@ from ir.lift import LiftError
 from phases import ScanTask, EscapeTask
 from program import FunctionDescription as Row, EntryModel
 
-ScanRow = namedtuple("ScanRow", "addr description calls jumps references returns exclusion seh_escapes register_facts cw_facts x87_count writers external_targets")
-CACHE_VERSION = "recomp-scan-v3"
+ScanRow = namedtuple("ScanRow", "addr description calls jumps references returns exclusion seh_escapes register_facts cw_facts x87_count writers external_targets stack_pops")
+CACHE_VERSION = "recomp-scan-v4"
 _WORKER = {}
 
 
@@ -80,7 +80,7 @@ def _scan(task):
                 fir = ctx.artifacts.lifted(tr, ctx.lifter, fn)
                 fir.entries = tuple(entries)
                 sites = call_sites.build(fir, ctx.image)
-                prepared = (call_contracts.prepare(fir, image=ctx.image, sites=sites)
+                prepared = (call_contracts.prepare(fir, image=ctx.image, sites=sites, frontend=key)
                             if not (entries or site or fn.dead_addrs) else None)
                 mode_prepared = prepare_x87(fir, ctx.image, sites=sites)
             except (LiftError, RecursionError):
@@ -95,7 +95,7 @@ def _scan(task):
                 writers.append({"site": ins.addr, "mnemonic": mnem})
         row = ScanRow(addr, Row(addr, fn.name, len(fn.insns), fn.insns[0].addr, fn.insns[-1].addr),
                      calls, sorted(jumps), refs, returns, reason, escapes, prepared, mode_prepared, x87_count,
-                     writers, sorted(external_targets))
+                     writers, sorted(external_targets), call_contracts.stack_pops_from_decoded(fn.insns))
         rows.append((key, row, False))
     ctx.artifacts.flush_counts()
     return rows

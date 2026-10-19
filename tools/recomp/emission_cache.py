@@ -9,12 +9,13 @@ from pathlib import Path
 import pickle
 import shutil
 import sqlite3
+import struct
 import sys
 
 from program import TranslateError
 from ir import x87_facts
 
-FORMAT = 'recomp-emission-cache-v3'
+FORMAT = 'recomp-emission-cache-v4'
 NON_PRODUCING = x87_facts.NON_PRODUCING
 RE_RUN_MODULES = x87_facts.RE_RUN_MODULES
 
@@ -57,33 +58,85 @@ def identity(settings, *, code_map=True):
     return x87_facts.digest(inputs)
 
 
-def canonical(value):
-    if isinstance(value, Mapping):
-        return ('mapping', sorted(((canonical(k), canonical(v)) for k, v in value.items()), key=repr))
-    if is_dataclass(value):
-        return (type(value).__module__, type(value).__qualname__,
-                [(field.name, canonical(getattr(value, field.name))) for field in fields(value) if field.init])
+_FIELD_NAMES = {}
+
+
+def _text(data):
+    data = data.encode() if isinstance(data, str) else data
+    return str(len(data)).encode() + b':' + data
+
+
+def _digest(value, memo):
+    if value is None:
+        return b'n'
+    if value is True:
+        return b'b1'
+    if value is False:
+        return b'b0'
+    kind = type(value)
+    if kind is int:
+        return b'i' + str(value).encode()
+    if kind is float:
+        return b'f' + struct.pack('>d', value)
+    if kind is str:
+        return b's' + _text(value)
+    if kind is bytes:
+        return b'y' + _text(value)
+
+    ident = id(value)
+    local = memo.get(ident)
+    if local is not None and local[0] is value:
+        return local[1]
+
+    h = hashlib.sha256()
     if isinstance(value, Enum):
-        return (type(value).__module__, type(value).__qualname__, canonical(value.value))
-    if isinstance(value, (set, frozenset)):
-        return ('set', sorted((canonical(item) for item in value), key=repr))
-    if isinstance(value, (tuple, list)):
-        return (type(value).__name__, [canonical(item) for item in value])
-    if isinstance(value, bytes):
-        return ('bytes', value.hex())
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    raise TypeError('unsupported preparation cache input: ' + type(value).__qualname__)
+        h.update(b'e' + _text(kind.__module__) + _text(kind.__qualname__))
+        h.update(_text(_digest(value.value, memo)))
+    elif isinstance(value, Mapping):
+        h.update(b'm')
+        rows = sorted((_digest(k, memo), _digest(v, memo)) for k, v in value.items())
+        h.update(str(len(rows)).encode() + b':')
+        for key, item in rows:
+            h.update(_text(key) + _text(item))
+    elif is_dataclass(value):
+        h.update(b'd' + _text(kind.__module__) + _text(kind.__qualname__))
+        names = _FIELD_NAMES.get(kind)
+        if names is None:
+            names = _FIELD_NAMES[kind] = tuple(field.name for field in fields(value) if field.init)
+        h.update(str(len(names)).encode() + b':')
+        for name in names:
+            h.update(_text(name) + _text(_digest(getattr(value, name), memo)))
+    elif isinstance(value, (set, frozenset)):
+        h.update(b't')
+        rows = sorted(_digest(item, memo) for item in value)
+        h.update(str(len(rows)).encode() + b':')
+        for item in rows:
+            h.update(_text(item))
+    elif isinstance(value, (tuple, list)):
+        tag = b'u' if kind is tuple else b'l' if kind is list else (
+            b'c' + _text(kind.__module__) + _text(kind.__qualname__)
+            + (b'u' if isinstance(value, tuple) else b'l'))
+        h.update(tag + str(len(value)).encode() + b':')
+        for item in value:
+            h.update(_text(_digest(item, memo)))
+    else:
+        raise TypeError('unsupported preparation cache input: ' + kind.__qualname__)
+    result = h.digest()
+    memo[ident] = (value, result)
+    return result
+
+
+def canonical(value):
+    return _digest(value, {})
 
 
 def preparation_key(namespace, fir, request):
     if fir is None or isinstance(fir, tuple):
-        return x87_facts.digest(canonical((namespace, fir, request)))
-    instructions = ([[(name, getattr(ins, name)) for name in ins.__slots__ if name != 'ops']
-                     for ins in fir.insns] if fir is not None else ())
-    body = {name: value for name, value in vars(fir).items() if name != 'insns'} if fir is not None else {}
-    return x87_facts.digest(canonical((namespace, body, instructions, request)))
-
+        return _digest((namespace, fir, request), {}).hex()
+    instructions = [[(name, getattr(ins, name)) for name in ins.__slots__ if name != 'ops']
+                    for ins in fir.insns]
+    body = {name: value for name, value in vars(fir).items() if name != 'insns'}
+    return _digest((namespace, body, instructions, request), {}).hex()
 
 class AnalysisCache:
     def __init__(self, root, namespace, readonly=False):

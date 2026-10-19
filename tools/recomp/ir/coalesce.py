@@ -8,7 +8,7 @@ This changes representation only, without inferring dead upper register bits.
 from .operations import TERMINATORS
 
 
-def initialize(s, groups, predecessors):
+def initialize(s, groups, predecessors, inherited=()):
     """Create wide inputs and joins with byte lanes for instruction state."""
     s.entry_ops = []
     joins = []
@@ -24,6 +24,8 @@ def initialize(s, groups, predecessors):
             s.aliases[s.inputs[key].id] = byte
         phis = {}
         for i, b in s.blocks.items():
+            if i in inherited:
+                continue
             phi = s.value("PHI", len(keys), data=(keys, predecessors[i]))
             phis[i] = phi
             b.phis.append(phi)

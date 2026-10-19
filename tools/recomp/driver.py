@@ -210,6 +210,41 @@ def _take_prepared(path):
     raise TranslateError("prepared body is unavailable in its owning worker: %s" % path)
 
 
+def _contract_components(batch):
+    common, items = batch
+    indirect, effects, noreturn, language, pops = common
+    ctx = _CTX
+    cache = (emission_cache.AnalysisCache(*ctx.settings.preparation_cache, readonly=True)
+             if getattr(ctx.settings, 'preparation_cache', None) else None)
+
+    def body(addr):
+        fn, entries = ctx.load(ctx.program.containing(addr) or addr)
+        fir = ctx.artifacts.lifted(ctx.tr, ctx.lifter, fn)
+        fir.entries = tuple(entries)
+        return fir
+
+    try:
+        out = []
+        for _index, component, firs, contracts, recursive in items:
+            result = call_contracts.component_contracts(
+                component, firs, contracts, recursive, indirect=indirect, effects=effects,
+                noreturn=noreturn, bodies=body, language=language, pops=pops,
+                summary_cache=cache)
+            pending = dict(cache.pending) if cache is not None else {}
+            used = set(cache.used) if cache is not None else set()
+            counts = dict(cache.counts) if cache is not None else {}
+            if cache is not None:
+                cache.pending.clear()
+                cache.used.clear()
+                cache.counts.clear()
+            out.append((result, pending, used, counts))
+        return out
+    finally:
+        ctx.artifacts.flush_counts()
+        if cache is not None:
+            cache.connection.close()
+
+
 def _prepare(task):
     analysis, selection = task.analysis, task.selection
     helpers, internal, contracts = analysis.helpers, analysis.internal, analysis.contracts
@@ -564,13 +599,27 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
                 return fir
 
             prepared = {addr: row.register_facts or None for addr, row in scanned.items()}
+            pop_facts = {addr: row.stack_pops for addr, row in scanned.items()
+                         if row.stack_pops is not None}
             roots = [addr for addr, row in scanned.items() if row.exclusion is None]
-            contracts = call_contracts.analyze(
-                calls, prepared,
-                analyzable=lambda a: bool(scanned.get(a) and scanned[a].register_facts is not None
-                                          and a not in helpers and a not in conservative),
-                roots=roots, indirect=indirect_targets, effects=settings.call_effects,
-                noreturn=ctx.program.noreturn, bodies=contract_body, summary_cache=analysis_cache)
+            execute = None
+            contract_pool = None
+            if settings.jobs > 1:
+                contract_pool = ProcessPoolExecutor(
+                    max_workers=settings.jobs, initializer=_init, initargs=(settings, artifacts))
+                def execute(batches):
+                    return list(contract_pool.map(_contract_components, batches))
+            try:
+                contracts = call_contracts.analyze(
+                    calls, prepared,
+                    analyzable=lambda a: bool(scanned.get(a) and scanned[a].register_facts is not None
+                                              and a not in helpers and a not in conservative),
+                    roots=roots, indirect=indirect_targets, effects=settings.call_effects,
+                    noreturn=ctx.program.noreturn, bodies=contract_body, pop_facts=pop_facts,
+                    summary_cache=analysis_cache, execute=execute)
+            finally:
+                if contract_pool is not None:
+                    contract_pool.shutdown()
         if analysis_cache is not None:
             analysis_cache.finish()
         phase("register contracts")

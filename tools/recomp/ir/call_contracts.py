@@ -238,7 +238,7 @@ class _Prepared(object):
     their index to the site address for ``summarize``'s indirect facts.
     """
 
-    __slots__ = ("language", "entry", "order", "succ", "preds", "use", "defs", "call", "opaque", "call_sites", "returns", "tails", "writes", "preserves", "stack_saves", "pops")
+    __slots__ = ("language", "entry", "order", "succ", "preds", "use", "defs", "call", "opaque", "call_sites", "returns", "tails", "writes", "preserves", "stack_saves", "pops", "frontend")
 
     def __init__(self, fir, cells, bits, sites=None):
         self.language = cells.language
@@ -252,6 +252,7 @@ class _Prepared(object):
         self.preserves = frozenset()
         self.stack_saves = False
         self.pops = None
+        self.frontend = None
         if self.entry is None:
             return
         n = len(fir.insns)
@@ -310,15 +311,30 @@ class _Prepared(object):
                 self.returns.append(i)
 
 
-def _stack_pops(fir):
+def _stack_pops_raw(raws):
     found = set()
-    for ins in fir.insns:
-        raw = bytes(ins.raw or b"").lstrip(b"\xf3")
+    for raw in raws:
+        raw = bytes(raw or b"").lstrip(b"\xf3")
         if raw[:1] == b"\xc3":
             found.add(0)
         elif raw[:1] == b"\xc2" and len(raw) == 3:
             found.add(int.from_bytes(raw[1:], "little"))
     return found.pop() if len(found) == 1 else None
+
+
+def _stack_pops(fir):
+    return _stack_pops_raw(ins.raw for ins in fir.insns)
+
+
+def stack_pops_from_decoded(insns):
+    raws = []
+    for ins in insns:
+        decode = getattr(ins, "decode", None)
+        raw = None if decode is None else decode.source_bytes
+        if not isinstance(raw, (bytes, bytearray)):
+            return None
+        raws.append(raw)
+    return _stack_pops_raw(raws)
 
 
 def _is_return(ins):
@@ -329,7 +345,7 @@ def closed(prepared):
     return bool(prepared) and not prepared.tails
 
 
-def prepare(fir, language=None, image=None, sites=None):
+def prepare(fir, language=None, image=None, sites=None, frontend=None):
     """The callee-independent facts of one lifted body, None unless its CFG is closed.
 
     Plain data, so workers can hand it to the process that solves the call graph."""
@@ -342,9 +358,13 @@ def prepare(fir, language=None, image=None, sites=None):
         return None
     cells = mapping(language or fir.language)
     p = _Prepared(fir, cells, _bits(cells), sites)
+    p.frontend = frontend
     p.pops = _stack_pops(fir)
-    p.stack_saves = any(ins.raw and len(ins.raw) == 1 and 0x50 <= ins.raw[0] <= 0x57
-                        for ins in fir.insns)
+    pushes = any(ins.raw and len(ins.raw) == 1 and 0x50 <= ins.raw[0] <= 0x57
+                 for ins in fir.insns)
+    restores = any(ins.raw and len(ins.raw) == 1 and (0x58 <= ins.raw[0] <= 0x5f or ins.raw[0] == 0xc9)
+                   for ins in fir.insns)
+    p.stack_saves = pushes and restores
     if (p.stack_saves and not p.tails and not fir.entries and not fir.seh and not any(
             op.opc in ("CALL", "CALLIND", "CALLOTHER") for ins in fir.insns for op in ins.ops)):
         p.preserves = _preserved_registers(fir, sites=sites)
@@ -405,7 +425,7 @@ def _preservation_lifter(language):
     return Lifter(language)
 
 
-def _preserved_registers(fir, contracts=None, sites=None, ir=None, pops=None):
+def _preserved_registers(fir, contracts=None, sites=None, ir=None, pops=None, memo=None):
     """GPRs equal to their entry value at every return.
 
     `contracts` maps call-site indices to the joined callee contract. Callees
@@ -423,21 +443,33 @@ def _preserved_registers(fir, contracts=None, sites=None, ir=None, pops=None):
     registers = {name: lifter.register(name) for name in GPRS}
     groups = {name: tuple((space, offset + n) for n in range(size))
               for name, (space, offset, size) in registers.items()}
+    kept_calls, kept_sites = {}, {}
+    for index, row in sites.items():
+        if row.kind == "tail":
+            continue
+        fields = _kept_fields(contracts.get(index))
+        keys = frozenset(key for field in fields for key in groups[field])
+        if row.kind == "indirect":
+            kept_sites[row.site] = keys
+        elif row.targets:
+            kept_calls[row.targets[0].address] = keys
+    key = None
+    if memo is not None:
+        direct_pops = tuple(sorted((target.address, pops.get(target.address))
+                                   for row in sites.values() if row.kind != "tail"
+                                   for target in row.targets))
+        key = (id(fir), fir.addr,
+               tuple(sorted((target, tuple(sorted(keys))) for target, keys in kept_calls.items())),
+               tuple(sorted((site, tuple(sorted(keys))) for site, keys in kept_sites.items())),
+               direct_pops)
+        cached = memo.get(key)
+        if cached is not None:
+            return cached
     try:
         if ir is None:
             ir = codegen_ir(fir, lifter)
         call_targets = {op.ins[0][1] for ins in ir.insns for op in ins.ops
                         if op.opc == "CALL" and op.ins and op.ins[0][0] == "ram"}
-        kept_calls, kept_sites = {}, {}
-        for index, row in sites.items():
-            if row.kind == "tail":
-                continue
-            fields = _kept_fields(contracts.get(index))
-            keys = frozenset(key for field in fields for key in groups[field])
-            if row.kind == "indirect":
-                kept_sites[row.site] = keys
-            elif row.targets:
-                kept_calls[row.targets[0].address] = keys
         s = build(ir, register_groups=groups.values(), call_targets=call_targets,
                   indirect_call_symbol="preservation", kept_calls=kept_calls,
                   kept_indirect=kept_sites)
@@ -459,22 +491,31 @@ def _preserved_registers(fir, contracts=None, sites=None, ir=None, pops=None):
             return None if count is None or base is None else (base, 4 + count)
 
         if not forward(s, calls=True, stack_reload=stack_reload, signed_sub=False):
-            return frozenset()
+            result = frozenset()
+            if memo is not None:
+                memo[key] = result
+            return result
     except (SSAError, RecursionError):
         return frozenset()
     returns = [b for b in s.blocks.values() if any(v.opc == "RETURN" for v in b.ops)]
     if not returns:
-        return frozenset()
+        result = frozenset()
+        if memo is not None:
+            memo[key] = result
+        return result
 
     def same_byte(left, right):
         left, right = s.resolve(left), s.resolve(right)
         return left is right or (left.opc == right.opc == "BYTE" and left.data == right.data
                                  and s.resolve(left.args[0]) is s.resolve(right.args[0]))
 
-    return frozenset(name for name, keys in groups.items()
-                     if all(key in s.inputs for key in keys) and all(
-                         same_byte(b.exit[key], s.inputs[key])
-                         for b in returns for key in keys))
+    result = frozenset(name for name, keys in groups.items()
+                       if all(key in s.inputs for key in keys) and all(
+                           same_byte(b.exit[key], s.inputs[key])
+                           for b in returns for key in keys))
+    if memo is not None:
+        memo[key] = result
+    return result
 
 
 def join_contracts(contracts):
@@ -546,7 +587,8 @@ def indirect_site_contracts(p, callee_lookup, indirect=None, effects=None, noret
             if contract is not None and p.call_sites[i].kind == "indirect"}
 
 
-def summarize(p, callee_lookup, cells=None, indirect=None, effects=None, noreturn=(), body=None, ir=None, pops=None):
+def summarize(p, callee_lookup, cells=None, indirect=None, effects=None, noreturn=(), body=None, ir=None, pops=None,
+              preservation_memo=None):
     """Compute one function's contract from its prepared facts.
 
     ``callee_lookup(target)`` returns a Contract or None for no summary.
@@ -564,7 +606,7 @@ def summarize(p, callee_lookup, cells=None, indirect=None, effects=None, noretur
     writes = p.writes
     contracts = _resolved_sites(p, callee_lookup, indirect, effects, noreturn)
     preserved = (p.preserves if body is None or not p.stack_saves or p.tails
-                 else _preserved_registers(body, contracts, p.call_sites, ir, pops))
+                 else _preserved_registers(body, contracts, p.call_sites, ir, pops, preservation_memo))
     for i, contract in contracts.items():
         if contract is None:
             use[i] = bits.all
@@ -699,8 +741,102 @@ def continuation_outputs(s, publications, groups, lane_field, extra_roots=(), ca
     return outputs
 
 
+def component_contracts(component, firs, contracts, recursive, *, indirect, effects, noreturn,
+                        bodies, language, pops, summary_cache=None):
+    cells = mapping(language)
+    preservation, preservation_memo = {}, {}
+    body_inputs, summary_inputs = {}, {}
+
+    def summary(addr, lookup):
+        from .normalize import codegen_ir
+        from .ssa import SSAError
+
+        p = firs[addr]
+        body, ir, key, facts = None, None, None, None
+        if summary_cache is not None:
+            facts = summary_inputs.get(addr)
+            if facts is None and p.frontend is not None:
+                call_pops = tuple(sorted((target.address, pops.get(target.address))
+                                         for row in p.call_sites.values()
+                                         for target in row.targets))
+                facts = summary_inputs[addr] = summary_cache.key(None,
+                    ('contract-inputs-frontend',
+                     {name: getattr(p, name) for name in p.__slots__}, call_pops))
+            if facts is not None:
+                key = summary_cache.key(None, ('contract', facts,
+                                              _resolved_sites(p, lookup, indirect, effects, noreturn)))
+                cached = summary_cache.get(key)
+                if cached is not None:
+                    return cached
+        if addr not in body_inputs:
+            try:
+                if bodies is not None and p.stack_saves and p.call_sites and not p.tails:
+                    body = bodies(addr) if callable(bodies) else bodies[addr]
+                    if body.entries or body.seh:
+                        body = None
+            except (SSAError, RecursionError, KeyError):
+                body = None
+            body_inputs[addr] = body
+        body = body_inputs[addr]
+        if summary_cache is not None and facts is None:
+            call_pops = {op.ins[0][1]: pops.get(op.ins[0][1])
+                         for ins in body.insns for op in ins.ops
+                         if op.opc == 'CALL' and op.ins and op.ins[0][0] == 'ram'} if body is not None else {}
+            facts = summary_inputs[addr] = summary_cache.key(body,
+                ('contract-inputs', {name: getattr(p, name) for name in p.__slots__}, call_pops))
+            key = summary_cache.key(None, ('contract', facts,
+                                          _resolved_sites(p, lookup, indirect, effects, noreturn)))
+            cached = summary_cache.get(key)
+            if cached is not None:
+                return cached
+        if body is not None:
+            try:
+                if addr not in preservation:
+                    preservation[addr] = codegen_ir(body, copy(_preservation_lifter(body.language)))
+                ir = preservation[addr]
+            except (SSAError, RecursionError, KeyError):
+                body = None
+        result = summarize(p, lookup, cells, indirect, effects, noreturn, body=body, ir=ir, pops=pops,
+                           preservation_memo=preservation_memo)
+        if key is not None:
+            summary_cache.put(key, result)
+        return result
+
+    live = {a: Contract(frozenset(), frozenset(), frozenset()) for a in component if a in firs}
+    resolved = {}
+
+    def lookup(target):
+        if target in contracts:
+            return contracts[target]
+        return live.get(target)
+
+    if not recursive:
+        for addr in component:
+            if addr in firs:
+                resolved[addr] = summary(addr, lookup)
+        return resolved
+    converged = False
+    for _ in range(_scc_cap(len(component), len(cells.all_cells))):
+        changed = False
+        for addr in component:
+            if addr not in firs:
+                continue
+            new = summary(addr, lookup)
+            current = live.get(addr)
+            if current is None or new != current:
+                live[addr] = new
+                changed = True
+        if not changed:
+            converged = True
+            break
+    for addr in component:
+        if addr in firs:
+            resolved[addr] = live[addr] if converged else CONSERVATIVE
+    return resolved
+
+
 def analyze(targets, prepared, *, analyzable, roots, progress=None, language=None, indirect=None, effects=None,
-            noreturn=(), bodies=None, summary_cache=None):
+            noreturn=(), bodies=None, pop_facts=None, summary_cache=None, execute=None):
     """Contracts for every analyzable body reachable from `roots`.
 
     `targets[addr]` lists a function's direct CALL targets, `prepared[addr]` is
@@ -716,18 +852,18 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
     the contracts already known below.
     """
     indirect = indirect or {}
+    pop_facts = pop_facts or {}
 
     def callees(addr):
         out = list(targets.get(addr, ()))
         body = prepared.get(addr)
         if body is not None:
             for row in body.call_sites.values():
-                if row.kind == "tail":
-                    out.extend(t.address for t in row.targets)
-                    continue
-                fact = indirect.get(row.site)
-                if fact is not None and fact[0] == "call":
-                    out.extend(fact[1])
+                out.extend(t.address for t in row.targets)
+                if row.kind != "tail":
+                    fact = indirect.get(row.site)
+                    if fact is not None and fact[0] == "call":
+                        out.extend(fact[1])
         return out
 
     needed, stack = set(), []
@@ -750,9 +886,6 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
         language = next(iter(languages), None)
     if any(p.language != (language or X86_32.language) for p in firs.values()):
         raise ValueError("call-contract analysis language disagrees with prepared bodies")
-    cells = mapping(language)
-    preservation = {}
-    body_inputs, summary_inputs = {}, {}
     pops = {addr: p.pops for addr, p in firs.items()}
     resolved_pops = {}
 
@@ -773,6 +906,10 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
             if count is not None:
                 resolved_pops[addr] = count
             return count
+        if addr in pop_facts:
+            count = pop_facts[addr]
+            resolved_pops[addr] = count
+            return count
         if bodies is None:
             return None
         try:
@@ -792,93 +929,91 @@ def analyze(targets, prepared, *, analyzable, roots, progress=None, language=Non
                 resolve_pops(target.address)
     pops.update(resolved_pops)
 
-    def summary(addr, lookup):
-        from .normalize import codegen_ir
-        from .ssa import SSAError
-
-        p = firs[addr]
-        body, ir, key = None, None, None
-        if addr not in body_inputs:
-            try:
-                if bodies is not None and p.stack_saves and p.call_sites and not p.tails:
-                    body = bodies(addr) if callable(bodies) else bodies[addr]
-                    if body.entries or body.seh:
-                        body = None
-            except (SSAError, RecursionError, KeyError):
-                body = None
-            body_inputs[addr] = body
-        body = body_inputs[addr]
-        if summary_cache is not None:
-            if addr not in summary_inputs:
-                call_pops = {op.ins[0][1]: pops.get(op.ins[0][1])
-                             for ins in body.insns for op in ins.ops
-                             if op.opc == 'CALL' and op.ins and op.ins[0][0] == 'ram'} if body is not None else {}
-                summary_inputs[addr] = summary_cache.key(body,
-                    ('contract-inputs', {name: getattr(p, name) for name in p.__slots__}, call_pops))
-            key = summary_cache.key(None, ('contract', summary_inputs[addr],
-                                          _resolved_sites(p, lookup, indirect, effects, noreturn)))
-            cached = summary_cache.get(key)
-            if cached is not None:
-                return cached
-        if body is not None:
-            try:
-                if addr not in preservation:
-                    preservation[addr] = codegen_ir(body, copy(_preservation_lifter(body.language)))
-                ir = preservation[addr]
-            except (SSAError, RecursionError, KeyError):
-                body = None
-        result = summarize(p, lookup, cells, indirect, effects, noreturn, body=body, ir=ir, pops=pops)
-        if key is not None:
-            summary_cache.put(key, result)
-        return result
-
-    contracts = {}
     components = call_graph(sorted(needed),
                             lambda a: [t for t in callees(a) if t in firs])
-    done = 0
-    for comp in components:
-        # Sound bottom for both analyses: the may-liveness least fixed point and
-        # the must-definite least fixed point (the strongest sound under-
-        # approximation, which only makes the caller publish more).
-        live = {a: Contract(frozenset(), frozenset(), frozenset()) for a in comp if a in firs}
+    recursive = [len(comp) > 1 or any(t in comp for a in comp if a in firs for t in callees(a))
+                 for comp in components]
+    common = (indirect, effects, noreturn, language, pops)
+    if execute is None:
+        contracts, done = {}, 0
+        for index, comp in enumerate(components):
+            firs_ = {a: firs[a] for a in comp if a in firs}
+            found = component_contracts(comp, firs_, contracts, recursive[index],
+                                        indirect=indirect, effects=effects, noreturn=noreturn,
+                                        bodies=bodies, language=language, pops=pops,
+                                        summary_cache=summary_cache)
+            contracts.update(found)
+            done += len(found)
+            if progress is not None:
+                for offset, _ in enumerate(found, 1):
+                    progress(done - len(found) + offset, len(needed))
+        return contracts
 
-        def lookup(target, live=live):
-            if target in contracts:
-                return contracts[target]
-            return live.get(target)
-
-        # The lattice chain is bounded by |comp| x cell count for each of reads
-        # and kills.  If the safety cap is hit the result is not a fixed point,
-        # and a non-converged may-analysis would under-approximate reads, so
-        # fall back to the conservative contract for the whole component.
-        recursive = len(comp) > 1 or any(t == comp[0] for t in callees(comp[0]))
-        if not recursive:
-            # No call into the component: one pass is the fixed point.
-            for addr in comp:
-                if addr in firs:
-                    contracts[addr] = summary(addr, lookup)
-                    done += 1
-                    if progress is not None:
-                        progress(done, len(needed))
-            continue
-        converged = False
-        for _ in range(_scc_cap(len(comp), len(cells.all_cells))):
-            changed = False
+    component_of = {addr: index for index, comp in enumerate(components)
+                    for addr in comp if addr in firs}
+    dependencies = [set() for _ in components]
+    callers = [set() for _ in components]
+    for index, comp in enumerate(components):
+        for addr in comp:
+            if addr not in firs:
+                continue
+            for target in callees(addr):
+                other = component_of.get(target)
+                if other is not None and other != index:
+                    dependencies[index].add(other)
+                    callers[other].add(index)
+    waiting = [len(found) for found in dependencies]
+    import heapq
+    ready = [(min(comp), index) for index, comp in enumerate(components) if not waiting[index]]
+    heapq.heapify(ready)
+    contracts, done = {}, 0
+    while ready:
+        wave = []
+        while ready:
+            wave.append(heapq.heappop(ready)[1])
+        batches, pending = [], []
+        for index in wave:
+            comp = components[index]
+            firs_ = {a: firs[a] for a in comp if a in firs}
+            callee_contracts = {}
             for addr in comp:
                 if addr not in firs:
                     continue
-                new = summary(addr, lookup)
-                current = live.get(addr)
-                if current is None or new != current:
-                    live[addr] = new
-                    changed = True
-            if not changed:
-                converged = True
-                break
-        for addr in comp:
-            if addr in firs:
-                contracts[addr] = live[addr] if converged else CONSERVATIVE
-                done += 1
+                for target in callees(addr):
+                    if target in contracts:
+                        callee_contracts[target] = contracts[target]
+            pending.append((index, comp, firs_, callee_contracts, recursive[index]))
+        batch = []
+        for item in pending:
+            if item[4]:
+                if batch:
+                    batches.append((common, batch))
+                    batch = []
+                batches.append((common, [item]))
+                continue
+            batch.append(item)
+            if len(batch) == 16:
+                batches.append((common, batch))
+                batch = []
+        if batch:
+            batches.append((common, batch))
+        for (_common, batch), results in zip(batches, execute(batches)):
+            for (index, comp, _firs, _contracts, _recursive), result in zip(batch, results):
+                found, cache_pending, cache_used, cache_counts = result
+                if summary_cache is not None:
+                    for key, value in cache_pending.items():
+                        summary_cache.put(key, value)
+                    for key in cache_used:
+                        summary_cache.retain(key)
+                    for name, count in cache_counts.items():
+                        summary_cache.counts[name] = summary_cache.counts.get(name, 0) + count
+                contracts.update(found)
+                done += len(found)
                 if progress is not None:
-                    progress(done, len(needed))
+                    for offset, _ in enumerate(found, 1):
+                        progress(done - len(found) + offset, len(needed))
+                for parent in callers[index]:
+                    waiting[parent] -= 1
+                    if not waiting[parent]:
+                        heapq.heappush(ready, (min(components[parent]), parent))
     return contracts
