@@ -145,6 +145,7 @@ struct HObj {
     uint32_t exit_code = 0;
     uint32_t thread_start = 0;
     uint32_t thread_param = 0;
+    uint32_t ideal_processor = 0x20; // MAXIMUM_PROCESSORS: no preference
     bool thread_suspended = false;
     bool thread_ran = false;
     // H_MAPPING
@@ -2598,6 +2599,17 @@ uint32_t cur_thread_id() {
 
 } // namespace
 
+bool kernel32_guest_environment_lookup(const std::string &name, std::string &value) {
+    for (const auto &entry : guest_environment()) {
+        size_t eq = entry.find('=');
+        if (eq != name.size() || os_strcasecmp(entry.substr(0, eq).c_str(), name.c_str()) != 0)
+            continue;
+        value = entry.substr(eq + 1);
+        return true;
+    }
+    return false;
+}
+
 // The register file of the thread that is running guest code right now. The
 // main thread runs on the loader's process-wide context; every other guest
 // thread has its own. A fault handler needs this: reporting the main context
@@ -3876,56 +3888,8 @@ bool thread_spawn(uint32_t h) {
     return true;
 }
 
-// Create the guest thread context and its cooperative host worker.
-// Each worker has its own stack/registers, but only the scheduler baton holder executes guest code.
 void k_CreateThread(X86 *c) {
-    uint32_t start = arg(c, 2), param = arg(c, 3), flags = arg(c, 4), ptid = arg(c, 5);
-    uint32_t h = handle_new(H_THREAD);
-    handles()[h].thread_start = start;
-    handles()[h].thread_param = param;
-    handles()[h].exit_code = STILL_ACTIVE_;
-
-    const char *mode = recomp_env("CREATETHREAD");
-    if (mode && strcmp(mode, "skip") == 0) {
-        LOGW("CreateThread(%08x): skipped (RECOMP_CREATETHREAD=skip)", start);
-        handles()[h].thread_ran = true;
-        handles()[h].exit_code = 0;
-        if (ptid)
-            wr32(ptid, 0);
-        set_eax(c, h);
-        return;
-    }
-    if (mode && strcmp(mode, "sync") == 0) {
-        LOGW("CreateThread(%08x, param=%08x): running synchronously to completion "
-             "(RECOMP_CREATETHREAD=sync)",
-             start, param);
-        handles()[h].exit_code = 0;
-        if (ptid)
-            wr32(ptid, 1);
-        run_thread_body(c, h);
-        set_eax(c, h);
-        return;
-    }
-
-    if (!thread_spawn(h)) {
-        LOGW("CreateThread(%08x): no context available, reporting failure", start);
-        handles()[h].exit_code = 0;
-        handles()[h].thread_ran = true;
-        set_last_error(ERROR_NOT_ENOUGH_MEMORY_);
-        set_eax(c, 0);
-        return;
-    }
-    GuestThread *t = threads().back();
-    if (flags & 0x00000004u) { // CREATE_SUSPENDED
-        t->suspend_count = 1;
-        handles()[h].thread_suspended = true;
-    }
-    handles()[h].thread_ran = true; // it exists; it is not a stub
-    if (ptid)
-        wr32(ptid, t->id);
-    LOGV("CreateThread(%08x, param=%08x, flags=%08x) -> handle %08x id %u", start, param, flags, h,
-         t->id);
-    set_eax(c, h);
+    set_eax(c, kernel32_create_guest_thread(c, arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5)));
 }
 
 void k_ExitThread(X86 *c) {
@@ -4103,6 +4067,18 @@ void k_GetThreadPriority(X86 *c) {
 void k_SetThreadPriority(X86 *c) {
     set_eax(c, 1);
 }
+void k_SetThreadIdealProcessor(X86 *c) {
+    HObj *o = handle_get(arg(c, 0), H_THREAD);
+    if (!o) {
+        set_last_error(ERROR_INVALID_HANDLE_);
+        set_eax(c, 0xffffffffu);
+        return;
+    }
+    uint32_t previous = o->ideal_processor;
+    uint32_t ideal = arg(c, 1);
+    o->ideal_processor = ideal >= 0x20 ? 0x20 : ideal;
+    set_eax(c, previous);
+}
 
 void k_ExitProcess(X86 *c) {
     LOGW("ExitProcess(%u)", arg(c, 0));
@@ -4145,6 +4121,55 @@ void k_UnhandledExceptionFilter(X86 *c) {
 // delivered anywhere. Continuing would run the guest past a point it never
 // reaches on Windows, so both abort with the state that caused them.
 } // namespace
+
+// Create the guest thread context and its cooperative host worker.
+// Each worker has its own stack/registers, but only the scheduler baton holder executes guest code.
+uint32_t kernel32_create_guest_thread(X86 *c, uint32_t start, uint32_t param, uint32_t flags,
+                                      uint32_t ptid) {
+    uint32_t h = handle_new(H_THREAD);
+    handles()[h].thread_start = start;
+    handles()[h].thread_param = param;
+    handles()[h].exit_code = STILL_ACTIVE_;
+
+    const char *mode = recomp_env("CREATETHREAD");
+    if (mode && strcmp(mode, "skip") == 0) {
+        LOGW("CreateThread(%08x): skipped (RECOMP_CREATETHREAD=skip)", start);
+        handles()[h].thread_ran = true;
+        handles()[h].exit_code = 0;
+        if (ptid)
+            wr32(ptid, 0);
+        return h;
+    }
+    if (mode && strcmp(mode, "sync") == 0) {
+        LOGW("CreateThread(%08x, param=%08x): running synchronously to completion "
+             "(RECOMP_CREATETHREAD=sync)",
+             start, param);
+        handles()[h].exit_code = 0;
+        if (ptid)
+            wr32(ptid, 1);
+        run_thread_body(c, h);
+        return h;
+    }
+
+    if (!thread_spawn(h)) {
+        LOGW("CreateThread(%08x): no context available, reporting failure", start);
+        handles()[h].exit_code = 0;
+        handles()[h].thread_ran = true;
+        set_last_error(ERROR_NOT_ENOUGH_MEMORY_);
+        return 0;
+    }
+    GuestThread *t = threads().back();
+    if (flags & 0x00000004u) { // CREATE_SUSPENDED
+        t->suspend_count = 1;
+        handles()[h].thread_suspended = true;
+    }
+    handles()[h].thread_ran = true; // it exists; it is not a stub
+    if (ptid)
+        wr32(ptid, t->id);
+    LOGV("CreateThread(%08x, param=%08x, flags=%08x) -> handle %08x id %u", start, param, flags, h,
+         t->id);
+    return h;
+}
 
 static bool printable_guest_string(uint32_t a, std::string *out) {
     if (!a || !gm_valid(a, 1))
@@ -4282,6 +4307,13 @@ void k_RaiseException(X86 *c) {
         LOGV("RaiseException(code=%08x nargs=%u arg0=%08x) from ret=%08x, frames:%s", arg(c, 0),
              arg(c, 2), arg(c, 2) && gm_valid(arg(c, 3), 4) ? rd32(arg(c, 3)) : 0,
              rd32(c->r[R_ESP]), frames.c_str());
+    }
+    // MS_VC_EXCEPTION is SetThreadName's debugger convention. Every raiser
+    // in this image wraps it in __try/__except(EXECUTE_HANDLER) whose block
+    // rejoins the normal path, so continuing here is that catch.
+    if (arg(c, 0) == 0x406d1388u) {
+        set_eax(c, 0);
+        return;
     }
     if (recomp_seh_raise(c, arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3)))
         return; // only the testing runtime can return from an unhandled raise
@@ -5899,6 +5931,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "GetCurrentProcess", 0, k_GetCurrentProcess},
     {"KERNEL32.dll", "GetThreadPriority", 1, k_GetThreadPriority},
     {"KERNEL32.dll", "SetThreadPriority", 2, k_SetThreadPriority},
+    {"KERNEL32.dll", "SetThreadIdealProcessor", 2, k_SetThreadIdealProcessor},
     {"KERNEL32.dll", "ExitProcess", 1, k_ExitProcess},
     {"KERNEL32.dll", "TerminateProcess", 2, k_TerminateProcess},
     // exceptions

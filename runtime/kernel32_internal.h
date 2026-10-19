@@ -30,6 +30,11 @@ void open_mutex_named(X86 *c, const std::string &name);
 
 void kernel32_wide_reset();
 
+uint32_t kernel32_create_guest_thread(X86 *c, uint32_t start, uint32_t param, uint32_t flags,
+                                      uint32_t ptid);
+
+bool kernel32_guest_environment_lookup(const std::string &name, std::string &value);
+
 void get_command_line(X86 *c);
 uint32_t win32_command_line();
 void startup_info(X86 *c);

@@ -313,6 +313,13 @@ void folder_path(X86 *c) {
     case 26:
     case 28:
     case 35:
+    case 0x02:
+    case 0x0d:
+    case 0x10:
+    case 0x14:
+    case 0x17:
+    case 0x19:
+    case 0x2e:
         break;
     default:
         set_eax(c, 0x80070057u);
@@ -403,6 +410,7 @@ const ImportShim shims[] = {
     {"msvcrt.dll", "memcpy", ARGC_CDECL, crt_memcpy},
     {"msvcrt.dll", "memset", ARGC_CDECL, crt_memset},
     {"SHFOLDER.dll", "SHGetFolderPathW", 5, folder_path},
+    {"SHELL32.dll", "SHGetFolderPathW", 5, folder_path},
     {"SHELL32.dll", "Shell_NotifyIconW", 2, yes},
     {"SHELL32.dll", "SHAppBarMessage", 2, zero},
     {"SHELL32.dll", "ShellExecuteW", 6, zero},
