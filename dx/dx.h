@@ -115,11 +115,12 @@ void dsound_pump();
 // stops. DirectSound's streaming worker is parked in WaitForMultipleObjects on
 // events nothing else would signal.
 void qmixer_frame_pump(X86 *c);
-// Refills Miles streams on the guest frame seam.
+// Services Miles sample completion and timer callbacks on the guest frame seam.
 void mss32_frame_pump(X86 *c);
 // Drops the Miles sample/driver/3D state, whose guest addresses and host
 // channels the arena teardown is about to discard.
 void mss32_reset();
+void mss32_shutdown();
 // Decode FMOD streams and schedule Soundlib MIDI events on the guest thread.
 void fmod_frame_pump(X86 *c);
 void soundlib_frame_pump(X86 *c);

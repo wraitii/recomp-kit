@@ -649,6 +649,7 @@ void boot_run() {
         bink_shutdown();
         waveout_shutdown();
     }
+    mss32_shutdown();
     // The drive left this thread registered and holding the baton on purpose:
     // the exits above are mod code and need it. This is where it goes back.
     sched_drive_release();

@@ -22,10 +22,15 @@
 #include <vector>
 #include <iterator>
 #include <map>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
+#include <utility>
 
 namespace {
 
 const uint32_t SMP_FREE = 1, SMP_DONE = 2, SMP_PLAYING = 4;
+constexpr uint32_t STREAM_BUFFER_MS = 1000;
 
 int32_t miles_volume_mb(int32_t v) {
     v = std::clamp(v, 0, 127);
@@ -112,9 +117,17 @@ struct Sample {
     uint32_t rate = 0;
 };
 std::vector<Sample> g_samples(64);
+std::mutex g_stream_mutex;
+std::condition_variable g_stream_condition;
+OsThread *g_stream_thread = nullptr;
+bool g_stream_worker_stop = false;
+bool g_stream_command = false;
+bool g_stream_host_shutdown = false;
 
 uint32_t stream_status(uint32_t handle);
 void stream_close_driver(uint32_t driver);
+void stream_stop_alias(int32_t index);
+bool stream_worker_start();
 
 // The single digital driver every sample belongs to. A sample handle does not
 // name a driver, so master volume comes from the most recently opened one.
@@ -158,6 +171,8 @@ Sample *sample_for(uint32_t handle) {
 // The sample borrows its WAVE image. The host copies PCM on submission;
 // Miles keeps the shared channel reserved until init or handle release.
 void sample_stop(Sample &s) {
+    std::lock_guard<std::mutex> lock(g_stream_mutex);
+    stream_stop_alias(s.stream);
     if (s.channel >= 0)
         host_audio_stop(s.channel);
     s.playing = false;
@@ -850,9 +865,6 @@ void ail_end_sample(X86 *c) {
     set_eax(c, 0);
 }
 
-// AIL_lock/AIL_unlock serialize access to Miles' global state. The shim's
-// state is touched only from the guest's own thread seam, so there is nothing
-// to guard; returning zero matches the API's void-like result.
 void ail_lock(X86 *c) {
     set_eax(c, 0);
 }
@@ -883,6 +895,7 @@ void ail_resume_sample(X86 *c) {
 }
 
 void ail_sample_status(X86 *c) {
+    std::lock_guard<std::mutex> lock(g_stream_mutex);
     Sample *s = sample_for(arg(c, 0));
     if (s && s->stream >= 0) {
         set_eax(c, stream_status((uint32_t)s->stream + 1));
@@ -985,6 +998,7 @@ void ail_sample_reverb_levels(X86 *c) {
 }
 
 void ail_set_sample_playback_rate(X86 *c) {
+    std::lock_guard<std::mutex> lock(g_stream_mutex);
     if (Sample *s = sample_for(arg(c, 0))) {
         s->rate = arg(c, 1);
         if (s->channel >= 0)
@@ -1034,11 +1048,12 @@ struct StreamSource {
     }
 };
 
-// Stream handles own the encoded image, decoder and shared host channel.
-// All state is serviced on the guest frame seam; the host copies each PCM
-// submission. A refused chunk remains pending until a later frame accepts it.
+// Stream handles own the encoded image, decoder and shared host channel. A
+// host worker refills them; the guest frame seam retains timers and callbacks.
 struct Stream {
     bool alive = false, playing = false;
+    uint64_t generation = 0, last_refill_ns = 0;
+    uint64_t refill_underruns = 0, max_refill_interval_ns = 0;
     uint32_t driver = 0;
     std::string name;
     // A paused stream is one the host voice has been stopped for. The host has
@@ -1055,6 +1070,28 @@ struct Stream {
     size_t pending_pos = 0;
 };
 std::vector<Stream> g_streams(64);
+uint64_t g_stream_generation = 0;
+
+void stream_report_refills(Stream &s) {
+    if (!s.last_refill_ns)
+        return;
+    log_msg(s.refill_underruns ? 1 : 2,
+            "mss32: stream refills name=%s generation=%llu underruns=%llu "
+            "max_refill_interval_ms=%llu",
+            s.name.c_str(), (unsigned long long)s.generation,
+            (unsigned long long)s.refill_underruns,
+            (unsigned long long)(s.max_refill_interval_ns / 1000000ull));
+    s.last_refill_ns = 0;
+    s.refill_underruns = 0;
+    s.max_refill_interval_ns = 0;
+}
+
+void stream_stop_alias(int32_t index) {
+    if (index >= 0 && (size_t)index < g_streams.size()) {
+        stream_report_refills(g_streams[index]);
+        g_streams[index].playing = false;
+    }
+}
 
 void driver_apply_mix(uint32_t driver) {
     auto it = g_drivers.find(driver);
@@ -1167,6 +1204,7 @@ Stream *stream_for(uint32_t handle) {
 }
 
 void stream_release(Stream &s) {
+    stream_report_refills(s);
     if (Sample *h = sample_for(s.sample)) {
         *h = Sample{};
     }
@@ -1178,6 +1216,7 @@ void stream_release(Stream &s) {
 }
 
 void stream_close_driver(uint32_t driver) {
+    std::lock_guard<std::mutex> lock(g_stream_mutex);
     for (auto &s : g_streams)
         if (s.alive && s.driver == driver)
             stream_release(s);
@@ -1218,21 +1257,32 @@ void ail_open_stream(X86 *c) {
         LOGW("mss32: open_stream(%s): short read of %s", guest.c_str(), path.c_str());
         return;
     }
+    StreamSource source;
+    if (!source.open(bytes)) {
+        WavImage wav{};
+        if (riff_parse_wave_host(bytes.data(), bytes.size(), &wav))
+            LOGW("mss32: open_stream(%s): WAVE format %04x bits=%u could not be decoded: %s",
+                 guest.c_str(), wav.format, wav.bits, path.c_str());
+        else
+            LOGW("mss32: open_stream(%s): not a decodable WAVE or MPEG image: %s", guest.c_str(),
+                 path.c_str());
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_stream_mutex);
+    if (g_stream_host_shutdown) {
+        LOGW("mss32: open_stream(%s) ignored after audio shutdown", guest.c_str());
+        return;
+    }
+    if (!stream_worker_start()) {
+        LOGW("mss32: open_stream(%s): cannot create stream worker", guest.c_str());
+        return;
+    }
     for (uint32_t i = 0; i < g_streams.size(); ++i) {
         Stream &s = g_streams[i];
         if (s.alive)
             continue;
         s = Stream{};
-        if (!s.source.open(bytes)) {
-            WavImage wav{};
-            if (riff_parse_wave_host(bytes.data(), bytes.size(), &wav))
-                LOGW("mss32: open_stream(%s): WAVE format %04x bits=%u could not be decoded: %s",
-                     guest.c_str(), wav.format, wav.bits, path.c_str());
-            else
-                LOGW("mss32: open_stream(%s): not a decodable WAVE or MPEG image: %s",
-                     guest.c_str(), path.c_str());
-            return;
-        }
+        s.source = std::move(source);
         s.channel = dx_alloc_audio_channel();
         if (s.channel < 0) {
             LOGW("mss32: open_stream(%s): no free audio channel", guest.c_str());
@@ -1273,13 +1323,15 @@ void ail_open_stream(X86 *c) {
     LOGW("mss32: open_stream(%s): no free stream handle", guest.c_str());
 }
 
-// Keep one second of appended PCM ahead. Decoder EOF is not playback EOF:
+// Decoder EOF is not playback EOF:
 // status stays playing until the host consumes the first play and all queues.
 void stream_update(Stream &s) {
-    if (!s.playing)
+    if (g_stream_host_shutdown || !s.playing)
         return;
-    uint32_t ahead = s.source.rate() * s.source.channels() * 2;
-    while (host_audio_queued_bytes(s.channel) < ahead) {
+    uint32_t ahead =
+        std::max(1u, s.source.rate() * STREAM_BUFFER_MS / 1000) * s.source.channels() * 2;
+    uint32_t queued = 0;
+    while (queued < ahead && host_audio_queued_bytes(s.channel) < ahead) {
         if (s.pending.empty()) {
             if (!s.source.decode_next(s.pending)) {
                 if (s.source.failed())
@@ -1295,10 +1347,23 @@ void stream_update(Stream &s) {
             s.pending_pos = 0;
         }
         uint32_t bytes = (uint32_t)(s.pending.size() - s.pending_pos) * 2;
+        bool dry = s.submitted && host_audio_voice_remaining_bytes(s.channel) == 0;
         int32_t taken = host_audio_queue(s.channel, s.pending.data() + s.pending_pos, bytes);
         if (taken <= 0)
             return;
+        uint64_t now = os_monotonic_ns();
+        uint64_t refill_interval = s.last_refill_ns ? now - s.last_refill_ns : 0;
+        s.max_refill_interval_ns = std::max(s.max_refill_interval_ns, refill_interval);
+        if (dry && refill_interval) {
+            ++s.refill_underruns;
+            LOGW("mss32: stream refill after dry gap name=%s generation=%llu "
+                 "refill_interval_ms=%llu",
+                 s.name.c_str(), (unsigned long long)s.generation,
+                 (unsigned long long)(refill_interval / 1000000ull));
+        }
+        s.last_refill_ns = now;
         s.submitted += (uint32_t)taken;
+        queued += (uint32_t)taken;
         s.pending_pos += (uint32_t)taken / 2;
         if (s.pending_pos >= s.pending.size())
             s.pending.clear();
@@ -1308,16 +1373,69 @@ void stream_update(Stream &s) {
         s.playing = false;
 }
 
-// Start with one decoded frame, then convert the channel so subsequent
-// frames append without restarting playback. Starting again rewinds.
+void *stream_worker(void *) {
+    std::unique_lock<std::mutex> lock(g_stream_mutex);
+    while (!g_stream_worker_stop) {
+        g_stream_condition.wait_for(lock, std::chrono::milliseconds(10),
+                                    [] { return g_stream_worker_stop || g_stream_command; });
+        if (g_stream_worker_stop)
+            break;
+        g_stream_command = false;
+        for (auto &s : g_streams)
+            if (s.alive)
+                stream_update(s);
+    }
+    return nullptr;
+}
+
+bool stream_worker_start() {
+    if (g_stream_host_shutdown)
+        return false;
+    if (g_stream_thread)
+        return true;
+    g_stream_worker_stop = false;
+    g_stream_command = true;
+    g_stream_thread = os_thread_create(stream_worker, nullptr, 0);
+    if (!g_stream_thread) {
+        g_stream_worker_stop = true;
+        return false;
+    }
+    return true;
+}
+
+// Prime before starting the host voice. Starting again rewinds.
 void stream_start(Stream &s) {
+    if (g_stream_host_shutdown) {
+        LOGW("mss32: stream start(%s) ignored after audio shutdown", s.name.c_str());
+        return;
+    }
     host_audio_stop(s.channel);
+    stream_report_refills(s);
     s.playing = false;
     s.paused = false;
     s.pending.clear();
     s.source.seek_frames(0);
     s.remaining = s.loops;
-    if (s.source.decode_next(s.pending)) {
+    s.generation = ++g_stream_generation;
+    std::vector<int16_t> decoded;
+    const size_t prime_samples =
+        (size_t)std::max(1u, s.source.rate() * STREAM_BUFFER_MS / 1000) * s.source.channels();
+    while (s.pending.size() < prime_samples) {
+        decoded.clear();
+        if (s.source.decode_next(decoded)) {
+            s.pending.insert(s.pending.end(), decoded.begin(), decoded.end());
+            continue;
+        }
+        if (s.source.failed() || (s.loops != 0 && s.remaining <= 1))
+            break;
+        if (s.remaining > 1)
+            --s.remaining;
+        s.source.seek_frames(0);
+        if (!s.source.decode_next(decoded))
+            break;
+        s.pending.insert(s.pending.end(), decoded.begin(), decoded.end());
+    }
+    if (!s.pending.empty()) {
         HostAudioPlay p{};
         p.channel = s.channel;
         p.pcm = s.pending.data();
@@ -1335,17 +1453,24 @@ void stream_start(Stream &s) {
         p.pan = h->is_3d ? sample3d_pan_mb(*h) : miles_pan_mb(h->pan01);
         host_audio_play(&p);
         s.submitted = p.bytes;
+        s.last_refill_ns = os_monotonic_ns();
         s.pending.clear();
+        s.pending_pos = 0;
         s.playing = host_audio_stream(s.channel) >= 0;
         sample_apply_mix(*h);
         if (!s.playing)
             host_audio_stop(s.channel);
+        else {
+            g_stream_command = true;
+            g_stream_condition.notify_one();
+        }
     } else {
         LOGW("mss32: stream start(%s): produced no PCM", s.name.c_str());
     }
 }
 
 void ail_start_stream(X86 *c) {
+    std::lock_guard<std::mutex> lock(g_stream_mutex);
     if (Stream *s = stream_for(arg(c, 0)))
         stream_start(*s);
     else
@@ -1354,6 +1479,7 @@ void ail_start_stream(X86 *c) {
 }
 
 void ail_close_stream(X86 *c) {
+    std::lock_guard<std::mutex> lock(g_stream_mutex);
     if (Stream *s = stream_for(arg(c, 0)))
         stream_release(*s);
     set_eax(c, 0);
@@ -1369,10 +1495,12 @@ uint32_t stream_status(uint32_t handle) {
 }
 
 void ail_stream_status(X86 *c) {
+    std::lock_guard<std::mutex> lock(g_stream_mutex);
     set_eax(c, stream_status(arg(c, 0)));
 }
 
 void ail_set_stream_volume(X86 *c) {
+    std::lock_guard<std::mutex> lock(g_stream_mutex);
     if (Stream *s = stream_for(arg(c, 0)))
         if (Sample *h = sample_for(s->sample)) {
             h->volume01 = std::clamp((int32_t)arg(c, 1), 0, 127) / 127.0f;
@@ -1382,14 +1510,18 @@ void ail_set_stream_volume(X86 *c) {
 }
 
 void ail_stream_volume(X86 *c) {
+    std::lock_guard<std::mutex> lock(g_stream_mutex);
     Stream *s = stream_for(arg(c, 0));
     Sample *h = s ? sample_for(s->sample) : nullptr;
     set_eax(c, h ? (uint32_t)std::lround(h->volume01 * 127.0f) : 0);
 }
 
 void ail_set_stream_loop_count(X86 *c) {
+    std::lock_guard<std::mutex> lock(g_stream_mutex);
     if (Stream *s = stream_for(arg(c, 0)))
         s->remaining = s->loops = arg(c, 1);
+    g_stream_command = true;
+    g_stream_condition.notify_one();
     set_eax(c, 0);
 }
 
@@ -1397,8 +1529,10 @@ void ail_set_stream_loop_count(X86 *c) {
 // the stream restarted on resume; SMP_STOPPED from the status call is what
 // tells the engine it may resume.
 void ail_pause_stream(X86 *c) {
+    std::lock_guard<std::mutex> lock(g_stream_mutex);
     Stream *s = stream_for(arg(c, 0));
     if (s && arg(c, 1)) {
+        stream_report_refills(*s);
         if (s->playing || s->channel >= 0)
             host_audio_stop(s->channel);
         s->playing = false;
@@ -1415,6 +1549,7 @@ void ail_pause_stream(X86 *c) {
 // AIL_set_stream_volume_levels(HSTREAM, F32 left, F32 right): the two levels
 // collapse to the host channel's single volume, as the sample form does.
 void ail_set_stream_volume_levels(X86 *c) {
+    std::lock_guard<std::mutex> lock(g_stream_mutex);
     if (Stream *s = stream_for(arg(c, 0)))
         if (Sample *h = sample_for(s->sample)) {
             float l = std::clamp(bits_to_float(arg(c, 1)), 0.0f, 1.0f);
@@ -1562,6 +1697,7 @@ void ail_set_3D_sample_distances(X86 *c) {
 }
 
 void ail_set_3D_sample_playback_rate(X86 *c) {
+    std::lock_guard<std::mutex> lock(g_stream_mutex);
     if (Sample *s = sample_for(arg(c, 0))) {
         s->rate = arg(c, 1);
         if (s->channel >= 0 && s->rate)
@@ -1757,17 +1893,20 @@ void ail_sample_volume_pan(X86 *c) {
 }
 
 void ail_service_stream(X86 *c) {
+    std::lock_guard<std::mutex> lock(g_stream_mutex);
     if (Stream *s = stream_for(arg(c, 0)))
         stream_update(*s);
     set_eax(c, 0);
 }
 
 void ail_stream_loop_count(X86 *c) {
+    std::lock_guard<std::mutex> lock(g_stream_mutex);
     Stream *s = stream_for(arg(c, 0));
     set_eax(c, s ? s->loops : 0);
 }
 
 void ail_stream_sample_handle(X86 *c) {
+    std::lock_guard<std::mutex> lock(g_stream_mutex);
     Stream *s = stream_for(arg(c, 0));
     set_eax(c, s ? s->sample : 0);
 }
@@ -2022,10 +2161,6 @@ void mss32_frame_pump(X86 *c) {
             guest_call(c, cb, handle);
         }
     }
-    for (auto &s : g_streams)
-        if (s.alive)
-            stream_update(s);
-
     // Miles timers, on the same seam. Each pass is bounded so a callback that
     // has slipped behind cannot run away inside one frame; the bound is per
     // timer, and a released timer is re-read rather than held as a reference.
@@ -2048,6 +2183,8 @@ void mss32_frame_pump(X86 *c) {
 // dx_reset discards them. The provider name block and the sample WAVE images
 // are guest heap allocations; the digital drivers and channels are host state.
 void mss32_reset() {
+    mss32_shutdown();
+    std::lock_guard<std::mutex> lock(g_stream_mutex);
     for (auto &s : g_streams)
         stream_release(s);
     for (auto &s : g_samples)
@@ -2069,6 +2206,28 @@ void mss32_reset() {
     g_listener_top3d[1] = 1.0f;
     g_listener_top3d[2] = 0.0f;
     g_rolloff3d = 1.0f;
+    g_stream_host_shutdown = false;
+}
+
+void mss32_shutdown() {
+    OsThread *thread = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_stream_mutex);
+        g_stream_host_shutdown = true;
+        g_stream_worker_stop = true;
+        g_stream_command = true;
+        thread = g_stream_thread;
+        g_stream_thread = nullptr;
+        for (auto &s : g_streams) {
+            if (!s.alive)
+                continue;
+            stream_report_refills(s);
+            s.playing = false;
+        }
+        g_stream_condition.notify_one();
+    }
+    if (thread)
+        os_thread_join(thread);
 }
 
 void mss32_register() {
