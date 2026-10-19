@@ -93,10 +93,9 @@ class PE(object):
             return None
         return int.from_bytes(self.data[va - self.base:va - self.base + 4], "little")
 
-    def relocated_pointers(self):
-        """{address a HIGHLOW base relocation rewrites: where it is stored}."""
+    def relocations(self):
+        """Yield (address a HIGHLOW base relocation rewrites, where it is stored)."""
         rva, size = self.reloc_dir
-        out = {}
         off, end = rva, rva + size
         while size and off + 8 <= end:
             page = int.from_bytes(self.data[off:off + 4], "little")
@@ -107,8 +106,22 @@ class PE(object):
                 entry = int.from_bytes(self.data[k:k + 2], "little")
                 site = page + (entry & 0xfff)
                 if entry >> 12 == 3 and site + 4 <= self.size:
-                    out.setdefault(int.from_bytes(self.data[site:site + 4], "little"), self.base + site)
+                    yield int.from_bytes(self.data[site:site + 4], "little"), self.base + site
             off += block
+
+    def relocated_pointers(self):
+        """{address a HIGHLOW base relocation rewrites: where it is stored}."""
+        out = {}
+        for target, site in self.relocations():
+            out.setdefault(target, site)
+        return out
+
+    def relocated_data_pointers(self):
+        """Relocated pointers stored outside executable code, mapping target to storage."""
+        out = {}
+        for target, site in self.relocations():
+            if not self.is_exec(site):
+                out.setdefault(target, site)
         return out
 
     def bytes_at(self, va, length):
@@ -266,6 +279,8 @@ class Program(object):
             size = 11
         elif b[0] in (0xB8, 0xB9) and b[5] == 0xE9:
             size = 10
+        elif b[0] == 0xC7 and b[1] == 0x44 and b[2] == 0x24 and b[8] == 0xE9:
+            size = 13
         elif b[0] == 0xE9:
             size = 5
         else:
@@ -276,8 +291,8 @@ class Program(object):
         """Every address generated code can be entered at, with why.
 
         Function starts, jump-table targets, interior entries Ghidra found
-        referenced from elsewhere, entry-thunk bodies and the game's configured
-        entries."""
+        referenced from elsewhere, entry-thunk bodies, data-relocated code
+        pointers and the game's configured entries."""
         if self._entries is not None:
             return self._entries
         found = {addr: "function" for addr in self.functions}
@@ -290,6 +305,9 @@ class Program(object):
             target = self.entry_thunk_target(addr)
             if target not in (None, addr) and self.containing(target) is not None:
                 found.setdefault(target, "thunk")
+        for target in self.pe.relocated_data_pointers():
+            if self.containing(target) is not None:
+                found.setdefault(target, "reloc")
         for addr in self.configured_entries:
             found.setdefault(addr, "config")
         self._entries = found
