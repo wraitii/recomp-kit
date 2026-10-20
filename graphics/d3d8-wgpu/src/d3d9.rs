@@ -142,6 +142,7 @@ const D3DPRESENT_INTERVAL_IMMEDIATE: u32 = 0x8000_0000;
 const D3DTEXF_LINEAR: u32 = 2;
 
 const D3DCAPS2_CANAUTOGENMIPMAP: u32 = 0x4000_0000;
+const D3DDEVCAPS2_STREAMOFFSET: u32 = 0x0000_0001;
 const D3DPTEXTURECAPS_ALPHA: u32 = 0x0000_0004;
 const D3DPTEXTURECAPS_CUBEMAP: u32 = 0x0000_0800;
 const D3DPTEXTURECAPS_VOLUMEMAP: u32 = 0x0000_2000;
@@ -2949,6 +2950,7 @@ fn caps_image(probe: &D3d9Probe) -> Vec<u8> {
     put_u32(&mut caps, 196, D3DVS_VERSION_2_0);
     put_u32(&mut caps, 200, 256);
     put_u32(&mut caps, 204, D3DPS_VERSION_2_0);
+    put_u32(&mut caps, 212, D3DDEVCAPS2_STREAMOFFSET);
     put_u32(&mut caps, 232, 1);
     put_u32(&mut caps, 236, 0x1ffff);
     put_u32(&mut caps, 240, 1);

@@ -49,6 +49,8 @@ queues immutable snapshots, and clears stream zero and index bindings.
 Programmable declarations support sixteen vertex streams. Multi-stream draws
 reuse D3D9 index ordering and checked byte fetches to pack only referenced
 attributes into immutable vertex snapshots, preserving register types and bits.
+Device caps advertise `D3DDEVCAPS2_STREAMOFFSET`, matching the supported
+per-stream byte offsets for suballocated vertex buffers.
 
 Clear accepts host copies of guest D3DRECT arrays, clips each rectangle to the
 current viewport, and preserves color/depth/stencil outside the selected regions.
