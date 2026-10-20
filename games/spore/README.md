@@ -83,6 +83,25 @@ full-precision bytecode when `D3DXSHADER_PARTIALPRECISION` is set, which the
 Direct3D 9 rules permit; `SKIPVALIDATION` still passes through vkd3d's HLSL
 front end, so malformed source may fail compilation.
 
+## Video conversion
+
+`native/video.cpp` replaces `0x00fce6c0..0x00fce729`, the intro's MMX
+pixel-conversion row loop. In the October 20 09:43 profile it occupies 31% of
+main-thread samples. The pinned executable's bytes match Ghidra; call site
+`0x00fcec87` in `0x00fceb10` and texture upload `0x00fd9490` establish its
+five stack arguments and role. It reads the original tables at `0x015b1818`,
+`0x015b2018` and `0x015b2818`, preserving wrapping word addition, unsigned
+byte saturation, final registers, MMX state, flags and stack writes. Keeping
+loop state local removes per-instruction guest-state overhead. Set
+`RECOMP_SPORE_VIDEO_ORIGINAL=1` before launch to use the translated original.
+
+The original frame selector `0x00fc94b0`, called from `0x00fcb450`, discards
+queued frames behind the movie clock; presentation FPS therefore does not
+measure movie-frame advancement. Decoding and frame selection stay translated.
+`DIVERGENCE(original):` a fault inside the native row loop does not publish
+intermediate registers. Original-byte differential validation and playback
+validation remain outstanding; the app has not been launched for this change.
+
 ## MSVCR90.dll
 
 The executable imports 159 entries from the VS2008 C runtime. The PE entry is
