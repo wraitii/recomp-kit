@@ -896,8 +896,8 @@ class Translator(ControlFlow):
                          % (dst.reg, i, helper, dst.reg, i, lane(src, i)) for i in range(4))
             elif m in SSE_PACKED_UNARY:
                 helper = "recomp_sse_%s" % m.lower()
-                L.extend("c->xmm[%d][%d] = %s(c->xmm[%d][%d]);"
-                         % (dst.reg, i, helper, dst.reg, i) for i in range(4))
+                L.extend("c->xmm[%d][%d] = %s(%s);"
+                         % (dst.reg, i, helper, lane(src, i)) for i in range(4))
             elif m in SSE_CMP_PS:
                 pred = SSE_CMP_PS[m]
                 L.extend("c->xmm[%d][%d] = recomp_sse_cmpps(%du, c->xmm[%d][%d], %s);"

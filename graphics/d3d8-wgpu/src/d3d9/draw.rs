@@ -3037,6 +3037,18 @@ pub(crate) fn execute(
                 eprintln!("[d3d9-trace] rs[{id}]={}", rs(state, id));
             }
             for texture in &snapshot.textures {
+                if texture.stage >= 8 {
+                    eprintln!(
+                        "[d3d9-trace] sampler={} id={} size={}x{} format={} lod={}",
+                        texture.stage,
+                        state.texture(texture.stage)?,
+                        texture.width,
+                        texture.height,
+                        texture.format,
+                        texture.lod
+                    );
+                    continue;
+                }
                 eprintln!(
                     "[d3d9-trace] stage={} id={} size={}x{} format={} lod={} color_op={} color_args={}/{} alpha_op={} alpha_args={}/{}",
                     texture.stage,
