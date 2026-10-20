@@ -2175,6 +2175,17 @@ static inline int64_t mmx_sat_u(int64_t x, unsigned bits) {
 }
 #define MMX_LANES(bits) (64u / (bits))
 static inline uint64_t mmx_padd(uint64_t a, uint64_t b, unsigned bits) {
+#if defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 9)
+    if (bits == 16) {
+        typedef uint16_t lanes4 __attribute__((vector_size(8)));
+        lanes4 x, y;
+        RECOMP_BITCOPY(&x, &a, 8);
+        RECOMP_BITCOPY(&y, &b, 8);
+        x += y;
+        RECOMP_BITCOPY(&a, &x, 8);
+        return a;
+    }
+#endif
     uint64_t r = 0;
     for (unsigned i = 0; i < MMX_LANES(bits); i++)
         r = mmx_put(r, bits, i, mmx_lane(a, bits, i) + mmx_lane(b, bits, i));
@@ -2252,6 +2263,21 @@ static inline uint64_t mmx_pcmpgt(uint64_t a, uint64_t b, unsigned bits) {
 /* Packing: the destination's lanes narrow into the low half, the source's
  * into the high half. */
 static inline uint64_t mmx_pack(uint64_t a, uint64_t b, unsigned from, int is_signed) {
+#if defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 9)
+    if (from == 16 && !is_signed) {
+        typedef int16_t lanes8 __attribute__((vector_size(16)));
+        typedef uint8_t bytes8 __attribute__((vector_size(8)));
+        uint64_t packed[2] = {a, b};
+        lanes8 x;
+        RECOMP_BITCOPY(&x, packed, 16);
+        x &= ~(x < 0);
+        lanes8 high = x > 255;
+        x = (x & ~high) | (high & 255);
+        bytes8 narrowed = __builtin_convertvector(x, bytes8);
+        RECOMP_BITCOPY(&a, &narrowed, 8);
+        return a;
+    }
+#endif
     unsigned to = from / 2, n = 64 / from;
     uint64_t r = 0;
     for (unsigned i = 0; i < n; i++) {
