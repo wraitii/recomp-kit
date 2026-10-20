@@ -25,6 +25,8 @@ class Properties:
 
 
 _TABLE = {}
+FLOAT_COMPARISONS = ("FLOAT_NAN", "FLOAT_EQUAL", "FLOAT_LESS")
+FLOAT_ARITHMETIC = ("FLOAT_ADD", "FLOAT_SUB", "FLOAT_MULT")
 
 
 def _add(name, **properties):
@@ -38,7 +40,7 @@ for _name in (
     "INT_LEFT", "INT_RIGHT", "INT_SRIGHT", "INT_CARRY", "INT_SCARRY", "INT_SBORROW",
     "BOOL_NEGATE", "INT_NEGATE", "INT_2COMP", "POPCOUNT", "SUBPIECE", "PIECE",
     "MEMORY", "CC_KIND",
-):
+) + FLOAT_COMPARISONS + FLOAT_ARITHMETIC + ("CVTTSS2SI",):
     _add(_name, pure=True, synthetic=_name in ("MEMORY", "CC_KIND"))
 for _name in ("CONST", "TARGET", "CALL_RELOAD", "CALL_KEEP", "INPUT", "PHI"):
     _add(_name, pure=True, synthetic=True)

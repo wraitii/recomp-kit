@@ -67,7 +67,7 @@ FCOM/FNCLEX status, FXAM, tags). `x87.py` corrects these by lowering operands,
 recovered from `Insn.raw`, to ordered `X87_MEM`/`X87_REG` effects that call the
 audited runtime helpers (`fx87`, `fdivz`, `fset`, exact-FILD metadata, FIST and
 FRNDINT rounding, status merging, FXAM, partial FPREM). They share the memory
-token with guest accesses. FS/GS and 16-bit addressing, FCOMI/FCMOV,
+token with guest accesses. FS/GS and 16-bit addressing, FCMOV,
 transcendentals and environment operations stay named fallbacks.
 
 `cfg.py` holds `FunctionIR` (instructions, successors, table sites, external
@@ -82,9 +82,15 @@ C emission and preparation stages.
 `ssa.py` builds SSA over integer p-code on the instruction CFG. Registers and
 instruction-local storage use byte lanes, preserving AL/AH/AX/EAX aliasing; each
 instruction is a block, joins have phis, and LOAD, STORE and x87 effects thread
-one memory token with no forwarding or store removal. Raw FLOAT operations,
-unbound calls, user operations and intra-instruction control flow are rejected
-with a named reason. `simplify.py` canonicalizes (trivial phis, copy/extension
+one memory token with no forwarding or store removal. COMISS/UCOMISS admit
+binary32 NaN, equality and less-than predicates, capturing memory once and
+preserving the eager emitter's flag behavior and lack of MXCSR exception delivery.
+ADDSS/SUBSS/MULSS and CVTTSS2SI use the runtime's binary32 helpers; XORPS splits
+128-bit operands into ordered dword lanes. FCOMI/FUCOMI comparisons return
+packed flags through SSA while updating x87 status and tags through the scalar
+tracker. Other raw FLOAT operations, unbound calls, user operations and
+intra-instruction control flow are rejected with a named reason. `simplify.py`
+canonicalizes (trivial phis, copy/extension
 propagation, constant folding) and removes dead values; potentially faulting
 loads, stores, branches, returns, division and unknown operations are roots.
 `coalesce.py` carries whole registers through phis; `publication.py` keeps

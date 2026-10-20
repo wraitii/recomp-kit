@@ -1798,19 +1798,25 @@ RECOMP_HOT_INLINE void fcom(X86 *c, double a, double b) {
 RECOMP_HOT_INLINE void fucom(X86 *c, double a, double b) {
     fcom_common(c, a, b, 1);
 }
+RECOMP_HOT_INLINE uint16_t fcomi_flags_sw(uint16_t *status, double a, double b, int quiet) {
+    uint8_t flags;
+    if (isnan(a) || isnan(b)) {
+        flags = 0x45u;
+        if (!quiet || is_snan(a) || is_snan(b))
+            *status |= 0x0001u;
+    } else {
+        flags = (uint8_t)((a < b) | ((a == b) << 6));
+    }
+    return flags;
+}
 /* FCOMI/FUCOMI report into EFLAGS instead of the status word, with the same
  * split over which NaNs are quiet. */
 static inline void fcomi_common(X86 *c, double a, double b, int quiet) {
+    uint16_t flags = fcomi_flags_sw(&c->fpu_sw, a, b, quiet);
     c->eflags_of = c->eflags_sf = c->eflags_af = 0;
-    if (isnan(a) || isnan(b)) {
-        c->eflags_zf = c->eflags_pf = c->eflags_cf = 1;
-        if (!quiet || is_snan(a) || is_snan(b))
-            c->fpu_sw |= 0x0001u;
-    } else {
-        c->eflags_pf = 0;
-        c->eflags_zf = (a == b);
-        c->eflags_cf = (a < b);
-    }
+    c->eflags_cf = flags & 1u;
+    c->eflags_pf = (flags >> 2) & 1u;
+    c->eflags_zf = (flags >> 6) & 1u;
 }
 static inline void fcomi(X86 *c, double a, double b) {
     fcomi_common(c, a, b, 0);

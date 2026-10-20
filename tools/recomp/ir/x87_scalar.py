@@ -48,6 +48,7 @@ region, keep the exact flush.
 from dataclasses import dataclass, field
 
 from . import x87_transition as t
+from .ssa import SSAError
 from .x87_transition import Expr, Type, Assign, Evaluate, Store, PublishTags, Activation, Declare
 from .x87_cw import CW_FAST, Dynamic, Guarded, condition_of, proven_fact
 
@@ -418,7 +419,8 @@ class X87Scalar:
         return Dynamic()
 
     def apply(self, recipe, address=None, result=None):
-        r = t.recipe(recipe) if isinstance(recipe, dict) else recipe
+        extended = isinstance(recipe, dict) and recipe.get('mnem') in ('FCOMI', 'FCOMIP', 'FUCOMI', 'FUCOMIP')
+        r = t.recipe(recipe, extended=extended) if isinstance(recipe, dict) else recipe
         m, bits, slots = r.mnem, r.bits, r.slots
         memory = bool(bits)
         operations = []
@@ -529,6 +531,18 @@ class X87Scalar:
                 other = mem(r.integer) if memory else t.literal(0.0, Type.F64) if m == 'FTST' else read(r.src)
                 a = read(0)
             operations.append(Evaluate(t.helper('fucom' if m.startswith('FU') else 'fcom', Type.VOID, sw, a, other)))
+            self.status_dirty = True
+            for _ in range(r.pops):
+                self._drop(operations)
+        elif r.action == 'compare_flags':
+            if result is None:
+                raise SSAError('x87 flag comparison has no SSA result')
+            if self.lazy_nan:
+                self._fold(0, operations)
+                self._fold(r.src, operations)
+            value = t.helper('fcomi_flags', Type.U16, sw, read(0), read(r.src),
+                             t.literal(int(m.startswith('FU'))))
+            operations.append(Assign(result, value))
             self.status_dirty = True
             for _ in range(r.pops):
                 self._drop(operations)

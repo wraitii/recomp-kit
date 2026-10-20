@@ -4,6 +4,7 @@ from .lift import Insn, Op
 from .integer import read_modify_write, arithmetic, shift, divide
 from .integer_extra import EXTRA_MNEMONICS, correct as correct_extra
 from .ssa import SSAError
+from .operations import FLOAT_COMPARISONS
 from .cfg import FunctionIR
 from . import x87
 
@@ -11,8 +12,9 @@ from . import x87
 SUPPORTED_MNEMONICS = frozenset((
     "MOV", "MOVSX", "MOVZX", "XCHG", "NOT", "LEAVE", "LEA", "PUSH", "POP", "RET", "NOP", "ADD", "SUB", "CMP", "INC", "DEC",
     "ADC", "SBB", "SHL", "SHR", "DIV",
-    "CLD", "STD", "SAHF", "MUL",
-    "TEST", "AND", "OR", "XOR", "JMP", "JZ", "JNZ", "JE", "JNE", "MOVSS", "XORPS",
+    "CLD", "STD", "SAHF", "LAHF", "MUL",
+    "TEST", "AND", "OR", "XOR", "JMP", "JZ", "JNZ", "JE", "JNE", "MOVSS", "XORPS", "COMISS", "UCOMISS",
+    "ADDSS", "SUBSS", "MULSS", "CVTTSS2SI",
     "JA", "JAE", "JB", "JBE", "JC", "JNC", "JG", "JGE", "JL", "JLE", "JS", "JNS",
     "JO", "JNO", "JP", "JNP", "JPE", "JPO", "CALL",
 )) | EXTRA_MNEMONICS
@@ -197,6 +199,68 @@ def normalize_direct_ram(ins, lifter):
     return rewritten
 
 
+def scalar_comparison(ins):
+    ops = list(ins.ops)
+    for op in ops:
+        if op.opc.startswith("FLOAT_") and (
+                op.opc not in FLOAT_COMPARISONS or op.out is None or op.out[2] != 1
+                or len(op.ins) != (1 if op.opc == "FLOAT_NAN" else 2)
+                or any(v[2] != 4 for v in op.ins)):
+            raise SSAError("%08x: unsupported scalar comparison shape" % ins.addr)
+    loads = [op for op in ops if op.opc == "LOAD"]
+    if not loads:
+        return ops
+    first = loads[0]
+    if (any(op.ins != first.ins or op.out != first.out for op in loads)
+            or any(op.out == first.out for op in ops if op.opc != "LOAD")
+            or any(op.opc == "STORE" for op in ops)):
+        raise SSAError("%08x: unsupported scalar comparison memory shape" % ins.addr)
+    return [op for op in ops if op.opc != "LOAD" or op is first]
+
+
+def scalar_float(ins):
+    ops = []
+    for op in ins.ops:
+        if op.opc == "FLOAT_TRUNC":
+            if (op.out is None or op.out[2] != 4 or len(op.ins) != 1 or op.ins[0][2] != 4):
+                raise SSAError("%08x: unsupported CVTTSS2SI shape" % ins.addr)
+            op = Op("CVTTSS2SI", op.out, op.ins)
+        elif op.opc in ("FLOAT_ADD", "FLOAT_SUB", "FLOAT_MULT"):
+            if (op.out is None or op.out[2] != 4 or len(op.ins) != 2
+                    or any(value[2] != 4 for value in op.ins)):
+                raise SSAError("%08x: unsupported scalar arithmetic shape" % ins.addr)
+        ops.append(op)
+    return ops
+
+
+def xorps(ins, lifter):
+    ops = []
+    for op in ins.ops:
+        if op.out is None or op.out[2] != 16:
+            if any(value[2] == 16 for value in op.ins):
+                raise SSAError("%08x: unsupported XORPS wide operand" % ins.addr)
+            ops.append(op)
+            continue
+        if op.out[0] not in ("unique", "register") or len(op.ins) != 1:
+            raise SSAError("%08x: unsupported XORPS destination" % ins.addr)
+        source = op.ins[0]
+        if not ((op.opc == "COPY" and source[0] in ("unique", "register") and source[2] == 16)
+                or (op.opc == "LOAD" and source[2] == 4)):
+            raise SSAError("%08x: unsupported XORPS source" % ins.addr)
+        for lane in range(4):
+            target = (op.out[0], op.out[1] + lane * 4, 4)
+            if op.opc == "COPY":
+                ops.append(Op("COPY", target, [(source[0], source[1] + lane * 4, 4)]))
+            else:
+                address = source
+                if lane:
+                    address = lifter.fresh_unique(4)
+                    ops.append(Op("INT_ADD", address, [source, ("const", lane * 4, 4)]))
+                ops.append(Op("LOAD", target, [address]))
+    return ops
+
+
+
 def add_exit_stubs(insns, succ, exits, tails):
     """Give each out-of-body transfer target one TAIL block, shared by its sources."""
     index = {ins.addr: k for k, ins in enumerate(insns)}
@@ -270,11 +334,17 @@ def codegen_ir(fir, lifter, tails=()):
                               False, False, [], ins.raw, ins.decode))
             continue
         if mnem not in SUPPORTED_MNEMONICS:
-            raise SSAError("%08x: C emitter: unsupported instruction %s" % (ins.addr, mnem))
+            raise SSAError("%08x: SSA normalization: unsupported instruction %s" % (ins.addr, mnem))
         ops = normalize_direct_ram(ins, lifter)
         normalized = Insn(ins.addr, ins.length, ins.mnem, ops, ins.x87_delta,
                           ins.x87, ins.internal_flow, ins.userops, ins.raw, ins.decode)
-        if mnem == "SAR":
+        if mnem in ("COMISS", "UCOMISS"):
+            ops = scalar_comparison(normalized)
+        elif mnem in ("ADDSS", "SUBSS", "MULSS", "CVTTSS2SI"):
+            ops = scalar_float(normalized)
+        elif mnem == "XORPS":
+            ops = xorps(normalized, lifter)
+        elif mnem == "SAR":
             ops = read_modify_write(normalized, lifter,
                                     lambda insn, operand: correct_extra(insn, lifter, operand))
         elif mnem in EXTRA_MNEMONICS:

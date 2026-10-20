@@ -117,6 +117,7 @@ HELPERS.update({
     'fround': (CW, FLOAT), 'fto_float': (CW, FLOAT),
     'fdivz': (SW, NUMBER, NUMBER), 'fprem': (SW, FLOAT, FLOAT, NUMBER),
     'fcom': (SW, FLOAT, NUMBER), 'fucom': (SW, FLOAT, NUMBER),
+    'fcomi_flags': (SW, FLOAT, FLOAT, NUMBER),
     'fscale': (FLOAT, FLOAT), 'atan2': (FLOAT, FLOAT),
     'ftag_classify': (FLOAT,), 'x87_indefinite': (),
     'fist': (SW, CW, FLOAT, NUMBER, NUMBER),
@@ -134,6 +135,7 @@ HELPER_RESULTS.update({name: Type.VOID for name in ('fcom', 'fucom', 'fpush', 'f
     'fcomi', 'fucomi', 'x87_fnsave', 'x87_frstor', 'x87_fnstenv', 'x87_fldenv')})
 HELPER_RESULTS.update({'ftag_classify': Type.TAG, 'fstsw': Type.U16, 'fto_float': Type.F32,
                        'fist': Type.I64, 'fist_cpu': Type.I64})
+HELPER_RESULTS['fcomi_flags'] = Type.U16
 PART_TYPES = {'value': Type.F64, 'bits': Type.U64, 'exact': Type.U8, 'tag': Type.TAG}
 ZERO = literal(0, Type.U8)
 ONE = literal(1, Type.U8)

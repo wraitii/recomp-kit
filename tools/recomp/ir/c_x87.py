@@ -119,6 +119,8 @@ class Printer:
                 return 'fprem_common(c, %s, %s, %s)' % tuple(args[1:]) if resident else 'fprem_sw(&%s, %s, %s, %s)' % tuple(args)
             if data in ('fcom', 'fucom'):
                 return '%s(c, %s, %s)' % (data, *args[1:]) if resident else '%s_sw(&%s, %s, %s)' % (data, *args)
+            if data == 'fcomi_flags':
+                return 'fcomi_flags_sw(&%s, %s, %s, %s)' % tuple(args)
             return '%s(%s)' % (data, ', '.join(args))
         raise SSAError('unknown x87 C expression %s' % kind)
 

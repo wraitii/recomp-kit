@@ -158,6 +158,16 @@ def emit_prepared(prepared, external_entry=False):
         wide = v.size > 4 or v.opc == "SUBPIECE"
         a = [ref(arg) for arg in v.args]
         opc = v.opc
+        if opc in operations.FLOAT_COMPARISONS:
+            values = ["recomp_sse_f32((uint32_t)(%s))" % arg for arg in a]
+            if opc == "FLOAT_NAN":
+                return "!!isnan(%s)" % values[0]
+            return "%s %s %s" % (values[0], "==" if opc == "FLOAT_EQUAL" else "<", values[1])
+        if opc in operations.FLOAT_ARITHMETIC:
+            helper = {"FLOAT_ADD": "add", "FLOAT_SUB": "sub", "FLOAT_MULT": "mul"}[opc]
+            return "recomp_sse_%sps((uint32_t)(%s), (uint32_t)(%s))" % (helper, a[0], a[1])
+        if opc == "CVTTSS2SI":
+            return "(uint32_t)recomp_sse_cvttss2si(recomp_sse_f32((uint32_t)(%s)))" % a[0]
         if wide:
             a = ["(uint64_t)(%s)" % arg for arg in a]
         zero = "0ull" if wide else "0u"

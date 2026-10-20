@@ -19,6 +19,7 @@ from .x87_transition import ARITH, INTEGER_ARITH, CONSTANTS, UNARY, recipe
 SUPPORTED = frozenset(ARITH) | frozenset(INTEGER_ARITH) | frozenset(CONSTANTS) | frozenset(UNARY) | {
     *(name + "P" for name in ARITH), "FLD", "FILD", "FST", "FSTP", "FIST", "FISTP",
     "FCOM", "FCOMP", "FCOMPP", "FUCOM", "FUCOMP", "FUCOMPP", "FICOM", "FICOMP",
+    "FCOMI", "FCOMIP", "FUCOMI", "FUCOMIP",
     "FTST", "FXAM", "FXCH", "FPREM", "FPREM1", "FNCLEX", "FCLEX",
     "FNSTSW", "FSTSW", "FNSTCW", "FSTCW", "FLDCW", "FNINIT", "FINIT",
     "FDECSTP", "FINCSTP", "FFREE", "FNOP", "FPTAN", "FSINCOS", "FSCALE", "FPATAN", "FYL2X", "FYL2XP1",
@@ -73,6 +74,7 @@ The descriptor carries validated operand roles rather than generated C text.
             else:
                 decoded_operands.append(("unsupported", None, operand.size, None, None,
                                          1, 0, None))
+    mnem = {"FCOMPI": "FCOMIP", "FUCOMPI": "FUCOMIP"}.get(mnem, mnem)
     if mnem not in SUPPORTED:
         raise SSAError("%08x: unsupported x87 instruction %s" % (ins.addr, mnem))
     expected = ins.mnem.upper().removeprefix("WAIT ").replace("FN", "F", 1)
@@ -109,15 +111,28 @@ The descriptor carries validated operand roles rather than generated C text.
             operands.append(("mem", size))
         else:
             raise SSAError("%08x: unsupported x87 operand" % ins.addr)
-    out = lifter.fresh_unique(2) if operands == [("ax", 0)] else None
+    flags_result = mnem in ("FCOMI", "FCOMIP", "FUCOMI", "FUCOMIP")
+    out = lifter.fresh_unique(2) if operands == [("ax", 0)] or flags_result else None
     effect = Op("X87_MEM" if args else "X87_REG", out, args,
                 {"mnem": mnem, "operands": tuple(operands)})
     # Validate every shape before emitting any function, including dead paths.
     try:
-        recipe(effect.data)
+        recipe(effect.data, extended=flags_result)
     except SSAError as error:
         raise SSAError("%08x: %s" % (ins.addr, error)) from error
     ops.append(effect)
     if out:
-        ops.append(Op("COPY", lifter.register("AX"), [out]))
+        if operands == [("ax", 0)]:
+            ops.append(Op("COPY", lifter.register("AX"), [out]))
+        else:
+            for name, shift in (("CF", 0), ("PF", 2), ("ZF", 6)):
+                value = out
+                if shift:
+                    value = lifter.fresh_unique(1)
+                    ops.append(Op("INT_RIGHT", value, [out, ("const", shift, 1)]))
+                bit = lifter.fresh_unique(1)
+                ops.append(Op("INT_AND", bit, [value, ("const", 1, 1)]))
+                ops.append(Op("COPY", lifter.register(name), [bit]))
+            for name in ("OF", "SF", "AF"):
+                ops.append(Op("COPY", lifter.register(name), [("const", 0, 1)]))
     return ops
