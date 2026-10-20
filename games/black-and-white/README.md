@@ -1,18 +1,29 @@
 # Black & White
 
-Portable static recompilation of the PC **Black & White (2001)** and its patch
-content, with selective native replacements. The behavioral reference is
-`runblack.exe` from the 1.42 fan patch (32-bit x86, DirectDraw/Direct3D 7,
-DirectInput, Winsock, Lionhead support libraries). The stock 1.2 executable is
-supporting evidence only. This directory is the game's configuration root
-(`--game black-and-white`).
+Native port of **Black & White (2001)**, using the PC release with Fan Patch
+1.42. Single-player gameplay is expected to be fully playable; the first island
+has been tested, with a full playthrough still pending. Networking is currently
+unsupported.
 
-The game profile includes packed function-boundary metadata and native
-replacements for terrain cell construction/rendering and LOD settings. The
-translated originals remain available for comparison. `render.d3d8_wgpu` selects
-the D3D8/wgpu renderer used by the game's Direct3D 7 path.
+## Install with Recomp Toolkit
 
-## Setup and build
+Apply Fan Patch 1.42 to your installed game before importing it. In
+[Recomp Toolkit](../../README.md#get-started), choose **Black & White** and select
+the patched game folder, including its matching DLLs. Choose a destination and
+select **Install**, then **Start game** when the build finishes.
+
+The toolkit does not apply patches. Prepare installer or disc copies outside
+the app, then select the resulting patched folder. The stock 1.2 executable is
+not a supported play version.
+
+## Build from source
+
+The behavioral reference is `runblack.exe` from Fan Patch 1.42; stock 1.2 is
+supporting evidence only. This directory is the configuration root
+(`--game black-and-white`). It includes code maps and native replacements for
+terrain cell construction/rendering and LOD settings, with switches back to the
+translated originals. `render.d3d8_wgpu` selects the renderer used by the
+Direct3D 7 path.
 
 From the game repository root (the one containing `recomp-kit/`):
 
@@ -26,9 +37,6 @@ tools/.venv/bin/python tools/build.py --regenerate --target app
 ```
 
 Setup links the installed game at `build/original`; it changes no game files.
-The desktop library accepts a supported 1.42 installed folder. Installer and disc
-sources must be prepared outside the library; patch order and content deltas remain
-unverified, so the library gives manual guidance and rechecks the resulting folder.
 Prerequisites are in [CONTRIBUTING](../../CONTRIBUTING.md#prerequisites). The
 translator needs `tools/.venv`; the system Python lacks `pefile`.
 

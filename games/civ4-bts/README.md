@@ -1,15 +1,29 @@
 # Civilization IV: Beyond the Sword
 
-Native port of the installed GOG **Civilization IV: Beyond the Sword**
-(`Civ4BeyondSword.exe`). This directory is the game's configuration root
-(`--game civ4-bts`): `game.toml` pins the executable, `metadata*/` hold the code
-maps for the executable and its auxiliary DLLs, and `native/` holds replacements.
-`mods/core` is the game's core mod content.
+Native port of **Civilization IV: Beyond the Sword**, using GOG 3.19. Fully
+playable in single player. Networking is currently unsupported, and work continues
+on occasional performance issues. Importing requires the base-game assets and an
+additional DLL.
 
-The installation also includes `CvGameCoreDLL` source. It is supporting research
-evidence only; verify behavior against the matching binaries.
+## Install with Recomp Toolkit
 
-## Setup and build
+In [Recomp Toolkit](../../README.md#get-started), choose **Civilization IV:
+Beyond the Sword** and select the complete Civilization IV folder containing
+`Beyond the Sword/` and the shared base-game assets.
+
+Supply the matching `msxml3.dll` beside `Civ4BeyondSword.exe`; the app checks its
+exact version along with the other required DLLs. Follow the app's preparation
+checklist for acquisition guidance. Wine is not needed to launch the game.
+Choose a destination and select **Install**, then **Start game** when the build
+finishes. Voice recording is not implemented.
+
+## Build from source
+
+This directory is the configuration root (`--game civ4-bts`): `game.toml` pins
+`Civ4BeyondSword.exe`, `metadata*/` hold the maps for it and its auxiliary DLLs,
+and `native/` holds replacements. `mods/core` is the game's core mod content.
+The installation's `CvGameCoreDLL` source is supporting research evidence only;
+verify behavior against the matching binaries.
 
 From the game repository root (the one containing `recomp-kit/`):
 
@@ -24,13 +38,10 @@ tools/.venv/bin/python tools/build.py --regenerate
 
 Setup checks the executable against `game.toml` and links the installation at
 `build/original`. Beyond the Sword also uses base Civ4 data from its parent
-directory; the installation link preserves that layout. For a desktop library
-import, select the complete Civ4 content root containing `Beyond the Sword/` and
-the base-game assets. The library preserves these relationships under `original/`
-and verifies each auxiliary DLL. The pinned `msxml3.dll` must be supplied manually;
-its stock-install provenance is unknown, and Wine is not a launch dependency.
-This nested installation flow still needs end-to-end verification. Prerequisites are in
-[CONTRIBUTING](../../CONTRIBUTING.md#prerequisites). Later builds need only
+directory; the installation link preserves that layout. The pinned `msxml3.dll`
+must be supplied manually; its stock-install provenance is unknown.
+Prerequisites are in [CONTRIBUTING](../../CONTRIBUTING.md#prerequisites).
+Later builds need only
 `tools/.venv/bin/python tools/build.py`; add `--regenerate` after changing a
 translation input.
 

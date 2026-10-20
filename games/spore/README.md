@@ -1,7 +1,10 @@
 # Spore (2008)
 
-Target: the GOG SPORE Collection build. The game directory is
-`recomp-kit/games/spore/` (`--game spore`).
+Work in progress on a native port of the GOG **SPORE Collection**, using the
+Galactic Adventures 3.1.0.22 executable. Gameplay and performance work is ongoing.
+Networking is currently unsupported across the toolkit.
+
+The game directory is `recomp-kit/games/spore/` (`--game spore`).
 
 ## Status
 
