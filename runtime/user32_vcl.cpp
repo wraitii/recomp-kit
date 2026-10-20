@@ -479,7 +479,7 @@ void get_window(X86 *c) {
 void window_thread(X86 *c) {
     Window *w = find_window(arg(c, 0));
     if (arg(c, 1))
-        wr32(arg(c, 1), w ? 1 : 0);
+        wr32(arg(c, 1), w ? static_cast<uint32_t>(os_process_id()) : 0);
     set_eax(c, w ? w->thread : 0);
 }
 void is_window(X86 *c) {
