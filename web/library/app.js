@@ -86,7 +86,7 @@ function renderRecovery() {
   const panel = element("recovery");
   const list = element("recovery-jobs");
   list.replaceChildren();
-  panel.hidden = busy || currentScreen !== 1 || !jobs.length;
+  panel.hidden = busy || ![1, 3].includes(currentScreen) || !jobs.length;
   for (const job of jobs) {
     const row = document.createElement("article");
     row.className = "recovery-job";
@@ -327,7 +327,7 @@ async function inspectSource(path) {
 function step(index, installing = false) {
   currentScreen = index;
   for (const [i, name] of ["requirements", "source", "job", "ready", "copy-result"].entries()) element(name).hidden = i !== index;
-  element("recovery").hidden = index !== 1 || busy || !selected?.recoverableJobs?.length;
+  element("recovery").hidden = ![1, 3].includes(index) || busy || !selected?.recoverableJobs?.length;
   element("setup").hidden = true;
   element("steps").hidden = index === 3 || (index === 2 && ["play", "log"].includes(lastAction));
   const needsAttention = index === 4 && !inspecting;
@@ -353,6 +353,7 @@ function step(index, installing = false) {
   if (index === 3) {
     element("installed-location").textContent = `Installed in ${destination}`;
     element("update-note").hidden = !selected?.updateAvailable;
+    element("rebuild").textContent = selected?.updateAvailable ? "Update" : "Rebuild";
   }
   if (index === 1) {
     element(source ? "source-forward" : "choose-source").focus();
@@ -396,7 +397,8 @@ async function openGame(game) {
   sourceKind = game.managedSource ? "folder" : "";
   candidateId = "";
   preflightReady = false;
-  inspectionReady = Boolean(game.managedSource);
+  preflightRevision++;
+  inspectionReady = false;
   resumeJob = null;
   destination = game.installation || "";
   element("destination").value = destination;
@@ -536,6 +538,8 @@ async function locateSource(job) {
   const kind = job.source?.kind === "folder" ? "folder" : "source";
   const path = await backend.pick(kind);
   if (!path) return;
+  destination = job.destination;
+  element("destination").value = destination;
   const result = await inspectSource(path);
   if (!result) return;
   const sameCandidate = result.candidates?.some((item) => item.installable && item.id === job.candidateId);
@@ -547,8 +551,6 @@ async function locateSource(job) {
   } else {
     source = path;
     candidateId = job.candidateId;
-    destination = job.destination;
-    element("destination").value = destination;
     message("The selected copy matches this saved job. Retry will recheck its full identity.");
   }
 }
@@ -574,11 +576,15 @@ async function changeDestination(job) {
   const separator = folder.includes("\\") ? "\\" : "/";
   destination = `${folder.replace(/[\\/]+$/, "")}${separator}${selected.id}`;
   element("destination").value = destination;
-  if (!inspectionReady && source && !await inspectSource(source)) return;
+  preflightReady = false;
+  preflightRevision++;
   message("This destination applies to a new job; the saved job remains unchanged.");
-  step(0);
-  await checkRequirements();
-  lock(false);
+  if (!inspectionReady) {
+    if (source) await inspectSource(source);
+    else step(1);
+    return;
+  }
+  await reviewInstallation();
 }
 
 async function openJobLog(job) {
@@ -692,7 +698,9 @@ function jobEvent(event) {
       element("retry").classList.toggle("primary", selected?.state !== "ready");
       message("");
     } else {
-      if (lastAction === "install") { selected.state = "ready"; selected.updateAvailable = false; }
+      if (lastAction === "install") Object.assign(selected, {
+        state: "ready", updateAvailable: false, installation: destination, managedSource: `${destination}/original`,
+      });
       step(3);
       if (lastAction === "play") element("installer").close();
     }
@@ -707,6 +715,7 @@ function jobEvent(event) {
 function close() {
   if (busy || checking || inspecting) return;
   checkRevision++;
+  preflightRevision++;
   element("installer").close();
 }
 
@@ -749,6 +758,12 @@ async function updateSpaceEstimate() {
   if (revision === preflightRevision) lock(false);
 }
 element("open-installation").onclick = () => attempt(() => backend.openFolder(destination));
+element("rebuild").onclick = () => attempt(async () => {
+  resumeJob = null;
+  destination = selected.installation;
+  element("destination").value = destination;
+  await inspectSource(selected.managedSource);
+});
 element("choose-source").onclick = () => attempt(chooseSource);
 element("choose-another").onclick = () => attempt(chooseSource);
 element("source-forward").onclick = () => attempt(() => hasInspection ? candidateCanInstall && inspectionReady ? reviewInstallation() : step(4) : inspectSource(source));

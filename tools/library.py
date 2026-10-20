@@ -356,8 +356,7 @@ def audit_macos_bundle(bundle, executable):
 def installed_manifest(cfg, game_id, job_id, executable_relative, data_root_relative, source_identity, recipe_identity,
                        app_identities, original_identity, log_path, executable_size, staged_data, auxiliary_paths):
     app_name = cfg["game"]["app_name"]
-    app_path = (Path(f"{app_name}.app") / "Contents" / "MacOS" / app_name
-                if platform.system() == "Darwin" else Path("app") / app_name)
+    app_path = artifact(cfg, Path())
     app_bundle = app_path.parents[2] if platform.system() == "Darwin" else Path("app")
     sidecar = f"Configure {cfg['game']['name']}.app"
     executable_file = Path("original") / executable_relative
@@ -445,8 +444,7 @@ def validate_installed_manifest(cfg, root, manifest):
             or not isinstance(owned, list) or len(owned) != 4):
         raise install_jobs.JobError("installation_manifest_invalid", "The installed launch declarations are invalid.")
     app_bundle = Path(f"{cfg['game']['app_name']}.app") if platform.system() == "Darwin" else Path("app")
-    expected_game = (app_bundle / "Contents" / "MacOS" / cfg["game"]["app_name"]
-                     if platform.system() == "Darwin" else app_bundle / cfg["game"]["app_name"])
+    expected_game = artifact(cfg, root).relative_to(root)
     expected_configure = f"Configure {cfg['game']['name']}.app/Contents/MacOS/ConfigureLauncher"
     for relative in [launch_paths.get("game"), launch_paths.get("configure"), *owned]:
         if (not isinstance(relative, str) or not relative or Path(relative).is_absolute() or "\\" in relative
@@ -1792,8 +1790,11 @@ def discover_request(request):
 def preflight_request(request):
     source = Path(request.get("source", "")).expanduser().resolve(strict=True)
     destination = Path(request.get("destination", "")).expanduser().resolve()
-    if not destination.parent.is_dir():
-        raise install_jobs.JobError("preflight_path_invalid", "Choose a destination with an existing parent directory.")
+    volume = destination
+    while not volume.exists():
+        volume = volume.parent
+    if not volume.is_dir():
+        raise install_jobs.JobError("preflight_path_invalid", "Choose a destination inside a folder.")
     source_kind = request.get("sourceKind")
     if source_kind == "zip":
         source_bytes = zip_adapter.archive_uncompressed_size(source, check_cancel)
@@ -1813,7 +1814,7 @@ def preflight_request(request):
         raise install_jobs.JobError("preflight_source_unsupported", "The selected source has no bounded space estimate.")
     required = (destination_copy_bytes + install_jobs.MAX_BUILD_BYTES + install_jobs.SAFETY_RESERVE_BYTES
                 + install_jobs.MAX_ATTEMPT_LOG_BYTES)
-    destination_space = shutil.disk_usage(destination.parent)
+    destination_space = shutil.disk_usage(volume)
     source_space = shutil.disk_usage(source)
     return {"source": {"path": str(source), "bytes": source_bytes, "freeBytes": source_space.free},
             "destination": {"path": str(destination), "freeBytes": destination_space.free,
