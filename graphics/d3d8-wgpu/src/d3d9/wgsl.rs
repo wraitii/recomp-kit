@@ -689,11 +689,7 @@ impl<'a> Gen<'a> {
     }
 
     fn const_limit(&self) -> u32 {
-        if self.p.relative {
-            if self.p.pixel { 32 } else { 256 }
-        } else {
-            self.p.max_const.max(1)
-        }
+        self.p.const_limit()
     }
 
     fn stage_kind(&self, stage: u32) -> u32 {
@@ -728,15 +724,23 @@ impl<'a> Gen<'a> {
                 }
             }
             R_CONST => {
+                let bank = if pixel { "pcb" } else { "vcb" };
                 if s.rel {
-                    format!(
-                        "c[clamp(i32(a0.{}) + {}, 0, {})]",
+                    let index = format!(
+                        "clamp(i32(a0.{}) + {}, 0, {})",
                         COMP[s.rel_comp as usize] as char,
                         s.index,
                         self.const_limit() - 1
-                    )
+                    );
+                    if self.p.defs.is_empty() {
+                        format!("{bank}[{index}]")
+                    } else {
+                        format!("d9_const({index})")
+                    }
+                } else if self.p.defs.contains_key(&s.index) {
+                    format!("d9_c{}()", s.index)
                 } else {
-                    format!("c[{}]", s.index)
+                    format!("{bank}[{}]", s.index)
                 }
             }
             R_ADDR => {
@@ -1267,14 +1271,6 @@ impl<'a> Gen<'a> {
     }
 
     fn generate(&mut self) -> Result<(), RenderError> {
-        let defs: Vec<(u32, [f32; 4])> = self.p.defs.iter().map(|(&k, &v)| (k, v)).collect();
-        for (index, value) in defs {
-            let b = value.map(f32::to_bits);
-            self.body += &format!(
-                "c[{index}] = bitcast<vec4<f32>>(vec4<u32>({}u, {}u, {}u, {}u));\n",
-                b[0], b[1], b[2], b[3]
-            );
-        }
         let code = self.p.code.clone();
         let mut i = 0usize;
         self.emit_sequence(&code, &mut i, &[], 0);
@@ -1282,6 +1278,29 @@ impl<'a> Gen<'a> {
             return Err(fail(cause));
         }
         Ok(())
+    }
+
+    fn constants(&self) -> String {
+        let (binding, bank) = if self.p.pixel { (2, "pcb") } else { (0, "vcb") };
+        let mut s = format!(
+            "@group(0) @binding({binding}) var<uniform> {bank}: array<vec4<f32>, {}>;\n",
+            self.const_limit()
+        );
+        for (index, value) in &self.p.defs {
+            let b = value.map(f32::to_bits);
+            s += &format!(
+                "fn d9_c{index}() -> vec4<f32> {{ return bitcast<vec4<f32>>(vec4<u32>({}u, {}u, {}u, {}u)); }}\n",
+                b[0], b[1], b[2], b[3]
+            );
+        }
+        if self.p.relative && !self.p.defs.is_empty() {
+            s += "fn d9_const(index: i32) -> vec4<f32> {\nswitch index {\n";
+            for index in self.p.defs.keys() {
+                s += &format!("case {index}: {{ return d9_c{index}(); }}\n");
+            }
+            s += &format!("default: {{ return {bank}[index]; }}\n}}\n}}\n");
+        }
+        s
     }
 
     fn compose_vertex(&self) -> String {
@@ -1300,13 +1319,9 @@ impl<'a> Gen<'a> {
             }
         }
         s += "}\n";
-        s += &format!(
-            "@group(0) @binding(0) var<uniform> vcb: array<vec4<f32>, {}>;\n",
-            self.const_limit()
-        );
+        s += &self.constants();
         s += "@group(0) @binding(1) var<uniform> vsp: VSP;\n";
         s += "@vertex\nfn vs_main(vin: VIn) -> V2F {\n";
-        s += "    var c = vcb;\n";
         s += "    var r: array<vec4<f32>, 32>;\n";
         s += "    var a0 = vec4<f32>(0.0);\n";
         s += "    var opos = vec4<f32>(0.0);\n";
@@ -1331,10 +1346,7 @@ impl<'a> Gen<'a> {
 
     fn compose_pixel(&self) -> String {
         let mut s = String::new();
-        s += &format!(
-            "@group(0) @binding(2) var<uniform> pcb: array<vec4<f32>, {}>;\n",
-            self.const_limit()
-        );
+        s += &self.constants();
         s += "@group(0) @binding(3) var<uniform> psp: PSP;\n";
         for &stage in &self.stages {
             let depth = self.variant.depth & (1u16 << stage) != 0;
@@ -1360,7 +1372,6 @@ impl<'a> Gen<'a> {
             );
         }
         s += "@fragment\nfn ps_main(vin: V2F) -> @location(0) vec4<f32> {\n";
-        s += "    var c = pcb;\n";
         s += "    var r: array<vec4<f32>, 32>;\n";
         s += "    var tc = array<vec4<f32>, 8>(vin.t0, vin.t1, vin.t2, vin.t3, vin.t4, vin.t5, vin.t6, vin.t7);\n";
         s += "    var t = tc;\n";
