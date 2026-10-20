@@ -19,7 +19,7 @@ CPU architecture, so further work is required.
 
 ## Get started
 
-[Download Recomp Toolkit](https://github.com/wraitii/recomp-kit/releases/latest)
+[Download Recomp Toolkit](https://github.com/wraitii/recomp-kit/releases/tag/latest-nightly)
 for Apple silicon Macs running macOS 14 or later. You'll need your own copy of
 one of the games below and Apple's Command Line Tools (`xcode-select --install`).
 The app includes the other build dependencies; GOG installer imports also need

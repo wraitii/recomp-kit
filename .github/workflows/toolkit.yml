@@ -5,13 +5,6 @@ on:
   pull_request:
   push:
     branches: [main]
-    paths:
-      - desktop/library/**
-      - web/library/**
-      - tools/**
-      - cmake/**
-      - dx/CMakeLists.txt
-      - .github/workflows/toolkit.yml
 
 permissions:
   contents: read
@@ -77,7 +70,7 @@ jobs:
           name: recomp-toolkit-macos-arm64
           path: build/toolkit/recomp-toolkit-macos-arm64.zip
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90
       - name: Preserve build caches
         if: ${{ !cancelled() && steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4

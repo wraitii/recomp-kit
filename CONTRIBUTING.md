@@ -71,6 +71,15 @@ with a standalone Python installation to bundle the source kit, conversion tools
 CMake, Ninja and native dependencies. The [desktop workflow](.github/workflows/toolkit.yml)
 contains the packaging recipe.
 
+Successful main builds update the `latest-nightly` prerelease after Developer ID
+signing and notarization in the [distribution workflow](.github/workflows/distribute.yml).
+Its repository secrets are `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD`,
+`MACOS_CERTIFICATE_BASE64` (the exported signing identity and private key as a
+base64-encoded P12), `MACOS_CERTIFICATE_PASSWORD` and `MACOS_SIGNING_IDENTITY`.
+Pending Apple submissions are preserved for 90 days and checked every 30 minutes;
+dispatch `distribute.yml` manually to check sooner. Signing covers bundled
+executables, Python extensions and libraries before the outer app.
+
 ## Add a game
 
 The translator targets 32-bit x86 Windows executables. To add a game, identify

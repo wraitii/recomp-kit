@@ -1,4 +1,3 @@
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -6,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
+from sign_macos import sign_bundle
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -96,21 +96,11 @@ def package(bundle, build_root, python_root):
     shutil.copytree(dependency_build / "d3d8-generated/rust", bridge / "rust")
     shutil.copy2(dependency_build / "d3d8-wgpu/rust/release/libd3d8_wgpu.a", bridge)
     source_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    manifest = {"source": source_sha, "architecture": "arm64", "macosMinimum": "14.0",
-                "files": {path.relative_to(dependencies).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
-                          for path in sorted(dependencies.rglob("*")) if path.is_file()}}
+    manifest = {"source": source_sha, "architecture": "arm64", "macosMinimum": "14.0"}
     (dependencies / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     for path in python.rglob("__pycache__"):
         shutil.rmtree(path)
-    mach_magic = {b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"}
-    for path in sorted(resources.rglob("*")):
-        if path.is_file() and not path.is_symlink():
-            with path.open("rb") as stream:
-                magic = stream.read(4)
-            if magic in mach_magic:
-                subprocess.run(["codesign", "--force", "--sign", "-", str(path)], check=True)
-    subprocess.run(["codesign", "--force", "--sign", "-", str(bundle)], check=True)
-    subprocess.run(["codesign", "--verify", "--deep", "--strict", str(bundle)], check=True)
+    sign_bundle(bundle)
     archive = bundle.parent / "recomp-toolkit-macos-arm64.zip"
     subprocess.run(["ditto", "-c", "-k", "--keepParent", str(bundle), str(archive)], check=True)
     print(f"Portable Recomp Toolkit: {archive} ({archive.stat().st_size / 1048576:.1f} MiB)")

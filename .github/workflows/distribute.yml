@@ -1,0 +1,341 @@
+name: Distribute toolkit nightly
+
+on:
+  workflow_run:
+    workflows: [Recomp Toolkit]
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: '17,47 * * * *'
+  workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: Successful main toolkit run ID (blank for the latest)
+        required: false
+        type: string
+      resume_run_id:
+        description: Distribution run ID to resume (blank to find saved state automatically)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: distribute-toolkit-nightly
+  cancel-in-progress: false
+
+jobs:
+  source:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-24.04
+    outputs:
+      enabled: ${{ steps.validate.outputs.enabled }}
+      ci_run: ${{ steps.validate.outputs.ci_run }}
+      sha: ${{ steps.validate.outputs.sha }}
+      resume: ${{ steps.validate.outputs.resume }}
+    steps:
+      - name: Validate source and resume runs
+        id: validate
+        uses: actions/github-script@v7
+        env:
+          CI_RUN: ${{ inputs.ci_run_id || github.event.workflow_run.id }}
+          RESUME_RUN: ${{ inputs.resume_run_id }}
+        with:
+          script: |
+            const repo = context.repo;
+            async function getRun(id) {
+              if (!/^[0-9]+$/.test(id)) throw new Error('Expected a numeric workflow run ID');
+              return (await github.rest.actions.getWorkflowRun({...repo, run_id: id})).data;
+            }
+            function trusted(run, path, events) {
+              if (run.path !== path || run.head_branch !== 'main' ||
+                  run.head_repository?.full_name !== `${repo.owner}/${repo.repo}` ||
+                  !events.includes(run.event)) {
+                throw new Error(`Untrusted source workflow run ${run.id}`);
+              }
+            }
+            let ciRun = process.env.CI_RUN;
+            if (!ciRun) {
+              const {data} = await github.rest.actions.listWorkflowRuns({
+                ...repo, workflow_id: 'toolkit.yml', branch: 'main', status: 'success', per_page: 100,
+              });
+              const latest = data.workflow_runs.find(run => ['push', 'workflow_dispatch'].includes(run.event));
+              if (!latest) {
+                core.setOutput('enabled', 'false');
+                return;
+              }
+              ciRun = String(latest.id);
+            }
+            const ci = await getRun(ciRun);
+            trusted(ci, '.github/workflows/toolkit.yml', ['push', 'workflow_dispatch']);
+            if (ci.conclusion !== 'success') throw new Error('CI must have succeeded');
+            const {data: main} = await github.rest.repos.getBranch({...repo, branch: 'main'});
+            if (main.commit.sha !== ci.head_sha) {
+              core.setOutput('enabled', 'false');
+              await core.summary.addRaw('Skipped obsolete toolkit build; waiting for the current main build.').write();
+              return;
+            }
+            if (context.eventName === 'schedule') {
+              try {
+                const {data: tag} = await github.rest.git.getRef({...repo, ref: 'tags/latest-nightly'});
+                const {data: release} = await github.rest.repos.getReleaseByTag({...repo, tag: 'latest-nightly'});
+                if (tag.object.sha === ci.head_sha && release.assets.some(asset => asset.name === 'recomp-toolkit-macos-arm64.zip')) {
+                  core.setOutput('enabled', 'false');
+                  return;
+                }
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+            }
+            let resume = process.env.RESUME_RUN;
+            if (!resume) {
+              const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
+                ...repo, name: `toolkit-notary-${ci.id}`, per_page: 100,
+              });
+              for (const artifact of artifacts.filter(a => !a.expired)) {
+                const previous = await getRun(String(artifact.workflow_run.id));
+                if (previous.path === '.github/workflows/distribute.yml' && previous.head_branch === 'main' &&
+                    previous.head_repository?.full_name === `${repo.owner}/${repo.repo}` &&
+                    ['workflow_run', 'workflow_dispatch', 'schedule'].includes(previous.event)) {
+                  resume = String(previous.id);
+                  break;
+                }
+              }
+            }
+            if (resume) {
+              const previous = await getRun(resume);
+              trusted(previous, '.github/workflows/distribute.yml', ['workflow_run', 'workflow_dispatch', 'schedule']);
+            }
+            core.setOutput('enabled', 'true');
+            core.setOutput('ci_run', String(ci.id));
+            core.setOutput('sha', ci.head_sha);
+            core.setOutput('resume', resume);
+
+  notarize:
+    needs: source
+    if: needs.source.outputs.enabled == 'true'
+    runs-on: macos-15
+    timeout-minutes: 30
+    outputs:
+      ready: ${{ steps.finish.outputs.ready }}
+    env:
+      SOURCE_RUN: ${{ needs.source.outputs.ci_run }}
+      SOURCE_SHA: ${{ needs.source.outputs.sha }}
+    steps:
+      - name: Check out trusted distribution tools
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Reuse submission from an earlier attempt
+        id: resume
+        uses: actions/github-script@v7
+        env:
+          RESUME_RUN: ${{ needs.source.outputs.resume }}
+          SOURCE_RUN: ${{ needs.source.outputs.ci_run }}
+        with:
+          script: |
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts,
+              {...context.repo, run_id: context.runId});
+            const saved = artifacts.some(a => a.name === `toolkit-notary-${process.env.SOURCE_RUN}` && !a.expired);
+            core.setOutput('run', saved ? String(context.runId) : process.env.RESUME_RUN);
+
+      - name: Download app from successful CI
+        if: steps.resume.outputs.run == ''
+        uses: actions/download-artifact@v4
+        with:
+          name: recomp-toolkit-macos-arm64
+          path: input
+          run-id: ${{ needs.source.outputs.ci_run }}
+          github-token: ${{ github.token }}
+
+      - name: Restore signed app and submission ID
+        if: steps.resume.outputs.run != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: toolkit-notary-${{ needs.source.outputs.ci_run }}
+          path: notary-state
+          run-id: ${{ steps.resume.outputs.run }}
+          github-token: ${{ github.token }}
+
+      - name: Prepare temporary notarization keychain
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_ID APPLE_TEAM_ID APPLE_APP_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing GitHub Actions secret: $name"
+              exit 1
+            fi
+          done
+          keychain="$RUNNER_TEMP/toolkit-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          echo "::add-mask::$keychain_password"
+          echo "KEYCHAIN_PASSWORD=$keychain_password" >> "$GITHUB_ENV"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          xcrun notarytool store-credentials toolkit-notary --keychain "$keychain" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+
+      - name: Sign preserved CI app with Developer ID
+        if: steps.resume.outputs.run == ''
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          for name in MACOS_CERTIFICATE_BASE64 MACOS_CERTIFICATE_PASSWORD MACOS_SIGNING_IDENTITY; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing GitHub Actions secret: $name"
+              exit 1
+            fi
+          done
+          keychain="$RUNNER_TEMP/toolkit-signing.keychain-db"
+          certificate="$RUNNER_TEMP/toolkit-signing.p12"
+          printf '%s' "$MACOS_CERTIFICATE_BASE64" | base64 --decode > "$certificate"
+          security import "$certificate" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$KEYCHAIN_PASSWORD" "$keychain" >/dev/null
+          rm -f "$certificate"
+          ditto -x -k input/recomp-toolkit-macos-arm64.zip staging
+          python3 tools/sign_macos.py 'staging/Recomp Toolkit.app' \
+            --identity "$MACOS_SIGNING_IDENTITY" --keychain "$keychain"
+          codesign --verify --deep --strict --verbose=2 'staging/Recomp Toolkit.app'
+          mkdir -p notary-state
+          ditto -c -k --keepParent --sequesterRsrc 'staging/Recomp Toolkit.app' notary-state/signed.zip
+
+      - name: Submit to Apple and save submission ID
+        if: steps.resume.outputs.run == ''
+        run: >-
+          python3 tools/notarize_macos.py submit
+          --archive notary-state/signed.zip --state-dir notary-state
+          --profile toolkit-notary --keychain "$RUNNER_TEMP/toolkit-signing.keychain-db"
+          --source-run "$SOURCE_RUN" --source-sha "$SOURCE_SHA"
+
+      - name: Preserve resumable submission for 90 days
+        if: always() && hashFiles('notary-state/submission.json') != '' && steps.resume.outputs.run == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: toolkit-notary-${{ needs.source.outputs.ci_run }}
+          path: |
+            notary-state/signed.zip
+            notary-state/submission.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+
+      - name: Check Apple status and staple when accepted
+        id: finish
+        run: >-
+          python3 tools/notarize_macos.py finish
+          --state-dir notary-state --output dist/recomp-toolkit-macos-arm64.zip
+          --profile toolkit-notary --keychain "$RUNNER_TEMP/toolkit-signing.keychain-db"
+          --source-run "$SOURCE_RUN" --source-sha "$SOURCE_SHA" --wait-seconds 120
+
+      - name: Upload notarized distribution
+        if: steps.finish.outputs.ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: recomp-toolkit-macos-arm64-notarized
+          path: dist/recomp-toolkit-macos-arm64.zip
+          if-no-files-found: error
+          overwrite: true
+          compression-level: 0
+          retention-days: 14
+
+      - name: Record result and resume command
+        if: always() && hashFiles('notary-state/submission.json') != ''
+        env:
+          READY: ${{ steps.finish.outputs.ready }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          receipt = json.loads(Path('notary-state/submission.json').read_text())
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f"Apple submission: `{receipt['id']}`\n\n")
+              summary.write(f"Source CI: `{receipt['source_run']}` / `{receipt['source_sha']}`\n\n")
+              if os.environ['READY'] == 'true':
+                  summary.write('Accepted, stapled, and verified.\n')
+              else:
+                  summary.write('Not published. Pending submissions are checked automatically every 30 minutes. To resume manually without rebuilding or resubmitting:\n\n')
+                  summary.write('```sh\ngh workflow run distribute.yml --ref main '
+                                f"-f ci_run_id={receipt['source_run']}\n```\n")
+          PY
+
+      - name: Clean up signing credentials
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/toolkit-signing.p12"
+          if [[ -f "$RUNNER_TEMP/toolkit-signing.keychain-db" ]]; then
+            security delete-keychain "$RUNNER_TEMP/toolkit-signing.keychain-db"
+          fi
+
+  publish:
+    needs: [source, notarize]
+    if: needs.notarize.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Skip obsolete builds
+        id: current
+        uses: actions/github-script@v7
+        env:
+          SOURCE_SHA: ${{ needs.source.outputs.sha }}
+        with:
+          script: |
+            const {data} = await github.rest.repos.getBranch({...context.repo, branch: 'main'});
+            const current = data.commit.sha === process.env.SOURCE_SHA;
+            core.setOutput('current', String(current));
+            if (!current) await core.summary.addRaw('Notarization succeeded; skipped nightly publishing because main has advanced. The notarized artifact remains downloadable.').write();
+
+      - name: Download notarized app
+        if: steps.current.outputs.current == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: recomp-toolkit-macos-arm64-notarized
+          path: dist
+
+      - name: Publish latest-nightly
+        if: steps.current.outputs.current == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ needs.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/$GH_REPO/git/ref/tags/latest-nightly" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/$GH_REPO/git/refs/tags/latest-nightly" \
+              -f sha="$SOURCE_SHA" -F force=true
+          else
+            gh api --method POST "repos/$GH_REPO/git/refs" \
+              -f ref=refs/tags/latest-nightly -f sha="$SOURCE_SHA"
+          fi
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          Automated snapshot of main at $SOURCE_SHA, published after successful toolkit packaging and Apple notarization.
+
+          Developer ID signed and notarized for Apple silicon Macs running macOS 14 or later.
+          Extract the ZIP, move Recomp Toolkit.app to Applications, and open it.
+          Apple's Command Line Tools are required (xcode-select --install).
+          Game files are not included; supply your own supported copies.
+          EOF
+          if gh release view latest-nightly >/dev/null 2>&1; then
+            gh release upload latest-nightly dist/recomp-toolkit-macos-arm64.zip --clobber
+            gh release edit latest-nightly --title 'Latest nightly' --prerelease \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          else
+            gh release create latest-nightly dist/recomp-toolkit-macos-arm64.zip \
+              --verify-tag --title 'Latest nightly' --prerelease \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
