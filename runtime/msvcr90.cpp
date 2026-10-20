@@ -218,16 +218,11 @@ void run_guest_exit(X86 *c, uint32_t code, bool run_handlers) {
         run_onexit(c);
     fflush(stdout);
     fflush(stderr);
-    os_exit_immediately((int)(code & 0xff));
+    kernel32_exit_process(code);
 }
 
 void crt_exit(X86 *c) {
-    run_onexit(c);
-    fflush(stdout);
-    fflush(stderr);
-    // The host's atexit hooks (the observe report among them) are part of the
-    // process ending, so a guest exit must go through them, not around them.
-    std::exit((int)(arg(c, 0) & 0xff));
+    run_guest_exit(c, arg(c, 0), true);
 }
 
 void crt_exit_fast(X86 *c) {

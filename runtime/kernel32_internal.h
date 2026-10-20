@@ -4,6 +4,7 @@
 #include <string>
 
 void kernel32_wide_register();
+void kernel32_exit_process(uint32_t code);
 std::string current_directory();
 void set_current_directory_named(X86 *c, const std::string &name);
 void create_file_named(X86 *c, const std::string &name);

@@ -4228,28 +4228,12 @@ void k_SetThreadIdealProcessor(X86 *c) {
 
 void k_ExitProcess(X86 *c) {
     LOGW("ExitProcess(%u)", arg(c, 0));
-    if (request_process_exit(arg(c, 0)))
-        return; // never returns
-    publish_process_exit(arg(c, 0));
-    g_exit_code = arg(c, 0);
-    g_exited = true;
-    if (g_exit_jmp_valid)
-        longjmp(g_exit_jmp, 1);
-    // No landing pad was installed (the guest was not started through
-    // run_entry): ExitProcess must not return, so end the host process.
-    exit((int)g_exit_code);
+    kernel32_exit_process(arg(c, 0));
 }
 
 void k_TerminateProcess(X86 *c) {
     LOGW("TerminateProcess(%u)", arg(c, 1));
-    if (request_process_exit(arg(c, 1)))
-        return; // never returns
-    publish_process_exit(arg(c, 1));
-    g_exit_code = arg(c, 1);
-    g_exited = true;
-    if (g_exit_jmp_valid)
-        longjmp(g_exit_jmp, 1);
-    exit((int)g_exit_code);
+    kernel32_exit_process(arg(c, 1));
 }
 
 // -------------------------------------------------------------------------
@@ -4268,6 +4252,17 @@ void k_UnhandledExceptionFilter(X86 *c) {
 // continuing would run the guest past a point it never reaches on Windows, so
 // an unhandled raise aborts with the state that caused it.
 } // namespace
+
+void kernel32_exit_process(uint32_t code) {
+    if (request_process_exit(code))
+        return;
+    publish_process_exit(code);
+    g_exit_code = code;
+    g_exited = true;
+    if (g_exit_jmp_valid)
+        longjmp(g_exit_jmp, 1);
+    exit((int)g_exit_code);
+}
 
 // Create the guest thread context and its cooperative host worker.
 // Each worker has its own stack/registers, but only the scheduler baton holder executes guest code.
