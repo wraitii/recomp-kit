@@ -26,6 +26,7 @@
 #include "../runtime/imports.h"
 #include "dxtypes.h"
 
+#include <array>
 #include <deque>
 #include <map>
 #include <memory>
