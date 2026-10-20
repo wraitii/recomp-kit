@@ -530,8 +530,7 @@ void PadMapperEditor::activate(int id) {
             capture_ = Capture::Identify;
             identify_start_ = last_raw_;
         }
-    }
-    else if (id == 20)
+    } else if (id == 20)
         scroll_ = std::max(0, scroll_ - 1);
     else if (id == 21)
         ++scroll_;
@@ -724,8 +723,7 @@ void PadMapperEditor::key(int scancode, bool down) {
         auto it = std::find_if(widget_ids_.begin(), widget_ids_.end(),
                                [&](const auto &item) { return item.second == focus_; });
         int index = it == widget_ids_.end() ? -1 : int(it - widget_ids_.begin());
-        const int direction =
-            scancode == kScanUp || scancode == kScanLeft ? -1 : 1;
+        const int direction = scancode == kScanUp || scancode == kScanLeft ? -1 : 1;
         index = (index + direction + int(widget_ids_.size())) % int(widget_ids_.size());
         focus_ = widget_ids_[size_t(index)].second;
     } else if (scancode == kScanReturn || scancode == kScanSpace) {

@@ -15,8 +15,7 @@ uint64_t cursor_revision = 1;
 uint32_t next_cursor = 0x000a0000;
 
 bool decode_cursor(uint32_t p, uint32_t bytes, HostCursorFrame *frame) {
-    if (bytes < 22 || rd16(p) || rd16(p + 2) != 2 || !rd16(p + 4) ||
-        rd16(p + 4) > (bytes - 6) / 16)
+    if (bytes < 22 || rd16(p) || rd16(p + 2) != 2 || !rd16(p + 4) || rd16(p + 4) > (bytes - 6) / 16)
         return false;
     uint32_t size = rd32(p + 14), offset = rd32(p + 18);
     if (offset > bytes || size > bytes - offset || size < 40)

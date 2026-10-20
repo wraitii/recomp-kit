@@ -478,8 +478,7 @@ void update_native_cursor() {
         for (const auto &frame : g_guest_cursor.frames) {
             int hot_x = frame.hot_x, hot_y = frame.hot_y;
             SDL_Surface *surface = cursor_surface(frame, &hot_x, &hot_y);
-            SDL_Cursor *cursor =
-                surface ? SDL_CreateColorCursor(surface, hot_x, hot_y) : nullptr;
+            SDL_Cursor *cursor = surface ? SDL_CreateColorCursor(surface, hot_x, hot_y) : nullptr;
             SDL_DestroySurface(surface);
             if (!cursor) {
                 fprintf(stderr, "[host] native cursor creation failed: %s\n", SDL_GetError());
@@ -661,11 +660,11 @@ void update_platform_pointer_capture() {
     // window's resize edges remain reachable.
     int bw, bh, dw, dh;
     window_sizes(&bw, &bh, &dw, &dh);
-    const bool fullscreen_hold =
-        (g_window_mode != 0 || window_fullscreen()) && g_window &&
-        platform_ui_pointer_capture_supported() && window_focused() &&
-        !window_minimized_or_hidden() && !g_capture_release_held && !mods_page_visible() &&
-        !mods_controls_editing() && !g_viewport_active && !g_fullscreen_transition;
+    const bool fullscreen_hold = (g_window_mode != 0 || window_fullscreen()) && g_window &&
+                                 platform_ui_pointer_capture_supported() && window_focused() &&
+                                 !window_minimized_or_hidden() && !g_capture_release_held &&
+                                 !mods_page_visible() && !mods_controls_editing() &&
+                                 !g_viewport_active && !g_fullscreen_transition;
     HostRect rect = host_pointer_confinement_wanted(want || fullscreen_hold, g_window_mode) &&
                             !relative && g_window
                         ? host_pointer_confinement_rect({0, 0, double(bw), double(bh)})

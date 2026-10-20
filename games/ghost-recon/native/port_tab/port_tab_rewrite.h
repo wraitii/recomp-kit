@@ -15,8 +15,8 @@
 /* Rewrites `in` into a malloc'd `*out` (caller frees). Returns 0 on success,
  * or a negative code on any pin/parse failure, writing a diagnostic to `err`.
  */
-int gr_port_tab_rewrite(const uint8_t *in, size_t in_len, uint8_t **out,
-                        size_t *out_len, char *err, size_t err_len);
+int gr_port_tab_rewrite(const uint8_t *in, size_t in_len, uint8_t **out, size_t *out_len, char *err,
+                        size_t err_len);
 
 /* The pinned input size, so callers can reject other variants before parsing.
  */

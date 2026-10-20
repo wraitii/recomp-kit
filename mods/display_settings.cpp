@@ -64,8 +64,8 @@ void mods_display_init() {
     initialized = true;
     for (int i = 0; i < DISPLAY_ROW_COUNT; ++i) {
         const RowSpec &row = kRows[i];
-        mods_settings_declare(MODS_OWNER_RUNTIME, "host.display", row.key, row.key,
-                              POP_SETTING_INT, desired[i], 0, row.maximum);
+        mods_settings_declare(MODS_OWNER_RUNTIME, "host.display", row.key, row.key, POP_SETTING_INT,
+                              desired[i], 0, row.maximum);
         int64_t value = desired[i];
         mods_settings_get(MODS_OWNER_RUNTIME, row.key, &value);
         desired[i] = int(std::clamp<int64_t>(value, 0, row.maximum));
@@ -145,8 +145,7 @@ std::string mods_display_line(DisplayRow row) {
     std::string result;
     switch (row) {
     case DISPLAY_WINDOW:
-        result = std::string("Display: ") +
-                 kRows[DISPLAY_WINDOW].choices[desired[DISPLAY_WINDOW]];
+        result = std::string("Display: ") + kRows[DISPLAY_WINDOW].choices[desired[DISPLAY_WINDOW]];
         break;
     case DISPLAY_OVERLAY:
         result = std::string("Performance overlay: ") +

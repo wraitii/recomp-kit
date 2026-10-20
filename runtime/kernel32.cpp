@@ -2506,7 +2506,7 @@ struct GuestThread {
     uint32_t wait_result = 0; // what the wait returns once released
     std::vector<GuestApc> apcs;
     bool alertable = false;
-    double last_yield = 0.0;  // for the bounded scheduling checkpoint
+    double last_yield = 0.0; // for the bounded scheduling checkpoint
     jmp_buf exit_jmp;
     uint32_t exit_code = 0;
 };

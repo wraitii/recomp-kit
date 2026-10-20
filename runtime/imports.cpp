@@ -473,7 +473,10 @@ bool cw_effect_allows(uint32_t ret, uint16_t before, uint16_t after) {
     uint32_t lo = 0, hi = recomp_cw_effect_count;
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2;
-        if (recomp_cw_effects[mid].ret < ret) lo = mid + 1; else hi = mid;
+        if (recomp_cw_effects[mid].ret < ret)
+            lo = mid + 1;
+        else
+            hi = mid;
     }
     if (lo == recomp_cw_effect_count || recomp_cw_effects[lo].ret != ret)
         return before == after;
@@ -527,9 +530,8 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     // contains the substring, with its stdcall arguments (hex and as float)
     // and the guest return address.
     static const char *trace_filter = recomp_env("TRACE_IMPORTS");
-    const bool need_desc = trace_filter != nullptr || g_call_observer != nullptr ||
-                           fn == nullptr || fn == imports_unsupported ||
-                           argc == ARGC_UNKNOWN || log_level() >= 2;
+    const bool need_desc = trace_filter != nullptr || g_call_observer != nullptr || fn == nullptr ||
+                           fn == imports_unsupported || argc == ARGC_UNKNOWN || log_level() >= 2;
     char desc[512];
     desc[0] = 0;
     if (need_desc) {

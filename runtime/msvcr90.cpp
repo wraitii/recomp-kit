@@ -71,34 +71,56 @@ void run_onexit(X86 *c) {
 // 16-17, RC in 8-9 and the exception masks are permuted (denormal at bit 19).
 uint32_t cw_to_public(uint32_t x) {
     uint32_t p = 0;
-    if (x & 0x0001) p |= 0x00000010; // invalid
-    if (x & 0x0002) p |= 0x00080000; // denormal
-    if (x & 0x0004) p |= 0x00000008; // zerodivide
-    if (x & 0x0008) p |= 0x00000004; // overflow
-    if (x & 0x0010) p |= 0x00000002; // underflow
-    if (x & 0x0020) p |= 0x00000001; // inexact
-    p |= ((x >> 10) & 3) << 8;       // RC
+    if (x & 0x0001)
+        p |= 0x00000010; // invalid
+    if (x & 0x0002)
+        p |= 0x00080000; // denormal
+    if (x & 0x0004)
+        p |= 0x00000008; // zerodivide
+    if (x & 0x0008)
+        p |= 0x00000004; // overflow
+    if (x & 0x0010)
+        p |= 0x00000002; // underflow
+    if (x & 0x0020)
+        p |= 0x00000001;       // inexact
+    p |= ((x >> 10) & 3) << 8; // RC
     switch ((x >> 8) & 3) {
-    case 0: p |= 0x00020000; break; // 24-bit
-    case 2: p |= 0x00010000; break; // 53-bit
-    default: break;                 // 64-bit
+    case 0:
+        p |= 0x00020000;
+        break; // 24-bit
+    case 2:
+        p |= 0x00010000;
+        break; // 53-bit
+    default:
+        break; // 64-bit
     }
     return p;
 }
 
 uint32_t cw_from_public(uint32_t p) {
     uint32_t x = 0;
-    if (p & 0x00000010) x |= 0x0001;
-    if (p & 0x00080000) x |= 0x0002;
-    if (p & 0x00000008) x |= 0x0004;
-    if (p & 0x00000004) x |= 0x0008;
-    if (p & 0x00000002) x |= 0x0010;
-    if (p & 0x00000001) x |= 0x0020;
+    if (p & 0x00000010)
+        x |= 0x0001;
+    if (p & 0x00080000)
+        x |= 0x0002;
+    if (p & 0x00000008)
+        x |= 0x0004;
+    if (p & 0x00000004)
+        x |= 0x0008;
+    if (p & 0x00000002)
+        x |= 0x0010;
+    if (p & 0x00000001)
+        x |= 0x0020;
     x |= ((p >> 8) & 3) << 10;
     switch (p & 0x00030000) {
-    case 0x00000000: x |= 0x0300; break; // 64-bit
-    case 0x00010000: x |= 0x0200; break; // 53-bit
-    default: break;                      // 24-bit
+    case 0x00000000:
+        x |= 0x0300;
+        break; // 64-bit
+    case 0x00010000:
+        x |= 0x0200;
+        break; // 53-bit
+    default:
+        break; // 24-bit
     }
     return x;
 }
@@ -249,8 +271,7 @@ void crt_amsg_exit(X86 *c) {
 }
 
 void crt_invoke_watson(X86 *c) {
-    LOGW("MSVCR90 _invoke_watson (invalid parameter, expression/form/file/line %u)",
-         arg(c, 3));
+    LOGW("MSVCR90 _invoke_watson (invalid parameter, expression/form/file/line %u)", arg(c, 3));
     fflush(stdout);
     fflush(stderr);
     abort();
@@ -587,8 +608,10 @@ int compare_ci(const unsigned char *a, const unsigned char *b, uint32_t n, bool 
         if (bounded && n == 0)
             return 0;
         unsigned char ca = *a, cb = *b;
-        if (ca >= 'A' && ca <= 'Z') ca += 32;
-        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca >= 'A' && ca <= 'Z')
+            ca += 32;
+        if (cb >= 'A' && cb <= 'Z')
+            cb += 32;
         if (ca != cb)
             return ca < cb ? -1 : 1;
         if (!ca)
@@ -884,8 +907,10 @@ int compare_wci(uint32_t a, uint32_t b, uint32_t n, bool bounded) {
     for (uint32_t i = 0; !bounded || i < n; ++i) {
         uint16_t ca = gm_valid(a + i * 2, 2) ? rd16(a + i * 2) : 0;
         uint16_t cb = gm_valid(b + i * 2, 2) ? rd16(b + i * 2) : 0;
-        if (ca >= 'A' && ca <= 'Z') ca += 32;
-        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca >= 'A' && ca <= 'Z')
+            ca += 32;
+        if (cb >= 'A' && cb <= 'Z')
+            cb += 32;
         if (ca != cb)
             return ca < cb ? -1 : 1;
         if (!ca)
@@ -963,9 +988,7 @@ int wide_digit(uint16_t ch) {
 }
 
 uint64_t wide_parse_uint(uint32_t p, int base, bool &negative, uint32_t &end) {
-    auto unit = [p](uint32_t i) {
-        return gm_valid(p + i * 2, 2) ? rd16(p + i * 2) : (uint16_t)0;
-    };
+    auto unit = [p](uint32_t i) { return gm_valid(p + i * 2, 2) ? rd16(p + i * 2) : (uint16_t)0; };
     uint32_t i = 0;
     while (unit(i) == ' ' || unit(i) == '\t' || unit(i) == '\r' || unit(i) == '\n' ||
            unit(i) == '\f' || unit(i) == '\v')
@@ -1491,10 +1514,13 @@ std::string format_host(const std::string &fmt, FmtArgs &args) {
                 host[h++] = 'l';
                 host[h++] = sign ? 'd' : conv;
                 host[h] = 0;
-                int n = snprintf(nullptr, 0, host, sign ? (long long)(int64_t)v : (unsigned long long)v);
-                if (n < 0) break;
+                int n = snprintf(nullptr, 0, host,
+                                 sign ? (long long)(int64_t)v : (unsigned long long)v);
+                if (n < 0)
+                    break;
                 std::vector<char> b((size_t)n + 1);
-                snprintf(b.data(), b.size(), host, sign ? (long long)(int64_t)v : (unsigned long long)v);
+                snprintf(b.data(), b.size(), host,
+                         sign ? (long long)(int64_t)v : (unsigned long long)v);
                 out.append(b.data(), (size_t)n);
             } else {
                 uint32_t v = args.u32();
@@ -1506,7 +1532,8 @@ std::string format_host(const std::string &fmt, FmtArgs &args) {
                 host[h++] = conv;
                 host[h] = 0;
                 int n = snprintf(nullptr, 0, host, sign ? (int)(int32_t)v : (unsigned)v);
-                if (n < 0) break;
+                if (n < 0)
+                    break;
                 std::vector<char> b((size_t)n + 1);
                 snprintf(b.data(), b.size(), host, sign ? (int)(int32_t)v : (unsigned)v);
                 out.append(b.data(), (size_t)n);
@@ -1953,7 +1980,8 @@ uint32_t cvt_slot() {
 
 void crt_cvt(X86 *c, bool significant) {
     int decpt = 0, sign = 0;
-    std::string digits = cvt_digits(stack_double(c, 0), (int32_t)arg(c, 2), decpt, sign, significant);
+    std::string digits =
+        cvt_digits(stack_double(c, 0), (int32_t)arg(c, 2), decpt, sign, significant);
     uint32_t decpt_p = arg(c, 3), sign_p = arg(c, 4);
     if (decpt_p && gm_valid(decpt_p, 4))
         wr32(decpt_p, (uint32_t)decpt);
@@ -1964,16 +1992,32 @@ void crt_cvt(X86 *c, bool significant) {
     set_eax(c, out);
 }
 
-void crt_fcvt(X86 *c) { crt_cvt(c, false); }
-void crt_ecvt(X86 *c) { crt_cvt(c, true); }
+void crt_fcvt(X86 *c) {
+    crt_cvt(c, false);
+}
+void crt_ecvt(X86 *c) {
+    crt_cvt(c, true);
+}
 
 // The compiler intrinsics take and return a double in ST(0), not on the stack.
-void crt_ci_log(X86 *c) { fset(c, 0, std::log(ST(c, 0))); }
-void crt_ci_cos(X86 *c) { fset(c, 0, std::cos(ST(c, 0))); }
-void crt_ci_sin(X86 *c) { fset(c, 0, std::sin(ST(c, 0))); }
-void crt_ci_sqrt(X86 *c) { fset(c, 0, std::sqrt(ST(c, 0))); }
-void crt_ci_asin(X86 *c) { fset(c, 0, std::asin(ST(c, 0))); }
-void crt_ci_acos(X86 *c) { fset(c, 0, std::acos(ST(c, 0))); }
+void crt_ci_log(X86 *c) {
+    fset(c, 0, std::log(ST(c, 0)));
+}
+void crt_ci_cos(X86 *c) {
+    fset(c, 0, std::cos(ST(c, 0)));
+}
+void crt_ci_sin(X86 *c) {
+    fset(c, 0, std::sin(ST(c, 0)));
+}
+void crt_ci_sqrt(X86 *c) {
+    fset(c, 0, std::sqrt(ST(c, 0)));
+}
+void crt_ci_asin(X86 *c) {
+    fset(c, 0, std::asin(ST(c, 0)));
+}
+void crt_ci_acos(X86 *c) {
+    fset(c, 0, std::acos(ST(c, 0)));
+}
 
 void crt_ci_fmod(X86 *c) {
     double divisor = ST(c, 0), dividend = ST(c, 1);
@@ -1987,8 +2031,12 @@ void crt_ci_pow(X86 *c) {
     fset(c, 0, std::pow(base, exponent));
 }
 
-void crt_floor(X86 *c) { fpush(c, std::floor(stack_double(c, 0))); }
-void crt_ceil(X86 *c) { fpush(c, std::ceil(stack_double(c, 0))); }
+void crt_floor(X86 *c) {
+    fpush(c, std::floor(stack_double(c, 0)));
+}
+void crt_ceil(X86 *c) {
+    fpush(c, std::ceil(stack_double(c, 0)));
+}
 
 void crt_ldexp(X86 *c) {
     fpush(c, std::ldexp(stack_double(c, 0), (int32_t)arg(c, 2)));
@@ -2007,8 +2055,12 @@ void crt_modf(X86 *c) {
     fpush(c, frac);
 }
 
-void crt_isnan(X86 *c) { set_eax(c, std::isnan(stack_double(c, 0)) ? 1 : 0); }
-void crt_finite(X86 *c) { set_eax(c, std::isfinite(stack_double(c, 0)) ? 1 : 0); }
+void crt_isnan(X86 *c) {
+    set_eax(c, std::isnan(stack_double(c, 0)) ? 1 : 0);
+}
+void crt_finite(X86 *c) {
+    set_eax(c, std::isfinite(stack_double(c, 0)) ? 1 : 0);
+}
 
 void crt_isupper(X86 *c) {
     int ch = ascii_class((int)arg(c, 0));
