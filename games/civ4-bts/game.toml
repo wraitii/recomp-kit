@@ -41,6 +41,8 @@ default_layout = "hidden"
 mobile_control = "mobile-only"
 
 [setup]
+supported_version = "GOG Beyond the Sword 3.19"
+source_notes = "Choose the Civilization IV folder containing Beyond the Sword and the shared game assets. The required msxml3.dll must also be supplied."
 required_dirs = ["Assets"]
 
 [setup.layout]

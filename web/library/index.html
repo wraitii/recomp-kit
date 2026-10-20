@@ -7,11 +7,11 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <header><span class="brand">RECOMP TOOLKIT <span>Library</span></span><div class="buttons"><button id="settings">Settings</button><button id="refresh">Refresh</button></div></header>
+  <header><span class="brand">RECOMP TOOLKIT <span>Games</span></span><div class="buttons"><a id="repository" href="https://github.com/wraitii/recomp-kit" target="_blank" rel="noopener noreferrer">GitHub ↗</a><button id="settings">Settings</button><button id="refresh">Refresh</button></div></header>
   <main>
-    <section class="intro"><h1>Your games</h1><p class="lead">Install from your own game files, or start an installed game.</p></section>
+    <section class="intro"><h1>Recompile a game</h1><p class="lead">Choose a supported game and provide your own copy to build a native app.</p></section>
     <p id="message" role="status" hidden></p>
-    <section id="games" aria-label="Game library"></section>
+    <section id="games" aria-label="Supported games"></section>
   </main>
   <dialog id="installer" aria-labelledby="install-title">
     <div class="modal-heading"><h2 id="install-title"></h2><button id="close" aria-label="Close game setup">Close</button></div>
@@ -28,11 +28,13 @@
       <div class="buttons actions"><button id="review-back" class="back">Back</button><button id="install" class="primary" disabled>Install</button></div>
     </section>
     <section id="source" hidden>
-      <p id="copy-help">We’ll check your files and build a native app. Your original copy stays untouched.</p>
+      <h3>Choose your game files</h3>
+      <p class="version-requirement">Required version: <strong id="supported-version"></strong></p>
+      <p id="source-notes" class="muted"></p>
       <article id="source-selection" class="selected" hidden><strong>Selected copy</strong><p id="source-selection-path"></p><p id="source-selection-status" class="muted"></p></article>
       <div class="choose-copy"><button id="choose-source" class="primary">Choose files or folder</button><p class="muted">Or drop your game files here.</p></div>
+      <p class="muted source-reassurance">Your original files stay untouched. We’ll verify the version before building.</p>
       <div class="buttons actions"><button id="source-forward" class="primary" hidden>Continue with this copy</button></div>
-      <details id="discovered"><summary>Copies found on this computer</summary><div id="discovery" aria-live="polite"></div></details>
     </section>
     <section id="copy-result" hidden>
       <h3 id="copy-result-title" tabindex="-1" aria-live="polite">Checking your copy…</h3>
@@ -75,7 +77,7 @@
       <div class="buttons actions"><button id="save" class="primary">Save settings</button></div>
     </section>
   </dialog>
-  <template id="card"><button class="game"><span class="game-top"><span class="monogram" aria-hidden="true"></span><span class="state"></span></span><span class="game-title"></span><span class="detail"></span><span class="card-action"></span></button></template>
+  <template id="card"><button class="game"><span class="game-top"><span class="game-title"></span><span class="state" hidden></span></span><span class="detail"></span><span class="card-action"></span></button></template>
   <script type="module" src="app.js"></script>
 </body>
 </html>

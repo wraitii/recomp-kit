@@ -19,6 +19,10 @@ guest_root = 'C:\Railroad Tycoon 3'
 # Remove per-store checks; DirectDraw Unlock compares the whole locked surface.
 store_hooks = false
 
+[setup]
+supported_version = "GOG 1.05"
+source_notes = "Use the GOG copy with official patch 1.05 and no unofficial user patch. Disc editions are not verified."
+
 [translate]
 # The public map holds Ghidra boundaries and control-flow addresses. Translation
 # decodes the original executable bytes; no instruction contents are published.

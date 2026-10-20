@@ -167,6 +167,10 @@ def validate_installation_hints(cfg, source):
         candidates.insert(0, game["executable"])
 
     setup = cfg["setup"]
+    for key in ("supported_version", "source_notes"):
+        value = setup.setdefault(key, "")
+        if not isinstance(value, str):
+            raise ValueError("%s: [setup] %s must be a string" % (source, key))
     installers = setup.setdefault("installers", [])
     if not isinstance(installers, list):
         raise ValueError("%s: setup.installers must be an array of tables" % source)

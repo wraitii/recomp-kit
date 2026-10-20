@@ -3,12 +3,15 @@ import { platform } from "./platform.js";
 const backend = platform();
 const element = (id) => document.getElementById(id);
 if (!navigator.platform.includes("Mac")) element("choose-source").textContent = "Choose game file";
-const labels = { ready: "Ready to play", notInstalled: "Not installed", unavailable: "Unavailable", needsBuild: "Build needed", busy: "Installation in progress" };
 const descriptions = {
-  "ghost-recon": "Lead an elite squad through tense, tactical missions behind enemy lines.",
-  "black-and-white": "Shape a world with your powers and raise a creature that learns from you.",
-  "railroad-tycoon-3": "Build a railway network and grow your transport empire.",
+  "ghost-recon": "The 2001 tactical shooter that started a franchise: small squads, careful planning, and unforgiving firefights.",
+  "black-and-white": "Lionhead’s 2001 god game, where miracles and a creature that learned from you made kindness and cruelty part of play.",
+  "railroad-tycoon-3": "The 2003 sequel that brought the railway empire builder into 3D, with fortunes riding on freight and the stock market.",
+  "4x4-evo2": "Terminal Reality’s 2001 off-road racer, pairing trucks and SUVs with open terrain, career racing, and vehicle upgrades.",
+  "civ4-bts": "The 2007 Civilization IV expansion that deepened empire building with espionage, corporations, and a wealth of scenarios.",
+  "spore": "Maxis’s ambitious 2008 life simulator, taking player-made creatures from a single cell to a spacefaring civilization.",
 };
+const cardActions = { ready: "View installed game →", notInstalled: "Choose game files →", needsBuild: "Continue setup →", busy: "View setup →", unavailable: "Not available yet" };
 const gigabytes = (bytes) => `${(bytes / 1e9).toFixed(1).replace(".", ",")} GB`;
 let currentScreen = null;
 let preparationRoute = false;
@@ -397,12 +400,12 @@ async function refresh() {
   for (const game of catalog.games) {
     const card = element("card").content.firstElementChild.cloneNode(true);
     card.querySelector(".game-title").textContent = game.title;
-    card.querySelector(".monogram").textContent = game.title.split(/\s+/).slice(0, 2).map((word) => word[0]).join("");
-    card.querySelector(".state").textContent = game.updateAvailable ? "Update available" : labels[game.state];
+    card.querySelector(".state").textContent = game.updateAvailable ? "Update available" : "Installed";
+    card.querySelector(".state").hidden = game.state !== "ready";
     card.querySelector(".state").classList.toggle("ready", game.state === "ready");
     card.dataset.unavailable = String(game.state === "unavailable");
-    card.querySelector(".detail").textContent = game.state === "unavailable" ? game.detail || "Support is not available yet." : descriptions[game.id] || "Install a native app from your game files.";
-    card.querySelector(".card-action").textContent = game.state === "ready" ? "View game →" : game.state === "unavailable" ? "Not available yet" : "Set up game →";
+    card.querySelector(".detail").textContent = descriptions[game.id] || game.detail || "Build a native app from your own game files.";
+    card.querySelector(".card-action").textContent = cardActions[game.state] || "View setup →";
     card.onclick = () => attempt(() => openGame(game));
     element("games").append(card);
   }
@@ -433,6 +436,8 @@ async function openGame(game) {
   element("destination").value = destination;
   element("pick-destination").disabled = false;
   element("install-title").textContent = game.title;
+  element("supported-version").textContent = game.supportedVersion || "Exact version not documented";
+  element("source-notes").textContent = game.sourceNotes || `Choose the game folder containing ${game.executable}.`;
   element("selected-source").hidden = !source;
   element("selected-source").textContent = source ? `Using your library copy: ${source}` : "";
   element("installer").showModal();
@@ -447,40 +452,6 @@ async function openGame(game) {
     return;
   }
   element("recheck").hidden = false;
-  element("discovered").hidden = true;
-  element("discovered").open = false;
-  element("discovery").replaceChildren();
-  discoverCopies(game.id);
-}
-
-async function discoverCopies(gameId) {
-  const target = element("discovery");
-  try {
-    const result = await backend.query({ action: "discover", game: gameId });
-    if (selected?.id !== gameId || !element("installer").open) return;
-    target.replaceChildren();
-    const found = result.candidates || [];
-    element("discovered").hidden = !found.length;
-    if (!found.some((candidate) => candidate.installable)) {
-      target.textContent = result.scanComplete ? "No supported copies were found. Choose a folder or game file." : "Search was incomplete. Choose a folder or game file to inspect it directly.";
-    }
-    if (!found.length) return;
-    const heading = document.createElement("p");
-      heading.textContent = `Found ${found.length} ${found.length === 1 ? "candidate" : "candidates"}. Choose a supported copy to review.`;
-    target.append(heading);
-    for (const candidate of found) {
-      const button = document.createElement("button");
-      button.className = "discovery-choice";
-      const version = typeof candidate.version === "object" ? candidate.version?.label : candidate.version;
-      button.textContent = `${candidate.installable ? version || "Supported" : candidate.status || "Needs preparation"} · ${candidate.contentRoot || candidate.executable?.path || "Candidate location unavailable"}`;
-      button.disabled = false;
-      button.onclick = () => attempt(() => chooseDroppedPath(candidate.contentRoot || candidate.executable?.path));
-      target.append(button);
-    }
-    lock(busy);
-  } catch (error) {
-    if (selected?.id === gameId) target.textContent = `Automatic search unavailable: ${errorText(error)} Choose a folder or game file.`;
-  }
 }
 
 async function checkRequirements() {
@@ -1146,6 +1117,10 @@ element("cancel").onclick = () => attempt(async () => {
   element("cancel").disabled = true;
   element("stage").textContent = "Stopping installation…";
 });
+element("repository").onclick = (event) => {
+  event.preventDefault();
+  attempt(() => backend.open(element("repository").href));
+};
 element("settings").onclick = () => {
   selected = null;
   source = "";

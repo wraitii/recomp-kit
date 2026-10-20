@@ -16,6 +16,10 @@ host_arena_base = 0
 guest_root = 'C:\Program Files\Electronic Arts\SPORE\SporebinEP1'
 windows_version = "5.1.2600"
 
+[setup]
+supported_version = "GOG Spore Collection — Galactic Adventures 3.1.0.22"
+source_notes = "Choose the collection folder containing SporebinEP1, Data, DataEP1, and bp1content. The base game alone is not supported."
+
 [translate]
 code_map = "metadata"
 
@@ -37,6 +41,7 @@ required_dirs = ["Data", "DataEP1", "bp1content"]
 
 [controls]
 default_layout = "hidden"
+mobile_control = "mobile-only"
 
 [registry.'HKEY_LOCAL_MACHINE\SOFTWARE\Electronic Arts\spore']
 reindexyesorno = 0
