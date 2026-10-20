@@ -545,6 +545,25 @@ struct FailureSiteHash {
     }
 };
 
+constexpr uint32_t D3DERR_NOTAVAILABLE = 0x8876086au;
+
+bool expected_capability_miss(const char *desc, uint32_t hr) {
+    if (hr != D3DERR_NOTAVAILABLE)
+        return false;
+    const char *method = strstr(desc, "::");
+    if (!method)
+        return false;
+    method += 2;
+    for (const char *query : {"CheckDeviceType", "CheckDeviceFormat", "CheckDeviceMultiSampleType",
+                              "CheckDepthStencilMatch", "CheckDeviceFormatConversion"}) {
+        if (strcmp(method, query) == 0)
+            return true;
+    }
+    return strcmp(method, "GetDeviceCaps") == 0 &&
+           (strstr(desc, "IDirect3D9::") || strstr(desc, "IDirect3D9Ex::") ||
+            strstr(desc, "IDirect3D8::"));
+}
+
 [[gnu::noinline]] void report_failure(const char *desc, uint32_t eax, uint32_t caller) {
     static auto *watched = new std::unordered_map<const char *, bool>();
     auto [kind, unseen] = watched->try_emplace(desc, false);
@@ -565,8 +584,14 @@ struct FailureSiteHash {
 }
 
 void dx_report_failure(const char *desc, uint32_t eax, uint32_t caller) {
-    if ((eax & 0x80000000u) && desc)
-        report_failure(desc, eax, caller);
+    if (!(eax & 0x80000000u) || !desc)
+        return;
+    if (expected_capability_miss(desc, eax)) {
+        const char *n = hresult_name(eax);
+        LOGV("dx: %s capability query: %s (0x%08x)", desc, n ? n : "HRESULT", eax);
+        return;
+    }
+    report_failure(desc, eax, caller);
 }
 
 } // namespace
