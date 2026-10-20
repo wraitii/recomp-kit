@@ -502,14 +502,6 @@ fn validate_buffer_lock(
             format!("unknown D3DLOCK flag(s) {unknown:#x}"),
         ));
     }
-    if request.flags & resource::D3DLOCK_DYNAMIC_ONLY != 0
-        && b.usage & resource::D3DUSAGE_DYNAMIC == 0
-    {
-        return Err(lock_fail(
-            StatusCode::InvalidArgument,
-            "D3DLOCK_DISCARD and D3DLOCK_NOOVERWRITE require D3DUSAGE_DYNAMIC",
-        ));
-    }
     if request.flags & resource::D3DLOCK_DONOTWAIT != 0 {
         return Err(lock_fail(
             StatusCode::InvalidArgument,

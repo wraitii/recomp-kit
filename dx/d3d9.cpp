@@ -5727,16 +5727,19 @@ void Dev_SetVertexShaderConstantF(X86 *c) {
 void Dev_SetPixelShaderConstantF(X86 *c) {
     ComObj *dev = this_device9(c);
     uint32_t start = arg(c, 1), data = arg(c, 2), count = arg(c, 3);
-    if (!dev || !dev->d3d9_device || count > 32 || start > 32 - count) {
+    bool range_valid = count <= 32 && start <= 32 - count;
+    bool data_valid = !count || (count <= UINT32_MAX / 16 && data && gm_valid(data, count * 16));
+    if (!dev || !dev->d3d9_device || !range_valid || !data_valid) {
+        static uint32_t failures = 0;
+        if (++failures == 1 || (failures & (failures - 1)) == 0)
+            LOGW("d3d9: SetPixelShaderConstantF invalid upload: start=%u count=%u data=%08x "
+                 "limit=32 range_valid=%d data_valid=%d failures=%u",
+                 start, count, data, range_valid, data_valid, failures);
         com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
     if (!count) {
         com_ret(c, D3D_OK9);
-        return;
-    }
-    if (!data || !gm_valid(data, count * 16)) {
-        com_ret(c, D3DERR_INVALIDCALL);
         return;
     }
     std::vector<float> values(count * 4);
