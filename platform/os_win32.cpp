@@ -295,7 +295,7 @@ int os_realpath(const char *path, char *buf, size_t cap) {
         resolved = L"\\\\" + resolved.substr(8);
     else if (resolved.rfind(L"\\\\?\\", 0) == 0)
         resolved.erase(0, 4);
-    return copy_out(narrow(resolved), buf, cap);
+    return copy_out(narrow(resolved.c_str()), buf, cap);
 }
 int os_directory_contains(const char *path, const char *name) {
     std::wstring pattern = widen(path) + L"\\*";

@@ -5,8 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-void fn_0047c160(
-    X86 *c); /* Retained mechanical original, bypasses FN override. */
+void fn_0047c160(X86 *c); /* Retained mechanical original, bypasses FN override. */
 
 /* Return address of the vtable +0x1c call at 0x0045f610 in FUN_0045f350 (the
  * scene draw): CALL dword ptr [EDX+0x1c], three bytes. The same function is
@@ -26,8 +25,8 @@ void fn_0047c160(
  * leaves behavior unchanged; any other value is passed to the renderer, which
  * stops with its existing diagnostic. Other callers run the original. */
 void gr_scene_post(X86 *c) {
-  uint32_t ret = rd32(c->r[R_ESP]);
-  fn_0047c160(c);
-  if (ret == SCENE_DRAW_AFTER_EFFECTS)
-    d3d8_scene_boundary(c, gr_port_fxaa_mode());
+    uint32_t ret = rd32(c->r[R_ESP]);
+    fn_0047c160(c);
+    if (ret == SCENE_DRAW_AFTER_EFFECTS)
+        d3d8_scene_boundary(c, gr_port_fxaa_mode());
 }

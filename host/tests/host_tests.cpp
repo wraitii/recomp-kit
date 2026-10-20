@@ -2143,6 +2143,7 @@ static void test_audio_ring_convert_midlap() {
             ring[off + i + 1] = (uint8_t)((value >> 8) & 0xff);
         }
     };
+    put(0, 4, 1000);
 
     HostAudioPlay play;
     memset(&play, 0, sizeof play);

@@ -7,11 +7,11 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <header><span class="brand">RECOMP TOOLKIT <span>Library</span></span><div class="buttons"><button id="settings">Settings</button><button id="refresh">Refresh</button></div></header>
+  <header><span class="brand">RECOMP TOOLKIT <span>Games</span></span><div class="buttons"><a id="repository" href="https://github.com/wraitii/recomp-kit" target="_blank" rel="noopener noreferrer">GitHub ↗</a><button id="settings">Settings</button><button id="refresh">Refresh</button></div></header>
   <main>
-    <section class="intro"><h1>Your games</h1><p class="lead">Install from your own game files, or start an installed game.</p></section>
+    <section class="intro"><h1>Recompile a game</h1><p class="lead">Choose a supported game and provide your own copy to build a native app.</p></section>
     <p id="message" role="status" hidden></p>
-    <section id="games" aria-label="Game library"></section>
+    <section id="games" aria-label="Supported games"></section>
   </main>
   <dialog id="installer" aria-labelledby="install-title">
     <div class="modal-heading"><h2 id="install-title"></h2><button id="close" aria-label="Close game setup">Close</button></div>
@@ -28,46 +28,27 @@
       <div class="buttons actions"><button id="review-back" class="back">Back</button><button id="install" class="primary" disabled>Install</button></div>
     </section>
     <section id="source" hidden>
-      <p id="copy-help">We’ll check your files and build a native app. Your original copy stays untouched.</p>
+      <h3>Choose your game files</h3>
+      <p class="version-requirement">Required version: <strong id="supported-version"></strong></p>
+      <p id="source-notes" class="muted"></p>
       <article id="source-selection" class="selected" hidden><strong>Selected copy</strong><p id="source-selection-path"></p><p id="source-selection-status" class="muted"></p></article>
       <div class="choose-copy"><button id="choose-source" class="primary">Choose files or folder</button><p class="muted">Or drop your game files here.</p></div>
+      <p class="muted source-reassurance">Your original files stay untouched. We’ll verify the version before building.</p>
       <div class="buttons actions"><button id="source-forward" class="primary" hidden>Continue with this copy</button></div>
-      <details id="discovered"><summary>Copies found on this computer</summary><div id="discovery" aria-live="polite"></div></details>
     </section>
     <section id="copy-result" hidden>
       <h3 id="copy-result-title" tabindex="-1" aria-live="polite">Checking your copy…</h3>
       <p id="selected-source" class="selected" hidden></p>
       <p id="copy-result-help"></p>
       <div id="inspection" hidden></div>
-      <div class="buttons actions"><button id="inspection-back" class="back">Back</button><button id="inspection-cancel" hidden>Cancel inspection</button><button id="choose-another">Choose another copy</button><button id="assisted-with-source" hidden>Set up preparation folder</button><button id="review-copy" class="primary" hidden>Continue</button></div>
-    </section>
-    <section id="preparation-plan" hidden>
-      <h3>Prepare files outside this app</h3>
-      <p>Use this folder to collect extracted game files. The library will check them before building.</p>
-      <ol class="preparation-instructions">
-        <li>Install your copy on Windows, or extract it with a compatible tool.</li>
-        <li>Create a preparation folder with a checklist of required files.</li>
-        <li>Copy the files there, keeping their folder structure. We’ll check them as you copy.</li>
-      </ol>
-      <div class="buttons actions"><button id="preparation-back" class="back">Back</button><button id="create-preparation" class="primary">Create preparation folder</button></div>
-    </section>
-    <section id="assisted" hidden>
-      <h3>Copy your game files</h3>
-      <p id="assisted-help" class="muted">Copy the extracted files here, keeping their folder structure.</p>
-      <p class="preparation-folder"> <code id="assisted-path" tabindex="0"></code> <button id="copy-assisted-path">Copy path</button> <button id="open-assisted-folder">Open folder</button></p>
-      <details><summary>Full file checklist</summary><pre id="assisted-checklist"></pre></details>
-      <div id="assisted-items"></div>
-      <p id="assisted-summary" class="muted"></p>
-      <p id="assisted-status" class="sr-only" role="status" aria-live="polite"></p>
-      <details><summary>Preparation options</summary><p class="muted">Back keeps these files. Discard preparation deletes these copies.</p><div class="buttons"><button id="assisted-recheck">Check files again</button><button id="assisted-cancel">Discard preparation</button></div></details>
-      <div class="buttons actions"><button id="assisted-back" class="back">Back</button><button id="assisted-continue" class="primary" disabled>Build game</button></div>
+      <div class="buttons actions"><button id="inspection-back" class="back">Back</button><button id="inspection-cancel" hidden>Cancel inspection</button><button id="choose-another">Choose another copy</button><button id="review-copy" class="primary" hidden>Continue</button></div>
     </section>
     <section id="job" aria-live="polite" hidden>
       <h3 id="stage"></h3><p id="job-duration" class="muted">This can take several minutes or longer.</p><p id="stage-help" class="muted"></p><progress id="progress" max="1"></progress><p id="current" class="muted"></p>
       <details><summary>Installation details</summary><pre id="log">Waiting for installation output…</pre></details>
       <div class="buttons actions"><button id="job-back" class="back" hidden>Back</button><button id="cancel">Cancel installation</button><button id="retry" hidden>Try again</button><button id="play-existing" class="primary" hidden>Start installed game</button></div>
     </section>
-    <section id="ready" hidden><h3>Installed</h3><p id="installed-location"></p><p id="update-note" class="muted" hidden>An updated build is available. You can keep playing the installed version.</p><div class="buttons actions"><button id="open-installation">Open folder</button><button id="play" class="primary">Start game</button></div></section>
+    <section id="ready" hidden><h3>Installed</h3><p id="installed-location"></p><p id="update-note" class="muted" hidden>An updated build is available. You can keep playing the installed version.</p><div class="buttons actions"><button id="open-installation">Open folder</button><button id="rebuild">Rebuild</button><button id="play" class="primary">Start game</button></div></section>
     <section id="setup" hidden><p class="muted">Choose the tools used to build game apps.</p>
       <label>Recomp-kit folder<div class="field"><input id="kit" spellcheck="false"><button id="pick-kit">Browse…</button></div></label>
       <label>Python program<div class="field"><input id="python" spellcheck="false"><button id="pick-python">Browse…</button></div></label>
@@ -75,7 +56,7 @@
       <div class="buttons actions"><button id="save" class="primary">Save settings</button></div>
     </section>
   </dialog>
-  <template id="card"><button class="game"><span class="game-top"><span class="monogram" aria-hidden="true"></span><span class="state"></span></span><span class="game-title"></span><span class="detail"></span><span class="card-action"></span></button></template>
+  <template id="card"><button class="game"><span class="game-top"><span class="game-title"></span><span class="state" hidden></span></span><span class="detail"></span><span class="card-action"></span></button></template>
   <script type="module" src="app.js"></script>
 </body>
 </html>

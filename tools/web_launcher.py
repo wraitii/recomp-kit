@@ -35,6 +35,8 @@ def game_entry(cfg):
         "executable": game["executable"],
         "sha256": game["sha256"],
         "requiredDirs": cfg["setup"]["required_dirs"],
+        "supportedVersion": cfg["setup"]["supported_version"],
+        "sourceNotes": cfg["setup"]["source_notes"],
         "exclude": cfg["bundle"]["exclude"],
         "store": launcher["store"],
         "installNames": launcher["install_names"],

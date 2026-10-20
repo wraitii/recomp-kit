@@ -724,7 +724,8 @@ def translate(args, settings, ctx, log, started, store, artifacts, parts, addrs)
     dependencies = {addr: results[addr].dependencies for addr in addrs}
     os.makedirs(args.out, exist_ok=True)
     output.write_funcs_header(args.out, entry_names)
-    output.emit_body_chunks(args.out, functions, bodies, entries_by_fn, dependencies, known_modes)
+    output.emit_body_chunks(args.out, functions, bodies, entries_by_fn, dependencies, known_modes,
+                            settings.module)
     output.emit_entry_chunks(args.out, entry_names, settings.module, checked_returns, private_masks,
                              selection.input_arguments)
     symbols = symbol_rows(ctx, entry_names, rows)
@@ -838,7 +839,7 @@ def translate_selected(args, settings, ctx, log, started):
     bodies = {addr: result.lines for addr, result in results.items()}
     dependencies = {addr: result.dependencies for addr, result in results.items()}
     paths = output.emit_body_chunks(args.out, functions, bodies, state['entries_by_fn'], dependencies,
-                                    state['known_modes'])
+                                    state['known_modes'], settings.module)
     written = {Path(path).name for path in paths}
     for path in Path(args.out).glob('chunk_*.c'):
         if not path.name.startswith('chunk_entries_') and path.name not in written:

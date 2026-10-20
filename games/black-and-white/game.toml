@@ -13,6 +13,10 @@ guest_size = 0x10800000
 strict_imports = true
 store_hooks = false
 
+[setup]
+supported_version = "Fan Patch 1.42"
+source_notes = "Apply Fan Patch 1.42 before selecting the game folder. Include its matching DLLs. The Toolkit does not apply patches."
+
 [translate]
 code_map = "metadata"
 private_leaf_contracts = true

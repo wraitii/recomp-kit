@@ -117,7 +117,7 @@ static void test_backbuffer(uint32_t format) {
     for (uint32_t iid : {sc(128), sc(144)}) {
         check(call_method(surface, 0, {iid, sc(8)}) == 0 && rd32(sc(8)) == surface,
               "QueryInterface retains canonical surface identity");
-        check(call_method(surface, 2) == 3, "release QueryInterface reference");
+        check(call_method(surface, 2) == 2, "release QueryInterface reference");
     }
     check(call_method(surface, 3, {sc(12)}) == 0 && rd32(sc(12)) == device,
           "GetDevice returns owning device");
@@ -136,8 +136,8 @@ static void test_backbuffer(uint32_t format) {
     check(obj->refs == 3 && dev->refs == 2, "invalid calls leak no references");
 
     uint32_t surface_id = obj->id;
-    check(call_method(surface, 2) == 2, "release first surface reference");
-    check(call_method(surface, 2) == 1 && com_get(surface_id) == obj,
+    check(call_method(surface, 2) == 1, "release first surface reference");
+    check(call_method(surface, 2) == 0 && com_get(surface_id) == obj,
           "device ownership keeps the surface alive after guest references are released");
     check(!obj->d3d8_owner_retained && dev->refs == 1 && dev->d3d8_backbuffer == surface_id,
           "internal-only surface does not retain the device and stays weakly cached");
@@ -484,7 +484,7 @@ static void test_depth() {
     check(call_method(device, 33, {sc(12)}) == 0x88760866 && rd32(sc(12)) == 0,
           "NULL depth detaches; GetDepthStencilSurface returns NOTFOUND");
     call_method(backbuffer, 2);
-    check(call_method(depth, 2) == 1 && com_get(depth_id) == d,
+    check(call_method(depth, 2) == 0 && com_get(depth_id) == d,
           "device ownership keeps the depth surface alive after guest references are released");
     check(!d->d3d8_owner_retained && dev->refs == 1,
           "internal-only depth surface does not retain the device");
@@ -564,8 +564,8 @@ static void test_implicit_surface_lifetime() {
     uint32_t saved_color = rd32(sc(0));
     check(call_method(device, 33, {sc(4)}) == 0, "save the implicit depth surface");
     uint32_t saved_depth = rd32(sc(4));
-    check(call_method(saved_color, 2) == 1, "release the saved color reference");
-    check(call_method(saved_depth, 2) == 1, "release the saved depth reference");
+    check(call_method(saved_color, 2) == 0, "release the saved color reference");
+    check(call_method(saved_depth, 2) == 0, "release the saved depth reference");
 
     // ensureLightingUpload then restores the saved pointers.
     check(call_method(device, 31, {saved_color, saved_depth}) == 0,

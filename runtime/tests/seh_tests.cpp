@@ -34,6 +34,9 @@ static uint32_t callback_sp, cleanup_reg, outer_reg;
 static bool raise_in_cleanup, unknown_sentinel;
 static void cleanup_block(X86 *c);
 static void surgery(X86 *c);
+static void accept(X86 *c);
+static void cleanup_accept(X86 *c);
+static void outer_accept(X86 *c);
 
 static uint32_t invoke(X86 *c, const char *name, std::initializer_list<uint32_t> args) {
     return guest_call(c, imports_resolve("KERNEL32.dll", name), args.begin(), (int)args.size());
@@ -117,6 +120,26 @@ extern "C" int32_t recomp_index_of(uint32_t target) {
     return target == LANDING || target == GUEST_RETURN_SENTINEL ? 0 : -1;
 }
 extern "C" void recomp_call(X86 *c, uint32_t target) {
+    if (target == handler_search) {
+        search(c);
+        return;
+    }
+    if (target == handler_accept) {
+        accept(c);
+        return;
+    }
+    if (target == handler_continue) {
+        continue_execution(c);
+        return;
+    }
+    if (target == cleanup_handler) {
+        cleanup_accept(c);
+        return;
+    }
+    if (target == outer_handler) {
+        outer_accept(c);
+        return;
+    }
     if (target == CLEANUP) {
         cleanup_block(c);
         return;
@@ -712,12 +735,11 @@ int main(int argc, char **argv) {
         os_setenv("RECOMP_LOG", "2");
     mem_init();
     imports_init();
-    handler_search = imports_alloc_trampoline("SEH.dll", "search", search, ARGC_CDECL);
-    handler_accept = imports_alloc_trampoline("SEH.dll", "accept", accept, ARGC_CDECL);
-    handler_continue =
-        imports_alloc_trampoline("SEH.dll", "continue", continue_execution, ARGC_CDECL);
-    cleanup_handler = imports_alloc_trampoline("SEH.dll", "cleanup", cleanup_accept, ARGC_CDECL);
-    outer_handler = imports_alloc_trampoline("SEH.dll", "outer", outer_accept, ARGC_CDECL);
+    handler_search = 0x0d030000;
+    handler_accept = 0x0d030010;
+    handler_continue = 0x0d030020;
+    cleanup_handler = 0x0d030030;
+    outer_handler = 0x0d030040;
     if (diagnostic)
         return diagnostic_case(argv[1], argv[2]);
     if (argc > 1 && !strcmp(argv[1], "null-call")) {

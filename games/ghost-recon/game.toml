@@ -11,6 +11,10 @@ entry_point = 0x006f3d14
 guest_root = 'C:\Ghost Recon'
 store_hooks = false
 
+[setup]
+supported_version = "GOG 1.4"
+source_notes = "Use the GOG 1.4 game folder or the supported GOG 1.4.0.0 (19232) offline installer."
+
 [[setup.installers]]
 format = "inno"
 label = "GOG 1.4.0.0 (19232)"

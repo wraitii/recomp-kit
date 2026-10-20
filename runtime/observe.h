@@ -7,8 +7,14 @@ extern "C" {
 
 #ifdef RECOMP_NO_OBSERVE
 #define recomp_observe_on 0
-static inline void observe_indirect(uint32_t, uint32_t, const char *) {}
-static inline void observe_pend(uint32_t) {}
+static inline void observe_indirect(uint32_t site, uint32_t target, const char *kind) {
+    (void)site;
+    (void)target;
+    (void)kind;
+}
+static inline void observe_pend(uint32_t site) {
+    (void)site;
+}
 static inline uint32_t observe_take(void) {
     return 0;
 }

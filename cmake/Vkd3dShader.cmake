@@ -87,7 +87,10 @@ target_compile_definitions(vkd3d_shader PUBLIC LIBVKD3D_SHADER_SOURCE
   PACKAGE_VERSION=\"2.1\" VKD3D_DEBUG_ENV=VKD3D_SHADER_DEBUG
   HAVE_SYNC_ADD_AND_FETCH HAVE_SYNC_BOOL_COMPARE_AND_SWAP HAVE_ATOMIC_EXCHANGE_N)
 if(WIN32)
-  target_compile_definitions(vkd3d_shader PRIVATE HAVE__STRTOF_L)
+  if(NOT MINGW)
+    file(WRITE "${VKD3D_SHADER_GENERATED}/unistd.h" "#include <io.h>\n")
+  endif()
+  target_compile_definitions(vkd3d_shader PRIVATE HAVE__STRTOF_L _USE_MATH_DEFINES)
 elseif(APPLE)
   target_compile_definitions(vkd3d_shader PRIVATE HAVE_STRTOF_L HAVE_XLOCALE_H HAVE_PTHREAD_H
     _DARWIN_C_SOURCE)

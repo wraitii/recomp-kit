@@ -24,8 +24,8 @@ int mods_display_scale(void);
 int mods_display_wide(void);
 void mods_display_scene_domain(int w, int h);
 int mods_display_scene_width(int guest_w, int guest_h);
-int mods_display_overlay(void);  /* 0 off, 1 counters, 2 frame-time graph */
-int mods_display_textures(void); /* 0 original, 1 HD pack */
+int mods_display_overlay(void);   /* 0 off, 1 counters, 2 frame-time graph */
+int mods_display_textures(void);  /* 0 original, 1 HD pack */
 int mods_display_filtering(void); /* 0 original, 1 trilinear, 2 4x, 3 8x, 4 16x */
 #ifdef __cplusplus
 }

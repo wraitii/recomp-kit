@@ -13,6 +13,7 @@ void entry_0d001030(X86 *c);
 
 const int recomp_profile_enabled = 0;
 uint32_t recomp_frame_watch;
+uint32_t recomp_dispatch_epoch = 1;
 static unsigned checkpoints;
 void recomp_execution_checkpoint_due(X86 *c) {
     c->checkpoint_countdown = 0;

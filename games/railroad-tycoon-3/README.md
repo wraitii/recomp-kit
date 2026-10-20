@@ -1,8 +1,22 @@
 # Railroad Tycoon 3
 
-Native port of the GOG **Railroad Tycoon 3 (2003)** `RT3.exe` (32-bit x86, MSVC 7-era C++). This directory is the game's configuration root (`--game railroad-tycoon-3`).
+Native port of **Railroad Tycoon 3 (2003)**. Fully playable in single player
+with good performance. Networking is currently unsupported.
 
-## Build and run
+## Required copy
+
+Use the GOG release with official patch 1.05 and no unofficial user patch.
+The installation must contain `RT3.exe` and its game data. Disc editions are
+unverified.
+
+For now, use the source-build instructions below. The build needs
+`--allow-unmodelled`, which the desktop installer does not yet pass.
+
+## Build from source
+
+The reference is the GOG `RT3.exe` (32-bit x86, MSVC 7-era C++), identified in
+[game.toml](game.toml). This directory is the configuration root
+(`--game railroad-tycoon-3`).
 
 From the game repository root (the one containing `recomp-kit/`); prerequisites are in
 [CONTRIBUTING](../../CONTRIBUTING.md#prerequisites):
@@ -18,8 +32,7 @@ tools/.venv/bin/python tools/build.py --regenerate --target app --jobs 8 \
 open build/RailroadTycoon3Recomp.app
 ```
 
-The installation must contain `RT3.exe` and the installed data. Setup links it at
-`build/original`. The supported executable hash is in [game.toml](game.toml).
+Setup links the installation at `build/original` without changing its files.
 
 For subsequent builds:
 
@@ -54,6 +67,8 @@ inconclusive.
 Set `store_hooks = true` and rebuild to restore dirty-range tracking and watchpoints.
 
 ## Status
+
+Single-player gameplay is fully playable and performant. Networking is unsupported.
 
 The code map is exported and validated: 6,039 functions and 510,070
 instructions, decoded from the real executable by `tools/build.py --regenerate`

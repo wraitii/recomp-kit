@@ -486,7 +486,8 @@ static inline float recomp_sse_sqrtf(float v) {
  * writes to it. Values that round outside int32 produce the indefinite result. */
 static inline int32_t recomp_sse_cvtsd2si(double v) {
     double rounded = nearbyint(v);
-    if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0)) return INT32_MIN;
+    if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0))
+        return INT32_MIN;
     return (int32_t)rounded;
 }
 static inline int32_t recomp_sse_cvtss2si(float v) {
@@ -494,7 +495,8 @@ static inline int32_t recomp_sse_cvtss2si(float v) {
 }
 static inline int32_t recomp_sse_cvttss2si(float v) {
     double d = (double)v;
-    if (!(d >= -2147483648.0 && d < 2147483648.0)) return INT32_MIN;
+    if (!(d >= -2147483648.0 && d < 2147483648.0))
+        return INT32_MIN;
     return (int32_t)d;
 }
 
@@ -539,9 +541,12 @@ static inline uint32_t recomp_sse_rcpps(uint32_t a) {
 }
 static inline uint32_t recomp_sse_rsqrtps(uint32_t a) {
     float x = recomp_sse_f32(a);
-    if (isnan(x)) return recomp_sse_f32_bits(x);
-    if (x == 0.0f) return (a >> 31) ? 0xff800000u : 0x7f800000u;
-    if (a >> 31) return 0xffc00000u;
+    if (isnan(x))
+        return recomp_sse_f32_bits(x);
+    if (x == 0.0f)
+        return (a >> 31) ? 0xff800000u : 0x7f800000u;
+    if (a >> 31)
+        return 0xffc00000u;
     return recomp_sse_f32_bits(1.0f / recomp_sse_sqrtf(x));
 }
 static inline float recomp_sse_rcpss(float v) {
@@ -554,14 +559,30 @@ static inline uint32_t recomp_sse_cmpps(unsigned pred, uint32_t a, uint32_t b) {
     float x = recomp_sse_f32(a), y = recomp_sse_f32(b);
     int r;
     switch (pred & 7u) {
-    case 0: r = x == y; break;
-    case 1: r = x < y; break;
-    case 2: r = x <= y; break;
-    case 3: r = isnan(x) || isnan(y); break;
-    case 4: r = !(x == y); break;
-    case 5: r = !(x < y); break;
-    case 6: r = !(x <= y); break;
-    default: r = !(isnan(x) || isnan(y)); break;
+    case 0:
+        r = x == y;
+        break;
+    case 1:
+        r = x < y;
+        break;
+    case 2:
+        r = x <= y;
+        break;
+    case 3:
+        r = isnan(x) || isnan(y);
+        break;
+    case 4:
+        r = !(x == y);
+        break;
+    case 5:
+        r = !(x < y);
+        break;
+    case 6:
+        r = !(x <= y);
+        break;
+    default:
+        r = !(isnan(x) || isnan(y));
+        break;
     }
     return r ? 0xffffffffu : 0u;
 }
@@ -570,7 +591,8 @@ static inline uint32_t recomp_sse_cmpps(unsigned pred, uint32_t a, uint32_t b) {
  * x87/SSE environment and does not model guest MXCSR writes, so publish that
  * environment and a mask advertising the usual DAZ support. */
 static inline void recomp_fxsave(uint32_t addr) {
-    for (uint32_t offset = 0; offset < 512; offset += 4) wr32(addr + offset, 0u);
+    for (uint32_t offset = 0; offset < 512; offset += 4)
+        wr32(addr + offset, 0u);
     wr16(addr, 0x037fu);
     wr16(addr + 4, 0xffffu);
     wr32(addr + 0x18, 0x1f80u);

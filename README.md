@@ -1,102 +1,98 @@
 # Recomp Toolkit
 
-A static recompilation kit: 32-bit x86 Windows games become native
-applications, with no JIT and no emulator at run time. macOS is the main
-target and Linux is supported; Windows builds work too, and iOS and Android
-builds exist. You supply your own copy of each game.
+Build native versions of supported classic PC games from your own copies.
+Recomp Toolkit checks your game files, recompiles the game and packages it as
+a native app for your computer. Launch each game's app directly, with its own
+settings and game files.
+
+The desktop app handles setup and builds, with a library view for convenience.
+
+## Platforms
+
+Apple silicon (ARM) Macs are the main target. Recompiling these 32-bit x86 games
+as native ARM apps is where the toolkit is most useful.
+
+Intel Macs should also work by building the toolkit and its dependencies from
+source. Windows and Linux builds should generally work too. On x86 machines,
+recompiling x86 back to x86 adds overhead without the benefit of moving to a new
+CPU architecture, so further work is required.
+
+## Get started
+
+[Download Recomp Toolkit](https://github.com/wraitii/recomp-kit/releases/tag/latest-nightly)
+for Apple silicon Macs running macOS 14 or later. You'll need your own copy of
+one of the games below and Apple's Command Line Tools (`xcode-select --install`).
+The app includes the other build dependencies; GOG installer imports also need
+`innoextract` 1.9 or later (`brew install innoextract` with Homebrew).
+
+1. Open Recomp Toolkit and choose a game.
+2. Choose your installed game folder, a ZIP of it, or a supported GOG installer.
+   The app checks that your copy matches the required version.
+3. Choose where to install the native app. Follow any preparation instructions,
+   then choose **Install**. Building happens on your computer and can take
+   several minutes or longer; leave room for the game files and temporary builds.
+4. Open the finished game's app, or choose **Start game** in Recomp Toolkit.
 
 ## Games
 
-Each game lives in `games/<id>/` with its own setup, build and status notes in
-`games/<id>/README.md`. Games are kept in their own repositories, each with this
-kit as a submodule.
+The games below are playable in single player, with Spore still in development.
+Networking is currently unsupported across the toolkit. Each game's page lists
+the required release and preparation steps.
 
-| Game | Status | Version | Notes |
-|---|---|---|---|
-| Black & White | Playable | CD with the 1.42 fan patch | [games/black-and-white](games/black-and-white/README.md) |
-| Tom Clancy's Ghost Recon | Playable | GOG 1.4 | [games/ghost-recon](games/ghost-recon/README.md) |
-| Railroad Tycoon 3 | Bring-up | GOG | [games/railroad-tycoon-3](games/railroad-tycoon-3/README.md) |
-| Civilization IV: Beyond the Sword | Playable | GOG | [games/civ4-bts](games/civ4-bts/README.md) |
-| 4x4 Evolution 2 | Playable | PC | [games/4x4-evo2](games/4x4-evo2/README.md) |
+| Game | Status | Required version |
+| --- | --- | --- |
+| [Black & White](games/black-and-white/README.md) | Playable | CD with Fan Patch 1.42 |
+| [Tom Clancy's Ghost Recon](games/ghost-recon/README.md) | Playable | GOG 1.4 |
+| [Civilization IV: Beyond the Sword](games/civ4-bts/README.md) | Playable | GOG 3.19; additional DLL required |
+| [4x4 Evolution 2](games/4x4-evo2/README.md) | Playable | PC 1.00.139 with matching renderer DLLs |
+| [Railroad Tycoon 3](games/railroad-tycoon-3/README.md) | Playable | GOG 1.05 |
+| [Spore](games/spore/README.md) | Work in progress | GOG Collection, Galactic Adventures 3.1.0.22 |
 
-## Recomp Toolkit
+Performance is generally good, with occasional slowdowns still being worked on,
+mostly in Civilization IV and Spore. Game execution is currently single-threaded:
+the game's threads run one at a time. This has little impact on the games ported
+so far. Rare crashes from incorrect code mappings are also possible.
 
-Recomp Toolkit imports installed folders, ZIPs and GOG Inno installers
-with exact version checks, and offers an assisted drop folder for manual preparation.
-Installer imports require `innoextract` 1.9 or later (on macOS: `brew install innoextract`)
-and recognize supported games by extracting and hashing only executable candidates
-and required modules, with data paths checked against the installer listing.
-Full extraction validates a private copy of the EXE and accompanying Inno BIN slices;
-external RAR payloads remain unsupported. Each game's optional `setup.installers`
-recipes supply verified layout adjustments for known releases. The library never
-executes installers. Other installers and disc images are reference-only. ZIP imports reject
-unsafe paths, links and special files and enforce entry and expanded-size limits.
-Black & White needs an installed folder with the fan patch.
+## Your installed apps
 
-On macOS, an installed folder contains the game app, a native Configure app,
-`original/`, and `.recomp-toolkit/installation.json`. The manifest keeps executable and
-data-root paths relative to that folder, so the app resolves them from its own
-location, including beneath a checkout. Resolution order is command-line override,
-`RECOMP_EXE`, installed manifest, checkout detection, then a saved executable path.
-An invalid installed manifest reports an error instead of selecting another copy.
-Configure reads its target from the manifest and shares the game's profile and
-installation lock. Profiles use the manifest identity under the platform user-data
-directory, so renaming the game folder does not change the profile key.
+**Game files.** You supply the games; downloads contain no commercial game files.
+The app copies your files into the destination you choose. Keep the whole
+installed folder together, including the game app, its Configure app,
+`original/` and `.recomp-toolkit/`.
 
-Publication stages both apps on the destination volume, retains backups, and
-replaces the manifest last. Rebuilds use and preserve the installed `original/`;
-importing another copy requires a new destination. Validated retries retain build
-outputs, and dependency caches remain reusable between jobs. The registry changes
-after publication. Use **Locate game folder** to attach a moved installation
-without rebuilding. Keep both apps, `original/` and `.recomp-toolkit/` together. macOS is
-the library's installation target for this pass; Windows/Linux installed layouts,
-direct launches after a move, interruption recovery and Gatekeeper prompts remain
-unverified. Copying and renaming the built game bundle preserves its signature and
-executable permission; that check does not establish launch behavior.
+**Installers and patches.** Supported GOG Inno installers can be extracted
+without running them. Keep accompanying BIN files beside the installer.
+Other installers and disc images need preparation outside Recomp Toolkit;
+select the resulting installed folder afterward. Apply any required patches
+before importing, including Black & White's Fan Patch 1.42.
 
-## Building from source
+**Settings.** Open the installed game's Configure app to adjust its settings
+and controller mappings. Launch the game directly whenever you want to play;
+Recomp Toolkit doesn't need to be open.
 
-From a game's repository root (the one containing `recomp-kit/`), with the game's
-`tools/build.py` wrapper:
-
-```sh
-python3 -m venv tools/.venv && tools/.venv/bin/pip install -r recomp-kit/requirements-dev.txt
-RECOMP_BUILD_ROOT=$PWD/build tools/.venv/bin/python recomp-kit/tools/setup.py \
-  --game <id> --install "/path/to/installed game"
-tools/.venv/bin/python tools/build.py --regenerate
-```
-
-Setup checks the executable against `game.toml` and links your installation;
-no game files are copied or changed. A game's `README.md` gives its exact commands
-and notes. Without a game repository, `tools/build.py --game <id>` in this kit
-builds into `build/<id>/`. `tools/build.py --target toolkit` builds Recomp Toolkit.
-On arm64 macOS, add `--package-toolkit --toolkit-python-root /path/to/python`
-with a standalone Python installation to bundle the source kit, conversion tools,
-CMake, Ninja, SDL and FFmpeg development files, Lua, and the Rust renderer. The
-`Recomp Toolkit` workflow builds and relocates this package without game files;
-its ad hoc signed artifact targets macOS 14 and still needs Apple Command Line
-Tools to compile games locally. Developer ID signing and notarization are not yet
-part of that workflow. Prerequisites, other targets and adding a game are in
-[CONTRIBUTING.md](CONTRIBUTING.md).
+**Trouble installing?** Check the required version on the game's page. If build
+tools are missing, follow the app's instructions and choose **Check again**.
+For a failed installation, expand **Installation details** and use **Try again**
+after resolving the reported problem. Include the game version and installation
+log when [reporting an issue](https://github.com/wraitii/recomp-kit/issues).
 
 ## How it works
 
-Translation reads the game's code map (function spans from Ghidra, no
-instruction bytes) and the executable, lifts each function with SLEIGH and
-emits SSA-based C ([docs/ir.md](docs/ir.md)). The runtime provides guest memory,
-threads and the Win32 and DirectX surface the game expects
-([docs/architecture.md](docs/architecture.md)), and native hosts draw through
-Metal or Vulkan. [docs/code-guide.md](docs/code-guide.md) maps behavior to
-source.
+Static recompilation translates the original game's 32-bit x86 Windows machine
+code into native code ahead of time. The toolkit supplies the operating-system,
+graphics and audio interfaces the game expects. The resulting app runs without
+a CPU emulator or JIT, using your game's original data. Each port includes
+translation metadata for the exact executable it supports.
 
-| Directory | What it holds |
-|---|---|
-| `runtime/` | x86 semantics (`x86.h`), guest memory, PE loader, scheduler, kernel32/user32 shims |
-| `dx/` | DirectX and media shims: DirectDraw through Direct3D 11, DirectSound/WinMM, DirectInput/XInput, Miles, QMixer, FMOD, Bink, DirectShow, Media Foundation |
-| `host/` | SDL3 host, Metal/Vulkan/fake GPU backends, audio mixer, presentation |
-| `platform/` | `os.h`, the only place that talks to the operating system |
-| `mods/` | the mod foundation (Lua 5.4), loader and lifecycle services |
-| `games/<id>/` | one game's `game.toml`, code map and native replacements |
-| `desktop/`, `web/` | the desktop library, browser launcher and player |
-| `tools/` | translator, build and test scripts |
-| `third_party/` | vendored Lua, TinySoundFont, minimp3, stb_truetype, volk, Vulkan headers |
+## Development and porting
+
+The desktop app is the recommended way to install supported games. To work on
+the toolkit or bring another game to it, start with [Contributing](CONTRIBUTING.md):
+
+- [Build from source](CONTRIBUTING.md#prerequisites), including the desktop app.
+- [Port a new game](CONTRIBUTING.md#add-a-game).
+- Explore the [architecture](docs/architecture.md), [code guide](docs/code-guide.md)
+  and [translator](docs/ir.md).
+
+Source builds cover Intel Macs, Windows and Linux, plus iOS and Android targets.
+The packaged desktop app targets Apple silicon Macs.

@@ -1,8 +1,8 @@
-recomp-kit is a static recompilation kit. Every game it builds is represented
-by its own repository, which carries that game's notices. Original game names,
-executable code, artwork, audio, levels and other data retain their original
-ownership and notices; this project is not affiliated with or endorsed by any
-game's publisher.
+Recomp Toolkit builds native apps from classic PC games using static
+recompilation. Each game's repository carries its game-specific notices.
+Original game names, executable code, artwork, audio, levels and other data
+retain their original ownership and notices; this project is not affiliated
+with or endorsed by any game's publisher.
 
 The handwritten native host, compatibility runtime, translator, build/test
 tools and project documentation are covered by LICENSE. Generated translations

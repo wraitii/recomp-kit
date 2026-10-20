@@ -102,8 +102,8 @@ static uint32_t set_pixel_shader(X86 *c, const uint32_t *a) {
     return 0;
 }
 
-static uint32_t shadow_constants(const uint32_t *a, uint32_t data, uint32_t capacity,
-                                 uint32_t low, uint32_t high) {
+static uint32_t shadow_constants(const uint32_t *a, uint32_t data, uint32_t capacity, uint32_t low,
+                                 uint32_t high) {
     uint32_t shadow = rd32(rd32(a[0] + STATE_MANAGER_OWNER) + OWNER_CONSTANTS);
     uint32_t reg = a[1], source = a[2], end = a[1] + a[3];
     if (end > rd32(shadow + capacity))

@@ -5,13 +5,6 @@ on:
   pull_request:
   push:
     branches: [main]
-    paths:
-      - desktop/library/**
-      - web/library/**
-      - tools/**
-      - cmake/**
-      - dx/CMakeLists.txt
-      - .github/workflows/toolkit.yml
 
 permissions:
   contents: read
@@ -32,6 +25,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Install parser generators
+        run: brew install bison flex
       - name: Restore native dependency caches
         id: cache
         uses: actions/cache/restore@v4
@@ -51,7 +46,7 @@ jobs:
           echo "994adadc202c5df0b4570192cc9a70e3f2c131e512f4a125c56efa8562f44b28  $RUNNER_TEMP/python.tar.gz" | shasum -a 256 -c -
           mkdir -p "$RUNNER_TEMP/standalone"
           tar -xzf "$RUNNER_TEMP/python.tar.gz" -C "$RUNNER_TEMP/standalone"
-          "$RUNNER_TEMP/standalone/python/bin/python3" -m pip install cmake==4.1.2 ninja==1.13.0
+          "$RUNNER_TEMP/standalone/python/bin/python3" -m pip install cmake==4.1.2 ninja==1.13.0 -r tools/requirements.txt
           echo "$RUNNER_TEMP/standalone/python/bin" >> "$GITHUB_PATH"
       - name: Build portable application without game files
         run: >-
@@ -77,7 +72,7 @@ jobs:
           name: recomp-toolkit-macos-arm64
           path: build/toolkit/recomp-toolkit-macos-arm64.zip
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90
       - name: Preserve build caches
         if: ${{ !cancelled() && steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4

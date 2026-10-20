@@ -35,8 +35,8 @@
 void fn_00803c00(X86 *c);
 
 enum {
-  G_LEVEL_OF_DETAIL = 0x00c3813cu, /* float, preset/options LOD scale */
-  G_OBJECT_LOD_MAX = 0x00c37ec8u,  /* float, object band multiplier clamp */
+    G_LEVEL_OF_DETAIL = 0x00c3813cu, /* float, preset/options LOD scale */
+    G_OBJECT_LOD_MAX = 0x00c37ec8u,  /* float, object band multiplier clamp */
 };
 
 /* Terrain band groups and the distance fields inside each. */
@@ -46,24 +46,24 @@ static const uint32_t kTerrainDistanceOffsets[] = {0x1cu, 0x20u, 0x24u};
 enum { DEFAULT_LEVEL = 3, DEFAULT_MAX = 50, DEFAULT_TERRAIN = 3 };
 
 static int lod_off(void) {
-  const char *v = getenv("RECOMP_LOD_OFF");
-  return v && v[0] == '1' && v[1] == '\0';
+    const char *v = getenv("RECOMP_LOD_OFF");
+    return v && v[0] == '1' && v[1] == '\0';
 }
 
 /* Parse a whole-string float. Returns 0 and leaves *out untouched when the
  * variable is absent or not a number. */
 static int env_float(const char *name, float *out) {
-  const char *v = getenv(name);
-  if (!v || !*v)
-    return 0;
-  char *end = NULL;
-  const double d = strtod(v, &end);
-  if (end == v || *end || d != d) {
-    fprintf(stderr, "recomp: %s=%s is not a number; ignored\n", name, v);
-    return 0;
-  }
-  *out = (float)d;
-  return 1;
+    const char *v = getenv(name);
+    if (!v || !*v)
+        return 0;
+    char *end = NULL;
+    const double d = strtod(v, &end);
+    if (end == v || *end || d != d) {
+        fprintf(stderr, "recomp: %s=%s is not a number; ignored\n", name, v);
+        return 0;
+    }
+    *out = (float)d;
+    return 1;
 }
 
 // @port 0x00803c00 0% rendering,verify,divergence
@@ -75,33 +75,33 @@ static int env_float(const char *name, float *out) {
 // option, not a reconstruction of original behavior; RECOMP_LOD_OFF=1 disables
 // it and restores the preset exactly.
 void bw_island_create(X86 *c) {
-  fn_00803c00(c);
-  if (lod_off())
-    return;
+    fn_00803c00(c);
+    if (lod_off())
+        return;
 
-  float level = (float)DEFAULT_LEVEL;
-  float max = (float)DEFAULT_MAX;
-  float terrain = (float)DEFAULT_TERRAIN;
-  env_float("RECOMP_LOD_LEVEL", &level);
-  env_float("RECOMP_LOD_MAX", &max);
-  env_float("RECOMP_LOD_TERRAIN", &terrain);
+    float level = (float)DEFAULT_LEVEL;
+    float max = (float)DEFAULT_MAX;
+    float terrain = (float)DEFAULT_TERRAIN;
+    env_float("RECOMP_LOD_LEVEL", &level);
+    env_float("RECOMP_LOD_MAX", &max);
+    env_float("RECOMP_LOD_TERRAIN", &terrain);
 
-  wrf32(G_LEVEL_OF_DETAIL, level);
-  wrf32(G_OBJECT_LOD_MAX, max);
-  if (terrain > 0.0f && terrain != 1.0f) {
-    for (size_t g = 0; g < sizeof(kTerrainGroups) / sizeof(kTerrainGroups[0]); ++g) {
-      for (size_t i = 0;
-           i < sizeof(kTerrainDistanceOffsets) / sizeof(kTerrainDistanceOffsets[0]); ++i) {
-        const uint32_t addr = kTerrainGroups[g] + kTerrainDistanceOffsets[i];
-        wrf32(addr, rdf32(addr) * terrain);
-      }
+    wrf32(G_LEVEL_OF_DETAIL, level);
+    wrf32(G_OBJECT_LOD_MAX, max);
+    if (terrain > 0.0f && terrain != 1.0f) {
+        for (size_t g = 0; g < sizeof(kTerrainGroups) / sizeof(kTerrainGroups[0]); ++g) {
+            for (size_t i = 0;
+                 i < sizeof(kTerrainDistanceOffsets) / sizeof(kTerrainDistanceOffsets[0]); ++i) {
+                const uint32_t addr = kTerrainGroups[g] + kTerrainDistanceOffsets[i];
+                wrf32(addr, rdf32(addr) * terrain);
+            }
+        }
     }
-  }
 
-  static int reported = 0;
-  if (!reported) {
-    reported = 1;
-    fprintf(stderr, "[recomp] lod: level=%.3f max=%.3f terrain=x%.3f\n",
-            (double)level, (double)max, (double)terrain);
-  }
+    static int reported = 0;
+    if (!reported) {
+        reported = 1;
+        fprintf(stderr, "[recomp] lod: level=%.3f max=%.3f terrain=x%.3f\n", (double)level,
+                (double)max, (double)terrain);
+    }
 }

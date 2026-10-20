@@ -47,6 +47,7 @@ static uint32_t call_shim(uint32_t target, std::initializer_list<uint32_t> args)
     g_cpu.r[R_ESP] = esp;
     uint32_t before = esp;
 
+    g_cpu.checkpoint_countdown = 0;
     if (!imports_dispatch(&g_cpu, target)) {
         fprintf(stderr, "FAIL: %08x is not a shim trampoline\n", target);
         ++g_failures;
@@ -95,6 +96,7 @@ static uint32_t call_method(uint32_t iface_ptr, uint32_t slot,
     wr32(esp, RET);
     g_cpu.r[R_ESP] = esp;
     uint32_t before = esp;
+    g_cpu.checkpoint_countdown = 0;
     if (!imports_dispatch(&g_cpu, target)) {
         fprintf(stderr, "FAIL: vtable slot %u holds %08x, not a trampoline\n", slot, target);
         ++g_failures;

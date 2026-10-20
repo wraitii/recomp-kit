@@ -1,18 +1,27 @@
 # Tom Clancy's Ghost Recon (2001)
 
-Native port of the GOG 1.4 **Tom Clancy's Ghost Recon**. Expansions (Desert Siege,
-Island Thunder) use the same executable with their expansion data. This directory
-is the game's configuration root (`--game ghost-recon`).
+Native port of **Tom Clancy's Ghost Recon (2001)**, using GOG 1.4. Fully playable
+in single player with good performance. Networking is currently unsupported.
+Desert Siege and Island Thunder use the same executable with their expansion data.
 
-## Setup and build
+## Install with Recomp Toolkit
 
-In Recomp Toolkit, choose `setup_tom_clancys_ghost_recon_1.4.0.0_(19232).exe`
-to import the GOG release, including Desert Siege and Island Thunder. Install
-`innoextract` 1.9 or later first (`brew install innoextract` on macOS). The recipe
-records the verified installer checksum, expanded size and relocation of
+In [Recomp Toolkit](../../README.md#get-started), choose **Tom Clancy's Ghost
+Recon** and select your GOG 1.4 game folder or
+`setup_tom_clancys_ghost_recon_1.4.0.0_(19232).exe`. Installer imports include
+Desert Siege and Island Thunder and need `innoextract` 1.9 or later
+(`brew install innoextract` on macOS). Choose a destination and select **Install**,
+then **Start game** when the build finishes.
+
+Ctrl+Option+M releases mouse capture. `RECOMP_FXAA=1` enables optional scene
+antialiasing.
+
+## Build from source
+
+This directory is the game's configuration root (`--game ghost-recon`). The
+installer recipe records the verified checksum, expanded size and relocation of
 `__support/app/Data/Save/Script/default.ass` to `Data/Save/Script/default.ass`,
-matching the installed copy. Extraction produces the supported executable
-without running setup or applying patches.
+matching the installed copy. Extraction does not run setup or apply patches.
 
 From the game repository root (the one containing `recomp-kit/`):
 
@@ -35,9 +44,6 @@ the executable with the code map in `metadata/`. Prerequisites are in
 `tools/build.py` in the game repository forwards to the kit with `--game ghost-recon`
 and outputs in `build/`; `--projection-cull-tests` and `--port-tab-tests` replay the
 native replacements against their translated originals.
-
-Ctrl+Option+M releases mouse capture. `RECOMP_FXAA=1` enables optional scene
-antialiasing.
 
 ## Code map
 

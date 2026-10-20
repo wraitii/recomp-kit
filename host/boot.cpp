@@ -784,8 +784,7 @@ void boot_print_undeliverable(FILE *out) {
         fprintf(out, "    target %08x  called from the instruction before %08x\n", u.target, u.ret);
     // With RECOMP_DISCOVERY set, these addresses are also on disk. See runtime/discovery.h.
     if (recomp_env("DISCOVERY"))
-        fprintf(out, "  %u of them recorded in %s\n", discovery_count(),
-                recomp_env("DISCOVERY"));
+        fprintf(out, "  %u of them recorded in %s\n", discovery_count(), recomp_env("DISCOVERY"));
 }
 
 void boot_print_import_stats(FILE *out, bool abnormal) {

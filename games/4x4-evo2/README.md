@@ -1,13 +1,25 @@
 # 4x4 Evolution 2
 
-Native port of PC **4x4 Evolution 2**: the supported executable identity, the
-exported code map, the native replacements and the renderer configuration. This
-directory is the game's configuration root (`--game 4x4-evo2`).
+Native port of **4x4 Evolution 2**, using PC version 1.00.139 and its matching
+Direct3D renderer DLLs. Fully playable in single player with good performance.
+Networking is currently unsupported. A bug is under investigation that may also
+occur in the original game.
 
-`game.toml` records the supported executable identity and translation settings;
-`metadata/` holds the exported code map without instruction contents or names.
+## Install with Recomp Toolkit
 
-## Setup and build
+In [Recomp Toolkit](../../README.md#get-started), choose **4x4 Evolution 2** and
+select the game folder containing `4x42.exe`, `tridx8.dll` and `tridx8tl.dll`.
+Choose a destination and select **Install**, then **Start game** when the build
+finishes. The OpenGL renderer (`TRIGL.DLL`) is unsupported.
+
+Open the installed game's Configure app for settings and **Controller setup**.
+Controller presets, mapping and calibration are described below.
+
+## Build from source
+
+This directory is the configuration root (`--game 4x4-evo2`). `game.toml` records
+the supported executable identity and translation settings; `metadata/` holds
+the code map without instruction contents or names.
 
 From the game repository root (the one containing `recomp-kit/`):
 

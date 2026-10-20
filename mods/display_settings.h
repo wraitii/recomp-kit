@@ -2,11 +2,7 @@
 #include "../runtime/display_seam.h"
 #include "pop_mod_api.h"
 #include <string>
-enum DisplayRow {
-    DISPLAY_WINDOW,
-    DISPLAY_OVERLAY,
-    DISPLAY_ROW_COUNT
-};
+enum DisplayRow { DISPLAY_WINDOW, DISPLAY_OVERLAY, DISPLAY_ROW_COUNT };
 // game.toml [settings] rows sets one bit per row in RECOMP_SETTINGS_ROWS, in
 // the order above; the controls rows share the bit after the display rows.
 constexpr int DISPLAY_CONTROLS_BIT = DISPLAY_ROW_COUNT;

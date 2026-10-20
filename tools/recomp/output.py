@@ -34,17 +34,36 @@ BODY_HEADER = """/* generated -- translated bodies do not depend on replacement 
 #endif
 """
 
-ENTRY_STUB_PRELUDE = """#include "x86.h"
+ENTRY_STUB_INCLUDES = """#include "x86.h"
 #ifdef RECOMP_OVERRIDE_HEADER
 #include RECOMP_OVERRIDE_HEADER
 #endif
-void recomp_enter(X86 *c, uint32_t index);
+"""
+
+ENTRY_STUB_PRELUDE = ENTRY_STUB_INCLUDES + """void recomp_enter(X86 *c, uint32_t index);
 #define RECOMP_SLOW_(i) RECOMP_UNLIKELY(__atomic_load_n(&recomp_slow[i], __ATOMIC_RELAXED))
 #define RECOMP_ENTER(i, base) \\
     do { recomp_execution_checkpoint(c); if (RECOMP_SLOW_(i)) recomp_enter(c, i); else base; } while (0)
 #define RECOMP_ENTER_CHECKED(i, body, base) \\
     do { recomp_execution_checkpoint(c); \\
          if (RECOMP_SLOW_(i)) recomp_enter_checked(c, i, expected, body); else base; } while (0)
+"""
+
+MODULE_ENTRY_STUB_PRELUDE = ENTRY_STUB_INCLUDES + """
+extern uint8_t recomp_%(key)s_hooked[];
+void recomp_enter_%(key)s(X86 *c, uint32_t index);
+void recomp_hook_%(key)s(X86 *c, uint32_t index);
+#define RECOMP_ENTER(i, base) \\
+    do { \\
+        if (RECOMP_UNLIKELY(recomp_profile_enabled || recomp_frame_watch)) \\
+            recomp_enter_%(key)s(c, i); \\
+        else { \\
+            recomp_execution_checkpoint(c); \\
+            if (RECOMP_UNLIKELY(__atomic_load_n(&recomp_%(key)s_hooked[i], __ATOMIC_ACQUIRE))) \\
+                recomp_hook_%(key)s(c, i); \\
+            else base; \\
+        } \\
+    } while (0)
 """
 
 
@@ -81,7 +100,7 @@ def partition_chunks(functions, bodies, budget=CHUNK_SOURCE_BUDGET):
     return sorted(result)
 
 
-def emit_body_chunks(out, functions, bodies, entries_by_fn, dependencies, known_modes=()):
+def emit_body_chunks(out, functions, bodies, entries_by_fn, dependencies, known_modes=(), module=None):
     """Emit local call declarations: no global census, indices or overrides."""
     Path(out, "body.h").write_text(BODY_HEADER)
     paths = []
@@ -103,7 +122,8 @@ def emit_body_chunks(out, functions, bodies, entries_by_fn, dependencies, known_
             if any('arena_' in body for body in text.values()):
                 fh.write(memory_helpers())
             if any('recomp_return_fast_' in body for body in text.values()):
-                fh.write(TABLE_RETURN_HELPERS)
+                prefix = "recomp_%s_" % module["key"] if module else "recomp_"
+                fh.write(TABLE_RETURN_HELPERS.replace("recomp_call_return_", prefix + "call_return_"))
             if any('recomp_fcom_(' in body for body in text.values()):
                 fh.write(FLOAT_HELPERS)
             for cache in caches:
@@ -144,22 +164,16 @@ def emit_entry_chunks(out, entry_names, module=None, checked_returns=(), private
     for bucket, entries in sorted(groups.items()):
         path = Path(out, "chunk_entries_%08x.c" % (bucket << ENTRY_ADDRESS_BITS))
         with path.open("w") as fh:
-            # Thunks never inspect CPU state; edits to inline instruction
-            # helpers must not invalidate them along with the actual bodies.
             fh.write('/* generated stable entry thunks -- do not edit */\n')
             if module:
-                fh.write('#include <stdint.h>\ntypedef struct X86 X86;\n')
-                enter = "recomp_enter_%s" % module["key"]
-                fh.write("void %s(X86 *c, uint32_t index);\n" % enter)
-                for index, addr in entries:
-                    fh.write("void entry_%08x(X86 *c) { %s(c, %du); }\n" % (addr, enter, index))
+                fh.write(MODULE_ENTRY_STUB_PRELUDE % module)
             else:
                 fh.write(ENTRY_STUB_PRELUDE)
-                for index, addr in entries:
-                    fh.write("#ifndef FN_%08x\n#define FN_%08x fn_%08x\n#define RECOMP_RAW_%08x\n#endif\n"
-                             "void FN_%08x(X86 *c);\n"
-                             "void entry_%08x(X86 *c) { RECOMP_ENTER(%du, FN_%08x(c)); }\n"
-                             % (addr, addr, addr, addr, addr, addr, index, addr))
+            for index, addr in entries:
+                fh.write("#ifndef FN_%08x\n#define FN_%08x fn_%08x\n#define RECOMP_RAW_%08x\n#endif\n"
+                         "void FN_%08x(X86 *c);\n"
+                         "void entry_%08x(X86 *c) { RECOMP_ENTER(%du, FN_%08x(c)); }\n"
+                         % (addr, addr, addr, addr, addr, addr, index, addr))
             private = [(i, a) for i, a in entries if private_masks and a in private_masks]
             if private:
                 for index, addr in private:
@@ -280,6 +294,23 @@ def write_funcs_header(out, entry_names):
         fh.write("#endif\n")
 
 
+def write_call_return_bitmap(fh, call_returns, prefix="recomp_"):
+    if call_returns:
+        first = call_returns[0]
+        words = [0] * (((call_returns[-1] - first) >> 5) + 1)
+        for addr in call_returns:
+            offset = addr - first
+            words[offset >> 5] |= 1 << (offset & 31)
+    else:
+        first, words = 0, [0]
+    fh.write("const uint32_t %scall_return_min = 0x%08xu;\n" % (prefix, first))
+    fh.write("const uint32_t %scall_return_span = %du;\n" % (prefix, len(words) * 32))
+    fh.write("const uint32_t %scall_return_bits[] = {\n" % prefix)
+    for word in words:
+        fh.write("    0x%08xu,\n" % word)
+    fh.write("};\n")
+
+
 def write_table(out, entry_names, functions, call_returns, private_masks=None, known_modes=(), regions=()):
     with open(os.path.join(out, "table.c"), "w") as fh:
         fh.write("/* generated by tools/recomp/driver.py -- do not edit */\n")
@@ -334,20 +365,7 @@ def write_table(out, entry_names, functions, call_returns, private_masks=None, k
         # every guest RET (7.4% self in a windowed profile); the bitset is
         # one array read. recomp_call_returns stays emitted as the source of
         # truth the translator's differential test compares the bitset to.
-        if call_returns:
-            cr_min = call_returns[0]
-            cr_words = [0] * (((call_returns[-1] - cr_min) >> 5) + 1)
-            for a in call_returns:
-                off = a - cr_min
-                cr_words[off >> 5] |= 1 << (off & 31)
-        else:
-            cr_min, cr_words = 0, [0]
-        fh.write("const uint32_t recomp_call_return_min = 0x%08xu;\n" % cr_min)
-        fh.write("const uint32_t recomp_call_return_span = %du;\n" % (len(cr_words) * 32))
-        fh.write("const uint32_t recomp_call_return_bits[] = {\n")
-        for w in cr_words:
-            fh.write("    0x%08xu,\n" % w)
-        fh.write("};\n")
+        write_call_return_bitmap(fh, call_returns)
         fh.write("""int recomp_is_call_return(uint32_t target)
 {
     uint32_t off = target - recomp_call_return_min;
@@ -563,7 +581,9 @@ def write_module_table(out, entry_names, functions, call_returns, module):
         fh.write("};\nstatic const uint32_t %sreturns[] = {\n" % prefix)
         for addr in call_returns or [0]:
             fh.write("    0x%08xu,\n" % addr)
-        fh.write("};\nstatic const char *const %snames[] = {\n" % prefix)
+        fh.write("};\n")
+        write_call_return_bitmap(fh, call_returns, prefix)
+        fh.write("static const char *const %snames[] = {\n" % prefix)
         for symbol in functions:
             fh.write("    %s,\n" % json.dumps(symbol["name"]))
         fh.write("};\nstatic void (*const %sbase[])(X86 *) = {\n" % prefix)
@@ -574,16 +594,18 @@ def write_module_table(out, entry_names, functions, call_returns, module):
         fh.write("static RecompHookFn %shooks[] = {\n" % prefix)
         for _ in entry_names:
             fh.write("    %srun,\n" % prefix)
-        fh.write("};\nstatic uint8_t %shooked[%d];\n" % (prefix, len(entry_names)))
+        fh.write("};\nuint8_t %shooked[%d];\n" % (prefix, len(entry_names)))
+        fh.write("void recomp_hook_%s(X86 *c, uint32_t i)\n{\n" % key)
+        fh.write("    x86_cc_settle(c); %shooks[i](c, i);\n}\n" % prefix)
         fh.write("void recomp_enter_%s(X86 *c, uint32_t i)\n{\n" % key)
         fh.write("    if (!recomp_profile_enabled && !recomp_frame_watch) {\n")
         fh.write("        recomp_execution_checkpoint(c);\n")
-        fh.write("        if (%shooked[i]) { x86_cc_settle(c); %shooks[i](c, i); }\n" % (prefix, prefix))
+        fh.write("        if (__atomic_load_n(&%shooked[i], __ATOMIC_ACQUIRE)) recomp_hook_%s(c, i);\n" % (prefix, key))
         fh.write("        else %sbase[i](c);\n        return;\n    }\n" % prefix)
         fh.write("    RecompSaved saved_; recomp_save(c, &saved_);\n")
         fh.write("    recomp_execution_checkpoint(c);\n")
         fh.write("    if (recomp_profile_enabled) recomp_profile_push(i);\n")
-        fh.write("    if (%shooked[i]) { x86_cc_settle(c); %shooks[i](c, i); }\n" % (prefix, prefix))
+        fh.write("    if (__atomic_load_n(&%shooked[i], __ATOMIC_ACQUIRE)) recomp_hook_%s(c, i);\n" % (prefix, key))
         fh.write("    else %sbase[i](c);\n" % prefix)
         fh.write("    if (recomp_profile_enabled) recomp_profile_pop();\n")
         fh.write("    if (recomp_frame_watch) recomp_check_saved(c, %saddrs[i], &saved_);\n}\n" % prefix)

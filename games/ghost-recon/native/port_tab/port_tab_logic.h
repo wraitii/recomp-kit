@@ -14,6 +14,5 @@ int gr_wide_eq(const uint16_t *s, const char *ascii);
 /* Widget name: the RSString at widget+0x20 holds a control block pointer at
  * +4 whose +4 is the wide buffer (FUN_0056c4e0's double indirection). */
 const uint16_t *gr_widget_name(const uint8_t *mem, uint32_t widget);
-uint32_t gr_child_by_name(const uint8_t *mem, uint32_t container,
-                          const char *ascii);
+uint32_t gr_child_by_name(const uint8_t *mem, uint32_t container, const char *ascii);
 #endif

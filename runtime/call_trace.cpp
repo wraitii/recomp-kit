@@ -46,9 +46,13 @@ extern "C" {
 __attribute__((weak)) const uint32_t recomp_func_addrs[] = {0};
 __attribute__((weak)) const uint32_t recomp_func_count = 0;
 __attribute__((weak)) void (*const recomp_base_ptrs[])(X86 *c) = {nullptr};
+__attribute__((weak)) void (*const recomp_raw_ptrs[])(X86 *c) = {nullptr};
 __attribute__((weak)) RecompHookFn recomp_hook_ptrs[] = {nullptr};
 __attribute__((weak)) uint8_t recomp_hooked[] = {0};
 __attribute__((weak)) uint8_t recomp_slow[] = {0};
+__attribute__((weak)) int recomp_region_enter(X86 *, uint32_t) {
+    return 0;
+}
 }
 
 namespace {

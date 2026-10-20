@@ -20,7 +20,7 @@ struct AuxSpec {
 const AuxSpec expected_aux[] = RECOMP_AUX_MODULES;
 
 std::string parent(const std::string &path) {
-    const size_t slash = path.find_last_of('/');
+    const size_t slash = path.find_last_of("/\\");
     return slash == std::string::npos ? std::string() : path.substr(0, slash);
 }
 
@@ -57,10 +57,22 @@ InstallationManifest installation_manifest_location_for_process() {
     char executable[4096];
     if (os_exe_path(executable, sizeof executable) != 0)
         return result;
-    const std::string bundle = parent(parent(parent(executable)));
-    if (bundle.size() < 5 || bundle.compare(bundle.size() - 4, 4, ".app") != 0)
-        return result;
-    std::string folder = parent(bundle);
+    std::string process_path = executable;
+    for (char &c : process_path)
+        if (c == '\\')
+            c = '/';
+    std::string folder;
+    if (strcmp(os_platform_name(), "macos") == 0) {
+        const std::string bundle = parent(parent(parent(process_path)));
+        if (bundle.size() < 5 || bundle.compare(bundle.size() - 4, 4, ".app") != 0)
+            return result;
+        folder = parent(bundle);
+    } else {
+        const std::string directory = parent(process_path);
+        if (directory.size() < 4 || directory.compare(directory.size() - 4, 4, "/app") != 0)
+            return result;
+        folder = parent(directory);
+    }
     const std::string metadata_dir = folder + "/.recomp-toolkit";
     const std::string candidate = folder + "/.recomp-toolkit/installation.json";
     OsStat metadata{}, st{};
@@ -152,7 +164,10 @@ InstallationManifest installation_manifest_for_process() {
         return result;
     }
     const std::string expected_game =
-        std::string(RECOMP_APP_NAME) + ".app/Contents/MacOS/" + RECOMP_APP_NAME;
+        strcmp(os_platform_name(), "macos") == 0
+            ? std::string(RECOMP_APP_NAME) + ".app/Contents/MacOS/" + RECOMP_APP_NAME
+            : std::string("app/") + RECOMP_APP_NAME +
+                  (strcmp(os_platform_name(), "windows") == 0 ? ".exe" : "");
     const std::string expected_configure =
         std::string("Configure ") + RECOMP_GAME_NAME + ".app/Contents/MacOS/ConfigureLauncher";
     if (launch_paths->str("game", "") != expected_game ||

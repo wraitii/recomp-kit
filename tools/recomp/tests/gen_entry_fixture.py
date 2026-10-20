@@ -27,7 +27,10 @@ def write(out):
         addresses[2]: {Declaration("entry", addresses[0])},
         addresses[3]: {Declaration("entry", addresses[1])},
     }
-    T.emit_body_chunks(out, functions, bodies, {}, dependencies)
+    chunks = T.emit_body_chunks(out, functions, bodies, {}, dependencies)
+    if len(chunks) != 1:
+        raise ValueError("The dispatch fixture must fit in one body chunk")
+    Path(chunks[0]).replace(out / "fixture_body.c")
     T.emit_entry_chunks(out, addresses)
     (out / "fixture_overrides.h").write_text("#define FN_0d001000 fixture_native\n")
     (out / "fixture_table.c").write_text('''#include "x86.h"
