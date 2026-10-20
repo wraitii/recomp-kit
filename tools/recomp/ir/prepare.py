@@ -327,7 +327,7 @@ def validate_operations(s):
         "INT_NOTEQUAL", "INT_LESS", "INT_LESSEQUAL", "BOOL_AND", "BOOL_OR", "BOOL_XOR",
         "INT_SLESS", "INT_SLESSEQUAL", "INT_LEFT", "INT_RIGHT", "INT_SRIGHT", "INT_CARRY",
         "INT_SCARRY", "INT_SBORROW", "BOOL_NEGATE", "INT_NEGATE", "INT_2COMP", "POPCOUNT",
-        "SUBPIECE", "PIECE")) | frozenset(operations.FLOAT_COMPARISONS + operations.FLOAT_ARITHMETIC + ("CVTTSS2SI",))
+        "SUBPIECE", "PIECE")) | frozenset(operations.FLOAT_COMPARISONS + operations.FLOAT_ARITHMETIC + operations.FLOAT_CONVERSIONS)
     for b in s.blocks.values():
         for v in b.ops:
             if v.opc in operations.FLOAT_COMPARISONS and (
@@ -337,8 +337,8 @@ def validate_operations(s):
             if v.opc in operations.FLOAT_ARITHMETIC and (
                     v.size != 4 or len(v.args) != 2 or any(arg.size != 4 for arg in v.args)):
                 raise SSAError("unsupported scalar arithmetic width")
-            if v.opc == "CVTTSS2SI" and (v.size != 4 or len(v.args) != 1 or v.args[0].size != 4):
-                raise SSAError("unsupported CVTTSS2SI shape")
+            if v.opc in operations.FLOAT_CONVERSIONS and (v.size != 4 or len(v.args) != 1 or v.args[0].size != 4):
+                raise SSAError("unsupported %s shape" % v.opc)
             if v.opc not in supported:
                 operations.describe(v.opc)
                 raise SSAError("unsupported integer operation %s" % v.opc)

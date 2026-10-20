@@ -22,7 +22,7 @@ from .ssa import SSAError
 #: CDQ, IMUL and the sixteen SETcc conditions already lift to expressible
 #: p-code. IDIV/NEG/SAR pass through correction below.
 EXTRA_MNEMONICS = frozenset((
-    "CDQ", "IMUL", "IDIV", "NEG", "SAR",
+    "CDQ", "IMUL", "IDIV", "NEG", "SAR", "CMOVB",
     "SETA", "SETAE", "SETB", "SETBE", "SETC", "SETE", "SETG", "SETGE",
     "SETL", "SETLE", "SETNA", "SETNAE", "SETNB", "SETNBE", "SETNC",
     "SETNE", "SETNG", "SETNGE", "SETNL", "SETNLE", "SETNO", "SETNP",
@@ -39,8 +39,42 @@ def correct(ins, lifter, operand=None):
         return negate(ins, lifter)
     if mnem == "SAR":
         return shift_arithmetic(ins, lifter, operand)
+    if mnem == "CMOVB":
+        return move_below(ins, lifter)
     # CDQ, IMUL and SETcc: SLEIGH semantics are already expressible.
     return list(ins.ops)
+
+
+def move_below(ins, lifter):
+    ops = list(ins.ops)
+    registers = {lifter.register(name) for name in (
+        "EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI",
+        "AX", "CX", "DX", "BX", "SP", "BP", "SI", "DI")}
+    cf = lifter.register("CF")
+    if (len(ops) != 4 or ops[0].opc != "COPY" or ops[0].out is None
+            or ops[0].out[0] != "unique" or len(ops[0].ins) != 1
+            or ops[0].ins[0] not in registers
+            or ops[0].out[2] != ops[0].ins[0][2]
+            or ops[1].opc != "BOOL_NEGATE" or ops[1].out is None
+            or ops[1].out[0] != "unique" or ops[1].out[2] != 1
+            or ops[1].ins != (cf,)
+            or ops[2].opc != "CBRANCH" or ops[2].out is not None
+            or ops[2].ins != (("ram", ins.addr + ins.length, 4), ops[1].out)
+            or ops[3].opc != "COPY" or ops[3].out not in registers
+            or ops[3].out[2] != ops[0].out[2]
+            or ops[3].ins != (ops[0].out,)):
+        raise SSAError("%08x: C emitter: unsupported CMOVB shape" % ins.addr)
+    source, target = ops[0].ins[0], ops[3].out
+    size = target[2]
+    carry = lifter.fresh_unique(size)
+    mask = lifter.fresh_unique(size)
+    changed = lifter.fresh_unique(size)
+    selected = lifter.fresh_unique(size)
+    return [Op("INT_ZEXT", carry, [cf]),
+            Op("INT_2COMP", mask, [carry]),
+            Op("INT_XOR", changed, [source, target]),
+            Op("INT_AND", selected, [changed, mask]),
+            Op("INT_XOR", target, [target, selected])]
 
 
 def divide_signed(ins, lifter):

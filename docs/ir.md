@@ -89,8 +89,9 @@ forwarding; matching PUSH/POP restores also support reviewed call preservation.
 COMISS/UCOMISS admit
 binary32 NaN, equality and less-than predicates, capturing memory once and
 preserving the eager emitter's flag behavior and lack of MXCSR exception delivery.
-ADDSS/SUBSS/MULSS and CVTTSS2SI use the runtime's binary32 helpers; XORPS splits
-128-bit operands into ordered dword lanes. FCOMI/FUCOMI comparisons return
+Scalar SSE arithmetic, MINSS/MAXSS and integer conversions use the runtime's
+binary32 helpers; MOVAPS register copies and XORPS use ordered dword lanes.
+Register-source CMOVB lowers to a flag-preserving selection. FCOMI/FUCOMI comparisons return
 packed flags through SSA while updating x87 status and tags through the scalar
 tracker. Other raw FLOAT operations, unbound calls, user operations and
 intra-instruction control flow are rejected with a named reason. `simplify.py`

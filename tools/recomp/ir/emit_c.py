@@ -164,10 +164,13 @@ def emit_prepared(prepared, external_entry=False):
                 return "!!isnan(%s)" % values[0]
             return "%s %s %s" % (values[0], "==" if opc == "FLOAT_EQUAL" else "<", values[1])
         if opc in operations.FLOAT_ARITHMETIC:
-            helper = {"FLOAT_ADD": "add", "FLOAT_SUB": "sub", "FLOAT_MULT": "mul"}[opc]
+            helper = {"FLOAT_ADD": "add", "FLOAT_SUB": "sub", "FLOAT_MULT": "mul",
+                      "FLOAT_DIV": "div", "FLOAT_MIN": "min", "FLOAT_MAX": "max"}[opc]
             return "recomp_sse_%sps((uint32_t)(%s), (uint32_t)(%s))" % (helper, a[0], a[1])
-        if opc == "CVTTSS2SI":
-            return "(uint32_t)recomp_sse_cvttss2si(recomp_sse_f32((uint32_t)(%s)))" % a[0]
+        if opc in ("CVTTSS2SI", "CVTSS2SI"):
+            return "(uint32_t)recomp_sse_%s(recomp_sse_f32((uint32_t)(%s)))" % (opc.lower(), a[0])
+        if opc == "CVTSI2SS":
+            return "recomp_sse_f32_bits((float)(int32_t)(uint32_t)(%s))" % a[0]
         if wide:
             a = ["(uint64_t)(%s)" % arg for arg in a]
         zero = "0ull" if wide else "0u"

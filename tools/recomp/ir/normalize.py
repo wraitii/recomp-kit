@@ -4,7 +4,7 @@ from .lift import Insn, Op
 from .integer import read_modify_write, arithmetic, shift, divide
 from .integer_extra import EXTRA_MNEMONICS, correct as correct_extra
 from .ssa import SSAError
-from .operations import FLOAT_COMPARISONS
+from .operations import FLOAT_COMPARISONS, FLOAT_ARITHMETIC, FLOAT_CONVERSIONS
 from .cfg import FunctionIR
 from . import x87
 
@@ -13,8 +13,8 @@ SUPPORTED_MNEMONICS = frozenset((
     "MOV", "MOVSX", "MOVZX", "XCHG", "NOT", "LEAVE", "LEA", "PUSH", "POP", "RET", "NOP", "ADD", "SUB", "CMP", "INC", "DEC",
     "ADC", "SBB", "SHL", "SHR", "DIV",
     "CLD", "STD", "SAHF", "LAHF", "MUL",
-    "TEST", "AND", "OR", "XOR", "JMP", "JZ", "JNZ", "JE", "JNE", "MOVSS", "XORPS", "COMISS", "UCOMISS",
-    "ADDSS", "SUBSS", "MULSS", "CVTTSS2SI",
+    "TEST", "AND", "OR", "XOR", "JMP", "JZ", "JNZ", "JE", "JNE", "MOVSS", "MOVAPS", "XORPS", "COMISS", "UCOMISS",
+    "ADDSS", "SUBSS", "MULSS", "DIVSS", "MINSS", "MAXSS", "CVTTSS2SI", "CVTSS2SI", "CVTSI2SS",
     "JA", "JAE", "JB", "JBE", "JC", "JNC", "JG", "JGE", "JL", "JLE", "JS", "JNS",
     "JO", "JNO", "JP", "JNP", "JPE", "JPO", "CALL",
 )) | EXTRA_MNEMONICS
@@ -219,17 +219,65 @@ def scalar_comparison(ins):
 
 
 def scalar_float(ins):
+    raw = list(ins.ops)
+    if ins.mnem.upper() in ("MINSS", "MAXSS"):
+        if len(raw) < 3:
+            raise SSAError("%08x: unsupported scalar min/max shape" % ins.addr)
+        compare, branch, copy = raw[-3:]
+        if (copy.opc != "COPY" or copy.out is None or copy.out[0] != "register"
+                or len(copy.ins) != 1 or copy.out[2] != 4 or copy.ins[0][2] != 4
+                or compare.opc != "FLOAT_LESS" or compare.out is None or compare.out[2] != 1
+                or compare.ins != ((copy.out, copy.ins[0]) if ins.mnem.upper() == "MINSS"
+                                   else (copy.ins[0], copy.out))
+                or branch.opc != "CBRANCH" or branch.out is not None
+                or branch.ins != (("ram", ins.addr + ins.length, 4), compare.out)
+                or any(op.opc in ("BRANCH", "CBRANCH", "BRANCHIND", "STORE") for op in raw[:-3])):
+            raise SSAError("%08x: unsupported scalar min/max shape" % ins.addr)
+        return raw[:-3] + [Op("FLOAT_MIN" if ins.mnem.upper() == "MINSS" else "FLOAT_MAX",
+                             copy.out, [copy.out, copy.ins[0]])]
+    if ins.mnem.upper() == "CVTSS2SI":
+        if (len(raw) < 2 or raw[-2].opc != "FLOAT_ROUND" or raw[-2].out is None
+                or raw[-2].out[0] != "unique" or raw[-2].out[2] != 4
+                or len(raw[-2].ins) != 1 or raw[-2].ins[0][2] != 4
+                or raw[-1].opc != "FLOAT_TRUNC" or raw[-1].out is None
+                or raw[-1].out[0] != "register" or raw[-1].out[2] != 4
+                or raw[-1].ins != (raw[-2].out,)):
+            raise SSAError("%08x: unsupported CVTSS2SI shape" % ins.addr)
+        raw[-2:] = [Op("CVTSS2SI", raw[-1].out, raw[-2].ins)]
     ops = []
-    for op in ins.ops:
+    for op in raw:
         if op.opc == "FLOAT_TRUNC":
             if (op.out is None or op.out[2] != 4 or len(op.ins) != 1 or op.ins[0][2] != 4):
                 raise SSAError("%08x: unsupported CVTTSS2SI shape" % ins.addr)
             op = Op("CVTTSS2SI", op.out, op.ins)
-        elif op.opc in ("FLOAT_ADD", "FLOAT_SUB", "FLOAT_MULT"):
+        elif op.opc == "FLOAT_INT2FLOAT":
+            op = Op("CVTSI2SS", op.out, op.ins)
+        if op.opc in FLOAT_CONVERSIONS:
+            if op.out is None or op.out[2] != 4 or len(op.ins) != 1 or op.ins[0][2] != 4:
+                raise SSAError("%08x: unsupported %s shape" % (ins.addr, op.opc))
+        elif op.opc in FLOAT_ARITHMETIC:
             if (op.out is None or op.out[2] != 4 or len(op.ins) != 2
                     or any(value[2] != 4 for value in op.ins)):
                 raise SSAError("%08x: unsupported scalar arithmetic shape" % ins.addr)
         ops.append(op)
+    return ops
+
+
+def movaps(ins, lifter):
+    ops = list(ins.ops)
+    bases = {lifter.register("XMM%d" % index)[1] for index in range(8)}
+    if len(ops) != 4:
+        raise SSAError("%08x: unsupported MOVAPS shape" % ins.addr)
+    source = ops[0].ins[0] if len(ops[0].ins) == 1 else None
+    target = ops[0].out
+    if (source is None or target is None
+            or source[0] != "register" or target[0] != "register"
+            or source[1] not in bases or target[1] not in bases):
+        raise SSAError("%08x: unsupported MOVAPS register shape" % ins.addr)
+    for lane, op in enumerate(ops):
+        if (op.opc != "COPY" or op.out != ("register", target[1] + lane * 4, 4)
+                or op.ins != (("register", source[1] + lane * 4, 4),)):
+            raise SSAError("%08x: unsupported MOVAPS lane shape" % ins.addr)
     return ops
 
 
@@ -340,8 +388,10 @@ def codegen_ir(fir, lifter, tails=()):
                           ins.x87, ins.internal_flow, ins.userops, ins.raw, ins.decode)
         if mnem in ("COMISS", "UCOMISS"):
             ops = scalar_comparison(normalized)
-        elif mnem in ("ADDSS", "SUBSS", "MULSS", "CVTTSS2SI"):
+        elif mnem in ("ADDSS", "SUBSS", "MULSS", "DIVSS", "MINSS", "MAXSS", "CVTTSS2SI", "CVTSS2SI", "CVTSI2SS"):
             ops = scalar_float(normalized)
+        elif mnem == "MOVAPS":
+            ops = movaps(normalized, lifter)
         elif mnem == "XORPS":
             ops = xorps(normalized, lifter)
         elif mnem == "SAR":
@@ -368,7 +418,8 @@ def codegen_ir(fir, lifter, tails=()):
         if i in fir.noreturn:
             ops = ops + [Op("TRAP", None, [], fir.noreturn[i])]
         result = Insn(ins.addr, ins.length, ins.mnem, ops, ins.x87_delta,
-                      ins.x87, ins.internal_flow, ins.userops, ins.raw, ins.decode)
+                      ins.x87, ins.internal_flow and mnem not in ("MINSS", "MAXSS", "CMOVB"),
+                      ins.userops, ins.raw, ins.decode)
         result.cc = _flag_producer(mnem, ops, flag_offsets)
         insns.append(result)
     for original, normalized in zip(fir.insns, insns):
