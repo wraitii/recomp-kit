@@ -440,10 +440,9 @@ def eh3_trylevels(fn, successors):
 class ControlFlow(object):
     STRING_MNEM = STRING_MNEM
 
-    def __init__(self, image, func_addrs, allow_unmodelled=None):
+    def __init__(self, image, func_addrs):
         self.image = image
         self.func_addrs = func_addrs
-        self.allow_unmodelled = allow_unmodelled
         self.unmodelled = []
         self.call_targets = set()
         self.jumptables = {}

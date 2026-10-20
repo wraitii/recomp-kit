@@ -133,12 +133,11 @@ Its Ghidra map is seeded from evidence, then exported and packed:
 tools/.venv/bin/python recomp-kit/tools/recomp/code_map.py --pack analysis/cvgamecore-export \
   --exe "Civilization IV Complete/Civ4/Beyond the Sword/Assets/CvGameCoreDLL.dll" \
   --out recomp-kit/games/civ4-bts/metadata-cvgamecore --base 0x10500000
-tools/.venv/bin/python tools/build.py --regenerate cvgamecore --target app \
-  --allow-unmodelled "<reason>"
+tools/.venv/bin/python tools/build.py --regenerate cvgamecore --target app
 ```
 
 The translator also runs a bootstrap sweep of the image for every module (`discover`
 in `[translate]`, on by default). Sweep bodies outside the Ghidra map are provisional:
 they are emitted as decoded regions, and a provisional jump into mapped code goes
-through the runtime dispatch rather than a trap. Those builds need `--allow-unmodelled`
-with a reason.
+through the runtime dispatch rather than a trap. Unsupported instructions trap
+at their own address if reached.

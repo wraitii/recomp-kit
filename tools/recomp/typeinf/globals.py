@@ -206,7 +206,7 @@ def main():
     parser.add_argument("--no-abi", action="store_true")
     args = parser.parse_args()
     game_config.resolve_game_args(args)
-    settings = Settings(game_config.load(args.game_dir, args.build_root), None, args.jobs, None)
+    settings = Settings(game_config.load(args.game_dir, args.build_root), jobs=args.jobs)
     started = time.monotonic()
     cache = Path(args.build_root) / "typeinf"
     key = source_key(settings)

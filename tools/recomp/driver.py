@@ -69,14 +69,12 @@ class Context(object):
         self.program = Program(settings, self.image, discovered_rows(settings))
         program = self.program
         self.decoded_only = program.metadata.get("emitter") == "decoded"
-        if program.metadata.get("provenance") == "provisional-sweep" and not settings.allow_unmodelled:
-            raise TranslateError("provisional code maps require --allow-unmodelled with an explicit reason")
         self.trap_instructions = {int(at, 16) for at in program.metadata.get("trap_instructions", "").split(",") if at}
         if self.decoded_only:
             settings.call_contracts = False
         self.entries = program.entries()
         self.interior = program.interior_entries()
-        self.tr = decoded.Translator(self.image, set(self.entries), settings.allow_unmodelled)
+        self.tr = decoded.Translator(self.image, set(self.entries))
         self.tr.provisional = program.provisional
         self.tr.mapped_containing = program.containing
         self.tr.noreturn_callees = set(program.noreturn)
@@ -113,7 +111,7 @@ class Context(object):
     def load(self, addr):
         """The decoded function, indexed, with the entries the map gives it."""
         image = self.image
-        image.allow_unmodelled = (self.decoded_only and self.settings.allow_unmodelled) or addr in self.program.provisional
+        image.trap_decode_errors = self.decoded_only or addr in self.program.provisional
         insns = []
         for start, size, lengths in self.program.functions[addr].spans:
             lengths = lengths or code_map.linear_lengths(self.lifter, image, start, size)
@@ -522,10 +520,6 @@ def parse_args(argv):
     ap.add_argument("--report", default=None, help="write a JSON stats file")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--jobs", type=int, default=None, help="worker processes (default: all cores)")
-    ap.add_argument("--allow-unmodelled", metavar="REASON", default=None,
-                    help="Translate instructions this translator cannot model into a trap at "
-                         "their own address instead of refusing the image; reaching one at run "
-                         "time is still fatal.")
     return ap.parse_args(argv)
 
 
@@ -533,7 +527,7 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     started = time.monotonic()
     log = (lambda *a: None) if args.quiet else (lambda *a: print(*a, file=sys.stderr, flush=True))
-    settings = Settings(game_config.load(args.game), args.allow_unmodelled, jobs_for(args.jobs), args.module)
+    settings = Settings(game_config.load(args.game), jobs=jobs_for(args.jobs), module=args.module)
     discovered_rows(settings)
     ctx = Context(settings)
     if ctx.dropped_discovered:

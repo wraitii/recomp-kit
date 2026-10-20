@@ -16,7 +16,7 @@ MASK = CW_PC_RC
 
 def settings_for(args):
     game_config.resolve_game_args(args, default=None)
-    settings = Settings(game_config.load(args.game_dir, args.build_root), allow_unmodelled="offline CW analysis")
+    settings = Settings(game_config.load(args.game_dir, args.build_root))
     if hashlib.sha256(Path(settings.exe).read_bytes()).hexdigest() != settings.sha256.lower():
         raise ValueError("original executable SHA-256 does not match game configuration")
     return settings

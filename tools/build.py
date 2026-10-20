@@ -337,7 +337,7 @@ def sync_tree(src, dst):
         sync_file(sp, dst / rel)
 
 
-def translation_fingerprints(cfg, allow_unmodelled=None):
+def translation_fingerprints(cfg):
     """Per-image hashes of everything that can change that image's translated sources.
 
     Each image owns its executable, code map and translation settings. Runtime
@@ -367,7 +367,7 @@ def translation_fingerprints(cfg, allow_unmodelled=None):
     finalization = json.dumps(source_revisions()["finalization"], sort_keys=True).encode()
     fingerprints = {}
     for key, module in images.items():
-        settings = Settings(config, allow_unmodelled, module=module)
+        settings = Settings(config, module=module)
         settings.module = stable(settings.module)
         h = hashlib.sha256(b"recomp-translate-v3\n" + finalization + b"\0" + identity(settings).encode())
         for path in (ROOT / "tools/game_config.py", ROOT / "tools/gen_game_config.py"):
@@ -491,7 +491,7 @@ def build_diff_harness(build_root, out):
     print("built diff harness: %s" % out)
 
 
-def run_translator(stage, game_dir, build_root, allow_unmodelled=None, aux_modules=(), regen_functions=(), main=True,
+def run_translator(stage, game_dir, build_root, aux_modules=(), regen_functions=(), main=True,
                    cache_emission=True):
     if main:
         command = [sys.executable, str(ROOT / "tools/recomp/driver.py"), "--out", str(stage),
@@ -501,8 +501,6 @@ def run_translator(stage, game_dir, build_root, allow_unmodelled=None, aux_modul
             command += ["--emission-cache", str(Path(build_root) / "recomp/emission-cache")]
         for function in regen_functions:
             command += ["--regen-function", function]
-        if allow_unmodelled:
-            command += ["--allow-unmodelled", allow_unmodelled]
         subprocess.run(command, cwd=ROOT, check=True)
     for module in aux_modules:
         destination = Path(stage) / ("aux-" + module["key"])
@@ -510,8 +508,6 @@ def run_translator(stage, game_dir, build_root, allow_unmodelled=None, aux_modul
         command = [sys.executable, str(ROOT / "tools/recomp/driver.py"), "--out", str(destination),
                    "--game", str(game_dir), "--module", module["key"],
                    "--report", str(Path(build_root) / ("recomp/translate-%s-report.json" % module["key"]))]
-        if allow_unmodelled:
-            command += ["--allow-unmodelled", allow_unmodelled]
         subprocess.run(command, cwd=ROOT, check=True)
 
 
@@ -543,9 +539,6 @@ def parse_args(argv, system=None):
                         help="Time budget per eager trial in milliseconds; each row's call count is "
                              "calibrated once to fill it. Zero runs correctness/size only")
     parser.add_argument("--corpus-trials", type=int, default=9)
-    parser.add_argument("--allow-unmodelled", metavar="REASON", default=None,
-                        help="Translate instructions the translator cannot model into a trap at "
-                             "their own address (passed to the translator)")
     parser.add_argument("--target", choices=sorted(TARGETS), default="app")
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 2, 8))
     parser.add_argument("--preset", default=default_preset(system), help="CMake configure preset")
@@ -591,15 +584,15 @@ def parse_args(argv, system=None):
         parser.error("--target web needs the Emscripten SDK's environment (source emsdk_env.sh)")
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
-    if args.function_corpus and any((args.regenerate, args.stub, args.allow_unmodelled,
+    if args.function_corpus and any((args.regenerate, args.stub,
                                       args.config != "Release", args.target != "app")):
         parser.error("--function-corpus is an isolated native Release build mode")
     if args.harness_out and not args.diff_harness:
         parser.error("--harness-out requires --diff-harness")
     if args.diff_harness and any((args.stub, args.regenerate, args.function_corpus,
-                                 args.target != "app", args.config != "Release", args.allow_unmodelled)):
+                                 args.target != "app", args.config != "Release")):
         parser.error("--diff-harness is isolated; it cannot be combined with --stub, "
-                     "--regenerate, --function-corpus, another target, Debug or --allow-unmodelled")
+                     "--regenerate, --function-corpus, another target or Debug")
     if args.corpus_asan and not args.function_corpus:
         parser.error("--corpus-asan requires --function-corpus")
     if args.corpus_asan and args.corpus_trial_ms != 0:
@@ -662,7 +655,7 @@ def main():
                 if not cfg.get("code_map_path"):
                     parser.error("Translation needs the game's code map: set [translate] code_map in game.toml")
                 selection = regenerate_selection(args.regenerate, cfg, parser)
-                fingerprints = translation_fingerprints(cfg, args.allow_unmodelled)
+                fingerprints = translation_fingerprints(cfg)
                 stamp = args.build_root / "recomp/translate.stamp"
                 stamped = read_translation_stamp(stamp)
                 translated = (args.build_root / "recomp/gen/table.c").is_file()
@@ -672,7 +665,7 @@ def main():
                     def regenerate_selected(stage):
                         shutil.copytree(args.build_root / "recomp/gen", stage, dirs_exist_ok=True)
                         run_translator(stage, args.game_dir, args.build_root,
-                                       args.allow_unmodelled, (), args.regen_function)
+                                       regen_functions=args.regen_function)
                     publish_generated(args.build_root, regenerate_selected)
                     stamped.pop("main", None)
                     write_translation_stamp(stamp, stamped)
@@ -686,7 +679,7 @@ def main():
                     else:
                         publish_generated(args.build_root,
                                           lambda stage: run_translator(stage, args.game_dir, args.build_root,
-                                                                       args.allow_unmodelled, cfg["aux_modules"],
+                                                                       aux_modules=cfg["aux_modules"],
                                                                        cache_emission=args.cache_emission))
                         write_translation_stamp(stamp, fingerprints)
                 else:
@@ -696,7 +689,7 @@ def main():
                     aux = [module for module in cfg["aux_modules"] if module["key"] in selection]
                     publish_generated(args.build_root,
                                       lambda stage: run_translator(stage, args.game_dir, args.build_root,
-                                                                   args.allow_unmodelled, aux, main=main_image,
+                                                                   aux_modules=aux, main=main_image,
                                                                    cache_emission=args.cache_emission),
                                       partial=True, main=main_image)
                     stamped.update((key, fingerprints[key]) for key in selection if key in fingerprints)

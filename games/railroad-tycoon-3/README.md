@@ -9,9 +9,6 @@ Use the GOG release with official patch 1.05 and no unofficial user patch.
 The installation must contain `RT3.exe` and its game data. Disc editions are
 unverified.
 
-For now, use the source-build instructions below. The build needs
-`--allow-unmodelled`, which the desktop installer does not yet pass.
-
 ## Build from source
 
 The reference is the GOG `RT3.exe` (32-bit x86, MSVC 7-era C++), identified in
@@ -27,8 +24,7 @@ python3 -m venv tools/.venv
 tools/.venv/bin/python -m pip install -r recomp-kit/requirements-dev.txt
 RECOMP_BUILD_ROOT=$PWD/build tools/.venv/bin/python recomp-kit/tools/setup.py \
   --game railroad-tycoon-3 --install "/absolute/path/to/your/installed/game"
-tools/.venv/bin/python tools/build.py --regenerate --target app --jobs 8 \
-  --allow-unmodelled "RT3 bring-up: unsupported MMX/3DNow/SSE instructions trap at their own address"
+tools/.venv/bin/python tools/build.py --regenerate --target app --jobs 8
 open build/RailroadTycoon3Recomp.app
 ```
 
@@ -41,8 +37,7 @@ tools/.venv/bin/python tools/build.py --target app --jobs 8
 ```
 
 Add `--regenerate` after changing translation inputs: the code map, translator
-or translation settings. Regeneration currently needs `--allow-unmodelled` (as in
-the first build above): the image still contains MMX/3DNow (`femms`, `pf*`) and
+or translation settings. The image still contains MMX/3DNow (`femms`, `pf*`) and
 scalar-SSE instructions the translator cannot model. They translate to a trap at
 their own address, and remain fidelity gaps if reached (see Status below).
 `--regenerate --target gen` generates translated C without configuring or
