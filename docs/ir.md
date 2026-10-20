@@ -82,7 +82,11 @@ C emission and preparation stages.
 `ssa.py` builds SSA over integer p-code on the instruction CFG. Registers and
 instruction-local storage use byte lanes, preserving AL/AH/AX/EAX aliasing; each
 instruction is a block, joins have phis, and LOAD, STORE and x87 effects thread
-one memory token with no forwarding or store removal. COMISS/UCOMISS admit
+one memory token. `preservation.py` forwards dword loads when every memory path
+reaches the same dominating read or stored value, crossing only proven disjoint
+writes and retaining every store. Calls and unknown aliases block ordinary
+forwarding; matching PUSH/POP restores also support reviewed call preservation.
+COMISS/UCOMISS admit
 binary32 NaN, equality and less-than predicates, capturing memory once and
 preserving the eager emitter's flag behavior and lack of MXCSR exception delivery.
 ADDSS/SUBSS/MULSS and CVTTSS2SI use the runtime's binary32 helpers; XORPS splits

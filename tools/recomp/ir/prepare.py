@@ -526,7 +526,7 @@ def prepare(fir, request, *, lifter=None, normalized=None):
     canonicalize(s)
     if not fir.entries and not seh_mark:
         from .preservation import forward
-        forward(s)
+        forward(s, cfg=cgi)
     s.compact()
     # DIVERGENCE(original): [ssa-state-locals] guest load/store faults
     # and store watch callbacks may observe earlier GPR/flag values

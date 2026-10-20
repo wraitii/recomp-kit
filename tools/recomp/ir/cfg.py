@@ -2,6 +2,35 @@
 from .guest import X86_32
 
 
+def dominators(successors, entry):
+    reachable, pending = set(), [entry]
+    while pending:
+        index = pending.pop()
+        if index not in reachable:
+            reachable.add(index)
+            pending.extend(successors[index])
+    predecessors = {index: [] for index in reachable}
+    for index in reachable:
+        for target in successors[index]:
+            predecessors[target].append(index)
+    all_bits = sum(1 << index for index in reachable)
+    result = {index: all_bits for index in reachable}
+    result[entry] = 1 << entry
+    order = sorted(reachable - {entry})
+    changed = True
+    while changed:
+        changed = False
+        for index in order:
+            bits = all_bits
+            for source in predecessors[index]:
+                bits &= result[source]
+            bits |= 1 << index
+            if bits != result[index]:
+                result[index] = bits
+                changed = True
+    return result
+
+
 class FunctionIR(object):
     """A function's lifted instructions and CFG.
 

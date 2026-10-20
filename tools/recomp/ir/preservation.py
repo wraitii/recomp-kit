@@ -1,19 +1,35 @@
-"""Forward proven register saves without removing guest stores or stack motion.
+"""Forward proven memory values without removing guest stores or stack motion.
 
-Every incoming memory path must reach the same PUSH value. Unknown aliases
-and opaque effects stop forwarding. Aligned stack locals use modular address
-intervals to prove disjointness. A surviving store to the same four bytes
-establishes that the removed restore load cannot fault. `calls=True` crosses a
-call's memory token, relying on the x86 stack discipline that a callee does not
-write its caller's save slot.
+Every incoming memory path must reach the same value. With a CFG, a dominating
+read or same-width store anchors ordinary dword loads; otherwise only matching
+PUSH/POP saves qualify. Unknown aliases and opaque effects stop forwarding.
+Aligned stack locals use modular intervals to prove disjointness. `calls=True`
+crosses calls only for register saves, relying on x86 stack discipline.
 """
 from .ssa import MEMORY
 from .simplify import canonicalize
 
 
-def forward(s, calls=False, stack_reload=None, signed_sub=True):
+def forward(s, calls=False, stack_reload=None, signed_sub=True, cfg=None):
     owners = {v.id: b for b in s.blocks.values() for v in b.ops}
     shapes, bounds, active = {}, {}, set()
+    general = cfg is not None and not calls
+    if general:
+        from .cfg import dominators
+        entry = next(i for i, ins in enumerate(cfg.insns) if ins.addr == cfg.addr)
+        dominates = dominators(cfg.succ, entry)
+        definitions = {v.id: (b.index, position)
+                       for b in s.blocks.values()
+                       for position, v in enumerate(b.phis + b.ops)}
+
+    def available(value, load):
+        definition = definitions.get(value.id)
+        if definition is None:
+            return value.opc in ("INPUT", "CONST", "TARGET")
+        source, position = definition
+        target, at = definitions[load.id]
+        return (position < at if source == target else
+                bool(dominates.get(target, 0) & (1 << source)))
 
     def address(value):
         value = s.resolve(value)
@@ -79,8 +95,10 @@ def forward(s, calls=False, stack_reload=None, signed_sub=True):
             register = raw[0] - 0x58
         elif raw == b"\xc9":
             register = 5
-        else:
+        elif not general:
             continue
+        else:
+            register = None
         for load in block.ops:
             if load.opc != "LOAD" or load.size != 4:
                 continue
@@ -109,8 +127,11 @@ def forward(s, calls=False, stack_reload=None, signed_sub=True):
                         origin = owners[effect.id].insn.raw or b""
                         source_address = address(source)
                         if (source_address == target_address and value.size == 4
-                                and origin == bytes([0x50 + register])):
+                                and (general or origin == bytes([0x50 + register]))):
                             source_value = s.resolve(value)
+                            if general and not available(source_value, load):
+                                saved_value = None
+                                break
                             if saved_value is not None and source_value is not saved_value:
                                 saved_value = None
                                 break
@@ -122,7 +143,19 @@ def forward(s, calls=False, stack_reload=None, signed_sub=True):
                         elif calls and source_address[0] != target_address[0]:
                             pending.append(effect.args[0])
                             continue
-                    elif effect.opc in ("LOAD", "X87_REG"):
+                    elif effect.opc == "LOAD":
+                        if (general and effect.size == load.size
+                                and address(effect.args[1]) == target_address):
+                            source_value = s.resolve(effect)
+                            if (not available(source_value, load)
+                                    or (saved_value is not None and source_value is not saved_value)):
+                                saved_value = None
+                                break
+                            saved_value = source_value
+                            continue
+                        pending.append(effect.args[0])
+                        continue
+                    elif effect.opc == "X87_REG":
                         pending.append(effect.args[0])
                         continue
                     elif calls and effect.opc in ("CALL", "CALLIND"):
@@ -139,6 +172,8 @@ def forward(s, calls=False, stack_reload=None, signed_sub=True):
                 break
             if saved_value is not None:
                 s.aliases[load.id] = saved_value
+                shapes.clear()
+                bounds.clear()
                 changed = True
     if changed:
         for block in s.blocks.values():
