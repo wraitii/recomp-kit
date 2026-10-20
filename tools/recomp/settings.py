@@ -6,7 +6,7 @@ from ir.body import EmissionPolicy
 
 
 class Settings(object):
-    def __init__(self, cfg, allow_unmodelled=None, jobs=1, module=None):
+    def __init__(self, cfg, jobs=1, module=None):
         translate = cfg["translate"]
         if not cfg.get("code_map_path"):
             raise TranslateError("game.toml [translate] code_map is required")
@@ -63,7 +63,6 @@ class Settings(object):
         self.discovered = None
         self.discovered_checked = False
         self.discovered_dropped = {}
-        self.allow_unmodelled = allow_unmodelled
         self.jobs = jobs
         relaxed = translate["fault_state"] == "relaxed"
         self.emit = EmissionPolicy(

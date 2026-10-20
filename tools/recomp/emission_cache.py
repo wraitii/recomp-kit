@@ -55,7 +55,6 @@ def identity(settings, *, code_map=True):
         'policy': asdict(settings.emit),
         'translate': dict(settings.cfg['translate']),
         'game': settings.cfg['game'], 'curated': settings.curated, 'module': settings.module,
-        'allow_unmodelled': settings.allow_unmodelled,
         'executable': hashlib.sha256(settings.exe.read_bytes()).hexdigest(),
         'dependencies': {name: version(name) for name in ('pypcode', 'capstone', 'pefile')},
         'python': sys.implementation.cache_tag,

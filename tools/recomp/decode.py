@@ -268,7 +268,7 @@ class Image(PE):
                 ci, source_bytes=source_bytes, address=address, mnem_override=mnem_override)
             ops = [self._op_text(record, op) for op in record.operands]
         except TranslateError as error:
-            if not getattr(self, "allow_unmodelled", False):
+            if not getattr(self, "trap_decode_errors", False):
                 raise
             addr = ci.address if address is None else address
             mnemonic = ci.raw_mnemonic if isinstance(ci, self._DecodeRecord) else ci.mnemonic

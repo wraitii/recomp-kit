@@ -11,7 +11,7 @@ code map v3 + PE -> program.py + frontend.py -> ir/lift.py -> ir/normalize.py ->
 ```
 
 `tools/recomp/driver.py` is the command (`--game DIR --out DIR`, `--report`,
-`--jobs`, `--allow-unmodelled REASON`); `build.py` runs it. `settings.py` turns
+`--jobs`); `build.py` runs it. `settings.py` turns
 `game.toml [translate]` and the command line into one `Settings` object that is
 passed to the program model, the workers and the corpus runner.
 
@@ -122,8 +122,8 @@ Bodies SSA cannot emit stay on `decoded.py`, the plain eager emitter (Capstone
 decoding, full-state helpers) fed the mapped boundaries: about 65 bodies,
 named in `translate-report.json` (INT, RDTSC, ROL/RCR, SHLD/SHRD, MMX,
 FNSAVE/FNSTENV, guest continuations, over-budget bodies). `decoded.py` also emits the wrappers of internal-switch
-entries. Unmodelled instructions become `recomp_unmodelled(c, addr)` traps only
-under `--allow-unmodelled`; otherwise translation fails.
+entries. Unmodelled instructions become `recomp_unmodelled(c, addr)` traps,
+reported during translation and fatal if reached.
 
 The decoded emitter handles `FEMMS` (`0f 0e`) by emptying the x87 tags and
 clearing TOP, preserving the control word and other status fields. AMD's Athlon

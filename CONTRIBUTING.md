@@ -115,7 +115,7 @@ For an initial map, use the standalone generator from the kit root:
 ```
 
 Set `[translate] code_map = "metadata"` in `game.toml`, then run setup. Build
-these provisional maps with `--regenerate --allow-unmodelled "Initial game port"`.
+these provisional maps with `--regenerate`.
 The generator recovers code from the executable using entry points, relocations,
 pointer tables and an instruction sweep. Its report records gaps and conflicts.
 
@@ -138,8 +138,8 @@ modules have their own maps and configuration.
 
 Run setup and regenerate an app build using the commands above. Follow the
 reported diagnostics to add missing support, using the original disassembly and
-callers to understand the required behavior. During bring-up,
-`--allow-unmodelled "REASON"` generates named traps for unsupported instructions.
+callers to understand the required behavior. Unsupported instructions generate
+named traps that remain fatal if reached.
 
 Keep reusable support in the translator, runtime or platform adapters. Game
 addresses and settings go in `game.toml`; native replacements go in the game's

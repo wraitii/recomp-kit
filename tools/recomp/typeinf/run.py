@@ -62,7 +62,7 @@ def main():
     parser.add_argument("--no-abi", action="store_true", help="do not assume indirect or unlifted callees preserve EBX/ESI/EDI/EBP")
     args = parser.parse_args()
     game_config.resolve_game_args(args)
-    program = Program(Settings(game_config.load(args.game_dir, args.build_root), None, 1, None))
+    program = Program(Settings(game_config.load(args.game_dir, args.build_root)))
     observed = load_observed(args.observe, program) if args.observe else ObservedEdges()
     deadline = time.monotonic() + args.timeout
     functions = Functions(program)

@@ -363,15 +363,6 @@ class Translator(ControlFlow):
         try:
             body = self._emit(fn, i, ins, m, nxt)
         except TranslateError as e:
-            # An instruction this translator cannot model becomes a trap at its
-            # own address rather than the end of the build. A listing routinely
-            # decodes the data past a function's real last instruction as code
-            # - sixteen-bit addressing and port instructions in a thirty-two-bit
-            # user-mode image are the signature - and refusing the image over
-            # bytes nothing executes helps nobody. Reaching one is still fatal,
-            # loudly and with its address, which is the property that matters.
-            if not self.traps_unmodelled(fn):
-                raise TranslateError("%08x %s: %s" % (ins.addr, ins.raw.split("  ", 1)[1], e))
             self.unmodelled.append((ins.addr, "%s: %s" % (ins.raw.split("  ", 1)[1], e)))
             body = ["recomp_unmodelled(c, 0x%08xu);" % ins.addr]
         declares = any(body[0].startswith(t) for t in
@@ -751,7 +742,7 @@ class Translator(ControlFlow):
                         self.call_targets.add(t)
                         L.append("CALL_FN(%08x);" % t)
                 else:
-                    self.reject_offimage_call(fn, t)
+                    self.reject_offimage_call(t)
                     L.append("recomp_call(c, %s);" % hexlit(t))
                 # An SSA callee may return with a pending flags descriptor; the
                 # decoded caller reads the guest's fields directly.
@@ -1150,26 +1141,8 @@ class Translator(ControlFlow):
 
     # ---- control-flow helpers -------------------------------------------
 
-    def traps_unmodelled(self, fn):
-        return self.allow_unmodelled or fn.addr in getattr(self, "provisional", ())
-
-    def reject_offimage_call(self, fn, t):
-        """A direct CALL whose literal target is not in the image at all.
-
-        No such instruction can be real: the bytes were decoded out of step
-        with the stream, which is what a listing does to the padding and
-        tables behind a function's last instruction. Under --allow-unmodelled
-        it goes through the same door as any other instruction the translator
-        cannot model - a trap at its own address - rather than surviving as a
-        dispatch target that reaches no translated code and fails the build
-        later, far from its cause. Without the switch the dangling-target
-        check still reports it, which is the stricter reading and stays the
-        default.
-
-        Only a call. A conditional jump out of the image is how a bad
-        speculative block gives itself away."""
-        if not self.traps_unmodelled(fn):
-            return
+    def reject_offimage_call(self, t):
+        """Trap an off-image direct call at its own instruction address."""
         if self.image.end <= self.image.base:
             return  # a translator built without bytes, as the unit tests are
         if self.image.base <= t < self.image.end:

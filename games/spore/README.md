@@ -37,12 +37,10 @@ python3 -m venv tools/.venv
 tools/.venv/bin/python -m pip install -r recomp-kit/requirements-dev.txt
 RECOMP_BUILD_ROOT=$PWD/build tools/.venv/bin/python recomp-kit/tools/setup.py \
   --game spore --install "$PWD/SPORE"
-tools/.venv/bin/python tools/build.py --regenerate \
-  --allow-unmodelled "Spore bring-up: unsupported instructions trap at their own address"
+tools/.venv/bin/python tools/build.py --regenerate
 ```
 
-The allowance covers instructions the recovered boundaries cannot model; each
-one traps at its own address if reached.
+Instructions the translator cannot model trap at their own address if reached.
 
 Setup checks the pinned executable against `game.toml`, validates the data
 directories and links the installation as `build/original`. It refuses to
